@@ -30,11 +30,13 @@
 #include <clio_ctp/compress/preprocess/data_stats_gpu.h>
 #include <clio_ctp/compress/preprocess/feature_extractor.h>
 
+#include <chrono>
 #include <vector>
 
 #include "clio_cte/compressor/compressor_runtime.h"
 #include "clio_cte/compressor/models/neuropress_bridge.h"
 #include "clio_cte/compressor/neuropress_path_trace.h"
+#include "clio_cte/compressor/neuropress_telemetry.h"
 
 namespace clio::cte::compressor {
 
@@ -45,6 +47,25 @@ std::vector<CompressionStats> Runtime::NeuroPressRankChunk(
     bool* out_neuropress_gpu_failed, const void** out_device_stats,
     const ctp::compress::preprocess::PredictionReuseContext* reuse,
     ctp::compress::preprocess::PredictionReuseOutcome* out_outcome) {
+  /* Selection latency, parked for this chunk's row. Covers everything below:
+     the statistics kernel, the reuse decision, and either a forward pass and
+     ranking or the cached ranking. Reported per chunk so the reused and
+     computed populations can be compared -- the difference between them is
+     what reuse saves, and it is far too small to read off a run's wall time. */
+  const auto sel_t0 = std::chrono::steady_clock::now();
+  bool sel_reused = false;
+  struct SelTimer {
+    const std::chrono::steady_clock::time_point &t0;
+    const bool &reused;
+    /* Destructor, so an early return -- unusable statistics, a declined
+       chunk -- still records what the attempt cost. */
+    ~SelTimer() {
+      RecordSelectionTiming(
+          std::chrono::duration<double, std::micro>(
+              std::chrono::steady_clock::now() - t0).count(), reused);
+    }
+  } sel_timer{sel_t0, sel_reused};
+
   // float32 always: the stats kernel is typed `const float*` and model.nnwt
   // was normalized against float32. Reading as uint8 puts MAD hundreds of
   // sigma outside the training range.
@@ -126,21 +147,121 @@ std::vector<CompressionStats> Runtime::NeuroPressRankChunk(
   {
     bool data_type_float = (context.data_type_ == 1);
     std::vector<CompressionStats> neuropress_stats;
+    /* Set by the host-decided path when this chunk was served the cached
+       ranking. Declared out here so the trace below can say so. */
+    bool served_from_cache = false;
     if (device_stats != nullptr) {
       bool np_infer_failed = false;
-      neuropress_stats = NeuroPressCandidateStatsDevice(
-          *neuropress_predictor_, chunk_size, device_stats, np_stream,
-          data_type_float, context.error_bound_, context.target_psnr_,
-          &np_infer_failed, config_.neuropress_best_mode_, reuse,
-          out_outcome);
+      /* ---- host-decided prediction reuse --------------------------------
+         The decision is a function of three doubles, and those three doubles
+         are fetched to the host every chunk anyway (the ReadDeviceFeatureStats
+         below, which used to be the only place they arrived). Asking BEFORE
+         the forward pass rather than after it is what makes a hit cheap: it
+         returns here, having launched nothing but the statistics kernel and
+         waited on nothing but the 24-byte copy.
+
+         DecidePredictionReuse and CommitChunkObservation below are the same
+         `__host__ __device__` functions the decision and commit kernels call
+         -- not a host reimplementation of them -- so the two paths cannot
+         disagree about what reuse means. */
+      NpHostReuseSlot *host_slot =
+          (np_reuse_host_decide_ && reuse != nullptr &&
+           reuse->slot != ctp::compress::preprocess::kNoLineageSlot)
+              ? NpHostReuseSlotFor(reuse->slot)
+              : nullptr;
+      ctp::compress::preprocess::ChunkSignature sig{};
+      /* Read once and used for both the decision and the commit: a Train()
+         landing between them would otherwise cache the new epoch against a
+         prediction made under the old weights. */
+      const int sgd_epoch = np_sgd_epoch_.load(std::memory_order_relaxed);
+      bool stats_read = false;
+      if (host_slot != nullptr) {
+        if (!ctp::ReadDeviceFeatureStats(device_stats, entropy, mad,
+                                         second_derivative_mean, np_stream)) {
+          *entropy = *mad = *second_derivative_mean = 0.0;
+        }
+        stats_read = true;
+        sig.entropy = *entropy;
+        sig.mad = *mad;
+        sig.second_derivative = *second_derivative_mean;
+        const uint32_t flags =
+            ctp::compress::preprocess::DecidePredictionReuse(
+                &host_slot->state, sig, reuse->timestep, reuse->thresholds,
+                reuse->chunk_bytes, reuse->error_bound, &sgd_epoch);
+        /* An empty cache is a miss whatever the divergence said. It is
+           reachable: a lineage whose first inference FAILED has advanced its
+           state without ever storing a ranking. */
+        if (!ctp::compress::preprocess::MustRunModel(flags) &&
+            !host_slot->ranked.empty()) {
+          ctp::compress::preprocess::CommitChunkObservation(
+              &host_slot->state, sig, reuse->timestep, /*model_ran=*/false,
+              &sgd_epoch);
+          if (out_outcome != nullptr) {
+            out_outcome->step_divergence = host_slot->state.step_divergence;
+            out_outcome->anchor_divergence =
+                host_slot->state.anchor_divergence;
+            out_outcome->path_divergence = host_slot->state.path_divergence;
+            out_outcome->flags = flags;
+          }
+          if (out_entropy) *out_entropy = *entropy;
+          if (out_mad) *out_mad = *mad;
+          if (out_second_deriv) *out_second_deriv = *second_derivative_mean;
+          /* Falls through to the shared tail rather than returning here: a
+             reused chunk must reach the same "2 infer" and "3 rank" traces
+             and the same return as a computed one, or the log stops
+             describing every selection. */
+          neuropress_stats = host_slot->ranked;
+          served_from_cache = true;
+          sel_reused = true;
+        }
+      }
+      if (!served_from_cache) {
+        neuropress_stats = NeuroPressCandidateStatsDevice(
+            *neuropress_predictor_, chunk_size, device_stats, np_stream,
+            data_type_float, context.error_bound_, context.target_psnr_,
+            &np_infer_failed, config_.neuropress_best_mode_,
+            /* The device keeps its own state only when the host is not
+               deciding; running both would advance the anchor twice. */
+            host_slot != nullptr ? nullptr : reuse,
+            host_slot != nullptr ? nullptr : out_outcome);
+      }
       if (np_infer_failed && out_neuropress_gpu_failed) {
         *out_neuropress_gpu_failed = true;
       }
       // 24-byte copy, no extra stall: the ranking already waited on the
       // stream. Ungated -- the per-chunk record needs these every chunk.
-      if (!ctp::ReadDeviceFeatureStats(device_stats, entropy, mad,
+      // Skipped when the host path already fetched them above.
+      if (!stats_read &&
+          !ctp::ReadDeviceFeatureStats(device_stats, entropy, mad,
                                        second_derivative_mean, np_stream)) {
         *entropy = *mad = *second_derivative_mean = 0.0;
+      }
+      if (host_slot != nullptr && !served_from_cache) {
+        /* Mirrors ReuseCommitKernel's model-ran half. has_prediction is set
+           only on a ranking that exists: caching an empty one would make the
+           next timestep's hit serve nothing. */
+        if (!neuropress_stats.empty()) {
+          host_slot->ranked = neuropress_stats;
+          const size_t n = neuropress_stats.size();
+          host_slot->state.cached_count = static_cast<int>(
+              n < static_cast<size_t>(
+                      ctp::compress::preprocess::kReuseMaxCandidates)
+                  ? n
+                  : static_cast<size_t>(
+                        ctp::compress::preprocess::kReuseMaxCandidates));
+          host_slot->state.has_prediction = 1;
+          host_slot->state.cached_chunk_bytes = reuse->chunk_bytes;
+          host_slot->state.cached_error_bound = reuse->error_bound;
+        }
+        ctp::compress::preprocess::CommitChunkObservation(
+            &host_slot->state, sig, reuse->timestep, /*model_ran=*/true,
+            &sgd_epoch);
+        if (out_outcome != nullptr) {
+          out_outcome->step_divergence = host_slot->state.step_divergence;
+          out_outcome->anchor_divergence = host_slot->state.anchor_divergence;
+          out_outcome->path_divergence = host_slot->state.path_divergence;
+          out_outcome->flags = host_slot->state.decision_flags;
+        }
       }
       if (out_entropy) *out_entropy = *entropy;
       if (out_mad) *out_mad = *mad;
@@ -151,10 +272,32 @@ std::vector<CompressionStats> Runtime::NeuroPressRankChunk(
           *second_derivative_mean, data_type_float, context.error_bound_,
           config_.neuropress_best_mode_);
     }
+    /* Whether the model ran, for the per-chunk record. The host path knows it
+       from its own branch; the device path has to read the verdict back out of
+       the outcome, because there the decision was made on the stream and the
+       host was never told. Without this the column reads "ran" for all 500
+       device rows while its trace reports 396 reuses -- the two disagreeing
+       about the same run. */
+    if (reuse != nullptr && out_outcome != nullptr && !served_from_cache &&
+        !ctp::compress::preprocess::MustRunModel(out_outcome->flags)) {
+      sel_reused = true;
+    }
     /* The trace claims a forward pass per action. With prediction reuse that
        is no longer unconditional, and a log that says the model ran when it
        did not would make the NN-invocation counts unauditable. */
-    if (reuse != nullptr && out_outcome != nullptr &&
+    if (served_from_cache) {
+      /* Checked BEFORE out_outcome, and on a flag rather than on the flags:
+         a caller that passed no outcome still reused, and the count of
+         forward passes has to come out right in either case. */
+      CLIO_PATH_TRACE(
+          "2 infer    [HOST] REUSED the cached ranking -- no forward pass, "
+          "no ranking kernel, no commit kernel, no prediction D2H "
+          "(d_step=%.6f d_anchor=%.6f d_path=%.6f, decided before the "
+          "stream was touched)",
+          out_outcome != nullptr ? out_outcome->step_divergence : -1.0,
+          out_outcome != nullptr ? out_outcome->anchor_divergence : -1.0,
+          out_outcome != nullptr ? out_outcome->path_divergence : -1.0);
+    } else if (reuse != nullptr && out_outcome != nullptr &&
         !ctp::compress::preprocess::MustRunModel(out_outcome->flags)) {
       CLIO_PATH_TRACE(
           "2 infer    [GPU] REUSED the cached prediction -- no forward pass "

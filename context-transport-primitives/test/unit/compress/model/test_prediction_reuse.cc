@@ -532,3 +532,85 @@ TEST_CASE("PredictionReuseInvalidatedWhenWeightsChange") {
   REQUIRE(DecidePredictionReuse(&s, same, 4, th) ==
           ReuseDecision::kReuseCachedPrediction);
 }
+
+/* ------------------------------------------------------------------ *
+ * The host-decided sequence, as Runtime::NeuroPressRankChunk runs it
+ * ------------------------------------------------------------------ */
+
+/* Deciding on the host before the forward pass, rather than on the device
+   after it, is what lets a hit skip four kernel launches, a memcpy and a
+   synchronize. The DECISION is the same function either way -- that is why it
+   is `__host__ __device__` -- so what needs pinning is the part that is NOT
+   shared: the four fields ReuseCommitKernel writes outside
+   CommitChunkObservation (has_prediction, cached_count, cached_chunk_bytes,
+   cached_error_bound) now have a second writer, on the host, and the two must
+   agree.
+
+   Ordered as the runtime orders it: decide, then either serve or run, then
+   commit. Reversing the last two would compare a signature against itself. */
+TEST_CASE("HostDecidedReuseMirrorsTheCommitKernel") {
+  using ctp::compress::preprocess::CommitChunkObservation;
+  PredictionReuseThresholds th;
+  th.step = 0.05; th.anchor = 0.20; th.refresh_interval = 1000;
+  const ChunkSignature same = Sig(4.0, 0.5, 0.25);
+  DeviceBlockState s = Fresh();
+  int epoch = 0;   // the runtime's np_sgd_epoch_, not w->sgd_call_count
+
+  // Chunk 0: nothing cached, so the model must run whatever the data says.
+  REQUIRE(MustRunModel(DecidePredictionReuse(&s, same, 0, th, 8388608.0, 1e-3,
+                                             &epoch)));
+
+  /* The miss path, in the runtime's order: cache the ranking, mirror the
+     four fields, THEN commit. `ranked` stands for the vector the host keeps;
+     an empty one must not set has_prediction. */
+  size_t ranked = 0;
+  if (ranked != 0) { s.has_prediction = 1; }
+  CommitChunkObservation(&s, same, 0, /*model_ran=*/true, &epoch);
+
+  /* Inference FAILED on the first observation: the state advanced but nothing
+     was cached. Both divergences are now zero, so the DATA says reuse -- and
+     the decision refuses anyway, on has_prediction. That is what makes the
+     runtime's `!ranked.empty()` guard belt-and-braces rather than the
+     mechanism: the two are set together, and the decision already covers the
+     case. Asserted so that a future decision which drops kInvalidPrediction
+     cannot quietly start serving an empty candidate list. */
+  {
+    const uint32_t r =
+        DecidePredictionReuse(&s, same, 1, th, 8388608.0, 1e-3, &epoch);
+    REQUIRE((r & ReuseDecision::kInvalidPrediction) != 0u);
+    REQUIRE(s.step_divergence == 0.0);
+    REQUIRE(s.anchor_divergence == 0.0);
+  }
+  REQUIRE(s.has_prediction == 0);
+
+  // Chunk 1 runs anyway (empty cache) and this time produces a ranking.
+  ranked = 32;
+  s.cached_count = static_cast<int>(ranked);
+  s.has_prediction = 1;
+  s.cached_chunk_bytes = 8388608.0;
+  s.cached_error_bound = 1e-3;
+  CommitChunkObservation(&s, same, 1, /*model_ran=*/true, &epoch);
+
+  // Chunk 2: unchanged data, unchanged weights, unchanged layout -> served.
+  REQUIRE(DecidePredictionReuse(&s, same, 2, th, 8388608.0, 1e-3, &epoch) ==
+          ReuseDecision::kReuseCachedPrediction);
+  CommitChunkObservation(&s, same, 2, /*model_ran=*/false, &epoch);
+  // Serving must not disturb what the cache is valid for.
+  REQUIRE(s.cached_count == 32);
+  REQUIRE(s.cached_chunk_bytes == 8388608.0);
+  REQUIRE(s.cached_error_bound == 1e-3);
+
+  /* The host counts its own Train() calls rather than reading
+     w->sgd_call_count, which would cost a synchronizing cudaMemcpy on the
+     path this exists to make cheap. The counters need not agree -- only that
+     the host's moves whenever the weights do. */
+  epoch = 1;
+  REQUIRE((DecidePredictionReuse(&s, same, 3, th, 8388608.0, 1e-3, &epoch) &
+           ReuseDecision::kModelChanged) != 0u);
+
+  // A chunk of a different size is refused even at zero divergence: the
+  // signature is intensive and cannot see input 4.
+  CommitChunkObservation(&s, same, 3, /*model_ran=*/true, &epoch);
+  REQUIRE((DecidePredictionReuse(&s, same, 4, th, 4194304.0, 1e-3, &epoch) &
+           ReuseDecision::kBlockLayoutChanged) != 0u);
+}

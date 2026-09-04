@@ -297,6 +297,77 @@ private:
       np_reuse_registry_;
   void *np_reuse_states_ = nullptr;
   std::mutex np_reuse_mutex_;
+
+  /* ---- host-side reuse decision (opt-in, OFF by default) ---------------
+     An alternative to deciding on the stream, kept because it is measured and
+     reproducible, not because it is on. The device-decided path costs a hit
+     four kernels it does not need; the decision reads three doubles, and those
+     three doubles are ALREADY brought to the host every chunk by the
+     ReadDeviceFeatureStats call that used to sit after the inference
+     (neuropress_selection.cc). Deciding before the forward pass rather than
+     after it turns a hit into: stats kernel, one 24-byte copy, one
+     synchronize, done -- no LaunchReuseDecision, no
+     InferKernelDeviceStats<<<32,64>>>, no RankKernel, no LaunchReuseCommit,
+     no FetchPredictionsSync, and no second synchronize.
+
+     WHY IT IS NOT THE DEFAULT. Measured on 2000 Nyx chunks with learning off:
+     68.8us saved per hit against the device path's 21.6us, at an 87.3% hit
+     rate, for 120ms across a 118s run. That is 0.1%, and three warm runs of
+     the same configuration span 220ms -- so the saving is real per chunk and
+     invisible per run. Equivalence holds exactly in inference mode (2000/2000
+     identical selections); in learn mode nothing can be proven either way,
+     because two runs of ONE configuration already differ on 1954 of 2000 rows.
+
+     The arithmetic is not reimplemented here. DecidePredictionReuse and
+     CommitChunkObservation are `__host__ __device__` and stateless beyond
+     their arguments, so the host path calls the SAME functions the kernels
+     do; the two cannot drift apart because there is only one of each.
+
+     WHAT THE CACHE HOLDS is the ranked result, not the raw prediction
+     arrays. Replaying those would mean re-running the candidate enumeration
+     -- 32 MakeCompressionFeatures, a base-id filter, a stable sort and a
+     GetLibraryInfo/WireIdForName pair per result -- to rebuild a vector that
+     is a pure function of inputs that did not change. Caching the vector
+     skips that host work too.
+
+     Slots are created on demand, not reserved: the capacity is a ceiling
+     (262144 by default) and a vector of that many entries would cost ~278 MiB
+     of host memory for a run that typically uses tens of lineages. unique_ptr
+     elements keep each slot's address stable when the outer vector grows. */
+  struct NpHostReuseSlot {
+    ctp::compress::preprocess::DevicePredictionReuseState state{};
+    /** Best-first, exactly as the device path returned it when the model last
+     *  ran for this lineage. Empty until then. */
+    std::vector<CompressionStats> ranked;
+  };
+  /**
+   * OFF by default: the device decides, on the stream, as it always has.
+   *
+   * CLIO_NEUROPRESS_REUSE_HOST_DECIDE=1 takes the host path. It is measurably
+   * cheaper -- 68.8us per hit against the device path's 21.6us on a 2000-chunk
+   * Nyx run, with bit-identical selections -- but that is 120ms across a 118s
+   * run, 0.1%, and below what any end-to-end measurement on this system
+   * resolves. The default stays where the shipped behaviour is; the flag keeps
+   * the comparison reproducible.
+   */
+  bool np_reuse_host_decide_ = false;
+  std::vector<std::unique_ptr<NpHostReuseSlot>> np_reuse_host_;
+  /**
+   * Host mirror of the model's SGD counter, for kModelChanged.
+   *
+   * NOT w->sgd_call_count: reading that is a synchronizing cudaMemcpy
+   * (NeuroPressGpuSgdCallCount), which on a per-chunk fast path would cost
+   * more than the kernels it saves. This counts the host's own successful
+   * Train() calls instead. It need not equal the device counter -- the
+   * decision only asks whether it MOVED since the cache was made, and it
+   * moves exactly when the host asks for training. A Train() the device
+   * declines still bumps it, which re-runs the model needlessly; that is the
+   * safe direction to be wrong in.
+   */
+  std::atomic<int> np_sgd_epoch_{0};
+  /** The host slot for a lineage, created on first use. Null for
+   *  kNoLineageSlot. Takes np_reuse_mutex_: it may grow the vector. */
+  NpHostReuseSlot *NpHostReuseSlotFor(uint32_t slot);
   /** Resolve a blob name to a reuse context; disabled context when the
    *  feature is off, the lineage is unresolvable, or the registry is full. */
   ctp::compress::preprocess::PredictionReuseContext PredictionReuseContextFor(

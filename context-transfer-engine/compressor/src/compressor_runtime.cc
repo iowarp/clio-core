@@ -460,6 +460,15 @@ void Runtime::InitPredictionReuse() {
     }
   }
 
+  /* Opt IN, not out: the device-decided path is the shipped behaviour and
+     stays the default. The host path saves 47us more per hit but that is 0.1%
+     of a run, so it is not worth making the default carry a second way of
+     keeping the same state. */
+  {
+    const char *v = std::getenv("CLIO_NEUROPRESS_REUSE_HOST_DECIDE");
+    np_reuse_host_decide_ = (v != nullptr && v[0] == '1');
+  }
+
   np_reuse_thresholds_.step =
       env_num("CLIO_NEUROPRESS_REUSE_STEP_THRESHOLD", np_reuse_thresholds_.step);
   np_reuse_thresholds_.anchor = env_num("CLIO_NEUROPRESS_REUSE_ANCHOR_THRESHOLD",
@@ -509,8 +518,10 @@ void Runtime::InitPredictionReuse() {
       ctp::compress::preprocess::LineageSlotRegistry>(capacity);
   np_reuse_enabled_ = true;
   HLOG(kInfo,
-       "NeuroPress prediction reuse ON: step={} anchor={} refresh={} "
-       "capacity={} lineages ({} MiB on the device)",
+       "NeuroPress prediction reuse ON, decided on the {}: step={} "
+       "anchor={} refresh={} capacity={} lineages ({} MiB on the device)",
+       np_reuse_host_decide_ ? "HOST before the forward pass"
+                             : "DEVICE after it,",
        np_reuse_thresholds_.step, np_reuse_thresholds_.anchor,
        np_reuse_thresholds_.refresh_interval, capacity,
        (static_cast<size_t>(capacity) *
@@ -859,6 +870,28 @@ ctp::compress::preprocess::PredictionReuseContext Runtime::PredictionReuseContex
   ctx.timestep = lineage.timestep;
   ctx.thresholds = np_reuse_thresholds_;
   return ctx;
+}
+
+/**
+ * The host slot for a lineage, created on first use.
+ *
+ * Takes the registry mutex because it may grow np_reuse_host_. That is a
+ * second uncontended acquire per chunk on top of SlotFor's, which is the
+ * price of not sizing the vector to the capacity ceiling -- nanoseconds
+ * against the tens of microseconds of kernel launches a hit avoids.
+ *
+ * The returned pointer is used WITHOUT the lock. Safe for the same reason
+ * the device state is: one slot belongs to one lineage, and two chunks of a
+ * lineage are never in flight together. The unique_ptr indirection is what
+ * makes the address survive another thread growing the vector.
+ */
+Runtime::NpHostReuseSlot *Runtime::NpHostReuseSlotFor(uint32_t slot) {
+  if (slot == ctp::compress::preprocess::kNoLineageSlot) return nullptr;
+  std::lock_guard<std::mutex> lock(np_reuse_mutex_);
+  if (slot >= np_reuse_host_.size()) np_reuse_host_.resize(slot + 1);
+  auto &p = np_reuse_host_[slot];
+  if (!p) p = std::make_unique<NpHostReuseSlot>();
+  return p.get();
 }
 
 /** Defined with the selection log below; used here to skip work it alone reads.
@@ -1983,6 +2016,15 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             // in `features`.
             bool trained = neuropress_predictor_->TrainDeviceStats(
                 features, labels, sel_device_stats);
+            /* kModelChanged for the host-decided reuse path. The weights this
+               moved are the ones every cached prediction was made against, so
+               the counter has to advance before the next chunk decides.
+               relaxed: the only question asked of it is whether the value
+               differs from the one stored in a slot, and slots are not shared
+               across threads. */
+            if (trained) {
+              np_sgd_epoch_.fetch_add(1, std::memory_order_relaxed);
+            }
             HLOG(kDebug,
                  "NeuroPress SGD: lib={} preset={} error_pct={} "
                  "threshold={} trained={}",
