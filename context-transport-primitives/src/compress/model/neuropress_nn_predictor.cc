@@ -119,8 +119,9 @@ bool NeuroPressNNPredictor::Load(const std::string& model_dir) {
 
   // Feature bounds are a v2 addition. A v1 file simply ends here, and
   // upstream fills in wide-open defaults rather than failing
-  // (nn_gpu.cu). Nothing consults them at inference or training; they are
-  // parsed so a v2 file round-trips through Save().
+  // (nn_gpu.cu). Upstream consults them nowhere; Clio hands them to the
+  // device, where every input is soft-bounded to them -- see
+  // NeuroPressSoftBoundSigma in the kernels header.
   x_mins_.resize(input_dim);
   x_maxs_.resize(input_dim);
   if (version >= 2) {
@@ -145,7 +146,8 @@ bool NeuroPressNNPredictor::Load(const std::string& model_dir) {
   // as CUDA kernels below, matching NeuroPress's own device-resident design.
   gpu::NeuroPressGpuWeights* raw = gpu::NeuroPressGpuLoad(
       weights_.data(), weights_.size(), biases_.data(), biases_.size(),
-      x_means_.data(), x_stds_.data(), y_means_.data(), y_stds_.data());
+      x_means_.data(), x_stds_.data(), y_means_.data(), y_stds_.data(),
+      x_mins_.data(), x_maxs_.data());
   gpu_weights_.reset(raw, [](gpu::NeuroPressGpuWeights* p) {
     gpu::NeuroPressGpuFree(p);
   });

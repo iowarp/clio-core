@@ -80,6 +80,11 @@ struct AdaptOptions {
   float max_step = 0.02f;     // CLIO_NEUROPRESS_SGD_MAX_STEP
   float grad_clip = 1.0f;     // CLIO_NEUROPRESS_SGD_GRAD_CLIP (<=0: off)
   float momentum = 0.85f;     // CLIO_NEUROPRESS_SGD_MOMENTUM
+  // Output-space trust region for the SHIPPED rule, in standardised output
+  // units: one SGD call may move a selection head by at most this much on
+  // the sample it trained on. <= 0 restores upstream's parameter-space-only
+  // bound. Not an upstream knob -- see the block in SGDKernel for why.
+  float out_delta = 0.5f;     // CLIO_NEUROPRESS_SGD_OUT_DELTA
 };
 }  // namespace
 
@@ -90,6 +95,12 @@ struct NeuroPressGpuWeights {
   float x_stds[kInputDim];
   float y_means[kOutputDim];
   float y_stds[kOutputDim];
+  // Feature bounds in STANDARDISED units, (x_min - mean)/std and
+  // (x_max - mean)/std, consumed by NeuroPressStandardize below. Part of the
+  // uploaded prefix; wide open (+-1e30) when the .nnwt carries none or
+  // CLIO_NEUROPRESS_INPUT_BOUND=0 asks for upstream's identity.
+  float x_los[kInputDim];
+  float x_his[kInputDim];
 
   // Online-learning state (never serialized to .nnwt, matches upstream).
   float log_var[kOutputDim];
@@ -115,6 +126,17 @@ struct NeuroPressGpuWeights {
 
 namespace {
 
+/** Standardise raw input i and soft-bound it to the training range. The ONE
+ *  path from a raw statistic to the network, shared by every inference kernel
+ *  and by SGD, so the two can never read a chunk differently. */
+__device__ __forceinline__ float NeuroPressStandardize(
+    const NeuroPressGpuWeights *__restrict__ w, int i, float raw) {
+  float sd = w->x_stds[i];
+  if (sd < 1e-8f) sd = 1e-8f;
+  const float centred = raw - w->x_means[i];
+  return NeuroPressSoftBoundSigma(centred / sd, w->x_los[i], w->x_his[i]);
+}
+
 /**
  * The options, parsed ONCE per process on first use.
  *
@@ -138,6 +160,7 @@ const AdaptOptions &Opts() {
     a.max_step = num("CLIO_NEUROPRESS_SGD_MAX_STEP", 0.02f);
     a.grad_clip = num("CLIO_NEUROPRESS_SGD_GRAD_CLIP", 1.0f);
     a.momentum = num("CLIO_NEUROPRESS_SGD_MOMENTUM", 0.85f);
+    a.out_delta = num("CLIO_NEUROPRESS_SGD_OUT_DELTA", 0.5f);
     return a;
   }();
   return o;
@@ -326,7 +349,8 @@ void ResetAllEmaBuffers() {
 NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len,
                                         const float *biases, size_t biases_len,
                                         const float *x_means, const float *x_stds,
-                                        const float *y_means, const float *y_stds) {
+                                        const float *y_means, const float *y_stds,
+                                        const float *x_mins, const float *x_maxs) {
   // Layout sanity: caller's flattened weights_ (13312 = 512+3*4096+512) plus
   // biases_ (264 = 4*64+8) must add up to exactly kParamCount (13576) when
   // interleaved below. If the .nnwt format ever changes shape this catches
@@ -363,7 +387,9 @@ NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len
   constexpr size_t kOffXStds = kOffXMeans + kInputDim;
   constexpr size_t kOffYMeans = kOffXStds + kInputDim;
   constexpr size_t kOffYStds = kOffYMeans + kOutputDim;
-  constexpr size_t kPrefixFloats = kOffYStds + kOutputDim;
+  constexpr size_t kOffXLos = kOffYStds + kOutputDim;
+  constexpr size_t kOffXHis = kOffXLos + kInputDim;
+  constexpr size_t kPrefixFloats = kOffXHis + kInputDim;
   // The single copy is only correct if the device struct really is laid out
   // the way this staging buffer assumes. Every member is a float array so no
   // padding can appear between them, but assert it rather than trust it:
@@ -381,6 +407,12 @@ NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len
   static_assert(offsetof(NeuroPressGpuWeights, y_stds) ==
                     sizeof(float) * kOffYStds,
                 "y_stds must directly follow y_means");
+  static_assert(offsetof(NeuroPressGpuWeights, x_los) ==
+                    sizeof(float) * kOffXLos,
+                "x_los must directly follow y_stds");
+  static_assert(offsetof(NeuroPressGpuWeights, x_his) ==
+                    sizeof(float) * kOffXHis,
+                "x_his must directly follow x_los");
 
   float host_params[kPrefixFloats];
   size_t w_off[5] = {0, kW1, kW1 + kW234, kW1 + 2 * kW234, kW1 + 3 * kW234};
@@ -405,6 +437,41 @@ NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len
   std::memcpy(host_params + kOffXStds, x_stds, sizeof(float) * kInputDim);
   std::memcpy(host_params + kOffYMeans, y_means, sizeof(float) * kOutputDim);
   std::memcpy(host_params + kOffYStds, y_stds, sizeof(float) * kOutputDim);
+  // Bounds to sigma units once, here, so the kernels do one compare each.
+  // CLIO_NEUROPRESS_INPUT_BOUND=0 leaves them wide open: upstream's identity,
+  // kept so the ablation runs from one binary.
+  //
+  // The bound is widened by a TOLERANCE of kInputMargin sigma on each side
+  // before it starts compressing. The fitted range is where the weights are
+  // trustworthy, not where they stop being usable: 8 MiB chunks standardise to
+  // 4.1 sigma on chunk_size against a file maximum of 1.6 (the training set
+  // topped out at 4 MiB), and compressing that mild extrapolation moved 139 of
+  // 300 Nyx pristine predictions by more than 10% and pushed the run's
+  // selection lock-in from chunk 1082 to 1555 for no gain in accuracy. At 3
+  // sigma of tolerance that input is left alone and Nyx locks in at chunk 1178
+  // instead of 1555 -- but LAMMPS position's MAD lands at 11.8 sigma instead
+  // of 8.8, and that costs the never-seen workload most of what the bound
+  // bought it: mean ratio MAPE 0.43 -> 0.98 and no selection lock-in at all.
+  // The tight bound is the default; the tolerance is a measured trade a
+  // deployment may take for an in-range workload it cares more about.
+  // CLIO_NEUROPRESS_INPUT_BOUND_MARGIN overrides; 0 is the tight bound.
+  static const bool kInputBound = [] {
+    const char *v = std::getenv("CLIO_NEUROPRESS_INPUT_BOUND");
+    return !(v != nullptr && v[0] == '0');
+  }();
+  static const float kInputMargin = [] {
+    const char *v = std::getenv("CLIO_NEUROPRESS_INPUT_BOUND_MARGIN");
+    return (v != nullptr && *v != '\0') ? std::strtof(v, nullptr) : 0.0f;
+  }();
+  for (int i = 0; i < kInputDim; ++i) {
+    float sd = x_stds[i];
+    if (sd < 1e-8f) sd = 1e-8f;
+    const bool have = kInputBound && x_mins != nullptr && x_maxs != nullptr;
+    host_params[kOffXLos + i] =
+        have ? (x_mins[i] - x_means[i]) / sd - kInputMargin : -1e30f;
+    host_params[kOffXHis + i] =
+        have ? (x_maxs[i] - x_means[i]) / sd + kInputMargin : 1e30f;
+  }
 
   bool ok = cudaMemcpy(&device_w->params, host_params, sizeof(host_params),
                        cudaMemcpyHostToDevice) == cudaSuccess;
@@ -632,11 +699,7 @@ __global__ void InferKernel(const NeuroPressGpuWeights *__restrict__ w,
   __shared__ float s_y[kOutputDim];
 
   if (t < kInputDim) {
-    float std_val = w->x_stds[t];
-    if (std_val < 1e-8f) std_val = 1e-8f;
-    const float raw =
-        raw_inputs[cand * kInputDim + t];
-    s_x[t] = (raw - w->x_means[t]) / std_val;
+    s_x[t] = NeuroPressStandardize(w, t, raw_inputs[cand * kInputDim + t]);
   }
   __syncthreads();
 
@@ -672,11 +735,7 @@ __global__ void InferKernelFull(const NeuroPressGpuWeights *__restrict__ w,
   __shared__ float s_y[kOutputDim];
 
   if (t < kInputDim) {
-    float std_val = w->x_stds[t];
-    if (std_val < 1e-8f) std_val = 1e-8f;
-    const float raw =
-        raw_inputs[cand * kInputDim + t];
-    s_x[t] = (raw - w->x_means[t]) / std_val;
+    s_x[t] = NeuroPressStandardize(w, t, raw_inputs[cand * kInputDim + t]);
   }
   __syncthreads();
 
@@ -802,9 +861,7 @@ __global__ void InferKernelDeviceStats(
     } else {
       raw = static_cast<float>(stats->second_derivative);
     }
-    float std_val = w->x_stds[t];
-    if (std_val < 1e-8f) std_val = 1e-8f;
-    s_x[t] = (raw - w->x_means[t]) / std_val;
+    s_x[t] = NeuroPressStandardize(w, t, raw);
   }
   __syncthreads();
 
@@ -1003,11 +1060,8 @@ __global__ void DecompHeadSGDKernel(
       raw[5] = samples[si].entropy;
       raw[6] = samples[si].mad;
       raw[7] = samples[si].second_derivative;
-      for (int i = 0; i < kInputDim; ++i) {
-        float sd = w->x_stds[i];
-        if (sd < 1e-8f) sd = 1e-8f;
-        s_x[i] = (raw[i] - w->x_means[i]) / sd;
-      }
+      for (int i = 0; i < kInputDim; ++i)
+        s_x[i] = NeuroPressStandardize(w, i, raw[i]);
     }
     __syncthreads();
 
@@ -1678,10 +1732,7 @@ __device__ __forceinline__ void SgdForwardAndErrors(
           raw = static_cast<float>(device_stats->second_derivative);
         }
       }
-      float std_val = w->x_stds[t];
-      if (std_val < 1e-8f) std_val = 1e-8f;
-      w->act_x[si][t] =
-          (raw - w->x_means[t]) / std_val;
+      w->act_x[si][t] = NeuroPressStandardize(w, t, raw);
     }
     __syncthreads();
 
@@ -1792,7 +1843,8 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
                           int num_samples, float learning_rate,
                           float *__restrict__ ema, bool *out_applied,
                           const ctp::DeviceFeatureStats *__restrict__
-                              device_stats) {
+                              device_stats,
+                          float out_delta) {
   int t = threadIdx.x;  // 0..63
   __shared__ float s_reduce[kHiddenDim];
 
@@ -2044,6 +2096,85 @@ __global__ void SGDKernel(NeuroPressGpuWeights *w,
     ema[i] = kEmaDecay * ema[i] + ema_new * w->combined[i];
   __syncthreads();
 
+  // ---- Output-space trust region. Clio addition; upstream has no analogue.
+  //
+  // `step` is bounded in PARAMETER space, at kMaxStep, on a unit direction.
+  // What that does to the PREDICTION depends entirely on the input: measured
+  // on the shipped weights, one 0.02 step along the ratio-head gradient moves
+  // the head by ~0.5 sigma on a Nyx chunk and by ~7 sigma on a LAMMPS chunk
+  // whose MAD sits 365 training sigmas outside the feature bounds -- inputs
+  // of that size drive the activations to ~250 and the head's raw output to
+  // +24 against a target of -1.2. A 7-sigma step onto a 0.5-clamped error
+  // overshoots the target every time; the error flips sign, the anti-flip
+  // damping halves the next step, momentum carries it back over, and the
+  // prediction random-walks between the 0.1 floor and the 100x cap (std 39.9
+  // around a mean of 25.4 over 666 position chunks, direction reversing on
+  // 45% of steps). The trunk moves under every other field meanwhile, which
+  // is how force's error GREW 18% over a run in which its gate fired on 94%
+  // of chunks.
+  //
+  // So bound the step by its effect on the heads instead: the forward-mode
+  // directional derivative of each selection output along the update
+  // direction, from the activations SgdForwardAndErrors already stored. It
+  // is exact, costs one pass over the layers per sample, and never touches
+  // params. Inside the training range dy is ~0.5/step and the bound at 0.5
+  // is nearly inert; on the inputs above it shrinks the step ~14x, which is
+  // what descent needs there. Row 1 of W5 and b5[1] are withheld from the
+  // update below, so head 1's tangent carries the trunk term only.
+  if (out_delta > 0.0f) {
+    __shared__ float s_tan_a[kHiddenDim];
+    __shared__ float s_tan_b[kHiddenDim];
+    float dy_local = 0.0f;
+    for (int si = 0; si < num_samples; ++si) {
+      // L1: dz1 = dW1 x + db1. The input is fixed, so there is no dx term.
+      float dz = ema[kOffB1 + t];
+      for (int i = 0; i < kInputDim; ++i)
+        dz += ema[kOffW1 + t * kInputDim + i] * w->act_x[si][i];
+      s_tan_a[t] = (w->act_z1[si][t] > 0.0f) ? dz : 0.0f;
+      __syncthreads();
+      // L2: dz2 = dW2 h1 + W2 dh1 + db2, and likewise below.
+      dz = ema[kOffB2 + t];
+      for (int i = 0; i < kHiddenDim; ++i)
+        dz += ema[kOffW2 + t * kHiddenDim + i] * w->act_h1[si][i] +
+              w->params[kOffW2 + t * kHiddenDim + i] * s_tan_a[i];
+      s_tan_b[t] = (w->act_z2[si][t] > 0.0f) ? dz : 0.0f;
+      __syncthreads();
+      dz = ema[kOffB3 + t];
+      for (int i = 0; i < kHiddenDim; ++i)
+        dz += ema[kOffW3 + t * kHiddenDim + i] * w->act_h2[si][i] +
+              w->params[kOffW3 + t * kHiddenDim + i] * s_tan_b[i];
+      s_tan_a[t] = (w->act_z3[si][t] > 0.0f) ? dz : 0.0f;
+      __syncthreads();
+      dz = ema[kOffB4 + t];
+      for (int i = 0; i < kHiddenDim; ++i)
+        dz += ema[kOffW4 + t * kHiddenDim + i] * w->act_h3[si][i] +
+              w->params[kOffW4 + t * kHiddenDim + i] * s_tan_a[i];
+      s_tan_b[t] = (w->act_z4[si][t] > 0.0f) ? dz : 0.0f;
+      __syncthreads();
+      // Heads 0..3, only where this sample carried an error for that head.
+      if (t < 4 && w->d5_raw[si][t] != 0.0f) {
+        float dy = 0.0f;
+        for (int i = 0; i < kHiddenDim; ++i) {
+          dy += w->params[kOffW5 + t * kHiddenDim + i] * s_tan_b[i];
+          if (t != 1) dy += ema[kOffW5 + t * kHiddenDim + i] * w->act_h4[si][i];
+        }
+        if (t != 1) dy += ema[kOffB5 + t];
+        dy_local = fmaxf(dy_local, fabsf(dy));
+      }
+      __syncthreads();
+    }
+    s_reduce[t] = dy_local;
+    __syncthreads();
+    for (int s2 = kHiddenDim / 2; s2 > 0; s2 >>= 1) {
+      if (t < s2) s_reduce[t] = fmaxf(s_reduce[t], s_reduce[t + s2]);
+      __syncthreads();
+    }
+    const float dy_max = s_reduce[0];
+    __syncthreads();
+    // params -= step * ema, so a head moves by about step * dy_max.
+    if (isfinite(dy_max) && dy_max * step > out_delta) step = out_delta / dy_max;
+  }
+
   if (t == 0) w->sgd_call_count += 1;
 
   bool finite_ok = isfinite(step) && isfinite(g_norm);
@@ -2287,7 +2418,7 @@ bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
   } else {
     SGDKernel<<<1, kHiddenDim, 0, g.stream>>>(
         w, static_cast<const NeuroPressGpuSGDSample *>(sc.d_samples),
-        num_samples, lr, ema, d_applied, d_stats);
+        num_samples, lr, ema, d_applied, d_stats, opt.out_delta);
   }
   if (cudaGetLastError() != cudaSuccess) return false;
 

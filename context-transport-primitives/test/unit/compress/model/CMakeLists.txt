@@ -12,7 +12,8 @@ add_executable(test_compress_model_exec
         test_prediction_reuse_state.cc
         test_prediction_reuse.cc
         test_prediction_reuse_gpu.cc
-        test_compress_factory_gpu.cc)
+        test_compress_factory_gpu.cc
+        test_sgd_output_bound.cc)
 
 add_dependencies(test_compress_model_exec clio_ctp_compress_model)
 target_link_libraries(test_compress_model_exec
@@ -43,6 +44,17 @@ add_test(NAME ctp_neuropress_adaptive_sgd COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_compress_model_exec "[.np_adaptive]")
 set_tests_properties(ctp_neuropress_adaptive_sgd PROPERTIES
         ENVIRONMENT "CLIO_NEUROPRESS_SGD_RULE=adaptive")
+
+# The goal case for the online-SGD fixes: each LAMMPS field converging to its
+# OWN target. It cannot pass until the model gets a per-lineage residual --
+# position and force are indistinguishable in the three input statistics while
+# their targets differ 2.2x -- so it is hidden by default
+# ([.pending_lineage_residual]) and run here as its own expected-to-fail ctest.
+# WHEN IT STARTS PASSING, REMOVE THE WILL_FAIL PROPERTY: that is the forcing
+# function that turns the goal into a guarantee.
+add_test(NAME ctp_neuropress_lineage_goal COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_compress_model_exec "[.pending_lineage_residual]")
+set_tests_properties(ctp_neuropress_lineage_goal PROPERTIES WILL_FAIL TRUE)
 
 install(TARGETS test_compress_model_exec
         LIBRARY DESTINATION lib

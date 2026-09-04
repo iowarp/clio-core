@@ -19,6 +19,7 @@
 #ifndef CLIO_CTP_COMPRESS_MODEL_NEUROPRESS_NN_GPU_KERNELS_H_
 #define CLIO_CTP_COMPRESS_MODEL_NEUROPRESS_NN_GPU_KERNELS_H_
 
+#include <cmath>
 #include <cstddef>
 
 #include "clio_ctp/compress/preprocess/prediction_reuse_gpu.h"
@@ -39,7 +40,51 @@ struct NeuroPressGpuWeights;
 NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len,
                                         const float *biases, size_t biases_len,
                                         const float *x_means, const float *x_stds,
-                                        const float *y_means, const float *y_stds);
+                                        const float *y_means, const float *y_stds,
+                                        const float *x_mins = nullptr,
+                                        const float *x_maxs = nullptr);
+
+#if defined(__CUDACC__)
+#define CTP_NN_HD __host__ __device__
+#else
+#define CTP_NN_HD
+#endif
+
+/**
+ * @brief Soft-bound one standardised input to the training range.
+ *
+ * `s` is an input already standardised as (raw - mean) / std; `lo` and `hi`
+ * are the .nnwt feature bounds in the same units. Identity inside [lo, hi].
+ * Beyond either bound the excess is compressed logarithmically:
+ * hi + log1p(s - hi), and symmetrically below. Continuous at the bound,
+ * strictly monotone everywhere, so order between out-of-range chunks is kept
+ * while their magnitude is not.
+ *
+ * Why not the identity, which is what upstream does: the shipped weights were
+ * fit on mad <= 0.50 and second_deriv <= 1.006, and LAMMPS float32 state
+ * presents mad = 39 and second_deriv = 99 -- 365 and 467 training sigmas out.
+ * Fed raw, those drive the hidden activations to ~250 and the ratio head's raw
+ * output to +24 against a cap at 2.04 (position predicted 25x, delivered
+ * 1.06x). Worse, they make the trunk's response to ANY weight change
+ * asymmetric: a step that moves an in-range chunk's prediction by 0.5 sigma
+ * moves an out-of-range chunk's by 5-7 sigma, so every in-range SGD call on a
+ * mixed stream kicks the out-of-range predictions across the whole output
+ * range. Under this bound the same chunk lands at ~9 sigma instead of 365,
+ * and the asymmetry is gone.
+ *
+ * Why not a hard clip: velocity (mad 1.53) and position (mad 38.9) would both
+ * clip to 0.50 and become the same input with different targets.
+ *
+ * The bounds ship IN the .nnwt (v2, "feature bounds") and were previously
+ * loaded and ignored. Applied identically by every inference kernel and by
+ * SGD -- one function -- so training never sees a different input than the
+ * prediction was made from. The weights themselves are untouched.
+ */
+CTP_NN_HD inline float NeuroPressSoftBoundSigma(float s, float lo, float hi) {
+  if (s > hi) return hi + log1pf(s - hi);
+  if (s < lo) return lo - log1pf(lo - s);
+  return s;
+}
 
 /** @brief Free a handle returned by NeuroPressGpuLoad(). No-op on nullptr. */
 void NeuroPressGpuFree(NeuroPressGpuWeights *w);
