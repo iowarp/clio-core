@@ -70,6 +70,16 @@ inline void TestSetenv(const char *name, const char *value, int overwrite) {
 #endif
 }
 
+/** Remove a variable from this process's environment. Windows spells "unset"
+ *  as "assign the empty string" -- _putenv_s(name, "") deletes the entry. */
+inline void TestUnsetenv(const char *name) {
+#ifdef _WIN32
+  (void)_putenv_s(name, "");
+#else
+  (void)unsetenv(name);
+#endif
+}
+
 /** access(path, F_OK) stand-in. The error_code overload is deliberate: one
  *  call site probes a "clio::"-marked name, and a bare colon in a path makes
  *  the throwing overload unhappy on Windows. */
@@ -404,6 +414,37 @@ int main() {
   // of sub-4 KiB metadata I/O still covers the single-pass case. Must be set
   // before the driver's first use -- it is read once.
   TestSetenv("CLIO_VFD_MAX_IO_BYTES", "4096", /*overwrite*/ 0);
+
+  // Section 9 asserts that a failed open leaves the DRIVER's own error on
+  // HDF5's stack, and HDF5_PLUGIN_PATH makes that unobservable -- so make this
+  // process's environment a precondition of the suite instead of a property of
+  // whoever launched it. The dashboard exports HDF5_PLUGIN_PATH for the VOL
+  // tests (clio-core-cdash-c.dev.slurm), ctest runs every test in that one
+  // environment, and section 9 then failed on the dashboard while passing
+  // everywhere else.
+  //
+  // Why it breaks, traced rather than guessed. With a plugin path set, a failed
+  // H5Fopen on a FAPL using the default VOL connector does not simply fail:
+  // H5VL_file_open searches the path for a connector that might read the file,
+  // registering each candidate and probing it with H5VL_FILE_IS_ACCESSIBLE ->
+  // H5F__is_hdf5 -> H5FD_open. So this driver's open() runs TWICE for one
+  // H5Fopen, and instrumenting both passes showed:
+  //
+  //   open ENTER absent.h5 depth=0
+  //   pushed 'authoritative native file' depth=1   <- pass 1 records it
+  //   open ENTER absent.h5 depth=0                 <- already wiped
+  //   pushed 'authoritative native file' depth=0   <- suppressed
+  //
+  // Pass 1's error is gone before pass 2 even begins (HDF5 clears the stack
+  // while setting up the candidate connector), and pass 2 runs inside
+  // H5E_PAUSE_ERRORS, where H5Epush2 honours estack->paused and records
+  // nothing. The application is left with only HDF5's generic "open failed".
+  // That is HDF5 losing a VFD's diagnostics -- it would do the same to sec2 --
+  // not this driver failing to report, which the trace above proves it does.
+  //
+  // The plugin path is still supplied explicitly to the one child process that
+  // needs it (see the CLIO_VFD_TRACE section), which is where it belongs.
+  TestUnsetenv("HDF5_PLUGIN_PATH");
 
   if (!InitRuntime()) {
     std::fprintf(stderr, "[vfd-suite] FAIL: runtime/CTE init\n");

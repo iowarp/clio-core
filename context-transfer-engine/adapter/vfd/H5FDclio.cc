@@ -150,6 +150,51 @@ unsigned long H5FDclio_cache_truncate_failures_g = 0;
     }                                                                      \
   } while (0)
 
+/* Ask a FAPL a question without HDF5 reporting an error we did not have.
+ *
+ * H5Pget_driver_info() documents that a FAPL carrying no driver-info block
+ * returns NULL "although no error is pushed on the stack in this case". HDF5
+ * 2.x pushes H5E_PLIST/H5E_CANTGET whenever the block is absent (H5Pfapl.c),
+ * and being an API function it auto-prints on the way out -- so every open of
+ * a FAPL built the documented way, H5Pset_driver(fapl, id, NULL), emitted an
+ * HDF5-DIAG block reporting a failure that did not happen. Thirteen per run of
+ * the VFD suite, in a dashboard log people are supposed to read.
+ *
+ * "Absent" is a legitimate answer to this question, so silence the auto-printer
+ * for the duration of the call and put back the stack the enclosing operation
+ * was accumulating. Both halves are needed: the printing happens inside the
+ * call (H5E_dump_api_stack at FUNC_LEAVE_API), so restoring the stack
+ * afterwards does not stop it. Neither H5Eget_current_stack nor
+ * H5Eset_current_stack touches the pause counter, so HDF5's own error
+ * bookkeeping is unaffected.
+ *
+ * Scope this around the QUERY ONLY -- a diagnostic the driver pushes while it
+ * is in scope would be discarded by the restore. */
+class H5FD__clio_QuietQuery {
+ public:
+  H5FD__clio_QuietQuery() : saved_(H5Eget_current_stack()) {
+    H5Eget_auto2(H5E_DEFAULT, &auto_func_, &auto_data_);
+    H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
+  }
+  ~H5FD__clio_QuietQuery() {
+    H5Eset_auto2(H5E_DEFAULT, auto_func_, auto_data_);
+    if (saved_ >= 0) {
+      /* Restores the saved entries and closes saved_; on failure the id still
+         must not leak. */
+      if (H5Eset_current_stack(saved_) < 0) {
+        H5Eclose_stack(saved_);
+      }
+    }
+  }
+  H5FD__clio_QuietQuery(const H5FD__clio_QuietQuery &) = delete;
+  H5FD__clio_QuietQuery &operator=(const H5FD__clio_QuietQuery &) = delete;
+
+ private:
+  hid_t saved_;
+  H5E_auto2_t auto_func_ = nullptr;
+  void *auto_data_ = nullptr;
+};
+
 /* POSIX I/O mode used as the third parameter to open/_open
  * when creating a new file (O_CREAT is set). */
 #if defined(H5_HAVE_WIN32_API)
@@ -334,6 +379,14 @@ typedef struct H5FD_clio_fapl_t {
   hbool_t fsync_on_flush; /* fsync(2) the native file in flush (default off) */
   size_t sieve_max;      /* vector-I/O coalescing window, bytes (0 = off) */
 } H5FD_clio_fapl_t;
+
+/* The driver-specific FAPL block, or NULL when the FAPL carries none (the
+ * default-policy open). Reports nothing either way -- see
+ * H5FD__clio_QuietQuery. */
+static const H5FD_clio_fapl_t *H5FD__clio_peek_fapl(hid_t fapl_id) {
+  H5FD__clio_QuietQuery quiet;
+  return (const H5FD_clio_fapl_t *)H5Pget_driver_info(fapl_id);
+}
 
 /* Coalescing window for vector I/O. 64 KiB matches HDF5's own default sieve
  * buffer (H5Pset_sieve_buf_size), which is the mechanism this replaces for
@@ -686,8 +739,7 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
 
   // Driver-specific FAPL config: use the caller's policy if a driver-info block
   // was set (H5Pset_fapl_clio), else the default (cache on).
-  const H5FD_clio_fapl_t *fa_in =
-      (const H5FD_clio_fapl_t *)H5Pget_driver_info(fapl_id);
+  const H5FD_clio_fapl_t *fa_in = H5FD__clio_peek_fapl(fapl_id);
   H5FD_clio_fapl_t fa = fa_in ? *fa_in : H5FD_clio_fapl_default_g;
 
   /* Driver config string. HDF5 does not hand this to a callback the way it does
@@ -1965,8 +2017,7 @@ herr_t H5Pget_fapl_clio(hid_t fapl_id, hbool_t *cache_enabled /*out*/) {
   // No driver-info block means the file would open with the default policy
   // (H5Pset_driver(fapl, driver, NULL)); report that same default so the getter
   // always describes what an open would actually do.
-  const H5FD_clio_fapl_t *fa =
-      (const H5FD_clio_fapl_t *)H5Pget_driver_info(fapl_id);
+  const H5FD_clio_fapl_t *fa = H5FD__clio_peek_fapl(fapl_id);
   *cache_enabled =
       fa ? fa->cache_enabled : H5FD_clio_fapl_default_g.cache_enabled;
   return SUCCEED;
