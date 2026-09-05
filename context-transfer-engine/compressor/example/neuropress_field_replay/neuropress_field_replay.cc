@@ -187,6 +187,13 @@ struct BlobRecord {
   double ratio = 0.0;
   size_t stored = 0;
   double ms = 0.0;
+  // Quantize + byte-shuffle kernel time for this chunk, separate from `ms`
+  // (the codec launch alone). Reported so a caller can measure the work that
+  // happens AFTER the data is device-resident: preproc_ms + compress_ms.
+  double preproc_ms = 0.0;
+  // Host-to-device staging for this chunk; 0 when the caller was already
+  // device-resident (in situ) or staging was not requested.
+  double h2d_ms = 0.0;
   // MEASURED decompression time (CUDA events around the codec call alone), or
   // <0 when nothing measured one. Needs CLIO_NEUROPRESS_EXPLORE_MEASURE_DT.
   // Same field, same clock and same caveat as the LAMMPS driver's dt_ms: NOT
@@ -461,6 +468,8 @@ int main(int argc, char **argv) {
       r.lib = c.compress_lib_;
       r.ratio = c.actual_compression_ratio_;
       r.ms = c.actual_compress_time_ms_;
+      r.preproc_ms = c.actual_preproc_time_ms_;
+      r.h2d_ms = c.actual_h2d_time_ms_;
       r.dt_ms = c.actual_decompress_time_ms_;
       // lib == 0 marks "stored raw": the codec did not shrink the chunk and
       // the caller's bytes went to the tier untouched, so the stored size is
@@ -588,15 +597,15 @@ int main(int argc, char **argv) {
     // and brotli merely happens to occupy wire id 0 in the factory registry --
     // so NameForWireId(0) answers "brotli" and a chunk that was never
     // compressed reads as a codec that never ran. Name the outcome instead.
-    csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,"
-           "decompress_ms,rc,stored_ratio\n";
+    csv << "blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,preproc_ms,"
+           "h2d_ms,decompress_ms,rc,stored_ratio\n";
     for (const auto &r : records)
       csv << r.name << ',' << r.bytes << ',' << std::hex << r.digest << std::dec
           << ',' << r.lib << ','
           << (r.lib == 0 ? std::string("raw(not-beneficial)")
                          : ctp::CompressionFactory::NameForWireId(r.lib))
           << ',' << r.ratio << ',' << r.stored << ',' << r.ms << ','
-          << r.dt_ms << ',' << (r.ok ? 0 : 1) << ','
+          << r.preproc_ms << ',' << r.h2d_ms << ',' << r.dt_ms << ',' << (r.ok ? 0 : 1) << ','
           << (r.stored ? double(r.bytes) / double(r.stored) : 0.0) << '\n';
   }
 

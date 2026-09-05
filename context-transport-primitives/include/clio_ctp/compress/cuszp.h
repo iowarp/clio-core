@@ -126,8 +126,12 @@ class Cuszp : public Compressor {
 
       size_t cmp_size = 0;
       uint3 dims = {0, 0, 0};  // ignored for 1D
+      // Same CUDA-event bracket as nvcomp -- see cusz.h.
+      // Stopped right after the codec call -- see cusz.h.
+      CodecKernelTimer _kt(stream);
       cuSZp_compress(d_in, d_cmp, n, &cmp_size, eb_, CUSZP_DIM_1D, dims,
                      CUSZP_TYPE_FLOAT, mode_, stream);
+      _kt.Stop();
       if (cudaStreamSynchronize(stream) != cudaSuccess) break;
       if (cudaGetLastError() != cudaSuccess || cmp_size == 0) break;
 

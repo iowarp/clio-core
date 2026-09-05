@@ -158,6 +158,27 @@ struct CompressorConfig {
    * it is no longer comparable with upstream.
    */
   clio::run::u32 neuropress_static_shuffle_ = 0;
+  /**
+   * Apply linear quantization to the static codec's input, at the run's
+   * error bound. Only meaningful alongside neuropress_static_lib_.
+   *
+   * Upstream's non-AUTO path carries quantize and shuffle as INDEPENDENT
+   * preprocessing flags -- GPUCOMPRESS_PREPROC_QUANTIZE (0x10) and
+   * GPUCOMPRESS_PREPROC_SHUFFLE_4 (0x02) -- and applies the first when the
+   * flag is set AND the error bound is positive
+   * (gpucompress_compress.cpp:434). This mirrors that: the bit is a REQUEST,
+   * and the actual decision still needs error_bound > 0, checked where
+   * upstream checks it.
+   *
+   * WHY IT EXISTS. Without it the static path can only express the 16
+   * LOSSLESS actions of the 32-action space, so a "best fixed codec" control
+   * is forced to compete lossless against a lossy selector. Measured on VPIC:
+   * static ans+shuffle4 reached 1.235x while NeuroPress at eb 1e-3 reached
+   * 4.825x -- a 4x gap that is an artifact of the control, not a result. The
+   * per-chunk oracle picks a QUANTIZED action on most chunks of every
+   * workload measured, so a control that cannot quantize is not a baseline.
+   */
+  bool neuropress_static_quantize_ = false;
   std::string trace_folder_path_;
   clio::run::PoolId next_pool_id_;  ///< Pool ID of the next module in the pipeline
                                ///< (e.g., CTE core at 513.0)
@@ -192,6 +213,7 @@ struct CompressorConfig {
         neuropress_best_mode_(other.neuropress_best_mode_),
         neuropress_static_lib_(other.neuropress_static_lib_),
         neuropress_static_shuffle_(other.neuropress_static_shuffle_),
+        neuropress_static_quantize_(other.neuropress_static_quantize_),
         trace_folder_path_(other.trace_folder_path_),
         next_pool_id_(other.next_pool_id_),
         tracking_enabled_(other.tracking_enabled_) {
@@ -211,7 +233,7 @@ struct CompressorConfig {
        neuropress_exploration_enabled_,
        neuropress_exploration_threshold_, neuropress_exploration_k_,
        neuropress_best_mode_, neuropress_static_lib_,
-       neuropress_static_shuffle_,
+       neuropress_static_shuffle_, neuropress_static_quantize_,
        trace_folder_path_, next_pool_id_, tracking_enabled_);
   }
 
@@ -306,6 +328,10 @@ struct CompressorConfig {
         if (node["neuropress_static_shuffle"]) {
           neuropress_static_shuffle_ =
               node["neuropress_static_shuffle"].as<clio::run::u32>();
+        }
+        if (node["neuropress_static_quantize"]) {
+          neuropress_static_quantize_ =
+              node["neuropress_static_quantize"].as<bool>();
         }
         // Exhaustive-search measurement mode. Widens the exploration gate
         // rather than opening it, so the runtime forces exploration on and K

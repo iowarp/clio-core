@@ -284,6 +284,12 @@ struct DeviceStatsScratch {
      statistics, so a double chunk is CONVERTED before it is measured. */
   float *d_narrow = nullptr;
   size_t narrow_capacity = 0;
+  /* 8-byte min/max result for DeviceMinMax, which QuantizeDevice calls once
+     per chunk. It used to cudaMalloc and cudaFree this every call: 2000 chunks
+     meant 2000 allocator round trips to move 8 bytes, and cudaMalloc can
+     serialize against the device. That is the same defect the comment above
+     records for ComputeDeviceStatsTyped, in the one place it was not fixed. */
+  unsigned int *d_minmax = nullptr;
   bool ok = false;
 };
 
@@ -294,7 +300,8 @@ DeviceStatsScratch &Scratch() {
             cudaMalloc(&p->d_hist, kHistBins * sizeof(unsigned int)) ==
                 cudaSuccess &&
             cudaMalloc(&p->d_scalars, 3 * sizeof(double)) == cudaSuccess &&
-            cudaMalloc(&p->d_stats, sizeof(DeviceFeatureStats)) == cudaSuccess;
+            cudaMalloc(&p->d_stats, sizeof(DeviceFeatureStats)) == cudaSuccess &&
+            cudaMalloc(&p->d_minmax, 2 * sizeof(unsigned int)) == cudaSuccess;
     return p;
   }();
   return *s;
@@ -836,8 +843,16 @@ bool DeviceMinMax(const float *d_in, size_t n, double *out_min,
   // next launch check would attribute it to this kernel.
   cudaGetLastError();
 
-  unsigned int *d_res = nullptr;
-  if (cudaMalloc(&d_res, 2 * sizeof(unsigned int)) != cudaSuccess) return false;
+  // Per-thread scratch rather than a fresh allocation per chunk. Falls back to
+  // a local cudaMalloc only if the cached buffer could not be created, so a
+  // scratch failure degrades instead of failing the compression.
+  DeviceStatsScratch &sc = Scratch();
+  unsigned int *d_res = sc.d_minmax;
+  bool owns = false;
+  if (d_res == nullptr) {
+    if (cudaMalloc(&d_res, 2 * sizeof(unsigned int)) != cudaSuccess) return false;
+    owns = true;
+  }
   unsigned int init[2] = {0xFFFFFFFFu, 0u};
   bool ok = cudaMemcpyAsync(d_res, init, sizeof(init), cudaMemcpyHostToDevice,
                             stream) == cudaSuccess;
@@ -857,7 +872,7 @@ bool DeviceMinMax(const float *d_in, size_t n, double *out_min,
              cudaSuccess &&
          cudaStreamSynchronize(stream) == cudaSuccess;
   }
-  cudaFree(d_res);
+  if (owns) cudaFree(d_res);
   if (!ok) return false;
 
   *out_min = static_cast<double>(KeyToFloat(h[0]));

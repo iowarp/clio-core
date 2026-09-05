@@ -158,7 +158,7 @@ done
 # reach BOTH the ranking and the SGD gate (they are one set of globals
 # upstream, and Clio follows that).
 NP_LEARN=false NP_EXPLORE=false EXPLORE_K=0 THRESH=0.5 BEST=false
-STATIC_LIB="" STATIC_SHUF=0
+STATIC_LIB="" STATIC_SHUF=0 STATIC_QUANT=false
 COST_ENV=()
 # Which of the two cost models this config asks for, recorded in meta.json so
 # a run is self-describing. The pre-existing configs keep their historical
@@ -208,9 +208,32 @@ case "$CONFIG" in
   static-zstd)    STATIC_LIB=nvcomp-zstd; STATIC_SHUF=0 ;;
   static-zstd-s4) STATIC_LIB=nvcomp-zstd; STATIC_SHUF=4 ;;
   static-zstd-s8) STATIC_LIB=nvcomp-zstd; STATIC_SHUF=8 ;;
+  # Generic fixed-codec arm: static-<lib>[-sN], e.g. static-cusz, static-ndzip,
+  # static-cuszp, static-bitcomp-s4. Named codecs above keep their historical
+  # spellings; this only adds names that had none. An nvcomp codec may be
+  # written bare ("bitcomp" -> "nvcomp-bitcomp"); external ones (cusz, cuszp,
+  # ndzip) are passed through as-is. An unknown name is NOT silently accepted:
+  # WireIdForName falls back to zstd, which would produce a plausible result
+  # for the wrong codec, so the runner's codec census must be checked.
+  static-*)
+    # static-<lib>[-q][-sN]: -q applies the run's error bound as linear
+    # quantization, -sN a byte shuffle of N. They are INDEPENDENT, matching
+    # upstream's PREPROC_QUANTIZE / PREPROC_SHUFFLE_4 flags. Without -q a
+    # fixed-codec arm can only reach the 16 LOSSLESS actions of the 32-action
+    # space, so it competes lossless against a lossy selector -- which is a
+    # broken control, not a baseline. -q is inert unless --eb is positive,
+    # the same gate upstream applies.
+    _spec=${CONFIG#static-}
+    case "$_spec" in *-s[0-9]*) STATIC_SHUF=${_spec##*-s}; _spec=${_spec%-s*} ;; esac
+    case "$_spec" in *-q)       STATIC_QUANT=true;         _spec=${_spec%-q} ;; esac
+    case "$_spec" in
+      cusz|cuszp|ndzip|zfp-sycl) STATIC_LIB=$_spec ;;
+      nvcomp-*)                  STATIC_LIB=$_spec ;;
+      *)                         STATIC_LIB=nvcomp-$_spec ;;
+    esac ;;
   *) echo "unknown config: $CONFIG" >&2; sed -n '2,34p' "$0" >&2; exit 2;;
 esac
-export NP_LEARN NP_EXPLORE EXPLORE_K THRESH BEST STATIC_LIB STATIC_SHUF
+export NP_LEARN NP_EXPLORE EXPLORE_K THRESH BEST STATIC_LIB STATIC_SHUF STATIC_QUANT
 
 # A positive error bound means the decompressed bytes are NOT the bytes that
 # went in, by design. Every verify path here is an FNV-1a digest comparison, so

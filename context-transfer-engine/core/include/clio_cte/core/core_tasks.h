@@ -1602,6 +1602,29 @@ struct Context {
   double actual_compression_ratio_;  // Actual compression ratio
                                      // (original/compressed)
   double actual_compress_time_ms_;   // Actual compression time in milliseconds
+  // MEASURED preprocessing time: the quantize and byte-shuffle kernels, summed,
+  // for this chunk. SEPARATE from actual_compress_time_ms_ on purpose -- that
+  // one is a CUDA-event bracket around the CODEC LAUNCH ALONE, because it feeds
+  // the exploration winner, the SGD compression-time target and the error_pct
+  // gate, and must keep matching the kernel time NeuroPress was trained
+  // against. Folding preprocessing into it would silently move all three.
+  //
+  // Reported so a caller can time the work that happens AFTER the data is on
+  // the device: preprocess + codec. Without it the only available window was
+  // stage+compress, which also contains the H2D copy -- on a 2 MiB-chunk replay
+  // that copy was ~15 s against ~0.5 s of codec, swamping every difference.
+  // 0.0 when neither transform ran, which is the lossless, unshuffled case.
+  double actual_preproc_time_ms_;
+  // MEASURED host-to-device staging for this chunk, when the caller handed over
+  // HOST memory and CLIO_NEUROPRESS_STAGE_H2D asked for a copy. 0.0 in situ,
+  // where the producer already owns device memory and nothing is copied.
+  //
+  // Measured rather than inferred. Subtracting phase totals to "get H2D" yields
+  // a residual that is mostly runtime plumbing: on vpic/smoke that residual was
+  // 7.25 ms/chunk while the copy itself is 0.084 ms/chunk (3.91 GiB at PCIe4) --
+  // off by ~86x. Timed with the same CUDA-event bracket as the codec and the
+  // preprocessing kernels so every component of the metric is comparable.
+  double actual_h2d_time_ms_;
   // MEASURED decompression time, in milliseconds, or < 0 when nothing measured
   // one -- which is the default, because nothing on the WRITE path needs to
   // decompress. It is filled only when CLIO_NEUROPRESS_EXPLORE_MEASURE_DT asks
@@ -1653,6 +1676,8 @@ struct Context {
         actual_compressed_size_(0),
         actual_compression_ratio_(1.0),
         actual_compress_time_ms_(0.0),
+        actual_preproc_time_ms_(0.0),
+        actual_h2d_time_ms_(0.0),
         actual_decompress_time_ms_(-1.0),
         actual_psnr_db_(-1.0) {
   }
@@ -1671,6 +1696,7 @@ struct Context {
              consumer_node_, data_type_, trace_, trace_key_, trace_node_,
              actual_original_size_, actual_compressed_size_,
              actual_compression_ratio_, actual_compress_time_ms_,
+             actual_preproc_time_ms_, actual_h2d_time_ms_,
              actual_decompress_time_ms_, actual_psnr_db_);
   }
 

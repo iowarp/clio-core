@@ -143,11 +143,21 @@ class Cusz : public Compressor {
       uint8_t *d_comp = nullptr;  // device buffer owned by the manager
       size_t comp_bytes = 0;
       psz_rc2 rc = {mode_, eb_, kRadius};
+      // Timed with the same CUDA-event bracket nvcomp uses, so this codec is
+      // comparable with the ones it is benchmarked against. Without it the
+      // runtime falls back to host wall clock around all of Compress().
+      // STOPPED IMMEDIATELY AFTER THE CODEC CALL. If the timer were left to
+      // its destructor at end of block it would also cover the output copies
+      // and the final stream sync -- exactly the over-broad window this
+      // bracket exists to replace. Stop() is idempotent, so the destructor
+      // firing on the `break` path is harmless.
+      CodecKernelTimer _kt(stream);
       if (psz_compress_float(mgr, rc, d_in, &prefix.header, &d_comp,
                              &comp_bytes) != 0 ||
           d_comp == nullptr) {
         break;
       }
+      _kt.Stop();
 
       const size_t total = sizeof(Prefix) + comp_bytes;
       if (total > output_size) break;  // caller buffer too small

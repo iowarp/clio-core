@@ -674,11 +674,12 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     HLOG(kWarning,
          "Static codec '{}' (resolved '{}', wire {}) is ON for pool '{}': "
          "every chunk uses this library and NeuroPress selection, learning "
-         "and exploration are all disabled (byte shuffle: {}).",
+         "and exploration are all disabled (byte shuffle: {}, quantize: {}).",
          config_.neuropress_static_lib_, resolved, wire, pool_name_,
          config_.neuropress_static_shuffle_ == 0
              ? std::string("off")
-             : std::to_string(config_.neuropress_static_shuffle_) + "-byte");
+             : std::to_string(config_.neuropress_static_shuffle_) + "-byte",
+         config_.neuropress_static_quantize_ ? "on (needs eb>0)" : "off");
     if (resolved != config_.neuropress_static_lib_) {
       HLOG(kWarning,
            "  '{}' is not a registered library; it fell back to '{}'. Check "
@@ -688,6 +689,29 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     // Upstream exposes ONE width: GPUCOMPRESS_PREPROC_SHUFFLE_4, and its NN
     // encodes shuffle as a single bit. 2 and 8 are Clio-only, so a run using
     // one is no longer a like-for-like comparison with NeuroPress.
+    // SELF-QUANTIZING CODECS OWN THE BOUND. cusz and cuszp are error-bounded
+    // lossy compressors: the wrapper hands them the run's eb directly (cusz.h
+    // `psz_rc2 rc = {mode_, eb_, kRadius}`) and they quantize internally.
+    // Running Clio's linear quantizer FIRST and then handing the result to one
+    // of them applies the bound twice, and the two errors compound past it --
+    // a run that reports eb 1e-3 while delivering worse. Upstream refuses the
+    // same combination by ignoring preprocessing flags entirely on its
+    // external path ("cuSZ handles lossy quantization internally",
+    // gpucompress_compress.cpp:57). Dropped rather than rejected so that a
+    // sweep over codecs with a single quantize setting stays runnable.
+    //
+    // ndzip is NOT in this list: it is lossless and models float bit patterns,
+    // so quantize+ndzip is a legitimate lossy pipeline exactly like
+    // quantize+nvcomp-zstd, and the bound is applied exactly once.
+    if (config_.neuropress_static_quantize_ &&
+        (resolved == "cusz" || resolved == "cuszp")) {
+      HLOG(kWarning,
+           "Static codec '{}' quantizes internally at its own error bound; "
+           "ignoring neuropress_static_quantize so the bound is not applied "
+           "twice (upstream ignores preprocessing flags for these too).",
+           resolved);
+      config_.neuropress_static_quantize_ = false;
+    }
     if (config_.neuropress_static_shuffle_ != 0 &&
         config_.neuropress_static_shuffle_ != 4) {
       HLOG(kWarning,
@@ -1391,12 +1415,25 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       CompressionStats fixed{};
       fixed.compress_lib_ =
           ctp::CompressionFactory::WireIdForName(config_.neuropress_static_lib_);
-      // Preset 2 (BALANCED) with no byte shuffle. The GPU codecs are
-      // single_mode -- preset is ignored and the id always uses slot 2 -- and
-      // upstream's non-AUTO algorithms apply no shuffle, so a shuffled
-      // control would not be comparing the same transform.
+      // Preset 2 (BALANCED): the GPU codecs are single_mode, so the preset is
+      // ignored and the id always uses slot 2. Shuffle and quantize ride the
+      // packed preset as INDEPENDENT bits, matching upstream's non-AUTO path,
+      // which carries GPUCOMPRESS_PREPROC_SHUFFLE_4 and
+      // GPUCOMPRESS_PREPROC_QUANTIZE as separate flags on the same config and
+      // encodes both into the action (gpucompress_compress.cpp:180-182).
+      //
+      // The quantize bit is a REQUEST, not a decision: want_quant below still
+      // requires error_bound > 0, the same condition upstream applies at
+      // gpucompress_compress.cpp:434. So a static arm on a lossless run stays
+      // lossless without needing a second switch.
+      //
+      // Precision is written as 32 here only to make the bit well-formed; it
+      // is never read as an input -- the quantizer chooses the precision and
+      // the preset is re-packed with the ACTUAL value once compression has
+      // run. Only the enabled bit is consulted (UnpackQuantEnabled).
       fixed.compress_preset_ = static_cast<int>(
-          PackPreset(2, config_.neuropress_static_shuffle_));
+          PackPreset(2, config_.neuropress_static_shuffle_) |
+          PackQuant(config_.neuropress_static_quantize_, 32));
       fixed.compression_ratio_ = 1.0;
       stats.push_back(fixed);
       ranked_by_cost = true;  // take stats.front() verbatim below
@@ -3122,7 +3159,13 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         task->return_code_ = 1;
         CLIO_CO_RETURN;
       }
-      ctp::GpuApi::Memcpy(staged_in, input_ptr, input_size);
+      {
+        // Same instrument as the codec and preprocessing kernels.
+#if CTP_ENABLE_CUDA
+        ctp::CodecKernelTimer _kt(nullptr, &context.actual_h2d_time_ms_);
+#endif
+        ctp::GpuApi::Memcpy(staged_in, input_ptr, input_size);
+      }
       input_ptr = staged_in;
     }
 
@@ -3231,10 +3274,20 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
           input_size, &quant_buf);
       size_t quant_bytes = 0;
-      if (!quant_device_alloc.IsNull() &&
-          ctp::compress::preprocess::QuantizeDevice(
-              input_ptr, input_size / sizeof(float), context.error_bound_,
-              quant_buf, &quant_bytes, &quant_params)) {
+      // Same CUDA-event instrument as the codec, so the two halves of
+      // clio_s are comparable. A host clock here would also count launch and
+      // sync overhead the codec's bracket excludes.
+      bool _q_ok;
+      {
+#if CTP_ENABLE_CUDA
+        ctp::CodecKernelTimer _kt(nullptr, &context.actual_preproc_time_ms_);
+#endif
+        _q_ok = !quant_device_alloc.IsNull() &&
+            ctp::compress::preprocess::QuantizeDevice(
+                input_ptr, input_size / sizeof(float), context.error_bound_,
+                quant_buf, &quant_bytes, &quant_params);
+      }
+      if (_q_ok) {
         input_ptr = quant_buf;          // still device-resident
         compress_input_size = quant_bytes;
         applied_quant = true;
@@ -3295,9 +3348,16 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         shuffle_device_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
             /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
             compress_input_size, &shuffle_device_buf);
-        if (!shuffle_device_alloc.IsNull() &&
-            ctp::compress::preprocess::ByteShuffleDevice(
-                input_ptr, shuffle_device_buf, compress_input_size, shuffle_elem)) {
+        bool _s_ok;
+        {
+#if CTP_ENABLE_CUDA
+          ctp::CodecKernelTimer _kt(nullptr, &context.actual_preproc_time_ms_);
+#endif
+          _s_ok = !shuffle_device_alloc.IsNull() &&
+              ctp::compress::preprocess::ByteShuffleDevice(
+                  input_ptr, shuffle_device_buf, compress_input_size, shuffle_elem);
+        }
+        if (_s_ok) {
           input_ptr = shuffle_device_buf;  // still on the device
           applied_shuffle = shuffle_elem;
           CLIO_PATH_TRACE(

@@ -36,6 +36,12 @@
 
 // #include "clio_ctp/data_structures/all.h"  // Deleted during hard refactoring
 
+#include <cstddef>
+#include <utility>
+#if CTP_ENABLE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 namespace ctp {
 
 class Compressor {
@@ -95,6 +101,78 @@ inline double &LastCodecKernelMs() {
   static thread_local double ms = -1.0;
   return ms;
 }
+
+#if CTP_ENABLE_CUDA
+/**
+ * CUDA-event bracket around a codec launch, for the wrappers that do not have
+ * nvcomp's manager-owned event pair.
+ *
+ * WHY IT EXISTS. Only nvcomp.h used to time its launch, so cusz, cuszp and
+ * ndzip fell through to compressor_runtime.cc's fallback -- host wall clock
+ * around the whole Compress(), which also covers staging, a cudaMalloc,
+ * configure_compression, the stream sync and the output copy. That made the
+ * external codecs measured with a systematically LARGER instrument than the
+ * nvcomp ones they are compared against. It showed up as an impossibility:
+ * cuSZ's summed compress_ms (28.4 s) exceeded the phase containing it
+ * (23.4 s), a negative residual.
+ *
+ * Events are created once per thread and reused, so a bracket costs two
+ * cudaEventRecords -- the same trade nvcomp's KernelTimer makes.
+ *
+ * A codec that leaves LastCodecKernelMs() at -1 still gets the wall-clock
+ * fallback, so a wrapper that cannot time itself degrades rather than lying.
+ */
+class CodecKernelTimer {
+ public:
+  /**
+   * @param s   stream to bracket on
+   * @param out where to store the elapsed ms; nullptr means LastCodecKernelMs().
+   *
+   * The out-parameter form exists so PREPROCESSING (quantize, byte shuffle) can
+   * be timed with the same instrument as the codec without overwriting the
+   * codec's slot. Mixing instruments inside one metric is exactly the defect
+   * this class was added to remove -- and preprocessing is the LARGER component
+   * on a quantized arm, so measuring it with a host clock while the codec used
+   * CUDA events made the two halves incomparable. It also made the same logical
+   * work instrument-dependent: cusz/cuszp quantize INSIDE their codec and were
+   * event-timed, while an nvcomp arm quantized separately and was host-timed.
+   *
+   * The event pair is thread-local and shared, which is safe because these
+   * brackets are sequential -- preprocessing completes before the codec starts.
+   */
+  explicit CodecKernelTimer(cudaStream_t s = nullptr, double *out = nullptr)
+      : stream_(s), out_(out) {
+    if (!out_) LastCodecKernelMs() = -1.0;
+    auto &e = Events();
+    if (!e.first && cudaEventCreate(&e.first) != cudaSuccess) return;
+    if (!e.second && cudaEventCreate(&e.second) != cudaSuccess) return;
+    on_ = (cudaEventRecord(e.first, stream_) == cudaSuccess);
+  }
+  /** Call after the launch; the elapsed time lands in LastCodecKernelMs(). */
+  void Stop() {
+    if (!on_) return;
+    on_ = false;
+    auto &e = Events();
+    if (cudaEventRecord(e.second, stream_) != cudaSuccess) return;
+    if (cudaEventSynchronize(e.second) != cudaSuccess) return;
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, e.first, e.second) == cudaSuccess) {
+      if (out_) *out_ += static_cast<double>(ms);   // accumulates: quantize + shuffle
+      else      LastCodecKernelMs() = static_cast<double>(ms);
+    }
+  }
+  ~CodecKernelTimer() { Stop(); }
+
+ private:
+  static std::pair<cudaEvent_t, cudaEvent_t> &Events() {
+    static thread_local std::pair<cudaEvent_t, cudaEvent_t> ev{nullptr, nullptr};
+    return ev;
+  }
+  cudaStream_t stream_ = nullptr;
+  double *out_ = nullptr;
+  bool on_ = false;
+};
+#endif  // CTP_ENABLE_CUDA
 
 }  // namespace ctp
 

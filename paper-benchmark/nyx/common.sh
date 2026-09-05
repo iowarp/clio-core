@@ -80,6 +80,7 @@ compose:
     neuropress_best_mode: ${BEST:-false}
 ${STATIC_LIB:+    neuropress_static_lib: "$STATIC_LIB"}
 ${STATIC_LIB:+    neuropress_static_shuffle: ${STATIC_SHUF:-0}}
+${STATIC_LIB:+    neuropress_static_quantize: ${STATIC_QUANT:-false}}
   - mod_name: clio_cte_core
     pool_name: cte_core
     pool_query: local

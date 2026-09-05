@@ -120,7 +120,11 @@ class Ndzip : public Compressor {
 
       auto compressor = ndzip::make_cuda_compressor<value_t>(
           ndzip::compressor_requirements{ext}, stream);
-      compressor->compress(d_in, ext, d_out, d_len);
+      // Same CUDA-event bracket as nvcomp -- see cusz.h.
+      {
+        CodecKernelTimer _kt(stream);
+        compressor->compress(d_in, ext, d_out, d_len);
+      }
 
       ndzip::index_type len_words = 0;
       if (cudaMemcpyAsync(&len_words, d_len, sizeof(ndzip::index_type),
