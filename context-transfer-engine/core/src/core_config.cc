@@ -508,14 +508,22 @@ bool Config::ParseStorageConfig(const YAML::Node &node) {
       device_config.bdev_type_ = device_node["bdev_type"].as<std::string>();
 
       // Validate bdev_type
+      // 's3' and 'gcs' name cloud object-store tiers. Their device paths are
+      // URLs (s3://bucket/prefix), not filesystem paths, so they deliberately
+      // skip the directory creation below -- see the 'ram' branch's sibling
+      // check. A bare bucket with no prefix is a configuration error: CTE
+      // registers targets as <path>_node<N>, which would corrupt the bucket
+      // name itself rather than the key prefix.
       if (device_config.bdev_type_ != "file" &&
           device_config.bdev_type_ != "ram" &&
           device_config.bdev_type_ != "hbm" &&
           device_config.bdev_type_ != "pinned" &&
-          device_config.bdev_type_ != "noop") {
+          device_config.bdev_type_ != "noop" &&
+          device_config.bdev_type_ != "s3" &&
+          device_config.bdev_type_ != "gcs") {
         HLOG(kError,
              "Config error: Invalid bdev_type '{}' (must be 'file', 'ram', "
-             "'hbm', 'pinned', or 'noop')",
+             "'hbm', 'pinned', 'noop', 's3', or 'gcs')",
              device_config.bdev_type_);
         return false;
       }

@@ -82,12 +82,24 @@ std::string ResolveS3Tool() {
  * @param args Full argv (args[0] is the program, resolved via PATH).
  * @return The child's exit status (0 = success), or -1 if fork/exec failed.
  */
-int RunProcess(const std::vector<std::string>& args) {
+int RunProcess(const std::vector<std::string>& args,
+               const std::string& s3_region = "",
+               const std::string& s3_profile = "") {
   pid_t pid = fork();
   if (pid == -1) {
     return -1;
   }
   if (pid == 0) {
+    // Child is single-threaded after fork, so setenv here is safe and scoped to
+    // this cae_s3_tool invocation only -- it never mutates the daemon's env.
+    // The daemon is ssh-launched without AWS_*, so these forwarded values are
+    // what let the tool sign for the right region with the right credentials.
+    if (!s3_region.empty()) {
+      setenv("AWS_DEFAULT_REGION", s3_region.c_str(), 1);
+    }
+    if (!s3_profile.empty()) {
+      setenv("AWS_PROFILE", s3_profile.c_str(), 1);
+    }
     std::vector<const char*> argv;
     argv.reserve(args.size() + 1);
     for (const auto& a : args) {
@@ -209,7 +221,7 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
     args.push_back(std::to_string(ctx.range_off));
     args.push_back(std::to_string(ctx.range_size));
   }
-  int tool_rc = RunProcess(args);
+  int tool_rc = RunProcess(args, ctx.s3_region, ctx.s3_profile);
   if (tool_rc != 0) {
     HLOG(kError,
          "S3FileAssimilator: cae_s3_tool get failed (rc={}) for s3://{}/{}",

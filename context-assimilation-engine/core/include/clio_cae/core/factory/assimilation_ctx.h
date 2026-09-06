@@ -54,6 +54,15 @@ struct AssimilationCtx {
   std::string src_token;   // Authentication token for source (e.g., Globus access token)
   std::string dst_token;   // Authentication token for destination
 
+  // S3 credential context for S3FileAssimilator -> cae_s3_tool. The assimilator
+  // runs inside the runtime daemon, which jarvis launches via ssh and which
+  // therefore does NOT inherit the client's AWS_* environment. The client
+  // forwards its own resolved values here so cae_s3_tool signs for the correct
+  // region with the correct profile instead of defaulting to us-east-1 /
+  // anonymous. Empty means "leave the child's inherited env untouched".
+  std::string s3_region;   // -> AWS_DEFAULT_REGION for the cae_s3_tool child
+  std::string s3_profile;  // -> AWS_PROFILE for the cae_s3_tool child
+
   // Inline data payload for src="string::..." sources. The bytes here are
   // stored verbatim as a single blob whose name is the path part of `src`
   // (everything after "string::"). Unused for file/hdf5/globus sources.
@@ -89,7 +98,7 @@ struct AssimilationCtx {
   template<class Archive>
   void serialize(Archive& ar) {
     ar(src, dst, format, depends_on, range_off, range_size, src_token, dst_token,
-       include_patterns, exclude_patterns, src_data);
+       include_patterns, exclude_patterns, src_data, s3_region, s3_profile);
   }
 };
 

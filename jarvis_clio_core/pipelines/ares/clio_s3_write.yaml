@@ -1,0 +1,626 @@
+# =============================================================================
+# Issue #968 - CLIO vs Zarr S3 WRITE benchmark: FULL SWEEP (36 rows).
+# =============================================================================
+#
+# Widened from a 2-row smoke pipeline after that smoke came back green on
+# 2026-08-26. Every gate, credential path and preflight below was carried over
+# from it verbatim; only the grid, the walltime and `verify` differed, so the
+# smoke has since been deleted and this file is the only write sweep.
+#
+# WHAT THE SMOKE ESTABLISHED, AND WHY THIS GRID LOOKS LIKE IT DOES.
+#
+#   At K=32 every engine converged on the same wire bandwidth:
+#
+#     raw PUT floor   10.75 MB/s      <- the ceiling
+#     zarr (none)     10.62 MB/s      98.8% of floor
+#     CLIO -> S3 bdev 10.11 MB/s      94.0% of floor
+#
+#   (A zarr+zstd variant also ran at 10.34 MB/s on the wire. It is no longer
+#   part of the grid -- see the note below.)
+#
+#   Independent write paths landing inside 6% of each other is not a
+#   coincidence. It is one shared constraint: roughly 85 Mbit/s of egress
+#   from an Ares compute node to S3. CLIO is not slow here; the link is.
+#
+#   That reframes the whole sweep. Blob size and concurrency cannot be
+#   explored usefully ABOVE the saturation point -- every such row just
+#   re-measures the same pipe and costs ~8 minutes to do it. So this grid
+#   spends its rows finding WHERE the knee is (K = 1,4,8,16,32,64) at two
+#   granularities, instead of pushing to larger blobs that only lengthen
+#   already-saturated rows.
+#
+#   K=64 is in the grid specifically to settle what kind of ceiling it is.
+#   The rawput floor forks K processes and involves no runtime worker at all,
+#   so it probes the link independently of CLIO's threading:
+#
+#     * rawput flat from K=32 to K=64  -> the link is saturated. CLIO's
+#       plateau is the network and nothing in CLIO can beat it. Report the
+#       ratio-to-floor column, not the absolute MB/s.
+#     * rawput keeps climbing at K=64  -> the ~10.7 was a per-connection
+#       concurrency limit, and CLIO's plateau IS worth chasing. Raise
+#       runtime.num_threads and re-run the top of the K axis.
+#
+# READ ratio-to-floor, NOT absolute MB/s. On a shared uplink the absolute
+# numbers are a property of the night you ran them. The distance to the
+# rawput floor is a property of CLIO.
+#
+# ZARR-ZSTD IS DELIBERATELY NOT A COMPARATOR. CLIO gets its own compression
+# mechanism later this year; until it does, comparing an uncompressed CLIO
+# write against a compressed zarr write measures zstd, not either system.
+# The 2026-08-26 sweep is the evidence for how badly: at K=32 zstd read 19.90
+# MB/s of agg_bw to CLIO's 12.17, purely because it moved 133 MiB of wire
+# bytes to CLIO's 256 MiB for the same logical payload -- on the wire it was
+# 10.34, i.e. slightly SLOWER than CLIO. That 19.90 was the largest number in
+# the file and the one most likely to be misquoted.
+#
+# `variants: ["none"]` below is the whole switch. Restore ["none", "zstd"]
+# once CLIO can compress too, and put back the zarr_s3.writezstd.* column in
+# post_cmds.
+#
+# Cost: writes are cheap -- ingress to S3 is free, PUTs run ~$0.005/1000.
+# ~37k PUTs across the grid is about $0.18. `verify` is OFF here (it is GET
+# egress, and the smoke already proved byte-fidelity); per-row honesty comes
+# from objects_measured/bytes_measured, which are a LISTING of the bucket and
+# cost nothing. post_cmds purges the prefix.
+#
+# Runtime: ~70 min per repeat, ~3.6 h for all 3. Sized for overnight.
+#
+# Usage:
+#   export S3_BENCH_BUCKET=my-bucket S3_BENCH_PROFILE=clio-bench
+#   export S3_BENCH_REGION=us-east-2      # MANDATORY, and must be the bucket's
+#                                         # real region -- verified in pre_cmds
+#   export IOWARP_VIEW=/mnt/common/$USER/iowarp-s3-view ZARR_VENV=$HOME/zarr-venv
+#   export PATH="$HOME/jarvis-venv/bin:$PATH"
+#   jarvis ppl submit <abs path>/clio_s3_write.yaml
+#
+# Output: ${HOME}/clio_s3_write_results/results.csv - 36 rows.
+#         Every *.agg_bw_mbps column must be populated, and every
+#         clio_s3.write.objects_measured must equal clio_s3.num_objects. A
+#         green row with a blank throughput column, or with zero objects
+#         measured, is a FAILURE.
+
+scheduler:
+  name: slurm
+  job_name: clio_s3_write_full
+  nodes: 1
+  ntasks_per_node: 1
+  # Must stay large: Ares Slurm uses proctrack/cgroup with ConstrainCores, and
+  # each S3 PUT occupies a whole runtime worker thread for its duration. A
+  # narrow cgroup silently caps concurrency.
+  # 40, NOT MORE. Ares compute nodes have 40 allocatable CPUs, and sbatch
+  # rejects the job outright with "CPU count per node can not be satisfied"
+  # if this exceeds that -- at submit time, before anything runs. Every
+  # working pipeline in this directory on the compute partition uses 40.
+  cpus_per_task: 40
+  partition: compute
+  # ~70 min per repeat x 3 repeats = ~3.6 h measured, with headroom for a
+  # bad-network night. Sized for overnight; raise `time` before adding rows.
+  time: "08:00:00"
+  output: ${HOME}/clio_s3_write-%j.out
+  error: ${HOME}/clio_s3_write-%j.err
+  # MUST stay literally identical to config.hostfile below.
+  hostfile: "${HOME}/.jarvis-s3-bench/clio_s3_write_hostfile.txt"
+  pre_cmds:
+    # 1) Toolchain. Pure PATH prepends -- never `spack load` / `conda activate`
+    #    (they install shell functions that misbehave under `set -euo pipefail`).
+    - 'export PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/bin:${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"'
+    - 'export LD_LIBRARY_PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib:${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib64:${LD_LIBRARY_PATH:-}"'
+    - 'command -v clio_run            >/dev/null 2>&1 || { echo "ERROR: clio_run not on PATH (view: ${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view})" >&2; exit 1; }'
+    - 'command -v clio_s3_write_bench >/dev/null 2>&1 || { echo "ERROR: clio_s3_write_bench not on PATH — was IOWarp built with +s3_bdev?" >&2; exit 1; }'
+    - 'command -v cae_s3_tool         >/dev/null 2>&1 || { echo "ERROR: cae_s3_tool not on PATH — was IOWarp built with +s3_cae? (needed for the rawput floor)" >&2; exit 1; }'
+    - 'command -v jarvis              >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
+    - '"${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" -c "import zarr,s3fs,numpy" || { echo "ERROR: zarr venv broken at ${ZARR_VENV:-$HOME/zarr-venv}" >&2; exit 1; }'
+    # Every IOWarp binary must come from ONE install root. A stale symlink
+    # view earlier on PATH silently pairs an OLD clio_run with a NEW bench:
+    # the runtime then rejects `bdev_type: s3`, CTE starts with zero storage
+    # devices, and every PutBlob fails with rc=11 -- twenty minutes later and
+    # a hundred log lines away from the cause. Compare realpaths, so a view
+    # that does symlink into the right prefix still passes.
+    #
+    # Also assert the runtime is new enough to accept the s3/gcs bdev_type.
+    # The allowlist's error string is a compiled-in literal, so grep the
+    # library for it directly -- do NOT trust the spack hash: branch versions
+    # do not rehash when the branch moves, so a stale build keeps its name.
+    - |
+      RUN_ROOT="$(dirname "$(dirname "$(readlink -f "$(command -v clio_run)")")")"
+      BENCH_ROOT="$(dirname "$(dirname "$(readlink -f "$(command -v clio_s3_write_bench)")")")"
+      if [ "$RUN_ROOT" != "$BENCH_ROOT" ]; then
+        echo "ERROR: mixed IOWarp installs on PATH -- these must be one prefix" >&2
+        echo "  clio_run            -> $RUN_ROOT" >&2
+        echo "  clio_s3_write_bench -> $BENCH_ROOT" >&2
+        echo "  Fix: export IOWARP_VIEW=\$(spack find --format '{prefix}' iowarp@dev | tail -1)" >&2
+        exit 1
+      fi
+      CTE_LIB="$RUN_ROOT/lib/libclio_cte_core_runtime.so"
+      [ -f "$CTE_LIB" ] || CTE_LIB="$RUN_ROOT/lib64/libclio_cte_core_runtime.so"
+      [ -f "$CTE_LIB" ] || { echo "ERROR: libclio_cte_core_runtime.so not found under $RUN_ROOT" >&2; exit 1; }
+      grep -aqF "'noop', 's3', or 'gcs'" "$CTE_LIB" || {
+        echo "ERROR: $CTE_LIB predates the s3/gcs bdev_type allowlist." >&2
+        echo "  It will log \"Invalid bdev_type 's3'\", warn \"No storage devices" >&2
+        echo "  configured\", and fail every PutBlob with rc=11. Rebuild:" >&2
+        echo "    spack uninstall -y iowarp@dev && spack clean -s \\" >&2
+        echo "      && spack install iowarp@dev +cae +cte +s3_cae +s3_bdev" >&2
+        exit 1; }
+      # Same trick for the benchmark binary itself. `spack develop` builds
+      # rebuild in place, so a `git pull` without a `spack install` leaves an
+      # binary that predates the source with no outward sign -- the spec name,
+      # the hash and the view all still look right. Grep the build stamp
+      # instead. Keep this literal in sync with kBuildMarker in
+      # context-transfer-engine/benchmark/clio_s3_write_bench.cc.
+      WANT_MARKER="s3wb-build-marker-2026-08-26"
+      grep -aqF "$WANT_MARKER" "$(command -v clio_s3_write_bench)" || {
+        echo "ERROR: clio_s3_write_bench is STALE -- it predates $WANT_MARKER." >&2
+        echo "  Pulling the repo does not rebuild it. For the dev spec:" >&2
+        echo "    spack install iowarp@dev" >&2
+        echo "  For a non-develop spec, branch versions do not rehash, so:" >&2
+        echo "    spack uninstall -y iowarp@dev && spack clean -s \\" >&2
+        echo "      && spack install iowarp@dev +cae +cte +s3_cae +s3_bdev" >&2
+        exit 1; }
+      echo "install root OK: $RUN_ROOT"
+      echo "CTE s3 allowlist OK: $CTE_LIB"
+      echo "bench build stamp OK: $WANT_MARKER"
+    # The S3 bdev must actually be in the runtime library, or CTE will fall
+    # back to a local tier and this measures RAM. Assert it rather than trust
+    # the build. Poco present + AWS SDK absent is the signature of the
+    # Poco+SigV4 transport -- but that signature is ALSO satisfied by the
+    # pre-keep-alive transport, so it is not sufficient on its own. This sweep
+    # exists to measure whether persistent connections moved the ceiling; run
+    # against a library without them and it produces a "before" number wearing
+    # an "after" label, after 3.6 hours. Assert the tally literal too, exactly
+    # as the smokes do.
+    - |
+      echo "bdev gate: host=$(hostname -s) time=$(date -Is)"
+      CLIO_RUN_BIN="$(command -v clio_run || true)"
+      echo "bdev gate: clio_run  -> $(readlink -f "$CLIO_RUN_BIN" 2>&1 || true)"
+      LIB="${CLIO_RUN_BIN%/bin/clio_run}/lib/libclio_bdev_runtime.so"
+      [ -f "$LIB" ] || LIB="${LIB%/lib/*}/lib64/libclio_bdev_runtime.so"
+      [ -f "$LIB" ] || { echo "ERROR: libclio_bdev_runtime.so not found under the install root" >&2; exit 1; }
+      echo "bdev gate: lib       -> $(readlink -f "$LIB" 2>&1 || true)"
+      LDD_OUT="$(ldd "$LIB" 2>&1)" || { echo "ERROR: ldd failed on $LIB:" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1; }
+      printf '%s\n' "$LDD_OUT" | grep -q PocoNetSSL || { echo "ERROR: $LIB has no Poco NetSSL — built without +s3_bdev?" >&2; exit 1; }
+      printf '%s\n' "$LDD_OUT" | grep -q aws-cpp-sdk && { echo "ERROR: $LIB links the AWS SDK — that stack-smashes runtime init" >&2; exit 1; }
+      # grep -a, not strings: binutils is not guaranteed on a compute node and
+      # the view precedes /usr/bin on PATH. Keep the count and the exit status
+      # apart so a read failure cannot masquerade as "old build".
+      KA_RC=0
+      KA_COUNT="$(grep -acF "S3 keepalive worker=" "$LIB")" || KA_RC=$?
+      echo "bdev gate: keepalive tally matches = ${KA_COUNT:-0} (grep rc=$KA_RC)"
+      [ "$KA_RC" -le 1 ] || { echo "ERROR: could not read $LIB (grep exit $KA_RC) -- an I/O or permission failure, not a verdict on the build" >&2; exit 1; }
+      [ "${KA_COUNT:-0}" -ge 1 ] || {
+        echo "ERROR: $LIB PREDATES the persistent-connection change." >&2
+        echo "  This sweep would spend 3.6 h producing a pre-keep-alive number" >&2
+        echo "  and label it as the post-change result. Rebuild first:" >&2
+        echo "    spack install iowarp@dev" >&2
+        exit 1; }
+      echo "bdev link check OK: $LIB (Poco present, no AWS SDK, keepalive tally present)"
+    - 'echo "toolchain: clio_run=$(command -v clio_run) bench=$(command -v clio_s3_write_bench) jarvis=$(command -v jarvis)"'
+    # 2) AWS credentials. NO SECRETS IN THIS FILE -- only profile/region names.
+    #    THIS DIFFERS FROM THE READ BENCH. There, cae_s3_tool resolved
+    #    AWS_PROFILE through the AWS SDK's credential chain. Here the process
+    #    that signs is the clio_run daemon, and its Poco SigV4 signer reads
+    #    RAW ENV VARS ONLY -- it has no profile support at all. So the profile
+    #    must be resolved to keys here, in the job script, which the daemon
+    #    then inherits. Ares has no AWS CLI, so `aws configure
+    #    export-credentials` is unavailable; parse the file directly.
+    - 'export AWS_PROFILE="${S3_BENCH_PROFILE:-clio-bench}"'
+    # No default. SigV4 is region-scoped and the bdev's signer does not follow
+    # redirects, so guessing us-east-1 for a bucket that lives elsewhere is a
+    # silent 400/301 inside a runtime worker. The preflight below resolves the
+    # bucket's true region and refuses to run if this disagrees.
+    - '[ -n "${S3_BENCH_REGION:-}" ] || { echo "ERROR: S3_BENCH_REGION not set -- it must be the real region of the bucket" >&2; exit 1; }'
+    - 'export AWS_DEFAULT_REGION="$S3_BENCH_REGION"'
+    # Real AWS: an endpoint override flips the signer to path-style addressing
+    # against a nonexistent host, so both must stay unset.
+    - 'unset S3_ENDPOINT AWS_ENDPOINT_URL'
+    - '[ -r "$HOME/.aws/credentials" ] || { echo "ERROR: ~/.aws/credentials missing/unreadable" >&2; exit 1; }'
+    - '[ -n "${S3_BENCH_BUCKET:-}" ] || { echo "ERROR: S3_BENCH_BUCKET not set" >&2; exit 1; }'
+    - |
+      eval "$(python3 - "$AWS_PROFILE" <<'PY'
+      import configparser, os, shlex, sys
+      profile = sys.argv[1]
+      cfg = configparser.ConfigParser()
+      cfg.read(os.path.expanduser("~/.aws/credentials"))
+      if profile not in cfg:
+          # stdout is eval'd by the shell, so diagnostics must go to stderr.
+          # The AWS_ACCESS_KEY_ID guard below turns empty output into a clean fail.
+          sys.exit(f"no profile [{profile}] in ~/.aws/credentials")
+      sec = cfg[profile]
+      for env, key in (("AWS_ACCESS_KEY_ID", "aws_access_key_id"),
+                       ("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"),
+                       ("AWS_SESSION_TOKEN", "aws_session_token")):
+          if sec.get(key):
+              print(f"export {env}={shlex.quote(sec[key])}")
+      PY
+      )"
+    - '[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "ERROR: AWS_ACCESS_KEY_ID empty after reading profile [$AWS_PROFILE] — the runtime cannot sign without it" >&2; exit 1; }'
+    - 'echo "credentials exported from [$AWS_PROFILE], region $AWS_DEFAULT_REGION"'
+    # 3) The rawput floor forks cae_s3_tool; give it a node-local staging dir
+    #    with room for concurrency * object_size (64 x 4 MiB = 256 MiB at
+    #    the widest point of this grid). /tmp is node-local on Ares.
+    - 'export CAE_S3_TOOL="$(command -v cae_s3_tool)"'
+    - 'export TMPDIR=/tmp/clio_s3_wbench; mkdir -p "$TMPDIR"'
+    # 4) Stale-state cleanup. pkill patterns are BRACKETED so they never match
+    #    this script's own argv. Only chi_* is removed from /dev/shm: it is
+    #    shared with other users, so a blanket sweep would destroy their state.
+    - 'pkill -9 -f "[c]himaera" 2>/dev/null || true'
+    - 'pkill -9 -f "[c]lio_run" 2>/dev/null || true'
+    - '{ command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true'
+    - 'rm -f /dev/shm/chi_* 2>/dev/null || true'
+    - 'rm -rf "$TMPDIR"/s3_raw_put_* /tmp/iowarp_chi* 2>/dev/null || true'
+    # 5) Experiment dirs + repo registration + clean slate (the sweep runner
+    #    RESUMES over an existing results.csv and would skip failed rows).
+    - 'mkdir -p "$HOME/clio_s3_write_results" "$HOME/.jarvis-s3-bench"'
+    # The runtime persists a perf model here and logs an ERROR per attempt if
+    # it cannot. /tmp is node-local, so this must happen on the compute node --
+    # creating it on the login node does nothing for the job.
+    - 'mkdir -p /tmp/clio/models 2>/dev/null || echo "note: /tmp/clio/models not creatable; TaskStatModel will log errors (harmless)"'
+    # Registering the repo was `|| true`, which also swallowed a WRONG path --
+    # jarvis then silently kept whatever copy it had registered before,
+    # including a stale one under ~/.ppi-jarvis. Resolve the checkout, prove
+    # the packages this pipeline needs are in it, and prove nothing shadows
+    # them. All three failures otherwise appear as a missing config option
+    # (`forward_env`) twenty minutes into the allocation.
+    - |
+      if [ -z "${CLIO_REPO:-}" ]; then
+        for cand in "$HOME/clio-core"; do
+          if [ -d "$cand/jarvis_clio_core/jarvis_clio_core" ]; then CLIO_REPO="$cand"; break; fi
+        done
+      fi
+      [ -n "${CLIO_REPO:-}" ] || { echo "ERROR: no CLIO checkout found; set CLIO_REPO" >&2; exit 1; }
+      export CLIO_REPO
+      RT_PKG="$CLIO_REPO/jarvis_clio_core/jarvis_clio_core/clio_runtime/pkg.py"
+      [ -f "$RT_PKG" ] || { echo "ERROR: $RT_PKG missing -- CLIO_REPO=$CLIO_REPO is wrong" >&2; exit 1; }
+      grep -q "forward_env" "$RT_PKG" || {
+        echo "ERROR: $RT_PKG has no forward_env option, so AWS credentials" >&2
+        echo "  cannot reach the clio_run daemon and every PutBlob will fail" >&2
+        echo "  with rc=11. Pull the branch in $CLIO_REPO." >&2
+        exit 1; }
+      for shadow in "$HOME/.ppi-jarvis/builtin/clio_runtime" \
+                    "$HOME/.ppi-jarvis/builtin/clio_s3_bench" \
+                    "$HOME/.ppi-jarvis/builtin/zarr_s3_bench" \
+                    "$HOME/.ppi-jarvis/builtin/s3_raw_put_bench"; do
+        if [ -e "$shadow" ]; then
+          echo "ERROR: $shadow shadows the checkout; jarvis will load the stale copy. Remove it." >&2
+          exit 1
+        fi
+      done
+      jarvis repo add "$CLIO_REPO/jarvis_clio_core" 2>/dev/null || true
+      echo "jarvis packages OK: $CLIO_REPO/jarvis_clio_core"
+    - 'rm -f "$HOME/clio_s3_write_results/results.csv"'
+    # Pre-flight the EXACT call the S3 bdev makes at Init: a HEAD on the
+    # bucket, signed with the RAW EXPORTED KEYS (not the profile -- the bdev
+    # cannot read profiles). Cheap, and it separates four failures that
+    # otherwise all surface identically as a dead bdev twenty minutes in:
+    #   empty keys -> the export above silently failed
+    #   403        -> the key pair lacks s3:ListBucket ON THE BUCKET. Object
+    #                 -level Get/Put grants are NOT enough; EnsureBucket HEADs
+    #                 the bucket itself before any block is written.
+    #   301        -> AWS_DEFAULT_REGION is not the bucket's region
+    #   404        -> bucket name typo (the bdev will NOT create it; that
+    #                 needs S3_ALLOW_BUCKET_CREATE=1, deliberately unset)
+    #
+    # HeadBucket ALONE IS NOT ENOUGH, and this is the subtle part. Modern
+    # botocore transparently follows S3 region redirects: it will retry
+    # against the correct region and report success even when the region we
+    # handed it is wrong. The bdev's hand-rolled SigV4 signer has no redirect
+    # logic at all, so a preflight that only HEADs can go green while the
+    # daemon gets a 400/301 on every PUT. Ask S3 for the authoritative region
+    # with GetBucketLocation and refuse to run on a mismatch.
+    - |
+      "${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" - <<'EOF' || exit 1
+      import os, sys
+      # botocore, not s3fs: s3fs's request helpers are internal and have
+      # changed shape across releases. botocore is a hard dependency of s3fs,
+      # so it is present in the same venv, and create_client/head_bucket are
+      # public API. (There is no boto3 in the zarr venv.)
+      import botocore.session, botocore.exceptions
+      key    = os.environ.get("AWS_ACCESS_KEY_ID", "")
+      secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+      token  = os.environ.get("AWS_SESSION_TOKEN") or None
+      region = os.environ.get("AWS_DEFAULT_REGION", "")
+      bucket = os.environ.get("S3_BENCH_BUCKET", "")
+      if not key or not secret:
+          sys.exit("ERROR: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are empty "
+                   "after the credential export. The S3 bdev needs raw keys.")
+      client = botocore.session.get_session().create_client(
+          "s3", region_name=region, aws_access_key_id=key,
+          aws_secret_access_key=secret, aws_session_token=token)
+      try:
+          client.head_bucket(Bucket=bucket)
+      except botocore.exceptions.ClientError as e:
+          code = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+          sys.exit(f"ERROR: HeadBucket on '{bucket}' failed with HTTP {code}: {e}\n"
+                   f"  403 -> the key pair needs s3:ListBucket on the bucket itself\n"
+                   f"  301 -> AWS_DEFAULT_REGION={region} is not the region of the bucket\n"
+                   f"  404 -> bucket name is wrong")
+      try:
+          loc = client.get_bucket_location(Bucket=bucket).get("LocationConstraint")
+      except botocore.exceptions.ClientError as e:
+          sys.exit(f"ERROR: GetBucketLocation on '{bucket}' failed: {e}\n"
+                   "  The key pair needs s3:GetBucketLocation. Without it the\n"
+                   "  region cannot be verified, and an unverified region is a\n"
+                   "  signing failure inside a runtime worker.")
+      # None/"" means us-east-1; "EU" is the legacy alias for eu-west-1.
+      true_region = {None: "us-east-1", "": "us-east-1",
+                     "EU": "eu-west-1"}.get(loc, loc)
+      if true_region != region:
+          sys.exit(f"ERROR: S3_BENCH_REGION={region} but bucket '{bucket}' "
+                   f"lives in {true_region}.\n"
+                   f"  botocore hid this by following the redirect; the bdev "
+                   f"signer will not.\n"
+                   f"  Fix: export S3_BENCH_REGION={true_region}")
+      print(f"S3 preflight OK: HeadBucket {bucket}, region confirmed "
+            f"{true_region}, with the exported keys")
+      EOF
+  post_cmds:
+    - 'RES="$HOME/clio_s3_write_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 36"'
+    # A green row with a blank throughput column is a FAILURE, not a success.
+    # Assert it here instead of leaving it to manual inspection.
+    - |
+      python3 - "$HOME/clio_s3_write_results/results.csv" <<'EOF'
+      import csv, os, sys
+      path = sys.argv[1]
+      if not os.path.exists(path):
+          print("NO RESULTS CSV AT", path); sys.exit(0)
+      need = ["clio_s3.write.agg_bw_mbps", "zarr_s3.write.agg_bw_mbps",
+              "raw_put.rawput.agg_bw_mbps"]
+      rows = list(csv.DictReader(open(path)))
+      green = [r for r in rows if r.get("status") == "success"]
+      bad = [r.get("run_idx") for r in green if any(not r.get(c) for c in need)]
+      print("rows:", len(rows))
+      print("GREEN ROWS WITH BLANK THROUGHPUT (== FAILURES):", bad or "none")
+      # objects_measured is a LIST of the bucket, not a number the benchmark
+      # computed, so it is the one column that cannot be fabricated by a run
+      # that wrote nothing. Zero here means the throughput columns are fiction
+      # even though the row is green.
+      empty = [r.get("run_idx") for r in green
+               if str(r.get("clio_s3.write.objects_measured", "")).strip() in ("", "0")]
+      print("GREEN ROWS THAT WROTE NO S3 OBJECTS (== FAILURES):", empty or "none")
+      # A blob should become exactly one object. A mismatch is not a failure,
+      # but it means the allocator fragmented and PUT count understates the
+      # request count -- worth knowing before reading the numbers.
+      for r in green:
+          got, want = (r.get("clio_s3.write.objects_measured"),
+                       r.get("clio_s3.write.put_count"))
+          if got and want and got != want:
+              print(f"  note: row {r.get('run_idx')} measured {got} objects "
+                    f"for {want} blobs (allocator returned >1 block per blob)")
+      EOF
+    # Purge the write prefix. Object keys are DETERMINISTIC (block_<offset>,
+    # raw_%06d.bin, zarr chunk paths), so re-runs overwrite rather than
+    # accumulate and storage does not grow without bound -- but leaving a few
+    # hundred MiB billed after a smoke is still rude. No AWS CLI on Ares, so
+    # this uses s3fs out of the zarr venv, which is guaranteed present because
+    # the zarr baseline depends on it. Never fails the job: a purge problem
+    # must not retroactively fail rows that already succeeded.
+    - |
+      "${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" - <<'EOF' || echo "purge skipped (non-fatal)"
+      import os, sys
+      import s3fs
+      bucket = os.environ.get("S3_BENCH_BUCKET")
+      if not bucket:
+          print("S3_BENCH_BUCKET unset; nothing to purge"); sys.exit(0)
+      fs = s3fs.S3FileSystem(anon=False)
+      target = f"{bucket}/clio-s3-write-bench"
+      if fs.exists(target):
+          fs.rm(target, recursive=True)
+          print("purged s3://" + target)
+      else:
+          print("nothing to purge at s3://" + target)
+      EOF
+
+config:
+  name: clio_s3_write
+
+  # MUST stay literally identical to scheduler.hostfile above.
+  hostfile: "${HOME}/.jarvis-s3-bench/clio_s3_write_hostfile.txt"
+
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 16          # SWEPT with concurrency -- see the note above
+      client_data_segment_size: "4G"
+      port: 9413
+      # IPC (unix socket), NOT shm: the benchmark is a detached client, not a
+      # descendant of the runtime daemon, and Ares compute nodes run
+      # ptrace_scope=1. SHM mode attaches the daemon's main segment by
+      # reopening /proc/<server_pid>/fd via a memfd symlink, which ptrace_scope=1
+      # denies for a non-descendant (shm_open -> EACCES, "Failed to initialize
+      # Clio"). The unix-socket transport needs no /proc reopen; it is ~38x
+      # faster than TCP (issue #768) so the throughput cost vs SHM is small.
+      ipc_mode: "ipc"
+      log_level: "info"
+      # SWIM off: transient errors must not promote a peer to dead mid-bench.
+      swim_enabled: false
+      sleep: 4
+      # THE DAEMON DOES NOT INHERIT THE JOB SCRIPT'S ENVIRONMENT. jarvis starts
+      # clio_run as PsshExecInfo(env=self.env, ...) with the curated dict it
+      # builds itself ("Auto-built environment with N variables" in the job
+      # log). That dict is a copy of whichever names in
+      # EnvironmentManager.COMMON_ENV_VARS happen to be set -- a fixed
+      # toolchain list (PATH, LD_LIBRARY_PATH, HOME, CC, ...) with no AWS_*
+      # entry -- so the AWS_* exports in pre_cmds reach jarvis and every
+      # benchmark process but NOT the runtime. The S3 bdev's SigV4 signer runs inside a
+      # runtime worker and reads raw keys from the environment only -- it has
+      # no AWS_PROFILE support. These names must therefore be forwarded
+      # explicitly. Names only; values never appear in the pipeline or the log.
+      forward_env:
+        - AWS_ACCESS_KEY_ID
+        - AWS_SECRET_ACCESS_KEY
+        - AWS_SESSION_TOKEN      # optional; skipped when unset
+        - AWS_DEFAULT_REGION
+
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      # EXACTLY ONE device, and it is the S3 tier. This is load-bearing: with
+      # any local tier present the DPE is free to place blobs there and the
+      # benchmark silently measures RAM instead of S3.
+      #
+      # The KEY PREFIX IS MANDATORY. CTE registers targets as <path>_node<N>,
+      # so a bare "s3://bucket" would append the node suffix to the BUCKET
+      # NAME. With a prefix the suffix lands on the prefix, which additionally
+      # gives free per-node key isolation.
+      devices:
+        - ["s3://${S3_BENCH_BUCKET}/clio-s3-write-bench/bdev", "64GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      pool_query: "local"
+
+    - pkg_type: jarvis_clio_core.clio_s3_bench
+      pkg_name: clio_s3
+      mode: write
+      object_size: "4m"                               # SWEPT
+      num_objects: 256                                # SWEPT
+      concurrency: 8                                  # SWEPT
+      worker_threads: 16                              # SWEPT (reported only)
+      # Count what actually landed in the bucket, instead of deriving it. The
+      # prefix is the clio_cte device path below MINUS the s3://bucket/ part
+      # and MINUS the _node<N> suffix CTE appends, so listing this stem covers
+      # every node. It is read right after the timed loop, before teardown:
+      # FreeBlocks issues a DeleteObject per block, so a later count reads 0.
+      bucket: "${S3_BENCH_BUCKET}"
+      key_prefix: "clio-s3-write-bench/bdev"
+      # Empty this prefix before each row. Every row of the sweep shares it,
+      # so without the purge objects_measured counts earlier rows' leftovers
+      # too: the 2026-08-26 grid had every 4 MiB row report 448 objects
+      # against num_objects 256, the excess being exactly 192 x 1 MiB orphans
+      # the 1 MiB rows' teardown never deleted. Throughput was unaffected
+      # (those columns come from logical_bytes/wall_time_us), but the guard
+      # degraded from an equality to a lower bound. Only this prefix is
+      # deleted -- zarr's store is one level up, rawput's keys are a sibling.
+      # The per-row objects_purged column keeps the underlying leak visible.
+      purge_prefix: true
+      venv: "${ZARR_VENV}"
+      tag_prefix: "s3wb"
+      aws_region: "${S3_BENCH_REGION}"
+      aws_profile: "${S3_BENCH_PROFILE}"
+      # OFF for the grid. The smoke already proved byte-fidelity end to end
+      # (both rows green with verify on == 128 blobs read back byte-identical),
+      # and re-reading every blob on all 36 rows is ~19 GiB of GET egress to
+      # re-answer a settled question. Per-row honesty comes from
+      # objects_measured / bytes_measured instead: those are a LISTING of the
+      # bucket, so a row that wrote nothing cannot fake them, and a listing is
+      # free. If you change the bdev's write path, flip this back on for one
+      # confirming run before trusting the grid.
+      verify: false
+
+    - pkg_type: jarvis_clio_core.zarr_s3_bench
+      pkg_name: zarr_s3
+      mode: write
+      bucket: "${S3_BENCH_BUCKET}"
+      store_prefix: "clio-s3-write-bench"
+      # One zarr chunk is one S3 object, so this is the same unit and the same
+      # spelling as clio_s3 above; the package computes the script's
+      # --total-bytes (num_objects * object_size) and --chunk-bytes from it.
+      num_objects: 256                                # SWEPT: == clio_s3
+      object_size: "4m"                               # SWEPT: == clio_s3
+      # Uncompressed only -- see the zstd note in the header.
+      variants: ["none"]
+      # Inert while variants is ["none"] (it only shapes source entropy for a
+      # codec to work on), but kept so restoring zstd is a one-line change: at
+      # 0.0 zstd cannot compress and slightly EXPANDS the data, at 1.0 it
+      # compresses to nothing. Neither resembles real scientific arrays.
+      compressibility: 0.5
+      async_concurrency: 8                            # SWEPT
+      aws_region: "${S3_BENCH_REGION}"
+      aws_profile: "${S3_BENCH_PROFILE}"
+      venv: "${ZARR_VENV}"
+
+    - pkg_type: jarvis_clio_core.s3_raw_put_bench
+      pkg_name: raw_put
+      bucket: "${S3_BENCH_BUCKET}"
+      key_prefix: "clio-s3-write-bench/rawput"
+      num_objects: 256                                # SWEPT: == clio_s3
+      object_size: "4m"                               # SWEPT: == clio_s3
+      concurrency: 8                                  # SWEPT
+      tmpdir: "/tmp/clio_s3_wbench"
+      aws_region: "${S3_BENCH_REGION}"
+      aws_profile: "${S3_BENCH_PROFILE}"
+
+vars:
+  # ---------------------------------------------------------------------
+  # Axis 1: GRANULARITY (2 points). Blob count is held at 256 for BOTH
+  # sizes rather than holding total bytes constant. That is deliberate: the
+  # concurrency axis reaches K=64, and a window of K in-flight requests is
+  # only meaningful if there are several windows' worth of work behind it.
+  # 64 blobs (the smoke's count) would have been a single window at K=64 and
+  # would have measured startup, not steady state.
+  #
+  # The cost is that the 4m rows move 4x the bytes of the 1m rows and take
+  # correspondingly longer. That is the right trade at an ~85 Mbit/s
+  # ceiling: a short row at saturation tells you nothing a long one does not.
+  #
+  # Larger blobs (16m+) are deliberately ABSENT. At 4 MiB the link is
+  # already saturated from K=16 up, so a 16m axis would spend ~25 min/row
+  # re-deriving the same 10.7 MB/s. Add it only if the K=64 rawput point
+  # shows the ceiling is NOT the link.
+  # ---------------------------------------------------------------------
+  #
+  # All three stacks take the same two names in the same spelling, so the
+  # zipped values are literally identical -- which is the point. This used to
+  # be six variables in three vocabularies (num_blobs/blob_size,
+  # total_bytes/chunk_bytes, num_objects/<byte count>) whose equality was
+  # maintained by hand and by comment.
+  clio_s3.object_size:    ["1m", "4m"]
+  clio_s3.num_objects:    [256,  256]
+  zarr_s3.object_size:    ["1m", "4m"]
+  zarr_s3.num_objects:    [256,  256]
+  raw_put.object_size:    ["1m", "4m"]
+  raw_put.num_objects:    [256,  256]
+
+  # ---------------------------------------------------------------------
+  # Axis 2: CONCURRENCY (6 points) -- the axis this sweep exists for.
+  # The smoke measured only K=1 and K=32 and found 6.03 -> 10.11 MB/s of
+  # wire bandwidth: a 1.7x return on 32x the concurrency. Where between
+  # those two the curve flattens is the actual deliverable, because it is
+  # the number that tells you how many in-flight PUTs are worth issuing.
+  #
+  # runtime.num_threads is zipped to stay >= K. Each S3 PUT blocks a runtime
+  # WORKER for its duration inside the bdev's WriteBlocks, so a worker pool
+  # narrower than K caps effective concurrency below the requested value and
+  # the row silently measures the pool instead of the link.
+  #
+  # 64 workers against cpus_per_task: 40 is intentional oversubscription
+  # (1.6x): these threads are parked in a socket read, not spinning on CPU.
+  # The smoke already ran 48 workers on 40 cpus without trouble. 40 is a
+  # hard Slurm limit on this partition, so widening the pool is the only
+  # lever available -- cpus_per_task cannot follow it.
+  #
+  # IF THE K=64 ROW DIPS BELOW K=32 *FOR CLIO ONLY* while rawput holds
+  # flat, oversubscription is the suspect -- rawput forks processes and
+  # uses no runtime worker, so it is unaffected by the pool. Re-run that
+  # one point with runtime.num_threads: 48 before reading anything into it.
+  # If both dip, it is the link and the pool is innocent.
+  #
+  # clio_s3.worker_threads is REPORTED ONLY (it lands in the fairness block
+  # as `Runtime worker threads`); it must track runtime.num_threads or the
+  # fairness column will describe a pool that was never configured.
+  # ---------------------------------------------------------------------
+  clio_s3.concurrency:       [1, 4,  8,  16, 32, 64]
+  zarr_s3.async_concurrency: [1, 4,  8,  16, 32, 64]
+  raw_put.concurrency:       [1, 4,  8,  16, 32, 64]
+  runtime.num_threads:       [4, 8,  16, 32, 48, 64]
+  clio_s3.worker_threads:    [4, 8,  16, 32, 48, 64]
+
+loop:
+  - [clio_s3.object_size, clio_s3.num_objects,
+     zarr_s3.object_size, zarr_s3.num_objects,
+     raw_put.object_size, raw_put.num_objects]
+  - [clio_s3.concurrency, zarr_s3.async_concurrency, raw_put.concurrency,
+     runtime.num_threads, clio_s3.worker_threads]
+
+# Per-combination wall-clock backstop. Expiry marks that row failed and the
+# sweep continues, so one wedged row cannot lose the other 35.
+#
+# The slowest combination is 4m x 256 blobs at K=1: the smoke's K=1 row moved
+# 256 MiB per engine in 255 s, so 1 GiB per engine across four engines is
+# ~730 s. 2400 leaves room for a bad night without letting a genuinely hung
+# row burn 40 minutes of the allocation.
+run_timeout: 2400
+
+# 3 repeats, because absolute throughput on a shared uplink is a property of
+# the night you measured it. Without repeats there is no way to tell a real
+# difference between two K values from ordinary link variance, and "CLIO is
+# 6% off the floor" needs an error bar before it is a claim.
+repeat: 3
+output: "${HOME}/clio_s3_write_results"

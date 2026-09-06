@@ -38,7 +38,10 @@ endif()
 
 add_subdirectory(lightbeam)
 
-if(CLIO_ENABLE_AMAZON_DRIVE)
+# Gated on CAE_ENABLE_S3, not CLIO_ENABLE_AMAZON_DRIVE: this test drives the AWS
+# SDK directly, and CAE_ENABLE_S3 is the option that implies the SDK is present.
+# The google_cloud test below is Poco-based, so its bdev flag is the right gate.
+if(CAE_ENABLE_S3)
     add_subdirectory(amazon_s3)
 endif()
 

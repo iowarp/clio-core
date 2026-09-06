@@ -893,6 +893,23 @@ if(CLIO_ENABLE_GOOGLE_CLOUD)
   message(STATUS "Google Cloud Storage bdev support: ENABLED (Poco found)")
 endif()
 
+# The S3 adapter (kS3 bdev transport) signs requests itself and talks to S3
+# over HTTPS via Poco -- it does NOT link the AWS SDK, which corrupts runtime
+# init when loaded into a CLIO_INIT-ing process. Same auto-disable treatment as
+# the GCS adapter above. (CAE_ENABLE_S3 below is a different feature that
+# happens to share the word "S3": it gates the CAE assimilator, which DOES use
+# the SDK, out-of-process via cae_s3_tool.)
+if(CLIO_ENABLE_AMAZON_DRIVE AND NOT Poco_FOUND)
+  message(WARNING "CLIO_ENABLE_AMAZON_DRIVE is ON but the Poco library "
+                  "(Net, NetSSL, Crypto components) was not found. "
+                  "S3 bdev support will be disabled. "
+                  "Install Poco (libpoco-dev) to enable it.")
+  set(CLIO_ENABLE_AMAZON_DRIVE OFF)
+endif()
+if(CLIO_ENABLE_AMAZON_DRIVE)
+  message(STATUS "Amazon S3 bdev support: ENABLED (Poco found)")
+endif()
+
 # AWS SDK for C++ (optional - for the CAE S3 assimilator, s3://). Reuses the
 # same dependency the bdev S3 transport links (aws-cpp-sdk-s3/-core). If the
 # option is requested but the SDK isn't found, warn and disable rather than
