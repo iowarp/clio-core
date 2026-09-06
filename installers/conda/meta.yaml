@@ -22,6 +22,41 @@ build:
   string: {{ preset.replace('-', '_') }}_h{{ PKG_HASH }}
   script_env:
     - IOWARP_PRESET
+  # Drop the `python` spec that the host python weak-run-exports, and keep
+  # everything else it exports (notably `python_abi 3.12.* *_cp312`, which the
+  # release preset does need -- it builds the nanobind extension modules with
+  # CLIO_CORE_ENABLE_PYTHON=ON). conda-build's _filter_run_exports matches by
+  # exported-spec name, so listing `python` here removes only that one spec.
+  #
+  # conda-forge's python-3.12.14-h5f976f7_2_cpython -- a NON-debug build, and
+  # the one the host env resolves to -- ships a run_export that belongs to the
+  # debug variant:
+  #
+  #   weak: ["python_abi 3.12.* *_cp312", "python 3.12.* *_debug_cpython"]
+  #
+  # In the feedstock that second entry sits behind a jinja guard on
+  # py_interp_debug == "yes" (written out in prose, not quoted as a tag:
+  # conda-build renders jinja over this whole file BEFORE parsing it as YAML,
+  # comments included, so an if-tag in a comment is a real unbalanced block and
+  # fails the render). It leaked into the regular output of build _2 and is
+  # unique to it -- every other python 3.12.x build on the channel exports
+  # python_abi alone. conda-build then carries the spec into `run`, where
+  # get_pin_from_build keeps the build glob and rewrites the version to the
+  # x.x pin, giving `python >=3.12,<3.13.0a0 *_debug_cpython`. Debug builds are
+  # published only under conda-forge's `python_debug` label, never `main`, so
+  # the _test_env solve cannot satisfy it and the build dies before compiling:
+  #
+  #   ExplainedDependencyNeedsBuildingError: Unsatisfiable dependencies for
+  #   platform linux-64: {MatchSpec("python[version='>=3.12,<3.13.0a0',
+  #   build=*_debug_cpython]")}
+  #
+  # This broke every conda leg org-wide on 2026-09-02 (gpu-tests on dev and on
+  # unrelated PR branches alike) with no recipe change on either side -- the
+  # 2026-09-01 run of the same recipe was green. Remove once the feedstock
+  # ships a fixed build; `python` stays in `run:` below either way, so the
+  # x.x pin conda-build applies there is unaffected.
+  ignore_run_exports:
+    - python
 
 requirements:
   build:

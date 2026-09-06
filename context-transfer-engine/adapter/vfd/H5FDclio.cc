@@ -1342,8 +1342,24 @@ static herr_t H5FD__clio_do_write(H5FD_clio_t *file, haddr_t addr, size_t size,
   // already succeeded), but NOT silent: a dropped populate is a range the tier
   // does not hold, which the future read tier must not mistake for resident
   // data. Count it and log once per failure so residency work has a signal.
+  //
+  // Gated on the read tier, like every other site that touches the tier: the
+  // open coherence check, the read that serves from it, the read-through
+  // populate below it, and the close that stamps it. This one was the
+  // exception, and with CLIO_VFD_READ_TIER unset -- the default -- that made it
+  // pure cost. Nothing in the process can read what it writes, because
+  // tier_coherent is only ever set inside the same gate; and nothing later can
+  // either, because close only stamps inside that gate, so the next session
+  // that does enable reads finds no stamp and drops the copy. The read path's
+  // own comment already states the invariant: "a tier filled only by writes is
+  // never stamped, and so never readable."
+  //
+  // Measured on nc_perf_tst_attsperf (macOS arm64, HDF5 write callbacks are
+  // frequently a few bytes, one PwriteFd each): 705 s with the populate, 10.8 s
+  // without, against a 10.8 s native baseline. nc_perf_tst_files3: 223 s vs
+  // 12.9 s vs 13.8 s.
 #if H5FD_CLIO_HAVE_CACHE_TIER
-  if (H5FD__clio_cache_live(file->fd)) {
+  if (H5FD__clio_cache_live(file->fd) && H5FD__clio_read_tier_on()) {
     if (CLIO_CFS_CLIENT->PwriteFd(file->fd, buf, size, static_cast<off_t>(addr)) < 0) {
       H5FDclio_cache_write_failures_g++;
       HLOG(kWarning,

@@ -36,19 +36,41 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: dev
           submodules: recursive
 
-      - name: Install build dependencies
+      - name: Install system libraries
         run: |
           bash CI/retry.sh sudo apt-get update
           bash CI/retry.sh sudo apt-get install -y libhdf5-dev liburing-dev
 
+      # The apt packages above are not the whole dependency set -- yaml-cpp,
+      # cereal, thallium and the rest live in the `iowarp` conda env that
+      # CI/ci-deps.sh builds, which is why every other Linux job runs this and
+      # then activates the env before configuring. This job did neither and
+      # died at `find_package(yaml-cpp REQUIRED)` before it ever reached ctest.
+      - name: Install dependencies (conda env)
+        run: |
+          chmod +x CI/ci-deps.sh
+          ./CI/ci-deps.sh --only-deps
+
+      # `--preset release` rather than a bare -DCMAKE_BUILD_TYPE=Release: the
+      # preset is what turns CLIO_CORE_ENABLE_TESTS on. Without it the build
+      # produces no test targets at all, so `ctest -L flaky` would have had
+      # nothing to run even once configure succeeded.
       - name: Configure and build
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda &>/dev/null; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+          cmake --preset release
           cmake --build build -j"$(nproc)"
 
       # -L (not -LE): run ONLY what the gates skip. No --repeat here -- the
@@ -62,11 +84,28 @@ jobs:
       - name: Run quarantined tests
         id: quarantined
         run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda &>/dev/null; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
           set -o pipefail
           rc=0
           ctest --test-dir build -L flaky --output-on-failure --timeout 300 \
             2>&1 | tee /tmp/quarantined.log || rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # An EMPTY pen and a green pen are not the same result, and ctest
+          # reports both as exit 0. "All quarantined tests passed" printed over
+          # a run that executed nothing is the exact failure mode this workflow
+          # exists to prevent, so the two are distinguished for the summary.
+          if grep -q "No tests were found" /tmp/quarantined.log; then
+            echo "empty=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty=0" >> "$GITHUB_OUTPUT"
+          fi
           echo "quarantined suite exited $rc (reported, not gating)"
 
       - name: Summarize quarantine
@@ -75,7 +114,12 @@ jobs:
           {
             echo "## Quarantined tests (\`flaky\` label)"
             echo
-            if [ "${{ steps.quarantined.outputs.rc }}" = "0" ]; then
+            if [ "${{ steps.quarantined.outputs.empty }}" = "1" ]; then
+              echo "No test currently carries the \`flaky\` ctest label — the"
+              echo "quarantine pen is empty and nothing was run. This is a real"
+              echo "result, not a pass: the gates' \`-LE flaky\` exclusions are"
+              echo "matching nothing."
+            elif [ "${{ steps.quarantined.outputs.rc }}" = "0" ]; then
               echo "All quarantined tests passed. Candidates for requalification —"
               echo "check each against a measured baseline before removing the label."
             else
@@ -101,7 +145,7 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15, windows-2025]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: dev
           submodules: recursive

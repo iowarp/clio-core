@@ -199,3 +199,35 @@ TEST_CASE("SystemInfoSharedMemoryCreateFailure") {
   SystemInfo::DestroySharedMemory(too_long);
   SystemInfo::DestroySharedMemory("ctp_no_such_segment_xyz");
 }
+
+TEST_CASE("SystemInfoShmRecreateAfterDestroy") {
+  // Regression for #1069. shm_destroy() must actually release the mapping, so
+  // the same segment name can be created again -- the pattern every test
+  // fixture and every restarting client uses.
+  //
+  // On Windows this failed: UnmapMemory() called VirtualFree(ptr, size,
+  // MEM_RELEASE), which cannot free a MapViewOfFile region at all (and, for a
+  // VirtualAlloc region, MEM_RELEASE requires dwSize == 0). Nothing was ever
+  // unmapped. Once segments gained a sparse backing file (#1063), the leaked
+  // view kept a live section on that file and the second create could not
+  // truncate it: ERROR_USER_MAPPED_FILE. The whole cycle has to run at least
+  // three times, because the first create is the one that passed even when
+  // this was broken.
+  const std::string name = "ctp_shm_recreate_test_" +
+                           std::to_string(SystemInfo::GetPid());
+  const size_t kSize = 4 * 1024 * 1024;
+
+  for (int i = 0; i < 3; ++i) {
+    PosixShmMmap backend;
+    REQUIRE(backend.shm_init(ctp::ipc::MemoryBackendId::GetRoot(), kSize,
+                             name));
+    // Touch the region: a create that "succeeded" against a stale section
+    // from a previous iteration must not be mistaken for a good one.
+    REQUIRE(backend.data_ != nullptr);
+    backend.data_[0] = static_cast<char>('a' + i);
+    REQUIRE(backend.data_[0] == static_cast<char>('a' + i));
+    backend.shm_destroy();
+  }
+
+  SystemInfo::DestroySharedMemory(name);
+}
