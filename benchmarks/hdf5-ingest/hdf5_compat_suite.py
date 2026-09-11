@@ -1010,6 +1010,22 @@ def _env(mode):
     if mode == "vol":
         e["HDF5_PLUGIN_PATH"] = BIN
         e["HDF5_VOL_CONNECTOR"] = "clio"
+        # Pin ADMISSION so these cases test cache MECHANICS, not cache POLICY.
+        #
+        # The connector decides what to admit by comparing the tier against the
+        # store it would replace, and this suite runs on a local filesystem
+        # where declining to cache is the CORRECT answer -- a page-cache read is
+        # faster than any round trip to the tier. Left to the default, the
+        # cases below that assert a hit (c_selection, cache_reuse, bbox_fetch,
+        # telemetry) would fail for a connector behaving exactly as designed,
+        # and the whole suite would have to be re-tuned every time the policy
+        # moved. The corpus is deliberately tiny -- vol_c_selection_test is
+        # 8x6 int32, 192 bytes -- which is precisely the size a cost-based
+        # policy refuses on fast storage.
+        #
+        # The policy itself is measured separately; this pin is only so a
+        # mechanics regression cannot hide behind a policy change.
+        e["CLIO_VOL_ADMIT_COST"] = "0"
     elif mode == "vfd":
         e["HDF5_PLUGIN_PATH"] = BIN
         e["HDF5_DRIVER"] = "clio_vfd"
