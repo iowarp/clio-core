@@ -172,6 +172,18 @@ struct clio_dataset_t {
      is one round trip per element-space transfer -- tens of thousands per test
      -- for a tier that cannot be used by such a workload at all. */
   bool image_known_absent = false;
+  /* The positive counterpart of image_known_absent: this handle has SEEN
+     chunk_0 present. Without it every read of a cached dataset re-paid a
+     blocking GetBlobSize round trip to be told what the previous read already
+     established -- 16 us of a 100 us served read, and the dominant per-read
+     cost once the selection path stopped materialising the whole image.
+
+     Safe to trust because a hit is never taken on the memo alone: every chunk
+     get in clio_read_cached_image is return-code checked, so a memo that has
+     gone stale (a blob evicted underneath us) fails the fetch, invalidates and
+     falls back to native -- the same path a negative hit test takes. The memo
+     can cost a wasted fetch attempt; it cannot produce a wrong answer. */
+  bool image_known_present = false;
   /* Pending async writes flushed on close */
   std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> pending_puts;
   std::vector<ctp::ipc::FullPtr<char>> pending_buffers;
@@ -630,6 +642,7 @@ static void clio_invalidate_dataset(clio_dataset_t *dset) {
   /* The hit-test key is gone and this handle is the one that removed it, so the
      next invalidation and the next hit test both already have their answer. */
   dset->image_known_absent = true;
+  dset->image_known_present = false;
 }
 
 /* ========================================================================
@@ -1932,14 +1945,19 @@ static bool clio_cache_populated(clio_dataset_t *dataset) {
      selection read pays a blocking round trip to be told "miss" on every single
      H5Dread for the whole life of the file. See image_known_absent. */
   if (dataset->image_known_absent) return false;
+  if (dataset->image_known_present) return true;
   auto *cte_client = get_cte_client();
   auto sz = cte_client->AsyncGetBlobSize(dataset->file->tag_id,
                                          dataset->dataset_path + "/chunk_0");
   sz.Wait();
-  if (sz->size_ > 0) return true;
+  if (sz->size_ > 0) {
+    dataset->image_known_present = true;
+    return true;
+  }
   /* A miss is knowledge too, and it is the same fact the invalidate path
      records: chunk_0 is not there. */
   dataset->image_known_absent = true;
+  dataset->image_known_present = false;
   return false;
 }
 
@@ -2064,6 +2082,20 @@ static herr_t clio_scatter_cb(const void **src_buf, size_t *src_bytes,
   return 0;
 }
 
+/* Per-thread gather scratch for clio_serve_selection, grown to the largest
+   image served on this thread and never shrunk. Deliberately raw and
+   uninitialized: the only bytes read out of it are the ones the fetch above
+   just wrote (see the call site). Freed at thread exit. */
+static char *clio_serve_scratch(size_t need) {
+  static thread_local std::unique_ptr<char[]> buf;
+  static thread_local size_t cap = 0;
+  if (need > cap) {
+    buf.reset(new (std::nothrow) char[need]);
+    cap = buf ? need : 0;
+  }
+  return buf.get();
+}
+
 /* Selection-aware READ serving (serve-only, no prefetch). When a hyperslab or
    point read hits a dataset whose linear chunk cache is populated, satisfy it
    from the CTE tier: fetch the chunks the selection's bounding box touches,
@@ -2112,9 +2144,20 @@ static bool clio_serve_selection(clio_dataset_t *dataset, hid_t mem_type_id,
     size_t span_lo = 0, span_hi = total_size;
     clio_selection_byte_span(full_space, file_space_id, type_size, total_size,
                              &span_lo, &span_hi);
-    std::vector<char> full(total_size);
-    if (!clio_read_cached_image(dataset, total_size, full.data(),
-                                span_lo, span_hi))
+    /* Reused and NOT value-initialized. `std::vector<char> full(total_size)`
+       both allocated and zeroed the whole image on every partial read, so an
+       8 KiB hyperslab of a 128 MiB dataset paid a 128 MiB memset -- measured at
+       72 ms per read against 5.6 us for the same read served natively, and
+       scaling with the DATASET rather than the selection.
+
+       Leaving it uninitialized is safe: H5Dgather reads only the positions the
+       file-space selection names, every one of which lies inside the selection's
+       bounding box by construction, and clio_read_cached_image has just filled
+       exactly that range. Bytes outside it are never read. Reusing the buffer
+       across reads additionally keeps the pages faulted in. */
+    char *full = clio_serve_scratch(total_size);
+    if (!full) break;
+    if (!clio_read_cached_image(dataset, total_size, full, span_lo, span_hi))
       break;
 
     /* Gather the file-space selection into a contiguous buffer. H5S_ALL file
@@ -2124,7 +2167,7 @@ static bool clio_serve_selection(clio_dataset_t *dataset, hid_t mem_type_id,
     if (nsel <= 0) break;
     size_t sel_size = static_cast<size_t>(nsel) * type_size;
     std::vector<char> sel(sel_size);
-    if (H5Dgather(fspace, full.data(), mem_type_id, sel_size, sel.data(),
+    if (H5Dgather(fspace, full, mem_type_id, sel_size, sel.data(),
                   nullptr, nullptr) < 0)
       break;
 
@@ -2319,7 +2362,12 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
           clio_tier_mark_accepting();
           /* chunk_0 landed: the tier is no longer known-empty for this
              dataset. See the write path's matching line. */
-          if (i == 0) dataset->image_known_absent = false;
+          if (i == 0) {
+            dataset->image_known_absent = false;
+            /* This put was WAITED on, so chunk_0 is known to have landed --
+               unlike the write path, where it is only submitted. */
+            dataset->image_known_present = true;
+          }
         }
       }
       /* Report before any invalidation below, so the discard has something to
