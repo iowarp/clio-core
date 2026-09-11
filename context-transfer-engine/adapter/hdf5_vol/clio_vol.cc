@@ -120,6 +120,19 @@ struct clio_file_t {
      stale" decision later. See clio_file_bind_tag. */
   bool tag_bound = false;
   bool tag_bind_failed = false;
+  /* This connector emptied the tier for this file at open (truncate, or a
+     coherence verdict that dropped the tag) and nothing has been staged under
+     the new tag since. The file-scope counterpart of
+     clio_dataset_t::image_known_absent, and the one that matters for a file
+     with many objects: without it, EVERY dataset in a cold file pays its own
+     blocking GetBlobSize to be told the miss that binding the tag already
+     established -- 3000 datasets, 3000 round trips, all of them guaranteed
+     misses.
+
+     Only ever causes a false MISS, never a false hit: a miss sends the read to
+     the native file, which is always correct. So a concurrent process staging
+     into the same tag costs a lost hit and nothing else. */
+  bool tier_known_empty = false;
   bool opened_truncated = false;
   /* Safe mode: cacheable datasets currently open in this file. H5Fflush and
      H5Fclose drain their pending CTE puts so no async write outlives a
@@ -560,6 +573,38 @@ static ClioAdmit clio_admit_policy() {
   return ClioAdmit::kOnWrite;
 }
 
+/* Smallest dataset worth staging; 0 (the default) means no floor.
+ *
+ * Below some size the tier cannot win on any storage medium: admitting costs at
+ * least one blocking PutBlob round trip, and what a later hit saves is one read
+ * of fewer bytes than that round trip took to arrange. Measured on 3000 x
+ * 64-byte datasets, staging cost ~183 us per dataset -- to store 64 bytes -- and
+ * the hit test another ~182 us, making the cache 18x SLOWER than no cache at
+ * all. With this set to 64 KiB the same workload goes from 1.19 s to 0.064 s of
+ * read time, because nothing stages and file->tier_known_empty then stays true
+ * so the per-dataset hit test is skipped too. The two effects are multiplicative
+ * and neither delivers much alone.
+ *
+ * DEFAULTED OFF deliberately. A floor is a policy change, not a bug fix: the
+ * compat suite asserts that a 192-byte dataset is cached (vol_c_selection_test
+ * is 8x6 int32, and the bbox_fetch case is built on that corpus), so any
+ * non-zero value here fails four of its cache-behaviour cases. That suite
+ * encodes the project's current answer to "is a tiny object worth caching"; the
+ * measurement above is an argument for changing that answer, and the change
+ * belongs to whoever owns the policy. Until then this ships as a measured knob.
+ *
+ * This is a floor on the SIZE of a staged image, not a policy about WHEN to
+ * stage; CLIO_VOL_ADMIT still decides that. */
+static size_t clio_min_stage_bytes() {
+  static const size_t v = [] {
+    if (const char *e = std::getenv("CLIO_VOL_MIN_STAGE_BYTES")) {
+      if (*e) return static_cast<size_t>(std::strtoull(e, nullptr, 10));
+    }
+    return static_cast<size_t>(0);
+  }();
+  return v;
+}
+
 /* Read ledger for kOnSecondAccess. Keyed by (tag, dataset path) and held for
  * the process, NOT on clio_dataset_t: wrappers die on close, and the evidence
  * wanted is "read more than once" ACROSS opens. Counts misses, not reads --
@@ -607,6 +652,9 @@ static void clio_invalidate_dataset(clio_dataset_t *dset) {
      difference between one blocking RPC per hyperslab write and one per
      dataset. See image_known_absent. */
   if (dset->image_known_absent) return;
+  /* Same fact at file scope: nothing has been staged for this file since the
+     tag was emptied, so there is no blob to delete. */
+  if (dset->file->tier_known_empty) return;
   /* Tell the telemetry the staged bytes are gone BEFORE dropping them.
      Everything staged for this dataset is about to stop being servable, so
      leaving it counted would inflate the admission denominator with data that
@@ -1127,6 +1175,7 @@ static bool clio_file_bind_tag(clio_file_t *file) {
   if (truncated) {
     auto del = cte_client->AsyncDelTag(tag_name);
     del.Wait();  /* absent tag is a harmless no-op */
+    file->tier_known_empty = true;
   }
   auto tag_task = cte_client->AsyncGetOrCreateTag(tag_name);
   tag_task.Wait();
@@ -1155,6 +1204,7 @@ static bool clio_file_bind_tag(clio_file_t *file) {
       return false;
     }
     file->tag_id = again->tag_id_;
+    file->tier_known_empty = true;
   }
   file->tag_bound = true;
   return true;
@@ -1842,7 +1892,8 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
        full, skip the staging loop entirely rather than pay an SHM allocation
        and a memcpy per chunk for bytes that cannot land. */
     const bool admit_here = (clio_admit_policy() == ClioAdmit::kOnWrite) &&
-                            clio_tier_accepting();
+                            clio_tier_accepting() &&
+                            total_size >= clio_min_stage_bytes();
     /* False whenever this write's bytes were NOT all offered to the tier --
        policy or back-pressure skipped staging, or the loop aborted early. The
        file then holds data the cache does not, so any previously staged image
@@ -1883,7 +1934,10 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
          being true. Cleared on submission rather than on completion: the memo
          may only ever skip work whose answer is certain, and from here on it
          is not. */
-      if (i == 0) dataset->image_known_absent = false;
+      if (i == 0) {
+        dataset->image_known_absent = false;
+        dataset->file->tier_known_empty = false;
+      }
     }
 
     /* Write to the native VOL -- the authoritative store. Its status is this
@@ -1946,6 +2000,9 @@ static bool clio_cache_populated(clio_dataset_t *dataset) {
      H5Dread for the whole life of the file. See image_known_absent. */
   if (dataset->image_known_absent) return false;
   if (dataset->image_known_present) return true;
+  /* The tag was emptied at open and nothing has been staged since, so no
+     dataset in this file can have an image. Answer without the round trip. */
+  if (dataset->file->tier_known_empty) return false;
   auto *cte_client = get_cte_client();
   auto sz = cte_client->AsyncGetBlobSize(dataset->file->tag_id,
                                          dataset->dataset_path + "/chunk_0");
@@ -2329,7 +2386,8 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
          re-discovered on every read-miss: stage chunk_0, fail, invalidate,
          miss again on the next read, stage again. The gate makes that cost
          once per retry interval instead of once per read. */
-      bool stage_here = clio_tier_accepting();
+      bool stage_here = clio_tier_accepting() &&
+                        total_size >= clio_min_stage_bytes();
       /* Under second-access, the FIRST miss only records that the read
          happened; staging waits for the second. Record it even when
          back-pressure is holding the gate shut, so a tier that frees up later
@@ -2364,6 +2422,7 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
              dataset. See the write path's matching line. */
           if (i == 0) {
             dataset->image_known_absent = false;
+            dataset->file->tier_known_empty = false;
             /* This put was WAITED on, so chunk_0 is known to have landed --
                unlike the write path, where it is only submitted. */
             dataset->image_known_present = true;
