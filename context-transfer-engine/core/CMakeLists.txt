@@ -5,6 +5,7 @@ add_clio_module_runtime(
   SOURCES
     src/core_runtime.cc
     src/core_config.cc
+    src/core_viz.cc
     # Data placement engine: one source file per placement policy
     src/dpe/dpe.cc
     src/dpe/random_dpe.cc
@@ -19,10 +20,12 @@ add_clio_module_runtime(
     # clio::run::Container dispatch path.
 )
 
-# Surface the GPU backend flags into the runtime library so the
-# GpuMetadataCache helpers (which reach ctp::GpuApi::MallocManaged etc.)
-# see the matching #if CTP_ENABLE_{CUDA,ROCM,SYCL} branches. Without
-# these the GPU code paths in core_runtime.cc are no-ops.
+# Surface the GPU backend flags into the runtime library so its ctp
+# headers resolve the same way they do inside clio_run_cxx. This is an
+# ABI requirement, not a feature switch: clio_ctp/types/numbers.h changes
+# the width of min_u32 & friends under CTP_ENABLE_{CUDA,ROCM}, so a TU
+# that disagrees about these flags disagrees about the layout of every
+# shared struct that uses them.
 if(CLIO_CORE_ENABLE_SYCL)
   # Host TU: CTP_ENABLE_SYCL=1 without -fsycl. See context-runtime/src for the
   # rationale; CLIO_SYCL_INCLUDE_DIR is discovered in wrp_core_enable_sycl().
@@ -56,5 +59,9 @@ endif()
 
 # Note: Cross-namespace dependencies (clio_run admin and bdev) are automatically
 # linked by add_chimod_* functions in ClioCoreCommon.cmake for non-clio_run namespaces
+
+# Web dashboard page for this module (issue #990): mounted at /viz/clio_cte_core
+# by the runtime as soon as a CTE pool comes up.
+clio_add_viz_assets(MOD_NAME clio_cte_core)
 
 add_subdirectory(util)

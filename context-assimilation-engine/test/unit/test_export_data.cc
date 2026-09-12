@@ -230,16 +230,29 @@ TEST_CASE("ExportData - Task AggregateOut", "[cae][export][task]") {
 
   auto replica = ipc->NewTask<ExportDataTask>(clio::run::CreateTaskId(),
                                               clio::cae::core::kCaePoolId,
-                                              clio::run::PoolQuery::Local(),
+                                              clio::run::PoolQuery::Broadcast(),
                                               "tag_agg", "/tmp/agg.bin", "binary");
   replica->bytes_exported_ = 200;
   replica->result_code_ = 5;
 
+  const clio::run::TaskId id_before = orig->task_id_;
+  const clio::run::PoolQuery query_before = orig->pool_query_;
+
   orig->AggregateOut(replica.template Cast<clio::run::Task>());
 
-  // AggregateOut calls Copy, so orig should now have replica's values
-  REQUIRE(orig->bytes_exported_ == 200);
-  REQUIRE(orig->result_code_ == 5);
+  // AggregateOut is an N->1 GATHER of OUT fields, not a whole-task copy
+  // (issue #915): each replica exports its own share, so the byte counts SUM.
+  REQUIRE(orig->bytes_exported_ == 300);
+  // result_code_ keeps the FIRST failure — a later replica must not be able to
+  // mask it (the old Copy() delegation let 5 overwrite 1).
+  REQUIRE(orig->result_code_ == 1);
+
+  // The origin's identity must survive aggregation untouched: the whole-task
+  // copy used to overwrite it with the replica's, which is what corrupted
+  // send_map_/completion bookkeeping mid-flight in #856.
+  REQUIRE(orig->task_id_ == id_before);
+  REQUIRE(memcmp(&orig->pool_query_, &query_before,
+                 sizeof(clio::run::PoolQuery)) == 0);
 
   orig.reset();
   replica.reset();
@@ -550,14 +563,26 @@ TEST_CASE("ParseOmni - Task AggregateOut", "[cae][export][task]") {
 
   auto rep = ipc->NewTask<ParseOmniTask>(clio::run::CreateTaskId(),
                                          clio::cae::core::kCaePoolId,
-                                         clio::run::PoolQuery::Local(), ctxs);
+                                         clio::run::PoolQuery::Broadcast(), ctxs);
   rep->num_tasks_scheduled_ = 5;
   rep->result_code_ = 9;
 
+  const clio::run::TaskId id_before = orig->task_id_;
+  const clio::run::PoolQuery query_before = orig->pool_query_;
+
   orig->AggregateOut(rep.template Cast<clio::run::Task>());
 
-  REQUIRE(orig->num_tasks_scheduled_ == 5);
+  // OUT fields only, merged with the semantics that suit them (issue #915):
+  // each replica schedules its own share, so the counts SUM...
+  REQUIRE(orig->num_tasks_scheduled_ == 6);
+  // ...and result_code_ takes the first failure. The origin was still clean
+  // (0), so the replica's 9 is adopted.
   REQUIRE(orig->result_code_ == 9);
+
+  // Identity is never touched by a gather.
+  REQUIRE(orig->task_id_ == id_before);
+  REQUIRE(memcmp(&orig->pool_query_, &query_before,
+                 sizeof(clio::run::PoolQuery)) == 0);
 
   orig.reset();
   rep.reset();

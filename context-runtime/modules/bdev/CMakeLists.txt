@@ -79,6 +79,10 @@ add_clio_module_runtime(
     ${BDEV_GCS_LIBS}
 )
 
+# Web dashboard page for this module (issue #990): mounted at /viz/clio_bdev by
+# the runtime as soon as a bdev pool comes up.
+clio_add_viz_assets(MOD_NAME clio_bdev)
+
 # SYCL HBM bdev support: a separate task. Adding -fsycl to
 # clio_bdev_runtime conflicts with the runtime's precompiled
 # headers (clang-offload-bundler rejects .pch). When that's resolved

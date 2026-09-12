@@ -92,6 +92,7 @@ jobs:
   create-deps-cpu-manifest:
     name: Create Multi-Arch Manifest (deps-cpu)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [build-deps-cpu-amd64, build-deps-cpu-arm64]
     steps:
       - name: Login to Docker Hub

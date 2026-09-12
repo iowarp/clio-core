@@ -142,7 +142,13 @@ struct FlushTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<FlushTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<FlushTask>();
+    // Each replica reports the work IT did, so the collective figure is the
+    // SUM (see admin FlushTask::AggregateOut).
+    total_work_done_ += replica->total_work_done_;
   }
 };
 

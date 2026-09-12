@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clio Safe Block Devices</title>
+  <!-- The admin shell's stylesheet + helpers: every page is same-origin. -->
+  <link rel="stylesheet" href="/viz/clio_admin/css/style.css">
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-brand">Clio</div>
+    <ul class="nav-links">
+      <li><a href="/viz/clio_admin/index.html">Cluster</a></li>
+      <li><a href="/viz/clio_admin/pools.html">Pools</a></li>
+      <li><a href="/viz/clio_admin/config.html">Config</a></li>
+      <li><a href="/viz/clio_safe_bdev/index.html" class="active">Safe bdev</a></li>
+    </ul>
+    <div class="nav-status" id="conn-status">connecting…</div>
+  </nav>
+
+  <main class="content">
+    <h1>Safe block devices</h1>
+    <p class="sub">
+      Erasure-coded arrays served by the <code>clio_safe_bdev</code> ChiMod.
+      Create arrays from the <a href="/viz/clio_admin/pools.html">Pools</a> tab.
+    </p>
+    <p class="sub"><a href="/viz/clio_admin/pools.html">&larr; back to pools</a></p>
+    <div id="errors"></div>
+
+    <div class="row">
+      <label for="pool-select">Array:</label>
+      <select id="pool-select"></select>
+      <span class="sub" id="pool-meta"></span>
+    </div>
+
+    <h2>Recovery</h2>
+    <div class="grid" id="recovery"></div>
+
+    <h2>All statistics</h2>
+    <div id="all-stats"></div>
+
+    <h2>Members</h2>
+    <div id="members"></div>
+
+    <h2>Add member</h2>
+    <p class="sub">
+      Name an existing bdev pool, or give a capacity and it is created first.
+      Parity members raise the array's parity level instead of adding capacity.
+    </p>
+    <div class="row">
+      <input id="am-name" size="22" placeholder="member pool name">
+      <input id="am-capacity" size="8" placeholder="capacity">
+      <select id="am-type"><option value="file">file</option><option value="ram">ram</option></select>
+      <label><input type="checkbox" id="am-parity"> parity</label>
+      <button id="am-submit">Add member</button>
+    </div>
+    <div class="sub" id="am-msg"></div>
+
+    <h2>Task predictions</h2>
+    <p class="sub">
+      The learned per-method cost model for this array: predicted time =
+      coefficient &times; task size; the error columns are the average miss.
+    </p>
+    <div id="predictions"></div>
+  </main>
+
+  <script src="/viz/clio_admin/js/api.js"></script>
+  <script src="js/safe_bdev.js"></script>
+</body>
+</html>

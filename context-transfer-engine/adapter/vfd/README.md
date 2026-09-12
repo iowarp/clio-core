@@ -68,10 +68,16 @@ export HDF5_DRIVER=clio_vfd
 ./my_hdf5_app
 ```
 
-**Known gap:** the driver does not yet parse `HDF5_DRIVER_CONFIG`, so
-`cache_enabled` cannot be set on this path (it uses the default, cache on).
-This path is also not yet covered by the test suite. Both are tracked as Q2.1
-work in `translation/VFD_VOL_PLAN.md` ("What Q2.x still has to build").
+`HDF5_DRIVER_CONFIG` is parsed: `H5FD__clio_apply_config_str` pulls it off the
+FAPL with `H5Pget_driver_config_str` and applies it at open. The grammar is the
+shared CLIO `key=value;...` one, and an unrecognised key or an unparseable value
+FAILS the open rather than being ignored — a knob the caller believes is set but
+is not is worse than a refused open. Both the accepted and the refused spellings
+are covered by section 22 of `test/unit/adapters/vfd/test_vfd_adapter.cc`.
+
+```sh
+export HDF5_DRIVER_CONFIG="cache=0;sieve=131072"
+```
 
 ## File naming
 
@@ -96,6 +102,8 @@ non-path and `H5Fopen` would abort. Both flags are now advertised.
 | Knob | Where | Default | Effect |
 |---|---|---|---|
 | `cache_enabled` | `H5Pset_fapl_clio` | on | Populate the CTE tier on write |
+| `cache=0\|1` | `HDF5_DRIVER_CONFIG` | on | The same knob, from the environment |
+| `sieve=<bytes>` | `HDF5_DRIVER_CONFIG` | 64 KiB | Vector-I/O coalescing window: consecutive elements whose spanning region fits in it are serviced as one I/O. `0` restores element-at-a-time. Accepts 0 through 1 GiB; the value bounds a per-call scratch allocation, so anything larger is refused rather than clamped |
 | `HDF5_DRIVER=clio_vfd` | env | — | Select the driver without source changes |
 | `HDF5_PLUGIN_PATH` | env | — | Where HDF5 looks for the `.so` |
 | `CLIO_VFD_DEBUG` | env | off | Print every read/write addr+size to stderr |

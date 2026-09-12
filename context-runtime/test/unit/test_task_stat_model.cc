@@ -34,13 +34,14 @@
 /**
  * Issue #956: the per-pool task-stat model.
  *
- * Covers the three properties the scheduler analysis depends on:
+ * Covers the properties the scheduler analysis depends on (issues #956, #994):
  *   1. a pool has a dedicated static container, distinct from the container
- *      that runs its methods, and that static container owns the model;
- *   2. every container of the pool reads and writes THAT model, so what the
- *      monitor reports is what the scheduler used;
- *   3. the weights survive a save/restore, matched by method NAME so a
- *      renumbered method enum cannot graft one method's model onto another.
+ *      that runs its methods, and the model is NOT on it: every container owns
+ *      and reinforces its own per-method statistics, so a write through one
+ *      container never moves another container's coefficients;
+ *   2. the weights survive a save/restore per container id, matched by method
+ *      NAME so a renumbered method enum cannot graft one method's model onto
+ *      another, and a container registered later restores its own file.
  */
 
 #include "../simple_test.h"
@@ -106,6 +107,7 @@ TEST_CASE("TaskStatModel: snapshot survives a YAML round trip",
   TaskStatModelSnapshot saved;
   saved.chimod_name_ = "bdev";
   saved.pool_name_ = "/mnt/nvme/scratch";
+  saved.container_id_ = 3;
   saved.learning_rate_ = 0.2f;
   saved.methods_["Write"] = MethodStatWeights{2.5f, 0.125f, 7.5f, 0.25f};
   saved.methods_["Read"] = MethodStatWeights{1.5f, 0.0625f, 3.25f, 0.5f};
@@ -115,6 +117,7 @@ TEST_CASE("TaskStatModel: snapshot survives a YAML round trip",
   REQUIRE(loaded.Load(path));
   REQUIRE(loaded.chimod_name_ == "bdev");
   REQUIRE(loaded.pool_name_ == "/mnt/nvme/scratch");
+  REQUIRE(loaded.container_id_ == 3);
   REQUIRE(loaded.methods_.size() == 2);
   REQUIRE(NearlyEqual(loaded.methods_["Write"].cpu_coef_, 2.5f));
   REQUIRE(NearlyEqual(loaded.methods_["Write"].cpu_mape_, 0.125f));
@@ -138,10 +141,29 @@ TEST_CASE("TaskStatModel: snapshot survives a YAML round trip",
   REQUIRE(corrupt.Empty());
 }
 
-TEST_CASE("TaskStatModel: pool has a dedicated static container that owns "
-          "the model", "[task_stat_model]") {
+/**
+ * Build a second real container for `pool_id` on this node with container id
+ * `container_id`, Init it exactly as CreatePool does (identity + model table
+ * + method names), and register it. This is what recovery does when a dead
+ * peer's container is re-hosted here (#856), and it is the only way to get
+ * two containers of one pool onto a single-node test runtime.
+ */
+DynamicContainer RegisterExtraContainer(PoolId pool_id, u32 container_id) {
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  const PoolInfo *info = pool_manager->GetPoolInfo(pool_id);
+  REQUIRE(info != nullptr);
+  DynamicContainer dc(info->chimod_name_, pool_id, info->pool_name_);
+  REQUIRE(dc.IsValid());
+  dc.get()->Init(pool_id, info->pool_name_, container_id);
+  REQUIRE(pool_manager->RegisterContainer(pool_id, container_id, dc));
+  return dc;
+}
+
+TEST_CASE("TaskStatModel: every container owns its own model; the static "
+          "container owns none",
+          "[task_stat_model]") {
   REQUIRE(InitRuntimeOnce());
-  PoolId pool_id = CreateRamBdevPool("model_static_956", 9956);
+  PoolId pool_id = CreateRamBdevPool("model_per_container_994", 9956);
 
   auto *pool_manager = CLIO_POOL_MANAGER;
   REQUIRE(pool_manager != nullptr);
@@ -155,73 +177,135 @@ TEST_CASE("TaskStatModel: pool has a dedicated static container that owns "
   // not be the container that serves the pool's tasks.
   REQUIRE(static_dc.get() != local_dc.get());
   REQUIRE(static_dc.get()->container_id_ == kStaticContainerId);
-  REQUIRE(static_dc.get()->IsModelOwner());
-  REQUIRE_FALSE(local_dc.get()->IsModelOwner());
 
-  // A write through the serving container lands on the static container's
-  // model, and inference through the serving container reads it back.
+  // A second container of the same pool on this node (what recovery produces).
+  const u32 other_id = node_id + 41;
+  DynamicContainer other_dc = RegisterExtraContainer(pool_id, other_id);
+  REQUIRE(pool_manager->GetContainer(pool_id, other_id).get() ==
+          other_dc.get());
+  REQUIRE(pool_manager->GetLocalContainers(pool_id).size() == 2);
+
   const u32 method = clio::run::bdev::Method::kWrite;
-  local_dc.get()->SetMethodWallCoef(method, 12.5f);
-  REQUIRE(NearlyEqual(static_dc.get()->GetMethodModelWall()[method], 12.5f));
+  const float static_wall_before =
+      static_dc.get()->GetMethodModelWall()[method];
+  const float other_wall_before = other_dc.get()->GetMethodModelWall()[method];
 
+  // A seed written through the serving container lands on THAT container only:
+  // neither the static container nor the pool's other container sees it.
+  local_dc.get()->SetMethodWallCoef(method, 12.5f);
+  REQUIRE(NearlyEqual(local_dc.get()->GetMethodModelWall()[method], 12.5f));
+  REQUIRE(NearlyEqual(static_dc.get()->GetMethodModelWall()[method],
+                      static_wall_before));
+  REQUIRE(NearlyEqual(other_dc.get()->GetMethodModelWall()[method],
+                      other_wall_before));
+
+  // Inference reads the container's own weights.
   TaskStat stat;
   stat.wall_time_ = 3.0f;
   REQUIRE(NearlyEqual(local_dc.get()->InferWallClockTime(method, stat),
                       12.5f * 4.0f));
+  REQUIRE(NearlyEqual(other_dc.get()->InferWallClockTime(method, stat),
+                      other_wall_before * 4.0f));
 
-  // Reinforcement from a completed task moves the shared model, not a private
-  // per-container copy.
+  // Reinforcement from a completed task moves ONLY the container it ran on.
   TaskStat cpu_stat;
   cpu_stat.compute_ = 9;
-  float before = static_dc.get()->GetMethodModel()[method];
+  const float local_before = local_dc.get()->GetMethodModel()[method];
+  const float other_before = other_dc.get()->GetMethodModel()[method];
+  const float static_before = static_dc.get()->GetMethodModel()[method];
   local_dc.get()->ReinforceCpuModel(method, /*pred=*/100.0f, /*real=*/10.0f,
                                     cpu_stat);
-  float after = static_dc.get()->GetMethodModel()[method];
-  REQUIRE(after < before);  // over-prediction must shrink the coefficient
-  REQUIRE(NearlyEqual(local_dc.get()->GetMethodModel()[method], after));
+  const float local_after = local_dc.get()->GetMethodModel()[method];
+  REQUIRE(local_after < local_before);  // over-prediction shrinks the coef
+  REQUIRE(NearlyEqual(other_dc.get()->GetMethodModel()[method], other_before));
+  REQUIRE(NearlyEqual(static_dc.get()->GetMethodModel()[method],
+                      static_before));
+  REQUIRE(local_dc.get()->IsModelDirty());
+  REQUIRE_FALSE(other_dc.get()->IsModelDirty());
+  REQUIRE_FALSE(static_dc.get()->IsModelDirty());
+
+  // And the other way round: learning on the second container leaves the
+  // serving container's coefficient exactly where it was.
+  other_dc.get()->ReinforceCpuModel(method, /*pred=*/10.0f, /*real=*/100.0f,
+                                    cpu_stat);
+  REQUIRE(other_dc.get()->GetMethodModel()[method] > other_before);
+  REQUIRE(NearlyEqual(local_dc.get()->GetMethodModel()[method], local_after));
 }
 
-TEST_CASE("TaskStatModel: weights persist and restore by method name",
+TEST_CASE("TaskStatModel: weights persist and restore per container by "
+          "method name",
           "[task_stat_model]") {
   REQUIRE(InitRuntimeOnce());
-  PoolId pool_id = CreateRamBdevPool("model_persist_956", 9957);
+  PoolId pool_id = CreateRamBdevPool("model_persist_994", 9957);
 
   auto *pool_manager = CLIO_POOL_MANAGER;
   u32 node_id = CLIO_IPC->GetNodeId();
-  DynamicContainer static_dc = pool_manager->GetStaticContainer(pool_id);
-  REQUIRE(static_dc.IsValid());
+  DynamicContainer local_dc = pool_manager->GetContainer(pool_id, node_id);
+  REQUIRE(local_dc.IsValid());
+  const u32 other_id = node_id + 42;
+  DynamicContainer other_dc = RegisterExtraContainer(pool_id, other_id);
+  const PoolInfo *info = pool_manager->GetPoolInfo(pool_id);
+  REQUIRE(info != nullptr);
+  const std::string chimod_name = info->chimod_name_;
 
   const u32 write_id = clio::run::bdev::Method::kWrite;
   const u32 read_id = clio::run::bdev::Method::kRead;
-  static_dc.get()->SetMethodCpuCoef(write_id, 4.25f);
-  static_dc.get()->SetMethodWallCoef(read_id, 6.75f);
+  local_dc.get()->SetMethodCpuCoef(write_id, 4.25f);
+  local_dc.get()->SetMethodWallCoef(read_id, 6.75f);
+  other_dc.get()->SetMethodCpuCoef(write_id, 8.5f);
+  other_dc.get()->SetMethodWallCoef(read_id, 13.5f);
 
-  // Flush every pool's model, then read this pool's file back.
+  // Flush every container's model, then read each container's file back:
+  // one file per container id, each holding that container's own weights.
   pool_manager->FlushModels(/*force=*/true);
-  const PoolInfo *info = pool_manager->GetPoolInfo(pool_id);
-  REQUIRE(info != nullptr);
-  const std::string path =
-      TaskStatModelPath(info->chimod_name_, "model_persist_956", node_id);
-  REQUIRE_FALSE(path.empty());
+  const std::string local_path =
+      TaskStatModelPath(chimod_name, "model_persist_994", node_id, node_id);
+  const std::string other_path =
+      TaskStatModelPath(chimod_name, "model_persist_994", node_id, other_id);
+  REQUIRE_FALSE(local_path.empty());
+  REQUIRE(local_path != other_path);
 
-  TaskStatModelSnapshot on_disk;
-  REQUIRE(on_disk.Load(path));
-  REQUIRE(NearlyEqual(on_disk.methods_["Write"].cpu_coef_, 4.25f));
-  REQUIRE(NearlyEqual(on_disk.methods_["Read"].wall_coef_, 6.75f));
+  TaskStatModelSnapshot local_disk;
+  REQUIRE(local_disk.Load(local_path));
+  REQUIRE(local_disk.container_id_ == node_id);
+  REQUIRE(NearlyEqual(local_disk.methods_["Write"].cpu_coef_, 4.25f));
+  REQUIRE(NearlyEqual(local_disk.methods_["Read"].wall_coef_, 6.75f));
+  TaskStatModelSnapshot other_disk;
+  REQUIRE(other_disk.Load(other_path));
+  REQUIRE(other_disk.container_id_ == other_id);
+  REQUIRE(NearlyEqual(other_disk.methods_["Write"].cpu_coef_, 8.5f));
+  REQUIRE(NearlyEqual(other_disk.methods_["Read"].wall_coef_, 13.5f));
+  // The static container has nothing to persist and gets no file.
+  REQUIRE_FALSE(std::filesystem::exists(TaskStatModelPath(
+      chimod_name, "model_persist_994", node_id, kStaticContainerId)));
 
-  // Restoring is what a reloaded container does: overwrite the seeded table
-  // from the file. Only names the binary still defines are applied; a method
-  // absent from the file keeps its seed.
-  static_dc.get()->SetMethodCpuCoef(write_id, 1.0f);
+  // Restoring overwrites the seeded table from the file. Only names the binary
+  // still defines are applied; a method absent from the file keeps its seed.
+  local_dc.get()->SetMethodCpuCoef(write_id, 1.0f);
   TaskStatModelSnapshot restore;
   restore.methods_["Write"] = MethodStatWeights{4.25f, 0.5f, 1.0f, 0.0f};
   restore.methods_["MethodThatNoLongerExists"] =
       MethodStatWeights{99.0f, 99.0f, 99.0f, 99.0f};
-  size_t restored = static_dc.get()->ImportModel(restore);
+  size_t restored = local_dc.get()->ImportModel(restore);
   REQUIRE(restored == 1);  // the unknown name is ignored, not misapplied
-  REQUIRE(NearlyEqual(static_dc.get()->GetMethodModel()[write_id], 4.25f));
+  REQUIRE(NearlyEqual(local_dc.get()->GetMethodModel()[write_id], 4.25f));
   // Read was not in the snapshot, so it keeps the value it already had.
-  REQUIRE(NearlyEqual(static_dc.get()->GetMethodModelWall()[read_id], 6.75f));
+  REQUIRE(NearlyEqual(local_dc.get()->GetMethodModelWall()[read_id], 6.75f));
+
+  // A container registered later restores ITS OWN file (matched by container
+  // id), not its neighbour's: pre-write a model for a third id, register a
+  // container with that id, and check the weights arrived — while the file the
+  // other container wrote is left alone.
+  const u32 late_id = node_id + 43;
+  TaskStatModelSnapshot late_snapshot;
+  late_snapshot.methods_["Write"] = MethodStatWeights{21.0f, 0.0f, 22.0f, 0.0f};
+  REQUIRE(late_snapshot.Save(
+      TaskStatModelPath(chimod_name, "model_persist_994", node_id, late_id)));
+  DynamicContainer late_dc = RegisterExtraContainer(pool_id, late_id);
+  REQUIRE(NearlyEqual(late_dc.get()->GetMethodModel()[write_id], 21.0f));
+  REQUIRE(NearlyEqual(late_dc.get()->GetMethodModelWall()[write_id], 22.0f));
+  REQUIRE_FALSE(late_dc.get()->IsModelDirty());  // a restore is not learning
+  REQUIRE(NearlyEqual(other_dc.get()->GetMethodModel()[write_id], 8.5f));
 }
 
 SIMPLE_TEST_MAIN()

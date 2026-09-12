@@ -35,6 +35,30 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
 #else
   if (task_ptr.IsNull()) return Future<TaskT>();
 
+  // Finalized-client guard (issue #970). ClientFinalize resets the transports
+  // this function is about to use, so a submit after it dereferences a dangling
+  // one. Complete the task with an error instead.
+  //
+  // Placed HERE rather than in IpcManager::Send, which is where it started: Send
+  // is not the only way in. ClientConnect (reconnect) and RegisterMemory call
+  // this directly from ipc_manager.cc -- five sites that bypass Send entirely --
+  // and each of them would hit the same dangling transport. Guarding the
+  // transport entry points covers those too, and needs no CTP_IS_HOST block of
+  // its own because this body is already the host half of one.
+  //
+  // The runtime self-send path (IpcCpu2Self::SendIn) is deliberately untouched:
+  // it uses none of these transports, so excluding it is structural here rather
+  // than an is_runtime test.
+  if (ipc->client_finalized_.load(std::memory_order_acquire)) {
+    HLOG(kWarning,
+         "Send(SHM): client is finalized; failing task instead of submitting on a "
+         "torn-down transport (issue #970)");
+    Future<TaskT> future(task_ptr->pool_id_, task_ptr->method_, task_ptr);
+    task_ptr->SetReturnCode(static_cast<u32>(-1));
+    task_ptr->SetComplete();
+    return future;
+  }
+
   // #642: the task's virtual address is the response key the worker echoes back
   // so this client thread can match the result to the right Future.
   size_t net_key = reinterpret_cast<size_t>(task_ptr.get());
@@ -116,6 +140,25 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
   TaskT *task_ptr = future.get();
   const size_t want_key = task_ptr->task_id_.net_key_;
 
+  // Finalized-client escape (issue #970). A task submitted AFTER
+  // ClientFinalize can never complete — the response listener is gone and the
+  // recv threads are joined — so waiting for it is an unbounded park with no
+  // possible wakeup. The reported case is an HDF5 VOL application: clio's
+  // atexit handler runs before H5_term_library (atexit is LIFO and the
+  // connector cannot register earlier than HDF5), so clio_file_close submits
+  // a DelBlob on a torn-down client and exit() never returns.
+  //
+  // Checked before the spin/park below rather than only inside the loop, so
+  // this costs nothing on the healthy path and returns immediately on the
+  // dead one.
+  if (ipc->client_finalized_.load(std::memory_order_acquire) &&
+      !task_ptr->IsComplete()) {
+    HLOG(kWarning,
+         "Recv(SHM): client is finalized; failing task instead of waiting "
+         "for a response that cannot arrive (issue #970)");
+    return false;
+  }
+
   // Block on this thread's EventManager until RecvShmClientThread marks this
   // task complete and signals us (SHM analogue of IpcCpu2CpuZmq::RecvOut). The
   // dedicated recv thread — not this thread — drains the single response ring,
@@ -171,6 +214,13 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
       HLOG(kWarning,
            "Recv(SHM): server died mid-wait; handing off to reconnect path");
       return IpcCpu2CpuZmq::RecvOut(ipc, future, max_sec);
+    }
+    // The twin of the entry check above, for a wait that was already parked
+    // when another thread began teardown (issue #970).
+    if (ipc->client_finalized_.load(std::memory_order_acquire)) {
+      HLOG(kWarning,
+           "Recv(SHM): client finalized mid-wait; failing task (issue #970)");
+      return false;
     }
   }
 

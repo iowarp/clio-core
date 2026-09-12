@@ -6,14 +6,15 @@
  */
 
 /**
- * CAE transparent-labeling benchmark.
+ * Transparent-summarization benchmark.
  *
- * Stresses the cost of LLM-driven labeling on the PutBlob fast path.
+ * Stresses the cost of LLM-driven summarization on the PutBlob fast path.
  * Each worker thread issues PutBlob calls of `--blob-size` bytes of
- * synthetic English text against a CAE pool whose label_matches rule
- * triggers labeling on every blob. The CAE container forwards the
- * blob to CTE for storage, then calls Ollama (`--model`, `--endpoint`)
- * to produce a `{blob_name}_label` blob in the same tag.
+ * synthetic English text against a CAE pool that forwards through the
+ * summarizer chimod, whose label_matches rule triggers on every blob. The
+ * summarizer forwards the blob down to CTE for storage, then calls Ollama
+ * (`--model`, `--endpoint`) to produce a `{blob_name}_label` blob in the
+ * same tag.
  *
  * After the run we walk every blob in every tag and ask CTE for the
  * label-blob sizes; the bench reports:
@@ -126,9 +127,12 @@ Args ParseArgs(int argc, char **argv) {
 }
 
 /**
- * Write the temporary compose YAML used by clio. CAE sits at 512.0
- * with a single labeling rule whose `model`, `context_length`, and
- * `num_predict` reflect the CLI args. CTE core is behind it at 513.0.
+ * Write the temporary compose YAML used by clio. The CAE core sits at the
+ * entrypoint 512.0 and forwards to the summarizer at 401.0, which carries a
+ * single rule whose `model`, `context_length`, and `num_predict` reflect the
+ * CLI args. The CTE core is behind both at 513.0.
+ * @param a Parsed command-line arguments.
+ * @return Path of the generated temporary compose file.
  */
 std::string WriteTempConfig(const Args &a) {
   char tmpl[] = "/tmp/cae_label_bench_config.XXXXXX.yaml";
@@ -152,21 +156,8 @@ std::string WriteTempConfig(const Args &a) {
     << "    pool_id: \"301.0\"\n"
     << "    bdev_type: ram\n"
     << "    capacity: \"4GB\"\n"
-    << "  - mod_name: clio_cae_core\n"
-    << "    pool_name: cae_main\n"
-    << "    pool_query: local\n"
-    << "    pool_id: \"512.0\"\n"
-    << "    next_pool_id: \"513.0\"\n"
-    << "    label_endpoint: \"" << a.endpoint << "\"\n"
-    << "    label_prompts:\n"
-    << "      summarize: \"Summarize the following text in one short sentence.\"\n"
-    << "    label_matches:\n"
-    << "      - tag_re: \".*\"\n"
-    << "        blob_re: \".*\"\n"
-    << "        model: \"" << a.model << "\"\n"
-    << "        prompt: \"summarize\"\n"
-    << "        context_length: " << a.context_length << "\n"
-    << "        num_predict: " << a.summary_tokens << "\n"
+    // CTE core first: an interposer's next_pool_id must already exist when
+    // its container is created.
     << "  - mod_name: clio_cte_core\n"
     << "    pool_name: cte_core\n"
     << "    pool_query: local\n"
@@ -179,7 +170,27 @@ std::string WriteTempConfig(const Args &a) {
     << "        capacity_limit: \"2GB\"\n"
     << "        score: 1.0\n"
     << "    dpe:\n"
-    << "      dpe_type: \"max_bw\"\n";
+    << "      dpe_type: \"max_bw\"\n"
+    << "  - mod_name: clio_cae_summarizer\n"
+    << "    pool_name: clio_cae_summarizer\n"
+    << "    pool_query: local\n"
+    << "    pool_id: \"401.0\"\n"
+    << "    next_pool_id: \"513.0\"\n"
+    << "    label_endpoint: \"" << a.endpoint << "\"\n"
+    << "    label_prompts:\n"
+    << "      summarize: \"Summarize the following text in one short sentence.\"\n"
+    << "    label_matches:\n"
+    << "      - tag_re: \".*\"\n"
+    << "        blob_re: \".*\"\n"
+    << "        model: \"" << a.model << "\"\n"
+    << "        prompt: \"summarize\"\n"
+    << "        context_length: " << a.context_length << "\n"
+    << "        num_predict: " << a.summary_tokens << "\n"
+    << "  - mod_name: clio_cae_core\n"
+    << "    pool_name: cae_main\n"
+    << "    pool_query: local\n"
+    << "    pool_id: \"512.0\"\n"
+    << "    next_pool_id: \"401.0\"\n";
   f.close();
   return tmpl;
 }
@@ -285,7 +296,7 @@ class LabelBench {
     };
 
     // PutBlob loop. Synchronous Wait() per op — labeling is sync
-    // inside the CAE handler, so depth>1 doesn't actually overlap
+    // inside the summarizer handler, so depth>1 doesn't actually overlap
     // labeling work. Sequential is the honest measure here.
     auto t0 = steady_clock::now();
     long ok_ops = 0;
@@ -307,12 +318,12 @@ class LabelBench {
     CLIO_IPC->FreeBuffer(buf);
 
     // Label inspection. Each unique key has a `{name}_label` written
-    // by the CAE handler. Some may be empty if labeling failed (e.g.
+    // by the summarizer handler. Some may be empty if summarization failed (e.g.
     // model unloaded mid-run); we count those separately so the
     // average is over present-and-non-empty labels only.
     //
-    // CAE doesn't forward GetBlobSize today, so we query CTE directly
-    // (at pool 513.0) instead of going through CAE.
+    // The CAE core doesn't forward GetBlobSize today, so we query CTE
+    // directly (at pool 513.0) instead of going through the chain.
     long long bytes = 0;
     long present = 0;
     for (long k = 0; k < per_thread_keys; ++k) {
@@ -329,7 +340,7 @@ class LabelBench {
   }
 
   void PrintInfo() {
-    HLOG(kInfo, "=== CAE Labeling Benchmark ===");
+    HLOG(kInfo, "=== CAE Summarization Benchmark ===");
     HLOG(kInfo, "Threads: {}  blob-size: {} B  max-blobs: {}  io-count/thread: {}",
          a_.threads, a_.blob_size, a_.max_blobs, a_.io_count);
     HLOG(kInfo, "Model: {}  endpoint: {}  context_length: {}  summary_tokens: {}",
@@ -382,7 +393,7 @@ class LabelBench {
         : static_cast<double>(sum_us) / static_cast<double>(times_us.size());
 
     HLOG(kInfo, "");
-    HLOG(kInfo, "=== CAE Labeling Results ===");
+    HLOG(kInfo, "=== CAE Summarization Results ===");
     HLOG(kInfo, "Total PutBlobs (= labels requested): {}", total_ops);
     HLOG(kInfo, "Wall time: {} s   per-thread time min/max/avg: {}/{}/{} s",
          Fmt(wall_s, 3), Fmt(min_us / 1.0e6, 3), Fmt(max_us / 1.0e6, 3),

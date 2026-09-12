@@ -1230,6 +1230,13 @@ class IpcManager {
    * @param priority Network queue priority (see NetQueuePriority for
    *                 the latency-vs-IO lane split).
    */
+  /**
+   * CLIO_NET_QPROF: mark the arrival of a peer's task on this node, so the
+   * server-side residency (arrival -> response enqueued) can be attributed.
+   * A no-op unless profiling is enabled.
+   */
+  void NetProfMarkRecvIn(const clio::run::shared_ptr<Task> &task);
+
   void EnqueueNetTask(Future<Task> future, NetQueuePriority priority);
 
   /**
@@ -1738,6 +1745,19 @@ class IpcManager {
   std::thread heartbeat_thread_;
   std::atomic<bool> heartbeat_running_{false};
   std::atomic<bool> server_alive_{true};
+
+  // Set at the TOP of ClientFinalize, before any transport is torn down
+  // (issue #970). Once teardown has begun, a response can never arrive: the
+  // response listener is destroyed and the recv threads are joined. The waits
+  // in IpcCpu2Cpu::RecvOut and IpcCpu2CpuZmq::RecvOut therefore treat this as
+  // a terminal condition and fail the task instead of parking on it.
+  //
+  // This is deliberately NOT folded into server_alive_. That flag means "the
+  // runtime went away and we may be able to reconnect to it", and it drives a
+  // reconnect/resend path that is exactly wrong here — the runtime is fine, it
+  // is THIS client that is gone, and reconnecting during teardown would build
+  // transports that the caller is in the middle of destroying.
+  std::atomic<bool> client_finalized_{false};
 
   // A client-side in-flight async submission, tracked by net_key. The async
   // recv thread marks the task complete (Task::is_complete_/is_new_data_) and

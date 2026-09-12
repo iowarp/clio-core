@@ -42,6 +42,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <cstdio>
 #include <cstring>
 #include <atomic>
 #include <mutex>
@@ -137,6 +138,34 @@ class IoUringAsyncIO : public AsyncIO {
       return true;
     }
 
+    // Diagnostic for a completion that never arrives (ctp_async_io, issue:
+    // "REQUIRE(attempts < 1000000)" at test_async_io.cc:135 -- the READ poll).
+    //
+    // That assertion fires only when a SUBMITTED read never reports back, and
+    // when it hit CI it failed all three `ctest --repeat until-pass:3`
+    // attempts, so it is not a one-in-a-run race -- it is a condition that
+    // arises on a runner and then persists. The bare timeout carried no
+    // evidence, so print the state that separates the candidates ONCE per
+    // 200k misses: a dropped CQE (cq overflow), an SQE that was prepared but
+    // never submitted (sq_ready > 0), or a completion delivered under a token
+    // nobody is waiting on (in_flight/completed sizes).
+    if ((++miss_polls_ % 200000) == 0) {
+      unsigned cq_ready = io_uring_cq_ready(&ring_);
+      unsigned sq_ready = io_uring_sq_ready(&ring_);
+      int overflow = -1;  // -1 = this liburing/kernel cannot report it
+#ifdef IORING_SQ_CQ_OVERFLOW
+      overflow = (*ring_.sq.kflags & IORING_SQ_CQ_OVERFLOW) ? 1 : 0;
+#endif
+      std::fprintf(stderr,
+                   "[AIO-STUCK] token=%llu misses=%llu in_flight=%zu "
+                   "completed=%zu cq_ready=%u sq_ready=%u cq_overflow=%d "
+                   "direct_fd=%d regular_fd=%d%c",
+                   (unsigned long long)token,
+                   (unsigned long long)miss_polls_, in_flight_.size(),
+                   completed_.size(), cq_ready, sq_ready, overflow,
+                   direct_fd_, regular_fd_, 10);
+      std::fflush(stderr);
+    }
     return false;
   }
 
@@ -236,6 +265,8 @@ class IoUringAsyncIO : public AsyncIO {
   std::mutex mutex_;
   std::unordered_set<IoToken> in_flight_;
   std::unordered_map<IoToken, IoResult> completed_;
+  // Misses seen by IsComplete; drives the [AIO-STUCK] diagnostic above.
+  unsigned long long miss_polls_ = 0;
 };
 
 }  // namespace ctp
