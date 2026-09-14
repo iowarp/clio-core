@@ -231,6 +231,42 @@ class H5FD__clio_QuietQuery {
  * CLIO_VFD_MAX_IO_BYTES overrides it so the multi-pass path can be exercised
  * with kilobyte-sized transfers -- the splitting/resume logic is identical at
  * any threshold, and a test needing 2 GiB of disk does not get run. */
+/* Whether to advertise the vectored-I/O callbacks.
+ *
+ * DEFAULT OFF, which is the opposite of what it sounds like. Implementing
+ * read_vector/write_vector is what switches HDF5's selection I/O ON (H5Dio.c:660
+ * enables it in AUTO mode iff the driver has the callbacks), and the
+ * selection-I/O path never populates the sieve buffer, so the sieve ends up
+ * unused. This driver ASKS for sieving -- it advertises H5FD_FEAT_DATA_SIEVE in
+ * query() -- and then defeated its own request by implementing these
+ * callbacks.
+ *
+ * The cost was measured, cache on and off, against sec2 as the oracle on a
+ * 16 MiB strided hyperslab. With the callbacks advertised the driver is 1.1x
+ * to 3.8x slower than sec2, worst at dense (small-stride) selections; with them
+ * withheld it is at parity, 0.98x-1.05x, at every stride. The driver's own
+ * coalescer is not the problem -- in-driver time is about a third of the
+ * overhead at stride 2 -- the rest is the library building multi-million-element
+ * vectors instead of streaming through its sieve, which no amount of driver-side
+ * work can recover. The coalescer exists only to repair damage that advertising
+ * these callbacks caused in the first place (iowarp/clio-core#980).
+ *
+ * There is no HDF5 feature flag for "I can do vector I/O but would rather you
+ * sieve", so the capability is expressed only by whether these pointers are
+ * non-NULL, and the choice is binary. This driver is serial -- it advertises no
+ * H5FD_FEAT_HAS_MPI and contains no MPI -- so the collective case that most
+ * justifies vector I/O does not arise.
+ *
+ * CLIO_VFD_VECTOR_IO=1 restores them, which is what the vectored-I/O coverage
+ * runs with: the coalescer is still built, still correct, and still tested. */
+static bool H5FD__clio_vector_io_on(void) {
+  static const bool on = [] {
+    const char *e = getenv("CLIO_VFD_VECTOR_IO");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
+  return on;
+}
+
 static size_t H5FD__clio_max_io_bytes(void) {
   static const size_t limit = []() -> size_t {
     const char *v = getenv("CLIO_VFD_MAX_IO_BYTES");
@@ -639,6 +675,29 @@ static const H5FD_class_t H5FD_clio_g = {
  *
  *-------------------------------------------------------------------------
  */
+/* The class HDF5 should actually see.
+ *
+ * Both registration paths must agree: H5FD_clio_init() for an application that
+ * registers the driver itself, and H5PLget_plugin_info() for HDF5_DRIVER=
+ * clio_vfd, which does NOT go through init and asks for the struct directly.
+ * Resolving it in one place is what keeps a knob from applying to only one of
+ * them -- and the plugin path is the one every unmodified application uses.
+ *
+ * A mutable copy, built once, so the template above can stay const. */
+static const H5FD_class_t *H5FD__clio_class(void) {
+  static H5FD_class_t cls;
+  static bool built = false;
+  if (!built) {
+    cls = H5FD_clio_g;
+    if (!H5FD__clio_vector_io_on()) {
+      cls.read_vector = NULL;
+      cls.write_vector = NULL;
+    }
+    built = true;
+  }
+  return &cls;
+}
+
 hid_t H5FD_clio_init(void) {
   hid_t ret_value = H5I_INVALID_HID; /* Return value */
 
@@ -663,7 +722,7 @@ hid_t H5FD_clio_init(void) {
   }
 
   if (H5I_VFL != H5Iget_type(H5FD_CLIO_g)) {
-    H5FD_CLIO_g = H5FDregister(&H5FD_clio_g);
+    H5FD_CLIO_g = H5FDregister(H5FD__clio_class());
   }
 
   /* Set return value */
@@ -2101,7 +2160,7 @@ H5PLUGIN_DLL const void *H5PLget_plugin_info(void) {
      H5FD_clio_init() left the guard disarmed for every HDF5_DRIVER=clio_vfd
      application, which is all of them. */
   H5FD__clio_install_exit_guard();
-  return &H5FD_clio_g;
+  return H5FD__clio_class();
 }
 
 } // extern C

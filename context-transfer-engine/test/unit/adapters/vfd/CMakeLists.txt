@@ -94,6 +94,23 @@ if(CLIO_CORE_ENABLE_TESTS)
         TIMEOUT 300
         LABELS "msan_skip")
 
+    # The same binary again with the vectored callbacks advertised. They are
+    # withheld by default (see H5FD__clio_vector_io_on: advertising them turns
+    # HDF5's data sieve off and measured 1.1x-3.8x slower on strided
+    # selections), so without this run the coalescing vector path -- which is
+    # still built, and still the path taken by anyone who sets the knob -- would
+    # have no coverage at all.
+    add_test(
+        NAME clio_cte_vfd_unit_tests_vector_io
+        COMMAND clio_cte_vfd_unit_tests
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(clio_cte_vfd_unit_tests_vector_io PROPERTIES
+        ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_VFD_VECTOR_IO=1"
+        RESOURCE_LOCK "clio_runtime"
+        TIMEOUT 300
+        LABELS "msan_skip")
+
     # No runtime, no fixtures, no resource lock -- the point is that this one
     # needs nothing brought up first.
     add_test(

@@ -405,6 +405,15 @@ herr_t FindClioErr(unsigned n, const H5E_error2_t *err, void *data) {
 }
 }  // namespace
 
+/* Whether the driver advertises its vectored callbacks this run. Sections that
+   can only be reached through them are skipped when it does not; see
+   H5FD__clio_vector_io_on for why withholding them is the default, and the
+   clio_cte_vfd_unit_tests_vector_io ctest entry for where they are covered. */
+static const bool want_vector_io = [] {
+  const char *e = std::getenv("CLIO_VFD_VECTOR_IO");
+  return e != nullptr && *e != '\0' && *e != '0';
+}();
+
 int main() {
   // Cap a single kernel I/O call at 4 KiB for the whole suite. The driver
   // splits any larger transfer into bounded passes and resumes; in production
@@ -941,11 +950,38 @@ int main() {
 
     CHECK(std::memcmp(got.data(), w.data(), kSmall * sizeof(int32_t)) == 0,
           "13: vectored round-trip byte-clean");
-    CHECK(H5FDclio_write_vector_calls_g > w0,
-          "13: write_vector was actually exercised");
-    CHECK(H5FDclio_read_vector_calls_g > r0,
-          "13: read_vector was actually exercised");
-    std::printf("[vfd-suite] ok 13: vectored I/O (read_vector/write_vector exercised)\n");
+
+    // The vectored callbacks are advertised only under CLIO_VFD_VECTOR_IO,
+    // because advertising them turns HDF5's selection I/O on and its data
+    // sieve OFF -- and this driver asks for sieving (H5FD_FEAT_DATA_SIEVE),
+    // which measured 1.1x-3.8x faster on strided selections. See
+    // H5FD__clio_vector_io_on.
+    //
+    // Both configurations are pinned here rather than only the one that
+    // happens to be the default. The round-trip assertion above is
+    // unconditional and is the part that matters: whichever path HDF5 takes,
+    // the bytes must be identical. What follows only checks that the path
+    // taken was the one that was asked for -- so a knob silently stopping
+    // working, in either direction, fails rather than passing quietly on the
+    // other path's correctness.
+    const bool want_vector = want_vector_io;
+    if (want_vector) {
+      CHECK(H5FDclio_write_vector_calls_g > w0,
+            "13: write_vector was actually exercised");
+    } else {
+      CHECK(H5FDclio_write_vector_calls_g == w0,
+            "13: write_vector withheld by default (sieve path)");
+    }
+    if (want_vector) {
+      CHECK(H5FDclio_read_vector_calls_g > r0,
+            "13: read_vector was actually exercised");
+    } else {
+      CHECK(H5FDclio_read_vector_calls_g == r0,
+            "13: read_vector withheld by default (sieve path)");
+    }
+    std::printf("[vfd-suite] ok 13: vectored I/O (%s)\n",
+                want_vector ? "read_vector/write_vector exercised"
+                            : "withheld; library sieve path, bytes identical");
   }
 
   // === 14. del callback: H5Fdelete removes BOTH stores ====================
@@ -1485,7 +1521,10 @@ int main() {
   // here. H5FDclio_vec_max_span_g reports the largest span serviced as one
   // coalesced I/O, so the assertion is on the bound itself rather than on data
   // that round-trips either way.
-  {
+  if (!want_vector_io) {
+    std::printf("[vfd-suite] skip 24: coalescing window -- vectored I/O not "
+                "advertised (covered by clio_cte_vfd_unit_tests_vector_io)\n");
+  } else {
     const char *kVecCap = "/tmp/clio_cte_vfd_veccap.h5";
     std::remove(kVecCap);
     const size_t kWindow = 4096;
