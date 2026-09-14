@@ -133,6 +133,10 @@ struct clio_file_t {
      the native file, which is always correct. So a concurrent process staging
      into the same tag costs a lost hit and nothing else. */
   bool tier_known_empty = false;
+  /* st_dev of the authoritative file, or 0 if it could not be stat'd. Identifies
+     the STORE, which is what the "can the tier win here" verdict is really about
+     -- see clio_device_beats_tier. */
+  unsigned long long dev = 0;
   bool opened_truncated = false;
   /* Safe mode: cacheable datasets currently open in this file. H5Fflush and
      H5Fclose drain their pending CTE puts so no async write outlives a
@@ -540,9 +544,19 @@ static bool clio_file_bind_tag(clio_file_t *file);
    This is also where the tag gets bound: it is the single door every tier
    access goes through, so a caller cannot reach a blob with an unbound tag and
    cannot forget to bind one. */
+/* Defined below with the cost model it belongs to; declared here because
+   clio_cache_usable must consult it before binding a tag. */
+static bool clio_device_beats_tier(unsigned long long dev);
+
 static bool clio_cache_usable(clio_file_t *file) {
-  return file && file->cache_enabled && get_cte_client() != nullptr &&
-         clio_file_bind_tag(file);
+  if (!file || !file->cache_enabled || get_cte_client() == nullptr) return false;
+  /* Asked BEFORE binding the tag, which is the whole point: binding is the
+     expensive part, and on a store the tier cannot beat it buys a tag nothing
+     will ever be stored under. Checked here rather than inside bind_tag so the
+     lazy-binding contract stays exactly as it was -- a file that never reaches
+     the tier still never binds. */
+  if (clio_device_beats_tier(file->dev)) return false;
+  return clio_file_bind_tag(file);
 }
 
 /* ------------------------------------------------------------------ admission
@@ -679,6 +693,61 @@ static bool clio_worth_staging(size_t bytes, double native_us) {
   if (native_us <= 0) return true;  /* unmeasured: do not second-guess */
   return native_us > clio_tier_predict_us(bytes);
 }
+
+/* ---------------------------------------------------- per-device verdict
+ * The cost gate above decides one transfer at a time, and that is too late for
+ * the largest cost a file-per-timestep workload pays: clio_file_bind_tag runs
+ * before any transfer is judged, and measured 273-305 us PER FILE (55-69% of
+ * the whole per-file cost on 500 x 64 KiB files) getting a tag that, on storage
+ * the tier cannot beat, nothing will ever be stored under.
+ *
+ * "Can the tier beat this store" is really a property of the STORE, so answer
+ * it once per device and reuse it. st_dev is the key: it is already known --
+ * the coherence stamp stats the file anyway -- and it is what distinguishes a
+ * local NVMe from a mounted parallel filesystem in a process using both, which
+ * a single process-wide verdict would get wrong for one of them.
+ *
+ * Fail-open by construction: a device with too few samples is treated as worth
+ * caching, so the only effect of no data is the behaviour that exists today.
+ * Samples come only from transfers large enough for throughput to mean anything
+ * -- below that, us/byte measures latency and would call every device slow. */
+static constexpr size_t kDevSampleMinBytes = 64 * 1024;
+static constexpr int kDevMinSamples = 4;
+
+struct ClioDevCost {
+  double us_per_byte = -1.0;
+  int samples = 0;
+};
+static std::mutex g_dev_mu;
+static std::map<unsigned long long, ClioDevCost> g_dev_cost;
+
+static void clio_note_native_cost(unsigned long long dev, size_t bytes,
+                                  double us) {
+  if (bytes < kDevSampleMinBytes || us <= 0) return;
+  const double per_b = us / static_cast<double>(bytes);
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  ClioDevCost &c = g_dev_cost[dev];
+  c.us_per_byte = (c.us_per_byte < 0) ? per_b
+                                      : c.us_per_byte + 0.25 * (per_b - c.us_per_byte);
+  if (c.samples < 1000) c.samples++;
+}
+
+/* True when this device has been measured to stream faster than the tier can,
+   often enough to believe it. Such a store wins at every size: at large sizes on
+   throughput, and at small sizes because the tier still owes a fixed round trip
+   the store does not. */
+static bool clio_device_beats_tier(unsigned long long dev) {
+  if (!clio_cost_gate_on() || dev == 0) return false;
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  auto it = g_dev_cost.find(dev);
+  if (it == g_dev_cost.end() || it->second.samples < kDevMinSamples) {
+    return false;  /* no verdict yet -- behave exactly as before */
+  }
+  double per_b = g_tier_us_per_byte.load(std::memory_order_relaxed);
+  if (per_b < 0) per_b = clio_tier_seed_us_per_byte();
+  return it->second.us_per_byte < per_b;
+}
+
 
 /* Smallest dataset worth staging; 0 (the default) means no floor.
  *
@@ -1223,6 +1292,14 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
   file->obj.kind = clio_kind_t::kFile;
   file->file_name = name;
   file->chunk_size = chunk_size;
+  {
+    /* One stat, once per open. Cheap next to the round trips it can save, and
+       the coherence stamp stats this file anyway. */
+    struct stat st;
+    if (name && ::stat(name, &st) == 0) {
+      file->dev = static_cast<unsigned long long>(st.st_dev);
+    }
+  }
   file->cache_enabled = cache_enabled;
   file->opened_truncated = truncated;
   file->trace = clio::trace::open_file(name);
@@ -2032,6 +2109,7 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
                        dxpl_id, &buf[d], req);
     const double native_us = std::chrono::duration<double, std::micro>(
         std::chrono::steady_clock::now() - t_natw0).count();
+    if (rc >= 0) clio_note_native_cost(dataset->file->dev, total_size, native_us);
 
     /* Admission. Under read-miss nothing is staged here; the data reaches the
        tier only if a later read asks for it and misses. The native write above
@@ -2519,6 +2597,7 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
          and so the one the admission gate needs. */
       const double native_us = std::chrono::duration<double, std::micro>(
           std::chrono::steady_clock::now() - t_nat0).count();
+      clio_note_native_cost(dataset->file->dev, total_size, native_us);
       if (rc < 0) {
         /* Nothing to stage from a failed read; record the failure and move to
            the next dataset like every other fallback path (an early return
