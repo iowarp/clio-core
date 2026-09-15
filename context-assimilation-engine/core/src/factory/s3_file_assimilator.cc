@@ -33,16 +33,25 @@
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cae/core/factory/s3_file_assimilator.h>
-
-#include <sys/wait.h>
-#include <unistd.h>
+#include <clio_cae/core/factory/aws_creds.h>
+#include <clio_cae/core/factory/s3_conn_pool.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
+
+// The in-process S3 REST client (Poco::Net + SigV4). Loading the AWS SDK into
+// this runtime process stack-smashes CLIO_INIT, so the read path signs and
+// streams over Poco instead -- the same transport the kS3 bdev tier proved.
+// cae_s3_tool (the SDK) still exists, but only as a standalone helper for the
+// benchmark floors and test seeding; the assimilator no longer forks it.
+#include "clio_runtime/bdev/transports/s3_rest.h"
 
 // Include clio_cte headers after the clio_cae includes to avoid Method
 // namespace collision (same ordering as BinaryFileAssimilator).
@@ -53,84 +62,159 @@ namespace clio::cae::core {
 
 namespace {
 
-// The S3 download is performed by a SEPARATE process (`cae_s3_tool`), never by
-// linking the AWS SDK into this runtime. Loading libaws-cpp-sdk-core.so into the
-// CLIO runtime process corrupts runtime startup (its load-time global ctors /
-// static-baked s2n collide with CLIO's init), so the SDK is fully isolated in the
-// helper and reached via fork+exec — the same approach the Globus assimilator uses
-// to shell out to curl.
+namespace s3 = clio::run::bdev::s3;
 
 /**
- * Resolve the path/name of the cae_s3_tool helper executable.
+ * Per-phase latency accumulators, summed across every object this process
+ * assimilates and reported once by S3AssimLogPhaseTally().
  *
- * Honors the CAE_S3_TOOL environment override (used by the test harness to point
- * at the build-tree binary); otherwise returns the bare name, resolved via PATH.
+ * Process-wide rather than instance state on purpose: AssimilatorFactory builds
+ * a fresh S3FileAssimilator inside every ParseOmni task (core_runtime.cc), so
+ * instance members would not survive a single object.
  *
- * @return Helper executable path or name.
+ * Relaxed ordering throughout -- these are counters read once at shutdown, and
+ * nothing branches on them, so no happens-before relationship is needed.
  */
-std::string ResolveS3Tool() {
-  const char* override_path = std::getenv("CAE_S3_TOOL");
-  if (override_path && *override_path) {
-    return override_path;
-  }
-  return "cae_s3_tool";
+std::atomic<uint64_t> g_n_objects{0};   ///< objects assimilated
+std::atomic<uint64_t> g_n_chunks{0};    ///< body chunks written to CTE
+std::atomic<uint64_t> g_us_tag{0};      ///< AsyncGetOrCreateTag  (CTE trip 1)
+std::atomic<uint64_t> g_us_creds{0};    ///< ResolveAwsCredentials (disk!)
+std::atomic<uint64_t> g_us_acquire{0};  ///< pool Acquire (may connect)
+std::atomic<uint64_t> g_us_begin{0};    ///< BeginGetObject (S3 round trip)
+std::atomic<uint64_t> g_us_desc{0};     ///< description PutBlob (CTE trip 2)
+std::atomic<uint64_t> g_us_fill{0};     ///< FillChunk -- body bytes off socket
+std::atomic<uint64_t> g_us_put{0};      ///< awaiting body PutBlobs (CTE trip N)
+std::atomic<uint64_t> g_us_end{0};      ///< EndGetObject (drain tail)
+std::atomic<uint64_t> g_us_total{0};    ///< whole Schedule(), entry to exit
+
+using SteadyClock = std::chrono::steady_clock;
+
+/** Microseconds elapsed since @p t0. Safe across a CLIO_CO_AWAIT: coroutine
+ *  locals are preserved over a suspend (see the ConnReturn comment below). */
+inline uint64_t UsSince(const SteadyClock::time_point &t0) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          SteadyClock::now() - t0)
+          .count());
 }
 
 /**
- * Fork + exec a process and wait for it to finish.
+ * Build the S3 client config for one import: endpoint (and its addressing
+ * style) from the environment, credentials + region from the resolver. The
+ * signer reads no environment itself, so the resolved values are injected here.
+ * `prefix` is left empty -- the assimilator passes whole object keys, so the
+ * bdev's KeyForOffset prefixing does not apply.
  *
- * @param args Full argv (args[0] is the program, resolved via PATH).
- * @return The child's exit status (0 = success), or -1 if fork/exec failed.
+ * @param bucket Target bucket.
+ * @param creds  Resolved access/secret/token + region.
+ * @return A ready S3Config.
  */
-int RunProcess(const std::vector<std::string>& args) {
-  pid_t pid = fork();
-  if (pid == -1) {
-    return -1;
-  }
-  if (pid == 0) {
-    std::vector<const char*> argv;
-    argv.reserve(args.size() + 1);
-    for (const auto& a : args) {
-      argv.push_back(a.c_str());
+s3::S3Config MakeS3Config(const std::string& bucket,
+                          const AwsCredentials& creds) {
+  // ConfigFromEnv gives us S3_ENDPOINT (+ trailing-slash stripping and the
+  // path-style decision); the credential fields it reads from the environment
+  // are then overridden by the resolver's result, which itself preferred the
+  // environment when present, so the two agree.
+  s3::S3Config cfg = s3::S3RestClient::ConfigFromEnv(bucket, /*prefix=*/"");
+  cfg.region = creds.region;
+  cfg.access_key = creds.access_key;
+  cfg.secret_key = creds.secret_key;
+  cfg.session_token = creds.session_token;
+  cfg.allow_bucket_create = false;  // a reader must never create a bucket
+  return cfg;
+}
+
+/**
+ * Fill exactly `want` bytes into `buf` from the live GET stream, resuming with a
+ * ranged GET whenever the response body ends short of `want` before the whole
+ * transfer is exhausted (e.g. a keep-alive socket dropped across a co_await).
+ * Mirrors what the old fork+exec path got for free by staging to a whole file.
+ *
+ * @param client   The S3 client.
+ * @param conn     The leased connection (kept across resumes).
+ * @param st       In/out: the current GET stream; replaced on a resume.
+ * @param key      Object key, for the resume request.
+ * @param buf      Destination buffer of capacity >= want.
+ * @param want     Bytes to place into buf (<= bytes remaining in the transfer).
+ * @param abs_start Object offset of buf[0] (absolute, for the Range header).
+ * @param max_resumes Cap on resume attempts before giving up.
+ * @param resumes  In/out: running count of resumes across the whole object.
+ * @param filled   Output: bytes actually placed into buf.
+ * @return An S3Result: ok when want bytes were filled, else error set.
+ */
+s3::S3Result FillChunk(s3::S3RestClient& client, s3::S3Connection& conn,
+                       s3::S3RestClient::S3GetStream& st, const std::string& key,
+                       char* buf, size_t want, uint64_t abs_start,
+                       int max_resumes, int* resumes, size_t* filled) {
+  size_t got_total = 0;
+  while (got_total < want) {
+    size_t got = 0;
+    s3::S3Result rr = client.ReadBody(st, buf + got_total, want - got_total,
+                                      &got);
+    got_total += got;
+    if (got_total >= want) break;
+    // The body ended (clean EOF or a mid-stream error) before this chunk was
+    // full, yet the transfer is not complete. Retire the response and resume
+    // from where we stopped with a ranged GET for the remaining bytes.
+    if (*resumes >= max_resumes) {
+      if (rr.error.empty()) {
+        rr.error = "S3 GET " + key + " ended short after " +
+                   std::to_string(max_resumes) + " resumes at offset " +
+                   std::to_string(abs_start + got_total);
+      }
+      *filled = got_total;
+      return rr;
     }
-    argv.push_back(nullptr);
-    execvp(argv[0], const_cast<char* const*>(argv.data()));
-    _exit(127);  // exec failed
+    ++(*resumes);
+    client.EndGetObject(conn, st);
+    const uint64_t resume_off = abs_start + got_total;
+    const uint64_t resume_len = static_cast<uint64_t>(want - got_total);
+    s3::S3Result rb = client.BeginGetObject(conn, key, resume_off, resume_len,
+                                            &st);
+    if (!rb.ok()) {
+      *filled = got_total;
+      return rb;
+    }
   }
-  int status = 0;
-  waitpid(pid, &status, 0);
-  if (WIFEXITED(status)) {
-    return WEXITSTATUS(status);
-  }
-  return -1;
-}
-
-/**
- * Create a unique temporary file and return its path. The file is created empty.
- *
- * @param out_path Output: the created temp file path (unchanged on failure).
- * @return true on success, false if the temp file could not be created.
- */
-bool MakeTempFile(std::string& out_path) {
-  const char* tmpdir = std::getenv("TMPDIR");
-  std::string tmpl = (tmpdir && *tmpdir) ? tmpdir : "/tmp";
-  tmpl += "/cae_s3_XXXXXX";
-  std::vector<char> buf(tmpl.begin(), tmpl.end());
-  buf.push_back('\0');
-  int fd = mkstemp(buf.data());
-  if (fd == -1) {
-    return false;
-  }
-  close(fd);  // helper reopens by name; keep only the path
-  out_path.assign(buf.data());
-  return true;
+  *filled = got_total;
+  return s3::S3Result{};
 }
 
 }  // namespace
 
+void S3AssimLogPhaseTally() {
+  const uint64_t n = g_n_objects.load(std::memory_order_relaxed);
+  if (n == 0) {
+    return;  // this process assimilated nothing from S3
+  }
+  const uint64_t chunks = g_n_chunks.load(std::memory_order_relaxed);
+  // Per-object means. Integer division is deliberate: ctp::Formatter only
+  // understands bare "{}" (no format specs), and microsecond precision is far
+  // finer than anything we can conclude from these anyway.
+  auto per_obj = [n](const std::atomic<uint64_t> &a) {
+    return a.load(std::memory_order_relaxed) / n;
+  };
+  HLOG(kInfo,
+       "CAE S3 phase TOTAL objects={} chunks={} chunks_per_obj={} | "
+       "per-object us: tag={} creds={} acquire={} get_begin={} desc={} "
+       "fill={} put_wait={} end={} TOTAL={}",
+       n, chunks, chunks / n, per_obj(g_us_tag), per_obj(g_us_creds),
+       per_obj(g_us_acquire), per_obj(g_us_begin), per_obj(g_us_desc),
+       per_obj(g_us_fill), per_obj(g_us_put), per_obj(g_us_end),
+       per_obj(g_us_total));
+  g_n_objects.store(0, std::memory_order_relaxed);
+  g_n_chunks.store(0, std::memory_order_relaxed);
+  for (std::atomic<uint64_t> *a : {&g_us_tag, &g_us_creds, &g_us_acquire,
+                                   &g_us_begin, &g_us_desc, &g_us_fill,
+                                   &g_us_put, &g_us_end, &g_us_total}) {
+    a->store(0, std::memory_order_relaxed);
+  }
+}
+
 S3FileAssimilator::S3FileAssimilator(
-    std::shared_ptr<clio::cte::core::Client> cte_client)
-    : cte_client_(cte_client) {}
+    std::shared_ptr<clio::cte::core::Client> cte_client,
+    S3ConnectionPool* s3_pool)
+    : cte_client_(cte_client), s3_pool_(s3_pool) {}
 
 clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
                                                   int& error_code) {
@@ -144,6 +228,12 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
        "S3FileAssimilator::Schedule ENTRY: src='{}', dst='{}', range_off={}, "
        "range_size={}",
        ctx.src, ctx.dst, ctx.range_off, ctx.range_size);
+
+  // Phase timing. Only the success path accumulates: an object that bails out
+  // early would otherwise drag the per-object means toward zero and make a
+  // failing run look fast. See S3AssimLogPhaseTally() for how to read these.
+  const SteadyClock::time_point _t_entry = SteadyClock::now();
+  SteadyClock::time_point _t_phase;
 
   // Validate destination protocol
   std::string dst_protocol = GetUrlProtocol(ctx.dst);
@@ -165,8 +255,10 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
   }
 
   // Get or create the tag in CTE
+  _t_phase = SteadyClock::now();
   auto tag_task = cte_client_->AsyncGetOrCreateTag(tag_name);
   CLIO_CO_AWAIT(tag_task);
+  g_us_tag.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
   clio::cte::core::TagId tag_id = tag_task->tag_id_;
   if (tag_id.IsNull()) {
     HLOG(kError, "S3FileAssimilator: Failed to get or create tag '{}'",
@@ -194,45 +286,74 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
     CLIO_CO_RETURN;
   }
 
-  // Download the object to a temp file via the out-of-process cae_s3_tool helper
-  // (the AWS SDK must not be loaded into this runtime process). The helper reads
-  // credentials / region / endpoint from the standard AWS environment.
-  std::string tmp_path;
-  if (!MakeTempFile(tmp_path)) {
-    HLOG(kError, "S3FileAssimilator: Failed to create temp file for download");
-    error_code = -5;
+  // Resolve credentials + region in-process (no AWS SDK): environment keys
+  // first, else the named profile from ~/.aws/credentials. Only the profile
+  // NAME (ctx.s3_profile) ever travels in the task payload -- never a secret.
+  // Timed because this can touch ~/.aws/credentials on EVERY object -- a
+  // per-object filesystem cost that would be invisible in the aggregate.
+  _t_phase = SteadyClock::now();
+  AwsCredResult cred = ResolveAwsCredentials(ctx.s3_profile, ctx.s3_region);
+  g_us_creds.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
+  if (!cred.ok) {
+    HLOG(kError, "S3FileAssimilator: {}", cred.error);
+    error_code = -6;
     CLIO_CO_RETURN;
   }
-  std::vector<std::string> args = {ResolveS3Tool(), "get", bucket, key,
-                                   tmp_path};
-  if (ctx.range_size > 0) {
-    args.push_back(std::to_string(ctx.range_off));
-    args.push_back(std::to_string(ctx.range_size));
+
+  // In-process S3 client (Poco + SigV4). The connection is leased from the
+  // runtime-owned pool for this object's whole lifetime, so a keep-alive socket
+  // is reused across objects and is never shared with another worker even if
+  // this task is migrated across a co_await (issue #785).
+  s3::S3RestClient client(MakeS3Config(bucket, cred.creds));
+  const std::string conn_key = client.ConnectionKey(key);
+  _t_phase = SteadyClock::now();
+  std::unique_ptr<s3::S3Connection> conn_owned =
+      s3_pool_ ? s3_pool_->Acquire(conn_key)
+               : std::make_unique<s3::S3Connection>();
+  g_us_acquire.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
+  s3::S3Connection& conn = *conn_owned;
+  s3::S3RestClient::S3GetStream stream;
+  // Return the connection on every exit path (success, error, co_return). In
+  // both coroutine backends locals are destroyed at CLIO_CO_RETURN but preserved
+  // across a suspend, which is exactly this lifetime. A socket whose body is
+  // still open (an error bailed mid-stream) must not be pooled -- it carries
+  // unconsumed bytes -- so it is retired; a clean finish nulls stream.body via
+  // EndGetObject, leaving a reusable socket to pool.
+  struct ConnReturn {
+    S3ConnectionPool* pool;
+    const std::string& key;
+    std::unique_ptr<s3::S3Connection>* conn;
+    s3::S3RestClient::S3GetStream* stream;
+    ~ConnReturn() {
+      if (!conn || !*conn) return;
+      if (stream && stream->body != nullptr) (*conn)->Retire();
+      if (pool) pool->Release(key, std::move(*conn));
+    }
+  } conn_guard{s3_pool_, conn_key, &conn_owned, &stream};
+
+  // Whole object unless a bounded range was requested (a bare range_off with no
+  // range_size means "whole object", matching the old fork+exec tool contract).
+  const uint64_t req_off = (ctx.range_size > 0) ? ctx.range_off : 0;
+  const uint64_t req_size = static_cast<uint64_t>(ctx.range_size);
+
+  _t_phase = SteadyClock::now();
+  s3::S3Result begin =
+      client.BeginGetObject(conn, key, req_off, req_size, &stream);
+  g_us_begin.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
+  if (begin.not_found) {
+    HLOG(kError, "S3FileAssimilator: object not found: s3://{}/{}", bucket, key);
+    error_code = -7;
+    CLIO_CO_RETURN;
   }
-  int tool_rc = RunProcess(args);
-  if (tool_rc != 0) {
-    HLOG(kError,
-         "S3FileAssimilator: cae_s3_tool get failed (rc={}) for s3://{}/{}",
-         tool_rc, bucket, key);
-    ::unlink(tmp_path.c_str());
+  if (!begin.ok()) {
+    HLOG(kError, "S3FileAssimilator: GET failed for s3://{}/{}: {}", bucket, key,
+         begin.error);
     error_code = -7;
     CLIO_CO_RETURN;
   }
 
-  // Open the downloaded file and stream it into CTE. Unlinking the open file
-  // makes cleanup automatic on every return path below (POSIX: the bytes stay
-  // readable until the stream closes).
-  std::ifstream body(tmp_path, std::ios::binary);
-  ::unlink(tmp_path.c_str());
-  if (!body) {
-    HLOG(kError, "S3FileAssimilator: Failed to open downloaded object '{}'",
-         tmp_path);
-    error_code = -8;
-    CLIO_CO_RETURN;
-  }
-  body.seekg(0, std::ios::end);
-  size_t total_size = static_cast<size_t>(body.tellg());
-  body.seekg(0, std::ios::beg);
+  // Bytes to ingest in THIS transfer (the range length, or the whole object).
+  size_t total_size = static_cast<size_t>(stream.content_length);
   size_t chunk_offset = (ctx.range_size > 0) ? ctx.range_off : 0;
   HLOG(kDebug, "S3FileAssimilator: s3://{}/{} -> {} bytes (offset {})", bucket,
        key, total_size, chunk_offset);
@@ -243,25 +364,36 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
   size_t desc_size = description.size();
   auto desc_buffer = CLIO_IPC->AllocateBuffer(desc_size);
   std::memcpy(desc_buffer.ptr_, description.c_str(), desc_size);
+  // Submitted here but NOT awaited here. This is a ~40-byte blob, and awaiting
+  // it inline put a whole CTE round trip on the critical path of every object,
+  // ahead of the first body byte being read. It costs the same round trip
+  // whether we wait for it now or after the body, so it waits with the body
+  // chunks -- one fewer serialized trip per object.
+  //
+  // That matters only at fine granularity, which is exactly where the read
+  // sweep showed CLIO losing: chunks-per-object is object_size/1 MiB, so an
+  // object under 32 MiB can never fill the kMaxParallelTasks window below and
+  // the fixed per-object trips dominate. Job 23925, CLIO/Zarr by chunk count:
+  // 256 chunks 1.04x, 32 chunks 1.03x, 4 chunks 0.71-0.81x, 1 chunk 0.59x.
+  //
+  // Ordering is safe: the tag already exists, and "description" and "chunk_N"
+  // are independent blobs under it.
+  const SteadyClock::time_point _t_desc = SteadyClock::now();
   auto desc_task =
       cte_client_->AsyncPutBlob(tag_id, "description", 0, desc_size,
                                 desc_buffer.shm_.template Cast<void>(), 1.0f,
                                 clio::cte::core::Context(), 0);
-  CLIO_CO_AWAIT(desc_task);
-  if (desc_task->return_code_ != 0) {
-    HLOG(kError,
-         "S3FileAssimilator: Failed to store description for tag '{}' (code {})",
-         tag_name, desc_task->return_code_);
-    error_code = -9;
-    CLIO_CO_RETURN;
-  }
 
-  // Stream the object body into CTE in chunks, keeping up to kMaxParallelTasks
-  // PutBlob tasks in flight (identical wait-and-drain shape to binary backend).
+  // Stream the body into CTE in chunks, keeping up to kMaxParallelTasks PutBlob
+  // tasks in flight (identical wait-and-drain shape to the binary backend). The
+  // body now comes off the socket instead of a staged file; FillChunk resumes a
+  // dropped keep-alive mid-object so a suspend across a PutBlob cannot truncate.
   static constexpr size_t kMaxChunkSize = 1024 * 1024;  // 1 MB
   static constexpr size_t kMaxParallelTasks = 32;
+  static constexpr int kMaxResumes = 16;
   size_t chunk_idx = 0;
   size_t bytes_processed = 0;
+  int resumes = 0;
   std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> active_tasks;
 
   while (bytes_processed < total_size) {
@@ -272,20 +404,20 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
       auto buffer_ptr = CLIO_IPC->AllocateBuffer(current_chunk_size);
       char* buffer = buffer_ptr.ptr_;
 
-      body.read(buffer, current_chunk_size);
-      std::streamsize bytes_read = body.gcount();
-      if (bytes_read != static_cast<std::streamsize>(current_chunk_size)) {
-        if (body.eof() && bytes_read > 0) {
-          current_chunk_size = static_cast<size_t>(bytes_read);
-        } else {
-          HLOG(kError,
-               "S3FileAssimilator: Short read on chunk {} from s3://{}/{} "
-               "(bytes_read={}, eof={}, fail={})",
-               chunk_idx, bucket, key, bytes_read, body.eof(), body.fail());
-          CLIO_IPC->FreeBuffer(buffer_ptr);
-          error_code = -9;
-          CLIO_CO_RETURN;
-        }
+      size_t filled = 0;
+      _t_phase = SteadyClock::now();
+      s3::S3Result fr =
+          FillChunk(client, conn, stream, key, buffer, current_chunk_size,
+                    req_off + bytes_processed, kMaxResumes, &resumes, &filled);
+      g_us_fill.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
+      if (!fr.error.empty() || filled != current_chunk_size) {
+        HLOG(kError,
+             "S3FileAssimilator: short/failed read on chunk {} from s3://{}/{} "
+             "(filled={}, want={}, err='{}')",
+             chunk_idx, bucket, key, filled, current_chunk_size, fr.error);
+        CLIO_IPC->FreeBuffer(buffer_ptr);
+        error_code = -8;
+        CLIO_CO_RETURN;
       }
 
       std::string blob_name = "chunk_" + std::to_string(chunk_idx);
@@ -300,7 +432,9 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
 
     if (!active_tasks.empty()) {
       auto& first_task = active_tasks.front();
+      _t_phase = SteadyClock::now();
       CLIO_CO_AWAIT(first_task);
+      g_us_put.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
       if (first_task->return_code_ != 0) {
         HLOG(kError, "S3FileAssimilator: PutBlob task failed with code {}",
              first_task->return_code_);
@@ -315,7 +449,9 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
 
   // Drain any remaining in-flight tasks.
   for (auto& task : active_tasks) {
+    _t_phase = SteadyClock::now();
     CLIO_CO_AWAIT(task);
+    g_us_put.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
     if (task->return_code_ != 0) {
       HLOG(kError, "S3FileAssimilator: PutBlob task failed with code {}",
            task->return_code_);
@@ -326,9 +462,37 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
     CLIO_IPC->FreeBuffer(task->blob_data_.template Cast<char>());
   }
 
+  // Now collect the description blob submitted before the body. By this point
+  // it has almost certainly landed, so this await is usually free -- which is
+  // the entire point of having moved it off the front of the object.
+  CLIO_CO_AWAIT(desc_task);
+  g_us_desc.fetch_add(UsSince(_t_desc), std::memory_order_relaxed);
+  if (desc_task->return_code_ != 0) {
+    HLOG(kError,
+         "S3FileAssimilator: Failed to store description for tag '{}' (code {})",
+         tag_name, desc_task->return_code_);
+    CLIO_IPC->FreeBuffer(desc_task->blob_data_.template Cast<char>());
+    error_code = -9;
+    CLIO_CO_RETURN;
+  }
+  // Pre-existing leak, fixed while moving this: the description buffer was
+  // allocated per object and never freed. BinaryFileAssimilator:176 has the
+  // same bug -- left alone here rather than edited blind in an unrelated path.
+  CLIO_IPC->FreeBuffer(desc_task->blob_data_.template Cast<char>());
+
+  // Drain any unread tail so the socket is reusable, then the guard pools it.
+  _t_phase = SteadyClock::now();
+  client.EndGetObject(conn, stream);
+  g_us_end.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
+
+  g_n_chunks.fetch_add(chunk_idx, std::memory_order_relaxed);
+  g_n_objects.fetch_add(1, std::memory_order_relaxed);
+  g_us_total.fetch_add(UsSince(_t_entry), std::memory_order_relaxed);
+
   HLOG(kDebug,
-       "S3FileAssimilator: Imported s3://{}/{} ({} chunks) into tag '{}'",
-       bucket, key, chunk_idx, tag_name);
+       "S3FileAssimilator: Imported s3://{}/{} ({} chunks, {} resumes) into "
+       "tag '{}'",
+       bucket, key, chunk_idx, resumes, tag_name);
   error_code = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

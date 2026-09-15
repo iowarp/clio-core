@@ -53,8 +53,9 @@
 namespace clio::cae::core {
 
 AssimilatorFactory::AssimilatorFactory(
-    std::shared_ptr<clio::cte::core::Client> cte_client)
-    : cte_client_(cte_client) {}
+    std::shared_ptr<clio::cte::core::Client> cte_client,
+    S3ConnectionPool* s3_pool)
+    : cte_client_(cte_client), s3_pool_(s3_pool) {}
 
 std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
     const std::string& src) {
@@ -125,8 +126,9 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
 #ifdef CAE_ENABLE_S3
     HLOG(kDebug,
          "AssimilatorFactory: Creating S3FileAssimilator for 's3' protocol");
-    // For s3 protocol, return an S3FileAssimilator
-    return std::make_unique<S3FileAssimilator>(cte_client_);
+    // For s3 protocol, return an S3FileAssimilator wired to the shared
+    // keep-alive connection pool (may be null -> it connects per object).
+    return std::make_unique<S3FileAssimilator>(cte_client_, s3_pool_);
 #else
     // S3 support not compiled in
     HLOG(kError,

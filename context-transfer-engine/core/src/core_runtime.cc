@@ -690,6 +690,10 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
         bdev_type = clio::run::bdev::BdevType::kPinned;
       } else if (device.bdev_type_ == "noop") {
         bdev_type = clio::run::bdev::BdevType::kNoop;
+      } else if (device.bdev_type_ == "s3") {
+        bdev_type = clio::run::bdev::BdevType::kS3;
+      } else if (device.bdev_type_ == "gcs") {
+        bdev_type = clio::run::bdev::BdevType::kGcs;
       }
 
       for (clio::run::u32 i = 0; i < actual_neighborhood; ++i) {

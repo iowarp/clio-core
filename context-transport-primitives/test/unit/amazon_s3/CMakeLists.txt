@@ -20,11 +20,10 @@ endif()
 
 add_executable(clio_ctp_s3_test test_s3_drive.cc)
 
-if(AWSSDK_FOUND)
-    set(AWS_S3_TARGET AWSSDK::s3)
-else()
-    set(AWS_S3_TARGET aws-cpp-sdk-s3 aws-cpp-sdk-core)
-endif()
+# The AWSSDK config package sets AWSSDK_FOUND but exports no namespaced
+# `AWSSDK::s3` target -- it defines the plain `aws-cpp-sdk-*` targets, which are
+# also what FetchContent produces. Same names either way; see cae_s3_tool.
+set(AWS_S3_TARGET aws-cpp-sdk-s3 aws-cpp-sdk-core)
 
 target_link_libraries(clio_ctp_s3_test
     PRIVATE

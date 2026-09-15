@@ -2,9 +2,9 @@
 
 This directory holds the two Jarvis regression pipelines for Issue #526:
 
-- [single_node.yaml](single_node.yaml) — one node, a 4×6 (I/O size × thread
+- [single_node.yaml](../single_node.yaml) — one node, a 4×6 (I/O size × thread
   count) sweep over four storage stacks = **24 rows**.
-- [distributed.yaml](distributed.yaml) — four nodes, a 1→2→4 client-node scaling
+- [distributed.yaml](../distributed.yaml) — four nodes, a 1→2→4 client-node scaling
   sweep over three stacks = **3 rows**.
 
 Both run their real work inside a pre-built Apptainer container (the SIF). This

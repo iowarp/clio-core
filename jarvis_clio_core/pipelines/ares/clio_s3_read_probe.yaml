@@ -1,0 +1,268 @@
+# =============================================================================
+# Issue #968 — 512 KiB / K=1 TIMING PROBE for the clio_s3_read sweep.
+# =============================================================================
+#
+# ONE cell, ONE repeat. This is not a result, it is a BUDGET MEASUREMENT for
+# `clio_s3_read.yaml`, and it deliberately picks that grid's most expensive
+# combination: 512 KiB objects (4096 requests for the same 2 GiB) at K=1, where
+# per-request cost is paid serially and cannot hide behind concurrency.
+#
+# Why this is needed. Every sweep row moves 2 GiB through THREE engines = 6 GiB,
+# which at the measured ~11.2 MB/s link ceiling is ~546 s of pure transfer per
+# row. 36 rows is therefore ~5.5 h of transfer alone against an 08:00:00 wall,
+# leaving ~46% for all per-request overhead plus 36 runtime start/stop cycles.
+# Extrapolating the 32 MiB smoke (job 23923): CLIO paid ~0.19 s/request of
+# non-transfer overhead and the raw_get floor ~3.5 s/request (process spawn +
+# Aws::InitAPI + fresh TLS handshake). At 4096 requests those become ~960 s and
+# potentially >1800 s respectively -- i.e. the floor alone may exceed the
+# sweep's per-combination `run_timeout`, and the grid as a whole may not fit the
+# allocation. An expired row is voided and the sweep continues, so the failure
+# mode is not a crash: it is silently losing the 512 KiB column, which is the
+# column where persistent connections matter MOST (4096 connection setups to
+# amortize, versus 8 at 256 MiB).
+#
+# What to read off it:
+#   - per-engine wall time for the cell -> the real per-request overhead
+#   - whether raw_get completes 4096 sequential `cae_s3_tool` spawns at all
+#   - whether run_timeout and repeat need changing before the 8 h sweep
+#   - validates the /dev/null floor (138568ae) at 4096 objects, not just 64
+#
+# run_timeout is raised to 7200 here ON PURPOSE: the probe must be allowed to
+# RUN LONG so we learn the real number. Do not copy that value into the sweep
+# without redoing the 36-row budget.
+#
+# Identity is deliberately distinct from the sweep -- own job_name, hostfile,
+# and results dir -- because the scheduler hostfile path is keyed on pipeline
+# name and two same-named jobs in flight corrupt each other's later iterations
+# (diagnosed on jobs 23911 + 23912). Still run it with nothing else of this
+# family queued: check `squeue -u $USER` first.
+#
+# Usage (identical env to the sweep):
+#   export S3_BENCH_BUCKET=my-bucket S3_BENCH_PROFILE=clio-bench
+#   export IOWARP_VIEW=/mnt/common/$USER/iowarp-s3-view ZARR_VENV=$HOME/zarr-venv
+#   jarvis ppl submit <abs path>/clio_s3_read_probe.yaml
+#
+scheduler:
+  name: slurm
+  job_name: clio_s3_probe
+  nodes: 1
+  ntasks_per_node: 1
+  # Must stay large: Ares Slurm uses proctrack/cgroup with ConstrainCores, and
+  # the S3 assimilator blocks a whole runtime worker thread on waitpid() for
+  # the duration of each GET. A narrow cgroup silently caps concurrency.
+  cpus_per_task: 40
+  partition: compute
+  time: "02:30:00"
+  output: ${HOME}/clio_s3_probe-%j.out
+  error: ${HOME}/clio_s3_probe-%j.err
+  # MUST stay literally identical to config.hostfile below.
+  hostfile: "${HOME}/.jarvis-s3-bench/clio_s3_probe_hostfile.txt"
+  pre_cmds:
+    # 1) Toolchain. Pure PATH prepends -- never `spack load` / `conda activate`
+    #    (they install shell functions that misbehave under `set -euo pipefail`).
+    - 'export PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/bin:${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"'
+    - 'export LD_LIBRARY_PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib:${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib64:${LD_LIBRARY_PATH:-}"'
+    - 'command -v clio_run           >/dev/null 2>&1 || { echo "ERROR: clio_run not on PATH (view: ${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view})" >&2; exit 1; }'
+    - 'command -v clio_s3_read_bench >/dev/null 2>&1 || { echo "ERROR: clio_s3_read_bench not on PATH — was IOWarp built with +cae +s3_cae?" >&2; exit 1; }'
+    - 'command -v cae_s3_tool        >/dev/null 2>&1 || { echo "ERROR: cae_s3_tool not on PATH — was IOWarp built with +s3_cae?" >&2; exit 1; }'
+    - 'command -v jarvis             >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
+    - '"${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" -c "import zarr,s3fs,numpy" || { echo "ERROR: zarr venv broken at ${ZARR_VENV:-$HOME/zarr-venv}" >&2; exit 1; }'
+    - 'echo "toolchain: clio_run=$(command -v clio_run) bench=$(command -v clio_s3_read_bench) jarvis=$(command -v jarvis)"'
+    # 1b) CAE runtime link gate. The s3:// read path is now IN-PROCESS over
+    #     Poco+SigV4 (no fork+exec, no AWS SDK in the runtime). Assert the
+    #     installed library actually is that build: Poco NetSSL present, AWS SDK
+    #     ABSENT, and the CAE keep-alive tally literal present (which also proves
+    #     the install post-dates this change -- a `spack develop` tree does not
+    #     rebuild on `git pull`, so `spack install iowarp@dev` after every pull).
+    - |
+      echo "cae gate: host=$(hostname -s) time=$(date -Is)"
+      CLIO_RUN_BIN="$(command -v clio_run || true)"
+      LIB="${CLIO_RUN_BIN%/bin/clio_run}/lib/libclio_cae_core_runtime.so"
+      [ -f "$LIB" ] || LIB="${LIB%/lib/*}/lib64/libclio_cae_core_runtime.so"
+      [ -f "$LIB" ] || { echo "ERROR: libclio_cae_core_runtime.so not found under the install root" >&2; exit 1; }
+      echo "cae gate: lib -> $(readlink -f "$LIB" 2>&1 || true)"
+      LDD_OUT="$(ldd "$LIB" 2>&1)" || { echo "ERROR: ldd failed on $LIB:" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1; }
+      printf '%s\n' "$LDD_OUT" | grep -q PocoNetSSL || { echo "ERROR: $LIB has no Poco NetSSL — CAE built without the in-process S3 path?" >&2; exit 1; }
+      printf '%s\n' "$LDD_OUT" | grep -q aws-cpp-sdk && { echo "ERROR: $LIB links the AWS SDK — that stack-smashes runtime init" >&2; exit 1; }
+      KA_RC=0
+      KA_COUNT="$(grep -acF "CAE S3 keepalive" "$LIB")" || KA_RC=$?
+      echo "cae gate: keepalive tally matches = ${KA_COUNT:-0} (grep rc=$KA_RC)"
+      [ "$KA_RC" -le 1 ] || { echo "ERROR: could not read $LIB (grep exit $KA_RC)" >&2; exit 1; }
+      [ "${KA_COUNT:-0}" -ge 1 ] || {
+        echo "ERROR: $LIB PREDATES the in-process persistent-connection read path." >&2
+        echo "  Rebuild first:  spack install iowarp@dev" >&2
+        exit 1; }
+      echo "cae link check OK: $LIB (Poco present, no AWS SDK, CAE keepalive tally present)"
+    # 2) AWS credentials. NO SECRETS IN THIS FILE. Credentials live in
+    #    ~/.aws/credentials (mode 600); both the AWS C++ SDK default chain
+    #    (cae_s3_tool) and botocore (s3fs) read it. Only non-secret profile and
+    #    region names appear here.
+    - 'export AWS_PROFILE="${S3_BENCH_PROFILE:-clio-bench}"'
+    - 'export AWS_DEFAULT_REGION="${S3_BENCH_REGION:-us-east-1}"'
+    # Real AWS: an endpoint override flips cae_s3_tool to path-style addressing
+    # against a nonexistent host, so both must stay unset.
+    - 'unset S3_ENDPOINT AWS_ENDPOINT_URL'
+    - '[ -r "$HOME/.aws/credentials" ] || { echo "ERROR: ~/.aws/credentials missing/unreadable" >&2; exit 1; }'
+    - '[ -n "${S3_BENCH_BUCKET:-}" ] || { echo "ERROR: S3_BENCH_BUCKET not set" >&2; exit 1; }'
+    # 3) The runtime no longer forks cae_s3_tool for the read path (it signs and
+    #    streams in-process over Poco, resolving credentials from AWS_PROFILE ->
+    #    ~/.aws/credentials with HOME already in the daemon env). But the raw-GET
+    #    FLOOR (s3_raw_get_bench) still drives cae_s3_tool, so keep it on PATH and
+    #    give it a node-local TMPDIR with room for concurrency * object_size.
+    - 'export CAE_S3_TOOL="$(command -v cae_s3_tool)"'
+    - 'export TMPDIR=/tmp/clio_s3_bench; mkdir -p "$TMPDIR"'
+    # 4) Stale-state cleanup. pkill patterns are BRACKETED so they never match
+    #    this script's own argv.
+    - 'pkill -9 -f "[c]himaera" 2>/dev/null || true'
+    - 'pkill -9 -f "[c]lio_run" 2>/dev/null || true'
+    - '{ command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true'
+    - 'rm -f /dev/shm/chi_* 2>/dev/null || true'
+    - 'rm -rf "$TMPDIR"/cae_s3_* /tmp/iowarp_chi* 2>/dev/null || true'
+    # 5) Experiment dirs + repo registration + clean slate (the sweep runner
+    #    RESUMES over an existing results.csv and would skip failed rows).
+    - 'mkdir -p "$HOME/clio_s3_probe_results" "$HOME/.jarvis-s3-bench"'
+    - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true'
+    - 'rm -f "$HOME/clio_s3_probe_results/results.csv"'
+  post_cmds:
+    - 'RES="$HOME/clio_s3_probe_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 1"'
+    # A green row with a blank throughput column is a FAILURE, not a success.
+    # Assert it here instead of leaving it to manual inspection.
+    - |
+      python3 - "$HOME/clio_s3_probe_results/results.csv" <<'EOF'
+      import csv, os, sys
+      path = sys.argv[1]
+      if not os.path.exists(path):
+          print("NO RESULTS CSV AT", path); sys.exit(0)
+      need = ["clio_s3.read.agg_bw_mbps", "zarr_s3.read.agg_bw_mbps",
+              "raw_get.rawget.agg_bw_mbps"]
+      rows = list(csv.DictReader(open(path)))
+      bad = [r.get("run_idx") for r in rows
+             if r.get("status") == "success" and any(not r.get(c) for c in need)]
+      print("rows:", len(rows))
+      print("GREEN ROWS WITH BLANK THROUGHPUT (== FAILURES):", bad or "none")
+      EOF
+
+config:
+  name: clio_s3_probe
+
+  # MUST stay literally identical to scheduler.hostfile above.
+  hostfile: "${HOME}/.jarvis-s3-bench/clio_s3_probe_hostfile.txt"
+
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 16          # SWEPT with concurrency -- see the note above
+      client_data_segment_size: "4G"
+      port: 9413
+      # IPC (unix socket), NOT shm: the benchmark is a detached client, not a
+      # descendant of the runtime daemon, and Ares compute nodes run
+      # ptrace_scope=1. SHM mode attaches the daemon's main segment by
+      # reopening /proc/<server_pid>/fd via a memfd symlink, which ptrace_scope=1
+      # denies for a non-descendant (shm_open -> EACCES, "Failed to initialize
+      # Clio"). The unix-socket transport needs no /proc reopen; it is ~38x
+      # faster than TCP (issue #768) so the throughput cost vs SHM is small.
+      ipc_mode: "ipc"
+      log_level: "info"
+      # SWIM off: transient errors must not promote a peer to dead mid-bench.
+      swim_enabled: false
+      sleep: 4
+
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      # 24 GB is ~12x the 2 GiB working set, so a row never spills or evicts.
+      devices:
+        - ["ram::cte_ram_tier1", "24GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      pool_query: "local"
+
+    - pkg_type: jarvis_clio_core.clio_s3_bench
+      pkg_name: clio_s3
+      mode: read
+      bucket: "${S3_BENCH_BUCKET}"
+      key_prefix: "clio-s3-read-bench/raw/33554432"   # SWEPT
+      object_size: "32m"                              # SWEPT
+      num_objects: 64                                 # SWEPT
+      concurrency: 8                                  # SWEPT
+      worker_threads: 16                              # SWEPT (reported only)
+      tag_prefix: "s3rb"
+      tmpdir: "/tmp/clio_s3_bench"
+      aws_region: "${S3_BENCH_REGION}"
+      # Set explicitly so the benchmark's env carries AWS_PROFILE deterministically;
+      # the benchmark forwards region+profile into each assimilation context so the
+      # ssh-launched runtime daemon's cae_s3_tool (which inherits neither) can sign
+      # correctly. Without this the daemon defaults to us-east-1/anonymous.
+      aws_profile: "${S3_BENCH_PROFILE}"
+      verify: false
+
+    - pkg_type: jarvis_clio_core.zarr_s3_bench
+      pkg_name: zarr_s3
+      mode: read
+      bucket: "${S3_BENCH_BUCKET}"
+      store_prefix: "clio-s3-read-bench"
+      chunk_edge: 256                                 # SWEPT
+      # Uncompressed only -- see the zstd note in the header. The staged
+      # dataset still carries the zstd stores; nothing reads them.
+      variants: ["none"]
+      async_concurrency: 8                            # SWEPT
+      aws_region: "${S3_BENCH_REGION}"
+      venv: "${ZARR_VENV}"
+
+    # Raw-GET wire-speed FLOOR: K concurrent `cae_s3_tool get` processes reading
+    # the SAME obj_%06d.bin keys the CLIO row reads. It is the only thing a CLIO
+    # read number is attributable against (report ratio-to-floor, not absolute
+    # MB/s). key_prefix/object_size/num_objects/concurrency mirror clio_s3 so the
+    # two measure identical work. NOTE it is NOT a floor at K=1 (serialized
+    # spawn + temp file per object only pipelines at K>=8).
+    - pkg_type: jarvis_clio_core.s3_raw_get_bench
+      pkg_name: raw_get
+      bucket: "${S3_BENCH_BUCKET}"
+      key_prefix: "clio-s3-read-bench/raw/33554432"   # SWEPT (== clio_s3.key_prefix)
+      object_size: "32m"                              # SWEPT
+      num_objects: 64                                 # SWEPT
+      concurrency: 8                                  # SWEPT
+      s3_tool: "cae_s3_tool"
+      tmpdir: "/tmp/clio_s3_bench"
+      aws_region: "${S3_BENCH_REGION}"
+      aws_profile: "${S3_BENCH_PROFILE}"
+
+vars:
+  # --- Granularity: bytes per request. Zipped, length 4. ---
+  # Chunk edge c -> c^3 * 2 bytes:
+  #   64 -> 512 KiB / 4096 objs ; 128 -> 4 MiB / 512 ;
+  #   256 -> 32 MiB / 64        ; 512 -> 256 MiB / 8
+  # Total bytes stay 2 GiB in every row; only request COUNT varies.
+  clio_s3.key_prefix:  ["clio-s3-read-bench/raw/524288"]
+  clio_s3.object_size: ["512k"]
+  clio_s3.num_objects: [4096]
+  zarr_s3.chunk_edge:  [64]
+  # The raw-GET floor reads the same keys/sizes/counts as the CLIO row.
+  raw_get.key_prefix:  ["clio-s3-read-bench/raw/524288"]
+  raw_get.object_size: ["512k"]
+  raw_get.num_objects: [4096]
+
+  # --- Concurrency. Zipped, length 3. ---
+  # runtime.num_threads rides along because the S3 assimilator blocks a runtime
+  # worker for the whole in-process GET: with too few workers, raising CLIO's
+  # concurrency buys nothing. The port removed the per-object fork+exec cost, NOT
+  # this worker-blocking ceiling. clio_s3.worker_threads mirrors the value into
+  # the fairness columns so every row records the confound.
+  clio_s3.concurrency:       [1]
+  zarr_s3.async_concurrency: [1]
+  runtime.num_threads:       [4]
+  clio_s3.worker_threads:    [4]
+  raw_get.concurrency:       [1]
+
+loop:
+  - [clio_s3.key_prefix, clio_s3.object_size, clio_s3.num_objects,
+     zarr_s3.chunk_edge,
+     raw_get.key_prefix, raw_get.object_size, raw_get.num_objects]
+  - [clio_s3.concurrency, zarr_s3.async_concurrency, runtime.num_threads,
+     clio_s3.worker_threads, raw_get.concurrency]
+
+# Per-combination wall-clock backstop. Expiry marks that row failed and the
+# sweep continues, so one wedged row can no longer lose the other 35.
+run_timeout: 7200
+
+repeat: 1
+output: "${HOME}/clio_s3_probe_results"
