@@ -2101,6 +2101,31 @@ namespace clio::run {
 // shared_ptr destructor (host) when the last owner drops — no explicit free.
 template <typename TaskT, typename AllocT>
 CTP_HOST_FUN Future<TaskT, AllocT>::~Future() {
+#if CTP_IS_HOST
+  // A future dropped WITHOUT being waited on still has to deregister. Firing
+  // AsyncX in a loop and letting each future die is legal use of the API (it is
+  // exactly what test_client_crash_putblob does), and consumed_ is false on that
+  // path, so the branch below never ran: the task's shared_ptr freed it while
+  // pending_zmq_futures_ still held a RAW pointer to it, and the next response
+  // wrote through that pointer (Task::SetNewData on freed memory —
+  // AddressSanitizer's heap-use-after-free in cr_cli_client_crash_leak).
+  //
+  // Gated on being the LAST owner: a copy of a live future carries
+  // consumed_ == false too, and deregistering for one of those would strand the
+  // owner still waiting for the response. use_count() == 1 here means this
+  // object's member destructor, which runs next, frees the task.
+  if (!consumed_ && !task_ptr_.IsNull() && task_ptr_.use_count() == 1 &&
+      !FutureShmIsNull()) {
+    ctp::ipc::FullPtr<FutureT> fs = GetFutureShm();
+    TaskT *t = TaskRaw();
+    if (!fs.IsNull() && t != nullptr &&
+        (fs->origin_ == ClientOrigin::kClientTcp ||
+         fs->origin_ == ClientOrigin::kClientIpc ||
+         fs->origin_ == ClientOrigin::kClientShm)) {
+      CLIO_CPU_IPC->CleanupResponseArchive(t->task_id_.net_key_);
+    }
+  }
+#endif
   if (consumed_) {
     // Clean up zero-copy response archive (TCP/IPC only, never used on GPU).
     // The FutureShm itself is owned by the host shared_ptr and freed

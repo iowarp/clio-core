@@ -3570,6 +3570,13 @@ bool IpcManager::WaitForServerAndReconnect(
 // TCP round-trip).
 static constexpr int kZmqPollTimeoutMs = 1;
 
+// Back-off after a failed (non-EAGAIN) client Recv. The first few retries stay
+// fast so a transient error costs no measurable latency; after that the link is
+// presumed down and the thread idles instead of burning a core.
+static constexpr int kRecvErrorRetryUs = 1000;
+static constexpr int kRecvErrorBackoffUs = 10000;
+static constexpr size_t kRecvErrorFastRetries = 32;
+
 void IpcManager::RecvZmqClientThread() {
   // Client-side thread: blocks for completed task responses. In TCP mode these
   // arrive on the dedicated response listener (an ephemeral ROUTER bound in
@@ -3591,10 +3598,19 @@ void IpcManager::RecvZmqClientThread() {
   // (FUTURE_COMPLETE set). Mismatch vs daemon-side send count = lost responses.
   size_t recv_count = 0;
   size_t miss_count = 0;
+  // Consecutive drains that ended in a Recv error rather than EAGAIN. A client
+  // whose runtime has gone away sits here for the rest of its life: the
+  // socket transport's client-mode Recv() keeps returning -1 on the dead fd,
+  // and a dead fd is permanently POLLIN-readable, so neither this loop nor the
+  // PollRecv() below ever blocks. Used to back off (and to log once instead of
+  // per iteration) so that case costs a few wakeups a second rather than a
+  // pegged core and a megabyte of log per second.
+  size_t error_streak = 0;
 
   while (zmq_recv_running_.load()) {
     // Drain all available messages first
     bool drained_any = false;
+    bool recv_error = false;
     bool got_message = true;
     while (got_message) {
       got_message = false;
@@ -3608,8 +3624,15 @@ void IpcManager::RecvZmqClientThread() {
         // ETERM means the ZMQ context is being shut down (zmq_ctx_shutdown was
         // called).  Exit immediately so the context destructor is not blocked.
         if (rc == ETERM) return;
-        HLOG(kDebug, "RecvZmqClientThread: Recv returned: {}", rc);
-        continue;
+        // Nothing was drained, so there is nothing more to drain: end the
+        // drain loop the same way the runtime-side PeerRecvThread does and let
+        // the wait below decide how long to wait. (This used to `continue`,
+        // which retried the same failing Recv immediately, forever.)
+        recv_error = true;
+        if (error_streak == 0) {
+          HLOG(kDebug, "RecvZmqClientThread: Recv returned: {}", rc);
+        }
+        break;
       }
       got_message = true;
       drained_any = true;
@@ -3667,9 +3690,24 @@ void IpcManager::RecvZmqClientThread() {
     // Only block when the drain loop found nothing; if we just processed
     // messages, loop back immediately to drain more. zmq_poll wakes the instant
     // a response arrives, so this adds no latency to message delivery.
-    if (!drained_any) {
-      recv_transport->PollRecv(kZmqPollTimeoutMs);
+    if (drained_any) {
+      error_streak = 0;
+      continue;
     }
+    if (recv_error) {
+      // Sleep instead of polling: the fd that just failed is readable (that is
+      // what EOF looks like), so PollRecv returns instantly and would spin.
+      // 1 ms keeps a one-off error cheap to recover from; a link that stays
+      // broken (the runtime exited while this client was still up) settles at
+      // 100 wakeups/sec, which also bounds how long the shutdown join waits.
+      ++error_streak;
+      CTP_THREAD_MODEL->SleepForUs(error_streak < kRecvErrorFastRetries
+                                       ? kRecvErrorRetryUs
+                                       : kRecvErrorBackoffUs);
+      continue;
+    }
+    error_streak = 0;
+    recv_transport->PollRecv(kZmqPollTimeoutMs);
   }
 }
 
@@ -4048,6 +4086,14 @@ void IpcManager::HeartbeatThread() {
 
 void IpcManager::CleanupResponseArchive(size_t net_key) {
   std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+  // Drop the in-flight registration FIRST. pending_zmq_futures_ holds a RAW
+  // Task* that is only valid while the client's Future owns it, and the sole
+  // caller is ~Future — the moment after which it does not. A response that
+  // arrives later found the stale entry and wrote through the freed task
+  // (RecvZmqClientThread -> Task::SetNewData), which is the heap-use-after-free
+  // AddressSanitizer reported for cr_cli_client_crash_leak. Nothing can consume
+  // the response once the future is gone, so forgetting it is the whole fix.
+  pending_zmq_futures_.erase(net_key);
   auto it = pending_response_archives_.find(net_key);
   if (it != pending_response_archives_.end()) {
     // Frees ZMQ zero-copy recv handles (bulk.desc); a no-op for a SHM archive

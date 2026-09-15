@@ -236,7 +236,34 @@ void Worker::Finalize() {
   // Clear assigned lane reference (don't delete - it's in shared memory)
   assigned_lane_.store(nullptr, std::memory_order_release);
 
+  // Release the event queues this worker owns: its own (Init /
+  // ReplaceEventQueue) plus every queue it inherited from a rescued worker.
+  // Nothing else ever freed them, so each worker walked off with a 147 KB ring
+  // on every runtime shutdown. Ownership is unambiguous — a queue moves to
+  // exactly one owner via ReplaceEventQueue / TransferAdoptedEventQueuesTo, and
+  // ~Worker runs only from WorkOrchestrator::Finalize during ServerFinalize,
+  // after StopWorkers() and DestroyAllContainers(), so no thread can still be
+  // draining or pushing. Freed last, after the queues above are emptied.
+  // (LeakSanitizer never got to report this: the RequestStop watchdog's
+  // use-after-free ended the daemon's ASan run before the exit-time leak check.)
+  DeleteEventQueue(event_queue_.exchange(nullptr, std::memory_order_acq_rel));
+  {
+    std::lock_guard<std::mutex> lk(park_mtx_);
+    for (EventQueue *q : adopted_event_queues_) {
+      DeleteEventQueue(q);
+    }
+    adopted_event_queues_.clear();
+  }
+
   is_initialized_ = false;
+}
+
+void Worker::DeleteEventQueue(EventQueue *queue) {
+  if (queue == nullptr) {
+    return;
+  }
+  ctp::ipc::FullPtr<EventQueue> ptr(CTP_MALLOC, queue);
+  CTP_MALLOC->DelObj(ptr);
 }
 
 void Worker::Run() {

@@ -42,6 +42,28 @@ using namespace std::chrono_literals;
 
 namespace {
 
+// Ceiling for the SHM-path read below. The number is not a wall-clock target
+// (see the gates at the assertion); it only has to sit far enough under the
+// ~72 us transport floor to prove no round trip happened. AddressSanitizer
+// instruments every load and store on that path, which measured 5.7-6.3 us in
+// the asan CI build against a bound picked from uninstrumented code -- a
+// failure that says nothing about the fast path. Sanitized builds get a bound
+// scaled for the instrumentation and still an order of magnitude below the
+// floor; the ratio gate is untouched and enforces the real claim either way.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define CLIO_TEST_SANITIZED 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+    __has_feature(memory_sanitizer)
+#define CLIO_TEST_SANITIZED 1
+#endif
+#endif
+#ifdef CLIO_TEST_SANITIZED
+constexpr double kShmReadMaxUs = 20.0;
+#else
+constexpr double kShmReadMaxUs = 5.0;
+#endif
+
 // A RAM target is what makes page payloads SHM-resident and therefore
 // direct-readable; a file target would (correctly) refuse the fast path.
 constexpr clio::run::u64 kRamTargetBytes = 256ULL * 1024 * 1024;
@@ -388,10 +410,10 @@ TEST_CASE("clio-fs SHM read: correctness and latency", "[cfs][shm][noleak]") {
   // condition just makes the suite flaky by runner class.
   //
   // What is machine-independent is that NO ROUND TRIP HAPPENED. The transport
-  // floor alone is ~72 us, so anything in single-digit microseconds cannot
+  // floor alone is ~72 us, so anything comfortably under kShmReadMaxUs cannot
   // have gone to the runtime; and the fast path must beat the RPC path it
   // replaces by a wide margin on whatever hardware this is.
-  REQUIRE(shm_us < 5.0);
+  REQUIRE(shm_us < kShmReadMaxUs);
   REQUIRE(rpc_us / shm_us > 20.0);
 
   cfs_io->CloseFd(fd);

@@ -48,6 +48,8 @@ using namespace std::chrono_literals;
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/singletons.h>
 #include <clio_runtime/types.h>
+#include <clio_runtime/work_orchestrator.h>
+#include <clio_runtime/worker.h>
 
 namespace {
   // Test configuration constants
@@ -146,6 +148,51 @@ TEST_CASE("Combined Initialization", "[runtime][client][combined]") {
       }
     }
   }
+}
+
+TEST_CASE("Worker event queue handoff and teardown", "[worker][785]") {
+  SimpleClioFixture fixture;
+  REQUIRE(g_initialized);
+
+  // The #785 stall rescue moves a wedged worker's event queue OBJECT to the
+  // worker rescuing it, because parked tasks hold a raw pointer to that exact
+  // queue. Ownership moves with it: the rescuer frees it in Finalize(), which
+  // is the path this exercises -- the runtime tears down at the end of this
+  // binary, and the leak-check / ASan builds are what prove the adopted queue
+  // is freed exactly once. Nothing else in the suite performs a rescue, so
+  // without this the handoff's teardown never runs at all.
+  auto *work_orch = CLIO_WORK_ORCHESTRATOR;
+  REQUIRE(work_orch != nullptr);
+  if (work_orch->GetWorkerCount() < 2) {
+    INFO("Fewer than two workers on this machine; no rescuer to hand off to");
+    return;
+  }
+
+  clio::run::Worker *donor = work_orch->GetWorker(0);
+  clio::run::Worker *rescuer = work_orch->GetWorker(1);
+  REQUIRE(donor != nullptr);
+  REQUIRE(rescuer != nullptr);
+
+  auto *original = donor->GetEventQueue();
+  REQUIRE(original != nullptr);
+
+  // The donor hands over the object and keeps a FRESH one, so there is exactly
+  // one consumer per queue: completions for the subtasks it spawns next go
+  // somewhere the donor still drains.
+  auto *released = donor->ReplaceEventQueue();
+  REQUIRE(released == original);
+  REQUIRE(donor->GetEventQueue() != nullptr);
+  REQUIRE(donor->GetEventQueue() != released);
+
+  // The rescuer APPENDS it; adopting must never displace a queue the rescuer
+  // already owns, or the tasks pointing at that one would never wake.
+  auto *rescuer_own = rescuer->GetEventQueue();
+  rescuer->AdoptEventQueue(released);
+  REQUIRE(rescuer->GetEventQueue() == rescuer_own);
+
+  // A null adopt is a no-op, not a null entry the teardown would walk into.
+  rescuer->AdoptEventQueue(nullptr);
+  REQUIRE(rescuer->GetEventQueue() == rescuer_own);
 }
 
 TEST_CASE("Error Handling", "[error][basic]") {
