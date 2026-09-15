@@ -1027,6 +1027,19 @@ void PoolManager::SaveModel(const std::string &chimod_name,
   if (path.empty()) {
     return;
   }
+  // One writer at a time, across every path that reaches here: the 1 Hz
+  // SystemMonitor flush (on a worker), the force=true flush
+  // DestroyAllContainers issues during shutdown, and the direct force=true
+  // saves on the container-leave / pool-destroy paths below. They can target
+  // the SAME container, and Save() writes "<path>.tmp" and renames it over the
+  // real file -- two of them interleaved means one rename lands on a temp file
+  // the other is still writing. FlushModels used to take model_flush_mutex_
+  // only for its throttle bookkeeping and release it before saving, and the two
+  // direct call sites never took it at all, so its "one writer at a time"
+  // comment described an exclusion nothing enforced. Held here rather than
+  // around the FlushModels loop so it covers those call sites too, and so it is
+  // never held while pool_metadata_mutex_ is (no lock-order inversion).
+  std::lock_guard<std::mutex> guard(model_flush_mutex_);
   TaskStatModelSnapshot snapshot = c->ExportModel();
   if (snapshot.Empty()) {
     return;  // module never registered method names — nothing to analyze
@@ -1045,7 +1058,8 @@ void PoolManager::FlushModels(bool force) {
     return;
   }
 
-  // One writer at a time, and no more often than the flush interval.
+  // No more often than the flush interval. Mutual exclusion between writers is
+  // SaveModel's job, not this throttle's -- see the lock there.
   {
     std::lock_guard<std::mutex> guard(model_flush_mutex_);
     auto now = std::chrono::steady_clock::now();

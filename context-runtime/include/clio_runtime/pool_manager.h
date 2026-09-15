@@ -412,6 +412,10 @@ class PoolManager {
   // the admin SystemMonitor (1 Hz) does not rewrite every pool's model file
   // once a second. Only touched from FlushModels under model_flush_mutex_.
   std::chrono::steady_clock::time_point last_model_flush_{};
+  // Serializes model-file writers. Guards last_model_flush_ above AND the whole
+  // export-emit-rename in SaveModel, which is the part that actually needs
+  // exclusion: every writer renames its own "<path>.tmp" over the shared model
+  // file. Never taken while pool_metadata_mutex_ is held.
   std::mutex model_flush_mutex_;
 
   // Map PoolId to pool metadata (contains containers, address map, etc.)

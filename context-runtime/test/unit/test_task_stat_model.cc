@@ -141,6 +141,86 @@ TEST_CASE("TaskStatModel: snapshot survives a YAML round trip",
   REQUIRE(corrupt.Empty());
 }
 
+TEST_CASE("TaskStatModel: a save that cannot complete fails quietly",
+          "[task_stat_model]") {
+  // Save() runs from an atexit handler (ServerFinalize -> DestroyAllContainers
+  // -> SaveModel), where an escaping exception is std::terminate on a process
+  // whose work is already done. So every way a save can fail has to end in
+  // `return false`, quietly, leaving nothing behind. These are those ways.
+  std::error_code ec;
+  std::filesystem::path dir =
+      std::filesystem::temp_directory_path(ec) / "clio_model_956_fail";
+  std::filesystem::remove_all(dir, ec);
+  std::filesystem::create_directories(dir, ec);
+
+  TaskStatModelSnapshot snap;
+  snap.chimod_name_ = "bdev";
+  snap.pool_name_ = "/mnt/nvme/scratch";
+  snap.container_id_ = 1;
+  snap.methods_["Write"] = MethodStatWeights{2.5f, 0.125f, 7.5f, 0.25f};
+
+  SECTION("no path at all") { REQUIRE_FALSE(snap.Save("")); }
+
+  SECTION("the parent directory cannot be created") {
+    // A regular file where a directory has to go: create_directories fails and
+    // Save gives up before writing anything.
+    const std::string blocker = (dir / "not_a_dir").string();
+    { std::ofstream ofs(blocker, std::ios::trunc); ofs << "x"; }
+    REQUIRE_FALSE(snap.Save(blocker + "/models/m.yaml"));
+  }
+
+  SECTION("the temp file cannot be opened") {
+    // Save writes "<path>.tmp" first. A directory sitting on that exact name
+    // makes the ofstream fail to open, whatever the process's privileges are.
+    const std::string path = (dir / "blocked.yaml").string();
+    std::filesystem::create_directory(path + ".tmp", ec);
+    REQUIRE_FALSE(ec);
+    REQUIRE_FALSE(snap.Save(path));
+    REQUIRE_FALSE(std::filesystem::exists(path));
+    std::filesystem::remove(path + ".tmp", ec);
+  }
+
+#ifndef _WIN32
+  SECTION("the temp file cannot be written") {
+    // /dev/full accepts the open and fails every write with ENOSPC, which is
+    // the full-disk case: the stream goes bad and Save must notice rather than
+    // rename a truncated file over a good one. Linux only.
+    if (std::filesystem::exists("/dev/full")) {
+      const std::string path = (dir / "nospace.yaml").string();
+      std::filesystem::remove(path + ".tmp", ec);
+      std::filesystem::create_symlink("/dev/full", path + ".tmp", ec);
+      REQUIRE_FALSE(ec);
+      REQUIRE_FALSE(snap.Save(path));
+      REQUIRE_FALSE(std::filesystem::exists(path));
+      std::filesystem::remove(path + ".tmp", ec);
+    }
+  }
+#endif
+
+  SECTION("the rename cannot install the file") {
+    // A non-empty directory where the model file goes: the temp file is
+    // written fine and the rename onto it fails. The temp file must not be
+    // left behind to be mistaken for a model later.
+    const std::string path = (dir / "occupied.yaml").string();
+    std::filesystem::create_directories(std::filesystem::path(path) / "child",
+                                        ec);
+    REQUIRE_FALSE(ec);
+    REQUIRE_FALSE(snap.Save(path));
+    REQUIRE_FALSE(std::filesystem::exists(path + ".tmp"));
+    std::filesystem::remove_all(path, ec);
+  }
+
+  // Whatever failed above, a good save still works afterwards: none of these
+  // paths leaves the snapshot or the directory in a state that poisons it.
+  const std::string good = (dir / "good.yaml").string();
+  REQUIRE(snap.Save(good));
+  TaskStatModelSnapshot back;
+  REQUIRE(back.Load(good));
+  REQUIRE(back.methods_.size() == 1);
+
+  std::filesystem::remove_all(dir, ec);
+}
+
 /**
  * Build a second real container for `pool_id` on this node with container id
  * `container_id`, Init it exactly as CreatePool does (identity + model table
