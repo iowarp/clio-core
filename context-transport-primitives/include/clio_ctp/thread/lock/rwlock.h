@@ -35,13 +35,17 @@
 #define CTP_THREAD_RWLOCK_H_
 
 #include "clio_ctp/constants/macros.h"
+#include "clio_ctp/introspect/system_info.h"
 #include "clio_ctp/thread/lock.h"
+#include "clio_ctp/thread/lock/mutex.h"
 #include "clio_ctp/thread/thread_model_manager.h"
 #include "clio_ctp/types/atomic.h"
 #include "clio_ctp/types/numbers.h"
 
 namespace ctp {
 
+/** Retained for source compatibility. The lock no longer has a mode: every
+ *  acquisition is exclusive. Nothing outside this header reads these. */
 class RwLockMode {
  public:
   typedef int Type;
@@ -50,235 +54,238 @@ class RwLockMode {
   CLS_CONST Type kRead = 2;
 };
 
-/** A reader-writer lock implementation */
+/** {pid:32, tid:32} of the calling OS thread, cached in TLS.
+ *
+ *  Cached because SystemInfo::GetTid() is a raw syscall(SYS_gettid) (~50-100ns)
+ *  — far too expensive to pay on every lock acquisition. Mirrors
+ *  clio::run::GetCoLockThreadId(). Includes the pid so the id is unique across
+ *  the processes sharing a segment; a tid alone collides trivially.
+ *
+ *  Never 0 for a live thread (pid is never 0), so 0 is usable as "no identity".
+ *  Not fork()-safe: a child would inherit a stale cache. Nothing in the runtime
+ *  forks after init, same assumption GetCoLockThreadId already makes.
+ *
+ *  NOTE: must be CTP_INLINE_CROSS_FUN (== CTP_CROSS_FUN inline), NOT
+ *  CTP_INLINE — macros.h defines CTP_INLINE to NOTHING unless CTP_DEBUG is
+ *  set, so a free function marked CTP_INLINE in a header multiply-defines at
+ *  link time in every release build. Body is #if-guarded rather than the
+ *  declaration, matching TimedMutex::StampOwner(). */
+CTP_INLINE_CROSS_FUN ctp::big_uint GetRwLockSelfId() {
+#if !CTP_IS_DEVICE_PASS
+  static thread_local const ctp::big_uint kSelf =
+      (static_cast<ctp::big_uint>(
+           static_cast<ctp::reg_uint>(ctp::SystemInfo::GetPid()))
+       << 32) |
+      static_cast<ctp::big_uint>(
+          static_cast<ctp::reg_uint>(ctp::SystemInfo::GetTid()));
+  return kSelf;
+#else
+  // No stable per-thread identity on device; 0 disables the recursion path.
+  return 0;
+#endif
+}
+
+/**
+ * RwLock — TEMPORARILY an exclusive, recursive lock over ctp::Mutex.
+ *
+ * WHY: the previous hand-rolled reader/writer algorithm did not provide
+ * reader/writer exclusion (issue #927). A reader could be admitted while a
+ * writer was inside, measured at ~1 in 6,500 read acquisitions at 8 readers
+ * and ~1 in 120 at a single reader/single writer. The defect was structural:
+ * admission was decided by reading one variable (`readers_`/`writers_`) and
+ * then CASing another (`mode_`), so a stale counter read could flip the phase
+ * out from under a writer that had already been granted the lock.
+ *
+ * Rather than ship a subtly-wrong lock, readers and writers now BOTH take the
+ * same exclusive mutex. Mutual exclusion is then true by construction: there is
+ * one holder, so there is nothing to get wrong. A proper parallel-reader
+ * algorithm replaces this shortly — see the design on #927.
+ *
+ * WHAT THIS COSTS: readers no longer run in parallel. Every ReadLock is a full
+ * exclusive acquisition. On read-heavy paths (CTE `target_lock_`, the client
+ * put sieve's `sieve_rw_`, `unordered_map_ll`'s per-bucket locks) this is a
+ * real throughput loss, accepted deliberately as the price of correctness until
+ * the replacement lands.
+ *
+ * RECURSIVE, on purpose. Making readers exclusive would otherwise turn two
+ * previously-working patterns into DETERMINISTIC self-deadlocks:
+ *   - read -> read nesting on one thread (the old lock was reader-preferring
+ *     precisely so this worked; clio::run::CoRwLock only short-circuits
+ *     write->read, so a read->read nest reaches this lock twice), and
+ *   - read -> write upgrade on one thread.
+ * Tracking {pid,tid} + depth lets the same thread re-enter. Note that an
+ * "upgrade" is not a lie here: the hold was already exclusive, so a nested
+ * WriteLock genuinely has the exclusivity it thinks it has.
+ *
+ * The `holder_` fast path is sound for the reason CoRwLock's is NOT trivially
+ * sound (see corwlock.h): `holder_` is written ONLY by the thread that holds
+ * the mutex, is stamped after the acquisition, and is cleared BEFORE the
+ * release. A non-holder therefore reads either 0 or the live holder's id — it
+ * can never observe a stale copy of its OWN id from an earlier hold and let
+ * itself in.
+ *
+ * NO DEAD-HOLDER RECOVERY, deliberately. ctp::Mutex is a fair ticket lock: if a
+ * holder dies, head_ never advances and every waiter blocks forever. That is
+ * acceptable because no RwLock instance currently lives in a segment shared
+ * with an untrusted process -- every one of them (unordered_map_ll's
+ * global_lock_/locks_ under MallocAllocator, CTE's sieve_rw_) is process-local,
+ * and ctp::ipc::RwLock has no users. Cross-process shm data structures that DO
+ * need a reclaimable reader/writer lock should use TimedRwLock instead (built
+ * on ctp::TimedMutex, which can break a lock left by a PROVABLY dead owner).
+ *
+ * Choosing ctp::Mutex over ctp::TimedMutex here is not just about the unused
+ * machinery: Mutex is a FAIR FIFO ticket lock, where TimedMutex is explicitly
+ * an unfair CAS lock (fairness is what it trades away to be reclaimable).
+ * Measured over TimedMutex, readers lost badly to writers -- 13:1 at one
+ * reader and one writer. Mutex also costs 24 bytes against TimedMutex's 40,
+ * and its Backoff() already does the yield-then-sleep escalation this wrapper
+ * would otherwise have to hand-roll.
+ *
+ * SHM-SAFE in layout: fixed-width atomics only, no pointers, no vtable, no
+ * heap — valid at any base address in any process. (Layout-safe is not the
+ * same as safe to share with a process that may die holding it; see above.)
+ * GPU: the recursion fast path is disabled on the device pass
+ * (GetRwLockSelfId() returns 0), so device callers must not nest;
+ * unordered_map_ll, the only device user, does not.
+ */
 struct RwLock {
-  ipc::atomic<RwLockMode::Type> mode_;
-  ipc::atomic<ctp::reg_uint> readers_;
-  ipc::atomic<ctp::reg_uint> writers_;
-  ipc::atomic<ctp::reg_uint> cur_writer_;
-  ipc::atomic<ctp::big_uint> ticket_;
-  // Batched-fairness counter: acquisitions granted since the last mode switch
-  // (reset to 0 in UpdateMode when the lock flips to kNone). Once a phase has
-  // served kFairnessBatch ops AND the opposite side is waiting, new same-side
-  // acquirers defer so the phase drains and the lock can flip. This bounds
-  // starvation (the pathology of the plain reader-preferring lock) while
-  // keeping the throughput of batching -- unlike a strict per-op handoff or a
-  // condition-variable lock's per-op mutex cost.
-  ipc::atomic<ctp::reg_uint> ops_since_switch_;
-  /** Ops granted in one phase before yielding to a waiting opposite side. */
-  static constexpr ctp::reg_uint kFairnessBatch = 32;
+  /** The actual exclusion. Sole source of truth for who holds the lock. */
+  Mutex mutex_;
+  /** {pid,tid} of the current holder; 0 when free. Holder-written only. */
+  ipc::atomic<ctp::big_uint> holder_;
+  /** Recursion depth of the current holder (>= 1 while held). */
+  ipc::atomic<ctp::reg_uint> depth_;
+  /** 1 when the OUTERMOST acquisition was a WriteLock. Preserves the original
+   *  IsWriteLocked() meaning now that readers are exclusive too. */
+  ipc::atomic<ctp::reg_uint> write_mode_;
+
   /** Default constructor */
   CTP_CROSS_FUN
-  RwLock()
-      : readers_(0),
-        writers_(0),
-        ticket_(0),
-        mode_(RwLockMode::kNone),
-        cur_writer_(0),
-        ops_since_switch_(0) {}
+  RwLock() : holder_(0), depth_(0), write_mode_(0) {}
 
-  /** Explicit constructor */
+  /** Explicit initializer (placement-new into shared memory) */
   CTP_CROSS_FUN
   void Init() {
-    readers_ = 0;
-    writers_ = 0;
-    ticket_ = 0;
-    mode_ = RwLockMode::kNone;
-    cur_writer_ = 0;
-    ops_since_switch_ = 0;
+    mutex_.Init();
+    holder_.store(0);
+    depth_.store(0);
+    write_mode_.store(0);
   }
 
-  /** Copy constructor (no-op, mirrors ctp::Mutex): copying a live
-   *  lock would clone its state, which is never what callers want, but
-   *  containers (e.g. priv::vector<RwLock>::operator=) need *some*
-   *  copy constructor to be callable. Construct a fresh, unheld lock. */
+  /** Copy constructor: the copy is a FRESH, UNHELD lock. Copying a live lock
+   *  would clone its ownership, which is never what callers want, but
+   *  containers (priv::vector<RwLock>::operator=) need some copy constructor to
+   *  be callable. Matches the previous RwLock and ctp::Mutex/TimedMutex. */
   CTP_CROSS_FUN
-  RwLock(const RwLock & /*other*/)
-      : readers_(0),
-        writers_(0),
-        ticket_(0),
-        mode_(RwLockMode::kNone),
-        cur_writer_(0),
-        ops_since_switch_(0) {}
+  RwLock(const RwLock & /*other*/) : holder_(0), depth_(0), write_mode_(0) {}
 
-  /** Copy assignment (no-op for state, same rationale as copy ctor). */
+  /** Copy assignment (fresh + unheld, same rationale as the copy ctor). */
   CTP_CROSS_FUN
   RwLock &operator=(const RwLock & /*other*/) {
-    readers_.store(0);
-    writers_.store(0);
-    ticket_.store(0);
-    mode_.store(RwLockMode::kNone);
-    cur_writer_.store(0);
-    ops_since_switch_.store(0);
+    Init();
     return *this;
   }
 
-  /** Move constructor */
+  /** Move constructor. Carries ownership across faithfully (the previous
+   *  RwLock's move did the same) so relocating a HELD lock keeps working. */
   CTP_CROSS_FUN
   RwLock(RwLock &&other) noexcept
-      : readers_(other.readers_.load()),
-        writers_(other.writers_.load()),
-        ticket_(other.ticket_.load()),
-        mode_(other.mode_.load()),
-        cur_writer_(other.cur_writer_.load()),
-        ops_since_switch_(other.ops_since_switch_.load()) {}
+      : holder_(other.holder_.load()),
+        depth_(other.depth_.load()),
+        write_mode_(other.write_mode_.load()) {
+    MoveMutexFrom(other);
+  }
 
   /** Move assignment operator */
   CTP_CROSS_FUN
   RwLock &operator=(RwLock &&other) noexcept {
     if (this != &other) {
-      readers_ = other.readers_.load();
-      writers_ = other.writers_.load();
-      ticket_ = other.ticket_.load();
-      mode_ = other.mode_.load();
-      cur_writer_ = other.cur_writer_.load();
-      ops_since_switch_ = other.ops_since_switch_.load();
+      MoveMutexFrom(other);
+      holder_.store(other.holder_.load());
+      depth_.store(other.depth_.load());
+      write_mode_.store(other.write_mode_.load());
     }
     return *this;
   }
 
   /** Acquire read lock.
    *
-   *  @param owner           legacy/unused owner id.
-   *  @param writer_priority when true, make this otherwise reader-preferring
-   *         lock writer-preferring for THIS acquisition: defer entering while a
-   *         writer is waiting on or holds the lock. This prevents a sustained
-   *         reader stream from starving writers — the reader-preferring default
-   *         lets a reader in whenever the lock is already in read mode,
-   *         regardless of a waiting writer, so writers can livelock (observed as
-   *         an icx/Windows ctest timeout in the unordered_map_ll growth stress
-   *         test). The wait happens BEFORE registering as a reader: incrementing
-   *         readers_ first and only then waiting for writers_==0 would deadlock
-   *         the writer, which spins for readers_==0. Stragglers that slip past
-   *         before a writer bumps writers_ are bounded — the writer's
-   *         ticket-based WriteLock drains them — so no reader is blocked
-   *         forever. Default false preserves the reader-preferring behavior that
-   *         reentrant callers (e.g. CoRwLock's read->read nesting) depend on. */
+   *  EXCLUSIVE for now (see the class comment) — readers do not run in
+   *  parallel. Both parameters are accepted and ignored: `owner` was always
+   *  unused, and `writer_priority` is meaningless when every acquisition is
+   *  already exclusive and FIFO-ordered by ctp::Mutex's ticket. */
   CTP_CROSS_FUN
-  void ReadLock(uint32_t owner, bool writer_priority = false) {
-    RwLockMode::Type mode = mode_.load_device();
-
-    // Batched fairness: if a writer is waiting and this read phase has already
-    // served a full batch, let the current readers drain (readers_ -> 0) so the
-    // waiting writer can take over before we pile on another reader. New readers
-    // gate here too, so readers_ actually reaches 0. Checked once (bounded).
-    if (writers_.load_device() > 0 && mode == RwLockMode::kRead &&
-        ops_since_switch_.load_device() >= kFairnessBatch) {
-      while (readers_.load_device() > 0) {
-#if !CTP_IS_DEVICE_PASS
-        CTP_THREAD_MODEL->Yield();
-#endif
-      }
-    }
-    ops_since_switch_.fetch_add(1);
-
-    if (writer_priority) {
-      while (writers_.load() > 0) {
-#if !CTP_IS_DEVICE_PASS
-        CTP_THREAD_MODEL->Yield();
-#endif
-      }
-    }
-
-    // Increment # readers. Check if in read mode.
-    readers_.fetch_add(1);
-
-    // Wait until we are in read mode
-    do {
-      UpdateMode(mode);
-      if (mode == RwLockMode::kRead) {
-        return;
-      }
-      if (mode == RwLockMode::kNone) {
-        bool ret = mode_.compare_exchange_weak(mode, RwLockMode::kRead);
-        if (ret) {
-          return;
-        }
-      }
-#if !CTP_IS_DEVICE_PASS
-      CTP_THREAD_MODEL->Yield();
-#endif
-    } while (true);
+  void ReadLock(uint32_t /*owner*/, bool /*writer_priority*/ = false) {
+    Acquire(false);
   }
 
   /** Release read lock */
   CTP_CROSS_FUN
-  void ReadUnlock() { readers_.fetch_sub(1); }
+  void ReadUnlock() { Release(); }
 
   /** Acquire write lock */
   CTP_CROSS_FUN
-  void WriteLock(uint32_t owner) {
-    RwLockMode::Type mode = mode_.load_device();
-    uint32_t cur_writer;
-
-    // Batched fairness: if readers are waiting and this write phase has served a
-    // full batch, let the current writers drain (writers_ -> 0) so the waiting
-    // readers can take over before we queue another writer. New writers gate
-    // here too, so writers_ actually reaches 0. Checked once (bounded).
-    if (readers_.load_device() > 0 && mode == RwLockMode::kWrite &&
-        ops_since_switch_.load_device() >= kFairnessBatch) {
-      while (writers_.load_device() > 0) {
-#if !CTP_IS_DEVICE_PASS
-        CTP_THREAD_MODEL->Yield();
-#endif
-      }
-    }
-    ops_since_switch_.fetch_add(1);
-
-    // Increment # writers & get ticket
-    writers_.fetch_add(1);
-    uint64_t tkt = ticket_.fetch_add(1);
-
-    // Wait until we are in read mode
-    do {
-      UpdateMode(mode);
-      if (mode == RwLockMode::kNone) {
-        mode_.compare_exchange_weak(mode, RwLockMode::kWrite);
-        // Use load_device() for cross-SM L2 visibility on GPU.
-        mode = mode_.load_device();
-      }
-      if (mode == RwLockMode::kWrite) {
-        // Use load_device() for cross-SM L2 visibility on GPU.
-        cur_writer = cur_writer_.load_device();
-        if (cur_writer == tkt) {
-          return;
-        }
-      }
-#if !CTP_IS_DEVICE_PASS
-      CTP_THREAD_MODEL->Yield();
-#endif
-    } while (true);
-  }
+  void WriteLock(uint32_t /*owner*/) { Acquire(true); }
 
   /** Release write lock */
   CTP_CROSS_FUN
-  void WriteUnlock() {
-    writers_.fetch_sub(1);
-    cur_writer_.fetch_add(1);
-  }
+  void WriteUnlock() { Release(); }
 
-  /** @return true while a writer holds (or is waiting/draining for) this lock.
-   *  Used by ContainerPtr::IsPlugged() so a reader can observe that a
-   *  migration/upgrade writer is in progress on the container. */
+  /** @return true while the lock is held in WRITE mode. Advisory — the answer
+   *  may be stale the instant it is returned. Deliberately NOT "held at all":
+   *  readers are exclusive now, and reporting a reader as a writer would change
+   *  the meaning callers were written against. */
   CTP_CROSS_FUN
-  bool IsWriteLocked() const { return writers_.load() > 0; }
+  bool IsWriteLocked() const { return write_mode_.load() != 0; }
 
  private:
-  /** Update the mode of the lock */
+  /** Copy Mutex's ticket state field-by-field. ctp::Mutex has no move ctor and
+   *  its copy ctor deliberately leaves the copy unheld, so a faithful
+   *  relocation of a held lock has to go through the fields. */
   CTP_INLINE_CROSS_FUN
-  void UpdateMode(RwLockMode::Type &mode) {
-    // When # readers is 0, there is a lag to when the mode is updated
-    // When # writers is 0, there is a lag to when the mode is updated
-    // Use load_device() for cross-SM L2 visibility on GPU.
-    mode = mode_.load_device();
-    if ((readers_.load_device() == 0 && mode == RwLockMode::kRead) ||
-        (writers_.load_device() == 0 && mode == RwLockMode::kWrite)) {
-      if (mode_.compare_exchange_weak(mode, RwLockMode::kNone)) {
-        // The phase just ended -- restart the batch counter so the next phase
-        // (read or write) gets a fresh kFairnessBatch budget.
-        ops_since_switch_.store(0);
-      }
+  void MoveMutexFrom(RwLock &other) {
+    mutex_.lock_.store(other.mutex_.lock_.load());
+    mutex_.head_.store(other.mutex_.head_.load());
+    mutex_.try_lock_.store(other.mutex_.try_lock_.load());
+  }
+
+  /** Acquire exclusively, or bump the depth if this thread already holds it. */
+  CTP_INLINE_CROSS_FUN
+  void Acquire(bool write) {
+    const ctp::big_uint me = GetRwLockSelfId();
+    // `me != 0` matters: on the device pass GetRwLockSelfId() is 0, and a free
+    // lock also has holder_ == 0 — without this guard every device acquisition
+    // would take the recursion path and skip the mutex entirely.
+    if (me != 0 && holder_.load() == me) {
+      depth_.fetch_add(1);
+      return;
     }
+    // Straight to the fair ticket queue. A barge-in fast path was tried here
+    // and REMOVED: it only fires when the queue is empty (lock_ == head_),
+    // which under real contention never happens, and it measured 2.7x SLOWER
+    // at 8 readers/4 writers (134k vs 370k ops/4s) while skewing the
+    // reader/writer split to 2.2:1. It was compensating for ctp::Mutex's
+    // sub-slack Backoff() sleep, which is now fixed at the source.
+    mutex_.Lock(0);
+    write_mode_.store(write ? 1 : 0);
+    depth_.store(1);
+    // Publish identity LAST: once holder_ is visible the rest must already be.
+    holder_.store(me);
+  }
+
+  /** Release one level; unlock the mutex when the outermost level exits. */
+  CTP_INLINE_CROSS_FUN
+  void Release() {
+    if (depth_.load() > 1) {
+      depth_.fetch_sub(1);
+      return;
+    }
+    // Retract identity BEFORE unlocking: the moment the mutex is released
+    // another thread may acquire, and it must not observe us as the holder.
+    holder_.store(0);
+    depth_.store(0);
+    write_mode_.store(0);
+    mutex_.Unlock();
   }
 };
 

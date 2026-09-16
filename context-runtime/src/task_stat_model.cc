@@ -32,7 +32,7 @@
  */
 
 /**
- * Persistence for the per-pool task-stat model (issue #956).
+ * Persistence for the per-container task-stat model (issues #956, #994).
  *
  * The scheduler routes every task on Container::InferCpuTime /
  * InferWallClockTime, whose coefficients are learned by SGD from completed
@@ -76,14 +76,16 @@ std::string SanitizeForFilename(const std::string &name) {
 }  // namespace
 
 std::string TaskStatModelPath(const std::string &chimod_name,
-                              const std::string &pool_name, u32 node_id) {
+                              const std::string &pool_name, u32 node_id,
+                              u32 container_id) {
   auto *config_manager = CLIO_CONFIG_MANAGER;
   if (!config_manager) {
     return std::string();
   }
   return config_manager->GetConfDir() + "/models/" +
          SanitizeForFilename(chimod_name) + "." + SanitizeForFilename(pool_name) +
-         "." + std::to_string(node_id) + ".yaml";
+         "." + std::to_string(node_id) + "." + std::to_string(container_id) +
+         ".yaml";
 }
 
 bool TaskStatModelSnapshot::Save(const std::string &path) const {
@@ -99,46 +101,74 @@ bool TaskStatModelSnapshot::Save(const std::string &path) const {
     return false;
   }
 
-  YAML::Emitter out;
-  out << YAML::BeginMap;
-  out << YAML::Key << "chimod_name" << YAML::Value << chimod_name_;
-  out << YAML::Key << "pool_name" << YAML::Value << pool_name_;
-  out << YAML::Key << "learning_rate" << YAML::Value << learning_rate_;
-  out << YAML::Key << "methods" << YAML::Value << YAML::BeginMap;
-  for (const auto &kv : methods_) {
-    out << YAML::Key << kv.first << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "cpu_coef" << YAML::Value << kv.second.cpu_coef_;
-    out << YAML::Key << "cpu_mape" << YAML::Value << kv.second.cpu_mape_;
-    out << YAML::Key << "wall_coef" << YAML::Value << kv.second.wall_coef_;
-    out << YAML::Key << "wall_mape" << YAML::Value << kv.second.wall_mape_;
+  // Everything below is guarded for the same reason Load() is: the model is an
+  // optimization, and losing a save is correct (just slower) behaviour. The
+  // stakes are higher here than on the read side, though -- SaveModel runs from
+  // PoolManager::DestroyAllContainers inside RuntimeManager::ServerFinalize,
+  // which CLIO_RUNTIME_FINALIZE drives from an atexit handler. An exception
+  // escaping into atexit is an uncaught exception with no frame left to catch
+  // it, so std::terminate aborts a process whose work is already finished. That
+  // is how a yaml-cpp allocation failure during the shutdown flush turned into
+  // "terminate called after throwing an instance of std::bad_alloc" AFTER every
+  // test in cr_task_archive_* had passed.
+  try {
+    YAML::Emitter out;
+    out << YAML::BeginMap;
+    out << YAML::Key << "chimod_name" << YAML::Value << chimod_name_;
+    out << YAML::Key << "pool_name" << YAML::Value << pool_name_;
+    out << YAML::Key << "container_id" << YAML::Value << container_id_;
+    out << YAML::Key << "learning_rate" << YAML::Value << learning_rate_;
+    out << YAML::Key << "methods" << YAML::Value << YAML::BeginMap;
+    for (const auto &kv : methods_) {
+      out << YAML::Key << kv.first << YAML::Value << YAML::BeginMap;
+      out << YAML::Key << "cpu_coef" << YAML::Value << kv.second.cpu_coef_;
+      out << YAML::Key << "cpu_mape" << YAML::Value << kv.second.cpu_mape_;
+      out << YAML::Key << "wall_coef" << YAML::Value << kv.second.wall_coef_;
+      out << YAML::Key << "wall_mape" << YAML::Value << kv.second.wall_mape_;
+      out << YAML::EndMap;
+    }
     out << YAML::EndMap;
-  }
-  out << YAML::EndMap;
-  out << YAML::EndMap;
+    out << YAML::EndMap;
 
-  // Write to a temp file and rename: a crash (or a kill during the periodic
-  // flush) must not be able to leave a half-written file that the next startup
-  // would happily load as the learned model.
-  const std::string tmp_path = path + ".tmp";
-  {
-    std::ofstream ofs(tmp_path, std::ios::trunc);
-    if (!ofs.is_open()) {
-      HLOG(kError, "TaskStatModel: failed to open {} for writing", tmp_path);
+    // Write to a temp file and rename: a crash (or a kill during the periodic
+    // flush) must not be able to leave a half-written file that the next startup
+    // would happily load as the learned model.
+    const std::string tmp_path = path + ".tmp";
+    {
+      std::ofstream ofs(tmp_path, std::ios::trunc);
+      if (!ofs.is_open()) {
+        HLOG(kError, "TaskStatModel: failed to open {} for writing", tmp_path);
+        return false;
+      }
+      ofs << out.c_str() << "\n";
+      // close() here, not at the end of the scope: the model is small enough to
+      // sit entirely in the stream buffer, so the write to the device happens
+      // at flush time. Letting the destructor do that puts the failure after
+      // this check -- good() would say the write succeeded and the rename below
+      // would install a file the filesystem never accepted (ENOSPC, a full
+      // quota, a dying disk). Closing explicitly moves the flush in front of
+      // the check; close() sets failbit if it cannot complete.
+      ofs.close();
+      if (!ofs.good()) {
+        HLOG(kError, "TaskStatModel: failed to write {}", tmp_path);
+        std::filesystem::remove(tmp_path, ec);
+        return false;
+      }
+    }
+    std::filesystem::rename(tmp_path, path, ec);
+    if (ec) {
+      HLOG(kError, "TaskStatModel: failed to install {}: {}", path, ec.message());
+      std::filesystem::remove(tmp_path, ec);
       return false;
     }
-    ofs << out.c_str() << "\n";
-    if (!ofs.good()) {
-      HLOG(kError, "TaskStatModel: failed to write {}", tmp_path);
-      return false;
-    }
-  }
-  std::filesystem::rename(tmp_path, path, ec);
-  if (ec) {
-    HLOG(kError, "TaskStatModel: failed to install {}: {}", path, ec.message());
-    std::filesystem::remove(tmp_path, ec);
+    return true;
+  } catch (const std::exception &e) {
+    HLOG(kWarning, "TaskStatModel: failed to save {} ({}); model not persisted",
+         path, e.what());
+    std::error_code rm_ec;
+    std::filesystem::remove(path + ".tmp", rm_ec);
     return false;
   }
-  return true;
 }
 
 bool TaskStatModelSnapshot::Load(const std::string &path) {
@@ -161,6 +191,9 @@ bool TaskStatModelSnapshot::Load(const std::string &path) {
     }
     if (root["pool_name"]) {
       pool_name_ = root["pool_name"].as<std::string>();
+    }
+    if (root["container_id"]) {
+      container_id_ = root["container_id"].as<u32>();
     }
     if (root["learning_rate"]) {
       learning_rate_ = root["learning_rate"].as<float>();
@@ -197,57 +230,41 @@ bool TaskStatModelSnapshot::Load(const std::string &path) {
 //=============================================================================
 
 TaskStatModelSnapshot Container::ExportModel() const {
-  const Container &owner = ModelOwner();
   TaskStatModelSnapshot snap;
-  snap.pool_name_ = owner.pool_name_;
-  snap.learning_rate_ = owner.learning_rate_;
-  // Names come from THIS container: the static container is Init'd by the same
-  // module, so the tables match, but reading them from the caller keeps the
-  // export usable even if a model owner was never given names.
-  const std::vector<std::string> &names =
-      method_names_.empty() ? owner.method_names_ : method_names_;
-  for (size_t i = 0; i < names.size(); ++i) {
-    if (names[i].empty()) {
+  snap.pool_name_ = pool_name_;
+  snap.container_id_ = container_id_;
+  snap.learning_rate_ = learning_rate_;
+  for (size_t i = 0; i < method_names_.size(); ++i) {
+    if (method_names_[i].empty()) {
       continue;
     }
     MethodStatWeights w;
-    if (i < owner.method_model_.size()) w.cpu_coef_ = owner.method_model_[i];
-    if (i < owner.method_mape_.size()) w.cpu_mape_ = owner.method_mape_[i];
-    if (i < owner.method_model_wall_.size()) {
-      w.wall_coef_ = owner.method_model_wall_[i];
-    }
-    if (i < owner.method_mape_wall_.size()) {
-      w.wall_mape_ = owner.method_mape_wall_[i];
-    }
-    snap.methods_[names[i]] = w;
+    if (i < method_model_.size()) w.cpu_coef_ = method_model_[i];
+    if (i < method_mape_.size()) w.cpu_mape_ = method_mape_[i];
+    if (i < method_model_wall_.size()) w.wall_coef_ = method_model_wall_[i];
+    if (i < method_mape_wall_.size()) w.wall_mape_ = method_mape_wall_[i];
+    snap.methods_[method_names_[i]] = w;
   }
   return snap;
 }
 
 size_t Container::ImportModel(const TaskStatModelSnapshot &snapshot) {
-  Container &owner = ModelOwner();
-  const std::vector<std::string> &names =
-      method_names_.empty() ? owner.method_names_ : method_names_;
   size_t restored = 0;
-  for (size_t i = 0; i < names.size(); ++i) {
-    auto it = snapshot.methods_.find(names[i]);
+  for (size_t i = 0; i < method_names_.size(); ++i) {
+    auto it = snapshot.methods_.find(method_names_[i]);
     if (it == snapshot.methods_.end()) {
-      continue;  // new method, or one this pool never exercised: keep the seed
+      continue;  // new method, or one this container never exercised: keep seed
     }
     const MethodStatWeights &w = it->second;
-    if (i < owner.method_model_.size()) owner.method_model_[i] = w.cpu_coef_;
-    if (i < owner.method_mape_.size()) owner.method_mape_[i] = w.cpu_mape_;
-    if (i < owner.method_model_wall_.size()) {
-      owner.method_model_wall_[i] = w.wall_coef_;
-    }
-    if (i < owner.method_mape_wall_.size()) {
-      owner.method_mape_wall_[i] = w.wall_mape_;
-    }
+    if (i < method_model_.size()) method_model_[i] = w.cpu_coef_;
+    if (i < method_mape_.size()) method_mape_[i] = w.cpu_mape_;
+    if (i < method_model_wall_.size()) method_model_wall_[i] = w.wall_coef_;
+    if (i < method_mape_wall_.size()) method_mape_wall_[i] = w.wall_mape_;
     ++restored;
   }
   // A restore is not new learning: leaving the flag clear keeps the periodic
   // flush from rewriting a file identical to the one just read.
-  owner.model_dirty_.store(false, std::memory_order_relaxed);
+  model_dirty_.store(false, std::memory_order_relaxed);
   return restored;
 }
 

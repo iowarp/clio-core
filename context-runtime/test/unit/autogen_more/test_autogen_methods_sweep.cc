@@ -19,6 +19,7 @@
 
 #include "simple_test.h"
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -141,10 +142,48 @@ void SweepMethod(clio::run::Container &container, clio::run::u32 method) {
 
   // --- AggregateOut via the container dispatch switch (the per-method tests
   // call task->AggregateOut directly, leaving the dispatch arms uncovered).
+  //
+  // This is also the identity regression for issue #915. AggregateOut merges
+  // a REPLICA's OUT fields into the ORIGIN; it must NEVER touch the origin's
+  // identity. The 77 implementations that delegated to Copy() ran Task::Copy
+  // and made the origin adopt the replica's task_id_/pool_query_/method_
+  // mid-flight while send_map_, the replica accounting and the completion
+  // path still keyed off the origin's — the `free(): invalid pointer` that
+  // killed leader-election recovery (#856). Stamping the origin and the
+  // replica with DIFFERENT identities makes any whole-task copy fail here
+  // instead of corrupting a live runtime.
   {
     auto replica = container.NewTask(method);
     if (!replica.IsNull()) {
+      task->task_id_ =
+          clio::run::TaskId(1111, 2222, 3333, /*replica_id=*/0, 4444, 55, 6666);
+      task->pool_query_ = clio::run::PoolQuery::Local();
+      task->method_ = method;
+
+      replica->task_id_ =
+          clio::run::TaskId(7777, 8888, 9999, /*replica_id=*/1, 1010, 11, 1212);
+      replica->pool_query_ = clio::run::PoolQuery::Broadcast();
+      replica->method_ = method;
+
+      const clio::run::TaskId id_before = task->task_id_;
+      const clio::run::PoolQuery query_before = task->pool_query_;
+      const clio::run::u32 method_before = task->method_;
+
       container.AggregateOut(method, task, replica);
+
+      // PoolQuery has no operator== and is deliberately trivially copyable
+      // (it is raw-byte compared elsewhere in the tree), so memcmp is the
+      // right test here.
+      if (!(task->task_id_ == id_before) ||
+          memcmp(&task->pool_query_, &query_before,
+                 sizeof(clio::run::PoolQuery)) != 0 ||
+          task->method_ != method_before) {
+        FAIL("AggregateOut changed the ORIGIN task's identity for method "
+             << method
+             << ": its AggregateOut is copying the whole replica (almost "
+                "certainly `Copy(other_base...)`) instead of merging OUT "
+                "fields only. See issue #915.");
+      }
     }
   }
 
@@ -458,6 +497,105 @@ TEST_CASE("AutogenSweep - CAE core all methods full dispatch battery",
     SweepMethod(cae_runtime, method);
   }
   REQUIRE(true);
+}
+
+//==============================================================================
+// Issue #915 — AggregateOut must merge OUT fields only.
+//
+// The per-method sweep above stamps distinct identities on origin and replica
+// for EVERY method of every module linked here, so a whole-task copy fails
+// immediately. This case pins the two specifics the issue calls out, on the
+// task where they actually bit: an shm-allocated IN/INOUT string, and the
+// OUT-field merge semantics.
+//
+// PutBlobTask::blob_name_ is a priv::string owned by the CLIENT's allocator.
+// A whole-task copy re-assigns it from the replica's segment, freeing the
+// client's buffer through the wrong allocator — the `free(): invalid pointer`
+// abort of #856/#500. AggregateOut must leave it untouched.
+//==============================================================================
+
+TEST_CASE("AggregateOut merges OUT fields only, never the whole task (#915)",
+          "[autogen][cte][aggregate_out][contract]") {
+  EnsureInitialized();
+
+  clio::cte::core::Runtime cte_runtime;
+  namespace ct = clio::cte::core;
+
+  SECTION("PutBlobTask: shm string IN field and identity survive");
+  {
+    auto origin_base = cte_runtime.NewTask(ct::Method::kPutBlob);
+    auto replica_base = cte_runtime.NewTask(ct::Method::kPutBlob);
+    REQUIRE(!origin_base.IsNull());
+    REQUIRE(!replica_base.IsNull());
+
+    auto *origin = static_cast<ct::PutBlobTask *>(origin_base.get());
+    auto *replica = static_cast<ct::PutBlobTask *>(replica_base.get());
+
+    origin->blob_name_ = "origin-blob";
+    origin->task_id_ =
+        clio::run::TaskId(4242, 4343, 4444, /*replica_id=*/0, 4545, 7, 0xABCD);
+    origin->pool_query_ = clio::run::PoolQuery::Broadcast();
+    origin->context_.emulated_time_ns_ = 0;
+
+    // A REPLICA looks exactly like the subtask that comes back off the wire:
+    // same method, different task_id_ (carrying replica_id/net_key), its own
+    // shm string, and the OUT state the remote handler produced.
+    replica->blob_name_ = "replica-blob";
+    replica->task_id_ =
+        clio::run::TaskId(9999, 9898, 9797, /*replica_id=*/1, 9696, 3, 0x1234);
+    replica->pool_query_ = clio::run::PoolQuery::Physical(3);
+    replica->context_.emulated_time_ns_ = 12345;
+    replica->context_.transform_flags_ = 0x2;
+
+    const clio::run::TaskId id_before = origin->task_id_;
+    const clio::run::PoolQuery query_before = origin->pool_query_;
+    const clio::run::u32 method_before = origin->method_;
+
+    cte_runtime.AggregateOut(ct::Method::kPutBlob, origin_base, replica_base);
+
+    // Identity is untouched.
+    REQUIRE(origin->task_id_ == id_before);
+    REQUIRE(memcmp(&origin->pool_query_, &query_before,
+                   sizeof(clio::run::PoolQuery)) == 0);
+    REQUIRE(origin->method_ == method_before);
+
+    // The client's shm string is untouched: a whole-task copy would have made
+    // this "replica-blob" and freed the origin's buffer through the replica's
+    // allocator.
+    REQUIRE(origin->blob_name_.str() == "origin-blob");
+
+    // The OUT state DID come across (this is what AggregateOut is for).
+    REQUIRE(origin->context_.emulated_time_ns_ == 12345);
+    REQUIRE((origin->context_.transform_flags_ & 0x2) != 0);
+  }
+
+  SECTION("FlushDataTask: OUT counters SUM across replicas");
+  {
+    auto origin_base = cte_runtime.NewTask(ct::Method::kFlushData);
+    auto r1 = cte_runtime.NewTask(ct::Method::kFlushData);
+    auto r2 = cte_runtime.NewTask(ct::Method::kFlushData);
+    REQUIRE(!origin_base.IsNull());
+    REQUIRE(!r1.IsNull());
+    REQUIRE(!r2.IsNull());
+
+    auto *origin = static_cast<ct::FlushDataTask *>(origin_base.get());
+    auto *rep1 = static_cast<ct::FlushDataTask *>(r1.get());
+    auto *rep2 = static_cast<ct::FlushDataTask *>(r2.get());
+
+    origin->bytes_flushed_ = 0;
+    origin->blobs_flushed_ = 0;
+    rep1->bytes_flushed_ = 100;
+    rep1->blobs_flushed_ = 1;
+    rep2->bytes_flushed_ = 250;
+    rep2->blobs_flushed_ = 4;
+
+    cte_runtime.AggregateOut(ct::Method::kFlushData, origin_base, r1);
+    cte_runtime.AggregateOut(ct::Method::kFlushData, origin_base, r2);
+
+    // Last-replica-wins (what the whole-task copy did) would leave 250/4.
+    REQUIRE(origin->bytes_flushed_ == 350);
+    REQUIRE(origin->blobs_flushed_ == 5);
+  }
 }
 
 SIMPLE_TEST_MAIN()

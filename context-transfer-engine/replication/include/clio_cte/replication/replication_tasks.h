@@ -121,7 +121,11 @@ struct DestroyTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<DestroyTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 
   void Copy(const ctp::ipc::FullPtr<DestroyTask>& other) {
@@ -167,7 +171,12 @@ struct ReplicateSweepTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ReplicateSweepTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ReplicateSweepTask>();
+    // Each replica sweeps its own shard, so the collective count is the SUM.
+    blobs_swept_ += replica->blobs_swept_;
   }
 
   void Copy(const ctp::ipc::FullPtr<ReplicateSweepTask> &other) {
@@ -207,7 +216,13 @@ struct ReplicateBlobTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ReplicateBlobTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ReplicateBlobTask>();
+    // Each replica copies its own share of the bytes, so the collective figure
+    // is the SUM.
+    bytes_copied_ += replica->bytes_copied_;
   }
 
   void Copy(const ctp::ipc::FullPtr<ReplicateBlobTask>& other) {
@@ -261,7 +276,13 @@ struct FlushTagTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<FlushTagTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<FlushTagTask>();
+    // Each replica flushes its own share of the tag, so both totals are SUMS.
+    blobs_replicated_ += replica->blobs_replicated_;
+    bytes_copied_ += replica->bytes_copied_;
   }
 
   void Copy(const ctp::ipc::FullPtr<FlushTagTask>& other) {

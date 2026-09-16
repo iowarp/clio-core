@@ -323,15 +323,22 @@ void RunStopCycle(int cycle, const std::string &stop_args, int n_load_clients,
   int exit_code = -1;
   const bool exited = server.WaitExit(45000, &exit_code);
   KillLoadClients(load);
+  // Both failures below are about a daemon that misbehaved on its way out, and
+  // whatever it has to say about that (an abort message, a watchdog line, the
+  // last teardown step it reached) is in its captured log — which CI discards
+  // with the runner. Quote the tail so the ctest output alone explains the
+  // failure: "unexpected daemon exit code 134" on its own is a dead end.
   if (!exited) {
     FAIL("cycle " + std::to_string(cycle) +
-         ": daemon did not exit within 45000 ms after stop");
+         ": daemon did not exit within 45000 ms after stop\n" +
+         clio::run::test::RuntimeServer::LogTail());
   }
   const bool code_ok =
       exit_code == 0 || (allow_watchdog && exit_code == kWatchdogExitCode);
   if (!code_ok) {
     FAIL("cycle " + std::to_string(cycle) + ": unexpected daemon exit code " +
-         std::to_string(exit_code));
+         std::to_string(exit_code) + "\n" +
+         clio::run::test::RuntimeServer::LogTail());
   }
   if (exit_code == kWatchdogExitCode) {
     INFO("cycle " + std::to_string(cycle) + ": watchdog-forced exit (2)");

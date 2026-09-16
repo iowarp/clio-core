@@ -182,7 +182,10 @@ TEST_CASE("FUSE ops - init is idempotent", "[fuse][ops]") {
   void *ret = cte_fuse_init(&conn, &cfg);
   (void)ret;
   REQUIRE(cfg.use_ino == 1);
-  REQUIRE(cfg.attr_timeout == 0);
+  // Kernel attr/entry caching defaults to 1 s (checkout-shaped workloads
+  // were lookup-storm bound at TTL 0); CLIO_FUSE_ATTR_CACHE_S=0 restores
+  // strict coherence.
+  REQUIRE(cfg.attr_timeout == 1.0);
 }
 
 // ============================================================================
@@ -312,6 +315,10 @@ TEST_CASE("FUSE ops - mkdir readdir rmdir", "[fuse][ops]") {
 // ============================================================================
 
 TEST_CASE("FUSE ops - chmod chown utimens", "[fuse][ops]") {
+  // Detached (fire-and-forget) utimens is the default; this case asserts
+  // exact read-back after each utimens, so pin the awaited mode. The env is
+  // read once on first use, and no earlier case calls utimens.
+  ctp::SystemInfo::Setenv("CLIO_FUSE_ASYNC_UTIMENS", "0", 1);
   Fx();
   const char *path = "/ops/perm.bin";
   auto fi = MakeFi();

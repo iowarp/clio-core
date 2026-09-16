@@ -91,19 +91,37 @@ class CTEBenchmark {
     if (a_.test_case == "PutDefer") return RunGeneric(Mode::kPutDefer);
     if (a_.test_case == "GetDefer") return RunGeneric(Mode::kGetDefer);
     if (a_.test_case == "PutGetDefer") return RunGeneric(Mode::kPutGetDefer);
+    if (a_.test_case == "PutStreamDefer") {
+      return RunGeneric(Mode::kPutStreamDefer);
+    }
     HLOG(kError,
          "Unknown test case: {} "
-         "(Put|Get|PutGet|PutDefer|GetDefer|PutGetDefer)",
+         "(Put|Get|PutGet|PutDefer|GetDefer|PutGetDefer|PutStreamDefer)",
          a_.test_case);
     return false;
   }
 
  private:
-  enum class Mode { kPut, kGet, kPutGet, kPutDefer, kGetDefer, kPutGetDefer };
+  enum class Mode {
+    kPut,
+    kGet,
+    kPutGet,
+    kPutDefer,
+    kGetDefer,
+    kPutGetDefer,
+    kPutStreamDefer
+  };
+
+  // PutStreamDefer (issue #1007): each thread STREAMS io_size writes at
+  // sequentially growing offsets through 16 MiB blob segments — the small-
+  // sustained-write shape the client-side sieve coalesces — instead of
+  // whole-value puts to rotating keys. A/B against the sieve kill switch
+  // (CLIO_CTE_PUT_SIEVE=0) isolates what page coalescing buys.
+  static constexpr clio::run::u64 kStreamBlobBytes = 16 * 1024 * 1024;
 
   static bool IsDeferMode(Mode m) {
     return m == Mode::kPutDefer || m == Mode::kGetDefer ||
-           m == Mode::kPutGetDefer;
+           m == Mode::kPutGetDefer || m == Mode::kPutStreamDefer;
   }
 
   void PrintInfo() {
@@ -310,6 +328,39 @@ class CTEBenchmark {
           }
         }
       }
+      if (mode == Mode::kPutStreamDefer) {
+        // Sequential partial-object stream: op n writes [n*io_size, ...)
+        // within its 16 MiB blob segment; segments advance with the byte
+        // position, so a time-limited run never rewrites (or unboundedly
+        // grows) a blob. The nonzero pacing wall covers SHIPPED bytes only;
+        // open sieve pages ride their own per-blob/global budgets.
+        // CLIO_BENCH_STREAM_REGION=<bytes> wraps each thread's stream so
+        // later passes REWRITE the same offsets — measuring the warm-page
+        // path (reused bdev blocks, no first-touch faults) instead of the
+        // ever-fresh one.
+        static const clio::run::u64 stream_region = [] {
+          const char *e = std::getenv("CLIO_BENCH_STREAM_REGION");
+          return e != nullptr ? std::strtoull(e, nullptr, 10) : 0ULL;
+        }();
+        for (long j = 0; j < batch; ++j) {
+          clio::run::u64 pos =
+              static_cast<clio::run::u64>(i + j) * a_.io_size;
+          if (stream_region != 0) {
+            pos %= stream_region;
+          }
+          long seg = static_cast<long>(pos / kStreamBlobBytes);
+          clio::run::u64 off = pos % kStreamBlobBytes;
+          int rc = cte->AsyncPutBlobDefer(
+              tag_id, blob_name(seg) + "_stream", off, a_.io_size,
+              put_buf.data(), 0.8f, clio::cte::core::Context(), 0, pq,
+              inflight_wall);
+          if (rc != 0) {
+            HLOG(kError, "[t{}] AsyncPutBlobDefer(stream) rc={}", tid, rc);
+            err.store(true, std::memory_order_relaxed);
+            break;
+          }
+        }
+      }
       if (mode == Mode::kGetDefer || mode == Mode::kPutGetDefer) {
         std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> gts;
         gts.reserve(batch);
@@ -334,7 +385,8 @@ class CTEBenchmark {
 
     // Drain INSIDE the timed region — deferred acks are early by design;
     // undrained throughput would count work the runtime hasn't done yet.
-    if (mode == Mode::kPutDefer || mode == Mode::kPutGetDefer) {
+    if (mode == Mode::kPutDefer || mode == Mode::kPutGetDefer ||
+        mode == Mode::kPutStreamDefer) {
       clio::cte::core::Client::AwaitPutsUntilSpace(0);
     }
     times[tid] =
@@ -380,7 +432,12 @@ int main(int argc, char **argv) {
   if (!args.ok) return 1;
 
   HLOG(kInfo, "Initializing Clio runtime...");
-  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
+  // CLIO_BENCH_SELF_RUN=1 self-launches the runtime IN-PROCESS (embedded
+  // mode) instead of attaching to an external clio_run — so both runtime
+  // modes can be measured from the same binary.
+  const char *self_run = std::getenv("CLIO_BENCH_SELF_RUN");
+  const bool embed = self_run != nullptr && self_run[0] == '1';
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, embed)) {
     HLOG(kError, "Failed to initialize Clio runtime");
     return 1;
   }

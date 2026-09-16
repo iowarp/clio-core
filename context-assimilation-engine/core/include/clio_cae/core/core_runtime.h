@@ -38,9 +38,7 @@
 #include <clio_cae/core/core_tasks.h>
 #include <clio_cae/core/core_client.h>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <unordered_map>
 
 // Forward declaration for CTE client
 namespace clio::cte::core {
@@ -194,10 +192,13 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume ImportData(clio::run::shared_ptr<ImportDataTask> &task);
 
   /**
-   * CTE interceptor handlers (Method::kPutBlob / kGetBlob / kGetOrCreateTag).
-   * Each forwards the inbound task to the configured next CTE pool. No
-   * labeling/intelligence yet — just passthrough so a client pointed at
-   * the CAE pool transparently lands data in CTE behind it.
+   * CTE interceptor handlers (Method::kPutBlob / kGetBlob / kGetOrCreateTag /
+   * kSemanticSearch). Each forwards the inbound task to the configured next
+   * CTE pool verbatim, so a client pointed at the CAE pool transparently
+   * lands data in whatever is behind it. Transparent LLM summarization used
+   * to hang off PutBlob here; it is now its own interposer chimod (see
+   * context-assimilation-engine/summarizer), composed between this pool and
+   * CTE.
    */
   clio::run::TaskResume PutBlob(clio::run::shared_ptr<PutBlobTask> &task);
   clio::run::TaskResume GetBlob(clio::run::shared_ptr<GetBlobTask> &task);
@@ -218,21 +219,6 @@ class Runtime : public clio::run::Container {
   Client client_;
   std::shared_ptr<clio::cte::core::Client> cte_client_;
   clio::run::PoolId next_pool_id_;  // CTE core pool when CAE is the interceptor
-
-  // Transparent labeling config snapshotted from CreateParams at Create
-  // time. Read-only afterwards, so no synchronization is needed for the
-  // PutBlob fast path.
-  std::vector<LabelMatch> label_matches_;
-  std::unordered_map<std::string, std::string> label_prompts_;
-  std::string label_endpoint_;
-
-  // tag_id → tag_name cache populated by GetOrCreateTag forwards.
-  // PutBlobTask carries tag_id but not tag_name; matching against
-  // LabelMatch::tag_re_ needs the name, so we remember it on the way
-  // through. Read under shared lock from PutBlob, written under
-  // exclusive lock from GetOrCreateTag.
-  std::unordered_map<clio::cte::core::TagId, std::string> tag_names_;
-  std::mutex tag_names_mu_;
 };
 
 }  // namespace clio::cae::core

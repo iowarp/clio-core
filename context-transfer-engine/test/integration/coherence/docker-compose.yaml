@@ -33,6 +33,24 @@ x-coh-env: &coh-env
   PATH: /workspace/build/bin:/usr/local/bin:/usr/bin:/bin
   LD_LIBRARY_PATH: /workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
 
+# Teardown note (cluster coherence regression, bisected to ddeb20d0):
+# each node kills ITS OWN runtime the instant its local client exits. Barrier()
+# guarantees every rank has PUBLISHED its blob, not that peers have finished
+# READING it -- so a rank that finishes first used to tear its node down while
+# slower peers were still fetching from it, and their Barrier() timed out.
+#
+# That never showed because ClientFinalize sat through up to a full second of
+# the heartbeat probe's nap, so the runtime outlived the client by roughly that
+# margin. ddeb20d0 made client exit prompt (correctly -- it was costing every
+# short-lived process ~1s) and the accidental grace disappeared, turning the
+# 4-node coherence step into a 20-minute timeout on every dev push since.
+#
+# Proven by experiment: f8f6fad9 fails, f8f6fad9 minus ddeb20d0 passes, and
+# f8f6fad9 WITH ddeb20d0 plus only that ~1s restored also passes -- so the
+# differentiator is the wall-clock grace, not the condition variable.
+#
+# Make the grace explicit and generous rather than incidental. Overridable via
+# COH_TEARDOWN_LINGER for anyone tightening the loop locally.
 x-coh-cmd: &coh-cmd >
   "
     echo \"Node $$NODE_ID: starting runtime\" &&
@@ -43,6 +61,7 @@ x-coh-cmd: &coh-cmd >
     /workspace/build/bin/test_cache_coherence 2>&1;
     TEST_EXIT_CODE=$$?;
     echo \"Node $$NODE_ID: suite exit $$TEST_EXIT_CODE\";
+    sleep $${COH_TEARDOWN_LINGER:-10};
     kill $$RUNTIME_PID 2>/dev/null;
     exit $$TEST_EXIT_CODE
   "

@@ -26,13 +26,32 @@
 #include <hdf5.h>
 
 #include <cstdio>
+#ifdef _WIN32
+#include <crtdbg.h>
+#endif
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <vector>
 
 #include "adapter/vfd/H5FDclio.h"
 
 namespace {
+
+/** setenv(3) is POSIX; MSVC spells it _putenv_s and has no "don't overwrite"
+ *  mode, so honor overwrite=0 by checking first. Kept local rather than shared
+ *  with test_vfd_adapter.cc on purpose: this test deliberately links nothing
+ *  beyond the driver, which is the whole point of "no runtime". */
+inline void TestSetenv(const char *name, const char *value, int overwrite) {
+#ifdef _WIN32
+  if (!overwrite && std::getenv(name) != nullptr) return;
+  (void)_putenv_s(name, value);
+#else
+  (void)setenv(name, value, overwrite);
+#endif
+}
+
 constexpr hsize_t kN = 4096;
 
 #define CHECK(cond, msg)                                              \
@@ -106,10 +125,47 @@ int RoundTrip(const char *label, hbool_t cache_enabled, const char *path) {
 }  // namespace
 
 int main() {
+  // Make a hard failure in this binary say something. Every one of these was
+  // load-bearing while diagnosing an abort in the driver's close path, and they
+  // are cheap enough to keep permanently: without them the process exited 3
+  // having printed NOTHING, because abort() discards buffered stdout and takes
+  // every case marker with it. Unbuffer both streams so the last thing printed
+  // survives, and name the terminating exception rather than leaving a silent
+  // exit code.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  std::setvbuf(stderr, nullptr, _IONBF, 0);
+#ifdef _WIN32
+  // A Debug HDF5 has its internal assert()s live, and the debug CRT reports
+  // those through a MODAL DIALOG once a debugger is attached -- which blocks an
+  // unattended run forever instead of failing it. Route them to stderr so the
+  // assert text is captured and the process proceeds to abort().
+  _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+  _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+  _set_error_mode(_OUT_TO_STDERR);
+  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+  std::set_terminate([] {
+    if (auto e = std::current_exception()) {
+      try {
+        std::rethrow_exception(e);
+      } catch (const std::exception &ex) {
+        std::fprintf(stderr, "[vfd-no-runtime] TERMINATE: %s\n", ex.what());
+      } catch (...) {
+        std::fprintf(stderr, "[vfd-no-runtime] TERMINATE: non-std exception\n");
+      }
+    } else {
+      std::fprintf(stderr, "[vfd-no-runtime] TERMINATE: no active exception\n");
+    }
+    std::fflush(stderr);
+    std::_Exit(3);
+  });
+
   // Give up on a missing runtime immediately instead of retrying for the
   // default 60s. Without this the second case below spends a minute confirming
   // what it already knows, and the fallback it is checking looks like a hang.
-  setenv("CLIO_CLIENT_RETRY_TIMEOUT", "0", /*overwrite*/ 0);
+  TestSetenv("CLIO_CLIENT_RETRY_TIMEOUT", "0", /*overwrite*/ 0);
 
   hid_t driver = H5FD_clio_init();
   CHECK(driver >= 0, "the driver registers without a runtime");

@@ -37,6 +37,18 @@ enum ShmFileFlags : clio::run::u32 {
   kShmFilePendingAppend = 1u << 2,
   /** Catch-all refusal for states the fast path does not model. */
   kShmFileNoFastPath = 1u << 3,
+  /**
+   * Directory whose ENTIRE child set is reflected in the mirror: every child
+   * mutation since its mkdir published a record (create/rename) or a
+   * tombstone (unlink), so a MIRROR MISS under it is authoritative ENOENT —
+   * the negative-lookup fast path (a task round trip per miss was the
+   * dominant metadata cost of checkout workloads). Set at Mkdir (an empty
+   * new dir is trivially complete) and at the root's creation; ops that add
+   * names the mirror does not model (symlink, hard-link alias) demote the
+   * parent to kShmFileNoFastPath. Implicit dirs (never Mkdir'd) simply have
+   * no record, which reads as incomplete.
+   */
+  kShmDirComplete = 1u << 4,
 };
 
 /** Sentinel for "no stored override" in the mode/uid/gid fields. */
@@ -76,7 +88,10 @@ struct ShmFileRecord {
   clio::run::u32 uid_;    /**< owner, or kShmFileNoOverride */
   clio::run::u32 gid_;    /**< group, or kShmFileNoOverride */
   clio::run::u32 flags_;  /**< ShmFileFlags */
-  clio::run::u32 reserved_;
+  /** ShmFsCacheRoot::nsgen_ at publish time. A non-directory record from an
+   *  older generation is treated as ABSENT by readers: a directory rename
+   *  moved some subtree, and path-keyed records under it kept stale keys. */
+  clio::run::u32 nsgen_;
 
   ShmFileRecord()
       : tag_id_(clio::run::UniqueId::GetNull()),
@@ -89,7 +104,7 @@ struct ShmFileRecord {
         uid_(kShmFileNoOverride),
         gid_(kShmFileNoOverride),
         flags_(0),
-        reserved_(0) {}
+        nsgen_(0) {}
 
   bool Exists() const { return (flags_ & kShmFileExists) != 0; }
   bool IsDir() const { return (flags_ & kShmFileIsDir) != 0; }
@@ -116,13 +131,23 @@ using ShmFsFileMap =
  * rather than competing for one slot.
  */
 struct ShmFsCacheRoot {
-  static constexpr clio::run::u32 kLayoutVersion = 1;
+  static constexpr clio::run::u32 kLayoutVersion = 3;
 
   clio::run::u32 version_;
   clio::run::u32 ready_;  /**< 0 until fully constructed; clients must check */
+  /**
+   * Nonzero once ANY PutFile failed to land (table full). From that moment a
+   * mirror MISS proves nothing — a real file may simply not be cached — so
+   * the COMPLETE-dir authoritative-negative fast path must stand down.
+   * Sticky by design: capacity does not come back.
+   */
+  std::atomic<clio::run::u32> overflow_;
+  /** Namespace generation: bumped on every DIRECTORY rename (see
+   *  ShmFileRecord::nsgen_). */
+  std::atomic<clio::run::u32> nsgen_;
   ShmFsFileMap path_to_file_;
 
-  ShmFsCacheRoot() : version_(0), ready_(0) {}
+  ShmFsCacheRoot() : version_(0), ready_(0), overflow_(0), nsgen_(0) {}
 };
 
 /**
@@ -206,11 +231,20 @@ class ShmFsCache {
     }
     try {
       ShmFsFileMap::BytesProbe p{path.data(), path.size()};
-      root_->path_to_file_.InsertOrAssign(
-          p, ShmCacheString::HashBytes(path.data(), path.size()), rec);
-      // A false return means the table is full: the path is simply not cached
-      // and clients keep using RPC for it.
+      ShmFileRecord stamped = rec;
+      stamped.nsgen_ = root_->nsgen_.load(std::memory_order_relaxed);
+      bool ok = root_->path_to_file_.InsertOrAssign(
+          p, ShmCacheString::HashBytes(path.data(), path.size()), stamped);
+      // A false return means the table is full: the path is simply not
+      // cached and clients keep using RPC for it — and authoritative
+      // negatives must stand down forever (see overflow_).
+      if (!ok) {
+        root_->overflow_.store(1, std::memory_order_release);
+      }
     } catch (...) {
+      if (root_ != nullptr) {
+        root_->overflow_.store(1, std::memory_order_release);
+      }
     }
   }
 
@@ -221,6 +255,14 @@ class ShmFsCache {
    * runtime", which is the correct answer for a deleted path, and a tombstone
    * would consume a slot in a table that never grows.
    */
+  /** Invalidate every non-directory record published before now (directory
+   *  rename: subtree records keep stale path keys — see ShmFileRecord). */
+  void BumpNsGen() {
+    if (IsEnabled()) {
+      root_->nsgen_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   void ErasePath(const std::string &path) {
     if (!IsEnabled()) {
       return;

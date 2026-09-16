@@ -179,34 +179,6 @@ struct OrganizerConfig {
 };
 
 /**
- * GPU metadata cache configuration.
- *
- * When enabled, CTE Core allocates a chunk of GPU-accessible memory
- * (managed/shared USM) at Create time and projects a fixed-capacity
- * snapshot of tag and blob metadata into it. The cache is updated by
- * GPU kernels launched from the CTE Core server side as PutBlob /
- * GetOrCreateTag / DelBlob / DelTag run on the CPU; downstream GPU
- * kernels can read entries directly to discover what the CTE has
- * placed in DRAM-tier (GPU-reachable) storage.
- *
- * Sizing: capacity_bytes_ caps the memory footprint of the cache. The
- * actual map slot counts (max_blobs_ / max_tags_) are derived from
- * capacity_bytes_ / sizeof(GpuBlobEntry|GpuTagEntry) in the Create path.
- */
-struct GpuMetadataCacheConfig {
-  bool enabled_;             /**< Master switch — off by default. */
-  clio::run::u64 capacity_bytes_;  /**< Total GPU memory footprint cap. */
-  clio::run::u32 max_blobs_;       /**< Hash slot count for blob entries.  */
-  clio::run::u32 max_tags_;        /**< Hash slot count for tag entries.   */
-
-  GpuMetadataCacheConfig()
-      : enabled_(false),
-        capacity_bytes_(64ULL * 1024ULL * 1024ULL),  // 64 MB default
-        max_blobs_(8192),
-        max_tags_(1024) {}
-};
-
-/**
  * CTE Core Configuration Manager
  * Provides YAML parsing and validation for CTE Core configuration
  */
@@ -236,11 +208,6 @@ class Config {
    * Data organizer configuration (periodic reorganization; off by default)
    */
   OrganizerConfig organizer_;
-
-  /**
-   * GPU metadata cache (optional, off by default).
-   */
-  GpuMetadataCacheConfig gpu_metadata_cache_;
 
   /**
    * Default constructor

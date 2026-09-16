@@ -16,8 +16,14 @@ add_clio_module_runtime(
   LIB_NAME clio_admin
   SOURCES
     src/admin_runtime.cc
+    src/admin_viz.cc
     src/autogen/admin_lib_exec.cc
 )
+
+# Web dashboard (issue #990): the admin ChiMod ships the dashboard shell, so its
+# viz/ directory is what "/" resolves to. Staged next to the built libraries and
+# installed under share/clio/viz so the runtime finds whichever copy it loaded.
+clio_add_viz_assets(MOD_NAME clio_admin)
 
 # Coverage builds: the daemon dies via std::abort() in InitiateShutdown,
 # which skips the gcov at-exit flush and silently discards all runtime-side

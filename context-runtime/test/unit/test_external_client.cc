@@ -212,4 +212,30 @@ TEST_CASE("ExternalClient - Client Operations", "[external_client][ipc]") {
   // server stopped by RuntimeServer destructor (RAII)
 }
 
+TEST_CASE("ExternalClient - WITH_RUNTIME=1 attaches to a running runtime",
+          "[external_client][ipc][1015]") {
+  // Issue #1015: CLIO_WITH_RUNTIME=1 means "make sure a runtime is available",
+  // not "be the runtime". With a daemon already holding the port, this process
+  // must attach as a plain client instead of failing (the old behaviour) or
+  // becoming a second runtime and clobbering the first one's state.
+  //
+  // This is the fast gate on the fall-back path: ServerInit cannot claim the
+  // port, so ClioInitImpl continues to ClientInit. The multi-node proof is the
+  // docker/MPI suite, which does not run here.
+  clio::run::test::RuntimeServer server;
+  REQUIRE(server.Start());
+  REQUIRE(server.WaitForReady());
+
+  setenv("CLIO_WITH_RUNTIME", "1", 1);
+  REQUIRE(CLIO_INIT(RuntimeMode::kClient, true));
+
+  // The decisive assertion: we did NOT become the runtime. Two runtimes on one
+  // port is the failure this issue exists to prevent, and a bare "init
+  // succeeded" check cannot tell the two apart.
+  REQUIRE_FALSE(CLIO_RUNTIME_MANAGER->IsRuntime());
+  REQUIRE(CLIO_IPC != nullptr);
+
+  // server stopped by RuntimeServer destructor (RAII)
+}
+
 SIMPLE_TEST_MAIN()

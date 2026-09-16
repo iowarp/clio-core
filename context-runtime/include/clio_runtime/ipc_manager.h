@@ -1230,6 +1230,13 @@ class IpcManager {
    * @param priority Network queue priority (see NetQueuePriority for
    *                 the latency-vs-IO lane split).
    */
+  /**
+   * CLIO_NET_QPROF: mark the arrival of a peer's task on this node, so the
+   * server-side residency (arrival -> response enqueued) can be attributed.
+   * A no-op unless profiling is enabled.
+   */
+  void NetProfMarkRecvIn(const clio::run::shared_ptr<Task> &task);
+
   void EnqueueNetTask(Future<Task> future, NetQueuePriority priority);
 
   /**
@@ -1739,6 +1746,19 @@ class IpcManager {
   std::atomic<bool> heartbeat_running_{false};
   std::atomic<bool> server_alive_{true};
 
+  // Set at the TOP of ClientFinalize, before any transport is torn down
+  // (issue #970). Once teardown has begun, a response can never arrive: the
+  // response listener is destroyed and the recv threads are joined. The waits
+  // in IpcCpu2Cpu::RecvOut and IpcCpu2CpuZmq::RecvOut therefore treat this as
+  // a terminal condition and fail the task instead of parking on it.
+  //
+  // This is deliberately NOT folded into server_alive_. That flag means "the
+  // runtime went away and we may be able to reconnect to it", and it drives a
+  // reconnect/resend path that is exactly wrong here — the runtime is fine, it
+  // is THIS client that is gone, and reconnecting during teardown would build
+  // transports that the caller is in the middle of destroying.
+  std::atomic<bool> client_finalized_{false};
+
   // A client-side in-flight async submission, tracked by net_key. The async
   // recv thread marks the task complete (Task::is_complete_/is_new_data_) and
   // wakes the waiter thread recorded on the FutureShm. Both pointers stay valid
@@ -2081,6 +2101,31 @@ namespace clio::run {
 // shared_ptr destructor (host) when the last owner drops — no explicit free.
 template <typename TaskT, typename AllocT>
 CTP_HOST_FUN Future<TaskT, AllocT>::~Future() {
+#if CTP_IS_HOST
+  // A future dropped WITHOUT being waited on still has to deregister. Firing
+  // AsyncX in a loop and letting each future die is legal use of the API (it is
+  // exactly what test_client_crash_putblob does), and consumed_ is false on that
+  // path, so the branch below never ran: the task's shared_ptr freed it while
+  // pending_zmq_futures_ still held a RAW pointer to it, and the next response
+  // wrote through that pointer (Task::SetNewData on freed memory —
+  // AddressSanitizer's heap-use-after-free in cr_cli_client_crash_leak).
+  //
+  // Gated on being the LAST owner: a copy of a live future carries
+  // consumed_ == false too, and deregistering for one of those would strand the
+  // owner still waiting for the response. use_count() == 1 here means this
+  // object's member destructor, which runs next, frees the task.
+  if (!consumed_ && !task_ptr_.IsNull() && task_ptr_.use_count() == 1 &&
+      !FutureShmIsNull()) {
+    ctp::ipc::FullPtr<FutureT> fs = GetFutureShm();
+    TaskT *t = TaskRaw();
+    if (!fs.IsNull() && t != nullptr &&
+        (fs->origin_ == ClientOrigin::kClientTcp ||
+         fs->origin_ == ClientOrigin::kClientIpc ||
+         fs->origin_ == ClientOrigin::kClientShm)) {
+      CLIO_CPU_IPC->CleanupResponseArchive(t->task_id_.net_key_);
+    }
+  }
+#endif
   if (consumed_) {
     // Clean up zero-copy response archive (TCP/IPC only, never used on GPU).
     // The FutureShm itself is owned by the host shared_ptr and freed
