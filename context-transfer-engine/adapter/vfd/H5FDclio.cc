@@ -285,6 +285,27 @@ static void H5FD__clio_resident_add(ClioResident *r, haddr_t off, size_t len) {
   }
 }
 
+/* Drop [off, off+len) from the set, splitting an interval that straddles it.
+   Needed because a populate that FAILS must not leave the range claimed: the
+   file has bytes the tier does not, and serving that range later would hand
+   back whatever the tier has instead -- pre-write data, or zeros. */
+static void H5FD__clio_resident_remove(ClioResident *r, haddr_t off,
+                                       size_t len) {
+  if (r == nullptr || r->overflowed || len == 0) return;
+  const haddr_t lo = off, hi = off + (haddr_t)len;
+  auto it = r->iv.upper_bound(lo);
+  if (it != r->iv.begin()) {
+    auto prev = std::prev(it);
+    if (prev->second > lo) it = prev;
+  }
+  while (it != r->iv.end() && it->first < hi) {
+    const haddr_t s0 = it->first, e0 = it->second;
+    it = r->iv.erase(it);
+    if (s0 < lo) r->iv[s0] = lo;          /* head survives */
+    if (e0 > hi) r->iv[hi] = e0;          /* tail survives */
+  }
+}
+
 /* True only when [off, off+len) lies wholly inside ONE recorded interval. */
 static bool H5FD__clio_resident_covers(const ClioResident *r, haddr_t off,
                                        size_t len) {
@@ -1140,9 +1161,6 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   /* Pack file */
   file->filename_ = strdup(name);
   file->tier_coherent = tier_coherent;
-  /* Only when the tier can actually serve; otherwise nothing consults it. */
-  file->resident = H5FD__clio_read_tier_on() ? new (std::nothrow) ClioResident()
-                                             : nullptr;
   file->cache_degraded = cache_degraded;
   {
     const std::string ident = H5FD__clio_stamp_of(native_path.c_str());
@@ -1160,6 +1178,12 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     free(file);
     return nullptr;
   }
+
+  /* Allocated AFTER the last fallible step above, so no error path has to
+     remember to free it. Only when the tier can serve; otherwise nothing
+     consults it, and a null set means "serve nothing", which is safe. */
+  file->resident = H5FD__clio_read_tier_on() ? new (std::nothrow) ClioResident()
+                                             : nullptr;
   file->fd = fd;
   file->posix_fd = posix_fd;
   file->flags = flags;
@@ -1435,8 +1459,12 @@ static herr_t H5FD__clio_do_read(H5FD_clio_t *file, haddr_t addr, size_t size,
   // All-or-nothing per request: splitting a read between tier and file would
   // mean tracking which half came from where on every failure path.
 #if H5FD_CLIO_HAVE_CACHE_TIER
-  if (H5FD__clio_read_tier_on() && file->tier_coherent && file->fd >= 0 &&
-      file->filename_ != nullptr &&
+  /* cache_live, not fd >= 0: see H5FD__clio_cache_live. Once exit handlers are
+     running the CLIO client may already be torn down, and this path calls into
+     it. Load-bearing now that the tier actually serves -- before, it never
+     fired at all. */
+  if (H5FD__clio_read_tier_on() && file->tier_coherent &&
+      H5FD__clio_cache_live(file->fd) && file->filename_ != nullptr &&
       H5FD__clio_resident_covers(file->resident, addr, size)) {
     const ssize_t served = CLIO_CFS_CLIENT->TryReadShmResident(
         file->filename_, static_cast<clio::run::u64>(addr), buf, size);
@@ -1489,11 +1517,19 @@ static herr_t H5FD__clio_do_read(H5FD_clio_t *file, haddr_t addr, size_t size,
   // readable. The open either matched the stamp or dropped the copy, so what
   // is written here came from the file as it now stands.
 #if H5FD_CLIO_HAVE_CACHE_TIER
-  if (H5FD__clio_read_tier_on() && file->fd >= 0) {
+  if (H5FD__clio_read_tier_on() && H5FD__clio_cache_live(file->fd)) {
+    /* == size, not >= 0. Write() returns "bytes accepted": in deferred mode
+       that is `count` unconditionally (a queued write that later fails latches
+       its errno for Flush/close), and in blocking mode it can be a SHORT
+       count. Treating either as a complete populate would mark bytes resident
+       that the tier may never hold -- reintroducing exactly this commit's
+       defect by a different route. */
     if (CLIO_CFS_CLIENT->PwriteFd(file->fd, buf, size,
-                                  static_cast<off_t>(addr)) >= 0) {
+                                  static_cast<off_t>(addr)) ==
+        static_cast<clio_vfd_ssize_t>(size)) {
       H5FD__clio_resident_add(file->resident, addr, size);
     } else {
+      H5FD__clio_resident_remove(file->resident, addr, size);
       H5FDclio_cache_write_failures_g++;
       // A populate that failed leaves a hole the tier does not know about, so
       // this copy can no longer be vouched for as a whole. Counting it is not
@@ -1573,9 +1609,16 @@ static herr_t H5FD__clio_do_write(H5FD_clio_t *file, haddr_t addr, size_t size,
      cost -- and this commit's residency recording, which only matters when the
      populate actually happens. */
   if (H5FD__clio_cache_live(file->fd) && H5FD__clio_read_tier_on()) {
-    if (CLIO_CFS_CLIENT->PwriteFd(file->fd, buf, size, static_cast<off_t>(addr)) >= 0) {
+    if (CLIO_CFS_CLIENT->PwriteFd(file->fd, buf, size,
+                                  static_cast<off_t>(addr)) ==
+        static_cast<clio_vfd_ssize_t>(size)) {
       H5FD__clio_resident_add(file->resident, addr, size);
     } else {
+      /* The native file now holds these bytes and the tier may not. Anything
+         previously recorded for this range describes PRE-WRITE data, so drop it
+         -- otherwise the next read of the range is served the old contents with
+         a success status. */
+      H5FD__clio_resident_remove(file->resident, addr, size);
       H5FDclio_cache_write_failures_g++;
       HLOG(kWarning,
            "CTE cache populate failed at addr={} size={} (native file is "

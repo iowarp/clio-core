@@ -27,6 +27,8 @@
 #include <hdf5.h>
 
 #include <fcntl.h>
+#include <chrono>
+#include <thread>
 #include <sys/stat.h>
 
 // The descriptor calls below go through the driver's own platform shims
@@ -1633,6 +1635,31 @@ int main() {
     std::printf("[vfd-suite] skip 25: read tier off "
                 "(covered by clio_cte_vfd_unit_tests_read_tier)\n");
   } else {
+    // A RAM target, registered here rather than by repointing InitRuntime.
+    // The tier only takes the SHM fast path when its pages live in shared
+    // memory; against the file target InitRuntime registers, TryReadShmResident
+    // declines and there is nothing to catch. Registering it in this section
+    // keeps the other 24 untouched and, more importantly, puts the
+    // precondition under the test's control instead of the environment's.
+    {
+      auto *cte = CLIO_CTE_CLIENT;
+      clio::run::PoolId ram_pool(957, 0);
+      clio::run::bdev::Client ram_bdev(ram_pool);
+      auto mk = ram_bdev.AsyncCreate(clio::run::PoolQuery::Dynamic(),
+                                     "ram::clio_vfd_scatter_tier", ram_pool,
+                                     clio::run::bdev::BdevType::kRam,
+                                     64ULL * 1024 * 1024);
+      mk.Wait();
+      CHECK(mk->GetReturnCode() == 0, "25: create the RAM tier bdev");
+      auto reg = cte->AsyncRegisterTarget("ram::clio_vfd_scatter_tier",
+                                          clio::run::bdev::BdevType::kRam,
+                                          64ULL * 1024 * 1024,
+                                          clio::run::PoolQuery::Local(), ram_pool);
+      reg.Wait();
+      CHECK(reg->GetReturnCode() == 0, "25: register a RAM tier target");
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
     const char *kHolePath = "/tmp/clio_cte_vfd_hole.h5";
     std::remove(kHolePath);
     constexpr size_t kSeg = 4096;
@@ -1727,30 +1754,6 @@ int main() {
       const char *kScatPath = "/tmp/clio_cte_vfd_scatter.h5";
       std::remove(kScatPath);
       constexpr size_t kScat = 256 * 1024;
-
-      // A RAM target, registered here rather than by repointing InitRuntime.
-      // The tier only takes the SHM fast path when its pages live in shared
-      // memory; against the file target InitRuntime registers, TryReadShmResident
-      // declines and there is nothing to catch. Registering it in this section
-      // keeps the other 24 untouched and, more importantly, puts the
-      // precondition under the test's control instead of the environment's.
-      {
-        auto *cte = CLIO_CTE_CLIENT;
-        clio::run::PoolId ram_pool(957, 0);
-        clio::run::bdev::Client ram_bdev(ram_pool);
-        auto mk = ram_bdev.AsyncCreate(clio::run::PoolQuery::Dynamic(),
-                                       "ram::clio_vfd_scatter_tier", ram_pool,
-                                       clio::run::bdev::BdevType::kRam,
-                                       64ULL * 1024 * 1024);
-        mk.Wait();
-        auto reg = cte->AsyncRegisterTarget("ram::clio_vfd_scatter_tier",
-                                            clio::run::bdev::BdevType::kRam,
-                                            64ULL * 1024 * 1024,
-                                            clio::run::PoolQuery::Local(), ram_pool);
-        reg.Wait();
-        CHECK(reg->GetReturnCode() == 0, "25b: register a RAM tier target");
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      }
 
       hid_t sfapl = H5Pcreate(H5P_FILE_ACCESS);
       CHECK(H5Pset_fapl_clio(sfapl, 1) >= 0, "25b: FAPL");
