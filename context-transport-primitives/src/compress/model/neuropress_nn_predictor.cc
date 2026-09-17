@@ -13,6 +13,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 
@@ -281,6 +282,15 @@ int NeuroPressAlgoIdForBaseId(int base_id) {
   }
 }
 
+bool NeuroPressNNPredictor::TrainingLosslessSentinel() {
+  // CLIO_NEUROPRESS_TRAIN_RAW_BOUND=1 restores upstream: train at the raw bound.
+  static const bool sentinel = [] {
+    const char* v = std::getenv("CLIO_NEUROPRESS_TRAIN_RAW_BOUND");
+    return !(v != nullptr && v[0] == '1');
+  }();
+  return sentinel;
+}
+
 std::vector<float> NeuroPressNNPredictor::FeaturesTo8Input(
     const CompressionFeatures& features, bool apply_lossless_sentinel) const {
   // NeuroPress expects: [algo_id, quant, shuffle, error_bound, data_size,
@@ -296,8 +306,7 @@ std::vector<float> NeuroPressNNPredictor::FeaturesTo8Input(
   // configs." Passing 0.0 put input 3 about 2.4e-6 standard deviations off
   // upstream's value for every lossless candidate, which is every candidate
   // Clio ranks.
-  // Sentinel for INFERENCE only -- see the header. Training feeds the raw
-  // bound on both SGD paths, so a lossless config contributes 0.0 there.
+  // The SGD paths pass TrainingLosslessSentinel(); see the header.
   const float error_bound_enc =
       (apply_lossless_sentinel && !features.quantize)
           ? 1e-7f
@@ -417,6 +426,8 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
                           end_time - start_time)
                           .count() /
                       static_cast<double>(batch.size());
+    const double kPredTimeFloor =
+        static_cast<double>(gpu::NeuroPressPredTimeFloorMs());
     for (size_t i = 0; i < batch.size(); ++i) {
       // Already clamped inside the kernel (nn_gpu.cu order: sanity
       // ceiling first, then the policy floors/caps). Repeat the policy half
@@ -429,8 +440,9 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
       results.emplace_back(
           std::max(0.1, std::min(100.0, static_cast<double>(ratio[i]))),
           std::max(0.0, std::min(120.0, static_cast<double>(psnr[i]))),
-          std::max(1.0, static_cast<double>(comp_time[i])),
-          std::max(1.0, static_cast<double>(decomp_time[i])), infer_ms);
+          std::max(kPredTimeFloor, static_cast<double>(comp_time[i])),
+          std::max(kPredTimeFloor, static_cast<double>(decomp_time[i])),
+          infer_ms);
     }
     return results;
   }
@@ -521,6 +533,7 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
     rank.w_io = weights->w_cost_io;
     rank.bandwidth_bytes_per_ms = weights->bandwidth_bytes_per_ms;
     rank.ratio_cap = weights->ratio_cap;
+    rank.min_time_ms = weights->min_time_ms;
     // The two mask inputs.
     //
     // The bound is the CHUNK's, i.e. upstream's cfg.error_bound -- NOT
@@ -589,6 +602,8 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
       static_cast<double>(batch.size());
 
   const double kRatioCap = (weights != nullptr) ? weights->ratio_cap : 100.0;
+  const double kPredTimeFloor =
+      static_cast<double>(gpu::NeuroPressPredTimeFloorMs());
   std::vector<CompressionPrediction> results;
   results.reserve(batch.size());
   for (size_t i = 0; i < batch.size(); ++i) {
@@ -598,8 +613,9 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
     results.emplace_back(
         std::max(0.1, std::min(kRatioCap, static_cast<double>(ratio[i]))),
         std::max(0.0, std::min(120.0, static_cast<double>(psnr[i]))),
-        std::max(1.0, static_cast<double>(comp_time[i])),
-        std::max(1.0, static_cast<double>(decomp_time[i])), infer_ms);
+        std::max(kPredTimeFloor, static_cast<double>(comp_time[i])),
+        std::max(kPredTimeFloor, static_cast<double>(decomp_time[i])),
+        infer_ms);
   }
   return results;
 #else
@@ -611,6 +627,27 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
   if (out_order != nullptr) out_order->clear();
   if (out_scores != nullptr) out_scores->clear();
   return {};
+#endif
+}
+
+void NeuroPressNNPredictor::MarkStatsPhase(void* stream, bool start) {
+#if CTP_ENABLE_NEUROPRESS_GPU
+  gpu::MarkNeuroPressStatsPhase(stream, start);
+#else
+  (void)stream;
+  (void)start;
+#endif
+}
+
+bool NeuroPressNNPredictor::TakePhaseTimes(double* stats_ms, double* infer_ms,
+                                           double* rank_ms) {
+#if CTP_ENABLE_NEUROPRESS_GPU
+  return gpu::TakeNeuroPressPhaseTimes(stats_ms, infer_ms, rank_ms);
+#else
+  (void)stats_ms;
+  (void)infer_ms;
+  (void)rank_ms;
+  return false;
 #endif
 }
 
@@ -639,7 +676,7 @@ bool NeuroPressNNPredictor::TrainDeviceStats(
     // nnSGDKernel exactly rather than the CPU port below.
     std::vector<gpu::NeuroPressGpuSGDSample> gpu_samples(num_samples);
     for (size_t si = 0; si < num_samples; ++si) {
-      auto x = FeaturesTo8Input(features[si], /*sentinel=*/false);
+      auto x = FeaturesTo8Input(features[si], TrainingLosslessSentinel());
       std::copy(x.begin(), x.end(), gpu_samples[si].raw_input);
       gpu_samples[si].actual_ratio = labels[si].compression_ratio;
       gpu_samples[si].actual_comp_time_ms = labels[si].compression_time_ms;
@@ -734,9 +771,8 @@ bool NeuroPressNNPredictor::TrainDecompHead(
     for (size_t si = 0; si < features.size(); ++si) {
       const double measured = decompression_times_ms[si];
       if (measured <= 0.0) continue;  // not measured -- nothing to learn from
-      // RAW bound: the sentinel is inference-only (nn_gpu.cu).
-      const auto x = FeaturesTo8Input(features[si],
-                                      /*apply_lossless_sentinel=*/false);
+      // The bound inference ranks at (TrainingLosslessSentinel).
+      const auto x = FeaturesTo8Input(features[si], TrainingLosslessSentinel());
       const int base_id =
           static_cast<int>(features[si].library_config_id) / 10;
       gpu::NeuroPressGpuDecompSample s{};

@@ -250,6 +250,12 @@ class NeuroPressNNPredictor : public CompressionPredictor {
       ctp::compress::preprocess::PredictionReuseOutcome* out_outcome =
           nullptr);
 
+  /** Selection phase timing for CLIO_NEUROPRESS_PHASE_LOG; see
+   *  gpu::NeuroPressPhaseTimingEnabled. No-ops without the GPU network. */
+  static void MarkStatsPhase(void* stream, bool start);
+  static bool TakePhaseTimes(double* stats_ms, double* infer_ms,
+                             double* rank_ms);
+
   /**
    * @brief Set the online-SGD learning rate.
    *
@@ -360,15 +366,16 @@ class NeuroPressNNPredictor : public CompressionPredictor {
    *
    * @param features Input features.
    * @param apply_lossless_sentinel Substitute 1e-7 for a lossless config's
-   *   error bound. TRUE only for INFERENCE -- upstream applies the sentinel in
-   *   its inference kernel and nowhere else; both SGD kernels feed the RAW
-   *   bound, so every training path must pass false or it trains against an
-   *   input upstream never builds.
+   *   error bound, as the offline training and every inference path do.
    * @return 8-element vector in NeuroPress order.
    */
   std::vector<float> FeaturesTo8Input(
       const CompressionFeatures& features,
       bool apply_lossless_sentinel = true) const;
+
+  /** Train lossless configs at the inference sentinel (upstream trains at the
+   *  raw bound). CLIO_NEUROPRESS_TRAIN_RAW_BOUND=1 restores upstream. */
+  static bool TrainingLosslessSentinel();
 
   // Architecture parameters.
   static constexpr uint32_t kInputDim = 8;

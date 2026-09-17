@@ -547,5 +547,149 @@ void LogNeuroPressSelection(const std::string &blob_name, size_t chunk_size,
   std::fflush(fp);
 }
 
+namespace {
+struct PhaseLog {
+  std::mutex mutex;
+  std::FILE *fp = nullptr;
+  long seq = 0;
+  std::map<std::string, ChunkPhases> open;
+};
+
+/** Leaked on purpose, see SelectionLogInstance. */
+PhaseLog *PhaseLogInstance() {
+  static PhaseLog *log = [] {
+    auto *l = new PhaseLog();
+    const char *path = std::getenv("CLIO_NEUROPRESS_PHASE_LOG");
+    if (path && *path) {
+      // Append: a read-back may be a separate process.
+      l->fp = std::fopen(path, "a");
+      if (l->fp && std::ftell(l->fp) == 0) {
+        std::fprintf(l->fp,
+                     "seq,chunk_id,path,chunk_bytes,stats_ms,nn_ms,"
+                     "nn_batch_chunks,choice_ms,factory_ms,compress_ms,"
+                     "decompress_ms,io_ms,preproc_ms,h2d_ms,wall_ms,other_ms,"
+                     "lib,reused,explore_ms,sgd_ms,explored,sgd_updates,"
+                     "stored_bytes\n");
+      }
+    }
+    return l;
+  }();
+  return log;
+}
+
+thread_local ChunkPhases g_selection_phases;
+thread_local bool g_selection_phases_valid = false;
+
+// Field-wise sum; a negative (unmeasured) field stays so only if both are.
+void MergePhases(ChunkPhases *a, const ChunkPhases &b) {
+  auto add = [](double *x, double y) {
+    if (y < 0.0) return;
+    *x = (*x < 0.0) ? y : *x + y;
+  };
+  add(&a->stats_ms, b.stats_ms);
+  add(&a->nn_ms, b.nn_ms);
+  add(&a->choice_ms, b.choice_ms);
+  add(&a->factory_ms, b.factory_ms);
+  add(&a->compress_ms, b.compress_ms);
+  add(&a->decompress_ms, b.decompress_ms);
+  add(&a->io_ms, b.io_ms);
+  add(&a->preproc_ms, b.preproc_ms);
+  add(&a->h2d_ms, b.h2d_ms);
+  if (b.reused >= 0) a->reused = b.reused;
+  a->explore_ms += b.explore_ms;
+  a->sgd_ms += b.sgd_ms;
+  a->explored += b.explored;
+  a->sgd_updates += b.sgd_updates;
+}
+}  // namespace
+
+bool PhaseLogEnabled() {
+  static const bool on = [] {
+    const char *p = std::getenv("CLIO_NEUROPRESS_PHASE_LOG");
+    return p && *p;
+  }();
+  return on;
+}
+
+void RecordSelectionPhases(double stats_ms, double nn_ms, double choice_ms,
+                           bool reused) {
+  ChunkPhases p;
+  p.stats_ms = stats_ms;
+  p.nn_ms = nn_ms;
+  p.choice_ms = choice_ms;
+  p.reused = reused ? 1 : 0;
+  g_selection_phases = p;
+  g_selection_phases_valid = true;
+}
+
+bool TakeSelectionPhases(ChunkPhases *out) {
+  if (!g_selection_phases_valid) return false;
+  MergePhases(out, g_selection_phases);
+  g_selection_phases_valid = false;
+  return true;
+}
+
+void OpenCompressPhases(const std::string &blob_name) {
+  PhaseLog *log = PhaseLogInstance();
+  if (!log->fp) return;
+  std::lock_guard<std::mutex> lock(log->mutex);
+  log->open[blob_name] = ChunkPhases{};
+}
+
+void AddCompressPhases(const std::string &blob_name, const ChunkPhases &p) {
+  PhaseLog *log = PhaseLogInstance();
+  if (!log->fp) return;
+  std::lock_guard<std::mutex> lock(log->mutex);
+  auto it = log->open.find(blob_name);
+  if (it == log->open.end()) return;
+  MergePhases(&it->second, p);
+}
+
+bool TakeCompressPhases(const std::string &blob_name, ChunkPhases *out) {
+  PhaseLog *log = PhaseLogInstance();
+  if (!log->fp) return false;
+  std::lock_guard<std::mutex> lock(log->mutex);
+  auto it = log->open.find(blob_name);
+  if (it == log->open.end()) return false;
+  MergePhases(out, it->second);
+  log->open.erase(it);
+  return true;
+}
+
+void LogChunkPhases(const std::string &blob_name, const char *path,
+                    size_t chunk_bytes, int lib, const ChunkPhases &p,
+                    double wall_ms, size_t stored_bytes) {
+  PhaseLog *log = PhaseLogInstance();
+  if (!log->fp) return;
+  const bool write = std::strcmp(path, "write") == 0;
+  // Unmeasured or not-applicable fields are written empty, never 0.
+  auto cell = [](double v, bool applies) {
+    char b[32] = "";
+    if (applies && v >= 0.0) std::snprintf(b, sizeof(b), "%.6f", v);
+    return std::string(b);
+  };
+  double covered = 0.0;
+  for (double v : {p.stats_ms, p.nn_ms, p.choice_ms, p.factory_ms,
+                   p.compress_ms, p.decompress_ms, p.io_ms, p.preproc_ms,
+                   p.h2d_ms, p.explore_ms, p.sgd_ms}) {
+    if (v > 0.0) covered += v;
+  }
+  std::lock_guard<std::mutex> lock(log->mutex);
+  std::fprintf(
+      log->fp,
+      "%ld,%s,%s,%zu,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%.6f,%.6f,%d,%s,%.6f,%.6f,"
+      "%d,%d,%zu\n",
+      log->seq++, blob_name.c_str(), path, chunk_bytes,
+      cell(p.stats_ms, write).c_str(), cell(p.nn_ms, write).c_str(),
+      write ? "1" : "",
+      cell(p.choice_ms, write).c_str(), cell(p.factory_ms, true).c_str(),
+      cell(p.compress_ms, write).c_str(),
+      cell(p.decompress_ms, !write).c_str(), cell(p.io_ms, true).c_str(),
+      cell(p.preproc_ms, write).c_str(), cell(p.h2d_ms, true).c_str(),
+      wall_ms, wall_ms - covered, lib,
+      (write && p.reused >= 0) ? (p.reused ? "1" : "0") : "", p.explore_ms,
+      p.sgd_ms, p.explored, p.sgd_updates, stored_bytes);
+  std::fflush(log->fp);
+}
 
 }  // namespace clio::cte::compressor

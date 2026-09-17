@@ -28,9 +28,13 @@ struct NeuroPressCostWeights {
  *  must both read these, or training scores what it is not ranking on. */
 NeuroPressCostWeights NeuroPressResolvedCostWeights();
 
-/** w_ct*ct + w_dt*dt + w_io*bytes/(min(ratio,cap)*bw). Times floored at 1 ms
- *  and ratio capped first, as upstream. Ratio <= 0 gives 1e30, a gate sentinel. */
+/** w_ct*ct + w_dt*dt + w_io*bytes/(min(ratio,cap)*bw). Times floored at
+ *  kMinTimeMs and ratio capped first. Ratio <= 0 gives 1e30, a gate sentinel. */
 struct NeuroPressCost {
+  /** Time floor in ms, upstream's (nn_gpu.cu:229-236). Applied to predicted
+   *  and measured times alike. */
+  static constexpr double kMinTimeMs = 1.0;
+
   double w_ct;
   double w_dt;
   double w_io;
@@ -40,8 +44,19 @@ struct NeuroPressCost {
 
   double operator()(double compress_ms, double decompress_ms,
                     double ratio) const {
-    const double ct = std::max(1.0, compress_ms);
-    const double dt = std::max(1.0, decompress_ms);
+    return Eval(compress_ms, decompress_ms, ratio, kMinTimeMs);
+  }
+
+  /** The same cost with no time floor (CLIO_NEUROPRESS_SGD_GATE=raw). */
+  double Raw(double compress_ms, double decompress_ms, double ratio) const {
+    return Eval(compress_ms, decompress_ms, ratio, 0.0);
+  }
+
+  /** Public so the struct stays an aggregate. */
+  double Eval(double compress_ms, double decompress_ms, double ratio,
+              double floor_ms) const {
+    const double ct = std::max(floor_ms, compress_ms);
+    const double dt = std::max(floor_ms, decompress_ms);
     const double rc = std::min(ratio_cap, ratio);
     return w_ct * ct + w_dt * dt +
            ((rc > 0.0) ? w_io * static_cast<double>(chunk_size) /

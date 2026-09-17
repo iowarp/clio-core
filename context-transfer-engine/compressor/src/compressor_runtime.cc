@@ -1018,8 +1018,14 @@ void Runtime::LearnDecompTime(const std::string& blob_key,
     auto it = decomp_features_.find(blob_key);
     if (it == decomp_features_.end()) return;  // never compressed here
 
-    // Floor the measurement at 1 ms before it becomes a target.
-    it->second.measured_ms = std::max(1.0, measured_ms);
+    // Upstream's label floor is 0.01 ms (nn_gpu.cu:775), not the 1 ms
+    // prediction clamp. CLIO_NEUROPRESS_DT_LABEL_FLOOR_MS overrides.
+    static const double kLabelFloorMs = [] {
+      const char* e = std::getenv("CLIO_NEUROPRESS_DT_LABEL_FLOOR_MS");
+      const double v = (e != nullptr && *e != '\0') ? std::atof(e) : 0.01;
+      return (v > 0.0) ? v : 0.01;
+    }();
+    it->second.measured_ms = std::max(kLabelFloorMs, measured_ms);
 
     // Train over EVERY record that has a measurement, not just this one and not only once per re...
     batch_features.reserve(decomp_features_.size());
@@ -1084,6 +1090,20 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             ? chunk_data
             : nullptr;
 
+    // Per-chunk phase log (CLIO_NEUROPRESS_PHASE_LOG).
+    const bool phase_log = PhaseLogEnabled();
+    ChunkPhases phases;
+    bool phases_selected = false;
+    double ds_h2d_ms = 0.0;
+    auto written_time = start_time;
+    std::chrono::steady_clock::time_point explore_t0;
+    bool explore_ran = false;
+    double explore_inner_ms = 0.0;
+    auto ms_since = [](std::chrono::steady_clock::time_point t) {
+      return std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - t).count();
+    };
+
     // SetNull(), not the default constructor.
     ctp::ipc::AllocatorId h2d_alloc;
     h2d_alloc.SetNull();
@@ -1114,7 +1134,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         CLIO_CO_RETURN;
       }
       // DeviceAwareMemcpy, NOT GpuApi::Memcpy.
+      const auto h2d_t0 = std::chrono::steady_clock::now();
       ctp::DeviceAwareMemcpy(staged, chunk_data, chunk_size);
+      ds_h2d_ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - h2d_t0).count();
       chunk_data = staged;
       // Same convention Compress uses to hand a device-resident output back (see where compressed_...
       CLIO_PATH_TRACE("WRITE  staged H2D %llu bytes -> device",
@@ -1175,6 +1198,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                               &neuropress_gpu_failed, &sel_device_stats,
                               np_reuse_on ? &np_reuse_ctx : nullptr,
                               np_reuse_on ? &np_reuse_outcome : nullptr);
+      phases_selected = phase_log && TakeSelectionPhases(&phases);
     }
 
     if (neuropress_gpu_failed) {
@@ -1293,11 +1317,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     }
 
     // Now call Compress to perform compression (and PutBlob unless deferred)
+    if (phases_selected) OpenCompressPhases(task->blob_name_.str());
     auto compress_task = client_.AsyncCompress(
         clio::run::PoolQuery::Local(), task->tag_id_, task->blob_name_.str(),
         task->offset_, task->size_, compress_input, task->score_, context,
         task->flags_, task->core_pool_id_, defer_store);
     CLIO_CO_AWAIT(compress_task);
+    written_time = std::chrono::high_resolution_clock::now();
 
     // Copy results back
     task->context_ = compress_task->context_;
@@ -1423,10 +1449,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // here would report a MAPE against a differently-clamped ratio.
           const double kMapeCap = NeuroPressResolvedCostWeights().cap;
           const double pred_r = std::min(kMapeCap, f.compression_ratio_);
-          const double pred_ct = std::max(1.0, f.compress_time_ms_);
-          const double pred_dt = std::max(1.0, f.decompress_time_ms_);
+          const double pred_ct =
+              std::max(NeuroPressCost::kMinTimeMs, f.compress_time_ms_);
+          const double pred_dt =
+              std::max(NeuroPressCost::kMinTimeMs, f.decompress_time_ms_);
           const double act_r = std::min(kMapeCap, context.actual_compression_ratio_);
-          const double act_ct = std::max(1.0, context.actual_compress_time_ms_);
+          const double act_ct = std::max(NeuroPressCost::kMinTimeMs,
+                                         context.actual_compress_time_ms_);
           // Decompression is not measured at write time; upstream substitutes the prediction, which ma...
           const double act_dt = pred_dt;
           diag.ratio_mape = static_cast<float>(
@@ -1499,6 +1528,25 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             ? std::fabs(actual_cost - predicted_cost) / actual_cost
             : 0.0;
 
+        // CLIO_NEUROPRESS_SGD_GATE=raw scores the SGD gate without the time
+        // floor; by default it scores the ranked cost, as upstream.
+        static const bool kRawSgdGate = [] {
+          const char *e = std::getenv("CLIO_NEUROPRESS_SGD_GATE");
+          return (e != nullptr && std::strcmp(e, "raw") == 0);
+        }();
+        double sgd_error_pct = error_pct;
+        if (kRawSgdGate) {
+          const double raw_pred = cost.Raw(predicted->compress_time_ms_,
+                                           predicted->decompress_time_ms_,
+                                           predicted->compression_ratio_);
+          const double raw_act = cost.Raw(context.actual_compress_time_ms_,
+                                          predicted->decompress_time_ms_,
+                                          context.actual_compression_ratio_);
+          sgd_error_pct = (raw_act > 0.0)
+              ? std::fabs(raw_act - raw_pred) / raw_act
+              : 0.0;
+        }
+
         // ---- Phase 1: "learn from PRIMARY result immediately" -- online SGD on the real, just-meas...
         std::string lib_name =
             ctp::CompressionFactory::NameForWireId(best_lib);
@@ -1557,7 +1605,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
 
           const double np_cost_thresh =
               static_cast<double>(config_.neuropress_mape_threshold_);
-          const bool np_cost_gate = error_pct > np_cost_thresh;
+          const bool np_cost_gate = sgd_error_pct > np_cost_thresh;
 
           // Same clamps the reported ratio_mape uses, so the gate and the
           // column agree.
@@ -1589,11 +1637,18 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                     static_cast<float>(context.actual_compression_ratio_),
                     static_cast<float>(primary_sgd_psnr),
                     static_cast<float>(context.actual_compress_time_ms_),
-                    /*decompress_time=*/0.0f)};
+                    // 0 when MEASURE_DT did not measure it
+                    static_cast<float>(
+                        (context.actual_decompress_time_ms_ > 0.0)
+                            ? context.actual_decompress_time_ms_
+                            : 0.0))};
 
             // Device-resident statistics when the selection had them, so the SGD kernel reads...
+            const auto sgd_t0 = std::chrono::steady_clock::now();
             bool trained = neuropress_predictor_->TrainDeviceStats(
                 features, labels, sel_device_stats);
+            phases.sgd_ms += ms_since(sgd_t0);
+            if (trained) ++phases.sgd_updates;
             /** kModelChanged for the host-decided reuse path. */
             if (trained) {
               np_sgd_epoch_.fetch_add(1, std::memory_order_relaxed);
@@ -1601,7 +1656,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             HLOG(kDebug,
                  "NeuroPress SGD: lib={} preset={} error_pct={} "
                  "threshold={} trained={}",
-                 lib_name, best_preset, error_pct,
+                 lib_name, best_preset, sgd_error_pct,
                  config_.neuropress_mape_threshold_, trained);
           }
         }
@@ -1625,6 +1680,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             (config_.neuropress_best_mode_ ||
              error_pct > static_cast<double>(
                              config_.neuropress_exploration_threshold_))) {
+          explore_t0 = std::chrono::steady_clock::now();
+          explore_ran = true;
           // K bounds the RANKED WINDOW scanned, not the number measured, and an ineligible slot inside...
           std::vector<const CompressionStats*> alternatives;
           int examined = 0;
@@ -1648,6 +1705,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           std::vector<ctp::compress::model::TrainingLabels> explore_labels;
           // Per-sample cost, kept parallel to the two vectors above purely so the batch can be ordered...
           std::vector<double> explore_costs;
+          std::vector<double> explore_pred_costs;
 
           // ---- The PRIMARY's decompression time, measured the same way the alternatives' will be.
           const double primary_dt_ms = context.actual_decompress_time_ms_;
@@ -2004,11 +2062,18 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                           alt_quant_params.data_max - alt_quant_params.data_min,
                           alt_quant_params.effective_error_bound)
                     : -1.0;
+            // The measured dt, so the trust region bounds head 1 too.
             explore_labels.emplace_back(static_cast<float>(alt_ratio),
                                         static_cast<float>(alt_psnr),
                                         static_cast<float>(alt_time_ms),
-                                        0.0f);
+                                        static_cast<float>(
+                                            (slot_ref.decomp_time_ms >= 0.0)
+                                                ? slot_ref.decomp_time_ms
+                                                : 0.0));
             explore_costs.push_back(alt_cost);
+            explore_pred_costs.push_back(cost(alt->compress_time_ms_,
+                                              alt->decompress_time_ms_,
+                                              alt->compression_ratio_));
           }
 
           // Input 3 as the MODEL sees it.
@@ -2116,12 +2181,21 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                   clio::cte::core::kBlobTransformed |
                   clio::cte::core::kBlobTransformCompressed;
 
+              const auto winner_put_t0 = std::chrono::high_resolution_clock::now();
               auto winner_put = core_client_->AsyncPutBlob(
                   task->tag_id_, task->blob_name_.str(), task->offset_,
                   winner_total, winner_shm.shm_.template Cast<void>(),
                   task->score_, winner_ctx, task->flags_,
                   clio::run::PoolQuery::Local());
               CLIO_CO_AWAIT(winner_put);
+              written_time = std::chrono::high_resolution_clock::now();
+              if (phases_selected) {
+                ChunkPhases put_io;
+                put_io.io_ms = std::chrono::duration<double, std::milli>(
+                                   written_time - winner_put_t0).count();
+                explore_inner_ms += put_io.io_ms;
+                AddCompressPhases(task->blob_name_.str(), put_io);
+              }
               const int winner_rc = winner_put->return_code_;
               CLIO_IPC->FreeBuffer(winner_shm);
 
@@ -2215,6 +2289,28 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                              [&](size_t a, size_t b) {
                                return explore_costs[a] < explore_costs[b];
                              });
+            // CLIO_NEUROPRESS_EXPLORE_SGD_HARD=N (default 3, 0 = upstream): keep the
+            // 7-N cheapest, then the N most mispredicted, |log(pred/measured)|.
+            static const size_t kHardSamples = [] {
+              const char *e = std::getenv("CLIO_NEUROPRESS_EXPLORE_SGD_HARD");
+              const long v = (e != nullptr && *e != '\0') ? std::atol(e) : 3;
+              return static_cast<size_t>(
+                  std::clamp<long>(v, 0, static_cast<long>(kMaxExploreSgdSamples)));
+            }();
+            if (kHardSamples > 0 && order.size() > kMaxExploreSgdSamples &&
+                explore_pred_costs.size() == explore_costs.size()) {
+              const size_t keep_cheap = kMaxExploreSgdSamples - kHardSamples;
+              auto miss = [&](size_t i) {
+                return (explore_costs[i] > 0.0 && explore_pred_costs[i] > 0.0)
+                           ? std::fabs(std::log(explore_pred_costs[i] /
+                                                explore_costs[i]))
+                           : 0.0;
+              };
+              std::stable_sort(order.begin() + static_cast<long>(keep_cheap),
+                               order.end(), [&](size_t a, size_t b) {
+                                 return miss(a) > miss(b);
+                               });
+            }
             if (order.size() > kMaxExploreSgdSamples) {
               order.resize(kMaxExploreSgdSamples);
             }
@@ -2230,8 +2326,14 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             explore_labels.swap(sorted_labels);
 
             // Same chunk, so the same device statistics -- exploration varies the ACTION, not the data....
+            phases.explored = static_cast<int>(alternatives.size());
+            const auto explore_sgd_t0 = std::chrono::steady_clock::now();
             bool explore_trained = neuropress_predictor_->TrainDeviceStats(
                 explore_features, explore_labels, sel_device_stats);
+            const double explore_sgd_ms = ms_since(explore_sgd_t0);
+            phases.sgd_ms += explore_sgd_ms;
+            explore_inner_ms += explore_sgd_ms;
+            if (explore_trained) ++phases.sgd_updates;
             // Regret: how much worse the primary's real cost was than the
             // best alternative found. 0 if the primary was already best.
             double regret = (best_cost > 0.0)
@@ -2269,6 +2371,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       }
     }
 
+    if (explore_ran) {
+      phases.explore_ms = std::max(0.0, ms_since(explore_t0) - explore_inner_ms);
+    }
+
     // The decision that actually reaches storage.
     {
       const int np_final_lib = context.compress_lib_;
@@ -2290,11 +2396,19 @@ clio::run::TaskResume Runtime::DynamicSchedule(
 
     // The one put, when exploration did not make it.
     if (defer_store && !stored_by_exploration && primary_image.valid()) {
+      const auto primary_put_t0 = std::chrono::high_resolution_clock::now();
       auto primary_put = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_,
           primary_image.size, primary_image.data, task->score_,
           task->context_, task->flags_, clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(primary_put);
+      written_time = std::chrono::high_resolution_clock::now();
+      if (phases_selected) {
+        ChunkPhases put_io;
+        put_io.io_ms = std::chrono::duration<double, std::milli>(
+                           written_time - primary_put_t0).count();
+        AddCompressPhases(task->blob_name_.str(), put_io);
+      }
       if (primary_put->return_code_ != 0) {
         // Nothing else stored this blob, so unlike a failed exploration put there is no earlier copy...
         HLOG(kError,
@@ -2305,6 +2419,20 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       }
     }
     primary_image.release();
+
+    // Always take the parked entry; log only a chunk that reached the tier.
+    if (phases_selected &&
+        TakeCompressPhases(task->blob_name_.str(), &phases) &&
+        task->return_code_ == 0) {
+      phases.h2d_ms = std::max(phases.h2d_ms, 0.0) + ds_h2d_ms;
+      LogChunkPhases(task->blob_name_.str(), "write", chunk_size,
+                     task->context_.compress_lib_, phases,
+                     std::chrono::duration<double, std::milli>(
+                         written_time - start_time).count(),
+                     task->context_.compress_lib_ != 0
+                         ? task->context_.actual_compressed_size_
+                         : chunk_size);
+    }
 
   } catch (const std::exception& e) {
     HLOG(kError, "Exception in DynamicSchedule: {}", e.what());
@@ -2396,7 +2524,19 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     }
 
     // Create compressor with specified preset
+    const auto factory_t0 = std::chrono::steady_clock::now();
     auto compressor = ctp::CompressionFactory::GetPreset(library_name, preset);
+    ChunkPhases compress_phases;  // phase log
+    compress_phases.factory_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - factory_t0).count();
+    auto park_compress_phases = [&](double io_ms) {
+      if (!PhaseLogEnabled()) return;
+      compress_phases.io_ms = io_ms;
+      compress_phases.preproc_ms = context.actual_preproc_time_ms_;
+      compress_phases.h2d_ms = context.actual_h2d_time_ms_;
+      AddCompressPhases(task->blob_name_.str(), compress_phases);
+    };
 
     if (!compressor) {
       HLOG(kWarning, "Failed to create compressor for library: {}",
@@ -2655,6 +2795,8 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
             .count();
     // Device time for the codec launch alone, when CLIO_CODEC_KERNEL_TIMING is on.
     const double compress_kernel_ms = ctp::LastCodecKernelMs();
+    compress_phases.compress_ms =
+        (compress_kernel_ms >= 0.0) ? compress_kernel_ms : compress_time;
 
     // Check if compression succeeded and is beneficial (include header size
     // in the total stored size)
@@ -2788,6 +2930,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         }
         task->context_ = context;
         task->return_code_ = 0;
+        park_compress_phases(0.0);  // the put happens in DynamicSchedule
       } else {
         CLIO_PATH_TRACE(
             "WRITE  PutBlob -> tier blob='%s' stored=%llu bytes, handed over "
@@ -2796,11 +2939,15 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
             (unsigned long long)total_stored_size,
             output_on_device ? "DEVICE" : "HOST");
         // Call PutBlob with header + compressed data
+        const auto put_t0 = std::chrono::steady_clock::now();
         auto put_task = core_client_->AsyncPutBlob(
             task->tag_id_, task->blob_name_.str(), task->offset_,
             total_stored_size, compressed_shm_ptr, task->score_, context,
             task->flags_, clio::run::PoolQuery::Local());
         CLIO_CO_AWAIT(put_task);
+        park_compress_phases(std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - put_t0)
+                                 .count());
         stored_put_rc = put_task->return_code_;
 
         // Device allocations belong to device_scratch above, which releases
@@ -2864,14 +3011,19 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         task->stored_owned_ = false;
         task->context_ = context;
         task->return_code_ = 0;
+        park_compress_phases(0.0);
         CLIO_CO_RETURN;
       }
 
+      const auto raw_put_t0 = std::chrono::steady_clock::now();
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
           clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(put_task);
+      park_compress_phases(std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - raw_put_t0)
+                               .count());
 
       task->context_ = put_task->context_;
       task->return_code_ = put_task->return_code_;
@@ -2910,6 +3062,14 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
     // toward this reader. No-op when tracking_enabled_=false.
     RegisterConsumer(task->tag_id_, task->pool_query_.GetReturnNode());
 
+    const auto read_t0 = std::chrono::steady_clock::now();
+    auto ms_since = [](std::chrono::steady_clock::time_point t) {
+      return std::chrono::duration<double, std::milli>(
+                 std::chrono::steady_clock::now() - t).count();
+    };
+    ChunkPhases read_phases;
+    read_phases.io_ms = 0.0;
+
     // Extract task parameters (same as GetBlobTask).
     clio::run::u64 expected_size = task->size_;
 
@@ -2940,9 +3100,11 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
 
     // Ask core directly (bypassing this class's own GetBlobSize override, which deliberately rep...
     if (core_client_) {
+      const auto size_t0 = std::chrono::steady_clock::now();
       auto size_task = core_client_->AsyncGetBlobSize(
           task->tag_id_, task->blob_name_.str(), clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(size_task);
+      read_phases.io_ms += ms_since(size_t0);
       if (size_task->return_code_ == 0 && size_task->size_ > 0) {
         expected_size = size_task->size_;
       }
@@ -2958,10 +3120,12 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
     ctp::ipc::ShmPtr<> temp_buffer_ptr = temp_buffer.shm_.template Cast<void>();
 
     // Call GetBlob to retrieve the (potentially compressed) data
+    const auto get_t0 = std::chrono::steady_clock::now();
     auto get_task = core_client_->AsyncGetBlob(
         task->tag_id_, task->blob_name_.str(), task->offset_, expected_size,
         task->flags_, temp_buffer_ptr, clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(get_task);
+    read_phases.io_ms += ms_since(get_t0);
 
     if (get_task->return_code_ != 0) {
       CLIO_IPC->FreeBuffer(temp_buffer);
@@ -3045,8 +3209,10 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       }
 
       // Create decompressor
+      const auto factory_t0 = std::chrono::steady_clock::now();
       auto decompressor =
           ctp::CompressionFactory::GetPreset(library_name, preset);
+      read_phases.factory_ms = ms_since(factory_t0);
       if (!decompressor) {
         CLIO_IPC->FreeBuffer(temp_buffer);
         HLOG(kWarning, "Failed to create decompressor for library: {}",
@@ -3097,9 +3263,11 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
         decompressed_size = quant_bytes;
       }
 
+      ctp::LastCodecKernelMs() = -1.0;  // not a stale compress time
       bool success =
           decompressor->Decompress(codec_dst, decompressed_size,
                                    compressed_data, compressed_size);
+      const double decompress_kernel_ms = ctp::LastCodecKernelMs();
 
       // Proof-of-execution trace, off unless CLIO_NEUROPRESS_DECOMPRESS_TRACE is set.
       {
@@ -3245,6 +3413,12 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       if (success) {
         task->output_size_ = decompressed_size;
         task->decompress_time_ms_ = decompress_time;
+        if (PhaseLogEnabled()) {
+          read_phases.decompress_ms = decompress_time;
+          LogChunkPhases(task->blob_name_.str(), "read", original_size,
+                         compress_lib, read_phases, ms_since(read_t0),
+                         expected_size);
+        }
 
         // Show the RECONSTRUCTED VALUES, not just that a call returned 0.
         {
@@ -3280,7 +3454,16 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
         }
 
         // Deferred decomp-head learning: this is the ONLY point a real decompression time exists.
-        LearnDecompTime(task->blob_name_.str(), decompress_time);
+        // Label with the codec kernel time, as compress and exploration do;
+        // CLIO_NEUROPRESS_DT_LABEL=wall uses the wall clock.
+        static const bool kDtLabelWall = [] {
+          const char *e = std::getenv("CLIO_NEUROPRESS_DT_LABEL");
+          return e != nullptr && std::strcmp(e, "wall") == 0;
+        }();
+        LearnDecompTime(task->blob_name_.str(),
+                        (!kDtLabelWall && decompress_kernel_ms >= 0.0)
+                            ? decompress_kernel_ms
+                            : decompress_time);
 
         // Log decompression telemetry
         CompressionTelemetry telemetry(
@@ -3305,9 +3488,17 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       auto output_fullptr =
           CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
       // Device-aware, not std::memcpy: the caller's destination is a CUDA-IPC device buffer whenev...
+      const auto copy_t0 = std::chrono::steady_clock::now();
       ctp::DeviceAwareMemcpy(output_fullptr.ptr_, temp_buffer.ptr_,
                              expected_size);
       CLIO_IPC->FreeBuffer(temp_buffer);
+      if (PhaseLogEnabled()) {
+        read_phases.factory_ms = 0.0;
+        read_phases.decompress_ms = ms_since(copy_t0);
+        LogChunkPhases(task->blob_name_.str(), "read", expected_size,
+                       /*lib=*/0, read_phases, ms_since(read_t0),
+                       expected_size);
+      }
 
       task->output_size_ = expected_size;
       task->decompress_time_ms_ = 0.0;

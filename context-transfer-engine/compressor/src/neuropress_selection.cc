@@ -26,6 +26,7 @@
  */
 
 #include <clio_ctp/compress/compress_factory.h>
+#include <clio_ctp/compress/model/neuropress_nn_predictor.h>
 #include <clio_ctp/compress/preprocess/data_stats.h>
 #include <clio_ctp/compress/preprocess/data_stats_gpu.h>
 #include <clio_ctp/compress/preprocess/feature_extractor.h>
@@ -63,6 +64,13 @@ std::vector<CompressionStats> Runtime::NeuroPressRankChunk(
       RecordSelectionTiming(
           std::chrono::duration<double, std::micro>(
               std::chrono::steady_clock::now() - t0).count(), reused);
+      // Phase log: read after the chain's synchronize.
+      double stats_ms = 0.0, nn_ms = 0.0, choice_ms = 0.0;
+      if (PhaseLogEnabled() &&
+          ctp::compress::model::NeuroPressNNPredictor::TakePhaseTimes(
+              &stats_ms, &nn_ms, &choice_ms)) {
+        RecordSelectionPhases(stats_ms, nn_ms, choice_ms, reused);
+      }
     }
   } sel_timer{sel_t0, sel_reused};
 
@@ -87,6 +95,8 @@ std::vector<CompressionStats> Runtime::NeuroPressRankChunk(
       num_elements > 0 && ctp::IsDevicePointer(chunk);
   if (np_device_path) {
     np_stream = ctp::DeviceStatsStream();
+    ctp::compress::model::NeuroPressNNPredictor::MarkStatsPhase(np_stream,
+                                                                true);
     // float64 is CONVERTED, not reinterpreted: reading a double as two float32
     // words makes the low half NaN about 1 time in 256.
     if (context.data_type_ == 2) {
@@ -96,6 +106,8 @@ std::vector<CompressionStats> Runtime::NeuroPressRankChunk(
       device_stats = ctp::ComputeDeviceStatsResident(chunk, num_elements,
                                                      data_type, np_stream);
     }
+    ctp::compress::model::NeuroPressNNPredictor::MarkStatsPhase(np_stream,
+                                                                false);
     /* Reused below instead of re-measuring; upstream passes one d_stats_ptr
        to both inference and runNNSGDCtx. */
     if (out_device_stats) *out_device_stats = device_stats;

@@ -180,6 +180,44 @@ void LogMeasuredQuality(const std::string &blob_name, size_t orig_bytes,
                         uint32_t shuffle, bool quantized,
                         const ctp::compress::preprocess::QualityMetrics &q);
 
+/** One chunk's time per phase for CLIO_NEUROPRESS_PHASE_LOG (plot_fig5.py).
+ *  Negative means not measured. */
+struct ChunkPhases {
+  double stats_ms = -1.0;
+  double nn_ms = -1.0;
+  double choice_ms = -1.0;
+  double factory_ms = -1.0;
+  double compress_ms = -1.0;
+  double decompress_ms = -1.0;
+  double io_ms = -1.0;
+  double preproc_ms = -1.0;
+  double h2d_ms = -1.0;
+  int reused = -1;  // 1 = cached ranking served, no forward pass
+  // Online learning, host wall; explore_ms excludes its SGD and winner put.
+  double explore_ms = 0.0;
+  double sgd_ms = 0.0;
+  int explored = 0;     // alternatives measured by the exploration sweep
+  int sgd_updates = 0;  // TrainDeviceStats calls that updated the model
+};
+
+bool PhaseLogEnabled();
+
+/** Thread-local hand-off from the selection to DynamicSchedule. */
+void RecordSelectionPhases(double stats_ms, double nn_ms, double choice_ms,
+                           bool reused);
+bool TakeSelectionPhases(ChunkPhases *out);
+
+/** Hand-off from Runtime::Compress, keyed by blob name; only chunks
+ *  DynamicSchedule opened are kept. Add accumulates. */
+void OpenCompressPhases(const std::string &blob_name);
+void AddCompressPhases(const std::string &blob_name, const ChunkPhases &p);
+bool TakeCompressPhases(const std::string &blob_name, ChunkPhases *out);
+
+/** path is "write" or "read"; lib 0 = stored raw. */
+void LogChunkPhases(const std::string &blob_name, const char *path,
+                    size_t chunk_bytes, int lib, const ChunkPhases &p,
+                    double wall_ms, size_t stored_bytes);
+
 }  // namespace clio::cte::compressor
 
 #endif  // CLIO_CTE_COMPRESSOR_NEUROPRESS_TELEMETRY_H_

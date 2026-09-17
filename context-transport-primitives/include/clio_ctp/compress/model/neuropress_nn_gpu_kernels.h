@@ -29,6 +29,10 @@ namespace ctp::compress::model::gpu {
 /** @brief Opaque device-resident weight handle (defined in the .cu TU). */
 struct NeuroPressGpuWeights;
 
+/** Floor on predicted compress/decompress times, in ms. Default 1 (upstream);
+ *  CLIO_NEUROPRESS_PRED_TIME_FLOOR_MS overrides. */
+float NeuroPressPredTimeFloorMs();
+
 /**
  * @brief Allocate device weight storage and upload from host-parsed .nnwt
  * data (same flattened layout NeuroPressNNPredictor::Load() already parses:
@@ -210,6 +214,9 @@ struct GpuRankParams {
    */
   double ratio_cap = 100.0;
 
+  /** Time floor in ms (RankingWeights::min_time_ms). */
+  double min_time_ms = 1.0;
+
   /**
    * The two mask inputs, applied in-kernel exactly as nn_gpu.cu does:
    *   quantize actions are masked when error_bound <= 0
@@ -243,6 +250,18 @@ bool NeuroPressGpuInferBatchDeviceStats(
        `out_outcome` must outlive the caller's synchronize. */
     const ctp::compress::preprocess::PredictionReuseContext *reuse = nullptr,
     ctp::compress::preprocess::PredictionReuseOutcome *out_outcome = nullptr);
+
+/** Selection phase timing (stats, infer, rank) with CUDA events, as upstream
+ *  times stats_ms/nn_ms. On only when CLIO_NEUROPRESS_PHASE_LOG is set. */
+bool NeuroPressPhaseTimingEnabled();
+
+/** Mark the start or end of the statistics launch on `stream`. */
+void MarkNeuroPressStatsPhase(void *stream, bool start);
+
+/** Read and clear this thread's spans after the chain synchronized. infer and
+ *  rank are 0 when a cached ranking was served. */
+bool TakeNeuroPressPhaseTimes(double *stats_ms, double *infer_ms,
+                              double *rank_ms);
 
 /**
  * @brief One deferred decompression-time observation.

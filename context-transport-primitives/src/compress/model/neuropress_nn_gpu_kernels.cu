@@ -60,6 +60,7 @@ struct AdaptOptions {
   float momentum = 0.85f;     // CLIO_NEUROPRESS_SGD_MOMENTUM
   // Output-space trust region for the SHIPPED rule, in standardised output units: one SGD call m...
   float out_delta = 0.5f;     // CLIO_NEUROPRESS_SGD_OUT_DELTA
+  float ratio_target_cap = 100.0f;  // CLIO_NEUROPRESS_SGD_RATIO_TARGET_CAP
 };
 }  // namespace
 
@@ -132,6 +133,11 @@ const AdaptOptions &Opts() {
     a.grad_clip = num("CLIO_NEUROPRESS_SGD_GRAD_CLIP", 1.0f);
     a.momentum = num("CLIO_NEUROPRESS_SGD_MOMENTUM", 0.85f);
     a.out_delta = num("CLIO_NEUROPRESS_SGD_OUT_DELTA", 0.5f);
+    // Upstream trains toward min(ratio, 10000) (nn_gpu.cu:773); 100, the
+    // ranking cap, keeps the ratio head from saturating on VPIC.
+    a.ratio_target_cap =
+        num("CLIO_NEUROPRESS_SGD_RATIO_TARGET_CAP", 100.0f);
+    if (!(a.ratio_target_cap > 0.0f)) a.ratio_target_cap = 100.0f;
     return a;
   }();
   return o;
@@ -244,6 +250,15 @@ void ResetAllEmaBuffers() {
 }
 
 }  // namespace
+
+float NeuroPressPredTimeFloorMs() {
+  static const float v = [] {
+    const char *e = std::getenv("CLIO_NEUROPRESS_PRED_TIME_FLOOR_MS");
+    const float f = (e != nullptr && *e != '\0') ? std::strtof(e, nullptr) : 1.0f;
+    return (f > 0.0f) ? f : 1.0f;
+  }();
+  return v;
+}
 
 NeuroPressGpuWeights *NeuroPressGpuLoad(const float *weights, size_t weights_len,
                                         const float *biases, size_t biases_len,
@@ -418,6 +433,7 @@ __device__ __forceinline__ void NeuroPressForwardShared(
     float *__restrict__ out_decomp_time, float *__restrict__ out_ratio,
     /** Policy ratio ceiling. */
     float ratio_cap,
+    float pred_time_floor,
     float *__restrict__ out_psnr,
     /** Outputs 4-7. */
     float *__restrict__ out_rmse = nullptr,
@@ -462,8 +478,8 @@ __device__ __forceinline__ void NeuroPressForwardShared(
     ratio = fmaxf(0.1f, fminf(ratio, 1e5f));
     psnr = fmaxf(0.0f, fminf(psnr, 120.0f));
 
-    out_comp_time[cand] = fmaxf(1.0f, comp_time);
-    out_decomp_time[cand] = fmaxf(1.0f, decomp_time);
+    out_comp_time[cand] = fmaxf(pred_time_floor, comp_time);
+    out_decomp_time[cand] = fmaxf(pred_time_floor, decomp_time);
     out_ratio[cand] = fminf(ratio_cap, ratio);
     out_psnr[cand] = psnr;
 
@@ -495,7 +511,8 @@ __global__ void InferKernel(const NeuroPressGpuWeights *__restrict__ w,
                             float *__restrict__ out_decomp_time,
                             float *__restrict__ out_ratio,
                             float *__restrict__ out_psnr,
-                            float ratio_cap = 100.0f) {
+                            float ratio_cap = 100.0f,
+                            float pred_time_floor = 1.0f) {
   int cand = blockIdx.x;
   int t = threadIdx.x;
 
@@ -511,6 +528,7 @@ __global__ void InferKernel(const NeuroPressGpuWeights *__restrict__ w,
 
   NeuroPressForwardShared(w, s_x, s_h1, s_h2, s_h3, s_h4, s_y, t, cand,
                           out_comp_time, out_decomp_time, out_ratio, ratio_cap,
+                          pred_time_floor,
                           out_psnr);
 }
 
@@ -525,7 +543,8 @@ __global__ void InferKernelFull(const NeuroPressGpuWeights *__restrict__ w,
                                 float *__restrict__ out_max_error,
                                 float *__restrict__ out_mae,
                                 float *__restrict__ out_ssim,
-                                float ratio_cap = 100.0f) {
+                                float ratio_cap = 100.0f,
+                                float pred_time_floor = 1.0f) {
   int cand = blockIdx.x;
   int t = threadIdx.x;
 
@@ -541,6 +560,7 @@ __global__ void InferKernelFull(const NeuroPressGpuWeights *__restrict__ w,
 
   NeuroPressForwardShared(w, s_x, s_h1, s_h2, s_h3, s_h4, s_y, t, cand,
                           out_comp_time, out_decomp_time, out_ratio, ratio_cap,
+                          pred_time_floor,
                           out_psnr, out_rmse, out_max_error, out_mae, out_ssim);
 }
 
@@ -557,6 +577,7 @@ __global__ void InferKernelDeviceStats(
     float *__restrict__ out_max_error = nullptr,
     float *__restrict__ out_mae = nullptr,
     float *__restrict__ out_ssim = nullptr, float ratio_cap = 100.0f,
+    float pred_time_floor = 1.0f,
     /** Prediction reuse. */
     const ctp::compress::preprocess::DevicePredictionReuseState
         *__restrict__ reuse_states = nullptr,
@@ -625,6 +646,7 @@ __global__ void InferKernelDeviceStats(
 
   NeuroPressForwardShared(w, s_x, s_h1, s_h2, s_h3, s_h4, s_y, t, cand,
                           out_comp_time, out_decomp_time, out_ratio, ratio_cap,
+                          pred_time_floor,
                           out_psnr, out_rmse, out_max_error, out_mae, out_ssim);
 }
 
@@ -640,6 +662,7 @@ __global__ void RankKernel(const float *__restrict__ ct_in,
                            double data_size_bytes, double w_ct, double w_dt,
                            double w_io, double bw, double error_bound,
                            double min_psnr, double ratio_cap,
+                           double min_time_ms,
                            int *__restrict__ out_order,
                            double *__restrict__ out_scores,
                            /** See InferKernelDeviceStats: null means unchanged behaviour. */
@@ -674,9 +697,9 @@ __global__ void RankKernel(const float *__restrict__ ct_in,
 
   if (tid < n) {
     // predictor.h:213-229, clamp for clamp.
-    const double ct = fmax(1.0, static_cast<double>(ct_in[tid]));
+    const double ct = fmax(min_time_ms, static_cast<double>(ct_in[tid]));
     const double dt_raw = static_cast<double>(dt_in[tid]);
-    const double dt = (dt_raw > 0.0) ? fmax(1.0, dt_raw) : ct;
+    const double dt = (dt_raw > 0.0) ? fmax(min_time_ms, dt_raw) : ct;
     const double ratio =
         fmax(0.1, fmin(ratio_cap, static_cast<double>(ratio_in[tid])));
     const double io = (ratio > 0.0) ? (data_size_bytes / (ratio * bw)) : 1e30;
@@ -1030,6 +1053,76 @@ bool NeuroPressGpuTrainDecompHead(NeuroPressGpuWeights *w,
   return ok;
 }
 
+namespace {
+// This thread's phase events, created once and reused.
+struct PhaseEvents {
+  cudaEvent_t stats_start = nullptr, stats_stop = nullptr;
+  cudaEvent_t nn_start = nullptr, nn_stop = nullptr, rank_stop = nullptr;
+  bool ok = false;
+  bool stats = false;
+  bool nn = false;
+};
+
+PhaseEvents &Phase() {
+  static thread_local PhaseEvents e = [] {
+    PhaseEvents p;
+    p.ok = cudaEventCreate(&p.stats_start) == cudaSuccess &&
+           cudaEventCreate(&p.stats_stop) == cudaSuccess &&
+           cudaEventCreate(&p.nn_start) == cudaSuccess &&
+           cudaEventCreate(&p.nn_stop) == cudaSuccess &&
+           cudaEventCreate(&p.rank_stop) == cudaSuccess;
+    return p;
+  }();
+  return e;
+}
+
+bool Elapsed(cudaEvent_t a, cudaEvent_t b, double *ms) {
+  float f = 0.0f;
+  if (cudaEventSynchronize(b) != cudaSuccess) return false;
+  if (cudaEventElapsedTime(&f, a, b) != cudaSuccess) return false;
+  *ms = static_cast<double>(f);
+  return true;
+}
+}  // namespace
+
+bool NeuroPressPhaseTimingEnabled() {
+  static const bool on = [] {
+    const char *p = std::getenv("CLIO_NEUROPRESS_PHASE_LOG");
+    return p && *p;
+  }();
+  return on;
+}
+
+void MarkNeuroPressStatsPhase(void *stream, bool start) {
+  if (!NeuroPressPhaseTimingEnabled()) return;
+  PhaseEvents &e = Phase();
+  if (!e.ok) return;
+  const cudaStream_t st = static_cast<cudaStream_t>(stream);
+  if (start) {
+    e.stats = cudaEventRecord(e.stats_start, st) == cudaSuccess;
+    e.nn = false;
+  } else if (e.stats) {
+    e.stats = cudaEventRecord(e.stats_stop, st) == cudaSuccess;
+  }
+}
+
+bool TakeNeuroPressPhaseTimes(double *stats_ms, double *infer_ms,
+                              double *rank_ms) {
+  PhaseEvents &e = Phase();
+  const bool stats = e.stats, nn = e.nn;
+  e.stats = e.nn = false;
+  if (!e.ok || !stats) return false;
+  if (!Elapsed(e.stats_start, e.stats_stop, stats_ms)) return false;
+  // A cached ranking launches neither the network nor the ranking.
+  *infer_ms = 0.0;
+  *rank_ms = 0.0;
+  if (nn && !(Elapsed(e.nn_start, e.nn_stop, infer_ms) &&
+              Elapsed(e.nn_stop, e.rank_stop, rank_ms))) {
+    return false;
+  }
+  return true;
+}
+
 bool NeuroPressGpuInferBatchDeviceStats(
     NeuroPressGpuWeights *w, const void *device_stats,
     const int *action_ids, int num_candidates, float chunk_size_bytes,
@@ -1047,6 +1140,12 @@ bool NeuroPressGpuInferBatchDeviceStats(
   if (!s.ok) return false;
 
   cudaStream_t st = static_cast<cudaStream_t>(stream);
+  // Phase log events; read after the fetch's synchronize, so no added wait.
+  PhaseEvents *phase = nullptr;
+  if (NeuroPressPhaseTimingEnabled() && Phase().ok && Phase().stats) {
+    phase = &Phase();
+    if (cudaEventRecord(phase->nn_start, st) != cudaSuccess) phase = nullptr;
+  }
   const size_t act_bytes = sizeof(int) * static_cast<size_t>(num_candidates);
 
   // Everything below is enqueued on the SAME stream the statistics were computed on, so the kern...
@@ -1086,6 +1185,7 @@ bool NeuroPressGpuInferBatchDeviceStats(
         out_mae ? s.d_mae : nullptr, out_ssim ? s.d_ssim : nullptr,
         /** One cap for BOTH halves. */
         rank != nullptr ? static_cast<float>(rank->ratio_cap) : 100.0f,
+        NeuroPressPredTimeFloorMs(),
         reuse != nullptr
             ? static_cast<const ctp::compress::preprocess::
                               DevicePredictionReuseState *>(reuse->states)
@@ -1094,13 +1194,17 @@ bool NeuroPressGpuInferBatchDeviceStats(
                          : ctp::compress::preprocess::kNoLineageSlot);
     ok = cudaGetLastError() == cudaSuccess;
   }
+  if (ok && phase != nullptr &&
+      cudaEventRecord(phase->nn_stop, st) != cudaSuccess) {
+    phase = nullptr;
+  }
   // Cost model and ordering, still on the device and still on this stream -- upstream does both ...
   if (ok && rank != nullptr && out_order != nullptr) {
     RankKernel<<<1, kMaxCandidates, 0, st>>>(
         s.d_ct, s.d_dt, s.d_r, s.d_p, s.d_actions, num_candidates,
         rank->data_size_bytes, rank->w_compress_time, rank->w_decompress_time,
         rank->w_io, rank->bandwidth_bytes_per_ms, rank->error_bound,
-        rank->min_psnr, rank->ratio_cap, s.d_order, s.d_scores,
+        rank->min_psnr, rank->ratio_cap, rank->min_time_ms, s.d_order, s.d_scores,
         reuse != nullptr
             ? static_cast<const ctp::compress::preprocess::
                               DevicePredictionReuseState *>(reuse->states)
@@ -1130,6 +1234,9 @@ bool NeuroPressGpuInferBatchDeviceStats(
                               ranked ? out_order : nullptr, out_scores,
                               out_rmse, out_max_error, out_mae, out_ssim);
   }
+  if (ok && phase != nullptr) {
+    phase->nn = cudaEventRecord(phase->rank_stop, st) == cudaSuccess;
+  }
   return ok;
 }
 
@@ -1157,7 +1264,7 @@ bool NeuroPressGpuInferBatchFull(NeuroPressGpuWeights *w,
     SgdWaitIfEverFired(st);
     InferKernelFull<<<num_candidates, kHiddenDim, 0, st>>>(
         w, s.d_raw, s.d_ct, s.d_dt, s.d_r, s.d_p, s.d_rmse, s.d_maxe,
-        s.d_mae, s.d_ssim, 100.0f);
+        s.d_mae, s.d_ssim, 100.0f, NeuroPressPredTimeFloorMs());
     ok = cudaGetLastError() == cudaSuccess;
   }
   if (ok) {
@@ -1191,7 +1298,8 @@ bool NeuroPressGpuInferBatch(NeuroPressGpuWeights *w, const float *raw_inputs,
     SgdWaitIfEverFired(st);
     /** This entry point takes no ranking parameters, so the cap stays at upstream's literal 100. */
     InferKernel<<<num_candidates, kHiddenDim, 0, st>>>(
-        w, s.d_raw, s.d_ct, s.d_dt, s.d_r, s.d_p, 100.0f);
+        w, s.d_raw, s.d_ct, s.d_dt, s.d_r, s.d_p, 100.0f,
+        NeuroPressPredTimeFloorMs());
     ok = cudaGetLastError() == cudaSuccess;
   }
   if (ok) {
@@ -1214,7 +1322,8 @@ __device__ __forceinline__ void ForwardOneLayer(
 __device__ __forceinline__ void SgdForwardAndErrors(
     NeuroPressGpuWeights *w,
     const NeuroPressGpuSGDSample *__restrict__ samples, int num_samples, int t,
-    const ctp::DeviceFeatureStats *__restrict__ device_stats) {
+    const ctp::DeviceFeatureStats *__restrict__ device_stats,
+    float ratio_target_cap) {
   // ---- Phase 1: per-sample forward pass + target/error computation ----
   for (int si = 0; si < num_samples; ++si) {
     if (t < kInputDim) {
@@ -1266,7 +1375,7 @@ __device__ __forceinline__ void SgdForwardAndErrors(
       const NeuroPressGpuSGDSample &s = samples[si];
       float d5[kOutputDim];
 
-      float clamped_ratio = fmaxf(0.5f, fminf(s.actual_ratio, 10000.0f));
+      float clamped_ratio = fmaxf(0.5f, fminf(s.actual_ratio, ratio_target_cap));
       float y_std2 = fmaxf(w->y_stds[2], 1e-8f);
       d5[2] = w->act_y[si][2] - (log1pf(clamped_ratio) - w->y_means[2]) / y_std2;
 
@@ -1335,11 +1444,12 @@ __device__ __forceinline__ void SgdForwardAndErrors(
 __global__ void SgdPrepareKernel(
     NeuroPressGpuWeights *w,
     const NeuroPressGpuSGDSample *__restrict__ samples, int num_samples,
-    const ctp::DeviceFeatureStats *__restrict__ device_stats) {
+    const ctp::DeviceFeatureStats *__restrict__ device_stats,
+    float ratio_target_cap) {
   int t = threadIdx.x;  // 0..63
   __shared__ float s_reduce[kHiddenDim];
 
-  SgdForwardAndErrors(w, samples, num_samples, t, device_stats);
+  SgdForwardAndErrors(w, samples, num_samples, t, device_stats, ratio_target_cap);
 
   // ---- Step 1, once per sample: L4 backward delta for ALL outputs, normalized to unit vectors.
   for (int si = 0; si < num_samples; ++si) {
@@ -1542,8 +1652,8 @@ __global__ void SgdTrustKernel(NeuroPressGpuWeights *w, int num_samples,
             w->params[kOffW4 + t * kHiddenDim + i] * s_tan_a[i];
     s_tan_b[t] = (w->act_h4[si][t] > 0.0f) ? dz : 0.0f;
     __syncthreads();
-    // Heads 0..3, only where this sample carried an error for that head.
-    if (t < 4 && w->d5_raw[si][t] != 0.0f) {
+    // Heads 0..3, with or without an error: an unbounded head drifts (VPIC dt).
+    if (t < 4) {
       float dy = 0.0f;
       for (int i = 0; i < kHiddenDim; ++i) {
         dy += w->params[kOffW5 + t * kHiddenDim + i] * s_tan_b[i];
@@ -1711,7 +1821,7 @@ __global__ void AdaptiveSGDKernel(
   __shared__ float s_reduce[kHiddenDim];
   __shared__ float s_dz4[kHiddenDim], s_dz3[kHiddenDim], s_dz2[kHiddenDim];
 
-  SgdForwardAndErrors(w, samples, num_samples, t, device_stats);
+  SgdForwardAndErrors(w, samples, num_samples, t, device_stats, o.ratio_target_cap);
 
   for (int i = t; i < kParamCount; i += kHiddenDim) w->combined[i] = 0.0f;
   __syncthreads();
@@ -1879,7 +1989,7 @@ bool NeuroPressGpuTrain(NeuroPressGpuWeights *w,
     /** Three launches where there was one, all on the SGD stream, so they chain on the device e... */
     SgdPrepareKernel<<<1, kHiddenDim, 0, g.stream>>>(
         w, static_cast<const NeuroPressGpuSGDSample *>(sc.d_samples),
-        num_samples, d_stats);
+        num_samples, d_stats, opt.ratio_target_cap);
     SgdPerOutputKernel<<<kOutputDim, kHiddenDim, 0, g.stream>>>(
         w, num_samples, lr);
     constexpr int kFoldBlock = 256;

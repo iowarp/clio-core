@@ -220,6 +220,7 @@ std::vector<CompressionStats> RankIntoStats(
      reaches the RANKING and the inference kernel's own clamp, so the model's
      predictions and the cost model score on one scale. */
   weights.ratio_cap = kOverride.cap;
+  weights.min_time_ms = NeuroPressCost::kMinTimeMs;
 
   // Best mode's ratio-only objective: zeroing ct/dt leaves a monotone function
   // of ratio. Applies to the RANKING too -- that decides which slots the sweep

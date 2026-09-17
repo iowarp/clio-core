@@ -197,6 +197,8 @@ struct RankingWeights {
   double bandwidth_bytes_per_ms = 5e6;
   /** Compression-ratio ceiling (upstream RATIO_CAP). 100 = upstream. */
   double ratio_cap = 100.0;
+  /** Time floor in ms; the CTE bridge sets NeuroPressCost::kMinTimeMs. */
+  double min_time_ms = 1.0;
 
   double Score(const CompressionPrediction &p) const {
     return w_ratio * p.compression_ratio -
@@ -213,12 +215,12 @@ struct RankingWeights {
       return Score(p);
     }
     // Same policy clamps NeuroPress applies before ranking (nn_gpu.cu):
-    // times floor at 1ms, ratio caps at 100x.
-    double ct = std::max(1.0, p.compression_time_ms);
+    // times floor at min_time_ms (NeuroPressCost::kMinTimeMs), ratio caps at 100x.
+    double ct = std::max(min_time_ms, p.compression_time_ms);
     // A model that doesn't predict decompression time reports 0; use the
     // compression-time estimate rather than scoring it as free.
     double dt = (p.decompression_time_ms > 0.0)
-                    ? std::max(1.0, p.decompression_time_ms)
+                    ? std::max(min_time_ms, p.decompression_time_ms)
                     : ct;
     // Floor at 0.1 as well as capping at 100: nn_gpu.cu clamps ratio to
     // [0.1, 1e5] before the policy cap, so io_cost can never be divided by a
