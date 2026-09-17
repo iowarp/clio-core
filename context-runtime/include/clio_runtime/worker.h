@@ -239,6 +239,14 @@ class Worker {
   EventQueue *ReplaceEventQueue();
 
   /**
+   * Destruct and free an event queue allocated from CTP_MALLOC.
+   * Only Finalize() calls it: a queue is owned by exactly one worker, and the
+   * owner at teardown is the one that frees it.
+   * @param queue the queue to release (nullptr is a no-op)
+   */
+  static void DeleteEventQueue(EventQueue *queue);
+
+  /**
    * issue #785: hand every queue this worker has ADOPTED to \a dst.
    *
    * Rescues cascade — a replacement adopts a donor's queue, then wedges and is

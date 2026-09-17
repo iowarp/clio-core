@@ -64,6 +64,18 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(ManyToOneSum(typed_task));
       break;
     }
+    case Method::kAllReduce: {
+      // Cast task FullPtr to specific type
+      auto& typed_task = task_ptr.template Cast<AllReduceTask>();
+      CLIO_CO_AWAIT(AllReduce(typed_task));
+      break;
+    }
+    case Method::kBarrier: {
+      // Cast task FullPtr to specific type
+      auto& typed_task = task_ptr.template Cast<BarrierTask>();
+      CLIO_CO_AWAIT(Barrier(typed_task));
+      break;
+    }
     case Method::kCoMutexTest: {
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<CoMutexTestTask>();
@@ -137,6 +149,16 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kAllReduce: {
+      auto& typed_task = task_ptr.template Cast<AllReduceTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kBarrier: {
+      auto& typed_task = task_ptr.template Cast<BarrierTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kCoMutexTest: {
       auto& typed_task = task_ptr.template Cast<CoMutexTestTask>();
       archive << *typed_task;
@@ -199,6 +221,16 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kManyToOneSum: {
       auto& typed_task = task_ptr.template Cast<ManyToOneSumTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kAllReduce: {
+      auto& typed_task = task_ptr.template Cast<AllReduceTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kBarrier: {
+      auto& typed_task = task_ptr.template Cast<BarrierTask>();
       archive >> *typed_task;
       break;
     }
@@ -276,6 +308,18 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
     }
     case Method::kManyToOneSum: {
       auto& typed_task = task_ptr.template Cast<ManyToOneSumTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kAllReduce: {
+      auto& typed_task = task_ptr.template Cast<AllReduceTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kBarrier: {
+      auto& typed_task = task_ptr.template Cast<BarrierTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task;
       break;
@@ -360,6 +404,18 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kManyToOneSum: {
       auto& typed_task = task_ptr.template Cast<ManyToOneSumTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kAllReduce: {
+      auto& typed_task = task_ptr.template Cast<AllReduceTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kBarrier: {
+      auto& typed_task = task_ptr.template Cast<BarrierTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -465,6 +521,28 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
         // Copy task fields (includes base Task fields)
         auto& task_typed = orig_task_ptr.template Cast<ManyToOneSumTask>();
         new_task_ptr->Copy(ctp::ipc::FullPtr<ManyToOneSumTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kAllReduce: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<AllReduceTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<AllReduceTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<AllReduceTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kBarrier: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<BarrierTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<BarrierTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<BarrierTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -577,6 +655,14 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<ManyToOneSumTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kAllReduce: {
+      auto new_task_ptr = ipc_manager->NewTask<AllReduceTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kBarrier: {
+      auto new_task_ptr = ipc_manager->NewTask<BarrierTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kCoMutexTest: {
       auto new_task_ptr = ipc_manager->NewTask<CoMutexTestTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
@@ -633,6 +719,16 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kManyToOneSum: {
       auto& typed_task = orig_task.template Cast<ManyToOneSumTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kAllReduce: {
+      auto& typed_task = orig_task.template Cast<AllReduceTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kBarrier: {
+      auto& typed_task = orig_task.template Cast<BarrierTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
@@ -698,6 +794,16 @@ void Runtime::AggregateIn(clio::run::u32 method, clio::run::shared_ptr<clio::run
     }
     case Method::kManyToOneSum: {
       auto& typed_task = agg_task.template Cast<ManyToOneSumTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
+      break;
+    }
+    case Method::kAllReduce: {
+      auto& typed_task = agg_task.template Cast<AllReduceTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
+      break;
+    }
+    case Method::kBarrier: {
+      auto& typed_task = agg_task.template Cast<BarrierTask>();
       typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }

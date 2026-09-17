@@ -31,6 +31,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <atomic>
 #include "fuse_cte.h"
 
 #include <algorithm>
@@ -286,9 +287,37 @@ void LinkGroupRename(const std::string &from, const std::string &to) {
   g_link_groups[to] = g;
 }
 
+// True only once a real mount is serving requests. See InvalidatePath.
+std::atomic<bool> g_fuse_session_live{false};
+
 // Invalidate a path's kernel entry+attr (and data) cache. Safe from request
 // context in write-through mode (no writeback pages to deadlock on).
+//
+// fuse_get_context() is only defined INSIDE a request handler. The handlers in
+// this file are also called directly -- by test_fuse_ops, which mounts nothing
+// -- and there libfuse has never populated a context. On macFUSE that returns
+// a pointer to uninitialised storage, so `cx->fuse` is non-null GARBAGE, the
+// null guard below passes, and fuse_invalidate_path dereferences it:
+//
+//   x0 = 0xee65bf959a3ab9e8                       <- wild mutex pointer
+//   lr = libfuse3.4.dylib`fuse_invalidate_path+72
+//   pc = libsystem_pthread.dylib`pthread_mutex_lock+12   EXC_BAD_ACCESS
+//
+// That is the fuse_ops SEGFAULT that has failed every macOS adapters run since
+// at least 2026-08-21. It hit the "hard link" case first because link/unlink
+// are the operations that invalidate siblings (see the note above cte_fuse_link)
+// -- the earlier cases never reach here. The address differed every run and
+// matched neither MallocScribble nor MallocPreScribble, which is what ruled out
+// a freed-heap read and pointed at never-initialised memory.
+//
+// A null check cannot fix this: the pointer is garbage, not null. Gate on a
+// flag that is set only by the real mount path instead, so a direct call with
+// no session is a no-op rather than a wild dereference. Linux happened to
+// survive it; that is luck, not correctness.
 void InvalidatePath(const std::string &p) {
+  if (!g_fuse_session_live.load(std::memory_order_acquire)) {
+    return;
+  }
   struct fuse_context *cx = fuse_get_context();
   if (cx != nullptr && cx->fuse != nullptr) {
     fuse_invalidate_path(cx->fuse, p.c_str());
@@ -576,6 +605,13 @@ void EnqueueClose(clio::run::u64 fh, std::string path) {
   EnqueueDrainOrdered(std::move(pc));
 }
 }  // namespace
+
+// Announce that a real mount is about to serve requests. Only after this is
+// fuse_get_context() meaningful; see InvalidatePath for what happens when it
+// is trusted without a session.
+void cte_fuse_mark_session_live() {
+  g_fuse_session_live.store(true, std::memory_order_release);
+}
 
 // ============================================================================
 // FUSE lifecycle

@@ -198,13 +198,31 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     // must not be host memory. Managed memory does support system-wide atomics
     // here (cudaDevAttrConcurrentManagedAccess = 1) and keeps the single
     // address space the queue's construction relies on.
-    dev.queue_backend = ctp::GpuApi::MallocManaged<char>(kQueueBackendBytes);
+    //
+    // ...UNLESS THE DEVICE RING IS LIVE, in which case the device never
+    // touches this queue at all: IpcGpu2Cpu::SendIn pushes to
+    // gpu_info_.gpu2cpu_ring and only falls through to the lane when the ring
+    // is null (ipc_gpu2cpu_impl.h). With no device-side atomic to support,
+    // the paragraph above does not apply, and managed memory is actively
+    // WRONG on a host that reports cudaDevAttrConcurrentManagedAccess = 0 --
+    // WSL2/WDDM is one. There the CPU may not touch a managed page while ANY
+    // kernel is resident, and the drain in RecvIn does exactly that on every
+    // poll: every gpu_vector test SEGFAULTS in Pop as soon as the first
+    // yieldable kernel launches. cudaMemAdvise below cannot fix it; the
+    // advice is unsupported on such a device. Pinned host memory is single-
+    // address-space too, so the BuddyAllocator construction is unaffected.
+    const bool ring_live = (dev.ring.dev_ring != nullptr);
+    dev.queue_backend = ring_live
+                            ? ctp::GpuApi::MallocHost<char>(kQueueBackendBytes)
+                            : ctp::GpuApi::MallocManaged<char>(kQueueBackendBytes);
     if (!dev.queue_backend) {
-      HLOG(kError, "ServerInitGpuQueues: MallocManaged for queue backend "
-           "failed (gpu_id={})", gpu_id);
+      HLOG(kError, "ServerInitGpuQueues: {} for queue backend "
+           "failed (gpu_id={})", ring_live ? "MallocHost" : "MallocManaged",
+           gpu_id);
       FinalizeGpuQueues();
       return false;
     }
+    dev.queue_backend_pinned = ring_live;
     dev.queue_backend_size = kQueueBackendBytes;
     std::memset(dev.queue_backend, 0, kQueueBackendBytes);
 #if CTP_ENABLE_CUDA
@@ -215,7 +233,7 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     // stalled migration froze every CE transfer on the device (captured:
     // cuStreamSynchronize wedged, 0% MEM util, free SMs irrelevant). With
     // AccessedBy there is nothing to migrate, ever.
-    {
+    if (!ring_live) {
       int dev_id = 0;
       cudaGetDevice(&dev_id);
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
@@ -370,8 +388,13 @@ bool gpu::IpcManager::RingNext(u32 gpu_id, clio::run::GpuRingEntry *out) {
 void gpu::IpcManager::FinalizeGpuQueues() {
   for (auto &dev : per_gpu_devices_) {
     if (dev.queue_backend) {
-      ctp::GpuApi::Free(dev.queue_backend);
+      if (dev.queue_backend_pinned) {
+        ctp::GpuApi::FreeHost(dev.queue_backend);
+      } else {
+        ctp::GpuApi::Free(dev.queue_backend);
+      }
       dev.queue_backend = nullptr;
+      dev.queue_backend_pinned = false;
     }
     if (dev.ring.dev_ring) {
       ctp::GpuApi::Free(reinterpret_cast<char *>(dev.ring.dev_ring));

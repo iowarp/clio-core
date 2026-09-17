@@ -100,30 +100,51 @@ std::vector<TargetInfo> MaxBwDpe::SelectTargets(const std::vector<TargetInfo>& t
     }
   }
 
-  // Sort low_score targets by CONFIGURED TIER first, then by performance.
+  // Rank the PREFERRED bucket by target_score_ (hottest tier first), using
+  // measured performance only to break ties.
   //
-  // These are the targets the blob is entitled to, so it should get the best
-  // one -- and "best" is what the operator declared via `score`, not what the
-  // bandwidth model guessed. Ranking by bandwidth alone silently discarded the
-  // configured tiering: write_bandwidth_mbps_ comes from InferWallClockTime(),
-  // a PREDICTION with no notion of device type, and it rated a kHbm tier at
-  // 118 MB/s against host RAM at 1600 MB/s. A config that declared
-  // `hbm score 1.0` above `ram score 0.2` therefore placed every blob on RAM
-  // and the GPU tier never received one -- so "GPU tier" numbers were really
-  // host-tier numbers. Performance still breaks ties within a tier.
-  std::sort(low_score_targets.begin(), low_score_targets.end(),
-            [&perf_comparator](const TargetInfo &a, const TargetInfo &b) {
-              if (a.target_score_ != b.target_score_) {
-                return a.target_score_ > b.target_score_;
-              }
-              return perf_comparator(a, b);
-            });
+  // Ranking this bucket on predicted bandwidth alone -- as it did until now --
+  // makes the operator's declared tiering irrelevant whenever the numbers
+  // disagree with it. Concretely: a config with a volatile RAM tier at
+  // score 1.0 and a file tier at 0.2 admits BOTH to this bucket for a hot blob
+  // (score 1.0), and if the file's measured/predicted write bandwidth happens
+  // to exceed the RAM tier's, the file wins and a "DRAM cache" copy is written
+  // to durable storage. That was observed on Vista (RAM predicted at 476 MB/s
+  // vs the file at 741 MB/s), where it put the cache primary on disk, made it
+  // survive a reboot, and broke cte_replication_persist_integration.
+  //
+  // The GPU tier shows the same failure from the other end: write_bandwidth_mbps_
+  // comes from InferWallClockTime(), a PREDICTION with no notion of device type,
+  // and it rated a kHbm tier at 118 MB/s against host RAM at 1600 MB/s. A config
+  // declaring `hbm score 1.0` above `ram score 0.2` therefore placed every blob
+  // on RAM and the GPU tier never received one -- so every "GPU tier" number
+  // measured on that config was really a host-tier number.
+  //
+  // The scores in the YAML are an explicit statement about which tier data of
+  // a given temperature belongs on. Bandwidth is an estimate -- sometimes a
+  // cold-model one. When they disagree, the declared intent wins; among tiers
+  // the operator scored the SAME, the faster device is the better choice, so
+  // performance still decides.
+  auto score_then_perf = [&perf_comparator](const TargetInfo& a,
+                                            const TargetInfo& b) {
+    if (a.target_score_ != b.target_score_) {
+      return a.target_score_ > b.target_score_;  // hottest tier first
+    }
+    return perf_comparator(a, b);
+  };
+  std::sort(low_score_targets.begin(), low_score_targets.end(), score_then_perf);
 
-  // Sort high_score targets by performance in REVERSE order
-  // (when falling back to higher tiers, prefer lower-performing ones first)
+  // The FALLBACK bucket holds tiers HOTTER than this blob was scored for, so
+  // the pick is "least over-provisioned first": closest score to the blob's,
+  // i.e. ascending target_score_, again with performance breaking ties. This
+  // keeps the previous intent -- do not burn the hottest tier on cold data --
+  // while expressing it in the same currency as the bucket above.
   std::sort(high_score_targets.begin(), high_score_targets.end(),
             [&perf_comparator](const TargetInfo& a, const TargetInfo& b) {
-              return perf_comparator(b, a);  // Reverse by swapping arguments
+              if (a.target_score_ != b.target_score_) {
+                return a.target_score_ < b.target_score_;  // closest first
+              }
+              return perf_comparator(a, b);
             });
 
   // Build result: low_score targets first (preferred), then high_score (fallback)

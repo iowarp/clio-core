@@ -28,11 +28,14 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/replication/replication_client.h>
+#include <clio_runtime/admin/admin_client.h>
+#include <clio_runtime/config_manager.h>
 
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -689,6 +692,115 @@ TEST_CASE("BlobReplicas - metadata snapshot covers replica layouts",
   REQUIRE(GetFrom(client, tag_id, "snap_blob", &got, 0) == 0);
   REQUIRE(std::memcmp(got.data(), primary_val.data(), kValSize) == 0);
   REQUIRE(GetFrom(client, tag_id, "snap_blob", &got, 1) == 0);
+  REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
+}
+
+TEST_CASE("BlobReplicas - snapshot replica layouts restore into a fresh pool",
+          "[cte][replicas][wal][886][noleak]") {
+  // Covers RestoreMetadataFromLog's REPLICA branch, which nothing else in the
+  // unit suite reaches.
+  //
+  // That branch was dead code until the entry tag was separated: replica
+  // records were written as type 3, the blob branch above it claims 1|2|3, so
+  // every replica record was parsed as a blob and the stream desynchronised
+  // from there (the reader went on to read string bytes as binary fields --
+  // observed as bdev "pool ids" that decode to ASCII, 1936876912 == "pers").
+  // It went unnoticed because no test ever restored a snapshot holding
+  // replicas.
+  //
+  // Restarting the EXISTING pool cannot test this: the container is already
+  // live, so a re-create returns it with its in-memory metadata intact and
+  // RestoreMetadataFromLog never runs. Compose a SECOND CTE pool instead --
+  // new id, same metadata_log_path, restart_ = true -- which is a genuinely
+  // cold container and must rebuild its state from the snapshot alone. That is
+  // the same path admin's RestartContainers drives after a reboot.
+  auto *client = CLIO_CTE_CLIENT;
+  REQUIRE(client != nullptr);
+
+  clio::cte::core::Tag tag("replica_restore_tag");
+  const clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  const std::string primary_val(kValSize, 'p');
+  const std::string replica_val(kValSize, 'r');
+  PutTo(client, tag_id, "restore_blob", primary_val, 0);
+  // PERSISTENT, so the replica lands on the file tier. A plain replica would
+  // land on the volatile RAM tier, and RestoreMetadataFromLog drops volatile
+  // blocks by design -- the copy is meant to die with the machine. Only a
+  // non-volatile replica has a layout that SHOULD survive, which is what makes
+  // its absence after a restore a real defect rather than correct behaviour.
+  {
+    clio::cte::core::Context ctx = ReplicaCtx(1);
+    ctx.replica_flags_ = clio::cte::core::REPLICA_PERSISTENT;
+    auto fut = client->AsyncPutBlob(tag_id, "restore_blob", 0, kValSize,
+                                    replica_val.data(), -1.0f, ctx);
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+  }
+
+  // Snapshot. This truncates the WAL, so afterwards the replica's layout lives
+  // ONLY in the snapshot and the restore below has to parse it correctly.
+  auto flush = client->AsyncFlushMetadata(clio::run::PoolQuery::Local(), 0);
+  flush.Wait();
+  REQUIRE(flush->GetReturnCode() == 0);
+
+  // Second CTE pool over the same storage + the same metadata log.
+  clio::run::PoolConfig cfg;
+  cfg.mod_name_ = "clio_cte_core";
+  cfg.pool_name_ = "clio_cte_restored";
+  cfg.pool_id_ = clio::run::PoolId(514, 0);
+  cfg.pool_query_ = clio::run::PoolQuery::Local();
+  cfg.restart_ = true;  // -> Runtime::Restart -> is_restart_ -> replay the log
+  {
+    std::ostringstream y;
+    y << "targets:\n"
+      << "  neighborhood: 1\n"
+      << "storage:\n"
+      << "  - path: \"ram::blob_replicas_dram\"\n"
+      << "    bdev_type: \"ram\"\n"
+      << "    capacity_limit: \"64MB\"\n"
+      << "    score: 1.0\n"
+      << "  - path: \"" << chi_test_data_dir() + "/blob_replicas_file.dat" << "\"\n"
+      << "    bdev_type: \"file\"\n"
+      << "    capacity_limit: \"1MB\"\n"
+      << "    score: 0.2\n"
+      << "    persistence_level: \"temporary\"\n"
+      << "performance:\n"
+      << "  metadata_log_path: " << chi_test_data_dir() + "/blob_replicas_meta.log" << "\n";
+    cfg.config_ = y.str();
+  }
+
+  clio::run::admin::Client admin_client(clio::run::kAdminPoolId);
+  auto compose = admin_client.AsyncCompose(cfg);
+  compose.Wait();
+  REQUIRE(compose->GetReturnCode() == 0);
+
+  // Read the replica back THROUGH THE RESTORED POOL. Its metadata came from
+  // the snapshot and nowhere else, so a misparsed replica record shows up here
+  // as a lost layout: a non-zero rc or the wrong bytes.
+  clio::cte::core::Client restored(clio::run::PoolId(514, 0));
+  std::vector<char> got;
+  const clio::run::u32 read_rc =
+      GetFrom(&restored, tag_id, "restore_blob", &got, 1);
+
+  // Tear the restored pool down BEFORE asserting, so a failing assertion does
+  // not leave a stray pool composed for the tests that follow.
+  //
+  // [noleak] on this case: composing a pool builds a container the PoolManager
+  // owns for the PROCESS lifetime -- DestroyPool unregisters it but does not
+  // return its rebuilt metadata image (~96 KB here) to the runtime private
+  // heap, which only ServerFinalize's DestroyAllContainers does. Measured with
+  // -DCLIO_CORE_ENABLE_LEAK_CHECK=ON: the delta is identical with and without
+  // this DestroyPool call, so the tag reflects real runtime-lifetime state
+  // rather than papering over a leak this test could actually release.
+  {
+    clio::run::admin::Client admin_cleanup(clio::run::kAdminPoolId);
+    auto destroy = admin_cleanup.AsyncDestroyPool(clio::run::PoolQuery::Local(),
+                                                  clio::run::PoolId(514, 0));
+    destroy.Wait();
+  }
+
+  REQUIRE(read_rc == 0);
+  REQUIRE(got.size() == kValSize);
   REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
 }
 

@@ -679,10 +679,27 @@ class ClioGvWorkload(Application):
                 opt('--ckpt-dir', 'ckpt_dir')
             if var == 'paged':
                 opt('--page-kb', 'page_kb')
-                # --vram-mb is GONE (per-block caches no longer exist; one
-                # shared cache per vector, sized for residency). The
-                # sweepable cache knob is --slots for the x/v caches; the
-                # neighbor-list cache is residency-sized by design.
+                # TWO CACHE KNOBS, AND THEY ARE NOT INTERCHANGEABLE.
+                #
+                # --slots sets the x/v frame count DIRECTLY, per block.
+                # --vram-mb hands the bench a TOTAL byte budget and lets its
+                # own planner divide it across x, v, f and the neighbour
+                # list, honouring the measured per-vector floors (kAtomFloor
+                # 24 frames, and 3/4 of rows-per-block above that). Those
+                # floors are why a residency sweep must go through the
+                # budget: --slots 16 at 16 blocks is BELOW the floor and the
+                # cell crashes rather than reporting a small cache
+                # (job 21721*, dist2_md_ooc row 0: blocks=16 slots=16 ->
+                # completed=0 crashed=1, while blocks=4 slots=40 passed).
+                #
+                # A previous edition of this comment said --vram-mb was
+                # "GONE". It is not: the paged bench still parses it and
+                # PlanCaches() is driven by it. Only the per-block-cache
+                # MODEL changed, not the flag.
+                #
+                # vram_mb=0 is the bench's own "size for residency" default
+                # and is what the 100% rung of a residency sweep wants.
+                opt('--vram-mb', 'vram_mb')
                 if c['slots']:
                     a.append('--slots %d' % c['slots'])
         elif wl == 'gmx':
@@ -954,10 +971,23 @@ class ClioGvWorkload(Application):
         # The resolved axis values, so a combined sweep's CSV carries the
         # concrete settings next to the abstract levels.
         stats['blocks_resolved'] = c.get('blocks') or 0
-        if c.get('slots') and not c.get('cache_mb'):
+        # THE CACHE RUNG MUST LAND IN THE CSV UNDER ITS OWN SPELLING.
+        # A residency sweep whose rows all say the same thing (or nothing)
+        # is not a sweep -- lammps_md's budget rung in particular is
+        # invisible unless vram_mb is named here, and its 100% rung is
+        # vram_mb=0, the bench's "size for residency" sentinel, which is
+        # FALSY and would otherwise print as a blank cell rather than as
+        # the resident reference point it is.
+        if c.get('cap'):
+            stats['cache_setting'] = 'cap_pages=%d' % c['cap']
+        elif c.get('vram_mb'):
+            stats['cache_setting'] = 'vram_mb=%d' % c['vram_mb']
+        elif c.get('slots') and not c.get('cache_mb'):
             stats['cache_setting'] = 'slots=%d' % c['slots']
         elif c.get('cache_mb'):
             stats['cache_setting'] = 'cache_mb=%d' % c['cache_mb']
+        elif c['workload'] == 'lammps_md' and c['variant'] == 'paged':
+            stats['cache_setting'] = 'vram_mb=0 (bench-sized, resident)'
         out = self._output_file()
         # VRAM peak (empirical, nvidia-smi): "<peak> <baseline>".
         try:
@@ -985,8 +1015,17 @@ class ClioGvWorkload(Application):
         if wl == 'lammps_md':
             gates = re.findall(r'(?:NVE|BALLISTIC|STATICS|RESORT) GATE: '
                                r'(PASS|FAIL)', text)
+            # THE TERMINAL GATE HAS TO BE THERE, not just some gate.
+            # STATICS and RESORT both print BEFORE the integration loop, so
+            # a run that dies in the force pass still leaves `STATICS GATE:
+            # PASS` in the log and every "all gates are PASS" test above
+            # passes vacuously. Measured on job 21718877: both nodes aborted
+            # with `DEVICE FATAL 5 (AllocatePage: set full)` and the cell
+            # landed completed=1 gates_pass=1 nodes_finished=2. NVE is the
+            # gate that only exists once the steps actually ran.
             stats['gates_pass'] = int(bool(gates) and
-                                      all(g == 'PASS' for g in gates))
+                                      all(g == 'PASS' for g in gates) and
+                                      'NVE GATE:' in text)
         else:
             stats['gates_pass'] = int(any(m in text
                                           for m in self._GATE_MARKS))
@@ -1054,6 +1093,20 @@ class ClioGvWorkload(Application):
             if ok < n:
                 stats['completed'] = 0
                 stats['gates_pass'] = 0
+
+        # A CRASH IS NOT A PASS. Every gate test above asks whether a
+        # marker is PRESENT, so a run that printed an early marker and then
+        # died reads as clean -- and the per-node veto below does not catch
+        # it either, because that same early marker satisfies `fin`. These
+        # four signatures are terminal by construction: the device-side
+        # abort path, libstdc++'s terminate, a CUDA fatal, and a segfault.
+        # Applied LAST so neither the clean-counters fallback nor anything
+        # else can undo it.
+        if any(sig in text for sig in ('DEVICE FATAL', 'terminate called',
+                                       'CUDA Error', 'Segmentation fault')):
+            stats['completed'] = 0
+            stats['gates_pass'] = 0
+            stats['crashed'] = 1
 
         def grab(pattern, key, cast=float, last=True):
             ms = re.findall(pattern, text)

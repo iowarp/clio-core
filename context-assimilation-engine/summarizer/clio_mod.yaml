@@ -1,0 +1,24 @@
+# Summarizer ChiMod — the transparent LLM summarization layer that used to
+# live inside clio_cae_core. An INTERPOSER on the CTE core's task interface:
+# it speaks the core's vocabulary, forwards every core verb to `next_pool_id`
+# verbatim, and additionally runs a configured summarization prompt over the
+# payload of each matching kPutBlob, storing the model's response as
+# `{blob_name}_label` in the same tag.
+#
+# NOTE: like the other interposers (cte cache / replication / indexer) this
+# module is deliberately NOT listed in clio_repo.yaml. `clio_run repo refresh`
+# would regenerate autogen/ with a plain switch and no default-case
+# forwarding, which is exactly the interposition behavior this module needs.
+# autogen/summarizer_methods.h and src/autogen/summarizer_lib_exec.cc are
+# hand-maintained to match this file.
+module_name: summarizer
+namespace: clio::cae
+version: 1.0.0
+
+kCreate: 0
+kDestroy: 1
+kMonitor: 9
+
+# Interposed core verb (MUST equal clio::cte::core::Method::kPutBlob). Every
+# other core method reaches the chain below through the dispatch defaults.
+kPutBlob: 15

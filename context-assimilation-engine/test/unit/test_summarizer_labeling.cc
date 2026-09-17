@@ -6,14 +6,15 @@
  */
 
 /**
- * CAE Transparent Labeling Integration Test
+ * Summarizer Transparent Labeling Integration Test
  *
- * Brings up CAE at pool 512.0 with labeling rules pointing at a local
+ * Brings up the summarizer at pool 401.0 (behind the CAE core entrypoint
+ * at 512.0) with rules pointing at a local
  * Ollama instance (assumed running at http://127.0.0.1:11434 with the
  * "gemma3:1b" model pulled). Two scenarios:
  *
  *   1. Small blob, large context_length — single LLM call, label stored.
- *   2. Larger blob, tiny context_length (512 tokens) — CAE chunks the
+ *   2. Larger blob, tiny context_length (512 tokens) — the summarizer chunks the
  *      blob, summarizes every chunk, concatenates the per-chunk
  *      responses, and stores the result as one label blob.
  *
@@ -59,7 +60,7 @@ void EnsureClio() {
   static bool s_initialized = false;
   if (s_initialized) return;
   fs::path config_path = fs::path(__FILE__).parent_path() /
-                          "test_cae_labeling_config.yaml";
+                          "test_summarizer_labeling_config.yaml";
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
   bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer);
   REQUIRE(success);
@@ -73,7 +74,7 @@ void EnsureClio() {
 /**
  * Poll for `{blob_name}_label` until it appears (up to `attempts`
  * 2-second poll cycles) and return its contents. The label is written
- * synchronously inside the CAE PutBlob handler, but we still poll to
+ * synchronously inside the summarizer PutBlob handler, but we still poll to
  * tolerate slightly-delayed scheduling on busy CI boxes.
  */
 std::string WaitForLabel(clio::cte::core::Client *cte_client,
@@ -104,8 +105,8 @@ std::string WaitForLabel(clio::cte::core::Client *cte_client,
 
 }  // namespace
 
-TEST_CASE("CAE transparent labeling via Ollama writes {name}_label",
-          "[cae][labeling][ollama]") {
+TEST_CASE("Summarizer transparent labeling via Ollama writes {name}_label",
+          "[cae][summarizer][labeling][ollama]") {
   if (ShouldSkip()) {
     INFO("CAE_LABEL_TEST_SKIP=1 set; skipping");
     return;
@@ -149,8 +150,8 @@ TEST_CASE("CAE transparent labeling via Ollama writes {name}_label",
   INFO("Generated label: " + label);
 }
 
-TEST_CASE("CAE transparent labeling chunks oversized blobs",
-          "[cae][labeling][ollama][chunking]") {
+TEST_CASE("Summarizer transparent labeling chunks oversized blobs",
+          "[cae][summarizer][labeling][ollama][chunking]") {
   if (ShouldSkip()) {
     INFO("CAE_LABEL_TEST_SKIP=1 set; skipping");
     return;
@@ -159,7 +160,7 @@ TEST_CASE("CAE transparent labeling chunks oversized blobs",
   auto *cte_client = CLIO_CTE_CLIENT;
 
   // ".chunked" tag → YAML rule with context_length=512. Chunking math
-  // in CAE::PutBlob reserves ~25% of context for the prompt+response
+  // in Summarizer::PutBlob reserves ~25% of context for the prompt+response
   // and assumes ~3 bytes/token, so the effective per-chunk budget is
   // ~512 * 0.75 * 3 ≈ 1150 bytes minus prompt size (~80 bytes) ≈ 1070.
   // Build a ~5 KB body of three distinct paragraphs so we get 4+

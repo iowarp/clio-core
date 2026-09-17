@@ -31,6 +31,12 @@ set(STREAMING_TEST_SOURCES
   test_streaming.cc
 )
 
+# Collective (AllReduce / Barrier) test executable
+set(COLLECTIVE_TEST_TARGET clio_run_collective_tests)
+set(COLLECTIVE_TEST_SOURCES
+  test_collectives.cc
+)
+
 # GPU client-process / submission / queue-stress / parallelism tests
 # removed along with the GPU runtime concept.
 
@@ -177,6 +183,34 @@ set_target_properties(${STREAMING_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Create Collective test executable
+add_executable(${COLLECTIVE_TEST_TARGET} ${COLLECTIVE_TEST_SOURCES})
+
+target_include_directories(${COLLECTIVE_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/modules/admin/include  # For admin tasks
+  ${CLIO_RUN_ROOT}/modules/MOD_NAME/include  # For MOD_NAME tasks and client
+)
+
+target_link_libraries(${COLLECTIVE_TEST_TARGET}
+  clio_admin_runtime          # Admin module runtime
+  clio_admin_client           # Admin module client
+  clio_MOD_NAME_runtime       # MOD_NAME module runtime for collective tasks
+  clio_MOD_NAME_client        # MOD_NAME module client
+  ctp::cxx                       # ClioCtp library
+  ${CMAKE_THREAD_LIBS_INIT}       # Threading support
+)
+
+set_target_properties(${COLLECTIVE_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${COLLECTIVE_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Enable CTest integration if testing is enabled
 if(CLIO_CORE_ENABLE_TESTS)
   # Each binary is registered once and runs all its Catch2 sections in a single
@@ -207,11 +241,21 @@ if(CLIO_CORE_ENABLE_TESTS)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
 
+  # Single-node coverage for the MOD_NAME collectives. The multi-node behaviour
+  # needs a cluster and lives in the collective_bench docker test; this covers
+  # the task types, the generated aggregate paths and the BatchManager cycle.
+  add_test(
+    NAME cr_all_collective_tests
+    COMMAND ${COLLECTIVE_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+
   set_tests_properties(
     cr_all_flush_tests
     cr_all_comutex_tests
     cr_all_wait_functionality_tests
     cr_all_streaming_tests
+    cr_all_collective_tests
     PROPERTIES
       TIMEOUT 300
       ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"

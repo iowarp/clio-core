@@ -70,6 +70,13 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       const auto &task_infos = archive.GetTaskInfos();
       if (task_infos.empty()) {
         HLOG(kError, "IpcCpu2CpuZmq::RecvIn: No task_infos in message");
+        // Nothing took ownership of the received bulks, so release them here.
+        // The ClearRecvHandles below is reached only on the success path; a
+        // message abandoned here or at the missing-container check kept its
+        // transport-allocated payload forever (LeakSanitizer: 1 MB per
+        // inbound bulk in cr_shutdown_bt_transports, where a client's last
+        // request arrives after its pool's container is already destroyed).
+        transport->ClearRecvHandles(archive);
         continue;
       }
 
@@ -82,6 +89,9 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       if (!container) {
         HLOG(kError, "IpcCpu2CpuZmq::RecvIn: Container not found "
              "for pool_id {}", pool_id);
+        // No AllocLoadTask ran, so the bulks are still transport-owned; see
+        // the note above.
+        transport->ClearRecvHandles(archive);
         continue;
       }
 

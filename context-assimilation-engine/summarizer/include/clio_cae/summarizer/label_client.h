@@ -5,12 +5,12 @@
  * BSD 3-Clause License. See LICENSE file.
  */
 
-#ifndef CLIO_CAE_CORE_LABEL_CLIENT_H_
-#define CLIO_CAE_CORE_LABEL_CLIENT_H_
+#ifndef CLIO_CAE_SUMMARIZER_LABEL_CLIENT_H_
+#define CLIO_CAE_SUMMARIZER_LABEL_CLIENT_H_
 
 #include <string>
 
-namespace clio::cae::core {
+namespace clio::cae::summarizer {
 
 /**
  * Synchronously call an Ollama-compatible /api/generate endpoint and
@@ -50,6 +50,6 @@ bool OllamaGenerate(const std::string &endpoint_base,
                     int num_predict,
                     std::string &out_response);
 
-}  // namespace clio::cae::core
+}  // namespace clio::cae::summarizer
 
-#endif  // CLIO_CAE_CORE_LABEL_CLIENT_H_
+#endif  // CLIO_CAE_SUMMARIZER_LABEL_CLIENT_H_

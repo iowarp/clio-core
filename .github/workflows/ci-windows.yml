@@ -114,10 +114,30 @@ jobs:
             Write-Host "Could not add Defender exclusions (continuing): $_"
           }
       - name: Bootstrap vcpkg
+        shell: pwsh
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
-          git pull
-          .\bootstrap-vcpkg.bat
+          # bootstrap-vcpkg downloads vcpkg.exe from the vcpkg-tool GitHub
+          # release, and that download intermittently dies with a WinHttp
+          # connection error -- seen on dev as
+          #   WinHttpReceiveResponse got error 0x00002EFE
+          #   Downloading vcpkg.exe failed. Please check your internet connection
+          # which failed a whole push build on windows-2022 with nothing wrong
+          # in the tree. Retry with a backoff; `git pull` is a network call
+          # too, so it retries alongside.
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            git pull
+            .\bootstrap-vcpkg.bat
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            $delay = $i * 15
+            Write-Host "bootstrap-vcpkg attempt $i failed (exit $LASTEXITCODE); retry in ${delay}s"
+            Start-Sleep -Seconds $delay
+          }
+          if (-not $ok) {
+            Write-Error "bootstrap-vcpkg failed after 5 attempts"
+            exit 1
+          }
       - name: Configure CMake
         run: |
           cmake -B build -A ${{ matrix.arch }} `
@@ -324,8 +344,27 @@ jobs:
         shell: pwsh
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
-          git pull
-          .\bootstrap-vcpkg.bat
+          # bootstrap-vcpkg downloads vcpkg.exe from the vcpkg-tool GitHub
+          # release, and that download intermittently dies with a WinHttp
+          # connection error -- seen on dev as
+          #   WinHttpReceiveResponse got error 0x00002EFE
+          #   Downloading vcpkg.exe failed. Please check your internet connection
+          # which failed a whole push build on windows-2022 with nothing wrong
+          # in the tree. Retry with a backoff; `git pull` is a network call
+          # too, so it retries alongside.
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            git pull
+            .\bootstrap-vcpkg.bat
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            $delay = $i * 15
+            Write-Host "bootstrap-vcpkg attempt $i failed (exit $LASTEXITCODE); retry in ${delay}s"
+            Start-Sleep -Seconds $delay
+          }
+          if (-not $ok) {
+            Write-Error "bootstrap-vcpkg failed after 5 attempts"
+            exit 1
+          }
       - name: Restore oneAPI cache
         id: cache-oneapi
         uses: actions/cache/restore@v4
@@ -524,10 +563,30 @@ jobs:
             Write-Host "Could not add Defender exclusions (continuing): $_"
           }
       - name: Bootstrap vcpkg
+        shell: pwsh
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
-          git pull
-          .\bootstrap-vcpkg.bat
+          # bootstrap-vcpkg downloads vcpkg.exe from the vcpkg-tool GitHub
+          # release, and that download intermittently dies with a WinHttp
+          # connection error -- seen on dev as
+          #   WinHttpReceiveResponse got error 0x00002EFE
+          #   Downloading vcpkg.exe failed. Please check your internet connection
+          # which failed a whole push build on windows-2022 with nothing wrong
+          # in the tree. Retry with a backoff; `git pull` is a network call
+          # too, so it retries alongside.
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            git pull
+            .\bootstrap-vcpkg.bat
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            $delay = $i * 15
+            Write-Host "bootstrap-vcpkg attempt $i failed (exit $LASTEXITCODE); retry in ${delay}s"
+            Start-Sleep -Seconds $delay
+          }
+          if (-not $ok) {
+            Write-Error "bootstrap-vcpkg failed after 5 attempts"
+            exit 1
+          }
       - name: Configure CMake (Boost backend, vcpkg boost-context feature)
         run: |
           cmake -B build-boost -A ${{ matrix.arch }} `

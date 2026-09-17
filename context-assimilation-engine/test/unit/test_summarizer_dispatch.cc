@@ -6,24 +6,25 @@
  */
 
 /**
- * CAE labeling-dispatch + semantic-search integration test (no Ollama).
+ * Summarizer dispatch + semantic-search integration test (no Ollama).
  *
- * The Ollama-gated tests (test_cae_labeling / test_cae_semantic_search) need a
- * live LLM to assert on real label text. This test instead brings up CAE with
- * label rules whose endpoint points at a dead port, so it exercises the
- * CAE-side dispatch logic that runs BEFORE any HTTP call and never needs a
- * model:
+ * The Ollama-gated tests (test_summarizer_labeling /
+ * test_summarizer_semantic_search) need a live LLM to assert on real summary
+ * text. This test instead brings up the summarizer chimod with rules whose
+ * endpoint points at a dead port, so it exercises the dispatch logic that
+ * runs BEFORE any HTTP call and never needs a model:
  *
- *   - Runtime::PutBlob transparent-labeling branch: FindLabelMatch (including
- *     its std::regex_error catch, a matching rule, and the no-match path),
- *     prompt resolution, chunking, and the graceful OllamaGenerate failure
- *     (label simply isn't produced; the blob PutBlob still succeeds).
- *   - Runtime::SemanticSearch forwarding to the CTE BM25 backend (CAE adds no
- *     LLM logic here — it just forwards), exercising the kSemanticSearch
- *     dispatch path.
+ *   - Runtime::PutBlob summarization branch: tag-name resolution,
+ *     FindLabelMatch (including its std::regex_error catch, a matching rule,
+ *     and the no-match path), prompt resolution, chunking, and the graceful
+ *     OllamaGenerate failure (no summary is produced; the blob PutBlob still
+ *     succeeds).
+ *   - kSemanticSearch forwarding through the interposition default all the
+ *     way to the indexer's BM25 backend — the summarizer adds no logic here,
+ *     it just forwards.
  *
- * Labeling failures must never flip the PutBlob return code, so every PutBlob
- * here is expected to return 0.
+ * Summarization failures must never flip the PutBlob return code, so every
+ * PutBlob here is expected to return 0.
  */
 
 #include "simple_test.h"
@@ -67,10 +68,10 @@ int PutNamedBlob(clio::cte::core::Client *cte_client,
 
 }  // namespace
 
-TEST_CASE("CAE labeling dispatch + semantic search forward",
-          "[cae][labeling][dispatch][semanticsearch]") {
+TEST_CASE("Summarizer dispatch + semantic search forward",
+          "[cae][summarizer][dispatch][semanticsearch]") {
   fs::path config_path = fs::path(__FILE__).parent_path() /
-                         "test_cae_labeling_dispatch_config.yaml";
+                         "test_summarizer_dispatch_config.yaml";
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
 
   bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer);
@@ -80,12 +81,14 @@ TEST_CASE("CAE labeling dispatch + semantic search forward",
   // Let compose pools materialize.
   std::this_thread::sleep_for(1s);
 
-  // Point the CTE client at the entrypoint pool (512.0 = CAE interceptor).
+  // Point the CTE client at the entrypoint pool (512.0 = CAE core, which
+  // forwards through the summarizer at 401.0).
   auto *cte_client = CLIO_CTE_CLIENT;
   cte_client->Init(clio::cte::core::kCtePoolId);
 
-  // GetOrCreateTag first so CAE caches tag_id -> "label_tag" for the PutBlob
-  // labeling lookup. The tag name matches the second label rule's tag_re.
+  // Create the tag the rules match on. The summarizer resolves tag_id ->
+  // "label_tag" via GetTagName down the chain when the PutBlob arrives; the
+  // name matches the second rule's tag_re.
   auto tag_task = cte_client->AsyncGetOrCreateTag("label_tag");
   tag_task.Wait();
   REQUIRE(tag_task->GetReturnCode() == 0);
@@ -96,15 +99,15 @@ TEST_CASE("CAE labeling dispatch + semantic search forward",
   //    "doc_.*". FindLabelMatch walks past the invalid-regex first rule (its
   //    regex_error is caught), matches the second, resolves the "summarize"
   //    prompt, chunks the payload, and calls OllamaGenerate against the dead
-  //    endpoint — which fails, so no label blob is written. The original blob
-  //    PutBlob must still succeed.
+  //    endpoint — which fails, so no summary blob is written. The original
+  //    blob PutBlob must still succeed.
   REQUIRE(PutNamedBlob(cte_client, tag_id, "doc_alpha") == 0);
 
   // 2. Blob name "misc_beta" does not match "doc_.*", so FindLabelMatch
   //    returns nullptr and PutBlob returns immediately after forwarding.
   REQUIRE(PutNamedBlob(cte_client, tag_id, "misc_beta") == 0);
 
-  // 3. The original blob is intact despite the labeling attempt.
+  // 3. The original blob is intact despite the summarization attempt.
   {
     const size_t data_size = 2048;
     auto get_buffer = CLIO_IPC->AllocateBuffer(data_size);
@@ -119,9 +122,10 @@ TEST_CASE("CAE labeling dispatch + semantic search forward",
     CLIO_IPC->FreeBuffer(get_buffer);
   }
 
-  // 4. SemanticSearch through CAE forwards to the CTE BM25 backend (no LLM).
-  //    Run locally against the entrypoint pool; a well-formed query must
-  //    return rc 0 regardless of how many blobs match.
+  // 4. SemanticSearch forwards through CAE and the summarizer to the
+  //    indexer's BM25 backend (no LLM). Run locally against the entrypoint
+  //    pool; a well-formed query must return rc 0 regardless of how many
+  //    blobs match.
   auto search_task = cte_client->AsyncSemanticSearch(
       "label_tag", "doc_.*", "alpha document", 5, clio::run::PoolQuery::Local());
   search_task.Wait();

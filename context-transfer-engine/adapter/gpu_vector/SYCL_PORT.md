@@ -73,8 +73,13 @@ So the SYCL side is two files:
 The same rule bit the runtime: `gpu2cpu_init_sycl.cc` had its kernel inside
 `#if CTP_IS_HOST`, so no device code was emitted for it and the host pass
 then submitted a kernel the runtime had never heard of --
-`Assertion 'It != m_DeviceKernelInfoMap.end()'`. The kernel is now hoisted
-into a function that touches no host-only state.
+`Assertion 'It != m_DeviceKernelInfoMap.end()'`. The kernel was hoisted into a
+function that touches no host-only state, and has since been removed
+altogether: dev builds the `GpuTaskQueue` on the HOST, because the allocator's
+`ctp::Mutex` is a device-side atomic RMW against host USM and Ponte Vecchio
+supports that at no memory scope (`usm_atomic_host_allocations == 0`), which
+killed every runtime start on Aurora. Host construction needs no device atomic,
+so that TU now contains no kernel and the rule no longer applies to it.
 
 ## Bugs this found in the existing SYCL path
 

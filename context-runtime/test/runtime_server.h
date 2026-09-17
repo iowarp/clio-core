@@ -232,6 +232,43 @@ class RuntimeServer {
            std::string::npos;
   }
 
+  /**
+   * Tail of the daemon's captured stdout/stderr, for failure messages.
+   *
+   * A daemon that dies of an abort — uncaught exception ("libc++abi:
+   * terminating with ..."), a libzmq assertion, malloc corruption — says WHY on
+   * stderr and nowhere else. That stderr is this log file, which lives in the
+   * runner's temp dir and dies with the runner: CI keeps only the ctest output,
+   * so a test that reports "exit code 134" and nothing else is unfixable from a
+   * CI log. Folding the tail into the failing assertion is what makes such a
+   * death diagnosable after the fact.
+   *
+   * The log is truncated on every Start(), so this is the current cycle's
+   * daemon only. Reads at most the last 64 KiB (the first line of that window
+   * may be partial).
+   * @param max_lines how many trailing lines to return
+   */
+  static std::string LogTail(size_t max_lines = 40) {
+    const std::string path = ServerLogPath();
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) return "(daemon log " + path + " not readable)";
+    const std::streamoff size = f.tellg();
+    constexpr std::streamoff kMaxBytes = 64 * 1024;
+    f.seekg(size > kMaxBytes ? size - kMaxBytes : 0);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(f, line)) lines.push_back(line);
+    if (lines.empty()) return "(daemon log " + path + " is empty)";
+    const size_t start =
+        lines.size() > max_lines ? lines.size() - max_lines : 0;
+    std::string out = "---- last " + std::to_string(lines.size() - start) +
+                      " line(s) of " + path + " ----\n";
+    for (size_t i = start; i < lines.size(); ++i) {
+      out += "    | " + lines[i] + "\n";
+    }
+    return out;
+  }
+
   /** Stop the daemon (SIGTERM then SIGKILL on POSIX — so ServerFinalize's leak
    *  report runs; TerminateProcess on Windows) and reap it. Idempotent; called
    *  by the destructor. */

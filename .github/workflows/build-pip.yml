@@ -187,7 +187,7 @@ jobs:
     # test job, far from the cause (#1004).
     - name: Install WinFsp (FUSE adapter SDK)
       run: |
-        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 -- choco install winfsp -y --no-progress
+        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
         if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
           throw "WinFsp SDK missing after the install succeeded -- failing HERE instead of shipping a wheel without the FUSE adapter (#1004)"
         }
@@ -378,13 +378,25 @@ jobs:
     - name: Checkout repository (for test script)
       uses: actions/checkout@v4
       with:
-        sparse-checkout: installers/pip
+        # CI/ as well as installers/pip: the image pull below goes through
+        # CI/retry.sh, which has to exist in the workspace.
+        sparse-checkout: |
+          installers/pip
+          CI
 
     - name: Download wheels
       uses: actions/download-artifact@v4
       with:
         name: wheels-${{ matrix.arch }}
         path: wheels/
+
+    # Pull with retry BEFORE the run. A registry hiccup makes `docker run`
+    # exit 125 -- "Error response from daemon: Get
+    # https://registry-1.docker.io/v2/..." -- which reads as a wheel failure
+    # but is Docker Hub being briefly unreachable. Pulling separately keeps the
+    # retry on the network step and off the test itself.
+    - name: Pull ${{ matrix.distro }}
+      run: bash CI/retry.sh docker pull ${{ matrix.distro }}
 
     - name: Test wheel in ${{ matrix.distro }}
       run: |
@@ -404,12 +416,33 @@ jobs:
               # AppStream module and put it ahead of the stock interpreter so
               # the venv below matches a wheel we actually ship. Newer distros
               # fall through to their default python3.
-              if dnf install -y -q python3.12 python3.12-pip >/dev/null 2>&1; then
+              #
+              # The expat package is not a typo and not optional. The
+              # rockylinux:8 base image ships expat 2.2.5, but the current
+              # python3.12-3.12.14-1.el8_10
+              # (built 2026-08-24) links pyexpat against 2.4+ symbols, so
+              # importing pyexpat dies with:
+              #   undefined symbol: XML_SetBillionLaughsAttackProtection...
+              # pip imports it, so ensurepip fails and python3 -m venv
+              # aborts -- which is how this arrived, as every test-wheels leg
+              # going red overnight with no change on our side. Naming expat
+              # explicitly upgrades it to 2.5.0 alongside the interpreter.
+              #
+              # NOTE: this whole block is the body of a bash -c single-quoted
+              # string, so no apostrophe may appear anywhere in it, comments
+              # included -- one would close the string and truncate the script
+              # for every distro in the matrix, not just this branch.
+              if dnf install -y -q python3.12 python3.12-pip expat >/dev/null 2>&1; then
                 ln -sf /usr/bin/python3.12 /usr/local/bin/python3
               else
-                dnf install -y -q python3 python3-pip >/dev/null 2>&1
+                dnf install -y -q python3 python3-pip expat >/dev/null 2>&1
               fi
             fi
+
+            # Fail loudly here rather than 20 lines down. Both branches above
+            # swallow their output, so a broken interpreter used to surface as
+            # an opaque ensurepip traceback from the venv step.
+            python3 -c "import pyexpat, ssl, sys; print(\"interpreter OK:\", sys.version)"
 
             # Create clean venv
             python3 -m venv /tmp/test-venv
@@ -638,6 +671,17 @@ jobs:
     timeout-minutes: 30
 
     steps:
+    # FIRST step on purpose: actions/checkout cleans the workspace, so running
+    # it after download-artifact deletes the very artifact this job tests
+    # ("Cannot find path ...\\wheels because it does not exist"). Sparse
+    # because the job needs only the retry helper, not the tree -- without a
+    # checkout at all the helper is absent and the step dies with "The argument
+    # 'CI/Retry.ps1' is not recognized as the name of a script file".
+    - name: Check out CI helpers
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -653,7 +697,7 @@ jobs:
     # install this from winfsp.dev. The DLL lives under
     # %ProgramFiles(x86)%\WinFsp\bin, which is not on PATH by default.
     - name: Install WinFsp (FUSE adapter runtime)
-      run: pwsh CI/Retry.ps1 -- choco install winfsp -y --no-progress
+      run: pwsh CI/Retry.ps1 choco install winfsp -y --no-progress
 
     - name: Test wheel in clean venv
       shell: pwsh

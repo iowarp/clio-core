@@ -3293,6 +3293,31 @@ class Client : public clio::run::ContainerClient {
    * @param blob_name Name of the blob
    * @param pool_query Pool query for task routing (default: Dynamic)
    */
+  /**
+   * Ask whether a byte range of a blob is physically present in the tier.
+   *
+   * Metadata only — it moves no payload, so it is far cheaper than the read
+   * it lets a caller avoid. The intended shape is: try the shared-memory
+   * path, and on a miss ask this rather than abandoning the whole request,
+   * because a miss in the SHM mirror does not distinguish a hole (zeros are
+   * correct) from bytes that exist but are only reachable by RPC.
+   *
+   * @param tag_id Tag owning the blob
+   * @param blob_name Blob name
+   * @param offset Start of the range of interest
+   * @param size Length of the range; 0 means "to the end of the blob"
+   */
+  clio::run::Future<GetResidencyTask> AsyncGetResidency(
+      const TagId &tag_id, const std::string &blob_name,
+      clio::run::u64 offset = 0, clio::run::u64 size = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetResidencyTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size);
+    return ipc_manager->Send(task);
+  }
+
   clio::run::Future<DelBlobTask> AsyncDelBlob(
       const TagId &tag_id,
       const std::string &blob_name,

@@ -1,0 +1,189 @@
+# lammps_md, PAGED, 2 NODES: RESIDENCY CALIBRATION -- RUN THIS BEFORE THE SWEEP.
+#
+#   1 cell. This file does NOT collect the 5-rung curve; it produces the
+#   number the curve has to be written in.
+#
+# WHY THIS ONE WORKLOAD NEEDS A CALIBRATION STEP AND THE OTHER FIVE DO NOT.
+# kmeans, weights, grayscott, gmx and lbann all take a cache size the
+# harness can compute from the deck: so many MB, or so many pages, out of a
+# per-node deck whose size is known from --data-mb or from K. A residency
+# ladder is then plain arithmetic and the YAML can carry it.
+#
+# lammps_md does not work that way. Its cache is not one number, it is a
+# PLAN: --vram-mb hands the bench a total byte budget and PlanCaches()
+# divides it across FOUR caches (x, v, f and the neighbour list), honouring
+# per-vector floors that are MEASURED rather than derived --
+#
+#     kAtomFloor      24 frames
+#     scaled floor    3/4 of rows-per-block, applied to x, v and f
+#     nl_floor        kNlLiveBytes worth of list pages
+#
+# -- and the floors scale with rows-per-block, i.e. with the block count.
+# So "10% of residency" is 10% of a number only the bench can compute, and
+# a budget below the floor is REFUSED (PlanCaches returns false: "--vram-mb
+# N is below the floor: B blocks needs M MB minimum for the pinned frames
+# alone"), not run small.
+#
+# GUESSING THAT NUMBER HAS ALREADY COST A CELL. In gv_dist2_md_ooc_a100
+# the blocks=16 / --slots 16 cell came back completed=0, crashed=1, while
+# blocks=4 / --slots 40 passed its gates with faults=12028. 16 frames was
+# under the measured 40-frame minimum at 16 blocks, and the failure mode
+# was a crash, not a slow cell. The bench's own source says the same thing
+# in as many words: "sizing v and f by that crashed: 16 frames fails, 24
+# passes. Guessing a floor from the guard count has now been wrong twice."
+#
+# SO: ASK THE BENCH. --vram-mb unset is the bench's "size for residency"
+# default; it computes the full-residency budget, prints it, and runs. This
+# cell captures that print. The post block then does the arithmetic and
+# emits the exact `wl.vram_mb` list for the sweep file.
+#
+# NOTE ON THE PKG: --vram-mb was being dropped before this change. The pkg
+# comment claimed the flag was "GONE (per-block caches no longer exist)",
+# but the paged bench still parses it at clio_lammps_md_paged_bench.cc:706
+# and PlanCaches() is driven by it -- only the cache MODEL changed, not the
+# flag. The lammps_md paged branch of ClioGvWorkload._args now emits it.
+#
+# GEOMETRY IS THE VALIDATED ONE, NOT THE ANCHOR'S. lattice 108 -> nb=64,
+# which is the configuration that actually ran clean at 2 nodes in
+# gv_dist2_halfcache_a100 (5279 ms, gates passed). nb MUST be a multiple of
+# 32 at a 256 KB page: a z-plane is nb^2 * 512 B and the slab seam has to
+# land on a page boundary, or a halo refresh overwrites this node's own
+# live elements and the run is quietly WRONG rather than failing.
+#
+# 128 BLOCKS. Blocks here stride nb^2 = 4096 bin-columns, not z-planes, so
+# the block count is not capped at 32 the way a reading of the halfcache
+# header suggests -- rows-per-block is 4096/128 = 32 and the scaled floor
+# is max(24, 24) = 24 frames. This is the value to change if the calibration
+# below reports a floor that eats the whole budget.
+#
+# Submit:  jarvis ppl submit gv_cache_lammps_md_a100.yaml
+# THEN:    read the emitted vram_mb ladder out of the post block's output
+#          and write gv_cache_lammps_md_sweep_a100.yaml with it.
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 60g
+  gpus_per_node: 1
+  time: "00:30:00"
+  job_name: gv_cache_md_cal
+  output: /u/llogan/gv_job_logs/gv_cache_md_cal-%j.out
+  error: /u/llogan/gv_job_logs/gv_cache_md_cal-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "scontrol show hostnames \"$SLURM_JOB_NODELIST\""
+    - "srun -N 2 --ntasks-per-node=1 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+config:
+  name: gv_cache_lammps_md_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: lammps_md
+      variant: paged
+      nodes: 2
+      node_launcher: "srun -N {n} --ntasks-per-node=1 --gpus-per-node=1"
+      hostfile: /u/llogan/.ppi-jarvis/shared/gv_cache_lammps_md_a100/hostfile.txt
+      cluster_port: 9443
+      blocks: 128
+      threads: 256
+      lattice: 108         # nb=64; MUST stay a multiple of 32 at a 256 KB page
+      page_kb: 256
+      steps: 8
+      ckpt: 0              # checkpoints are a different experiment
+      ram_mb: 16384
+      nvme_mb: 0
+      prefault: "0"
+      timeout_sec: 1500
+      barrier_sec: 300
+      output_dir: /tmp/clio_gv/cache_lammps_md
+
+vars:
+  # THE CALIBRATION CELL. 0 is the bench's "size every cache for residency"
+  # sentinel -- it is NOT "no cache". This is the 100% rung of the eventual
+  # ladder as well as the measurement of what 100% costs.
+  wl.vram_mb: [0]
+
+loop:
+  - [wl.vram_mb]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/cache_lammps_md"
+
+post: |
+  import pandas as pd, os, re, glob
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  pd.set_option('display.width', 240)
+
+  cols = [c for c in ['wl.vram_mb', 'cache_setting', 'blocks_resolved',
+                      'nodes', 'nodes_finished', 'completed', 'gates_pass',
+                      'crashed', 'bench_ms', 'ms_per_step', 'matom_steps_s',
+                      'steps_run', 'runtime', 'vram_peak_mb', 'faults',
+                      'evicts', 'get_errors', 'put_errors']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+
+  if df.get('completed', pd.Series([0])).iloc[0] != 1:
+      logger.warning('THE CALIBRATION CELL DID NOT COMPLETE. There is no '
+                     'residency budget to derive a ladder from, so do NOT '
+                     'write the sweep file yet. Check the node logs under '
+                     '~/.ppi-jarvis/shared/gv_cache_lammps_md_a100*/wl/'
+                     'gvw_dist/*.node0.log -- if PlanCaches refused, it says '
+                     'so on one line with the minimum it wanted.')
+
+  # THE POINT OF THIS PIPELINE: recover the bench's own residency budget.
+  # It prints one of two shapes depending on which path it took:
+  #   "budget N MB: x <slots> (of <npages> resident), v .., f .., list .."
+  #   "note: full residency needs N MB over B blocks but ..."
+  budget = None
+  pat = [re.compile(r'full residency needs\s+(\d+)\s*MB'),
+         re.compile(r'budget\s+(\d+)\s*MB'),
+         re.compile(r'caches use\s+(\d+)\s*MB')]
+  logs = sorted(glob.glob(os.path.expanduser(
+      '~/.ppi-jarvis/shared/gv_cache_lammps_md_a100*/wl/gvw_dist/*.node*.log')))
+  for lg in logs:
+      try:
+          txt = open(lg, errors='replace').read()
+      except OSError:
+          continue
+      for p in pat:
+          m = p.search(txt)
+          if m:
+              budget = int(m.group(1))
+              logger.info('residency budget found in %s: %d MB'
+                          % (os.path.basename(lg), budget))
+              break
+      if budget:
+          break
+
+  if budget:
+      rungs = [('10%', 0.10), ('25%', 0.25), ('50%', 0.50),
+               ('80%', 0.80), ('100%', 1.00)]
+      vals = []
+      for name, f in rungs:
+          # The 100% rung stays 0 -- the bench's own residency sizing -- so
+          # it is measured the same way it was calibrated rather than by a
+          # rounded MB figure that might land a frame short.
+          vals.append(0 if f == 1.00 else int(round(budget * f)))
+      logger.info('\nPASTE THIS INTO gv_cache_lammps_md_sweep_a100.yaml:\n'
+                  '  # residency budget measured at %d MB over 128 blocks\n'
+                  '  wl.vram_mb: [%s]   # 10/25/50/80/100%%  (0 == resident)\n'
+                  % (budget, ', '.join(str(v) for v in vals)))
+      logger.warning('BEFORE SUBMITTING THAT SWEEP: the tight rungs may sit '
+                     'BELOW the PlanCaches floor, which is a REFUSAL, not a '
+                     'small cache. If a rung comes back completed=0 with a '
+                     'near-zero runtime, raise it or drop `blocks` -- the '
+                     'floor scales with rows-per-block.')
+  else:
+      logger.warning('could not find a residency budget line in any node log '
+                     '(looked for "full residency needs N MB", "budget N MB", '
+                     '"caches use N MB"). Read the log by hand: the ladder '
+                     'cannot be written without this number, and GUESSING IT '
+                     'IS WHAT CRASHED THE blocks=16/slots=16 CELL IN '
+                     'gv_dist2_md_ooc.')
+      for lg in logs[:2]:
+          logger.info('  node log: %s' % lg)

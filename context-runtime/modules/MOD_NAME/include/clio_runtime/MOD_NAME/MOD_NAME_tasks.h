@@ -263,6 +263,126 @@ struct ManyToOneSumTask : public clio::run::Task {
 };
 
 /**
+ * AllReduceTask - the MPI_Allreduce(MPI_SUM) analogue for PoolQuery::AllToOne.
+ *
+ * Each participant contributes value_. Routed AllToOne, the neighborhood leader
+ * holds the batch until a task from EVERY container in the pool has arrived,
+ * folds them into one aggregate via AggregateIn (summing value_), runs it once,
+ * and broadcasts sum_ back to every participant. That is exactly allreduce
+ * semantics: all contribute, all observe the same combined result, and nobody
+ * returns before everybody has contributed.
+ *
+ * Distinct from ManyToOneSumTask, which is the same arithmetic on the
+ * *time-windowed* ManyToOne path; this one exists to be benchmarked head-to-head
+ * against MPI_Allreduce, so it carries no test-only baggage.
+ */
+struct AllReduceTask : public clio::run::Task {
+  IN clio::run::u64 value_;  // this participant's contribution
+  OUT clio::run::u64 sum_;   // collective total (broadcast to all participants)
+
+  /** SHM default constructor */
+  AllReduceTask() : clio::run::Task(), value_(0), sum_(0) {}
+
+  /** Emplace constructor */
+  explicit AllReduceTask(const clio::run::TaskId &task_node,
+                         const clio::run::PoolId &pool_id,
+                         const clio::run::PoolQuery &pool_query,
+                         clio::run::u64 value)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kAllReduce),
+        value_(value), sum_(0) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kAllReduce;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  CTP_CROSS_FUN ~AllReduceTask() {}
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(value_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(sum_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<AllReduceTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    value_ = other->value_;
+    sum_ = other->sum_;
+  }
+
+  /** AggregateOut: gather replica OUT — sum partial totals (N->1). */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    sum_ += other_base.template Cast<AllReduceTask>()->sum_;
+  }
+
+  /** AggregateIn: fold a batched participant's contribution into this. */
+  void AggregateIn(const ctp::ipc::FullPtr<clio::run::Task> &member_base) {
+    value_ += member_base.template Cast<AllReduceTask>()->value_;
+  }
+};
+
+/**
+ * BarrierTask - the MPI_Barrier analogue for PoolQuery::AllToOne.
+ *
+ * Deliberately payload-free: it measures the cost of the collective machinery
+ * itself (routing to the leader, parking in the BatchManager, the count-based
+ * release, and the 1->N completion broadcast) with no reduction arithmetic and
+ * no data to serialize. AggregateIn/AggregateOut therefore have nothing to
+ * merge; they exist so the generated aggregate paths have a body to call, and
+ * their emptiness is the point rather than an omission.
+ */
+struct BarrierTask : public clio::run::Task {
+  /** SHM default constructor */
+  BarrierTask() : clio::run::Task() {}
+
+  /** Emplace constructor */
+  explicit BarrierTask(const clio::run::TaskId &task_node,
+                       const clio::run::PoolId &pool_id,
+                       const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kBarrier) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kBarrier;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  CTP_CROSS_FUN ~BarrierTask() {}
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<BarrierTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+  }
+
+  /** AggregateOut: no OUT payload to gather; only the base merge applies. */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+  }
+
+  /** AggregateIn: no IN payload to fold — arrival alone is the contribution. */
+  void AggregateIn(const ctp::ipc::FullPtr<clio::run::Task> &member_base) {
+    (void)member_base;
+  }
+};
+
+/**
  * CoMutexTestTask - Test CoMutex functionality
  */
 struct CoMutexTestTask : public clio::run::Task {
