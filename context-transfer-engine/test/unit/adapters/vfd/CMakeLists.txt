@@ -100,6 +100,22 @@ if(CLIO_CORE_ENABLE_TESTS)
     # selections), so without this run the coalescing vector path -- which is
     # still built, and still the path taken by anyone who sets the knob -- would
     # have no coverage at all.
+    # The CTE read tier, which is off by default. Section 25 is the Q2.3
+    # acceptance gate for it (a read spanning resident and non-resident ranges
+    # must match the native file, and a hot re-read must demonstrably come from
+    # the tier). Without this entry the feature has no coverage at all, which is
+    # how it came to serve zero reads unnoticed.
+    add_test(
+        NAME clio_cte_vfd_unit_tests_read_tier
+        COMMAND clio_cte_vfd_unit_tests
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(clio_cte_vfd_unit_tests_read_tier PROPERTIES
+        ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_VFD_READ_TIER=1"
+        RESOURCE_LOCK "clio_runtime"
+        TIMEOUT 300
+        LABELS "msan_skip")
+
     add_test(
         NAME clio_cte_vfd_unit_tests_vector_io
         COMMAND clio_cte_vfd_unit_tests

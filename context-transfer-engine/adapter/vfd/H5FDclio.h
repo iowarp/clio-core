@@ -100,6 +100,13 @@ CLIO_VFD_API extern unsigned long H5FDclio_read_vector_calls_g;
 CLIO_VFD_API extern unsigned long H5FDclio_write_vector_calls_g;
 CLIO_VFD_API extern unsigned long H5FDclio_vec_max_span_g;
 
+/* Read-tier serve accounting. Exported so a test can PROVE a hot re-read came
+   from the tier: a cache that is off and one that never hits return the same
+   bytes with the same status, so correctness assertions alone cannot tell them
+   apart -- which is how the tier came to serve zero reads unnoticed. */
+CLIO_VFD_API extern unsigned long H5FDclio_cache_read_hits_g;
+CLIO_VFD_API extern unsigned long H5FDclio_cache_read_misses_g;
+
 /* H5PLget_plugin_type/H5PLget_plugin_info are declared by <H5PLextern.h>
  * (included above) with H5PLUGIN_DLL. Re-declaring them bare here made the
  * two declarations disagree about linkage, which MSVC rejects outright
