@@ -117,6 +117,13 @@ if [ "$EXPLORE_K" -gt 0 ]; then NP_EXPLORE=true; else NP_EXPLORE=false; fi
 if [ -n "$STATIC_LIB" ]; then NP_LEARN=false; NP_EXPLORE=false; fi
 
 RANK_DIRS=()
+# BENCH_NP_LR / BENCH_NP_MAPE, as in paper-benchmark/lib/compose_hooks.sh.
+np_learning_yaml() {
+  [ -n "${BENCH_NP_LR:-}" ] && printf '\n    neuropress_learning_rate: %s' "$BENCH_NP_LR"
+  [ -n "${BENCH_NP_MAPE:-}" ] && printf '\n    neuropress_mape_threshold: %s' "$BENCH_NP_MAPE"
+  return 0
+}
+
 r=0
 for RPORT in $PORTS; do
   if [ "$RANKS" -eq 1 ]; then RD=$STORE; else RD=$(printf '%s/rank%04d' "$STORE" "$r"); fi
@@ -146,7 +153,7 @@ compose:
     neuropress_online_learning_enabled: $NP_LEARN
     neuropress_exploration_enabled: $NP_EXPLORE
     neuropress_exploration_k: $EXPLORE_K
-    neuropress_exploration_threshold: $THRESH
+    neuropress_exploration_threshold: $THRESH$(np_learning_yaml)
     neuropress_best_mode: $BEST
 ${STATIC_LIB:+    neuropress_static_lib: "$STATIC_LIB"}
 ${STATIC_LIB:+    neuropress_static_shuffle: $STATIC_SHUF}

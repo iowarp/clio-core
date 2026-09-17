@@ -22,6 +22,7 @@
 #                  same measurements scored purely by bytes saved.
 #   explore        ratio-only ranking, top-K alternatives measured, winner kept
 #   best           best mode: exhaustive, ratio-only
+#   baseline       no compression: every chunk stored raw
 #   static-zstd    fixed nvcomp-zstd, no shuffle
 #   static-zstd-s4 fixed nvcomp-zstd + 4-byte shuffle -- the stride matching
 #                  VPIC's float32 fields
@@ -100,12 +101,13 @@ COST_ENV=()
 # rest under the ratio-only ones.
 case "$CONFIG" in
   dynamic|learn|explore-balance) COSTMODEL=balance ;;
-  static-*)                      COSTMODEL=none ;;
+  static-*|baseline)             COSTMODEL=none ;;
   *)                             COSTMODEL=ratio ;;
 esac
 RATIO_ONLY=(CLIO_NEUROPRESS_COST_W_CT=0 CLIO_NEUROPRESS_COST_W_DT=0 CLIO_NEUROPRESS_COST_W_IO=1)
 case "$CONFIG" in
   dynamic)        ;;
+  baseline)       NO_COMPRESS=1 ;;  # figure 9: stored raw, no codec
   dynamic-ratio)  COST_ENV=("${RATIO_ONLY[@]}") ;;
   learn)          NP_LEARN=true ;;
   learn-ratio)    NP_LEARN=true; COST_ENV=("${RATIO_ONLY[@]}") ;;
@@ -207,6 +209,7 @@ ARGS=(--dir "$FIELDS" --ext "$EXT" --chunk "$CHUNK"
 [ "$MAX_FILES" -gt 0 ] && ARGS+=(--max-files "$MAX_FILES")
 [ "$VERIFY" = 1 ]      && ARGS+=(--verify)
 [ "$CHECK_BOUND" = 1 ] && [ "$MODE" = lossy ] && ARGS+=(--check-bound)
+[ "${NO_COMPRESS:-0}" = 1 ] && ARGS+=(--no-compress)
 
 export LD_LIBRARY_PATH="$BUILD/bin:/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 START=$(date +%s.%N)

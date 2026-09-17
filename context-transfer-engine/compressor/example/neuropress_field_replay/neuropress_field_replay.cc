@@ -75,6 +75,7 @@ struct Options {
   // and compares element-wise, which is the only check that actually tests
   // the guarantee the error bound makes.
   bool check_bound = false;
+  bool no_compress = false;  // raw PutBlob/GetBlob, no codec (baseline)
 };
 
 void Usage(const char *argv0) {
@@ -93,6 +94,8 @@ void Usage(const char *argv0) {
       << "  --tag NAME       CTE tag [field_replay]\n"
       << "  --report CSV     per-chunk outcome\n"
       << "  --verify         read every blob back and compare\n"
+      << "  --no-compress    baseline: store every chunk raw with PutBlob, no\n"
+      << "                   codec selection or compression\n"
       << "  --readback CSV   no files: read the blobs a previous run listed\n"
       << "  --dump-decompressed DIR  with --readback, write each decompressed\n"
       << "                   blob to DIR so an EXTERNAL tool can compare it\n"
@@ -120,6 +123,7 @@ bool ParseArgs(int argc, char **argv, Options *o) {
     else if (a == "--check-bound") o->check_bound = true;
     else if (a == "--f64") o->f64 = true;
     else if (a == "--verify") o->verify = true;
+    else if (a == "--no-compress") o->no_compress = true;
     else if (a == "-h" || a == "--help") { Usage(argv[0]); std::exit(0); }
     else { std::cerr << "unknown option " << a << "\n"; Usage(argv[0]); return false; }
   }
@@ -204,6 +208,7 @@ struct BlobRecord {
 
 struct Pending {
   clio::run::Future<clio::cte::compressor::DynamicScheduleTask> fut;
+  clio::run::Future<clio::cte::core::PutBlobTask> put;  // --no-compress
   ctp::ipc::FullPtr<char> buf;
   size_t record;
 };
@@ -265,11 +270,20 @@ int main(int argc, char **argv) {
       auto buf = CLIO_IPC->AllocateBuffer(r.bytes);
       if (buf.IsNull()) { std::cerr << "AllocateBuffer (verify) failed\n"; return false; }
       std::memset(buf.ptr_, 0, r.bytes);
-      auto get = compressor.AsyncDecompressExplicit(
-          clio::run::PoolQuery::Local(), tag_id, r.name, 0, r.bytes, 0,
-          buf.shm_.template Cast<void>(), cte_client->pool_id_);
-      get.Wait();
-      const int rc_get = get->GetReturnCode();
+      int rc_get;
+      if (opt.no_compress) {
+        auto get = cte_client->AsyncGetBlob(
+            tag_id, r.name, 0, r.bytes, 0, buf.shm_.template Cast<void>(),
+            clio::run::PoolQuery::Local());
+        get.Wait();
+        rc_get = get->GetReturnCode();
+      } else {
+        auto get = compressor.AsyncDecompressExplicit(
+            clio::run::PoolQuery::Local(), tag_id, r.name, 0, r.bytes, 0,
+            buf.shm_.template Cast<void>(), cte_client->pool_id_);
+        get.Wait();
+        rc_get = get->GetReturnCode();
+      }
 
       // Which check applies is decided by the error bound, not by a separate
       // flag: under lossy compression the decoded bytes are NOT the input
@@ -339,7 +353,7 @@ int main(int argc, char **argv) {
          original one, so it proves the round trip is self-consistent; writing
          the bytes out lets something else compare them against the
          simulation's own output and remove this program from the loop. */
-      if (!opt.dump_dir.empty() && get->GetReturnCode() == 0) {
+      if (!opt.dump_dir.empty() && rc_get == 0) {
         std::string fn = r.name;
         for (auto &ch : fn) if (ch == '/') ch = '_';
         std::ofstream(opt.dump_dir + "/" + fn + ".bin", std::ios::binary)
@@ -437,12 +451,18 @@ int main(int argc, char **argv) {
   for (const auto &f : files) payload += fs::file_size(f);
 
   const size_t elem = opt.f64 ? 8 : 4;
-  std::cout << "field replay -> Clio compressor, runtime in-process\n"
+  std::cout << (opt.no_compress
+                    ? "field replay -> Clio core, NO compression (baseline), "
+                      "runtime in-process\n"
+                    : "field replay -> Clio compressor, runtime in-process\n")
             << "  " << files.size() << " file(s) under " << opt.dir
             << "  payload=" << payload / 1048576.0 << " MiB  ("
             << (opt.f64 ? "float64" : "float32") << ")\n"
             << "  chunk=" << (opt.chunk ? std::to_string(opt.chunk)
                                         : std::string("whole file"))
+            << "  cte client pool=" << cte_client->pool_id_.major_ << "."
+            << cte_client->pool_id_.minor_ << "  compressor pool=" << pool_major
+            << "." << pool_minor
             << std::endl;
 
   // float32 = 1, float64 = 2 -- the same encoding the HDF5 VOL assigns from
@@ -461,8 +481,17 @@ int main(int argc, char **argv) {
 
   auto drain = [&]() {
     for (auto &p : pending) {
-      p.fut.Wait();
       auto &r = records[p.record];
+      if (opt.no_compress) {
+        p.put.Wait();
+        r.ok = p.put->GetReturnCode() == 0;
+        r.lib = 0;  // stored raw, by construction
+        r.ratio = 1.0;
+        r.stored = r.bytes;
+        CLIO_IPC->FreeBuffer(p.buf);
+        continue;
+      }
+      p.fut.Wait();
       const auto &c = p.fut->context_;
       r.ok = p.fut->GetReturnCode() == 0;
       r.lib = c.compress_lib_;
@@ -524,9 +553,15 @@ int main(int argc, char **argv) {
       records.push_back(rec);
 
       Pending p;
-      p.fut = compressor.AsyncDynamicSchedule(
-          clio::run::PoolQuery::Local(), tag_id, rec.name, 0, n,
-          buf.shm_.template Cast<void>(), -1.0f, ctx, 0, cte_client->pool_id_);
+      if (opt.no_compress) {
+        p.put = cte_client->AsyncPutBlob(
+            tag_id, rec.name, 0, n, buf.shm_.template Cast<void>(), -1.0f,
+            clio::cte::core::Context(), 0, clio::run::PoolQuery::Local());
+      } else {
+        p.fut = compressor.AsyncDynamicSchedule(
+            clio::run::PoolQuery::Local(), tag_id, rec.name, 0, n,
+            buf.shm_.template Cast<void>(), -1.0f, ctx, 0, cte_client->pool_id_);
+      }
       p.buf = buf;
       p.record = records.size() - 1;
       pending.push_back(std::move(p));
@@ -539,6 +574,27 @@ int main(int argc, char **argv) {
                    std::chrono::steady_clock::now() - t1).count();
   }
   drain();
+
+  // CLIO_REPLAY_FINAL_FLUSH=1: move volatile blobs to a durable tier, inside
+  // `total`. No fsync, so this times the write to the page cache.
+  double flush_s = 0.0;
+  unsigned long long flushed_bytes = 0, flushed_blobs = 0;
+  int flush_rc = 0;
+  bool flush_ran = false;
+  if (const char *e = std::getenv("CLIO_REPLAY_FINAL_FLUSH");
+      e && *e && *e != '0') {
+    const auto tf = std::chrono::steady_clock::now();
+    auto fl = cte_client->AsyncFlushData(clio::run::PoolQuery::Local(),
+                                         /*target_persistence_level=*/1,
+                                         /*period_us=*/0);
+    fl.Wait();
+    flush_s = std::chrono::duration<double>(
+                  std::chrono::steady_clock::now() - tf).count();
+    flushed_bytes = fl->bytes_flushed_;
+    flushed_blobs = fl->blobs_flushed_;
+    flush_rc = fl->GetReturnCode();
+    flush_ran = true;
+  }
 
   // ---- Report. ----
   size_t stored_total = 0, in_total = 0, kept = 0, raw = 0, failed = 0;
@@ -576,6 +632,11 @@ int main(int argc, char **argv) {
             << std::chrono::duration<double>(
                    std::chrono::steady_clock::now() - t_start).count()
             << " s" << std::endl;
+  if (flush_ran) {
+    std::cout << "  flush: " << flushed_blobs << " blob(s), " << flushed_bytes
+              << " B moved to durable storage in " << flush_s << " s  (rc="
+              << flush_rc << ")" << std::endl;
+  }
 
   if (!opt.report.empty()) {
     std::ofstream csv(opt.report);

@@ -66,6 +66,8 @@ done
 PATCHED=$(mktemp /tmp/vpic_build_XXXXXX.sh)
 trap 'rm -f "$PATCHED"' EXIT
 INJECT="-L$CUDA_DRIVER_DIR -lcuda"
+# DECK_EXTRA_LDFLAGS: link flags searched first, e.g. for a newer libstdc++.
+[ -n "${DECK_EXTRA_LDFLAGS:-}" ] && INJECT="$DECK_EXTRA_LDFLAGS $INJECT"
 if [ "$INSITU" = true ]; then
   # The deck calls the six C entry points of libclio_vpic_insitu.so. Only the
   # C header reaches nvcc_wrapper; everything of Clio's stays behind the .so,

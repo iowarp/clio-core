@@ -144,6 +144,7 @@ struct Options {
   bool f32 = false;              // downcast the state to float32 before staging
   bool kokkos = false;    // -k on g 1 -sf kk
   bool verify = false;    // read every blob back through the decompressor
+  bool no_compress = false;  // raw PutBlob/GetBlob, no codec (baseline)
   bool quiet = false;     // LAMMPS -screen none
   // Extra LAMMPS -var NAME VALUE pairs, so a deck can expose its physics
   // (density, temperature, cutoff, seed, timestep) without this driver
@@ -198,6 +199,8 @@ void Usage(const char *argv0) {
          "                   is ever materialised on the device or the host\n"
       << "  --expect-lossy   a positive CLIO_NEUROPRESS_ERROR_BOUND was set, so "
          "the bytes are NOT expected to match; report decode failures only\n"
+      << "  --no-compress    baseline: store every chunk raw with PutBlob, no "
+         "codec selection or compression\n"
       << "  --readback CSV   no simulation: read every blob named in a "
          "previous --report CSV back\n"
       << "                   through the decompressor and compare digests "
@@ -241,6 +244,7 @@ bool ParseArgs(int argc, char **argv, Options *o) {
     else if (a == "--readback") o->readback = need("CSV");
     else if (a == "--dump-decompressed") o->decomp_dir = need("DIR");
     else if (a == "--expect-lossy") o->expect_lossy = true;
+    else if (a == "--no-compress") o->no_compress = true;
     else if (a == "--f32") o->f32 = true;
     else if (a == "--kokkos") o->kokkos = true;
     else if (a == "--verify") o->verify = true;
@@ -314,6 +318,7 @@ struct BlobRecord {
 
 struct Pending {
   clio::run::Future<clio::cte::compressor::DynamicScheduleTask> fut;
+  clio::run::Future<clio::cte::core::PutBlobTask> put;  // --no-compress
   // Host orders only. On --order device the staging buffer belongs to the
   // slot pool below, which outlives every individual task, so there is
   // nothing per-task to release.
@@ -382,11 +387,20 @@ int main(int argc, char **argv) {
       auto buf = CLIO_IPC->AllocateBuffer(r.bytes);
       if (buf.IsNull()) { std::cerr << "AllocateBuffer (verify) failed\n"; return false; }
       std::memset(buf.ptr_, 0, r.bytes);
-      auto get = compressor.AsyncDecompressExplicit(
-          clio::run::PoolQuery::Local(), tag_id, r.name, 0, r.bytes, 0,
-          buf.shm_.template Cast<void>(), cte_client->pool_id_);
-      get.Wait();
-      const int rc_get = get->GetReturnCode();
+      int rc_get;
+      if (opt.no_compress) {
+        auto get = cte_client->AsyncGetBlob(
+            tag_id, r.name, 0, r.bytes, 0, buf.shm_.template Cast<void>(),
+            clio::run::PoolQuery::Local());
+        get.Wait();
+        rc_get = get->GetReturnCode();
+      } else {
+        auto get = compressor.AsyncDecompressExplicit(
+            clio::run::PoolQuery::Local(), tag_id, r.name, 0, r.bytes, 0,
+            buf.shm_.template Cast<void>(), cte_client->pool_id_);
+        get.Wait();
+        rc_get = get->GetReturnCode();
+      }
       // Under a positive error bound the bytes are SUPPOSED to differ, so a
       // digest test would report FAILED on a run behaving exactly as asked.
       // There `bad` counts decode failures only, and the verdict on the data
@@ -593,7 +607,10 @@ int main(int argc, char **argv) {
   const size_t chunks_per_field = (field_bytes + chunk - 1) / chunk;
   const int nframes = opt.steps / opt.gap + 1;
 
-  std::cout << "LAMMPS (library) -> Clio compressor, runtime in-process\n"
+  std::cout << (opt.no_compress
+                    ? "LAMMPS (library) -> Clio core, NO compression "
+                      "(baseline), runtime in-process\n"
+                    : "LAMMPS (library) -> Clio compressor, runtime in-process\n")
             << "  atoms=" << natoms << "  steps=" << opt.steps << "  gap="
             << opt.gap << "  frames=" << nframes << "  fields="
             << fields.size() << "\n"
@@ -632,8 +649,17 @@ int main(int argc, char **argv) {
 
   auto drain = [&]() {
     for (auto &p : pending) {
-      p.fut.Wait();
       auto &r = records[p.record];
+      if (opt.no_compress) {
+        p.put.Wait();
+        r.ok = p.put->GetReturnCode() == 0;
+        r.lib = 0;  // stored raw, by construction
+        r.ratio = 1.0;
+        r.stored = r.bytes;
+        if (!p.on_device) CLIO_IPC->FreeBuffer(p.buf);
+        continue;
+      }
+      p.fut.Wait();
       const auto &c = p.fut->context_;
       r.ok = p.fut->GetReturnCode() == 0;
       r.lib = c.compress_lib_;
@@ -970,10 +996,17 @@ int main(int argc, char **argv) {
         }
 
         Pending p;
-        p.fut = compressor.AsyncDynamicSchedule(
-            clio::run::PoolQuery::Local(), tag_id, rec.name, /*offset=*/0, n,
-            blob_data, /*score=*/-1.0f, ctx, /*flags=*/0,
-            cte_client->pool_id_);
+        if (opt.no_compress) {
+          p.put = cte_client->AsyncPutBlob(
+              tag_id, rec.name, /*offset=*/0, n, blob_data, /*score=*/-1.0f,
+              clio::cte::core::Context(), /*flags=*/0,
+              clio::run::PoolQuery::Local());
+        } else {
+          p.fut = compressor.AsyncDynamicSchedule(
+              clio::run::PoolQuery::Local(), tag_id, rec.name, /*offset=*/0, n,
+              blob_data, /*score=*/-1.0f, ctx, /*flags=*/0,
+              cte_client->pool_id_);
+        }
         p.buf = host_buf;
         p.on_device = (dev_field != nullptr);
         p.record = records.size() - 1;
@@ -1024,6 +1057,26 @@ int main(int argc, char **argv) {
     drain();
     stage_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   }
+
+  // CLIO_REPLAY_FINAL_FLUSH=1, as in neuropress_field_replay.
+  double flush_s = 0.0;
+  unsigned long long flushed_bytes = 0, flushed_blobs = 0;
+  int flush_rc = 0;
+  bool flush_ran = false;
+  if (const char *e = std::getenv("CLIO_REPLAY_FINAL_FLUSH");
+      e && *e && *e != '0') {
+    const auto tf = std::chrono::steady_clock::now();
+    auto fl = cte_client->AsyncFlushData(clio::run::PoolQuery::Local(),
+                                         /*target_persistence_level=*/1,
+                                         /*period_us=*/0);
+    fl.Wait();
+    flush_s = std::chrono::duration<double>(
+                  std::chrono::steady_clock::now() - tf).count();
+    flushed_bytes = fl->bytes_flushed_;
+    flushed_blobs = fl->blobs_flushed_;
+    flush_rc = fl->GetReturnCode();
+    flush_ran = true;
+  }
   const auto t_end_write = std::chrono::steady_clock::now();
 
   // ---- Report. ----------------------------------------------------------
@@ -1059,6 +1112,11 @@ int main(int argc, char **argv) {
             << stage_s << " s   total "
             << std::chrono::duration<double>(t_end_write - t_start).count()
             << " s" << std::endl;
+  if (flush_ran) {
+    std::cout << "  flush: " << flushed_blobs << " blob(s), " << flushed_bytes
+              << " B moved to durable storage in " << flush_s << " s  (rc="
+              << flush_rc << ")" << std::endl;
+  }
 
   if (!opt.report.empty()) {
     std::ofstream csv(opt.report);

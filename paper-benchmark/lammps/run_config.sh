@@ -39,6 +39,7 @@
 #   explore        dynamic-ratio + exploration: the top-K alternatives are
 #                  actually compressed and the measured winner adopted.
 #   best           best mode: exhaustive, ratio-only ranking.
+#   baseline       no compression: every chunk stored raw.
 #   static-zstd    fixed nvcomp-zstd, no shuffle -- codec control, no model.
 #   static-zstd-s4 fixed nvcomp-zstd + 4-byte shuffle (upstream's only width).
 #   static-zstd-s8 fixed nvcomp-zstd + 8-byte shuffle (matches float64; NOT
@@ -171,7 +172,7 @@ COST_ENV=()
 case "$CONFIG" in
   dynamic|learn|explore-balance) COSTMODEL=balance ;;
   explore-speed)                 COSTMODEL=speed ;;
-  static-*)                      COSTMODEL=none ;;
+  static-*|baseline)             COSTMODEL=none ;;
   *)                             COSTMODEL=ratio ;;
 esac
 RATIO_ONLY=(CLIO_NEUROPRESS_COST_W_CT=0 CLIO_NEUROPRESS_COST_W_DT=0 CLIO_NEUROPRESS_COST_W_IO=1)
@@ -185,6 +186,7 @@ RATIO_ONLY=(CLIO_NEUROPRESS_COST_W_CT=0 CLIO_NEUROPRESS_COST_W_DT=0 CLIO_NEUROPR
 SPEED_ONLY=(CLIO_NEUROPRESS_COST_W_CT=1 CLIO_NEUROPRESS_COST_W_DT=1 CLIO_NEUROPRESS_COST_W_IO=0)
 case "$CONFIG" in
   dynamic)        ;;
+  baseline)       NO_COMPRESS=1 ;;  # figure 9: stored raw, no codec
   dynamic-ratio)  COST_ENV=("${RATIO_ONLY[@]}") ;;
   learn)          NP_LEARN=true ;;
   learn-ratio)    NP_LEARN=true; COST_ENV=("${RATIO_ONLY[@]}") ;;
@@ -286,7 +288,8 @@ ARGS=(--deck "${DECK:-$HERE/in.melt}" --box "$BOX" --steps "$STEPS" --gap "$GAP"
 [ -n "$DECOMP_DIR" ] && { mkdir -p "$DECOMP_DIR"; ARGS+=(--dump-decompressed "$DECOMP_DIR"); }
 # A positive bound means the decompressed bytes are NOT the bytes staged, so
 # the digest check would report FAILED on a run doing exactly what was asked.
-[ -n "$EB" ] && ARGS+=(--expect-lossy)
+[ "$MODE" = lossy ] && ARGS+=(--expect-lossy)
+[ "${NO_COMPRESS:-0}" = 1 ] && ARGS+=(--no-compress)
 # --f32 stages a float32 downcast of LAMMPS' double state. Host gather only, so
 # the compressor needs STAGE_H2D to see a device pointer -- which is what makes
 # the quantizer reachable at all. See "Can LAMMPS be float32?" in README.md.

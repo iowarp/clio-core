@@ -49,6 +49,24 @@ VOL, so `warpx/run_config.sh` always runs the simulation.
 | `wallclock_table.py` | the summary table for `compare_wallclock.sh` |
 | `perchunk_oracle_tables.py` | the tables for `compare_perchunk_oracle.sh` |
 
+### Paper figures that are re-measured, not regenerated from a file
+
+Named for the NeuroPress submission's figure numbers (not those of
+[Where the paper's figures come from](#where-the-papers-figures-come-from)).
+Plots go to `figures/<figure>/`; runs go under `results/` unless `--out` is given.
+
+| script | what it does |
+|---|---|
+| `figure_5.sh` → `plot/fig5_timesteps.py`, `plot/plot_fig5.py` | per-chunk time breakdown of the write and read paths, from `CLIO_NEUROPRESS_PHASE_LOG` |
+| `figure_8.sh` → `plot/fig8_trace.py`, `plot/plot_fig8.py` | regret and cost MAPE per chunk with every configuration measured; see `figures/fig8/README.md` |
+| `figure_9.sh` → `plot/plot_fig9.py` | end-to-end wall clock: Baseline, the ablation and the external codecs, each ending with a timed flush |
+| `ai/gen_fields.sh` | the AI workload's dumps (ViT-B/16 checkpoints, upstream's exporter) |
+| `lib/compose_hooks.sh` | compose knobs every `<workload>/common.sh` sources: `BENCH_TIER*`, `BENCH_FLUSH_MS`, `BENCH_NP_LR`, `BENCH_NP_MAPE` |
+| `lib/decode_wal.py` | which storage pools a run placed each blob on |
+
+LAMMPS on the GPU needs `--require-device`; replayed WarpX needs
+`CLIO_NEUROPRESS_STAGE_H2D=1`.
+
 ### Aggregate and check a run
 
 | script | what it does |

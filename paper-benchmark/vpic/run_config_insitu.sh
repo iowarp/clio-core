@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run ONE named configuration of the VPIC benchmark IN SITU -- GPU-resident.
 #
-#   ./run_config_insitu.sh <config> [--ncell N] [--steps N] [--int N]
+#   ./run_config_insitu.sh <config> [--ncell N] [--steps N] [--int N] [--nppc N]
 #                          [--chunk B] [--bw B/ms] [--eb X] [--explore-k K]
 #                          [--explore-thresh X] [--results DIR] [--tag NAME]
 #
@@ -38,6 +38,7 @@ while [ $# -gt 0 ]; do
     --ncell) NCELL=$2; shift 2;;
     --steps) STEPS=$2; shift 2;;
     --int|--dump-int) INT=$2; shift 2;;
+    --nppc) NPPC=$2; shift 2;;
     --clean-div) CLEAN_DIV=$2; shift 2;;
     --chunk) CHUNK=$2; shift 2;;
     --bw) BW=$2; shift 2;;
@@ -101,6 +102,7 @@ env "${COST_ENV[@]}" \
     CLIO_NEUROPRESS_SELECTION_LOG="$STORE/selection.csv" \
     CLIO_NEUROPRESS_EXPLORE_LOG="$STORE/explore.csv" \
     "$INSITU/run.sh" --port "$PORT" --ncell "$NCELL" --steps "$STEPS" --int "$INT" \
+        ${NPPC:+--nppc "$NPPC"} \
         --chunk "$CHUNK" --learn --explore "$EXPLORE_K_OPT" \
         --threshold "$THRESH_OPT" --store "$STORE" \
         ${VERIFY:+$([ "$VERIFY" = 1 ] && echo --verify)} \

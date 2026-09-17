@@ -588,11 +588,14 @@ begin_diagnostics {
       sim_log( "[clio-insitu] step " << step() << ": " << nv
                << " voxels x " << FIELD_VAR_COUNT << " vars handed over" );
 
-    /* Last diagnostic of the run: drain, report and tear the client down
-       here, because a VPIC deck has no finalize hook and the runtime's worker
-       threads must not outlive the process's static destructors. */
-    if( step() >= num_step ) clio_vpic_insitu_end();
+    if( rank() == 0 && step() >= num_step )
+      sim_log( "[clio-insitu] last frame at step " << step() );
   }
+
+  /* Last step: drain and tear the client down (a deck has no finalize hook).
+     Outside the interval block, so it runs when num_step is not a multiple. */
+  if( global->clio_insitu_interval > 0 && step() >= num_step )
+    clio_vpic_insitu_end();
 #endif
  
   if( step()==-10 ) {

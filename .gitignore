@@ -271,6 +271,10 @@ paper-benchmark/warpx/run-viz/
 # simulation output behind them is not kept either: without --keep-dumps it
 # goes to a scratch directory and is deleted after rendering.
 paper-benchmark/*/viz/
+# compare_wallclock.sh's default --out.
+paper-benchmark/strategies/
+# Run logs and per-chunk CSVs kept beside a figure's plots stay local.
+paper-benchmark/figures/*/*/logs/
 # VPIC field dumps and the compiled deck. build_deck.sh rebuilds the binary;
 # gen_fields.sh regenerates the fields. The DECK SOURCE is tracked.
 paper-benchmark/vpic/fields/

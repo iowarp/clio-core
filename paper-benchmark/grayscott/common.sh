@@ -41,6 +41,9 @@ print(p)
 PY
 }
 
+# Storage tiers, async flush, learning rates (BENCH_*).
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/compose_hooks.sh"
+
 # The three-pool compose file every workload in this directory uses.
 bench_compose() {
   local store=$1 port=$2 tier_mb=$3
@@ -67,7 +70,7 @@ compose:
     neuropress_online_learning_enabled: ${NP_LEARN:-false}
     neuropress_exploration_enabled: ${NP_EXPLORE:-false}
     neuropress_exploration_k: ${EXPLORE_K:-0}
-    neuropress_exploration_threshold: ${THRESH:-0.5}
+    neuropress_exploration_threshold: ${THRESH:-0.5}$(bench_learning_yaml)
     neuropress_best_mode: ${BEST:-false}
 ${STATIC_LIB:+    neuropress_static_lib: "$STATIC_LIB"}
 ${STATIC_LIB:+    neuropress_static_shuffle: ${STATIC_SHUF:-0}}
@@ -78,12 +81,12 @@ ${STATIC_LIB:+    neuropress_static_quantize: ${STATIC_QUANT:-false}}
     pool_id: "513.0"
     storage:
       - path: "$store/cte_tier.dat"
-        bdev_type: "file"
-        capacity_limit: "${tier_mb}MB"
+        bdev_type: "${BENCH_TIER1_TYPE:-file}"
+        capacity_limit: "${BENCH_TIER1_MB:-$tier_mb}MB"
         score: 1.0
-        persistence_level: "temporary"
+        persistence_level: "${BENCH_TIER1_PERSIST:-temporary}"$(bench_tier2_yaml "$tier_mb")
     performance:
-      metadata_log_path: "$store/cte_metadata_log"
+      metadata_log_path: "$store/cte_metadata_log"$(bench_flush_yaml)
       transaction_log_capacity: "32MB"
     dpe:
       dpe_type: "max_bw"
