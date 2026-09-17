@@ -707,15 +707,14 @@ TEST_CASE("ShmTransport Send/Recv GPU", "[gpu][transport]") {
 
     // Step 7: Launch recv kernel first (will spinwait for data)
     // Uses recv_alloc for its internal allocations
-    GpuRecvKernel<<<1, 1, 0, recv_stream>>>(recv_alloc, output_buf, kDataSize,
-                                             copy_space, shm_info,
-                                             recv_result, recv_size);
+    GpuRecvKernel<<<1, 1, 0, static_cast<cudaStream_t>(recv_stream)>>>(
+        recv_alloc, output_buf, kDataSize, copy_space, shm_info, recv_result,
+        recv_size);
 
     // Step 8: Launch send kernel (produces data)
     // Uses send_alloc for its internal allocations
-    GpuSendKernel<<<1, 1, 0, send_stream>>>(send_alloc, data_buf, kDataSize,
-                                             copy_space, shm_info,
-                                             send_result);
+    GpuSendKernel<<<1, 1, 0, static_cast<cudaStream_t>(send_stream)>>>(
+        send_alloc, data_buf, kDataSize, copy_space, shm_info, send_result);
 
     // Step 9: Synchronize both streams
     ctp::GpuApi::Synchronize(send_stream);
