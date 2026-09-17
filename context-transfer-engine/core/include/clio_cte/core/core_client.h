@@ -230,6 +230,14 @@ class Client : public clio::run::ContainerClient {
     if (shm_root_ == nullptr || out == nullptr || size == 0) {
       return false;
     }
+    // DEVICE destinations take the RPC path: this fast path is a plain host
+    // std::memcpy, and a gpu_vector page fault hands us a cudaMalloc'd
+    // pointer a CPU store cannot touch (observed as a straight SIGSEGV when
+    // the compressor's get for a raw-stored device blob landed here). The
+    // RPC path dispatches on IsDevicePointer and copies device-side.
+    if (ctp::IsDevicePointer(out)) {
+      return false;
+    }
     ShmBlobRecord rec;
     if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
       return false;
@@ -414,7 +422,7 @@ class Client : public clio::run::ContainerClient {
 
   /**
    * GPU-callable AsyncCreate: takes const char* names for GPU kernel use.
-   * Routes to CPU admin worker via PoolQuery::ToLocalCpu().
+   * Routes via the caller's pool_query (PoolQuery::Dynamic()).
    * @param pool_query Pool query for task routing
    * @param pool_name Name of the pool (const char*, GPU-safe)
    * @param custom_pool_id Explicit pool ID
@@ -558,6 +566,27 @@ class Client : public clio::run::ContainerClient {
     // lookups from co-located chimods (clio-fs Open does three in a
     // row) each paid a queue+schedule+wake hop; inline they run on
     // the calling fiber. Falls back to Send everywhere else.
+    return CLIO_RUN_INLINE(task);
+  }
+
+  /**
+   * GetOrCreateTag WITH a fault handler (checkpointing / lazy copy): blobs
+   * this tag does not hold are resolved by `fault_pool_id` (e.g. the
+   * checkpoint chimod), which receives `fault_params` -- for checkpoint,
+   * the SOURCE tag name -- in Context::fault_params_ on every fault.
+   */
+  clio::run::Future<GetOrCreateTagTask<CreateParams>> AsyncGetOrCreateTag(
+      const std::string &tag_name, const clio::run::PoolId &fault_pool_id,
+      const std::string &fault_pool_name, const std::string &fault_params,
+      const TagId &tag_id = TagId::GetNull(),
+      const clio::run::PoolQuery &pool_query =
+          clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetOrCreateTagTask<CreateParams>>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_name, tag_id);
+    task->fault_pool_id_ = fault_pool_id;
+    task->fault_pool_name_ = fault_pool_name.c_str();
+    task->fault_params_ = fault_params.c_str();
     return CLIO_RUN_INLINE(task);
   }
 
@@ -2807,8 +2836,24 @@ class Client : public clio::run::ContainerClient {
     // Replica-targeted reads (issue #886, context.replica_ != 0) must also
     // reach the runtime: the SHM mirror publishes the PRIMARY's block layout
     // only, so serving them here would silently return primary bytes.
+    // A CODEC MUST REACH THE RUNTIME. This path serves the blob straight out
+    // of the SHM mirror, which holds the bytes AS STORED -- it applies no
+    // transform. A get that asked for decompression and took this route got
+    // compressed bytes back and a return code of 0, and only for blobs the
+    // codec had actually shrunk, so incompressible data still looked correct.
+    // Symptom: gv::Vector reads were bit-exact with codec=NONE and corrupt
+    // with zstd, identically at every page size. Device-destination gets never
+    // hit it because TryReadBlobShm refuses device pointers, which is why the
+    // in-kernel path looked fine and only host-side reads were wrong.
+    // A GENERATIONAL GET MUST REACH THE RUNTIME. Its whole contract is "do
+    // not serve until the blob has reached this generation", and the
+    // generation lives in the runtime's blob metadata -- serving the bytes
+    // from the SHM mirror here would answer the readiness question with
+    // whatever happens to be cached, which is precisely the stale read the
+    // flag exists to prevent.
     if (dst == nullptr || size == 0 || flags != 0 || context.emulate_ ||
-        context.replica_ != 0 || ForceNetEnv()) {
+        context.replica_ != 0 || context.compress_lib_ != 0 ||
+        (context.op_flags_ & Context::kGenerational) || ForceNetEnv()) {
       return false;
     }
     if (!HasShmCache() && !AttachShmCache()) {
@@ -3203,6 +3248,33 @@ class Client : public clio::run::ContainerClient {
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     return AsyncPodGetBlob(tag_id, blob_name.c_str(), offset, size, flags,
                            blob_data, pool_query);
+  }
+
+  // ===========================================================================
+  // Batched POD paging. One task carries up to kPodMultiMax page requests, so
+  // a full page-cache flush costs a handful of submissions instead of one per
+  // page. Build the task, Add() records until it returns false, then Send.
+  // ===========================================================================
+
+  /** Allocate an empty batch of `TaskT` (PodMulti{Put,Get}BlobTask /
+   *  PodMultiScoreTask) for the caller to fill with Add(). */
+  template <typename TaskT>
+  clio::run::shared_ptr<TaskT> NewPodBatch(
+      const TagId &tag_id, const Context &context = Context(),
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<TaskT>(clio::run::CreateTaskId(), pool_id_,
+                                            pool_query, tag_id);
+    task.get()->context_ = context;
+    task.get()->flags_ = flags;
+    return task;
+  }
+
+  /** Submit a batch built with NewPodBatch(). */
+  template <typename TaskT>
+  clio::run::Future<TaskT> AsyncPodBatch(clio::run::shared_ptr<TaskT> &task) {
+    return CLIO_CPU_IPC->Send(task);
   }
 
   clio::run::Future<PodReorganizeBlobTask> AsyncPodReorganizeBlob(

@@ -71,10 +71,77 @@ __device__ inline void page_cache_finish_load(
   __threadfence();
 }
 
+/**
+ * Acquire a page AND PIN IT. Upstream BaM's acquire_page/release_page pair
+ * is a reference count, not just a lookup: it is what stops a slot being
+ * re-tagged while another block is mid-read of it. Without the pin this
+ * cache was documented as unusable above 2 blocks out of core.
+ *
+ * A takeover waits for the slot's pin count to drain. See
+ * PageCacheDeviceState::page_refs for the one-pin-per-thread contract that
+ * keeps that wait acyclic on a direct-mapped cache.
+ */
+__device__ inline uint8_t *page_cache_acquire_pinned(
+    PageCacheDeviceState &state,
+    uint64_t offset,
+    bool *needs_load) {
+  const uint32_t slot =
+      (uint32_t)((offset >> state.page_shift) % state.num_pages);
+  uint8_t *page = state.cache_mem + (uint64_t)slot * state.page_size;
+  unsigned long long desired = (unsigned long long)offset;
+  unsigned long long *tag_ptr = (unsigned long long *)&state.page_tags[slot];
+
+  for (;;) {
+    // Pin FIRST, then check the tag. Reversed, the slot could be taken over
+    // between the check and the pin -- the same publish-then-verify order a
+    // page cache always needs.
+    atomicAdd(&state.page_refs[slot], 1u);
+    __threadfence();
+    if (atomicAdd(tag_ptr, 0ULL) == desired) {
+      const uint32_t st = atomicAdd(&state.page_states[slot], 0);
+      if (st == static_cast<uint32_t>(PageState::kValid) ||
+          st == static_cast<uint32_t>(PageState::kDirty)) {
+        *needs_load = false;
+        return page;                      // hit, pinned
+      }
+      if (st == static_cast<uint32_t>(PageState::kLoading)) {
+        atomicSub(&state.page_refs[slot], 1u);   // someone else is filling it
+        __nanosleep(64);
+        continue;
+      }
+    }
+    // Miss: claim the slot. Drop our pin while waiting for the others to
+    // drain, or we would be waiting on ourselves.
+    atomicSub(&state.page_refs[slot], 1u);
+    while (atomicAdd(&state.page_refs[slot], 0u) != 0u) {
+      __nanosleep(64);
+    }
+    if (atomicCAS(&state.page_states[slot],
+                  static_cast<uint32_t>(PageState::kValid),
+                  static_cast<uint32_t>(PageState::kLoading)) ==
+            static_cast<uint32_t>(PageState::kValid) ||
+        atomicCAS(&state.page_states[slot],
+                  static_cast<uint32_t>(PageState::kInvalid),
+                  static_cast<uint32_t>(PageState::kLoading)) ==
+            static_cast<uint32_t>(PageState::kInvalid)) {
+      atomicExch(tag_ptr, desired);
+      __threadfence();
+      atomicAdd(&state.page_refs[slot], 1u);   // pin the page we will fill
+      *needs_load = true;
+      return page;
+    }
+    __nanosleep(64);                     // lost the claim; re-examine
+  }
+}
+
+/** Drop one pin taken by page_cache_acquire_pinned. */
 __device__ inline void page_cache_release(
     PageCacheDeviceState &state,
     uint64_t offset) {
-  (void)state; (void)offset;
+  const uint32_t slot =
+      (uint32_t)((offset >> state.page_shift) % state.num_pages);
+  __threadfence();
+  atomicSub(&state.page_refs[slot], 1u);
 }
 
 __device__ inline void page_cache_mark_dirty(
@@ -234,11 +301,28 @@ __device__ inline void host_write_page(
 /* NVMe I/O stubs                                                      */
 /* ================================================================== */
 
+/**
+ * Fill a cache page from the "device".
+ *
+ * NOT a queue-pair emulation. A full submission/doorbell/completion path was
+ * built and removed: it needs device atomics on mapped host memory, which
+ * this GPU cannot do (cudaDevAttrHostNativeAtomicSupported = 0), and the
+ * host-side controller it requires serialises against the very kernel
+ * waiting on it. The protocol shape was not worth that.
+ *
+ * What a miss actually costs on real BaM is a bulk asynchronous transfer
+ * from storage into the cache page, and CUDA already gives that: the
+ * warp-cooperative copy below moves a page from pinned host memory over
+ * PCIe with all 32 lanes in flight, GPU-initiated, no host thread. That is
+ * the transfer being modelled, so it IS the emulation -- the medium is
+ * DRAM rather than flash, which understates a real NVMe miss and is worth
+ * saying out loud whenever a miss-heavy number is quoted.
+ */
 __device__ inline int nvme_read_page(
     QueuePairDevice &qp, uint64_t bus_addr,
     uint64_t offset, uint32_t page_size) {
   (void)qp; (void)bus_addr; (void)offset; (void)page_size;
-  return -1;
+  return -1;   // wired only when real gnb hardware is present
 }
 
 __device__ inline int nvme_write_page(

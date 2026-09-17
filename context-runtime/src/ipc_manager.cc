@@ -35,6 +35,21 @@
  * IPC manager implementation
  */
 
+// Guarded for the same reason gpu_api.h guards it: execinfo.h is glibc/BSD and
+// MSVC has none, so an unguarded include fails the Windows build of
+// clio_run_cxx outright ("C1083: Cannot open include file: 'execinfo.h'").
+// The one call site -- an opt-in CLIO_SHM_TRACE diagnostic -- carries the same
+// guard and degrades to a line saying the backtrace is unavailable there.
+#if defined(__has_include)
+#if __has_include(<execinfo.h>)
+#define CLIO_RUN_HAS_EXECINFO 1
+#include <execinfo.h>
+#endif
+#endif
+#ifndef CLIO_RUN_HAS_EXECINFO
+#define CLIO_RUN_HAS_EXECINFO 0
+#endif
+
 #include "clio_runtime/ipc_manager.h"
 
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
@@ -556,7 +571,17 @@ bool IpcManager::ServerInit() {
   // (Device-aware memcpy is now ctp::DeviceAwareMemcpy in gpu_api.h.)
   {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
-    u32 queue_depth = config->GetQueueDepth();
+    // ONE lane serves every block on the GPU, so it must be sized for the
+    // whole device, not for a single producer. The generic runtime depth is
+    // sized for CPU lanes (one per worker); reusing it here let a burst of
+    // faults overrun the ring, and an overrun is unrecoverable because a
+    // dropped task leaves its kernel waiting on a completion that will never
+    // come. Entries are ~32 bytes against a 16 MB backend, so a deep ring
+    // costs ~2 MB and removes the cliff.
+    constexpr u32 kGpuQueueDepth = 64 * 1024;
+    u32 queue_depth =
+        (config->GetQueueDepth() > kGpuQueueDepth) ? config->GetQueueDepth()
+                                                  : kGpuQueueDepth;
     constexpr size_t kHipClientBackendBytes = 64 * 1024 * 1024;  // 64 MB
     if (!ChiServerBootstrapHipGpu(this, queue_depth,
                                    kHipClientBackendBytes)) {
@@ -571,7 +596,17 @@ bool IpcManager::ServerInit() {
   // on both.
   {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
-    u32 queue_depth = config->GetQueueDepth();
+    // ONE lane serves every block on the GPU, so it must be sized for the
+    // whole device, not for a single producer. The generic runtime depth is
+    // sized for CPU lanes (one per worker); reusing it here let a burst of
+    // faults overrun the ring, and an overrun is unrecoverable because a
+    // dropped task leaves its kernel waiting on a completion that will never
+    // come. Entries are ~32 bytes against a 16 MB backend, so a deep ring
+    // costs ~2 MB and removes the cliff.
+    constexpr u32 kGpuQueueDepth = 64 * 1024;
+    u32 queue_depth =
+        (config->GetQueueDepth() > kGpuQueueDepth) ? config->GetQueueDepth()
+                                                  : kGpuQueueDepth;
     constexpr size_t kSyclClientBackendBytes = 64 * 1024 * 1024;  // 64 MB
     if (!ChiServerBootstrapSyclGpu(this, queue_depth,
                                     kSyclClientBackendBytes)) {
@@ -2317,6 +2352,27 @@ FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
 
   // 3. All existing allocators are full - create new shared memory segment
   // Calculate segment size: (requested_size + 32MB metadata) * 1.2 multiplier
+  //
+  // These segments are never released, so a workload that keeps landing here
+  // grows shared memory without bound (measured: 509 segments / 57 GiB in one
+  // papers100M epoch). CLIO_SHM_TRACE=1 prints who asked, which is the only
+  // way to tell a genuine capacity need from an allocation the existing
+  // arenas should have been able to serve.
+  if (std::getenv("CLIO_SHM_TRACE") != nullptr) {
+#if CLIO_RUN_HAS_EXECINFO
+    void *frames[24];
+    int n = backtrace(frames, 24);
+    char **syms = backtrace_symbols(frames, n);
+    HLOG(kError, "[SHM-TRACE] growing for a {} byte request; callers:", size);
+    for (int i = 0; i < n && syms != nullptr; ++i) {
+      HLOG(kError, "[SHM-TRACE]   {}", syms[i]);
+    }
+    free(syms);
+#else
+    HLOG(kError, "[SHM-TRACE] growing for a {} byte request; no backtrace on "
+         "this platform (execinfo.h absent)", size);
+#endif
+  }
   size_t new_size = static_cast<size_t>((size + kShmMetadataOverhead) *
                                         kShmAllocationMultiplier);
   if (!IncreaseClientShm(new_size)) {
@@ -4536,9 +4592,6 @@ bool IpcManager::IsTaskLocal(const clio::run::shared_ptr<Task> & /*task_ptr*/,
       // here, they are not local.
       return false;
 
-    case RoutingMode::ToLocalCpu:
-      return true;  // GPU producer-only path: always local
-
     case RoutingMode::Null:
       return true;  // Null mode is a no-op, treat as local
   }
@@ -4741,9 +4794,8 @@ std::vector<PoolQuery> IpcManager::ResolvePoolQuery(
     case RoutingMode::Physical:
       result = ResolvePhysicalQuery(query, pool_id, task_ptr);
       break;
-    case RoutingMode::ToLocalCpu:
     case RoutingMode::Null:
-      // GPU producer-only ToLocalCpu and Null modes pass through.
+      // Null mode passes through.
       result = {query};
       break;
     case RoutingMode::ManyToOne:

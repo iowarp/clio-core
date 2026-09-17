@@ -90,8 +90,10 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks",
   REQUIRE(handles.size() == kNumTasks);
 
   // 3. Stage the FullPtr<TaskT> array in pinned host so the kernel sees it.
+  // BYTES, not a count -- same under-allocation the backpressure test hit.
   ctp::ipc::FullPtr<TaskT> *task_handle_dev =
-      ctp::GpuApi::MallocHost<ctp::ipc::FullPtr<TaskT>>(kNumTasks);
+      ctp::GpuApi::MallocHost<ctp::ipc::FullPtr<TaskT>>(
+          static_cast<size_t>(kNumTasks) * sizeof(ctp::ipc::FullPtr<TaskT>));
   REQUIRE(task_handle_dev != nullptr);
   for (clio::run::u32 i = 0; i < kNumTasks; ++i) task_handle_dev[i] = handles[i];
 

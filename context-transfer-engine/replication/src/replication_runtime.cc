@@ -441,26 +441,71 @@ clio::run::TaskResume Runtime::GetBlob(
     //    range (the post-drop state), then restore the DRAM fast path by
     //    copying the WHOLE replica back into the primary (best-effort).
     bool served = false;
+    static const bool heal_trace = getenv("CLIO_HEAL_TRACE") != nullptr;
+    if (heal_trace) {
+      fprintf(stderr, "[heal] blob=%s primary_size=%llu end=%llu replicas=%d\n",
+              blob_name.c_str(), (unsigned long long)primary_size,
+              (unsigned long long)end, config_.num_replicas_);
+    }
     for (int r = 1; r <= config_.num_replicas_ && !served; ++r) {
       clio::run::u64 rep_size = 0;
       {
         auto size_task = cte->AsyncGetBlobSize(
             task->tag_id_, blob_name, clio::run::PoolQuery::Local(), r);
         CLIO_CO_AWAIT(size_task);
+        if (heal_trace) {
+          fprintf(stderr, "[heal]   replica %d rc=%d size=%llu\n", r,
+                  (int)size_task->GetReturnCode(),
+                  (unsigned long long)size_task->size_);
+        }
         if (size_task->GetReturnCode() != 0) {
           continue;
         }
         rep_size = size_task->size_;
       }
-      if (rep_size < end) {
-        continue;
-      }
+      // COVERAGE IS A STORED-BYTES QUESTION, AND `end` IS LOGICAL.
+      //
+      // `rep_size` is the replica's STORED size; `end` is the end of the
+      // range the CALLER asked for, in the blob's logical bytes. For an
+      // untransformed copy those are the same currency and comparing them
+      // is right: a replica holding a prefix must not serve past it.
+      //
+      // For a TRANSFORMED copy they are not. A 64KB blob stored compressed
+      // in 177 bytes made every replica look "too small" (177 < 65536), so
+      // no replica could ever heal a compressed blob -- the read fell
+      // through to a core whose primary had just been dropped and returned
+      // an error. That is the #886 stack case: drop the primary, and the
+      // durable replica that exists to survive exactly that could not be
+      // used.
+      //
+      // A transformed replica holds the blob's WHOLE stored image, so it
+      // can serve any logical range -- the codec above expands it. We only
+      // learn the transform state from the get itself (context_ reports it
+      // OUT), so a short replica is ATTEMPTED and then accepted only if it
+      // really was transformed. Untransformed short replicas are rejected
+      // exactly as before, without an extra round trip.
+      const bool covers_logical = rep_size >= end;
       task->context_.replica_ = r;
+      task->context_.transform_flags_ = 0;
       CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
                              task.template Cast<clio::run::Task>()));
+      const clio::run::u32 rep_transform = task->context_.transform_flags_;
       task->context_.replica_ = 0;
       if (task->GetReturnCode() != 0) {
         continue;
+      }
+      if (!covers_logical && rep_transform == 0) {
+        if (heal_trace) {
+          fprintf(stderr,
+                  "[heal]   replica %d TOO SMALL and untransformed "
+                  "(%llu < %llu)\n",
+                  r, (unsigned long long)rep_size, (unsigned long long)end);
+        }
+        continue;
+      }
+      if (heal_trace) {
+        fprintf(stderr, "[heal]   replica %d SERVED (stored %llu, transform "
+                "0x%x)\n", r, (unsigned long long)rep_size, rep_transform);
       }
       clio::run::u64 recached = 0;
       CLIO_CO_AWAIT(RecachePrimary(task->tag_id_, blob_name, r, rep_size,

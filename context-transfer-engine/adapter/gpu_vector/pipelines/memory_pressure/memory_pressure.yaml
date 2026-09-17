@@ -1,0 +1,148 @@
+# COMBINED memory-pressure x parallelism study: all six workloads, one
+# sweep, one results.csv, one figure.
+#
+# ANCHOR PROBLEMS (calibrate_6gb.py, all measured, MPI peak ~6 GB):
+#   kmeans / weights / grayscott  data_mb=6000        -> 6153-6161 MB
+#   gmx                           K=912 (page-kb 6498) -> 6099 MB @ K=920
+#   lbann                         in=4096 H=172032 b=256 -> 6121 MB
+#   lammps_md                     lattice=126          -> 6319 MB
+#
+# AXES. Per-workload axis values differ (lbann's blocks must divide both
+# weight matrices' page counts -> 64 not 67; lammps_md sweeps --slots
+# because --vram-mb is gone and its list cache is residency-sized), so
+# the CONCRETE values ride zipped ladders in the workload group and the
+# swept axes are the abstract LEVELS 1..4:
+#   cache_level  1..4 -> cache_ladder[level]  (int = total cache MB;
+#                        s<N> = per-vector slots, lammps_md)
+#   blocks_level 1..4 -> blocks_ladder[level] (1 .. ~80% of an RTX
+#                        5080's 84 SMs)
+# The resolved settings land in results.csv as cache_setting /
+# blocks_resolved next to the levels.
+#
+# Per-workload notes (carried over from the individual pipelines):
+#   gmx    --no-dense (a 6 GB mesh cannot hold the in-VRAM reference
+#          beside itself; the exact conservation gate still runs), and
+#          the 1 GB x 67-block corner REFUSES by design: the gather
+#          holds 4 planes/block -> >= 270-plane floor. That hole is the
+#          working-set floor scaling with parallelism, not a bug.
+#   lbann  page_kb=672 (LCM of W1's 16 KB and W2's 672 KB rows);
+#          lr=0.0001 (0.01 diverges to NaN losses at this H -- the loss
+#          gate then fails on nan != nan while weights stay bit-equal).
+#          The paged vector is the WEIGHTS (~2.9 GB): the cache ladder
+#          tops out at residency.
+#   lammps_md  checkpoints every 5 steps through vector.Copy; the
+#          neighbor-list cache (5.05 GB) is residency-sized in the
+#          bench, so total VRAM spans ~5.4-6.3 GB across the ladder.
+#
+# Full CTE stack per cell where the bench supports it (hbm cache + RAM
+# tier + file tier); CLIO_PREFAULT=0 for warmed memory.
+#
+# Run:   ../run.sh memory_pressure.yaml
+# Post:  jarvis ppl post yaml memory_pressure.yaml
+config:
+  name: gv_memory_pressure
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: paged
+      cache_level: 1
+      blocks_level: 1
+      prefault: "0"
+      timeout_sec: 1800
+      output_dir: /tmp/clio_gv/memory_pressure
+
+vars:
+  # ---- zipped per-workload anchor group -----------------------------
+  wl.workload:   [kmeans, weights, grayscott, gmx, lbann, lammps_md]
+  wl.steps:      [4, 3, 4, 0, 5, 20]
+  wl.data_mb:    [6000, 6000, 6000, 0, 0, 0]
+  wl.page_kb:    [1024, 1024, 1024, 6498, 672, 256]
+  wl.atoms:      [0, 0, 0, 200000, 0, 0]
+  wl.in_dim:     [0, 0, 0, 0, 4096, 0]
+  wl.hidden:     [0, 0, 0, 0, 172032, 0]
+  wl.out_dim:    [0, 0, 0, 0, 64, 0]
+  wl.batch:      [0, 0, 0, 0, 256, 0]
+  wl.lr:         [0, 0, 0, 0, 0.0001, 0]
+  wl.lattice:    [0, 0, 0, 0, 0, 126]
+  wl.ckpt:       [0, 0, 0, 0, 0, 5]
+  wl.hbm_mb:     [256, 256, 256, 0, 0, 0]
+  wl.nvme_mb:    [8192, 8192, 8192, 0, 0, 0]
+  wl.repeat:     [1, 0, 1, 1, 0, 0]
+  wl.no_dense:   [false, false, false, true, false, false]
+  wl.cache_ladder:
+    - "1024,2048,4096,6144"
+    - "1024,2048,4096,6144"
+    - "1024,2048,4096,6144"
+    - "1024,2048,4096,6144"
+    - "512,1024,2048,2944"
+    - "s128,s256,s512,s896"
+  wl.blocks_ladder:
+    - "1,16,32,67"
+    - "1,16,32,67"
+    - "1,16,32,67"
+    - "1,16,32,67"
+    - "1,16,32,64"
+    - "1,16,32,67"
+  # ---- swept axes ---------------------------------------------------
+  wl.cache_level: [1, 2, 3, 4]
+  wl.blocks_level: [1, 2, 3, 4]
+
+loop:
+  - [wl.workload, wl.steps, wl.data_mb, wl.page_kb, wl.atoms, wl.in_dim,
+     wl.hidden, wl.out_dim, wl.batch, wl.lr, wl.lattice, wl.ckpt,
+     wl.hbm_mb, wl.nvme_mb, wl.repeat, wl.no_dense, wl.cache_ladder,
+     wl.blocks_ladder]
+  - [wl.cache_level]
+  - [wl.blocks_level]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/memory_pressure"
+
+post: |
+  import matplotlib
+  matplotlib.use('Agg')
+  import matplotlib.pyplot as plt
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  bad = df[df.get('gates_pass', 0) != 1]
+  if len(bad):
+      for _, r in bad.iterrows():
+          logger.warning(f"failed cell: {r['wl.workload']} "
+                         f"cache_level={r['wl.cache_level']} "
+                         f"blocks_level={r['wl.blocks_level']}")
+      logger.warning(f'{len(bad)} cells failed gates -- excluded')
+  df = df[df.gates_pass == 1].copy()
+  # Per-workload time metric: per-step where the bench reports it.
+  TCOL = {'lbann': 'ms_per_step', 'lammps_md': 'ms_per_step'}
+  ORDER = ['kmeans', 'weights', 'grayscott', 'gmx', 'lbann', 'lammps_md']
+  fig, axes = plt.subplots(2, 6, figsize=(26, 8))
+  for j, wl in enumerate(ORDER):
+      g = df[df['wl.workload'] == wl]
+      tcol = TCOL.get(wl, 'bench_ms')
+      ax = axes[0][j]
+      for cs, gg in g.groupby('cache_setting'):
+          gg = gg.sort_values('blocks_resolved')
+          ax.plot(gg['blocks_resolved'], gg[tcol], 'o-', label=str(cs))
+      ax.set_title(wl); ax.set_xlabel('blocks')
+      ax.set_ylabel(tcol); ax.set_xscale('log', base=2)
+      ax.set_yscale('log'); ax.legend(fontsize=6)
+      ax = axes[1][j]
+      if 'faults' in g.columns and g['faults'].notna().any():
+          for b, gg in g.groupby('blocks_resolved'):
+              gg = gg.sort_values('wl.cache_level')
+              ax.plot(gg['wl.cache_level'], gg['faults'], '^-',
+                      label=f'{b} blocks')
+          ax.set_xlabel('cache level (1..4)'); ax.set_ylabel('page faults')
+          ax.legend(fontsize=6)
+      else:
+          ax.set_axis_off()
+  fig.suptitle('memory pressure x parallelism at the 6 GB anchors '
+               '(cache ladders per workload; see yaml)', y=1.0)
+  fig.tight_layout()
+  fig.savefig('memory_pressure.png', dpi=130)
+  cols = ['wl.workload', 'cache_setting', 'blocks_resolved', 'gates_pass',
+          'bench_ms', 'ms_per_step', 'faults', 'evicts', 'vram_peak_mb']
+  df[[c for c in cols if c in df.columns]].to_csv(
+      'memory_pressure_summary.csv', index=False)
+  logger.info('wrote memory_pressure.png + memory_pressure_summary.csv')

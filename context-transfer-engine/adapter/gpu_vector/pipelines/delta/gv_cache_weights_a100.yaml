@@ -1,0 +1,184 @@
+# weights, PAGED, 2 NODES: PAGE CACHE RESIDENCY SWEEP AT A FIXED BLOCK COUNT.
+#
+#   1 workload x 5 residency rungs = 5 cells
+#
+# The rationale for fixing blocks and sweeping cache alone -- and the
+# measurement behind 432 blocks (REG:64 on every paged coroutine kernel ->
+# 4 blocks/SM x 108 SMs = one full A100 wave) -- is written out in
+# gv_cache_kmeans_a100.yaml. It is not repeated here. What IS specific to
+# weights:
+#
+# --data-mb IS PER NODE FOR THIS WORKLOAD AND ONLY THIS WORKLOAD. The paged
+# weights bench has no --data-mb at all: its logical array is
+# blocks x pages x page_kb, so the pkg maps the declared size onto --pages
+# PER BLOCK, and --pages is per block PER NODE. The model therefore grows
+# with the node count, and 32000 here is already the per-node figure -- the
+# same 32 GB/node deck the other four carry, reached by a different route.
+# Writing 64000 here (as kmeans and grayscott correctly do, since theirs is
+# global and split) would silently run TWICE the intended deck.
+#
+#   --pages = 32000*1024 / (432 blocks * 1024 KB) = 74 pages/block
+#   deck    = 432 * 74 * 1 MB = 31968 MB/node
+#
+# weights PINS ONE PAGE PER BLOCK, like kmeans -- a block re-reads its own
+# contiguous run of pages -- so the pinned floor at 432 blocks is 432 of
+# 31968 pages, 1.35%, and the 10% rung is comfortably legal.
+#
+#   rung   cache_mb   slots/block   of 74 pages/block   true residency
+#    10%      3200          7              74               9.5%
+#    25%      8000         18              74              24.3%
+#    50%     16000         37              74              50.0%
+#    80%     25600         59              74              79.7%
+#   100%     32000         74              74             100.0%  (resident)
+#
+# --repeat, NOT --steps. The paged edition has no --passes; --repeat is the
+# re-read knob and the bench reports BEST-OF. 6 re-reads: best-of a re-read
+# is the STEADY-STATE warm number, which is what a residency curve wants --
+# it excludes the compulsory cold pass that flattened kmeans' first run at
+# 2 iterations (see that file's header). (The pkg maps `steps` onto --repeat when repeat is unset, which
+# is why repeat is named explicitly here rather than left to that fallback.)
+#
+# THE DISTRIBUTED CHECKSUM IS THE GATE THAT MATTERS. weights reduces a
+# checksum across nodes, which is what distinguishes a real 2-node run from
+# two independent single-node runs that both passed. gates_pass=0 with a
+# checksum mismatch is a correctness finding, not a cache finding.
+#
+# NO FILE TIER (nvme_mb 0): the end-of-run flush is a clean no-op without
+# one. 20 min wall, resumable by resubmitting (jarvis resumes by row count).
+# FRESH RUN: rm -rf $HOME/gv_pipeline_results/cache_weights first.
+#
+# Submit:  jarvis ppl submit gv_cache_weights_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 110g
+  gpus_per_node: 1
+  time: "00:40:00"
+  job_name: gv_cache_wt
+  output: /u/llogan/gv_job_logs/gv_cache_wt-%j.out
+  error: /u/llogan/gv_job_logs/gv_cache_wt-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "scontrol show hostnames \"$SLURM_JOB_NODELIST\""
+    - "srun -N 2 --ntasks-per-node=1 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+config:
+  name: gv_cache_weights_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: weights
+      variant: paged
+      nodes: 2
+      node_launcher: "srun -N {n} --ntasks-per-node=1 --gpus-per-node=1"
+      hostfile: /u/llogan/.ppi-jarvis/shared/gv_cache_weights_a100/hostfile.txt
+      cluster_port: 9435
+      # ---- FIXED: everything that is not the cache -------------------
+      blocks: 432
+      threads: 256
+      data_mb: 32000       # PER NODE for weights -> --pages 74 per block
+      page_kb: 1024
+      # ITERATIONS SIZED SO THE CACHE CAN ACTUALLY SHOW UP. Measured on
+      # job 21721196 at steps=2: faults fell 3.2x across the ladder
+      # (56896 -> 17842) while bench_ms did not move at all
+      # (16887/17470/13406/16573 ms). The reason is compulsory misses --
+      # at 2 iterations ONE of them is unavoidably cold however large the
+      # cache is, so at most half the accesses were ever cacheable, and
+      # that thin signal sat under a fixed ~40 s 32 GB ingest. At 8 the
+      # ratio is 1 cold to 7 warm and the dynamic range is ~8x. The cells
+      # ran 70-80 s against a 480 s cap, so this is spending headroom that
+      # was already there, not risking it.
+      repeat: 6            # timed re-reads; best-of is reported
+      # 44 GB, NOT 33280. The deck is 432 blocks x 74 pages x 1 MB =
+      # 31968 MB and a 33280 MB tier left only 4% slack -- not enough for
+      # the seed's writeback, which filled the tier and aborted:
+      #   [seed] rounds=576 ABORTED (writeback failed)
+      #   SEED DID NOT CONVERGE (rounds=576, put_errors=179).
+      #   The tier cannot hold this image
+      # That is a CAPACITY failure that looks like a hang from the outside
+      # (the cell burns its whole cap retrying), which is why raising
+      # timeout_sec did not help it.
+      ram_mb: 45056
+      nvme_mb: 0
+      prefault: "0"
+      timeout_sec: 900
+      barrier_sec: 300
+      output_dir: /tmp/clio_gv/cache_weights
+
+vars:
+  # THE ONLY AXIS: total page cache as a fraction of this node's 32000 MB.
+  wl.cache_mb: [3200, 8000, 16000, 25600, 32000]
+
+loop:
+  - [wl.cache_mb]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/cache_weights"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  pd.set_option('display.width', 240)
+
+  DECK_MB_PER_NODE = 32000
+  if 'wl.cache_mb' in df.columns:
+      df['residency_pct'] = (100.0 * df['wl.cache_mb']
+                             / DECK_MB_PER_NODE).round(1)
+
+  cols = [c for c in ['residency_pct', 'wl.cache_mb', 'cache_setting',
+                      'blocks_resolved', 'nodes', 'nodes_finished',
+                      'completed', 'gates_pass', 'bench_ms', 'gbps',
+                      'runtime', 'vram_peak_mb', 'faults', 'evicts', 'puts',
+                      'get_errors', 'put_errors', 'checksum']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+
+  ok = df[(df.get('completed', 0) == 1) & df['bench_ms'].notna()]
+  if len(ok) and 'residency_pct' in ok.columns:
+      full = ok[ok['residency_pct'] >= 100.0]
+      if len(full):
+          base = float(full['bench_ms'].min())
+          curve = ok[['residency_pct', 'bench_ms']].copy()
+          curve['x_resident'] = (curve['bench_ms'] / base).round(2)
+          logger.info('\nweights paged, 432 blocks, 32 GB/node -- cost of a '
+                      'smaller cache:\n'
+                      + curve.sort_values('residency_pct').to_string(index=False))
+      else:
+          logger.warning('the 100%% rung produced no number -- no resident '
+                         'baseline, so the other rungs are absolute only')
+
+  if 'faults' in df.columns:
+      for _, r in df.iterrows():
+          if r.get('completed', 0) != 1:
+              continue
+          f = r.get('faults')
+          pct = r.get('residency_pct', 0)
+          if pct < 100.0 and (pd.isna(f) or float(f or 0) == 0):
+              logger.warning('NO FAULTS at the %s%% rung -- not storage-bound, '
+                             'so this cell does not belong on the curve' % pct)
+
+  # weights is the workload whose gate proves the run was DISTRIBUTED.
+  for _, r in df.iterrows():
+      if r.get('completed', 0) == 1 and r.get('gates_pass', 0) != 1:
+          logger.warning('GATES FAILED at the %s%% rung -- the cross-node '
+                         'checksum did not agree. That is a correctness '
+                         'finding, not a cache result; do not plot this cell.'
+                         % r.get('residency_pct'))
+
+  bad = df[df.get('completed', 0) != 1]
+  for _, r in bad.iterrows():
+      logger.warning('OVER THE 480 s CAP or FAILED: residency %s%% '
+                     '(cache_mb=%s, runtime=%s, nodes_finished=%s)'
+                     % (r.get('residency_pct'), r.get('wl.cache_mb'),
+                        r.get('runtime'), r.get('nodes_finished')))
+
+  if len(df) < 5:
+      logger.warning('only %d of 5 rungs have rows -- RESUBMIT THIS FILE to '
+                     'continue' % len(df))
+  elif not len(bad):
+      logger.info('all 5 residency rungs completed')

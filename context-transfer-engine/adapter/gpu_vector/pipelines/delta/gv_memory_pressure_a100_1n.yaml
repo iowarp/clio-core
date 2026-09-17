@@ -1,0 +1,227 @@
+# memory pressure x parallelism on ONE NCSA Delta A100 -- the SLURM edition
+# of ../memory_pressure/memory_pressure.yaml.
+#
+# WHAT IS THE SAME, DELIBERATELY. Every anchor problem, every ladder, every
+# swept level, and the post: section are copied unchanged from the RTX
+# pipeline. The point of running it here is to compare the SAME 6 GB
+# problems on a different card, and a "port" that also retunes the axes
+# compares nothing. In particular the blocks ladder still tops out at 67,
+# which was 80% of an RTX 5080's 84 SMs; on the A100's 108 SMs that is ~62%,
+# so the top of the parallelism axis UNDER-subscribes this GPU rather than
+# over-subscribing it. Raise it to 86 if you want the A100's own 80% -- but
+# then the two datasets are no longer the same experiment.
+#
+# WHAT IS DIFFERENT.
+#   - a `scheduler:` block, because Delta has no GPU on the login node.
+#     Mode A (no scheduler.* vars): the WHOLE sweep runs inside ONE
+#     allocation, which is what you want when consecutive cells have to see
+#     the same GPU drain (the pkg's _wait_for_gpu_idle).
+#   - one A100 out of the four on a gpuA100x4 node, plus a quarter of the
+#     node's cores and memory.
+#   - output_dir and the file tier live on /tmp (node-local NVMe, purged at
+#     job end). Per-cell logs do NOT survive the job; results.csv does,
+#     under $HOME.
+#
+# SIZING THE WALL CLOCK, FROM MEASURED CELLS. 6 workloads x 4 cache levels x
+# 4 blocks levels = 96 cells. The smoke run (same anchors, cache_level 4 /
+# blocks_level 3 = 32 blocks, job 21582692 on gpua006) timed the CHEAPEST
+# corner of each workload:
+#
+#   gmx 11s   grayscott 18s   kmeans 18s   weights 24s
+#   lbann 143s   lammps_md 147s      (VRAM peak 6.6-7.1 GB throughout)
+#
+# The sweep then walks AWAY from that corner in both directions: blocks_level
+# 1 is ONE block, i.e. 1/32 of the parallelism the numbers above were taken
+# at, and the tighter cache levels add faults on top. The two slow workloads
+# therefore reach timeout_sec=1800 at blocks_level 1 and are truncated there
+# by design (that truncation is the pipeline's own ceiling, not the job's).
+# Adding it up: ~1.2 h for each of the four fast workloads and ~2.6 h for
+# each of lbann and lammps_md, so ~10 h of cells plus the pkg's inter-cell
+# GPU-drain waits. 24:00:00 leaves real headroom; the partition allows 48 h.
+#
+# If you want a shorter job, split it: the workload group is the outer loop,
+# so cutting `wl.workload` (and its zipped rows) to a subset gives you an
+# independent, resumable slice.
+#
+# RESUME, AND THE FOOT-GUN INSIDE IT. jarvis's pipeline-test runner counts
+# the rows already in `<output>/results.csv` and skips that many runs
+# (pipeline_test.py: "Skip already-completed runs" -- it compares a COUNT, not
+# the parameters). For a 24-hour job that is exactly what you want: if the
+# allocation dies at cell 60, resubmitting the same YAML picks up at 61.
+# But it also means a results.csv left over from a DIFFERENT sweep silently
+# eats the first N cells of this one and still reports "N successful". Before
+# a fresh run, clear the directory:
+#     rm -rf $HOME/gv_pipeline_results/memory_pressure_a100
+# (Observed: a gmx-only 8-cell test pointed at the smoke run's output dir ran
+# 2 cells, inherited 6, and reported 8 successes.)
+#
+# Submit:  jarvis ppl submit gv_memory_pressure_a100_1n.yaml
+# Script only (no sbatch):
+#          jarvis ppl submit gv_memory_pressure_a100_1n.yaml +no_submit
+# Re-render figures from stored results, no GPU needed:
+#          jarvis ppl post yaml gv_memory_pressure_a100_1n.yaml
+#
+# ANCHOR PROBLEMS (calibrate_6gb.py, all measured, MPI peak ~6 GB):
+#   kmeans / weights / grayscott  data_mb=6000        -> 6153-6161 MB
+#   gmx                           K=912 (page-kb 6498) -> 6099 MB @ K=920
+#   lbann                         in=4096 H=172032 b=256 -> 6121 MB
+#   lammps_md                     lattice=126          -> 6319 MB
+#
+# AXES. Per-workload axis values differ (lbann's blocks must divide both
+# weight matrices' page counts -> 64 not 67; lammps_md sweeps --slots
+# because --vram-mb is gone and its list cache is residency-sized), so the
+# CONCRETE values ride zipped ladders in the workload group and the swept
+# axes are the abstract LEVELS 1..4:
+#   cache_level  1..4 -> cache_ladder[level]  (int = total cache MB;
+#                        s<N> = per-vector slots, lammps_md)
+#   blocks_level 1..4 -> blocks_ladder[level]
+# The resolved settings land in results.csv as cache_setting /
+# blocks_resolved next to the levels.
+#
+# Per-workload notes (carried over from the individual pipelines):
+#   gmx    --no-dense (a 6 GB mesh cannot hold the in-VRAM reference beside
+#          itself; the exact conservation gate still runs), and the 1 GB x
+#          67-block corner REFUSES by design: the gather holds 4 planes/block
+#          -> >= 270-plane floor. That hole is the working-set floor scaling
+#          with parallelism, not a bug.
+#   lbann  page_kb=672 (LCM of W1's 16 KB and W2's 672 KB rows); lr=0.0001
+#          (0.01 diverges to NaN losses at this H). The paged vector is the
+#          WEIGHTS (~2.9 GB): the cache ladder tops out at residency.
+#   lammps_md  checkpoints every 5 steps through vector.Copy; the neighbor-
+#          list cache (5.05 GB) is residency-sized in the bench.
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 1
+  ntasks_per_node: 1
+  # A quarter node: gpuA100x4 nodes are 64 cores / 256 GB / 4 A100s, and we
+  # take one of the four GPUs. The paged benches host the clio runtime
+  # IN-PROCESS (an external daemon cannot service another process's in-kernel
+  # faults), so the cores here serve the runtime's workers, not extra ranks.
+  cpus_per_task: 16
+  mem: 60g
+  gpus_per_node: 1
+  time: "24:00:00"
+  job_name: gv_mp_a100_1n
+  output: gv_mp_a100_1n-%j.out
+  error: gv_mp_a100_1n-%j.err
+  pre_cmds:
+    # env.sh is what makes the benchmarks runnable: it puts
+    # ${CLIO_GV_BUILD}/bin on PATH and LD_LIBRARY_PATH and exports
+    # CLIO_PREFAULT=0. It is `set -u`-safe and re-sources the lmod init
+    # itself, because the generated script runs under `set -euo pipefail`
+    # in a non-login shell where `module` is not yet a function.
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv"
+
+config:
+  name: gv_memory_pressure_a100_1n
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: paged
+      cache_level: 1
+      blocks_level: 1
+      prefault: "0"
+      timeout_sec: 1800
+      output_dir: /tmp/clio_gv/memory_pressure_a100
+
+vars:
+  # ---- zipped per-workload anchor group -----------------------------
+  wl.workload:   [kmeans, weights, grayscott, gmx, lbann, lammps_md]
+  wl.steps:      [4, 3, 4, 0, 5, 20]
+  wl.data_mb:    [6000, 6000, 6000, 0, 0, 0]
+  wl.page_kb:    [1024, 1024, 1024, 6498, 672, 256]
+  wl.atoms:      [0, 0, 0, 200000, 0, 0]
+  wl.in_dim:     [0, 0, 0, 0, 4096, 0]
+  wl.hidden:     [0, 0, 0, 0, 172032, 0]
+  wl.out_dim:    [0, 0, 0, 0, 64, 0]
+  wl.batch:      [0, 0, 0, 0, 256, 0]
+  wl.lr:         [0, 0, 0, 0, 0.0001, 0]
+  wl.lattice:    [0, 0, 0, 0, 0, 126]
+  wl.ckpt:       [0, 0, 0, 0, 0, 5]
+  wl.hbm_mb:     [256, 256, 256, 0, 0, 0]
+  wl.nvme_mb:    [8192, 8192, 8192, 0, 0, 0]
+  wl.repeat:     [1, 0, 1, 1, 0, 0]
+  wl.no_dense:   [false, false, false, true, false, false]
+  wl.cache_ladder:
+    - "1024,2048,4096,6144"
+    - "1024,2048,4096,6144"
+    - "1024,2048,4096,6144"
+    - "1024,2048,4096,6144"
+    - "512,1024,2048,2944"
+    - "s128,s256,s512,s896"
+  wl.blocks_ladder:
+    - "1,16,32,67"
+    - "1,16,32,67"
+    - "1,16,32,67"
+    - "1,16,32,67"
+    - "1,16,32,64"
+    - "1,16,32,67"
+  # ---- swept axes ---------------------------------------------------
+  wl.cache_level: [1, 2, 3, 4]
+  wl.blocks_level: [1, 2, 3, 4]
+
+loop:
+  - [wl.workload, wl.steps, wl.data_mb, wl.page_kb, wl.atoms, wl.in_dim,
+     wl.hidden, wl.out_dim, wl.batch, wl.lr, wl.lattice, wl.ckpt,
+     wl.hbm_mb, wl.nvme_mb, wl.repeat, wl.no_dense, wl.cache_ladder,
+     wl.blocks_ladder]
+  - [wl.cache_level]
+  - [wl.blocks_level]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/memory_pressure_a100"
+
+post: |
+  import matplotlib
+  matplotlib.use('Agg')
+  import matplotlib.pyplot as plt
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  bad = df[df.get('gates_pass', 0) != 1]
+  if len(bad):
+      for _, r in bad.iterrows():
+          logger.warning(f"failed cell: {r['wl.workload']} "
+                         f"cache_level={r['wl.cache_level']} "
+                         f"blocks_level={r['wl.blocks_level']}")
+      logger.warning(f'{len(bad)} cells failed gates -- excluded')
+  df = df[df.gates_pass == 1].copy()
+  # Per-workload time metric: per-step where the bench reports it.
+  TCOL = {'lbann': 'ms_per_step', 'lammps_md': 'ms_per_step'}
+  ORDER = ['kmeans', 'weights', 'grayscott', 'gmx', 'lbann', 'lammps_md']
+  fig, axes = plt.subplots(2, 6, figsize=(26, 8))
+  for j, wl in enumerate(ORDER):
+      g = df[df['wl.workload'] == wl]
+      tcol = TCOL.get(wl, 'bench_ms')
+      ax = axes[0][j]
+      for cs, gg in g.groupby('cache_setting'):
+          gg = gg.sort_values('blocks_resolved')
+          ax.plot(gg['blocks_resolved'], gg[tcol], 'o-', label=str(cs))
+      ax.set_title(wl); ax.set_xlabel('blocks')
+      ax.set_ylabel(tcol); ax.set_xscale('log', base=2)
+      ax.set_yscale('log'); ax.legend(fontsize=6)
+      ax = axes[1][j]
+      if 'faults' in g.columns and g['faults'].notna().any():
+          for b, gg in g.groupby('blocks_resolved'):
+              gg = gg.sort_values('wl.cache_level')
+              ax.plot(gg['wl.cache_level'], gg['faults'], '^-',
+                      label=f'{b} blocks')
+          ax.set_xlabel('cache level (1..4)'); ax.set_ylabel('page faults')
+          ax.legend(fontsize=6)
+      else:
+          ax.set_axis_off()
+  fig.suptitle('memory pressure x parallelism at the 6 GB anchors, '
+               'NCSA Delta 1x A100 (cache ladders per workload; see yaml)',
+               y=1.0)
+  fig.tight_layout()
+  fig.savefig('memory_pressure_a100.png', dpi=130)
+  cols = ['wl.workload', 'cache_setting', 'blocks_resolved', 'gates_pass',
+          'bench_ms', 'ms_per_step', 'faults', 'evicts', 'vram_peak_mb']
+  df[[c for c in cols if c in df.columns]].to_csv(
+      'memory_pressure_a100_summary.csv', index=False)
+  logger.info('wrote memory_pressure_a100.png + '
+              'memory_pressure_a100_summary.csv')

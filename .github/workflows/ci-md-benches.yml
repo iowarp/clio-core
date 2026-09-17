@@ -1,0 +1,126 @@
+name: MD baselines compile gate (MPI + NVSHMEM)
+
+# COMPILE gate for the two distributed eternia-MD baselines,
+# context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md/clio_lammps_md_{mpi,nvshmem}_bench.cc.
+#
+# This workflow deliberately does NOT try to run them. GitHub-hosted runners
+# have no GPU, so the distributed test cannot execute here at all; that job
+# lives in the repo as a script, not as CI:
+#
+#     context-transfer-engine/adapter/gpu_vector/test/distributed_md/
+#         run_md_distributed.sh
+#
+# which stands up two containers, compiles both benches inside each, runs
+# them as 2-rank jobs and asserts the physics gates plus a nonzero migrant
+# count. Run it on any GPU host (it is what was used to validate these
+# files). A CI job that could never run would be worse than none: it reads
+# as coverage that does not exist.
+#
+# What IS real coverage here: compiling CUDA needs nvcc, not a GPU, so the
+# compile-rot failure mode -- by far the likeliest way these two files break
+# -- is caught on a standard runner, in review, on every PR that touches
+# them.
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md/clio_lammps_md_mpi_bench.cc'
+      - 'context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md/clio_lammps_md_nvshmem_bench.cc'
+      - 'context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md/CMakeLists.txt'
+      - 'context-transfer-engine/adapter/gpu_vector/test/distributed_md/**'
+      - '.github/workflows/ci-md-benches.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-md-benches-${{ github.ref }}
+  # Cancel superseded PR-branch runs only; a merge to a shared branch must
+  # always finish (same rationale as gpu-tests.yml).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  BENCH_DIR: context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md
+  NVSHMEM_WHEEL: nvidia-nvshmem-cu12
+
+jobs:
+  compile-md-benches:
+    name: Compile both MD baselines (nvcc, no GPU needed)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install CUDA toolkit
+        run: |
+          if ! command -v nvcc &>/dev/null; then
+            wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+            sudo dpkg -i cuda-keyring_1.1-1_all.deb
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq cuda-toolkit-12-6
+          fi
+          echo "/usr/local/cuda/bin" >> $GITHUB_PATH
+
+      - name: Install OpenMPI
+        run: sudo apt-get install -y -qq libopenmpi-dev openmpi-bin
+
+      # The wheel ships headers plus libnvshmem_host.so.3 and the rdc device
+      # archive -- everything the link needs and nothing that needs a driver.
+      # find_library wants an unversioned soname, hence the symlink.
+      - name: Install NVSHMEM (wheel)
+        run: |
+          python3 -m pip install --quiet --target "$HOME/nvshmem-pkg" "$NVSHMEM_WHEEL"
+          NVS="$HOME/nvshmem-pkg/nvidia/nvshmem"
+          ln -sf libnvshmem_host.so.3 "$NVS/lib/libnvshmem_host.so"
+          echo "NVSHMEM_HOME=$NVS" >> $GITHUB_ENV
+
+      # Compiled for two architectures on purpose: sm_80 and sm_89 lower
+      # differently, and a device-side change that only breaks on one of them
+      # is exactly the sort of thing a single-arch build waves through. (Not
+      # sm_70: NVSHMEM's device archive is not guaranteed to carry it, and a
+      # missing cubin fails at nvlink for a reason unrelated to this code.)
+      - name: Compile clio_lammps_md_nvshmem_bench
+        run: |
+          nvcc -x cu -std=c++17 -O2 \
+              -gencode=arch=compute_80,code=sm_80 \
+              -gencode=arch=compute_89,code=sm_89 \
+              -rdc=true -DMD_NVSHMEM_USE_MPI \
+              -I"$NVSHMEM_HOME/include" \
+              -I/usr/lib/x86_64-linux-gnu/openmpi/include \
+              "$BENCH_DIR/clio_lammps_md_nvshmem_bench.cc" -o /tmp/clio_lammps_md_nvshmem_bench \
+              -L"$NVSHMEM_HOME/lib" -lnvshmem_device -lnvshmem_host \
+              -Xlinker /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so
+
+      - name: Compile clio_lammps_md_mpi_bench
+        run: |
+          nvcc -x cu -std=c++17 -O2 \
+              -gencode=arch=compute_80,code=sm_80 \
+              -gencode=arch=compute_89,code=sm_89 \
+              -I/usr/lib/x86_64-linux-gnu/openmpi/include \
+              "$BENCH_DIR/clio_lammps_md_mpi_bench.cc" -o /tmp/clio_lammps_md_mpi_bench \
+              -Xlinker /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so
+
+      # Both binaries must at least reach argument parsing without a GPU. This
+      # catches a link that resolved but cannot load (a missing soname), which
+      # a compile-only check would pass.
+      - name: Both binaries load and reject a bad argument
+        run: |
+          export LD_LIBRARY_PATH="$NVSHMEM_HOME/lib:${LD_LIBRARY_PATH:-}"
+          for b in /tmp/clio_lammps_md_mpi_bench /tmp/clio_lammps_md_nvshmem_bench; do
+            if "$b" --not-an-argument 2>&1 | grep -q 'unknown arg'; then
+              echo "OK: $b loads and parses"
+            else
+              echo "FAIL: $b did not reach argument parsing"; exit 1
+            fi
+          done
+
+      # The harness is shell + compose; a syntax error in either would only
+      # surface on a GPU host otherwise.
+      - name: Validate the distributed harness
+        run: |
+          bash -n context-transfer-engine/adapter/gpu_vector/test/distributed_md/run_md_distributed.sh
+          cd context-transfer-engine/adapter/gpu_vector/test/distributed_md
+          HOST_WORKSPACE=/tmp CUDA_HOME=/tmp NVSHMEM_HOME=/tmp MD_SSH_DIR=/tmp \
+            docker compose config -q

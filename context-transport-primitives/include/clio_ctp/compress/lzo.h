@@ -34,7 +34,10 @@
 #ifndef CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Lzo_H_
 #define CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Lzo_H_
 
-#if CTP_ENABLE_COMPRESS
+// Optional codec: compiled out when the library was not found at
+// configure time. CompressionFactory returns nullptr for it instead,
+// which is the same contract the optional GPU codecs already use.
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_LZO
 
 #include <lzo/lzo1x.h>
 
@@ -72,6 +75,6 @@ class Lzo : public Compressor {
 
 }  // namespace ctp
 
-#endif  // CTP_ENABLE_COMPRESS
+#endif  // CTP_ENABLE_COMPRESS && CTP_ENABLE_LZO
 
 #endif  // CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Lzo_H_

@@ -37,6 +37,27 @@ class MemBdevTransport : public BdevTransport {
   clio::run::u64 GetRemainingSize() const override { return allocator_.GetRemainingSize(); }
 
   /**
+   * Synchronous single-extent read, callable from ANY worker fiber — the
+   * fault-chain level-collapse entry (see clio_direct_read in the core lib).
+   * No task, no coroutine, no yield: host destinations memcpy inline; device
+   * destinations enqueue on a borrowed stream and block on it (~45 µs for a
+   * pinned-tier page vs ~500 µs of await-resume latency on the task path).
+   *
+   * @return 0 on success; nonzero → caller must fall back to the task path
+   *         (device-backed tier, out of bounds, or no stream available).
+   */
+  int DirectRead(clio::run::u64 off, clio::run::u64 size, char* dst);
+  /** Write-side twin of DirectRead: in-process write of a tier-resident
+   *  range, no dispatched task. Nonzero = use the task path. When
+   *  `pending_stream` is non-null a GPU-involved copy is returned STILL IN
+   *  FLIGHT through it; the caller polls it done and returns the stream. */
+  int DirectWrite(clio::run::u64 off, clio::run::u64 size, const char* src,
+                  void** pending_stream = nullptr);
+
+  /** Device base of a kHbm tier (nullptr otherwise) — zero-copy mapping. */
+  char *DeviceBase() const { return device_backed_ ? device_base_ : nullptr; }
+
+  /**
    * Whether RAM page `page_idx` has been committed (its backing memory
    * allocated) yet.
    *
@@ -159,6 +180,38 @@ class MemBdevTransport : public BdevTransport {
   bool shm_backed_ = false;
   std::string shm_name_;
 
+  /**
+   * kHbm backing: ONE cudaMalloc'd device buffer covering the whole capacity,
+   * indexed exactly like the SHM mapping (page N is an offset, not a separate
+   * allocation).
+   *
+   * BdevType::kHbm has always been documented as "GPU High-Bandwidth Memory
+   * via cudaMalloc (device memory)", but nothing ever allocated it: kHbm fell
+   * through to the same `new char[]` as a plain RAM device, so a configured
+   * GPU tier was host memory wearing a different name. Every measurement that
+   * assumed a fast device tier and a slow spill tier was really measuring host
+   * against host.
+   *
+   * One allocation rather than per-page: cudaMalloc is a synchronizing call,
+   * and paying it per 1 GiB page during a write would stall every stream in
+   * flight.
+   */
+  char *device_base_ = nullptr;
+  size_t device_usable_ = 0;
+  bool device_backed_ = false;
+
+  /** @return true if `page_idx` lies inside the device allocation. */
+  bool DevicePageInBounds(size_t page_idx) const {
+    if (kRamPageSize != 0 && page_idx > device_usable_ / kRamPageSize) {
+      return false;  // guards the multiply below from overflowing
+    }
+    return page_idx * kRamPageSize < device_usable_;
+  }
+
+  /** Allocate the device buffer for a kHbm pool. Best-effort: a host with no
+   *  usable GPU keeps the previous host-memory behaviour. */
+  void InitDeviceBacking();
+
   // Incremental population of the sparse SHM mapping (SystemInfo::BulkFault).
   // First-touch demand faulting made cold placement ~20x slower than warm on
   // WSL2 (one #PF per 4KB of memcpy), so when an allocation crosses this
@@ -172,6 +225,10 @@ class MemBdevTransport : public BdevTransport {
   std::atomic<clio::run::u64> populated_bytes_{0};
   /** Bulk-fault [populated_bytes_, round_up(end, unit)) if end crosses it. */
   void EnsurePopulated(clio::run::u64 end);
+  /** SHM spans EnsurePopulated pinned for async GPU DMA; unpinned in
+   *  Destroy() before the mapping is torn down. */
+  std::mutex pinned_spans_mu_;
+  std::vector<std::pair<char *, size_t>> pinned_spans_;
 
   // A lazily-allocated RAM page. A kPinned pool allocates page-locked host
   // memory through GpuApi (cudaMallocHost / hipHostMalloc / sycl::malloc_host)

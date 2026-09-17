@@ -88,6 +88,9 @@ static ggml_backend_buffer_t ggml_iowarp_buft_alloc_buffer(
             for (size_t p = p0; p < p1; ++p) ctx->mgr->Vmm().touchPage(p);
             cudaMemcpy(data, src, size, cudaMemcpyDeviceToHost);
         },
+        // set_tensor_2d / get_tensor_2d — optional strided copies, not needed
+        nullptr,
+        nullptr,
         // cpy_tensor — device-to-device copy within the same Vmm space
         [](ggml_backend_buffer_t, const struct ggml_tensor* src,
                 struct ggml_tensor* dst) -> bool {
@@ -753,6 +756,8 @@ static const ggml_backend_i k_iowarp_be_iface = {
     /* .free               = */ iowarp_be_free,
     /* .set_tensor_async   = */ iowarp_be_set_tensor_async,
     /* .get_tensor_async   = */ iowarp_be_get_tensor_async,
+    /* .set_tensor_2d_async= */ nullptr,  // optional strided copies
+    /* .get_tensor_2d_async= */ nullptr,
     /* .cpy_tensor_async   = */ nullptr,  // fall back to sync copy
     /* .synchronize        = */ iowarp_be_synchronize,
     /* .graph_plan_create  = */ nullptr,

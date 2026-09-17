@@ -54,35 +54,15 @@ using Timestamp = std::chrono::steady_clock::time_point;
 struct CompressorConfig {
   static constexpr const char* chimod_lib_name = "clio_cte_compressor";
 
-  std::string qtable_model_path_;
-  std::string linreg_model_path_;
-  std::string distribution_model_path_;
-  std::string dnn_model_weights_path_;
   std::string trace_folder_path_;
   clio::run::PoolId next_pool_id_;  ///< Pool ID of the next module in the pipeline
                                ///< (e.g., CTE core at 513.0)
-  /**
-   * When true (default), the compressor tracks per-tag consumer node sets
-   * via Decompress requests and uses them to route Compress placement
-   * toward the most recent consumer of the same tag. When false, the
-   * tracking map and PollConsumers periodic are bypassed and Compress
-   * tasks fall back to pure DirectHash routing on the tag_id. Set false
-   * for benchmarks where you want to isolate the cost of the tracking
-   * mechanism itself, or for workloads with no clear producer-consumer
-   * locality.
-   */
-  bool tracking_enabled_ = true;
 
   CompressorConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
 
   CompressorConfig(const clio::run::PoolId &pool_id, const CompressorConfig &other)
-      : qtable_model_path_(other.qtable_model_path_),
-        linreg_model_path_(other.linreg_model_path_),
-        distribution_model_path_(other.distribution_model_path_),
-        dnn_model_weights_path_(other.dnn_model_weights_path_),
-        trace_folder_path_(other.trace_folder_path_),
-        next_pool_id_(other.next_pool_id_),
-        tracking_enabled_(other.tracking_enabled_) {
+      : trace_folder_path_(other.trace_folder_path_),
+        next_pool_id_(other.next_pool_id_) {
     (void)pool_id;
   }
 
@@ -92,9 +72,7 @@ struct CompressorConfig {
     // (issue #886) — omitting it silently rewired a programmatically
     // created compressor pool straight to the default core, bypassing any
     // interposer chained beneath it.
-    ar(qtable_model_path_, linreg_model_path_, distribution_model_path_,
-       dnn_model_weights_path_, trace_folder_path_, next_pool_id_,
-       tracking_enabled_);
+    ar(trace_folder_path_, next_pool_id_);
   }
 
   /**
@@ -115,9 +93,6 @@ struct CompressorConfig {
             clio::run::u32 minor = std::stoul(next_str.substr(dot + 1));
             next_pool_id_ = clio::run::PoolId(major, minor);
           }
-        }
-        if (node["tracking_enabled"]) {
-          tracking_enabled_ = node["tracking_enabled"].as<bool>();
         }
       } catch (...) {
         // Config parsing is best-effort

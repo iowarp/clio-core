@@ -95,6 +95,15 @@ else()
     message(STATUS "CTE: cache chimod disabled (use -DCLIO_CTE_ENABLE_CACHE=ON)")
 endif()
 
+# Checkpoint chimod -- the fault handler behind vector.Copy's lazy copies.
+option(CLIO_CTE_ENABLE_CHECKPOINT "Build the checkpoint chimod" ON)
+if(CLIO_CTE_ENABLE_CHECKPOINT)
+    message(STATUS "CTE: building checkpoint chimod")
+    add_subdirectory(checkpoint)
+else()
+    message(STATUS "CTE: checkpoint chimod disabled")
+endif()
+
 # Add the indexer ChiMod (issue #905) — owns the SemanticSearch index as an
 # interposer above the CTE core. Small and dependency-free.
 option(CLIO_CTE_ENABLE_INDEXER "Build the indexer chimod (#905)" ON)

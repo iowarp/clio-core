@@ -34,7 +34,8 @@
 #ifndef CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Brotli_H_
 #define CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Brotli_H_
 
-#if CTP_ENABLE_COMPRESS
+// Optional codec: see the note in snappy.h.
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_BROTLI
 
 #include <brotli/decode.h>
 #include <brotli/encode.h>
@@ -87,6 +88,6 @@ class Brotli : public Compressor {
 
 }  // namespace ctp
 
-#endif  // CTP_ENABLE_COMPRESS
+#endif  // CTP_ENABLE_COMPRESS && CTP_ENABLE_BROTLI
 
 #endif  // CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Brotli_H_

@@ -1,0 +1,256 @@
+# CACHE PRESSURE: dataset >> cache, cache driven to the floor.
+#
+# Gray-Scott plus the three eternia application workloads (LAMMPS, GROMACS,
+# LBANN). Each sweeps six points of halving cache over its OWN slot list,
+# scaled to its OWN dataset -- see the vars block. The applications are not
+# comparable to Gray-Scott in absolute terms and are not meant to be; what is
+# comparable is the SHAPE of each curve as residency falls.
+#
+# WHY THIS EXISTS. gv_cache_trend swept coverage 0.5 -> 0.1 and Gray-Scott
+# barely moved. That was not because cache size does not matter -- it was
+# because the cache was never under pressure. Gray-Scott's reuse is a SLIDING
+# WINDOW of 8 planes (z-1,z,z+1 of u and v, plus two outputs), and at 320
+# slots/block the cache held that window FORTY TIMES OVER. Its faults sat at
+# ~4.4 per z-iteration against an ideal of 4, i.e. essentially perfect reuse,
+# with no headroom for any cache size to improve or degrade.
+#
+# So this sweep drives the cache from 40x the window down to EXACTLY the
+# window (8 planes, the benchmark's hard floor -- below it a plane still being
+# read could be evicted, which would silently return wrong data rather than
+# fail). That is where reuse has to collapse, and where the shape of the curve
+# is actually informative.
+#
+#   grid          10240 MB = 1.25x this card's VRAM, and 2.5x - 80x the cache.
+#   slots/block   256, 128, 64, 32, 16, 8
+#   total cache   4096, 2048, 1024, 512, 256, 128 MB
+#   window        8 planes = 8 MB per block, 128 MB across 16 blocks
+#
+# So the last point has the cache EQUAL to the window and nothing else, and the
+# first has 32x spare. If the sliding window is what the cache is buying, the
+# curve should be flat across the top and turn sharply near the floor.
+#
+# THE METRIC THAT ANSWERS IT is faults per z-iteration, not milliseconds:
+#   8.0 = no reuse captured at all (every one of the 8 holds faults)
+#   4.0 = perfect window reuse (only the 2 incoming planes + 2 outputs fault)
+# Timings on this workload move ~26% run to run; faults move ~0.03%, so the
+# fault ratio is the trustworthy signal and the times are corroboration.
+#
+# GEOMETRY: one page is one XY plane, so at 1 MB pages the grid is
+# 512 x 512 x 2560 across 4 fields = 10240 planes total, 640 per block.
+# z-iterations = 2560 per step x 2 steps = 5120, each holding 8 planes,
+# so 40960 holds total: 40960 faults means zero reuse, 20480 means perfect.
+#
+# STANDING CAVEAT: Gray-Scott's field checksum is not reproducible run to run
+# (3.37e-04 spread on identical settings), so treat these timings as
+# indicative. The FAULT counts are not affected by that nondeterminism.
+#
+# Requires: clio_gpu_vector_grayscott_bench on PATH (<build>/bin), a CUDA device.
+#
+# Usage (from the repo root):
+#   export PATH=$PWD/build-coro/bin:$PATH
+#   jarvis repo add ./jarvis_clio_core
+#   jarvis ppl run yaml \
+#     context-transfer-engine/adapter/gpu_vector/pipelines/gv_grayscott_pressure.yaml
+
+config:
+  name: gv_grayscott_pressure
+  # Inside `config:` -- a top-level `env:` is silently dropped by the pipeline
+  # test loader, which dumps only this sub-dict to the temp yaml it runs.
+  env:
+    CLIO_PREFAULT: "2GB"
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gpu_vector_grayscott
+      pkg_name: gs
+
+      data_mb: 10240
+      page_kb: 1024
+      blocks: 16
+      hbm_mb: 1024
+      hbm_only: false
+      threads: 256
+      steps: 2
+      repeat: 3
+
+      Du: 0.2
+      Dv: 0.1
+      F: 0.02
+      K: 0.048
+      dt: 1.0
+
+      vram_budget_gb: 7.0
+      timeout_sec: 3600
+      output_dir: "/tmp/gv_gs_pressure"
+
+      # Swept directly rather than as a fraction: the interesting range runs
+      # down to the 8-plane floor, which no round fraction of 640 lands on.
+      cache_mb: 0
+      cache_frac: 0.0
+      slots: 256
+
+    # ---- the three eternia application workloads under the same pressure --
+    #
+    # Same question asked of the applications: drive the cache down until reuse
+    # collapses, and see where the curve bends.
+    #
+    # Their slot lists are SCALED, not shared. Gray-Scott's 256 slots x 16
+    # blocks x 1024 KB is a 4 GB cache, larger than any of these three
+    # datasets -- running them at that point would measure a fully resident
+    # array and call it a cache sweep. Each list starts near full residency for
+    # that workload and halves down, so all four sweep the same SHAPE.
+    #
+    # LAMMPS is the one to watch: it is the only write-heavy workload of the
+    # set, so pressure forces writeback and eviction of DIRTY pages rather than
+    # refetching of clean ones.
+    #
+    # LBANN'S CACHE AXIS IS INERT, and that is a property of the kernel rather
+    # than a badly chosen sweep. Every LBANN kernel -- forward, backward-input,
+    # weight-gradient and the SGD update -- calls DropAll() on entry, because
+    # the host may have rewritten the backing store between launches and a
+    # resident page could otherwise be stale. Each kernel then makes a SINGLE
+    # pass over W. So there is no reuse for a cache to capture across calls or
+    # within one, and the fault count is fixed by the number of pages touched:
+    # measured flat at 4100 faults from 64 slots down to 2. It is included
+    # anyway because "this workload cannot benefit from a bigger cache" is a
+    # result, and one that a reader would otherwise assume the opposite of.
+    - pkg_type: jarvis_clio_core.clio_eternia_lammps
+      pkg_name: lmp
+      lattice_cells: 25
+      steps: 20
+      page_kb: 256
+      blocks: 16
+      threads: 256
+      slots: 16
+      cache_mb: 0
+      cache_frac: 0.0
+      timeout_sec: 1800
+      output_dir: "/tmp/gv_pressure_lammps"
+    - pkg_type: jarvis_clio_core.clio_eternia_gromacs
+      pkg_name: gmx
+      cells: 60
+      steps: 2
+      page_kb: 64
+      blocks: 16
+      slots: 8
+      cache_mb: 0
+      cache_frac: 0.0
+      timeout_sec: 1800
+      output_dir: "/tmp/gv_pressure_gromacs"
+    - pkg_type: jarvis_clio_core.clio_eternia_lbann
+      pkg_name: lb
+      width: 8192
+      epochs: 2
+      page_kb: 256
+      blocks: 16
+      slots: 64
+      cache_mb: 0
+      cache_frac: 0.0
+      host_weights: true
+      own_weights: false
+      timeout_sec: 1800
+      output_dir: "/tmp/gv_pressure_lbann"
+
+vars:
+  gs.slots: [256, 128, 64, 32, 16, 8]
+  # Scaled per workload: the same six-point halving, but starting from roughly
+  # full residency for THAT dataset. Sharing Gray-Scott's list would run the
+  # applications with a cache several times larger than their whole array.
+  #   LBANN   W = 256 MB over 16 blocks at 256 KB -> 64 slots is full residency
+  #   LAMMPS  44 MB   -> 16 slots is about 1.5x the dataset
+  #   GROMACS 4.3 MB at 64 KB -> 8 slots is about 2x the dataset
+  # LAMMPS stops at 3, not 1: the pair style needs the i-atom page and the
+  # j-atom page resident together plus one spare, and refuses less. Asking for
+  # 2 and 1 cost two cells of a previous run -- they ran LAMMPS and died inside
+  # the pair style rather than being rejected up front, which the package now
+  # does. GROMACS holds its i-atoms in scratch and is correct at a single slot.
+  lb.slots:  [64, 32, 16, 8, 4, 2]
+  lmp.slots: [16, 12, 8, 6, 4, 3]
+  gmx.slots: [8, 4, 2, 1, 1, 1]
+
+loop:
+  - [gs.slots, lb.slots, lmp.slots, gmx.slots]
+
+repeat: 1
+
+run_timeout: 3600
+
+output: "/home/llogan/Documents/Projects/iowarp/core/results/gv_grayscott_pressure"
+
+post: |
+  import re, os, glob
+  BLOCKS = 16
+  STEPS = 2
+  ANSI = re.compile(r'\x1b\[[0-9;]*m')
+
+  def field(line, key):
+      m = re.search(r'(?:^|\s)' + key + r'=([0-9.]+)', line)
+      return float(m.group(1)) if m else None
+
+  # Read the benchmark's own summary lines: the package's stats are fine here
+  # (one workload, no key collisions) but the log carries nz, which the fault
+  # ratio needs.
+  data = {}
+  for fn in glob.glob('/tmp/gv_gs_pressure/*.log'):
+      try:
+          txt = ANSI.sub('', open(fn, errors='replace').read())
+      except OSError:
+          continue
+      last = None
+      for ln in txt.splitlines():
+          # Not 'GRAYSCOTT blocks=': the summary line gained a `mode=` field
+          # when the baseline kernel was added, so the old marker matched
+          # nothing and every row came out empty.
+          if ln.startswith('GRAYSCOTT ') and 'ms=' in ln:
+              last = ln
+      if last is None:
+          continue
+      sl = field(last, 'slots')
+      if sl is not None:
+          data[int(sl)] = last
+
+  slots = sorted(data.keys(), reverse=True)
+  lines = ['Gray-Scott under cache pressure: grid 10240 MB (1.25x VRAM), '
+           '1 MB pages, 16 blocks',
+           'window = 8 planes/block; cache driven from 32x the window down to 1x',
+           '']
+  lines.append(f"  {'slots/blk':>10} {'cache MB':>9} {'x window':>9} "
+               f"{'step_ms':>10} {'faults':>9} {'faults/z':>9} {'reuse':>8} {'vs 256':>8}")
+  base = None
+  for s in slots:
+      ln = data[s]
+      ms = field(ln, 'ms')
+      ft = field(ln, 'faults')
+      nz = field(ln, 'nz')
+      cache = BLOCKS * s
+      # z-iterations across the whole grid: nz per field, all blocks, per step.
+      zit = (nz * STEPS) if nz else None
+      fpz = (ft / zit) if (ft and zit) else None
+      # 8 holds per z: 4.0 = perfect window reuse, 8.0 = none.
+      reuse = ((8.0 - fpz) / 4.0 * 100.0) if fpz else None
+      if base is None and ms:
+          base = ms
+      rel = ((ms / base - 1) * 100) if (ms and base) else None
+      lines.append(f"  {s:>10} {cache:>9} {cache/128.0:>8.1f}x "
+                   f"{(f'{ms:.0f}' if ms else '-'):>10} "
+                   f"{(f'{ft:.0f}' if ft else '-'):>9} "
+                   f"{(f'{fpz:.2f}' if fpz else '-'):>9} "
+                   f"{(f'{reuse:.0f}%' if reuse is not None else '-'):>8} "
+                   f"{(f'{rel:+.1f}%' if rel is not None else '-'):>8}")
+
+  lines += ['', 'marginal cost of each halving of the cache:']
+  for i in range(len(slots) - 1):
+      a, b = slots[i], slots[i + 1]
+      ma, mb = field(data[a], 'ms'), field(data[b], 'ms')
+      fa, fb = field(data[a], 'faults'), field(data[b], 'faults')
+      if ma and mb:
+          lines.append(f'  {a:>4} -> {b:<4} slots: {(mb/ma-1)*100:+6.1f}% time'
+                       f'   faults {fa:.0f} -> {fb:.0f} '
+                       f'({(fb/fa-1)*100:+.1f}%)')
+
+  lines += ['',
+            'faults/z: 4.0 = perfect sliding-window reuse (only the 2 incoming',
+            'planes and 2 outputs fault); 8.0 = no reuse at all. This is the',
+            'number to read -- timings on this workload move ~26% run to run,',
+            'fault counts ~0.03%.']
+
+  open('grayscott_pressure_summary.txt', 'w').write('\n'.join(lines) + '\n')
+  logger.info('post: wrote grayscott_pressure_summary.txt')

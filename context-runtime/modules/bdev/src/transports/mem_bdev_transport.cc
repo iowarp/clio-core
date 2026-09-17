@@ -3,6 +3,10 @@
  * All rights reserved.
  */
 
+#include "clio_runtime/cycle_counter.h"
+extern "C" void clio_evlat_add(int which, unsigned long long cycles);
+extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
+                                       void *stream);
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/worker.h>
@@ -11,6 +15,7 @@
 #include <clio_ctp/util/config_parse.h>
 #include <clio_ctp/util/gpu_api.h>
 #include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 
@@ -47,6 +52,12 @@ bool MemBdevTransport::Init(const CreateParams& params,
   // exactly as before on the private heap; only the client fast path is lost.
   if (bdev_type_ == BdevType::kRam && runtime != nullptr) {
     InitShmBacking(runtime->pool_id_);
+  }
+
+  // kHbm is DEVICE memory. Until this existed it was silently the same host
+  // heap as kRam, so a "GPU tier" cost exactly what the tier below it cost.
+  if (bdev_type_ == BdevType::kHbm) {
+    InitDeviceBacking();
   }
 
   // CLIO_PREFAULT: pre-fault the RAM segment at init instead of (or ahead of)
@@ -156,6 +167,32 @@ bool MemBdevTransport::Init(const CreateParams& params,
   return true;
 }
 
+void MemBdevTransport::InitDeviceBacking() {
+#if CTP_ENABLE_GPU
+  if (ram_capacity_ == 0) {
+    return;
+  }
+  device_base_ = ctp::GpuApi::Malloc<char>(static_cast<size_t>(ram_capacity_));
+  if (device_base_ == nullptr) {
+    // Do NOT degrade to host memory. A kHbm tier that is quietly host-backed
+    // turns every tiering number into a host-to-host measurement while still
+    // reporting success, which is worse than not running at all.
+    HLOG(kFatal,
+         "HBM bdev: cudaMalloc of {} bytes failed. The kHbm tier must be "
+         "real device memory; refusing to serve it from host memory.",
+         ram_capacity_);
+    return;
+  }
+  device_usable_ = static_cast<size_t>(ram_capacity_);
+  device_backed_ = true;
+  HLOG(kInfo, "HBM bdev: {} bytes of DEVICE memory allocated", ram_capacity_);
+#else
+  HLOG(kWarning,
+       "HBM bdev requested in a build with no GPU support -- this tier is "
+       "host memory, not device memory");
+#endif
+}
+
 void MemBdevTransport::InitShmBacking(const clio::run::PoolId &pool_id) {
   try {
     auto pid = static_cast<clio::run::u32>(ctp::SystemInfo::GetPid());
@@ -253,6 +290,17 @@ void MemBdevTransport::PreallocateRamPages() {
 }
 
 void MemBdevTransport::Destroy() {
+#if CTP_ENABLE_GPU
+  {
+    // Unpin before the mapping goes away; a registered range must not
+    // outlive its backing.
+    std::lock_guard<std::mutex> lock(pinned_spans_mu_);
+    for (auto &span : pinned_spans_) {
+      ctp::GpuApi::TryUnregisterHostMemory(span.first);
+    }
+    pinned_spans_.clear();
+  }
+#endif
   if (shm_backed_) {
     // Mark unusable before tearing the mapping down so a client that is
     // mid-attach refuses rather than reading a dying segment.
@@ -264,6 +312,15 @@ void MemBdevTransport::Destroy() {
     shm_backed_ = false;
     shm_backend_.shm_destroy();
   }
+#if CTP_ENABLE_GPU
+  if (device_backed_ && device_base_ != nullptr) {
+    ctp::GpuApi::Free(device_base_);
+  }
+#endif
+  device_base_ = nullptr;
+  device_usable_ = 0;
+  device_backed_ = false;
+
   std::lock_guard<std::mutex> lock(ram_pages_mu_);
   for (RamPage &page : ram_pages_) {
     FreeRamPage(page);
@@ -326,6 +383,21 @@ void MemBdevTransport::EnsurePopulated(clio::run::u64 end) {
                                                std::memory_order_acq_rel,
                                                std::memory_order_acquire)) {
       ctp::SystemInfo::BulkFault(shm_base_ + cur, target - cur);
+#if CTP_ENABLE_GPU
+      // Pin the span we just committed. Unpinned SHM turns every
+      // MemcpyAsync against this tier into a driver-staged SYNCHRONOUS
+      // copy (~2.4 GB/s measured against ~12 GB/s pinned), which was the
+      // whole flush-bench gap vs a raw cudaMemcpy. Spans are disjoint by
+      // the CAS claim above, so no range registers twice. Best-effort: a
+      // GPU-less host just skips it. CLIO_BDEV_NO_PIN=1 opts out (pinning
+      // holds the committed pages in RAM).
+      static const bool no_pin = std::getenv("CLIO_BDEV_NO_PIN") != nullptr;
+      if (!no_pin && ctp::GpuApi::GetDeviceCount() > 0 &&
+          ctp::GpuApi::TryRegisterHostMemory(shm_base_ + cur, target - cur)) {
+        std::lock_guard<std::mutex> lock(pinned_spans_mu_);
+        pinned_spans_.emplace_back(shm_base_ + cur, target - cur);
+      }
+#endif
       return;
     }
   }
@@ -353,6 +425,17 @@ char* MemBdevTransport::AllocRamPage(RamPage &page) {
   if (page.data == nullptr) {
     page.data = new char[kRamPageSize];
     page.pinned = false;
+    if (bdev_type_ == BdevType::kPinned) {
+      // NOT silent: a pageable page on a kPinned tier turns every async DMA
+      // out of it into a driver-staged synchronous copy (~2x per-read cost).
+      // One run with a few of these looks like an unexplained 50->75 ms/tok
+      // mode flip -- log it so the flip is attributable.
+      HLOG(kError,
+           "kPinned bdev '{}': page-locked alloc ({} MB) FAILED -- falling"
+           " back to pageable memory; reads of this page will be"
+           " staged-synchronous",
+           shm_name_, kRamPageSize >> 20);
+    }
   }
   // Zero every page we hand back. A region that was never written must read
   // back as zeros, and neither `new char[]` nor MallocHost guarantees that.
@@ -367,6 +450,12 @@ char* MemBdevTransport::AllocRamPage(RamPage &page) {
 }
 
 char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
+  // Device-backed (kHbm): one cudaMalloc covers the capacity, so a page is an
+  // offset into it -- nothing to allocate, and nothing on the host heap.
+  if (device_backed_ && device_base_ != nullptr &&
+      DevicePageInBounds(page_idx)) {
+    return device_base_ + page_idx * kRamPageSize;
+  }
   // SHM-backed devices need no per-page allocation at all: the whole capacity
   // is one sparse mapping, so a page is just an offset into it.
   //
@@ -395,6 +484,10 @@ char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
 }
 
 char* MemBdevTransport::GetRamPage(size_t page_idx) const {
+  if (device_backed_ && device_base_ != nullptr &&
+      DevicePageInBounds(page_idx)) {
+    return device_base_ + page_idx * kRamPageSize;
+  }
   if (shm_backed_ && shm_base_ != nullptr && ShmPageInBounds(page_idx)) {
     return shm_base_ + page_idx * kRamPageSize;
   }
@@ -448,6 +541,16 @@ void MemBdevTransport::WriteBlocksCpu(const ctp::ipc::FullPtr<WriteTask>& task,
       clio::run::u64 intra = cur_off % kRamPageSize;
       clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
       char* page = EnsureRamPage(page_idx);
+      // A RAM page is PINNED host memory, and that allocation can fail --
+      // it is a scarcer resource than plain DRAM. Unchecked, the null went
+      // straight into the copy below: a segfault on the CPU path and
+      // "MemcpyAsync CUDA Error 1: invalid argument" on the GPU one. Report
+      // a short write instead, which is the same shape a full device
+      // reports and which callers already handle.
+      if (page == nullptr) {
+        task->return_code_ = 1;
+        return;
+      }
       memcpy(page + intra, data + data_offset, chunk);
       cur_off += chunk;
       data_offset += chunk;
@@ -487,6 +590,13 @@ int MemBdevTransport::LaunchWriteBlocksGpu(const ctp::ipc::FullPtr<WriteTask>& t
       clio::run::u64 intra = cur_off % kRamPageSize;
       clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
       char* page = EnsureRamPage(page_idx);
+      // See the CPU path: a pinned-page allocation failure must not become a
+      // null destination for the copy. This is the site that actually fired
+      // -- a gpu_vector flush of ~5.6M atoms exhausted pinned memory and
+      // crashed the run with "invalid argument" out of cudaMemcpyAsync.
+      if (page == nullptr) {
+        return 1;
+      }
       // Enqueue only; the caller yields and waits on the stream afterward.
       ctp::GpuApi::MemcpyAsync(page + intra, data + data_offset, chunk, stream);
       cur_off += chunk;
@@ -521,9 +631,15 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
     CLIO_CO_RETURN;
   }
 
-  // Host source: a synchronous host->host memcpy is fastest and gains nothing
-  // from a GPU stream.
-  if (!ctp::IsDevicePointer(data_ptr.ptr_)) {
+  // Host source AND host pages: a synchronous host->host memcpy is fastest and
+  // gains nothing from a GPU stream.
+  //
+  // device_backed_ has to be part of this test, not just the source pointer.
+  // On a kHbm pool the PAGE is device memory, so plain memcpy into it is
+  // invalid no matter where the source lives -- the host->host path would
+  // fault or silently corrupt. Routing on the source alone was safe only
+  // while kHbm quietly used host memory.
+  if (!device_backed_ && !ctp::IsDeviceAccessible(data_ptr.ptr_)) {
     WriteBlocksCpu(task, data_ptr.ptr_);
     CLIO_CO_RETURN;
   }
@@ -531,18 +647,59 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
   // Device source: enqueue every chunk copy asynchronously on a per-task stream
   // and yield the worker while the transfers are in flight, so concurrent write
   // tasks overlap on the copy engines instead of each blocking a worker.
-  void *stream = ctp::GpuApi::CreateStream();
+  // Borrowed from the pre-created pool -- see GpuApi::BorrowStream and the
+  // matching comment in ReadBlocks below.
+  void *stream = ctp::GpuApi::BorrowStream();
+  // Unbounded, but NOT a thread-blocker: this is a coroutine, so the yield
+  // hands the worker back and other tasks keep running. That distinction is
+  // the whole reason the stream-pool deadlock was on the OTHER path --
+  // DeviceAwareMemcpy waits from a non-coroutine context and blocks a worker,
+  // which then cannot resume the very tasks holding the streams. The error
+  // semantics are deliberately left alone here (a bounded wait would have to
+  // surface as an I/O failure); what was missing was any way to SEE a task
+  // stuck in this loop, since it produces no stack a `pgrep`/gdb sweep can
+  // spot and the scheduler counts the worker as healthy.
+  for (int waits = 0; stream == nullptr; ++waits) {
+    if (waits == 1000) {   // ~10s of 10ms yields
+      HLOG(kWarning,
+           "[stream-pool] bdev write has waited ~10s for a stream "
+           "(outstanding={}). Tasks keep running -- this is a stalled task, "
+           "not a wedged worker -- but a pool that never refills means "
+           "something is holding streams.",
+           ctp::GpuApi::StreamBorrows().load() -
+               ctp::GpuApi::StreamReturns().load());
+    }
+    CLIO_CO_AWAIT(clio::run::yield(10.0));
+    stream = ctp::GpuApi::BorrowStream();
+  }
+  static const bool put_prof = std::getenv("CLIO_PUT_PROF") != nullptr;
+  const auto bw_t0 = std::chrono::steady_clock::now();
   clio::run::u64 bytes_written = 0;
   int rc = LaunchWriteBlocksGpu(task, data_ptr.ptr_, stream, bytes_written);
+  const auto bw_t1 = std::chrono::steady_clock::now();
   if (force_sync_gpu_) {
     // Benchmark A/B: block the worker like the old synchronous path.
-    ctp::GpuApi::Synchronize(stream);
+    ctp::GpuApi::PollSync(stream);
   } else {
     while (!ctp::GpuApi::StreamQuery(stream)) {
       CLIO_CO_AWAIT(clio::run::yield(10.0));
     }
   }
-  ctp::GpuApi::DestroyStream(stream);
+  ctp::GpuApi::ReturnStream(stream);
+  if (put_prof) {
+    const auto bw_t2 = std::chrono::steady_clock::now();
+    auto *w = CLIO_CUR_WORKER;
+    fprintf(stderr, "[bwr] worker=%u launch_us=%lld wait_us=%lld len=%llu "
+            "end_us=%lld\n",
+            w != nullptr ? w->GetId() : 9999u,
+            (long long) std::chrono::duration_cast<std::chrono::microseconds>(
+                bw_t1 - bw_t0).count(),
+            (long long) std::chrono::duration_cast<std::chrono::microseconds>(
+                bw_t2 - bw_t1).count(),
+            (unsigned long long) task->length_,
+            (long long) std::chrono::duration_cast<std::chrono::microseconds>(
+                bw_t2.time_since_epoch()).count());
+  }
 
   task->return_code_ = rc;
   task->bytes_written_ = bytes_written;
@@ -600,6 +757,16 @@ int MemBdevTransport::LaunchReadBlocksGpu(const ctp::ipc::FullPtr<ReadTask>& tas
                                           clio::run::u64& bytes_read) {
   clio::run::u64 total_bytes_read = 0;
   clio::run::u64 data_offset = 0;
+  // CLIO_DR_LOG=1: trace every device-destination read so a corrupted frame
+  // address can be matched against the copy that wrote it (stale-page hunt).
+  static const bool dr_log = getenv("CLIO_DR_LOG") != nullptr;
+  if (dr_log) {
+    fprintf(stderr, "[dr-task] dst %p sz %llu off %llu\n", (void *)data,
+            (unsigned long long)task->length_,
+            (unsigned long long)(task->blocks_.empty()
+                                     ? 0
+                                     : task->blocks_[0].offset_));
+  }
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
@@ -625,6 +792,14 @@ int MemBdevTransport::LaunchReadBlocksGpu(const ctp::ipc::FullPtr<ReadTask>& tas
       // dst is device memory here; enqueue the copy (or a zero-fill for a
       // never-written region) on the stream without waiting.
       if (page) {
+        // Device pointer in, device pointer out -- one D2D copy, no host
+        // staging. This used to bounce D2H+H2D through a mutex-serialized
+        // pinned slab because an indefinitely resident faulting kernel
+        // occupied every SM and starved the intra-device copy forever.
+        // Yieldable kernels remove that premise: a faulting block SUSPENDS
+        // and the kernel EXITS, so nothing is resident while this runs.
+        // The bounce is not kept as a fallback -- a silent host detour would
+        // hide exactly the regression that would matter here.
         ctp::GpuApi::MemcpyAsync(dst, page + intra, chunk, stream);
       } else {
         ctp::GpuApi::MemsetAsync(dst, 0, chunk, stream);
@@ -660,31 +835,242 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
     CLIO_CO_RETURN;
   }
 
-  // Host destination: synchronous host<->host copy.
-  if (!ctp::IsDevicePointer(data_ptr.ptr_)) {
+  // Host destination AND host pages: synchronous host<->host copy.
+  //
+  // As on the write side, device_backed_ must be part of the test: on a kHbm
+  // pool the SOURCE page is device memory, so memcpy out of it is invalid
+  // however the destination is allocated.
+  if (!device_backed_ && !ctp::IsDeviceAccessible(data_ptr.ptr_)) {
     ReadBlocksCpu(task, data_ptr.ptr_);
     CLIO_CO_RETURN;
   }
 
   // Device destination: enqueue async copies on a per-task stream and yield
   // while they run.
-  void *stream = ctp::GpuApi::CreateStream();
+  // Borrowed from a pre-created pool, never created here: creating a stream
+  // while a kernel is resident blocks until that kernel finishes, and the
+  // kernels this serves spin until this very read completes. Yield until one
+  // frees up rather than making a new one. See GpuApi::BorrowStream.
+  void *stream = ctp::GpuApi::BorrowStream();
+  // Unbounded, but NOT a thread-blocker: this is a coroutine, so the yield
+  // hands the worker back and other tasks keep running. That distinction is
+  // the whole reason the stream-pool deadlock was on the OTHER path --
+  // DeviceAwareMemcpy waits from a non-coroutine context and blocks a worker,
+  // which then cannot resume the very tasks holding the streams. The error
+  // semantics are deliberately left alone here (a bounded wait would have to
+  // surface as an I/O failure); what was missing was any way to SEE a task
+  // stuck in this loop, since it produces no stack a `pgrep`/gdb sweep can
+  // spot and the scheduler counts the worker as healthy.
+  for (int waits = 0; stream == nullptr; ++waits) {
+    if (waits == 1000) {   // ~10s of 10ms yields
+      HLOG(kWarning,
+           "[stream-pool] bdev read has waited ~10s for a stream "
+           "(outstanding={}). Tasks keep running -- this is a stalled task, "
+           "not a wedged worker -- but a pool that never refills means "
+           "something is holding streams.",
+           ctp::GpuApi::StreamBorrows().load() -
+               ctp::GpuApi::StreamReturns().load());
+    }
+    CLIO_CO_AWAIT(clio::run::yield(10.0));
+    stream = ctp::GpuApi::BorrowStream();
+  }
   clio::run::u64 bytes_read = 0;
   int rc = LaunchReadBlocksGpu(task, data_ptr.ptr_, stream, bytes_read);
   if (force_sync_gpu_) {
     // Benchmark A/B: block the worker like the old synchronous path.
-    ctp::GpuApi::Synchronize(stream);
+    ctp::GpuApi::PollSync(stream);
   } else {
     while (!ctp::GpuApi::StreamQuery(stream)) {
       CLIO_CO_AWAIT(clio::run::yield(10.0));
     }
   }
-  ctp::GpuApi::DestroyStream(stream);
+  ctp::GpuApi::ReturnStream(stream);
 
   task->return_code_ = rc;
   task->bytes_read_ = bytes_read;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+int MemBdevTransport::DirectRead(clio::run::u64 off, clio::run::u64 size,
+                                 char* dst) {
+  if (size == 0) return 0;
+  if (ram_capacity_ != std::numeric_limits<clio::run::u64>::max() &&
+      off + size > ram_capacity_) {
+    return -1;
+  }
+  // Device-backed tiers used to refuse this path unconditionally ("its D2D
+  // copies have their own scheduling constraints") and that refusal was,
+  // measured, the single largest cost in the eternia fault path: with every
+  // page resident in the hbm tier, EVERY get fell through to the dispatched
+  // task route at ~264 us avg (evchan get_total; read_await 263 us of it),
+  // while the direct-read channel stayed at n=0. The constraint the old
+  // comment gestured at is real but belongs to a different design: an
+  // intra-device D2D memcpy may be scheduled like a kernel, so a workload
+  // that faults FROM A RESIDENT SPINNING KERNEL could see the copy never
+  // schedule and PollSync spin its worker. The yieldable fault path -- the
+  // only one that does not already deadlock for other reasons (see
+  // HoldPageYield) -- services faults BETWEEN rounds with no kernel
+  // resident, where a D2D is as safe as the H2D below. CLIO_DIRECT_READ_DEV=0
+  // restores the old refusal for anything still faulting from a resident
+  // kernel.
+  static const bool dev_direct = [] {
+    const char *e = getenv("CLIO_DIRECT_READ_DEV");
+    return e == nullptr || e[0] != '0';
+  }();
+  if (device_backed_ && !dev_direct) return -1;
+
+  const bool dev_dst = ctp::IsDeviceAccessible(dst);
+  // The stream serves any copy with a device side: device destination, or a
+  // device-backed SOURCE page (GetRamPage returns raw device pointers then,
+  // and memcpy from device memory is invalid however dst is allocated).
+  const bool use_stream = dev_dst || device_backed_;
+  // CLIO_DR_LOG=1: trace device-destination direct reads (stale-page hunt).
+  static const bool dr_log = getenv("CLIO_DR_LOG") != nullptr;
+  if (dr_log && use_stream) {
+    fprintf(stderr, "[dr-direct] dst %p sz %llu off %llu\n", (void *)dst,
+            (unsigned long long)size, (unsigned long long)off);
+  }
+  void* stream = nullptr;
+  if (use_stream) {
+    // Borrowed, never created (creating a stream needs the context write lock
+    // a resident faulting kernel holds — see ReadBlocks). If none is free
+    // RIGHT NOW, fall back to the task path rather than spin on the caller's
+    // fiber.
+    stream = ctp::GpuApi::BorrowStream();
+    if (stream == nullptr) return -1;
+  }
+
+  clio::run::u64 cur_off = off;
+  clio::run::u64 left = size;
+  clio::run::u64 data_offset = 0;
+  while (left > 0) {
+    size_t page_idx = static_cast<size_t>(cur_off / kRamPageSize);
+    clio::run::u64 intra = cur_off % kRamPageSize;
+    clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
+    // NEVER LET ONE CUDA COPY CROSS A REGISTRATION-SPAN BOUNDARY. The SHM
+    // tier is pinned in populate_unit_ quanta as separate cudaHostRegister
+    // calls, and CUDA requires a copy's whole range to lie within ONE
+    // registration -- a range spanning two ADJACENT pinned spans fails with
+    // "invalid argument" (measured: sync and async, base attributes clean,
+    // rlimit unlimited). A tier that fits one span never crosses, which is
+    // why small decks were immune. Split at the quanta like we already split
+    // at page boundaries.
+    if (shm_backed_ && populate_unit_ != 0) {
+      const clio::run::u64 span_left =
+          populate_unit_ - (cur_off % populate_unit_);
+      if (chunk > span_left) chunk = span_left;
+    }
+    char* page = GetRamPage(page_idx);
+    char* d = dst + data_offset;
+    if (page != nullptr && use_stream) {
+      // Direction inferred (cudaMemcpyDefault): covers H2D, D2H and the
+      // device-backed tier's D2D with the same call.
+      ctp::GpuApi::MemcpyAsync(d, page + intra, chunk, stream);
+    } else if (page != nullptr) {
+      std::memcpy(d, page + intra, chunk);
+    } else if (dev_dst) {
+      ctp::GpuApi::MemsetAsync(d, 0, chunk, stream);
+    } else {
+      std::memset(d, 0, chunk);
+    }
+    cur_off += chunk;
+    data_offset += chunk;
+    left -= chunk;
+  }
+
+  if (use_stream) {
+    // Copy-engine work only — safe to block on even with a faulting kernel
+    // resident (kernels block later LAUNCHES, not DMA).
+    const unsigned long long ev_s0 = clio::run::CycleNow();
+    ctp::GpuApi::PollSync(stream);   // never block in driver sync
+    ctp::GpuApi::ReturnStream(stream);
+    clio_evlat_add(3, clio::run::CycleNow() - ev_s0);  // ch3: DirectRead sync portion
+  }
+  return 0;
+}
+
+int MemBdevTransport::DirectWrite(clio::run::u64 off, clio::run::u64 size,
+                                  const char* src, void** pending_stream) {
+  if (pending_stream != nullptr) *pending_stream = nullptr;
+  if (size == 0) return 0;
+  if (ram_capacity_ != std::numeric_limits<clio::run::u64>::max() &&
+      off + size > ram_capacity_) {
+    return -1;
+  }
+  // Same device-tier gate as DirectRead, same rationale: an intra-device
+  // copy issued from a fault serviced BETWEEN kernel rounds is safe; the
+  // env knob restores the refusal for anything still faulting from a
+  // resident kernel.
+  static const bool dev_direct = [] {
+    const char *e = getenv("CLIO_DIRECT_READ_DEV");
+    return e == nullptr || e[0] != '0';
+  }();
+  if (device_backed_ && !dev_direct) return -1;
+
+  const bool dev_src = ctp::IsDeviceAccessible(const_cast<char *>(src));
+  const bool use_stream = dev_src || device_backed_;
+  void* stream = nullptr;
+  if (use_stream) {
+    // Borrowed, never created; none free right now = task path, not a spin.
+    stream = ctp::GpuApi::BorrowStream();
+    if (stream == nullptr) return -1;
+  }
+
+  clio::run::u64 cur_off = off;
+  clio::run::u64 left = size;
+  clio::run::u64 data_offset = 0;
+  while (left > 0) {
+    size_t page_idx = static_cast<size_t>(cur_off / kRamPageSize);
+    clio::run::u64 intra = cur_off % kRamPageSize;
+    clio::run::u64 chunk = std::min<clio::run::u64>(left, kRamPageSize - intra);
+    // NEVER LET ONE CUDA COPY CROSS A REGISTRATION-SPAN BOUNDARY. The SHM
+    // tier is pinned in populate_unit_ quanta as separate cudaHostRegister
+    // calls, and CUDA requires a copy's whole range to lie within ONE
+    // registration -- a range spanning two ADJACENT pinned spans fails with
+    // "invalid argument" (measured: sync and async, base attributes clean,
+    // rlimit unlimited). A tier that fits one span never crosses, which is
+    // why small decks were immune. Split at the quanta like we already split
+    // at page boundaries.
+    if (shm_backed_ && populate_unit_ != 0) {
+      const clio::run::u64 span_left =
+          populate_unit_ - (cur_off % populate_unit_);
+      if (chunk > span_left) chunk = span_left;
+    }
+    // Ensure, not Get: a write ALLOCATES the page it lands in.
+    char* page = EnsureRamPage(page_idx);
+    if (page == nullptr) {
+      if (use_stream) {
+        ctp::GpuApi::PollSync(stream);
+        ctp::GpuApi::ReturnStream(stream);
+      }
+      return -1;
+    }
+    const char* s = src + data_offset;
+    if (use_stream) {
+      ctp::GpuApi::MemcpyAsync(page + intra, s, chunk, stream);
+    } else {
+      std::memcpy(page + intra, s, chunk);
+    }
+    cur_off += chunk;
+    data_offset += chunk;
+    left -= chunk;
+  }
+
+  if (use_stream) {
+    if (pending_stream != nullptr) {
+      // Hand the in-flight stream to the caller: a coroutine caller yields
+      // during the DMA instead of this function busy-spinning the worker,
+      // which is what lets that worker run OTHER puts under the copy.
+      *pending_stream = stream;
+      return 0;
+    }
+    const unsigned long long ev_s0 = clio::run::CycleNow();
+    ctp::GpuApi::PollSync(stream);
+    ctp::GpuApi::ReturnStream(stream);
+    clio_evlat_add(3, clio::run::CycleNow() - ev_s0);
+  }
+  return 0;
 }
 
 } // namespace clio::run::bdev

@@ -15,6 +15,7 @@
 
 namespace bam {
 
+
 class PageCache {
  public:
   /**
@@ -68,6 +69,8 @@ class PageCache {
   uint32_t *d_page_states_;   // Per-page state
   uint64_t *d_page_tags_;     // Per-page tag (storage offset)
   uint32_t *d_page_locks_;    // Per-page spinlock
+  uint32_t *d_page_refs_;     // Per-page pin count (acquire_page/release_page)
+ private:
   uint64_t *d_bus_addrs_;     // Per-cache-page bus addresses (NVMe mode)
 
   // NVMe controller (optional)

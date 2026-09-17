@@ -48,7 +48,13 @@
 #endif
 #include "cte_env.h"
 
-using kvhdf5::byte_t;  // raw blob-payload bytes (codebase convention)
+// NOTE: deliberately NOT named `kv_byte_t`. cuSZ's <cusz.h> (pulled in
+// transitively via clio_ctp/compress/compress_factory.h, which the
+// context-runtime headers include) declares `typedef uint8_t kv_byte_t;` at
+// GLOBAL scope. kvhdf5::byte_t is cuda::std::byte, so a global
+// `using kv_byte_t = kvhdf5::byte_t;
+// fails to compile as soon as CUDA and compression are both enabled.
+using kv_byte_t = kvhdf5::byte_t;
 
 namespace {
 
@@ -58,8 +64,8 @@ constexpr unsigned kSeedBase = 0x40u;  // chunk c uses seed (kSeedBase + c)
 
 // Device pattern for a chunk: byte i = (seed ^ i) & 0xFF. Distinct seeds give
 // distinct chunk contents (so a stuck chunk index fails verification).
-constexpr byte_t Pattern(unsigned seed, unsigned i) {
-    return static_cast<byte_t>((seed ^ i) & 0xFFu);
+constexpr kv_byte_t Pattern(unsigned seed, unsigned i) {
+    return static_cast<kv_byte_t>((seed ^ i) & 0xFFu);
 }
 
 }  // namespace
@@ -75,10 +81,10 @@ __global__ void McFillWriteKernel(kvhdf5::GpuDatasetHandle h, unsigned seed_base
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
     for (uint32_t c = blockIdx.x; c < h.Count(); c += gridDim.x) {
-        byte_t* dst = h.Data(c);
+        kv_byte_t* dst = h.Data(c);
         uint64_t n = h.Size(c);
         for (uint64_t i = threadIdx.x; i < n; i += blockDim.x)
-            dst[i] = static_cast<byte_t>(((seed_base + c) ^ i) & 0xFFu);
+            dst[i] = static_cast<kv_byte_t>(((seed_base + c) ^ i) & 0xFFu);
         __threadfence_system();
         __syncthreads();
         h.Write(c);       // thread-0 only (internal guard)
@@ -108,7 +114,7 @@ static void RunAndVerify(kvhdf5::GpuCteDataset& ds, unsigned seed_base,
     kvhdf5::GpuDatasetHandle h = ds.Handle();
     const uint32_t n = ds.ChunkCount();
 
-    std::vector<std::vector<byte_t>> expected(n);
+    std::vector<std::vector<kv_byte_t>> expected(n);
     for (uint32_t c = 0; c < n; ++c) {
         const uint64_t bytes = ds.ChunkBytes(c);
         expected[c].resize(bytes);
@@ -117,7 +123,7 @@ static void RunAndVerify(kvhdf5::GpuCteDataset& ds, unsigned seed_base,
     }
     auto ZeroAll = [&] {
         for (uint32_t c = 0; c < n; ++c) {
-            std::vector<byte_t> z(ds.ChunkBytes(c));
+            std::vector<kv_byte_t> z(ds.ChunkBytes(c));
             ctp::GpuApi::Memcpy(ds.DeviceData(c), z.data(), ds.ChunkBytes(c));
         }
     };
@@ -132,7 +138,7 @@ static void RunAndVerify(kvhdf5::GpuCteDataset& ds, unsigned seed_base,
 
     for (uint32_t c = 0; c < n; ++c) {
         const uint64_t bytes = ds.ChunkBytes(c);
-        std::vector<byte_t> back(bytes);
+        std::vector<kv_byte_t> back(bytes);
         ctp::GpuApi::Memcpy(back.data(), ds.DeviceData(c), bytes);
         if (std::memcmp(back.data(), expected[c].data(), bytes) != 0)
             std::fprintf(stderr, "[%s] chunk %u mismatch\n", label, c);
@@ -315,7 +321,7 @@ TEST_CASE("GPU multi-chunk parallelism sweep (grid x chunk-count)",
 // Write() = Send().Wait() — this is exactly what these cases assert.
 
 // Host-side CTE read-back of one blob into a registered CPU buffer.
-static std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag,
+static std::vector<kv_byte_t> HostReadBlob(clio::cte::core::TagId tag,
                                         const std::string& name, uint64_t size) {
     ctp::ipc::FullPtr<char> buf = CLIO_CPU_IPC->AllocateBuffer(size);
     REQUIRE(!buf.IsNull());
@@ -326,7 +332,7 @@ static std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag,
                                       /*flags=*/clio::run::u32(0), shm);
     t.Wait();
     REQUIRE(t->GetReturnCode() == 0);
-    std::vector<byte_t> out(size);
+    std::vector<kv_byte_t> out(size);
     std::memcpy(out.data(), buf.ptr_, size);
     return out;
 }
@@ -358,9 +364,9 @@ static void RunPoolAndVerifyHost(clio::run::IpcManager* ipc,
     std::fprintf(stderr, "[ck] %s: kernel + Synchronize done (Put-side complete)\n",
                  label);
 
-    std::vector<std::vector<byte_t>> got(chunks);
+    std::vector<std::vector<kv_byte_t>> got(chunks);
     for (unsigned c = 0; c < chunks; ++c) {
-        std::vector<byte_t> expected(chunk_bytes);
+        std::vector<kv_byte_t> expected(chunk_bytes);
         for (unsigned i = 0; i < chunk_bytes; ++i) expected[i] = Pattern(seed + c, i);
         std::fprintf(stderr, "[ck] %s: HostReadBlob chunk %u ...\n", label, c);
         got[c] = HostReadBlob(tag, std::to_string(c), chunk_bytes);

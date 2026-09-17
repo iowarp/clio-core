@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace bam {
 
@@ -15,6 +16,7 @@ PageCache::PageCache(const PageCacheConfig &config)
       d_page_states_(nullptr),
       d_page_tags_(nullptr),
       d_page_locks_(nullptr),
+      d_page_refs_(nullptr),
       d_bus_addrs_(nullptr),
       host_buf_(nullptr),
       host_buf_size_(0) {
@@ -38,6 +40,7 @@ PageCache::~PageCache() {
   if (d_page_states_) cudaFree(d_page_states_);
   if (d_page_tags_)   cudaFree(d_page_tags_);
   if (d_page_locks_)  cudaFree(d_page_locks_);
+  if (d_page_refs_)   cudaFree(d_page_refs_);
   if (d_bus_addrs_)   cudaFree(d_bus_addrs_);
 
   if (host_buf_) {
@@ -72,10 +75,13 @@ int PageCache::init_gpu_memory() {
   err = cudaMalloc(&d_page_tags_, num_pages * sizeof(uint64_t));
   if (err != cudaSuccess) goto fail;
   err = cudaMalloc(&d_page_locks_, num_pages * sizeof(uint32_t));
+  if (err == cudaSuccess)
+    err = cudaMalloc(&d_page_refs_, num_pages * sizeof(uint32_t));
   if (err != cudaSuccess) goto fail;
 
   // Initialize metadata to zero
   cudaMemset(d_page_states_, 0, num_pages * sizeof(uint32_t));
+  cudaMemset(d_page_refs_, 0, num_pages * sizeof(uint32_t));
   cudaMemset(d_page_tags_, 0xFF, num_pages * sizeof(uint64_t));  // Invalid tag
   cudaMemset(d_page_locks_, 0, num_pages * sizeof(uint32_t));
 
@@ -84,6 +90,7 @@ int PageCache::init_gpu_memory() {
   dev_state_.page_states = d_page_states_;
   dev_state_.page_tags = d_page_tags_;
   dev_state_.page_locks = d_page_locks_;
+  dev_state_.page_refs = d_page_refs_;
   dev_state_.page_size = page_size;
   dev_state_.num_pages = num_pages;
   dev_state_.page_shift = page_shift;
@@ -201,5 +208,10 @@ QueuePairDevice PageCache::queue_pair_device(uint32_t idx) const {
 
   return qpd;
 }
+
+}  // namespace bam
+
+namespace bam {
+
 
 }  // namespace bam
