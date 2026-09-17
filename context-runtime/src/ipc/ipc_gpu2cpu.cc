@@ -60,10 +60,20 @@ void EvPush(char kind, unsigned tid, unsigned long long slot,
 struct EvChan {
   std::atomic<unsigned long long> sum{0}, cnt{0}, mx{0};
 };
-EvChan g_chan[8];
-const char *g_chan_name[8] = {"multi_total", "multi_await", "get_total",
+// 10, not 8: channels 8-9 measure REORGANIZATION AGAINST THE DATA PATH.
+// A tier migration holds the blob's write token while it reads the whole
+// blob into a host buffer, frees the old placement and writes the new one --
+// and GetBlobImpl's torn-layout guard makes a concurrent reader WAIT on that
+// token. So a prefetcher promoting a page that is about to be demanded can
+// convert its own hint into a synchronous stall on that very page, which is
+// invisible in every counter either side of the boundary. These two make it
+// visible: reorg_stall is what the demand path lost, reorg_move is what the
+// migration cost.
+EvChan g_chan[10];
+const char *g_chan_name[10] = {"multi_total", "multi_await", "get_total",
                               "bdev_h2d",   "read_await",  "get_meta",
-                              "bdev_read",  "direct_read"};
+                              "bdev_read",  "direct_read",
+                              "reorg_stall", "reorg_move"};
 std::terminate_handler g_prev_term = nullptr;
 void EvDumpOnTerminate() {
   const unsigned long long end = g_ev_seq.load();
@@ -126,7 +136,7 @@ void EvLatencyReport() {
 }  // namespace
 
 extern "C" void clio_evlat_add(int which, unsigned long long cycles) {
-  if (which < 0 || which >= 8) return;
+  if (which < 0 || which >= 10) return;
   g_chan[which].sum.fetch_add(cycles, std::memory_order_relaxed);
   g_chan[which].cnt.fetch_add(1, std::memory_order_relaxed);
   unsigned long long m = g_chan[which].mx.load(std::memory_order_relaxed);
@@ -139,7 +149,7 @@ namespace {
 
 void EvChanReport() {
   const double us = 1.0 / 2995.0;
-  for (int i = 0; i < 8; ++i) {
+  for (int i = 0; i < 10; ++i) {
     const unsigned long long c = g_chan[i].cnt.load();
     if (c == 0) continue;
     fprintf(stderr, "clio-evchan %-12s n=%llu avg=%.0fus max=%.0fus\n",

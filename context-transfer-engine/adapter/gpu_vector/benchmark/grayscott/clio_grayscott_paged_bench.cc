@@ -119,6 +119,9 @@ namespace gs = clio::gv_bench::grayscott;
 // Cross-node reduction. Included INSIDE the device-pass guard: it uses the
 // CTE client, whose members are compiled out of the CUDA device pass.
 #include "../bench_dist.h"
+// Host-only for the same reason: the prefetcher is pure host policy that
+// speaks to the CTE, and never appears in a kernel.
+#include "grayscott_prefetch.h"
 
 namespace {
 
@@ -132,6 +135,18 @@ class YieldRunner {
  public:
   YieldRunner(unsigned nblocks, unsigned nthreads)
       : drv_(nblocks, nthreads), stack_(nblocks, nthreads, kYieldLaneBytes) {}
+
+  /**
+   * Route this driver's post-round states into the vector's prefetchers.
+   *
+   * The seam is the runtime's (Yieldable knows nothing about the CTE) and the
+   * policy is the vector's (which owns the tag and the client); this call is
+   * the one line that joins them.
+   */
+  void BindPrefetch(gv::Vector<float> &vec) {
+    drv_.SetYieldObserver(vec.YieldObserver());
+  }
+
   template <typename LaunchT>
   u32 Run(LaunchT &&launch) {
     // Both resets are required: RunToCompletion does not reset, so a reused
@@ -181,6 +196,31 @@ int main(int argc, char **argv) {
   std::string nvme_path = "/tmp/gv_storage_tier.dat";
   bool hbm_only = false;
   float Du = 0.2f, Dv = 0.1f, F = 0.02f, K = 0.048f, dt = 1.0f;
+  // PREFETCH: tier hints issued from the driver's gap between rounds. "none"
+  // is the baseline and the default -- registering a prefetcher changes where
+  // pages live, so every existing number stays comparable unless asked.
+  // "stride" is the generic control that knows nothing about Gray-Scott; the
+  // gap between it and "gs" is what "workload-specific" is worth.
+  std::string prefetch = "none";
+  // 0 = SIZE IT FROM THE FAST TIER; see the derivation below.
+  u64 lookahead = 4;
+  float pf_hot = 1.0f, pf_warm = 0.2f, pf_cold = 0.0f;
+  bool pf_demote = true;
+  // 0 = no gate. See PrefetchPolicy::stall_every_.
+  u64 pf_stall_every = 0;
+  // Tier scores and the host tier's capacity. Defaults reproduce the historic
+  // configuration exactly; see the config writer for what they mean.
+  float hbm_score = 1.0f, ram_score = 0.2f, nvme_score = 0.0f;
+  // CHECKPOINTING. 0 = off. Every N steps the whole vector is snapshotted
+  // with Vector::Copy (the lazy copy-on-write primitive) and then
+  // MATERIALISED, because an untouched Copy is zero bytes and would produce
+  // no checkpoint at all. `ckpt_drain` demotes each finished checkpoint out
+  // of the fast tier: a materialised checkpoint lands at blob score 1.0 and
+  // otherwise sits in VRAM holding cold history that nobody reads again.
+  u64 ckpt_every = 0;
+  bool ckpt_drain = false;
+  float ckpt_cold = 0.0f;
+  unsigned long long ram_mb = 0;   // 0 = data_mb + 1024, the historic value
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -205,6 +245,20 @@ int main(int argc, char **argv) {
     // next() parses a number; the path needs the raw argv token.
     else if (a == "--nvme-path" && i + 1 < argc) nvme_path = argv[++i];
     else if (a == "--baseline") baseline = true;
+    else if (a == "--prefetch" && i + 1 < argc) prefetch = argv[++i];
+    else if (a == "--lookahead") lookahead = next();
+    else if (a == "--pf-hot") pf_hot = nextf();
+    else if (a == "--pf-warm") pf_warm = nextf();
+    else if (a == "--pf-cold") pf_cold = nextf();
+    else if (a == "--pf-no-demote") pf_demote = false;
+    else if (a == "--pf-stall-every") pf_stall_every = next();
+    else if (a == "--hbm-score") hbm_score = nextf();
+    else if (a == "--ram-score") ram_score = nextf();
+    else if (a == "--nvme-score") nvme_score = nextf();
+    else if (a == "--ram-mb") ram_mb = next();
+    else if (a == "--ckpt-every") ckpt_every = next();
+    else if (a == "--ckpt-drain") ckpt_drain = true;
+    else if (a == "--ckpt-cold") ckpt_cold = nextf();
     else if (a == "--Du") Du = nextf();
     else if (a == "--Dv") Dv = nextf();
     else if (a == "--F") F = nextf();
@@ -214,9 +268,38 @@ int main(int argc, char **argv) {
       std::printf("usage: %s [--blocks N] [--threads N] [--slots N] "
                   "[--steps N] [--page-kb N] [--data-mb N] [--hbm-mb N] "
                   "[--repeat N] [--hbm-only] [--Du f] [--Dv f] [--F f] "
-                  "[--K f] [--dt f]\n", argv[0]);
+                  "[--K f] [--dt f]\n"
+                  "       [--prefetch none|stride|gs] [--lookahead N] "
+                  "(0 = size it to the fast tier)\n"
+                  "       [--pf-hot f] [--pf-warm f] [--pf-cold f] "
+                  "[--pf-no-demote] [--pf-stall-every N]\n"
+                  "       [--nvme-mb N] [--nvme-path P] [--ram-mb N]\n"
+                  "       [--ckpt-every N] [--ckpt-drain] [--ckpt-cold f]\n"
+                  "       [--hbm-score f] [--ram-score f] [--nvme-score f]\n"
+                  "         tier scores: a tier scored ABOVE the vector's put "
+                  "score (0.5) is\n"
+                  "         never a first choice. For capacity-ordered "
+                  "placement across all\n"
+                  "         three tiers pass e.g. 0.5 / 0.3 / 0.1.\n",
+                  argv[0]);
       return 0;
     }
+  }
+
+  if (prefetch != "none" && prefetch != "stride" && prefetch != "gs") {
+    std::fprintf(stderr, "GRAYSCOTT ERROR: --prefetch must be one of "
+                 "none|stride|gs (got '%s')\n", prefetch.c_str());
+    return 2;
+  }
+  // A prefetch run against the baseline driver would measure nothing: the
+  // baseline tears the kernel down per z and never yields, so no cursor is
+  // ever published and no hint is ever derived. Refused rather than run,
+  // because it would report prefetch=gs and sent=0 and look like a result.
+  if (baseline && prefetch != "none") {
+    std::fprintf(stderr, "GRAYSCOTT ERROR: --baseline does not yield, so no "
+                 "cursor is published and --prefetch %s would emit nothing.\n",
+                 prefetch.c_str());
+    return 2;
   }
 
   // The coroutine-mode refusal that used to be here moved with the kernels:
@@ -304,6 +387,46 @@ int main(int argc, char **argv) {
   const u64 n = 4 * region;
   const double logical_mb =
       static_cast<double>(n * sizeof(float)) / (1024.0 * 1024.0);
+  // Historic default: enough host tier to hold the whole grid with room over,
+  // i.e. a hierarchy with no real pressure on the host tier.
+  const unsigned long long ram_cap_mb =
+      (ram_mb != 0) ? ram_mb : (data_mb + 1024);
+
+  // ---- "OPTIMAL" LOOKAHEAD ---------------------------------------------
+  //
+  // --lookahead 0 sizes the promotion window to the FAST TIER rather than
+  // guessing a constant, which is what makes "optimal prefetching" a defined
+  // thing on this workload rather than a vibe.
+  //
+  // Gray-Scott's access order is a deterministic sweep: block b reads planes
+  // z0..z1 in order, four regions per z. So the future is fully known, and
+  // the Belady-optimal placement is simply "the fast tier holds the next
+  // |fast tier| accesses". A prefetcher that promotes exactly that far ahead
+  // and demotes everything behind it IS optimal for this pattern -- there is
+  // no cleverer policy available, only a better-sized window.
+  //
+  // At any instant the hot set is, across the grid,
+  //     blocks * 4 regions * (L + 2)          [+2: the z-1 and z still held]
+  // planes. Setting that equal to the fast tier's capacity in planes:
+  //     L = hbm_planes / (4 * blocks) - 2
+  //
+  // Undersized, the tier sits part empty and misses are served from a slower
+  // one. Oversized, promotions evict each other before they are used and the
+  // migrations are wasted work -- which is why this is a real optimum with a
+  // curve either side of it, not a "bigger is better" knob.
+  const u64 hbm_planes =
+      static_cast<u64>(hbm_mb) * 1024ull * 1024ull / page_bytes;
+  const u64 auto_lookahead =
+      (hbm_planes > 4ull * blocks * 2ull)
+          ? (hbm_planes / (4ull * blocks) - 2ull)
+          : 1ull;
+  if (lookahead == 0) {
+    lookahead = auto_lookahead;
+    std::printf("  lookahead: auto = %llu planes (fast tier holds %llu "
+                "planes; %u blocks x 4 regions x (L+2))\n",
+                (unsigned long long)lookahead,
+                (unsigned long long)hbm_planes, blocks);
+  }
 
   // THE BENCH OWNS ITS CONFIG ONLY WHEN NOBODY ELSE SUPPLIED ONE. Writing
   // one and Setenv-ing it with overwrite=1 unconditionally makes it
@@ -327,16 +450,30 @@ int main(int argc, char **argv) {
         << "    bdev_type: ram\n    capacity: \"1GB\"\n\n"
         << "  - mod_name: clio_cte_core\n    pool_name: cte_core\n"
         << "    pool_query: local\n    pool_id: \"512.0\"\n    storage:\n"
-        // MaxBwDpe sorts the preferred group DESCENDING and the vector puts at
-        // blob score 1.0, so the HIGHER score is the preferred tier: HBM must
-        // sit above the host tier.
+        // TIER SCORES ARE A COMMAND-LINE AXIS, and getting them wrong is the
+        // difference between a three-tier run and a two-tier run that says it
+        // has three.
+        //
+        // MaxBwDpe partitions targets into `target_score <= blob_score`
+        // (PREFERRED, sorted by score DESCENDING) and the rest (FALLBACK,
+        // taken only when no preferred tier has room). The vector writes every
+        // page at kVectorBlobScore = 0.5, so A TIER SCORED ABOVE 0.5 IS NEVER
+        // A FIRST CHOICE FOR ANYTHING THIS VECTOR WRITES.
+        //
+        // The old defaults -- HBM 1.0, RAM 0.2 -- put HBM in the fallback
+        // group, which is why every run of this benchmark reported
+        // "kHBM used=0MiB ... nothing landed in the fastest tier" while the
+        // comment here asserted the opposite. Preserved as the DEFAULTS
+        // anyway, so existing sweeps reproduce exactly; a run that wants
+        // capacity-ordered placement across all three tiers passes scores at
+        // or below 0.5, descending (e.g. 0.5 / 0.3 / 0.1).
         << "      - path: \"hbm::gv_gs_hbm\"\n        bdev_type: \"hbm\"\n"
         << "        capacity_limit: \"" << hbm_mb << "MB\"\n"
-        << "        score: 1.0\n";
+        << "        score: " << hbm_score << "\n";
     if (!hbm_only) {
       cfg << "      - path: \"ram::gv_gs_ram\"\n        bdev_type: \"ram\"\n"
-          << "        capacity_limit: \"" << (data_mb + 1024) << "MB\"\n"
-          << "        score: 0.2\n";
+          << "        capacity_limit: \"" << ram_cap_mb << "MB\"\n"
+          << "        score: " << ram_score << "\n";
     }
       // OPTIONAL STORAGE TIER. Without it the whole dataset lives in host
       // DRAM and NOTHING EVER TOUCHES STORAGE -- what such a run measures is
@@ -344,18 +481,22 @@ int main(int argc, char **argv) {
       // which is exactly why a cache-size sweep over a DRAM-only hierarchy
       // comes back flat: there is no penalty for the cache to save.
       //
-      // score BELOW the host tier. MaxBwDpe splits on target_score <=
-      // blob_score and sorts the preferred group DESCENDING, and the vector
-      // puts pages at blob score 1.0, so HIGHER score = preferred. This is the
-      // REVERSE of the GNN trainer's hierarchy, whose put path uses blob score
-      // 0.5 -- copying its numbers here would silently make storage the
-      // FIRST-choice tier.
+      // score BELOW the host tier, so the preferred group ranks it last.
+      //
+      // IT MUST STILL BE <= THE BLOB SCORE TO BE PREFERRED AT ALL. At the
+      // default 0.0 it is, for any blob score -- but a prefetcher demoting to
+      // "cold" has to name a score at or above this one, or storage lands in
+      // the FALLBACK group and the ordering there is by the bandwidth model
+      // rather than by the operator's declared tiering. That model is not
+      // trustworthy for this (see the note in MaxBwDpe::SelectTargets, which
+      // rated an HBM tier at 118 MB/s against host RAM at 1600), so a cold
+      // score should equal this number rather than merely be below it.
       if (nvme_mb > 0) {
         cfg << "      - path: \"" << nvme_path << "\"\n"
             << "        bdev_type: \"file\"\n"
             << "        persistence_level: \"temporary\"\n"
             << "        capacity_limit: \"" << nvme_mb << "MB\"\n"
-            << "        score: 0.0\n";
+            << "        score: " << nvme_score << "\n";
       }
 
     cfg << "    dpe:\n      dpe_type: \"max_bw\"\n";
@@ -418,6 +559,35 @@ int main(int argc, char **argv) {
   YieldRunner runner(blocks, threads);
 
   const u64 ubase = 0, vbase = region, unext = 2 * region, vnext = 3 * region;
+
+  // ---- PREFETCHERS ------------------------------------------------------
+  // Registered on the VECTOR (which owns the tag and the CTE client) and
+  // fired from the DRIVER's post-round gap (which is the only host time with
+  // no kernel resident). BindPrefetch joins the two.
+  gv::PrefetchPolicy pf_policy;
+  pf_policy.hot_ = pf_hot;
+  pf_policy.warm_ = pf_warm;
+  pf_policy.cold_ = pf_cold;
+  pf_policy.lookahead_ = lookahead;
+  pf_policy.stall_every_ = static_cast<u32>(pf_stall_every);
+  vec.SetPrefetchPolicy(pf_policy);
+  std::shared_ptr<gs::GrayScottPrefetcher> gs_pf;
+  if (prefetch == "gs") {
+    // zbase/zend/zper are the SAME locals LaunchStep is given below, which is
+    // what keeps the host's idea of block b's slab from drifting from the
+    // kernel's.
+    gs_pf = std::make_shared<gs::GrayScottPrefetcher>(
+        plane, nz, zbase, zend, zper, pf_policy, pf_demote);
+    vec.RegisterPrefetcher(gs_pf);
+  } else if (prefetch == "stride") {
+    // Blind to three of the four regions and to demotion entirely -- that is
+    // the point of it. It is pointed at u's current region because the cursor
+    // it sees counts z, and u is the region whose plane index the cursor
+    // equals. It cannot learn that v, unext and vnext exist.
+    vec.RegisterPrefetcher(std::make_shared<gv::StridePrefetcher>(
+        ubase / plane, nz, pf_policy));
+  }
+  if (vec.HasPrefetchers()) runner.BindPrefetch(vec);
 
   runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
     gs::LaunchSeed(g, b, gpu, dev, plane, nx, ny, nz, zper, ubase, vbase,
@@ -514,6 +684,8 @@ int main(int argc, char **argv) {
   };
 
   double best_ms = 1e30, checksum = 0.0;
+  u64 ckpt_id = 0, ckpt_pages = 0;
+  double ckpt_ms = 0.0;
   for (int r = 0; r < repeat; ++r) {
     // RE-SEED between repeats. Without this, repeat 2 continues evolving the
     // field left by repeat 1, so each timed run measures a different physical
@@ -528,10 +700,26 @@ int main(int argc, char **argv) {
       ctp::GpuApi::Synchronize();
     }
     vec.ResetStats();
+    vec.ResetPrefetchStats();
+    vec.ResetPrefetchHistory();
+    vec.PrefetchRunBegin();
     ctp::GpuApi::Synchronize();
     const double t0 = NowMs();
     u64 cu = ubase, cv = vbase, nu = unext, nv = vnext;
+    // Checkpoints are KEPT ALIVE for the whole run: dropping the handle would
+    // let the copy tag go away and with it the bytes we just produced.
+    std::vector<std::unique_ptr<gv::Vector<float>>> ckpts;
     for (u32 s = 0; s < steps; ++s) {
+      // RE-ARM EVERY STEP. The swap below makes last step's outputs this
+      // step's inputs, so a prefetcher still holding the old assignment
+      // promotes the wrong four regions.
+      //
+      // NO HISTORY RESET HERE. The dedup map models the score the CTE holds
+      // for a page, which a change of MEANING does not invalidate -- see
+      // Vector::ResetPrefetchHistory. Clearing it re-sent every page its own
+      // current score at each step boundary, which the CTE no-ops, and made
+      // the promote/demote tally meaningless.
+      if (gs_pf) gs_pf->SetRegions(cu, cv, nu, nv);
       if (baseline) {
         if (!run_baseline_step(cu, cv, nu, nv)) {
           std::fprintf(stderr, "GRAYSCOTT ERROR: baseline step failed\n");
@@ -565,10 +753,54 @@ int main(int argc, char **argv) {
       // at the launch site.
       std::swap(cu, nu);
       std::swap(cv, nv);
+
+      // ---- CHECKPOINT ------------------------------------------------
+      // Vector::Copy is COPY-ON-WRITE: it registers the checkpoint chimod as
+      // the copy tag's fault handler and duplicates nothing. So the snapshot
+      // must be MATERIALISED, and materialised SOON: the handler pulls from
+      // the source at fault time, and the region swap above overwrites each
+      // pair every second step, so a checkpoint left lazy for two more steps
+      // would silently capture later bytes instead of these.
+      //
+      // Materialisation is server-side (a size-0 put takes the put-side
+      // materialise-only fault), so the bytes never cross to the host -- this
+      // is a checkpoint being made durable, not a read-back.
+      if (ckpt_every != 0 && ((s + 1) % ckpt_every) == 0) {
+        const double ck0 = NowMs();
+        auto snap = vec.Copy("gv_gs_ck" + std::to_string(ckpt_id));
+        const u64 mat = snap->MaterializeAll();
+        if (mat == 0) {
+          std::fprintf(stderr, "GRAYSCOTT ERROR: checkpoint %llu failed to "
+                       "materialize\n", (unsigned long long)ckpt_id);
+          return 1;
+        }
+        ckpt_pages += mat;
+        // DRAIN IT. A materialised checkpoint is written at blob score 1.0
+        // (the handler puts at -1.0, which PutBlobImpl resolves to 1.0 for a
+        // new blob), so it outranks the LIVE grid on every tier and parks
+        // cold history in VRAM. Nothing ever reads it again in this run, so
+        // demoting it is not speculative -- it is the drain that has to
+        // happen anyway, done early instead of by eviction pressure later.
+        if (ckpt_drain) {
+          snap->SetPrefetchPolicy(pf_policy);
+          snap->ScoreAllPages(ckpt_cold);
+          snap->DrainPrefetch();
+        }
+        ckpts.push_back(std::move(snap));
+        ckpt_ms += NowMs() - ck0;
+        ++ckpt_id;
+      }
     }
     ctp::GpuApi::Synchronize();
     const double ms = NowMs() - t0;
     if (ms < best_ms) best_ms = ms;
+    // AFTER the timer, deliberately. The SUBMISSIONS are inside the timed
+    // region -- they are host time in the round gaps and the run really pays
+    // for them -- but the run never waits on a rescore to complete, so
+    // charging it for that wait would be charging it for work it did not do.
+    // The drain is here only so the tier occupancy read below reflects the
+    // migrations this run asked for rather than a race with them.
+    vec.DrainPrefetch();
 
     // GS_PLANE_DUMP=1 prints a per-plane sum of v. Diffing that between a
     // 1-node and a 2-node run says WHICH planes are wrong, which is the
@@ -611,6 +843,7 @@ int main(int argc, char **argv) {
   }
 
   const auto st = vec.ReadStats(0);
+  const auto pf = vec.ReadPrefetchStats();
   // Bytes touched per step: 6 input planes + 2 output planes per z.
   const double moved_gb =
       static_cast<double>(nz) * plane * sizeof(float) * 8.0 * steps /
@@ -631,17 +864,47 @@ int main(int argc, char **argv) {
   // entry (kHBM) and (513,1) the second (host). Deriving them from
   // cte_core's major instead gave remaining > capacity -- an impossible
   // reading that would have been reported as a placement violation.
+  //
+  // ALL THREE TIERS, and the storage one is not optional to report: a
+  // three-tier run whose report covers two of them cannot answer "what
+  // fraction of the data is where", which on a tiered evaluation IS the
+  // result. The third bdev is (514,1) by the same config-order rule.
   {
-    clio::run::bdev::Client t_fast(clio::run::PoolId(512, 1));
-    clio::run::bdev::Client t_host(clio::run::PoolId(513, 1));
-    auto fa = t_fast.AsyncGetStats(); fa.Wait();
-    auto ha = t_host.AsyncGetStats(); ha.Wait();
     const clio::run::u64 fast_cap = (clio::run::u64)hbm_mb * 1024ull * 1024ull;
-    const clio::run::u64 host_cap = (clio::run::u64)(data_mb + 1024) * 1024ull * 1024ull;
-    const clio::run::u64 fast_used =
-        fast_cap > fa->remaining_size_ ? fast_cap - fa->remaining_size_ : 0;
-    const clio::run::u64 host_used =
-        host_cap > ha->remaining_size_ ? host_cap - ha->remaining_size_ : 0;
+    const clio::run::u64 host_cap =
+        hbm_only ? 0ull : (clio::run::u64)ram_cap_mb * 1024ull * 1024ull;
+    const clio::run::u64 stor_cap = (clio::run::u64)nvme_mb * 1024ull * 1024ull;
+    // Bdev minors follow CONFIG ORDER, and the host tier is skipped entirely
+    // under --hbm-only -- so storage is the SECOND entry there, not the
+    // third. Indexing it unconditionally as 514 read a pool that does not
+    // exist and reported the storage tier as completely full.
+    clio::run::bdev::Client t_fast(clio::run::PoolId(512, 1));
+    auto fa = t_fast.AsyncGetStats(); fa.Wait();
+    const clio::run::u64 fast_rem = fa->remaining_size_;
+    clio::run::u64 host_rem = 0, stor_rem = 0;
+    if (!hbm_only) {
+      clio::run::bdev::Client t_host(clio::run::PoolId(513, 1));
+      auto ha = t_host.AsyncGetStats(); ha.Wait();
+      host_rem = ha->remaining_size_;
+    }
+    if (nvme_mb > 0) {
+      clio::run::bdev::Client t_stor(
+          clio::run::PoolId(hbm_only ? 513 : 514, 1));
+      auto sa = t_stor.AsyncGetStats(); sa.Wait();
+      stor_rem = sa->remaining_size_;
+    }
+    auto used = [](clio::run::u64 cap, clio::run::u64 rem) {
+      return cap > rem ? cap - rem : 0ull;
+    };
+    const clio::run::u64 fast_used = used(fast_cap, fast_rem);
+    const clio::run::u64 host_used = used(host_cap, host_rem);
+    const clio::run::u64 stor_used = used(stor_cap, stor_rem);
+    const double total_mb =
+        static_cast<double>((fast_used + host_used + stor_used) >> 20);
+    auto pct = [&](clio::run::u64 u) {
+      return total_mb > 0.0 ? 100.0 * static_cast<double>(u >> 20) / total_mb
+                            : 0.0;
+    };
     // RAW remaining is printed alongside the derived used, because the
     // derived number alone is not interpretable: if a queried pool does not
     // exist or the stat fails, remaining reads 0 and "used" then equals the
@@ -650,23 +913,47 @@ int main(int argc, char **argv) {
     // report and it nearly produced a false VIOLATION.
     std::fprintf(stderr,
                  "TIER SPLIT: kHBM used=%lluMiB cap=%lluMiB remain=%lluMiB | "
-                 "host used=%lluMiB cap=%lluMiB remain=%lluMiB%s\n",
+                 "host used=%lluMiB cap=%lluMiB remain=%lluMiB | "
+                 "stor used=%lluMiB cap=%lluMiB remain=%lluMiB%s\n",
                  (unsigned long long)(fast_used >> 20),
                  (unsigned long long)(fast_cap >> 20),
-                 (unsigned long long)(fa->remaining_size_ >> 20),
+                 (unsigned long long)(fast_rem >> 20),
                  (unsigned long long)(host_used >> 20),
                  (unsigned long long)(host_cap >> 20),
-                 (unsigned long long)(ha->remaining_size_ >> 20),
-                 (fast_used == 0 && fa->remaining_size_ == fast_cap)
+                 (unsigned long long)(host_rem >> 20),
+                 (unsigned long long)(stor_used >> 20),
+                 (unsigned long long)(stor_cap >> 20),
+                 (unsigned long long)(stor_rem >> 20),
+                 (fast_used == 0 && fast_rem == fast_cap)
                      ? "   <-- nothing landed in the fastest tier"
                      : "");
+    // The line the tiered evaluation actually reads: where the data ENDED UP,
+    // as a fraction. A capacity split is what was ASKED for; this is what was
+    // achieved, and on this workload the two came apart silently for as long
+    // as the fast tier was unreachable.
+    std::fprintf(stderr,
+                 "TIER PCT: vram=%.1f%% dram=%.1f%% nvme=%.1f%% "
+                 "(placed %.0fMiB of %.0fMiB logical)\n",
+                 pct(fast_used), pct(host_used), pct(stor_used), total_mb,
+                 logical_mb);
   }
 
   std::fprintf(stderr,
                "GRAYSCOTT mode=%s blocks=%u thr=%u nx=%llu ny=%llu nz=%llu "
                "page_kb=%llu slots=%u steps=%u data_mb=%.0f hbm_mb=%llu "
                "ms=%.1f GB/s=%.2f v_checksum=%.6f faults=%llu evicts=%llu "
-               "puts=%llu get_errors=%llu put_errors=%llu memcpy_pin_gbps=%.2f memcpy_page_gbps=%.2f\n",
+               "puts=%llu get_errors=%llu put_errors=%llu memcpy_pin_gbps=%.2f memcpy_page_gbps=%.2f "
+               // PREFETCH ACCOUNTING. Reported unconditionally, including for
+               // a --prefetch none run where every field is 0: a run whose
+               // pf_sent is 0 is NOT a prefetching run whatever its timings
+               // say, and that has to be readable from the log rather than
+               // inferred from the command line.
+               "prefetch=%s lookahead=%llu stall_every=%llu "
+               "pf_hints=%llu pf_sent=%llu "
+               "pf_deduped=%llu pf_batches=%llu pf_promote=%llu "
+               "pf_demote=%llu pf_errors=%llu pf_notfound=%llu "
+               "pf_dropped=%llu ckpt_every=%llu ckpt_n=%llu "
+               "ckpt_gb=%.2f ckpt_ms=%.0f ckpt_drain=%d\n",
                baseline ? "baseline" : "paged",
                blocks, threads, (unsigned long long)nx, (unsigned long long)ny,
                (unsigned long long)nz, (unsigned long long)page_kb, slots,
@@ -675,7 +962,21 @@ int main(int argc, char **argv) {
                (unsigned long long)st.evicts, (unsigned long long)st.puts,
                (unsigned long long)st.get_errors,
                (unsigned long long)st.put_errors,
-               mcp.pinned_gbps, mcp.pageable_gbps);
+               mcp.pinned_gbps, mcp.pageable_gbps,
+               vec.PrefetcherNames().c_str(), (unsigned long long)lookahead,
+               (unsigned long long)pf_stall_every,
+               (unsigned long long)pf.hints_, (unsigned long long)pf.sent_,
+               (unsigned long long)pf.deduped_,
+               (unsigned long long)pf.batches_,
+               (unsigned long long)pf.promotions_,
+               (unsigned long long)pf.demotions_,
+               (unsigned long long)pf.errors_,
+               (unsigned long long)pf.not_found_,
+               (unsigned long long)pf.dropped_,
+               (unsigned long long)ckpt_every, (unsigned long long)ckpt_id,
+               static_cast<double>(ckpt_pages) * page_bytes /
+                   (1024.0 * 1024.0 * 1024.0),
+               ckpt_ms, ckpt_drain ? 1 : 0);
 
   ctp::GpuApi::Free(d_sum);
   BenchFlushData();

@@ -21,7 +21,10 @@
 #endif
 #include <clio_cte/gpu_vector/device_vector.h>
 #include <clio_cte/gpu_vector/page.h>
+#include <clio_cte/gpu_vector/prefetch.h>
 
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -286,10 +289,122 @@ class Vector {
                                  new_name);
       }
     }
-    return std::unique_ptr<Vector<T>>(new Vector<T>(
+    std::unique_ptr<Vector<T>> out(new Vector<T>(
         new_name, std::vector<int>{}, page_bytes_, nblocks_, set_size_,
         num_elems_, storage_pool_id_, compress_lib_, compress_preset_,
         nsets_, capacity_pages_));
+    // MaterializeAll needs the SOURCE name: the fault it issues carries the
+    // source in fault_params_, exactly as the core's own internal fault does.
+    out->ckpt_src_ = tag_name_;
+    return out;
+  }
+
+  /**
+   * Force a lazy Copy() to become REAL BYTES, server-side.
+   *
+   * Copy() is copy-on-write: it registers a fault handler and duplicates
+   * nothing, so an untouched checkpoint occupies zero storage. That is the
+   * point of it -- and it makes an untouched checkpoint useless as a
+   * checkpoint, because the handler materialises from the SOURCE AT FAULT
+   * TIME. A workload that keeps mutating the source (Gray-Scott overwrites
+   * each region pair every second step) therefore has a window: materialise
+   * inside it and the snapshot is the state at Copy(); materialise after it
+   * and the snapshot silently holds LATER bytes.
+   *
+   * The mechanism is the put-side materialise-only fault: a put of size 0
+   * with a null pointer finds no blob under the copy tag, dispatches the
+   * fault, and the checkpoint chimod reads the whole source blob and writes
+   * it into the copy. NO BYTES CROSS TO THE HOST -- the copy happens entirely
+   * inside the runtime, which is why this is not simply "read the checkpoint
+   * back".
+   *
+   * Submitted in flights rather than one at a time: each materialisation is a
+   * whole-blob read plus a whole-blob write, and serialising a 1 GiB
+   * checkpoint's worth of them at ~1 ms each is minutes of nothing.
+   *
+   * @return pages materialised (0 on the first failure, which is reported).
+   */
+  clio::run::u64 MaterializeAll(clio::run::u32 inflight = 32) {
+    if (ckpt_src_.empty()) {
+      std::fprintf(stderr, "gpu_vector: MaterializeAll on '%s', which is not "
+                   "a Copy() -- there is no source to materialise from\n",
+                   tag_name_.c_str());
+      return 0;
+    }
+    // THE MATERIALISE-ONLY FAULT, ISSUED DIRECTLY.
+    //
+    // NOT a size-0 PutBlob: PutBlobImpl rejects size == 0 with rc=2 long
+    // before it reaches the fault dispatch, so the "put-side materialise-only
+    // fault" the chimod documents is generated INTERNALLY by the core and is
+    // not reachable from a client put. And not an ordinary Get either -- that
+    // materialises, but only by dragging every byte back to the host, which
+    // for a 32 GiB checkpoint stream is 32 GiB of pointless PCIe traffic.
+    //
+    // So we send the core's own fault task: a GetBlobTask addressed to the
+    // CHECKPOINT POOL with size 0 and a null destination, carrying the source
+    // tag in fault_params_. The handler reads the whole source blob and puts
+    // it into the copy, entirely inside the runtime.
+    auto *ipc = CLIO_CPU_IPC;
+    const clio::run::u64 np = NumPages();
+    std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> futs;
+    futs.reserve(inflight);
+    clio::run::u64 done = 0;
+    auto reap = [&]() -> bool {
+      for (auto &f : futs) {
+        f.Wait();
+        if (f->GetReturnCode() != 0) {
+          std::fprintf(stderr,
+                       "gpu_vector: MaterializeAll page %llu rc=%d (tag '%s' "
+                       "src '%s')\n", (unsigned long long)done,
+                       f->GetReturnCode(), tag_name_.c_str(),
+                       ckpt_src_.c_str());
+          return false;
+        }
+        ++done;
+      }
+      futs.clear();
+      return true;
+    };
+    for (clio::run::u64 pg = 0; pg < np; ++pg) {
+      clio::cte::core::Context ctx = PageContext();
+      // The handler decodes fault_params_ as the source tag NAME.
+      std::snprintf(ctx.fault_params_,
+                    clio::cte::core::Context::kFaultParamsSize, "%s",
+                    ckpt_src_.c_str());
+      // The name goes on the wire decoded; the raw-int32 flag would make the
+      // handler decode a decimal name a second time.
+      ctx.op_flags_ &= ~clio::cte::core::Context::kBlobNameRawInt32;
+      auto sub = ipc->NewTask<clio::cte::core::GetBlobTask>(
+          clio::run::CreateTaskId(),
+          clio::cte::checkpoint::kCheckpointPoolId,
+          clio::run::PoolQuery::Local(), tag_id_, PageName(pg), 0, 0, 0,
+          ctp::ipc::ShmPtr<>::GetNull(), ctx);
+      futs.push_back(ipc->Send(sub));
+      if (futs.size() >= inflight && !reap()) return 0;
+    }
+    if (!reap()) return 0;
+    return done;
+  }
+
+  /**
+   * Score every page of this vector, for a caller draining a checkpoint out
+   * of the fast tier. Same batched rescore path as the prefetcher.
+   *
+   * A materialised checkpoint lands at blob score 1.0 (the fault handler puts
+   * at -1.0, which PutBlobImpl resolves to 1.0 for a new blob), so it
+   * outranks the live data on every tier and fills the fast one with bytes
+   * nobody will read again. Draining it is not an optimisation -- it is the
+   * difference between a fast tier holding the working set and a fast tier
+   * holding cold history.
+   */
+  void ScoreAllPages(float score) {
+    const clio::run::u64 np = NumPages();
+    std::vector<PrefetchHint> hints;
+    hints.reserve(static_cast<size_t>(np));
+    for (clio::run::u64 pg = 0; pg < np; ++pg) {
+      hints.push_back(PrefetchHint{pg, score});
+    }
+    PrefetchNow(hints);
   }
 
   /**
@@ -563,7 +678,297 @@ class Vector {
     return s;
   }
 
+  // =====================================================================
+  // PREFETCHING -- see prefetch.h for what this is and is not.
+  //
+  // A prefetcher turns "where is this block in its computation" into "which
+  // pages should be hot"; this half turns those hints into CTE bulk rescores
+  // and keeps them off the driver's critical path. The two are separate
+  // because the first is workload knowledge and the second is plumbing that
+  // no workload should have to reimplement.
+  // =====================================================================
+
+  /**
+   * Attach a prefetcher. Several may be registered; their hints merge into
+   * one sink for the round and LAST WRITER WINS for a repeated page -- which
+   * is what lets a generic stride prefetcher run underneath a
+   * workload-specific one as a floor.
+   *
+   * EXPLICIT, NEVER AUTOMATIC. A prefetcher that fired by default would
+   * change the tier placement of every existing benchmark, including the ones
+   * whose published numbers assume the frecency organizer is the only thing
+   * moving blobs.
+   */
+  void RegisterPrefetcher(std::shared_ptr<Prefetcher> p) {
+    if (p != nullptr) prefetchers_.push_back(std::move(p));
+  }
+
+  void SetPrefetchPolicy(const PrefetchPolicy &p) { prefetch_policy_ = p; }
+  const PrefetchPolicy &GetPrefetchPolicy() const { return prefetch_policy_; }
+  bool HasPrefetchers() const { return !prefetchers_.empty(); }
+
+  /** Names of the registered prefetchers, for the report line. */
+  std::string PrefetcherNames() const {
+    std::string s;
+    for (const auto &p : prefetchers_) {
+      if (!s.empty()) s += "+";
+      s += p->Name();
+    }
+    return s.empty() ? std::string("none") : s;
+  }
+
+  PrefetchStats ReadPrefetchStats() const { return prefetch_stats_; }
+  void ResetPrefetchStats() { prefetch_stats_ = PrefetchStats(); }
+
+  /**
+   * Forget what has already been sent.
+   *
+   * CALL THIS PER RUN, NOT PER PHASE, and in particular NOT when the meaning
+   * of a page changes.
+   *
+   * `last_sent_` is a model of ONE thing: the score the CTE currently holds
+   * for a page. That model survives a change of meaning perfectly well -- a
+   * page's score is whatever was last set on it, whether the workload now
+   * thinks of it as an input or an output. Dedup suppresses a hint only when
+   * the DESIRED score equals the last one SENT, which is exactly the case
+   * where the CTE would compare the two and do nothing anyway.
+   *
+   * Clearing it per step (Gray-Scott's region swap) looked like the cautious
+   * choice and was a real defect: it threw away accurate state, so every page
+   * was re-sent its current score at the top of each step -- a rescore the
+   * CTE no-ops -- and the promotion/demotion tally was computed against an
+   * assumed prior instead of the known one. That is how a run reported
+   * promote=896 against demote=32512 while sending 66048 records.
+   *
+   * It exists for the start of a RUN, where the vector may have been rebuilt
+   * or the tiers reset underneath the map.
+   */
+  void ResetPrefetchHistory() { last_sent_.clear(); }
+
+  /** Tell every prefetcher a new kernel run is starting. */
+  void PrefetchRunBegin() {
+    for (auto &p : prefetchers_) p->OnRunBegin();
+  }
+
+  /**
+   * The observer to install on a yieldable driver:
+   *
+   *     drv.SetYieldObserver(vec.YieldObserver());
+   *
+   * Captures `this`; the vector must outlive the driver, which it does in
+   * every sane arrangement (the vector is what the kernel is paging against).
+   */
+  clio::run::gpu::YieldObserverFn YieldObserver() {
+    return [this](const clio::run::gpu::YieldBlockState *states,
+                  clio::run::u32 nblocks, clio::run::u32 round) {
+      OnYieldRound(states, nblocks, round);
+    };
+  }
+
+  /**
+   * Run every prefetcher over one round's block states and submit whatever
+   * survives dedup. Called from the driver's post-round gap: no kernel is
+   * resident, so the rescores this issues overlap the NEXT round's kernel.
+   */
+  void OnYieldRound(const clio::run::gpu::YieldBlockState *states,
+                    clio::run::u32 nblocks, clio::run::u32 round) {
+    if (prefetchers_.empty() || states == nullptr) return;
+    // Reap LAST round's submissions first. Never wait on them: a rescore that
+    // has not landed yet is still useful, and one that failed is counted, not
+    // retried. Waiting here would put tier migration back on the critical
+    // path, which is the whole thing this exists to take it off.
+    ReapPrefetchFutures(/*block=*/false);
+
+    sink_.Clear();
+    for (clio::run::u32 b = 0; b < nblocks; ++b) {
+      YieldEvent ev;
+      ev.block_ = b;
+      ev.round_ = round;
+      ev.status_ = states[b].status_;
+      ev.resume_point_ = states[b].resume_point_;
+      ev.wait_tag_ = states[b].wait_tag_;
+      ev.cursor_ = states[b].cursor_;
+      ev.cursor_aux_ = states[b].cursor_aux_;
+      for (auto &p : prefetchers_) p->OnYield(ev, sink_);
+    }
+    for (auto &p : prefetchers_) p->OnRoundEnd(round, sink_);
+
+    prefetch_stats_.hints_ += sink_.hints().size();
+    prefetch_stats_.dropped_ += sink_.dropped();
+    SubmitHints(sink_.hints());
+  }
+
+  /**
+   * Submit hints directly, without a Prefetcher or the yield observer.
+   *
+   * For an organizer that runs at a PHASE boundary rather than at a yield: a
+   * batch loop that knows the next batch's page set exactly, one batch ahead,
+   * has nothing to infer from the coroutine cursor and no reason to wait for a
+   * round to end. It just says what it wants moved.
+   *
+   * Same dedup, batching and non-blocking submission as the yield path, so a
+   * page already at the requested score costs a map lookup and nothing else.
+   */
+  void PrefetchNow(const std::vector<PrefetchHint> &hints) {
+    if (hints.empty()) return;
+    ReapPrefetchFutures(/*block=*/false);
+    prefetch_stats_.hints_ += hints.size();
+    SubmitHints(hints);
+  }
+
+  /** Wait for every outstanding rescore. For the end of a run, where the
+   *  question "did the prefetcher's work actually land" has to be answerable
+   *  before the tier occupancy is read. */
+  void DrainPrefetch() { ReapPrefetchFutures(/*block=*/true); }
+
  private:
+  /**
+   * Dedup, batch, submit.
+   *
+   * DEDUP IS NOT AN OPTIMIZATION HERE, it is what makes the whole thing
+   * affordable. A block parks several times inside one Gray-Scott
+   * z-iteration, so without it the same eight promotions are re-sent on every
+   * one of those rounds and the CTE pays a task submission to discover each
+   * time that the score has not moved. The threshold mirrors the CTE's own
+   * score_difference_threshold, which is what it would compare against
+   * anyway.
+   */
+  void SubmitHints(const std::vector<PrefetchHint> &hints) {
+    if (hints.empty()) return;
+    // Collapse duplicates WITHIN the round first -- several blocks hint the
+    // same halo plane, and last writer wins by construction.
+    round_merge_.clear();
+    for (const auto &h : hints) round_merge_[h.page_] = h.score_;
+
+    auto *core = PrefetchClient();
+    if (core == nullptr) return;
+    clio::run::shared_ptr<clio::cte::core::PodMultiScoreTask> batch;
+    clio::run::u32 in_batch = 0;
+    for (const auto &kv : round_merge_) {
+      const clio::run::u64 pg = kv.first;
+      const float score = kv.second;
+      auto seen = last_sent_.find(pg);
+      if (seen != last_sent_.end() &&
+          std::fabs(seen->second - score) < prefetch_policy_.epsilon_) {
+        ++prefetch_stats_.deduped_;
+        continue;
+      }
+      // A page nobody has hinted about yet sits at the score the vector WROTE
+      // it at -- kVectorBlobScore -- not at kDefaultScore, which is a frame's
+      // eviction rank inside the GPU cache and has nothing to do with the
+      // tier the blob is in. Using the latter made every first-time hot hint
+      // (1.0 against a phantom prior of 1.0) count as neither a promotion nor
+      // a demotion, and the run reported 224 promotions against 3968
+      // demotions while visibly filling the HBM tier from empty.
+      const float prev = (seen == last_sent_.end()) ? kVectorBlobScore
+                                                    : seen->second;
+      if (score > prev) {
+        ++prefetch_stats_.promotions_;
+      } else if (score < prev) {
+        ++prefetch_stats_.demotions_;
+      }
+      last_sent_[pg] = score;
+
+      if (!batch) {
+        // Dynamic routing: in a multi-node pool the blob's metadata lives on
+        // its hashed owner, and a hint about a neighbour's halo plane is a
+        // legitimate thing to emit. (PodMultiScore itself dispatches its
+        // per-record PodReorganizeBlob locally, so a cross-node hint is
+        // currently a no-op rather than a fault -- which is the right failure
+        // mode for a hint, and is why this is not gated on node count.)
+        // kCtePrefetchHint: this batch's completion latency is off everyone's
+        // critical path -- nothing waits on a rescore, by construction. The
+        // flag is what lets the runtime treat it as background work and keep
+        // a latency-critical demand fault from queueing behind it.
+        batch = core->template NewPodBatch<clio::cte::core::PodMultiScoreTask>(
+            tag_id_, PageContext(), clio::cte::core::kCtePrefetchHint,
+            clio::run::PoolQuery::Dynamic());
+        in_batch = 0;
+      }
+      // Only blob_name_ and score_ carry meaning for a rescore; size 0 and a
+      // null pointer are what the handler expects for the rest.
+      batch.get()->Add(PageName(pg).c_str(), 0, 0, ctp::ipc::ShmPtr<>(), score);
+      ++in_batch;
+      ++prefetch_stats_.sent_;
+      if (in_batch >= clio::cte::core::kPodMultiMax) {
+        pending_.push_back(core->AsyncPodBatch(batch));
+        ++prefetch_stats_.batches_;
+        batch = {};
+      }
+    }
+    if (batch && in_batch > 0) {
+      pending_.push_back(core->AsyncPodBatch(batch));
+      ++prefetch_stats_.batches_;
+    }
+  }
+
+  /** Retire completed rescore batches. Non-blocking unless asked. */
+  void ReapPrefetchFutures(bool block) {
+    size_t keep = 0;
+    for (size_t i = 0; i < pending_.size(); ++i) {
+      auto &f = pending_[i];
+      if (f.IsNull()) continue;
+      if (block) {
+        f.Wait();
+      } else if (!f.IsComplete()) {
+        // GUARDED, because keep == i on every element until the first one is
+        // dropped -- which is the common case, since most rounds retire
+        // nothing. `pending_[i] = std::move(pending_[i])` is a self-move, and
+        // whether that is harmless depends on Future's move-assignment
+        // rather than on anything visible here. Not worth relying on.
+        if (keep != i) pending_[keep] = std::move(f);
+        ++keep;
+        continue;
+      }
+      // PER-RECORD, and split by reason. A batch's return code is only its
+      // FIRST failure, and the failures are not all the same kind of event:
+      // rc 3 is "blob not found", which for a hint is entirely expected --
+      // the lookahead runs past the end of what has been written, and on the
+      // first step of Gray-Scott the two output regions have no blobs at all
+      // because the seed writes only u and v. Folding those into an error
+      // count made a healthy run report 1008 errors and look broken. A real
+      // refusal (a score out of range, a blob the CTE would not move) is a
+      // different thing and stays counted as one.
+      const clio::run::u32 n =
+          std::min(f->count_, clio::cte::core::kPodMultiMax);
+      for (clio::run::u32 r = 0; r < n; ++r) {
+        const clio::run::u32 rc = f->reqs_[r].rc_;
+        if (rc == 0) continue;
+        if (rc == 3) {
+          ++prefetch_stats_.not_found_;
+        } else {
+          ++prefetch_stats_.errors_;
+        }
+      }
+    }
+    pending_.resize(block ? 0 : keep);
+  }
+
+  /** One long-lived client for rescores, created on first use: the vector is
+   *  often constructed before a caller decides to prefetch at all. */
+  clio::cte::core::Client *PrefetchClient() {
+    if (!prefetch_core_) {
+      prefetch_core_ =
+          std::make_unique<clio::cte::core::Client>(storage_pool_id_);
+    }
+    return prefetch_core_.get();
+  }
+
+  std::vector<std::shared_ptr<Prefetcher>> prefetchers_;
+  PrefetchPolicy prefetch_policy_;
+  PrefetchStats prefetch_stats_;
+  PrefetchSink sink_;
+  /** page -> score last actually submitted. The dedup filter. */
+  std::map<clio::run::u64, float> last_sent_;
+  /** page -> score, within one round. Reused to avoid a per-round alloc. */
+  std::map<clio::run::u64, float> round_merge_;
+  std::vector<clio::run::Future<clio::cte::core::PodMultiScoreTask>> pending_;
+  std::unique_ptr<clio::cte::core::Client> prefetch_core_;
+  /** Source tag name when this Vector is a Copy(); empty otherwise. Only
+   *  MaterializeAll needs it, and only a copy can be materialised. */
+  std::string ckpt_src_;
+
+
   struct DevState {
     int gpu_id = 0;
     DeviceVector<T> view;

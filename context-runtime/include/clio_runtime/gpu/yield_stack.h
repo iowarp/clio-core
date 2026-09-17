@@ -518,6 +518,37 @@ __device__ __forceinline__ bool YieldSuspended() {
   return YieldTls().block_state_->status_ == kYieldSuspended;
 }
 
+/**
+ * Tell the host WHERE IN ITS DATA this block currently is -- see
+ * YieldBlockState::cursor_.
+ *
+ * Call it wherever the workload's own notion of position advances (the top of
+ * a z-iteration, of an epoch, of a bin sweep), not at every yield: a yield is
+ * a fact about the paging, and the position is a fact about the algorithm.
+ *
+ * NO PARAMETER THREADING AND NO NESTING LIMIT, because YieldTls().block_state_
+ * is the same object as view.Y() -- YieldTlsPublish stamped it at kernel entry
+ * -- so a device function ten calls deep can publish without the kernel having
+ * passed anything down to it. Works identically under the macro mechanism and
+ * under coroutines.
+ *
+ * Thread 0 stores; block-collective in the sense that every thread must reach
+ * it, which the __syncthreads makes load-bearing rather than decorative: the
+ * store must be visible to the whole block before anyone acts on the position.
+ * NO __threadfence_system: this is read by the host only AFTER the kernel has
+ * completed, and kernel completion orders it. Fencing per z-iteration would
+ * pay for a guarantee the driver already has.
+ */
+__device__ __forceinline__ void YieldPublishCursor(clio::run::u64 pos,
+                                                   clio::run::u64 aux = 0) {
+  if (threadIdx.x == 0) {
+    YieldBlockState *bs = YieldTls().block_state_;
+    bs->cursor_ = pos;
+    bs->cursor_aux_ = aux;
+  }
+  __syncthreads();
+}
+
 /** This lane's header, found without any parameter threading. */
 __device__ __forceinline__ YieldLaneHeader *YieldLane() {
   YieldSmem &s = YieldTls();

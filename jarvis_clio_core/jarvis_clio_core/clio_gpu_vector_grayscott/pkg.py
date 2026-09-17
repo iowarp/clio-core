@@ -1,7 +1,7 @@
 """
 GPU Vector Gray-Scott Benchmark Package
 
-Drives clio_gpu_vector_grayscott_bench: a 3D reaction-diffusion stencil over a
+Drives clio_grayscott_paged_bench: a 3D reaction-diffusion stencil over a
 grid that does not fit on the device. The distinguishing feature is a SLIDING
 WINDOW -- computing plane z needs z-1, z, z+1, and computing z+1 then needs z,
 z+1, z+2 -- so two of every three planes are immediately reused. None of the
@@ -18,7 +18,7 @@ running, because a plane still being read could otherwise be evicted under it
 package validates the same rule at configure time so the cell is named before
 a run is spent on it.
 
-Assumes clio_gpu_vector_grayscott_bench is on PATH (it lives in <build>/bin).
+Assumes clio_grayscott_paged_bench is on PATH (it lives in <build>/bin).
 """
 from jarvis_cd.core.pkg import Application
 from jarvis_cd.shell import Exec, LocalExecInfo
@@ -171,6 +171,62 @@ class ClioGpuVectorGrayscott(Application):
              'msg': 'Omit the host spill tier so a grid that does not fit '
                     'fails loudly instead of quietly spilling',
              'type': bool, 'default': False},
+            {'name': 'nvme_mb',
+             'msg': 'Storage tier capacity in MB (0 = no storage tier). '
+                    'WITHOUT ONE NOTHING EVER TOUCHES A DISK: the whole '
+                    'dataset lives in host DRAM and what the run measures is '
+                    'DRAM over PCIe, not I/O. This is the axis the prefetcher '
+                    'exists for -- a tier stack with no slow tier has no '
+                    'latency for a promotion to hide',
+             'type': int, 'default': 0},
+            {'name': 'nvme_path',
+             'msg': 'Backing file for the storage tier. Defaults to a '
+                    'per-cell file under output_dir; two cells sharing one '
+                    'path would fight over it',
+             'type': str, 'default': ''},
+            {'name': 'prefetch',
+             'msg': 'Tier prefetcher: none|stride|gs. "none" is the baseline. '
+                    '"gs" is the workload-specific sliding-window policy '
+                    '(promote z+1..z+lookahead of all four regions, demote '
+                    'z-2 of the inputs). "stride" is the GENERIC CONTROL that '
+                    'knows nothing about Gray-Scott -- the gap between it and '
+                    '"gs" is what workload-specific knowledge is worth. '
+                    'Prefetching never changes the answer, only where pages '
+                    'live, so the checksum must be identical across all three',
+             'type': str, 'default': 'none'},
+            {'name': 'lookahead',
+             'msg': 'Planes ahead of the cursor to promote. Small on purpose: '
+                    'a tier migration has to COMPLETE inside the window to be '
+                    'worth anything, and everything promoted occupies the fast '
+                    'tier until it is used',
+             'type': int, 'default': 4},
+            {'name': 'pf_hot', 'msg': 'Blob score for a promoted page. Higher '
+                    'is faster: MaxBwDpe ranks the preferred group descending',
+             'type': float, 'default': 1.0},
+            {'name': 'pf_warm', 'msg': 'Blob score for a page out of the '
+                    'window but read again soon (the written-back outputs)',
+             'type': float, 'default': 0.2},
+            {'name': 'pf_cold', 'msg': 'Blob score for a page done with for a '
+                    'long time. Set equal to pf_warm when there is no storage '
+                    'tier: a rescore with nowhere lower to go moves no bytes '
+                    'and still costs a task',
+             'type': float, 'default': 0.0},
+            {'name': 'pf_stall_every',
+             'msg': 'Emit a hint only once per X observed STALLS (0 = every '
+                    'time the position advances). A stall means the block '
+                    'waited on a tier, so this SELECTS the promotions that '
+                    'can repay their cost rather than merely rate-limiting '
+                    'them. Measured on Gray-Scott: migrations fall 45x from '
+                    'X=0 to X=256 and the prefetcher becomes free, but cost '
+                    'and benefit fall together so it never beats no-prefetch. '
+                    'A conservative X (>=16) is the safe default for leaving '
+                    'a prefetcher registered',
+             'type': int, 'default': 0},
+            {'name': 'pf_demote',
+             'msg': 'Emit demotions as well as promotions. Off isolates the '
+                    'promotion half: HBM then fills and stays full, because '
+                    'nothing the prefetcher says ever makes room',
+             'type': bool, 'default': True},
             {'name': 'repeat', 'msg': 'Timed repetitions (best is reported)',
              'type': int, 'default': 3},
             {'name': 'Du', 'msg': 'u diffusion rate', 'type': float,
@@ -397,8 +453,8 @@ class ClioGpuVectorGrayscott(Application):
     def start(self):
         # Clear a previous cell's orphan BEFORE anything else: it
         # holds the runtime port and would fail this cell at startup.
-        _reap_stale_runtime(self.log, 'clio_gpu_vector_grayscott_bench')
-        Which('clio_gpu_vector_grayscott_bench',
+        _reap_stale_runtime(self.log, 'clio_grayscott_paged_bench')
+        Which('clio_grayscott_paged_bench',
               LocalExecInfo(env=self.mod_env)).run()
         _wait_for_free_vram(self.log,
                             self.config['hbm_mb'] / 1024.0 +
@@ -408,7 +464,7 @@ class ClioGpuVectorGrayscott(Application):
         os.makedirs(c['output_dir'], exist_ok=True)
         out = self._output_file()
 
-        cmd = ['clio_gpu_vector_grayscott_bench',
+        cmd = ['clio_grayscott_paged_bench',
                f'--blocks {c["blocks"]}', f'--threads {c["threads"]}',
                f'--slots {self._slots()}', f'--steps {c["steps"]}',
                f'--page-kb {c["page_kb"]}', f'--data-mb {c["data_mb"]}',
@@ -417,6 +473,24 @@ class ClioGpuVectorGrayscott(Application):
                f'--K {c["K"]}', f'--dt {c["dt"]}']
         if c['hbm_only']:
             cmd.append('--hbm-only')
+        if c['nvme_mb'] > 0:
+            # Per cell by default: two cells sharing one backing file would
+            # fight over it, and the loser's tier is silently wrong rather
+            # than absent.
+            path = c['nvme_path'] or os.path.join(
+                c['output_dir'], 'gs_storage_tier.dat')
+            cmd.append(f'--nvme-mb {c["nvme_mb"]}')
+            cmd.append(f'--nvme-path {path}')
+        if c['prefetch'] != 'none':
+            cmd.append(f'--prefetch {c["prefetch"]}')
+            cmd.append(f'--lookahead {c["lookahead"]}')
+            cmd.append(f'--pf-hot {c["pf_hot"]}')
+            cmd.append(f'--pf-warm {c["pf_warm"]}')
+            cmd.append(f'--pf-cold {c["pf_cold"]}')
+            if c['pf_stall_every'] > 0:
+                cmd.append(f'--pf-stall-every {c["pf_stall_every"]}')
+            if not c['pf_demote']:
+                cmd.append('--pf-no-demote')
         if c['timeout_sec'] > 0:
             cmd.insert(0, f'timeout {c["timeout_sec"]}')
 

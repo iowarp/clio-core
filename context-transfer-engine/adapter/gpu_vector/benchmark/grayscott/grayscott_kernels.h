@@ -132,6 +132,18 @@ CTP_GPU_FUN inline gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane
   gv::Held<float> vzm, vz, vzp;
   gv::Held<float> unx, vnx;
   for (u64 z = z0; z < z1; ++z) {
+    // TELL THE HOST WHERE WE ARE, so a registered prefetcher can promote the
+    // planes this loop is about to fault on before it faults on them. Once
+    // per z-iteration, BEFORE the first fetch -- a position published after
+    // the fetches it should have anticipated is a position published too
+    // late. One thread-0 store per plane; nothing on the critical path.
+    //
+    // z+1, NOT z: 0 is the "kernel published nothing" sentinel, which every
+    // block starts at and which the seed and sum kernels never leave. A raw
+    // z would make the first plane of the field indistinguishable from
+    // silence, and the prefetcher would then guess for a block that had not
+    // yet said anything.
+    gy::YieldPublishCursor(z + 1);
     const bool interior = (z > 0 && z + 1 < nz);
     const u64 zm = interior ? (z - 1) : z;
     const u64 zp = interior ? (z + 1) : z;

@@ -1238,7 +1238,7 @@ class DeviceVector {
         // Only the bytes the caller named. The rest of the frame keeps
         // whatever it held; the caller owns what it asked for.
         t->Add("", boff, blen,
-               RawPtr(static_cast<char *>(p->data) + boff), 0.5f);
+               RawPtr(static_cast<char *>(p->data) + boff), kVectorBlobScore);
         t->reqs_[n].blob_name_.assign(reinterpret_cast<const char *>(&pn32),
                                       sizeof(pn32));
         bt->fetch_vlo[n] = flo;
@@ -1439,7 +1439,7 @@ class DeviceVector {
         if (!ClipToPage(pn, lo[r], hi[r], &boff, &blen)) continue;
         const clio::run::u32 pn32 = static_cast<clio::run::u32>(pn);
         t->Add("", boff, blen,
-               RawPtr(static_cast<char *>(p->data) + boff), 0.5f);
+               RawPtr(static_cast<char *>(p->data) + boff), kVectorBlobScore);
         t->reqs_[n].blob_name_.assign(reinterpret_cast<const char *>(&pn32),
                                       sizeof(pn32));
         bt->flush_slot[n++] = static_cast<clio::run::u32>(p - h_->pages_);

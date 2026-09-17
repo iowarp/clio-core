@@ -2840,12 +2840,23 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // WriteReplicaData zeroes it while the replica's blocks are lent to its
     // staging BlobInfo, so a mid-write replica reads as size 0 here and we
     // wait out the writer instead of snapshotting an empty layout.
-    while ((replica_sel > 0
-                ? blob_info_ptr->GetReplica(replica_sel, false)
-                      ->total_size_cache_
-                : blob_info_ptr->GetTotalSize()) < offset + size &&
-           blob_info_ptr->IsWriteLocked()) {
-      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    // ch8 reorg_stall: HOW LONG A READ WAITED FOR A WRITER. Almost always a
+    // reorganize -- PutBlob frees nothing and so never empties the layout --
+    // which makes this the direct measure of tier migration stalling the
+    // demand path. Sampled only when the wait actually happens, so a run with
+    // no contention reports n=0 rather than a floor of zeros.
+    {
+      const unsigned long long ev_r0 = clio::run::CycleNow();
+      bool ev_waited = false;
+      while ((replica_sel > 0
+                  ? blob_info_ptr->GetReplica(replica_sel, false)
+                        ->total_size_cache_
+                  : blob_info_ptr->GetTotalSize()) < offset + size &&
+             blob_info_ptr->IsWriteLocked()) {
+        ev_waited = true;
+        CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+      }
+      if (ev_waited) clio_evlat_add(8, clio::run::CycleNow() - ev_r0);
     }
 
     // A replica slot with NO bytes (post-eviction reclaim, or never written)
@@ -3183,6 +3194,16 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
       // non-zero token for the duration of this call.
       lock_tok = reinterpret_cast<clio::run::u64>(&rc);
     }
+    // ch9 reorg_move: the WHOLE migration, token acquisition included. Paired
+    // with ch8 (reorg_stall) this says both what a move costs and what it
+    // cost everyone else -- the two numbers a "reorganization should be free"
+    // claim actually rests on. Timed from here rather than from entry so it
+    // excludes the cheap early-outs (score unchanged, blob absent, empty).
+    const unsigned long long ev_m0 = clio::run::CycleNow();
+    struct EvMoveScope {
+      unsigned long long t0;
+      ~EvMoveScope() { clio_evlat_add(9, clio::run::CycleNow() - t0); }
+    } ev_move_scope{ev_m0};
     while (!blob_info.TryLockWrite(lock_tok)) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
@@ -4167,6 +4188,25 @@ clio::run::TaskResume Runtime::PodMultiScore(
   int first_rc = 0;
   clio::run::u32 n = task->count_;
   if (n > kPodMultiMax) n = kPodMultiMax;
+  // SERIAL-INLINE, AND MEASURED TO BE THE RIGHT CHOICE -- do not "fix" this
+  // into the dispatch-then-await shape PodMultiGetBlob uses for large
+  // batches. That was tried, on the reasoning that a record here is far
+  // heavier than a get (ReorganizeBlobInternal reads the WHOLE blob into a
+  // host staging buffer, frees the old placement, re-runs the DPE and writes
+  // the blob to its new tier -- ~200 us for a 256 KB page, so 64 of them pin
+  // one fiber for ~13 ms). Dispatching them was WORSE on every axis:
+  //
+  //   Gray-Scott, 2048 MB over three tiers, 61k migrations:
+  //     serial   4605 ms, reorg_move avg  215 us, reorg_stall n=0
+  //     dispatch 5350 ms, reorg_move avg 1956 us, reorg_stall n=12
+  //
+  // Bulk tier migration is BANDWIDTH-bound, not latency-bound. Running 64 of
+  // them at once does not finish them sooner -- it queues them against each
+  // other on the same bdevs, multiplies each one's latency ~9x, and starts
+  // colliding with demand reads on the per-blob write token (reorg_stall
+  // appeared only in the dispatched run). Serializing is what keeps
+  // reorganization behaving like background work: one migration's bandwidth
+  // at a time, leaving the rest for the data path.
   for (clio::run::u32 i = 0; i < n; ++i) {
     auto &req = task->reqs_[i];
     auto sub = ipc_manager->NewTask<PodReorganizeBlobTask>(

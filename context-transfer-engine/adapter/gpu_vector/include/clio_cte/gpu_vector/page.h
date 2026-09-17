@@ -17,6 +17,29 @@ namespace clio::cte::gpu_vector {
 /** page_num of an empty slot. */
 constexpr clio::run::u64 kNoPage = ~static_cast<clio::run::u64>(0);
 
+/**
+ * The CTE BLOB score every page is written at, by both the flush path and the
+ * create-on-get in the fetch path.
+ *
+ * NOT the same thing as kDefaultScore, which is a frame's eviction rank
+ * inside the GPU page cache and never leaves the device. This one is the
+ * number the DPE tiers on, and the two being both "a score" and both
+ * per-page is exactly how they got confused.
+ *
+ * IT IS 0.5, AND THAT DECIDES WHICH TIERS A PAGE CAN EVER REACH. MaxBwDpe
+ * splits tiers on target_score <= blob_score, so a tier scored ABOVE 0.5 is
+ * excluded from the preferred group for every page this vector writes. In the
+ * Gray-Scott config -- HBM 1.0, host RAM 0.2, storage 0.0 -- that means pages
+ * never land in HBM at all on their own, which the benchmark's TIER SPLIT
+ * line reports as "nothing landed in the fastest tier". A prefetcher hinting
+ * at 1.0 is what makes the fast tier reachable.
+ *
+ * Named here rather than repeated as a literal at the two Add() call sites
+ * because a prefetcher has to know what score a page starts at in order to
+ * say whether its own hint is a promotion or a demotion.
+ */
+constexpr float kVectorBlobScore = 0.5f;
+
 using MultiGetSlot = clio::cte::core::PodMultiGetBlobTask;
 using MultiPutSlot = clio::cte::core::PodMultiPutBlobTask;
 
