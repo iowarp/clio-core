@@ -304,6 +304,19 @@ macro(wrp_core_enable_sycl CXX_STANDARD)
         set(SYCL_CUDA_ARCH "sm_70" CACHE STRING
             "CUDA architecture when SYCL_TARGET=nvptx64-nvidia-cuda")
     endif()
+    # PTX ISA version for the NVPTX backend, as a target feature (ptx87, ...).
+    #
+    # DPC++ pins a default PTX version per nightly, and an arch newer than that
+    # default is a HARD BACKEND ERROR rather than a diagnostic at the flag:
+    #   "PTX version 8.5 does not support target 'sm_120'. Minimum required
+    #    PTX version is 8.7."
+    # Empty means "use the compiler's default", which is right everywhere the
+    # default already covers SYCL_CUDA_ARCH; set it only when it does not
+    # (sm_120 / Blackwell needs -DSYCL_PTX_FEATURE=ptx87).
+    if(NOT DEFINED CACHE{SYCL_PTX_FEATURE})
+        set(SYCL_PTX_FEATURE "" CACHE STRING
+            "PTX ISA target feature for the NVPTX SYCL backend (e.g. ptx87); empty uses the compiler default")
+    endif()
 
     # Opt-in flag for SYCL device-side virtual functions.
     # -fsycl-allow-virtual-functions is supported by recent DPC++ nightlies;
@@ -404,6 +417,19 @@ function(wrp_core_apply_sycl_flags target)
             target_link_options(${target} PRIVATE
                 "SHELL:-Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=${SYCL_CUDA_ARCH}"
             )
+            # --cuda-feature goes on the DRIVER line, not through
+            # -Xsycl-target-backend. Only the first -Xsycl-target-backend is
+            # honoured during compilation (the arch one above); a second is
+            # silently dropped with "argument unused during compilation" and
+            # the backend still dies on the default PTX version. Folding both
+            # into one quoted pass-through does not work either -- the arch
+            # parser then reads the whole string as the arch name.
+            if(SYCL_PTX_FEATURE)
+                target_compile_options(${target} PRIVATE
+                    --cuda-feature=+${SYCL_PTX_FEATURE})
+                target_link_options(${target} PRIVATE
+                    --cuda-feature=+${SYCL_PTX_FEATURE})
+            endif()
         endif()
 
         if(CLIO_SYCL_ALLOW_VIRTUAL_FUNCTIONS)

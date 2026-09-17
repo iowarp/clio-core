@@ -253,6 +253,12 @@ class IpcManager {
     /** Pinned host backend holding the GpuTaskQueue. */
     char *queue_backend = nullptr;
     size_t queue_backend_size = 0;
+    /**
+     * cudaMallocHost (true) vs cudaMallocManaged (false) -- they need
+     * different free calls, and which one was used depends on whether the
+     * device ring was allocated. See ServerInitGpuQueues.
+     */
+    bool queue_backend_pinned = false;
     /** The actual GpuTaskQueue object, constructed inside queue_backend. */
     ctp::ipc::FullPtr<clio::run::GpuTaskQueue> gpu2cpu_queue;
     /** AllocatorId → registered client backend. */
