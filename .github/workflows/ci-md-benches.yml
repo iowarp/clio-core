@@ -41,7 +41,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  BENCH_DIR: context-transfer-engine/adapter/gpu_vector/benchmark
+  BENCH_DIR: context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md
   NVSHMEM_WHEEL: nvidia-nvshmem-cu12
 
 jobs:
