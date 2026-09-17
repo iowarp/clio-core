@@ -34,7 +34,22 @@
 #ifndef CTP_UTIL_GPU_API_H
 #define CTP_UTIL_GPU_API_H
 
+// execinfo.h is a glibc/BSD header; MSVC has none, and CI Windows builds this
+// file with CUDA ON -- so an unguarded include breaks the Windows build on
+// every TU that touches gpu_api.h ("C1083: Cannot open include file:
+// 'execinfo.h'"). __has_include settles it without a platform list, and the
+// one call site below carries the same guard so the absence is not a
+// compile error there either.
+#if defined(__has_include)
+#if __has_include(<execinfo.h>)
+#define CTP_HAS_EXECINFO 1
 #include <execinfo.h>
+#endif
+#endif
+#ifndef CTP_HAS_EXECINFO
+#define CTP_HAS_EXECINFO 0
+#endif
+
 #include <cstring>
 #include <thread>
 #include <chrono>
@@ -954,11 +969,13 @@ class GpuApi {
                 size, stream);
         // NAME THE CALLER. Five ticks of theorizing could not localize this
         // call site; ten lines of backtrace can.
+#if CTP_HAS_EXECINFO
         {
           void *bt[16];
           const int nbt = backtrace(bt, 16);
           backtrace_symbols_fd(bt, nbt, 2);
         }
+#endif
         // MITIGATE, LOUDLY: retry synchronously with no stream. If the
         // stream argument was the invalid one, this completes and the run
         // proceeds with the failure on record instead of a poisoned context.

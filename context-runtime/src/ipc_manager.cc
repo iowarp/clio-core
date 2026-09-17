@@ -35,7 +35,20 @@
  * IPC manager implementation
  */
 
+// Guarded for the same reason gpu_api.h guards it: execinfo.h is glibc/BSD and
+// MSVC has none, so an unguarded include fails the Windows build of
+// clio_run_cxx outright ("C1083: Cannot open include file: 'execinfo.h'").
+// The one call site -- an opt-in CLIO_SHM_TRACE diagnostic -- carries the same
+// guard and degrades to a line saying the backtrace is unavailable there.
+#if defined(__has_include)
+#if __has_include(<execinfo.h>)
+#define CLIO_RUN_HAS_EXECINFO 1
 #include <execinfo.h>
+#endif
+#endif
+#ifndef CLIO_RUN_HAS_EXECINFO
+#define CLIO_RUN_HAS_EXECINFO 0
+#endif
 
 #include "clio_runtime/ipc_manager.h"
 
@@ -2346,6 +2359,7 @@ FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
   // way to tell a genuine capacity need from an allocation the existing
   // arenas should have been able to serve.
   if (std::getenv("CLIO_SHM_TRACE") != nullptr) {
+#if CLIO_RUN_HAS_EXECINFO
     void *frames[24];
     int n = backtrace(frames, 24);
     char **syms = backtrace_symbols(frames, n);
@@ -2354,6 +2368,10 @@ FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
       HLOG(kError, "[SHM-TRACE]   {}", syms[i]);
     }
     free(syms);
+#else
+    HLOG(kError, "[SHM-TRACE] growing for a {} byte request; no backtrace on "
+         "this platform (execinfo.h absent)", size);
+#endif
   }
   size_t new_size = static_cast<size_t>((size + kShmMetadataOverhead) *
                                         kShmAllocationMultiplier);
