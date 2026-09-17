@@ -119,7 +119,22 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // Spawn periodic Send task — outbound side still runs on the worker
   // because the per-task send path is bounded by transport capacity, and
   // EnqueueNetTask is invoked from many worker threads anyway.
-  client_.AsyncSendPoll(clio::run::PoolQuery::Local(), 0, 500);
+  //
+  // The period is NOT just a delay: Worker::AddToBlockedQueue buckets periodic
+  // tasks BY period, and ContinueBlockedTasks services the buckets at very
+  // different rates -- <=50us every 4 loop iterations, <=200us every 8, <=50ms
+  // every 64. This poll drives every cross-node send, so the bucket it lands in
+  // is the cadence of the entire outbound network path. At the previous 500us
+  // it fell in the <=50ms bucket and was serviced every 64 iterations: tasks
+  // sat ~300us on the send queue, which made a plain cross-node round trip
+  // ~650us and a 4-node collective ~1ms. Keeping it in the <=50us bucket cuts
+  // that to ~45us and the round trip to ~310us. Any future value MUST stay
+  // <= 50us or the outbound path silently drops back to the slow bucket.
+  constexpr double kSendPollPeriodUs = 25.0;
+  static_assert(kSendPollPeriodUs <= 50.0,
+                "SendPoll must stay in the fastest periodic bucket (<=50us); "
+                "above it the cross-node send drain is serviced 16x less often");
+  client_.AsyncSendPoll(clio::run::PoolQuery::Local(), 0, kSendPollPeriodUs);
 
   // Spawn periodic ClientSend task for client response sending via lightbeam
   client_.AsyncClientSend(clio::run::PoolQuery::Local(), 100);
@@ -428,10 +443,32 @@ clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
     }
   }
 
-  // Per-tick maintenance: retries and dead-node fanout.
-  CLIO_IPC->GetRun2Run()->ProcessRetryQueues();
-  CLIO_IPC->GetRun2Run()->ScanSendMapTimeouts();
-  ScanTaskProgress();  // #628: cross-node task-progress validity check
+  // Maintenance: retries, dead-node fanout, cross-node task-progress (#628).
+  //
+  // These are LIVENESS scans on millisecond-to-second timescales (retry
+  // backoffs, send-map timeouts, task TTLs) -- nothing about them needs to run
+  // at the drain's cadence. They used to run on EVERY tick, which was cheap
+  // when this periodic ticked every 500us and invisible because the drain was
+  // slow anyway. Once the period drops to make the drain responsive, their
+  // fixed per-tick cost becomes the tick rate's ceiling: the tick cannot repeat
+  // faster than the scans take, and a task's wait on the send queue is exactly
+  // one tick. Giving them their own millisecond cadence lets the drain below
+  // tick as fast as the worker loop allows, which is the whole point of the
+  // short period.
+  {
+    constexpr clio::run::u64 kMaintIntervalNs = 1000000;  // 1ms
+    static thread_local clio::run::u64 last_maint_ns = 0;
+    clio::run::u64 now_ns = static_cast<clio::run::u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    if (now_ns - last_maint_ns >= kMaintIntervalNs) {
+      last_maint_ns = now_ns;
+      CLIO_IPC->GetRun2Run()->ProcessRetryQueues();
+      CLIO_IPC->GetRun2Run()->ScanSendMapTimeouts();
+      ScanTaskProgress();  // #628: cross-node task-progress validity check
+    }
+  }
 
   // Snapshot the depth of each priority at function entry so a hot
   // producer can't monopolise this tick.

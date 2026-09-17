@@ -603,20 +603,103 @@ bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
   return true;
 #endif
 #elif CTP_ENABLE_WINDOWS_SYSINFO
+  // Back the section with a SPARSE FILE, not the paging file.
+  //
+  // The obvious spelling, CreateFileMapping(INVALID_HANDLE_VALUE, ...), asks
+  // for a pagefile-backed section -- and a section created without SEC_RESERVE
+  // is SEC_COMMIT, so the WHOLE size is charged against the system commit
+  // limit the moment it is created, before a single byte is touched. Neither
+  // POSIX branch above behaves that way: Linux's memfd_create + ftruncate and
+  // macOS's regular file are both sparse and charge per touched page.
+  //
+  // That asymmetry is not academic. A CLIO client's per-process data segment
+  // defaults to 512 MB (+32 MB metadata), so on Windows every process that
+  // called ClientInit charged 544 MB of commit whether it used any of it or
+  // not. Measured on a 32 GB host: eight such segments cost 4361 MB of commit
+  // with zero bytes written. Run a test suite that starts several client
+  // processes at once and the commit limit is reached, at which point
+  // CreateFileMapping fails with ERROR_COMMITMENT_LIMIT, ZeroMQ cannot create
+  // a thread, and unrelated processes on the machine start failing to fork.
+  //
+  // A file-backed section is charged to the file instead, and a sparse file
+  // allocates only the ranges written. The same eight segments then cost 0 MB
+  // of commit. FILE_ATTRIBUTE_TEMPORARY keeps the pages in memory unless the
+  // system is actually short of it, so this is not a trip to the disk.
+  //
+  // Everything else is unchanged: the section still carries the same
+  // "Local\<base>" name, so OpenSharedMemory/SharedMemoryExists are untouched,
+  // and a second process still attaches by name.
+  //
   // POSIX shared memory names start with `/` (e.g. "/ctp_shm_42"). Win32
   // kernel object names can't contain `/`, so map to "Local\<base>" — the
   // per-session namespace, which is right for single-host SHM. Without
   // this the mapping was created anonymously (nullptr name) and could
   // not be reopened by name, breaking every OpenSharedMemory.
   std::string win_name = WinShmName(name);
-  fd.windows_fd_ =
-      CreateFileMappingA(INVALID_HANDLE_VALUE,   // use paging file
-                         nullptr,                // default security
-                         PAGE_READWRITE,         // read/write access
-                         0,          // maximum object size (high-order DWORD)
-                         static_cast<DWORD>(size),  // low-order DWORD
-                         win_name.c_str());         // mapping object name
-  return fd.windows_fd_ != nullptr;
+
+  EnsureMemfdDir();
+  std::string shm_path = GetMemfdPath(name);
+
+  // FILE_SHARE_DELETE so DestroySharedMemory can unlink the path the way the
+  // POSIX branches do while a mapping is still live.
+  HANDLE hfile = CreateFileA(shm_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                 FILE_SHARE_DELETE,
+                             nullptr, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_TEMPORARY, nullptr);
+  if (hfile == INVALID_HANDLE_VALUE) {
+    fd.windows_fd_ = nullptr;
+    return false;
+  }
+
+  // Sparse, so extending the file below reserves no disk either. Best effort:
+  // a filesystem without sparse support still gives a correct (if eagerly
+  // sized) file, and the commit-charge problem this function exists to avoid
+  // is solved by the file backing regardless.
+  DWORD unused = 0;
+  DeviceIoControl(hfile, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &unused,
+                  nullptr);
+
+  LARGE_INTEGER end;
+  end.QuadPart = static_cast<LONGLONG>(size);
+  if (!SetFilePointerEx(hfile, end, nullptr, FILE_BEGIN) ||
+      !SetEndOfFile(hfile)) {
+    // Same reason as the CreateFileMappingA path below: preserve the error
+    // across the cleanup call so the caller reports this failure, not
+    // CloseHandle's.
+    const DWORD size_err = GetLastError();
+    CloseHandle(hfile);
+    fd.windows_fd_ = nullptr;
+    SetLastError(size_err);
+    return false;
+  }
+
+  fd.windows_fd_ = CreateFileMappingA(
+      hfile,                                       // backing file
+      nullptr,                                     // default security
+      PAGE_READWRITE,                              // read/write access
+      static_cast<DWORD>(size >> 32),              // size, high-order DWORD
+      static_cast<DWORD>(size & 0xFFFFFFFFull),    // size, low-order DWORD
+      win_name.c_str());                           // mapping object name
+  const DWORD map_err = GetLastError();
+
+  // The section holds its own reference to the file, so the file handle has
+  // done its job. Closing it here keeps File a union of one handle and leaves
+  // CloseSharedMemory unchanged.
+  CloseHandle(hfile);
+
+  if (fd.windows_fd_ == nullptr) {
+    // Restore the error AFTER the cleanup call. The caller reports the failure
+    // with GetLastSharedMemoryError(), which reads GetLastError() -- so the
+    // DeleteFileA below would otherwise be what gets reported, and the real
+    // reason would be lost. That is how a create failure came to be blamed on
+    // "Win32 error 203" (ERROR_ENVVAR_NOT_FOUND), a code nothing in this
+    // function can produce.
+    DeleteFileA(shm_path.c_str());
+    SetLastError(map_err);
+    return false;
+  }
+  return true;
 #endif
 }
 
@@ -672,6 +755,47 @@ void SystemInfo::DestroySharedMemory(const std::string &name) {
   unlink(shm_path.c_str());
 #endif
 #elif CTP_ENABLE_WINDOWS_SYSINFO
+  // The segment is the sparse file CreateNewSharedMemory made; remove it, as
+  // the POSIX branches remove theirs. This used to be an empty branch, from
+  // when the Windows section was backed by the paging file and had no path to
+  // remove -- so every segment ever created leaked its name until the machine
+  // was rebooted, and shm_init's "destroy any stale segment first" call did
+  // nothing at all.
+  //
+  // Best effort, exactly like unlink() above: the file was opened with
+  // FILE_SHARE_DELETE, so this succeeds even while a mapping is live on a
+  // filesystem with POSIX delete semantics, and where it does not, the
+  // CREATE_ALWAYS in CreateNewSharedMemory still resets the contents.
+  DeleteFileA(GetMemfdPath(name).c_str());
+#endif
+}
+
+std::string SystemInfo::GetLastSharedMemoryError() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return strerror(errno);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  DWORD err = GetLastError();
+  char *buf = nullptr;
+  DWORD n = FormatMessageA(
+      FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+          FORMAT_MESSAGE_IGNORE_INSERTS,
+      nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+      reinterpret_cast<char *>(&buf), 0, nullptr);
+  std::string msg;
+  if (n && buf) {
+    msg.assign(buf, n);
+    while (!msg.empty() && (msg.back() == '\r' || msg.back() == '\n' ||
+                            msg.back() == '.' || msg.back() == ' ')) {
+      msg.pop_back();
+    }
+  }
+  if (buf) {
+    LocalFree(buf);
+  }
+  if (msg.empty()) {
+    msg = "unknown error";
+  }
+  return msg + " (Win32 error " + std::to_string(err) + ")";
 #endif
 }
 
@@ -755,7 +879,38 @@ void SystemInfo::UnmapMemory(void *ptr, size_t size) {
 #if CTP_ENABLE_PROCFS_SYSINFO
   munmap(ptr, size);
 #elif CTP_ENABLE_WINDOWS_SYSINFO
-  VirtualFree(ptr, size, MEM_RELEASE);
+  // This is the counterpart of TWO allocators, because on POSIX one munmap()
+  // serves both: MapSharedMemory() (MapViewOfFile) and MapPrivateMemory()
+  // (VirtualAlloc). Win32 has a separate deallocator for each, and the one
+  // that used to be here -- VirtualFree(ptr, size, MEM_RELEASE) -- was wrong
+  // for both:
+  //
+  //   * A MapViewOfFile region is MEM_MAPPED. VirtualFree cannot free it at
+  //     all; only UnmapViewOfFile can.
+  //   * For a VirtualAlloc region, MEM_RELEASE REQUIRES dwSize to be 0.
+  //     Passing the region's size fails with ERROR_INVALID_PARAMETER.
+  //
+  // Both failures were silent -- the return value is discarded -- so every
+  // view and every private mapping leaked for the life of the process. That
+  // was invisible while Windows segments were pagefile-backed, but once they
+  // gained a sparse backing file (#1063) a leaked view keeps a live section on
+  // that file, and CreateNewSharedMemory's CREATE_ALWAYS cannot truncate a
+  // file with a mapped section: ERROR_USER_MAPPED_FILE. See #1069.
+  //
+  // Ask the OS which kind of region this is rather than threading a flag
+  // through every caller: the callers are shared with the POSIX build, where
+  // the distinction does not exist.
+  if (ptr == nullptr) {
+    return;
+  }
+  MEMORY_BASIC_INFORMATION mbi;
+  if (VirtualQuery(ptr, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+      mbi.Type == MEM_MAPPED) {
+    UnmapViewOfFile(ptr);
+    return;
+  }
+  VirtualFree(ptr, 0, MEM_RELEASE);
+  (void)size;
 #endif
 }
 

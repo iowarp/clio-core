@@ -6,10 +6,11 @@
  */
 
 /**
- * CAE labeling + CTE SemanticSearch end-to-end test.
+ * Summarizer labeling + CTE SemanticSearch end-to-end test.
  *
  * Inserts 10 short text "documents" via the standard CTE client. The
- * client targets the CAE pool (512.0), so CAE's PutBlob interceptor
+ * client targets the CAE core pool (512.0), which forwards through the
+ * summarizer at 401.0, so its PutBlob handler
  * fires Ollama labeling on each blob and stores `{name}_label`
  * alongside. Then we issue an AsyncSemanticSearch with a
  * natural-language query restricted to `.*_label$` blob names — BM25
@@ -91,8 +92,8 @@ constexpr size_t kNumDocs = sizeof(kCorpus) / sizeof(kCorpus[0]);
 
 }  // namespace
 
-TEST_CASE("CAE labels 10 docs; CTE SemanticSearch returns top-5",
-          "[cae][cte][bm25][semantic-search][ollama]") {
+TEST_CASE("Summarizer labels 10 docs; CTE SemanticSearch returns top-5",
+          "[cae][summarizer][cte][bm25][semantic-search][ollama]") {
   {
     const char *skip = std::getenv("CAE_LABEL_TEST_SKIP");
     if (skip && std::string(skip) == "1") {
@@ -101,7 +102,7 @@ TEST_CASE("CAE labels 10 docs; CTE SemanticSearch returns top-5",
     }
   }
   fs::path config_path = fs::path(__FILE__).parent_path() /
-                          "test_cae_semantic_search_config.yaml";
+                          "test_summarizer_semantic_search_config.yaml";
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
 
   REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
@@ -119,7 +120,7 @@ TEST_CASE("CAE labels 10 docs; CTE SemanticSearch returns top-5",
   REQUIRE(tag->GetReturnCode() == 0);
   auto tag_id = tag->tag_id_;
 
-  // Step 1: PutBlob each document. CAE handler labels every one
+  // Step 1: PutBlob each document. The summarizer labels every one
   // synchronously inside the PutBlob path, so by the time these
   // Wait() returns the matching `{name}_label` blob is already
   // written. Sequential so we don't blast 10 inferences at once on

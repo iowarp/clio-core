@@ -95,6 +95,7 @@ int main(int argc, char *argv[]) {
   // mountpoint is a drive letter like "Z:" or a host directory) and drives
   // the FUSE protocol. The callbacks and the entire CTE data path below them
   // are identical to the Linux build.
+  cte_fuse_mark_session_live();
   return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
 #else
   // Apptainer's --fusemount opens /dev/fuse on the host, performs the
@@ -121,7 +122,8 @@ int main(int argc, char *argv[]) {
   }
 
   if (prefd == -1) {
-    return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
+    cte_fuse_mark_session_live();
+  return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
   }
 
 #if FUSE_VERSION < FUSE_MAKE_VERSION(3, 14)
@@ -176,7 +178,8 @@ int main(int argc, char *argv[]) {
 
   struct fuse_args args = FUSE_ARGS_INIT(new_argc, argv);
   struct fuse *fuse =
-      fuse_new(&args, &cte_fuse_ops, sizeof(cte_fuse_ops), nullptr);
+      (cte_fuse_mark_session_live(),
+       fuse_new(&args, &cte_fuse_ops, sizeof(cte_fuse_ops), nullptr));
   if (!fuse) {
     fuse_opt_free_args(&args);
     return 1;

@@ -383,6 +383,17 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
+    # FIRST step on purpose: actions/checkout cleans the workspace, so running
+    # it after download-artifact deletes the very artifact this job tests
+    # ("Cannot find path ...\\wheels because it does not exist"). Sparse
+    # because the job needs only the retry helper, not the tree -- without a
+    # checkout at all the helper is absent and the step dies with "The argument
+    # 'CI/Retry.ps1' is not recognized as the name of a script file".
+    - name: Check out CI helpers
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+
     - name: Download AppImage artifact
       uses: actions/download-artifact@v4
       with:
@@ -463,7 +474,7 @@ jobs:
     # community-feed 503, silently building the package without the adapter.
     - name: Install WinFsp (FUSE adapter SDK)
       run: |
-        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 -- choco install winfsp -y --no-progress
+        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
         if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
           throw "WinFsp SDK missing after the install succeeded -- failing HERE rather than packaging without the FUSE adapter (#1004)"
         }
@@ -474,7 +485,7 @@ jobs:
     # package, so it reads as a packaging-config problem rather than a missing
     # tool. The runner image does not ship NSIS.
     - name: Install NSIS (installer generator for cpack -G NSIS)
-      run: pwsh CI/Retry.ps1 -- choco install nsis -y --no-progress
+      run: pwsh CI/Retry.ps1 choco install nsis -y --no-progress
 
     - name: Configure with CMake
       run: |
@@ -519,6 +530,17 @@ jobs:
     timeout-minutes: 45
     if: always() && needs.build-windows.result == 'success'
     steps:
+    # FIRST step on purpose: actions/checkout cleans the workspace, so running
+    # it after download-artifact deletes the very artifact this job tests
+    # ("Cannot find path ...\\wheels because it does not exist"). Sparse
+    # because the job needs only the retry helper, not the tree -- without a
+    # checkout at all the helper is absent and the step dies with "The argument
+    # 'CI/Retry.ps1' is not recognized as the name of a script file".
+    - name: Check out CI helpers
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+
     - name: Download Windows package
       uses: actions/download-artifact@v4
       with:
@@ -528,7 +550,7 @@ jobs:
     # Same hardening for the runtime install used by the smoke test (#1004).
     - name: Install WinFsp (FUSE adapter runtime)
       run: |
-        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 -- choco install winfsp -y --no-progress
+        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
         if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\bin")) {
           throw "WinFsp runtime missing after the install succeeded -- failing HERE rather than smoke-testing without it (#1004)"
         }

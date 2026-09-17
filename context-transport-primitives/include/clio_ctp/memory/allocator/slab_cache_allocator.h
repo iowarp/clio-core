@@ -90,9 +90,19 @@ class SlabAllocator {
       return;
     }
     SlabTls *tls = Tls();
-    if (!tls->regions_.Emplace(region.ptr_)) {
+    // cap_ has to be enforced HERE, not by Emplace's return value. regions_ is
+    // an ext_ring_buffer (RING_BUFFER_DYNAMIC_SIZE), and a dynamic ring GROWS
+    // when full instead of refusing -- EmplaceImpl unconditionally returns true.
+    // So `if (!Emplace(...)) alloc_->Free(...)` made the overflow path dead
+    // code and cap_ merely the ring's INITIAL capacity: every region a thread
+    // ever freed was cached forever and never returned to the backing
+    // allocator. For the Boost fiber-stack pool (BoostStackPool) that is a
+    // 256 KiB stack retained per fiber the thread has finished, unbounded.
+    if (tls->regions_.Size() >= cap_) {
       alloc_->Free(region);
+      return;
     }
+    tls->regions_.Emplace(region.ptr_);
   }
 };
 

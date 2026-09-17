@@ -34,6 +34,12 @@ add_dependencies(test_ctp_malloc_exec clio_ctp_host)
 target_link_libraries(test_ctp_malloc_exec
         clio_ctp_host)
 
+add_executable(test_slab_cache_allocator_exec
+        test_slab_cache_allocator.cc)
+add_dependencies(test_slab_cache_allocator_exec clio_ctp_host)
+target_link_libraries(test_slab_cache_allocator_exec
+        clio_ctp_host Catch2::Catch2WithMain)
+
 add_executable(test_thread_allocator_exec
         test_thread_allocator.cc)
 add_dependencies(test_thread_allocator_exec clio_ctp_host)
@@ -91,6 +97,9 @@ add_test(NAME ctp_thread_allocator_multithread COMMAND
 
 add_test(NAME ctp_ctp_malloc COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_ctp_malloc_exec)
+
+add_test(NAME ctp_slab_cache_allocator COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_slab_cache_allocator_exec)
 
 # Skip under MSan: buddy allocator, thread/partitioned allocator, and hshm
 # malloc all use raw mmap/brk memory that MSan cannot instrument (no

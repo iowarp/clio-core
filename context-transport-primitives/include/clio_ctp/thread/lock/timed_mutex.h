@@ -49,12 +49,50 @@
 // Only the /proc start-time refinement is Linux-specific.
 #if !defined(_WIN32) && !CTP_IS_DEVICE_PASS
 #define CTP_TIMED_MUTEX_POSIX_LIVENESS 1
+#include <pthread.h>
+
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
 #endif
 
 namespace ctp {
+
+#if !CTP_IS_DEVICE_PASS
+namespace detail {
+
+/** Generation counter for cached per-process identity. Bumped in the CHILD
+ *  after every fork(), which is the only event that can invalidate a cached
+ *  pid / process start time.
+ *
+ *  Plain `unsigned`, no atomics: pthread_atfork's child handler runs in the
+ *  child, where fork() has left exactly one thread, and the parent's copy is
+ *  never written at all. */
+CTP_INLINE_CROSS_FUN unsigned &ProcIdentityGenStorage() {
+  static unsigned gen = 0;
+  return gen;
+}
+
+/** @return the current identity generation, registering the fork hook once.
+ *
+ *  This exists so StampOwner() does NOT have to call getpid() per acquisition
+ *  just to notice a fork. getpid() is a real syscall (glibc dropped its cache
+ *  in 2.25) and measured ~128ns/acquisition here -- enough on its own to make
+ *  the lock slower than the racy implementation it replaced. A relaxed load and
+ *  compare costs ~1ns and catches the only case that matters. */
+CTP_INLINE_CROSS_FUN unsigned ProcIdentityGen() {
+#if defined(CTP_TIMED_MUTEX_POSIX_LIVENESS)
+  static const bool kRegistered = []() {
+    ::pthread_atfork(nullptr, nullptr, []() { ++ProcIdentityGenStorage(); });
+    return true;
+  }();
+  (void)kRegistered;
+#endif
+  return ProcIdentityGenStorage();
+}
+
+}  // namespace detail
+#endif
 
 /**
  * TimedMutex -- a cross-process mutex whose holder can be RECLAIMED if it dies
@@ -231,9 +269,30 @@ struct TimedMutex {
   CTP_INLINE_CROSS_FUN
   void StampOwner() {
 #if !CTP_IS_DEVICE_PASS
-    owner_pid_ = static_cast<min_u32>(ctp::SystemInfo::GetPid());
-    owner_start_ = GetProcessStartTime(static_cast<min_u32>(
-        ctp::SystemInfo::GetPid()));
+    // Computed ONCE: a process's pid and start time are invariant for its
+    // lifetime, while GetProcessStartTime() is an fopen + fread + parse of
+    // /proc/<pid>/stat and GetPid() is a syscall. Paying that per acquisition
+    // cost ~43us per lock, which is invisible for a lease held for
+    // milliseconds but fatal once ctp::RwLock became a wrapper over this mutex
+    // and started taking it on every metadata read (issue #927).
+    //
+    // Cache invalidated by fork generation, NOT recomputed per acquisition.
+    // Caching unconditionally would make a forked child stamp its PARENT's
+    // identity; the parent is alive, so the child's abandoned holds would never
+    // be reclaimable (this hangs the cross-process half of test_lease.cc).
+    // thread_local so concurrent acquisitions don't race on the cache -- the
+    // /proc read is then once per thread, not once per acquisition.
+    static thread_local min_u32 cached_pid = 0;
+    static thread_local min_u64 cached_start = 0;
+    static thread_local unsigned cached_gen = 0;
+    const unsigned gen = detail::ProcIdentityGen();
+    if (cached_pid == 0 || cached_gen != gen) {
+      cached_pid = static_cast<min_u32>(ctp::SystemInfo::GetPid());
+      cached_start = GetProcessStartTime(cached_pid);
+      cached_gen = gen;
+    }
+    owner_pid_ = cached_pid;
+    owner_start_ = cached_start;
 #endif
   }
 

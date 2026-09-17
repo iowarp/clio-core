@@ -5,9 +5,9 @@
  * BSD 3-Clause License. See LICENSE file.
  */
 
-#include <clio_cae/core/label_client.h>
+#include <clio_cae/summarizer/label_client.h>
 
-#ifdef CLIO_CAE_ENABLE_LABELING
+#ifdef CLIO_CAE_ENABLE_SUMMARIZATION
 
 #include <clio_ctp/util/logging.h>
 
@@ -17,7 +17,7 @@
 #include <mutex>
 #include <string>
 
-namespace clio::cae::core {
+namespace clio::cae::summarizer {
 
 namespace {
 
@@ -134,11 +134,11 @@ bool OllamaGenerate(const std::string &endpoint_base,
   }
 }
 
-}  // namespace clio::cae::core
+}  // namespace clio::cae::summarizer
 
-#else  // CLIO_CAE_ENABLE_LABELING
+#else  // CLIO_CAE_ENABLE_SUMMARIZATION
 
-namespace clio::cae::core {
+namespace clio::cae::summarizer {
 
 bool OllamaGenerate(const std::string &, const std::string &,
                     const std::string &, int, int, std::string &out_response) {
@@ -146,6 +146,6 @@ bool OllamaGenerate(const std::string &, const std::string &,
   return false;
 }
 
-}  // namespace clio::cae::core
+}  // namespace clio::cae::summarizer
 
-#endif  // CLIO_CAE_ENABLE_LABELING
+#endif  // CLIO_CAE_ENABLE_SUMMARIZATION

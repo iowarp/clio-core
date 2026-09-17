@@ -67,12 +67,27 @@ export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
 JARVIS_CD_DIR="$REPO_ROOT/external/jarvis-cd"
 if [ ! -d "$JARVIS_CD_DIR/jarvis_cd" ]; then
     JARVIS_CD_REPO="${JARVIS_CD_REPO:-https://github.com/grc-iit/jarvis-cd.git}"
-    JARVIS_CD_REF="${JARVIS_CD_REF:-dev}"
+    # PINNED to a commit, not a branch name. Tracking dev meant an upstream
+    # push could break this job with no commit of ours -- and did: jarvis-cd
+    # moved jarvis_cd.util.container_utils and every run went red with
+    #   ModuleNotFoundError: No module named 'jarvis_cd.util.container_utils'
+    # for 13 of 31 runs across five days. A SHA turns upstream churn into a
+    # deliberate bump we review instead of an overnight outage. Set
+    # JARVIS_CD_REF=dev to probe a newer upstream before moving the pin.
+    JARVIS_CD_REF="${JARVIS_CD_REF:-1d2cf925d36da3a1d62730fbc6c65b5001efe43b}"
     log "cloning jarvis-cd ($JARVIS_CD_REF) into external/jarvis-cd"
-    if ! git clone --quiet --depth 1 --branch "$JARVIS_CD_REF" \
-            "$JARVIS_CD_REPO" "$JARVIS_CD_DIR"; then
-        err "FAIL: could not clone jarvis-cd ($JARVIS_CD_REPO @ $JARVIS_CD_REF)"
-        exit 1
+    # git clone --branch takes a ref and never a SHA, so fetch the commit
+    # directly. The clone fallback keeps JARVIS_CD_REF=dev working.
+    if ! ( git init --quiet "$JARVIS_CD_DIR" \
+           && git -C "$JARVIS_CD_DIR" remote add origin "$JARVIS_CD_REPO" \
+           && git -C "$JARVIS_CD_DIR" fetch --quiet --depth 1 origin "$JARVIS_CD_REF" \
+           && git -C "$JARVIS_CD_DIR" checkout --quiet FETCH_HEAD ); then
+        rm -rf "$JARVIS_CD_DIR"
+        if ! git clone --quiet --depth 1 --branch "$JARVIS_CD_REF" \
+                "$JARVIS_CD_REPO" "$JARVIS_CD_DIR"; then
+            err "FAIL: could not clone jarvis-cd ($JARVIS_CD_REPO @ $JARVIS_CD_REF)"
+            exit 1
+        fi
     fi
 else
     log "using existing external/jarvis-cd checkout"

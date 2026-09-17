@@ -210,7 +210,7 @@ option(CAE_ENABLE_GCS "Enable Google Cloud Storage (gs://) import in CAE" OFF)
 # LLM labeling/summary + semantic-search features and their integration tests
 # require a running Ollama service. OFF by default so default builds don't
 # build or run them without Ollama.
-option(CLIO_CAE_ENABLE_SUMMARY "Enable CAE LLM labeling/summary + semantic-search (requires a running Ollama service)" OFF)
+option(CLIO_CAE_ENABLE_SUMMARY "Enable the summarizer chimod's live-Ollama tests + semantic-search (requires a running Ollama service)" OFF)
 
 #------------------------------------------------------------------------------
 # External Examples and Applications

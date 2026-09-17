@@ -41,6 +41,7 @@ using pid_t = int;
 #endif
 
 #include <atomic>
+#include <exception>
 // ============================================================================
 // Coroutine backend selection.
 //   * Default: C++20 stackless coroutines (std::coroutine_handle).

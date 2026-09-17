@@ -62,7 +62,15 @@ static std::atomic<uint64_t> sendout_ser_ns{0}, sendout_tx_ns{0},
 static std::atomic<uint64_t> recv_ns{0}, recvin_ns{0}, recvout_ns{0},
     recv_n{0};
 inline bool On() {
-  static bool on = std::getenv("CLIO_NET_TRACE") != nullptr;
+  // Non-EMPTY, not merely non-null: a harness that forwards the knob as
+  // "${CLIO_NET_TRACE:-}" (docker-compose environment:, and any `VAR=${VAR:-}`
+  // prefix) sets it to the empty string when unset, and a null check then
+  // leaves tracing permanently on -- silently adding clock reads and log
+  // volume to every measurement that was supposed to be clean.
+  static bool on = [] {
+    const char *e = std::getenv("CLIO_NET_TRACE");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
   return on;
 }
 inline uint64_t NowNs() {
@@ -254,7 +262,23 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
 
     task_copy->task_id_.net_key_ = send_map_key;
     task_copy->task_id_.replica_id_ = i;
-    task_copy->pool_query_ = query;
+    // A collective (ManyToOne / AllToOne) member keeps its OWN query across the
+    // wire. `query` here is the physical envelope RouteManyToOne wrapped it in
+    // (Physical(leader)), and the target node was already resolved from it
+    // above, so nothing on this side still needs it. The receiving leader,
+    // however, needs the collective query itself: it carries the routing mode
+    // that makes RouteTask park the task in the BatchManager, plus the
+    // container_hash and batch_key that decide WHICH group it joins.
+    // Overwriting it with the envelope erased all three, so a forwarded member
+    // arrived at the leader looking like an ordinary Physical task: it ran
+    // standalone and returned an un-combined result (an AllReduce gave each
+    // caller back its own value with rc=0), and the collective it should have
+    // joined waited for a member that never arrived.
+    if (origin_task->pool_query_.IsCollectiveMode()) {
+      task_copy->pool_query_ = origin_task->pool_query_;
+    } else {
+      task_copy->pool_query_ = query;
+    }
     task_copy->pool_query_.SetReturnNode(ipc_manager->GetNodeId());
 
     if (!ipc_manager->IsAlive(target_node_id)) {
@@ -529,6 +553,7 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   future.GetTaskPtr()->BeginRunContext();
+  ipc_manager->NetProfMarkRecvIn(task_ptr);
   task_ptr->SetRouted();
 
   if (ipc_manager->GetScheduler() != nullptr) {

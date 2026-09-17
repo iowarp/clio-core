@@ -48,7 +48,6 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/data_organizer/data_organizer.h>
 #include <clio_cte/core/shm_metadata_cache.h>
-#include <clio_cte/core/gpu_metadata_cache.h>
 #include <clio_cte/core/transaction_log.h>
 #include <clio_ctp/search/regex_search_engine.h>
 
@@ -504,70 +503,6 @@ private:
   // Restart flag: set by Restart() before calling Init()/Create()
   bool is_restart_ = false;
 
-  // -----------------------------------------------------------------
-  // GPU metadata cache (optional; populated when
-  // config_.gpu_metadata_cache_.enabled_ is true).
-  //
-  // Owned by the CTE Core server. The header pointer addresses
-  // GPU-managed USM (sycl::malloc_shared on SYCL, cudaMallocManaged on
-  // CUDA). All mutations go through GpuCache* helpers below, which are
-  // the ONLY places that touch this state from PutBlob / GetOrCreateTag /
-  // DelBlob / DelTag.
-  // -----------------------------------------------------------------
-  GpuMetadataCacheHeader *gpu_cache_ = nullptr;
-  size_t gpu_cache_bytes_ = 0;
-
-  /**
-   * Allocate and initialize the GPU metadata cache region. No-op if
-   * the feature is disabled or no GPU backend is built in. Sets
-   * gpu_cache_ / gpu_cache_bytes_ on success.
-   *
-   * @return true on success (or feature-disabled), false on allocation
-   *         failure.
-   */
-  bool GpuCacheCreate();
-
-  /** Free the GPU metadata cache region. Safe to call when disabled. */
-  void GpuCacheDestroy();
-
-  /**
-   * Add or update a blob entry in the cache. Called from PutBlob right
-   * after the blob has been placed. Resolves the bdev_type of the
-   * blob's first block via registered_targets_ + storage_devices_,
-   * and either projects the blob into the cache (DRAM-tier targets) or
-   * removes any stale projection (file/noop targets).
-   *
-   * The PutBlob call site stays a single line; all bdev-type lookup
-   * logic lives here.
-   */
-  void GpuCacheOnPutBlob(const TagId &tag_id, const std::string &blob_name,
-                         const BlobInfo &blob_info);
-
-  /**
-   * Resolve the bdev_type string ("ram", "hbm", "pinned", "file", "noop",
-   * "") for a blob given its BlobInfo. Returns an empty string when
-   * registered_targets_ has no entry for the first block's pool id.
-   *
-   * Caller must hold no locks (this acquires target_lock_ for read).
-   */
-  std::string GetBdevTypeForBlob(const BlobInfo &blob_info);
-
-  /** Remove a blob entry. Called from DelBlob. */
-  void GpuCacheOnDelBlob(const TagId &tag_id, const std::string &blob_name);
-
-  /** Add (or refresh) a tag entry. Called from GetOrCreateTag. */
-  void GpuCacheOnGetOrCreateTag(const TagId &tag_id,
-                                const std::string &tag_name);
-
-  /** Remove a tag entry and cascade-remove all blob entries owning it. */
-  void GpuCacheOnDelTag(const TagId &tag_id);
-
-  /**
-   * Read-only accessor (host-side) for tests / diagnostics. Returns
-   * the cache header pointer if enabled, else nullptr.
-   */
-  GpuMetadataCacheHeader *GetGpuCache() const { return gpu_cache_; }
-
   // Telemetry ring buffer for performance monitoring
   static inline constexpr size_t kTelemetryRingSize = 1024; // Ring buffer size
   std::unique_ptr<ctp::ipc::circular_mpsc_ring_buffer<CteTelemetry, ctp::ipc::MallocAllocator>> telemetry_log_;
@@ -896,6 +831,11 @@ private:
    * @param rctx Runtime context for task execution
    */
   clio::run::TaskResume GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask> &task);
+
+  /** Residency: is this byte range physically present in the tier?
+   *  See GetResidencyTask for why only the tier can answer this. */
+  clio::run::TaskResume GetResidency(
+      clio::run::shared_ptr<GetResidencyTask> &task);
 
   /**
    * Get contained blobs operation - returns all blob names in a tag

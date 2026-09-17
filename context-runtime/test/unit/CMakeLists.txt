@@ -1166,6 +1166,18 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 120
   )
 
+  # Issue #1015: CLIO_WITH_RUNTIME=1 must attach to a running daemon, not fail
+  # and not start a second runtime. Own process: CLIO_INIT is once-per-process.
+  add_test(
+    NAME cr_external_client_with_runtime_attaches
+    COMMAND ${EXTERNAL_CLIENT_TEST_TARGET} "ExternalClient - WITH_RUNTIME=1 attaches to a running runtime"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_external_client_with_runtime_attaches PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    TIMEOUT 120
+  )
+
   add_test(
     NAME cr_external_client_operations
     COMMAND ${EXTERNAL_CLIENT_TEST_TARGET} "ExternalClient - Client Operations"

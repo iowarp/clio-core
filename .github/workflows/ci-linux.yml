@@ -39,16 +39,25 @@ jobs:
   # node containers, with gcov pulled out of the nodes) is folded in next; until
   # then it still runs, without coverage, in cluster-tests.yml.
   # ---- Matrix tier selection (issue #921) -----------------------------------
-  # A pull request runs the `unit amd64` phase only; the full phase sweep runs
-  # on push to main/dev. Every PR commit fanning out to six phases plus four
+  # A pull request runs `unit amd64` and `cae`; the full phase sweep runs on
+  # push to main/dev. Every PR commit fanning out to six phases plus four
   # variant jobs made Linux the slowest gate and multiplied flake exposure
-  # without multiplying signal -- the non-unit phases each scope themselves to
+  # without multiplying signal -- the remaining phases each scope themselves to
   # one subtree and rarely fail alone. They still gate what lands, at the merge
   # point rather than on every push to a branch.
   #
-  # `unit amd64` is the PR phase because it is the only one that runs the core
+  # `unit amd64` is a PR phase because it is the only one that runs the core
   # suite (everything except adapter/integration/docker/cae/cee), so a
   # regression in the runtime, transport, or CTE shows up there first.
+  #
+  # `cae` is a PR phase because it is the ONLY phase that runs the CAE suite at
+  # all: those tests are label-gated (`ctest -L cae`) and the `unit` phase's
+  # default exclude set drops every CAE test carrying `integration` -- which is
+  # most of the ones that exercise a live runtime, since that label is what
+  # keeps them off macOS (issue #504). Without this phase a PR touching CAE
+  # skipped its own tests entirely and reported near-zero patch coverage, so a
+  # CAE regression only surfaced after merge. It is amd64-only and scoped to
+  # */context-assimilation-engine/*, so it adds one job, not a sweep.
   #
   # The phase list lives here as JSON rather than as a `strategy.matrix.include`
   # block because a job-level `if:` cannot see the `matrix` context -- filtering
@@ -100,7 +109,7 @@ jobs:
           JSON
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "full=false" >> "$GITHUB_OUTPUT"
-            sel=$(jq -c '{include: [.[] | select(.phase == "unit" and .arch == "amd64")]}' /tmp/phases.json)
+            sel=$(jq -c '{include: [.[] | select((.phase == "unit" and .arch == "amd64") or .phase == "cae")]}' /tmp/phases.json)
           else
             echo "full=true" >> "$GITHUB_OUTPUT"
             sel=$(jq -c '{include: .}' /tmp/phases.json)

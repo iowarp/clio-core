@@ -138,6 +138,11 @@ add_executable(test_bdev_free_visibility
     test_bdev_free_visibility.cc
 )
 
+# Residency op (VFD_VOL_PLAN §1): present vs absent vs unreachable.
+add_executable(test_residency_op
+    test_residency_op.cc
+)
+
 # Batching benchmark (#820): many small writes at ONE blob, A/B'd on the same
 # binary via CLIO_TASK_BATCHING.
 add_executable(bench_same_blob_batching
@@ -469,6 +474,18 @@ target_link_libraries(test_vectored_blob_io
 
 # Link test_bdev_fragmentation (#820) - same deps.
 target_link_libraries(test_bdev_fragmentation
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# Link test_residency_op - same deps.
+target_link_libraries(test_residency_op
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime
@@ -889,6 +906,13 @@ set_tests_properties(cte_bdev_fragmentation PROPERTIES
 
 # issue #919: placement must see space freed since the last StatTargets tick.
 # Four fill/stat/delete/put cycles; a stray periodic tick can rescue one, not all.
+add_test(NAME cte_residency_op
+    COMMAND test_residency_op)
+set_tests_properties(cte_residency_op PROPERTIES
+    TIMEOUT 300
+    LABELS "cte;residency"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+
 add_test(NAME cte_bdev_free_visibility
     COMMAND test_bdev_free_visibility)
 set_tests_properties(cte_bdev_free_visibility PROPERTIES
@@ -1688,9 +1712,11 @@ set_tests_properties(
 # ------------------------------------------------------------------------------
 # clio-fs zero-IPC read path (issue #817): correctness + latency
 #
-# UNIX-only: the descriptor layer it drives is built on unistd.h / sys/stat.h /
-# off_t and has no Windows port, so the filesystem client compiles it out there
-# exist there.
+# UNIX-only, but no longer because of the descriptor layer: that has a Windows
+# port now (FsOff/FsSsize via posix_compat.h) and is compiled on every platform.
+# What keeps this binary UNIX-only is its own harness -- RuntimeServer forks a
+# real clio_run daemon through unistd.h/sys/wait.h, which is the whole point of
+# the test (see the InitRuntime comment).
 # ------------------------------------------------------------------------------
 if(UNIX)
 add_executable(test_cfs_shm_read
@@ -1863,36 +1889,6 @@ set_tests_properties(cte_putblob_priv_separate PROPERTIES
     TIMEOUT 180
     LABELS "unit;core;cte;msan_skip")
 endif()  # UNIX
-
-add_executable(test_cte_gpu_metadata_cache
-    test_cte_gpu_metadata_cache.cc
-)
-
-target_link_libraries(test_cte_gpu_metadata_cache
-    clio_cte_core_runtime
-    clio_cte_core_client
-    clio::run::admin_runtime
-    clio::run::admin_client
-    clio::run::bdev_runtime
-    clio::run::bdev_client
-    ctp::cxx
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-
-add_test(NAME cte_gpu_metadata_cache_all
-    COMMAND test_cte_gpu_metadata_cache)
-
-set_tests_properties(
-    cte_gpu_metadata_cache_all
-    PROPERTIES
-        TIMEOUT 120
-        # msan_skip: prints test counts through SimpleTest::print_summary, whose
-        # std::ostream number formatting lives in the uninstrumented libstdc++.so
-        # (std::num_put / std::ctype widening) — unfixable third-party false
-        # positives.
-        LABELS "unit;core;cte;msan_skip"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
-)
 
 # ------------------------------------------------------------------------------
 # Config error-path unit tests — simple_test.h framework (NOT Catch2)
