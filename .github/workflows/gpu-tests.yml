@@ -162,7 +162,7 @@ jobs:
                    test_gpu_vector_smoke test_gpu_vector_semantics \
                    test_gpu_vector_workloads test_gpu_vector_compress \
                    test_gpu_vector_race test_gpu_vector_hbm_nvcomp \
-                   clio_gpu_vector_weights_bench
+                   clio_weights_paged_bench
 
     # NOTE: GPU tests are disabled until self-hosted GPU runners are available.
     # To re-enable, change runs-on to [self-hosted, gpu], add nvidia-smi
