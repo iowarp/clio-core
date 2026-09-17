@@ -31,6 +31,20 @@ target_compile_definitions(test_compress_exec
 add_test(NAME ctp_compress COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_compress_exec "~[error=FatalError]")
 
+# Device quantizer: needs a GPU, so registered but labelled.
+if(CLIO_CORE_ENABLE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    add_executable(test_quantize_device_exec
+            ${TEST_MAIN}/main.cc
+            test_init.cc
+            test_quantize_device.cc)
+    target_link_libraries(test_quantize_device_exec
+            clio_ctp_host ctp::compress CUDA::cudart Catch2::Catch2)
+    add_test(NAME ctp_quantize_device COMMAND
+            ${CMAKE_BINARY_DIR}/bin/test_quantize_device_exec)
+    set_tests_properties(ctp_quantize_device PROPERTIES LABELS "gpu")
+endif()
+
 #------------------------------------------------------------------------------
 # Install Targets
 #------------------------------------------------------------------------------

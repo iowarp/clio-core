@@ -28,6 +28,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <thread>
 #include <cmath>
@@ -234,6 +235,129 @@ TEST_CASE("CompressorInterpose - transparent compress/decompress + parity",
     // would pass even if the quantize bit were dropped -- which is exactly
     // the silent downgrade this path had before.
     REQUIRE(worst > 0.0);
+  }
+
+  // Preset word of a stored blob as the core holds it; 0 if stored raw.
+  auto stored_preset = [&](const std::string &name) -> uint32_t {
+    auto sz = core->AsyncGetBlobSize(tag_id, name);
+    sz.Wait();
+    REQUIRE(sz->GetReturnCode() == 0);
+    std::vector<char> raw(sz->size_, 0);
+    auto get = core->AsyncGetBlob(tag_id, name, 0, sz->size_, /*flags=*/0,
+                                  raw.data());
+    get.Wait();
+    REQUIRE(get->GetReturnCode() == 0);
+    REQUIRE(raw.size() >= 12);
+    uint32_t magic = 0, preset = 0;
+    std::memcpy(&magic, raw.data(), 4);
+    std::memcpy(&preset, raw.data() + 8, 4);
+    return magic == 0x43544543u ? preset : 0u;
+  };
+  const double kBound = 0.05;
+  const int kQuantPreset = static_cast<int>(2u | (1u << 24));
+
+  // B3. float64 is quantized as float64, not as pairs of float32 words.
+  {
+    const size_t kDoubles = kValSize / sizeof(double);
+    std::vector<double> dvals(kDoubles);
+    for (size_t i = 0; i < kDoubles; ++i) dvals[i] = static_cast<double>(i % 1000);
+    clio::cte::core::Context ctx;
+    ctx.compress_lib_ = 1;
+    ctx.data_type_ = 2;
+    ctx.error_bound_ = kBound;
+    ctx.compress_preset_ = kQuantPreset;
+    auto put = comp_io.AsyncPutBlob(
+        tag_id, "quant_f64", 0, kValSize,
+        reinterpret_cast<char *>(dvals.data()), /*score=*/-1.0f, ctx);
+    put.Wait();
+    REQUIRE(put->GetReturnCode() == 0);
+    std::vector<double> got(kDoubles, 0.0);
+    auto get = comp_io.AsyncGetBlob(tag_id, "quant_f64", 0, kValSize,
+                                    /*flags=*/0,
+                                    reinterpret_cast<char *>(got.data()));
+    get.Wait();
+    REQUIRE(get->GetReturnCode() == 0);
+    double worst = 0.0;
+    for (size_t i = 0; i < kDoubles; ++i) {
+      worst = std::max(worst, std::fabs(got[i] - dvals[i]));
+    }
+    INFO("float64 worst |orig - dequantized| = " << worst);
+    REQUIRE(worst <= kBound);
+    REQUIRE(worst > 0.0);
+    const uint32_t preset = stored_preset("quant_f64");
+    REQUIRE(((preset >> 24) & 1u) == 1u);  // quantized
+    REQUIRE(((preset >> 28) & 1u) == 1u);  // as float64
+  }
+
+  // B4. NaN and a spread no index can span: quantized anyway, the NaN and
+  //     the huge values kept bit-exact, the rest within the bound.
+  {
+    const size_t kFloats = kValSize / sizeof(float);
+    std::vector<float> fvals(kFloats);
+    for (size_t i = 0; i < kFloats; ++i) {
+      fvals[i] = (i % 2) ? static_cast<float>(std::sin(i * 1e-3) * 1.96e12)
+                         : static_cast<float>(i % 977) * 0.25f - 100.0f;
+    }
+    fvals[6] = std::numeric_limits<float>::quiet_NaN();
+    clio::cte::core::Context ctx;
+    ctx.compress_lib_ = 1;
+    ctx.data_type_ = 1;
+    ctx.error_bound_ = kBound;
+    ctx.compress_preset_ = kQuantPreset;
+    auto put = comp_io.AsyncPutBlob(
+        tag_id, "quant_escape", 0, kValSize,
+        reinterpret_cast<char *>(fvals.data()), /*score=*/-1.0f, ctx);
+    put.Wait();
+    REQUIRE(put->GetReturnCode() == 0);
+    std::vector<float> got(kFloats, 0.0f);
+    auto get = comp_io.AsyncGetBlob(tag_id, "quant_escape", 0, kValSize,
+                                    /*flags=*/0,
+                                    reinterpret_cast<char *>(got.data()));
+    get.Wait();
+    REQUIRE(get->GetReturnCode() == 0);
+    double worst = 0.0;
+    size_t nan_changed = 0;
+    for (size_t i = 0; i < kFloats; ++i) {
+      if (std::isnan(fvals[i])) {
+        nan_changed += std::memcmp(&got[i], &fvals[i], sizeof(float)) != 0;
+        continue;
+      }
+      worst = std::max(worst, std::fabs(static_cast<double>(got[i]) -
+                                        static_cast<double>(fvals[i])));
+    }
+    INFO("escape worst |orig - dequantized| = " << worst);
+    REQUIRE(nan_changed == 0);
+    REQUIRE(worst <= kBound);
+    REQUIRE(worst > 0.0);
+    const uint32_t preset = stored_preset("quant_escape");
+    REQUIRE(((preset >> 24) & 1u) == 1u);  // quantized
+    REQUIRE(((preset >> 27) & 1u) == 1u);  // with escapes
+  }
+
+  // B5. A quantize request on untyped bytes is not applied: they come back
+  //     exact instead of being read as float32.
+  {
+    const size_t kInts = kValSize / sizeof(int32_t);
+    std::vector<int32_t> ivals(kInts);
+    for (size_t i = 0; i < kInts; ++i) ivals[i] = static_cast<int32_t>(i);
+    clio::cte::core::Context ctx;
+    ctx.compress_lib_ = 1;
+    ctx.data_type_ = 0;
+    ctx.error_bound_ = kBound;
+    ctx.compress_preset_ = kQuantPreset;
+    auto put = comp_io.AsyncPutBlob(
+        tag_id, "quant_untyped", 0, kValSize,
+        reinterpret_cast<char *>(ivals.data()), /*score=*/-1.0f, ctx);
+    put.Wait();
+    REQUIRE(put->GetReturnCode() == 0);
+    std::vector<int32_t> got(kInts, -1);
+    auto get = comp_io.AsyncGetBlob(tag_id, "quant_untyped", 0, kValSize,
+                                    /*flags=*/0,
+                                    reinterpret_cast<char *>(got.data()));
+    get.Wait();
+    REQUIRE(get->GetReturnCode() == 0);
+    REQUIRE(std::memcmp(got.data(), ivals.data(), kValSize) == 0);
+    REQUIRE(((stored_preset("quant_untyped") >> 24) & 1u) == 0u);
   }
 
   // C. Partial + VECTORED reads of the compressed blob — impossible against

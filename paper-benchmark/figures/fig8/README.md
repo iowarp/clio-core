@@ -68,6 +68,7 @@ Defaults: 25-chunk bins, regret capped at 20%, MAPE at 50%.
 - Each configuration is timed once per chunk; one slow sample reads as a large
   regret. Report the median too.
 - WarpX's E and j fields (1e7–1e12) exceed the quantizer's int32 grid at eb 0.05,
-  so its "quantized" actions often run lossless.
+  so in these runs its "quantized" actions often ran lossless. The quantizer
+  now quantizes them, storing the values the grid cannot hold bit-exact.
 - The same configuration has diverged and not diverged across runs; use two
   seeds before drawing stability conclusions.

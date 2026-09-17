@@ -124,7 +124,8 @@ bool MeasureStoredChunkQuality(
   //    original domain, and the only one that can carry real error.
   if (quant != nullptr) {
     if (!acquire(&d_q, &q_id, orig_bytes)) { cleanup(); return false; }
-    if (!pp::DequantizeDevice(cur, orig_bytes / sizeof(float), *quant, d_q)) {
+    if (!pp::DequantizeDevice(cur, orig_bytes / quant->elem_bytes, *quant,
+                              d_q)) {
       cleanup();
       return false;
     }

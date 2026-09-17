@@ -586,11 +586,7 @@ int main(int argc, char **argv) {
 
   // --f32 stages a DOWNCAST copy. LAMMPS' state is double (Atom::x/v/f are
   // double**), so this is a lossy narrowing of its own, before NeuroPress sees
-  // anything -- but it is what makes a NeuroPress error bound reachable at all:
-  // the quantizer reads every buffer as float32 regardless of the declared
-  // type, and float64 bytes read that way are largely non-finite, so it
-  // declines. Handing it real float32 is the difference between an error bound
-  // that applies and one that is silently inert.
+  // anything. Without it the chunks are float64 and quantized as float64.
   // --order device now downcasts IN THE GATHER KERNEL, so --f32 no longer
   // implies a host round trip. `raw` is still incompatible: it hands over
   // Atom::x/v/f themselves, which are double and are not ours to narrow.

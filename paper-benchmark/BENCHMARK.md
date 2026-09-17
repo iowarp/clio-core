@@ -540,6 +540,8 @@ float32 ULP is already ~0.025 -- twenty-five times the 1e-3 asked for. Upstream
 NeuroPress does the same thing and prints "Using maximum precision quantization
 (error may exceed bound)". **If a run needs a guaranteed bound, check the range
 of the field it is applied to first.**
+That was an earlier quantizer. The current one never exceeds the bound: an
+element the grid cannot hold within it is stored bit-exact.
 
 ### PSNR is conservative, and cannot see a bound violation
 

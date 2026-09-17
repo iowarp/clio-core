@@ -82,6 +82,7 @@ inline size_t PrecisionToBytes(int precision) {
   switch (precision) {
     case 8: return 1;
     case 16: return 2;
+    case 64: return 8;
     default: return 4;
   }
 }
@@ -120,18 +121,13 @@ inline int ComputeRequiredPrecision(double data_range,
 
 
 /**
- * @brief Why QuantizeDevice() declined a chunk. A refusal is routine, not an
- *        error: the caller stores losslessly, honouring any bound at zero
- *        error. Reported so the only symptom is not a worse ratio.
+ * @brief Why QuantizeDevice() returned false. Never the data: any chunk of
+ *        float32 or float64 quantizes under any positive bound.
  */
 enum class QuantizeRefusal : int {
   kNone = 0,
-  kNonFiniteRange,     /**< min/max not finite */
-  kStepNotPositive,    /**< defensive; eb > 0 is checked on entry */
-  kIndexExceedsInt32,  /**< bound needs a finer grid than int32 indexes */
-  kIndexLeftWidth,     /**< planner bug: impossible by construction */
-  kElementMissedBound, /**< an element missed the bound through the decoder */
-  kDeviceError,        /**< CUDA failed; not a property of the data */
+  kInvalidArgument, /**< null buffer, no elements, element size or bound */
+  kDeviceError,     /**< CUDA failed */
   kNoCudaSupport,
 };
 
@@ -140,16 +136,8 @@ inline const char *QuantizeRefusalName(QuantizeRefusal reason) {
   switch (reason) {
     case QuantizeRefusal::kNone:
       return "none";
-    case QuantizeRefusal::kNonFiniteRange:
-      return "data range is not finite";
-    case QuantizeRefusal::kStepNotPositive:
-      return "no positive quantization step exists for this bound";
-    case QuantizeRefusal::kIndexExceedsInt32:
-      return "bound needs a finer grid than int32 can index";
-    case QuantizeRefusal::kIndexLeftWidth:
-      return "an index left the chosen width (planner bug)";
-    case QuantizeRefusal::kElementMissedBound:
-      return "an element missed the bound through its own decoder";
+    case QuantizeRefusal::kInvalidArgument:
+      return "invalid argument";
     case QuantizeRefusal::kDeviceError:
       return "CUDA error";
     case QuantizeRefusal::kNoCudaSupport:
@@ -161,14 +149,10 @@ inline const char *QuantizeRefusalName(QuantizeRefusal reason) {
 /** @brief Token form, for the explore.csv column: no spaces or commas. */
 inline const char *QuantizeRefusalToken(QuantizeRefusal reason) {
   switch (reason) {
-    case QuantizeRefusal::kNone:               return "none";
-    case QuantizeRefusal::kNonFiniteRange:     return "nonfinite_range";
-    case QuantizeRefusal::kStepNotPositive:    return "step_not_positive";
-    case QuantizeRefusal::kIndexExceedsInt32:  return "index_exceeds_int32";
-    case QuantizeRefusal::kIndexLeftWidth:     return "index_left_width";
-    case QuantizeRefusal::kElementMissedBound: return "element_missed_bound";
-    case QuantizeRefusal::kDeviceError:        return "device_error";
-    case QuantizeRefusal::kNoCudaSupport:      return "no_cuda_support";
+    case QuantizeRefusal::kNone:            return "none";
+    case QuantizeRefusal::kInvalidArgument: return "invalid_argument";
+    case QuantizeRefusal::kDeviceError:     return "device_error";
+    case QuantizeRefusal::kNoCudaSupport:   return "no_cuda_support";
   }
   return "unknown";
 }
@@ -185,59 +169,72 @@ struct DeviceQuantizeParams {
   double error_bound = 0.0;      /**< Bound requested by the caller */
   double effective_error_bound = 0.0;  /**< Bound actually used for the scale */
   double scale = 0.0;            /**< 1 / (2 * effective_error_bound) */
-  double data_min = 0.0;         /**< Minimum of the original data */
-  double data_max = 0.0;         /**< Maximum of the original data */
-  int precision = 0;             /**< 8, 16 or 32 bits per value */
+  double data_min = 0.0;         /**< Grid offset: min of gridded elements */
+  double data_max = 0.0;         /**< Max of gridded elements */
+  int precision = 0;             /**< 8, 16, 32 or 64 bits per slot */
+  int elem_bytes = 4;            /**< 4 = float32, 8 = float64 */
+  /** Slots are elem_bytes wide and a bitmap (bit i of byte i/8) follows
+      them; bit i%8 of byte i/8 set means slot i holds element i's own bits. */
+  bool escapes = false;
+  uint64_t escape_count = 0;     /**< Set bits in that bitmap */
   bool bound_achievable = true;  /**< Always true on success */
   QuantizeRefusal refusal = QuantizeRefusal::kNone; /**< Set on every false
                                       return */
 };
 
-/**
- * @brief Quantize a device float32 buffer in place of a device output.
- *
- * Device-resident counterpart of Quantize() above, and the one the selection
- * path can actually use: the data being compressed lives on the GPU, so
- * quantizing on the host would mean a D2H/H2D round trip per chunk.
- * Reproduces quantize_simple()'s pipeline (quantization_kernels.cu): CUB
- * min/max reduction, effective error bound, precision from that bound, then
- * a clamped linear quantization written at the selected width.
- *
- * @param device_in   Device float32 buffer.
- * @param num_elements Element count (NOT bytes).
- * @param error_bound Requested absolute bound; must be > 0.
- * @param device_out  Device output, at least num_elements * 4 bytes.
- * @param out_bytes   Receives the packed output size.
- * @param out_params  Receives everything the read side needs to invert this.
- * @param stream      cudaStream_t to launch on, as an opaque pointer, or
- *                    nullptr for the shared per-thread stream. Supplying one
- *                    keeps this slot's work off every other slot's stream, so
- *                    a sweep quantizing K candidates overlaps them the way
- *                    upstream's quantize_simple(..., s.stream) does.
- *
- *                    Unlike ByteShuffleDevice, this still synchronizes the
- *                    given stream once, internally: the packed width is chosen
- *                    from the data's min/max, so those have to reach the host
- *                    before the quantize kernel can be launched or *out_bytes
- *                    computed. The wait is scoped to `stream`, so it blocks
- *                    only this candidate -- slots already launched keep
- *                    running.
- * @return true only if EVERY element round-trips through DequantizeDevice
- *         within error_bound; the kernel checks each one. False if the bound
- *         cannot be honored or CUDA failed -- out_params->refusal says which,
- *         and the caller should store the chunk losslessly.
- */
-bool QuantizeDevice(const void *device_in, size_t num_elements,
-                    double error_bound, void *device_out, size_t *out_bytes,
-                    DeviceQuantizeParams *out_params, void *stream = nullptr);
+/** @brief Bytes QuantizeDevice wrote for these parameters: slots, bitmap,
+ *  and zeros up to a multiple of 8, since nvcomp-bitcomp reads 8-byte words
+ *  and mangles a partial one. */
+inline size_t QuantizedBytes(size_t num_elements,
+                             const DeviceQuantizeParams &p) {
+  const size_t b = num_elements * PrecisionToBytes(p.precision) +
+                   (p.escapes ? (num_elements + 7) / 8 : 0);
+  return (b + 7) & ~size_t{7};
+}
+
+/** @brief Output QuantizeDevice may need: escape slots, bitmap, padding. */
+inline size_t QuantizeCapacity(size_t num_elements, size_t elem_bytes) {
+  return (num_elements * elem_bytes + (num_elements + 7) / 8 + 7) &
+         ~size_t{7};
+}
 
 /**
- * @brief Inverse of QuantizeDevice(): packed integers back to float32.
+ * @brief Error-bounded linear quantization of a device float32/float64 buffer.
  *
- * @param device_in  Packed quantized values, as QuantizeDevice wrote them.
+ * Indices are round((x - data_min) * scale) at the narrowest width the chunk
+ * needs, and every element is decoded with DequantizeDevice's arithmetic and
+ * checked against error_bound before the chunk is accepted. When some element
+ * cannot be held that way -- NaN or Inf, a spread wider than the widest index,
+ * or a failed check -- the output switches to escape slots: elem_bytes-wide
+ * slots, where an escaped element keeps its own bits, and a bitmap after them.
+ * So every element decodes within error_bound or bit-exact, and the call never
+ * declines a chunk.
+ *
+ * @param device_in    Device buffer of num_elements float32 or float64.
+ * @param num_elements Element count (NOT bytes).
+ * @param elem_bytes   4 (float32) or 8 (float64).
+ * @param error_bound  Absolute bound; any value > 0, infinity included.
+ * @param device_out   Device output of QuantizeCapacity() bytes.
+ * @param out_bytes    Receives QuantizedBytes().
+ * @param out_params   Receives everything the read side needs to invert this.
+ * @param stream       cudaStream_t to launch on, as an opaque pointer, or
+ *                     nullptr for the shared per-thread stream. The call
+ *                     synchronizes only that stream.
+ * @return false only for invalid arguments or a CUDA failure
+ *         (out_params->refusal says which).
+ */
+bool QuantizeDevice(const void *device_in, size_t num_elements,
+                    size_t elem_bytes, double error_bound, void *device_out,
+                    size_t *out_bytes, DeviceQuantizeParams *out_params,
+                    void *stream = nullptr);
+
+/**
+ * @brief Inverse of QuantizeDevice().
+ *
+ * @param device_in  QuantizedBytes() bytes, as QuantizeDevice wrote them.
  * @param num_elements Element count.
  * @param params     The parameters QuantizeDevice returned.
- * @param device_out Device float32 output, at least num_elements * 4 bytes.
+ * @param device_out Device output, num_elements * params.elem_bytes bytes.
  */
 bool DequantizeDevice(const void *device_in, size_t num_elements,
                       const DeviceQuantizeParams &params, void *device_out);

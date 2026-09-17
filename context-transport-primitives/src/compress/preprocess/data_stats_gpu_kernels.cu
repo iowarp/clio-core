@@ -284,12 +284,9 @@ struct DeviceStatsScratch {
      statistics, so a double chunk is CONVERTED before it is measured. */
   float *d_narrow = nullptr;
   size_t narrow_capacity = 0;
-  /* 8-byte min/max result for DeviceMinMax, which QuantizeDevice calls once
-     per chunk. It used to cudaMalloc and cudaFree this every call: 2000 chunks
-     meant 2000 allocator round trips to move 8 bytes, and cudaMalloc can
-     serialize against the device. That is the same defect the comment above
-     records for ComputeDeviceStatsTyped, in the one place it was not fixed. */
-  unsigned int *d_minmax = nullptr;
+  /* QuantizeDevice's range keys and pass counters, four u64 reused per chunk
+     rather than an allocator round trip each. */
+  unsigned long long *d_range = nullptr;
   bool ok = false;
 };
 
@@ -301,7 +298,8 @@ DeviceStatsScratch &Scratch() {
                 cudaSuccess &&
             cudaMalloc(&p->d_scalars, 3 * sizeof(double)) == cudaSuccess &&
             cudaMalloc(&p->d_stats, sizeof(DeviceFeatureStats)) == cudaSuccess &&
-            cudaMalloc(&p->d_minmax, 2 * sizeof(unsigned int)) == cudaSuccess;
+            cudaMalloc(&p->d_range, 4 * sizeof(unsigned long long)) ==
+                cudaSuccess;
     return p;
   }();
   return *s;
@@ -706,46 +704,287 @@ bool ByteUnshuffleDevice(const void *device_in, void *device_out,
 // separately-device-linked .cu to this RDC-enabled static library breaks
 // __cudaRegisterLinkedBinary at static init.
 //
-// Ported from quantization_kernels.cu. The arithmetic is upstream's; only
-// the plumbing (CUB temp buffers, error reporting) is Clio's.
+// Every element is either on the grid, checked through the decoder's own
+// arithmetic, or stored bit-exact in its slot (escape mode), so a chunk is
+// never refused and never exceeds the bound.
 // ===========================================================================
 #include "clio_ctp/compress/preprocess/quantization.h"
+
+#include <cstring>
 
 namespace ctp::compress::preprocess {
 
 namespace {
 
-/**
- * q = round((v - data_min) * scale), clamped to the output width.
- * Matches quantize_linear_kernel (quantization_kernels.cu:55-81): the clamp
- * is what keeps an out-of-range value from becoming undefined behavior in
- * the float->int conversion.
- */
-template <typename OutT>
-__global__ void QuantizeKernel(const float *__restrict__ in,
+constexpr double kInf = std::numeric_limits<double>::infinity();
+// Largest double below 2^63, so the int64 cast of a checked index is defined.
+constexpr double kInt64Max = 9223372036854774784.0;
+
+/** The decoder: one correctly rounded fma, then the element type. */
+template <typename T>
+__device__ __forceinline__ T Decode(double q, double inv_scale, double offset) {
+  return static_cast<T>(fma(q, inv_scale, offset));
+}
+
+__device__ __forceinline__ int32_t BitsOf(float f) {
+  return static_cast<int32_t>(__float_as_uint(f));
+}
+__device__ __forceinline__ int64_t BitsOf(double d) {
+  return static_cast<int64_t>(__double_as_longlong(d));
+}
+__device__ __forceinline__ float FromBits(int32_t b) {
+  return __uint_as_float(static_cast<unsigned int>(b));
+}
+__device__ __forceinline__ double FromBits(int64_t b) {
+  return __longlong_as_double(static_cast<long long>(b));
+}
+
+/** Grid encoder. fail: 1 = index outside the width, 2 = bound missed. */
+template <typename InT, typename OutT>
+__global__ void QuantizeKernel(const InT *__restrict__ in,
                                OutT *__restrict__ out, size_t n, double scale,
                                double offset, double lo, double hi,
-                               double inv_scale, double error_bound,
-                               int *__restrict__ fail) {
+                               double inv_scale, double eb_check,
+                               unsigned long long *fail) {
   size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
   for (; i < n; i += stride) {
-    const double centered = static_cast<double>(in[i]) - offset;
-    const double q = round(centered * scale);
-    // No clamp: the planner sizes the width from the grid it encodes, so an
-    // index outside it is a bug to report, not to hide.
-    if (q < lo || q > hi) { atomicExch(fail, 1); return; }
+    const double x = static_cast<double>(in[i]);
+    const double q = round((x - offset) * scale);
+    if (!(q >= lo && q <= hi)) { atomicExch(fail, 1ull); return; }
     out[i] = static_cast<OutT>(q);
-    // DequantizeKernel's expression verbatim, NOT fma() -- one rounding
-    // instead of two would verify a decoder we do not ship. This check, not
-    // the step formula, is what makes `true` mean every element is in bound.
-    const float decoded = static_cast<float>(q * inv_scale + offset);
-    if (fabs(static_cast<double>(decoded) - static_cast<double>(in[i])) >
-        error_bound) {
-      atomicExch(fail, 2);
-      return;
+    const double z = static_cast<double>(Decode<InT>(q, inv_scale, offset));
+    if (!(fabs(z - x) <= eb_check)) { atomicExch(fail, 2ull); return; }
+  }
+}
+
+/**
+ * Escape-mode encoder, one bitmap byte per iteration: an element with
+ * |x| < limit whose index fits and whose decode passes keeps its index;
+ * any other element keeps its own bits and gets its map bit set.
+ */
+template <typename InT, typename SlotT>
+__global__ void EscapeQuantizeKernel(const InT *__restrict__ in,
+                                     SlotT *__restrict__ slots,
+                                     uint8_t *__restrict__ map, size_t n,
+                                     double limit, double scale,
+                                     double offset, double lo, double hi,
+                                     double inv_scale, double eb_check,
+                                     unsigned long long *escaped) {
+  size_t j = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  const size_t rows = (n + 7) / 8;
+  for (; j < rows; j += stride) {
+    unsigned int bits = 0, count = 0;
+    const size_t end = (8 * j + 8 < n) ? 8 * j + 8 : n;
+    for (size_t i = 8 * j; i < end; ++i) {
+      const double x = static_cast<double>(in[i]);
+      bool ok = fabs(x) < limit;
+      if (ok) {
+        const double q = round((x - offset) * scale);
+        ok = q >= lo && q <= hi &&
+             fabs(static_cast<double>(Decode<InT>(q, inv_scale, offset)) -
+                  x) <= eb_check;
+        if (ok) slots[i] = static_cast<SlotT>(q);
+      }
+      if (!ok) {
+        slots[i] = BitsOf(in[i]);
+        bits |= 1u << (i - 8 * j);
+        ++count;
+      }
+    }
+    map[j] = static_cast<uint8_t>(bits);
+    if (count != 0) atomicAdd(escaped, static_cast<unsigned long long>(count));
+  }
+}
+
+template <typename SlotT, typename OutT>
+__global__ void DequantizeKernel(const SlotT *__restrict__ in,
+                                 OutT *__restrict__ out, size_t n,
+                                 double inv_scale, double offset) {
+  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  for (; i < n; i += stride) {
+    out[i] = Decode<OutT>(static_cast<double>(in[i]), inv_scale, offset);
+  }
+}
+
+template <typename SlotT, typename OutT>
+__global__ void EscapeDequantizeKernel(const SlotT *__restrict__ in,
+                                       const uint8_t *__restrict__ map,
+                                       OutT *__restrict__ out, size_t n,
+                                       double inv_scale, double offset) {
+  size_t j = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  const size_t rows = (n + 7) / 8;
+  for (; j < rows; j += stride) {
+    const unsigned int bits = map[j];
+    const size_t end = (8 * j + 8 < n) ? 8 * j + 8 : n;
+    for (size_t i = 8 * j; i < end; ++i) {
+      out[i] = ((bits >> (i - 8 * j)) & 1u)
+                   ? FromBits(in[i])
+                   : Decode<OutT>(static_cast<double>(in[i]), inv_scale,
+                                  offset);
     }
   }
+}
+
+/**
+ * Monotonic value->unsigned key, so integer min/max order values correctly:
+ * for x >= 0 the IEEE bit pattern already orders, for x < 0 it orders in
+ * reverse, and this maps both into one increasing space.
+ */
+__device__ __forceinline__ unsigned int ValueKey(float f) {
+  unsigned int b = __float_as_uint(f);
+  return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+__device__ __forceinline__ unsigned long long ValueKey(double d) {
+  const unsigned long long s = 0x8000000000000000ull;
+  unsigned long long b = static_cast<unsigned long long>(__double_as_longlong(d));
+  return (b & s) ? ~b : (b | s);
+}
+double KeyToValue(unsigned int k) {
+  unsigned int b = (k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k;
+  float f;
+  std::memcpy(&f, &b, sizeof(f));
+  return static_cast<double>(f);
+}
+double KeyToValue(unsigned long long k) {
+  const unsigned long long s = 0x8000000000000000ull;
+  unsigned long long b = (k & s) ? (k & ~s) : ~k;
+  double d;
+  std::memcpy(&d, &b, sizeof(d));
+  return d;
+}
+
+__device__ __forceinline__ void AtomicMinKey(unsigned int *a, unsigned int v) {
+  atomicMin(a, v);
+}
+__device__ __forceinline__ void AtomicMaxKey(unsigned int *a, unsigned int v) {
+  atomicMax(a, v);
+}
+__device__ __forceinline__ void AtomicMinKey(unsigned long long *a,
+                                            unsigned long long v) {
+  unsigned long long cur = *a;
+  while (v < cur) {
+    const unsigned long long seen = atomicCAS(a, cur, v);
+    if (seen == cur) break;
+    cur = seen;
+  }
+}
+__device__ __forceinline__ void AtomicMaxKey(unsigned long long *a,
+                                            unsigned long long v) {
+  unsigned long long cur = *a;
+  while (v > cur) {
+    const unsigned long long seen = atomicCAS(a, cur, v);
+    if (seen == cur) break;
+    cur = seen;
+  }
+}
+
+/**
+ * Min/max over the elements with |x| < limit (NaN never qualifies), block
+ * reduction + one atomic pair per block; `skipped` is set if any did not.
+ */
+template <typename T, typename K>
+__global__ void RangeKernel(const T *__restrict__ in, size_t n, double limit,
+                            K *out_min, K *out_max,
+                            unsigned long long *skipped) {
+  __shared__ K s_min[kBlockSize];
+  __shared__ K s_max[kBlockSize];
+  K lo = static_cast<K>(~static_cast<K>(0)), hi = 0;
+  bool skip = false;
+  size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+    if (!(fabs(static_cast<double>(in[i])) < limit)) {
+      skip = true;
+      continue;
+    }
+    const K k = ValueKey(in[i]);
+    lo = k < lo ? k : lo;
+    hi = k > hi ? k : hi;
+  }
+  if (skip) atomicExch(skipped, 1ull);
+  s_min[threadIdx.x] = lo;
+  s_max[threadIdx.x] = hi;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      const K a = s_min[threadIdx.x + s], b = s_max[threadIdx.x + s];
+      if (a < s_min[threadIdx.x]) s_min[threadIdx.x] = a;
+      if (b > s_max[threadIdx.x]) s_max[threadIdx.x] = b;
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    AtomicMinKey(out_min, s_min[0]);
+    AtomicMaxKey(out_max, s_max[0]);
+  }
+}
+
+int Blocks(size_t count) {
+  const size_t b = (count + 255) / 256;
+  return static_cast<int>(b < 1 ? 1 : (b > 65535 ? 65535 : b));
+}
+
+/**
+ * Range of the elements below `limit` on the caller's stream, in the
+ * per-thread scratch. *found is false when no element qualified.
+ */
+bool DeviceRange(const void *d_in, size_t n, bool f64, double limit,
+                 cudaStream_t stream, double *lo, double *hi, bool *found,
+                 bool *skipped) {
+  // A sticky error from an unrelated earlier call (IsDevicePointer on a host
+  // pointer) must not be blamed on this launch.
+  cudaGetLastError();
+  DeviceStatsScratch &sc = Scratch();
+  unsigned long long *d = sc.d_range;
+  bool owns = false;
+  if (d == nullptr) {
+    if (cudaMalloc(&d, 4 * sizeof(unsigned long long)) != cudaSuccess) {
+      return false;
+    }
+    owns = true;
+  }
+  const int grid = static_cast<int>(
+      std::min<size_t>((n + kBlockSize - 1) / kBlockSize, 1024));
+  unsigned long long h[3] = {~0ull, 0ull, 0ull};
+  if (!f64) {
+    const unsigned int k[2] = {0xFFFFFFFFu, 0u};
+    std::memcpy(h, k, sizeof(k));
+  }
+  bool ok = cudaMemcpyAsync(d, h, sizeof(h), cudaMemcpyHostToDevice,
+                            stream) == cudaSuccess;
+  if (ok) {
+    if (f64) {
+      RangeKernel<double, unsigned long long><<<grid, kBlockSize, 0, stream>>>(
+          static_cast<const double *>(d_in), n, limit, d, d + 1, d + 2);
+    } else {
+      auto *k = reinterpret_cast<unsigned int *>(d);
+      RangeKernel<float, unsigned int><<<grid, kBlockSize, 0, stream>>>(
+          static_cast<const float *>(d_in), n, limit, k, k + 1, d + 2);
+    }
+    ok = cudaGetLastError() == cudaSuccess &&
+         cudaMemcpyAsync(h, d, sizeof(h), cudaMemcpyDeviceToHost, stream) ==
+             cudaSuccess &&
+         cudaStreamSynchronize(stream) == cudaSuccess;
+  }
+  if (owns) cudaFree(d);
+  if (!ok) return false;
+  *skipped = h[2] != 0;
+  if (f64) {
+    *found = h[0] <= h[1];
+    *lo = KeyToValue(h[0]);
+    *hi = KeyToValue(h[1]);
+  } else {
+    unsigned int k[2];
+    std::memcpy(k, h, sizeof(k));
+    *found = k[0] <= k[1];
+    *lo = KeyToValue(k[0]);
+    *hi = KeyToValue(k[1]);
+  }
+  if (!*found) *lo = *hi = 0.0;
+  return true;
 }
 
 /**
@@ -753,310 +992,291 @@ __global__ void QuantizeKernel(const float *__restrict__ in,
  * of that magnitude. From nextafterf, not a fixed ratio: the real quantity
  * doubles at every binade boundary.
  */
-inline double HalfUlpFloat32(double x) {
+double HalfUlpFloat32(double x) {
+  // Beyond the float range the cast is undefined; the decoder's cast then
+  // returns the source itself, so nothing needs reserving.
+  if (!(std::fabs(x) <= std::numeric_limits<float>::max())) return 0.0;
   const float f = static_cast<float>(std::fabs(x));
   if (!std::isfinite(f)) return 0.0;
   const float nxt = std::nextafterf(f, std::numeric_limits<float>::infinity());
   return 0.5 * (static_cast<double>(nxt) - static_cast<double>(f));
 }
 
-/** restored = q * inv_scale + offset -- dequantize_linear_kernel:83-99. */
+/** Full float64 spacing at |x|; infinite when x is. */
+double UlpFloat64(double x) {
+  x = std::fabs(x);
+  if (!std::isfinite(x)) return kInf;
+  return std::nextafter(x, kInf) - x;
+}
+
+struct Grid {
+  double offset = 0.0, delta = 1.0, scale = 1.0, inv_scale = 1.0;
+};
+
+/**
+ * Step whose decoded values land within 0.95*eb of their source:
+ *   float32  rounding gives delta/2 and the cast at most ULP/2; where ULP is
+ *            the larger, the cast returns the source itself (|z-x| <= delta).
+ *   float64  no final cast, so reserve 12 ULP for the double arithmetic.
+ * The per-element check, not this bound, is what the guarantee rests on.
+ */
+bool MakeGrid(double lo, double hi, double eb, bool f64, Grid *g) {
+  const double m = std::min(std::max(std::fabs(lo), std::fabs(hi)) + eb,
+                            std::numeric_limits<double>::max());
+  double d;
+  if (hi - lo == 0.0) {
+    d = 1.0;  // every value IS lo
+  } else if (!std::isfinite(eb)) {
+    d = 1e300;
+  } else if (f64) {
+    d = 2.0 * (0.95 * eb - 12.0 * UlpFloat64(m));
+  } else {
+    d = std::max(2.0 * (0.95 * eb - HalfUlpFloat32(m)), 0.95 * eb);
+  }
+  if (!(d > 0.0)) return false;
+  d = std::min(d, 1e300);
+  const double s = 1.0 / d;
+  const double inv = 1.0 / s;
+  if (!(s > 0.0 && std::isfinite(s) && inv > 0.0 && std::isfinite(inv))) {
+    return false;
+  }
+  *g = Grid{lo, d, s, inv};
+  return true;
+}
+
+int PrecisionFor(double qmax, bool f64) {
+  if (qmax <= 127.0) return 8;
+  if (qmax <= 32767.0) return 16;
+  if (qmax <= 2147483647.0) return 32;
+  if (f64 && qmax <= kInt64Max) return 64;
+  return 0;
+}
+
+template <typename OutT>
+double IndexMax() {
+  return sizeof(OutT) == 8 ? kInt64Max
+                           : static_cast<double>(std::numeric_limits<OutT>::max());
+}
+
+template <typename InT, typename OutT>
+void LaunchGrid(const void *in, void *out, size_t n, const Grid &g,
+                double eb_check, unsigned long long *flag, cudaStream_t st) {
+  QuantizeKernel<InT, OutT><<<Blocks(n), 256, 0, st>>>(
+      static_cast<const InT *>(in), static_cast<OutT *>(out), n, g.scale,
+      g.offset, static_cast<double>(std::numeric_limits<OutT>::min()),
+      IndexMax<OutT>(), g.inv_scale, eb_check, flag);
+}
+
 template <typename InT>
-__global__ void DequantizeKernel(const InT *__restrict__ in,
-                                 float *__restrict__ out, size_t n,
-                                 double inv_scale, double offset) {
-  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
-  for (; i < n; i += stride) {
-    out[i] = static_cast<float>(static_cast<double>(in[i]) * inv_scale + offset);
+void LaunchGridTyped(int precision, const void *in, void *out, size_t n,
+                     const Grid &g, double eb_check, unsigned long long *flag,
+                     cudaStream_t st) {
+  switch (precision) {
+    case 8:  LaunchGrid<InT, int8_t>(in, out, n, g, eb_check, flag, st); break;
+    case 16: LaunchGrid<InT, int16_t>(in, out, n, g, eb_check, flag, st); break;
+    case 32: LaunchGrid<InT, int32_t>(in, out, n, g, eb_check, flag, st); break;
+    default: LaunchGrid<InT, int64_t>(in, out, n, g, eb_check, flag, st); break;
   }
 }
 
-/**
- * Monotonic float->uint key so integer atomicMin/atomicMax order floats
- * correctly: for x >= 0 the IEEE bit pattern already orders, for x < 0 it
- * orders in reverse, and this maps both into one increasing space.
- */
-__device__ __forceinline__ unsigned int FloatKey(float f) {
-  unsigned int b = __float_as_uint(f);
-  return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
-}
-__host__ __forceinline__ float KeyToFloat(unsigned int k) {
-  unsigned int b = (k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k;
-  float f;
-  std::memcpy(&f, &b, sizeof(f));
-  return f;
-}
-
-/** Block reduction + one atomic pair per block. */
-__global__ void MinMaxKernel(const float *__restrict__ in, size_t n,
-                             unsigned int *out_min, unsigned int *out_max) {
-  __shared__ unsigned int s_min[kBlockSize];
-  __shared__ unsigned int s_max[kBlockSize];
-  unsigned int lo = 0xFFFFFFFFu, hi = 0u;
-  size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-    unsigned int k = FloatKey(in[i]);
-    lo = min(lo, k);
-    hi = max(hi, k);
-  }
-  s_min[threadIdx.x] = lo;
-  s_max[threadIdx.x] = hi;
-  __syncthreads();
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s) {
-      s_min[threadIdx.x] = min(s_min[threadIdx.x], s_min[threadIdx.x + s]);
-      s_max[threadIdx.x] = max(s_max[threadIdx.x], s_max[threadIdx.x + s]);
-    }
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) {
-    atomicMin(out_min, s_min[0]);
-    atomicMax(out_max, s_max[0]);
-  }
-}
-
-/**
- * Data range, equivalent to compute_data_range_typed (:187-232).
- *
- * Hand-rolled rather than CUB: this file lives in an RDC-enabled static
- * library whose device link is already known to be fragile (see the header
- * comment above the shuffle kernels), and pulling CUB in made every
- * reduction fail at runtime with "invalid device function" -- its kernels
- * were not device-linked for the target architecture. min and max are exact
- * and order-independent, so a manual reduction is numerically identical to
- * CUB's, unlike a sum would be.
- */
-bool DeviceMinMax(const float *d_in, size_t n, double *out_min,
-                  double *out_max, cudaStream_t stream_in = nullptr) {
-  // The per-thread stream, not the null stream. Upstream runs every stage of
-  // a compression on its CompContext's own stream and waits only on that
-  // (gpucompress_pool.cpp); the null stream plus cudaDeviceSynchronize below
-  // stalled every other worker's kernels as well as this one, which on a
-  // runtime with a worker pool is a throughput bug, not a style point.
-  cudaStream_t stream = (stream_in != nullptr)
-                            ? stream_in
-                            : static_cast<cudaStream_t>(DeviceStatsStream());
-  // Clear any sticky error left by an EARLIER, unrelated CUDA call --
-  // cudaPointerGetAttributes on a host pointer (which IsDevicePointer does
-  // routinely on this path) leaves cudaErrorInvalidValue behind, and the
-  // next launch check would attribute it to this kernel.
+/** One quantize pass; *counter receives the kernel's flag or escape count. */
+bool RunPass(bool f64, bool escape, int precision, const void *in, void *out,
+             size_t n, double limit, const Grid &g, double eb_check,
+             cudaStream_t st, unsigned long long *counter) {
   cudaGetLastError();
-
-  // Per-thread scratch rather than a fresh allocation per chunk. Falls back to
-  // a local cudaMalloc only if the cached buffer could not be created, so a
-  // scratch failure degrades instead of failing the compression.
   DeviceStatsScratch &sc = Scratch();
-  unsigned int *d_res = sc.d_minmax;
+  unsigned long long *d = sc.d_range;
   bool owns = false;
-  if (d_res == nullptr) {
-    if (cudaMalloc(&d_res, 2 * sizeof(unsigned int)) != cudaSuccess) return false;
+  if (d == nullptr) {
+    if (cudaMalloc(&d, 4 * sizeof(unsigned long long)) != cudaSuccess) {
+      return false;
+    }
     owns = true;
   }
-  unsigned int init[2] = {0xFFFFFFFFu, 0u};
-  bool ok = cudaMemcpyAsync(d_res, init, sizeof(init), cudaMemcpyHostToDevice,
-                            stream) == cudaSuccess;
-
+  unsigned long long *c = d + 3;
+  unsigned long long h = 0;
+  bool ok = cudaMemcpyAsync(c, &h, sizeof(h), cudaMemcpyHostToDevice, st) ==
+            cudaSuccess;
   if (ok) {
-    int grid = static_cast<int>(
-        std::min<size_t>((n + kBlockSize - 1) / kBlockSize, 1024));
-    if (grid < 1) grid = 1;
-    MinMaxKernel<<<grid, kBlockSize, 0, stream>>>(d_in, n, d_res, d_res + 1);
-    ok = cudaGetLastError() == cudaSuccess;
-  }
-  unsigned int h[2] = {0u, 0u};
-  if (ok) {
-    // One stream-scoped wait for the whole sequence, after the read is
-    // enqueued -- rather than a device-wide barrier before it.
-    ok = cudaMemcpyAsync(h, d_res, sizeof(h), cudaMemcpyDeviceToHost, stream) ==
+    if (escape) {
+      const int blocks = Blocks((n + 7) / 8);
+      const double lo = f64 ? -9223372036854775808.0 : -2147483648.0;
+      const double hi = f64 ? kInt64Max : 2147483647.0;
+      if (f64) {
+        auto *s = static_cast<int64_t *>(out);
+        EscapeQuantizeKernel<double, int64_t><<<blocks, 256, 0, st>>>(
+            static_cast<const double *>(in), s,
+            reinterpret_cast<uint8_t *>(s + n), n, limit, g.scale, g.offset,
+            lo, hi, g.inv_scale, eb_check, c);
+      } else {
+        auto *s = static_cast<int32_t *>(out);
+        EscapeQuantizeKernel<float, int32_t><<<blocks, 256, 0, st>>>(
+            static_cast<const float *>(in), s,
+            reinterpret_cast<uint8_t *>(s + n), n, limit, g.scale, g.offset,
+            lo, hi, g.inv_scale, eb_check, c);
+      }
+    } else if (f64) {
+      LaunchGridTyped<double>(precision, in, out, n, g, eb_check, c, st);
+    } else {
+      LaunchGridTyped<float>(precision, in, out, n, g, eb_check, c, st);
+    }
+    ok = cudaGetLastError() == cudaSuccess &&
+         cudaMemcpyAsync(&h, c, sizeof(h), cudaMemcpyDeviceToHost, st) ==
              cudaSuccess &&
-         cudaStreamSynchronize(stream) == cudaSuccess;
+         cudaStreamSynchronize(st) == cudaSuccess;
   }
-  if (owns) cudaFree(d_res);
-  if (!ok) return false;
-
-  *out_min = static_cast<double>(KeyToFloat(h[0]));
-  *out_max = static_cast<double>(KeyToFloat(h[1]));
-  return true;
+  if (owns) cudaFree(d);
+  *counter = h;
+  return ok;
 }
 
 }  // namespace
 
 bool QuantizeDevice(const void *device_in, size_t num_elements,
-                    double error_bound, void *device_out, size_t *out_bytes,
-                    DeviceQuantizeParams *out_params, void *stream_in) {
-  if (!device_in || !device_out || !out_bytes || !out_params ||
-      num_elements == 0 || error_bound <= 0.0) {
+                    size_t elem_bytes, double error_bound, void *device_out,
+                    size_t *out_bytes, DeviceQuantizeParams *out_params,
+                    void *stream_in) {
+  if (out_params == nullptr) return false;
+  *out_params = DeviceQuantizeParams{};
+  out_params->refusal = QuantizeRefusal::kInvalidArgument;
+  if (!device_in || !device_out || !out_bytes || num_elements == 0 ||
+      (elem_bytes != 4 && elem_bytes != 8) || !(error_bound > 0.0)) {
+    return false;
+  }
+  out_params->refusal = QuantizeRefusal::kDeviceError;
+  const bool f64 = elem_bytes == 8;
+  const size_t n = num_elements;
+  // Same per-thread stream the rest of this path uses; upstream's
+  // quantize_simple likewise takes a stream and waits only on it.
+  cudaStream_t st = (stream_in != nullptr)
+                        ? static_cast<cudaStream_t>(stream_in)
+                        : static_cast<cudaStream_t>(DeviceStatsStream());
+  // Four doubles below eb: a double-rounded |z - x| that passes this is
+  // within eb exactly.
+  double eb_check = error_bound;
+  for (int k = 0; k < 4; ++k) eb_check = std::nextafter(eb_check, 0.0);
+
+  double lo = 0.0, hi = 0.0;
+  bool found = false, skipped = false;
+  if (!DeviceRange(device_in, n, f64, kInf, st, &lo, &hi, &found, &skipped)) {
+    return false;
+  }
+  Grid g;
+  int precision = 0;
+  if (found && MakeGrid(lo, hi, error_bound, f64, &g)) {
+    precision = PrecisionFor(std::ceil((hi - lo) / g.delta), f64);
+  }
+  unsigned long long counter = 0;
+  if (precision != 0 && !skipped &&
+      !RunPass(f64, false, precision, device_in, device_out, n, kInf, g,
+               eb_check, st, &counter)) {
+    return false;
+  }
+  const bool escapes = precision == 0 || skipped || counter != 0;
+  unsigned long long escaped = 0;
+  if (escapes) {
+    // When the finite values fit a grid, only the others escape. Otherwise
+    // the grid spans the elements below 2^(floor(log2 eb)+24), above which
+    // float32 spacing already exceeds eb, and that span always fits int32;
+    // float64 keeps a margin for its 12-ULP reserve, which int64 holds.
+    double limit = kInf;
+    if (precision == 0) {
+      if (std::isfinite(error_bound)) {
+        limit = std::ldexp(1.0, std::ilogb(error_bound) + (f64 ? 47 : 24));
+      }
+      if (!DeviceRange(device_in, n, f64, limit, st, &lo, &hi, &found,
+                       &skipped)) {
+        return false;
+      }
+      if (!MakeGrid(lo, hi, error_bound, f64, &g)) {
+        g = Grid{lo, 1.0, 1.0, 1.0};
+      }
+    }
+    precision = f64 ? 64 : 32;
+    if (!RunPass(f64, true, precision, device_in, device_out, n, limit, g,
+                 eb_check, st, &escaped)) {
+      return false;
+    }
+  }
+
+  out_params->error_bound = error_bound;
+  out_params->effective_error_bound = 0.5 * g.delta;
+  out_params->scale = g.scale;
+  out_params->data_min = g.offset;
+  out_params->data_max = hi;
+  out_params->precision = precision;
+  out_params->elem_bytes = static_cast<int>(elem_bytes);
+  out_params->escapes = escapes;
+  out_params->escape_count = escaped;
+  out_params->bound_achievable = true;
+  *out_bytes = QuantizedBytes(n, *out_params);
+  const size_t used = n * PrecisionToBytes(precision) + (escapes ? (n + 7) / 8 : 0);
+  if (*out_bytes > used &&
+      (cudaMemsetAsync(static_cast<char *>(device_out) + used, 0,
+                       *out_bytes - used, st) != cudaSuccess ||
+       cudaStreamSynchronize(st) != cudaSuccess)) {
     return false;
   }
   out_params->refusal = QuantizeRefusal::kNone;
-  const float *in = static_cast<const float *>(device_in);
-  // Same per-thread stream the rest of this path uses; upstream's
-  // quantize_simple likewise takes a stream and waits only on it.
-  cudaStream_t qstream = (stream_in != nullptr)
-                             ? static_cast<cudaStream_t>(stream_in)
-                             : static_cast<cudaStream_t>(DeviceStatsStream());
-
-  double data_min = 0.0, data_max = 0.0;
-  // On the caller's stream too, so a sweep's reductions do not all queue up
-  // behind one another on the shared per-thread stream.
-  if (!DeviceMinMax(in, num_elements, &data_min, &data_max, qstream)) {
-    out_params->refusal = QuantizeRefusal::kDeviceError;
-    return false;
-  }
-  // NaN defeats every guard below: `range <= 0` is false, fmax ignores a NaN
-  // operand, and the width comparisons are all false.
-  if (!std::isfinite(data_min) || !std::isfinite(data_max)) {
-    out_params->refusal = QuantizeRefusal::kNonFiniteRange;
-    return false;
-  }
-
-  const double data_range = data_max - data_min;
-  const double max_abs = fmax(fabs(data_min), fabs(data_max));
-
-  // The step holds the bound, or the chunk is refused -- what this replaced
-  // substituted a looser bound and quantized against that. Two bounds on the
-  // reconstruction error apply, strongest in opposite regimes, so take the
-  // larger step they permit:
-  //   2*(0.95*eb - ULP/2)  rounding contributes delta/2, the float cast at
-  //                        most ULP/2. Wins where spacing is small.
-  //   0.95*eb              the decoder returns the nearest float32 to y, so
-  //                        it cannot land further from y than the float32
-  //                        source x is: |z-x| <= 2|x-y| <= delta. Holds at
-  //                        any spacing, which keeps large data quantizable.
-  // The reserve is taken at max_abs + eb, not max_abs: a reconstruction can
-  // land delta/2 outside the data and cross into the next binade.
-  double delta;
-  if (data_range == 0.0) {
-    // Every value IS data_min, so q = 0 reproduces it exactly.
-    delta = 1.0;
-  } else {
-    const double half_ulp = HalfUlpFloat32(max_abs + error_bound);
-    delta = fmax(2.0 * (0.95 * error_bound - half_ulp), 0.95 * error_bound);
-  }
-  if (!(delta > 0.0)) {
-    out_params->refusal = QuantizeRefusal::kStepNotPositive;
-    return false;
-  }
-
-  // Width from the grid actually encoded, so no clamp can occur.
-  const double q_max_required = std::ceil(data_range / delta);
-  int precision;
-  if (q_max_required <= 127.0) {
-    precision = 8;
-  } else if (q_max_required <= 32767.0) {
-    precision = 16;
-  } else if (q_max_required <= 2147483647.0) {
-    precision = 32;
-  } else {
-    // Finer than int32 can index, and finer than the float32 it replaces:
-    // the caller's lossless path is both smaller and exact.
-    out_params->refusal = QuantizeRefusal::kIndexExceedsInt32;
-    return false;
-  }
-  const double scale = 1.0 / delta;
-  // As DequantizeDevice derives it, so the kernel checks the shipped decoder.
-  const double inv_scale = 1.0 / scale;
-  const size_t width = PrecisionToBytes(precision);
-
-  // 1 = an index left the width, 2 = an element missed the bound.
-  int *d_fail = nullptr;
-  if (cudaMallocAsync(&d_fail, sizeof(int), qstream) != cudaSuccess) {
-    out_params->refusal = QuantizeRefusal::kDeviceError;
-    return false;
-  }
-  if (cudaMemsetAsync(d_fail, 0, sizeof(int), qstream) != cudaSuccess) {
-    cudaFreeAsync(d_fail, qstream);
-    out_params->refusal = QuantizeRefusal::kDeviceError;
-    return false;
-  }
-
-  const int threads = 256;
-  int blocks = static_cast<int>((num_elements + threads - 1) / threads);
-  if (blocks > 65535) blocks = 65535;
-  if (blocks < 1) blocks = 1;
-
-  if (width == 1) {
-    QuantizeKernel<int8_t><<<blocks, threads, 0, qstream>>>(
-        in, static_cast<int8_t *>(device_out), num_elements, scale, data_min,
-        -128.0, 127.0, inv_scale, error_bound, d_fail);
-  } else if (width == 2) {
-    QuantizeKernel<int16_t><<<blocks, threads, 0, qstream>>>(
-        in, static_cast<int16_t *>(device_out), num_elements, scale, data_min,
-        -32768.0, 32767.0, inv_scale, error_bound, d_fail);
-  } else {
-    QuantizeKernel<int32_t><<<blocks, threads, 0, qstream>>>(
-        in, static_cast<int32_t *>(device_out), num_elements, scale, data_min,
-        -2147483648.0, 2147483647.0, inv_scale, error_bound, d_fail);
-  }
-  if (cudaGetLastError() != cudaSuccess) {
-    cudaFreeAsync(d_fail, qstream);
-    out_params->refusal = QuantizeRefusal::kDeviceError;
-    return false;
-  }
-  int h_fail = 0;
-  if (cudaMemcpyAsync(&h_fail, d_fail, sizeof(int), cudaMemcpyDeviceToHost,
-                      qstream) != cudaSuccess) {
-    cudaFreeAsync(d_fail, qstream);
-    out_params->refusal = QuantizeRefusal::kDeviceError;
-    return false;
-  }
-  cudaFreeAsync(d_fail, qstream);
-  // Stream-scoped, matching upstream's quantize_simple, which takes a stream
-  // and synchronizes only it (quantization_kernels.cu).
-  if (cudaStreamSynchronize(qstream) != cudaSuccess) {
-    out_params->refusal = QuantizeRefusal::kDeviceError;
-    return false;
-  }
-
-  if (h_fail != 0) {
-    out_params->refusal = (h_fail == 1) ? QuantizeRefusal::kIndexLeftWidth
-                                        : QuantizeRefusal::kElementMissedBound;
-    return false;
-  }
-
-  *out_bytes = num_elements * width;
-  out_params->error_bound = error_bound;
-  // Half the step -- the half-width `scale = 1/(2*eff)` always meant.
-  out_params->effective_error_bound = 0.5 * delta;
-  out_params->scale = scale;
-  out_params->data_min = data_min;
-  out_params->data_max = data_max;
-  out_params->precision = precision;
-  out_params->bound_achievable = true;
   return true;
 }
 
 bool DequantizeDevice(const void *device_in, size_t num_elements,
                       const DeviceQuantizeParams &params, void *device_out) {
-  cudaStream_t dstream = static_cast<cudaStream_t>(DeviceStatsStream());
-  if (!device_in || !device_out || num_elements == 0 || params.scale <= 0.0) {
+  cudaStream_t st = static_cast<cudaStream_t>(DeviceStatsStream());
+  if (!device_in || !device_out || num_elements == 0 ||
+      !(params.scale > 0.0) || !std::isfinite(params.scale) ||
+      (params.elem_bytes != 4 && params.elem_bytes != 8)) {
     return false;
   }
-  const double inv_scale = 1.0 / params.scale;
+  const bool f64 = params.elem_bytes == 8;
+  const double inv = 1.0 / params.scale;
+  if (!std::isfinite(inv)) return false;
+  const double off = params.data_min;
+  const size_t n = num_elements;
   const size_t width = PrecisionToBytes(params.precision);
+  cudaGetLastError();
 
-  const int threads = 256;
-  int blocks = static_cast<int>((num_elements + threads - 1) / threads);
-  if (blocks > 65535) blocks = 65535;
-  if (blocks < 1) blocks = 1;
-
-  float *out = static_cast<float *>(device_out);
-  if (width == 1) {
-    DequantizeKernel<int8_t><<<blocks, threads, 0, dstream>>>(
-        static_cast<const int8_t *>(device_in), out, num_elements, inv_scale,
-        params.data_min);
-  } else if (width == 2) {
-    DequantizeKernel<int16_t><<<blocks, threads, 0, dstream>>>(
-        static_cast<const int16_t *>(device_in), out, num_elements, inv_scale,
-        params.data_min);
+  if (params.escapes) {
+    if (width != static_cast<size_t>(params.elem_bytes)) return false;
+    const auto *map = static_cast<const uint8_t *>(device_in) + n * width;
+    const int blocks = Blocks((n + 7) / 8);
+    if (f64) {
+      EscapeDequantizeKernel<int64_t, double><<<blocks, 256, 0, st>>>(
+          static_cast<const int64_t *>(device_in), map,
+          static_cast<double *>(device_out), n, inv, off);
+    } else {
+      EscapeDequantizeKernel<int32_t, float><<<blocks, 256, 0, st>>>(
+          static_cast<const int32_t *>(device_in), map,
+          static_cast<float *>(device_out), n, inv, off);
+    }
+  } else if (f64) {
+    auto *o = static_cast<double *>(device_out);
+    switch (width) {
+      case 1: DequantizeKernel<int8_t, double><<<Blocks(n), 256, 0, st>>>(
+                  static_cast<const int8_t *>(device_in), o, n, inv, off); break;
+      case 2: DequantizeKernel<int16_t, double><<<Blocks(n), 256, 0, st>>>(
+                  static_cast<const int16_t *>(device_in), o, n, inv, off); break;
+      case 4: DequantizeKernel<int32_t, double><<<Blocks(n), 256, 0, st>>>(
+                  static_cast<const int32_t *>(device_in), o, n, inv, off); break;
+      default: DequantizeKernel<int64_t, double><<<Blocks(n), 256, 0, st>>>(
+                  static_cast<const int64_t *>(device_in), o, n, inv, off); break;
+    }
   } else {
-    DequantizeKernel<int32_t><<<blocks, threads, 0, dstream>>>(
-        static_cast<const int32_t *>(device_in), out, num_elements, inv_scale,
-        params.data_min);
+    auto *o = static_cast<float *>(device_out);
+    switch (width) {
+      case 1: DequantizeKernel<int8_t, float><<<Blocks(n), 256, 0, st>>>(
+                  static_cast<const int8_t *>(device_in), o, n, inv, off); break;
+      case 2: DequantizeKernel<int16_t, float><<<Blocks(n), 256, 0, st>>>(
+                  static_cast<const int16_t *>(device_in), o, n, inv, off); break;
+      case 4: DequantizeKernel<int32_t, float><<<Blocks(n), 256, 0, st>>>(
+                  static_cast<const int32_t *>(device_in), o, n, inv, off); break;
+      default: DequantizeKernel<int64_t, float><<<Blocks(n), 256, 0, st>>>(
+                  static_cast<const int64_t *>(device_in), o, n, inv, off); break;
+    }
   }
   if (cudaGetLastError() != cudaSuccess) return false;
-  return cudaStreamSynchronize(dstream) == cudaSuccess;
+  return cudaStreamSynchronize(st) == cudaSuccess;
 }
 
 }  // namespace ctp::compress::preprocess
