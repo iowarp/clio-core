@@ -156,17 +156,34 @@ if(CAE_ENABLE_S3)
   install(TARGETS cae_s3_tool DESTINATION bin)
 endif()
 
+# OMNI parsing, split out of the clio_cae binary so the unit tests can link it
+# (a main()-only translation unit is not linkable from a test). Static: it has
+# exactly two consumers, the binary below and test_cae_omni_loader.
+add_library(cae_omni_loader STATIC src/omni_loader.cc)
+target_include_directories(cae_omni_loader
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(cae_omni_loader
+  PUBLIC
+    clio_cae_core_client
+  PRIVATE
+    ctp::configure
+    ${YAML_CPP_LIBS}
+)
+
 # clio_cae utility (CAE OMNI ingest driver). Installed as `clio_cae`;
 # the legacy `clio_cae_omni` name is preserved as an install-time symlink
 # so out-of-tree scripts and pipelines keep working.
-add_executable(clio_cae util/clio_cae.cc)
+add_executable(clio_cae util/clio_cae.cc) # process entry (coverage-excluded)
 target_link_libraries(clio_cae
   PRIVATE
+    cae_omni_loader
     clio_cae_core_client
     clio::run::cxx
     ctp::configure
 )
-install(TARGETS clio_cae DESTINATION bin)
 
 # Install `clio_cae_omni` as a symlink to `clio_cae` (Windows: copy fallback).
 install(CODE "
