@@ -136,7 +136,15 @@ static FinalizeFunc g_test_finalize = nullptr;
 // Test failure exception
 class TestFailure : public std::exception {
 public:
-    explicit TestFailure(const std::string& message) : message_(message) {}
+    explicit TestFailure(const std::string& message) : message_(message) {
+        // Every failure message is composed in a std::ostringstream, and
+        // basic_stringbuf::str() runs inside the uninstrumented libstdc++.so:
+        // the characters it hands back carry no MSan shadow, so PRINTING the
+        // explanation of a failure is itself reported -- twice, burying the
+        // one line that says what actually broke. Cleared once here rather
+        // than at each of the macros that build a message.
+        CTP_MSAN_UNPOISON_STRING(message_);
+    }
     const char* what() const noexcept override { return message_.c_str(); }
 private:
     std::string message_;

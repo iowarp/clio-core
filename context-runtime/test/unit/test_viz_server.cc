@@ -976,8 +976,14 @@ TEST_CASE("Viz pools can be shut down from the dashboard", "[viz]") {
   // succeeded. Sent raw because a well-behaved HTTP client library always
   // adds Content-Length and would never exercise this.
   {
-    Poco::Net::StreamSocket socket(Poco::Net::SocketAddress(
-        "127.0.0.1", static_cast<Poco::UInt16>(port)));
+    // Poco constructs both of these inside its own uninstrumented .so, so the
+    // socket's state is read by every call below with no MSan shadow behind
+    // it -- starting with setReceiveTimeout, which reads the fd.
+    Poco::Net::SocketAddress address("127.0.0.1",
+                                     static_cast<Poco::UInt16>(port));
+    CTP_MSAN_UNPOISON_OBJ(address);
+    Poco::Net::StreamSocket socket(address);
+    CTP_MSAN_UNPOISON_OBJ(socket);
     socket.setReceiveTimeout(Poco::Timespan(10, 0));
     const std::string raw =
         "POST /api/pools/4995.0/destroy HTTP/1.1\r\n"
