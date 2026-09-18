@@ -229,7 +229,8 @@ def set_fonts():
     return serif[0]
 
 
-def draw(ax, data, panel, bin_n, regret_clip=REGRET_CLIP, mape_clip=MAPE_CLIP, stat=None):
+def draw(ax, data, panel, bin_n, regret_clip=REGRET_CLIP, mape_clip=MAPE_CLIP, stat=None,
+         eb=None):
     """One panel; every workload keeps its legend entry. `stat` may be per panel."""
     col, ylabel = ("regret_pct", "Regret (%)") if panel == "regret" else ("cost_mape_pct", "Cost MAPE (%)")
     if isinstance(stat, dict):
@@ -264,10 +265,13 @@ def draw(ax, data, panel, bin_n, regret_clip=REGRET_CLIP, mape_clip=MAPE_CLIP, s
     handles = [Line2D([], [], color=COLOR[k], linewidth=LINE_W, label=LABEL[k]) for k in KEYS]
     ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.30), ncol=len(KEYS),
               fontsize=FS_LEG, frameon=False, handlelength=1.6, columnspacing=1.0,
-              handletextpad=0.4, borderaxespad=0.0)
+              handletextpad=0.4, borderaxespad=0.0,
+              title=(rf"NeuroPress, error bound $\varepsilon = {eb:g}$" if eb else None),
+              title_fontsize=FS_LEG)
 
 
-def draw_per_chunk(data, bin_n, regret_clip=REGRET_CLIP, mape_clip=MAPE_CLIP, stat=None):
+def draw_per_chunk(data, bin_n, regret_clip=REGRET_CLIP, mape_clip=MAPE_CLIP, stat=None,
+                   eb=None):
     """Every chunk's regret and cost MAPE, one row per workload; None without data."""
     keys = [k for k in KEYS if data.get(k) is not None and not data[k].empty]
     if not keys:
@@ -317,6 +321,8 @@ def draw_per_chunk(data, bin_n, regret_clip=REGRET_CLIP, mape_clip=MAPE_CLIP, st
     note = (f"Regret capped at {rclip:g}%.  {mnote}"
             if rclip is not None else
             f"Regret axis: linear to {REGRET_LINTHRESH:g}%, logarithmic above.  {mnote}")
+    if eb:
+        note = rf"NeuroPress, error bound $\varepsilon = {eb:g}$.  " + note
     fig.text(0.5, -0.36 / h, note, ha="center", va="top", fontsize=FS_LEG - 0.5, color="0.35")
     return fig
 
@@ -369,6 +375,9 @@ def main():
     ap.add_argument("--mape-stat", choices=("mean", "median"), default=None)
     ap.add_argument("--mape-raw", dest="mape_raw", action="store_true",
                     help="score cost MAPE with no time floor (the *_raw columns)")
+    ap.add_argument("--eb", type=float, default=0.05,
+                    help="the runs' absolute error bound, shown with the legend (default: 0.05, "
+                         "figure_8.sh's; 0 hides it)")
     ap.add_argument("--chunks-out", metavar="DIR",
                     help="also write DIR/<workload>/chunks.csv and DIR/summary.txt")
     a = ap.parse_args()
@@ -391,7 +400,7 @@ def main():
     written = []
     for panel, stem in (("regret", "fig8a_regret"), ("mape", "fig8b_cost_mape")):
         fig, ax = plt.subplots(figsize=(FIG_W, FIG_H[panel]))
-        draw(ax, data, panel, a.bin, a.regret_clip, a.mape_clip, stat)
+        draw(ax, data, panel, a.bin, a.regret_clip, a.mape_clip, stat, a.eb)
         path = os.path.join(a.out, stem + ".png")
         fig.savefig(path, dpi=PREVIEW_DPI, bbox_inches="tight")
         plt.close(fig)
@@ -400,14 +409,14 @@ def main():
     fig, axes = plt.subplots(2, 1, figsize=(FIG_W, FIG_H["regret"] + FIG_H["mape"] + 0.9),
                              gridspec_kw=dict(height_ratios=[FIG_H["regret"], FIG_H["mape"]],
                                               hspace=0.95))
-    draw(axes[0], data, "regret", a.bin, a.regret_clip, a.mape_clip, stat)
-    draw(axes[1], data, "mape", a.bin, a.regret_clip, a.mape_clip, stat)
+    draw(axes[0], data, "regret", a.bin, a.regret_clip, a.mape_clip, stat, a.eb)
+    draw(axes[1], data, "mape", a.bin, a.regret_clip, a.mape_clip, stat, a.eb)
     path = os.path.join(a.out, "fig8_preview.png")
     fig.savefig(path, dpi=PREVIEW_DPI, bbox_inches="tight")
     plt.close(fig)
     written.append(path)
 
-    fig = draw_per_chunk(data, a.bin, a.regret_clip, a.mape_clip, stat)
+    fig = draw_per_chunk(data, a.bin, a.regret_clip, a.mape_clip, stat, a.eb)
     if fig is not None:
         path = os.path.join(a.out, "fig8c_per_chunk.png")
         fig.savefig(path, dpi=PREVIEW_DPI, bbox_inches="tight")

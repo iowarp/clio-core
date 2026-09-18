@@ -308,6 +308,10 @@ enum class ModelType {
   kXGBoost,      /**< Gradient-boosted trees (optional xgboost C API) */
   kNeuroPressNN, /**< NeuroPress dense multi-output net (.nnwt weights) */
   kDenseNN,      /**< Legacy MiniDNN/Eigen dense net */
+  /** HCompress's Expected Compression Cost (IPDPS 2020), a BASELINE for
+   *  accuracy comparison only -- it is never selected to drive a
+   *  compression call. See model/hcompress_ccp_predictor.h. */
+  kHCompressCcp,
 };
 
 /**

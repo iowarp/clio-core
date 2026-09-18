@@ -292,3 +292,16 @@ paper-benchmark/warpx/results/
 # Gray-Scott writes its HDF5, its reference dump and per-run stores under
 # results/. The harness scripts are tracked; what a run produces is not.
 paper-benchmark/grayscott/results/
+# The synthetic corpus every static model was fitted on -- our NN's and
+# XGBoost's training set and HCompress's profiler seed. 130 MB of measurements,
+# and an INPUT to model-accuracy/ rather than a result of it.
+paper-benchmark/benchmark_results_600k.csv
+# make_table.sh compiles this on demand from tracked sources; it is in no
+# CMake target precisely so that scoring a baseline cannot affect a build.
+paper-benchmark/model-accuracy/hcompress_ccp_eval
+# build_deck.sh's backup copy of the compiled deck.
+paper-benchmark/vpic/*.Linux.*
+# Campaign CSVs kept beside a figure's plots stay local, like the logs above:
+# the plots are the tracked artefact, the measurements behind them are not.
+paper-benchmark/figures/*/*/*.csv
+paper-benchmark/figures/*/*/data/
