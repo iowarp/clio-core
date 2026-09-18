@@ -61,6 +61,18 @@
 #include "sycl_lz4.h"
 #endif
 
+#if CTP_ENABLE_SYCL_SNAPPY
+#include "sycl_snappy.h"
+#endif
+
+#if CTP_ENABLE_SYCL_ANS
+#include "sycl_ans.h"
+#endif
+
+#if CTP_ENABLE_SYCL_ZSTD
+#include "sycl_zstd.h"
+#endif
+
 #if CTP_ENABLE_CUSZ
 #include "cusz.h"
 #endif
@@ -537,6 +549,33 @@ class CompressionFactory {
     return nullptr;
 #endif
   }
+  // GPU (SYCL) Snappy: portable LOSSLESS analog of nvcomp-snappy. Single-mode,
+  // like sycl-lz4. Returns nullptr when the SYCL Snappy kernels are not built.
+  static std::unique_ptr<Compressor> MakeSyclSnappy(CompressionPreset) {
+#if CTP_ENABLE_SYCL_SNAPPY
+    return std::make_unique<SyclSnappy>();
+#else
+    return nullptr;
+#endif
+  }
+  // GPU (SYCL) ANS: portable static rANS entropy coder, analog of nvcomp-ans.
+  // Single-mode. Returns nullptr when the SYCL ANS kernels are not built.
+  static std::unique_ptr<Compressor> MakeSyclAns(CompressionPreset) {
+#if CTP_ENABLE_SYCL_ANS
+    return std::make_unique<SyclAns>();
+#else
+    return nullptr;
+#endif
+  }
+  // GPU (SYCL) Zstd-STYLE: LZ77 + rANS combined codec (NOT libzstd-compatible).
+  // Single-mode. Returns nullptr when the SYCL Zstd kernels are not built.
+  static std::unique_ptr<Compressor> MakeSyclZstd(CompressionPreset) {
+#if CTP_ENABLE_SYCL_ZSTD
+    return std::make_unique<SyclZstd>();
+#else
+    return nullptr;
+#endif
+  }
   // cuSZ: GPU error-bounded LOSSY float compressor. Multi-mode like the lossy
   // CPU entries -- presets map to error bounds (FAST=1e-2 loose, BALANCED=1e-3,
   // BEST=1e-4 tight); higher fidelity -> lower compression. Returns nullptr when
@@ -619,6 +658,9 @@ class CompressionFactory {
         CompressorInfo{"ndzip",           19, 21, true,  &MakeNdzip, false},
         CompressorInfo{"cuszp",           20, 22, false, &MakeCuszp, true},
         CompressorInfo{"sycl-lz4",        21, 23, true,  &MakeSyclLz4, true},
+        CompressorInfo{"sycl-snappy",     22, 24, true,  &MakeSyclSnappy, true},
+        CompressorInfo{"sycl-ans",        23, 25, true,  &MakeSyclAns, true},
+        CompressorInfo{"sycl-zstd",       24, 26, true,  &MakeSyclZstd, true},
     };
     return kRegistry;
   }
