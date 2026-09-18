@@ -6,6 +6,7 @@
 #include <clio_runtime/bdev/bdev_runtime.h>
 #include <clio_runtime/comutex.h>
 #include <clio_ctp/util/gpu_api.h>
+#include <clio_ctp/util/msan.h>
 #include <clio_runtime/work_orchestrator.h>
 #include <clio_runtime/worker.h>
 #include <clio_ctp/introspect/system_info.h>
@@ -70,12 +71,19 @@ bool Runtime::SavePerfStatsFile(const std::string &path,
   if (path.empty()) return false;
   try {
     namespace fs = std::filesystem;
-    fs::create_directories(fs::path(path).parent_path());
+    // Named, not a temporary: libstdc++.so builds it, so its destructor reads
+    // memory MSan has no record of. See VizServer::AssetSearchDirs.
+    fs::path parent = fs::path(path).parent_path();
+    CTP_MSAN_UNPOISON_PATH(parent);
+    fs::create_directories(parent);
     // Write to a tmp file then rename so a crash mid-write never leaves a
     // truncated stats file for the next session to trip over.
     const std::string tmp = path + ".tmp";
     {
       std::ofstream ofs(tmp, std::ios::trunc);
+      // Stream state lives in uninstrumented libstdc++.so, so is_open()/good()
+      // read bytes MSan has no record of.
+      CTP_MSAN_UNPOISON_OBJ(ofs);
       if (!ofs.is_open()) return false;
       ofs << kPerfStatsHeader << "\n"
           << "read_bandwidth_mbps " << metrics.read_bandwidth_mbps_ << "\n"
@@ -85,6 +93,7 @@ bool Runtime::SavePerfStatsFile(const std::string &path,
           << "iops " << metrics.iops_ << "\n"
           << "model_wall_read " << model_wall_read << "\n"
           << "model_wall_write " << model_wall_write << "\n";
+      CTP_MSAN_UNPOISON_OBJ(ofs);
       if (!ofs.good()) return false;
     }
     std::error_code ec;
@@ -101,6 +110,7 @@ bool Runtime::LoadPerfStatsFile(const std::string &path, PerfMetrics &metrics,
                                 float &model_wall_write) {
   if (path.empty()) return false;
   std::ifstream ifs(path);
+  CTP_MSAN_UNPOISON_OBJ(ifs);  // see SavePerfStatsFile
   if (!ifs.is_open()) return false;
   std::string header;
   if (!std::getline(ifs, header) || header != kPerfStatsHeader) {

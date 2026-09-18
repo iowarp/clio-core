@@ -70,6 +70,42 @@ install(TARGETS ${SAFE_BDEV_CC_TEST_TARGET}
   RUNTIME DESTINATION bin
 )
 
+# Compose-time config tests. CreateParams::LoadConfig is header-only and the
+# only safe-bdev entry point a deployment's YAML reaches, yet the suites above
+# build their CreateParams in C++ and never parse a line of it. Its own binary
+# for the same reason as the EC tests: no daemon, no shared memory, so it runs
+# in milliseconds anywhere.
+set(SAFE_BDEV_CONFIG_TEST_TARGET clio_safe_bdev_config_tests)
+add_executable(${SAFE_BDEV_CONFIG_TEST_TARGET} test_safe_bdev_config.cc)
+
+target_include_directories(${SAFE_BDEV_CONFIG_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/modules/admin/include
+  ${CLIO_RUN_ROOT}/modules/bdev/include
+  ${CLIO_RUN_ROOT}/modules/safe-bdev/include
+)
+
+# Client-only: CreateParams lives in the header, so nothing here needs the
+# runtime half of the chimod.
+target_link_libraries(${SAFE_BDEV_CONFIG_TEST_TARGET}
+  clio_safe_bdev_client
+  clio_bdev_client
+  clio_admin_client
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+set_target_properties(${SAFE_BDEV_CONFIG_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+install(TARGETS ${SAFE_BDEV_CONFIG_TEST_TARGET}
+  RUNTIME DESTINATION bin
+)
+
 # Erasure-coding core tests. These are daemon-independent: the EC core
 # (GF(2^8), Reed-Solomon, EcArray) is header-only and pulls in no Chimaera
 # runtime, so this target links nothing but the test harness. Keeping it
@@ -114,6 +150,16 @@ if(CLIO_CORE_ENABLE_TESTS)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_safe_bdev_ec_tests PROPERTIES TIMEOUT 60)
+
+  add_test(
+    NAME cr_safe_bdev_config_tests
+    COMMAND ${SAFE_BDEV_CONFIG_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_safe_bdev_config_tests PROPERTIES
+    TIMEOUT 60
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+  )
 
   # CLIO_NUM_THREADS=16 is load-bearing: at the default 4 the scheduler places
   # every data-plane task on the same general-purpose worker and the race can

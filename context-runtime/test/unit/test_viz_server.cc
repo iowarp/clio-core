@@ -63,6 +63,7 @@
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/pool_manager.h"
 #include "clio_runtime/viz/viz_json.h"
+#include "clio_ctp/util/msan.h"
 #include "clio_runtime/viz/viz_server.h"
 
 #include <clio_runtime/bdev/bdev_client.h>
@@ -87,9 +88,23 @@ struct HttpReply {
   std::string body;
 };
 
+/** Clear the MSan shadow on everything uninstrumented Poco just produced.
+ *  Poco parses the response off the socket, so the status line, the headers
+ *  and the body all arrive as bytes MSan has no record of; every assertion
+ *  below reads them. */
+void UnpoisonReply(HttpReply *reply) {
+  CTP_MSAN_UNPOISON_OBJ(*reply);
+  CTP_MSAN_UNPOISON_STRING(reply->content_type);
+  CTP_MSAN_UNPOISON_STRING(reply->body);
+}
+
 /** GET @p path from the dashboard on 127.0.0.1:@p port. */
 HttpReply HttpGet(clio::run::u32 port, const std::string &path) {
   HttpReply reply;
+  // Nothing under test runs in here -- it is all Poco, uninstrumented, doing
+  // its own address parsing and socket work through libc. See UnpoisonReply
+  // for the data it hands back.
+  ctp::MsanInterceptorCheckGuard msan_guard;
   Poco::Net::HTTPClientSession session("127.0.0.1",
                                        static_cast<Poco::UInt16>(port));
   session.setTimeout(Poco::Timespan(15, 0));
@@ -98,9 +113,13 @@ HttpReply HttpGet(clio::run::u32 port, const std::string &path) {
   session.sendRequest(request);
   Poco::Net::HTTPResponse response;
   std::istream &stream = session.receiveResponse(response);
+  CTP_MSAN_UNPOISON_OBJ(response);
   Poco::StreamCopier::copyToString(stream, reply.body);
   reply.status = static_cast<int>(response.getStatus());
-  reply.content_type = response.getContentType();
+  const std::string &ctype = response.getContentType();
+  CTP_MSAN_UNPOISON_STRING(ctype);  // read by operator= before we could clear it
+  reply.content_type = ctype;
+  UnpoisonReply(&reply);
   return reply;
 }
 
@@ -110,6 +129,7 @@ HttpReply HttpGet(clio::run::u32 port, const std::string &path) {
 HttpReply HttpPostForm(clio::run::u32 port, const std::string &path,
                        const std::string &form) {
   HttpReply reply;
+  ctp::MsanInterceptorCheckGuard msan_guard;  // see HttpGet
   Poco::Net::HTTPClientSession session("127.0.0.1",
                                        static_cast<Poco::UInt16>(port));
   session.setTimeout(Poco::Timespan(60, 0));
@@ -120,9 +140,13 @@ HttpReply HttpPostForm(clio::run::u32 port, const std::string &path,
   session.sendRequest(request) << form;
   Poco::Net::HTTPResponse response;
   std::istream &stream = session.receiveResponse(response);
+  CTP_MSAN_UNPOISON_OBJ(response);
   Poco::StreamCopier::copyToString(stream, reply.body);
   reply.status = static_cast<int>(response.getStatus());
-  reply.content_type = response.getContentType();
+  const std::string &ctype = response.getContentType();
+  CTP_MSAN_UNPOISON_STRING(ctype);  // see HttpGet
+  reply.content_type = ctype;
+  UnpoisonReply(&reply);
   return reply;
 }
 
@@ -537,6 +561,21 @@ TEST_CASE("Viz HTTP server answers the dashboard API", "[viz]") {
   REQUIRE(missing.status == 404);
   REQUIRE(Contains(missing.body, "\"error\":"));
 
+  // A request line Poco itself cannot turn into a URI: "%zz" is not a valid
+  // percent-escape, so the URI parse throws while the request is still being
+  // unpacked -- before the router ever sees a path. That exception has to
+  // become a 400 naming what was wrong; letting it escape would take down the
+  // HTTP worker thread and leave the browser with a dropped connection.
+  HttpReply bad_uri = HttpGet(port, "/api/%zz");
+  Explain("/api/%zz", bad_uri);
+  REQUIRE(bad_uri.status == 400);
+  REQUIRE(Contains(bad_uri.body, "bad request"));
+
+  // The dashboard is still serving afterwards -- the handler recovered, it did
+  // not just happen to answer once before dying.
+  HttpReply after_bad_uri = HttpGet(port, "/api/health");
+  REQUIRE(after_bad_uri.status == 200);
+
   // ---- static assets and the home page ----
   // The admin ChiMod's viz/ directory is mounted automatically because its
   // container registered while the module was loaded from the build tree.
@@ -937,8 +976,14 @@ TEST_CASE("Viz pools can be shut down from the dashboard", "[viz]") {
   // succeeded. Sent raw because a well-behaved HTTP client library always
   // adds Content-Length and would never exercise this.
   {
-    Poco::Net::StreamSocket socket(Poco::Net::SocketAddress(
-        "127.0.0.1", static_cast<Poco::UInt16>(port)));
+    // Poco constructs both of these inside its own uninstrumented .so, so the
+    // socket's state is read by every call below with no MSan shadow behind
+    // it -- starting with setReceiveTimeout, which reads the fd.
+    Poco::Net::SocketAddress address("127.0.0.1",
+                                     static_cast<Poco::UInt16>(port));
+    CTP_MSAN_UNPOISON_OBJ(address);
+    Poco::Net::StreamSocket socket(address);
+    CTP_MSAN_UNPOISON_OBJ(socket);
     socket.setReceiveTimeout(Poco::Timespan(10, 0));
     const std::string raw =
         "POST /api/pools/4995.0/destroy HTTP/1.1\r\n"

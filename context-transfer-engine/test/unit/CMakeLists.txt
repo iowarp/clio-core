@@ -1138,6 +1138,42 @@ set_tests_properties(
         LABELS "unit;cache;cte"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
+
+#------------------------------------------------------------------------------
+# Cache chimod compose-time config (pure, no runtime). CacheConfig::LoadConfig
+# is header-only and is the only cache entry point a deployment's YAML reaches,
+# but test_cache_interpose above composes the pool from a C++ CacheConfig and
+# never parses a line of it. No daemon, no shared memory — runs in
+# milliseconds.
+#------------------------------------------------------------------------------
+add_executable(test_cache_config_units test_cache_config_units.cc)
+target_include_directories(test_cache_config_units PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/cache/include
+)
+# Client-only: the config lives in the header, so the runtime half of the
+# chimod is not needed to parse it.
+target_link_libraries(test_cache_config_units
+    clio_cte_cache_client
+    clio_cte_core_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_cache_config_units
+    COMMAND test_cache_config_units)
+
+set_tests_properties(
+    cte_cache_config_units
+    PROPERTIES
+        TIMEOUT 60
+        LABELS "unit;cache;cte;config"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+)
+
+install(TARGETS test_cache_config_units
+    RUNTIME DESTINATION bin
+)
 endif()  # TARGET clio_cte_cache_client
 
 #------------------------------------------------------------------------------

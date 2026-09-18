@@ -45,6 +45,8 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <clio_ctp/util/msan.h>
+
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -93,8 +95,11 @@ bool TaskStatModelSnapshot::Save(const std::string &path) const {
     return false;
   }
   std::error_code ec;
-  std::filesystem::create_directories(
-      std::filesystem::path(path).parent_path(), ec);
+  // parent_path() runs inside uninstrumented libstdc++.so, so the temporary it
+  // returns is poisoned and its destructor is reported.
+  std::filesystem::path parent = std::filesystem::path(path).parent_path();
+  CTP_MSAN_UNPOISON_PATH(parent);
+  std::filesystem::create_directories(parent, ec);
   if (ec) {
     HLOG(kError, "TaskStatModel: cannot create model directory for {}: {}",
          path, ec.message());
@@ -113,6 +118,10 @@ bool TaskStatModelSnapshot::Save(const std::string &path) const {
   // test in cr_task_archive_* had passed.
   try {
     YAML::Emitter out;
+    // libyaml-cpp.so writes and reads this object's members itself, on a stack
+    // slot MSan poisoned on entry, so its own bookkeeping reads are reported
+    // while the document is being built -- before c_str() is ever called.
+    CTP_MSAN_UNPOISON_OBJ(out);
     out << YAML::BeginMap;
     out << YAML::Key << "chimod_name" << YAML::Value << chimod_name_;
     out << YAML::Key << "pool_name" << YAML::Value << pool_name_;
@@ -136,10 +145,15 @@ bool TaskStatModelSnapshot::Save(const std::string &path) const {
     const std::string tmp_path = path + ".tmp";
     {
       std::ofstream ofs(tmp_path, std::ios::trunc);
+      // Neither the stream's state (read by is_open/good below) nor the text
+      // the yaml-cpp emitter accumulated is visible to MSan: libstdc++.so and
+      // libyaml-cpp.so are both uninstrumented.
+      CTP_MSAN_UNPOISON_OBJ(ofs);
       if (!ofs.is_open()) {
         HLOG(kError, "TaskStatModel: failed to open {} for writing", tmp_path);
         return false;
       }
+      CTP_MSAN_UNPOISON(out.c_str(), out.size() + 1);
       ofs << out.c_str() << "\n";
       // close() here, not at the end of the scope: the model is small enough to
       // sit entirely in the stream buffer, so the write to the device happens
@@ -149,6 +163,7 @@ bool TaskStatModelSnapshot::Save(const std::string &path) const {
       // quota, a dying disk). Closing explicitly moves the flush in front of
       // the check; close() sets failbit if it cannot complete.
       ofs.close();
+      CTP_MSAN_UNPOISON_OBJ(ofs);
       if (!ofs.good()) {
         HLOG(kError, "TaskStatModel: failed to write {}", tmp_path);
         std::filesystem::remove(tmp_path, ec);
@@ -182,6 +197,10 @@ bool TaskStatModelSnapshot::Load(const std::string &path) {
   }
   try {
     YAML::Node root = YAML::LoadFile(path);
+    // Every key compare and every .as<std::string>() below reads scalar bytes
+    // that uninstrumented libyaml-cpp.so produced; clear the tree once here
+    // rather than at each of them.
+    ctp::MsanUnpoisonYaml(root);
     if (!root || !root.IsMap()) {
       HLOG(kWarning, "TaskStatModel: {} is not a YAML map; ignoring", path);
       return false;

@@ -46,14 +46,7 @@
 // false positives under MemorySanitizer (uninstrumented conda libstdc++).
 #include <string>
 // MSan: mark yaml Node scalar bytes as initialized after YAML::Load(File).
-// Precompiled yaml-cpp.so propagates "uninitialized" bytes (from uninstrumented
-// libstdc++) through our instrumented _M_assign into Node scalar strings;
-// __msan_unpoison fixes the false-positive use-of-uninitialized-value reports.
-#if defined(__has_feature)
-#if __has_feature(memory_sanitizer)
-#include <sanitizer/msan_interface.h>
-#endif
-#endif
+#include "clio_ctp/util/msan.h"
 
 #include "formatter.h"
 #include "clio_ctp/constants/macros.h"
@@ -308,39 +301,6 @@ class ConfigParse {
     return hosts;
   }
 
-#if defined(__has_feature)
-#if __has_feature(memory_sanitizer)
-  /**
-   * Traverse a fully-loaded YAML tree and mark all scalar string bytes as
-   * initialized in MSan's shadow memory.
-   *
-   * Background: precompiled yaml-cpp.so calls back into our MSan-instrumented
-   * binary via PLT (e.g. std::string::_M_assign).  The uninstrumented scanner
-   * bytes are propagated into yaml Node scalar strings and appear
-   * "uninitialized" to MSan.  After YAML::Load(File) returns, the tree is
-   * structurally valid; we just need to tell MSan the character bytes are OK.
-   * Called by BaseConfig::LoadText and BaseConfig::LoadFromFile.
-   */
-  static void MsanUnpoisonYamlNode(const YAML::Node &node) {
-    if (!node.IsDefined() || node.IsNull()) return;
-    if (node.IsScalar()) {
-      const std::string &s = node.Scalar();
-      if (!s.empty()) {
-        __msan_unpoison(s.data(), s.size());
-      }
-    } else if (node.IsSequence()) {
-      for (auto it = node.begin(); it != node.end(); ++it) {
-        MsanUnpoisonYamlNode(*it);
-      }
-    } else if (node.IsMap()) {
-      for (auto it = node.begin(); it != node.end(); ++it) {
-        MsanUnpoisonYamlNode(it->first);
-        MsanUnpoisonYamlNode(it->second);
-      }
-    }
-  }
-#endif
-#endif
 };
 
 /**
@@ -357,11 +317,7 @@ class BaseConfig {
       return;
     }
     YAML::Node yaml_conf = YAML::Load(config_string);
-#if defined(__has_feature)
-#if __has_feature(memory_sanitizer)
-    ctp::ConfigParse::MsanUnpoisonYamlNode(yaml_conf);
-#endif
-#endif
+    ctp::MsanUnpoisonYaml(yaml_conf);
     ParseYAML(yaml_conf);
   }
 
@@ -376,11 +332,7 @@ class BaseConfig {
     auto real_path = ctp::ConfigParse::ExpandPath(path);
     try {
       YAML::Node yaml_conf = YAML::LoadFile(real_path);
-#if defined(__has_feature)
-#if __has_feature(memory_sanitizer)
-      ctp::ConfigParse::MsanUnpoisonYamlNode(yaml_conf);
-#endif
-#endif
+      ctp::MsanUnpoisonYaml(yaml_conf);
       ParseYAML(yaml_conf);
     } catch (std::exception &e) {
       HLOG(kFatal, e.what());

@@ -44,6 +44,7 @@
 #include <unordered_map>
 #include <vector>
 #include <yaml-cpp/yaml.h>
+#include <clio_ctp/util/msan.h>
 
 namespace clio::cae::summarizer {
 
@@ -163,6 +164,11 @@ struct SummarizerConfig {
     if (pool_config.config_.empty()) return;
     try {
       YAML::Node node = YAML::Load(pool_config.config_);
+      // yaml-cpp is a prebuilt .so: the scalars its scanner just
+      // produced carry no MSan shadow, so every key lookup and
+      // .as<>() below reads memory it has no record of. One walk
+      // here covers the whole tree.
+      ctp::MsanUnpoisonYaml(node);
       if (node["next_pool_id"]) {
         std::string next_str = node["next_pool_id"].as<std::string>();
         auto dot = next_str.find('.');
