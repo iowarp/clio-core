@@ -567,7 +567,7 @@ PhaseLog *PhaseLogInstance() {
         std::fprintf(l->fp,
                      "seq,chunk_id,path,chunk_bytes,stats_ms,nn_ms,"
                      "nn_batch_chunks,choice_ms,factory_ms,compress_ms,"
-                     "decompress_ms,io_ms,preproc_ms,h2d_ms,wall_ms,other_ms,"
+                     "decompress_ms,io_ms,io_start_ns,preproc_ms,h2d_ms,h2d_start_ns,wall_ms,other_ms,"
                      "lib,reused,explore_ms,sgd_ms,explored,sgd_updates,"
                      "stored_bytes\n");
       }
@@ -595,6 +595,14 @@ void MergePhases(ChunkPhases *a, const ChunkPhases &b) {
   add(&a->io_ms, b.io_ms);
   add(&a->preproc_ms, b.preproc_ms);
   add(&a->h2d_ms, b.h2d_ms);
+  // Timestamps must NOT be summed: keep the earliest of the set values, so a
+  // chunk stamped on two different paths reports one interval start.
+  auto keep_min = [](double *x, double y) {
+    if (y < 0.0) return;
+    *x = (*x < 0.0 || y < *x) ? y : *x;
+  };
+  keep_min(&a->h2d_start_ns, b.h2d_start_ns);
+  keep_min(&a->io_start_ns, b.io_start_ns);
   if (b.reused >= 0) a->reused = b.reused;
   a->explore_ms += b.explore_ms;
   a->sgd_ms += b.sgd_ms;
@@ -677,7 +685,7 @@ void LogChunkPhases(const std::string &blob_name, const char *path,
   std::lock_guard<std::mutex> lock(log->mutex);
   std::fprintf(
       log->fp,
-      "%ld,%s,%s,%zu,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%.6f,%.6f,%d,%s,%.6f,%.6f,"
+      "%ld,%s,%s,%zu,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%.6f,%.6f,%d,%s,%.6f,%.6f,"
       "%d,%d,%zu\n",
       log->seq++, blob_name.c_str(), path, chunk_bytes,
       cell(p.stats_ms, write).c_str(), cell(p.nn_ms, write).c_str(),
@@ -685,7 +693,9 @@ void LogChunkPhases(const std::string &blob_name, const char *path,
       cell(p.choice_ms, write).c_str(), cell(p.factory_ms, true).c_str(),
       cell(p.compress_ms, write).c_str(),
       cell(p.decompress_ms, !write).c_str(), cell(p.io_ms, true).c_str(),
+      cell(p.io_start_ns, true).c_str(),
       cell(p.preproc_ms, write).c_str(), cell(p.h2d_ms, true).c_str(),
+      cell(p.h2d_start_ns, true).c_str(),
       wall_ms, wall_ms - covered, lib,
       (write && p.reused >= 0) ? (p.reused ? "1" : "0") : "", p.explore_ms,
       p.sgd_ms, p.explored, p.sgd_updates, stored_bytes);

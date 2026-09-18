@@ -342,7 +342,10 @@ int main(int argc, char **argv) {
   Options opt;
   if (!ParseArgs(argc, argv, &opt)) return 2;
 
-  const auto t_start = std::chrono::steady_clock::now();
+  // Process start. Runtime bring-up and LAMMPS construction are identical for
+  // every arm, so they are reported as `setup` and EXCLUDED from `total`
+  // (t_work, at the loop): leaving them in added the same work to every bar.
+  const auto t_proc = std::chrono::steady_clock::now();
 
   // ---- Clio: attach this process to the runtime. ----------------------
   // CLIO_CTE_CLIENT_INIT -> CLIO_INIT(kClient): with CLIO_WITH_RUNTIME=1 in
@@ -1017,7 +1020,10 @@ int main(int argc, char **argv) {
   // `run 0` is setup: lmp->init(), Verlet::setup(1) -- neighbor lists, and
   // the FIRST force computation, so f at step 0 is meaningful. (A dump at
   // step 0 is written from inside that same setup, via output->setup.)
-  const auto t_sim0 = std::chrono::steady_clock::now();
+  // The workload starts here: simulate, stage+compress, then the final flush.
+  const auto t_work = std::chrono::steady_clock::now();
+  const double setup_s = std::chrono::duration<double>(t_work - t_proc).count();
+  const auto t_sim0 = t_work;
   double sim_s = 0.0, stage_s = 0.0;
   lammps_command(lmp, "run 0 post no");
   LmpCheck(lmp, "run 0");
@@ -1106,8 +1112,8 @@ int main(int argc, char **argv) {
               << " chunk(s)\n";
   std::cout << "  time: simulate " << sim_s << " s   stage+compress(wait) "
             << stage_s << " s   total "
-            << std::chrono::duration<double>(t_end_write - t_start).count()
-            << " s" << std::endl;
+            << std::chrono::duration<double>(t_end_write - t_work).count()
+            << " s   (setup " << setup_s << " s, excluded)" << std::endl;
   if (flush_ran) {
     std::cout << "  flush: " << flushed_blobs << " blob(s), " << flushed_bytes
               << " B moved to durable storage in " << flush_s << " s  (rc="

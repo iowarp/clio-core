@@ -192,6 +192,15 @@ struct ChunkPhases {
   double io_ms = -1.0;
   double preproc_ms = -1.0;
   double h2d_ms = -1.0;
+  /** steady_clock ns at the FIRST H2D of this chunk, -1 if it never staged.
+   *  h2d_ms is a SUM of per-chunk copies; chunks run concurrently, so summing
+   *  it across chunks over-counts the elapsed staging. With a start stamp the
+   *  harness can take the UNION of [start, start+h2d_ms] instead. */
+  double h2d_start_ns = -1.0;
+  /** steady_clock ns at the FIRST tier put of this chunk, -1 if none. Same
+   *  reason as h2d_start_ns: io_ms is a sum and the puts run concurrently, so
+   *  only the UNION of [start, start+io_ms] is elapsed I/O. */
+  double io_start_ns = -1.0;
   int reused = -1;  // 1 = cached ranking served, no forward pass
   // Online learning, host wall; explore_ms excludes its SGD and winner put.
   double explore_ms = 0.0;

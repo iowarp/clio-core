@@ -315,7 +315,7 @@ static_assert(sizeof(CompressionHeader) == 24,
 static_assert(offsetof(CompressionHeader, original_size_) == 16,
               "compressed_size_ must occupy the former padding at offset 12");
 
-/** Bring up prediction reuse: on by default, CLIO_NEUROPRESS_REUSE_PREDICTIONS=0 opts out, an... */
+/** Bring up prediction reuse: off by default, CLIO_NEUROPRESS_REUSE_PREDICTIONS=1 opts in, and never while exploring. */
 void Runtime::InitPredictionReuse() {
   auto env_num = [](const char *name, double fallback) {
     const char *v = std::getenv(name);
@@ -334,16 +334,18 @@ void Runtime::InitPredictionReuse() {
     return;
   }
 
-  // Opt out, not in: absent means on. An explicit 0/false/no/off runs the
-  // model for every chunk.
+  // Opt in, not out: absent means off. Only an explicit 1/true/yes/on
+  // enables it; anything else runs the model for every chunk.
   {
     const char *v = std::getenv("CLIO_NEUROPRESS_REUSE_PREDICTIONS");
-    if (v != nullptr && (*v == '0' || *v == 'f' || *v == 'F' || *v == 'n' ||
-                         *v == 'N' || (*v == 'o' && v[1] == 'f'))) {
+    const bool on =
+        v != nullptr &&
+        (*v == '1' || *v == 't' || *v == 'T' || *v == 'y' || *v == 'Y' ||
+         ((*v == 'o' || *v == 'O') && (v[1] == 'n' || v[1] == 'N')));
+    if (!on) {
       HLOG(kInfo,
-           "NeuroPress prediction reuse DISABLED by "
-           "CLIO_NEUROPRESS_REUSE_PREDICTIONS={}; the model runs for every chunk",
-           v);
+           "NeuroPress prediction reuse is OFF (the default); set "
+           "CLIO_NEUROPRESS_REUSE_PREDICTIONS=1 to enable it");
       return;
     }
   }
@@ -1140,6 +1142,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     ChunkPhases phases;
     bool phases_selected = false;
     double ds_h2d_ms = 0.0;
+    double ds_h2d_start_ns = -1.0;   // for the elapsed-staging union
     auto written_time = start_time;
     std::chrono::steady_clock::time_point explore_t0;
     bool explore_ran = false;
@@ -1180,6 +1183,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       }
       // DeviceAwareMemcpy, NOT GpuApi::Memcpy.
       const auto h2d_t0 = std::chrono::steady_clock::now();
+      ds_h2d_start_ns = static_cast<double>(
+          h2d_t0.time_since_epoch().count());
       ctp::DeviceAwareMemcpy(staged, chunk_data, chunk_size);
       ds_h2d_ms = std::chrono::duration<double, std::milli>(
                       std::chrono::steady_clock::now() - h2d_t0).count();
@@ -1229,6 +1234,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       fixed.compression_ratio_ = 1.0;
       stats.push_back(fixed);
       ranked_by_cost = true;  // take stats.front() verbatim below
+      // No selection ran, so there are no selection spans to take -- but this
+      // chunk still stages, preprocesses, compresses and stores. Open the row
+      // anyway, or a fixed-codec run reports no write phases at all and its
+      // H2D staging cannot be measured (or subtracted) the way a dynamic
+      // run's can.
+      phases_selected = phase_log;
     } else {
       /** Prediction reuse for THIS chunk. */
       np_reuse_ctx = PredictionReuseContextFor(task->blob_name_.str());
@@ -2231,6 +2242,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                   clio::cte::core::kBlobTransformCompressed;
 
               const auto winner_put_t0 = std::chrono::high_resolution_clock::now();
+              const auto winner_put_s0 = std::chrono::steady_clock::now();
               auto winner_put = core_client_->AsyncPutBlob(
                   task->tag_id_, task->blob_name_.str(), task->offset_,
                   winner_total, winner_shm.shm_.template Cast<void>(),
@@ -2242,6 +2254,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 ChunkPhases put_io;
                 put_io.io_ms = std::chrono::duration<double, std::milli>(
                                    written_time - winner_put_t0).count();
+                put_io.io_start_ns = static_cast<double>(
+                    winner_put_s0.time_since_epoch().count());
                 explore_inner_ms += put_io.io_ms;
                 AddCompressPhases(task->blob_name_.str(), put_io);
               }
@@ -2445,6 +2459,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // The one put, when exploration did not make it.
     if (defer_store && !stored_by_exploration && primary_image.valid()) {
       const auto primary_put_t0 = std::chrono::high_resolution_clock::now();
+      const auto primary_put_s0 = std::chrono::steady_clock::now();
       auto primary_put = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_,
           primary_image.size, primary_image.data, task->score_,
@@ -2455,6 +2470,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         ChunkPhases put_io;
         put_io.io_ms = std::chrono::duration<double, std::milli>(
                            written_time - primary_put_t0).count();
+        put_io.io_start_ns = static_cast<double>(
+            primary_put_s0.time_since_epoch().count());
         AddCompressPhases(task->blob_name_.str(), put_io);
       }
       if (primary_put->return_code_ != 0) {
@@ -2473,6 +2490,11 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         TakeCompressPhases(task->blob_name_.str(), &phases) &&
         task->return_code_ == 0) {
       phases.h2d_ms = std::max(phases.h2d_ms, 0.0) + ds_h2d_ms;
+      // Earliest of the two staging points, so the interval covers both.
+      if (ds_h2d_start_ns >= 0.0 &&
+          (phases.h2d_start_ns < 0.0 || ds_h2d_start_ns < phases.h2d_start_ns)) {
+        phases.h2d_start_ns = ds_h2d_start_ns;
+      }
       LogChunkPhases(task->blob_name_.str(), "write", chunk_size,
                      task->context_.compress_lib_, phases,
                      std::chrono::duration<double, std::milli>(
@@ -2583,6 +2605,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       compress_phases.io_ms = io_ms;
       compress_phases.preproc_ms = context.actual_preproc_time_ms_;
       compress_phases.h2d_ms = context.actual_h2d_time_ms_;
+      // h2d_start_ns is already set where the copy happened, if it happened.
       AddCompressPhases(task->blob_name_.str(), compress_phases);
     };
 
@@ -2636,6 +2659,12 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       }
       {
         // Same instrument as the codec and preprocessing kernels.
+        const double h2d_start_ns = static_cast<double>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        if (compress_phases.h2d_start_ns < 0.0 ||
+            h2d_start_ns < compress_phases.h2d_start_ns) {
+          compress_phases.h2d_start_ns = h2d_start_ns;
+        }
 #if CTP_ENABLE_CUDA
         ctp::CodecKernelTimer _kt(nullptr, &context.actual_h2d_time_ms_);
 #endif
@@ -3016,6 +3045,8 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
             total_stored_size, compressed_shm_ptr, task->score_, context,
             task->flags_, clio::run::PoolQuery::Local());
         CLIO_CO_AWAIT(put_task);
+        compress_phases.io_start_ns =
+            static_cast<double>(put_t0.time_since_epoch().count());
         park_compress_phases(std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - put_t0)
                                  .count());
@@ -3092,6 +3123,8 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           task->blob_data_, task->score_, context, task->flags_,
           clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(put_task);
+      compress_phases.io_start_ns =
+          static_cast<double>(raw_put_t0.time_since_epoch().count());
       park_compress_phases(std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - raw_put_t0)
                                .count());

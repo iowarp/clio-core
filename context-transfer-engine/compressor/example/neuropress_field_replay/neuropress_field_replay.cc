@@ -230,7 +230,12 @@ std::string FieldOf(const std::string &stem) {
 int main(int argc, char **argv) {
   Options opt;
   if (!ParseArgs(argc, argv, &opt)) return 2;
-  const auto t_start = std::chrono::steady_clock::now();
+  // Process start. Runtime bring-up, field discovery and the payload du all
+  // happen before the workload proper and are IDENTICAL for every arm, so they
+  // are reported as `setup` and EXCLUDED from `total` (t_work, below): leaving
+  // them in added ~2 s of the same work to every bar and diluted every
+  // comparison the figure makes.
+  const auto t_proc = std::chrono::steady_clock::now();
 
   // ---- Clio: attach to the runtime, which CLIO_WITH_RUNTIME=1 brings up
   // in THIS process, composed from CLIO_SERVER_CONF. Same call the HDF5 VOL
@@ -510,6 +515,11 @@ int main(int argc, char **argv) {
     pending.clear();
   };
 
+  // The workload starts here: read, stage+compress, then the final flush.
+  const auto t_work = std::chrono::steady_clock::now();
+  const double setup_s =
+      std::chrono::duration<double>(t_work - t_proc).count();
+
   std::vector<char> filebuf;
   for (const auto &f : files) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -630,8 +640,8 @@ int main(int argc, char **argv) {
   std::cout << "  time: read " << read_s << " s   stage+compress " << stage_s
             << " s   total "
             << std::chrono::duration<double>(
-                   std::chrono::steady_clock::now() - t_start).count()
-            << " s" << std::endl;
+                   std::chrono::steady_clock::now() - t_work).count()
+            << " s   (setup " << setup_s << " s, excluded)" << std::endl;
   if (flush_ran) {
     std::cout << "  flush: " << flushed_blobs << " blob(s), " << flushed_bytes
               << " B moved to durable storage in " << flush_s << " s  (rc="

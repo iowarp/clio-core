@@ -281,7 +281,7 @@ private:
       neuropress_predictor_;
 
   /* ---- prediction reuse across timesteps ------------------------------
-     On by default; CLIO_NEUROPRESS_REUSE_PREDICTIONS=0 opts out, and it is
+     Off by default; CLIO_NEUROPRESS_REUSE_PREDICTIONS=1 opts in, and it is
      never used while exploration is enabled. The registry maps a lineage key
      to a dense slot in the device state array; the array itself is device
      memory and is read only by kernels.
