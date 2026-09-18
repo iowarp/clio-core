@@ -324,6 +324,12 @@ add_subdirectory(src)
 # of the GPU codecs, so it is built by a dedicated rule (src/compress/sycl_lz4).
 option(CLIO_CTP_ENABLE_SYCL_LZ4
        "Build the SYCL LZ4 GPU codec (portable nvcomp-lz4 equivalent)" OFF)
+option(CLIO_CTP_ENABLE_SYCL_SNAPPY
+       "Build the SYCL Snappy GPU codec (portable nvcomp-snappy equivalent)" OFF)
+option(CLIO_CTP_ENABLE_SYCL_ANS
+       "Build the SYCL ANS GPU codec (portable rANS entropy coder)" OFF)
+option(CLIO_CTP_ENABLE_SYCL_ZSTD
+       "Build the SYCL Zstd-style GPU codec (LZ+rANS; not libzstd-compatible)" OFF)
 
 # ctp::compress - Compression support
 add_library(compress INTERFACE)
@@ -370,6 +376,9 @@ target_compile_definitions(compress INTERFACE
     CTP_ENABLE_NDZIP=$<BOOL:${CLIO_CTP_ENABLE_NDZIP}>
     CTP_ENABLE_CUSZP=$<BOOL:${CLIO_CTP_ENABLE_CUSZP}>
     CTP_ENABLE_SYCL_LZ4=$<BOOL:${CLIO_CTP_ENABLE_SYCL_LZ4}>
+    CTP_ENABLE_SYCL_SNAPPY=$<BOOL:${CLIO_CTP_ENABLE_SYCL_SNAPPY}>
+    CTP_ENABLE_SYCL_ANS=$<BOOL:${CLIO_CTP_ENABLE_SYCL_ANS}>
+    CTP_ENABLE_SYCL_ZSTD=$<BOOL:${CLIO_CTP_ENABLE_SYCL_ZSTD}>
 )
 
 # Build + link the SYCL LZ4 kernels object (its own SYCL-compiler rule) and let
@@ -386,6 +395,30 @@ if(CLIO_CTP_ENABLE_SYCL_LZ4)
         $<BUILD_INTERFACE:clio_ctp_sycl_lz4>)
     target_sources(compress INTERFACE
         $<BUILD_INTERFACE:$<TARGET_OBJECTS:clio_ctp_sycl_lz4>>)
+endif()
+
+if(CLIO_CTP_ENABLE_SYCL_SNAPPY)
+    add_subdirectory(src/compress/sycl_snappy)
+    target_link_libraries(compress INTERFACE
+        $<BUILD_INTERFACE:clio_ctp_sycl_snappy>)
+    target_sources(compress INTERFACE
+        $<BUILD_INTERFACE:$<TARGET_OBJECTS:clio_ctp_sycl_snappy>>)
+endif()
+
+if(CLIO_CTP_ENABLE_SYCL_ANS)
+    add_subdirectory(src/compress/sycl_ans)
+    target_link_libraries(compress INTERFACE
+        $<BUILD_INTERFACE:clio_ctp_sycl_ans>)
+    target_sources(compress INTERFACE
+        $<BUILD_INTERFACE:$<TARGET_OBJECTS:clio_ctp_sycl_ans>>)
+endif()
+
+if(CLIO_CTP_ENABLE_SYCL_ZSTD)
+    add_subdirectory(src/compress/sycl_zstd)
+    target_link_libraries(compress INTERFACE
+        $<BUILD_INTERFACE:clio_ctp_sycl_zstd>)
+    target_sources(compress INTERFACE
+        $<BUILD_INTERFACE:$<TARGET_OBJECTS:clio_ctp_sycl_zstd>>)
 endif()
 
 add_library(ctp::compress ALIAS compress)
