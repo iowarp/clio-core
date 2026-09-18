@@ -19,7 +19,16 @@ static constexpr clio::run::u64 kReplicateChunkBytes = 4ULL * 1024 * 1024;
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  config_ = task->GetParams();
+  // The task is NOT a CreateTask, whatever the parameter says. The generated
+  // dispatch reinterprets whatever create task the runtime is holding into
+  // this ChiMod's instantiation, and what it is actually holding depends on
+  // who asked for the pool -- compose builds ComposeTask<PoolConfig>, a direct
+  // caller builds its own. All of them ARE a CreatePoolFields, so reads go
+  // through that; the config type is named at the call instead of being baked
+  // into the object's type. Touching the task through `task` itself would be
+  // undefined behaviour, which is what UBSan reports here.
+  auto &fields = task.template Cast<clio::run::admin::CreatePoolFields>();
+  config_ = fields->GetParamsAs<ReplicationConfig>();
   interposer_next_pool_ = config_.next_pool_id_;  // base forwarding target
   if (!config_.next_pool_id_.IsNull()) {
     core_client_ =
@@ -39,7 +48,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     HLOG(kInfo, "replication: async write-through sweep every {} ms",
          config_.replicate_period_ms_);
   }
-  task->return_code_ = 0;
+  fields->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

@@ -162,6 +162,92 @@ struct CreatePoolFields : public clio::run::Task {
         is_admin_(is_admin),
         do_compose_(do_compose),
         client_(client) {}
+
+#if CTP_IS_HOST
+  /**
+   * Deserialize chimod_params_ as @p CreateParamsT.
+   *
+   * The params type belongs to the READER, not to the object: what is in
+   * chimod_params_ is either a serialized CreateParams written by the same
+   * ChiMod that is now reading it, or -- in compose mode -- a PoolConfig whose
+   * YAML that ChiMod's config parses via LoadConfig. Which is why this is a
+   * member template on the shared base rather than a member of one
+   * instantiation: the runtime routinely hands a ChiMod a create task that was
+   * BUILT as some other instantiation (the compose path builds
+   * ComposeTask<PoolConfig> for every pool it brings up), and calling a member
+   * of the reader's instantiation on that object is undefined behaviour --
+   * UBSan's vptr check reports it on exactly the tests that take that path.
+   */
+  template <typename CreateParamsT>
+  CreateParamsT GetParamsAs() const {
+    if (do_compose_) {
+      // Compose mode: deserialize PoolConfig and load into CreateParams
+      clio::run::PoolConfig pool_config =
+          clio::run::Task::Deserialize<clio::run::PoolConfig>(chimod_params_);
+      CreateParamsT params;
+      params.LoadConfig(pool_config);
+      return params;
+    }
+    // Normal mode: deserialize CreateParams directly
+    return clio::run::Task::Deserialize<CreateParamsT>(chimod_params_);
+  }
+
+  /** Serialize @p CreateParamsT into chimod_params_. Does nothing in compose
+   *  mode, where chimod_params_ holds the PoolConfig instead. See
+   *  GetParamsAs for why the params type is a parameter of the call. */
+  template <typename CreateParamsT, typename... Args>
+  void SetParamsAs(Args &&...args) {
+    if (do_compose_) {
+      return;  // Skip SetParams in compose mode
+    }
+    CreateParamsT params(std::forward<Args>(args)...);
+    clio::run::Task::Serialize(CLIO_PRIV_ALLOC, chimod_params_, params);
+  }
+#endif
+
+  /**
+   * AggregateOut replica results into this task.
+   *
+   * Lives here, not on BaseCreateTask, for the same reason as GetParamsAs: the
+   * generated AggregateOut dispatch reaches a create task through whatever
+   * instantiation the ChiMod's method table names, which is not the one the
+   * object was built as. It touches only the fields above, so the shared base
+   * is where it belongs.
+   */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    // OUT fields ONLY (issue #856). Pool creation is BROADCAST, so this runs
+    // once per surviving node with a foreign replica. Delegating to Copy()
+    // ran Task::Copy — overwriting the ORIGIN's task_id_, pool_query_ and
+    // completer_ with the replica's while send_map_/completion bookkeeping
+    // still referenced the origin — and re-assigned IN priv::strings across
+    // shared-memory segments (free() through the wrong allocator). See the
+    // RecoverContainersTask note: that is the `free(): invalid pointer`
+    // abort behind the leader-election recovery crash.
+    auto other = other_base.template Cast<CreatePoolFields>();
+    // Every replica creates the same pool and reports the same id; take the
+    // first non-null so a later empty answer cannot erase it.
+    if (new_pool_id_.IsNull()) {
+      new_pool_id_ = other->new_pool_id_;
+    }
+    if (error_message_.size() == 0 && other->error_message_.size() > 0) {
+      error_message_ = other->error_message_;
+    }
+    // A replica that could not be delivered because its target node DIED must
+    // not fail the whole create (issue #856). Pool creation is a broadcast:
+    // Task::AggregateOut propagates any non-zero replica RC to the origin, so
+    // one unreachable node turned an otherwise-successful create into an
+    // error — which is exactly what the leader-election suite asserts on right
+    // after it kills a node (and, before dead-node tasks completed at all,
+    // what HUNG instead). The pool genuinely exists once any node created it
+    // and reported its id; the dead node's container is created when it
+    // rejoins or when recovery redistributes it. Only the network-timeout RC
+    // is forgiven — a real create failure still propagates.
+    if (!new_pool_id_.IsNull() &&
+        GetReturnCode() == clio::run::kRun2RunNetworkTimeoutRC) {
+      SetReturnCode(0);
+    }
+  }
 };
 
 /**
@@ -300,11 +386,8 @@ struct BaseCreateTask : public CreatePoolFields {
    */
   template <typename... Args>
   void SetParams(Args &&...args) {
-    if (do_compose_) {
-      return;  // Skip SetParams in compose mode
-    }
-    CreateParamsT params(std::forward<Args>(args)...);
-    clio::run::Task::Serialize(CLIO_PRIV_ALLOC, chimod_params_, params);
+    CreatePoolFields::template SetParamsAs<CreateParamsT>(
+        std::forward<Args>(args)...);
   }
 
   /**
@@ -313,17 +396,7 @@ struct BaseCreateTask : public CreatePoolFields {
    * LoadConfig
    */
   CreateParamsT GetParams() const {
-    if (do_compose_) {
-      // Compose mode: deserialize PoolConfig and load into CreateParams
-      clio::run::PoolConfig pool_config =
-          clio::run::Task::Deserialize<clio::run::PoolConfig>(chimod_params_);
-      CreateParamsT params;
-      params.LoadConfig(pool_config);
-      return params;
-    } else {
-      // Normal mode: deserialize CreateParams directly
-      return clio::run::Task::Deserialize<CreateParamsT>(chimod_params_);
-    }
+    return CreatePoolFields::template GetParamsAs<CreateParamsT>();
   }
 #else
   CTP_GPU_FUN CreateParamsT GetParams() const {
@@ -390,42 +463,6 @@ struct BaseCreateTask : public CreatePoolFields {
     HLOG(kDebug, "BaseCreateTask::Copy() AFTER: this->do_compose_={}",
          do_compose_);
 #endif
-  }
-
-  /** AggregateOut replica results into this task */
-  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
-    Task::AggregateOut(other_base);
-    // OUT fields ONLY (issue #856). Pool creation is BROADCAST, so this runs
-    // once per surviving node with a foreign replica. Delegating to Copy()
-    // ran Task::Copy — overwriting the ORIGIN's task_id_, pool_query_ and
-    // completer_ with the replica's while send_map_/completion bookkeeping
-    // still referenced the origin — and re-assigned IN priv::strings across
-    // shared-memory segments (free() through the wrong allocator). See the
-    // RecoverContainersTask note: that is the `free(): invalid pointer`
-    // abort behind the leader-election recovery crash.
-    auto other = other_base.template Cast<BaseCreateTask>();
-    // Every replica creates the same pool and reports the same id; take the
-    // first non-null so a later empty answer cannot erase it.
-    if (new_pool_id_.IsNull()) {
-      new_pool_id_ = other->new_pool_id_;
-    }
-    if (error_message_.size() == 0 && other->error_message_.size() > 0) {
-      error_message_ = other->error_message_;
-    }
-    // A replica that could not be delivered because its target node DIED must
-    // not fail the whole create (issue #856). Pool creation is a broadcast:
-    // Task::AggregateOut propagates any non-zero replica RC to the origin, so
-    // one unreachable node turned an otherwise-successful create into an
-    // error — which is exactly what the leader-election suite asserts on right
-    // after it kills a node (and, before dead-node tasks completed at all,
-    // what HUNG instead). The pool genuinely exists once any node created it
-    // and reported its id; the dead node's container is created when it
-    // rejoins or when recovery redistributes it. Only the network-timeout RC
-    // is forgiven — a real create failure still propagates.
-    if (!new_pool_id_.IsNull() &&
-        GetReturnCode() == clio::run::kRun2RunNetworkTimeoutRC) {
-      SetReturnCode(0);
-    }
   }
 
   /**

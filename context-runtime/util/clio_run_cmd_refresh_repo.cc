@@ -538,7 +538,20 @@ class ChiModGenerator {
     oss << "  switch (method) {\n";
 
     for (const auto& method : methods) {
-      std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
+      // A GetOrCreate* task is aggregated through the SHARED create-task base,
+      // not through this ChiMod's instantiation of it. The object was built by
+      // whoever asked for the pool -- the compose path builds
+      // ComposeTask<PoolConfig> for every pool it brings up -- so calling this
+      // ChiMod's instantiation on it is undefined behaviour, which UBSan's
+      // vptr check reports on every replica aggregate that crosses the network.
+      // AggregateOut lives on CreatePoolFields and touches only shared fields,
+      // so the base is both legal and sufficient.
+      const bool is_create_pool =
+          method.method_name.length() >= 11 &&
+          method.method_name.substr(0, 11) == "GetOrCreate";
+      std::string task_type =
+          is_create_pool ? std::string("clio::run::admin::CreatePoolFields")
+                         : GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
       oss << "      auto& typed_task = orig_task.template Cast<" << task_type << ">();\n";
       oss << "      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));\n";

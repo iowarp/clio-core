@@ -1355,7 +1355,7 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
       break;
     }
     case Method::kGetOrCreatePool: {
-      auto& typed_task = orig_task.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
+      auto& typed_task = orig_task.template Cast<clio::run::admin::CreatePoolFields>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
