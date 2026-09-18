@@ -87,17 +87,27 @@ struct CreateParams {
 };
 
 /**
- * BaseCreateTask - Templated base class for all ChiMod CreateTasks
- * @tparam CreateParamsT The parameter structure containing chimod-specific
- * configuration
- * @tparam MethodId The method ID for this task type
- * @tparam IS_ADMIN Whether this is an admin operation (sets volatile variable)
- * @tparam DO_COMPOSE Whether this task is called from compose (minimal error
- * checking)
+ * CreatePoolFields - the pool-operation state every ChiMod's create task
+ * carries, in a type that does NOT depend on which CreateParams it was built
+ * for.
+ *
+ * It exists so the runtime can reach those fields on a create task whose
+ * CreateParamsT it cannot know. PoolManager::CreatePool serves every ChiMod:
+ * admin::CreateTask, GetOrCreatePoolTask<XConfig> and ComposeTask<XConfig> all
+ * arrive there as a plain Task, and there is no one instantiation of
+ * BaseCreateTask that names them all. It used to reinterpret_cast to an
+ * arbitrary one; every instantiation lays these members out identically, so it
+ * worked, but reading an object through an unrelated type is undefined
+ * behaviour, and UBSan's vptr check said so on all 187 tests that create a
+ * pool. Downcasting to this shared base is the same access, spelled in a way
+ * the language defines.
+ *
+ * Layout is deliberately unchanged: single non-virtual inheritance that adds
+ * no virtual function of its own keeps the Task subobject at offset 0 and
+ * these members after it, exactly where they were. That matters here -- these
+ * tasks live in shared memory and are serialized field by field.
  */
-template <typename CreateParamsT, clio::run::u32 MethodId = Method::kCreate,
-          bool IS_ADMIN = false, bool DO_COMPOSE = false>
-struct BaseCreateTask : public clio::run::Task {
+struct CreatePoolFields : public clio::run::Task {
   // Pool operation parameters
   INOUT clio::run::priv::string chimod_name_;
   IN clio::run::priv::string pool_name_;
@@ -108,24 +118,69 @@ struct BaseCreateTask : public clio::run::Task {
   // Results for pool operations
   OUT clio::run::priv::string error_message_;
 
-  // Flags set by template parameters (must be serialized for remote execution)
+  // Flags set by the derived task's template parameters (must be serialized
+  // for remote execution)
   bool is_admin_;
   bool do_compose_;
 
   // Client pointer for PostWait callback (not serialized)
   clio::run::ContainerClient *client_;
 
-  /** SHM default constructor */
-  BaseCreateTask()
+  /** SHM default constructor. The flags come from the derived task's template
+   *  arguments, which this base cannot see. */
+  CTP_CROSS_FUN CreatePoolFields(bool is_admin, bool do_compose)
       : clio::run::Task(),
         chimod_name_(CLIO_PRIV_ALLOC),
         pool_name_(CLIO_PRIV_ALLOC),
         chimod_params_(CLIO_PRIV_ALLOC),
         new_pool_id_(clio::run::PoolId::GetNull()),
         error_message_(CLIO_PRIV_ALLOC),
-        is_admin_(IS_ADMIN),
-        do_compose_(DO_COMPOSE),
-        client_(nullptr) {
+        is_admin_(is_admin),
+        do_compose_(do_compose),
+        client_(nullptr) {}
+
+  /** Emplace constructor. The two name parameters are templated so one
+   *  definition serves every spelling the derived constructors use --
+   *  std::string, const char*, and the mix of the two -- since priv::string
+   *  accepts them all. chimod_params_ is left empty: what goes in it depends
+   *  on CreateParamsT, so only the derived constructor can fill it. */
+  template <typename ChimodNameT, typename PoolNameT>
+  CTP_CROSS_FUN CreatePoolFields(const clio::run::TaskId &task_node,
+                                 const clio::run::PoolId &task_pool_id,
+                                 const clio::run::PoolQuery &pool_query,
+                                 const ChimodNameT &chimod_name,
+                                 const PoolNameT &pool_name,
+                                 const clio::run::PoolId &target_pool_id,
+                                 clio::run::ContainerClient *client,
+                                 bool is_admin, bool do_compose)
+      : clio::run::Task(task_node, task_pool_id, pool_query, 0),
+        chimod_name_(CLIO_PRIV_ALLOC, chimod_name),
+        pool_name_(CLIO_PRIV_ALLOC, pool_name),
+        chimod_params_(CLIO_PRIV_ALLOC),
+        new_pool_id_(target_pool_id),
+        error_message_(CLIO_PRIV_ALLOC),
+        is_admin_(is_admin),
+        do_compose_(do_compose),
+        client_(client) {}
+};
+
+/**
+ * BaseCreateTask - Templated base class for all ChiMod CreateTasks
+ * @tparam CreateParamsT The parameter structure containing chimod-specific
+ * configuration
+ * @tparam MethodId The method ID for this task type
+ * @tparam IS_ADMIN Whether this is an admin operation (sets volatile variable)
+ * @tparam DO_COMPOSE Whether this task is called from compose (minimal error
+ * checking)
+ *
+ * Everything that does not depend on CreateParamsT lives in CreatePoolFields
+ * above; see the note there for why that split exists.
+ */
+template <typename CreateParamsT, clio::run::u32 MethodId = Method::kCreate,
+          bool IS_ADMIN = false, bool DO_COMPOSE = false>
+struct BaseCreateTask : public CreatePoolFields {
+  /** SHM default constructor */
+  BaseCreateTask() : CreatePoolFields(IS_ADMIN, DO_COMPOSE) {
 #if CTP_IS_HOST
     HLOG(kDebug,
          "BaseCreateTask default constructor: IS_ADMIN={}, DO_COMPOSE={}, "
@@ -141,15 +196,9 @@ struct BaseCreateTask : public clio::run::Task {
       const clio::run::PoolQuery &pool_query, const std::string &chimod_name,
       const std::string &pool_name, const clio::run::PoolId &target_pool_id,
       clio::run::ContainerClient *client, CreateParamsArgs &&...create_params_args)
-      : clio::run::Task(task_node, task_pool_id, pool_query, 0),
-        chimod_name_(CLIO_PRIV_ALLOC, chimod_name),
-        pool_name_(CLIO_PRIV_ALLOC, pool_name),
-        chimod_params_(CLIO_PRIV_ALLOC),
-        new_pool_id_(target_pool_id),
-        error_message_(CLIO_PRIV_ALLOC),
-        is_admin_(IS_ADMIN),
-        do_compose_(DO_COMPOSE),
-        client_(client) {
+      : CreatePoolFields(task_node, task_pool_id, pool_query, chimod_name,
+                         pool_name, target_pool_id, client, IS_ADMIN,
+                         DO_COMPOSE) {
     // Initialize base task
     task_id_ = task_node;
     method_ = MethodId;
@@ -178,15 +227,9 @@ struct BaseCreateTask : public clio::run::Task {
       const clio::run::PoolQuery &pool_query, const char *chimod_name,
       const std::string &pool_name, const clio::run::PoolId &target_pool_id,
       clio::run::ContainerClient *client)
-      : clio::run::Task(task_node, task_pool_id, pool_query, 0),
-        chimod_name_(CLIO_PRIV_ALLOC, chimod_name),
-        pool_name_(CLIO_PRIV_ALLOC, pool_name),
-        chimod_params_(CLIO_PRIV_ALLOC),
-        new_pool_id_(target_pool_id),
-        error_message_(CLIO_PRIV_ALLOC),
-        is_admin_(IS_ADMIN),
-        do_compose_(DO_COMPOSE),
-        client_(client) {
+      : CreatePoolFields(task_node, task_pool_id, pool_query, chimod_name,
+                         pool_name, target_pool_id, client, IS_ADMIN,
+                         DO_COMPOSE) {
     // Initialize base task
     task_id_ = task_node;
     method_ = MethodId;
@@ -215,15 +258,10 @@ struct BaseCreateTask : public clio::run::Task {
       const clio::run::PoolQuery &pool_query, const char *chimod_name,
       const char *pool_name, const clio::run::PoolId &target_pool_id,
       clio::run::ContainerClient *client)
-      : clio::run::Task(task_node, task_pool_id, pool_query, 0),
-        chimod_name_(CLIO_PRIV_ALLOC, chimod_name),
-        pool_name_(CLIO_PRIV_ALLOC, pool_name),
-        chimod_params_(CLIO_PRIV_ALLOC),
-        new_pool_id_(target_pool_id),
-        error_message_(CLIO_PRIV_ALLOC),
-        is_admin_(IS_ADMIN),
-        do_compose_(false),
-        client_(client) {
+      // do_compose_ is hard-false here rather than DO_COMPOSE, as it was
+      // before this constructor delegated.
+      : CreatePoolFields(task_node, task_pool_id, pool_query, chimod_name,
+                         pool_name, target_pool_id, client, IS_ADMIN, false) {
     task_id_ = task_node;
     method_ = MethodId;
     task_flags_.Clear();
@@ -236,15 +274,9 @@ struct BaseCreateTask : public clio::run::Task {
                           const clio::run::PoolId &task_pool_id,
                           const clio::run::PoolQuery &pool_query,
                           const clio::run::PoolConfig &pool_config)
-      : clio::run::Task(task_node, task_pool_id, pool_query, 0),
-        chimod_name_(CLIO_PRIV_ALLOC, pool_config.mod_name_),
-        pool_name_(CLIO_PRIV_ALLOC, pool_config.pool_name_),
-        chimod_params_(CLIO_PRIV_ALLOC),
-        new_pool_id_(pool_config.pool_id_),
-        error_message_(CLIO_PRIV_ALLOC),
-        is_admin_(IS_ADMIN),
-        do_compose_(DO_COMPOSE),
-        client_(nullptr) {
+      : CreatePoolFields(task_node, task_pool_id, pool_query,
+                         pool_config.mod_name_, pool_config.pool_name_,
+                         pool_config.pool_id_, nullptr, IS_ADMIN, DO_COMPOSE) {
 #if CTP_IS_HOST
     HLOG(kDebug,
          "BaseCreateTask COMPOSE constructor: IS_ADMIN={}, DO_COMPOSE={}, "
@@ -429,6 +461,13 @@ struct BaseCreateTask : public clio::run::Task {
  * Uses MethodId=kCreate and IS_ADMIN=true
  */
 using CreateTask = BaseCreateTask<CreateParams, Method::kCreate, true>;
+
+// The CreatePoolFields split must stay free: these tasks are placed in shared
+// memory and serialized field by field, and PoolManager::CreatePool downcasts
+// to the base expecting the very same object. Adding a data member or a
+// virtual function to BaseCreateTask would break both, silently.
+static_assert(sizeof(CreateTask) == sizeof(CreatePoolFields),
+              "BaseCreateTask must add no storage to CreatePoolFields");
 
 /**
  * GetOrCreatePoolTask - Template typedef for pool creation by external ChiMods
