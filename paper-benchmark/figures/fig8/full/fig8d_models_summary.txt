@@ -1,30 +1,32 @@
-workload model                  chunks  regret first 200  regret last 20%  cost MAPE last 20%  top-1 pick
-VPIC     NeuroPress (online)       656            52.80%           45.90%              11.80%       32.3%
-VPIC     NeuroPress (static)       656            78.72%           35.75%               9.05%       47.6%
-VPIC     XGBoost                   656           174.02%           96.31%            1097.01%        0.0%
-VPIC     HCompress CCP (+fb)       656            49.62%           32.75%               8.14%       43.4%
-VPIC     HCompress CCP (seed)      656           174.02%           96.31%            3616.48%        0.0%
+workload model                  chunks  regret first 200  regret last 20%  cost MAPE last 20%  top-1 pick  mean tied  regret <=cap  MAPE <=cap
+VPIC     NeuroPress (online)      2000             2.18%            0.27%               0.60%       49.7%        1.4         0.27%       0.60%
+VPIC     NeuroPress (static)      2000            10.86%            6.20%               2.50%       54.9%        1.2         1.82%       2.50%
+VPIC     XGBoost                  2000            79.12%           78.83%            1161.35%        0.0%        1.0        78.83%     100.00%
+VPIC     HCompress CCP (+fb)      2000           394.97%          465.88%              61.51%        8.9%       21.0        75.89%      61.51%
+VPIC     HCompress CCP (seed)     2000            17.87%           17.99%             585.98%       11.2%        1.0        17.99%     100.00%
 
-Nyx      NeuroPress (online)      1056             6.48%           29.83%              10.34%       38.0%
-Nyx      NeuroPress (static)      1056            38.74%          162.00%              48.76%       26.9%
-Nyx      XGBoost                  1056            29.24%           59.29%            2324.43%        5.5%
-Nyx      HCompress CCP (+fb)      1056            12.23%           21.25%              10.99%       39.9%
-Nyx      HCompress CCP (seed)     1056            14.69%           56.56%            4820.31%       16.6%
+Nyx      NeuroPress (online)      2010             5.86%            0.18%               0.33%       78.1%        1.0         0.18%       0.33%
+Nyx      NeuroPress (static)      2010             5.81%          329.36%              65.47%       24.7%        2.1        86.35%      65.47%
+Nyx      XGBoost                  2010            13.27%           66.23%            1668.95%        0.4%        1.0        66.23%     100.00%
+Nyx      HCompress CCP (+fb)      2010            97.95%          125.94%               7.75%        1.7%        2.7        51.22%       7.75%
+Nyx      HCompress CCP (seed)     2010            24.24%           18.68%             568.78%       71.6%        1.0        18.68%     100.00%
 
-LAMMPS   NeuroPress (online)       603            10.23%           11.60%               5.99%       38.8%
-LAMMPS   NeuroPress (static)       603            18.91%           32.30%              13.95%       38.0%
-LAMMPS   XGBoost                   603            38.66%           22.30%            1632.26%        0.0%
-LAMMPS   HCompress CCP (+fb)       603            57.73%           42.97%              28.79%        0.3%
-LAMMPS   HCompress CCP (seed)      603            38.66%           22.30%            1935.30%        0.0%
+LAMMPS   NeuroPress (online)      2004             0.29%            0.24%               0.74%       41.1%        1.0         0.24%       0.74%
+LAMMPS   NeuroPress (static)      2004             0.70%            0.74%               4.16%       33.3%        1.0         0.74%       4.16%
+LAMMPS   XGBoost                  2004            18.19%           18.37%            1667.98%        0.0%        1.0        18.37%     100.00%
+LAMMPS   HCompress CCP (+fb)      2004             8.84%            1.68%               0.37%        0.0%        1.0         1.68%       0.37%
+LAMMPS   HCompress CCP (seed)     2004            10.89%           10.24%             145.89%        0.0%        1.0        10.24%     100.00%
 
-WarpX    NeuroPress (online)       500            12.39%           12.53%               9.17%       14.0%
-WarpX    NeuroPress (static)       500             6.23%           37.45%              31.13%        5.2%
-WarpX    XGBoost                   500            10.83%           20.50%            2034.65%        0.0%
-WarpX    HCompress CCP (+fb)       500            17.25%           47.77%              31.07%       31.4%
-WarpX    HCompress CCP (seed)      500             5.70%           20.22%            4557.71%        1.8%
+WarpX    NeuroPress (online)      1998            45.97%            2.77%               8.20%       22.6%        1.0         2.07%       8.20%
+WarpX    NeuroPress (static)      1998            12.57%            7.21%              29.20%        4.4%        1.0         4.55%      29.20%
+WarpX    XGBoost                  1998            14.55%           24.55%            1564.68%        0.0%        1.0        24.55%     100.00%
+WarpX    HCompress CCP (+fb)      1998             4.70%            3.85%              23.15%        3.0%        1.2         3.85%      23.15%
+WarpX    HCompress CCP (seed)     1998            55.44%           32.22%             330.42%        1.3%        1.0        32.22%     100.00%
 
-AI       NeuroPress (online)       656           124.14%          176.77%              29.43%       49.7%
-AI       NeuroPress (static)       656            72.71%          161.29%              27.50%       70.4%
-AI       XGBoost                   656           148.28%          246.99%            1017.50%        4.9%
-AI       HCompress CCP (+fb)       656            62.36%          195.82%              32.38%       57.3%
-AI       HCompress CCP (seed)      656           153.76%          246.56%            2862.02%        1.2%
+AI       NeuroPress (online)      1804            40.86%           27.99%               9.60%       44.0%        2.2        13.82%       9.60%
+AI       NeuroPress (static)      1804           151.32%          138.31%              19.42%       66.2%        2.3        23.22%      19.42%
+AI       XGBoost                  1804            75.60%           96.27%            1365.32%        7.7%        1.0        72.36%      99.86%
+AI       HCompress CCP (+fb)      1804           306.46%          451.23%              58.36%       17.1%       18.9        77.26%      57.27%
+AI       HCompress CCP (seed)     1804            34.05%           40.58%             560.51%       50.1%        1.0        24.16%      98.24%
+
+Means are UNCAPPED; the two <=cap columns clip each chunk at 100% first, as the figure does.

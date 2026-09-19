@@ -228,11 +228,18 @@ def predictions(rows: pd.DataFrame, hc: pd.DataFrame, nn: NeuroPressNN,
 
     # hcompress.csv is written row-for-row from the same eval.csv, so it aligns
     # positionally; the assertion keeps a silent misalignment from becoming a
-    # published number.
+    # published number. `library` is checked as well as `chunk`, because the 32
+    # rows of one chunk all carry the same chunk id: a permutation WITHIN a
+    # chunk -- which is exactly what hcompress_ccp_eval.cc's regroup-by-chunk
+    # would produce from an out-of-order eval.csv -- passes a chunk-only check
+    # while attributing every prediction to the wrong configuration.
     if len(hc) != len(rows):
         raise SystemExit(f"hcompress.csv has {len(hc)} rows, rows.csv has {len(rows)}")
     if not (hc.chunk.to_numpy() == rows.chunk.to_numpy()).all():
-        raise SystemExit("hcompress.csv is not aligned with rows.csv")
+        raise SystemExit("hcompress.csv is not aligned with rows.csv (chunk order)")
+    if "library" in hc and not (hc.library.to_numpy() == rows.library.to_numpy()).all():
+        raise SystemExit("hcompress.csv is not aligned with rows.csv (library order "
+                         "within a chunk)")
     for label, suffix in [("HCompress CCP (seed only)", "seed"),
                           ("HCompress CCP (+ feedback)", "fb")]:
         out[label] = {

@@ -184,6 +184,65 @@ def build_synthetic(corpus: str, nn: NeuroPressNN):
     return tr, va
 
 
+
+def align_seed_time_convention(seed, nn, mode):
+    """Put the profiler seed's TIME labels in the convention the campaign measures.
+
+    The corpus and the shipped network do not agree about what a compression
+    time is, and the disagreement is not small: the corpus's
+    `compression_time_ms` has log1p mean 3.098 (about 21.4 ms) while the
+    network's own stored `y_means` for that head is 1.347 (about 2.85 ms), and
+    the campaign measures codec kernel time at about 1.56 ms. Seeding HCompress
+    from the raw column therefore starts it 6-7x out in units the campaign never
+    uses, while our own model starts on-target -- so the baseline spends its
+    first chunks correcting an error we handed it, and its seed-only row
+    measures a convention mismatch rather than the model.
+
+    The obvious repair -- recover codec time as time minus per-call overhead --
+    is NOT available: regressing the column on size gives R^2 of 0.000 to 0.027
+    per algorithm with intercepts of 20-32 ms, so the size-dependent part is
+    buried in noise and subtracting the intercept yields negative times. One
+    global factor per head is all this corpus supports, and it is applied here
+    rather than hidden: each time column is scaled so its log1p mean matches the
+    corresponding head of the network both models are being compared against.
+    That removes the offset without inventing a per-codec calibration neither
+    paper specifies.
+
+    `none` keeps the raw columns, which is what earlier campaigns reported.
+    """
+    if mode == "none":
+        print("  seed times: RAW corpus convention (per-call); not the campaign's")
+        return seed
+    out = seed.copy()
+    for col, head in (("ct_ms", 0), ("dt_ms", 1)):
+        v = pd.to_numeric(out[col], errors="coerce")
+        ok = v.notna() & (v > 0)
+        if not ok.any():
+            continue
+        # Match in log1p space, where the head's statistics are stored. The
+        # factor is SOLVED for rather than taken as expm1(want)/expm1(have):
+        # these labels are strongly right-skewed (log1p median 1.36 against a
+        # log1p mean of 3.10), so exponentiating the means overshoots -- it put
+        # the median at 0.39 ms, under both the network's 2.85 and the
+        # campaign's measured 1.56.
+        x = v[ok].to_numpy(dtype=float)
+        want = float(nn.y_means[head])
+        have = float(np.log1p(x).mean())
+        lo, hi = 1e-6, 1e6
+        for _ in range(200):
+            mid = (lo * hi) ** 0.5
+            if float(np.log1p(x * mid).mean()) < want:
+                lo = mid
+            else:
+                hi = mid
+        scale = (lo * hi) ** 0.5
+        out.loc[ok, col] = x * scale
+        print(f"  seed {col}: log1p mean {have:.3f} -> "
+              f"{float(np.log1p(x * scale).mean()):.3f} (target {want:.3f}); "
+              f"x{scale:.4g}; median {np.median(x):.3f} -> "
+              f"{np.median(x) * scale:.3f} ms")
+    return out
+
 def build_workload(campaign: str, wl: str) -> pd.DataFrame:
     base = os.path.join(campaign, wl, wl)
     e = pd.read_csv(os.path.join(base, "explore.csv"))
@@ -249,6 +308,11 @@ def main() -> int:
     ap.add_argument("--campaign", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--workload", action="append", default=None)
+    ap.add_argument("--seed-time-convention", default="nn",
+                    choices=["nn", "none"],
+                    help="nn: rescale the seed's time labels to the convention "
+                         "the shipped network encodes, which is the one the "
+                         "campaign measures. none: the raw per-call columns.")
     ap.add_argument("--nnwt", default="/u/imuradli/clio-core/context-transport-primitives/"
                                      "src/compress/model/weights/model.nnwt")
     a = ap.parse_args()
@@ -260,7 +324,7 @@ def main() -> int:
     # own model was trained on -- the same corpus, the same split, same side.
     cols = ["data_type", "data_format", "library", "distribution", "bytes",
             "ct_ms", "dt_ms", "ratio"]
-    seed = train[cols]
+    seed = align_seed_time_convention(train[cols], nn, a.seed_time_convention)
     seed.to_csv(os.path.join(a.out, "seed.csv"), index=False, float_format="%.9g")
     print(f"  seed.csv: {len(seed)} profiler row(s)")
 

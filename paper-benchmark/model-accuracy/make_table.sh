@@ -4,7 +4,7 @@
 #
 #   ./make_table.sh --corpus CSV --campaign DIR --out DIR
 #                   [--feedback-interval N] [--forget L]
-#                   [--feedback-scope executed|all] [--constant-as NAME]
+#                   [--feedback-scope self|executed|all] [--constant-as NAME]
 #                   [--skip-prepare]
 #
 # Three steps, in order:
@@ -19,7 +19,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-CORPUS="" CAMPAIGN="" OUT="" N=1 FORGET=1.0 SCOPE=executed CONSTANT_AS="" PREPARE=1
+CORPUS="" CAMPAIGN="" OUT="" N=1 FORGET=1.0 SCOPE=self CONSTANT_AS="" PREPARE=1
 SEED=seed.csv TAG="" MAPE_CAP=100   # --seed-file picks the profiler sample
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -41,6 +41,17 @@ done
 [ -n "$OUT" ] || { echo "--out DIR is required" >&2; exit 2; }
 IN=$OUT/inputs
 mkdir -p "$IN"
+
+# Everything this prints is a record of HOW the table was built -- the seed's
+# time rescaling factors, each setting's chunk and row counts, how many rows the
+# baseline was fed and how often its own pick matched the run's. None of that is
+# recoverable from the CSVs afterwards, so the script keeps its own log rather
+# than relying on whoever ran it to capture the terminal.
+LOG=$OUT/make_table${TAG}.log
+exec > >(tee "$LOG") 2>&1
+echo "== make_table.sh $(date -Is)"
+echo "   corpus=${CORPUS:-<skipped>} campaign=${CAMPAIGN:-<skipped>} out=$OUT"
+echo "   interval=$N forget=$FORGET scope=$SCOPE seed=$SEED tag=${TAG:-<none>}"
 
 if [ "$PREPARE" = 1 ]; then
   [ -n "$CORPUS" ] && [ -n "$CAMPAIGN" ] || { echo "--corpus and --campaign are required" >&2; exit 2; }
@@ -76,3 +87,4 @@ python3 "$HERE/accuracy_table.py" --inputs "$IN" --out "$OUT" \
   --tag "${TAG}_unclamped" --hc-suffix "$TAG" --mape-cap "$MAPE_CAP" \
   --no-policy-clamp >/dev/null
 echo "also wrote the no-clamp variant to $OUT"
+echo "log -> $LOG"
