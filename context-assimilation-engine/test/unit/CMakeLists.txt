@@ -370,6 +370,32 @@ endif()
 set_tests_properties(cae_cloud_factory_guard PROPERTIES LABELS "cloud;cae;factory;msan_skip")
 
 #------------------------------------------------------------------------------
+# In-process AWS credential/region resolver (aws_creds.h). Pure functions --
+# env + INI parsing, no runtime, no network, no real ~/.aws -- so it is built
+# hermetically (no CLIO client libs, no live runtime), like cae_hdf5_export.
+# Gated on CAE_ENABLE_S3 because the resolver only matters to the in-process
+# s3:// read path.
+#------------------------------------------------------------------------------
+if(CAE_ENABLE_S3)
+  add_executable(cae_s3_creds_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/aws_creds/test_aws_creds.cc
+  )
+  target_include_directories(cae_s3_creds_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../core/include  # clio_cae/core/factory/aws_creds.h
+    ${CMAKE_SOURCE_DIR}/context-runtime/test         # simple_test.h
+  )
+  target_link_libraries(cae_s3_creds_test PRIVATE
+    ctp::cxx)  # simple_test.h pulls in clio_ctp (malloc allocator)
+  set_target_properties(cae_s3_creds_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+  )
+  add_test(NAME cae_s3_creds COMMAND cae_s3_creds_test)
+  set_tests_properties(cae_s3_creds PROPERTIES TIMEOUT 60 LABELS "cloud;cae;s3")
+  install(TARGETS cae_s3_creds_test DESTINATION bin)
+endif()
+
+#------------------------------------------------------------------------------
 # Test: S3 (s3://) Assimilation (Conditional, self-skips without S3_ENDPOINT)
 #------------------------------------------------------------------------------
 # Seeds an object into an S3-compatible store (MinIO) and imports it through

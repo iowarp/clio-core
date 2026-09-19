@@ -14,11 +14,15 @@ elseif(CLIO_CORE_ENABLE_ROCM)
   list(APPEND BDEV_GPU_LIBS ctp::rocm_cxx)
 endif()
 
+# Amazon S3 transport (kS3). Talks to S3 over HTTPS via Poco with SigV4
+# signing -- NOT the AWS SDK, which cannot be loaded into a process that calls
+# CLIO_INIT (see s3_rest.h). The root CMakeLists auto-disables
+# CLIO_ENABLE_AMAZON_DRIVE if Poco is absent.
 set(BDEV_S3_SOURCES "")
 set(BDEV_S3_LIBS "")
 if(CLIO_ENABLE_AMAZON_DRIVE)
   list(APPEND BDEV_S3_SOURCES src/transports/s3_bdev_transport.cc)
-  list(APPEND BDEV_S3_LIBS aws-cpp-sdk-s3 aws-cpp-sdk-core)
+  list(APPEND BDEV_S3_LIBS Poco::Net Poco::NetSSL Poco::Crypto)
 endif()
 
 # Google Cloud Storage transport (kGcs). Talks to GCS over HTTPS via Poco; the

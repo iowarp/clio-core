@@ -284,6 +284,74 @@ jobs:
         # did not" (#919/#921). Reports only -- never fails the job.
         run: bash CI/report_flaky_tests.sh build-boost/Testing/Temporary/LastTest.log "linux boost ${{ matrix.os }}"
 
+  # ---- S3 bdev (kS3): SigV4 + REST client ------------------------------------
+  # CLIO_ENABLE_AMAZON_DRIVE defaults OFF and no other job turns it on, so
+  # without this job the S3 bdev transport is never compiled in CI and
+  # cr_bdev_s3_rest -- which is registered only under that flag -- never runs
+  # anywhere. cr_bdev_sigv4 does run in the ordinary jobs (it is gated on
+  # Poco_FOUND alone, deliberately, since it is pure string manipulation); it is
+  # repeated here because it is the first thing to check when a signing change
+  # breaks the round trip.
+  #
+  # Neither test touches the network: cr_bdev_sigv4 replays botocore-generated
+  # vectors offline, and cr_bdev_s3_rest is driven by s3_stub_server.py, a
+  # stdlib-only in-memory S3 stand-in on an ephemeral port that verifies SigV4
+  # itself. No AWS account, no credentials, no egress -- so this gates PRs too,
+  # unlike the push-only boost variants above.
+  s3-bdev:
+    name: s3-bdev (sigv4 + rest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Build + test the S3 bdev (inside deps-cpu)
+        run: |
+          # deps-cpu already carries libpoco-dev, libssl-dev and python3, which
+          # is everything this job needs.
+          docker run --rm -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
+            iowarp/deps-cpu:latest bash -c '
+              set -eo pipefail
+              export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+              export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
+              git config --global --add safe.directory /workspace
+              # release, not boost: this job has no reason to pull in
+              # libboost-context-dev. PYTHON=OFF mirrors the boost preset --
+              # the bindings are unrelated here and only slow the configure.
+              cmake --preset release \
+                -DCLIO_ENABLE_AMAZON_DRIVE=ON \
+                -DCLIO_CORE_ENABLE_PYTHON=OFF 2>&1 | tee /tmp/configure.log
+              # Fail loudly if the flag was silently auto-disabled. The root
+              # CMakeLists does a plain `set(CLIO_ENABLE_AMAZON_DRIVE OFF)` when
+              # Poco is missing -- a normal variable that shadows the cache, so
+              # CMakeCache.txt still says ON and cannot be used to detect this.
+              # The STATUS line is emitted only when the flag actually survived.
+              grep -q "Amazon S3 bdev support: ENABLED" /tmp/configure.log || {
+                echo "ERROR: CLIO_ENABLE_AMAZON_DRIVE was disabled during configure (Poco not found?)." >&2
+                exit 1
+              }
+              # clio_bdev_runtime is built for compile coverage of
+              # s3_bdev_transport.cc, which nothing else in CI compiles. The two
+              # test targets do not link it, so it would not be built otherwise.
+              cmake --build build -j"$(nproc)" --target \
+                clio_run_sigv4_test clio_run_s3_rest_test clio_bdev_runtime
+              # No retries: both tests are deterministic and network-free, so a
+              # failure here is a real one.
+              ctest --test-dir build --output-on-failure --timeout 180 \
+                -R "cr_bdev_sigv4|cr_bdev_s3_rest"
+              # ctest exits 0 when a filter matches nothing, which would make a
+              # renamed or dropped test look like a pass. Match the two names
+              # exactly rather than counting lines: -R also pulls in the
+              # cr_pre/post_test_cleanup fixtures, so a raw line count is 4.
+              test "$(ctest --test-dir build -N -R "cr_bdev_sigv4|cr_bdev_s3_rest" \
+                | grep -cE "Test +#[0-9]+: (cr_bdev_sigv4|cr_bdev_s3_rest)$")" -eq 2 || {
+                echo "ERROR: expected both cr_bdev_sigv4 and cr_bdev_s3_rest to be registered." >&2
+                exit 1
+              }
+            '
+
   # ---- Sanitizers: asan / ubsan / msan --------------------------------------
   sanitizers:
     name: sanitizer (${{ matrix.sanitizer }})

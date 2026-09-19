@@ -45,6 +45,26 @@ class Client;
 
 namespace clio::cae::core {
 
+// Forward declaration; defined under CLIO_ENABLE_S3_REST in s3_conn_pool.h.
+class S3ConnectionPool;
+
+/**
+ * Emit the accumulated per-phase latency breakdown for every object this
+ * process assimilated from S3, then reset the accumulators.
+ *
+ * Sibling of S3ConnectionPool::LogTally() and called from the same place --
+ * ~Runtime() -- for the same reason: a tally in a ChiMod kDestroy task method
+ * is unreachable on an ordinary shutdown (#563).
+ *
+ * The figures are LATENCY, not CPU: each phase is wall-clock across its
+ * CLIO_CO_AWAIT, so a suspended coroutine's wait shows up in the phase it was
+ * waiting on. That is the intended reading -- the question these answer is
+ * "where does an object's 2.5 s go", not "which phase burns cycles".
+ *
+ * No-ops when this process assimilated nothing.
+ */
+void S3AssimLogPhaseTally();
+
 /**
  * S3FileAssimilator - Imports an object straight from Amazon S3 (or any
  * S3-compatible endpoint, e.g. MinIO) into CTE.
@@ -62,10 +82,13 @@ namespace clio::cae::core {
 class S3FileAssimilator : public BaseAssimilator {
  public:
   /**
-   * Constructor with CTE client
+   * Constructor with CTE client and optional keep-alive connection pool.
    * @param cte_client Shared pointer to initialized CTE client
+   * @param s3_pool    Long-lived pool of reusable S3 connections (owned by
+   *                   Runtime), or nullptr to connect fresh per object.
    */
-  explicit S3FileAssimilator(std::shared_ptr<clio::cte::core::Client> cte_client);
+  explicit S3FileAssimilator(std::shared_ptr<clio::cte::core::Client> cte_client,
+                             S3ConnectionPool* s3_pool = nullptr);
 
   /**
    * Schedule assimilation tasks for an S3 object
@@ -102,6 +125,7 @@ class S3FileAssimilator : public BaseAssimilator {
   bool ParseS3Url(const std::string& url, std::string& bucket, std::string& key);
 
   std::shared_ptr<clio::cte::core::Client> cte_client_;
+  S3ConnectionPool* s3_pool_ = nullptr;  ///< not owned; may be null
 };
 
 }  // namespace clio::cae::core

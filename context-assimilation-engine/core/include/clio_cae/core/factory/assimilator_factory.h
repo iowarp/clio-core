@@ -42,6 +42,11 @@ namespace clio::cae::core {
 
 // Forward declarations
 class BinaryFileAssimilator;
+// Kept opaque here (defined under CLIO_ENABLE_S3_REST in s3_conn_pool.h): only
+// the S3 assimilator dereferences it, and this header is compiled in all
+// configurations. A null pointer means "no pool" (non-S3 callers, or an S3
+// build that chose not to pool).
+class S3ConnectionPool;
 
 }  // namespace clio::cae::core
 
@@ -58,10 +63,15 @@ namespace clio::cae::core {
 class AssimilatorFactory {
  public:
   /**
-   * Constructor with CTE client
+   * Constructor with CTE client and an optional S3 keep-alive connection pool.
    * @param cte_client Shared pointer to initialized CTE client
+   * @param s3_pool    Long-lived S3 connection pool (owned by Runtime), or
+   *                   nullptr; passed on to the S3 assimilator so cross-object
+   *                   sockets are reused. Ignored by every other assimilator.
    */
-  explicit AssimilatorFactory(std::shared_ptr<clio::cte::core::Client> cte_client);
+  explicit AssimilatorFactory(
+      std::shared_ptr<clio::cte::core::Client> cte_client,
+      S3ConnectionPool* s3_pool = nullptr);
 
   /**
    * Get an assimilator instance for the given source URL
@@ -79,6 +89,7 @@ class AssimilatorFactory {
   std::string GetUrlProtocol(const std::string& url);
 
   std::shared_ptr<clio::cte::core::Client> cte_client_;
+  S3ConnectionPool* s3_pool_ = nullptr;  ///< not owned; may be null
 };
 
 }  // namespace clio::cae::core

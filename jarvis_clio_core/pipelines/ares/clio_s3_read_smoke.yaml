@@ -1,0 +1,449 @@
+# =============================================================================
+# Issue #968 — CLIO S3 READ failure-REPRODUCTION smoke.
+# =============================================================================
+#
+# This is NOT a benchmark. It produces no comparison and no headline number.
+# Its only job is to make the sporadic read failure happen again, often enough
+# and with enough logging attached that we can finally say what causes it.
+#
+# ---------------------------------------------------------------------------
+# WHAT WE KNOW (jobs 23925 + 23930, 72 rows total, combined_23925_23930.csv)
+# ---------------------------------------------------------------------------
+# Four rows failed with "clio_s3 exited 1". ALL FOUR are in the SAME cell:
+#
+#     cell            runs   failures
+#     4m   / 512        18       4      <-- 22%
+#     256m / 8          18       0
+#     32m  / 64         18       0
+#     512k / 4096       18       0
+#
+#   job=23925 run=23 comb=7 rep=2  K=8   4m/512
+#   job=23925 run=24 comb=8 rep=0  K=32  4m/512
+#   job=23925 run=25 comb=8 rep=1  K=32  4m/512
+#   job=23930 run=18 comb=6 rep=0  K=1   4m/512
+#
+# 0 failures in the other 54 rows. The failure spans every concurrency (1, 8,
+# 32) but only one granularity, so CONCURRENCY IS NOT THE AXIS -- granularity
+# is, or something that co-varies with it. This also re-scales the rate: the
+# at-risk population is 18 rows x 512 objects = 9216 objects for 4 observed
+# object-level failures, i.e. ~1 in 2300, not the ~1 in 42000 we got by
+# dividing over the whole grid. That is ~18x more reproducible.
+#
+# WE DO NOT HAVE A CONFIRMED MECHANISM. The leading suspicion is that a
+# response is delivered to the wrong task: the client IPC registry keys pending
+# responses on the task's heap ADDRESS (TaskId::net_key_ =
+# reinterpret_cast<size_t>(ptr), types.h:292), so a reply that outlives its task
+# can land on a later task allocated at the recycled address. Job 23930's log
+# carries one corroborating line -- a single "[CountClientRecv] miss#1: No
+# pending future for net_key 93974002770592" five lines from the only failure --
+# but one line is not a diagnosis. THIS PIPELINE IS BUILT TO GATHER EVIDENCE,
+# NOT TO CONFIRM THAT STORY. It should be equally capable of refuting it.
+#
+# ---------------------------------------------------------------------------
+# HOW THIS PIPELINE IS SHAPED, AND WHY
+# ---------------------------------------------------------------------------
+# 1. THE FAILING CELL RUNS FIRST, AND RUNS FOUR TIMES.
+#    Combos 0-11 are 4m/512 at K=1,8,32, repeated as four blocks. At the
+#    observed 22% per-row rate, 12 rows should yield ~2.6 failures. Putting
+#    them first means an allocation overrun costs the stress tail, never the
+#    reproduction (results.csv is written incrementally).
+#
+# 2. ONE DISCRIMINATOR BLOCK (combos 12-14): 4m at 128 objects instead of 512.
+#    The granularity axis in the parent sweep confounds THREE things at once --
+#    object size, object COUNT, and chunks-per-object (object_size / 1 MiB
+#    kMaxChunkSize). 4m is the only cell where 1 < chunks < kMaxParallelTasks
+#    (4 chunks vs a 32-deep window), so it never fills the in-flight window;
+#    but it is also a middling object count. Holding size at 4m and cutting the
+#    count to 128 separates "4 MiB objects" from "512 objects". If failures
+#    follow the count, it is a turnover/duration effect; if they follow the
+#    size, it is the chunk-window shape.
+#
+# 3. THE REST OF THE GRID FOLLOWS AS STRESS (combos 15-23), one block each at
+#    256m/8, 32m/64, 512k/4096. These are the 54 clean rows. They are here to
+#    keep testing the null -- if one of them fails now, "only 4m" was an
+#    artifact of 72 rows and the whole framing above is wrong. That is a result
+#    worth paying 46 minutes for.
+#
+# 4. CLIO ONLY. zarr_s3 and raw_get are deliberately ABSENT. The failure is
+#    "clio_s3 exited 1"; neither comparator can produce it, and together they
+#    cost ~2/3 of every row's wall time. Dropping them buys 3x the reproduction
+#    attempts per hour. Use clio_s3_read.yaml when you want a comparison.
+#
+# 5. log_level IS SWEPT, not fixed. It rides the granularity axis: "debug" for
+#    the 15 reproduction/discriminator rows, "info" for the 9 stress rows.
+#    THIS IS THE SINGLE MOST IMPORTANT CHANGE IN THIS FILE. Job 23930 ran at
+#    "info", which is why its [CountClientRecv] / [CountSend] counters and the
+#    ipc_cpu2cpu_zmq.cc SendOut re-queue lines -- the exact evidence that would
+#    show a duplicated or late response -- were never written. Debug on the
+#    stress rows too would multiply the log by the 4096-object column for no
+#    reproduction value, hence the split.
+#
+# 6. verify: true. The parent sweep runs verify:false. Here it is the
+#    DISCRIMINATING MEASUREMENT, not a nicety: VerifyTags re-reads each tag's
+#    size from CTE after the timed run. So for a failed object we learn which
+#    of two very different things happened:
+#      - bytes ARE in CTE  -> the assimilation SUCCEEDED and only the REPLY was
+#                             lost/misrouted. That is the false-negative story,
+#                             and it implicates the IPC response path.
+#      - bytes are NOT     -> a real assimilation failure that merely reports
+#                             itself badly. Different bug, different fix.
+#    Two CTE round trips per object, no S3 traffic; ~5 s on a 512-object row.
+#
+# ---------------------------------------------------------------------------
+# BUDGET (from the 72 measured rows, CLIO-only wall time per row)
+# ---------------------------------------------------------------------------
+#     4m/512   K=1 384 s   K=8 277 s   K=32 234 s   -> 895 s per block
+#     4m/128   ~1/4 of the above                    -> ~224 s
+#     256m/8   271 + 189 + 188                      -> 648 s
+#     32m/64   264 + 186 + 185                      -> 635 s
+#     512k/4096 711 + 379 + 386                     -> 1476 s
+#   4 target blocks 3580 + discriminator 224 + stress 2759   = 6563 s
+#   + 24 runtime start/stop cycles (~35 s)                   =  840 s
+#   + debug-logging overhead on 15 rows (assume +30%)        = ~1141 s
+#                                                      TOTAL ~ 8544 s = 2 h 23 m
+#   time: 04:00:00 leaves ~68% headroom. Do not trim it to "save queue time" --
+#   a truncated smoke that stops before a failure teaches nothing.
+#
+# DISK: 15 rows at debug on a stack that already wrote 190k lines at info. The
+# scheduler .out/.err can plausibly reach several GB. pre_cmds asserts free
+# space in $HOME up front rather than dying at row 9; post_cmds extracts a
+# SMALL summary file so nobody has to move a multi-GB log to read the result.
+#
+# CAVEAT ON LOGS: clio_runtime's clean() deletes {shared_dir}/clio_run.log at
+# teardown (clio_runtime/pkg.py:547), so the per-row daemon log does NOT
+# survive the row. The durable record is the scheduler .out/.err pair, which is
+# what job 23930's line-187531 grep came from. post_cmds reads those.
+#
+# Identity is deliberately distinct from the sweep and the probe -- own
+# job_name, hostfile and results dir -- because the scheduler hostfile path is
+# keyed on pipeline name, and two same-named jobs in flight corrupt each
+# other's later iterations (diagnosed on jobs 23911 + 23912). Run it with
+# nothing else of this family queued: check `squeue -u $USER` first.
+#
+# Usage (identical env to the sweep):
+#   export S3_BENCH_BUCKET=my-bucket S3_BENCH_PROFILE=clio-bench
+#   export IOWARP_VIEW=/mnt/common/$USER/iowarp-s3-view
+#   jarvis ppl submit <abs path>/clio_s3_read_smoke.yaml
+#
+#   pre_cmds expand when the JOB runs, so export any overrides BEFORE submitting.
+#
+scheduler:
+  name: slurm
+  job_name: clio_s3_smoke
+  nodes: 1
+  ntasks_per_node: 1
+  # Must stay large: Ares Slurm uses proctrack/cgroup with ConstrainCores, and
+  # a narrow cgroup silently caps the runtime's effective worker count, which
+  # would change the very concurrency behaviour we are trying to reproduce.
+  cpus_per_task: 40
+  partition: compute
+  time: "04:00:00"
+  output: ${HOME}/clio_s3_smoke-%j.out
+  error: ${HOME}/clio_s3_smoke-%j.err
+  # MUST stay literally identical to config.hostfile below.
+  hostfile: "${HOME}/.jarvis-s3-bench/clio_s3_smoke_hostfile.txt"
+  pre_cmds:
+    # 1) Toolchain. Pure PATH prepends -- never `spack load` / `conda activate`
+    #    (they install shell functions that misbehave under `set -euo pipefail`).
+    - 'export PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/bin:${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"'
+    - 'export LD_LIBRARY_PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib:${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib64:${LD_LIBRARY_PATH:-}"'
+    - 'command -v clio_run           >/dev/null 2>&1 || { echo "ERROR: clio_run not on PATH (view: ${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view})" >&2; exit 1; }'
+    - 'command -v clio_s3_read_bench >/dev/null 2>&1 || { echo "ERROR: clio_s3_read_bench not on PATH — was IOWarp built with +cae +s3_cae?" >&2; exit 1; }'
+    - 'command -v jarvis             >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
+    - 'echo "toolchain: clio_run=$(command -v clio_run) bench=$(command -v clio_s3_read_bench) jarvis=$(command -v jarvis)"'
+    # NOTE: no zarr venv check and no cae_s3_tool check -- this pipeline runs
+    # neither comparator. Keep it that way; adding them back would re-import
+    # 2/3 of the wall time this smoke exists to spend on repetitions instead.
+    # 1b) CAE runtime link gate. Assert the installed library is the in-process
+    #     (Poco+SigV4, no AWS SDK) build, and that it post-dates the port -- a
+    #     `spack develop` tree does NOT rebuild on `git pull`, so run
+    #     `spack install iowarp@dev` after every pull or this smoke measures a
+    #     stale binary and every conclusion from it is void.
+    - |
+      echo "cae gate: host=$(hostname -s) time=$(date -Is)"
+      CLIO_RUN_BIN="$(command -v clio_run || true)"
+      LIB="${CLIO_RUN_BIN%/bin/clio_run}/lib/libclio_cae_core_runtime.so"
+      [ -f "$LIB" ] || LIB="${LIB%/lib/*}/lib64/libclio_cae_core_runtime.so"
+      [ -f "$LIB" ] || { echo "ERROR: libclio_cae_core_runtime.so not found under the install root" >&2; exit 1; }
+      echo "cae gate: lib -> $(readlink -f "$LIB" 2>&1 || true)"
+      LDD_OUT="$(ldd "$LIB" 2>&1)" || { echo "ERROR: ldd failed on $LIB:" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1; }
+      printf '%s\n' "$LDD_OUT" | grep -q PocoNetSSL || { echo "ERROR: $LIB has no Poco NetSSL — CAE built without the in-process S3 path?" >&2; exit 1; }
+      printf '%s\n' "$LDD_OUT" | grep -q aws-cpp-sdk && { echo "ERROR: $LIB links the AWS SDK — that stack-smashes runtime init" >&2; exit 1; }
+      KA_RC=0
+      KA_COUNT="$(grep -acF "CAE S3 keepalive" "$LIB")" || KA_RC=$?
+      echo "cae gate: keepalive tally matches = ${KA_COUNT:-0} (grep rc=$KA_RC)"
+      [ "$KA_RC" -le 1 ] || { echo "ERROR: could not read $LIB (grep exit $KA_RC)" >&2; exit 1; }
+      [ "${KA_COUNT:-0}" -ge 1 ] || {
+        echo "ERROR: $LIB PREDATES the in-process persistent-connection read path." >&2
+        echo "  Rebuild first:  spack install iowarp@dev" >&2
+        exit 1; }
+      echo "cae link check OK: $LIB (Poco present, no AWS SDK, CAE keepalive tally present)"
+    # 1c) Record the build under test. A reproduction attempt that cannot name
+    #     the binary it ran against is not evidence. Print the git description
+    #     of the source tree spack developed from, if it is reachable.
+    - |
+      SRC="${CLIO_REPO:-$HOME/clio-core}"
+      if [ -d "$SRC/.git" ]; then
+        echo "build under test: $(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown) \
+      on $(git -C "$SRC" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+        git -C "$SRC" status --porcelain 2>/dev/null | head -5
+      else
+        echo "build under test: source tree $SRC not found (cannot record revision)"
+      fi
+    # 2) AWS credentials. NO SECRETS IN THIS FILE. Credentials live in
+    #    ~/.aws/credentials (mode 600). Only non-secret profile and region names
+    #    appear here.
+    - 'export AWS_PROFILE="${S3_BENCH_PROFILE:-clio-bench}"'
+    - 'export AWS_DEFAULT_REGION="${S3_BENCH_REGION:-us-east-1}"'
+    # Real AWS: an endpoint override flips addressing to path-style against a
+    # nonexistent host, so both must stay unset.
+    - 'unset S3_ENDPOINT AWS_ENDPOINT_URL'
+    - '[ -r "$HOME/.aws/credentials" ] || { echo "ERROR: ~/.aws/credentials missing/unreadable" >&2; exit 1; }'
+    - '[ -n "${S3_BENCH_BUCKET:-}" ] || { echo "ERROR: S3_BENCH_BUCKET not set" >&2; exit 1; }'
+    - 'export TMPDIR=/tmp/clio_s3_bench; mkdir -p "$TMPDIR"'
+    # 2b) Debug logging needs room. 15 of 24 rows run at debug on a stack that
+    #     already produced ~190k lines per job at info. Fail NOW with a clear
+    #     message rather than at row 9 with a truncated log and a wasted
+    #     allocation. 20 GiB is a deliberate over-ask; lower it only after a
+    #     run tells you the real figure.
+    - |
+      AVAIL_KB="$(df -Pk "$HOME" | awk 'NR==2 {print $4}')"
+      echo "free space in \$HOME: $((AVAIL_KB / 1024 / 1024)) GiB"
+      [ "$AVAIL_KB" -ge 20971520 ] || {
+        echo "ERROR: need >= 20 GiB free in \$HOME for debug-level logs; have $((AVAIL_KB / 1024 / 1024)) GiB" >&2
+        echo "  Either free space or drop runtime.log_level to info in this file (and lose the counters)." >&2
+        exit 1; }
+    # 3) Stale-state cleanup. pkill patterns are BRACKETED so they never match
+    #    this script's own argv.
+    - 'pkill -9 -f "[c]himaera" 2>/dev/null || true'
+    - 'pkill -9 -f "[c]lio_run" 2>/dev/null || true'
+    - '{ command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true'
+    - 'rm -f /dev/shm/chi_* 2>/dev/null || true'
+    - 'rm -rf "$TMPDIR"/cae_s3_* /tmp/iowarp_chi* 2>/dev/null || true'
+    # 4) Experiment dirs + repo registration + clean slate (the runner RESUMES
+    #    over an existing results.csv and would skip the very rows we want).
+    - 'mkdir -p "$HOME/clio_s3_smoke_results" "$HOME/.jarvis-s3-bench"'
+    - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true'
+    - 'rm -f "$HOME/clio_s3_smoke_results/results.csv"'
+  post_cmds:
+    - 'RES="$HOME/clio_s3_smoke_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 24"'
+    # ---- Row-level verdict -------------------------------------------------
+    # Which rows failed, and were they the predicted cell? A green row with a
+    # blank throughput column is also a failure and is asserted here rather than
+    # left to manual inspection.
+    - |
+      python3 - "$HOME/clio_s3_smoke_results/results.csv" <<'EOF'
+      import csv, os, sys
+      from collections import defaultdict
+      path = sys.argv[1]
+      if not os.path.exists(path):
+          print("NO RESULTS CSV AT", path); sys.exit(0)
+      rows = list(csv.DictReader(open(path)))
+      print("rows:", len(rows))
+      need = ["clio_s3.read.agg_bw_mbps"]
+      blank = [r.get("run_idx") for r in rows
+               if r.get("status") == "success" and any(not r.get(c) for c in need)]
+      print("GREEN ROWS WITH BLANK THROUGHPUT (== FAILURES):", blank or "none")
+      cell = defaultdict(lambda: [0, 0])
+      for r in rows:
+          k = (r.get("clio_s3.object_size"), r.get("clio_s3.num_objects"),
+               r.get("clio_s3.concurrency"))
+          cell[k][0] += 1
+          if r.get("status") != "success":
+              cell[k][1] += 1
+      print()
+      print(f"{'size':>6} {'nobj':>5} {'K':>3} {'runs':>5} {'fail':>5}")
+      for k in sorted(cell, key=lambda x: (x[0] or '', int(x[2] or 0))):
+          v = cell[k]
+          print(f"{k[0] or '?':>6} {k[1] or '?':>5} {k[2] or '?':>3} {v[0]:>5} {v[1]:>5}")
+      print()
+      print("=== failed rows ===")
+      for r in rows:
+          if r.get("status") != "success":
+              print(f"  run={r.get('run_idx')} comb={r.get('combination_idx')} "
+                    f"K={r.get('clio_s3.concurrency')} nobj={r.get('clio_s3.num_objects')} "
+                    f"size={r.get('clio_s3.object_size')} err={r.get('error')}")
+      EOF
+    # ---- Evidence extraction ----------------------------------------------
+    # The scheduler .out/.err pair is the durable log (clio_run.log is deleted
+    # per row by clio_runtime.clean()). Pull the handful of lines that matter
+    # into ONE SMALL FILE so the run can be read -- and pasted -- without moving
+    # gigabytes. Every pattern here is load-bearing:
+    #   ParseOmni failed       the failure itself, with all four codes
+    #   [CountClientRecv]      a response with no pending future (the miss#1 line)
+    #   [CountSend]            send_fail_counter -- retried/re-queued responses
+    #   re-queueing            the ZMQ EAGAIN retry path in ipc_cpu2cpu_zmq.cc
+    #   No pending future      the same miss, matched independently of the tag
+    #   Verify:                did the bytes actually land in CTE? (the bench
+    #                          logs "Verify: ..." from VerifyTags)
+    #   keepalive TOTAL        socket reuse actually happened
+    #   phase TOTAL            per-phase latency breakdown
+    #   [#785]                 the worker stall/lane-rescue family -- "adopted
+    #                          lane", "lane rescues performed", "spawned elastic
+    #                          worker", "lost a task re-queuing during rescue".
+    #                          A stall+rescue immediately preceded 23930's only
+    #                          failure, so this is not optional colour.
+    - |
+      SUM="$HOME/clio_s3_smoke_results/evidence-${SLURM_JOB_ID:-unknown}.txt"
+      : > "$SUM"
+      LOGS=""
+      for f in "$HOME"/clio_s3_smoke-${SLURM_JOB_ID:-*}.out "$HOME"/clio_s3_smoke-${SLURM_JOB_ID:-*}.err; do
+        [ -f "$f" ] && LOGS="$LOGS $f"
+      done
+      if [ -z "$LOGS" ]; then
+        echo "NO SCHEDULER LOGS FOUND -- looked for \$HOME/clio_s3_smoke-${SLURM_JOB_ID:-*}.{out,err}" | tee -a "$SUM"
+      else
+        echo "=== evidence extracted from:$LOGS ===" | tee -a "$SUM"
+        for f in $LOGS; do
+          echo "  $f  ($(wc -l < "$f") lines, $(du -h "$f" | cut -f1))" | tee -a "$SUM"
+        done
+        # -F throughout: every pattern below is a LITERAL. "[#785]" and
+        # "[CountClientRecv]" are bracket expressions to a regex grep and would
+        # silently match the wrong thing (or nothing) without it.
+        for pat in "ParseOmni failed" "[CountClientRecv]" "[CountSend]" "re-queueing" \
+                   "No pending future" "Verify:" "keepalive TOTAL" \
+                   "phase TOTAL" "[#785]"; do
+          echo "" >> "$SUM"
+          echo "----- grep -nF '$pat' -----" >> "$SUM"
+          # Cap each pattern so one chatty match cannot bloat the summary.
+          grep -nHF -- "$pat" $LOGS 2>/dev/null | head -200 >> "$SUM" || true
+          c=$(grep -chF -- "$pat" $LOGS 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          echo "  (total matches: ${c:-0})" >> "$SUM"
+        done
+        echo "" | tee -a "$SUM"
+        echo "evidence summary written to: $SUM ($(wc -l < "$SUM") lines)" | tee -a "$SUM"
+      fi
+    - 'echo "NEXT: paste $HOME/clio_s3_smoke_results/evidence-*.txt and results.csv"'
+
+config:
+  name: clio_s3_smoke
+
+  # MUST stay literally identical to scheduler.hostfile above.
+  hostfile: "${HOME}/.jarvis-s3-bench/clio_s3_smoke_hostfile.txt"
+
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 16          # SWEPT with concurrency
+      client_data_segment_size: "4G"
+      port: 9413
+      # IPC (unix socket), NOT shm: the benchmark is a detached client, not a
+      # descendant of the runtime daemon, and Ares compute nodes run
+      # ptrace_scope=1, which denies the /proc reopen SHM mode needs.
+      #
+      # THIS ALSO FIXES THE CODE PATH UNDER TEST. ipc_mode "ipc" means the live
+      # client transport is IpcCpu2CpuZmq + IpcManager::RecvZmqClientThread --
+      # the SHM twin (IpcCpu2Cpu, DrainShmResponses) is dead code in these jobs.
+      # Do not switch this to shm "to compare": that would exercise a different
+      # transport and tell us nothing about the failure we are chasing.
+      ipc_mode: "ipc"
+      # SWEPT with granularity: debug for the reproduction rows, info for the
+      # stress tail. See point 5 in the header -- job 23930 ran entirely at info
+      # and that is precisely why its response-path counters are missing.
+      log_level: "debug"
+      # SWIM off: transient errors must not promote a peer to dead mid-run.
+      swim_enabled: false
+      sleep: 4
+
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      # 24 GB is ~12x the 2 GiB working set, so a row never spills or evicts.
+      # Keep it that way: an eviction mid-row would add a second explanation
+      # for a failed object and cost us the discrimination.
+      devices:
+        - ["ram::cte_ram_tier1", "24GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      pool_query: "local"
+
+    - pkg_type: jarvis_clio_core.clio_s3_bench
+      pkg_name: clio_s3
+      mode: read
+      bucket: "${S3_BENCH_BUCKET}"
+      key_prefix: "clio-s3-read-bench/raw/4194304"    # SWEPT
+      object_size: "4m"                               # SWEPT
+      num_objects: 512                                # SWEPT
+      concurrency: 8                                  # SWEPT
+      worker_threads: 16                              # SWEPT (reported only)
+      tag_prefix: "s3smoke"
+      tmpdir: "/tmp/clio_s3_bench"
+      aws_region: "${S3_BENCH_REGION}"
+      aws_profile: "${S3_BENCH_PROFILE}"
+      # THE DISCRIMINATOR -- see point 6 in the header. Re-reads each tag's size
+      # from CTE after the timed run, so a failed object can be classified as
+      # "bytes landed, reply lost" (IPC response path) vs "bytes missing" (a
+      # real assimilation failure). Costs 2 CTE round trips per object and no
+      # S3 traffic. The parent sweep leaves this false because it perturbs
+      # timing; here correctness of diagnosis outranks timing fidelity.
+      verify: true
+
+vars:
+  # --- Granularity axis. Zipped, length 8. ORDER IS THE POINT. ---
+  #
+  #   idx 0-3  4m / 512   debug   the failing cell, four blocks (12 rows)
+  #   idx 4    4m / 128   debug   discriminator: same size, 1/4 the objects
+  #   idx 5-7  the clean cells    info    stress / null check
+  #
+  # The four identical 4m/512 entries are NOT a mistake and must not be
+  # "tidied" into `repeat: 4`. repeat multiplies EVERY combination, which would
+  # also quadruple the 512k/4096 column -- the most expensive and least
+  # informative one -- and push the job past its allocation. Repeating the
+  # entry here weights only the cell we care about.
+  #
+  # Chunks per object = object_size / 1 MiB (kMaxChunkSize), against a
+  # kMaxParallelTasks=32 in-flight window:
+  #   256m -> 256 chunks (window fills, steady-state wait-and-pop)
+  #   32m  ->  32 chunks (fills exactly once, drained by the tail loop)
+  #   4m   ->   4 chunks (NEVER fills; the only cell with 1 < chunks < 32)
+  #   512k ->   1 chunk  (single task, no window at all)
+  clio_s3.key_prefix: ["clio-s3-read-bench/raw/4194304",
+                       "clio-s3-read-bench/raw/4194304",
+                       "clio-s3-read-bench/raw/4194304",
+                       "clio-s3-read-bench/raw/4194304",
+                       "clio-s3-read-bench/raw/4194304",
+                       "clio-s3-read-bench/raw/268435456",
+                       "clio-s3-read-bench/raw/33554432",
+                       "clio-s3-read-bench/raw/524288"]
+  clio_s3.object_size: ["4m", "4m", "4m", "4m", "4m", "256m", "32m", "512k"]
+  # 128 at idx 4 reads obj_000000..obj_000127 out of the 512 staged at this
+  # prefix -- a prefix holds exactly 2 GiB / object_size objects, so asking for
+  # FEWER is always safe and asking for more is not.
+  clio_s3.num_objects: [512, 512, 512, 512, 128, 8, 64, 4096]
+  runtime.log_level:  ["debug", "debug", "debug", "debug", "debug",
+                       "info", "info", "info"]
+
+  # --- Concurrency axis. Zipped, length 3. ---
+  # All three are kept even though the failure spans all three: that is exactly
+  # why they must stay. Concurrency was ruled OUT as the axis by the 72 rows,
+  # so dropping it would remove the control that established that.
+  #
+  # runtime.num_threads rides along because the S3 assimilator blocks a runtime
+  # worker for the whole in-process GET: with too few workers, raising CLIO's
+  # concurrency buys nothing. clio_s3.worker_threads mirrors the value into the
+  # fairness columns so every row records the confound.
+  clio_s3.concurrency:    [1, 8, 32]
+  runtime.num_threads:    [4, 16, 48]
+  clio_s3.worker_threads: [4, 16, 48]
+
+loop:
+  # Granularity is the OUTER dimension and concurrency the INNER one, so the
+  # emitted order is combo 0 = 4m/512/K=1, 1 = K=8, 2 = K=32, 3 = block two...
+  # That keeps all twelve reproduction rows contiguous at the front.
+  - [clio_s3.key_prefix, clio_s3.object_size, clio_s3.num_objects,
+     runtime.log_level]
+  - [clio_s3.concurrency, runtime.num_threads, clio_s3.worker_threads]
+
+# Per-combination wall-clock backstop. Expiry marks the row failed and the run
+# continues, so one wedged row cannot cost the other 23.
+#
+# 1800 is set from measurement: the slowest row here is 512k/K=1 at ~711 s
+# CLIO-only (72-row mean), and this pipeline drops the two comparators that
+# forced the parent sweep's 5400. 1800 leaves ~2.5x on that worst cell, which
+# also covers the debug-logging slowdown on the 4m rows (max ~384 s at K=1).
+run_timeout: 1800
+
+# repeat stays 1 ON PURPOSE. Repetition of the cell under test is expressed in
+# the granularity list above, where it can be targeted; repeat: N would
+# multiply the stress tail too. See the note on the granularity axis.
+repeat: 1
+output: "${HOME}/clio_s3_smoke_results"
