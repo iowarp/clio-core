@@ -130,9 +130,13 @@ def one_declarator(s):
     # DECLARATOR, not the type: `const float *rp0[9], *rp1[9];` splits into
     # two statements that each keep their star. lammps_md is full of these.
     decl = r"\**\s*[A-Za-z_]\w*(?:\[[^\]]*\])*(?:\s*=\s*[^;,]+)?"
+    # The type may be several words -- `unsigned long long q = 0, ck = 0;`
+    # is the shape that regressed gmx when this pattern allowed only one
+    # `unsigned`/`signed` before the base name.
+    ty = (r"(?:const\s+|volatile\s+|unsigned\s+|signed\s+|long\s+|short\s+)*"
+          r"[A-Za-z_][\w:]*(?:<[^;]*?>)?")
     return re.sub(
-        r"^([ \t]+)((?:const )?(?:unsigned |signed )?"
-        r"(?:[A-Za-z_][\w:]*(?:<[^;]*?>)?))[ \t]+"
+        r"^([ \t]+)(" + ty + r")[ \t]+"
         r"(" + decl + r"(?:\s*,\s*" + decl + r")+)\s*;$",
         fix, s, flags=re.M)
 

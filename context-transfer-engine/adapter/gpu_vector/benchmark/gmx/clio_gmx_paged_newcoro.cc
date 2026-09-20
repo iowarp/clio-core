@@ -200,7 +200,8 @@ CTP_GPU_FUN CLIO_COROC_INLINE void SumCoro(gv::DeviceVector<unsigned long long> 
   for (u64 z = z0; z < z1; ++z) {
     CO_AWAIT(mesh.CoFetch(0, z * plane, plane));
     auto h = CO_AWAIT(mesh.CoHoldPage(z * plane, plane, /*write=*/false));
-    unsigned long long q = 0, ck = 0;
+    unsigned long long q = 0;
+    unsigned long long ck = 0;
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
       const unsigned long long v = h[z * plane + i];
       q += v;

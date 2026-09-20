@@ -31,7 +31,11 @@ DEFS="-DCTP_ENABLE_SYCL=1 -DCTP_ENABLE_CUDA=0 -DCLIO_COROC -DCLIO_RUNTIME=1
       -DCTP_ENABLE_COMPRESS=0 -DCTP_ENABLE_NVCOMP=0 -DCTP_ENABLE_CUSZ=0
       -DCTP_ENABLE_CUSZP=0 -DCTP_ENABLE_LIBPRESSIO=0 -DCTP_ENABLE_NDZIP=0
       -DCTP_ENABLE_ZFP_SYCL=0 -DCTP_ENABLE_BLOSC2=0"
-SYCLT="-fsycl -fsycl-targets=nvptx64-nvidia-cuda
+# ONE DEVICE IMAGE. yield_stack.h keeps its smem base in a device_global
+# with device_image_scope, and DPC++ splits a TU with many kernels into
+# several images -- which that property forbids. lammps_md has enough
+# kernels to trip it; the others do not.
+SYCLT="-fsycl -fsycl-device-code-split=off -fsycl-targets=nvptx64-nvidia-cuda
        -Xsycl-target-backend --cuda-gpu-arch=sm_120
        --cuda-path=/usr/local/cuda-13.2 -Wno-unknown-cuda-version"
 

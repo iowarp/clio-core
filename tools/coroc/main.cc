@@ -629,6 +629,28 @@ class Transpiler {
     }
   }
 
+  /**
+   * Is this hoist re-derived on every entry rather than saved?
+   *
+   * Two kinds are:
+   *
+   *   A REFERENCE, which cannot be value-initialised above the switch and
+   *   assigned later, and does not need to be: it is a name for something
+   *   else, and the something else survives the park.
+   *
+   *   A MACRO-EXPANDED declaration, because the strip cannot take it apart.
+   *   Replacing "everything up to the name" collapses to the whole macro
+   *   invocation, so `MD_RED_SCRATCH(red)` became the statement `red;` and
+   *   the pointer stayed null -- which surfaced as an 8-byte write to
+   *   0x200 from thread 64, i.e. `red[threadIdx.x]` through a null base.
+   *   Both macros this applies to bind into shared memory, which does not
+   *   survive a park anyway, so re-deriving is also the correct semantics.
+   */
+  bool IsRederived(const VarDecl *vd) const {
+    return vd->getType()->isReferenceType() ||
+           vd->getLocation().isMacroID();
+  }
+
   /** The name a hoisted declaration ended up with. */
   std::string HoistName(const VarDecl *vd) const {
     auto it = renamed_.find(vd);
@@ -833,8 +855,8 @@ class Transpiler {
                                            : p->getName().str());
     }
     for (const VarDecl *vd : fi.hoisted) {
-      // A re-derived reference is not carried across the park; see EmitBody.
-      if (vd->getType()->isReferenceType()) continue;
+      // A re-derived declaration is not carried across the park.
+      if (IsRederived(vd)) continue;
       names.push_back(HoistName(vd));
     }
     return names;
@@ -886,6 +908,10 @@ class Transpiler {
      * use so far derives from a parameter or a global.
      */
     for (const VarDecl *vd : fi.hoisted) {
+      // Only a REFERENCE must have one: a macro can expand to several
+      // declarations and not all of them are initialised --
+      // MD_RED_SCRATCH declares `extern __shared__ char smem_raw[]` and
+      // then the pointer into it.
       if (!vd->getType()->isReferenceType()) continue;
       if (vd->getInit() == nullptr) {
         Error(vd->getLocation(), "a reference across a CO_AWAIT needs an "
@@ -950,9 +976,18 @@ class Transpiler {
     }
     // Re-derived names come first: they are what the value hoists may be
     // initialised from, never the other way round.
+    // ONE INVOCATION PER MACRO, not one per variable it declares.
+    // MD_RED_SCRATCH declares both `smem_raw` and `red`, so both are
+    // hoisted and both map back to the same expansion -- emitting it
+    // twice redeclares everything in it. nvcc tolerated that; SYCL,
+    // where the macro expands to a single declaration, did not.
+    std::set<unsigned> emitted;
     for (const VarDecl *vd : fi.hoisted) {
-      if (!vd->getType()->isReferenceType() || vd->getInit() == nullptr) {
-        continue;
+      if (!IsRederived(vd)) continue;
+      if (vd->getLocation().isMacroID()) {
+        const unsigned at = sm_.getFileOffset(
+            sm_.getExpansionLoc(vd->getLocation()));
+        if (!emitted.insert(at).second) continue;
       }
       // A macro-expanded declaration must be moved as the INVOCATION, not
       // as the declarator: the declarator's spelling lives in the macro
@@ -969,7 +1004,7 @@ class Transpiler {
     }
     for (const std::vector<const VarDecl *> *group : {&written, &deduced}) {
       for (const VarDecl *vd : *group) {
-        if (vd->getType()->isReferenceType()) continue;
+        if (IsRederived(vd)) continue;
         // Value-initialized, not vacuous: the dispatch shape defeats
         // definite-assignment analysis, so a bare declaration draws
         // -Wmaybe-uninitialized even where it is provably assigned. Legal
@@ -1027,7 +1062,7 @@ class Transpiler {
       // strip that ends at the name leaves `[4];` behind as a statement.
       // An array has nowhere to put an initializer in the hoisted form
       // anyway, so the whole declaration goes.
-      if (vd->getType()->isReferenceType()) {
+      if (IsRederived(vd)) {
         // Moved wholesale, initializer and all, so nothing stays behind.
         Replace(rw_, ds->getSourceRange(), "(void)" + name + ";");
         continue;
