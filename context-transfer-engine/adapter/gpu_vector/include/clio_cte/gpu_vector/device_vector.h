@@ -728,8 +728,13 @@ class DeviceVector {
 
   /** Wait for the outstanding CoBeginFetch and publish its pages. */
   CTP_GPU_FUN void CoAwaitFetch() {
-    FetchWait w = FetchWait{this};
-    CO_AWAIT(w.Take());
+    // A TEMPORARY, not a named local. A named awaiter is an ordinary
+    // hoist: declared value-initialised above the switch and assigned
+    // at its original site -- so `v` is null when the park guard calls
+    // Ready() on the way in, and FlushBusy() dereferences it. The
+    // transpiler gives a temporary its own awaiter slot and assigns it
+    // immediately before the case label, which is the designed shape.
+    CO_AWAIT(FetchWait{this}.Take());
     if (threadIdx.x == 0 && FetchBusy()) PublishFetch();
     __syncthreads();
   }
@@ -766,8 +771,7 @@ class DeviceVector {
     for (;;) {
       if (!__syncthreads_or(p == nullptr ? 1 : 0)) break;
       if (!__syncthreads_or(FindClaimed(pn) != nullptr ? 1 : 0)) break;
-      OnceWait once = OnceWait{0};
-      CO_AWAIT(once.Take());
+      CO_AWAIT(OnceWait{0}.Take());
       p = Find(pn);
     }
     if (__syncthreads_or(p == nullptr ? 1 : 0)) {
@@ -825,8 +829,7 @@ class DeviceVector {
     clio::run::u64 rhi[kMaxFetchRanges];
     clio::run::u32 nr = 0;
     GatherRanges(rlo, rhi, nr, off, count, rest...);
-    FlushWait w = FlushWait{this};
-    CO_AWAIT(w.Take());
+    CO_AWAIT(FlushWait{this}.Take());
     if (threadIdx.x == 0) {
       if (FlushBusy()) RetireFlush();
       SubmitFlushRanges(rlo, rhi, nr);
@@ -836,8 +839,7 @@ class DeviceVector {
 
   /** Wait for the writeback started by CoBeginFlush. */
   CTP_GPU_FUN void CoEndFlush() {
-    FlushWait w = FlushWait{this};
-    CO_AWAIT(w.Take());
+    CO_AWAIT(FlushWait{this}.Take());
     if (threadIdx.x == 0 && FlushBusy()) RetireFlush();
     __syncthreads();
   }
