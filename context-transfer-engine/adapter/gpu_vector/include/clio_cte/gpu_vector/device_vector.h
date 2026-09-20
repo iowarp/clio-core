@@ -734,7 +734,7 @@ class DeviceVector {
 
   /** Wait for the outstanding CoBeginFetch and publish its pages. */
   CTP_GPU_FUN void CoAwaitFetch() {
-    FetchWait w{this};
+    FetchWait w = FetchWait{this};
     CO_AWAIT(w.Take());
     if (threadIdx.x == 0 && FetchBusy()) PublishFetch();
     __syncthreads();
@@ -755,8 +755,12 @@ class DeviceVector {
    * `if (p == nullptr)` around a barrier would put part of the block into a
    * __syncthreads the rest never reaches.
    */
+  // NO DEFAULT ARGUMENT. clio-coroc appends the context to the END of the
+  // parameter list, so a defaulted parameter before it produces
+  // `(..., bool write = false, Ctx &_cy)`, which is ill-formed. Callers
+  // spell `write` out.
   CTP_GPU_FUN PageRef<T> CoHoldPage(clio::run::u64 off, clio::run::u64 count,
-                                    bool write = false) {
+                                    bool write) {
     const clio::run::u64 pn = PageOf(off);
     Page *p = Find(pn);
     if (__syncthreads_or(p == nullptr ? 1 : 0)) {
@@ -768,7 +772,7 @@ class DeviceVector {
     for (;;) {
       if (!__syncthreads_or(p == nullptr ? 1 : 0)) break;
       if (!__syncthreads_or(FindClaimed(pn) != nullptr ? 1 : 0)) break;
-      OnceWait once{0};
+      OnceWait once = OnceWait{0};
       CO_AWAIT(once.Take());
       p = Find(pn);
     }
@@ -801,7 +805,19 @@ class DeviceVector {
         __trap();
       }
     }
-    Held<T> h = Pin(p, off, count, write);
+    // NO NAMED Held LOCAL. Every declaration in a block that contains a
+    // CO_AWAIT is hoisted to function scope and joins the save list, and
+    // Held has a destructor, so naming it here trips R6 even though it dies
+    // before any suspend. A temporary has no declaration to hoist.
+    return AsPageRef(Pin(p, off, count, write), p);
+  }
+
+  /** Narrow a Held guard to the trivially copyable view a suspend can
+   *  carry. Not suspending, so its parameter is never saved.
+   *  @param h the guard Pin() produced
+   *  @param p the frame it resolved to
+   *  @return the same range, as a PageRef */
+  CTP_GPU_FUN static PageRef<T> AsPageRef(Held<T> h, Page *p) {
     return PageRef<T>{h.ptr(), p, h.begin_off(), h.run()};
   }
 
@@ -815,7 +831,7 @@ class DeviceVector {
     clio::run::u64 rhi[kMaxFetchRanges];
     clio::run::u32 nr = 0;
     GatherRanges(rlo, rhi, nr, off, count);
-    FlushWait w{this};
+    FlushWait w = FlushWait{this};
     CO_AWAIT(w.Take());
     if (threadIdx.x == 0) {
       if (FlushBusy()) RetireFlush();
@@ -826,7 +842,7 @@ class DeviceVector {
 
   /** Wait for the writeback started by CoBeginFlush. */
   CTP_GPU_FUN void CoEndFlush() {
-    FlushWait w{this};
+    FlushWait w = FlushWait{this};
     CO_AWAIT(w.Take());
     if (threadIdx.x == 0 && FlushBusy()) RetireFlush();
     __syncthreads();

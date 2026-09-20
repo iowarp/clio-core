@@ -637,7 +637,18 @@ class Transpiler {
     const bool written_auto =
         tsi != nullptr && !tsi->getTypeLoc().getAs<AutoTypeLoc>().isNull();
     if (!written_auto) {
-      return Text(sm_, lo_, tsi->getTypeLoc().getSourceRange());
+      // AN ARRAY DECLARATOR'S TypeLoc SPANS THE NAME. `T x[4]` is written
+      // with the extent after the identifier, so the source range of the
+      // type runs from `T` to `]` and copying it verbatim re-emits the name
+      // -- observed as `T hz[4] hz[4]{};`. Descend to the element type and
+      // let ArrayExtent put the brackets back.
+      TypeLoc tl = tsi->getTypeLoc();
+      for (;;) {
+        ArrayTypeLoc atl = tl.getAs<ArrayTypeLoc>();
+        if (atl.isNull()) break;
+        tl = atl.getElementLoc();
+      }
+      return Text(sm_, lo_, tl.getSourceRange());
     }
     const Expr *init = vd->getInit();
     if (init == nullptr) {
@@ -657,6 +668,28 @@ class Transpiler {
       }
     }
     return "decltype(" + Text(sm_, lo_, init->getSourceRange()) + ")";
+  }
+
+  /**
+   * The `[N]...` part of an array declarator, or empty.
+   *
+   * A declaration's TYPE and its DECLARATOR are different things, and the
+   * hoist rebuilds the declaration from the type text plus the name -- which
+   * silently drops the extent, turning `PageRef<T> hz[4]` into
+   * `PageRef<T> hz`. The element type is what HoistedType returns, so the
+   * extents have to come back here.
+   *
+   * @param vd the hoisted declaration
+   * @return "[4]", "[2][3]", ... or "" for a non-array
+   */
+  std::string ArrayExtent(const VarDecl *vd) const {
+    std::string out;
+    QualType t = vd->getType();
+    while (const auto *at = ctx_.getAsConstantArrayType(t)) {
+      out += "[" + llvm::toString(at->getSize(), 10, false) + "]";
+      t = at->getElementType();
+    }
+    return out;
   }
 
   /** The child call with the context threaded in (edit E2). */
@@ -745,12 +778,31 @@ class Transpiler {
   /** E3 */
   void EmitPrologue(const FnInfo &fi, const CompoundStmt *body) {
     std::string out = "\n/* clio-coroc: generated */\n";
+    // ORDER MATTERS AND DECLARATION ORDER IS THE WRONG ONE. A hoisted `auto`
+    // gets a decltype of its initializer, and that initializer can name
+    // another hoisted variable -- `auto h = CO_AWAIT(v.Hold(z * plane, ...))`
+    // inside `for (u64 z = ...)` produces `decltype(... z ...) h;` above
+    // `u64 z;`. Emitting the ones whose type is written first, then the
+    // deduced ones, fixes every case that can arise: a written type names no
+    // hoisted variable, and a deduced one can only name variables the source
+    // had already declared, which are written-type or deduced-from-earlier.
+    std::vector<const VarDecl *> written;
+    std::vector<const VarDecl *> deduced;
     for (const VarDecl *vd : fi.hoisted) {
-      // Value-initialized, not vacuous: the dispatch shape defeats definite-
-      // assignment analysis, so a bare declaration draws -Wmaybe-uninitialized
-      // even where it is provably assigned. Legal here because nothing jumps
-      // over these -- they sit above the switch.
-      out += HoistedType(fi, vd) + " " + vd->getName().str() + "{};\n";
+      const TypeSourceInfo *tsi = vd->getTypeSourceInfo();
+      const bool is_auto =
+          tsi != nullptr && !tsi->getTypeLoc().getAs<AutoTypeLoc>().isNull();
+      (is_auto ? deduced : written).push_back(vd);
+    }
+    for (const std::vector<const VarDecl *> *group : {&written, &deduced}) {
+      for (const VarDecl *vd : *group) {
+        // Value-initialized, not vacuous: the dispatch shape defeats
+        // definite-assignment analysis, so a bare declaration draws
+        // -Wmaybe-uninitialized even where it is provably assigned. Legal
+        // here because nothing jumps over these -- they sit above the switch.
+        out += HoistedType(fi, vd) + " " + vd->getName().str() +
+               ArrayExtent(vd) + "{};\n";
+      }
     }
     std::vector<std::string> packs;
     const std::vector<std::string> base = SaveList(fi);
@@ -789,6 +841,14 @@ class Transpiler {
         continue;
       }
       const std::string name = vd->getName().str();
+      // Same reason as in HoistedType: the extent sits AFTER the name, so a
+      // strip that ends at the name leaves `[4];` behind as a statement.
+      // An array has nowhere to put an initializer in the hoisted form
+      // anyway, so the whole declaration goes.
+      if (vd->getType()->isArrayType() && !vd->hasInit()) {
+        Replace(rw_, ds->getSourceRange(), "(void)" + name + ";");
+        continue;
+      }
       const SourceRange strip(ds->getBeginLoc(), vd->getLocation());
       // With an initializer this leaves `x = init;`. Without one it leaves
       // `(void)x;`, which is a valid statement and keeps the line count.
