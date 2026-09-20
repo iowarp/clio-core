@@ -1,70 +1,60 @@
-# P0 spikes — portable GPU coroutines
+# Portable GPU coroutines — `CO_AWAIT` on SYCL, CUDA and ROCm
 
-These validate the *output shape* of the `clio-coroc` design (`$HOME/coroutines.md`)
-before the transpiler is written. Everything here is hand-written in exactly the
-form the tool will emit, because the assumptions that can sink the design are
-about backends, not about tooling — and no amount of tool engineering fixes a
-shape a device compiler will not accept.
+`CO_AWAIT(...)` in device code, transpiled to a group-scoped state machine that
+parks and resumes across kernel launches. No C++20 coroutines, no function
+pointers, no recursion, no global device state, and **no backend token in the
+generated code** — so one transpiled source serves all three backends.
 
-| file | what it is |
-|---|---|
-| `spike_workload.h` | the workload in both forms: `src` (what a user writes) and `gen` (what the tool emits). Read them side by side. |
-| `spike_host.cc` | S2–S5 on the host backend: a work-group emulated with real threads and a real `std::barrier`. |
-| `spike_sycl.cc` | S1 on SYCL: JIT/run, plus AOT through IGC for Aurora's PVC. |
+Design: `$HOME/coroutines.md`.
 
-The call graph is deliberately awkward, because a flat one would prove nothing:
-
-```
-StreamTile   depth 0   two suspend points, one inside a loop
-  HoldPage   depth 1   one suspend point, inside an `if`
-    Fetch    depth 2   one leaf await
-  Flush      depth 1   one leaf await      <- second child at the same depth
-```
-
-## Building and running
+## Run it
 
 ```bash
-# Host backend (S2-S5). No GPU, no SYCL.
-g++ -std=c++20 -O1 -Wall -Wextra -pthread \
-    -I context-runtime/include -I context-runtime/test/co \
-    context-runtime/test/co/spike_host.cc -o build-spike/spike_host
-./build-spike/spike_host
-
-# SYCL, JIT + run on whatever device is present (S1 semantics)
-icpx -fsycl -std=c++20 -O2 -Wall \
-     -I context-runtime/include -I context-runtime/test/co \
-     context-runtime/test/co/spike_sycl.cc -o build-spike/spike_sycl
-ONEAPI_DEVICE_SELECTOR=opencl:cpu ./build-spike/spike_sycl
-
-# SYCL, AOT for Aurora's GPU (S1 codegen -- runs IGC, needs no GPU)
-icpx -fsycl -std=c++20 -O2 -fsycl-targets=spir64_gen -Xs "-device pvc" \
-     -I context-runtime/include -I context-runtime/test/co \
-     context-runtime/test/co/spike_sycl.cc -o build-spike/spike_sycl_pvc
+./tools/coroc/build.sh                      # build the transpiler (needs an LLVM with dev files)
+./context-runtime/test/co/run_coroc.sh      # transpile + differential test + SYCL + AOT
 ```
 
-## Results — 2026-09-20, Aurora login node, oneAPI 2025.3.2 (clang 21)
+## What each piece is
 
-| spike | what it falsifies | result |
-|---|---|---|
-| **S1** codegen | the generated `switch`-inside-a-loop (an irreducible CFG) survives a real device backend | **PASS** — `icpx -fsycl-targets=spir64_gen -Xs "-device pvc"` reports `Build succeeded`. IGC accepts it. No `--emit=flat` fallback needed. |
-| **S1** semantics | the state machine computes what the source computes, on a device | **PASS** — bit-identical to the synchronous form on the OpenCL CPU device. |
-| **S2** barriers | a barrier between two suspend points is legal, crossed after a resume (invariant I2/I3) | **PASS** — no hang; launch count exactly `npages*2 + 1`. |
-| **S3** nesting | frame offsets reproduce on a three-level replay descent (invariant I1) | **PASS** — `max_park_depth == 2`; a wrong offset would make `Pop` read another frame and corrupt the output. |
-| **S4** persistence | state survives the kernel exit with no fence and no atomic (invariant I8) | **PASS** — each group fetched and flushed each page exactly once across 13 launches. |
-| **S5** differential | nothing is missing from a save list | **PASS** — parking run bit-identical to the synchronous source, over a poisoned (`0xA5`) stack. |
+| file | role |
+|---|---|
+| `include/clio_runtime/co/coro.h` | device runtime: `Item` (the five-operation backend seam), `Ctx`, `Frame`, `Scope`, and the `CO_AWAIT` marker |
+| `include/clio_runtime/co/driver.h` | host side: stack layout and the relaunch loop. Allocates nothing, so it has no per-backend conditional |
+| `tools/coroc/main.cc` | the transpiler, on clang LibTooling |
+| `coro_workload.h` | **the input.** What a user writes, and all of it |
+| `coro_types.h` | data and awaiters. No `CO_AWAIT`, so never rewritten |
+| `coro_ref.cc` / `coro_gen.cc` | the differential test's two halves |
+| `coro_sycl.cc` | the same generated header, on SYCL |
+| `bad_missing_await.h` | negative test: rule R1 must reject it |
+| `spike_*.{h,cc}` | the P0 spikes — the output shape written by hand, before the tool existed |
 
-Numbers from both backends, which agree exactly:
+## Results — 2026-09-20, Aurora login node
+
+oneAPI 2025.3.2 (clang 21) for SYCL; GCC 13.4 and LLVM 22 for the tool.
 
 ```
-stack bytes per work-item (deepest chain): 184
-launches=13 parks=36 fetches=18 flushes=18 max_park_depth=2
+PASS  host: transpiled == source (576 values)
+PASS  sycl: transpiled == source, on device
+PASS  sycl: IGC accepts the generated shape for pvc
+PASS  R1: unwrapped call to a suspending function is an error
 ```
+
+```
+gen:  launches=13 fetches=18 flushes=18 max_park_depth=2 hwm=248/512 bytes
+sycl: launches=13 fetches=18 flushes=18 max_park_depth=2 hwm=240/512 bytes
+```
+
+Thirteen launches is `npages*2 + 1` — every page faults once on the fetch and
+once on the flush, and the last launch finds everything ready. `max_park_depth=2`
+means the three-level chain really did park at its leaf, so the replay descent
+reconstructed `StreamTile > HoldPage > Fetch` and every frame landed back at the
+offset it had. The stack is poisoned with `0xA5` before each run, so a value
+missing from a save list comes back as garbage rather than a plausible zero.
 
 ### The premise, confirmed
 
-The reason this mechanism exists is that C++20 device coroutines do not compile
-for spir64. Verified on this toolchain with a five-line coroutine: clang does not
-merely error, it **crashes**.
+A five-line C++20 device coroutine does not merely fail to compile for spir64 —
+clang **crashes** on it:
 
 ```
 3. coro_probe.cc:15:6: Generating code for declaration 'DeviceCoro'
@@ -72,36 +62,68 @@ merely error, it **crashes**.
  #5 (anonymous namespace)::PromoteMem2Reg::run()
 ```
 
-(The design doc records an earlier symptom — a PHI operand-type assert in
-`EmitCoroutineBody`. Same class, different crash site; clang 21 gets further
-before falling over.) The design emits no coroutine, so it cannot meet this bug
-or any successor of it.
+This design emits no coroutine, so it cannot meet that bug or its successors.
+
+## What the transpiler does
+
+Five edits, and nothing else:
+
+| | edit |
+|---|---|
+| E1 | append `clio::co::Ctx &_cy` to every suspending function's signature |
+| E2 | append `_cy` at every call to a suspending function |
+| E3 | insert the `Frame`, the hoisted declarations and the dispatching `switch` |
+| E4 | insert `case N:` + replay + park guard at each `CO_AWAIT` |
+| E5 | close the switch and call `Done()` before every return |
+
+A function is suspending **iff its body contains `CO_AWAIT`** — local and
+explicit, never inferred transitively, so there is no whole-program fixed point
+and a TU can be processed alone.
+
+The hoisting rule is one sentence: *a declaration moves to function scope iff
+its block lexically contains a `CO_AWAIT`.* It moves the **declaration**, not the
+variable — the hoisted variable is an ordinary automatic, so loop counters stay
+in registers. It exists only so the dispatch can jump past them without entering
+the scope of a variable with non-vacuous initialization, which is ill-formed.
+That also means **a missed hoist is impossible**: it would be a compile error in
+the generated file, not wrong data.
 
 ## Not yet covered
 
-- **CUDA and ROCm.** Neither `nvcc` nor `hipcc` exists on this node, so the
-  CUDA/HIP branch of `Item` is written but unexercised. It is five lines and
-  token-identical between the two, but *unexercised is unexercised* — S1 must be
-  re-run on a machine with those toolchains before the design's portability claim
-  is anything more than an argument.
-- **A real GPU.** AOT compilation proves IGC accepts the code; it does not prove
-  the PVC executes it correctly. Run `spike_sycl` on a compute node.
-- **Divergent `CO_AWAIT`** (rule R3). The workload is uniformly convergent. A
-  spike that deliberately violates it, to check that `-DCLIO_CO_VERIFY` catches
-  it rather than hanging, is still to write.
+- **CUDA and ROCm.** Neither `nvcc` nor `hipcc` is on this node, so the CUDA/HIP
+  branch of `Item` is written but unexercised. Five token-identical lines, but
+  unexercised is unexercised.
+- **A real GPU.** AOT proves IGC accepts the generated code; it does not prove a
+  PVC executes it. Run `coro_sycl` on a compute node.
+- **Precise liveness.** The save list is every parameter plus every hoisted
+  variable — a superset of the live set, so always correct, costing frame bytes
+  at a park and nothing on the fast path. `clang::LiveVariables` would shrink it.
+- **Expression-position awaits**, range-`for` desugaring, `CO_AWAIT` directly in
+  a kernel lambda. All diagnosed rather than mis-compiled.
+- **Randomized park schedules** in the differential test, and the
+  divergent-`CO_AWAIT` check behind `-DCLIO_CO_VERIFY`.
 
-## Two things the spikes changed in the design
+## Five things found by building rather than by thinking
 
-Both were found by compiling, not by thinking, and both are requirements on the
-transpiler's emitter:
+Each is now a requirement on the emitter or on the runtime, and each was a bug
+first:
 
-1. **Emit `[[fallthrough]];`** at the fresh-entry-into-first-await edge.
-   Otherwise every generated file trips `-Wimplicit-fallthrough`, and a
-   `-Werror` build fails.
-2. **Value-initialize hoisted declarations** (`u64 i{};`). The dispatch shape
-   defeats the compiler's definite-assignment analysis, so hoisted variables draw
-   `-Wmaybe-uninitialized` even where they are provably assigned before use. This
-   is legal precisely because hoisted declarations sit *above* the switch, where
-   no jump crosses their initialization — and it is the one place the in-place
-   hoisting refinement (design doc §8.4) cannot be used, since that refinement
-   requires vacuous initialization.
+1. **`Await(T&&)` cannot take a void await.** `CO_AWAIT(Fetch(c, page))` awaits
+   a void-returning call, and no function can take a void argument. The marker
+   is a comma expression — `(AwaitMark(), (e))` — because the built-in comma
+   accepts a void operand and yields its right operand with the same type *and*
+   value category.
+2. **Macro-argument text needs spelling locations, not expansion.** The operand
+   of `CO_AWAIT` is a macro argument whose expansion range is the whole
+   invocation, so asking for it yields the marker back. This first appeared as
+   generated code containing `CO_AWAIT(Fetch(c, page), _cy)`.
+3. **A statement ending inside a macro has an unreliable expansion end.** The
+   park guard must be anchored on the `CO_AWAIT` itself; anchored on the
+   enclosing statement it skipped past its own semicolon and landed in the
+   middle of the next line's `for`-init.
+4. **Emit `[[fallthrough]];`** at the fresh-entry-into-first-await edge, or every
+   generated file trips `-Wimplicit-fallthrough` and a `-Werror` build fails.
+5. **Value-initialize hoisted declarations, and emit an unreachable `return {}`.**
+   The dispatch shape defeats definite-assignment and reachability analysis, so
+   hoisted variables draw `-Wmaybe-uninitialized` and non-void functions draw
+   `-Wreturn-type` even where both are provably fine.

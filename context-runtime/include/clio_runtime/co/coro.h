@@ -69,9 +69,11 @@
 #ifndef CLIO_RUNTIME_CO_CORO_H_
 #define CLIO_RUNTIME_CO_CORO_H_
 
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 
 /* -------------------------------------------------------------------------
  * Backend selection.
@@ -227,6 +229,8 @@ struct GroupHeader {
   u32 status;                /**< Status */
   u32 park_depth;            /**< deepest frame live at the park */
   u64 wait_tag;              /**< opaque token for the host servicer */
+  u32 hwm;                   /**< widest chain seen, in per-item bytes */
+  u32 overflow;              /**< nonzero if the stack was too small */
   u32 state[kMaxDepth];      /**< resume point per call depth (group-uniform) */
 };
 
@@ -244,6 +248,39 @@ struct StackView {
     return reinterpret_cast<GroupHeader *>(GroupBase(g));
   }
 };
+
+/* =========================================================================
+ * The marker.
+ * ========================================================================= */
+
+/**
+ * The marker. `CO_AWAIT(e)` is `(AwaitMark(), (e))` -- a comma expression whose
+ * left operand is a call to this function and nothing else.
+ *
+ * WHY A COMMA AND NOT A FUNCTION TAKING `e`. A function cannot take a void
+ * argument, and `CO_AWAIT(Fetch(c, page))` awaits a void-returning call. The
+ * built-in comma operator accepts a void operand and yields its right operand
+ * with the same type AND value category, so one spelling covers void and
+ * non-void awaits identically. (Found by compiling: the obvious
+ * `Await(T&&)` form fails on every void await in the workload.)
+ *
+ * Five properties follow, each removing work from the transpiler:
+ *  1. the left operand is a CallExpr to a uniquely-named function, so one
+ *     matcher finds every suspend point and nothing is inferred;
+ *  2. the expression has the right type, so `auto h = CO_AWAIT(f())` deduces
+ *     what `f()` deduces and the tool never computes or spells a type;
+ *  3. the parentheses mean there is no precedence question;
+ *  4. ordinary `return` still works -- spelling it `co_await` would make Sema
+ *     demand a promise_type, forbid `return`, and on spir64 crash clang; and
+ *  5. UNTRANSPILED SOURCE STILL COMPILES AND RUNS, synchronously, which is the
+ *     differential oracle the whole test strategy rests on.
+ */
+CLIO_CO_FUN void AwaitMark() {}
+
+/** The value type of `CO_AWAIT(<awaiter>)`. Generated code uses this to give a
+ *  hoisted `auto` declaration a type without the transpiler ever naming one. */
+template <class A>
+using AwaiterResult = decltype(std::declval<A &>().Take());
 
 /** Bytes a frame of `per_item` bytes occupies for a whole group. */
 CLIO_CO_FUN u32 FrameStride(u32 per_item, u32 group_size) {
@@ -290,6 +327,8 @@ class Ctx {
       : it_(it),
         hdr_(st.Header(it.Group())),
         frames_(st.GroupBase(it.Group()) + sizeof(GroupHeader)),
+        capacity_((st.bytes_per_group - static_cast<u32>(sizeof(GroupHeader))) /
+                  (st.group_size ? st.group_size : 1u)),
         group_size_(st.group_size),
         lane_(it.Local()),
         cursor_(0),
@@ -315,6 +354,7 @@ class Ctx {
   Item it_;
   GroupHeader *hdr_;
   char *frames_;
+  u32 capacity_;    /**< per-item bytes available for the whole chain */
   u32 group_size_;
   u32 lane_;
   u32 cursor_;      /**< bytes consumed by frames on the current chain (I1) */
@@ -349,7 +389,13 @@ class Frame {
         replay_pending_(false),
         popped_(0) {
     c.depth_ += 1;
-    c.cursor_ += FrameStride(per_item, c.group_size_);
+    c.cursor_ += per_item;
+    // A stack that is too small must SAY so. Silently running past the end
+    // would corrupt the next group's frames and surface far from here.
+    if (c.lane_ == 0) {
+      if (c.cursor_ > c.hdr_->hwm) c.hdr_->hwm = c.cursor_;
+      if (c.cursor_ > c.capacity_ || c.depth_ > kMaxDepth) c.hdr_->overflow = 1;
+    }
     if (c.replaying_) {
       // This call was on the chain when the group parked, so its resume point
       // is in the group header. Only meaningful while replaying: on a fresh
@@ -414,7 +460,7 @@ class Frame {
   /** Normal return: release the frame so the cursor reflects the chain (I1). */
   CLIO_CO_FUN void Done() {
     c_->depth_ -= 1;
-    c_->cursor_ -= FrameStride(per_item_, c_->group_size_);
+    c_->cursor_ -= per_item_;
   }
 
   /** Bytes this call actually used at its widest Push; for the size assert. */
@@ -424,7 +470,11 @@ class Frame {
   /** This work-item's private slice of this frame. Lane-major, so each lane
    *  owns a contiguous run and no two lanes ever touch the same bytes. */
   CLIO_CO_FUN char *Slot() const {
-    return c_->frames_ + off_ +
+    // Frames are laid out chain-major, lanes within them: every call's slice
+    // starts at its chain offset scaled by the group, and this lane owns a
+    // contiguous run inside it. No two lanes ever touch the same bytes.
+    return c_->frames_ +
+           static_cast<std::size_t>(off_) * c_->group_size_ +
            static_cast<std::size_t>(c_->lane_) * per_item_;
   }
 
@@ -498,5 +548,10 @@ class Scope {
 };
 
 }  // namespace clio::co
+
+/**
+ * The one token a user writes. Consumed by clio-coroc; the identity otherwise.
+ */
+#define CO_AWAIT(...) (::clio::co::AwaitMark(), (__VA_ARGS__))
 
 #endif  // CLIO_RUNTIME_CO_CORO_H_

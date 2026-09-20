@@ -169,3 +169,6 @@ abrt_bt.so
 # Per-session HDF5 artifacts written by demo/benchmark runs (UUID-named .h5).
 # Generated output, never source.
 demologs/
+build-coroc/
+build-gen/
+build-spike/
