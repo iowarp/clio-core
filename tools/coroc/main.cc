@@ -439,6 +439,7 @@ class Transpiler {
       suspending_names_.insert(kv.first->getNameAsString());
     }
     for (auto &kv : fns_) Prepare(kv.second);
+    for (auto &kv : fns_) RenameCollidingHoists(kv.second);
     CheckUnwrappedCalls(tu);
     // Emitting over a rejected program dereferences the very fields the
     // diagnostic said were missing -- an unusable await site has neither a
@@ -581,6 +582,59 @@ class Transpiler {
     return true;
   }
 
+
+  /**
+   * Give every hoisted declaration a name unique within its function.
+   *
+   * Hoisting FLATTENS scopes. Two declarations of `p` in sibling blocks
+   * shadow nothing -- neither is in scope where the other is -- and become
+   * a redefinition once both are lifted to function scope. The source is
+   * not wrong; the transform is, so the transform fixes it.
+   *
+   * Renaming is exact rather than textual: clang knows which DeclRefExprs
+   * resolve to this VarDecl, so each is rewritten and nothing that merely
+   * shares the spelling is touched. lammps_md needed it for p, pg and
+   * pub_need; grayscott for two page holds both called h.
+   */
+  void RenameCollidingHoists(FnInfo &fi) {
+    std::map<std::string, int> seen;
+    for (const VarDecl *vd : fi.hoisted) {
+      const std::string name = vd->getName().str();
+      const int n = ++seen[name];
+      if (n == 1) continue;
+      const std::string fresh = name + "_cy" + std::to_string(n);
+      renamed_[vd] = fresh;
+      // NOT at the declaration: EmitHoistStrips already rewrites the range
+      // that covers the name, and two Rewriter edits over one range leave
+      // whichever lost silently undone.
+      struct V : RecursiveASTVisitor<V> {
+        const VarDecl *target;
+        std::string fresh;
+        Transpiler *t;
+        bool VisitDeclRefExpr(DeclRefExpr *e) {
+          // Once only. A declaration can be reached through more than one
+          // function's body -- a lambda, a local class -- and renaming an
+          // already-renamed use produced `pub_need_cy2_cy2`.
+          if (e->getDecl() == target && t->renamed_uses_.insert(e).second) {
+            Replace(t->rw_, SourceRange(e->getLocation(), e->getLocation()),
+                    fresh);
+          }
+          return true;
+        }
+      } v;
+      v.target = vd;
+      v.fresh = fresh;
+      v.t = this;
+      v.TraverseStmt(const_cast<Stmt *>(fi.fn->getBody()));
+    }
+  }
+
+  /** The name a hoisted declaration ended up with. */
+  std::string HoistName(const VarDecl *vd) const {
+    auto it = renamed_.find(vd);
+    return it == renamed_.end() ? vd->getName().str() : it->second;
+  }
+
   /** Climb to the statement that directly contains this expression. */
   const Stmt *EnclosingStatement(const Stmt *s) {
     const Stmt *cur = s;
@@ -656,6 +710,38 @@ class Transpiler {
       // type runs from `T` to `]` and copying it verbatim re-emits the name
       // -- observed as `T hz[4] hz[4]{};`. Descend to the element type and
       // let ArrayExtent put the brackets back.
+      // EVERYTHING BEFORE THE NAME. A TypeLoc's source range leaves out
+      // leading qualifiers, so `const float **s_sp0` came back as
+      // `float **` and the hoist silently dropped the const -- which nvcc
+      // then reported at the assignment, not at the declaration. Taking
+      // the characters from the declaration's start up to the identifier
+      // keeps the qualifiers and the stars, and leaves the extent to
+      // ArrayExtent.
+      auto it = fi.decl_stmt.find(vd);
+      if (it != fi.decl_stmt.end()) {
+        const CharSourceRange csr = CharSourceRange::getCharRange(
+            sm_.getExpansionLoc(it->second->getBeginLoc()),
+            sm_.getExpansionLoc(vd->getLocation()));
+        std::string txt = Lexer::getSourceText(csr, sm_, lo_).str();
+        // A TOP-LEVEL const has to go. The hoist declares the variable
+        // above the switch and the original site becomes an assignment to
+        // it, which a const object will not accept -- "expression must be
+        // a modifiable lvalue", pointing at the assignment rather than at
+        // the declaration that caused it. A const POINTEE is untouched:
+        // `const float *p` stays exactly that, and only `const u64 n`
+        // loses its qualifier.
+        if (vd->getType().isLocalConstQualified()) {
+          // the LAST one: in `const float *const p` the top-level
+          // qualifier is the second, and dropping the first leaves
+          // `float *const p`, still not assignable.
+          const std::size_t c = txt.rfind("const");
+          if (c != std::string::npos) {
+            txt.erase(c, 5);
+            while (c < txt.size() && txt[c] == ' ') txt.erase(c, 1);
+          }
+        }
+        if (!txt.empty()) return txt;
+      }
       TypeLoc tl = tsi->getTypeLoc();
       for (;;) {
         ArrayTypeLoc atl = tl.getAs<ArrayTypeLoc>();
@@ -738,7 +824,11 @@ class Transpiler {
       names.push_back(p->isParameterPack() ? p->getName().str() + "..."
                                            : p->getName().str());
     }
-    for (const VarDecl *vd : fi.hoisted) names.push_back(vd->getName().str());
+    for (const VarDecl *vd : fi.hoisted) {
+      // A re-derived reference is not carried across the park; see EmitBody.
+      if (vd->getType()->isReferenceType()) continue;
+      names.push_back(HoistName(vd));
+    }
     return names;
   }
 
@@ -767,10 +857,31 @@ class Transpiler {
     const auto *body = dyn_cast_or_null<CompoundStmt>(fi.fn->getBody());
     if (body == nullptr) return;
 
+    /* A REFERENCE IS RE-DERIVED, NOT SAVED.
+     *
+     * It cannot be hoisted the usual way: a hoist declares the variable
+     * value-initialized above the switch and assigns it later, and a
+     * reference can be neither. But it does not need saving either -- it
+     * is a NAME for something else, and the something else is still there
+     * after the park. So its declaration moves above the switch WITH its
+     * initializer and is re-executed on every entry.
+     *
+     * That is exactly right for the case that forced it: lammps_md's
+     * CLIO_SHARED_PERSIST binds a reference into the block's shared arena,
+     * and CLIO_COROC_RUN has already called PersistRestore by the time the
+     * resume gets here -- so re-deriving the name is not merely allowed,
+     * it is the only correct thing, because the arena is at a fresh
+     * address each launch.
+     *
+     * The initializer is re-evaluated, so it must not depend on a hoisted
+     * local, whose value at re-entry is whatever Pop last restored. Every
+     * use so far derives from a parameter or a global.
+     */
     for (const VarDecl *vd : fi.hoisted) {
-      if (vd->getType()->isReferenceType()) {
-        Error(vd->getLocation(),
-              "a reference declared across a CO_AWAIT cannot be hoisted");
+      if (!vd->getType()->isReferenceType()) continue;
+      if (vd->getInit() == nullptr) {
+        Error(vd->getLocation(), "a reference across a CO_AWAIT needs an "
+                                 "initializer to be re-derived from");
       }
     }
 
@@ -829,13 +940,33 @@ class Transpiler {
           tsi != nullptr && !tsi->getTypeLoc().getAs<AutoTypeLoc>().isNull();
       (is_auto ? deduced : written).push_back(vd);
     }
+    // Re-derived names come first: they are what the value hoists may be
+    // initialised from, never the other way round.
+    for (const VarDecl *vd : fi.hoisted) {
+      if (!vd->getType()->isReferenceType() || vd->getInit() == nullptr) {
+        continue;
+      }
+      // A macro-expanded declaration must be moved as the INVOCATION, not
+      // as the declarator: the declarator's spelling lives in the macro
+      // DEFINITION, where the type and the name are still parameters.
+      // lammps_md writes CLIO_SHARED_PERSIST(MdTables, s_tbl), whose
+      // declarator spells `Type &name = ...`.
+      SourceRange r = vd->getSourceRange();
+      if (r.getBegin().isMacroID()) {
+        const CharSourceRange csr = sm_.getExpansionRange(r);
+        out += Lexer::getSourceText(csr, sm_, lo_).str() + ";\n";
+      } else {
+        out += Text(sm_, lo_, r) + ";\n";
+      }
+    }
     for (const std::vector<const VarDecl *> *group : {&written, &deduced}) {
       for (const VarDecl *vd : *group) {
+        if (vd->getType()->isReferenceType()) continue;
         // Value-initialized, not vacuous: the dispatch shape defeats
         // definite-assignment analysis, so a bare declaration draws
         // -Wmaybe-uninitialized even where it is provably assigned. Legal
         // here because nothing jumps over these -- they sit above the switch.
-        out += HoistedType(fi, vd) + " " + vd->getName().str() +
+        out += HoistedType(fi, vd) + " " + HoistName(vd) +
                ArrayExtent(vd) + "{};\n";
       }
     }
@@ -883,11 +1014,16 @@ class Transpiler {
               "declare one variable per statement across a CO_AWAIT");
         continue;
       }
-      const std::string name = vd->getName().str();
+      const std::string name = HoistName(vd);
       // Same reason as in HoistedType: the extent sits AFTER the name, so a
       // strip that ends at the name leaves `[4];` behind as a statement.
       // An array has nowhere to put an initializer in the hoisted form
       // anyway, so the whole declaration goes.
+      if (vd->getType()->isReferenceType()) {
+        // Moved wholesale, initializer and all, so nothing stays behind.
+        Replace(rw_, ds->getSourceRange(), "(void)" + name + ";");
+        continue;
+      }
       if (vd->getType()->isArrayType() && !vd->hasInit()) {
         Replace(rw_, ds->getSourceRange(), "(void)" + name + ";");
         continue;
@@ -997,6 +1133,9 @@ class Transpiler {
   /** Names of the above, for calls that never resolve to a decl
    *  because they are written inside a class template. */
   std::set<std::string> suspending_names_;
+  /** Hoists that had to be renamed to survive the flattening. */
+  std::map<const VarDecl *, std::string> renamed_;
+  std::set<const DeclRefExpr *> renamed_uses_;
   unsigned errors_ = 0;
   unsigned rewritten_ = 0;
 };

@@ -75,6 +75,16 @@ def rewrite_awaits(src):
         if not m:
             out += src[i:]
             return out
+        # SKIP PROSE. These headers discuss co_await in their comments --
+        # "every co_await on a", "no co_await follows, so shared survives"
+        # -- and a match there sends the paren scan below off into the next
+        # real statement, which comes back as a stray ')' several lines
+        # away. md_kernels.h has two such sentences.
+        bol = src.rfind("\n", 0, m.start()) + 1
+        if src[bol:m.start()].lstrip().startswith(("//", "*", "/*")):
+            out += src[i:m.end()]
+            i = m.end()
+            continue
         out += src[i:m.start()]
         j = m.end()
         # the callee expression, up to its argument list
@@ -116,11 +126,14 @@ def one_declarator(s):
         if len(parts) < 2:
             return m.group(0)
         return "".join("%s%s %s;\n" % (indent, ty, p.strip()) for p in parts)[:-1]
+    # Each declarator may carry its own `*`, and it belongs to the
+    # DECLARATOR, not the type: `const float *rp0[9], *rp1[9];` splits into
+    # two statements that each keep their star. lammps_md is full of these.
+    decl = r"\**\s*[A-Za-z_]\w*(?:\[[^\]]*\])*(?:\s*=\s*[^;,]+)?"
     return re.sub(
         r"^([ \t]+)((?:const )?(?:unsigned |signed )?"
-        r"(?:[A-Za-z_][\w:]*(?:<[^;]*?>)?)[ \t]*\**)[ \t]"
-        r"([A-Za-z_]\w*(?:\[[^\]]*\])?(?:\s*=\s*[^;,]+)?"
-        r"(?:\s*,\s*[A-Za-z_]\w*(?:\[[^\]]*\])?(?:\s*=\s*[^;,]+)?)+)\s*;$",
+        r"(?:[A-Za-z_][\w:]*(?:<[^;]*?>)?))[ \t]+"
+        r"(" + decl + r"(?:\s*,\s*" + decl + r")+)\s*;$",
         fix, s, flags=re.M)
 
 

@@ -366,7 +366,8 @@ __device__ CLIO_COROC_INLINE void ForceCoro(gv::DeviceVector<float> x,
     gv::PageRef<float> hg[9][2];
     u64 rbase[9];
     u64 rrun0[9];
-    const float *rp0[9], *rp1[9];
+    const float *rp0[9];
+    const float *rp1[9];
     for (int q = 0; q < 9; ++q) {
       const int dz = q / 3 - 1;
       const int dy = q % 3 - 1;
@@ -525,12 +526,12 @@ __device__ CLIO_COROC_INLINE void BuildListCoro(gv::DeviceVector<float> x,
   // memory. That made ~6 dependent global loads of pure bookkeeping per
   // entry and is why the list pass first measured SLOWER than cell-direct
   // despite 17x fewer candidates. Filled once per row after every hold
-  // (no CO_AWAIT(follows, so shared survives) and read by all threads.
+  // (no co_await follows, so shared survives) and read by all threads.
   // SURVIVES A PARK. These were staged in plain __shared__, which the driver
   // destroys when it exits the kernel to suspend, so every one of them had to
   // be re-published by hand after the last hold that could suspend -- and a
   // suspend added anywhere after that fill would have read stale pointers.
-  CLIO_SHARED_PERSIST(MdTables, s_tbl));
+  CLIO_SHARED_PERSIST(MdTables, s_tbl);
   const float **s_sp0 = s_tbl.sp0;
   const float **s_sp1 = s_tbl.sp1;
   u64 *s_srun = s_tbl.srun;
@@ -598,7 +599,8 @@ __device__ CLIO_COROC_INLINE void BuildListCoro(gv::DeviceVector<float> x,
     {   // guards die at the close of this scope, before the reservations go back
     gv::PageRef<float> hg[6][2];
     u64 srun[6];
-    const float *sp0[6], *sp1[6];
+    const float *sp0[6];
+    const float *sp1[6];
     u32 sbase[6];
     u32 scnt[6];
     u32 sdz[6];
@@ -679,9 +681,9 @@ __device__ CLIO_COROC_INLINE void BuildListCoro(gv::DeviceVector<float> x,
     // that had to sit after the last hold that could suspend, because the
     // arena was plain __shared__ and the driver destroys shared when it
     // exits the kernel to park. CLIO_SHARED_PERSIST carries it across the
-    // suspension now, so this is an ordinary fill and a CO_AWAIT(added below
+    // suspension now, so this is an ordinary fill and a co_await added below
     // it is no longer a silent corruption.
-    if (threadIdx.x == 0)) {
+    if (threadIdx.x == 0) {
       for (u32 t = 0; t < nspans; ++t) {
         s_sp0[t] = sp0[t];
         s_sp1[t] = sp1[t];
@@ -827,12 +829,12 @@ __device__ CLIO_COROC_INLINE void ListForceCoro(gv::DeviceVector<float> x,
   // memory. That made ~6 dependent global loads of pure bookkeeping per
   // entry and is why the list pass first measured SLOWER than cell-direct
   // despite 17x fewer candidates. Filled once per row after every hold
-  // (no CO_AWAIT(follows, so shared survives) and read by all threads.
+  // (no co_await follows, so shared survives) and read by all threads.
   // SURVIVES A PARK. These were staged in plain __shared__, which the driver
   // destroys when it exits the kernel to suspend, so every one of them had to
   // be re-published by hand after the last hold that could suspend -- and a
   // suspend added anywhere after that fill would have read stale pointers.
-  CLIO_SHARED_PERSIST(MdTables, s_tbl));
+  CLIO_SHARED_PERSIST(MdTables, s_tbl);
   const float **s_sp0 = s_tbl.sp0;
   const float **s_sp1 = s_tbl.sp1;
   u64 *s_srun = s_tbl.srun;
@@ -936,7 +938,8 @@ __device__ CLIO_COROC_INLINE void ListForceCoro(gv::DeviceVector<float> x,
     {   // guards die at the close of this scope, before the release below
     gv::PageRef<float> hg[6][2];
     u64 srun[6];
-    const float *sp0[6], *sp1[6];
+    const float *sp0[6];
+    const float *sp1[6];
     u32 sbase[6];
     u32 scnt[6];
     u32 sdz[6];
@@ -1043,9 +1046,9 @@ __device__ CLIO_COROC_INLINE void ListForceCoro(gv::DeviceVector<float> x,
     // that had to sit after the last hold that could suspend, because the
     // arena was plain __shared__ and the driver destroys shared when it
     // exits the kernel to park. CLIO_SHARED_PERSIST carries it across the
-    // suspension now, so this is an ordinary fill and a CO_AWAIT(added below
+    // suspension now, so this is an ordinary fill and a co_await added below
     // it is no longer a silent corruption.
-    if (threadIdx.x == 0)) {
+    if (threadIdx.x == 0) {
       for (u32 t = 0; t < nspans; ++t) {
         s_sp0[t] = sp0[t];
         s_sp1[t] = sp1[t];
@@ -1382,10 +1385,14 @@ __device__ CLIO_COROC_INLINE void GatherCoro(gv::DeviceVector<float> src,
     // runs per dz), of both vectors -- they are the same vector on the
     // position pass, where the second hold is a cache hit. Row-at-a-time
     // holds needed 36 live guards and overflowed the coroutine frame.
-    gv::PageRef<float> hs[6][2], hx[6][2];
+    gv::PageRef<float> hs[6][2];
+    gv::PageRef<float> hx[6][2];
     u64 srun[6];
     u64 xrun[6];
-    const float *sp0[6], *sp1[6], *xp0[6], *xp1[6];
+    const float *sp0[6];
+    const float *sp1[6];
+    const float *xp0[6];
+    const float *xp1[6];
     u32 qspan[9];
     u64 qoff[9];
     u64 srow[9];
