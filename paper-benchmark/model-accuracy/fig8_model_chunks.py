@@ -234,6 +234,27 @@ def one_workload(key, label, rows, hc, nn, xgb, floor, tie_seed, tie_break,
     return recs
 
 
+# ---------------------------------------------------------------------------
+# Default model locations, resolved so this runs on a machine that is not the
+# one it was written on.
+#
+#   model.nnwt     ships IN this repo, so it is found relative to THIS file.
+#   xgb_model.pkl  does NOT: it belongs to the upstream NeuroPress checkout.
+#                  Set NEUROPRESS_DIR (default ~/NeuroPress) or pass --xgb.
+#
+# Both defaults used to be absolute paths under one author's home directory,
+# which breaks silently on any other machine -- argparse happily accepts the
+# path and the load fails later, far from the cause.
+# ---------------------------------------------------------------------------
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_NNWT = os.path.normpath(os.path.join(
+    _HERE, "..", "..", "context-transport-primitives",
+    "src", "compress", "model", "weights", "model.nnwt"))
+DEFAULT_XGB = os.path.join(
+    os.environ.get("NEUROPRESS_DIR", os.path.expanduser("~/NeuroPress")),
+    "neural_net", "weights", "xgb_model.pkl")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -243,9 +264,8 @@ def main() -> int:
     ap.add_argument("--floor", type=float, default=1.0,
                     help="reporting time floor in ms (1 = the deployed policy; "
                          "5 = panels (a)-(c)'s convention)")
-    ap.add_argument("--nnwt", default="/u/imuradli/clio-core/context-transport-primitives/"
-                                      "src/compress/model/weights/model.nnwt")
-    ap.add_argument("--xgb", default="/u/imuradli/NeuroPress/neural_net/weights/xgb_model.pkl")
+    ap.add_argument("--nnwt", default=DEFAULT_NNWT)
+    ap.add_argument("--xgb", default=DEFAULT_XGB)
     ap.add_argument("--tie-break", default="random", choices=["random", "first"],
                     help="how to choose among candidates the clamp made equal")
     ap.add_argument("--tie-seed", type=int, default=0)

@@ -270,6 +270,27 @@ def predictions(rows: pd.DataFrame, hc: pd.DataFrame, nn: NeuroPressNN,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Default model locations, resolved so this runs on a machine that is not the
+# one it was written on.
+#
+#   model.nnwt     ships IN this repo, so it is found relative to THIS file.
+#   xgb_model.pkl  does NOT: it belongs to the upstream NeuroPress checkout.
+#                  Set NEUROPRESS_DIR (default ~/NeuroPress) or pass --xgb.
+#
+# Both defaults used to be absolute paths under one author's home directory,
+# which breaks silently on any other machine -- argparse happily accepts the
+# path and the load fails later, far from the cause.
+# ---------------------------------------------------------------------------
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_NNWT = os.path.normpath(os.path.join(
+    _HERE, "..", "..", "context-transport-primitives",
+    "src", "compress", "model", "weights", "model.nnwt"))
+DEFAULT_XGB = os.path.join(
+    os.environ.get("NEUROPRESS_DIR", os.path.expanduser("~/NeuroPress")),
+    "neural_net", "weights", "xgb_model.pkl")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -280,9 +301,8 @@ def main() -> int:
                     help="per-row APE ceiling, in %% (0 = none). 100 bounds "
                          "every MAPE at 100%% while keeping models below the "
                          "ceiling distinguishable.")
-    ap.add_argument("--nnwt", default="/u/imuradli/clio-core/context-transport-primitives/"
-                                     "src/compress/model/weights/model.nnwt")
-    ap.add_argument("--xgb", default="/u/imuradli/NeuroPress/neural_net/weights/xgb_model.pkl")
+    ap.add_argument("--nnwt", default=DEFAULT_NNWT)
+    ap.add_argument("--xgb", default=DEFAULT_XGB)
     ap.add_argument("--tag", default="", help="suffix for the output file names")
     ap.add_argument("--hc-suffix", default="",
                     help="read hcompress<suffix>.csv, so seeding variants can "

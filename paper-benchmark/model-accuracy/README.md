@@ -43,6 +43,51 @@ Outputs land in `/projects/bekn/imuradli/np-hcompress/out/`:
 `correctness*.csv`, `feedback_sweep.csv`. Data stays out of the repo; only code
 lives here.
 
+## Running this on another machine
+
+The scoring step is **pure CPU** — "nothing is re-measured and no model is
+retrained" — so a second machine can reproduce the whole model comparison with
+no GPU, no nvCOMP/cuSZ/ndzip and no simulation dumps, provided it is given the
+campaign CSVs. Only the *measurement* step needs the GPU stack.
+
+**In git, so a clone is enough:** every script here, the HCompress predictor
+itself (`context-transport-primitives/.../hcompress_ccp_predictor.{h,cc}`),
+`hcompress_ccp_eval.cc` (`make_table.sh` compiles it with g++ on first use, so
+the binary is not shipped), and **`model.nnwt`** — the NN's weights, found
+relative to this file.
+
+**NOT in git — transfer these out of band:**
+
+| artifact | size | needed by | why it is not in git |
+|---|---|---|---|
+| `benchmark_results_600k.csv` | 124 MB | **both baselines** — XGBoost's held-out split and HCompress's seed | `.gitignore`; measurement data does not belong in the repo |
+| `xgb_model.pkl` | 13 MB | XGBoost | it belongs to the upstream **NeuroPress** checkout, not to this repo |
+| a campaign, `<wl>/<wl>/{explore.csv,dist.csv}` | ~10s of MB | everything | produced by `run_campaign.sh`; regenerating it needs the GPU stack and ~93 GB of dumps |
+
+**HCompress needs no weights file.** Unlike the NN (`model.nnwt`) and XGBoost
+(`xgb_model.pkl`), its cost model is *fitted at runtime*: `Seed()` does a ridge
+/ RLS fit over a profiler sample that `prepare_inputs.py` derives from the
+corpus into `seed.csv`, and its only data-dependent input at prediction time is
+each chunk's distribution class from `dist.csv`. Given the corpus, there is
+nothing pre-trained to ship.
+
+**Paths.** `--nnwt` resolves relative to this file, so it needs no
+configuration. `--xgb` defaults to `$NEUROPRESS_DIR/neural_net/weights/
+xgb_model.pkl` with `NEUROPRESS_DIR` defaulting to `~/NeuroPress`; set that
+variable or pass `--xgb`. The field paths in `run_campaign.sh` are all
+`${VAR:-...}` overridable, but their defaults point at this cluster and are
+only relevant if you re-measure.
+
+Scoring an already-measured campaign elsewhere:
+
+```bash
+export NEUROPRESS_DIR=/path/to/NeuroPress        # for xgb_model.pkl
+./make_table.sh --corpus /path/to/benchmark_results_600k.csv \
+                --campaign /path/to/campaign --out out
+python3 fig8_model_chunks.py --inputs out/inputs --out fig8d_chunks.csv
+python3 ../plot/plot_fig8_models.py --chunks fig8d_chunks.csv --out figures
+```
+
 ## What was measured
 
 One campaign, one build, `explore-balance` with exploration forced on every
