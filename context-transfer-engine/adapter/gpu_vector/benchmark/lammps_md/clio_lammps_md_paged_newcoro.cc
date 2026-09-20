@@ -1,6 +1,7 @@
 #if CTP_ENABLE_SYCL
 #define CLIO_SYCL_KERNEL_TU 1
 #endif
+#define GV_MD_CORO 1
 /* Copyright 2024 IOWarp - BSD 3-Clause License */
 /**
  * eternia-MD: a from-scratch reimplementation of the LAMMPS melt benchmark
@@ -304,7 +305,6 @@ static bool EnvOn(const char *name) {
  * The `, clio::co::Ctx &_cy` on each signature and at each
  * call site is appended by clio-coroc, not written here.
  * ===================================================== */
-namespace clio::gv_bench::md {
 
 __device__ CLIO_COROC_INLINE void AdmitSpans(u32 need, u32 pool, u32 slack) {
   if (need == 0u) return;
@@ -2042,7 +2042,6 @@ __device__ CLIO_COROC_INLINE void HaloUnpinCoro(gv::DeviceVector<float> x, u32 n
   return;
 }
 
-}  // namespace clio::gv_bench::md
 
 /* TWO BACKENDS, ONE WORKLOAD. Everything above this line is compiled for both: the transpiled state machine contains no vendor token. What differs is only how a grid is submitted. */
 #if CTP_ENABLE_SYCL
@@ -2354,7 +2353,7 @@ void LaunchHaloUnpin(dim3 grid,
     gv::DeviceVector<float> x_ = x;
     x_.Init(tbl_base + yv.Block());
     __syncthreads();
-    CLIO_COROC_RUN(yv, ys, HaloUnpinCoro(_cy, x_, nb, cap, z0, z1, yv.Block()));
+    CLIO_COROC_RUN(yv, ys, HaloUnpinCoro(x_, nb, cap, z0, z1, yv.Block()));
   });
 }
 
@@ -2765,7 +2764,7 @@ __global__ MD_LAUNCH_BOUNDS void HaloUnpinKernel(
   CLIO_GPU_INIT(info, nullptr);
   x.Init(tbl_base + yv.Block());
   __syncthreads();
-  CLIO_COROC_RUN(yv, ys, HaloUnpinCoro(_cy, x, nb, cap, z0, z1, yv.Block()));
+  CLIO_COROC_RUN(yv, ys, HaloUnpinCoro(x, nb, cap, z0, z1, yv.Block()));
 }
 
 

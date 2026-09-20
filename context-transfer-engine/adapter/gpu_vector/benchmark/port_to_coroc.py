@@ -212,11 +212,35 @@ def extract_ycoro_regions(src):
 
 
 def suspending_names(work):
-    """The suspending functions the workload defines, by name."""
-    return set(re.findall(
+    """The suspending functions the workload defines, by name.
+
+    SUSPENDING MEANS CONTAINS CO_AWAIT, which is clio-coroc's own rule --
+    local and explicit, never inferred. Matching the DECLARATION shape
+    instead is not the same thing: lammps_md has YCoroMain functions with
+    no await in them at all (HaloUnpinCoro), and the tool rightly leaves
+    those alone, so a call site that adds the context to them passes one
+    argument too many.
+    """
+    names = set()
+    pat = re.compile(
         r"(?:CTP_GPU_FUN\s+(?:inline|CLIO_COROC_INLINE)|__device__)"
-        r"\s+[\w:<>,\s*&]+?\s(\w+)\s*\(",
-        work))
+        r"\s+[\w:<>,\s*&]+?\s(\w+)\s*\(")
+    for m in pat.finditer(work):
+        brace = work.find("{", m.end())
+        if brace < 0:
+            continue
+        depth, i = 0, brace
+        while i < len(work):
+            if work[i] == "{":
+                depth += 1
+            elif work[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        if "CO_AWAIT(" in work[brace:i]:
+            names.add(m.group(1))
+    return names
 
 
 def add_ctx_at_calls(body, names):
@@ -388,6 +412,11 @@ def main():
     # true branch before splitting -- otherwise the prologue ends
     # inside an open conditional and everything after it vanishes.
     b = keep_if_branch(b, "#if defined(GV_MD_CORO)")
+    # ...and the driver refuses to run without it. The coroc edition
+    # IS the suspending build, so define it rather than resolve the
+    # negative guard, which has an #else arm carrying the real main.
+    if "GV_MD_CORO" in b:
+        b = "#define GV_MD_CORO 1\n" + b
     guard = "\n#if !CTP_IS_DEVICE_PASS\n"
     cut = b.index(guard) + 1
     prologue = b[:cut]
@@ -422,6 +451,7 @@ def main():
     # lammps_md spells its coroutines `__device__ gy::YCoroMain Fn(`
     work = re.sub(r'(?m)^__device__ ', '__device__ CLIO_COROC_INLINE ', work)
 
+    wrap = ("namespace " + ns + " {") in read(kern)
     names = suspending_names(work)
     lau = rewrite_launcher(read(launch), ns, names)
     sycl_src = os.path.join(d, "sycl", "%s_launch_sycl.cc" % name)
@@ -448,12 +478,17 @@ def main():
              " * The `, clio::co::Ctx &_cy` on each signature and at each\n"
              " * call site is appended by clio-coroc, not written here.\n"
              " * ===================================================== */\n"
-             "namespace " + ns + " {\n\n"
+           # WRAP ONLY IF THE SOURCE DID. gmx and the rest define their
+           # coroutines inside clio::gv_bench::<name>; lammps_md defines
+           # them at GLOBAL scope, and its launcher's kernels are global
+           # too. Wrapping those moves the workload out of the launcher's
+           # reach -- "identifier ReadProbeCoro is undefined".
+           + (("namespace " + ns + " {\n\n") if wrap else "\n")
            + work
            # the launcher brings its OWN namespaces -- lbann and md both
            # reopen clio::run::gpu at file scope for their stack helpers --
            # so the workload's wrapper closes before it, not around it
-           + "\n}  // namespace " + ns + "\n"
+           + (("\n}  // namespace " + ns + "\n") if wrap else "\n")
            + lau
            + "\n"
            + driver)

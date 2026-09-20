@@ -730,7 +730,15 @@ class Transpiler {
         // the declaration that caused it. A const POINTEE is untouched:
         // `const float *p` stays exactly that, and only `const u64 n`
         // loses its qualifier.
-        if (vd->getType().isLocalConstQualified()) {
+        // For an ARRAY the qualifier sits on the ELEMENT type, so
+        // `const double vals[4]` is not locally const-qualified and the
+        // drop below has to be told to look inside. Its elements are
+        // assigned one at a time by the strip, so the const must go.
+        bool drop = vd->getType().isLocalConstQualified();
+        if (const auto *at = ctx_.getAsArrayType(vd->getType())) {
+          drop = drop || at->getElementType().isConstQualified();
+        }
+        if (drop) {
           // the LAST one: in `const float *const p` the top-level
           // qualifier is the second, and dropping the first leaves
           // `float *const p`, still not assignable.
@@ -1023,6 +1031,24 @@ class Transpiler {
         // Moved wholesale, initializer and all, so nothing stays behind.
         Replace(rw_, ds->getSourceRange(), "(void)" + name + ";");
         continue;
+      }
+      // AN ARRAY IS NOT ASSIGNABLE. The strip normally turns
+      // `T x = init;` into `x = init;`, but `double vals[4] = {a,b,c,d}`
+      // becomes `vals = {a,b,c,d}`, which is neither a modifiable lvalue
+      // nor a valid initializer list. Element-wise assignment preserves
+      // the semantics exactly and keeps the array in the save list, which
+      // re-deriving it above the switch would not.
+      if (vd->getType()->isArrayType() && vd->hasInit()) {
+        if (const auto *il = dyn_cast<InitListExpr>(vd->getInit())) {
+          std::string out;
+          for (unsigned i = 0; i < il->getNumInits(); ++i) {
+            out += (i != 0 ? " " : "") + name + "[" + std::to_string(i) +
+                   "] = " + Text(sm_, lo_, il->getInit(i)->getSourceRange()) +
+                   ";";
+          }
+          Replace(rw_, ds->getSourceRange(), out);
+          continue;
+        }
       }
       if (vd->getType()->isArrayType() && !vd->hasInit()) {
         Replace(rw_, ds->getSourceRange(), "(void)" + name + ";");
