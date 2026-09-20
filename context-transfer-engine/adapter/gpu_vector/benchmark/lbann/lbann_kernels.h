@@ -52,6 +52,7 @@ using ::clio_lb::Sym01;
 // b1 was the only wrong input. Plain device arrays have neither failure
 // mode: every node computes the identical update from the gathered d1/d2,
 // so the copies agree bit-for-bit with no CTE round trip at all.
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain Fwd1Coro(gv::DeviceVector<float> w, u64 w1_off,
                                   const float *b1v, u64 I, u64 H, u64 B,
                                   const float *x, float *a1, u64 h0, u64 h1,
@@ -84,9 +85,11 @@ CTP_GPU_FUN inline gy::YCoroMain Fwd1Coro(gv::DeviceVector<float> w, u64 w1_off,
     w.UnpinRange(page_lo, count);
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 /** fwd2 + output gradient: z2[o,b], d2[o,b] = 2 (z2 - y) / (B*O), and the
  *  per-(o-range) loss partial, summed once by thread 0 in fixed order. */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain Fwd2Coro(gv::DeviceVector<float> w, u64 w2_off,
                                   const float *b2v, u64 H, u64 O, u64 B,
                                   const float *a1, const float *y, float *d2,
@@ -116,12 +119,14 @@ CTP_GPU_FUN inline gy::YCoroMain Fwd2Coro(gv::DeviceVector<float> w, u64 w2_off,
     w.UnpinRange(page_lo, count);
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 /** bwd1: d1[h,b] = relu'(a1) * sum_o W2[o,h] d2[o,b]. Reads W2 PRE-update
  *  (launched before upd2), one thread per (h,b), o-sum sequential. The
  *  block again owns o-ROWS of W2 pages for the sliding holds, but every
  *  block needs every row, so blocks stride the row-pages and accumulate
  *  into d1 with a fixed per-element owner: block(h) = h range. */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain Bwd1Coro(gv::DeviceVector<float> w, u64 w2_off,
                                   u64 H, u64 O, u64 B, const float *a1,
                                   const float *d2, float *d1, u64 h0, u64 h1,
@@ -169,9 +174,11 @@ CTP_GPU_FUN inline gy::YCoroMain Bwd1Coro(gv::DeviceVector<float> w, u64 w2_off,
     if (a1[h * B + b] <= 0.0f) d1[h * B + b] = 0.0f;
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 /** upd2: W2[o,h] -= lr sum_b d2[o,b] a1[h,b]; b2 likewise. Block owns
  *  o-rows: ONE WRITER PER PAGE, publish at the write site. */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain Upd2Coro(gv::DeviceVector<float> w, u64 w2_off,
                                   float *b2v, u64 H, u64 O, u64 B,
                                   const float *a1, const float *d2, float lr,
@@ -215,8 +222,10 @@ CTP_GPU_FUN inline gy::YCoroMain Upd2Coro(gv::DeviceVector<float> w, u64 w2_off,
   }
   co_await w.EndFlush();
 }
+#endif  // CLIO_HAS_YCORO
 
 /** upd1: W1[h,i] -= lr d1[h,b] x[b,i]; b1 likewise. Block owns h-rows. */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain Upd1Coro(gv::DeviceVector<float> w, u64 w1_off,
                                   float *b1v, u64 I, u64 H, u64 B,
                                   const float *x, const float *d1, float lr,
@@ -255,8 +264,10 @@ CTP_GPU_FUN inline gy::YCoroMain Upd1Coro(gv::DeviceVector<float> w, u64 w1_off,
   }
   co_await w.EndFlush();
 }
+#endif  // CLIO_HAS_YCORO
 
 /** Seed the weights deterministically and publish them. */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> w, u64 n, u64 e0,
                                   u64 e1, u64 chunk) {
   for (u64 lo = e0; lo < e1; lo += chunk) {
@@ -272,8 +283,10 @@ CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> w, u64 n, u64 
   }
   co_await w.EndFlush();
 }
+#endif  // CLIO_HAS_YCORO
 
 /** Order-independent integer digest of the weights: sum of bit patterns. */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain DigestCoro(gv::DeviceVector<float> w, u64 e0, u64 e1,
                                     u64 chunk, unsigned long long *out) {
   unsigned long long acc = 0;
@@ -290,6 +303,7 @@ CTP_GPU_FUN inline gy::YCoroMain DigestCoro(gv::DeviceVector<float> w, u64 e0, u
   }
   atomicAdd(out, acc);
 }
+#endif  // CLIO_HAS_YCORO
 
 /** Largest absolute elementwise difference between the paged weights and the
  *  dense reference, scaled to 1e9 so it fits an integer atomic.
@@ -303,6 +317,7 @@ CTP_GPU_FUN inline gy::YCoroMain DigestCoro(gv::DeviceVector<float> w, u64 e0, u
  *  unachievable one -- and unlike a looser hash or a sum-of-weights check,
  *  it still fails on a SINGLE wrong element rather than averaging it away.
  */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain MaxDiffCoro(gv::DeviceVector<float> w, u64 e0,
                                      u64 e1, u64 chunk, const float *ref,
                                      unsigned long long *out, u64 rlo,
@@ -341,6 +356,7 @@ CTP_GPU_FUN inline gy::YCoroMain MaxDiffCoro(gv::DeviceVector<float> w, u64 e0,
     old = prev;                // someone raised it; re-test against theirs
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 // -------------------- DENSE REFERENCE (same loops, plain memory) ----------
 

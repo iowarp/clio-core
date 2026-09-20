@@ -424,3 +424,61 @@ if(TARGET clio_gmx_nccl_bench AND MPIEXEC_EXECUTABLE)
         TIMEOUT 900 LABELS "bench;gpu;nccl;distributed" RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)
 endif()
+
+#------------------------------------------------------------------------------
+# gmx paged bench, MACRO-form edition -- the one that reaches Intel GPUs.
+#
+# NOTE THE GUARD: no `NOT SYCL_TARGET MATCHES "spir64"`. That exclusion exists
+# on the coroutine target above because clang cannot compile a device coroutine
+# for SPIR-V (EmitCoroutineBody builds the frame PHI in addrspace 0 and
+# llvm.coro.* is declared llvm_ptr_ty, while spir64 carries -G1). The macro
+# mechanism needs no compiler coroutine support, so it builds for spir64 --
+# which is what Aurora's Ponte Vecchio GPUs require.
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_SYCL)
+    set(_gmxm_inc
+        ${CMAKE_SOURCE_DIR}/context-runtime/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include)
+
+    add_library(gmx_macros_sycl_launch SHARED sycl/gmx_macros_launch_sycl.cc)
+    wrp_core_apply_sycl_flags(gmx_macros_sycl_launch)
+    set_target_properties(gmx_macros_sycl_launch PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    target_include_directories(gmx_macros_sycl_launch PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR} ${_gmxm_inc})
+    target_link_libraries(gmx_macros_sycl_launch PUBLIC
+        clio_run_cxx clio_run_cxx_gpu clio_cte_core_client)
+
+    add_executable(clio_gmx_macros_bench_sycl clio_gmx_macros_bench.cc)
+    target_link_options(clio_gmx_macros_bench_sycl PRIVATE
+        -fsycl -fsycl-targets=${SYCL_TARGET})
+    target_include_directories(clio_gmx_macros_bench_sycl PRIVATE
+        ${CLIO_SYCL_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${_gmxm_inc})
+    target_link_libraries(clio_gmx_macros_bench_sycl PRIVATE
+        gmx_macros_sycl_launch
+        clio_run_cxx clio_run_cxx_gpu clio_admin_client clio_bdev_client
+        clio_cte_core_client clio_cte_core_runtime clio::cte::gpu_vector
+        ${CMAKE_THREAD_LIBS_INIT})
+    set_target_properties(clio_gmx_macros_bench_sycl PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    install(TARGETS clio_gmx_macros_bench_sycl RUNTIME DESTINATION bin)
+
+    # REGRESSION COVERAGE for the SYCL row. Without an entry here the row is
+    # only ever as correct as the last time someone ran it by hand.
+    # --blocks 8 is the SYCL backend's documented ceiling, not a taste.
+    add_test(NAME cte_gpu_vector_gmx_macros_sycl
+        COMMAND clio_gmx_macros_bench_sycl --page-kb 128 --blocks 8 --atoms 200000
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_gmx_macros_sycl PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector;sycl;macros"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+    message(STATUS "gmx paged bench (SYCL, macro form): ON")
+endif()

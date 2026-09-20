@@ -115,6 +115,67 @@ if(CLIO_CORE_ENABLE_SYCL AND NOT SYCL_TARGET MATCHES "spir64")
 endif()
 
 #------------------------------------------------------------------------------
+# kmeans paged bench, MACRO-form edition -- the one that reaches Intel GPUs.
+#
+# NOTE THE GUARD: no `NOT SYCL_TARGET MATCHES "spir64"`. That exclusion exists
+# on the coroutine targets above because clang cannot compile a device
+# coroutine for SPIR-V (EmitCoroutineBody builds the frame PHI in addrspace 0
+# and llvm.coro.* is declared llvm_ptr_ty, while spir64 carries -G1). The macro
+# mechanism needs no compiler coroutine support, so it builds for spir64 --
+# which is what Aurora's Ponte Vecchio GPUs require.
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_SYCL)
+    set(_kmm_inc
+        ${CMAKE_SOURCE_DIR}/context-runtime/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include)
+
+    # SHARED, not static: device code in a static archive does not reach the
+    # executable's device image and the first kernel aborts in ProgramManager.
+    add_library(kmeans_macros_sycl_launch SHARED sycl/kmeans_macros_launch_sycl.cc)
+    wrp_core_apply_sycl_flags(kmeans_macros_sycl_launch)
+    set_target_properties(kmeans_macros_sycl_launch PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    target_include_directories(kmeans_macros_sycl_launch PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR} ${_kmm_inc})
+    target_link_libraries(kmeans_macros_sycl_launch PUBLIC
+        clio_run_cxx clio_run_cxx_gpu clio_cte_core_client)
+
+    add_executable(clio_kmeans_macros_bench_sycl clio_kmeans_macros_bench.cc)
+    # Not compiled with -fsycl, but linked with it: that is what pulls in the
+    # SYCL runtime and the device image from the launch library.
+    target_link_options(clio_kmeans_macros_bench_sycl PRIVATE
+        -fsycl -fsycl-targets=${SYCL_TARGET})
+    target_include_directories(clio_kmeans_macros_bench_sycl PRIVATE
+        ${CLIO_SYCL_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${_kmm_inc})
+    target_link_libraries(clio_kmeans_macros_bench_sycl PRIVATE
+        kmeans_macros_sycl_launch
+        clio_run_cxx clio_run_cxx_gpu clio_admin_client clio_bdev_client
+        clio_cte_core_client clio_cte_core_runtime clio::cte::gpu_vector
+        ${CMAKE_THREAD_LIBS_INIT})
+    set_target_properties(clio_kmeans_macros_bench_sycl PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    install(TARGETS clio_kmeans_macros_bench_sycl RUNTIME DESTINATION bin)
+
+    # Same gates as the coroutine row: a divergence between the two editions
+    # is a defect in the macro port, which is exactly what this catches.
+    add_test(NAME cte_gpu_vector_kmeans_macros_sycl
+        COMMAND clio_kmeans_macros_bench_sycl --blocks 8 --iters 2
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_kmeans_macros_sycl PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector;sycl;macros"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+    message(STATUS "kmeans paged bench (SYCL, macro form): ON")
+endif()
+
+#------------------------------------------------------------------------------
 # kmeans, MPI edition: baseline, links nothing from clio.
 #------------------------------------------------------------------------------
 if(CLIO_CORE_ENABLE_CUDA)

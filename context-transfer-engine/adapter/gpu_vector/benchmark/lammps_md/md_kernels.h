@@ -200,6 +200,7 @@ __device__ bool AdmitWaits(u32 need, u32 pool, u32 slack) {
  *  need 6 -- a permanent admit stall before the first force chunk). */
 __device__ constexpr u32 kAdmitSlackChunks = 8u;
 
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroTask AdmitSpans(u32 need, u32 pool, u32 slack) {
   if (need == 0u) co_return;
   u32 rounds = 0;
@@ -223,6 +224,7 @@ __device__ gy::YCoroTask AdmitSpans(u32 need, u32 pool, u32 slack) {
   }
   co_return;
 }
+#endif  // CLIO_HAS_YCORO
 
 __device__ void ReleaseSpans(u32 need) {
   __syncthreads();
@@ -330,6 +332,7 @@ CTP_GPU_FUN u32 PagesSpanned(const V &v, u64 off, u64 count) {
  * from geometry. Stage 1 only needs the layout to exist and to survive the
  * integrator; binning DYNAMICS (resort, stencils) arrive in stage 2.
  */
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
                                    gv::DeviceVector<float> f,
                                    u32 nb, u32 cap, float box, float cutoff,
@@ -474,6 +477,7 @@ __device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
     }
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 /**
  * K2c (stage 3): build the Verlet list on the PAGED neigh vector.
@@ -496,6 +500,7 @@ __device__ gy::YCoroMain ForceCoro(gv::DeviceVector<float> x,
  * global-index page lookup. 16 bits hold any row (nb * cap < 65536,
  * checked at startup).
  */
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
                                        gv::DeviceVector<int> nl, u32 nb,
                                        u32 cap, float box, float rlist,
@@ -773,6 +778,7 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
     co_await nl.EndFlush();
   }     // per-chunk loop
 }
+#endif  // CLIO_HAS_YCORO
 
 /**
  * K3-list (stage 3): the force pass streaming the Verlet list. Same
@@ -782,6 +788,7 @@ __device__ gy::YCoroMain BuildListCoro(gv::DeviceVector<float> x,
  * test here skips the skin shell, which is what keeps the list valid
  * between rebuilds.
  */
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
                                        gv::DeviceVector<float> f,
                                        gv::DeviceVector<int> nl, u32 nb,
@@ -1132,6 +1139,7 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
     }
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 /**
  * K2a: destination pass of the resort (stage 2). Positions have drifted
@@ -1151,6 +1159,7 @@ __device__ gy::YCoroMain ListForceCoro(gv::DeviceVector<float> x,
  * everyone wraps their own, everyone publishes, then everyone assigns.
  * This pass writes only pages this node owns, so one-writer-per-page holds.
  */
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain RebinWrapCoro(gv::DeviceVector<float> x, u32 nb,
                                        u32 cap, float box, u32 z0, u32 z1,
                                        u32 nblocks, u32 block) {
@@ -1187,6 +1196,7 @@ __device__ gy::YCoroMain RebinWrapCoro(gv::DeviceVector<float> x, u32 nb,
   }
   if (MdG().md_flush) co_await x.EndFlush();
 }
+#endif  // CLIO_HAS_YCORO
 
 /**
  * K2a-ii: ASSIGN. Claim a destination slot for every atom that lands in a bin
@@ -1207,6 +1217,7 @@ __device__ gy::YCoroMain RebinWrapCoro(gv::DeviceVector<float> x, u32 nb,
  * The halo planes are read-only here, so the write-per-page invariant the
  * generational design rests on is untouched.
  */
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain RebinAssignCoro(gv::DeviceVector<float> x, u32 nb,
                                          u32 cap, float box, u32 *bincnt,
                                          u32 *d_dest, int *d_err, u32 z0,
@@ -1276,6 +1287,7 @@ __device__ gy::YCoroMain RebinAssignCoro(gv::DeviceVector<float> x, u32 nb,
     }
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 /**
  * K2b: apply the permutation for ONE vector, src -> dst (the ping-pong
@@ -1306,6 +1318,7 @@ __device__ gy::YCoroMain RebinAssignCoro(gv::DeviceVector<float> x, u32 nb,
  * stencil shape the force pass already pays and is safe to share because
  * it is read-only.
  */
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
                                     gv::DeviceVector<float> srcx,
                                     gv::DeviceVector<float> dst, u32 nb,
@@ -1505,8 +1518,10 @@ __device__ gy::YCoroMain GatherCoro(gv::DeviceVector<float> src,
   }     // per-row loop
   if (MdG().md_flush) co_await dst.EndFlush();
 }
+#endif  // CLIO_HAS_YCORO
 
 /** Pre-sentinel every slot of a ping-pong destination vector. */
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain SentinelCoro(gv::DeviceVector<float> dst, u32 nb,
                                       u32 cap, u32 z0, u32 z1, u32 nblocks,
                                       u32 block) {
@@ -1530,9 +1545,11 @@ __device__ gy::YCoroMain SentinelCoro(gv::DeviceVector<float> dst, u32 nb,
   }
   if (MdG().md_flush) co_await dst.EndFlush();
 }
+#endif  // CLIO_HAS_YCORO
 
 /** K1/K4 for real MD: the kick reads the FORCE VECTOR (mass = 1). Same
  *  page-parallel shape as the ballistic form. */
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
                                          gv::DeviceVector<float> v,
                                          gv::DeviceVector<float> f,
@@ -1593,6 +1610,7 @@ __device__ gy::YCoroMain MDIntegrateCoro(gv::DeviceVector<float> x,
     co_await v.EndFlush();
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 /** Flush every dirty page of the SHARED x/v tables to the backing store, so
  *  host Download (which reads the store, not the frames) sees the truth.
@@ -1639,6 +1657,7 @@ __device__ inline float ProbeLoadCV(const float *p) {
 #endif
 }
 
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
                                        u32 nblocks, u32 block) {
   const u64 epp = x.ElemsPerPage();
@@ -1691,7 +1710,9 @@ __device__ gy::YCoroMain ReadProbeCoro(gv::DeviceVector<float> x, u64 passes,
     }
   }
 }
+#endif  // CLIO_HAS_YCORO
 
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
                                        gv::DeviceVector<float> v,
                                        gv::DeviceVector<float> third,
@@ -1769,10 +1790,12 @@ __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
   co_await x.EndFlush();
   co_await v.EndFlush();
 }
+#endif  // CLIO_HAS_YCORO
 
 /** K5: thermo -- KE and net momentum, block-reduced then atomically merged.
  *  Read-holds only. Reduction scratch is dynamic shared memory after the
  *  yield header. */
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain ThermoCoro(gv::DeviceVector<float> x,
                                     gv::DeviceVector<float> v,
                                     double *out, u32 nb, u32 cap, u32 z0,
@@ -1818,6 +1841,7 @@ __device__ gy::YCoroMain ThermoCoro(gv::DeviceVector<float> x,
     __syncthreads();
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 
 /**
@@ -1831,6 +1855,7 @@ __device__ gy::YCoroMain ThermoCoro(gv::DeviceVector<float> x,
  * what lets the reader below demand that version rather than whatever it
  * happens to have.
  */
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
                                          gv::DeviceVector<float> v, u32 nb,
                                          u32 cap, u32 z0, u32 z1, u64 gen,
@@ -1915,6 +1940,7 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
     }
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 /** Take the halo pin on a vector whose halo the NEXT pass will read at
  *  `gen` -- the gather-scoped twin of the publish's persistent x pin. The v
@@ -1924,6 +1950,7 @@ __device__ gy::YCoroMain PublishSlabCoro(gv::DeviceVector<float> x,
  *  has no barrier and may already be publishing the next step), and a
  *  migrating atom crosses with one generation's position and another's
  *  velocity. */
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain HaloPinCoro(gv::DeviceVector<float> x, u32 nb,
                                      u32 cap, u32 z0, u32 z1, u64 gen,
                                      u32 block) {
@@ -1940,6 +1967,7 @@ __device__ gy::YCoroMain HaloPinCoro(gv::DeviceVector<float> x, u32 nb,
   }
   co_return;
 }
+#endif  // CLIO_HAS_YCORO
 
 /** REFAULT-STALENESS PROBE (MD_VERIFY_REFAULT=N): write a round-stamped
  *  pattern to every slab page, publish it at the write site, drop every
@@ -1953,6 +1981,7 @@ __device__ float RefaultPattern(u64 pg, u64 round, u64 e) {
   return (float)(((pg * 131ull + round * 4099ull + (e & 63ull)) & 0xFFFFull));
 }
 
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain RefaultWriteCoro(gv::DeviceVector<float> x,
                                           u64 pg_lo, u64 pg_hi, u64 round,
                                           u64 ppp, u32 nblocks, u32 block) {
@@ -1977,6 +2006,7 @@ __device__ gy::YCoroMain RefaultWriteCoro(gv::DeviceVector<float> x,
     co_await x.EndFlush();
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 /** Which round wrote this value? -1 if it matches no round's pattern. */
 __device__ int RefaultDecode(u64 pg, u64 e, float v) {
@@ -1986,6 +2016,7 @@ __device__ int RefaultDecode(u64 pg, u64 e, float v) {
   return -1;
 }
 
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain RefaultVerifyCoro(gv::DeviceVector<float> x,
                                            u64 pg_lo, u64 pg_hi, u64 round,
                                            u64 ppp, u64 below_pg, u64 above_pg,
@@ -2042,10 +2073,12 @@ __device__ gy::YCoroMain RefaultVerifyCoro(gv::DeviceVector<float> x,
     x.UnpinRange(above_pg * epp, ppp * epp);
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 /** Give back the persistent halo pin before the resort swaps the handles:
  *  the OTHER vector carries the halo from the next exchange on, and a pin
  *  left behind would strand two planes of the scatter destination's pool. */
+#if CLIO_HAS_YCORO
 __device__ gy::YCoroMain HaloUnpinCoro(gv::DeviceVector<float> x, u32 nb,
                                        u32 cap, u32 z0, u32 z1, u32 block) {
   if (block == 0) {
@@ -2061,6 +2094,7 @@ __device__ gy::YCoroMain HaloUnpinCoro(gv::DeviceVector<float> x, u32 nb,
   }
   co_return;
 }
+#endif  // CLIO_HAS_YCORO
 
 
 

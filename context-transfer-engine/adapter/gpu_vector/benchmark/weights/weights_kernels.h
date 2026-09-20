@@ -84,6 +84,7 @@ CTP_GPU_FUN inline void BaselineBody(const ::clio::run::u32 *tile,
  * the frame; compare the CLIO_YLOCAL_INIT bookkeeping in the macro version
  * below. Suspends stay block-collective: every yield site votes.
  */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain SeedLaneCoro(gv::DeviceVector<::clio::run::u32> v,
                                       ::clio::run::u64 per,
                                       ::clio::run::u64 page_elems,
@@ -112,6 +113,7 @@ CTP_GPU_FUN inline gy::YCoroMain SeedLaneCoro(gv::DeviceVector<::clio::run::u32>
   }
   co_await v.EndFlush();
 }
+#endif  // CLIO_HAS_YCORO
 
 /**
  * The measured pass: a weighted sum over this block's slice of the model,
@@ -121,6 +123,7 @@ CTP_GPU_FUN inline gy::YCoroMain SeedLaneCoro(gv::DeviceVector<::clio::run::u32>
  * the read is an ordinary parallel loop with no fault path in it at all.
  */
 /** The measured pass as a per-lane coroutine; same shape as SeedLaneCoro. */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain WeightsLaneCoro(gv::DeviceVector<::clio::run::u32> v,
                                          ::clio::run::u64 per,
                                          ::clio::run::u64 page_elems,
@@ -152,6 +155,7 @@ CTP_GPU_FUN inline gy::YCoroMain WeightsLaneCoro(gv::DeviceVector<::clio::run::u
   }
   atomicAdd(sum, acc);
 }
+#endif  // CLIO_HAS_YCORO
 
 }  // namespace clio::gv_bench::weights
 

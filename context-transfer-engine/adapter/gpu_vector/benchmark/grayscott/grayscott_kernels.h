@@ -80,6 +80,7 @@ CTP_GPU_FUN inline void BaselineBody(const float *uzm, const float *uz,
 }
 
 /** Seed u and v for this block's z-range, one plane (= one page) at a time. */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane,
                                   u64 nx, u64 ny, u64 nz, u64 z0, u64 z1,
                                   u64 ubase, u64 vbase) {
@@ -110,6 +111,7 @@ CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane
   // durable before this kernel returns.
   co_await vec.EndFlush();
 }
+#endif  // CLIO_HAS_YCORO
 
 /**
  * One Gray-Scott step over this block's z-range.
@@ -119,6 +121,7 @@ CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> vec, u64 plane
  * slots >= 4 is enforced on the host. Boundary planes (z=0, z=nz-1) are copied
  * through rather than computed, the usual fixed-boundary treatment.
  */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane,
                                   u64 nx, u64 ny, u64 nz, u64 z0, u64 z1,
                                   u64 nlo, u64 nhi, u64 gen,
@@ -270,8 +273,10 @@ CTP_GPU_FUN inline gy::YCoroMain StepCoro(gv::DeviceVector<float> vec, u64 plane
     }
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 /** Sum of v over this block's range, for the correctness checksum. */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain SumCoro(gv::DeviceVector<float> vec, u64 plane,
                                  u64 z0, u64 z1, u64 vbase, double *out) {
   for (u64 z = z0; z < z1; ++z) {
@@ -286,6 +291,7 @@ CTP_GPU_FUN inline gy::YCoroMain SumCoro(gv::DeviceVector<float> vec, u64 plane,
     vec.UnpinRange(vbase + z * plane, plane);
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 }  // namespace clio::gv_bench::grayscott
 

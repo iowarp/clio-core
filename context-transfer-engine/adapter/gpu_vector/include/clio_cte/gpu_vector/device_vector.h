@@ -14,6 +14,11 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_runtime/gpu/yield_coro.h>
+/* The macro-form API below spells suspension with yield_stack.h's CLIO_Y*
+ * macros. yield_coro.h includes this header too, but only inside its
+ * CLIO_YIELD_CORO guard -- which is off precisely in the builds that need the
+ * macro form -- so include it directly rather than relying on that path. */
+#include <clio_runtime/gpu/yield_stack.h>
 #include <clio_runtime/types.h>
 
 #include "page.h"
@@ -273,6 +278,7 @@ class DeviceVector {
    * Only the named bytes become valid in the frame, and only those bytes may
    * be read back: a hold over elements this fetch did not name traps.
    */
+#if CLIO_HAS_YCORO
   template <typename... Args>
   __device__ clio::run::gpu::YCoroTask BeginFetch(clio::run::u64 generation,
                                                   Args... args) {
@@ -293,6 +299,7 @@ class DeviceVector {
     __syncthreads();
     co_return;
   }
+#endif  // CLIO_HAS_YCORO
 
   /**
    * Release the pins a Fetch took over [off, off+count).
@@ -317,12 +324,14 @@ class DeviceVector {
   }
 
   /** Wait for the outstanding BeginFetch and publish its pages. */
+#if CLIO_HAS_YCORO
   __device__ clio::run::gpu::YCoroTask AwaitFetch() {
     CLIO_CO_YIELD_WHEN(;, FetchBusy() && !FetchDone(), FetchTag());
     if (threadIdx.x == 0 && FetchBusy()) PublishFetch();
     __syncthreads();
     co_return;
   }
+#endif  // CLIO_HAS_YCORO
 
   /**
    * BeginFetch then AwaitFetch. Same ranges, same rules -- this is the whole
@@ -330,6 +339,7 @@ class DeviceVector {
    * the two is what lets a caller compute over one range while the next is
    * in flight; when there is no such work, the split is only noise.
    */
+#if CLIO_HAS_YCORO
   template <typename... Args>
   __device__ clio::run::gpu::YCoroTask Fetch(clio::run::u64 generation,
                                              Args... args) {
@@ -369,6 +379,7 @@ class DeviceVector {
     }
     co_return;
   }
+#endif  // CLIO_HAS_YCORO
 
   /** Name the first page still below the demanded generation. */
   __device__ void ReportGenStall(clio::run::u64 gen, const clio::run::u64 *lo,
@@ -415,6 +426,7 @@ class DeviceVector {
    * there. A page that is still absent is a caller error and the kernel
    * stops -- proceeding would read another page's bytes.
    */
+#if CLIO_HAS_YCORO
   __device__ clio::run::gpu::YCoroTaskT<Held<T>> HoldPage(
       clio::run::u64 off, clio::run::u64 count, bool write = false) {
     const clio::run::u64 pn = PageOf(off);
@@ -504,6 +516,7 @@ class DeviceVector {
     }
     co_return Pin(p, off, count, write);
   }
+#endif  // CLIO_HAS_YCORO
 
   /**
    * Write back only the named element ranges, as (offset, count) pairs. Use
@@ -511,6 +524,7 @@ class DeviceVector {
    * flush would send the frame's other bytes too and clobber whatever
    * another block put there.
    */
+#if CLIO_HAS_YCORO
   template <typename... Rest>
   __device__ clio::run::gpu::YCoroTask BeginFlush(clio::run::u64 generation,
                                                   clio::run::u64 off,
@@ -529,6 +543,7 @@ class DeviceVector {
     __syncthreads();
     co_return;
   }
+#endif  // CLIO_HAS_YCORO
 
   /**
    * Make a range current and hold it.
@@ -544,6 +559,7 @@ class DeviceVector {
    * What remains is Fetch + HoldPage, which is what the peer-miss path always
    * fell back to.
    */
+#if CLIO_HAS_YCORO
   __device__ clio::run::gpu::YCoroTaskT<Held<T>> UpdateRange(
       clio::run::u64 off, clio::run::u64 count, clio::run::u32 from,
       bool write = false, clio::run::u64 generation = 0) {
@@ -552,20 +568,24 @@ class DeviceVector {
     Held<T> h = co_await HoldPage(off, count, write);
     co_return static_cast<Held<T> &&>(h);
   }
+#endif  // CLIO_HAS_YCORO
 
   /** Wait for the writeback started by BeginFlush. */
+#if CLIO_HAS_YCORO
   __device__ clio::run::gpu::YCoroTask EndFlush() {
     CLIO_CO_YIELD_WHEN(;, FlushBusy() && !FlushDone(), FlushTag());
     if (threadIdx.x == 0 && FlushBusy()) RetireFlush();
     __syncthreads();
     co_return;
   }
+#endif  // CLIO_HAS_YCORO
 
   /**
    * BeginFlush then EndFlush. The put has landed when this returns, so the
    * range is readable by any other block. Prefer the split form inside a
    * loop, where the put of one page overlaps the next page's compute.
    */
+#if CLIO_HAS_YCORO
   template <typename... Rest>
   __device__ clio::run::gpu::YCoroTask Flush(clio::run::u64 generation,
                                              clio::run::u64 off,
@@ -574,6 +594,185 @@ class DeviceVector {
     co_await BeginFlush(generation, off, count, rest...);
     co_await EndFlush();
     co_return;
+  }
+#endif  // CLIO_HAS_YCORO
+
+  // ==================== Macro-form yieldable API (no coroutines) ===========
+  //
+  // WHY THIS EXISTS. SPIR-V cannot compile a device coroutine at all, so the
+  // co_await methods above are unreachable on Intel GPUs. It is not a clang
+  // oversight that a flag works around: clang's EmitCoroutineBody builds the
+  // coroutine-frame PHI as `ptr addrspace(0)` (CGCoroutine.cpp), and the whole
+  // llvm.coro.* family is declared `llvm_ptr_ty` rather than `llvm_anyptr_ty`,
+  // while spir64's datalayout carries -G1. Measured on Aurora oneAPI 2025.2 and
+  // 2025.3.2 and on intel/llvm nightly-2026-09-18 (clang 24); -O0/-O1/-O2,
+  // -fno-sycl-early-optimizations and per_kernel split all abort identically,
+  // and hand-rolling with __builtin_coro_* dies one layer down on the same
+  // address space. NVPTX is unaffected only because its default AS is 0.
+  //
+  // These are the SAME operations expressed with the macro (Duff's device)
+  // mechanism in yield_stack.h, which needs no compiler coroutine support.
+  // They are ADDITIVE -- nothing above is modified, and CUDA/NVPTX keeps the
+  // coroutine path.
+  //
+  // CALLING CONVENTION. Every M-method is yieldable in the macro sense, so a
+  // caller reaches it with CLIO_YCALL(...) from inside its own
+  // CLIO_YBEGIN/CLIO_YEND body. Operations that return a value take an
+  // out-pointer, because CLIO_YCALL discards the call expression's value.
+
+  /** Range scratch as a named type: CLIO_YLOCAL cannot take `T[N]` directly,
+   *  the comma-free array type has to arrive as one macro argument. */
+  using MRangeArr = clio::run::u64[kMaxFetchRanges];
+
+  /** Macro-form BeginFetch. Mirrors BeginFetch() above. */
+  template <typename... Args>
+  CTP_GPU_FUN void MBeginFetch(clio::run::u64 generation, Args... args) {
+    CLIO_YFRAME();
+    // lo/hi/nr are computed BEFORE the AwaitFetch yield and read after it, so
+    // they are frame locals rather than automatics -- this is exactly the
+    // "locals do not survive a yield" rule the macro mechanism imposes.
+    CLIO_YLOCAL(MRangeArr, lo);
+    CLIO_YLOCAL(MRangeArr, hi);
+    CLIO_YLOCAL_INIT(clio::run::u32, nr, 0);
+    CLIO_YBEGIN();
+    if (threadIdx.x == 0) Tasks()->fetch_generation = generation;
+    __syncthreads();
+    nr = 0;
+    GatherRanges(lo, hi, nr, args...);
+    // One fetch in flight per block, as in the coroutine form.
+    if (FetchBusy()) {
+      CLIO_YCALL(MAwaitFetch());
+    }
+    if (threadIdx.x == 0) SubmitFetch(lo, hi, nr);
+    __syncthreads();
+    CLIO_YEND();
+  }
+
+  /** Macro-form AwaitFetch. Mirrors AwaitFetch() above. */
+  CTP_GPU_FUN void MAwaitFetch() {
+    CLIO_YFRAME();
+    CLIO_YBEGIN();
+    // CLIO_YIELD_IF_RESUME_WHEN re-tests on resume (its case label sits before
+    // the if), which is the looping behaviour CLIO_CO_YIELD_WHEN provides.
+    CLIO_YIELD_IF_RESUME_WHEN(FetchBusy() && !FetchDone(), FetchTag());
+    if (threadIdx.x == 0 && FetchBusy()) PublishFetch();
+    __syncthreads();
+    CLIO_YEND();
+  }
+
+  /** Macro-form Fetch. Mirrors Fetch() above. */
+  template <typename... Args>
+  CTP_GPU_FUN void MFetch(clio::run::u64 generation, Args... args) {
+    CLIO_YFRAME();
+    CLIO_YBEGIN();
+    CLIO_YCALL(MBeginFetch(generation, args...));
+    CLIO_YCALL(MAwaitFetch());
+    CLIO_YEND();
+  }
+
+  /**
+   * Macro-form HoldPage. Mirrors HoldPage() above; the pin is written through
+   * `out` because CLIO_YCALL cannot carry a return value.
+   *
+   * The voted branches are load-bearing for the same reason they are in the
+   * coroutine version: `p` derives from peer-mutated state and both arms below
+   * contain __syncthreads, so an unvoted test splits the block at a barrier.
+   */
+  CTP_GPU_FUN void MHoldPage(Held<T> *out, clio::run::u64 off,
+                             clio::run::u64 count, bool write = false) {
+    CLIO_YFRAME();
+    CLIO_YLOCAL_INIT(clio::run::u64, pn, PageOf(off));
+    CLIO_YLOCAL_INIT(Page *, p, nullptr);
+    CLIO_YLOCAL_INIT(int, once, 0);
+    CLIO_YBEGIN();
+    pn = PageOf(off);
+    p = Find(pn);
+    if (__syncthreads_or(p == nullptr ? 1 : 0)) {
+      CLIO_YCALL(MAwaitFetch());
+      p = Find(pn);
+    }
+    // Wait for the peer that claimed the frame; see HoldPage() for why the
+    // wait tag is 0 (there is no completion word to poll for a peer publish).
+    for (;;) {
+      if (!__syncthreads_or(p == nullptr ? 1 : 0)) break;
+      if (!__syncthreads_or(FindClaimed(pn) != nullptr ? 1 : 0)) break;
+      once = 0;
+      CLIO_YIELD_IF_RESUME_WHEN(once++ == 0, 0ull);
+      p = Find(pn);
+    }
+    if (__syncthreads_or(p == nullptr ? 1 : 0)) {
+      if (threadIdx.x == 0) {
+        printf("[gpu_vector] FATAL page=%llu not resident (macro form). "
+               "MHoldPage does not fetch -- name it in an MFetch first.\n",
+               (unsigned long long) pn);
+      }
+      FatalNote(kFatalNotResident, pn, SetOf(pn), h_->set_size_);
+      __trap();
+    }
+    // Resident is not valid: a fetch transfers only the range it was given.
+    if (!write) {
+      const clio::run::u64 in = off % h_->elems_per_page_;
+      clio::run::u64 run = h_->elems_per_page_ - in;
+      if (run > count) run = count;
+      if (__syncthreads_or(!Covers(p, static_cast<clio::run::u32>(in),
+                                   static_cast<clio::run::u32>(in + run))
+                               ? 1 : 0)) {
+        if (threadIdx.x == 0) {
+          printf("[gpu_vector] FATAL page=%llu: elements [%u,%u) were never "
+                 "fetched (frame holds [%u,%u)). Name the range in an "
+                 "MFetch first.\n",
+                 (unsigned long long) PageOf(off), (unsigned) in,
+                 (unsigned) (in + run), p->valid_lo, p->valid_hi);
+        }
+        FatalNote(kFatalNotCovered, PageOf(off), in, p->valid_hi);
+        __trap();
+      }
+    }
+    *out = Pin(p, off, count, write);
+    CLIO_YEND();
+  }
+
+  /** Macro-form BeginFlush. Mirrors BeginFlush() above. */
+  template <typename... Rest>
+  CTP_GPU_FUN void MBeginFlush(clio::run::u64 generation, clio::run::u64 off,
+                               clio::run::u64 count, Rest... rest) {
+    CLIO_YFRAME();
+    CLIO_YLOCAL(MRangeArr, rlo);
+    CLIO_YLOCAL(MRangeArr, rhi);
+    CLIO_YLOCAL_INIT(clio::run::u32, nr, 0);
+    CLIO_YBEGIN();
+    if (threadIdx.x == 0) Tasks()->flush_generation = generation;
+    __syncthreads();
+    nr = 0;
+    GatherRanges(rlo, rhi, nr, off, count, rest...);
+    CLIO_YIELD_IF_RESUME_WHEN(FlushBusy() && !FlushDone(), FlushTag());
+    if (threadIdx.x == 0) {
+      if (FlushBusy()) RetireFlush();
+      SubmitFlushRanges(rlo, rhi, nr);
+    }
+    __syncthreads();
+    CLIO_YEND();
+  }
+
+  /** Macro-form EndFlush. Mirrors EndFlush() above. */
+  CTP_GPU_FUN void MEndFlush() {
+    CLIO_YFRAME();
+    CLIO_YBEGIN();
+    CLIO_YIELD_IF_RESUME_WHEN(FlushBusy() && !FlushDone(), FlushTag());
+    if (threadIdx.x == 0 && FlushBusy()) RetireFlush();
+    __syncthreads();
+    CLIO_YEND();
+  }
+
+  /** Macro-form Flush. Mirrors Flush() above. */
+  template <typename... Rest>
+  CTP_GPU_FUN void MFlush(clio::run::u64 generation, clio::run::u64 off,
+                          clio::run::u64 count, Rest... rest) {
+    CLIO_YFRAME();
+    CLIO_YBEGIN();
+    CLIO_YCALL(MBeginFlush(generation, off, count, rest...));
+    CLIO_YCALL(MEndFlush());
+    CLIO_YEND();
   }
 
  private:

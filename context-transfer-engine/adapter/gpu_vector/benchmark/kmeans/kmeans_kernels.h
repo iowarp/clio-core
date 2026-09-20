@@ -62,6 +62,7 @@ using ::clio_km::PointVal;
  *  different problem than the reference it is gated against. Zero for a
  *  single-node run, which is therefore unchanged.
  */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> v, u64 per,
                               u64 page_elems, u32 dims, u32 k, u64 base_idx,
                               u32 block) {
@@ -83,6 +84,7 @@ CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> v, u64 per,
   // to eviction would simply be lost.
   co_await v.EndFlush();
 }
+#endif  // CLIO_HAS_YCORO
 
 /**
  * One Lloyd assignment pass over this block's slice.
@@ -93,6 +95,7 @@ CTP_GPU_FUN inline gy::YCoroMain SeedCoro(gv::DeviceVector<float> v, u64 per,
  * this accepts. (It is also why there is no __shared__ anywhere in this
  * benchmark, and so why one kernel body serves both backends.)
  */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain AssignCoro(gv::DeviceVector<float> v, u64 per,
                                 u64 page_elems, u32 dims, u32 k,
                                 const float *cent, float *sums,
@@ -133,6 +136,7 @@ CTP_GPU_FUN inline gy::YCoroMain AssignCoro(gv::DeviceVector<float> v, u64 per,
     v.UnpinRange(base + off, n);
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 /* ------------------------------------------------------------------ */
 /* Plain (non-paged) kernel bodies. These are ordinary functions; the   */

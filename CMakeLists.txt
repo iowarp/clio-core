@@ -1390,8 +1390,32 @@ if(NOT CLIO_CORE_MSVC_LIKE)
     # always clang (DPC++) or AdaptiveCpp, never nvcc, so the reason that
     # option exists does not apply.
     if(CLIO_CORE_ENABLE_SYCL)
-        add_compile_definitions(CLIO_YIELD_CORO)
-        message(STATUS "Yieldable GPU kernels: C++20 device coroutines (SYCL)")
+        # Which yield mechanism SYCL gets is decided by the TARGET, not by
+        # preference, because SPIR-V cannot compile a device coroutine at all:
+        # clang's EmitCoroutineBody builds the coroutine-frame PHI assuming the
+        # default address space, and spir64's datalayout puts globals in
+        # addrspace 1 (-G1), so the PHI gets mismatched operand types and
+        # clang aborts on
+        #   "All operands to PHI node must be the same type as the PHI node!"
+        # Measured on Aurora oneAPI 2025.2 / 2025.3.2 AND on intel/llvm
+        # nightly-2026-09-18 (clang 24); -O0/-O1/-O2,
+        # -fno-sycl-early-optimizations and per_kernel split all abort alike.
+        # NVPTX is unaffected only because its datalayout has no -G field, so
+        # globals land in addrspace 0 and the operands happen to agree. Upstream
+        # intel/llvm#20661 was closed by a stale bot, unfixed.
+        #
+        # So: coroutines where they work (NVPTX), the macro mechanism on SPIR-V.
+        # yield_stack.h's YieldTls() already has the SYCL branch the macro path
+        # needs -- it puts the block's YieldSmem in global memory, which is why
+        # `extern __shared__` is not the blocker an older comment here claimed.
+        if(SYCL_TARGET MATCHES "spir64")
+            message(STATUS
+                "Yieldable GPU kernels: macro/Duff's device "
+                "(SPIR-V cannot compile device coroutines)")
+        else()
+            add_compile_definitions(CLIO_YIELD_CORO)
+            message(STATUS "Yieldable GPU kernels: C++20 device coroutines (SYCL)")
+        endif()
 
         # CTP_ENABLE_SYCL GLOBALLY, and this is a correctness requirement
         # rather than convenience.
