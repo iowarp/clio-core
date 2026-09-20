@@ -52,6 +52,9 @@
 #include "../bench_flush_data.h"
 #include <clio_cte/gpu_vector/gpu_vector.h>
 #include <clio_ctp/util/gpu_api.h>
+#if CTP_ENABLE_SYCL
+#include <sycl/sycl.hpp>
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -287,10 +290,137 @@ CTP_GPU_FUN inline void ZeroCoro(gv::DeviceVector<unsigned long long> mesh,
 }
 
 /* ==========================================================================
- * THE LAUNCHES. Identical to cuda/gmx_launch_cuda.cc except that
- * CLIO_YCORO_RUN becomes CLIO_COROC_RUN, which also absorbs the
- * YieldTlsPublish the old macro needed beside it.
+ * THE LAUNCHES.
+ *
+ * TWO BACKENDS, ONE WORKLOAD. Everything above this line is compiled for
+ * both: the transpiled state machine contains no vendor token, which is the
+ * property the whole design exists to buy. What differs below is only how a
+ * grid is submitted -- `<<<>>>` or `parallel_for` -- and that difference is
+ * the same one the original cuda/ and sycl/ launchers already carry.
+ *
+ * The CUDA arm is cuda/gmx_launch_cuda.cc with CLIO_YCORO_RUN replaced by
+ * CLIO_COROC_RUN, which also absorbs the YieldTlsPublish the old macro
+ * needed beside it. The SYCL arm is sycl/gmx_launch_sycl.cc with the same
+ * substitution, and with the lambda now taking the context and CALLING the
+ * workload rather than returning a task from it.
  * ========================================================================== */
+
+#if CTP_ENABLE_SYCL
+
+namespace {
+
+/** One grid, submitted. */
+template <typename BodyT>
+void Submit(dim3 grid, dim3 block, BodyT body) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t global = static_cast<size_t>(grid.x) * block.x;
+  q.parallel_for(
+       sycl::nd_range<1>{sycl::range<1>(global), sycl::range<1>(block.x)},
+       [=](sycl::nd_item<1>) { body(); })
+      .wait();
+}
+
+/**
+ * A suspending entry, submitted.
+ *
+ * `make` takes the context FIRST, as every suspending call does, and calls
+ * the workload rather than returning a task -- there are no task types any
+ * more. CLIO_COROC_RUN declares `_cy` and publishes the stack.
+ */
+template <typename MakeCall>
+void SubmitYieldable(dim3 grid, dim3 block, DevMesh mesh, View vw,
+                     StackView sv, MakeCall make) {
+  Submit(grid, block, [=]() {
+    DevMesh dev = mesh;
+    dev.Init(vw.Block());
+    CLIO_COROC_RUN(vw, sv, make(_cy, dev, vw.Block()));
+  });
+}
+
+}  // namespace
+
+void InitBackend(u32 max_blocks, const GpuInfo &info) {
+  ::clio::run::gpu::SyclInitBlockIpcManagers(max_blocks, info);
+}
+
+void LaunchZero(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
+                u64 K, u64 plane, u64 zper, u64 zbase, u64 zend, View vw,
+                StackView sv) {
+  (void)info;  // stamped once by InitBackend, not per launch
+  (void)K;
+  SubmitYieldable(grid, block, mesh, vw, sv,
+                  [=](clio::co::Ctx &cy, DevMesh dev, u32 blk) {
+                    const u64 z0 = zbase + static_cast<u64>(blk) * zper;
+                    const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
+                    ZeroCoro(cy, dev, plane, z0, z1);
+                  });
+}
+
+void LaunchSpread(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
+                  const float *ax, const float *ay, const float *az,
+                  const long long *aq, const u32 *bin_start, u64 K, u64 plane,
+                  u64 zper, u64 zbase, u64 zend, View vw, StackView sv) {
+  (void)info;
+  SubmitYieldable(grid, block, mesh, vw, sv,
+                  [=](clio::co::Ctx &cy, DevMesh dev, u32 blk) {
+                    const u64 z0 = zbase + static_cast<u64>(blk) * zper;
+                    const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
+                    SpreadCoro(cy, dev, ax, ay, az, aq, bin_start, K, plane,
+                               z0, z1);
+                  });
+}
+
+void LaunchSum(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh, u64 K,
+               u64 plane, u64 zper, unsigned long long *out, u64 zbase,
+               u64 zend, View vw, StackView sv) {
+  (void)info;
+  SubmitYieldable(grid, block, mesh, vw, sv,
+                  [=](clio::co::Ctx &cy, DevMesh dev, u32 blk) {
+                    const u64 z0 = zbase + static_cast<u64>(blk) * zper;
+                    const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
+                    SumCoro(cy, dev, K, plane, z0, z1, out);
+                  });
+}
+
+void LaunchGather(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
+                  const float *ax, const float *ay, const float *az,
+                  const long long *aq, const u32 *bin_start, u64 K, u64 plane,
+                  u64 bper, unsigned long long *out, u64 zbase, u64 zend,
+                  View vw, StackView sv) {
+  (void)info;
+  SubmitYieldable(grid, block, mesh, vw, sv,
+                  [=](clio::co::Ctx &cy, DevMesh dev, u32 blk) {
+                    const u64 b0 = zbase + static_cast<u64>(blk) * bper;
+                    const u64 b1 = (b0 + bper < zend) ? (b0 + bper) : zend;
+                    GatherCoro(cy, dev, ax, ay, az, aq, bin_start, K, plane,
+                               b0, b1, out);
+                  });
+}
+
+void LaunchDenseSpread(u32 blocks, u32 threads, unsigned long long *mesh,
+                       const float *ax, const float *ay, const float *az,
+                       const long long *aq, const u32 *bin_start, u64 K,
+                       u64 plane, u64 zper) {
+  Submit(dim3(blocks), dim3(threads), [=]() {
+    DenseSpreadBody(mesh, ax, ay, az, aq, bin_start, K, plane, zper);
+  });
+}
+
+void LaunchDenseSum(const unsigned long long *mesh, u64 n,
+                    unsigned long long *out) {
+  Submit(dim3(64), dim3(256), [=]() { DenseSumBody(mesh, n, out); });
+}
+
+void LaunchDenseGather(u32 blocks, u32 threads, const unsigned long long *mesh,
+                       const float *ax, const float *ay, const float *az,
+                       const long long *aq, const u32 *bin_start, u64 K,
+                       u64 plane, u64 bper, unsigned long long *out) {
+  Submit(dim3(blocks), dim3(threads), [=]() {
+    DenseGatherBody(mesh, ax, ay, az, aq, bin_start, K, plane, bper, out);
+  });
+}
+
+#else  /* CUDA */
 
 namespace {
 
@@ -421,6 +551,8 @@ void LaunchDenseGather(u32 blocks, u32 threads, const unsigned long long *mesh,
   DenseGatherKernelNew<<<blocks, threads>>>(mesh, ax, ay, az, aq, bin_start, K,
                                             plane, bper, out);
 }
+
+#endif  /* CTP_ENABLE_SYCL */
 
 }  // namespace clio::gv_bench::gmx
 
