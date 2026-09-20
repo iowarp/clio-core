@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Figure 9: end-to-end wall-clock time per workload, lower is better.
 
-(a) the ablation and (b) NeuroPress against fixed codecs. Every bar is an
-independent run; its pale upper segment is that run's own I/O time.
+(a) the ablation ladder and (b) NeuroPress against fixed codecs. Every bar is
+one run: the solid segment is its write loop, the pale one the input read and
+the final flush (see fig9.md, beside this file, for what that does and does
+not mean).
+
+THE ARMS, THE WORKLOADS AND THE ERROR BOUNDS ALL COME FROM THE CSV. This script
+carries no data of its own and no fixed arm list -- an earlier version did, and
+a campaign whose arm names it did not happen to list lost those bars silently.
 
 Usage:
-  ./plot_fig9.py                            # defaults, writes figures/
-  ./plot_fig9.py --csv a.csv [--csv b.csv]  # measured, merged per workload
-  ./plot_fig9.py --write-template fig9.csv
+  ./plot_fig9.py --csv fig9.csv [--csv other.csv]   # merged per workload
+  ./plot_fig9.py --write-template fig9.csv          # an empty CSV, header only
 """
-import argparse, csv, math, os, sys
+import argparse, csv, math, os, re, sys
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -29,7 +34,10 @@ Y_AUTO_BELOW = 0.5                 # if max(total) < Y_CLIP*this, rescale to the
 IO_BLEND = 0.60                    # I/O segment blended this far toward white
 BAR_PAD = 0.18                     # fraction of the group width left as gutter
 
-WORKLOADS = ["VPIC", "Nyx", "LAMMPS", "WarpX", "AI"]
+# Preferred left-to-right column order. A workload present in the CSV but not
+# named here is appended in the order it first appears, so a new one plots
+# without editing this file.
+WORKLOAD_ORDER = ["VPIC", "Nyx", "LAMMPS", "WarpX", "AI"]
 
 # tab10 mapping carried over from the published figure, so colours stay stable
 # Untiered arms write straight to the PFS; every +Tier arm spills to NVMe. A
@@ -42,6 +50,12 @@ COLORS_A = {
     "NP+Tier":               "#ff7f0e",
     "NP+Tier+Async":         "#9467bd",
     "NP+Tier+Async+Lossy":   "#d62728",
+    # The lossy ladder as the published figure drew it: one hue per bound, not
+    # three shades of one. Listed rather than derived so a re-plot reproduces
+    # the campaign's own colours.
+    "NP+Tier+Async+Lossy (low)":  "#d62728",
+    "NP+Tier+Async+Lossy (med)":  "#e377c2",
+    "NP+Tier+Async+Lossy (high)": "#17becf",
 }
 COLORS_B = {
     "Best fixed nvCOMP":      "#1f77b4",
@@ -55,8 +69,99 @@ COLORS_B = {
     "NeuroPress":             "#d62728",
     "NeuroPress+Tier":        "#ff9896",
 }
-ORDER_A = list(COLORS_A)
-ORDER_B = list(COLORS_B)
+# Codecs that are lossless however they were invoked: panel (b) gives ndzip the
+# run's error bound, but it ignores it.
+LOSSLESS_BASES = {"ndzip"}
+
+# Hues for an arm no palette above names. Deliberately distinct from both.
+FALLBACK_CYCLE = ["#17becf", "#e377c2", "#bcbd22", "#8c564b", "#7b4173",
+                  "#843c39", "#5254a3", "#637939"]
+
+_LADDER_RE = re.compile(r"\s*\((low|med|high)\)\s*$")
+_LADDER_TINT = {"low": 0.0, "med": 0.30, "high": 0.55}
+
+
+def base_name(strategy):
+    """The arm's family: its ladder suffix and a trailing `+Tier` removed.
+
+    `NP+Tier+Async+Lossy (med)` -> `NP+Tier+Async+Lossy`; `cuSZ+Tier` -> `cuSZ`.
+    Consulted only for an arm the palettes do not name, so that it lands near
+    its family's hue instead of an arbitrary one.
+
+    @param strategy Arm label exactly as the CSV spells it.
+    @return The family name, which may equal `strategy`.
+    """
+    s = _LADDER_RE.sub("", strategy)
+    return s[:-len("+Tier")] if s.endswith("+Tier") else s
+
+
+def build_palette(order, known):
+    """Map every arm of one panel to a colour, published hues first.
+
+    An unlisted arm is derived rather than dropped: a `+Tier` row takes its
+    codec's hue blended toward white, a `(med)`/`(high)` ladder step a deeper
+    blend of its family's, and a name with no family at all takes the next
+    fallback hue. Deterministic -- the same CSV always plots the same colours.
+
+    @param order Arm labels for this panel, in plotting order.
+    @param known Published {label: colour} for this panel.
+    @return {label: colour} covering every entry of `order`.
+    """
+    out, spare = {}, 0
+    for s in order:
+        if s in known:
+            out[s] = known[s]
+            continue
+        base = base_name(s)
+        if base in known:
+            m = _LADDER_RE.search(s)
+            tint = _LADDER_TINT.get(m.group(1), 0.0) if m else 0.0
+            if s.endswith("+Tier"):
+                tint = max(tint, 0.45)
+            out[s] = (mpl.colors.to_hex(blend_to_white(known[base], tint))
+                      if tint > 0 else known[base])
+        else:
+            out[s] = FALLBACK_CYCLE[spare % len(FALLBACK_CYCLE)]
+            spare += 1
+    return out
+
+
+def panel_order(rows, panel, known):
+    """Arms of one panel: the published order first, then any new name.
+
+    The order comes from the DATA. That is what lets a campaign with a
+    different arm set -- an extra error-bound step, a tiered variant -- plot
+    completely instead of losing the bars this file does not name.
+
+    @param rows Raw CSV rows.
+    @param panel "a" or "b".
+    @param known Published palette for that panel; its key order is canonical.
+    @return Arm labels in plotting order.
+    """
+    seen = []
+    for r in rows:
+        if (r.get("panel") or "").strip() != panel:
+            continue
+        s = (r.get("strategy") or "").strip()
+        if s and s not in seen:
+            seen.append(s)
+    head = [s for s in known if s in seen]
+    return head + [s for s in seen if s not in head]
+
+
+def workload_order(rows):
+    """Workloads as columns: the canonical five first, then any other.
+
+    @param rows Raw CSV rows.
+    @return Workload names in plotting order.
+    """
+    seen = []
+    for r in rows:
+        w = (r.get("workload") or "").strip()
+        if w and w not in seen:
+            seen.append(w)
+    head = [w for w in WORKLOAD_ORDER if w in seen]
+    return head + [w for w in seen if w not in head]
 
 # The single figure carries both panels, so every bar needs its own colour: the
 # panel (b) palette above deliberately reuses (a)'s hues. Panel (b)'s NeuroPress
@@ -66,63 +171,11 @@ COLORS_B_SINGLE = {"Best fixed nvCOMP": "#08519c", "Best fixed nvCOMP+Tier": "#6
                    "ndzip": "#b15928", "ndzip+Tier": "#dbdb8d",
                    "cuSZp3": "#006d2c", "cuSZp3+Tier": "#a1d99b",
                    "cuSZ": "#252525", "cuSZ+Tier": "#969696"}
-ORDER_SINGLE = ([("a", s) for s in ORDER_A] +
-                [("b", s) for s in ORDER_B if s in COLORS_B_SINGLE])
-COLORS_SINGLE = {**COLORS_A, **COLORS_B_SINGLE}
-
-# Error bound per arm, as figure_9.sh sets it; the CSV's eb column overrides.
-# Every lossy arm now runs at the same bound, 1e-3; the CSV's eb column wins.
-EB_DEFAULT = {k: 1e-3 for k in
-              ("NP+Tier+Async+Lossy", "Best fixed nvCOMP", "Best fixed nvCOMP+Tier",
-               "cuSZp3", "cuSZp3+Tier", "cuSZ", "cuSZ+Tier",
-               "NeuroPress", "NeuroPress+Tier")}
-LOSSLESS = {"ndzip", "ndzip+Tier"}   # given the bound, but a lossless codec
-
-# Default data, read off the published figure: (total, compute) in minutes.
-# AI is an empty placeholder column.
-_A = {                     # strategy -> {workload: (total, compute)}
-    "Baseline":      {"VPIC": (5.5, 1.10), "Nyx": (5.5, 2.75), "LAMMPS": (6.0, 1.19), "WarpX": (5.0, 2.49)},
-    "nvCOMP":        {"VPIC": (4.4, 1.14), "Nyx": (4.9, 2.85), "LAMMPS": (4.8, 1.24), "WarpX": (4.5, 2.60)},
-    "nvCOMP+Tier":   {"VPIC": (3.4, 1.13), "Nyx": (4.3, 2.82), "LAMMPS": (3.7, 1.23), "WarpX": (3.9, 2.57)},
-    "NP only":       {},   # no data yet
-    "NP+Tier":       {"VPIC": (3.0, 1.10), "Nyx": (4.0, 2.75), "LAMMPS": (3.3, 1.19), "WarpX": (3.6, 2.49)},
-    "NP+Tier+Async": {"VPIC": (2.5, 1.06), "Nyx": (3.6, 2.66), "LAMMPS": (2.8, 1.16), "WarpX": (3.3, 2.43)},
-    "NP+Tier+Async+Lossy": {"VPIC": (2.2, 1.05), "Nyx": (3.4, 2.63), "LAMMPS": (2.5, 1.14), "WarpX": (3.1, 2.40)},
-}
-
-# Panel (b) defaults: old VPIC totals with no compute/I-O split (drawn hatched).
-_B = {
-    "Best fixed nvCOMP": {"VPIC": 3.4},
-    "ndzip":             {"VPIC": 3.1},
-    "cuSZp3":            {"VPIC": 2.8},
-    "cuSZ":              {"VPIC": 14.2},   # clipped; real value printed above
-    "NeuroPress":        {"VPIC": 2.2},
-}
-
-
-def default_rows():
-    """Defaults as long-format rows, matching the --csv schema exactly."""
-    rows = []
-    for s in ORDER_A:
-        for w in WORKLOADS:
-            tc = _A[s].get(w)
-            if tc is None:
-                rows.append(dict(panel="a", workload=w, strategy=s,
-                                 compute_min="", io_min="", total_min="", std_min=""))
-            else:
-                total, comp = tc
-                rows.append(dict(panel="a", workload=w, strategy=s,
-                                 compute_min=f"{comp:.2f}",
-                                 io_min=f"{total - comp:.2f}",
-                                 total_min=f"{total:.2f}", std_min=""))
-    for s in ORDER_B:
-        for w in WORKLOADS:
-            t = _B[s].get(w)
-            rows.append(dict(panel="b", workload=w, strategy=s,
-                             compute_min="", io_min="",
-                             total_min="" if t is None else f"{t:.2f}", std_min=""))
-    return rows
-
+# The error bound of every arm comes from the CSV's `eb` column. It used to
+# have a hardcoded fallback table here, which is what the legend actually read:
+# the lookup meant to consult the data unpacked the index key in the wrong
+# order and never matched, so a re-plot at a different bound still printed
+# 1e-3. The column is written by figure_9.sh for every row.
 
 FIELDS = ["panel", "workload", "strategy", "compute_min", "io_min", "total_min", "std_min", "ratio", "eb"]
 
@@ -172,7 +225,13 @@ def blend_to_white(hexcolor, frac):
 # ----------------------------------------------------------------------------
 # SANITY CHECKS -- print to stdout, never raise
 # ----------------------------------------------------------------------------
-def sanity(D):
+def sanity(D, workloads, order_a):
+    """Report contradictions in the data; print, never raise.
+
+    @param D Indexed rows from index().
+    @param workloads Workload names to check, in plotting order.
+    @param order_a Panel (a) arm labels, as the CSV spells them.
+    """
     print("== sanity checks ==")
     n = 0
     for (p, s, w), d in sorted(D.items()):
@@ -183,11 +242,14 @@ def sanity(D):
                 print(f"  [split]  {p}/{w}/{s}: compute+io={d['compute']+d['io']:.3f} "
                       f"!= total={d['total']:.3f}"); n += 1
 
-    # each added layer should not be slower than the one before it
+    # Each added layer should not be slower than the one before it. The last
+    # step is built from the data: a campaign may run one lossy arm or a ladder
+    # of several, and each is checked against the lossless arm it extends.
     chains = [("nvCOMP", "nvCOMP+Tier"),
-              ("NP only", "NP+Tier"), ("NP+Tier", "NP+Tier+Async"),
-              ("NP+Tier+Async", "NP+Tier+Async+Lossy")]
-    for w in WORKLOADS:
+              ("NP only", "NP+Tier"), ("NP+Tier", "NP+Tier+Async")]
+    chains += [("NP+Tier+Async", s) for s in order_a
+               if base_name(s) == "NP+Tier+Async+Lossy"]
+    for w in workloads:
         for lo, hi in chains:
             a = D.get(("a", lo, w), {}).get("total")
             b = D.get(("a", hi, w), {}).get("total")
@@ -198,21 +260,30 @@ def sanity(D):
     print()
 
 
-def reductions(D):
-    """The percentages quoted in the caption and body text."""
+def reductions(D, workloads, order_a, order_b):
+    """The percentages quoted in the caption and body text.
+
+    @param D Indexed rows from index().
+    @param workloads Workload names, in plotting order.
+    @param order_a,order_b Arm labels per panel, as the CSV spells them.
+    """
     def pct(new, old):
         if new is None or old in (None, 0):
             return None
         return (old - new) / old * 100.0
 
     print("== percentage reductions (positive = faster) ==")
+    # One column per lossy arm the campaign actually ran, not one fixed name:
+    # a ladder over three bounds used to report a single empty column, because
+    # its arms are spelled `... Lossy (low|med|high)`.
     pairs = [("NP+Tier+Async", "Baseline"), ("NP+Tier+Async", "nvCOMP+Tier"),
-             ("NP only", "nvCOMP"), ("NP+Tier", "nvCOMP+Tier"),
-             ("NP+Tier+Async+Lossy", "NP+Tier+Async")]
+             ("NP only", "nvCOMP"), ("NP+Tier", "nvCOMP+Tier")]
+    pairs += [(s, "NP+Tier+Async") for s in order_a
+              if base_name(s) == "NP+Tier+Async+Lossy"]
     print(f"{'workload':<9}" + "".join(f"{(a.replace('NP+Tier+Async+', '')[:15]):>17}" for a, _ in pairs))
     print(f"{'':<9}" + "".join(f"{('vs ' + b)[:15]:>17}" for _, b in pairs))
     print(f"{'':<9}" + "".join(f"{'-' * 15:>17}" for _ in pairs))
-    for w in WORKLOADS:
+    for w in workloads:
         cells = []
         for a, b in pairs:
             r = pct(D.get(("a", a, w), {}).get("total"), D.get(("a", b, w), {}).get("total"))
@@ -220,13 +291,13 @@ def reductions(D):
         print(f"{w:<9}" + "".join(cells))
 
     print("\n== panel (b): NeuroPress vs each external baseline ==")
-    for w in WORKLOADS:
+    for w in workloads:
         np_t = D.get(("b", "NeuroPress", w), {}).get("total")
         if np_t is None:
             print(f"  {w:<8} --")
             continue
         parts = []
-        for s in ORDER_B:
+        for s in order_b:
             if s == "NeuroPress":
                 continue
             r = pct(np_t, D.get(("b", s, w), {}).get("total"))
@@ -238,17 +309,49 @@ def reductions(D):
 # ----------------------------------------------------------------------------
 # PLOTTING
 # ----------------------------------------------------------------------------
-def draw_panel(ax, D, panel, order, colors, warn_total_only, ylim, dec, show_ratio=False):
+def draw_panel(ax, D, panel, order, colors, warn_total_only, ylim, dec,
+               workloads, show_ratio=False):
+    """Draw one group of bars per workload, one bar per arm.
+
+    @param workloads Workload names, left to right; one x-tick each.
+    @return True if anything was drawn; False for an empty arm list, which a
+      `--panel a` run produces for panel (b) -- the CSV then has no rows of
+      that panel at all.
+    """
     nb = len(order)
+    if nb == 0 or not workloads:
+        return False
     # Vertical labels are wider than the bar pitch once the ratio is appended.
     # Spread them over ROWS interleaved baselines so no two neighbours share one:
     # 14 arms per group need 3 rows; 2 still collided.
     # A rotated 7 pt label is ~28 px wide against a ~21 px bar pitch, so
     # neighbours collide however short the text is. Interleave their baselines:
     # 3 rows when the ratio doubles the length, 2 for a time-only label.
-    rows = (3 if nb > 10 else 2) if show_ratio else (2 if nb > 6 else 1)
+    # A rotated label is wider than the bar pitch, so neighbours are given
+    # interleaved baselines. The combined axis carries both panels -- 17 arms
+    # with the external +Tier pairs -- and two rows is not enough there.
+    # >13, not >12: the published combined axis is exactly 13 arms (9 ablation
+    # + 4 externals) and staggers over 2 rows. Adding the external +Tier pairs
+    # takes it to 17, which needs a third row.
+    rows = (3 if nb > 10 else 2) if show_ratio else (3 if nb > 13 else
+                                                    (2 if nb > 6 else 1))
     width = (1.0 - BAR_PAD) / nb
-    x0 = np.arange(len(WORKLOADS))
+    x0 = np.arange(len(workloads))
+
+    # A workload with NO measured arm gets ONE centred marker rather than a
+    # "TBD" per bar: at 17 arms those overlap into an illegible band, and the
+    # message is about the workload, not about each arm of it.
+    def _measured(w):
+        for it in order:
+            pp, ss = it if isinstance(it, tuple) else (panel, it)
+            if D.get((pp, ss, w), {}).get("total") is not None:
+                return True
+        return False
+    blank = {w for w in workloads if not _measured(w)}
+    for j, w in enumerate(workloads):
+        if w in blank:
+            ax.text(x0[j], ylim * 0.02, "not measured", ha="center",
+                    va="bottom", fontsize=FS_VAL, color="0.55")
 
     for i, item in enumerate(order):
         # An entry is a strategy, or (panel, strategy) when one axis carries both.
@@ -257,16 +360,19 @@ def draw_panel(ax, D, panel, order, colors, warn_total_only, ylim, dec, show_rat
         pale = blend_to_white(col, IO_BLEND)
         # Mark the external codecs when they share an axis with the ablation.
         edge = "black" if isinstance(item, tuple) and p == "b" else "white"
-        for j, w in enumerate(WORKLOADS):
+        for j, w in enumerate(workloads):
             x = x0[j] - (1.0 - BAR_PAD) / 2 + width * (i + 0.5)
             d = D.get((p, s, w), {})
             total = d.get("total")
 
             # Not measured yet: leave the slot empty but keep its width, so the
-            # layout is identical once the number arrives.
+            # layout is identical once the number arrives. A per-bar marker is
+            # only drawn when SOME arm of this workload was measured -- a wholly
+            # unmeasured workload already carries one centred label above.
             if total is None:
-                ax.text(x, ylim * 0.01, "TBD", ha="center", va="bottom",
-                        fontsize=FS_VAL - 1, color="0.55", rotation=90)
+                if w not in blank:
+                    ax.text(x, ylim * 0.01, "TBD", ha="center", va="bottom",
+                            fontsize=FS_VAL - 1, color="0.55", rotation=90)
                 continue
 
             comp, io = d.get("compute"), d.get("io")
@@ -315,23 +421,25 @@ def draw_panel(ax, D, panel, order, colors, warn_total_only, ylim, dec, show_rat
                         va="bottom", rotation=90, fontsize=FS_VAL, zorder=7)
 
     ax.set_xticks(x0)
-    ax.set_xlim(-0.5, len(WORKLOADS) - 0.5)
+    ax.set_xlim(-0.5, len(workloads) - 0.5)
     ax.set_ylim(0, ylim)
     ax.set_axisbelow(True)
     ax.grid(axis="y", linestyle=":", linewidth=0.5, color="0.75", zorder=0)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.tick_params(labelsize=FS_TICK)
+    return True
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--csv", action="append",
-                    help="long-format CSV to plot instead of the defaults; repeat "
-                         "to merge per-workload runs into one figure")
+                    help="long-format CSV to plot; repeat to merge per-workload "
+                         "runs into one figure. REQUIRED -- this script has no "
+                         "data of its own")
     ap.add_argument("--write-template", metavar="PATH",
-                    help="write the default data as a CSV and exit")
+                    help="write an empty CSV with just the header and exit")
     ap.add_argument("--out", default="figures", help="output directory (default: figures)")
     ap.add_argument("--ylim", type=float, default=None,
                     help=f"y-axis limit in MINUTES (default: {Y_CLIP:g}, auto-rescaled "
@@ -343,13 +451,34 @@ def main():
         with open(args.write_template, "w", newline="") as fh:
             wtr = csv.DictWriter(fh, fieldnames=FIELDS)
             wtr.writeheader()
-            wtr.writerows(default_rows())
         print(f"wrote template: {args.write_template}")
         return 0
 
-    rows = [r for c in args.csv for r in load(c)] if args.csv else default_rows()
+    # No measured CSV, no figure. The previous version fell back to a table of
+    # numbers read off the published PNG, so a bare invocation produced a
+    # complete, plausible Figure 9 out of nothing.
+    if not args.csv:
+        print("error: --csv is required (pass figure_9.sh's fig9.csv; repeat "
+              "the flag to merge one CSV per workload)", file=sys.stderr)
+        return 2
+    rows = [r for c in args.csv for r in load(c)]
     D, _ = index(rows)
     # The CSVs are already in minutes, and so is the figure -- no conversion.
+
+    # Arms, workloads and colours all come from the rows just read.
+    workloads = workload_order(rows)
+    order_a = panel_order(rows, "a", COLORS_A)
+    order_b = panel_order(rows, "b", COLORS_B)
+    colors_a = build_palette(order_a, COLORS_A)
+    colors_b = build_palette(order_b, COLORS_B)
+    # The combined figure needs a distinct hue per bar, so panel (b) is redrawn
+    # from its own palette there; an arm with no entry keeps its panel colour.
+    order_single = ([("a", s) for s in order_a] +
+                    [("b", s) for s in order_b
+                     if s in COLORS_B_SINGLE or base_name(s) in COLORS_B_SINGLE])
+    colors_single = {**colors_a,
+                     **build_palette([s for pan, s in order_single if pan == "b"],
+                                     COLORS_B_SINGLE)}
 
     mpl.rcParams["font.family"] = "serif"
     mpl.rcParams["font.serif"] = ["Times New Roman", "STIXGeneral", "DejaVu Serif"]
@@ -381,31 +510,48 @@ def main():
                 else rf"$\varepsilon = {e:g}$")
 
     def legend_label(s):
-        if s in LOSSLESS:
+        """The arm's legend text, with the bound it actually ran at.
+
+        The key order is (panel, strategy, workload) -- the previous version
+        unpacked it as (panel, workload, strategy), so the match never fired
+        and every bound came from a hardcoded table instead of the run.
+        """
+        if base_name(s) in LOSSLESS_BASES:
             return f"{s} (lossless)"
-        seen = [d["eb"] for (p_, w_, s_), d in D.items() if s_ == s and d.get("eb") is not None]
-        e = seen[0] if seen else EB_DEFAULT.get(s, 0.0)
-        if not e:
-            return s
-        return f"{s.replace(' (low)', '').replace(' (med)', '').replace(' (high)', '')}, {eps(e)}"
+        seen = [d["eb"] for (p_, s_, w_), d in D.items()
+                if s_ == s and d.get("eb")]
+        # With the bound appended the (low)/(med)/(high) suffix is redundant --
+        # epsilon is what tells the ladder steps apart -- so it is dropped, as
+        # the published legend does. Without a bound it is all there is, so it
+        # stays.
+        return f"{_LADDER_RE.sub('', s)}, {eps(seen[0])}" if seen else s
 
     # One figure per panel, on the same y-axis so the two stay comparable.
     os.makedirs(args.out, exist_ok=True)
     warn_total_only, pngs = [], []
     for panel, order, colors, height, title, name in (
-            ("a", ORDER_A, COLORS_A, 2.3,
+            ("a", order_a, colors_a, 2.3,
              "(a) Ablation  --  each bar is a separate run; lossless unless $\\varepsilon$ is shown",
              "fig9a_ablation.png"),
-            ("b", ORDER_B, COLORS_B, 2.0, "(b) External baselines",
+            ("b", order_b, colors_b, 2.0, "(b) External baselines",
              "fig9b_baselines.png")):
+        if not order:
+            # `--panel a` / `--panel b` writes only its own rows, so the other
+            # panel has no arms. Skip it instead of drawing an empty axis.
+            print(f"note: no panel ({panel}) rows in the CSV; {name} not written")
+            continue
         fig, ax = plt.subplots(figsize=(FIG_W, height))
-        draw_panel(ax, D, panel, order, colors, warn_total_only, ylim, dec)
+        draw_panel(ax, D, panel, order, colors, warn_total_only, ylim, dec,
+                   workloads)
         ax.set_ylabel("Total wall-clock time (min)", fontsize=FS_AXIS)
-        ax.set_xticklabels(WORKLOADS, fontsize=FS_TICK)
+        ax.set_xticks(np.arange(len(workloads)))
+        ax.set_xticklabels(workloads, fontsize=FS_TICK)
         fig.subplots_adjust(top=0.99)
+        # At most 4 columns: the arm legend and the segment key below share one
+        # line, and a 5-column row of bound-annotated labels ran under the key.
         fig.legend(handles=[Patch(facecolor=colors[s_], label=legend_label(s_)) for s_ in order],
                    loc="lower left", bbox_to_anchor=(0.005, 0.995),
-                   ncol=3 if panel == "a" else 5,   # (a): nvCOMP | NP | NP lossy
+                   ncol=3 if panel == "a" else min(4, len(order)),
                    fontsize=FS_LEG, frameon=False, handlelength=1.3, handleheight=0.9,
                    columnspacing=1.0, labelspacing=0.35, title=title,
                    title_fontsize=FS_LEG, alignment="left")
@@ -422,14 +568,22 @@ def main():
 
     # The same data as one figure: the ablation and the external codecs on one
     # axis, so every arm is read against the same bars.
+    if not order_single:
+        print("note: nothing to plot on the combined axis")
+        sanity(D, workloads, order_a)
+        reductions(D, workloads, order_a, order_b)
+        print("wrote " + (", ".join(pngs) if pngs else "nothing"))
+        return 0
     fig, ax = plt.subplots(figsize=(FIG_W, 3.6))
-    draw_panel(ax, D, None, ORDER_SINGLE, COLORS_SINGLE, warn_total_only, ylim, dec)
+    draw_panel(ax, D, None, order_single, colors_single, warn_total_only, ylim,
+               dec, workloads)
     ax.set_ylabel("Total wall-clock time (min)", fontsize=FS_AXIS)
-    ax.set_xticklabels(WORKLOADS, fontsize=FS_TICK)
+    ax.set_xticks(np.arange(len(workloads)))
+    ax.set_xticklabels(workloads, fontsize=FS_TICK)
     fig.subplots_adjust(top=0.99)
-    fig.legend(handles=[Patch(facecolor=COLORS_SINGLE[s_], label=legend_label(s_),
+    fig.legend(handles=[Patch(facecolor=colors_single[s_], label=legend_label(s_),
                               edgecolor="black" if p_ == "b" else "white", linewidth=0.5)
-                        for p_, s_ in ORDER_SINGLE],
+                        for p_, s_ in order_single],
                loc="lower left", bbox_to_anchor=(0.005, 0.995), ncol=3,
                fontsize=FS_LEG, frameon=False, handlelength=1.3, handleheight=0.9,
                columnspacing=1.0, labelspacing=0.35,
@@ -451,8 +605,8 @@ def main():
     if warn_total_only:
         print(f"WARNING: {len(warn_total_only)} bar(s) had a total but no "
               f"compute/I-O split; drawn hatched: {', '.join(warn_total_only)}\n")
-    sanity(D)
-    reductions(D)
+    sanity(D, workloads, order_a)
+    reductions(D, workloads, order_a, order_b)
     print("wrote " + ", ".join(pngs))
     return 0
 

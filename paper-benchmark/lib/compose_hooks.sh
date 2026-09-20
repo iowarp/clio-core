@@ -1,6 +1,10 @@
 # Optional compose settings, sourced by every <workload>/common.sh. Unset, the
 # compose file is unchanged.
 #   BENCH_TIER1_TYPE / _MB / _PERSIST  first tier (default file, workload size, temporary)
+#   BENCH_TIER1_PATH   where tier 1's file lives (default: <results>/cte_tier.dat).
+#                      Set it to put the bytes on a chosen DEVICE while the run's
+#                      CSVs and logs stay in the results dir. Inert for a `ram`
+#                      tier, whose path is only a shared-memory name.
 #   BENCH_TIER2_PATH / _MB / _SCORE    add a long_term file tier (score 0.3)
 #   BENCH_FLUSH_MS     flush_data_period_ms; 0 disables it (unset: core default 10 s)
 #   BENCH_NP_LR        neuropress_learning_rate

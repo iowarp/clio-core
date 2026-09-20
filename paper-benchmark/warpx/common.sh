@@ -103,7 +103,7 @@ ${STATIC_LIB:+    neuropress_static_quantize: ${STATIC_QUANT:-false}}
     pool_query: local
     pool_id: "513.0"
     storage:
-      - path: "$store/cte_tier.dat"
+      - path: "${BENCH_TIER1_PATH:-$store/cte_tier.dat}"
         bdev_type: "${BENCH_TIER1_TYPE:-file}"
         capacity_limit: "${BENCH_TIER1_MB:-$tier_mb}MB"
         score: 1.0
