@@ -60,6 +60,40 @@ argument list matches the transpiled signature parameter for parameter.
   the same line. Kept anyway, because it is the correct shape and the
   other five still pass with it.
 
+## Ruled out, third round
+
+- **A stale frame mistaken for a replay.** `Frame::Replaying()` returned
+  `!fresh_`, and `fresh_` is false whenever the depth already had a frame
+  -- which is not the same as "this call parked here". A chain that
+  resumed, ran on, and then made a DIFFERENT call at the same depth would
+  re-attach to the old frame and Pop a save list belonging to its
+  predecessor, overwriting its own freshly-assigned awaiter. That would
+  read as a null receiver at the park guard, which is exactly the
+  symptom. It is now `!fresh_ && resume_point_ != 0`, since Done() zeroes
+  the resume point on every normal return. The fault is unchanged.
+
+  The guard is kept: it is strictly more correct, and the other five
+  still pass with it, including gmx's out-of-core path, which parks
+  heavily (495 evictions), and grayscott's bit-identical checksum.
+
+## Two readings of `0x8`, and how to tell them apart
+
+Both fit a 4-byte read at a small offset through a null pointer:
+
+1. `FlushWait::Ready()` calling `v->FlushBusy()`, which reads
+   `Tasks()->flush_busy` -- i.e. the awaiter's DeviceVector is null.
+2. `Frame::Frame()` doing `lane_->cur_depth_++`. `cur_depth_` is at
+   offset 8 of `YieldLaneHeader` (after `sp_` and `live_depth_`), so a
+   null lane gives precisely a 4-byte access to 0x8.
+
+Reading (2) would mean `YieldLane()` is null, which should have faulted
+at BuildListCoro's own Frame long before line 783 -- unless the awaits at
+598-670 are all in branches not taken at this lattice size, which would
+make 783 the first Frame constructed in the kernel. That is checkable and
+is the next thing to check: print or trap on `YieldLane() == nullptr` at
+the top of BuildListCoro, or run with --lattice small enough to force the
+earlier branches and see whether the fault moves.
+
 ## The remaining suspect
 
 

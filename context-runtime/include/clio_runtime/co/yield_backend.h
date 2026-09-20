@@ -238,8 +238,21 @@ class Frame {
   }
 
   /** True while re-entering a call that was live when the kernel exited, so
-   *  the save list on the way to the resume point must be restored. */
-  __device__ __forceinline__ bool Replaying() const { return !fresh_; }
+   *  the save list on the way to the resume point must be restored.
+   *
+   * A RESUME POINT IS REQUIRED, not just a live frame. `fresh_` is false
+   * whenever this depth already had a frame, which is not the same as
+   * "this call parked here": a chain that resumed, ran on, and then made
+   * a DIFFERENT call at the same depth re-attaches to the old frame, and
+   * with only the fresh_ test that call would Pop a save list belonging
+   * to its predecessor -- overwriting its own freshly-assigned awaiter
+   * with stale bytes, which reads as a null receiver at the park guard.
+   * Done() zeroes the resume point on every normal return, so a frame
+   * with none has nothing to replay.
+   */
+  __device__ __forceinline__ bool Replaying() const {
+    return !fresh_ && Header()->resume_point_ != 0;
+  }
 
   /**
    * Suspend here: record where to come back to and save the live set.
