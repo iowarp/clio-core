@@ -1,3 +1,6 @@
+#if CTP_ENABLE_SYCL
+#define CLIO_SYCL_KERNEL_TU 1
+#endif
 /* Copyright 2024 IOWarp - BSD 3-Clause License */
 /**
  * K-means over a GPU vector whose point set does not fit on the device.
@@ -94,6 +97,9 @@ using kb::PointVal;
 // the CTE client are `#if !CTP_IS_DEVICE_PASS` and simply do not exist
 // there. Under SYCL this guard is transparent: the driver is a plain C++ TU,
 // so CTP_IS_DEVICE_PASS is 0 and everything below compiles once.
+#if CTP_ENABLE_SYCL
+#include <sycl/sycl.hpp>
+#endif
 
 /* =====================================================
  * THE WORKLOAD, on the new coroutine API. Ordinary return
@@ -184,6 +190,106 @@ CTP_GPU_FUN CLIO_COROC_INLINE void AssignCoro(gv::DeviceVector<float> v, u64 per
   }
 }
 
+}  // namespace clio::gv_bench::kmeans
+
+/* TWO BACKENDS, ONE WORKLOAD. Everything above this line is compiled for both: the transpiled state machine contains no vendor token. What differs is only how a grid is submitted. */
+#if CTP_ENABLE_SYCL
+
+namespace clio::gv_bench::kmeans {
+
+namespace {
+
+/** Submit one grid and wait, in CUDA's (grid, block) shape. */
+template <typename BodyT>
+void Submit(dim3 grid, dim3 block, BodyT body) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t global = static_cast<size_t>(grid.x) * block.x;
+  q.parallel_for(
+       sycl::nd_range<1>{sycl::range<1>(global), sycl::range<1>(block.x)},
+       [=](sycl::nd_item<1>) { body(); })
+      .wait();
+}
+
+/** The yieldable prologue, shared by both yieldable launches below. */
+template <typename MakeCoro>
+void SubmitYieldable(dim3 grid, dim3 block, DevF32 v, View vw, StackView sv,
+                     MakeCoro make) {
+  Submit(grid, block, [=]() {
+    DevF32 dev = v;
+    dev.Init(vw.Block());
+    __syncthreads();
+    CLIO_COROC_RUN(vw, sv, make(_cy, dev, vw.Block()));
+  });
+}
+
+}  // namespace
+
+void InitBackend(u32 max_blocks, const GpuInfo &info) {
+  ::clio::run::gpu::SyclInitBlockIpcManagers(max_blocks, info);
+}
+
+void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
+                u64 page_elems, u32 dims, u32 k, u64 base_idx, View vw,
+                StackView sv) {
+  // gpu_info is already stamped into every block's record by InitBackend, so
+  // unlike CUDA there is no per-launch CLIO_GPU_INIT store.
+  (void)info;
+  SubmitYieldable(grid, block, v, vw, sv, [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
+    SeedCoro(_cy, dev, per, page_elems, dims, k, base_idx, blk);
+  });
+}
+
+void LaunchAssign(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
+                  u64 page_elems, u32 dims, u32 k, const float *cent,
+                  float *sums, unsigned *counts, View vw, StackView sv) {
+  (void)info;
+  SubmitYieldable(grid, block, v, vw, sv, [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
+    AssignCoro(_cy, dev, per, page_elems, dims, k, cent, sums, counts, blk);
+  });
+}
+
+void LaunchBaseline(u32 threads, const float *tile, u64 n, u32 dims, u32 k,
+                    const float *cent, float *sums, unsigned *counts) {
+  Submit(dim3(1), dim3(threads),
+         [=]() { BaselineBody(tile, n, dims, k, cent, sums, counts); });
+}
+
+void LaunchUpdate(float *cent, const float *sums, const unsigned *counts,
+                  u32 dims, u32 k) {
+  Submit(dim3((k + 63) / 64), dim3(64),
+         [=]() { UpdateBody(cent, sums, counts, dims, k); });
+}
+
+}  // namespace clio::gv_bench::kmeans
+
+namespace clio::run::gpu {
+
+/** The out-of-line half of YieldStack::Reset; see (3) in the file comment
+ *  and the declaration in yield_stack.h. */
+void SyclYieldStackReset(const YieldStackView &view, clio::run::u32 nlanes,
+                         char *smem_base) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  YieldStackView v = view;
+  q.parallel_for(sycl::range<1>(nlanes), [=](sycl::id<1> i) {
+     auto *h = reinterpret_cast<YieldLaneHeader *>(
+         v.base_ + static_cast<clio::run::u64>(i[0]) * v.bytes_per_lane_);
+     // sp_ starts AFTER the header: the header is not frame space.
+     h->sp_ = sizeof(YieldLaneHeader);
+     h->live_depth_ = 0;
+     h->cur_depth_ = 0;
+     h->error_ = kYieldErrNone;
+     h->coro_resume_ = 0;
+     h->coro_top_ = 0;
+     h->coro_park_ = 0;
+   }).wait();
+  char *base = smem_base;
+  q.copy(&base, g_yield_smem_dg, 1).wait();
+}
+
+}  // namespace clio::run::gpu
+
+#else  /* CUDA */
+
 namespace clio::gv_bench::kmeans {
 
 namespace {
@@ -257,7 +363,7 @@ void LaunchUpdate(float *cent, const float *sums, const unsigned *counts,
 
 }  // namespace clio::gv_bench::kmeans
 
-}  // namespace clio::gv_bench::kmeans
+#endif  /* CTP_ENABLE_SYCL */
 
 #if !CTP_IS_DEVICE_PASS
 

@@ -237,6 +237,60 @@ def add_ctx_at_calls(body, names):
     return body
 
 
+def run_macro_names(body, at):
+    """The View and StackView parameter names in scope at offset `at`.
+
+    CLIO_COROC_RUN needs them by name, and the CUDA launchers call them
+    yv/ys while the SYCL ones call them vw/sv. Taking the nearest preceding
+    declaration is enough: each is a parameter of the function the run macro
+    sits in.
+    """
+    view, stack = "yv", "ys"
+    for m in re.finditer(r"\bView\s+(\w+)", body[:at]):
+        view = m.group(1)
+    for m in re.finditer(r"\bStackView\s+(\w+)", body[:at]):
+        stack = m.group(1)
+    return view, stack
+
+
+def rewrite_sycl_launcher(src, names):
+    """The SYCL launcher, transformed the same way as the CUDA one.
+
+    Its shape is uniform across all six benchmarks: a Submit wrapping
+    parallel_for, a SubmitYieldable that publishes the stack and runs the
+    entry, and one lambda per launch that RETURNS the coroutine. Under coroc
+    there are no task types, so the lambda takes the context and CALLS the
+    workload instead.
+    """
+    lines = src.split("\n")
+    last = max(i for i, l in enumerate(lines) if l.startswith("#include"))
+    body = "\n".join(lines[last + 1:])
+    body = re.sub(r"^[ \t]*::?clio::run::gpu::YieldTlsPublish\([^;]*\);[ \t]*\n",
+                  "", body, flags=re.M)
+    body = re.sub(r"^[ \t]*gy::YieldTlsPublish\([^;]*\);[ \t]*\n", "",
+                  body, flags=re.M)
+    # the entry: `CLIO_YCORO_RUN(make(dev, vw.Block()))`
+    out, i = "", 0
+    while True:
+        k = body.find("CLIO_YCORO_RUN(", i)
+        if k < 0:
+            out += body[i:]
+            break
+        view, stack = run_macro_names(body, k)
+        op = k + len("CLIO_YCORO_RUN")
+        end = match_parens(body, op)
+        inner = body[op + 1:end - 1]
+        inner = re.sub(r"\bmake\s*\(", "make(_cy, ", inner, count=1)
+        out += body[i:k] + "CLIO_COROC_RUN(%s, %s, %s)" % (view, stack, inner)
+        i = end
+    body = out
+    # each launch's lambda: take the context, and call rather than return
+    body = re.sub(r"\[=\]\((Dev\w+\s+\w+,\s*u32\s+\w+)\)",
+                  r"[=](clio::co::Ctx &_cy, \1)", body)
+    body = re.sub(r"\breturn\s+(\w+Coro)\s*\(", r"\1(", body)
+    return add_ctx_at_calls(body, names)
+
+
 def rewrite_launcher(src, ns, names):
     """The launcher, from after its includes to EOF.
 
@@ -250,8 +304,16 @@ def rewrite_launcher(src, ns, names):
     body = "\n".join(lines[last + 1:])
     body = re.sub(r"^[ \t]*gy::YieldTlsPublish\([^;]*\);[ \t]*\\?\n", "",
                   body, flags=re.M)
-    body = re.sub(r"CLIO_YCORO_RUN\(", "CLIO_COROC_RUN(yv, ys, ", body)
-    return add_ctx_at_calls(body, names)
+    out, i = "", 0
+    while True:
+        k = body.find("CLIO_YCORO_RUN(", i)
+        if k < 0:
+            out += body[i:]
+            break
+        view, stack = run_macro_names(body, k)
+        out += body[i:k] + "CLIO_COROC_RUN(%s, %s, " % (view, stack)
+        i = k + len("CLIO_YCORO_RUN(")
+    return add_ctx_at_calls(out, names)
 
 
 def keep_if_branch(src, opener):
@@ -329,6 +391,8 @@ def main():
     # lammps_md's driver never includes the kernels header -- the LAUNCHER
     # did, and the launcher's includes are stripped here. Without it the
     # workload loses every helper the guarded regions do not define.
+    # the SYCL arm needs the header the stripped launcher included
+    prologue += "#if CTP_ENABLE_SYCL\n#include <sycl/sycl.hpp>\n#endif\n"
     need = '#include "%s_kernels.h"' % name
     if need not in prologue:
         prologue += ('\n#include "../gv_launch_bounds.h"\n' + need + "\n")
@@ -347,8 +411,24 @@ def main():
 
     names = suspending_names(work)
     lau = rewrite_launcher(read(launch), ns, names)
+    sycl_src = os.path.join(d, "sycl", "%s_launch_sycl.cc" % name)
+    if os.path.exists(sycl_src):
+        syc = rewrite_sycl_launcher(read(sycl_src), names)
+        lau = ("\n/* TWO BACKENDS, ONE WORKLOAD. Everything above this"
+               " line is compiled for both: the transpiled state machine"
+               " contains no vendor token. What differs is only how a grid"
+               " is submitted. */\n"
+               "#if CTP_ENABLE_SYCL\n" + syc +
+               "\n#else  /* CUDA */\n" + lau +
+               "\n#endif  /* CTP_ENABLE_SYCL */\n")
 
-    out = (prologue
+    # The SYCL launchers open with this, BEFORE any include: it tells
+    # yield_stack.h and device_vector.h that this TU submits kernels,
+    # which is what declares g_yield_smem_dg among other things. It
+    # has to lead the file, so it cannot ride in the prologue.
+    lead = ("#if CTP_ENABLE_SYCL" + chr(10) +
+            "#define CLIO_SYCL_KERNEL_TU 1" + chr(10) + "#endif" + chr(10))
+    out = (lead + prologue
            + "\n/* =====================================================\n"
              " * THE WORKLOAD, on the new coroutine API. Ordinary return\n"
              " * types, ordinary locals, one marker per suspending call.\n"
@@ -357,8 +437,12 @@ def main():
              " * ===================================================== */\n"
              "namespace " + ns + " {\n\n"
            + work
+           # the launcher brings its OWN namespaces -- lbann and md both
+           # reopen clio::run::gpu at file scope for their stack helpers --
+           # so the workload's wrapper closes before it, not around it
+           + "\n}  // namespace " + ns + "\n"
            + lau
-           + "\n}  // namespace " + ns + "\n\n"
+           + "\n"
            + driver)
 
     dst = os.path.join(d, "clio_%s_paged_newcoro.cc" % bname)
