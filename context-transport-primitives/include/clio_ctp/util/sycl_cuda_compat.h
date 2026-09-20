@@ -440,6 +440,14 @@ using ::sycl::ext::oneapi::experimental::printf;
 namespace clio::cte::gpu_vector {
 using ::sycl::ext::oneapi::experimental::printf;
 }
+/* clio::co is the clio-coroc device runtime (co/yield_backend.h). Its frame
+ * allocator reports a lane overflow before it traps, for the same reason
+ * YieldFrame::Alloc does -- the next lane's frames sit directly after this
+ * one, so an unreported overflow corrupts a NEIGHBOUR and both go wrong
+ * later, far from here. */
+namespace clio::co {
+using ::sycl::ext::oneapi::experimental::printf;
+}
 
 /**
  * The execution-space keywords, as nothing.
