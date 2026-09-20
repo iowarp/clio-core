@@ -72,6 +72,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 #include <utility>
 
@@ -106,10 +107,50 @@
 #define CLIO_CO_HOST 0
 #endif
 
+/* The annotation on every suspending function and on the runtime's own
+ * helpers.
+ *
+ * `__forceinline__` is the default because it is what keeps a CO_AWAIT on the
+ * fast path down to a predicated branch, with no call and no ABI stack. It is
+ * also what decides the kernel's register count, because inlining the whole
+ * suspending chain into the entry point makes the allocator hold every live
+ * value of every level at once. Define CLIO_CO_NO_FORCEINLINE to leave the
+ * chain outlined and trade registers for calls; measured both ways in
+ * context-runtime/test/co/CUDA_RESULTS.md, because which side of that trade
+ * wins is a property of the workload and not of this header. */
 #if CLIO_CO_CUDA || CLIO_CO_HIP
+#if defined(CLIO_CO_NO_FORCEINLINE)
+#define CLIO_CO_FUN __device__
+#else
 #define CLIO_CO_FUN __device__ __forceinline__
+#endif
 #else
 #define CLIO_CO_FUN inline
+#endif
+
+/* Device code and the host driver share exactly one thing: the arithmetic that
+ * turns a group index into its region of the stack. On SYCL and on the host
+ * emulation that is unremarkable, because there is one address space and one
+ * compiler; under nvcc a `__device__` function called from driver.h is a hard
+ * error. So the handful of entities both sides use are marked separately, and
+ * the separation is meaningful rather than a workaround: anything spelled
+ * CLIO_CO_HD must be pure address arithmetic over caller-supplied memory,
+ * touching no builtin and no group state. */
+#if CLIO_CO_CUDA || CLIO_CO_HIP
+#define CLIO_CO_HD __host__ __device__ inline
+#else
+#define CLIO_CO_HD inline
+#endif
+
+/* A constexpr function called from device code. nvcc will not let a
+ * `__device__` function name a plain constexpr one even in an unevaluated or
+ * constant context -- that is what --expt-relaxed-constexpr exists to relax --
+ * and a header should not oblige every consumer to pass an experimental flag,
+ * so the frame-size arithmetic carries the annotation itself. */
+#if CLIO_CO_CUDA || CLIO_CO_HIP
+#define CLIO_CO_CE __host__ __device__ constexpr
+#else
+#define CLIO_CO_CE constexpr
 #endif
 
 #if CLIO_CO_SYCL
@@ -241,10 +282,10 @@ struct StackView {
   u32 group_size = 0;
   u32 n_groups = 0;
 
-  CLIO_CO_FUN char *GroupBase(u32 g) const {
+  CLIO_CO_HD char *GroupBase(u32 g) const {
     return base + static_cast<std::size_t>(g) * bytes_per_group;
   }
-  CLIO_CO_FUN GroupHeader *Header(u32 g) const {
+  CLIO_CO_HD GroupHeader *Header(u32 g) const {
     return reinterpret_cast<GroupHeader *>(GroupBase(g));
   }
 };
@@ -287,10 +328,28 @@ CLIO_CO_FUN u32 FrameStride(u32 per_item, u32 group_size) {
   return per_item * group_size;
 }
 
+/**
+ * Byte copy for the save/restore path, spelled so every device compiler has it.
+ *
+ * `__builtin_memcpy` is a GCC/Clang spelling, so it covers icpx for SYCL and
+ * hipcc, and it covers nvcc on Linux, where the frontend mimics GCC. It does
+ * not cover nvcc with MSVC as the host compiler, which mimics MSVC and has no
+ * such builtin -- found by compiling this file for CUDA for the first time.
+ * Plain `memcpy` is in the device library of all three toolchains and lowers
+ * to the same thing for the compile-time sizes used here.
+ *
+ * @param dst destination, already aligned for the value being moved
+ * @param src source
+ * @param n   bytes to move; always `sizeof(T)` at every call site
+ */
+CLIO_CO_FUN void CopyBytes(void *dst, const void *src, std::size_t n) {
+  memcpy(dst, src, n);
+}
+
 /** Sum of the sizes of a trivially copyable pack, with natural alignment.
  *  This is what kFrameBytes_<fn> is built from, per suspend point. */
 template <class... Ts>
-constexpr u32 PackBytes() {
+CLIO_CO_CE u32 PackBytes() {
   u32 n = 0;
   // Fold over the pack, aligning each element to its own alignment.
   (((n = (n + static_cast<u32>(alignof(Ts)) - 1) &
@@ -301,9 +360,9 @@ constexpr u32 PackBytes() {
 }
 
 /** Largest of a set of per-suspend-point pack sizes (design doc R3). */
-constexpr u32 MaxOf(u32 a) { return a; }
+CLIO_CO_CE u32 MaxOf(u32 a) { return a; }
 template <class... Rest>
-constexpr u32 MaxOf(u32 a, u32 b, Rest... rest) {
+CLIO_CO_CE u32 MaxOf(u32 a, u32 b, Rest... rest) {
   return MaxOf(a > b ? a : b, rest...);
 }
 
@@ -481,13 +540,13 @@ class Frame {
   template <class T>
   CLIO_CO_FUN static void StoreOne(char *&p, const T &v) {
     p = Align(p, alignof(T));
-    __builtin_memcpy(p, &v, sizeof(T));
+    CopyBytes(p, &v, sizeof(T));
     p += sizeof(T);
   }
   template <class T>
   CLIO_CO_FUN static void LoadOne(char *&p, T &v) {
     p = Align(p, alignof(T));
-    __builtin_memcpy(&v, p, sizeof(T));
+    CopyBytes(&v, p, sizeof(T));
     p += sizeof(T);
   }
   CLIO_CO_FUN static char *Align(char *p, std::size_t a) {

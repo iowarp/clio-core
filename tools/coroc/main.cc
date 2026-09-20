@@ -53,6 +53,7 @@
  * nothing. That is also what lets the tool parse with a small prelude instead
  * of CUDA, HIP or SYCL headers, and be coupled to none of their versions.
  */
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <set>
@@ -167,12 +168,30 @@ SourceLocation SemiAfter(const SourceManager &sm, const LangOptions &lo,
   return SourceLocation();
 }
 
+/** A path with every separator turned into a forward slash.
+ *
+ * Clang reports paths with the host's native separator. On Windows that makes
+ * a raw path two different bugs at once: a prefix comparison against a
+ * slash-spelled --rewrite-root never matches, and inside an emitted `#line`
+ * directive the path is a string literal full of escape sequences, where
+ * a drive-relative "\\U" is a hard error rather than a warning. Forward
+ * slashes are accepted everywhere we target, so one normalisation fixes both.
+ *
+ * @param path the path as clang spelled it
+ * @return the same path with every native separator replaced by '/'
+ */
+std::string Slashed(llvm::StringRef path) {
+  std::string out = path.str();
+  std::replace(out.begin(), out.end(), '\\', '/');
+  return out;
+}
+
 std::string LineDirective(const SourceManager &sm, SourceLocation loc) {
   const SourceLocation e = sm.getExpansionLoc(loc);
   std::string out = "\n#line ";
   out += std::to_string(sm.getSpellingLineNumber(e));
   out += " \"";
-  out += sm.getFilename(e).str();
+  out += Slashed(sm.getFilename(e));
   out += "\"\n";
   return out;
 }
@@ -358,6 +377,11 @@ class Transpiler {
     for (auto &kv : fns_) suspending_.insert(Canonical(kv.first));
     for (auto &kv : fns_) Prepare(kv.second);
     CheckUnwrappedCalls(tu);
+    // Emitting over a rejected program dereferences the very fields the
+    // diagnostic said were missing -- an unusable await site has neither a
+    // callee nor an awaiter -- so a source error must stop the pass, not
+    // merely be counted alongside a crash.
+    if (errors_ != 0) return;
     for (auto &kv : fns_) Emit(kv.second);
   }
 
@@ -365,7 +389,26 @@ class Transpiler {
   std::size_t FunctionCount() const { return fns_.size(); }
 
  private:
+  /** The one declaration that stands for `fd` and every instantiation of it.
+   *
+   * A suspending function that is a member of a class template is SCANNED as
+   * the template pattern -- that is the only place its body, and so its
+   * CO_AWAIT, is written -- but every call to it resolves to an
+   * instantiation, whose canonical decl is a different node. Without the hop
+   * through the pattern the call looks like a call to an ordinary function
+   * and E2 never appends the context, which is how `DeviceVector<T>::Fetch`
+   * defeated the first version of this tool.
+   *
+   * Rewriting is unaffected: the pattern is the only text on disk, so one
+   * patch to it serves all instantiations.
+   *
+   * @param fd any declaration of the function
+   * @return the canonical declaration of its template pattern, or of itself
+   */
   const FunctionDecl *Canonical(const FunctionDecl *fd) const {
+    if (const FunctionDecl *pattern = fd->getTemplateInstantiationPattern()) {
+      fd = pattern;
+    }
     return fd->getCanonicalDecl();
   }
 
@@ -378,7 +421,8 @@ class Transpiler {
 
   bool InRoot(SourceLocation loc) const {
     if (g_root.empty()) return true;
-    return sm_.getFilename(sm_.getExpansionLoc(loc)).starts_with(g_root);
+    return llvm::StringRef(Slashed(sm_.getFilename(sm_.getExpansionLoc(loc))))
+        .starts_with(Slashed(g_root));
   }
 
   /* ---- preparation -------------------------------------------------- */
@@ -460,7 +504,7 @@ class Transpiler {
       bool VisitCallExpr(CallExpr *c) {
         const FunctionDecl *fd = c->getDirectCallee();
         if (fd == nullptr) return true;
-        if (t->suspending_.count(fd->getCanonicalDecl()) == 0) return true;
+        if (t->suspending_.count(t->Canonical(fd)) == 0) return true;
         if (ok.count(c) != 0) return true;
         pending.push_back(c);
         return true;
@@ -783,11 +827,12 @@ class Action : public ASTFrontendAction {
     for (auto it = rw_.buffer_begin(); it != rw_.buffer_end(); ++it) {
       auto fe = sm.getFileEntryRefForID(it->first);
       if (!fe) continue;
-      const std::string path = fe->getName().str();
-      if (!g_root.empty() && path.rfind(g_root, 0) != 0) continue;
+      const std::string path = Slashed(fe->getName());
+      const std::string root = Slashed(g_root);
+      if (!root.empty() && path.rfind(root, 0) != 0) continue;
       std::string rel = path;
-      if (!g_root.empty()) {
-        rel = path.substr(g_root.size());
+      if (!root.empty()) {
+        rel = path.substr(root.size());
         while (!rel.empty() && rel.front() == '/') rel.erase(rel.begin());
       } else {
         rel = llvm::sys::path::filename(path).str();
