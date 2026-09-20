@@ -14,6 +14,15 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_runtime/gpu/yield_coro.h>
+/* clio-coroc: the transpiler-lowered spelling of the same verbs. Opt in
+ * with -DCLIO_COROC; without it nothing below the CLIO_HAS_COROC gate is
+ * compiled and this header is byte-for-byte what it was. */
+#if defined(CLIO_COROC)
+#include <clio_runtime/co/yield_backend.h>
+#endif
+#ifndef CLIO_HAS_COROC
+#define CLIO_HAS_COROC 0
+#endif
 /* The macro-form API below spells suspension with yield_stack.h's CLIO_Y*
  * macros. yield_coro.h includes this header too, but only inside its
  * CLIO_YIELD_CORO guard -- which is off precisely in the builds that need the
@@ -177,6 +186,45 @@ class Held {
   bool owns_pin_ = true;
 };
 
+/**
+ * A resolved page range: what CoHoldPage hands back under clio-coroc.
+ *
+ * WHY A SECOND TYPE AND NOT Held<T>. Under the transpiler a value that is
+ * live across a suspend point is byte-copied into the call's frame and the
+ * function RETURNS, which runs the destructor of every local it owns. A
+ * guard with a non-trivial destructor would release its pin on the way out
+ * and come back pointing at a frame nobody holds -- so the rule (R6) is that
+ * anything crossing a suspend must be trivially copyable, and Frame::Push
+ * static_asserts it rather than letting it corrupt quietly. Under
+ * yield_coro.h the question never arose, because a C++20 coroutine suspends
+ * without unwinding.
+ *
+ * That costs nothing here, because Held is ALREADY a non-owning view: Pin()
+ * hard-codes `owns = false` -- the fetch takes the pin and UnpinRange
+ * releases it, and the guard only resolves a pointer into the frame. This
+ * type is that fact made explicit, with the accessors the kernels use.
+ */
+template <typename T>
+struct PageRef {
+  T *data_ = nullptr;
+  Page *page_ = nullptr;
+  clio::run::u64 begin_ = 0;
+  clio::run::u64 run_ = 0;
+
+  CTP_GPU_FUN T *ptr() const { return data_; }
+  CTP_GPU_FUN clio::run::u64 run() const { return run_; }
+  CTP_GPU_FUN clio::run::u64 begin_off() const { return begin_; }
+  CTP_GPU_FUN explicit operator bool() const { return page_ != nullptr; }
+  /** Indexed by ABSOLUTE element offset, exactly like Held. */
+  CTP_GPU_FUN T &operator[](clio::run::u64 off) const {
+    return data_[off - begin_];
+  }
+  /** Set this frame's eviction rank. Higher means keep. */
+  CTP_GPU_FUN void Rescore(float rank) const {
+    if (page_ != nullptr && threadIdx.x == 0) page_->score = rank;
+  }
+};
+
 template <typename T>
 class DeviceVector {
  public:
@@ -284,7 +332,10 @@ class DeviceVector {
                                                   Args... args) {
     if (threadIdx.x == 0) Tasks()->fetch_generation = generation;
     __syncthreads();
-    clio::run::u64 lo[kMaxFetchRanges], hi[kMaxFetchRanges];
+    // One declarator per statement: the transpiler hoists a declaration
+    // whose block contains a CO_AWAIT, and a hoist can only move one name.
+    clio::run::u64 lo[kMaxFetchRanges];
+    clio::run::u64 hi[kMaxFetchRanges];
     clio::run::u32 nr = 0;
     GatherRanges(lo, hi, nr, args...);
     // One fetch in flight per block: staging into a task the runtime is still
@@ -532,7 +583,8 @@ class DeviceVector {
                                                   Rest... rest) {
     if (threadIdx.x == 0) Tasks()->flush_generation = generation;
     __syncthreads();
-    clio::run::u64 rlo[kMaxFetchRanges], rhi[kMaxFetchRanges];
+    clio::run::u64 rlo[kMaxFetchRanges];
+    clio::run::u64 rhi[kMaxFetchRanges];
     clio::run::u32 nr = 0;
     GatherRanges(rlo, rhi, nr, off, count, rest...);
     CLIO_CO_YIELD_WHEN(;, FlushBusy() && !FlushDone(), FlushTag());
@@ -596,6 +648,198 @@ class DeviceVector {
     co_return;
   }
 #endif  // CLIO_HAS_YCORO
+
+  // =================== clio-coroc yieldable API ===========================
+  //
+  // The same verbs as the YCoroTask block above, lowered by the transpiler
+  // instead of by clang's coroutine pass. Return types are the ORDINARY ones
+  // -- void, PageRef<T> -- because there is no task wrapper: a suspending
+  // function is a plain function that clio-coroc rewrites into a resumable
+  // switch. The `clio::co::Ctx &` each one takes is appended by the tool and
+  // is not written here.
+  //
+  // Every `CLIO_CO_YIELD_WHEN(reap, cond, tag)` above becomes
+  // `CO_AWAIT(<awaiter>.Take())`, where the awaiter re-tests `cond` on each
+  // entry. That is the same retry-loop semantics: the resume point sits
+  // before the vote, the host services the fault in between, and the block
+  // falls through once nobody is still waiting.
+#if CLIO_HAS_COROC
+
+  /** Waits until this block's outstanding fetch has landed. */
+  struct FetchWait {
+    DeviceVector *v;
+    CTP_GPU_FUN bool Ready() const {
+      return !(v->FetchBusy() && !v->FetchDone());
+    }
+    CTP_GPU_FUN clio::run::u64 Tag() const { return v->FetchTag(); }
+    CTP_GPU_FUN void Take() const {}
+  };
+
+  /** Waits until this block's outstanding flush has landed. */
+  struct FlushWait {
+    DeviceVector *v;
+    CTP_GPU_FUN bool Ready() const {
+      return !(v->FlushBusy() && !v->FlushDone());
+    }
+    CTP_GPU_FUN clio::run::u64 Tag() const { return v->FlushTag(); }
+    CTP_GPU_FUN void Take() const {}
+  };
+
+  /**
+   * Suspends exactly once, then falls through.
+   *
+   * The peer-wait in CoHoldPage has nothing the host can poll -- it waits for
+   * ANOTHER BLOCK to publish a frame -- so it resumes every round and
+   * re-checks, which is what tag 0 means to the driver. Ready() flips on its
+   * first evaluation and the awaiter is saved across the park, so the resume
+   * falls straight through and the enclosing loop re-tests the real
+   * condition.
+   */
+  struct OnceWait {
+    clio::run::u32 entered;
+    CTP_GPU_FUN bool Ready() {
+      const bool was = entered != 0;
+      entered = 1;
+      return was;
+    }
+    CTP_GPU_FUN clio::run::u64 Tag() const { return 0ull; }
+    CTP_GPU_FUN void Take() const {}
+  };
+
+  /** Stage a fetch of one range. Mirrors the YCoroTask BeginFetch. */
+  // NOT VARIADIC, unlike the YCoroTask verbs above. clio-coroc puts every
+  // parameter in the save list, and a parameter PACK there is emitted
+  // without its expansion -- `Push(..., args)` rather than
+  // `Push(..., args...)` -- which is a hard error in the generated file.
+  // Until the tool expands packs, a suspending function takes a fixed
+  // parameter list; the multi-range form is the one caller shape these
+  // benchmarks never use.
+  CTP_GPU_FUN void CoBeginFetch(clio::run::u64 generation,
+                                clio::run::u64 off,
+                                clio::run::u64 count) {
+    if (threadIdx.x == 0) Tasks()->fetch_generation = generation;
+    __syncthreads();
+    clio::run::u64 lo[kMaxFetchRanges];
+    clio::run::u64 hi[kMaxFetchRanges];
+    clio::run::u32 nr = 0;
+    GatherRanges(lo, hi, nr, off, count);
+    // One fetch in flight per block: staging into a task the runtime is still
+    // reading would overwrite records mid-transfer.
+    if (FetchBusy()) {
+      CO_AWAIT(CoAwaitFetch());
+    }
+    if (threadIdx.x == 0) SubmitFetch(lo, hi, nr);
+    __syncthreads();
+  }
+
+  /** Wait for the outstanding CoBeginFetch and publish its pages. */
+  CTP_GPU_FUN void CoAwaitFetch() {
+    FetchWait w{this};
+    CO_AWAIT(w.Take());
+    if (threadIdx.x == 0 && FetchBusy()) PublishFetch();
+    __syncthreads();
+  }
+
+  /** CoBeginFetch then CoAwaitFetch. */
+  CTP_GPU_FUN void CoFetch(clio::run::u64 generation, clio::run::u64 off,
+                           clio::run::u64 count) {
+    CO_AWAIT(CoBeginFetch(generation, off, count));
+    CO_AWAIT(CoAwaitFetch());
+  }
+
+  /**
+   * The page holding `off`, as a trivially copyable view. Does NOT fault.
+   *
+   * Structurally identical to the YCoroTaskT<Held<T>> version, including
+   * every vote: `p` is derived from state other blocks mutate, so a plain
+   * `if (p == nullptr)` around a barrier would put part of the block into a
+   * __syncthreads the rest never reaches.
+   */
+  CTP_GPU_FUN PageRef<T> CoHoldPage(clio::run::u64 off, clio::run::u64 count,
+                                    bool write = false) {
+    const clio::run::u64 pn = PageOf(off);
+    Page *p = Find(pn);
+    if (__syncthreads_or(p == nullptr ? 1 : 0)) {
+      CO_AWAIT(CoAwaitFetch());  // it may simply not have landed yet
+      p = Find(pn);
+    }
+    // Wait for the peer that claimed it: in a shared cache the block that
+    // claims a frame is the only one that fills it.
+    for (;;) {
+      if (!__syncthreads_or(p == nullptr ? 1 : 0)) break;
+      if (!__syncthreads_or(FindClaimed(pn) != nullptr ? 1 : 0)) break;
+      OnceWait once{0};
+      CO_AWAIT(once.Take());
+      p = Find(pn);
+    }
+    if (__syncthreads_or(p == nullptr ? 1 : 0)) {
+      if (threadIdx.x == 0) {
+        printf("[gpu_vector] FATAL set=%u page=%llu not resident. "
+               "CoHoldPage does not fetch -- name it in a CoBeginFetch "
+               "first.\n",
+               SetOf(pn), (unsigned long long) pn);
+      }
+      FatalNote(kFatalNotResident, pn, SetOf(pn), h_->set_size_);
+      __trap();
+    }
+    // RESIDENT IS NOT VALID: the frame may hold a different slice of the
+    // page, and reading the rest would hand back what it held before.
+    if (!write) {
+      const clio::run::u64 in = off % h_->elems_per_page_;
+      clio::run::u64 run = h_->elems_per_page_ - in;
+      if (run > count) run = count;
+      if (__syncthreads_or(!Covers(p, static_cast<clio::run::u32>(in),
+                                   static_cast<clio::run::u32>(in + run))
+                               ? 1 : 0)) {
+        if (threadIdx.x == 0) {
+          printf("[gpu_vector] FATAL table=%u page=%llu: elements [%u,%u) of "
+                 "this page were never fetched -- the frame holds [%u,%u).\n",
+                 Table(), (unsigned long long) PageOf(off), (unsigned) in,
+                 (unsigned) (in + run), p->valid_lo, p->valid_hi);
+        }
+        FatalNote(kFatalNotCovered, PageOf(off), in, p->valid_hi);
+        __trap();
+      }
+    }
+    Held<T> h = Pin(p, off, count, write);
+    return PageRef<T>{h.ptr(), p, h.begin_off(), h.run()};
+  }
+
+  /** Stage a writeback of the named ranges. */
+  CTP_GPU_FUN void CoBeginFlush(clio::run::u64 generation,
+                                clio::run::u64 off,
+                                clio::run::u64 count) {
+    if (threadIdx.x == 0) Tasks()->flush_generation = generation;
+    __syncthreads();
+    clio::run::u64 rlo[kMaxFetchRanges];
+    clio::run::u64 rhi[kMaxFetchRanges];
+    clio::run::u32 nr = 0;
+    GatherRanges(rlo, rhi, nr, off, count);
+    FlushWait w{this};
+    CO_AWAIT(w.Take());
+    if (threadIdx.x == 0) {
+      if (FlushBusy()) RetireFlush();
+      SubmitFlushRanges(rlo, rhi, nr);
+    }
+    __syncthreads();
+  }
+
+  /** Wait for the writeback started by CoBeginFlush. */
+  CTP_GPU_FUN void CoEndFlush() {
+    FlushWait w{this};
+    CO_AWAIT(w.Take());
+    if (threadIdx.x == 0 && FlushBusy()) RetireFlush();
+    __syncthreads();
+  }
+
+  /** CoBeginFlush then CoEndFlush. */
+  CTP_GPU_FUN void CoFlush(clio::run::u64 generation, clio::run::u64 off,
+                           clio::run::u64 count) {
+    CO_AWAIT(CoBeginFlush(generation, off, count));
+    CO_AWAIT(CoEndFlush());
+  }
+
+#endif  // CLIO_HAS_COROC
 
   // ==================== Macro-form yieldable API (no coroutines) ===========
   //
