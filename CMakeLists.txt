@@ -1416,6 +1416,14 @@ if(NOT CLIO_CORE_MSVC_LIKE)
         # <sycl/sycl.hpp> is pulled in by macros.h whenever CTP_ENABLE_SYCL
         # is set, so every TU now needs the header path -- the driver only
         # adds it under -fsycl, which most TUs do not get.
+        #
+        # Discover it HERE rather than relying on wrp_core_enable_sycl(): that
+        # runs from the component subdirectories, which are added hundreds of
+        # lines below this point. On a cold configure CLIO_SYCL_INCLUDE_DIR was
+        # therefore still empty here, the guard below fell through, and every
+        # host TU failed with "'sycl/sycl.hpp' file not found" -- while a second
+        # configure succeeded off the cached value, making it look intermittent.
+        wrp_core_detect_sycl()
         if(CLIO_SYCL_INCLUDE_DIR)
             include_directories(SYSTEM ${CLIO_SYCL_INCLUDE_DIR})
         endif()

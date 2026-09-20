@@ -259,6 +259,63 @@ macro(wrp_core_enable_rocm GPU_RUNTIME CXX_STANDARD)
     endif()
 endmacro()
 
+# Detect the SYCL compiler flavor and locate <sycl/sycl.hpp>.
+#
+# Split out of wrp_core_enable_sycl() because the top-level CMakeLists defines
+# CTP_ENABLE_SYCL globally -- and therefore needs CLIO_SYCL_INCLUDE_DIR -- at a
+# point BEFORE any add_subdirectory() has had a chance to call
+# wrp_core_enable_sycl(). Everything set here is cached and guarded, so calling
+# it from both places is idempotent.
+macro(wrp_core_detect_sycl)
+    # Compiler flavor detection. Override with -DWRP_SYCL_COMPILER=DPCPP|ACPP.
+    if(NOT DEFINED CLIO_SYCL_COMPILER)
+        get_filename_component(_wrp_cxx_name "${CMAKE_CXX_COMPILER}" NAME)
+        if(_wrp_cxx_name MATCHES "^(acpp|syclcc|hipsycl)" OR
+           CMAKE_CXX_COMPILER_ID STREQUAL "AdaptiveCpp")
+            set(CLIO_SYCL_COMPILER "ACPP" CACHE STRING
+                "SYCL compiler flavor (DPCPP|ACPP)")
+        else()
+            # Default to DPC++ for icpx, dpcpp, and clang++ with -fsycl.
+            set(CLIO_SYCL_COMPILER "DPCPP" CACHE STRING
+                "SYCL compiler flavor (DPCPP|ACPP)")
+        endif()
+    endif()
+
+    # Locate the SYCL headers so HOST translation units -- compiled with
+    # CTP_ENABLE_SYCL=1 but WITHOUT -fsycl (see context-runtime/src and
+    # context-transfer-engine/core) -- can still find <sycl/sycl.hpp>.
+    # icpx only adds this directory to its search path under -fsycl, so for
+    # plain host TUs we must supply it explicitly. Derive it from the compiler
+    # location rather than hardcoding a vendor prefix: on Aurora the headers
+    # live next to icpx (e.g. .../oneapi/compiler/latest/include/sycl), NOT at
+    # /opt/intel/dpcpp. <sycl/sycl.hpp> is plain C++ and parses without the
+    # SYCL frontend (it only warns; we silence that via the compile def below).
+    if(NOT DEFINED CACHE{CLIO_SYCL_INCLUDE_DIR})
+        set(_wrp_sycl_inc "")
+        if(CLIO_SYCL_COMPILER STREQUAL "DPCPP")
+            get_filename_component(_wrp_cxx_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+            get_filename_component(_wrp_cmplr_root "${_wrp_cxx_bin}" DIRECTORY)
+            if(EXISTS "${_wrp_cmplr_root}/include/sycl/sycl.hpp")
+                set(_wrp_sycl_inc "${_wrp_cmplr_root}/include")
+            elseif(EXISTS "/opt/intel/dpcpp/include/sycl/sycl.hpp")
+                set(_wrp_sycl_inc "/opt/intel/dpcpp/include")
+            endif()
+        elseif(CLIO_SYCL_COMPILER STREQUAL "ACPP")
+            if(EXISTS "/opt/adaptivecpp/include/AdaptiveCpp/sycl/sycl.hpp")
+                set(_wrp_sycl_inc "/opt/adaptivecpp/include/AdaptiveCpp")
+            endif()
+        endif()
+        set(CLIO_SYCL_INCLUDE_DIR "${_wrp_sycl_inc}" CACHE PATH
+            "SYCL header directory for host TUs compiled without -fsycl")
+    endif()
+    if(NOT CLIO_SYCL_INCLUDE_DIR)
+        message(WARNING
+            "SYCL enabled but <sycl/sycl.hpp> not located next to ${CMAKE_CXX_COMPILER} "
+            "nor at the legacy /opt prefixes. Host TUs that include it will fail to "
+            "compile. Set -DCLIO_SYCL_INCLUDE_DIR=<dir containing sycl/sycl.hpp>.")
+    endif()
+endmacro()
+
 # Enable Intel GPU / SYCL (oneAPI icpx -fsycl, or AdaptiveCpp acpp)
 #
 # Detects the SYCL compiler flavor and sets CLIO_SYCL_COMPILER (DPCPP|ACPP).
@@ -273,19 +330,7 @@ macro(wrp_core_enable_sycl CXX_STANDARD)
     set(CMAKE_CXX_STANDARD ${CXX_STANDARD})
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-    # Compiler flavor detection. Override with -DWRP_SYCL_COMPILER=DPCPP|ACPP.
-    if(NOT DEFINED CLIO_SYCL_COMPILER)
-        get_filename_component(_wrp_cxx_name "${CMAKE_CXX_COMPILER}" NAME)
-        if(_wrp_cxx_name MATCHES "^(acpp|syclcc|hipsycl)" OR
-           CMAKE_CXX_COMPILER_ID STREQUAL "AdaptiveCpp")
-            set(CLIO_SYCL_COMPILER "ACPP" CACHE STRING
-                "SYCL compiler flavor (DPCPP|ACPP)")
-        else()
-            # Default to DPC++ for icpx, dpcpp, and clang++ with -fsycl.
-            set(CLIO_SYCL_COMPILER "DPCPP" CACHE STRING
-                "SYCL compiler flavor (DPCPP|ACPP)")
-        endif()
-    endif()
+    wrp_core_detect_sycl()
 
     # SYCL target triple. Override with -DSYCL_TARGET=...
     #   spir64               JIT, runs on any OpenCL/Level Zero device
@@ -325,39 +370,6 @@ macro(wrp_core_enable_sycl CXX_STANDARD)
         "Pass -fsycl-allow-virtual-functions to DPC++ (recent compiler only)"
         OFF)
 
-    # Locate the SYCL headers so HOST translation units -- compiled with
-    # CTP_ENABLE_SYCL=1 but WITHOUT -fsycl (see context-runtime/src and
-    # context-transfer-engine/core) -- can still find <sycl/sycl.hpp>.
-    # icpx only adds this directory to its search path under -fsycl, so for
-    # plain host TUs we must supply it explicitly. Derive it from the compiler
-    # location rather than hardcoding a vendor prefix: on Aurora the headers
-    # live next to icpx (e.g. .../oneapi/compiler/latest/include/sycl), NOT at
-    # /opt/intel/dpcpp. <sycl/sycl.hpp> is plain C++ and parses without the
-    # SYCL frontend (it only warns; we silence that via the compile def below).
-    if(NOT DEFINED CACHE{CLIO_SYCL_INCLUDE_DIR})
-        set(_wrp_sycl_inc "")
-        if(CLIO_SYCL_COMPILER STREQUAL "DPCPP")
-            get_filename_component(_wrp_cxx_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
-            get_filename_component(_wrp_cmplr_root "${_wrp_cxx_bin}" DIRECTORY)
-            if(EXISTS "${_wrp_cmplr_root}/include/sycl/sycl.hpp")
-                set(_wrp_sycl_inc "${_wrp_cmplr_root}/include")
-            elseif(EXISTS "/opt/intel/dpcpp/include/sycl/sycl.hpp")
-                set(_wrp_sycl_inc "/opt/intel/dpcpp/include")
-            endif()
-        elseif(CLIO_SYCL_COMPILER STREQUAL "ACPP")
-            if(EXISTS "/opt/adaptivecpp/include/AdaptiveCpp/sycl/sycl.hpp")
-                set(_wrp_sycl_inc "/opt/adaptivecpp/include/AdaptiveCpp")
-            endif()
-        endif()
-        set(CLIO_SYCL_INCLUDE_DIR "${_wrp_sycl_inc}" CACHE PATH
-            "SYCL header directory for host TUs compiled without -fsycl")
-    endif()
-    if(NOT CLIO_SYCL_INCLUDE_DIR)
-        message(WARNING
-            "SYCL enabled but <sycl/sycl.hpp> not located next to ${CMAKE_CXX_COMPILER} "
-            "nor at the legacy /opt prefixes. Host TUs that include it will fail to "
-            "compile. Set -DCLIO_SYCL_INCLUDE_DIR=<dir containing sycl/sycl.hpp>.")
-    endif()
 
     message(STATUS "SYCL enabled: compiler=${CLIO_SYCL_COMPILER} target=${SYCL_TARGET} device=${SYCL_DEVICE} include=${CLIO_SYCL_INCLUDE_DIR}")
 endmacro()
