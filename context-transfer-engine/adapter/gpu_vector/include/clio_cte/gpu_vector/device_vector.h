@@ -706,23 +706,17 @@ class DeviceVector {
     CTP_GPU_FUN void Take() const {}
   };
 
-  /** Stage a fetch of one range. Mirrors the YCoroTask BeginFetch. */
-  // NOT VARIADIC, unlike the YCoroTask verbs above. clio-coroc puts every
-  // parameter in the save list, and a parameter PACK there is emitted
-  // without its expansion -- `Push(..., args)` rather than
-  // `Push(..., args...)` -- which is a hard error in the generated file.
-  // Until the tool expands packs, a suspending function takes a fixed
-  // parameter list; the multi-range form is the one caller shape these
-  // benchmarks never use.
-  CTP_GPU_FUN void CoBeginFetch(clio::run::u64 generation,
-                                clio::run::u64 off,
-                                clio::run::u64 count) {
+  /** Stage a fetch of the named ranges. Mirrors the YCoroTask BeginFetch.
+   *  Variadic: lammps_md fetches two planes in one call, and clio-coroc
+   *  carries the pack into the save list with its ellipsis intact. */
+  template <typename... Args>
+  CTP_GPU_FUN void CoBeginFetch(clio::run::u64 generation, Args... args) {
     if (threadIdx.x == 0) Tasks()->fetch_generation = generation;
     __syncthreads();
     clio::run::u64 lo[kMaxFetchRanges];
     clio::run::u64 hi[kMaxFetchRanges];
     clio::run::u32 nr = 0;
-    GatherRanges(lo, hi, nr, off, count);
+    GatherRanges(lo, hi, nr, args...);
     // One fetch in flight per block: staging into a task the runtime is still
     // reading would overwrite records mid-transfer.
     if (FetchBusy()) {
@@ -741,9 +735,9 @@ class DeviceVector {
   }
 
   /** CoBeginFetch then CoAwaitFetch. */
-  CTP_GPU_FUN void CoFetch(clio::run::u64 generation, clio::run::u64 off,
-                           clio::run::u64 count) {
-    CO_AWAIT(CoBeginFetch(generation, off, count));
+  template <typename... Args>
+  CTP_GPU_FUN void CoFetch(clio::run::u64 generation, Args... args) {
+    CO_AWAIT(CoBeginFetch(generation, args...));
     CO_AWAIT(CoAwaitFetch());
   }
 
@@ -822,15 +816,15 @@ class DeviceVector {
   }
 
   /** Stage a writeback of the named ranges. */
-  CTP_GPU_FUN void CoBeginFlush(clio::run::u64 generation,
-                                clio::run::u64 off,
-                                clio::run::u64 count) {
+  template <typename... Rest>
+  CTP_GPU_FUN void CoBeginFlush(clio::run::u64 generation, clio::run::u64 off,
+                                clio::run::u64 count, Rest... rest) {
     if (threadIdx.x == 0) Tasks()->flush_generation = generation;
     __syncthreads();
     clio::run::u64 rlo[kMaxFetchRanges];
     clio::run::u64 rhi[kMaxFetchRanges];
     clio::run::u32 nr = 0;
-    GatherRanges(rlo, rhi, nr, off, count);
+    GatherRanges(rlo, rhi, nr, off, count, rest...);
     FlushWait w = FlushWait{this};
     CO_AWAIT(w.Take());
     if (threadIdx.x == 0) {
@@ -849,9 +843,10 @@ class DeviceVector {
   }
 
   /** CoBeginFlush then CoEndFlush. */
+  template <typename... Rest>
   CTP_GPU_FUN void CoFlush(clio::run::u64 generation, clio::run::u64 off,
-                           clio::run::u64 count) {
-    CO_AWAIT(CoBeginFlush(generation, off, count));
+                           clio::run::u64 count, Rest... rest) {
+    CO_AWAIT(CoBeginFlush(generation, off, count, rest...));
     CO_AWAIT(CoEndFlush());
   }
 

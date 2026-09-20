@@ -80,6 +80,26 @@
 /** Device suspension via clio-coroc is available in this build. */
 #define CLIO_HAS_COROC 1
 
+/**
+ * The annotation every suspending function carries.
+ *
+ * FORCED, not merely suggested. A transpiled function is a switch over the
+ * whole call's state, which is bulky enough that a compiler left to itself
+ * may decline to inline it -- and an OUTLINED suspending function is a
+ * resource contradiction, because the kernel carries __launch_bounds__ and
+ * the callee does not. nvcc says so exactly: "Entry function ... with max
+ * regcount of 64 calls function ... with regcount of 255", which is what
+ * grayscott's StepCoro did before this existed.
+ *
+ * Inlining is also what the design wants on the fast path: a CO_AWAIT that
+ * does not suspend should be a predicated branch, not a call.
+ */
+#if CTP_IS_GPU_COMPILER
+#define CLIO_COROC_INLINE __forceinline__
+#else
+#define CLIO_COROC_INLINE inline
+#endif
+
 #include <cstddef>
 #include <cstring>
 #include <type_traits>
@@ -312,6 +332,32 @@ __host__ __device__ constexpr u32 MaxOf(u32 a, u32 b, Rest... rest) {
  *  gets a type without the transpiler ever naming one. */
 template <class A>
 using AwaiterResult = decltype(std::declval<A &>().Take());
+
+/**
+ * Suspend once, then fall through. The replacement for a bare
+ * `co_await YCoroSuspend{tag}`.
+ *
+ * lammps_md waits on a peer with a retry loop that votes and then suspends
+ * unconditionally; there is no condition the host could poll, so the block
+ * resumes every round and re-checks. Ready() is false on its first
+ * evaluation and true afterwards, and the awaiter is saved across the park,
+ * so the resume falls straight through and the enclosing loop re-tests the
+ * real condition.
+ *
+ * The transpiler re-assigns the awaiter at the top of each loop iteration,
+ * so `entered` starts false again every time round.
+ */
+struct YieldOnce {
+  u64 tag = 0;
+  u32 entered = 0;
+  __device__ __forceinline__ bool Ready() {
+    const bool was = entered != 0;
+    entered = 1;
+    return was;
+  }
+  __device__ __forceinline__ u64 Tag() const { return tag; }
+  __device__ __forceinline__ void Take() const {}
+};
 
 /** The marker. Consumed by clio-coroc; the identity otherwise. */
 __device__ __forceinline__ void AwaitMark() {}

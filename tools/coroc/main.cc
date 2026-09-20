@@ -367,6 +367,20 @@ class ScopeWalk : public RecursiveASTVisitor<ScopeWalk> {
     return r;
   }
 
+  /* A NESTED FUNCTION BODY IS NOT THIS FUNCTION'S BODY.
+   *
+   * A local class or a lambda declared inside a suspending function has
+   * returns and declarations of its own, and they belong to IT. Walking into
+   * them put `_cy_f.Done();` inside a local struct's operator[], where
+   * `_cy_f` is not in scope -- which nvcc answered with a segfault and clang
+   * with "reference to local variable declared in enclosing function".
+   * kmeans has exactly that shape: a PageAt shim closing over the held page.
+   */
+  bool TraverseLambdaExpr(LambdaExpr *) { return true; }
+  bool TraverseCXXRecordDecl(CXXRecordDecl *) { return true; }
+  bool TraverseFunctionDecl(FunctionDecl *) { return true; }
+  bool TraverseCXXMethodDecl(CXXMethodDecl *) { return true; }
+
   bool VisitDeclStmt(DeclStmt *s) {
     if (stack_.empty()) return true;
     for (const Decl *d : s->decls()) {
@@ -695,13 +709,13 @@ class Transpiler {
   /** The child call with the context threaded in (edit E2). */
   std::string CallWithCtx(const AwaitSite &s) {
     std::string t = Text(sm_, lo_, s.operand->getSourceRange());
-    const std::size_t close = t.rfind(')');
-    if (close == std::string::npos) {
-      Error(s.operand->getBeginLoc(), "cannot find the call's closing paren");
+    const std::size_t open = t.find('(');
+    if (open == std::string::npos) {
+      Error(s.operand->getBeginLoc(), "cannot find the call's opening paren");
       return t;
     }
     const auto *call = cast<CallExpr>(s.operand);
-    t.insert(close, call->getNumArgs() == 0 ? "_cy" : ", _cy");
+    t.insert(open + 1, call->getNumArgs() == 0 ? "_cy" : "_cy, ");
     return t;
   }
 
@@ -714,7 +728,15 @@ class Transpiler {
   std::vector<std::string> SaveList(const FnInfo &fi) {
     std::vector<std::string> names;
     for (const ParmVarDecl *p : fi.fn->parameters()) {
-      if (!p->getName().empty()) names.push_back(p->getName().str());
+      if (p->getName().empty()) continue;
+      // A PARAMETER PACK IS NOT ONE NAME. `Args... args` saved as `args`
+      // is a use of an unexpanded pack, which is a hard error -- so it
+      // carries its ellipsis into both the Push/Pop argument list and the
+      // PackBytes type list, where the fold does the right thing for each.
+      // DeviceVector's multi-range Fetch is variadic and lammps_md calls it
+      // with two ranges, so this is not a corner case.
+      names.push_back(p->isParameterPack() ? p->getName().str() + "..."
+                                           : p->getName().str());
     }
     for (const VarDecl *vd : fi.hoisted) names.push_back(vd->getName().str());
     return names;
@@ -760,7 +782,20 @@ class Transpiler {
     ++rewritten_;
   }
 
-  /** E1 */
+  /** E1
+   *
+   * THE CONTEXT GOES FIRST, not last.
+   *
+   * Appending it is the obvious choice and it is wrong, because a variadic
+   * suspending function has its pack last too: `Fetch(u64 gen, Args... args)`
+   * called as `Fetch(gen, off, count, _cy)` binds the context INTO the pack
+   * and forwards it to GatherRanges as if it were a range bound. nvcc
+   * reports only "no instance matches the argument list", well away from the
+   * cause. DeviceVector's multi-range fetch is exactly that shape and
+   * lammps_md calls it with two planes.
+   *
+   * First is unambiguous for every arity, variadic or not.
+   */
   void EmitSignature(const FnInfo &fi) {
     const FunctionTypeLoc ftl =
         fi.fn->getFunctionTypeLoc();
@@ -769,8 +804,8 @@ class Transpiler {
       return;
     }
     const std::string add =
-        fi.fn->getNumParams() == 0 ? "clio::co::Ctx &_cy" : ", clio::co::Ctx &_cy";
-    if (!InsertBefore(rw_, ftl.getRParenLoc(), add)) {
+        fi.fn->getNumParams() == 0 ? "clio::co::Ctx &_cy" : "clio::co::Ctx &_cy, ";
+    if (!InsertAfterTok(rw_, ftl.getLParenLoc(), add)) {
       Error(fi.fn->getLocation(), "could not rewrite the signature");
     }
   }
@@ -816,7 +851,15 @@ class Transpiler {
     for (const AwaitSite &s : fi.awaits) {
       std::vector<std::string> types;
       if (!s.nested) types.push_back("decltype(" + AwaiterName(s) + ")");
-      for (const std::string &n : base) types.push_back("decltype(" + n + ")");
+      for (const std::string &n : base) {
+        // `args...` becomes `decltype(args)...`: the ellipsis has to end up
+        // OUTSIDE the decltype, or it expands nothing.
+        if (n.size() > 3 && n.compare(n.size() - 3, 3, "...") == 0) {
+          types.push_back("decltype(" + n.substr(0, n.size() - 3) + ")...");
+        } else {
+          types.push_back("decltype(" + n + ")");
+        }
+      }
       packs.push_back("clio::co::PackBytes<" + Join(types) + ">()");
     }
     if (packs.empty()) packs.push_back("0u");

@@ -14,7 +14,7 @@
  *     gy::YCoroMain SpreadCoro(...)    void SpreadCoro(..., co::Ctx &_cy)
  *     co_await mesh.Fetch(a, b, c)     CO_AWAIT(mesh.CoFetch(a, b, c))
  *     auto h = co_await m.HoldPage()   auto h = CO_AWAIT(m.CoHoldPage())
- *     CLIO_YCORO_RUN(SpreadCoro(...))  CLIO_COROC_RUN(yv, ys, SpreadCoro(...))
+ *     CLIO_YCORO_RUN(SpreadCoro(...))  CLIO_COROC_RUN(yv, ys, SpreadCoro(_cy, ...))
  *
  * The `, co::Ctx &_cy` is NOT written by hand -- clio-coroc appends it, and
  * appends the matching argument at every call. What a person writes is the
@@ -302,7 +302,7 @@ __global__ GV_LAUNCH_BOUNDS void ZeroKernelNew(GpuInfo info, DevMesh mesh,
   mesh.Init(yv.Block());
   const u64 z0 = zbase + static_cast<u64>(yv.Block()) * zper;
   const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
-  CLIO_COROC_RUN(yv, ys, ZeroCoro(mesh, plane, z0, z1, _cy));
+  CLIO_COROC_RUN(yv, ys, ZeroCoro(_cy, mesh, plane, z0, z1));
 }
 
 __global__ GV_LAUNCH_BOUNDS void SpreadKernelNew(
@@ -313,8 +313,8 @@ __global__ GV_LAUNCH_BOUNDS void SpreadKernelNew(
   mesh.Init(yv.Block());
   const u64 z0 = zbase + static_cast<u64>(yv.Block()) * zper;
   const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
-  CLIO_COROC_RUN(yv, ys, SpreadCoro(mesh, ax, ay, az, aq, bin_start, K, plane,
-                                    z0, z1, _cy));
+  CLIO_COROC_RUN(yv, ys, SpreadCoro(_cy, mesh, ax, ay, az, aq, bin_start, K, plane,
+                                    z0, z1));
 }
 
 __global__ GV_LAUNCH_BOUNDS void SumKernelNew(GpuInfo info, DevMesh mesh,
@@ -326,7 +326,7 @@ __global__ GV_LAUNCH_BOUNDS void SumKernelNew(GpuInfo info, DevMesh mesh,
   mesh.Init(yv.Block());
   const u64 z0 = zbase + static_cast<u64>(yv.Block()) * zper;
   const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
-  CLIO_COROC_RUN(yv, ys, SumCoro(mesh, K, plane, z0, z1, out, _cy));
+  CLIO_COROC_RUN(yv, ys, SumCoro(_cy, mesh, K, plane, z0, z1, out));
 }
 
 __global__ GV_LAUNCH_BOUNDS void GatherKernelNew(
@@ -338,8 +338,8 @@ __global__ GV_LAUNCH_BOUNDS void GatherKernelNew(
   mesh.Init(yv.Block());
   const u64 b0 = zbase + static_cast<u64>(yv.Block()) * bper;
   const u64 b1 = (b0 + bper < zend) ? (b0 + bper) : zend;
-  CLIO_COROC_RUN(yv, ys, GatherCoro(mesh, ax, ay, az, aq, bin_start, K, plane,
-                                    b0, b1, out, _cy));
+  CLIO_COROC_RUN(yv, ys, GatherCoro(_cy, mesh, ax, ay, az, aq, bin_start, K, plane,
+                                    b0, b1, out));
 }
 
 __global__ GV_LAUNCH_BOUNDS void DenseSpreadKernelNew(
