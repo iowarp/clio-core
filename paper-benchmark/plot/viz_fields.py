@@ -10,7 +10,7 @@ per frame, one flat cube per component, named
 two blast-wave panels, which turn themselves off when the first frame is not a
 uniform background (see below).
 
-The benchmark's two phases (gen_fields.sh -> run_sweep.sh) exchange flat
+The benchmark's two phases (gen_fields.sh -> run_config.sh) exchange flat
 float32 files, and those files -- not Nyx's AMReX plotfiles -- are what the
 compressor actually sees.  So this reads them directly: no yt, no VisIt, no
 AMReX, just numpy.  A dump is a bare ncell^3 C-ordered float32 array, so the

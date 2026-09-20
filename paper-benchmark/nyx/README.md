@@ -25,7 +25,7 @@ Nyx to dump raw fields and sweeps those files offline. This mirrors that.
 
 ```
   phase 1: ./gen_fields.sh     Nyx (GPU) ──► plt00000/fab0000_comp00_density.f32 …
-  phase 2: ./run_sweep.sh      files ──► Clio compressor ──► NeuroPress ──► CTE tier
+  phase 2: ./run_config.sh     files ──► Clio compressor ──► NeuroPress ──► CTE tier
 ```
 
 Splitting them buys something the LAMMPS benchmark cannot have: **every policy
@@ -137,9 +137,7 @@ because each configuration re-runs the simulation:
 
 ```bash
 ./gen_fields.sh                              # Nyx -> ./fields (~1 GB, a few min)
-./run_sweep.sh                               # every policy over those files
-./run_config.sh dynamic                      # one policy
-./read.sh --run dynamic                      # cold read-back, separate process
+./run_config.sh dynamic                      # one policy over those files
 ../collect.py results/                       # re-aggregate
 ```
 
@@ -150,13 +148,10 @@ memory by construction — so without the stage every chunk is refused and every
 blob fails `rc=11` with `0 B in -> 0 B on the tier`.
 
 Every run verifies itself: each blob is read back through the decompressor and
-its FNV-1a-64 digest compared with the digest of the bytes staged. `read.sh`
-repeats that from a *different* process with `CLIO_RESTART=1`, sharing only the
-store directory and `blobs.csv` with the writer -- the field files are never
-opened, so the compressed tier is the only copy of the data in existence.
+its FNV-1a-64 digest compared with the digest of the bytes staged.
 
 `gen_fields.sh` takes `--ncell --steps --plot-int --out --bin --keep-plt`;
-`run_sweep.sh` takes `--fields --chunk --max-files --repeats --configs --results`. Defaults
+`run_config.sh` takes `<config> --fields --chunk --max-files --f64 --results --tag`. Defaults
 are 128³, 200 steps, dumping every 10 → 21 frames × 6 components × 8 MiB ≈
 1,008 MiB, chunked at 4 MiB into 252 chunks — deliberately the same chunk
 count as the LAMMPS benchmark.
@@ -166,23 +161,7 @@ Fields dumped are the hydro state: `density`, `xmom`, `ymom`, `zmom`,
 
 ## Looking at the data
 
-**`./visualize.sh` is the one-liner**: it runs the workload at the evolving
-default and renders every field into `./viz/`, keeping only the figures — the
-~4 GB of dumps behind them go to a scratch directory and are deleted when the
-render finishes.
-
-```bash
-./visualize.sh                       # ~49 s -> ./viz (6 montages, 6 GIFs, evolution.png)
-./visualize.sh --steps 400 --int 16  # quicker
-./visualize.sh --keep-dumps          # keep the .f32 too
-```
-
-`zmom` is sliced on **x**, not z, and that is not cosmetic: a vector component
-is antisymmetric about the mid-plane normal to its own axis, so z-momentum is
-~0 across the whole z mid-plane and the montage comes out blank while the field
-is perfectly healthy. `visualize.sh` passes `--axis-for x:zmom` for you.
-
-The pieces, if you want them separately:
+Dump a small run and render it:
 
 ```bash
 ./gen_fields.sh --ncell 64 --steps 400 --plot-int 16 --exp-energy 10 \
@@ -191,9 +170,13 @@ The pieces, if you want them separately:
                 --out /tmp/nyx-viz                          # ~4 s
 ```
 
+Pass `--axis-for x:zmom`: a vector component is antisymmetric about the
+mid-plane normal to its own axis, so z-momentum is ~0 across the whole z
+mid-plane and the montage comes out blank while the field is perfectly healthy.
+
 `../plot/viz_fields.py` reads the flat `.f32` dumps with nothing but numpy, and that is
 the point: those files, not Nyx's plotfiles, are what the compressor is handed,
-so what it draws is what the sweep compresses. Per field it writes a montage of
+so what it draws is what a run compresses. Per field it writes a montage of
 mid-plane slices across the run and the same slices as a GIF; once per run it
 writes `evolution.png`, which puts shock radius, fraction of the domain off
 ambient, and a zlib stand-in for the compression ratio on one time axis.
@@ -378,7 +361,7 @@ configuration that produces one.
 
 - Lossless throughout: `error_bound_ = 0`, which masks the 16 quantize actions.
   Verified rather than assumed: 2,016 blobs in the float32 sweep, 2,016 in the
-  float64 control, and 756 recovered cold from the tier by `read.sh` -- zero
+  float64 control, and 756 recovered cold from the tier -- zero
   failures, and `quantize=0` / `psnr=-1` on every candidate the exploration
   runs measured.
 - Element type is float32 (`Context::data_type_ = 1`) by default, float64

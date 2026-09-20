@@ -35,7 +35,6 @@ reading WarpX's openPMD output.
 | `<workload>/run_config.sh` | **one** named configuration of one workload |
 | `nyx/run_config_insitu.sh`, `vpic/run_config_insitu.sh` | the same, but GPU-resident: the simulation hands the compressor a device pointer instead of replaying dumps |
 | `<workload>/gen_fields.sh` | write field dumps to disk, for the replay route and for the evolution metric |
-| `<workload>/run_sweep.sh` | one workload across several configurations |
 
 WarpX has no replay route: a stock, unmodified WarpX writes through Clio's HDF5
 VOL, so `warpx/run_config.sh` always runs the simulation.
@@ -44,22 +43,22 @@ VOL, so `warpx/run_config.sh` always runs the simulation.
 
 | script | what it does |
 |---|---|
-| `compare_wallclock.sh` | NeuroPress against fixed codecs and cuSZ/cuSZp3/ndzip, end to end |
 | `compare_perchunk_oracle.sh` | how close the selector gets to a per-chunk oracle |
-| `wallclock_table.py` | the summary table for `compare_wallclock.sh` |
 | `perchunk_oracle_tables.py` | the tables for `compare_perchunk_oracle.sh` |
 
 ### Paper figures that are re-measured, not regenerated from a file
 
 Named for the NeuroPress submission's figure numbers (not those of
 [Where the paper's figures come from](#where-the-papers-figures-come-from)).
-Plots go to `figures/<figure>/`; runs go under `results/` unless `--out` is given.
+Each harness lives in the directory its plots land in, `figures/<figure>/`,
+with the one plotter that draws them; runs go under `results/` unless
+`--out` is given.
 
 | script | what it does |
 |---|---|
-| `figure_5.sh` → `plot/fig5_timesteps.py`, `plot/plot_fig5.py` | per-chunk time breakdown of the write and read paths, from `CLIO_NEUROPRESS_PHASE_LOG` |
-| `figure_8.sh` → `plot/fig8_trace.py`, `plot/plot_fig8.py` | regret and cost MAPE per chunk with every configuration measured; see `figures/fig8/README.md` |
-| `figure_9.sh` → `plot/plot_fig9.py` | end-to-end wall clock: Baseline, the ablation and the external codecs, each ending with a timed flush; what the bars do and do not measure is in [`plot/fig9.md`](plot/fig9.md) |
+| `figures/fig5/figure_5.sh` → `plot_fig5.py` (beside it; `table`, `pies`, `stacked`, `anatomy` modes) | per-chunk time breakdown of the write and read paths, from `CLIO_NEUROPRESS_PHASE_LOG` |
+| `figures/fig8/figure_8.sh` → `plot_fig8.py` (beside it; `trace`, `panels`, `models`, `split` modes) | regret and cost MAPE per chunk with every configuration measured; see `figures/fig8/README.md` |
+| `figures/fig9/figure_9.sh` → `plot_fig9.py` (beside it) | end-to-end wall clock: Baseline, the ablation and the external codecs, each ending with a timed flush; what the bars do and do not measure is in [`figures/fig9/fig9.md`](figures/fig9/fig9.md) |
 | `ai/gen_fields.sh` | the AI workload's dumps (ViT-B/16 checkpoints, upstream's exporter) |
 | `lib/compose_hooks.sh` | compose knobs every `<workload>/common.sh` sources: `BENCH_TIER*`, `BENCH_FLUSH_MS`, `BENCH_NP_LR`, `BENCH_NP_MAPE` |
 | `lib/decode_wal.py` | which storage pools a run placed each blob on |
@@ -101,9 +100,8 @@ LAMMPS on the GPU needs `--require-device`; replayed WarpX needs
 | `plot/figure_lossy.py` | the same three frames, original against decompressed, plus the error map |
 | `plot/viz_fields.py` | a full montage and GIF of an f32 dump sequence, with blast-wave diagnostics |
 | `plot/viz_selection.py {actions,bound,chunks}` | a run chunk by chunk: what the model saw, what it picked, and whether the error bound did anything |
-| `plot/viz_learning.py {trend,perchunk}` | whether online SGD moves the model: `trend` smooths the cost-model error and draws a learning-off control against it, `perchunk` marks every chunk that produced a gradient. Reads `selection.csv`, gzipped or not. |
-| `plot/paper_figures.py {fig3,fig4,fig5,fields}` | the paper's Figures 3–5 and the field montage beside them |
-| `plot/viz_openpmd.py`, `plot/viz_atoms.py` | the same for WarpX's openPMD fields and LAMMPS's atom state |
+| `evolution-study/paper_figures.py {fig3,fig4,fig5,fields}` | the paper's Figures 3–5 and the field montage beside them |
+| `plot/viz_openpmd.py` | the same for WarpX's openPMD fields |
 
 `plot/figure_evolution.py` refuses to write a blank plate: a slice that is
 identically zero while the volume is not means the plane or the shape is wrong,
@@ -113,9 +111,9 @@ not that the data is static.
 
 ## Running the large workloads on one local GPU
 
-These are the invocations that produced what is in `evolution-study/` and
-`learning-study/`. They were previously driven by Slurm jobs on Delta; the
-parameters below are those jobs' own, with the cluster paths localised.
+These are the invocations that produced what is in `evolution-study/`. They
+were previously driven by Slurm jobs on Delta; the parameters below are those
+jobs' own, with the cluster paths localised.
 
 **The chunk size is per workload, and for WarpX it is a correctness condition,
 not a tuning knob.** openPMD emits each AMReX box as a separate partial write,
@@ -152,10 +150,6 @@ CLIO_NEUROPRESS_STAGE_H2D=1 ./vpic/run_config.sh explore-balance \
     --steps 2000 --interval 10 --chunk 1048576 --stage-h2d \
     --bw 5e6 --eb 1e-3 --explore-k 31 --results "$RESULTS" --tag warpx_k31
 ```
-
-The learning campaign is the same four lines with `explore-balance` replaced by
-`learn` / `learn-ratio` / `dynamic` / `dynamic-ratio` and the `--explore-k`
-dropped; `learning-study/drivers/` holds them as runnable scripts.
 
 `--require-device` on LAMMPS is a correctness flag, not a performance one:
 without it the driver gathers each chunk into host memory, where NeuroPress's
@@ -222,31 +216,13 @@ evolution-study/<workload>/fields_fig.png
 evolution-study/<workload>/evolution_begin_middle_end.png
 ```
 
-Not `<workload>/viz/` -- that is each workload's `visualize.sh` render target,
-regenerated on every run.
-
 `evolution-study/regenerate.sh` rebuilds all of them from that directory
-alone; `plot/paper_figures.py {fig3,fig4,fig5,fields}` is what it drives. Pass
+alone; `evolution-study/paper_figures.py {fig3,fig4,fig5,fields}` is what it drives. Pass
 `--slices <run>.slices.npz` to read the cached mid-planes instead of the
 deleted dumps — 100–300 KB standing in for 4.8–26 GB, and byte-identical
 output. Pass `--shape NX,NY,NZ` for a non-cubic grid: WarpX's 64×64×512 has
 exactly 128³ cells, so the cube-root test *passes* and silently reshapes a slab
 into a cube.
-
----
-
-## Does the *model* adapt? — `learning-study/`
-
-[`learning-study/`](learning-study/README.md) asks the other half of the
-question. The evolution study establishes that the data changes; this one asks
-whether NeuroPress's online SGD notices — sixteen runs, four workloads ×
-{balanced, ratio-only cost} × {learning on, off}, exploration off throughout so
-the model trains only on the action it actually picked.
-
-The learning-off arms are the point: a prediction error that falls over a run
-proves nothing on its own, because the data gets easier or harder by itself.
-In 7 of 8 arms the learning run crosses the SGD gate far less often than its
-own control.
 
 ---
 

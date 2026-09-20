@@ -26,15 +26,11 @@ study's rankings — are in [`RESULTS.md`](RESULTS.md).**
 
 ## Looking at the data
 
-**`./visualize.sh` is the one-liner**: it runs the workload at the evolving
-default and renders every field into `./viz/`, keeping only the figures — the
-~2 GB of openPMD behind them goes to a scratch directory and is deleted when
-the render finishes.
+Run it and render the openPMD it wrote with `../plot/viz_openpmd.py`:
 
 ```bash
-./visualize.sh                       # ~2 min -> ./viz (one montage per field + evolution.png)
-./visualize.sh --steps 200 --int 20  # quicker
-./visualize.sh --keep-dumps          # keep the openPMD too
+./run_config.sh dynamic --steps 200 --results /tmp/wx --tag look
+../plot/viz_openpmd.py --run /tmp/wx/look --out /tmp/wx-viz
 ```
 
 `--steps` is the only knob that makes a run shorter here; the grid cannot be
@@ -64,20 +60,13 @@ reports a problem. 64×64×512 is the smallest grid that stages anything. This i
 the same failure the `CLIO_VOL_CHUNK_SIZE` note at the top of `run_config.sh`
 describes, reached from the other direction.
 
-### Reading the fields back: `read_fields.sh`
+### Reading the fields back
 
-`read.sh` proves the tier answered and the bytes are right. It does not write
-them anywhere, so there is nothing to look at. `read_fields.sh` does the
-equivalent of `--dump-decompressed` on the other three workloads — which have a
-Clio driver to put the flag on, and this one does not:
-
-```bash
-./read_fields.sh --results /tmp/wx2 --runs "eb001 eb01 eb10" --out /tmp/wx-cmp
-```
-
-It reads each run's own `.h5` **twice** — once through the native HDF5 VOL for
-the originals, once through Clio's for the decompressed copies — and writes both
-as raw float32. Within a run, deliberately: comparing across runs would measure
+`read.sh` proves the tier answered and the bytes are right, but it does not
+write them anywhere, so there is nothing to look at. WarpX has no Clio driver
+to put `--dump-decompressed` on, as the other workloads do; reading each run's
+`.h5` twice — once through the native HDF5 VOL, once through Clio's — is what
+recovers original-vs-decompressed bytes. Comparing across runs would measure
 WarpX's own 0.6% run-to-run spread instead of the codec.
 
 **The native file is authoritative and uncompressed, so a VOL read that misses
@@ -90,8 +79,7 @@ read in the measurements recorded in `RESULTS.md` inverted at least one codec.
 ## Running
 
 ```bash
-./run_sweep.sh                      # every policy, each a full WarpX run
-./run_config.sh explore             # one policy
+./run_config.sh explore             # one policy, a full WarpX run
 ./read.sh --run static-zstd-s4      # read back through the VOL
 ../collect.py results/              # re-aggregate
 ```

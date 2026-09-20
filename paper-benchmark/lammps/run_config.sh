@@ -331,6 +331,24 @@ env CLIO_SERVER_CONF="$STORE/compose.yaml" \
     "$BIN" "${ARGS[@]}" > "$STORE/stdout.log" 2> "$STORE/runtime.log"
 RC=$?
 set -e
+# --raw writes flat, pre-chunked .bin blobs. Replaying them needs the layout
+# every other workload dumps: <frame>/<array><ext>, one whole array per file,
+# the frame zero-padded so lexical order is chronological. Both the replay
+# driver's blob naming and --check-bound's source lookup assume it
+# (neuropress_field_replay.cc:171,549). blobs.csv is in emission order, so
+# appending in that order reassembles each array from its chunks.
+if [ -n "$RAW_DIR" ] && [ $RC -eq 0 ] && [ -s "$STORE/blobs.csv" ]; then
+  RAW_EXT=.f64; [ "$F32" = 1 ] && RAW_EXT=.f32
+  while IFS=, read -r blob _rest; do
+    [ "$blob" = blob ] && continue
+    arr=${blob%%/*}; rest=${blob#*/}; stp=${rest%%/*}
+    [ -e "$RAW_DIR/${blob//\//_}.bin" ] || continue
+    frame=$(printf '%s/step%06d' "$RAW_DIR" "${stp#step_}")
+    mkdir -p "$frame"
+    cat "$RAW_DIR/${blob//\//_}.bin" >> "$frame/$arr$RAW_EXT"
+    rm -f "$RAW_DIR/${blob//\//_}.bin"
+  done < "$STORE/blobs.csv"
+fi
 # awk, not bc: bc is not installed everywhere and a missing one would leave
 # WALL empty, producing invalid JSON that collect.py then skips silently.
 WALL=$(awk -v a="$START" -v b="$(date +%s.%N)" 'BEGIN{printf "%.2f", b-a}')

@@ -248,7 +248,7 @@ def build_workload(campaign: str, wl: str) -> pd.DataFrame:
     e = pd.read_csv(os.path.join(base, "explore.csv"))
     dist = pd.read_csv(os.path.join(base, "dist.csv"), usecols=["blob", "dist_class"])
 
-    # Penalty rows were never measured; fig8_trace.py drops them the same way.
+    # Penalty rows were never measured; `plot_fig8.py trace` drops them too.
     penalty = (e.ct_ms <= 0) & (e.dt_ms < 0) & (e.cost >= 1e5)
     kept = e[~penalty].copy()
 

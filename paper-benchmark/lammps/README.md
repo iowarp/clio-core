@@ -62,10 +62,8 @@ and the rest of Clio still configures.
 ## Running
 
 ```bash
-./run_sweep.sh                          # every policy, 2M atoms — ~6.5 min
-./run_sweep.sh --box 20 --steps 100     # quick shakedown
-./run_sweep.sh --repeats 3              # variance
-./run_config.sh dynamic                 # one policy
+./run_config.sh dynamic                 # one policy, 2M atoms
+./run_config.sh dynamic --box 20 --steps 100    # quick shakedown
 ./collect.py results/                   # re-aggregate
 ./run_config.sh -h                      # all options
 ```
@@ -73,9 +71,8 @@ and the rest of Clio still configures.
 ### Configuring the simulation
 
 Size and sampling are run options; the physics is a set of pass-through
-options that reach the deck as LAMMPS `-var`. Both `run_config.sh` and
-`run_sweep.sh` accept them, so a whole sweep can be repeated at another
-state point without editing anything.
+options that reach the deck as LAMMPS `-var`, so a run can be repeated at
+another state point without editing anything.
 
 | option | deck variable | default | |
 |---|---|---|---|
@@ -147,20 +144,6 @@ argument must still be numeric — `fix_langevin.cpp:76`).
 
 ### Looking at the data
 
-**`./visualize.sh` is the one-liner**: it runs the workload at the evolving
-default and renders into `./viz/`, keeping only the figures — the staged bytes
-go to a scratch directory and are deleted when the render finishes.
-
-```bash
-./visualize.sh                       # ~22 s -> ./viz (montage, GIF, evolution.png)
-./visualize.sh --ramp                # in.melt_ramp instead of the hot melt
-./visualize.sh --keep-dumps          # keep the staged bytes too
-```
-
-It computes `--chunk` from `--box` rather than taking it, because `../plot/viz_atoms.py`
-assumes one chunk per field per frame and anything else produces fragments that
-will not reshape.
-
 This workload is in situ — LAMMPS runs as a library in the benchmark process
 and no file is ever written — so there is nothing on disk to look at unless the
 run asks for it. `--raw DIR` makes the driver write each staged blob's bytes,
@@ -169,13 +152,14 @@ which are exactly what NeuroPress compressed.
 ```bash
 ./run_config.sh dynamic --box 20 --steps 500 --gap 20 --chunk 768000 \
     --require-device --raw /tmp/lmp-raw --results /tmp/lmp-lossless --tag ll
-../plot/viz_atoms.py --raw /tmp/lmp-raw --out /tmp/lmp-viz          # ~20 s
 ```
 
-`../plot/viz_atoms.py` draws a 1.2σ slab through the middle of the box, coloured by
-speed, as a montage and a GIF — a slab and not the whole box, because 32,000
+The chunk size must give one chunk per field per frame; anything else produces
+fragments that will not reshape. What the staged bytes look like was drawn by
+`viz_atoms.py`, which is in git history: a 1.2σ slab through the middle of
+the box, coloured by speed — a slab and not the whole box, because 32,000
 atoms projected through 33σ of depth is a uniform smear at every timestep and
-the melt is invisible. `evolution.png` carries MSD, g(r), temperature, the
+the melt is invisible. Its `evolution.png` carried MSD, g(r), temperature, the
 per-byte redundancy above, and a zlib stand-in for the ratio.
 
 The physics is unambiguous: g(r) goes from sharp fcc shells out to 16σ at step 0

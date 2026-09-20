@@ -1,7 +1,0 @@
-{"config":"dynamic","tag":"vpic_dynamic","rc":0,"mode":"lossy",
- "cost_model":"balance","bw_bytes_per_ms":5e6,
- "error_bound":1e-3,"explore_k":0,"explore_thresh":0.5,"device":"gpu","workload":"vpic-weibel",
- "atoms":0,"steps":2000,"gap":0,"frames":200,
- "chunk":4194304,"files":3200,"payload_bytes":26843696729,"wall_s":129.55,
- "verified":0,"port":39361,
- "physics":{"problem":"weibel","precision":"float32"}}

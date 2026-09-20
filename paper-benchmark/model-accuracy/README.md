@@ -85,7 +85,7 @@ export NEUROPRESS_DIR=/path/to/NeuroPress        # for xgb_model.pkl
 ./make_table.sh --corpus /path/to/benchmark_results_600k.csv \
                 --campaign /path/to/campaign --out out
 python3 fig8_model_chunks.py --inputs out/inputs --out fig8d_chunks.csv
-python3 ../plot/plot_fig8_models.py --chunks fig8d_chunks.csv --out figures
+python3 ../figures/fig8/plot_fig8.py models --chunks fig8d_chunks.csv --out figures
 ```
 
 ## What was measured
@@ -134,7 +134,7 @@ adding it back to `SETTINGS` in `accuracy_table.py`.
 
 The reported MAPE caps each row's absolute percentage error at **100% before
 averaging**, which is this repo's own convention for the statistic
-(`plot_fig8.py`'s per-chunk `MAPE_CLIP`). Capping per row, rather than clipping
+(`figures/fig8/plot_fig8.py`'s per-chunk `MAPE_CLIP`). Capping per row, rather than clipping
 the reported mean, is what keeps the comparison alive above the ceiling: a
 model whose errors are all 30% stays distinguishable from one whose errors are
 half 10% and half 2000%, where clipping the mean would put both at 100.

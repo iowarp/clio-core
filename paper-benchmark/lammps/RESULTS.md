@@ -186,7 +186,7 @@ where the bound pushed the ranking onto an action that expanded instead.
 
 ### Temporal redundancy: zero per value, 22.6% per byte
 
-`../plot/viz_atoms.py` measures how much of a frame survives the next timestep. Per
+Measured over the staged frames: how much of a frame survives the next timestep. Per
 value the answer is **0.00%, at every frame, for every field** — not one of the
 96,000 doubles in a frame is unchanged, where the Nyx blast starts at 99.9% and
 ends at 57%. That number is saturated and on its own misleading. Per byte:
@@ -220,10 +220,10 @@ setting across workloads**, and a LAMMPS lossy result should not be read beside
 a VPIC one as if it were.
 
 ```bash
-# a colder, denser state point, whole sweep
-./run_sweep.sh --density 1.2 --temp 0.4 --dt 0.002
+# a colder, denser state point
+./run_config.sh dynamic --density 1.2 --temp 0.4 --dt 0.002
 
-# one policy, longer trajectory, finer sampling, different seed
+# longer trajectory, finer sampling, different seed
 ./run_config.sh dynamic --steps 1000 --gap 100 --seed 12345
 ```
 
@@ -237,8 +237,8 @@ treats it as part of the run's identity: two runs of the same policy at
 different density or temperature are different experiments and are reported
 as separate rows, never averaged together.
 
-`run_sweep.sh` writes one directory per run under `results/`, then
-`collect.py` produces `summary.csv` and `summary.md`.
+`run_config.sh` writes one directory per run under `results/`, and
+`collect.py` turns a set of them into `summary.csv` and `summary.md`.
 
 Each run directory holds `blobs.csv` (every chunk: size, codec, ratio, stored
 bytes, compress time, digest), `selection.csv` (what NeuroPress chose, its

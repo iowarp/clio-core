@@ -1,7 +1,0 @@
-{"config":"dynamic-ratio","tag":"nyx_dynamic-ratio","rc":0,"mode":"lossy",
- "cost_model":"ratio","bw_bytes_per_ms":5e6,
- "error_bound":1e-3,"explore_k":0,"explore_thresh":0.5,"device":"gpu","workload":"nyx-sedov",
- "atoms":0,"steps":2000,"gap":0,"frames":51,
- "chunk":4194304,"files":306,"payload_bytes":20535313906,"wall_s":59.62,
- "verified":0,"port":53679,
- "physics":{"problem":"sedov","precision":"float32"}}

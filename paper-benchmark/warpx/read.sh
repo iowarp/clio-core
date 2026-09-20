@@ -42,7 +42,7 @@ done
 [ -n "$RUN" ] || { echo "need --run NAME" >&2; exit 2; }
 STORE=$RESULTS/$RUN
 RUNDIR=$STORE/run
-[ -d "$RUNDIR/diags" ] || { echo "no $RUNDIR/diags -- run_sweep.sh deletes them to save space; rerun ./run_config.sh $RUN" >&2; exit 1; }
+[ -d "$RUNDIR/diags" ] || { echo "no $RUNDIR/diags -- deleted to save space; rerun ./run_config.sh $RUN" >&2; exit 1; }
 [ -f "$STORE/compose.yaml" ] || { echo "no $STORE/compose.yaml" >&2; exit 1; }
 
 # Relative, because that is how WarpX wrote it (see the note above).

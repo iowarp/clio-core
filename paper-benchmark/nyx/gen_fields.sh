@@ -63,7 +63,7 @@
 # uses. It aborts AFTER writing each dump, so the symptom is a nonzero exit
 # with seemingly complete output. See the patch header for the full analysis.
 #
-# Phase 2 is run_sweep.sh, which replays whatever this produced.
+# Phase 2 is run_config.sh, which replays whatever this produced.
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
@@ -155,7 +155,7 @@ JSON
 echo "   $N field files, $(du -sh "$OUT" | cut -f1)"
 echo "   fields: $(find "$OUT" -name '*.f32' -printf '%f\n' | sed -E 's/fab[0-9]+_comp[0-9]+_//; s/\.f32//' | sort -u | tr '\n' ' ')"
 echo
-echo "now sweep it:  ./run_sweep.sh --fields $OUT"
+echo "now replay it: ./run_config.sh <config> --fields $OUT"
 if [ "$KEEP_PLT" = 1 ]; then
   echo "   plotfiles: $WORK ($(du -sh "$WORK" | cut -f1)) -- yt/VisIt/ParaView read these"
   echo "or look at it: ../plot/viz_fields.py --fields $OUT --plt $WORK --out /tmp/nyx-viz"

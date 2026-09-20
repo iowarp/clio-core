@@ -29,8 +29,7 @@ offline. `weibel_clio.cxx` links nothing from Clio or NeuroPress.
 
 ```
   phase 1: ./build_deck.sh && ./gen_fields.sh    VPIC ──► plt00000/fab0000_comp04_cbx.f32 …
-  phase 2: ./run_sweep.sh                        files ──► Clio ──► NeuroPress ──► CTE tier
-  phase 3: ./read.sh --run <name>                cold read from the tier alone
+  phase 2: ./run_config.sh <config>              files ──► Clio ──► NeuroPress ──► CTE tier
 ```
 
 Splitting them means every policy replays identical bytes, so the comparison is
@@ -119,8 +118,7 @@ byte-identical input:
 
 ```bash
 ./gen_fields.sh                    # VPIC -> ./fields (~1 GB)
-./run_sweep.sh                     # every policy over those files
-./read.sh --run static-zstd-s4     # cold read-back, separate process
+./run_config.sh static-zstd-s4     # one policy over those files
 ../collect.py results/             # re-aggregate
 ```
 
@@ -139,18 +137,14 @@ silently running the wrong path.
 
 ## Looking at the data
 
-**`./visualize.sh` is the one-liner**: it runs the workload at the evolving
-default and renders all sixteen field variables into `./viz/`, keeping only the
-figures — the dumps behind them go to a scratch directory and are deleted when
-the render finishes.
+Dump a small run and render it with `../plot/viz_fields.py`:
 
 ```bash
-./visualize.sh                       # ~26 s -> ./viz (16 montages, 16 GIFs, evolution.png)
-./visualize.sh --ncell 126           # the benchmark's own resolution, ~130 s
-./visualize.sh --keep-dumps          # keep the .f32 too
+./gen_fields.sh --ncell 64 --out /tmp/vpic-quick
+../plot/viz_fields.py --fields /tmp/vpic-quick --out /tmp/vpic-viz
 ```
 
-It defaults to `--ncell 64` rather than the benchmark's 126: 126 exists so the
+`--ncell 64` rather than the benchmark's 126: 126 exists so the
 dumped `(N+2)^3` extent is exactly 128³ voxels = 8 MiB per variable, which is a
 chunk-count property and means nothing to a picture. `rhob`'s panel is a still
 image on purpose — this deck is vacuum and accumulates no bound charge, so no

@@ -21,6 +21,15 @@ and the numbers in evolution.csv come from exactly the same bytes and the same
 source handling -- including the h5dump path for openPMD and the chunk-order
 concatenation for raw.
 
+THE PANEL MACHINERY IS IMPORTABLE, not private to main(): pick_at(),
+refuse_blank(), shared_norm() and draw_panels() are what a figure needs to
+draw these same panels and then add something of its own on top, and
+draw_panels takes an `overlay` callback for exactly that. The motivation
+plate (Motivation_SimEvolution/plot_motivation.py) rules its panels into the
+chunks the field was stored as that way, so a figure built on this one shares
+the frame reading, the shared colour scale and the blank-plate refusal
+instead of restating them.
+
 A VECTOR COMPONENT IS ANTISYMMETRIC ABOUT THE MID-PLANE NORMAL TO ITS OWN
 AXIS, so slicing z-momentum on the z mid-plane gives ~0 everywhere and a blank
 panel from perfectly healthy data. Measured on Nyx at 128^3: zmom reaches 4.24
@@ -69,6 +78,118 @@ def slice_of(flat, axis, shape=None):
     return {"x": v[i, :, :], "y": v[:, j, :], "z": v[:, :, k]}[axis], v
 
 
+def pick_at(nframes, at):
+    """Which frames to draw, from fractions of the run.
+
+    Shared so that two figures asked for the same fractions land on the same
+    timesteps; duplicates collapse, so --at 0 --at 0 draws one panel.
+
+    @param nframes how many frames the reader found
+    @param at fractions of the run, 0 first frame and 1 last
+    @return frame indices, in the order asked for
+    """
+    return list(dict.fromkeys(
+        min(nframes - 1, max(0, int(round(f * (nframes - 1))))) for f in at))
+
+
+def refuse_blank(field, axis, slices, vols):
+    """Stop rather than write a plate that is blank for a reason.
+
+    A slice that is identically zero while the volume is not means the plane
+    or the shape is wrong, not that the data is static -- a vector component
+    is antisymmetric about the mid-plane normal to its own axis, and a
+    mis-shaped reshape lands anywhere. Either way the picture would be a lie.
+
+    @param field the field being drawn, for the message
+    @param axis the plane it was sliced on
+    @param slices the 2-D slices about to be drawn
+    @param vols the volumes they came from
+    """
+    if (max(abs(s).max() for s in slices) == 0
+            and max(abs(v).max() for v in vols) > 0):
+        sys.exit(f"{field}: identically zero on the {axis} mid-plane while "
+                 f"the volume reaches {max(abs(v).max() for v in vols):.4g}. "
+                 f"Wrong plane or wrong --shape; refusing to write a blank figure.")
+
+
+def shared_norm(slices):
+    """One colour scale for every panel, and the map to read it with.
+
+    Computed over all the slices together, which is the whole point: per-panel
+    autoscaling will stretch noise to full contrast and make a static field
+    look like it is evolving. Log only when the data is strictly positive and
+    spans enough decades to need it -- Sedov density does, a signed field
+    cannot -- and diverging when it changes sign.
+
+    @param slices the 2-D slices to be drawn
+    @return (norm, colormap name)
+    """
+    both = np.concatenate([s.ravel() for s in slices])
+    finite = both[np.isfinite(both)]
+    lo, hi = np.percentile(finite, [1, 99]) if finite.size else (0, 1)
+    if lo == hi:
+        lo, hi = (lo - 1e-12, hi + 1e-12)
+    if finite.min() > 0 and hi / max(lo, 1e-300) > 50:
+        return LogNorm(vmin=max(lo, finite.min()), vmax=hi), "inferno"
+    m = max(abs(lo), abs(hi))
+    if finite.min() < 0:
+        return Normalize(vmin=-m, vmax=m), "RdBu_r"
+    return Normalize(vmin=lo, vmax=hi), "inferno"
+
+
+def draw_panels(fig, axes, slices, vols, labels, steps, norm, cmap,
+                overlay=None):
+    """One mid-plane slice per panel, all on the same scale, with one colorbar.
+
+    @param fig the figure, for the colorbar
+    @param axes one axis per frame
+    @param slices the 2-D slices to draw
+    @param vols the volumes they were cut from, for an overlay that needs the
+           grid rather than the picture
+    @param labels beginning / middle / last, one per panel; "" for a panel
+           titled with its timestep alone, which is what a figure whose
+           caption already says which end of the run is which wants
+    @param steps each panel's timestep
+    @param norm, cmap from shared_norm
+    @param overlay optional f(ax, vol, step), called on each panel once its
+           image is drawn: for a figure that adds something the field itself
+           does not carry, such as the chunks it was stored as
+    """
+    for ax, s, lab, st, vol in zip(axes, slices, labels, steps, vols):
+        im = ax.imshow(s.T, origin="lower", norm=norm, cmap=cmap)
+        if overlay:
+            overlay(ax, vol, st)
+        ax.set_title(f"{lab} — step {st}" if lab else f"step {st}")
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.colorbar(im, ax=axes, fraction=0.025, pad=0.02)
+
+
+def suptitle(fig, a, field):
+    """The one line over the panels: what is drawn and how it is scaled.
+
+    @param fig the figure
+    @param a the parsed arguments
+    @param field the field drawn
+    """
+    if a.atoms:
+        fig.suptitle(f"{a.workload or a.source}: {field} — x–y projection, "
+                     f"colour = z", y=0.99)
+        return
+    fig.suptitle(f"{a.workload or a.source}: {field} — {a.axis} mid-plane, "
+                 f"one shared color scale", y=0.99)
+
+
+def panel_labels(n):
+    """Words for the panels, however many frames were asked for.
+
+    @param n how many frames are drawn
+    @return the labels, first to last
+    """
+    if n == 1:
+        return ["one frame"]
+    return ["beginning"] + ["middle"] * (n - 2) + ["last"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True, choices=sorted(ev.SOURCES))
@@ -81,8 +202,18 @@ def main():
                     help="NX,NY,NZ for a non-cubic grid, e.g. 64,64,512")
     ap.add_argument("--atoms", action="store_true",
                     help="rows are atom xyz, not a field cube: scatter instead")
+    ap.add_argument("--no-title", dest="title", action="store_false",
+                    help="leave the figure title off: in a paper that text "
+                         "is the caption's job. The per-panel labels stay")
     ap.add_argument("--f64", action="store_true")
     ap.add_argument("--step-scale", type=int, default=1)
+    ap.add_argument("--at", action="append", type=float, default=[],
+                    help="fractions of the run to draw, repeatable "
+                         "[0 0.5 1]; the frame nearest each is used. The "
+                         "first frame of a blast run is a point source and "
+                         "looks like an empty box, so a figure of one starts "
+                         "at 0.05 instead -- pass the same fractions to two "
+                         "figures and they line up on the same timesteps")
     a = ap.parse_args()
 
     field = a.field or DEFAULT_FIELD.get(a.workload, "")
@@ -100,8 +231,8 @@ def main():
     if len(frames) < 2:
         sys.exit(f"{a.dir}: need at least 2 frames, found {len(frames)}")
 
-    pick = [0, len(frames) // 2, len(frames) - 1]
-    labels = ["beginning", "middle", "last"]
+    pick = pick_at(len(frames), a.at or [0.0, 0.5, 1.0])
+    labels = panel_labels(len(pick))
     steps, arrays = [], []
     for i in pick:
         step, fields = frames[i]
@@ -110,7 +241,9 @@ def main():
         steps.append(step * a.step_scale)
         arrays.append(fields[field].astype(np.float64))
 
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.8))
+    fig, axes = plt.subplots(1, len(pick),
+                             figsize=(4.5 * len(pick), 4.8), squeeze=False)
+    axes = axes[0]
 
     if a.atoms:
         # natoms x 3. Project onto x-y and colour by z so depth is visible;
@@ -133,45 +266,16 @@ def main():
                      f"use --shape, or --atoms if these are atom rows")
         slices = [g[0] for g in got]
         vols = [g[1] for g in got]
-        # REFUSE TO WRITE A BLANK PLATE. A slice that is identically zero while
-        # the volume is not means the plane or the shape is wrong, not that the
-        # data is static -- a vector component is antisymmetric about the
-        # mid-plane normal to its own axis, and a mis-shaped reshape lands
-        # anywhere. Either way the picture would be a lie, so stop.
-        if (max(abs(s).max() for s in slices) == 0
-                and max(abs(v).max() for v in vols) > 0):
-            sys.exit(f"{field}: identically zero on the {a.axis} mid-plane while "
-                     f"the volume reaches {max(abs(v).max() for v in vols):.4g}. "
-                     f"Wrong plane or wrong --shape; refusing to write a blank figure.")
-        both = np.concatenate([s.ravel() for s in slices])
-        finite = both[np.isfinite(both)]
-        lo, hi = np.percentile(finite, [1, 99]) if finite.size else (0, 1)
-        if lo == hi:
-            lo, hi = (lo - 1e-12, hi + 1e-12)
-        # Log scale only when the data is strictly positive and spans enough
-        # decades to need it -- Sedov density does, a signed field cannot.
-        if finite.min() > 0 and hi / max(lo, 1e-300) > 50:
-            norm, cmap = LogNorm(vmin=max(lo, finite.min()), vmax=hi), "inferno"
-        else:
-            m = max(abs(lo), abs(hi))
-            if finite.min() < 0:
-                norm, cmap = Normalize(vmin=-m, vmax=m), "RdBu_r"
-            else:
-                norm, cmap = Normalize(vmin=lo, vmax=hi), "inferno"
-        for ax, s, lab, st in zip(axes, slices, labels, steps):
-            im = ax.imshow(s.T, origin="lower", norm=norm, cmap=cmap)
-            ax.set_title(f"{lab} — step {st}")
-            ax.set_xticks([]); ax.set_yticks([])
-        fig.colorbar(im, ax=axes, fraction=0.025, pad=0.02)
+        refuse_blank(field, a.axis, slices, vols)
+        norm, cmap = shared_norm(slices)
+        draw_panels(fig, axes, slices, vols, labels, steps, norm, cmap)
 
-    fig.suptitle(f"{a.workload or a.source}: {field} — "
-                 f"{a.axis} mid-plane, one shared color scale"
-                 if not a.atoms else
-                 f"{a.workload or a.source}: {field} — x–y projection, colour = z",
-                 y=0.99)
+    if a.title:
+        suptitle(fig, a, field)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     fig.savefig(a.out, dpi=130, bbox_inches="tight")
-    print(f"{a.out}  ({field}, steps {steps[0]}/{steps[1]}/{steps[2]})")
+    print(f"{a.out}  ({field}, steps "
+          f"{'/'.join(str(st) for st in steps)})")
 
 
 if __name__ == "__main__":

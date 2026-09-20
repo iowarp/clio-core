@@ -10,7 +10,7 @@
 # -- which separates "float32" from "compressible" in every claim that rests on
 # the element width.
 #
-# Every configuration in run_sweep.sh differs ONLY in how the codec is chosen.
+# Every configuration run_config.sh accepts differs ONLY in how the codec is chosen.
 # Unlike the LAMMPS benchmark -- whose GPU trajectory is not bit-reproducible,
 # so each policy sees slightly different bytes -- every policy here replays the
 # IDENTICAL files, which makes the comparison exact rather than statistical.

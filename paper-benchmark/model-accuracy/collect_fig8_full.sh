@@ -8,11 +8,17 @@
 set -euo pipefail
 
 TAG=${1:-full2k-09181841}
-ROOT=/projects/bekn/imuradli/np-hcompress
+# Machine-specific paths (gitignored).
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SITE=${SITE:-$HERE/../site.sh}
+# shellcheck source=/dev/null
+[ -f "$SITE" ] && . "$SITE"
+ROOT=${ROOT:-${DATA:-$HOME}/np-hcompress}
 DEST=${2:-$ROOT/fig8_full}
 OUT=$ROOT/out-$TAG
 RUNS=$ROOT/runs/$TAG
-REPO=/u/imuradli/clio-core
+# Derived from this file's location, as env.sh:15 does.
+REPO=${REPO:-$(cd "$HERE/../.." && pwd)}
 
 [ -d "$OUT" ]  || { echo "no campaign output at $OUT" >&2; exit 2; }
 [ -d "$RUNS" ] || { echo "no run dir at $RUNS" >&2; exit 2; }
@@ -73,13 +79,15 @@ for f in prepare_inputs.py accuracy_table.py fig8_model_chunks.py \
   [ -f "$REPO/paper-benchmark/model-accuracy/$f" ] && \
     cp "$REPO/paper-benchmark/model-accuracy/$f" "$DEST/scripts/$f"
 done
-cp "$REPO/paper-benchmark/plot/plot_fig8_models.py" "$DEST/scripts/" 2>/dev/null || true
+cp "$REPO/paper-benchmark/figures/fig8/plot_fig8.py" "$DEST/scripts/" 2>/dev/null || true
 for f in "$ROOT"/jobs/acc.sbatch "$ROOT"/jobs/fig8_dump.sbatch; do
   [ -f "$f" ] && cp "$f" "$DEST/scripts/$(basename "$f")"
 done
 
 # --- the figure itself
-for f in "$REPO"/paper-benchmark/figures/fig8/full/fig8d_models.png; do
+# Whichever size a run last plotted into; figures are not tracked, so this
+# finds nothing unless `plot_fig8.py models` has been run in this checkout.
+for f in "$REPO"/paper-benchmark/figures/fig8/*/fig8d_models.png; do
   [ -f "$f" ] && link "$f" "$DEST/figures/$(basename "$f")"
 done
 

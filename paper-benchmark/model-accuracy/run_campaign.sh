@@ -90,6 +90,11 @@ NP_ENV=(BENCH_NP_LR=0.2 BENCH_NP_MAPE=0.10 MEASURE_DT=1 MEASURE_QUALITY=1
 # (neuropress_field_replay.cc:452) and the drivers flatten '/' to '_' -- without
 # the index a dump replays field-major, and LAMMPS's unpadded step_0/step_3/
 # step_12 would not even sort numerically. Chunk order IS panel (d)'s x axis.
+# Machine-specific paths (gitignored); sourced after the arg loop, so $SIZE is known.
+SITE=${SITE:-$HERE/../site.sh}
+# shellcheck source=/dev/null
+[ -f "$SITE" ] && . "$SITE"
+
 VPIC_FIELDS=${VPIC_FIELDS:-/work/hdd/bekn/imuradli/np-fig8-vpic/fields}
 LAMMPS_FIELDS=${LAMMPS_FIELDS:-/work/hdd/bekn/imuradli/np-fig8-lammps/fields}
 NYX_FIELDS=${NYX_FIELDS:-/projects/bekn/imuradli/np-nyx-256-2000/fields}

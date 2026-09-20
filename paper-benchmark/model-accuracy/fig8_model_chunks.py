@@ -22,7 +22,7 @@ The ranking floor is the one the selector really applies (`NeuroPressCost`), so
 a counterfactual pick has to use it or it is not the pick that system would have
 made.
 
-The reporting floor DEFAULTS TO THE SAME 1 ms, which is not what `fig8_trace.py`
+The reporting floor DEFAULTS TO THE SAME 1 ms, which is not what `plot_fig8.py trace`
 does: panels (a)-(c) report at 5 ms, upstream's trace convention. That is the
 wrong floor for a comparison BETWEEN models here. Chunks are 8 MiB, so the cost's
 I/O term is at most 1.7 ms while a 5 ms floor puts at least 10 ms of constant

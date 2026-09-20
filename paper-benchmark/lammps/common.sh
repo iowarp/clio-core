@@ -5,7 +5,7 @@
 # (DYNAMIC compression). Nothing is written to a file: the driver reads
 # Atom::x/v/f between `run` segments and hands them to the compressor.
 #
-# Every configuration in run_sweep.sh differs ONLY in how the codec is chosen,
+# Every configuration run_config.sh accepts differs ONLY in how the codec is chosen,
 # so the payload is held constant and the selection policy is the variable.
 
 bench_setup() {

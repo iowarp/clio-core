@@ -150,7 +150,7 @@ if ! awk -v e="$LOSSY_EB" 'BEGIN{exit !(e+0>0)}'; then
   echo "REFUSING TO START: --eb must be POSITIVE (got '$LOSSY_EB')." >&2
   echo "This benchmark is lossy-only: 16 of the 32 actions are quantize" >&2
   echo "actions and they are masked at eb=0, so a run without a bound can" >&2
-  echo "measure at most half the action space. Use run_sweep.sh for the" >&2
+  echo "measure at most half the action space. Use figures/fig8 for the" >&2
   echo "lossless policy comparison." >&2
   exit 2
 fi

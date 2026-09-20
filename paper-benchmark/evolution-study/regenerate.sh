@@ -13,7 +13,7 @@
 set -eu
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=${1:-$HERE}
-PF=$HERE/../plot/paper_figures.py
+PF=$HERE/paper_figures.py
 PY=${PYTHON:-python3}
 "$PY" -c "import matplotlib, numpy" 2>/dev/null || {
   echo "matplotlib/numpy missing from $PY -- set PYTHON=<interpreter that has them>" >&2

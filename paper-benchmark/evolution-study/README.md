@@ -104,12 +104,7 @@ each workload's directory as four byte-identical copies.
 LAMMPS has no `fig3.png`: atom coordinates have no grid to localize activity
 on, which is the same reason it has no `.slices.npz`.
 
-`<workload>/viz/` is NOT where these live. That directory is each workload's
-`visualize.sh` render target -- scratch output regenerated on every run, and
-documented as such in the workload READMEs. Curated study figures and a
-script's working directory should not be the same place.
-
-`../plot/paper_figures.py {fig3,fig4,fig5,fields}` draws them; pass
+`./paper_figures.py {fig3,fig4,fig5,fields}`, beside this file, draws them; pass
 `--slices <run>.slices.npz` to use the cache instead of the deleted dumps.
 
 ## Regenerating
@@ -133,12 +128,6 @@ they hold.** They store five arrays named `s0`..`s4`, so the variable the fig3
 top row shows cannot be recovered from them. `regenerate.sh` pins it per
 workload instead, and the values there were recovered by matching each
 committed figure's bottom row against every field in `blocks.csv.gz`.
-
-## Sibling
-
-[`../learning-study/`](../learning-study/) asks the other question: not whether
-the data evolves, but whether the *model* does — NeuroPress's online SGD across
-the same four workloads under both cost models, with a learning-off control.
 
 ## History
 

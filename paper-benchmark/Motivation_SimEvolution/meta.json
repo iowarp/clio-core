@@ -1,0 +1,32 @@
+{
+ "config": "explore-ratio",
+ "tag": "nyx_density_k31_ratio",
+ "rc": 0,
+ "mode": "lossy",
+ "cost_model": "ratio",
+ "bw_bytes_per_ms": 5000000.0,
+ "error_bound": 0.001,
+ "explore_k": 31,
+ "explore_thresh": 0,
+ "device": "gpu",
+ "workload": "nyx-sedov",
+ "atoms": 0,
+ "steps": 2000,
+ "gap": 0,
+ "frames": 43,
+ "chunk": 4194304,
+ "files": 43,
+ "payload_bytes": 2885681152,
+ "wall_s": 58.69,
+ "verified": 0,
+ "port": 41031,
+ "physics": {
+  "problem": "sedov",
+  "precision": "float32"
+ },
+ "field": "density",
+ "source_dumps": "/mnt/np-data/nyx-i48/fields",
+ "ratio_cap": "1e9 (upstream 100, lifted)",
+ "measure_quality": 0,
+ "measure_dt": 0
+}

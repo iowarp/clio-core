@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Machine-specific paths. Copy to site.sh (gitignored) and edit.
+# Sourced by external-baselines/env.sh, by figures/fig5/figure_5.sh and
+# figures/fig8/figure_8.sh, and by model-accuracy/run_campaign.sh, after their
+# arg loop and before their
+# ${VAR:-default} lines -- so $SIZE is known here, this file beats the script
+# defaults, and the caller's environment beats this file.
+
+REPO=${REPO:-$HOME/clio-core}
+BUILD=${BUILD:-$REPO/build}
+NPENV=${NPENV:-$HOME/np-env}
+WORK=${WORK:-$HOME/np-baselines}
+# TWO consumers: ai/gen_fields.sh (upstream's checkpoint exporter) and the
+# model-accuracy scorers, whose --xgb defaults to
+# $NEUROPRESS_DIR/neural_net/weights/xgb_model.pkl. The NN's own weights
+# (model.nnwt) ship in this repo and are found relative to the script.
+NEUROPRESS_DIR=${NEUROPRESS_DIR:-$HOME/NeuroPress}
+
+DATA=${DATA:-/mnt/np-data}              # input dumps
+TIER2_ROOT=${TIER2_ROOT:-/mnt/np-tier2} # tiered spill: real NVMe, NOT the baseline's device
+PFS_ROOT=${PFS_ROOT:-$HOME/np-pfs}      # PFS stand-in: untiered arms write here
+
+NYX_BIN=${NYX_BIN:-$HOME/src/Nyx/build-clio/Exec/HydroTests/nyx_HydroTests}
+WARPX_BIN=${WARPX_BIN:-$HOME/src/warpx/build-clio/bin/warpx.3d}
+DECK=${DECK:-$HOME/src/warpx/Examples/Physics_applications/laser_acceleration/inputs_base_3d}
+
+# 2k replays the same physics dumped twice as often, not a longer run.
+if [ "${SIZE:-}" = 2k ]; then
+  NYX_FIELDS=${NYX_FIELDS:-$DATA/nyx-i48/fields}
+  VPIC_FIELDS=${VPIC_FIELDS:-$DATA/vpic/fields}
+  LAMMPS_FIELDS=${LAMMPS_FIELDS:-$DATA/lammps-b60/fields}
+else
+  NYX_FIELDS=${NYX_FIELDS:-$DATA/nyx-i96/fields}
+  VPIC_FIELDS=${VPIC_FIELDS:-$DATA/vpic-i16/fields}
+  LAMMPS_FIELDS=${LAMMPS_FIELDS:-$DATA/lammps/fields}
+fi
+WARPX_FIELDS=${WARPX_FIELDS:-$DATA/warpx-i5/fields}
+AI_FIELDS=${AI_FIELDS:-$DATA/ai/fields}
+# gen_synth_fields.py is in neither repo; copy this from the source machine.
+SYNTH_FIELDS=${SYNTH_FIELDS:-$DATA/synth/fields}
+
+# Without this the replay driver dies on libpsz_cu_core.so.
+export LD_LIBRARY_PATH="$BUILD/bin:$NPENV/np/lib:$NPENV/cusz/lib64:$NPENV/cuszp/lib64:$NPENV/ndzip/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# The plot steps call bare python3, which on a distro python has no numpy.
+case ":$PATH:" in *":$HOME/np-venv/bin:"*) ;; *) PATH="$HOME/np-venv/bin:$PATH" ;; esac
+export PATH
+# No SLURM: CLIO_MEMFD_DIR falls back to /tmp/clio_$USER. Set it per run if
+# you run anything in parallel.
+
+export REPO BUILD NPENV WORK DATA TIER2_ROOT PFS_ROOT NEUROPRESS_DIR \
+       NYX_BIN WARPX_BIN DECK \
+       NYX_FIELDS VPIC_FIELDS WARPX_FIELDS LAMMPS_FIELDS AI_FIELDS SYNTH_FIELDS

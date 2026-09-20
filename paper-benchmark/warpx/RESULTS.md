@@ -88,7 +88,7 @@ lossless.
 | `dynamic` | 11.785× | 33.9 MiB | 12.1 s | pass |
 | `learn` | 7.107× | 56.3 MiB | 16.1 s | pass |
 
-Every run is verified: `run_sweep.sh` passes `--verify`, so each configuration
+Every run is verified: `run_config.sh --verify`, so each configuration
 reads three field datasets back through the VOL from a separate process and
 requires both byte-equality with a native read and trace evidence that the tier
 served them. Across the eight runs: **192 chunk inversions, 0 cache misses.**

@@ -15,7 +15,7 @@
 #   ./compare_perchunk_oracle.sh --workload vpic --size smoke
 #   ./compare_perchunk_oracle.sh --workload nyx  --size full --bw 1.2e6
 #
-# Companion: compare_wallclock.sh measures the same strategies END TO END.
+# Companion: figures/fig9/figure_9.sh measures the same strategies END TO END.
 # This one is the offline per-chunk analysis; that one is the stopwatch.
 #
 # WHY A SWEEP AND NOT FIVE TIMED ARMS. A per-chunk optimum needs every chunk
@@ -54,6 +54,12 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$WL" ] || usage
 case "$SIZE" in smoke|full) ;; *) echo "--size must be smoke or full" >&2; exit 2 ;; esac
+
+# Machine-specific paths (gitignored); sourced after the arg loop, so $SIZE is
+# known, and before the ${VAR:-default} field resolution below.
+SITE=${SITE:-$HERE/site.sh}
+# shellcheck source=/dev/null
+[ -f "$SITE" ] && . "$SITE"
 
 TARGET_CHUNKS=2000
 case "$SIZE" in

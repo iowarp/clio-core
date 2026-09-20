@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Build and install the external GPU compressors the baseline campaign needs:
 #
+#   cuSZ v0.17.3   error-bounded lossy   (szcompressor/cuSZ)
 #   cuSZp v3.0.0   error-bounded lossy   (szcompressor/cuSZp)
 #   ndzip          lossless float, CUDA  (celerity/ndzip)
 #
-# cuSZ is assumed already installed at $NPENV/cusz; it is not built here.
-#
 # Each needs a patch to build on a current toolchain. They are applied here
 # rather than left as folklore:
+#
+#  0. cuSZ must be cloned --recursive: PSZ_ACTIVATE_LC=ON builds
+#     third_party/lc_gen, which includes headers from the third_party/lc
+#     submodule. A plain clone dies at "max_scan.h: No such file or directory".
 #
 #  1. cuSZp hardcodes CMAKE_CUDA_ARCHITECTURES "60 61 62 70 75 80 86" with a
 #     plain set(), which overrides -D. CUDA 13 dropped Pascal AND Volta, so
@@ -47,8 +50,28 @@ SRC=${SRC:-$WORK/ext-src}; mkdir -p "$SRC"
 CMAKE=${CMAKE:-cmake}
 echo "== using $($CMAKE --version | head -1); arch sm_$CUDA_ARCH; sources in $SRC"
 
+# ------------------------------------------------------------------- cuSZ v0.17.3
+if [ ! -e "$NPENV/cusz/lib64/libcusz.so" ] && [ ! -e "$NPENV/cusz/lib/libcusz.so" ]; then
+  echo "== cuSZ v0.17.3"
+  # Patch 0: submodules, see the header note.
+  [ -d "$SRC/cuSZ" ] || git clone --recursive --branch v0.17.3 \
+      https://github.com/szcompressor/cuSZ.git "$SRC/cuSZ"
+  git -C "$SRC/cuSZ" submodule update --init --recursive
+  $CMAKE -S "$SRC/cuSZ" -B "$SRC/cuSZ/build" -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
+      -DCMAKE_INSTALL_PREFIX="$NPENV/cusz" \
+      -DPSZ_BACKEND=CUDA -DPSZ_ACTIVATE_LC=ON \
+      -DPSZ_BUILD_EXAMPLES=OFF -DPSZ_BUILD_PYBINDING=OFF -DBUILD_TESTING=OFF
+  $CMAKE --build "$SRC/cuSZ/build" -j "$JOBS"
+  $CMAKE --install "$SRC/cuSZ/build"
+else
+  echo "== cuSZ already at $NPENV/cusz"
+fi
+# env.sh spells this libdir lib64; Debian/Ubuntu installs to lib.
+[ -d "$NPENV/cusz/lib" ] && [ ! -e "$NPENV/cusz/lib64" ] && ln -s lib "$NPENV/cusz/lib64"
+
 # ---------------------------------------------------------------- cuSZp v3
-if [ ! -e "$NPENV/cuszp/lib64/libcuSZp.so" ]; then
+if [ ! -e "$NPENV/cuszp/lib64/libcuSZp.so" ] && [ ! -e "$NPENV/cuszp/lib/libcuSZp.so" ]; then
   echo "== cuSZp v3.0.0"
   [ -d "$SRC/cuszp" ] || git clone --depth 1 --branch cuSZp-V3.0.0 \
       https://github.com/szcompressor/cuSZp.git "$SRC/cuszp"
@@ -62,6 +85,7 @@ if [ ! -e "$NPENV/cuszp/lib64/libcuSZp.so" ]; then
 else
   echo "== cuSZp already at $NPENV/cuszp"
 fi
+[ -d "$NPENV/cuszp/lib" ] && [ ! -e "$NPENV/cuszp/lib64" ] && ln -s lib "$NPENV/cuszp/lib64"
 
 # ----------------------------------------------------------------- ndzip
 if [ ! -e "$NPENV/ndzip/lib/libndzip-cuda.so" ]; then
@@ -97,7 +121,8 @@ fi
 
 echo
 echo "== installed =="
-for f in "$NPENV/cuszp/lib64/libcuSZp.so" "$NPENV/ndzip/lib/libndzip-cuda.so"; do
+for f in "$NPENV/cusz/lib64/libcusz.so" "$NPENV/cuszp/lib64/libcuSZp.so" \
+         "$NPENV/ndzip/lib/libndzip-cuda.so"; do
   [ -e "$f" ] && echo "   $f" || echo "   MISSING: $f"
 done
 cat <<'MSG'

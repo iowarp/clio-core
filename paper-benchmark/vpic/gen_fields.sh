@@ -84,4 +84,4 @@ JSON
 echo "   $N field files, $(du -sh "$OUT" | cut -f1)"
 echo "   vars: $(find "$OUT" -name '*.f32' -printf '%f\n' | sed -E 's/fab[0-9]+_comp[0-9]+_//; s/\.f32//' | sort -u | tr '\n' ' ')"
 echo
-echo "now sweep it:  ./run_sweep.sh --fields $OUT"
+echo "now replay it: ./run_config.sh <config> --fields $OUT"

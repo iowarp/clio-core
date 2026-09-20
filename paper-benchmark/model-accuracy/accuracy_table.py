@@ -88,7 +88,7 @@ def mape(pred: np.ndarray, act: np.ndarray, cap: float = 0.0) -> float:
     """Mean absolute percentage error, optionally with a PER-ROW ceiling.
 
     `cap` clips each row's APE before the mean, which is the repo's own
-    convention for this statistic (plot_fig8.py's per-chunk MAPE_CLIP) and not
+    convention for this statistic (figures/fig8/plot_fig8.py's per-chunk MAPE_CLIP) and not
     the same thing as clipping the reported mean. Clipping the mean would put
     every model above the ceiling on the same number and destroy the comparison
     exactly where the models differ most; clipping per row keeps a model whose
