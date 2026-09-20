@@ -1598,6 +1598,22 @@ void Worker::ProcessBlockedQueue(std::queue<clio::run::shared_ptr<Task>> &queue,
       continue;
     }
 
+    // A GPU-submitted task can lose its RunContext between the completion
+    // check above and here: its completion is published by another thread,
+    // the device re-fires the slot, and IpcGpu2Cpu::RecvIn resets the context
+    // for the new submission -- all while this loop still holds the OLD
+    // submission's yield-queue entry. On CUDA the asynchronous SendOut made
+    // that sequence take longer than this loop body; on Level Zero it is
+    // synchronous and the reset lands inside the window. A task with no
+    // context has nothing to resume: it is an orphan entry, so skip it as the
+    // completed case above is skipped. Seen on Aurora as
+    //   Task::SetYielded: null RunContext (pool=513 method=51)
+    // thrown from the SetYielded below. This NARROWS the window rather than
+    // closing it; closing it needs the re-fire reset to be owned by the task's
+    // worker, which is a larger change than a diagnostic bring-up should carry.
+    if (task->RunCtxPtr() == nullptr) {
+      continue;
+    }
     task->SetYieldCount(0);
 
     // CRITICAL: Clear the is_yielded_ flag before resuming the task
@@ -1660,6 +1676,12 @@ void Worker::ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue
     if (elapsed_us + 2000.0 >= task->YieldTimeUs()) {
       // Time threshold reached (within tolerance) - execute the task
       bool is_started = task->IsStarted();
+
+      // Same orphan guard as the yield-queue resume above: a context reset by
+      // a GPU slot re-fire leaves nothing to resume.
+      if (task->RunCtxPtr() == nullptr) {
+        continue;
+      }
 
       // CRITICAL: Clear the is_yielded_ flag before resuming the task
       // This allows the task to call Wait() again if needed
@@ -1727,7 +1749,24 @@ void Worker::ProcessEventQueue() {
     // Skip if the parent's coroutine already completed. Uses the completion
     // query (the flag, not coro_handle_.done()) to avoid dereferencing a
     // coroutine frame a cross-thread completion may already have freed (#485).
-    if (parent->IsCoroCompleted()) {
+    //
+    // AND SKIP IF THE PARENT HAS NO RUNCONTEXT AT ALL. The comment above the
+    // parent lookup argues its context cannot have been freed yet, and for a
+    // parent that awaits this child that is true. A GPU-submitted parent is
+    // different: under producer-only reuse the device re-fires the same task
+    // slot the moment the runtime frees it, and IpcGpu2Cpu::RecvIn resets the
+    // slot's RunContext for the new submission -- with no regard for a child
+    // the old submission left in flight. On CUDA the asynchronous SendOut
+    // copies gave such a child time to finish first; on Level Zero SendOut is
+    // synchronous, the free-then-refire lands within microseconds, and the
+    // child's completion arrives here to find its parent's context gone.
+    // Measured on Aurora: every gpu2cpu event paired correctly (S/C/P/F, no
+    // duplicate delivery), the last event a free, then
+    //   Task::IsCoroCompleted: null RunContext (pool=513 method=51)
+    // thrown from this very line for a bdev child of the freed parent.
+    // A context-less parent is an orphan by definition, and orphans are
+    // already skipped here rather than crashed on; this makes that hold.
+    if (parent->RunCtxPtr() == nullptr || parent->IsCoroCompleted()) {
       continue;
     }
 
@@ -1753,6 +1792,12 @@ void Worker::ProcessEventQueue() {
     // leader-election). Both await paths record the awaited future before
     // suspending, and a future with a null FutureShm matches null == null,
     // so exact equality cannot strand a legitimate waiter.
+    // Re-checked at the point of use: the orphan check above is fifty lines
+    // upstream, and a GPU slot re-fire can reset the parent's context in the
+    // meantime (see the yield-queue resume for the full account).
+    if (parent->RunCtxPtr() == nullptr) {
+      continue;
+    }
     const void* awaited = parent->AwaitedFshm();
     if (awaited != future.GetFutureShm().ptr_) {
       continue;

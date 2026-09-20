@@ -504,7 +504,14 @@ class Frame {
       c_->hdr_->state[depth_] = state;
     }
     char *p = Slot();
+    // CLIO_CO_DIAG_NOSAVE: a DIAGNOSTIC ONLY -- compiles the save/restore out so
+    // a device-compiler crash can be attributed to it or not. The result does
+    // not resume correctly and must never be run.
+#if !defined(CLIO_CO_DIAG_NOSAVE)
     (StoreOne(p, vs), ...);
+#else
+    (void)p; ((void)vs, ...);
+#endif
   }
 
   /** Restore the live set written by the matching Push, in the same order. */
@@ -513,7 +520,11 @@ class Frame {
     static_assert((std::is_trivially_copyable_v<Ts> && ...),
                   "a value live across a CO_AWAIT must be trivially copyable");
     char *p = Slot();
+#if !defined(CLIO_CO_DIAG_NOSAVE)
     (LoadOne(p, vs), ...);
+#else
+    (void)p; ((void)vs, ...);
+#endif
   }
 
   /** Normal return: release the frame so the cursor reflects the chain (I1). */

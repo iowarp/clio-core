@@ -4043,8 +4043,15 @@ int main(int argc, char **argv) {
   // The yield driver has its own traps (frame overflow, nesting depth) and
   // the same problem, so give it the same channel: a device global pointing
   // at pinned host slots.
+  // Same fix, same reason as gpu_vector.h's FatalSlots: on Level Zero a device
+  // atomic to malloc_host memory faults (measured, usm_atomic_probe), and
+  // YieldFatalNote CAS's this word from device code. Shared USM takes it.
   unsigned long long *yfatal =
+#if CTP_ENABLE_SYCL
+      ctp::GpuApi::MallocManaged<unsigned long long>(4 * sizeof(unsigned long long));
+#else
       ctp::GpuApi::MallocHost<unsigned long long>(4 * sizeof(unsigned long long));
+#endif
   if (yfatal != nullptr) {
     std::memset(yfatal, 0, 4 * sizeof(unsigned long long));
     md::SymbolWrite(md::MdSym::kYieldFatal, &yfatal, sizeof(yfatal));

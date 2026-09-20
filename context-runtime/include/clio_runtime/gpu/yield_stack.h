@@ -216,8 +216,22 @@ enum YieldFatal : unsigned long long {
  * device_image_scope puts the variable in the device image instead, so
  * there is no USM allocation to outlive anything. It also states the
  * constraint that is already true here: only the owning image reads it. */
+#if defined(CLIO_SYCL_DG_USM)
+/* The USM-backed default, opted into per build.
+ *
+ * The crash above is a CUDA-backend defect. On Level Zero the USM form is
+ * sound, and it is the ONLY form that lets DPC++ split a many-kernel TU into
+ * per-kernel device images: device_image_scope forbids the variable from
+ * appearing in more than one image, which is exactly what per_kernel does.
+ * lammps_md carries ~32 kernels; merged into a single image they crash IGC
+ * (Internal Compiler Error: Segmentation violation), so on spir64 the split
+ * is not an optimisation but the difference between compiling and not. */
+using SyclImageScope =
+    decltype(::sycl::ext::oneapi::experimental::properties());
+#else
 using SyclImageScope = decltype(::sycl::ext::oneapi::experimental::properties(
     ::sycl::ext::oneapi::experimental::device_image_scope));
+#endif
 inline ::sycl::ext::oneapi::experimental::device_global<unsigned long long *,
                                                         SyclImageScope>
     g_yield_fatal_dg;

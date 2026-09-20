@@ -48,6 +48,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <mutex>
 #include <vector>
 
 namespace clio::run {
@@ -60,12 +61,20 @@ namespace gpu {
  *  Defined only by the TU that owns the kernels -- see the same rule, and
  *  the DPC++ double-registration abort that motivates it, in yield_stack.h. */
 #if defined(CLIO_SYCL_KERNEL_TU)
-// device_image_scope for the same reason as the yield globals; see
-// yield_stack.h.
+// device_image_scope for the same reason as the yield globals, and dropped
+// under CLIO_SYCL_DG_USM for the same reason too: see yield_stack.h. Every
+// image-scoped device_global in the TU has to switch together, or per-kernel
+// splitting still fails on whichever one was missed.
+#if defined(CLIO_SYCL_DG_USM)
+inline ::sycl::ext::oneapi::experimental::device_global<
+    char *, decltype(::sycl::ext::oneapi::experimental::properties())>
+    g_sycl_block_ipc;
+#else
 inline ::sycl::ext::oneapi::experimental::device_global<
     char *, decltype(::sycl::ext::oneapi::experimental::properties(
                 ::sycl::ext::oneapi::experimental::device_image_scope))>
     g_sycl_block_ipc;
+#endif
 inline char *SyclBlockIpcBase() { return g_sycl_block_ipc.get(); }
 #else
 inline char *SyclBlockIpcBase() { return nullptr; }
@@ -246,6 +255,10 @@ class IpcManager {
      */
     clio::run::GpuRingEntry *host_entries = nullptr;
     unsigned int *host_ready = nullptr;
+    // NO MUTEX HERE. This struct's layout is ABI for every translation unit
+    // that inlines the accessors below, and adding a member to it while
+    // rebuilding only libclio_run_cxx made every benchmark SIGSEGV at init.
+    // The SYCL ring drain serialises on a file-static in gpu2cpu_init_sycl.cc.
   };
 
   /** Per-physical-GPU state: queue + queue backend + client backends. */

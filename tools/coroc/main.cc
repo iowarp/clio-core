@@ -1234,6 +1234,26 @@ class Action : public ASTFrontendAction {
    *  the same relative path, so a consumer's include path can shadow the
    *  originals without a single source edit anywhere. */
   void EndSourceFileAction() override {
+    // REFUSE TO WRITE A TRANSPILE BUILT ON A TRUNCATED PARSE.
+    //
+    // A fatal error -- a missing header, above all -- does not stop clang from
+    // handing us an AST; it hands us a SHORTER one. Every await past the
+    // failure is then invisible, so the hoist strips run but the case labels do
+    // not, and the output is wrong in a way that often still compiles. Found
+    // exactly that way: a missing sycl/sycl.hpp produced six transpiles, five
+    // of which compiled clean and all six of which were garbage.
+    //
+    // ORDINARY errors are NOT fatal here, and must not be. A ported source is
+    // not valid C++ until this tool has run: call sites already pass `_cy`
+    // while the definitions do not yet declare it, so "no matching function"
+    // is the expected state of the input, not a problem with it. The AST is
+    // complete in that case; only the overload resolution failed.
+    if (getCompilerInstance().getDiagnostics().hasFatalErrorOccurred()) {
+      llvm::errs() << "clio-coroc: FATAL parse error -- refusing to write "
+                      "output. A truncated AST yields a partial, silently "
+                      "wrong transpile.\n";
+      return;
+    }
     SourceManager &sm = rw_.getSourceMgr();
     for (auto it = rw_.buffer_begin(); it != rw_.buffer_end(); ++it) {
       auto fe = sm.getFileEntryRefForID(it->first);

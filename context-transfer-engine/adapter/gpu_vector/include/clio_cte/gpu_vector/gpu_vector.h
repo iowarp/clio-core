@@ -96,8 +96,21 @@ inline bool ResumeWhenComplete(clio::run::u32 /*block*/, clio::run::u64 tag) {
 inline unsigned long long *FatalSlots() {
 #if CTP_ENABLE_GPU
   static unsigned long long *slots = [] {
+#if CTP_ENABLE_SYCL
+    // SHARED, not pinned host, under SYCL. Measured on Aurora's Max 1550
+    // (benchmark/usm_atomic_probe.cc): a device atomic to malloc_host memory
+    // faults -- AtomicAccessViolation, and the device declares
+    // usm_atomic_host_allocations=0 -- while malloc_shared takes it. This
+    // latch is CAS'd from device code, and it was the one host-memory atomic
+    // in the whole device path; every paged benchmark died on it. The
+    // trap-survival argument for host memory does not apply on Level Zero
+    // anyway: a GPU fault there aborts the process, so nothing survives it.
+    auto *p = ctp::GpuApi::MallocManaged<unsigned long long>(
+        8 * sizeof(unsigned long long));
+#else
     auto *p = ctp::GpuApi::MallocHost<unsigned long long>(
         8 * sizeof(unsigned long long));
+#endif
     if (p != nullptr) std::memset(p, 0, 8 * sizeof(unsigned long long));
     return p;
   }();
