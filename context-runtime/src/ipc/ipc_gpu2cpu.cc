@@ -72,12 +72,15 @@ struct EvChan {
 // 10-11: rtt_remote is SendIn -> RecvOutCompleteOriginTask on the origin
 // (the whole remote round trip); evq_wait is a subtask's completion event
 // sitting in the parent's event queue before the parent's worker pops it.
-EvChan g_chan[12];
-const char *g_chan_name[12] = {"multi_total", "multi_await", "get_total",
+// 12-14: the remote-owner put on the origin -- bounce copy, client send
+// call, await of the owner's reply.
+EvChan g_chan[15];
+const char *g_chan_name[15] = {"multi_total", "multi_await", "get_total",
                               "bdev_h2d",   "read_await",  "get_meta",
                               "bdev_read",  "direct_read",
                               "reorg_stall", "reorg_move",
-                              "rtt_remote", "evq_wait"};
+                              "rtt_remote", "evq_wait",
+                              "pput_bounce", "pput_send", "pput_await"};
 std::terminate_handler g_prev_term = nullptr;
 void EvDumpOnTerminate() {
   const unsigned long long end = g_ev_seq.load();
@@ -140,7 +143,7 @@ void EvLatencyReport() {
 }  // namespace
 
 extern "C" void clio_evlat_add(int which, unsigned long long cycles) {
-  if (which < 0 || which >= 12) return;
+  if (which < 0 || which >= 15) return;
   g_chan[which].sum.fetch_add(cycles, std::memory_order_relaxed);
   g_chan[which].cnt.fetch_add(1, std::memory_order_relaxed);
   unsigned long long m = g_chan[which].mx.load(std::memory_order_relaxed);
@@ -153,7 +156,7 @@ namespace {
 
 void EvChanReport() {
   const double us = 1.0 / 2995.0;
-  for (int i = 0; i < 12; ++i) {
+  for (int i = 0; i < 15; ++i) {
     const unsigned long long c = g_chan[i].cnt.load();
     if (c == 0) continue;
     fprintf(stderr, "clio-evchan %-12s n=%llu avg=%.0fus max=%.0fus\n",

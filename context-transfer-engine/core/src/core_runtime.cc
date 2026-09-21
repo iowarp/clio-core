@@ -3899,13 +3899,21 @@ clio::run::TaskResume Runtime::PodPutBlob(
         task->SetReturnCode(22);  // unmappable source
         CLIO_CO_RETURN;
       }
+      // Latency report (CLIO_EVLAT) channels 12-14: the bounce copy, the
+      // client-side send call, and the await of the owner's reply.
+      const unsigned long long ev_p0 = clio::run::CycleNow();
       std::vector<char> bounce(task->size_);
       CLIO_CO_AWAIT(CoDeviceCopy(bounce.data(), src, task->size_));
+      const unsigned long long ev_p1 = clio::run::CycleNow();
+      clio_evlat_add(12, ev_p1 - ev_p0);
       auto fut = client_.AsyncPutBlob(task->tag_id_, eff_name, task->offset_,
                                       task->size_, bounce.data(),
                                       task->score_, task->context_,
                                       task->flags_, owner);
+      const unsigned long long ev_p2 = clio::run::CycleNow();
+      clio_evlat_add(13, ev_p2 - ev_p1);
       CLIO_CO_AWAIT(fut);
+      clio_evlat_add(14, clio::run::CycleNow() - ev_p2);
       task->SetReturnCode(fut->GetReturnCode());
       CLIO_CO_RETURN;
     }
