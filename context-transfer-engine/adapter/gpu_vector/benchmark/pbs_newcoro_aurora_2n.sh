@@ -59,7 +59,14 @@ fi
 # The template's `networking:` block gains the hostfile; everything else --
 # port, workers, tiers sized for the single-node args -- is kept. The
 # benchmarks split --data-mb across nodes, so per-node data only shrinks.
+# cte_core MUST BE 512.0. A benchmark given an external config assumes the
+# cluster layout its own comments describe -- cte_core at 512.0, no
+# compressor -- while weights' self-written single-node config puts cte_core
+# at 513.0 behind a compressor slot. Templating that unchanged sent every
+# weights put to a pool with no container (put_errors=4, "SEED DID NOT
+# CONVERGE"). Renumber it; the other four already compose 512.0.
 awk -v hf="${RUNDIR}/hostfile" '
+  /pool_id: "513.0"/ { sub(/"513.0"/, "\"512.0\"") }
   { print }
   /^networking:/ { print "  hostfile: \"" hf "\"" }
 ' "${TEMPLATE}" > clio_2n.yaml
