@@ -22,13 +22,13 @@ export SYCL_CACHE_DIR=${SYCL_CACHE_DIR:-${ROOT}/build-spike/sycl_cache}
 mkdir -p "$SYCL_CACHE_DIR"
 # Second pass with copy engines forced on, to see whether the environment
 # alone moves the busy-tile numbers.
-for pass in default copyengine; do
+for pass in default; do
   echo "--- pass ${pass} ---"
   if [ "${pass}" = copyengine ]; then
     export UR_L0_USE_COPY_ENGINE=1 SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE=1
     export UR_L0_USE_COPY_ENGINE_FOR_D2D_COPY=1 SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE_FOR_D2D_COPY=1
   fi
-  timeout --signal=TERM --kill-after=10s 60 "${EXE}"
+  timeout --signal=TERM --kill-after=5s 20 "${EXE}"
   echo "pass ${pass} exit=$?"
 done
 echo "RESULT copyprobe: done"

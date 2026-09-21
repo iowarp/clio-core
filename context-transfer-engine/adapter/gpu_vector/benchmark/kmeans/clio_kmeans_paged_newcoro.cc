@@ -741,6 +741,7 @@ int main(int argc, char **argv) {
     vec.ResetStats();
     ctp::GpuApi::Synchronize();
     const double t0 = NowMs();
+    double t_iter0 = t0;
     for (u32 it = 0; it < iters; ++it) {
       ctp::GpuApi::Memset(d_sums, 0, k * dims * sizeof(float));
       ctp::GpuApi::Memset(d_counts, 0, k * sizeof(unsigned));
@@ -759,11 +760,28 @@ int main(int argc, char **argv) {
       // Combine the shards BEFORE the update, so every node divides the same
       // global sums by the same global counts and they stay in lockstep.
       ctp::GpuApi::Synchronize();
+      const double t_kernel = NowMs();
       if (!reduce_centroids()) {
         std::fprintf(stderr, "KMEANS ERROR: centroid reduction failed\n");
         return 1;
       }
+      const double t_reduce = NowMs();
       kb::LaunchUpdate(d_cent, d_sums, d_counts, dims, k);
+      // PER-ITERATION SPLIT, on stderr with the rest of the diagnostics: the
+      // two-node runs were slow with almost no faults, and the total alone
+      // could not say whether the time was in the kernel or in the
+      // cross-node reduction that follows it.
+      {
+        const auto is = vec.ReadStats(0);
+        std::fprintf(stderr,
+                     "  iter %u: kernel=%.1fms reduce=%.1fms faults=%llu "
+                     "evicts=%llu alloc_waits=%llu\n",
+                     it, t_kernel - t_iter0, t_reduce - t_kernel,
+                     (unsigned long long)is.faults,
+                     (unsigned long long)is.evicts,
+                     (unsigned long long)is.alloc_waits);
+      }
+      t_iter0 = NowMs();
     }
     ctp::GpuApi::Synchronize();
     const double ms = NowMs() - t0;
@@ -834,12 +852,14 @@ int main(int argc, char **argv) {
                "KMEANS mode=%s blocks=%u thr=%u dims=%u k=%u iters=%u page_kb=%llu "
                "slots=%u data_mb=%.0f hbm_mb=%llu points=%llu ms=%.1f "
                "GB/s=%.2f centroid_checksum=%.6f faults=%llu evicts=%llu "
+               "alloc_waits=%llu "
                "puts=%llu get_errors=%llu put_errors=%llu memcpy_pin_gbps=%.2f memcpy_page_gbps=%.2f\n",
                baseline ? "baseline" : "paged",
                blocks, threads, dims, k, iters, (unsigned long long)page_kb,
                slots, logical_mb, (unsigned long long)hbm_mb,
                (unsigned long long)npoints, best_ms, gbps, csum,
                (unsigned long long)st.faults, (unsigned long long)st.evicts,
+               (unsigned long long)st.alloc_waits,
                (unsigned long long)st.puts, (unsigned long long)st.get_errors,
                (unsigned long long)st.put_errors,
                mcp.pinned_gbps, mcp.pageable_gbps);

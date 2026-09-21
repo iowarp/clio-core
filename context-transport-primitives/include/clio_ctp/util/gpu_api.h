@@ -50,6 +50,7 @@
 #define CTP_HAS_EXECINFO 0
 #endif
 
+#include <algorithm>
 #include <cstring>
 #include <thread>
 #include <chrono>
@@ -1147,6 +1148,41 @@ class GpuApi {
     static sycl::queue q{sycl::gpu_selector_v};
     return q;
   }
+
+  /** Bytes of pinned host USM each thread keeps for bouncing copies between
+   *  device memory and pageable host memory (see DeviceAwareMemcpy). Larger
+   *  copies go through it in chunks of this size. */
+  static constexpr size_t kSyclBounceBytes = 4u << 20;
+
+  /**
+   * Per-thread pinned host bounce buffer of kSyclBounceBytes, allocated on
+   * first use with sycl::malloc_host on SyclQueue()'s context and freed when
+   * the thread exits. Returns nullptr if the allocation fails, in which
+   * case the caller copies directly and pays the pageable-memory cost.
+   * @return Pinned buffer for this thread, or nullptr
+   */
+  static char *SyclPinnedBounce() {
+    struct Holder {
+      char *ptr = nullptr;
+      Holder() {
+        try {
+          ptr = sycl::malloc_host<char>(kSyclBounceBytes, SyclQueue());
+        } catch (const sycl::exception &) {
+          ptr = nullptr;
+        }
+      }
+      ~Holder() {
+        if (ptr != nullptr) {
+          try {
+            sycl::free(ptr, SyclQueue());
+          } catch (const sycl::exception &) {
+          }
+        }
+      }
+    };
+    thread_local Holder holder;
+    return holder.ptr;
+  }
 #endif
 };
 
@@ -1327,12 +1363,43 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   // property this path depends on: it runs on the fault-service side while
   // the faulting kernel is still resident, and a copy kernel cannot be
   // scheduled behind a kernel that never exits.
-  if (!IsDeviceAccessible(dst) && !IsDeviceAccessible(src)) {
+  const bool dst_dev = IsDeviceAccessible(dst);
+  const bool src_dev = IsDeviceAccessible(src);
+  if (!dst_dev && !src_dev) {
     std::memcpy(dst, src, n);
     return;
   }
   auto &q = GpuApi::SyclQueue();
-  q.memcpy(dst, src, n).wait();
+  if (dst_dev == src_dev) {
+    q.memcpy(dst, src, n).wait();
+    return;
+  }
+  // ONE SIDE IS PAGEABLE HOST MEMORY. A direct queue::memcpy to or from
+  // memory Level Zero does not know (a heap buffer, a std::vector, a
+  // memfd-backed segment) costs ~2 ms per 64 KB on PVC -- the driver pins
+  // or stages the pages every call -- against 10 us for pinned host USM,
+  // kernel running or not (sycl_copy_probe). Every copy on the paged
+  // vector's remote fault path lands in such memory: the network staging
+  // buffer, the transfer engine's bounce vector, the bdev's shared-memory
+  // buffers, the reply into the frame from a zmq buffer. So bounce through
+  // a per-thread pinned buffer instead; a host USM pointer takes the same
+  // path harmlessly (pinned-to-pinned memcpy is a few microseconds).
+  char *pin = GpuApi::SyclPinnedBounce();
+  if (pin == nullptr) {
+    q.memcpy(dst, src, n).wait();
+    return;
+  }
+  const size_t kChunk = GpuApi::kSyclBounceBytes;
+  for (size_t off = 0; off < n; off += kChunk) {
+    const size_t c = std::min(kChunk, n - off);
+    if (src_dev) {
+      q.memcpy(pin, static_cast<const char *>(src) + off, c).wait();
+      std::memcpy(static_cast<char *>(dst) + off, pin, c);
+    } else {
+      std::memcpy(pin, static_cast<const char *>(src) + off, c);
+      q.memcpy(static_cast<char *>(dst) + off, pin, c).wait();
+    }
+  }
 #else
   std::memcpy(dst, src, n);
 #endif
