@@ -49,6 +49,22 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
   }
   per_gpu_devices_.resize(sycl_devices.size());
 
+  // THE I/O STREAM POOL, as the HIP init warms it. Without this the pool
+  // held ONE queue (the first BorrowStream creates it and marks the pool
+  // warmed), so every concurrent bdev write or read after the first waited
+  // in its 10 us yield loop for that queue to come back; the reserved
+  // per-thread streams the GPU worker's pops use were never created either.
+  {
+    int io_pool = 64;
+    if (const char *e = std::getenv("CLIO_GPU_STREAM_POOL")) {
+      const int v = std::atoi(e);
+      if (v > 0) io_pool = v;
+    }
+    ctp::GpuApi::WarmStreamPool(io_pool);
+    HLOG(kInfo, "GPU I/O stream pool (SYCL): {} streams (CLIO_GPU_STREAM_POOL)",
+         io_pool);
+  }
+
   constexpr size_t kQueueBackendBytes = 16 * 1024 * 1024;
   auto &q = ctp::GpuApi::SyclQueue();
 

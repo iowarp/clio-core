@@ -55,6 +55,9 @@
 
 #include <sycl/sycl.hpp>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -134,6 +137,27 @@ int main() {
   // fast case; this is the question.
   char *pageable = new char[kBytes];
   std::vector<char> vec(kBytes, 1);
+  // MAP_SHARED memfd memory: what the runtime's shared-memory segments are,
+  // and where every byte that arrives over the network is copied from and
+  // into. The bdev profile measured 3.7-6.1 ms per 64 KB HBM write
+  // *submission* from such memory, against 2 us of wait. A second copy of
+  // the mapping is registered with prepare_for_device_copy first.
+  char *shm = nullptr;
+  char *shm_reg = nullptr;
+  {
+    int fd = memfd_create("copyprobe", 0);
+    if (fd >= 0 && ftruncate(fd, 2 * kBytes) == 0) {
+      void *m = mmap(nullptr, 2 * kBytes, PROT_READ | PROT_WRITE, MAP_SHARED,
+                     fd, 0);
+      if (m != MAP_FAILED) {
+        shm = static_cast<char *>(m);
+        shm_reg = shm + kBytes;
+        std::memset(shm, 1, 2 * kBytes);
+        sycl::ext::oneapi::experimental::prepare_for_device_copy(
+            shm_reg, kBytes, q_ooo);
+      }
+    }
+  }
   int *flag = sycl::malloc_device<int>(1, qk);  // device USM: kernel polls it
   std::memset(host, 1, kBytes);
   std::memset(host2, 1, kBytes);
@@ -177,6 +201,11 @@ int main() {
   Report("ooo_ctx", "idle", q_ctx, dev2, host2, kBytes);
   Report("ooo_pg", "idle", q_ooo, dev, pageable, kBytes);
   Report("ooo_vec", "idle", q_ooo, dev, vec.data(), kBytes);
+  if (shm != nullptr) {
+    Report("ooo_shm", "idle", q_ooo, dev, shm, kBytes);
+    Report("ooo_shmR", "idle", q_ooo, dev, shm_reg, kBytes);
+    Report("in_shm", "idle", q_in, dev, shm, kBytes);
+  }
 
   // The persistent kernel: 64 work-groups of 256, every item spinning on the
   // host flag -- the shape of the benchmarks' block-per-group kernels.
@@ -200,6 +229,11 @@ int main() {
   Report("ooo_ctx", "busy", q_ctx, dev2, host2, kBytes);
   Report("ooo_pg", "busy", q_ooo, dev, pageable, kBytes);
   Report("ooo_vec", "busy", q_ooo, dev, vec.data(), kBytes);
+  if (shm != nullptr) {
+    Report("ooo_shm", "busy", q_ooo, dev, shm, kBytes);
+    Report("ooo_shmR", "busy", q_ooo, dev, shm_reg, kBytes);
+    Report("in_shm", "busy", q_in, dev, shm, kBytes);
+  }
 
   // Stop the kernel through the out-of-order queue (an in-order copy would
   // queue behind the kernel it is meant to release).

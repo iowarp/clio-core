@@ -1020,22 +1020,23 @@ class GpuApi {
     }
 #endif
 #if CTP_ENABLE_SYCL && !CTP_ENABLE_CUDA && !CTP_ENABLE_ROCM
-    // SYNCHRONOUS, and `stream` is ignored: SYCL has no stream handle this
-    // API can carry, and a queue submitted here would complete on nobody's
-    // schedule but its own.
-    //
-    // It must not stay a no-op, which is what the missing branch made it.
-    // MemBdevTransport::DirectWrite copies a page out of device memory with
-    // this call, so on SYCL the RAM tier silently kept whatever it had:
-    // every gpu_vector page that went through a writeback read back as
-    // garbage, with rc=0 and put_errors=0 all the way down.
-    //
-    // Blocking here is a real cost -- the CUDA path deliberately overlaps
-    // these -- so this is where to start when the SYCL writeback pipeline
-    // needs to go faster, not where to stop.
-    (void)stream;
+    // HONOUR THE STREAM. This used to ignore it and run every "async" copy
+    // as a synchronous memcpy().wait() on the one shared SyclQueue(), from
+    // every worker and the network receive thread at once. On the two-node
+    // paged vector that put each 64 KB HBM block write at 3.7-6.1 ms of
+    // *submission* time (bdev [bwr] profile) against 2 us of wait, and the
+    // same for the task-POD copies the GPU worker makes per pop. A stream
+    // here is a CreateStream() in-order queue owned by the caller: enqueue
+    // on it and let PollSync/StreamQuery wait, as the CUDA path does. With
+    // no stream the copy stays synchronous on the shared queue, since those
+    // callers synchronise nothing themselves. (It must not be a no-op: the
+    // missing branch once left the SYCL RAM tier reading back garbage.)
     if (size != 0) {
-      SyclQueue().memcpy(dst, src, size).wait();
+      if (stream != nullptr) {
+        static_cast<sycl::queue *>(stream)->memcpy(dst, src, size);
+      } else {
+        SyclQueue().memcpy(dst, src, size).wait();
+      }
     }
 #endif
   }
@@ -1146,6 +1147,22 @@ class GpuApi {
    */
   static sycl::queue &SyclQueue() {
     static sycl::queue q{sycl::gpu_selector_v};
+    return q;
+  }
+
+  /**
+   * An in-order queue private to the calling thread, on the same device as
+   * SyclQueue(). For synchronous host-initiated copies from worker and
+   * receive threads: a copy submitted and waited on here contends with
+   * nobody else's wait, where the shared out-of-order SyclQueue() serialised
+   * every thread on its lock (measured 3.7-6.1 ms per 64 KB copy on a
+   * two-node paged run, against 10 us for the copy itself).
+   * @return This thread's queue, constructed on first use
+   */
+  static sycl::queue &SyclThreadQueue() {
+    thread_local sycl::queue q{SyclQueue().get_context(),
+                               SyclQueue().get_device(),
+                               sycl::property::queue::in_order{}};
     return q;
   }
 
@@ -1369,7 +1386,10 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
     std::memcpy(dst, src, n);
     return;
   }
-  auto &q = GpuApi::SyclQueue();
+  // A queue PER THREAD, not the shared one: workers and the network receive
+  // thread copy concurrently, and a synchronous memcpy().wait() on one
+  // shared out-of-order queue serialised them all on its lock.
+  auto &q = GpuApi::SyclThreadQueue();
   if (dst_dev == src_dev) {
     q.memcpy(dst, src, n).wait();
     return;
