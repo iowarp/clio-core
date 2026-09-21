@@ -51,7 +51,7 @@ the benchmark's own timing of the paged pass, per rank.
 | grayscott | Flare | OK | 14.4 s / 9.0 s, 2.2-3.6 GB/s | v_checksum 10416629.698624 on both ranks and both tiers |
 | grayscott | DAOS  | OK | 4.5 s / 6.2 s, 7.1-5.2 GB/s | 10.8k faults/rank, 4096 puts |
 | weights   | DAOS  | OK | 4.72 s / 4.78 s, 1.7 GB/s | after (12); both ranks checksum OK and identical, 16.2k faults/rank, put_errors=0. Three runs before it trapped in `AllocatePage: set full` within the first eight pages per block |
-| weights   | Flare | pending | -- | same trap twice before (12); rerun queued |
+| weights   | Flare | OK | 5.75 s / 5.59 s, 1.4 GB/s | after (12); checksum_total identical to the DAOS run on both ranks, 16.2k faults/rank, put_errors=0. Trapped twice before it |
 
 At 64 KB pages the first kmeans run wrote ~45 MB/s per node to Flare (a
 synchronous ~1.4 ms per page put) and was still loading when the 200 s
