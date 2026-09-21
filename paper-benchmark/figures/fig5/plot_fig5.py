@@ -529,8 +529,12 @@ def write_timesteps(phase_log, workload, out, warmup_step=-1):
 # pointed out explicitly". Bars are means over every chunk of that path;
 # Choice includes the codec factory.
 # ============================================================================
+#: The applications only. The synthetic periodic/random/mixed fields are a
+#: calibration bracket, not a workload, and are not drawn; figure_5.sh -w
+#: synth still produces their phase log for anyone checking the codecs
+#: against a known-compressible and a known-incompressible input.
 ST_WLS = [("vpic", "VPIC"), ("nyx", "Nyx"), ("lammps", "LAMMPS"),
-          ("warpx", "WarpX"), ("ai", "AI"), ("synth", "Synthetic")]
+          ("warpx", "WarpX"), ("ai", "AI")]
 #: The selector's own stages, in the order they run. FACTORY IS ONE WEDGE
 #: WITH THE CHOICE IT SERVES (`__choice__` = choice_ms + factory_ms): drawn
 #: apart, the construction is 0.001-0.07% of a chunk -- a hairline that no
