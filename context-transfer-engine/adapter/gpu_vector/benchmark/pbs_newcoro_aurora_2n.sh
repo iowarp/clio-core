@@ -93,13 +93,20 @@ mpiexec -n "${NRANKS}" --ppn 1 --envall bash -c '
     > "rank$r.log" 2>&1
   rc=$?
   echo "rank $r on $(hostname) exit=$rc" >> "rank$r.log"
-  exit $rc
+  # ALWAYS 0 HERE. PALS tears the whole job down the moment one rank exits
+  # non-zero, and a rank that was about to print its gate then never does;
+  # the job result is derived from the per-rank exit lines below instead.
+  exit 0
 '
-rc=$?
-echo "--- elapsed $((SECONDS - start))s, mpiexec exit=${rc} ---"
+mrc=$?
+echo "--- elapsed $((SECONDS - start))s, mpiexec exit=${mrc} ---"
+rc=${mrc}
 for r in $(seq 0 $((NRANKS - 1))); do
   echo "----- rank ${r} -----"
   grep --line-buffered -vE "LoadBalance|\[#78[15]|INFO|SUCCESS|WARNING" "rank${r}.log" | tail -40
+  rrc=$(grep -oE "^rank ${r} on .* exit=[0-9]+" "rank${r}.log" | tail -1 | grep -oE "[0-9]+$")
+  [ -z "${rrc}" ] && rrc=99
+  [ "${rrc}" -gt "${rc}" ] && rc=${rrc}
 done
 
 case "${rc}" in
