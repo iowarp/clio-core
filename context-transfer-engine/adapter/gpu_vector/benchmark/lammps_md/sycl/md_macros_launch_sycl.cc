@@ -190,6 +190,8 @@ void LaunchIntegrate(dim3 grid,
                      float gy_,
                      float gz,
                      int drift,
+                     u64 pg_lo,
+                     u64 pg_hi,
                      u32 nblocks,
                      gy::YieldableView<> yv,
                      gy::YieldStackView ys) {
@@ -207,7 +209,7 @@ void LaunchIntegrate(dim3 grid,
     // Publishes the block's stack base and zeroes the frame depth --
     // what CLIO_YCORO_RUN's prologue does for the coroutine edition.
     CLIO_YKERNEL_ENTER(yv, ys);
-    IntegrateMacro(x_, v_, third_, use_third, dt, gx, gy_, gz, drift, nblocks, yv.Block());
+    IntegrateMacro(x_, v_, third_, use_third, dt, gx, gy_, gz, drift, pg_lo, pg_hi, nblocks, yv.Block());
   });
 }
 

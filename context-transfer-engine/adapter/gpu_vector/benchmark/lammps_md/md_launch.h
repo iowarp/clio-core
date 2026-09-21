@@ -91,6 +91,8 @@ void LaunchIntegrate(dim3 grid,
                      float gy_,
                      float gz,
                      int drift,
+                     u64 pg_lo,
+                     u64 pg_hi,
                      u32 nblocks,
                      gy::YieldableView<> yv,
                      gy::YieldStackView ys);

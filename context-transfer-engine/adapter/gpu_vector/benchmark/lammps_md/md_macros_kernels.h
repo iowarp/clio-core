@@ -547,7 +547,8 @@ CTP_GPU_FUN inline void RebinAssignMacro(VecF x, u32 nb, u32 cap, float box,
 CTP_GPU_FUN inline void IntegrateMacro(VecF x, VecF v, VecF third,
                                        int use_third, float dt, float gx,
                                        float gy_, float gz, int drift,
-                                       u32 nblocks, u32 block) {
+                                       u64 pg_lo, u64 pg_hi, u32 nblocks,
+                                       u32 block) {
   CLIO_YFRAME();
   CLIO_YLOCAL_INIT(u64, pg, 0);
   CLIO_YLOCAL_INIT(u64, cnt, 0);
@@ -555,10 +556,12 @@ CTP_GPU_FUN inline void IntegrateMacro(VecF x, VecF v, VecF third,
   CLIO_YLOCAL(HeldF, hv);
   CLIO_YLOCAL(HeldF, ht);
   const u64 epp = x.ElemsPerPage();
-  const u64 npages = (x.size() + epp - 1) / epp;
   const float half = 0.5f * dt;
   CLIO_YBEGIN();
-  for (pg = block; pg < npages; pg += nblocks) {
+  // THIS NODE'S SLAB ONLY, [pg_lo, pg_hi): every page is published by name
+  // into one store shared by every node, so integrating the whole lattice
+  // overwrites the neighbour's slab. Single node passes [0, npages).
+  for (pg = pg_lo + block; pg < pg_hi; pg += nblocks) {
     CLIO_YCALL(x.MFetch(0, pg * epp, epp));
     CLIO_YCALL(x.MHoldPage(&hx, pg * epp, epp, /*write=*/true));
     CLIO_YCALL(v.MFetch(0, pg * epp, epp));

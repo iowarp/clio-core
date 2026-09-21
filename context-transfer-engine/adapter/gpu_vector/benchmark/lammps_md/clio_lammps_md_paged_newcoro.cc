@@ -1786,11 +1786,18 @@ __device__ CLIO_COROC_INLINE void IntegrateCoro(gv::DeviceVector<float> x,
                                        gv::DeviceVector<float> third,
                                        int use_third, float dt, float gx,
                                        float gy_, float gz, int drift,
-                                       u32 nblocks, u32 block) {
+                                       u64 pg_lo, u64 pg_hi, u32 nblocks,
+                                       u32 block) {
   const u64 epp = x.ElemsPerPage();
-  const u64 npages = (x.size() + epp - 1) / epp;
   const float half = 0.5f * dt;
-  for (u64 pg = block; pg < npages; pg += nblocks) {
+  // THIS NODE'S SLAB ONLY, [pg_lo, pg_hi). Every page is published by name
+  // into ONE store shared by every node, so a node that integrates the whole
+  // lattice writes its neighbour's slab too. Node 1 faulted node 0's slab
+  // after node 0 had published its first half-step, integrated those pages
+  // ten more times and, finishing later, wrote them back last: node 0 then
+  // downloaded its own atoms one drift and one half-kick ahead of the
+  // reference while node 1 passed bitwise. Single node passes [0, npages).
+  for (u64 pg = pg_lo + block; pg < pg_hi; pg += nblocks) {
     CO_AWAIT(x.CoFetch(0, pg * epp, epp));
     auto hx4 = CO_AWAIT(x.CoHoldPage(pg * epp, epp, /*write=*/true));
     CO_AWAIT(v.CoFetch(0, pg * epp, epp));
@@ -2301,6 +2308,8 @@ void LaunchIntegrate(dim3 grid,
                      float gy_,
                      float gz,
                      int drift,
+                     u64 pg_lo,
+                     u64 pg_hi,
                      u32 nblocks,
                      gy::YieldableView<> yv,
                      gy::YieldStackView ys) {
@@ -2316,7 +2325,7 @@ void LaunchIntegrate(dim3 grid,
     gv::DeviceVector<float> third_ = third;
     third_.Init(yv.Block());
     __syncthreads();
-    CLIO_COROC_RUN(yv, ys, IntegrateCoro(_cy, x_, v_, third_, use_third, dt, gx, gy_, gz, drift, nblocks, yv.Block()));
+    CLIO_COROC_RUN(yv, ys, IntegrateCoro(_cy, x_, v_, third_, use_third, dt, gx, gy_, gz, drift, pg_lo, pg_hi, nblocks, yv.Block()));
   });
 }
 
@@ -2785,7 +2794,7 @@ __global__ MD_LAUNCH_BOUNDS void IntegrateKernel(clio::run::IpcManagerGpuInfo in
                                 gv::DeviceVector<float> v,
                                 gv::DeviceVector<float> third, int use_third,
                                 float dt, float gx, float gy_, float gz,
-                                int drift, u32 nblocks,
+                                int drift, u64 pg_lo, u64 pg_hi, u32 nblocks,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -2794,7 +2803,7 @@ __global__ MD_LAUNCH_BOUNDS void IntegrateKernel(clio::run::IpcManagerGpuInfo in
   third.Init(yv.Block());
   __syncthreads();
   CLIO_COROC_RUN(yv, ys, IntegrateCoro(_cy, x, v, third, use_third, dt, gx, gy_, gz,
-                               drift, nblocks, yv.Block()));
+                               drift, pg_lo, pg_hi, nblocks, yv.Block()));
 }
 
 
@@ -3131,11 +3140,14 @@ void LaunchIntegrate(dim3 grid,
                      float gy_,
                      float gz,
                      int drift,
+                     u64 pg_lo,
+                     u64 pg_hi,
                      u32 nblocks,
                      gy::YieldableView<> yv,
                      gy::YieldStackView ys) {
   IntegrateKernel<<<grid, block, smem>>>(
-      info, x, v, third, use_third, dt, gx, gy_, gz, drift, nblocks, yv, ys);
+      info, x, v, third, use_third, dt, gx, gy_, gz, drift, pg_lo, pg_hi,
+      nblocks, yv, ys);
 }
 
 void LaunchPublishSlab(dim3 grid,
@@ -5696,14 +5708,14 @@ gpu, *dst, g.nb, g.cap,
       md::LaunchIntegrate(gr, b, CLIO_YIELD_SMEM_BYTES,
 
           gpu, dx, dv, dthird, use_third, fdt, fgx, fgy, fgz, /*drift=*/1,
-          a.blocks, vw, sv);
+          slab_pg_lo, slab_pg_hi, a.blocks, vw, sv);
     });
     const u32 rr = runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                                   gy::YieldStackView sv) {
       md::LaunchIntegrate(gr, b, CLIO_YIELD_SMEM_BYTES,
 
           gpu, dx, dv, dthird, use_third, fdt, fgx, fgy, fgz, /*drift=*/0,
-          a.blocks, vw, sv);
+          slab_pg_lo, slab_pg_hi, a.blocks, vw, sv);
     });
     if (std::getenv("MD_ROUNDS") != nullptr) {
       const auto &rl = runner.RoundLog();
@@ -5747,7 +5759,8 @@ gpu, dx, dv, d_thermo, g.nb,
     unsigned long long done = 0;
     md::SymbolRead(&done, md::MdSym::kPagesDone, sizeof(done));
     const unsigned long long want =
-        static_cast<unsigned long long>(npages) * a.steps * 2ull;
+        static_cast<unsigned long long>(slab_pg_hi - slab_pg_lo) * a.steps *
+        2ull;
     std::printf("  page iterations: %llu of %llu expected%s\n", done, want,
                 (done == want) ? "  [all work ran]"
                                : "   <-- WORK WAS DROPPED");

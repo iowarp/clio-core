@@ -2517,14 +2517,14 @@ gpu, *dst, g.nb, g.cap,
       md::LaunchIntegrate(gr, b, CLIO_YIELD_SMEM_BYTES,
 
           gpu, dx, dv, dthird, use_third, fdt, fgx, fgy, fgz, /*drift=*/1,
-          a.blocks, vw, sv);
+          slab_pg_lo, slab_pg_hi, a.blocks, vw, sv);
     });
     const u32 rr = runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                                   gy::YieldStackView sv) {
       md::LaunchIntegrate(gr, b, CLIO_YIELD_SMEM_BYTES,
 
           gpu, dx, dv, dthird, use_third, fdt, fgx, fgy, fgz, /*drift=*/0,
-          a.blocks, vw, sv);
+          slab_pg_lo, slab_pg_hi, a.blocks, vw, sv);
     });
     if (std::getenv("MD_ROUNDS") != nullptr) {
       const auto &rl = runner.RoundLog();
@@ -2568,7 +2568,8 @@ gpu, dx, dv, d_thermo, g.nb,
     unsigned long long done = 0;
     md::SymbolRead(&done, md::MdSym::kPagesDone, sizeof(done));
     const unsigned long long want =
-        static_cast<unsigned long long>(npages) * a.steps * 2ull;
+        static_cast<unsigned long long>(slab_pg_hi - slab_pg_lo) * a.steps *
+        2ull;
     std::printf("  page iterations: %llu of %llu expected%s\n", done, want,
                 (done == want) ? "  [all work ran]"
                                : "   <-- WORK WAS DROPPED");

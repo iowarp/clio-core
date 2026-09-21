@@ -1731,11 +1731,16 @@ __device__ gy::YCoroMain IntegrateCoro(gv::DeviceVector<float> x,
                                        gv::DeviceVector<float> third,
                                        int use_third, float dt, float gx,
                                        float gy_, float gz, int drift,
-                                       u32 nblocks, u32 block) {
+                                       u64 pg_lo, u64 pg_hi, u32 nblocks,
+                                       u32 block) {
   const u64 epp = x.ElemsPerPage();
-  const u64 npages = (x.size() + epp - 1) / epp;
   const float half = 0.5f * dt;
-  for (u64 pg = block; pg < npages; pg += nblocks) {
+  // THIS NODE'S SLAB ONLY, [pg_lo, pg_hi). Every page is published by name
+  // into ONE store shared by every node, so a node that integrates the whole
+  // lattice writes its neighbour's slab too: node 1 faulted node 0's slab
+  // after node 0 had published its first half-step, and wrote it back last
+  // one drift and one half-kick ahead. Single node passes [0, npages).
+  for (u64 pg = pg_lo + block; pg < pg_hi; pg += nblocks) {
     co_await x.Fetch(0, pg * epp, epp);
     auto hx = co_await x.HoldPage(pg * epp, epp, /*write=*/true);
     co_await v.Fetch(0, pg * epp, epp);
