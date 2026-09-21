@@ -3,7 +3,7 @@
 Six paged benchmarks, transpiled by `tools/coroc` and compiled with icpx
 (oneAPI 2025.3.2) for `spir64_gen -device pvc`. Each runs as ONE single-node
 job in the `debug` queue, capped at 90 s inside the queue's 5-minute minimum
-walltime, pinned to one tile. Results as of 2026-09-21, commit after 7a7c6a05:
+walltime, pinned to one tile. Results as of 2026-09-21:
 
 | benchmark | args                                              | result | notes |
 |-----------|---------------------------------------------------|--------|-------|
@@ -16,7 +16,25 @@ walltime, pinned to one tile. Results as of 2026-09-21, commit after 7a7c6a05:
 
 Sizes are chosen for the 90 s cap, not for the numbers in RESULTS.md, and
 every one still exceeds its cache so the paging path is exercised.
-Results as of 2026-09-21, commit after 651a3139: all six pass.
+
+## Two nodes
+
+One rank per node (`pbs_newcoro_aurora_2n.sh`, `submit_2n_all_aurora.sh`),
+same sizes, each benchmark splitting its problem with `--nodes 2 --node r`,
+the runtimes joined by a hostfile from `$PBS_NODEFILE`:
+
+| benchmark | result | notes |
+|-----------|--------|-------|
+| gmx       | PASS   | all gates on both ranks, 67 faults/rank (half of single-node), 15 s |
+| lbann     | PASS   | loss + weight gates, "2 nodes" all-gather path, 322 faults/rank, 43 s |
+| weights   | PASS   | both ranks the same global checksum, put_errors=0, 36 s -- once the config composed cte_core at 512.0 |
+| grayscott | PASS   | v_checksum bit-identical to single-node on both ranks, 18 s |
+| kmeans    | see 5  | crashed in the runtime's network send; fixed, rerun pending |
+| lammps_md | OPEN   | runs to completion on both nodes, gate fails; see below |
+
+Storage tiers on Flare and DAOS: `pbs_newcoro_aurora_2n_tier.sh` and
+`submit_tier_all_aurora.sh` (16 GB through 8 GB of HBM into 8 GB on a
+filesystem), results to follow.
 
 ## How to build and run
 
@@ -79,6 +97,14 @@ and `BENCH_EXE` (a differently named binary).
    `-fp-model=fast` on both passes, unlike nvcc and clang; the benchmark
    compile is `-fp-model=precise -ffp-contract=off` now.
 
+5. **Device memory on the wire.** kmeans' first cross-node page flush died
+   in `zmq_send(0xff000000112e0000, 65536)`: a task bound for the node that
+   owns a blob carried the paged vector's frame -- GPU memory -- as its
+   bulk buffer, and the transport copies bulk bytes with a host memcpy.
+   `SaveTaskArchive::bulk` now stages device-only memory through a host
+   buffer the archive owns for the send (`task_archive.cc`). The other
+   four never hit it because their cross-node traffic is host memory.
+
 Two smaller things found on the way and kept: `__nanosleep` was an empty
 function under SYCL, so `AllocatePage`'s transient-pressure backoff was 4096
 instant retries and a trap; and the device-side fatal latch is device memory
@@ -88,6 +114,14 @@ atomic fault.
 
 ## Open
 
+- **lammps_md across two nodes**: each rank completes all 640 page
+  iterations deterministically, but every owned atom ends one drift
+  (dt*v per axis) and one half-kick (dt*g/2) AHEAD of the ballistic
+  reference on both nodes -- i.e. one extra integrate launch in the
+  multi-node stage-1 loop. Not a readback artefact (MD_SETTLE_MS=2000
+  changed nothing) and not the network. The stage-1 gate now judges only
+  the node's own z-slab (it compared every global slot before, which read
+  as exactly half the energy); the extra launch is unlocated.
 - **Composite (two-tile) mode**: lbann faults on an atomic to device memory
   when a root device is used unpinned; the other four pass either way. One
   tile is ALCF's recommended unit and is what the table reports.
