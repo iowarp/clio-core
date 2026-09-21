@@ -56,7 +56,7 @@ with the one plotter that draws them; runs go under `results/` unless
 
 | script | what it does |
 |---|---|
-| `figures/fig5/figure_5.sh` → `plot_fig5.py` (beside it; `table`, `pies`, `stacked`, `anatomy` modes) | per-chunk time breakdown of the write and read paths, from `CLIO_NEUROPRESS_PHASE_LOG` |
+| `figures/fig5/figure_5.sh` → `plot_fig5.py` (beside it; `table`, `summary`, `stacked`, `anatomy` modes) | per-chunk time breakdown of the write and read paths as stacked bars, from `CLIO_NEUROPRESS_PHASE_LOG` |
 | `figures/fig8/figure_8.sh` → `plot_fig8.py` (beside it; `trace`, `panels`, `models`, `split` modes) | regret and cost MAPE per chunk with every configuration measured; see `figures/fig8/README.md` |
 | `figures/fig9/figure_9.sh` → `plot_fig9.py` (beside it) | end-to-end wall clock: Baseline, the ablation and the external codecs, each ending with a timed flush; what the bars do and do not measure is in [`figures/fig9/fig9.md`](figures/fig9/fig9.md) |
 | `ai/gen_fields.sh` | the AI workload's dumps (ViT-B/16 checkpoints, upstream's exporter) |

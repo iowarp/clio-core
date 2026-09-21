@@ -19,7 +19,7 @@ belong to it alone -- `plot_fig5.py <mode> --help`:
   ./plot_fig5.py stacked [--split]        the paper's plate, from the phase logs
   ./plot_fig5.py anatomy                  the two anatomy plates
   ./plot_fig5.py table PHASE.CSV --workload Nyx --out ts.csv
-  ./plot_fig5.py pies --timesteps ts.csv --no-defaults --out DIR
+  ./plot_fig5.py summary --timesteps ts.csv --no-defaults
 
 `stacked` and `anatomy` draw into this script's own directory unless --out says
 otherwise. The stage colours and the print sizes are shared by all three
@@ -31,34 +31,25 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-from matplotlib import font_manager
-from matplotlib.patches import Patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))   # figures/fig5
 
 # ----------------------------------------------------------------------------
 # STYLE CONSTANTS -- everything tweakable lives here
 # ----------------------------------------------------------------------------
-PIE_W, PIE_H = 1.35, 1.45          # inches per pie
 FS_AXIS, FS_TICK, FS_LEG, FS_ANN = 8, 7, 7, 6.5   # final print size, nothing < 6.5
-FONT_SERIF = ["Times New Roman", "STIXGeneral", "DejaVu Serif"]
 
-WEDGE_EDGE_LW = 0.6                # white line between wedges
-PIE_LABEL_MIN_PCT = 7.0            # wedges at least this big carry their % inside
-ANN_GRAY, TBD_GRAY = "0.35", "0.55"
-LEG_NCOL = 4
 
 COVERAGE_MIN_PCT = 80.0            # warn when the stages explain less of the wall
 CLAIM_PCT = 11.0                   # paper: overhead "under 11%"
 REBUTTAL_LO, REBUTTAL_HI = 5.0, 10.0   # rebuttal: "averages 5-10%"
 BYTES_PER_MB = 1024 ** 2           # "4 MB" chunk = 4 MiB
 
-ROW_TITLE = {"write": "(a) Write path", "read": "(b) Read path"}
 
 # Bar order is FIXED: the original figure's data point first, then workloads in
 # paper order. Never sort by value. (CSV key, tick label)
 BARS = [
-    ("Synthetic", "Synthetic\n(4 MB periodic)"),
+    ("Synthetic", "Synthetic\n(4 MB periodic/random)"),
     ("VPIC", "VPIC"),
     ("Nyx", "Nyx"),
     ("LAMMPS", "LAMMPS"),
@@ -366,77 +357,6 @@ def summary(S, err_mode):
 # ----------------------------------------------------------------------------
 # PLOTTING
 # ----------------------------------------------------------------------------
-_SHORT = {"Stats Kernel": "Stats", "NN Inference": "NN", "Compress Choice": "Choice",
-          "Compress Factory": "Factory", "Compress Time": "Compress",
-          "Decompress Time": "Decompress", "I/O Time": "I/O"}
-
-
-def _text_color(hexcolor):
-    r, g, b = mpl.colors.to_rgb(hexcolor)
-    return "white" if 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.55 else "black"
-
-
-def draw_pie(ax, s, path):
-    """One pie: every wedge at its true share. Wedges too thin to label are
-    listed beneath with their exact share, so none of them is lost."""
-    ax.set_aspect("equal")
-    ax.axis("off")
-    if s is None:
-        ax.text(0.5, 0.5, "TBD", ha="center", va="center", fontsize=FS_AXIS,
-                color=TBD_GRAY, transform=ax.transAxes)
-        return
-    comps = PATHS[path]
-    shares = [max(float(v), 0.0) for v in s["share"]]
-    wedges, _ = ax.pie(shares, colors=[c for _, _, c in comps], startangle=90,
-                       counterclock=False, radius=1.0,
-                       wedgeprops=dict(edgecolor="white", linewidth=WEDGE_EDGE_LW))
-    small = []
-    for wdg, (name, _col, color), share in zip(wedges, comps, shares):
-        if share >= PIE_LABEL_MIN_PCT:
-            ang = np.deg2rad((wdg.theta1 + wdg.theta2) / 2.0)
-            # One decimal where rounding would claim the whole pie (99.5 -> "100%").
-            txt = f"{share:.1f}%" if share >= 99.5 else f"{share:.0f}%"
-            ax.text(0.62 * np.cos(ang), 0.62 * np.sin(ang), txt,
-                    ha="center", va="center", fontsize=FS_ANN, fontweight="bold",
-                    color=_text_color(color))
-        else:
-            small.append(f"{_SHORT[name]} {fmt_pct(share)}")
-    err = f" ± {s['err']:.2f}" if s["err"] is not None else ""
-    lines = [f"overhead {fmt_pct(s['ov_pct'])}{err}"]
-    # Two short entries per line keeps the list inside the pie's column.
-    lines += ["  ".join(small[k:k + 2]) for k in range(0, len(small), 2)]
-    ax.text(0.5, -0.04, "\n".join(lines), ha="center", va="top", fontsize=FS_ANN,
-            color=ANN_GRAY, transform=ax.transAxes, linespacing=1.15)
-
-
-def legend_handles():
-    """Write-path stages, then the read-path ones not already listed."""
-    seen, out = set(), []
-    for name, _col, color in WRITE + READ:
-        if name not in seen:
-            seen.add(name)
-            out.append(Patch(facecolor=color, edgecolor="none", label=name))
-    return out
-
-
-def set_fonts():
-    avail = {f.name for f in font_manager.fontManager.ttflist}
-    serif = [f for f in FONT_SERIF if f in avail] or ["DejaVu Serif"]
-    mpl.rcParams.update({
-        "font.family": "serif", "font.serif": serif, "mathtext.fontset": "stix",
-        "pdf.fonttype": 42, "ps.fonttype": 42, "axes.linewidth": 0.6,
-    })
-    return serif[0]
-
-
-SAVE_PAD = 0.02                    # pad_inches for the tight bbox
-
-
-def save(fig, stem, out):
-    png = os.path.join(out, stem + ".png")
-    fig.savefig(png, dpi=300, bbox_inches="tight", pad_inches=SAVE_PAD)
-    plt.close(fig)
-    return [png]
 
 
 def timesteps_rows(patterns):
@@ -469,21 +389,6 @@ def timesteps_rows(patterns):
     return rows
 
 
-def plot_workload(S, w, out):
-    """One workload's breakdown: a write-path pie beside a read-path pie."""
-    label = dict(BARS)[w].replace("\n", " ")
-    fig, axes = plt.subplots(1, 2, figsize=(2 * PIE_W + 0.6, PIE_H + 0.75))
-    for ax, path in zip(axes, ("write", "read")):
-        s = S.get((w, path))
-        sub = f"\n{fmt_ms(s['total_ms'])}{TIME_UNIT}, n={s['n']}" if s is not None else ""
-        ax.set_title(f"{ROW_TITLE[path]}{sub}", fontsize=FS_AXIS, pad=3, linespacing=1.1)
-        draw_pie(ax, s, path)
-    fig.suptitle(label, fontsize=FS_AXIS + 1, y=1.06)
-    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.18, top=0.66, wspace=0.35)
-    fig.legend(handles=legend_handles(), loc="lower center", bbox_to_anchor=(0.5, 0.80),
-               ncol=LEG_NCOL, fontsize=FS_LEG, frameon=False, handlelength=1.1,
-               handleheight=0.8, handletextpad=0.4, columnspacing=0.9, labelspacing=0.25)
-    return save(fig, f"fig5_{w.lower()}", out)
 
 
 # ============================================================================
@@ -491,7 +396,7 @@ def plot_workload(S, w, out):
 # dump, which is what --timesteps reads back. It was fig5_timesteps.py until
 # this directory went to one plotter.
 # ============================================================================
-DUMP_RE = re.compile(r"^(?:step_?|plt|diag)(\d+)$")
+DUMP_RE = re.compile(r"^(?:step_?|plt|diag|epoch)(\d+)$")
 TS_WRITE = ["stats_ms", "nn_ms", "choice_ms", "factory_ms", "compress_ms", "io_ms"]
 TS_READ = {"factory_ms": "read_factory_ms", "decompress_ms": "decompress_ms",
            "io_ms": "read_io_ms"}
@@ -624,18 +529,72 @@ def write_timesteps(phase_log, workload, out, warmup_step=-1):
 # pointed out explicitly". Bars are means over every chunk of that path;
 # Choice includes the codec factory.
 # ============================================================================
-ST_WLS = [("vpic", "VPIC"), ("nyx", "Nyx"), ("lammps", "LAMMPS"), ("warpx", "WarpX")]
-ST_SEL = [("Stats", "stats_ms"), ("NN", "nn_ms"), ("Choice", "__choice__")]
+ST_WLS = [("vpic", "VPIC"), ("nyx", "Nyx"), ("lammps", "LAMMPS"),
+          ("warpx", "WarpX"), ("ai", "AI"), ("synth", "Synthetic")]
+#: The selector's own stages, in the order they run. FACTORY IS ONE WEDGE
+#: WITH THE CHOICE IT SERVES (`__choice__` = choice_ms + factory_ms): drawn
+#: apart, the construction is 0.001-0.07% of a chunk -- a hairline that no
+#: magnification makes readable -- while together they are the cost of
+#: deciding and then building the codec, which is what a reader is weighing.
+#: `summary` prints the two separately for anyone who needs the split.
+#: EVERY MEASURED COLUMN IS DRAWN, and the residual with them, so a bar is
+#: the chunk's whole latency rather than a selection from it. The identity
+#: LogChunkPhases maintains is other_ms = wall_ms - (the ten measured
+#: columns), so these segments sum to wall_ms exactly -- assert_complete()
+#: checks it per workload rather than trusting the arithmetic.
+ST_SEL = [("Stats", "stats_ms"), ("NN", "__nn__"), ("Explore", "explore_ms"),
+          ("Factory", "__choice__")]
+#: UNATTRIBUTED IS NOT DRAWN. The bars are the time this figure can NAME,
+#: normalised to 100% of itself -- not of the chunk's wall. other_ms is the
+#: residual wall minus the measured columns, and profiling it (Nsight
+#: Systems, Nyx, 4 MiB) showed it is not one phenomenon: one-time CUDA and
+#: runtime init on the first chunk of a process (446.6 of 449.7 ms, now
+#: dropped as warmup by st_warm), the timing events' own cudaEventSynchronize
+#: (49.4 ms of a 96.1 ms steady residual), per-chunk cudaMalloc/cudaFree and
+#: launch overhead no stage brackets, the synchronous H2D of compressed bytes
+#: on read (0.69 ms/chunk, which has no column at all), and -- where chunks
+#: overlap -- time a chunk spent QUEUED behind others. Drawn as one grey
+#: wedge it read as a single missing stage, which it is not.
+#: st_measured_total() reports what the bar does cover, and `summary` still
+#: prints the residual for anyone checking.
 ST_WRITE = ST_SEL + [("Compress", "compress_ms"), ("I/O", "io_ms")]
-ST_READ = [("Decompress", "decompress_ms"), ("I/O", "io_ms")]
-ST_COL = {"Stats": "#2f5597", "NN": "#7c9fd4", "Choice": "#c6d4ec",
-          "Compress": "#ffc000", "I/O": "#ededed", "Decompress": "#9ecae1"}
-ST_HAT = {"Stats": "....", "NN": "////", "Choice": "xxxx", "Compress": "....",
-          "I/O": "", "Decompress": "////"}
+
+#: MEASURED BUT DELIBERATELY NOT DRAWN. Both are real time and both stay in
+#: the phase log and in `summary`; they are off the bars because neither is
+#: work the selector does on a chunk.
+#:   other_ms  the residual -- not one phenomenon but five (one-time CUDA and
+#:             runtime init, the timing events' own cudaEventSynchronize,
+#:             unbracketed cudaMalloc/cudaFree and launch overhead, the read
+#:             path's uninstrumented H2D, and queueing where chunks overlap).
+#:   h2d_ms    staging the chunk from host shm onto the GPU. This is the cost
+#:             of GETTING the data to the device so the process can start,
+#:             not of the process; a producer that already holds its data on
+#:             the GPU (the WarpX VOL, the LAMMPS in-process library) never
+#:             pays it at all, so charging it to compression would make the
+#:             figure a property of where the caller's buffer happens to live.
+#: assert_complete() subtracts these from the wall before checking that what
+#: IS drawn partitions what remains.
+ST_OFF = [("Unattributed", "other_ms"), ("H2D", "h2d_ms")]
+#: A read row carries neither preproc_ms nor h2d_ms -- the writer gates the
+#: first to write rows and never populates the second -- so the read path's
+#: inverse shuffle, dequantize and staging are inside Unattributed.
+ST_READ = [("Factory", "factory_ms"), ("Decompress", "decompress_ms"),
+           ("I/O", "io_ms")]
+#: Factory is red on purpose: it is the stage a reader comes looking for,
+#: and at 0.2-3.5% of a chunk it needs the contrast to be found at all.
+ST_COL = {"Stats": "#2f5597", "NN": "#7c9fd4", "Explore": "#7fbc41",
+          "SGD": "#c994c7", "Factory": "#d1495b",
+          "Preproc": "#8c6bb1", "H2D": "#66c2a5", "Compress": "#ffc000",
+          "I/O": "#ededed", "Decompress": "#9ecae1",
+          "Unattributed": "#bdbdbd"}
+ST_HAT = {"Stats": "....", "NN": "////", "Explore": "--", "SGD": "||",
+          "Factory": "xxxx", "Preproc": "\\\\",
+          "H2D": "++", "Compress": "....", "I/O": "", "Decompress": "////",
+          "Unattributed": "//"}
 ST_BREAK_MS = 0.30
 COL_W, TEXT_W = 3.334, 7.0          # acmart sigplan \columnwidth / \textwidth
-#: The rc the two bar renderings print at. Applied per draw, not at import, so
-#: the pies above keep their own font handling.
+#: The rc both bar renderings print at. Applied per draw rather than at
+#: import, so importing this file changes nothing about a caller's figures.
 BAR_RC = {"font.family": "serif",
           "font.serif": ["Times New Roman", "STIXGeneral", "DejaVu Serif"],
           "pdf.fonttype": 42, "ps.fonttype": 42, "axes.linewidth": 0.6,
@@ -649,42 +608,257 @@ def default_results():
                           os.path.join(HERE, "..", "..", "results", "figure5"))
 
 
+#: One-time CUDA and runtime initialisation is charged, in full, to whichever
+#: chunk happens to go first in a process. Nsight Systems on a Nyx replay
+#: (36 chunks): chunk 0 is 449.7 ms of wall with 446.6 ms unattributed, while
+#: the next 35 average 5.65 ms with 2.75 ms unattributed -- a 79x outlier.
+#: The profile names it: cudaMemGetInfo 210.8 ms in ONE call, cuLibraryLoadData
+#: 78.6 ms, cudaMallocHost 10.6 ms, cudaHostAlloc 7.5 ms, the first
+#: cudaMallocFromPoolAsync 9.3 ms -- 317 ms of one-time CUDA setup, plus the
+#: runtime's own shm and worker-pool construction.
+#:
+#: It is dropped rather than drawn because it is a property of STARTING, not
+#: of compressing a chunk, and because leaving it in makes the figure depend
+#: on the payload: at 128 chunks per rep it moves a bar by under a point, at
+#: 2 chunks it IS the bar. Every rep is a fresh process, so each one pays it
+#: once -- the reset of `seq` to 0 is what marks a new rep in a concatenated
+#: phase log.
+def st_warm(rows, path):
+    """A path's rows with each rep's first chunk -- its cold start -- removed.
+
+    @param rows every row of a concatenated phase log, in file order
+    @param path write or read
+    @return the warm rows of that path; all of them if a rep has only one,
+            since reporting nothing is worse than reporting a cold number
+    """
+    rep, last, out = 0, None, []
+    for r in rows:
+        try:
+            q = int(r["seq"])
+        except (KeyError, TypeError, ValueError):
+            q = None
+        if q is not None and last is not None and q < last:
+            rep += 1                      # seq went backwards: a new process
+        if q is not None:
+            last = q
+        if r["path"] == path:
+            out.append((rep, q, r))
+    if not out:
+        return []
+    cold = {}                             # (rep) -> the lowest seq of this path
+    for rp, q, _r in out:
+        if q is not None and (rp not in cold or q < cold[rp]):
+            cold[rp] = q
+    warm = [r for rp, q, r in out if q is None or q != cold.get(rp)]
+    return warm or [r for _rp, _q, r in out]
+
+
+#: A field whose size is not a whole number of chunks ends in a SHORT one --
+#: VPIC's 13.396 MiB field is 3 x 4 MiB plus 1.396, an AI checkpoint 81 x
+#: 4 MiB plus 1.3. A short chunk is not a small version of a full one: the
+#: model's forward pass, the SGD step and the codec's launch overhead are
+#: fixed per chunk, so a 1.4 MiB chunk spends ~3x the FRACTION of itself on
+#: them. Averaging the two together makes a bar depend on how a field's size
+#: happens to divide, which is not a property of the compressor.
+def st_full(rows):
+    """Only whole chunks: the modal size, which is the configured --chunk.
+
+    @param rows one path's rows, already warm
+    @return the rows at the most common chunk_bytes; all of them when the
+            log has no chunk_bytes to judge by
+    """
+    sizes = [r.get("chunk_bytes") for r in rows if r.get("chunk_bytes")]
+    if not sizes:
+        return rows
+    full = max(set(sizes), key=lambda b: (sizes.count(b), int(b)))
+    return [r for r in rows if r.get("chunk_bytes") == full] or rows
+
+
 def st_per_chunk(res, wl, path, stages):
     """Mean milliseconds per stage over one workload's chunks of one path.
 
     @param res the results directory holding figure_5_<wl>/phase.csv
     @param wl the workload key, e.g. vpic
     @param path write or read
-    @param stages [(legend name, column)], __choice__ meaning choice+factory
+    Two virtual columns keep the decomposition DISJOINT AND COMPLETE:
+      __choice__ = choice_ms + factory_ms   deciding, then building the codec
+      __nn__     = nn_ms + sgd_ms + preproc_ms
+                   the model side of a chunk: the forward pass, the SGD step
+                   that follows it, and the quantize/byte-shuffle the chosen
+                   action implies. Each is 0.02-1.7% of a chunk on its own --
+                   three hairlines with leader lines where the reader wants
+                   one number for what the model costs.
+
+    EXPLORATION IS NOT IN __nn__. Trial compressions are
+    1-55% of a chunk -- WarpX measured 54.9% -- while inference is
+    0.01-0.23%, so folding them together would put a codec's work under a
+    label that says forward pass. It is its own segment, and zero whenever
+    the run is learning-only. The runtime already
+    keeps the three disjoint -- explore_ms subtracts both its own tier put
+    (compressor_runtime.cc:2259, counted in io_ms) and the SGD it runs
+    (:2397, counted in sgd_ms) -- so drawing them apart neither
+    double-counts nor leaves a gap.
+    An absent cell is ZERO, not "skip the row": a chunk that never explored
+    spent no time exploring, and averaging only over the chunks that did
+    would report the conditional mean while the bar implies the marginal one.
+
+    @param stages [(legend name, column)]
     @return ({stage: ms}, rows seen)
     """
-    rows = [r for r in csv.DictReader(open(f"{res}/figure_5_{wl}/phase.csv"))
-            if r["path"] == path]
+    rows = st_full(st_warm(
+        list(csv.DictReader(open(f"{res}/figure_5_{wl}/phase.csv"))), path))
+
+    def cell(r, c):
+        v = r.get(c)
+        return float(v) if v not in (None, "") else 0.0
 
     def col(c):
         if c == "__choice__":
             return col("choice_ms") + col("factory_ms")
-        return float(np.mean([float(r[c]) for r in rows
-                              if r.get(c) not in (None, "")] or [0.0]))
+        if c == "__nn__":
+            return col("nn_ms") + col("sgd_ms") + col("preproc_ms")
+        return float(np.mean([cell(r, c) for r in rows] or [0.0]))
     return {n: col(c) for n, c in stages}, len(rows)
 
 
+#: A segment carries its share only if the text FITS in the drawn segment,
+#: measured in points after the axis limits are known. A fraction-of-axis
+#: rule cannot do this: the same 0.1% is legible on the magnified sub-axis
+#: and sub-pixel on the full-range one, and two adjacent thin stages would
+#: each pass a width test and still print over one another.
+ST_LABEL_PAD = 5.0                 # points of clearance the text and its
+                                   #: background box need inside a segment
+
+
 def _st_stack(ax, y, d, stages, lw):
-    """One workload's bar, stacked stage by stage. @return its total ms."""
+    """One workload's bar, stacked stage by stage.
+
+    @return (total ms, [(name, left, right)]) so the shares can be written on
+            afterwards, once the axis limits are known -- a segment that is
+            sub-pixel on the full-range axis is legible on the magnified one,
+            and only the limits say which
+    """
     left = 0.0
+    spans = []
     for name, _ in stages:
         v = d[name]
         ax.barh(y, v, left=left, height=0.62, color=ST_COL[name], hatch=ST_HAT[name],
                 edgecolor="black", linewidth=lw, zorder=3)
+        spans.append((name, left, left + v))
         left += v
-    return left
+    return left, spans
 
 
-def _st_frame(ax, ys, labels=True):
+def _st_shares(axes, y, spans, total):
+    """Write each segment's share of its bar, once, on the axis that shows it.
+
+    The write panel draws the same bar on two sub-axes -- magnified and
+    full-range -- so a stage has two chances to be legible and must be
+    labelled only once. Each segment therefore picks the axis where the most
+    of it is drawn, in POINTS: a stage that straddles the break shows a
+    sliver on the magnified axis and its remainder on the other, and which of
+    those is wider is not something the data units can answer.
+
+    Where the text will not fit inside the segment it goes just above it,
+    which is the only way Nyx's and WarpX's compress share can appear at all:
+    their whole bar is about a tenth of VPIC's, so every stage of theirs is a
+    few points wide on an axis scaled to VPIC.
+
+    @param axes the sub-axes of one panel, limits already set
+    @param y the bar's row
+    @param spans _st_stack's second return
+    @param total the bar's total ms, the denominator of every share
+    """
+    if total <= 0:
+        return
+    size = FS_ANN - 0.8
+    box = dict(facecolor="white", alpha=0.85, edgecolor="none",
+               boxstyle="square,pad=0.16")
+    above = {}
+    for name, x0, x1 in spans:
+        share = 100.0 * (x1 - x0) / total
+        # A stage that would print as 0.0% is below what the figure can say
+        # about it; everything else gets a number somewhere, however thin the
+        # segment, because a shared x-scale makes a real 15% of one workload
+        # narrower on the page than 0.3% of another.
+        if share < 0.1:
+            continue
+        txt = f"{share:.1f}%" if share < 10 else f"{share:.0f}%"
+        need = len(txt) * size * 0.58 + ST_LABEL_PAD
+        best, best_w = None, 0.0
+        for ax in axes:
+            lo, hi = ax.get_xlim()
+            a, b = max(x0, lo), min(x1, hi)
+            if b <= a:
+                continue
+            per_pt = 72.0 / ax.figure.dpi
+            w = (ax.transData.transform((b, y))[0]
+                 - ax.transData.transform((a, y))[0]) * per_pt
+            if w > best_w:
+                best, best_w = (ax, (a + b) / 2.0), w
+        if best is None or best_w <= 0.0:
+            continue
+        ax, mid = best
+        if best_w >= need:
+            ax.text(mid, y, txt, ha="center", va="center", fontsize=size,
+                    zorder=5, color="#111111", bbox=box)
+        elif len(axes) == 1:
+            # Leaders are for a panel with nowhere else to put the number.
+            # Where a magnified companion axis exists it has already made the
+            # thin stages legible, and a fan of leaders on top of that is
+            # clutter -- the exact numbers are in `summary` either way.
+            above.setdefault(ax, []).append((mid, txt, need))
+    _st_above(above, y, size, box)
+
+
+def _st_above(above, y, size, box):
+    """Place the labels that did not fit inside their segment, over the bar.
+
+    They are the thin stages, so they arrive adjacent and would overprint.
+    Each is nudged right until its box clears its neighbour's -- in DISPLAY
+    space, because the write panel's two sub-axes have different scales and
+    a data-unit gap means a different gap on each.
+
+    @param above {axis: [(x, text, width in points)]}
+    @param y the bar's row
+    @param size the font size
+    @param box the plate the text sits on
+    """
+    for ax, items in above.items():
+        px = ax.figure.dpi / 72.0                 # points -> pixels
+        placed = []
+        for mid, txt, need in sorted(items):
+            x = ax.transData.transform((mid, y))[0]
+            if placed and x - placed[-1][0] < (placed[-1][1] + need) / 2 * px:
+                x = placed[-1][0] + (placed[-1][1] + need) / 2 * px
+            placed.append((x, need))
+            ax.annotate(txt, xy=(mid, y + 0.31),
+                        xytext=(ax.transData.inverted().transform((x, 0))[0],
+                                y + 0.54),
+                        ha="center", va="center", fontsize=size - 0.4,
+                        color="#333333", zorder=5, bbox=box,
+                        arrowprops=dict(arrowstyle="-", lw=0.4, color="#999999",
+                                        shrinkA=0.5, shrinkB=0.5))
+
+
+def st_available(res):
+    """The workloads this results tree actually holds a phase log for.
+
+    A run of one workload should still draw, with the rows it measured,
+    rather than dying on the first missing file.
+
+    @param res the results directory
+    @return the (key, label) pairs in ST_WLS order, those with a phase log
+    """
+    return [(wl, lab) for wl, lab in ST_WLS
+            if os.path.isfile(f"{res}/figure_5_{wl}/phase.csv")]
+
+
+def _st_frame(ax, ys, wls, labels=True):
     """Ticks, grid and spines shared by every stacked sub-axis."""
     ax.set_yticks(ys)
-    ax.set_yticklabels([l for _, l in ST_WLS] if labels else [], fontsize=FS_TICK)
-    ax.set_ylim(-0.6, len(ST_WLS) - 0.4)
+    ax.set_yticklabels([l for _, l in wls] if labels else [], fontsize=FS_TICK)
+    ax.set_ylim(-0.6, len(wls) - 0.4)
     ax.grid(axis="x", color="#cccccc", linewidth=0.4, zorder=0)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
@@ -692,49 +866,180 @@ def _st_frame(ax, ys, labels=True):
     ax.tick_params(labelsize=FS_TICK)
 
 
-def st_draw_write(res, axL, axR):
+def st_draw_write(res, axL, axR, wls):
     """The write panel, across the axis break.
 
     @param res the results directory
     @param axL the magnified 0..ST_BREAK_MS sub-axis
     @param axR the full-range sub-axis
+    @param wls the workloads to draw, from st_available
     """
-    ys = np.arange(len(ST_WLS))[::-1]
+    ys = np.arange(len(wls))[::-1]
     wmax = 0.0
-    for y, (wl, _l) in zip(ys, ST_WLS):
+    drawn = []
+    for y, (wl, _l) in zip(ys, wls):
         d, _n = st_per_chunk(res, wl, "write", ST_WRITE)
         for ax, lw in ((axL, 0.3), (axR, 0.5)):
-            tot = _st_stack(ax, y, d, ST_WRITE, lw)
+            tot, spans = _st_stack(ax, y, d, ST_WRITE, lw)
         wmax = max(wmax, tot)
+        drawn.append((y, spans, tot))
         axR.text(tot * 1.02, y, f"{tot:.1f} ms", va="center", ha="left",
                  fontsize=FS_ANN, zorder=4)
     axL.set_xlim(0, ST_BREAK_MS)
     axR.set_xlim(ST_BREAK_MS, wmax * 1.26)
-    _st_frame(axL, ys, True)
-    _st_frame(axR, ys, False)
+    _st_frame(axL, ys, wls, True)
+    _st_frame(axR, ys, wls, False)
     axL.spines["right"].set_visible(False)
     axR.spines["left"].set_visible(False)
     axR.tick_params(axis="y", length=0)
     axL.set_xticks([0, 0.1, 0.2])
     axR.set_xticks([5, 10, 15, 20, 25])
+    for y, spans, tot in drawn:
+        _st_shares((axL, axR), y, spans, tot)
     kw = dict(marker=[(-1, -0.6), (1, 0.6)], markersize=4, linestyle="none",
               color="black", mec="black", mew=0.6, clip_on=False)
     axL.plot([1, 1], [0, 1], transform=axL.transAxes, **kw)
     axR.plot([0, 0], [0, 1], transform=axR.transAxes, **kw)
 
 
-def st_draw_read(res, ax):
-    """The read panel: decompress and I/O, no break needed."""
-    ys = np.arange(len(ST_WLS))[::-1]
+def st_draw_read(res, ax, wls):
+    """The read panel: decompress and I/O, no break needed.
+
+    @param wls the workloads to draw, from st_available
+    """
+    ys = np.arange(len(wls))[::-1]
     rmax = 0.0
-    for y, (wl, _l) in zip(ys, ST_WLS):
+    drawn = []
+    for y, (wl, _l) in zip(ys, wls):
         d, _n = st_per_chunk(res, wl, "read", ST_READ)
-        tot = _st_stack(ax, y, d, ST_READ, 0.5)
+        tot, spans = _st_stack(ax, y, d, ST_READ, 0.5)
         rmax = max(rmax, tot)
+        drawn.append((y, spans, tot))
         ax.text(tot * 1.02, y, f"{tot:.1f} ms", va="center", ha="left",
                 fontsize=FS_ANN, zorder=4)
     ax.set_xlim(0, rmax * 1.30)
-    _st_frame(ax, ys, True)
+    for y, spans, tot in drawn:
+        _st_shares((ax,), y, spans, tot)
+    _st_frame(ax, ys, wls, True)
+
+
+ST_ZOOM = 10.0                     # the magnified sub-axis, in percent
+
+
+def assert_complete(res, wl, path, stages, tol=1e-6):
+    """Verify the drawn stages account for the chunk's whole latency.
+
+    A stacked bar claims a partition. This is the only thing that makes the
+    claim true, and it is cheap, so it runs on every draw rather than living
+    in a test nobody runs.
+
+    @param res, wl, path, stages as st_per_chunk takes them
+    @param tol allowed ms of drift on the mean, for float summation
+    @return (sum of the stages, mean wall_ms); raises if they disagree
+    """
+    d, _n = st_per_chunk(res, wl, path, stages)
+    ref, _n = st_per_chunk(res, wl, path, [("wall", "wall_ms")] + ST_OFF)
+    off = sum(ref[n] for n, _c in ST_OFF)
+    drawn, whole = sum(d.values()), ref["wall"] - off
+    if whole > 0 and abs(drawn - whole) > max(tol, 1e-4 * whole):
+        raise SystemExit(f"{wl}/{path}: the drawn stages sum to {drawn:.6f} ms "
+                         f"but the drawable columns sum to {whole:.6f} ms "
+                         f"(wall {ref['wall']:.6f} - not drawn {off:.6f}) -- "
+                         f"the bar is not a partition of what it claims. "
+                         f"Missing or double-counted column; see ST_WRITE / "
+                         f"ST_READ / ST_OFF.")
+    return drawn, whole
+
+
+def st_draw_shares(res, axes, wls, stages, path):
+    """One bar per workload, normalised to 100%: the widths ARE the shares.
+
+    The absolute rendering cannot show these six together -- AI's chunk takes
+    77.6 ms and Nyx's 0.8 ms, so on one linear axis Nyx's whole bar is under
+    a point wide. Shares fix that, and the total milliseconds printed at the
+    end of each bar keep the magnitudes on the plate.
+
+    THE SAME BAR IS DRAWN TWICE when two axes are given: the first magnified
+    to the first ST_ZOOM percent, the second over the whole 100. Without it
+    the stages this figure exists to expose -- stats, NN, choice, together
+    0.2% of an AI chunk -- are a hairline. With it they are legible on the
+    left while the composition stays honest on the right.
+
+    @param res the results directory
+    @param axes (magnified, full) or (full,)
+    @param wls the workloads to draw, from st_available
+    @param stages [(legend name, column)] in stacking order
+    @param path write or read
+    """
+    ys = np.arange(len(wls))[::-1]
+    full = axes[-1]
+    drawn = []
+    for y, (wl, _l) in zip(ys, wls):
+        d, _n = st_per_chunk(res, wl, path, stages)
+        assert_complete(res, wl, path, stages)
+        total = sum(d.values())
+        if total <= 0:
+            continue
+        share = {k: 100.0 * v / total for k, v in d.items()}
+        for ax, lw in zip(axes, (0.3, 0.5) if len(axes) > 1 else (0.5,)):
+            _tot, spans = _st_stack(ax, y, share, stages, lw)
+        drawn.append((y, spans, 100.0))
+        full.text(102.5, y, f"{total:.1f} ms", va="center", ha="left",
+                  fontsize=FS_ANN, zorder=4)
+    # Room for that label inside the axis: at xlim 100 it overhangs, and in
+    # the combined plate it lands on the next panel's workload names.
+    full.set_xlim(0, 122)
+    zoomed = len(axes) > 1
+    full.set_xticks([25, 50, 75, 100] if zoomed else [0, 25, 50, 75, 100])
+    full.set_xticklabels((["25", "50", "75", "100%"] if zoomed else
+                          ["0", "25", "50", "75", "100%"]), fontsize=FS_TICK)
+    _st_frame(full, ys, wls, len(axes) == 1)
+    if len(axes) > 1:
+        mag = axes[0]
+        mag.set_xlim(0, ST_ZOOM)
+        mag.set_xticks([0, 5, 10])
+        mag.set_xticklabels(["0", "5", "10%"], fontsize=FS_TICK)
+        _st_frame(mag, ys, wls, True)
+        mag.spines["right"].set_visible(False)
+        full.spines["left"].set_visible(False)
+        full.tick_params(axis="y", length=0)
+        kw = dict(marker=[(-1, -0.6), (1, 0.6)], markersize=4,
+                  linestyle="none", color="black", mec="black", mew=0.6,
+                  clip_on=False)
+        mag.plot([1, 1], [0, 1], transform=mag.transAxes, **kw)
+        full.plot([0, 0], [0, 1], transform=full.transAxes, **kw)
+    for y, spans, tot in drawn:
+        _st_shares(tuple(axes), y, spans, tot)
+
+
+def st_present(res, wls, spec):
+    """Stage names that are actually non-zero somewhere, in stage order.
+
+    A key for a segment no bar draws is not neutral: run with exploration
+    off and a legend that still lists "Explore" says the selector explored.
+    The modes differ in WHICH stages exist -- learn-only leaves explore_ms
+    identically 0 -- so the key is derived from the data rather than fixed.
+
+    @param res the results directory
+    @param wls the workloads being drawn
+    @param spec [(path, stages)] every panel the legend covers
+    @return the ordered, de-duplicated names with a non-zero mean
+    """
+    seen, out = set(), []
+    for path, stages in spec:
+        for name, _c in stages:
+            if name in seen:
+                continue
+            for wl, _l in wls:
+                try:
+                    d, _n = st_per_chunk(res, wl, path, [(name, _c)])
+                except (OSError, KeyError):
+                    continue
+                if d[name] > 0:
+                    seen.add(name)
+                    out.append(name)
+                    break
+    return out
 
 
 def bar_legend(fig, names, y=1.0, ncol=None, columnspacing=1.0):
@@ -758,40 +1063,114 @@ def emit(fig, out, name):
     return path
 
 
-def draw_stacked(res, out, split=False, name="fig5_stacked.png"):
+def draw_stacked(res, out, split=False, name="fig5_stacked.png",
+                 absolute=False, zoom=False):
     """The stacked plate: both panels in one \\textwidth figure, or one each.
 
     @param res the results directory holding figure_5_<wl>/phase.csv
     @param out the directory to write into
     @param split True for fig5_write.png and fig5_read.png at \\columnwidth
     @param name the combined figure's file name, when not splitting
-    @return 0
+    @param absolute draw milliseconds on a broken axis instead of shares --
+           readable only while the workloads' totals are within ~20x
+    @param zoom add a companion axis over the first ST_ZOOM percent of the
+           write panel. It makes the selector's stages legible and costs a
+           second set of axes; off by default, because the plate reads
+           cleaner without it
+    @return 0, or 1 when the results tree holds no phase log at all
     """
+    wls = st_available(res)
+    if not wls:
+        print(f"no figure_5_<workload>/phase.csv under {res}; nothing to stack")
+        return 1
+    if len(wls) < len(ST_WLS):
+        missing = [w for w, _ in ST_WLS if (w, dict(ST_WLS)[w]) not in wls]
+        print(f"stacking {len(wls)} of {len(ST_WLS)} workloads "
+              f"(no phase log for: {', '.join(missing)})")
+    height = 0.40 * len(wls)
     with plt.rc_context(BAR_RC):
+        if not absolute:
+            if split:
+                fw = plt.figure(figsize=(COL_W, 1.00 + height))
+                if zoom:
+                    gs = fw.add_gridspec(1, 2, width_ratios=[1.0, 2.3],
+                                         wspace=0.06)
+                    axes_w = (fw.add_subplot(gs[0]), fw.add_subplot(gs[1]))
+                else:
+                    axes_w = (fw.add_subplot(111),)
+                st_draw_shares(res, axes_w, wls, ST_WRITE, "write")
+                # One row, and the axis label just under the ticks: the old
+                # bottom=0.30 reserved a third of the page for a single line
+                # of text.
+                bar_legend(fw, st_present(res, wls, [("write", ST_WRITE)]),
+                           y=1.02, columnspacing=0.8)
+                fw.text(0.58, 0.045, "Share of measured per-chunk write time",
+                        ha="center", fontsize=FS_AXIS)
+                fw.subplots_adjust(top=0.86, bottom=0.15, left=0.17, right=0.86)
+                emit(fw, out, "fig5_write.png")
+
+                fr = plt.figure(figsize=(COL_W, 1.00 + height))
+                st_draw_shares(res, (fr.add_subplot(111),), wls, ST_READ, "read")
+                bar_legend(fr, st_present(res, wls, [("read", ST_READ)]),
+                           y=1.02, columnspacing=0.8)
+                fr.text(0.58, 0.045, "Share of measured per-chunk read time",
+                        ha="center", fontsize=FS_AXIS)
+                fr.subplots_adjust(top=0.86, bottom=0.15, left=0.20, right=0.86)
+                emit(fr, out, "fig5_read.png")
+                return 0
+            fig = plt.figure(figsize=(TEXT_W, 1.75 + height))
+            outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0],
+                                     wspace=0.30)
+            if zoom:
+                inner = outer[0, 0].subgridspec(1, 2, width_ratios=[1.0, 2.3],
+                                                wspace=0.06)
+                axes_w = (fig.add_subplot(inner[0]), fig.add_subplot(inner[1]))
+            else:
+                axes_w = (fig.add_subplot(outer[0, 0]),)
+            axW = axes_w[-1]
+            axR = fig.add_subplot(outer[0, 1])
+            st_draw_shares(res, axes_w, wls, ST_WRITE, "write")
+            st_draw_shares(res, (axR,), wls, ST_READ, "read")
+            axW.set_xlabel("Share of measured per-chunk time"
+                           + ("   [left axis magnified]" if zoom else ""),
+                           fontsize=FS_AXIS, labelpad=2)
+            axR.set_xlabel("Share of measured per-chunk time", fontsize=FS_AXIS,
+                           labelpad=2)
+            # ncol = one row. A fixed ncol wraps whenever the mode changes
+            # how many stages exist -- learning-only has no Explore -- and
+            # leaves the last key orphaned on a line of its own.
+            bar_legend(fig, st_present(res, wls, [("write", ST_WRITE),
+                                                  ("read", ST_READ)]))
+            # top was 0.78 to clear the panel titles; with those gone the
+            # legend is the only thing above the axes, and one row of it
+            # needs far less.
+            fig.subplots_adjust(top=0.90, bottom=0.17, left=0.075, right=0.955)
+            emit(fig, out, os.path.basename(os.environ.get("FIG5_OUT", name)))
+            return 0
         if split:
-            fw = plt.figure(figsize=(COL_W, 1.60))
+            fw = plt.figure(figsize=(COL_W, 1.00 + height))
             gs = fw.add_gridspec(1, 2, width_ratios=[1.0, 1.9], wspace=0.06)
-            st_draw_write(res, fw.add_subplot(gs[0]), fw.add_subplot(gs[1]))
+            st_draw_write(res, fw.add_subplot(gs[0]), fw.add_subplot(gs[1]), wls)
             bar_legend(fw, ["Stats", "NN", "Choice", "Compress", "I/O"], y=1.02, ncol=5)
             fw.text(0.58, 0.035, "Per-chunk time (ms); axis break at 0.3 ms",
                     ha="center", fontsize=FS_AXIS)
             fw.subplots_adjust(top=0.80, bottom=0.30, left=0.17, right=0.975)
             emit(fw, out, "fig5_write.png")
 
-            fr = plt.figure(figsize=(COL_W, 1.60))
-            st_draw_read(res, fr.add_subplot(111))
+            fr = plt.figure(figsize=(COL_W, 1.00 + height))
+            st_draw_read(res, fr.add_subplot(111), wls)
             bar_legend(fr, ["Decompress", "I/O"], y=1.02, ncol=2)
             fr.text(0.60, 0.035, "Per-chunk time (ms)", ha="center", fontsize=FS_AXIS)
             fr.subplots_adjust(top=0.80, bottom=0.30, left=0.20, right=0.975)
             emit(fr, out, "fig5_read.png")
             return 0
-        fig = plt.figure(figsize=(TEXT_W, 2.35))
+        fig = plt.figure(figsize=(TEXT_W, 1.75 + height))
         outer = fig.add_gridspec(1, 2, width_ratios=[3.5, 1.7], wspace=0.30)
         inner = outer[0, 0].subgridspec(1, 2, width_ratios=[1.0, 2.1], wspace=0.05)
         axL, axR = fig.add_subplot(inner[0]), fig.add_subplot(inner[1])
         axRd = fig.add_subplot(outer[0, 1])
-        st_draw_write(res, axL, axR)
-        st_draw_read(res, axRd)
+        st_draw_write(res, axL, axR, wls)
+        st_draw_read(res, axRd, wls)
         axRd.set_xlabel("Per-chunk time (ms)", fontsize=FS_AXIS, labelpad=2)
         axRd.set_title("(b) Read path", fontsize=FS_AXIS, pad=4)
         bar_legend(fig, ["Stats", "NN", "Choice", "Compress", "I/O", "Decompress"], ncol=6)
@@ -815,7 +1194,7 @@ def draw_stacked(res, out, split=False, name="fig5_stacked.png"):
 # One continuous bar per path; the stages too small to draw are labelled
 # beside it, as the donuts did.
 # ============================================================================
-AN_COL = dict(ST_COL, Factory="#e8467c")
+AN_COL = dict(ST_COL)
 AN_HAT = dict(ST_HAT, Factory="")
 AN_WRITE = [("Stats", 5.0), ("NN", 12.0), ("Choice", 0.040), ("Factory", 0.010),
             ("Compress", 110.0), ("I/O", 30.0)]
@@ -921,10 +1300,15 @@ def draw_anatomy(out):
     return 0
 
 
-def draw_pies(args):
-    """One write/read pie pair per workload, with the sanity checks after it.
+def print_summary(args):
+    """The per-chunk stage shares as numbers: the sanity checks and the tables.
 
-    @param args the parsed `pies` arguments
+    There is no figure here any more -- figure 5 is the stacked plate -- but
+    the overhead share this prints is the paper's claim, and the coverage
+    check says how much of the runtime's per-chunk wall the drawn stages
+    account for. Both are worth having per run.
+
+    @param args the parsed `summary` arguments
     @return 0
     """
     global TIME_UNIT
@@ -952,21 +1336,9 @@ def draw_pies(args):
         problems.update(p_csv)
 
     S = summarize(groups, args.err)
-    font = set_fonts()
-    os.makedirs(args.out, exist_ok=True)
-    written = []
-    for w, _ in BARS:
-        if (w, "write") in S or (w, "read") in S:
-            written += plot_workload(S, w, args.out)
-
-    try:
-        sanity(S, problems)
-        summary(S, args.err)
-    except Exception as e:          # the checks must never cost the figure
-        print(f"WARNING: sanity/summary failed: {e!r}\n")
-    print(f"font: {font}   spread: {'+-1 sd' if args.err == 'std' else '95% CI'}")
-    for f in written:
-        print(f"wrote {f}")
+    sanity(S, problems)
+    summary(S, args.err)
+    print(f"spread: {'+-1 sd' if args.err == 'std' else '95% CI'}")
     return 0
 
 
@@ -988,6 +1360,14 @@ def main():
                         "fig5_read.png) instead of one \\textwidth plate")
     m.add_argument("--name", default="fig5_stacked.png", metavar="FILE",
                    help="the combined plate's file name")
+    m.add_argument("--zoom", action="store_true",
+                   help="add a magnified companion axis over the first "
+                        f"{ST_ZOOM:g}%% of the write panel, for the selector "
+                        "stages")
+    m.add_argument("--absolute", action="store_true",
+                   help="bars in milliseconds on a broken axis, rather than "
+                        "shares of each workload's own total. Only readable "
+                        "while the totals are within ~20x of each other")
 
     m = mode.add_parser("anatomy", help="the two anatomy plates, from the "
                                         "embedded synthetic point")
@@ -995,7 +1375,7 @@ def main():
                    help="where to write [this script's own directory]")
 
     m = mode.add_parser("table", help="a run's phase log summed per dump, which "
-                                      "is what `pies --timesteps` reads")
+                                      "is what `summary --timesteps` reads")
     m.add_argument("phase", metavar="PHASE.CSV",
                    help="the runtime's per-chunk phase log")
     m.add_argument("--workload", required=True, metavar="NAME",
@@ -1005,8 +1385,8 @@ def main():
     m.add_argument("--warmup-step", type=int, default=-1, metavar="N",
                    help="drop dumps at step <= N")
 
-    m = mode.add_parser("pies", help="one write/read pie pair per workload, "
-                                     "each wedge a stage's mean share")
+    m = mode.add_parser("summary", help="the stage shares as numbers: the "
+                                        "overhead claim and the coverage check")
     m.add_argument("--csv", action="extend", nargs="+", default=[], metavar="PATH",
                    help="per-chunk timing log(s); repeatable, globs allowed")
     m.add_argument("--timesteps", action="extend", nargs="+", default=[], metavar="PATH",
@@ -1017,8 +1397,6 @@ def main():
                         "measured-only figure")
     m.add_argument("--write-template", metavar="PATH",
                    help="write an example log (the embedded defaults) and exit")
-    m.add_argument("--out", default="figures", metavar="DIR",
-                   help="where to write [figures/]")
     m.add_argument("--err", choices=("std", "ci95"), default="std",
                    help="spread printed with the overhead share: +-1 standard "
                         "deviation (default) or 95%% CI of the mean")
@@ -1026,12 +1404,12 @@ def main():
     args = ap.parse_args()
     if args.mode == "stacked":
         return draw_stacked(args.results or default_results(), args.out,
-                            args.split, args.name)
+                            args.split, args.name, args.absolute, args.zoom)
     if args.mode == "anatomy":
         return draw_anatomy(args.out)
     if args.mode == "table":
         return write_timesteps(args.phase, args.workload, args.out, args.warmup_step)
-    return draw_pies(args)
+    return print_summary(args)
 
 
 if __name__ == "__main__":

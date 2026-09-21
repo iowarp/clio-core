@@ -265,6 +265,9 @@ paper-benchmark/lammps/raw-viz-run/
 paper-benchmark/warpx/run-viz/
 # compare_perchunk_oracle.sh's default --out.
 paper-benchmark/cc2/
+# A figure harness writes its run tree beside itself: gigabytes of dumps,
+# tier images and logs. Only the plots in that directory are tracked.
+paper-benchmark/figures/*/results/
 # Run logs and per-chunk CSVs kept beside a figure's plots stay local.
 paper-benchmark/figures/*/*/logs/
 # A --size smoke run draws into <figure>/smoke/ beside the paper plots
