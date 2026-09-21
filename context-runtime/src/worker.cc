@@ -1731,11 +1731,20 @@ void Worker::ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue
       // This ensures all tasks in this batch get the same block_start time
       task->BlockStart() = batch_timestamp;
 
-      // Route task again - this will handle both local and distributed routing
-      // RouteTask handles Retry/Dne internally via AddToRetryQueue
-      if (CLIO_IPC->RouteTask(task->RunFuture()) == RouteResult::ExecHere) {
+      // A YIELDED COROUTINE RESUMES HERE, on the worker that parked it. It
+      // used to be re-routed through RuntimeMapTask on every yield, so a
+      // poll loop such as "yield 10 us until the copy lands" hopped to
+      // another worker's lane on most iterations and waited there behind
+      // new tasks: a 64 KB device-to-host bounce measured 17-22 ms of wall
+      // time on the two-node kmeans (clio-evchan pput_bounce) for a copy
+      // that takes well under a millisecond. Periodic pollers keep the
+      // re-route, which is how they rebalance; RouteTask handles Retry/Dne
+      // internally via AddToRetryQueue.
+      if (is_started && !task->IsPeriodic()) {
+        ExecTask(task, true);
+      } else if (CLIO_IPC->RouteTask(task->RunFuture()) ==
+                 RouteResult::ExecHere) {
         ExecTask(task, is_started);
-
         // If task re-yielded with a polling interval, ExecTask already
         // re-added it to the periodic queue via AddToBlockedQueue.
       }
