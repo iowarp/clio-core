@@ -653,6 +653,15 @@ void AddCompressPhases(const std::string &blob_name, const ChunkPhases &p) {
   MergePhases(&it->second, p);
 }
 
+void SetCompressMs(const std::string &blob_name, double ms) {
+  PhaseLog *log = PhaseLogInstance();
+  if (!log->fp || !(ms >= 0.0)) return;
+  std::lock_guard<std::mutex> lock(log->mutex);
+  auto it = log->open.find(blob_name);
+  if (it == log->open.end()) return;
+  it->second.compress_ms = ms;
+}
+
 bool TakeCompressPhases(const std::string &blob_name, ChunkPhases *out) {
   PhaseLog *log = PhaseLogInstance();
   if (!log->fp) return false;

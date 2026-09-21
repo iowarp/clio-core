@@ -222,6 +222,23 @@ void OpenCompressPhases(const std::string &blob_name);
 void AddCompressPhases(const std::string &blob_name, const ChunkPhases &p);
 bool TakeCompressPhases(const std::string &blob_name, ChunkPhases *out);
 
+/**
+ * Replace a parked chunk's compress_ms with the time of the codec that was
+ * actually STORED.
+ *
+ * Exploration compresses a chunk with the primary codec and then with up to
+ * K alternatives, and may store an alternative. The phase log recorded the
+ * primary's kernel time beside the adopted codec's name -- on this
+ * benchmark 12.9% of write rows, understating the stored codec's time by a
+ * median 1.74x and reporting rates a codec cannot reach (nvcomp-deflate at
+ * 34 GB/s). MergePhases SUMS compress_ms, so the correction has to overwrite
+ * rather than add.
+ *
+ * @param blob_name the parked chunk
+ * @param ms the adopted codec's kernel time
+ */
+void SetCompressMs(const std::string &blob_name, double ms);
+
 /** path is "write" or "read"; lib 0 = stored raw. */
 void LogChunkPhases(const std::string &blob_name, const char *path,
                     size_t chunk_bytes, int lib, const ChunkPhases &p,

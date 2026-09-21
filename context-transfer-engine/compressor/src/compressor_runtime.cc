@@ -2296,6 +2296,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                 task->context_.actual_compressed_size_ = winner_total;
                 task->context_.actual_compression_ratio_ = winner.ratio;
                 task->context_.actual_compress_time_ms_ = winner.time_ms;
+                // The phase log parked the PRIMARY's kernel time; the bytes
+                // on the tier are the winner's, so the log must name one
+                // codec and time the same one.
+                SetCompressMs(task->blob_name_.str(), winner.time_ms);
                 // ...and dt, or the context reports the PRIMARY's
                 // decompression time next to the WINNER's codec name.
                 task->context_.actual_decompress_time_ms_ = winner.dt_ms;
@@ -2746,6 +2750,15 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           &quant_buf);
       size_t quant_bytes = 0;
       // Same CUDA-event instrument as the codec, so the two halves of clio_s are comparable.
+      // REVERTED, AND WHY IT MUST STAY REVERTED UNTIL THE PATH SYNCHRONISES
+      // ITSELF: recording on the legacy default stream implicitly synchronises
+      // every blocking stream in the context, and the preprocessing path
+      // depends on that barrier. Moving these events to the kernel's own
+      // DeviceStatsStream() removed it and corrupted data -- AI lost 1832 of
+      // 3608 blobs on one rep, 1 of 3608 on another, silently and
+      // non-deterministically. The measurement defect is real (the bracket
+      // times a device-wide drain, 312x on a 4-worker repro) but it is
+      // load-bearing; fix the missing synchronisation first, then move it.
       bool _q_ok;
       {
 #if CTP_ENABLE_CUDA
@@ -2812,6 +2825,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
         bool _s_ok;
         {
 #if CTP_ENABLE_CUDA
+          // Left on the default stream for the reason at the quantize bracket.
           ctp::CodecKernelTimer _kt(nullptr, &context.actual_preproc_time_ms_);
 #endif
           _s_ok = !shuffle_device_alloc.IsNull() &&
@@ -3517,7 +3531,22 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
         task->output_size_ = decompressed_size;
         task->decompress_time_ms_ = decompress_time;
         if (PhaseLogEnabled()) {
-          read_phases.decompress_ms = decompress_time;
+          // SYMMETRY WITH THE WRITE PATH (compress_ms, above): the phase log
+          // records the CODEC KERNEL time when the codec measured one, so
+          // that compress_ms and decompress_ms are the same KIND of quantity
+          // and a figure may put them side by side. The host wall over this
+          // whole region -- per-chunk manager construction, the H2D of the
+          // compressed bytes, the D2H of the output, the allocations and the
+          // inverse preprocessing -- is not lost: LogChunkPhases derives
+          // other_ms as wall minus the measured components, so it lands
+          // there, exactly as the write path's non-kernel work does.
+          //
+          // Measured on VPIC at 4 MiB: the wall is 3.10 ms per chunk and the
+          // kernel 0.39 ms, so 87% of what this column used to report was
+          // not decompression.
+          read_phases.decompress_ms = (decompress_kernel_ms >= 0.0)
+                                          ? decompress_kernel_ms
+                                          : decompress_time;
           LogChunkPhases(task->blob_name_.str(), "read", original_size,
                          compress_lib, read_phases, ms_since(read_t0),
                          expected_size);
@@ -3597,7 +3626,12 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       CLIO_IPC->FreeBuffer(temp_buffer);
       if (PhaseLogEnabled()) {
         read_phases.factory_ms = 0.0;
-        read_phases.decompress_ms = ms_since(copy_t0);
+        // A blob stored raw was never compressed, so no codec runs here and
+        // there is no decompression to time. Charging this copy to
+        // decompress_ms made a chunk no codec had touched carry up to 1.7 ms
+        // of "Decompress Time" in figure 5. The copy is still accounted:
+        // other_ms is the wall minus what was measured.
+        read_phases.decompress_ms = 0.0;
         LogChunkPhases(task->blob_name_.str(), "read", expected_size,
                        /*lib=*/0, read_phases, ms_since(read_t0),
                        expected_size);
