@@ -120,7 +120,13 @@ DGDEF=()
 [ "${SPLIT:-off}" != "off" ] && DGDEF=(-DCLIO_SYCL_DG_USM)
 # EXTRA_CXX: experiment hook, e.g. -fno-inline to test whether clang-level
 # inlining is what produces the single 6000-block function IGC cannot take.
-"$ICPX" -fsycl "${AOTFLAGS[@]}" "${DGDEF[@]}" ${EXTRA_CXX:-} -std=c++20 -O2 -c "$G/$BD/clio_${NAME}_paged_newcoro.cc" \
+# NO IMPLICIT FMA CONTRACTION. The benchmarks gate device results against
+# host references computed in the same TU with explicit fmaf; icpx contracts
+# a*b+c on the device pass by default and the host pass differently, and
+# lammps_md's ballistic gate then failed bitwise at 1e-9..1e-7 while its
+# double-precision closed form and thermo agreed to 3e-14. Explicit
+# __fmaf_rn/sycl::fma calls are unaffected by this flag.
+"$ICPX" -fsycl "${AOTFLAGS[@]}" "${DGDEF[@]}" ${EXTRA_CXX:-} -std=c++20 -O2 -ffp-contract=off -c "$G/$BD/clio_${NAME}_paged_newcoro.cc" \
   -o "$OUT/${NAME}_sycl${SUFFIX}.o" \
   -I"$G/$GVI" -I"$G/$GVI/clio_cte/gpu_vector" \
   "${INCS[@]}" "${DEFS[@]}" > "$OUT/sy_$NAME.log" 2>&1

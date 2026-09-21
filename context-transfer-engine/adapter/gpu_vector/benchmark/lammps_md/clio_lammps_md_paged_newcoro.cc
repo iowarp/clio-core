@@ -38,6 +38,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -4159,12 +4160,29 @@ int main(int argc, char **argv) {
 #endif
     md::SymbolWrite(md::MdSym::kYieldFatal, &yfatal, sizeof(yfatal));
   }
+  // STOPPED AT EXIT, not left running. Under SYCL the watcher issues copies
+  // on a queue of its own, and a detached thread still doing so while
+  // exit() tears the SYCL runtime down freed the adapter under it (core:
+  // urAdapterRelease -> _int_free -> unlink_chunk). An atexit handler runs
+  // before the shared libraries' destructors, so it stops the thread first.
+  static std::atomic<bool> watch_stop{false};
+  static std::atomic<bool> watch_done{false};
+  std::atexit([] {
+    watch_stop.store(true);
+    for (int i = 0; i < 2000 && !watch_done.load(); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
   std::thread fatal_watch([yfatal] {
 #if CTP_ENABLE_SYCL
     void *watch_stream = ctp::GpuApi::CreateStream();
     unsigned long long snap[4] = {0, 0, 0, 0};
 #endif
     for (;;) {
+      if (watch_stop.load()) {
+        watch_done.store(true);
+        return;
+      }
 #if CTP_ENABLE_SYCL
       const unsigned long long *f = snap;
       if (yfatal != nullptr) {
@@ -4180,12 +4198,14 @@ int main(int argc, char **argv) {
                      "103=coro-frame): block=%llu lane=%llu need=%llu\n",
                      f[0], f[1], f[2], f[3]);
         std::fflush(stderr);
+        watch_done.store(true);
         return;
       }
       const std::string msg = gv::FatalReport();
       if (!msg.empty()) {
         std::fprintf(stderr, "%s\n", msg.c_str());
         std::fflush(stderr);
+        watch_done.store(true);
         return;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
