@@ -1044,7 +1044,7 @@ class GpuApi {
       if (stream != nullptr) {
         static_cast<sycl::queue *>(stream)->memcpy(dst, src, size);
       } else {
-        SyclQueue().memcpy(dst, src, size).wait();
+        { auto ev = SyclQueue().memcpy(dst, src, size); SpinWaitEvent(ev); }
       }
     }
 #endif
@@ -1179,6 +1179,27 @@ class GpuApi {
                                SyclQueue().get_device(),
                                sycl::property::queue::in_order{}};
     return q;
+  }
+
+  /**
+   * Wait for a SYCL event by polling its status, never by event::wait().
+   * On the two-node paged vector the runtime's 64 KB copies were bimodal:
+   * 80% landed in 100-500 us, 20% stalled 5-50 ms (clio-evhist dam_copy),
+   * and every completion parked behind such a stall waited as long. That
+   * shape is a blocking wait that spins briefly and then sleeps with
+   * backoff inside the driver; polling the status keeps the thread on the
+   * event and returns the moment the copy lands.
+   * @param ev Event to wait for
+   */
+  static void SpinWaitEvent(sycl::event &ev) {
+    for (;;) {
+      const auto st =
+          ev.get_info<sycl::info::event::command_execution_status>();
+      if (st == sycl::info::event_command_status::complete) {
+        return;
+      }
+      std::this_thread::yield();
+    }
   }
 
   /** Bytes of pinned host USM each thread keeps for bouncing copies between
@@ -1417,7 +1438,7 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   // shared out-of-order queue serialised them all on its lock.
   auto &q = GpuApi::SyclThreadQueue();
   if (dst_dev == src_dev) {
-    q.memcpy(dst, src, n).wait();
+    { auto ev = q.memcpy(dst, src, n); GpuApi::SpinWaitEvent(ev); }
 #if defined(__x86_64__)
     if (clio_evlat_add != nullptr) clio_evlat_add(16, __rdtsc() - ev_c1);
 #endif
@@ -1430,7 +1451,7 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   // taken for; it also keeps every host side the driver sees registered.
   char *pin = GpuApi::SyclPinnedBounce();
   if (pin == nullptr) {
-    q.memcpy(dst, src, n).wait();
+    { auto ev = q.memcpy(dst, src, n); GpuApi::SpinWaitEvent(ev); }
 #if defined(__x86_64__)
     if (clio_evlat_add != nullptr) clio_evlat_add(16, __rdtsc() - ev_c1);
 #endif
@@ -1440,11 +1461,11 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   for (size_t off = 0; off < n; off += kChunk) {
     const size_t c = std::min(kChunk, n - off);
     if (src_dev) {
-      q.memcpy(pin, static_cast<const char *>(src) + off, c).wait();
+      { auto ev = q.memcpy(pin, static_cast<const char *>(src) + off, c); GpuApi::SpinWaitEvent(ev); }
       std::memcpy(static_cast<char *>(dst) + off, pin, c);
     } else {
       std::memcpy(pin, static_cast<const char *>(src) + off, c);
-      q.memcpy(static_cast<char *>(dst) + off, pin, c).wait();
+      { auto ev = q.memcpy(static_cast<char *>(dst) + off, pin, c); GpuApi::SpinWaitEvent(ev); }
     }
   }
 #if defined(__x86_64__)
