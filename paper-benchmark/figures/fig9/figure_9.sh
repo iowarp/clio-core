@@ -30,7 +30,7 @@
 # derivable from this instrumentation; fig9.md beside this script records why, and the two
 # alternative splits that were tried and rejected.
 #
-# Environment: PFS_ROOT, NVME_ROOT, EB_LOW, PANEL_B_TIER, NP_CFG, MAXF, RAM_PCT/RAM_MB,
+# Environment: ONLY (same as --only), DUMP_ROOT, PFS_ROOT, NVME_ROOT, ALLOW_NETWORK_TIER2, EB_LOW, PANEL_B_TIER, NP_CFG, SMOKE_GB, MAXF, RAM_PCT/RAM_MB,
 # COST_BW, NP_LR, NP_MAPE, MEASURE_DT, MEASURE_QUALITY, ARM_TIMEOUT, BEST_FIXED.
 #===============================================================================
 set -uo pipefail
@@ -61,11 +61,16 @@ PANEL_B_TIER=${PANEL_B_TIER:-1}
 # /work/hdd comparable to /work/nvme. So the untiered arms had the FASTEST
 # durable device of the three and the +Tier arms the slowest, which understates
 # exactly what the tiering ablation is trying to show.
-#   /work/hdd  HDD-backed Lustre -- the PFS
-#   /work/nvme NVMe-backed Lustre: NVMe media, still over the network
-# On a COMPUTE node /tmp is node-local NVMe, so NVME_ROOT=/tmp/fig9-$SLURM_JOB_ID
-# makes tier 2 a genuinely local device instead of NVMe over tcp. That is the
-# sharper contrast; the default stays on /work/nvme because it survives the job.
+#   /work/hdd  HDD-backed Lustre (pool ddn_hdd) -- the PFS
+#   /work/nvme SSD-backed Lustre (pool ddn_ssd): NVMe media, but over the
+#              network. NOT used for tier 2 any more.
+# TIER 2 IS THE NODE'S OWN NVMe. On a Delta compute node /tmp is a local NVMe
+# drive, private to the job: nvme0n1 (MZXL51T6HBJR), xfs, 1.5 TB, no quota,
+# 1.2 GB/s durable write (3 x 2 GiB, conv=fdatasync, job 22274732) against
+# 434-502 MB/s for /work/nvme. It is wiped when the job ends, which costs
+# nothing here: every tier image is deleted as soon as its arm is measured, and
+# the results live under --out. require_local_tier2 below refuses a network
+# filesystem as tier 2, so "+Tier" cannot silently mean NVMe over the network.
 CLIO_ACCT=${CLIO_ACCT:-}
 if [ -z "$CLIO_ACCT" ]; then
   # The allocation, from group membership rather than hardcoded: delta_<acct>
@@ -81,8 +86,8 @@ fi
 _WHO=${USER:-$(id -un)}
 PFS_ROOT=${PFS_ROOT:-/work/hdd/$CLIO_ACCT/$_WHO/fig9-pfs}
 # TIER2_ROOT is the old spelling, still honoured.
-NVME_ROOT=${NVME_ROOT:-${TIER2_ROOT:-/work/nvme/$CLIO_ACCT/$_WHO/fig9-nvme}}
-PANEL=both DRY=0 OUT="" FIELDS="" ONLY=""
+NVME_ROOT=${NVME_ROOT:-${TIER2_ROOT:-/tmp/fig9-nvme-${SLURM_JOB_ID:-$_WHO}}}
+PANEL=both DRY=0 OUT="" FIELDS="" ONLY=${ONLY:-}
 BEST_FIXED=${BEST_FIXED:-}     # default per workload, below
 ASYNC_MS=${ASYNC_MS:-500}      # periodic flush for the +Async arms
 # RAM tier 1, eagerly committed at runtime start. Sized as RAM_PCT of the payload
@@ -124,11 +129,15 @@ usage() { sed -n '3,9p' "$0" >&2; cat >&2 <<'U'
 
   --workload, -w  nyx | vpic | warpx | lammps | ai   (default nyx)
   --size, -s      smoke | full                       (default smoke)
+                  smoke replays SMOKE_GB (default 4) GiB per workload;
+                  full replays the whole dump. MAXF overrides either.
   --panel         a | b | both                       (default both)
   --out DIR       results directory
   --fields DIR    dump directory (default: per workload, from the environment)
-  --only LABEL    run only the arm with this exact label (rerun one arm; point
-                  --out at a FRESH dir, because the CSV is truncated at start)
+  --only ARMS     run only these arms: a comma-separated list of exact labels
+                  or result-dir tags, e.g. --only "Baseline,NP+Tier,best_fixed_nvcomp"
+                  (repeatable; env ONLY does the same). --dry-run lists them.
+                  An existing fig9.csv in --out is kept as fig9.csv.<time>.bak
   --dry-run       print the arms and stop
 U
 exit 2; }
@@ -140,7 +149,7 @@ while [ $# -gt 0 ]; do
     --panel)       PANEL=$2; shift 2 ;;
     --out)         OUT=$2; shift 2 ;;
     --fields)      FIELDS=$2; shift 2 ;;
-    --only)        ONLY=$2; shift 2 ;;   # rerun ONE arm, by exact label
+    --only)        ONLY=${ONLY:+$ONLY,}$2; shift 2 ;;
     --dry-run)     DRY=1; shift ;;
     -h|--help)     usage ;;
     *) echo "unknown flag: $1" >&2; usage ;;
@@ -161,20 +170,40 @@ OUT=${OUT:-$BENCH/results/figure9/$WL-$SIZE}
 mkdir -p "$OUT"
 CSV="$OUT/fig9.csv"
 
+# ONE PLACE FOR EVERY WORKLOAD'S DUMPS: $DUMP_ROOT/<workload>/fields. The five
+# dumps used to live under names that described the figure they were first
+# generated for, not the workload they feed -- `np-fig8-nyx` and `np-fig8-vpic`
+# WERE figure 9's Nyx and VPIC inputs, and on 2026-09-20 both were deleted as
+# "figure 8 data" during a cleanup. A single root named by workload removes
+# that trap. Derived from the account, like PFS_ROOT, so nothing is pinned to
+# one user's home.
+DUMP_ROOT=${DUMP_ROOT:-/work/hdd/$CLIO_ACCT/$_WHO/np-dumps}
 if [ -z "$FIELDS" ]; then
+  # A per-workload override wins; then the consolidated root; then a dump this
+  # checkout generated in-tree with <workload>/gen_fields.sh.
   case "$WL" in
-    nyx)    FIELDS=${NYX_FIELDS:-$BENCH/nyx/fields} ;;
-    vpic)   FIELDS=${VPIC_FIELDS:-$BENCH/vpic/fields} ;;
-    warpx)  FIELDS=${WARPX_FIELDS:-$BENCH/warpx/fields} ;;
-    ai)     FIELDS=${AI_FIELDS:-$BENCH/ai/fields} ;;
+    nyx)    FIELDS=${NYX_FIELDS:-} ;;
+    vpic)   FIELDS=${VPIC_FIELDS:-} ;;
+    warpx)  FIELDS=${WARPX_FIELDS:-} ;;
+    ai)     FIELDS=${AI_FIELDS:-} ;;
     # LAMMPS is replayed from a dump like the other four, so every workload is
     # measured the same way: a real input read, and no simulate time in the bar.
     # The dump is the driver's own --raw output, byte-identical to what the
     # in-situ path hands the compressor (job 22190101, 3933 blobs verified).
-    lammps) FIELDS=${LAMMPS_FIELDS:-/work/hdd/bekn/imuradli/np-lammps-30g/fields} ;;
+    lammps) FIELDS=${LAMMPS_FIELDS:-} ;;
   esac
+  [ -n "$FIELDS" ] || FIELDS=$DUMP_ROOT/$WL/fields
+  [ -d "$FIELDS" ] || FIELDS=$BENCH/$WL/fields
 fi
-if [ -z "$(find "$FIELDS" -name '*.f32' -print -quit 2>/dev/null)" ]; then
+# ONE metadata scan for the whole run, reused by the size budget, the payload
+# and warm_cache. These dumps sit on Lustre, where listing 2,010 files across
+# nested step directories takes minutes, and three separate scans paid that
+# before the first arm ran. Sorted by path: the order the driver replays in
+# (neuropress_field_replay.cc:452-453), so every consumer sees the same set.
+FILE_INDEX=$(mktemp "${TMPDIR:-/tmp}/fig9-files-XXXXXX") || exit 3
+trap 'rm -f "$FILE_INDEX"' EXIT
+find "$FIELDS" -name '*.f32' -printf '%p\t%s\n' 2>/dev/null | sort > "$FILE_INDEX"
+if [ ! -s "$FILE_INDEX" ]; then
   echo "no field dumps at $FIELDS -- pass --fields DIR or run $WL/gen_fields.sh" >&2
   exit 3
 fi
@@ -184,20 +213,53 @@ export CLIO_NEUROPRESS_STAGE_H2D=1
 
 case "$WL" in nyx|vpic) DRIVER=$BENCH/$WL/run_config.sh ;; *) DRIVER=$BENCH/nyx/run_config.sh ;; esac
 
-# ARM_TIMEOUT (s): a smoke arm is ~4 s; a full 30 GB replay arm is ~6 min.
-MAXF_ENV=${MAXF:-}   # an explicit MAXF must survive the per-workload overrides
-case "$SIZE" in smoke) CHUNK=2097152; MAXF=${MAXF:-60}; ARM_TIMEOUT=${ARM_TIMEOUT:-40} ;;
-                full)  CHUNK=8388608; MAXF=${MAXF:-0};  ARM_TIMEOUT=${ARM_TIMEOUT:-1800} ;; esac
-# An AI file is a whole 327 MiB tensor, so 2 files is the smoke default -- but an
-# explicit MAXF wins, because online learning needs far more than 328 chunks.
-[ "$WL" = ai ] && [ "$SIZE" = smoke ] && MAXF=${MAXF_ENV:-2}
+# files_for_budget <index> <GiB> -- how many files that budget covers, counted in
+# the order the driver replays them. The budget is filled in WHOLE files, so a
+# workload whose files are large overshoots it: AI's 327 MiB tensors make 4 GiB
+# into 4255 MiB. A dump smaller than the budget replays whole, and the answer is
+# never 0.
+#   @param 1 file index: "path<TAB>bytes" per line, sorted by path
+#   @param 2 payload budget in GiB
+#   @return file count, on stdout
+files_for_budget() {
+  awk -F'\t' -v g="$2" '
+      BEGIN { b = g * 1073741824 }
+      { s += $2; if (s >= b) { print NR; done = 1; exit } }
+      END { if (!done) print (NR ? NR : 1) }' "$1"
+}
+# SMOKE IS A BYTE BUDGET, NOT A FILE COUNT. The five dumps differ 40x in file
+# size -- 8 MiB for VPIC/Nyx/WarpX/LAMMPS against a whole 327 MiB tensor for AI
+# -- so one --max-files gave each workload a different payload (480 MiB against
+# 655 MiB at 60 files) and AI needed a hardcoded override of its own. Setting
+# the payload instead makes the five comparable and needs no per-workload case.
+SMOKE_GB=${SMOKE_GB:-4}
+# ARM_TIMEOUT (s): at 480 MiB the slowest arm measured was 8.3 s (cuSZ on WarpX,
+# 2026-09-20), so a 4 GiB arm is ~70 s and the codec-bound ones rather more;
+# 300 leaves room without letting a hung arm hold the allocation. A full 30 GB
+# replay arm is ~6 min.
+# CHUNK: the unit every arm compresses and puts. Never below MIN_CHUNK (4 MiB):
+# at 2 MiB each compressed chunk paid its ~3 ms of fixed runtime cost (task
+# hand-off, GPU->host staging, rescheduling) twice as often per byte, and on
+# the 8 MiB dumps only a file's own chunks overlap, so small chunks penalised
+# every compressed arm against Baseline for reasons unrelated to compression.
+MIN_CHUNK=4194304
+case "$SIZE" in
+  smoke) CHUNK=4194304
+         MAXF=${MAXF:-$(files_for_budget "$FILE_INDEX" "$SMOKE_GB")}
+         ARM_TIMEOUT=${ARM_TIMEOUT:-300} ;;
+  full)  CHUNK=8388608; MAXF=${MAXF:-0}; ARM_TIMEOUT=${ARM_TIMEOUT:-1800} ;;
+esac
+if [ "$CHUNK" -lt "$MIN_CHUNK" ]; then
+  echo "chunk $CHUNK B is below the $MIN_CHUNK B minimum unit" >&2
+  exit 2
+fi
 # ---- payload this run will replay, and the RAM tier as a percentage of it ----
 if [ -z "${RAM_MB:-}" ]; then
-  # BY PATH, then the first MAXF -- the driver sorts its file list and truncates
-  # it (neuropress_field_replay.cc:452-453), so sizing from the MAXF LARGEST
-  # files measured a set it never replays whenever the dumps differ in size.
-  PAYLOAD_MB=$(find "$FIELDS" -name '*.f32' -printf '%p\t%s\n' 2>/dev/null | sort \
-    | awk -F'\t' -v n="$MAXF" 'n == 0 || NR <= n { s += $2 } END { printf "%.0f", s / 1048576 }')
+  # The first MAXF of the index, which is already in the driver's replay order --
+  # sizing from the MAXF LARGEST files would measure a set it never replays
+  # whenever the dumps differ in size.
+  PAYLOAD_MB=$(awk -F'\t' -v n="$MAXF" \
+    'n == 0 || NR <= n { s += $2 } END { printf "%.0f", s / 1048576 }' "$FILE_INDEX")
   RAM_MB=$(awk -v p="${PAYLOAD_MB:-0}" -v pc="$RAM_PCT" \
     'BEGIN { v = p * pc / 100.0; if (v < 64) v = 64; printf "%.0f", v }')
   echo "== payload ${PAYLOAD_MB:-?} MiB -> RAM tier ${RAM_MB} MiB (${RAM_PCT}%)"
@@ -209,37 +271,92 @@ fi
 # there. arms.csv records the set this run built, so a CSV is never ambiguous
 # about which shape it came from.
 #
-# PANEL (a): the ablation ladder. Untiered arms write straight to the PFS;
-# every +Tier arm spills to NVMe (TIER2_ROOT).
-ARMS=(
-  "Baseline|a|baseline|0|0|0"
-  "nvCOMP|a|$BEST_FIXED|0|0|0"
-  "nvCOMP+Tier|a|$BEST_FIXED|0|1|0"
-  "NP only|a|$NP_CFG|0|0|0"
-  "NP+Tier|a|$NP_CFG|0|1|0"
-  "NP+Tier+Async|a|$NP_CFG|0|1|$ASYNC_MS"
-  # ...and the lossy end of that ladder.
-  "NP+Tier+Async+Lossy|a|$NP_CFG|$EB_LOW|1|$ASYNC_MS"
-)
-# PANEL (b): the external codecs and NeuroPress at the SAME bound. With
-# PANEL_B_TIER=1 each runs twice so the tier is the only variable: the PFS row
-# writes each chunk through to Lustre inside the timed loop, the +Tier row puts
-# to RAM and drains to NVMe behind the periodic flush.
-for _b in "Best fixed nvCOMP:$BEST_FIXED" "ndzip:static-ndzip" \
-          "cuSZp3:static-cuszp" "cuSZ:static-cusz" "NeuroPress:$NP_CFG"; do
-  _bl=${_b%%:*}; _bc=${_b#*:}
-  ARMS+=( "$_bl|b|$_bc|$EB_LOW|0|0" )
-  [ "$PANEL_B_TIER" = 1 ] && ARMS+=( "$_bl+Tier|b|$_bc|$EB_LOW|1|$ASYNC_MS" )
-done
-unset _b _bl _bc
+# LOSSLESS-ONLY WORKLOADS. An AI checkpoint is model weights, not a simulation
+# field: there is no error budget to spend, so the figure offers it no lossy
+# point at all. Its panel (a) ladder stops before the lossy rung and its panel
+# (b) runs at eb=0. The error-bounded codecs are not merely run at eb=0 there,
+# they are LEFT OUT: cuSZ and cuSZp3 have no lossless mode, so a lossless arm
+# of either is not the codec the name promises.
+LOSSLESS_ONLY_WORKLOADS=${LOSSLESS_ONLY_WORKLOADS:-AI}
+LOSSY_ONLY_CODECS=${LOSSY_ONLY_CODECS:-"cuSZ cuSZp3"}
+
+# lossless_only <workload display name> -- true when that workload runs no
+# lossy arm. Keyed by display name (AI, Nyx, ...), because the TBD rows this
+# run writes for the OTHER four workloads have to honour their rules too.
+#   @param 1 workload display name
+#   @return 0 when lossless-only, 1 otherwise
+lossless_only() {
+  case " $LOSSLESS_ONLY_WORKLOADS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+# build_arms <workload display name> -- echo that workload's arm set, one spec
+# per line. A function rather than one global list because the arm set is now a
+# property of the workload: an AI run must emit ITS arms, and the TBD rows it
+# writes for Nyx must emit Nyx's, or a merged CSV would show AI a column of
+# cuSZ bars marked TBD that were never going to be run.
+#   @param 1 workload display name
+#   @return arm specs on stdout: label|panel|config|eb|tier|async_ms
+build_arms() {
+  local w=$1 eb_b=$EB_LOW lossless=0 b bl bc
+  lossless_only "$w" && { lossless=1; eb_b=0; }
+  # PANEL (a): the ablation ladder. Untiered arms write straight to the PFS;
+  # every +Tier arm spills to the node's own NVMe (NVME_ROOT).
+  echo "Baseline|a|baseline|0|0|0"
+  echo "nvCOMP|a|$BEST_FIXED|0|0|0"
+  echo "nvCOMP+Tier|a|$BEST_FIXED|0|1|0"
+  echo "NP only|a|$NP_CFG|0|0|0"
+  echo "NP+Tier|a|$NP_CFG|0|1|0"
+  echo "NP+Tier+Async|a|$NP_CFG|0|1|$ASYNC_MS"
+  # ...and the lossy end of that ladder, which a lossless-only workload skips.
+  [ "$lossless" = 1 ] || echo "NP+Tier+Async+Lossy|a|$NP_CFG|$EB_LOW|1|$ASYNC_MS"
+  # PANEL (b): the external codecs and NeuroPress at the SAME bound. With
+  # PANEL_B_TIER=1 each runs twice so the tier is the only variable: the PFS row
+  # writes each chunk through to Lustre inside the timed loop, the +Tier row puts
+  # to RAM and drains to NVMe behind the periodic flush.
+  # On a lossless-only workload this panel runs at eb=0, so `Best fixed nvCOMP`
+  # repeats panel (a)'s `nvCOMP` and `NeuroPress` repeats `NP only`. That is the
+  # same measurement drawn in both panels, not a second run of a different arm.
+  for b in "Best fixed nvCOMP:$BEST_FIXED" "ndzip:static-ndzip" \
+           "cuSZp3:static-cuszp" "cuSZ:static-cusz" "NeuroPress:$NP_CFG"; do
+    bl=${b%%:*}; bc=${b#*:}
+    if [ "$lossless" = 1 ]; then
+      case " $LOSSY_ONLY_CODECS " in *" $bl "*) continue ;; esac
+    fi
+    echo "$bl|b|$bc|$eb_b|0|0"
+    [ "$PANEL_B_TIER" = 1 ] && echo "$bl+Tier|b|$bc|$eb_b|1|$ASYNC_MS"
+  done
+}
+mapfile -t ARMS < <(build_arms "$WLNAME")
+
+# slug <label> -- the arm's result-dir tag: "NP+Tier+Async" -> np_tier_async.
+slug() { echo "$1" | tr 'A-Z ()+' 'a-z___' | tr -s '_' | sed 's/_$//'; }
+
+# only_names -- the --only entries, one per line, surrounding spaces trimmed.
+only_names() {
+  tr ',' '\n' <<< "$ONLY" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$'
+}
 
 # arm_selected <label> <panel> -- does --panel / --only let this arm run?
+# --only matches an arm by its exact label or by its tag (see slug).
 # One definition, used by the preflight below and by the run loop, so the
 # preflight cannot demand a resource that no selected arm will touch.
 arm_selected() {
-  { [ "$PANEL" = both ] || [ "$PANEL" = "$2" ]; } &&
-  { [ -z "$ONLY" ] || [ "$1" = "$ONLY" ]; }
+  { [ "$PANEL" = both ] || [ "$PANEL" = "$2" ]; } || return 1
+  [ -z "$ONLY" ] && return 0
+  only_names | grep -qxF -e "$1" -e "$(slug "$1")"
 }
+
+# A misspelt --only entry would otherwise run nothing and exit clean.
+if [ -n "$ONLY" ]; then
+  _known=$(for _spec in "${ARMS[@]}"; do _l=${_spec%%|*}; echo "$_l"; slug "$_l"; done)
+  while IFS= read -r _n; do
+    grep -qxF -e "$_n" <<< "$_known" && continue
+    echo "--only: no $WLNAME arm is called '$_n'. Arms (label / tag):" >&2
+    for _spec in "${ARMS[@]}"; do _l=${_spec%%|*}; echo "  $_l / $(slug "$_l")" >&2; done
+    exit 2
+  done < <(only_names)
+  unset _known _n _spec _l
+fi
 
 # Both device roots must be writable before the first arm needs one, not
 # discovered by it: a failed mkdir inside run_arm skips that arm silently and
@@ -268,13 +385,29 @@ require_root() {
       echo "   found, so the default path is incomplete -- set CLIO_ACCT or $2.)" >&2
     exit 4
   fi
-  echo "== $1 root: $4  [$(df -Th "$4" 2>/dev/null | tail -1 | awk '{print $2}')]"
+  echo "== $1 root: $4  [$(df -Th "$4" 2>/dev/null | tail -1 | awk '{print $2" on "$1}')]"
+}
+# require_local_tier2 <root> -- tier 2 must be a device IN this node. A network
+# filesystem there turns "+Tier" into "NVMe over the network", which the figure
+# does not want to measure; refuse it unless ALLOW_NETWORK_TIER2=1 says so.
+require_local_tier2() {
+  [ "$_want_nvme" = 1 ] || return 0
+  local fs; fs=$(df -T "$1" 2>/dev/null | awk 'NR==2{print $2}')
+  case "$fs" in
+    lustre|nfs|nfs4|gpfs|beegfs|cifs|smb3|ceph|panfs|fuse.*)
+      [ "${ALLOW_NETWORK_TIER2:-0}" = 1 ] && return 0
+      echo "NVME_ROOT $1 is on $fs: a network filesystem, not this node's NVMe." >&2
+      echo "  Tier 2 must be node-local (on a Delta compute node: /tmp)." >&2
+      echo "  Set ALLOW_NETWORK_TIER2=1 to override on purpose." >&2
+      exit 4 ;;
+  esac
 }
 if [ "$DRY" != 1 ]; then
   require_root PFS  PFS_ROOT  "$_want_pfs"  "$PFS_ROOT" \
     "untiered arm (Baseline included) puts its tier-1 file"
   require_root NVMe NVME_ROOT "$_want_nvme" "$NVME_ROOT" \
     "+Tier arm spills tier 2"
+  require_local_tier2 "$NVME_ROOT"
 fi
 
 # A runtime killed mid-run leaves IPC state that slows later arms; clear this
@@ -303,7 +436,6 @@ clean_leftovers() {
   find /dev/shm -maxdepth 1 -user "$USER" -name 'sm_segment.*' -delete 2>/dev/null
 }
 
-slug() { echo "$1" | tr 'A-Z ()+' 'a-z___' | tr -s '_' | sed 's/_$//'; }
 
 # ELAPSED time covered by a per-chunk phase, in seconds: the UNION of the
 # [start, start+dur] intervals, NOT their sum. Chunks pipeline, so a sum
@@ -531,7 +663,7 @@ print("%s %s: %d B, %d B allocated, %s"
 warm_cache() {
   [ "$DRY" = 1 ] && return 0
   local -a files
-  mapfile -t files < <(find "$FIELDS" -name '*.f32' | sort)
+  mapfile -t files < <(cut -f1 "$FILE_INDEX")
   [ "$MAXF" -gt 0 ] 2>/dev/null && files=( "${files[@]:0:$MAXF}" )
   echo "== warming page cache over ${#files[@]} file(s) (untimed)"
   printf '%s\0' "${files[@]}" | xargs -0 -r cat > /dev/null 2>&1
@@ -563,7 +695,7 @@ warm_cache
 unset _spec _l _p _c _e _t _f
 cat > "$OUT/run.json" <<JSON
 {"workload":"$WLNAME","size":"$SIZE","panel":"$PANEL","arms":${#ARMS[@]},
- "np_config":"$NP_CFG","best_fixed":"$BEST_FIXED","chunk":$CHUNK,"max_files":$MAXF,
+ "np_config":"$NP_CFG","best_fixed":"$BEST_FIXED","chunk":$CHUNK,"max_files":$MAXF,"smoke_gb":"$SMOKE_GB",
  "eb":"$EB_LOW","panel_b_tier":$PANEL_B_TIER,"async_ms":$ASYNC_MS,"ram_mb":${RAM_MB:-0},
  "cost_bw_bytes_per_ms":"$COST_BW","np_lr":$NP_LR,"np_mape":$NP_MAPE,
  "measure_dt":$MEASURE_DT,"measure_quality":$MEASURE_QUALITY,
@@ -571,6 +703,9 @@ cat > "$OUT/run.json" <<JSON
  "pfs_root":"$PFS_ROOT","nvme_root":"$NVME_ROOT"}
 JSON
 
+# Never truncate earlier results: rerunning a few arms into the same --out
+# would otherwise wipe every row the previous run recorded.
+[ "$DRY" != 1 ] && [ -s "$CSV" ] && cp "$CSV" "$CSV.$(date +%m%d%H%M%S).bak"
 echo "panel,workload,strategy,compute_min,io_min,total_min,std_min,ratio,eb" > "$CSV"
 
 for spec in "${ARMS[@]}"; do
@@ -584,11 +719,13 @@ done
 # TBD rows for the other workloads keep the plot layout fixed.
 for w in "${WORKLOADS_ALL[@]}"; do
   [ "$w" = "$WLNAME" ] && continue
-  for spec in "${ARMS[@]}"; do
-    IFS='|' read -r label panel _ eb _ _ <<< "$spec"
+  # That workload's OWN arms: a lossless-only workload must not gain a column of
+  # lossy bars marked TBD just because this run happened to measure them.
+  while IFS='|' read -r label panel _ eb _ _; do
+    [ -n "$label" ] || continue
     [ "$PANEL" = both ] || [ "$PANEL" = "$panel" ] || continue
     echo "$panel,$w,\"$label\",,,,,,$eb" >> "$CSV"
-  done
+  done < <(build_arms "$w")
 done
 
 echo; echo "csv: $CSV"

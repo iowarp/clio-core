@@ -23,63 +23,81 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 # ----------------------------------------------------------------------------
-# STYLE CONSTANTS -- everything tweakable lives here
+# STYLE -- everything tweakable lives here
 # ----------------------------------------------------------------------------
-FIG_W, FIG_H = 7.16, 3.8          # IEEE two-column figure* width, inches
-FS_AXIS, FS_TICK, FS_LEG, FS_VAL = 9, 8, 7.5, 7    # nothing below 7 pt
+FIG_W = 7.16                       # IEEE two-column figure* width, inches
+PLOT_H = 2.35                      # inches of plot area, axis to axis
+FS_TITLE, FS_TICK, FS_LEG, FS_VAL = 8.5, 7, 7, 7   # nothing below 7 pt
 Y_CLIP = 6.5                       # MINUTES; cuSZ/VPIC at 14.2 min must not set this
 Y_AUTO_BELOW = 0.5                 # if max(total) < Y_CLIP*this, rescale to the
                                    # data -- a smoke run is ~4 s and would
                                    # otherwise be invisible against a 390 s axis
-IO_BLEND = 0.60                    # I/O segment blended this far toward white
-BAR_PAD = 0.18                     # fraction of the group width left as gutter
+HEADROOM = 1.30                    # y limit over the tallest bar: room for its
+                                   # upright value label
+IO_BLEND = 0.55                    # pale segment: this far from the fill to white
+BAR_W = 0.80                       # bar width as a fraction of its slot; the rest
+                                   # is the surface gap between neighbours
+GROUP_W = 0.92                     # share of each workload's width given to bars;
+                                   # the rest is the gutter between groups
+AX_LEFT, AX_RIGHT = 0.07, 0.995    # plot area, figure fractions
+LEGEND_COLS = 4                    # arm-legend columns above the plot
+KEY_H = 0.46                       # inches under the axis: x labels + key line
 
-# Preferred left-to-right column order. A workload present in the CSV but not
-# named here is appended in the order it first appears, so a new one plots
-# without editing this file.
+# Preferred panel order. A workload present in the CSV but not named here is
+# appended in the order it first appears, so a new one plots without editing
+# this file.
 WORKLOAD_ORDER = ["VPIC", "Nyx", "LAMMPS", "WarpX", "AI"]
 
-# tab10 mapping carried over from the published figure, so colours stay stable
-# Untiered arms write straight to the PFS; every +Tier arm spills to NVMe. A
-# codec keeps its hue across both, so the pair reads as one codec, two devices.
-COLORS_A = {
-    "Baseline":              "#7f7f7f",
-    "nvCOMP":                "#1f77b4",
-    "nvCOMP+Tier":           "#2ca02c",
-    "NP only":               "#5d3fd3",
-    "NP+Tier":               "#ff7f0e",
-    "NP+Tier+Async":         "#9467bd",
-    "NP+Tier+Async+Lossy":   "#d62728",
-    # The lossy ladder as the published figure drew it: one hue per bound, not
-    # three shades of one. Listed rather than derived so a re-plot reproduces
-    # the campaign's own colours.
-    "NP+Tier+Async+Lossy (low)":  "#d62728",
-    "NP+Tier+Async+Lossy (med)":  "#e377c2",
-    "NP+Tier+Async+Lossy (high)": "#17becf",
+# Ink and chrome. Text never takes a series colour.
+INK, INK_MUTED, GRID = "#2b2b2b", "#6b6a66", "#e7e6e2"
+
+# ARM COLOURS: hue = library, hatching = the +Tier variant, and along the
+# NeuroPress ladder a darker step = one more feature. Seven colour classes,
+# not fifteen: the previous one-hue-per-arm palette ran past what a reader can
+# hold, gave cuSZ+Tier the same grey as Baseline, and marked the external
+# codecs with black outlines. NeuroPress is green and ndzip red, as requested;
+# cuSZ moved from orange to amber because every red beside an orange failed
+# the normal-vision floor. Validated with the dataviz skill's
+# validate_palette.js on a light surface:
+#   libraries  #d9403f #c98500 #872985 #5089cc #008856 -- all checks pass
+#   ordinal    #5089cc -> #1c5cab  and  #31aa76 -> #008856 -> #006435 -- pass
+#   neighbours Baseline|ndzip CVD 10.3 / normal 26.5; ndzip|cuSZ 8.3 / 16.0;
+#              nvCOMP+Tier|NP only 16.3 / 18.6; Best fixed|NeuroPress 19.0 / 20.1
+#   cuSZp3 vs Best fixed nvCOMP (neighbours in panel b): CVD 7.4, normal 18.5;
+#   ndzip red vs NeuroPress green (never neighbours): CVD 7.7, normal 30.5 --
+#   both inside the 6-8 CVD floor band, legal with secondary encoding: every
+#   bar is labelled and the legend follows bar order.
+ARM_COLORS = {
+    "Baseline":            "#4b4a47",
+    "ndzip":               "#d9403f",
+    "cuSZ":                "#c98500",
+    "cuSZp3":              "#872985",
+    "nvCOMP":              "#5089cc",   # lossless: the ablation's fixed codec
+    "Best fixed nvCOMP":   "#1c5cab",   # the same library at the run's bound
+    "NP only":             "#31aa76",
+    "NP":                  "#31aa76",   # base_name("NP+Tier")
+    "NP+Tier+Async":       "#008856",
+    "NP+Tier+Async+Lossy": "#006435",
+    "NeuroPress":          "#006435",   # panel (b): NeuroPress at the bound
 }
-COLORS_B = {
-    "Best fixed nvCOMP":      "#1f77b4",
-    "Best fixed nvCOMP+Tier": "#6baed6",
-    "ndzip":                  "#bcbd22",
-    "ndzip+Tier":             "#dbdb8d",
-    "cuSZp3":                 "#8c564b",
-    "cuSZp3+Tier":            "#c49c94",
-    "cuSZ":                   "#7f7f7f",
-    "cuSZ+Tier":              "#c7c7c7",
-    "NeuroPress":             "#d62728",
-    "NeuroPress+Tier":        "#ff9896",
-}
+TIER_HATCH = "////"
+KEY_GREY = "#8c8b87"               # neutral swatch for the segment/hatch key
+# Hues for an arm no entry above names, taken in fixed order.
+FALLBACK_COLORS = ["#008300", "#e87ba4", "#eda100"]
+
 # Codecs that are lossless however they were invoked: panel (b) gives ndzip the
 # run's error bound, but it ignores it.
 LOSSLESS_BASES = {"ndzip"}
 
-# Hues for an arm no palette above names. Deliberately distinct from both.
-FALLBACK_CYCLE = ["#17becf", "#e377c2", "#bcbd22", "#8c564b", "#7b4173",
-                  "#843c39", "#5254a3", "#637939"]
+# Canonical left-to-right arm order within each panel; an arm the CSV has and
+# these lists lack is appended in the order it first appears.
+ORDER_A = ["Baseline", "nvCOMP", "nvCOMP+Tier", "NP only", "NP+Tier",
+           "NP+Tier+Async", "NP+Tier+Async+Lossy"]
+ORDER_B = ["ndzip", "ndzip+Tier", "cuSZ", "cuSZ+Tier", "cuSZp3", "cuSZp3+Tier",
+           "Best fixed nvCOMP", "Best fixed nvCOMP+Tier",
+           "NeuroPress", "NeuroPress+Tier"]
 
 _LADDER_RE = re.compile(r"\s*\((low|med|high)\)\s*$")
-_LADDER_TINT = {"low": 0.0, "med": 0.30, "high": 0.55}
-
 
 def base_name(strategy):
     """The arm's family: its ladder suffix and a trailing `+Tier` removed.
@@ -95,37 +113,6 @@ def base_name(strategy):
     return s[:-len("+Tier")] if s.endswith("+Tier") else s
 
 
-def build_palette(order, known):
-    """Map every arm of one panel to a colour, published hues first.
-
-    An unlisted arm is derived rather than dropped: a `+Tier` row takes its
-    codec's hue blended toward white, a `(med)`/`(high)` ladder step a deeper
-    blend of its family's, and a name with no family at all takes the next
-    fallback hue. Deterministic -- the same CSV always plots the same colours.
-
-    @param order Arm labels for this panel, in plotting order.
-    @param known Published {label: colour} for this panel.
-    @return {label: colour} covering every entry of `order`.
-    """
-    out, spare = {}, 0
-    for s in order:
-        if s in known:
-            out[s] = known[s]
-            continue
-        base = base_name(s)
-        if base in known:
-            m = _LADDER_RE.search(s)
-            tint = _LADDER_TINT.get(m.group(1), 0.0) if m else 0.0
-            if s.endswith("+Tier"):
-                tint = max(tint, 0.45)
-            out[s] = (mpl.colors.to_hex(blend_to_white(known[base], tint))
-                      if tint > 0 else known[base])
-        else:
-            out[s] = FALLBACK_CYCLE[spare % len(FALLBACK_CYCLE)]
-            spare += 1
-    return out
-
-
 def panel_order(rows, panel, known):
     """Arms of one panel: the published order first, then any new name.
 
@@ -135,7 +122,7 @@ def panel_order(rows, panel, known):
 
     @param rows Raw CSV rows.
     @param panel "a" or "b".
-    @param known Published palette for that panel; its key order is canonical.
+    @param known Canonical arm order for that panel (ORDER_A / ORDER_B).
     @return Arm labels in plotting order.
     """
     seen = []
@@ -163,14 +150,17 @@ def workload_order(rows):
     head = [w for w in WORKLOAD_ORDER if w in seen]
     return head + [w for w in seen if w not in head]
 
-# The single figure carries both panels, so every bar needs its own colour: the
-# panel (b) palette above deliberately reuses (a)'s hues. Panel (b)'s NeuroPress
-# is no longer a duplicate: panel (b) now runs each codec both ways.
-# External bars are outlined.
-COLORS_B_SINGLE = {"Best fixed nvCOMP": "#08519c", "Best fixed nvCOMP+Tier": "#6baed6",
-                   "ndzip": "#b15928", "ndzip+Tier": "#dbdb8d",
-                   "cuSZp3": "#006d2c", "cuSZp3+Tier": "#a1d99b",
-                   "cuSZ": "#252525", "cuSZ+Tier": "#969696"}
+# Left-to-right order on the combined figure: Baseline, the external codecs as
+# plain/+Tier pairs, then nvCOMP -- the fixed-codec reference NeuroPress is
+# measured against -- directly before the NeuroPress arms, which follow in the
+# ablation's own order. Each entry is (panel, arm label). Panel (b)'s own
+# NeuroPress arms stay off it: panel (a)'s ladder already carries NeuroPress.
+SINGLE_ORDER = [("a", "Baseline"),
+                ("b", "ndzip"), ("b", "ndzip+Tier"),
+                ("b", "cuSZ"), ("b", "cuSZ+Tier"),
+                ("b", "cuSZp3"), ("b", "cuSZp3+Tier"),
+                ("a", "nvCOMP"), ("a", "nvCOMP+Tier"),
+                ("b", "Best fixed nvCOMP"), ("b", "Best fixed nvCOMP+Tier")]
 # The error bound of every arm comes from the CSV's `eb` column. It used to
 # have a hardcoded fallback table here, which is what the legend actually read:
 # the lookup meant to consult the data unpacked the index key in the wrong
@@ -305,130 +295,249 @@ def reductions(D, workloads, order_a, order_b):
         print(f"  {w:<8} " + ",  ".join(parts))
     print()
 
-
 # ----------------------------------------------------------------------------
-# PLOTTING
+# PLOTTING -- one chart, the workloads' groups lined up left to right
 # ----------------------------------------------------------------------------
-def draw_panel(ax, D, panel, order, colors, warn_total_only, ylim, dec,
-               workloads, show_ratio=False):
-    """Draw one group of bars per workload, one bar per arm.
+def arm_style(s, spare):
+    """Fill colour and tier flag of one arm.
 
-    @param workloads Workload names, left to right; one x-tick each.
-    @return True if anything was drawn; False for an empty arm list, which a
-      `--panel a` run produces for panel (b) -- the CSV then has no rows of
-      that panel at all.
+    @param s Arm label exactly as the CSV spells it.
+    @param spare Fallback assignments shared across calls, so an arm no table
+      entry names keeps one colour in every figure of the run.
+    @return (fill hex, tiered) -- a tiered arm is drawn hatched.
     """
-    nb = len(order)
-    if nb == 0 or not workloads:
-        return False
-    # Vertical labels are wider than the bar pitch once the ratio is appended.
-    # Spread them over ROWS interleaved baselines so no two neighbours share one:
-    # 14 arms per group need 3 rows; 2 still collided.
-    # A rotated 7 pt label is ~28 px wide against a ~21 px bar pitch, so
-    # neighbours collide however short the text is. Interleave their baselines:
-    # 3 rows when the ratio doubles the length, 2 for a time-only label.
-    # A rotated label is wider than the bar pitch, so neighbours are given
-    # interleaved baselines. The combined axis carries both panels -- 17 arms
-    # with the external +Tier pairs -- and two rows is not enough there.
-    # >13, not >12: the published combined axis is exactly 13 arms (9 ablation
-    # + 4 externals) and staggers over 2 rows. Adding the external +Tier pairs
-    # takes it to 17, which needs a third row.
-    rows = (3 if nb > 10 else 2) if show_ratio else (3 if nb > 13 else
-                                                    (2 if nb > 6 else 1))
-    width = (1.0 - BAR_PAD) / nb
-    x0 = np.arange(len(workloads))
+    tiered = "+Tier" in s
+    for key in (s, _LADDER_RE.sub("", s), base_name(s)):
+        if key in ARM_COLORS:
+            return ARM_COLORS[key], tiered
+    if s not in spare:
+        spare[s] = FALLBACK_COLORS[len(spare) % len(FALLBACK_COLORS)]
+    return spare[s], tiered
 
-    # A workload with NO measured arm gets ONE centred marker rather than a
-    # "TBD" per bar: at 17 arms those overlap into an illegible band, and the
-    # message is about the workload, not about each arm of it.
-    def _measured(w):
-        for it in order:
-            pp, ss = it if isinstance(it, tuple) else (panel, it)
-            if D.get((pp, ss, w), {}).get("total") is not None:
-                return True
-        return False
-    blank = {w for w in workloads if not _measured(w)}
+
+def eps_text(e):
+    """Mathtext for one error bound: 10^k when it is a power of ten.
+
+    @param e Absolute error bound, > 0.
+    @return A mathtext string such as $\\varepsilon = 10^{-3}$.
+    """
+    k = math.log10(e)
+    return (rf"$\varepsilon = 10^{{{round(k)}}}$" if abs(k - round(k)) < 1e-9
+            else rf"$\varepsilon = {e:g}$")
+
+
+def lossy_bounds(D):
+    """Every distinct non-zero bound a lossy arm ran at, ascending.
+
+    @param D Indexed rows from index().
+    @return Sorted list of bounds; empty when every arm was lossless.
+    """
+    return sorted({d["eb"] for (_, s, _), d in D.items()
+                   if (d.get("eb") or 0) > 0 and base_name(s) not in LOSSLESS_BASES})
+
+
+def arm_label(s, D):
+    """Legend text for one arm.
+
+    One bound across the run: a dagger marks the lossy arms and the key under
+    the grid states the bound once. Several bounds (an older ladder campaign):
+    each lossy arm carries its own bound instead.
+
+    @param s Arm label as the CSV spells it.
+    @param D Indexed rows from index().
+    @return The label to print.
+    """
+    name = _LADDER_RE.sub("", s)
+    if base_name(s) in LOSSLESS_BASES:
+        return name
+    ebs = sorted({d["eb"] for (_, s_, _), d in D.items()
+                  if s_ == s and (d.get("eb") or 0) > 0})
+    if not ebs:
+        return name
+    return f"{name} †" if len(lossy_bounds(D)) == 1 else f"{name}, {eps_text(ebs[0])}"
+
+
+def label_size(nmax, n_groups):
+    """Value-label font size that fits one upright label per bar.
+
+    Every group gets 1/n of the axes width and GROUP_W of that for bars, so a
+    bar's slot is known before anything is drawn. An upright label is about
+    0.8 em thick; it is kept inside 90% of the slot so neighbours never touch.
+
+    @param nmax Slots per group: the most arms any workload in the figure has.
+    @param n_groups Number of workload groups on the axis.
+    @return Font size in points, at most FS_VAL.
+    """
+    axes_pt = FIG_W * (AX_RIGHT - AX_LEFT) * 72.0
+    slot_pt = axes_pt / n_groups * GROUP_W / nmax
+    return min(FS_VAL, math.floor(slot_pt * 0.9 / 0.80 * 2) / 2)
+
+
+def draw_bars(ax, D, items, workloads, nmax, ylim, dec, fs, spare, warn):
+    """Every workload's bars on one axis, one group per workload.
+
+    A group holds only the arms with a row for that workload, packed and
+    centred, so an arm it never runs leaves no gap; an arm with a row but no
+    total was meant to run and did not, and keeps its slot marked TBD. Each
+    value label stands upright on its own bar's centre line, so it cannot
+    reach a neighbour however tall the bars are.
+
+    @param ax Axes to draw on.
+    @param D Indexed rows from index().
+    @param items (panel, arm) pairs in plotting order.
+    @param workloads Workload names, left to right.
+    @param nmax Slots per group.
+    @param ylim Y-axis limit, minutes.
+    @param dec Decimals on the value labels.
+    @param fs Value-label font size, from label_size().
+    @param spare Fallback-colour assignments, shared across figures.
+    @param warn Collects arms that had a total but no compute/I-O split.
+    """
+    slot = GROUP_W / nmax
     for j, w in enumerate(workloads):
-        if w in blank:
-            ax.text(x0[j], ylim * 0.02, "not measured", ha="center",
-                    va="bottom", fontsize=FS_VAL, color="0.55")
-
-    for i, item in enumerate(order):
-        # An entry is a strategy, or (panel, strategy) when one axis carries both.
-        p, s = item if isinstance(item, tuple) else (panel, item)
-        col = colors[s]
-        pale = blend_to_white(col, IO_BLEND)
-        # Mark the external codecs when they share an axis with the ablation.
-        edge = "black" if isinstance(item, tuple) and p == "b" else "white"
-        for j, w in enumerate(workloads):
-            x = x0[j] - (1.0 - BAR_PAD) / 2 + width * (i + 0.5)
-            d = D.get((p, s, w), {})
-            total = d.get("total")
-
-            # Not measured yet: leave the slot empty but keep its width, so the
-            # layout is identical once the number arrives. A per-bar marker is
-            # only drawn when SOME arm of this workload was measured -- a wholly
-            # unmeasured workload already carries one centred label above.
+        present = [it for it in items if it + (w,) in D]
+        start = j - len(present) * slot / 2.0
+        for k, (p, s) in enumerate(present):
+            d, x = D[(p, s, w)], start + slot * (k + 0.5)
+            col, tiered = arm_style(s, spare)
+            total, comp = d.get("total"), d.get("compute")
             if total is None:
-                if w not in blank:
-                    ax.text(x, ylim * 0.01, "TBD", ha="center", va="bottom",
-                            fontsize=FS_VAL - 1, color="0.55", rotation=90)
+                ax.text(x, ylim * 0.01, "TBD", ha="center", va="bottom",
+                        rotation=90, fontsize=fs, color=INK_MUTED)
                 continue
-
-            comp, io = d.get("compute"), d.get("io")
-            label = f"{total:.{dec}f}"
-            r = d.get("ratio")
-            if show_ratio and r is not None:
-                label += f" ({r:.0f}\u00d7)" if r >= 10 else f" ({r:.1f}\u00d7)"
-            drawn = min(total, ylim)        # clipped bars stop at the limit
+            drawn = min(total, ylim)
+            if comp is None:
+                warn.append(f"{p}/{w}/{s}")  # no split: one solid segment
+            solid = drawn if comp is None else min(comp, drawn)
+            ax.bar(x, solid, width=slot * BAR_W, color=col, edgecolor="white",
+                   linewidth=0, hatch=TIER_HATCH if tiered else None, zorder=3)
+            if drawn > solid:
+                ax.bar(x, drawn - solid, bottom=solid, width=slot * BAR_W,
+                       linewidth=0, color=blend_to_white(col, IO_BLEND), zorder=3)
             clipped = total > ylim
-
-            if comp is None or io is None:
-                # Total only -- no split available. Hatch it so the figure never
-                # implies a compute/I-O breakdown that was not measured.
-                ax.bar(x, drawn, width=width * 0.92, color=col,
-                       edgecolor=edge, linewidth=0.4, hatch="////", zorder=3)
-                warn_total_only.append(f"{p}/{w}/{s}")
-            else:
-                cdraw = min(comp, drawn)
-                ax.bar(x, cdraw, width=width * 0.92, color=col,
-                       edgecolor=edge, linewidth=0.4, zorder=3)
-                ax.bar(x, max(drawn - cdraw, 0.0), bottom=cdraw, width=width * 0.92,
-                       color=pale, edgecolor=edge, linewidth=0.4, zorder=3)
-
-            if d.get("std") is not None and not clipped:
-                ax.errorbar(x, total, yerr=d["std"], ecolor="black",
-                            elinewidth=0.7, capsize=1.6, capthick=0.7, zorder=5)
-
-            if clipped:
-                # Two diagonal white slashes: the axis-break convention.
-                for dy in (ylim * 0.025, ylim * 0.046):
-                    ax.plot([x - width * 0.46, x + width * 0.46],
-                            [drawn - dy - ylim * 0.011, drawn - dy + ylim * 0.011],
-                            color="white", lw=1.1, solid_capstyle="butt",
-                            zorder=6, clip_on=False)
-
-            if clipped:
-                # Printed inside the axes: a clipped bar already reaches the
-                # top, so a label above it would collide with the panel above.
-                ax.text(x, ylim * 0.98, label, ha="center", va="top",
-                        rotation=90, fontsize=FS_VAL, zorder=7,
-                        bbox=dict(boxstyle="square,pad=0.08", fc="white",
-                                  ec="none", alpha=0.85))
-            else:
-                lift = ylim * (0.012 + (0.075 if show_ratio else 0.055) * (i % rows))
-                ax.text(x, drawn + lift, label, ha="center",
-                        va="bottom", rotation=90, fontsize=FS_VAL, zorder=7)
-
-    ax.set_xticks(x0)
+            ax.annotate(f"{total:.{dec}f}", (x, drawn),
+                        xytext=(0, -1.5 if clipped else 1.5),
+                        textcoords="offset points", ha="center",
+                        va="top" if clipped else "bottom", rotation=90,
+                        fontsize=fs, color="white" if clipped else INK, zorder=6)
     ax.set_xlim(-0.5, len(workloads) - 0.5)
     ax.set_ylim(0, ylim)
+    ax.set_xticks(range(len(workloads)))
+    ax.set_xticklabels(workloads, fontsize=FS_TITLE, color=INK)
+    ax.tick_params(axis="x", length=0, pad=4)
+    ax.tick_params(axis="y", labelsize=FS_TICK, colors=INK_MUTED, width=0.6,
+                   length=2.5)
+    ax.set_ylabel("Total wall-clock time (min)", fontsize=FS_TICK, color=INK)
+    ax.grid(axis="y", color=GRID, linewidth=0.6, zorder=0)
     ax.set_axisbelow(True)
-    ax.grid(axis="y", linestyle=":", linewidth=0.5, color="0.75", zorder=0)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.tick_params(labelsize=FS_TICK)
-    return True
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(INK_MUTED)
+        ax.spines[side].set_linewidth(0.6)
+
+
+def draw_legend(fig, ax, D, items, spare, title):
+    """The arm legend, spread across the full width above the plot.
+
+    @param fig The figure.
+    @param ax The plot axes; the legend sits on its top edge.
+    @param D Indexed rows from index().
+    @param items (panel, arm) pairs in plotting order.
+    @param spare Fallback-colour assignments, shared across figures.
+    @param title Figure name printed over the entries, or None for none.
+    """
+    handles = []
+    for _, s in items:
+        col, tiered = arm_style(s, spare)
+        handles.append(Patch(facecolor=col, edgecolor="white", linewidth=0,
+                             hatch=TIER_HATCH if tiered else None,
+                             label=arm_label(s, D)))
+    leg = ax.legend(handles=handles, loc="lower left", mode="expand",
+                    bbox_to_anchor=(0.0, 1.03, 1.0, 0.0), borderaxespad=0,
+                    ncol=min(LEGEND_COLS, len(handles)), frameon=False,
+                    fontsize=FS_LEG, handlelength=1.5, handleheight=1.1,
+                    columnspacing=1.0, labelspacing=0.45, title=title,
+                    title_fontsize=FS_TITLE, alignment="left")
+    for t in leg.get_texts():
+        t.set_color(INK)
+    leg.get_title().set_color(INK)
+
+
+def draw_key(fig, D):
+    """One line under the axis: what a bar's parts, its hatching and the
+    dagger mean.
+
+    @param fig The figure.
+    @param D Indexed rows from index(), for the error bound.
+    """
+    key = [Patch(facecolor=KEY_GREY, linewidth=0, label="write loop"),
+           Patch(facecolor=blend_to_white(KEY_GREY, IO_BLEND), linewidth=0,
+                 label="input read + final flush"),
+           Patch(facecolor=KEY_GREY, edgecolor="white", linewidth=0,
+                 hatch=TIER_HATCH, label="+Tier: RAM tier over NVMe")]
+    ebs = lossy_bounds(D)
+    if len(ebs) == 1:
+        # Text only: an invisible swatch keeps it spaced like its neighbours.
+        key.append(Patch(facecolor="none", edgecolor="none",
+                         label=f"\u2020 lossy, {eps_text(ebs[0])}"))
+    leg = fig.legend(handles=key, loc="lower left", borderaxespad=0,
+                     bbox_to_anchor=(AX_LEFT - 0.01, 0.01), ncol=len(key),
+                     frameon=False, fontsize=FS_LEG, handlelength=1.5,
+                     handleheight=1.1, columnspacing=1.6)
+    for t in leg.get_texts():
+        t.set_color(INK)
+
+
+def render_single(path, D, items, workloads, ylim, dec, spare, warn, title):
+    """One chart: every workload's group of bars lined up left to right.
+
+    @param path Output PNG path.
+    @param D Indexed rows from index().
+    @param items (panel, arm) pairs in plotting order.
+    @param workloads Workload names, left to right.
+    @param ylim Y-axis limit, minutes.
+    @param dec Decimals on the value labels.
+    @param spare Fallback-colour assignments, shared across figures.
+    @param warn Collects arms that had a total but no compute/I-O split.
+    @param title Figure name printed over the legend, or None for none.
+    @return The value-label font size used.
+    """
+    nmax = max(sum(1 for it in items if it + (w,) in D) for w in workloads)
+    fs = label_size(nmax, len(workloads))
+    legend_rows = math.ceil(len(items) / LEGEND_COLS)
+    top_h = (0.30 if title else 0.12) + 0.19 * legend_rows
+    height = PLOT_H + top_h + KEY_H
+    fig, ax = plt.subplots(figsize=(FIG_W, height))
+    fig.subplots_adjust(left=AX_LEFT, right=AX_RIGHT, bottom=KEY_H / height,
+                        top=1.0 - top_h / height)
+    draw_bars(ax, D, items, workloads, nmax, ylim, dec, fs, spare, warn)
+    draw_legend(fig, ax, D, items, spare, title)
+    draw_key(fig, D)
+    fig.savefig(path, dpi=300, facecolor="white", bbox_inches="tight",
+                pad_inches=0.04)
+    plt.close(fig)
+    return fs
+
+
+def pick_ylim(D, forced):
+    """The shared y limit and the value-label precision.
+
+    @param D Indexed rows from index().
+    @param forced --ylim from the command line, or None.
+    @return (ylim in minutes, decimals for the value labels).
+    """
+    totals = [d["total"] for d in D.values() if d["total"] is not None]
+    dmax = max(totals) if totals else Y_CLIP
+    if forced is not None:
+        ylim = forced
+    else:
+        ylim = dmax * HEADROOM
+        if dmax < Y_CLIP * Y_AUTO_BELOW:
+            print(f"note: max total {dmax:.4g} min is far below the {Y_CLIP:g} "
+                  f"min paper limit; y-axis fitted to {ylim:.4g}. Pass --ylim "
+                  "to override.\n")
+    return ylim, (1 if ylim >= 2 else (2 if ylim >= 0.3 else 3))
 
 
 def main():
@@ -442,169 +551,54 @@ def main():
                     help="write an empty CSV with just the header and exit")
     ap.add_argument("--out", default="figures", help="output directory (default: figures)")
     ap.add_argument("--ylim", type=float, default=None,
-                    help=f"y-axis limit in MINUTES (default: {Y_CLIP:g}, auto-rescaled "
-                         "when the data is far below it, e.g. a smoke run)")
+                    help="y-axis limit in MINUTES (default: fitted to the data)")
     args = ap.parse_args()
 
     if args.write_template:
         os.makedirs(os.path.dirname(os.path.abspath(args.write_template)) or ".", exist_ok=True)
         with open(args.write_template, "w", newline="") as fh:
-            wtr = csv.DictWriter(fh, fieldnames=FIELDS)
-            wtr.writeheader()
+            csv.DictWriter(fh, fieldnames=FIELDS).writeheader()
         print(f"wrote template: {args.write_template}")
         return 0
-
-    # No measured CSV, no figure. The previous version fell back to a table of
-    # numbers read off the published PNG, so a bare invocation produced a
-    # complete, plausible Figure 9 out of nothing.
+    # No measured CSV, no figure. An older version fell back to numbers read
+    # off the published PNG, so a bare invocation drew a plausible Figure 9
+    # out of nothing.
     if not args.csv:
         print("error: --csv is required (pass figure_9.sh's fig9.csv; repeat "
               "the flag to merge one CSV per workload)", file=sys.stderr)
         return 2
     rows = [r for c in args.csv for r in load(c)]
     D, _ = index(rows)
-    # The CSVs are already in minutes, and so is the figure -- no conversion.
-
-    # Arms, workloads and colours all come from the rows just read.
     workloads = workload_order(rows)
-    order_a = panel_order(rows, "a", COLORS_A)
-    order_b = panel_order(rows, "b", COLORS_B)
-    colors_a = build_palette(order_a, COLORS_A)
-    colors_b = build_palette(order_b, COLORS_B)
-    # The combined figure needs a distinct hue per bar, so panel (b) is redrawn
-    # from its own palette there; an arm with no entry keeps its panel colour.
-    order_single = ([("a", s) for s in order_a] +
-                    [("b", s) for s in order_b
-                     if s in COLORS_B_SINGLE or base_name(s) in COLORS_B_SINGLE])
-    colors_single = {**colors_a,
-                     **build_palette([s for pan, s in order_single if pan == "b"],
-                                     COLORS_B_SINGLE)}
+    order_a = panel_order(rows, "a", ORDER_A)
+    order_b = panel_order(rows, "b", ORDER_B)
+    single = ([("a", s) for s in order_a] +
+              [("b", s) for s in order_b if base_name(s) != "NeuroPress"])
+    single = ([x for x in SINGLE_ORDER if x in single] +
+              [x for x in single if x not in SINGLE_ORDER])
 
-    mpl.rcParams["font.family"] = "serif"
-    mpl.rcParams["font.serif"] = ["Times New Roman", "STIXGeneral", "DejaVu Serif"]
-    mpl.rcParams["mathtext.fontset"] = "stix"
-    mpl.rcParams["pdf.fonttype"] = 42
-    mpl.rcParams["ps.fonttype"] = 42
-
-    totals = [d["total"] for d in D.values() if d["total"] is not None]
-    dmax = max(totals) if totals else Y_CLIP
-    if args.ylim is not None:
-        ylim = args.ylim
-    elif dmax < Y_CLIP * Y_AUTO_BELOW:
-        ylim = dmax * 1.52          # smoke-scale data: show it, do not clip it
-                                    # (1.52, not 1.28: the ratio makes the
-                                    #  vertical bar labels about twice as long,
-                                    #  and they are staggered over two rows)
-        print(f"note: max total {dmax:.4g} min is far below the {Y_CLIP:g} min "
-              f"paper limit; y-axis rescaled to {ylim:.4g}. Pass --ylim to override.\n")
-    else:
-        # Fit the data rather than clip it: at full scale WarpX reaches 8.6 min,
-        # so the 6.5 min paper limit truncated five bars and pushed their labels
-        # into the legend. --ylim still forces a fixed limit for the paper.
-        ylim = dmax * 1.30          # time-only labels need little headroom
-    dec = 1 if ylim >= 2 else (2 if ylim >= 0.3 else 3)
-
-    def eps(e):
-        k = math.log10(e)
-        return (rf"$\varepsilon = 10^{{{round(k)}}}$" if abs(k - round(k)) < 1e-9
-                else rf"$\varepsilon = {e:g}$")
-
-    def legend_label(s):
-        """The arm's legend text, with the bound it actually ran at.
-
-        The key order is (panel, strategy, workload) -- the previous version
-        unpacked it as (panel, workload, strategy), so the match never fired
-        and every bound came from a hardcoded table instead of the run.
-        """
-        if base_name(s) in LOSSLESS_BASES:
-            return f"{s} (lossless)"
-        seen = [d["eb"] for (p_, s_, w_), d in D.items()
-                if s_ == s and d.get("eb")]
-        # With the bound appended the (low)/(med)/(high) suffix is redundant --
-        # epsilon is what tells the ladder steps apart -- so it is dropped, as
-        # the published legend does. Without a bound it is all there is, so it
-        # stays.
-        return f"{_LADDER_RE.sub('', s)}, {eps(seen[0])}" if seen else s
-
-    # One figure per panel, on the same y-axis so the two stay comparable.
+    mpl.rcParams.update({"font.family": "serif",
+                         "font.serif": ["Times New Roman", "STIXGeneral", "DejaVu Serif"],
+                         "mathtext.fontset": "stix", "hatch.linewidth": 0.7,
+                         "hatch.color": "white", "pdf.fonttype": 42,
+                         "ps.fonttype": 42})
+    ylim, dec = pick_ylim(D, args.ylim)
     os.makedirs(args.out, exist_ok=True)
-    warn_total_only, pngs = [], []
-    for panel, order, colors, height, title, name in (
-            ("a", order_a, colors_a, 2.3,
-             "(a) Ablation  --  each bar is a separate run; lossless unless $\\varepsilon$ is shown",
-             "fig9a_ablation.png"),
-            ("b", order_b, colors_b, 2.0, "(b) External baselines",
-             "fig9b_baselines.png")):
-        if not order:
-            # `--panel a` / `--panel b` writes only its own rows, so the other
-            # panel has no arms. Skip it instead of drawing an empty axis.
-            print(f"note: no panel ({panel}) rows in the CSV; {name} not written")
+    spare, warn, pngs = {}, [], []
+    for items, title, name in (
+            ([("a", s) for s in order_a], "(a) Ablation", "fig9a_ablation.png"),
+            ([("b", s) for s in order_b], "(b) External baselines", "fig9b_baselines.png"),
+            (single, None, "fig9.png")):
+        if not items:
+            print(f"note: no rows for {name}; not written")
             continue
-        fig, ax = plt.subplots(figsize=(FIG_W, height))
-        draw_panel(ax, D, panel, order, colors, warn_total_only, ylim, dec,
-                   workloads)
-        ax.set_ylabel("Total wall-clock time (min)", fontsize=FS_AXIS)
-        ax.set_xticks(np.arange(len(workloads)))
-        ax.set_xticklabels(workloads, fontsize=FS_TICK)
-        fig.subplots_adjust(top=0.99)
-        # At most 4 columns: the arm legend and the segment key below share one
-        # line, and a 5-column row of bound-annotated labels ran under the key.
-        fig.legend(handles=[Patch(facecolor=colors[s_], label=legend_label(s_)) for s_ in order],
-                   loc="lower left", bbox_to_anchor=(0.005, 0.995),
-                   ncol=3 if panel == "a" else min(4, len(order)),
-                   fontsize=FS_LEG, frameon=False, handlelength=1.3, handleheight=0.9,
-                   columnspacing=1.0, labelspacing=0.35, title=title,
-                   title_fontsize=FS_LEG, alignment="left")
-        # Segment key in neutral gray: a convention, not a strategy.
-        fig.legend(handles=[Patch(facecolor="#808080", label="Write loop: stats, NN, quantize, codec,\n"
-                              "tier put, setup, scheduling"),
-                            Patch(facecolor=blend_to_white("#808080", IO_BLEND),
-                                  label="Input read + final flush")],
-                   loc="lower right", bbox_to_anchor=(0.998, 0.995), ncol=1,
-                   fontsize=FS_LEG, frameon=False, handlelength=1.3, handleheight=0.9)
         pngs.append(os.path.join(args.out, name))
-        fig.savefig(pngs[-1], dpi=300, bbox_inches="tight")
-        plt.close(fig)
-
-    # The same data as one figure: the ablation and the external codecs on one
-    # axis, so every arm is read against the same bars.
-    if not order_single:
-        print("note: nothing to plot on the combined axis")
-        sanity(D, workloads, order_a)
-        reductions(D, workloads, order_a, order_b)
-        print("wrote " + (", ".join(pngs) if pngs else "nothing"))
-        return 0
-    fig, ax = plt.subplots(figsize=(FIG_W, 3.6))
-    draw_panel(ax, D, None, order_single, colors_single, warn_total_only, ylim,
-               dec, workloads)
-    ax.set_ylabel("Total wall-clock time (min)", fontsize=FS_AXIS)
-    ax.set_xticks(np.arange(len(workloads)))
-    ax.set_xticklabels(workloads, fontsize=FS_TICK)
-    fig.subplots_adjust(top=0.99)
-    fig.legend(handles=[Patch(facecolor=colors_single[s_], label=legend_label(s_),
-                              edgecolor="black" if p_ == "b" else "white", linewidth=0.5)
-                        for p_, s_ in order_single],
-               loc="lower left", bbox_to_anchor=(0.005, 0.995), ncol=3,
-               fontsize=FS_LEG, frameon=False, handlelength=1.3, handleheight=0.9,
-               columnspacing=1.0, labelspacing=0.35,
-               title="Each bar is a separate run; lossless unless $\\varepsilon$ is shown; "
-                     "outlined = external codec\n"
-                     "Solid = the measured write loop; light = the input read and final flush.\n"
-                     "EXCLUDED: H2D staging, and simulate time for LAMMPS",
-               title_fontsize=FS_LEG, alignment="left")
-    fig.legend(handles=[Patch(facecolor="#808080", label="Write loop: stats, NN, quantize, codec,\n"
-                              "tier put, setup, scheduling"),
-                        Patch(facecolor=blend_to_white("#808080", IO_BLEND),
-                              label="Input read + final flush")],
-               loc="lower right", bbox_to_anchor=(0.998, 0.995), ncol=1,
-               fontsize=FS_LEG, frameon=False, handlelength=1.3, handleheight=0.9)
-    pngs.append(os.path.join(args.out, "fig9.png"))
-    fig.savefig(pngs[-1], dpi=300, bbox_inches="tight")
-    plt.close(fig)
-
-    if warn_total_only:
-        print(f"WARNING: {len(warn_total_only)} bar(s) had a total but no "
-              f"compute/I-O split; drawn hatched: {', '.join(warn_total_only)}\n")
+        fs = render_single(pngs[-1], D, items, workloads, ylim, dec, spare, warn, title)
+        if fs < FS_VAL:
+            print(f"note: {name}: value labels at {fs:g} pt so one fits on every bar")
+    if warn:
+        print(f"WARNING: {len(warn)} bar(s) had a total but no compute/I-O "
+              f"split; drawn as one segment: {', '.join(sorted(set(warn)))}\n")
     sanity(D, workloads, order_a)
     reductions(D, workloads, order_a, order_b)
     print("wrote " + ", ".join(pngs))

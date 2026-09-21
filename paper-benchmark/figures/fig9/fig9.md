@@ -13,7 +13,7 @@ here.
 
 This figure is a *device* measurement, and its arms are pinned to Delta's two
 storage classes: untiered arms write tier 1 to `/work/hdd/<acct>` (the PFS),
-`+Tier` arms spill tier 2 to `/work/nvme/<acct>`. The account is discovered from
+`+Tier` arms spill tier 2 to the compute node's own NVMe (`/tmp`). The account is discovered from
 a `delta_<acct>` group with a matching `/work/hdd/<acct>`, so on Chameleon
 `CLIO_ACCT` resolves empty, neither root exists, and `require_root` exits 4
 before the first arm.
@@ -34,7 +34,18 @@ and no GPU, which is why that is the piece pushed for Chameleon.
 ```bash
 ./figure_9.sh -w nyx -s full            # one workload, all arms
 ./figure_9.sh -w nyx -s smoke --dry-run # print the arm set and stop
+SMOKE_GB=2 ./figure_9.sh -w nyx -s smoke   # a smaller smoke payload
 ```
+
+`-s smoke` replays `SMOKE_GB` GiB (default 4), `-s full` the whole dump. The
+smoke size is a **byte budget, not a file count**: the five dumps differ 40x in
+file size -- 8 MiB for VPIC/Nyx/WarpX/LAMMPS against a whole 327 MiB tensor for
+AI -- so the older fixed `--max-files 60` replayed 480 MiB of one workload and
+655 MiB of another, and AI needed a hardcoded override of its own. The budget is
+filled in the order the driver replays (sorted by path), a dump smaller than it
+replays whole, and `MAXF` still overrides either size. Each arm reads that
+payload once, so a run reads `SMOKE_GB` x 17 arms, plus one untimed `warm_cache`
+pass.
 
 Each run writes, under `--out`:
 
@@ -47,6 +58,25 @@ Each run writes, under `--out`:
 Merge per-workload runs by repeating the flag:
 `plot_fig9.py --csv nyx.csv --csv vpic.csv ...`. A blank row never replaces a
 measured one, so the order does not matter.
+
+**AI runs lossless only.** An AI checkpoint is model weights, not a simulation
+field, so there is no error budget to spend and the figure offers it no lossy
+point: its panel (a) ladder stops before the lossy rung and its panel (b) runs
+at `eb=0`, which leaves it **12 arms** against the other workloads' 17. cuSZ and
+cuSZp3 are dropped from it entirely rather than run at `eb=0` -- they are
+error-bounded codecs with no lossless mode, so a "lossless cuSZ" arm would not
+be the codec the label promises. The rule lives in `LOSSLESS_ONLY_WORKLOADS`
+(default `AI`) and is applied per workload, including to the TBD rows a run
+writes for the other four, so a merged CSV never shows AI a column of lossy bars
+marked TBD that were never going to run. At `eb=0` panel (b)'s `Best fixed
+nvCOMP` and `NeuroPress` repeat panel (a)'s `nvCOMP` and `NP only` -- the same
+measurement drawn in both panels.
+
+**Caveat for a merged figure.** `plot_fig9.py` takes an arm's legend bound from
+the first non-zero `eb` it finds for that label across ALL workloads, so in a
+merged plot `NeuroPress` is labelled with the simulation workloads' bound while
+AI's bar of that name is lossless. Plot AI separately, or read its bounds from
+`arms.csv`, until the legend is made per-workload.
 
 **17 arms.** Panel (a) is the ablation ladder ending in ONE lossy arm at
 `EB_LOW` (1e-3); an earlier version swept a 1e-3/1e-2/1e-1 ladder across three
@@ -84,7 +114,7 @@ durable file's size and allocated bytes per arm, so "the untiered arms went to
 the PFS" is a measurement rather than a claim.
 
 **Defaults and why.** `PFS_ROOT` is `/work/hdd/<acct>/<user>/fig9-pfs` and
-`NVME_ROOT` is `/work/nvme/<acct>/<user>/fig9-nvme`; `<acct>` comes from the
+`NVME_ROOT` is `/tmp/fig9-nvme-<jobid>`, the node's own NVMe; `<acct>` comes from the
 `delta_<acct>` group that has a matching `/work/hdd/<acct>`, so nothing is
 hardcoded to one user. Override either, or set `CLIO_ACCT`.
 
@@ -96,10 +126,20 @@ arms therefore had the *fastest* durable device and the `+Tier` arms the
 slowest — the opposite of the ablation's premise, and an understatement of what
 tiering buys.
 
-Note that `/work/nvme` is NVMe **media behind Lustre**, reached over the
-network, not node-local NVMe. On a compute node `/tmp` is node-local NVMe, so
-`NVME_ROOT=/tmp/fig9-$SLURM_JOB_ID` gives the sharper device contrast; the
-default stays on `/work/nvme` because it survives the job.
+**Tier 2 is the node's own NVMe, never NVMe over the network.** `/work/nvme`
+is SSD media behind Lustre (pool `ddn_ssd`, while `/work/hdd` is pool
+`ddn_hdd`), reached over the network. On a Delta GPU node `/tmp` is a local
+NVMe drive private to the job: `nvme0n1` (MZXL51T6HBJR), xfs, 1.5 TB, no quota,
+**1.2 GB/s** durable write (3 × 2 GiB, `conv=fdatasync`, job 22274732) against
+434–502 MB/s for `/work/nvme`. `/tmp` is wiped when the job ends, which costs
+nothing: each tier image is deleted as soon as its arm is measured, and results
+live under `--out`. `require_local_tier2` refuses a network filesystem
+(Lustre, NFS, GPFS, ...) as tier 2 and exits 4; set `ALLOW_NETWORK_TIER2=1` only
+to reproduce the older network-NVMe runs. Every job log's header names the
+filesystem and device each root resolved to.
+
+Campaigns before 2026-09-21 put tier 2 on `/work/nvme`; their `+Tier` bars
+measure NVMe over the network, and `run.json`'s `nvme_root` records which.
 
 ## What the segments mean
 
@@ -164,11 +204,11 @@ Measured 2026-09-19/20 on Delta, and worth knowing before submitting:
   own `node_state` reads `/proc/meminfo`, which reports the NODE's free memory
   and is blind to the cgroup limit — it will cheerfully print `memavail=196 GB`
   while the job dies at 16.
-- **Watch the project quota.** `/work/hdd` and `/work/nvme` are one Lustre
-  filesystem sharing one project quota. Each untiered arm writes a tier the size
-  of the payload, and an arm that is SIGKILLed never reaches `run_arm`'s cleanup,
-  so 30 GB orphans accumulate under `PFS_ROOT`. Setting `NVME_ROOT=/tmp/...`
-  keeps the tiered arms off the quota entirely.
+- **Watch the project quota.** `/work/hdd` sits on one project quota. Each
+  untiered arm writes a tier the size of the payload, and an arm that is
+  SIGKILLed never reaches `run_arm`'s cleanup, so 30 GB orphans accumulate under
+  `PFS_ROOT`. The tiered arms are off the quota entirely: their tier 2 is the
+  node's `/tmp`.
 
 ## Caveats to carry into any claim
 
