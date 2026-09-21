@@ -36,6 +36,11 @@ core.
 | kmeans    | PASS   | `--data-mb 256 --hbm-mb 128`: 4874 faults/rank, kernel 574 ms at 0.87 GB/s, checksum matching single-node (bound: past the 90 s cap after (5)-(7)); 64 MB/node: 33 ms per iteration against 65 ms on one node |
 | lammps_md | PASS   | `--lattice 28 --steps 10`: ballistic gate bitwise on both ranks, 320 page iterations each (its own slab), 0 faults; 94 ms for 10 steps (164 ms while every node integrated the whole lattice, see (11)) |
 
+All six re-verified on two nodes after (12), every binary rebuilt on the
+final `device_vector.h`: gmx, lbann, weights (26-29 ms, same checksum),
+grayscott (139 ms, 14.4 GB/s, same v_checksum), kmeans (582 ms, both
+ranks 30719.999645) and lammps_md (bitwise, 90 ms) all PASS.
+
 ### Storage tiers on Flare and DAOS
 
 `pbs_newcoro_aurora_2n_tier.sh` and `submit_tier_all_aurora.sh`: 16 GB
