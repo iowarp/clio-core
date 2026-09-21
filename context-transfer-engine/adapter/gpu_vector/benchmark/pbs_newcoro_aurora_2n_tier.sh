@@ -55,6 +55,7 @@ test -x "${EXE}" || { echo "NO EXECUTABLE -- build it first"; exit 2; }
 
 mkdir -p "${RUNDIR}"
 cd "${RUNDIR}"
+ulimit -c unlimited
 rm -f ./rank*.log ./hostfile ./clio_tier*.yaml
 sort -u "${PBS_NODEFILE}" > hostfile
 

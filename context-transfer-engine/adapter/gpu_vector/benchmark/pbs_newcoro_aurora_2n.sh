@@ -47,6 +47,7 @@ test -n "${TEMPLATE}" && test -f "${TEMPLATE}" || { echo "NO CONFIG TEMPLATE in 
 
 mkdir -p "${RUNDIR}"
 cd "${RUNDIR}"
+ulimit -c unlimited
 rm -f ./rank*.log ./hostfile ./clio_2n.yaml
 
 # One hostname per line. The runtime resolves each entry and picks the one
