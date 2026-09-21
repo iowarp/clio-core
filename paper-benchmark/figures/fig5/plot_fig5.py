@@ -597,6 +597,16 @@ ST_HAT = {"Stats": "....", "NN": "////", "Explore": "--", "SGD": "||",
           "Unattributed": "//"}
 ST_BREAK_MS = 0.30
 COL_W, TEXT_W = 3.334, 7.0          # acmart sigplan \columnwidth / \textwidth
+#: WRITE AND READ SIT SIDE BY SIDE IN ONE COLUMN, each a separate file placed
+#: at 0.48\columnwidth. They are drawn AT that width so every font prints at
+#: the size written here; drawn at \columnwidth and scaled by 0.48, the 7 pt
+#: ticks printed at 3.4 pt.
+SUB_W = 0.48 * COL_W
+#: Bar thickness as a fraction of the row pitch. The leader labels for thin
+#: segments sit in the gap ABOVE a bar, so the gap -- 1 - ST_BAR_H of a row --
+#: must hold one line of 5-6 pt text; at 0.62 it did not at half a column,
+#: and the labels were drawn over the previous workload's bar.
+ST_BAR_H = 0.50
 #: The rc both bar renderings print at. Applied per draw rather than at
 #: import, so importing this file changes nothing about a caller's figures.
 BAR_RC = {"font.family": "serif",
@@ -746,7 +756,7 @@ def _st_stack(ax, y, d, stages, lw):
     spans = []
     for name, _ in stages:
         v = d[name]
-        ax.barh(y, v, left=left, height=0.62, color=ST_COL[name], hatch=ST_HAT[name],
+        ax.barh(y, v, left=left, height=ST_BAR_H, color=ST_COL[name], hatch=ST_HAT[name],
                 edgecolor="black", linewidth=lw, zorder=3)
         spans.append((name, left, left + v))
         left += v
@@ -836,9 +846,11 @@ def _st_above(above, y, size, box):
             if placed and x - placed[-1][0] < (placed[-1][1] + need) / 2 * px:
                 x = placed[-1][0] + (placed[-1][1] + need) / 2 * px
             placed.append((x, need))
-            ax.annotate(txt, xy=(mid, y + 0.31),
+            # Anchored at the bar's top edge; the label is centred halfway
+            # up the gap, clear of the bar above.
+            ax.annotate(txt, xy=(mid, y + ST_BAR_H / 2),
                         xytext=(ax.transData.inverted().transform((x, 0))[0],
-                                y + 0.54),
+                                y + 0.5),
                         ha="center", va="center", fontsize=size - 0.4,
                         color="#333333", zorder=5, bbox=box,
                         arrowprops=dict(arrowstyle="-", lw=0.4, color="#999999",
@@ -955,7 +967,7 @@ def assert_complete(res, wl, path, stages, tol=1e-6):
     return drawn, whole
 
 
-def st_draw_shares(res, axes, wls, stages, path):
+def st_draw_shares(res, axes, wls, stages, path, ms_in_label=False):
     """One bar per workload, normalised to 100%: the widths ARE the shares.
 
     The absolute rendering cannot show these six together -- AI's chunk takes
@@ -974,8 +986,12 @@ def st_draw_shares(res, axes, wls, stages, path):
     @param wls the workloads to draw, from st_available
     @param stages [(legend name, column)] in stacking order
     @param path write or read
+    @param ms_in_label put each bar's total under its workload name instead
+           of after the bar -- at half a column the trailing label costs a
+           third of the width the bars need
     """
     ys = np.arange(len(wls))[::-1]
+    tot_ms = {}
     full = axes[-1]
     drawn = []
     for y, (wl, _l) in zip(ys, wls):
@@ -988,16 +1004,33 @@ def st_draw_shares(res, axes, wls, stages, path):
         for ax, lw in zip(axes, (0.3, 0.5) if len(axes) > 1 else (0.5,)):
             _tot, spans = _st_stack(ax, y, share, stages, lw)
         drawn.append((y, spans, 100.0))
-        full.text(102.5, y, f"{total:.1f} ms", va="center", ha="left",
-                  fontsize=FS_ANN, zorder=4)
+        tot_ms[wl] = total
+        if not ms_in_label:
+            full.text(102.5, y, f"{total:.1f} ms", va="center", ha="left",
+                      fontsize=FS_ANN, zorder=4)
     # Room for that label inside the axis: at xlim 100 it overhangs, and in
     # the combined plate it lands on the next panel's workload names.
-    full.set_xlim(0, 122)
+    full.set_xlim(0, 100.5 if ms_in_label else 122)
     zoomed = len(axes) > 1
     full.set_xticks([25, 50, 75, 100] if zoomed else [0, 25, 50, 75, 100])
     full.set_xticklabels((["25", "50", "75", "100%"] if zoomed else
                           ["0", "25", "50", "75", "100%"]), fontsize=FS_TICK)
     _st_frame(full, ys, wls, len(axes) == 1)
+    if ms_in_label:
+        # Two texts, not one two-line tick label: a Text has one size and one
+        # colour, and the total should read as a subscript to the name rather
+        # than compete with it.
+        from matplotlib.transforms import blended_transform_factory, offset_copy
+        at = offset_copy(blended_transform_factory(full.transAxes, full.transData),
+                         fig=full.figure, x=-4.5, units="points")
+        full.set_yticklabels([])
+        for y, (wl, lab) in zip(ys, wls):
+            full.text(0, y + 0.13, lab, transform=at, ha="right", va="center",
+                      fontsize=FS_TICK)
+            if wl in tot_ms:
+                full.text(0, y - 0.20, f"{tot_ms[wl]:.1f} ms", transform=at,
+                          ha="right", va="center", fontsize=FS_TICK - 1,
+                          color="#555555")
     if len(axes) > 1:
         mag = axes[0]
         mag.set_xlim(0, ST_ZOOM)
@@ -1031,28 +1064,43 @@ def st_present(res, wls, spec):
     """
     seen, out = set(), []
     for path, stages in spec:
-        for name, _c in stages:
-            if name in seen:
+        shares = []
+        for wl, _l in wls:
+            try:
+                d, _n = st_per_chunk(res, wl, path, stages)
+            except (OSError, KeyError):
                 continue
-            for wl, _l in wls:
-                try:
-                    d, _n = st_per_chunk(res, wl, path, [(name, _c)])
-                except (OSError, KeyError):
-                    continue
-                if d[name] > 0:
-                    seen.add(name)
-                    out.append(name)
-                    break
+            tot = sum(d.values())
+            if tot > 0:
+                shares.append({k: 100.0 * v / tot for k, v in d.items()})
+        for name, _c in stages:
+            # The labeller's own floor: below 0.1% a segment is drawn but
+            # never labelled and is not visible at print size. Read-path
+            # Factory is 0.001 ms of a ~2 ms chunk -- a key with no bar.
+            if name not in seen and any(sh.get(name, 0) >= 0.1 for sh in shares):
+                seen.add(name)
+                out.append(name)
     return out
 
 
-def bar_legend(fig, names, y=1.0, ncol=None, columnspacing=1.0):
-    """The stage key both bar renderings carry, in stage order."""
+def bar_legend(fig, names, y=1.0, ncol=None, columnspacing=1.0, fontsize=None):
+    """The stage key both bar renderings carry, in stage order.
+
+    matplotlib fills a multi-column legend DOWN each column, so five stages
+    in three columns would read Stats, Factory, I/O across the top. The names
+    are permuted so that it reads left to right, row by row, in stage order.
+    """
+    ncol = ncol or len(names)
+    if ncol < len(names):
+        rows = -(-len(names) // ncol)
+        grid = [names[r * ncol:(r + 1) * ncol] for r in range(rows)]
+        names = [grid[r][c] for c in range(ncol) for r in range(rows)
+                 if c < len(grid[r])]
     h = [plt.Rectangle((0, 0), 1, 1, facecolor=ST_COL.get(name, AN_COL.get(name)),
                        hatch=ST_HAT.get(name, AN_HAT.get(name)), edgecolor="black",
                        linewidth=0.5) for name in names]
     fig.legend(h, names, loc="upper center", bbox_to_anchor=(0.5, y),
-               ncol=ncol or len(names), fontsize=FS_LEG, frameon=False,
+               ncol=ncol, fontsize=fontsize or FS_LEG, frameon=False,
                handlelength=1.3, handleheight=0.85, columnspacing=columnspacing,
                handletextpad=0.4)
 
@@ -1095,32 +1143,24 @@ def draw_stacked(res, out, split=False, name="fig5_stacked.png",
     with plt.rc_context(BAR_RC):
         if not absolute:
             if split:
-                fw = plt.figure(figsize=(COL_W, 1.00 + height))
-                if zoom:
-                    gs = fw.add_gridspec(1, 2, width_ratios=[1.0, 2.3],
-                                         wspace=0.06)
-                    axes_w = (fw.add_subplot(gs[0]), fw.add_subplot(gs[1]))
-                else:
-                    axes_w = (fw.add_subplot(111),)
-                st_draw_shares(res, axes_w, wls, ST_WRITE, "write")
-                # One row, and the axis label just under the ticks: the old
-                # bottom=0.30 reserved a third of the page for a single line
-                # of text.
-                bar_legend(fw, st_present(res, wls, [("write", ST_WRITE)]),
-                           y=1.02, columnspacing=0.8)
-                fw.text(0.58, 0.045, "Share of measured per-chunk write time",
-                        ha="center", fontsize=FS_AXIS)
-                fw.subplots_adjust(top=0.86, bottom=0.15, left=0.17, right=0.86)
-                emit(fw, out, "fig5_write.png")
-
-                fr = plt.figure(figsize=(COL_W, 1.00 + height))
-                st_draw_shares(res, (fr.add_subplot(111),), wls, ST_READ, "read")
-                bar_legend(fr, st_present(res, wls, [("read", ST_READ)]),
-                           y=1.02, columnspacing=0.8)
-                fr.text(0.58, 0.045, "Share of measured per-chunk read time",
-                        ha="center", fontsize=FS_AXIS)
-                fr.subplots_adjust(top=0.86, bottom=0.15, left=0.20, right=0.86)
-                emit(fr, out, "fig5_read.png")
+                # Both plates share ONE geometry -- width, height and every
+                # margin -- so placed side by side their rows line up. The
+                # budget, in inches at print size: two legend rows and the
+                # leader labels above the first bar on top, the tick labels
+                # below, 0.30 per workload between.
+                top_in, bot_in, row_in = 0.40, 0.17, 0.34
+                h = top_in + bot_in + row_in * len(wls)
+                geom = dict(top=1 - top_in / h, bottom=bot_in / h,
+                            left=0.345, right=0.93)
+                legend = dict(y=1.0, ncol=3, columnspacing=0.7, fontsize=6.5)
+                for path, stages, fname in (("write", ST_WRITE, "fig5_write.png"),
+                                            ("read", ST_READ, "fig5_read.png")):
+                    f = plt.figure(figsize=(SUB_W, h))
+                    st_draw_shares(res, (f.add_subplot(111),), wls, stages, path,
+                                   ms_in_label=True)
+                    bar_legend(f, st_present(res, wls, [(path, stages)]), **legend)
+                    f.subplots_adjust(**geom)
+                    emit(f, out, fname)
                 return 0
             fig = plt.figure(figsize=(TEXT_W, 1.75 + height))
             outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0],
