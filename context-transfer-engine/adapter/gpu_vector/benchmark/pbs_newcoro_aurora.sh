@@ -55,12 +55,20 @@ ONEAPI_DEVICE_SELECTOR=level_zero:gpu sycl-ls 2>&1 | head -5
 # them as stack calls. Read by IGC at JIT time; harmless for AOT binaries,
 # which had it baked in at their ocloc step. See build_newcoro_aurora.sh.
 export IGC_FunctionControl=3
-# BENCH_ZE_MASK pins the run to one tile (e.g. 0.0). Diagnostic: an Aurora node
-# is 6 root GPUs x 2 tiles, and under the default composite hierarchy a kernel
-# is implicitly scaled across both tiles of its root device. A device_global
-# the host wrote on one tile can then read as zero on the other -- which is
-# what lbann's "GPU read fault at 0x0" one second after its banner looks like.
-[ -n "${BENCH_ZE_MASK:-}" ] && export ZE_AFFINITY_MASK="${BENCH_ZE_MASK}"
+# ONE TILE, BY DEFAULT. An Aurora node is 6 root GPUs x 2 tiles, and under the
+# default composite hierarchy a kernel is implicitly scaled across both tiles
+# of its root device. lbann passes pinned to a tile and dies without the pin
+# on an AtomicAccessViolation (PDE level: an atomic to a page the context has
+# not mapped) inside 3s, while kmeans, gmx, grayscott and weights pass either
+# way. Every atomic lbann issues targets GpuApi::Malloc device memory, so the
+# composite-mode fault is in the driver's view of that memory, not in the
+# benchmark; it stays OPEN, and one tile -- ALCF's recommended unit anyway --
+# is the configuration these results are reported under. BENCH_ZE_MASK
+# overrides (e.g. 0.1); BENCH_ZE_MASK=none runs composite.
+case "${BENCH_ZE_MASK:-0.0}" in
+  none) ;;
+  *)    export ZE_AFFINITY_MASK="${BENCH_ZE_MASK:-0.0}" ;;
+esac
 # BENCH_TRACE=1 makes the SYCL runtime log every Unified Runtime call, kernel
 # launches by name included, so a GPU fault can be attributed to the last
 # kernel enqueued before it. Env var only; the binary is untouched.

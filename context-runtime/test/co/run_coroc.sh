@@ -103,5 +103,21 @@ if "${COROC}" "${SRC}/bad_missing_await.h" \
 else
   echo "PASS  R1: unwrapped call to a suspending function is an error"
 fi
+# R9: an awaiter is restored from the frame on the relaunch, not rebuilt, so
+# a pointer to private memory inside it is dangling there. Both spellings --
+# `this` and the address of a local -- must be rejected, and the diagnostic
+# must name the rule so the fix (point it at global memory) is findable.
+r9_out="$("${COROC}" "${SRC}/bad_awaiter_this.h" \
+     --rewrite-root="${ROOT}/context-runtime" \
+     --mirror-to="${OUT}/badout" \
+     -- -x c++ -std=c++20 -I"${INC}" -I"${SRC}" 2>&1 || true)"
+if [[ "$(grep -c "(R9)" <<< "${r9_out}")" -eq 2 ]] &&
+   [[ ! -f "${OUT}/badout/context-runtime/test/co/bad_awaiter_this.h" ]]; then
+  echo "PASS  R9: an awaiter holding 'this' or a local's address is an error"
+else
+  echo "FAIL  R9: expected two R9 errors and no output; got:"
+  sed 's/^/        /' <<< "${r9_out}" | head -12
+  fail=1
+fi
 
 exit "${fail}"

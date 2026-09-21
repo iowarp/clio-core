@@ -665,23 +665,46 @@ class DeviceVector {
   // falls through once nobody is still waiting.
 #if CLIO_HAS_COROC
 
-  /** Waits until this block's outstanding fetch has landed. */
+  /**
+   * Waits until this block's outstanding fetch has landed.
+   *
+   * HOLDS THE BLOCK'S TASK RECORD, NOT `this`. An awaiter is saved into the
+   * frame at a park and restored by Pop on the relaunch -- the switch jumps
+   * to the case label, past the assignment that built it -- so whatever it
+   * points at has to sit at the same address in the next launch. `this` is
+   * the by-value DeviceVector parameter of the calling coroutine: private
+   * memory, which CUDA happened to place at the same address launch after
+   * launch and PVC does not. Through the stale pointer Ready() read some
+   * other block's state, or none, and reported the slot free while the
+   * host was still writing back its previous submission. The runtime then
+   * popped a re-fire of a slot whose last submission was mid-coroutine,
+   * the D2H copy of the new POD zeroed that coroutine's RunContext, and the
+   * worker died on "CoroHandle: null RunContext" (weights on Aurora; the
+   * gpu2cpu evlog showed S-after-C on every flush slot). BlockTasks lives in
+   * the task backend, device global memory, at one address for the whole
+   * run.
+   */
   struct FetchWait {
-    DeviceVector *v;
+    BlockTasks *bt;
     CTP_GPU_FUN bool Ready() const {
-      return !(v->FetchBusy() && !v->FetchDone());
+      return !(bt->fetch_busy != 0u && !FetchLanded(bt));
     }
-    CTP_GPU_FUN clio::run::u64 Tag() const { return v->FetchTag(); }
+    CTP_GPU_FUN clio::run::u64 Tag() const {
+      return reinterpret_cast<clio::run::u64>(&bt->fetch->fut_.is_complete_.x);
+    }
     CTP_GPU_FUN void Take() const {}
   };
 
-  /** Waits until this block's outstanding flush has landed. */
+  /** Waits until this block's outstanding flush has landed. Same rule as
+   *  FetchWait: it carries the block's task record, never `this`. */
   struct FlushWait {
-    DeviceVector *v;
+    BlockTasks *bt;
     CTP_GPU_FUN bool Ready() const {
-      return !(v->FlushBusy() && !v->FlushDone());
+      return !(bt->flush_busy != 0u && !FlushLanded(bt));
     }
-    CTP_GPU_FUN clio::run::u64 Tag() const { return v->FlushTag(); }
+    CTP_GPU_FUN clio::run::u64 Tag() const {
+      return reinterpret_cast<clio::run::u64>(&bt->flush->fut_.is_complete_.x);
+    }
     CTP_GPU_FUN void Take() const {}
   };
 
@@ -734,7 +757,7 @@ class DeviceVector {
     // Ready() on the way in, and FlushBusy() dereferences it. The
     // transpiler gives a temporary its own awaiter slot and assigns it
     // immediately before the case label, which is the designed shape.
-    CO_AWAIT(FetchWait{this}.Take());
+    CO_AWAIT(FetchWait{Tasks()}.Take());
     if (threadIdx.x == 0 && FetchBusy()) PublishFetch();
     __syncthreads();
   }
@@ -829,7 +852,7 @@ class DeviceVector {
     clio::run::u64 rhi[kMaxFetchRanges];
     clio::run::u32 nr = 0;
     GatherRanges(rlo, rhi, nr, off, count, rest...);
-    CO_AWAIT(FlushWait{this}.Take());
+    CO_AWAIT(FlushWait{Tasks()}.Take());
     if (threadIdx.x == 0) {
       if (FlushBusy()) RetireFlush();
       SubmitFlushRanges(rlo, rhi, nr);
@@ -839,7 +862,7 @@ class DeviceVector {
 
   /** Wait for the writeback started by CoBeginFlush. */
   CTP_GPU_FUN void CoEndFlush() {
-    CO_AWAIT(FlushWait{this}.Take());
+    CO_AWAIT(FlushWait{Tasks()}.Take());
     if (threadIdx.x == 0 && FlushBusy()) RetireFlush();
     __syncthreads();
   }
@@ -1747,11 +1770,16 @@ class DeviceVector {
 
 
   CTP_GPU_FUN bool FetchBusy() const { return Tasks()->fetch_busy != 0u; }
-  CTP_GPU_FUN bool FetchDone() const {
-    BlockTasks *bt = Tasks();
+  /** Has the runtime completed the fetch this record holds? Static, on the
+   *  record itself, so a saved awaiter can ask without going through a
+   *  DeviceVector pointer (see FetchWait).
+   *  @param bt the block's task record
+   *  @return true when no fetch is recorded or its completion flag is set */
+  CTP_GPU_FUN static bool FetchLanded(const BlockTasks *bt) {
     return bt->fetch_fut.IsNull() ||
            (bt->fetch->fut_.is_complete_.load() & 1u) != 0u;
   }
+  CTP_GPU_FUN bool FetchDone() const { return FetchLanded(Tasks()); }
   CTP_GPU_FUN clio::run::u64 FetchTag() const {
     return reinterpret_cast<clio::run::u64>(
         &Tasks()->fetch->fut_.is_complete_.x);
@@ -1842,11 +1870,14 @@ class DeviceVector {
   // ------------------------------ flush ------------------------------
 
   CTP_GPU_FUN bool FlushBusy() const { return Tasks()->flush_busy != 0u; }
-  CTP_GPU_FUN bool FlushDone() const {
-    BlockTasks *bt = Tasks();
+  /** Has the runtime completed the flush this record holds? See FetchLanded.
+   *  @param bt the block's task record
+   *  @return true when no flush is recorded or its completion flag is set */
+  CTP_GPU_FUN static bool FlushLanded(const BlockTasks *bt) {
     return bt->flush_fut.IsNull() ||
            (bt->flush->fut_.is_complete_.load() & 1u) != 0u;
   }
+  CTP_GPU_FUN bool FlushDone() const { return FlushLanded(Tasks()); }
   CTP_GPU_FUN clio::run::u64 FlushTag() const {
     return reinterpret_cast<clio::run::u64>(
         &Tasks()->flush->fut_.is_complete_.x);

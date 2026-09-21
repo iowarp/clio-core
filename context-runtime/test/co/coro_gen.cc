@@ -65,8 +65,10 @@ int main() {
     d::Launch(d::kGroups, d::kLanes, [&](co::Item it) {
       co::Scope scope(view, it);
       if (scope) {
-        d::StreamTile(c, w.OutFor(it.Group()), d::kPages, it.Local(),
-                      it.Size(), it, scope.Context());
+        // The context is the FIRST parameter: E1 prepends it (a defaulted
+        // trailing parameter would otherwise end up before it).
+        d::StreamTile(scope.Context(), c, w.OutFor(it.Group()), d::kPages,
+                      it.Local(), it.Size(), it);
       }
     });
 

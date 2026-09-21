@@ -26,6 +26,7 @@ Design: `$HOME/coroutines.md`.
 | `coro_ref.cc` / `coro_gen.cc` | the differential test's two halves |
 | `coro_sycl.cc` | the same generated header, on SYCL |
 | `bad_missing_await.h` | negative test: rule R1 must reject it |
+| `bad_awaiter_this.h` | negative test: rule R9 must reject it (awaiter carrying `this` or a local's address across a park) |
 | `spike_*.{h,cc}` | the P0 spikes — the output shape written by hand, before the tool existed |
 
 ## Results — 2026-09-20, Aurora login node
@@ -37,6 +38,7 @@ PASS  host: transpiled == source (576 values)
 PASS  sycl: transpiled == source, on device
 PASS  sycl: IGC accepts the generated shape for pvc
 PASS  R1: unwrapped call to a suspending function is an error
+PASS  R9: an awaiter holding 'this' or a local's address is an error
 ```
 
 ```

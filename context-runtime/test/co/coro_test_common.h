@@ -69,10 +69,23 @@ inline constexpr u32 kStackBytes = 512;
  *  threads and a real barrier, so group collectives are genuinely exercised. */
 template <class BodyFn>
 void Launch(u32 n_groups, u32 group_size, BodyFn body) {
-  std::vector<std::unique_ptr<HostGroup>> groups;
-  groups.reserve(n_groups);
-  for (u32 g = 0; g < n_groups; ++g) {
-    groups.push_back(std::make_unique<HostGroup>(group_size, g));
+  // THE GROUPS PERSIST ACROSS LAUNCHES. An Item is trivially copyable and
+  // rides in the frame like any other parameter, so a lane resumes with the
+  // Item it parked with -- and on the host that Item holds a HostGroup
+  // pointer. Fresh groups per launch left it dangling: a resumed lane then
+  // ran Barrier() and Any() on a freed std::barrier, lanes mixed barrier
+  // phases, two of them ran off the end while the rest waited in a vote,
+  // and the differential test deadlocked at the last Flush. On the GPU
+  // backends an Item names its group by index and nothing dangles; that is
+  // the property this oracle has to reproduce.
+  static std::vector<std::unique_ptr<HostGroup>> groups;
+  if (groups.size() != n_groups ||
+      (n_groups != 0 && groups[0]->size != group_size)) {
+    groups.clear();
+    groups.reserve(n_groups);
+    for (u32 g = 0; g < n_groups; ++g) {
+      groups.push_back(std::make_unique<HostGroup>(group_size, g));
+    }
   }
   std::vector<std::thread> threads;
   threads.reserve(static_cast<std::size_t>(n_groups) * group_size);

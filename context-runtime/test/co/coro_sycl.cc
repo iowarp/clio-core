@@ -124,10 +124,11 @@ int main(int argc, char **argv) {
        co::Scope scope(view, co::Item(it));
        if (scope) {
          const co::u32 g = static_cast<co::u32>(it.get_group(0));
-         d::StreamTile(cache, out + g * kPages * kPer, kPages,
-                       static_cast<co::u32>(it.get_local_id(0)),
+         // Context FIRST: E1 prepends it (see coro_gen.cc).
+         d::StreamTile(scope.Context(), cache, out + g * kPages * kPer,
+                       kPages, static_cast<co::u32>(it.get_local_id(0)),
                        static_cast<co::u32>(it.get_local_range(0)),
-                       co::Item(it), scope.Context());
+                       co::Item(it));
        }
      }).wait();
 

@@ -41,8 +41,8 @@
  *
  * Design: $HOME/coroutines.md. The five edits (section 3.2):
  *
- *   E1  append `clio::co::Ctx &_cy` to every suspending function's signature
- *   E2  append `_cy` to every call to a suspending function
+ *   E1  prepend `clio::co::Ctx &_cy` to every suspending function's signature
+ *   E2  pass `_cy` first at every call to a suspending function
  *   E3  insert the Frame, the hoisted declarations and the dispatching switch
  *   E4  insert `case N:` + replay + park guard at each CO_AWAIT
  *   E5  close the switch and call Done() before every return
@@ -538,6 +538,63 @@ class Transpiler {
             "CO_AWAIT operand must be a call to a suspending function or "
             "'<awaiter>.Take()'");
     }
+    for (const AwaitSite &s : fi.awaits) {
+      std::string what;
+      if (s.awaiter != nullptr && AwaiterCapturesFrame(s.awaiter, &what)) {
+        Error(s.awaiter->getBeginLoc(),
+              "awaiter carries " + what + " across a park (R9). It is saved "
+              "into the frame and RESTORED on the relaunch, not rebuilt, so "
+              "an address it holds must be the same address next launch; "
+              "frame-private storage is not. Point it at global memory "
+              "instead (e.g. the block's task record).");
+      }
+    }
+  }
+
+  /**
+   * R9: does an awaiter expression capture the address of frame-private
+   * storage?
+   *
+   * An awaiter is pushed into the frame at a park and popped on the
+   * relaunch -- the switch jumps to the case label, past the assignment
+   * that built it -- so any pointer it holds is dereferenced in a launch
+   * other than the one that formed it. `this` (the by-value object a
+   * suspending member was called on) and the address of a parameter or
+   * local are private memory: CUDA happened to hand back the same address
+   * launch after launch, PVC did not, and `FlushWait{this}` then read some
+   * other block's flush state and re-fired a slot the host was still
+   * writing back. Only an EXPLICIT `this` counts; the implicit object of a
+   * member call inside the expression (`Wait{Tasks()}`) is evaluated now,
+   * not carried.
+   *
+   * @param aw   the awaiter expression
+   * @param what on true, a description of the capture for the diagnostic
+   * @return true if the expression captures frame-private storage
+   */
+  static bool AwaiterCapturesFrame(const Expr *aw, std::string *what) {
+    struct V : RecursiveASTVisitor<V> {
+      std::string hit;
+      bool VisitCXXThisExpr(CXXThisExpr *e) {
+        if (!e->isImplicit() && hit.empty()) hit = "'this'";
+        return true;
+      }
+      bool VisitUnaryOperator(UnaryOperator *u) {
+        if (u->getOpcode() != UO_AddrOf || !hit.empty()) return true;
+        const auto *dr =
+            dyn_cast<DeclRefExpr>(u->getSubExpr()->IgnoreParenImpCasts());
+        if (dr == nullptr) return true;
+        const auto *vd = dyn_cast<VarDecl>(dr->getDecl());
+        if (vd != nullptr && vd->isLocalVarDeclOrParm() &&
+            !vd->isStaticLocal()) {
+          hit = "the address of '" + vd->getName().str() + "'";
+        }
+        return true;
+      }
+    } v;
+    v.TraverseStmt(const_cast<Expr *>(aw));
+    if (v.hit.empty()) return false;
+    *what = v.hit;
+    return true;
   }
 
   /**
