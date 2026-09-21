@@ -66,7 +66,7 @@ void SaveTaskArchive::bulk(ctp::ipc::ShmPtr<> ptr, size_t size, uint32_t flags) 
     char *host = staged_.back().get();
     ctp::DeviceAwareMemcpy(host, full_ptr.ptr_, size);
     full_ptr.ptr_ = host;
-    full_ptr.shm_ = ctp::ipc::ShmPtr<>::GetNull();
+    full_ptr.shm_ = ctp::ipc::ShmPtr<char>::GetNull();
   }
   ctp::lbm::Bulk bulk;
   bulk.data = full_ptr;
