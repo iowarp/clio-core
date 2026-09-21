@@ -63,6 +63,15 @@
 #include "clio_ctp/constants/macros.h"
 #include "clio_ctp/util/logging.h"
 
+#if defined(__x86_64__)
+#include <x86intrin.h>
+#endif
+
+/** Latency-report hook (defined by the runtime in ipc_gpu2cpu.cc, absent in
+ *  a bare CTP binary). Weak so a header-only user needs no definition. */
+extern "C" void clio_evlat_add(int which, unsigned long long cycles)
+    __attribute__((weak));
+
 extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
                                        void *stream);
 
@@ -1386,8 +1395,19 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   // property this path depends on: it runs on the fault-service side while
   // the faulting kernel is still resident, and a copy kernel cannot be
   // scheduled behind a kernel that never exits.
+  // Latency report (CLIO_EVLAT) channels 15-16 when the runtime's hook is
+  // linked: the two pointer-type queries, then the copy.
+#if defined(__x86_64__)
+  const unsigned long long ev_c0 = __rdtsc();
+#else
+  const unsigned long long ev_c0 = 0;
+#endif
   const bool dst_dev = IsDeviceAccessible(dst);
   const bool src_dev = IsDeviceAccessible(src);
+#if defined(__x86_64__)
+  const unsigned long long ev_c1 = __rdtsc();
+  if (clio_evlat_add != nullptr) clio_evlat_add(15, ev_c1 - ev_c0);
+#endif
   if (!dst_dev && !src_dev) {
     std::memcpy(dst, src, n);
     return;
@@ -1398,21 +1418,22 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   auto &q = GpuApi::SyclThreadQueue();
   if (dst_dev == src_dev) {
     q.memcpy(dst, src, n).wait();
+#if defined(__x86_64__)
+    if (clio_evlat_add != nullptr) clio_evlat_add(16, __rdtsc() - ev_c1);
+#endif
     return;
   }
-  // ONE SIDE IS PAGEABLE HOST MEMORY. A direct queue::memcpy to or from
-  // memory Level Zero does not know (a heap buffer, a std::vector, a
-  // memfd-backed segment) costs ~2 ms per 64 KB on PVC -- the driver pins
-  // or stages the pages every call -- against 10 us for pinned host USM,
-  // kernel running or not (sycl_copy_probe). Every copy on the paged
-  // vector's remote fault path lands in such memory: the network staging
-  // buffer, the transfer engine's bounce vector, the bdev's shared-memory
-  // buffers, the reply into the frame from a zmq buffer. So bounce through
-  // a per-thread pinned buffer instead; a host USM pointer takes the same
-  // path harmlessly (pinned-to-pinned memcpy is a few microseconds).
+  // ONE SIDE IS PAGEABLE HOST MEMORY (a heap buffer, a std::vector, a
+  // memfd-backed segment). sycl_copy_probe measured a direct copy to such
+  // memory at 37 us D2H / 5 us H2D per 64 KB against 10 us pinned, so the
+  // per-thread pinned bounce below is a small win, not the fix it was first
+  // taken for; it also keeps every host side the driver sees registered.
   char *pin = GpuApi::SyclPinnedBounce();
   if (pin == nullptr) {
     q.memcpy(dst, src, n).wait();
+#if defined(__x86_64__)
+    if (clio_evlat_add != nullptr) clio_evlat_add(16, __rdtsc() - ev_c1);
+#endif
     return;
   }
   const size_t kChunk = GpuApi::kSyclBounceBytes;
@@ -1426,6 +1447,9 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
       q.memcpy(static_cast<char *>(dst) + off, pin, c).wait();
     }
   }
+#if defined(__x86_64__)
+  if (clio_evlat_add != nullptr) clio_evlat_add(16, __rdtsc() - ev_c1);
+#endif
 #else
   std::memcpy(dst, src, n);
 #endif
