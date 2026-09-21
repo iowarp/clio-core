@@ -16,11 +16,16 @@ TIERS=${TIERS:-"flare daos"}
 BENCHES=${BENCHES:-"kmeans grayscott weights"}
 HBM_MB=${HBM_MB:-4096}
 TIER_MB=${TIER_MB:-4608}
+# 1 MB PAGES throughout. The file tier is latency-bound per write: the
+# first kmeans run at 64 KB pages wrote ~45 MB/s per node to Flare (a
+# synchronous ~1.4 ms per page) and was still loading its 8 GB when the
+# 200 s cap hit, against 1.0-1.3 GB/s measured with dd. At 1 MB a page the
+# same bytes are 16x fewer operations.
 args_for() {
   case "$1" in
-    kmeans)    echo "--data-mb 16384 --hbm-mb ${HBM_MB} --iters 1 --page-kb 64" ;;
+    kmeans)    echo "--data-mb 16384 --hbm-mb ${HBM_MB} --iters 1 --page-kb 1024" ;;
     grayscott) echo "--data-mb 16384 --hbm-mb ${HBM_MB} --steps 1 --repeat 1 --page-kb 1024" ;;
-    weights)   echo "--blocks 64 --pages 2048 --page-kb 64 --hbm-mb ${HBM_MB} --repeat 1" ;;
+    weights)   echo "--blocks 64 --pages 128 --page-kb 1024 --hbm-mb ${HBM_MB} --repeat 1" ;;
     *)         echo "" ;;
   esac
 }
