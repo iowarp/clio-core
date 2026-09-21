@@ -23,13 +23,17 @@ One rank per node (`pbs_newcoro_aurora_2n.sh`, `submit_2n_all_aurora.sh`),
 same sizes, each benchmark splitting its problem with `--nodes 2 --node r`,
 the runtimes joined by a hostfile from `$PBS_NODEFILE`:
 
+Times are the job's wall time for the whole run (init included); "bound"
+is the same job before (10), when the launcher pinned each rank to one
+core.
+
 | benchmark | result | notes |
 |-----------|--------|-------|
-| gmx       | PASS   | all gates on both ranks, 67 faults/rank (half of single-node), 15 s |
-| lbann     | PASS   | loss + weight gates, "2 nodes" all-gather path, 322 faults/rank, 43 s |
-| weights   | PASS   | both ranks the same global checksum, put_errors=0, 36 s -- once the config composed cte_core at 512.0 |
-| grayscott | PASS   | v_checksum bit-identical to single-node on both ranks, 18 s |
-| kmeans    | see 5  | crashed in the runtime's network send; fixed, rerun pending |
+| gmx       | PASS   | all gates on both ranks, 67 faults/rank (half of single-node); 4 s (bound: 15 s) |
+| lbann     | PASS   | loss + weight gates, "2 nodes" all-gather path; 5 s (bound: 43 s) |
+| weights   | PASS   | both ranks the same global checksum, put_errors=0; 7 s (bound: 36 s) |
+| grayscott | PASS   | v_checksum bit-identical to single-node on both ranks; 146 ms of kernel at 13.7 GB/s (bound: 3390 ms, 0.59 GB/s) |
+| kmeans    | PASS   | `--data-mb 256 --hbm-mb 128`: 4874 faults/rank, kernel 574 ms at 0.87 GB/s, checksum matching single-node (bound: past the 90 s cap after (5)-(7)); 64 MB/node: 33 ms per iteration against 65 ms on one node |
 | lammps_md | OPEN   | runs to completion on both nodes, gate fails; see below |
 
 Storage tiers on Flare and DAOS: `pbs_newcoro_aurora_2n_tier.sh` and
