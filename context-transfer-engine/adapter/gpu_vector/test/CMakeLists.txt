@@ -1005,3 +1005,145 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS
         RUN_SERIAL TRUE
         ENVIRONMENT "BUILD_DIR=${_gv_build_name};GVW_CONF=gvw_conf_tiered.yaml")
 endif()
+
+# ---------------------------------------------------------------------------
+# The NEWCORO editions of the paged gates -- the same six workloads, with the
+# device coroutines lowered by clio-coroc instead of by the compiler.
+#
+# WHY THESE NEED THEIR OWN GATES. Every gate above compiles co_await with a
+# compiler that understands it. The ported benchmarks
+# (clio_<wl>_paged_newcoro.cc) run the same science through a state machine
+# produced by tools/coroc, so what they exercise is a DIFFERENT LOWERING of
+# the suspend points -- and a suspend point is exactly where a page fault,
+# an eviction and a cross-node fetch all happen. A lowering that drops a live
+# value across a resume, or replays a frame that already ran, produces a
+# plausible wrong number under precisely the conditions these gates create.
+# Nothing else in the tree runs them across nodes.
+#
+# THEY ARE NOT CMAKE TARGETS, and that is not an oversight: the transpile is a
+# source-to-source pass that runs before the compiler, against flags taken
+# from a configured build. The harness therefore builds them on demand, by
+# invoking benchmark/build_newcoro.sh (and run_newcoro_sycl.sh) with
+# NEWCORO_RUN=0, into the same bin/ the containers mount. Every gate below
+# rebuilds, so an edit to a benchmark OR to the transpiler cannot be gated
+# against a stale binary.
+#
+# OPT-IN on the transpiler, because building it needs an LLVM with
+# development files that a plain clio build does not:
+#   -DCLIO_GV_COROC=ON       (or a path to a prebuilt clio-coroc)
+# with tools/coroc/build.sh having been run.
+#
+#   ctest -L gv_dist_newcoro        # CUDA, 2 nodes, resident
+#   ctest -L gv_dist_ooc_newcoro    # CUDA, 2 nodes, under eviction
+#   ctest -L gv_dist4_newcoro       # CUDA, 4 nodes, resident
+#   ctest -L gv_dist_newcoro_sycl   # the SYCL editions of the 2-node pair
+#   ctest -L gv_dist_ooc_newcoro_sycl
+#
+# WHY 4 NODES IS NOT REDUNDANT WITH 2, for this edition specifically. The
+# first instinct is that node count varies the DECOMPOSITION (extra halo
+# seams, smaller bands, the page-ownership constraint) while the newcoro axis
+# varies the LOWERING, so crossing them buys nothing. That is wrong, and the
+# 4-node CUDA set is the evidence: every defect it ever found -- grayscott's
+# second interior seam, lbann's sub-page band (a HANG, not a failure),
+# lammps_md's z-plane geometry -- appears only at 4. Those are all suspend
+# points that 2 nodes never reaches, and a suspend point is precisely where
+# the two lowerings can differ. A 2-node newcoro pass says nothing about the
+# frames only a 4-way split creates.
+# ---------------------------------------------------------------------------
+set(CLIO_GV_COROC "" CACHE STRING
+    "Path to the clio-coroc transpiler (or ON for <source>/build-coroc); \
+enables the newcoro docker gates")
+
+if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS AND CLIO_GV_COROC)
+    if(CLIO_GV_COROC STREQUAL "ON")
+        set(_gv_coroc ${CMAKE_SOURCE_DIR}/build-coroc/clio-coroc)
+    else()
+        set(_gv_coroc ${CLIO_GV_COROC})
+    endif()
+    if(NOT EXISTS ${_gv_coroc})
+        message(WARNING
+            "CLIO_GV_COROC is set but ${_gv_coroc} does not exist -- run "
+            "tools/coroc/build.sh. The newcoro docker gates are NOT registered.")
+    else()
+        foreach(_wl kmeans weights gmx grayscott lbann lammps_md)
+            # Resident, CUDA.
+            add_test(NAME cte_gv_distributed_newcoro_${_wl}
+                COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
+            )
+            # Longer than the co_await gates: each one transpiles and compiles
+            # its benchmark before the two-container run begins.
+            set_tests_properties(cte_gv_distributed_newcoro_${_wl} PROPERTIES
+                TIMEOUT 3000
+                LABELS "cte;gpu;gpu_vector;gv_dist_newcoro;distributed;docker"
+                RUN_SERIAL TRUE
+                ENVIRONMENT "BUILD_DIR=${_gv_build_name};GVW_VARIANT=newcoro;COROC=${_gv_coroc}")
+
+            # Under eviction, CUDA. This is the one that matters: a suspend
+            # point whose lowering loses a live value only shows it when the
+            # page under that value went away while the frame was suspended.
+            #
+            # lammps_md is in this set. It was the one workload that FAILED
+            # it -- its fetch/evict chain nests deeper than the coroc
+            # backend's old fixed-depth frame table (kYieldMaxDepth=8) could
+            # hold, which trapped at low block counts and livelocked at the
+            # OOC deck's cache size. That table is gone: clio::co::Frame is a
+            # LIFO park log now (context-runtime/include/clio_runtime/co/
+            # yield_backend.h), sized only by bytes_per_lane. See
+            # distributed_workloads/README.md for the before/after.
+            add_test(NAME cte_gv_ooc_newcoro_${_wl}
+                COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
+            )
+            set_tests_properties(cte_gv_ooc_newcoro_${_wl} PROPERTIES
+                TIMEOUT 3000
+                LABELS "cte;gpu;gpu_vector;gv_dist_ooc_newcoro;distributed;docker"
+                RUN_SERIAL TRUE
+                ENVIRONMENT "BUILD_DIR=${_gv_build_name};GVW_OOC=1;GVW_VARIANT=newcoro;COROC=${_gv_coroc}")
+        endforeach()
+
+        # THE SAME SIX AT 4 NODES. Resident only: the 4-node decks already
+        # quarter the per-node working set, and stacking GVW_OOC on top of
+        # that is a different pressure question the 2-node OOC set answers
+        # better with a deck calibrated for it.
+        foreach(_wl kmeans weights gmx grayscott lbann lammps_md)
+            add_test(NAME cte_gv_distributed4_newcoro_${_wl}
+                COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
+            )
+            # Four containers plus a transpile, so longer again than the
+            # 2-node newcoro gates.
+            set_tests_properties(cte_gv_distributed4_newcoro_${_wl} PROPERTIES
+                TIMEOUT 3600
+                LABELS "cte;gpu;gpu_vector;gv_dist4_newcoro;distributed;docker"
+                RUN_SERIAL TRUE
+                ENVIRONMENT "BUILD_DIR=${_gv_build_name};GVW_NODES=4;GVW_VARIANT=newcoro;COROC=${_gv_coroc}")
+        endforeach()
+        message(STATUS "gpu_vector newcoro docker gates: ON (${_gv_coroc})")
+    endif()
+
+    # The SYCL editions of the same. They link against the DPC++ build tree,
+    # while the TRANSPILE still needs a CUDA tree's compile_commands.json for
+    # its -I/-D set -- hence both directories, which is what
+    # GVW_CUDA_BUILD_DIR is for.
+    if(EXISTS ${_gv_coroc} AND CLIO_GV_SYCL_BUILD_DIR)
+        foreach(_wl kmeans weights gmx grayscott lbann lammps_md)
+            add_test(NAME cte_gv_distributed_newcoro_sycl_${_wl}
+                COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
+            )
+            set_tests_properties(cte_gv_distributed_newcoro_sycl_${_wl} PROPERTIES
+                TIMEOUT 3000
+                LABELS "cte;gpu;gpu_vector;gv_dist_newcoro_sycl;distributed;docker"
+                RUN_SERIAL TRUE
+                ENVIRONMENT "BUILD_DIR=${CLIO_GV_SYCL_BUILD_DIR};GVW_VARIANT=newcoro_sycl;GVW_CUDA_BUILD_DIR=${_gv_build_name};COROC=${_gv_coroc}")
+
+            add_test(NAME cte_gv_ooc_newcoro_sycl_${_wl}
+                COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
+            )
+            set_tests_properties(cte_gv_ooc_newcoro_sycl_${_wl} PROPERTIES
+                TIMEOUT 3000
+                LABELS "cte;gpu;gpu_vector;gv_dist_ooc_newcoro_sycl;distributed;docker"
+                RUN_SERIAL TRUE
+                ENVIRONMENT "BUILD_DIR=${CLIO_GV_SYCL_BUILD_DIR};GVW_OOC=1;GVW_VARIANT=newcoro_sycl;GVW_CUDA_BUILD_DIR=${_gv_build_name};COROC=${_gv_coroc}")
+        endforeach()
+        message(STATUS "gpu_vector newcoro SYCL docker gates: ON "
+                       "(${CLIO_GV_SYCL_BUILD_DIR})")
+    endif()
+endif()
