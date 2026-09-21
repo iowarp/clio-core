@@ -326,6 +326,9 @@ void Worker::Run() {
     // issue #785: re-read every iteration. The monitor thread may have moved
     // this lane to a replacement worker while we were wedged in a task, so a
     // cached pointer would keep us consuming a lane we no longer own.
+    // Parked parents first (see ProcessNewTasks): their continuations are
+    // the work most likely to unblock something else.
+    ProcessEventQueue();
     if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
       u32 count = ProcessNewTasks(lane);
       if (count > 0) did_work_ = true;
@@ -571,6 +574,15 @@ u32 Worker::ProcessNewTasks(TaskLane *lane) {
   while (tasks_processed < MAX_TASKS_PER_ITERATION) {
     if (ProcessNewTask(lane)) {
       tasks_processed++;
+      // COMPLETION EVENTS BETWEEN NEW TASKS, not after the whole batch. A
+      // parked parent's continuation is usually the cheapest and most
+      // urgent work a worker has -- on the paged vector it is what
+      // unblocks a GPU block -- yet it waited behind up to 16 fresh lane
+      // tasks of milliseconds each. Measured on the two-node kmeans: a
+      // completion event sat 20 ms on average (max 140 ms) in the parent's
+      // event queue (clio-evchan evq_wait), and every remote round trip
+      // paid that twice. An empty queue costs a lock and a check.
+      ProcessEventQueue();
     } else {
       break;
     }
