@@ -1045,7 +1045,11 @@ class GpuApi {
     // missing branch once left the SYCL RAM tier reading back garbage.)
     if (size != 0) {
       if (stream != nullptr) {
-        static_cast<sycl::queue *>(stream)->memcpy(dst, src, size);
+        // Eventless, like SyclCopySync: the per-event bookkeeping was the
+        // cost (2.6 ms per 64 KB against 5 us on the device). StreamQuery
+        // below synchronises the in-order stream directly.
+        sycl::ext::oneapi::experimental::memcpy(
+            *static_cast<sycl::queue *>(stream), dst, src, size);
       } else {
         SyclCopySync(SyclQueue(), dst, src, size);
       }
@@ -1107,8 +1111,13 @@ class GpuApi {
     // concurrent copies (sycl_copy_probe: 42 us per 64 KB pair alone,
     // 263 us with 8 threads, 490 us with 16, tails to 1.6 ms) that block
     // was most of a task's executing time on the two-node paged vector.
+    // The stream's copies are submitted without events (MemcpyAsync), so
+    // there is nothing to query; an in-order queue's wait() synchronises
+    // its command list directly and, with eventless submission, returns in
+    // the ~100-200 us the copy takes rather than the milliseconds the
+    // event path cost. A caller's "yield until landed" loop thus runs once.
     if (stream) {
-      return static_cast<sycl::queue *>(stream)->ext_oneapi_empty();
+      static_cast<sycl::queue *>(stream)->wait();
     }
     return true;
 #else
