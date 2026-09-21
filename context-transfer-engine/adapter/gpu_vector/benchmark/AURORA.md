@@ -119,6 +119,40 @@ and `BENCH_EXE` (a differently named binary).
    one level up: after changing a header that crosses a library boundary,
    relink every executable, not only the libraries.
 
+7. **Device memory on the wire, the reply.** With (5) and (6) in, rank 0
+   died in `LoadTaskArchive::bulk` instead: a page fault on a blob the
+   other node owns is a bdev ReadTask whose destination is the GPU frame,
+   and the reply's bytes were copied into it with a host memcpy (rank 1
+   then hung on its dead peer until the cap). The copy is
+   `DeviceAwareMemcpy` now, which stays a plain memcpy for host
+   destinations. The grayscott tiering run's rank-1 segfault in memmove
+   (stale binary, so (6) or this) has the same shape: at 8 GB per node its
+   pages cross nodes, which the 256 MB two-node run never did.
+
+8. **Pages placed on the other node's HBM.** With the crashes gone the
+   256 MB two-node kmeans ran past its 90 s cap while the runtime kept
+   processing tasks. `CLIO_NET_TRACE=1` on a 64 MB-per-node run: rank 0
+   spent 4.1 s of a 6.5 s kernel *serialising* sends -- 2016 sends, 105 MB,
+   ~1.8 ms each -- and rank 1 spent 5 ms on the same amount. The 1.8 ms is
+   the staged copy from (5): a device frame going out as bulk. It was not
+   the transfer engine's remote-owner path (that bounces in the PutBlob
+   coroutine and sends host memory, which is rank 1's 5 ms) but the
+   placer: cte_core registers every node's bdevs on every node across a
+   neighborhood window (default 4), so a GPU page could be written to the
+   OTHER node's HBM, a bdev write whose bulk is the frame. Forcing the L0
+   copy engines on (`UR_L0_USE_COPY_ENGINE=1` and friends) changed
+   nothing. `targets: {neighborhood: 1}` in the two-node compose (both
+   job scripts) removed the staged sends entirely (ser 3 ms on both ranks)
+   and cut the kernel from 6.5 s to 4.5 s.
+   Still open: 4.5 s for ~170 remote faults is ~26 ms per fault, and the
+   scheduler's histogram still shows hundreds of tasks in the 1-500 ms
+   bins. Every remaining device copy on the fault path -- the PutBlob
+   bounce, the HBM bdev write and read, the reply landing in the frame --
+   is a synchronous `queue::memcpy().wait()` on the runtime's default
+   out-of-order queue while the benchmark kernel occupies the tile. The
+   `sycl_copy_probe` job measures that copy under a spinning kernel for
+   the default, in-order and separate-context queues.
+
 Two smaller things found on the way and kept: `__nanosleep` was an empty
 function under SYCL, so `AllocatePage`'s transient-pressure backoff was 4096
 instant retries and a trap; and the device-side fatal latch is device memory

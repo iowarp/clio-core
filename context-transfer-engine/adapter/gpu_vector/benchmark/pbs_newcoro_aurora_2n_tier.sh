@@ -115,6 +115,12 @@ compose:
     pool_name: cte_core
     pool_query: local
     pool_id: "512.0"
+    # Targets stay node-local (see pbs_newcoro_aurora_2n.sh): with the
+    # default neighborhood a GPU page can be placed on the other node's HBM,
+    # and that write ships the device frame through a synchronous staged
+    # copy. The tiers below are per node by construction anyway.
+    targets:
+      neighborhood: 1
     storage:
       - path: "hbm::gv_tier_hbm"
         bdev_type: "hbm"
