@@ -59,7 +59,14 @@ void EvPush(char kind, unsigned tid, unsigned long long slot,
 // across coroutine suspends is deliberate -- waits are what we are hunting.
 struct EvChan {
   std::atomic<unsigned long long> sum{0}, cnt{0}, mx{0};
+  /** Log-scale histogram in microseconds: <10 <20 <50 <100 <200 <500 <1ms
+   *  <2ms <5ms <10ms <20ms <50ms >=50ms. A mean says nothing about whether a
+   *  channel is uniformly slow or fast with rare stalls. */
+  static constexpr int kBuckets = 13;
+  std::atomic<unsigned long long> hist[kBuckets]{};
 };
+constexpr double kEvBucketUs[EvChan::kBuckets - 1] = {
+    10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000};
 // 10, not 8: channels 8-9 measure REORGANIZATION AGAINST THE DATA PATH.
 // A tier migration holds the blob's write token while it reads the whole
 // blob into a host buffer, frees the old placement and writes the new one --
@@ -153,6 +160,10 @@ extern "C" void clio_evlat_add(int which, unsigned long long cycles) {
   while (cycles > m &&
          !g_chan[which].mx.compare_exchange_weak(m, cycles)) {
   }
+  const double us = static_cast<double>(cycles) / 2995.0;
+  int b = 0;
+  while (b < EvChan::kBuckets - 1 && us >= kEvBucketUs[b]) ++b;
+  g_chan[which].hist[b].fetch_add(1, std::memory_order_relaxed);
 }
 
 namespace {
@@ -165,6 +176,11 @@ void EvChanReport() {
     fprintf(stderr, "clio-evchan %-12s n=%llu avg=%.0fus max=%.0fus\n",
             g_chan_name[i], c, (double) g_chan[i].sum.load() * us / (double) c,
             (double) g_chan[i].mx.load() * us);
+    fprintf(stderr, "clio-evhist %-12s", g_chan_name[i]);
+    for (int b = 0; b < EvChan::kBuckets; ++b) {
+      fprintf(stderr, " %llu", g_chan[i].hist[b].load());
+    }
+    fprintf(stderr, "  (<10us <20 <50 <100 <200 <500 <1ms <2 <5 <10 <20 <50 >=50ms)\n");
   }
 }
 
