@@ -16,7 +16,54 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../../" && pwd)"
-export HOST_WORKSPACE="${HOST_WORKSPACE:-$REPO_ROOT}"
+
+# TWO PATHS TO THE SAME CHECKOUT, and they are not always the same string.
+#
+# REPO_ROOT is where this script reads and writes: the binaries it runs for
+# the single-node reference, the build scripts it invokes. HOST_WORKSPACE is
+# the bind SOURCE handed to the docker daemon, which resolves paths in the
+# DAEMON's filesystem, not in ours.
+#
+# On a developer host those are identical and this is all a no-op. Inside the
+# repo's own devcontainer they are not: /workspace here is
+# /home/<user>/.../core on the host, and binding "/workspace" hands the daemon
+# a path that does not exist. Docker then creates it as an empty directory and
+# every node dies with
+#
+#   sh: 1: /workspace/<build>/bin/clio_<wl>_paged_newcoro: not found
+#   == gvw-node1 exited 127
+#
+# -- which reads as a missing binary rather than a missing mount, and the
+# binary is right there. So translate: ask the daemon what THIS container's
+# mounts are and rewrite the path through the one that contains us.
+gvw_daemon_path() {   # gvw_daemon_path <path here> -> the same path, as the daemon sees it
+  local p="$1" src dst best_src="" best_dst=""
+  [ -f /.dockerenv ] || { echo "$p"; return; }
+  while IFS='|' read -r src dst; do
+    [ -n "$dst" ] || continue
+    case "$p" in
+      "$dst"|"$dst"/*)
+        # Longest destination wins: /workspace/sub beats /workspace.
+        if [ ${#dst} -gt ${#best_dst} ]; then best_dst="$dst"; best_src="$src"; fi ;;
+    esac
+  done < <(docker inspect "$(hostname)" \
+             --format '{{range .Mounts}}{{.Source}}|{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null)
+  if [ -n "$best_dst" ]; then echo "${best_src}${p#"$best_dst"}"; else echo "$p"; fi
+}
+export HOST_WORKSPACE="${HOST_WORKSPACE:-$(gvw_daemon_path "$REPO_ROOT")}"
+if [ "$HOST_WORKSPACE" != "$REPO_ROOT" ]; then
+  echo "== docker-outside-of-docker: binding $HOST_WORKSPACE (this is $REPO_ROOT)"
+elif [ -f /.dockerenv ]; then
+  # In a container, but the translation found nothing to translate through --
+  # `docker inspect $(hostname)` only works while the hostname is still the
+  # container id, and a compose-set hostname breaks that. Say so now: the
+  # alternative is four nodes dying with "not found" on a binary that exists,
+  # which is a much longer walk to the same conclusion.
+  echo "== WARNING: running inside a container, but could not work out how the"
+  echo "   docker daemon sees $REPO_ROOT, so it is being passed through as-is."
+  echo "   If the nodes exit 127 with 'not found', set HOST_WORKSPACE to this"
+  echo "   checkout's path on the DOCKER HOST and re-run."
+fi
 export HOST_UID=$(id -u) HOST_GID=$(id -g)
 export GVW_NODES="${GVW_NODES:-2}"
 SVCS="gvw-node1 gvw-node2"
@@ -29,7 +76,7 @@ if [ "$GVW_NODES" -ge 3 ]; then
   SVCS="$SVCS gvw-node3"
 fi
 [ "$GVW_NODES" -ge 4 ] && SVCS="$SVCS gvw-node4"
-BIN_DIR="$HOST_WORKSPACE/${BUILD_DIR:-build}/bin"
+BIN_DIR="$REPO_ROOT/${BUILD_DIR:-build}/bin"
 
 # Per-workload: the binary, the deck, and how to pull the gated number out of
 # its summary line. The decks are small on purpose -- this harness is testing
@@ -106,20 +153,120 @@ deck() {
   esac
 }
 
-# GVW_VARIANT=sycl runs the SYCL editions instead of the CUDA ones. They are
-# the same driver and the same gates -- only the launch TU differs -- so the
-# decks and tolerances above apply unchanged. They live in their OWN build
-# tree (DPC++ cannot share one with nvcc), hence BUILD_DIR pointing
-# elsewhere, and they need the DPC++ prefix mounted for libsycl.
-if [ "${GVW_VARIANT:-}" = sycl ]; then
-  export DPCPP_HOME="${DPCPP_HOME:-$HOME/opt/dpcpp}"
-  if [ ! -d "$DPCPP_HOME/lib" ]; then
-    echo "GVW_VARIANT=sycl but no DPC++ at $DPCPP_HOME; set DPCPP_HOME" >&2
-    exit 2
+# GVW_VARIANT selects WHICH EDITION of each benchmark to run. All four are the
+# same driver, the same decks and the same gates -- only how the device
+# coroutines were lowered, and which compiler lowered them, differs -- so a
+# divergence between editions is a real backend or lowering difference rather
+# than a differently-configured run.
+#
+#   (unset)       clio_<wl>_paged_bench            nvcc/clang, co_await
+#   sycl          clio_<wl>_paged_bench_sycl       DPC++,      co_await
+#   newcoro       clio_<wl>_paged_newcoro          nvcc,       clio-coroc
+#   newcoro_sycl  clio_<wl>_paged_newcoro_sycl     DPC++,      clio-coroc
+#
+# The newcoro editions are the reason this block grew: they are NOT CMake
+# targets. Nothing in `cmake --build` produces them, because the transpile is
+# a source-to-source pass that runs before the compiler, so without the
+# on-demand build below a `ctest -L gv_dist_newcoro` on a fresh tree would
+# find no binary at all -- and, worse, on a stale tree would silently gate a
+# binary built from an older benchmark or an older transpiler.
+case "${GVW_VARIANT:-}" in
+  ""|sycl|newcoro|newcoro_sycl) ;;
+  *) echo "unknown GVW_VARIANT: ${GVW_VARIANT}" >&2; exit 2 ;;
+esac
+
+# Both SYCL editions link libsycl from the DPC++ prefix, which is not in the
+# deps image; the compose file mounts it.
+case "${GVW_VARIANT:-}" in
+  sycl|newcoro_sycl)
+    export DPCPP_HOME="${DPCPP_HOME:-$HOME/opt/dpcpp}"
+    if [ ! -d "$DPCPP_HOME/lib" ]; then
+      echo "GVW_VARIANT=${GVW_VARIANT} but no DPC++ at $DPCPP_HOME; set DPCPP_HOME" >&2
+      exit 2
+    fi ;;
+esac
+
+bench_name() {   # deck() sets BENCH for the CUDA edition; adjust for the rest
+  # Only a *_paged_bench has a newcoro edition. Anything else -- today just
+  # test_cte_reput_stale -- passes through unchanged rather than being
+  # rewritten into the name of a binary nobody ever built. run_one already
+  # skips that case, so this is belt and braces, but a silent
+  # "test_cte_reput_stale_paged_newcoro" would be a confusing thing to debug.
+  local base="${1%_paged_bench}"
+  case "${GVW_VARIANT:-}" in
+    sycl)         echo "${1}_sycl" ;;
+    newcoro)      [ "$base" = "$1" ] && echo "$1" || echo "${base}_paged_newcoro" ;;
+    newcoro_sycl) [ "$base" = "$1" ] && echo "$1" || echo "${base}_paged_newcoro_sycl" ;;
+    *)            echo "$1" ;;
+  esac
+}
+
+# THE NEWCORO EDITIONS ARE BUILT ON DEMAND, by the same scripts a developer
+# runs by hand, into the same bin/ the containers mount. Rebuilt on every
+# invocation rather than only when missing: the pipeline has two inputs the
+# binary's timestamp cannot see past -- the benchmark source and the
+# transpiler itself -- and a gate that silently ran last week's lowering is
+# worse than no gate. The build is a single TU and takes well under a minute.
+#
+#   GVW_NEWCORO_BUILD=0   skip it and use whatever is already in bin/
+#   GVW_BUILD_CUDA_HOME   the toolkit the BUILD uses (nvcc + the transpiler's
+#                         parse), when it must differ from the CUDA_HOME the
+#                         compose file binds into the containers. Unset by
+#                         default, which lets build_newcoro.sh take nvcc from
+#                         PATH.
+#   GVW_CUDA_BUILD_DIR    the CUDA tree whose compile_commands.json supplies
+#                         the transpile's -I/-D set. Only needed for
+#                         newcoro_sycl, where BUILD_DIR is the DPC++ tree and
+#                         cannot answer that question.
+BENCH_SRC_DIR="$REPO_ROOT/context-transfer-engine/adapter/gpu_vector/benchmark"
+ensure_newcoro() {   # ensure_newcoro <workload>
+  local wl="$1" script rc
+  case "${GVW_VARIANT:-}" in
+    newcoro)      script=build_newcoro.sh ;;
+    newcoro_sycl) script=run_newcoro_sycl.sh ;;
+    *) return 0 ;;
+  esac
+  if [ "${GVW_NEWCORO_BUILD:-1}" = 0 ]; then
+    echo "  (GVW_NEWCORO_BUILD=0 -- using the binary already in bin/)"
+    return 0
   fi
-fi
-bench_name() {   # deck() sets BENCH for the CUDA edition; adjust for SYCL
-  [ "${GVW_VARIANT:-}" = sycl ] && echo "${1}_sycl" || echo "$1"
+  echo "=== $wl [$GVW_VARIANT]: transpile + build"
+  local log="/tmp/gvw_${wl}_${GVW_VARIANT}_build.log"
+  rc=0
+  if ! (
+    cd "$BENCH_SRC_DIR" || exit 1
+    # THE MOUNT'S CUDA_HOME IS NOT THE BUILD'S CUDA_HOME. Three different
+    # requirements have been sharing one variable:
+    #
+    #   the compose bind   a toolkit the DAEMON can see (on a devcontainer
+    #                      host that may be the only CUDA 13 it has)
+    #   nvcc               must match the libraries the benches link
+    #   the coroc parse    must be a CUDA this clang understands -- clang 18
+    #                      cannot read the CUDA 13 headers at all
+    #
+    # Leaking the mount's value into the build makes EVERY transpile die on
+    #   crt/math_functions.hpp: error: expected function body after function
+    #   declarator   /  fatal error: 'texture_fetch_functions.h' file not found
+    # which reads as a broken transpiler rather than a mis-pointed toolkit.
+    # Let build_newcoro.sh discover its own (it takes nvcc from PATH and
+    # parses against the same one) unless told otherwise.
+    if [ -n "${GVW_BUILD_CUDA_HOME:-}" ]; then
+      export CUDA_HOME="$GVW_BUILD_CUDA_HOME"
+    else
+      unset CUDA_HOME
+    fi
+    if [ "$GVW_VARIANT" = newcoro_sycl ]; then
+      CLIO_SYCL_BUILD_DIR="$REPO_ROOT/${BUILD_DIR:-build}" \
+      CLIO_BUILD_DIR="${GVW_CUDA_BUILD_DIR:+$REPO_ROOT/$GVW_CUDA_BUILD_DIR}" \
+      NEWCORO_RUN=0 ./"$script" "$wl"
+    else
+      CLIO_BUILD_DIR="$REPO_ROOT/${BUILD_DIR:-build}" \
+      NEWCORO_RUN=0 ./"$script" "$wl"
+    fi
+  ) > "$log" 2>&1; then rc=1; fi
+  sed 's/^/  | /' "$log" | tail -6
+  [ $rc -eq 0 ] || { echo "  BUILD FAILED (see $log)"; return 1; }
+  return 0
 }
 
 # GVW_OOC=1 swaps every deck for an OUT-OF-CORE one: the working set exceeds
@@ -158,6 +305,14 @@ extract() { sed -nE "s/.*${1}.*/\\1/p" "$2" | head -1; }
 
 run_one() {
   local wl="$1"; REQUIRE_EVICTS=""; deck "$wl"
+  # reput_stale is a self-checking CTE probe, not a paged benchmark: it has no
+  # newcoro edition and is not waiting for one. Skipped rather than failed, so
+  # `all` stays green under a newcoro variant.
+  if [ "${TOL:-}" = selfcheck ] && [ "${GVW_VARIANT:-}" != "${GVW_VARIANT#newcoro}" ]; then
+    echo "=== $wl: no newcoro edition (a CTE probe, not a paged bench) -- skipped"
+    return 0
+  fi
+  ensure_newcoro "$wl" || return 1
   if [ "${TOL:-}" = selfcheck ]; then
     echo "=== $wl: 2-node self-checking probe"
     cd "$SCRIPT_DIR"; rm -f "$SCRIPT_DIR"/.done_* 2>/dev/null || true
@@ -245,7 +400,7 @@ run_one() {
     local wref wgot
     wref="$(extract "$WITNESS" "$ref_log")"
     wgot="$(extract "$WITNESS" "/tmp/gvw_${wl}_dist.log")"
-    echo "  witness: 1-node=$wref 2-node=$wgot"
+    echo "  witness: 1-node=$wref ${GVW_NODES}-node=$wgot"
     if [ -z "$wgot" ] || [ -z "$wref" ]; then
       echo "  GATE FAIL: witness missing"; return 1
     fi
