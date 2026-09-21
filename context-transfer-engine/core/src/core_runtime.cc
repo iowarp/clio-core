@@ -3833,6 +3833,33 @@ clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task)
 // unchanged (TargetIsNodeLocal is true for every blob).
 // ---------------------------------------------------------------------------
 
+clio::run::TaskResume Runtime::CoDeviceCopy(void *dst, const void *src,
+                                            size_t n) {
+  CLIO_TASK_BODY_BEGIN
+  if (n == 0) {
+    CLIO_CO_RETURN;
+  }
+  if (!ctp::IsDeviceAccessible(dst) && !ctp::IsDeviceAccessible(src)) {
+    std::memcpy(dst, src, n);
+    CLIO_CO_RETURN;
+  }
+  // Same shape as MemBdevTransport::WriteBlocks: borrow a stream (yielding
+  // while the pool is empty), enqueue, yield until the stream drains.
+  void *stream = ctp::GpuApi::BorrowStream();
+  while (stream == nullptr) {
+    CLIO_CO_AWAIT(clio::run::yield(10.0));
+    stream = ctp::GpuApi::BorrowStream();
+  }
+  ctp::GpuApi::MemcpyAsync(static_cast<char *>(dst),
+                           static_cast<const char *>(src), n, stream);
+  while (!ctp::GpuApi::StreamQuery(stream)) {
+    CLIO_CO_AWAIT(clio::run::yield(10.0));
+  }
+  ctp::GpuApi::ReturnStream(stream);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::PodPutBlob(
     clio::run::shared_ptr<PodPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -3873,7 +3900,7 @@ clio::run::TaskResume Runtime::PodPutBlob(
         CLIO_CO_RETURN;
       }
       std::vector<char> bounce(task->size_);
-      ctp::DeviceAwareMemcpy(bounce.data(), src, task->size_);
+      CLIO_CO_AWAIT(CoDeviceCopy(bounce.data(), src, task->size_));
       auto fut = client_.AsyncPutBlob(task->tag_id_, eff_name, task->offset_,
                                       task->size_, bounce.data(),
                                       task->score_, task->context_,
@@ -3962,7 +3989,7 @@ clio::run::TaskResume Runtime::PodGetBlob(
         char *dst = CLIO_IPC->ToFullPtr(task->blob_data_)
                         .template Cast<char>().ptr_;
         if (dst != nullptr) {
-          ctp::DeviceAwareMemcpy(dst, bounce.data(), task->size_);
+          CLIO_CO_AWAIT(CoDeviceCopy(dst, bounce.data(), task->size_));
         } else {
           task->SetReturnCode(22);  // unmappable destination
         }

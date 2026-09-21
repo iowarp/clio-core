@@ -272,6 +272,19 @@ public:
   clio::run::TaskResume PodPutBlob(clio::run::shared_ptr<PodPutBlobTask> &task);
   clio::run::TaskResume PodGetBlob(clio::run::shared_ptr<PodGetBlobTask> &task);
 
+  /**
+   * Copy between device and host memory WITHOUT blocking the worker: the
+   * copy is enqueued on a borrowed GPU stream and the coroutine yields until
+   * it lands. A host-to-host pair is a plain memcpy. For the bounce copies
+   * on the remote-owner put and get paths, where a synchronous
+   * DeviceAwareMemcpy held the worker for the whole copy while concurrent
+   * copies serialised in the driver.
+   * @param dst Destination (device or host)
+   * @param src Source (device or host)
+   * @param n Bytes to copy
+   */
+  clio::run::TaskResume CoDeviceCopy(void *dst, const void *src, size_t n);
+
   /** In-process blob lookup for the zero-copy device-tier mapping. */
   std::shared_ptr<BlobInfo> LocateBlobShared(const std::string &key);
   clio::run::TaskResume PodReorganizeBlob(

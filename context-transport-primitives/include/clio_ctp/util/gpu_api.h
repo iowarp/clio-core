@@ -1089,8 +1089,14 @@ class GpuApi {
     CUDA_ERROR_CHECK(rc);
     return true;
 #elif CTP_ENABLE_SYCL
+    // NON-BLOCKING, like cudaStreamQuery. This used to wait_and_throw(), so
+    // every "yield until the copy lands" loop in the bdev transport blocked
+    // its worker thread instead, and under the driver's serialisation of
+    // concurrent copies (sycl_copy_probe: 42 us per 64 KB pair alone,
+    // 263 us with 8 threads, 490 us with 16, tails to 1.6 ms) that block
+    // was most of a task's executing time on the two-node paged vector.
     if (stream) {
-      static_cast<sycl::queue *>(stream)->wait_and_throw();
+      return static_cast<sycl::queue *>(stream)->ext_oneapi_empty();
     }
     return true;
 #else

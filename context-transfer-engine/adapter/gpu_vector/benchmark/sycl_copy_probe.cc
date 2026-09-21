@@ -62,6 +62,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -233,6 +234,49 @@ int main() {
     Report("ooo_shm", "busy", q_ooo, dev, shm, kBytes);
     Report("ooo_shmR", "busy", q_ooo, dev, shm_reg, kBytes);
     Report("in_shm", "busy", q_in, dev, shm, kBytes);
+  }
+
+  // CONCURRENT COPIES. The runtime has ten threads copying at once, each on
+  // its own in-order queue; the single-thread numbers above say nothing
+  // about what the driver does under that. T threads, each 200 D2H+H2D
+  // 64 KB copies into its own pageable buffer, kernel still running.
+  for (int nthreads : {1, 4, 8, 16}) {
+    std::vector<std::thread> ths;
+    std::vector<double> per_thread_ms(nthreads, 0.0);
+    std::vector<double> per_thread_max(nthreads, 0.0);
+    auto t0 = std::chrono::steady_clock::now();
+    for (int t = 0; t < nthreads; ++t) {
+      ths.emplace_back([&, t]() {
+        sycl::queue q{dev_sel, sycl::property::queue::in_order()};
+        char *d = sycl::malloc_device<char>(kBytes, q);
+        std::vector<char> h(kBytes, 1);
+        double sum = 0, mx = 0;
+        for (int i = 0; i < 200; ++i) {
+          auto a = std::chrono::steady_clock::now();
+          q.memcpy(h.data(), d, kBytes).wait();
+          q.memcpy(d, h.data(), kBytes).wait();
+          double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - a).count();
+          sum += ms;
+          if (ms > mx) mx = ms;
+        }
+        per_thread_ms[t] = sum / 200.0;
+        per_thread_max[t] = mx;
+        sycl::free(d, q);
+      });
+    }
+    for (auto &th : ths) th.join();
+    double total_ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+    double avg = 0, mx = 0;
+    for (int t = 0; t < nthreads; ++t) {
+      avg += per_thread_ms[t];
+      if (per_thread_max[t] > mx) mx = per_thread_max[t];
+    }
+    avg /= nthreads;
+    std::printf("PROBE mt%-2d    busy D2H+H2D per_pair_mean=%.3fms max=%.3fms "
+                "total=%.1fms\n", nthreads, avg, mx, total_ms);
+    std::fflush(stdout);
   }
 
   // Stop the kernel through the out-of-order queue (an in-order copy would

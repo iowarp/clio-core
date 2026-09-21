@@ -28,7 +28,7 @@ for pass in default; do
     export UR_L0_USE_COPY_ENGINE=1 SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE=1
     export UR_L0_USE_COPY_ENGINE_FOR_D2D_COPY=1 SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE_FOR_D2D_COPY=1
   fi
-  timeout --signal=TERM --kill-after=5s 20 "${EXE}"
+  timeout --signal=TERM --kill-after=5s 60 "${EXE}"
   echo "pass ${pass} exit=$?"
 done
 echo "RESULT copyprobe: done"
