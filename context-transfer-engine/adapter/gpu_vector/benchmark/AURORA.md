@@ -12,10 +12,11 @@ walltime, pinned to one tile. Results as of 2026-09-21, commit after 7a7c6a05:
 | weights   | `--repeat 1`                                      | PASS   | 4 s, checksum OK, 437 faults, 309 evictions |
 | grayscott | `--data-mb 512 --hbm-mb 128 --repeat 1 --steps 2` | PASS   | 4 s, v_checksum 339533.404295, 256 faults |
 | kmeans    | `--data-mb 256 --hbm-mb 128`                      | PASS   | 17 s, checksum OK, 13 320 faults/evictions |
-| lammps_md | `--steps 20`                                      | OPEN   | IGC crashes (exit 245 / -11) compiling `BuildListCoro`; see below |
+| lammps_md | `--lattice 12 --steps 10`                         | PASS   | 3 s, ballistic gate bitwise; 10 steps in 106 ms |
 
 Sizes are chosen for the 90 s cap, not for the numbers in RESULTS.md, and
 every one still exceeds its cache so the paging path is exercised.
+Results as of 2026-09-21, commit after 651a3139: all six pass.
 
 ## How to build and run
 
@@ -63,6 +64,21 @@ and `BENCH_EXE` (a differently named binary).
    of a night of bisecting until `SYCL_UR_TRACE=2` placed the fault address at
    that queue's allocation. The default is now this tree's `build-fresh`.
 
+4. **lammps_md** (three more, in order). IGC's backend segfaulted on the
+   list-build kernel under every knob; the trigger was the pair of
+   `nl.CoBeginFlush`/`CoEndFlush` awaits as written inside `BuildListCoro`
+   (compiling them out was the one change that built all 20 images), and
+   moving exactly those two awaits into their own `noinline` coroutines
+   works -- an IGC bug on a code shape, layout-sensitive, so the stage split
+   that came first is kept too. Then the process died in `exit()`: the
+   detached fatal-channel watcher was issuing SYCL copies while the runtime
+   unloaded its adapters (an `atexit` stop fixes it), which had been hidden
+   behind the `SIGSEGV` handler `FatalMirror()` used to install -- Level
+   Zero owns that signal for shared-USM migration, so that handler is gone.
+   Finally the ballistic gate failed bitwise at 3-4 ulp: icpx defaults to
+   `-fp-model=fast` on both passes, unlike nvcc and clang; the benchmark
+   compile is `-fp-model=precise -ffp-contract=off` now.
+
 Two smaller things found on the way and kept: `__nanosleep` was an empty
 function under SYCL, so `AllocatePage`'s transient-pressure backoff was 4096
 instant retries and a trap; and the device-side fatal latch is device memory
@@ -72,10 +88,6 @@ atomic fault.
 
 ## Open
 
-- **lammps_md**: IGC's backend segfaults compiling `BuildListCoro` (a 6,475
-  basic-block function after the transpile). `IGC_FunctionControl=3` fixed
-  12 of the 13 kernels; this one needs restructuring (split the list build
-  into smaller coroutines) or a flatter emission.
 - **Composite (two-tile) mode**: lbann faults on an atomic to device memory
   when a root device is used unpinned; the other four pass either way. One
   tile is ALCF's recommended unit and is what the table reports.

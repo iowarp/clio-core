@@ -32,7 +32,10 @@ set -u
 : "${BENCH_ARGS:=}"
 ROOT=${ROOT:-/home/llogan/clio-core/.claude/worktrees/gpu-coro}
 EXE="${ROOT}/build-spike/${BENCH_EXE:-clio_${BENCH_NAME}_paged_newcoro_aot}"
-TEMPLATE="${ROOT}/build-spike/run_${BENCH_NAME}/gv_${BENCH_NAME}_bench.yaml"
+# The config the single-node run left behind. Most benchmarks write
+# gv_<name>_bench.yaml; lammps_md writes gpu_vector_md.yaml, hence the glob.
+TEMPLATE=$(ls "${ROOT}/build-spike/run_${BENCH_NAME}"/gv_${BENCH_NAME}_bench.yaml \
+              "${ROOT}/build-spike/run_${BENCH_NAME}"/*.yaml 2>/dev/null | head -1)
 RUNDIR=${RUNDIR:-${ROOT}/build-spike/run2n_${BENCH_NAME}}
 NRANKS=2
 
@@ -40,7 +43,7 @@ echo "=== ${BENCH_NAME} x${NRANKS} nodes: $(sort -u "$PBS_NODEFILE" | tr '\n' ' 
 echo "exe:  ${EXE}"
 echo "args: ${BENCH_ARGS} --nodes ${NRANKS} --node <rank>"
 test -x "${EXE}" || { echo "NO EXECUTABLE -- build it first"; exit 2; }
-test -f "${TEMPLATE}" || { echo "NO CONFIG TEMPLATE ${TEMPLATE} -- run the single-node job first"; exit 2; }
+test -n "${TEMPLATE}" && test -f "${TEMPLATE}" || { echo "NO CONFIG TEMPLATE in build-spike/run_${BENCH_NAME}/ -- run the single-node job first"; exit 2; }
 
 mkdir -p "${RUNDIR}"
 cd "${RUNDIR}"
