@@ -65,8 +65,14 @@ case "${BENCH_TIER}" in
     TIER_DIR="/lus/flare/projects/IOWarp/clio_tier/${JOBTAG}"
     ;;
   daos)
+    # PBS runs this script in a non-login bash where `module` is not defined, so
+    # a bare `module load` did nothing: daos then looked for the agent socket in
+    # /var/run/daos_agent instead of the DAOS_AGENT_DRPC_DIR the module sets, and
+    # launch-dfuse.sh was not on PATH. Initialise Lmod first, and say what took.
+    source /usr/share/lmod/lmod/init/bash
     module use /soft/modulefiles
-    module load daos/base 2>&1 | tail -1
+    module load daos/base
+    echo "daos env: launch-dfuse.sh=$(command -v launch-dfuse.sh || echo MISSING) agent_dir=${DAOS_AGENT_DRPC_DIR:-unset} socket=$(ls "${DAOS_AGENT_DRPC_DIR:-/run/daos_agent_oneScratch}" 2>&1 | tr '\n' ' ')"
     if ! daos cont query "${DAOS_POOL}" "${DAOS_CONT}" > /dev/null 2>&1; then
       daos cont create --type=POSIX "${DAOS_POOL}" "${DAOS_CONT}" 2>&1 | tail -2
     fi
