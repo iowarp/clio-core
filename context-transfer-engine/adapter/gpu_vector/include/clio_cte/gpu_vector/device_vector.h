@@ -770,14 +770,36 @@ class DeviceVector {
     if (FetchBusy()) {
       CO_AWAIT(CoAwaitFetch());
     }
-    // A full set yields the round instead of spinning; see BeginFetch.
+    // A full set yields the round instead of spinning; see BeginFetch. The
+    // first attempt stays here so the common case is a predicated branch;
+    // the retry loop lives in its own NOINLINE coroutine (see it for why).
+    int ok = 0;
+    if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr) ? 1 : 0;
+    if (!__syncthreads_or(ok)) {
+      CO_AWAIT(CoSubmitFetchYielding(lo, hi, nr));
+    }
+    __syncthreads();
+  }
+
+  /** Submit-or-yield until SubmitFetch takes the whole batch.
+   *
+   *  ITS OWN FUNCTION, AND NOT BY CHOICE. Written inline in CoBeginFetch
+   *  (a loop around one await), IGC's backend segfaults linking lammps_md's
+   *  images (icpx: gen compiler exit 245, plain and per-kernel split alike)
+   *  while the other five benchmarks build -- the layout-sensitive
+   *  code-shape bug of AURORA.md (4), whose fix was the same move. The
+   *  ranges are pointers into the caller's frame, which outlives the
+   *  suspend.
+   *  @param lo,hi,nr the element ranges CoBeginFetch gathered */
+  CTP_GPU_FUN __attribute__((noinline)) void CoSubmitFetchYielding(
+      const clio::run::u64 *lo, const clio::run::u64 *hi,
+      clio::run::u32 nr) {
     for (;;) {
+      CO_AWAIT(OnceWait{0}.Take());
       int ok = 0;
       if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr) ? 1 : 0;
       if (__syncthreads_or(ok)) break;
-      CO_AWAIT(OnceWait{0}.Take());
     }
-    __syncthreads();
   }
 
   /** Wait for the outstanding CoBeginFetch and publish its pages. */
