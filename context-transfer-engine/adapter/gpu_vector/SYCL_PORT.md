@@ -27,7 +27,7 @@ twelve names, and `clio_ctp/util/sycl_cuda_compat.h` supplies them for SYCL:
 ```
 threadIdx blockIdx blockDim   __syncthreads __syncthreads_or
 atomicAdd atomicCAS atomicSub atomicExch atomicOr atomicAnd atomicXor
-__threadfence __threadfence_system __trap __nanosleep clock64 __shfl_sync
+__threadfence __threadfence_system __trap clock64 __shfl_sync
 printf   __device__ __host__ __global__ __align__ __forceinline__   dim3
 ```
 

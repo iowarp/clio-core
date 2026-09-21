@@ -11,7 +11,7 @@
  *     threadIdx blockIdx blockDim gridDim  __syncthreads __syncthreads_or
  *     atomicAdd atomicCAS atomicSub atomicExch
  *     __threadfence __threadfence_system __trap
- *     (+ printf, __nanosleep, clock64, __shfl_sync, the bit-cast intrinsics)
+ *     (+ printf, clock64, __shfl_sync, the bit-cast intrinsics)
  *
  * Everything else in those files is ordinary C++. Porting by rewriting each
  * call site into a neutral macro would touch several hundred lines of the
@@ -276,28 +276,11 @@ inline void Trap() {
 #endif
 }
 
-/**
- * CUDA's __nanosleep: back off for roughly `ns` nanoseconds.
- *
- * SPIR-V has neither a sleep instruction nor a cycle counter (Clock64 below
- * reads 0), so this is a COUNTED spin -- about a nanosecond per iteration
- * on PVC, which is the order the callers want: they back off from 1us to
- * 1ms. It used to be an empty function, which turned every "wait, then
- * retry" loop in the paged vector into a zero-length wait; AllocatePage's
- * four-second grace under transient set pressure became 4096 instant
- * retries and a trap, on a cache that was merely busy, not full.
- *
- * @param ns nanoseconds to wait, approximately
- */
-inline void NanoSleep(unsigned ns) {
-#if defined(__SYCL_DEVICE_ONLY__)
-  volatile unsigned sink = 0;
-  for (unsigned i = 0; i < ns; ++i) sink = sink + 1u;
-  (void)sink;
-#else
-  (void)ns;
-#endif
-}
+// There is deliberately NO __nanosleep shim. SPIR-V has no sleep instruction
+// and no cycle counter, and the counted-spin stand-in that used to live here
+// was never calibrated (55 ns per iteration on PVC, so every wait was 55x
+// too long). The GPU waits by spinning on every backend; no device code in
+// this tree sleeps.
 
 /**
  * CUDA's bit-cast intrinsics.
@@ -422,7 +405,6 @@ inline long long Clock64() {
 #define __threadfence() ::clio::run::gpu::sycl_compat::FenceDevice()
 #define __threadfence_system() ::clio::run::gpu::sycl_compat::FenceSystem()
 #define __trap() ::clio::run::gpu::sycl_compat::Trap()
-#define __nanosleep(n) ::clio::run::gpu::sycl_compat::NanoSleep(n)
 #define clock64() ::clio::run::gpu::sycl_compat::Clock64()
 #define __float_as_uint(f) ::clio::run::gpu::sycl_compat::FloatAsUint(f)
 #define __uint_as_float(u) ::clio::run::gpu::sycl_compat::UintAsFloat(u)

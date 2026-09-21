@@ -102,6 +102,11 @@ struct VecHeader {
   unsigned long long *stat_gen_stale_;
   unsigned long long *stat_gen_busy_;
   unsigned long long *stat_flush_skipped_;
+  /** Retries of the page-cache backoff in FaultPage: how often a fault found
+   *  every frame of its set pinned and had to sleep. Each retry sleeps a
+   *  doubling counted spin (up to 1<<20 iterations), so this number, times
+   *  the spin's real cost on the device, is time a block spent not faulting. */
+  unsigned long long *stat_alloc_waits_;
   /** THE FATAL CHANNEL: 8 slots of PINNED HOST memory the device writes just
    *  before it traps. Neither of the obvious channels survives a trap --
    *  device printf is buffered and dies with the context, and device memory
@@ -1144,9 +1149,6 @@ class DeviceVector {
     if (h_->set_locks_ == nullptr) return;      // private: single writer
     int *w = &h_->set_locks_[static_cast<size_t>(set) * kLockStride];
     while (atomicCAS(w, 0, 1) != 0) {
-#if __CUDA_ARCH__ >= 700
-      __nanosleep(32);
-#endif
     }
     __threadfence();
   }
@@ -1177,9 +1179,6 @@ class DeviceVector {
   CTP_GPU_FUN void LockFree(clio::run::u32 b) {
     int *w = &h_->free_lock_[static_cast<size_t>(b) * kLockStride];
     while (atomicCAS(w, 0, 1) != 0) {
-#if __CUDA_ARCH__ >= 700
-      __nanosleep(32);
-#endif
     }
     __threadfence();
   }
@@ -1677,22 +1676,23 @@ class DeviceVector {
           // chunks and UnpinRange -- the first distributed out-of-core run
           // trapped here while its own report showed 1 of 19 frames pinned,
           // the spike already drained. Peers' unpins need no help from this
-          // block, so waiting is safe: back off and re-claim (AllocatePage
+          // block, so waiting is safe: spin and re-claim (AllocatePage
           // itself retries both evictions). Only a pressure that never
           // drains -- the true hold-set livelock -- reaches the trap.
-          constexpr clio::run::u32 kMaxWaitNs = 1u << 20;            // 1 ms
-          clio::run::u32 wait_ns = 1024u;
-          for (clio::run::u32 spins = 0; p == nullptr && spins < 4096u;
-               ++spins) {                        // ~4 s of 1 ms waits, then trap
-            // SYCL TOO. This guard used to be __CUDA_ARCH__ alone, so on
-            // PVC the grace period was 4096 back-to-back retries -- a set
-            // that was busy for a few microseconds (every frame flushing or
-            // pinned by a peer mid-chunk) trapped as "set full" on the
-            // spot. sycl_compat's __nanosleep is a counted spin.
-#if CTP_ENABLE_SYCL || __CUDA_ARCH__ >= 700
-            __nanosleep(wait_ns);
-#endif
-            if (wait_ns < kMaxWaitNs) wait_ns *= 2u;
+          //
+          // A PURE SPIN, no sleep. This used to back off with __nanosleep,
+          // which is a real instruction on CUDA and a counted loop under
+          // SYCL that nobody had calibrated (55 ns per iteration on PVC:
+          // the 1 ms cap was a 57 ms stall per retry). The GPU waits by
+          // polling now, everywhere; the grace period is a retry count
+          // sized so a set busy for microseconds never traps (each retry
+          // is an AllocatePage under the set lock, a few microseconds).
+          constexpr clio::run::u32 kMaxAllocRetries = 1u << 20;
+          for (clio::run::u32 spins = 0;
+               p == nullptr && spins < kMaxAllocRetries; ++spins) {
+            if (h_->stat_alloc_waits_ != nullptr) {
+              atomicAdd(h_->stat_alloc_waits_, 1ull);
+            }
             p = AllocatePage(pn, &is_new);
           }
           if (p == nullptr) {

@@ -231,6 +231,7 @@ class Vector {
     clio::run::u64 gen_busy = 0;     // generational demand: CAS lost to peer
     clio::run::u64 flush_skipped = 0;  // flush pages not resident: DROPPED
     clio::run::u64 put_errors = 0;   // writebacks that returned non-zero
+    clio::run::u64 alloc_waits = 0;  // page-cache backoff retries (FaultPage)
   };
 
   /**
@@ -537,7 +538,7 @@ class Vector {
 #if CTP_ENABLE_GPU
     for (auto &kv : devs_) {
       if (kv.second.stats != nullptr) continue;
-      const size_t bytes = 9 * sizeof(unsigned long long);
+      const size_t bytes = 10 * sizeof(unsigned long long);
       auto *c = reinterpret_cast<unsigned long long *>(
           ctp::GpuApi::Malloc<char>(bytes));
       if (c == nullptr) throw std::runtime_error("gpu_vector: stats alloc failed");
@@ -555,6 +556,7 @@ class Vector {
       kv.second.hdr.stat_gen_busy_ = c + 7;    // stale but CAS lost
       // Pages a flush could not FIND -- silently dropped writebacks.
       kv.second.hdr.stat_flush_skipped_ = c + 8;
+      kv.second.hdr.stat_alloc_waits_ = c + 9;
       PublishHeader(kv.second);
     }
 #endif
@@ -745,9 +747,10 @@ class Vector {
 #if CTP_ENABLE_GPU
     auto it = devs_.find(gpu_id);
     if (it == devs_.end() || it->second.stats == nullptr) return s;
-    unsigned long long h[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    unsigned long long h[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     ctp::GpuApi::Memcpy(h, it->second.stats, sizeof(h));
     s.faults = h[0];
+    s.alloc_waits = h[9];
     s.puts = h[1];
     s.evicts = h[2];
     s.get_errors = h[3];
@@ -1169,6 +1172,7 @@ class Vector {
     st.hdr.stat_gen_busy_ = nullptr;
     st.hdr.stat_flush_skipped_ = nullptr;
     st.hdr.stat_put_errors_ = nullptr;
+    st.hdr.stat_alloc_waits_ = nullptr;
     st.hdr.fatal_ = FatalSlots();
     st.hdr.fatal_mirror_ = FatalMirror();
     PublishHeader(st);

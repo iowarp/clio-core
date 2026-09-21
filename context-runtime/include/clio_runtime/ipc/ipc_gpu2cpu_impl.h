@@ -141,11 +141,8 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
       // lane, not a total-work limit. Spinning until it lands is also what
       // makes this safe under EITHER lane flag (WAIT_FOR_SPACE today, where
       // the loop never iterates, or ERROR_ON_NO_SPACE), which retires the
-      // TODO(ring) that used to sit here.
+      // TODO(ring) that used to sit here. Pure spin, no sleep.
       while (!qlane.Push(task_future)) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-        __nanosleep(64);
-#endif
       }
     }
 
@@ -194,9 +191,6 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
       auto &qlane = ipc->gpu_info_.gpu2cpu_queue->GetLane(0, 0);
       // See the probing branch: a dropped Push hangs the waiter forever.
       while (!qlane.Push(task_future)) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-        __nanosleep(64);
-#endif
       }
     }
   }
