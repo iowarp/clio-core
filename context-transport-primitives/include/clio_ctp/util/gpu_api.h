@@ -1045,11 +1045,9 @@ class GpuApi {
     // missing branch once left the SYCL RAM tier reading back garbage.)
     if (size != 0) {
       if (stream != nullptr) {
-        // Eventless, like SyclCopySync: the per-event bookkeeping was the
-        // cost (2.6 ms per 64 KB against 5 us on the device). StreamQuery
-        // below synchronises the in-order stream directly.
-        sycl::ext::oneapi::experimental::memcpy(
-            *static_cast<sycl::queue *>(stream), dst, src, size);
+        // Event-based (see SyclCopySync for why not eventless); StreamQuery
+        // below polls the stream.
+        static_cast<sycl::queue *>(stream)->memcpy(dst, src, size);
       } else {
         SyclCopySync(SyclQueue(), dst, src, size);
       }
@@ -1111,13 +1109,11 @@ class GpuApi {
     // concurrent copies (sycl_copy_probe: 42 us per 64 KB pair alone,
     // 263 us with 8 threads, 490 us with 16, tails to 1.6 ms) that block
     // was most of a task's executing time on the two-node paged vector.
-    // The stream's copies are submitted without events (MemcpyAsync), so
-    // there is nothing to query; an in-order queue's wait() synchronises
-    // its command list directly and, with eventless submission, returns in
-    // the ~100-200 us the copy takes rather than the milliseconds the
-    // event path cost. A caller's "yield until landed" loop thus runs once.
+    // Non-blocking, like cudaStreamQuery: true once the in-order stream has
+    // nothing pending. Callers poll it (PollSync) or yield between polls
+    // (the bdev transport).
     if (stream) {
-      static_cast<sycl::queue *>(stream)->wait();
+      return static_cast<sycl::queue *>(stream)->ext_oneapi_empty();
     }
     return true;
 #else
@@ -1208,8 +1204,15 @@ class GpuApi {
    */
   static void SyclCopySync(sycl::queue &q, void *dst, const void *src,
                            size_t n) {
-    sycl::ext::oneapi::experimental::memcpy(q, dst, src, n);
-    q.wait();
+    // EVENT-BASED, waited by polling. An eventless submission followed by
+    // queue::wait() was tried: the first run with the runtime's threads on
+    // more than one core (see pbs_newcoro_aurora_2n.sh, --cpu-bind) died
+    // in RecvIn on a torn task record -- the shape of a wait that returned
+    // before the copy landed. The 2.6 ms per copy that motivated it was
+    // measured with every runtime thread time-sharing ONE core, and is not
+    // the event's cost.
+    sycl::event ev = q.memcpy(dst, src, n);
+    SpinWaitEvent(ev);
   }
 
   /**

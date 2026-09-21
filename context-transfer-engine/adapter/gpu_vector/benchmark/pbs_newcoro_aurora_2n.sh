@@ -103,11 +103,22 @@ export BENCH_RANK_ARGS="${BENCH_ARGS}"
 export BENCH_RANK_N="${NRANKS}"
 export BENCH_RANK_DIR="${RUNDIR}"
 
-echo "--- run (90s cap per rank, ${NRANKS} ranks) ---"
+# CPU BINDING. The single-node script runs the binary directly and sees the
+# whole node; under mpiexec a rank gets whatever PALS binds by default. The
+# runtime is ~12 spinning threads (workers, net send/recv, the GPU worker,
+# the reply thread) and a narrow cpuset time-slices them, which reads as
+# every completion event waiting 15-20 ms in every worker's queue
+# (clio-evqw) while each task's own CPU time is under a millisecond.
+# Print what the default would have been, then run unbound unless
+# BENCH_CPU_BIND says otherwise.
+echo "--- default binding per rank ---"
+mpiexec -n "${NRANKS}" --ppn 1 bash -c 'echo "rank ${PALS_RANKID:-?} $(grep Cpus_allowed_list /proc/self/status) nproc=$(nproc)"' 2>&1 | head -4
+CPU_BIND=${BENCH_CPU_BIND:-none}
+echo "--- run (90s cap per rank, ${NRANKS} ranks, --cpu-bind ${CPU_BIND}) ---"
 start=$SECONDS
 # Each rank writes its own log; the job log gets both, filtered, afterwards.
 # --envall carries every export above to the ranks.
-mpiexec -n "${NRANKS}" --ppn 1 --envall bash -c '
+mpiexec -n "${NRANKS}" --ppn 1 --envall --cpu-bind "${CPU_BIND}" bash -c '
   r=${PALS_RANKID:-${PMI_RANK:-0}}
   cd "$BENCH_RANK_DIR"
   timeout --signal=TERM --kill-after=10s 90 \

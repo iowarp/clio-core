@@ -180,6 +180,28 @@ and `BENCH_EXE` (a differently named binary).
    at 55 ns per iteration (removed; the GPU spin-waits), and a
    `neighborhood: 1` compose knob keeps cte_core targets node-local.
 
+10. **One CPU per rank.** The two-node script launches through
+    `mpiexec --ppn 1`; the single-node script runs the binary directly.
+    PALS's default binding gave each rank `Cpus_allowed_list: 1` -- ONE
+    core for the runtime's dozen spinning threads (workers, net send and
+    receive, the GPU worker, the reply thread) plus the benchmark's host
+    thread. Every two-node measurement above was taken in that state:
+    the uniform 15-20 ms a completion event sat in EVERY worker's queue
+    (clio-evqw), the 5-50 ms tail on one-in-four device copies while the
+    device itself did each in 4-5 us (event profiling), the "10 us per
+    loop iteration" that was thousands of microsecond iterations plus a
+    few 40 ms timeslice gaps. The two-node job scripts now print the
+    launcher's default binding and run with `--cpu-bind none`
+    (`BENCH_CPU_BIND` overrides). The first unbound run then crashed in
+    RecvIn on a torn task record: eventless copy submission (9) had been
+    waited with `queue::wait()`, which the unbound timing showed does not
+    cover it; copies are event-based again, waited by polling.
+
+    Lesson for the notes: the runtime-side changes in (9) that survive are
+    the ones that removed real serialisation (one shared queue, one
+    warmed stream, honouring the stream, per-thread queues); the ones
+    chasing "2 ms per copy" were chasing a scheduler artefact.
+
 Two smaller things found on the way and kept: `__nanosleep` was an empty
 function under SYCL, so `AllocatePage`'s transient-pressure backoff was 4096
 instant retries and a trap; and the device-side fatal latch is device memory

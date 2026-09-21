@@ -155,7 +155,9 @@ export BENCH_RANK_DIR="${RUNDIR}"
 # minutes, and PBS reaping the job mid-sentence is what the cap prevents.
 echo "--- run (200s cap per rank, ${NRANKS} ranks) ---"
 start=$SECONDS
-mpiexec -n "${NRANKS}" --ppn 1 --no-vni --envall bash -c '
+# --cpu-bind: see pbs_newcoro_aurora_2n.sh. The runtime's spinning threads
+# must not share a narrow cpuset.
+mpiexec -n "${NRANKS}" --ppn 1 --no-vni --envall --cpu-bind "${BENCH_CPU_BIND:-none}" bash -c '
   r=${PALS_RANKID:-${PMI_RANK:-0}}
   cd "$BENCH_RANK_DIR"
   sed "s/__RANK__/$r/g" clio_tier_template.yaml > "clio_tier_r$r.yaml"
