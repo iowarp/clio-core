@@ -23,7 +23,10 @@
 #include <clio_cte/gpu_vector/page.h>
 #include <clio_cte/gpu_vector/prefetch.h>
 
+#include <unistd.h>
+
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -97,21 +100,25 @@ inline unsigned long long *FatalSlots() {
 #if CTP_ENABLE_GPU
   static unsigned long long *slots = [] {
 #if CTP_ENABLE_SYCL
-    // SHARED, not pinned host, under SYCL. Measured on Aurora's Max 1550
-    // (benchmark/usm_atomic_probe.cc): a device atomic to malloc_host memory
-    // faults -- AtomicAccessViolation, and the device declares
-    // usm_atomic_host_allocations=0 -- while malloc_shared takes it. This
-    // latch is CAS'd from device code, and it was the one host-memory atomic
-    // in the whole device path; every paged benchmark died on it. The
-    // trap-survival argument for host memory does not apply on Level Zero
-    // anyway: a GPU fault there aborts the process, so nothing survives it.
-    auto *p = ctp::GpuApi::MallocManaged<unsigned long long>(
+    // DEVICE memory under SYCL. The latch is an atomicCAS from device code,
+    // and on Aurora's Max 1550 a device atomic to malloc_host memory faults
+    // outright (usm_atomic_host_allocations=0), while one to malloc_shared
+    // faults whenever the page happens to be resident on the HOST at that
+    // moment -- an AtomicAccessViolation at PDE level, not a migration.
+    // Shared memory passed benchmark/usm_atomic_probe.cc only because that
+    // kernel's launch migrated the page first; here the host memsets the
+    // slots at start-up and the device first touches them seconds later,
+    // mid-run, and the trap's own report became the crash that hid it
+    // (weights, lbann). Device memory takes atomics unconditionally. The
+    // host reads the note from FatalMirror() instead.
+    auto *p = ctp::GpuApi::Malloc<unsigned long long>(
         8 * sizeof(unsigned long long));
+    if (p != nullptr) ctp::GpuApi::Memset(p, 0, 8 * sizeof(unsigned long long));
 #else
     auto *p = ctp::GpuApi::MallocHost<unsigned long long>(
         8 * sizeof(unsigned long long));
-#endif
     if (p != nullptr) std::memset(p, 0, 8 * sizeof(unsigned long long));
+#endif
     return p;
   }();
   return slots;
@@ -120,30 +127,90 @@ inline unsigned long long *FatalSlots() {
 #endif
 }
 
-/** Human-readable form of whatever the device latched, or "" if nothing. */
-inline std::string FatalReport() {
-  unsigned long long *f = FatalSlots();
-  if (f == nullptr || f[0] == kFatalNone) return std::string();
-  const char *what = "unknown";
-  switch (f[0]) {
-    case kFatalInitBlock:   what = "Init(block) beyond the task table"; break;
-    case kFatalNotResident: what = "HoldPage: page not resident"; break;
-    case kFatalNotCovered:  what = "HoldPage: range never fetched"; break;
-    case kFatalUnbound:     what = "vector used before Init()"; break;
-    case kFatalSetFull:     what = "AllocatePage: set full"; break;
-    case kFatalFlushSplit:  what = "flush range needs more records"; break;
+/** Name of a fatal code, for the report.
+ *  @param code slot 0 of the fatal channel
+ *  @return a short description, "unknown" for a code this build does not know */
+inline const char *FatalWhat(unsigned long long code) {
+  switch (code) {
+    case kFatalInitBlock:   return "Init(block) beyond the task table";
+    case kFatalNotResident: return "HoldPage: page not resident";
+    case kFatalNotCovered:  return "HoldPage: range never fetched";
+    case kFatalUnbound:     return "vector used before Init()";
+    case kFatalSetFull:     return "AllocatePage: set full";
+    case kFatalFlushSplit:  return "flush range needs more records";
     case kFatalGetFailed:
-      what = "fetch returned an error; its pages were left EMPTY "
+      return "fetch returned an error; its pages were left EMPTY "
              "(a generational get names a generation the writer has "
              "not published)";
-      break;
-    default: break;
+    default: return "unknown";
   }
-  char buf[256];
-  std::snprintf(buf, sizeof(buf),
-                "[gpu_vector] DEVICE FATAL %llu (%s): a1=%llu a2=%llu a3=%llu "
-                "block=%llu", f[0], what, f[1], f[2], f[3], f[4]);
-  return std::string(buf);
+}
+
+/** Format the eight fatal slots. Plain snprintf into the caller's buffer, so
+ *  the abort handler below can use it too.
+ *  @param f   the slots (host-readable)
+ *  @param buf output
+ *  @param n   bytes in buf
+ *  @return bytes written, 0 when nothing was latched */
+inline int FatalFormat(const unsigned long long *f, char *buf, size_t n) {
+  if (f == nullptr || f[0] == kFatalNone) return 0;
+  const int w = std::snprintf(
+      buf, n, "[gpu_vector] DEVICE FATAL %llu (%s): a1=%llu a2=%llu a3=%llu "
+      "block=%llu\n", f[0], FatalWhat(f[0]), f[1], f[2], f[3], f[4]);
+  return w < 0 ? 0 : (w > static_cast<int>(n) ? static_cast<int>(n) : w);
+}
+
+/**
+ * The HOST-READABLE copy of the fatal channel.
+ *
+ * Under SYCL the latch itself is device memory (see FatalSlots) and the
+ * device mirrors each note here with plain stores; elsewhere this IS the
+ * latch. On Level Zero a device trap does not return to the caller -- the
+ * driver aborts the process -- so the only way the note reaches a human is
+ * a SIGABRT handler that prints this buffer on the way down, installed on
+ * first use. Without it a trap reads as an unexplained AtomicAccessViolation
+ * or a "fault at 0x0", which is what every FATAL on Aurora looked like.
+ */
+inline unsigned long long *FatalMirror() {
+#if CTP_ENABLE_GPU
+  static unsigned long long *mirror = [] {
+#if CTP_ENABLE_SYCL
+    auto *p = ctp::GpuApi::MallocHost<unsigned long long>(
+        8 * sizeof(unsigned long long));
+    if (p != nullptr) std::memset(p, 0, 8 * sizeof(unsigned long long));
+#else
+    unsigned long long *p = FatalSlots();
+#endif
+    struct Reporter {
+      static void OnAbort(int sig) {
+        char buf[320];
+        const int w = FatalFormat(FatalMirror(), buf, sizeof(buf));
+        if (w > 0) {
+          const ssize_t r = ::write(2, buf, static_cast<size_t>(w));
+          (void)r;
+        }
+        std::signal(sig, SIG_DFL);
+        std::raise(sig);
+      }
+    };
+    std::signal(SIGABRT, &Reporter::OnAbort);
+    std::signal(SIGSEGV, &Reporter::OnAbort);
+    return p;
+  }();
+  return mirror;
+#else
+  return nullptr;
+#endif
+}
+
+/** Human-readable form of whatever the device latched, or "" if nothing. */
+inline std::string FatalReport() {
+  char buf[320];
+  const int w = FatalFormat(FatalMirror(), buf, sizeof(buf));
+  if (w <= 0) return std::string();
+  std::string s(buf, static_cast<size_t>(w));
+  while (!s.empty() && s.back() == '\n') s.pop_back();
+  return s;
 }
 
 template <typename T>
@@ -1099,6 +1166,7 @@ class Vector {
     st.hdr.stat_flush_skipped_ = nullptr;
     st.hdr.stat_put_errors_ = nullptr;
     st.hdr.fatal_ = FatalSlots();
+    st.hdr.fatal_mirror_ = FatalMirror();
     PublishHeader(st);
     devs_[gpu_id] = st;
   }

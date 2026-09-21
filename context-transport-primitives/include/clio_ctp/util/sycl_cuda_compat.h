@@ -276,7 +276,28 @@ inline void Trap() {
 #endif
 }
 
-inline void NanoSleep(unsigned) { /* no SYCL equivalent; spin */ }
+/**
+ * CUDA's __nanosleep: back off for roughly `ns` nanoseconds.
+ *
+ * SPIR-V has neither a sleep instruction nor a cycle counter (Clock64 below
+ * reads 0), so this is a COUNTED spin -- about a nanosecond per iteration
+ * on PVC, which is the order the callers want: they back off from 1us to
+ * 1ms. It used to be an empty function, which turned every "wait, then
+ * retry" loop in the paged vector into a zero-length wait; AllocatePage's
+ * four-second grace under transient set pressure became 4096 instant
+ * retries and a trap, on a cache that was merely busy, not full.
+ *
+ * @param ns nanoseconds to wait, approximately
+ */
+inline void NanoSleep(unsigned ns) {
+#if defined(__SYCL_DEVICE_ONLY__)
+  volatile unsigned sink = 0;
+  for (unsigned i = 0; i < ns; ++i) sink = sink + 1u;
+  (void)sink;
+#else
+  (void)ns;
+#endif
+}
 
 /**
  * CUDA's bit-cast intrinsics.

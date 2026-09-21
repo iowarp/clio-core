@@ -139,7 +139,13 @@ echo "  SYCL OK: $(stat -c%s "$OUT/${NAME}_sycl${SUFFIX}.o") bytes"
 # branch is header-only (co/coro.h, co/driver.h, co/yield_backend.h), so a
 # stack built before them still links.
 # --------------------------------------------------------------------------
-BUILD=${CLIO_SYCL_BUILD:-/home/llogan/clio-core/build/sycl}
+# THIS TREE'S BUILD BY DEFAULT, never the main checkout's. The runpath is baked
+# in at link time, and one rebuild without the override linked every
+# benchmark against /home/llogan/clio-core/build/sycl -- a runtime from before
+# the device-ring port. Its kernels took the legacy host-memory queue and
+# died on its first atomic (AtomicAccessViolation at the 16 MB queue base),
+# which read exactly like the pre-ring failure and cost a night of bisecting.
+BUILD=${CLIO_SYCL_BUILD:-$W/build-fresh}
 if [ ! -d "$BUILD/bin" ]; then
   echo "  (no CLIO_SYCL_BUILD -- compile only)"
   exit 0

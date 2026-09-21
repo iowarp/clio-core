@@ -110,6 +110,13 @@ struct VecHeader {
    *  context, so a poller sees the reason. Slot 0 is the code (0 = nothing
    *  happened), 1..4 are its arguments, and it is written once and latched. */
   unsigned long long *fatal_;
+  /** Under SYCL, `fatal_` is DEVICE memory (the latch is an atomicCAS, and
+   *  on PVC an atomic to host or shared memory whose page is not mapped on
+   *  the device faults -- which is how a trap's own report became the crash
+   *  that hid it). The note is mirrored here, into pinned host memory, with
+   *  plain stores, so the host can read it after the abort. Same pointer
+   *  as fatal_ elsewhere. */
+  unsigned long long *fatal_mirror_;
 };
 
 /** Reasons a gpu_vector kernel traps. Slot 0 of the fatal channel. */
@@ -1075,6 +1082,16 @@ class DeviceVector {
     h_->fatal_[2] = a2;
     h_->fatal_[3] = a3;
     h_->fatal_[4] = static_cast<unsigned long long>(table_);
+    // The host-readable copy, plain stores only (see VecHeader::fatal_mirror_).
+    // Code LAST, so a reader that sees the code sees the arguments.
+    if (h_->fatal_mirror_ != nullptr && h_->fatal_mirror_ != h_->fatal_) {
+      h_->fatal_mirror_[1] = a1;
+      h_->fatal_mirror_[2] = a2;
+      h_->fatal_mirror_[3] = a3;
+      h_->fatal_mirror_[4] = static_cast<unsigned long long>(table_);
+      __threadfence_system();
+      h_->fatal_mirror_[0] = code;
+    }
     __threadfence_system();
   }
 
@@ -1667,7 +1684,12 @@ class DeviceVector {
           clio::run::u32 wait_ns = 1024u;
           for (clio::run::u32 spins = 0; p == nullptr && spins < 4096u;
                ++spins) {                        // ~4 s of 1 ms waits, then trap
-#if __CUDA_ARCH__ >= 700
+            // SYCL TOO. This guard used to be __CUDA_ARCH__ alone, so on
+            // PVC the grace period was 4096 back-to-back retries -- a set
+            // that was busy for a few microseconds (every frame flushing or
+            // pinned by a peer mid-chunk) trapped as "set full" on the
+            // spot. sycl_compat's __nanosleep is a counted spin.
+#if CTP_ENABLE_SYCL || __CUDA_ARCH__ >= 700
             __nanosleep(wait_ns);
 #endif
             if (wait_ns < kMaxWaitNs) wait_ns *= 2u;
