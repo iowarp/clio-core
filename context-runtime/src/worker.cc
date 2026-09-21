@@ -1277,6 +1277,14 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
   // Call appropriate coroutine function based on task state. Driving the
   // coroutine is the Task's own responsibility (it owns its RunContext/frame).
   if (is_started) {
+    // A resumed task is on this worker's CPU again: re-add the predicted cost
+    // its park released (see the yield branch below). Symmetric with the
+    // first-execution add for new tasks, and EndTask subtracts it once more
+    // when the task finishes, so load_ always equals the predicted cost of
+    // the tasks that can actually occupy this worker right now.
+    load_.store(load_.load(std::memory_order_relaxed) +
+                    task_ptr->PredictedLoad(),
+                std::memory_order_relaxed);
     task_ptr->ResumeCoroutine(task_ptr);
   } else {
     task_ptr->StartCoroutine(task_ptr);
@@ -1338,6 +1346,19 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
 
   // If coroutine yielded (not done and is_yielded_ set), don't clean up
   if (task_ptr->IsYielded() && !coro_done) {
+    // A PARKED TASK IS NOT LOAD. load_ counted every started-but-unfinished
+    // task until EndTask, parked coroutines included. On a two-node paged
+    // vector dozens of fault tasks sit parked on a remote await at any
+    // moment, so every worker read as backlogged: RuntimeMapTask stopped
+    // running sub-gets inline (RealtimeLoad > kInlineCallerLoadUs), routed
+    // them by predicted WALL time to the one heavy-class worker, found it
+    // "saturated" and spawned elastic workers at the 500 ms tick, while the
+    // tasks waited ~40 ms per hop in lanes (clio-evlat: C-P p50 85 ms on two
+    // nodes against 7 ms on one; multi_await 40 ms against a 1.5 ms get).
+    // Release the cost while parked; the resume above re-adds it.
+    load_.store(load_.load(std::memory_order_relaxed) -
+                    task_ptr->PredictedLoad(),
+                std::memory_order_relaxed);
     // yield_time_us_ > 0 means cooperative yield (polling) — add to periodic
     // queue so the worker re-checks after the requested delay.
     // yield_time_us_ == 0 means waiting for a Future event — the event queue

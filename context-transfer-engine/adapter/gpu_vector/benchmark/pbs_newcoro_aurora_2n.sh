@@ -75,8 +75,12 @@ fi
 # while the transfer engine's own remote-owner path bounces in the PutBlob
 # coroutine and sends host memory. Blob OWNERSHIP still spreads by hash
 # across both containers; only the storage behind each owner stays local.
-awk -v hf="${RUNDIR}/hostfile" '
+# BENCH_WORKERS overrides the runtime's thread count (experiment knob: the
+# scheduler's heavy cost class starts with one worker and grows by elastic
+# spawns at its 500 ms tick, which is slow when every fault task is heavy).
+awk -v hf="${RUNDIR}/hostfile" -v nw="${BENCH_WORKERS:-}" '
   /pool_id: "513.0"/ { sub(/"513.0"/, "\"512.0\"") }
+  nw != "" && /^  num_threads:/ { $0 = "  num_threads: " nw }
   { print }
   /pool_id: "512.0"/ { print "    targets:"; print "      neighborhood: 1" }
   /^networking:/ { print "  hostfile: \"" hf "\"" }
