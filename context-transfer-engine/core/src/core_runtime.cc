@@ -3843,19 +3843,16 @@ clio::run::TaskResume Runtime::CoDeviceCopy(void *dst, const void *src,
     std::memcpy(dst, src, n);
     CLIO_CO_RETURN;
   }
-  // Same shape as MemBdevTransport::WriteBlocks: borrow a stream (yielding
-  // while the pool is empty), enqueue, yield until the stream drains.
-  void *stream = ctp::GpuApi::BorrowStream();
-  while (stream == nullptr) {
-    CLIO_CO_AWAIT(clio::run::yield(10.0));
-    stream = ctp::GpuApi::BorrowStream();
-  }
-  ctp::GpuApi::MemcpyAsync(static_cast<char *>(dst),
-                           static_cast<const char *>(src), n, stream);
-  while (!ctp::GpuApi::StreamQuery(stream)) {
-    CLIO_CO_AWAIT(clio::run::yield(10.0));
-  }
-  ctp::GpuApi::ReturnStream(stream);
+  // SYNCHRONOUS ON PURPOSE, on this thread's own queue. The yielding form
+  // (enqueue, then `yield 10 us` until the stream drains) was tried and
+  // measured: the copy lands in well under a millisecond, but a yielded
+  // coroutine is only re-polled at the periodic queue's cadence, eight
+  // tasks per pass, so the 64 KB bounce took 10-22 ms of wall time on the
+  // two-node kmeans (clio-evchan pput_bounce) and every poll was an
+  // executing segment charged to the task. A blocking copy on a
+  // per-thread queue is 40 us alone and 0.3-0.5 ms with ten threads
+  // copying at once (sycl_copy_probe), which is the cheaper wait.
+  ctp::DeviceAwareMemcpy(dst, src, n);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

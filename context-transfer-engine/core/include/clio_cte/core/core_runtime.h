@@ -273,12 +273,10 @@ public:
   clio::run::TaskResume PodGetBlob(clio::run::shared_ptr<PodGetBlobTask> &task);
 
   /**
-   * Copy between device and host memory WITHOUT blocking the worker: the
-   * copy is enqueued on a borrowed GPU stream and the coroutine yields until
-   * it lands. A host-to-host pair is a plain memcpy. For the bounce copies
-   * on the remote-owner put and get paths, where a synchronous
-   * DeviceAwareMemcpy held the worker for the whole copy while concurrent
-   * copies serialised in the driver.
+   * Copy between device and host memory from a coroutine: a synchronous
+   * copy on the calling thread's own GPU queue (see the definition for why
+   * the yielding form lost). A host-to-host pair is a plain memcpy. Used by
+   * the bounce copies on the remote-owner put and get paths.
    * @param dst Destination (device or host)
    * @param src Source (device or host)
    * @param n Bytes to copy
