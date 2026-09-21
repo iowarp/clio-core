@@ -4,6 +4,9 @@
 #
 #   submit_2n_aurora.sh <name> <tag> [args...]
 #
+# JOB_SCRIPT selects another job script in this directory (default
+# pbs_newcoro_aurora_2n.sh); BENCH_EXTRA adds comma-separated qsub -v vars.
+#
 # Writes build-spike/pbs/<tag>.log. Waits (rather than returns) because the
 # debug queue admits one queued job per user and these are run in sequence.
 set -u
@@ -15,7 +18,7 @@ id=""
 for i in $(seq 1 360); do
   out=$(qsub -N "c2n_${TAG}" -o "$ROOT/build-spike/pbs/${TAG}.log" \
         -v "BENCH_NAME=${NAME},BENCH_ARGS=${ARGS},ROOT=${ROOT}${BENCH_EXTRA:+,${BENCH_EXTRA}}" \
-        "$HERE/pbs_newcoro_aurora_2n.sh" 2>&1)
+        "$HERE/${JOB_SCRIPT:-pbs_newcoro_aurora_2n.sh}" 2>&1)
   case "$out" in
     *"limit of jobs"*) sleep 20 ;;
     *qsub:*) echo "SUBMIT-FAILED ${TAG}: ${out}"; exit 1 ;;
