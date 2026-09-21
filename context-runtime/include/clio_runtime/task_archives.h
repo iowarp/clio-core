@@ -194,22 +194,21 @@ public:
   void PushPod(bool val) { is_pod_ = val; }
   void PopPod() { is_pod_ = false; }
 
+  /** Constructor and destructor are defined OUT OF LINE, in task_archive.cc.
+   *  Inline, every executable carried its own copy, and an executable linked
+   *  before a member was added kept constructing the OLD layout while the
+   *  library's bulk() used the new one: the crash in a two-node kmeans was
+   *  bulk() pushing onto a staged_ that a stale kmeans binary never
+   *  initialised. With the special members in one library the layout has
+   *  one owner, and a stale binary fails to link instead of failing to run.
+   *  @param msg_type Serialization mode of the message being built
+   *  @param lbm_transport Transport used to Expose bulk buffers (may be null) */
   explicit SaveTaskArchive(MsgType msg_type,
-                           ctp::lbm::Transport *lbm_transport = nullptr)
-      : NetTaskArchive(msg_type),
-        serializer_(buffer_),
-        lbm_transport_(lbm_transport) {
-    buffer_.reserve(256);
-  }
-
-  SaveTaskArchive(SaveTaskArchive &&other) noexcept
-      : NetTaskArchive(std::move(other)),
-        buffer_(std::move(other.buffer_)),
-        serializer_(buffer_, true),
-        lbm_transport_(other.lbm_transport_),
-        staged_(std::move(other.staged_)) {
-    other.lbm_transport_ = nullptr;
-  }
+                           ctp::lbm::Transport *lbm_transport = nullptr);
+  /** Move constructor: takes the buffer, the staged copies and the transport.
+   *  @param other Archive to move from; its transport is cleared */
+  SaveTaskArchive(SaveTaskArchive &&other) noexcept;
+  ~SaveTaskArchive();
 
   SaveTaskArchive &operator=(SaveTaskArchive &&other) noexcept = delete;
   SaveTaskArchive(const SaveTaskArchive &) = delete;

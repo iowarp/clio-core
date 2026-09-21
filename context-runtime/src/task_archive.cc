@@ -43,6 +43,25 @@
 
 namespace clio::run {
 
+SaveTaskArchive::SaveTaskArchive(MsgType msg_type,
+                                 ctp::lbm::Transport *lbm_transport)
+    : NetTaskArchive(msg_type),
+      serializer_(buffer_),
+      lbm_transport_(lbm_transport) {
+  buffer_.reserve(256);
+}
+
+SaveTaskArchive::SaveTaskArchive(SaveTaskArchive &&other) noexcept
+    : NetTaskArchive(std::move(other)),
+      buffer_(std::move(other.buffer_)),
+      serializer_(buffer_, true),
+      lbm_transport_(other.lbm_transport_),
+      staged_(std::move(other.staged_)) {
+  other.lbm_transport_ = nullptr;
+}
+
+SaveTaskArchive::~SaveTaskArchive() = default;
+
 /**
  * SaveTaskArchive bulk transfer implementation
  * Adds bulk descriptor to send vector with proper Expose handling

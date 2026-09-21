@@ -105,6 +105,20 @@ and `BENCH_EXE` (a differently named binary).
    buffer the archive owns for the send (`task_archive.cc`). The other
    four never hit it because their cross-node traffic is host memory.
 
+6. **A stale benchmark binary interposing the runtime.** The rerun of (5)
+   crashed inside the staging code itself: `staged_.emplace_back` with the
+   vector's three pointers holding stack garbage, on libraries that were
+   provably rebuilt. The archive's constructor was inline in the header,
+   so the kmeans executable -- linked three hours before the member was
+   added -- exported its own copy, and the dynamic linker picked it over
+   the library's (the executable is first in lookup scope). The old copy
+   constructed the old 1152-byte layout; the library's `bulk()` used the
+   new 1176-byte one. The special members now live in `task_archive.cc`,
+   so the layout has one owner and a stale binary fails to link instead of
+   corrupting memory. Same lesson as the task-struct ABI note in AGENTS.md,
+   one level up: after changing a header that crosses a library boundary,
+   relink every executable, not only the libraries.
+
 Two smaller things found on the way and kept: `__nanosleep` was an empty
 function under SYCL, so `AllocatePage`'s transient-pressure backoff was 4096
 instant retries and a trap; and the device-side fatal latch is device memory
