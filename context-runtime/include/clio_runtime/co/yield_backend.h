@@ -182,80 +182,74 @@ class Ctx {
 };
 
 /* ======================================================================== */
-/* Frame -- one suspending call's slice of the lane region.                  */
+/* Frame -- this call's slice of the lane's park log.                        */
 /* ======================================================================== */
 
 /**
- * Claims this call's frame on construction and releases it on Done().
+ * The lane region is a LIFO LOG of parked frames, and nothing else.
  *
- * Fresh entry claims the next region and zeroes the resume point; a resume
- * re-attaches to the frame this call already owns at this depth, which is
- * what makes the save list come back.
+ * WHY A LOG AND NOT A DEPTH-INDEXED TABLE. The previous design pre-claimed a
+ * fixed-size frame at function ENTRY and recorded where it landed in
+ * `frame_off_[kYieldMaxDepth]`, so that the next entry could find the same
+ * frame by depth. That made the chain's nesting depth a resource with a
+ * compile-time cap (8), and lammps_md's fetch/evict chain blew through it
+ * under eviction pressure -- DEVICE FATAL 101 -- while the bytes were never
+ * the problem.
+ *
+ * The cap was never necessary, because the ORDER of parks and resumes is
+ * already a stack:
+ *
+ *   park:    the unwind is innermost-first. C parks and pushes, returns to
+ *            B; B sees Parked() and pushes, returns to A; A pushes; the
+ *            kernel exits.                       log = [C, B, A], A on top
+ *   resume:  re-entry is outermost-first. A enters and pops (top), calls B
+ *            which pops, calls C which pops.
+ *
+ * So a frame is claimed at PARK time, not entry time: Push appends
+ * [vars..., trailer{start, state}] and bumps `sp_`; Pop reads the top entry
+ * and unbumps. A function entering the chain asks one question -- is the log
+ * non-empty? -- and if so the top entry is necessarily its own: the only way
+ * it would not be is if the resuming caller invoked a different callee than
+ * the one that parked, and the caller jumps straight to its `case N:` at the
+ * awaited call, so it cannot. A call that completes without parking leaves
+ * nothing behind, which is also why Done() has nothing to do.
+ *
+ * The only limit left is `bytes_per_lane_`, which is the actual memory.
+ * `cur_depth_`, `live_depth_` and `frame_off_` are not read here; they
+ * belong to the macro backend, which keeps its own scheme.
  */
+struct CoLogTrailer {
+  u32 start_; /**< byte offset of this entry's first var, from the lane base */
+  u32 state_; /**< the case label to resume at */
+};
+
 class Frame {
  public:
   /**
    * @param cx    the context threaded in by clio-coroc
-   * @param bytes save-list bytes this call needs, the max over its suspend
-   *              points -- a compile-time constant the transpiler computes
+   * @param bytes the transpiler's compile-time frame size. Kept for the
+   *              call signature it emits; a log sizes entries as they are
+   *              written, so it is not needed.
    */
   __device__ __forceinline__ Frame(Ctx &cx, u32 bytes) : cx_(&cx) {
+    (void)bytes;
     lane_ = cx.Lane();
     base_ = reinterpret_cast<char *>(lane_);
-    const u32 d = lane_->cur_depth_++;
-    if (d >= clio::run::gpu::kYieldMaxDepth) {
-      lane_->error_ = clio::run::gpu::kYieldErrDepth;
-      clio::run::gpu::YieldFatalNote(clio::run::gpu::kYieldFatalDepth,
-                                     blockIdx.x, threadIdx.x, d);
-      __trap();
-    }
-    if (d < lane_->live_depth_) {
-      fp_ = lane_->frame_off_[d];
-      fresh_ = false;
-    } else {
-      fp_ = (lane_->sp_ + 15u) & ~15u;
-      const u32 end = fp_ + static_cast<u32>(sizeof(CoFrameHeader)) + bytes;
-      if (end > clio::run::gpu::YieldTls().stack_.bytes_per_lane_) {
-        lane_->error_ = clio::run::gpu::kYieldErrOverflow;
-        printf("[coroc] block %u lane %u: frame overflow, need %u > %u bytes\n",
-               blockIdx.x, threadIdx.x, end,
-               clio::run::gpu::YieldTls().stack_.bytes_per_lane_);
-        clio::run::gpu::YieldFatalNote(clio::run::gpu::kYieldFatalCoroFrame,
-                                       blockIdx.x, threadIdx.x, end);
-        __trap();
-      }
-      lane_->frame_off_[d] = fp_;
-      lane_->sp_ = end;
-      lane_->live_depth_ = d + 1;
-      fresh_ = true;
-      Header()->resume_point_ = 0;
-    }
+    // Non-empty log at entry means the chain is resuming and the top entry
+    // is this call's. Read its state once; Pop consumes it.
+    replay_ = lane_->sp_ > static_cast<u32>(sizeof(clio::run::gpu::YieldLaneHeader));
+    state_ = replay_ ? Top()->state_ : 0u;
   }
 
   /** The case label this entry must jump to. Zero on a fresh call. */
-  __device__ __forceinline__ u32 Resume() const {
-    return Header()->resume_point_;
-  }
+  __device__ __forceinline__ u32 Resume() const { return state_; }
 
-  /** True while re-entering a call that was live when the kernel exited, so
-   *  the save list on the way to the resume point must be restored.
-   *
-   * A RESUME POINT IS REQUIRED, not just a live frame. `fresh_` is false
-   * whenever this depth already had a frame, which is not the same as
-   * "this call parked here": a chain that resumed, ran on, and then made
-   * a DIFFERENT call at the same depth re-attaches to the old frame, and
-   * with only the fresh_ test that call would Pop a save list belonging
-   * to its predecessor -- overwriting its own freshly-assigned awaiter
-   * with stale bytes, which reads as a null receiver at the park guard.
-   * Done() zeroes the resume point on every normal return, so a frame
-   * with none has nothing to replay.
-   */
-  __device__ __forceinline__ bool Replaying() const {
-    return !fresh_ && Header()->resume_point_ != 0;
-  }
+  /** True while re-entering a call that parked: the save list on the way to
+   *  the resume point must be restored with Pop. */
+  __device__ __forceinline__ bool Replaying() const { return replay_; }
 
   /**
-   * Suspend here: record where to come back to and save the live set.
+   * Suspend here: append this call's live set and resume point to the log.
    *
    * @param state the case label to resume at
    * @param vs    the values that must survive the park
@@ -264,36 +258,50 @@ class Frame {
   __device__ __forceinline__ void Push(u32 state, const Ts &...vs) {
     static_assert((std::is_trivially_copyable_v<Ts> && ...),
                   "a value live across a CO_AWAIT must be trivially copyable");
-    Header()->resume_point_ = state;
-    cx_->MarkParked();
-    char *p = Slot();
+    const u32 start = lane_->sp_;
+    char *p = base_ + start;
     (StoreOne(p, vs), ...);
+    p = Align(p, alignof(CoLogTrailer));
+    const u32 end = static_cast<u32>(p - base_) +
+                    static_cast<u32>(sizeof(CoLogTrailer));
+    if (end > clio::run::gpu::YieldTls().stack_.bytes_per_lane_) {
+      lane_->error_ = clio::run::gpu::kYieldErrOverflow;
+      printf("[coroc] block %u lane %u: park log overflow, need %u > %u bytes\n",
+             blockIdx.x, threadIdx.x, end,
+             clio::run::gpu::YieldTls().stack_.bytes_per_lane_);
+      clio::run::gpu::YieldFatalNote(clio::run::gpu::kYieldFatalCoroFrame,
+                                     blockIdx.x, threadIdx.x, end);
+      __trap();
+    }
+    CoLogTrailer *t = reinterpret_cast<CoLogTrailer *>(p);
+    t->start_ = start;
+    t->state_ = state;
+    lane_->sp_ = end;
+    cx_->MarkParked();
   }
 
-  /** Restore the live set written by the matching Push, in the same order. */
+  /** Restore the live set written by the matching Push, in the same order,
+   *  and release the entry. */
   template <class... Ts>
   __device__ __forceinline__ void Pop(Ts &...vs) {
     static_assert((std::is_trivially_copyable_v<Ts> && ...),
                   "a value live across a CO_AWAIT must be trivially copyable");
-    char *p = Slot();
+    const u32 start = Top()->start_;
+    char *p = base_ + start;
     (LoadOne(p, vs), ...);
-    fresh_ = true;  // replay consumed; deeper suspends this entry are fresh
+    lane_->sp_ = start;
+    replay_ = false;  // replay consumed; deeper suspends this entry are fresh
+    state_ = 0;
   }
 
-  /** Normal return: release the frame so a later call reuses the space. */
-  __device__ __forceinline__ void Done() const {
-    lane_->cur_depth_ -= 1;
-    lane_->live_depth_ = lane_->cur_depth_;
-    lane_->sp_ = fp_;
-    Header()->resume_point_ = 0;
-  }
+  /** Normal return. A call that did not park left nothing on the log, and a
+   *  call that resumed already consumed its entry in Pop. */
+  __device__ __forceinline__ void Done() const {}
 
  private:
-  __device__ __forceinline__ CoFrameHeader *Header() const {
-    return reinterpret_cast<CoFrameHeader *>(base_ + fp_);
-  }
-  __device__ __forceinline__ char *Slot() const {
-    return base_ + fp_ + sizeof(CoFrameHeader);
+  __device__ __forceinline__ CoLogTrailer *Top() const {
+    return reinterpret_cast<CoLogTrailer *>(
+        base_ + lane_->sp_ - static_cast<u32>(sizeof(CoLogTrailer)));
   }
   __device__ __forceinline__ static char *Align(char *p, std::size_t a) {
     const std::uintptr_t x = reinterpret_cast<std::uintptr_t>(p);
@@ -315,8 +323,8 @@ class Frame {
   Ctx *cx_;
   clio::run::gpu::YieldLaneHeader *lane_;
   char *base_;
-  u32 fp_;
-  bool fresh_;
+  u32 state_;
+  bool replay_;
 };
 
 /* ======================================================================== */
