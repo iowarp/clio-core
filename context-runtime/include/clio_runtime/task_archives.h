@@ -185,6 +185,10 @@ private:
   ctp::ipc::GlobalSerialize<std::vector<char>> serializer_;
   ctp::lbm::Transport *lbm_transport_;
   bool is_pod_ = false;
+  /** Host copies of bulk buffers that live in DEVICE memory (see bulk()).
+   *  Owned here so they outlive the send: the transport copies bulk bytes
+   *  with a host memcpy inside Send, and a GPU address there is a segfault. */
+  std::vector<std::unique_ptr<char[]>> staged_;
 
 public:
   void PushPod(bool val) { is_pod_ = val; }
@@ -202,7 +206,8 @@ public:
       : NetTaskArchive(std::move(other)),
         buffer_(std::move(other.buffer_)),
         serializer_(buffer_, true),
-        lbm_transport_(other.lbm_transport_) {
+        lbm_transport_(other.lbm_transport_),
+        staged_(std::move(other.staged_)) {
     other.lbm_transport_ = nullptr;
   }
 

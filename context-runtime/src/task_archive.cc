@@ -39,6 +39,7 @@
 #include "clio_runtime/task_archives.h"
 #include "clio_runtime/ipc_manager.h"
 #include "clio_ctp/util/logging.h"
+#include <clio_ctp/util/gpu_api.h>
 
 namespace clio::run {
 
@@ -51,6 +52,22 @@ namespace clio::run {
  */
 void SaveTaskArchive::bulk(ctp::ipc::ShmPtr<> ptr, size_t size, uint32_t flags) {
   ctp::ipc::FullPtr<char> full_ptr = CLIO_IPC->ToFullPtr(ptr).template Cast<char>();
+  // DEVICE MEMORY IS STAGED THROUGH THE HOST. A task bound for another node
+  // can carry a bulk buffer that lives in GPU memory -- a paged vector's
+  // frame being written back to the node that owns its blob -- and the
+  // transport copies bulk bytes with a host memcpy inside Send. On Aurora
+  // that was zmq_send(0xff000000112e0000, 65536) dying in memmove, on the
+  // first cross-node page flush of a two-node kmeans. Managed memory is
+  // host-readable and needs nothing; device-only memory is copied once into
+  // a buffer this archive owns for as long as the send needs it.
+  if (size != 0 && full_ptr.ptr_ != nullptr &&
+      ctp::IsDevicePointer(full_ptr.ptr_)) {
+    staged_.emplace_back(new char[size]);
+    char *host = staged_.back().get();
+    ctp::DeviceAwareMemcpy(host, full_ptr.ptr_, size);
+    full_ptr.ptr_ = host;
+    full_ptr.shm_ = ctp::ipc::ShmPtr<>::GetNull();
+  }
   ctp::lbm::Bulk bulk;
   bulk.data = full_ptr;
   bulk.size = size;
