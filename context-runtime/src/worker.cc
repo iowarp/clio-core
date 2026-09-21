@@ -39,6 +39,10 @@
  */
 
 #include "clio_runtime/worker.h"
+#include "clio_runtime/cycle_counter.h"
+
+/** Latency-report channel hook (defined in ipc_gpu2cpu.cc). */
+extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 
 // <coroutine> only for the C++20 stackless backend, not the Boost stackful one.
 // (CLIO_ENABLE_BOOST_COROUTINES is defined by task.h, included below, in terms of
@@ -1755,6 +1759,17 @@ void Worker::ProcessEventQueue() {
   while (eq->Pop(future)) {
     HLOG(kDebug, "Worker {}: ProcessEventQueue popped subtask future",
          worker_id_);
+    // Latency report (CLIO_EVLAT): how long the completion event sat here.
+    {
+      const clio::run::shared_ptr<Task> &sub = future.GetTaskPtr();
+      if (!sub.IsNull()) {
+        RunContext *rc = sub->RunCtxPtr();
+        if (rc != nullptr && rc->notify_ns_ != 0) {
+          clio_evlat_add(11, clio::run::CycleNow() - rc->notify_ns_);
+          rc->notify_ns_ = 0;
+        }
+      }
+    }
     // Mark the subtask's future as complete
     future.Complete();
 

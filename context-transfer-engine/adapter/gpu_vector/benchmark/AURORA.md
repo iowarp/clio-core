@@ -144,14 +144,41 @@ and `BENCH_EXE` (a differently named binary).
    nothing. `targets: {neighborhood: 1}` in the two-node compose (both
    job scripts) removed the staged sends entirely (ser 3 ms on both ranks)
    and cut the kernel from 6.5 s to 4.5 s.
-   Still open: 4.5 s for ~170 remote faults is ~26 ms per fault, and the
-   scheduler's histogram still shows hundreds of tasks in the 1-500 ms
-   bins. Every remaining device copy on the fault path -- the PutBlob
-   bounce, the HBM bdev write and read, the reply landing in the frame --
-   is a synchronous `queue::memcpy().wait()` on the runtime's default
-   out-of-order queue while the benchmark kernel occupies the tile. The
-   `sycl_copy_probe` job measures that copy under a spinning kernel for
-   the default, in-order and separate-context queues.
+   Still open after that: 4.5 s for ~170 remote faults, against 65 ms
+   per iteration for the same size on ONE node (`kmeans_1n_64`).
+
+9. **Every SYCL copy on one shared queue.** `sycl_copy_probe` cleared the
+   GPU side: a 64 KB host-initiated copy is 10 us pinned, 37 us pageable
+   (heap, std::vector or MAP_SHARED memfd alike), with the tile idle or
+   running a 64-group spin kernel, whatever queue or copy-engine setting.
+   The runtime's own numbers disagreed: the bdev `[bwr]` profile
+   (`CLIO_PUT_PROF=1`) put each HBM block write at 3.7-6.1 ms of copy
+   *submission* and 2 us of wait, and the scheduler's per-method table
+   (on-CPU time, timers pause across a park) had PodMultiGetBlob at
+   3.75 ms and bdev Write at 5.9 ms per task. Cause: under SYCL,
+   `GpuApi::MemcpyAsync` ignored its stream and ran every "async" copy as
+   a synchronous `memcpy().wait()` on the one shared `SyclQueue()`, from
+   every worker and the network receive thread at once; DeviceAwareMemcpy
+   did the same; and the SYCL init never warmed the I/O stream pool, so
+   `BorrowStream` handed out a single queue and every concurrent bdev copy
+   yielded waiting for it. Now: MemcpyAsync enqueues on the caller's
+   in-order stream (PollSync/StreamQuery wait on it), DeviceAwareMemcpy
+   uses a per-thread in-order queue, and the pool is warmed like the HIP
+   init does. Two-node 64 MB kmeans: kernel 4.5 s -> 2.9 s, GetBlob
+   handler 3 ms -> 0.4-0.75 ms, bdev read await 6.7 ms -> 0.4 ms.
+
+   Still open: the fault handler still spends ~40 ms awaiting a sub-get
+   that itself takes under 1 ms, and a GPU submission still waits ~70 ms
+   from route to handler end (clio-evlat C-P p50), against 7 ms on one
+   node. The next report carries two more channels, the remote round
+   trip (SendIn to reply) and the completion event's wait in the parent's
+   event queue, to place the remaining 40 ms.
+
+   Also found and kept on the way: PodMultiGetBlob's parked coroutines
+   were counted as worker load until they finished (they now release it
+   while parked), the device-side `__nanosleep` shim was a counted spin
+   at 55 ns per iteration (removed; the GPU spin-waits), and a
+   `neighborhood: 1` compose knob keeps cte_core targets node-local.
 
 Two smaller things found on the way and kept: `__nanosleep` was an empty
 function under SYCL, so `AllocatePage`'s transient-pressure backoff was 4096

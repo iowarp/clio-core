@@ -34,7 +34,11 @@
 #include <cstring>
 
 #include <clio_runtime/ipc/ipc_run2run.h>
+#include <clio_runtime/cycle_counter.h>
 #include <clio_runtime/ipc_manager.h>
+
+/** Latency-report channel hook (defined in ipc_gpu2cpu.cc). */
+extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 #include <clio_runtime/pool_manager.h>
 #include <clio_runtime/config_manager.h>
 #include <clio_runtime/worker.h>
@@ -313,6 +317,11 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
     }
 
     replica_targets[i] = target_node_id;
+    // Latency report (CLIO_EVLAT): the remote round trip starts here and
+    // ends in RecvOutCompleteOriginTask.
+    if (RunContext *rc = origin_task->RunCtxPtr()) {
+      if (rc->notify_ns_ == 0) rc->notify_ns_ = clio::run::CycleNow();
+    }
     SendInTransmitReplica(ipc_manager, task_copy,
                           target_node_id, origin_task);
   }
@@ -762,6 +771,12 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
   // RunContext.
   if (!ClaimOrigin(net_key)) {
     return;
+  }
+  if (RunContext *rc = origin_task->RunCtxPtr()) {
+    if (rc->notify_ns_ != 0) {
+      clio_evlat_add(10, clio::run::CycleNow() - rc->notify_ns_);
+      rc->notify_ns_ = 0;
+    }
   }
 
   // The origin task is about to be completed through EndTask, which calls the

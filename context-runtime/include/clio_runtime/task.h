@@ -969,6 +969,12 @@ class RunContext {
    *  0 for every task the probe did not open — which is every CPU-origin task,
    *  and all tasks when the probe is off. */
   uintptr_t probe_rec_;
+  /** Cycle stamp for the latency report (CLIO_EVLAT): set when this task's
+   *  completion event is pushed onto its parent's event queue, read when the
+   *  parent's worker pops it (channel evq_wait); and on an origin task, set
+   *  at SendIn and read when the remote reply completes it (channel
+   *  rtt_remote). 0 when unset. */
+  unsigned long long notify_ns_ = 0;
 
  private:
   std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event
