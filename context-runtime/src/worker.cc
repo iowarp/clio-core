@@ -44,11 +44,52 @@
 /** Latency-report channel hook (defined in ipc_gpu2cpu.cc). */
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 
+namespace {
+/**
+ * Event-queue wait per popping worker (CLIO_EVLAT). The global evq_wait
+ * channel showed completion events sitting 5-50 ms in their parent's queue
+ * on the two-node kmeans after every task's executing time had dropped
+ * below a millisecond; this says which workers' queues are the slow ones.
+ * Printed at exit as "clio-evqw worker=N n=.. avg=..us slow(>5ms)=..".
+ */
+struct EvqWaitByWorker {
+  static constexpr int kMax = 64;
+  static std::atomic<unsigned long long> n[kMax], sum[kMax], slow[kMax];
+  static void Add(unsigned worker, unsigned long long cycles) {
+    if (worker >= static_cast<unsigned>(kMax)) return;
+    n[worker].fetch_add(1, std::memory_order_relaxed);
+    sum[worker].fetch_add(cycles, std::memory_order_relaxed);
+    if (cycles > 5000ull * 2995ull) {
+      slow[worker].fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  static void Report() {
+    for (int w = 0; w < kMax; ++w) {
+      const unsigned long long c = n[w].load();
+      if (c == 0) continue;
+      std::fprintf(stderr, "clio-evqw worker=%d n=%llu avg=%.0fus slow(>5ms)=%llu\n",
+                   w, c, static_cast<double>(sum[w].load()) / 2995.0 /
+                             static_cast<double>(c),
+                   slow[w].load());
+    }
+  }
+  EvqWaitByWorker() {
+    if (std::getenv("CLIO_EVLAT") != nullptr) std::atexit(Report);
+  }
+};
+std::atomic<unsigned long long> EvqWaitByWorker::n[EvqWaitByWorker::kMax];
+std::atomic<unsigned long long> EvqWaitByWorker::sum[EvqWaitByWorker::kMax];
+std::atomic<unsigned long long> EvqWaitByWorker::slow[EvqWaitByWorker::kMax];
+EvqWaitByWorker g_evqw_init;
+}  // namespace
+
 // <coroutine> only for the C++20 stackless backend, not the Boost stackful one.
 // (CLIO_ENABLE_BOOST_COROUTINES is defined by task.h, included below, in terms of
 // CLIO_ENABLE_BOOST_COROUTINES.)
 #if !defined(CLIO_ENABLE_BOOST_COROUTINES)
+#include <atomic>
 #include <coroutine>
+#include <cstdio>
 #endif
 #include <cerrno>
 #include <cstdlib>
@@ -1780,13 +1821,16 @@ void Worker::ProcessEventQueue() {
   while (eq->Pop(future)) {
     HLOG(kDebug, "Worker {}: ProcessEventQueue popped subtask future",
          worker_id_);
-    // Latency report (CLIO_EVLAT): how long the completion event sat here.
+    // Latency report (CLIO_EVLAT): how long the completion event sat here,
+    // and per popping worker, so a slow queue can be traced to its owner.
     {
       const clio::run::shared_ptr<Task> &sub = future.GetTaskPtr();
       if (!sub.IsNull()) {
         RunContext *rc = sub->RunCtxPtr();
         if (rc != nullptr && rc->notify_ns_ != 0) {
-          clio_evlat_add(11, clio::run::CycleNow() - rc->notify_ns_);
+          const unsigned long long d = clio::run::CycleNow() - rc->notify_ns_;
+          clio_evlat_add(11, d);
+          EvqWaitByWorker::Add(worker_id_, d);
           rc->notify_ns_ = 0;
         }
       }
