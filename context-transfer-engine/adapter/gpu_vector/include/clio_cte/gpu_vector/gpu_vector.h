@@ -154,9 +154,22 @@ inline const char *FatalWhat(unsigned long long code) {
  *  @return bytes written, 0 when nothing was latched */
 inline int FatalFormat(const unsigned long long *f, char *buf, size_t n) {
   if (f == nullptr || f[0] == kFatalNone) return 0;
-  const int w = std::snprintf(
+  int w = std::snprintf(
       buf, n, "[gpu_vector] DEVICE FATAL %llu (%s): a1=%llu a2=%llu a3=%llu "
       "block=%llu\n", f[0], FatalWhat(f[0]), f[1], f[2], f[3], f[4]);
+  if (w > 0 && f[0] == kFatalSetFull && static_cast<size_t>(w) < n) {
+    // Slots 5-7 carry ReportSetFull's tallies, packed as documented there.
+    const unsigned long long t4 = f[5], t5 = f[6], t6 = f[7];
+    const int w2 = std::snprintf(
+        buf + w, n - static_cast<size_t>(w),
+        "[gpu_vector]   home set: %llu pinned, %llu in flight | all sets: "
+        "%llu resident, %llu pinned, %llu fetching, %llu flushing, %llu "
+        "empty | regions: %llu of %llu on free lists\n",
+        f[3], t4 & 0xFFFFull, t5 & 0xFFFFull, (t5 >> 16) & 0xFFFFull,
+        (t4 >> 16) & 0xFFFFull, (t4 >> 32) & 0xFFFFull, (t5 >> 32) & 0xFFFFull,
+        t6 & 0xFFFFFFFFull, t6 >> 32);
+    if (w2 > 0) w += w2;
+  }
   return w < 0 ? 0 : (w > static_cast<int>(n) ? static_cast<int>(n) : w);
 }
 
@@ -183,7 +196,7 @@ inline unsigned long long *FatalMirror() {
 #endif
     struct Reporter {
       static void OnAbort(int sig) {
-        char buf[320];
+        char buf[512];
         const int w = FatalFormat(FatalMirror(), buf, sizeof(buf));
         if (w > 0) {
           const ssize_t r = ::write(2, buf, static_cast<size_t>(w));
@@ -209,7 +222,7 @@ inline unsigned long long *FatalMirror() {
 
 /** Human-readable form of whatever the device latched, or "" if nothing. */
 inline std::string FatalReport() {
-  char buf[320];
+  char buf[512];
   const int w = FatalFormat(FatalMirror(), buf, sizeof(buf));
   if (w <= 0) return std::string();
   std::string s(buf, static_cast<size_t>(w));

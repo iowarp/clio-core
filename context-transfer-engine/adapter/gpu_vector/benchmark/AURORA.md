@@ -34,11 +34,28 @@ core.
 | weights   | PASS   | both ranks the same global checksum, put_errors=0; 7 s (bound: 36 s) |
 | grayscott | PASS   | v_checksum bit-identical to single-node on both ranks; 146 ms of kernel at 13.7 GB/s (bound: 3390 ms, 0.59 GB/s) |
 | kmeans    | PASS   | `--data-mb 256 --hbm-mb 128`: 4874 faults/rank, kernel 574 ms at 0.87 GB/s, checksum matching single-node (bound: past the 90 s cap after (5)-(7)); 64 MB/node: 33 ms per iteration against 65 ms on one node |
-| lammps_md | OPEN   | runs to completion on both nodes, gate fails; see below |
+| lammps_md | PASS   | `--lattice 28 --steps 10`: ballistic gate bitwise on both ranks, 320 page iterations each (its own slab), 0 faults; 94 ms for 10 steps (164 ms while every node integrated the whole lattice, see (11)) |
 
-Storage tiers on Flare and DAOS: `pbs_newcoro_aurora_2n_tier.sh` and
-`submit_tier_all_aurora.sh` (16 GB through 8 GB of HBM into 8 GB on a
-filesystem), results to follow.
+### Storage tiers on Flare and DAOS
+
+`pbs_newcoro_aurora_2n_tier.sh` and `submit_tier_all_aurora.sh`: 16 GB
+of data across the two nodes, a 4 GB HBM tier per node and a 4.5 GB file
+tier per node on the filesystem under test (`neighborhood: 1`, 1 MB
+pages). Every run spilled 9.0 GB into its tier directory; "kernel" is
+the benchmark's own timing of the paged pass, per rank.
+
+| benchmark | tier | result | kernel | notes |
+|-----------|------|--------|--------|-------|
+| kmeans    | Flare | OK | 3.36 s, 2.38 GB/s | 7.5k faults/rank; checksum 30782.392076 |
+| kmeans    | DAOS  | OK | 5.33 s, 1.50 GB/s | checksum 30782.372690 (differs in the 7th digit; the centroid sums are atomic float adds, ordered by fault timing) |
+| grayscott | Flare | OK | 14.4 s / 9.0 s, 2.2-3.6 GB/s | v_checksum 10416629.698624 on both ranks and both tiers |
+| grayscott | DAOS  | OK | 4.5 s / 6.2 s, 7.1-5.2 GB/s | 10.8k faults/rank, 4096 puts |
+| weights   | DAOS  | OK | 4.72 s / 4.78 s, 1.7 GB/s | after (12); both ranks checksum OK and identical, 16.2k faults/rank, put_errors=0. Three runs before it trapped in `AllocatePage: set full` within the first eight pages per block |
+| weights   | Flare | pending | -- | same trap twice before (12); rerun queued |
+
+At 64 KB pages the first kmeans run wrote ~45 MB/s per node to Flare (a
+synchronous ~1.4 ms per page put) and was still loading when the 200 s
+cap hit; the tier runs use 1 MB pages.
 
 ## How to build and run
 
@@ -206,6 +223,39 @@ and `BENCH_EXE` (a differently named binary).
     warmed stream, honouring the stream, per-thread queues); the ones
     chasing "2 ms per copy" were chasing a scheduler artefact.
 
+11. **lammps_md on two nodes: every node integrated the whole lattice.**
+    The ballistic `IntegrateCoro` looped over every page of x and v, and
+    every page is published by name into ONE store shared by both nodes.
+    Node 1 faulted node 0's slab after node 0 had published its first
+    half-step, integrated it ten more times and, finishing later, wrote
+    it back last: node 0 then downloaded its own atoms exactly one drift
+    and one half-kick ahead of the reference while node 1 passed bitwise
+    (node 0 had read node 1's slab pristine, being first). Deterministic
+    across runs, and nothing to do with the runtime. The kernel now takes
+    a page range and each node integrates only its slab, in all three
+    editions and both backends; the expected page-iteration count
+    follows (320 per node, not 640).
+
+12. **weights tiering: a spin-wait inside the yield driver.** Both ranks
+    trapped in `AllocatePage: set full` within their first eight pages per
+    block. The trap's tallies (now carried through the host-mirrored fatal
+    latch, since a device printf does not survive a Level Zero trap) said
+    what the set held: 6 pinned, 5 in flight of 8 frames -- and, across
+    the cache, 63 pinned, 63 flushing, 31 fetching, with 150-365 frames
+    EMPTY and as many regions on the free lists. Not exhaustion: every
+    other block held exactly its one current page pinned and its previous
+    page flushing, and half of them were parked awaiting a fetch. Under
+    the yield driver a parked block runs again only when the ROUND ends,
+    and a block spinning in `SubmitFetch`'s allocation retry (2^20
+    AllocatePage calls) never lets it end. Six peers' frames hashed into
+    one 8-way set is a few-percent event per snapshot with 64 blocks; it
+    only needed to happen once. The retry now spins briefly (2^12) and
+    then YIELDS the round: `SubmitFetch` keeps the frames it has claimed,
+    records where it stopped and returns false; the three BeginFetch forms
+    loop on a yield-once (tag 0, as the peer-wait in HoldPage) and call it
+    again, and only a stall that survives 2^16 rounds traps. The spin also
+    retires the block's own landed flush while it waits.
+
 Two smaller things found on the way and kept: `__nanosleep` was an empty
 function under SYCL, so `AllocatePage`'s transient-pressure backoff was 4096
 instant retries and a trap; and the device-side fatal latch is device memory
@@ -215,14 +265,6 @@ atomic fault.
 
 ## Open
 
-- **lammps_md across two nodes**: each rank completes all 640 page
-  iterations deterministically, but every owned atom ends one drift
-  (dt*v per axis) and one half-kick (dt*g/2) AHEAD of the ballistic
-  reference on both nodes -- i.e. one extra integrate launch in the
-  multi-node stage-1 loop. Not a readback artefact (MD_SETTLE_MS=2000
-  changed nothing) and not the network. The stage-1 gate now judges only
-  the node's own z-slab (it compared every global slot before, which read
-  as exactly half the energy); the extra launch is unlocated.
 - **Composite (two-tile) mode**: lbann faults on an atomic to device memory
   when a root device is used unpinned; the other four pass either way. One
   tile is ALCF's recommended unit and is what the table reports.

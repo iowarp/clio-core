@@ -358,7 +358,20 @@ class DeviceVector {
     // NO SEPARATE COUNT/EVICT/PIN PASS. SubmitFetch claims each page in its
     // home set under that set's lock, evicting there if it has to, and leaves
     // it pinned. Those pins persist until the caller's UnpinRange.
-    if (threadIdx.x == 0) SubmitFetch(lo, hi, nr);
+    //
+    // A FULL SET IS A YIELD, NOT A SPIN. The frames holding the set belong
+    // to peers that are parked (awaiting their own fetch or flush), and a
+    // parked block only runs again when this ROUND ends -- which a block
+    // spinning in place never lets happen. SubmitFetch keeps what it has
+    // claimed, says no, and the block gives the round back; tag 0 because
+    // what it waits for (a peer's unpin) has no completion word.
+    for (;;) {
+      int ok = 0;
+      if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr) ? 1 : 0;
+      if (__syncthreads_or(ok)) break;
+      int once = 0;
+      CLIO_CO_YIELD_WHEN(;, once++ == 0, 0ull);
+    }
     __syncthreads();
     co_return;
   }
@@ -757,7 +770,13 @@ class DeviceVector {
     if (FetchBusy()) {
       CO_AWAIT(CoAwaitFetch());
     }
-    if (threadIdx.x == 0) SubmitFetch(lo, hi, nr);
+    // A full set yields the round instead of spinning; see BeginFetch.
+    for (;;) {
+      int ok = 0;
+      if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr) ? 1 : 0;
+      if (__syncthreads_or(ok)) break;
+      CO_AWAIT(OnceWait{0}.Take());
+    }
     __syncthreads();
   }
 
@@ -926,6 +945,8 @@ class DeviceVector {
     CLIO_YLOCAL(MRangeArr, lo);
     CLIO_YLOCAL(MRangeArr, hi);
     CLIO_YLOCAL_INIT(clio::run::u32, nr, 0);
+    CLIO_YLOCAL_INIT(int, ok, 0);
+    CLIO_YLOCAL_INIT(int, once, 0);
     CLIO_YBEGIN();
     if (threadIdx.x == 0) Tasks()->fetch_generation = generation;
     __syncthreads();
@@ -935,7 +956,14 @@ class DeviceVector {
     if (FetchBusy()) {
       CLIO_YCALL(MAwaitFetch());
     }
-    if (threadIdx.x == 0) SubmitFetch(lo, hi, nr);
+    // A full set yields the round instead of spinning; see BeginFetch.
+    for (;;) {
+      ok = 0;
+      if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr) ? 1 : 0;
+      if (__syncthreads_or(ok)) break;
+      once = 0;
+      CLIO_YIELD_IF_RESUME_WHEN(once++ == 0, 0ull);
+    }
     __syncthreads();
     CLIO_YEND();
   }
@@ -1079,20 +1107,28 @@ class DeviceVector {
    * before the trap kills the context.
    */
   CTP_GPU_FUN void FatalNote(unsigned long long code, unsigned long long a1,
-                             unsigned long long a2,
-                             unsigned long long a3) const {
+                             unsigned long long a2, unsigned long long a3,
+                             unsigned long long a4 = 0,
+                             unsigned long long a5 = 0,
+                             unsigned long long a6 = 0) const {
     if (h_->fatal_ == nullptr || threadIdx.x != 0) return;
     if (atomicCAS(h_->fatal_, kFatalNone, code) != kFatalNone) return;
     h_->fatal_[1] = a1;
     h_->fatal_[2] = a2;
     h_->fatal_[3] = a3;
     h_->fatal_[4] = static_cast<unsigned long long>(table_);
+    h_->fatal_[5] = a4;
+    h_->fatal_[6] = a5;
+    h_->fatal_[7] = a6;
     // The host-readable copy, plain stores only (see VecHeader::fatal_mirror_).
     // Code LAST, so a reader that sees the code sees the arguments.
     if (h_->fatal_mirror_ != nullptr && h_->fatal_mirror_ != h_->fatal_) {
       h_->fatal_mirror_[1] = a1;
       h_->fatal_mirror_[2] = a2;
       h_->fatal_mirror_[3] = a3;
+      h_->fatal_mirror_[5] = a4;
+      h_->fatal_mirror_[6] = a5;
+      h_->fatal_mirror_[7] = a6;
       h_->fatal_mirror_[4] = static_cast<unsigned long long>(table_);
       __threadfence_system();
       h_->fatal_mirror_[0] = code;
@@ -1431,8 +1467,15 @@ class DeviceVector {
     return n;
   }
 
-  /** Say which set overflowed and what is holding it. */
-  CTP_GPU_FUN void ReportSetFull(clio::run::u64 pn) const {
+  /** Say which set overflowed and what is holding it. The tallies also go
+   *  back packed for the fatal latch, since a device printf does not
+   *  survive the trap on Level Zero:
+   *  @param t4 home set: busy | fetching_all << 16 | flushing_all << 32
+   *  @param t5 all sets: resident | pinned_all << 16 | empty_tags << 32
+   *  @param t6 regions: on free lists | nregions << 32 */
+  CTP_GPU_FUN void ReportSetFull(clio::run::u64 pn, unsigned long long *t4,
+                                 unsigned long long *t5,
+                                 unsigned long long *t6) const {
     const clio::run::u32 set = SetOf(pn);
     Page *tbl = SetPages(set);
     clio::run::u32 pinned = 0, busy = 0;
@@ -1475,6 +1518,14 @@ class DeviceVector {
     printf("[gpu_vector]   all sets: %u resident (%u pinned, %u fetching, "
            "%u flushing), %u empty tags; %u of %u regions on free lists\n",
            res, pin_all, fet, flu, freed, q, h_->nregions_);
+    *t4 = static_cast<unsigned long long>(busy) |
+          (static_cast<unsigned long long>(fet) << 16) |
+          (static_cast<unsigned long long>(flu) << 32);
+    *t5 = static_cast<unsigned long long>(res) |
+          (static_cast<unsigned long long>(pin_all) << 16) |
+          (static_cast<unsigned long long>(freed) << 32);
+    *t6 = static_cast<unsigned long long>(q) |
+          (static_cast<unsigned long long>(h_->nregions_) << 32);
   }
 
   /** One eviction pass over one set; returns how many frames it dropped. */
@@ -1621,16 +1672,33 @@ class DeviceVector {
     }
   }
 
-  /** Claim a frame per missing page, fill the bulk get, send it. Thread 0. */
-  CTP_GPU_FUN void SubmitFetch(const clio::run::u64 *lo,
+  /** Claim a frame per missing page, fill the bulk get, send it. Thread 0.
+   *
+   *  RESUMABLE. A page whose home set stays full is not claimed; the call
+   *  keeps every frame it did claim (pinned and marked in flight, exactly as
+   *  a completed call would leave them), records where it stopped and
+   *  returns false so the caller can yield the round and call again with the
+   *  same ranges. Only after kMaxFetchStalls such yields does it trap.
+   *  @return true once the batch is submitted (or was empty) */
+  CTP_GPU_FUN bool SubmitFetch(const clio::run::u64 *lo,
                                const clio::run::u64 *hi, clio::run::u32 nr) {
     BlockTasks *bt = Tasks();
     auto *t = bt->fetch;
-    t->count_ = 0;
     clio::run::u32 n = 0;
-    for (clio::run::u32 r = 0; r < nr; ++r) {
+    clio::run::u32 r0 = 0;
+    clio::run::u64 resume_pn = 0;
+    const bool resuming = bt->fetch_partial != 0u;
+    if (resuming) {
+      n = bt->fetch_n;
+      r0 = bt->fetch_resume_r;
+      resume_pn = bt->fetch_resume_pn;
+    } else {
+      t->count_ = 0;
+    }
+    for (clio::run::u32 r = r0; r < nr; ++r) {
       if (hi[r] <= lo[r]) continue;
-      const clio::run::u64 p0 = PageOf(lo[r]);
+      const clio::run::u64 p0 =
+          (resuming && r == r0) ? resume_pn : PageOf(lo[r]);
       const clio::run::u64 p1 = PageOf(hi[r] - 1);
       for (clio::run::u64 pn = p0;
            pn <= p1 && n < clio::cte::core::kPodMultiMax; ++pn) {
@@ -1687,17 +1755,47 @@ class DeviceVector {
           // polling now, everywhere; the grace period is a retry count
           // sized so a set busy for microseconds never traps (each retry
           // is an AllocatePage under the set lock, a few microseconds).
-          constexpr clio::run::u32 kMaxAllocRetries = 1u << 20;
+          //
+          // RETIRE THIS BLOCK'S OWN LANDED FLUSH WHILE WAITING. The frame a
+          // block flushed for its previous page stays `flushing` -- and so
+          // unevictable by anyone -- until the block next reaches
+          // BeginFlush or EndFlush. Retiring it touches only this block's
+          // task record, so it is safe from here (thread 0).
+          //
+          // THE SPIN IS SHORT, AND THEN THE BLOCK YIELDS. The frames that
+          // fill a set belong to peers, and under the yield driver a peer
+          // that has parked -- awaiting its fetch or its flush -- runs again
+          // only when the round ends. A block spinning here holds the round
+          // open, so those peers can never unpin, and the wait never
+          // drains: the weights tiering run trapped on both nodes within
+          // its first eight pages per block, the home set showing 3-6
+          // pinned frames and the rest in flight, after 2^20 retries. A few
+          // thousand retries cover transient pressure (peers that are
+          // running and about to unpin); beyond that the caller yields the
+          // round and comes back, and only a stall that survives
+          // kMaxFetchStalls rounds is treated as the true hold-set wedge.
+          constexpr clio::run::u32 kMaxAllocRetries = 1u << 12;
+          constexpr clio::run::u32 kMaxFetchStalls = 1u << 16;
           for (clio::run::u32 spins = 0;
                p == nullptr && spins < kMaxAllocRetries; ++spins) {
             if (h_->stat_alloc_waits_ != nullptr) {
               atomicAdd(h_->stat_alloc_waits_, 1ull);
             }
+            if (FlushBusy() && FlushLanded(bt)) RetireFlush();
             p = AllocatePage(pn, &is_new);
           }
           if (p == nullptr) {
-            ReportSetFull(pn);
-            FatalNote(kFatalSetFull, pn, SetOf(pn), PinnedInSet(SetOf(pn)));
+            if (++bt->fetch_stalls < kMaxFetchStalls) {
+              bt->fetch_partial = 1u;
+              bt->fetch_n = n;
+              bt->fetch_resume_r = r;
+              bt->fetch_resume_pn = pn;
+              return false;
+            }
+            unsigned long long t4 = 0, t5 = 0, t6 = 0;
+            ReportSetFull(pn, &t4, &t5, &t6);
+            FatalNote(kFatalSetFull, pn, SetOf(pn), PinnedInSet(SetOf(pn)),
+                      t4, t5, t6);
             __trap();
           }
           if (!is_new) {
@@ -1748,10 +1846,12 @@ class DeviceVector {
       }
     }
     bt->fetch_n = n;
+    bt->fetch_partial = 0u;
+    bt->fetch_stalls = 0u;
     // The version THIS batch is being fetched at. PublishFetch stamps the
     // frames with it; fetch_generation may already have moved on by then.
     bt->fetch_gen_sub = bt->fetch_generation;
-    if (n == 0) return;
+    if (n == 0) return true;
     t->task_flags_.Clear();
     t->return_code_.store(0);
     t->task_id_ = DeviceTaskId(Table(), kKindFetch, bt->seq++);
@@ -1787,6 +1887,7 @@ class DeviceVector {
     t->fut_.is_complete_.store(0);   // reused task: clear the last completion
     bt->fetch_fut =
         clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(t));
+    return true;
   }
 
 

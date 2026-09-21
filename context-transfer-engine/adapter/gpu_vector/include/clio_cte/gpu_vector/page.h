@@ -106,6 +106,14 @@ struct BlockTasks {
   clio::run::u64 fetch_gen_sub;
   /** Generation stamped on the in-flight flush (0 = ordinary flush). */
   clio::run::u64 flush_generation;
+  /** A SubmitFetch that could not claim every page keeps what it claimed and
+   *  says where to resume: fetch_partial != 0 means fetch_n records are
+   *  staged and the walk continues at range fetch_resume_r, page
+   *  fetch_resume_pn. fetch_stalls counts the yields taken while waiting. */
+  clio::run::u32 fetch_partial;
+  clio::run::u32 fetch_resume_r;
+  clio::run::u64 fetch_resume_pn;
+  clio::run::u32 fetch_stalls;
 };
 
 /**
