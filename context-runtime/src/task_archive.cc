@@ -199,7 +199,14 @@ void LoadTaskArchive::bulk(ctp::ipc::ShmPtr<> &ptr, size_t size, uint32_t flags)
           char *src = recv[current_bulk_index_].data.ptr_;
           size_t copy_size = recv[current_bulk_index_].size;
           if (dst.ptr_ && src) {
-            memcpy(dst.ptr_, src, copy_size);
+            // THE CALLER'S BUFFER MAY BE DEVICE MEMORY. A paged vector's
+            // page fault on a blob another node owns is a bdev ReadTask
+            // whose destination is the GPU frame; the reply's bytes arrive
+            // in host memory and a plain memcpy into the frame is the
+            // mirror image of the send-side crash above (kmeans two-node
+            // rank 0, __memmove into 0xff00... from RecvOut). Host
+            // destinations take the same memcpy as before.
+            ctp::DeviceAwareMemcpy(dst.ptr_, src, copy_size);
           }
         } else {
           // No original buffer — zero-copy, point directly at recv buffer
