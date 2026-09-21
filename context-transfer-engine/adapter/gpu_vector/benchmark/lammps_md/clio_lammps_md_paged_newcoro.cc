@@ -4140,21 +4140,45 @@ int main(int argc, char **argv) {
   // YieldFatalNote CAS's this word from device code. Shared USM takes it.
   unsigned long long *yfatal =
 #if CTP_ENABLE_SYCL
-      ctp::GpuApi::MallocManaged<unsigned long long>(4 * sizeof(unsigned long long));
+      // DEVICE memory, not shared. The yield driver's YieldFatalNote CAS's
+      // this word from a kernel, and on the Max 1550 a device atomic to host
+      // memory faults outright while one to shared memory faults whenever
+      // the page is host-resident at that moment -- which a 2 ms host poller
+      // guarantees. The watcher below reads it with an engine copy on its
+      // own stream instead, so the page never moves. (gpu_vector.h's
+      // FatalSlots tells the same story.)
+      ctp::GpuApi::Malloc<unsigned long long>(4 * sizeof(unsigned long long));
 #else
       ctp::GpuApi::MallocHost<unsigned long long>(4 * sizeof(unsigned long long));
 #endif
   if (yfatal != nullptr) {
+#if CTP_ENABLE_SYCL
+    ctp::GpuApi::Memset(yfatal, 0, 4 * sizeof(unsigned long long));
+#else
     std::memset(yfatal, 0, 4 * sizeof(unsigned long long));
+#endif
     md::SymbolWrite(md::MdSym::kYieldFatal, &yfatal, sizeof(yfatal));
   }
   std::thread fatal_watch([yfatal] {
+#if CTP_ENABLE_SYCL
+    void *watch_stream = ctp::GpuApi::CreateStream();
+    unsigned long long snap[4] = {0, 0, 0, 0};
+#endif
     for (;;) {
-      if (yfatal != nullptr && yfatal[0] != 0) {
+#if CTP_ENABLE_SYCL
+      const unsigned long long *f = snap;
+      if (yfatal != nullptr) {
+        ctp::GpuApi::MemcpyAsync(snap, yfatal, sizeof(snap), watch_stream);
+        ctp::GpuApi::PollSync(watch_stream);
+      }
+#else
+      const unsigned long long *f = yfatal;
+#endif
+      if (yfatal != nullptr && f[0] != 0) {
         std::fprintf(stderr,
                      "[yield] DEVICE FATAL %llu (101=depth 102=frame "
                      "103=coro-frame): block=%llu lane=%llu need=%llu\n",
-                     yfatal[0], yfatal[1], yfatal[2], yfatal[3]);
+                     f[0], f[1], f[2], f[3]);
         std::fflush(stderr);
         return;
       }

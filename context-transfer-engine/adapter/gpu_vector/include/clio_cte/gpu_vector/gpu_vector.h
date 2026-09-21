@@ -193,8 +193,12 @@ inline unsigned long long *FatalMirror() {
         std::raise(sig);
       }
     };
+    // SIGABRT ONLY. The Level Zero driver owns SIGSEGV: a host access to a
+    // shared-USM page the device holds is a fault the driver's handler
+    // resolves by migrating the page back. Taking SIGSEGV here killed
+    // lammps_md three seconds in, on its fatal-channel poller's first read
+    // after a kernel had pulled the page to the device.
     std::signal(SIGABRT, &Reporter::OnAbort);
-    std::signal(SIGSEGV, &Reporter::OnAbort);
     return p;
   }();
   return mirror;
