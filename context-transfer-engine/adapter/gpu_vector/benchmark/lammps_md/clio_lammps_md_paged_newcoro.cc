@@ -5772,8 +5772,12 @@ gpu, dx, dv, d_thermo, g.nb,
   }
   const auto sx = vx.ReadStats(0);
   const auto sv2 = vv.ReadStats(0);
-  const bool resident_ok = (sx.faults == 0 && sx.evicts == 0 &&
-                            sv2.faults == 0 && sv2.evicts == 0);
+  // Across nodes the halo planes are FETCHED by design -- a neighbour owns
+  // and publishes them -- so faults are the exchange, not a broken contract;
+  // the contract there is that nothing of the owned slab is ever evicted.
+  const bool resident_ok =
+      (sx.evicts == 0 && sv2.evicts == 0) &&
+      (a.nodes > 1 || (sx.faults == 0 && sv2.faults == 0));
   std::printf("  paging: x faults=%llu evicts=%llu | v faults=%llu "
               "evicts=%llu  %s\n",
               (unsigned long long)sx.faults, (unsigned long long)sx.evicts,
@@ -5807,9 +5811,19 @@ gpu, dx, dv, d_thermo, g.nb,
     double max_cf = 0.0;
     double ke_ref = 0.0, mom_ref[3] = {0, 0, 0};
     const double n = static_cast<double>(a.steps);
+    // THIS NODE'S SLAB ONLY. The device thermo is per node, and the slots
+    // outside [my_z0, my_z1) hold either the halo (a neighbour's planes,
+    // exchanged for x but not integrated here) or nothing this node ever
+    // wrote. Comparing all of them against a global reference gave each of
+    // two nodes exactly half the energy and 18816 velocity "mismatches".
+    const u64 bins_per_plane = static_cast<u64>(g.nb) * g.nb;
     for (u64 s = 0; s < g.nslots; ++s) {
       const u64 e = s * kStride;
       if (hx[e + 3] < 0.0f) continue;
+      if (a.nodes > 1) {
+        const u64 bz = (s / g.cap) / bins_per_plane;
+        if (bz < my_z0 || bz >= my_z1) continue;
+      }
       // (a) float replica, same op order as the kernel
       float rx[3] = {hx[e], hx[e + 1], hx[e + 2]};
       float rv[3] = {hv[e], hv[e + 1], hv[e + 2]};
