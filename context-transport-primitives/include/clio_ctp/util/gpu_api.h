@@ -62,6 +62,9 @@
 
 #include "clio_ctp/constants/macros.h"
 #include "clio_ctp/util/logging.h"
+#if CTP_ENABLE_SYCL
+#include <sycl/ext/oneapi/experimental/enqueue_functions.hpp>
+#endif
 
 #if defined(__x86_64__)
 #include <x86intrin.h>
@@ -1044,7 +1047,7 @@ class GpuApi {
       if (stream != nullptr) {
         static_cast<sycl::queue *>(stream)->memcpy(dst, src, size);
       } else {
-        { auto ev = SyclQueue().memcpy(dst, src, size); SpinWaitEvent(ev); }
+        SyclCopySync(SyclQueue(), dst, src, size);
       }
     }
 #endif
@@ -1175,13 +1178,29 @@ class GpuApi {
    * @return This thread's queue, constructed on first use
    */
   static sycl::queue &SyclThreadQueue() {
-    // Profiling on, so SpinWaitEvent can report where a slow copy spent its
-    // time (queued on the device vs. transferring) to the latency report.
-    thread_local sycl::queue q{
-        SyclQueue().get_context(), SyclQueue().get_device(),
-        sycl::property_list{sycl::property::queue::in_order{},
-                            sycl::property::queue::enable_profiling{}}};
+    thread_local sycl::queue q{SyclQueue().get_context(),
+                               SyclQueue().get_device(),
+                               sycl::property::queue::in_order{}};
     return q;
+  }
+
+  /**
+   * One synchronous copy on `q` WITHOUT a SYCL event. Event profiling on the
+   * two-node kmeans put the device at 4-5 us per 64 KB copy while the host
+   * saw 2.6 ms on average with 5-50 ms stalls in a quarter of them: the
+   * time is the runtime's per-event bookkeeping under ten threads of
+   * churn, not the transfer. The enqueue-functions extension submits with
+   * no event, and an in-order queue's wait() synchronises its command list
+   * directly.
+   * @param q In-order queue to copy on
+   * @param dst Destination
+   * @param src Source
+   * @param n Bytes
+   */
+  static void SyclCopySync(sycl::queue &q, void *dst, const void *src,
+                           size_t n) {
+    sycl::ext::oneapi::experimental::memcpy(q, dst, src, n);
+    q.wait();
   }
 
   /**
@@ -1459,7 +1478,7 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   // shared out-of-order queue serialised them all on its lock.
   auto &q = GpuApi::SyclThreadQueue();
   if (dst_dev == src_dev) {
-    { auto ev = q.memcpy(dst, src, n); GpuApi::SpinWaitEvent(ev); }
+    GpuApi::SyclCopySync(q, dst, src, n);
 #if defined(__x86_64__)
     if (clio_evlat_add != nullptr) clio_evlat_add(16, __rdtsc() - ev_c1);
 #endif
@@ -1472,7 +1491,7 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   // taken for; it also keeps every host side the driver sees registered.
   char *pin = GpuApi::SyclPinnedBounce();
   if (pin == nullptr) {
-    { auto ev = q.memcpy(dst, src, n); GpuApi::SpinWaitEvent(ev); }
+    GpuApi::SyclCopySync(q, dst, src, n);
 #if defined(__x86_64__)
     if (clio_evlat_add != nullptr) clio_evlat_add(16, __rdtsc() - ev_c1);
 #endif
@@ -1482,11 +1501,11 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   for (size_t off = 0; off < n; off += kChunk) {
     const size_t c = std::min(kChunk, n - off);
     if (src_dev) {
-      { auto ev = q.memcpy(pin, static_cast<const char *>(src) + off, c); GpuApi::SpinWaitEvent(ev); }
+      GpuApi::SyclCopySync(q, pin, static_cast<const char *>(src) + off, c);
       std::memcpy(static_cast<char *>(dst) + off, pin, c);
     } else {
       std::memcpy(pin, static_cast<const char *>(src) + off, c);
-      { auto ev = q.memcpy(static_cast<char *>(dst) + off, pin, c); GpuApi::SpinWaitEvent(ev); }
+      GpuApi::SyclCopySync(q, static_cast<char *>(dst) + off, pin, c);
     }
   }
 #if defined(__x86_64__)
