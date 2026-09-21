@@ -286,6 +286,19 @@ struct MdTables {
   const int *np[kMaxNlGuards];
   u64 gs[kMaxNlGuards];
   u64 gl[kMaxNlGuards];
+  /** The chunk's held x spans, as the list build's stage coroutines hand
+   *  them to each other: which plane (sdz = dz+1) and y rows (sbase, scnt)
+   *  each span covers, and what its fetch pinned (sxrb, sxlen) so the chunk
+   *  can give it back. Block-uniform, so they live here rather than in a
+   *  coroutine frame -- and a stage cannot return them through a pointer
+   *  into its caller's frame, which would not survive a park (rule R9). */
+  u32 sbase[9];
+  u32 scnt[9];
+  u32 sdz[9];
+  u64 sxrb[9];
+  u64 sxlen[9];
+  u32 nspans;
+  u32 nguards;
 };
 
 

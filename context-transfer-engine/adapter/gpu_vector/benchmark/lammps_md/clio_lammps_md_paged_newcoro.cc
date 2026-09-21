@@ -512,40 +512,343 @@ __device__ CLIO_COROC_INLINE void ForceCoro(gv::DeviceVector<float> x,
  * stencil row (0..8); the force pass decodes with two shifts instead of a
  * global-index page lookup. 16 bits hold any row (nb * cap < 65536,
  * checked at startup).
+ *
+ * STAGED, NOT ONE FUNCTION. This was a single 290-line coroutine with 18
+ * suspend points inside four nested loops, and IGC's backend segfaults
+ * compiling the state machine that makes (the one kernel of lammps_md that
+ * IGC_FunctionControl=3 did not rescue). Each stage below carries at most
+ * three suspend points and a frame of a few hundred bytes; the compute is
+ * an ordinary function with no suspend point at all, so it is never
+ * hoisted into a frame. Stages hand each other block-uniform results
+ * through the persistent shared tables (MdTables), which is where the
+ * original already published them for the compute pass -- never through
+ * a pointer into a caller's frame, which would not survive a park (R9).
  */
-__device__ CLIO_COROC_INLINE void BuildListCoro(gv::DeviceVector<float> x,
+
+/**
+ * The stencil's y rows for a chunk [y0, ylast]: one range, or two when
+ * the stencil wraps past either edge of the box. Non-suspending.
+ *
+ * @param nb    bins per side
+ * @param y0    first row of the chunk
+ * @param ylast last row of the chunk
+ * @param rl    out: first row of each range
+ * @param rn    out: rows in each range
+ * @return number of ranges (1 or 2)
+ */
+__device__ inline u32 StencilYRanges(u32 nb, u32 y0, u32 ylast, u32 *rl,
+                                     u32 *rn) {
+  const int lo = static_cast<int>(y0) - 1;
+  const int hi = static_cast<int>(ylast) + 1;
+  u32 nr = 0;
+  if (lo < 0) {
+    rl[nr] = 0; rn[nr] = static_cast<u32>(hi) + 1u; ++nr;
+    rl[nr] = nb - 1u; rn[nr] = 1u; ++nr;
+  } else if (hi > static_cast<int>(nb) - 1) {
+    rl[nr] = static_cast<u32>(lo); rn[nr] = nb - static_cast<u32>(lo); ++nr;
+    rl[nr] = 0; rn[nr] = 1u; ++nr;
+  } else {
+    rl[nr] = static_cast<u32>(lo);
+    rn[nr] = static_cast<u32>(hi - lo + 1); ++nr;
+  }
+  return nr;
+}
+
+/**
+ * Span guards a chunk's three stencil planes will hold, for AdmitSpans.
+ * Non-suspending: pure arithmetic over the same ranges HoldChunkSpansCoro
+ * will fetch.
+ *
+ * @return guards to reserve for this chunk
+ */
+__device__ inline u32 CountChunkSpanGuards(const gv::DeviceVector<float> &x,
+                                           u32 nb, u32 cap, u32 bz, u32 y0,
+                                           u32 ylast, u64 row_elems) {
+  u32 span_guards = 0;
+  for (int dz = -1; dz <= 1; ++dz) {
+    const u32 wz = (bz + nb + dz) % nb;
+    u32 rl[2];
+    u32 rn[2];
+    const u32 nr = StencilYRanges(nb, y0, ylast, rl, rn);
+    for (u32 t = 0; t < nr; ++t) {
+      const u64 rb = ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
+      span_guards += PagesSpanned(x, rb, static_cast<u64>(rn[t]) * row_elems);
+    }
+  }
+  return span_guards;
+}
+
+/**
+ * Stage 1 of the list build: hold the three stencil planes' rows for one
+ * chunk and publish the spans into the persistent tables.
+ *
+ * The guards are trivially copyable VIEWS; nothing has to outlive this
+ * call. Fetch is the pinner and the chunk's UnpinRange (from sxrb/sxlen)
+ * the releaser, exactly as before the split.
+ *
+ * @param x     the paged atom vector
+ * @param bz    the chunk's z plane
+ * @param y0    first row of the chunk
+ * @param ylast last row of the chunk
+ * @param z0    first z plane this node owns
+ * @param z1    one past the last z plane this node owns
+ * @param hgen  generation to demand for planes outside [z0, z1)
+ * @param block logical block, for the page masks
+ */
+__device__ CLIO_COROC_INLINE void HoldChunkSpansCoro(gv::DeviceVector<float> x,
+                                                     u32 nb, u32 cap, u32 bz,
+                                                     u32 y0, u32 ylast, u32 z0,
+                                                     u32 z1, u64 hgen,
+                                                     u32 block) {
+  CLIO_SHARED_PERSIST(MdTables, s_tbl);
+  const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
+  u32 nspans = 0;
+  for (int dz = -1; dz <= 1; ++dz) {
+    const u32 wz = (bz + nb + dz) % nb;
+    u32 rl[2];
+    u32 rn[2];
+    const u32 nr = StencilYRanges(nb, y0, ylast, rl, rn);
+    for (u32 t = 0; t < nr; ++t) {
+      const u64 rb = ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
+      const u64 len = static_cast<u64>(rn[t]) * row_elems;
+      // Same rule as ForceCoro: a plane outside this node's slab belongs to
+      // a neighbour, and only a generational fetch refuses last step's copy.
+      CO_AWAIT(x.CoFetch((wz < z0 || wz >= z1) ? hgen : 0, rb, len));
+      gv::PageRef<float> h0 = CO_AWAIT(x.CoHoldPage(rb, len, /*write=*/false));
+      gv::PageRef<float> h1;
+      if (h0.run() < len) {
+        h1 = CO_AWAIT(x.CoHoldPage(rb + h0.run(), len - h0.run(), /*write=*/false));
+      }
+      MarkPages(MdG().xmask, x.PageOf(rb), x.PageOf(rb + len - 1), block);
+      if (threadIdx.x == 0) {
+        s_tbl.sp0[nspans] = h0.ptr();
+        s_tbl.sp1[nspans] = h1 ? h1.ptr() : nullptr;
+        s_tbl.srun[nspans] = h0.run();
+        s_tbl.sxrb[nspans] = rb;
+        s_tbl.sxlen[nspans] = len;
+        s_tbl.sbase[nspans] = rl[t];
+        s_tbl.scnt[nspans] = rn[t];
+        s_tbl.sdz[nspans] = static_cast<u32>(dz + 1);
+      }
+      ++nspans;
+    }
+  }
+  if (threadIdx.x == 0) s_tbl.nspans = nspans;
+  __syncthreads();
+}
+
+/**
+ * Stage 2 of the list build: write-hold one row's whole list region and
+ * publish its guards (host-checked to fit kMaxNlGuards).
+ *
+ * @param nl      the paged neighbour-list vector
+ * @param row     the (bz, by) row being built
+ * @param rowlist list elements per row
+ * @param block   logical block, for the page masks
+ */
+__device__ CLIO_COROC_INLINE void HoldRowGuardsCoro(gv::DeviceVector<int> nl,
+                                                    u64 row, u64 rowlist,
+                                                    u32 block) {
+  CLIO_SHARED_PERSIST(MdTables, s_tbl);
+  const u64 nb0 = row * rowlist;
+  u64 off = 0;
+  u32 nguards = 0;
+  while (off < rowlist && nguards < static_cast<u32>(kMaxNlGuards)) {
+    CO_AWAIT(nl.CoFetch(0, nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1)));
+    gv::PageRef<int> hn = CO_AWAIT(nl.CoHoldPage(nb0 + off, rowlist - off, /*write=*/true));
+    MarkPages(MdG().nlmask, nl.PageOf(nb0 + off),
+              nl.PageOf(nb0 + off + hn.run() - 1), block);
+    if (threadIdx.x == 0) {
+      s_tbl.np[nguards] = hn.ptr();
+      s_tbl.gs[nguards] = off;
+      s_tbl.gl[nguards] = hn.run();
+    }
+    off += hn.run();
+    ++nguards;
+  }
+  if (threadIdx.x == 0) s_tbl.nguards = nguards;
+  __syncthreads();
+}
+
+/**
+ * Map the nine stencil rows (dz, dy) of row `by` onto the chunk's held
+ * spans: qspan[q] is the span and qoff[q] the element offset of that row
+ * inside it. Thread 0 writes, everyone waits. Non-suspending.
+ */
+__device__ inline void PublishRowStencil(MdTables &t, u32 nb, u32 by,
+                                         u64 row_elems) {
+  if (threadIdx.x == 0) {
+    for (int dz = -1; dz <= 1; ++dz) {
+      for (int dy = -1; dy <= 1; ++dy) {
+        const u32 wy = (by + nb + dy) % nb;
+        const int q = (dz + 1) * 3 + (dy + 1);
+        for (u32 s = 0; s < t.nspans; ++s) {
+          if (t.sdz[s] != static_cast<u32>(dz + 1)) continue;
+          if (wy >= t.sbase[s] && wy < t.sbase[s] + t.scnt[s]) {
+            t.qspan[q] = s;
+            t.qoff[q] = static_cast<u64>(wy - t.sbase[s]) * row_elems;
+            break;
+          }
+        }
+      }
+    }
+  }
+  __syncthreads();
+}
+
+/**
+ * The candidate scan for one row: every thread takes row slots in stride,
+ * walks the nine stencil rows' bins, and writes its entries into the held
+ * list guards. Non-suspending, so none of this is ever hoisted into a
+ * coroutine frame -- which is also what keeps the bookkeeping in shared
+ * memory and registers rather than the yield-stack lane.
+ *
+ * @param t        the block's tables: spans, stencil map, list guards
+ * @param d_cnt    per-slot entry counts (resident)
+ * @param d_err    set when a slot overflows maxneigh
+ * @param row      the row being built
+ * @param islots   slots per row (nb * cap)
+ */
+__device__ inline void FillListRow(const MdTables &t, u32 nb, u32 cap,
+                                   float box, float rlist, u32 maxneigh,
+                                   u32 *d_cnt, int *d_err, u64 row,
+                                   u64 islots) {
+  const float r2list = rlist * rlist;
+  const float halfL = 0.5f * box;
+  const u64 slotbase = row * islots;
+  const u32 sp4 = t.qspan[4];
+  const u64 off4 = t.qoff[4];
+  const u64 run4 = t.srun[sp4];
+  const float *const ip0 = t.sp0[sp4];
+  const float *const ip1 = t.sp1[sp4];
+  // The list guards, as PER-THREAD copies. Not a frame concern any more --
+  // this function never suspends -- and it is what keeps the entry store
+  // from going through a pointer loaded out of shared memory inside the
+  // candidate loop: kMaxNlGuards is four, so this is four registers each.
+  int *np[kMaxNlGuards];
+  u64 gs[kMaxNlGuards];
+  u64 gl[kMaxNlGuards];
+  const u32 nguards = t.nguards;
+  for (u32 g = 0; g < static_cast<u32>(kMaxNlGuards); ++g) {
+    np[g] = g < nguards ? const_cast<int *>(t.np[g]) : nullptr;
+    gs[g] = g < nguards ? t.gs[g] : 0;
+    gl[g] = g < nguards ? t.gl[g] : 0;
+  }
+  for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
+    const u64 e = off4 + s * kStride;
+    const float *const ip = (e < run4) ? ip0 + e : ip1 + (e - run4);
+    if (ip[3] < 0.0f) {
+      d_cnt[slotbase + s] = 0;
+      continue;
+    }
+    const float xi = ip[0];
+    const float yi = ip[1];
+    const float zi = ip[2];
+    const u32 bx = static_cast<u32>(s / cap);
+    u32 cnt = 0;
+    u32 gi = 0;
+    for (int q = 0; q < 9; ++q) {
+      for (int dxx = -1; dxx <= 1; ++dxx) {
+        const u32 jbx = (bx + nb + dxx) % nb;
+        const u64 jb = static_cast<u64>(jbx) * cap * kStride;
+        const u32 spq = t.qspan[q];
+        const u64 rq = t.srun[spq];
+        const u64 qo = t.qoff[q];
+        const float *const qp0 = t.sp0[spq];
+        const float *const qp1 = t.sp1[spq];
+        for (u32 sj = 0; sj < cap; ++sj) {
+          const u64 ej = qo + jb + static_cast<u64>(sj) * kStride;
+          const float *const jp = (ej < rq) ? qp0 + ej : qp1 + (ej - rq);
+          if (jp[3] < 0.0f) continue;
+          if (q == 4 && jbx == bx && sj == s % cap) continue;
+          float ddx = xi - jp[0];
+          float ddy = yi - jp[1];
+          float ddz = zi - jp[2];
+          if (ddx > halfL) ddx -= box; else if (ddx < -halfL) ddx += box;
+          if (ddy > halfL) ddy -= box; else if (ddy < -halfL) ddy += box;
+          if (ddz > halfL) ddz -= box; else if (ddz < -halfL) ddz += box;
+          const float rsq = ddx * ddx + ddy * ddy + ddz * ddz;
+          if (rsq >= r2list) continue;
+          if (cnt >= maxneigh) {   // refuse, never overrun
+            *d_err = 1;
+            continue;
+          }
+          const u64 o = static_cast<u64>(cnt) * islots + s;
+          while (gi + 1 < nguards && o >= gs[gi] + gl[gi]) ++gi;
+          // Entries are STENCIL-RELATIVE, (q, slot-within-row), not
+          // span-relative: the two passes then need not agree on how
+          // they group rows into held spans, which is what lets the
+          // force pass amortize its holds over a CHUNK of rows while
+          // the build pass holds per row.
+          np[gi][o - gs[gi]] = static_cast<int>(
+              (static_cast<u32>(q) << 16) | (jbx * cap + sj));
+          ++cnt;
+        }
+      }
+    }
+    d_cnt[slotbase + s] = cnt;
+  }
+}
+
+/**
+ * Give a row's list guards back. Safe after BeginFlush and not before the
+ * writes: a frame with a flush in flight is not an eviction candidate, so
+ * the row's bytes cannot be dropped between the submit and the wait.
+ * Recomputed from gs, the offset each fetch was issued at. Non-suspending.
+ */
+__device__ inline void UnpinRowGuards(gv::DeviceVector<int> &nl,
+                                      const MdTables &t, u64 row,
+                                      u64 rowlist) {
+  for (u32 gq = 0; gq < t.nguards; ++gq) {
+    const u64 fo = row * rowlist + t.gs[gq];
+    nl.UnpinRange(nl.PageLo(fo), nl.PageSpan(fo, 1));
+  }
+}
+
+/** Give a chunk's x spans back: what HoldChunkSpansCoro's fetches pinned.
+ *  Non-suspending. */
+__device__ inline void UnpinChunkSpans(gv::DeviceVector<float> &x,
+                                       const MdTables &t) {
+  for (u32 sq = 0; sq < t.nspans; ++sq) x.UnpinRange(t.sxrb[sq], t.sxlen[sq]);
+}
+
+/**
+ * Stage 3 of the list build: publish one built row (see BuildListCoro on
+ * why the flush is not flushed). Its own function, and not by choice: with
+ * the two flush awaits written inline in BuildListCoro, IGC's backend
+ * segfaults on the kernel (and, depending on layout, on ListForce's too),
+ * and compiling them out is the one change that made every image build.
+ * The float-vector flushes in Integrate and Rebin compile as written.
+ */
+__device__ __attribute__((noinline)) void FlushRowCoro(gv::DeviceVector<int> nl,
+                                                       u64 row, u64 rowlist) {
+  CO_AWAIT(nl.CoBeginFlush(0, row * rowlist, rowlist));
+}
+
+/** The chunk's last flush, waited for. See FlushRowCoro. */
+__device__ __attribute__((noinline)) void EndChunkFlushCoro(gv::DeviceVector<int> nl) {
+  CO_AWAIT(nl.CoEndFlush());
+}
+
+/** The list build: one chunk of rows at a time, three stage coroutines
+ *  and two plain helpers per chunk. Five suspend points, all at this level.
+ *
+ *  NOINLINE, deliberately. IGC's dump of the kernel that crashes it shows
+ *  clang had folded this whole state machine into the SYCL kernel entry
+ *  (778 blocks, no coroutine function left), while ListForceCoro -- the
+ *  same shape, and it compiles -- survives as its own 255-block function
+ *  that the entry merely calls. IGC_FunctionControl=3 can only keep a call
+ *  that still exists when IGC gets the module. */
+__device__ __attribute__((noinline)) void BuildListCoro(gv::DeviceVector<float> x,
                                        gv::DeviceVector<int> nl, u32 nb,
                                        u32 cap, float box, float rlist,
                                        u32 maxneigh, u32 *d_cnt, int *d_err,
                                        u32 rowchunk, u32 z0, u32 z1,
                                        u32 nblocks, u32 block, u64 hgen) {
-  // BLOCK-UNIFORM TABLES LIVE IN SHARED, NOT IN THE FRAME. Every thread
-  // holds the same rows and the same list guards, but a thread-local array
-  // indexed by a runtime value (rp0[q], np[gi]) cannot be a register: it
-  // lands in the coroutine frame, which IS the yield-stack lane in GLOBAL
-  // memory. That made ~6 dependent global loads of pure bookkeeping per
-  // entry and is why the list pass first measured SLOWER than cell-direct
-  // despite 17x fewer candidates. Filled once per row after every hold
-  // (no co_await follows, so shared survives) and read by all threads.
-  // SURVIVES A PARK. These were staged in plain __shared__, which the driver
-  // destroys when it exits the kernel to suspend, so every one of them had to
-  // be re-published by hand after the last hold that could suspend -- and a
-  // suspend added anywhere after that fill would have read stale pointers.
   CLIO_SHARED_PERSIST(MdTables, s_tbl);
-  const float **s_sp0 = s_tbl.sp0;
-  const float **s_sp1 = s_tbl.sp1;
-  u64 *s_srun = s_tbl.srun;
-  u64 *s_qoff = s_tbl.qoff;
-  u32 *s_qspan = s_tbl.qspan;
-  const int **s_np = s_tbl.np;
-  u64 *s_gs = s_tbl.gs;
-  u64 *s_gl = s_tbl.gl;
   const u64 row_elems = static_cast<u64>(nb) * cap * kStride;
-  const u64 nrows = static_cast<u64>(nb) * nb;
   const u64 islots = static_cast<u64>(nb) * cap;
   const u64 rowlist = islots * maxneigh;
-  const float r2list = rlist * rlist;
-  const float halfL = 0.5f * box;
   // Same amortization as the force pass: the stencil spans serve a CHUNK
   // of rows, so the three holds are paid once per chunk rather than once
   // per row.
@@ -565,243 +868,32 @@ __device__ CLIO_COROC_INLINE void BuildListCoro(gv::DeviceVector<float> x,
     // WRITE holds, so it exhausts the very same tables. Admitting only the
     // force kernel just relocates the exhaustion to this one -- every hold
     // set in the grid has to be admitted, or none of them are protected.
-    u32 span_guards = 0;
-    {
-      const int lo0 = static_cast<int>(y0) - 1;
-      const int hi0 = static_cast<int>(ylast) + 1;
-      for (int dz = -1; dz <= 1; ++dz) {
-        const u32 wz = (bz + nb + dz) % nb;
-        u32 rl[2];
-        u32 rn[2];
-        u32 nr = 0;
-        if (lo0 < 0) {
-          rl[nr] = 0; rn[nr] = static_cast<u32>(hi0) + 1u; ++nr;
-          rl[nr] = nb - 1u; rn[nr] = 1u; ++nr;
-        } else if (hi0 > static_cast<int>(nb) - 1) {
-          rl[nr] = static_cast<u32>(lo0);
-          rn[nr] = nb - static_cast<u32>(lo0); ++nr;
-          rl[nr] = 0; rn[nr] = 1u; ++nr;
-        } else {
-          rl[nr] = static_cast<u32>(lo0);
-          rn[nr] = static_cast<u32>(hi0 - lo0 + 1); ++nr;
-        }
-        for (u32 t = 0; t < nr; ++t) {
-          const u64 rb =
-              ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
-          span_guards += PagesSpanned(x, rb, static_cast<u64>(rn[t]) * row_elems);
-        }
-      }
-    }
-    // LATCHED. The reservation taken here is the one given back at the
-    // release below; recomputing it there would let a block give back a
-    // reservation it never took.
+    // LATCHED: the reservation taken here is the one given back below.
+    const u32 span_guards =
+        CountChunkSpanGuards(x, nb, cap, bz, y0, ylast, row_elems);
     CO_AWAIT(AdmitSpans(span_guards, x.Regions(), kAdmitSlackChunks));
-    {   // guards die at the close of this scope, before the reservations go back
-    gv::PageRef<float> hg[6][2];
-    u64 srun[6];
-    const float *sp0[6];
-    const float *sp1[6];
-    u32 sbase[6];
-    u32 scnt[6];
-    u32 sdz[6];
-    // WHAT THE FETCH PINNED, so the chunk can give it back. In shared mode
-    // Fetch is the pinner and UnpinRange the releaser; a range fetched and
-    // never released is a frame no other block can ever reclaim. A no-op
-    // under private tables, where the guards above own their own pins.
-    u64 sxrb[6];
-    u64 sxlen[6];
-    u32 nspans = 0;
-    for (int dz = -1; dz <= 1; ++dz) {
-      const u32 wz = (bz + nb + dz) % nb;
-      const int lo = static_cast<int>(y0) - 1;
-      const int hi = static_cast<int>(ylast) + 1;
-      u32 rl[2];
-      u32 rn[2];
-      u32 nr = 0;
-      if (lo < 0) {
-        rl[nr] = 0; rn[nr] = static_cast<u32>(hi) + 1u; ++nr;
-        rl[nr] = nb - 1u; rn[nr] = 1u; ++nr;
-      } else if (hi > static_cast<int>(nb) - 1) {
-        rl[nr] = static_cast<u32>(lo); rn[nr] = nb - static_cast<u32>(lo); ++nr;
-        rl[nr] = 0; rn[nr] = 1u; ++nr;
-      } else {
-        rl[nr] = static_cast<u32>(lo);
-        rn[nr] = static_cast<u32>(hi - lo + 1); ++nr;
-      }
-      for (u32 t = 0; t < nr; ++t) {
-        const u64 rb =
-            ((static_cast<u64>(wz) * nb + rl[t]) * nb) * cap * kStride;
-        const u64 len = static_cast<u64>(rn[t]) * row_elems;
-        // Same rule as ForceCoro: a plane outside this node's slab belongs to
-        // a neighbour, and only a generational fetch refuses last step's copy.
-        CO_AWAIT(x.CoFetch((wz < z0 || wz >= z1) ? hgen : 0, rb, len));
-        hg[nspans][0] = CO_AWAIT(x.CoHoldPage(rb, len, /*write=*/false));
-        srun[nspans] = hg[nspans][0].run();
-        if (srun[nspans] < len) {
-          hg[nspans][1] =
-              CO_AWAIT(x.CoHoldPage(rb + srun[nspans], len - srun[nspans], /*write=*/false));
-        }
-        MarkPages(MdG().xmask, x.PageOf(rb), x.PageOf(rb + len - 1), block);
-        sxrb[nspans] = rb;
-        sxlen[nspans] = len;
-        sp0[nspans] = hg[nspans][0].ptr();
-        sp1[nspans] = hg[nspans][1] ? hg[nspans][1].ptr() : nullptr;
-        sbase[nspans] = rl[t];
-        scnt[nspans] = rn[t];
-        sdz[nspans] = static_cast<u32>(dz + 1);
-        ++nspans;
-      }
-    }
+    CO_AWAIT(HoldChunkSpansCoro(x, nb, cap, bz, y0, ylast, z0, z1, hgen, block));
     for (u32 by = y0; by <= ylast; ++by) {
-    const u64 row = static_cast<u64>(bz) * nb + by;
-    // Write-hold this row's whole list region (host-checked to fit the
-    // guard array): the working-set lower bound for the neigh vector.
-    gv::PageRef<int> hn[kMaxNlGuards];
-    int *np[kMaxNlGuards];
-    u64 gstart[kMaxNlGuards];
-    u64 glen[kMaxNlGuards];
-    u32 nguards = 0;
-    {
-      const u64 nb0 = row * rowlist;
-      u64 off = 0;
-      while (off < rowlist && nguards < kMaxNlGuards) {
-        CO_AWAIT(nl.CoFetch(0, nl.PageLo(nb0 + off), nl.PageSpan(nb0 + off, 1)));
-        hn[nguards] =
-            CO_AWAIT(nl.CoHoldPage(nb0 + off, rowlist - off, /*write=*/true));
-        MarkPages(MdG().nlmask, nl.PageOf(nb0 + off),
-                  nl.PageOf(nb0 + off + hn[nguards].run() - 1), block);
-        np[nguards] = hn[nguards].ptr();
-        gstart[nguards] = off;
-        glen[nguards] = hn[nguards].run();
-        off += hn[nguards].run();
-        ++nguards;
-      }
+      const u64 row = static_cast<u64>(bz) * nb + by;
+      CO_AWAIT(HoldRowGuardsCoro(nl, row, rowlist, block));
+      PublishRowStencil(s_tbl, nb, by, row_elems);
+      FillListRow(s_tbl, nb, cap, box, rlist, maxneigh, d_cnt, d_err, row,
+                  islots);
+      __syncthreads();
+      // PUBLISH THIS LIST ROW AND LET THE FRAME GO. The row was write-held,
+      // and a dirty page is unevictable -- the vector will not write it back
+      // on the caller's behalf. Building every row this block owns without
+      // flushing fills the table with dirty frames EvictPages cannot reclaim,
+      // and it traps; the pass only ever reads one row at a time, so with
+      // the flush the cache can be tiny.
+      CO_AWAIT(FlushRowCoro(nl, row, rowlist));
+      UnpinRowGuards(nl, s_tbl, row, rowlist);
     }
-    // Publish the block-uniform tables. This used to be a RE-publication
-    // that had to sit after the last hold that could suspend, because the
-    // arena was plain __shared__ and the driver destroys shared when it
-    // exits the kernel to park. CLIO_SHARED_PERSIST carries it across the
-    // suspension now, so this is an ordinary fill and a co_await added below
-    // it is no longer a silent corruption.
-    if (threadIdx.x == 0) {
-      for (u32 t = 0; t < nspans; ++t) {
-        s_sp0[t] = sp0[t];
-        s_sp1[t] = sp1[t];
-        s_srun[t] = srun[t];
-      }
-      for (int dz = -1; dz <= 1; ++dz) {
-        for (int dy = -1; dy <= 1; ++dy) {
-          const u32 wy = (by + nb + dy) % nb;
-          const int q = (dz + 1) * 3 + (dy + 1);
-          for (u32 t = 0; t < nspans; ++t) {
-            if (sdz[t] != static_cast<u32>(dz + 1)) continue;
-            if (wy >= sbase[t] && wy < sbase[t] + scnt[t]) {
-              s_qspan[q] = t;
-              s_qoff[q] = static_cast<u64>(wy - sbase[t]) * row_elems;
-              break;
-            }
-          }
-        }
-      }
-      for (u32 q = 0; q < nguards; ++q) {
-        s_np[q] = np[q];
-        s_gs[q] = gstart[q];
-        s_gl[q] = glen[q];
-      }
-    }
-    __syncthreads();
-    const u64 slotbase = row * islots;
-    const u32 sp4 = s_qspan[4];
-    const u64 off4 = s_qoff[4];
-    const u64 run4 = s_srun[sp4];
-    const float *const ip0 = s_sp0[sp4];
-    const float *const ip1 = s_sp1[sp4];
-    for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
-      const u64 e = off4 + s * kStride;
-      const float *const ip = (e < run4) ? ip0 + e : ip1 + (e - run4);
-      if (ip[3] < 0.0f) {
-        d_cnt[slotbase + s] = 0;
-        continue;
-      }
-      const float xi = ip[0];
-      const float yi = ip[1];
-      const float zi = ip[2];
-      const u32 bx = static_cast<u32>(s / cap);
-      u32 cnt = 0;
-      u32 gi = 0;
-      for (int q = 0; q < 9; ++q) {
-        for (int dxx = -1; dxx <= 1; ++dxx) {
-          const u32 jbx = (bx + nb + dxx) % nb;
-          const u64 jb = static_cast<u64>(jbx) * cap * kStride;
-          const u32 spq = s_qspan[q];
-          const u64 rq = s_srun[spq];
-          const u64 qo = s_qoff[q];
-          const float *const qp0 = s_sp0[spq];
-          const float *const qp1 = s_sp1[spq];
-          for (u32 sj = 0; sj < cap; ++sj) {
-            const u64 ej = qo + jb + static_cast<u64>(sj) * kStride;
-            const float *const jp = (ej < rq) ? qp0 + ej : qp1 + (ej - rq);
-            if (jp[3] < 0.0f) continue;
-            if (q == 4 && jbx == bx && sj == s % cap) continue;
-            float ddx = xi - jp[0];
-            float ddy = yi - jp[1];
-            float ddz = zi - jp[2];
-            if (ddx > halfL) ddx -= box; else if (ddx < -halfL) ddx += box;
-            if (ddy > halfL) ddy -= box; else if (ddy < -halfL) ddy += box;
-            if (ddz > halfL) ddz -= box; else if (ddz < -halfL) ddz += box;
-            const float rsq = ddx * ddx + ddy * ddy + ddz * ddz;
-            if (rsq >= r2list) continue;
-            if (cnt >= maxneigh) {   // refuse, never overrun
-              *d_err = 1;
-              continue;
-            }
-            const u64 o = static_cast<u64>(cnt) * islots + s;
-            while (gi + 1 < nguards && o >= s_gs[gi] + s_gl[gi]) ++gi;
-            // Entries are STENCIL-RELATIVE, (q, slot-within-row), not
-            // span-relative: the two passes then need not agree on how
-            // they group rows into held spans, which is what lets the
-            // force pass amortize its holds over a CHUNK of rows while
-            // the build pass holds per row.
-            const_cast<int *>(s_np[gi])[o - s_gs[gi]] = static_cast<int>(
-                (static_cast<u32>(q) << 16) | (jbx * cap + sj));
-            ++cnt;
-          }
-        }
-      }
-      d_cnt[slotbase + s] = cnt;
-    }
-    __syncthreads();
-    // PUBLISH THIS LIST ROW AND LET THE FRAME GO.
-    //
-    // The row was write-held, and a dirty page is unevictable -- the vector
-    // will not write it back on the caller's behalf. Building every row this
-    // block owns without flushing therefore fills the table with dirty frames
-    // that EvictPages cannot reclaim, and it traps. That, not any working
-    // set, is what set the list cache floor: a block builds ~53 rows, so it
-    // needed ~64 frames purely to keep every dirty row. The pass only ever
-    // reads one row at a time, so with the flush the cache can be tiny.
-    CO_AWAIT(nl.CoBeginFlush(0, row * rowlist, rowlist));
-    // Safe after BeginFlush and not before the writes: a frame with a flush
-    // in flight is not an eviction candidate, so the row's bytes cannot be
-    // dropped between the submit and the wait.
-    //
-    // RECOMPUTED FROM gstart, NOT STORED. Two more u64 arrays here overflow
-    // the coroutine frame (2144 > 2048) -- and they were redundant: gstart
-    // already records the offset each fetch was issued at, and nothing
-    // between the fetch and here suspends, so the arithmetic costs
-    // registers rather than frame.
-    for (u32 gq = 0; gq < nguards; ++gq) {
-      const u64 fo = row * rowlist + gstart[gq];
-      nl.UnpinRange(nl.PageLo(fo), nl.PageSpan(fo, 1));
-    }
-    }   // per-row loop
-    // Inside the guard scope: sxrb/nspans live here, and the pins must go
-    // back before the next chunk fetches its own spans.
-    for (u32 sq = 0; sq < nspans; ++sq) x.UnpinRange(sxrb[sq], sxlen[sq]);
-    }
+    // The pins go back before the next chunk fetches its own spans.
+    UnpinChunkSpans(x, s_tbl);
     ReleaseSpans(span_guards);
-    CO_AWAIT(nl.CoEndFlush());
-  }     // per-chunk loop
+    CO_AWAIT(EndChunkFlushCoro(nl));
+  }
 }
 
 /**
