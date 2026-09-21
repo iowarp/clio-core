@@ -83,14 +83,17 @@ constexpr double kEvBucketUs[EvChan::kBuckets - 1] = {
 // call, await of the owner's reply.
 // 15-16: inside ctp::DeviceAwareMemcpy (SYCL): the two pointer-type
 // queries, and the copy itself.
-EvChan g_chan[17];
-const char *g_chan_name[17] = {"multi_total", "multi_await", "get_total",
+// 17-18: from SYCL event profiling on the copy helpers' queues -- how long
+// the copy waited on the device before starting, and how long it ran.
+EvChan g_chan[19];
+const char *g_chan_name[19] = {"multi_total", "multi_await", "get_total",
                               "bdev_h2d",   "read_await",  "get_meta",
                               "bdev_read",  "direct_read",
                               "reorg_stall", "reorg_move",
                               "rtt_remote", "evq_wait",
                               "pput_bounce", "pput_send", "pput_await",
-                              "dam_ptrq", "dam_copy"};
+                              "dam_ptrq", "dam_copy",
+                              "cp_queue", "cp_xfer"};
 std::terminate_handler g_prev_term = nullptr;
 void EvDumpOnTerminate() {
   const unsigned long long end = g_ev_seq.load();
@@ -153,7 +156,7 @@ void EvLatencyReport() {
 }  // namespace
 
 extern "C" void clio_evlat_add(int which, unsigned long long cycles) {
-  if (which < 0 || which >= 17) return;
+  if (which < 0 || which >= 19) return;
   g_chan[which].sum.fetch_add(cycles, std::memory_order_relaxed);
   g_chan[which].cnt.fetch_add(1, std::memory_order_relaxed);
   unsigned long long m = g_chan[which].mx.load(std::memory_order_relaxed);
@@ -170,7 +173,7 @@ namespace {
 
 void EvChanReport() {
   const double us = 1.0 / 2995.0;
-  for (int i = 0; i < 17; ++i) {
+  for (int i = 0; i < 19; ++i) {
     const unsigned long long c = g_chan[i].cnt.load();
     if (c == 0) continue;
     fprintf(stderr, "clio-evchan %-12s n=%llu avg=%.0fus max=%.0fus\n",

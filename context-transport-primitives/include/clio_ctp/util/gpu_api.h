@@ -1175,9 +1175,12 @@ class GpuApi {
    * @return This thread's queue, constructed on first use
    */
   static sycl::queue &SyclThreadQueue() {
-    thread_local sycl::queue q{SyclQueue().get_context(),
-                               SyclQueue().get_device(),
-                               sycl::property::queue::in_order{}};
+    // Profiling on, so SpinWaitEvent can report where a slow copy spent its
+    // time (queued on the device vs. transferring) to the latency report.
+    thread_local sycl::queue q{
+        SyclQueue().get_context(), SyclQueue().get_device(),
+        sycl::property_list{sycl::property::queue::in_order{},
+                            sycl::property::queue::enable_profiling{}}};
     return q;
   }
 
@@ -1196,9 +1199,27 @@ class GpuApi {
       const auto st =
           ev.get_info<sycl::info::event::command_execution_status>();
       if (st == sycl::info::event_command_status::complete) {
-        return;
+        break;
       }
       std::this_thread::yield();
+    }
+    // Latency report channels 17-18 (device timestamps, ns): the copy's
+    // wait on the device before it started, and its transfer time. Only
+    // when the queue was created with profiling (SyclThreadQueue); a
+    // queue without it throws here, which is caught and ignored.
+    if (clio_evlat_add != nullptr) {
+      try {
+        const auto t_sub =
+            ev.get_profiling_info<sycl::info::event_profiling::command_submit>();
+        const auto t_start =
+            ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+        const auto t_end =
+            ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+        // The report divides by 2995 cycles per us; these are ns.
+        if (t_start >= t_sub) clio_evlat_add(17, (t_start - t_sub) * 2995ull / 1000ull);
+        if (t_end >= t_start) clio_evlat_add(18, (t_end - t_start) * 2995ull / 1000ull);
+      } catch (const sycl::exception &) {
+      }
     }
   }
 
