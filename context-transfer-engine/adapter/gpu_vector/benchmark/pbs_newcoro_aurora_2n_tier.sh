@@ -28,10 +28,18 @@
 #   BENCH_NAME, BENCH_ARGS   as for the other scripts; --hbm-mb in BENCH_ARGS
 #                            should equal BENCH_HBM_MB (it sizes the vector's
 #                            own frame cache)
-#   BENCH_TIER               flare | daos
+#   BENCH_TIER               flare | daos | stack
 #   BENCH_HBM_MB             HBM tier capacity per node (default 4096)
 #   BENCH_TIER_MB            file tier capacity per node (default 4608)
 #   DAOS_POOL / DAOS_CONT    default IOWarp / clio_tier
+#
+# BENCH_TIER=stack is the THREE-TIER config, DRAM -> DAOS -> Flare, in one
+# runtime: a host-DRAM bdev on top (score 1.0), the DAOS container next
+# (0.5) and Flare last (0.2), each per node and each smaller than the data
+# so every tier fills and spills into the next.
+#   BENCH_TOP_MB             DRAM tier capacity per node (default 2048)
+#   BENCH_DAOS_MB            DAOS tier capacity per node (default 4096)
+#   BENCH_FLARE_MB           Flare tier capacity per node (default 4608)
 set -u
 
 : "${BENCH_NAME:?set BENCH_NAME}"
@@ -39,6 +47,9 @@ set -u
 BENCH_TIER=${BENCH_TIER:-flare}
 BENCH_HBM_MB=${BENCH_HBM_MB:-4096}
 BENCH_TIER_MB=${BENCH_TIER_MB:-4608}
+BENCH_TOP_MB=${BENCH_TOP_MB:-2048}
+BENCH_DAOS_MB=${BENCH_DAOS_MB:-4096}
+BENCH_FLARE_MB=${BENCH_FLARE_MB:-4608}
 DAOS_POOL=${DAOS_POOL:-IOWarp}
 DAOS_CONT=${DAOS_CONT:-clio_tier}
 ROOT=${ROOT:-/home/llogan/clio-core/.claude/worktrees/gpu-coro}
@@ -47,7 +58,11 @@ RUNDIR=${RUNDIR:-${ROOT}/build-spike/runtier_${BENCH_TIER}_${BENCH_NAME}}
 NRANKS=2
 JOBTAG=${PBS_JOBID%%.*}
 
-echo "=== ${BENCH_NAME} x${NRANKS} nodes, tier=${BENCH_TIER} hbm=${BENCH_HBM_MB}MB file=${BENCH_TIER_MB}MB per node ==="
+if [ "${BENCH_TIER}" = stack ]; then
+  echo "=== ${BENCH_NAME} x${NRANKS} nodes, tier=stack dram=${BENCH_TOP_MB}MB -> daos=${BENCH_DAOS_MB}MB -> flare=${BENCH_FLARE_MB}MB per node ==="
+else
+  echo "=== ${BENCH_NAME} x${NRANKS} nodes, tier=${BENCH_TIER} hbm=${BENCH_HBM_MB}MB file=${BENCH_TIER_MB}MB per node ==="
+fi
 echo "nodes: $(sort -u "$PBS_NODEFILE" | tr '\n' ' ')"
 echo "exe:  ${EXE}"
 echo "args: ${BENCH_ARGS} --nodes ${NRANKS} --node <rank>"
@@ -59,34 +74,78 @@ ulimit -c unlimited
 rm -f ./rank*.log ./hostfile ./clio_tier*.yaml
 sort -u "${PBS_NODEFILE}" > hostfile
 
-# ---- the filesystem tier -------------------------------------------------
+# ---- the filesystem tier(s) ----------------------------------------------
+# Mount the DAOS container with dfuse and set MNT.
+#
+# PBS runs this script in a non-login bash where `module` is not defined, so
+# a bare `module load` did nothing: daos then looked for the agent socket in
+# /var/run/daos_agent instead of the DAOS_AGENT_DRPC_DIR the module sets, and
+# launch-dfuse.sh was not on PATH. Initialise Lmod first, and say what took.
+mount_daos() {
+  source /usr/share/lmod/lmod/init/bash
+  module use /soft/modulefiles
+  module load daos/base
+  echo "daos env: launch-dfuse.sh=$(command -v launch-dfuse.sh || echo MISSING) agent_dir=${DAOS_AGENT_DRPC_DIR:-unset} socket=$(ls "${DAOS_AGENT_DRPC_DIR:-/run/daos_agent_oneScratch}" 2>&1 | tr '\n' ' ')"
+  if ! daos cont query "${DAOS_POOL}" "${DAOS_CONT}" > /dev/null 2>&1; then
+    daos cont create --type=POSIX "${DAOS_POOL}" "${DAOS_CONT}" 2>&1 | tail -2
+  fi
+  clean-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" > /dev/null 2>&1
+  launch-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" 2>&1 | tail -2
+  MNT="/tmp/${DAOS_POOL}/${DAOS_CONT}"
+  mount | grep -qF "${MNT}" || { echo "dfuse NOT mounted at ${MNT}"; exit 2; }
+}
+FLARE_ROOT="/lus/flare/projects/IOWarp/clio_tier/${JOBTAG}"
+TIER_DIRS=""
 case "${BENCH_TIER}" in
   flare)
-    TIER_DIR="/lus/flare/projects/IOWarp/clio_tier/${JOBTAG}"
+    TIER_DIR="${FLARE_ROOT}"
     ;;
   daos)
-    # PBS runs this script in a non-login bash where `module` is not defined, so
-    # a bare `module load` did nothing: daos then looked for the agent socket in
-    # /var/run/daos_agent instead of the DAOS_AGENT_DRPC_DIR the module sets, and
-    # launch-dfuse.sh was not on PATH. Initialise Lmod first, and say what took.
-    source /usr/share/lmod/lmod/init/bash
-    module use /soft/modulefiles
-    module load daos/base
-    echo "daos env: launch-dfuse.sh=$(command -v launch-dfuse.sh || echo MISSING) agent_dir=${DAOS_AGENT_DRPC_DIR:-unset} socket=$(ls "${DAOS_AGENT_DRPC_DIR:-/run/daos_agent_oneScratch}" 2>&1 | tr '\n' ' ')"
-    if ! daos cont query "${DAOS_POOL}" "${DAOS_CONT}" > /dev/null 2>&1; then
-      daos cont create --type=POSIX "${DAOS_POOL}" "${DAOS_CONT}" 2>&1 | tail -2
-    fi
-    clean-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" > /dev/null 2>&1
-    launch-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" 2>&1 | tail -2
-    MNT="/tmp/${DAOS_POOL}/${DAOS_CONT}"
-    mount | grep -qF "${MNT}" || { echo "dfuse NOT mounted at ${MNT}"; exit 2; }
+    mount_daos
     TIER_DIR="${MNT}/clio_tier/${JOBTAG}"
     ;;
-  *) echo "BENCH_TIER must be flare or daos"; exit 2 ;;
+  stack)
+    mount_daos
+    TIER_DIR_DAOS="${MNT}/clio_tier/${JOBTAG}"
+    TIER_DIR_FLARE="${FLARE_ROOT}"
+    TIER_DIR="${TIER_DIR_DAOS}"
+    TIER_DIRS="${TIER_DIR_FLARE}"
+    ;;
+  *) echo "BENCH_TIER must be flare, daos or stack"; exit 2 ;;
 esac
-mkdir -p "${TIER_DIR}" || { echo "cannot create ${TIER_DIR}"; exit 2; }
-echo "tier dir: ${TIER_DIR}"
-df -h "${TIER_DIR}" | tail -1
+for d in "${TIER_DIR}" ${TIER_DIRS}; do
+  mkdir -p "${d}" || { echo "cannot create ${d}"; exit 2; }
+  echo "tier dir: ${d}"
+  df -h "${d}" | tail -1
+done
+
+# The storage list for the config, per mode.
+if [ "${BENCH_TIER}" = stack ]; then
+  STORAGE_YAML="      - path: \"ram::gv_tier_dram\"
+        bdev_type: \"ram\"
+        capacity_limit: \"${BENCH_TOP_MB}MB\"
+        score: 1.0
+      - path: \"${TIER_DIR_DAOS}/node__RANK__.dat\"
+        bdev_type: \"file\"
+        persistence_level: \"long_term\"
+        capacity_limit: \"${BENCH_DAOS_MB}MB\"
+        score: 0.5
+      - path: \"${TIER_DIR_FLARE}/node__RANK__.dat\"
+        bdev_type: \"file\"
+        persistence_level: \"long_term\"
+        capacity_limit: \"${BENCH_FLARE_MB}MB\"
+        score: 0.2"
+else
+  STORAGE_YAML="      - path: \"hbm::gv_tier_hbm\"
+        bdev_type: \"hbm\"
+        capacity_limit: \"${BENCH_HBM_MB}MB\"
+        score: 1.0
+      - path: \"${TIER_DIR}/node__RANK__.dat\"
+        bdev_type: \"file\"
+        persistence_level: \"long_term\"
+        capacity_limit: \"${BENCH_TIER_MB}MB\"
+        score: 0.2"
+fi
 
 # ---- per-rank config -----------------------------------------------------
 # __RANK__ is substituted by each rank before it starts its runtime.
@@ -122,20 +181,12 @@ compose:
     targets:
       neighborhood: 1
     storage:
-      - path: "hbm::gv_tier_hbm"
-        bdev_type: "hbm"
-        capacity_limit: "${BENCH_HBM_MB}MB"
-        score: 1.0
-      - path: "${TIER_DIR}/node__RANK__.dat"
-        bdev_type: "file"
-        persistence_level: "long_term"
-        capacity_limit: "${BENCH_TIER_MB}MB"
-        score: 0.2
+${STORAGE_YAML}
     dpe:
       dpe_type: "max_bw"
 EOF
 echo "--- config (rank template) ---"
-grep -E "path:|capacity_limit|hostfile" clio_tier_template.yaml
+grep -E "path:|capacity_limit|score|hostfile" clio_tier_template.yaml
 
 export IGC_FunctionControl=3
 case "${BENCH_ZE_MASK:-0.0}" in
@@ -181,10 +232,12 @@ for r in $(seq 0 $((NRANKS - 1))); do
 done
 
 echo "--- tier files (what actually spilled to ${BENCH_TIER}) ---"
-ls -l "${TIER_DIR}" 2>&1
-du -sh "${TIER_DIR}" 2>&1
-rm -rf "${TIER_DIR}"
-[ "${BENCH_TIER}" = daos ] && clean-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" > /dev/null 2>&1
+for d in "${TIER_DIR}" ${TIER_DIRS}; do
+  ls -l "${d}" 2>&1
+  du -sh "${d}" 2>&1
+  rm -rf "${d}"
+done
+case "${BENCH_TIER}" in daos|stack) clean-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" > /dev/null 2>&1 ;; esac
 
 case "${rc}" in
   0)   echo "RESULT ${BENCH_NAME}x${NRANKS}@${BENCH_TIER}: OK" ;;
