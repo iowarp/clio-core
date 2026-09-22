@@ -214,6 +214,12 @@ int main(int argc, char **argv) {
       rc = 1;
     }
     Update(q, d_cent, d_sums, d_counts, dims, k);
+    // Progress, so a run that overruns its cap shows whether it stalled or
+    // merely slowed (a 12-iteration deck timed out where 4 took 79 s).
+    if (rank == 0) {
+      std::fprintf(stderr, "  iter %u done at %.1f ms (comm so far %.1f ms)\n",
+                   it, gvc::NowMs() - t0, t_comm);
+    }
   }
   const double ms = gvc::NowMs() - t0;
 
