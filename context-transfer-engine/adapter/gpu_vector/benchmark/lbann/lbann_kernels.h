@@ -367,6 +367,25 @@ CTP_GPU_FUN inline void DenseSeed(float *w, u64 n) {
   }
 }
 
+/**
+ * Seed one window of the same stream, addressed by its GLOBAL index.
+ *
+ * The seed is a pure function of the global element index, so a caller that
+ * needs only the bias rows can have exactly those bits without materialising
+ * the whole parameter array. That is what --no-ref does: the biases live in
+ * plain device arrays and used to be copied out of the dense reference, which
+ * is the one thing that forced a reference-sized allocation even when no
+ * reference was wanted.
+ *  @param w     destination, n floats
+ *  @param base  global index of w[0] in the parameter array
+ *  @param n     elements to write */
+CTP_GPU_FUN inline void DenseSeedRange(float *w, u64 base, u64 n) {
+  for (u64 i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += static_cast<u64>(gridDim.x) * blockDim.x) {
+    w[i] = Sym01(Lcg(0xB5297A4D3F84D5B5ull + base + i)) * 0.05f;
+  }
+}
+
 CTP_GPU_FUN inline void DenseFwd1(const float *w, u64 w1_off, u64 b1_off, u64 I,
                           u64 H, u64 B, const float *x, float *a1, u64 hper) {
   const u64 h0 = static_cast<u64>(blockIdx.x) * hper;

@@ -16,10 +16,14 @@
 #   daos70    DAOS-heavy               10 / 70 / 20
 #   lustre70  Lustre-heavy             10 / 20 / 70
 #
-# lbann is NOT in the default list: its edition trains a dense in-VRAM
-# reference of the WHOLE model beside the paged one, so an 8 GB/node deck
-# would need a 32 GB dense copy per node as well. It needs the baselines'
-# --no-ref switch before it can take an E4 deck.
+# lbann runs with --no-ref: its dense reference is a copy of the WHOLE
+# parameter array in device memory, so a 32 GB deck would want a 32 GB twin
+# beside it. Its deck puts the mass in W1 (65536 -> 131072, 34.4 GB) and
+# keeps O at 1024, because Bwd1 slides every block over the WHOLE of W2
+# while W1 is read per block over its own h-band only: a W2 sized like W1
+# would be re-read 64 times against a 4 GB frame cache. H and O must divide
+# the node and block counts and tile pages exactly, which 131072 and 1024 do
+# at 64 blocks (rpp1 = 4, rpp2 = 2).
 #
 # The decks are the two-node tiering study's, 8 GB per node each (kmeans
 # and grayscott split --data-mb across the nodes; weights owns its
@@ -29,7 +33,7 @@
 # first. Job logs land in build-spike/pbs/<bench>_e4_<comp>.log.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BENCHES=${BENCHES:-"kmeans grayscott weights gmx lammps_md"}
+BENCHES=${BENCHES:-"kmeans grayscott weights gmx lammps_md lbann"}
 COMPS=${COMPS:-"dram100 dram75 bal25 daos70 lustre70"}
 TIER_BUDGET_MB=${TIER_BUDGET_MB:-10240}
 HBM_MB=${HBM_MB:-4096}
@@ -68,6 +72,7 @@ args_for() {
     weights)   echo "--blocks 64 --pages 128 --page-kb 1024 --hbm-mb ${HBM_MB} --repeat 1" ;;
     gmx)       echo "--page-kb 20000 --blocks 16 --cap 200 --repeat 1" ;;
     lammps_md) echo "--lattice 552 --steps 1 --page-kb 1024" ;;
+    lbann)     echo "--in 65536 --hidden 131072 --out 1024 --batch 64 --steps 1 --page-kb 1024 --blocks 64 --cap 4096 --no-ref" ;;
     *)         echo "" ;;
   esac
 }

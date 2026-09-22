@@ -574,6 +574,10 @@ void LaunchDenseSeed(float *w, u64 n) {
   SubmitPlain(64, 256, [=]() { DenseSeed(w, n); });
 }
 
+void LaunchDenseSeedRange(float *w, u64 base, u64 n) {
+  SubmitPlain(64, 256, [=]() { DenseSeedRange(w, base, n); });
+}
+
 void LaunchDenseFwd1(u32 blocks, u32 threads, const float *w, u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper) {
   SubmitPlain(blocks, threads, [=]() { DenseFwd1(w, w1_off, b1_off, I, H, B, x, a1, hper); });
 }
@@ -693,6 +697,11 @@ __global__ GV_LAUNCH_BOUNDS void DenseSeedKernel(float *w, u64 n) {
   DenseSeed(w, n);
 }
 
+__global__ GV_LAUNCH_BOUNDS void DenseSeedRangeKernel(float *w, u64 base,
+                                                      u64 n) {
+  DenseSeedRange(w, base, n);
+}
+
 __global__ GV_LAUNCH_BOUNDS void DenseFwd1Kernel(const float *w, u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper) {
   DenseFwd1(w, w1_off, b1_off, I, H, B, x, a1, hper);
 }
@@ -788,6 +797,10 @@ void LaunchDenseSeed(float *w, u64 n) {
   DenseSeedKernel<<<64, 256>>>(w, n);
 }
 
+void LaunchDenseSeedRange(float *w, u64 base, u64 n) {
+  DenseSeedRangeKernel<<<64, 256>>>(w, base, n);
+}
+
 void LaunchDenseFwd1(u32 blocks, u32 threads, const float *w, u64 w1_off, u64 b1_off, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper) {
   DenseFwd1Kernel<<<blocks, threads>>>(w, w1_off, b1_off, I, H, B, x, a1, hper);
 }
@@ -861,6 +874,14 @@ int main(int argc, char **argv) {
   u32 nodes = 1, node = 0;
   u64 page_kb = 64, I = 256, H = 4096, O = 64, B = 64, steps = 5;
   float lr = 0.01f;
+  // --no-ref: train the paged path ONLY. The reference is a dense copy of
+  // the WHOLE parameter array in device memory, so it doubles the footprint
+  // and caps the deck at half of VRAM -- an 8 GB/node paged deck would want
+  // a 32 GB dense twin beside it. Without it the LOSS and WEIGHT gates have
+  // nothing to compare against and are skipped; the run still reports its
+  // loss trajectory and its paging counters, which is what the tiering and
+  // scaling studies measure. Same switch, same meaning, as the baselines'.
+  bool no_ref = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> u64 {
@@ -871,6 +892,7 @@ int main(int argc, char **argv) {
     else if (a == "--node") node = static_cast<u32>(next());
     else if (a == "--threads") threads = static_cast<u32>(next());
     else if (a == "--cap") cap = static_cast<u32>(next());
+    else if (a == "--no-ref") no_ref = true;
     else if (a == "--page-kb") page_kb = next();
     else if (a == "--in") I = next();
     else if (a == "--hidden") H = next();
@@ -881,7 +903,7 @@ int main(int argc, char **argv) {
     else if (a == "--help") {
       std::printf("usage: %s [--blocks N] [--threads N] [--cap PAGES] "
                   "[--page-kb N] [--in N] [--hidden N] [--out N] [--batch N] "
-                  "[--steps N] [--lr F]\n", argv[0]);
+                  "[--steps N] [--lr F] [--no-ref]\n", argv[0]);
       return 0;
     }
   }
@@ -1077,18 +1099,28 @@ int main(int argc, char **argv) {
   };
 
   // ---- Dense reference training. -----------------------------------------
-  auto *d_wref = ctp::GpuApi::Malloc<float>(n * sizeof(float));
-  lb::LaunchDenseSeed(d_wref, n);
-  ctp::GpuApi::Synchronize();
-  // The paged path's biases live in PLAIN DEVICE ARRAYS, not the vector (see
-  // the note above Fwd1Coro). Captured here, after the dense seed and before
-  // dense training mutates d_wref, so both paths start from identical bits.
+  // Under --no-ref there is no d_wref at all (that is the whole point), so
+  // the biases are seeded straight from the same index-addressed stream.
+  float *d_wref = nullptr;
   auto *d_b1 = ctp::GpuApi::Malloc<float>(H * sizeof(float));
   auto *d_b2 = ctp::GpuApi::Malloc<float>(O * sizeof(float));
-  ctp::GpuApi::Memcpy(d_b1, d_wref + b1_off, H * sizeof(float));
-  ctp::GpuApi::Memcpy(d_b2, d_wref + b2_off, O * sizeof(float));
+  if (no_ref) {
+    lb::LaunchDenseSeedRange(d_b1, b1_off, H);
+    lb::LaunchDenseSeedRange(d_b2, b2_off, O);
+    ctp::GpuApi::Synchronize();
+  } else {
+    d_wref = ctp::GpuApi::Malloc<float>(n * sizeof(float));
+    lb::LaunchDenseSeed(d_wref, n);
+    ctp::GpuApi::Synchronize();
+    // The paged path's biases live in PLAIN DEVICE ARRAYS, not the vector
+    // (see the note above Fwd1Coro). Captured here, after the dense seed and
+    // before dense training mutates d_wref, so both paths start from
+    // identical bits.
+    ctp::GpuApi::Memcpy(d_b1, d_wref + b1_off, H * sizeof(float));
+    ctp::GpuApi::Memcpy(d_b2, d_wref + b2_off, O * sizeof(float));
+  }
   const double t_ref0 = NowMs();
-  for (u64 s = 0; s < steps; ++s) {
+  for (u64 s = 0; !no_ref && s < steps; ++s) {
     lb::LaunchDenseFwd1(blocks, threads, d_wref, w1_off, b1_off, I, H, B, d_x,
                         d_a1, hper_all);
     lb::LaunchDenseFwd2(blocks, threads, d_wref, w2_off, b2_off, H, O, B, d_a1,
@@ -1305,8 +1337,13 @@ int main(int argc, char **argv) {
               (unsigned long long)st.faults, (unsigned long long)st.evicts,
               (unsigned long long)st.puts, (unsigned long long)st.get_errors,
               (unsigned long long)st.put_errors);
-  std::printf("  %llu steps: paged %.1f ms/step, dense %.1f ms/step\n",
-              (unsigned long long)steps, t_paged / steps, t_ref / steps);
+  if (no_ref) {
+    std::printf("  %llu steps: paged %.1f ms/step, dense skipped (--no-ref)\n",
+                (unsigned long long)steps, t_paged / steps);
+  } else {
+    std::printf("  %llu steps: paged %.1f ms/step, dense %.1f ms/step\n",
+                (unsigned long long)steps, t_paged / steps, t_ref / steps);
+  }
 
   int rc = 0;
   bool loss_ok = true;
@@ -1317,7 +1354,7 @@ int main(int argc, char **argv) {
   // 0 growing to 2.4e-8 at step 4. The single-node path keeps the exact
   // comparison -- there is no reordering there to excuse a difference.
   const double loss_tol = (nodes > 1) ? 1e-6 : 0.0;
-  for (u64 s = 0; s < steps; ++s) {
+  for (u64 s = 0; !no_ref && s < steps; ++s) {
     const double diff = loss_got[s] - loss_ref[s];
     const double adiff = diff < 0 ? -diff : diff;
     const double scale = loss_ref[s] != 0.0 ?
@@ -1328,7 +1365,12 @@ int main(int argc, char **argv) {
       loss_ok = false;
     }
   }
-  if (loss_ok) {
+  if (no_ref) {
+    // No reference to gate against; the trajectory is still reported, and a
+    // diverged run shows up here as plainly as a failed comparison would.
+    std::printf("  LOSS GATE: skipped (--no-ref); loss %.6f -> %.6f\n",
+                loss_got[0], loss_got[steps - 1]);
+  } else if (loss_ok) {
     std::printf("  LOSS GATE: PASS (all %llu steps within tolerance; final loss "
                 "%.6f -> %.6f)\n",
                 (unsigned long long)steps, loss_ref[0],
@@ -1336,7 +1378,10 @@ int main(int argc, char **argv) {
   } else {
     rc = 1;
   }
-  {
+  if (no_ref) {
+    std::printf("  WEIGHT GATE: skipped (--no-ref; nothing to compare "
+                "against)\n");
+  } else {
     // ONE WEIGHT GATE FOR BOTH MODES, elementwise over the two weight
     // regions. The digest is gone: it hashed the whole vector including the
     // bias pages, which are dead now that the biases live outside it -- and
