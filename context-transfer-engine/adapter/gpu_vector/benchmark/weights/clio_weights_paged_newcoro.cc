@@ -873,6 +873,14 @@ int main(int argc, char **argv) {
       }
       got_all = pair[0];
       want_all = pair[1];
+      // Every node must hold the SAME reduced total; a node whose reduction
+      // read one peer twice and another never still passes got == want on
+      // its own, so that comparison alone cannot see it (see AgreeU64).
+      if (!clio_bench_dist::AgreeU64(*cte_red, red_tag, node, nodes,
+                                     red_round++, got_all, "wtagree")) {
+        ok = false;
+        std::fprintf(stderr, "AGREEMENT GATE: FAIL (reduced checksum differs across nodes)\n");
+      }
     }
     checksum_total = got_all;
     if (got_all != want_all) {

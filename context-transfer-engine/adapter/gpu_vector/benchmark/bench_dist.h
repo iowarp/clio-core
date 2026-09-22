@@ -205,6 +205,44 @@ inline bool ReduceSumU64(clio::cte::core::Client &cte,
 }
 
 /**
+ * Check that every node holds the same u64 after a reduction.
+ *
+ * A reduction that returns a different total on one node is invisible to a
+ * per-node gate: that node compares its own reduced `got` against its own
+ * reduced `want`, and if both were shifted the same way (a peer's pair read
+ * twice, another's never) they still agree. Measured on the E4 weights
+ * DAOS-heavy cell: three nodes at one total, the fourth at another, all four
+ * printing checksum=OK. This sums the value over the nodes with a second
+ * round and fails unless the sum is exactly `nodes` times this node's value,
+ * which is only true when every node holds the same number.
+ *  @param cte,tag,node,nodes,round  as ReduceSumU64
+ *  @param value   this node's reduced value
+ *  @param prefix  blob-name prefix for the agreement round
+ *  @return true when all nodes agree (or the round itself failed and was
+ *          reported), false when the values differ */
+inline bool AgreeU64(clio::cte::core::Client &cte,
+                     const clio::cte::core::TagId &tag, u32 node, u32 nodes,
+                     u64 round, u64 value, const char *prefix = "gvagree",
+                     int timeout_s = 120) {
+  if (nodes <= 1) return true;
+  u64 sum = value;
+  if (!ReduceSumU64(cte, tag, node, nodes, round, &sum, 1, prefix,
+                    timeout_s)) {
+    return false;
+  }
+  if (sum != value * static_cast<u64>(nodes)) {
+    std::fprintf(stderr,
+                 "  agree[%s]: node %u holds %llu but the nodes sum to %llu "
+                 "(%u x mine = %llu): the reduction disagreed across nodes\n",
+                 prefix, node, (unsigned long long)value,
+                 (unsigned long long)sum, nodes,
+                 (unsigned long long)(value * static_cast<u64>(nodes)));
+    return false;
+  }
+  return true;
+}
+
+/**
  * All-gather a contiguous float slice.
  *
  * Every node owns [lo, hi) of the same array and needs the whole thing. Each
