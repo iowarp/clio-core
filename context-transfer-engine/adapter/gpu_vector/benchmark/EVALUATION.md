@@ -73,6 +73,7 @@ deck is measured first to size the largest one that fits.
 |---|---|---|---|---|
 | kmeans | 128 GB global (32 GB/rank), 8 iters | pending | pending | pending |
 | grayscott | 128 GB global, 8 steps, 1 MB page | pending | pending | pending |
-| gmx | K=2048 (17 GB/node), 20 M atoms | pending | pending | pending |
-| lbann | 65536 -> 65536 -> 458752, batch 1024, 5 steps | TIMEOUT (> 240 s) | -- | -- |
+| gmx | K=2048 (17 GB/node), 20 M atoms, 1 pass | 1009 ms PASS | 990 ms PASS | 992 ms PASS; conservation exact, checksums identical; gather dominates (~880 ms) |
+| lbann | 65536 -> 65536 -> 458752, batch 1024, 5 steps (anchor) | TIMEOUT (> 240 s at 8 work-groups) | -- | -- |
+| lbann | 16384 -> 16384 -> 114688 (2 GB/node), batch 1024, 3 steps, 1024 work-groups | 27.7 s (9.2 s/step) PASS | 25.9 s (8.6 s/step) PASS | 29.1 s (9.7 s/step) PASS; digests identical |
 | lammps_md | pending | | | |
