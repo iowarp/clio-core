@@ -106,3 +106,18 @@ because they carried 128 MB per node. The tiers now follow the deck.
 | gmx | default deck, 128 KB page | pending |
 | lbann | default deck | pending |
 | lammps_md | L=28, 10 steps, ballistic gate | pending |
+
+## Plan coverage so far
+
+| study | status |
+|---|---|
+| 4-node baseline (plan's step 1) | baselines: complete for all five workloads on MPI, oneCCL and Intel SHMEM at stage-one decks; stage-two (5-minute) decks complete for kmeans, gmx, lbann, lammps_md, grayscott anchor queued. Eternia: kmeans and grayscott pass at stage-one decks (checksums equal to the baselines'); gmx, lbann, lammps_md queued; the resident-deck pass (E1's configuration) queued for kmeans and grayscott |
+| E1 scaling (8 -> 64 nodes) | not started; needs the 4-node rung closed first |
+| E2 page size | not started |
+| E3 persistence | not started; the baselines' `--ckpt-dir` arms (Lustre-direct, DAOS-direct) exist in the lammps_md edition |
+| E4 tiering | partly exercised before this plan at 2 nodes: kmeans, grayscott and weights through HBM -> DAOS, HBM -> Flare, and DRAM -> DAOS -> Flare (AURORA.md); the 4-node five-composition sweep is not started |
+| E5 memory reduction | not started |
+| E6 organization (gnn) | not started; gnn has only the older single-node CTE edition and needs its OGB datasets staged |
+
+Order of work in force: every cell at 4 nodes under 5 minutes first, then
+the same cells grown toward 15 minutes, non-Eternia before Eternia.
