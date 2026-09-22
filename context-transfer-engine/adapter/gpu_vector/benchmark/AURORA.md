@@ -41,6 +41,17 @@ final `device_vector.h`: gmx, lbann, weights (26-29 ms, same checksum),
 grayscott (139 ms, 14.4 GB/s, same v_checksum), kmeans (582 ms, both
 ranks 30719.999645) and lammps_md (bitwise, 90 ms) all PASS.
 
+Re-verified once more after merging the coroutine backend change
+(dbfce040, `clio::co::Frame` as a LIFO park log): all six two-node runs and
+all six tiering runs pass, results to the digit where they are bit-exact.
+One number moved: weights on Flare took 27-37 s (39k-85k kernel rounds)
+against 5.7 s (4k-9k rounds) the day before, with faults and evicts
+identical and the same binary on DAOS unchanged (4.0-5.0 s, 1-2k
+rounds). Flare was slower that hour, and the set-full retry of (12) waits
+with tag 0 -- resume every round -- so a slow tier becomes polling by
+kernel relaunch. Correct, and the obvious refinement is to wait on the
+block's own in-flight flush word when there is one.
+
 ### Storage tiers on Flare and DAOS
 
 `pbs_newcoro_aurora_2n_tier.sh` and `submit_tier_all_aurora.sh`: 16 GB
