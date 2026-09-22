@@ -116,6 +116,23 @@ because they carried 128 MB per node. The tiers now follow the deck.
 | grayscott, resident (E1 configuration) | as above but HBM tier 2 GB/node holds the deck, tiers 4 GB + 2 GB | at dt=1: 0.61-0.81 s, checksum 3086389.535277 = the baselines'; at dt=0.5: 0.73-0.84 s, checksum 2754766.354742 = the dt=0.5 baselines' on all four nodes, same fault and put counts; 520-528 faults (frame cache, served from the HBM tier) and 2048 puts per rank; no storage traffic |
 | kmeans, resident (E1 configuration) | as above but HBM tier 2 GB/node holds the whole deck, tiers 4 GB + 2 GB | global-atomics assignment: 2.81-2.84 s (1.41 GB/s), checksum identical on all ranks, 162-174 faults/rank. With block-private accumulators: 1.00-1.03 s (3.9-4.0 GB/s), checksum 30720.000018 on all ranks, 156-176 faults and evicts per rank, 0 puts. The faults are the vector's per-block frame cache (8 pages/block, streaming by design), served from the HBM tier: no storage traffic, which is E1's condition |
 
+## E4: tiering composition at 4 nodes (debugging scale)
+
+`submit_e4_aurora.sh`: one 10 GB/node tier budget split five ways
+(DRAM / DAOS / Flare in percent), 8 GB/node decks, 1 MB pages, a 4 GB HBM
+frame cache in front of the tiers, one job per cell, 780 s cap. A tier at
+0 MB is left out of the config. The plan asks for 64 GB/node; this is the
+rung that has to fit five minutes first. The Eternia editions only -- the
+baselines have no tiers, their reference is the resident 15-minute rows.
+Stats are per rank after the seed (ResetStats before the timed loop), so
+`puts` counts write-backs during the measured pass only.
+
+| workload | dram100 (100/0/0) | dram75 (75/25/0) | bal25 (25/50/25) | daos70 (10/70/20) | lustre70 (10/20/70) |
+|---|---|---|---|---|---|
+| kmeans, 1 iter over 8 GB/node | 2.02-2.18 s (3.7-4.0 GB/s), checksum 30720.000074 on all ranks, 7463-7472 faults and evicts, 0 puts | pending | pending | pending | pending |
+| grayscott, 1 step over 8 GB/node | pending | pending | pending | pending | pending |
+| weights, 64 blocks x 128 pages | pending | pending | pending | pending | pending |
+
 ## Plan coverage so far
 
 | study | status |
