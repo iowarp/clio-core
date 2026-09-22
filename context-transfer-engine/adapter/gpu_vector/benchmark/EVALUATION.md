@@ -128,14 +128,16 @@ the same cells grown toward 15 minutes, non-Eternia before Eternia.
 ## Stage 4: baselines toward 15-minute runs
 
 Cap 840 s per rank, 15-minute walltime. lbann's 32 GB anchor is about
-150 s per step at 1024 work-groups, so 5 steps is ~12.5 minutes and each
-substrate runs as its own job. The other four already fit 5 minutes at
+150 s per step at 1024 work-groups, and with the host-side seeding of
+34 GB of parameters per rank 5 steps overran the cap on MPI; 3 steps is
+the deck that fits 15 minutes, each substrate as its own job. The other four already fit 5 minutes at
 the plan's anchor decks, so their 15-minute rows raise the work
 (iterations, steps, passes, checkpoint volume) at the same size.
 
 | workload | deck | MPI | oneCCL | Intel SHMEM |
 |---|---|---|---|---|
-| lbann | 65536 -> 65536 -> 458752 (32 GB/node), batch 1024, 5 steps, 1024 work-groups; one job per substrate | pending | pending | pending |
+| lbann | 65536 -> 65536 -> 458752 (32 GB/node), batch 1024, 5 steps, 1024 work-groups; one job per substrate | TIMEOUT at 840 s | (not run) | (not run) |
+| lbann | the same at 3 steps | pending | pending | pending |
 | kmeans | 128 GB global (32 GB/rank), 12 iters, 1024 work-groups | pending | pending | pending |
 | grayscott | 128 GB global, 256 steps, 1 MB page | pending | pending | pending |
 | gmx | K=2048, 20 M atoms, 200 passes | pending | pending | pending |
