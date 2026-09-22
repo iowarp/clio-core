@@ -80,3 +80,24 @@ deck is measured first to size the largest one that fits.
 | lbann | 16384 -> 16384 -> 114688 (2 GB/node), batch 1024, 3 steps, 1024 work-groups | 27.7 s (9.2 s/step) PASS | 25.9 s (8.6 s/step) PASS | 29.1 s (9.7 s/step) PASS; digests identical |
 | lbann | 32768 -> 32768 -> 229376 (8 GB/node), batch 1024, 5 steps, 1024 work-groups | 179.0 s (35.8 s/step, comm 8.8 s) PASS | 172.4 s (34.5 s/step, comm 1.7 s) PASS | 179.2 s (35.8 s/step, comm 8.4 s) PASS; digests identical. The 5-minute-stage lbann deck; the 32 GB anchor (~150 s/step) belongs to the 15-minute stage |
 | lammps_md | pending | | | |
+
+## Stage 3: Eternia at 4 nodes, stage-one decks
+
+`pbs_newcoro_aurora_4n.sh` (the two-node script with the node count from
+the allocation and the storage tiers sized from the deck through
+`BENCH_TIER_HBM_MB` / `BENCH_TIER_RAM_MB`).
+
+First attempt, finding: the four-node job reused the single-node config
+unchanged, whose tiers total 640 MB per node (kmeans: 64 MB of HBM + 576
+MB of RAM). A 1 GB/node deck filled them, every put was refused -- the
+reduction's tiny blobs included -- and all four ranks died with "timed
+out publishing" after the 120 s reduction timeout. The two-node runs fit
+because they carried 128 MB per node. The tiers now follow the deck.
+
+| workload | deck | Eternia (4 nodes) |
+|---|---|---|
+| kmeans | 4 GB global (1 GB/rank), 4 iters, 1 MB page, HBM 512 MB, tiers 2 GB + 2 GB | pending |
+| grayscott | 4 GB global, 4 steps, 1 MB page, tiers 2 GB + 2 GB | pending |
+| gmx | default deck, 128 KB page | pending |
+| lbann | default deck | pending |
+| lammps_md | L=28, 10 steps, ballistic gate | pending |
