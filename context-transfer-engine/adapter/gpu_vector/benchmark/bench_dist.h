@@ -94,8 +94,8 @@ inline bool ReduceSum(clio::cte::core::Client &cte,
     f.Wait();
     if (f->GetReturnCode() == 0) break;
     if (expired()) {
-      std::fprintf(stderr, "  reduce[%s]: timed out publishing node %u\n",
-                   prefix, node);
+      std::fprintf(stderr, "  reduce[%s]: timed out publishing node %u (last put rc=%u)\n",
+                   prefix, node, f->GetReturnCode());
       return false;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -173,8 +173,8 @@ inline bool ReduceSumU64(clio::cte::core::Client &cte,
     f.Wait();
     if (f->GetReturnCode() == 0) break;
     if (expired()) {
-      std::fprintf(stderr, "  reduce64[%s]: timed out publishing node %u\n",
-                   prefix, node);
+      std::fprintf(stderr, "  reduce64[%s]: timed out publishing node %u (last put rc=%u)\n",
+                   prefix, node, f->GetReturnCode());
       return false;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -243,8 +243,8 @@ inline bool AllGatherF32(clio::cte::core::Client &cte,
     f.Wait();
     if (f->GetReturnCode() == 0) break;
     if (expired()) {
-      std::fprintf(stderr, "  gather[%s]: timed out publishing node %u\n",
-                   prefix, node);
+      std::fprintf(stderr, "  gather[%s]: timed out publishing node %u (last put rc=%u)\n",
+                   prefix, node, f->GetReturnCode());
       return false;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));

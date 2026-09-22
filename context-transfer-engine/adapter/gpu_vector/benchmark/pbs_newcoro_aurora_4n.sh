@@ -80,9 +80,22 @@ fi
 # BENCH_WORKERS overrides the runtime's thread count (experiment knob: the
 # scheduler's heavy cost class starts with one worker and grows by elastic
 # spawns at its 500 ms tick, which is slow when every fault task is heavy).
-awk -v hf="${RUNDIR}/hostfile" -v nw="${BENCH_WORKERS:-}" '
+# TIER CAPACITIES FOLLOW THE DECK. The single-node template's tiers are
+# sized for that run's arguments (kmeans: 64 MB of HBM + 576 MB of RAM);
+# a four-node deck of 1 GB/node put into them was refused outright --
+# every put, the reduction's tiny blobs included, so the run died with
+# "timed out publishing". BENCH_TIER_HBM_MB / BENCH_TIER_RAM_MB replace
+# the hbm:: and ram:: targets' capacity_limit; for the plan's E1 rung the
+# HBM tier must hold the whole per-node deck.
+awk -v hf="${RUNDIR}/hostfile" -v nw="${BENCH_WORKERS:-}" \
+    -v hbm="${BENCH_TIER_HBM_MB:-}" -v ram="${BENCH_TIER_RAM_MB:-}" '
   /pool_id: "513.0"/ { sub(/"513.0"/, "\"512.0\"") }
   nw != "" && /^  num_threads:/ { $0 = "  num_threads: " nw }
+  /path: "hbm::/ { tier = "hbm" }
+  /path: "ram::/ { tier = "ram" }
+  /path: "\// { tier = "file" }
+  tier == "hbm" && hbm != "" && /capacity_limit:/ { sub(/"[0-9]+[A-Za-z]*"/, "\"" hbm "MB\"") }
+  tier == "ram" && ram != "" && /capacity_limit:/ { sub(/"[0-9]+[A-Za-z]*"/, "\"" ram "MB\"") }
   { print }
   /pool_id: "512.0"/ { print "    targets:"; print "      neighborhood: 1" }
   /^networking:/ { print "  hostfile: \"" hf "\"" }
@@ -90,6 +103,7 @@ awk -v hf="${RUNDIR}/hostfile" -v nw="${BENCH_WORKERS:-}" '
 export CLIO_SERVER_CONF="${RUNDIR}/clio_4n.yaml"
 echo "--- config ---"
 sed -n '1,4p' clio_4n.yaml
+grep -E "path:|capacity_limit" clio_4n.yaml
 
 export IGC_FunctionControl=3
 case "${BENCH_ZE_MASK:-0.0}" in
