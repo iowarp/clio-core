@@ -33,7 +33,8 @@ time spent in the substrate's collectives and exchanges.
 | workload | deck | MPI | oneCCL | Intel SHMEM |
 |---|---|---|---|---|
 | kmeans | 4 GB global (1 GB/rank), 4 iters | 2465 ms (comm 1026) PASS | 2540 ms (comm 1062) PASS | 2045 ms (comm 622) PASS |
-| grayscott | 4 GB global, 4 steps, 1 MB page | 35 ms (comm 15) PASS | 43 ms (comm 22) PASS | 52 ms (comm 30) PASS; v_checksum identical on all three |
+| grayscott | 4 GB global, 4 steps, 1 MB page | 35 ms (comm 15) PASS | 43 ms (comm 22) PASS | 52 ms (comm 30) PASS; v_checksum identical on all three (at dt=1, superseded) |
+| grayscott, dt=0.5 | the same deck after the stability fix | 50 ms (comm 29) PASS | 35 ms (comm 14) PASS | 47 ms (comm 26) PASS; v_checksum 2754766.354742 on all three, the reference for the Eternia rerun |
 | gmx | K=512, 4 M atoms, 1 pass | 91 ms PASS | 82 ms PASS | 105 ms PASS; conservation exact, mesh checksum and gather energy identical on all three |
 | lbann | 1024 -> 4096 -> 256, batch 64, 5 steps | 178 ms (comm 22) PASS | 215 ms (comm 104) PASS | 257 ms (comm 106) PASS; loss and weight digest bit-equal to the dense reference on all three |
 | lammps_md | L=40 (256 k atoms), 20 steps, rebin 10, T=3.0 | 25 ms PASS | 28 ms PASS | 32 ms PASS; statics and resort exact on all three |
