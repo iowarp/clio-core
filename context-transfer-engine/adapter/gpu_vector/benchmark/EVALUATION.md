@@ -120,7 +120,7 @@ because they carried 128 MB per node. The tiers now follow the deck.
 | E1 scaling (8 -> 64 nodes) | not started; needs the 4-node rung closed first |
 | E2 page size | not started |
 | E3 persistence | not started; the baselines' `--ckpt-dir` arms (Lustre-direct, DAOS-direct) exist in the lammps_md edition |
-| E4 tiering | partly exercised before this plan at 2 nodes: kmeans, grayscott and weights through HBM -> DAOS, HBM -> Flare, and DRAM -> DAOS -> Flare (AURORA.md); the 4-node five-composition sweep is not started |
+| E4 tiering | partly exercised before this plan at 2 nodes: kmeans, grayscott and weights through HBM -> DAOS, HBM -> Flare, and DRAM -> DAOS -> Flare (AURORA.md). The 4-node sweep is scripted (`submit_e4_aurora.sh` over `pbs_newcoro_aurora_4n_tier.sh`: the plan's five DRAM/DAOS/Lustre compositions of one 10 GB/node budget, 8 GB/node decks, a tier at 0 MB left out of the config) and launches after the queued baselines. First pass covers kmeans, grayscott and weights; lbann and lammps_md need their decks sized to 8 GB/node first, and the Eternia gmx edition has a fixed 128^3 mesh (8 MB), too small to spill, so it needs a mesh-size knob before it can join |
 | E5 memory reduction | not started |
 | E6 organization (gnn) | not started; gnn has only the older single-node CTE edition and needs its OGB datasets staged |
 
