@@ -83,7 +83,8 @@ deck is measured first to size the largest one that fits.
 | workload | deck | MPI | oneCCL | Intel SHMEM |
 |---|---|---|---|---|
 | kmeans | 128 GB global (32 GB/rank), 4 iters, 1024 work-groups | 79.1 s (19.8 s/iter, comm 2.3 s) PASS | 77.6 s (19.4 s/iter, comm 0.1 s) PASS | 66.9 s (16.7 s/iter, comm 8.3 s) PASS with a 16 GB heap (out of device memory at 40 GB) |
-| grayscott | 128 GB global (32 GB/rank), 8 steps, 1 MB page, 40 GB symmetric heap | 1.34 s (168 ms/step, comm 28 ms) PASS | 1.34 s (168 ms/step, comm 26 ms) PASS | 1.36 s (170 ms/step, comm 31 ms) PASS; v_checksum identical on all three |
+| grayscott | 128 GB global (32 GB/rank), 8 steps, 1 MB page, 40 GB symmetric heap | 1.34 s (168 ms/step, comm 28 ms) PASS | 1.34 s (168 ms/step, comm 26 ms) PASS | 1.36 s (170 ms/step, comm 31 ms) PASS; v_checksum identical on all three (at dt=1, superseded) |
+| grayscott, dt=0.5 | the same anchor after the stability fix | 1.34 s (167.6 ms/step, comm 26 ms) PASS | 1.34 s (167.5 ms/step, comm 25 ms) PASS | 1.36 s (170.2 ms/step, comm 38 ms) PASS; v_checksum 99539486.036462 on MPI and oneCCL, ...463 on Intel SHMEM (last digit of the host reduction order) |
 | gmx | K=2048 (17 GB/node), 20 M atoms, 1 pass | 1009 ms PASS | 990 ms PASS | 992 ms PASS; conservation exact, checksums identical; gather dominates (~880 ms) |
 | lbann | 65536 -> 65536 -> 458752, batch 1024, 5 steps (anchor) | TIMEOUT (> 240 s at 8 work-groups) | -- | -- |
 | lbann | 16384 -> 16384 -> 114688 (2 GB/node), batch 1024, 3 steps, 1024 work-groups | 27.7 s (9.2 s/step) PASS | 25.9 s (8.6 s/step) PASS | 29.1 s (9.7 s/step) PASS; digests identical |
