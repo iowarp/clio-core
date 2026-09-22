@@ -463,6 +463,18 @@ inline void AtomicAdd(T *p, T v) {
   a.fetch_add(v);
 }
 
+/** Relaxed atomic add on work-group local memory (a local_accessor slot).
+ *  @param p  address in local memory
+ *  @param v  value to add */
+template <typename T>
+inline void AtomicAddLocal(T *p, T v) {
+  sycl::atomic_ref<T, sycl::memory_order::relaxed,
+                   sycl::memory_scope::work_group,
+                   sycl::access::address_space::local_space>
+      a(*p);
+  a.fetch_add(v);
+}
+
 }  // namespace gvc
 
 #endif  // CLIO_GV_BENCH_SYCL_BASELINE_GV_COMM_H_

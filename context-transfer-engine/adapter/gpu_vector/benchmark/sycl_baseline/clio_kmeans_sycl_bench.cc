@@ -87,12 +87,17 @@ void Seed(sycl::queue &q, float *pts, u64 base, u64 n, u32 dims, u32 k) {
    }).wait();
 }
 
-/** The assignment step: each point joins its nearest centroid's sum and
- *  count. Grid-stride over points, atomics into sums/counts, as the CUDA
- *  kernel. */
-void Assign(sycl::queue &q, u32 blocks, u32 threads, const float *pts,
-            u64 npts, u32 dims, u32 k, const float *cent, float *sums,
-            unsigned *counts) {
+/** The assignment step with every point's atomics landing in global
+ *  memory, as the CUDA kernel. Kept for a k * dims too large for the
+ *  work-group tile; contention on the winning cluster's sums grows as
+ *  Lloyd's converges, so a step gets slower with every iteration.
+ *  @param q,blocks,threads  launch shape
+ *  @param pts,npts,dims,k    this rank's points and the problem shape
+ *  @param cent               the current centroids (k * dims)
+ *  @param sums,counts        zeroed accumulators (k * dims and k) */
+void AssignGlobal(sycl::queue &q, u32 blocks, u32 threads, const float *pts,
+                  u64 npts, u32 dims, u32 k, const float *cent, float *sums,
+                  unsigned *counts) {
   const size_t g = static_cast<size_t>(blocks) * threads;
   q.parallel_for(sycl::nd_range<1>(g, threads), [=](sycl::nd_item<1> it) {
      for (u64 p = it.get_global_id(0); p < npts; p += g) {
@@ -104,6 +109,62 @@ void Assign(sycl::queue &q, u32 blocks, u32 threads, const float *pts,
        gvc::AtomicAdd(&counts[bestk], 1u);
      }
    }).wait();
+}
+
+/** The assignment step with a per-work-group tile: each group accumulates
+ *  its points' sums and counts in local memory and flushes the tile to the
+ *  global accumulators once, so the global contention is one atomic per
+ *  group per entry however the points distribute over the clusters. The
+ *  per-iteration time is then flat (the global path took 30 s for the
+ *  first Lloyd step of the 32 GB deck and 68-116 s for the last).
+ *  Parameters as AssignGlobal. */
+void AssignTiled(sycl::queue &q, u32 blocks, u32 threads, const float *pts,
+                 u64 npts, u32 dims, u32 k, const float *cent, float *sums,
+                 unsigned *counts) {
+  const size_t g = static_cast<size_t>(blocks) * threads;
+  const u32 kd = k * dims;
+  q.submit([&](sycl::handler &h) {
+     sycl::local_accessor<float, 1> lsums(sycl::range<1>(kd), h);
+     sycl::local_accessor<unsigned, 1> lcounts(sycl::range<1>(k), h);
+     h.parallel_for(sycl::nd_range<1>(g, threads), [=](sycl::nd_item<1> it) {
+       const u32 lid = static_cast<u32>(it.get_local_id(0));
+       for (u32 i = lid; i < kd; i += threads) lsums[i] = 0.0f;
+       for (u32 i = lid; i < k; i += threads) lcounts[i] = 0u;
+       sycl::group_barrier(it.get_group());
+       for (u64 p = it.get_global_id(0); p < npts; p += g) {
+         const float *pt = pts + p * dims;
+         const u32 bestk = NearestCentroid(pt, cent, dims, k);
+         for (u32 i = 0; i < dims; ++i) {
+           gvc::AtomicAddLocal(&lsums[bestk * dims + i], pt[i]);
+         }
+         gvc::AtomicAddLocal(&lcounts[bestk], 1u);
+       }
+       sycl::group_barrier(it.get_group());
+       for (u32 i = lid; i < kd; i += threads) {
+         if (lsums[i] != 0.0f) gvc::AtomicAdd(&sums[i], lsums[i]);
+       }
+       for (u32 i = lid; i < k; i += threads) {
+         if (lcounts[i] != 0u) gvc::AtomicAdd(&counts[i], lcounts[i]);
+       }
+     });
+   }).wait();
+}
+
+/** The assignment step: the tiled path when the k * dims tile fits the
+ *  work-group's local memory (the queue's device says how much), the
+ *  global-atomics path otherwise. Parameters as AssignGlobal. */
+void Assign(sycl::queue &q, u32 blocks, u32 threads, const float *pts,
+            u64 npts, u32 dims, u32 k, const float *cent, float *sums,
+            unsigned *counts) {
+  const u64 tile_bytes = static_cast<u64>(k) * dims * sizeof(float) +
+                         static_cast<u64>(k) * sizeof(unsigned);
+  const u64 local_bytes =
+      q.get_device().get_info<sycl::info::device::local_mem_size>();
+  if (tile_bytes <= local_bytes / 2) {
+    AssignTiled(q, blocks, threads, pts, npts, dims, k, cent, sums, counts);
+  } else {
+    AssignGlobal(q, blocks, threads, pts, npts, dims, k, cent, sums, counts);
+  }
 }
 
 /** centroid = sum / count, leaving an empty cluster where it was. */
