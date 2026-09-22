@@ -86,6 +86,16 @@ static constexpr u32 kYieldLaneBytes = 1024;
 #include "kmeans_kernels.h"
 #include "kmeans_launch.h"
 
+namespace clio::gv_bench::kmeans {
+/** The assignment pass with block-private accumulators (see AssignCoro):
+ *  bsums holds grid.x * k * dims floats and bcounts grid.x * k counters,
+ *  both zeroed by the caller before every pass. Yieldable. */
+void LaunchAssignTiled(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v,
+                       u64 per, u64 page_elems, u32 dims, u32 k,
+                       const float *cent, float *sums, unsigned *counts,
+                       float *bsums, unsigned *bcounts, View vw, StackView sv);
+}  // namespace clio::gv_bench::kmeans
+
 namespace kb = clio::gv_bench::kmeans;
 using kb::PointVal;
 
@@ -152,8 +162,18 @@ CTP_GPU_FUN CLIO_COROC_INLINE void SeedCoro(gv::DeviceVector<float> v, u64 per,
 CTP_GPU_FUN CLIO_COROC_INLINE void AssignCoro(gv::DeviceVector<float> v, u64 per,
                                 u64 page_elems, u32 dims, u32 k,
                                 const float *cent, float *sums,
-                                unsigned *counts, u32 block) {
+                                unsigned *counts, float *bsums,
+                                unsigned *bcounts, u32 block) {
   const u64 base = static_cast<u64>(block) * per;
+  // BLOCK-PRIVATE ACCUMULATORS. With every point's atomics landing in the
+  // one global sums/counts, the winning cluster's entries serialize the
+  // whole device as Lloyd's converges (the 32 GB deck's steps grew from
+  // 20 s to 116 s). bsums/bcounts are per-block slices in global memory
+  // (no __shared__, so the one body still serves both backends): a block
+  // contends only with its own threads, and flushes each entry to the
+  // global accumulators once at the end. Null slices keep the old path.
+  float *ts = bsums ? bsums + static_cast<u64>(block) * k * dims : sums;
+  unsigned *tc = bcounts ? bcounts + static_cast<u64>(block) * k : counts;
   for (u64 off = 0; off < per; off += page_elems) {
     const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
     CO_AWAIT(v.CoFetch(0, base + off, n));
@@ -175,9 +195,9 @@ CTP_GPU_FUN CLIO_COROC_INLINE void AssignCoro(gv::DeviceVector<float> v, u64 per
       } pt{h, pbase};
       const u32 bestk = ::clio_km::NearestCentroid(pt, cent, dims, k);
       for (u32 i = 0; i < dims; ++i) {
-        atomicAdd(&sums[bestk * dims + i], h[pbase + i]);
+        atomicAdd(&ts[bestk * dims + i], h[pbase + i]);
       }
-      atomicAdd(&counts[bestk], 1u);
+      atomicAdd(&tc[bestk], 1u);
     }
     __syncthreads();
     // NO RELEASE HINT HERE. Telling the cache "this page is dead after use"
@@ -187,6 +207,16 @@ CTP_GPU_FUN CLIO_COROC_INLINE void AssignCoro(gv::DeviceVector<float> v, u64 per
     // traffic on top. The unpin below is NOT that hint -- it gives back the
     // fetch's reservation and leaves the page resident.
     v.UnpinRange(base + off, n);
+  }
+  if (bsums) {
+    __syncthreads();
+    const u32 kd = k * dims;
+    for (u32 i = threadIdx.x; i < kd; i += blockDim.x) {
+      if (ts[i] != 0.0f) atomicAdd(&sums[i], ts[i]);
+    }
+    for (u32 i = threadIdx.x; i < k; i += blockDim.x) {
+      if (tc[i] != 0u) atomicAdd(&counts[i], tc[i]);
+    }
   }
 }
 
@@ -244,7 +274,19 @@ void LaunchAssign(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
                   float *sums, unsigned *counts, View vw, StackView sv) {
   (void)info;
   SubmitYieldable(grid, block, v, vw, sv, [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
-    AssignCoro(_cy, dev, per, page_elems, dims, k, cent, sums, counts, blk);
+    AssignCoro(_cy, dev, per, page_elems, dims, k, cent, sums, counts, nullptr,
+               nullptr, blk);
+  });
+}
+
+void LaunchAssignTiled(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v,
+                       u64 per, u64 page_elems, u32 dims, u32 k,
+                       const float *cent, float *sums, unsigned *counts,
+                       float *bsums, unsigned *bcounts, View vw, StackView sv) {
+  (void)info;
+  SubmitYieldable(grid, block, v, vw, sv, [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
+    AssignCoro(_cy, dev, per, page_elems, dims, k, cent, sums, counts, bsums,
+               bcounts, blk);
   });
 }
 
@@ -314,7 +356,18 @@ __global__ GV_LAUNCH_BOUNDS void AssignKernel(GpuInfo info, DevF32 v, u64 per, u
   v.Init(yv.Block());
   __syncthreads();
   CLIO_COROC_RUN(yv, ys, AssignCoro(_cy, v, per, page_elems, dims, k, cent, sums, counts,
-                            yv.Block()));
+                            nullptr, nullptr, yv.Block()));
+}
+
+__global__ GV_LAUNCH_BOUNDS void AssignTiledKernel(
+    GpuInfo info, DevF32 v, u64 per, u64 page_elems, u32 dims, u32 k,
+    const float *cent, float *sums, unsigned *counts, float *bsums,
+    unsigned *bcounts, View yv, StackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.Init(yv.Block());
+  __syncthreads();
+  CLIO_COROC_RUN(yv, ys, AssignCoro(_cy, v, per, page_elems, dims, k, cent, sums, counts,
+                            bsums, bcounts, yv.Block()));
 }
 
 __global__ GV_LAUNCH_BOUNDS void BaselineKernel(const float *tile, u64 n, u32 dims, u32 k,
@@ -349,6 +402,15 @@ void LaunchAssign(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
                   float *sums, unsigned *counts, View vw, StackView sv) {
   AssignKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
       info, v, per, page_elems, dims, k, cent, sums, counts, vw, sv);
+}
+
+void LaunchAssignTiled(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v,
+                       u64 per, u64 page_elems, u32 dims, u32 k,
+                       const float *cent, float *sums, unsigned *counts,
+                       float *bsums, unsigned *bcounts, View vw, StackView sv) {
+  AssignTiledKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
+      info, v, per, page_elems, dims, k, cent, sums, counts, bsums, bcounts,
+      vw, sv);
 }
 
 void LaunchBaseline(u32 threads, const float *tile, u64 n, u32 dims, u32 k,
@@ -632,6 +694,12 @@ int main(int argc, char **argv) {
   d_cent = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_cent)>>(k * dims * sizeof(float));
   d_sums = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_sums)>>(k * dims * sizeof(float));
   d_counts = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_counts)>>(k * sizeof(unsigned));
+  // Per-block slices for the assignment (see AssignCoro).
+  const size_t bsums_n = static_cast<size_t>(blocks) * k * dims;
+  const size_t bcounts_n = static_cast<size_t>(blocks) * k;
+  float *d_bsums = ctp::GpuApi::Malloc<float>(bsums_n * sizeof(float));
+  unsigned *d_bcounts =
+      ctp::GpuApi::Malloc<unsigned>(bcounts_n * sizeof(unsigned));
 
   // Initial centroids: the first k points, taken on the host from the same
   // generator, so every configuration starts identically.
@@ -751,10 +819,13 @@ int main(int argc, char **argv) {
           return 1;
         }
       } else {
+        ctp::GpuApi::Memset(d_bsums, 0, bsums_n * sizeof(float));
+        ctp::GpuApi::Memset(d_bcounts, 0, bcounts_n * sizeof(unsigned));
         runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
-          kb::LaunchAssign(g, b, gpu, dev, per, page_elems, dims, k, d_cent,
-                           d_sums, d_counts, vw, sv);
+          kb::LaunchAssignTiled(g, b, gpu, dev, per, page_elems, dims, k,
+                                d_cent, d_sums, d_counts, d_bsums, d_bcounts,
+                                vw, sv);
         });
       }
       // Combine the shards BEFORE the update, so every node divides the same
@@ -865,6 +936,7 @@ int main(int argc, char **argv) {
                mcp.pinned_gbps, mcp.pageable_gbps);
 
   ctp::GpuApi::Free(d_cent); ctp::GpuApi::Free(d_sums); ctp::GpuApi::Free(d_counts);
+  ctp::GpuApi::Free(d_bsums); ctp::GpuApi::Free(d_bcounts);
   BenchFlushData();
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;
