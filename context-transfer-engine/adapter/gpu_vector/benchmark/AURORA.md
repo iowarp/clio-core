@@ -69,6 +69,22 @@ the benchmark's own timing of the paged pass, per rank.
 | weights   | DAOS  | OK | 4.72 s / 4.78 s, 1.7 GB/s | after (12); both ranks checksum OK and identical, 16.2k faults/rank, put_errors=0. Three runs before it trapped in `AllocatePage: set full` within the first eight pages per block |
 | weights   | Flare | OK | 5.75 s / 5.59 s, 1.4 GB/s | after (12); checksum_total identical to the DAOS run on both ranks, 16.2k faults/rank, put_errors=0. Trapped twice before it |
 
+#### Three tiers in one runtime: DRAM -> DAOS -> Flare
+
+`BENCH_TIER=stack` (`TIERS=stack submit_tier_all_aurora.sh`): per node a
+host-DRAM bdev of 2 GB (score 1.0), a DAOS file of 4 GB (0.5) and a Flare
+file of 4.5 GB (0.2), in front of 8 GB of data per node. Both file tiers
+filled to capacity on every run, the checksums match every other
+configuration, and the end-of-run persist is clean (at 3 GB + 3.5 GB of
+persistent capacity the runs were correct but FlushData declined the 2 GB
+still in DRAM, so the persistent pair now holds the whole 8 GB).
+
+| benchmark | result | kernel | notes |
+|-----------|--------|--------|-------|
+| kmeans    | OK | 4.78 s, 1.68 GB/s | 7.5k faults/rank; DAOS 4 GiB + Flare 4.5 GiB per node |
+| grayscott | OK | 6.8 s / 5.9 s, 4.7-5.4 GB/s | v_checksum 10416629.698624 |
+| weights   | OK | 20.8 s, 0.38 GB/s | checksum identical; 37k-128k rounds, the tag-0 polling of the set-full retry against two slow tiers (see above) |
+
 At 64 KB pages the first kmeans run wrote ~45 MB/s per node to Flare (a
 synchronous ~1.4 ms per page put) and was still loading when the 200 s
 cap hit; the tier runs use 1 MB pages.
