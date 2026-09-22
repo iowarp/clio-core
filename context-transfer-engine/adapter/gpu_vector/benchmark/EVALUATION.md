@@ -102,7 +102,7 @@ because they carried 128 MB per node. The tiers now follow the deck.
 | workload | deck | Eternia (4 nodes) |
 |---|---|---|
 | kmeans | 4 GB global (1 GB/rank), 4 iters, 1 MB page, HBM 512 MB, tiers 2 GB + 2 GB | 2.76-2.78 s (1.45 GB/s), checksum identical on all ranks, 158-177 faults/rank. Baselines on the same deck: MPI 2.47 s, oneCCL 2.54 s, ISHMEM 2.05 s. Not yet resident (512 MB cache against 1 GB); E1 proper needs the cache to hold the deck |
-| grayscott | 4 GB global, 4 steps, 1 MB page, tiers 2 GB + 2 GB | pending |
+| grayscott | 4 GB global, 4 steps, 1 MB page, HBM 512 MB, tiers 2 GB + 2 GB | 0.69-0.74 s (43-46 GB/s of paged traffic), v_checksum 3086389.535277 = the baselines' exactly; 520-528 faults and 2048 puts per rank per run. Baselines on the same deck: 35 / 43 / 52 ms. At a deck this small every step's full write-back through the transfer engine dominates; the ratio is the number to watch as the deck grows |
 | gmx | default deck, 128 KB page | pending |
 | lbann | default deck | pending |
 | lammps_md | L=28, 10 steps, ballistic gate | pending |
