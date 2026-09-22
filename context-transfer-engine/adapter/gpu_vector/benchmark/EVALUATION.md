@@ -129,7 +129,7 @@ Stats are per rank after the seed (ResetStats before the timed loop), so
 
 | workload | dram100 (100/0/0) | dram75 (75/25/0) | bal25 (25/50/25) | daos70 (10/70/20) | lustre70 (10/20/70) |
 |---|---|---|---|---|---|
-| kmeans, 1 iter over 8 GB/node | 2.02-2.18 s (3.7-4.0 GB/s), checksum 30720.000074 on all ranks, 7463-7472 faults and evicts, 0 puts | 3.97 s on all four nodes (2.0 GB/s), checksum 30719.999974, ~7456 faults and evicts; the DAOS tier file was its full 2.5 GB on every node, so the DAOS share carried a third of the faults at about half the DRAM-only rate | pending | pending | pending |
+| kmeans, 1 iter over 8 GB/node | 2.02-2.18 s (3.7-4.0 GB/s), checksum 30720.000074 on all ranks, 7463-7472 faults and evicts, 0 puts | 3.97 s on all four nodes (2.0 GB/s), checksum 30719.999974, ~7456 faults and evicts; the DAOS tier file was its full 2.5 GB on every node, so the DAOS share carried a third of the faults at about half the DRAM-only rate | 5.58 s on all four nodes (1.43 GB/s), checksum 30719.999983, ~7450 faults and evicts; DAOS file 5.0 GB and Flare file 2.5 GB per node, both tiers at their full capacity, so only 0.5 GB stayed in DRAM | pending | pending |
 | grayscott, 1 step over 8 GB/node | pending | pending | pending | pending | pending |
 | weights, 64 blocks x 128 pages | pending | pending | pending | pending | pending |
 
