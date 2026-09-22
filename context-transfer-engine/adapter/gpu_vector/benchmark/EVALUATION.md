@@ -143,4 +143,4 @@ the plan's anchor decks, so their 15-minute rows raise the work
 | kmeans | 128 GB global (32 GB/rank), 12 iters, 1024 work-groups | pending | pending | pending |
 | grayscott | 128 GB global, 256 steps, 1 MB page | pending | pending | pending |
 | gmx | K=2048, 20 M atoms, 200 passes | 190.1 s (spread 13.9 s, gather 173.1 s, comm 0.1 s) PASS | 190.1 s (spread 13.9 s, gather 173.0 s, comm 0.2 s) PASS | 190.2 s (spread 13.9 s, gather 173.1 s, comm 0.2 s) PASS; checksums identical to the single-pass anchor on all three |
-| lammps_md | L=256, 300 steps, rebin 10, checkpoint every 5 (60 x 1.3 GB, DRAM); one job per substrate | pending | pending | pending |
+| lammps_md | L=256, 300 steps, rebin 10, checkpoint every 5 (60 x 1.3 GB, DRAM); one job per substrate | pending | pending | 30.8 s (102.7 ms/step, halo 5.6 s, 60 checkpoints in 1.48 s) PASS, NVE drift 2.4e-3 over 300 steps |
