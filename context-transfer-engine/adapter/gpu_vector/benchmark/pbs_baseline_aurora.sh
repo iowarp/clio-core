@@ -50,9 +50,13 @@ mkdir -p "$SYCL_CACHE_DIR"
 # GPU-aware MPI for the MPI edition (MPICH --with-ze); oneCCL wants it too.
 export MPIR_CVAR_ENABLE_GPU=${MPIR_CVAR_ENABLE_GPU:-1}
 # ISHMEM's symmetric heap: every buffer a collective or a put names lives
-# there, and the default is far below a per-node deck. 40 GB of the tile's
-# 64 GB; the editions keep bulk data that no peer touches in plain USM.
-export ISHMEM_SYMMETRIC_SIZE=${ISHMEM_SYMMETRIC_SIZE:-42949672960}
+# there, and the default is far below a per-node deck -- but the heap is
+# RESERVED at init, so it competes with the plain-USM bulk data for the
+# tile's 64 GB (kmeans at 32 GB/rank plus a 40 GB heap was
+# UR_RESULT_ERROR_OUT_OF_RESOURCES). 16 GB by default; grayscott, whose
+# fields are all symmetric, passes a larger value through the job's
+# environment (BENCH_EXTRA="ISHMEM_SYMMETRIC_SIZE=...").
+export ISHMEM_SYMMETRIC_SIZE=${ISHMEM_SYMMETRIC_SIZE:-17179869184}
 export BENCH_RANK_ARGS="${BENCH_ARGS}"
 export BENCH_RANK_CAP="${BENCH_CAP}"
 CPU_BIND=${BENCH_CPU_BIND:-none}
