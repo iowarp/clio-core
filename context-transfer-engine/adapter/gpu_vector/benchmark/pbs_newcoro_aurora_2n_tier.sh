@@ -8,6 +8,10 @@
 #PBS -A IOWarp
 #PBS -j oe
 #
+# (pbs_newcoro_aurora_4n_tier.sh carries the four-node headers -- select=4,
+# debug-scaling, 15-minute walltime -- and execs this file; the node count
+# comes from the allocation either way.)
+#
 # TIERED two-node run of one paged benchmark: GPU HBM in front of a
 # filesystem tier on Flare (Lustre) or DAOS (a POSIX container mounted with
 # dfuse), with every tier smaller than the data so the spill is real.
@@ -40,6 +44,12 @@
 #   BENCH_TOP_MB             DRAM tier capacity per node (default 2048)
 #   BENCH_DAOS_MB            DAOS tier capacity per node (default 4096)
 #   BENCH_FLARE_MB           Flare tier capacity per node (default 4608)
+#
+# A tier given capacity 0 is LEFT OUT of the config (and DAOS is not mounted
+# when its tier is out), which is how the plan's E4 compositions are spelt:
+# DRAM-heavy 75/25/0 has no Flare tier and the DRAM-only reference has only
+# the DRAM tier. BENCH_LABEL (default BENCH_TIER) names the composition in
+# the RESULT line. BENCH_CAP is the per-rank cap in seconds (default 200).
 set -u
 
 : "${BENCH_NAME:?set BENCH_NAME}"
@@ -55,8 +65,10 @@ DAOS_CONT=${DAOS_CONT:-clio_tier}
 ROOT=${ROOT:-/home/llogan/clio-core/.claude/worktrees/gpu-coro}
 EXE="${ROOT}/build-spike/${BENCH_EXE:-clio_${BENCH_NAME}_paged_newcoro_aot}"
 RUNDIR=${RUNDIR:-${ROOT}/build-spike/runtier_${BENCH_TIER}_${BENCH_NAME}}
-NRANKS=2
+NRANKS=$(sort -u "${PBS_NODEFILE}" | wc -l)
 JOBTAG=${PBS_JOBID%%.*}
+BENCH_LABEL=${BENCH_LABEL:-${BENCH_TIER}}
+BENCH_CAP=${BENCH_CAP:-200}
 
 if [ "${BENCH_TIER}" = stack ]; then
   echo "=== ${BENCH_NAME} x${NRANKS} nodes, tier=stack dram=${BENCH_TOP_MB}MB -> daos=${BENCH_DAOS_MB}MB -> flare=${BENCH_FLARE_MB}MB per node ==="
@@ -105,15 +117,23 @@ case "${BENCH_TIER}" in
     TIER_DIR="${MNT}/clio_tier/${JOBTAG}"
     ;;
   stack)
-    mount_daos
-    TIER_DIR_DAOS="${MNT}/clio_tier/${JOBTAG}"
-    TIER_DIR_FLARE="${FLARE_ROOT}"
-    TIER_DIR="${TIER_DIR_DAOS}"
-    TIER_DIRS="${TIER_DIR_FLARE}"
+    # Each tier only if it has capacity; TIER_DIR is the first present one
+    # (empty when the stack is DRAM-only) and TIER_DIRS the rest.
+    TIER_DIR=""
+    TIER_DIR_DAOS=""; TIER_DIR_FLARE=""
+    if [ "${BENCH_DAOS_MB}" -gt 0 ]; then
+      mount_daos
+      TIER_DIR_DAOS="${MNT}/clio_tier/${JOBTAG}"
+      TIER_DIR="${TIER_DIR_DAOS}"
+    fi
+    if [ "${BENCH_FLARE_MB}" -gt 0 ]; then
+      TIER_DIR_FLARE="${FLARE_ROOT}"
+      if [ -z "${TIER_DIR}" ]; then TIER_DIR="${TIER_DIR_FLARE}"; else TIER_DIRS="${TIER_DIR_FLARE}"; fi
+    fi
     ;;
   *) echo "BENCH_TIER must be flare, daos or stack"; exit 2 ;;
 esac
-for d in "${TIER_DIR}" ${TIER_DIRS}; do
+for d in ${TIER_DIR} ${TIER_DIRS}; do
   mkdir -p "${d}" || { echo "cannot create ${d}"; exit 2; }
   echo "tier dir: ${d}"
   df -h "${d}" | tail -1
@@ -121,20 +141,31 @@ done
 
 # The storage list for the config, per mode.
 if [ "${BENCH_TIER}" = stack ]; then
-  STORAGE_YAML="      - path: \"ram::gv_tier_dram\"
+  STORAGE_YAML=""
+  if [ "${BENCH_TOP_MB}" -gt 0 ]; then
+    STORAGE_YAML="${STORAGE_YAML}      - path: \"ram::gv_tier_dram\"
         bdev_type: \"ram\"
         capacity_limit: \"${BENCH_TOP_MB}MB\"
         score: 1.0
-      - path: \"${TIER_DIR_DAOS}/node__RANK__.dat\"
+"
+  fi
+  if [ "${BENCH_DAOS_MB}" -gt 0 ]; then
+    STORAGE_YAML="${STORAGE_YAML}      - path: \"${TIER_DIR_DAOS}/node__RANK__.dat\"
         bdev_type: \"file\"
         persistence_level: \"long_term\"
         capacity_limit: \"${BENCH_DAOS_MB}MB\"
         score: 0.5
-      - path: \"${TIER_DIR_FLARE}/node__RANK__.dat\"
+"
+  fi
+  if [ "${BENCH_FLARE_MB}" -gt 0 ]; then
+    STORAGE_YAML="${STORAGE_YAML}      - path: \"${TIER_DIR_FLARE}/node__RANK__.dat\"
         bdev_type: \"file\"
         persistence_level: \"long_term\"
         capacity_limit: \"${BENCH_FLARE_MB}MB\"
-        score: 0.2"
+        score: 0.2
+"
+  fi
+  [ -n "${STORAGE_YAML}" ] || { echo "stack with every tier at 0 MB"; exit 2; }
 else
   STORAGE_YAML="      - path: \"hbm::gv_tier_hbm\"
         bdev_type: \"hbm\"
@@ -201,10 +232,12 @@ export BENCH_RANK_EXE="${EXE}"
 export BENCH_RANK_ARGS="${BENCH_ARGS}"
 export BENCH_RANK_N="${NRANKS}"
 export BENCH_RANK_DIR="${RUNDIR}"
+export BENCH_RANK_CAP="${BENCH_CAP}"
 
-# 200 s: the dfuse launch and the tier listing need their share of the five
-# minutes, and PBS reaping the job mid-sentence is what the cap prevents.
-echo "--- run (200s cap per rank, ${NRANKS} ranks) ---"
+# 200 s by default: the dfuse launch and the tier listing need their share
+# of the five minutes, and PBS reaping the job mid-sentence is what the cap
+# prevents. The four-node wrapper's 15-minute walltime takes a larger cap.
+echo "--- run (${BENCH_CAP}s cap per rank, ${NRANKS} ranks) ---"
 start=$SECONDS
 # --cpu-bind: see pbs_newcoro_aurora_2n.sh. The runtime's spinning threads
 # must not share a narrow cpuset.
@@ -213,7 +246,7 @@ mpiexec -n "${NRANKS}" --ppn 1 --no-vni --envall --cpu-bind "${BENCH_CPU_BIND:-n
   cd "$BENCH_RANK_DIR"
   sed "s/__RANK__/$r/g" clio_tier_template.yaml > "clio_tier_r$r.yaml"
   export CLIO_SERVER_CONF="$BENCH_RANK_DIR/clio_tier_r$r.yaml"
-  timeout --signal=TERM --kill-after=10s 200 \
+  timeout --signal=TERM --kill-after=10s "${BENCH_RANK_CAP:-200}" \
     stdbuf -oL -eL "$BENCH_RANK_EXE" $BENCH_RANK_ARGS --nodes "$BENCH_RANK_N" --node "$r" \
     > "rank$r.log" 2>&1
   rc=$?
@@ -231,17 +264,19 @@ for r in $(seq 0 $((NRANKS - 1))); do
   [ "${rrc}" -gt "${rc}" ] && rc=${rrc}
 done
 
-echo "--- tier files (what actually spilled to ${BENCH_TIER}) ---"
-for d in "${TIER_DIR}" ${TIER_DIRS}; do
+echo "--- tier files (what actually spilled to ${BENCH_LABEL}) ---"
+for d in ${TIER_DIR} ${TIER_DIRS}; do
   ls -l "${d}" 2>&1
   du -sh "${d}" 2>&1
   rm -rf "${d}"
 done
-case "${BENCH_TIER}" in daos|stack) clean-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" > /dev/null 2>&1 ;; esac
+if [ "${BENCH_TIER}" = daos ] || [ -n "${TIER_DIR_DAOS:-}" ]; then
+  clean-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" > /dev/null 2>&1
+fi
 
 case "${rc}" in
-  0)   echo "RESULT ${BENCH_NAME}x${NRANKS}@${BENCH_TIER}: OK" ;;
-  124) echo "RESULT ${BENCH_NAME}x${NRANKS}@${BENCH_TIER}: TIMEOUT (a rank exceeded the 200s cap)" ;;
-  *)   echo "RESULT ${BENCH_NAME}x${NRANKS}@${BENCH_TIER}: FAILED rc=${rc}" ;;
+  0)   echo "RESULT ${BENCH_NAME}x${NRANKS}@${BENCH_LABEL}: OK" ;;
+  124) echo "RESULT ${BENCH_NAME}x${NRANKS}@${BENCH_LABEL}: TIMEOUT (a rank exceeded the ${BENCH_CAP}s cap)" ;;
+  *)   echo "RESULT ${BENCH_NAME}x${NRANKS}@${BENCH_LABEL}: FAILED rc=${rc}" ;;
 esac
 exit "${rc}"
