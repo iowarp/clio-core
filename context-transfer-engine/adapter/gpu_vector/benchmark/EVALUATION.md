@@ -139,7 +139,7 @@ the plan's anchor decks, so their 15-minute rows raise the work
 | workload | deck | MPI | oneCCL | Intel SHMEM |
 |---|---|---|---|---|
 | lbann | 65536 -> 65536 -> 458752 (32 GB/node), batch 1024, 5 steps, 1024 work-groups; one job per substrate | TIMEOUT at 840 s | (not run) | (not run) |
-| lbann | the same at 3 steps | pending | 502.3 s (167.4 s/step, comm 2.0 s) PASS; 521 s of wall time per rank | 512.0 s (170.7 s/step, comm 10.7 s) PASS; 531 s of wall time per rank; weight digest identical to oneCCL's |
+| lbann | the same at 3 steps | 509.3 s (169.8 s/step, comm 8.9 s) PASS; 528 s of wall time per rank; weight digest identical on all three substrates | 502.3 s (167.4 s/step, comm 2.0 s) PASS; 521 s of wall time per rank | 512.0 s (170.7 s/step, comm 10.7 s) PASS; 531 s of wall time per rank; weight digest identical to oneCCL's |
 | kmeans | 128 GB global (32 GB/rank), 12 iters, 1024 work-groups | TIMEOUT at 840 s on an allocation spanning four racks (4 iters took 79 s on one chassis); rerun with per-iteration progress pending | (not run) | (not run) |
 | grayscott | 128 GB global, 256 steps, 1 MB page | pending | pending | pending |
 | gmx | K=2048, 20 M atoms, 200 passes | 190.1 s (spread 13.9 s, gather 173.1 s, comm 0.1 s) PASS | 190.1 s (spread 13.9 s, gather 173.0 s, comm 0.2 s) PASS | 190.2 s (spread 13.9 s, gather 173.1 s, comm 0.2 s) PASS; checksums identical to the single-pass anchor on all three |
