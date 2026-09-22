@@ -77,11 +77,14 @@ namespace {
  *  @param n       elements to write
  *  @param dims,k  the generator's parameters */
 void Seed(sycl::queue &q, float *pts, u64 base, u64 n, u32 dims, u32 k) {
-  q.parallel_for(sycl::range<1>(static_cast<size_t>(n)),
-                 [=](sycl::id<1> i) {
-                   pts[i] = PointVal(base + i, dims, k);
-                 })
-      .wait();
+  // Grid-stride: a 32 GB shard is 8.6 G elements, more than a range<1>
+  // of 32-bit ids can name.
+  const size_t g = 1024 * 256;
+  q.parallel_for(sycl::nd_range<1>(g, 256), [=](sycl::nd_item<1> it) {
+     for (u64 i = it.get_global_id(0); i < n; i += g) {
+       pts[i] = PointVal(base + i, dims, k);
+     }
+   }).wait();
 }
 
 /** The assignment step: each point joins its nearest centroid's sum and

@@ -26,11 +26,15 @@ CCL_ROOT=${CCL_ROOT:-/opt/aurora/26.26.0/oneapi/ccl/latest}
 ISHMEM_ROOT=${ISHMEM_ROOT:-/opt/aurora/26.26.0/oneapi/ishmem/latest}
 ZE_LIB=${ZE_LIB:-/usr/lib64}
 
+# -fno-sycl-id-queries-fit-in-int: a 32 GB shard is 8.6 G elements, past
+# the 32-bit index range SYCL assumes by default (the kmeans anchor deck
+# threw "range does not fit in int" at launch).
 # PRECISE FLOATING POINT, as build_newcoro_aurora.sh: icpx defaults to
 # -fp-model=fast, and the gates compare against host references computed
 # with explicit rounding.
 CXX=("$ICPX" -fsycl -fsycl-targets=spir64_gen -Xs "-device pvc"
      -std=c++20 -O2 -fp-model=precise -ffp-contract=off
+     -fno-sycl-id-queries-fit-in-int
      -I"$MPICH_ROOT/include" -I"$HERE/sycl_baseline")
 LD=(-L"$MPICH_ROOT/lib" -Wl,-rpath,"$MPICH_ROOT/lib" -lmpi)
 case "$SUB" in

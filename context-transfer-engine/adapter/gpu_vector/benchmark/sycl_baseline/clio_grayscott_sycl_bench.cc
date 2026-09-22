@@ -128,12 +128,14 @@ void Step(sycl::queue &q, u32 blocks, u32 threads, const float *u,
 /** Seed the own planes of a slab pair from the global initial condition. */
 void SeedSlab(sycl::queue &q, float *u, float *v, Slab s) {
   const u64 n = s.nzl * s.plane;
-  q.parallel_for(sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> id) {
-     const u64 e = id;
-     const u64 lz = 1 + e / s.plane, i = e % s.plane;
-     const u64 gzz = s.gz0 + lz - 1;
-     u[lz * s.plane + i] = InitU(i % s.nx, i / s.nx, gzz, s.nx, s.ny, s.nz);
-     v[lz * s.plane + i] = InitV(i % s.nx, i / s.nx, gzz, s.nx, s.ny, s.nz);
+  const size_t g = 1024 * 256;   // grid-stride: n can exceed 32-bit ids
+  q.parallel_for(sycl::nd_range<1>(g, 256), [=](sycl::nd_item<1> it) {
+     for (u64 e = it.get_global_id(0); e < n; e += g) {
+       const u64 lz = 1 + e / s.plane, i = e % s.plane;
+       const u64 gzz = s.gz0 + lz - 1;
+       u[lz * s.plane + i] = InitU(i % s.nx, i / s.nx, gzz, s.nx, s.ny, s.nz);
+       v[lz * s.plane + i] = InitV(i % s.nx, i / s.nx, gzz, s.nx, s.ny, s.nz);
+     }
    }).wait();
   // Halo planes start as zero, as cudaMalloc'd memory did not promise but
   // the exchange overwrites them before the first read anyway.

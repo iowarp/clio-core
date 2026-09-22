@@ -44,3 +44,25 @@ Findings on the way:
   script sets `ISHMEM_SYMMETRIC_SIZE` to 40 GB, and the editions keep bulk
   data no peer names in plain USM (`AllocLocal`).
 - The debug queue caps at two nodes; 4-node jobs go to `debug-scaling`.
+- oneCCL send/recv on an in-order stream deadlocks on a closed ring when
+  every rank posts recv first (lammps_md hung for its whole cap; grayscott's
+  open chain did not). Even ranks send first, odd ranks receive first now.
+- lammps_md at the melt deck (`--temp 3.0`) drifts 4e-3 over 20 steps on
+  every substrate, above the default 5e-4 tolerance; the CUDA editions'
+  recipe for this deck sets `--drift-tol 5e-3`, and the baseline runs use
+  it. The statics and resort gates are exact.
+
+## Stage 2: 4-node baselines at the plan's anchor decks (32 GB/node)
+
+Cap 240 s per rank. The anchor lbann deck (65536 -> 65536 -> 458752,
+batch 1024) exceeded the cap on MPI: at 32 GB of parameters per node the
+dense kernels need more than 4 minutes for 5 steps, so a smaller lbann
+deck is measured first to size the largest one that fits.
+
+| workload | deck | MPI | oneCCL | Intel SHMEM |
+|---|---|---|---|---|
+| kmeans | 128 GB global (32 GB/rank), 8 iters | pending | pending | pending |
+| grayscott | 128 GB global, 8 steps, 1 MB page | pending | pending | pending |
+| gmx | K=2048 (17 GB/node), 20 M atoms | pending | pending | pending |
+| lbann | 65536 -> 65536 -> 458752, batch 1024, 5 steps | TIMEOUT (> 240 s) | -- | -- |
+| lammps_md | pending | | | |
