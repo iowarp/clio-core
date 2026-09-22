@@ -108,6 +108,7 @@ because they carried 128 MB per node. The tiers now follow the deck.
 | gmx | default deck, 128 KB page | pending |
 | lbann | default deck | pending |
 | lammps_md | L=28, 10 steps, ballistic gate | pending |
+| kmeans, resident (E1 configuration) | as above but HBM tier 2 GB/node holds the whole deck, tiers 4 GB + 2 GB | 2.81-2.84 s (1.41 GB/s), checksum identical on all ranks, 162-174 faults/rank. The faults are the vector's per-block frame cache (8 pages/block, streaming by design), served from the HBM tier: no storage traffic, which is E1's condition |
 
 ## Plan coverage so far
 
