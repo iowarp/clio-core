@@ -634,7 +634,10 @@ int main(int argc, char **argv) {
   unsigned long long nvme_mb = 0;
   std::string nvme_path = "/tmp/gv_storage_tier.dat";
   bool hbm_only = false;
-  float Du = 0.2f, Dv = 0.1f, F = 0.02f, K = 0.048f, dt = 1.0f;
+  // dt = 0.5: explicit Euler on the 7-point Laplacian is stable only while
+  // 12 * Du * dt < 2. At dt = 1 (12 * 0.2 = 2.4) the checkerboard mode grows
+  // 1.4x per step -- invisible over 8 steps, NaN by 256.
+  float Du = 0.2f, Dv = 0.1f, F = 0.02f, K = 0.048f, dt = 0.5f;
   // PREFETCH: tier hints issued from the driver's gap between rounds. "none"
   // is the baseline and the default -- registering a prefetcher changes where
   // pages live, so every existing number stays comparable unless asked.
@@ -1277,6 +1280,13 @@ int main(int argc, char **argv) {
         !clio_bench_dist::ReduceSum(*cte_red, red_tag, node, nodes,
                                     red_round++, &checksum, 1, "gsred")) {
       std::fprintf(stderr, "GRAYSCOTT ERROR: checksum reduction failed\n");
+      return 1;
+    }
+    // A diverged field sums to inf or NaN, and NaN compares false against
+    // every tolerance; refuse it here rather than let a gate pass it.
+    if (!std::isfinite(checksum)) {
+      std::fprintf(stderr, "GRAYSCOTT ERROR: v_checksum is not finite (the "
+                           "stencil diverged)\n");
       return 1;
     }
   }

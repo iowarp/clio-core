@@ -77,8 +77,8 @@ __global__ void StepPlane(bam::ArrayDevice<float> u, bam::ArrayDevice<float> v,
            vp.at(zm * plane + i) + vp.at(zp * plane + i) - 6.0f * vv;
     }
     const float uvv = uu * vv * vv;
-    unx[i] = uu + 1.0f * (0.2f * lu - uvv + 0.02f * (1.0f - uu));
-    vnx[i] = vv + 1.0f * (0.1f * lv + uvv - (0.02f + 0.048f) * vv);
+    unx[i] = uu + 0.5f * (0.2f * lu - uvv + 0.02f * (1.0f - uu));
+    vnx[i] = vv + 0.5f * (0.1f * lv + uvv - (0.02f + 0.048f) * vv);
   }
 }
 

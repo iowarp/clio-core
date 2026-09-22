@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
   unsigned long long nvme_mb = 0;
   std::string nvme_path = "/tmp/gv_storage_tier.dat";
   bool hbm_only = false;
-  float Du = 0.2f, Dv = 0.1f, F = 0.02f, K = 0.048f, dt = 1.0f;
+  float Du = 0.2f, Dv = 0.1f, F = 0.02f, K = 0.048f, dt = 0.5f;
   // PREFETCH: tier hints issued from the driver's gap between rounds. "none"
   // is the baseline and the default -- registering a prefetcher changes where
   // pages live, so every existing number stays comparable unless asked.

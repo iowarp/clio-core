@@ -180,7 +180,10 @@ int main(int argc, char **argv) {
 
   u32 blocks = 64, threads = 256, steps = 4;
   u64 page_kb = 1024, data_mb = 2048;
-  float Du = 0.2f, Dv = 0.1f, F = 0.02f, K = 0.048f, dt = 1.0f;
+  // dt = 0.5: explicit Euler on the 7-point Laplacian is stable only while
+  // 12 * Du * dt < 2. At dt = 1 (12 * 0.2 = 2.4) the checkerboard mode grows
+  // 1.4x per step -- invisible over 8 steps, NaN by 256.
+  float Du = 0.2f, Dv = 0.1f, F = 0.02f, K = 0.048f, dt = 0.5f;
   double check_csum = 0.0, check_tol = 1e-3;
   bool do_check = false;
   for (int i = 1; i < argc; ++i) {
@@ -261,6 +264,13 @@ int main(int argc, char **argv) {
   if (rank == 0) {
     std::printf("  %u steps in %.1f ms (comm %.1f ms)  v_checksum=%.6f\n",
                 steps, ms, t_comm, csum);
+    // A blown-up field sums to inf or NaN, and NaN compares false against
+    // every tolerance; refuse it before the checksum gate can pass it.
+    if (!std::isfinite(csum)) {
+      std::printf("  FINITE GATE: FAIL (v_checksum is not finite: the "
+                  "stencil diverged)\n");
+      rc = 1;
+    }
     std::printf("GRAYSCOTT %s: nx=%llu ny=%llu nz=%llu steps=%u ranks=%d "
                 "data_mb=%llu page_kb=%llu ms=%.1f comm_ms=%.1f "
                 "ms_per_step=%.2f v_checksum=%.6f\n",
