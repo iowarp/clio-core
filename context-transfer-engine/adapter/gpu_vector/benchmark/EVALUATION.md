@@ -108,7 +108,7 @@ because they carried 128 MB per node. The tiers now follow the deck.
 | gmx | default deck, 128 KB page | pending |
 | lbann | default deck | refused by the edition's own check: at 4 nodes the output band is 2 rows per node against 4-row pages (nodes would share a page). Resubmitted on the stage-one deck 1024 -> 4096 -> 256, batch 64, 5 steps (16 pages per node in both bands) |
 | lbann | 1024 -> 4096 -> 256, batch 64, 5 steps | paged 119.6 ms/step (its in-process dense reference: 73.7 ms/step); loss and weight gates pass on all four nodes; 1048-1242 faults and 722 puts per rank. Baselines on the same deck: 35.6 / 43.0 / 51.4 ms/step |
-| lammps_md | L=28, 10 steps, ballistic gate | pending |
+| lammps_md | L=28 (88 k atoms, 4 z-planes per node), 10 steps, 64 KB page, ballistic gate | 56.5-68.2 ms (5.7-6.8 ms/step, 12.9-15.5 Matom-steps/s); ballistic gate passes on all four nodes (bitwise x/v mismatches 0, KE rel_err 4.7e-14, momentum exact); x and v resident (0 faults, 0 evicts); 10 of 10 step iterations per block. Eternia's stage-one MD deck is the integrator edition, so this is a functional pass rather than a like-for-like number against the baselines' L=40 melt deck |
 | grayscott, resident (E1 configuration) | as above but HBM tier 2 GB/node holds the deck, tiers 4 GB + 2 GB | 0.61-0.81 s, checksum 3086389.535277 = the baselines'; 520-528 faults (frame cache, served from the HBM tier) and 2048 puts per rank; no storage traffic |
 | kmeans, resident (E1 configuration) | as above but HBM tier 2 GB/node holds the whole deck, tiers 4 GB + 2 GB | 2.81-2.84 s (1.41 GB/s), checksum identical on all ranks, 162-174 faults/rank. The faults are the vector's per-block frame cache (8 pages/block, streaming by design), served from the HBM tier: no storage traffic, which is E1's condition |
 
@@ -116,7 +116,7 @@ because they carried 128 MB per node. The tiers now follow the deck.
 
 | study | status |
 |---|---|
-| 4-node baseline (plan's step 1) | baselines: complete for all five workloads on MPI, oneCCL and Intel SHMEM at stage-one decks; stage-two (5-minute) decks complete for kmeans, gmx, lbann, lammps_md, grayscott anchor queued. Eternia: kmeans and grayscott pass at stage-one decks (checksums equal to the baselines'); gmx, lbann, lammps_md queued; the resident-deck pass (E1's configuration) queued for kmeans and grayscott |
+| 4-node baseline (plan's step 1) | baselines: complete for all five workloads on MPI, oneCCL and Intel SHMEM at stage-one decks; stage-two (5-minute) decks complete for kmeans, gmx, lbann, lammps_md, grayscott anchor queued. Eternia: kmeans, grayscott, lbann and lammps_md pass at stage-one decks (checksums equal to the baselines' where exact); gmx queued; the resident-deck pass (E1's configuration) queued for kmeans and grayscott |
 | E1 scaling (8 -> 64 nodes) | not started; needs the 4-node rung closed first |
 | E2 page size | not started |
 | E3 persistence | not started; the baselines' `--ckpt-dir` arms (Lustre-direct, DAOS-direct) exist in the lammps_md edition |
