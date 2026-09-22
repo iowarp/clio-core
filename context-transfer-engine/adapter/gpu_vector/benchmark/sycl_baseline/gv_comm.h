@@ -319,17 +319,25 @@ class Comm {
                  u64 nrecv) {
     q.wait();
 #if defined(GV_COMM_CCL)
-    std::vector<ccl::event> evs;
-    if (from >= 0 && nrecv > 0) {
-      evs.push_back(ccl::recv(recv, static_cast<size_t>(nrecv), CclType<T>(),
-                              from, *comm_, *stream_));
-    }
-    if (to >= 0 && nsend > 0) {
-      evs.push_back(ccl::send(const_cast<T *>(send),
-                              static_cast<size_t>(nsend), CclType<T>(), to,
-                              *comm_, *stream_));
-    }
-    for (auto &e : evs) e.wait();
+    // ORDER BY PARITY. The stream is in order, so a rank's send cannot
+    // start until its recv has completed; with every rank posting recv
+    // first, a closed ring (lammps_md's periodic halo) is a circular wait
+    // and hangs. Even ranks send first, odd ranks receive first, which is
+    // the classic break of that cycle and costs nothing on an open chain.
+    auto do_send = [&]() {
+      if (to >= 0 && nsend > 0) {
+        ccl::send(const_cast<T *>(send), static_cast<size_t>(nsend),
+                  CclType<T>(), to, *comm_, *stream_).wait();
+      }
+    };
+    auto do_recv = [&]() {
+      if (from >= 0 && nrecv > 0) {
+        ccl::recv(recv, static_cast<size_t>(nrecv), CclType<T>(), from,
+                  *comm_, *stream_).wait();
+      }
+    };
+    if ((rank & 1) == 0) { do_send(); do_recv(); }
+    else                 { do_recv(); do_send(); }
 #elif defined(GV_COMM_ISHMEM)
     if (to >= 0 && nsend > 0) {
       ishmem_putmem(recv, send, static_cast<size_t>(nsend * sizeof(T)), to);

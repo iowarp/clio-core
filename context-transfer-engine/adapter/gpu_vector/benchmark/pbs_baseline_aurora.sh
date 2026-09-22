@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #PBS -l select=4
 #PBS -l place=scatter
-#PBS -l walltime=00:05:00
+#PBS -l walltime=00:15:00
 #PBS -l filesystems=home:flare
 #PBS -q debug-scaling
 #PBS -A IOWarp
@@ -18,7 +18,9 @@
 #   BENCH_ARGS   the edition's own arguments (global sizes; each edition
 #                splits them across ranks)
 #   BENCH_CAP    per-rank timeout in seconds (default 240: the plan's
-#                five-minute cap with room for launch and teardown)
+#                five-minute cap with room for launch and teardown). The
+#                walltime is 15 minutes so one substrate hitting its cap
+#                does not starve the ones after it.
 #
 # Nothing of the clio runtime is started: these editions link nothing from
 # clio, which is what makes them baselines.
@@ -78,7 +80,10 @@ for sub in ${BENCH_SUB//:/ }; do
       stdbuf -oL -eL "$BENCH_RANK_EXE" $BENCH_RANK_ARGS > "rank$r.log" 2>&1
     rc=$?
     echo "rank $r on $(hostname) exit=$rc" >> "rank$r.log"
-    exit $rc
+    # ALWAYS 0 HERE: PALS tears the job down the moment one rank exits
+    # non-zero, and the others then never write their exit lines. The
+    # result is derived from the per-rank lines instead.
+    exit 0
   '
   mrc=$?
   echo "elapsed $((SECONDS - start))s, mpiexec exit=${mrc}"
