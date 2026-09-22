@@ -32,7 +32,8 @@ time spent in the substrate's collectives and exchanges.
 
 | workload | deck | MPI | oneCCL | Intel SHMEM |
 |---|---|---|---|---|
-| kmeans | 4 GB global (1 GB/rank), 4 iters | 2465 ms (comm 1026) PASS | 2540 ms (comm 1062) PASS | 2045 ms (comm 622) PASS |
+| kmeans | 4 GB global (1 GB/rank), 4 iters | 2465 ms (comm 1026) PASS | 2540 ms (comm 1062) PASS | 2045 ms (comm 622) PASS (global-atomics assignment, superseded) |
+| kmeans, tiled assignment | the same deck, 1024 work-groups | 68.9 ms (17.2 ms/iter, comm 13) PASS | 173.0 ms (43.2 ms/iter, comm 80) PASS | 61.6 ms (15.4 ms/iter, comm 6) PASS; centroid checksum 30720.0010-30720.0013 (atomic summation order), all four iterations counted. 36x faster than the global-atomics assignment on the same deck: the earlier stage-one time was almost entirely atomic contention. The Eternia kmeans edition accumulates with global atomics too, so its 2.8 s on this deck is the same contention and it needs the same treatment before the comparison means anything |
 | grayscott | 4 GB global, 4 steps, 1 MB page | 35 ms (comm 15) PASS | 43 ms (comm 22) PASS | 52 ms (comm 30) PASS; v_checksum identical on all three (at dt=1, superseded) |
 | grayscott, dt=0.5 | the same deck after the stability fix | 50 ms (comm 29) PASS | 35 ms (comm 14) PASS | 47 ms (comm 26) PASS; v_checksum 2754766.354742 on all three, the reference for the Eternia rerun |
 | gmx | K=512, 4 M atoms, 1 pass | 91 ms PASS | 82 ms PASS | 105 ms PASS; conservation exact, mesh checksum and gather energy identical on all three |
