@@ -75,9 +75,12 @@ inline float InitV(u64 x, u64 y, u64 z, u64 nx, u64 ny, u64 nz) {
   return in ? 0.25f : 0.0f;
 }
 
-/** Grid geometry of one rank's slab. */
+/** Grid geometry of one rank's slab. `hi` is the extended-slab plane index
+ *  of halo_hi: max over ranks of nzl, plus one, so every rank's buffer has
+ *  the same shape (ISHMEM puts land at the sender's offset on the peer, and
+ *  symmetric allocations must match in size). */
 struct Slab {
-  u64 plane, nx, ny, nz, nzl, gz0;
+  u64 plane, nx, ny, nz, nzl, gz0, hi;
 };
 
 /**
@@ -96,11 +99,13 @@ void Step(sycl::queue &q, u32 blocks, u32 threads, const float *u,
        const u64 gzz = s.gz0 + lz - 1;
        const bool interior = (gzz > 0 && gzz + 1 < s.nz);
        const float *uz = u + lz * s.plane;
-       const float *uzm = interior ? uz - s.plane : uz;
-       const float *uzp = interior ? uz + s.plane : uz;
        const float *vz = v + lz * s.plane;
+       // The plane above the last owned one is halo_hi, at its fixed slot.
+       const u64 up = (lz == s.nzl) ? s.hi : lz + 1;
+       const float *uzm = interior ? uz - s.plane : uz;
+       const float *uzp = interior ? u + up * s.plane : uz;
        const float *vzm = interior ? vz - s.plane : vz;
-       const float *vzp = interior ? vz + s.plane : vz;
+       const float *vzp = interior ? v + up * s.plane : vz;
        float *unx = un + lz * s.plane;
        float *vnx = vn + lz * s.plane;
        for (u64 i = lid; i < s.plane; i += threads) {
@@ -141,8 +146,8 @@ void SeedSlab(sycl::queue &q, float *u, float *v, Slab s) {
   // the exchange overwrites them before the first read anyway.
   q.memset(u, 0, s.plane * sizeof(float));
   q.memset(v, 0, s.plane * sizeof(float));
-  q.memset(u + (s.nzl + 1) * s.plane, 0, s.plane * sizeof(float));
-  q.memset(v + (s.nzl + 1) * s.plane, 0, s.plane * sizeof(float));
+  q.memset(u + s.hi * s.plane, 0, s.plane * sizeof(float));
+  q.memset(v + s.hi * s.plane, 0, s.plane * sizeof(float));
   q.wait();
 }
 
@@ -207,7 +212,10 @@ int main(int argc, char **argv) {
   s.gz0 = static_cast<u64>(rank) * per;
   const u64 gz1 = (rank == nranks - 1) ? s.nz : s.gz0 + per;
   s.nzl = gz1 - s.gz0;
-  const u64 ext = (s.nzl + 2) * s.plane;
+  // The last rank absorbs the remainder, so it has the most planes.
+  const u64 nzl_max = s.nz - static_cast<u64>(nranks - 1) * per;
+  s.hi = nzl_max + 1;
+  const u64 ext = (nzl_max + 2) * s.plane;
 
   if (rank == 0) {
     std::printf("Gray-Scott, %s edition (SYCL): %llux%llux%llu, %u steps, %d "
@@ -230,8 +238,7 @@ int main(int argc, char **argv) {
     // BOTTOM own plane goes down into the lower neighbour's HIGH halo.
     const double c0 = gvc::NowMs();
     comm.Sendrecv(fld + s.nzl * s.plane, up, fld, dn, s.plane);
-    comm.Sendrecv(fld + s.plane, dn, fld + (s.nzl + 1) * s.plane, up,
-                  s.plane);
+    comm.Sendrecv(fld + s.plane, dn, fld + s.hi * s.plane, up, s.plane);
     t_comm += gvc::NowMs() - c0;
   };
 

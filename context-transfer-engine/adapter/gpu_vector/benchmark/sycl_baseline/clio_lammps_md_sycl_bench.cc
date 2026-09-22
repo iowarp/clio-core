@@ -236,6 +236,7 @@ struct Decomp {
   int use_halo = 0;
   u32 halo_lo = 0;
   u32 halo_hi = 0;
+  u32 hi_slot = 0;     // extended-slab slot of halo_hi: max_planes + 1
 };
 
 /** Global plane -> element offset inside the EXTENDED slab. Owned planes
@@ -243,7 +244,7 @@ struct Decomp {
 inline u64 PlaneOff(const Decomp &d, u32 bz, u64 plane_elems) {
   if (d.use_halo) {
     if (bz == d.halo_lo) return 0;
-    if (bz == d.halo_hi) return (d.nplanes + 1ull) * plane_elems;
+    if (bz == d.halo_hi) return static_cast<u64>(d.hi_slot) * plane_elems;
   }
   return (static_cast<u64>(bz - d.z0) + 1ull) * plane_elems;
 }
@@ -876,8 +877,19 @@ int main(int argc, char **argv) {
   const u32 mynplanes = h_plane_z0[mype + 1] - myz0;
   const int rank_down = (mype - 1 + npes) % npes;
   const int rank_up = (mype + 1) % npes;
-
-  const u32 ext_planes = mynplanes + 2;
+  // THE EXTENDED SLAB IS THE SAME SHAPE ON EVERY RANK: [halo_lo | slots
+  // 1..max_planes (this rank owns the first nplanes of them) | halo_hi at
+  // slot max_planes + 1]. Plane counts are uneven when nb % npes != 0, and
+  // a halo_hi at (nplanes + 1) then sits at a different offset per rank --
+  // under ISHMEM a put lands at the SENDER's offset on the peer, which
+  // overwrote the peer's last owned plane (1.5% of pairs missing at
+  // step 0), and unequal symmetric allocation sizes corrupt the heap.
+  u32 max_planes = 0;
+  for (int p = 0; p < npes; ++p) {
+    max_planes = std::max(max_planes, h_plane_z0[p + 1] - h_plane_z0[p]);
+  }
+  const u32 hi_slot = max_planes + 1;
+  const u32 ext_planes = max_planes + 2;
   const u64 ext_elems = static_cast<u64>(ext_planes) * g.plane_elems;
   const u64 own_off = g.plane_elems;
   const u64 local_slots = static_cast<u64>(mynplanes) * g.nb * g.nb * g.cap;
@@ -941,6 +953,7 @@ int main(int argc, char **argv) {
   d.use_halo = (npes > 1) || a.force_halo;
   d.halo_lo = (myz0 + g.nb - 1) % g.nb;
   d.halo_hi = (myz0 + mynplanes) % g.nb;
+  d.hi_slot = hi_slot;
 
   unsigned long long *d_ctr = comm.AllocLocal<unsigned long long>(kCtrNumCtrs);
   q.memset(d_ctr, 0, kCtrNumCtrs * sizeof(unsigned long long)).wait();
@@ -958,8 +971,7 @@ int main(int argc, char **argv) {
     const float *const last =
         xe + own_off + static_cast<u64>(mynplanes - 1) * g.plane_elems;
     comm.Sendrecv(last, rank_up, xe, rank_down, g.plane_elems);
-    comm.Sendrecv(first, rank_down,
-                  xe + static_cast<u64>(mynplanes + 1) * g.plane_elems,
+    comm.Sendrecv(first, rank_down, xe + static_cast<u64>(hi_slot) * g.plane_elems,
                   rank_up, g.plane_elems);
     t_halo += gvc::NowMs() - t;
     halo_bytes += 2.0 * g.plane_elems * sizeof(float);

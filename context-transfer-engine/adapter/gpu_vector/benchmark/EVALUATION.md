@@ -36,7 +36,7 @@ time spent in the substrate's collectives and exchanges.
 | grayscott | 4 GB global, 4 steps, 1 MB page | 35 ms (comm 15) PASS | 43 ms (comm 22) PASS | 52 ms (comm 30) PASS; v_checksum identical on all three |
 | gmx | K=512, 4 M atoms, 1 pass | 91 ms PASS | 82 ms PASS | 105 ms PASS; conservation exact, mesh checksum and gather energy identical on all three |
 | lbann | 1024 -> 4096 -> 256, batch 64, 5 steps | 178 ms (comm 22) PASS | 215 ms (comm 104) PASS | 257 ms (comm 106) PASS; loss and weight digest bit-equal to the dense reference on all three |
-| lammps_md | pending | | | |
+| lammps_md | L=40 (256 k atoms), 20 steps, rebin 10, T=3.0 | 25 ms PASS | 28 ms PASS | see below |
 
 Findings on the way:
 
@@ -51,6 +51,16 @@ Findings on the way:
   every substrate, above the default 5e-4 tolerance; the CUDA editions'
   recipe for this deck sets `--drift-tol 5e-3`, and the baseline runs use
   it. The statics and resort gates are exact.
+- Uneven plane counts (23 planes over 4 ranks) put each rank's halo_hi
+  slot at a different offset. Under ISHMEM a put lands at the SENDER's
+  offset on the peer, so it overwrote the peer's last owned plane (1.5% of
+  pairs missing at step 0), and unequal symmetric allocation sizes
+  corrupted the heap. lammps_md and grayscott now keep halo_hi at a fixed
+  slot after the maximum plane count, so every rank's slab has one shape.
+- lbann's editions inherited the CUDA default of 8 work-groups x 256; on a
+  PVC tile that is 2048 work-items and even a quarter-size deck exceeded
+  the cap. The grid-stride kernels keep bit-identical sums at any
+  work-item count, so the baseline runs use `--blocks 1024`.
 
 ## Stage 2: 4-node baselines at the plan's anchor decks (32 GB/node)
 
