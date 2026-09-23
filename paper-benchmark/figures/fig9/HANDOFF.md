@@ -72,7 +72,32 @@ path; the harness knob is `CUSZ_REUSE`, recorded in `run.json`.
 
 ## 2. What is NOT settled — fix these first
 
-### 2.1 cuSZ and cuSZp3 miss the error bound, badly (BLOCKER)
+### 2.1 cuSZ and cuSZp3 miss the error bound, badly (NO LONGER CHECKED)
+
+**Decision (2026-09-23):** `figure_9.sh` no longer runs `--check-bound` on the
+cuSZ and cuSZp3 arms (`--no-verify` instead, `bound` column empty). Both codecs
+quantize internally, and `compressor_runtime.cc` disables our quantizer for
+them. cuSZ's Lorenzo kernel prequantizes with `round(x * 1/(2eb))` in fp32
+(`lrz_c.cu.inl`). cuSZp does `cvt.s32(x * 0.5f/eb)` (`cuSZp_kernels_1D_f32.cu`).
+The bound is their contract, so the figure times them and does not certify
+them. Arms that use our quantizer are still checked.
+
+Root cause, checked locally 2026-09-23 on nyx-i96 (12 files, 192 chunks),
+with the verifier compared against each codec run standalone (no Clio code):
+
+- **cuSZ, max|err| 1.048576e+03: our wrapper's config, not the verifier.**
+  `cusz.h` hardcodes `codec1 = HF`. cuSZ's own CLI with `--pred lrz --hist
+  generic --codec1 hf` decodes an all-zero chunk as a ramp of -512 quant steps
+  per element (1024 x 1.024 = 1048.576), which is exactly our result. With
+  `hfr-v3` (cuSZ's DEFAULT_CODEC, and what upstream NeuroPress uses) the same
+  chunk decodes exactly. Every 1048.576 chunk is flat.
+- **cuSZ and cuSZp, overshoots of 1.0376e-3 to 1.5625e-2: the codecs'.**
+  Standalone cuSZ and a standalone cuSZp probe reproduce the same worst errors
+  on the same chunks. They come from fp32 reconstruction; at |x| ~ 2.4e5 the
+  fp32 spacing is 1.5625e-2.
+- The two codecs did NOT fail identically. cuSZp never shows 1048.576.
+
+
 
 ```
 BOUND FAILED: 3354 chunk(s) against eb=1e-3, 2931 exceeded, worst max|err|=1.048576e+03
@@ -210,7 +235,8 @@ against rather than to an assumption about it.
 
 ## 5. Before the all-workload run
 
-1. Fix the bound failures (2.1). Without this the lossy arms are not comparable.
+1. Bound failures (2.1): no longer checked for cuSZ/cuSZp3. Before trusting
+   their bars, rule out the shared-cause caveat there.
 2. Decide reps. At `runs=1` nothing is established; five paired reps is what the
    audit asks for. **Budget: 141 GPU-hours left of 4947** — this is the binding
    constraint, and reps are the expensive axis.

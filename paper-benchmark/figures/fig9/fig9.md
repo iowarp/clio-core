@@ -184,6 +184,10 @@ measure NVMe over the network, and `run.json`'s `nvme_root` records which.
 - **Verification** runs once per arm, in rep 1 (it is untimed but a full
   read-back). A lossy arm is checked element-wise against its bound
   (`--check-bound`); one that exceeds it is still drawn, with `*` on its label.
+  **cuSZ and cuSZp3 are not checked**: they quantize internally, in fp32, so
+  their bound is the codec's contract rather than ours. Their `bound` column is
+  empty. The check still covers every arm that uses our quantizer (nvCOMP `-q`,
+  NeuroPress lossy).
 - **RAM tier pre-faulted** (`CLIO_PREFAULT=0` on +Tier arms) during setup, so
   page faults no longer land in the timed loop (1.7 s of full Nyx's
   nvCOMP+Tier loop before).

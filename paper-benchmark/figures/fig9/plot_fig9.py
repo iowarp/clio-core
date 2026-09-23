@@ -80,6 +80,10 @@ ARM_COLORS = {
     "cuSZp3":              "#872985",
     "nvCOMP":              "#5089cc",   # lossless: the ablation's fixed codec
     "Best fixed nvCOMP":   "#1c5cab",   # the same library at the run's bound
+    # Slowest fixed action in the sweep. Same library, so the same hue family:
+    # the lighter step of the validated #5089cc -> #1c5cab ordinal pair, and
+    # always drawn beside Best so that pair is the one a reader compares.
+    "Worst fixed nvCOMP":  "#5089cc",
     "NP only":             "#31aa76",
     "NP":                  "#31aa76",   # base_name("NP+Tier")
     "NP+Tier+Async":       "#008856",
@@ -101,6 +105,7 @@ ORDER_A = ["Baseline", "nvCOMP", "nvCOMP+Tier", "NP only", "NP+Tier",
            "NP+Tier+Async", "NP+Tier+Async+Lossy"]
 ORDER_B = ["ndzip", "ndzip+Tier", "cuSZ", "cuSZ+Tier", "cuSZp3", "cuSZp3+Tier",
            "Best fixed nvCOMP", "Best fixed nvCOMP+Tier",
+           "Worst fixed nvCOMP", "Worst fixed nvCOMP+Tier",
            "NeuroPress", "NeuroPress+Tier"]
 
 _LADDER_RE = re.compile(r"\s*\((low|med|high)\)\s*$")
@@ -166,7 +171,8 @@ SINGLE_ORDER = [("a", "Baseline"),
                 ("b", "cuSZ"), ("b", "cuSZ+Tier"),
                 ("b", "cuSZp3"), ("b", "cuSZp3+Tier"),
                 ("a", "nvCOMP"), ("a", "nvCOMP+Tier"),
-                ("b", "Best fixed nvCOMP"), ("b", "Best fixed nvCOMP+Tier")]
+                ("b", "Best fixed nvCOMP"), ("b", "Best fixed nvCOMP+Tier"),
+                ("b", "Worst fixed nvCOMP"), ("b", "Worst fixed nvCOMP+Tier")]
 # The error bound of every arm comes from the CSV's `eb` column. It used to
 # have a hardcoded fallback table here, which is what the legend actually read:
 # the lookup meant to consult the data unpacked the index key in the wrong

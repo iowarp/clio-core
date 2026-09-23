@@ -39,7 +39,7 @@
 # alternative splits that were tried and rejected.
 #
 # Environment: ONLY (same as --only), DUMP_ROOT, PFS_ROOT, NVME_ROOT, ALLOW_NETWORK_TIER2, EB_LOW, PANEL_B_TIER, NP_CFG, SMOKE_GB, MAXF, RAM_PCT/RAM_MB,
-# COST_BW, NP_LR, NP_MAPE, MEASURE_DT, MEASURE_QUALITY, ARM_TIMEOUT, BEST_FIXED,
+# COST_BW, NP_LR, NP_MAPE, MEASURE_DT, MEASURE_QUALITY, ARM_TIMEOUT, BEST_FIXED, WORST_FIXED,
 # SELECTION_LOG (default 0), STAGE_INPUT (default 1), STAGE_ROOT, STAGE_STREAMS, EXCLUDE_READ (default 1),
 # REPS (runs per arm, default 3), TBD_OTHERS (default 0).
 #===============================================================================
@@ -116,6 +116,7 @@ PFS_ROOT=${PFS_ROOT:-/work/hdd/$CLIO_ACCT/$_WHO/fig9-pfs}
 NVME_ROOT=${NVME_ROOT:-${TIER2_ROOT:-/tmp/fig9-nvme-${SLURM_JOB_ID:-$_WHO}}}
 PANEL=both DRY=0 OUT="" FIELDS="" ONLY=${ONLY:-}
 BEST_FIXED=${BEST_FIXED:-}     # default per workload, below
+WORST_FIXED=${WORST_FIXED:-}   # default per workload, below
 ASYNC_MS=${ASYNC_MS:-500}      # periodic flush for the +Async arms
 # RAM tier 1, committed at runtime start: run_arm sets CLIO_PREFAULT=0 for a
 # tiered arm, which faults the whole mapping in during setup (untimed). Without
@@ -193,9 +194,60 @@ case "$WL" in nyx) WLNAME=Nyx ;; vpic) WLNAME=VPIC ;; warpx) WLNAME=WarpX ;; lam
 # the rest as TBD rows, so a single-workload CSV still plots at the full layout
 # and several merge without reordering. Must match the plot's WORKLOAD_ORDER.
 WORKLOADS_ALL=(VPIC Nyx LAMMPS WarpX AI)
-# The oracle sweep's best fixed action (../../compare_perchunk_oracle.sh).
+# BEST AND WORST FIXED nvCOMP ACTION, per workload: the fastest and slowest
+# median wall clock over all 32 fixed actions (8 nvCOMP libs x -q x -s4) at
+# eb=1e-3, 3 interleaved reps each, every one bound-checked.
+#   nyx   2026-09-23, nyx-i96 plt00005/13/21 (18 files, 1.13 GiB), local NVMe:
+#         best  static-bitcomp-q  1.056 s (8.09x); runner-up static-ans-q-s4
+#               1.094 s -- within rep noise of it
+#         worst static-deflate    4.454 s (4.40x)
+#         At eb=0 (panel a) -q is inert, so best/worst there are static-bitcomp
+#         (1.715 s) and static-deflate -- the same libraries, no separate pin.
+#   vpic  2026-09-23, vpic-i16, all 16 fields spread over the run (144 files,
+#         1.13 GiB), local NVMe; stopped after 53 of 96 runs (every config has
+#         rep 1, the top and bottom ones rep 2):
+#         best  static-ans-q-s4   1.588 s (6.73x) -- the earlier oracle pick;
+#               static-ans-q 1.661 s and static-bitcomp-q-s4 1.665 s close behind
+#         worst static-deflate-s4 13.375 s (1.29x); static-zstd-s4 12.406 s next
+#         At eb=0 the best NON-quantized action is static-bitcomp (4.77 s), not
+#         static-ans-s4 (4.94 s), which panel (a) runs -- within noise, not pinned.
+#   lammps 2026-09-23, lammps (site.sh default), position/velocity/force over the
+#         run (408 files, 1.14 GiB), local NVMe; stopped after 73 of 96 runs
+#         (every config rep 1, top and bottom rep 2):
+#         best  static-ans-q-s4   4.328 s (1.99x); static-bitcomp-q-s4 4.468 s
+#               (the earlier pick) and static-bitcomp-q 4.655 s close behind
+#         worst static-deflate-s4 18.955 s (1.20x); static-deflate 18.163 s next
+#         At eb=0 the best non-quantized action is static-ans-s4 -- exactly what
+#         panel (a) runs.
+#   warpx 2026-09-23, warpx-i5, all 10 fields spread over the run (150 files,
+#         1.17 GiB), local NVMe; stopped at 48 of 96 runs (every config rep 1):
+#         best  static-ans-q-s4     3.581 s (1.86x); static-bitcomp-q-s4 3.763 s
+#               (the earlier pick) next
+#         worst static-deflate-q-s4 10.791 s (2.24x) -- a tie with
+#               static-deflate-s4 10.771 s on one rep each
+#         At eb=0 the best non-quantized action is static-ans-s4, what panel (a)
+#         runs.
+#   ai    2026-09-23, ai, one file per field (weights/gradients/adam_m/adam_v,
+#         1.28 GiB), local NVMe; LOSSLESS ONLY, so the 16 actions without -q at
+#         eb=0, each round-tripped bit-exact; stopped at 24 of 48 runs:
+#         best  static-bitcomp-s4 3.988 s (1.03x); static-ans-s4 4.055 s and
+#               static-cascaded 4.088 s within rep noise of it
+#         worst static-deflate-s4 13.653 s (1.17x)
+# Every workload is swept; the fallback below only covers a new one.
 if [ -z "$BEST_FIXED" ]; then
-  case "$WL" in vpic) BEST_FIXED=static-ans-q-s4 ;; *) BEST_FIXED=static-bitcomp-q-s4 ;; esac
+  case "$WL" in
+    nyx)  BEST_FIXED=static-bitcomp-q ;;
+    vpic|lammps|warpx) BEST_FIXED=static-ans-q-s4 ;;
+    ai)   BEST_FIXED=static-bitcomp-s4 ;;
+    *)    BEST_FIXED=static-bitcomp-q-s4 ;;
+  esac
+fi
+if [ -z "$WORST_FIXED" ]; then
+  case "$WL" in
+    nyx)  WORST_FIXED=static-deflate ;;
+    vpic|lammps|ai) WORST_FIXED=static-deflate-s4 ;;
+    warpx)       WORST_FIXED=static-deflate-q-s4 ;;
+  esac
 fi
 OUT=${OUT:-$BENCH/results/figure9/$WL-$SIZE}
 mkdir -p "$OUT"
@@ -385,7 +437,8 @@ build_arms() {
   # On a lossless-only workload this panel runs at eb=0, so `Best fixed nvCOMP`
   # repeats panel (a)'s `nvCOMP` and `NeuroPress` repeats `NP only`. That is the
   # same measurement drawn in both panels, not a second run of a different arm.
-  for b in "Best fixed nvCOMP:$BEST_FIXED" "ndzip:static-ndzip" \
+  for b in "Best fixed nvCOMP:$BEST_FIXED" \
+           ${WORST_FIXED:+"Worst fixed nvCOMP:$WORST_FIXED"} "ndzip:static-ndzip" \
            "cuSZp3:static-cuszp" "cuSZ:static-cusz" "NeuroPress:$NP_CFG"; do
     bl=${b%%:*}; bc=${b#*:}
     if [ "$lossless" = 1 ]; then
@@ -666,10 +719,22 @@ run_arm() {
   # Verification is untimed but costs a full read-back, so it runs once per arm.
   # A lossy arm checks |orig - decoded| <= eb instead of a digest, which lossy
   # data must fail; without --check-bound it was not verified at all.
+  #
+  # EXCEPT cuSZ and cuSZp3. They quantize INTERNALLY (compressor_runtime.cc
+  # disables our quantizer for them), in fp32: cuSZ's Lorenzo kernel does
+  # round(x * 1/(2eb)) in float and cuSZp does cvt.s32(x * 0.5f/eb), so the
+  # bound is their contract, not something this pipeline produces or can fix.
+  # The figure times them; it does not certify them. A lossy digest check would
+  # fail by construction, so these arms skip the read-back entirely and record
+  # an empty `bound`. Our own quantizer (nvCOMP -q, NeuroPress lossy) is still
+  # checked, because that bound IS ours.
   if [ "$rep" -gt 1 ]; then
     cmd+=( --no-verify )
   elif awk -v e="$eb" 'BEGIN{exit !(e + 0 > 0)}'; then
-    cmd+=( --check-bound )
+    case "$cfg" in
+      static-cusz|static-cuszp) cmd+=( --no-verify ) ;;
+      *)                        cmd+=( --check-bound ) ;;
+    esac
   fi
 
   if [ "$DRY" = 1 ]; then
@@ -941,7 +1006,7 @@ warm_cache
 unset _spec _l _p _c _e _t _f
 cat > "$OUT/run.json" <<JSON
 {"workload":"$WLNAME","size":"$SIZE","panel":"$PANEL","arms":${#ARMS[@]},
- "np_config":"$NP_CFG","best_fixed":"$BEST_FIXED","chunk":$CHUNK,"max_files":$MAXF,"smoke_gb":"$SMOKE_GB",
+ "np_config":"$NP_CFG","best_fixed":"$BEST_FIXED","worst_fixed":"$WORST_FIXED","chunk":$CHUNK,"max_files":$MAXF,"smoke_gb":"$SMOKE_GB",
  "eb":"$EB_LOW","panel_b_tier":$PANEL_B_TIER,"async_ms":$ASYNC_MS,"ram_mb":${RAM_MB:-0},
  "cusz_reuse":"${CUSZ_REUSE:-auto}",
  "cost_bw_bytes_per_ms":"$COST_BW","np_lr":$NP_LR,"np_mape":$NP_MAPE,
