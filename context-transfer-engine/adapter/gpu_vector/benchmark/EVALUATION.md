@@ -158,10 +158,19 @@ tier is the right one.
 | workload / composition | 64 KB | 256 KB | 1 MB | 4 MB | 16 MB |
 |---|---|---|---|---|---|
 | kmeans, DRAM-only | 12.00-12.02 s (0.67 GB/s), 130401-130475 faults | 3.26-3.42 s (2.3-2.5 GB/s), 32059-32070 faults | 2.34-2.50 s (3.2-3.4 GB/s), 7442-7483 faults (the E4 cell measured 2.02-2.18 s) | 2.56 s (3.12 GB/s), 1209-1236 faults | 0.50 s (15.97 GB/s), ZERO faults -- see the confound below |
+| kmeans, DRAM-only, CACHE PINNED at 512 MB | 11.42 s, 123216-123253 faults | 3.19-3.21 s, 31028-31077 faults | 2.62 s, 7441-7490 faults | pending | n/a (a 16 MB page cannot make a 512 MB cache at 64 blocks) |
 | kmeans, Lustre-heavy | 30.0 s (0.27 GB/s), 130424-130471 faults | ABORTED at the 600 s cap on all four ranks: the kernel took DEVICE FATAL 7 ("fetch returned an error; its pages were left EMPTY -- a generational get names a generation the writer has not published"), then a GPU write to address 0 and a driver abort. Preceded by TaskProgress replica warnings, i.e. the same overloaded-network conditions as the zero-fill defect above | 4.78 s (1.67 GB/s), 7443-7470 faults, Flare 7.5 GB and DAOS 2.1 GB per node -- but the E4 cell at the SAME page and composition measured 23.0 s (0.35 GB/s). See the variance note below | 3.47-3.92 s (2.0-2.3 GB/s), 1201-1231 faults | 0.49 s (16.3 GB/s): resident, the cache confound again, and identical to the DRAM-only cell because no tier is touched |
 
-**THIS SWEEP CHANGES TWO THINGS AT ONCE, AND THE SECOND ONE DOMINATES AT
-16 MB.** The vector's frame cache is `slots x blocks x page`, and the
+**THE PINNED-CACHE ROW IS THE ONE TO READ FOR PAGE SIZE.** With the cache
+held at 512 MB the curve is 11.42 / 3.19 / 2.62 s for 64 KB / 256 KB /
+1 MB, against 12.01 / 3.34 / 2.42 s when the cache was left to grow with
+the page. The two agree closely at these sizes, so the page size -- not
+the cache -- is what drove the 4.6x between 64 KB and 1 MB. The confound
+only bites at the top of the sweep, where the cache became a large
+fraction of the deck.
+
+**THE FIRST SWEEP CHANGED TWO THINGS AT ONCE, AND THE SECOND ONE
+DOMINATES AT 16 MB.** The vector's frame cache is `slots x blocks x page`, and the
 editions take `--slots` (8) and `--blocks` (64) as counts, not bytes. So
 sweeping the page size sweeps the cache with it:
 
