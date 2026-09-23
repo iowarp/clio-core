@@ -35,7 +35,9 @@
 #                 the E4 row. THE FOURTH FIELD IS WHAT MAKES E2 HONEST: the
 #                 frame cache is slots x blocks x page, so sweeping the page
 #                 alone sweeps the cache too; scaling slots inversely holds
-#                 the cache constant in bytes.
+#                 the cache constant in bytes. A fifth field is a free-form
+#                 tag, which exists so REPEATS of one cell get distinct run
+#                 directories and logs instead of overwriting each other.
 #   BENCH_GROUP_N nodes per cell (default 4)
 #   BENCH_CAP     per-rank cap in seconds (default 600)
 #   TIER_BUDGET_MB, HBM_MB, DATA_MB  as submit_e4_aurora.sh
@@ -130,15 +132,19 @@ run_cell() {
   tail=${cell#*:}
   comp=${tail%%:*}
   # Third field is the page size in KB, fourth the slots per block.
-  local slots=""
+  local slots="" rtag=""
   if [ "${tail}" = "${comp}" ]; then
     pkb=""
   else
     pkb=${tail#*:}
-    if [ "${pkb}" != "${pkb%:*}" ]; then slots=${pkb#*:}; pkb=${pkb%%:*}; fi
+    if [ "${pkb}" != "${pkb%:*}" ]; then
+      slots=${pkb#*:}
+      pkb=${pkb%%:*}
+      if [ "${slots}" != "${slots%:*}" ]; then rtag=${slots#*:}; slots=${slots%%:*}; fi
+    fi
   fi
   local exe="${ROOT}/build-spike/clio_${wl}_paged_newcoro_aot"
-  local slug="${comp}${pkb:+_p${pkb}}${slots:+_s${slots}}"
+  local slug="${comp}${pkb:+_p${pkb}}${slots:+_s${slots}}${rtag:+_r${rtag}}"
   local rundir="${ROOT}/build-spike/e4b_${JOBTAG}_${wl}_${slug}"
   local log="${ROOT}/build-spike/pbs/${wl}_e4_${slug}.log"
   local pd pa pf top daos flare
