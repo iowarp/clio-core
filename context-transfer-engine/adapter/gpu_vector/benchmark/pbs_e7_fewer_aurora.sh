@@ -72,7 +72,17 @@ export SYCL_CACHE_DIR=${SYCL_CACHE_DIR:-${ROOT}/build-spike/sycl_cache}
 mkdir -p "$SYCL_CACHE_DIR"
 export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 export MPIR_CVAR_ENABLE_GPU=1
-export ISHMEM_SYMMETRIC_SIZE=${ISHMEM_SYMMETRIC_SIZE:-68719476736}
+# ISHMEM's symmetric heap lives IN HBM, and a PVC tile has 64 GB, so asking
+# for 64 GB fails outright: zeMemAllocDevice returns UNSUPPORTED_SIZE and
+# ishmem_init dies with rc=139 before the benchmark starts (seen at the
+# 32-node rung). Size it from the share instead -- 1.35x, which covers the
+# collective buffers on top of the four grayscott arrays -- and cap it at
+# 40 GB, the largest value these baselines have been seen to accept.
+ISHMEM_MB=$(( PERNODE_MB * 27 / 20 ))
+[ "${ISHMEM_MB}" -gt 40960 ] && ISHMEM_MB=40960
+[ "${ISHMEM_MB}" -lt 8192 ] && ISHMEM_MB=8192
+export ISHMEM_SYMMETRIC_SIZE=${ISHMEM_SYMMETRIC_SIZE:-$(( ISHMEM_MB * 1024 * 1024 ))}
+echo "    ishmem symmetric heap ${ISHMEM_MB} MB"
 
 source /usr/share/lmod/lmod/init/bash
 module use /soft/modulefiles
