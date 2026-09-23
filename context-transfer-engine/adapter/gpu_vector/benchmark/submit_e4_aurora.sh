@@ -38,6 +38,8 @@ COMPS=${COMPS:-"dram100 dram75 bal25 daos70 lustre70"}
 TIER_BUDGET_MB=${TIER_BUDGET_MB:-10240}
 HBM_MB=${HBM_MB:-4096}
 DATA_MB=${DATA_MB:-32768}
+# 240 s suits the 8 GB/node decks; lammps_md seeds 673 M atoms into binned
+# storage before its step and needs more of the job's 15 minutes.
 E4_CAP=${E4_CAP:-240}
 
 # Shares in percent: dram daos flare.
@@ -61,17 +63,20 @@ shares_for() {
 #              the others get, and it clears the edition's own floor of
 #              4 * blocks + 2.
 #   lammps_md  ballistic mode (no --md, so no neighbour list): x and v are
-#              binned at 512 bytes per bin and bins = floor(0.5713 *
-#              lattice), measured from the stage-one deck (L=28 -> 16^3
-#              bins, 2.0 MB per array). L=552 -> 315^3 bins -> 16 GB per
-#              array globally, so x + v is 8 GB/node.
+#              binned at 512 bytes per bin and nb = floor(0.5999 * lattice)
+#              bins per side (box/lattice = 1.6796, bin = 2.8). A z-plane
+#              is nb^2 * 512 bytes and MUST be a whole number of pages, so
+#              at a 1 MB page nb has to be a multiple of 64 -- L=552 gave
+#              nb=331 and every rank refused it. L=534 gives nb=320: a
+#              plane is exactly 50 pages, the planes split 80 per node at
+#              4 nodes, and x + v is 8.2 GB/node.
 args_for() {
   case "$1" in
     kmeans)    echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --iters 1 --page-kb 1024" ;;
     grayscott) echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --steps 1 --repeat 1 --page-kb 1024" ;;
     weights)   echo "--blocks 64 --pages 128 --page-kb 1024 --hbm-mb ${HBM_MB} --repeat 1" ;;
     gmx)       echo "--page-kb 20000 --blocks 16 --cap 200 --repeat 1" ;;
-    lammps_md) echo "--lattice 552 --steps 1 --page-kb 1024" ;;
+    lammps_md) echo "--lattice 534 --steps 1 --page-kb 1024" ;;
     lbann)     echo "--in 65536 --hidden 131072 --out 1024 --batch 64 --steps 1 --page-kb 1024 --blocks 64 --cap 4096 --no-ref" ;;
     *)         echo "" ;;
   esac
