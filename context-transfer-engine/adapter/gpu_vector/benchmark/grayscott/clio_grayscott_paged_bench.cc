@@ -119,6 +119,7 @@ namespace gs = clio::gv_bench::grayscott;
 // Cross-node reduction. Included INSIDE the device-pass guard: it uses the
 // CTE client, whose members are compiled out of the CUDA device pass.
 #include "../bench_dist.h"
+#include "../bench_ckpt.h"
 // Host-only for the same reason: the prefetcher is pure host policy that
 // speaks to the CTE, and never appears in a kernel.
 #include "grayscott_prefetch.h"
@@ -219,6 +220,7 @@ int main(int argc, char **argv) {
   // otherwise sits in VRAM holding cold history that nobody reads again.
   u64 ckpt_every = 0;
   bool ckpt_drain = false;
+  bool ckpt_final = true;   // --no-ckpt: skip the end-of-run checkpoint
   float ckpt_cold = 0.0f;
   unsigned long long ram_mb = 0;   // 0 = data_mb + 1024, the historic value
 
@@ -258,6 +260,7 @@ int main(int argc, char **argv) {
     else if (a == "--ram-mb") ram_mb = next();
     else if (a == "--ckpt-every") ckpt_every = next();
     else if (a == "--ckpt-drain") ckpt_drain = true;
+    else if (a == "--no-ckpt") ckpt_final = false;
     else if (a == "--ckpt-cold") ckpt_cold = nextf();
     else if (a == "--Du") Du = nextf();
     else if (a == "--Dv") Dv = nextf();
@@ -979,6 +982,16 @@ int main(int argc, char **argv) {
                ckpt_ms, ckpt_drain ? 1 : 0);
 
   ctp::GpuApi::Free(d_sum);
+  // FINAL-STATE CHECKPOINT: vector.Copy of the whole field, on
+  // by default (--no-ckpt skips it). After every gate, because the
+  // multi-node path drops the cache first -- see bench_ckpt.h.
+  // Unlike the periodic --ckpt-every snapshots this one needs no
+  // MaterializeAll: nothing writes the field after it, so the lazy copy
+  // cannot be overtaken by a later step.
+  std::unique_ptr<gv::Vector<float>> final_ck;
+  if (ckpt_final) {
+    final_ck = clio_bench_ckpt::FinalCheckpoint(vec, "gv_gs_ckpt_final", nodes);
+  }
   BenchFlushData();
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;

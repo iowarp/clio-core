@@ -834,6 +834,7 @@ void LaunchDenseDigest(const float *w, u64 n, unsigned long long *out) {
 // Cross-node collectives. Included INSIDE the device-pass guard: it uses
 // the CTE client, whose members are compiled out of the CUDA device pass.
 #include "../bench_dist.h"
+#include "../bench_ckpt.h"
 
 namespace {
 
@@ -882,6 +883,7 @@ int main(int argc, char **argv) {
   // loss trajectory and its paging counters, which is what the tiering and
   // scaling studies measure. Same switch, same meaning, as the baselines'.
   bool no_ref = false;
+  bool ckpt = true;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> u64 {
@@ -899,6 +901,7 @@ int main(int argc, char **argv) {
     else if (a == "--out") O = next();
     else if (a == "--batch") B = next();
     else if (a == "--steps") steps = next();
+    else if (a == "--no-ckpt") ckpt = false;
     else if (a == "--lr" && i + 1 < argc) lr = std::strtof(argv[++i], nullptr);
     else if (a == "--help") {
       std::printf("usage: %s [--blocks N] [--threads N] [--cap PAGES] "
@@ -1466,6 +1469,11 @@ int main(int argc, char **argv) {
   }
   std::printf("%s\n", rc == 0 ? "LBANN BENCH: ALL GATES PASS"
                               : "LBANN BENCH: GATE FAILURE");
+  // FINAL-STATE CHECKPOINT: vector.Copy of the trained weights, on
+  // by default (--no-ckpt skips it). After every gate, because the
+  // multi-node path drops the cache first -- see bench_ckpt.h.
+  std::unique_ptr<gv::Vector<float>> w_ck;
+  if (ckpt) w_ck = clio_bench_ckpt::FinalCheckpoint(w, "gv_lbann_w_ckpt", nodes);
   BenchFlushData();
   return rc;
 }

@@ -81,6 +81,7 @@ struct Args {
   u32 maxneigh = 96;       // Verlet-list capacity per atom slot
   u32 rowchunk = 4;        // rows per block in the force pass (hold reuse)
   u64 ckpt = 0;            // checkpoint every N steps (0 = never)
+  bool no_ckpt = false;    // skip the end-of-run vector.Copy checkpoint
   u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
   u32 nlslots = 0;         // list cache frames per block; 0 = NlSlots() default
   u64 vram_mb = 0;         // cache budget across ALL vectors; 0 = size for residency
@@ -3522,6 +3523,8 @@ class YieldRunner {
 #endif  // !CTP_IS_DEVICE_PASS
 
 #if !CTP_IS_DEVICE_PASS
+// Host-only: the end-of-run vector.Copy checkpoint.
+#include "../bench_ckpt.h"
 
 /** Clamp a requested slot count up to what the kernels actually pin. */
 static u32 AtLeastSlots(u32 want, u32 floor_slots, const char *what) {
@@ -3852,6 +3855,7 @@ int main(int argc, char **argv) {
     else if (want("--nodes")) a.nodes = static_cast<u32>(atoi(argv[++i]));
     else if (want("--node")) a.node = static_cast<u32>(atoi(argv[++i]));
     else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
+    else if (std::strcmp(argv[i], "--no-ckpt") == 0) a.no_ckpt = true;
     else if (std::strcmp(argv[i], "--readprobe") == 0) a.readprobe = 1;
     else {
       std::fprintf(stderr, "unknown arg %s\n", argv[i]);
@@ -5682,6 +5686,17 @@ gpu, *dst, g.nb, g.cap,
                   c[5], c[0] * us / 1000.0, c[1] * us / 1000.0,
                   c[2] * us / 1000.0, c[3] * us / 1000.0,
                   c[4] * us / 1000.0);
+    }
+    // FINAL-STATE CHECKPOINT: vector.Copy of the current positions and
+    // velocities, on by default (--no-ckpt skips it). Last, because the
+    // multi-node path drops the cache first -- see bench_ckpt.h.
+    std::unique_ptr<gv::Vector<float>> fin_x, fin_v;
+    if (!a.no_ckpt) {
+      gv::Vector<float> *fin_vv = (cvx == &vx) ? &vv : &vv2;
+      fin_x = clio_bench_ckpt::FinalCheckpoint(*cvx, tag("md_ckpt_x_final"),
+                                               a.nodes);
+      fin_v = clio_bench_ckpt::FinalCheckpoint(*fin_vv,
+                                               tag("md_ckpt_v_final"), a.nodes);
     }
     ctp::GpuApi::Free(d_acc);
     ctp::GpuApi::Free(d_thermo);

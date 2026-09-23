@@ -14,6 +14,10 @@ add_clio_module_runtime(
     # Data organizer (issue #738): one source file per organization policy
     src/data_organizer/data_organizer.cc
     src/data_organizer/frecency_organizer.cc
+    src/data_organizer/cyclic_organizer.cc
+    src/data_organizer/hotset_organizer.cc
+    src/data_organizer/scatter_organizer.cc
+    src/data_organizer/grayscott_organizer.cc
     src/autogen/core_lib_exec.cc
     # GPU runtime concept removed — kernels submit tasks to the CPU runtime
     # via gpu2cpu_queue and the CPU executes them through the standard

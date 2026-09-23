@@ -33,6 +33,13 @@ if(CLIO_CORE_ENABLE_CUDA)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     install(TARGETS clio_grayscott_paged_bench RUNTIME DESTINATION bin)
+    # vector.Copy (the end-of-run checkpoint, bench_ckpt.h) creates the
+    # checkpoint chimod's pool, which the runtime LOADS rather than links:
+    # without this, building just this target leaves the chimod unbuilt and
+    # Copy throws "checkpoint pool create failed" at the end of the run.
+    if(TARGET clio_cte_checkpoint_runtime)
+      add_dependencies(clio_grayscott_paged_bench clio_cte_checkpoint_runtime)
+    endif()
 
     # The CUDA paged row had NO ctest entry while its SYCL twin did -- so a
     # break here would have been caught only on the backend that is harder to

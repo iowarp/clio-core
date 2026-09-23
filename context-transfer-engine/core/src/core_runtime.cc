@@ -1060,6 +1060,7 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
     case Method::kTagQuery:
     case Method::kBlobQuery:
     case Method::kEvict:
+    case Method::kReorganizeHint:
       return clio::run::PoolQuery::Broadcast();
 
     default:
@@ -4317,6 +4318,14 @@ void Runtime::CollectOrganizerBlobStats(clio::run::u32 replica_id,
         stat.tag_id_.minor_ = static_cast<clio::run::u32>(std::stoul(
             key.substr(first_dot + 1, second_dot - first_dot - 1)));
 
+        // The canonical tag name, so a policy can recognise a tag family
+        // (checkpoints, scratch, ...) without a lookup of its own. Missing
+        // tags (deleted mid-round) leave it empty rather than skipping the
+        // blob: the stat is still true, the name is just not known.
+        if (tag_id_to_info_.contains(stat.tag_id_)) {
+          std::shared_ptr<TagInfo> ti = tag_id_to_info_.get(stat.tag_id_);
+          if (ti) stat.tag_name_ = ti->tag_name_.str();
+        }
         out.push_back(std::move(stat));
       });
 }
@@ -4731,6 +4740,22 @@ clio::run::TaskResume Runtime::Evict(clio::run::shared_ptr<EvictTask> &task) {
   CLIO_TASK_BODY_END
 }
 
+
+
+/**
+ * Store the organizer phase hint. The value is opaque here: it is published to
+ * organizer_hint_ for DataOrganizer::Reorganize to read on its next round via
+ * OrganizerHint(). Broadcast, so every container ends up with the same value.
+ * @param task carries the hint in hint_
+ */
+clio::run::TaskResume Runtime::ReorganizeHint(
+    clio::run::shared_ptr<ReorganizeHintTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  organizer_hint_.store(task->hint_, std::memory_order_relaxed);
+  task->SetReturnCode(0);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
 
 clio::run::TaskResume Runtime::MultiPutBlob(
     clio::run::shared_ptr<MultiPutBlobTask> &task) {

@@ -582,6 +582,7 @@ void LaunchDenseGather(u32 blocks, u32 threads, const unsigned long long *mesh,
 // Cross-node reduction. Included INSIDE the device-pass guard: it uses the
 // CTE client, whose members are compiled out of the CUDA device pass.
 #include "../bench_dist.h"
+#include "../bench_ckpt.h"
 
 namespace {
 
@@ -627,6 +628,7 @@ int main(int argc, char **argv) {
   // for the two bit-equality gates. CONSERVATION stays enforced -- it is
   // self-contained (mesh total == input charge, exact).
   bool no_dense = false;
+  bool ckpt = true;
   // Optional file tier (full CTE stack: hbm-resident cache + RAM + file).
   u64 nvme_mb = 0;
   std::string nvme_path = "/tmp/gv_gmx_tier.dat";
@@ -644,13 +646,14 @@ int main(int argc, char **argv) {
     else if (a == "--atoms") atoms = next();
     else if (a == "--repeat") repeat = static_cast<int>(next());
     else if (a == "--no-dense") no_dense = true;
+    else if (a == "--no-ckpt") ckpt = false;
     else if (a == "--nodes") nodes = static_cast<u32>(next());
     else if (a == "--node") node = static_cast<u32>(next());
     else if (a == "--nvme-mb") nvme_mb = next();
     else if (a == "--nvme-path" && i + 1 < argc) nvme_path = argv[++i];
     else if (a == "--help") {
       std::printf("usage: %s [--blocks N] [--threads N] [--cap PAGES] "
-                  "[--page-kb N] [--atoms N] [--repeat N]\n", argv[0]);
+                  "[--page-kb N] [--atoms N] [--repeat N] [--no-ckpt]\n", argv[0]);
       return 0;
     }
   }
@@ -1002,6 +1005,13 @@ int main(int argc, char **argv) {
   }
   std::printf("%s\n", rc == 0 ? "GMX BENCH: ALL GATES PASS"
                               : "GMX BENCH: GATE FAILURE");
+  // FINAL-STATE CHECKPOINT: vector.Copy of the charge mesh, on
+  // by default (--no-ckpt skips it). After every gate, because the
+  // multi-node path drops the cache first -- see bench_ckpt.h.
+  std::unique_ptr<gv::Vector<unsigned long long>> mesh_ck;
+  if (ckpt) {
+    mesh_ck = clio_bench_ckpt::FinalCheckpoint(mesh, "gv_gmx_mesh_ckpt", nodes);
+  }
   BenchFlushData();
   return rc;
 }
