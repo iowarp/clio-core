@@ -157,7 +157,7 @@ tier is the right one.
 
 | workload / composition | 64 KB | 256 KB | 1 MB | 4 MB | 16 MB |
 |---|---|---|---|---|---|
-| kmeans, DRAM-only | 12.00-12.02 s (0.67 GB/s), 130401-130475 faults | 3.26-3.42 s (2.3-2.5 GB/s), 32059-32070 faults | 2.34-2.50 s (3.2-3.4 GB/s), 7442-7483 faults (the E4 cell measured 2.02-2.18 s) | pending | pending |
+| kmeans, DRAM-only | 12.00-12.02 s (0.67 GB/s), 130401-130475 faults | 3.26-3.42 s (2.3-2.5 GB/s), 32059-32070 faults | 2.34-2.50 s (3.2-3.4 GB/s), 7442-7483 faults (the E4 cell measured 2.02-2.18 s) | 2.56 s (3.12 GB/s), 1209-1236 faults: 6x fewer faults than 1 MB and slightly SLOWER, so the curve has flattened and the per-fault cost is no longer what limits it | pending |
 | kmeans, Lustre-heavy | pending | pending | 23.0 s (0.35 GB/s) (the E4 cell) | pending | pending |
 
 ## Plan coverage so far
