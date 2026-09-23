@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+#PBS -l place=scatter
+#PBS -l walltime=00:40:00
+#PBS -l filesystems=home:flare:daos_user_fs
+#PBS -l daos=daos_user
+#PBS -q debug-scaling
+#PBS -A IOWarp
+#PBS -j oe
+#
+# E7 -- THE SAME WORKLOAD ON FEWER NODES.
+#
+# Every other study here grows the problem with the machine. This one does
+# the opposite: the TOTAL footprint is fixed and the node count falls, so the
+# per-node share rises and the question is whether the job still runs at all.
+# That is the practical claim for tiering -- not that it is fast, but that it
+# removes the "you need N nodes or you cannot start" floor.
+#
+#   480 GB total, in every rung:
+#
+#     32 nodes -> 15 GB/node      12 nodes -> 40 GB/node
+#     16 nodes -> 30 GB/node       8 nodes -> 60 GB/node
+#      6 nodes -> 80 GB/node       4 nodes -> 120 GB/node
+#
+# WHY 480 AND NOT 512. grayscott's z-planes must divide the node count, and
+# nz = data_mb/4. 480 GB gives nz = 122880 = 96 x 1280, which divides 4, 6,
+# 8, 12, 16 and 32 exactly. 512 GB gives nz = 131072 = 2^17, which does not
+# divide 6 or 12, and the edition would refuse those two rungs.
+#
+# THE FRAME CACHE IS FIXED AT 8 GB PER NODE in every rung, so the only thing
+# that changes is how far the deck overflows it: 1.9x at 32 nodes, 15x at 4.
+#
+# THE BASELINES CANNOT FOLLOW ALL THE WAY DOWN, and that is the point. They
+# hold the shard in HBM, and a PVC tile has 64 GB, so a share above ~48 GB
+# has nowhere to live. They run at 32, 16 and 12 nodes and are skipped below
+# that with the reason printed -- skipped, not failed, because burning the
+# per-rank cap on a run that cannot fit teaches nothing.
+#
+#   BENCH_TOTAL_MB  total footprint (default 491520 = 480 GB)
+#   BENCH_STEPS     steps per run (default 2)
+#   BENCH_CAP       per-rank cap in seconds (default 900)
+set -u
+
+ROOT=${ROOT:-/home/llogan/clio-core/.claude/worktrees/gpu-coro}
+TOTAL_MB=${BENCH_TOTAL_MB:-491520}
+STEPS=${BENCH_STEPS:-2}
+CAP=${BENCH_CAP:-900}
+CACHE_MB=${BENCH_CACHE_MB:-8192}
+NRANKS=$(sort -u "${PBS_NODEFILE}" | wc -l)
+PERNODE_MB=$(( TOTAL_MB / NRANKS ))
+JOBTAG=${PBS_JOBID%%.*}
+DAOS_POOL=${DAOS_POOL:-IOWarp}
+DAOS_CONT=${DAOS_CONT:-clio_tier}
+FLARE_ROOT="/lus/flare/projects/IOWarp/clio_tier/${JOBTAG}"
+# A tier budget of 1.25x the share: enough that no put is refused, tight
+# enough that the lower tiers actually fill.
+BUDGET_MB=$(( PERNODE_MB * 5 / 4 ))
+DRAM_MB=$(( BUDGET_MB / 4 ))
+DAOS_MB=$(( BUDGET_MB / 2 ))
+FLARE_MB=$(( BUDGET_MB - DRAM_MB - DAOS_MB ))
+# 64 blocks x 1 MB pages, so slots = cache in MB / 64.
+SLOTS=$(( CACHE_MB / 64 ))
+
+echo "=== E7 rung: ${NRANKS} nodes, ${TOTAL_MB} MB total, ${PERNODE_MB} MB/node ==="
+echo "    tiers/node: dram ${DRAM_MB} + daos ${DAOS_MB} + flare ${FLARE_MB} MB"
+echo "    frame cache ${CACHE_MB} MB (${SLOTS} slots x 64 blocks x 1 MB), "\
+"oversubscribed $(( PERNODE_MB / CACHE_MB ))x"
+
+export IGC_FunctionControl=3
+export ZE_AFFINITY_MASK=${BENCH_ZE_MASK:-0.0}
+export SYCL_CACHE_PERSISTENT=1
+export SYCL_CACHE_DIR=${SYCL_CACHE_DIR:-${ROOT}/build-spike/sycl_cache}
+mkdir -p "$SYCL_CACHE_DIR"
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+export MPIR_CVAR_ENABLE_GPU=1
+export ISHMEM_SYMMETRIC_SIZE=${ISHMEM_SYMMETRIC_SIZE:-68719476736}
+
+source /usr/share/lmod/lmod/init/bash
+module use /soft/modulefiles
+module load daos/base
+daos cont query "${DAOS_POOL}" "${DAOS_CONT}" > /dev/null 2>&1 ||
+  daos cont create --type=POSIX "${DAOS_POOL}" "${DAOS_CONT}" 2>&1 | tail -2
+clean-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" > /dev/null 2>&1
+launch-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" 2>&1 | tail -1
+MNT="/tmp/${DAOS_POOL}/${DAOS_CONT}"
+mount | grep -qF "${MNT}" || { echo "dfuse NOT mounted"; exit 2; }
+TDIR_DAOS="${MNT}/clio_tier/${JOBTAG}"
+TDIR_FLARE="${FLARE_ROOT}"
+mkdir -p "${TDIR_DAOS}" "${TDIR_FLARE}"
+
+# @param 1 label  @param 2 exe  @param 3 args  @param 4 ranked (1 = --nodes/--node)
+run_one() {
+  local label=$1 exe=$2 args=$3 ranked=$4
+  local rundir="${ROOT}/build-spike/e7_${JOBTAG}_${label}"
+  if [ ! -x "${exe}" ]; then
+    echo "RESULT e7/${label}x${NRANKS}: NO-EXECUTABLE"; return 2
+  fi
+  mkdir -p "${rundir}"; rm -f "${rundir}"/rank*.log
+  echo "--- ${label}: ${args} ---"
+  local start=$SECONDS
+  BENCH_RANK_EXE="${exe}" BENCH_RANK_ARGS="${args}" BENCH_RANK_DIR="${rundir}" \
+  BENCH_RANK_CAP="${CAP}" BENCH_RANK_N="${NRANKS}" BENCH_RANK_RANKED="${ranked}" \
+  mpiexec -n "${NRANKS}" --ppn 1 --no-vni --envall --cpu-bind none bash -c '
+    r=${PALS_RANKID:-${PMI_RANK:-0}}
+    cd "$BENCH_RANK_DIR"
+    ulimit -c 0
+    extra=""
+    [ "$BENCH_RANK_RANKED" = 1 ] && extra="--nodes $BENCH_RANK_N --node $r"
+    [ -f clio_e7_template.yaml ] &&
+      sed "s/__RANK__/$r/g" clio_e7_template.yaml > "clio_e7_r$r.yaml" &&
+      export CLIO_SERVER_CONF="$BENCH_RANK_DIR/clio_e7_r$r.yaml"
+    timeout --signal=TERM --kill-after=10s "$BENCH_RANK_CAP" \
+      stdbuf -oL -eL "$BENCH_RANK_EXE" $BENCH_RANK_ARGS $extra \
+      > "rank$r.log" 2>&1
+    rc=$?
+    echo "rank $r on $(hostname) exit=$rc" >> "rank$r.log"
+    exit 0
+  '
+  local rc=0 r rrc
+  echo "elapsed $((SECONDS - start))s"
+  for r in 0 1; do
+    [ "${r}" -lt "${NRANKS}" ] || continue
+    echo "----- rank ${r} -----"
+    grep -vE "LoadBalance|\[#78[15]|INFO|SUCCESS|WARNING" "${rundir}/rank${r}.log" \
+      2>/dev/null | tail -16
+  done
+  for (( r = 0; r < NRANKS; ++r )); do
+    rrc=$(grep -oE "^rank ${r} on .* exit=[0-9]+" "${rundir}/rank${r}.log" \
+          2>/dev/null | tail -1 | grep -oE "[0-9]+$")
+    [ -z "${rrc}" ] && rrc=99
+    [ "${rrc}" -gt "${rc}" ] && rc=${rrc}
+  done
+  case "${rc}" in
+    0)   echo "RESULT e7/${label}x${NRANKS}: OK" ;;
+    124) echo "RESULT e7/${label}x${NRANKS}: TIMEOUT (${CAP}s cap)" ;;
+    *)   echo "RESULT e7/${label}x${NRANKS}: FAILED rc=${rc}" ;;
+  esac
+  return "${rc}"
+}
+
+BASE_ARGS="--data-mb ${TOTAL_MB} --steps ${STEPS} --page-kb 1024"
+
+# ---- the baselines, where the shard still fits a 64 GB tile ---------------
+if [ "${PERNODE_MB}" -le 49152 ]; then
+  for sub in mpi ccl ishmem; do
+    rc=0
+    run_one "grayscott_${sub}" "${ROOT}/build-spike/clio_grayscott_${sub}_bench" \
+            "${BASE_ARGS}" 0 || rc=$?
+  done
+else
+  echo "RESULT e7/grayscott_baselinesx${NRANKS}: SKIPPED -- the shard is "\
+"${PERNODE_MB} MB and a PVC tile holds 64 GB; an in-HBM baseline has nowhere "\
+"to put it. This is the floor tiering is meant to remove."
+fi
+
+# ---- Eternia, every rung --------------------------------------------------
+ET_DIR="${ROOT}/build-spike/e7_${JOBTAG}_grayscott_eternia"
+mkdir -p "${ET_DIR}"
+sort -u "${PBS_NODEFILE}" > "${ET_DIR}/hostfile"
+cat > "${ET_DIR}/clio_e7_template.yaml" <<EOF
+networking:
+  port: 9460
+  hostfile: "${ET_DIR}/hostfile"
+
+# See pbs_e4_batch_aurora.sh: a wide compose starves SWIM's probe replies,
+# its 60 s suspicion timeout fires and recovery moves a live node's
+# containers, after which routing cannot find them.
+swim:
+  enabled: false
+
+runtime:
+  num_threads: 8
+  queue_depth: 8192
+  first_busy_wait: 10000000
+
+gpu:
+  queue_depth: 8192
+
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "1GB"
+
+  - mod_name: clio_cte_core
+    pool_name: cte_core
+    pool_query: local
+    pool_id: "512.0"
+    targets:
+      neighborhood: 1
+    storage:
+      - path: "ram::gv_e7_dram"
+        bdev_type: "ram"
+        capacity_limit: "${DRAM_MB}MB"
+        score: 1.0
+      - path: "${TDIR_DAOS}/node__RANK__.dat"
+        bdev_type: "file"
+        persistence_level: "long_term"
+        capacity_limit: "${DAOS_MB}MB"
+        score: 0.5
+      - path: "${TDIR_FLARE}/node__RANK__.dat"
+        bdev_type: "file"
+        persistence_level: "long_term"
+        capacity_limit: "${FLARE_MB}MB"
+        score: 0.2
+    dpe:
+      dpe_type: "max_bw"
+EOF
+rc=0
+run_one "grayscott_eternia" \
+        "${ROOT}/build-spike/clio_grayscott_paged_newcoro_aot" \
+        "${BASE_ARGS} --hbm-mb ${CACHE_MB} --repeat 1 --slots ${SLOTS}" 1 || rc=$?
+
+echo "--- tier files ---"
+for d in "${TDIR_DAOS}" "${TDIR_FLARE}"; do du -sh "${d}" 2>&1; rm -rf "${d}"; done
+clean-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" > /dev/null 2>&1
+echo "E7 RUNG DONE ${NRANKS}"
+exit 0
