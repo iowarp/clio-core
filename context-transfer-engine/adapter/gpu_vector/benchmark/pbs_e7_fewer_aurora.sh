@@ -51,9 +51,15 @@ JOBTAG=${PBS_JOBID%%.*}
 DAOS_POOL=${DAOS_POOL:-IOWarp}
 DAOS_CONT=${DAOS_CONT:-clio_tier}
 FLARE_ROOT="/lus/flare/projects/IOWarp/clio_tier/${JOBTAG}"
-# A tier budget of 1.25x the share: enough that no put is refused, tight
-# enough that the lower tiers actually fill.
-BUDGET_MB=$(( PERNODE_MB * 5 / 4 ))
+# THE PERSISTENT SHARE, NOT THE TOTAL BUDGET, IS WHAT MUST COVER THE DATA.
+# The first 32-node rung used a budget of 1.25x the share split 25/50/25,
+# which leaves DAOS+Flare holding 0.9375x -- just under. The shutdown flush
+# then declined blob after blob ("persistent tier(s) at level >= 1"), the
+# full tiers left dirty frames unevictable, and the fault path livelocked:
+# "ROUND CAP HIT after 2000000 rounds with 32 block(s) still suspended".
+# One arithmetic slip, two symptoms. At 1.6x the persistent tiers hold 1.2x
+# the share and there is room to write back.
+BUDGET_MB=$(( PERNODE_MB * 8 / 5 ))
 DRAM_MB=$(( BUDGET_MB / 4 ))
 DAOS_MB=$(( BUDGET_MB / 2 ))
 FLARE_MB=$(( BUDGET_MB - DRAM_MB - DAOS_MB ))
