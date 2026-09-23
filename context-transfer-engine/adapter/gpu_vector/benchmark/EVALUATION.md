@@ -305,6 +305,42 @@ FIRST PASS (balanced composition), kept as defect evidence only:
 | weights | 7.72-8.62 s | DEVICE FATAL 2 | DEVICE FATAL 2 | checksum MISMATCH | ok |
 | lbann | DEVICE FATAL 2 | 23.0-24.6 s | 33.3-34.7 s | DEVICE FATAL 2 | 24.4-24.9 s |
 
+## E3: persistence at 4 nodes
+
+grayscott, 8 steps, a snapshot every 2 steps, 1 GB/node deck, 1 MB pages,
+16 frames of cache. Three arms per composition: no checkpoint (the floor),
+a checkpoint left at blob score 1.0 in the fast tier (asynchronous), and one
+drained out of it before the run continues (synchronous).
+
+THE DECK IS 1 GB/NODE, NOT 8. A checkpoint is a SECOND full copy of the
+vector, so the live deck plus four snapshots must fit the 10 GB tier. At
+8 GB/node that is 40 GB and every checkpointing arm failed with "checkpoint
+0 failed to materialize" -- which is itself the same constraint E4 found on
+lammps_md, arrived at from the other direction.
+
+| arm | DRAM-only | DAOS-heavy | Lustre-heavy |
+|---|---|---|---|
+| no checkpoint | 1.16 s | 6.76 s | 6.61 s |
+| checkpoint, left hot | 16.63 s | 42.50 s | 44.20 s |
+| checkpoint, drained | 17.71 s | 44.34 s | 44.50 s |
+| checkpoint volume | 16 GB | 16 GB | 16 GB |
+| of which checkpointing | 15.4 s (93%) | 35.2 s (83%) | 35.2 s (80%) |
+
+Three things the matrix says:
+
+1. **Persistence dominates everything else here.** Checkpointing is 80-93% of
+   every run that does it. The tiering question E4 asks is second order once
+   a workload checkpoints at this rate.
+2. **Draining costs a steady few percent** -- 6.5% on DRAM, 4.3% on DAOS,
+   0.7% on Lustre -- and never changes the ranking. Synchronous placement is
+   cheap; it is the snapshot itself that is expensive.
+3. **DAOS AND LUSTRE ARE INDISTINGUISHABLE FOR CHECKPOINTS** (35.2 s each),
+   though they diverged sharply in E4 at an 8 GB/node deck. Checkpoint writes
+   are large and sequential, which is the shape where Lustre matches an
+   object store -- the same mechanism that makes gmx prefer Lustre in
+   Section E4. The storage choice that matters for paging does not matter for
+   persistence.
+
 ## Plan coverage so far
 
 | study | status |
