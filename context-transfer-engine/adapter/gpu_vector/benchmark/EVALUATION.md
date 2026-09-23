@@ -265,6 +265,27 @@ FIVE ARE THE PAGING DEFECT: weights at 2, 4 and 8 frames and lbann at 64 and
 512. The pass is kept for that evidence, not for its timings; the curve is
 rerun on dram75, which spills to DAOS and is stable.
 
+SECOND PASS, on dram75 (75 DRAM / 25 DAOS / 0 Lustre), cache pinned by
+scaling slots. This is the E5 curve; the first pass below is kept only as
+defect evidence.
+
+| workload | 1 GB | 2 GB | 4 GB | 8 GB |
+|---|---|---|---|---|
+| kmeans | 3.28 s | 3.21 s | 3.52 s | pending |
+| grayscott | 3.02 s | 2.87 s | 2.64 s | 2.34 s (4102 faults) |
+| weights | 3.49 s | 3.18 s | pending | pending |
+| lbann | pending | pending | pending | pending |
+
+The two shapes are the result. grayscott improves monotonically and gains
+23% over an 8x cache, because its stencil revisits planes and a larger cache
+turns those revisits into hits. kmeans does NOT: flat from 1 to 2 GB and
+SLOWER at 4 GB, because it streams one page per block and never revisits, so
+extra frames only add eviction and write-back work. For a streaming workload
+the cache can be cut to an eighth at no cost at all; for a stencil the same
+cut costs 23%. That is the memory-reduction claim, workload-resolved.
+
+FIRST PASS (balanced composition), kept as defect evidence only:
+
 | workload | 64 MB | 128 MB | 256 MB | 512 MB | 1 GB |
 |---|---|---|---|---|---|
 | kmeans | 4.39 s | 3.92 s | 4.16 s | 5.77 s | 5.51 s |
