@@ -271,10 +271,10 @@ defect evidence.
 
 | workload | 1 GB | 2 GB | 4 GB | 8 GB |
 |---|---|---|---|---|
-| kmeans | 3.28 s | 3.21 s | 3.52 s | pending |
+| kmeans | 3.28 s | 3.21 s | 3.52 s | 1.90 s |
 | grayscott | 3.02 s | 2.87 s | 2.64 s | 2.34 s (4102 faults) |
 | weights | 3.49 s | 3.18 s | 4.64 s CHECKSUM MISMATCH | 2.94 s |
-| lbann | pending | pending | pending | pending |
+| lbann | 14.89 s/step | 19.05 s/step | 19.18 s/step | 18.98 s/step |
 
 The two shapes are the result. grayscott improves monotonically and gains
 23% over an 8x cache, because its stencil revisits planes and a larger cache
@@ -282,7 +282,14 @@ turns those revisits into hits. kmeans does NOT: flat from 1 to 2 GB and
 SLOWER at 4 GB, because it streams one page per block and never revisits, so
 extra frames only add eviction and write-back work. For a streaming workload
 the cache can be cut to an eighth at no cost at all; for a stencil the same
-cut costs 23%. That is the memory-reduction claim, workload-resolved.
+cut costs 23%. That is the memory-reduction claim, workload-resolved. The 8 GB kmeans
+point (1.90 s) is the deck going resident -- the cache finally equals the
+shard -- so its curve is flat-then-cliff rather than gradual, while
+grayscott's is gradual throughout. lbann is flat from 2 GB up and
+FASTEST at 1 GB (14.9 s against 19.0 s), the same inversion as kmeans and
+for the same reason: its backward pass sweeps the whole second matrix, so
+no achievable cache turns those reads into hits and the extra frames only
+add eviction work.
 
 weights mismatches at 4 GB while passing at 1, 2 and 8 GB, ON A
 COMPOSITION WITH NO LUSTRE (DRAM + DAOS only). So the paging defect is
