@@ -241,6 +241,17 @@ networking:
   port: 9460
   hostfile: "${rundir}/hostfile"
 
+# SWIM OFF, for the same reason the E1 scaling config turns it off. Its
+# suspicion timeout is 60 s and expiry runs TriggerRecovery, which moves a
+# LIVE node's containers; a wide compose starves probe replies past that
+# threshold and the cluster never forms. Seen at 256 nodes in E1 and again
+# at 64 nodes here, where a grayscott cell died with "could not create
+# reduction tag" after 36 minutes of send timeouts -- it never reached its
+# first step, let alone its checkpoints. Four-node cells never hit it,
+# which is why it went unnoticed while every batch was four nodes wide.
+swim:
+  enabled: false
+
 runtime:
   num_threads: 8
   queue_depth: 8192
