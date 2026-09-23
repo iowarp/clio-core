@@ -27,8 +27,11 @@
 # under their own job-and-cell path. The runtime's port is the same in every
 # group, which is fine because the groups are disjoint sets of nodes.
 #
-#   BENCH_CELLS   space-separated <workload>:<composition>, e.g.
-#                 "kmeans:dram100 kmeans:bal25 grayscott:dram100"
+#   BENCH_CELLS   space-separated <workload>:<composition>[:<page-kb>],
+#                 e.g. "kmeans:dram100 kmeans:bal25:65536 grayscott:dram100".
+#                 The optional third field overrides the deck's page size,
+#                 which is what E2 sweeps; it also renames the cell's log so
+#                 a page sweep does not overwrite the E4 row.
 #   BENCH_GROUP_N nodes per cell (default 4)
 #   BENCH_CAP     per-rank cap in seconds (default 600)
 #   TIER_BUDGET_MB, HBM_MB, DATA_MB  as submit_e4_aurora.sh
@@ -92,7 +95,8 @@ mount_daos() {
 }
 NEED_DAOS=0
 for cell in ${BENCH_CELLS}; do
-  read -r pd pa pf <<< "$(shares_for "${cell##*:}")"
+  ctail=${cell#*:}
+  read -r pd pa pf <<< "$(shares_for "${ctail%%:*}")"
   [ "${pa:-0}" -gt 0 ] && NEED_DAOS=1
 done
 MNT=""
@@ -117,15 +121,26 @@ export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 # @param 2 group index, which picks the node slice and the run directory
 run_cell() {
   local cell=$1 gi=$2
-  local wl=${cell%%:*} comp=${cell##*:}
+  local wl comp pkb tail
+  wl=${cell%%:*}
+  tail=${cell#*:}
+  comp=${tail%%:*}
+  # Third field, when present, is the page size in KB.
+  if [ "${tail}" = "${comp}" ]; then pkb=""; else pkb=${tail#*:}; fi
   local exe="${ROOT}/build-spike/clio_${wl}_paged_newcoro_aot"
-  local rundir="${ROOT}/build-spike/e4b_${JOBTAG}_${wl}_${comp}"
-  local log="${ROOT}/build-spike/pbs/${wl}_e4_${comp}.log"
+  local slug="${comp}${pkb:+_p${pkb}}"
+  local rundir="${ROOT}/build-spike/e4b_${JOBTAG}_${wl}_${slug}"
+  local log="${ROOT}/build-spike/pbs/${wl}_e4_${slug}.log"
   local pd pa pf top daos flare
   read -r pd pa pf <<< "$(shares_for "${comp}")"
   local args; args=$(args_for "${wl}")
+  # Replace the deck's own --page-kb rather than appending, so the edition
+  # sees exactly one.
+  if [ -n "${pkb}" ]; then
+    args=$(echo "${args}" | sed -E "s/--page-kb [0-9]+/--page-kb ${pkb}/")
+  fi
   if [ -z "${pd:-}" ] || [ -z "${args}" ] || [ ! -x "${exe}" ]; then
-    echo "RESULT ${wl}x${GROUP_N}@${comp}: FAILED rc=2 (unknown cell or no exe)" | tee -a "${log}"
+    echo "RESULT ${wl}x${GROUP_N}@${slug}: FAILED rc=2 (unknown cell or no exe)" | tee -a "${log}"
     return
   fi
   top=$(( TIER_BUDGET_MB * pd / 100 ))
@@ -151,7 +166,7 @@ run_cell() {
         score: 1.0"
   fi
   if [ "${daos}" -gt 0 ]; then
-    tdir_daos="${MNT}/clio_tier/${JOBTAG}/${wl}_${comp}"
+    tdir_daos="${MNT}/clio_tier/${JOBTAG}/${wl}_${slug}"
     mkdir -p "${tdir_daos}"
     storage="${storage}
       - path: \"${tdir_daos}/node__RANK__.dat\"
@@ -161,7 +176,7 @@ run_cell() {
         score: 0.5"
   fi
   if [ "${flare}" -gt 0 ]; then
-    tdir_flare="${FLARE_ROOT}/${wl}_${comp}"
+    tdir_flare="${FLARE_ROOT}/${wl}_${slug}"
     mkdir -p "${tdir_flare}"
     storage="${storage}
       - path: \"${tdir_flare}/node__RANK__.dat\"
@@ -204,7 +219,7 @@ ${storage}
 EOF
 
   {
-    echo "=== ${wl} @ ${comp} on ${hosts} (dram ${top} daos ${daos} flare ${flare} MB/node) ==="
+    echo "=== ${wl} @ ${slug} on ${hosts} (dram ${top} daos ${daos} flare ${flare} MB/node) ==="
     echo "args: ${args} --nodes ${GROUP_N} --node <rank>"
   } > "${log}"
   local start=$SECONDS
@@ -239,12 +254,12 @@ EOF
     echo "--- tier files ---"
     for d in ${tdir_daos} ${tdir_flare}; do ls -l "${d}" 2>&1; rm -rf "${d}"; done
     case "${rc}" in
-      0)   echo "RESULT ${wl}x${GROUP_N}@${comp}: OK" ;;
-      124) echo "RESULT ${wl}x${GROUP_N}@${comp}: TIMEOUT (a rank exceeded the ${BENCH_CAP}s cap)" ;;
-      *)   echo "RESULT ${wl}x${GROUP_N}@${comp}: FAILED rc=${rc}" ;;
+      0)   echo "RESULT ${wl}x${GROUP_N}@${slug}: OK" ;;
+      124) echo "RESULT ${wl}x${GROUP_N}@${slug}: TIMEOUT (a rank exceeded the ${BENCH_CAP}s cap)" ;;
+      *)   echo "RESULT ${wl}x${GROUP_N}@${slug}: FAILED rc=${rc}" ;;
     esac
   } >> "${log}"
-  echo "CELL DONE ${wl}@${comp} rc=${rc} ($((SECONDS - start))s)"
+  echo "CELL DONE ${wl}@${slug} rc=${rc} ($((SECONDS - start))s)"
 }
 
 # ---- dispatch: keep every group busy ---------------------------------------
