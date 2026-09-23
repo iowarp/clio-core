@@ -113,7 +113,35 @@ surrounding comment already claims and does not yet have.
 - Record the refused generation and the blob name in the `kFatalGetFailed`
   arguments (the generation is already in `bt->fetch_gen_sub`).
 
-### 3. Do not refuse a generation that is merely late (the real fix)
+### 3. Find out why the get actually fails (CORRECTED -- see below)
+
+**My first version of this section was wrong and is retracted.** I took the
+explanation from the comment above the branch ("it is the generational path
+that makes this reachable in practice") and applied it to every symptom
+without checking. Two things falsify that for weights:
+
+- **weights fetches at generation 0.** `CoFetch(0, ...)` in both its seed and
+  gather loops, and the runtime's generational wait is guarded by
+  `generation_ != 0`, so weights never enters that path at all. Only lbann
+  passes real generations.
+- **The runtime already waits.** `GetBlob` parks the reader until the named
+  generation arrives, bounded at 10 seconds, and only then returns 1. So a
+  refusal is not a lost race of microseconds that a retry would paper over;
+  it is a writer that did not publish in ten seconds, or a different failure
+  entirely.
+
+So the mechanism in "The mechanism" above stands -- a failed get let the
+kernel run on, and that is what turned one fault into three symptoms -- but
+the CAUSE of the failing get is still open, and is probably not the same for
+weights (generation 0, some other GetBlob error) as for lbann (real
+generations, possibly the 10 s timeout).
+
+Step 1 is also the diagnostic for this: the trap it adds prints the page
+number and the generation of the fetch that was refused, which is exactly
+the information the old silent path threw away. The next run of the failing
+cells will name them.
+
+### 3b. Then, if it is a late generation (the original idea, still plausible for lbann)
 
 A get naming a generation the writer has not published yet is a **transient**
 condition, not an error: the writer is a peer block that will publish. The

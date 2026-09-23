@@ -561,8 +561,14 @@ class DeviceVector {
                "it in a BeginFetch first.\n",
                SetOf(pn), (unsigned long long) pn, have, fetching, free_n,
                h_->set_size_, Tasks()->fetch_busy, Tasks()->fetch_n);
+        // INTO THE MIRROR TOO. The printf above dies with the process when
+        // the trap fires -- the driver discards the GPU buffer -- and the
+        // mirror's three spare argument slots were going unused, so a code-2
+        // trap reached the host saying only "page P of set S is missing",
+        // which cannot distinguish an eviction from a fetch that never ran.
+        FatalNote(kFatalNotResident, pn, SetOf(pn), h_->set_size_, have,
+                  fetching, free_n);
       }
-      FatalNote(kFatalNotResident, pn, SetOf(pn), h_->set_size_);
       __trap();
     }
     // RESIDENT IS NOT VALID. The frame may hold a different slice of this
@@ -852,12 +858,22 @@ class DeviceVector {
     }
     if (__syncthreads_or(p == nullptr ? 1 : 0)) {
       if (threadIdx.x == 0) {
-        printf("[gpu_vector] FATAL set=%u page=%llu not resident. "
+        Page *tbl = SetPages(SetOf(pn));
+        clio::run::u32 have = 0, fetching = 0, free_n = 0;
+        for (clio::run::u32 i = 0; i < h_->set_size_; ++i) {
+          if (tbl[i].page_num == pn) ++have;
+          if (tbl[i].fetching) ++fetching;
+          if (tbl[i].page_num == kNoPage) ++free_n;
+        }
+        printf("[gpu_vector] FATAL set=%u page=%llu not resident "
+               "(frames holding it=%u fetching=%u free=%u of %u). "
                "CoHoldPage does not fetch -- name it in a CoBeginFetch "
                "first.\n",
-               SetOf(pn), (unsigned long long) pn);
+               SetOf(pn), (unsigned long long) pn, have, fetching, free_n,
+               h_->set_size_);
+        FatalNote(kFatalNotResident, pn, SetOf(pn), h_->set_size_, have,
+                  fetching, free_n);
       }
-      FatalNote(kFatalNotResident, pn, SetOf(pn), h_->set_size_);
       __trap();
     }
     // RESIDENT IS NOT VALID: the frame may hold a different slice of the
@@ -1044,11 +1060,21 @@ class DeviceVector {
     }
     if (__syncthreads_or(p == nullptr ? 1 : 0)) {
       if (threadIdx.x == 0) {
-        printf("[gpu_vector] FATAL page=%llu not resident (macro form). "
+        Page *tbl = SetPages(SetOf(pn));
+        clio::run::u32 have = 0, fetching = 0, free_n = 0;
+        for (clio::run::u32 i = 0; i < h_->set_size_; ++i) {
+          if (tbl[i].page_num == pn) ++have;
+          if (tbl[i].fetching) ++fetching;
+          if (tbl[i].page_num == kNoPage) ++free_n;
+        }
+        printf("[gpu_vector] FATAL page=%llu not resident (macro form) "
+               "(frames holding it=%u fetching=%u free=%u of %u). "
                "MHoldPage does not fetch -- name it in an MFetch first.\n",
-               (unsigned long long) pn);
+               (unsigned long long) pn, have, fetching, free_n,
+               h_->set_size_);
+        FatalNote(kFatalNotResident, pn, SetOf(pn), h_->set_size_, have,
+                  fetching, free_n);
       }
-      FatalNote(kFatalNotResident, pn, SetOf(pn), h_->set_size_);
       __trap();
     }
     // Resident is not valid: a fetch transfers only the range it was given.
@@ -1957,21 +1983,47 @@ class DeviceVector {
       if (h_->stat_get_errors_ != nullptr) {
         atomicAdd(h_->stat_get_errors_, 1ull);
       }
+      // EMPTYING THE FRAME WAS NOT ENOUGH, AND THE RETURN BELOW WAS WRONG.
+      //
+      // Leaving valid=[0,0) relies on a later Covers() to catch the frame,
+      // and Covers is only consulted on a READ hold. A write hold resolves
+      // the same frame by page_num, skips the check and writes into bytes
+      // that were never fetched -- measured as the weights checksum landing
+      // 2%-65% off with no error anywhere. And returning normally let the
+      // kernel run on past a fetch that did not happen, so when it did trap
+      // it trapped somewhere unrelated (kFatalNotResident, or Covers three
+      // holds later), which is why the same one bug produced three
+      // different-looking symptoms.
+      //
+      // So: take the page's IDENTITY away, not just its contents. A frame
+      // whose page_num is kNoPage cannot be resolved by Find() at all, so
+      // neither hold can reach it. Then stop here, at the fetch that failed,
+      // which is the earliest point that can name what is missing.
+      const clio::run::u64 first_pn =
+          bt->fetch_n ? h_->pages_[bt->fetch_slot[0]].page_num : 0ull;
       for (clio::run::u32 i = 0; i < bt->fetch_n; ++i) {
         Page *p = &h_->pages_[bt->fetch_slot[i]];
-        LockSet(SetOf(p->page_num));
+        const clio::run::u64 set = SetOf(p->page_num);
+        LockSet(set);
         p->valid_lo = 0u;
         p->valid_hi = 0u;
+        p->page_num = kNoPage;     // no identity: Find() cannot return it
         __threadfence();
         atomicSub(&p->fetching, 1u);
-        UnlockSet(SetOf(p->page_num));
+        UnlockSet(set);
       }
-      FatalNote(kFatalGetFailed,
-                bt->fetch_n ? h_->pages_[bt->fetch_slot[0]].page_num : 0ull,
+      FatalNote(kFatalGetFailed, first_pn,
                 static_cast<clio::run::u64>(bt->fetch_n),
                 bt->fetch_gen_sub);
       bt->fetch_n = 0;
       bt->fetch_busy = 0u;
+      printf("[gpu_vector] FATAL table=%u: a fetch of %u page(s) from page "
+             "%llu at generation %llu was REFUSED by the runtime. The pages "
+             "were not transferred, so the frames have been emptied and the "
+             "kernel is stopped here rather than reading them.\n",
+             Table(), (unsigned)bt->fetch_n, (unsigned long long)first_pn,
+             (unsigned long long)bt->fetch_gen_sub);
+      __trap();
       return;
     }
     for (clio::run::u32 i = 0; i < bt->fetch_n; ++i) {
