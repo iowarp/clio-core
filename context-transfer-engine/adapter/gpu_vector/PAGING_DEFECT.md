@@ -73,6 +73,12 @@ Two things follow from that code, and they are the defect:
    therefore not independent failures; they are the same event reported from
    whichever site won the race.
 
+**It is not Lustre-specific.** The clean E5 pass, on a DRAM+DAOS composition
+with no Lustre at all, reproduces it: weights checksums OK at 16, 32 and 128
+frames of cache and MISMATCHes at 64. Non-monotone in cache size, which is
+what a race looks like and not what a capacity threshold looks like. Any
+file tier will do; the filesystem behind it is irrelevant.
+
 **Why a file tier and cache pressure are both needed.** A generational get is
 only issued when a page must be re-read; with a cache that holds the working
 set, pages are never re-fetched and the path is unreachable. kmeans at one

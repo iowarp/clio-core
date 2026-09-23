@@ -273,7 +273,7 @@ defect evidence.
 |---|---|---|---|---|
 | kmeans | 3.28 s | 3.21 s | 3.52 s | pending |
 | grayscott | 3.02 s | 2.87 s | 2.64 s | 2.34 s (4102 faults) |
-| weights | 3.49 s | 3.18 s | pending | pending |
+| weights | 3.49 s | 3.18 s | 4.64 s CHECKSUM MISMATCH | 2.94 s |
 | lbann | pending | pending | pending | pending |
 
 The two shapes are the result. grayscott improves monotonically and gains
@@ -283,6 +283,11 @@ SLOWER at 4 GB, because it streams one page per block and never revisits, so
 extra frames only add eviction and write-back work. For a streaming workload
 the cache can be cut to an eighth at no cost at all; for a stencil the same
 cut costs 23%. That is the memory-reduction claim, workload-resolved.
+
+weights mismatches at 4 GB while passing at 1, 2 and 8 GB, ON A
+COMPOSITION WITH NO LUSTRE (DRAM + DAOS only). So the paging defect is
+not Lustre-specific and not a capacity threshold; it is non-monotone in
+cache size, which is the signature of a race. See PAGING_DEFECT.md.
 
 FIRST PASS (balanced composition), kept as defect evidence only:
 
