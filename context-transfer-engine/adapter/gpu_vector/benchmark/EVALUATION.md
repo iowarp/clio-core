@@ -254,12 +254,23 @@ covers all four workloads is therefore 16 / 32 / 64 / 128 slots, which is
 1 / 2 / 4 / 8 GB against the 8 GB shard: an eighth of the deck up to
 resident.
 
-| workload | 64 MB | 128 MB | 256 MB | 512 MB | 1 GB | 2 GB | 4 GB | 8 GB |
-|---|---|---|---|---|---|---|---|---|
-| kmeans | pending | pending | pending | pending | pending | pending | pending | pending |
-| grayscott | refused (below the 10-frame floor) | refused | refused | refused | pending | pending | pending | pending |
-| weights | pending | pending | pending | pending | pending | pending | pending | pending |
-| lbann | n/a | n/a | n/a | n/a | pending | pending | pending | pending |
+FIRST PASS (balanced composition): 11 of 20 cells returned a number, and
+the curve they make is not usable. The balanced mix carries a Lustre share,
+so the cells inherit the 3.2x spread measured above: kmeans came out
+4.39 / 3.92 / 4.16 / 5.77 / 5.51 s across 64 MB to 1 GB of cache and lbann
+23.0 / 33.3 / 24.4 s across 128 MB to 1 GB. Both are non-monotone, which is
+noise rather than a memory-reduction result. Of the nine that returned
+nothing, four are grayscott below its 10-frame floor (my sweep's error) and
+FIVE ARE THE PAGING DEFECT: weights at 2, 4 and 8 frames and lbann at 64 and
+512. The pass is kept for that evidence, not for its timings; the curve is
+rerun on dram75, which spills to DAOS and is stable.
+
+| workload | 64 MB | 128 MB | 256 MB | 512 MB | 1 GB |
+|---|---|---|---|---|---|
+| kmeans | 4.39 s | 3.92 s | 4.16 s | 5.77 s | 5.51 s |
+| grayscott | refused (10-frame floor) | refused | refused | refused | 32 s |
+| weights | 7.72-8.62 s | DEVICE FATAL 2 | DEVICE FATAL 2 | checksum MISMATCH | ok |
+| lbann | DEVICE FATAL 2 | 23.0-24.6 s | 33.3-34.7 s | DEVICE FATAL 2 | 24.4-24.9 s |
 
 ## Plan coverage so far
 
