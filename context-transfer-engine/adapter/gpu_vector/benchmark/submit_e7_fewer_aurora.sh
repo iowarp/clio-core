@@ -16,6 +16,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 for n in ${RUNGS}; do
   id=""
+  # TRUNCATE FIRST. PBS appends to an existing -o file, so a re-run of a rung
+  # leaves the previous run's results above its own and `grep RESULT` returns
+  # both. That is not a cosmetic problem: reading a stale failure as the new
+  # one sends the next hour in the wrong direction, which it did once already.
+  : > "${ROOT}/build-spike/pbs/e7_fewer_${n}.log"
   for i in $(seq 1 360); do
     out=$(qsub -N "e7_${n}" -l select="${n}" \
           -o "${ROOT}/build-spike/pbs/e7_fewer_${n}.log" \
