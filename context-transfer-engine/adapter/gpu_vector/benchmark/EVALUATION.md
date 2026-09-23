@@ -159,6 +159,7 @@ tier is the right one.
 |---|---|---|---|---|---|
 | kmeans, DRAM-only | 12.00-12.02 s (0.67 GB/s), 130401-130475 faults | 3.26-3.42 s (2.3-2.5 GB/s), 32059-32070 faults | 2.34-2.50 s (3.2-3.4 GB/s), 7442-7483 faults (the E4 cell measured 2.02-2.18 s) | 2.56 s (3.12 GB/s), 1209-1236 faults | 0.50 s (15.97 GB/s), ZERO faults -- see the confound below |
 | kmeans, DRAM-only, CACHE PINNED at 512 MB | 11.42 s, 123216-123253 faults | 3.19-3.21 s, 31028-31077 faults | 2.62 s, 7441-7490 faults | 2.53 s, 1213-1216 faults | n/a (a 16 MB page cannot make a 512 MB cache at 64 blocks) |
+| kmeans, Lustre-heavy, CACHE PINNED at 512 MB | 22.64 s (0.35 GB/s) | 4.94 s (1.62 GB/s) | 3.33 s (2.40 GB/s) | 3.33 s (2.40 GB/s) | n/a |
 | kmeans, Lustre-heavy | 30.0 s (0.27 GB/s), 130424-130471 faults | ABORTED at the 600 s cap on all four ranks: the kernel took DEVICE FATAL 7 ("fetch returned an error; its pages were left EMPTY -- a generational get names a generation the writer has not published"), then a GPU write to address 0 and a driver abort. Preceded by TaskProgress replica warnings, i.e. the same overloaded-network conditions as the zero-fill defect above | 4.78 s (1.67 GB/s), 7443-7470 faults, Flare 7.5 GB and DAOS 2.1 GB per node -- but the E4 cell at the SAME page and composition measured 23.0 s (0.35 GB/s). See the variance note below | 3.47-3.92 s (2.0-2.3 GB/s), 1201-1231 faults | 0.49 s (16.3 GB/s): resident, the cache confound again, and identical to the DRAM-only cell because no tier is touched |
 
 **THE PINNED-CACHE ROW IS THE ONE TO READ FOR PAGE SIZE.** With the cache
@@ -192,6 +193,23 @@ inversely (512 MB at 64 blocks: 128 / 32 / 8 / 2 slots for 64 KB / 256 KB /
 1 MB / 4 MB; 16 MB cannot reach 512 MB at 64 blocks and needs fewer
 blocks). The cells above stand as a cache-size sweep, which is E5's
 question, and E2 is rerun with the cache pinned.
+
+**THE PINNED PAIR IS THE E2 RESULT.** With the cache held at 512 MB in both
+arms, the Lustre penalty against DRAM-only is:
+
+| page | DRAM-only | Lustre-heavy | penalty |
+|---|---|---|---|
+| 64 KB | 11.42 s | 22.64 s | 1.98x |
+| 256 KB | 3.19 s | 4.94 s | 1.55x |
+| 1 MB | 2.62 s | 3.33 s | 1.27x |
+| 4 MB | 2.53 s | 3.33 s | 1.32x |
+
+The penalty falls from 2.0x to about 1.3x as the page grows and then flattens,
+which is the same mechanism gmx showed in E4 and is measured here without the
+cache confound. Note the Lustre column is one draw each from a distribution
+with a 3.2x spread (below), so the 1 MB and 4 MB points being equal is within
+noise; the 64 KB-to-1 MB trend is far larger than the spread and is the
+result.
 
 **LUSTRE SPREAD, MEASURED.** Four repeats of the same cell (kmeans,
 Lustre-heavy, 1 MB page, cache pinned at 512 MB) in one allocation:
