@@ -237,6 +237,30 @@ the cap for every cell. The tier budget has to grow with it (a composition
 needs about 1.25x the data, and a persisting workload needs its persistent
 share alone to cover the data), which is 80 GB/node against 512 GB of DDR5.
 
+## E5: memory reduction at 4 nodes
+
+How far the frame cache can be cut before the run stops keeping up. Fixed
+deck (8 GB/node), fixed page (1 MB), fixed composition (balanced, so there
+is real storage underneath); only the cache varies. Cache bytes are
+`slots x blocks x page` for kmeans, grayscott and weights (64 blocks) and
+`cap x page` for lbann.
+
+EACH EDITION HAS A FLOOR AND grayscott's IS 10 FRAMES. Its stencil holds
+ten planes at once -- z-1, z and z+1 of both u and v, plus both outputs --
+so a smaller cache could evict a plane that is still being read, and the
+edition refuses rather than corrupting the step. The first pass swept 1-16
+slots and every grayscott cell below 10 refused, correctly. The sweep that
+covers all four workloads is therefore 16 / 32 / 64 / 128 slots, which is
+1 / 2 / 4 / 8 GB against the 8 GB shard: an eighth of the deck up to
+resident.
+
+| workload | 64 MB | 128 MB | 256 MB | 512 MB | 1 GB | 2 GB | 4 GB | 8 GB |
+|---|---|---|---|---|---|---|---|---|
+| kmeans | pending | pending | pending | pending | pending | pending | pending | pending |
+| grayscott | refused (below the 10-frame floor) | refused | refused | refused | pending | pending | pending | pending |
+| weights | pending | pending | pending | pending | pending | pending | pending | pending |
+| lbann | n/a | n/a | n/a | n/a | pending | pending | pending | pending |
+
 ## Plan coverage so far
 
 | study | status |
