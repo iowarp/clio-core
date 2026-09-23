@@ -883,7 +883,13 @@ int main(int argc, char **argv) {
   // loss trajectory and its paging counters, which is what the tiering and
   // scaling studies measure. Same switch, same meaning, as the baselines'.
   bool no_ref = false;
-  bool ckpt = true;
+  // OPT-IN, NOT OPT-OUT. The end-of-run checkpoint arrived enabled by
+  // default, which silently changes what an already-queued job measures:
+  // the E1 scaling rungs were submitted against binaries without it and
+  // would have executed binaries with it, so their numbers would have
+  // carried a final write the 256-node rung did not, and the ladder would
+  // not have been self-consistent. --ckpt-final asks for it.
+  bool ckpt = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> u64 {
@@ -901,7 +907,8 @@ int main(int argc, char **argv) {
     else if (a == "--out") O = next();
     else if (a == "--batch") B = next();
     else if (a == "--steps") steps = next();
-    else if (a == "--no-ckpt") ckpt = false;
+    else if (a == "--no-ckpt") ckpt = false;   // kept: now a no-op
+    else if (a == "--ckpt-final") ckpt = true;
     else if (a == "--lr" && i + 1 < argc) lr = std::strtof(argv[++i], nullptr);
     else if (a == "--help") {
       std::printf("usage: %s [--blocks N] [--threads N] [--cap PAGES] "

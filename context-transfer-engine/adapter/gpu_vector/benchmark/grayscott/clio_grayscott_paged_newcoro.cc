@@ -662,7 +662,13 @@ int main(int argc, char **argv) {
   // otherwise sits in VRAM holding cold history that nobody reads again.
   u64 ckpt_every = 0;
   bool ckpt_drain = false;
-  bool ckpt_final = true;   // --no-ckpt: skip the end-of-run checkpoint
+  // OPT-IN, NOT OPT-OUT. The end-of-run checkpoint arrived enabled by
+  // default, which silently changes what an already-queued job measures:
+  // the E1 scaling rungs were submitted against binaries without it and
+  // would have executed binaries with it, so their numbers would have
+  // carried a final write the 256-node rung did not, and the ladder would
+  // not have been self-consistent. --ckpt-final asks for it.
+  bool ckpt_final = false;  // --ckpt-final: take the end-of-run checkpoint
   // --organizer-hint: tell the CTE data organizer which step is starting
   // (ReorganizeHint(s+1)), so a phase-aware organizer knows which region pair
   // is about to be overwritten. Opaque to the core; see GrayScottDataOrganizer.
@@ -706,7 +712,8 @@ int main(int argc, char **argv) {
     else if (a == "--ram-mb") ram_mb = next();
     else if (a == "--ckpt-every") ckpt_every = next();
     else if (a == "--ckpt-drain") ckpt_drain = true;
-    else if (a == "--no-ckpt") ckpt_final = false;
+    else if (a == "--no-ckpt") ckpt_final = false;   // kept: now a no-op
+    else if (a == "--ckpt-final") ckpt_final = true;
     else if (a == "--organizer-hint") organizer_hint = true;
     else if (a == "--ckpt-cold") ckpt_cold = nextf();
     else if (a == "--Du") Du = nextf();

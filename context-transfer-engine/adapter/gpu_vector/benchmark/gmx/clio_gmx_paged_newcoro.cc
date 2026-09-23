@@ -628,7 +628,13 @@ int main(int argc, char **argv) {
   // for the two bit-equality gates. CONSERVATION stays enforced -- it is
   // self-contained (mesh total == input charge, exact).
   bool no_dense = false;
-  bool ckpt = true;
+  // OPT-IN, NOT OPT-OUT. The end-of-run checkpoint arrived enabled by
+  // default, which silently changes what an already-queued job measures:
+  // the E1 scaling rungs were submitted against binaries without it and
+  // would have executed binaries with it, so their numbers would have
+  // carried a final write the 256-node rung did not, and the ladder would
+  // not have been self-consistent. --ckpt-final asks for it.
+  bool ckpt = false;
   // Optional file tier (full CTE stack: hbm-resident cache + RAM + file).
   u64 nvme_mb = 0;
   std::string nvme_path = "/tmp/gv_gmx_tier.dat";
@@ -646,7 +652,8 @@ int main(int argc, char **argv) {
     else if (a == "--atoms") atoms = next();
     else if (a == "--repeat") repeat = static_cast<int>(next());
     else if (a == "--no-dense") no_dense = true;
-    else if (a == "--no-ckpt") ckpt = false;
+    else if (a == "--no-ckpt") ckpt = false;   // kept: now a no-op
+    else if (a == "--ckpt-final") ckpt = true;
     else if (a == "--nodes") nodes = static_cast<u32>(next());
     else if (a == "--node") node = static_cast<u32>(next());
     else if (a == "--nvme-mb") nvme_mb = next();

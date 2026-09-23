@@ -81,7 +81,13 @@ struct Args {
   u32 maxneigh = 96;       // Verlet-list capacity per atom slot
   u32 rowchunk = 4;        // rows per block in the force pass (hold reuse)
   u64 ckpt = 0;            // checkpoint every N steps (0 = never)
-  bool no_ckpt = false;    // skip the end-of-run vector.Copy checkpoint
+  // OPT-IN, NOT OPT-OUT. The end-of-run checkpoint arrived enabled by
+  // default, which silently changes what an already-queued job measures:
+  // the E1 scaling rungs were submitted against binaries without it and
+  // would have executed binaries with it, so their numbers would have
+  // carried a final write the 256-node rung did not, and the ladder would
+  // not have been self-consistent. --ckpt-final asks for it.
+  bool no_ckpt = true;     // --ckpt-final takes the end-of-run checkpoint
   u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
   u32 nlslots = 0;         // list cache frames per block; 0 = NlSlots() default
   u64 vram_mb = 0;         // cache budget across ALL vectors; 0 = size for residency
@@ -3856,6 +3862,7 @@ int main(int argc, char **argv) {
     else if (want("--node")) a.node = static_cast<u32>(atoi(argv[++i]));
     else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
     else if (std::strcmp(argv[i], "--no-ckpt") == 0) a.no_ckpt = true;
+    else if (std::strcmp(argv[i], "--ckpt-final") == 0) a.no_ckpt = false;
     else if (std::strcmp(argv[i], "--readprobe") == 0) a.readprobe = 1;
     else {
       std::fprintf(stderr, "unknown arg %s\n", argv[i]);
