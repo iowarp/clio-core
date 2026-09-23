@@ -9,6 +9,9 @@
 # pbs_e4_batch_aurora.sh run NODES/4 cells at a time inside it.
 #
 #   NODES      allocation size, a multiple of 4 (default 16 -> 4 at a time)
+#   DATA_MB, TIER_BUDGET_MB, HBM_MB  passed through to the job; E3 needs a
+#              smaller deck than the default because a checkpoint is a
+#              SECOND full copy of the vector and has to fit the tier too
 #   BENCH_CAP  per-rank cap in seconds (default 600)
 set -u
 TAG=${1:?tag}; shift
@@ -21,7 +24,7 @@ id=""
 for i in $(seq 1 360); do
   out=$(qsub -N "e4b_${TAG}" -l select="${NODES}" \
         -o "$ROOT/build-spike/pbs/e4batch_${TAG}.log" \
-        -v "BENCH_CELLS=${CELLS},ROOT=${ROOT},BENCH_CAP=${BENCH_CAP:-600}" \
+        -v "BENCH_CELLS=${CELLS},ROOT=${ROOT},BENCH_CAP=${BENCH_CAP:-600},DATA_MB=${DATA_MB:-32768},TIER_BUDGET_MB=${TIER_BUDGET_MB:-10240},HBM_MB=${HBM_MB:-4096}" \
         "$HERE/pbs_e4_batch_aurora.sh" 2>&1)
   case "$out" in
     *"limit of jobs"*) sleep 20 ;;
