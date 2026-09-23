@@ -121,6 +121,18 @@ networking:
   port: 9460
   hostfile: "${rundir}/hostfile"
 
+# SWIM OFF. Failure detection is orthogonal to what this study measures and
+# is actively harmful here. Its suspicion timeout is 60 s and expiry runs
+# TriggerRecovery, which redistributes a live node's containers. At 256
+# nodes the 256-way compose starves probe replies long enough to cross that
+# threshold, so nodes that are merely busy get declared dead, their
+# containers are redistributed, routing then answers Dne (container does not
+# exist) and the cluster never converges -- the 256 rung sat for 900 s
+# without completing one iteration. On a healthy batch allocation no node is
+# going to fail mid-run; if one does, the job dies anyway.
+swim:
+  enabled: false
+
 runtime:
   num_threads: 8
   queue_depth: 8192
