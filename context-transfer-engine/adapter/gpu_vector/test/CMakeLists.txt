@@ -754,7 +754,7 @@ option(CLIO_CORE_ENABLE_DOCKER_TESTS
 
 if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
     get_filename_component(_gv_build_name "${CMAKE_BINARY_DIR}" NAME)
-    foreach(_wl kmeans weights gmx grayscott lbann lammps_md)
+    foreach(_wl kmeans weights gmx grayscott lbann lammps_md gnn)
         add_test(NAME cte_gv_distributed_${_wl}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
         )
@@ -804,7 +804,7 @@ endif()
 #   ctest -L distributed         # everything
 # ---------------------------------------------------------------------------
 if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
-    foreach(_wl kmeans weights gmx grayscott lbann)
+    foreach(_wl kmeans weights gmx grayscott lbann gnn)
         add_test(NAME cte_gv_distributed4_${_wl}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
         )
@@ -843,6 +843,8 @@ set(CLIO_GV_SYCL_BUILD_DIR "" CACHE STRING
 
 if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS
    AND CLIO_GV_SYCL_BUILD_DIR)
+    # gnn is absent from every SYCL list: it has no sycl/ launcher yet, so
+    # there is no SYCL edition to gate.
     foreach(_wl kmeans weights gmx grayscott lbann lammps_md)
         add_test(NAME cte_gv_distributed_sycl_${_wl}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
@@ -967,7 +969,7 @@ endif()
 #   ctest -L gv_dist_ooc_sycl    # the SYCL editions of the same
 # ---------------------------------------------------------------------------
 if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS)
-    foreach(_wl kmeans weights gmx grayscott lbann lammps_md)
+    foreach(_wl kmeans weights gmx grayscott lbann lammps_md gnn)
         add_test(NAME cte_gv_ooc_${_wl}
             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
         )
@@ -1065,7 +1067,7 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS AND CLIO_GV_COROC)
             "CLIO_GV_COROC is set but ${_gv_coroc} does not exist -- run "
             "tools/coroc/build.sh. The newcoro docker gates are NOT registered.")
     else()
-        foreach(_wl kmeans weights gmx grayscott lbann lammps_md)
+        foreach(_wl kmeans weights gmx grayscott lbann lammps_md gnn)
             # Resident, CUDA.
             add_test(NAME cte_gv_distributed_newcoro_${_wl}
                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
@@ -1100,11 +1102,11 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS AND CLIO_GV_COROC)
                 ENVIRONMENT "BUILD_DIR=${_gv_build_name};GVW_OOC=1;GVW_VARIANT=newcoro;COROC=${_gv_coroc}")
         endforeach()
 
-        # THE SAME SIX AT 4 NODES. Resident only: the 4-node decks already
+        # THE SAME SEVEN AT 4 NODES. Resident only: the 4-node decks already
         # quarter the per-node working set, and stacking GVW_OOC on top of
         # that is a different pressure question the 2-node OOC set answers
         # better with a deck calibrated for it.
-        foreach(_wl kmeans weights gmx grayscott lbann lammps_md)
+        foreach(_wl kmeans weights gmx grayscott lbann lammps_md gnn)
             add_test(NAME cte_gv_distributed4_newcoro_${_wl}
                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/distributed_workloads/run_workloads_distributed.sh ${_wl}
             )

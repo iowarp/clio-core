@@ -3,6 +3,7 @@
 #
 #   ./run_workloads_distributed.sh kmeans
 #   ./run_workloads_distributed.sh weights
+#   ./run_workloads_distributed.sh gnn
 #   ./run_workloads_distributed.sh all
 #
 # Requires: nvidia container toolkit; the repo built into build/ (or set
@@ -143,6 +144,22 @@ deck() {
       # harness does not build.)
       ARGS="--md --lattice 28 --steps 20"
       KEY='E0=(-?[0-9.]+)'; TOL=1e-6 ;;
+    gnn)
+      BENCH=clio_gnn_paged_bench
+      # 2-layer GraphSAGE: 128 pages per region split by ownership, every
+      # vertex's neighbours drawn from the whole graph, so at N nodes about
+      # (N-1)/N of the edges read a peer's page -- features in layer 1, the
+      # peer's freshly written embeddings in layer 2.
+      ARGS="--vertices 8192 --blocks 8 --slots 64"
+      # No atomics, fixed summation order: bit-identical at any node count,
+      # and the digest is an integer sum, so the reduction is exact too.
+      KEY='logit_digest=([0-9]+)'; TOL=exact
+      # 0 on one node. Nonzero proves the decomposition crosses nodes, which
+      # is what makes the control below mean anything.
+      WITNESS='remote_edges=([0-9]+)'
+      # Skip peer-owned neighbours (still counted in the mean's divisor). The
+      # digest must move, or the cross-node reads were not load-bearing.
+      CONTROL_ENV='GNN_NO_REMOTE=1' ;;
     reput_stale)
       # Self-checking CTE probe: no single-node reference, no checksum math.
       # Runs both containers, each exits nonzero on a stale serve.
@@ -296,6 +313,9 @@ ooc_deck() {
     # from the PAGE SIZE instead: 32KB pages double the page count to 64
     # against 28 slots. --rowchunk 1 because a 6-row held span needs 48KB.
     lammps_md) ARGS="--md --lattice 28 --steps 10 --blocks 8 --slots 28 --page-kb 32 --rowchunk 1" ;; # 3313 evicts, E0 = documented -592121.595111
+    # 24 slots x 8 blocks is fewer frames than the 256 pages each node
+    # touches (its own X and H, plus nearly every peer page as a neighbour).
+    gnn)       ARGS="--vertices 8192 --blocks 8 --slots 24" ;;                     # 185 evicts, same digest as resident
   esac
 }
 
@@ -444,12 +464,12 @@ FAILED=""
 TARGET="${1:-all}"
 if [ "$TARGET" = all ]; then
   rc=0
-  for wl in kmeans weights gmx grayscott lbann lammps_md; do
+  for wl in kmeans weights gmx grayscott lbann lammps_md gnn; do
     run_one "$wl" || { rc=1; FAILED="$FAILED $wl"; }
   done
   echo
   echo "=== summary"
-  echo "  validated distributed: kmeans weights gmx grayscott lbann lammps_md"
+  echo "  validated distributed: kmeans weights gmx grayscott lbann lammps_md gnn"
   [ -n "$UNSUPPORTED" ] && echo "  NOT YET SUPPORTED:    $UNSUPPORTED"
   [ -n "$FAILED" ] && echo "  FAILING:              $FAILED"
   exit $rc

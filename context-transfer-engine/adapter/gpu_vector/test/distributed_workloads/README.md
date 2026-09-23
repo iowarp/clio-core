@@ -4,7 +4,7 @@ Runs a paged workload benchmark across a multi-container Clio cluster and
 checks that it still computes the right answer.
 
 ```
-BUILD_DIR=build-gv ./run_workloads_distributed.sh {kmeans|weights|gmx|grayscott|lbann|lammps_md|all}
+BUILD_DIR=build-gv ./run_workloads_distributed.sh {kmeans|weights|gmx|grayscott|lbann|lammps_md|gnn|all}
 
 GVW_NODES=4                     # 4 containers instead of 2
 GVW_VARIANT=sycl                # the SYCL editions (needs their own build tree)
@@ -145,8 +145,47 @@ failure mode they actually have is a plausible, wrong number.
 | grayscott | rel 0 | 3D stencil, the only one exchanging a halo every step |
 | lbann     | max abs 0 | elementwise vs the dense reference, not a digest |
 | lammps_md | rel 0 | `E0 = -592121.595111`, the value `distributed_md_bench/` documents |
+| gnn       | bit-exact | `logit_digest` is an integer sum over logit bit patterns; see below |
 
-All six also pass at 4 nodes, and all six pass in their SYCL edition.
+All six also pass at 4 nodes, and all six pass in their SYCL edition. gnn
+passes at 2 and 4 nodes and out of core, in both CUDA editions. It has no SYCL
+edition yet (no `sycl/` launcher), so it is absent from every SYCL gate list.
+
+### gnn: a 2-layer GraphSAGE forward, sharded by page ownership
+
+`benchmark/gnn/clio_gnn_paged_bench` is the multi-node edition of the GNN
+tooling. The burst bench and `gnn_aggregate` read a prepared dataset from
+local disk and own the whole matrix, so they are single-node only. This bench
+synthesises features and the graph from a hash, so every node and the
+single-node reference agree on the input without a dataset in the containers.
+
+Each node owns a contiguous run of pages in two regions, X (features) and H
+(layer-1 embeddings). Neighbours are drawn from the whole graph, so about
+(N-1)/N of the edges read a peer's page. Layer 1 reads peer X pages at
+generation 1 (published by the seed), and layer 2 reads peer H pages at
+generation 2 (published by layer 1). Own pages are fetched at generation 0,
+for the reason grayscott documents: a page this node wrote and never
+re-fetched stays at generation 0, so demanding one of it stalls.
+
+Nothing uses atomics, and each output element is summed in a fixed order. So
+the logits are BIT-IDENTICAL at any node count, block count and lowering, and
+the gate is an equality test on an integer digest. Measured on the
+`--vertices 8192` deck (RTX 4070 Laptop):
+
+| run | digest | witness `remote_edges` | control `GNN_NO_REMOTE=1` |
+|---|---|---|---|
+| 1 node (reference) | 10160982883994938968 | 0 | -- |
+| 2 nodes, co_await and newcoro | 10160982883994938968 | 22463 | 13839825605177781443 |
+| 4 nodes, co_await and newcoro | 10160982883994938968 | 33766 | 16573396213974516880 |
+| 2 nodes OOC (`--slots 24`), both | 10160982883994938968 | 22463 | skipped (OOC) |
+
+OOC evictions were 184 to 202 single-node and 106 to 109 distributed,
+depending on the edition. The negative control drops peer-owned neighbours
+but keeps them in the mean's divisor, so it computes a different function by
+design and has to move. Independently of node count, every node also checks
+its own logits against a host float reference (`ref_err`, about 2e-7, gated
+at 1e-4). That catches a run where every node count is equally wrong, which
+the 1-vs-N comparison alone cannot.
 
 ### Which newcoro gates have actually been RUN
 
@@ -155,9 +194,9 @@ Registering a gate is not evidence it passes. These were executed, on an RTX
 
 | label | gates | status |
 |---|---|---|
-| `gv_dist4_newcoro`     | 6 | **all run, all pass** |
-| `gv_dist_newcoro`      | 6 | **all run, all pass** |
-| `gv_dist_ooc_newcoro`  | 6 | **all run, all pass** (lammps_md included -- see the frame-log section) |
+| `gv_dist4_newcoro`     | 7 | **all run, all pass** (gnn added later, run on the same machine) |
+| `gv_dist_newcoro`      | 7 | **all run, all pass** |
+| `gv_dist_ooc_newcoro`  | 7 | **all run, all pass** (lammps_md included -- see the frame-log section) |
 | `gv_dist_newcoro_sycl` | 6 | REGISTERED BUT NEVER RUN -- needs a DPC++ tree |
 | `gv_dist_ooc_newcoro_sycl` | 6 | REGISTERED BUT NEVER RUN -- same |
 
