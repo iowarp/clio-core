@@ -191,6 +191,22 @@ in E4, 2.34-2.50 s here). Before any Lustre-heavy number goes in a
 figure it needs repeats and a spread, not a point.
 
 
+## Scope, as decided 2026-09-23
+
+gnn is OUT for now. It is the only workload with no distributed edition --
+only the older single-node CTE one -- and it would need porting to the paged
+vector, three baseline substrates and the papers100M dataset staged. E6
+(organization) goes with it, since gnn is the workload that study is about.
+
+THE 15-MINUTE CAP GOVERNS THE FOOTPRINT, not the other way round. The plan
+asks for 64 GB/node; the cells above ran at 8 GB/node, which is the
+debugging rung and finishes in 2-60 s. The cap therefore has room: at
+8x the footprint the slowest cell measured here (lbann Lustre-heavy, 63.8 s)
+projects to about 8.5 minutes, so the plan's 64 GB/node is reachable inside
+the cap for every cell. The tier budget has to grow with it (a composition
+needs about 1.25x the data, and a persisting workload needs its persistent
+share alone to cover the data), which is 80 GB/node against 512 GB of DDR5.
+
 ## Plan coverage so far
 
 | study | status |
@@ -203,7 +219,7 @@ figure it needs repeats and a spread, not a point.
 | **OPEN DEFECT (E4 weights on Lustre)** | a file tier at capacity serves paged reads under the wrong page identity, or not at all: reproducible, two runs, 4 nodes. Only weights hits it; kmeans and grayscott pass the same composition. Everything else in this file is unaffected |
 | E4 tiering | partly exercised before this plan at 2 nodes: kmeans, grayscott and weights through HBM -> DAOS, HBM -> Flare, and DRAM -> DAOS -> Flare (AURORA.md). The 4-node sweep is scripted (`submit_e4_aurora.sh` over `pbs_newcoro_aurora_4n_tier.sh`: the plan's five DRAM/DAOS/Lustre compositions of one 10 GB/node budget, 8 GB/node decks, a tier at 0 MB left out of the config) and launches after the queued baselines. First pass covers kmeans, grayscott and weights; lbann and lammps_md need their decks sized to 8 GB/node first, and the Eternia gmx edition has a fixed 128^3 mesh (8 MB), too small to spill, so it needs a mesh-size knob before it can join |
 | E5 memory reduction | not started |
-| E6 organization (gnn) | not started; gnn has only the older single-node CTE edition and needs its OGB datasets staged |
+| E6 organization (gnn) | OUT OF SCOPE for now (see Scope above): gnn has only the older single-node CTE edition and needs its OGB datasets staged |
 
 Order of work in force: every cell at 4 nodes under 5 minutes first, then
 the same cells grown toward 15 minutes, non-Eternia before Eternia.
