@@ -953,6 +953,26 @@ int main(int argc, char **argv) {
                  (unsigned long long)O, nodes);
     return 2;
   }
+  // A CACHE FLOOR, the same guard grayscott and gmx already carry.
+  //
+  // --cap counts frames for the WHOLE GRID, not per block, which is easy to
+  // misread: 64 frames across 64 blocks is ONE frame per block. A block
+  // needs at least one frame to hold the page it is reading and one to
+  // fetch the next into, so below 2 per block the run does not refuse -- it
+  // traps inside the kernel, and the driver abort then kills the process
+  // before the host can read the fatal channel, so it reports rc=134 with
+  // no message at all. Measured: --cap 64 at 64 blocks over a 33 GB model.
+  // Refuse it here, where a sentence can still be printed.
+  if (cap != 0 && cap < 2 * blocks) {
+    std::fprintf(stderr,
+                 "LBANN ERROR: --cap %u < %u frames (2 per block x %u "
+                 "blocks). --cap counts frames for the whole grid, not per "
+                 "block: a block needs one frame to hold its current page "
+                 "and one to fetch the next into. Below that the kernel "
+                 "traps and the driver abort hides the reason.\n",
+                 cap, 2 * blocks, blocks);
+    return 2;
+  }
   // MODEL-PARALLEL BAND SPLIT. A node owns h-rows of W1 and o-rows of W2.
   // a1 and d2 are laid out [feature][batch] (a1[h*B+b], d2[o*B+b]), so a
   // band is a CONTIGUOUS slice and the exchange is a slice gather.
