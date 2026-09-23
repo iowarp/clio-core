@@ -241,6 +241,22 @@ figure it needs repeats and a spread, not a point.
 
 ## Scope, as decided 2026-09-23
 
+weights is OUT. It is a synthetic gather we added as an adversarial case for
+the prefetcher, not one of the plan's workloads (the plan names kmeans,
+grayscott, gmx, lbann, lammps_md and gnn; `weights` appears once, in
+passing). It is also the only workload still hitting the paging defect, so
+chasing its cells costs allocations without moving plan coverage. Its rows
+stay in the tables below as they were measured, marked, and are not pursued
+further.
+
+That makes **E5 complete** for every workload in scope -- kmeans, grayscott
+and lbann at all four cache sizes -- and leaves **E4 complete** for kmeans,
+grayscott, gmx and lbann at all five compositions, with lammps_md's three
+missing cells being a RESULT (a workload that persists cannot use a
+composition whose persistent share is smaller than its data) rather than a
+gap.
+
+
 gnn is OUT for now. It is the only workload with no distributed edition --
 only the older single-node CTE one -- and it would need porting to the paged
 vector, three baseline substrates and the papers100M dataset staged. E6
