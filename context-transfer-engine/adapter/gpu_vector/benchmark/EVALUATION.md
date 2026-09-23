@@ -341,6 +341,42 @@ Three things the matrix says:
    Section E4. The storage choice that matters for paging does not matter for
    persistence.
 
+## E1: scaling, 256 to 512 nodes (production queue)
+
+Weak scaling at 4 GB/node, so the deck grows with the rung (1 TB at 256
+nodes) and a FLAT curve is the claim. kmeans and grayscott only: the other
+editions need their mesh, layer widths or bin count divisible by the node
+count, which fails at 320 and 448. One job per rung, all four editions
+inside it. debug-scaling caps a user at one running job, so the ladder runs
+in `prod`, whose floor is 256 nodes.
+
+### The baselines scale; the Eternia runtime does not come up at 256 nodes
+
+| rung | kmeans MPI | kmeans oneCCL | kmeans Intel SHMEM | kmeans Eternia |
+|---|---|---|---|---|
+| 256 | 1.10 s (55.2 ms/iter, comm 15.1 ms) | OK | OK | **TIMEOUT at 900 s, zero iterations** |
+
+All three baselines passed at 256 nodes over 8.6 G points and 1 TB, and
+grayscott passed on all three as well. The Eternia arm never completed an
+iteration. Its log shows the runtime failing to form a working cluster
+rather than the benchmark failing:
+
+- `RouteTask: RouteLocal returned 4 ... task_ptr is null`
+- `[stuck-wait] no completion after ...`
+- `SWIM: Direct probe to node 96` and suspicion traffic against nodes 0, 32,
+  64, 128, 160
+- `ScanSendMapTimeouts: replica 0 of net_key ... timed out`, repeatedly
+
+The oversized "Main segment: requested 1.2 TB" warning above it is NOT the
+cause: that is the RAM-sized auto default being clamped to half the memory
+budget, by design, and it happens at every scale.
+
+**This is the largest Eternia run ever attempted here -- every prior
+distributed result in this file is at 4 nodes.** So the finding is simply
+that the runtime's cluster formation and task routing do not yet work at
+256 nodes, and the scaling ladder has found the limit it exists to find.
+The baseline arms still give a usable 256-512 curve for the substrates.
+
 ## Plan coverage so far
 
 | study | status |
