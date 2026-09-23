@@ -35,9 +35,14 @@
 #                 the E4 row. THE FOURTH FIELD IS WHAT MAKES E2 HONEST: the
 #                 frame cache is slots x blocks x page, so sweeping the page
 #                 alone sweeps the cache too; scaling slots inversely holds
-#                 the cache constant in bytes. A fifth field is a free-form
-#                 tag, which exists so REPEATS of one cell get distinct run
-#                 directories and logs instead of overwriting each other.
+#                 the cache constant in bytes. The editions spell that knob
+#                 two ways -- kmeans, grayscott, weights and lammps_md take
+#                 --slots (frames per block), lbann and gmx take --cap (frames
+#                 for the whole grid) -- and the field is mapped to whichever
+#                 the workload has, so a sweep reads the same either way. A
+#                 fifth field is a free-form tag, which exists so REPEATS of
+#                 one cell get distinct run directories and logs instead of
+#                 overwriting each other.
 #   BENCH_GROUP_N nodes per cell (default 4)
 #   BENCH_CAP     per-rank cap in seconds (default 600)
 #   TIER_BUDGET_MB, HBM_MB, DATA_MB  as submit_e4_aurora.sh
@@ -156,9 +161,11 @@ run_cell() {
     args=$(echo "${args}" | sed -E "s/--page-kb [0-9]+/--page-kb ${pkb}/")
   fi
   if [ -n "${slots}" ]; then
+    local knob="--slots"
+    case "${wl}" in lbann|gmx) knob="--cap" ;; esac
     case "${args}" in
-      *--slots*) args=$(echo "${args}" | sed -E "s/--slots [0-9]+/--slots ${slots}/") ;;
-      *)         args="${args} --slots ${slots}" ;;
+      *"${knob} "*) args=$(echo "${args}" | sed -E "s/${knob} [0-9]+/${knob} ${slots}/") ;;
+      *)            args="${args} ${knob} ${slots}" ;;
     esac
   fi
   if [ -z "${pd:-}" ] || [ -z "${args}" ] || [ ! -x "${exe}" ]; then
