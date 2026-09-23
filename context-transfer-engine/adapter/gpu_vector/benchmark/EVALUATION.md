@@ -190,6 +190,24 @@ inversely (512 MB at 64 blocks: 128 / 32 / 8 / 2 slots for 64 KB / 256 KB /
 blocks). The cells above stand as a cache-size sweep, which is E5's
 question, and E2 is rerun with the cache pinned.
 
+**LUSTRE SPREAD, MEASURED.** Four repeats of the same cell (kmeans,
+Lustre-heavy, 1 MB page, cache pinned at 512 MB) in one allocation:
+
+| repeat | time | rate |
+|---|---|---|
+| a | 3.33 s | 2.40 GB/s |
+| b | 3.88 s | 2.06 GB/s |
+| c | 7.15 s | 1.12 GB/s |
+| d | 10.69 s | 0.75 GB/s |
+
+A 3.2x spread over identical runs. The four were scheduled across three
+groups of four nodes and therefore overlapped, so part of this is the cells
+contending with each OTHER on Flare, not only with the rest of the machine.
+That does not rescue the number: it means a Lustre-heavy cell has no single
+value, and the clean measurement is one Lustre cell at a time, repeated,
+reported as a spread. Every Lustre-heavy figure in E2 and E4 above is one
+draw from this distribution and should be read as such.
+
 **LUSTRE NUMBERS VARY BY 5x RUN TO RUN.** The two runs above differ only
 in when they ran and in that the second shared its allocation with four
 other cells -- which should have made it slower, not 5x faster. Flare is
