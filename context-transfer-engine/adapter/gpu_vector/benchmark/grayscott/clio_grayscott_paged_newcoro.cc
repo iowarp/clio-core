@@ -660,6 +660,10 @@ int main(int argc, char **argv) {
   u64 ckpt_every = 0;
   bool ckpt_drain = false;
   bool ckpt_final = true;   // --no-ckpt: skip the end-of-run checkpoint
+  // --organizer-hint: tell the CTE data organizer which step is starting
+  // (ReorganizeHint(s+1)), so a phase-aware organizer knows which region pair
+  // is about to be overwritten. Opaque to the core; see GrayScottDataOrganizer.
+  bool organizer_hint = false;
   float ckpt_cold = 0.0f;
   unsigned long long ram_mb = 0;   // 0 = data_mb + 1024, the historic value
 
@@ -700,6 +704,7 @@ int main(int argc, char **argv) {
     else if (a == "--ckpt-every") ckpt_every = next();
     else if (a == "--ckpt-drain") ckpt_drain = true;
     else if (a == "--no-ckpt") ckpt_final = false;
+    else if (a == "--organizer-hint") organizer_hint = true;
     else if (a == "--ckpt-cold") ckpt_cold = nextf();
     else if (a == "--Du") Du = nextf();
     else if (a == "--Dv") Dv = nextf();
@@ -1162,6 +1167,11 @@ int main(int argc, char **argv) {
       // current score at each step boundary, which the CTE no-ops, and made
       // the promote/demote tally meaningless.
       if (gs_pf) gs_pf->SetRegions(cu, cv, nu, nv);
+      if (organizer_hint) {
+        // Broadcast and waited: cheap next to a step, and the organizer must
+        // not see step s's hint while step s+1 is already writing.
+        (void)CLIO_CTE_CLIENT->ReorganizeHint(static_cast<clio::run::i32>(s + 1));
+      }
       if (baseline) {
         if (!run_baseline_step(cu, cv, nu, nv)) {
           std::fprintf(stderr, "GRAYSCOTT ERROR: baseline step failed\n");

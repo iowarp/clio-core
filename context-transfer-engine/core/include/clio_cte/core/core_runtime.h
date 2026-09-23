@@ -34,6 +34,7 @@
 #ifndef WRPCTE_CORE_RUNTIME_H_
 #define WRPCTE_CORE_RUNTIME_H_
 
+#include <algorithm>
 #include <memory>
 #include <atomic>
 #include <clio_runtime/clio_runtime.h>
@@ -224,6 +225,47 @@ public:
   /** Evict lowest-score blobs off a tier until a byte budget is reclaimed
    *  (Method::kEvict). Broadcast; each shard reports its share. */
   clio::run::TaskResume Evict(clio::run::shared_ptr<EvictTask> &task);
+  /** Store the organizer phase hint (Method::kReorganizeHint). Broadcast;
+   *  the value itself is opaque here and interpreted by the organizer. */
+  clio::run::TaskResume ReorganizeHint(
+      clio::run::shared_ptr<ReorganizeHintTask> &task);
+
+  /**
+   * The phase hint last set by ReorganizeHint (0 until one is set). Read by
+   * DataOrganizer::Reorganize; the organizer owns the meaning of each value.
+   * @return the current hint
+   */
+  clio::run::i32 OrganizerHint() const {
+    return organizer_hint_.load(std::memory_order_relaxed);
+  }
+
+  /**
+   * How many periodic organizer replicas partition the blob space. An
+   * organizer that infers geometry from the blob count of a tag needs this
+   * to scale its hash-partitioned slice back up.
+   * @return organizer_tasks from the config, at least 1
+   */
+  clio::run::u32 OrganizerReplicas() const {
+    return std::max(1u, config_.organizer_.organizer_tasks_);
+  }
+
+  /**
+   * Capacity of the highest-scored storage tier, in bytes.
+   *
+   * Read from the configured storage devices rather than the live target
+   * list: capacities are fixed when a target registers, and config_ needs no
+   * lock, which matters because an organizer reads this from a coroutine on a
+   * worker. Returns 0 when no tier is configured.
+   * @return bytes the fastest tier can hold
+   */
+  clio::run::u64 FastTierCapacityBytes() const {
+    clio::run::u64 cap = 0;
+    float best = -1.0f;
+    for (const StorageDeviceConfig &d : storage_devices_) {
+      if (d.score_ > best) { best = d.score_; cap = d.capacity_limit_; }
+    }
+    return cap;
+  }
   clio::run::TaskResume MultiPutBlob(
       clio::run::shared_ptr<MultiPutBlobTask> &task);
   /** Record that a node holds a cached/replicated copy of a blob
@@ -499,6 +541,12 @@ private:
   // #738). nullptr when config_.organizer_.name_ is "none"/unknown; the
   // periodic DynamicReorganize task then degrades to a no-op.
   std::unique_ptr<DataOrganizer> organizer_;
+
+  // Organizer phase hint set by ReorganizeHint (Method::kReorganizeHint).
+  // Atomic: written by the task handler on a worker, read by the periodic
+  // DynamicReorganize coroutine on possibly another worker. Meaning is
+  // organizer-defined; 0 means "no hint given".
+  std::atomic<clio::run::i32> organizer_hint_{0};
 
   // Restart flag: set by Restart() before calling Init()/Create()
   bool is_restart_ = false;

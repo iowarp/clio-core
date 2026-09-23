@@ -98,6 +98,7 @@ using ctp::env::GetCompat;
 // Basic type aliases using CTP types
 using u32 = ctp::u32;
 using u64 = ctp::u64;
+using i32 = ctp::i32;
 using i64 = ctp::i64;
 using ibitfield = ctp::ibitfield;
 

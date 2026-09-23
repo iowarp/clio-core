@@ -79,6 +79,16 @@ add_executable(test_evict
     test_evict.cc
 )
 
+# Organizer phase hint (Method::kReorganizeHint) API test
+add_executable(test_reorganize_hint
+    test_reorganize_hint.cc
+)
+
+# Gray-Scott data organizer (organizer: grayscott) policy + end-to-end test
+add_executable(test_grayscott_organizer
+    test_grayscott_organizer.cc
+)
+
 # PutBlob's make-room-and-retry trigger: the caller side of kEvict, which had
 # no non-test caller until now.
 add_executable(test_evict_trigger
@@ -359,6 +369,30 @@ target_link_libraries(test_reorganize_blob
 
 # Link test_evict - using simple_test.h framework (NOT Catch2)
 target_link_libraries(test_evict
+    clio_cte_core_runtime         # CTE core runtime library
+    clio_cte_core_client          # CTE core client library
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
+    ctp::cxx                    # ClioCtp library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+
+# Link test_reorganize_hint - same dependency set as test_evict
+target_link_libraries(test_reorganize_hint
+    clio_cte_core_runtime         # CTE core runtime library
+    clio_cte_core_client          # CTE core client library
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
+    ctp::cxx                    # ClioCtp library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+
+# Link test_grayscott_organizer - same dependency set
+target_link_libraries(test_grayscott_organizer
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
     clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
@@ -1255,6 +1289,14 @@ endif()  # full 4-layer cache stack
 # Add score-driven eviction tests (Method::kEvict)
 add_test(NAME cte_evict
     COMMAND test_evict)
+
+add_test(NAME cte_reorganize_hint
+    COMMAND test_reorganize_hint)
+
+add_test(NAME cte_grayscott_organizer
+    COMMAND test_grayscott_organizer)
+set_tests_properties(cte_grayscott_organizer PROPERTIES TIMEOUT 180 LABELS "cte")
+set_tests_properties(cte_reorganize_hint PROPERTIES TIMEOUT 120 LABELS "cte")
 
 set_tests_properties(
     cte_evict

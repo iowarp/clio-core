@@ -97,7 +97,13 @@ GLOBAL_CROSS_CONST clio::run::u32 kPodMultiPutBlob = 51;
 GLOBAL_CROSS_CONST clio::run::u32 kPodMultiGetBlob = 52;
 GLOBAL_CROSS_CONST clio::run::u32 kPodMultiScore = 53;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 54;
+// Organizer phase hint (issue: ReorganizeHint). A single integer the
+// application sets to tell the data organizer which phase of its algorithm
+// it is in; stored per container as Runtime::organizer_hint_ and read by
+// DataOrganizer::Reorganize through Runtime::OrganizerHint(). Broadcast.
+GLOBAL_CROSS_CONST clio::run::u32 kReorganizeHint = 54;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 55;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {

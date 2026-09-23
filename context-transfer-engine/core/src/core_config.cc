@@ -291,7 +291,10 @@ bool Config::ParseYamlNode(const YAML::Node &node) {
   // Parse data organizer configuration (top-level keys, issue #738)
   if (node["organizer"]) {
     std::string organizer = node["organizer"].as<std::string>();
-    if (organizer != "none" && organizer != "frecency") {
+    if (organizer != "none" && organizer != "frecency" &&
+        organizer != "grayscott" &&
+        organizer != "cyclic" &&
+        organizer != "scatter" && organizer != "hotset") {
       HLOG(kError,
            "Config error: Invalid organizer '{}' (must be 'none' or "
            "'frecency')",

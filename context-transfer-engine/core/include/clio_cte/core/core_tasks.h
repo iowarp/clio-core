@@ -2872,6 +2872,51 @@ struct EvictTask : public clio::run::Task {
 };
 
 /**
+ * ReorganizeHintTask (Method::kReorganizeHint) - set the organizer phase hint.
+ *
+ * The application tells the data organizer which phase of its algorithm it is
+ * in. The hint is a bare integer with no meaning to the CTE core itself: it is
+ * stored in Runtime::organizer_hint_ and handed to DataOrganizer::Reorganize
+ * through Runtime::OrganizerHint(), and a specific organizer decides what a
+ * value means (e.g. "streaming pass" vs "random access", or the current
+ * iteration). Broadcast so every container carries the same hint; no output.
+ */
+struct ReorganizeHintTask : public clio::run::Task {
+  IN clio::run::i32 hint_;   // Opaque phase indicator; meaning is the organizer's
+  // SHM constructor
+  ReorganizeHintTask() : clio::run::Task(), hint_(0) {}
+  // Emplace constructor
+  CTP_CROSS_FUN explicit ReorganizeHintTask(const clio::run::TaskId &task_id,
+                                            const clio::run::PoolId &pool_id,
+                                            const clio::run::PoolQuery &pool_query,
+                                            clio::run::i32 hint)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kReorganizeHint),
+        hint_(hint) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kReorganizeHint;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(hint_);
+  }
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+  void Copy(const ctp::ipc::FullPtr<ReorganizeHintTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    hint_ = other->hint_;   // every IN field: this is the per-replica duplication path
+  }
+  /** Broadcast aggregation: nothing to merge, every shard stored the same hint. */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+  }
+};
+/**
  * MultiPutBlobTask (issue #862) - batched multi-blob put.
  *
  * Carries up to ~64 whole-value puts to DIFFERENT blobs in ONE task: all

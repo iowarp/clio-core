@@ -207,6 +207,18 @@ compose:
     #   max_concurrent_operations: 64    # Max concurrent I/O operations
     #   score_threshold: 0.7             # Score above which blobs are reorganized
     #   score_difference_threshold: 0.05 # Min score delta to trigger reorganization
+    #
+    # Internal data organizer (periodic tier re-placement). Commented out =
+    # "none" (disabled). Each replica runs DynamicReorganize every period and
+    # rescores blobs through ReorganizeBlobInternal; higher score = faster tier.
+    #   organizer: "none"                # "none" | "frecency" (recency+frequency)
+    #                                    # | "grayscott" (reference policy: write-once
+    #                                    #   checkpoint tags sink to the slowest tier;
+    #                                    #   with a ReorganizeHint(step) the pair about
+    #                                    #   to be overwritten is demoted. Measured not
+    #                                    #   to pay on Gray-Scott -- see its header)
+    #   organizer_tasks: 1               # Periodic replicas (blob space is hash-partitioned)
+    #   organizer_period_ms: 5000        # Period between organizer rounds (ms)
     #   flush_metadata_period_ms: 5000   # Metadata flush interval (ms)
     #   flush_data_period_ms: 10000      # Data flush interval (ms)
     #   flush_data_min_persistence: 1    # Min persistence level (1=temp-nonvolatile)

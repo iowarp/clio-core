@@ -31,41 +31,47 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-// DataOrganizerFactory: name -> organizer instance. Each organization POLICY
-// implementation lives in its own source file in this directory; register
-// new policies here.
-
-#include <clio_cte/core/data_organizer/data_organizer.h>
-#include <clio_cte/core/data_organizer/frecency_organizer.h>
-#include <clio_cte/core/data_organizer/cyclic_organizer.h>
-#include <clio_cte/core/data_organizer/grayscott_organizer.h>
-#include <clio_cte/core/data_organizer/hotset_organizer.h>
 #include <clio_cte/core/data_organizer/scatter_organizer.h>
+#include <clio_cte/core/core_runtime.h>
+
+#include <cmath>
+#include <vector>
 
 namespace clio::cte::core {
 
-std::unique_ptr<DataOrganizer> DataOrganizerFactory::Get(
-    const std::string &name) {
-  if (name.empty() || name == "none") {
-    return nullptr;
+bool ScatterDataOrganizer::ShouldPromote(const OrganizerBlobStat &stat,
+                                         bool gather_phase) {
+  if (gather_phase) return true;
+  // A page that has been read at all is past its write-once life.
+  return stat.last_read_ != 0;
+}
+
+clio::run::TaskResume ScatterDataOrganizer::Reorganize(
+    Runtime *server, clio::run::u32 replica_id) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  std::vector<OrganizerBlobStat> stats;
+  server->CollectOrganizerBlobStats(replica_id, stats);
+  const clio::run::u64 fast_bytes = server->FastTierCapacityBytes();
+  if (fast_bytes == 0 || stats.empty()) {
+    CLIO_CO_RETURN;
   }
-  if (name == "frecency") {
-    return std::make_unique<FrecencyDataOrganizer>();
+  const bool gather = server->OrganizerHint() == kPhaseGather;
+  const clio::run::u64 budget =
+      static_cast<clio::run::u64>(static_cast<double>(fast_bytes) * kFillFactor);
+  for (const OrganizerBlobStat &stat : stats) {
+    if (!ShouldPromote(stat, gather)) continue;
+    if (std::fabs(kHotScore - stat.score_) < kEpsilon) continue;
+    if (promoted_bytes_ + stat.size_ > budget) continue;
+    clio::run::u32 rc = 0;
+    CLIO_CO_AWAIT(server->ReorganizeBlobInternal(stat.tag_id_, stat.blob_name_,
+                                                 kHotScore, rc));
+    if (rc == 0) promoted_bytes_ += stat.size_;
   }
-  if (name == "grayscott") {
-    return std::make_unique<GrayScottDataOrganizer>();
-  }
-  if (name == "cyclic") {
-    return std::make_unique<CyclicDataOrganizer>();
-  }
-  if (name == "scatter") {
-    return std::make_unique<ScatterDataOrganizer>();
-  }
-  if (name == "hotset") {
-    return std::make_unique<HotSetDataOrganizer>();
-  }
-  HLOG(kError, "DataOrganizerFactory: unknown organizer '{}'", name);
-  return nullptr;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 }  // namespace clio::cte::core

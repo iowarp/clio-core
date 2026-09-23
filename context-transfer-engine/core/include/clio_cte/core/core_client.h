@@ -3355,6 +3355,34 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Asynchronously set the data organizer's phase hint (Method::kReorganizeHint).
+   * The value is opaque to the core: it is stored on every container and read
+   * by the configured DataOrganizer on its next Reorganize round, which decides
+   * what a given value means for its policy.
+   * @param hint Opaque phase indicator (e.g. algorithm phase or iteration)
+   * @param pool_query Routing; Broadcast by default so all containers agree
+   */
+  clio::run::Future<ReorganizeHintTask> AsyncReorganizeHint(
+      clio::run::i32 hint,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<ReorganizeHintTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, hint);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Set the data organizer's phase hint and wait until every container has it.
+   * @param hint Opaque phase indicator; see AsyncReorganizeHint
+   * @return the task's return code (0 on success)
+   */
+  clio::run::u32 ReorganizeHint(clio::run::i32 hint) {
+    auto task = AsyncReorganizeHint(hint);
+    task.Wait();
+    return task->GetReturnCode();
+  }
+
+  /**
    * Asynchronously truncate a blob to an exact logical size (grow/shrink).
    * @param tag_id Tag the blob belongs to
    * @param blob_name Blob to resize
