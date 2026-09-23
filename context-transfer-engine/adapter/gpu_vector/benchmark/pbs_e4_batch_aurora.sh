@@ -27,8 +27,11 @@
 # under their own job-and-cell path. The runtime's port is the same in every
 # group, which is fine because the groups are disjoint sets of nodes.
 #
-#   BENCH_CELLS   space-separated <workload>:<composition>[:<page-kb>[:<slots>]]
-#                 e.g. "kmeans:dram100 kmeans:bal25:64 grayscott:dram100".
+#   BENCH_CELLS   space-separated <workload>[+<variant>]:<composition>[:<page-kb>[:<slots>]]
+#                 e.g. "kmeans:dram100 grayscott+ckpt:bal25:1024:8". A
+#                 +variant keeps the workload's binary but takes a different
+#                 argument line from the table below, which is how E3's
+#                 checkpoint arms are expressed.
 #                 The third field overrides the deck's page size, which is
 #                 what E2 sweeps, and the fourth its slots-per-block. Both
 #                 go into the cell's log name so a sweep does not overwrite
@@ -84,6 +87,15 @@ args_for() {
     gmx)       echo "--page-kb 20000 --blocks 16 --cap 200 --repeat 1" ;;
     lammps_md) echo "--lattice 534 --steps 1 --page-kb 1024" ;;
     lbann)     echo "--in 65536 --hidden 131072 --out 1024 --batch 64 --steps 1 --page-kb 1024 --blocks 64 --cap 4096 --no-ref" ;;
+    # E3, persistence. Same deck and same 8 steps in every arm; what differs
+    # is whether a checkpoint is taken and where it is allowed to settle.
+    # `nockpt` is the floor, `ckpt` leaves each snapshot at blob score 1.0
+    # (it stays in the fast tier -- the asynchronous case), and `ckptdrain`
+    # demotes each finished snapshot out of it, which is the synchronous
+    # case: the checkpoint is pushed down the stack before the run goes on.
+    grayscott+nockpt)    echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --steps 8 --repeat 1 --page-kb 1024" ;;
+    grayscott+ckpt)      echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --steps 8 --repeat 1 --page-kb 1024 --ckpt-every 2" ;;
+    grayscott+ckptdrain) echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --steps 8 --repeat 1 --page-kb 1024 --ckpt-every 2 --ckpt-drain" ;;
     *)         echo "" ;;
   esac
 }
@@ -132,8 +144,9 @@ export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 # @param 2 group index, which picks the node slice and the run directory
 run_cell() {
   local cell=$1 gi=$2
-  local wl comp pkb tail
-  wl=${cell%%:*}
+  local wl wlv comp pkb tail
+  wlv=${cell%%:*}
+  wl=${wlv%%+*}
   tail=${cell#*:}
   comp=${tail%%:*}
   # Third field is the page size in KB, fourth the slots per block.
@@ -149,12 +162,14 @@ run_cell() {
     fi
   fi
   local exe="${ROOT}/build-spike/clio_${wl}_paged_newcoro_aot"
-  local slug="${comp}${pkb:+_p${pkb}}${slots:+_s${slots}}${rtag:+_r${rtag}}"
+  local slug="${wlv#*+}_${comp}"
+  [ "${wlv}" = "${wl}" ] && slug="${comp}"
+  slug="${slug}${pkb:+_p${pkb}}${slots:+_s${slots}}${rtag:+_r${rtag}}"
   local rundir="${ROOT}/build-spike/e4b_${JOBTAG}_${wl}_${slug}"
   local log="${ROOT}/build-spike/pbs/${wl}_e4_${slug}.log"
   local pd pa pf top daos flare
   read -r pd pa pf <<< "$(shares_for "${comp}")"
-  local args; args=$(args_for "${wl}")
+  local args; args=$(args_for "${wlv}")
   # Replace the deck's own --page-kb rather than appending, so the edition
   # sees exactly one.
   if [ -n "${pkb}" ]; then
