@@ -60,6 +60,8 @@ ROOT=${ROOT:-/home/llogan/clio-core/.claude/worktrees/gpu-coro}
 GROUP_N=${BENCH_GROUP_N:-4}
 BENCH_CAP=${BENCH_CAP:-600}
 TIER_BUDGET_MB=${TIER_BUDGET_MB:-10240}
+BENCH_STEPS=${BENCH_STEPS:-2}
+BENCH_CKPT_EVERY=${BENCH_CKPT_EVERY:-1}
 HBM_MB=${HBM_MB:-4096}
 DATA_MB=${DATA_MB:-32768}
 DAOS_POOL=${DAOS_POOL:-IOWarp}
@@ -96,6 +98,10 @@ args_for() {
     grayscott+nockpt)    echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --steps 8 --repeat 1 --page-kb 1024" ;;
     grayscott+ckpt)      echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --steps 8 --repeat 1 --page-kb 1024 --ckpt-every 2" ;;
     grayscott+ckptdrain) echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --steps 8 --repeat 1 --page-kb 1024 --ckpt-every 2 --ckpt-drain" ;;
+    # E5 at scale: the deck and the step count come from the environment so
+    # one arm can be calibrated and then swept. BENCH_STEPS steps, a snapshot
+    # every BENCH_CKPT_EVERY of them.
+    grayscott+scaled)    echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --steps ${BENCH_STEPS:-2} --repeat 1 --page-kb 1024 --ckpt-every ${BENCH_CKPT_EVERY:-1}" ;;
     *)         echo "" ;;
   esac
 }
