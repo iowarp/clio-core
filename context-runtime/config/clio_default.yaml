@@ -87,6 +87,34 @@ runtime:
 # interception therefore lives only in the dedicated interceptor test
 # configs, never in this default.
 #
+# =========================================================================
+# SWIM failure detection
+# =========================================================================
+# SWIM gossips liveness probes between nodes and declares a peer dead when
+# its probes go unanswered for long enough. Recovery then redistributes the
+# dead peer's containers.
+#
+# DISABLED BY DEFAULT, and the default is the recommendation. A wide
+# collective -- composing a pool across 256 nodes, flushing a full-machine
+# page working set -- starves probe replies for longer than the suspicion
+# timeout while every node is healthy and merely busy. SWIM then declares
+# live nodes dead, recovery moves their containers, and routing can no
+# longer find them: tasks come back with RouteResult::Dne and the job dies.
+# Measured at 256 nodes, eight nodes (ids 0, 32, 64 ... 224) were marked
+# dead inside a single run in which nothing had actually failed.
+#
+# Timeouts long enough to survive a wide collective are also long enough
+# that the detector no longer detects anything useful, so leaving this off
+# is the honest setting for a job-scheduled run, where the batch system
+# already kills the whole allocation if a node dies. Turn it on for a
+# long-lived service deployment and size the timeouts for the widest
+# collective that deployment issues.
+swim:
+  enabled: false                        # default: false
+  direct_probe_timeout_sec: 30.0        # default: 30.0 -- direct probe reply deadline
+  indirect_probe_timeout_sec: 15.0      # default: 15.0 -- indirect (relayed) probe deadline
+  suspicion_timeout_sec: 60.0           # default: 60.0 -- suspect -> dead, triggers recovery
+
 # Only clio_bdev is strictly required. Drop the CAE or CTE entry if you
 # don't need it.
 compose:

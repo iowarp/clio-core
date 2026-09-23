@@ -134,6 +134,7 @@ enum FatalCode : unsigned long long {
   kFatalSetFull = 5,        // AllocatePage: no frame (args: page, set, pinned)
   kFatalFlushSplit = 6,     // flush range needs more records than one task
   kFatalGetFailed = 7,      // fetch returned non-zero (args: page, n, gen)
+  kFatalPutFailed = 8,      // writeback refused (args: page, n, generation)
 };
 
 /**
@@ -2175,12 +2176,53 @@ class DeviceVector {
         clio::run::gpu::IpcManager::GetBlockIpcManager()->Send(SlotPtr(t));
   }
 
-  /** Clear the flags of a landed flush. Thread 0 only. */
+  /**
+   * Clear the flags of a LANDED flush. Thread 0 only.
+   *
+   * A WRITEBACK THAT FAILED HAS NOT WRITTEN ANYTHING BACK, and the frame it
+   * came from holds the only copy of those bytes. This used to count the
+   * failure in stat_put_errors_ and then retire the records exactly as if
+   * they had landed: `flushing` fell to zero, FreeSomeIn -- which filters on
+   * pins/fetching/flushing and knows nothing about dirtiness -- picked the
+   * frame as a victim, and the page was gone.
+   *
+   * The loss surfaced two layers away and minutes later. The next demand for
+   * that page asked the store for a generation the failed put had never
+   * published, the reader waited out its ten-second bound and returned an
+   * error ("GetBlob '299519': generation 2 never reached"), and from there
+   * every block parked on faults that could not be satisfied: 2,000,000
+   * rounds, no runtime traffic at all, killed by a 15-minute cap. Nothing in
+   * between named the dropped page.
+   *
+   * So a failure stops here instead. Resending is not an option the callers
+   * can absorb: EndFlush promises the bytes are readable by other blocks when
+   * it returns, and BeginFlush overwrites this slot with the next range the
+   * moment it retires, so any attempt still in flight would be the same data
+   * loss with more steps. The store refusing a put is a capacity or placement
+   * failure that belongs to the store, and the honest thing the kernel can do
+   * is say which page, at which generation, and stop while the bytes are
+   * still intact.
+   */
   CTP_GPU_FUN void RetireFlush() {
     BlockTasks *bt = Tasks();
-    if (bt->flush_n != 0 && bt->flush->GetReturnCode() != 0 &&
-        h_->stat_put_errors_ != nullptr) {
-      atomicAdd(h_->stat_put_errors_, 1ull);
+    if (bt->flush_n != 0 && bt->flush->GetReturnCode() != 0) {
+      if (h_->stat_put_errors_ != nullptr) {
+        atomicAdd(h_->stat_put_errors_, 1ull);
+      }
+      const clio::run::u64 first_pn = h_->pages_[bt->flush_slot[0]].page_num;
+      printf("[gpu_vector] FATAL table=%u: a writeback of %u page(s) from "
+             "page %llu at generation %llu was REFUSED by the runtime (rc=%u). "
+             "Those bytes exist only in the page cache, so the kernel is "
+             "stopped here rather than dropping the frames. The store is out "
+             "of capacity or declined the placement.\n",
+             Table(), (unsigned)bt->flush_n, (unsigned long long)first_pn,
+             (unsigned long long)bt->flush_generation,
+             (unsigned)bt->flush->GetReturnCode());
+      FatalNote(kFatalPutFailed, first_pn,
+                static_cast<clio::run::u64>(bt->flush_n),
+                static_cast<clio::run::u64>(bt->flush_generation));
+      __trap();
+      return;
     }
     for (clio::run::u32 i = 0; i < bt->flush_n; ++i) {
       Page *p = &h_->pages_[bt->flush_slot[i]];

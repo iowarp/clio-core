@@ -82,10 +82,17 @@ export MPIR_CVAR_ENABLE_GPU=1
 # for 64 GB fails outright: zeMemAllocDevice returns UNSUPPORTED_SIZE and
 # ishmem_init dies with rc=139 before the benchmark starts (seen at the
 # 32-node rung). Size it from the share instead -- 1.35x, which covers the
-# collective buffers on top of the four grayscott arrays -- and cap it at
-# 40 GB, the largest value these baselines have been seen to accept.
+# collective buffers on top of the four grayscott arrays -- and cap it below
+# the tile so the driver has somewhere to put everything else.
+#
+# THE CAP WAS 40 GB AND THAT IS EXACTLY THE 12-NODE SHARE, so the 12-node
+# baseline asked for a heap the size of its own data with nothing left for
+# the halo buffers and died before it started (rc=99, no exit line). 48 GB
+# leaves 16 GB of the 64 GB tile for the driver and the collectives, which
+# is the most that has run. A rung whose share still does not fit under it
+# is the baseline floor this study is about, and it fails honestly.
 ISHMEM_MB=$(( PERNODE_MB * 27 / 20 ))
-[ "${ISHMEM_MB}" -gt 40960 ] && ISHMEM_MB=40960
+[ "${ISHMEM_MB}" -gt 49152 ] && ISHMEM_MB=49152
 [ "${ISHMEM_MB}" -lt 8192 ] && ISHMEM_MB=8192
 export ISHMEM_SYMMETRIC_SIZE=${ISHMEM_SYMMETRIC_SIZE:-$(( ISHMEM_MB * 1024 * 1024 ))}
 echo "    ishmem symmetric heap ${ISHMEM_MB} MB"

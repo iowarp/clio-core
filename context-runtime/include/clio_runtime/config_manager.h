@@ -548,10 +548,20 @@ class ConfigManager : public ctp::BaseConfig {
   u32 gpu_queue_depth_ = 16;                 // Default: 16 tasks per queue
 
   // SWIM membership-detection configuration.
-  // Defaults match the prior hard-coded constants in admin_runtime.cc so
-  // existing deployments behave identically when these fields are absent
-  // from the YAML.
-  bool swim_enabled_ = true;
+  //
+  // DISABLED BY DEFAULT. SWIM decides a peer is dead from probe replies, and
+  // a wide collective -- a 256-node compose, a full-machine page flush --
+  // starves those replies for longer than the suspicion timeout while every
+  // node is healthy and busy. The detector then declares live nodes dead and
+  // recovery redistributes their containers, after which routing cannot find
+  // the containers and the job fails. Measured at 256 nodes: eight nodes,
+  // ids 0, 32, 64 ... 224, marked dead inside one run.
+  //
+  // Timeouts long enough to survive that are also long enough to be useless
+  // as a detector, so the honest default is off. A deployment that genuinely
+  // needs failure detection turns it on with `swim: enabled: true` and sizes
+  // the timeouts for its own collective width.
+  bool swim_enabled_ = false;
   float swim_direct_probe_timeout_sec_ = 30.0f;
   float swim_indirect_probe_timeout_sec_ = 15.0f;
   float swim_suspicion_timeout_sec_ = 60.0f;

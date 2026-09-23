@@ -7527,21 +7527,39 @@ clio::run::TaskResume Runtime::PlaceBlobBytes(
                                    blob_score, min_persistence_level,
                                    preallocate, error_code, shortfall));
 
-  // Placement failed. Make room and try once more, but only for a put whose
-  // bytes are expendable and only by reclaiming other expendable bytes: CTE
-  // core also stores blobs that ARE the data, and evicting those to admit a
-  // write would destroy bytes their owner still expects. A put without the
-  // flag fails here exactly as it would have without this path.
+  // Placement failed. Make room and try once more, by reclaiming EXPENDABLE
+  // bytes and only those: CTE core also stores blobs that ARE the data, and
+  // evicting those to admit a write would destroy bytes their owner still
+  // expects. `droppable_only` below is what enforces that, and it is enforced
+  // against the blobs being reclaimed -- which is the only side of the
+  // question that can lose anything.
+  //
+  // THE GATE USED TO ASK THE WRONG SIDE. It required kCtePutDroppable on the
+  // INCOMING put, so a write whose bytes are precious could not reclaim space
+  // from blobs whose bytes are not, which is backwards: the incoming write's
+  // expendability says nothing about what is safe to free. It also made the
+  // whole path dead for the one caller that needs it most. A gpu_vector page
+  // flush never sets flags_ at all, so every GPU page cache in the system ran
+  // with no make-room path whatsoever: once its tiers filled, every later
+  // flush failed with rc 13 and nothing in the CTE would ever reclaim a byte,
+  // because there is no other capacity-driven eviction trigger anywhere --
+  // FlushData is periodic and DynamicReorganize does not reduce footprint.
   //
   // One retry. Either eviction freed enough or it did not, and looping turns a
   // full tier into a treadmill.
-  if (!(put_flags & kCtePutDroppable) ||
-      !CteAllocIsCapacityFailure(error_code) || shortfall == 0) {
+  if (!CteAllocIsCapacityFailure(error_code) || shortfall == 0) {
     CLIO_CO_RETURN;
   }
 
+  // LOCAL, NOT BROADCAST. The capacity that just ran out is this container's:
+  // ExtendBlob walks registered_targets_, which are the targets registered on
+  // this node, so asking every other node in the job to free bytes neither
+  // helps this put nor is free to ask. It mattered little while the path was
+  // gated to droppable puts and fired rarely; now that any capacity failure
+  // can reach it, a full tier would otherwise turn every subsequent put into
+  // an all-to-all.
   auto evict = client_.AsyncEvict(kCteEvictAnyTier, shortfall,
-                                  clio::run::PoolQuery::Broadcast(),
+                                  clio::run::PoolQuery::Local(),
                                   /*droppable_only=*/1);
   CLIO_CO_AWAIT(evict);
   const clio::run::u64 reclaimed = evict->bytes_evicted_;
@@ -7763,6 +7781,18 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
     CLIO_CO_AWAIT(AllocateFromTarget(target_info_copy, req, out_blocks,
                                 alloc_success));
     if (!alloc_success || out_blocks.empty()) {
+      // NAMED, NOT SWALLOWED. This `continue` used to be the only trace a
+      // tier going out of space left anywhere: no log, no counter, nothing
+      // to distinguish "device full" from "the bdev returned rc=1" from "the
+      // call threw". A whole tier could fill and the CTE logs said nothing
+      // at all, which is how a capacity failure reached a GPU page cache as
+      // an unexplained stall. Debug level because the walk is ALLOWED to
+      // fail here -- falling to the next target is the design -- and the
+      // aggregate failure below is the line that matters.
+      HLOG(kDebug,
+           "ExtendBlob: target {} declined {} byte(s) (remaining {}); trying "
+           "the next target",
+           selected_target_id, req, target_info_copy.remaining_space_);
       continue;  // this target can't satisfy req; outer loop tries the next
     }
 
@@ -7818,6 +7848,26 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
     blob_info.RecomputeTotalSize();
     if (shortfall != nullptr) {
       *shortfall = remaining_to_allocate;
+    }
+    // THE LINE THAT MATTERS, and it is a warning. Every candidate target was
+    // walked and the blob still needs bytes, so the put is about to fail with
+    // rc 13 and the caller's data has nowhere to go. Printing the per-tier
+    // remainders here is what turns "the job wedged" into "DAOS is at zero",
+    // which is the difference between reading a stack trace and reading a
+    // capacity number.
+    {
+      std::string tiers;
+      clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+      for (const auto &t : ordered_targets) {
+        TargetInfo *ti = registered_targets_.find(t.bdev_client_.pool_id_);
+        if (ti == nullptr) continue;
+        tiers += " " + std::to_string(ti->remaining_space_);
+      }
+      HLOG(kWarning,
+           "ExtendBlob: out of space for blob '{}' -- {} of {} byte(s) "
+           "unplaced across {} target(s); remaining per target:{}",
+           blob_info.blob_name_.str(), remaining_to_allocate, additional_size,
+           ordered_targets.size(), tiers);
     }
     error_code = 3;
     CLIO_CO_RETURN;
