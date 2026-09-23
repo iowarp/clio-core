@@ -257,10 +257,24 @@ composition whose persistent share is smaller than its data) rather than a
 gap.
 
 
-gnn is OUT for now. It is the only workload with no distributed edition --
-only the older single-node CTE one -- and it would need porting to the paged
-vector, three baseline substrates and the papers100M dataset staged. E6
-(organization) goes with it, since gnn is the workload that study is about.
+gnn is OUT for now, but the reason CHANGED on 2026-09-23 08:00 and the gap
+is much smaller than it was. Merging origin/gpu-coro-port brought a
+DISTRIBUTED GraphSAGE edition (`gnn/clio_gnn_paged_newcoro.cc`) that takes
+--nodes/--node and SYNTHESISES its features from a hash, so the papers100M
+staging that made this a multi-day job is no longer needed at all.
+
+What blocks it now is one thing: **that edition is CUDA-only and does not
+compile on Aurora.** It declares `__global__` kernels and launches them with
+`<<<>>>` unconditionally, with no `#if CTP_ENABLE_SYCL` split -- every other
+edition carries one. icpx stops at the launch site:
+
+    clio_gnn_paged_newcoro.cc:290:15: error: expected expression
+
+The port is bounded: gnn has only two launch functions (LaunchSeed,
+LaunchLayer) against kmeans's four, and kmeans's whole SYCL section --
+Submit, SubmitYieldable, InitBackend and the wrappers -- is about 100 lines
+that can be copied nearly verbatim. That is an afternoon, not a week, and it
+would put gnn back into E4, E5 and E1 and make E6 reachable.
 
 THE 15-MINUTE CAP GOVERNS THE FOOTPRINT, not the other way round. The plan
 asks for 64 GB/node; the cells above ran at 8 GB/node, which is the
