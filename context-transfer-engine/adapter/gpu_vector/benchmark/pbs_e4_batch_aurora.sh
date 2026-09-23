@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l walltime=00:60:00
+#PBS -l filesystems=home:flare:daos_user_fs
+#PBS -l daos=daos_user
+#PBS -q debug-scaling
+#PBS -A IOWarp
+#PBS -j oe
+#
+# MANY E4 CELLS IN ONE ALLOCATION.
+#
+# debug-scaling admits ONE running and ONE queued job per user
+# (max_run = queued_jobs_threshold = 1), so cells submitted one per job are
+# serialised by the queue, not by the machine: each 4-node cell waits 8-10
+# minutes to run for 20-60 seconds. The queue does allow 256 nodes and an
+# hour, so the way to run cells in parallel is to take a wide allocation and
+# put several cells in it at once.
+#
+# This script splits its nodes into GROUPS OF FOUR and runs one cell per
+# group concurrently, then takes the next cells as groups free up. Sixteen
+# nodes run four cells at a time; a workload's whole five-composition row
+# lands in one job instead of five.
+#
+# Each cell is a (workload, composition) pair. Groups share nothing: their
+# own run directory, their own hostfile and config, their own tier files
+# under their own job-and-cell path. The runtime's port is the same in every
+# group, which is fine because the groups are disjoint sets of nodes.
+#
+#   BENCH_CELLS   space-separated <workload>:<composition>, e.g.
+#                 "kmeans:dram100 kmeans:bal25 grayscott:dram100"
+#   BENCH_GROUP_N nodes per cell (default 4)
+#   BENCH_CAP     per-rank cap in seconds (default 600)
+#   TIER_BUDGET_MB, HBM_MB, DATA_MB  as submit_e4_aurora.sh
+#
+# The composition shares and the per-workload decks are the same table
+# submit_e4_aurora.sh uses, kept here rather than sourced so the job script
+# is self-contained on the compute node.
+set -u
+
+: "${BENCH_CELLS:?set BENCH_CELLS}"
+ROOT=${ROOT:-/home/llogan/clio-core/.claude/worktrees/gpu-coro}
+GROUP_N=${BENCH_GROUP_N:-4}
+BENCH_CAP=${BENCH_CAP:-600}
+TIER_BUDGET_MB=${TIER_BUDGET_MB:-10240}
+HBM_MB=${HBM_MB:-4096}
+DATA_MB=${DATA_MB:-32768}
+DAOS_POOL=${DAOS_POOL:-IOWarp}
+DAOS_CONT=${DAOS_CONT:-clio_tier}
+JOBTAG=${PBS_JOBID%%.*}
+FLARE_ROOT="/lus/flare/projects/IOWarp/clio_tier/${JOBTAG}"
+
+# ---- the cell tables -------------------------------------------------------
+# Shares in percent: dram daos flare. A tier at 0 is left out of the config.
+shares_for() {
+  case "$1" in
+    dram100)  echo "100 0 0" ;;
+    dram75)   echo "75 25 0" ;;
+    bal25)    echo "25 50 25" ;;
+    daos70)   echo "10 70 20" ;;
+    lustre70) echo "10 20 70" ;;
+    *)        echo "" ;;
+  esac
+}
+args_for() {
+  case "$1" in
+    kmeans)    echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --iters 1 --page-kb 1024" ;;
+    grayscott) echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --steps 1 --repeat 1 --page-kb 1024" ;;
+    weights)   echo "--blocks 64 --pages 128 --page-kb 1024 --hbm-mb ${HBM_MB} --repeat 1" ;;
+    gmx)       echo "--page-kb 20000 --blocks 16 --cap 200 --repeat 1" ;;
+    lammps_md) echo "--lattice 534 --steps 1 --page-kb 1024" ;;
+    lbann)     echo "--in 65536 --hidden 131072 --out 1024 --batch 64 --steps 1 --page-kb 1024 --blocks 64 --cap 4096 --no-ref" ;;
+    *)         echo "" ;;
+  esac
+}
+
+# ---- DAOS, once for the whole allocation -----------------------------------
+# Every group that needs a DAOS tier uses the same dfuse mount; mounting it
+# per cell would race on the same mountpoint.
+mount_daos() {
+  source /usr/share/lmod/lmod/init/bash
+  module use /soft/modulefiles
+  module load daos/base
+  if ! daos cont query "${DAOS_POOL}" "${DAOS_CONT}" > /dev/null 2>&1; then
+    daos cont create --type=POSIX "${DAOS_POOL}" "${DAOS_CONT}" 2>&1 | tail -2
+  fi
+  clean-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" > /dev/null 2>&1
+  launch-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" 2>&1 | tail -2
+  MNT="/tmp/${DAOS_POOL}/${DAOS_CONT}"
+  mount | grep -qF "${MNT}" || { echo "dfuse NOT mounted at ${MNT}"; return 1; }
+  return 0
+}
+NEED_DAOS=0
+for cell in ${BENCH_CELLS}; do
+  read -r pd pa pf <<< "$(shares_for "${cell##*:}")"
+  [ "${pa:-0}" -gt 0 ] && NEED_DAOS=1
+done
+MNT=""
+if [ "${NEED_DAOS}" = 1 ]; then
+  mount_daos || exit 2
+fi
+
+mapfile -t ALLNODES < <(sort -u "${PBS_NODEFILE}")
+NGROUPS=$(( ${#ALLNODES[@]} / GROUP_N ))
+echo "=== E4 batch: ${#ALLNODES[@]} nodes, ${NGROUPS} groups of ${GROUP_N}, $(echo ${BENCH_CELLS} | wc -w) cells ==="
+[ "${NGROUPS}" -ge 1 ] || { echo "not enough nodes for one group"; exit 2; }
+
+export IGC_FunctionControl=3
+export ZE_AFFINITY_MASK="${BENCH_ZE_MASK:-0.0}"
+export SYCL_CACHE_PERSISTENT=1
+export SYCL_CACHE_DIR=${SYCL_CACHE_DIR:-${ROOT}/build-spike/sycl_cache}
+mkdir -p "$SYCL_CACHE_DIR"
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+
+# ---- run one cell on one group --------------------------------------------
+# @param 1 cell, as <workload>:<composition>
+# @param 2 group index, which picks the node slice and the run directory
+run_cell() {
+  local cell=$1 gi=$2
+  local wl=${cell%%:*} comp=${cell##*:}
+  local exe="${ROOT}/build-spike/clio_${wl}_paged_newcoro_aot"
+  local rundir="${ROOT}/build-spike/e4b_${JOBTAG}_${wl}_${comp}"
+  local log="${ROOT}/build-spike/pbs/${wl}_e4_${comp}.log"
+  local pd pa pf top daos flare
+  read -r pd pa pf <<< "$(shares_for "${comp}")"
+  local args; args=$(args_for "${wl}")
+  if [ -z "${pd:-}" ] || [ -z "${args}" ] || [ ! -x "${exe}" ]; then
+    echo "RESULT ${wl}x${GROUP_N}@${comp}: FAILED rc=2 (unknown cell or no exe)" | tee -a "${log}"
+    return
+  fi
+  top=$(( TIER_BUDGET_MB * pd / 100 ))
+  daos=$(( TIER_BUDGET_MB * pa / 100 ))
+  flare=$(( TIER_BUDGET_MB * pf / 100 ))
+
+  mkdir -p "${rundir}"
+  local hosts="" i
+  for (( i = gi * GROUP_N; i < (gi + 1) * GROUP_N; ++i )); do
+    hosts="${hosts}${hosts:+,}${ALLNODES[$i]}"
+    echo "${ALLNODES[$i]}" >> "${rundir}/hostfile.tmp"
+  done
+  mv "${rundir}/hostfile.tmp" "${rundir}/hostfile"
+
+  # Tier directories, per cell so two groups never share a file bdev.
+  local tdir_daos="" tdir_flare="" storage=""
+  storage="    storage:"
+  if [ "${top}" -gt 0 ]; then
+    storage="${storage}
+      - path: \"ram::gv_tier_dram\"
+        bdev_type: \"ram\"
+        capacity_limit: \"${top}MB\"
+        score: 1.0"
+  fi
+  if [ "${daos}" -gt 0 ]; then
+    tdir_daos="${MNT}/clio_tier/${JOBTAG}/${wl}_${comp}"
+    mkdir -p "${tdir_daos}"
+    storage="${storage}
+      - path: \"${tdir_daos}/node__RANK__.dat\"
+        bdev_type: \"file\"
+        persistence_level: \"long_term\"
+        capacity_limit: \"${daos}MB\"
+        score: 0.5"
+  fi
+  if [ "${flare}" -gt 0 ]; then
+    tdir_flare="${FLARE_ROOT}/${wl}_${comp}"
+    mkdir -p "${tdir_flare}"
+    storage="${storage}
+      - path: \"${tdir_flare}/node__RANK__.dat\"
+        bdev_type: \"file\"
+        persistence_level: \"long_term\"
+        capacity_limit: \"${flare}MB\"
+        score: 0.2"
+  fi
+
+  cat > "${rundir}/clio_tier_template.yaml" <<EOF
+networking:
+  port: 9460
+  hostfile: "${rundir}/hostfile"
+
+runtime:
+  num_threads: 8
+  queue_depth: 8192
+  first_busy_wait: 10000000
+
+gpu:
+  queue_depth: 8192
+
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "1GB"
+
+  - mod_name: clio_cte_core
+    pool_name: cte_core
+    pool_query: local
+    pool_id: "512.0"
+    targets:
+      neighborhood: 1
+${storage}
+    dpe:
+      dpe_type: "max_bw"
+EOF
+
+  {
+    echo "=== ${wl} @ ${comp} on ${hosts} (dram ${top} daos ${daos} flare ${flare} MB/node) ==="
+    echo "args: ${args} --nodes ${GROUP_N} --node <rank>"
+  } > "${log}"
+  local start=$SECONDS
+  BENCH_RANK_EXE="${exe}" BENCH_RANK_ARGS="${args}" BENCH_RANK_N="${GROUP_N}" \
+  BENCH_RANK_DIR="${rundir}" BENCH_RANK_CAP="${BENCH_CAP}" \
+  mpiexec -n "${GROUP_N}" --ppn 1 --hosts "${hosts}" --no-vni --envall \
+          --cpu-bind none bash -c '
+    r=${PALS_RANKID:-${PMI_RANK:-0}}
+    cd "$BENCH_RANK_DIR"
+    sed "s/__RANK__/$r/g" clio_tier_template.yaml > "clio_tier_r$r.yaml"
+    export CLIO_SERVER_CONF="$BENCH_RANK_DIR/clio_tier_r$r.yaml"
+    timeout --signal=TERM --kill-after=10s "${BENCH_RANK_CAP}" \
+      stdbuf -oL -eL "$BENCH_RANK_EXE" $BENCH_RANK_ARGS --nodes "$BENCH_RANK_N" --node "$r" \
+      > "rank$r.log" 2>&1
+    rc=$?
+    echo "rank $r on $(hostname) exit=$rc" >> "rank$r.log"
+    exit 0
+  ' >> "${log}" 2>&1
+  local mrc=$? rc r rrc
+  echo "--- elapsed $((SECONDS - start))s, mpiexec exit=${mrc} ---" >> "${log}"
+  rc=${mrc}
+  for (( r = 0; r < GROUP_N; ++r )); do
+    echo "----- rank ${r} -----" >> "${log}"
+    grep -vE "LoadBalance|\[#78[15]|INFO|SUCCESS|WARNING|HANGWATCH" \
+         "${rundir}/rank${r}.log" 2>/dev/null | tail -30 >> "${log}"
+    rrc=$(grep -oE "^rank ${r} on .* exit=[0-9]+" "${rundir}/rank${r}.log" 2>/dev/null |
+          tail -1 | grep -oE "[0-9]+$")
+    [ -z "${rrc}" ] && rrc=99
+    [ "${rrc}" -gt "${rc}" ] && rc=${rrc}
+  done
+  {
+    echo "--- tier files ---"
+    for d in ${tdir_daos} ${tdir_flare}; do ls -l "${d}" 2>&1; rm -rf "${d}"; done
+    case "${rc}" in
+      0)   echo "RESULT ${wl}x${GROUP_N}@${comp}: OK" ;;
+      124) echo "RESULT ${wl}x${GROUP_N}@${comp}: TIMEOUT (a rank exceeded the ${BENCH_CAP}s cap)" ;;
+      *)   echo "RESULT ${wl}x${GROUP_N}@${comp}: FAILED rc=${rc}" ;;
+    esac
+  } >> "${log}"
+  echo "CELL DONE ${wl}@${comp} rc=${rc} ($((SECONDS - start))s)"
+}
+
+# ---- dispatch: keep every group busy ---------------------------------------
+declare -a GPID
+for (( g = 0; g < NGROUPS; ++g )); do GPID[$g]=0; done
+for cell in ${BENCH_CELLS}; do
+  placed=0
+  while [ "${placed}" = 0 ]; do
+    for (( g = 0; g < NGROUPS; ++g )); do
+      if [ "${GPID[$g]}" = 0 ] || ! kill -0 "${GPID[$g]}" 2>/dev/null; then
+        run_cell "${cell}" "${g}" &
+        GPID[$g]=$!
+        placed=1
+        break
+      fi
+    done
+    [ "${placed}" = 0 ] && sleep 5
+  done
+done
+wait
+case "${NEED_DAOS}" in 1) clean-dfuse.sh "${DAOS_POOL}:${DAOS_CONT}" > /dev/null 2>&1 ;; esac
+rm -rf "${FLARE_ROOT}"
+echo "E4 BATCH DONE"
