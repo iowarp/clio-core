@@ -371,6 +371,15 @@ The oversized "Main segment: requested 1.2 TB" warning above it is NOT the
 cause: that is the RAM-sized auto default being clamped to half the memory
 budget, by design, and it happens at every scale.
 
+**FIXED (config only, 2026-09-23 04:15).** SWIM's suspicion timeout is 60 s
+and its expiry runs TriggerRecovery, which redistributes a LIVE node's
+containers. The 256-way compose starves probe replies past that threshold,
+so busy nodes are declared dead, their containers move, and routing then
+answers Dne for a pool that has been taken away -- the spiral above. The
+scaling config now sets `swim: enabled: false`, which is right for a batch
+allocation where a node that truly dies takes the job with it anyway. Rung
+320 is queued carrying the fix and is the test of it.
+
 **This is the largest Eternia run ever attempted here -- every prior
 distributed result in this file is at 4 nodes.** So the finding is simply
 that the runtime's cluster formation and task routing do not yet work at
