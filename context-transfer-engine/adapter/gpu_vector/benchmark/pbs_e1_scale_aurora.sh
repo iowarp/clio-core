@@ -160,9 +160,15 @@ for wl in kmeans grayscott; do
     grayscott) base_args="--data-mb ${DATA_MB} --steps ${ITERS} --page-kb 1024" ;;
   esac
   for sub in mpi ccl ishmem; do
+    # NO `|| true` HERE. It makes $? the status of `true`, so every rung
+    # summarised as OK however many cells failed -- which is exactly what
+    # the 256 rung did with two of its eight cells broken. run_one already
+    # never aborts the script (it returns, it does not exit), so the guard
+    # was never needed.
+    rc=0
     run_one "${wl}_${sub}" "${ROOT}/build-spike/clio_${wl}_${sub}_bench" \
-            "${base_args}" 0 || true
-    rc=$?; [ "${rc}" -gt "${worst}" ] && worst=${rc}
+            "${base_args}" 0 || rc=$?
+    [ "${rc}" -gt "${worst}" ] && worst=${rc}
   done
   # The Eternia arm: 80 frames per block of 1 MB over 64 blocks is 5 GB of
   # frame cache against a 4 GB share, so the shard is resident.
@@ -174,9 +180,10 @@ for wl in kmeans grayscott; do
     kmeans)    et_args="--data-mb ${DATA_MB} --hbm-mb ${PERNODE_MB} --iters ${ITERS} --page-kb 1024 --slots 80" ;;
     grayscott) et_args="--data-mb ${DATA_MB} --hbm-mb ${PERNODE_MB} --steps ${ITERS} --repeat 1 --page-kb 1024 --slots 80" ;;
   esac
+  rc=0
   run_one "${wl}_eternia" "${ROOT}/build-spike/clio_${wl}_paged_newcoro_aot" \
-          "${et_args}" 1 || true
-  rc=$?; [ "${rc}" -gt "${worst}" ] && worst=${rc}
+          "${et_args}" 1 || rc=$?
+  [ "${rc}" -gt "${worst}" ] && worst=${rc}
   unset CLIO_SERVER_CONF
 done
 
