@@ -157,8 +157,29 @@ tier is the right one.
 
 | workload / composition | 64 KB | 256 KB | 1 MB | 4 MB | 16 MB |
 |---|---|---|---|---|---|
-| kmeans, DRAM-only | 12.00-12.02 s (0.67 GB/s), 130401-130475 faults | 3.26-3.42 s (2.3-2.5 GB/s), 32059-32070 faults | 2.34-2.50 s (3.2-3.4 GB/s), 7442-7483 faults (the E4 cell measured 2.02-2.18 s) | 2.56 s (3.12 GB/s), 1209-1236 faults: 6x fewer faults than 1 MB and slightly SLOWER, so the curve has flattened and the per-fault cost is no longer what limits it | pending |
-| kmeans, Lustre-heavy | pending | pending | 4.78 s (1.67 GB/s), 7443-7470 faults, Flare 7.5 GB and DAOS 2.1 GB per node -- but the E4 cell at the SAME page and composition measured 23.0 s (0.35 GB/s). See the variance note below | pending | pending |
+| kmeans, DRAM-only | 12.00-12.02 s (0.67 GB/s), 130401-130475 faults | 3.26-3.42 s (2.3-2.5 GB/s), 32059-32070 faults | 2.34-2.50 s (3.2-3.4 GB/s), 7442-7483 faults (the E4 cell measured 2.02-2.18 s) | 2.56 s (3.12 GB/s), 1209-1236 faults | 0.50 s (15.97 GB/s), ZERO faults -- see the confound below |
+| kmeans, Lustre-heavy | pending | pending | 4.78 s (1.67 GB/s), 7443-7470 faults, Flare 7.5 GB and DAOS 2.1 GB per node -- but the E4 cell at the SAME page and composition measured 23.0 s (0.35 GB/s). See the variance note below | 3.47-3.92 s (2.0-2.3 GB/s), 1201-1231 faults | pending |
+
+**THIS SWEEP CHANGES TWO THINGS AT ONCE, AND THE SECOND ONE DOMINATES AT
+16 MB.** The vector's frame cache is `slots x blocks x page`, and the
+editions take `--slots` (8) and `--blocks` (64) as counts, not bytes. So
+sweeping the page size sweeps the cache with it:
+
+| page | frame cache | faults |
+|---|---|---|
+| 64 KB | 32 MB | 130400 |
+| 256 KB | 128 MB | 32060 |
+| 1 MB | 512 MB | 7460 |
+| 4 MB | 2 GB | 1220 |
+| 16 MB | 8 GB = the whole node's deck | 0 |
+
+At 16 MB the cache holds the entire 8 GB shard, so the run never faults at
+all and its 0.50 s is not a page-size result -- it is the resident case.
+The honest sweep holds the cache constant in BYTES by scaling `--slots`
+inversely (512 MB at 64 blocks: 128 / 32 / 8 / 2 slots for 64 KB / 256 KB /
+1 MB / 4 MB; 16 MB cannot reach 512 MB at 64 blocks and needs fewer
+blocks). The cells above stand as a cache-size sweep, which is E5's
+question, and E2 is rerun with the cache pinned.
 
 **LUSTRE NUMBERS VARY BY 5x RUN TO RUN.** The two runs above differ only
 in when they ran and in that the second shared its allocation with four
