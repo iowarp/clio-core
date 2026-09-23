@@ -165,6 +165,45 @@ and a generational fetch. Assert that either the data is right or the run
 traps -- never that it finishes with a wrong checksum. This belongs beside
 the existing gpu_vector tests rather than in the benchmark suite.
 
+## Verification run, after steps 1 and 2 (2026-09-23 04:45)
+
+The six cells that had corrupted or died were rerun on the fixed binaries.
+
+| cell | before | after |
+|---|---|---|
+| weights dram75, 64 frames | checksum MISMATCH | **OK**, get_errors=0 |
+| weights bal25, 8 frames | checksum MISMATCH | **OK**, get_errors=0 |
+| weights bal25, 4 frames | DEVICE FATAL 2, rc=134 | **OK**, get_errors=0 |
+| weights bal25, 2 frames | DEVICE FATAL 2, rc=134 | **OK**, get_errors=0 |
+| lbann bal25, 512 frames | DEVICE FATAL 2, rc=134 | **OK**, 34.8-36.7 s/step |
+| lbann bal25, 64 frames | DEVICE FATAL 2, rc=134 | still rc=134 -- but see below |
+
+**READ THIS BEFORE CALLING IT FIXED.** Every passing cell reports
+`get_errors=0`, so no get failed and the repaired branch was never entered.
+Five clean draws of an intermittent fault is not proof; the corruption path
+has been removed but has not been seen firing correctly. Nor can a rebuild
+be ruled out as having perturbed the timing. What can be said is that the
+write hold can no longer reach a frame whose fetch failed, because the frame
+no longer has a page number to be found by.
+
+**The lbann 64-frame cell is a bad deck, not the defect.** lbann counts its
+cache in frames for the WHOLE GRID (`--cap`), not per block, so 64 frames
+across 64 blocks is ONE frame per block against 33 GB of weights, and its
+backward pass needs several pages live at once. grayscott refuses exactly
+this with a clear message about its ten-plane stencil; lbann has no floor
+check, so it traps instead, and the abort kills the process before the host
+reads the fatal channel -- which is why that cell produces no diagnostic
+line at all. Two things to fix: the deck (mine), and the missing guard.
+
+### 5. Give lbann the floor check grayscott has
+
+grayscott computes its minimum (10 planes) and refuses below it, naming the
+reason. lbann should do the same: its backward pass sweeps W2 in
+`rows_per_page` chunks and needs at least a small multiple of blocks. A
+one-line refusal saves a 30-second job and produces a sentence instead of a
+driver abort. The same audit is worth doing for gmx (which HAS a floor,
+`4 * blocks + 2`) and weights (which does not).
+
 ## What this blocks
 
 E5 sweeps the cache deliberately, so it lands in this path by construction:
