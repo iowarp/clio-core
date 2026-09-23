@@ -51,7 +51,9 @@ Each run writes, under `--out`:
 
 | file | what it is |
 |---|---|
-| `fig9.csv` | one row per arm: `panel,workload,strategy,compute_min,io_min,total_min,std_min,ratio,eb`. Its own workload is filled, the other four left blank so a single-workload CSV plots at the full layout. |
+| `fig9.csv` | one row per arm: `panel,workload,strategy,compute_min,io_min,total_min,std_min,ratio,eb,runs,bound,payload_mib,setup_min` — the MEDIAN run by total (mean of the middle two for an even count), `std_min` the sample std of the totals, `bound` `ok`/`exceeded` for a lossy arm. Rebuilt after every run. `TBD_OTHERS=1` adds blank rows for the other four workloads. |
+| `fig9_runs.csv` | every recorded run: `panel,workload,strategy,rep,compute_min,io_min,total_min,ratio,bound,setup_min,eb` |
+| `<arm>/r<N>/cusz_setup.csv` | cuSZ only (`CLIO_CUSZ_PHASE_LOG`): one STAMPED row per span, `phase,elems,ms,start_ns`, with `phase` in `stream` / `mgr` / `release` — the CUDA stream and the `psz_resource` that cuSZ's rev1 API makes the wrapper build and tear down for EVERY chunk. `setup_min` is the UNION of those spans clipped to the measured window, never their sum: chunks compress on several workers at once, and summing produced 14.307 s inside a 13.539 s arm. The build and the release stay separate spans because the codec kernel runs between them. The output copy is not logged: moving the compressed frame out of the manager's buffer is output work every codec does. An arm that never calls cuSZ writes no file and records 0; a NeuroPress arm that routes some chunks to cuSZ records exactly those. `plot_fig9.py --deduct-setup` subtracts it and relabels the y-axis — the default figure plots what was measured. |
 | `arms.csv` | the exact arm set this run built — label, panel, config, eb, tier, async_ms |
 | `run.json` | the parameters behind it |
 
@@ -143,34 +145,69 @@ measure NVMe over the network, and `run.json`'s `nvme_root` records which.
 
 ## What the segments mean
 
-- **Solid** = the write loop (`stage+compress`): stats, NN, quantize, codec,
-  tier put, setup, scheduling.
-- **Light** = `total_min - compute_min`, i.e. the input read plus the final
-  flush.
-- **Excluded from both**: H2D staging — the figure assumes the data is already
-  on the GPU, as upstream's VOL write does — and, for LAMMPS, the simulate time.
+- **Solid** = NON-I/O ELAPSED: `total_min - io_min`, i.e. stats, NN, quantize,
+  codec, task hand-offs, per-chunk library setup and scheduling. It is
+  deliberately NOT called "compute": on the cuSZ arm 82% of it is
+  `psz_create_resource_manager`/`psz_release_resource`, not computation, and the
+  word hid that for the whole first round of this figure.
+- **Light** = MEASURED elapsed device I/O. Each bdev transport brackets its own
+  transfer (`CLIO_IO_LOG`, `modules/bdev/include/clio_runtime/bdev/io_log.h`):
+  for a file tier from the device-to-host copy of the image through the write,
+  for the RAM tier around the copy into the segment. The harness takes the
+  UNION of those intervals, never their sum, because writes overlap, and each
+  interval is first CLIPPED to the measured window the driver prints
+  (`window: start_ns N   end_ns M`, the same steady clock `io_log.h` stamps
+  with), so no write outside the timed region can contribute to the bar. This is
+  the span upstream's VOL also calls I/O (`vol_d2h_copy_ms` +
+  `vol_io_queue_wait_ms` + drain), and it covers the final flush too.
+  Campaigns before 2026-09-22 had no I/O measurement at all: the pale segment
+  was the input read plus the flush.
+- **Excluded from both**: the input read and H2D staging — the figure assumes
+  the data is already in memory and on the GPU, as upstream's VOL write does —
+  and, for LAMMPS, the simulate time. `EXCLUDE_READ=0` puts the read back.
+  Inputs are copied once per job to node-local `/tmp` (`STAGE_INPUT=1`,
+  16 parallel streams), so every arm reads the same local bytes instead of
+  re-reading Lustre, whose cached pages expire after 600 s idle.
+- **No selection log** (`SELECTION_LOG=0`): it hashes every input chunk and
+  compressed payload byte by byte inside the compressor, ~19 ms per 8 MiB
+  chunk that only the compressed arms paid (jobs 22300816, 22300826).
   Staging is removed as the *union* of the per-chunk intervals, not their sum:
   chunks pipeline, and on AI the per-chunk walls overlap 52–77×, so summing them
   over-subtracted up to 3.8% of the total.
 - `ratio` is input bytes / stored bytes. `eb` is the error bound; `0` is
   lossless.
-- `std_min` is empty unless a caller merges repeats — each arm is run once.
+- **Repeated, rotated runs.** Each arm runs `REPS` times (default 3); rep *k*
+  starts the arm list *k*/`REPS` of the way round, so no arm always runs first.
+  The bar is the median run and the whisker ±1 std of the totals. One run per
+  arm was the noisiest input: PFS write loops moved 25–30% between identical
+  runs, and single Lustre stalls of 0.1–2 s decided which arm won.
+- **Verification** runs once per arm, in rep 1 (it is untimed but a full
+  read-back). A lossy arm is checked element-wise against its bound
+  (`--check-bound`); one that exceeds it is still drawn, with `*` on its label.
+- **RAM tier pre-faulted** (`CLIO_PREFAULT=0` on +Tier arms) during setup, so
+  page faults no longer land in the timed loop (1.7 s of full Nyx's
+  nvCOMP+Tier loop before).
 
-## Why there is no I/O bar
+## The I/O bar, and what it is not
 
-`io_min` is `total_min - compute_min`. It is **not** an I/O measurement, and the
-figure does not claim one.
+Since 2026-09-22 the pale segment IS a measurement: the bdev transports time
+their own transfers (`CLIO_IO_LOG`), and the harness takes the union of those
+intervals. Solid is `total - io`, so the two always add to the bar.
 
-Audited 2026-09-18: the runtime's per-chunk `io_ms` is a real awaited write
-(`AsyncPutBlob` → `PutBlobImpl` → `ModifyExistingData` → bdev `AsyncWrite`,
-polled to completion in `fs_bdev_transport.cc`) — buffered, not fsynced. On an
-**untiered** arm that write lands on the file tier inside the loop, so 100% of
-the arm's durable write is already inside the solid bar. On a `+Tier+Async` arm
-the put goes to RAM at memcpy speed and only 0–38% is, with the rest moved later
-by an untimed periodic `FlushData` worker. The same field therefore measures a
-file write on some arms and a memcpy on others, and the per-chunk intervals
-overlap. A wall-clock compute/IO split is not derivable from this
-instrumentation.
+What it does NOT use is the compressor's per-chunk `io_ms`. Audited 2026-09-18:
+that field is the awaited put (`AsyncPutBlob` → `PutBlobImpl` →
+`ModifyExistingData` → bdev `AsyncWrite`), so it carries task hand-offs and
+scheduling, it sums to many times the elapsed loop because chunks pipeline, and
+it measures a durable file write on an untiered arm but a memcpy on a tiered
+one. The bdev timers avoid all three: they bracket the transfer itself, they
+are unioned rather than summed, and each records which device class moved the
+bytes (`file` or `ram`).
+
+Note what each arm's I/O therefore means. On an **untiered** arm the whole
+durable write happens inside the loop, so the pale segment is the PFS. On a
+`+Tier` arm the puts land in RAM at memcpy speed and the NVMe write happens in
+the flush, which the union also covers. The two bars are both measured I/O, but
+they are I/O to different devices -- that is the ablation's point, not a flaw.
 
 Two alternative splits were tried and rejected, because a reader will ask:
 

@@ -79,6 +79,36 @@ class Compressor {
     (void)input_size;
     return 0;
   }
+
+  /**
+   * @brief Point an error-bounded codec at the bound the CALLER asked for.
+   *
+   * The factory builds every codec from a CompressionPreset, and a lossy one
+   * then derives its bound from that preset (FAST 1e-2, BALANCED 1e-3, BEST
+   * 1e-4). That is a three-value menu, not the caller's number: a run that
+   * asks for eb = 5e-4 silently gets 1e-3 -- twice the tolerance -- while the
+   * verifier still checks 5e-4 and reports the codec as having missed a bound
+   * it was never given. The preset values happen to coincide with the bound
+   * this benchmark uses (1e-3), which is why the mismatch went unseen.
+   *
+   * Overridden by the GPU error-bounded codecs (cusz.h, cuszp.h); a lossless
+   * one ignores it and returns false, which is how a caller can tell the bound
+   * did not take.
+   *
+   * NOT overridden by sz.h and sz3.h: both already carry a same-named
+   * NON-virtual setter, which hides this one, so a call through a Compressor*
+   * on those two reaches this default and returns false. That is the behaviour
+   * they had before this virtual existed, and neither is a GPU codec this
+   * benchmark runs -- but anyone adding them to a bounded comparison has to
+   * make their setters overrides first.
+   *
+   * @param eb absolute error bound the caller requires; ignored when <= 0.
+   * @return true when this codec will honour that bound.
+   * */
+  virtual bool SetErrorBound(double eb) {
+    (void)eb;
+    return false;
+  }
 };
 
 /**

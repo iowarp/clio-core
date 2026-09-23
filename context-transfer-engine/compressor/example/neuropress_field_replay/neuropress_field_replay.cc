@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -47,6 +48,9 @@
 #include <map>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <clio_cte/compressor/compressor_client.h>
 #include <clio_cte/core/core_client.h>
@@ -183,10 +187,99 @@ bool SourceOfBlob(const std::string &name, const std::string &dir,
   return true;
 }
 
+/**
+ * fdatasync every file this run made durable, inside the timed window.
+ *
+ * NOTHING in the write path fsyncs (bdev writes are buffered), so "durable"
+ * used to mean different things per arm: on the node's xfs an arm's whole
+ * output stayed dirty in memory past the timer and drained later, untimed,
+ * while Lustre pushed the bytes out inside the loop. An arm on local NVMe was
+ * therefore timed against the page cache and one on the PFS was not, which is
+ * most of what the tiering ablation appeared to show.
+ *
+ * CLIO_REPLAY_FSYNC is a comma-separated list of tier paths as composed; each
+ * is synced along with the per-node files the runtime actually created
+ * (<path>_node<N>), so the caller does not have to know the node suffix.
+ *
+ * THE BARRIER MUST FAIL LOUDLY. This used to skip an unopenable file and
+ * ignore a failed fdatasync, so a run could report a time without ever having
+ * made its bytes durable -- the one thing the barrier exists to guarantee.
+ * Now: every fdatasync error is fatal, and a tier path that syncs NOTHING is
+ * fatal, because a tier that produced no file at all means the arm did not
+ * write where the harness believes it did. The composed path itself is allowed
+ * to be absent: the runtime writes <path>_node<N>, so the bare path usually
+ * does not exist and only the siblings do.
+ *
+ * @param spec comma-separated tier paths, or empty to do nothing.
+ * @param out_files receives how many files were synced.
+ * @param out_error receives why the barrier did not hold; empty on success.
+ * @return seconds spent in fdatasync, 0 when the list is empty.
+ */
+double FsyncTiers(const std::string &spec, size_t *out_files,
+                  std::string *out_error) {
+  *out_files = 0;
+  out_error->clear();
+  if (spec.empty()) return 0.0;
+  const auto t0 = std::chrono::steady_clock::now();
+  size_t start = 0;
+  while (start <= spec.size()) {
+    const size_t comma = spec.find(',', start);
+    std::string path = spec.substr(start, comma == std::string::npos
+                                              ? std::string::npos
+                                              : comma - start);
+    start = (comma == std::string::npos) ? spec.size() + 1 : comma + 1;
+    if (path.empty()) continue;
+    // The composed path, plus <path>_node<N> that the runtime writes.
+    std::vector<std::string> candidates = {path};
+    const fs::path dir = fs::path(path).parent_path();
+    const std::string stem = fs::path(path).filename().string();
+    std::error_code ec;
+    for (const auto &e : fs::directory_iterator(dir, ec)) {
+      const std::string name = e.path().filename().string();
+      if (name.size() > stem.size() && name.compare(0, stem.size(), stem) == 0) {
+        candidates.push_back(e.path().string());
+      }
+    }
+    size_t synced_here = 0;
+    for (const auto &c : candidates) {
+      const int fd = ::open(c.c_str(), O_RDONLY);
+      if (fd < 0) {
+        // ENOENT on the composed path is the normal case, not a failure; any
+        // other errno is a file that exists and could not be opened.
+        if (errno != ENOENT && out_error->empty()) {
+          *out_error = "cannot open " + c + ": " + std::strerror(errno);
+        }
+        continue;
+      }
+      const bool ok = ::fdatasync(fd) == 0;
+      const int err = errno;
+      ::close(fd);
+      if (!ok) {
+        if (out_error->empty()) {
+          *out_error = "fdatasync failed on " + c + ": " + std::strerror(err);
+        }
+        continue;
+      }
+      ++synced_here;
+      ++*out_files;
+    }
+    if (synced_here == 0 && out_error->empty()) {
+      *out_error = "no file to sync for tier path " + path +
+                   " (neither it nor any " + stem + "_node* sibling exists)";
+    }
+  }
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+      .count();
+}
+
 struct BlobRecord {
   std::string name;
   size_t bytes = 0;
   uint64_t digest = 0;
+  // Where the chunk came from, so its digest can be taken after the timed
+  // loop. Points into the driver's file list; null for read-back records.
+  const fs::path *src_file = nullptr;
+  size_t src_off = 0;
   int lib = 0;
   double ratio = 0.0;
   size_t stored = 0;
@@ -205,6 +298,38 @@ struct BlobRecord {
   double dt_ms = -1.0;
   bool ok = false;
 };
+
+/**
+ * Fill each record's FNV-1a digest from the source bytes on disk.
+ *
+ * The digest only feeds the round-trip check and blobs.csv, so it is
+ * bookkeeping, not part of the write path. Hashing inside the timed loop
+ * charged 5-7 s per 4 GiB arm to every arm -- lossy ones too, which never
+ * verify -- so it is computed here, after the timer has stopped, by re-reading
+ * each chunk from the file and offset recorded when it was written.
+ *
+ * @param records blobs written this run; `bytes`, `src_file` and `src_off`
+ *                must be set.
+ * @return number of records whose source could not be re-read; those keep
+ *         digest 0, so a later round-trip check reports them as mismatches.
+ */
+size_t FillDigestsFromSource(std::vector<BlobRecord> *records) {
+  size_t missing = 0;
+  std::vector<char> buf;
+  for (auto &r : *records) {
+    if (r.src_file == nullptr) { ++missing; continue; }
+    std::ifstream in(*r.src_file, std::ios::binary);
+    buf.resize(r.bytes);
+    in.seekg(static_cast<std::streamoff>(r.src_off));
+    in.read(buf.data(), static_cast<std::streamsize>(r.bytes));
+    if (!in || in.gcount() != static_cast<std::streamsize>(r.bytes)) {
+      ++missing;
+      continue;
+    }
+    r.digest = Fnv1a(buf.data(), r.bytes);
+  }
+  return missing;
+}
 
 struct Pending {
   clio::run::Future<clio::cte::compressor::DynamicScheduleTask> fut;
@@ -559,7 +684,8 @@ int main(int argc, char **argv) {
       BlobRecord rec;
       rec.name = frame + "/" + stem + "/chunk_" + std::to_string(ci);
       rec.bytes = n;
-      rec.digest = Fnv1a(src, n);
+      rec.src_file = &f;  // digest is taken after the timer stops
+      rec.src_off = off;
       records.push_back(rec);
 
       Pending p;
@@ -586,7 +712,8 @@ int main(int argc, char **argv) {
   drain();
 
   // CLIO_REPLAY_FINAL_FLUSH=1: move volatile blobs to a durable tier, inside
-  // `total`. No fsync, so this times the write to the page cache.
+  // `total`. The fdatasync below then makes the bytes durable, also inside
+  // `total`, so every arm's bar ends at the same guarantee.
   double flush_s = 0.0;
   unsigned long long flushed_bytes = 0, flushed_blobs = 0;
   int flush_rc = 0;
@@ -605,6 +732,13 @@ int main(int argc, char **argv) {
     flush_rc = fl->GetReturnCode();
     flush_ran = true;
   }
+
+  // DURABILITY BARRIER, inside `total`: see FsyncTiers.
+  size_t synced_files = 0;
+  std::string fsync_error;
+  const char *fsync_spec = std::getenv("CLIO_REPLAY_FSYNC");
+  const double fsync_s = FsyncTiers(fsync_spec != nullptr ? fsync_spec : "",
+                                    &synced_files, &fsync_error);
 
   // ---- Report. ----
   size_t stored_total = 0, in_total = 0, kept = 0, raw = 0, failed = 0;
@@ -637,15 +771,38 @@ int main(int argc, char **argv) {
                            : ctp::CompressionFactory::NameForWireId(lib))
               << " : " << n
               << " chunk(s)\n";
+  // THE MEASURED WINDOW, in the same steady-clock nanoseconds the bdev's I/O
+  // log stamps its writes with (io_log.h's Now()). Without it the harness can
+  // only union whatever intervals the log holds, including any that ran before
+  // the timer opened or after it closed; with it every interval is clipped to
+  // [start, end] first, so the pale segment can never exceed the bar or count
+  // work outside it.
+  std::cout << "  window: start_ns "
+            << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   t_work.time_since_epoch()).count()
+            << "   end_ns "
+            << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count()
+            << std::endl;
   std::cout << "  time: read " << read_s << " s   stage+compress " << stage_s
             << " s   total "
             << std::chrono::duration<double>(
                    std::chrono::steady_clock::now() - t_work).count()
             << " s   (setup " << setup_s << " s, excluded)" << std::endl;
+  if (synced_files > 0 || fsync_s > 0.0) {
+    std::cout << "  fsync: " << synced_files << " file(s) in " << fsync_s
+              << " s" << std::endl;
+  }
   if (flush_ran) {
     std::cout << "  flush: " << flushed_blobs << " blob(s), " << flushed_bytes
               << " B moved to durable storage in " << flush_s << " s  (rc="
               << flush_rc << ")" << std::endl;
+  }
+
+  // Outside every timer above: the digest is verification bookkeeping.
+  if (const size_t missing = FillDigestsFromSource(&records)) {
+    std::cerr << "digest: could not re-read the source of " << missing
+              << " blob(s)\n";
   }
 
   if (!opt.report.empty()) {
@@ -681,6 +838,14 @@ int main(int argc, char **argv) {
   }
 
   int rc = failed ? 1 : 0;
+  // THE BARRIER IS PART OF THE MEASUREMENT. A run whose bytes were never made
+  // durable has not measured what this figure claims, so it fails outright --
+  // the harness must not be able to record a time for it. One line in the same
+  // grep-able shape as VERIFIED:/BOUND OK: above.
+  if (!fsync_error.empty()) {
+    std::cout << "FSYNC FAILED: " << fsync_error << std::endl;
+    rc = 1;
+  }
   if (opt.verify && !verify_records(records)) rc = 1;
   // A bound violation is a FAILED run. Evaluated after verify_records, which
   // is what populates the counters, and independently of it: under --check-bound

@@ -215,13 +215,22 @@ ARGS=(--dir "$FIELDS" --ext "$EXT" --chunk "$CHUNK"
 # Decoded bytes for an external checker (the directory must exist).
 [ -n "${REPLAY_DUMP_DECOMPRESSED:-}" ] && ARGS+=(--dump-decompressed "$REPLAY_DUMP_DECOMPRESSED")
 
+# CLIO_NEUROPRESS_SELECTION_LOG is a VALIDATION log, not free: per chunk it
+# records the chosen codec plus a byte-by-byte FNV-1a hash of the input chunk
+# (compressor_runtime.cc:1444) and a GPU->host copy and hash of the compressed
+# payload (neuropress_telemetry.cc:254). That is ~19 ms per 8 MiB chunk inside
+# the compressor, paid by compressed arms only -- Baseline never enters it.
+# SELECTION_LOG=0 leaves it unset; figure 9 does, because it times the arms.
+SEL_LOG=""
+[ "${SELECTION_LOG:-1}" = 1 ] && SEL_LOG="$STORE/selection.csv"
+
 export LD_LIBRARY_PATH="$BUILD/bin:/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 START=$(date +%s.%N)
 set +e
 env CLIO_SERVER_CONF="$STORE/compose.yaml" \
     CLIO_WITH_RUNTIME=1 \
     CLIO_REPLAY_COMPRESSOR_POOL=512.0 \
-    CLIO_NEUROPRESS_SELECTION_LOG="$STORE/selection.csv" \
+    ${SEL_LOG:+CLIO_NEUROPRESS_SELECTION_LOG=$SEL_LOG} \
     ${NP_EXPLORE:+$([ "$NP_EXPLORE" = true ] && echo CLIO_NEUROPRESS_EXPLORE_LOG="$STORE/explore.csv")} \
     CTP_LOG_LEVEL="${CTP_LOG_LEVEL:-warning}" \
     ${EB:+CLIO_NEUROPRESS_ERROR_BOUND=$EB} \

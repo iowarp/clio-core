@@ -4,6 +4,7 @@
  */
 
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
+#include <clio_runtime/bdev/io_log.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/worker.h>
 #include <clio_runtime/work_orchestrator.h>
@@ -462,6 +463,11 @@ int MemBdevTransport::LaunchWriteBlocksGpu(const ctp::ipc::FullPtr<WriteTask>& t
 
 clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task) {
   CLIO_TASK_BODY_BEGIN
+  // The RAM tier's transfer, bracketed like the file tier's (see io_log.h), so
+  // a +Tier arm's elapsed I/O is measured on the device it actually used.
+  auto *io_log = IoLog::Get();
+  const long long io_start_ns = io_log->enabled() ? IoLog::Now() : 0;
+  const auto io_t0 = std::chrono::steady_clock::now();
 
   auto *ipc_mgr = CLIO_IPC;
   ctp::ipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
@@ -484,6 +490,13 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
   // from a GPU stream.
   if (!ctp::IsDevicePointer(data_ptr.ptr_)) {
     WriteBlocksCpu(task, data_ptr.ptr_);
+    if (io_log->enabled()) {
+      io_log->Record("ram",
+                     static_cast<unsigned long long>(task->bytes_written_),
+                     io_start_ns,
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - io_t0).count());
+    }
     CLIO_CO_RETURN;
   }
 
@@ -505,6 +518,12 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
 
   task->return_code_ = rc;
   task->bytes_written_ = bytes_written;
+  if (io_log->enabled()) {
+    io_log->Record("ram", static_cast<unsigned long long>(bytes_written),
+                   io_start_ns,
+                   std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - io_t0).count());
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

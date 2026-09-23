@@ -2,9 +2,10 @@
 """Figure 9: end-to-end wall-clock time per workload, lower is better.
 
 (a) the ablation ladder and (b) NeuroPress against fixed codecs. Every bar is
-one run: the solid segment is its write loop, the pale one the input read and
-the final flush (see fig9.md, beside this file, for what that does and does
-not mean).
+one run: the solid segment is compute, the pale one the MEASURED elapsed
+device I/O (the bdev's own write timers, union of the per-write intervals)
+(see fig9.md, beside this file, for what that does and does not mean; CSVs
+from before 2026-09-22 still carry the input read in the pale segment).
 
 THE ARMS, THE WORKLOADS AND THE ERROR BOUNDS ALL COME FROM THE CSV. This script
 carries no data of its own and no fixed arm list -- an earlier version did, and
@@ -28,7 +29,12 @@ from matplotlib.patches import Patch
 FIG_W = 7.16                       # IEEE two-column figure* width, inches
 PLOT_H = 2.35                      # inches of plot area, axis to axis
 FS_TITLE, FS_TICK, FS_LEG, FS_VAL = 8.5, 7, 7, 7   # nothing below 7 pt
-Y_CLIP = 6.5                       # MINUTES; cuSZ/VPIC at 14.2 min must not set this
+# THE CSV IS IN MINUTES, THE CHART IS IN SECONDS. figure_9.sh writes *_min
+# columns; index() multiplies every one of them by this on the way in, so the
+# axis, the value labels, --ylim, the sanity checks and --deduct-setup all
+# speak the same unit and nothing downstream has to convert again.
+SEC_PER_MIN = 60.0
+Y_CLIP = 6.5 * SEC_PER_MIN         # SECONDS; cuSZ/VPIC at 14.2 min must not set this
 Y_AUTO_BELOW = 0.5                 # if max(total) < Y_CLIP*this, rescale to the
                                    # data -- a smoke run is ~4 s and would
                                    # otherwise be invisible against a 390 s axis
@@ -167,7 +173,12 @@ SINGLE_ORDER = [("a", "Baseline"),
 # order and never matched, so a re-plot at a different bound still printed
 # 1e-3. The column is written by figure_9.sh for every row.
 
-FIELDS = ["panel", "workload", "strategy", "compute_min", "io_min", "total_min", "std_min", "ratio", "eb"]
+FIELDS = ["panel", "workload", "strategy", "compute_min", "io_min", "total_min",
+          "std_min", "ratio", "eb", "setup_min"]
+
+# The y-axis caption. A list so --deduct-setup can rewrite it for every axes
+# without threading a flag through draw_bars.
+YLABEL = ["Total wall-clock time (s)"]
 
 
 def _f(v):
@@ -193,17 +204,86 @@ def index(rows):
     """rows -> {(panel, strategy, workload): {compute, io, total, std}}"""
     out, warn = {}, []
     for r in rows:
-        total = _f(r.get("total_min"))
-        comp, io = _f(r.get("compute_min")), _f(r.get("io_min"))
+        def _sec(name):
+            v = _f(r.get(name))
+            return None if v is None else v * SEC_PER_MIN
+        total = _sec("total_min")
+        comp, io = _sec("compute_min"), _sec("io_min")
         if total is None and comp is not None and io is not None:
             total = comp + io          # total is optional when both parts given
         key = (r["panel"].strip(), r["strategy"].strip(), r["workload"].strip())
         # When merging CSVs, a TBD row never replaces a measured one.
         if total is None and out.get(key, {}).get("total") is not None:
             continue
-        out[key] = dict(compute=comp, io=io, total=total, std=_f(r.get("std_min")),
-                        ratio=_f(r.get("ratio")), eb=_f(r.get("eb")))
+        out[key] = dict(compute=comp, io=io, total=total, std=_sec("std_min"),
+                        ratio=_f(r.get("ratio")), eb=_f(r.get("eb")),
+                        bound=(r.get("bound") or "").strip(),
+                        payload=_f(r.get("payload_mib")),
+                        setup=_sec("setup_min"))
     return out, warn
+
+
+def deduct_setup(D):
+    """Take cuSZ's per-chunk resource-manager build out of every bar.
+
+    cuSZ's rev1 C API has no reset and no reuse contract, so the wrapper
+    constructs a CUDA stream and a psz_resource -- histogram, Huffman book,
+    quantisation buffers -- and destroys both for EVERY chunk. figure_9.sh
+    measures exactly those three calls per chunk (cusz.h's SetupLog) and sums
+    them into `setup_min`; this removes that sum from the compute segment, so a
+    bar shows what the codec would cost if the library let its state be reused.
+
+    NOT the default. The measured figure is the honest one -- this is the
+    library a user would actually link -- and only cuSZ has a column to remove,
+    so a deducted chart must say so in its axis label. Applied to EVERY arm,
+    not just the cuSZ ones: a NeuroPress arm that routes some chunks to cuSZ
+    pays the same construction and gets the same credit.
+
+    @param D index() output; modified in place.
+    @return seconds removed, summed over every bar that had any.
+    """
+    removed = 0.0
+    for v in D.values():
+        u = v.get("setup")
+        if not u or v.get("total") is None:
+            continue
+        u = min(u, v["total"])
+        v["total"] -= u
+        if v.get("compute") is not None:
+            # The manager is host-side construction, so it sits in the solid
+            # compute segment; the pale I/O segment is untouched.
+            v["compute"] = max(0.0, v["compute"] - u)
+        removed += u
+    return removed
+
+
+def payload_text(mib):
+    """How much data one bar moved, for the axis label.
+
+    @param mib Payload replayed by that workload's arms, in MiB.
+    @return "4 GiB", "512 MiB", or "" when the CSV did not record it.
+    """
+    if not mib:
+        return ""
+    return f"{mib / 1024:.3g} GiB" if mib >= 1024 else f"{mib:.3g} MiB"
+
+
+def workload_labels(D, workloads):
+    """Axis labels: the workload, and under it the payload its arms replayed.
+
+    A merged CSV can hold workloads measured at different sizes, and a bar
+    means nothing without the bytes behind it.
+
+    @param D Indexed rows from index().
+    @param workloads Workload names, left to right.
+    @return One label per workload.
+    """
+    out = []
+    for w in workloads:
+        sizes = {d.get("payload") for k, d in D.items() if k[2] == w and d.get("payload")}
+        size = payload_text(max(sizes)) if sizes else ""
+        out.append(f"{w}\n{size}" if size else w)
+    return out
 
 
 def blend_to_white(hexcolor, frac):
@@ -387,7 +467,7 @@ def draw_bars(ax, D, items, workloads, nmax, ylim, dec, fs, spare, warn):
     @param items (panel, arm) pairs in plotting order.
     @param workloads Workload names, left to right.
     @param nmax Slots per group.
-    @param ylim Y-axis limit, minutes.
+    @param ylim Y-axis limit, seconds.
     @param dec Decimals on the value labels.
     @param fs Value-label font size, from label_size().
     @param spare Fallback-colour assignments, shared across figures.
@@ -415,7 +495,8 @@ def draw_bars(ax, D, items, workloads, nmax, ylim, dec, fs, spare, warn):
                 ax.bar(x, drawn - solid, bottom=solid, width=slot * BAR_W,
                        linewidth=0, color=blend_to_white(col, IO_BLEND), zorder=3)
             clipped = total > ylim
-            ax.annotate(f"{total:.{dec}f}", (x, drawn),
+            top = drawn
+            ax.annotate(f"{total:.{dec}f}", (x, top),
                         xytext=(0, -1.5 if clipped else 1.5),
                         textcoords="offset points", ha="center",
                         va="top" if clipped else "bottom", rotation=90,
@@ -423,11 +504,13 @@ def draw_bars(ax, D, items, workloads, nmax, ylim, dec, fs, spare, warn):
     ax.set_xlim(-0.5, len(workloads) - 0.5)
     ax.set_ylim(0, ylim)
     ax.set_xticks(range(len(workloads)))
-    ax.set_xticklabels(workloads, fontsize=FS_TITLE, color=INK)
+    ax.set_xticklabels(workload_labels(D, workloads), fontsize=FS_TITLE, color=INK)
     ax.tick_params(axis="x", length=0, pad=4)
     ax.tick_params(axis="y", labelsize=FS_TICK, colors=INK_MUTED, width=0.6,
                    length=2.5)
-    ax.set_ylabel("Total wall-clock time (min)", fontsize=FS_TICK, color=INK)
+    # RELABELLED when a deduction was applied, so a chart can never be mistaken
+    # for the measured one: the reader is told what was taken out of every bar.
+    ax.set_ylabel(YLABEL[0], fontsize=FS_TICK, color=INK)
     ax.grid(axis="y", color=GRID, linewidth=0.6, zorder=0)
     ax.set_axisbelow(True)
     for side in ("top", "right"):
@@ -471,9 +554,13 @@ def draw_key(fig, D):
     @param fig The figure.
     @param D Indexed rows from index(), for the error bound.
     """
-    key = [Patch(facecolor=KEY_GREY, linewidth=0, label="write loop"),
+    # NOT "compute". The solid segment is total minus the measured device I/O,
+    # so it also holds scheduling, allocation and per-chunk library setup --
+    # on the cuSZ arm 82% of the bar is the resource manager being built and
+    # torn down, which a reader would never guess from the word "compute".
+    key = [Patch(facecolor=KEY_GREY, linewidth=0, label="non-I/O elapsed"),
            Patch(facecolor=blend_to_white(KEY_GREY, IO_BLEND), linewidth=0,
-                 label="input read + final flush"),
+                 label="device I/O (measured)"),
            Patch(facecolor=KEY_GREY, edgecolor="white", linewidth=0,
                  hatch=TIER_HATCH, label="+Tier: RAM tier over NVMe")]
     ebs = lossy_bounds(D)
@@ -496,7 +583,7 @@ def render_single(path, D, items, workloads, ylim, dec, spare, warn, title):
     @param D Indexed rows from index().
     @param items (panel, arm) pairs in plotting order.
     @param workloads Workload names, left to right.
-    @param ylim Y-axis limit, minutes.
+    @param ylim Y-axis limit, seconds.
     @param dec Decimals on the value labels.
     @param spare Fallback-colour assignments, shared across figures.
     @param warn Collects arms that had a total but no compute/I-O split.
@@ -525,7 +612,7 @@ def pick_ylim(D, forced):
 
     @param D Indexed rows from index().
     @param forced --ylim from the command line, or None.
-    @return (ylim in minutes, decimals for the value labels).
+    @return (ylim in seconds, decimals for the value labels).
     """
     totals = [d["total"] for d in D.values() if d["total"] is not None]
     dmax = max(totals) if totals else Y_CLIP
@@ -534,10 +621,13 @@ def pick_ylim(D, forced):
     else:
         ylim = dmax * HEADROOM
         if dmax < Y_CLIP * Y_AUTO_BELOW:
-            print(f"note: max total {dmax:.4g} min is far below the {Y_CLIP:g} "
-                  f"min paper limit; y-axis fitted to {ylim:.4g}. Pass --ylim "
+            print(f"note: max total {dmax:.4g} s is far below the {Y_CLIP:g} "
+                  f"s paper limit; y-axis fitted to {ylim:.4g}. Pass --ylim "
                   "to override.\n")
-    return ylim, (1 if ylim >= 2 else (2 if ylim >= 0.3 else 3))
+    # Decimals from the SMALLEST bar: an axis stretched by one slow arm used
+    # to print every fast arm as "0.2", hiding the differences between them.
+    lo = min(totals) if totals else ylim
+    return ylim, (1 if lo >= 2 else (2 if lo >= 0.2 else 3))
 
 
 def main():
@@ -551,7 +641,14 @@ def main():
                     help="write an empty CSV with just the header and exit")
     ap.add_argument("--out", default="figures", help="output directory (default: figures)")
     ap.add_argument("--ylim", type=float, default=None,
-                    help="y-axis limit in MINUTES (default: fitted to the data)")
+                    help="y-axis limit in SECONDS (default: fitted to the data)")
+    ap.add_argument("--deduct-setup", action="store_true",
+                    help="subtract each arm's measured cuSZ resource-manager "
+                         "construction (setup_min) from its bar; the chart is "
+                         "relabelled to say so (default: plot what was measured)")
+    ap.add_argument("--panels", action="store_true",
+                    help="also write the per-panel figures fig9a_ablation.png "
+                         "and fig9b_baselines.png (default: the single chart only)")
     args = ap.parse_args()
 
     if args.write_template:
@@ -569,11 +666,32 @@ def main():
         return 2
     rows = [r for c in args.csv for r in load(c)]
     D, _ = index(rows)
+    if args.deduct_setup:
+        cut = deduct_setup(D)
+        if cut == 0.0:
+            print("note: --deduct-setup had nothing to remove; no row carries a "
+                  "setup_min (only runs after 2026-09-22 measure it)",
+                  file=sys.stderr)
+        else:
+            print(f"--deduct-setup: removed {cut:.2f} s of cuSZ "
+                  f"resource-manager construction across the chart")
+            YLABEL[0] = ("Wall-clock time (s)\n"
+                         "excl. cuSZ per-chunk resource-manager build")
     workloads = workload_order(rows)
     order_a = panel_order(rows, "a", ORDER_A)
     order_b = panel_order(rows, "b", ORDER_B)
+    # Panel (b)'s NeuroPress arms are normally left off the single chart --
+    # panel (a)'s ladder already carries NeuroPress. When a run measured no
+    # panel (a) NP arm (an --only campaign, say), dropping them would leave the
+    # chart with no NeuroPress bar at all, so they come back in.
+    # The duplicate is panel (a)'s LOSSY NP rung, not any NP arm: panel (b)'s
+    # NeuroPress runs at the same bound, so the two would draw one measurement
+    # twice. A lossless-only campaign has no such rung and keeps them.
+    has_np_lossy_a = any((D.get(("a", s, w)) or {}).get("eb")
+                         for s in order_a if s.startswith("NP") for w in workloads)
     single = ([("a", s) for s in order_a] +
-              [("b", s) for s in order_b if base_name(s) != "NeuroPress"])
+              [("b", s) for s in order_b
+               if not has_np_lossy_a or base_name(s) != "NeuroPress"])
     single = ([x for x in SINGLE_ORDER if x in single] +
               [x for x in single if x not in SINGLE_ORDER])
 
@@ -585,10 +703,12 @@ def main():
     ylim, dec = pick_ylim(D, args.ylim)
     os.makedirs(args.out, exist_ok=True)
     spare, warn, pngs = {}, [], []
-    for items, title, name in (
-            ([("a", s) for s in order_a], "(a) Ablation", "fig9a_ablation.png"),
-            ([("b", s) for s in order_b], "(b) External baselines", "fig9b_baselines.png"),
-            (single, None, "fig9.png")):
+    figures = [(single, None, "fig9.png")]
+    if args.panels:
+        figures = [([("a", s) for s in order_a], "(a) Ablation", "fig9a_ablation.png"),
+                   ([("b", s) for s in order_b], "(b) External baselines",
+                    "fig9b_baselines.png")] + figures
+    for items, title, name in figures:
         if not items:
             print(f"note: no rows for {name}; not written")
             continue

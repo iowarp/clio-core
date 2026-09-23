@@ -1700,10 +1700,17 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                             ? context.actual_decompress_time_ms_
                             : 0.0))};
 
-            // Device-resident statistics when the selection had them, so the SGD kernel reads...
+            // This chunk's own statistics, from the host features (see below).
             const auto sgd_t0 = std::chrono::steady_clock::now();
+            // NOT sel_device_stats. That is a per-thread scratch buffer, and this
+            // chunk suspended on its compression (CLIO_CO_AWAIT above) while other
+            // chunks' selections on the same worker overwrote it: an SGD step
+            // reading it trained on ANOTHER chunk's features (97.8% of steps on
+            // AI, CUDA_INFERENCE_AUDIT.md P0). `features` carries this chunk's own
+            // statistics, read from that buffer right after selection, before
+            // any suspension; nullptr makes the kernel use them.
             bool trained = neuropress_predictor_->TrainDeviceStats(
-                features, labels, sel_device_stats);
+                features, labels, nullptr);
             phases.sgd_ms += ms_since(sgd_t0);
             if (trained) ++phases.sgd_updates;
             /** kModelChanged for the host-decided reuse path. */
@@ -2391,11 +2398,14 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             explore_features.swap(sorted_feats);
             explore_labels.swap(sorted_labels);
 
-            // Same chunk, so the same device statistics -- exploration varies the ACTION, not the data....
+            // Same chunk, so the same statistics -- exploration varies the ACTION, not the data.
             phases.explored = static_cast<int>(alternatives.size());
             const auto explore_sgd_t0 = std::chrono::steady_clock::now();
+            // nullptr for the same reason as the primary step: the device
+            // buffer may belong to another chunk by now; the host features
+            // carry this chunk's statistics.
             bool explore_trained = neuropress_predictor_->TrainDeviceStats(
-                explore_features, explore_labels, sel_device_stats);
+                explore_features, explore_labels, nullptr);
             const double explore_sgd_ms = ms_since(explore_sgd_t0);
             phases.sgd_ms += explore_sgd_ms;
             explore_inner_ms += explore_sgd_ms;
@@ -2600,6 +2610,15 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // Create compressor with specified preset
     const auto factory_t0 = std::chrono::steady_clock::now();
     auto compressor = ctp::CompressionFactory::GetPreset(library_name, preset);
+    // THE REQUESTED BOUND, not the preset's. GetPreset builds a lossy codec
+    // from a three-value menu (FAST 1e-2 / BALANCED 1e-3 / BEST 1e-4); the
+    // caller's actual error bound never reached it, so any request off that
+    // menu silently ran at the nearest preset while the verifier checked the
+    // number that was asked for. A lossless codec returns false and is
+    // unaffected.
+    if (compressor && context.error_bound_ > 0.0) {
+      compressor->SetErrorBound(context.error_bound_);
+    }
     ChunkPhases compress_phases;  // phase log
     compress_phases.factory_ms =
         std::chrono::duration<double, std::milli>(
@@ -3882,6 +3901,10 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   auto compressor = ctp::CompressionFactory::GetPreset(library_name, preset);
   if (!compressor) {
     return false;
+  }
+  // The requested bound, as at the primary compress site above.
+  if (ctx.error_bound_ > 0.0) {
+    compressor->SetErrorBound(ctx.error_bound_);
   }
   auto t0 = std::chrono::high_resolution_clock::now();
 

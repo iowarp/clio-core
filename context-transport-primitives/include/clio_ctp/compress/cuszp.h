@@ -120,9 +120,14 @@ class Cuszp : public Compressor {
           ToDeviceInput(input, input_size, stream, &free_in));
       if (d_in == nullptr) break;
 
-      // cuSZp writes into a caller-provided device buffer; size it for the
-      // worst case (no larger than the original data).
-      if (cudaMalloc(&d_cmp, input_size) != cudaSuccess) break;
+      // cuSZp writes into a caller-provided device buffer and documents no
+      // worst-case size. Its fixed-length blocks can exceed the input once the
+      // per-block bit width nears 32 (sign and outlier bytes ride on top), so
+      // an input-sized buffer is not a bound. Twice the input plus slack is;
+      // it costs only transient device memory.
+      if (cudaMalloc(&d_cmp, CompressCapacity(input_size)) != cudaSuccess) {
+        break;
+      }
 
       size_t cmp_size = 0;
       uint3 dims = {0, 0, 0};  // ignored for 1D
@@ -268,8 +273,22 @@ class Cuszp : public Compressor {
     return ok;
   }
 
-  /** Set the absolute error bound. */
-  void SetErrorBound(float eb) { eb_ = eb; }
+  /**
+   * Point this codec at the bound the caller asked for (Compressor override).
+   *
+   * Takes a double to match the Compressor interface and narrows to the float
+   * cuSZp's C API wants. The MODE is untouched (CUSZP_MODE_OUTLIER, matching
+   * upstream), so cuSZp's own quantization logic still decides how the bound
+   * is applied -- only the tolerance comes from the caller.
+   *
+   * @param eb absolute error bound; ignored when <= 0.
+   * @return true when the bound was taken.
+   */
+  bool SetErrorBound(double eb) override {
+    if (!(eb > 0.0)) return false;
+    eb_ = static_cast<float>(eb);
+    return true;
+  }
   /** Get the absolute error bound. */
   float GetErrorBound() const { return eb_; }
 
@@ -279,6 +298,17 @@ class Cuszp : public Compressor {
   // 1024). Inputs with nbEle <= this are single-block; see the retain logic in
   // Compress for why that case is handled specially.
   static constexpr size_t kBlockElems = 32 * 1024;
+  /**
+   * Device buffer size handed to cuSZp_compress for an input of `input_size`
+   * bytes: twice the input plus 64 KiB, a generous bound on its fixed-length
+   * block encoding.
+   *
+   * @param input_size Input bytes.
+   * @return Bytes to allocate for cuSZp's output.
+   */
+  static size_t CompressCapacity(size_t input_size) {
+    return 2 * input_size + 65536;
+  }
 
   // Self-describing prefix carried ahead of the cuSZp codestream. 32 bytes,
   // 8-aligned so the codestream that follows stays aligned for cuSZp.

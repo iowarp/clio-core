@@ -3,11 +3,13 @@
  * All rights reserved.
  */
 
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <clio_runtime/bdev/transports/fs_bdev_transport.h>
+#include <clio_runtime/bdev/io_log.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/worker.h>
@@ -320,6 +322,12 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
   ctp::ipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
 
   bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
+  // I/O STARTS HERE, at the device-to-host copy, and ends when the last block
+  // is written: upstream's VOL brackets the same span (d2h copy + queue wait
+  // + drain) as I/O. Off unless CLIO_IO_LOG names a file.
+  auto *io_log = IoLog::Get();
+  const long long io_start_ns = io_log->enabled() ? IoLog::Now() : 0;
+  const auto io_t0 = std::chrono::steady_clock::now();
   std::vector<char> staging;
   if (data_on_device) {
     staging.resize(task->length_);
@@ -378,6 +386,12 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
   }
 
   task->return_code_ = 0;
+  if (io_log->enabled()) {
+    io_log->Record("file", static_cast<unsigned long long>(total_bytes_written),
+                   io_start_ns,
+                   std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - io_t0).count());
+  }
   task->bytes_written_ = total_bytes_written;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

@@ -1,0 +1,58 @@
+diff --git a/psz/src/compressor.inl b/psz/src/compressor.inl
+index 009af9c..49d2428 100644
+--- a/psz/src/compressor.inl
++++ b/psz/src/compressor.inl
+@@ -89,6 +89,24 @@ PPL_IMPL(int)::compress_analysis(psz_ctx* ctx, PSZ_BUF* mem, T* in, u4* h_hist,
+   const auto predictor = PIPELINE.predictor;
+   const auto radius = RC.radius;
+ 
++  /* EVERY predictor kernel claims its outlier slots with atomicAdd on this one
++     counter, so it MUST start at zero for each compression. It used to be reset
++     only inside the Spline branch below, which left a REUSED psz_resource
++     counting on from the previous chunk's total: the outlier array kept the
++     previous chunk's entries at the front, header->splen covered them, and
++     decompression scattered those stale values into the new chunk -- decoding
++     to the field's own magnitude (max|err| 199.7 against eb 1e-3 on Nyx) from
++     the second use of a manager onward.
++
++     That is the pattern example/src/batch_run.cc documents -- one manager
++     created before the file loop, every file compressed through it, released
++     once -- so the batch example itself produces wrong output past its first
++     file with the Lorenzo predictor. (It also carries an unrelated-looking
++     "!!!! TODO (root cause?)" memset of the DECOMPRESSED buffer between
++     iterations; that one is on d_decomp, not on this counter, and this fix
++     does not explain it.) Hoisted here so manager reuse is safe. */
++  memset_device(mem->buf_outlier2()->num_d(), 1, 0);
++
+   if (PIPELINE.predictor == Lorenzo)
+     GPU_c_lorenzo_nd<T, Toggle::ZigZag_Off>::compressor_kernel(
+         mem, make_view(in, len), eb, radius, stream);
+@@ -98,7 +116,6 @@ PPL_IMPL(int)::compress_analysis(psz_ctx* ctx, PSZ_BUF* mem, T* in, u4* h_hist,
+   else if (PIPELINE.predictor == Spline) {
+     mem->set_spline_variant(ctx->spline_variant);       // anchor sizing before anchor_len3()
+     ctx->header->spline_variant = ctx->spline_variant;  // persist for decompress dispatch
+-    memset_device(mem->buf_outlier2()->num_d(), 1, 0);
+     if constexpr (std::is_same_v<T, f4>)
+       psz::module::GPU_c_spline<T, E>::kernel_v1(
+           make_view(in, len), make_view(mem->eq_d(), len),
+@@ -135,6 +152,12 @@ PPL_IMPL(int)::compress(psz_ctx* ctx, PSZ_BUF* mem, T* in, u1** out, size_t* out
+   const HFR_Opts hfr_opts{ctx->cli ? ctx->cli->hfr_rmerge_count : 3};
+ 
+   auto compress_predict = [&]() -> int {
++    /* Zeroed for EVERY predictor, not just Spline -- see compress_analysis
++       above. This is the reset that makes a psz_resource safe to reuse across
++       chunks; without it the second and later compressions through one manager
++       emit the previous chunk's outliers and decode to garbage. */
++    memset_device(mem->buf_outlier2()->num_d(), 1, 0);
++
+     if (predictor == Lorenzo)
+       GPU_c_lorenzo_nd<T, Toggle::ZigZag_Off>::compressor_kernel(
+           mem, make_view(in, len), eb, radius, stream);
+@@ -147,7 +170,6 @@ PPL_IMPL(int)::compress(psz_ctx* ctx, PSZ_BUF* mem, T* in, u1** out, size_t* out
+     else if (predictor == Spline) {
+       mem->set_spline_variant(ctx->spline_variant);       // anchor sizing before anchor_len3()
+       ctx->header->spline_variant = ctx->spline_variant;  // persist for decompress dispatch
+-      memset_device(mem->buf_outlier2()->num_d(), 1, 0);
+       if constexpr (std::is_same_v<T, f4>)
+         psz::module::GPU_c_spline<T, E>::kernel_v1(
+             make_view(in, len), make_view(mem->eq_d(), len),
