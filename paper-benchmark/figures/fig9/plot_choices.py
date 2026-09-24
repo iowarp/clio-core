@@ -43,6 +43,7 @@ import sys
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
@@ -78,6 +79,62 @@ CODEC_COLORS = {
 }
 FALLBACK_COLORS = ["#e87ba4", "#006435", "#4b4a47"]
 OTHER_COLOR = "#d6d5d1"
+
+# ---------------------------------------------------------------------------
+# PAPER STYLE -- the serif, gridded, boxed-legend look, as a named style rather
+# than a fork of the plotter. Everything below is a deviation from the default
+# sans style above; the data path is shared.
+# ---------------------------------------------------------------------------
+#: Serif stack, best first. Nimbus Roman is URW's Times clone and is what a
+#: Times-set paper matches; STIXGeneral is the maths-companion fallback.
+SERIF = ["Nimbus Roman", "STIXGeneral", "DejaVu Serif", "serif"]
+
+# GREYSCALE SEPARATION, which EuroSys requires outright ("Graphs and figures
+# should be readable when printed in grayscale, without magnification").
+# Hue alone does not survive the conversion: measured on this palette, `ans`
+# and `snappy` land on 118 and 119 of 255 -- indistinguishable -- and eight
+# pairs fall inside 0.06 of relative luminance. Identity is therefore carried
+# by the segment's own label first and a texture second, never by colour.
+# Ordered so the most-chosen codecs get the least busy fills.
+CODEC_HATCH = {
+    "nvcomp-ans":          "",
+    "nvcomp-bitcomp":      "/",
+    "nvcomp-zstd":         "\\",
+    "raw(not-beneficial)": "",
+    "nvcomp-lz4":          "x",
+    "nvcomp-snappy":       "-",
+    "nvcomp-cascaded":     ".",
+    "nvcomp-gdeflate":     "o",
+    "nvcomp-deflate":      "+",
+    "(other)":             "",
+}
+
+
+def hatch_for(codec: str) -> str:
+    """Texture for a codec, or "" for a solid fill."""
+    return CODEC_HATCH.get(codec, "")
+# EuroSys 2027 sizes the figure and its type together: the text block is
+# 178 x 229 mm (7 x 9 in), and ">=10-point font ... applies to all text,
+# including figures and captions". A font size only means 10 pt if the figure
+# is placed at the width it was drawn at, so fig_w IS the 7 in text block and
+# the caller must \includegraphics[width=\textwidth] with no rescaling.
+# Shrinking this figure to one column scales every number below with it and
+# breaks the rule -- redraw at fig_w 3.35 instead, do not scale.
+PAPER = {
+    "fig_w": 7.0,          # inches = the 178 mm text block, placed 1:1
+    "plot_h": 2.30,
+    "bar_w": 0.62,
+    "fs_title": 11,
+    "fs_axis": 10,         # y label
+    "fs_tick": 10,
+    "fs_val": 10,          # in-segment label
+    "fs_key": 10,          # the lines under each bar
+    "fs_leg": 10,
+    "grid": "#b8b8b8",
+    "edge": "#3a3a3a",     # bar outline
+    "label_floor": 3.0,    # percent: smaller segments carry no number
+    "name_floor": 9.0,     # percent: above this the segment names its codec
+}
 
 #: No title by default: in a paper the caption carries it, and a title
 #: inside the figure duplicates the caption and costs plot height. Pass
@@ -196,6 +253,205 @@ def colour_for(codec: str, taken: dict) -> str:
     if codec not in taken:
         taken[codec] = FALLBACK_COLORS[len(taken) % len(FALLBACK_COLORS)]
     return taken[codec]
+
+
+def assert_no_overlap(fig, artists, legend) -> None:
+    """Fail loudly if any labelled artist collides with the legend box.
+
+    Layout here is hand-budgeted in inches, which is precise but brittle: a
+    font-size or legend-row change moves a box and the collision is only
+    visible by opening the PNG. This re-measures after layout instead.
+
+    :param fig: the drawn figure, before savefig
+    :param artists: text artists that must stay clear of the legend
+    :param legend: the legend whose frame they must not touch
+    :raises RuntimeError: naming the first collision found
+    """
+    fig.canvas.draw()
+    rend = fig.canvas.get_renderer()
+    lb = legend.get_window_extent(rend)
+    for a in artists:
+        ab = a.get_window_extent(rend)
+        if ab.overlaps(lb):
+            raise RuntimeError(
+                f"layout collision: {a.get_text()!r} overlaps the legend "
+                f"(text y {ab.y0:.0f}-{ab.y1:.0f}, legend y {lb.y0:.0f}-"
+                f"{lb.y1:.0f}); raise legend_h/key_h in PAPER")
+
+
+def check_eurosys(fig, ax, segs_drawn, min_pt: float = 10.0) -> list:
+    """Check a drawn figure against the EuroSys 2027 CFP, and report failures.
+
+    The CFP sets two rules that a default chart breaks, both checked here
+    rather than by opening the PNG:
+
+      ">=10-point font ... applies to all text, including figures and captions"
+        Every Text artist is measured. A point size only MEANS 10 pt if the
+        figure is placed at the width it was drawn at, so the figure width is
+        reported alongside for the caller to match with \includegraphics.
+
+      "Graphs and figures should be readable when printed in grayscale"
+        Hue is dropped and each vertically adjacent pair of segments is
+        checked: it must differ in relative luminance, OR carry a different
+        hatch, OR both be labelled. Colour alone never counts.
+
+    :param fig: the drawn figure
+    :param ax: its axis
+    :param segs_drawn: [(workload, [(codec, pct, colour, hatch, labelled)])]
+    :param min_pt: the CFP minimum, in points
+    :return: list of human-readable failures; empty means compliant
+    """
+    fails = []
+    w_in, h_in = fig.get_size_inches()
+    if w_in > 7.001:
+        fails.append(f"width {w_in:.2f} in exceeds the 7 in (178 mm) text block")
+
+    small = sorted({round(t.get_fontsize(), 1) for t in fig.findobj(mpl.text.Text)
+                    if t.get_text().strip() and t.get_fontsize() < min_pt})
+    if small:
+        fails.append(f"font sizes below {min_pt} pt: {small}")
+
+    def lum(hex_or_rgb):
+        r, g, b = mpl.colors.to_rgb(hex_or_rgb)
+        f = lambda c: c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+        return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+
+    for wl, segs in segs_drawn:
+        for (c1, p1, col1, h1, lab1), (c2, p2, col2, h2, lab2) in zip(segs, segs[1:]):
+            if abs(lum(col1) - lum(col2)) >= 0.06:
+                continue                      # separable by tone alone
+            if (h1 or "") != (h2 or ""):
+                continue                      # separable by texture
+            if lab1 and lab2:
+                continue                      # each says its own name
+            fails.append(
+                f"{wl}: {pretty(c1)} and {pretty(c2)} are adjacent, differ by "
+                f"{abs(lum(col1) - lum(col2)):.3f} luminance, share a hatch, "
+                f"and are not both labelled -- they merge in grayscale")
+    return fails
+
+
+def draw_paper(data, shuffles, out_path: str, title: str) -> None:
+    """The serif, gridded, boxed-legend rendering of the share chart.
+
+    Differences from draw() that are deliberate, not incidental:
+
+      SEGMENTS CARRY THE PERCENTAGE ONLY, not the codec name. That trades the
+      legend-free reading draw() gives for a cleaner bar, and costs the reader
+      one colour lookup per segment. Keep the legend below the axis so the
+      lookup is short.
+      EVERY CODEC GETS ITS OWN SEGMENT at a high enough --top; there is no
+      "(other)" tail in this style, so pass --top 8 to match.
+
+    :param data: [(workload, chunks, [(codec, count, pct)])] in display order
+    :param shuffles: {workload: pct} or {} to omit the shuffle line
+    :param out_path: PNG to write
+    :param title: bold serif heading; "" draws none
+    """
+    P = PAPER
+    with mpl.rc_context({"font.family": "serif", "font.serif": SERIF,
+                         "mathtext.fontset": "stix",
+                         "hatch.linewidth": 0.6}):
+        # Measured, not guessed. The key under the axis holds up to three
+        # 10 pt lines (workload / chunks / shuffled), the lowest of which sits
+        # 40 pt below the axis; the legend box is two 10 pt rows plus its own
+        # border padding, about 0.58 in tall, sitting 0.012 fig-fractions up.
+        # The previous 0.52 + 0.62 put the legend's top edge through the
+        # "shuffled" line. assert_no_overlap() below re-checks this after
+        # layout, so a font or row-count change cannot silently reintroduce it.
+        legend_h = 0.70
+        key_h = 0.68 if shuffles else 0.40
+        head_h = 0.34 if title else 0.12
+        fig_h = legend_h + key_h + P["plot_h"] + head_h
+        fig = plt.figure(figsize=(P["fig_w"], fig_h))
+        ax = fig.add_axes([0.085, (legend_h + key_h) / fig_h, 0.885,
+                           P["plot_h"] / fig_h])
+
+        taken: dict = {}
+        weight: dict = collections.defaultdict(float)
+        segs_drawn = []
+        for i, (wl, _n, segs) in enumerate(data):
+            bottom = 0.0
+            drawn = []
+            for codec, _c, pct in segs:
+                weight[codec] += pct
+                ax.bar(i, pct, P["bar_w"], bottom=bottom,
+                       color=colour_for(codec, taken), edgecolor=P["edge"],
+                       linewidth=0.7, hatch=hatch_for(codec), zorder=3)
+                if pct >= P["label_floor"]:
+                    fg = INK if codec == "(other)" else "white"
+                    # NAME, not just a number, wherever it fits: in greyscale
+                    # the fill cannot identify the codec, so the text must.
+                    txt = (f"{pretty(codec)}\n{pct:.0f}%"
+                           if pct >= P["name_floor"] else f"{pct:.0f}%")
+                    ax.text(i, bottom + pct / 2.0, txt, ha="center",
+                            va="center", fontsize=P["fs_val"], color=fg,
+                            zorder=5, linespacing=1.2)
+                drawn.append((codec, pct, colour_for(codec, taken),
+                              hatch_for(codec), pct >= P["name_floor"]))
+                bottom += pct
+            segs_drawn.append((wl, drawn))
+
+        ax.set_xticks(range(len(data)))
+        ax.set_xticklabels([wl for wl, _, _ in data], fontsize=P["fs_tick"],
+                           color="black")
+        ax.set_xlim(-0.62, len(data) - 0.38)
+        ax.set_ylim(0, 100)
+        ax.set_yticks([0, 20, 40, 60, 80, 100])
+        ax.tick_params(axis="y", labelsize=P["fs_tick"], colors="black")
+        ax.set_ylabel("Percentage of chunks (%)", fontsize=P["fs_axis"],
+                      color="black", labelpad=6)
+        if title:
+            ax.set_title(title, fontsize=P["fs_title"], color="black",
+                         fontweight="bold", pad=12)
+        ax.yaxis.grid(True, color=P["grid"], linewidth=0.8, linestyle=(0, (5, 4)),
+                      zorder=0)
+        ax.set_axisbelow(True)
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        for sp in ("left", "bottom"):
+            ax.spines[sp].set_color("black")
+            ax.spines[sp].set_linewidth(0.9)
+
+        keys = []
+        for i, (wl, n, _segs) in enumerate(data):
+            keys.append(ax.annotate(
+                f"{n} chunks", (i, 0), xytext=(0, -26),
+                textcoords="offset points", ha="center",
+                fontsize=P["fs_key"], color="black", annotation_clip=False))
+            if wl in shuffles:
+                keys.append(ax.annotate(
+                    f"shuffled {shuffles[wl]:.0f}%", (i, 0), xytext=(0, -40),
+                    textcoords="offset points", ha="center",
+                    fontsize=P["fs_key"], color="black",
+                    annotation_clip=False))
+
+        seen = sorted(weight, key=lambda c: (c == "(other)", -weight[c]))
+        handles = [Patch(facecolor=colour_for(c, taken), edgecolor=P["edge"],
+                         linewidth=0.7, hatch=hatch_for(c), label=pretty(c))
+                   for c in seen]
+        leg = fig.legend(handles=handles, loc="lower center",
+                         ncol=min(5, len(handles)), fontsize=P["fs_leg"],
+                         labelcolor="black", bbox_to_anchor=(0.5, 0.012),
+                         handlelength=1.2, handleheight=1.0,
+                         columnspacing=1.5, handletextpad=0.5,
+                         frameon=True, fancybox=True, borderpad=0.7)
+        leg.get_frame().set_edgecolor("#cccccc")
+        leg.get_frame().set_linewidth(0.9)
+        leg.get_frame().set_facecolor("white")
+
+        assert_no_overlap(fig, keys, leg)
+        fails = check_eurosys(fig, ax, segs_drawn)
+        if fails:
+            print("EuroSys compliance FAILED:", file=sys.stderr)
+            for f in fails:
+                print(f"  - {f}", file=sys.stderr)
+        else:
+            w, h = fig.get_size_inches()
+            print(f"  EuroSys checks pass: {w:.2f} x {h:.2f} in, all text "
+                  f">= 10 pt, every adjacent pair separable in grayscale")
+        fig.savefig(out_path, dpi=300, facecolor="white")
+        plt.close(fig)
 
 
 def draw(data, shuffles, out_path: str, title: str) -> None:
@@ -500,6 +756,10 @@ def main() -> int:
                          "same stack in absolute chunks. timeline: one panel "
                          "per workload, y = simulation time. heat: one column "
                          "per workload, cell = dominant codec at that time.")
+    ap.add_argument("--style", default="plain", choices=["plain", "paper"],
+                    help="plain: the sans, label-in-bar default. paper: serif, "
+                         "gridded, boxed legend, percentages only (share mode "
+                         "only; pair with --top 8).")
     ap.add_argument("--bins", type=int, default=32,
                     help="timestep bins for --mode timeline/heat (default 32)")
     ap.add_argument("--out", default="live", help="output directory")
@@ -574,6 +834,8 @@ def main() -> int:
     if args.mode == "count":
         draw_count(data, path, args.title.replace("by workload",
                                                   "by workload (chunk counts)"))
+    elif args.style == "paper":
+        draw_paper(data, shuffles, path, args.title)
     else:
         draw(data, shuffles, path, args.title)
 

@@ -278,6 +278,42 @@ Four modes, all from the same data:
 `--top N` sets how many codecs get their own segment before the rest merge into
 `(other)`; 3 keeps the legend short enough to read at column width.
 
+### EuroSys formatting, and what `--style paper` does about it
+
+`--style paper` (share mode) is drawn to the EuroSys 2027 CFP, which sets two
+requirements a default matplotlib chart fails:
+
+> "≥10-point font … applies to all text, including figures and captions"
+> "Graphs and figures should be readable when printed in grayscale, without
+> magnification"
+
+**Size.** The text block is 178 × 229 mm (7 × 9 in), so the figure is drawn at
+`fig_w = 7.0` and every font in it is 10–11 pt. A point size only *means* 10 pt
+if the figure is placed at the width it was drawn at, so include it with
+`\includegraphics[width=\textwidth]` and **do not scale it**. Shrinking this to
+one column scales the type with it and breaks the rule — redraw at
+`fig_w = 3.35` instead.
+
+**Greyscale.** Hue alone does not survive the conversion. Measured on this
+palette, `ans` and `snappy` land on 118 and 119 of 255 — indistinguishable —
+and eight pairs fall inside 0.06 of relative luminance. So identity is carried
+by the segment's own label first (`bitcomp` / `98%`, not just `98%`) and a
+per-codec hatch second. Colour is decoration, not information. A greyscale
+proof is one line:
+
+```python
+from PIL import Image
+Image.open("live/fig9_choices_paper.png").convert("L").save("/tmp/grey.png")
+```
+
+The palette was checked with the dataviz validator: it passes the lightness
+band and the normal-vision floor, and its two warnings — `gdeflate`↔`cascaded`
+at ΔE 7.7 under protanopia, and three fills under 3:1 against the surface — are
+both discharged by the same labels and textures the greyscale rule required.
+`stored raw` is deliberately the one achromatic fill, matching Baseline's grey
+in the main figure, because it denotes the same outcome: bytes stored
+untouched.
+
 It reads `blobs.csv`, which every arm writes at no cost, so it needs no rerun.
 What it showed on the 2026-09-23 campaign:
 
