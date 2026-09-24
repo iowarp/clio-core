@@ -262,8 +262,21 @@ the codec wrong (the `Best fixed nvCOMP` / `Worst fixed nvCOMP` spread), and the
 histogram shows why the right guess differs.
 
 ```bash
-./plot_choices.py --camp Nyx=<campaign>/nyx --camp VPIC=<campaign>/vpic ... --out live
+./plot_choices.py --mode share --top 3 \
+  --camp Nyx=<campaign>/nyx --camp VPIC=<campaign>/vpic ... --out live
 ```
+
+Four modes, all from the same data:
+
+| `--mode` | what it draws | use it for |
+|---|---|---|
+| `share` (default) | 100%-stacked bar per workload, each segment labelled with its codec and share | **the paper figure.** Reads without the legend |
+| `count` | the same stack in absolute chunks | when sample sizes matter more than composition |
+| `timeline` | one panel per workload, y = simulation time | showing the choice moves *during* a run |
+| `heat` | one column per workload, cell = dominant codec, dotted where the winner is under 2/3 | the most compact; loses magnitude |
+
+`--top N` sets how many codecs get their own segment before the rest merge into
+`(other)`; 3 keeps the legend short enough to read at column width.
 
 It reads `blobs.csv`, which every arm writes at no cost, so it needs no rerun.
 What it showed on the 2026-09-23 campaign:
