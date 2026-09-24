@@ -253,6 +253,54 @@ Measured 2026-09-19/20 on Delta, and worth knowing before submitting:
   `PFS_ROOT`. The tiered arms are off the quota entirely: their tier 2 is the
   node's `/tmp`.
 
+## The companion histogram: what was chosen
+
+`plot_choices.py` draws `live/fig9_choices.png` — one 100%-stacked bar per
+workload, segmented by the codec NeuroPress picked for each chunk. It is the
+motivation counterpart to this figure: panel (b) measures the cost of guessing
+the codec wrong (the `Best fixed nvCOMP` / `Worst fixed nvCOMP` spread), and the
+histogram shows why the right guess differs.
+
+```bash
+./plot_choices.py --camp Nyx=<campaign>/nyx --camp VPIC=<campaign>/vpic ... --out live
+```
+
+It reads `blobs.csv`, which every arm writes at no cost, so it needs no rerun.
+What it showed on the 2026-09-23 campaign:
+
+| workload | top choice | codecs covering 95% | byte-shuffled |
+|---|---|---|---|
+| VPIC   | bitcomp 98.0%    | 1 | 21% |
+| Nyx    | bitcomp 54.5%    | 2 | 97% |
+| LAMMPS | ans 66.3%        | 2 | 100% |
+| WarpX  | zstd 47.2%       | 4 | 21% |
+| AI     | stored raw 79.4% | 3 | 17% |
+
+**The winning codec differs on four of the five**, and on AI the winner is not a
+codec at all: 79.4% of chunks are stored uncompressed because compression grew
+them (mean ratio 0.994). That is a decision a fixed-codec system cannot make.
+
+**VPIC is the control case and should be reported as one.** At 98% one codec, a
+fixed bitcomp would do nearly as well there. The honest claim is that adaptivity
+costs nothing when one codec dominates and wins when none does — not that
+adaptivity always wins.
+
+Two limits on the histogram:
+
+- **It shows the library, not the full configuration.** `blobs.csv` records
+  `compress_lib_` and a *summed* `actual_preproc_time_ms_`; the chosen action's
+  quantize/byte-shuffle booleans never leave the compressor, so `core_tasks.h`
+  has nowhere to carry them. The `shuffled` column above is inferred from
+  `preproc_ms > 0` on the **lossless** arm, where it is exact — quantize is
+  masked to `-INFINITY` without a positive bound. On a lossy arm the two
+  transforms share one accumulator and the split is not recoverable.
+  `SELECTION_LOG=1` logs the flags directly, at the cost of FNV-hashing every
+  input and output byte.
+- **The shares drift run to run.** The chooser learns online: two runs of the
+  same Nyx arm gave 44.1% and 75.6% for the same codec. Ratios reproduce to
+  1–3%; choice shares do not. Cite the spread — how many codecs cover the bar —
+  rather than one codec's percentage, unless the weights were frozen.
+
 ## Caveats to carry into any claim
 
 - The durable writes of an untiered arm happen inside the write loop, so
