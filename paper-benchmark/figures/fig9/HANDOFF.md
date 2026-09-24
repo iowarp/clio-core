@@ -72,15 +72,39 @@ path; the harness knob is `CUSZ_REUSE`, recorded in `run.json`.
 
 ## 2. What is NOT settled — fix these first
 
-### 2.1 cuSZ and cuSZp3 miss the error bound, badly (NO LONGER CHECKED)
+### 2.1 No lossy arm is bound-checked (DECIDED -- figure 9 does not certify bounds)
 
-**Decision (2026-09-23):** `figure_9.sh` no longer runs `--check-bound` on the
-cuSZ and cuSZp3 arms (`--no-verify` instead, `bound` column empty). Both codecs
-quantize internally, and `compressor_runtime.cc` disables our quantizer for
-them. cuSZ's Lorenzo kernel prequantizes with `round(x * 1/(2eb))` in fp32
-(`lrz_c.cu.inl`). cuSZp does `cvt.s32(x * 0.5f/eb)` (`cuSZp_kernels_1D_f32.cu`).
-The bound is their contract, so the figure times them and does not certify
-them. Arms that use our quantizer are still checked.
+**Decision (2026-09-23, superseding the earlier per-codec carve-out):**
+`figure_9.sh` runs `--no-verify` on **every** arm with `eb > 0` -- the external
+codecs (cuSZ, cuSZp3, nvCOMP `-q`, ndzip) *and* NeuroPress's own lossy rungs.
+The `bound` column is empty for all of them, and an empty column means NOT
+CHECKED, never "checked and fine". Lossless arms are still verified bit-exact
+at rep 1.
+
+Figure 9 measures end-to-end wall clock at a *requested* bound. Whether a codec
+honours that bound is an accuracy question and belongs to the accuracy figures,
+which run over the same dumps.
+
+**This changes no number in the figure.** Verification was never inside the
+measurement: the driver prints `total` as `now() - t_work` and calls
+`verify_records()`/`report_bound()` only afterwards, and the `window:
+start_ns/end_ns` that `io_s` is clipped to closes at the same instant, so the
+read-back falls outside `total`, `io` and `compute` alike. Turning it off buys
+job wall clock, not a faster bar. (One asymmetry it does introduce: lossless
+arms still do a rep-1 read-back that lossy arms no longer do, so their rep 2+
+start from a slightly warmer cache.)
+
+Note that dropping `--check-bound` alone is not
+enough: with no flag the driver falls back to a digest comparison that lossy
+data fails by construction, so the read-back is skipped outright.
+
+The `bound_only` machinery in `run_arm` (record-but-flag a bound-exceeded run)
+is now dormant -- nothing passes `--check-bound` any more. It is left in place
+so the flag can be turned back on without re-deriving it.
+
+Two consequences to carry to Chameleon, since nothing will catch them now:
+the cuSZ mis-decode below is **ours to fix**, and no lossy bar in this figure
+carries any quality evidence.
 
 Root cause, checked locally 2026-09-23 on nyx-i96 (12 files, 192 chunks),
 with the verifier compared against each codec run standalone (no Clio code):
@@ -103,14 +127,19 @@ with the verifier compared against each codec run standalone (no Clio code):
 BOUND FAILED: 3354 chunk(s) against eb=1e-3, 2931 exceeded, worst max|err|=1.048576e+03
 ```
 
-**87% of chunks**, worst error the magnitude of the field itself. Identical
-across stock cuSZ, patched cuSZ, per-chunk and reused — so it PREDATES all of
-this work and the reuse fix neither caused nor cured it. It matches the known
-flat-chunk zero-bit-Huffman failure.
+That is what the check reported on the last campaign that ran it: **87% of
+chunks**, worst error the magnitude of the field itself. It was identical
+across stock cuSZ, patched cuSZ, per-chunk and reused, so the manager-reuse fix
+(1.3) neither caused nor cured it.
 
-Until this is understood, **cuSZ and cuSZp3 are not valid entries in a
-quality-matched comparison at any speed**, and the 8.4x speedup does not rescue
-them. This is the single most important thing to fix on Chameleon.
+**STILL OPEN, and it is our code, not cuSZ's:** `cusz.h:511` (and the
+self-test's copy at `:287`) hardcodes `psz_pipeline{Lorenzo, HistGeneric, HF,
+CodecNull}`, while cuSZ's own `DEFAULT_CODEC` is `HFR_V3`
+(`psz/include/cusz/type.h:53`) and that is what upstream NeuroPress uses. `HF`
+mis-decodes flat chunks; `hfr-v3` decodes them exactly. `codec1` selects the
+**encoder** too, so until this is changed the cuSZ bar is timing a non-default
+Huffman variant -- the number may be unrepresentative, not merely uncertified.
+Change the enum in both places; verification is off either way.
 
 Note: an earlier reading of this as "a 0.7% overshoot" was wrong. That number
 (`1.007080e-03`) came from a synthetic probe, not from the campaign.
@@ -235,8 +264,9 @@ against rather than to an assumption about it.
 
 ## 5. Before the all-workload run
 
-1. Bound failures (2.1): no longer checked for cuSZ/cuSZp3. Before trusting
-   their bars, rule out the shared-cause caveat there.
+1. Bound checks are off for every lossy arm (2.1) -- that is decided. What is
+   still open there is cuSZ's `codec1 = HF`, which changes the *encoder* and so
+   changes the cuSZ bar itself. Fix that before trusting it.
 2. Decide reps. At `runs=1` nothing is established; five paired reps is what the
    audit asks for. **Budget: 141 GPU-hours left of 4947** — this is the binding
    constraint, and reps are the expensive axis.

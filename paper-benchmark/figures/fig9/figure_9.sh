@@ -423,8 +423,17 @@ build_arms() {
   # PANEL (a): the ablation ladder. Untiered arms write straight to the PFS;
   # every +Tier arm spills to the node's own NVMe (NVME_ROOT).
   echo "Baseline|a|baseline|0|0|0"
-  echo "nvCOMP|a|$BEST_FIXED|0|0|0"
-  echo "nvCOMP+Tier|a|$BEST_FIXED|0|1|0"
+  # NO PANEL (a) nvCOMP RUNGS (2026-09-23). They ran $BEST_FIXED at eb=0 -- the
+  # same library panel (b) runs at the bound -- so the figure drew the winning
+  # nvCOMP codec twice under two names. Panel (b)'s `Best fixed nvCOMP` and
+  # `Worst fixed nvCOMP` are now the only nvCOMP arms, and they are compared
+  # against each other at ONE bound, which is the comparison worth making.
+  #
+  # WHAT THIS COSTS: panel (a)'s ladder loses its lossless external-codec
+  # comparator, so plot_fig9.py's `NP only vs nvCOMP` and `NP+Tier vs
+  # nvCOMP+Tier` reductions go empty. They are NOT repointed at `Best fixed
+  # nvCOMP`: that arm runs at eb=1e-3 while the NP rungs here run lossless, so
+  # the comparison would be across different bounds.
   echo "NP only|a|$NP_CFG|0|0|0"
   echo "NP+Tier|a|$NP_CFG|0|1|0"
   echo "NP+Tier+Async|a|$NP_CFG|0|1|$ASYNC_MS"
@@ -716,25 +725,31 @@ run_arm() {
                  --results "$store" --tag "$tag" --chunk "$CHUNK" )
   cmd+=( --fields "$FIELDS" )
   [ "$MAXF" -gt 0 ] 2>/dev/null && cmd+=( --max-files "$MAXF" )
-  # Verification is untimed but costs a full read-back, so it runs once per arm.
-  # A lossy arm checks |orig - decoded| <= eb instead of a digest, which lossy
-  # data must fail; without --check-bound it was not verified at all.
+  # Verification is UNTIMED -- the driver prints `time: ... total` from
+  # now() - t_work and only then calls verify_records()/report_bound(), and the
+  # `window: start_ns/end_ns` that io_s is clipped to closes at the same
+  # instant. So no bar moves whether this runs or not; it costs job wall clock
+  # (a full read-back) and nothing else. It runs once per arm, in rep 1.
   #
-  # EXCEPT cuSZ and cuSZp3. They quantize INTERNALLY (compressor_runtime.cc
-  # disables our quantizer for them), in fp32: cuSZ's Lorenzo kernel does
-  # round(x * 1/(2eb)) in float and cuSZp does cvt.s32(x * 0.5f/eb), so the
-  # bound is their contract, not something this pipeline produces or can fix.
-  # The figure times them; it does not certify them. A lossy digest check would
-  # fail by construction, so these arms skip the read-back entirely and record
-  # an empty `bound`. Our own quantizer (nvCOMP -q, NeuroPress lossy) is still
-  # checked, because that bound IS ours.
-  if [ "$rep" -gt 1 ]; then
+  # NO LOSSY ARM IS BOUND-CHECKED (decision 2026-09-23). Every arm with eb > 0
+  # runs --no-verify: the external codecs (cuSZ, cuSZp3, nvCOMP -q, ndzip) AND
+  # NeuroPress's own lossy rungs alike. This figure reports END-TO-END WALL
+  # CLOCK at a REQUESTED bound. Whether a codec honours that bound is a
+  # different question, measured by the accuracy figures against the same
+  # dumps; answering it here costs a full read-back per arm and, when it fails,
+  # turns a timing campaign into an accuracy triage.
+  #
+  # DROPPING --check-bound IS NOT ENOUGH ON ITS OWN. With no verification flag
+  # the driver falls back to a digest comparison of the decoded bytes, which
+  # lossy data fails BY CONSTRUCTION (neuropress_field_replay.cc, "Which check
+  # applies is decided by the error bound"). So the read-back is skipped
+  # outright and the `bound` column is left empty -- an empty column here means
+  # NOT CHECKED, never "checked and fine".
+  #
+  # A LOSSLESS arm at rep 1 is still verified in full, bit-exact against the
+  # input, because that check tests reconstruction rather than a bound.
+  if [ "$rep" -gt 1 ] || awk -v e="$eb" 'BEGIN{exit !(e + 0 > 0)}'; then
     cmd+=( --no-verify )
-  elif awk -v e="$eb" 'BEGIN{exit !(e + 0 > 0)}'; then
-    case "$cfg" in
-      static-cusz|static-cuszp) cmd+=( --no-verify ) ;;
-      *)                        cmd+=( --check-bound ) ;;
-    esac
   fi
 
   if [ "$DRY" = 1 ]; then
@@ -798,6 +813,25 @@ run_arm() {
     if [ "$sub" = 1 ]; then
       stage_s=$(awk -v a="$stage_s" -v h="$h2d_s" 'BEGIN{printf "%.3f", a - h}')
       total_s=$(awk -v t="$total_s" -v h="$h2d_s" 'BEGIN{printf "%.3f", t - h}')
+    fi
+  fi
+  # BASELINE'S OWN H2D. Every compressed arm's host->device staging is logged
+  # per chunk to phases.csv and removed by the union above. Baseline has no
+  # phase log -- it never went through the compressor -- so its staging is
+  # reported by the driver on its own line instead, and removed here. Without
+  # this the arm that was FIXED to be device-resident would be charged for the
+  # upload, which is a replay artifact either way: an in-situ producer already
+  # holds the data on the GPU. The D2H on the way OUT stays in the bar, which
+  # is the whole point of the fix.
+  local bh2d
+  bh2d=$(grep -hoE "time: h2d [0-9.]+ s" "$store"/*/stdout.log 2>/dev/null \
+         | tail -1 | grep -oE "[0-9.]+" | head -1)
+  if [ -n "$bh2d" ] && [ -n "$total_s" ]; then
+    local ok; ok=$(awk -v t="$total_s" -v h="$bh2d" 'BEGIN{print (h>0 && t-h>0)?1:0}')
+    if [ "$ok" = 1 ]; then
+      total_s=$(awk -v t="$total_s" -v h="$bh2d" 'BEGIN{printf "%.3f", t - h}')
+      stage_s=$(awk -v a="${stage_s:-0}" -v h="$bh2d" 'BEGIN{printf "%.3f", a - h}')
+      echo "     baseline H2D ${bh2d}s removed (replay artifact; the bdev's D2H stays in)" >&2
     fi
   fi
   # THE INPUT READ IS NOT PART OF THE BAR, for the same reason as H2D above: in

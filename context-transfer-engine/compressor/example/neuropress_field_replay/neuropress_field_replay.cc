@@ -55,7 +55,12 @@
 #include <clio_cte/compressor/compressor_client.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_ctp/compress/compress_factory.h>
+// DeviceAwareMemcpy and gpu::IpcManager::MemKind, for the baseline's H2D
+// staging: --no-compress hands the bdev a DEVICE pointer so it pays the same
+// device-to-host copy every compressed arm pays.
+#include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/gpu/gpu_ipc_manager.h>
 
 namespace fs = std::filesystem;
 
@@ -335,6 +340,9 @@ struct Pending {
   clio::run::Future<clio::cte::compressor::DynamicScheduleTask> fut;
   clio::run::Future<clio::cte::core::PutBlobTask> put;  // --no-compress
   ctp::ipc::FullPtr<char> buf;
+  /** --no-compress only: the device copy the bdev writes from, freed on drain.
+      Null on every other path, where the compressor owns its own staging. */
+  ctp::ipc::AllocatorId dev_alloc;
   size_t record;
 };
 
@@ -608,6 +616,9 @@ int main(int argc, char **argv) {
   std::vector<BlobRecord> records;
   std::vector<Pending> pending;
   double read_s = 0.0, stage_s = 0.0;
+  // --no-compress only: host->device staging, a replay artifact the
+  // harness subtracts the same way it subtracts the compressor's h2d_ms.
+  double baseline_h2d_s = 0.0;
 
   auto drain = [&]() {
     for (auto &p : pending) {
@@ -618,6 +629,9 @@ int main(int argc, char **argv) {
         r.lib = 0;  // stored raw, by construction
         r.ratio = 1.0;
         r.stored = r.bytes;
+        if (!p.dev_alloc.IsNull()) {
+          CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, p.dev_alloc);
+        }
         CLIO_IPC->FreeBuffer(p.buf);
         continue;
       }
@@ -690,8 +704,40 @@ int main(int argc, char **argv) {
 
       Pending p;
       if (opt.no_compress) {
+        // BASELINE STARTS ON THE GPU, like every arm it is compared against.
+        //
+        // fs_bdev_transport.cc:328-334 starts the I/O timer BEFORE the
+        // device-to-host copy a device-resident blob implies -- its own
+        // comment calls that "the single D2H that terminates the device
+        // path". A compressed arm hands the bdev a DEVICE pointer and so pays
+        // that copy inside io_s; a Baseline that handed over a HOST buffer
+        // skipped it entirely and was credited a free payload-sized D2H.
+        // On a 40 GiB arm that is not a rounding error.
+        //
+        // So stage the chunk up and put the device pointer. The H2D itself is
+        // a REPLAY artifact -- an in-situ producer already has the data on the
+        // device -- so it is timed separately and reported for subtraction,
+        // exactly as the compressor's own h2d_ms is.
+        char *dev = nullptr;
+        p.dev_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+            /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem, n,
+            &dev);
+        if (p.dev_alloc.IsNull() || dev == nullptr) {
+          std::cerr << "baseline: device staging failed for " << rec.name
+                    << " (" << n << " B)\n";
+          return 1;
+        }
+        const auto h2d_t0 = std::chrono::steady_clock::now();
+        ctp::DeviceAwareMemcpy(dev, buf.ptr_, n);
+        baseline_h2d_s += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - h2d_t0).count();
+        // AllocateAndRegisterGpuBackend's convention: off_ carries the raw
+        // device address, which IpcManager::ToFullPtr resolves for the process
+        // that minted the id (ipc_manager.h, "Case 4").
+        ctp::ipc::ShmPtr<void> dev_shm(p.dev_alloc,
+                                       reinterpret_cast<size_t>(dev));
         p.put = cte_client->AsyncPutBlob(
-            tag_id, rec.name, 0, n, buf.shm_.template Cast<void>(), -1.0f,
+            tag_id, rec.name, 0, n, dev_shm, -1.0f,
             clio::cte::core::Context(), 0, clio::run::PoolQuery::Local());
       } else {
         p.fut = compressor.AsyncDynamicSchedule(
@@ -784,6 +830,12 @@ int main(int argc, char **argv) {
             << std::chrono::duration_cast<std::chrono::nanoseconds>(
                    std::chrono::steady_clock::now().time_since_epoch()).count()
             << std::endl;
+  if (baseline_h2d_s > 0.0) {
+    // Named h2d so the harness can subtract it exactly as it subtracts the
+    // compressor's h2d_ms union: an in-situ producer would not pay it.
+    std::cout << "  time: h2d " << baseline_h2d_s << " s   (baseline staging, "
+                 "excluded from the bar)" << std::endl;
+  }
   std::cout << "  time: read " << read_s << " s   stage+compress " << stage_s
             << " s   total "
             << std::chrono::duration<double>(

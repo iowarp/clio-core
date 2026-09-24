@@ -124,6 +124,17 @@ def base_name(strategy):
     return s[:-len("+Tier")] if s.endswith("+Tier") else s
 
 
+# ARMS MEASURED BUT NOT DRAWN. panel_order() deliberately appends any arm it
+# does not recognise, so a campaign with a new arm never loses bars silently --
+# which means removing a name from ORDER_A/ORDER_B does NOT hide it. Anything
+# listed here is filtered out instead. The runs still happen and their CSVs are
+# kept; only the bar is suppressed.
+#
+#   nvCOMP, +Tier  panel (a)'s fixed-codec rungs, dropped from the arm set on
+#                  2026-09-23; older campaigns still carry their rows.
+HIDDEN_ARMS = {"nvCOMP", "nvCOMP+Tier"}
+
+
 def panel_order(rows, panel, known):
     """Arms of one panel: the published order first, then any new name.
 
@@ -143,6 +154,8 @@ def panel_order(rows, panel, known):
         s = (r.get("strategy") or "").strip()
         if s and s not in seen:
             seen.append(s)
+    seen = [s for s in seen if base_name(s) not in HIDDEN_ARMS
+            and s not in HIDDEN_ARMS]
     head = [s for s in known if s in seen]
     return head + [s for s in seen if s not in head]
 
@@ -167,12 +180,17 @@ def workload_order(rows):
 # ablation's own order. Each entry is (panel, arm label). Panel (b)'s own
 # NeuroPress arms stay off it: panel (a)'s ladder already carries NeuroPress.
 SINGLE_ORDER = [("a", "Baseline"),
+                # The WORST fixed codec sits right after Baseline, untiered
+                # then tiered. Both are slower than Baseline on Nyx, so putting
+                # them beside it reads as the ceiling the rest of the chart is
+                # measured against -- and the pair's own untiered/tiered step is
+                # visible before the eye travels along the descending bars.
+                ("b", "Worst fixed nvCOMP"), ("b", "Worst fixed nvCOMP+Tier"),
                 ("b", "ndzip"), ("b", "ndzip+Tier"),
                 ("b", "cuSZ"), ("b", "cuSZ+Tier"),
                 ("b", "cuSZp3"), ("b", "cuSZp3+Tier"),
                 ("a", "nvCOMP"), ("a", "nvCOMP+Tier"),
-                ("b", "Best fixed nvCOMP"), ("b", "Best fixed nvCOMP+Tier"),
-                ("b", "Worst fixed nvCOMP"), ("b", "Worst fixed nvCOMP+Tier")]
+                ("b", "Best fixed nvCOMP"), ("b", "Best fixed nvCOMP+Tier")]
 # The error bound of every arm comes from the CSV's `eb` column. It used to
 # have a hardcoded fallback table here, which is what the legend actually read:
 # the lookup meant to consult the data unpacked the index key in the wrong
@@ -353,7 +371,7 @@ def reductions(D, workloads, order_a, order_b):
     # a ladder over three bounds used to report a single empty column, because
     # its arms are spelled `... Lossy (low|med|high)`.
     pairs = [("NP+Tier+Async", "Baseline"), ("NP+Tier+Async", "nvCOMP+Tier"),
-             ("NP only", "nvCOMP"), ("NP+Tier", "nvCOMP+Tier")]
+             ("NP+Tier", "nvCOMP+Tier")]
     pairs += [(s, "NP+Tier+Async") for s in order_a
               if base_name(s) == "NP+Tier+Async+Lossy"]
     print(f"{'workload':<9}" + "".join(f"{(a.replace('NP+Tier+Async+', '')[:15]):>17}" for a, _ in pairs))
@@ -652,6 +670,11 @@ def main():
                     help="subtract each arm's measured cuSZ resource-manager "
                          "construction (setup_min) from its bar; the chart is "
                          "relabelled to say so (default: plot what was measured)")
+    ap.add_argument("--per-workload", action="store_true",
+                    help="also write one figure per workload "
+                         "(fig9_<workload>.png). They SHARE the combined "
+                         "chart's y-axis, so bar heights stay comparable "
+                         "between them; pass --ylim to set it explicitly")
     ap.add_argument("--panels", action="store_true",
                     help="also write the per-panel figures fig9a_ablation.png "
                          "and fig9b_baselines.png (default: the single chart only)")
@@ -722,6 +745,22 @@ def main():
         fs = render_single(pngs[-1], D, items, workloads, ylim, dec, spare, warn, title)
         if fs < FS_VAL:
             print(f"note: {name}: value labels at {fs:g} pt so one fits on every bar")
+    # ONE FIGURE PER WORKLOAD, same bars, same order, same colours. The y-axis
+    # is the COMBINED chart's, not each workload's own: refitting per figure
+    # would make a 21 s bar and a 72 s bar the same height on the page, which
+    # is exactly the comparison a reader makes when the five sit side by side
+    # in a paper. The cost is whitespace above the shorter workloads.
+    if args.per_workload:
+        for w in workloads:
+            items_w = [it for it in single if it + (w,) in D]
+            name = f"fig9_{w.lower()}.png"
+            if not items_w:
+                print(f"note: no rows for {w}; {name} not written")
+                continue
+            pngs.append(os.path.join(args.out, name))
+            # `spare` is shared so an arm keeps one colour across every figure;
+            # `warn` is not, or each split bar would be reported twice.
+            render_single(pngs[-1], D, items_w, [w], ylim, dec, spare, [], None)
     if warn:
         print(f"WARNING: {len(warn)} bar(s) had a total but no compute/I-O "
               f"split; drawn as one segment: {', '.join(sorted(set(warn)))}\n")

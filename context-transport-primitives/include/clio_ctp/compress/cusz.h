@@ -178,10 +178,32 @@ class SetupLog {
  * and freeing a manager into a dead context is a crash, not a leak worth
  * chasing -- the process is exiting.
  */
+// How many psz_resource managers one thread keeps alive at once.
+//
+// ONE WAS NOT ENOUGH. The cache is keyed on ELEMENT COUNT, so a workload whose
+// chunks are not all the same length alternates between keys and a single slot
+// is evicted on nearly every chunk. LAMMPS replays 3933 files in two sizes --
+// 2097152 and 1949696 elements, a 2622/1311 split -- and rebuilt the manager
+// 3933 times at a mean 9.81 ms: 38.59 s of a 61.76 s bar. Nyx, whose every
+// chunk is 2097152 elements, spent 46.9 ms in total on the same code. The
+// reuse win was therefore real only for uniformly chunked input.
+//
+// Three matches nvCOMP's kLruDepth (nvcomp.h:831) and covers a ragged tail
+// plus one spare. Each live manager holds GPU buffers -- histogram, Huffman
+// book, quantisation -- so raising this is not free and wants measuring.
+inline constexpr int kMgrSlots = 3;
+
+/** One cached manager and the key it was built for. */
+struct MgrSlot {
+  psz_resource *mgr = nullptr; /**< built manager, or nullptr when free. */
+  size_t elems = 0;            /**< element count it was built for. */
+  uint64_t stamp = 0;          /**< Context::tick at last use; 0 = never. */
+};
+
 struct Context {
   cudaStream_t stream = nullptr;
-  psz_resource *mgr = nullptr;
-  size_t elems = 0;
+  MgrSlot slot[kMgrSlots];     /**< LRU of managers, keyed by element count. */
+  uint64_t tick = 0;           /**< monotonic counter driving the LRU. */
 };
 
 /**
@@ -210,17 +232,34 @@ inline Context *AcquireStream() {
  */
 inline psz_resource *AcquireManager(Context *ctx, size_t n,
                                     psz_pipeline pipeline) {
-  if (ctx->mgr != nullptr && ctx->elems == n) return ctx->mgr;
-  if (ctx->mgr != nullptr) {
-    psz_release_resource(ctx->mgr);
-    ctx->mgr = nullptr;
-    ctx->elems = 0;
+  ++ctx->tick;
+  for (MgrSlot &s : ctx->slot) {  // hit: same element count already built
+    if (s.mgr != nullptr && s.elems == n) {
+      s.stamp = ctx->tick;
+      return s.mgr;
+    }
+  }
+  // Miss. Prefer a slot that was never used; otherwise evict the least
+  // recently used one, so an alternating two-length workload keeps both.
+  MgrSlot *victim = &ctx->slot[0];
+  for (MgrSlot &s : ctx->slot) {
+    if (s.mgr == nullptr) {
+      victim = &s;
+      break;
+    }
+    if (s.stamp < victim->stamp) victim = &s;
+  }
+  if (victim->mgr != nullptr) {
+    psz_release_resource(victim->mgr);
+    victim->mgr = nullptr;
+    victim->elems = 0;
   }
   psz_len len = {n, 1, 1};
-  ctx->mgr = psz_create_resource_manager(F4, len, pipeline, ctx->stream);
-  if (ctx->mgr == nullptr) return nullptr;
-  ctx->elems = n;
-  return ctx->mgr;
+  victim->mgr = psz_create_resource_manager(F4, len, pipeline, ctx->stream);
+  if (victim->mgr == nullptr) return nullptr;
+  victim->elems = n;
+  victim->stamp = ctx->tick;
+  return victim->mgr;
 }
 
 /**
@@ -284,7 +323,7 @@ inline bool ReuseProbeSplen(psz_resource *mgr, float *d_in, size_t *splen,
  */
 inline bool ReuseSelfTest() {
   constexpr size_t kN = 1u << 20;   // 1 Mi floats = 4 MiB, a real chunk size
-  psz_pipeline pipeline = {Lorenzo, HistGeneric, HF, CodecNull};
+  psz_pipeline pipeline = {Lorenzo, HistGeneric, DEFAULT_CODEC, CodecNull};
   const char *why = "did not run";
   double err_fresh = -1.0, diff = -1.0, tol = 0.0;
 
@@ -508,7 +547,7 @@ class Cusz : public Compressor {
       if (d_in == nullptr) break;
 
       psz_len len = {n, 1, 1};  // x, y, z (1D)
-      psz_pipeline pipeline = {Lorenzo, HistGeneric, HF, CodecNull};
+      psz_pipeline pipeline = {Lorenzo, HistGeneric, DEFAULT_CODEC, CodecNull};
       t0 = std::chrono::steady_clock::now();
       if (log_setup) ns_mgr = cusz_detail::SetupLog::Now();
       // Reusing, this is free on every chunk but the first of a new length,
