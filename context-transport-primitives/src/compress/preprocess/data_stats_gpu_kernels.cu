@@ -571,24 +571,29 @@ namespace {
  * computes `num_elements = chunk_size / ElementSize` for its OWN chunk. A
  * global plane layout produces different bytes for anything above 256 KiB.
  *
- * One thread block per chunk, grid-strided so a large buffer does not need
- * one block per chunk resident at once. Within a chunk the write side is
- * coalesced (out[b*n + elem] is contiguous across threads) at the cost of a
- * strided read -- the same trade upstream makes.
+ * A 2-D grid: blockIdx.y walks the chunks, and the x blocks split ONE chunk's
+ * elements between them. It used to be one block per chunk, which left an
+ * 8 MiB buffer 32 blocks on a 108-SM A100 and a 2 MiB one 8 -- 12% achieved
+ * occupancy, under 3% of DRAM bandwidth, ~150 us per chunk. Only the work
+ * decomposition changed, so every byte lands where it did. Within a chunk the
+ * write side is coalesced (out[b*n + elem] is contiguous across threads) at
+ * the cost of a strided read -- the same trade upstream makes.
  */
 template <unsigned ElemSize>
 __global__ void ShuffleKernel(const uint8_t *__restrict__ in,
                               uint8_t *__restrict__ out, size_t num_bytes,
                               size_t chunk_bytes) {
   const size_t num_chunks = (num_bytes + chunk_bytes - 1) / chunk_bytes;
-  for (size_t c = blockIdx.x; c < num_chunks; c += gridDim.x) {
+  const size_t first = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  for (size_t c = blockIdx.y; c < num_chunks; c += gridDim.y) {
     const size_t base = c * chunk_bytes;
     const size_t remain = num_bytes - base;
     const size_t chunk = remain < chunk_bytes ? remain : chunk_bytes;
     const size_t n = chunk / ElemSize;
     const uint8_t *ci = in + base;
     uint8_t *co = out + base;
-    for (size_t elem = threadIdx.x; elem < n; elem += blockDim.x) {
+    for (size_t elem = first; elem < n; elem += stride) {
 #pragma unroll
       for (unsigned b = 0; b < ElemSize; ++b) {
         co[b * n + elem] = ci[elem * ElemSize + b];
@@ -597,7 +602,7 @@ __global__ void ShuffleKernel(const uint8_t *__restrict__ in,
     // Trailing partial element of THIS chunk, copied verbatim
     // (byte_shuffle_kernels.cu:59-65). Only the last chunk can have one,
     // since kShuffleChunkBytes is a multiple of every supported ElemSize.
-    for (size_t i = threadIdx.x + n * ElemSize; i < chunk; i += blockDim.x) {
+    for (size_t i = first + n * ElemSize; i < chunk; i += stride) {
       co[i] = ci[i];
     }
   }
@@ -608,29 +613,42 @@ __global__ void UnshuffleKernel(const uint8_t *__restrict__ in,
                                 uint8_t *__restrict__ out, size_t num_bytes,
                                 size_t chunk_bytes) {
   const size_t num_chunks = (num_bytes + chunk_bytes - 1) / chunk_bytes;
-  for (size_t c = blockIdx.x; c < num_chunks; c += gridDim.x) {
+  const size_t first = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+  for (size_t c = blockIdx.y; c < num_chunks; c += gridDim.y) {
     const size_t base = c * chunk_bytes;
     const size_t remain = num_bytes - base;
     const size_t chunk = remain < chunk_bytes ? remain : chunk_bytes;
     const size_t n = chunk / ElemSize;
     const uint8_t *ci = in + base;
     uint8_t *co = out + base;
-    for (size_t elem = threadIdx.x; elem < n; elem += blockDim.x) {
+    for (size_t elem = first; elem < n; elem += stride) {
 #pragma unroll
       for (unsigned b = 0; b < ElemSize; ++b) {
         co[elem * ElemSize + b] = ci[b * n + elem];
       }
     }
-    for (size_t i = threadIdx.x + n * ElemSize; i < chunk; i += blockDim.x) {
+    for (size_t i = first + n * ElemSize; i < chunk; i += stride) {
       co[i] = ci[i];
     }
   }
 }
 
-/** Shared validation + launch geometry for both directions. Returns false
- *  if the request is not shuffleable; otherwise fills the launch config. */
+/**
+ * Shared validation + launch geometry for both directions: y = one block row
+ * per chunk (at most 65535, grid-strided past that), x = enough blocks to give
+ * each of a full chunk's elements its own thread.
+ *
+ * @param in        device input
+ * @param out       device output
+ * @param num_bytes buffer length
+ * @param elem_size 2, 4 or 8
+ * @param grid      filled with the launch grid
+ * @param threads   filled with the block size
+ * @return false if the request is not shuffleable
+ */
 bool PrepareLaunch(const uint8_t *in, uint8_t *out, size_t num_bytes,
-                   size_t elem_size, int *blocks, int *threads) {
+                   size_t elem_size, dim3 *grid, int *threads) {
   if (!in || !out || num_bytes == 0) return false;
   if (elem_size != 2 && elem_size != 4 && elem_size != 8) return false;
   // Sub-element buffers are copied verbatim, not rejected -- same as the
@@ -638,7 +656,11 @@ bool PrepareLaunch(const uint8_t *in, uint8_t *out, size_t num_bytes,
   *threads = 256;
   const size_t num_chunks =
       (num_bytes + kShuffleChunkBytes - 1) / kShuffleChunkBytes;
-  *blocks = static_cast<int>(num_chunks > 65535 ? 65535 : num_chunks);
+  const size_t per_chunk =
+      std::min(num_bytes, kShuffleChunkBytes) / elem_size;
+  const size_t x = (per_chunk + *threads - 1) / *threads;
+  *grid = dim3(static_cast<unsigned>(x < 1 ? 1 : x),
+               static_cast<unsigned>(num_chunks > 65535 ? 65535 : num_chunks));
   return true;
 }
 
@@ -653,7 +675,8 @@ bool ByteShuffleDevice(const void *device_in, void *device_out,
                        size_t num_bytes, size_t elem_size, void *stream_in) {
   const uint8_t *in = static_cast<const uint8_t *>(device_in);
   uint8_t *out = static_cast<uint8_t *>(device_out);
-  int blocks = 0, threads = 0;
+  dim3 blocks;
+  int threads = 0;
   if (!PrepareLaunch(in, out, num_bytes, elem_size, &blocks, &threads)) {
     return false;
   }
@@ -680,7 +703,8 @@ bool ByteUnshuffleDevice(const void *device_in, void *device_out,
                          size_t num_bytes, size_t elem_size) {
   const uint8_t *in = static_cast<const uint8_t *>(device_in);
   uint8_t *out = static_cast<uint8_t *>(device_out);
-  int blocks = 0, threads = 0;
+  dim3 blocks;
+  int threads = 0;
   if (!PrepareLaunch(in, out, num_bytes, elem_size, &blocks, &threads)) {
     return false;
   }
