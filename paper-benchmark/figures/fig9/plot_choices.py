@@ -79,8 +79,10 @@ CODEC_COLORS = {
 FALLBACK_COLORS = ["#e87ba4", "#006435", "#4b4a47"]
 OTHER_COLOR = "#d6d5d1"
 
-#: Axis title when the caller does not override it.
-DEFAULT_TITLE = "Codec chosen per chunk by NeuroPress, by workload"
+#: No title by default: in a paper the caption carries it, and a title
+#: inside the figure duplicates the caption and costs plot height. Pass
+#: --title to put one back, e.g. for a slide.
+DEFAULT_TITLE = ""
 
 #: Printed instead of the wire name; "raw" is an outcome, not a library.
 PRETTY = {"raw(not-beneficial)": "stored raw"}
@@ -204,11 +206,17 @@ def draw(data, shuffles, out_path: str, title: str) -> None:
     :param out_path: PNG to write
     :param title: axis title
     """
-    key_h = 0.62 if shuffles else 0.40
-    legend_h = 0.50
-    fig_h = PLOT_H + key_h + legend_h + 0.22
+    # Explicit vertical budget, inches, bottom-up: legend band, then the key
+    # under the axis (workload, chunk count, shuffle line), then the plot, then
+    # whatever the title needs. Letting matplotlib decide left a dead band the
+    # height of a title that is no longer drawn.
+    legend_h = 0.44
+    key_h = 0.54 if shuffles else 0.34
+    head_h = 0.34 if title else 0.10
+    fig_h = legend_h + key_h + PLOT_H + head_h
     fig = plt.figure(figsize=(FIG_W, fig_h))
-    ax = fig.add_axes([0.055, (key_h + 0.10) / fig_h, 0.925, PLOT_H / fig_h])
+    ax = fig.add_axes([0.055, (legend_h + key_h) / fig_h, 0.925,
+                       PLOT_H / fig_h])
 
     taken: dict = {}
     # LEGEND BY TOTAL SHARE, not by first appearance: appearance order put the
@@ -239,7 +247,8 @@ def draw(data, shuffles, out_path: str, title: str) -> None:
     ax.set_yticklabels(["0", "25", "50", "75", "100%"], fontsize=FS_TICK,
                        color=INK_MUTED)
     ax.set_ylabel("chunks", fontsize=FS_TICK, color=INK)
-    ax.set_title(title, fontsize=FS_TITLE, color=INK, pad=5)
+    if title:
+        ax.set_title(title, fontsize=FS_TITLE, color=INK, pad=5)
     ax.yaxis.grid(True, color=GRID, linewidth=0.6, zorder=0)
     ax.set_axisbelow(True)
     for s in ("top", "right", "left"):
@@ -259,13 +268,7 @@ def draw(data, shuffles, out_path: str, title: str) -> None:
                         fontsize=FS_VAL, color=INK_MUTED, annotation_clip=False)
 
     seen = sorted(weight, key=lambda c: (c == "(other)", -weight[c]))
-    handles = [Patch(facecolor=colour_for(c, taken), edgecolor="white",
-                     linewidth=0.6, label=pretty(c)) for c in seen]
-    fig.legend(handles=handles, loc="lower center", ncol=min(6, len(handles)),
-               frameon=False, fontsize=FS_LEG, labelcolor=INK,
-               bbox_to_anchor=(0.5, 0.005), handlelength=1.1,
-               columnspacing=1.3, handletextpad=0.45)
-
+    _legend(fig, weight, taken)
     fig.savefig(out_path, dpi=300, facecolor="white")
     plt.close(fig)
 
@@ -277,7 +280,8 @@ def draw_count(data, out_path: str, title: str) -> None:
     the sample sizes visible (AI 1804 chunks against WarpX 5130) at the cost of
     making the smaller workloads' composition harder to read.
     """
-    legend_h, foot_h, panel_h, head_h = 0.44, 0.26, 2.05, 0.40
+    legend_h, foot_h, panel_h = 0.44, 0.26, 2.05
+    head_h = 0.40 if title else 0.14
     fig_h = legend_h + foot_h + panel_h + head_h
     fig = plt.figure(figsize=(FIG_W, fig_h))
     ax = fig.add_axes([0.085, (legend_h + foot_h) / fig_h, 0.895,
@@ -300,7 +304,8 @@ def draw_count(data, out_path: str, title: str) -> None:
     ax.set_xticklabels([wl for wl, _, _ in data], fontsize=FS_TICK, color=INK)
     ax.set_ylabel("chunks", fontsize=FS_TICK, color=INK)
     ax.tick_params(axis="y", labelsize=FS_TICK, colors=INK_MUTED)
-    ax.set_title(title, fontsize=FS_TITLE, color=INK, pad=6)
+    if title:
+        ax.set_title(title, fontsize=FS_TITLE, color=INK, pad=6)
     ax.yaxis.grid(True, color=GRID, linewidth=0.6, zorder=0)
     ax.set_axisbelow(True)
     for sp in ("top", "right", "left"):
@@ -345,7 +350,8 @@ def draw_timeline(series, out_path: str, title: str, nbins: int) -> None:
     del nbins
     # Vertical budget, inches, bottom-up. Every band is explicit because an
     # earlier version let the suptitle land on top of the panel titles.
-    legend_h, foot_h, panel_h, head_h = 0.44, 0.22, 2.05, 0.46
+    legend_h, foot_h, panel_h = 0.44, 0.22, 2.05
+    head_h = 0.46 if title else 0.18
     fig_h = legend_h + foot_h + panel_h + head_h
     fig = plt.figure(figsize=(FIG_W, fig_h))
     n = len(series)
@@ -387,8 +393,9 @@ def draw_timeline(series, out_path: str, title: str, nbins: int) -> None:
             ax.set_ylabel("early  \u2192  late", fontsize=FS_VAL, color=INK_MUTED,
                           labelpad=2)
 
-    fig.text(0.5, 1 - 0.13 / fig_h, title, ha="center", va="top",
-             fontsize=FS_TITLE, color=INK)
+    if title:
+        fig.text(0.5, 1 - 0.13 / fig_h, title, ha="center", va="top",
+                 fontsize=FS_TITLE, color=INK)
     _legend(fig, weight, taken)
     fig.savefig(out_path, dpi=300, facecolor="white")
     plt.close(fig)
@@ -406,7 +413,8 @@ def draw_heat(series, out_path: str, title: str, nbins: int) -> None:
     :param nbins: requested bin cap; each column is stretched to fill the height
     """
     del nbins
-    legend_h, foot_h, panel_h, head_h = 0.44, 0.34, 2.15, 0.42
+    legend_h, foot_h, panel_h = 0.44, 0.34, 2.15
+    head_h = 0.42 if title else 0.16
     fig_h = legend_h + foot_h + panel_h + head_h
     fig = plt.figure(figsize=(FIG_W, fig_h))
     ax = fig.add_axes([0.075, (legend_h + foot_h) / fig_h, 0.915,
@@ -466,8 +474,9 @@ def draw_heat(series, out_path: str, title: str, nbins: int) -> None:
                     textcoords="offset points", ha="center", va="top",
                     fontsize=FS_VAL, color=INK_MUTED, annotation_clip=False)
 
-    fig.text(0.5, 1 - 0.13 / fig_h, title, ha="center", va="top",
-             fontsize=FS_TITLE, color=INK)
+    if title:
+        fig.text(0.5, 1 - 0.13 / fig_h, title, ha="center", va="top",
+                 fontsize=FS_TITLE, color=INK)
     tie = Patch(facecolor="#c9c8c4", edgecolor=(1, 1, 1, 0.45), hatch="......",
                 linewidth=0.0, label="winner under 2/3")
     _legend(fig, weight, taken, extra=tie)
@@ -548,8 +557,6 @@ def main() -> int:
             print("no workload carried a timestep", file=sys.stderr)
             return 1
         title = args.title
-        if title == DEFAULT_TITLE:
-            title = "Codec chosen per chunk by NeuroPress, over simulation time"
         if args.mode == "timeline":
             draw_timeline(series, path, title, args.bins)
         else:
