@@ -71,7 +71,7 @@ e5env="E5_RUNROOT=${OUT} E5_PERNODE_MB=${E5S_PERNODE_MB:-65536} E5_TIER_MB=20000
     E5_SFX_kmeans=${E5S_KM_SFX:-_x_ckpt2} E5_ITERS_kmeans=${E5S_KM_ITERS:-24} E5_KM_REPEAT=1 E5_KM_EXTRA="--ckpt-final" \
     bash "${B}/pbs_e5_aurora.sh" > "${OUT}/kmeans.log" 2>&1 &
 [ -n "${GF[grayscott]:-}" ] && [ -n "${gs_cells}" ] && env PBS_NODEFILE="${GF[grayscott]}" ${e5env} E5_CELLS="${gs_cells# }" \
-    E5_STEPS_grayscott=${E5S_GS_STEPS:-8} E5_GS_REPEAT=1 E5_GS_EXTRA="--ckpt-every ${E5S_GS_CKPT:-4}" \
+    E5_STEPS_grayscott=${E5S_GS_STEPS:-8} E5_GS_REPEAT=1 E5_GS_EXTRA="${E5S_GS_CKPT_ARGS:---ckpt-final}" \
     bash "${B}/pbs_e5_aurora.sh" > "${OUT}/grayscott.log" 2>&1 &
 e4env="E4_OUTROOT=${OUT} BENCH_CAP=${CAP} DATA_MB=32768 TIER_BUDGET_MB=200000 HBM_MB=4096 BENCH_GROUP_N=${N}"
 [ -n "${GF[gmx]:-}" ] && [ -n "${gx_cells}" ] && env PBS_NODEFILE="${GF[gmx]}" ${e4env} BENCH_CELLS="${gx_cells# }" \

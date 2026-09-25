@@ -44,6 +44,12 @@ PERNODE_MB=${E5_PERNODE_MB:-256000}
 DATA_MB=$(( PERNODE_MB * NRANKS ))
 TIER_MB=${E5_TIER_MB:-450000}
 CAP=${E5_CAP:-1500}
+# A materialised periodic Gray-Scott checkpoint copies the whole grid (4 TB
+# at 64 nodes) and ran past a 20-minute cell cap, so --ckpt-every maps to the
+# final-state checkpoint every other workload takes. E5_GS_KEEP_EVERY=1 keeps it.
+if [ "${E5_GS_KEEP_EVERY:-0}" != 1 ] && [[ "${E5_GS_EXTRA:-}" == *--ckpt-every* ]]; then
+  E5_GS_EXTRA=$(echo "${E5_GS_EXTRA}" | sed -E 's/--ckpt-every [0-9]+/--ckpt-final/')
+fi
 CELLS=${E5_CELLS:-"kmeans:32 kmeans:24 kmeans:16 kmeans:8 kmeans:4 grayscott:32 grayscott:24 grayscott:16 grayscott:8 grayscott:4"}
 
 export ZE_AFFINITY_MASK=${BENCH_ZE_MASK:-0.0}
@@ -118,7 +124,7 @@ cell_deck() {
     grayscott)
       # 512 work-groups so the 4 GB rung still has 8 slots per group
       # (--ooc needs 6); budget GB = slots x 512 x 1 MB.
-      EXE="${ROOT}/build-spike/clio_grayscott_paged_newcoro_aot${E5_SFX_grayscott:-_x_fc2_ct7}"
+      EXE="${ROOT}/build-spike/clio_grayscott_paged_newcoro_aot${E5_SFX_grayscott:-_x_fc2_ct8}"
       ARGS="--data-mb ${DATA_MB} --steps ${E5_STEPS_grayscott:-8} --page-kb 1024 --blocks 512 --threads 256 --slots $(( gb * 2 )) --two-phase --ooc${E5_GS_REPEAT:+ --repeat ${E5_GS_REPEAT}} ${E5_GS_EXTRA:-}"
       FC=2 ;;
     *) EXE=""; ARGS=""; FC=3 ;;

@@ -1955,6 +1955,14 @@ int main(int argc, char **argv) {
     final_ck = clio_bench_ckpt::FinalCheckpoint(vec, "gv_gs_ckpt_final", nodes,
                                                  ckpt_sync);
   }
+  // EXIT BARRIER: each rank embeds its node's runtime, so a rank that exits
+  // early takes that node's containers with it, and a slower rank whose
+  // checkpoint tag lives there hangs in GetOrCreateTag (seen at 64 nodes).
+  if (ckpt_final && nodes > 1 &&
+      !clio_bench_dist::Barrier(*cte_red, red_tag, node, nodes, red_round++,
+                                "gsdone", 600)) {
+    std::fprintf(stderr, "GRAYSCOTT ERROR: exit barrier failed\n");
+  }
   BenchFlushData();
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;
