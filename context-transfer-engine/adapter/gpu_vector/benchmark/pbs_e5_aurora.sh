@@ -112,7 +112,7 @@ cell_deck() {
       # 512 work-groups so the 4 GB rung still has 8 slots per group
       # (--ooc needs 6); budget GB = slots x 512 x 1 MB.
       EXE="${ROOT}/build-spike/clio_grayscott_paged_newcoro_aot${E5_SFX_grayscott:-_x_fc2_ooc1}"
-      ARGS="--data-mb ${DATA_MB} --steps ${E5_STEPS_grayscott:-8} --page-kb 1024 --blocks 512 --threads 256 --slots $(( gb * 2 )) --two-phase --ooc"
+      ARGS="--data-mb ${DATA_MB} --steps ${E5_STEPS_grayscott:-8} --page-kb 1024 --blocks 512 --threads 256 --slots $(( gb * 2 )) --two-phase --ooc${E5_GS_REPEAT:+ --repeat ${E5_GS_REPEAT}}"
       FC=2 ;;
     *) EXE=""; ARGS=""; FC=3 ;;
   esac
