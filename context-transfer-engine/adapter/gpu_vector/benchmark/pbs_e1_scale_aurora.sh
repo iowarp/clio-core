@@ -119,11 +119,15 @@ run_one() {
     cd "$BENCH_RANK_DIR"
     ulimit -c 0
     extra=""
+    en() { cat /sys/class/drm/card0/device/hwmon/hwmon*/energy1_input 2>/dev/null | tr "\n" " "; }
+    e0=$(en)
     [ "$BENCH_RANK_RANKED" = 1 ] && extra="--nodes $BENCH_RANK_N --node $r"
     timeout --signal=TERM --kill-after=10s "$BENCH_RANK_CAP" \
       stdbuf -oL -eL "$BENCH_RANK_EXE" $BENCH_RANK_ARGS $extra \
       > "rank$r.log" 2>&1
     rc=$?
+    e1=$(en)
+    echo "ENERGY_UJ before: ${e0} after: ${e1}" >> "rank$r.log"
     echo "rank $r on $(hostname) exit=$rc" >> "rank$r.log"
     exit 0
   '
@@ -151,6 +155,14 @@ run_one() {
     echo "${cl}" | sed 's/^/    /' | cut -c1-240
     echo "COMMMAX e1/${label}x${NRANKS}: $(echo "${cl}" | grep -oE 'comm_ms=[0-9.]+' | cut -d= -f2 | sort -g | tail -1) ms (slowest rank)"
   fi
+  # Energy summed over ranks (first hwmon counter = the card), in joules.
+  local ej=0 f b a
+  for f in "${rundir}"/rank*.log; do
+    read -r b _ <<< "$(grep -a "ENERGY_UJ" "${f}" | sed 's/.*before: //; s/ after:.*//')"
+    read -r a _ <<< "$(grep -a "ENERGY_UJ" "${f}" | sed 's/.*after: //')"
+    [ -n "${b:-}" ] && [ -n "${a:-}" ] && ej=$(awk -v e="${ej}" -v x="${a}" -v y="${b}" 'BEGIN{printf "%.0f", e + (x - y) / 1e6}')
+  done
+  echo "ENERGY e1/${label}x${NRANKS}: ${ej} J"
   case "${rc}" in
     0)   echo "RESULT e1/${label}x${NRANKS}: OK" ;;
     124) echo "RESULT e1/${label}x${NRANKS}: TIMEOUT (a rank exceeded the ${CAP}s cap)" ;;
@@ -327,7 +339,26 @@ for wl in ${WORKLOADS}; do
   done
   # The Eternia arm, on the SAME grid as the baselines above: SLOTS frames per
   # block of 1 MB over B blocks holds the node's whole share, so it is resident.
-  et_rundir="${BENCH_RUNROOT:-${ROOT}/build-spike}/e1_${JOBTAG}_${wl}_b${B}_eternia"
+  # E5 (memory reduction) over the E1 decks: shrink ONLY the Eternia cache.
+  #   BENCH_E5_DIV=D  gmx: cap = max(cap_need, GX_CAP / D) with cap_need =
+  #                   min(4B, slab + 3) + 2 (so D > 1 needs a smaller grid);
+  #                   lbann: cap = max(LB_CAP / D, 2B), sets resized;
+  #                   lammps_md: --slots BENCH_E5_MD_SLOTS (x/v frames per block).
+  et_tag=""
+  if [ -n "${BENCH_E5_DIV:-}" ]; then
+    et_tag="_e5d${BENCH_E5_DIV}"
+    case "${wl}" in
+      gmx)
+        local_slab=$(( (GX_K + NRANKS - 1) / NRANKS ))
+        need=$(( 4 * B < local_slab + 3 ? 4 * B + 2 : local_slab + 5 ))
+        GX_CAP=$(( GX_CAP / BENCH_E5_DIV )); [ "${GX_CAP}" -lt "${need}" ] && GX_CAP=${need} ;;
+      lbann)
+        LB_CAP=$(( LB_CAP / BENCH_E5_DIV )); [ "${LB_CAP}" -lt $(( 2 * B )) ] && LB_CAP=$(( 2 * B ))
+        LB_SET=$(( (LB_CAP + B - 1) / B + 8 )) ;;
+    esac
+    echo "    E5 div ${BENCH_E5_DIV}: gmx cap ${GX_CAP:-} lbann cap ${LB_CAP:-} lammps slots ${BENCH_E5_MD_SLOTS:-auto}"
+  fi
+  et_rundir="${BENCH_RUNROOT:-${ROOT}/build-spike}/e1_${JOBTAG}_${wl}_b${B}_eternia${et_tag}"
   mkdir -p "${et_rundir}"
   et_conf "${et_rundir}" $(( PERNODE_MB + 2048 ))
   export CLIO_SERVER_CONF="${et_rundir}/clio_e1.yaml"
@@ -352,8 +383,9 @@ for wl in ${WORKLOADS}; do
   # lammps_md runs resident-lean (no interior publish, no resort clears).
   et_fc=3; [ "${wl}" = grayscott ] && et_fc=${BENCH_GS_FC:-2}
   if [ "${wl}" = lammps_md ]; then export MD_LEAN=1; else unset MD_LEAN; fi
+  [ "${wl}" = lammps_md ] && [ -n "${BENCH_E5_MD_SLOTS:-}" ] && et_args="${et_args} --slots ${BENCH_E5_MD_SLOTS}"
   IGC_FunctionControl=${et_fc} \
-  run_one "${wl}_b${B}_eternia" "${ROOT}/build-spike/clio_${wl}_paged_newcoro_aot${et_sfx}" \
+  run_one "${wl}_b${B}_eternia${et_tag}" "${ROOT}/build-spike/clio_${wl}_paged_newcoro_aot${et_sfx}" \
           "${et_args}" 1 || rc=$?
   unset MD_LEAN
   [ "${rc}" -gt "${worst}" ] && worst=${rc}
