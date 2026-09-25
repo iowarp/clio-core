@@ -258,6 +258,11 @@ run_cell() {
 networking:
   port: 9460
   hostfile: "${rundir}/hostfile"
+  # >= node count, as in the E1/E5 configs: a Broadcast wider than
+  # neighborhood_size is split into Range queries that the receiving node
+  # runs only locally, so at 64 nodes pool creation reached nodes 0 and 32
+  # only (lbann at 64 nodes: writebacks REFUSED rc=11 on ranks 0 and 32).
+  neighborhood_size: 1024
 
 # SWIM OFF, for the same reason the E1 scaling config turns it off. Its
 # suspicion timeout is 60 s and expiry runs TriggerRecovery, which moves a
