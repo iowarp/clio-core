@@ -2689,7 +2689,16 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       // Bound by TIME, not iterations: how long a yield actually parks is
       // not something this loop can assume, and an iteration count silently
       // became a 167 ms timeout that fired before a writer 400 ms away.
-      constexpr clio::run::u64 kGenWaitNs = 10ull * 1000 * 1000 * 1000;
+      // Default 120 s; CLIO_GEN_WAIT_MS overrides it. Out of core, a step
+      // takes tens of seconds and ranks drift further apart than 10 s, so a
+      // healthy neighbour's halo was reported as never published under the old
+      // fixed 10 s bound (E5 at 16
+      // nodes, grayscott: "generation 8 never reached (range at 6)").
+      static const clio::run::u64 kGenWaitNs = [] {
+        const char *e = std::getenv("CLIO_GEN_WAIT_MS");
+        const clio::run::u64 ms = (e != nullptr && *e) ? std::strtoull(e, nullptr, 10) : 120000ull;
+        return ms * 1000ull * 1000ull;
+      }();
       const clio::run::u64 gen_t0 = GetCurrentTimeNs();
       while (blob_info_ptr == nullptr ||
              blob_info_ptr->RangeGeneration(offset, size) <
