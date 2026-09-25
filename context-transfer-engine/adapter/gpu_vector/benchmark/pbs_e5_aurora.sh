@@ -106,13 +106,13 @@ cell_deck() {
     kmeans)
       # 1024 work-groups; budget GB = slots x 1024 x 1 MB.
       EXE="${ROOT}/build-spike/clio_kmeans_paged_newcoro_aot${E5_SFX_kmeans:-_x_ct}"
-      ARGS="--data-mb ${DATA_MB} --iters ${E5_ITERS_kmeans:-8} --page-kb 1024 --blocks 1024 --threads 256 --slots ${gb} --publish-seed${E5_KM_REPEAT:+ --repeat ${E5_KM_REPEAT}}"
+      ARGS="--data-mb ${DATA_MB} --iters ${E5_ITERS_kmeans:-8} --page-kb 1024 --blocks 1024 --threads 256 --slots ${gb} --publish-seed${E5_KM_REPEAT:+ --repeat ${E5_KM_REPEAT}} ${E5_KM_EXTRA:-}"
       FC=3 ;;
     grayscott)
       # 512 work-groups so the 4 GB rung still has 8 slots per group
       # (--ooc needs 6); budget GB = slots x 512 x 1 MB.
       EXE="${ROOT}/build-spike/clio_grayscott_paged_newcoro_aot${E5_SFX_grayscott:-_x_fc2_ooc1}"
-      ARGS="--data-mb ${DATA_MB} --steps ${E5_STEPS_grayscott:-8} --page-kb 1024 --blocks 512 --threads 256 --slots $(( gb * 2 )) --two-phase --ooc${E5_GS_REPEAT:+ --repeat ${E5_GS_REPEAT}}"
+      ARGS="--data-mb ${DATA_MB} --steps ${E5_STEPS_grayscott:-8} --page-kb 1024 --blocks 512 --threads 256 --slots $(( gb * 2 )) --two-phase --ooc${E5_GS_REPEAT:+ --repeat ${E5_GS_REPEAT}} ${E5_GS_EXTRA:-}"
       FC=2 ;;
     *) EXE=""; ARGS=""; FC=3 ;;
   esac
@@ -135,7 +135,7 @@ run_cell() {
   IGC_FunctionControl=${FC} CLIO_SERVER_CONF="${rundir}/clio_e5.yaml" \
   BENCH_RANK_EXE="${EXE}" BENCH_RANK_ARGS="${ARGS}" BENCH_RANK_DIR="${rundir}" \
   BENCH_RANK_CAP="${CAP}" BENCH_RANK_N="${NRANKS}" \
-  mpiexec -n "${NRANKS}" --ppn 1 --envall --cpu-bind none bash -c '
+  mpiexec -n "${NRANKS}" --ppn 1 --hosts "$(sort -u "${PBS_NODEFILE}" | paste -sd,)" --envall --cpu-bind none bash -c '
     r=${PALS_RANKID:-${PMI_RANK:-0}}
     cd "$BENCH_RANK_DIR"
     ulimit -c 0

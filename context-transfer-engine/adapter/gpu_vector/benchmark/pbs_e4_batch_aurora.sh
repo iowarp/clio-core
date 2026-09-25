@@ -107,6 +107,11 @@ args_for() {
     gmx+e5)       echo "--page-kb 78408 --blocks 8 --cap 427 --repeat 5" ;;
     lbann+e5)     echo "--in 65536 --hidden 1048576 --out 1024 --batch 64 --steps 1 --page-kb 1024 --blocks 64 --cap 32768 --no-ref" ;;
     lammps_md+e5) echo "--lattice 640 --steps 5 --page-kb 1024" ;;
+    # E5 at scale (pbs_e5_scale_aurora.sh): 8 GB/node decks sized by the
+    # caller, final-state checkpoint on; page (gmx plane) and cap come from
+    # the cell's 3rd and 4th fields.
+    gmx+e5b)      echo "--page-kb 20000 --blocks ${E5B_GMX_BLOCKS:-4} --repeat ${E5B_GMX_PASSES:-12} --ckpt-final" ;;
+    lbann+e5b)    echo "--in 65536 --hidden ${E5B_LB_HIDDEN:-131072} --out 1024 --batch 64 --steps ${E5B_LB_STEPS:-15} --page-kb 1024 --blocks 64 --no-ref --ckpt-final" ;;
     grayscott+scaled)    echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --steps ${BENCH_STEPS:-2} --repeat 1 --page-kb 1024 --ckpt-every ${BENCH_CKPT_EVERY:-1}" ;;
     *)         echo "" ;;
   esac

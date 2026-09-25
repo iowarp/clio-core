@@ -540,6 +540,7 @@ void LaunchUpdate(float *cent, const float *sums, const unsigned *counts,
 // scope it breaks the CUDA build of this driver and not the SYCL one.
 #include "../bench_dist.h"
 #include "../gv_comm_report.h"
+#include "../bench_ckpt.h"
 
 
 namespace {
@@ -593,6 +594,9 @@ int main(int argc, char **argv) {
   // Out-of-core WITHOUT in-kernel faulting: sync storage I/O, sync
   // HBM<->DRAM copy, kernel torn down for every transfer.
   bool baseline = false;
+  // --ckpt-final: vector.Copy of the point set after the run (see
+  // bench_ckpt.h); --ckpt-sync makes that Copy fully synchronous.
+  bool ckpt = false, ckpt_sync = false;
   // Storage tier: without it no workload ever touches a disk.
   unsigned long long nvme_mb = 0;
   std::string nvme_path = "/tmp/gv_storage_tier.dat";
@@ -627,6 +631,8 @@ int main(int argc, char **argv) {
     else if (a == "--data-mb") data_mb = next();
     else if (a == "--hbm-mb") hbm_mb = next();
     else if (a == "--repeat") repeat = static_cast<int>(next());
+    else if (a == "--ckpt-final") ckpt = true;
+    else if (a == "--ckpt-sync") ckpt = ckpt_sync = true;
     else if (a == "--hbm-only") hbm_only = true;
     else if (a == "--nvme-mb") nvme_mb = next();
     // next() parses a number; the path needs the raw argv token.
@@ -1081,6 +1087,14 @@ int main(int argc, char **argv) {
                  "--publish-seed or more --slots\n",
                  (unsigned long long)st.evicts);
     return 1;
+  }
+
+  // FINAL-STATE CHECKPOINT, after every gate that reads the live cache (the
+  // multi-node path drops it first).
+  std::unique_ptr<gv::Vector<float>> vec_ck;
+  if (ckpt && !baseline) {
+    vec_ck = clio_bench_ckpt::FinalCheckpoint(vec, region + "_ckpt", nodes,
+                                              ckpt_sync);
   }
 
   ctp::GpuApi::Free(d_cent); ctp::GpuApi::Free(d_sums); ctp::GpuApi::Free(d_counts);
