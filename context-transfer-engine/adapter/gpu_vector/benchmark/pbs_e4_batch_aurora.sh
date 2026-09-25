@@ -101,6 +101,12 @@ args_for() {
     # E5 at scale: the deck and the step count come from the environment so
     # one arm can be calibrated and then swept. BENCH_STEPS steps, a snapshot
     # every BENCH_CKPT_EVERY of them.
+    # E5 (HBM budget sweep) for the workloads without an E5 edition: a
+    # 64 GB/node deck at 4 nodes; the budget is the 4th cell field (--cap in
+    # frames for gmx/lbann, --slots per block for lammps_md).
+    gmx+e5)       echo "--page-kb 78408 --blocks 8 --cap 427 --repeat 5" ;;
+    lbann+e5)     echo "--in 65536 --hidden 1048576 --out 1024 --batch 64 --steps 1 --page-kb 1024 --blocks 64 --cap 32768 --no-ref" ;;
+    lammps_md+e5) echo "--lattice 640 --steps 5 --page-kb 1024" ;;
     grayscott+scaled)    echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --steps ${BENCH_STEPS:-2} --repeat 1 --page-kb 1024 --ckpt-every ${BENCH_CKPT_EVERY:-1}" ;;
     *)         echo "" ;;
   esac
@@ -171,8 +177,8 @@ run_cell() {
   local slug="${wlv#*+}_${comp}"
   [ "${wlv}" = "${wl}" ] && slug="${comp}"
   slug="${slug}${pkb:+_p${pkb}}${slots:+_s${slots}}${rtag:+_r${rtag}}"
-  local rundir="${ROOT}/build-spike/e4b_${JOBTAG}_${wl}_${slug}"
-  local log="${ROOT}/build-spike/pbs/${wl}_e4_${slug}.log"
+  local rundir="${E4_OUTROOT:-${ROOT}/build-spike}/e4b_${JOBTAG}_${wl}_${slug}"
+  local log="${E4_OUTROOT:-${ROOT}/build-spike/pbs}/${wl}_e4_${slug}.log"
   local pd pa pf top daos flare
   read -r pd pa pf <<< "$(shares_for "${comp}")"
   local args; args=$(args_for "${wlv}")
@@ -292,10 +298,14 @@ EOF
     cd "$BENCH_RANK_DIR"
     sed "s/__RANK__/$r/g" clio_tier_template.yaml > "clio_tier_r$r.yaml"
     export CLIO_SERVER_CONF="$BENCH_RANK_DIR/clio_tier_r$r.yaml"
+    en() { cat /sys/class/drm/card0/device/hwmon/hwmon*/energy1_input 2>/dev/null | head -1; }
+    e0=$(en)
     timeout --signal=TERM --kill-after=10s "${BENCH_RANK_CAP}" \
       stdbuf -oL -eL "$BENCH_RANK_EXE" $BENCH_RANK_ARGS --nodes "$BENCH_RANK_N" --node "$r" \
       > "rank$r.log" 2>&1
     rc=$?
+    e1=$(en)
+    [ -n "$e0" ] && [ -n "$e1" ] && echo "ENERGY_UJ $((e1 - e0))" >> "rank$r.log"
     echo "rank $r on $(hostname) exit=$rc" >> "rank$r.log"
     exit 0
   ' >> "${log}" 2>&1

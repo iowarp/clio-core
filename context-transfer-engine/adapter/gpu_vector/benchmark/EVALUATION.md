@@ -675,3 +675,41 @@ Eternia 1919.3-1922.8 ms/step vs MPI 2062.0, oneCCL 2038.5, Intel SHMEM 2101.8 (
 
 ### gmx at 4 nodes, fixed (job 8861048)
 Eternia spread 213.5-219.8 ms/pass + gather+sum 83.2-83.5 ms/pass (~300 ms/pass) vs MPI 307.6, oneCCL 309.1, Intel SHMEM 309.3 ms/pass: 0.97x. mesh_checksum 16937849875879000010 and gather_energy 147849839193652 equal the three baselines bit for bit. Slowest-rank communication over the run: Eternia 3.4 ms, MPI 47.6, oneCCL 86.8, Intel SHMEM 43.6. The fixes: no write-site publish when resident; the cap check bounded by distinct planes (shared cache), not 4 x blocks; the gather made plane-wise like the baselines (a node reads only its own planes, so there is no halo, publish or barrier), which also made its rounding the baselines'.
+
+## Status as of 2026-09-25 05:00 UTC (submission push)
+
+Run outputs, CSVs, figures and the analysis scripts now live on Flare
+(`/lus/flare/projects/IOWarp/llogan_e1/`): a home quota overrun truncated files
+under build-spike. The scripts are also copied into `analysis/` here.
+
+**E1 (weak scaling, 4-64 nodes): complete.** Eternia relative to MPI at 64 nodes:
+kmeans 1.19x, grayscott 1.12x (two-phase, seed barrier), gmx 1.01x, lbann 1.07x.
+Per-cell results are in `e1_cells.csv`. The 128-node run was cancelled (not required).
+
+**E3 (persistence, 4 nodes, grayscott, job 8865914): 9 of 12 cells OK.** The cells
+that hit the 600 s cap (rc=134) are nockpt/lustre70, ckptdrain/bal25 and
+ckptdrain/daos70.
+
+**E5 (memory reduction): 4 nodes complete** for kmeans and grayscott. The gmx, lbann
+and lammps_md decks run as jobs 8865970-8865972. E7, E6 and E5 at 256 nodes are
+dropped.
+
+**E5 at 16 nodes (job 8865932): only kmeans at 8 GB passed (134.4 s).** There are
+two failure modes:
+1. False "Gone" from the #628 task-progress probe. The probe runs every 5 s
+   by default. A backlogged node answers "Gone" for a replica that is still
+   queued or whose response is still in flight. The origin then completes the
+   put with a network-timeout RC, so gpu_vector reports "writeback REFUSED"
+   (FATAL 8) or an empty fetch (FATAL 7), and the GPU segfaults. The backlogged
+   rank is the one rank without a FATAL, and it hangs until the cap. The
+   workaround uses the existing knob `CLIO_TASK_PROGRESS_INTERVAL_MS=0`, which
+   is now the default in `pbs_e5_aurora.sh`. The runtime fix, still to do:
+   the probe must not report Gone for a replica that has not yet been received
+   or whose response is in flight.
+2. A single-rank crash with no probe involvement: kmeans 24 GB (rank 4) and
+   4 GB (rank 5, UR OUT_OF_RESOURCES after iteration 7), and grayscott 32 GB
+   (ranks 5 and 15, FATAL 7) and 24 GB. The crashes are on different hosts, so
+   this is not a bad node. On the crashing node the elastic scheduler had grown
+   to ~170 workers (quick 32, medium 69, heavy 69). This is under investigation.
+The reruns with the probe off are E5_16a 8866193 (kmeans 32/24/16 and
+grayscott 32) and E5_16b 8866233 (grayscott 24/16/8/4).

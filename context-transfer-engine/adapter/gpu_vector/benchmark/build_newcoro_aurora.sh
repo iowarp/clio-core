@@ -22,8 +22,8 @@ W="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 GVI=context-transfer-engine/adapter/gpu_vector/include
 BD=context-transfer-engine/adapter/gpu_vector/benchmark/$DIR
 SRC="$W/$BD/clio_${NAME}_paged_newcoro.cc"
-G="$W/build-gen-$NAME"
-OUT="$W/build-spike"
+G="${BUILD_GEN:-$W}/build-gen-$NAME"
+OUT="${BUILD_OUT:-$W/build-spike}"
 COROC="$W/build-coroc/clio-coroc"
 
 test -f "$SRC" || { echo "no source: $SRC" >&2; exit 1; }

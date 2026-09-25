@@ -1442,7 +1442,18 @@ int main(int argc, char **argv) {
                    zbase, zend, vw, sv, 0u);
   });
   ctp::GpuApi::Synchronize();
-  // NO seed-side flush/barrier/invalidate. SeedCoro publishes its own
+  // SEED BARRIER (before the clock). Step 0's halo fetch demands a peer's
+  // generation-1 publish, and the runtime bounds that wait (~10 s). At 64
+  // nodes start-up and seeding skew exceeds it: a node reached step 0 before
+  // its neighbour had published and the fetch failed (DEVICE FATAL 7). Every
+  // node publishes its seed before any node takes its first step.
+  if (nodes > 1 &&
+      !clio_bench_dist::Barrier(*cte_red, red_tag, node, nodes, red_round++,
+                                "gsseed", 600)) {
+    std::fprintf(stderr, "GRAYSCOTT ERROR: seed barrier failed\n");
+    return 1;
+  }
+  // No seed-side flush/invalidate. SeedCoro publishes its own
   // planes AS generation 1 (BeginFlush(1) + EndFlush), and step 0's halo
   // fetch DEMANDS generation 1 -- the demand polls until the peer's
   // publish is served, so the generation is the barrier. A whole-table

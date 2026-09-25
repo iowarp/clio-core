@@ -103,7 +103,7 @@ export MPIR_CVAR_ENABLE_GPU=1
 # @param 4 1 if the binary takes --nodes/--node, 0 if it is an MPI baseline
 run_one() {
   local label=$1 exe=$2 args=$3 ranked=$4
-  local rundir="${ROOT}/build-spike/e1_${JOBTAG}_${label}"
+  local rundir="${BENCH_RUNROOT:-${ROOT}/build-spike}/e1_${JOBTAG}_${label}"
   if [ ! -x "${exe}" ]; then
     echo "RESULT e1/${label}x${NRANKS}: NO-EXECUTABLE"
     return 2
@@ -282,9 +282,9 @@ for wl in ${WORKLOADS}; do
   # GMX FRAME BUDGET: the Eternia mesh cache holds at least one frame per
   # work-group and a frame is a whole K*K plane, which grows as N^(2/3). At
   # 16 nodes 1024 x 80 MB = 85 GB overflowed the 64 GB tile. Halve the grid
-  # (for ALL four arms, so they still share it) until the frames fit 52 GB.
+  # (for ALL four arms, so they still share it) until the frames fit 40 GB (52 GB failed to allocate at 64 nodes).
   if [ "${wl}" = gmx ]; then
-    while [ $(( B * GX_PKB / 1024 )) -gt 53248 ] && [ "${B}" -gt 64 ]; do
+    while [ $(( B * GX_PKB / 1024 )) -gt 40960 ] && [ "${B}" -gt 32 ]; do
       B=$(( B / 2 ))
     done
     wl_decks "${wl}" "${B}"
@@ -327,7 +327,7 @@ for wl in ${WORKLOADS}; do
   done
   # The Eternia arm, on the SAME grid as the baselines above: SLOTS frames per
   # block of 1 MB over B blocks holds the node's whole share, so it is resident.
-  et_rundir="${ROOT}/build-spike/e1_${JOBTAG}_${wl}_b${B}_eternia"
+  et_rundir="${BENCH_RUNROOT:-${ROOT}/build-spike}/e1_${JOBTAG}_${wl}_b${B}_eternia"
   mkdir -p "${et_rundir}"
   et_conf "${et_rundir}" $(( PERNODE_MB + 2048 ))
   export CLIO_SERVER_CONF="${et_rundir}/clio_e1.yaml"

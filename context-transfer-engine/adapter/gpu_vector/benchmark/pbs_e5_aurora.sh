@@ -41,6 +41,11 @@ export ZE_AFFINITY_MASK=${BENCH_ZE_MASK:-0.0}
 export SYCL_CACHE_PERSISTENT=1
 export SYCL_CACHE_DIR=${SYCL_CACHE_DIR:-${ROOT}/build-spike/sycl_cache}
 export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+# The #628 task-progress probe answers "Gone" for a replica whose response is
+# still in flight (or not yet received) on a backlogged node; the origin then
+# fails a healthy writeback with a network-timeout RC (E5 16 nodes: REFUSED
+# writebacks, 8865932). The per-rank cap bounds real hangs instead.
+export CLIO_TASK_PROGRESS_INTERVAL_MS=${CLIO_TASK_PROGRESS_INTERVAL_MS:-0}
 
 echo "=== E5: ${NRANKS} nodes, ${PERNODE_MB} MB/node deck (${DATA_MB} MB), DRAM tier ${TIER_MB} MB/node ==="
 echo "    cells: ${CELLS}"
@@ -115,7 +120,7 @@ cell_deck() {
 run_cell() {
   local wl=${1%%:*} gb=${1#*:}
   local label="${wl}_hbm${gb}"
-  local rundir="${ROOT}/build-spike/e5_${JOBTAG}_${label}"
+  local rundir="${E5_RUNROOT:-${ROOT}/build-spike}/e5_${JOBTAG}_${label}"
   cell_deck "${wl}" "${gb}"
   if [ -z "${EXE}" ] || [ ! -x "${EXE}" ]; then
     echo "RESULT e5/${label}x${NRANKS}: NO-EXECUTABLE (${EXE})"
