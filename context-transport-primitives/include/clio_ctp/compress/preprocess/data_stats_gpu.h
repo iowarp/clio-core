@@ -59,6 +59,16 @@ struct DeviceFeatureStats {
   double entropy;
   double mad;
   double second_derivative;
+  /**
+   * The chunk's value range, min and max over its elements (NaN ignored).
+   * Not a model feature: the three above keep their offsets and meaning.
+   * It is what an absolute error bound is measured against -- the analytical
+   * PSNR of quantizing this chunk -- and the three features cannot recover
+   * it, since none of them carries the data's absolute scale. The quality
+   * floor in RankKernel (GpuRankParams::min_psnr) reads it.
+   */
+  double value_min;
+  double value_max;
 };
 
 /**

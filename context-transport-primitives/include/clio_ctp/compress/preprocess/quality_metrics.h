@@ -157,9 +157,12 @@ inline QualityMetrics QualityFromAccumulators(const QualityAccumulators &a,
   // reported against unity.
   const double dr = (m.data_range > 0.0) ? m.data_range : 1.0;
 
-  // 1e-10 is upstream's threshold, not an epsilon of convenience: below it the
-  // round trip is called bit-exact and PSNR saturates rather than diverging.
-  m.psnr_db = (m.rmse < 1e-10)
+  // Saturate only an EXACT round trip. Upstream saturates below an absolute
+  // RMSE of 1e-10, which is not "bit-exact" for data whose values are that
+  // small: a chunk of 1e-17-scale values quantized to a flat line has RMSE
+  // ~1e-17 and was reported at 120 dB when, against its own range, it is
+  // ~6 dB (12 such chunks on Nyx). The error is judged against the range.
+  m.psnr_db = (m.rmse <= 0.0)
                   ? 120.0
                   : std::fmin(120.0, 20.0 * std::log10(dr / m.rmse));
 

@@ -50,7 +50,7 @@ bench_compose() {
   local store=$1
   # Tier is sized from the payload actually on disk plus headroom, since the
   # replay's size is a property of the dump rather than of any parameter here.
-  local payload_mb=$(( $(du -sm "$FIELDS" 2>/dev/null | cut -f1) ))
+  local payload_mb=$(( $(du -smL "$FIELDS" 2>/dev/null | cut -f1) ))   # -L: a staged subset is symlinks
   [ "$payload_mb" -lt 1 ] && payload_mb=1
   local tier_mb=$(( payload_mb + 512 ))
   local bdev_mb=$(( tier_mb * 2 ))

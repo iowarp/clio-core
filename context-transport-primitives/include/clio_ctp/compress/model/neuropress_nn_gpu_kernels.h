@@ -220,7 +220,9 @@ struct GpuRankParams {
   /**
    * The two mask inputs, applied in-kernel exactly as nn_gpu.cu does:
    *   quantize actions are masked when error_bound <= 0
-   *   any action is masked when min_psnr > 0 and its predicted PSNR is below it
+   *   a QUANTIZED action is masked when min_psnr > 0 and the analytical PSNR
+   *   of its chunk's value range under error_bound is below it (the network's
+   *   PSNR when no device stats are given); a lossless action never is
    * A masked action scores -INFINITY, so it loses to every unmasked one but is
    * still ranked -- upstream always returns an action, even when every action
    * is masked. Leave min_psnr at 0 to disable the PSNR mask, which is

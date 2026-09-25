@@ -36,17 +36,22 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
+#include <regex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -85,6 +90,19 @@ struct Options {
   // the guarantee the error bound makes.
   bool check_bound = false;
   bool no_compress = false;  // raw PutBlob/GetBlob, no codec (baseline)
+  // Read-back requests kept in flight at once. 1 is the sequential read every
+  // earlier campaign used; more is a consumer that prefetches, which lets the
+  // runtime's workers decode several chunks concurrently.
+  size_t read_inflight = 1;
+  // Decode into device memory (a GPU consumer's buffer) instead of host
+  // shared memory; the runtime then skips the D2H of every decoded chunk.
+  bool read_to_gpu = false;
+  // With --verify: read everything back this many times, each timed. Needed
+  // for a memory-backed tier, whose contents do not outlive this process.
+  size_t read_repeat = 1;
+  // With --verify: read back only the blobs whose name matches (ECMAScript
+  // regex), as a consumer that reads some of the fields a producer wrote.
+  std::string read_match;
 };
 
 void Usage(const char *argv0) {
@@ -106,6 +124,11 @@ void Usage(const char *argv0) {
       << "  --no-compress    baseline: store every chunk raw with PutBlob, no\n"
       << "                   codec selection or compression\n"
       << "  --readback CSV   no files: read the blobs a previous run listed\n"
+      << "  --read-inflight N  keep N read-back requests in flight [1]\n"
+      << "  --read-to-gpu    read back into device memory (a GPU consumer)\n"
+      << "  --read-repeat N  with --verify: N timed read-backs; --check-bound\n"
+      << "                   then runs one more, untimed, to check the bound\n"
+      << "  --read-match RE  with --verify: read back only blobs matching RE\n"
       << "  --dump-decompressed DIR  with --readback, write each decompressed\n"
       << "                   blob to DIR so an EXTERNAL tool can compare it\n"
       << "                   against the simulation's own output files\n";
@@ -133,6 +156,16 @@ bool ParseArgs(int argc, char **argv, Options *o) {
     else if (a == "--f64") o->f64 = true;
     else if (a == "--verify") o->verify = true;
     else if (a == "--no-compress") o->no_compress = true;
+    else if (a == "--read-to-gpu") o->read_to_gpu = true;
+    else if (a == "--read-match") o->read_match = need("REGEX");
+    else if (a == "--read-repeat") {
+      o->read_repeat = std::strtoull(need("N"), nullptr, 10);
+      if (o->read_repeat == 0) o->read_repeat = 1;
+    }
+    else if (a == "--read-inflight") {
+      o->read_inflight = std::strtoull(need("N"), nullptr, 10);
+      if (o->read_inflight == 0) o->read_inflight = 1;
+    }
     else if (a == "-h" || a == "--help") { Usage(argv[0]); std::exit(0); }
     else { std::cerr << "unknown option " << a << "\n"; Usage(argv[0]); return false; }
   }
@@ -163,6 +196,60 @@ double ErrorBoundFromEnv() {
   if (e == nullptr || *e == '\0') return 0.0;
   const double v = std::atof(e);
   return v > 0.0 ? v : 0.0;
+}
+
+/**
+ * Value-range-relative bound, from CLIO_NEUROPRESS_REL_BOUND: with eps > 0 the
+ * quantizer bounds each chunk by eps x its (max - min) rather than by the
+ * absolute CLIO_NEUROPRESS_ERROR_BOUND (QuantizeDevice). 0 = absolute mode.
+ *
+ * @return eps, or 0
+ */
+double RelativeBoundFromEnv() {
+  const char *e = std::getenv("CLIO_NEUROPRESS_REL_BOUND");
+  if (e == nullptr || *e == '\0') return 0.0;
+  const double v = std::atof(e);
+  return v > 0.0 ? v : 0.0;
+}
+
+/**
+ * The bound one chunk was quantized to, for the element-wise check.
+ *
+ * @param src   the chunk's original bytes
+ * @param bytes their size
+ * @param f64   element width is 8 bytes
+ * @param eb    the absolute bound
+ * @param rel   the relative bound, 0 in absolute mode
+ * @return rel x the chunk's value range (NaN ignored) in relative mode, the
+ *   absolute bound otherwise and for a constant chunk, which is exact anyway
+ */
+double ChunkBound(const char *src, size_t bytes, bool f64, double eb, double rel) {
+  if (rel <= 0.0) return eb;
+  double lo = std::numeric_limits<double>::infinity(), hi = -lo;
+  const size_t n = bytes / (f64 ? sizeof(double) : sizeof(float));
+  for (size_t i = 0; i < n; ++i) {
+    const double v = f64 ? reinterpret_cast<const double *>(src)[i]
+                         : static_cast<double>(reinterpret_cast<const float *>(src)[i]);
+    if (std::isnan(v)) continue;
+    lo = std::min(lo, v);
+    hi = std::max(hi, v);
+  }
+  return (hi > lo) ? rel * (hi - lo) : eb;
+}
+
+/**
+ * Quality floor for lossy selection, in dB, from CLIO_NEUROPRESS_TARGET_PSNR.
+ * With a positive error bound, NeuroPress then refuses to quantize a chunk
+ * whose analytical PSNR (its value range against the bound) is below the
+ * floor, and stores it losslessly instead. 0 (the default) disables the floor.
+ *
+ * @return the floor in whole dB, or 0
+ */
+unsigned TargetPsnrFromEnv() {
+  const char *e = std::getenv("CLIO_NEUROPRESS_TARGET_PSNR");
+  if (e == nullptr || *e == '\0') return 0;
+  const double v = std::atof(e);
+  return v > 0.0 ? static_cast<unsigned>(std::lround(v)) : 0;
 }
 
 /**
@@ -398,120 +485,297 @@ int main(int argc, char **argv) {
   // Error bound in force for this run, so verification can pick the check that
   // actually applies: bit-exact for lossless, |orig-decoded| <= eb for lossy.
   const double verify_eb = ErrorBoundFromEnv();
+  const double verify_rel = RelativeBoundFromEnv();
   size_t bound_checked = 0, bound_exceeded = 0, bound_unreadable = 0;
   double bound_worst = 0.0;
 
-  auto verify_records = [&](const std::vector<BlobRecord> &recs) -> bool {
-    size_t bad = 0;
-    std::vector<char> srcbuf;
-    for (const auto &r : recs) {
-      auto buf = CLIO_IPC->AllocateBuffer(r.bytes);
-      if (buf.IsNull()) { std::cerr << "AllocateBuffer (verify) failed\n"; return false; }
-      std::memset(buf.ptr_, 0, r.bytes);
-      int rc_get;
-      if (opt.no_compress) {
-        auto get = cte_client->AsyncGetBlob(
-            tag_id, r.name, 0, r.bytes, 0, buf.shm_.template Cast<void>(),
-            clio::run::PoolQuery::Local());
-        get.Wait();
-        rc_get = get->GetReturnCode();
-      } else {
-        auto get = compressor.AsyncDecompressExplicit(
-            clio::run::PoolQuery::Local(), tag_id, r.name, 0, r.bytes, 0,
-            buf.shm_.template Cast<void>(), cte_client->pool_id_);
-        get.Wait();
-        rc_get = get->GetReturnCode();
-      }
-
-      // Which check applies is decided by the error bound, not by a separate
-      // flag: under lossy compression the decoded bytes are NOT the input
-      // bytes by construction, so a digest comparison there reports a failure
-      // that is not one. --check-bound asks for the element-wise comparison
-      // that tests the guarantee the bound actually makes.
-      bool ok;
-      if (opt.check_bound && verify_eb > 0.0) {
-        ok = rc_get == 0;
-        std::string src;
-        size_t off = 0;
-        if (ok && SourceOfBlob(r.name, opt.dir, opt.ext, opt.chunk, &src, &off)) {
-          std::ifstream in(src, std::ios::binary);
-          if (in) {
-            srcbuf.resize(r.bytes);
-            in.seekg(static_cast<std::streamoff>(off));
-            in.read(srcbuf.data(), static_cast<std::streamsize>(r.bytes));
-            if (in.gcount() == static_cast<std::streamsize>(r.bytes)) {
-              // Compare at the element width the run declared. A float64
-              // replay quantizes as float64; reading it as float32 would
-              // compare halves of values against each other.
-              double worst = 0.0;
-              if (opt.f64) {
-                const auto *a = reinterpret_cast<const double *>(srcbuf.data());
-                const auto *b = reinterpret_cast<const double *>(buf.ptr_);
-                for (size_t i = 0; i < r.bytes / sizeof(double); ++i)
-                  worst = std::max(worst, std::fabs(a[i] - b[i]));
-              } else {
-                const auto *a = reinterpret_cast<const float *>(srcbuf.data());
-                const auto *b = reinterpret_cast<const float *>(buf.ptr_);
-                for (size_t i = 0; i < r.bytes / sizeof(float); ++i)
-                  worst = std::max(worst,
-                                   std::fabs(static_cast<double>(a[i]) -
-                                             static_cast<double>(b[i])));
-              }
-              ++bound_checked;
-              bound_worst = std::max(bound_worst, worst);
-              if (worst > verify_eb) {
-                ++bound_exceeded;
-                // Scientific, and NOT the stream's inherited precision:
-                // the summary block below sets fixed/3dp for ratios ("5.370x"),
-                // which is sticky and would round an error of 9.49e-04 to
-                // "0.001" -- indistinguishable from the bound it is being
-                // checked against.
-                std::cerr << std::scientific << std::setprecision(6)
-                          << "  BOUND EXCEEDED " << r.name << " max|err|="
-                          << worst << " > eb=" << verify_eb << "\n";
-              }
+  // One read-back record's verdict from its decoded bytes: the digest, or
+  // under a positive bound "decompressed without error" plus, with
+  // --check-bound, the element-wise comparison against the source file.
+  // Driver work, never inside a read's timed interval.
+  std::vector<char> srcbuf;
+  auto check_record = [&](const BlobRecord &r, const char *data,
+                          int rc_get) -> bool {
+    // Which check applies is decided by the error bound, not by a separate
+    // flag: under lossy compression the decoded bytes are NOT the input
+    // bytes by construction, so a digest comparison there reports a failure
+    // that is not one. --check-bound asks for the element-wise comparison
+    // that tests the guarantee the bound actually makes.
+    bool ok;
+    if (verify_eb > 0.0) {
+      // A positive bound rules the digest out on its own: nothing lossy can
+      // reproduce the input bytes, so decompressing without error is the
+      // whole round-trip check available here. The element-wise test against
+      // the source files is what --check-bound adds, and it is deliberately
+      // separate: it re-reads every source chunk, which a TIMED read-back
+      // must not do.
+      ok = rc_get == 0;
+      std::string src;
+      size_t off = 0;
+      if (opt.check_bound && ok &&
+          SourceOfBlob(r.name, opt.dir, opt.ext, opt.chunk, &src, &off)) {
+        std::ifstream in(src, std::ios::binary);
+        if (in) {
+          srcbuf.resize(r.bytes);
+          in.seekg(static_cast<std::streamoff>(off));
+          in.read(srcbuf.data(), static_cast<std::streamsize>(r.bytes));
+          if (in.gcount() == static_cast<std::streamsize>(r.bytes)) {
+            // Compare at the element width the run declared. A float64
+            // replay quantizes as float64; reading it as float32 would
+            // compare halves of values against each other.
+            double worst = 0.0;
+            if (opt.f64) {
+              const auto *a = reinterpret_cast<const double *>(srcbuf.data());
+              const auto *b = reinterpret_cast<const double *>(data);
+              for (size_t i = 0; i < r.bytes / sizeof(double); ++i)
+                worst = std::max(worst, std::fabs(a[i] - b[i]));
             } else {
-              ++bound_unreadable;
+              const auto *a = reinterpret_cast<const float *>(srcbuf.data());
+              const auto *b = reinterpret_cast<const float *>(data);
+              for (size_t i = 0; i < r.bytes / sizeof(float); ++i)
+                worst = std::max(worst,
+                                 std::fabs(static_cast<double>(a[i]) -
+                                           static_cast<double>(b[i])));
+            }
+            ++bound_checked;
+            bound_worst = std::max(bound_worst, worst);
+            const double bound =
+                ChunkBound(srcbuf.data(), r.bytes, opt.f64, verify_eb, verify_rel);
+            if (worst > bound) {
+              ++bound_exceeded;
+              // Scientific, and NOT the stream's inherited precision:
+              // the summary block below sets fixed/3dp for ratios ("5.370x"),
+              // which is sticky and would round an error of 9.49e-04 to
+              // "0.001" -- indistinguishable from the bound it is being
+              // checked against.
+              std::cerr << std::scientific << std::setprecision(6)
+                        << "  BOUND EXCEEDED " << r.name << " max|err|="
+                        << worst << " > eb=" << bound << "\n";
             }
           } else {
             ++bound_unreadable;
           }
-        } else if (ok) {
+        } else {
           ++bound_unreadable;
         }
-      } else {
-        ok = rc_get == 0 && Fnv1a(buf.ptr_, r.bytes) == r.digest;
+      } else if (opt.check_bound && ok) {
+        ++bound_unreadable;
       }
-      if (!ok) {
-        ++bad;
-        std::cerr << "  MISMATCH " << r.name << " rc=" << rc_get << "\n";
-      }
-      /* Optionally hand the decompressed bytes to an external checker. The
-         digest above is computed by the same program that computed the
-         original one, so it proves the round trip is self-consistent; writing
-         the bytes out lets something else compare them against the
-         simulation's own output and remove this program from the loop. */
-      if (!opt.dump_dir.empty() && rc_get == 0) {
-        std::string fn = r.name;
-        for (auto &ch : fn) if (ch == '/') ch = '_';
-        std::ofstream(opt.dump_dir + "/" + fn + ".bin", std::ios::binary)
-            .write(buf.ptr_, static_cast<std::streamsize>(r.bytes));
-      }
-      CLIO_IPC->FreeBuffer(buf);
+    } else {
+      ok = rc_get == 0 && Fnv1a(data, r.bytes) == r.digest;
     }
+    if (!ok) std::cerr << "  MISMATCH " << r.name << " rc=" << rc_get << "\n";
+    /* Optionally hand the decompressed bytes to an external checker. The
+       digest above is computed by the same program that computed the
+       original one, so it proves the round trip is self-consistent; writing
+       the bytes out lets something else compare them against the
+       simulation's own output and remove this program from the loop. */
+    if (!opt.dump_dir.empty() && rc_get == 0) {
+      std::string fn = r.name;
+      for (auto &ch : fn) if (ch == '/') ch = '_';
+      std::ofstream(opt.dump_dir + "/" + fn + ".bin", std::ios::binary)
+          .write(data, static_cast<std::streamsize>(r.bytes));
+    }
+    return ok;
+  };
+
+  // One read-back destination: host shared memory, or with --read-to-gpu a
+  // device buffer registered with the runtime (a GPU consumer's memory; the
+  // runtime decodes straight into it, and there is no D2H of the result).
+  struct ReadBuf {
+    ctp::ipc::FullPtr<char> host;
+    ctp::ipc::AllocatorId dev_alloc;
+    char *dev = nullptr;
+    ctp::ipc::ShmPtr<void> shm;
+  };
+  // A destination for `bytes`, cleared unless `clear` is false; false when it
+  // cannot be allocated.
+  auto alloc_read_buf = [&](size_t bytes, ReadBuf *b, bool clear) -> bool {
+    if (opt.read_to_gpu) {
+      b->dev_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+          /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem, bytes,
+          &b->dev);
+      if (b->dev_alloc.IsNull() || b->dev == nullptr) return false;
+      if (clear) ctp::GpuApi::Memset(b->dev, 0, bytes);
+      // off_ carries the raw device address, which ToFullPtr resolves for the
+      // process that minted the id (ipc_manager.h, "Case 4").
+      b->shm = ctp::ipc::ShmPtr<void>(b->dev_alloc, reinterpret_cast<size_t>(b->dev));
+      return true;
+    }
+    b->host = CLIO_IPC->AllocateBuffer(bytes);
+    if (b->host.IsNull()) return false;
+    if (clear) std::memset(b->host.ptr_, 0, bytes);
+    b->shm = b->host.shm_.template Cast<void>();
+    return true;
+  };
+  // The decoded bytes on the host for check_record: the buffer itself, or a
+  // copy of the device buffer when a check or the dump needs the data.
+  std::vector<char> host_copy;
+  auto host_view = [&](const ReadBuf &b, size_t bytes) -> const char * {
+    if (!opt.read_to_gpu) return b.host.ptr_;
+    const bool need = verify_eb <= 0.0 || opt.check_bound || !opt.dump_dir.empty();
+    if (!need) return nullptr;
+    host_copy.resize(bytes);
+    ctp::DeviceAwareMemcpy(host_copy.data(), b.dev, bytes);
+    return host_copy.data();
+  };
+  auto free_read_buf = [&](ReadBuf &b) {
+    if (opt.read_to_gpu) CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, b.dev_alloc);
+    else CLIO_IPC->FreeBuffer(b.host);
+  };
+  // Issue one read into `b`: a raw GetBlob for the baseline, else the
+  // compressor's decompress.
+  auto issue_get = [&](const BlobRecord &r, const ReadBuf &b) {
+    return compressor.AsyncDecompressExplicit(
+        clio::run::PoolQuery::Local(), tag_id, r.name, 0, r.bytes, 0, b.shm,
+        cte_client->pool_id_);
+  };
+  auto issue_raw = [&](const BlobRecord &r, const ReadBuf &b) {
+    return cte_client->AsyncGetBlob(tag_id, r.name, 0, r.bytes, 0, b.shm,
+                                    clio::run::PoolQuery::Local());
+  };
+  // A record's verdict once its read finished, plus the buffer's release.
+  // Driver work: callers keep it out of the timed interval.
+  auto finish_record = [&](const BlobRecord &r, ReadBuf &b, int rc,
+                           size_t *bad, size_t *got_bytes) {
+    if (rc == 0) *got_bytes += r.bytes;
+    const char *data = host_view(b, r.bytes);
+    // With the data on the device and nothing to check it against, only the
+    // return code is left -- which is all a lossy run checks anyway.
+    const bool ok = data != nullptr ? check_record(r, data, rc) : rc == 0;
+    if (!ok) {
+      ++*bad;
+      if (data == nullptr) std::cerr << "  MISMATCH " << r.name << " rc=" << rc << "\n";
+    }
+    free_read_buf(b);
+  };
+
+  // Read-back with up to --read-inflight requests outstanding: a consumer
+  // that prefetches, so the runtime's workers decode chunks concurrently.
+  //
+  // A TIMING mode. Its time is the wall clock of the whole loop -- issuing,
+  // waiting, and allocating and releasing each buffer, as a prefetching
+  // consumer would -- with nothing subtracted: the reads still in flight keep
+  // progressing during any driver work, so subtracting that work would remove
+  // read time with it. For the same reason nothing heavy runs inside the loop:
+  // buffers are not cleared and only each read's return code is checked. The
+  // data are verified by a sequential read (the harness's first), and a
+  // windowed read that must dump or check them says its time includes that.
+  auto read_windowed = [&](const std::vector<BlobRecord> &recs, size_t *bad,
+                           double *get_ms, size_t *got_bytes) -> bool {
+    const bool inspect = !opt.dump_dir.empty() || opt.check_bound;
+    if (inspect) {
+      std::cerr << "note: windowed read with --dump-decompressed/--check-bound;"
+                   " its time includes that work\n";
+    }
+    auto run = [&](auto issue) -> bool {
+      using Fut = decltype(issue(recs[0], std::declval<const ReadBuf &>()));
+      struct Slot {
+        size_t idx;
+        ReadBuf buf;
+        Fut fut;
+      };
+      std::deque<Slot> window;
+      auto finish = [&](Slot &slot) {
+        slot.fut.Wait();
+        const int rc = slot.fut->GetReturnCode();
+        const BlobRecord &r = recs[slot.idx];
+        if (inspect) {
+          finish_record(r, slot.buf, rc, bad, got_bytes);
+          return;
+        }
+        if (rc == 0) *got_bytes += r.bytes;
+        else {
+          ++*bad;
+          std::cerr << "  MISMATCH " << r.name << " rc=" << rc << "\n";
+        }
+        free_read_buf(slot.buf);
+      };
+      const auto t_start = std::chrono::steady_clock::now();
+      for (size_t i = 0; i < recs.size(); ++i) {
+        if (window.size() >= opt.read_inflight) {
+          finish(window.front());
+          window.pop_front();
+        }
+        ReadBuf buf;
+        if (!alloc_read_buf(recs[i].bytes, &buf, inspect)) {
+          std::cerr << "read buffer allocation failed\n";
+          return false;
+        }
+        Fut fut = issue(recs[i], buf);
+        window.push_back(Slot{i, buf, std::move(fut)});
+      }
+      while (!window.empty()) {
+        finish(window.front());
+        window.pop_front();
+      }
+      *get_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_start).count();
+      return true;
+    };
+    return opt.no_compress ? run(issue_raw) : run(issue_get);
+  };
+
+  // Read-back one request at a time. The time is the read path alone: the
+  // GetBlob / decompress call and its wait. The digest, the bound check and
+  // the optional dump are verification, so a cold read-back's time is not
+  // inflated by them.
+  auto read_sequential = [&](const std::vector<BlobRecord> &recs, size_t *bad,
+                             double *get_ms, size_t *got_bytes) -> bool {
+    for (const auto &r : recs) {
+      ReadBuf buf;
+      if (!alloc_read_buf(r.bytes, &buf, /*clear=*/true)) {
+        std::cerr << "read buffer allocation failed\n";
+        return false;
+      }
+      int rc_get;
+      const auto t_get = std::chrono::steady_clock::now();
+      if (opt.no_compress) {
+        auto get = issue_raw(r, buf);
+        get.Wait();
+        rc_get = get->GetReturnCode();
+      } else {
+        auto get = issue_get(r, buf);
+        get.Wait();
+        rc_get = get->GetReturnCode();
+      }
+      *get_ms += std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - t_get).count();
+      finish_record(r, buf, rc_get, bad, got_bytes);
+    }
+    return true;
+  };
+
+  auto verify_records = [&](const std::vector<BlobRecord> &recs) -> bool {
+    size_t bad = 0;
+    double get_ms = 0.0;
+    size_t got_bytes = 0;
+    const bool read_ok =
+        opt.read_inflight > 1
+            ? read_windowed(recs, &bad, &get_ms, &got_bytes)
+            : read_sequential(recs, &bad, &get_ms, &got_bytes);
+    if (!read_ok) return false;
     // Say which check ran. In bound mode the bytes are NOT expected to match
     // bit for bit, so claiming they did would be false on every lossy run --
     // `bad` there counts decompression failures only, and the verdict on the
     // data is the BOUND line below.
-    const bool bound_mode = opt.check_bound && verify_eb > 0.0;
+    // Any positive bound, --check-bound or not: claiming a bit-exact round trip
+    // on a lossy run would be false whether or not the bound was also checked.
+    const bool bound_mode = verify_eb > 0.0;
     std::cout << (bad == 0 ? "VERIFIED: " : "FAILED: ") << (recs.size() - bad)
               << " of " << recs.size()
               << (bound_mode
-                      ? " blobs decompressed without error (bound checked"
-                        " separately below)"
+                      ? (opt.check_bound
+                             ? " blobs decompressed without error (bound"
+                               " checked separately below)"
+                             : " blobs decompressed without error (lossy: no"
+                               " bit-exact check, and --check-bound was not"
+                               " asked for)")
                       : " blobs round-tripped bit-exact through the"
                         " decompressor")
               << std::endl;
+    std::cout << "  get+decompress: " << get_ms << " ms for " << got_bytes
+              << " B in " << recs.size() << " blob(s)" << std::endl;
     return bad == 0;
   };
 
@@ -609,9 +873,13 @@ int main(int argc, char **argv) {
   clio::cte::core::Context ctx;
   ctx.data_type_ = opt.f64 ? 2 : 1;
   ctx.error_bound_ = ErrorBoundFromEnv();
+  ctx.target_psnr_ = TargetPsnrFromEnv();
   if (ctx.error_bound_ > 0.0)
     std::cout << "  error bound=" << ctx.error_bound_
               << "  LOSSY (quantize actions enabled)" << std::endl;
+  if (ctx.error_bound_ > 0.0 && ctx.target_psnr_ > 0)
+    std::cout << "  quality floor=" << ctx.target_psnr_
+              << " dB (a chunk below it is stored losslessly)" << std::endl;
 
   std::vector<BlobRecord> records;
   std::vector<Pending> pending;
@@ -898,7 +1166,44 @@ int main(int argc, char **argv) {
     std::cout << "FSYNC FAILED: " << fsync_error << std::endl;
     rc = 1;
   }
-  if (opt.verify && !verify_records(records)) rc = 1;
+  // --verify after a write: --read-repeat timed read-backs (a memory-backed
+  // tier must be read in this process), then one more, untimed and
+  // sequential, that checks the data -- element-wise against the bound with
+  // --check-bound, bit-exact against the digest for a lossless run -- so the
+  // timed reads (return codes only) carry none of it.
+  auto verify_repeated = [&](const std::vector<BlobRecord> &recs) -> bool {
+    const bool check = opt.check_bound || verify_eb <= 0.0;
+    const size_t window = opt.read_inflight;
+    opt.check_bound = false;
+    bool ok = true;
+    for (size_t i = 1; i <= opt.read_repeat; ++i) {
+      std::cout << "READ " << i << "/" << opt.read_repeat << std::endl;
+      ok = verify_records(recs) && ok;
+    }
+    if (check) {
+      opt.check_bound = verify_eb > 0.0;
+      opt.read_inflight = 1;
+      std::cout << "READ check (untimed; sequential, "
+                << (verify_eb > 0.0 ? "element-wise bound" : "bit-exact digest")
+                << ")" << std::endl;
+      ok = verify_records(recs) && ok;
+      opt.read_inflight = window;
+    }
+    return ok;
+  };
+  std::vector<BlobRecord> read_set;
+  if (!opt.read_match.empty()) {
+    const std::regex re(opt.read_match);
+    for (const auto &r : records) {
+      if (std::regex_search(r.name, re)) read_set.push_back(r);
+    }
+    std::cout << "read-back set: " << read_set.size() << " of " << records.size()
+              << " blob(s) match '" << opt.read_match << "'" << std::endl;
+  }
+  if (opt.verify &&
+      !verify_repeated(opt.read_match.empty() ? records : read_set)) {
+    rc = 1;
+  }
   // A bound violation is a FAILED run. Evaluated after verify_records, which
   // is what populates the counters, and independently of it: under --check-bound
   // verify_records only fails on a decompress error, so without this a run

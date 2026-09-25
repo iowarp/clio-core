@@ -653,6 +653,23 @@ __global__ void InferKernelDeviceStats(
 /** Widest candidate set the ranking warp can hold, and the reason it is 32: that is upstream's ... */
 
 
+/**
+ * Analytical PSNR of quantizing a chunk under an absolute bound: the error is
+ * uniform on [-eb, eb], so MSE = eb^2 / 3 against the chunk's own value range.
+ * A chunk with no range (constant) quantizes exactly and scores the 120 dB
+ * cap -- the same cap the network's PSNR output and AnalyticalPsnr use.
+ *
+ * @param range        the chunk's max - min
+ * @param error_bound  the absolute bound
+ * @return PSNR in dB, at most 120
+ */
+__device__ __forceinline__ double AnalyticQuantPsnr(double range,
+                                                    double error_bound) {
+  if (!(range > 0.0) || !(error_bound > 0.0)) return 120.0;
+  const double mse = error_bound * error_bound / 3.0;
+  return fmin(120.0, 10.0 * log10(range * range / mse));
+}
+
 /** Cost model + ranking, on the GPU. */
 __global__ void RankKernel(const float *__restrict__ ct_in,
                            const float *__restrict__ dt_in,
@@ -670,7 +687,12 @@ __global__ void RankKernel(const float *__restrict__ ct_in,
                                DevicePredictionReuseState
                                    *__restrict__ reuse_states = nullptr,
                            uint32_t reuse_slot =
-                               ctp::compress::preprocess::kNoLineageSlot) {
+                               ctp::compress::preprocess::kNoLineageSlot,
+                           /** The chunk's device stats; its value range
+                               drives the quality floor. Null: the floor falls
+                               back to the network's PSNR. */
+                           const ctp::DeviceFeatureStats *__restrict__ stats =
+                               nullptr) {
   const int tid = static_cast<int>(threadIdx.x);
 
   // Replay the cached ORDER as well as the cached predictions.
@@ -710,8 +732,20 @@ __global__ void RankKernel(const float *__restrict__ ct_in,
     DecodeAction(action_ids[tid], &algo, &quant, &shuffle);
     const bool is_quant = (quant != 0);
     if (is_quant && error_bound <= 0.0) score = -CUDART_INF;
-    if (min_psnr > 0.0 && static_cast<double>(psnr_in[tid]) < min_psnr) {
-      score = -CUDART_INF;
+    // The quality floor. Two departures from nn_gpu.cu, which masks ANY action
+    // on the network's PSNR: a lossless action is never masked on quality (it
+    // has none to lose, and masking it can leave nothing but lossy actions to
+    // fall back on), and a quantized action is judged by the analytical PSNR
+    // of its chunk's value range. The network's PSNR head cannot see that
+    // range -- its features carry no absolute scale -- so under an absolute
+    // bound it misses the chunks quantizing erases (measured: VPIC fields
+    // spanning 1e-7..1e-6 at eb 1e-4, 0 of 186 flagged; the range catches 186).
+    if (min_psnr > 0.0 && is_quant) {
+      const double psnr =
+          (stats != nullptr)
+              ? AnalyticQuantPsnr(stats->value_max - stats->value_min, error_bound)
+              : static_cast<double>(psnr_in[tid]);
+      if (psnr < min_psnr) score = -CUDART_INF;
     }
   }
 
@@ -1210,7 +1244,8 @@ bool NeuroPressGpuInferBatchDeviceStats(
                               DevicePredictionReuseState *>(reuse->states)
             : nullptr,
         reuse != nullptr ? reuse->slot
-                         : ctp::compress::preprocess::kNoLineageSlot);
+                         : ctp::compress::preprocess::kNoLineageSlot,
+        static_cast<const ctp::DeviceFeatureStats *>(device_stats));
     ok = cudaGetLastError() == cudaSuccess;
     // The ranking is NOT fetched here: it shares one allocation with the predictions, so FetchPr...
     ranked = ok;

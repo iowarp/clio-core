@@ -9,11 +9,13 @@
 #include "clio_ctp/compress/preprocess/byte_shuffle.h"  // kShuffleChunkBytes
 
 #include <cuda_runtime.h>
+#include <math_constants.h>  // CUDART_INF
 #include <cstdio>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 
 namespace ctp {
@@ -21,6 +23,8 @@ namespace {
 
 constexpr int kHistBins = 256;
 constexpr int kBlockSize = 256;
+/** Grid cap of the resident stats passes, and so the per-block min/max slots. */
+constexpr int kMaxStatsBlocks = 1024;
 
 /**
  * Pass 1: byte histogram (for entropy) + typed value sum (for mean, needed
@@ -32,7 +36,9 @@ constexpr int kBlockSize = 256;
 template <typename T>
 __global__ void StatsPass1Kernel(const T *data, size_t num_elements,
                                   unsigned int *histogram, double *sum_out,
-                                  double *sum_abs_d2_out) {
+                                  double *sum_abs_d2_out,
+                                  double *block_min = nullptr,
+                                  double *block_max = nullptr) {
   // Per-WARP privatized histograms, and a 4-bytes-at-a-time read, both taken
   // from histogramKernelVec4 (entropy_kernel.cu). That variant is not
   // an upstream curiosity: launchEntropyKernelsAsync PICKS it whenever
@@ -53,8 +59,13 @@ __global__ void StatsPass1Kernel(const T *data, size_t num_elements,
 
   __shared__ double block_sum[kBlockSize];
   __shared__ double block_d2[kBlockSize];
+  __shared__ double block_lo[kBlockSize];
+  __shared__ double block_hi[kBlockSize];
   double thread_sum = 0.0;
   double thread_d2 = 0.0;
+  // Value range, for the quality floor (DeviceFeatureStats::value_min/max).
+  // fmin/fmax drop a NaN operand, so a NaN element never becomes the range.
+  double thread_lo = CUDART_INF, thread_hi = -CUDART_INF;
   __syncthreads();
 
   const uint8_t *bytes = reinterpret_cast<const uint8_t *>(data);
@@ -91,7 +102,10 @@ __global__ void StatsPass1Kernel(const T *data, size_t num_elements,
 
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elements;
        i += stride) {
-    thread_sum += static_cast<double>(data[i]);
+    const double v = static_cast<double>(data[i]);
+    thread_sum += v;
+    thread_lo = fmin(thread_lo, v);
+    thread_hi = fmax(thread_hi, v);
   }
 
   // Second derivative: d2[i] = data[i+1] - 2*data[i] + data[i-1], i in
@@ -108,14 +122,24 @@ __global__ void StatsPass1Kernel(const T *data, size_t num_elements,
 
   block_sum[threadIdx.x] = thread_sum;
   block_d2[threadIdx.x] = thread_d2;
+  block_lo[threadIdx.x] = thread_lo;
+  block_hi[threadIdx.x] = thread_hi;
   __syncthreads();
 
   for (int s = blockDim.x / 2; s > 0; s >>= 1) {
     if (threadIdx.x < s) {
       block_sum[threadIdx.x] += block_sum[threadIdx.x + s];
       block_d2[threadIdx.x] += block_d2[threadIdx.x + s];
+      block_lo[threadIdx.x] = fmin(block_lo[threadIdx.x], block_lo[threadIdx.x + s]);
+      block_hi[threadIdx.x] = fmax(block_hi[threadIdx.x], block_hi[threadIdx.x + s]);
     }
     __syncthreads();
+  }
+  // One pair per block, folded by FinalizeFeatureStatsKernel: no atomics and
+  // no initialising launch, which a global min/max would need.
+  if (threadIdx.x == 0 && block_min != nullptr) {
+    block_min[blockIdx.x] = block_lo[0];
+    block_max[blockIdx.x] = block_hi[0];
   }
 
   // Fold the per-warp histograms together before the global atomic, so each
@@ -251,8 +275,20 @@ __global__ void DowncastF64ToF32Kernel(const double *__restrict__ in,
 
 __global__ void FinalizeFeatureStatsKernel(const double *__restrict__ scalars,
                                             size_t num_elements,
+                                            const double *__restrict__ block_min,
+                                            const double *__restrict__ block_max,
+                                            int num_blocks,
                                             DeviceFeatureStats *__restrict__ out) {
   if (threadIdx.x != 0) return;
+  double lo = CUDART_INF, hi = -CUDART_INF;
+  for (int b = 0; b < num_blocks; ++b) {
+    lo = fmin(lo, block_min[b]);
+    hi = fmax(hi, block_max[b]);
+  }
+  // No finite element at all (empty or all-NaN): report a zero range, which
+  // the quality floor reads as "quantizing loses nothing".
+  out->value_min = (lo <= hi) ? lo : 0.0;
+  out->value_max = (lo <= hi) ? hi : 0.0;
   out->mad = (num_elements > 0)
                  ? scalars[2] / static_cast<double>(num_elements)
                  : 0.0;
@@ -278,6 +314,9 @@ struct DeviceStatsScratch {
   cudaStream_t stream = nullptr;
   unsigned int *d_hist = nullptr;
   double *d_scalars = nullptr;  // [sum, sum_abs_d2, sum_abs_dev]
+  /* Per-block min and max of pass 1 (kMaxStatsBlocks each), folded into the
+     stats' value range by the finalize kernel. */
+  double *d_block_minmax = nullptr;
   DeviceFeatureStats *d_stats = nullptr;
   /* Narrowed copy of a float64 chunk, grown on demand and reused. See
      ComputeDeviceStatsResidentF32From64: the model is normalised on float32
@@ -298,6 +337,8 @@ DeviceStatsScratch &Scratch() {
                 cudaSuccess &&
             cudaMalloc(&p->d_scalars, 3 * sizeof(double)) == cudaSuccess &&
             cudaMalloc(&p->d_stats, sizeof(DeviceFeatureStats)) == cudaSuccess &&
+            cudaMalloc(&p->d_block_minmax, 2 * kMaxStatsBlocks * sizeof(double)) ==
+                cudaSuccess &&
             cudaMalloc(&p->d_range, 4 * sizeof(unsigned long long)) ==
                 cudaSuccess;
     return p;
@@ -321,20 +362,21 @@ bool ComputeDeviceStatsResidentTyped(const T *data, size_t num_elements,
   }
 
   int grid = static_cast<int>(std::min<size_t>(
-      (num_elements + kBlockSize - 1) / kBlockSize, 1024));
+      (num_elements + kBlockSize - 1) / kBlockSize, kMaxStatsBlocks));
   if (grid < 1) grid = 1;
+  double *d_lo = s.d_block_minmax, *d_hi = s.d_block_minmax + kMaxStatsBlocks;
 
   // Same four stages upstream runs, in the same order, all on one stream:
   // pass 1 (histogram + sum + second derivative), entropy from the histogram,
   // pass 2 (MAD, mean read on-device), finalize.
   StatsPass1Kernel<T><<<grid, kBlockSize, 0, stream>>>(
-      data, num_elements, s.d_hist, s.d_scalars, s.d_scalars + 1);
+      data, num_elements, s.d_hist, s.d_scalars, s.d_scalars + 1, d_lo, d_hi);
   EntropyFromHistKernel<<<1, kBlockSize, 0, stream>>>(s.d_hist, num_bytes,
                                                       &s.d_stats->entropy);
   StatsPass2DevKernel<T><<<grid, kBlockSize, 0, stream>>>(
       data, num_elements, s.d_scalars, s.d_scalars + 2);
   FinalizeFeatureStatsKernel<<<1, 1, 0, stream>>>(s.d_scalars, num_elements,
-                                                  s.d_stats);
+                                                  d_lo, d_hi, grid, s.d_stats);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -1154,6 +1196,28 @@ bool RunPass(bool f64, bool escape, int precision, const void *in, void *out,
   return ok;
 }
 
+/**
+ * Value-range-relative error bound, from CLIO_NEUROPRESS_REL_BOUND.
+ *
+ * With eps > 0 each chunk is quantized to eps x (its max - min) instead of the
+ * caller's absolute bound -- the per-chunk analogue of SZ's value-range
+ * relative mode, and the fair uniform baseline for fields whose values are
+ * orders of magnitude apart (an absolute bound erases the small ones). A
+ * constant chunk keeps the absolute bound: it quantizes exactly either way.
+ * The applied bound travels in the header (DeviceQuantizeParams), so decoding
+ * needs nothing else. 0 or unset = absolute mode.
+ *
+ * @return eps, or 0
+ */
+double RelativeErrorBound() {
+  static const double eps = [] {
+    const char *e = std::getenv("CLIO_NEUROPRESS_REL_BOUND");
+    const double v = (e != nullptr && *e != '\0') ? std::atof(e) : 0.0;
+    return v > 0.0 ? v : 0.0;
+  }();
+  return eps;
+}
+
 }  // namespace
 
 bool QuantizeDevice(const void *device_in, size_t num_elements,
@@ -1175,16 +1239,18 @@ bool QuantizeDevice(const void *device_in, size_t num_elements,
   cudaStream_t st = (stream_in != nullptr)
                         ? static_cast<cudaStream_t>(stream_in)
                         : static_cast<cudaStream_t>(DeviceStatsStream());
-  // Four doubles below eb: a double-rounded |z - x| that passes this is
-  // within eb exactly.
-  double eb_check = error_bound;
-  for (int k = 0; k < 4; ++k) eb_check = std::nextafter(eb_check, 0.0);
-
   double lo = 0.0, hi = 0.0;
   bool found = false, skipped = false;
   if (!DeviceRange(device_in, n, f64, kInf, st, &lo, &hi, &found, &skipped)) {
     return false;
   }
+  if (RelativeErrorBound() > 0.0 && found && hi > lo) {
+    error_bound = RelativeErrorBound() * (hi - lo);
+  }
+  // Four doubles below eb: a double-rounded |z - x| that passes this is
+  // within eb exactly.
+  double eb_check = error_bound;
+  for (int k = 0; k < 4; ++k) eb_check = std::nextafter(eb_check, 0.0);
   Grid g;
   int precision = 0;
   if (found && MakeGrid(lo, hi, error_bound, f64, &g)) {

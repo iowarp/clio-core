@@ -271,8 +271,8 @@ def measured_runs(inmem, traces):
         rel = float(meta.get("rel", 0) or 0)
         key = bound_key(meta["workload"], "rel" if rel > 0 else "eb", rel if rel > 0 else meta["eb"])
         # -replay-<policy> / -np-<variant>: one arm, named by the suffix;
-        # -ratio: the ratio-cost-model campaign, whose arms keep their names.
-        m = re.fullmatch(r"(nyx|vpic|lammps|warpx)(-(?:eb|rel)[0-9e.-]+?)?(-(replay|np)-(\w+)|-ratio)?",
+        # -ratio / -balanced: a cost-model campaign, whose arms keep their names.
+        m = re.fullmatch(r"(nyx|vpic|lammps|warpx)(-(?:eb|rel)[0-9e.-]+?)?(-(replay|np)-(\w+)|-ratio|-balanced)?",
                          os.path.basename(base))
         if key not in traces or not m:
             continue

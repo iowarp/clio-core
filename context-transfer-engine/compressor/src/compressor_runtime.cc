@@ -181,7 +181,10 @@ inline void WarnQuantizeUntyped(int data_type) {
 }
 
 inline double AnalyticalPsnr(double data_range, double error_bound) {
-  if (data_range <= 0.0 || error_bound <= 0.0) return -1.0;
+  if (error_bound <= 0.0) return -1.0;  // not quantized
+  // A constant chunk quantizes exactly: the cap, not "unknown" -- -1 read as
+  // a failed quality floor and sent such chunks to lossless for nothing.
+  if (data_range <= 0.0) return 120.0;
   const double mse_expected = (error_bound * error_bound) / 3.0;
   return std::min(10.0 * std::log10((data_range * data_range) / mse_expected),
                   120.0);
