@@ -30,6 +30,13 @@
 # Energy: each rank reads its GPU's hwmon energy counters (microjoules)
 # before and after the run; the cell line reports the sum over ranks.
 set -u
+# GPU NotPresent faults on HOST addresses at 64 nodes (one rank dies, the
+# rest livelock): per-page transfer buffers are malloc'd and freed, glibc
+# returns large ones with munmap, and Level Zero's cached pinning of that
+# address goes stale when the address is reused. Keep freed memory mapped:
+# serve everything < 32 MB from the heap and never trim it.
+export MALLOC_MMAP_THRESHOLD_=${MALLOC_MMAP_THRESHOLD_:-33554432}
+export MALLOC_TRIM_THRESHOLD_=${MALLOC_TRIM_THRESHOLD_:-1099511627776}
 ROOT=${ROOT:-/home/llogan/clio-core/.claude/worktrees/gpu-coro}
 JOBTAG=${PBS_JOBID%%.*}
 NRANKS=$(sort -u "${PBS_NODEFILE}" | wc -l)

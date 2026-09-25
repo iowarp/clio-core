@@ -54,6 +54,13 @@
 # submit_e4_aurora.sh uses, kept here rather than sourced so the job script
 # is self-contained on the compute node.
 set -u
+# GPU NotPresent faults on HOST addresses at 64 nodes (one rank dies, the
+# rest livelock): per-page transfer buffers are malloc'd and freed, glibc
+# returns large ones with munmap, and Level Zero's cached pinning of that
+# address goes stale when the address is reused. Keep freed memory mapped:
+# serve everything < 32 MB from the heap and never trim it.
+export MALLOC_MMAP_THRESHOLD_=${MALLOC_MMAP_THRESHOLD_:-33554432}
+export MALLOC_TRIM_THRESHOLD_=${MALLOC_TRIM_THRESHOLD_:-1099511627776}
 
 : "${BENCH_CELLS:?set BENCH_CELLS}"
 ROOT=${ROOT:-/home/llogan/clio-core/.claude/worktrees/gpu-coro}
