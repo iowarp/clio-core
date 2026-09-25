@@ -107,10 +107,36 @@ AOTFLAGS=()
 SUFFIX=""
 if [ "${AOT:-0}" = "1" ]; then
   AOTFLAGS=(-fsycl-targets=spir64_gen -Xs "-device pvc")
+  # GRF=large compiles for PVC's 256-register mode. The coroutine kernels
+  # spill >10 KB per thread at the default 128 (IGC dump: LaunchAssignTiled
+  # 11328 B, SIMD16), and every access to spilled state goes to scratch.
+  [ "${GRF:-}" = large ] &&
+    AOTFLAGS=(-fsycl-targets=spir64_gen -Xs "-device pvc -options -ze-opt-large-register-file")
+  # NOL2G=1 promises IGC that no generic pointer ever holds a LOCAL address,
+  # so every generic access resolves to global at compile time. The paging
+  # path reads everything through h_ (a generic pointer to the device header),
+  # and each of those loads was a runtime local-window check plus a divergent
+  # branch. Only valid for a kernel that never routes SLM through a generic
+  # pointer -- grayscott; NOT the kmeans local tile.
+  # GRF=small forces 128 registers: with subroutine calls (IGC_FC=2) IGC's
+  # auto-selection picked 256, which halved occupancy at high block counts.
+  [ "${GRF:-}" = small ] &&
+    AOTFLAGS=(-fsycl-targets=spir64_gen -Xs "-device pvc -options -ze-intel-128-GRF-per-thread")
+  [ "${NOL2G:-}" = 1 ] &&
+    AOTFLAGS=(-fsycl-targets=spir64_gen -Xs "-device pvc -options -cl-intel-no-local-to-generic")
   SUFFIX="_aot"
 fi
 [ "${SPLIT:-off}" != "off" ] && SUFFIX="${SUFFIX}_split"
 [ -n "${EXTRA_CXX:-}" ] && SUFFIX="${SUFFIX}_x"
+# IGC_FC overrides the stack-call setting below (default 3). Only lammps_md
+# needs 3; a build with another value gets its own suffix so it never
+# replaces the default binary.
+[ -n "${IGC_FC:-}" ] && SUFFIX="${SUFFIX}_fc${IGC_FC}"
+[ "${GRF:-}" = large ] && SUFFIX="${SUFFIX}_grf"
+[ "${GRF:-}" = small ] && SUFFIX="${SUFFIX}_sgrf"
+[ "${NOL2G:-}" = 1 ] && SUFFIX="${SUFFIX}_nol2g"
+# TAG names a build variant without changing how it compiles.
+[ -n "${TAG:-}" ] && SUFFIX="${SUFFIX}_${TAG}"
 
 echo "### [$NAME] 2. SYCL device compile (${SUFFIX:+AOT pvc}${SUFFIX:-spir64 JIT})"
 ICPX=${ICPX:-$(command -v icpx 2>/dev/null || ls /opt/aurora/*/oneapi/compiler/latest/bin/icpx 2>/dev/null | head -1)}
@@ -180,7 +206,7 @@ done
 # 20 per-kernel images. IGC_FunctionControl=3 (stack calls) keeps them as
 # calls and every image compiles. Set for the link, where ocloc runs; the JIT
 # path needs the same variable in the job environment (pbs_newcoro_aurora.sh).
-export IGC_FunctionControl=3
+export IGC_FunctionControl=${IGC_FC:-3}
 
 echo "### [$NAME] 3. link"
 "$ICPX" "${SYCLT[@]}" "${AOTFLAGS[@]}" -std=c++20 -O2 \

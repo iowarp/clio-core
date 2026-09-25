@@ -475,3 +475,203 @@ the plan's anchor decks, so their 15-minute rows raise the work
 | grayscott, dt=0.5 | 128 GB global, 256 steps, 1 MB page | 42.7 s (167.0 ms/step, comm 3.1 s) PASS | 42.7 s (166.7 ms/step, comm 3.0 s) PASS | 43.3 s (169.1 ms/step, comm 3.2 s) PASS; v_checksum 30810718.238060 identical on all three, finite. The step time is memory-bound and flat, so a 15-minute-class deck is 2048 steps (~6 min) if longer resolution is wanted; the 256-step deck stands as the row |
 | gmx | K=2048, 20 M atoms, 200 passes | 190.1 s (spread 13.9 s, gather 173.1 s, comm 0.1 s) PASS | 190.1 s (spread 13.9 s, gather 173.0 s, comm 0.2 s) PASS | 190.2 s (spread 13.9 s, gather 173.1 s, comm 0.2 s) PASS; checksums identical to the single-pass anchor on all three |
 | lammps_md | L=256, 300 steps, rebin 10, checkpoint every 5 (60 x 1.3 GB, DRAM); one job per substrate | 29.0 s (96.6 ms/step, halo 3.9 s, 60 checkpoints in 1.49 s) PASS, NVE drift 2.4e-3, statics and resort exact | 27.9 s (93.1 ms/step, halo 2.8 s, 60 checkpoints in 1.48 s) PASS | 30.8 s (102.7 ms/step, halo 5.6 s, 60 checkpoints in 1.48 s) PASS, NVE drift 2.4e-3 over 300 steps |
+
+## E7: fixed 480 GB on fewer nodes (grayscott), status as of 2026-09-23 11:30
+
+`submit_e7_fewer_aurora.sh`, rungs descending 32 16 12 8 6 4, one job per
+rung on debug-scaling. Same 491520 MB grayscott deck, 2 steps, 1 MB page.
+
+| rung | MB/node | MPI | oneCCL | Intel SHMEM | Eternia |
+|---|---|---|---|---|---|
+| 32 | 15360 | 82.13 ms/step | 82.59 | 93.95 | 23209.60 ms/step, OK, checksum 313164429.143324 (not gated by the edition) |
+| 16 | 30720 | 158.80 | 159.68 | 168.35 | FAILED rc=134 (earlier run, before the tier-budget and writeback fixes); rerun job 8858365 QUEUED |
+| 12 | 40960 | 210.39 | 210.81 | FAILED rc=99 (heap sizing, fixed since) | FAILED rc=134 (pre-fix); needs rerun |
+| 8, 6, 4 | | not run | | | |
+
+The 32-node Eternia run is 283x slower than the baselines. That is NOT
+explained by paging: moving about 30.7 GB per node at the measured 19.35 GB/s
+takes about 1.6 s, so paging should cost about 10x. The run averages
+2725 us per fault, against 293-508 us in the earlier 4- and 8-node runs and
+about 110 us for one documented round trip. OPEN: does the per-fault cost
+track the per-node blob count (15 GB/node vs 4 GB) or the node count? The
+16-node rung (30 GB/node) separates the two. Also OPEN: the paged grayscott
+edition does not gate its checksum against a reference.
+
+## E1 status as of 2026-09-23 11:30
+
+Rung 256 (the run before the fix): all six baseline cells OK. Eternia kmeans
+TIMEOUT, Eternia grayscott rc=134. Rungs 256/320/384/448/512 are resubmitted
+with the rebuilt binaries and SWIM disabled (jobs 8858330, 8857156, 8856950,
+8856951, 8856952 in `small`), all QUEUED.
+
+## Single-node debugging of Eternia's resident performance (2026-09-23 afternoon)
+
+Scaling is paused and production E1 cancelled until Eternia is competitive on
+ONE node with the deck resident. Everything below is 1 node, 32 GB, all
+substrates on the same 1024 x 256 grid unless stated.
+
+**The comparison is fair.** Both editions time the same per-iteration work
+(memsets, assign, reduction, update); setup is outside both. The Eternia
+per-iteration time is one kernel launch (rounds=1, drv_gpu = total).
+
+**kmeans: FIXED, 1.12x MPI.** VTune gpu-hotspots (after unsetting the module
+env vars so Pin could inject):
+
+| assign kernel | time (4 it) | SIMD | XVE active | stalled | idle | occupancy | mem read |
+|---|---|---|---|---|---|---|---|
+| MPI | 1.71 s | 32 | 31.8% | 45.2% | 23.0% | 75.5% | 78.5 GB/s |
+| Eternia (before) | 3.79 s | 16 | 71.0% | 18.5% | 10.6% | 89.4% | 36.1 GB/s |
+
+Compute-bound on ~10x the instructions. The assembly showed why: the assign
+body is a stack call (not inlined), so IGC could not prove its pointers
+global and every coordinate load was a GENERIC-address dispatch (mask high
+bits, compare against the local window, divergent branch to load.ugm or
+load.slm, join). Casting the point and centroid pointers with
+`sycl::address_space_cast<global_space>` at each use (never stored: coroc
+byte-copies frame locals) leaves two plain load.ugm per coordinate.
+Result: **Eternia 478 ms/iter vs MPI 427 (1.12x)**, 0 faults, checksum OK;
+was 905-977 (2.2x).
+
+Ruled out on the way, each measured: unequal grid (was half of the original
+5x), global atomics (local tile: no gain), handle reloads (raw pointer: no
+gain), stack calls (fc2: 2%), register pressure (256 GRF: spill unchanged),
+SIMD16 (forced SIMD32: no gain; 2x WORSE for grayscott), host memory
+(everything is malloc_device), relaunch rounds (1 per iteration).
+
+**grayscott: in progress.** Per-step split at 64 blocks showed steps 1-3 at
+~6 s each (MPI 161 ms) with 252 faults and 14-17 rounds: kernel time, not
+paging. Removing the per-step write-back of every plane (boundary planes
+only) cut puts 64000 -> 1024 but did not change the time. The same global
+cast is now applied to the stencil's eight plane pointers; under test.
+A block-range halo-generation change crashed at 1024 blocks (DEVICE FATAL 3)
+and was reverted.
+
+Open for later: gpu_vector's CoFetch has no generation-wait loop for a stale
+page a peer already claimed (YCoro Fetch has one); clock64() is 0 on SYCL so
+LRU tie-breaks are inert; ~465 generic-address checks remain in the paging
+machinery itself (per page, not per element).
+
+### grayscott, resident, 1 node, 32 GB: the fixes, in order (2026-09-23 evening)
+
+ms per step, steady state; MPI at the same grid: 160 (64 blocks), 50-55 (1024).
+
+| build (cumulative) | 64 blocks | 1024 blocks |
+|---|---|---|
+| start of the day | ~6000 | ~3460 |
+| global-address casts in the stencil | 2963-3237 | 583-667 |
+| outputs seeded before the clock (no first-touch faults) | same | same |
+| GRF 256 (the stencil loop spilled: 23 fills/spills per pass -> 1) | 933-1295 | 471-571 |
+| stencil out of line (StencilPlane) | no change | no change |
+| one flush for both boundary planes (was two, the second parked) | 480-638 | 435-530 |
+| batched set scans: ScanSet keeps 8 volatile loads in flight | 323-357 | 400-474 |
+| sliding window: each input plane fetched/held/unpinned once, not 3x | 216-220 | 414-485 |
+| u+v fetched and unpinned together (CoFetch ranges, UnpinRange2) | **213-216 (1.34x)** | 378-470 |
+
+Checksums equal MPI's to 12 digits in every row; 0 faults.
+
+What did NOT help, measured: narrow cache sets (--set-size, opt-in): hashed
+sets collide and evict at full capacity, 2-3x slower, AND the checksum goes
+wrong once dirty interior pages are evicted -- boundary-only publishing is
+correct only while resident; that eviction path must be fixed before any
+out-of-core study. SIMD32 (2x worse), IGC StaticGASResolution /
+-cl-intel-no-local-to-generic (no effect), pinned-host task records (device
+atomics fault on host memory: AtomicAccessViolation). VTune source/bb-latency
+mode (GTPin) crashes the coroutine kernels.
+
+In flight: one deferred flush of both boundary planes; skip CoAwaitFetch when
+nothing was submitted; publish only node-edge planes (the page table is shared
+by all blocks on a node, so intra-node halos come from the shared cache).
+
+### E1 at 4 nodes with the fixes (2026-09-24 00:40, job 8860490)
+
+32 GB/node resident (25% cache headroom), every substrate on 1024 x 256, 8
+iterations/steps. No spill but communication: kmeans 0 faults / 0 evicts /
+0 puts; grayscott 0 evicts, its 16-32 faults are halo fetches of the
+neighbours' edge planes and its 32 puts are its own edge publishes.
+
+| workload | MPI | oneCCL | Intel SHMEM | Eternia | Eternia / MPI |
+|---|---|---|---|---|---|
+| kmeans (ms/iter) | 434.2 | 445.1 | 436.5 | 480.7-489.8 | 1.11-1.13x |
+| grayscott (ms/step) | 59.4 | 59.4 | 60.8 | 121.9-155.1 | 2.0-2.6x |
+
+Checksums: grayscott 97206390.029335 vs MPI .029317 (2e-13); kmeans within
+5e-8. kmeans is inside the plan's 10-20%; grayscott is not yet (single-node
+1.86x at this grid is the memory-locality gap of the slab traversal; the
+cyclic plane order is under test).
+
+### grayscott: where the remaining gap is (2026-09-24, 00:30-01:30)
+
+1 node, 32 GB resident, ms per step (MPI: 160 at 64 blocks, 54 at 1024, 47 at 2048).
+
+**Paging machinery is now cheap.** GS_NO_COMPUTE=1 runs every page operation
+and skips the arithmetic: 8.3 ms of a 99.5 ms step at 1024 blocks (slab),
+50 of 279 at 64 blocks. The rest is the stencil itself.
+
+**The stencil is slower because of where it is compiled, not what it
+computes.** The baselines' Step kernel is exactly Eternia's cyclic plane order
+without paging (one work-group per plane, planes cyclic over groups). In the
+coroutine kernel the stencil function (StencilPlane) is a stack call
+(IGC_FunctionControl=3), SIMD16, and under the stack-call ABI spills inside
+its loop: 1305 instructions / 68 loads / 42 stores / 77 spill-fill against
+the baselines' 447 / 16 / 2 / 0.
+
+Tried, measured, and not the answer:
+
+| change | 64 blk | 1024 blk | why not |
+|---|---|---|---|
+| cyclic plane order (baseline's order) | 335 (worse) | 92 (from 99) | locality is a small part |
+| --plane-split G (blocks share a slab) | -- | 140-932 | multiplies page ops, contention |
+| SIMD32 on the coroutine kernel | 538 | 157-168 | the whole coroutine spills |
+| IGC_FunctionControl=2 (subroutines) | 218 | 121 | IGC auto-picks 256 GRF, halves occupancy |
+| IGC_FC=2 + forced 128 GRF | 444 | 127-140 | stencil clean (406/12/2/0) but slower overall |
+
+Best in-kernel configurations: 64 blocks slab GRF 256 = 210 (1.31x);
+1024 blocks cyclic GRF 128 = 92 (1.70x); 2048 cyclic GRF 128 = 90 (1.89x).
+
+**Two-phase mode (--two-phase, opt-in).** The coroutine kernel fetches, pins
+and resolves every page of the step into a pointer table (ResolveCoro;
+node-halo planes at the step's generation); a plain kernel -- the baselines'
+Step, verbatim, through the table -- computes; a second coroutine pass
+unpins. Paging and residency stay Eternia's; only the arithmetic leaves the
+coroutine. It changes what the benchmark exercises (pin-then-compute rather
+than in-kernel faulting), so it is reported alongside the in-kernel mode, not
+instead of it. Under test.
+
+### Single node, the other workloads vs MPI (2026-09-24, job 8860605; resident, same grids)
+
+| workload | MPI | Eternia (as built) | ratio | cause found | fix (queued) |
+|---|---|---|---|---|---|
+| kmeans | 425 ms/iter | 475 ms/iter | 1.12x | (fixed earlier: generic address space) | -- |
+| grayscott, 2048 blocks | 46.4-47.0 ms/step | 60.4-61.2 ms/step two-phase (fc2) | 1.30x | stencil through pointer table ~54 ms + resolve/release 6-7 ms | -- |
+| gmx (K=1280, 20M atoms) | 279 ms/pass (spread 220 + gather 59) | 701 ms/pass (spread 623 + gather 79) | 2.5x | every pass writes the whole 16 GB mesh back to DRAM (12800 puts) + generic loads/atomics in spread | v3: no write-site publish when resident (evict gate), out-of-line SpreadBin with global casts; job 8860617 |
+| lbann (65536-65536-4096, b64) | 1977 ms/step | OUT_OF_RESOURCES | -- | set size hardcoded 24: 24576 slots for 69634 pages | v3: --set-size, resident default = share*1.25; job 8860617 |
+| lammps_md (16.4M atoms) | 68.7 ms/step | 496.5 ms/step | 7.2x | single-node interior publish every step + 3 cache clears per resort (resort 2591 vs 35 ms, refaults) | v3 MD_LEAN=1; job 8860622 |
+
+Grayscott two-phase (gs_tp3, 8860600): at 1024 blocks 66-70 ms/step vs MPI 50.5-51.6; at 2048 blocks 60-61 vs 46.4-47.0; checksum 21600573.157590 vs MPI .157630 (2e-12 rel); 0 faults/evicts/puts. Beats the in-kernel mode (92 / 90 ms/step).
+
+### 1-node fixes, first results (2026-09-24 02:15, jobs 8860617 / 8860622)
+- gmx v3 (write-site publish off when resident; out-of-line spread with global casts): spread 214.9 + gather+sum 80.3 = 295.2 ms/pass vs MPI 279.2 (1.06x); 0 puts, 0 evicts, conservation exact. With --publish: 734 ms/pass (the old behaviour).
+- lbann v3 (resident set size): runs, but 13777 ms/step vs MPI 1977 -- 417794 faults and puts in 5 steps = every page refetched and written back every step by the generational protocol. Fixed for resident single-node runs (generation 0, no publish; evict gate); measuring in ct1.
+- lammps_md MD_LEAN (no interior publish, no resort clears): 369.0 ms/step vs MPI 68.7; 0 faults/puts. KE after 20 steps 43562485.166 vs MPI 43562485.214. The DEFAULT single-node path gives KE 62771460.946 (reproduced twice) with every gate passing: it is WRONG physics, not just slow. Remaining gap: force 5767 vs 1247 ms, build 1652 vs 699. v4 moves the list-force pair loop out of line with global casts (job 8860657).
+- lammps_md KE trajectory (8860644, lattice 40): default Eternia matches MPI bit-for-bit in KE through step 10, then at step 11 (first resort) returns EXACTLY to the step-0 state (KE 1152000, En == E0): the single-node resort's ClearCache discards the live frames and the next fetch reloads the seed from the store. MD_LEAN matches MPI at every n (1, 2, 5, 9, 10, 11). Default single-node mode is retired for E1.
+
+### E1 comm/compute split, 1 node (ct1, job 8860668; GV_COMM_TIMING builds)
+Communication = GPU time inside CoFetch/CoHoldPage/CoBeginFlush/CoEndFlush as a share of blocks' busy GPU time (intel_get_cycle_counter; coherence checked by a probe). Grayscott two-phase: host time of resolve+release (comm) vs stencil kernel (compute).
+
+| workload | MPI | Eternia | ratio | comm share | comm ms |
+|---|---|---|---|---|---|
+| kmeans (1024 blk) | 428.4 ms/iter | 457 ms/iter | 1.07x | 1.3% | ~6 ms/iter |
+| grayscott two-phase (2048 blk) | 46.2 ms/step | 62.2 ms/step | 1.35x | 13.6% | 8.5 ms/step; stencil 54.1 ms/step |
+| gmx | 273.9 ms/pass | 294.1 ms/pass | 1.07x | 0.8% | ~2.3 ms/pass |
+| lbann (256 KB pages) | 1982 ms/step | 8091 ms/step | 4.1x | 8.5% | 685 ms/step; compute is the gap (64 of 256 threads busy in Fwd1/Fwd2) |
+| lammps_md v4 lean | 68.7 ms/step | 181.3 ms/step | 2.6x | (not instrumented) | force 2088 vs 1247, build 1419 vs 699 ms / 20 steps |
+
+In-kernel grayscott (--plane-order cyclic) reports comm > busy, i.e. its counters are not valid; not the E1 mode, unexplained.
+- ct2 (8860692): grayscott two-phase with global casts on the stencil's table pointers: 54.8-55.8 ms/step vs MPI 46.6 (1.19x); stencil 46.6 ms/step (= MPI's whole step), comm 8.2 ms/step (15%). lbann at 1 MB pages (4 rows/page, all threads busy): 4162 ms/step vs 1982 (2.1x), comm 4.1%; 2 and 4 MB pages are refused (a page would span blocks' output rows).
+- lbann (ct4-ct6, 1 MB pages): per-phase timing showed upd1 at 3.4x the baseline (each 4-row page re-read the 16 MB batch from L2) and bwd1 at 2.7x (d1 read/written once per W2 page). Fix: each block holds its whole band and sweeps column-major (upd1: x column in registers across 64 rows) or keeps the o-sum in a register (bwd1); same summation order. Result: 1967.0 ms/step vs MPI 1957.7-1981.7 (1.00x); phases Eternia/MPI fwd1 784/1026, fwd2 185/117, bwd1 442/145, upd2 49/47, upd1 507/622; comm 8.9% (bwd1's per-block holds of all 1024 W2 pages). Small deck with the dense reference: LOSS and WEIGHT gates PASS, weights bit-equal. The old page-by-page fallback (env LBANN_UPD1_PAGED/LBANN_BWD1_PAGED) GPU-faults on the small deck: open, not the default path.
+
+### lbann at 4 nodes, fixed (job 8861020)
+Eternia 1919.3-1922.8 ms/step vs MPI 2062.0, oneCCL 2038.5, Intel SHMEM 2101.8 (0.93x MPI). Phases Eternia/MPI: fwd1 843/1082, fwd2 181/117, bwd1 238/145, upd2 47/47, upd1 552/623. Slowest-rank communication: Eternia 33.8 ms (GPU Fetch/Hold/Flush), MPI 336.8, oneCCL 195.0, Intel SHMEM 352.2 ms (wall time in exchanges). The fixes that got here: seed only the node's own rows; W1 and W2 node-private (no generations, no per-step publish -- this also removed a DEVICE FATAL 7 get/put race on the node's own pages and a HoldPage claim race when 1024 blocks demanded the same peer W2 pages); bwd1 by per-node partials combined in node order (the baselines' scheme) instead of pulling every peer W2 page each step (3 GB/step); fwd1 and upd1 over each block's whole held band.
+
+### gmx at 4 nodes, fixed (job 8861048)
+Eternia spread 213.5-219.8 ms/pass + gather+sum 83.2-83.5 ms/pass (~300 ms/pass) vs MPI 307.6, oneCCL 309.1, Intel SHMEM 309.3 ms/pass: 0.97x. mesh_checksum 16937849875879000010 and gather_energy 147849839193652 equal the three baselines bit for bit. Slowest-rank communication over the run: Eternia 3.4 ms, MPI 47.6, oneCCL 86.8, Intel SHMEM 43.6. The fixes: no write-site publish when resident; the cap check bounded by distinct planes (shared cache), not 4 x blocks; the gather made plane-wise like the baselines (a node reads only its own planes, so there is no halo, publish or barrier), which also made its rounding the baselines'.

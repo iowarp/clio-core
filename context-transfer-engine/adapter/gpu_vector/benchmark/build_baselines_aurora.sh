@@ -45,7 +45,8 @@ case "$SUB" in
           LD+=("$ISHMEM_ROOT/lib/libishmem.a" -L"$ZE_LIB" -lze_loader -lpthread) ;;
   *) echo "substrate must be mpi, ccl or ishmem"; exit 2 ;;
 esac
-BIN="$OUT/clio_${WL}_${SUB}_bench"
+# BL_SUFFIX: build beside the live binary (a running job keeps its copy).
+BIN="$OUT/clio_${WL}_${SUB}_bench${BL_SUFFIX:-}"
 echo "### [$WL/$SUB] $(date +%H:%M:%S) compile+link -> $BIN"
 "${CXX[@]}" "${DEF[@]}" "$SRC" -o "$BIN" "${LD[@]}" > "$OUT/bl_${WL}_${SUB}.log" 2>&1 \
   || { echo "BUILD FAILED; see $OUT/bl_${WL}_${SUB}.log"; grep -m5 "error" "$OUT/bl_${WL}_${SUB}.log"; exit 1; }

@@ -47,8 +47,14 @@ using MultiPutSlot = clio::cte::core::PodMultiPutBlobTask;
 struct Page {
   clio::run::u64 page_num;    // kNoPage when free
   void *data;                 // this page's bytes
-  float score;                // eviction rank; EvictPages takes the lowest
   clio::run::u64 last_access; // breaks score ties (LRU)
+  /** THE CLAIMER'S COMPLETION WORD: the address of the fetch future of the
+   *  block that claimed this frame to fill it (0 = none recorded). A block
+   *  that finds the frame claimed by someone else parks on this word, so the
+   *  host relaunches it when that transfer lands instead of every round.
+   *  (Fields reordered so the record stays 64 bytes.) */
+  clio::run::u64 fetch_tag;
+  float score;                // eviction rank; EvictPages takes the lowest
   clio::run::u32 pins;        // holders; a pinned page is never a victim
   clio::run::u32 flushing;    // a put is outstanding
   clio::run::u32 fetching;    // a get is outstanding
@@ -114,6 +120,11 @@ struct BlockTasks {
   clio::run::u32 fetch_resume_r;
   clio::run::u64 fetch_resume_pn;
   clio::run::u32 fetch_stalls;
+  /** GV_COMM_TIMING: GPU clock at the start of this block's current resident
+   *  segment. A Fetch/Hold/Flush call that parked started in an earlier
+   *  segment; it is charged only from here, so the park itself (the host
+   *  round trip, and a different EU's clock) never counts as GPU time. */
+  clio::run::u64 seg_t0;
 };
 
 /**

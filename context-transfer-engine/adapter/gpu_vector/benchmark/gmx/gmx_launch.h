@@ -32,13 +32,17 @@ void InitBackend(u32 max_blocks, const GpuInfo &info);
 /* ---- paged path (yieldable) ---- */
 void LaunchZero(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
                 u64 K, u64 plane, u64 zper, u64 zbase, u64 zend, View vw,
-                  StackView sv);
+                  StackView sv, u32 publish);
+
+void LaunchPublishPlanes(dim3 grid, dim3 block, const GpuInfo &info,
+                         DevMesh mesh, u64 plane, u64 z0, u64 z1, View vw,
+                         StackView sv);
 
 void LaunchSpread(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
                   const float *ax, const float *ay, const float *az,
                   const long long *aq, const u32 *bin_start, u64 K, u64 plane,
                   u64 zper, u64 zbase, u64 zend, View vw,
-                  StackView sv);
+                  StackView sv, u32 publish);
 
 void LaunchSum(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh, u64 K,
                u64 plane, u64 zper, unsigned long long *out, u64 zbase, u64 zend, View vw,

@@ -226,6 +226,34 @@ void LaunchBuildList(dim3 grid,
                      gy::YieldableView<> yv,
                      gy::YieldStackView ys);
 
+/* ---- two-phase force / list build (MD_TWO_PHASE, SYCL) ---- */
+void LaunchCopyRows(u32 blocks, u32 threads, const float *const *xtab,
+                    float *dense, u64 row_elems, u64 nrows);
+void LaunchCopyRowsI(u32 blocks, u32 threads, int *const *tab, int *dense,
+                     u64 row_elems, u64 nrows);
+void LaunchCopyRowsBack(u32 blocks, u32 threads, float *const *tab,
+                        const float *dense, u64 row_elems, u64 nrows);
+void LaunchRowsResolve(dim3 grid, dim3 block, gv::DeviceVector<float> x,
+                       gv::DeviceVector<float> f, gv::DeviceVector<int> nl,
+                       u64 nrows, u64 row_elems, u64 rowlist, u64 x_pe,
+                       u64 nl_pe, u32 want_f, u32 nl_write, const float **xtab,
+                       float **ftab, int **nltab, u32 nblocks,
+                       gy::YieldableView<> yv, gy::YieldStackView ys);
+void LaunchRowsRelease(dim3 grid, dim3 block, gv::DeviceVector<float> x,
+                       gv::DeviceVector<float> f, gv::DeviceVector<int> nl,
+                       u64 nrows, u64 row_elems, u64 rowlist, u64 x_pe,
+                       u64 nl_pe, u32 want_f, u32 nblocks,
+                       gy::YieldableView<> yv, gy::YieldStackView ys);
+void LaunchListForceTab(u32 blocks, u32 threads, const float *const *xtab,
+                        float *const *ftab, int *const *nltab,
+                        const u32 *d_cnt, u32 nb, u32 cap, float box,
+                        float cutoff, int eflag, double *acc, int nocompute,
+                        u32 rowchunk);
+void LaunchBuildListTab(u32 blocks, u32 threads, const float *const *xtab,
+                        int *const *nltab, u32 *d_cnt, int *d_err, u32 nb,
+                        u32 cap, float box, float rlist, u32 maxneigh,
+                        u32 rowchunk);
+
 void LaunchListForce(dim3 grid,
                      dim3 block,
                      size_t smem,

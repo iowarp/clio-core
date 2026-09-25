@@ -52,6 +52,32 @@ namespace clio::cte::gpu_vector {
  * implied by it).
  */
 
+/** A device-resident task region and its host snapshot (see
+ *  ResumeWhenComplete). One per vector device table; host-only. */
+struct TaskRegion {
+  char *base = nullptr;
+  std::vector<char> snap;
+  clio::run::u32 last_block = 0;
+  bool fresh = false;
+};
+inline std::vector<TaskRegion> &TaskRegions() {
+  static std::vector<TaskRegion> regions;
+  return regions;
+}
+inline void RegisterTaskRegion(char *base, size_t bytes) {
+  TaskRegion r;
+  r.base = base;
+  r.snap.resize(bytes);
+  TaskRegions().push_back(std::move(r));
+}
+inline TaskRegion *FindTaskRegion(clio::run::u64 tag) {
+  for (auto &r : TaskRegions()) {
+    const auto lo = reinterpret_cast<clio::run::u64>(r.base);
+    if (tag >= lo && tag + sizeof(unsigned int) <= lo + r.snap.size()) return &r;
+  }
+  return nullptr;
+}
+
 /**
  * Resume a parked block ONLY when the completion word its wait tag names has
  * flipped.
@@ -64,12 +90,33 @@ namespace clio::cte::gpu_vector {
  *
  * A wait tag of 0 means "no condition", so those blocks always resume.
  */
-inline bool ResumeWhenComplete(clio::run::u32 /*block*/, clio::run::u64 tag) {
+inline bool ResumeWhenComplete(clio::run::u32 block, clio::run::u64 tag) {
 #if CTP_ENABLE_GPU
+  // ONE COPY PER SPIN, NOT ONE PER BLOCK. The completion words live in the
+  // task sets, which are device memory (the kernel does device-scope atomics
+  // on them; PVC faults an atomic on host memory). Reading them one blocking
+  // 4-byte memcpy per parked block per spin of the driver was 867k Level Zero
+  // copies in a 4-step Gray-Scott run, ~50 us each: at 1024 parked blocks a
+  // single spin cost ~50 ms before anything relaunched. Instead the whole
+  // task region is snapshotted in one copy when a new spin starts (the driver
+  // walks pending blocks in increasing order, so a block index that does not
+  // increase marks a new spin) and every block's word is read from that.
   if (tag == 0) return true;
+  TaskRegion *r = FindTaskRegion(tag);
+  if (r == nullptr) {
+    unsigned int done = 0;
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(&done),
+                        reinterpret_cast<const char *>(tag), sizeof(done));
+    return (done & 1u) != 0u;
+  }
+  if (!r->fresh || block <= r->last_block) {
+    ctp::GpuApi::Memcpy(r->snap.data(), r->base, r->snap.size());
+    r->fresh = true;
+  }
+  r->last_block = block;
   unsigned int done = 0;
-  ctp::GpuApi::Memcpy(reinterpret_cast<char *>(&done),
-                      reinterpret_cast<const char *>(tag), sizeof(done));
+  std::memcpy(&done, r->snap.data() + (tag - reinterpret_cast<clio::run::u64>(r->base)),
+              sizeof(done));
   return (done & 1u) != 0u;
 #else
   (void) tag;
@@ -245,6 +292,10 @@ class Vector {
     clio::run::u64 flush_skipped = 0;  // flush pages not resident: DROPPED
     clio::run::u64 put_errors = 0;   // writebacks that returned non-zero
     clio::run::u64 alloc_waits = 0;  // page-cache backoff retries (FaultPage)
+    // GV_COMM_TIMING only (zero otherwise): GPU cycles in the Fetch, Hold
+    // and Flush calls, a benchmark's busy segments, and the call counts.
+    clio::run::u64 fetch_cyc = 0, hold_cyc = 0, flush_cyc = 0, busy_cyc = 0;
+    clio::run::u64 fetch_calls = 0, hold_calls = 0, flush_calls = 0;
   };
 
   /**
@@ -551,7 +602,7 @@ class Vector {
 #if CTP_ENABLE_GPU
     for (auto &kv : devs_) {
       if (kv.second.stats != nullptr) continue;
-      const size_t bytes = 10 * sizeof(unsigned long long);
+      const size_t bytes = 17 * sizeof(unsigned long long);
       auto *c = reinterpret_cast<unsigned long long *>(
           ctp::GpuApi::Malloc<char>(bytes));
       if (c == nullptr) throw std::runtime_error("gpu_vector: stats alloc failed");
@@ -570,6 +621,7 @@ class Vector {
       // Pages a flush could not FIND -- silently dropped writebacks.
       kv.second.hdr.stat_flush_skipped_ = c + 8;
       kv.second.hdr.stat_alloc_waits_ = c + 9;
+      kv.second.hdr.stat_cyc_ = c + 10;        // 7 slots: see VecHeader
       PublishHeader(kv.second);
     }
 #endif
@@ -760,8 +812,15 @@ class Vector {
 #if CTP_ENABLE_GPU
     auto it = devs_.find(gpu_id);
     if (it == devs_.end() || it->second.stats == nullptr) return s;
-    unsigned long long h[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    unsigned long long h[17] = {};
     ctp::GpuApi::Memcpy(h, it->second.stats, sizeof(h));
+    s.fetch_cyc = h[10];
+    s.hold_cyc = h[11];
+    s.flush_cyc = h[12];
+    s.busy_cyc = h[13];
+    s.fetch_calls = h[14];
+    s.hold_calls = h[15];
+    s.flush_calls = h[16];
     s.faults = h[0];
     s.alloc_waits = h[9];
     s.puts = h[1];
@@ -1117,6 +1176,7 @@ class Vector {
     st.tasks_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
         nblocks_ * kTaskSetBytes, &st.tasks_base);
+    RegisterTaskRegion(st.tasks_base, nblocks_ * kTaskSetBytes);
     st.btbl_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
         nblocks_ * sizeof(BlockTasks), &st.btbl_base);
@@ -1186,6 +1246,7 @@ class Vector {
     st.hdr.stat_flush_skipped_ = nullptr;
     st.hdr.stat_put_errors_ = nullptr;
     st.hdr.stat_alloc_waits_ = nullptr;
+    st.hdr.stat_cyc_ = nullptr;
     st.hdr.fatal_ = FatalSlots();
     st.hdr.fatal_mirror_ = FatalMirror();
     PublishHeader(st);

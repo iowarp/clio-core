@@ -299,6 +299,11 @@ struct MdTables {
   u64 sxlen[9];
   u32 nspans;
   u32 nguards;
+  /** The force pair loop's per-row fast path: stencil row q starts at
+   *  qbase[q] when it lies inside ONE held span (qflat = all nine do), so a
+   *  neighbour costs one table load, as in the baselines' s_qptr. */
+  const float *qbase[9];
+  u32 qflat;
 };
 
 

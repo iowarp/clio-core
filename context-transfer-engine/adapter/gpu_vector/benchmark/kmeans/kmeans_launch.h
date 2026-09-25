@@ -48,7 +48,7 @@ void InitBackend(u32 max_blocks, const GpuInfo &info);
 /** Seed the point set into the vector, one page at a time. Yieldable. */
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
                 u64 page_elems, u32 dims, u32 k, u64 base_idx, View vw,
-                StackView sv);
+                StackView sv, u32 publish);
 
 /** One Lloyd assignment pass over the paged point set. Yieldable. */
 void LaunchAssign(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,

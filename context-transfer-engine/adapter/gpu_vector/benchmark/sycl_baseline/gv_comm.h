@@ -296,6 +296,34 @@ class Comm {
 #endif
   }
 
+  /** Personalised exchange: send[q*count, (q+1)*count) goes to rank q, and
+   *  recv[r*count, (r+1)*count) arrives from rank r, in rank order.
+   *  @param send device buffer of count * nranks elements, by destination
+   *  @param recv device buffer of count * nranks elements, by source */
+  template <typename T> void Alltoall(const T *send, T *recv, u64 count) {
+    q.wait();
+#if defined(GV_COMM_CCL)
+    ccl::alltoall(send, recv, static_cast<size_t>(count), CclType<T>(),
+                  *comm_, *stream_)
+        .wait();
+#elif defined(GV_COMM_ISHMEM)
+    IshmemAlltoall(recv, send, static_cast<size_t>(count));
+#else
+    if (host_stage_) {
+      std::vector<T> hs(static_cast<size_t>(count) * nranks);
+      std::vector<T> hr(static_cast<size_t>(count) * nranks);
+      q.memcpy(hs.data(), send, hs.size() * sizeof(T)).wait();
+      MPI_Alltoall(hs.data(), static_cast<int>(count), MpiType<T>(),
+                   hr.data(), static_cast<int>(count), MpiType<T>(),
+                   MPI_COMM_WORLD);
+      q.memcpy(recv, hr.data(), hr.size() * sizeof(T)).wait();
+    } else {
+      MPI_Alltoall(send, static_cast<int>(count), MpiType<T>(), recv,
+                   static_cast<int>(count), MpiType<T>(), MPI_COMM_WORLD);
+    }
+#endif
+  }
+
   /**
    * One halo plane each way: send `n` elements from `send` to rank `to`
    * and receive `n` elements from rank `from` into `recv`. -1 means no
@@ -446,6 +474,42 @@ class Comm {
   static void IshmemFcollect(unsigned long long *d,
                              const unsigned long long *s, size_t n) {
     if (ishmem_ulonglong_fcollect(d, s, n)) Fail("ishmem_ulonglong_fcollect");
+  }
+  /** ishmem_*_alltoall has been seen to return nonzero at large counts
+   *  while the delivered data was correct (lbann: digest equal to MPI's).
+   *  A nonzero rc is therefore logged once and the exchange is REDONE with
+   *  one-sided puts (slice p of `s` -> rank p's d[me]) and a barrier, which
+   *  is correct by construction, instead of aborting the run. */
+  template <typename T>
+  static void IshmemAlltoallPut(T *d, const T *s, size_t n) {
+    const int me = ishmem_my_pe(), np = ishmem_n_pes();
+    for (int p = 0; p < np; ++p) {
+      ishmem_putmem(d + static_cast<size_t>(me) * n,
+                    s + static_cast<size_t>(p) * n, n * sizeof(T), p);
+    }
+    ishmem_barrier_all();
+  }
+  static void IshmemAlltoallRc(int rc, const char *what) {
+    static bool warned = false;
+    if (rc != 0 && !warned) {
+      std::fprintf(stderr, "%s returned %d; using put+barrier alltoall\n",
+                   what, rc);
+      warned = true;
+    }
+  }
+  static void IshmemAlltoall(float *d, const float *s, size_t n) {
+    const int rc = ishmem_float_alltoall(d, s, n);
+    if (rc != 0) {
+      IshmemAlltoallRc(rc, "ishmem_float_alltoall");
+      IshmemAlltoallPut(d, s, n);
+    }
+  }
+  static void IshmemAlltoall(double *d, const double *s, size_t n) {
+    const int rc = ishmem_double_alltoall(d, s, n);
+    if (rc != 0) {
+      IshmemAlltoallRc(rc, "ishmem_double_alltoall");
+      IshmemAlltoallPut(d, s, n);
+    }
   }
   static void Fail(const char *what) {
     std::fprintf(stderr, "%s failed\n", what);

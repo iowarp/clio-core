@@ -35,7 +35,8 @@ void InitBackend(u32 max_blocks, const GpuInfo &info);
 /** Seed u and v for every block's z-range, one plane per page. Yieldable. */
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
                 u64 plane, u64 nx, u64 ny, u64 nz, u64 zper, u64 ubase,
-                u64 vbase, u64 zbase, u64 zend, View vw, StackView sv);
+                u64 vbase, u64 zbase, u64 zend, View vw, StackView sv,
+                u32 all);
 
 /** One Gray-Scott step over the paged field. Yieldable. */
 void LaunchStep(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,

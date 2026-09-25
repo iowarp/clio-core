@@ -108,6 +108,184 @@ namespace clio::gv_bench::lbann {
  * way grayscott's planes do. ONE GUARD AT A TIME: the row loop fetches the
  * page under the current row, computes every row on that page, releases it.
  */
+// THE PAGE BODIES, OUT OF LINE AND GLOBAL (see the kmeans and gmx editions).
+// Written inline in the coroutines, every weight load went through
+// PageRef::operator[] on a pointer IGC could not prove global -- a
+// generic-address check per multiply-add of a 275 GFMA step -- and shared
+// the coroutine's registers. Each takes the page's first row as a raw
+// pointer and does exactly the arithmetic, in exactly the order, of the
+// loop it replaces.
+#if CTP_ENABLE_SYCL && defined(__SYCL_DEVICE_ONLY__)
+template <typename T>
+CTP_GPU_FUN inline auto LbG(T *p) {
+  return ::sycl::address_space_cast<::sycl::access::address_space::global_space,
+                                    ::sycl::access::decorated::yes>(p);
+}
+#else
+template <typename T>
+CTP_GPU_FUN inline T *LbG(T *p) { return p; }
+#endif
+
+/** fwd1 for rows [hp, hend) of W1; `wp` = row hp. */
+CTP_GPU_FUN __attribute__((noinline)) void Fwd1Page(
+    const float *wp, u64 hp, u64 hend, u64 I, u64 B, const float *b1v,
+    const float *x, float *a1) {
+  const auto W = LbG(wp);
+  const auto X = LbG(x);
+  const u64 nout = (hend - hp) * B;
+  for (u64 t = threadIdx.x; t < nout; t += blockDim.x) {
+    const u64 h = hp + t / B;
+    const u64 b = t % B;
+    float acc = LbG(b1v)[h];
+    for (u64 i = 0; i < I; ++i) acc += W[(h - hp) * I + i] * X[b * I + i];
+    LbG(a1)[h * B + b] = acc > 0.0f ? acc : 0.0f;
+  }
+}
+
+/** fwd1 over a block's whole held band; `tab[p]` is row h0 + p*rpp. */
+CTP_GPU_FUN __attribute__((noinline)) void Fwd1Rows(
+    float *const *tab, u64 rpp, u64 h0, u64 h1, u64 I, u64 B,
+    const float *b1v, const float *x, float *a1) {
+  const auto X = LbG(x);
+  const auto TB = LbG(tab);
+  for (u64 t = threadIdx.x; t < (h1 - h0) * B; t += blockDim.x) {
+    const u64 h = h0 + t / B;
+    const u64 b = t % B;
+    const u64 p = (h - h0) / rpp;
+    const auto W = LbG(TB[p]);
+    const u64 hp = h0 + p * rpp;
+    float acc = LbG(b1v)[h];
+    for (u64 i = 0; i < I; ++i) acc += W[(h - hp) * I + i] * X[b * I + i];
+    LbG(a1)[h * B + b] = acc > 0.0f ? acc : 0.0f;
+  }
+}
+
+/** fwd2 + output gradient for rows [op, oend) of W2; `wp` = row op. */
+CTP_GPU_FUN __attribute__((noinline)) void Fwd2Page(
+    const float *wp, u64 op, u64 oend, u64 H, u64 O, u64 B, const float *b2v,
+    const float *a1, const float *y, float *d2, double *loss_parts) {
+  const auto W = LbG(wp);
+  const auto A = LbG(a1);
+  const u64 nout = (oend - op) * B;
+  for (u64 t = threadIdx.x; t < nout; t += blockDim.x) {
+    const u64 o = op + t / B;
+    const u64 b = t % B;
+    float acc = LbG(b2v)[o];
+    for (u64 h = 0; h < H; ++h) acc += W[(o - op) * H + h] * A[h * B + b];
+    const float diff = acc - LbG(y)[b * O + o];
+    LbG(d2)[o * B + b] = 2.0f * diff / static_cast<float>(B * O);
+    LbG(loss_parts)[o * B + b] =
+        static_cast<double>(diff) * static_cast<double>(diff);
+  }
+}
+
+/** bwd1 accumulation of rows [op, oend) of W2 into d1[h0..h1). */
+CTP_GPU_FUN __attribute__((noinline)) void Bwd1Page(
+    const float *wp, u64 op, u64 oend, u64 H, u64 B, u64 h0, u64 h1,
+    const float *d2, float *d1) {
+  const auto W = LbG(wp);
+  const auto D2 = LbG(d2);
+  const auto D1 = LbG(d1);
+  for (u64 t = threadIdx.x; t < (h1 - h0) * B; t += blockDim.x) {
+    const u64 h = h0 + t / B;
+    const u64 b = t % B;
+    float acc = D1[h * B + b];
+    for (u64 o = op; o < oend; ++o) acc += W[(o - op) * H + h] * D2[o * B + b];
+    D1[h * B + b] = acc;
+  }
+}
+
+/** upd2 for rows [op, oend) of W2; `wp` = row op. */
+CTP_GPU_FUN __attribute__((noinline)) void Upd2Page(
+    float *wp, u64 op, u64 oend, u64 H, u64 B, const float *d2,
+    const float *a1, float lr) {
+  const auto W = LbG(wp);
+  const auto D2 = LbG(d2);
+  const auto A = LbG(a1);
+  const u64 nout = (oend - op) * H;
+  for (u64 t = threadIdx.x; t < nout; t += blockDim.x) {
+    const u64 o = op + t / H;
+    const u64 h = t % H;
+    float g = 0.0f;
+    for (u64 b = 0; b < B; ++b) g += D2[o * B + b] * A[h * B + b];
+    W[(o - op) * H + h] -= lr * g;
+  }
+}
+
+/** upd1 for rows [hp, hend) of W1; `wp` = row hp. */
+CTP_GPU_FUN __attribute__((noinline)) void Upd1Page(
+    float *wp, u64 hp, u64 hend, u64 I, u64 B, const float *d1,
+    const float *x, float lr) {
+  const auto W = LbG(wp);
+  const auto D1 = LbG(d1);
+  const auto X = LbG(x);
+  const u64 nout = (hend - hp) * I;
+  for (u64 t = threadIdx.x; t < nout; t += blockDim.x) {
+    const u64 h = hp + t / I;
+    const u64 i = t % I;
+    float g = 0.0f;
+    for (u64 b = 0; b < B; ++b) g += D1[h * B + b] * X[b * I + i];
+    W[(h - hp) * I + i] -= lr * g;
+  }
+}
+
+/** upd1 over a block's whole held band: `tab[p]` is the first row of page p,
+ *  pages cover rows [h0, h1) in order, `rpp` rows each. Column-major sweep:
+ *  x[:, i] is loaded once per column (registers) and applied to every row;
+ *  the per-element sum is the same b-ascending one as Upd1Page. B > 64 falls
+ *  back to reloading x per row. */
+CTP_GPU_FUN __attribute__((noinline)) void Upd1Rows(
+    float *const *tab, u64 np, u64 rpp, u64 h0, u64 h1, u64 I, u64 B,
+    const float *d1, const float *x, float lr) {
+  constexpr u64 kMaxB = 64;
+  const auto D1 = LbG(d1);
+  const auto X = LbG(x);
+  const auto TB = LbG(tab);
+  for (u64 i = threadIdx.x; i < I; i += blockDim.x) {
+    float xr[kMaxB];
+#pragma unroll
+    for (u64 b = 0; b < kMaxB; ++b) xr[b] = (b < B) ? X[b * I + i] : 0.0f;
+    for (u64 p = 0; p < np; ++p) {
+      const auto W = LbG(TB[p]);
+      const u64 hp = h0 + p * rpp;
+      const u64 hend = (hp + rpp < h1) ? hp + rpp : h1;
+      for (u64 h = hp; h < hend; ++h) {
+        float g = 0.0f;
+        if (B <= kMaxB) {
+#pragma unroll
+          for (u64 b = 0; b < kMaxB; ++b) {
+            if (b < B) g += D1[h * B + b] * xr[b];
+          }
+        } else {
+          for (u64 b = 0; b < B; ++b) g += D1[h * B + b] * X[b * I + i];
+        }
+        W[(h - hp) * I + i] -= lr * g;
+      }
+    }
+  }
+}
+
+/** bwd1 over every held W2 page: d1[h,b] = relu'(a1) * sum_o W2[o,h] d2[o,b],
+ *  o ascending (the page-by-page path's order), sum kept in a register. */
+CTP_GPU_FUN __attribute__((noinline)) void Bwd1Rows(
+    float *const *tab, u64 np, u64 rpp, u64 O, u64 H, u64 B, u64 h0, u64 h1,
+    const float *a1, const float *d2, float *d1) {
+  const auto D2 = LbG(d2);
+  const auto TB = LbG(tab);
+  for (u64 t = threadIdx.x; t < (h1 - h0) * B; t += blockDim.x) {
+    const u64 h = h0 + t / B;
+    const u64 b = t % B;
+    float acc = 0.0f;
+    for (u64 p = 0; p < np; ++p) {
+      const auto W = LbG(TB[p]);
+      const u64 op = p * rpp;
+      const u64 oend = (op + rpp < O) ? op + rpp : O;
+      for (u64 o = op; o < oend; ++o) acc += W[(o - op) * H + h] * D2[o * B + b];
+    }
+    LbG(d1)[h * B + b] = (LbG(a1)[h * B + b] <= 0.0f) ? 0.0f : acc;
+  }
+}
+
 // THE BIASES ARE NOT IN THE PAGED VECTOR. They are tiny (H + O floats),
 // read by EVERY block and rewritten identically by every node -- the worst
 // possible tenant for a shared paged cache. Keeping them paged produced two
@@ -123,7 +301,30 @@ namespace clio::gv_bench::lbann {
 CTP_GPU_FUN CLIO_COROC_INLINE void Fwd1Coro(gv::DeviceVector<float> w, u64 w1_off,
                                   const float *b1v, u64 I, u64 H, u64 B,
                                   const float *x, float *a1, u64 h0, u64 h1,
-                                  u64 rows_per_page, u64 gen) {
+                                  u64 rows_per_page, u64 gen, float **tab) {
+  // BAND PATH (tab != null), as Upd1: with one row per page (I = 262144 on
+  // the 4-node deck) a page is 64 outputs -- a quarter of the block's
+  // threads. Hold the whole band, then every thread takes (h, b) outputs
+  // across it. Same i-ascending sums, same bits.
+  if (tab != nullptr) {
+    u64 np = 0;
+    for (u64 hp = h0; hp < h1; hp += rows_per_page) {
+      const u64 page_lo = w1_off + hp * I;
+      const u64 hend = (hp + rows_per_page < h1) ? hp + rows_per_page : h1;
+      CO_AWAIT(w.CoFetch(gen, page_lo, (hend - hp) * I));
+      auto hw = CO_AWAIT(w.CoHoldPage(page_lo, (hend - hp) * I, /*write=*/false));
+      if (threadIdx.x == 0) tab[np] = hw.ptr() + (page_lo - hw.begin_off());
+      ++np;
+    }
+    __syncthreads();
+    Fwd1Rows(tab, rows_per_page, h0, h1, I, B, b1v, x, a1);
+    __syncthreads();
+    for (u64 hp = h0; hp < h1; hp += rows_per_page) {
+      const u64 hend = (hp + rows_per_page < h1) ? hp + rows_per_page : h1;
+      w.UnpinRange(w1_off + hp * I, (hend - hp) * I);
+    }
+    return;
+  }
   // EVERY WEIGHT READ NAMES THE STEP'S GENERATION. Under eviction a gen-0
   // refetch of a page this node published LAST step can be served a stale
   // replica while the writeback settles -- measured distributed+OOC as the
@@ -137,17 +338,8 @@ CTP_GPU_FUN CLIO_COROC_INLINE void Fwd1Coro(gv::DeviceVector<float> w, u64 w1_of
     const u64 count = (hend - hp) * I;
     CO_AWAIT(w.CoFetch(gen, page_lo, count));
     auto hw = CO_AWAIT(w.CoHoldPage(page_lo, count, /*write=*/false));
-    // One thread per (h, b) output element; the i-sum is sequential.
-    const u64 nout = (hend - hp) * B;
-    for (u64 t = threadIdx.x; t < nout; t += blockDim.x) {
-      const u64 h = hp + t / B;
-      const u64 b = t % B;
-      float acc = b1v[h];
-      for (u64 i = 0; i < I; ++i) {
-        acc += hw[w1_off + h * I + i] * x[b * I + i];
-      }
-      a1[h * B + b] = acc > 0.0f ? acc : 0.0f;
-    }
+    Fwd1Page(hw.ptr() + (page_lo - hw.begin_off()), hp, hend, I, B, b1v, x,
+             a1);
     __syncthreads();
     w.UnpinRange(page_lo, count);
   }
@@ -166,20 +358,8 @@ CTP_GPU_FUN CLIO_COROC_INLINE void Fwd2Coro(gv::DeviceVector<float> w, u64 w2_of
     const u64 count = (oend - op) * H;
     CO_AWAIT(w.CoFetch(gen, page_lo, count));
     auto hw = CO_AWAIT(w.CoHoldPage(page_lo, count, /*write=*/false));
-    const u64 nout = (oend - op) * B;
-    for (u64 t = threadIdx.x; t < nout; t += blockDim.x) {
-      const u64 o = op + t / B;
-      const u64 b = t % B;
-      float acc = b2v[o];
-      for (u64 h = 0; h < H; ++h) {
-        acc += hw[w2_off + o * H + h] * a1[h * B + b];
-      }
-      const float diff = acc - y[b * O + o];
-      d2[o * B + b] = 2.0f * diff / static_cast<float>(B * O);
-      // Stash the squared error where the deterministic reducer finds it.
-      loss_parts[o * B + b] =
-          static_cast<double>(diff) * static_cast<double>(diff);
-    }
+    Fwd2Page(hw.ptr() + (page_lo - hw.begin_off()), op, oend, H, O, B, b2v,
+             a1, y, d2, loss_parts);
     __syncthreads();
     w.UnpinRange(page_lo, count);
   }
@@ -194,7 +374,32 @@ CTP_GPU_FUN CLIO_COROC_INLINE void Bwd1Coro(gv::DeviceVector<float> w, u64 w2_of
                                   u64 H, u64 O, u64 B, const float *a1,
                                   const float *d2, float *d1, u64 h0, u64 h1,
                                   u64 rows_per_page, u64 o0, u64 o1,
-                                  u64 gen) {
+                                  u64 gen, float **tab) {
+  // BAND PATH (tab != null): hold every W2 page, then one pass per output
+  // element with the running sum in a register. Page by page, d1 was read
+  // and written back once per page (1024 times per element per step). Same
+  // o-ascending sum, so the same bits. `tab` is this block's page table.
+  if (tab != nullptr) {
+    u64 np = 0;
+    for (u64 op = 0; op < O; op += rows_per_page) {
+      const u64 oend = (op + rows_per_page < O) ? op + rows_per_page : O;
+      const u64 page_lo = w2_off + op * H;
+      const u64 count = (oend - op) * H;
+      CO_AWAIT(w.CoFetch(gen, page_lo, count));
+      auto hw = CO_AWAIT(w.CoHoldPage(page_lo, count, /*write=*/false));
+      if (threadIdx.x == 0) tab[np] = hw.ptr() + (page_lo - hw.begin_off());
+      ++np;
+    }
+    __syncthreads();
+    Bwd1Rows(tab, np, rows_per_page, O, H, B, h0, h1, a1, d2, d1);
+    __syncthreads();
+    for (u64 op = 0; op < O; op += rows_per_page) {
+      const u64 oend = (op + rows_per_page < O) ? op + rows_per_page : O;
+      w.UnpinRange(w2_off + op * H, (oend - op) * H);
+    }
+    (void)o0; (void)o1;
+    return;
+  }
   // This block owns d1 rows h0..h1 and must read ALL of W2 for them. Pages
   // slide over the whole of W2; the o-sum stays sequential per element by
   // accumulating across page visits in registers is impossible (o spans
@@ -219,15 +424,8 @@ CTP_GPU_FUN CLIO_COROC_INLINE void Bwd1Coro(gv::DeviceVector<float> w, u64 w2_of
     (void)o0; (void)o1;
     CO_AWAIT(w.CoFetch(gen, page_lo, count));
     auto hw = CO_AWAIT(w.CoHoldPage(page_lo, count, /*write=*/false));
-    for (u64 t = threadIdx.x; t < (h1 - h0) * B; t += blockDim.x) {
-      const u64 h = h0 + t / B;
-      const u64 b = t % B;
-      float acc = d1[h * B + b];
-      for (u64 o = op; o < oend; ++o) {
-        acc += hw[w2_off + o * H + h] * d2[o * B + b];
-      }
-      d1[h * B + b] = acc;
-    }
+    Bwd1Page(hw.ptr() + (page_lo - hw.begin_off()), op, oend, H, B, h0, h1,
+             d2, d1);
     __syncthreads();
     w.UnpinRange(page_lo, count);
   }
@@ -236,6 +434,45 @@ CTP_GPU_FUN CLIO_COROC_INLINE void Bwd1Coro(gv::DeviceVector<float> w, u64 w2_of
     const u64 b = t % B;
     if (a1[h * B + b] <= 0.0f) d1[h * B + b] = 0.0f;
   }
+}
+
+/**
+ * BWD1, TWO PHASES (the default; LBANN_BWD1_BAND=1 keeps the band path).
+ * Every node needs every W2 page. The band path had all of a node's blocks
+ * demand the same (peer-owned) pages at once, which on 4 nodes hit the
+ * paging layer's open claim race ("HoldPage: range never fetched") and made
+ * each block hold 4096 pages. Here each page is fetched and held by exactly
+ * ONE block into a node-wide table; a plain kernel runs the sum through it;
+ * W2ReleaseCoro unpins. Same o-ascending sums, so the same bits.
+ */
+CTP_GPU_FUN CLIO_COROC_INLINE void W2ResolveCoro(gv::DeviceVector<float> w, u64 w2_off,
+                                       u64 H, u64 O, u64 rpp, u64 gen,
+                                       float **tab, u32 nblk, u32 blk,
+                                       u64 o_lo) {
+  // Rows [o_lo, O): the whole of W2 on one node, this node's own rows in
+  // the partial (multi-node) scheme. tab[p] = row o_lo + p*rpp.
+  for (u64 p = blk; o_lo + p * rpp < O; p += nblk) {
+    const u64 op = o_lo + p * rpp;
+    const u64 oend = (op + rpp < O) ? op + rpp : O;
+    const u64 page_lo = w2_off + op * H;
+    const u64 count = (oend - op) * H;
+    CO_AWAIT(w.CoFetch(gen, page_lo, count));
+    auto hw = CO_AWAIT(w.CoHoldPage(page_lo, count, /*write=*/false));
+    if (threadIdx.x == 0) tab[p] = hw.ptr() + (page_lo - hw.begin_off());
+  }
+  __syncthreads();
+}
+
+/** Unpin what W2ResolveCoro pinned (same pages, same blocks). */
+CTP_GPU_FUN inline void W2ReleaseCoro(gv::DeviceVector<float> w, u64 w2_off,
+                                      u64 H, u64 O, u64 rpp, u32 nblk,
+                                      u32 blk, u64 o_lo) {
+  for (u64 p = blk; o_lo + p * rpp < O; p += nblk) {
+    const u64 op = o_lo + p * rpp;
+    const u64 oend = (op + rpp < O) ? op + rpp : O;
+    w.UnpinRange(w2_off + op * H, (oend - op) * H);
+  }
+  __syncthreads();
 }
 
 /** upd2: W2[o,h] -= lr sum_b d2[o,b] a1[h,b]; b2 likewise. Block owns
@@ -249,20 +486,12 @@ CTP_GPU_FUN CLIO_COROC_INLINE void Upd2Coro(gv::DeviceVector<float> w, u64 w2_of
     const u64 page_lo = w2_off + op * H;
     const u64 oend = (op + rows_per_page < o1) ? op + rows_per_page : o1;
     const u64 count = (oend - op) * H;
-    CO_AWAIT(w.CoFetch(gen - 1, page_lo, count));
+    CO_AWAIT(w.CoFetch(gen == 0 ? 0 : gen - 1, page_lo, count));
     auto hw = CO_AWAIT(w.CoHoldPage(page_lo, count, /*write=*/true));
-    const u64 nout = (oend - op) * H;
-    for (u64 t = threadIdx.x; t < nout; t += blockDim.x) {
-      const u64 o = op + t / H;
-      const u64 h = t % H;
-      float g = 0.0f;
-      for (u64 b = 0; b < B; ++b) {
-        g += d2[o * B + b] * a1[h * B + b];
-      }
-      hw[w2_off + o * H + h] -= lr * g;
-    }
+    Upd2Page(hw.ptr() + (page_lo - hw.begin_off()), op, oend, H, B, d2, a1,
+             lr);
     __syncthreads();
-    CO_AWAIT(w.CoBeginFlush(gen, page_lo, count));
+    if (gen != 0) CO_AWAIT(w.CoBeginFlush(gen, page_lo, count));
     w.UnpinRange(page_lo, count);
   }
   // THE BIAS UPDATE IS REPLICATED, NOT PARTITIONED. b2 is O floats and
@@ -281,7 +510,7 @@ CTP_GPU_FUN CLIO_COROC_INLINE void Upd2Coro(gv::DeviceVector<float> w, u64 w2_of
     }
     __syncthreads();
   }
-  CO_AWAIT(w.CoEndFlush());
+  if (gen != 0) CO_AWAIT(w.CoEndFlush());
 }
 
 /** upd1: W1[h,i] -= lr d1[h,b] x[b,i]; b1 likewise. Block owns h-rows. */
@@ -289,25 +518,41 @@ CTP_GPU_FUN CLIO_COROC_INLINE void Upd1Coro(gv::DeviceVector<float> w, u64 w1_of
                                   float *b1v, u64 I, u64 H, u64 B,
                                   const float *x, const float *d1, float lr,
                                   u64 h0, u64 h1, u64 rows_per_page,
-                                  u64 gen, bool do_bias) {
+                                  u64 gen, bool do_bias, float **tab) {
+  // HOLD THE BLOCK'S WHOLE BAND, THEN SWEEP COLUMNS. Page by page, each
+  // 4-row page re-read the whole 16 MB batch x from L2 (3.4x the baseline's
+  // upd1, whose work-group keeps one x column slice in L1 across all its
+  // rows). With every page of the band held, Upd1Rows loads a column of x
+  // into registers once and applies it to all of the band's rows -- the
+  // same b-ascending sums, so the same bits. `tab` is this block's slice of
+  // a device table of page pointers (null: the page-by-page path).
+  u64 np = 0;
+  if (tab != nullptr) {
+    for (u64 hp = h0; hp < h1; hp += rows_per_page) {
+      const u64 page_lo = w1_off + hp * I;
+      const u64 hend = (hp + rows_per_page < h1) ? hp + rows_per_page : h1;
+      const u64 count = (hend - hp) * I;
+      CO_AWAIT(w.CoFetch(gen == 0 ? 0 : gen - 1, page_lo, count));
+      auto hw = CO_AWAIT(w.CoHoldPage(page_lo, count, /*write=*/true));
+      if (threadIdx.x == 0) tab[np] = hw.ptr() + (page_lo - hw.begin_off());
+      ++np;
+    }
+    __syncthreads();
+    Upd1Rows(tab, np, rows_per_page, h0, h1, I, B, d1, x, lr);
+    __syncthreads();
+  }
   for (u64 hp = h0; hp < h1; hp += rows_per_page) {
     const u64 page_lo = w1_off + hp * I;
     const u64 hend = (hp + rows_per_page < h1) ? hp + rows_per_page : h1;
     const u64 count = (hend - hp) * I;
-    CO_AWAIT(w.CoFetch(gen - 1, page_lo, count));
-    auto hw = CO_AWAIT(w.CoHoldPage(page_lo, count, /*write=*/true));
-    const u64 nout = (hend - hp) * I;
-    for (u64 t = threadIdx.x; t < nout; t += blockDim.x) {
-      const u64 h = hp + t / I;
-      const u64 i = t % I;
-      float g = 0.0f;
-      for (u64 b = 0; b < B; ++b) {
-        g += d1[h * B + b] * x[b * I + i];
-      }
-      hw[w1_off + h * I + i] -= lr * g;
+    if (tab == nullptr) {
+      CO_AWAIT(w.CoFetch(gen == 0 ? 0 : gen - 1, page_lo, count));
+      auto hw = CO_AWAIT(w.CoHoldPage(page_lo, count, /*write=*/true));
+      Upd1Page(hw.ptr() + (page_lo - hw.begin_off()), hp, hend, I, B, d1, x,
+               lr);
+      __syncthreads();
     }
-    __syncthreads();
-    CO_AWAIT(w.CoBeginFlush(gen, page_lo, count));
+    if (gen != 0) CO_AWAIT(w.CoBeginFlush(gen, page_lo, count));
     w.UnpinRange(page_lo, count);
   }
   // REPLICATED, like b2 -- b1 is H floats in a single page, so a per-node
@@ -321,12 +566,12 @@ CTP_GPU_FUN CLIO_COROC_INLINE void Upd1Coro(gv::DeviceVector<float> w, u64 w1_of
     }
     __syncthreads();
   }
-  CO_AWAIT(w.CoEndFlush());
+  if (gen != 0) CO_AWAIT(w.CoEndFlush());
 }
 
 /** Seed the weights deterministically and publish them. */
 CTP_GPU_FUN CLIO_COROC_INLINE void SeedCoro(gv::DeviceVector<float> w, u64 n, u64 e0,
-                                  u64 e1, u64 chunk) {
+                                  u64 e1, u64 chunk, u32 publish) {
   for (u64 lo = e0; lo < e1; lo += chunk) {
     const u64 hi = (lo + chunk < e1) ? lo + chunk : e1;
     CO_AWAIT(w.CoFetch(0, lo, hi - lo));
@@ -335,10 +580,12 @@ CTP_GPU_FUN CLIO_COROC_INLINE void SeedCoro(gv::DeviceVector<float> w, u64 n, u6
       h[i] = Sym01(Lcg(0xB5297A4D3F84D5B5ull + i)) * 0.05f;
     }
     __syncthreads();
-    CO_AWAIT(w.CoBeginFlush(1, lo, hi - lo));
+    // Published only when a peer will read it (the legacy generational
+    // modes): W1 and W2 are node-private now and the cache holds them.
+    if (publish != 0) CO_AWAIT(w.CoBeginFlush(1, lo, hi - lo));
     w.UnpinRange(lo, hi - lo);
   }
-  CO_AWAIT(w.CoEndFlush());
+  if (publish != 0) CO_AWAIT(w.CoEndFlush());
 }
 
 /** Order-independent integer digest of the weights: sum of bit patterns. */
@@ -432,7 +679,11 @@ void SubmitYieldable(dim3 grid, dim3 block, DevF32 w, View vw, StackView sv,
          DevF32 dev = w;
          dev.Init(vw.Block());
          __syncthreads();
+         // GV_COMM_TIMING: this resident segment is the denominator of the
+         // Fetch/Hold/Flush share (a no-op in an untimed build).
+         const unsigned long long gv_seg0 = dev.CommSegmentBegin();
          CLIO_COROC_RUN(vw, sv, make(_cy, dev, vw.Block()));
+         dev.CommStamp(3, gv_seg0);
        })
       .wait();
 }
@@ -445,7 +696,7 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 
 void LaunchFwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 w1_off, const float *b1v, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen,
-                 View vw, StackView sv) {
+                 View vw, StackView sv, float **tab, u64 tab_stride) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk_) {
@@ -453,7 +704,8 @@ void LaunchFwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                     const bool bias0 = (blk == 0);
                     (void)bias0;
                     Fwd1Coro(_cy, dev, w1_off, b1v, I, H, B, x, a1, rbase + blk * hper,
-                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp, gen);
+                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp, gen,
+                          tab != nullptr ? tab + blk * tab_stride : nullptr);
                   });
 }
 
@@ -473,7 +725,7 @@ void LaunchFwd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
 
 void LaunchBwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 o0, u64 o1, u64 gen,
-                 View vw, StackView sv) {
+                 View vw, StackView sv, float **tab, u64 tab_stride) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk_) {
@@ -481,8 +733,130 @@ void LaunchBwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                     const bool bias0 = (blk == 0);
                     (void)bias0;
                     Bwd1Coro(_cy, dev, w2_off, H, O, B, a1, d2, d1, rbase + blk * hper,
-                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp, o0, o1, gen);
+                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp, o0, o1, gen,
+                          tab != nullptr ? tab + blk * tab_stride : nullptr);
                   });
+}
+
+void LaunchW2Resolve(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
+                     u64 w2_off, u64 H, u64 O, u64 rpp, u64 gen, float **tab,
+                     View vw, StackView sv, u64 o_lo) {
+  (void)info;
+  SubmitYieldable(grid, block, w, vw, sv,
+                  [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
+                    W2ResolveCoro(_cy, dev, w2_off, H, O, rpp, gen, tab, grid.x, blk, o_lo);
+                  });
+}
+
+void LaunchW2Release(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
+                     u64 w2_off, u64 H, u64 O, u64 rpp, View vw,
+                     StackView sv, u64 o_lo) {
+  (void)info;
+  SubmitYieldable(grid, block, w, vw, sv,
+                  [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
+                    (void)_cy;
+                    W2ReleaseCoro(dev, w2_off, H, O, rpp, grid.x, blk, o_lo);
+                  });
+}
+
+/** bwd1 through the node-wide W2 table, grid-strided like the baselines'. */
+void LaunchBwd1Tab(u32 blocks, u32 threads, float *const *tab, u64 np,
+                   u64 rpp, u64 O, u64 H, u64 B, u64 h0, u64 h1,
+                   const float *a1, const float *d2, float *d1) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t g = static_cast<size_t>(blocks) * threads;
+  q.parallel_for(sycl::nd_range<1>(g, threads), [=](sycl::nd_item<1> it) {
+     const auto D2 = LbG(d2);
+     const auto TB = LbG(tab);
+     for (u64 t = it.get_global_id(0); t < (h1 - h0) * B; t += g) {
+       const u64 h = h0 + t / B;
+       const u64 b = t % B;
+       float acc = 0.0f;
+       for (u64 p = 0; p < np; ++p) {
+         const auto W = LbG(TB[p]);
+         const u64 op = p * rpp;
+         const u64 oend = (op + rpp < O) ? op + rpp : O;
+         for (u64 o = op; o < oend; ++o) acc += W[(o - op) * H + h] * D2[o * B + b];
+       }
+       LbG(d1)[h * B + b] = (LbG(a1)[h * B + b] <= 0.0f) ? 0.0f : acc;
+     }
+   }).wait();
+}
+
+/** This node's o-partial of d1 for EVERY h (the baselines' Bwd1Partial):
+ *  page-blocked over this node's W2 rows [o_lo, o_hi), tab[p] = row
+ *  o_lo + p*rpp. out = the node's H*B slice of the partials buffer. */
+void LaunchBwd1PartialTab(u32 blocks, u32 threads, float *const *tab,
+                          u64 rpp, u64 o_lo, u64 o_hi, u64 H, u64 B,
+                          const float *d2, float *out) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t g = static_cast<size_t>(blocks) * threads;
+  q.parallel_for(sycl::nd_range<1>(g, threads), [=](sycl::nd_item<1> it) {
+     const auto D2 = LbG(d2);
+     const auto TB = LbG(tab);
+     for (u64 t = it.get_global_id(0); t < H * B; t += g) {
+       const u64 h = t / B;
+       const u64 b = t % B;
+       float acc = 0.0f;
+       for (u64 op = o_lo, p = 0; op < o_hi; op += rpp, ++p) {
+         const u64 oend = (op + rpp < o_hi) ? op + rpp : o_hi;
+         const auto W = LbG(TB[p]);
+         float blk = 0.0f;
+         for (u64 o = op; o < oend; ++o) blk += W[(o - op) * H + h] * D2[o * B + b];
+         acc += blk;
+       }
+       LbG(out)[h * B + b] = acc;
+     }
+   }).wait();
+}
+
+/** fwd2 + output gradient over this node's W2 rows [o_lo, o_hi), one
+ *  work-item per (o, b) across the whole grid (the baselines' Fwd2):
+ *  tab[p] = row o_lo + p*rpp. The coroutine edition gives each block only
+ *  oper*B outputs, which leaves half the threads idle once a page holds two
+ *  rows. Same float order as the baselines: bias, then h ascending.
+ *  @param blocks,threads grid; @param tab resolved page pointers;
+ *  @param rpp W2 rows per page; @param o_lo,o_hi this node's rows;
+ *  @param H,O,B layer sizes; @param b2v bias; @param a1 gathered hidden
+ *  activations; @param y targets; @param d2 output gradient (written);
+ *  @param loss_parts per-(o,b) squared error (written). */
+void LaunchFwd2Tab(u32 blocks, u32 threads, float *const *tab, u64 rpp,
+                   u64 o_lo, u64 o_hi, u64 H, u64 O, u64 B, const float *b2v,
+                   const float *a1, const float *y, float *d2,
+                   double *loss_parts) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t g = static_cast<size_t>(blocks) * threads;
+  q.parallel_for(sycl::nd_range<1>(g, threads), [=](sycl::nd_item<1> it) {
+     const auto A = LbG(a1);
+     const auto TB = LbG(tab);
+     for (u64 t = it.get_global_id(0); t < (o_hi - o_lo) * B; t += g) {
+       const u64 o = o_lo + t / B;
+       const u64 b = t % B;
+       const u64 r = o - o_lo;
+       const auto W = LbG(TB[r / rpp]) + (r % rpp) * H;
+       float acc = LbG(b2v)[o];
+       for (u64 h = 0; h < H; ++h) acc += W[h] * A[h * B + b];
+       const float diff = acc - LbG(y)[b * O + o];
+       LbG(d2)[o * B + b] = 2.0f * diff / static_cast<float>(B * O);
+       LbG(loss_parts)[o * B + b] =
+           static_cast<double>(diff) * static_cast<double>(diff);
+     }
+   }).wait();
+}
+
+/** d1 = relu'(a1) * sum over nodes of the partials, IN NODE ORDER (the
+ *  baselines' Bwd1Combine). */
+void LaunchBwd1Combine(u32 blocks, u32 threads, const float *parts,
+                       u64 nodes, u64 HB, const float *a1, float *d1) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t g = static_cast<size_t>(blocks) * threads;
+  q.parallel_for(sycl::nd_range<1>(g, threads), [=](sycl::nd_item<1> it) {
+     for (u64 t = it.get_global_id(0); t < HB; t += g) {
+       float acc = 0.0f;
+       for (u64 r = 0; r < nodes; ++r) acc += LbG(parts)[r * HB + t];
+       LbG(d1)[t] = (LbG(a1)[t] <= 0.0f) ? 0.0f : acc;
+     }
+   }).wait();
 }
 
 void LaunchUpd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
@@ -501,7 +875,7 @@ void LaunchUpd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
 
 void LaunchUpd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 w1_off, float *b1v, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen,
-                 View vw, StackView sv) {
+                 View vw, StackView sv, float **tab, u64 tab_stride) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk_) {
@@ -509,21 +883,24 @@ void LaunchUpd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                     const bool bias0 = (blk == 0);
                     (void)bias0;
                     Upd1Coro(_cy, dev, w1_off, b1v, I, H, B, x, d1, lr, rbase + blk * hper,
-                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp, gen, bias0);
+                          ((rbase + (blk + 1) * hper) < rend) ? (rbase + (blk + 1) * hper) : rend, rpp, gen, bias0,
+                          tab != nullptr ? tab + blk * tab_stride : nullptr);
                   });
 }
 
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 n, u64 eper, u64 chunk,
-                 View vw, StackView sv) {
+                 View vw, StackView sv, u64 base, u32 publish) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, w, vw, sv,
                   [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk_) {
                     const u64 blk = static_cast<u64>(blk_);
                     const bool bias0 = (blk == 0);
                     (void)bias0;
-                    SeedCoro(_cy, dev, n, blk * eper,
-                          ((blk + 1) * eper < n) ? (blk + 1) * eper : n, chunk);
+                    // [base, n): this block's eper-slice of it.
+                    SeedCoro(_cy, dev, n, base + blk * eper,
+                          (base + (blk + 1) * eper < n) ? base + (blk + 1) * eper : n, chunk,
+                          publish);
                   });
 }
 
@@ -651,8 +1028,9 @@ namespace {
 
 LB_KERNEL(Fwd1,
           Fwd1Coro(_cy, w, w1_off, b1v, I, H, B, x, a1, rbase + static_cast<u64>(yv.Block()) * hper,
-                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * hper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * hper) : rend, rpp, gen),
-          u64 w1_off, const float *b1v, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen)
+                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * hper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * hper) : rend, rpp, gen,
+                          tab != nullptr ? tab + static_cast<u64>(yv.Block()) * tab_stride : nullptr),
+          u64 w1_off, const float *b1v, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen, float **tab, u64 tab_stride)
 
 LB_KERNEL(Fwd2,
           Fwd2Coro(_cy, w, w2_off, b2v, H, O, B, a1, y, d2, loss_parts, rbase + static_cast<u64>(yv.Block()) * oper,
@@ -661,8 +1039,9 @@ LB_KERNEL(Fwd2,
 
 LB_KERNEL(Bwd1,
           Bwd1Coro(_cy, w, w2_off, H, O, B, a1, d2, d1, rbase + static_cast<u64>(yv.Block()) * hper,
-                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * hper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * hper) : rend, rpp, o0, o1, gen),
-          u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 o0, u64 o1, u64 gen)
+                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * hper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * hper) : rend, rpp, o0, o1, gen,
+                          tab != nullptr ? tab + static_cast<u64>(yv.Block()) * tab_stride : nullptr),
+          u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 o0, u64 o1, u64 gen, float **tab, u64 tab_stride)
 
 LB_KERNEL(Upd2,
           Upd2Coro(_cy, w, w2_off, b2v, H, O, B, a1, d2, lr, rbase + static_cast<u64>(yv.Block()) * oper,
@@ -671,13 +1050,14 @@ LB_KERNEL(Upd2,
 
 LB_KERNEL(Upd1,
           Upd1Coro(_cy, w, w1_off, b1v, I, H, B, x, d1, lr, rbase + static_cast<u64>(yv.Block()) * hper,
-                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * hper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * hper) : rend, rpp, gen, bias0),
-          u64 w1_off, float *b1v, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen)
+                          ((rbase + (static_cast<u64>(yv.Block()) + 1) * hper) < rend) ? (rbase + (static_cast<u64>(yv.Block()) + 1) * hper) : rend, rpp, gen, bias0,
+                          tab != nullptr ? tab + static_cast<u64>(yv.Block()) * tab_stride : nullptr),
+          u64 w1_off, float *b1v, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen, float **tab, u64 tab_stride)
 
 LB_KERNEL(Seed,
-          SeedCoro(_cy, w, n, static_cast<u64>(yv.Block()) * eper,
-                          ((static_cast<u64>(yv.Block()) + 1) * eper < n) ? (static_cast<u64>(yv.Block()) + 1) * eper : n, chunk),
-          u64 n, u64 eper, u64 chunk)
+          SeedCoro(_cy, w, n, base + static_cast<u64>(yv.Block()) * eper,
+                          (base + (static_cast<u64>(yv.Block()) + 1) * eper < n) ? base + (static_cast<u64>(yv.Block()) + 1) * eper : n, chunk, publish),
+          u64 n, u64 eper, u64 chunk, u64 base, u32 publish)
 
 LB_KERNEL(MaxDiff,
           MaxDiffCoro(_cy, w, static_cast<u64>(yv.Block()) * eper,
@@ -737,8 +1117,8 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 
 void LaunchFwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 w1_off, const float *b1v, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen,
-                 View vw, StackView sv) {
-  Fwd1Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w1_off, b1v, I, H, B, x, a1, hper, rpp, rbase, rend, gen, vw,
+                 View vw, StackView sv, float **tab, u64 tab_stride) {
+  Fwd1Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w1_off, b1v, I, H, B, x, a1, hper, rpp, rbase, rend, gen, tab, tab_stride, vw,
                                                   sv);
 }
 
@@ -749,10 +1129,36 @@ void LaunchFwd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                                                   sv);
 }
 
+void LaunchW2Resolve(dim3, dim3, const GpuInfo &, DevF32, u64, u64, u64,
+                     u64, u64, float **, View, StackView, u64) {
+  std::abort();
+}
+void LaunchW2Release(dim3, dim3, const GpuInfo &, DevF32, u64, u64, u64, u64,
+                     View, StackView, u64) {
+  std::abort();
+}
+void LaunchBwd1PartialTab(u32, u32, float *const *, u64, u64, u64, u64, u64,
+                          const float *, float *) {
+  std::abort();
+}
+void LaunchFwd2Tab(u32, u32, float *const *, u64, u64, u64, u64, u64, u64,
+                   const float *, const float *, const float *, float *,
+                   double *) {
+  std::abort();
+}
+void LaunchBwd1Combine(u32, u32, const float *, u64, u64, const float *,
+                       float *) {
+  std::abort();
+}
+void LaunchBwd1Tab(u32, u32, float *const *, u64, u64, u64, u64, u64, u64,
+                   u64, const float *, const float *, float *) {
+  std::abort();
+}
+
 void LaunchBwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 o0, u64 o1, u64 gen,
-                 View vw, StackView sv) {
-  Bwd1Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w2_off, H, O, B, a1, d2, d1, hper, rpp, rbase, rend, o0, o1, gen, vw,
+                 View vw, StackView sv, float **tab, u64 tab_stride) {
+  Bwd1Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w2_off, H, O, B, a1, d2, d1, hper, rpp, rbase, rend, o0, o1, gen, tab, tab_stride, vw,
                                                   sv);
 }
 
@@ -765,15 +1171,15 @@ void LaunchUpd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
 
 void LaunchUpd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 w1_off, float *b1v, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen,
-                 View vw, StackView sv) {
-  Upd1Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w1_off, b1v, I, H, B, x, d1, lr, hper, rpp, rbase, rend, gen, vw,
+                 View vw, StackView sv, float **tab, u64 tab_stride) {
+  Upd1Kernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, w1_off, b1v, I, H, B, x, d1, lr, hper, rpp, rbase, rend, gen, tab, tab_stride, vw,
                                                   sv);
 }
 
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 n, u64 eper, u64 chunk,
-                 View vw, StackView sv) {
-  SeedKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, n, eper, chunk, vw,
+                 View vw, StackView sv, u64 base, u32 publish) {
+  SeedKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(info, w, n, eper, chunk, base, publish, vw,
                                                   sv);
 }
 
@@ -835,6 +1241,7 @@ void LaunchDenseDigest(const float *w, u64 n, unsigned long long *out) {
 // the CTE client, whose members are compiled out of the CUDA device pass.
 #include "../bench_dist.h"
 #include "../bench_ckpt.h"
+#include "../gv_comm_report.h"
 
 namespace {
 
@@ -890,6 +1297,10 @@ int main(int argc, char **argv) {
   // carried a final write the 256-node rung did not, and the ladder would
   // not have been self-consistent. --ckpt-final asks for it.
   bool ckpt = false;
+  // Ways per block's set. 0 = 24, or, for a resident cache, enough for this
+  // block's share of the pages plus 25% headroom: at 24 ways a 17 GB deck in
+  // 256 KB pages fills 24576 slots with 69634 pages and has to evict.
+  u32 set_size = 0;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> u64 {
@@ -900,6 +1311,7 @@ int main(int argc, char **argv) {
     else if (a == "--node") node = static_cast<u32>(next());
     else if (a == "--threads") threads = static_cast<u32>(next());
     else if (a == "--cap") cap = static_cast<u32>(next());
+    else if (a == "--set-size") set_size = static_cast<u32>(next());
     else if (a == "--no-ref") no_ref = true;
     else if (a == "--page-kb") page_kb = next();
     else if (a == "--in") I = next();
@@ -1169,17 +1581,51 @@ int main(int argc, char **argv) {
 
   // ---- Paged training. ---------------------------------------------------
   const u64 eper = ((npages + blocks - 1) / blocks) * elems_per_page;
-  gv::Vector<float> w("gv_lbann_w", {0}, page_bytes, blocks, 24, n,
+  if (set_size == 0) {
+    set_size = 24;
+    if (cap == 0) {
+      const u64 need = (npages + blocks - 1) / blocks;
+      set_size = static_cast<u32>(std::max<u64>(24, need + (need + 3) / 4));
+    }
+  }
+  gv::Vector<float> w("gv_lbann_w", {0}, page_bytes, blocks, set_size, n,
                       clio::run::PoolId::GetNull(), 0, 1, 0,
                       cap == 0 ? static_cast<u32>(npages + 2) : cap);
   w.EnableStats();
   auto dw = w.GetDevice(0);
   YieldRunner runner(blocks, threads);
-  runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                 gy::YieldStackView sv) {
-    lb::LaunchSeed(g, b, gpu, dw, n, eper,
-                                                elems_per_page, vw, sv);
-  });
+  // SEED ONLY WHAT THIS NODE OWNS. Every node seeded the WHOLE vector --
+  // 70 GB at 4 nodes through a cache sized for this node's share, so the
+  // seed alone evicted without end (the 600 s cap). The values are indexed
+  // by global element, so seeding a node's own W1 and W2 rows gives exactly
+  // the bytes the whole-vector seed gave them; a peer's W2 rows arrive by
+  // generational fetch, which is the exchange being measured.
+  // Publish the seed only for the legacy modes where a peer reads it.
+  const u32 seed_pub = (getenv("LBANN_W1_GEN") != nullptr ||
+                        getenv("LBANN_BWD1_PULL") != nullptr ||
+                        getenv("LBANN_BWD1_BAND") != nullptr ||
+                        getenv("LBANN_BWD1_PAGED") != nullptr) ? 1u : 0u;
+  auto seed_range = [&](u64 lo, u64 hi) {
+    if (hi <= lo) return;
+    const u64 pl = (lo / elems_per_page) * elems_per_page;
+    const u64 ep = (((hi - pl + blocks - 1) / blocks + elems_per_page - 1) /
+                    elems_per_page) * elems_per_page;
+    runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                   gy::YieldStackView sv) {
+      lb::LaunchSeed(g, b, gpu, dw, hi, ep, elems_per_page, vw, sv, pl,
+                     seed_pub);
+    });
+  };
+  if (nodes > 1) {
+    seed_range(w1_off + h0 * I, w1_off + h1 * I);
+    seed_range(w2_off + o0 * H, w2_off + o1 * H);
+  } else {
+    runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                   gy::YieldStackView sv) {
+      lb::LaunchSeed(g, b, gpu, dw, n, eper, elems_per_page, vw, sv, 0,
+                     seed_pub);
+    });
+  }
   ctp::GpuApi::Synchronize();
 
   // ---- cross-node collectives ------------------------------------------
@@ -1213,11 +1659,13 @@ int main(int argc, char **argv) {
   // d1 is only needed whole for the REPLICATED b1 update; the weight
   // update still uses this node's own rows.
   std::vector<float> h_d1(static_cast<size_t>(H) * B);
+  double lb_host_ms = 0.0;  // wall ms in host-side exchanges
   const auto gather = [&](float *dev, std::vector<float> &host,
                           const std::vector<dist_u64> &los,
                           const std::vector<dist_u64> &his,
                           const char *what) -> bool {
     if (nodes <= 1) return true;
+    const double hx0 = NowMs();
     ctp::GpuApi::Memcpy(host.data(), dev, host.size() * sizeof(float));
     if (!clio_bench_dist::AllGatherF32(*cte_x, x_tag, node, nodes,
                                        x_round++, host.data(), los[node],
@@ -1226,11 +1674,77 @@ int main(int argc, char **argv) {
       return false;
     }
     ctp::GpuApi::Memcpy(dev, host.data(), host.size() * sizeof(float));
+    lb_host_ms += NowMs() - hx0;
     return true;
   };
 
+  const auto lb_c0 = w.ReadStats(0);
+  // RESIDENT, ONE NODE: NO GENERATIONS, NO PUBLISH. Every block reads and
+  // writes the same frames of one shared cache and the phases are separate
+  // launches, so the frame IS the current weight; demanding generation s+1
+  // turned every read into a stale refetch and every update into a write-
+  // back of the whole 17 GB (6 x 69634 faults and puts in 5 steps). Across
+  // nodes the protocol stays: that is the communication. gen 0 = "any
+  // resident copy"; the update coroutines skip their flushes at gen 0.
+  const bool lean = (nodes == 1 && cap == 0);
+  const auto G = [&](u64 g) -> u64 { return lean ? 0 : g; };
+  // W1 IS NODE-PRIVATE. Its rows [h0, h1) are read (Fwd1) and written (Upd1)
+  // only by this node, and the cache holds them, so the frames are the
+  // weights: no generation, no per-step publish, at any node count. Only W2
+  // crosses nodes (every Bwd1 reads all of it) -- that is the exchange. The
+  // W1 publish was 17 GB of puts per step nobody read, and its generational
+  // re-read of this node's own rows is where DEVICE FATAL 7 (a get racing
+  // its own put) surfaced on 4 nodes. LBANN_W1_GEN=1 restores it.
+  const bool w1_gen = !lean && getenv("LBANN_W1_GEN") != nullptr;
+  const auto G1 = [&](u64 g) -> u64 { return w1_gen ? g : 0; };
+  // Upd1's per-block page table (see Upd1Coro): one pointer per page of a
+  // block's band. LBANN_UPD1_PAGED=1 keeps the page-by-page path.
+  const u64 u1tab_stride = (hper + rpp1 - 1) / rpp1;
+  float **d_u1tab = nullptr;
+  if (getenv("LBANN_UPD1_PAGED") == nullptr) {
+    d_u1tab = ctp::GpuApi::Malloc<float *>(static_cast<size_t>(blocks) *
+                                           u1tab_stride * sizeof(float *));
+  }
+  // Bwd1's node-wide W2 table (the default); LBANN_BWD1_BAND=1 or
+  // LBANN_BWD1_PAGED=1 select the older paths.
+  const u64 w2_np = (O + (rpp2 ? rpp2 : 1) - 1) / (rpp2 ? rpp2 : 1);
+  float **d_w2tab = nullptr;
+  if (getenv("LBANN_BWD1_BAND") == nullptr &&
+      getenv("LBANN_BWD1_PAGED") == nullptr) {
+    d_w2tab = ctp::GpuApi::Malloc<float *>(w2_np * sizeof(float *));
+  }
+  // MULTI-NODE BWD1 BY PARTIALS (the default at nodes > 1; LBANN_BWD1_PULL=1
+  // keeps the pull-every-W2-page path). W2 then never leaves its node, so it
+  // is node-private too: no generations, no publish.
+  const bool partial = nodes > 1 && d_w2tab != nullptr &&
+                       getenv("LBANN_BWD1_PULL") == nullptr;
+  const auto G2 = [&](u64 g) -> u64 { return partial ? 0 : G(g); };
+  float *d_d1p = nullptr;
+  std::vector<float> h_d1p;
+  std::vector<dist_u64> p_lo(nodes), p_hi(nodes);
+  if (partial) {
+    // Partial of d1 for EVERY h (by destination node), and the received
+    // slices: each node gets only its own rows from every peer.
+    d_d1p = ctp::GpuApi::Malloc<float>((H * B + H * B) * sizeof(float));
+    h_d1p.resize(static_cast<size_t>(2) * H * B);
+    for (u32 nd = 0; nd < nodes; ++nd) {
+      p_lo[nd] = static_cast<dist_u64>(nd) * H * B;
+      p_hi[nd] = p_lo[nd] + static_cast<dist_u64>(H) * B;
+    }
+  }
+  // Bwd1's per-block table: every W2 page (LBANN_BWD1_PAGED=1: page by page).
+  const u64 b1tab_stride = (O + (rpp2 ? rpp2 : 1) - 1) / (rpp2 ? rpp2 : 1);
+  float **d_b1tab = nullptr;
+  if (getenv("LBANN_BWD1_PAGED") == nullptr) {
+    d_b1tab = ctp::GpuApi::Malloc<float *>(static_cast<size_t>(blocks) *
+                                           b1tab_stride * sizeof(float *));
+  }
   const double t0 = NowMs();
+  // Per-phase wall time, for the E1 comparison against the baselines.
+  double ph[5] = {0, 0, 0, 0, 0};
   for (u64 s = 0; s < steps; ++s) {
+    {
+    const double pk = NowMs();
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       // Step s reads the weights the previous step published (gen s+1) and
@@ -1239,9 +1753,12 @@ int main(int argc, char **argv) {
       lb::LaunchFwd1(g, b, gpu, dw, w1_off, d_b1, I,
                                                   H, B, d_x, d_a1, hper, rpp1,
                                                   h0, h1,
-                                                  static_cast<u64>(s) + 1,
-                                                  vw, sv);
+                                                  G1(static_cast<u64>(s) + 1),
+                                                  vw, sv, d_u1tab, u1tab_stride);
     });
+    ctp::GpuApi::Synchronize();
+    ph[0] += NowMs() - pk;
+    }
     // Fwd2 sums over EVERY h, so it needs the whole a1, not this node's
     // band. Without this each node forward-propagates a fraction of the
     // hidden layer and the loss is quietly wrong rather than failing.
@@ -1250,20 +1767,99 @@ int main(int argc, char **argv) {
       std::fprintf(stderr, "LBANN ERROR: a1 gather failed\n");
       return 1;
     }
+    {
+    const double pk = NowMs();
+    if (partial && getenv("LBANN_FWD2_CORO") == nullptr) {
+      // Two-phase, like bwd1: resolve this node's (private) W2 pages, run
+      // the baselines' grid-wide kernel over them, release.
+      const u64 rp = rpp2 ? rpp2 : 1;
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        lb::LaunchW2Resolve(g, b, gpu, dw, w2_off, H, o1, rp, 0, d_w2tab, vw,
+                            sv, o0);
+      });
+      ctp::GpuApi::Synchronize();
+      lb::LaunchFwd2Tab(blocks, threads, d_w2tab, rp, o0, o1, H, O, B, d_b2,
+                        d_a1, d_y, d_d2, d_lp);
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        lb::LaunchW2Release(g, b, gpu, dw, w2_off, H, o1, rp, vw, sv, o0);
+      });
+    } else {
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchFwd2(g, b, gpu, dw, w2_off, d_b2, H,
                                                   O, B, d_a1, d_y, d_d2, d_lp,
                                                   oper, rpp2 ? rpp2 : 1, o0, o1,
-                                                  static_cast<u64>(s) + 1,
+                                                  G2(static_cast<u64>(s) + 1),
                                                   vw, sv);
     });
+    }
+    ctp::GpuApi::Synchronize();
+    ph[1] += NowMs() - pk;
+    }
     // Bwd1 sums over EVERY o, so d2 has to be whole before it runs.
     ctp::GpuApi::Synchronize();
     if (!gather(d_d2, h_d2, d2_lo, d2_hi, "lbd2")) {
       std::fprintf(stderr, "LBANN ERROR: d2 gather failed\n");
       return 1;
     }
+    {
+    const double pk = NowMs();
+    if (partial) {
+      // THE BASELINES' SCHEME: this node's o-partial of d1 over its OWN W2
+      // rows, the partials all-gathered and combined in node order. No W2
+      // page ever leaves its node; the exchange is H*B floats per node.
+      const u64 rp = rpp2 ? rpp2 : 1;
+      const u64 HB = H * B;
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        lb::LaunchW2Resolve(g, b, gpu, dw, w2_off, H, o1, rp, 0, d_w2tab, vw,
+                            sv, o0);
+      });
+      ctp::GpuApi::Synchronize();
+      lb::LaunchBwd1PartialTab(blocks, threads, d_w2tab, rp, o0, o1, H, B,
+                               d_d2, d_d1p);
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        lb::LaunchW2Release(g, b, gpu, dw, w2_off, H, o1, rp, vw, sv, o0);
+      });
+      ctp::GpuApi::Synchronize();
+      // SLICE EXCHANGE (every substrate does the same): node q needs only
+      // rows [q*hn, (q+1)*hn) of d1 -- Upd1 touches its own W1 rows and b1
+      // rows -- so each node sends each peer just that slice of its partial
+      // and combines the nodes' slices for its rows in node order, the same
+      // float order as the full combine.
+      const u64 hn = h1 - h0;
+      const double hx0 = NowMs();
+      ctp::GpuApi::Memcpy(h_d1p.data(), d_d1p, HB * sizeof(float));
+      if (!clio_bench_dist::SliceExchangeF32(*cte_x, x_tag, node, nodes,
+                                             x_round++, h_d1p.data(), hn * B,
+                                             h_d1p.data() + HB, "lbd1s")) {
+        std::fprintf(stderr, "LBANN ERROR: d1 slice exchange failed\n");
+        return 1;
+      }
+      ctp::GpuApi::Memcpy(d_d1p + HB, h_d1p.data() + HB,
+                          nodes * hn * B * sizeof(float));
+      lb_host_ms += NowMs() - hx0;
+      lb::LaunchBwd1Combine(blocks, threads, d_d1p + HB, nodes, hn * B,
+                            d_a1 + h0 * B, d_d1 + h0 * B);
+    } else if (d_w2tab != nullptr) {
+      const u64 bgen = G(static_cast<u64>(s) + 1);
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        lb::LaunchW2Resolve(g, b, gpu, dw, w2_off, H, O, rpp2 ? rpp2 : 1,
+                            bgen, d_w2tab, vw, sv, 0);
+      });
+      ctp::GpuApi::Synchronize();
+      lb::LaunchBwd1Tab(blocks, threads, d_w2tab, w2_np, rpp2 ? rpp2 : 1, O, H,
+                        B, h0, h1, d_a1, d_d2, d_d1);
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        lb::LaunchW2Release(g, b, gpu, dw, w2_off, H, O, rpp2 ? rpp2 : 1, vw,
+                            sv, 0);
+      });
+    } else
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchBwd1(g, b, gpu, dw, w2_off, H, O, B,
@@ -1274,30 +1870,44 @@ int main(int argc, char **argv) {
                                                   // step. Seed publishes 1, Upd2 at step s
                                                   // publishes s+2, so step s demands s+1.
                                                   o0, o1,
-                                                  static_cast<u64>(s) + 1, vw, sv);
+                                                  G(static_cast<u64>(s) + 1), vw, sv,
+                                                  d_b1tab, b1tab_stride);
     });
+    ctp::GpuApi::Synchronize();
+    ph[2] += NowMs() - pk;
+    }
     // b1 is computed from the WHOLE d1 on every node, so gather it before
     // the updates run.
     ctp::GpuApi::Synchronize();
-    if (!gather(d_d1, h_d1, a1_lo, a1_hi, "lbd1")) {
+    if (!partial && !gather(d_d1, h_d1, a1_lo, a1_hi, "lbd1")) {
       std::fprintf(stderr, "LBANN ERROR: d1 gather failed\n");
       return 1;
     }
+    {
+    const double pk = NowMs();
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchUpd2(g, b, gpu, dw, w2_off, d_b2, H,
                                                   O, B, d_a1, d_d2, lr, oper,
                                                   rpp2 ? rpp2 : 1, o0, o1,
-                                                  static_cast<u64>(s) + 2, vw, sv);
+                                                  G2(static_cast<u64>(s) + 2), vw, sv);
     });
+    ctp::GpuApi::Synchronize();
+    ph[3] += NowMs() - pk;
+    }
+    {
+    const double pk = NowMs();
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       lb::LaunchUpd1(g, b, gpu, dw, w1_off, d_b1, I,
                                                   H, B, d_x, d_d1, lr, hper,
                                                   rpp1, h0, h1,
-                                                  static_cast<u64>(s) + 2,
-                                                  vw, sv);
+                                                  G1(static_cast<u64>(s) + 2),
+                                                  vw, sv, d_u1tab, u1tab_stride);
     });
+    ctp::GpuApi::Synchronize();
+    ph[4] += NowMs() - pk;
+    }
     ctp::GpuApi::Synchronize();
     // Each node summed only its own o-band; the loss is over the whole
     // output layer, so the partials are combined before the divide.
@@ -1343,6 +1953,21 @@ int main(int argc, char **argv) {
     // peer's. That is real work, not a line here.
   }
   const double t_paged = NowMs() - t0;
+  std::printf("  phases per step (ms): fwd1=%.1f fwd2=%.1f bwd1=%.1f "
+              "upd2=%.1f upd1=%.1f\n", ph[0] / steps, ph[1] / steps,
+              ph[2] / steps, ph[3] / steps, ph[4] / steps);
+  {
+    clio_gv_bench::CommAcc lb_comm;
+    lb_comm.Add(lb_c0, w.ReadStats(0));
+    lb_comm.AddHost(lb_host_ms);
+    lb_comm.Print("lbann", t_paged);
+  }
+  if ((lean || !w1_gen) && w.ReadStats(0).evicts != 0) {
+    std::fprintf(stderr, "LBANN ERROR: resident single-node run evicted "
+                 "%llu frames; its updates were not published\n",
+                 (unsigned long long)w.ReadStats(0).evicts);
+    return 1;
+  }
   // VERIFICATION IS BY OWNER, FROM RESIDENT FRAMES. The old sequence --
   // publish, barrier, invalidate, refault the WHOLE vector -- turned the
   // verifier into a cross-node reader of blobs that have been re-put every

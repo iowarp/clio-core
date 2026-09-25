@@ -30,6 +30,7 @@
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 #include <clio_cte/core/core_client.h>
 #include "../bench_flush_data.h"
+#include "../gv_comm_report.h"
 #include <clio_cte/gpu_vector/gpu_vector.h>
 #include "md_launch.h"
 #include <clio_ctp/util/gpu_api.h>
@@ -704,6 +705,20 @@ __device__ inline void PublishRowStencil(MdTables &t, u32 nb, u32 by,
   __syncthreads();
 }
 
+// GLOBAL, SAID OUT LOUD: the tables (the persist arena is global memory on
+// SYCL), the held spans and the list pages are all global, but a pointer
+// loaded from a table is generic to IGC. Cast at each use, never stored.
+#if CTP_ENABLE_SYCL && defined(__SYCL_DEVICE_ONLY__)
+template <typename T>
+CTP_GPU_FUN inline auto MdGl(T *p) {
+  return ::sycl::address_space_cast<::sycl::access::address_space::global_space,
+                                    ::sycl::access::decorated::yes>(p);
+}
+#else
+template <typename T>
+CTP_GPU_FUN inline T *MdGl(T *p) { return p; }
+#endif
+
 /**
  * The candidate scan for one row: every thread takes row slots in stride,
  * walks the nine stencil rows' bins, and writes its entries into the held
@@ -744,7 +759,7 @@ __device__ inline void FillListRow(const MdTables &t, u32 nb, u32 cap,
   }
   for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
     const u64 e = off4 + s * kStride;
-    const float *const ip = (e < run4) ? ip0 + e : ip1 + (e - run4);
+    const auto ip = MdGl((e < run4) ? ip0 + e : ip1 + (e - run4));
     if (ip[3] < 0.0f) {
       d_cnt[slotbase + s] = 0;
       continue;
@@ -766,7 +781,7 @@ __device__ inline void FillListRow(const MdTables &t, u32 nb, u32 cap,
         const float *const qp1 = t.sp1[spq];
         for (u32 sj = 0; sj < cap; ++sj) {
           const u64 ej = qo + jb + static_cast<u64>(sj) * kStride;
-          const float *const jp = (ej < rq) ? qp0 + ej : qp1 + (ej - rq);
+          const auto jp = MdGl((ej < rq) ? qp0 + ej : qp1 + (ej - rq));
           if (jp[3] < 0.0f) continue;
           if (q == 4 && jbx == bx && sj == s % cap) continue;
           float ddx = xi - jp[0];
@@ -902,6 +917,151 @@ __device__ __attribute__((noinline)) void BuildListCoro(gv::DeviceVector<float> 
     ReleaseSpans(span_guards);
     CO_AWAIT(EndChunkFlushCoro(nl));
   }
+}
+
+
+// THE PAIR LOOP, OUT OF LINE AND GLOBAL (see the kmeans, grayscott and gmx
+// editions). Inline in ListForceCoro it shared the coroutine's registers,
+// and every load in it -- the span and list pointers staged in the persist
+// arena (global memory on SYCL), the neighbour positions behind them, the
+// list entries -- went through a pointer IGC could not prove global: a
+// generic-address check and a divergent branch per load. Same arithmetic,
+// same order, same results as the inline loop it replaces.
+// (MdGl: defined above FillListRow.)
+
+struct MdAcc3 {
+  double pe;
+  double w;
+  double n;
+};
+
+__device__ __attribute__((noinline)) MdAcc3 ListPairsRow(
+    const MdTables *tb, u32 nguards, float *fp0, float *fp1, u64 frun0,
+    const u32 *d_cnt, u64 slotbase, u64 islots, int nocompute, int eflag,
+    float box, float halfL, float c2, u64 row_elems) {
+  const auto T = MdGl(tb);
+  double pe = 0.0;
+  double w = 0.0;
+  double npairs = 0.0;
+  // FAST PATH: every stencil row inside one span and the row's list in one
+  // guard (pages holding whole rows: --page-kb 285 / --nl-page-kb 1710 on
+  // the 160-lattice deck). Then a neighbour is qbase[q] + slot, one load --
+  // the baselines' shape -- instead of span/offset/run lookups per pair.
+  if (threadIdx.x == 0) {
+    auto W = MdGl(const_cast<MdTables *>(tb));
+    u32 flat = (nguards == 1u && W->gs[0] == 0u) ? 1u : 0u;
+    for (u32 q = 0; q < 9u; ++q) {
+      const u32 spq = W->qspan[q];
+      const u64 qo = W->qoff[q];
+      if (qo + row_elems <= W->srun[spq]) {
+        W->qbase[q] = W->sp0[spq] + qo;
+      } else {
+        flat = 0u;
+      }
+    }
+    W->qflat = flat;
+  }
+  __syncthreads();
+  if (T->qflat != 0u) {
+    const auto NP = MdGl(T->np[0]);
+    const auto ipr = MdGl(T->qbase[4]);
+    for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
+      const auto ip = ipr + s * kStride;
+      if (ip[3] < 0.0f) continue;
+      const float xi = ip[0];
+      const float yi = ip[1];
+      const float zi = ip[2];
+      const u32 cnt = nocompute ? 0u : MdGl(d_cnt)[slotbase + s];
+      float fx = 0.0f;
+      float fy = 0.0f;
+      float fz = 0.0f;
+      for (u32 k = 0; k < cnt; ++k) {
+        const u32 ent =
+            static_cast<u32>(NP[static_cast<u64>(k) * islots + s]);
+        const auto jp = MdGl(T->qbase[ent >> 16] +
+                             static_cast<u64>(ent & 0xffffu) * kStride);
+        float ddx = xi - jp[0];
+        float ddy = yi - jp[1];
+        float ddz = zi - jp[2];
+        if (ddx > halfL) ddx -= box; else if (ddx < -halfL) ddx += box;
+        if (ddy > halfL) ddy -= box; else if (ddy < -halfL) ddy += box;
+        if (ddz > halfL) ddz -= box; else if (ddz < -halfL) ddz += box;
+        const float rsq = ddx * ddx + ddy * ddy + ddz * ddz;
+        if (rsq >= c2) continue;
+        const float r2i = 1.0f / rsq;
+        const float r6i = r2i * r2i * r2i;
+        const float fpair = r6i * (48.0f * r6i - 24.0f) * r2i;
+        fx = __fmaf_rn(ddx, fpair, fx);
+        fy = __fmaf_rn(ddy, fpair, fy);
+        fz = __fmaf_rn(ddz, fpair, fz);
+        if (eflag) {
+          pe += 0.5 * static_cast<double>(4.0f * r6i * (r6i - 1.0f));
+          w += 0.5 * static_cast<double>(r6i * (48.0f * r6i - 24.0f));
+          npairs += 1.0;
+        }
+      }
+      const u64 fe = s * kStride;
+      const auto op = MdGl((fe < frun0) ? fp0 + fe : fp1 + (fe - frun0));
+      op[0] = fx;
+      op[1] = fy;
+      op[2] = fz;
+    }
+    return MdAcc3{pe, w, npairs};
+  }
+  const u32 sp4 = T->qspan[4];
+  const u64 off4 = T->qoff[4];
+  const u64 run4 = T->srun[sp4];
+  const float *const ip0 = T->sp0[sp4];
+  const float *const ip1 = T->sp1[sp4];
+  for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
+    const u64 e = off4 + s * kStride;
+    const auto ip = MdGl((e < run4) ? ip0 + e : ip1 + (e - run4));
+    if (ip[3] < 0.0f) continue;
+    const float xi = ip[0];
+    const float yi = ip[1];
+    const float zi = ip[2];
+    const u32 cnt = nocompute ? 0u : MdGl(d_cnt)[slotbase + s];
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float fz = 0.0f;
+    u32 gi = 0;
+    for (u32 k = 0; k < cnt; ++k) {
+      const u64 o = static_cast<u64>(k) * islots + s;
+      while (gi + 1 < nguards && o >= T->gs[gi] + T->gl[gi]) ++gi;
+      const u32 ent = static_cast<u32>(MdGl(T->np[gi])[o - T->gs[gi]]);
+      const u32 q = ent >> 16;
+      const u32 spq = T->qspan[q];
+      const u64 ej = T->qoff[q] + static_cast<u64>(ent & 0xffffu) * kStride;
+      const u64 rq = T->srun[spq];
+      const auto jp =
+          MdGl((ej < rq) ? T->sp0[spq] + ej : T->sp1[spq] + (ej - rq));
+      float ddx = xi - jp[0];
+      float ddy = yi - jp[1];
+      float ddz = zi - jp[2];
+      if (ddx > halfL) ddx -= box; else if (ddx < -halfL) ddx += box;
+      if (ddy > halfL) ddy -= box; else if (ddy < -halfL) ddy += box;
+      if (ddz > halfL) ddz -= box; else if (ddz < -halfL) ddz += box;
+      const float rsq = ddx * ddx + ddy * ddy + ddz * ddz;
+      if (rsq >= c2) continue;
+      const float r2i = 1.0f / rsq;
+      const float r6i = r2i * r2i * r2i;
+      const float fpair = r6i * (48.0f * r6i - 24.0f) * r2i;
+      fx = __fmaf_rn(ddx, fpair, fx);
+      fy = __fmaf_rn(ddy, fpair, fy);
+      fz = __fmaf_rn(ddz, fpair, fz);
+      if (eflag) {
+        pe += 0.5 * static_cast<double>(4.0f * r6i * (r6i - 1.0f));
+        w += 0.5 * static_cast<double>(r6i * (48.0f * r6i - 24.0f));
+        npairs += 1.0;
+      }
+    }
+    const u64 fe = s * kStride;
+    const auto op = MdGl((fe < frun0) ? fp0 + fe : fp1 + (fe - frun0));
+    op[0] = fx;
+    op[1] = fy;
+    op[2] = fz;
+  }
+  return MdAcc3{pe, w, npairs};
 }
 
 /**
@@ -1177,60 +1337,13 @@ __device__ CLIO_COROC_INLINE void ListForceCoro(gv::DeviceVector<float> x,
     __syncthreads();
     if (threadIdx.x == 0) atomicAdd(&MdG().md_cyc[2], (unsigned long long)(clock64() - _l0));
     const long long _p0 = clock64();
-    const u64 slotbase = row * islots;
-    const u32 sp4 = s_qspan[4];
-    const u64 off4 = s_qoff[4];
-    const u64 run4 = s_srun[sp4];
-    const float *const ip0 = s_sp0[sp4];
-    const float *const ip1 = s_sp1[sp4];
-    for (u64 s = threadIdx.x; s < islots; s += blockDim.x) {
-      const u64 e = off4 + s * kStride;
-      const float *const ip = (e < run4) ? ip0 + e : ip1 + (e - run4);
-      if (ip[3] < 0.0f) continue;
-      const float xi = ip[0];
-      const float yi = ip[1];
-      const float zi = ip[2];
-      const u32 cnt = nocompute ? 0u : d_cnt[slotbase + s];
-      float fx = 0.0f;
-      float fy = 0.0f;
-      float fz = 0.0f;
-      u32 gi = 0;
-      for (u32 k = 0; k < cnt; ++k) {
-        const u64 o = static_cast<u64>(k) * islots + s;
-        while (gi + 1 < nguards && o >= s_gs[gi] + s_gl[gi]) ++gi;
-        const u32 ent = static_cast<u32>(s_np[gi][o - s_gs[gi]]);
-        const u32 q = ent >> 16;
-        const u32 spq = s_qspan[q];
-        const u64 ej = s_qoff[q] +
-                       static_cast<u64>(ent & 0xffffu) * kStride;
-        const u64 rq = s_srun[spq];
-        const float *const jp =
-            (ej < rq) ? s_sp0[spq] + ej : s_sp1[spq] + (ej - rq);
-        float ddx = xi - jp[0];
-        float ddy = yi - jp[1];
-        float ddz = zi - jp[2];
-        if (ddx > halfL) ddx -= box; else if (ddx < -halfL) ddx += box;
-        if (ddy > halfL) ddy -= box; else if (ddy < -halfL) ddy += box;
-        if (ddz > halfL) ddz -= box; else if (ddz < -halfL) ddz += box;
-        const float rsq = ddx * ddx + ddy * ddy + ddz * ddz;
-        if (rsq >= c2) continue;
-        const float r2i = 1.0f / rsq;
-        const float r6i = r2i * r2i * r2i;
-        const float fpair = r6i * (48.0f * r6i - 24.0f) * r2i;
-        fx = __fmaf_rn(ddx, fpair, fx);
-        fy = __fmaf_rn(ddy, fpair, fy);
-        fz = __fmaf_rn(ddz, fpair, fz);
-        if (eflag) {
-          pe += 0.5 * static_cast<double>(4.0f * r6i * (r6i - 1.0f));
-          w += 0.5 * static_cast<double>(r6i * (48.0f * r6i - 24.0f));
-          npairs += 1.0;
-        }
-      }
-      const u64 fe = s * kStride;
-      float *const op = (fe < frun0) ? fp0 + fe : fp1 + (fe - frun0);
-      op[0] = fx;
-      op[1] = fy;
-      op[2] = fz;
+    {
+      const MdAcc3 pr = ListPairsRow(
+          &s_tbl, nguards, fp0, fp1, frun0, d_cnt, row * islots, islots,
+          nocompute, eflag, box, halfL, c2, row_elems);
+      pe += pr.pe;
+      w += pr.w;
+      npairs += pr.n;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -1277,6 +1390,83 @@ __device__ CLIO_COROC_INLINE void ListForceCoro(gv::DeviceVector<float> x,
       __syncthreads();
     }
   }
+}
+
+/**
+ * TWO-PHASE FORCE / LIST BUILD (MD_TWO_PHASE=1; single node, resident, pages
+ * of whole rows). Grayscott's cure for the same disease: the paging work --
+ * fetch, hold, pin -- runs ONCE per row in this short coroutine and leaves a
+ * pointer per row in three device tables; the force and the list build then
+ * run as the baselines' own plain kernels through those tables, with no
+ * span/offset/guard bookkeeping per neighbour. RowsReleaseCoro gives the pins
+ * back. x: every row (the stencil reaches all planes on one node); f and nl:
+ * every row. Each page is resolved by exactly one block.
+ *
+ * @param x_pe, nl_pe elements per page; x_pe is a multiple of row_elems and
+ *                    nl_pe of rowlist (checked by the host)
+ */
+__device__ CLIO_COROC_INLINE void RowsResolveCoro(
+    gv::DeviceVector<float> x, gv::DeviceVector<float> f,
+    gv::DeviceVector<int> nl, u64 nrows, u64 row_elems, u64 rowlist,
+    u64 x_pe, u64 nl_pe, u32 want_f, u32 nl_write, const float **xtab,
+    float **ftab, int **nltab, u32 nblocks, u32 block) {
+  const u64 xn = nrows * row_elems;
+  for (u64 lo = static_cast<u64>(block) * x_pe; lo < xn;
+       lo += static_cast<u64>(nblocks) * x_pe) {
+    const u64 cnt = (lo + x_pe < xn) ? x_pe : (xn - lo);
+    CO_AWAIT(x.CoFetch(0, lo, cnt));
+    auto hx = CO_AWAIT(x.CoHoldPage(lo, cnt, /*write=*/false));
+    if (threadIdx.x == 0) {
+      for (u64 r = lo / row_elems; r < (lo + cnt) / row_elems; ++r) {
+        xtab[r] = hx.ptr() + (r * row_elems - hx.begin_off());
+      }
+    }
+    if (want_f != 0u) {
+      CO_AWAIT(f.CoFetch(0, lo, cnt));
+      auto hf = CO_AWAIT(f.CoHoldPage(lo, cnt, /*write=*/true));
+      if (threadIdx.x == 0) {
+        for (u64 r = lo / row_elems; r < (lo + cnt) / row_elems; ++r) {
+          ftab[r] = hf.ptr() + (r * row_elems - hf.begin_off());
+        }
+      }
+    }
+  }
+  const u64 nn = nrows * rowlist;
+  for (u64 lo = static_cast<u64>(block) * nl_pe; lo < nn;
+       lo += static_cast<u64>(nblocks) * nl_pe) {
+    const u64 cnt = (lo + nl_pe < nn) ? nl_pe : (nn - lo);
+    CO_AWAIT(nl.CoFetch(0, lo, cnt));
+    auto hn = CO_AWAIT(nl.CoHoldPage(lo, cnt, nl_write != 0u));
+    if (threadIdx.x == 0) {
+      for (u64 r = lo / rowlist; r < (lo + cnt) / rowlist; ++r) {
+        nltab[r] = hn.ptr() + (r * rowlist - hn.begin_off());
+      }
+    }
+  }
+  __syncthreads();
+}
+
+/** Give back what RowsResolveCoro pinned (same pages, same blocks). */
+// Not suspending (like HaloUnpinCoro): run through CLIO_COROC_RUN without
+// a coroutine context.
+__device__ inline void RowsReleaseCoro(
+    gv::DeviceVector<float> x, gv::DeviceVector<float> f,
+    gv::DeviceVector<int> nl, u64 nrows, u64 row_elems, u64 rowlist,
+    u64 x_pe, u64 nl_pe, u32 want_f, u32 nblocks, u32 block) {
+  const u64 xn = nrows * row_elems;
+  for (u64 lo = static_cast<u64>(block) * x_pe; lo < xn;
+       lo += static_cast<u64>(nblocks) * x_pe) {
+    const u64 cnt = (lo + x_pe < xn) ? x_pe : (xn - lo);
+    x.UnpinRange(lo, cnt);
+    if (want_f != 0u) f.UnpinRange(lo, cnt);
+  }
+  const u64 nn = nrows * rowlist;
+  for (u64 lo = static_cast<u64>(block) * nl_pe; lo < nn;
+       lo += static_cast<u64>(nblocks) * nl_pe) {
+    const u64 cnt = (lo + nl_pe < nn) ? nl_pe : (nn - lo);
+    nl.UnpinRange(lo, cnt);
+  }
+  __syncthreads();
 }
 
 /**
@@ -2298,7 +2488,9 @@ void LaunchReadProbe(dim3 grid,
     gv::DeviceVector<float> x_ = x;
     x_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
     CLIO_COROC_RUN(yv, ys, ReadProbeCoro(_cy, x_, passes, nblocks, yv.Block()));
+    x_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2332,7 +2524,11 @@ void LaunchIntegrate(dim3 grid,
     gv::DeviceVector<float> third_ = third;
     third_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
+    v_.CommSegmentBegin();   // every vector: a flush or fetch on it times from this segment
+    third_.CommSegmentBegin();   // every vector: a flush or fetch on it times from this segment
     CLIO_COROC_RUN(yv, ys, IntegrateCoro(_cy, x_, v_, third_, use_third, dt, gx, gy_, gz, drift, pg_lo, pg_hi, nblocks, yv.Block()));
+    x_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2362,7 +2558,10 @@ void LaunchPublishSlab(dim3 grid,
     gv::DeviceVector<float> v_ = v;
     v_.Init(tbl_base + yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
+    v_.CommSegmentBegin();   // every vector: a flush or fetch on it times from this segment
     CLIO_COROC_RUN(yv, ys, PublishSlabCoro(_cy, x_, v_, nb, cap, z0, z1, gen, halo_first, nblocks, yv.Block()));
+    x_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2387,7 +2586,9 @@ void LaunchHaloPin(dim3 grid,
     gv::DeviceVector<float> x_ = x;
     x_.Init(tbl_base + yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
     CLIO_COROC_RUN(yv, ys, HaloPinCoro(_cy, x_, nb, cap, z0, z1, gen, yv.Block()));
+    x_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2411,7 +2612,9 @@ void LaunchRefaultWrite(dim3 grid,
     gv::DeviceVector<float> x_ = x;
     x_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
     CLIO_COROC_RUN(yv, ys, RefaultWriteCoro(_cy, x_, pg_lo, pg_hi, round, ppp, nblocks, yv.Block()));
+    x_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2438,7 +2641,9 @@ void LaunchRefaultVerify(dim3 grid,
     gv::DeviceVector<float> x_ = x;
     x_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
     CLIO_COROC_RUN(yv, ys, RefaultVerifyCoro(_cy, x_, pg_lo, pg_hi, round, ppp, below_pg, above_pg, nblocks, yv.Block(), d_out));
+    x_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2490,7 +2695,10 @@ void LaunchThermo(dim3 grid,
     gv::DeviceVector<float> v_ = v;
     v_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
+    v_.CommSegmentBegin();   // every vector: a flush or fetch on it times from this segment
     CLIO_COROC_RUN(yv, ys, ThermoCoro(_cy, x_, v_, out, nb, cap, z0, z1, nblocks, yv.Block()));
+    x_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2523,7 +2731,10 @@ void LaunchForce(dim3 grid,
     gv::DeviceVector<float> f_ = f;
     f_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
+    f_.CommSegmentBegin();   // every vector: a flush or fetch on it times from this segment
     CLIO_COROC_RUN(yv, ys, ForceCoro(_cy, x_, f_, nb, cap, box, cutoff, eflag, acc, z0, z1, nblocks, yv.Block(), hgen, force_all));
+    x_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2557,8 +2768,299 @@ void LaunchBuildList(dim3 grid,
     gv::DeviceVector<int> nl_ = nl;
     nl_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
+    nl_.CommSegmentBegin();   // every vector: a flush or fetch on it times from this segment
     CLIO_COROC_RUN(yv, ys, BuildListCoro(_cy, x_, nl_, nb, cap, box, rlist, maxneigh, d_cnt, d_err, rowchunk, z0, z1, nblocks, yv.Block(), hgen));
+    x_.CommStamp(3, gv_seg0);
   });
+}
+
+void LaunchRowsResolve(dim3 grid, dim3 block, gv::DeviceVector<float> x,
+                       gv::DeviceVector<float> f, gv::DeviceVector<int> nl,
+                       u64 nrows, u64 row_elems, u64 rowlist, u64 x_pe,
+                       u64 nl_pe, u32 want_f, u32 nl_write, const float **xtab,
+                       float **ftab, int **nltab, u32 nblocks,
+                       gy::YieldableView<> yv, gy::YieldStackView ys) {
+  Submit(grid, block, [=]() {
+    gv::DeviceVector<float> x_ = x;
+    x_.Init(yv.Block());
+    gv::DeviceVector<float> f_ = f;
+    f_.Init(yv.Block());
+    gv::DeviceVector<int> nl_ = nl;
+    nl_.Init(yv.Block());
+    __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
+    f_.CommSegmentBegin();
+    nl_.CommSegmentBegin();
+    CLIO_COROC_RUN(yv, ys, RowsResolveCoro(_cy, x_, f_, nl_, nrows, row_elems, rowlist, x_pe, nl_pe, want_f, nl_write, xtab, ftab, nltab, nblocks, yv.Block()));
+    x_.CommStamp(3, gv_seg0);
+  });
+}
+
+void LaunchRowsRelease(dim3 grid, dim3 block, gv::DeviceVector<float> x,
+                       gv::DeviceVector<float> f, gv::DeviceVector<int> nl,
+                       u64 nrows, u64 row_elems, u64 rowlist, u64 x_pe,
+                       u64 nl_pe, u32 want_f, u32 nblocks,
+                       gy::YieldableView<> yv, gy::YieldStackView ys) {
+  Submit(grid, block, [=]() {
+    gv::DeviceVector<float> x_ = x;
+    x_.Init(yv.Block());
+    gv::DeviceVector<float> f_ = f;
+    f_.Init(yv.Block());
+    gv::DeviceVector<int> nl_ = nl;
+    nl_.Init(yv.Block());
+    __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
+    f_.CommSegmentBegin();
+    nl_.CommSegmentBegin();
+    CLIO_COROC_RUN(yv, ys, RowsReleaseCoro(x_, f_, nl_, nrows, row_elems, rowlist, x_pe, nl_pe, want_f, nblocks, yv.Block()));
+    x_.CommStamp(3, gv_seg0);
+  });
+}
+
+/** NO CAST IN THE PLAIN KERNELS. In an ordinary kernel IGC already knows
+ *  these pointers are global and loads straight through them; an explicit
+ *  address_space_cast there is lowered to pointer canonicalisation (a
+ *  shl/asr pair on the address's high word before every load) -- measured
+ *  as 1.7e9 extra ALU1 instructions, half the thread occupancy and 2x the
+ *  baselines' force time. The cast pays only inside the coroutine kernels,
+ *  where pointers arrive through frames and would otherwise be generic. */
+template <typename T>
+inline T *MdPlain(T *p) { return p; }
+
+/** MD_TP_OWNQ: device milliseconds of the force-tab kernel, summed. */
+double g_tp_dev_ms = 0.0;
+
+/** Diagnostic (MD_TP_DENSE=2): copy int list rows into a contiguous buffer. */
+void LaunchCopyRowsI(u32 blocks, u32 threads, int *const *tab, int *dense,
+                     u64 row_elems, u64 nrows) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t g = static_cast<size_t>(blocks) * threads;
+  q.parallel_for(sycl::nd_range<1>(g, threads), [=](sycl::nd_item<1> it) {
+     for (u64 r = it.get_group(0); r < nrows; r += blocks) {
+       const auto src = MdGl(tab[r]);
+       const auto dst = MdGl(dense + r * row_elems);
+       for (u64 e = it.get_local_id(0); e < row_elems; e += threads) dst[e] = src[e];
+     }
+   }).wait();
+}
+/** Diagnostic: copy contiguous f rows back into the paged frames. */
+void LaunchCopyRowsBack(u32 blocks, u32 threads, float *const *tab,
+                        const float *dense, u64 row_elems, u64 nrows) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t g = static_cast<size_t>(blocks) * threads;
+  q.parallel_for(sycl::nd_range<1>(g, threads), [=](sycl::nd_item<1> it) {
+     for (u64 r = it.get_group(0); r < nrows; r += blocks) {
+       const auto dst = MdGl(tab[r]);
+       const auto src = MdGl(dense + r * row_elems);
+       for (u64 e = it.get_local_id(0); e < row_elems; e += threads) dst[e] = src[e];
+     }
+   }).wait();
+}
+
+/** Diagnostic (MD_TP_DENSE): gather every x row into one contiguous buffer. */
+void LaunchCopyRows(u32 blocks, u32 threads, const float *const *xtab,
+                    float *dense, u64 row_elems, u64 nrows) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t g = static_cast<size_t>(blocks) * threads;
+  q.parallel_for(sycl::nd_range<1>(g, threads), [=](sycl::nd_item<1> it) {
+     for (u64 r = it.get_group(0); r < nrows; r += blocks) {
+       const auto src = MdGl(xtab[r]);
+       const auto dst = MdGl(dense + r * row_elems);
+       for (u64 e = it.get_local_id(0); e < row_elems; e += threads) dst[e] = src[e];
+     }
+   }).wait();
+}
+
+/** The baselines' ListForceKernel, row by row through the row tables. */
+void LaunchListForceTab(u32 blocks, u32 threads, const float *const *xtab,
+                        float *const *ftab, int *const *nltab,
+                        const u32 *d_cnt, u32 nb, u32 cap, float box,
+                        float cutoff, int eflag, double *acc, int nocompute,
+                        u32 rowchunk) {
+  // MD_TP_OWNQ=1: a private in-order, profiled queue -- off the shared
+  // SyclQueue the runtime's worker threads also submit to -- and the
+  // kernel's DEVICE time accumulated for the report (g_tp_dev_ms).
+  static const bool ownq = std::getenv("MD_TP_OWNQ") != nullptr;
+  static sycl::queue pq{ctp::GpuApi::SyclQueue().get_context(),
+                        ctp::GpuApi::SyclQueue().get_device(),
+                        {sycl::property::queue::in_order{},
+                         sycl::property::queue::enable_profiling{}}};
+  auto &q = ownq ? pq : ctp::GpuApi::SyclQueue();
+  const size_t g = static_cast<size_t>(blocks) * threads;
+  sycl::event ev = q.submit([&](sycl::handler &h) {
+     sycl::local_accessor<const float *, 1> qptr(9, h);
+     h.parallel_for(sycl::nd_range<1>(g, threads), [=](sycl::nd_item<1> it) {
+       const u32 tid = it.get_local_id(0);
+       const u64 islots = static_cast<u64>(nb) * cap;
+       const u64 row_elems = islots * kStride;
+       const u64 nrows = static_cast<u64>(nb) * nb;
+       const float c2 = cutoff * cutoff;
+       const float halfL = 0.5f * box;
+       double pe = 0.0, w = 0.0, npairs = 0.0;
+       // THE BASELINES' ORDER: a work-group takes `rowchunk` consecutive
+       // rows of one plane, so the stencil rows around them are re-read
+       // from cache rather than fetched once per row (18 row reads per 4
+       // rows instead of 36).
+       const u32 cpz = (nb + rowchunk - 1) / rowchunk;
+       const u64 nchunks = static_cast<u64>(nb) * cpz;
+       (void)nrows;
+       for (u64 ch = it.get_group(0); ch < nchunks; ch += blocks) {
+       const u32 bz = static_cast<u32>(ch / cpz);
+       const u32 y0 = static_cast<u32>(ch % cpz) * rowchunk;
+       const u32 yend = (y0 + rowchunk < nb) ? (y0 + rowchunk) : nb;
+       for (u32 by = y0; by < yend; ++by) {
+         const u64 row = static_cast<u64>(bz) * nb + by;
+         if (tid == 0) {
+           for (int dz = -1; dz <= 1; ++dz) {
+             for (int dy = -1; dy <= 1; ++dy) {
+               const u32 wz = (bz + nb + dz) % nb;
+               const u32 wy = (by + nb + dy) % nb;
+               qptr[(dz + 1) * 3 + (dy + 1)] =
+                   xtab[static_cast<u64>(wz) * nb + wy];
+             }
+           }
+         }
+         const auto fp = MdPlain(ftab[row]);
+         for (u64 e = tid; e < row_elems; e += threads) fp[e] = 0.0f;
+         sycl::group_barrier(it.get_group());
+         const auto np = MdPlain(nltab[row]);
+         const u64 slotbase = row * islots;
+         const auto ip_row = MdPlain(qptr[4]);
+         for (u64 s = tid; s < islots; s += threads) {
+           const auto ip = ip_row + s * kStride;
+           if (ip[3] < 0.0f) continue;
+           const float xi = ip[0], yi = ip[1], zi = ip[2];
+           const u32 n = nocompute ? 0u : MdPlain(d_cnt)[slotbase + s];
+           float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+           for (u32 k = 0; k < n; ++k) {
+             const u32 ent = static_cast<u32>(np[static_cast<u64>(k) * islots + s]);
+             const auto jp = MdPlain(qptr[ent >> 16] +
+                                  static_cast<u64>(ent & 0xffffu) * kStride);
+             float ddx = xi - jp[0];
+             float ddy = yi - jp[1];
+             float ddz = zi - jp[2];
+             if (ddx > halfL) ddx -= box; else if (ddx < -halfL) ddx += box;
+             if (ddy > halfL) ddy -= box; else if (ddy < -halfL) ddy += box;
+             if (ddz > halfL) ddz -= box; else if (ddz < -halfL) ddz += box;
+             const float rsq = ddx * ddx + ddy * ddy + ddz * ddz;
+             if (rsq >= c2) continue;
+             const float r2i = 1.0f / rsq;
+             const float r6i = r2i * r2i * r2i;
+             const float fpair = r6i * (48.0f * r6i - 24.0f) * r2i;
+             fx = sycl::fma(ddx, fpair, fx);
+             fy = sycl::fma(ddy, fpair, fy);
+             fz = sycl::fma(ddz, fpair, fz);
+             if (eflag) {
+               pe += 0.5 * static_cast<double>(4.0f * r6i * (r6i - 1.0f));
+               w += 0.5 * static_cast<double>(r6i * (48.0f * r6i - 24.0f));
+               npairs += 1.0;
+             }
+           }
+           const auto op = fp + s * kStride;
+           op[0] = fx; op[1] = fy; op[2] = fz;
+         }
+         sycl::group_barrier(it.get_group());
+       }
+       }
+       if (eflag) {
+         const double vals[3] = {pe, w, npairs};
+         for (int k = 0; k < 3; ++k) {
+           const double t = sycl::reduce_over_group(it.get_group(), vals[k],
+                                                    sycl::plus<double>());
+           if (tid == 0) {
+             sycl::atomic_ref<double, sycl::memory_order::relaxed,
+                              sycl::memory_scope::device,
+                              sycl::access::address_space::global_space>(acc[k])
+                 .fetch_add(t);
+           }
+         }
+       }
+     });
+   });
+  ev.wait();
+  if (ownq) {
+    const auto t0 = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+    const auto t1 = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+    g_tp_dev_ms += static_cast<double>(t1 - t0) * 1e-6;
+  }
+}
+
+/** The baselines' BuildListKernel, row by row through the row tables. */
+void LaunchBuildListTab(u32 blocks, u32 threads, const float *const *xtab,
+                        int *const *nltab, u32 *d_cnt, int *d_err, u32 nb,
+                        u32 cap, float box, float rlist, u32 maxneigh,
+                        u32 rowchunk) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t g = static_cast<size_t>(blocks) * threads;
+  q.submit([&](sycl::handler &h) {
+     sycl::local_accessor<const float *, 1> qptr(9, h);
+     h.parallel_for(sycl::nd_range<1>(g, threads), [=](sycl::nd_item<1> it) {
+       const u32 tid = it.get_local_id(0);
+       const u64 islots = static_cast<u64>(nb) * cap;
+       const u64 nrows = static_cast<u64>(nb) * nb;
+       const float r2list = rlist * rlist;
+       const float halfL = 0.5f * box;
+       const u32 cpz = (nb + rowchunk - 1) / rowchunk;   // baselines' order
+       const u64 nchunks = static_cast<u64>(nb) * cpz;
+       (void)nrows;
+       for (u64 ch = it.get_group(0); ch < nchunks; ch += blocks) {
+       const u32 bz = static_cast<u32>(ch / cpz);
+       const u32 y0 = static_cast<u32>(ch % cpz) * rowchunk;
+       const u32 yend = (y0 + rowchunk < nb) ? (y0 + rowchunk) : nb;
+       for (u32 by = y0; by < yend; ++by) {
+         const u64 row = static_cast<u64>(bz) * nb + by;
+         if (tid == 0) {
+           for (int dz = -1; dz <= 1; ++dz) {
+             for (int dy = -1; dy <= 1; ++dy) {
+               const u32 wz = (bz + nb + dz) % nb;
+               const u32 wy = (by + nb + dy) % nb;
+               qptr[(dz + 1) * 3 + (dy + 1)] =
+                   xtab[static_cast<u64>(wz) * nb + wy];
+             }
+           }
+         }
+         sycl::group_barrier(it.get_group());
+         const auto np = MdPlain(nltab[row]);
+         const u64 slotbase = row * islots;
+         const auto ip_row = MdPlain(qptr[4]);
+         for (u64 s = tid; s < islots; s += threads) {
+           const auto ip = ip_row + s * kStride;
+           if (ip[3] < 0.0f) { MdPlain(d_cnt)[slotbase + s] = 0; continue; }
+           const float xi = ip[0], yi = ip[1], zi = ip[2];
+           const u32 bx = static_cast<u32>(s / cap);
+           u32 n = 0;
+           for (int qq = 0; qq < 9; ++qq) {
+             const auto qp = MdPlain(qptr[qq]);
+             for (int dxx = -1; dxx <= 1; ++dxx) {
+               const u32 jbx = (bx + nb + dxx) % nb;
+               const u64 jb = static_cast<u64>(jbx) * cap * kStride;
+               for (u32 sj = 0; sj < cap; ++sj) {
+                 const auto jp = qp + jb + static_cast<u64>(sj) * kStride;
+                 if (jp[3] < 0.0f) continue;
+                 if (qq == 4 && jbx == bx && sj == s % cap) continue;
+                 float ddx = xi - jp[0];
+                 float ddy = yi - jp[1];
+                 float ddz = zi - jp[2];
+                 if (ddx > halfL) ddx -= box; else if (ddx < -halfL) ddx += box;
+                 if (ddy > halfL) ddy -= box; else if (ddy < -halfL) ddy += box;
+                 if (ddz > halfL) ddz -= box; else if (ddz < -halfL) ddz += box;
+                 const float rsq = ddx * ddx + ddy * ddy + ddz * ddz;
+                 if (rsq >= r2list) continue;
+                 if (n >= maxneigh) { *MdPlain(d_err) = 1; continue; }
+                 np[static_cast<u64>(n) * islots + s] = static_cast<int>(
+                     (static_cast<u32>(qq) << 16) | (jbx * cap + sj));
+                 ++n;
+               }
+             }
+           }
+           MdPlain(d_cnt)[slotbase + s] = n;
+         }
+         sycl::group_barrier(it.get_group());
+       }
+       }
+     });
+   }).wait();
 }
 
 void LaunchListForce(dim3 grid,
@@ -2598,7 +3100,11 @@ void LaunchListForce(dim3 grid,
     gv::DeviceVector<int> nl_ = nl;
     nl_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
+    f_.CommSegmentBegin();   // every vector: a flush or fetch on it times from this segment
+    nl_.CommSegmentBegin();   // every vector: a flush or fetch on it times from this segment
     CLIO_COROC_RUN(yv, ys, ListForceCoro(_cy, x_, f_, nl_, nb, cap, box, cutoff, maxneigh, d_cnt, eflag, acc, nocompute, rowchunk, z0, z1, nblocks, yv.Block(), hgen, force_all, band));
+    x_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2623,7 +3129,9 @@ void LaunchRebinWrap(dim3 grid,
     gv::DeviceVector<float> x_ = x;
     x_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
     CLIO_COROC_RUN(yv, ys, RebinWrapCoro(_cy, x_, nb, cap, box, z0, z1, nblocks, yv.Block()));
+    x_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2652,7 +3160,9 @@ void LaunchRebinAssign(dim3 grid,
     gv::DeviceVector<float> x_ = x;
     x_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
     CLIO_COROC_RUN(yv, ys, RebinAssignCoro(_cy, x_, nb, cap, box, bincnt, d_dest, d_err, z0, z1, nblocks, yv.Block(), hgen));
+    x_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2685,7 +3195,11 @@ void LaunchGather(dim3 grid,
     gv::DeviceVector<float> dst_ = dst;
     dst_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = src_.CommSegmentBegin();
+    srcx_.CommSegmentBegin();   // every vector: a flush or fetch on it times from this segment
+    dst_.CommSegmentBegin();   // every vector: a flush or fetch on it times from this segment
     CLIO_COROC_RUN(yv, ys, GatherCoro(_cy, src_, srcx_, dst_, nb, cap, d_dest, keep_w, z0, z1, nblocks, yv.Block(), hgen));
+    src_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2709,7 +3223,9 @@ void LaunchSentinel(dim3 grid,
     gv::DeviceVector<float> dst_ = dst;
     dst_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = dst_.CommSegmentBegin();
     CLIO_COROC_RUN(yv, ys, SentinelCoro(_cy, dst_, nb, cap, z0, z1, nblocks, yv.Block()));
+    dst_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -2741,7 +3257,11 @@ void LaunchMDIntegrate(dim3 grid,
     gv::DeviceVector<float> f_ = f;
     f_.Init(yv.Block());
     __syncthreads();
+    const unsigned long long gv_seg0 = x_.CommSegmentBegin();
+    v_.CommSegmentBegin();   // every vector: a flush or fetch on it times from this segment
+    f_.CommSegmentBegin();   // every vector: a flush or fetch on it times from this segment
     CLIO_COROC_RUN(yv, ys, MDIntegrateCoro(_cy, x_, v_, f_, dt, drift, nb, cap, z0, z1, nblocks, yv.Block()));
+    x_.CommStamp(3, gv_seg0);
   });
 }
 
@@ -3308,6 +3828,37 @@ void LaunchBuildList(dim3 grid,
                      gy::YieldStackView ys) {
   BuildListKernel<<<grid, block, smem>>>(
       info, x, nl, nb, cap, box, rlist, maxneigh, d_cnt, d_err, rowchunk, z0, z1, nblocks, hgen, yv, ys);
+}
+
+void LaunchRowsResolve(dim3, dim3, gv::DeviceVector<float>,
+                       gv::DeviceVector<float>, gv::DeviceVector<int>, u64,
+                       u64, u64, u64, u64, u32, u32, const float **,
+                       float **, int **, u32, gy::YieldableView<>,
+                       gy::YieldStackView) {
+  std::fprintf(stderr, "MD_TWO_PHASE: SYCL only\n");
+  std::abort();
+}
+void LaunchRowsRelease(dim3, dim3, gv::DeviceVector<float>,
+                       gv::DeviceVector<float>, gv::DeviceVector<int>, u64,
+                       u64, u64, u64, u64, u32, u32, gy::YieldableView<>,
+                       gy::YieldStackView) {
+  std::abort();
+}
+void LaunchCopyRows(u32, u32, const float *const *, float *, u64, u64) {
+  std::abort();
+}
+void LaunchCopyRowsI(u32, u32, int *const *, int *, u64, u64) { std::abort(); }
+void LaunchCopyRowsBack(u32, u32, float *const *, const float *, u64, u64) {
+  std::abort();
+}
+void LaunchListForceTab(u32, u32, const float *const *, float *const *,
+                        int *const *, const u32 *, u32, u32, float, float, int,
+                        double *, int, u32) {
+  std::abort();
+}
+void LaunchBuildListTab(u32, u32, const float *const *, int *const *, u32 *,
+                        int *, u32, u32, float, float, u32, u32) {
+  std::abort();
 }
 
 void LaunchListForce(dim3 grid,
@@ -4142,7 +4693,14 @@ int main(int argc, char **argv) {
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
     std::fprintf(stderr, "cte client init failed\n");
     return 1;
+  }  // DIAGNOSTIC: MD_SLEEP_S=N idles N s with the runtime up, so another
+  // process can be timed on the same GPU beside it (interference probe).
+  if (const char *zz = std::getenv("MD_SLEEP_S")) {
+    std::printf("  [MD_SLEEP_S] runtime up; idling %s s\n", zz);
+    std::fflush(stdout);
+    std::this_thread::sleep_for(std::chrono::seconds(std::atoi(zz)));
   }
+
   auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
 
   // Per-block device state the SYCL backend allocates once (its IpcManagers
@@ -4297,6 +4855,13 @@ int main(int argc, char **argv) {
   // plane it happens to be holding. It must produce a MEASURABLY WORSE answer
   // than the exchange; when it did not, that was the bug.
   const bool no_halo = EnvOn("MD_NO_HALO");
+  // MD_LEAN=1: a resident single-node run keeps x/v device-canonical the
+  // way decomposed runs already do -- no interior publish (no reader: the
+  // page table is shared, so every block sees every frame) and no cache
+  // clears around the resort (the comments there: with one shared cache
+  // there is nothing to invalidate). Refused out of core, where the frames
+  // are not the only copy anyone reads.
+  const bool lean = EnvOn("MD_LEAN") && a.slots == 0;
   // DIAGNOSTIC: force every force-pass fetch to name this generation.
   const char *fg = std::getenv("MD_FORCE_GEN");
   const u64 force_gen = fg ? std::strtoull(fg, nullptr, 10) : 0;
@@ -4867,6 +5432,129 @@ gpu, dxp, a.steps,
     vn.Prefetch(nl_slab_lo, nl_slab_hi, 0, 1);
     auto dn = vn.GetDevice(0);
     report_caches();
+    // MD_TWO_PHASE=1 (see RowsResolveCoro): one node, resident-lean, and
+    // pages that hold whole rows -- the row tables need a row never to
+    // straddle a page.
+    const u64 tp_row_elems = static_cast<u64>(g.nb) * g.cap * kStride;
+    const u64 tp_nrows = static_cast<u64>(g.nb) * g.nb;
+    const bool two_phase = EnvOn("MD_TWO_PHASE") && lean && a.nodes == 1 &&
+                           a.use_list && (page_elems % tp_row_elems) == 0 &&
+                           (nl_page_elems % md_rowlist) == 0;
+    const float **d_xtab = nullptr;
+    float **d_ftab = nullptr;
+    int **d_nltab = nullptr;
+    if (two_phase) {
+      d_xtab = ctp::GpuApi::Malloc<const float *>(tp_nrows * sizeof(float *));
+      d_ftab = ctp::GpuApi::Malloc<float *>(tp_nrows * sizeof(float *));
+      d_nltab = ctp::GpuApi::Malloc<int *>(tp_nrows * sizeof(int *));
+      std::printf("  [MD_TWO_PHASE] row tables (%llu rows): force and list "
+                  "build run as plain kernels\n",
+                  (unsigned long long)tp_nrows);
+    } else if (EnvOn("MD_TWO_PHASE")) {
+      std::printf("  [MD_TWO_PHASE] NOT used: needs MD_LEAN, one node, the "
+                  "list, and pages of whole rows (x page %% %llu, list page %% "
+                  "%llu)\n", (unsigned long long)tp_row_elems,
+                  (unsigned long long)md_rowlist);
+    }
+    // Resolve -> run -> release, for one force or list-build pass.
+    double tp_ms[3] = {0.0, 0.0, 0.0};   // resolve, kernel, release
+    // MD_TP_DENSE=1 (DIAGNOSTIC): force reads x from a contiguous copy, the
+    // baselines' layout, to separate "the loop" from "where x lives".
+    float *d_xdense = nullptr;
+    const float **d_xdtab = nullptr;
+    double tp_copy_ms = 0.0;
+    double tp_fk_ms = 0.0;   // the force kernel alone
+    // MD_TP_DENSE=2 also copies the list (after each build) and writes f to
+    // a contiguous buffer copied back into the frames after each force.
+    const char *tpd = std::getenv("MD_TP_DENSE");
+    const bool tp_dense2 = two_phase && tpd != nullptr && std::atoi(tpd) >= 2;
+    int *d_ndense = nullptr;
+    int **d_ndtab = nullptr;
+    float *d_fdense = nullptr;
+    float **d_fdtab = nullptr;
+    if (tp_dense2) {
+      d_ndense = ctp::GpuApi::Malloc<int>(tp_nrows * md_rowlist * sizeof(int));
+      d_fdense = ctp::GpuApi::Malloc<float>(tp_nrows * tp_row_elems * sizeof(float));
+      std::vector<int *> hn(tp_nrows);
+      std::vector<float *> hf(tp_nrows);
+      for (u64 r = 0; r < tp_nrows; ++r) {
+        hn[r] = d_ndense + r * md_rowlist;
+        hf[r] = d_fdense + r * tp_row_elems;
+      }
+      d_ndtab = ctp::GpuApi::Malloc<int *>(tp_nrows * sizeof(int *));
+      d_fdtab = ctp::GpuApi::Malloc<float *>(tp_nrows * sizeof(float *));
+      ctp::GpuApi::Memcpy(d_ndtab, hn.data(), tp_nrows * sizeof(int *));
+      ctp::GpuApi::Memcpy(d_fdtab, hf.data(), tp_nrows * sizeof(float *));
+      std::printf("  [MD_TP_DENSE=2] list and f contiguous too\n");
+    }
+    if (two_phase && EnvOn("MD_TP_DENSE")) {
+      d_xdense = ctp::GpuApi::Malloc<float>(tp_nrows * tp_row_elems * sizeof(float));
+      std::vector<const float *> hd(tp_nrows);
+      for (u64 r = 0; r < tp_nrows; ++r) hd[r] = d_xdense + r * tp_row_elems;
+      d_xdtab = ctp::GpuApi::Malloc<const float *>(tp_nrows * sizeof(float *));
+      ctp::GpuApi::Memcpy(d_xdtab, hd.data(), tp_nrows * sizeof(float *));
+      std::printf("  [MD_TP_DENSE] force reads a contiguous copy of x\n");
+    }
+    // MD_TP_KEEP=1: resolve once (x, f and nl all write-held) and keep the
+    // pins across passes; a resort, which swaps the x vector, releases them
+    // and the next pass resolves again. Resident on one node nothing else
+    // moves a page, so the tables stay true between resorts.
+    const bool tp_keep = two_phase && EnvOn("MD_TP_KEEP");
+    bool tp_live = false;
+    auto tp_release_all = [&]() {
+      if (!tp_live) return;
+      const double tq = NowMs();
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        md::LaunchRowsRelease(gr, b, dx, df, dn, tp_nrows, tp_row_elems,
+                              md_rowlist, page_elems, nl_page_elems, 1u,
+                              a.blocks, vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      tp_ms[2] += NowMs() - tq;
+      tp_live = false;
+    };
+    auto tp_pass = [&](u32 want_f, u32 nl_write, auto &&body) {
+      double tq = NowMs();
+      if (tp_keep) {
+        if (!tp_live) {
+          runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                         gy::YieldStackView sv) {
+            md::LaunchRowsResolve(gr, b, dx, df, dn, tp_nrows, tp_row_elems,
+                                  md_rowlist, page_elems, nl_page_elems, 1u,
+                                  1u, d_xtab, d_ftab, d_nltab, a.blocks, vw,
+                                  sv);
+          });
+          ctp::GpuApi::Synchronize();
+          tp_live = true;
+        }
+        tp_ms[0] += NowMs() - tq; tq = NowMs();
+        body();
+        ctp::GpuApi::Synchronize();
+        tp_ms[1] += NowMs() - tq;
+        return;
+      }
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        md::LaunchRowsResolve(gr, b, dx, df, dn, tp_nrows, tp_row_elems,
+                              md_rowlist, page_elems, nl_page_elems, want_f,
+                              nl_write, d_xtab, d_ftab, d_nltab, a.blocks, vw,
+                              sv);
+      });
+      ctp::GpuApi::Synchronize();
+      tp_ms[0] += NowMs() - tq; tq = NowMs();
+      body();
+      ctp::GpuApi::Synchronize();
+      tp_ms[1] += NowMs() - tq; tq = NowMs();
+      runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        md::LaunchRowsRelease(gr, b, dx, df, dn, tp_nrows, tp_row_elems,
+                              md_rowlist, page_elems, nl_page_elems, want_f,
+                              a.blocks, vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      tp_ms[2] += NowMs() - tq;
+    };
     std::printf("  list: maxneigh=%u row=%llu entries page=%lluKB "
                 "(%llu pages, %llu guards/row)\n",
                 a.maxneigh, (unsigned long long)md_rowlist,
@@ -4905,6 +5593,19 @@ gpu, dxp, a.steps,
       const double _t = NowMs();
       ctp::GpuApi::Memset(d_err, 0, sizeof(int));
       MdMark("BuildList");
+      if (two_phase) {
+        tp_pass(0u, 1u, [&]() {
+          md::LaunchBuildListTab(a.blocks, a.threads, d_xtab, d_nltab, d_cnt,
+                                 d_err, g.nb, g.cap, fbox, frlist, a.maxneigh,
+                                 a.rowchunk);
+          if (tp_dense2) {
+            const double tc = NowMs();
+            md::LaunchCopyRowsI(a.blocks, a.threads, d_nltab, d_ndense,
+                                md_rowlist, tp_nrows);
+            tp_copy_ms += NowMs() - tc;
+          }
+        });
+      } else
       runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         md::LaunchBuildList(gr, b, smem_force,
@@ -4917,6 +5618,27 @@ gpu, dxp, a.steps,
       int err = 0;
       ctp::GpuApi::Memcpy(&err, d_err, sizeof(int));
       t_build += NowMs() - _t;
+      if (EnvOn("MD_LISTSTAT")) {   // total list entries (see the baseline)
+        std::vector<u32> hc(g.nslots);
+        ctp::GpuApi::Memcpy(hc.data(), d_cnt, g.nslots * sizeof(u32));
+        unsigned long long tot = 0, mx = 0, atoms = 0;
+        for (u32 c : hc) { tot += c; if (c > mx) mx = c; atoms += (c != 0); }
+        // SLOT PACKING: empty slots BEFORE an occupied one in the same bin
+        // (a hole a SIMD lane idles on), and 32-slot groups' lane use.
+        const u64 capv = static_cast<u64>(g.cap);
+        unsigned long long holes = 0, grp_busy = 0, grp_n = 0;
+        for (u64 s0 = 0; s0 + 1 < hc.size(); ++s0) {
+          if ((s0 % capv) != capv - 1 && hc[s0] == 0 && hc[s0 + 1] != 0) ++holes;
+        }
+        for (u64 g0 = 0; g0 + 32 <= hc.size(); g0 += 32) {
+          unsigned busy = 0;
+          for (u64 k = 0; k < 32; ++k) busy += (hc[g0 + k] != 0);
+          if (busy) { grp_busy += busy; ++grp_n; }
+        }
+        std::printf("  [liststat] entries=%llu atoms_with_nbrs=%llu max=%llu "
+                    "holes=%llu lanes_busy_per_active_32=%.2f\n", tot, atoms, mx,
+                    holes, grp_n ? double(grp_busy) / grp_n : 0.0);
+      }
       if (err != 0) {
         std::fprintf(stderr,
                      "list: an atom has more than --maxneigh %u neighbours "
@@ -4997,7 +5719,37 @@ gpu, dxp, a.steps,
                    std::fflush(stderr); }
       const double _t = NowMs();
       if (eflag) ctp::GpuApi::Memset(d_acc, 0, 3 * sizeof(double));
-      if (a.use_list) {
+      if (two_phase) {
+        pub_drain();
+        MdMark("ListForceTab");
+        tp_pass(1u, 0u, [&]() {
+          const float **xt = d_xtab;
+          if (d_xdense != nullptr) {
+            const double tc = NowMs();
+            md::LaunchCopyRows(a.blocks, a.threads, d_xtab, d_xdense,
+                               tp_row_elems, tp_nrows);
+            tp_copy_ms += NowMs() - tc;
+            xt = d_xdtab;
+          }
+          if (tp_dense2) {
+            const double tk = NowMs();
+            md::LaunchListForceTab(a.blocks, a.threads, xt, d_fdtab, d_ndtab,
+                                   d_cnt, g.nb, g.cap, fbox, fcut, eflag, d_acc,
+                                   nocompute, a.rowchunk);
+            tp_fk_ms += NowMs() - tk;
+            const double tc = NowMs();
+            md::LaunchCopyRowsBack(a.blocks, a.threads, d_ftab, d_fdense,
+                                   tp_row_elems, tp_nrows);
+            tp_copy_ms += NowMs() - tc;
+          } else {
+            const double tk = NowMs();
+          md::LaunchListForceTab(a.blocks, a.threads, xt, d_ftab, d_nltab,
+                                 d_cnt, g.nb, g.cap, fbox, fcut, eflag, d_acc,
+                                 nocompute, a.rowchunk);
+            tp_fk_ms += NowMs() - tk;
+          }
+        });
+      } else if (a.use_list) {
         MdMark("ListForce");
         // COMM/COMPUTE OVERLAP. While the publish is in flight, run the
         // INTERIOR band first -- its stencil never leaves the slab, so it
@@ -5177,6 +5929,7 @@ gpu, dx, dv, d_thermo, g.nb, g.cap,
     // K2: wrap + rebin + double-buffered scatter, then swap the handles.
     // Returns false on bin overflow (the host refuses the run).
     auto resort = [&]() -> bool {
+      tp_release_all();   // the swap below retires this x; tables go stale
       const double _t = NowMs();
       // The inputs are already published: IntegrateCoro flushes each page it
       // writes, by name. What is still needed is invalidation -- a block
@@ -5201,7 +5954,7 @@ gpu, dx, dv, d_thermo, g.nb, g.cap,
       // GENERATIONAL demand's job (that is what `refetch` counts), not an
       // invalidation pass's. Single-node keeps the clear until its OOC
       // interaction is separately verified.
-      if (a.nodes == 1) {
+      if (a.nodes == 1 && !lean) {
         vx.ClearCache();
         vv.ClearCache();
         vx2.ClearCache();
@@ -5287,7 +6040,7 @@ gpu, dx, dv, d_thermo, g.nb, g.cap,
       // gather refetched pre-wrap bytes from the store. Same class as the
       // other two mid-resort clears: with one shared cache there is nothing
       // to invalidate.
-      if (a.nodes == 1) {
+      if (a.nodes == 1 && !lean) {
         vx.ClearCache();
         vv.ClearCache();
         vx2.ClearCache();
@@ -5357,7 +6110,7 @@ gpu, *dst, g.nb, g.cap,
       // Occupied()==0 on the spare -- with evicts=0, because ClearCache does
       // not count. PE alternated exactly 0 <-> exactly-initial with the swap
       // parity, KE read 0, and the system never evolved.
-      if (a.nodes == 1) {
+      if (a.nodes == 1 && !lean) {
         vx.ClearCache();
         vv.ClearCache();
         vx2.ClearCache();
@@ -5394,7 +6147,12 @@ gpu, *dst, g.nb, g.cap,
     {
       const u32 pub = (EnvOn("MD_NO_PUBLISH")) ? 0u : 1u;
       md::SymbolWrite(md::MdSym::kPublish, &pub, sizeof(pub));
-      const u32 pub_int = (a.nodes > 1 && EnvOn("MD_NO_INTERIOR")) ? 0u : 1u;
+      const u32 pub_int =
+          ((a.nodes > 1 && EnvOn("MD_NO_INTERIOR")) || lean) ? 0u : 1u;
+      if (lean) {
+        std::printf("  [MD_LEAN] resident: no interior publish, no resort "
+                    "cache clears\n");
+      }
       md::SymbolWrite(md::MdSym::kPubInterior, &pub_int, sizeof(pub_int));
       // Out of core the frames are NOT the only copy anyone will ever read:
       // every write must reach the store before its page can be evicted.
@@ -5502,8 +6260,21 @@ gpu, *dst, g.nb, g.cap,
     // force() and build_list() too, and counting those made the phase totals
     // sum to more than the run they were supposedly decomposing.
     t_force = 0.0; t_kick = 0.0; t_resort = 0.0; t_build = 0.0;
+    tp_ms[0] = tp_ms[1] = tp_ms[2] = 0.0;
+    tp_copy_ms = 0.0;
+    tp_fk_ms = 0.0;
+#if CTP_ENABLE_SYCL
+    md::g_tp_dev_ms = 0.0;
+#endif
     t_kick_int = 0.0; t_kick_pub = 0.0; r_kick_int = 0; r_kick_pub = 0;
     t_force_kern = 0.0; t_ckpt = 0.0; t_ckpt_stock = 0.0; n_ckpt = 0;
+    // E1 split (GV_COMM_TIMING): every paged vector's Fetch/Hold/Flush
+    // cycles against the blocks' busy cycles (stamped on each launch's
+    // first vector), over exactly the timed steps.
+    const auto mc_x = vx.ReadStats(0), mc_v = vv.ReadStats(0),
+               mc_f = vf.ReadStats(0), mc_x2 = vx2.ReadStats(0),
+               mc_v2 = vv2.ReadStats(0);
+    const auto mc_n = vn.ReadStats(0);
     const double t0 = NowMs();
     for (u64 step = 0; step < a.steps; ++step) {
       kick(/*drift=*/1);   // uses f(t)
@@ -5641,6 +6412,16 @@ gpu, *dst, g.nb, g.cap,
     }
     const bool nve_ok = (e_drift < a.drift_tol) &&
                         (!expect_resident || res_ok) && !runner.HitCap();
+    {
+      clio_gv_bench::CommAcc md_comm;
+      md_comm.Add(mc_x, vx.ReadStats(0));
+      md_comm.Add(mc_v, vv.ReadStats(0));
+      md_comm.Add(mc_f, vf.ReadStats(0));
+      md_comm.Add(mc_x2, vx2.ReadStats(0));
+      md_comm.Add(mc_v2, vv2.ReadStats(0));
+      md_comm.Add(mc_n, vn.ReadStats(0));
+      md_comm.Print("lammps_md", run_ms);
+    }
     std::printf("  NVE GATE: %s\n", nve_ok ? "PASS" : "FAIL");
     std::printf("  %llu steps in %.1f ms (%.3f ms/step, %.1f "
                 "Matom-steps/s)\n",
@@ -5678,6 +6459,19 @@ gpu, *dst, g.nb, g.cap,
       std::printf("  publish split (device cycles): flush=%llu halo_fetch=%llu"
                   " (%.1f%% fetch)\n", fc, gc,
                   (fc + gc) ? 100.0 * (double)gc / (double)(fc + gc) : 0.0);
+    }
+    if (two_phase) {
+      std::printf("  two-phase (total ms, all passes): resolve=%.1f "
+                  "kernel=%.1f release=%.1f dense_copy=%.1f "
+                  "force_kernel=%.1f\n", tp_ms[0], tp_ms[1], tp_ms[2],
+                  tp_copy_ms, tp_fk_ms);
+#if CTP_ENABLE_SYCL
+      if (std::getenv("MD_TP_OWNQ") != nullptr) {
+        std::printf("  [MD_TP_OWNQ] force kernel DEVICE time %.1f ms (wall "
+                    "%.1f ms) on a private queue\n", md::g_tp_dev_ms,
+                    tp_fk_ms);
+      }
+#endif
     }
     std::printf("  phases (total ms): force=%.1f (gpu %.1f) kick=%.1f "
                 "resort=%.1f build=%.1f\n", t_force, t_force_kern, t_kick,

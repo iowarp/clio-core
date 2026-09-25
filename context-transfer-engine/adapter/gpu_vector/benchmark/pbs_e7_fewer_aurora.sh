@@ -38,6 +38,12 @@
 #   BENCH_TOTAL_MB  total footprint (default 491520 = 480 GB)
 #   BENCH_STEPS     steps per run (default 2)
 #   BENCH_CAP       per-rank cap in seconds (default 900)
+#   BENCH_PPN       ranks per node, one per GPU (default 1). With more than
+#                   one, rank r runs on tile 0 of GPU (r mod PPN) and the
+#                   node's ranks share ONE clio runtime: every Eternia rank
+#                   runs with CLIO_WITH_RUNTIME=1, the first to bind the port
+#                   becomes the runtime and the rest attach as clients.
+#   BENCH_CACHE_MB  Eternia frame cache PER RANK (default 8192)
 set -u
 
 ROOT=${ROOT:-/home/llogan/clio-core/.claude/worktrees/gpu-coro}
@@ -45,8 +51,11 @@ TOTAL_MB=${BENCH_TOTAL_MB:-491520}
 STEPS=${BENCH_STEPS:-2}
 CAP=${BENCH_CAP:-900}
 CACHE_MB=${BENCH_CACHE_MB:-8192}
-NRANKS=$(sort -u "${PBS_NODEFILE}" | wc -l)
-PERNODE_MB=$(( TOTAL_MB / NRANKS ))
+PPN=${BENCH_PPN:-1}
+NNODES=$(sort -u "${PBS_NODEFILE}" | wc -l)
+NRANKS=$(( NNODES * PPN ))
+PERNODE_MB=$(( TOTAL_MB / NNODES ))
+PERRANK_MB=$(( TOTAL_MB / NRANKS ))
 JOBTAG=${PBS_JOBID%%.*}
 DAOS_POOL=${DAOS_POOL:-IOWarp}
 DAOS_CONT=${DAOS_CONT:-clio_tier}
@@ -66,10 +75,10 @@ FLARE_MB=$(( BUDGET_MB - DRAM_MB - DAOS_MB ))
 # 64 blocks x 1 MB pages, so slots = cache in MB / 64.
 SLOTS=$(( CACHE_MB / 64 ))
 
-echo "=== E7 rung: ${NRANKS} nodes, ${TOTAL_MB} MB total, ${PERNODE_MB} MB/node ==="
+echo "=== E7 rung: ${NNODES} nodes x ${PPN} GPUs = ${NRANKS} ranks, ${TOTAL_MB} MB total, ${PERNODE_MB} MB/node, ${PERRANK_MB} MB/rank ==="
 echo "    tiers/node: dram ${DRAM_MB} + daos ${DAOS_MB} + flare ${FLARE_MB} MB"
-echo "    frame cache ${CACHE_MB} MB (${SLOTS} slots x 64 blocks x 1 MB), "\
-"oversubscribed $(( PERNODE_MB / CACHE_MB ))x"
+echo "    frame cache ${CACHE_MB} MB per rank (${SLOTS} slots x 64 blocks x 1 MB), "\
+"share/cache = ${PERRANK_MB}/${CACHE_MB}"
 
 export IGC_FunctionControl=3
 export ZE_AFFINITY_MASK=${BENCH_ZE_MASK:-0.0}
@@ -91,7 +100,7 @@ export MPIR_CVAR_ENABLE_GPU=1
 # leaves 16 GB of the 64 GB tile for the driver and the collectives, which
 # is the most that has run. A rung whose share still does not fit under it
 # is the baseline floor this study is about, and it fails honestly.
-ISHMEM_MB=$(( PERNODE_MB * 27 / 20 ))
+ISHMEM_MB=$(( PERRANK_MB * 27 / 20 ))
 [ "${ISHMEM_MB}" -gt 49152 ] && ISHMEM_MB=49152
 [ "${ISHMEM_MB}" -lt 8192 ] && ISHMEM_MB=8192
 export ISHMEM_SYMMETRIC_SIZE=${ISHMEM_SYMMETRIC_SIZE:-$(( ISHMEM_MB * 1024 * 1024 ))}
@@ -122,18 +131,30 @@ run_one() {
   local start=$SECONDS
   BENCH_RANK_EXE="${exe}" BENCH_RANK_ARGS="${args}" BENCH_RANK_DIR="${rundir}" \
   BENCH_RANK_CAP="${CAP}" BENCH_RANK_N="${NRANKS}" BENCH_RANK_RANKED="${ranked}" \
-  mpiexec -n "${NRANKS}" --ppn 1 --no-vni --envall --cpu-bind none bash -c '
+  BENCH_RANK_PPN="${PPN}" \
+  mpiexec -n "${NRANKS}" --ppn "${PPN}" --no-vni --envall --cpu-bind none bash -c '
     r=${PALS_RANKID:-${PMI_RANK:-0}}
+    lr=${PALS_LOCAL_RANKID:-0}
+    nd=$(( r / BENCH_RANK_PPN ))
     cd "$BENCH_RANK_DIR"
     ulimit -c 0
+    # One GPU per rank: in FLAT mode tile 0 of GPU k is device 2k.
+    if [ "$BENCH_RANK_PPN" -gt 1 ]; then
+      export ZE_FLAT_DEVICE_HIERARCHY=FLAT
+      export ZE_AFFINITY_MASK=$(( 2 * lr ))
+    fi
     extra=""
     [ "$BENCH_RANK_RANKED" = 1 ] && extra="--nodes $BENCH_RANK_N --node $r"
+    # The config names the NODE, not the rank: every rank on a node writes the
+    # same one, and whichever binds the port first is that node'"'"'s runtime.
     [ -f clio_e7_template.yaml ] &&
-      sed "s/__RANK__/$r/g" clio_e7_template.yaml > "clio_e7_r$r.yaml" &&
-      export CLIO_SERVER_CONF="$BENCH_RANK_DIR/clio_e7_r$r.yaml"
+      sed "s/__RANK__/$nd/g" clio_e7_template.yaml > "clio_e7_r$r.yaml" &&
+      export CLIO_SERVER_CONF="$BENCH_RANK_DIR/clio_e7_r$r.yaml" &&
+      export CLIO_WITH_RUNTIME=1
+    echo "rank $r node $nd local $lr ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK:-unset} CLIO_WITH_RUNTIME=${CLIO_WITH_RUNTIME:-unset}" > "rank$r.log"
     timeout --signal=TERM --kill-after=10s "$BENCH_RANK_CAP" \
       stdbuf -oL -eL "$BENCH_RANK_EXE" $BENCH_RANK_ARGS $extra \
-      > "rank$r.log" 2>&1
+      >> "rank$r.log" 2>&1
     rc=$?
     echo "rank $r on $(hostname) exit=$rc" >> "rank$r.log"
     exit 0
@@ -163,7 +184,7 @@ run_one() {
 BASE_ARGS="--data-mb ${TOTAL_MB} --steps ${STEPS} --page-kb 1024"
 
 # ---- the baselines, where the shard still fits a 64 GB tile ---------------
-if [ "${PERNODE_MB}" -le 49152 ]; then
+if [ "${PERRANK_MB}" -le 49152 ]; then
   for sub in mpi ccl ishmem; do
     rc=0
     run_one "grayscott_${sub}" "${ROOT}/build-spike/clio_grayscott_${sub}_bench" \
@@ -171,7 +192,7 @@ if [ "${PERNODE_MB}" -le 49152 ]; then
   done
 else
   echo "RESULT e7/grayscott_baselinesx${NRANKS}: SKIPPED -- the shard is "\
-"${PERNODE_MB} MB and a PVC tile holds 64 GB; an in-HBM baseline has nowhere "\
+"${PERRANK_MB} MB and a PVC tile holds 64 GB; an in-HBM baseline has nowhere "\
 "to put it. This is the floor tiering is meant to remove."
 fi
 
@@ -216,17 +237,21 @@ compose:
       - path: "ram::gv_e7_dram"
         bdev_type: "ram"
         capacity_limit: "${DRAM_MB}MB"
-        score: 1.0
+        # SCORES MUST BE <= THE VECTOR'S BLOB SCORE (0.5, page.h) TO BE A FIRST
+        # CHOICE: MaxBwDpe prefers targets scored at or below the blob and uses
+        # the rest only as fallback. DRAM at 1.0 was fallback, so every page
+        # went to DAOS first and DRAM only after DAOS and Flare filled.
+        score: 0.5
       - path: "${TDIR_DAOS}/node__RANK__.dat"
         bdev_type: "file"
         persistence_level: "long_term"
         capacity_limit: "${DAOS_MB}MB"
-        score: 0.5
+        score: 0.3
       - path: "${TDIR_FLARE}/node__RANK__.dat"
         bdev_type: "file"
         persistence_level: "long_term"
         capacity_limit: "${FLARE_MB}MB"
-        score: 0.2
+        score: 0.1
     dpe:
       dpe_type: "max_bw"
 EOF

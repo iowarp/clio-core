@@ -74,6 +74,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -129,8 +130,16 @@ namespace clio::gv_bench::grayscott {
 /** Seed u and v for this block's z-range, one plane (= one page) at a time. */
 CTP_GPU_FUN CLIO_COROC_INLINE void SeedCoro(gv::DeviceVector<float> vec, u64 plane,
                                   u64 nx, u64 ny, u64 nz, u64 z0, u64 z1,
-                                  u64 ubase, u64 vbase) {
+                                  u64 ubase, u64 vbase, u64 zlo, u64 zhi,
+                                  u32 all) {
+  // PUBLISH ONLY THE EDGES (unless `all`: out of core, where any plane can
+  // be evicted and must be refetchable from the CTE). A peer's first step reads this node's first and
+  // last planes (generation 1); every other plane is read only out of this
+  // node's resident cache. Publishing the whole 32 GB seed filled a DRAM
+  // tier on 8 nodes (the DPE places blobs across nodes) and the runtime
+  // refused the put (FATAL 8).
   for (u64 z = z0; z < z1; ++z) {
+    const bool edge = all != 0u || (z == zlo || z + 1 == zhi);
     {
       CO_AWAIT(vec.CoFetch(0, ubase + z * plane, plane));
       auto h = CO_AWAIT(vec.CoHoldPage(ubase + z * plane, plane, /*write=*/true));
@@ -138,7 +147,7 @@ CTP_GPU_FUN CLIO_COROC_INLINE void SeedCoro(gv::DeviceVector<float> vec, u64 pla
         h[ubase + z * plane + i] = InitU(i % nx, i / nx, z, nx, ny, nz);
       }
       // Collective: name the plane just written.
-      CO_AWAIT(vec.CoBeginFlush(1, ubase + z * plane, plane));
+      if (edge) CO_AWAIT(vec.CoBeginFlush(1, ubase + z * plane, plane));
       // Fetch is the pinner; UnpinRange is the releaser, after the flush.
       vec.UnpinRange(ubase + z * plane, plane);
     }
@@ -149,7 +158,7 @@ CTP_GPU_FUN CLIO_COROC_INLINE void SeedCoro(gv::DeviceVector<float> vec, u64 pla
         h2[vbase + z * plane + i] = InitV(i % nx, i / nx, z, nx, ny, nz);
       }
       // Collective: name the plane just written.
-      CO_AWAIT(vec.CoBeginFlush(1, vbase + z * plane, plane));
+      if (edge) CO_AWAIT(vec.CoBeginFlush(1, vbase + z * plane, plane));
       vec.UnpinRange(vbase + z * plane, plane);
     }
   }
@@ -157,6 +166,66 @@ CTP_GPU_FUN CLIO_COROC_INLINE void SeedCoro(gv::DeviceVector<float> vec, u64 pla
   // durable before this kernel returns.
   CO_AWAIT(vec.CoEndFlush());
 }
+
+// GLOBAL, SAID OUT LOUD (see the kmeans edition). The step body is a call the
+// kernel does not inline, so IGC cannot prove a held plane's pointer is
+// global and every stencil load became a generic-address check plus a
+// divergent branch. The cast is applied at each use and never stored:
+// clio-coroc byte-copies a coroutine's locals, which a multi_ptr cannot be.
+#if CTP_ENABLE_SYCL && defined(__SYCL_DEVICE_ONLY__)
+template <typename T>
+CTP_GPU_FUN inline auto GsG(T *p) {
+  return ::sycl::address_space_cast<::sycl::access::address_space::global_space,
+                                    ::sycl::access::decorated::yes>(p);
+}
+#else
+template <typename T>
+CTP_GPU_FUN inline T *GsG(T *p) { return p; }
+#endif
+
+// THE STENCIL, OUT OF LINE. Inside StepCoro the loop shared the register
+// budget of the whole coroutine body -- eight plane pointers, the step's
+// indices and the transpiled state all live across it -- and IGC spilled
+// inside the loop: 23 scratch fills/spills per pass at 128 GRF, one at 256.
+// As its own function it is allocated alone, the way the baselines' step
+// kernel is. Same arithmetic and index types as the baselines (u64).
+CTP_GPU_FUN __attribute__((noinline)) void StencilPlane(
+    float *pum, float *pu0, float *pup, float *pvm, float *pv0, float *pvp,
+    float *pun, float *pvn, u64 plane, u64 nx, u64 ny, bool interior,
+    float Du, float Dv, float F, float K, float dt, u64 e0, u64 e1) {
+  (void)plane;
+  for (u64 i = e0 + threadIdx.x; i < e1; i += blockDim.x) {
+    const u64 x = i % nx;
+    const u64 y = i / nx;
+    const float u = GsG(pu0)[i];
+    const float v = GsG(pv0)[i];
+    float lu;
+    float lv;
+    if (x == 0 || x + 1 == nx || y == 0 || y + 1 == ny || !interior) {
+      lu = 0.0f; lv = 0.0f;      // fixed boundary
+    } else {
+      lu = GsG(pu0)[i - 1] +
+           GsG(pu0)[i + 1] +
+           GsG(pu0)[i - nx] +
+           GsG(pu0)[i + nx] +
+           GsG(pum)[i] +
+           GsG(pup)[i] - 6.0f * u;
+      lv = GsG(pv0)[i - 1] +
+           GsG(pv0)[i + 1] +
+           GsG(pv0)[i - nx] +
+           GsG(pv0)[i + nx] +
+           GsG(pvm)[i] +
+           GsG(pvp)[i] - 6.0f * v;
+    }
+    const float uvv = u * v * v;
+    GsG(pun)[i] = u + dt * (Du * lu - uvv + F * (1.0f - u));
+    GsG(pvn)[i] = v + dt * (Dv * lv + uvv - (F + K) * v);
+  }
+}
+
+/** No plane held in a window slot (StepCoro). Namespace scope: clio-coroc
+ *  does not hoist a constexpr local. */
+constexpr u64 kNoZ = ~static_cast<u64>(0);
 
 /**
  * One Gray-Scott step over this block's z-range.
@@ -171,134 +240,74 @@ CTP_GPU_FUN CLIO_COROC_INLINE void StepCoro(gv::DeviceVector<float> vec, u64 pla
                                   u64 nlo, u64 nhi, u64 gen,
                                   u64 ubase, u64 vbase, u64 unext, u64 vnext,
                                   float Du, float Dv, float F, float K,
-                                  float dt) {
-  // One guard per concurrently-needed plane; declared OUTSIDE the loop and
-  // move-assigned each iteration, so the assignment releases the previous
-  // plane's pin instead of leaking it.
-  gv::PageRef<float> uzm;
-  gv::PageRef<float> uz;
-  gv::PageRef<float> uzp;
-  gv::PageRef<float> vzm;
-  gv::PageRef<float> vz;
-  gv::PageRef<float> vzp;
+                                  float dt, u64 e0, u64 e1, u64 zstride) {
+  // SLIDING WINDOW OVER THE INPUT PLANES. The step used to fetch, hold and
+  // unpin z-1, z and z+1 of both fields at EVERY z, so each input plane went
+  // through the paging path three times (as z+1, then z, then z-1) -- eight
+  // fetch/hold/unpin sequences per plane, each a set scan and a handful of
+  // block-wide collectives. The window {z-1, z, z+1} is consecutive, so a
+  // 3-slot ring indexed by plane % 3 keeps each held plane in its own slot:
+  // per z only the plane entering the window is fetched and held, and the one
+  // leaving it (z-2) is unpinned when its slot is reused. Outputs are still
+  // one fetch/hold/unpin per z. Halo planes demand the step's generation
+  // exactly as before; they are fetched once per step instead of three times.
+  float *pus[3] = {nullptr, nullptr, nullptr};
+  float *pvs[3] = {nullptr, nullptr, nullptr};
+  u64 held[3] = {kNoZ, kNoZ, kNoZ};
+  gv::PageRef<float> hu;
+  gv::PageRef<float> hv;
   gv::PageRef<float> unx;
   gv::PageRef<float> vnx;
-  for (u64 z = z0; z < z1; ++z) {
-    // TELL THE HOST WHERE WE ARE, so a registered prefetcher can promote the
-    // planes this loop is about to fault on before it faults on them. Once
-    // per z-iteration, BEFORE the first fetch -- a position published after
-    // the fetches it should have anticipated is a position published too
-    // late. One thread-0 store per plane; nothing on the critical path.
-    //
-    // z+1, NOT z: 0 is the "kernel published nothing" sentinel, which every
-    // block starts at and which the seed and sum kernels never leave. A raw
-    // z would make the first plane of the field indistinguishable from
-    // silence, and the prefetcher would then guess for a block that had not
-    // yet said anything.
+  for (u64 z = z0; z < z1; z += zstride) {
     gy::YieldPublishCursor(z + 1);
     const bool interior = (z > 0 && z + 1 < nz);
     const u64 zm = interior ? (z - 1) : z;
     const u64 zp = interior ? (z + 1) : z;
-
-    // A GENERATION IS DEMANDED ONLY OF A NEIGHBOUR'S PLANE. Page generation
-    // is stamped by the FETCH that delivers it, not by the flush that
-    // publishes it, so a plane this node wrote locally and never re-fetched
-    // sits at generation 0 forever -- demanding one on it stalls the block
-    // with "gen stall: page N at gen 0 want G" and never resolves. Own
-    // planes are current by construction and take 0 (any version); only
-    // the halo, which a PEER produced, needs the demand.
-    const u64 gzm = (zm < nlo || zm >= nhi) ? gen : 0;
-    const u64 gzp = (zp < nlo || zp >= nhi) ? gen : 0;
-    CO_AWAIT(vec.CoFetch(gzm, ubase + zm * plane, plane));
-    // Three input planes of u, then three of v, then the two outputs -- ONE
-    // GUARD PER PLANE, because a guard indexes only its own held page.
-    // THE HOLD IS THE PIN: each guard's plane stays resident until the
-    // guard is re-assigned past it, so the sliding window (z and z+1 are
-    // re-held next iteration) is expressed by the pins themselves and needs
-    // no score hints.
-    uzm = CO_AWAIT(vec.CoHoldPage(ubase + zm * plane, plane, /*write=*/false));
-    CO_AWAIT(vec.CoFetch(0, ubase + z * plane, plane));
-    uz = CO_AWAIT(vec.CoHoldPage(ubase + z * plane, plane, /*write=*/false));
-    CO_AWAIT(vec.CoFetch(gzp, ubase + zp * plane, plane));
-    uzp = CO_AWAIT(vec.CoHoldPage(ubase + zp * plane, plane, /*write=*/false));
-    CO_AWAIT(vec.CoFetch(gzm, vbase + zm * plane, plane));
-    vzm = CO_AWAIT(vec.CoHoldPage(vbase + zm * plane, plane, /*write=*/false));
-    CO_AWAIT(vec.CoFetch(0, vbase + z * plane, plane));
-    vz = CO_AWAIT(vec.CoHoldPage(vbase + z * plane, plane, /*write=*/false));
-    CO_AWAIT(vec.CoFetch(gzp, vbase + zp * plane, plane));
-    vzp = CO_AWAIT(vec.CoHoldPage(vbase + zp * plane, plane, /*write=*/false));
-    CO_AWAIT(vec.CoFetch(0, unext + z * plane, plane));
-    unx = CO_AWAIT(vec.CoHoldPage(unext + z * plane, plane, /*write=*/true));
-    CO_AWAIT(vec.CoFetch(0, vnext + z * plane, plane));
-    vnx = CO_AWAIT(vec.CoHoldPage(vnext + z * plane, plane, /*write=*/true));
-
-    for (u64 i = threadIdx.x; i < plane; i += blockDim.x) {
-      const u64 x = i % nx;
-      const u64 y = i / nx;
-      const float u = uz[ubase + z * plane + i];
-      const float v = vz[vbase + z * plane + i];
-      float lu;
-      float lv;
-      if (x == 0 || x + 1 == nx || y == 0 || y + 1 == ny || !interior) {
-        lu = 0.0f; lv = 0.0f;      // fixed boundary
-      } else {
-        lu = uz[ubase + z * plane + i - 1] +
-             uz[ubase + z * plane + i + 1] +
-             uz[ubase + z * plane + i - nx] +
-             uz[ubase + z * plane + i + nx] +
-             uzm[ubase + zm * plane + i] +
-             uzp[ubase + zp * plane + i] - 6.0f * u;
-        lv = vz[vbase + z * plane + i - 1] +
-             vz[vbase + z * plane + i + 1] +
-             vz[vbase + z * plane + i - nx] +
-             vz[vbase + z * plane + i + nx] +
-             vzm[vbase + zm * plane + i] +
-             vzp[vbase + zp * plane + i] - 6.0f * v;
+    for (u32 k = 0; k < 3; ++k) {
+      const u64 d = (k == 0) ? zm : ((k == 1) ? z : zp);
+      const u32 slot = static_cast<u32>(d % 3);
+      if (held[slot] != d) {
+        if (held[slot] != kNoZ) {
+          vec.UnpinRange2(ubase + held[slot] * plane, plane,
+                          vbase + held[slot] * plane, plane);
+        }
+        // A GENERATION IS DEMANDED ONLY OF A NEIGHBOUR'S PLANE (see below the
+        // seed): own planes are current by construction and take 0.
+        const u64 g = (d < nlo || d >= nhi) ? gen : 0;
+        // Both fields' plane in ONE fetch (CoFetch takes several ranges).
+        CO_AWAIT(vec.CoFetch(g, ubase + d * plane, plane, vbase + d * plane,
+                             plane));
+        hu = CO_AWAIT(vec.CoHoldPage(ubase + d * plane, plane, /*write=*/false));
+        pus[slot] = hu.ptr() + (ubase + d * plane - hu.begin_off());
+        hv = CO_AWAIT(vec.CoHoldPage(vbase + d * plane, plane, /*write=*/false));
+        pvs[slot] = hv.ptr() + (vbase + d * plane - hv.begin_off());
+        held[slot] = d;
       }
-      const float uvv = u * v * v;
-      unx[unext + z * plane + i] = u + dt * (Du * lu - uvv + F * (1.0f - u));
-      vnx[vnext + z * plane + i] = v + dt * (Dv * lv + uvv - (F + K) * v);
     }
+    CO_AWAIT(vec.CoFetch(0, unext + z * plane, plane, vnext + z * plane,
+                         plane));
+    unx = CO_AWAIT(vec.CoHoldPage(unext + z * plane, plane, /*write=*/true));
+    vnx = CO_AWAIT(vec.CoHoldPage(vnext + z * plane, plane, /*write=*/true));
+    float *pun = unx.ptr() + (unext + z * plane - unx.begin_off());
+    float *pvn = vnx.ptr() + (vnext + z * plane - vnx.begin_off());
+    StencilPlane(pus[zm % 3], pus[z % 3], pus[zp % 3], pvs[zm % 3],
+                 pvs[z % 3], pvs[zp % 3], pun, pvn, plane, nx, ny, interior,
+                 Du, Dv, F, K, dt, e0, e1);
     __syncthreads();
-    // Flush the write-once outputs; the drop below is best-effort (a page
-    // still flushing or pinned is refused and reclaimed by ordinary eviction
-    // once it settles).
-    CO_AWAIT(vec.CoBeginFlush(gen + 1, unext + z * plane, plane));
-    CO_AWAIT(vec.CoBeginFlush(gen + 1, vnext + z * plane, plane));
-    // ONE UNPIN PER FETCH, all eight planes of this step. The sliding window
-    // is expressed by re-fetching z and z+1 next iteration, not by holding
-    // their pins across it: a pin held across the step would accumulate one
-    // per plane per z and fill the set.
-    vec.UnpinRange(ubase + zm * plane, plane);
-    vec.UnpinRange(ubase + z * plane, plane);
-    vec.UnpinRange(ubase + zp * plane, plane);
-    vec.UnpinRange(vbase + zm * plane, plane);
-    vec.UnpinRange(vbase + z * plane, plane);
-    vec.UnpinRange(vbase + zp * plane, plane);
-    vec.UnpinRange(unext + z * plane, plane);
-    vec.UnpinRange(vnext + z * plane, plane);
-    if (interior) {
-      // Plane z-1 leaves the sliding window for good: empty the guard so the
-      // drop can take it. (zm == z when not interior, so releasing it there
-      // would release the plane the next iteration still needs.)
-      uzm = {};
-      vzm = {};
-      const u64 d0 = vec.PageOf(ubase + zm * plane);
-      const u64 d1 = vec.PageOf(vbase + zm * plane);
-      const u64 d2 = vec.PageOf(unext + z * plane);
-      const u64 d3 = vec.PageOf(vnext + z * plane);
-      const u64 drops[4] = {d0, d1, d2, d3};
+    vec.UnpinRange2(unext + z * plane, plane, vnext + z * plane, plane);
+  }
+  // NO FLUSH IN THE STEP. The node-edge planes another node reads are
+  // published by PublishCoro, launched after this kernel has finished -- with
+  // a plane split across blocks (--plane-split) no single block knows when
+  // an edge plane is complete, and the step kernel's end is the one point
+  // where every block's writes are.
+  for (u32 k = 0; k < 3; ++k) {
+    if (held[k] != kNoZ) {
+      vec.UnpinRange2(ubase + held[k] * plane, plane, vbase + held[k] * plane,
+                      plane);
     }
   }
-  // Drain before returning: the next step swaps the regions and other blocks
-  // will fault on the planes written here. Waiting once per block per step,
-  // rather than once per plane, keeps the puts pipelined while still making
-  // them durable at the step boundary. Every guard empties first so nothing
-  // stays pinned when the drops below run.
-  uzm = {}; uz = {}; uzp = {};
-  vzm = {}; vz = {}; vzp = {};
-  unx = {}; vnx = {};
-  CO_AWAIT(vec.CoEndFlush());
+  hu = {}; hv = {}; unx = {}; vnx = {};
   // ...and then DROP THE CACHE. Durability alone is not enough. A block reads
   // planes owned by its NEIGHBOURS (z-1 at the bottom of its slab, z+1 at the
   // top), and those pages stay resident in this block's cache. The regions
@@ -323,6 +332,126 @@ CTP_GPU_FUN CLIO_COROC_INLINE void StepCoro(gv::DeviceVector<float> vec, u64 pla
       }
     }
   }
+}
+
+/** TWO-PHASE, PHASE 1: fetch, pin and hold every plane this block's slab of
+ *  the step needs, and record each plane's frame pointer in `tab`. The pins
+ *  are kept (ReleaseCoro gives them back after the compute kernel), so the
+ *  frames cannot move or be evicted while the plain stencil kernel reads
+ *  them. Table layout, t = z - (zbase - 1): pu[t], pv[t] for input planes
+ *  zbase-1 .. zend (the node halo included), pun[z - zbase], pvn[z - zbase]
+ *  for output planes. The halo planes are fetched at the step's generation;
+ *  block 0 takes the low one, the last block the high one. */
+/** One plane of ResolveCoro: fetch (at `gen`) and hold the planes named, and
+ *  write their frame pointers. OUT OF LINE because the loop written inline
+ *  made IGC's backend crash (gen compiler exit 245, the code-shape bug of
+ *  AURORA.md (4)); the documented fix is to give the suspending loop body
+ *  its own noinline coroutine. `outs` = 0 resolves only u and v (a halo
+ *  plane); 1 also resolves the two output planes. */
+CTP_GPU_FUN __attribute__((noinline)) void ResolvePlane(
+    gv::DeviceVector<float> vec, u64 plane, u64 z, u64 zbase, u64 gen,
+    u64 ubase, u64 vbase, u64 unext, u64 vnext, float **tab, u64 ntab,
+    u32 outs) {
+  gv::PageRef<float> h;
+  if (outs != 0u) {
+    CO_AWAIT(vec.CoFetch(gen, ubase + z * plane, plane, vbase + z * plane,
+                         plane, unext + z * plane, plane, vnext + z * plane,
+                         plane));
+  } else {
+    CO_AWAIT(vec.CoFetch(gen, ubase + z * plane, plane, vbase + z * plane,
+                         plane));
+  }
+  h = CO_AWAIT(vec.CoHoldPage(ubase + z * plane, plane, /*write=*/false));
+  if (threadIdx.x == 0) {
+    tab[0 * ntab + (z - zbase + 1)] =
+        h.ptr() + (ubase + z * plane - h.begin_off());
+  }
+  h = CO_AWAIT(vec.CoHoldPage(vbase + z * plane, plane, /*write=*/false));
+  if (threadIdx.x == 0) {
+    tab[1 * ntab + (z - zbase + 1)] =
+        h.ptr() + (vbase + z * plane - h.begin_off());
+  }
+  if (outs != 0u) {
+    h = CO_AWAIT(vec.CoHoldPage(unext + z * plane, plane, /*write=*/true));
+    if (threadIdx.x == 0) {
+      tab[2 * ntab + (z - zbase)] =
+          h.ptr() + (unext + z * plane - h.begin_off());
+    }
+    h = CO_AWAIT(vec.CoHoldPage(vnext + z * plane, plane, /*write=*/true));
+    if (threadIdx.x == 0) {
+      tab[3 * ntab + (z - zbase)] =
+          h.ptr() + (vnext + z * plane - h.begin_off());
+    }
+  }
+  h = {};
+}
+
+CTP_GPU_FUN CLIO_COROC_INLINE void ResolveCoro(gv::DeviceVector<float> vec,
+                                    u64 plane, u64 nz, u64 z0, u64 z1,
+                                    u64 zbase, u64 zend, u64 gen, u64 ubase,
+                                    u64 vbase, u64 unext, u64 vnext,
+                                    float **tab, u64 ntab, u32 blk, u32 nblk) {
+  for (u64 z = z0; z < z1; ++z) {
+    CO_AWAIT(ResolvePlane(vec, plane, z, zbase, 0, ubase, vbase, unext, vnext,
+                          tab, ntab, 1u));
+  }
+  // Node halo: the plane below zbase and the plane at zend, from the peers.
+  if (blk == 0 && zbase > 0) {
+    CO_AWAIT(ResolvePlane(vec, plane, zbase - 1, zbase, gen, ubase, vbase,
+                          unext, vnext, tab, ntab, 0u));
+  }
+  if (blk + 1 == nblk && zend < nz) {
+    CO_AWAIT(ResolvePlane(vec, plane, zend, zbase, gen, ubase, vbase, unext,
+                          vnext, tab, ntab, 0u));
+  }
+}
+
+/** TWO-PHASE, PHASE 3: give back every pin ResolveCoro took. */
+CTP_GPU_FUN CLIO_COROC_INLINE void ReleaseCoro(gv::DeviceVector<float> vec,
+                                    u64 plane, u64 nz, u64 z0, u64 z1,
+                                    u64 zbase, u64 zend, u64 ubase, u64 vbase,
+                                    u64 unext, u64 vnext, u32 blk, u32 nblk,
+                                    u64 flush_gen) {
+  for (u64 z = z0; z < z1; ++z) {
+    vec.UnpinRange2(ubase + z * plane, plane, vbase + z * plane, plane);
+    // OUT OF CORE: write the output planes back (asynchronously -- one flush
+    // in flight per block, overlapping the next plane's release) so an
+    // evicted plane is refetchable. flush_gen = the generation the next
+    // step's halo fetch demands, so this also publishes the node edges.
+    if (flush_gen != 0) {
+      CO_AWAIT(vec.CoBeginFlush(flush_gen, unext + z * plane, plane,
+                                vnext + z * plane, plane));
+    }
+    vec.UnpinRange2(unext + z * plane, plane, vnext + z * plane, plane);
+  }
+  if (blk == 0 && zbase > 0) {
+    vec.UnpinRange2(ubase + (zbase - 1) * plane, plane,
+                    vbase + (zbase - 1) * plane, plane);
+  }
+  if (blk + 1 == nblk && zend < nz) {
+    vec.UnpinRange2(ubase + zend * plane, plane, vbase + zend * plane, plane);
+  }
+  // Waits for the last writeback (out of core); otherwise no flush is
+  // outstanding and it returns at once. Also the suspend point that makes
+  // this a coroutine like its siblings.
+  CO_AWAIT(vec.CoEndFlush());
+}
+
+/** Publish the node's edge output planes at generation `gen`, the ones a
+ *  peer node's halo fetch demands. One block, after the step kernel. */
+CTP_GPU_FUN CLIO_COROC_INLINE void PublishCoro(gv::DeviceVector<float> vec,
+                                    u64 plane, u64 nlo, u64 nhi, u64 gen,
+                                    u64 unext, u64 vnext) {
+  if (nhi > nlo + 1) {
+    CO_AWAIT(vec.CoBeginFlush(gen, unext + nlo * plane, plane,
+                              vnext + nlo * plane, plane,
+                              unext + (nhi - 1) * plane, plane,
+                              vnext + (nhi - 1) * plane, plane));
+  } else if (nhi > nlo) {
+    CO_AWAIT(vec.CoBeginFlush(gen, unext + nlo * plane, plane,
+                              vnext + nlo * plane, plane));
+  }
+  CO_AWAIT(vec.CoEndFlush());
 }
 
 /** Sum of v over this block's range, for the correctness checksum. */
@@ -357,7 +486,11 @@ void Submit(dim3 grid, dim3 block, BodyT body) {
   const size_t global = static_cast<size_t>(grid.x) * block.x;
   q.parallel_for(
        sycl::nd_range<1>{sycl::range<1>(global), sycl::range<1>(block.x)},
-       [=](sycl::nd_item<1>) { body(); })
+       [=](sycl::nd_item<1>)
+#ifdef GV_SG32
+           [[intel::reqd_sub_group_size(32)]]
+#endif
+       { body(); })
       .wait();
 }
 
@@ -369,7 +502,11 @@ void SubmitYieldable(dim3 grid, dim3 block, DevF32 vec, View vw, StackView sv,
     DevF32 dev = vec;
     dev.Init(vw.Block());
     __syncthreads();
+    // GV_COMM_TIMING: this resident segment is the denominator of the
+    // Fetch/Hold/Flush share (a no-op in an untimed build).
+    const unsigned long long gv_seg0 = dev.CommSegmentBegin();
     CLIO_COROC_RUN(vw, sv, make(_cy, dev, vw.Block()));
+    dev.CommStamp(3, gv_seg0);
   });
 }
 
@@ -381,12 +518,14 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
                 u64 plane, u64 nx, u64 ny, u64 nz, u64 zper, u64 ubase,
-                u64 vbase, u64 zbase, u64 zend, View vw, StackView sv) {
+                u64 vbase, u64 zbase, u64 zend, View vw, StackView sv,
+                u32 all) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, vec, vw, sv, [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
     const u64 z0 = zbase + static_cast<u64>(blk) * zper;
     const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
-    SeedCoro(_cy, dev, plane, nx, ny, nz, z0, z1, ubase, vbase);
+    SeedCoro(_cy, dev, plane, nx, ny, nz, z0, z1, ubase, vbase, zbase, zend,
+             all);
   });
 }
 
@@ -394,14 +533,116 @@ void LaunchStep(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
                 u64 plane, u64 nx, u64 ny, u64 nz, u64 zper, u64 ubase,
                 u64 vbase, u64 unext, u64 vnext, float Du, float Dv, float F,
                 float K, float dt, u64 zbase, u64 zend, u64 gen, View vw,
-                StackView sv) {
+                StackView sv, u32 split) {
   (void)info;
   SubmitYieldable(grid, block, vec, vw, sv, [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
-    const u64 z0 = zbase + static_cast<u64>(blk) * zper;
-    const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
+    // SLAB x CHUNK. `split` blocks share a slab of planes and each takes one
+    // contiguous 1/split of every plane in it (see --plane-split).
+    // split == 0 means CYCLIC plane order (--plane-order cyclic): block b
+    // takes planes b, b+B, b+2B, ... so the blocks sweep a contiguous band
+    // together and a plane's three stencil reads land close in time.
+    const u64 nblk = grid.x;
+    const bool nocomp = (split & 0x40000000u) != 0u;
+    const u32 sp = split & ~0x40000000u;
+    const u64 slab = sp ? blk / sp : 0, chunk = sp ? blk % sp : 0;
+    const u64 z0 = sp ? zbase + slab * zper : zbase + blk;
+    const u64 z1 = sp ? ((z0 + zper < zend) ? (z0 + zper) : zend) : zend;
+    const u64 e0 = sp ? chunk * plane / sp : 0;
+    const u64 e1 = sp ? (chunk + 1) * plane / sp : plane;
+    const u64 zs = sp ? 1 : nblk;
     StepCoro(_cy, dev, plane, nx, ny, nz, z0, z1, zbase, zend, gen, ubase, vbase, unext, vnext,
-                    Du, Dv, F, K, dt);
+                    Du, Dv, F, K, dt, e0, nocomp ? e0 : e1, zs);
   });
+}
+
+void LaunchPublish(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
+                   u64 plane, u64 zbase, u64 zend, u64 gen, u64 unext,
+                   u64 vnext, View vw, StackView sv) {
+  (void)info;
+  SubmitYieldable(grid, block, vec, vw, sv, [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
+    (void)blk;
+    PublishCoro(_cy, dev, plane, zbase, zend, gen, unext, vnext);
+  });
+}
+
+void LaunchResolve(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
+                   u64 plane, u64 nz, u64 zper, u64 zbase, u64 zend, u64 gen,
+                   u64 ubase, u64 vbase, u64 unext, u64 vnext, float **tab,
+                   u64 ntab, View vw, StackView sv) {
+  (void)info;
+  const u32 nblk = static_cast<u32>(grid.x);
+  SubmitYieldable(grid, block, vec, vw, sv, [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
+    const u64 zs = zbase + static_cast<u64>(blk) * zper;
+    const u64 z0 = zs < zend ? zs : zend;
+    const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
+    ResolveCoro(_cy, dev, plane, nz, z0, z1, zbase, zend, gen, ubase, vbase,
+                unext, vnext, tab, ntab, blk, nblk);
+  });
+}
+
+void LaunchRelease(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
+                   u64 plane, u64 nz, u64 zper, u64 zbase, u64 zend, u64 ubase,
+                   u64 vbase, u64 unext, u64 vnext, View vw, StackView sv,
+                   u64 flush_gen) {
+  (void)info;
+  const u32 nblk = static_cast<u32>(grid.x);
+  SubmitYieldable(grid, block, vec, vw, sv, [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
+    const u64 zs = zbase + static_cast<u64>(blk) * zper;
+    const u64 z0 = zs < zend ? zs : zend;
+    const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
+    ReleaseCoro(_cy, dev, plane, nz, z0, z1, zbase, zend, ubase, vbase, unext,
+                vnext, blk, nblk, flush_gen);
+  });
+}
+
+/** TWO-PHASE, PHASE 2: the baselines' Step kernel, verbatim in shape (one
+ *  work-group per plane, planes cyclic over groups, one work-item per cell),
+ *  reading each plane through the frame pointer ResolveCoro pinned. A plain
+ *  kernel, so IGC compiles it as the baselines' is compiled (SIMD32, no
+ *  coroutine register budget). */
+void LaunchStencilTab(u32 blocks, u32 threads, float *const *tab, u64 ntab,
+                      u64 plane, u64 nx, u64 ny, u64 nz, u64 zbase, u64 zend,
+                      float Du, float Dv, float F, float K, float dt) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t g = static_cast<size_t>(blocks) * threads;
+  const u64 nzl = zend - zbase;
+  q.parallel_for(sycl::nd_range<1>(g, threads), [=](sycl::nd_item<1> it) {
+     const u64 lid = it.get_local_id(0), grp = it.get_group(0);
+     for (u64 lz = grp; lz < nzl; lz += blocks) {
+       const u64 gzz = zbase + lz;
+       const bool interior = (gzz > 0 && gzz + 1 < nz);
+       const u64 t = lz + 1;   // table index of plane gzz
+       // A pointer loaded from the table is generic to IGC: cast each plane
+       // to global once here (not a coroutine, so `auto` is fine).
+       const float *uz0 = tab[0 * ntab + t];
+       const float *vz0 = tab[1 * ntab + t];
+       const auto uz = GsG(uz0);
+       const auto vz = GsG(vz0);
+       const auto uzm = GsG(interior ? tab[0 * ntab + t - 1] : uz0);
+       const auto uzp = GsG(interior ? tab[0 * ntab + t + 1] : uz0);
+       const auto vzm = GsG(interior ? tab[1 * ntab + t - 1] : vz0);
+       const auto vzp = GsG(interior ? tab[1 * ntab + t + 1] : vz0);
+       const auto unx = GsG(tab[2 * ntab + lz]);
+       const auto vnx = GsG(tab[3 * ntab + lz]);
+       for (u64 i = lid; i < plane; i += threads) {
+         const u64 x = i % nx, y = i / nx;
+         const float uu = uz[i];
+         const float vv = vz[i];
+         float lu, lv;
+         if (x == 0 || x + 1 == nx || y == 0 || y + 1 == ny || !interior) {
+           lu = 0.0f; lv = 0.0f;
+         } else {
+           lu = uz[i - 1] + uz[i + 1] + uz[i - nx] + uz[i + nx] + uzm[i] +
+                uzp[i] - 6.0f * uu;
+           lv = vz[i - 1] + vz[i + 1] + vz[i - nx] + vz[i + nx] + vzm[i] +
+                vzp[i] - 6.0f * vv;
+         }
+         const float uvv = uu * vv * vv;
+         unx[i] = uu + dt * (Du * lu - uvv + F * (1.0f - uu));
+         vnx[i] = vv + dt * (Dv * lv + uvv - (F + K) * vv);
+       }
+     }
+   }).wait();
 }
 
 void LaunchSum(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
@@ -462,27 +703,42 @@ namespace {
 __global__ GV_LAUNCH_BOUNDS void SeedKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nx, u64 ny,
                            u64 nz, u64 zper, u64 ubase, u64 vbase, u64 zbase,
                            u64 zend, View yv,
-                           StackView ys) {
+                           StackView ys, u32 all) {
   CLIO_GPU_INIT(info, nullptr);
   vec.Init(yv.Block());
   __syncthreads();
   const u64 z0 = zbase + static_cast<u64>(yv.Block()) * zper;
   const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
-  CLIO_COROC_RUN(yv, ys, SeedCoro(_cy, vec, plane, nx, ny, nz, z0, z1, ubase, vbase));
+  CLIO_COROC_RUN(yv, ys, SeedCoro(_cy, vec, plane, nx, ny, nz, z0, z1, ubase, vbase, zbase, zend, all));
 }
 
 __global__ GV_LAUNCH_BOUNDS void StepKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nx, u64 ny,
                            u64 nz, u64 zper, u64 ubase, u64 vbase, u64 zbase,
                            u64 zend, u64 unext,
                            u64 vnext, float Du, float Dv, float F, float K,
-                           float dt, u64 gen, View yv, StackView ys) {
+                           float dt, u64 gen, View yv, StackView ys, u32 split) {
   CLIO_GPU_INIT(info, nullptr);
   vec.Init(yv.Block());
   __syncthreads();
-  const u64 z0 = zbase + static_cast<u64>(yv.Block()) * zper;
-  const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
+  const u64 nblk = gridDim.x;
+  const u64 slab = split ? yv.Block() / split : 0;
+  const u64 chunk = split ? yv.Block() % split : 0;
+  const u64 z0 = split ? zbase + slab * zper : zbase + yv.Block();
+  const u64 z1 = split ? ((z0 + zper < zend) ? (z0 + zper) : zend) : zend;
+  const u64 e0 = split ? chunk * plane / split : 0;
+  const u64 e1 = split ? (chunk + 1) * plane / split : plane;
+  const u64 zs = split ? 1 : nblk;
   CLIO_COROC_RUN(yv, ys, StepCoro(_cy, vec, plane, nx, ny, nz, z0, z1, zbase, zend, gen, ubase, vbase, unext,
-                          vnext, Du, Dv, F, K, dt));
+                          vnext, Du, Dv, F, K, dt, e0, e1, zs));
+}
+
+__global__ GV_LAUNCH_BOUNDS void PublishKernel(GpuInfo info, DevF32 vec, u64 plane,
+                              u64 zbase, u64 zend, u64 gen, u64 unext,
+                              u64 vnext, View yv, StackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  vec.Init(yv.Block());
+  __syncthreads();
+  CLIO_COROC_RUN(yv, ys, PublishCoro(_cy, vec, plane, zbase, zend, gen, unext, vnext));
 }
 
 __global__ GV_LAUNCH_BOUNDS void SumKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nz,
@@ -517,21 +773,38 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
                 u64 plane, u64 nx, u64 ny, u64 nz, u64 zper, u64 ubase,
-                u64 vbase, u64 zbase, u64 zend, View vw, StackView sv) {
+                u64 vbase, u64 zbase, u64 zend, View vw, StackView sv,
+                u32 all) {
   SeedKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
       info, vec, plane, nx, ny, nz, zper, ubase, vbase, zbase, zend, vw,
-      sv);
+      sv, all);
 }
 
 void LaunchStep(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
                 u64 plane, u64 nx, u64 ny, u64 nz, u64 zper, u64 ubase,
                 u64 vbase, u64 unext, u64 vnext, float Du, float Dv, float F,
                 float K, float dt, u64 zbase, u64 zend, u64 gen, View vw,
-                StackView sv) {
+                StackView sv, u32 split) {
   StepKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
       info, vec, plane, nx, ny, nz, zper, ubase, vbase, zbase, zend, unext,
-      vnext, Du, Dv, F, K, dt, gen, vw, sv);
+      vnext, Du, Dv, F, K, dt, gen, vw, sv, split);
 }
+
+void LaunchPublish(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
+                   u64 plane, u64 zbase, u64 zend, u64 gen, u64 unext,
+                   u64 vnext, View vw, StackView sv) {
+  PublishKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
+      info, vec, plane, zbase, zend, gen, unext, vnext, vw, sv);
+}
+
+// Two-phase mode is SYCL-only for now; the host refuses it on CUDA.
+void LaunchResolve(dim3, dim3, const GpuInfo &, DevF32, u64, u64, u64, u64,
+                   u64, u64, u64, u64, u64, u64, float **, u64, View,
+                   StackView) {}
+void LaunchRelease(dim3, dim3, const GpuInfo &, DevF32, u64, u64, u64, u64,
+                   u64, u64, u64, u64, u64, View, StackView, u64) {}
+void LaunchStencilTab(u32, u32, float *const *, u64, u64, u64, u64, u64, u64,
+                      u64, float, float, float, float, float) {}
 
 void LaunchSum(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
                u64 plane, u64 nz, u64 zper, u64 vbase, double *out,
@@ -559,6 +832,7 @@ void LaunchBaseline(u32 threads, const float *uzm, const float *uz,
 // CTE client, whose members are compiled out of the CUDA device pass.
 #include "../bench_dist.h"
 #include "../bench_ckpt.h"
+#include "../gv_comm_report.h"
 // Host-only for the same reason: the prefetcher is pure host policy that
 // speaks to the CTE, and never appears in a kernel.
 #include "grayscott_prefetch.h"
@@ -587,18 +861,45 @@ class YieldRunner {
     drv_.SetYieldObserver(vec.YieldObserver());
   }
 
+  double KernelMs() const { return drv_.KernelMs(); }
+  void ResetTimers() { drv_.ResetTimers(); }
+
   template <typename LaunchT>
   u32 Run(LaunchT &&launch) {
     // Both resets are required: RunToCompletion does not reset, so a reused
     // runner whose driver still reads "done" skips the launch entirely.
     drv_.Reset();
     stack_.Reset();
-    return drv_.RunToCompletion(
+    // WHO IS RELAUNCHED, AND WHY: blocks parked with no tag (relaunched
+    // every round to re-check) against blocks resumed because their task's
+    // completion word flipped. Printed for any pass that needs > 50 rounds.
+    unsigned long long n_tag0 = 0, n_ready = 0, n_wait = 0;
+    std::map<clio::run::u32, unsigned long long> rp0;
+    const u32 rounds = drv_.RunToCompletion(
         [&](dim3 g, dim3 b, gy::YieldableView<> view) {
           launch(g, b, view, stack_.View());
         },
         [] {}, /*max_rounds=*/2000000,
-      gv::ResumeWhenComplete);
+        [&](clio::run::u32 blk, clio::run::u64 tag) {
+          if (tag == 0) {
+            ++n_tag0;
+            ++rp0[drv_.BlockState(blk).resume_point_];
+            return true;
+          }
+          const bool r = gv::ResumeWhenComplete(blk, tag);
+          (r ? n_ready : n_wait)++;
+          return r;
+        });
+    if (rounds > 50) {
+      std::fprintf(stderr, "  [relaunch] rounds=%u tag0_relaunches=%llu "
+                   "tag_ready=%llu tag_still_waiting=%llu | tag0 resume "
+                   "points:", rounds, n_tag0, n_ready, n_wait);
+      for (const auto &kv : rp0) {
+        std::fprintf(stderr, " %u:%llu", kv.first, kv.second);
+      }
+      std::fprintf(stderr, "\n");
+    }
+    return rounds;
   }
 
  private:
@@ -610,6 +911,37 @@ class YieldRunner {
 
 int main(int argc, char **argv) {
   u32 blocks = 64, threads = 256, slots = 12, steps = 4;
+  // --set-size N: cache SETS of N ways, as many as it takes to hold
+  // blocks * slots pages. Default 0 keeps one set per block, `slots` wide.
+  u32 set_size_arg = 0;
+  // --plane-split G: G blocks share each slab of planes, each taking 1/G of
+  // every plane. MPI's grid-stride works on ~one plane across the whole GPU
+  // at a time, so the z-1/z/z+1 planes stay in L3 and each is read from
+  // memory once; one slab per block had 1024 slabs in flight, evicted the
+  // neighbours between uses and read ~3x the bytes (VTune: 207 GB vs 68 GB
+  // per 4 steps at 1024 blocks). Default 1 keeps one slab per block.
+  u32 plane_split = 1;
+  // --plane-order cyclic: block b steps planes b, b+B, b+2B, ... (the
+  // baselines' grid-stride order) instead of a contiguous slab.
+  bool plane_cyclic = false;
+  // --two-phase: the coroutine kernel fetches, pins and resolves every page
+  // of the step into a pointer table; a plain kernel (the baselines' Step,
+  // verbatim) computes through it; a second coroutine pass unpins. Paging
+  // stays Eternia's; only the arithmetic leaves the coroutine, where the
+  // stencil ran SIMD16 under the coroutine's register budget (measured
+  // ~1.7x the baselines' stencil at 1024 blocks with paging at ~8%).
+  bool two_phase = false;
+  // --ooc (with --two-phase): OUT OF CORE. The deck is larger than the frame
+  // cache, so each step walks the node's slab in BANDS that fit the cache
+  // (resolve band -> stencil -> release), and the release writes every
+  // output plane back with an asynchronous CoBeginFlush at the generation
+  // the next step demands. The seed publishes every plane. That makes any
+  // plane evictable and refetchable; resident runs (E1) keep edge-only
+  // publishing.
+  bool ooc = false;
+  // GS_NO_COMPUTE=1 (diagnostic): every page operation runs, the stencil
+  // arithmetic does not, so step time minus this is the stencil's share.
+  const bool no_compute = getenv("GS_NO_COMPUTE") != nullptr;
   // Z-SLAB DECOMPOSITION, like the MPI edition. --nodes N --node i gives
   // this process a contiguous slab of the SAME global field; nz stays
   // global so the fixed boundary (z == 0, z == nz-1) is honoured however
@@ -685,6 +1017,11 @@ int main(int argc, char **argv) {
       return (i + 1 < argc) ? std::strtof(argv[++i], nullptr) : 0.0f;
     };
     if (a == "--blocks") blocks = static_cast<u32>(next());
+    else if (a == "--set-size") set_size_arg = static_cast<u32>(next());
+    else if (a == "--plane-split") plane_split = static_cast<u32>(next());
+    else if (a == "--plane-order" && i + 1 < argc) plane_cyclic = (std::string(argv[++i]) == "cyclic");
+    else if (a == "--two-phase") two_phase = true;
+    else if (a == "--ooc") ooc = true;
     else if (a == "--threads") threads = static_cast<u32>(next());
     else if (a == "--slots") slots = static_cast<u32>(next());
     else if (a == "--steps") steps = static_cast<u32>(next());
@@ -765,7 +1102,13 @@ int main(int argc, char **argv) {
   // The kernel holds 6 input planes + 2 output planes at once. A smaller cache
   // could evict a plane the kernel is still reading -- that would not crash,
   // it would silently read whatever replaced it, so it is refused.
-  const u32 kNeededSlots = 10;
+  // Out of core the two-phase bands are sized to the cache, so only a band of
+  // one plane per block (4 pages each, plus the halos) has to fit.
+  const u32 kNeededSlots = (ooc && two_phase) ? 6 : 10;
+  if (ooc && !two_phase) {
+    std::fprintf(stderr, "GRAYSCOTT ERROR: --ooc needs --two-phase\n");
+    return 2;
+  }
   if (slots < kNeededSlots) {
     std::fprintf(stderr,
                  "GRAYSCOTT ERROR: slots=%u but the stencil holds %u planes at "
@@ -840,6 +1183,13 @@ int main(int argc, char **argv) {
     return 2;
   }
   const u64 zper = ((zend - zbase) + blocks - 1) / blocks;
+  if (plane_split == 0 || blocks % plane_split != 0) {
+    std::fprintf(stderr, "GRAYSCOTT ERROR: --plane-split %u must divide "
+                 "--blocks %u\n", plane_split, blocks);
+    return 2;
+  }
+  const u64 slabs = blocks / plane_split;
+  const u64 zper_step = ((zend - zbase) + slabs - 1) / slabs;
   const u64 region = plane * nz;
   const u64 n = 4 * region;
   const double logical_mb =
@@ -1009,11 +1359,41 @@ int main(int argc, char **argv) {
     red_tag = t->tag_id_;
   }
 
+  // NARROW SETS WHEN ASKED. With one set per block the set is `slots` wide
+  // (516 for a resident 32 GB deck at 64 blocks), and every Find /
+  // FindClaimed is a linear scan of the whole set -- run by every thread,
+  // eight lookups per plane. The same capacity in narrow sets makes each
+  // lookup a scan of set_size entries; pages hash across sets (SetOf).
+  const u32 cap_pages = blocks * (slots < 24u ? 24u : slots);
+  const u32 vec_set_size =
+      set_size_arg != 0 ? set_size_arg : (slots < 24u ? 24u : slots);
+  const u32 vec_nsets =
+      set_size_arg != 0 ? (cap_pages + set_size_arg - 1) / set_size_arg : 0;
   gv::Vector<float> vec("gv_grayscott", {0}, page_bytes, blocks,
-                        slots < 24u ? 24u : slots, n);
+                        vec_set_size, n, clio::run::PoolId::GetNull(), 0, 1,
+                        vec_nsets, set_size_arg != 0 ? cap_pages : 0);
+  if (set_size_arg != 0) {
+    std::printf("  cache: %u sets x %u ways over %u pages\n", vec_nsets,
+                vec_set_size, cap_pages);
+  }
   vec.EnableStats();
   auto dev = vec.GetDevice(0);
   YieldRunner runner(blocks, threads);
+  YieldRunner pub_runner(1, threads);
+  const u64 ntab = (zend - zbase) + 2;
+  // OUT-OF-CORE BAND: planes per resolve/release pass. Each plane pins 4
+  // pages (u, v and both outputs), plus 2 halo planes of u and v; keep a
+  // quarter of the cache free so set conflicts do not evict a pinned page.
+  const u64 frames = static_cast<u64>(slots) * blocks;
+  u64 ooc_band = (frames * 3 / 4 > 8) ? (frames * 3 / 4 - 4) / 4 : 1;
+  if (ooc_band > zend - zbase) ooc_band = zend - zbase;
+  if (ooc) {
+    std::printf("  out of core: %llu frames, bands of %llu planes (%llu per "
+                "node slab)\n", (unsigned long long)frames,
+                (unsigned long long)ooc_band,
+                (unsigned long long)(zend - zbase));
+  }
+  float **d_tab = ctp::GpuApi::Malloc<float *>(4 * ntab * sizeof(float *));
 
   const u64 ubase = 0, vbase = region, unext = 2 * region, vnext = 3 * region;
 
@@ -1048,7 +1428,18 @@ int main(int argc, char **argv) {
 
   runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
     gs::LaunchSeed(g, b, gpu, dev, plane, nx, ny, nz, zper, ubase, vbase,
-                   zbase, zend, vw, sv);
+                   zbase, zend, vw, sv, ooc ? 1u : 0u);
+  });
+  ctp::GpuApi::Synchronize();
+  // TOUCH THE OUTPUT REGIONS TOO, before the clock starts. The baselines
+  // allocate and initialise all four fields up front; here unext/vnext were
+  // never written, so step 0's first write to each of their pages faulted
+  // (16000 faults at 32 GB/node) inside the timed region -- a setup cost the
+  // baselines do not pay. Seeding them with the same generator makes them
+  // resident; step 0 overwrites every value, so the result is unchanged.
+  runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+    gs::LaunchSeed(g, b, gpu, dev, plane, nx, ny, nz, zper, unext, vnext,
+                   zbase, zend, vw, sv, 0u);
   });
   ctp::GpuApi::Synchronize();
   // NO seed-side flush/barrier/invalidate. SeedCoro publishes its own
@@ -1152,7 +1543,7 @@ int main(int argc, char **argv) {
       runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         gs::LaunchSeed(g, b, gpu, dev, plane, nx, ny, nz, zper, ubase, vbase,
-                       zbase, zend, vw, sv);
+                       zbase, zend, vw, sv, ooc ? 1u : 0u);
       });
       ctp::GpuApi::Synchronize();
     }
@@ -1162,6 +1553,10 @@ int main(int argc, char **argv) {
     vec.PrefetchRunBegin();
     ctp::GpuApi::Synchronize();
     const double t0 = NowMs();
+    // E1 split: in-kernel Fetch/Hold/Flush share (GV_COMM_TIMING), and in
+    // two-phase mode the host time of the paging kernels vs the stencil.
+    clio_gv_bench::CommAcc gs_comm;
+    double gs_step_ms = 0.0, gs_tab_ms = 0.0;
     u64 cu = ubase, cv = vbase, nu = unext, nv = vnext;
     // Checkpoints are KEPT ALIVE for the whole run: dropping the handle would
     // let the copy tag go away and with it the bytes we just produced.
@@ -1188,15 +1583,72 @@ int main(int argc, char **argv) {
           return 1;
         }
       } else {
-        runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
-                       gy::YieldStackView sv) {
-          gs::LaunchStep(g, b, gpu, dev, plane, nx, ny, nz, zper, cu, cv, nu,
-                         nv, Du, Dv, F, K, dt, zbase, zend,
-                         // GS_NO_HALO=1 forces generation 0 -- "any
-                         // version" -- which is the control: it disables
-                         // the DEMAND itself, not merely the barrier.
-                         halo_off ? 0 : static_cast<u64>(s) + 1, vw, sv);
-        });
+        const auto st0 = vec.ReadStats(0);
+        const double ts0 = NowMs();
+        runner.ResetTimers();
+        u32 srounds = 0;
+        if (two_phase) {
+          // Resident: one band = the whole slab. Out of core: bands of
+          // `band` planes (see ooc_band below), each flushed on release.
+          const u64 bstep = ooc ? ooc_band : (zend - zbase);
+          const u64 hgen = halo_off ? 0 : static_cast<u64>(s) + 1;
+          const u64 fgen = ooc ? static_cast<u64>(s) + 2 : 0;
+          for (u64 zb = zbase; zb < zend; zb += bstep) {
+            const u64 ze = (zb + bstep < zend) ? zb + bstep : zend;
+            const u64 bper = ((ze - zb) + blocks - 1) / blocks;
+            srounds += runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                      gy::YieldStackView sv) {
+              gs::LaunchResolve(g, b, gpu, dev, plane, nz, ooc ? bper : zper,
+                                zb, ze, hgen, cu, cv, nu, nv, d_tab, ntab, vw,
+                                sv);
+            });
+            if (!no_compute) {
+              const double tt0 = NowMs();
+              gs::LaunchStencilTab(blocks, threads, d_tab, ntab, plane, nx, ny,
+                                   nz, zb, ze, Du, Dv, F, K, dt);
+              ctp::GpuApi::Synchronize();
+              gs_tab_ms += NowMs() - tt0;
+            }
+            srounds += runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                      gy::YieldStackView sv) {
+              gs::LaunchRelease(g, b, gpu, dev, plane, nz, ooc ? bper : zper,
+                                zb, ze, cu, cv, nu, nv, vw, sv, fgen);
+            });
+          }
+        } else {
+          srounds = runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                   gy::YieldStackView sv) {
+            gs::LaunchStep(g, b, gpu, dev, plane, nx, ny, nz, zper_step, cu, cv,
+                           nu, nv, Du, Dv, F, K, dt, zbase, zend,
+                           // GS_NO_HALO=1 forces generation 0 -- "any
+                           // version" -- which is the control: it disables
+                           // the DEMAND itself, not merely the barrier.
+                           halo_off ? 0 : static_cast<u64>(s) + 1, vw, sv,
+                           (plane_cyclic ? 0u : plane_split) |
+                               (no_compute ? 0x40000000u : 0u));
+          });
+        }
+        // Publish the node's edge planes once every block's writes are done.
+        // Only a peer node reads them, so a single node skips it.
+        // Out of core the release already flushed every plane at s+2.
+        if (nodes > 1 && !ooc) {
+          pub_runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                             gy::YieldStackView sv) {
+            gs::LaunchPublish(g, b, gpu, dev, plane, zbase, zend,
+                              static_cast<u64>(s) + 2, nu, nv, vw, sv);
+          });
+        }
+        // PER-STEP SPLIT: whether the time is first-touch faults (step 0
+        // writes a fresh output region), relaunch rounds, or the kernel.
+        const auto st1 = vec.ReadStats(0);
+        gs_comm.Add(st0, st1);
+        gs_step_ms += NowMs() - ts0;
+        std::fprintf(stderr,
+                     "  step %u: %.1fms rounds=%u gpu=%.1fms faults=%llu "
+                     "puts=%llu\n", s, NowMs() - ts0, srounds,
+                     runner.KernelMs(),
+                     (unsigned long long)(st1.faults - st0.faults),
+                     (unsigned long long)(st1.puts - st0.puts));
       }
       // NO per-step flush/barrier/invalidate: the generational demand IS
       // the halo exchange. A halo fetch names generation s+1 and a stale
@@ -1256,6 +1708,18 @@ int main(int argc, char **argv) {
     ctp::GpuApi::Synchronize();
     const double ms = NowMs() - t0;
     if (ms < best_ms) best_ms = ms;
+    if (gs_step_ms > 0.0) {
+      if (two_phase) {
+        // Everything but the stencil is the paging kernels (resolve, release,
+        // edge publish): communication by E1's definition.
+        std::printf("COMM grayscott two-phase: comm_ms=%.1f (resolve+release"
+                    "+publish) compute_ms=%.1f (stencil) of %.1f ms over %u "
+                    "steps\n", gs_step_ms - gs_tab_ms, gs_tab_ms, gs_step_ms,
+                    steps);
+      } else {
+        gs_comm.Print("grayscott", gs_step_ms);
+      }
+    }
     // AFTER the timer, deliberately. The SUBMISSIONS are inside the timed
     // region -- they are host time in the round gaps and the run really pays
     // for them -- but the run never waits on a rescore to complete, so
@@ -1313,6 +1777,21 @@ int main(int argc, char **argv) {
 
   const auto st = vec.ReadStats(0);
   const auto pf = vec.ReadPrefetchStats();
+  // EDGE-ONLY PUBLISHING IS CORRECT ONLY WHILE RESIDENT. The step publishes
+  // just the node-edge planes and leaves every interior plane dirty in the
+  // cache, and a gpu_vector Page has no dirty bit: an eviction drops the
+  // frame without writing it back, and the refetch reads an older copy.
+  // Measured: 33 evictions at 256 blocks with 4% slot headroom moved the
+  // checksum in the 6th digit. Until the cache tracks dirty pages, a run
+  // that evicted anything reports failure instead of a wrong number.
+  if (st.evicts != 0 && !ooc) {
+    std::fprintf(stderr,
+                 "GRAYSCOTT ERROR: %llu page(s) evicted; interior planes are "
+                 "not written back, so the result is invalid. Give the cache "
+                 "headroom (--slots) so the deck stays resident.\n",
+                 (unsigned long long)st.evicts);
+    return 1;
+  }
   // Bytes touched per step: 6 input planes + 2 output planes per z.
   const double moved_gb =
       static_cast<double>(nz) * plane * sizeof(float) * 8.0 * steps /

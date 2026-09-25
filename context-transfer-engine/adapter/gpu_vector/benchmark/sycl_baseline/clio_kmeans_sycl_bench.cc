@@ -283,6 +283,11 @@ int main(int argc, char **argv) {
     }
   }
   const double ms = gvc::NowMs() - t0;
+  // E1 COMM LINE, EVERY rank: wall time inside this substrate's exchanges
+  // (it includes waiting on the slowest peer), as a share of the timed run.
+  // Same shape as the paged editions' "COMM" line; the harness takes the max.
+  std::printf("COMM %s %s: rank %d comm_ms=%.1f of %.1f ms (%.1f%%)\n", "kmeans",
+              gvc::Comm::Name(), rank, t_comm, ms, ms > 0.0 ? 100.0 * t_comm / ms : 0.0);
 
   q.memcpy(h_cent.data(), d_cent, kd * sizeof(float)).wait();
   double csum = 0.0;

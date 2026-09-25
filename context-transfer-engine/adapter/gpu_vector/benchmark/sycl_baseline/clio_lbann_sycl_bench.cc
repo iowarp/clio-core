@@ -279,7 +279,9 @@ int main(int argc, char **argv) {
   float *d_d2_own = comm.Alloc<float>(oper * B);
   double *d_lp = comm.Alloc<double>(O * B);
   double *d_lp_own = comm.Alloc<double>(oper * B);
-  float *d_d1p = comm.Alloc<float>(static_cast<u64>(nranks) * H * B);
+  // Received d1 slices: hper*B from every rank (= H*B), not the all-gather's
+  // nranks*H*B -- at 128 ranks that buffer alone would be 64 GB.
+  float *d_d1p = comm.Alloc<float>(H * B);
   float *d_d1p_own = comm.Alloc<float>(H * B);
   float *d_d1 = sycl::malloc_device<float>(H * B, q);
   std::vector<double> h_lp(O * B);
@@ -288,18 +290,26 @@ int main(int argc, char **argv) {
   comm.Barrier();
   const double t0 = gvc::NowMs();
   double t_comm = 0.0;
+  // Per-kernel wall time (every launch here already waits), for the E1
+  // phase comparison against the paged edition.
+  double ph[5] = {0, 0, 0, 0, 0};
+  double pk = 0.0;
   for (u64 s = 0; s < steps; ++s) {
+    pk = gvc::NowMs();
     // fwd1 own rows -> allgather a1. The kernels write the OWN slice into
     // the gathered layout; the substrate gathers from a contiguous own
     // buffer, so copy the slice out and gather it back in rank order.
     Fwd1(q, blocks, threads, d_w1, d_b1, h0, h1, I, B, d_x, d_a1);
+    ph[0] += gvc::NowMs() - pk;
     q.memcpy(d_a1_own, d_a1 + h0 * B, hper * B * sizeof(float)).wait();
     double c0 = gvc::NowMs();
     comm.Allgather(d_a1_own, d_a1, hper * B);
     t_comm += gvc::NowMs() - c0;
     // fwd2 own rows -> allgather d2 and the loss parts.
+    pk = gvc::NowMs();
     Fwd2(q, blocks, threads, d_w2, d_b2, o0, o1, H, O, B, d_a1, d_y, d_d2,
          d_lp);
+    ph[1] += gvc::NowMs() - pk;
     q.memcpy(d_d2_own, d_d2 + o0 * B, oper * B * sizeof(float));
     q.memcpy(d_lp_own, d_lp + o0 * B, oper * B * sizeof(double));
     q.wait();
@@ -312,17 +322,39 @@ int main(int argc, char **argv) {
     for (u64 i = 0; i < O * B; ++i) l += h_lp[i];
     loss[s] = l / static_cast<double>(B * O);
     // bwd1: own o-partial -> allgather -> combine IN RANK ORDER.
+    pk = gvc::NowMs();
     Bwd1Partial(q, blocks, threads, d_w2, o0, o1, H, B, d_d2, d_d1p_own, rpp);
+    ph[2] += gvc::NowMs() - pk;
     c0 = gvc::NowMs();
-    comm.Allgather(d_d1p_own, d_d1p, H * B);
+    // SLICE EXCHANGE: rank q needs only rows [q*hper, (q+1)*hper) of d1
+    // (Upd1 touches its own W1 and b1 rows), so each rank sends each peer
+    // just that slice of its partial and combines the slices for its own
+    // rows in rank order -- the same float order as the full combine.
+    comm.Alltoall(d_d1p_own, d_d1p, hper * B);
     t_comm += gvc::NowMs() - c0;
-    Bwd1Combine(q, blocks, threads, d_d1p, nranks, H, B, d_a1, d_d1);
-    // updates on own shards (d2/a1/d1 are full everywhere).
+    Bwd1Combine(q, blocks, threads, d_d1p, nranks, hper, B, d_a1 + h0 * B,
+                d_d1 + h0 * B);
+    // updates on own shards (d2/a1 are full everywhere; d1 is valid on this
+    // rank's rows only, which are the only rows Upd1 reads).
+    pk = gvc::NowMs();
     Upd2(q, blocks, threads, d_w2, d_b2, o0, o1, H, B, d_a1, d_d2, lr);
+    ph[3] += gvc::NowMs() - pk;
+    pk = gvc::NowMs();
     Upd1(q, blocks, threads, d_w1, d_b1, h0, h1, I, B, d_x, d_d1, lr);
+    ph[4] += gvc::NowMs() - pk;
+  }
+  if (rank == 0) {
+    std::printf("  phases per step (ms): fwd1=%.1f fwd2=%.1f bwd1=%.1f "
+                "upd2=%.1f upd1=%.1f\n", ph[0] / steps, ph[1] / steps,
+                ph[2] / steps, ph[3] / steps, ph[4] / steps);
   }
   comm.Barrier();
   const double ms = gvc::NowMs() - t0;
+  // E1 COMM LINE, EVERY rank: wall time inside this substrate's exchanges
+  // (it includes waiting on the slowest peer), as a share of the timed run.
+  // Same shape as the paged editions' "COMM" line; the harness takes the max.
+  std::printf("COMM %s %s: rank %d comm_ms=%.1f of %.1f ms (%.1f%%)\n", "lbann",
+              gvc::Comm::Name(), rank, t_comm, ms, ms > 0.0 ? 100.0 * t_comm / ms : 0.0);
 
   // Weight digest over the LOGICAL ids (order-independent integer sum).
   const unsigned long long dg_loc =
@@ -352,6 +384,9 @@ int main(int argc, char **argv) {
       float *r_b1 = sycl::malloc_device<float>(H, q);
       float *r_w2 = sycl::malloc_device<float>(w2_n, q);
       float *r_b2 = sycl::malloc_device<float>(O, q);
+      // Every rank-range's partial of d1, for the reference combine.
+      float *d_refp = sycl::malloc_device<float>(
+          static_cast<u64>(nranks) * H * B, q);
       SeedShard(q, r_w1, 0, w1_n);
       SeedShard(q, r_b1, w1_n, H);
       SeedShard(q, r_w2, w1_n + H, w2_n);
@@ -369,9 +404,9 @@ int main(int argc, char **argv) {
           Bwd1Partial(q, blocks, threads, r_w2 + static_cast<u64>(r) * oper * H,
                       static_cast<u64>(r) * oper,
                       static_cast<u64>(r + 1) * oper, H, B, d_d2,
-                      d_d1p + static_cast<u64>(r) * H * B, rpp);
+                      d_refp + static_cast<u64>(r) * H * B, rpp);
         }
-        Bwd1Combine(q, blocks, threads, d_d1p, nranks, H, B, d_a1, d_d1);
+        Bwd1Combine(q, blocks, threads, d_refp, nranks, H, B, d_a1, d_d1);
         Upd2(q, blocks, threads, r_w2, r_b2, 0, O, H, B, d_a1, d_d2, lr);
         Upd1(q, blocks, threads, r_w1, r_b1, 0, H, I, B, d_x, d_d1, lr);
       }
@@ -399,7 +434,7 @@ int main(int argc, char **argv) {
         std::printf("  WEIGHT GATE: PASS (bit-equal to dense reference)\n");
       }
       sycl::free(r_w1, q); sycl::free(r_b1, q);
-      sycl::free(r_w2, q); sycl::free(r_b2, q);
+      sycl::free(r_w2, q); sycl::free(r_b2, q); sycl::free(d_refp, q);
     }
     std::printf("LBANN %s: %s\n", gvc::Comm::Name(),
                 rc == 0 ? "ALL GATES PASS" : "GATE FAILURE");

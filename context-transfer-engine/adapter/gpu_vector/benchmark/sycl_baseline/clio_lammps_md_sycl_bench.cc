@@ -1035,6 +1035,28 @@ int main(int argc, char **argv) {
       q.memset(r.err, 0, sizeof(int)).wait();
       BuildListKernel(q, fargs(0), d_nl, frlist, d_cnt, r.err);
       const bool bad = read_err();
+      // MD_LISTSTAT=1: total list entries, to compare editions' work.
+      if (std::getenv("MD_LISTSTAT") != nullptr) {
+        std::vector<u32> hc(local_slots);
+        q.memcpy(hc.data(), d_cnt, local_slots * sizeof(u32)).wait();
+        unsigned long long tot = 0, mx = 0, atoms = 0;
+        for (u32 c : hc) { tot += c; if (c > mx) mx = c; atoms += (c != 0); }
+        // SLOT PACKING: empty slots BEFORE an occupied one in the same bin
+        // (a hole a SIMD lane idles on), and 32-slot groups' lane use.
+        const u64 capv = static_cast<u64>(a.cap);
+        unsigned long long holes = 0, grp_busy = 0, grp_n = 0;
+        for (u64 s0 = 0; s0 + 1 < hc.size(); ++s0) {
+          if ((s0 % capv) != capv - 1 && hc[s0] == 0 && hc[s0 + 1] != 0) ++holes;
+        }
+        for (u64 g0 = 0; g0 + 32 <= hc.size(); g0 += 32) {
+          unsigned busy = 0;
+          for (u64 k = 0; k < 32; ++k) busy += (hc[g0 + k] != 0);
+          if (busy) { grp_busy += busy; ++grp_n; }
+        }
+        std::printf("  [liststat] entries=%llu atoms_with_nbrs=%llu max=%llu "
+                    "holes=%llu lanes_busy_per_active_32=%.2f\n", tot, atoms, mx,
+                    holes, grp_n ? double(grp_busy) / grp_n : 0.0);
+      }
       t_build += gvc::NowMs() - t;
       if (bad && root) {
         std::fprintf(stderr, "list: an atom has more than --maxneigh %u "
@@ -1214,6 +1236,11 @@ int main(int argc, char **argv) {
     }
     comm.Barrier();
     const double run_ms = gvc::NowMs() - t0;
+    // E1 COMM LINE, EVERY rank: wall time inside this substrate's exchanges
+    // (it includes waiting on the slowest peer), as a share of the timed run.
+    // Same shape as the paged editions' "COMM" line; the harness takes the max.
+    std::printf("COMM %s %s: rank %d comm_ms=%.1f of %.1f ms (%.1f%%)\n", "lammps_md",
+                gvc::Comm::Name(), mype, t_halo, run_ms, run_ms > 0.0 ? 100.0 * t_halo / run_ms : 0.0);
     exchange_halo(dx_ext);
     force(1);
     const double ke_n = thermo_ke();

@@ -108,6 +108,91 @@ using gx::Spline4;
  * ===================================================== */
 namespace clio::gv_bench::gmx {
 
+// GLOBAL, SAID OUT LOUD (see the kmeans and grayscott editions). The bin
+// body is out of line so it is register-allocated alone, and a call the
+// kernel does not inline cannot prove the page or the atom arrays are
+// global: every load and the mesh atomic became a generic-address check.
+#if CTP_ENABLE_SYCL && defined(__SYCL_DEVICE_ONLY__)
+template <typename T>
+CTP_GPU_FUN inline auto GxG(T *p) {
+  return ::sycl::address_space_cast<::sycl::access::address_space::global_space,
+                                    ::sycl::access::decorated::yes>(p);
+}
+CTP_GPU_FUN inline void GxAtomicAdd(unsigned long long *p,
+                                    unsigned long long v) {
+  ::sycl::atomic_ref<unsigned long long, ::sycl::memory_order::relaxed,
+                     ::sycl::memory_scope::device,
+                     ::sycl::access::address_space::global_space>(*p)
+      .fetch_add(v);
+}
+#else
+template <typename T>
+CTP_GPU_FUN inline T *GxG(T *p) { return p; }
+CTP_GPU_FUN inline void GxAtomicAdd(unsigned long long *p,
+                                    unsigned long long v) {
+  atomicAdd(p, v);
+}
+#endif
+
+/** One source bin's atoms into plane z (`dst` = the plane's first point). */
+CTP_GPU_FUN __attribute__((noinline)) void SpreadBin(
+    unsigned long long *dst, u64 z, u64 K, u64 b, const float *ax,
+    const float *ay, const float *az, const long long *aq,
+    const u32 *bin_start, u32 tid, u32 nthreads) {
+  const u32 a0 = GxG(bin_start)[b];
+  const u32 a1 = GxG(bin_start)[b + 1];
+  for (u32 a = a0 + tid; a < a1; a += nthreads) {
+      const float x = GxG(ax)[a];
+      const float y = GxG(ay)[a];
+      const float zz = GxG(az)[a];
+      const int ix0 = static_cast<int>(floorf(x)) - 1;
+      const int iy0 = static_cast<int>(floorf(y)) - 1;
+      // Which of the atom's four z-nodes is THIS plane? The bin choice
+      // already guarantees (z - b) mod K lands in 0..3.
+      const int dzw = static_cast<int>((z + K - b) % K);
+      float wx[4];
+      float wy[4];
+      float wz[4];
+      Spline4(x - floorf(x), wx);
+      Spline4(y - floorf(y), wy);
+      Spline4(zz - floorf(zz), wz);
+      // EXACTLY-CONSERVING SPLIT. Rounding each of the 64 pieces
+      // independently leaves a per-atom residue (measured: 809 fixed-point
+      // units over 200k atoms), so the LAST piece at each level absorbs
+      // the remainder: the four z-pieces sum to q exactly, and the 16
+      // xy-pieces of each z-piece sum to it exactly. Deterministic, so
+      // the dense reference computes the identical values.
+      long long qz4[4];
+      {
+        long long run = 0;
+        for (int j = 0; j < 3; ++j) {
+          qz4[j] = static_cast<long long>(
+              FxRound(static_cast<double>(GxG(aq)[a]) * wz[j]));
+          run += qz4[j];
+        }
+        qz4[3] = GxG(aq)[a] - run;
+      }
+      const long long qz = qz4[dzw];
+      long long xy_run = 0;
+      for (int jy = 0; jy < 4; ++jy) {
+        const u64 gy_ = static_cast<u64>((iy0 + jy + static_cast<int>(K)) %
+                                         static_cast<int>(K));
+        for (int jx = 0; jx < 4; ++jx) {
+          const u64 gx = static_cast<u64>((ix0 + jx + static_cast<int>(K)) %
+                                          static_cast<int>(K));
+          const long long v =
+              (jy == 3 && jx == 3)
+                  ? qz - xy_run
+                  : static_cast<long long>(FxRound(
+                        static_cast<double>(qz) * wy[jy] * wx[jx]));
+          xy_run += v;
+          GxAtomicAdd(&dst[gy_ * K + gx],
+                      static_cast<unsigned long long>(v));
+        }
+      }
+    }
+}
+
 /**
  * Spread this block's planes. For plane z the contributing atoms are those
  * whose spline base bin b satisfies b <= z <= b+3, i.e. bins z-3..z (mod K).
@@ -122,75 +207,24 @@ CTP_GPU_FUN CLIO_COROC_INLINE void SpreadCoro(gv::DeviceVector<unsigned long lon
                                     const float *ax, const float *ay,
                                     const float *az, const long long *aq,
                                     const u32 *bin_start, u64 K, u64 plane,
-                                    u64 z0, u64 z1) {
+                                    u64 z0, u64 z1, u32 publish) {
   for (u64 z = z0; z < z1; ++z) {
     CO_AWAIT(mesh.CoFetch(0, z * plane, plane));
     auto h = CO_AWAIT(mesh.CoHoldPage(z * plane, plane, /*write=*/true));
     // Four source bins feed plane z; threads stride the atoms of each bin.
     for (int db = -3; db <= 0; ++db) {
       const u64 b = (z + K + static_cast<u64>(db + static_cast<int>(K))) % K;
-      const u32 a0 = bin_start[b];
-      const u32 a1 = bin_start[b + 1];
-      for (u32 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
-        const float x = ax[a];
-        const float y = ay[a];
-        const float zz = az[a];
-        const int ix0 = static_cast<int>(floorf(x)) - 1;
-        const int iy0 = static_cast<int>(floorf(y)) - 1;
-        // Which of the atom's four z-nodes is THIS plane? The bin choice
-        // already guarantees (z - b) mod K lands in 0..3.
-        const int dzw = static_cast<int>((z + K - b) % K);
-        float wx[4];
-        float wy[4];
-        float wz[4];
-        Spline4(x - floorf(x), wx);
-        Spline4(y - floorf(y), wy);
-        Spline4(zz - floorf(zz), wz);
-        // EXACTLY-CONSERVING SPLIT. Rounding each of the 64 pieces
-        // independently leaves a per-atom residue (measured: 809 fixed-point
-        // units over 200k atoms), so the LAST piece at each level absorbs
-        // the remainder: the four z-pieces sum to q exactly, and the 16
-        // xy-pieces of each z-piece sum to it exactly. Deterministic, so
-        // the dense reference computes the identical values.
-        long long qz4[4];
-        {
-          long long run = 0;
-          for (int j = 0; j < 3; ++j) {
-            qz4[j] = static_cast<long long>(
-                FxRound(static_cast<double>(aq[a]) * wz[j]));
-            run += qz4[j];
-          }
-          qz4[3] = aq[a] - run;
-        }
-        const long long qz = qz4[dzw];
-        long long xy_run = 0;
-        for (int jy = 0; jy < 4; ++jy) {
-          const u64 gy_ = static_cast<u64>((iy0 + jy + static_cast<int>(K)) %
-                                           static_cast<int>(K));
-          for (int jx = 0; jx < 4; ++jx) {
-            const u64 gx = static_cast<u64>((ix0 + jx + static_cast<int>(K)) %
-                                            static_cast<int>(K));
-            const long long v =
-                (jy == 3 && jx == 3)
-                    ? qz - xy_run
-                    : static_cast<long long>(FxRound(
-                          static_cast<double>(qz) * wy[jy] * wx[jx]));
-            xy_run += v;
-            atomicAdd(reinterpret_cast<unsigned long long *>(
-                          &h[z * plane + gy_ * K + gx]),
-                      static_cast<unsigned long long>(v));
-          }
-        }
-      }
+      SpreadBin(h.ptr() + (z * plane - h.begin_off()), z, K, b, ax, ay, az,
+                aq, bin_start, threadIdx.x, blockDim.x);
       __syncthreads();
     }
     // PUBLISH AT THE WRITE SITE, then release. One writer per page makes
     // this ordering sound; eviction after the unpin costs a refault, never
     // data.
-    CO_AWAIT(mesh.CoBeginFlush(0, z * plane, plane));
+    if (publish != 0) CO_AWAIT(mesh.CoBeginFlush(0, z * plane, plane));
     mesh.UnpinRange(z * plane, plane);
   }
-  CO_AWAIT(mesh.CoEndFlush());
+  if (publish != 0) CO_AWAIT(mesh.CoEndFlush());
 }
 
 /** Mesh checksum + exact charge total, striding planes across blocks. */
@@ -229,33 +263,35 @@ CTP_GPU_FUN CLIO_COROC_INLINE void GatherCoro(gv::DeviceVector<unsigned long lon
                                     const float *az, const long long *aq,
                                     const u32 *bin_start, u64 K, u64 plane,
                                     u64 b0, u64 b1, unsigned long long *out) {
-  gv::PageRef<unsigned long long> hz[4];
+  // PLANE BY PLANE, THE BASELINES' GATHER. [b0, b1) are this block's PLANES:
+  // plane z is read against the atoms of bins z-3..z (every node holds every
+  // atom), so a node reads only its own planes -- no peer plane, no publish,
+  // no barrier. The per-bin form held planes b..b+3, three of them a peer's,
+  // which on 4 nodes cost an edge publish, a barrier and a remote fetch per
+  // pass. Each (atom, plane) contribution is rounded as the baselines round
+  // it, so the gather energy equals theirs bit for bit.
   unsigned long long acc = 0;
-  for (u64 b = b0; b < b1; ++b) {
-    // Atoms in bin b have iz0 == b: hold planes b..b+3 (mod K).
-    for (int j = 0; j < 4; ++j) {
-      const u64 z = (b + static_cast<u64>(j)) % K;
-      CO_AWAIT(mesh.CoFetch(0, z * plane, plane));
-      hz[j] = CO_AWAIT(mesh.CoHoldPage(z * plane, plane, /*write=*/false));
-    }
-    const u32 a0 = bin_start[b];
-    const u32 a1 = bin_start[b + 1];
-    for (u32 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
-      const float x = ax[a];
-      const float y = ay[a];
-      const float zz = az[a];
-      const int ix0 = static_cast<int>(floorf(x)) - 1;
-      const int iy0 = static_cast<int>(floorf(y)) - 1;
-      float wx[4];
-      float wy[4];
-      float wzS[4];
-      Spline4(x - floorf(x), wx);
-      Spline4(y - floorf(y), wy);
-      Spline4(zz - floorf(zz), wzS);
-      double phi = 0.0;
-      for (int jz = 0; jz < 4; ++jz) {
-        const u64 z = (b + static_cast<u64>(jz)) % K;
-        double pl = 0.0;
+  for (u64 z = b0; z < b1; ++z) {
+    CO_AWAIT(mesh.CoFetch(0, z * plane, plane));
+    auto hz = CO_AWAIT(mesh.CoHoldPage(z * plane, plane, /*write=*/false));
+    for (int db = -3; db <= 0; ++db) {
+      const u64 b = (z + K + static_cast<u64>(db + static_cast<int>(K))) % K;
+      const u32 a0 = bin_start[b];
+      const u32 a1 = bin_start[b + 1];
+      for (u32 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
+        const float x = ax[a];
+        const float y = ay[a];
+        const float zz = az[a];
+        const int ix0 = static_cast<int>(floorf(x)) - 1;
+        const int iy0 = static_cast<int>(floorf(y)) - 1;
+        const int dzw = static_cast<int>((z + K - b) % K);
+        float wx[4];
+        float wy[4];
+        float wzS[4];
+        Spline4(x - floorf(x), wx);
+        Spline4(y - floorf(y), wy);
+        Spline4(zz - floorf(zz), wzS);
+        double pl_sum = 0.0;
         for (int jy = 0; jy < 4; ++jy) {
           const u64 gy_ = static_cast<u64>((iy0 + jy + static_cast<int>(K)) %
                                            static_cast<int>(K));
@@ -263,23 +299,65 @@ CTP_GPU_FUN CLIO_COROC_INLINE void GatherCoro(gv::DeviceVector<unsigned long lon
           for (int jx = 0; jx < 4; ++jx) {
             const u64 gx = static_cast<u64>((ix0 + jx + static_cast<int>(K)) %
                                             static_cast<int>(K));
-            const long long v = static_cast<long long>(
-                hz[jz][z * plane + gy_ * K + gx]);
-            row += static_cast<double>(v) * wx[jx];
+            row += static_cast<double>(static_cast<long long>(
+                       hz[z * plane + gy_ * K + gx])) * wx[jx];
           }
-          pl += row * wy[jy];
+          pl_sum += row * wy[jy];
         }
-        phi += pl * wzS[jz];
+        acc += static_cast<unsigned long long>(static_cast<long long>(
+            FxRound(pl_sum * wzS[dzw] *
+                    (static_cast<double>(aq[a]) / kFxScale))));
       }
-      // q_a * phi(x_a), requantized: exact and order-independent.
-      acc += static_cast<unsigned long long>(static_cast<long long>(
-          FxRound(phi * (static_cast<double>(aq[a]) / kFxScale))));
+      __syncthreads();
     }
-    __syncthreads();
-    for (int j = 0; j < 4; ++j) {
-      const u64 z = (b + static_cast<u64>(j)) % K;
-      hz[j] = {};
-      mesh.UnpinRange(z * plane, plane);
+    mesh.UnpinRange(z * plane, plane);
+  }
+  atomicAdd(out, acc);
+}
+
+/** The dense reference's gather, plane-wise like GatherCoro (and the
+ *  baselines), so paged == dense == MPI bit for bit. Blocks take planes. */
+CTP_GPU_FUN inline void DenseGatherPlaneBody(const unsigned long long *mesh,
+                                             const float *ax, const float *ay,
+                                             const float *az, const long long *aq,
+                                             const u32 *bin_start, u64 K,
+                                             u64 plane, u64 zper,
+                                             unsigned long long *out) {
+  const u64 z0 = static_cast<u64>(blockIdx.x) * zper;
+  const u64 z1 = (z0 + zper < K) ? (z0 + zper) : K;
+  unsigned long long acc = 0;
+  for (u64 z = z0; z < z1; ++z) {
+    for (int db = -3; db <= 0; ++db) {
+      const u64 b = (z + K + static_cast<u64>(db + static_cast<int>(K))) % K;
+      const u32 a0 = bin_start[b];
+      const u32 a1 = bin_start[b + 1];
+      for (u32 a = a0 + threadIdx.x; a < a1; a += blockDim.x) {
+        const float x = ax[a], y = ay[a], zz = az[a];
+        const int ix0 = static_cast<int>(floorf(x)) - 1;
+        const int iy0 = static_cast<int>(floorf(y)) - 1;
+        const int dzw = static_cast<int>((z + K - b) % K);
+        float wx[4], wy[4], wzS[4];
+        Spline4(x - floorf(x), wx);
+        Spline4(y - floorf(y), wy);
+        Spline4(zz - floorf(zz), wzS);
+        double pl_sum = 0.0;
+        for (int jy = 0; jy < 4; ++jy) {
+          const u64 gy_ = static_cast<u64>((iy0 + jy + static_cast<int>(K)) %
+                                           static_cast<int>(K));
+          double row = 0.0;
+          for (int jx = 0; jx < 4; ++jx) {
+            const u64 gx = static_cast<u64>((ix0 + jx + static_cast<int>(K)) %
+                                            static_cast<int>(K));
+            row += static_cast<double>(static_cast<long long>(
+                       mesh[z * plane + gy_ * K + gx])) * wx[jx];
+          }
+          pl_sum += row * wy[jy];
+        }
+        acc += static_cast<unsigned long long>(static_cast<long long>(
+            FxRound(pl_sum * wzS[dzw] *
+                    (static_cast<double>(aq[a]) / kFxScale))));
+      }
+      __syncthreads();
     }
   }
   atomicAdd(out, acc);
@@ -288,14 +366,25 @@ CTP_GPU_FUN CLIO_COROC_INLINE void GatherCoro(gv::DeviceVector<unsigned long lon
 /** Zero this block's planes and publish, so a fault after eviction reads
  *  zeros rather than "blob not found". */
 CTP_GPU_FUN CLIO_COROC_INLINE void ZeroCoro(gv::DeviceVector<unsigned long long> mesh,
-                                  u64 plane, u64 z0, u64 z1) {
+                                  u64 plane, u64 z0, u64 z1, u32 publish) {
   for (u64 z = z0; z < z1; ++z) {
     CO_AWAIT(mesh.CoFetch(0, z * plane, plane));
     auto h = CO_AWAIT(mesh.CoHoldPage(z * plane, plane, /*write=*/true));
     for (u64 i = threadIdx.x; i < plane; i += blockDim.x) h[z * plane + i] = 0;
     __syncthreads();
-    CO_AWAIT(mesh.CoBeginFlush(0, z * plane, plane));
+    if (publish != 0) CO_AWAIT(mesh.CoBeginFlush(0, z * plane, plane));
     mesh.UnpinRange(z * plane, plane);
+  }
+  if (publish != 0) CO_AWAIT(mesh.CoEndFlush());
+}
+
+/** Publish planes [z0, z1) -- the node's first planes, the only ones a
+ *  peer's gather reads -- one plane per block. Resident planes: no fetch. */
+CTP_GPU_FUN CLIO_COROC_INLINE void PublishPlanesCoro(gv::DeviceVector<unsigned long long> mesh,
+                                           u64 plane, u64 z0, u64 z1, u32 nblk,
+                                           u32 blk) {
+  for (u64 z = z0 + blk; z < z1; z += nblk) {
+    CO_AWAIT(mesh.CoBeginFlush(0, z * plane, plane));
   }
   CO_AWAIT(mesh.CoEndFlush());
 }
@@ -326,7 +415,11 @@ void SubmitYieldable(dim3 grid, dim3 block, DevMesh mesh, View vw,
     DevMesh dev = mesh;
     dev.Init(vw.Block());
     __syncthreads();
+    // GV_COMM_TIMING: this resident segment is the denominator of the
+    // Fetch/Hold/Flush share (a no-op in an untimed build).
+    const unsigned long long gv_seg0 = dev.CommSegmentBegin();
     CLIO_COROC_RUN(vw, sv, make(_cy, dev, vw.Block()));
+    dev.CommStamp(3, gv_seg0);
   });
 }
 
@@ -338,12 +431,21 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 
 void LaunchZero(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
                 u64 K, u64 plane, u64 zper, u64 zbase, u64 zend, View vw,
-                  StackView sv) {
+                  StackView sv, u32 publish) {
   (void)info;   // stamped once by InitBackend, not per launch
   SubmitYieldable(grid, block, mesh, vw, sv, [=](clio::co::Ctx &_cy, DevMesh dev, u32 blk) {
     const u64 z0 = zbase + static_cast<u64>(blk) * zper;
     const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
-    ZeroCoro(_cy, dev, plane, z0, z1);
+    ZeroCoro(_cy, dev, plane, z0, z1, publish);
+  });
+}
+
+void LaunchPublishPlanes(dim3 grid, dim3 block, const GpuInfo &info,
+                         DevMesh mesh, u64 plane, u64 z0, u64 z1, View vw,
+                         StackView sv) {
+  (void)info;
+  SubmitYieldable(grid, block, mesh, vw, sv, [=](clio::co::Ctx &_cy, DevMesh dev, u32 blk) {
+    PublishPlanesCoro(_cy, dev, plane, z0, z1, grid.x, blk);
   });
 }
 
@@ -351,12 +453,12 @@ void LaunchSpread(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
                   const float *ax, const float *ay, const float *az,
                   const long long *aq, const u32 *bin_start, u64 K, u64 plane,
                   u64 zper, u64 zbase, u64 zend, View vw,
-                  StackView sv) {
+                  StackView sv, u32 publish) {
   (void)info;
   SubmitYieldable(grid, block, mesh, vw, sv, [=](clio::co::Ctx &_cy, DevMesh dev, u32 blk) {
     const u64 z0 = zbase + static_cast<u64>(blk) * zper;
     const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
-    SpreadCoro(_cy, dev, ax, ay, az, aq, bin_start, K, plane, z0, z1);
+    SpreadCoro(_cy, dev, ax, ay, az, aq, bin_start, K, plane, z0, z1, publish);
   });
 }
 
@@ -403,7 +505,7 @@ void LaunchDenseGather(u32 blocks, u32 threads, const unsigned long long *mesh,
                        const long long *aq, const u32 *bin_start, u64 K,
                        u64 plane, u64 bper, unsigned long long *out) {
   Submit(dim3(blocks), dim3(threads), [=]() {
-    DenseGatherBody(mesh, ax, ay, az, aq, bin_start, K, plane, bper, out);
+    DenseGatherPlaneBody(mesh, ax, ay, az, aq, bin_start, K, plane, bper, out);
   });
 }
 
@@ -441,26 +543,34 @@ namespace {
 
 __global__ GV_LAUNCH_BOUNDS void ZeroKernel(GpuInfo info, DevMesh mesh, u64 K, u64 plane,
                            u64 zper, u64 zbase, u64 zend, View yv,
-                           StackView ys) {
+                           StackView ys, u32 publish) {
   CLIO_GPU_INIT(info, nullptr);
   mesh.Init(yv.Block());
   __syncthreads();
   const u64 z0 = zbase + static_cast<u64>(yv.Block()) * zper;
   const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
-  CLIO_COROC_RUN(yv, ys, ZeroCoro(_cy, mesh, plane, z0, z1));
+  CLIO_COROC_RUN(yv, ys, ZeroCoro(_cy, mesh, plane, z0, z1, publish));
+}
+
+__global__ GV_LAUNCH_BOUNDS void PublishPlanesKernel(GpuInfo info, DevMesh mesh, u64 plane,
+                                     u64 z0, u64 z1, View yv, StackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  mesh.Init(yv.Block());
+  __syncthreads();
+  CLIO_COROC_RUN(yv, ys, PublishPlanesCoro(_cy, mesh, plane, z0, z1, gridDim.x, yv.Block()));
 }
 
 __global__ GV_LAUNCH_BOUNDS void SpreadKernel(GpuInfo info, DevMesh mesh, const float *ax,
                              const float *ay, const float *az,
                              const long long *aq, const u32 *bin_start, u64 K,
                              u64 plane, u64 zper, u64 zbase, u64 zend, View yv,
-                           StackView ys) {
+                           StackView ys, u32 publish) {
   CLIO_GPU_INIT(info, nullptr);
   mesh.Init(yv.Block());
   __syncthreads();
   const u64 z0 = zbase + static_cast<u64>(yv.Block()) * zper;
   const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
-  CLIO_COROC_RUN(yv, ys, SpreadCoro(_cy, mesh, ax, ay, az, aq, bin_start, K, plane, z0, z1));
+  CLIO_COROC_RUN(yv, ys, SpreadCoro(_cy, mesh, ax, ay, az, aq, bin_start, K, plane, z0, z1, publish));
 }
 
 __global__ GV_LAUNCH_BOUNDS void SumKernel(GpuInfo info, DevMesh mesh, u64 K, u64 plane,
@@ -506,7 +616,7 @@ __global__ GV_LAUNCH_BOUNDS void DenseGatherKernel(const unsigned long long *mes
                                   const float *az, const long long *aq,
                                   const u32 *bin_start, u64 K, u64 plane,
                                   u64 bper, unsigned long long *out) {
-  DenseGatherBody(mesh, ax, ay, az, aq, bin_start, K, plane, bper, out);
+  DenseGatherPlaneBody(mesh, ax, ay, az, aq, bin_start, K, plane, bper, out);
 }
 
 }  // namespace
@@ -520,19 +630,26 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 
 void LaunchZero(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
                 u64 K, u64 plane, u64 zper, u64 zbase, u64 zend, View vw,
-                  StackView sv) {
+                  StackView sv, u32 publish) {
   ZeroKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
-      info, mesh, K, plane, zper, zbase, zend, vw, sv);
+      info, mesh, K, plane, zper, zbase, zend, vw, sv, publish);
+}
+
+void LaunchPublishPlanes(dim3 grid, dim3 block, const GpuInfo &info,
+                         DevMesh mesh, u64 plane, u64 z0, u64 z1, View vw,
+                         StackView sv) {
+  PublishPlanesKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
+      info, mesh, plane, z0, z1, vw, sv);
 }
 
 void LaunchSpread(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh,
                   const float *ax, const float *ay, const float *az,
                   const long long *aq, const u32 *bin_start, u64 K, u64 plane,
                   u64 zper, u64 zbase, u64 zend, View vw,
-                  StackView sv) {
+                  StackView sv, u32 publish) {
   SpreadKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
       info, mesh, ax, ay, az, aq, bin_start, K, plane, zper, zbase, zend,
-      vw, sv);
+      vw, sv, publish);
 }
 
 void LaunchSum(dim3 grid, dim3 block, const GpuInfo &info, DevMesh mesh, u64 K,
@@ -583,6 +700,7 @@ void LaunchDenseGather(u32 blocks, u32 threads, const unsigned long long *mesh,
 // CTE client, whose members are compiled out of the CUDA device pass.
 #include "../bench_dist.h"
 #include "../bench_ckpt.h"
+#include "../gv_comm_report.h"
 
 namespace {
 
@@ -640,6 +758,13 @@ int main(int argc, char **argv) {
   std::string nvme_path = "/tmp/gv_gmx_tier.dat";
   u64 page_kb = 64, atoms = 200000;
   int repeat = 1;
+  // PUBLISH EACH PLANE AT ITS WRITE SITE? Only a cache that can evict needs
+  // it: an evicted partial plane must be readable on refault. A resident
+  // cache never evicts (gated below), so the per-pass write-back of the
+  // whole mesh to DRAM is pure overhead the baselines do not pay; the
+  // cross-node gather is covered by the FlushResidentToCte before it.
+  // -1 = decide from --cap (publish only when a cap is set).
+  int publish_flag = -1;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> u64 {
@@ -652,6 +777,8 @@ int main(int argc, char **argv) {
     else if (a == "--atoms") atoms = next();
     else if (a == "--repeat") repeat = static_cast<int>(next());
     else if (a == "--no-dense") no_dense = true;
+    else if (a == "--publish") publish_flag = 1;
+    else if (a == "--no-publish") publish_flag = 0;
     else if (a == "--no-ckpt") ckpt = false;   // kept: now a no-op
     else if (a == "--ckpt-final") ckpt = true;
     else if (a == "--nodes") nodes = static_cast<u32>(next());
@@ -705,11 +832,18 @@ int main(int argc, char **argv) {
   }
   const u64 zper = ((zend - zbase) + blocks - 1) / blocks;
   // The gather holds 4 planes at once per block; refuse a cache that could
-  // evict a plane mid-read (same rule as grayscott's slots >= window).
-  if (cap != 0 && cap < 4 * blocks + 2) {
-    std::fprintf(stderr, "GMX ERROR: --cap %u < %u (4 planes held per block "
-                 "x %u blocks + slack). The gather window would evict pages "
-                 "it is reading.\n", cap, 4 * blocks + 2, blocks);
+  // evict a plane mid-read (same rule as grayscott's slots >= window). The
+  // cache is SHARED by the node's blocks, so what is pinned at once is at
+  // most the DISTINCT planes the node touches -- its slab plus the gather's
+  // 3 peer planes -- however many blocks hold them. (4 x blocks was the
+  // private-table bound: 131 GB of 32 MB planes at K=2032, 1024 blocks.)
+  const u64 cap_need =
+      std::min<u64>(4ull * blocks, (zend - zbase) + 3) + 2;
+  if (cap != 0 && cap < cap_need) {
+    std::fprintf(stderr, "GMX ERROR: --cap %u < %llu (distinct planes the "
+                 "node pins at once: min(4 x blocks, slab + 3) + 2). The "
+                 "gather window would evict pages it is reading.\n", cap,
+                 (unsigned long long)cap_need);
     return 2;
   }
 
@@ -870,6 +1004,8 @@ int main(int argc, char **argv) {
 
   // ---- Paged path. -------------------------------------------------------
   const u32 tags = 24;
+  const u32 publish =
+      publish_flag >= 0 ? static_cast<u32>(publish_flag) : (cap != 0 ? 1u : 0u);
   gv::Vector<unsigned long long> mesh(
       "gv_gmx_mesh", {0}, page_bytes, blocks, tags, nmesh,
       clio::run::PoolId::GetNull(), 0, 1, 0,
@@ -880,7 +1016,8 @@ int main(int argc, char **argv) {
 
   runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                  gy::YieldStackView sv) {
-    gx::LaunchZero(g, b, gpu, dmesh, K, plane, zper, zbase, zend, vw, sv);
+    gx::LaunchZero(g, b, gpu, dmesh, K, plane, zper, zbase, zend, vw, sv,
+                   publish);
   });
   ctp::GpuApi::Synchronize();
 
@@ -903,21 +1040,23 @@ int main(int argc, char **argv) {
   }
 
   double t_spread = 0.0, t_gather = 0.0;
+  clio_gv_bench::CommAcc gx_comm;   // spread + gather, not the untimed zero
   unsigned long long got[4] = {0, 0, 0, 0};
   for (int r = 0; r < repeat; ++r) {
     if (r != 0) {
       runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                      gy::YieldStackView sv) {
         gx::LaunchZero(g, b, gpu, dmesh, K, plane, zper, zbase, zend, vw,
-                       sv);
+                       sv, publish);
       });
       ctp::GpuApi::Synchronize();
     }
+    const auto gx_c0 = mesh.ReadStats(0);
     const double t0 = NowMs();
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       gx::LaunchSpread(g, b, gpu, dmesh, d_ax, d_ay, d_az, d_aq, d_bs, K,
-                       plane, zper, zbase, zend, vw, sv);
+                       plane, zper, zbase, zend, vw, sv, publish);
     });
     ctp::GpuApi::Synchronize();
     const double t1 = NowMs();
@@ -938,8 +1077,19 @@ int main(int argc, char **argv) {
     // 2.4% short, while CONSERVATION and MESH (both plane-local) passed.
     // Flush, then barrier: the flush makes this node's slab visible and
     // the barrier stops anyone gathering before every peer has flushed.
-    if (nodes > 1) {
-      mesh.FlushResidentToCte();
+    // The plane-wise gather reads only this node's planes: nothing to
+    // publish, nothing to wait for. GMX_EDGE_PUBLISH=1 keeps the old step.
+    if (nodes > 1 && std::getenv("GMX_EDGE_PUBLISH") != nullptr) {
+      // PUBLISH THE EDGE, NOT THE SLAB. A peer's gather reads only the 3
+      // planes past its own slab -- this node's first 3 -- so those are the
+      // exchange. Flushing the whole resident slab (16.8 GB at the 4-node
+      // deck) made the gather 150x the baselines'.
+      const u64 pz1 = (zbase + 3 < zend) ? zbase + 3 : zend;
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        gx::LaunchPublishPlanes(g, b, gpu, dmesh, plane, zbase, pz1, vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
       if (!clio_bench_dist::Barrier(*cte_red, red_tag, node, nodes,
                                     red_round++, "gxbar")) {
         std::fprintf(stderr, "GMX ERROR: spread/gather barrier failed\n");
@@ -953,6 +1103,7 @@ int main(int argc, char **argv) {
     });
     ctp::GpuApi::Synchronize();
     t_gather += NowMs() - t1;
+    gx_comm.Add(gx_c0, mesh.ReadStats(0));
     ctp::GpuApi::Memcpy(got, d_out, sizeof(got));
     // Each node summed only its own slab of planes and its own bins, so
     // the four gate totals are partials. They are EXACT integers and
@@ -969,12 +1120,19 @@ int main(int argc, char **argv) {
     }
   }
 
+  gx_comm.Print("gmx", t_spread + t_gather);
   const auto st = mesh.ReadStats(0);
   std::printf("  paging: faults=%llu evicts=%llu puts=%llu get_errors=%llu "
               "put_errors=%llu\n",
               (unsigned long long)st.faults, (unsigned long long)st.evicts,
               (unsigned long long)st.puts, (unsigned long long)st.get_errors,
               (unsigned long long)st.put_errors);
+  if (publish == 0 && st.evicts != 0) {
+    std::fprintf(stderr, "GMX ERROR: %llu evictions without write-site "
+                 "publish (the cache is not resident); rerun with --publish "
+                 "or a larger cache\n", (unsigned long long)st.evicts);
+    return 1;
+  }
   std::printf("  spread %.1f ms (dense %.1f)  gather+sum %.1f ms\n",
               t_spread / repeat, t_ref_spread, t_gather / repeat);
 
@@ -982,6 +1140,11 @@ int main(int argc, char **argv) {
   int rc = 0;
   const unsigned long long want_q =
       static_cast<unsigned long long>(q_total);
+  // Same totals the baselines print, for a cross-substrate check even
+  // under --no-dense: the mesh checksum and the gather energy are exact
+  // integers, so they must equal the MPI edition's bit for bit.
+  std::printf("  totals: mesh_checksum=%llu gather_energy=%llu\n",
+              (unsigned long long)got[1], (unsigned long long)got[2]);
   if (got[0] != want_q) {
     std::printf("  CONSERVATION GATE: FAIL (mesh total %llu != input %llu)\n",
                 got[0], want_q);

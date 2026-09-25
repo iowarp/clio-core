@@ -130,7 +130,7 @@ namespace clio::gv_bench::kmeans {
  */
 CTP_GPU_FUN CLIO_COROC_INLINE void SeedCoro(gv::DeviceVector<float> v, u64 per,
                               u64 page_elems, u32 dims, u32 k, u64 base_idx,
-                              u32 block) {
+                              u32 block, u32 publish) {
   const u64 base = static_cast<u64>(block) * per;
   for (u64 off = 0; off < per; off += page_elems) {
     const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
@@ -139,16 +139,79 @@ CTP_GPU_FUN CLIO_COROC_INLINE void SeedCoro(gv::DeviceVector<float> v, u64 per,
     for (u64 i = threadIdx.x; i < n; i += blockDim.x) {
       h[base + off + i] = PointVal(base_idx + base + off + i, dims, k);
     }
-    // Collective: name the page just written.
-    CO_AWAIT(v.CoBeginFlush(0, base + off, n));
+    // Collective: name the page just written -- only when asked. A node's
+    // points are private and a resident cache holds them all, so writing the
+    // whole seed back is 32 GB of puts per node that nothing reads; on 4
+    // nodes it exhausted node 0's 64 copy streams and hung setup.
+    if (publish != 0) CO_AWAIT(v.CoBeginFlush(0, base + off, n));
     // Fetch is the pinner; UnpinRange is the releaser.
     v.UnpinRange(base + off, n);
   }
   // Collect every flush started above: only explicit flushes write data back
   // now (drops refuse dirty pages), so a seeded page left in flight or left
   // to eviction would simply be lost.
-  CO_AWAIT(v.CoEndFlush());
+  if (publish != 0) CO_AWAIT(v.CoEndFlush());
 }
+
+// ---- WORK-GROUP TILE (SYCL) ---------------------------------------------
+//
+// THE BASELINES TILE IN LOCAL MEMORY AND THIS DID NOT. Their AssignTiled
+// accumulates each point into a work-group tile in local memory and flushes
+// the tile to global memory once per group; AssignCoro added every point into
+// a per-block slice in GLOBAL memory, 33 device-scope atomics per point. With
+// the deck resident (0 faults) that alone left Eternia 2.2x behind MPI at the
+// same 1024 x 256 grid -- a different algorithm, not the cost of paging.
+//
+// The tile is claimed AT THE POINT OF USE, per page, and flushed before the
+// next suspend point, so no local-memory pointer is ever stored in a
+// coroutine frame or carried across a relaunch. The point loop between
+// CoHoldPage and UnpinRange never suspends, which is what makes that legal.
+// CUDA keeps the global path (KmTile returns null): its launch bounds and
+// __shared__ budget are a separate question and nothing here changes it.
+constexpr u32 kKmTileFloats = 1024;   // k * dims ceiling for the tile
+constexpr u32 kKmTileCounts = 64;     // k ceiling for the tile
+#if CTP_ENABLE_SYCL && defined(__SYCL_DEVICE_ONLY__)
+CTP_GPU_FUN inline float *KmTileSums() {
+  auto g = ::sycl::ext::oneapi::this_work_item::get_work_group<1>();
+  return *::sycl::ext::oneapi::group_local_memory_for_overwrite<
+      float[kKmTileFloats]>(g);
+}
+CTP_GPU_FUN inline unsigned *KmTileCounts() {
+  auto g = ::sycl::ext::oneapi::this_work_item::get_work_group<1>();
+  return *::sycl::ext::oneapi::group_local_memory_for_overwrite<
+      unsigned[kKmTileCounts]>(g);
+}
+template <typename T>
+CTP_GPU_FUN inline void KmLocalAdd(T *p, T v) {
+  ::sycl::atomic_ref<T, ::sycl::memory_order::relaxed,
+                     ::sycl::memory_scope::work_group,
+                     ::sycl::access::address_space::local_space>(*p)
+      .fetch_add(v);
+}
+// GLOBAL, SAID OUT LOUD. The assign body runs inside a call the kernel does
+// not inline (the coroutine functions are stack calls on SYCL), so IGC cannot
+// prove its pointers are global and emits a GENERIC load for every access:
+// mask the high address bits, compare against the local window, branch
+// divergently to load.ugm or load.slm, join. Measured in the distance loop,
+// that was one check-and-branch per coordinate read, ~10x the baselines'
+// instruction count at 71% XVE-active. A pointer cast to the global address
+// space loads with a single load.ugm, as the inlined baseline does.
+template <typename T>
+CTP_GPU_FUN inline auto KmGlobal(T *p) {
+  return ::sycl::address_space_cast<::sycl::access::address_space::global_space,
+                                    ::sycl::access::decorated::yes>(p);
+}
+#else
+CTP_GPU_FUN inline float *KmTileSums() { return nullptr; }
+CTP_GPU_FUN inline unsigned *KmTileCounts() { return nullptr; }
+template <typename T>
+CTP_GPU_FUN inline void KmLocalAdd(T *p, T v) { atomicAdd(p, v); }
+template <typename T>
+CTP_GPU_FUN inline T *KmGlobal(T *p) { return p; }
+#endif
+// Applied AT THE USE, never stored: clio-coroc hoists a coroutine's locals
+// into a frame it byte-copies, and a multi_ptr is neither hoistable as `auto`
+// nor trivially copyable. The cast itself is free.
 
 /**
  * One Lloyd assignment pass over this block's slice.
@@ -183,23 +246,55 @@ CTP_GPU_FUN CLIO_COROC_INLINE void AssignCoro(gv::DeviceVector<float> v, u64 per
     // Whole pages hold whole points (enforced on the host), so a page is
     // exactly n/dims points and no point straddles a page boundary.
     const u64 npts = n / dims;
+    // Local tile for this page (SYCL; null elsewhere or if k*dims is too big).
+    const u32 kdt = k * dims;
+    float *ls = (bsums && kdt <= kKmTileFloats && k <= kKmTileCounts)
+                    ? KmTileSums() : nullptr;
+    unsigned *lc = ls ? KmTileCounts() : nullptr;
+    if (ls) {
+      for (u32 i = threadIdx.x; i < kdt; i += blockDim.x) ls[i] = 0.0f;
+      for (u32 i = threadIdx.x; i < k; i += blockDim.x) lc[i] = 0u;
+      __syncthreads();
+    }
+    // A RAW POINTER, RESOLVED ONCE PER PAGE. The loop used to read every
+    // coordinate through a shim holding a REFERENCE to `h`, and `h` is a
+    // coroutine local: taking its address pins it in the frame, which lives
+    // in global memory, so each of the k*dims reads per point reloaded the
+    // handle's data pointer and base from the frame before touching the
+    // point -- where the baselines read a plain `pts + p * dims`. Resident,
+    // one launch and zero faults, the kernel still ran ~2x the baselines'
+    // time, which is what pointed here. Nothing below can suspend, so a
+    // pointer into the held frame is valid until UnpinRange.
+    const float *const pg = h.ptr() + (base + off - h.begin_off());
     for (u64 p = threadIdx.x; p < npts; p += blockDim.x) {
-      const u64 pbase = base + off + p * dims;
-      // The held page is indexed by ABSOLUTE element offset, so hand
-      // NearestCentroid a shim that closes over that base rather than a raw
-      // pointer -- the arithmetic is then provably the baselines'.
-      struct PageAt {
-        const decltype(h) &hh;
-        u64 b;
-        CTP_GPU_FUN float operator[](u32 i) const { return hh[b + i]; }
-      } pt{h, pbase};
-      const u32 bestk = ::clio_km::NearestCentroid(pt, cent, dims, k);
-      for (u32 i = 0; i < dims; ++i) {
-        atomicAdd(&ts[bestk * dims + i], h[pbase + i]);
+      const float *const pt = pg + p * dims;
+      const u32 bestk =
+          ::clio_km::NearestCentroid(KmGlobal(pt), KmGlobal(cent), dims, k);
+      if (ls) {
+        for (u32 i = 0; i < dims; ++i) {
+          KmLocalAdd(&ls[bestk * dims + i], KmGlobal(pt)[i]);
+        }
+        KmLocalAdd(&lc[bestk], 1u);
+      } else {
+        for (u32 i = 0; i < dims; ++i) {
+          atomicAdd(&ts[bestk * dims + i], KmGlobal(pt)[i]);
+        }
+        atomicAdd(&tc[bestk], 1u);
       }
-      atomicAdd(&tc[bestk], 1u);
     }
     __syncthreads();
+    if (ls) {
+      // Flush the page's tile into the block's slice: k*dims + k atomics per
+      // page instead of (dims + 1) per point. Done before UnpinRange and the
+      // next CoFetch, so the tile never outlives this stretch of the kernel.
+      for (u32 i = threadIdx.x; i < kdt; i += blockDim.x) {
+        if (ls[i] != 0.0f) atomicAdd(&ts[i], ls[i]);
+      }
+      for (u32 i = threadIdx.x; i < k; i += blockDim.x) {
+        if (lc[i] != 0u) atomicAdd(&tc[i], lc[i]);
+      }
+      __syncthreads();
+    }
     // NO RELEASE HINT HERE. Telling the cache "this page is dead after use"
     // was measured to be actively WRONG: the page IS re-read on the next
     // Lloyd pass, and the frequency policy was retaining ~10% of them across
@@ -236,7 +331,14 @@ void Submit(dim3 grid, dim3 block, BodyT body) {
   const size_t global = static_cast<size_t>(grid.x) * block.x;
   q.parallel_for(
        sycl::nd_range<1>{sycl::range<1>(global), sycl::range<1>(block.x)},
-       [=](sycl::nd_item<1>) { body(); })
+       [=](sycl::nd_item<1>)
+#ifdef GV_SG32
+       // THE SYCL ANALOGUE OF LAUNCH BOUNDS. IGC picks the SIMD width itself
+       // and chose SIMD16 for the coroutine kernels, where the baselines
+       // compile SIMD32 -- half the lanes per instruction on the same work.
+           [[intel::reqd_sub_group_size(32)]]
+#endif
+       { body(); })
       .wait();
 }
 
@@ -248,7 +350,11 @@ void SubmitYieldable(dim3 grid, dim3 block, DevF32 v, View vw, StackView sv,
     DevF32 dev = v;
     dev.Init(vw.Block());
     __syncthreads();
+    // GV_COMM_TIMING: this resident segment is the denominator of the
+    // Fetch/Hold/Flush share (a no-op in an untimed build).
+    const unsigned long long gv_seg0 = dev.CommSegmentBegin();
     CLIO_COROC_RUN(vw, sv, make(_cy, dev, vw.Block()));
+    dev.CommStamp(3, gv_seg0);
   });
 }
 
@@ -260,12 +366,12 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
                 u64 page_elems, u32 dims, u32 k, u64 base_idx, View vw,
-                StackView sv) {
+                StackView sv, u32 publish) {
   // gpu_info is already stamped into every block's record by InitBackend, so
   // unlike CUDA there is no per-launch CLIO_GPU_INIT store.
   (void)info;
   SubmitYieldable(grid, block, v, vw, sv, [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
-    SeedCoro(_cy, dev, per, page_elems, dims, k, base_idx, blk);
+    SeedCoro(_cy, dev, per, page_elems, dims, k, base_idx, blk, publish);
   });
 }
 
@@ -342,11 +448,11 @@ namespace {
 __global__ GV_LAUNCH_BOUNDS void SeedKernel(GpuInfo info, DevF32 v, u64 per,
                                             u64 page_elems, u32 dims, u32 k,
                                             u64 base_idx, View yv,
-                                            StackView ys) {
+                                            StackView ys, u32 publish) {
   CLIO_GPU_INIT(info, nullptr);
   v.Init(yv.Block());
   __syncthreads();
-  CLIO_COROC_RUN(yv, ys, SeedCoro(_cy, v, per, page_elems, dims, k, base_idx, yv.Block()));
+  CLIO_COROC_RUN(yv, ys, SeedCoro(_cy, v, per, page_elems, dims, k, base_idx, yv.Block(), publish));
 }
 
 __global__ GV_LAUNCH_BOUNDS void AssignKernel(GpuInfo info, DevF32 v, u64 per, u64 page_elems,
@@ -392,9 +498,9 @@ void InitBackend(u32 max_blocks, const GpuInfo &info) {
 
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
                 u64 page_elems, u32 dims, u32 k, u64 base_idx, View vw,
-                StackView sv) {
+                StackView sv, u32 publish) {
   SeedKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
-      info, v, per, page_elems, dims, k, base_idx, vw, sv);
+      info, v, per, page_elems, dims, k, base_idx, vw, sv, publish);
 }
 
 void LaunchAssign(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
@@ -433,6 +539,7 @@ void LaunchUpdate(float *cent, const float *sums, const unsigned *counts,
 // CTE client, whose members are compiled out of the device pass, so at file
 // scope it breaks the CUDA build of this driver and not the SYCL one.
 #include "../bench_dist.h"
+#include "../gv_comm_report.h"
 
 
 namespace {
@@ -461,6 +568,15 @@ class YieldRunner {
         },
         [] {}, /*max_rounds=*/2000000,
       gv::ResumeWhenComplete);
+  }
+  /** Where the driver's time went since the last ResetTimers: GPU time in
+   *  launch+sync, the per-round D2H state copy, the pending-list upload. */
+  double KernelMs() const { return drv_.KernelMs(); }
+  double CopyMs() const { return drv_.CopyMs(); }
+  double UploadMs() const { return drv_.UploadMs(); }
+  void ResetTimers() { drv_.ResetTimers(); }
+  const std::vector<std::pair<double, u32>> &RoundLog() const {
+    return drv_.RoundLog();
   }
 
  private:
@@ -491,6 +607,9 @@ int main(int argc, char **argv) {
   // so its vector gets its own tag namespace; two processes sharing one CTE
   // would otherwise both create "gv_kmeans" and page into each other's blobs.
   u32 nodes = 1, node = 0;
+  // --publish-seed writes the seeded points back to the CTE (the old
+  // behaviour); by default a resident run keeps them only in its frames.
+  bool publish_seed = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -502,6 +621,7 @@ int main(int argc, char **argv) {
     else if (a == "--dims") dims = static_cast<u32>(next());
     else if (a == "--clusters") k = static_cast<u32>(next());
     else if (a == "--slots") slots = static_cast<u32>(next());
+    else if (a == "--publish-seed") publish_seed = true;
     else if (a == "--iters") iters = static_cast<u32>(next());
     else if (a == "--page-kb") page_kb = next();
     else if (a == "--data-mb") data_mb = next();
@@ -684,7 +804,7 @@ int main(int argc, char **argv) {
   // ---- seed the point set -------------------------------------------------
   runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
     kb::LaunchSeed(g, b, gpu, dev, per, page_elems, dims, k, base_idx, vw,
-                   sv);
+                   sv, publish_seed ? 1u : 0u);
   });
   ctp::GpuApi::Synchronize();
 
@@ -808,9 +928,12 @@ int main(int argc, char **argv) {
     ctp::GpuApi::Memcpy(d_cent, h_cent.data(), h_cent.size() * sizeof(float));
     vec.ResetStats();
     ctp::GpuApi::Synchronize();
+    const auto km_c0 = vec.ReadStats(0);
+    double km_host_ms = 0.0;
     const double t0 = NowMs();
     double t_iter0 = t0;
     for (u32 it = 0; it < iters; ++it) {
+      u32 it_rounds = 0;
       ctp::GpuApi::Memset(d_sums, 0, k * dims * sizeof(float));
       ctp::GpuApi::Memset(d_counts, 0, k * sizeof(unsigned));
       if (baseline) {
@@ -821,7 +944,8 @@ int main(int argc, char **argv) {
       } else {
         ctp::GpuApi::Memset(d_bsums, 0, bsums_n * sizeof(float));
         ctp::GpuApi::Memset(d_bcounts, 0, bcounts_n * sizeof(unsigned));
-        runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+        runner.ResetTimers();
+        it_rounds = runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                        gy::YieldStackView sv) {
           kb::LaunchAssignTiled(g, b, gpu, dev, per, page_elems, dims, k,
                                 d_cent, d_sums, d_counts, d_bsums, d_bcounts,
@@ -837,6 +961,7 @@ int main(int argc, char **argv) {
         return 1;
       }
       const double t_reduce = NowMs();
+      km_host_ms += t_reduce - t_kernel;
       kb::LaunchUpdate(d_cent, d_sums, d_counts, dims, k);
       // PER-ITERATION SPLIT, on stderr with the rest of the diagnostics: the
       // two-node runs were slow with almost no faults, and the total alone
@@ -844,19 +969,35 @@ int main(int argc, char **argv) {
       // cross-node reduction that follows it.
       {
         const auto is = vec.ReadStats(0);
+        const auto &rl = runner.RoundLog();
         std::fprintf(stderr,
                      "  iter %u: kernel=%.1fms reduce=%.1fms faults=%llu "
-                     "evicts=%llu alloc_waits=%llu\n",
+                     "evicts=%llu alloc_waits=%llu rounds=%u "
+                     "drv_gpu=%.1fms drv_copy=%.1fms drv_upload=%.1fms "
+                     "r0=%.1fms/%u r1=%.1fms/%u rlast=%.1fms/%u\n",
                      it, t_kernel - t_iter0, t_reduce - t_kernel,
                      (unsigned long long)is.faults,
                      (unsigned long long)is.evicts,
-                     (unsigned long long)is.alloc_waits);
+                     (unsigned long long)is.alloc_waits, it_rounds,
+                     runner.KernelMs(), runner.CopyMs(), runner.UploadMs(),
+                     rl.size() > 0 ? rl[0].first : 0.0,
+                     rl.size() > 0 ? rl[0].second : 0u,
+                     rl.size() > 1 ? rl[1].first : 0.0,
+                     rl.size() > 1 ? rl[1].second : 0u,
+                     rl.empty() ? 0.0 : rl.back().first,
+                     rl.empty() ? 0u : rl.back().second);
       }
       t_iter0 = NowMs();
     }
     ctp::GpuApi::Synchronize();
     const double ms = NowMs() - t0;
     if (ms < best_ms) best_ms = ms;
+    {
+      clio_gv_bench::CommAcc km_comm;
+      km_comm.Add(km_c0, vec.ReadStats(0));
+      km_comm.AddHost(km_host_ms);
+      km_comm.Print("kmeans", ms);
+    }
     ctp::GpuApi::Memcpy(h_final.data(), d_cent, h_final.size() * sizeof(float));
   }
 
@@ -934,6 +1075,13 @@ int main(int argc, char **argv) {
                (unsigned long long)st.puts, (unsigned long long)st.get_errors,
                (unsigned long long)st.put_errors,
                mcp.pinned_gbps, mcp.pageable_gbps);
+  if (!baseline && !publish_seed && st.evicts != 0) {
+    std::fprintf(stderr, "KMEANS ERROR: %llu evictions of unpublished seed "
+                 "pages (the cache is not resident); rerun with "
+                 "--publish-seed or more --slots\n",
+                 (unsigned long long)st.evicts);
+    return 1;
+  }
 
   ctp::GpuApi::Free(d_cent); ctp::GpuApi::Free(d_sums); ctp::GpuApi::Free(d_counts);
   ctp::GpuApi::Free(d_bsums); ctp::GpuApi::Free(d_bcounts);

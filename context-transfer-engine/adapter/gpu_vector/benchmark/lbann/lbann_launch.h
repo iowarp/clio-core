@@ -34,15 +34,33 @@ void InitBackend(u32 max_blocks, const GpuInfo &info);
 
 void LaunchFwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 w1_off, const float *b1v, u64 I, u64 H, u64 B, const float *x, float *a1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen,
-                 View vw, StackView sv);
+                 View vw, StackView sv, float **tab, u64 tab_stride);
 
 void LaunchFwd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 w2_off, const float *b2v, u64 H, u64 O, u64 B, const float *a1, const float *y, float *d2, double *loss_parts, u64 oper, u64 rpp, u64 rbase, u64 rend, u64 gen,
                  View vw, StackView sv);
 
+void LaunchW2Resolve(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
+                     u64 w2_off, u64 H, u64 O, u64 rpp, u64 gen, float **tab,
+                     View vw, StackView sv, u64 o_lo);
+void LaunchW2Release(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
+                     u64 w2_off, u64 H, u64 O, u64 rpp, View vw,
+                     StackView sv, u64 o_lo);
+void LaunchBwd1PartialTab(u32 blocks, u32 threads, float *const *tab,
+                          u64 rpp, u64 o_lo, u64 o_hi, u64 H, u64 B,
+                          const float *d2, float *out);
+void LaunchFwd2Tab(u32 blocks, u32 threads, float *const *tab, u64 rpp,
+                   u64 o_lo, u64 o_hi, u64 H, u64 O, u64 B, const float *b2v,
+                   const float *a1, const float *y, float *d2,
+                   double *loss_parts);
+void LaunchBwd1Combine(u32 blocks, u32 threads, const float *parts,
+                       u64 nodes, u64 HB, const float *a1, float *d1);
+void LaunchBwd1Tab(u32 blocks, u32 threads, float *const *tab, u64 np,
+                   u64 rpp, u64 O, u64 H, u64 B, u64 h0, u64 h1,
+                   const float *a1, const float *d2, float *d1);
 void LaunchBwd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 w2_off, u64 H, u64 O, u64 B, const float *a1, const float *d2, float *d1, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 o0, u64 o1, u64 gen,
-                 View vw, StackView sv);
+                 View vw, StackView sv, float **tab, u64 tab_stride);
 
 void LaunchUpd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 w2_off, float *b2v, u64 H, u64 O, u64 B, const float *a1, const float *d2, float lr, u64 oper, u64 rpp, u64 rbase, u64 rend, u64 gen,
@@ -50,11 +68,11 @@ void LaunchUpd2(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
 
 void LaunchUpd1(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 w1_off, float *b1v, u64 I, u64 H, u64 B, const float *x, const float *d1, float lr, u64 hper, u64 rpp, u64 rbase, u64 rend, u64 gen,
-                 View vw, StackView sv);
+                 View vw, StackView sv, float **tab, u64 tab_stride);
 
 void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 n, u64 eper, u64 chunk,
-                 View vw, StackView sv);
+                 View vw, StackView sv, u64 base, u32 publish);
 
 void LaunchDigest(dim3 grid, dim3 block, const GpuInfo &info, DevF32 w,
                  u64 n, u64 eper, u64 chunk, unsigned long long *out,
