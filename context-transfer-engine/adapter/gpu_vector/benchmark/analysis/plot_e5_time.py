@@ -12,20 +12,22 @@ import matplotlib.pyplot as plt
 OUT = '/lus/flare/projects/IOWarp/llogan_e1/figs'
 os.makedirs(OUT, exist_ok=True)
 
-# workload -> list of (label, [(budget GB, normalised time)], deck GB/node)
+# workload -> list of (label, [(budget GB/node, runtime s)]). Runtime = wall
+# time of the timed region on the slowest rank: kmeans 8 iterations,
+# Gray-Scott 8 steps, gmx 1 pass, lbann 1 step.
 DATA = {
-    'kmeans': [('4 nodes',  [(32, 1.00), (24, 1.21), (16, 1.40), (8, 1.44), (4, 1.34)]),
-               ('16 nodes', [(32, 1.00), (24, 1.22), (16, 1.47), (8, 1.44), (4, 1.35)])],
-    'Gray-Scott': [('4 nodes',  [(32, 1.00), (24, 1.06), (16, 1.06), (8, 1.08), (4, 0.88)]),
-                   ('16 nodes', [(32, 1.00), (24, 1.08), (16, 1.19), (8, 0.94), (4, 1.01)])],
-    'gmx': [('4 nodes', [(8.2, 1.00), (4.1, 0.93), (2.05, 0.91), (1.37, 0.90)])],
-    'lbann': [('4 nodes', [(8, 1.00), (4, 1.12), (2, 0.98), (1, 0.88)])],
+    'kmeans': [('4 nodes',  [(32, 73.6), (24, 89.4), (16, 103.4), (8, 106.0), (4, 98.4)]),
+               ('16 nodes', [(32, 93.5), (24, 114.5), (16, 137.3), (8, 134.4), (4, 140.4)])],
+    'Gray-Scott': [('4 nodes',  [(32, 218.3), (24, 231.2), (16, 231.0), (8, 235.2), (4, 193.2)]),
+                   ('16 nodes', [(32, 299.5), (24, 323.4), (16, 355.1), (8, 324.1), (4, 301.5)])],
+    'gmx': [('4 nodes', [(8.2, 7.31), (4.1, 6.79), (2.05, 6.66), (1.37, 6.55)])],
+    'lbann': [('4 nodes', [(8, 22.4), (4, 25.1), (2, 21.9), (1, 19.7)])],
 }
 DECK = {'kmeans': 64, 'Gray-Scott': 64, 'gmx': 8, 'lbann': 8}
 STYLE = {'4 nodes': dict(marker='o', color='#1f77b4'),
          '16 nodes': dict(marker='s', color='#d62728', ls='--')}
 
-fig, axes = plt.subplots(2, 2, figsize=(3.5, 3.1), sharey=True)
+fig, axes = plt.subplots(2, 2, figsize=(3.5, 3.1))
 for ax, (wl, series) in zip(axes.flat, DATA.items()):
     for lab, pts in series:
         xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
@@ -34,15 +36,14 @@ for ax, (wl, series) in zip(axes.flat, DATA.items()):
     ax.set_xscale('log', base=2); ax.set_xticks(xs)
     ax.set_xticklabels(['%g' % x for x in xs], fontsize=6.5)
     ax.minorticks_off(); ax.invert_xaxis()
-    ax.axhline(1.0, c='gray', lw=0.6)
-    ax.set_ylim(0.8, 1.6); ax.tick_params(axis='y', labelsize=7)
+    ax.set_ylim(0, 1.18 * max(p[1] for _, pts in series for p in pts)); ax.tick_params(axis='y', labelsize=7)
     ax.set_title('%s (%d GB/node)' % (wl, DECK[wl]), fontsize=7.5, pad=2)
     ax.grid(alpha=.3)
 fig.supxlabel('GPU memory budget (GB/node)', fontsize=7, y=0.01)
 for ax in axes[:, 0]:
-    ax.set_ylabel('normalised time', fontsize=7)
+    ax.set_ylabel('runtime (s)', fontsize=7)
 axes[0, 0].legend(fontsize=6.5, loc='lower right', frameon=False)
 fig.tight_layout(pad=0.3, h_pad=0.6, w_pad=0.4, rect=(0, 0.03, 1, 1))
-fig.savefig(os.path.join(OUT, 'e5_time.pdf'))
-fig.savefig(os.path.join(OUT, 'e5_time.png'), dpi=200)
-print('wrote', os.path.join(OUT, 'e5_time.pdf'))
+fig.savefig(os.path.join(OUT, 'e5_runtime.pdf'))
+fig.savefig(os.path.join(OUT, 'e5_runtime.png'), dpi=200)
+print('wrote', os.path.join(OUT, 'e5_runtime.pdf'))
