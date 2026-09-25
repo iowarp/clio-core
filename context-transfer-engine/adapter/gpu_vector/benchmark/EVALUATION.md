@@ -713,3 +713,36 @@ two failure modes:
    to ~170 workers (quick 32, medium 69, heavy 69). This is under investigation.
 The reruns with the probe off are E5_16a 8866193 (kmeans 32/24/16 and
 grayscott 32) and E5_16b 8866233 (grayscott 24/16/8/4).
+
+## E5 collected as-is, 2026-09-25 05:15 UTC
+
+`analysis/e5_cells.csv` holds every E5CELL line; `analysis/e1_cells.csv` holds E1.
+Passing cells (ms = slowest rank over the timed region; J = GPU energy summed over ranks):
+
+| workload | nodes | 32 GB | 24 GB | 16 GB | 8 GB | 4 GB |
+|---|---|---|---|---|---|---|
+| kmeans | 2 | 40401 ms | - | 62270 | 64648 | 74255 |
+| kmeans | 4 | 73604 ms / 313.7 kJ | 89390 / 367.1 | 103398 / 409.9 | 106019 / 417.4 | 98403 / 393.0 |
+| kmeans | 16 | FAIL (probe) | FAIL (device) | FAIL (probe) | 134371 / 2097.5 | FAIL (device) |
+| grayscott | 2 | 141657 ms | - | 144485 | 155312 | 140591 |
+| grayscott | 4 | 218314 ms / 817.3 kJ | 231201 / 893.0 | 230977 / 894.1 | 235234 / 859.4 | 193179 / 761.7 |
+| grayscott | 16 | FAIL (gen wait) | FAIL (gen wait) | pending | pending | pending |
+
+Failure causes at 16 nodes:
+- probe: the #628 task-progress probe reported a live replica as Gone. It is off
+  from now on (CLIO_TASK_PROGRESS_INTERVAL_MS=0).
+- gen wait: the 10 s generational-get bound fired on a healthy neighbour. Commit
+  7d67cafd makes it CLIO_GEN_WAIT_MS with a 120 s default. Only
+  libclio_cte_core_runtime.so was relinked; the old binary matches f634bb9b.
+- device: a single-rank device fault (UR OUT_OF_RESOURCES or a GPU segfault) with
+  no probe or generation-wait message. The cause is open. The mitigation is
+  E5_KM_REPEAT=1 plus E5_RETRY=1.
+
+E5 for gmx, lbann and lammps_md: job 8865970 (gmx) failed in every cell because
+its deck was untested (`--blocks 8`, no E1 flags). The broken lbann and lammps
+jobs were cancelled. They are replaced by pbs_e5x_aurora.sh, which runs the E1
+decks for gmx and lbann and the E4 deck for lammps, shrinking only the cache.
+Validation job 8866329 is queued.
+
+Still queued or running at collection time: E5_16b 8866233 (grayscott 16/8/4
+remaining), E5_16a 8866193, E5_16c 8866321, e5x_val 8866329.
