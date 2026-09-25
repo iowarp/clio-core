@@ -22,6 +22,8 @@
 #   E5_PERNODE_MB   deck per node (default 256000, the plan's 256 GB)
 #   E5_TIER_MB      DRAM tier per node (default 450000)
 #   E5_CAP          per-rank cap in seconds (default 1500)
+#   E5_KM_REPEAT    kmeans timed repetitions (binary default 3, best reported)
+#   E5_RETRY        reruns of a failed cell (default 0)
 #   E5_ITERS_kmeans / E5_STEPS_grayscott   (default 8 / 8)
 #   E5_SFX_kmeans / E5_SFX_grayscott       binary suffixes
 #
@@ -104,7 +106,7 @@ cell_deck() {
     kmeans)
       # 1024 work-groups; budget GB = slots x 1024 x 1 MB.
       EXE="${ROOT}/build-spike/clio_kmeans_paged_newcoro_aot${E5_SFX_kmeans:-_x_ct}"
-      ARGS="--data-mb ${DATA_MB} --iters ${E5_ITERS_kmeans:-8} --page-kb 1024 --blocks 1024 --threads 256 --slots ${gb} --publish-seed"
+      ARGS="--data-mb ${DATA_MB} --iters ${E5_ITERS_kmeans:-8} --page-kb 1024 --blocks 1024 --threads 256 --slots ${gb} --publish-seed${E5_KM_REPEAT:+ --repeat ${E5_KM_REPEAT}}"
       FC=3 ;;
     grayscott)
       # 512 work-groups so the 4 GB rung still has 8 slots per group
@@ -166,6 +168,7 @@ run_cell() {
     read -r a _ <<< "$(grep -a "ENERGY_UJ" "${f}" | sed 's/.*after: //')"
     [ -n "${b:-}" ] && [ -n "${a:-}" ] && ej=$(awk -v e="${ej}" -v x="${a}" -v y="${b}" 'BEGIN{printf "%.0f", e + (x - y) / 1e6}')
   done
+  LAST_RC=${worst}; LAST_DIR=${rundir}
   echo "E5CELL ${wl} hbm_gb=${gb} nodes=${NRANKS} ms=${msmax} energy_J=${ej} rc=${worst}"
   case "${worst}" in
     0)   echo "RESULT e5/${label}x${NRANKS}: OK" ;;
@@ -174,6 +177,17 @@ run_cell() {
   esac
 }
 
-for c in ${CELLS}; do run_cell "${c}"; done
+# E5_RETRY: rerun a failed cell up to N more times (16 nodes: an intermittent
+# single-rank device fault takes down a whole cell). A failed attempt's
+# logs are kept as <rundir>.fail<k>.
+for c in ${CELLS}; do
+  run_cell "${c}"
+  k=0
+  while [ "${LAST_RC}" != 0 ] && [ "${k}" -lt "${E5_RETRY:-0}" ]; do
+    k=$((k + 1)); mv "${LAST_DIR}" "${LAST_DIR}.fail${k}"
+    echo "RETRY ${c} attempt $((k + 1))"
+    run_cell "${c}"
+  done
+done
 echo "E5 DONE"
 exit 0
