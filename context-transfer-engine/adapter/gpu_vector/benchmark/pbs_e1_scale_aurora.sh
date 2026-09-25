@@ -384,6 +384,9 @@ for wl in ${WORKLOADS}; do
   et_fc=3; [ "${wl}" = grayscott ] && et_fc=${BENCH_GS_FC:-2}
   if [ "${wl}" = lammps_md ]; then export MD_LEAN=1; else unset MD_LEAN; fi
   [ "${wl}" = lammps_md ] && [ -n "${BENCH_E5_MD_SLOTS:-}" ] && et_args="${et_args} --slots ${BENCH_E5_MD_SLOTS}"
+  # Out of core, gmx evicts mesh planes it has written: the resident-only
+  # --no-publish would refuse ("evictions without write-site publish").
+  if [ "${wl}" = gmx ] && [ "${BENCH_E5_DIV:-1}" != 1 ]; then et_args="${et_args/--no-publish/--publish}"; fi
   IGC_FunctionControl=${et_fc} \
   run_one "${wl}_b${B}_eternia${et_tag}" "${ROOT}/build-spike/clio_${wl}_paged_newcoro_aot${et_sfx}" \
           "${et_args}" 1 || rc=$?
