@@ -202,7 +202,7 @@ fi
 
 NFILES=$(find "$FIELDS" -name "*$EXT" | wc -l)
 [ "$NFILES" -gt 0 ] || { echo "no *$EXT files under $FIELDS" >&2; exit 1; }
-PAYLOAD=$(du -sb "$FIELDS" | cut -f1)
+PAYLOAD=$(du -sbL "$FIELDS" | cut -f1)   # -L: a staged subset is symlinks
 echo "== $NAME: $NFILES field file(s), $(awk -v p="$PAYLOAD" 'BEGIN{printf "%.1f", p/1048576}') MiB $PREC, chunk $CHUNK, port $PORT"
 
 ARGS=(--dir "$FIELDS" --ext "$EXT" --chunk "$CHUNK"
@@ -214,6 +214,9 @@ ARGS=(--dir "$FIELDS" --ext "$EXT" --chunk "$CHUNK"
 [ "${NO_COMPRESS:-0}" = 1 ] && ARGS+=(--no-compress)
 # Decoded bytes for an external checker (the directory must exist).
 [ -n "${REPLAY_DUMP_DECOMPRESSED:-}" ] && ARGS+=(--dump-decompressed "$REPLAY_DUMP_DECOMPRESSED")
+# REPLAY_EXTRA_ARGS: further driver options, word-split, e.g. "--read-inflight 8
+# --read-to-gpu" for the in-process read-back that --verify does after a write.
+[ -n "${REPLAY_EXTRA_ARGS:-}" ] && read -r -a _extra <<< "$REPLAY_EXTRA_ARGS" && ARGS+=("${_extra[@]}")
 
 # CLIO_NEUROPRESS_SELECTION_LOG is a VALIDATION log, not free: per chunk it
 # records the chosen codec plus a byte-by-byte FNV-1a hash of the input chunk
