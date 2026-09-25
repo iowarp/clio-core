@@ -27,23 +27,23 @@ DECK = {'kmeans': 64, 'Gray-Scott': 64, 'gmx': 8, 'lbann': 8}
 STYLE = {'4 nodes': dict(marker='o', color='#1f77b4'),
          '16 nodes': dict(marker='s', color='#d62728', ls='--')}
 
-fig, axes = plt.subplots(2, 2, figsize=(3.5, 3.1))
+fig, axes = plt.subplots(1, 4, figsize=(3.5, 1.55))
+axes = axes.reshape(1, 4)
 for ax, (wl, series) in zip(axes.flat, DATA.items()):
     for lab, pts in series:
         xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-        ax.plot(xs, ys, label=lab, lw=1.2, ms=3.5, **STYLE[lab])
+        ax.plot(xs, ys, label=lab, lw=1.0, ms=2.5, **STYLE[lab])
     xs = sorted({p[0] for _, pts in series for p in pts})
     ax.set_xscale('log', base=2); ax.set_xticks(xs)
-    ax.set_xticklabels(['%g' % x for x in xs], fontsize=6.5)
+    ax.set_xticklabels(['%g' % x for x in xs], fontsize=4.8, rotation=90)
     ax.minorticks_off(); ax.invert_xaxis()
-    ax.set_ylim(0, 1.18 * max(p[1] for _, pts in series for p in pts)); ax.tick_params(axis='y', labelsize=7)
-    ax.set_title('%s (%d GB/node)' % (wl, DECK[wl]), fontsize=7.5, pad=2)
+    ax.set_ylim(0, 1.18 * max(p[1] for _, pts in series for p in pts)); ax.tick_params(axis='y', labelsize=5.5, pad=1); ax.tick_params(axis='x', pad=1, length=2)
+    ax.set_title('%s\n(%d GB/node)' % (wl, DECK[wl]), fontsize=6, pad=2)
     ax.grid(alpha=.3)
-fig.supxlabel('GPU memory budget (GB/node)', fontsize=7, y=0.01)
-for ax in axes[:, 0]:
-    ax.set_ylabel('runtime (s)', fontsize=7)
-axes[0, 0].legend(fontsize=6.5, loc='lower right', frameon=False)
-fig.tight_layout(pad=0.3, h_pad=0.6, w_pad=0.4, rect=(0, 0.03, 1, 1))
+fig.supxlabel('GPU memory budget (GB/node)', fontsize=6, y=0.0)
+axes[0, 0].set_ylabel('runtime (s)', fontsize=6, labelpad=1)
+axes[0, 0].legend(fontsize=5, loc='lower center', frameon=False, handlelength=1.5)
+fig.tight_layout(pad=0.2, w_pad=0.3, rect=(0, 0.04, 1, 1))
 fig.savefig(os.path.join(OUT, 'e5_runtime.pdf'))
 fig.savefig(os.path.join(OUT, 'e5_runtime.png'), dpi=200)
 print('wrote', os.path.join(OUT, 'e5_runtime.pdf'))
