@@ -49,6 +49,11 @@
  * node's pages, and the Copy's writeback then has nothing stale to send.
  * Single-node the frames ARE the truth and the Copy's writeback is kept.
  *
+ * SYNC MODE (--ckpt-sync in every benchmark). By default the Copy is lazy
+ * copy-on-write: pages materialise when first touched. With `sync` the Copy
+ * materialises every page before returning, so the checkpoint's full data
+ * movement lands inside the timed CHECKPOINT line.
+ *
  * Host-only: include inside the !CTP_IS_DEVICE_PASS guard.
  */
 #ifndef CLIO_GV_BENCH_CKPT_H_
@@ -73,19 +78,22 @@ namespace clio_bench_ckpt {
  * @param name  checkpoint tag; identical on every node (the vector's tag is
  *              shared, so all nodes register the same copy)
  * @param nodes node count; > 1 drops the cache before copying (see above)
+ * @param sync  true: fully synchronous Copy (every page materialised before
+ *              return); false: lazy copy-on-write
  * @return the checkpoint handle. Keep it alive until the run ends: dropping
  *         it lets the copy tag go away with it.
  */
 template <typename T>
 std::unique_ptr<clio::cte::gpu_vector::Vector<T>> FinalCheckpoint(
     clio::cte::gpu_vector::Vector<T> &vec, const std::string &name,
-    unsigned nodes) {
+    unsigned nodes, bool sync = false) {
   const auto t0 = std::chrono::steady_clock::now();
   if (nodes > 1) vec.ClearCache(0);
-  auto ck = vec.Copy(name);
+  auto ck = vec.Copy(name, sync);
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
-  std::printf("  CHECKPOINT: vector.Copy -> %s (%.2f ms)\n", name.c_str(), ms);
+  std::printf("  CHECKPOINT: vector.Copy -> %s (%s, %.2f ms)\n", name.c_str(),
+              sync ? "sync" : "lazy", ms);
   return ck;
 }
 

@@ -76,6 +76,7 @@ struct Args {
   u32 maxneigh = 96;       // Verlet-list capacity per atom slot
   u32 rowchunk = 4;        // rows per block in the force pass (hold reuse)
   u64 ckpt = 0;            // checkpoint every N steps (0 = never)
+  bool ckpt_sync = false;  // --ckpt-sync: every vector.Copy fully synchronous
   bool no_ckpt = false;    // skip the end-of-run vector.Copy checkpoint
   u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
   u32 nlslots = 0;         // list cache frames per block; 0 = NlSlots() default
@@ -704,6 +705,7 @@ int main(int argc, char **argv) {
     else if (want("--maxneigh")) a.maxneigh = static_cast<u32>(atoi(argv[++i]));
     else if (want("--rowchunk")) a.rowchunk = static_cast<u32>(atoi(argv[++i]));
     else if (want("--ckpt")) a.ckpt = static_cast<u64>(atol(argv[++i]));
+    else if (std::strcmp(argv[i], "--ckpt-sync") == 0) a.ckpt_sync = true;
     else if (want("--nl-page-kb")) a.nl_page_kb = static_cast<u64>(atol(argv[++i]));
     else if (want("--nlslots")) a.nlslots = static_cast<u32>(atoi(argv[++i]));
     else if (want("--vram-mb")) a.vram_mb = static_cast<u64>(atol(argv[++i]));
@@ -2270,8 +2272,10 @@ gpu, *dst, g.nb, g.cap,
       const double _t = NowMs();
       ctp::GpuApi::Synchronize();
       gv::Vector<float> *cvv = (cvx == &vx) ? &vv : &vv2;
-      ck_x = cvx->Copy("md_ckpt_x_" + std::to_string(n_ckpt));
-      ck_v = cvv->Copy("md_ckpt_v_" + std::to_string(n_ckpt));
+      ck_x = cvx->Copy("md_ckpt_x_" + std::to_string(n_ckpt),
+                       a.ckpt_sync);
+      ck_v = cvv->Copy("md_ckpt_v_" + std::to_string(n_ckpt),
+                       a.ckpt_sync);
       t_ckpt += NowMs() - _t;
       const double _t2 = NowMs();
       ctp::GpuApi::Memcpy(h_ckpt_stock, d_ckpt_stock, 2 * g.nelems);
@@ -2503,9 +2507,10 @@ gpu, *dst, g.nb, g.cap,
     if (!a.no_ckpt) {
       gv::Vector<float> *fin_vv = (cvx == &vx) ? &vv : &vv2;
       fin_x = clio_bench_ckpt::FinalCheckpoint(*cvx, tag("md_ckpt_x_final"),
-                                               a.nodes);
+                                               a.nodes, a.ckpt_sync);
       fin_v = clio_bench_ckpt::FinalCheckpoint(*fin_vv,
-                                               tag("md_ckpt_v_final"), a.nodes);
+                                               tag("md_ckpt_v_final"), a.nodes,
+                                               a.ckpt_sync);
     }
     ctp::GpuApi::Free(d_acc);
     ctp::GpuApi::Free(d_thermo);

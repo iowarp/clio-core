@@ -215,6 +215,27 @@ TEST_CASE("gpu_vector: Copy is a lazy checkpoint", "[gpu_vector][copy]") {
                  (unsigned long long)bad, (unsigned long long)kElems);
     REQUIRE(bad == 0);
   }
+
+  // 5. SYNCHRONOUS COPY: Copy(name, /*sync=*/true) materialises every page
+  //    before returning, so overwriting the source BEFORE anything touches
+  //    the copy must not leak into it. A lazy copy would materialise at the
+  //    first read below and serve the newer bytes.
+  {
+    auto sync_copy = src.Copy("gv_copy_ckpt_sync", /*sync=*/true);
+    REQUIRE(sync_copy != nullptr);
+    std::vector<clio::run::u32> host(kElems);
+    for (clio::run::u64 i = 0; i < kElems; ++i) host[i] = Pat(i, kSeedA + 4);
+    src.Preload(host.data(), kElems);
+
+    const clio::run::u64 bad_copy = HostMismatches(*sync_copy, kSeedB);
+    const clio::run::u64 bad_src = HostMismatches(src, kSeedA + 4);
+    std::fprintf(stderr,
+                 "[sync-copy] copy-vs-B=%llu src-vs-A4=%llu / %llu\n",
+                 (unsigned long long)bad_copy, (unsigned long long)bad_src,
+                 (unsigned long long)kElems);
+    REQUIRE(bad_copy == 0);
+    REQUIRE(bad_src == 0);
+  }
 }
 
 #endif  // !CTP_IS_DEVICE_PASS
