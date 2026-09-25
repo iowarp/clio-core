@@ -31,6 +31,9 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <cstdio>
+#include <cstdlib>
+#include <atomic>
 #include <clio_cte/core/data_organizer/scatter_organizer.h>
 #include <clio_cte/core/core_runtime.h>
 
@@ -58,7 +61,25 @@ clio::run::TaskResume ScatterDataOrganizer::Reorganize(
   if (fast_bytes == 0 || stats.empty()) {
     CLIO_CO_RETURN;
   }
-  const bool gather = server->OrganizerHint() == kPhaseGather;
+  const clio::run::i32 hint = server->OrganizerHint();
+  const bool gather = hint == kPhaseGather;
+  // CLIO_ORGANIZER_TRACE=1 reports each distinct phase hint this organizer
+  // observes, once. The hint arrives by ReorganizeHint broadcast from the
+  // application, and a hint that never lands is indistinguishable from a
+  // policy that does not help -- both just look like "no effect" -- so the
+  // arrival has to be observable on its own.
+  {
+    static std::atomic<clio::run::i32> last_seen{-12345};
+    if (last_seen.exchange(hint) != hint) {
+      const char *tr = getenv("CLIO_ORGANIZER_TRACE");
+      if (tr != nullptr && tr[0] != '\0' && tr[0] != '0') {
+        std::fprintf(stderr, "[organizer scatter] phase hint -> %d "
+                     "(blobs=%zu fast_bytes=%llu)\n", (int)hint, stats.size(),
+                     (unsigned long long)fast_bytes);
+        std::fflush(stderr);
+      }
+    }
+  }
   const clio::run::u64 budget =
       static_cast<clio::run::u64>(static_cast<double>(fast_bytes) * kFillFactor);
   for (const OrganizerBlobStat &stat : stats) {

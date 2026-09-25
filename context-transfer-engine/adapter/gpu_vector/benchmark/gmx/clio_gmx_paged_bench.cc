@@ -146,6 +146,9 @@ int main(int argc, char **argv) {
   // self-contained (mesh total == input charge, exact).
   bool no_dense = false;
   bool ckpt = true;
+  // --ckpt-sync: the final vector.Copy is fully synchronous (every page
+  // materialised inside the Copy) instead of lazy copy-on-write.
+  bool ckpt_sync = false;
   // Optional file tier (full CTE stack: hbm-resident cache + RAM + file).
   u64 nvme_mb = 0;
   std::string nvme_path = "/tmp/gv_gmx_tier.dat";
@@ -164,13 +167,14 @@ int main(int argc, char **argv) {
     else if (a == "--repeat") repeat = static_cast<int>(next());
     else if (a == "--no-dense") no_dense = true;
     else if (a == "--no-ckpt") ckpt = false;
+    else if (a == "--ckpt-sync") ckpt_sync = true;
     else if (a == "--nodes") nodes = static_cast<u32>(next());
     else if (a == "--node") node = static_cast<u32>(next());
     else if (a == "--nvme-mb") nvme_mb = next();
     else if (a == "--nvme-path" && i + 1 < argc) nvme_path = argv[++i];
     else if (a == "--help") {
       std::printf("usage: %s [--blocks N] [--threads N] [--cap PAGES] "
-                  "[--page-kb N] [--atoms N] [--repeat N] [--no-ckpt]\n", argv[0]);
+                  "[--page-kb N] [--atoms N] [--repeat N] [--no-ckpt] [--ckpt-sync]\n", argv[0]);
       return 0;
     }
   }
@@ -527,7 +531,8 @@ int main(int argc, char **argv) {
   // multi-node path drops the cache first -- see bench_ckpt.h.
   std::unique_ptr<gv::Vector<unsigned long long>> mesh_ck;
   if (ckpt) {
-    mesh_ck = clio_bench_ckpt::FinalCheckpoint(mesh, "gv_gmx_mesh_ckpt", nodes);
+    mesh_ck = clio_bench_ckpt::FinalCheckpoint(mesh, "gv_gmx_mesh_ckpt", nodes,
+                                                ckpt_sync);
   }
   BenchFlushData();
   return rc;

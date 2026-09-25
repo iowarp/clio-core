@@ -133,6 +133,9 @@ int main(int argc, char **argv) {
   u64 page_kb = 64, I = 256, H = 4096, O = 64, B = 64, steps = 5;
   float lr = 0.01f;
   bool ckpt = true;
+  // --ckpt-sync: the final vector.Copy is fully synchronous (every page
+  // materialised inside the Copy) instead of lazy copy-on-write.
+  bool ckpt_sync = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() -> u64 {
@@ -150,6 +153,7 @@ int main(int argc, char **argv) {
     else if (a == "--batch") B = next();
     else if (a == "--steps") steps = next();
     else if (a == "--no-ckpt") ckpt = false;
+    else if (a == "--ckpt-sync") ckpt_sync = true;
     else if (a == "--lr" && i + 1 < argc) lr = std::strtof(argv[++i], nullptr);
     else if (a == "--help") {
       std::printf("usage: %s [--blocks N] [--threads N] [--cap PAGES] "
@@ -678,7 +682,10 @@ int main(int argc, char **argv) {
   // by default (--no-ckpt skips it). After every gate, because the
   // multi-node path drops the cache first -- see bench_ckpt.h.
   std::unique_ptr<gv::Vector<float>> w_ck;
-  if (ckpt) w_ck = clio_bench_ckpt::FinalCheckpoint(w, "gv_lbann_w_ckpt", nodes);
+  if (ckpt) {
+    w_ck = clio_bench_ckpt::FinalCheckpoint(w, "gv_lbann_w_ckpt", nodes,
+                                            ckpt_sync);
+  }
   BenchFlushData();
   return rc;
 }

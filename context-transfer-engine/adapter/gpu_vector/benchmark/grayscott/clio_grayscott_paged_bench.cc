@@ -220,6 +220,9 @@ int main(int argc, char **argv) {
   // otherwise sits in VRAM holding cold history that nobody reads again.
   u64 ckpt_every = 0;
   bool ckpt_drain = false;
+  // --ckpt-sync: every vector.Copy is fully synchronous (all pages
+  // materialised inside the Copy) instead of lazy copy-on-write.
+  bool ckpt_sync = false;
   bool ckpt_final = true;   // --no-ckpt: skip the end-of-run checkpoint
   float ckpt_cold = 0.0f;
   unsigned long long ram_mb = 0;   // 0 = data_mb + 1024, the historic value
@@ -260,6 +263,7 @@ int main(int argc, char **argv) {
     else if (a == "--ram-mb") ram_mb = next();
     else if (a == "--ckpt-every") ckpt_every = next();
     else if (a == "--ckpt-drain") ckpt_drain = true;
+    else if (a == "--ckpt-sync") ckpt_sync = true;
     else if (a == "--no-ckpt") ckpt_final = false;
     else if (a == "--ckpt-cold") ckpt_cold = nextf();
     else if (a == "--Du") Du = nextf();
@@ -277,7 +281,7 @@ int main(int argc, char **argv) {
                   "       [--pf-hot f] [--pf-warm f] [--pf-cold f] "
                   "[--pf-no-demote] [--pf-stall-every N]\n"
                   "       [--nvme-mb N] [--nvme-path P] [--ram-mb N]\n"
-                  "       [--ckpt-every N] [--ckpt-drain] [--ckpt-cold f]\n"
+                  "       [--ckpt-every N] [--ckpt-drain] [--ckpt-sync] [--ckpt-cold f]\n"
                   "       [--hbm-score f] [--ram-score f] [--nvme-score f]\n"
                   "         tier scores: a tier scored ABOVE the vector's put "
                   "score (0.5) is\n"
@@ -770,8 +774,9 @@ int main(int argc, char **argv) {
       // is a checkpoint being made durable, not a read-back.
       if (ckpt_every != 0 && ((s + 1) % ckpt_every) == 0) {
         const double ck0 = NowMs();
-        auto snap = vec.Copy("gv_gs_ck" + std::to_string(ckpt_id));
-        const u64 mat = snap->MaterializeAll();
+        // --ckpt-sync materialises inside the Copy; otherwise do it here.
+        auto snap = vec.Copy("gv_gs_ck" + std::to_string(ckpt_id), ckpt_sync);
+        const u64 mat = ckpt_sync ? snap->NumPages() : snap->MaterializeAll();
         if (mat == 0) {
           std::fprintf(stderr, "GRAYSCOTT ERROR: checkpoint %llu failed to "
                        "materialize\n", (unsigned long long)ckpt_id);
@@ -990,7 +995,8 @@ int main(int argc, char **argv) {
   // cannot be overtaken by a later step.
   std::unique_ptr<gv::Vector<float>> final_ck;
   if (ckpt_final) {
-    final_ck = clio_bench_ckpt::FinalCheckpoint(vec, "gv_gs_ckpt_final", nodes);
+    final_ck = clio_bench_ckpt::FinalCheckpoint(vec, "gv_gs_ckpt_final", nodes,
+                                                 ckpt_sync);
   }
   BenchFlushData();
   clio::run::CLIO_RUNTIME_FINALIZE();

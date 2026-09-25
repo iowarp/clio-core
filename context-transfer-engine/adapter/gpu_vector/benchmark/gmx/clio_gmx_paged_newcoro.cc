@@ -735,6 +735,11 @@ class YieldRunner {
 
 int main(int argc, char **argv) {
   u32 blocks = 16, threads = 256, cap = 0;
+  // --organizer-hint: announce the spread->gather turn to the CTE data
+  // organizer via clio_bench_dist::SetPhase (a ReorganizeHint broadcast).
+  // ScatterDataOrganizer keys on it to promote the mesh before the first
+  // gather fault rather than one page-read after it.
+  bool organizer_hint = false;
   // Z-PLANE SLAB DECOMPOSITION, exactly the MPI edition's: the mesh is the
   // big object and the atoms are REPLICATED on every node. Spread and
   // gather are both decomposed by owner, so no halo is ever exchanged --
@@ -753,6 +758,10 @@ int main(int argc, char **argv) {
   // carried a final write the 256-node rung did not, and the ladder would
   // not have been self-consistent. --ckpt-final asks for it.
   bool ckpt = false;
+  // --ckpt-sync: the final vector.Copy is fully synchronous (every page
+  // materialised inside the Copy) instead of lazy copy-on-write. Implies
+  // --ckpt-final.
+  bool ckpt_sync = false;
   // Optional file tier (full CTE stack: hbm-resident cache + RAM + file).
   u64 nvme_mb = 0;
   std::string nvme_path = "/tmp/gv_gmx_tier.dat";
@@ -773,6 +782,7 @@ int main(int argc, char **argv) {
     if (a == "--blocks") blocks = static_cast<u32>(next());
     else if (a == "--threads") threads = static_cast<u32>(next());
     else if (a == "--cap") cap = static_cast<u32>(next());
+    else if (a == "--organizer-hint") organizer_hint = true;
     else if (a == "--page-kb") page_kb = next();
     else if (a == "--atoms") atoms = next();
     else if (a == "--repeat") repeat = static_cast<int>(next());
@@ -781,13 +791,14 @@ int main(int argc, char **argv) {
     else if (a == "--no-publish") publish_flag = 0;
     else if (a == "--no-ckpt") ckpt = false;   // kept: now a no-op
     else if (a == "--ckpt-final") ckpt = true;
+    else if (a == "--ckpt-sync") ckpt = ckpt_sync = true;
     else if (a == "--nodes") nodes = static_cast<u32>(next());
     else if (a == "--node") node = static_cast<u32>(next());
     else if (a == "--nvme-mb") nvme_mb = next();
     else if (a == "--nvme-path" && i + 1 < argc) nvme_path = argv[++i];
     else if (a == "--help") {
       std::printf("usage: %s [--blocks N] [--threads N] [--cap PAGES] "
-                  "[--page-kb N] [--atoms N] [--repeat N] [--no-ckpt]\n", argv[0]);
+                  "[--page-kb N] [--atoms N] [--repeat N] [--no-ckpt] [--ckpt-sync]\n", argv[0]);
       return 0;
     }
   }
@@ -1052,6 +1063,10 @@ int main(int argc, char **argv) {
       ctp::GpuApi::Synchronize();
     }
     const auto gx_c0 = mesh.ReadStats(0);
+    // SPREAD: the mesh is being WRITTEN and nothing reads it until the
+    // gather, so an organizer promoting on sight buys migrations for pages
+    // with no reuse ahead of them.
+    clio_bench_dist::SetPhase(clio_bench_dist::kPhaseScatter, organizer_hint);
     const double t0 = NowMs();
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
@@ -1096,6 +1111,10 @@ int main(int argc, char **argv) {
         return 1;
       }
     }
+    // THE TURN. Everything the gather reads has now been written. Announced
+    // before the launch and waited on, so the organizer cannot still hold the
+    // scatter phase while the gather is already faulting.
+    clio_bench_dist::SetPhase(clio_bench_dist::kPhaseGather, organizer_hint);
     runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
                    gy::YieldStackView sv) {
       gx::LaunchGather(g, b, gpu, dmesh, d_ax, d_ay, d_az, d_aq, d_bs, K,
@@ -1180,7 +1199,8 @@ int main(int argc, char **argv) {
   // multi-node path drops the cache first -- see bench_ckpt.h.
   std::unique_ptr<gv::Vector<unsigned long long>> mesh_ck;
   if (ckpt) {
-    mesh_ck = clio_bench_ckpt::FinalCheckpoint(mesh, "gv_gmx_mesh_ckpt", nodes);
+    mesh_ck = clio_bench_ckpt::FinalCheckpoint(mesh, "gv_gmx_mesh_ckpt", nodes,
+                                                ckpt_sync);
   }
   BenchFlushData();
   return rc;

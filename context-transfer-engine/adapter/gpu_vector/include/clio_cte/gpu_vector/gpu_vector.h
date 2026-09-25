@@ -397,8 +397,19 @@ class Vector {
    * The returned handle is CTE-ONLY: it builds NO device views (those cost
    * a full page-cache allocation in VRAM). Host Download/Preload work; a
    * kernel that must read the snapshot binds its own Vector to `new_name`.
+   *
+   * @param new_name tag of the copy
+   * @param sync     false (default): lazy copy-on-write, as above. true:
+   *                 FULLY SYNCHRONOUS -- every page of the copy is
+   *                 materialised (MaterializeAll) before Copy returns, so the
+   *                 copy holds real bytes equal to the source at this call
+   *                 and later writes to the source cannot leak into it.
+   * @return the copy's handle
+   * @throws std::runtime_error if any step, including a sync
+   *         materialisation, fails
    */
-  std::unique_ptr<Vector<T>> Copy(const std::string &new_name) {
+  std::unique_ptr<Vector<T>> Copy(const std::string &new_name,
+                                  bool sync = false) {
     using clio::cte::core::Context;
     if (tag_name_.size() >= Context::kFaultParamsSize) {
       // The registration would be silently truncated at fault time and the
@@ -445,6 +456,13 @@ class Vector {
     // MaterializeAll needs the SOURCE name: the fault it issues carries the
     // source in fault_params_, exactly as the core's own internal fault does.
     out->ckpt_src_ = tag_name_;
+    if (sync) {
+      const clio::run::u64 np = out->NumPages();
+      if (out->MaterializeAll() != np) {
+        throw std::runtime_error("gpu_vector: synchronous copy " + new_name +
+                                 " failed to materialise");
+      }
+    }
     return out;
   }
 

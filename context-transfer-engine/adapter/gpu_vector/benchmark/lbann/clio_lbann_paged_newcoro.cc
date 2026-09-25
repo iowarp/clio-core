@@ -1297,6 +1297,10 @@ int main(int argc, char **argv) {
   // carried a final write the 256-node rung did not, and the ladder would
   // not have been self-consistent. --ckpt-final asks for it.
   bool ckpt = false;
+  // --ckpt-sync: the final vector.Copy is fully synchronous (every page
+  // materialised inside the Copy) instead of lazy copy-on-write. Implies
+  // --ckpt-final.
+  bool ckpt_sync = false;
   // Ways per block's set. 0 = 24, or, for a resident cache, enough for this
   // block's share of the pages plus 25% headroom: at 24 ways a 17 GB deck in
   // 256 KB pages fills 24576 slots with 69634 pages and has to evict.
@@ -1321,6 +1325,7 @@ int main(int argc, char **argv) {
     else if (a == "--steps") steps = next();
     else if (a == "--no-ckpt") ckpt = false;   // kept: now a no-op
     else if (a == "--ckpt-final") ckpt = true;
+    else if (a == "--ckpt-sync") ckpt = ckpt_sync = true;
     else if (a == "--lr" && i + 1 < argc) lr = std::strtof(argv[++i], nullptr);
     else if (a == "--help") {
       std::printf("usage: %s [--blocks N] [--threads N] [--cap PAGES] "
@@ -2105,7 +2110,10 @@ int main(int argc, char **argv) {
   // by default (--no-ckpt skips it). After every gate, because the
   // multi-node path drops the cache first -- see bench_ckpt.h.
   std::unique_ptr<gv::Vector<float>> w_ck;
-  if (ckpt) w_ck = clio_bench_ckpt::FinalCheckpoint(w, "gv_lbann_w_ckpt", nodes);
+  if (ckpt) {
+    w_ck = clio_bench_ckpt::FinalCheckpoint(w, "gv_lbann_w_ckpt", nodes,
+                                            ckpt_sync);
+  }
   BenchFlushData();
   return rc;
 }
