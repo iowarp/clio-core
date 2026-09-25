@@ -202,6 +202,17 @@ echo "### [$NAME] 3. compile with NVCC (the compiler co_await cannot use)"
   -Xcompiler -fPIC --expt-relaxed-constexpr --extended-lambda \
   -I"$W/$BD" -I"$O/gv_include" -I"$O/gv_include/clio_cte/gpu_vector" \
   $EXTRA $FLAGS > "$LOG/nv_$NAME.log" 2>&1
+NVRC=$?
+# TEST THE EXIT CODE, NOT JUST THE FILE. A previous build leaves an object
+# behind, so `test -f` passes after a FAILED compile and the link then quietly
+# produces a binary from stale code that reports "LINKED OK" -- observed
+# silently shipping a binary three edits out of date.
+if [ "$NVRC" -ne 0 ]; then
+  echo "NVCC FAILED rc=$NVRC (see $LOG/nv_$NAME.log)"
+  grep -E "error" "$LOG/nv_$NAME.log" | head -15
+  rm -f "$B/newcoro/${NAME}.o"
+  exit 1
+fi
 if ! test -f "$B/newcoro/${NAME}.o"; then
   echo "NVCC FAILED (see $LOG/nv_$NAME.log)"
   grep -E "error" "$LOG/nv_$NAME.log" | head -15; exit 1

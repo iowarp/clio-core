@@ -22,6 +22,8 @@
 
 #include <clio_cte/core/core_client.h>
 
+#include "bench_phase.h"
+
 namespace clio_bench_dist {
 
 using u32 = unsigned int;
