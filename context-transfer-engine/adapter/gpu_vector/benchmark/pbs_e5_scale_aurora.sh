@@ -27,13 +27,17 @@ mkdir -p "${OUT}"
 export ROOT SYCL_CACHE_DIR=${SYCL_CACHE_DIR:-/lus/flare/projects/IOWarp/llogan_e1/sycl_cache}
 export CLIO_TASK_PROGRESS_INTERVAL_MS=0
 
+# E5S_WL: which workloads to run, one equal group each (default all four).
+WL=(${E5S_WL:-kmeans grayscott gmx lbann})
 mapfile -t ALL < <(sort -u "${PBS_NODEFILE}")
-N=$(( ${#ALL[@]} / 4 ))
-for g in 0 1 2 3; do
-  printf '%s\n' "${ALL[@]:$(( g * N )):${N}}" > "${OUT}/nodes_g${g}"
+N=$(( ${#ALL[@]} / ${#WL[@]} ))
+declare -A GF
+for g in "${!WL[@]}"; do
+  printf '%s\n' "${ALL[@]:$(( g * N )):${N}}" > "${OUT}/nodes_${WL[$g]}"
+  GF[${WL[$g]}]="${OUT}/nodes_${WL[$g]}"
 done
 CAP=${E5S_CAP:-1200}
-echo "=== E5 at scale: ${#ALL[@]} nodes, 4 groups of ${N}, out ${OUT} ==="
+echo "=== E5 at scale: ${#ALL[@]} nodes, groups of ${N}: ${WL[*]}, out ${OUT} ==="
 
 # ---- gmx deck: K^3 x 8 B = 8 GiB x N, K a multiple of 16 and of N ----------
 GX_K=$(awk -v n="${N}" 'BEGIN{k=exp(log(8*2^30*n/8)/3); m=16; while (m % n) m+=16; k=int((k+m-1)/m)*m; print k}')
@@ -63,17 +67,17 @@ km_cells=""; for b in ${E5S_KM-32 24 16 8 4}; do km_cells="${km_cells} kmeans:${
 gs_cells=""; for b in ${E5S_GS-32 24 16 8 4}; do gs_cells="${gs_cells} grayscott:${b}"; done
 
 e5env="E5_RUNROOT=${OUT} E5_PERNODE_MB=${E5S_PERNODE_MB:-65536} E5_TIER_MB=200000 E5_CAP=${CAP} E5_RETRY=0"
-[ -n "${km_cells}" ] && env PBS_NODEFILE="${OUT}/nodes_g0" ${e5env} E5_CELLS="${km_cells# }" \
+[ -n "${GF[kmeans]:-}" ] && [ -n "${km_cells}" ] && env PBS_NODEFILE="${GF[kmeans]}" ${e5env} E5_CELLS="${km_cells# }" \
     E5_SFX_kmeans=_x_ckpt E5_ITERS_kmeans=${E5S_KM_ITERS:-24} E5_KM_REPEAT=1 E5_KM_EXTRA="--ckpt-final" \
     bash "${B}/pbs_e5_aurora.sh" > "${OUT}/kmeans.log" 2>&1 &
-[ -n "${gs_cells}" ] && env PBS_NODEFILE="${OUT}/nodes_g1" ${e5env} E5_CELLS="${gs_cells# }" \
+[ -n "${GF[grayscott]:-}" ] && [ -n "${gs_cells}" ] && env PBS_NODEFILE="${GF[grayscott]}" ${e5env} E5_CELLS="${gs_cells# }" \
     E5_STEPS_grayscott=${E5S_GS_STEPS:-8} E5_GS_REPEAT=1 E5_GS_EXTRA="--ckpt-every ${E5S_GS_CKPT:-4}" \
     bash "${B}/pbs_e5_aurora.sh" > "${OUT}/grayscott.log" 2>&1 &
 e4env="E4_OUTROOT=${OUT} BENCH_CAP=${CAP} DATA_MB=32768 TIER_BUDGET_MB=200000 HBM_MB=4096 BENCH_GROUP_N=${N}"
-[ -n "${gx_cells}" ] && env PBS_NODEFILE="${OUT}/nodes_g2" ${e4env} BENCH_CELLS="${gx_cells# }" \
+[ -n "${GF[gmx]:-}" ] && [ -n "${gx_cells}" ] && env PBS_NODEFILE="${GF[gmx]}" ${e4env} BENCH_CELLS="${gx_cells# }" \
     E5B_GMX_BLOCKS=${GX_BLK} E5B_GMX_PASSES=${E5S_GMX_PASSES:-12} \
     bash "${B}/pbs_e4_batch_aurora.sh" > "${OUT}/gmx.log" 2>&1 &
-[ -n "${lb_cells}" ] && env PBS_NODEFILE="${OUT}/nodes_g3" ${e4env} BENCH_CELLS="${lb_cells# }" \
+[ -n "${GF[lbann]:-}" ] && [ -n "${lb_cells}" ] && env PBS_NODEFILE="${GF[lbann]}" ${e4env} BENCH_CELLS="${lb_cells# }" \
     E5B_LB_HIDDEN=${LB_H} E5B_LB_STEPS=${E5S_LB_STEPS:-15} \
     bash "${B}/pbs_e4_batch_aurora.sh" > "${OUT}/lbann.log" 2>&1 &
 wait
