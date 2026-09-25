@@ -1096,6 +1096,15 @@ int main(int argc, char **argv) {
     vec_ck = clio_bench_ckpt::FinalCheckpoint(vec, region + "_ckpt", nodes,
                                               ckpt_sync);
   }
+  // EXIT BARRIER. Each rank embeds its node's runtime, so a rank that exits
+  // takes that node's containers with it. A slower rank whose checkpoint tag
+  // is owned by an exited node then waits forever in GetOrCreateTag (64
+  // nodes: 5 ranks hung). No node leaves until every node has checkpointed.
+  if (ckpt && !baseline && nodes > 1 &&
+      !clio_bench_dist::Barrier(*cte_red, red_tag, node, nodes, red_round++,
+                                "kmdone", 600)) {
+    std::fprintf(stderr, "KMEANS ERROR: exit barrier failed\n");
+  }
 
   ctp::GpuApi::Free(d_cent); ctp::GpuApi::Free(d_sums); ctp::GpuApi::Free(d_counts);
   ctp::GpuApi::Free(d_bsums); ctp::GpuApi::Free(d_bcounts);

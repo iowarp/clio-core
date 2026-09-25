@@ -68,7 +68,7 @@ gs_cells=""; for b in ${E5S_GS-32 24 16 8 4}; do gs_cells="${gs_cells} grayscott
 
 e5env="E5_RUNROOT=${OUT} E5_PERNODE_MB=${E5S_PERNODE_MB:-65536} E5_TIER_MB=200000 E5_CAP=${CAP} E5_RETRY=0"
 [ -n "${GF[kmeans]:-}" ] && [ -n "${km_cells}" ] && env PBS_NODEFILE="${GF[kmeans]}" ${e5env} E5_CELLS="${km_cells# }" \
-    E5_SFX_kmeans=_x_ckpt E5_ITERS_kmeans=${E5S_KM_ITERS:-24} E5_KM_REPEAT=1 E5_KM_EXTRA="--ckpt-final" \
+    E5_SFX_kmeans=${E5S_KM_SFX:-_x_ckpt2} E5_ITERS_kmeans=${E5S_KM_ITERS:-24} E5_KM_REPEAT=1 E5_KM_EXTRA="--ckpt-final" \
     bash "${B}/pbs_e5_aurora.sh" > "${OUT}/kmeans.log" 2>&1 &
 [ -n "${GF[grayscott]:-}" ] && [ -n "${gs_cells}" ] && env PBS_NODEFILE="${GF[grayscott]}" ${e5env} E5_CELLS="${gs_cells# }" \
     E5_STEPS_grayscott=${E5S_GS_STEPS:-8} E5_GS_REPEAT=1 E5_GS_EXTRA="--ckpt-every ${E5S_GS_CKPT:-4}" \
