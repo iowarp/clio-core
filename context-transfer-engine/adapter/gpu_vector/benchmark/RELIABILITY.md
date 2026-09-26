@@ -178,3 +178,9 @@ production layout: one runtime per node remains the design.
   rounds (3.9 ms each, slowest 22.8 ms). Timed region 115 s vs 109 s at 16
   nodes (steps 15-16 s vs 13 s; a checkpoint of 8192 pages 10.4-11.0 s at
   both scales). Weak scaling holds 16 -> 64 for this CPU-only pattern.
+- 2026-09-26 16:10 UTC (dev node 2, job 8872255), everything on the fixed
+  libraries: kmeans GPU ladder PASS; colocated reproducer suite 0 failures;
+  CTE stress ladder 9/9 PASS; grayscott GPU ladder PASS with the corrected
+  gate (its checksum is extensive and non-linear in the deck; paging is
+  bit-exact against a resident run of the same deck at 2 and 4 ranks, ~4,500
+  evictions each).
