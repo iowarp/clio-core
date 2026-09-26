@@ -48,8 +48,11 @@ INCS=(-I"$W/$BD"
 # _deps; on Aurora they are spack prefixes, so discover them rather than
 # hardcoding a hash-suffixed path that will rot at the next module update.
 SPACK_ROOT=${SPACK_ROOT:-$(ls -d /opt/aurora/*/spack/unified/*/install/linux-x86_64 2>/dev/null | head -1)}
+# Aurora's unified spack has boost but not yaml-cpp/cereal/libzmq; those are
+# in the user's own spack (the one build-fresh was configured against), so
+# search both. Without them the transpile dies on 'yaml-cpp/yaml.h'.
 for pkg in yaml-cpp cereal boost libzmq zeromq; do
-  d=$(ls -d "$SPACK_ROOT"/${pkg}-*/include 2>/dev/null | head -1)
+  d=$(ls -d "$SPACK_ROOT"/${pkg}-*/include "$HOME"/spack/opt/spack/linux-*/${pkg}-*/include 2>/dev/null | head -1)
   [ -n "$d" ] && INCS+=(-I"$d")
 done
 # The SYCL headers, for the PARSE only. macros.h pulls in <sycl/sycl.hpp>
