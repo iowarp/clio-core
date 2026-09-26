@@ -34,6 +34,16 @@ same configuration at small scale.
    gates, prints the 64-node submit line only when every rung passes.
 7. Each reproducer becomes a distributed test under gpu_vector/test.
 8. A `clio-bench` runbook skill: procedure + failure-signature table.
+9. DONE: a CPU-only CTE stress benchmark that mimics the vector
+   (`context-transfer-engine/benchmark/clio_cte_vector_stress`, ladder
+   `stress_ladder.sh`, scale launcher `pbs_stress_aurora.sh`). Found
+   defects 8-11 in the core with no GPU involved.
+10. Open: the barrier miss (defect 9) has not recurred in 2,400+ gate
+    rounds since the reader drain; keep the diagnostics armed and watch the
+    16-node stress runs. A unit test for the torn-read cases (concurrent
+    put/get on one blob, byte verification, both the RPC and the zero-IPC
+    path) belongs in context-transfer-engine/test/unit once the test tree
+    is built here.
 
 ## Enabler: several runtimes on one node
 

@@ -34,6 +34,15 @@ behind them.
    the reproducers of the known defects as pass/fail cases (smoke, range
    split, targets race with and without the fix, peer death, probe out of
    core), ~10 minutes on one node.
+   After any CTE or runtime change, run the CPU-only CTE stress ladder,
+   `context-transfer-engine/benchmark/stress_ladder.sh <workdir>` (~4 min,
+   no GPU): `clio_cte_vector_stress` drives the CTE the way the vector does
+   (generational pages, halo and random reads across co-located runtimes,
+   PodMulti batches, checkpoints, the gate barrier) and verifies every
+   byte. It found the torn-read defects (8, 11) the GPU benchmarks turned
+   into "wrong checksum, no error". Build it with
+   `context-transfer-engine/benchmark/build_stress_aurora.sh`; it is
+   subject to the same staleness check as the GPU binaries.
 5. **Iterate on a held dev node**, not on the queue: `qsub -v
    DEVNODE_DIR=<flare dir> pbs_devnode_aurora.sh` (1 node, debug queue, 1 h)
    executes scripts dropped into `<dir>/queue/`, output in `<dir>/out/`.
