@@ -209,3 +209,7 @@ production layout: one runtime per node remains the design.
   declared dead, 200/200 gate rounds, 132 s wall (172 s before the startup
   work); 6 pool creates per rank. Stress ladder 9/9 and kmeans GPU ladder
   PASS on the same libraries (dev node 4).
+- 2026-09-26 22:30 UTC (dev node 6, job 8872832), final libraries of the day
+  (97250a23 FlushData atomic move + WAL mutex, 689f47e3 flush-race test):
+  stress ladder 9/9, kmeans GPU ladder PASS, colocated suite 21/21 (7 cases
+  including late_peer); torn-read test and both same-blob variants pass.
