@@ -67,6 +67,16 @@ struct IpcCpu2CpuZmq {
   /** Re-send a task via ZMQ after server restart. */
   template <typename TaskT>
   static void ResendTask(IpcManager *ipc, Future<TaskT> &future);
+
+  /**
+   * Emit the one-shot client-response send tally (#968).
+   *
+   * SendOut's send/fail counters were only observable through a 1-in-256
+   * kDebug line, which a default build compiles out entirely, so a run could
+   * retry or drop responses with nothing in the log to show it. Called once
+   * from ~IpcManager(); a no-op when this process sent nothing.
+   */
+  static void LogSendTally();
 };
 
 }  // namespace clio::run

@@ -126,7 +126,8 @@ TEST_CASE("ConfigErrors - storage device parsing", "[cte][config][storage]") {
       "    capacity_limit: 1g\n    score: -0.5\n"));
 
   SECTION("Valid device with every bdev_type accepted");
-  for (const char *type : {"file", "ram", "hbm", "pinned", "noop"}) {
+  for (const char *type : {"file", "ram", "hbm", "pinned", "noop", "s3",
+                           "gcs"}) {
     Config ok;
     std::string yaml = std::string("storage:\n  - path: /tmp/x\n") +
                        "    bdev_type: " + type + "\n" +
@@ -134,6 +135,30 @@ TEST_CASE("ConfigErrors - storage device parsing", "[cte][config][storage]") {
     REQUIRE(ok.LoadFromString(yaml));
     REQUIRE(ok.storage_.devices_.size() == 1);
     REQUIRE(ok.storage_.devices_[0].bdev_type_ == type);
+  }
+
+  SECTION("Cloud device paths survive parsing intact");
+  // A cloud path is a URL, not a filesystem path. ExpandPath must leave the
+  // scheme alone (it only substitutes ${VAR}), because the bdev parses
+  // "s3://bucket/prefix" back apart at Init time -- and because CTE appends
+  // "_node<N>" to this string, a prefix is mandatory or the suffix would land
+  // on the bucket name.
+  {
+    Config ok;
+    REQUIRE(ok.LoadFromString(
+        "storage:\n  - path: s3://my-bucket/my-prefix\n"
+        "    bdev_type: s3\n    capacity_limit: 64gb\n    score: 1.0\n"));
+    REQUIRE(ok.storage_.devices_.size() == 1);
+    REQUIRE(ok.storage_.devices_[0].path_ == "s3://my-bucket/my-prefix");
+    REQUIRE(ok.storage_.devices_[0].bdev_type_ == "s3");
+  }
+  {
+    Config ok;
+    REQUIRE(ok.LoadFromString(
+        "storage:\n  - path: gcs://my-bucket/my-prefix\n"
+        "    bdev_type: gcs\n    capacity_limit: 64gb\n    score: 1.0\n"));
+    REQUIRE(ok.storage_.devices_[0].path_ == "gcs://my-bucket/my-prefix");
+    REQUIRE(ok.storage_.devices_[0].bdev_type_ == "gcs");
   }
 }
 

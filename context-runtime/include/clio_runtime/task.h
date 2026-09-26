@@ -946,6 +946,18 @@ class RunContext {
    *  task's identity. The ZMQ recv thread keys pending_zmq_futures_ by this, so
    *  the response must carry it for the client to match (else it hangs). */
   uintptr_t client_net_key_;
+  /** #968: the client's OWN task identity, captured at RecvIn alongside
+   *  client_net_key_ and stamped back onto the response at SendOut.
+   *
+   *  net_key_ is the client task's heap address, so it is recycled as soon as
+   *  that task is freed. Demuxing a response by net_key alone therefore has no
+   *  way to tell "the reply to the task I am waiting for" from "a late reply to
+   *  a previous task that happened to live at this address". unique_ is
+   *  monotonic per client process and is never recycled, so echoing it lets the
+   *  client recv thread corroborate the address match against a real identity.
+   *  0 means the peer did not echo one (nothing to check). */
+  u32 client_task_unique_;
+  u32 client_task_major_;  /**< Companion to client_task_unique_ (per-thread) */
   ctp::lbm::ShmTransferInfo input_;   /**< SHM transfer info (client -> worker) */
   ctp::lbm::ShmTransferInfo output_;  /**< SHM transfer info (worker -> client) */
   ctp::lbm::Transport* response_transport_; /**< Transport for the response */
@@ -959,6 +971,12 @@ class RunContext {
    *  (task freed via RAII) instead of re-queued forever. Non-serialized;
    *  meaningful only on the server's outbound response future. */
   u32 send_fail_count_;            /**< Consecutive response-Send failures */
+  /** #968: how many times SendOut has put a response for THIS future on the
+   *  wire. A successful send should happen exactly once; a second one means the
+   *  client is being handed two replies for one request, and the second lands
+   *  on whatever now owns that net_key. Counted so the anomaly is reported
+   *  where it happens rather than inferred from the client's miss tally. */
+  u32 responses_sent_;
   ctp::Timepoint first_send_fail_; /**< Time of the first failure (for timeout) */
   ctp::abitfield32_t gpu_flags_;   /**< GPU device-completion bit (gpu2gpu) */
   uintptr_t gpu_task_device_ptr_;  /**< Device addr of the task POD (kDeviceMem) */
@@ -1018,10 +1036,13 @@ class RunContext {
         origin_(ClientOrigin::kClientShm),
         client_pid_(0),
         client_net_key_(0),
+        client_task_unique_(0),
+        client_task_major_(0),
         response_transport_(nullptr),
         response_identity_len_(0),
         response_fd_(-1),
         send_fail_count_(0),
+        responses_sent_(0),
         gpu_task_device_ptr_(0),
         gpu_task_size_(0),
         probe_rec_(0),

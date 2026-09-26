@@ -64,8 +64,38 @@ struct MacSignalRegistry {
   std::unordered_map<uint64_t, int> map_;  // key=(pid<<32|lo32(tid)), val=write_fd
 
   static MacSignalRegistry& Get() {
-    static MacSignalRegistry r;
-    return r;
+    // Deliberately leaked, and that is the point: this registry must outlive
+    // every atexit handler in the process.
+    //
+    // The runtime tears itself down from atexit handlers
+    // (std::atexit(CLIO_RUNTIME_FINALIZE) in clio_runtime.cc, plus
+    // RuntimeManagerCleanupAtExit), and that teardown still pushes tasks and
+    // wakes workers: RuntimeManager::ServerFinalize -> DrainPendingTasks runs
+    // with the workers live, so a coroutine can reach IpcManager::AwakenWorker
+    // -> EventManager::Signal -> Find() -> lock(mtx_) at any point during it.
+    // WorkOrchestrator::StopWorkers signals every worker too, and
+    // ~EventManager() calls Unregister().
+    //
+    // Held by value, this object's destructor is registered with __cxa_atexit
+    // the first time Get() runs -- on a worker thread, racing the main thread's
+    // std::atexit calls. Lose that race and the registry is destroyed FIRST,
+    // so the teardown wake path locks a pthread_mutex_destroy'd mutex. libc++
+    // then fails the lock with EINVAL and std::mutex::lock() throws inside a
+    // coroutine, whose promise unhandled_exception() std::terminate()s the
+    // process ("mutex lock failed: Invalid argument"; daemon exit code 134).
+    //
+    // There is no Linux twin of this bug to compare against, which is why it
+    // reads as macOS-only: event_manager_linux.h has no registry and no mutex
+    // at all (Signal() is a bare tgkill syscall).
+    //
+    // A never-destroyed heap instance removes the ordering dependency
+    // entirely, and matches how the runtime's own singletons already work
+    // (GetGlobalPtrVar heap-allocates and never destroys them). The pointer
+    // itself is trivially destructible, so nothing is registered with
+    // __cxa_atexit; the one-time init keeps its guard. Cost is one small
+    // leaked object per process, at exit.
+    static MacSignalRegistry* r = new MacSignalRegistry();
+    return *r;
   }
 
   static uint64_t Key(int pid, int tid) {

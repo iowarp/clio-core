@@ -243,6 +243,22 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     archive->ResetBulkIndex();
     archive->msg_type_ = MsgType::kSerializeOut;
     *archive >> (*task_ptr);
+  } else if (!future.consumed_) {
+    // Twin of the check in IpcCpu2CpuZmq::RecvOut -- see the long comment
+    // there for why a complete task with no parked archive is a protocol
+    // violation rather than a benign miss, and why returning true here hid
+    // the #968 read failures behind untouched constructor defaults.
+    //
+    // consumed_ matters MORE on this path than on the ZMQ twin: the claim
+    // above ERASES the entry, so a second Wait() on the same future finds
+    // nothing legitimately. Destroy(true) sets consumed_ after Recv returns,
+    // so it is false only on the first claim.
+    HLOG(kError,
+         "IpcCpu2Cpu::RecvOut: task completed with NO response archive for "
+         "net_key {} -- the completion came from another task's response "
+         "(recycled address). Failing instead of returning defaults. See #968.",
+         want_key);
+    return false;
   }
   return true;
 #endif  // CTP_IS_HOST

@@ -88,6 +88,12 @@ class Future {
   template <typename OtherTaskT, typename OtherAllocT>
   friend class Future;
   friend struct IpcCpu2Self;
+  // The two client transports read consumed_ in RecvOut to tell a FIRST
+  // response-claim (where a missing archive is a protocol violation worth
+  // failing on) from a re-Wait of an already-consumed future (where the
+  // SHM twin has legitimately erased it). See ipc_cpu2cpu*_impl.h.
+  friend struct IpcCpu2Cpu;
+  friend struct IpcCpu2CpuZmq;
   friend struct IpcCpu2Gpu;
   friend struct IpcGpu2Cpu;
 

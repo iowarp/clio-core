@@ -2259,6 +2259,11 @@ size_t IpcManager::ReportRuntimeLeaks(const char *phase) const {
 }
 
 IpcManager::~IpcManager() {
+  // One-shot client-response send tally (#968). Emitted here because SendOut
+  // is driven from a periodic admin task and has no exit of its own to hook.
+  // No-ops in a process that never sent a client response, so clients and
+  // short-lived tools stay silent.
+  IpcCpu2CpuZmq::LogSendTally();
 #if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
   ReportRuntimeLeaks("~IpcManager");
 #endif
@@ -3611,6 +3616,15 @@ void IpcManager::RecvZmqClientThread() {
   // (FUTURE_COMPLETE set). Mismatch vs daemon-side send count = lost responses.
   size_t recv_count = 0;
   size_t miss_count = 0;
+  // #968: replies whose echoed client identity did not match the future found
+  // at their net_key. See the identity check in the drain loop below.
+  size_t identity_mismatch_count = 0;
+  // #968: when set, a mismatched reply is REJECTED rather than delivered. Read
+  // once here (not per message) because it must not change mid-run.
+  const bool strict_response_identity = []() {
+    const char *env = clio::run::env::GetCompat("STRICT_RESPONSE_IDENTITY");
+    return env != nullptr && env[0] == '1';
+  }();
   // Consecutive drains that ended in a Recv error rather than EAGAIN. A client
   // whose runtime has gone away sits here for the rest of its life: the
   // socket transport's client-mode Recv() keeps returning -1 on the dead fd,
@@ -3655,21 +3669,65 @@ void IpcManager::RecvZmqClientThread() {
         HLOG(kError, "RecvZmqClientThread: No task_infos in response");
         continue;
       }
-      size_t net_key = archive->task_infos_[0].task_id_.net_key_;
+      const TaskId &wire_id = archive->task_infos_[0].task_id_;
+      size_t net_key = wire_id.net_key_;
 
       std::lock_guard<std::mutex> lock(pending_futures_mutex_);
       auto it = pending_zmq_futures_.find(net_key);
       if (it == pending_zmq_futures_.end()) {
         ++miss_count;
+        // #968: report the echoed identity too. A miss whose unique_ matches a
+        // task this process has already completed is a LATE reply (the task finished and
+        // was reaped before its second response arrived); a miss with an
+        // unknown unique_ is a reply for something else entirely. The bare
+        // net_key could not tell those apart.
         HLOG(kError,
              "[CountClientRecv] miss#{}: No pending future for net_key {} "
-             "(received={}, misses={})",
-             miss_count, net_key, recv_count, miss_count);
+             "(echoed client_unique={} major={} pid={}, received={}, "
+             "misses={})",
+             miss_count, net_key, wire_id.unique_, wire_id.major_,
+             wire_id.pid_, recv_count, miss_count);
         recv_transport->ClearRecvHandles(*archive);
         continue;
       }
 
       Task *task = it->second.task;
+
+      // #968 IDENTITY CHECK. pending_zmq_futures_ is keyed by net_key, which is
+      // the waiting task's heap address and is recycled the moment that task is
+      // freed. The address matching therefore proves nothing on its own: a late
+      // reply to a previous task at this address matches just as well as the
+      // real one, and the client then deserializes THAT task's OUT fields over
+      // the one it is waiting for -- a silent wrong answer, which is the #968
+      // symptom. unique_ is monotonic per client process and never recycled, so
+      // comparing it turns the address match into a real identity match.
+      //
+      // Default is observe-only: log loudly, deliver anyway, so a run that has
+      // never seen a mismatch behaves exactly as before. Set
+      // CLIO_STRICT_RESPONSE_IDENTITY=1 to REJECT a mismatched response instead
+      // (treat it as a miss and keep waiting for the right one), which is the
+      // actual fix once the logs confirm this is what is happening.
+      if (wire_id.unique_ != 0 &&
+          (wire_id.unique_ != task->task_id_.unique_ ||
+           wire_id.major_ != task->task_id_.major_)) {
+        ++identity_mismatch_count;
+        HLOG(kError,
+             "[#968] RESPONSE IDENTITY MISMATCH on net_key {}: reply carries "
+             "unique={} major={} pid={} but the future waiting at this address "
+             "is unique={} major={} pid={}. This reply belongs to a DIFFERENT "
+             "task ({}). mismatches={}",
+             net_key, wire_id.unique_, wire_id.major_, wire_id.pid_,
+             task->task_id_.unique_, task->task_id_.major_,
+             task->task_id_.pid_,
+             strict_response_identity ? "REJECTED, still waiting"
+                                      : "delivered anyway -- observe-only mode",
+             identity_mismatch_count);
+        if (strict_response_identity) {
+          ++miss_count;
+          recv_transport->ClearRecvHandles(*archive);
+          continue;
+        }
+      }
 
       // Store the archive for Recv() to pick up
       pending_response_archives_[net_key] = std::move(archive);
@@ -3721,6 +3779,30 @@ void IpcManager::RecvZmqClientThread() {
     }
     error_streak = 0;
     recv_transport->PollRecv(kZmqPollTimeoutMs);
+  }
+
+  // One-shot teardown tally (#968). recv_count / miss_count were only ever
+  // observable through a 1-in-256 kDebug line that a default build compiles
+  // out, so a run could end having silently mis-routed responses with nothing
+  // in the log to say so. This is ONE line per client process, at kInfo, and
+  // it is the denominator every rate in this area needs.
+  //
+  // misses > 0 means at least one response arrived naming a net_key with no
+  // pending future -- i.e. a reply outlived the task it belonged to. That is
+  // the signature the #968 read failures turn on, so it is promoted to
+  // kWarning to survive a log level that hides kInfo.
+  if (miss_count > 0 || identity_mismatch_count > 0) {
+    HLOG(kWarning,
+         "[CountClientRecv] TOTAL responses={} misses={} identity_mismatches={}"
+         " -- a miss is a response naming a net_key with NO pending future; a "
+         "mismatch is one that matched an address but named a different task; "
+         "see #968 (strict_identity={})",
+         recv_count, miss_count, identity_mismatch_count,
+         strict_response_identity ? 1 : 0);
+  } else {
+    HLOG(kInfo,
+         "[CountClientRecv] TOTAL responses={} misses=0 identity_mismatches=0",
+         recv_count);
   }
 }
 

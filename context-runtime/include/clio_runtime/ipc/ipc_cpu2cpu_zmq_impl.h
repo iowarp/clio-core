@@ -167,6 +167,7 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
   // Memory fence + deserialize from pending_response_archives_
   std::atomic_thread_fence(std::memory_order_acquire);
   size_t net_key = task_ptr->task_id_.net_key_;
+  bool claimed = false;
   {
     std::lock_guard<std::mutex> lock(ipc->pending_futures_mutex_);
     auto it = ipc->pending_response_archives_.find(net_key);
@@ -175,7 +176,39 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
       archive->ResetBulkIndex();
       archive->msg_type_ = MsgType::kSerializeOut;
       *archive >> (*task_ptr);
+      claimed = true;
     }
+  }
+  // Reaching here with NO archive is a protocol violation, and this used to
+  // fall through to `return true` in silence -- which is precisely how the
+  // #968 read failures presented: the task looked like it succeeded while
+  // every OUT field still held its client-side constructor default (rc=0,
+  // result_code=0, scheduled=0, msg=''), because the OUT deserialize never
+  // ran. Nothing distinguished that from a genuine zero-valued success.
+  //
+  // It cannot happen on a well-formed round trip. The ONLY client-path writer
+  // of IsComplete() is the demux in IpcManager::RecvZmqClientThread, which
+  // parks the archive under this same net_key BEFORE calling SetComplete().
+  // So a complete task with no archive means the completion that woke us was
+  // raised by some OTHER task's response -- the aliasing case, since net_key
+  // is the task's recycled heap address (TaskId::net_key_, types.h).
+  //
+  // Failing here (rather than logging and continuing) is what makes the bug
+  // observable: WaitCpu2Cpu stamps return_code_ = -1 on a false return, so
+  // the caller sees a real error instead of plausible defaults.
+  //
+  // consumed_ guards the one legitimate miss: a SECOND Wait() on a future
+  // whose archive the first Wait already claimed. Destroy(true) sets
+  // consumed_ after Recv returns, so it is false on the first claim and true
+  // on any re-Wait. (The ZMQ path does not erase on claim -- the SHM twin
+  // does -- but the guard is kept in both for symmetry.)
+  if (!claimed && !future.consumed_) {
+    HLOG(kError,
+         "IpcCpu2CpuZmq::RecvOut: task completed with NO response archive for "
+         "net_key {} -- the completion came from another task's response "
+         "(recycled address). Failing instead of returning defaults. See #968.",
+         net_key);
+    return false;
   }
   return true;
 #endif  // CTP_IS_HOST
