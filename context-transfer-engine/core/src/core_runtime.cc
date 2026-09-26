@@ -1125,15 +1125,45 @@ clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTarg
       HLOG(kDebug, "Creating bdev with pool ID: major={}, minor={}",
            bdev_pool_id.major_, bdev_pool_id.minor_);
 
-      // Create the bdev container using the client
-      clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
+      // Create the bdev container ON THE TARGET NODE ONLY. A per-node tier
+      // is one container; the previous Dynamic query became a Broadcast for
+      // a pool that did not exist yet and instantiated a container on every
+      // node -- N pool creates per node, N^2 cluster-wide (4,096 at 64
+      // nodes), which is what stalled node 5 at 16 nodes long enough to be
+      // declared dead (RELIABILITY.md defect 12). Same pattern as a
+      // compose entry with `pool_query: local`: the container is composed
+      // where it lives. Routing to it from elsewhere (neighborhood > 1)
+      // needs only the pool's address map, which the registrant seeds
+      // below without creating anything.
+      auto *ipc_manager = CLIO_IPC;
+      const clio::run::u32 num_hosts = static_cast<clio::run::u32>(
+          std::max<size_t>(ipc_manager->GetNumHosts(), 1));
+      const clio::run::u32 this_node =
+          static_cast<clio::run::u32>(ipc_manager->GetNodeId());
+      const clio::run::u32 target_node =
+          task->target_query_.IsDirectHashMode()
+              ? task->target_query_.GetHash() % num_hosts
+              : this_node;
+      const clio::run::PoolQuery pool_query =
+          target_node == this_node
+              ? clio::run::PoolQuery::Local()
+              : clio::run::PoolQuery::Physical(target_node);
       HLOG(kDebug,
            "RegisterTarget: Creating bdev with custom_pool_id=({},{}), "
-           "target_name={}",
-           bdev_pool_id.major_, bdev_pool_id.minor_, target_name);
+           "target_name={} on node {} (this node {})",
+           bdev_pool_id.major_, bdev_pool_id.minor_, target_name, target_node,
+           this_node);
       auto create_task = bdev_client.AsyncCreate(
           pool_query, target_name, bdev_pool_id, bdev_type, total_size);
       CLIO_CO_AWAIT(create_task);
+      if (create_task->return_code_ == 0 && target_node != this_node) {
+        auto *pool_manager = CLIO_POOL_MANAGER;
+        if (pool_manager->GetPoolInfo(create_task->new_pool_id_) == nullptr) {
+          // Address map only (container i lives on node i), so DirectHash
+          // queries for this target resolve to the node that holds it.
+          pool_manager->InitAddressMap(create_task->new_pool_id_, num_hosts);
+        }
+      }
       HLOG(kDebug,
            "RegisterTarget: After create, create_task->new_pool_id_=({},{}), "
            "create_task->return_code_={}",
@@ -1170,7 +1200,7 @@ clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTarg
     // ATTACH path this doubles as a liveness probe: a failed GetStats means
     // the existing pool is not reachable, so we refuse to register it.
     clio::run::u64 remaining_size;
-    auto stats_task = bdev_client.AsyncGetStats();
+    auto stats_task = bdev_client.AsyncGetStats(task->target_query_);
     CLIO_CO_AWAIT(stats_task);
     if (attach_existing && stats_task->GetReturnCode() != 0) {
       HLOG(kError,
