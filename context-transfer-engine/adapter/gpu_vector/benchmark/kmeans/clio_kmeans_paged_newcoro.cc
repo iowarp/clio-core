@@ -1035,7 +1035,10 @@ int main(int argc, char **argv) {
   // entry (kHBM) and (513,1) the second (host). Deriving them from
   // cte_core's major instead gave remaining > capacity -- an impossible
   // reading that would have been reported as a placement violation.
-  {
+  // Opt-in (KM_TIER_CHECK=1): it assumes a second storage entry (513,1); in a
+  // one-tier config that query has no container, so it spends 5 s in the
+  // runtime's retry budget and logs an ERROR at the end of every run.
+  if (std::getenv("KM_TIER_CHECK") != nullptr) {
     clio::run::bdev::Client t_fast(clio::run::PoolId(512, 1));
     clio::run::bdev::Client t_host(clio::run::PoolId(513, 1));
     auto fa = t_fast.AsyncGetStats(); fa.Wait();

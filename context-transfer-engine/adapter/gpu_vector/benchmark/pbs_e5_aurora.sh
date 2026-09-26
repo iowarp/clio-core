@@ -31,6 +31,8 @@
 # before and after the run; the cell line reports the sum over ranks.
 set -u
 ROOT=${ROOT:-/home/llogan/clio-core/.claude/worktrees/gpu-coro}
+# shellcheck source=bench_config.sh
+source "${ROOT}/context-transfer-engine/adapter/gpu_vector/benchmark/bench_config.sh"
 JOBTAG=${PBS_JOBID%%.*}
 NRANKS=$(sort -u "${PBS_NODEFILE}" | wc -l)
 PERNODE_MB=${E5_PERNODE_MB:-256000}
@@ -58,49 +60,12 @@ export CLIO_TASK_PROGRESS_INTERVAL_MS=${CLIO_TASK_PROGRESS_INTERVAL_MS:-0}
 echo "=== E5: ${NRANKS} nodes, ${PERNODE_MB} MB/node deck (${DATA_MB} MB), DRAM tier ${TIER_MB} MB/node ==="
 echo "    cells: ${CELLS}"
 
-# ---- per-cell runtime config: one DRAM tier, SWIM off (see E1) -----------
+# ---- per-cell runtime config: the shared generator (bench_config.sh) ------
 e5_conf() {
   local rundir=$1
   sort -u "${PBS_NODEFILE}" > "${rundir}/hostfile"
-  cat > "${rundir}/clio_e5.yaml" <<EOF
-networking:
-  port: 9460
-  hostfile: "${rundir}/hostfile"
-  # >= node count: a Broadcast wider than neighborhood_size is split into
-  # multi-node Range queries that the receiving node runs only locally (a
-  # runtime bug), so at 64 nodes pool creation reached nodes 0 and 32 only
-  # and 62 nodes had no CTE target. Sized past the allocation, every
-  # broadcast becomes one single-node query per node (the 24-node path).
-  neighborhood_size: 1024
-swim:
-  enabled: false
-runtime:
-  num_threads: 8
-  queue_depth: 8192
-  first_busy_wait: 10000000
-gpu:
-  queue_depth: 8192
-compose:
-  - mod_name: clio_bdev
-    pool_name: "ram::chi_default_bdev"
-    pool_query: local
-    pool_id: "301.0"
-    bdev_type: ram
-    capacity: "1GB"
-  - mod_name: clio_cte_core
-    pool_name: cte_core
-    pool_query: local
-    pool_id: "512.0"
-    targets:
-      neighborhood: 1
-    storage:
-      - path: "ram::gv_e5_dram"
-        bdev_type: "ram"
-        capacity_limit: "${TIER_MB}MB"
-        score: 0.5
-    dpe:
-      dpe_type: "max_bw"
-EOF
+  BENCH_TIERS="ram::gv_e5_dram|ram|${TIER_MB}MB|0.5" \
+    bench_clio_yaml "${rundir}/clio_e5.yaml" "${rundir}/hostfile" 9460
 }
 
 # ---- the deck for one cell ------------------------------------------------
@@ -130,7 +95,7 @@ run_cell() {
   local label="${wl}_hbm${gb}"
   local rundir="${E5_RUNROOT:-${ROOT}/build-spike}/e5_${JOBTAG}_${label}"
   cell_deck "${wl}" "${gb}"
-  if [ -z "${EXE}" ] || [ ! -x "${EXE}" ]; then
+  if [ -z "${EXE}" ] || [ ! -x "${EXE}" ] || ! bench_check_binary "${EXE}"; then
     echo "RESULT e5/${label}x${NRANKS}: NO-EXECUTABLE (${EXE})"
     return
   fi
@@ -158,7 +123,8 @@ run_cell() {
     echo "ENERGY_UJ before: ${e0} after: ${e1}" >> "rank$r.log"
     echo "rank $r on $(hostname) exit=$rc" >> "rank$r.log"
     exit 0
-  '
+  ' &
+  bench_watch_ranks "${rundir}" $! "${NRANKS}"
   echo "elapsed $((SECONDS - start))s"
   for r in 0 1; do
     echo "----- rank ${r} -----"

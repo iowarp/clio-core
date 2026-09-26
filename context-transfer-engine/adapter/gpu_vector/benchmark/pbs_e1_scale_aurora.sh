@@ -49,6 +49,8 @@
 set -u
 
 ROOT=${ROOT:-/home/llogan/clio-core/.claude/worktrees/gpu-coro}
+# shellcheck source=bench_config.sh
+source "${ROOT}/context-transfer-engine/adapter/gpu_vector/benchmark/bench_config.sh"
 ITERS=${BENCH_ITERS:-20}
 CAP=${BENCH_CAP:-900}
 NRANKS=$(sort -u "${PBS_NODEFILE}" | wc -l)
@@ -104,7 +106,7 @@ export MPIR_CVAR_ENABLE_GPU=1
 run_one() {
   local label=$1 exe=$2 args=$3 ranked=$4
   local rundir="${BENCH_RUNROOT:-${ROOT}/build-spike}/e1_${JOBTAG}_${label}"
-  if [ ! -x "${exe}" ]; then
+  if [ ! -x "${exe}" ] || ! bench_check_binary "${exe}"; then
     echo "RESULT e1/${label}x${NRANKS}: NO-EXECUTABLE"
     return 2
   fi
@@ -130,7 +132,8 @@ run_one() {
     echo "ENERGY_UJ before: ${e0} after: ${e1}" >> "rank$r.log"
     echo "rank $r on $(hostname) exit=$rc" >> "rank$r.log"
     exit 0
-  '
+  ' &
+  bench_watch_ranks "${rundir}" $! "${NRANKS}"
   local rc=0 r rrc
   echo "elapsed $((SECONDS - start))s"
   # Only ranks 0 and 1 are printed: at 512 nodes the full dump would bury the
@@ -171,65 +174,12 @@ run_one() {
   return "${rc}"
 }
 
-# ---- the Eternia config: a DRAM tier and nothing else ----------------------
+# ---- the Eternia config: the shared generator, one DRAM tier ---------------
 et_conf() {
   local rundir=$1 cap_mb=$2
   sort -u "${PBS_NODEFILE}" > "${rundir}/hostfile"
-  cat > "${rundir}/clio_e1.yaml" <<EOF
-networking:
-  port: 9460
-  hostfile: "${rundir}/hostfile"
-  # >= node count: a Broadcast wider than neighborhood_size is split into
-  # multi-node Range queries that the receiving node runs only locally (a
-  # runtime bug), so at 64 nodes pool creation reached nodes 0 and 32 only
-  # and 62 nodes had no CTE target. Sized past the allocation, every
-  # broadcast becomes one single-node query per node (the 24-node path).
-  neighborhood_size: 1024
-
-# SWIM OFF. Failure detection is orthogonal to what this study measures and
-# is actively harmful here. Its suspicion timeout is 60 s and expiry runs
-# TriggerRecovery, which redistributes a live node's containers. At 256
-# nodes the 256-way compose starves probe replies long enough to cross that
-# threshold, so nodes that are merely busy get declared dead, their
-# containers are redistributed, routing then answers Dne (container does not
-# exist) and the cluster never converges -- the 256 rung sat for 900 s
-# without completing one iteration. On a healthy batch allocation no node is
-# going to fail mid-run; if one does, the job dies anyway.
-swim:
-  enabled: false
-
-runtime:
-  num_threads: 8
-  queue_depth: 8192
-  first_busy_wait: 10000000
-
-gpu:
-  queue_depth: 8192
-
-compose:
-  - mod_name: clio_bdev
-    pool_name: "ram::chi_default_bdev"
-    pool_query: local
-    pool_id: "301.0"
-    bdev_type: ram
-    capacity: "1GB"
-
-  - mod_name: clio_cte_core
-    pool_name: cte_core
-    pool_query: local
-    pool_id: "512.0"
-    targets:
-      neighborhood: 1
-    storage:
-      - path: "ram::gv_e1_dram"
-        bdev_type: "ram"
-        capacity_limit: "${cap_mb}MB"
-        # <= the vector's blob score (0.5), or MaxBwDpe files the only tier
-        # under fallback and places through its bandwidth model instead.
-        score: 0.5
-    dpe:
-      dpe_type: "max_bw"
-EOF
+  BENCH_TIERS="ram::gv_e1_dram|ram|${cap_mb}MB|0.5" \
+    bench_clio_yaml "${rundir}/clio_e1.yaml" "${rundir}/hostfile" 9460
 }
 
 # WEAK-SCALED DECKS for gmx, lbann and lammps_md: each keeps the single-node

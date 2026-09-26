@@ -221,3 +221,14 @@ if [ ! -x "$OUT/clio_${NAME}_paged_newcoro${SUFFIX}" ]; then
   exit 1
 fi
 echo "  linked: $OUT/clio_${NAME}_paged_newcoro${SUFFIX}"
+# PROVENANCE. One line per build in $OUT/MANIFEST.tsv: when, binary, commit
+# (+dirty when the tree had uncommitted changes), and the knobs that shaped
+# it. Binaries used to be identified by suffix alone, and their build flags
+# had to be recovered from old transcripts.
+{
+  printf '%s\t%s\t%s%s\tEXTRA_CXX=%s\tIGC_FC=%s\tTAG=%s\tGRF=%s\tSPLIT=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "clio_${NAME}_paged_newcoro${SUFFIX}" \
+    "$(git -C "$W" rev-parse --short HEAD 2>/dev/null || echo nogit)" \
+    "$(git -C "$W" diff --quiet HEAD -- 2>/dev/null || echo +dirty)" \
+    "${EXTRA_CXX:-}" "${IGC_FC:-}" "${TAG:-}" "${GRF:-}" "${SPLIT:-off}"
+} >> "$OUT/MANIFEST.tsv"

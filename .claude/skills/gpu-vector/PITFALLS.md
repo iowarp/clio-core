@@ -29,7 +29,7 @@
 - C++20 frames need ~8 KB lanes (256 B overflows; code 103).
 
 **Generations**
-- A generational get waits at most 10 s, then fails -> code 7. A writer that never publishes shows up far away, much later.
+- A generational get waits at most `CLIO_GEN_WAIT_MS` (default 120 s; it was a fixed 10 s, which fired on healthy neighbours at 16+ nodes), then fails -> code 7. A writer that never publishes shows up far away, much later.
 - A page's generation is stamped by the fetch that delivers it. Demanding a generation on your own page hangs; demand only on peers' pages; initial data publishes as 1.
 - Off-by-one on the last generation (demanding one more than was published) only worked while generation-0 data satisfied any demand.
 - Several writers to the same bytes in one generation are unsupported; a shared page under a generational demand can stall forever ("gen stall ... fetching=1 pins=4").
@@ -49,7 +49,7 @@
 
 - A file tier filled to capacity under gather-like refaulting can serve a page under the wrong identity. Failed gets/puts now trap instead of serving bad data; the root cause is open.
 - Narrow sets combined with eviction of written pages can produce a wrong answer. Use per-block sets with headroom.
-- A node presumed dead by the membership protocol can make remote reads return zeros. Keep `swim: enabled: false` (the default) for benchmarks.
+- A node presumed dead by the membership protocol can make remote reads return zeros. SWIM is off by default (timeouts now 300/150/3600 s); leave it off for benchmarks. For running and debugging procedures see the `clio-bench` skill.
 - An undersized tier can produce wrong results instead of an out-of-space error. Size tiers to hold the data plus snapshots.
 
 ## 3. Validation that works

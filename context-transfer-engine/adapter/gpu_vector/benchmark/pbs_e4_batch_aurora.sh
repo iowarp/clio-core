@@ -57,6 +57,8 @@ set -u
 
 : "${BENCH_CELLS:?set BENCH_CELLS}"
 ROOT=${ROOT:-/home/llogan/clio-core/.claude/worktrees/gpu-coro}
+# shellcheck source=bench_config.sh
+source "${ROOT}/context-transfer-engine/adapter/gpu_vector/benchmark/bench_config.sh"
 GROUP_N=${BENCH_GROUP_N:-4}
 BENCH_CAP=${BENCH_CAP:-600}
 TIER_BUDGET_MB=${TIER_BUDGET_MB:-10240}
@@ -200,7 +202,7 @@ run_cell() {
       *)            args="${args} ${knob} ${slots}" ;;
     esac
   fi
-  if [ -z "${pd:-}" ] || [ -z "${args}" ] || [ ! -x "${exe}" ]; then
+  if [ -z "${pd:-}" ] || [ -z "${args}" ] || [ ! -x "${exe}" ] || ! bench_check_binary "${exe}"; then
     echo "RESULT ${wl}x${GROUP_N}@${slug}: FAILED rc=2 (unknown cell or no exe)" | tee -a "${log}"
     return
   fi
@@ -217,83 +219,24 @@ run_cell() {
   mv "${rundir}/hostfile.tmp" "${rundir}/hostfile"
 
   # Tier directories, per cell so two groups never share a file bdev.
-  local tdir_daos="" tdir_flare="" storage=""
-  storage="    storage:"
+  # Tiers for the shared generator: "path|bdev|capacity|score[|persistence]".
+  # Scores are the E4 study's own (DRAM 1.0, DAOS 0.5, Lustre 0.2).
+  local tdir_daos="" tdir_flare="" tiers=""
   if [ "${top}" -gt 0 ]; then
-    storage="${storage}
-      - path: \"ram::gv_tier_dram\"
-        bdev_type: \"ram\"
-        capacity_limit: \"${top}MB\"
-        score: 1.0"
+    tiers+="ram::gv_tier_dram|ram|${top}MB|1.0"$'\n'
   fi
   if [ "${daos}" -gt 0 ]; then
     tdir_daos="${MNT}/clio_tier/${JOBTAG}/${wl}_${slug}"
     mkdir -p "${tdir_daos}"
-    storage="${storage}
-      - path: \"${tdir_daos}/node__RANK__.dat\"
-        bdev_type: \"file\"
-        persistence_level: \"long_term\"
-        capacity_limit: \"${daos}MB\"
-        score: 0.5"
+    tiers+="${tdir_daos}/node__RANK__.dat|file|${daos}MB|0.5|long_term"$'\n'
   fi
   if [ "${flare}" -gt 0 ]; then
     tdir_flare="${FLARE_ROOT}/${wl}_${slug}"
     mkdir -p "${tdir_flare}"
-    storage="${storage}
-      - path: \"${tdir_flare}/node__RANK__.dat\"
-        bdev_type: \"file\"
-        persistence_level: \"long_term\"
-        capacity_limit: \"${flare}MB\"
-        score: 0.2"
+    tiers+="${tdir_flare}/node__RANK__.dat|file|${flare}MB|0.2|long_term"$'\n'
   fi
-
-  cat > "${rundir}/clio_tier_template.yaml" <<EOF
-networking:
-  port: 9460
-  hostfile: "${rundir}/hostfile"
-  # >= node count, as in the E1/E5 configs: a Broadcast wider than
-  # neighborhood_size is split into Range queries that the receiving node
-  # runs only locally, so at 64 nodes pool creation reached nodes 0 and 32
-  # only (lbann at 64 nodes: writebacks REFUSED rc=11 on ranks 0 and 32).
-  neighborhood_size: 1024
-
-# SWIM OFF, for the same reason the E1 scaling config turns it off. Its
-# suspicion timeout is 60 s and expiry runs TriggerRecovery, which moves a
-# LIVE node's containers; a wide compose starves probe replies past that
-# threshold and the cluster never forms. Seen at 256 nodes in E1 and again
-# at 64 nodes here, where a grayscott cell died with "could not create
-# reduction tag" after 36 minutes of send timeouts -- it never reached its
-# first step, let alone its checkpoints. Four-node cells never hit it,
-# which is why it went unnoticed while every batch was four nodes wide.
-swim:
-  enabled: false
-
-runtime:
-  num_threads: 8
-  queue_depth: 8192
-  first_busy_wait: 10000000
-
-gpu:
-  queue_depth: 8192
-
-compose:
-  - mod_name: clio_bdev
-    pool_name: "ram::chi_default_bdev"
-    pool_query: local
-    pool_id: "301.0"
-    bdev_type: ram
-    capacity: "1GB"
-
-  - mod_name: clio_cte_core
-    pool_name: cte_core
-    pool_query: local
-    pool_id: "512.0"
-    targets:
-      neighborhood: 1
-${storage}
-    dpe:
-      dpe_type: "max_bw"
-EOF
+  BENCH_TIERS="${tiers}" \
+    bench_clio_yaml "${rundir}/clio_tier_template.yaml" "${rundir}/hostfile" 9460
 
   {
     echo "=== ${wl} @ ${slug} on ${hosts} (dram ${top} daos ${daos} flare ${flare} MB/node) ==="
@@ -318,7 +261,8 @@ EOF
     [ -n "$e0" ] && [ -n "$e1" ] && echo "ENERGY_UJ $((e1 - e0))" >> "rank$r.log"
     echo "rank $r on $(hostname) exit=$rc" >> "rank$r.log"
     exit 0
-  ' >> "${log}" 2>&1
+  ' >> "${log}" 2>&1 &
+  bench_watch_ranks "${rundir}" $! "${GROUP_N}" >> "${log}" 2>&1
   local mrc=$? rc r rrc
   echo "--- elapsed $((SECONDS - start))s, mpiexec exit=${mrc} ---" >> "${log}"
   rc=${mrc}
