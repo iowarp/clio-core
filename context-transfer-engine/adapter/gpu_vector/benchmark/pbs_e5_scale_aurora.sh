@@ -53,8 +53,12 @@ done
 # ---- lbann deck: 32768 W1 rows (8 GB) per node; the page holds a whole W2
 # row (H floats), so it is the larger of 1 MB and 128 KB x N --------------
 LB_H=$(( 32768 * N ))
+# 256 output rows per node, as at 4 nodes: with 1024 rows at 64 nodes a node
+# owned 16 W2 rows for 64 work-groups and generation 2 of some W2 pages was
+# never published (every reader timed out).
+LB_O=$(( 256 * N ))
 LB_PKB=$(( 128 * N )); [ "${LB_PKB}" -lt 1024 ] && LB_PKB=1024
-LB_RES=$(( (32768 * 256 / LB_PKB) + (1024 / N * LB_H * 4 / 1024 / LB_PKB) + 16 ))
+LB_RES=$(( (32768 * 256 / LB_PKB) + (LB_O / N * LB_H * 4 / 1024 / LB_PKB) + 16 ))
 lb_cells=""
 for d in ${E5S_LB-1 2 4 8}; do
   c=$(( LB_RES / d )); [ "${c}" -lt 128 ] && c=128
@@ -78,7 +82,7 @@ e4env="E4_OUTROOT=${OUT} BENCH_CAP=${CAP} DATA_MB=32768 TIER_BUDGET_MB=200000 HB
     E5B_GMX_BLOCKS=${GX_BLK} E5B_GMX_PASSES=${E5S_GMX_PASSES:-12} \
     bash "${B}/pbs_e4_batch_aurora.sh" > "${OUT}/gmx.log" 2>&1 &
 [ -n "${GF[lbann]:-}" ] && [ -n "${lb_cells}" ] && env PBS_NODEFILE="${GF[lbann]}" ${e4env} BENCH_CELLS="${lb_cells# }" \
-    E5B_LB_HIDDEN=${LB_H} E5B_LB_STEPS=${E5S_LB_STEPS:-15} \
+    E5B_LB_HIDDEN=${LB_H} E5B_LB_OUT=${LB_O} E5B_LB_STEPS=${E5S_LB_STEPS:-15} \
     bash "${B}/pbs_e4_batch_aurora.sh" > "${OUT}/lbann.log" 2>&1 &
 wait
 echo "E5S DONE"

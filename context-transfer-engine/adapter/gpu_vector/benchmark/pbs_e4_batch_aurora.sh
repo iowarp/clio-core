@@ -111,7 +111,7 @@ args_for() {
     # caller, final-state checkpoint on; page (gmx plane) and cap come from
     # the cell's 3rd and 4th fields.
     gmx+e5b)      echo "--page-kb 20000 --blocks ${E5B_GMX_BLOCKS:-4} --repeat ${E5B_GMX_PASSES:-12} --no-dense --ckpt-final" ;;
-    lbann+e5b)    echo "--in 65536 --hidden ${E5B_LB_HIDDEN:-131072} --out 1024 --batch 64 --steps ${E5B_LB_STEPS:-15} --page-kb 1024 --blocks 64 --no-ref --ckpt-final" ;;
+    lbann+e5b)    echo "--in 65536 --hidden ${E5B_LB_HIDDEN:-131072} --out ${E5B_LB_OUT:-1024} --batch 64 --steps ${E5B_LB_STEPS:-15} --page-kb 1024 --blocks 64 --no-ref --ckpt-final" ;;
     grayscott+scaled)    echo "--data-mb ${DATA_MB} --hbm-mb ${HBM_MB} --steps ${BENCH_STEPS:-2} --repeat 1 --page-kb 1024 --ckpt-every ${BENCH_CKPT_EVERY:-1}" ;;
     *)         echo "" ;;
   esac
