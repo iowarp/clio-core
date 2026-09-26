@@ -197,6 +197,47 @@ TEST_CASE("ConcurrentSameBlob - many threads write disjoint regions of ONE "
                "[same_blob] FIRST mismatch at pos={} expected=0x{:02x} "
                "got=0x{:02x} (total_bytes={})",
                base + b, static_cast<int>(expect), static_cast<int>(v), total);
+          // DIAGNOSIS: is the runtime's copy intact (RPC re-read; a non-zero
+          // flag word disables the client's shared-memory fast path and the
+          // runtime ignores it), and what did the shm record say?
+          {
+            ctp::ipc::FullPtr<char> rb2 = ipc->AllocateBuffer(win);
+            std::memset(rb2.ptr_, 0xAA, win);
+            auto again = CLIO_CTE_CLIENT->AsyncGetBlob(
+                tag_id, blob, base, win, 1u, rb2.shm_.template Cast<void>(),
+                clio::run::PoolQuery::Local());
+            again.Wait();
+            clio::run::u64 rpc_bad = 0, both_bad = 0;
+            for (clio::run::u64 k = 0; k < win; ++k) {
+              const unsigned char e2 = static_cast<unsigned char>((base + k) & 0xff);
+              if (static_cast<unsigned char>(rb2.ptr_[k]) != e2) ++rpc_bad;
+              if (static_cast<unsigned char>(rb2.ptr_[k]) != e2 &&
+                  static_cast<unsigned char>(rb.ptr_[k]) != e2) ++both_bad;
+            }
+            HLOG(kError,
+                 "[same_blob] DIAG window [{}, +{}): RPC re-read rc={} bad={} "
+                 "(bad in both={}); fast-path bytes at first mismatch: {:02x} {:02x} {:02x} {:02x}",
+                 base, win, again->GetReturnCode(), rpc_bad, both_bad,
+                 (unsigned)(unsigned char)rb.ptr_[b], (unsigned)(unsigned char)rb.ptr_[std::min(b + 1, win - 1)],
+                 (unsigned)(unsigned char)rb.ptr_[std::min(b + 2, win - 1)], (unsigned)(unsigned char)rb.ptr_[std::min(b + 3, win - 1)]);
+            clio::cte::core::ShmBlobRecord rec;
+            if (CLIO_CTE_CLIENT->TryGetBlobRecordShm(tag_id, blob, &rec)) {
+              HLOG(kError,
+                   "[same_blob] DIAG shm record: total_size={} num_blocks={} flags={:#x} "
+                   "direct={} covered={} placement_gen={} content_seq={} rep_direct={} rep_blocks={}",
+                   rec.total_size_, rec.num_blocks_, rec.flags_, rec.IsDirectReadable(),
+                   rec.CoveredBytes(), rec.placement_gen_, rec.content_seq_, rec.rep_direct_,
+                   rec.rep_num_blocks_);
+              for (clio::run::u32 i = 0; i < rec.num_blocks_ && i < 16; ++i) {
+                HLOG(kError, "[same_blob]   block {}: pool={} target_off={} size={} bdev_type={} node={}",
+                     i, rec.blocks_[i].target_pool_, rec.blocks_[i].target_offset_,
+                     rec.blocks_[i].size_, rec.blocks_[i].bdev_type_, rec.blocks_[i].node_id_);
+              }
+            } else {
+              HLOG(kError, "[same_blob] DIAG: no shm record for the blob");
+            }
+            ipc->FreeBuffer(rb2);
+          }
         }
         ++total_mismatches;
       }

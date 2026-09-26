@@ -39,6 +39,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -204,6 +205,7 @@ class TransactionLog {
   // ---- Log helpers for each transaction type ----
 
   void Log(TxnType type, const TxnSetBlobDroppable &txn) {
+    std::lock_guard<std::mutex> lk(mu_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -213,6 +215,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnCreateNewBlob &txn) {
+    std::lock_guard<std::mutex> lk(mu_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -222,6 +225,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnExtendBlob &txn) {
+    std::lock_guard<std::mutex> lk(mu_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -238,6 +242,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnExtendReplica &txn) {
+    std::lock_guard<std::mutex> lk(mu_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -260,6 +265,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnClearBlob &txn) {
+    std::lock_guard<std::mutex> lk(mu_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -268,6 +274,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnDelBlob &txn) {
+    std::lock_guard<std::mutex> lk(mu_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -276,6 +283,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnSetBlobTransform &txn) {
+    std::lock_guard<std::mutex> lk(mu_);
     buffer_.clear();
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
@@ -285,6 +293,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnCreateTag &txn) {
+    std::lock_guard<std::mutex> lk(mu_);
     buffer_.clear();
     WriteString(buffer_, txn.tag_name_);
     WriteU32(buffer_, txn.tag_major_);
@@ -293,6 +302,7 @@ class TransactionLog {
   }
 
   void Log(TxnType type, const TxnDelTag &txn) {
+    std::lock_guard<std::mutex> lk(mu_);
     buffer_.clear();
     WriteString(buffer_, txn.tag_name_);
     WriteU32(buffer_, txn.tag_major_);
@@ -486,6 +496,15 @@ class TransactionLog {
   clio::run::u64 capacity_bytes_ = 0;
   std::ofstream ofs_;
   std::vector<char> buffer_;  // Reusable serialization buffer
+  /**
+   * One log is shared by every worker whose id maps onto it: the runtime
+   * shards logs by `worker_id % num_logs`, and elastic workers (ids past the
+   * configured count) alias the base workers' logs. Two threads then raced on
+   * buffer_ and ofs_ -- heap corruption that surfaced as zeroed regions in a
+   * blob written by 8 threads with the metadata log on (RELIABILITY.md
+   * defect 14). Log() never suspends, so a plain mutex is correct here.
+   */
+  std::mutex mu_;
 
   /** Write a complete record: [u8 type][u32 size][payload] */
   void WriteRecord(TxnType type, const std::vector<char> &payload) {
