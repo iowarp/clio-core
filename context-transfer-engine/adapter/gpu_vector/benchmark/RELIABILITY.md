@@ -161,3 +161,9 @@ production layout: one runtime per node remains the design.
   slowest 9.8 ms), every rank exit 0. Timed region 109 s; seed 4.5 s;
   checkpoint of 8192 pages 10.5 s. The previous attempt (8872256, 15 s
   probe-silence rule) never left startup.
+- 2026-09-26 15:55 UTC, 64 nodes (job 8872293): same configuration as the
+  16-node run. All 64 ranks: 196,602-196,608 verified gets each (12.6 M),
+  0 errors of any kind, 0 mismatches, 0 nodes declared dead, 200/200 gate
+  rounds (3.9 ms each, slowest 22.8 ms). Timed region 115 s vs 109 s at 16
+  nodes (steps 15-16 s vs 13 s; a checkpoint of 8192 pages 10.4-11.0 s at
+  both scales). Weak scaling holds 16 -> 64 for this CPU-only pattern.
