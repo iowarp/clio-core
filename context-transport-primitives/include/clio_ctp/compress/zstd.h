@@ -34,7 +34,8 @@
 #ifndef CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Zstd_H_
 #define CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Zstd_H_
 
-#if CTP_ENABLE_COMPRESS
+// Optional codec: see the note in snappy.h.
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_ZSTD
 
 #include <zstd.h>
 
@@ -65,6 +66,6 @@ class Zstd : public Compressor {
 
 }  // namespace ctp
 
-#endif  // CTP_ENABLE_COMPRESS
+#endif  // CTP_ENABLE_COMPRESS && CTP_ENABLE_ZSTD
 
 #endif  // CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Zstd_H_

@@ -54,6 +54,17 @@ class Iowarp(CMakePackage):
     variant('boost_coro', default=False,
             description='Use Boost.Context stackful coroutine backend (issue #620)')
 
+    # Language virtuals. Spack 1.x assigns a package a compiler only if it
+    # declares these; without them iowarp gets no compiler wrapper and CMake
+    # falls back to /usr/bin/c++, which on SLES 15 is GCC 7.5 and cannot do
+    # the C++20 this project requires.
+    depends_on('c', type='build')
+    depends_on('cxx', type='build')
+
+    # C++20 with coroutines: GCC 10+ / Clang 10+.
+    conflicts('%gcc@:9', msg='iowarp requires C++20; use gcc@10: or newer')
+    conflicts('%clang@:9', msg='iowarp requires C++20; use clang@10: or newer')
+
     # Core dependencies (always required)
     depends_on('cmake@3.25:')
     depends_on('catch2@3.0.1')

@@ -59,6 +59,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 #include <filesystem>
 #include <memory>
 #include <thread>
@@ -2593,9 +2595,29 @@ TEST_CASE("CTE SHM cache write-then-read",
     REQUIRE(fixture->WaitForTaskCompletion(size_task, 10000));
     REQUIRE(rec.total_size_ == size_task->size_);
 
-    // Payload reads must still be refused until the RAM bdev is SHM-backed
-    // (phase 6): this blob lives on a FILE target, so direct read is invalid.
-    REQUIRE_FALSE(rec.IsDirectReadable());
+    // ASSERT THE INVARIANT, NOT THE DEPLOYMENT. This used to require
+    // REQUIRE_FALSE(rec.IsDirectReadable()) on the grounds that "this blob
+    // lives on a FILE target" -- but which target it lands on is decided by
+    // whatever targets the ambient clio.yaml declares. On a config whose
+    // only CTE target is a SHM-backed RAM tier the blob is legitimately
+    // direct-readable, and the test failed for describing the operator's
+    // config rather than the code.
+    //
+    // What must hold in EVERY config is that the cache does not lie: if it
+    // advertises a direct read, that read has to succeed and return exactly
+    // the bytes the authoritative path would. If it does not advertise one,
+    // the direct read must refuse rather than invent data.
+    {
+      std::vector<char> direct(blob_size, 0);
+      const bool served = fixture->core_client_->TryReadBlobShm(
+          tag_id, blob_name, direct.data(), blob_size, 0);
+      if (rec.IsDirectReadable() && blob_size <= rec.CoveredBytes()) {
+        REQUIRE(served);
+        REQUIRE(std::memcmp(direct.data(), test_data.data(), blob_size) == 0);
+      } else {
+        REQUIRE_FALSE(served);
+      }
+    }
 
     CLIO_IPC->FreeBuffer(blob_data_fullptr);
   }

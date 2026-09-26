@@ -32,6 +32,23 @@ kDelBlob: 18            # Delete a blob
 kPodPutBlob: 43         # POD variant of PutBlob
 kPodGetBlob: 44         # POD variant of GetBlob
 kPodReorganizeBlob: 45  # POD variant of ReorganizeBlob
+
+# NOTE: this manifest has DRIFTED from the generated headers -- methods 36-42,
+# kMultiPutBlob (48) and kRegisterReplicaContainer (49) exist in
+# autogen/core_methods.h but not here, so `clio repo refresh` DELETES them.
+# Treat the generated header as the source of truth and edit both by hand
+# until the drift is reconciled.
+#
+# Batched POD paging (one task carries many page requests).
+#
+# A page fault costs ~110us of round trip -- GPU->CPU submission, worker
+# pickup, CTE and bdev traversal, completion -- against ~6us for the 256 KB
+# device-to-device copy it exists to perform. Data movement is about 5% of a
+# read; the round trip is the other 95%. Batching amortizes that trip over
+# many pages, which is the only lever that touches the dominant term.
+kPodMultiPutBlob: 50    # Many POD puts in one task (page flush)
+kPodMultiGetBlob: 51    # Many POD gets in one task (page fault)
+kPodMultiScore: 52      # Many POD score updates in one task (reorganize hints)
 kGetBlobScore: 22       # Get the score of a blob
 kGetBlobSize: 23        # Get the size of a blob
 kGetBlobInfo: 25        # Get comprehensive blob metadata (score, size, blocks, targets)

@@ -115,8 +115,24 @@ macro(wrp_core_enable_rocm GPU_RUNTIME CXX_STANDARD)
     endif()
     message(STATUS "ROCm enabled: HIP_PLATFORM=${CLIO_ROCM_HIP_PLATFORM}")
 
+    # Honour ROCM_PATH (the variable hipcc, hipconfig and the ROCm CMake
+    # packages all use) before falling back to the default location. Without
+    # this, pointing every other ROCm variable at a relocated install still
+    # left ROCM_ROOT on /opt/rocm, and the include directory below silently
+    # resolved to a path that does not exist.
+    if(NOT DEFINED ROCM_ROOT)
+        if(DEFINED ROCM_PATH)
+            set(_wrp_rocm_default "${ROCM_PATH}")
+        elseif(DEFINED ENV{ROCM_PATH})
+            set(_wrp_rocm_default "$ENV{ROCM_PATH}")
+        else()
+            set(_wrp_rocm_default "/opt/rocm")
+        endif()
+    else()
+        set(_wrp_rocm_default "${ROCM_ROOT}")
+    endif()
     set(ROCM_ROOT
-        "/opt/rocm"
+        "${_wrp_rocm_default}"
         CACHE PATH
         "Root directory of the ROCm installation"
     )
@@ -139,7 +155,12 @@ macro(wrp_core_enable_rocm GPU_RUNTIME CXX_STANDARD)
             "CUDA C++ standard" FORCE)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON CACHE BOOL
             "Require CUDA standard" FORCE)
+        # Same substitution trap as the HIP-AMD branch below: this line reads
+        # `set(HIP "CUDA")` after expansion. The cache variable is what the
+        # rest of the build actually consumes.
         set(GPU_RUNTIME "CUDA")
+        set(CLIO_ROCM_GPU_LANG "CUDA" CACHE INTERNAL
+            "CMake language used to compile ROCm/HIP sources" FORCE)
         # Mirror the cuda-language platform-variable cache from
         # wrp_core_enable_cuda — without this, generate-time fails with
         # "Error required internal CMake variable not set" once a nested
@@ -170,11 +191,65 @@ macro(wrp_core_enable_rocm GPU_RUNTIME CXX_STANDARD)
         endforeach()
     else()
         # HIP-AMD: hipcc invokes clang/Clang. Use CMake's HIP language.
-        set(GPU_RUNTIME ${GPU_RUNTIME})
+        #
+        # `set(GPU_RUNTIME ${GPU_RUNTIME})` was a no-op with a trap in it. This
+        # is a MACRO and GPU_RUNTIME is its PARAMETER, so the name is
+        # text-substituted before evaluation: called as
+        # wrp_core_enable_rocm(HIP 17) that line expanded to `set(HIP HIP)`,
+        # defining a variable named HIP and never defining GPU_RUNTIME at all.
+        # set_rocm_sources() (a function, so a real scope) then read
+        # ${GPU_RUNTIME}, got the empty string, and every ROCm configure died
+        # in set_source_files_properties with "incorrect number of arguments"
+        # -- a message that names neither the variable nor this macro.
+        set(CLIO_ROCM_GPU_LANG "${GPU_RUNTIME}" CACHE INTERNAL
+            "CMake language used to compile ROCm/HIP sources" FORCE)
+        # macros.h pulls in <hip/hip_runtime_api.h> for ANY TU with
+        # CTP_ENABLE_ROCM set -- including the many compiled by the plain C++
+        # compiler, which knows nothing about ROCm. The NVIDIA branch adds its
+        # include directory per-target; the AMD branch never did, so every
+        # host TU failed with "hip_runtime_api.h: No such file or directory".
+        if(EXISTS "${ROCM_ROOT}/include")
+            include_directories(SYSTEM "${ROCM_ROOT}/include")
+        endif()
+        # ...and say WHICH HIP platform. hip_runtime_api.h ends in
+        #   #error "Must define exactly one of __HIP_PLATFORM_AMD__ or
+        #           __HIP_PLATFORM_NVIDIA__"
+        # and guards its entire body on that choice. amdclang++ defines the
+        # AMD macro implicitly for -x hip, but the ordinary C++ compiler
+        # building the host TUs does not -- so those TUs included the header,
+        # got a body that was #if'd out, and failed with a wall of
+        # "hipSetDevice was not declared in this scope". The NVIDIA branch has
+        # always set its counterpart per-target; this is the AMD equivalent.
+        add_compile_definitions(__HIP_PLATFORM_AMD__=1)
         enable_language(${GPU_RUNTIME})
         set(CMAKE_${GPU_RUNTIME}_STANDARD ${CXX_STANDARD})
         set(CMAKE_${GPU_RUNTIME}_EXTENSIONS OFF)
         set(CMAKE_${GPU_RUNTIME}_STANDARD_REQUIRED ON)
+        # Same nested-scope problem the CUDA branch above documents, and the
+        # same cure. enable_language() populates these in the CALLING scope;
+        # a later nested project() resets it, and generate-time then fails
+        # with "Error required internal CMake variable not set /
+        # CMAKE_HIP_COMPILE_OBJECT". Caching them makes them survive.
+        foreach(_hip_var
+                CMAKE_INCLUDE_FLAG_${GPU_RUNTIME}
+                _CMAKE_${GPU_RUNTIME}_WHOLE_FLAG
+                _CMAKE_${GPU_RUNTIME}_RDC_FLAG
+                _CMAKE_${GPU_RUNTIME}_EXTRA_FLAGS
+                _CMAKE_COMPILE_AS_${GPU_RUNTIME}_FLAG
+                CMAKE_${GPU_RUNTIME}_COMPILE_OBJECT
+                CMAKE_${GPU_RUNTIME}_COMPILE_WHOLE_COMPILATION
+                CMAKE_${GPU_RUNTIME}_LINK_EXECUTABLE
+                CMAKE_${GPU_RUNTIME}_CREATE_SHARED_LIBRARY
+                CMAKE_${GPU_RUNTIME}_CREATE_SHARED_MODULE
+                CMAKE_${GPU_RUNTIME}_DEVICE_LINK_LIBRARY
+                CMAKE_${GPU_RUNTIME}_DEVICE_LINK_EXECUTABLE
+                CMAKE_${GPU_RUNTIME}_HOST_LINK_LAUNCHER
+                CMAKE_SHARED_LIBRARY_${GPU_RUNTIME}_FLAGS
+                CMAKE_SHARED_LIBRARY_CREATE_${GPU_RUNTIME}_FLAGS)
+            if(DEFINED ${_hip_var})
+                set(${_hip_var} "${${_hip_var}}" CACHE INTERNAL "" FORCE)
+            endif()
+        endforeach()
         if(GPU_RUNTIME STREQUAL "CUDA")
             include_directories("${ROCM_ROOT}/include")
         endif()
@@ -184,20 +259,14 @@ macro(wrp_core_enable_rocm GPU_RUNTIME CXX_STANDARD)
     endif()
 endmacro()
 
-# Enable Intel GPU / SYCL (oneAPI icpx -fsycl, or AdaptiveCpp acpp)
+# Detect the SYCL compiler flavor and locate <sycl/sycl.hpp>.
 #
-# Detects the SYCL compiler flavor and sets CLIO_SYCL_COMPILER (DPCPP|ACPP).
-# Configures default values for SYCL_TARGET / SYCL_DEVICE / SYCL_CUDA_ARCH
-# that callers can override on the CMake command line.
-#
-# Flags are NOT applied globally to avoid breaking PCH and non-SYCL targets.
-# Use add_sycl_library / add_sycl_executable (defined below near
-# add_cuda_library / add_cuda_executable), or call wrp_core_apply_sycl_flags()
-# directly on a target that contains SYCL device code.
-macro(wrp_core_enable_sycl CXX_STANDARD)
-    set(CMAKE_CXX_STANDARD ${CXX_STANDARD})
-    set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
+# Split out of wrp_core_enable_sycl() because the top-level CMakeLists defines
+# CTP_ENABLE_SYCL globally -- and therefore needs CLIO_SYCL_INCLUDE_DIR -- at a
+# point BEFORE any add_subdirectory() has had a chance to call
+# wrp_core_enable_sycl(). Everything set here is cached and guarded, so calling
+# it from both places is idempotent.
+macro(wrp_core_detect_sycl)
     # Compiler flavor detection. Override with -DWRP_SYCL_COMPILER=DPCPP|ACPP.
     if(NOT DEFINED CLIO_SYCL_COMPILER)
         get_filename_component(_wrp_cxx_name "${CMAKE_CXX_COMPILER}" NAME)
@@ -211,31 +280,6 @@ macro(wrp_core_enable_sycl CXX_STANDARD)
                 "SYCL compiler flavor (DPCPP|ACPP)")
         endif()
     endif()
-
-    # SYCL target triple. Override with -DSYCL_TARGET=...
-    #   spir64               JIT, runs on any OpenCL/Level Zero device
-    #   spir64_gen           AOT, requires SYCL_DEVICE (e.g. pvc, dg2, gen12lp)
-    #   nvptx64-nvidia-cuda  NVIDIA GPUs via DPC++ CUDA backend
-    #   amdgcn-amd-amdhsa    AMD GPUs via DPC++ ROCm backend
-    if(NOT DEFINED CACHE{SYCL_TARGET})
-        set(SYCL_TARGET "spir64" CACHE STRING
-            "SYCL target triple (spir64|spir64_gen|nvptx64-nvidia-cuda|amdgcn-amd-amdhsa)")
-    endif()
-    if(NOT DEFINED CACHE{SYCL_DEVICE})
-        set(SYCL_DEVICE "" CACHE STRING
-            "SYCL AOT device for spir64_gen target (e.g. pvc, dg2, gen12lp)")
-    endif()
-    if(NOT DEFINED CACHE{SYCL_CUDA_ARCH})
-        set(SYCL_CUDA_ARCH "sm_70" CACHE STRING
-            "CUDA architecture when SYCL_TARGET=nvptx64-nvidia-cuda")
-    endif()
-
-    # Opt-in flag for SYCL device-side virtual functions.
-    # -fsycl-allow-virtual-functions is supported by recent DPC++ nightlies;
-    # leave OFF unless you have confirmed your toolchain accepts it.
-    option(CLIO_SYCL_ALLOW_VIRTUAL_FUNCTIONS
-        "Pass -fsycl-allow-virtual-functions to DPC++ (recent compiler only)"
-        OFF)
 
     # Locate the SYCL headers so HOST translation units -- compiled with
     # CTP_ENABLE_SYCL=1 but WITHOUT -fsycl (see context-runtime/src and
@@ -270,6 +314,62 @@ macro(wrp_core_enable_sycl CXX_STANDARD)
             "nor at the legacy /opt prefixes. Host TUs that include it will fail to "
             "compile. Set -DCLIO_SYCL_INCLUDE_DIR=<dir containing sycl/sycl.hpp>.")
     endif()
+endmacro()
+
+# Enable Intel GPU / SYCL (oneAPI icpx -fsycl, or AdaptiveCpp acpp)
+#
+# Detects the SYCL compiler flavor and sets CLIO_SYCL_COMPILER (DPCPP|ACPP).
+# Configures default values for SYCL_TARGET / SYCL_DEVICE / SYCL_CUDA_ARCH
+# that callers can override on the CMake command line.
+#
+# Flags are NOT applied globally to avoid breaking PCH and non-SYCL targets.
+# Use add_sycl_library / add_sycl_executable (defined below near
+# add_cuda_library / add_cuda_executable), or call wrp_core_apply_sycl_flags()
+# directly on a target that contains SYCL device code.
+macro(wrp_core_enable_sycl CXX_STANDARD)
+    set(CMAKE_CXX_STANDARD ${CXX_STANDARD})
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+    wrp_core_detect_sycl()
+
+    # SYCL target triple. Override with -DSYCL_TARGET=...
+    #   spir64               JIT, runs on any OpenCL/Level Zero device
+    #   spir64_gen           AOT, requires SYCL_DEVICE (e.g. pvc, dg2, gen12lp)
+    #   nvptx64-nvidia-cuda  NVIDIA GPUs via DPC++ CUDA backend
+    #   amdgcn-amd-amdhsa    AMD GPUs via DPC++ ROCm backend
+    if(NOT DEFINED CACHE{SYCL_TARGET})
+        set(SYCL_TARGET "spir64" CACHE STRING
+            "SYCL target triple (spir64|spir64_gen|nvptx64-nvidia-cuda|amdgcn-amd-amdhsa)")
+    endif()
+    if(NOT DEFINED CACHE{SYCL_DEVICE})
+        set(SYCL_DEVICE "" CACHE STRING
+            "SYCL AOT device for spir64_gen target (e.g. pvc, dg2, gen12lp)")
+    endif()
+    if(NOT DEFINED CACHE{SYCL_CUDA_ARCH})
+        set(SYCL_CUDA_ARCH "sm_70" CACHE STRING
+            "CUDA architecture when SYCL_TARGET=nvptx64-nvidia-cuda")
+    endif()
+    # PTX ISA version for the NVPTX backend, as a target feature (ptx87, ...).
+    #
+    # DPC++ pins a default PTX version per nightly, and an arch newer than that
+    # default is a HARD BACKEND ERROR rather than a diagnostic at the flag:
+    #   "PTX version 8.5 does not support target 'sm_120'. Minimum required
+    #    PTX version is 8.7."
+    # Empty means "use the compiler's default", which is right everywhere the
+    # default already covers SYCL_CUDA_ARCH; set it only when it does not
+    # (sm_120 / Blackwell needs -DSYCL_PTX_FEATURE=ptx87).
+    if(NOT DEFINED CACHE{SYCL_PTX_FEATURE})
+        set(SYCL_PTX_FEATURE "" CACHE STRING
+            "PTX ISA target feature for the NVPTX SYCL backend (e.g. ptx87); empty uses the compiler default")
+    endif()
+
+    # Opt-in flag for SYCL device-side virtual functions.
+    # -fsycl-allow-virtual-functions is supported by recent DPC++ nightlies;
+    # leave OFF unless you have confirmed your toolchain accepts it.
+    option(CLIO_SYCL_ALLOW_VIRTUAL_FUNCTIONS
+        "Pass -fsycl-allow-virtual-functions to DPC++ (recent compiler only)"
+        OFF)
+
 
     message(STATUS "SYCL enabled: compiler=${CLIO_SYCL_COMPILER} target=${SYCL_TARGET} device=${SYCL_DEVICE} include=${CLIO_SYCL_INCLUDE_DIR}")
 endmacro()
@@ -329,6 +429,19 @@ function(wrp_core_apply_sycl_flags target)
             target_link_options(${target} PRIVATE
                 "SHELL:-Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=${SYCL_CUDA_ARCH}"
             )
+            # --cuda-feature goes on the DRIVER line, not through
+            # -Xsycl-target-backend. Only the first -Xsycl-target-backend is
+            # honoured during compilation (the arch one above); a second is
+            # silently dropped with "argument unused during compilation" and
+            # the backend still dies on the default PTX version. Folding both
+            # into one quoted pass-through does not work either -- the arch
+            # parser then reads the whole string as the arch name.
+            if(SYCL_PTX_FEATURE)
+                target_compile_options(${target} PRIVATE
+                    --cuda-feature=+${SYCL_PTX_FEATURE})
+                target_link_options(${target} PRIVATE
+                    --cuda-feature=+${SYCL_PTX_FEATURE})
+            endif()
         endif()
 
         if(CLIO_SYCL_ALLOW_VIRTUAL_FUNCTIONS)
@@ -361,7 +474,14 @@ function(set_rocm_sources MODE DO_COPY SRC_FILES ROCM_SOURCE_FILES_VAR)
     if(CLIO_ROCM_HIP_PLATFORM STREQUAL "nvidia")
         set(_wrp_rocm_lang CUDA)
     else()
-        set(_wrp_rocm_lang ${GPU_RUNTIME})
+        set(_wrp_rocm_lang ${CLIO_ROCM_GPU_LANG})
+    endif()
+    if(NOT _wrp_rocm_lang)
+        message(FATAL_ERROR
+            "set_rocm_sources: no GPU language. wrp_core_enable_rocm(<LANG> "
+            "<STD>) must run before any add_rocm_* target is declared. "
+            "Failing here rather than in set_source_files_properties, which "
+            "reports only 'incorrect number of arguments'.")
     endif()
 
     foreach(SOURCE IN LISTS SRC_FILES)
@@ -440,8 +560,20 @@ function(_wrp_apply_rocm_flags TARGET)
             POSITION_INDEPENDENT_CODE ON
             CUDA_RUNTIME_LIBRARY Shared)
     else()
-        target_link_libraries(${TARGET} PUBLIC -fgpu-rdc)
-        target_compile_options(${TARGET} PUBLIC -fgpu-rdc)
+        # -fgpu-rdc is a HIP-ONLY flag, and both of these lines used to hand
+        # it to every language and every dependent: PUBLIC propagation put it
+        # on g++'s command line for ordinary C++ TUs, which fails with
+        # "unrecognized command-line option '-fgpu-rdc'". Scope it to the HIP
+        # language, and keep the link flag PRIVATE so a plain-C++ consumer of
+        # this target does not inherit a device-link flag it cannot use.
+        target_compile_options(${TARGET} PUBLIC
+            $<$<COMPILE_LANGUAGE:HIP>:-fgpu-rdc>)
+        # -fgpu-rdc splits device code out of the object, so the final link
+        # must run the HIP DEVICE LINK to gather it back. Without --hip-link
+        # the host link succeeds at finding libamdhip64 and then fails on
+        # "undefined symbol: __hip_fatbin_<hash>" / "__hip_gpubin_handle_
+        # <hash>" -- the fatbin the device link would have produced.
+        target_link_options(${TARGET} PRIVATE -fgpu-rdc --hip-link)
         set_target_properties(${TARGET} PROPERTIES
             POSITION_INDEPENDENT_CODE ON)
     endif()
@@ -495,6 +627,18 @@ endfunction()
 #   add_cuda_library(TARGET SHARED|STATIC DO_COPY source1.cc ...
 #       [INCLUDE_DIRS dir1 dir2 ...]
 #       [LINK_LIBS lib1 lib2 ...])
+# RDC (separable compilation) is nvcc-only here. Under clang-CUDA, CMake's
+# device-link step drives fatbinary with pre-CUDA-13 options ("fatbinary
+# fatal: Unknown option 'im'"), and none of this tree's device code needs
+# cross-TU device linking anyway -- every kernel's device callees live in
+# headers, so each TU's fatbin is self-contained (proved by the manual
+# clang builds of the gpu_vector bench and the llama bridge).
+if(CMAKE_CUDA_COMPILER MATCHES "clang")
+    set(CLIO_CUDA_SEPARABLE OFF)
+else()
+    set(CLIO_CUDA_SEPARABLE ON)
+endif()
+
 function(add_cuda_library TARGET SHARED DO_COPY)
     cmake_parse_arguments(CUDA "" "" "INCLUDE_DIRS;LINK_LIBS" ${ARGN})
     set(SRC_FILES ${CUDA_UNPARSED_ARGUMENTS})
@@ -525,13 +669,13 @@ function(add_cuda_library TARGET SHARED DO_COPY)
         # CLIO_RUN_GPU_API on the ChiServerBootstrap* entry points, CTP_DLL in
         # clio_ctp_cuda).
         set_target_properties(${TARGET} PROPERTIES
-            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_SEPARABLE_COMPILATION ${CLIO_CUDA_SEPARABLE}
             POSITION_INDEPENDENT_CODE ON
             CUDA_RUNTIME_LIBRARY Shared
         )
     else()
         set_target_properties(${TARGET} PROPERTIES
-            CUDA_SEPARABLE_COMPILATION ON
+            CUDA_SEPARABLE_COMPILATION ${CLIO_CUDA_SEPARABLE}
             POSITION_INDEPENDENT_CODE ON
             CUDA_RUNTIME_LIBRARY Static
         )
@@ -571,7 +715,7 @@ function(add_cuda_executable TARGET DO_COPY)
     set_cuda_sources("${DO_COPY}" "${SRC_FILES}" CUDA_SOURCE_FILES)
     add_executable(${TARGET} ${CUDA_SOURCE_FILES})
     set_target_properties(${TARGET} PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_SEPARABLE_COMPILATION ${CLIO_CUDA_SEPARABLE}
         POSITION_INDEPENDENT_CODE ON
     )
 

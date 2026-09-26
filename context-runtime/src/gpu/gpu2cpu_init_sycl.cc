@@ -145,6 +145,28 @@ void gpu::IpcManager::UnregisterClientBackend(
 
 // FindClientBackend is now inline in gpu_ipc_manager.h.
 
+/**
+ * The batched device-ring transport is not built on the SYCL path.
+ *
+ * ServerInitGpuQueues above leaves `ring.dev_ring` null, so GetGpuInfo hands
+ * the kernel a null `gpu2cpu_ring` and IpcGpu2Cpu::SendIn takes the legacy
+ * per-task GpuTaskQueue path instead. Nothing ever pushes to a ring here, so
+ * there is nothing for the worker to drain -- but the symbol is referenced
+ * unconditionally by the worker poll loop in libclio_run_cxx, so it has to
+ * exist.
+ *
+ * This costs the SYCL path the ring's whole point: one D2H copy per BATCH of
+ * submissions rather than per submission. Porting it is mechanical (SYCL's
+ * malloc_host is directly device-addressable, so it needs no
+ * cudaHostGetDevicePointer step at all) and worth doing before any SYCL
+ * performance claim -- but a correctness bring-up does not need it.
+ */
+bool gpu::IpcManager::RingNext(u32 gpu_id, clio::run::GpuRingEntry *out) {
+  (void)gpu_id;
+  (void)out;
+  return false;
+}
+
 CLIO_RUN_GPU_API bool ChiServerBootstrapSyclGpu(IpcManager *self,
                                                 clio::run::u32 queue_depth,
                                                 size_t backend_bytes) {

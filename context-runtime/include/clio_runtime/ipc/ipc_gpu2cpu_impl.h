@@ -9,7 +9,8 @@
 #define CLIO_RUNTIME_INCLUDE_IPC_GPU2CPU_IMPL_H_
 
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
-#include "clio_runtime/gpu/submit_probe.h"
+#include "clio_runtime/gpu/gpu_device_ring.h"
+#include "clio_runtime/gpu/submit_probe.h" 
 #include "clio_ctp/util/gpu_intrinsics.h"
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
@@ -38,9 +39,19 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
     gpu::IpcManager *ipc, const ctp::ipc::FullPtr<TaskT> &task_ptr) {
   gpu::Future<TaskT> future;
 
-#if CTP_IS_GPU_COMPILER
-  if (threadIdx.x != 0) return future;
-#endif
+  // Any thread may enqueue. This used to be `if (threadIdx.x != 0) return
+  // future;` -- a silent no-op for every thread but 0, from a "caller
+  // broadcasts" design the gpu_vector never followed. The vector serialises
+  // submissions under a per-block lock, and the winning lane is whichever
+  // thread got the lock: with one warp the hardware happens to resolve the
+  // contention to lane 0 (so every test passed), with several warps the
+  // winner is usually NOT threadIdx.x==0 and its page get was silently
+  // discarded -- Wait() returned on an empty future, the stale return code
+  // read 0, and the slot served its PREVIOUS page's bytes as the new page.
+  // Measured: 96 of 128 pages corrupt at 256 threads, zero at 32. The queue
+  // push below is a multi-producer atomic claim, so concurrent senders from
+  // any thread are safe; callers that want one submission per block must
+  // elect a sender themselves, which every caller in the tree already does.
 
   if (task_ptr.IsNull() || !ipc->gpu_info_.gpu2cpu_queue) {
     return future;
@@ -108,13 +119,35 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
     if (prec) p_postfence_cy = gpu::ProbeCycles();
 #endif
 
-    auto &qlane = ipc->gpu_info_.gpu2cpu_queue->GetLane(0, 0);
-    // TODO(ring): Push's return value is dropped. Latent today -- the gpu2cpu lane
-    // is WAIT_FOR_SPACE, so Push blocks until a slot frees and cannot fail. But it
-    // becomes a SILENT TASK DROP the instant this lane is switched to
-    // ERROR_ON_NO_SPACE, and a dropped task hangs WriteWait forever. Propagate the
-    // bool up through SubmitAsync / WriteAsync before changing this lane's flags.
-    qlane.Push(task_future);
+    // DEVICE RING (CLIO_GPU_DEVRING=1): push with a device-scope atomic into
+    // device memory. No system-scoped atomic per submission -- the CPU picks
+    // these up in batches. Falls through to the legacy managed queue when the
+    // ring was not allocated. (The probe still records: hop 3 then measures a
+    // device-memory push instead of the pinned-host lane, which is exactly
+    // the comparison the ring exists to make.)
+    if (ipc->gpu_info_.gpu2cpu_ring != nullptr) {
+      GpuRingEntry e;
+      e.task_addr = reinterpret_cast<u64>(task_ptr.ptr_);
+      e.alloc_major = task_ptr.shm_.alloc_id_.major_;
+      e.alloc_minor = task_ptr.shm_.alloc_id_.minor_;
+      e.task_size = task_size;
+      ipc->gpu_info_.gpu2cpu_ring->Push(e);
+    } else {
+      auto &qlane = ipc->gpu_info_.gpu2cpu_queue->GetLane(0, 0);
+      // Push RETURNS FALSE when the lane is full, and dropping the task there
+      // is unrecoverable: the caller is about to wait on a completion flag
+      // nothing will ever set. Measured with a demand-paged vector: 128
+      // blocks x 1 page passed while 128 x 2 hung -- a burst overrunning the
+      // lane, not a total-work limit. Spinning until it lands is also what
+      // makes this safe under EITHER lane flag (WAIT_FOR_SPACE today, where
+      // the loop never iterates, or ERROR_ON_NO_SPACE), which retires the
+      // TODO(ring) that used to sit here.
+      while (!qlane.Push(task_future)) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        __nanosleep(64);
+#endif
+      }
+    }
 
 #if CTP_IS_GPU_COMPILER
     if (prec) {
@@ -150,10 +183,22 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
 
     CTP_DEVICE_FENCE_SYSTEM();
 
-    auto &qlane = ipc->gpu_info_.gpu2cpu_queue->GetLane(0, 0);
-    // TODO(ring): see the probing branch — Push's return value is dropped; safe
-    // only while this lane stays WAIT_FOR_SPACE.
-    qlane.Push(task_future);
+    if (ipc->gpu_info_.gpu2cpu_ring != nullptr) {
+      GpuRingEntry e;
+      e.task_addr = reinterpret_cast<u64>(task_ptr.ptr_);
+      e.alloc_major = task_ptr.shm_.alloc_id_.major_;
+      e.alloc_minor = task_ptr.shm_.alloc_id_.minor_;
+      e.task_size = task_size;
+      ipc->gpu_info_.gpu2cpu_ring->Push(e);
+    } else {
+      auto &qlane = ipc->gpu_info_.gpu2cpu_queue->GetLane(0, 0);
+      // See the probing branch: a dropped Push hangs the waiter forever.
+      while (!qlane.Push(task_future)) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        __nanosleep(64);
+#endif
+      }
+    }
   }
   return future;
 }
@@ -172,9 +217,12 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
 template <typename TaskT, typename AllocT>
 CTP_CROSS_FUN void gpu::Future<TaskT, AllocT>::Wait() {
 #if CTP_IS_GPU || CTP_IS_SYCL_DEVICE
-#if CTP_IS_GPU_COMPILER
-  if (threadIdx.x != 0) return;
-#endif
+  // Any thread may wait. This was `if (threadIdx.x != 0) return;` -- the same
+  // broadcast-era guard as SendIn's, and the second half of the same bug: once
+  // sends were allowed from any lane, a non-zero faulting lane would enqueue
+  // the get and then "wait" by returning INSTANTLY, reading the page while the
+  // CPU was still filling it. Symptom moved from deterministic stale pages to
+  // racy ones. The poll and the system fence below are per-thread safe.
   if (task_ptr_.IsNull()) return;
   volatile unsigned int *fp = reinterpret_cast<volatile unsigned int *>(
       &task_ptr_.ptr_->fut_.is_complete_.x);

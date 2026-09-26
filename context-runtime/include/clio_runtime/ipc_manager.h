@@ -1047,9 +1047,15 @@ class IpcManager {
   template <typename T>
   ctp::ipc::FullPtr<T> ToFullPtr(const ctp::ipc::ShmPtr<T> &shm_ptr) {
     // Full allocator lookup implementation
-    // Case 1: AllocatorId is null - offset IS the raw memory address
-    // This is used for private memory allocations (new/delete)
-    if (shm_ptr.alloc_id_ == ctp::ipc::AllocatorId::GetNull()) {
+    // Case 1: the offset IS the raw address, with no allocator to resolve it
+    // against. Two tags land here:
+    //   GetNull()       - a private HOST address (new/delete).
+    //   GetGpuPointer() - a GPU DEVICE address, which is only dereferenceable
+    //                     in the owning context and must be moved with a
+    //                     device-aware copy. Resolution is the same (pass the
+    //                     address through); the difference is that a holder
+    //                     can now tell the two apart and act on it.
+    if (shm_ptr.alloc_id_.IsRawAddress()) {
       // The offset field contains the raw pointer address
       T *raw_ptr = reinterpret_cast<T *>(shm_ptr.off_.load());
       return ctp::ipc::FullPtr<T>(raw_ptr);
@@ -1146,8 +1152,13 @@ class IpcManager {
     // Acquire reader lock for thread-safe access
     allocator_map_lock_.ReadLock();
 
+    // (alloc_map_ is the live registry; a stale `alloc_vector_` member was
+    // referenced here for a long time without anyone noticing, because no
+    // caller instantiates this overload -- clang's definition-time lookup is
+    // what finally flagged it.)
     ctp::ipc::FullPtr<T> result;
-    for (auto *alloc : alloc_vector_) {
+    for (auto &kv : alloc_map_) {
+      auto *alloc = kv.second;
       if (alloc && alloc->ContainsPtr(ptr)) {
         result = ctp::ipc::FullPtr<T>(alloc, ptr);
         allocator_map_lock_.ReadUnlock();
@@ -2153,6 +2164,16 @@ CTP_HOST_FUN Future<TaskT, AllocT>::~Future() {
 }
 
 // GetFutureShm() - converts internal ShmPtr to FullPtr
+//
+// CTP_IS_HOST for the same reason as Future::await_suspend_impl in task.h:
+// this body reads Task::RunCtxPtr(), which is itself #if CTP_IS_HOST, and a
+// device pass member-checks the whole translation unit.
+//
+// CTP_HOST_FUN alone is not enough. Under clang-CUDA it nearly is -- wrong-
+// side calls are diagnosed lazily, so an unused host function with a
+// device-invalid body survives -- but SYCL has no deferred diagnostics and
+// rejects it outright. The GPU path uses gpu::Future and never this.
+#if CTP_IS_HOST
 template <typename TaskT, typename AllocT>
 CTP_HOST_FUN ctp::ipc::FullPtr<typename Future<TaskT, AllocT>::FutureT>
 Future<TaskT, AllocT>::GetFutureShm() const {
@@ -2164,6 +2185,7 @@ Future<TaskT, AllocT>::GetFutureShm() const {
   }
   return ctp::ipc::FullPtr<FutureT>(t->RunCtxPtr());
 }
+#endif  // CTP_IS_HOST
 
 // ----------------------------------------------------------------
 // IsComplete variants

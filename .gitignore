@@ -122,6 +122,15 @@ MANIFEST
 # CTest temporary output
 Testing/Temporary/
 
+# In-source CMake/CTest configures. Running `cmake` from inside a source
+# directory (rather than a build dir) scatters these through the tree; they
+# were committed twice before under adapter/gpu_vector/.
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+Testing/
+
 # Test files
 tests/main.cpp
 
@@ -169,6 +178,30 @@ abrt_bt.so
 # Per-session HDF5 artifacts written by demo/benchmark runs (UUID-named .h5).
 # Generated output, never source.
 demologs/
+
+# Jarvis pipeline-test output. `jarvis ppl run` resolves a test's `output:`
+# to <cwd>/results/<test_name> when it is not an absolute path, so sweeps run
+# from the repo root drop results.csv/results.yaml and their post-processing
+# artifacts (grids, summaries, .png) in here. Generated data, never source --
+# and easy to commit by accident because it appears at the repo root.
+results/
+
+# The upstream LLVM apt installer, fetched into the repo root by hand
+# (llvm.sh, plus llvm.sh.1/.2 from repeated downloads). Third-party tooling
+# pulled down on demand, never source -- it was committed by accident once.
+llvm.sh*
+
+# Runtime configs the gpu_vector tests/benches write into their CWD --
+# committed once by accident from repo-root runs; never sources.
+/gpu_vector_*.yaml
+
+# Crash artifacts and batch logs. core_pattern on Delta is
+# `core.%e.%t.%u.%p.%h`, so a segfaulting bench drops a ~470 MB core in
+# whatever directory it ran from -- four of them appeared in the tree root
+# during the 2-node paged debugging alone.
+core.*
+slurm-*.out
+slurm-*.err
 
 # Locally staged HDF5 install prefixes for the Windows VFD build. Neither
 # HDF_Group's installer nor vcpkg ships a usable HDF5 dev install on Windows,

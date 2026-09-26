@@ -203,7 +203,7 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   put_blob_shm.alloc_id_.SetNull();
   put_blob_shm.off_ = reinterpret_cast<clio::run::u64>(blob_dev);
   auto *put_proto_task = new (put_proto) cte::PodPutBlobTask(
-      clio::run::CreateTaskId(), cte::kCtePoolId, clio::run::PoolQuery::ToLocalCpu(),
+      clio::run::CreateTaskId(), cte::kCtePoolId, clio::run::PoolQuery::Dynamic(),
       g_tag_id, kBlobName, /*offset=*/clio::run::u64(0),
       static_cast<clio::run::u64>(kBlobBytes), put_blob_shm,
       /*score=*/-1.0f, cte::Context(), /*flags=*/clio::run::u32(0));
@@ -217,7 +217,7 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   get_blob_shm.alloc_id_.SetNull();
   get_blob_shm.off_ = reinterpret_cast<clio::run::u64>(blob_dev);
   auto *get_proto_task = new (get_proto) cte::PodGetBlobTask(
-      clio::run::CreateTaskId(), cte::kCtePoolId, clio::run::PoolQuery::ToLocalCpu(),
+      clio::run::CreateTaskId(), cte::kCtePoolId, clio::run::PoolQuery::Dynamic(),
       g_tag_id, kBlobName, /*offset=*/clio::run::u64(0),
       static_cast<clio::run::u64>(kBlobBytes), /*flags=*/clio::run::u32(0),
       get_blob_shm);

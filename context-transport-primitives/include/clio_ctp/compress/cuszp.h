@@ -41,8 +41,20 @@
 
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "compress.h"
+#include <cstdio>
+#include <cstdlib>
+
+#define CUSZP_TRACE(...)                                                      \
+  do {                                                                        \
+    if (std::getenv("CLIO_CUSZP_TRACE")) {                                    \
+      std::fprintf(stderr, "[CUSZP] " __VA_ARGS__);                           \
+      std::fprintf(stderr, "\n");                                            \
+      std::fflush(stderr);                                                    \
+    }                                                                         \
+  } while (0)
 
 namespace ctp {
 
@@ -108,9 +120,12 @@ class Cuszp : public Compressor {
     const size_t n = input_size / sizeof(float);
 
     cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
-      return false;
-    }
+    // Use the caller's pooled stream when one is set. Creating a stream per
+    // call is not just overhead: a cudaStreamCreate against a resident
+    // spinning kernel has deadlocked this runtime before, and on the
+    // device-to-device fault path the compressor runtime has already handed
+    // us a slot stream via SetGpuStreamForThread.
+    stream = CodecStream();
     float *d_in = nullptr;
     bool free_in = false;
     unsigned char *d_cmp = nullptr;  // temp worst-case device output buffer
@@ -179,7 +194,6 @@ class Cuszp : public Compressor {
 
     if (d_cmp != nullptr) cudaFree(d_cmp);
     if (free_in) cudaFree(d_in);
-    cudaStreamDestroy(stream);
     return ok;
   }
 
@@ -190,9 +204,12 @@ class Cuszp : public Compressor {
     }
 
     cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
-      return false;
-    }
+    // Use the caller's pooled stream when one is set. Creating a stream per
+    // call is not just overhead: a cudaStreamCreate against a resident
+    // spinning kernel has deadlocked this runtime before, and on the
+    // device-to-device fault path the compressor runtime has already handed
+    // us a slot stream via SetGpuStreamForThread.
+    stream = CodecStream();
     float *d_out = nullptr;
     bool free_out = false;
     unsigned char *d_stream = nullptr;
@@ -201,17 +218,38 @@ class Cuszp : public Compressor {
     do {
       Prefix prefix;
       if (IsDeviceAccessible(input)) {
-        if (cudaMemcpy(&prefix, input, sizeof(Prefix),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+        // STREAM-ORDERED, and it must be. The caller stages the compressed
+        // bytes into device memory with an ASYNC H2D on its own slot stream
+        // and then calls us; a plain cudaMemcpy here is ordered against the
+        // default stream, not that one, so it raced the staging copy and read
+        // zeros -- prefix.magic came back 0 and every page failed to decode.
+        // nvcomp never tripped this because it is handed its sizes as
+        // arguments and never reads its own input from the host.
+        cudaError_t pe = cudaMemcpyAsync(&prefix, input, sizeof(Prefix),
+                                         cudaMemcpyDeviceToHost, stream);
+        if (pe == cudaSuccess) {
+          pe = cudaStreamSynchronize(stream);
+        }
+        if (pe != cudaSuccess) {
+          CUSZP_TRACE("prefix D2H failed: %s", cudaGetErrorString(pe));
           break;
         }
       } else {
         std::memcpy(&prefix, input, sizeof(Prefix));
       }
-      if (prefix.magic != kMagic) break;  // not one of our blobs
+      if (prefix.magic != kMagic) {
+        CUSZP_TRACE("magic mismatch: got %x want %x (input_size=%zu dev=%d)",
+                    prefix.magic, kMagic, input_size,
+                    (int)IsDeviceAccessible(input));
+        break;  // not one of our blobs
+      }
 
       const size_t n = static_cast<size_t>(prefix.elems);
-      if (n * sizeof(float) > output_size) break;  // caller buffer too small
+      if (n * sizeof(float) > output_size) {
+        CUSZP_TRACE("output too small: need %zu have %zu", n * sizeof(float),
+                    output_size);
+        break;
+      }
       // `avail` = compressed bytes physically present in the blob (what Compress
       // retained: cuSZp's cmp_size for multi-block, or the full buffer for the
       // single-block case). `cmp_arg` = the cmp_size value cuSZp itself reported,
@@ -244,8 +282,14 @@ class Cuszp : public Compressor {
       cuSZp_decompress(d_out, d_stream, n, cmp_arg, prefix.eb, CUSZP_DIM_1D,
                        dims, CUSZP_TYPE_FLOAT,
                        static_cast<cuszp_mode_t>(prefix.mode), stream);
-      bool decoded = cudaStreamSynchronize(stream) == cudaSuccess &&
-                     cudaGetLastError() == cudaSuccess;
+      const cudaError_t se = cudaStreamSynchronize(stream);
+      const cudaError_t le = cudaGetLastError();
+      bool decoded = se == cudaSuccess && le == cudaSuccess;
+      if (!decoded) {
+        CUSZP_TRACE("decode failed: sync=%s last=%s n=%zu cmp_arg=%zu avail=%zu",
+                    cudaGetErrorString(se), cudaGetErrorString(le), n, cmp_arg,
+                    avail);
+      }
       if (decoded) {
         if (!out_is_device) {
           decoded = cudaMemcpy(output, d_out, n * sizeof(float),
@@ -260,11 +304,203 @@ class Cuszp : public Compressor {
 
     if (free_stream) cudaFree(d_stream);
     if (free_out) cudaFree(d_out);
-    cudaStreamDestroy(stream);
     return ok;
   }
 
   /** Set the absolute error bound. */
+  /**
+   * The stream this codec runs on. NEVER creates one.
+   *
+   * Creating a stream per operation was both a correctness and a performance
+   * hazard: cudaStreamCreate has deadlocked this runtime against a resident
+   * consumer kernel, and it is pure overhead on a path that already has a
+   * stream to use. The caller supplies one through SetGpuStreamForThread; with
+   * no override we run on the default stream, which is always valid in the
+   * caller's context. Adopting the PROCESS-WIDE override is deliberately not
+   * done here -- it belongs to another CUDA context and using it silently
+   * compresses zeros.
+   */
+  static cudaStream_t CodecStream() {
+    return static_cast<cudaStream_t>(GetGpuCodecStreamThreadOnly());
+  }
+
+  /**
+   * Batched compress: issue every job, then synchronize ONCE.
+   *
+   * cuSZp has no batched kernel, so this cannot fuse the launches, but the
+   * per-job synchronize is what actually hurt: each sync had to win a slot
+   * against the consumer kernel's relaunch loop, which measured 22 decodes in
+   * 280 seconds. Issuing the whole batch back-to-back and waiting once turns
+   * N of those contests into one.
+   */
+  bool CompressBatch(CompressJob *jobs, size_t n) override {
+    return RunBatch(jobs, n, /*compress=*/true);
+  }
+
+  /** Batched decompress. See CompressBatch. */
+  bool DecompressBatch(CompressJob *jobs, size_t n) override {
+    return RunBatch(jobs, n, /*compress=*/false);
+  }
+
+  /**
+   * Phased batch runner.
+   *
+   * DECOMPRESS is native: all prefixes are read, ONE wait, all decodes are
+   * launched, ONE wait. Two synchronizes for the whole batch instead of two
+   * per job.
+   *
+   * STAGING IS BY RESIDENCY, NOT BY HABIT. A device `src` is decoded from
+   * where it lies and a device `dst` is decoded straight into, so the common
+   * case -- a compressed page on a device tier faulting into a device page
+   * cache -- allocates nothing and copies nothing. A scratch slab is created
+   * only if some job actually has a host pointer, and only large enough for
+   * those jobs.
+   *
+   * COMPRESS still uses the serial fallback. cuSZp reports its compressed size
+   * through a host out-parameter that is only valid after the kernel has run,
+   * so batching it needs a second issue phase for the prefix writes; the
+   * interface is in place for that and decompress is where the measured cost
+   * was.
+   */
+  bool RunBatch(CompressJob *jobs, size_t n, bool compress) {
+    if (compress || n == 0) {
+      return RunBatchSerial(jobs, n, compress);
+    }
+    cudaStream_t stream = CodecStream();
+    std::vector<Prefix> pre(n);
+    std::vector<char> host_pre(n * sizeof(Prefix));
+
+    // Phase 0 -- every prefix, then ONE wait.
+    for (size_t i = 0; i < n; ++i) {
+      jobs[i].ok = false;
+      jobs[i].out_size = 0;
+      if (jobs[i].src == nullptr || jobs[i].dst == nullptr ||
+          jobs[i].src_size < sizeof(Prefix)) {
+        continue;
+      }
+      if (IsDeviceAccessible(const_cast<void *>(jobs[i].src))) {
+        cudaMemcpyAsync(&pre[i], jobs[i].src, sizeof(Prefix),
+                        cudaMemcpyDeviceToHost, stream);
+      } else {
+        std::memcpy(&pre[i], jobs[i].src, sizeof(Prefix));
+      }
+    }
+    CUSZP_TRACE("batch n=%zu: prefixes issued", n);
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return false;
+    CUSZP_TRACE("batch: prefixes landed");
+
+    // Size a scratch slab for the HOST-side jobs only; all-device batches get
+    // no slab at all.
+    size_t slab_need = 0;
+    for (size_t i = 0; i < n; ++i) {
+      if (pre[i].magic != kMagic) continue;
+      const size_t nb = static_cast<size_t>(pre[i].elems) * sizeof(float);
+      if (nb == 0 || nb > jobs[i].dst_capacity) continue;
+      if (!IsDeviceAccessible(const_cast<void *>(jobs[i].src))) {
+        slab_need += jobs[i].src_size;
+      }
+      if (!IsDeviceAccessible(jobs[i].dst)) slab_need += nb;
+    }
+    char *slab = nullptr;
+    CUSZP_TRACE("batch: slab_need=%zu", slab_need);
+    if (slab_need > 0 && cudaMalloc(&slab, slab_need) != cudaSuccess) {
+      return false;
+    }
+    size_t slab_off = 0;
+    std::vector<void *> host_dst(n, nullptr);
+    std::vector<size_t> host_dst_bytes(n, 0);
+
+    // Phase 1 -- launch the decodes, then wait.
+    //
+    // ISSUED IN CHUNKS, and that is not a tuning choice. cuSZp has no batched
+    // entry point, so this is one kernel launch per page. The consumer that is
+    // waiting on these pages is itself a kernel being relaunched in a tight
+    // loop by its host driver, so the launch queue is already busy; pushing an
+    // unbounded number of decodes into it blocks the launch call itself, and
+    // the consumer cannot retire because it is waiting for exactly these
+    // decodes. Measured: a batch of 8 completes, the next batch of 56 hangs
+    // partway through issuing, with every worker stalled.
+    //
+    // Draining every kChunk launches bounds what is in flight and breaks the
+    // cycle. nvcomp does not need this because its batched API is ONE launch
+    // for the whole group.
+    constexpr size_t kChunk = 8;
+    size_t issued_since_drain = 0;
+    for (size_t i = 0; i < n; ++i) {
+      if (pre[i].magic != kMagic) continue;
+      const size_t elems = static_cast<size_t>(pre[i].elems);
+      const size_t nb = elems * sizeof(float);
+      if (elems == 0 || nb > jobs[i].dst_capacity) continue;
+
+      const unsigned char *d_stream = nullptr;
+      if (IsDeviceAccessible(const_cast<void *>(jobs[i].src))) {
+        d_stream = static_cast<const unsigned char *>(jobs[i].src) +
+                   sizeof(Prefix);   // decode in place: no staging
+      } else {
+        char *st = slab + slab_off;
+        slab_off += jobs[i].src_size;
+        cudaMemcpyAsync(st, jobs[i].src, jobs[i].src_size,
+                        cudaMemcpyHostToDevice, stream);
+        d_stream =
+            reinterpret_cast<const unsigned char *>(st) + sizeof(Prefix);
+      }
+
+      float *d_out = nullptr;
+      if (IsDeviceAccessible(jobs[i].dst)) {
+        d_out = static_cast<float *>(jobs[i].dst);  // decode straight in
+      } else {
+        d_out = reinterpret_cast<float *>(slab + slab_off);
+        slab_off += nb;
+        host_dst[i] = jobs[i].dst;
+        host_dst_bytes[i] = nb;
+      }
+
+      uint3 dims = {0, 0, 0};
+      cuSZp_decompress(d_out, const_cast<unsigned char *>(d_stream), elems,
+                       static_cast<size_t>(pre[i].cmp_size), pre[i].eb,
+                       CUSZP_DIM_1D, dims, CUSZP_TYPE_FLOAT,
+                       static_cast<cuszp_mode_t>(pre[i].mode), stream);
+      jobs[i].ok = true;
+      jobs[i].out_size = nb;
+      if (host_dst[i] != nullptr) {
+        cudaMemcpyAsync(host_dst[i], d_out, nb, cudaMemcpyDeviceToHost, stream);
+      }
+      if (++issued_since_drain >= kChunk) {
+        issued_since_drain = 0;
+        // POLL rather than block, so a decode that never completes is
+        // distinguishable from one that is merely slow.
+        int spins = 0;
+        cudaError_t q;
+        while ((q = cudaStreamQuery(stream)) == cudaErrorNotReady) {
+          if (++spins > 200000) {
+            CUSZP_TRACE("chunk drain STUCK after %d polls at job %zu/%zu",
+                        spins, i, n);
+            break;
+          }
+        }
+        if (q != cudaSuccess && q != cudaErrorNotReady) {
+          CUSZP_TRACE("chunk drain error: %s", cudaGetErrorString(q));
+          break;
+        }
+        if (spins > 200000) break;
+      }
+    }
+    CUSZP_TRACE("batch: decodes issued, waiting");
+    const bool synced = cudaStreamSynchronize(stream) == cudaSuccess &&
+                        cudaGetLastError() == cudaSuccess;
+    CUSZP_TRACE("batch: decodes done synced=%d", (int)synced);
+    if (slab != nullptr) cudaFree(slab);
+    bool all = true;
+    for (size_t i = 0; i < n; ++i) {
+      if (!synced) {
+        jobs[i].ok = false;
+        jobs[i].out_size = 0;
+      }
+      all = all && jobs[i].ok;
+    }
+    return all;
+  }
+
   void SetErrorBound(float eb) { eb_ = eb; }
   /** Get the absolute error bound. */
   float GetErrorBound() const { return eb_; }

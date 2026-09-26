@@ -1,0 +1,60 @@
+# Gray-Scott MPI baseline: 3D stencil, z-slab decomposition.
+#
+# Axes: grid size via data_mb (VRAM axis: 4 fields of nx*ny*nz floats
+# live on-device) x steps (runtime axis: one halo'd stencil sweep per
+# step). No checkpoint phase. page_kb here only shapes the derived
+# nx/ny (plane = page_kb*1024/4 cells), matching the paged bench's grid
+# derivation so the two are comparable cell-for-cell.
+config:
+  name: gv_grayscott_mpi_sweep
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: grayscott
+      variant: mpi
+      nprocs: 1
+      steps: 4
+      data_mb: 1024
+      page_kb: 1024
+      prefault: "0"
+      timeout_sec: 600
+      output_dir: /tmp/clio_gv/grayscott_mpi_sweep
+
+vars:
+  wl.data_mb: [512, 1024, 2048, 4096]
+  wl.steps: [4, 16, 64]
+
+loop:
+  - [wl.data_mb]
+  - [wl.steps]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/grayscott_mpi_sweep"
+
+post: |
+  import matplotlib
+  matplotlib.use('Agg')
+  import matplotlib.pyplot as plt
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  bad = df[df.get('gates_pass', 0) != 1]
+  if len(bad):
+      logger.warning(f'{len(bad)} cells failed gates -- excluded from figures')
+  df = df[df.gates_pass == 1]
+  fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+  for steps, g in df.groupby('wl.steps'):
+      g = g.sort_values('wl.data_mb')
+      axes[0].plot(g['wl.data_mb'], g['bench_ms'], 'o-', label=f'{steps} steps')
+  axes[0].set_xlabel('grid data (MB)'); axes[0].set_ylabel('time (ms)')
+  axes[0].set_title('gray-scott MPI: runtime vs grid x steps')
+  axes[0].legend(); axes[0].set_xscale('log', base=2)
+  one = df[df['wl.steps'] == sorted(df['wl.steps'].unique())[0]]
+  one = one.sort_values('wl.data_mb')
+  axes[1].plot(one['wl.data_mb'], one['vram_delta_mb'], 's-', color='tab:red')
+  axes[1].plot(one['wl.data_mb'], one['wl.data_mb'], '--', color='gray',
+               label='u+v grid data (y=x)')
+  axes[1].set_xlabel('grid data (MB)'); axes[1].set_ylabel('VRAM delta (MB)')
+  axes[1].set_title('gray-scott MPI: peak VRAM vs grid (nvidia-smi)')
+  axes[1].legend()
+  fig.tight_layout(); fig.savefig('grayscott_mpi_sweep.png', dpi=130)
+  logger.info('wrote grayscott_mpi_sweep.png')

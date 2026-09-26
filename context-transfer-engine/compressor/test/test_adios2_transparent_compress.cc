@@ -107,6 +107,35 @@ TEST_CASE("ADIOS2 transparent compress - GetBlob float array",
   const size_t num_elements = 16 * 1024;
   const size_t data_size = num_elements * sizeof(float);
 
+  // Write the blob this test reads.
+  //
+  // The put and the get are registered as SEPARATE ctest entries running this
+  // same binary under different name filters, which means separate processes
+  // and therefore separate runtimes. Reading a blob the other entry wrote only
+  // ever worked when both happened to run in one process; on its own the get
+  // asked for a blob that had never been written and failed on the return
+  // code, with nothing to say the data was simply absent.
+  {
+    auto seed_buffer = CLIO_IPC->AllocateBuffer(data_size);
+    REQUIRE(!seed_buffer.IsNull());
+    float *seed = reinterpret_cast<float *>(seed_buffer.ptr_);
+    for (size_t i = 0; i < num_elements; ++i) {
+      seed[i] = static_cast<float>(i % 256);  // must match the check below
+    }
+    clio::cte::core::Context sctx;
+#if CTP_ENABLE_COMPRESS
+    sctx.dynamic_compress_ = 1;
+    sctx.compress_lib_ = 4;    // LZ4
+    sctx.compress_preset_ = 2; // BALANCED
+    sctx.data_type_ = 1;       // float
+#endif
+    auto seed_put = cte_client->AsyncPutBlob(
+        g_tag_id, "temperature/step0", 0, data_size,
+        seed_buffer.shm_.template Cast<void>(), -1.0f, sctx, 0);
+    seed_put.Wait();
+    REQUIRE(seed_put->GetReturnCode() == 0);
+  }
+
   auto get_buffer = CLIO_IPC->AllocateBuffer(data_size);
   REQUIRE(!get_buffer.IsNull());
   memset(get_buffer.ptr_, 0, data_size);

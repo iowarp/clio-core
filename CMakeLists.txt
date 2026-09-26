@@ -138,6 +138,22 @@ endif()
 option(CLIO_CORE_ENABLE_ELF "Enable ELF support (required for CTE adapters)" OFF)
 option(CLIO_CORE_ENABLE_OPENMP "Enable the use of OpenMP" OFF)
 option(CLIO_CORE_ENABLE_CUDA "Enable CUDA support" OFF)
+# ONE SWITCH FOR THE WHOLE GPU BUILD, not a per-feature flag.
+#
+# clang compiles CUDA as C++, so it gets C++20 device coroutines; nvcc does
+# not, and nothing that needs them can be built by it. That is a property of
+# the TOOLCHAIN, so it belongs to the build as a whole -- picking the compiler
+# in one place and letting every GPU component ask "is this a clang build?"
+# rather than each carrying its own flag and its own way to be misconfigured.
+#
+# gpu_vector is the component that needs it: its device API is coroutines all
+# the way down. With this OFF the vector is not built at all (see its
+# CMakeLists) rather than failing halfway through a compile with "namespace
+# clio::run::gpu has no member YCoroTask", which is what a CI job that did not
+# know about this got.
+option(CLIO_GPU_CLANG
+       "Use clang as the CUDA compiler for ALL GPU code (enables device coroutines; required by gpu_vector)"
+       OFF)
 option(CLIO_CORE_ENABLE_GPU_RUNTIME "Enable GPU runtime (CDP-based parallelism)" OFF)
 option(CLIO_CORE_ENABLE_ROCM "Enable ROCm support" OFF)
 option(CLIO_CORE_ENABLE_NIXL "Enable NIXL (NVIDIA Inference Xfer Library) transport" OFF)
@@ -266,7 +282,40 @@ endif()
 #------------------------------------------------------------------------------
 # Provides macros for dependency resolution and ChiMod build functions
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+
+# BEFORE ClioCoreCommon, because that is where enable_language(CUDA) runs and
+# the compiler cannot be chosen after the language is enabled.
+if(CLIO_GPU_CLANG)
+    if(NOT CLIO_CORE_ENABLE_CUDA)
+        message(FATAL_ERROR "CLIO_GPU_CLANG requires CLIO_CORE_ENABLE_CUDA=ON")
+    endif()
+    if(NOT CMAKE_CUDA_COMPILER)
+        # Newest first: device coroutines need a recent clang, and the probe
+        # is the same one a developer would do by hand.
+        find_program(CLIO_GPU_CLANGXX
+                     NAMES clang++-22 clang++-21 clang++-20 clang++-19 clang++
+                     DOC "clang++ used as the CUDA compiler")
+        if(NOT CLIO_GPU_CLANGXX)
+            message(FATAL_ERROR
+                    "CLIO_GPU_CLANG=ON but no clang++ was found. Install one "
+                    "(clang++-22 or newer is what this tree is tested with) "
+                    "or pass -DCMAKE_CUDA_COMPILER=/path/to/clang++.")
+        endif()
+        set(CMAKE_CUDA_COMPILER "${CLIO_GPU_CLANGXX}" CACHE FILEPATH
+            "CUDA compiler (clang, selected by CLIO_GPU_CLANG)" FORCE)
+    elseif(NOT CMAKE_CUDA_COMPILER MATCHES "clang")
+        message(FATAL_ERROR
+                "CLIO_GPU_CLANG=ON but CMAKE_CUDA_COMPILER is "
+                "'${CMAKE_CUDA_COMPILER}'. nvcc cannot compile device "
+                "coroutines; pass a clang++ or turn CLIO_GPU_CLANG off.")
+    endif()
+    message(STATUS "GPU toolchain: clang (${CMAKE_CUDA_COMPILER}) -- device coroutines on")
+endif()
+
 include(ClioCoreCommon)
+# Measured per-kernel register ceilings for device-coroutine kernels; a no-op
+# unless CLIO_GPU_CLANG is on.
+include(ClioCoroRegCap)
 
 #------------------------------------------------------------------------------
 # External Library Discovery
@@ -391,6 +440,52 @@ if(CLIO_CORE_ENABLE_ROCM)
     endif()
     if(NOT CLIO_ROCM_HIP_PLATFORM STREQUAL "nvidia")
         find_package(HIP REQUIRED)
+        # THESE MUST BE TOP-LEVEL, not inside wrp_core_enable_rocm().
+        #
+        # macros.h includes <hip/hip_runtime_api.h> for every TU with
+        # CTP_ENABLE_ROCM set, and that header guards its whole body on
+        # __HIP_PLATFORM_AMD__. amdclang++ defines it implicitly for -x hip;
+        # the plain C++ compiler does not. Setting it inside the macro looked
+        # right and was not: add_compile_definitions/include_directories are
+        # DIRECTORY-scoped, and the macro is called from context-runtime/ and
+        # context-transport-primitives/ -- so context-transfer-engine and
+        # everything else got neither, and failed with ~470 errors of the form
+        # "hipGetLastError was not declared in this scope" the moment the
+        # build got far enough to reach them.
+        if(NOT DEFINED ROCM_ROOT)
+            if(DEFINED ROCM_PATH)
+                set(ROCM_ROOT "${ROCM_PATH}" CACHE PATH "ROCm root")
+            elseif(DEFINED ENV{ROCM_PATH})
+                set(ROCM_ROOT "$ENV{ROCM_PATH}" CACHE PATH "ROCm root")
+            else()
+                set(ROCM_ROOT "/opt/rocm" CACHE PATH "ROCm root")
+            endif()
+        endif()
+        if(EXISTS "${ROCM_ROOT}/include")
+            include_directories(SYSTEM "${ROCM_ROOT}/include")
+        endif()
+        # The HIP toolchain emits a bare `-lamdhip64` for HIP-linked targets.
+        # That resolves for an install at the default prefix and not for one
+        # anywhere else, failing with "unable to find library -lamdhip64", so
+        # give the linker the search path explicitly. RPATH too, otherwise the
+        # binaries link and then cannot start.
+        if(EXISTS "${ROCM_ROOT}/lib")
+            link_directories("${ROCM_ROOT}/lib")
+            list(APPEND CMAKE_BUILD_RPATH "${ROCM_ROOT}/lib")
+            list(APPEND CMAKE_INSTALL_RPATH "${ROCM_ROOT}/lib")
+        endif()
+        add_compile_definitions(__HIP_PLATFORM_AMD__=1)
+        # ...and link the HIP runtime everywhere, for exactly the reason the
+        # SYCL block below says of libsycl: gpu_api.h's inline helpers call
+        # hipPointerGetAttributes, hipMemcpy and friends, so ANY target that
+        # merely includes it needs the library -- not just the ones compiled
+        # as HIP. Without this the build fails late, at link, with
+        # "undefined reference to hipPointerGetAttributes ... DSO missing from
+        # command line" on whichever unrelated benchmark happened to include
+        # gpu_api.h.
+        if(TARGET hip::host)
+            link_libraries(hip::host)
+        endif()
     endif()
     message(STATUS "found ROCm/HIP support (HIP_PLATFORM=${CLIO_ROCM_HIP_PLATFORM})")
 endif()
@@ -437,64 +532,163 @@ set(SERIALIZATION_LIBS ${MSGPACK_TARGET} ${SERIALIZATION_LIBS})
 # Thread support
 find_package(Threads REQUIRED)
 
+# CUDA 13 moved libcu++ (cuda/std/*) under include/cccl. Anything including
+# <cuda/std/...> -- kvhdf5 does -- otherwise fails with a bare
+# "cuda/std/cstdint: No such file or directory". This has to be at top level:
+# include_directories() only affects the directory that calls it and the
+# subdirectories added after, so setting it inside a helper invoked from one
+# component never reaches the others. Harmless on older toolkits, where the
+# directory does not exist.
+if(CLIO_CORE_ENABLE_CUDA)
+    foreach(_cccl "${CUDAToolkit_INCLUDE_DIRS}/cccl"
+                  "/usr/local/cuda/targets/x86_64-linux/include/cccl")
+        if(EXISTS "${_cccl}")
+            message(STATUS "libcu++ (CUDA 13 layout) at ${_cccl}")
+            include_directories("${_cccl}")
+            break()
+        endif()
+    endforeach()
+endif()
+
 # Compression libraries (conditional)
 if(CLIO_CTE_ENABLE_COMPRESS)
     message(STATUS "CLIO_CTE_ENABLE_COMPRESS is ON")
 
+    # EVERY codec is optional.
+    #
+    # These used to be REQUIRED, which made enabling compression an
+    # all-or-nothing proposition: a box missing any single one of nine dev
+    # packages could not configure at all, even to use a codec it did have.
+    # The GPU-side codecs (nvcomp, cuSZ, ...) were already detected this way;
+    # the lossless CPU ones now match. A codec that is not found is compiled
+    # out via its CTP_ENABLE_<X> definition, and CompressionFactory returns
+    # nullptr for it -- which every caller already handles, because that is
+    # what the optional GPU codecs have always done.
+    set(CLIO_CTP_ENABLE_ZSTD OFF)
+    set(CLIO_CTP_ENABLE_LZ4 OFF)
+    set(CLIO_CTP_ENABLE_ZLIB OFF)
+    set(CLIO_CTP_ENABLE_LZMA OFF)
+    set(CLIO_CTP_ENABLE_BROTLI OFF)
+    set(CLIO_CTP_ENABLE_BLOSC2 OFF)
+    set(CLIO_CTP_ENABLE_BZIP2 OFF)
+    set(CLIO_CTP_ENABLE_LZO OFF)
+    set(CLIO_CTP_ENABLE_SNAPPY OFF)
+
+    # A .pc file is not proof the headers are installed: conda ships
+    # libbrotlidec.pc from a RUNTIME-only package, so pkg-config reports
+    # brotli found and the build then dies on a missing brotli/decode.h.
+    # Every pkg-config codec therefore also has to locate its principal
+    # header before being declared usable.
+    macro(clio_check_codec_header out_var pkg header)
+        find_path(${out_var} ${header} HINTS ${${pkg}_INCLUDE_DIRS})
+    endmacro()
+
     # Libraries with pkg-config support
-    pkg_check_modules(libzstd REQUIRED libzstd)
-    message(STATUS "found zstd.h at ${libzstd_INCLUDE_DIRS}")
+    pkg_check_modules(libzstd QUIET libzstd)
+    clio_check_codec_header(_zstd_hdr libzstd zstd.h)
+    if(libzstd_FOUND AND _zstd_hdr)
+        set(CLIO_CTP_ENABLE_ZSTD ON)
+        message(STATUS "found zstd.h at ${libzstd_INCLUDE_DIRS}")
+    else()
+        message(STATUS "zstd not found - zstd codec disabled (apt: libzstd-dev)")
+    endif()
 
-    pkg_check_modules(liblz4 REQUIRED liblz4)
-    message(STATUS "found lz4.h at ${liblz4_INCLUDE_DIRS}")
+    pkg_check_modules(liblz4 QUIET liblz4)
+    clio_check_codec_header(_lz4_hdr liblz4 lz4.h)
+    if(liblz4_FOUND AND _lz4_hdr)
+        set(CLIO_CTP_ENABLE_LZ4 ON)
+        message(STATUS "found lz4.h at ${liblz4_INCLUDE_DIRS}")
+    else()
+        message(STATUS "lz4 not found - lz4 codec disabled (apt: liblz4-dev)")
+    endif()
 
-    pkg_check_modules(zlib REQUIRED zlib)
-    message(STATUS "found zlib.h at ${zlib_INCLUDE_DIRS}")
+    pkg_check_modules(zlib QUIET zlib)
+    clio_check_codec_header(_zlib_hdr zlib zlib.h)
+    if(zlib_FOUND AND _zlib_hdr)
+        set(CLIO_CTP_ENABLE_ZLIB ON)
+        message(STATUS "found zlib.h at ${zlib_INCLUDE_DIRS}")
+    else()
+        message(STATUS "zlib not found - zlib codec disabled (apt: zlib1g-dev)")
+    endif()
 
-    pkg_check_modules(liblzma REQUIRED liblzma)
-    message(STATUS "found liblzma.h at ${liblzma_INCLUDE_DIRS}")
+    pkg_check_modules(liblzma QUIET liblzma)
+    clio_check_codec_header(_lzma_hdr liblzma lzma.h)
+    if(liblzma_FOUND AND _lzma_hdr)
+        set(CLIO_CTP_ENABLE_LZMA ON)
+        message(STATUS "found liblzma.h at ${liblzma_INCLUDE_DIRS}")
+    else()
+        message(STATUS "lzma not found - lzma codec disabled (apt: liblzma-dev)")
+    endif()
 
-    pkg_check_modules(libbrotlicommon REQUIRED libbrotlicommon libbrotlidec libbrotlienc)
-    message(STATUS "found libbrotli.h at ${libbrotlicommon_INCLUDE_DIRS}")
+    pkg_check_modules(libbrotlicommon QUIET libbrotlicommon libbrotlidec libbrotlienc)
+    clio_check_codec_header(_brotli_hdr libbrotlicommon brotli/decode.h)
+    if(libbrotlicommon_FOUND AND _brotli_hdr)
+        set(CLIO_CTP_ENABLE_BROTLI ON)
+        message(STATUS "found libbrotli.h at ${libbrotlicommon_INCLUDE_DIRS}")
+    else()
+        message(STATUS "brotli not found - brotli codec disabled (apt: libbrotli-dev)")
+    endif()
 
-    pkg_check_modules(blosc2 REQUIRED blosc2)
-    message(STATUS "found blosc2.h at ${blosc2_INCLUDE_DIRS}")
+    pkg_check_modules(blosc2 QUIET blosc2)
+    clio_check_codec_header(_blosc2_hdr blosc2 blosc2.h)
+    if(blosc2_FOUND AND _blosc2_hdr)
+        set(CLIO_CTP_ENABLE_BLOSC2 ON)
+        message(STATUS "found blosc2.h at ${blosc2_INCLUDE_DIRS}")
+    else()
+        message(STATUS "blosc2 not found - blosc codec disabled (apt: libblosc2-dev)")
+    endif()
+
+    # The find_path/find_library codecs need the same prefixes pkg-config
+    # already knows about. Without this bzip2 read as "not found" on a host
+    # whose bzlib.h sits in a conda prefix, while zstd and lz4 right beside it
+    # were found -- because those came through pkg-config, which had been told
+    # where to look, and these had not.
+    set(CLIO_CODEC_HINTS "$ENV{CONDA_PREFIX}" ${CMAKE_PREFIX_PATH})
 
     # bzip2
-    find_path(bzip2_INCLUDE_DIR bzlib.h REQUIRED)
-    find_library(bzip2_LIBRARY bz2 REQUIRED)
+    find_path(bzip2_INCLUDE_DIR bzlib.h HINTS ${CLIO_CODEC_HINTS}
+              PATH_SUFFIXES include)
+    find_library(bzip2_LIBRARY bz2 HINTS ${CLIO_CODEC_HINTS}
+                 PATH_SUFFIXES lib lib64)
     if(bzip2_INCLUDE_DIR AND bzip2_LIBRARY)
+        set(CLIO_CTP_ENABLE_BZIP2 ON)
         set(bzip2_INCLUDE_DIRS ${bzip2_INCLUDE_DIR})
         set(bzip2_LIBRARIES bz2)
         get_filename_component(bzip2_LIBRARY_DIRS "${bzip2_LIBRARY}" DIRECTORY)
         message(STATUS "found bz2.h at ${bzip2_INCLUDE_DIRS}")
     else()
-        message(FATAL_ERROR "bzip2 not found. Install with: apt-get install libbz2-dev")
+        message(STATUS "bzip2 not found - bzip2 codec disabled (apt: libbz2-dev)")
     endif()
 
     # lzo
-    find_path(lzo2_INCLUDE_DIR lzo/lzo1x.h REQUIRED)
-    find_library(lzo2_LIBRARY lzo2 REQUIRED)
+    find_path(lzo2_INCLUDE_DIR lzo/lzo1x.h HINTS ${CLIO_CODEC_HINTS}
+              PATH_SUFFIXES include)
+    find_library(lzo2_LIBRARY lzo2 HINTS ${CLIO_CODEC_HINTS}
+                 PATH_SUFFIXES lib lib64)
     if(lzo2_INCLUDE_DIR AND lzo2_LIBRARY)
+        set(CLIO_CTP_ENABLE_LZO ON)
         set(lzo2_INCLUDE_DIRS ${lzo2_INCLUDE_DIR})
         set(lzo2_LIBRARIES lzo2)
         get_filename_component(lzo2_LIBRARY_DIRS "${lzo2_LIBRARY}" DIRECTORY)
         get_filename_component(lzo2_dir "${lzo2_INCLUDE_DIRS}" DIRECTORY)
         message(STATUS "found lzo2.h at ${lzo2_INCLUDE_DIRS}")
     else()
-        message(FATAL_ERROR "lzo not found. Install with: apt-get install liblzo2-dev")
+        message(STATUS "lzo not found - lzo codec disabled (apt: liblzo2-dev)")
     endif()
 
     # snappy
-    find_path(snappy_INCLUDE_DIR snappy.h REQUIRED)
-    find_library(snappy_LIBRARY snappy REQUIRED)
+    find_path(snappy_INCLUDE_DIR snappy.h HINTS ${CLIO_CODEC_HINTS}
+              PATH_SUFFIXES include)
+    find_library(snappy_LIBRARY snappy HINTS ${CLIO_CODEC_HINTS}
+                 PATH_SUFFIXES lib lib64)
     if(snappy_INCLUDE_DIR AND snappy_LIBRARY)
+        set(CLIO_CTP_ENABLE_SNAPPY ON)
         set(snappy_INCLUDE_DIRS ${snappy_INCLUDE_DIR})
         set(snappy_LIBRARIES snappy)
         get_filename_component(snappy_LIBRARY_DIRS "${snappy_LIBRARY}" DIRECTORY)
         message(STATUS "found snappy.h at ${snappy_INCLUDE_DIRS}")
     else()
-        message(FATAL_ERROR "snappy not found. Install with: apt-get install libsnappy-dev")
+        message(STATUS "snappy not found - snappy codec disabled (apt: libsnappy-dev)")
     endif()
 
     # LibPressio - try find_package first (CMake-based), fall back to pkg-config
@@ -652,39 +846,28 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - cuSZp GPU compression disabled")
     endif()
 
-    set(COMPRESS_LIBS
-        bz2
-        ${lzo2_LIBRARIES}
-        ${libzstd_LIBRARIES}
-        ${liblz4_LIBRARIES}
-        ${zlib_LIBRARIES}
-        ${liblzma_LIBRARIES}
-        ${libbrotlicommon_LIBRARIES}
-        ${snappy_LIBRARIES}
-        ${blosc2_LIBRARIES}
-    )
-    set(COMPRESS_INCLUDES
-        ${bzip2_INCLUDE_DIRS}
-        ${lzo2_INCLUDE_DIRS} ${lzo2_dir}
-        ${libzstd_INCLUDE_DIRS}
-        ${liblz4_INCLUDE_DIRS}
-        ${zlib_INCLUDE_DIRS}
-        ${liblzma_INCLUDE_DIRS}
-        ${libbrotlicommon_INCLUDE_DIRS}
-        ${snappy_INCLUDE_DIRS}
-        ${blosc2_INCLUDE_DIRS}
-    )
-    set(COMPRESS_LIB_DIRS
-        ${bzip2_LIBRARY_DIRS}
-        ${lzo2_LIBRARY_DIRS}
-        ${libzstd_LIBRARY_DIRS}
-        ${liblz4_LIBRARY_DIRS}
-        ${zlib_LIBRARY_DIRS}
-        ${liblzma_LIBRARY_DIRS}
-        ${libbrotlicommon_LIBRARY_DIRS}
-        ${snappy_LIBRARY_DIRS}
-        ${blosc2_LIBRARY_DIRS}
-    )
+    # Only the codecs actually found contribute libs/includes. An absent one
+    # leaves its *_LIBRARIES empty anyway, but listing it unconditionally also
+    # dragged in a bare `bz2` link flag for a library that may not exist.
+    set(COMPRESS_LIBS "")
+    set(COMPRESS_INCLUDES "")
+    set(COMPRESS_LIB_DIRS "")
+    macro(clio_add_codec enabled libs includes libdirs)
+        if(${enabled})
+            list(APPEND COMPRESS_LIBS ${libs})
+            list(APPEND COMPRESS_INCLUDES ${includes})
+            list(APPEND COMPRESS_LIB_DIRS ${libdirs})
+        endif()
+    endmacro()
+    clio_add_codec(CLIO_CTP_ENABLE_BZIP2  "${bzip2_LIBRARIES}"          "${bzip2_INCLUDE_DIRS}"          "${bzip2_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_LZO    "${lzo2_LIBRARIES}"           "${lzo2_INCLUDE_DIRS};${lzo2_dir}" "${lzo2_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_ZSTD   "${libzstd_LIBRARIES}"        "${libzstd_INCLUDE_DIRS}"        "${libzstd_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_LZ4    "${liblz4_LIBRARIES}"         "${liblz4_INCLUDE_DIRS}"         "${liblz4_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_ZLIB   "${zlib_LIBRARIES}"           "${zlib_INCLUDE_DIRS}"           "${zlib_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_LZMA   "${liblzma_LIBRARIES}"        "${liblzma_INCLUDE_DIRS}"        "${liblzma_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_BROTLI "${libbrotlicommon_LIBRARIES}" "${libbrotlicommon_INCLUDE_DIRS}" "${libbrotlicommon_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_SNAPPY "${snappy_LIBRARIES}"         "${snappy_INCLUDE_DIRS}"         "${snappy_LIBRARY_DIRS}")
+    clio_add_codec(CLIO_CTP_ENABLE_BLOSC2 "${blosc2_LIBRARIES}"         "${blosc2_INCLUDE_DIRS}"         "${blosc2_LIBRARY_DIRS}")
     # Only add libpressio if found
     if(CLIO_CTP_ENABLE_LIBPRESSIO)
         list(APPEND COMPRESS_LIBS ${libpressio_LIBRARIES})
@@ -720,6 +903,13 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         list(APPEND COMPRESS_LIBS ${cuszp_LIBRARIES})
         list(APPEND COMPRESS_INCLUDES ${cuszp_INCLUDE_DIRS})
     endif()
+
+    # Make the per-codec switches available to subdirectories (CTP), same as
+    # the GPU codecs below.
+    foreach(_codec ZSTD LZ4 ZLIB LZMA BROTLI BLOSC2 BZIP2 LZO SNAPPY)
+        set(CLIO_CTP_ENABLE_${_codec} ${CLIO_CTP_ENABLE_${_codec}}
+            CACHE BOOL "Enable ${_codec} codec (auto-detected)" FORCE)
+    endforeach()
 
     # Make CTP_ENABLE_LIBPRESSIO available to subdirectories (CTP)
     set(CLIO_CTP_ENABLE_LIBPRESSIO ${CLIO_CTP_ENABLE_LIBPRESSIO} CACHE BOOL "Enable LibPressio wrapper (auto-detected)" FORCE)
@@ -1129,9 +1319,166 @@ if(NOT CLIO_CORE_MSVC_LIKE)
     # Release configuration
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
 
-    # CUDA: allow constexpr __host__ functions in __host__ __device__ contexts
+    # CUDA dialect flags are per compiler. NOTE: the CUDA language is
+    # enabled by the subprojects (wrp_core_enable_cuda), AFTER this file
+    # runs, so CMAKE_CUDA_COMPILER_ID does not exist yet -- detect clang
+    # from the compiler the user/preset selected instead.
     if(CLIO_CORE_ENABLE_CUDA)
-        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -diag-suppress=20011,20012,20013")
+        if(CMAKE_CUDA_COMPILER MATCHES "clang")
+            # CMake 3.28's clang-CUDA identification probes with sm_52/30/20,
+            # all removed from CUDA 13's ptxas, so identification fails with
+            # "ptxas fatal: Value 'sm_52' is not defined". Newer CMake probes
+            # with the SDK's own defaults. (pip install cmake gets a current
+            # one without touching the system package.)
+            if(CMAKE_VERSION VERSION_LESS "3.30")
+                message(FATAL_ERROR
+                    "clang as the CUDA compiler needs CMake >= 3.30 with a "
+                    "CUDA 13 toolkit (this CMake ${CMAKE_VERSION} probes "
+                    "compiler identity with GPU archs the toolkit dropped).")
+            endif()
+            # clang -x cuda. Differences from nvcc that matter here:
+            #  - no --expt-relaxed-constexpr (constexpr functions are
+            #    implicitly host+device already) and no -diag-suppress
+            #    (the host-call-from-device sloppiness those numbers hide
+            #    is a hard error under clang -- and fixing the call sites
+            #    is the point);
+            #  - the toolkit is usually newer than the last CUDA release
+            #    this clang was taught about;
+            #  - nvcc adds the toolkit's CCCL directory (cuda/std, thrust,
+            #    cub) to the include path implicitly, clang does not;
+            #  - device TUs in this tree type-pun through differently-typed
+            #    fills (task archives, shared-header copies). nvcc's codegen
+            #    never exploited strict aliasing on them; keep clang from
+            #    being the first (measured: reordered shared-header reads in
+            #    the llama bridge produced wild pointers).
+            find_package(CUDAToolkit REQUIRED)
+            set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-unknown-cuda-version -fno-strict-aliasing")
+            if(EXISTS "${CUDAToolkit_TARGET_DIR}/include/cccl")
+                set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -isystem ${CUDAToolkit_TARGET_DIR}/include/cccl")
+            endif()
+        else()
+            # nvcc: allow constexpr __host__ functions in __host__ __device__
+            # contexts, and quiet the host-call-from-device warning family.
+            set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -diag-suppress=20011,20012,20013")
+        endif()
+    endif()
+
+    # C++20 device coroutines as the yieldable-kernel mechanism
+    # (yield_coro.h). Opt-in, and clang-only: nvcc rejects co_await in
+    # device code outright. The macro mechanism stays the default and the
+    # two share one stack and host protocol, so this flips per build, not
+    # per kernel.
+    # KEPT AS AN ALIAS. CLIO_GPU_CLANG is the switch now -- one toolchain
+    # decision for all GPU code -- but scripts and presets that pass the old
+    # flag should keep working rather than silently building something else.
+    option(CLIO_GPU_YIELD_CORO
+           "Deprecated alias for CLIO_GPU_CLANG" OFF)
+    if(CLIO_GPU_YIELD_CORO AND NOT CLIO_GPU_CLANG)
+        message(FATAL_ERROR
+                "CLIO_GPU_YIELD_CORO is now CLIO_GPU_CLANG, which also picks "
+                "the compiler. Re-run with -DCLIO_GPU_CLANG=ON.")
+    endif()
+    if(CLIO_GPU_CLANG)
+        add_compile_definitions(CLIO_YIELD_CORO)
+        message(STATUS "Yieldable GPU kernels: C++20 device coroutines (clang)")
+    endif()
+
+    # SYCL has no second mechanism to choose between. The macro yield system
+    # reaches its per-block state through `extern __shared__`, which SYCL does
+    # not have, so coroutines are not the opt-in there -- they are the only
+    # implementation. Not gated on CLIO_GPU_CLANG: a SYCL device compiler is
+    # always clang (DPC++) or AdaptiveCpp, never nvcc, so the reason that
+    # option exists does not apply.
+    if(CLIO_CORE_ENABLE_SYCL)
+        # Which yield mechanism SYCL gets is decided by the TARGET, not by
+        # preference, because SPIR-V cannot compile a device coroutine at all:
+        # clang's EmitCoroutineBody builds the coroutine-frame PHI assuming the
+        # default address space, and spir64's datalayout puts globals in
+        # addrspace 1 (-G1), so the PHI gets mismatched operand types and
+        # clang aborts on
+        #   "All operands to PHI node must be the same type as the PHI node!"
+        # Measured on Aurora oneAPI 2025.2 / 2025.3.2 AND on intel/llvm
+        # nightly-2026-09-18 (clang 24); -O0/-O1/-O2,
+        # -fno-sycl-early-optimizations and per_kernel split all abort alike.
+        # NVPTX is unaffected only because its datalayout has no -G field, so
+        # globals land in addrspace 0 and the operands happen to agree. Upstream
+        # intel/llvm#20661 was closed by a stale bot, unfixed.
+        #
+        # So: coroutines where they work (NVPTX), the macro mechanism on SPIR-V.
+        # yield_stack.h's YieldTls() already has the SYCL branch the macro path
+        # needs -- it puts the block's YieldSmem in global memory, which is why
+        # `extern __shared__` is not the blocker an older comment here claimed.
+        if(SYCL_TARGET MATCHES "spir64")
+            message(STATUS
+                "Yieldable GPU kernels: macro/Duff's device "
+                "(SPIR-V cannot compile device coroutines)")
+        else()
+            add_compile_definitions(CLIO_YIELD_CORO)
+            message(STATUS "Yieldable GPU kernels: C++20 device coroutines (SYCL)")
+        endif()
+
+        # CTP_ENABLE_SYCL GLOBALLY, and this is a correctness requirement
+        # rather than convenience.
+        #
+        # CUDA can afford to scope CTP_ENABLE_CUDA to the targets that link
+        # ctp::cuda_cxx, because host and device TUs are compiled by
+        # different compilers and a host-only consumer genuinely wants the
+        # non-GPU behaviour. Under SYCL every TU is built by the SAME
+        # compiler, and CTP_ENABLE_SYCL selects between two bodies of the
+        # SAME inline functions in gpu_api.h -- IsDeviceAccessiblePointer,
+        # DeviceAwareMemcpy. Defining it unevenly is an ODR violation whose
+        # symptom is that the linker keeps whichever body it saw first.
+        #
+        # Measured: mem_bdev_transport.cc did not get the define, so its
+        # DeviceAwareMemcpy was a plain std::memcpy, and the CTE's writeback
+        # of a page from device memory segfaulted the runtime worker in
+        # MemBdevTransport::DirectWrite.
+        #
+        # -fsycl stays per-target: only TUs that actually contain kernels
+        # need the device pass, and it is expensive.
+        add_compile_definitions(CTP_ENABLE_SYCL=1)
+        # <sycl/sycl.hpp> is pulled in by macros.h whenever CTP_ENABLE_SYCL
+        # is set, so every TU now needs the header path -- the driver only
+        # adds it under -fsycl, which most TUs do not get.
+        #
+        # Discover it HERE rather than relying on wrp_core_enable_sycl(): that
+        # runs from the component subdirectories, which are added hundreds of
+        # lines below this point. On a cold configure CLIO_SYCL_INCLUDE_DIR was
+        # therefore still empty here, the guard below fell through, and every
+        # host TU failed with "'sycl/sycl.hpp' file not found" -- while a second
+        # configure succeeded off the cached value, making it look intermittent.
+        wrp_core_detect_sycl()
+        if(CLIO_SYCL_INCLUDE_DIR)
+            include_directories(SYSTEM ${CLIO_SYCL_INCLUDE_DIR})
+        endif()
+        # Silence the "<sycl/sycl.hpp> included without -fsycl" pragma in
+        # exactly the TUs where that is deliberate.
+        add_compile_definitions(SYCL_DISABLE_FSYCL_SYCLHPP_WARNING)
+
+        # ...and link libsycl everywhere, for the same reason the define is
+        # global. With CTP_ENABLE_SYCL set, gpu_api.h's inline helpers
+        # (IsDevicePointer, DeviceAwareMemcpy, HasSyclGpuDevice) reference
+        # sycl:: symbols, so any target that touches them needs the library
+        # -- not just the ones compiled with -fsycl. Without this the build
+        # fails late, at link, with "DSO missing from command line" on
+        # whichever unrelated test happened to include gpu_api.h.
+        if(CLIO_SYCL_INCLUDE_DIR)
+            get_filename_component(_clio_sycl_root
+                                   "${CLIO_SYCL_INCLUDE_DIR}" DIRECTORY)
+            if(EXISTS "${_clio_sycl_root}/lib")
+                link_directories("${_clio_sycl_root}/lib")
+                # ...and put it on the RUNPATH, not just the LINK path.
+                # Without this every binary in a SYCL build dies at startup
+                # with "libsycl.so.9: cannot open shared object file" unless
+                # the caller exported LD_LIBRARY_PATH by hand -- which made
+                # cte_gpu_vector_smoke_sycl a test that passes or fails
+                # depending on the developer's shell, and would have made
+                # every SYCL bench ctest entry do the same.
+                list(APPEND CMAKE_BUILD_RPATH "${_clio_sycl_root}/lib")
+                list(APPEND CMAKE_INSTALL_RPATH "${_clio_sycl_root}/lib")
+            endif()
+        endif()
+        link_libraries(sycl)
     endif()
 
     # AddressSanitizer + LeakSanitizer configuration
@@ -1297,9 +1644,14 @@ if(CLIO_CORE_ENABLE_TESTS)
         # 10620 is the HDF5 VOL I/O suite. Any test moved off the default port
         # has to be listed here too, or it silently loses the stray-listener
         # sweep that moving off the default was meant to make unnecessary.
-        # Still missing: 10500/10613/10615/10617 and the 10596-10599 range,
-        # whose suites moved off 9413 without being added here.
-        "_clio_ports='5555 5558 9413 9414 9416 10620'; \
+        #
+        # The ports this comment used to list as "still missing" are now here.
+        # That gap was not cosmetic: 10500 is the GPU stress suite's port
+        # (CLIO_PORT=10500 in its ctest ENVIRONMENT), so a runtime that
+        # outlived its test kept the port and every later test that needed it
+        # failed to bind. In a full run that presents as a CASCADE of dozens of
+        # unrelated red tests, each of which passes when run on its own.
+        "_clio_ports='5555 5558 9413 9414 9416 10500 10596 10597 10598 10599 10613 10615 10617 10620'; \
          if command -v fuser >/dev/null 2>&1; then \
            for _p in \$_clio_ports; do fuser -k \$_p/tcp >/dev/null 2>&1; done; \
          elif command -v ss >/dev/null 2>&1; then \
@@ -1314,8 +1666,30 @@ if(CLIO_CORE_ENABLE_TESTS)
            echo 'clio cleanup: no fuser/ss/lsof; cannot free runtime ports -- back-to-back embedded-runtime tests may fail to bind' >&2; \
          fi")
 
+    # A port sweep only finds processes that still HOLD a port. A leaked daemon
+    # keeps its SHM segments and poisons later tests just as effectively, so
+    # also reap it by name.
+    #
+    # EXACT match, never a prefix. Every test executable here is named
+    # clio_run_<something> and `comm` is truncated to 15 chars, so a
+    # /^clio_run/ pattern also matches clio_run_shutdown_battletest (as
+    # "clio_run_shutdo") and kills the test that is currently running -- that
+    # mistake turned 7 green shutdown battletests red. `pkill -f clio_run` is
+    # worse still: it matches the cleanup shell itself.
+    # NOTE ON THE DOLLARS: CMake passes $ through this string LITERALLY, so
+    # what is written here is what bash receives. awk's field refs must
+    # therefore be $1/$2 (writing $$2 emits $$2, which awk reads as $($2)),
+    # the shell variable must be $_pid (writing $$_pid emits bash's PID glued
+    # to "_pid"), and bash's own PID must be $$. Both mistakes were made here
+    # first and neither is visible in the CMake source -- they were found by
+    # reading the GENERATED command with `ctest -N -V`.
+    set(_clio_proc_kill
+        "ps -eo pid,comm 2>/dev/null \
+           | awk -v self=$$ '($2 == \"clio_run\" || $2 == \"clio_daemon\") && $1 != self {print $1}' \
+           | while read -r _pid; do kill -9 \"$_pid\" 2>/dev/null; done; \
+         true")
     set(_clio_cleanup_cmd
-        "${_clio_port_kill}; \
+        "${_clio_port_kill}; ${_clio_proc_kill}; \
          rm -f /tmp/clio_*.ipc 2>/dev/null; \
          rm -f /tmp/clio_server_timing.log 2>/dev/null; \
          rm -rf /tmp/clio_memfd 2>/dev/null; \

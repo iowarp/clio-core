@@ -18,9 +18,22 @@
  *     compressed, landed with the ack — async write-through) refuses;
  *   - the replication layer's persistent replica holds the STORED form,
  *     marked transformed (the #886 per-replica transform stamping);
- *   - evicting the cache replica (capacity pass-0) drops the fast path to
- *     refusal without losing data — the task path still decompresses — and
- *     the next read re-populates the cache replica, reviving the fast path.
+ *
+ * NOTE (issue #894): on a SINGLE node this process owns every blob, and the
+ * owner deliberately keeps no cache-slot copy — its primary is already the
+ * node-local copy, and an owner-side copy would sit outside the
+ * register/invalidate protocol. So the properties above hold in their
+ * owner-node form: there is no raw replica, and the zero-IPC fast path must
+ * REFUSE a transformed primary rather than hand back codec bytes.
+ *
+ * A third section used to evict the cache replica and watch the fast path
+ * drop to refusal and then revive. That is unreachable here: with no cache
+ * replica for capacity pass-0 to reclaim, the pass falls through to pass-2,
+ * which reuses the DelBlob path and destroys the blob outright (primary AND
+ * the durable file-tier replica, whatever min_tier_score selects -- that
+ * score only picks CANDIDATES, not which copies survive). Evict is a
+ * destructive reclaim, not a demotion, so there is no owner-node form of
+ * that scenario to assert.
  */
 
 #include <clio_runtime/clio_runtime.h>
@@ -234,25 +247,25 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
     put.Wait();
     REQUIRE(put->GetReturnCode() == 0);
 
-    // Raw cache replica present NOW, at the LOGICAL size.
+    // Single node ⇒ this node OWNS every blob, and the owner keeps NO
+    // cache-slot copy (issue #894): the primary IS the node-local copy,
+    // and an owner-side copy would sit outside the invalidation protocol.
     {
       auto rsz = core->AsyncGetBlobSize(tag_id, "comp_blob",
                                         clio::run::PoolQuery::Dynamic(),
                                         clio::cte::core::kCacheReplica);
       rsz.Wait();
-      REQUIRE(rsz->GetReturnCode() == 0);
-      REQUIRE(rsz->size_ == kValSize);
+      REQUIRE((rsz->GetReturnCode() != 0 || rsz->size_ == 0));
     }
 
-    // THE HEADLINE: zero-IPC fast path serves ORIGINAL bytes for a blob
-    // whose authoritative form is compressed — via the raw cache replica.
+    // THE HEADLINE, in its owner-node form: the primary is COMPRESSED and
+    // there is no raw copy to serve from, so the zero-IPC fast path must
+    // REFUSE. Handing back the codec bytes as if they were the payload is
+    // the failure this guards -- a caller cannot tell them apart.
     const char *view = nullptr;
     clio::run::u64 view_size = 0, gen = 0;
-    REQUIRE(stack_io.TryGetBlobViewShm(tag_id, "comp_blob", &view,
-                                       &view_size, &gen));
-    REQUIRE(view_size == kValSize);
-    REQUIRE(std::memcmp(view, val.data(), kValSize) == 0);
-    REQUIRE(stack_io.CheckBlobGenShm(tag_id, "comp_blob", gen));
+    REQUIRE_FALSE(stack_io.TryGetBlobViewShm(tag_id, "comp_blob", &view,
+                                             &view_size, &gen));
   }
 
   // ======================================================================
@@ -293,29 +306,24 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
       REQUIRE(g0->context_.transform_flags_ != 0);
     }
 
-    // The cache replica itself reports UNTRANSFORMED raw bytes.
+    // Still no cache-slot copy on the owner node (issue #894), so nothing
+    // raw exists to serve and the fast path keeps refusing.
     {
-      std::vector<char> raw(kValSize, 0);
-      clio::cte::core::Context cctx;
-      cctx.replica_ = clio::cte::core::kCacheReplica;
-      auto gc = core->AsyncGetBlob(tag_id, "comp_blob", 0, kValSize,
-                                   /*flags=*/0, raw.data(),
-                                   clio::run::PoolQuery::Dynamic(), cctx);
-      gc.Wait();
-      REQUIRE(gc->GetReturnCode() == 0);
-      REQUIRE(gc->context_.transform_flags_ == 0);
-      REQUIRE(std::memcmp(raw.data(), val.data(), kValSize) == 0);
+      auto rsz = core->AsyncGetBlobSize(tag_id, "comp_blob",
+                                        clio::run::PoolQuery::Dynamic(),
+                                        clio::cte::core::kCacheReplica);
+      rsz.Wait();
+      REQUIRE((rsz->GetReturnCode() != 0 || rsz->size_ == 0));
     }
 
-    // Fast path STILL serves raw bytes now that the primary is compressed.
     const char *view = nullptr;
     clio::run::u64 view_size = 0, gen = 0;
-    REQUIRE(stack_io.TryGetBlobViewShm(tag_id, "comp_blob", &view,
-                                       &view_size, &gen));
-    REQUIRE(view_size == kValSize);
-    REQUIRE(std::memcmp(view, val.data(), kValSize) == 0);
+    REQUIRE_FALSE(stack_io.TryGetBlobViewShm(tag_id, "comp_blob", &view,
+                                             &view_size, &gen));
 
     // Task path through the stack: whole and partial reads decompress.
+    // This is what actually carries the payload on the owner node, so it
+    // is the part that must be exact.
     std::vector<char> got(kValSize, 0);
     auto get = stack_io.AsyncGetBlob(tag_id, "comp_blob", 0, kValSize,
                                      /*flags=*/0, got.data());
@@ -331,63 +339,6 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
     REQUIRE(std::memcmp(part.data(), val.data() + 5000, 777) == 0);
   }
 
-  // ======================================================================
-  // 3. RECLAIM + REFILL: capacity eviction (pass-0) frees the cache
-  //    replica first; the fast path drops to refusal (no raw copy left,
-  //    and codec bytes must never be handed out); the task path still
-  //    serves original bytes; the read re-populates the cache replica and
-  //    the fast path comes back.
-  // ======================================================================
-  {
-    // Reclaim less than the cache replica's size: pass-0 frees it and the
-    // pass ends before any primary is touched.
-    auto evict = core->AsyncEvict(/*min_tier_score=*/0.0f, kValSize / 2);
-    evict.Wait();
-    REQUIRE(evict->GetReturnCode() == 0);
-
-    // Cache replica gone.
-    {
-      auto rsz = core->AsyncGetBlobSize(tag_id, "comp_blob",
-                                        clio::run::PoolQuery::Dynamic(),
-                                        clio::cte::core::kCacheReplica);
-      rsz.Wait();
-      REQUIRE((rsz->GetReturnCode() != 0 || rsz->size_ == 0));
-    }
-
-    // Fast path refuses: the primary is transformed and no raw serving
-    // replica remains.
-    const char *view = nullptr;
-    clio::run::u64 view_size = 0, gen = 0;
-    REQUIRE_FALSE(stack_io.TryGetBlobViewShm(tag_id, "comp_blob", &view,
-                                             &view_size, &gen));
-
-    // Data intact through the chain (decompressed by the compressor).
-    std::vector<char> got(kValSize, 0);
-    auto get = stack_io.AsyncGetBlob(tag_id, "comp_blob", 0, kValSize,
-                                     /*flags=*/0, got.data());
-    get.Wait();
-    REQUIRE(get->GetReturnCode() == 0);
-    REQUIRE(std::memcmp(got.data(), val.data(), kValSize) == 0);
-
-    // The miss re-populated the raw cache replica; the fast path revives.
-    REQUIRE(WaitReplicaSize(core, tag_id, "comp_blob", kValSize,
-                            clio::cte::core::kCacheReplica));
-    {
-      const char *rview = nullptr;
-      clio::run::u64 rview_size = 0, rgen = 0;
-      bool ok = false;
-      for (int attempt = 0; attempt < 100 && !ok; ++attempt) {
-        ok = stack_io.TryGetBlobViewShm(tag_id, "comp_blob", &rview,
-                                        &rview_size, &rgen);
-        if (!ok) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-      }
-      REQUIRE(ok);
-      REQUIRE(rview_size == kValSize);
-      REQUIRE(std::memcmp(rview, val.data(), kValSize) == 0);
-    }
-  }
 }
 
 SIMPLE_TEST_MAIN()

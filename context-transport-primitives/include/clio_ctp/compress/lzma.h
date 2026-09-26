@@ -34,7 +34,8 @@
 #ifndef CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Lzma_H_
 #define CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Lzma_H_
 
-#if CTP_ENABLE_COMPRESS
+// Optional codec: see the note in snappy.h.
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_LZMA
 
 #include <lzma.h>
 
@@ -117,6 +118,6 @@ class Lzma : public Compressor {
 
 }  // namespace ctp
 
-#endif  // CTP_ENABLE_COMPRESS
+#endif  // CTP_ENABLE_COMPRESS && CTP_ENABLE_LZMA
 
 #endif  // CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Lzma_H_

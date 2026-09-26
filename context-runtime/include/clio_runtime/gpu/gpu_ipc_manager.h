@@ -38,6 +38,9 @@
 #include "clio_runtime/types.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/gpu/gpu_info.h"
+#include "clio_runtime/gpu/gpu_device_ring.h"
+// blockIdx, for the per-block GetBlockIpcManager under SYCL. Inert on CUDA.
+#include "clio_ctp/util/sycl_cuda_compat.h"
 #include "clio_runtime/gpu/future.h"
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
 
@@ -49,6 +52,25 @@
 
 namespace clio::run {
 namespace gpu {
+
+#if CTP_ENABLE_SYCL
+/** Base of the per-block IpcManager array; see GetBlockIpcManager below.
+ *  Installed by the host with SyclInitBlockIpcManagers.
+ *
+ *  Defined only by the TU that owns the kernels -- see the same rule, and
+ *  the DPC++ double-registration abort that motivates it, in yield_stack.h. */
+#if defined(CLIO_SYCL_KERNEL_TU)
+// device_image_scope for the same reason as the yield globals; see
+// yield_stack.h.
+inline ::sycl::ext::oneapi::experimental::device_global<
+    char *, decltype(::sycl::ext::oneapi::experimental::properties(
+                ::sycl::ext::oneapi::experimental::device_image_scope))>
+    g_sycl_block_ipc;
+inline char *SyclBlockIpcBase() { return g_sycl_block_ipc.get(); }
+#else
+inline char *SyclBlockIpcBase() { return nullptr; }
+#endif
+#endif
 
 /**
  * Producer-only GPU IPC infrastructure manager.
@@ -142,6 +164,24 @@ class IpcManager {
     __shared__ char s_ipc_bytes[sizeof(IpcManager)];
     return reinterpret_cast<IpcManager *>(s_ipc_bytes);
   }
+#elif CTP_ENABLE_SYCL
+  /**
+   * SYCL: the same PER-BLOCK IpcManager, in global memory.
+   *
+   * Callers reachable from a kernel (IpcGpu2Cpu::SendIn, and every submit
+   * site in device_vector.h) resolve it by plain symbol lookup with no
+   * parameter, which is the whole reason the CUDA version is `__shared__`
+   * rather than a kernel argument. SYCL has no `__shared__` a free function
+   * can name, so the array lives in USM and the host installs its base --
+   * exactly the arrangement YieldTls uses for YieldSmem.
+   *
+   * ONE PER BLOCK, not one global: `probe_slot_` is per-block mutable state
+   * that SendIn stamps for the submission in flight. Sharing a single record
+   * across the grid would let blocks overwrite each other's probe slot.
+   */
+  static IpcManager *GetBlockIpcManager() {
+    return reinterpret_cast<IpcManager *>(SyclBlockIpcBase()) + blockIdx.x;
+  }
 #endif  // CTP_IS_GPU_COMPILER
 
   /** Kind of memory a client-registered backend lives in. Visible from
@@ -181,17 +221,73 @@ class IpcManager {
     MemKind kind = MemKind::kPinnedHost;
   };
 
+  /**
+   * Host-side mirror of a device-memory submission ring.
+   *
+   * The ring lives on the GPU, so the CPU cannot Pop() from it -- it copies.
+   * One D2H copy brings back a whole span of submissions, which is the entire
+   * point: per-request bus crossings become per-BATCH crossings. Drained
+   * entries are held here and handed out one at a time, so the worker keeps
+   * its existing one-task-per-poll pacing (batching the WORKER's dequeue is
+   * what deadlocked in d265bdb3 -- this batches the TRANSPORT only).
+   */
+  struct GpuRingMirror {
+    clio::run::GpuDeviceRing *dev_ring = nullptr;  ///< device address of the ring
+    void *stream = nullptr;                    ///< dedicated copy stream
+    /** Slots consumed so far; the device sees this via a published tail_. */
+    unsigned long long tail = 0;
+    /** Entries drained but not yet handed to a worker. */
+    std::vector<clio::run::GpuRingEntry> pending;
+    size_t pending_pos = 0;                    ///< read cursor into `pending`
+    /**
+     * The ring payload, in PINNED HOST memory. The host reads these directly;
+     * the device writes them through the mapped device pointers stored in the
+     * ring. No staging and no copy is involved on the read path any more.
+     */
+    clio::run::GpuRingEntry *host_entries = nullptr;
+    unsigned int *host_ready = nullptr;
+  };
+
   /** Per-physical-GPU state: queue + queue backend + client backends. */
   struct PerGpuDeviceState {
     /** Pinned host backend holding the GpuTaskQueue. */
     char *queue_backend = nullptr;
     size_t queue_backend_size = 0;
+    /**
+     * cudaMallocHost (true) vs cudaMallocManaged (false) -- they need
+     * different free calls, and which one was used depends on whether the
+     * device ring was allocated. See ServerInitGpuQueues.
+     */
+    bool queue_backend_pinned = false;
     /** The actual GpuTaskQueue object, constructed inside queue_backend. */
     ctp::ipc::FullPtr<clio::run::GpuTaskQueue> gpu2cpu_queue;
     /** AllocatorId → registered client backend. */
     std::unordered_map<u64, ClientBackend> client_backends;
     u32 gpu_id = 0;
+    /** Device-ring state; dev_ring stays null when the legacy queue is used. */
+    GpuRingMirror ring;
   };
+
+  /**
+   * Drain up to `max_out` submissions from the device ring into the mirror's
+   * pending list, and return the next one. Returns false when nothing is
+   * ready. Host-only; implemented in gpu2cpu_init_hip.cc beside the ring's
+   * allocation so the copy logic sits next to the layout it depends on.
+   */
+  CLIO_RUN_GPU_API bool RingNext(u32 gpu_id, clio::run::GpuRingEntry *out);
+
+  /**
+   * The dedicated copy stream for a device's ring, or null.
+   *
+   * SendOut publishes completions on it: issuing the POD writeback and then
+   * the completion flag as two async copies on ONE stream keeps
+   * payload-before-flag ordering (the invariant the kernel's release signal
+   * depends on) without the caller blocking on either.
+   */
+  void *GetRingStream(u32 gpu_id) const {
+    if (gpu_id >= per_gpu_devices_.size()) return nullptr;
+    return per_gpu_devices_[gpu_id].ring.stream;
+  }
 
   std::vector<PerGpuDeviceState> per_gpu_devices_;
 
@@ -222,6 +318,7 @@ class IpcManager {
     IpcManagerGpuInfo info;
     if (gpu_id >= per_gpu_devices_.size()) return info;
     info.gpu2cpu_queue = per_gpu_devices_[gpu_id].gpu2cpu_queue.ptr_;
+    info.gpu2cpu_ring = per_gpu_devices_[gpu_id].ring.dev_ring;
     info.gpu_id = gpu_id;
     return info;
   }
@@ -280,9 +377,50 @@ class IpcManager {
 
 #if CTP_IS_SYCL_COMPILER
 
-#define CLIO_GPU_INIT(gpu_info, ipc_ptr)                                  \
-  clio::run::gpu::IpcManager *g_ipc_manager_ptr = (ipc_ptr);                        \
-  g_ipc_manager_ptr->ClientInitGpu(gpu_info);                                 \
+/**
+ * Allocate and publish the per-block IpcManager array. Call ONCE on the host
+ * before launching any kernel that submits tasks, with the widest grid those
+ * kernels will use.
+ *
+ * gpu_info is stamped here rather than at kernel entry: it is the same value
+ * for every block and every launch, so writing it once on the host removes a
+ * store and a barrier from the kernel prologue. The CUDA path cannot do this
+ * -- its IpcManager is __shared__ and therefore born fresh, and uninitialized,
+ * at every launch.
+ */
+namespace clio::run::gpu {
+inline void SyclInitBlockIpcManagers(clio::run::u32 nblocks,
+                                     const clio::run::IpcManagerGpuInfo &gpu_info) {
+  auto &q = ctp::GpuApi::SyclQueue();
+  const size_t bytes = static_cast<size_t>(nblocks) * sizeof(IpcManager);
+  char *base = static_cast<char *>(sycl::malloc_device(bytes, q));
+  q.memset(base, 0, bytes).wait();
+  clio::run::IpcManagerGpuInfo info = gpu_info;
+  q.parallel_for(sycl::range<1>(nblocks), [=](sycl::id<1> i) {
+     reinterpret_cast<IpcManager *>(base)[i[0]].gpu_info_ = info;
+     reinterpret_cast<IpcManager *>(base)[i[0]].probe_slot_ = kProbeNoSlot;
+   }).wait();
+#if defined(CLIO_SYCL_KERNEL_TU)
+  q.copy(&base, g_sycl_block_ipc, 1).wait();
+#else
+  // Unreachable in practice: this function submits kernels, so only a
+  // -fsycl TU can call it, and the one that does owns the device global.
+  (void)base;
+#endif
+}
+}  // namespace clio::run::gpu
+
+/**
+ * SYCL: nothing to do at kernel entry -- SyclInitBlockIpcManagers already
+ * stamped gpu_info into every block's record on the host, and
+ * GetBlockIpcManager finds this block's by symbol lookup. The names are kept
+ * so a kernel body reads the same as its CUDA twin.
+ */
+#define CLIO_GPU_INIT(gpu_info, ipc_ptr)                                      \
+  (void)(gpu_info);                                                           \
+  (void)(ipc_ptr);                                                            \
+  clio::run::gpu::IpcManager *g_ipc_manager_ptr =                             \
+      clio::run::gpu::IpcManager::GetBlockIpcManager();                       \
   clio::run::gpu::IpcManager &g_ipc_manager = *g_ipc_manager_ptr
 
 #else  // CUDA / ROCm

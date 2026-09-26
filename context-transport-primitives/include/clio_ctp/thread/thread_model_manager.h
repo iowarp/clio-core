@@ -57,7 +57,10 @@
 #define CTP_THREAD_MODEL \
   ctp::CrossSingleton<CTP_DEFAULT_THREAD_MODEL>::GetInstance()
 #define CTP_THREAD_MODEL_T ctp::CTP_DEFAULT_THREAD_MODEL*
-#elif CTP_IS_GPU
+#elif CTP_IS_DEVICE_PASS
+// CTP_IS_DEVICE_PASS, not CTP_IS_GPU: the SYCL device pass is a device pass
+// too, and leaving it out left CTP_THREAD_MODEL undefined there -- the host
+// branch above is gated on CTP_IS_HOST, which the SYCL device pass is not.
 #define CTP_THREAD_MODEL \
   ctp::CrossSingleton<CTP_DEFAULT_THREAD_MODEL_GPU>::GetInstance()
 #define CTP_THREAD_MODEL_T ctp::CTP_DEFAULT_THREAD_MODEL_GPU*

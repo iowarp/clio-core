@@ -1,0 +1,85 @@
+# 2-node distributed GENERATIONAL PUT/GET -- CTE only, no GPU work.
+#
+# Two nodes, ONE blob, two non-overlapping regions that SWAP each iteration:
+# a node writes its region and then reads the peer's, naming the generation.
+# There is no barrier between the put and the get -- the generation is the
+# only thing ordering them, which is the claim under test.
+#
+#   HOST_WORKSPACE=$(pwd) docker compose up --abort-on-container-failure
+x-node: &node
+  image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+  init: true
+  runtime: nvidia
+  stop_grace_period: 5s
+  security_opt:
+    - seccomp:unconfined
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  volumes:
+    - ${HOST_WORKSPACE:?set HOST_WORKSPACE to the repo root}:/workspace:rw
+    - ${CUDA_HOME:-/usr/local/cuda-13.3}:/usr/local/cuda:ro
+    - /usr/lib/x86_64-linux-gnu/nvcomp:/usr/lib/x86_64-linux-gnu/nvcomp:ro
+    - ${CUSZP_LIB_DIR:-/tmp}:/opt/cuszp-lib:ro
+  working_dir: /workspace
+  mem_limit: 8g
+
+x-env: &common-env
+  - NVIDIA_VISIBLE_DEVICES=all
+  - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+  - CLIO_NUM_CONTAINERS=2
+  - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_generation/gvgen_conf.yaml
+  - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
+  - GVGEN_ITERS=${GVGEN_ITERS:-8}
+  - GVGEN_BARRIER_TIMEOUT=${GVGEN_BARRIER_TIMEOUT:-180}
+  # The harness config composes a RAM tier per node, so client-driven
+  # registration is off here (same as distributed/).
+  - GVGEN_REGISTER_TARGET=${GVGEN_REGISTER_TARGET:-0}
+
+services:
+  gvgen-node1:
+    <<: *node
+    container_name: gvgen-node1
+    hostname: gvgen-node1
+    networks:
+      gvgen-cluster: { ipv4_address: 172.24.0.10 }
+    environment:
+      - NODE_ID=1
+      - NODE_IP=172.24.0.10
+      - GVGEN_START_DELAY=0
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CLIO_NUM_CONTAINERS=2
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_generation/gvgen_conf.yaml
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
+      - GVGEN_ITERS=${GVGEN_ITERS:-8}
+      - GVGEN_BARRIER_TIMEOUT=${GVGEN_BARRIER_TIMEOUT:-180}
+      - GVGEN_REGISTER_TARGET=${GVGEN_REGISTER_TARGET:-0}
+    command: ["sh", "-c", "sleep $${GVGEN_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_cte_generation_distributed"]
+    entrypoint: []
+
+  gvgen-node2:
+    <<: *node
+    container_name: gvgen-node2
+    hostname: gvgen-node2
+    networks:
+      gvgen-cluster: { ipv4_address: 172.24.0.11 }
+    environment:
+      - NODE_ID=2
+      - NODE_IP=172.24.0.11
+      - GVGEN_START_DELAY=6
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CLIO_NUM_CONTAINERS=2
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_generation/gvgen_conf.yaml
+      - LD_LIBRARY_PATH=/workspace/${BUILD_DIR:-build}/bin:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/opt/cuszp-lib:/usr/local/lib
+      - GVGEN_ITERS=${GVGEN_ITERS:-8}
+      - GVGEN_BARRIER_TIMEOUT=${GVGEN_BARRIER_TIMEOUT:-180}
+      - GVGEN_REGISTER_TARGET=${GVGEN_REGISTER_TARGET:-0}
+    command: ["sh", "-c", "sleep $${GVGEN_START_DELAY:-0}; exec /workspace/${BUILD_DIR:-build}/bin/test_cte_generation_distributed"]
+    entrypoint: []
+
+networks:
+  gvgen-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.24.0.0/24

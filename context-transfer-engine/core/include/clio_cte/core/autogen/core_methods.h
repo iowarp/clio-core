@@ -83,7 +83,21 @@ GLOBAL_CROSS_CONST clio::run::u32 kRegisterReplicaContainer = 49;
  */
 GLOBAL_CROSS_CONST clio::run::u32 kGetResidency = 50;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 51;
+// Batched POD paging: one task carries many page requests. A page fault costs
+// ~110 us of round trip -- GPU->CPU submission, worker pickup, CTE and bdev
+// traversal, completion -- against ~6 us for the 256 KB device-to-device copy
+// it performs, so data movement is about 5% of a read and the trip is the
+// rest. These amortize the trip across a batch, which is the only change that
+// touches the dominant term.
+//
+// NUMBERED FROM 51, not 50: kGetResidency landed on dev while this branch was
+// out, and both had claimed 50. The id is a wire value every node decodes, so
+// the branch's own additions moved rather than the one already integrated.
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiPutBlob = 51;
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiGetBlob = 52;
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiScore = 53;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 54;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -128,6 +142,9 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[48] = "MultiPutBlob";
     v[49] = "RegisterReplicaContainer";
     v[50] = "GetResidency";
+    v[51] = "PodMultiPutBlob";
+    v[52] = "PodMultiGetBlob";
+    v[53] = "PodMultiScore";
     return v;
   }();
   return names;

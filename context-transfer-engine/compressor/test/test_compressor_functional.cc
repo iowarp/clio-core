@@ -46,8 +46,10 @@
  * These tests require a fully initialized CTE environment with core pool.
  */
 
+#include "clio_ctp/util/gpu_api.h"
 #include "simple_test.h"
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <vector>
 #include <random>
@@ -82,6 +84,28 @@ namespace CompLib {
   constexpr int ZLIB = 9;
   constexpr int ZSTD = 10;
   constexpr int NVCOMP_LZ4 = 11;  // GPU compressor (requires nvcomp build)
+}
+
+/**
+ * Is a codec actually COMPILED INTO this build?
+ *
+ * The registry's `make` returns nullptr when a backend was not built, which is
+ * how CompressorFactory already reports "unavailable" everywhere else. These
+ * tests used to hardcode CompLib::LZ4 and REQUIRE a zero return code, so on a
+ * machine with liblz4 installed but liblz4-DEV missing (the runtime .so is
+ * there, the header is not, so CMake sets CLIO_CTP_ENABLE_LZ4=OFF) three test
+ * cases failed. They were reporting the absence of an OPTIONAL dependency as a
+ * product defect.
+ *
+ * Skipping is the honest behaviour: an optional codec that was not built is
+ * not a failing codec. The GPU cases in this file already do exactly this for
+ * a missing CUDA device.
+ */
+bool CodecBuiltIn(const std::string &name) {
+  // GetPreset is the factory's PUBLIC availability check: it returns nullptr
+  // when the backend was not compiled in (FindByBaseId is private).
+  return ctp::CompressionFactory::GetPreset(
+             name, ctp::CompressionPreset::BALANCED) != nullptr;
 }
 
 /**
@@ -127,6 +151,11 @@ std::vector<char> GenerateTestData(size_t size, const std::string& pattern) {
  */
 void InitializeClio() {
   // Initialize CLIO Runtime runtime in client mode with runtime
+  // Compose a bdev before init: CreateCorePool below needs one, and without
+  // it pool creation fails silently and every task addressed to those pools
+  // hangs forever.
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF",
+                          "test_compressor_functional_config.yaml", 1);
   bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (!success) {
     throw std::runtime_error("Failed to initialize Clio runtime");
@@ -144,18 +173,12 @@ void CleanupClio() {
  * Create and return pool ID for core chimod
  */
 clio::run::PoolId CreateCorePool() {
-  clio::run::PoolId core_pool_id = clio::run::PoolId(1, 1);
-  clio::cte::core::Client core_client;
-
-  clio::cte::core::CreateParams core_params;
-  auto create_task = core_client.AsyncCreate(
-      clio::run::PoolQuery::Local(),
-      "test_core_pool",
-      core_pool_id,
-      core_params);
-  create_task.Wait();
-
-  return core_pool_id;
+  // Use the CTE core composed by test_compressor_functional_config.yaml.
+  //
+  // This used to build a pool with a default CreateParams, which carries no
+  // storage targets -- so the PutBlob that Compress performs at the end had
+  // nowhere to land and returned an error. The composed pool has a RAM tier.
+  return clio::run::PoolId(513, 0);
 }
 
 /**
@@ -242,6 +265,10 @@ TEST_CASE("Basic Compress and Store", "[compressor][functional][basic]") {
   ctp::ipc::ShmPtr<> blob_data = shm_buffer.shm_.template Cast<void>();
 
   Context context;
+  if (!CodecBuiltIn("lz4")) {
+    INFO("lz4 not built into this CTP (liblz4-dev missing); skipping");
+    return;
+  }
   context.compress_lib_ = CompLib::LZ4;
   context.compress_preset_ = 2;
 
@@ -282,6 +309,10 @@ TEST_CASE("Decompress and Retrieve", "[compressor][functional][basic]") {
   ctp::ipc::ShmPtr<> put_blob_data = put_buffer.shm_.template Cast<void>();
 
   Context context;
+  if (!CodecBuiltIn("lz4")) {
+    INFO("lz4 not built into this CTP (liblz4-dev missing); skipping");
+    return;
+  }
   context.compress_lib_ = CompLib::LZ4;
   context.compress_preset_ = 2;
 
@@ -384,6 +415,16 @@ TEST_CASE("Multiple Compression Libraries", "[compressor][functional][libraries]
 
   for (const auto& [lib_id, lib_name] : libraries) {
     SECTION(lib_name) {
+      // Same reasoning as the single-codec cases: a codec that was not built
+      // is not a codec that fails. Without this, "Multiple Compression
+      // Libraries" reported a red for LZ4 on any machine lacking liblz4-dev.
+      std::string lib_lower = lib_name;
+      std::transform(lib_lower.begin(), lib_lower.end(), lib_lower.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      if (!CodecBuiltIn(lib_lower)) {
+        INFO(lib_name + " not built into this CTP; skipping");
+        continue;
+      }
       auto shm_buffer = fixture.AllocateAndCopyData(test_data);
       REQUIRE(!shm_buffer.IsNull());
 
@@ -520,7 +561,7 @@ TEST_CASE("Error Handling - Invalid Parameters", "[compressor][functional][error
  */
 TEST_CASE("NvComp GPU Round-trip", "[compressor][functional][nvcomp][gpu]") {
   int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+  if ((device_count = ctp::GpuApi::GetDeviceCount()) == 0) {
     INFO("No CUDA device available; skipping nvcomp functional test");
     return;
   }

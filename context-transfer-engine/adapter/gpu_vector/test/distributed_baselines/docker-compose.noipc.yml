@@ -1,0 +1,13 @@
+# Overrides `ipc: host` for cross-container NVSHMEM experiments.
+#
+# distributed_md/'s cluster sets ipc: host so NVSHMEM's peer transport can pass
+# CUDA IPC handles between PEs in ONE container. Across containers that setting
+# is actively harmful: a shared IPC namespace makes UCX believe the peer is
+# reachable over posix/shm, so it selects shared memory and then cannot reach
+# anything -- "no active messages transport ... posix/memory - Destination is
+# unreachable" -- regardless of UCX_TLS.
+services:
+  md-node1:
+    ipc: private
+  md-node2:
+    ipc: private

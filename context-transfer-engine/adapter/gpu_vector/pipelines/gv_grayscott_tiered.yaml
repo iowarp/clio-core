@@ -1,0 +1,259 @@
+# TIERED EVALUATION: what a prefetcher is worth as the tier stack deepens.
+#
+# WHY THIS EXISTS. gv_grayscott_pressure swept the CACHE axis and found it
+# largely inert above the 8-plane sliding window: Gray-Scott's reuse is a
+# window, the cache captures it at 8 planes per block, and no further cache
+# buys anything. That is a real result and it is also a dead end -- it says
+# the remaining cost is not "how many planes are resident on the GPU" but
+# WHERE THE NON-RESIDENT ONES LIVE. This sweep is that axis.
+#
+# WHAT PREFETCHING IS HERE. Not a cache fill -- the demand fetch is untouched.
+# It is a bulk rescore through the CTE's PodMultiScore API, issued from the
+# yieldable driver's gap between rounds, that moves a page UP THE TIER STACK
+# before the fault asks for it. See ../PREFETCH.md.
+#
+# THE THREE ROWS.
+#
+#   hbm            one tier. A CONTROL: there is nowhere to promote FROM, so
+#                  every prefetch configuration must land on top of `none`
+#                  within noise. If it does not, the prefetcher is costing
+#                  something it should not, and the other two rows cannot be
+#                  read until that is explained.
+#   hbm+ram        two tiers, the configuration every existing Gray-Scott
+#                  number was measured on.
+#   hbm+ram+nvme   three tiers. The only row where a promotion hides real
+#                  latency, because it is the only row with a slow tier.
+#
+# THE FOUR COLUMNS.
+#
+#   none     today's behaviour, the baseline.
+#   stride   the GENERIC control: last-two-cursors -> stride -> promote ahead,
+#            in ONE region, with no demotion. It is right about u's current
+#            plane and blind to v and to both output regions.
+#   gs       the workload-specific policy: promote z+1..z+L across all four
+#            regions, demote z-2 of the inputs to cold and of the outputs only
+#            to warm (they are re-read next step -- see grayscott_prefetch.h).
+#   gs-nodem gs with demotion off, which isolates the promotion half.
+#
+# `stride` is not padding. A workload-specific prefetcher beating `none`
+# proves prefetching helps; it does NOT prove that workload-SPECIFIC
+# prefetching helps. The gap between `stride` and `gs` is the only thing in
+# this sweep that answers that, and it is the claim the design rests on.
+#
+# THE INVARIANT THAT MUST HOLD IN EVERY CELL: v_checksum is identical across
+# all four prefetch settings within a tier row. A prefetcher moves pages
+# between tiers and nothing else; if the answer moves, the hint is not a hint
+# and the run is void. The post section checks this and says so loudly.
+#
+# WHAT TO READ. Timings on this workload move ~26% run to run, so:
+#   - faults        must be UNCHANGED by prefetching. A prefetcher that
+#                   changes the fault count is doing something other than what
+#                   it claims -- the same pages are demanded either way.
+#   - kHBM used     is the direct evidence the hints landed. Note that with no
+#                   prefetcher this reads ZERO: the vector writes pages at
+#                   blob score 0.5 (kVectorBlobScore) and MaxBwDpe splits on
+#                   target_score <= blob_score, so a tier scored 1.0 is
+#                   excluded from the preferred group for every page. THE
+#                   FAST TIER IS UNREACHABLE WITHOUT A HINT. That is a finding
+#                   in its own right and it is why the `hbm` control row
+#                   matters.
+#   - pf_sent       a run reporting 0 is not a prefetching run whatever its
+#                   timings say.
+#   - pf_notfound   EXPECTED, not a fault: the lookahead runs past the written
+#                   frontier, and on step 0 the two output regions have no
+#                   blobs at all because the seed writes only u and v.
+#                   pf_errors is the one that must be 0.
+#
+# GEOMETRY. 2048 MB grid at 256 KB pages = 256x256 planes, 2048 of them across
+# four fields, 8 blocks. Deliberately smaller than the pressure sweep's 10 GB:
+# this sweep has 12 cells rather than 6 and each one wants a storage tier that
+# is actually written, so a cell has to finish in minutes rather than an hour.
+#
+# Requires: clio_grayscott_paged_bench on PATH (<build>/bin), a CUDA device,
+# and enough space under output_dir for the storage tier.
+#
+# Usage (from the repo root):
+#   export PATH=$PWD/build-gv/bin:$PATH
+#   jarvis repo add ./jarvis_clio_core
+#   jarvis ppl run yaml \
+#     context-transfer-engine/adapter/gpu_vector/pipelines/gv_grayscott_tiered.yaml
+
+config:
+  name: gv_grayscott_tiered
+  env:
+    CLIO_PREFAULT: "2GB"
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gpu_vector_grayscott
+      pkg_name: gs
+
+      data_mb: 2048
+      page_kb: 256
+      blocks: 8
+      threads: 256
+      # 16 planes per block = 2x the 8-plane window. Above the floor so the
+      # cache is not itself the bottleneck, and far enough below full
+      # residency that the tier the miss is served from still matters.
+      slots: 16
+      cache_mb: 0
+      cache_frac: 0.0
+      steps: 4
+      repeat: 3
+
+      # ---- the tier axis, driven by the loop below ----
+      hbm_mb: 128
+      hbm_only: false
+      nvme_mb: 0
+
+      # ---- the prefetch axis, driven by the loop below ----
+      prefetch: none
+      lookahead: 4
+      pf_hot: 1.0
+      pf_warm: 0.2
+      pf_cold: 0.0
+      pf_demote: true
+
+      Du: 0.2
+      Dv: 0.1
+      F: 0.02
+      K: 0.048
+      dt: 1.0
+
+      vram_budget_gb: 7.0
+      timeout_sec: 3600
+      output_dir: "/tmp/gv_gs_tiered"
+
+vars:
+  # THREE TIER STACKS x FOUR PREFETCH SETTINGS = 12 cells.
+  #
+  # The two lists are zipped INDEPENDENTLY of each other (see `loop`): the
+  # tier list is the outer sweep and the prefetch list the inner, so every
+  # prefetcher is measured on every stack. hbm_only is what removes the host
+  # tier; nvme_mb is what adds the storage tier.
+  #
+  # pf_cold tracks the stack. With no storage tier there is nowhere below
+  # warm to go, and a rescore that moves no bytes still costs a task -- so the
+  # single-tier and two-tier rows demote to 0.2, not to 0.0.
+  gs.hbm_only:  [true, false, false]
+  gs.nvme_mb:   [0,    0,     8192]
+  gs.pf_cold:   [0.2,  0.2,   0.0]
+
+  gs.prefetch:  [none, stride, gs,   gs]
+  gs.pf_demote: [true, true,   true, false]
+
+loop:
+  - [gs.hbm_only, gs.nvme_mb, gs.pf_cold]
+  - [gs.prefetch, gs.pf_demote]
+
+repeat: 1
+
+run_timeout: 14400
+
+output: "/home/llogan/Documents/Projects/iowarp/core/results/gv_grayscott_tiered"
+
+post: |
+  import re, glob, os
+  ANSI = re.compile(r'\x1b\[[0-9;]*m')
+
+  def field(line, key, cast=float):
+      m = re.search(r'(?:^|\s)' + key + r'=([-0-9.eE+]+)', line)
+      return cast(m.group(1)) if m else None
+
+  def sfield(line, key):
+      m = re.search(r'(?:^|\s)' + key + r'=(\S+)', line)
+      return m.group(1) if m else None
+
+  # Each cell writes its own log; the GRAYSCOTT line carries the settings, so
+  # the rows can be reconstructed without trusting the file ordering.
+  rows = []
+  for fn in sorted(glob.glob('/tmp/gv_gs_tiered/*.log')):
+      try:
+          txt = ANSI.sub('', open(fn, errors='replace').read())
+      except OSError:
+          continue
+      summary, tier = None, None
+      for ln in txt.splitlines():
+          if ln.startswith('GRAYSCOTT ') and 'ms=' in ln:
+              summary = ln
+          elif ln.startswith('TIER SPLIT:'):
+              tier = ln
+      if summary is None:
+          continue
+      hbm_used = None
+      if tier:
+          m = re.search(r'kHBM used=(\d+)MiB', tier)
+          if m:
+              hbm_used = int(m.group(1))
+      rows.append({
+          'pf':       sfield(summary, 'prefetch') or '?',
+          'ms':       field(summary, 'ms'),
+          'faults':   field(summary, 'faults'),
+          'chk':      field(summary, 'v_checksum'),
+          'sent':     field(summary, 'pf_sent'),
+          'dedup':    field(summary, 'pf_deduped'),
+          'promo':    field(summary, 'pf_promote'),
+          'demo':     field(summary, 'pf_demote'),
+          'err':      field(summary, 'pf_errors'),
+          'nf':       field(summary, 'pf_notfound'),
+          'hbm_used': hbm_used,
+          'file':     os.path.basename(fn),
+      })
+
+  out = ['Gray-Scott tiered evaluation: prefetching as a tier hint',
+         '2048 MB grid, 256 KB pages (256x256 planes), 8 blocks, 16 slots/blk',
+         '']
+  out.append(f"  {'prefetch':>10} {'ms':>8} {'faults':>8} {'kHBM MB':>8} "
+             f"{'pf_sent':>8} {'dedup':>8} {'promo':>7} {'demo':>7} "
+             f"{'err':>5} {'notfnd':>7}")
+  for r in rows:
+      def f(v, spec):
+          return format(v, spec) if v is not None else '-'
+      out.append(f"  {r['pf']:>10} {f(r['ms'], '8.0f')} "
+                 f"{f(r['faults'], '8.0f')} {f(r['hbm_used'], '8d') if r['hbm_used'] is not None else '-':>8} "
+                 f"{f(r['sent'], '8.0f')} {f(r['dedup'], '8.0f')} "
+                 f"{f(r['promo'], '7.0f')} {f(r['demo'], '7.0f')} "
+                 f"{f(r['err'], '5.0f')} {f(r['nf'], '7.0f')}")
+
+  # ---- THE INVARIANT ---------------------------------------------------
+  # A prefetcher moves pages between tiers and changes nothing else. If the
+  # checksum moves, the hint is not a hint and every number above is void.
+  # Checked here rather than left to a reader, because the failure is silent:
+  # a wrong checksum still prints as a number.
+  out += ['', 'INVARIANT -- the answer must not depend on the prefetcher:']
+  chks = sorted({round(r['chk'], 6) for r in rows if r['chk'] is not None})
+  if len(chks) <= 1:
+      out.append(f'  OK: one checksum across every cell ({chks[0] if chks else "none"})')
+  else:
+      out.append(f'  *** VIOLATED: {len(chks)} distinct checksums: {chks}')
+      out.append('  A prefetch hint changed the ANSWER. Nothing above is usable.')
+      out.append('  (Standing caveat: this workload is independently known to')
+      out.append('   be non-reproducible run to run at ~3e-04, so compare the')
+      out.append('   spread against that before concluding the hint is at fault.)')
+
+  # A prefetcher that sent nothing is not a prefetcher, whatever it is named.
+  out += ['', 'SANITY -- a named prefetcher that sent nothing did nothing:']
+  # A COUNTER, not a slice of the tail. Each row can raise two complaints, so
+  # "were there any ***" cannot be answered by looking at a fixed number of
+  # trailing lines -- that reported OK underneath real violations.
+  bad = 0
+  for r in rows:
+      if r['pf'] not in (None, 'none') and not r['sent']:
+          out.append(f"  *** {r['file']}: prefetch={r['pf']} but pf_sent=0")
+          bad += 1
+      if r['err']:
+          out.append(f"  *** {r['file']}: pf_errors={r['err']:.0f} "
+                     f"(pf_notfound is fine; pf_errors is not)")
+          bad += 1
+  if bad == 0:
+      out.append('  OK')
+
+  out += ['',
+          'READING THIS. faults must be UNCHANGED by prefetching -- the same',
+          'pages are demanded either way; only the tier they are served from',
+          'moves. kHBM used is the direct evidence the hints landed, and it',
+          'reads 0 for every none row because the vector writes pages at blob',
+          'score 0.5 and MaxBwDpe excludes a tier scored above that: the fast',
+          'tier is UNREACHABLE without a hint. Timings move ~26% run to run on',
+          'this workload, so treat ms as corroboration, not as the result.']
+
+  open('grayscott_tiered_summary.txt', 'w').write('\n'.join(out) + '\n')
+  logger.info('post: wrote grayscott_tiered_summary.txt')

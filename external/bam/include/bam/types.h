@@ -53,6 +53,20 @@ struct PageCacheDeviceState {
   uint32_t *page_states;     // GPU VRAM: per-page state (atomics)
   uint64_t *page_tags;       // GPU VRAM: per-page storage offset tag
   uint32_t *page_locks;      // GPU VRAM: per-page spinlocks
+  /**
+   * GPU VRAM: per-page reference count -- the PIN behind acquire_page.
+   *
+   * Without it `release_page` was a no-op and a slot could be re-tagged
+   * while another block was mid-read of it, which is why out-of-core runs
+   * above 2 blocks were documented as "not a result". A takeover now waits
+   * for the count to drain.
+   *
+   * CONTRACT: a thread may hold at most ONE pin at a time. The cache is
+   * direct-mapped, so pinning page A and then missing on page B that maps to
+   * the same slot would wait on yourself. bam_ptr::update_page releases
+   * before it acquires for exactly this reason.
+   */
+  uint32_t *page_refs;
   size_t    page_size;
   uint32_t  num_pages;
   uint32_t  page_shift;      // log2(page_size)

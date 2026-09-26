@@ -1,0 +1,612 @@
+/* Copyright 2024 IOWarp - BSD 3-Clause License */
+/**
+ * What does the vector ABSTRACTION cost, with no I/O involved at all?
+ *
+ * Gray-Scott reaction-diffusion, run twice over an identical grid with an
+ * identical launch configuration: once against a plain cudaMalloc'd float*,
+ * once against a gpu_vector sized so the whole grid is resident. Nothing is
+ * faulted, evicted or flushed during timing -- every page is made resident
+ * first -- so the difference between the two numbers is purely the cost of
+ * going through at()/operator[] instead of dereferencing a pointer.
+ *
+ * That cost is not academic. A 5-point stencil does 12 element accesses per
+ * cell per step, and each one resolves a page: a bounds computation, a
+ * compare against the per-thread cached page, and a load of the page's data
+ * pointer. If that is expensive it dominates any workload that touches memory
+ * more than once per byte fetched, which is most of them.
+ *
+ * Both versions are checked against each other cell by cell: the vector must
+ * produce bit-identical results, or the timing means nothing.
+ */
+
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/gpu/gpu_ipc_manager.h>
+#include <clio_cte/core/core_client.h>
+#include "bench_flush_data.h"
+#include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_ctp/util/gpu_api.h>
+
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <clio_runtime/gpu/yieldable.h>
+#include <clio_runtime/gpu/yield_stack.h>
+
+namespace gv = clio::cte::gpu_vector;
+namespace gy = clio::run::gpu;
+using clio::run::u32;
+using clio::run::u64;
+
+namespace {
+constexpr float kDu = 0.16f;
+constexpr float kDv = 0.08f;
+constexpr float kF = 0.060f;
+constexpr float kK = 0.062f;
+constexpr float kDt = 1.0f;
+}  // namespace
+
+/** Initial condition: mostly u=1, a seeded square of v. */
+CTP_INLINE_CROSS_FUN void InitCell(u64 idx, u32 dim, float *u, float *v) {
+  const u32 y = static_cast<u32>(idx / dim);
+  const u32 x = static_cast<u32>(idx % dim);
+  const bool seed = (x > dim / 2 - dim / 16 && x < dim / 2 + dim / 16 &&
+                     y > dim / 2 - dim / 16 && y < dim / 2 + dim / 16);
+  *u = seed ? 0.50f : 1.0f;
+  *v = seed ? 0.25f : 0.0f;
+}
+
+/** Periodic neighbour index. */
+CTP_INLINE_CROSS_FUN u64 Wrap(int c, u32 dim) {
+  if (c < 0) return static_cast<u64>(c + static_cast<int>(dim));
+  if (c >= static_cast<int>(dim)) return static_cast<u64>(c - static_cast<int>(dim));
+  return static_cast<u64>(c);
+}
+
+/** One Gray-Scott step on RAW pointers. */
+__global__ void GrayScottRaw(const float *ui, const float *vi, float *uo,
+                             float *vo, u32 dim) {
+  const u64 cells = static_cast<u64>(dim) * dim;
+  for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
+       idx += static_cast<u64>(gridDim.x) * blockDim.x) {
+    const int x = static_cast<int>(idx % dim);
+    const int y = static_cast<int>(idx / dim);
+    const u64 l = y * dim + Wrap(x - 1, dim);
+    const u64 r = y * dim + Wrap(x + 1, dim);
+    const u64 d = Wrap(y - 1, dim) * dim + x;
+    const u64 t = Wrap(y + 1, dim) * dim + x;
+    const float u = ui[idx], v = vi[idx];
+    const float lu = ui[l] + ui[r] + ui[d] + ui[t] - 4.0f * u;
+    const float lv = vi[l] + vi[r] + vi[d] + vi[t] - 4.0f * v;
+    const float uvv = u * v * v;
+    uo[idx] = u + kDt * (kDu * lu - uvv + kF * (1.0f - u));
+    vo[idx] = v + kDt * (kDv * lv + uvv - (kF + kK) * v);
+  }
+}
+
+/**
+ * The same step, through the vector, using the INDEXING FAST PATH.
+ *
+ * HoldPage resolves each field's page once, up front (everything is resident
+ * by construction, so each co_await completes on the fast path with no
+ * suspension); the loop then indexes through the guards, which touch the held
+ * page with no resolution at all. This is only valid while every access stays
+ * inside the held page -- here that means one page per field, which the
+ * caller guarantees before launching.
+ */
+__device__ gy::YCoroMain GrayScottHoldCoro(gv::DeviceVector<float> ui,
+                                           gv::DeviceVector<float> vi,
+                                           gv::DeviceVector<float> uo,
+                                           gv::DeviceVector<float> vo, u32 dim,
+                                           u32 block) {
+  const u64 cells = static_cast<u64>(dim) * dim;
+  co_await ui.Fetch(0, 0, cells);
+  // One resolution per field for the whole kernel, instead of one per access.
+  auto hui = co_await ui.HoldPage(0, cells);
+  co_await vi.Fetch(0, 0, cells);
+  auto hvi = co_await vi.HoldPage(0, cells);
+  co_await uo.Fetch(0, 0, cells);
+  auto huo = co_await uo.HoldPage(0, cells, /*write=*/true);
+  co_await vo.Fetch(0, 0, cells);
+  auto hvo = co_await vo.HoldPage(0, cells, /*write=*/true);
+  for (u64 idx = static_cast<u64>(block) * blockDim.x + threadIdx.x;
+       idx < cells; idx += static_cast<u64>(gridDim.x) * blockDim.x) {
+    const int x = static_cast<int>(idx % dim);
+    const int y = static_cast<int>(idx / dim);
+    const u64 l = y * dim + Wrap(x - 1, dim);
+    const u64 r = y * dim + Wrap(x + 1, dim);
+    const u64 d = Wrap(y - 1, dim) * dim + x;
+    const u64 t = Wrap(y + 1, dim) * dim + x;
+    const float u = hui[idx], v = hvi[idx];
+    const float lu = hui[l] + hui[r] + hui[d] + hui[t] - 4.0f * u;
+    const float lv = hvi[l] + hvi[r] + hvi[d] + hvi[t] - 4.0f * v;
+    const float uvv = u * v * v;
+    huo[idx] = u + kDt * (kDu * lu - uvv + kF * (1.0f - u));
+    hvo[idx] = v + kDt * (kDv * lv + uvv - (kF + kK) * v);
+  }
+  ui.UnpinRange(0, cells);
+  vi.UnpinRange(0, cells);
+  uo.UnpinRange(0, cells);
+  vo.UnpinRange(0, cells);
+}
+
+__global__ void GrayScottHold(clio::run::IpcManagerGpuInfo info,
+                              gv::DeviceVector<float> ui,
+                              gv::DeviceVector<float> vi,
+                              gv::DeviceVector<float> uo,
+                              gv::DeviceVector<float> vo, u32 dim,
+                              gy::YieldableView<> yv, gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  ui.Init(yv.Block());
+  vi.Init(yv.Block());
+  uo.Init(yv.Block());
+  vo.Init(yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(GrayScottHoldCoro(ui, vi, uo, vo, dim, yv.Block()));
+}
+
+__global__ void InitRaw(float *u, float *v, u32 dim) {
+  const u64 cells = static_cast<u64>(dim) * dim;
+  for (u64 idx = blockIdx.x * blockDim.x + threadIdx.x; idx < cells;
+       idx += static_cast<u64>(gridDim.x) * blockDim.x) {
+    InitCell(idx, dim, &u[idx], &v[idx]);
+  }
+}
+
+/** Initialise the vectors AND make every page resident (no faults later).
+ *
+ * A COROUTINE: this is the only kernel here that actually pages anything in,
+ * and the blocking HoldPage it used to spin in is the in-kernel-wait pattern
+ * that wedges the whole benchmark. Every block writes EVERY page -- the
+ * caches are per block, and the timed stencil grid-strides the whole grid
+ * from every block, so every block needs every page resident in its own
+ * cache. The duplicate writes store identical values and are harmless. */
+__device__ gy::YCoroMain InitVecCoro(gv::DeviceVector<float> u,
+                                     gv::DeviceVector<float> v,
+                                     gv::DeviceVector<float> uo,
+                                     gv::DeviceVector<float> vo, u32 dim) {
+  const u64 cells = static_cast<u64>(dim) * dim;
+  for (u64 i = 0; i < cells;) {
+    co_await u.Fetch(0, u.PageLo(i), u.PageSpan(i, 1));
+    auto hu = co_await u.HoldPage(i, cells - i, /*write=*/true);
+    co_await v.Fetch(0, v.PageLo(i), v.PageSpan(i, 1));
+    auto hv = co_await v.HoldPage(i, cells - i, /*write=*/true);
+    co_await uo.Fetch(0, uo.PageLo(i), uo.PageSpan(i, 1));
+    auto huo = co_await uo.HoldPage(i, cells - i, /*write=*/true);
+    co_await vo.Fetch(0, vo.PageLo(i), vo.PageSpan(i, 1));
+    auto hvo = co_await vo.HoldPage(i, cells - i, /*write=*/true);
+    for (u64 k = i + threadIdx.x; k < i + hu.run(); k += blockDim.x) {
+      float a, b;
+      InitCell(k, dim, &a, &b);
+      hu[k] = a;
+      hv[k] = b;
+      huo[k] = a;
+      hvo[k] = b;
+    }
+    __syncthreads();
+    const u64 run = hu.run();
+    u.UnpinRange(u.PageLo(i), u.PageSpan(i, 1));
+    v.UnpinRange(v.PageLo(i), v.PageSpan(i, 1));
+    uo.UnpinRange(uo.PageLo(i), uo.PageSpan(i, 1));
+    vo.UnpinRange(vo.PageLo(i), vo.PageSpan(i, 1));
+    i += run;
+  }
+}
+
+__global__ void InitVec(clio::run::IpcManagerGpuInfo info,
+                        gv::DeviceVector<float> u, gv::DeviceVector<float> v,
+                        gv::DeviceVector<float> uo, gv::DeviceVector<float> vo,
+                        u32 dim, gy::YieldableView<> yv,
+                        gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  u.Init(yv.Block());
+  v.Init(yv.Block());
+  uo.Init(yv.Block());
+  vo.Init(yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(InitVecCoro(u, v, uo, vo, dim));
+}
+
+/** Copy a vector's contents out to a raw buffer, for comparison.
+ *
+ * Holds ONE ELEMENT AT A TIME on purpose: this measures the resolve-per-access
+ * cost, and the coroutine hold's fast path (resident page, no suspension) IS
+ * the resolution being measured. Everything is resident here, so the co_await
+ * never actually suspends. */
+__device__ gy::YCoroMain VecToRawCoro(gv::DeviceVector<float> src, float *dst,
+                                      u32 dim, u32 block) {
+  const u64 cells = static_cast<u64>(dim) * dim;
+  for (u64 idx = static_cast<u64>(block) * blockDim.x + threadIdx.x;
+       idx < cells; idx += static_cast<u64>(gridDim.x) * blockDim.x) {
+    co_await src.Fetch(0, src.PageLo(idx), src.PageSpan(idx, 1));
+    auto h = co_await src.HoldPage(idx, 1);
+    dst[idx] = h[idx];
+    src.UnpinRange(src.PageLo(idx), src.PageSpan(idx, 1));
+  }
+}
+
+__global__ void VecToRaw(clio::run::IpcManagerGpuInfo info,
+                         gv::DeviceVector<float> src, float *dst, u32 dim,
+                         gy::YieldableView<> yv, gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  src.Init(yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(VecToRawCoro(src, dst, dim, yv.Block()));
+}
+
+#if !CTP_IS_DEVICE_PASS
+
+namespace {
+
+double NowMs() {
+  using clock = std::chrono::high_resolution_clock;
+  return std::chrono::duration<double, std::milli>(
+             clock::now().time_since_epoch()).count();
+}
+
+constexpr unsigned kYieldLaneBytes = 8192;
+
+/** Drive a coroutine kernel to completion: launch, service, relaunch. */
+template <typename LaunchT>
+clio::run::u32 RunYieldable(unsigned nblocks, unsigned nthreads,
+                            LaunchT &&launch) {
+  gy::Yieldable<> drv(nblocks, nthreads);
+  gy::YieldStack stack(nblocks, nthreads, kYieldLaneBytes);
+  return drv.RunToCompletion(
+      [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+        launch(g, b, view, stack.View());
+      },
+      [] {}, /*max_rounds=*/200000,
+      gv::ResumeWhenComplete);
+}
+
+/** Reusable yield driver for the TIMED loops: constructing the driver and
+ *  its stack allocates, and doing that once per stencil step would put the
+ *  allocation inside the timed region. Both Reset() calls are required --
+ *  RunToCompletion does not reset, so a reused runner whose driver still
+ *  reads "done" skips the launch entirely and reports an instant, empty
+ *  success. */
+class YieldRunner {
+ public:
+  YieldRunner(unsigned nblocks, unsigned nthreads)
+      : drv_(nblocks, nthreads), stack_(nblocks, nthreads, kYieldLaneBytes) {}
+  template <typename LaunchT>
+  clio::run::u32 Run(LaunchT &&launch) {
+    drv_.Reset();
+    stack_.Reset();
+    return drv_.RunToCompletion(
+        [&](dim3 g, dim3 b, gy::YieldableView<> view) {
+          launch(g, b, view, stack_.View());
+        },
+        [] {}, /*max_rounds=*/200000,
+      gv::ResumeWhenComplete);
+  }
+
+ private:
+  gy::Yieldable<> drv_;
+  gy::YieldStack stack_;
+};
+
+}  // namespace
+
+int main(int argc, char **argv) {
+  u32 dim = 256;
+  u32 steps = 100;
+  u32 blocks = 8;
+  u32 threads = 256;
+  u32 repeat = 3;
+  u64 page_kb = 64;
+  for (int i = 1; i < argc; ++i) {
+    const std::string f = argv[i];
+    auto next = [&]() -> const char * {
+      return (i + 1 < argc) ? argv[++i] : "0";
+    };
+    if (f == "--dim") dim = std::atoi(next());
+    else if (f == "--steps") steps = std::atoi(next());
+    else if (f == "--blocks") blocks = std::atoi(next());
+    else if (f == "--threads") threads = std::atoi(next());
+    else if (f == "--page-kb") page_kb = std::atoll(next());
+    else if (f == "--repeat") repeat = std::atoi(next());
+    else if (f == "--help") {
+      std::printf("usage: %s [--dim N] [--steps N] [--blocks N] [--threads N] "
+                  "[--page-kb N] [--repeat N]\n", argv[0]);
+      return 0;
+    }
+  }
+  const u64 cells = static_cast<u64>(dim) * dim;
+  // ONE HOLD PER FIELD MEANS ONE PAGE PER FIELD.
+  //
+  // The hold arm takes a single guard over the whole field and then indexes
+  // it across every cell, including the stencil's neighbours. A guard reaches
+  // only to the end of ITS page, so with several pages per field that read
+  // ran off the frame. It used to land on the right bytes anyway: the private
+  // cache filled a block's table in page order, so page k+1 was the next
+  // frame in memory. One associative cache places a frame by hash, so the
+  // accident is gone and the same read returns another page's data --
+  // measured here as 3541 of 65536 cells disagreeing with the raw baseline.
+  //
+  // Round the page up to the whole field so the premise is true by
+  // construction rather than by luck.
+  u64 page_bytes = page_kb * 1024;
+  const u64 field_bytes = cells * sizeof(float);
+  if (page_bytes < field_bytes) {
+    while (page_bytes < field_bytes) page_bytes <<= 1;
+    std::printf("  note: one hold per field needs one page per field; "
+                "raising page to %lluKB\n",
+                (unsigned long long)(page_bytes >> 10));
+    page_kb = page_bytes >> 10;
+  }
+  const u64 page_elems = page_bytes / sizeof(float);
+  const u64 pages = (cells + page_elems - 1) / page_elems;
+
+  {
+    std::ofstream cfg("gpu_vector_access.yaml");
+    cfg << "networking:\n  port: 9438\n\n"
+        << "runtime:\n  num_threads: 4\n  queue_depth: 8192\n\n"
+        << "gpu:\n  queue_depth: 8192\n\n"
+        << "compose:\n"
+        << "  - mod_name: clio_bdev\n"
+        << "    pool_name: \"ram::chi_default_bdev\"\n"
+        << "    pool_query: local\n    pool_id: \"301.0\"\n"
+        << "    bdev_type: ram\n    capacity: \"2GB\"\n\n"
+        << "  - mod_name: clio_cte_core\n"
+        << "    pool_name: cte_core\n    pool_query: local\n"
+        << "    pool_id: \"512.0\"\n"
+        << "    storage:\n"
+        << "      - path: \"ram::gv_access_tier\"\n"
+        << "        bdev_type: \"ram\"\n        capacity_limit: \"1GB\"\n"
+        << "        score: 1.0\n"
+        << "    dpe:\n      dpe_type: \"max_bw\"\n";
+    cfg.close();
+    ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", "gpu_vector_access.yaml", 1);
+  }
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
+    std::fprintf(stderr, "runtime init failed\n");
+    return 1;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
+    std::fprintf(stderr, "cte client init failed\n");
+    return 1;
+  }
+  auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
+
+  std::printf(
+      "gray-scott: raw cuda pointer vs gpu_vector (all resident, ZERO I/O)\n"
+      "  grid=%ux%u (%llu cells, %.2f MB/field)  steps=%u\n"
+      "  launch=<<<%u,%u>>>  page=%lluKB (%llu pages/field)\n",
+      dim, dim, (unsigned long long) cells,
+      static_cast<double>(cells * sizeof(float)) / (1024.0 * 1024.0), steps,
+      blocks, threads, (unsigned long long) page_kb,
+      (unsigned long long) pages);
+
+  // ---- raw ----
+  float *ru = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+  float *rv = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+  float *ru2 = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+  float *rv2 = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+
+  double raw_ms = 1e30;
+  for (u32 r = 0; r < repeat; ++r) {
+    InitRaw<<<blocks, threads>>>(ru, rv, dim);
+    ctp::GpuApi::Synchronize();
+    const double t0 = NowMs();
+    float *a = ru, *b = rv, *c = ru2, *d = rv2;
+    for (u32 s = 0; s < steps; ++s) {
+      GrayScottRaw<<<blocks, threads>>>(a, b, c, d, dim);
+      float *ta = a; a = c; c = ta;
+      float *tb = b; b = d; d = tb;
+    }
+    ctp::GpuApi::Synchronize();
+    const double ms = NowMs() - t0;
+    if (ms < raw_ms) raw_ms = ms;
+  }
+  // The SAME stencil on ONE block: the vector run below must be single-block
+  // (its page caches are private per block, so several blocks writing
+  // interleaved cells of a shared page hold incoherent copies -- reads of
+  // cross-block neighbours then see stale values). The fair pointer baseline
+  // for it is therefore a 1-block launch, timed here; the multi-block number
+  // above stays as throughput context.
+  double raw1_ms = 1e30;
+  for (u32 r = 0; r < repeat; ++r) {
+    InitRaw<<<blocks, threads>>>(ru, rv, dim);
+    ctp::GpuApi::Synchronize();
+    const double t0 = NowMs();
+    float *a = ru, *b = rv, *c = ru2, *d = rv2;
+    for (u32 s = 0; s < steps; ++s) {
+      GrayScottRaw<<<1, threads>>>(a, b, c, d, dim);
+      float *ta = a; a = c; c = ta;
+      float *tb = b; b = d; d = tb;
+    }
+    ctp::GpuApi::Synchronize();
+    const double ms = NowMs() - t0;
+    if (ms < raw1_ms) raw1_ms = ms;
+  }
+
+  // Re-run once to leave the final state in a known buffer for comparison.
+  InitRaw<<<blocks, threads>>>(ru, rv, dim);
+  ctp::GpuApi::Synchronize();
+  {
+    float *a = ru, *b = rv, *c = ru2, *d = rv2;
+    for (u32 s = 0; s < steps; ++s) {
+      GrayScottRaw<<<blocks, threads>>>(a, b, c, d, dim);
+      float *ta = a; a = c; c = ta;
+      float *tb = b; b = d; d = tb;
+    }
+    ctp::GpuApi::Synchronize();
+    ru = a; rv = b;   // final results live here
+  }
+
+  // ---- vector: cache holds every page, so nothing ever faults while timing --
+  double vec_ms = 1e30, hold_ms = 1e30;
+  {
+    gv::Vector<float> vu("gs_u", {0}, page_bytes, blocks,
+                         static_cast<u32>(pages), cells);
+    gv::Vector<float> vv("gs_v", {0}, page_bytes, blocks,
+                         static_cast<u32>(pages), cells);
+    gv::Vector<float> vu2("gs_u2", {0}, page_bytes, blocks,
+                          static_cast<u32>(pages), cells);
+    gv::Vector<float> vv2("gs_v2", {0}, page_bytes, blocks,
+                          static_cast<u32>(pages), cells);
+    vu.EnableStats();
+    auto du = vu.GetDevice(0), dv = vv.GetDevice(0);
+    auto du2 = vu2.GetDevice(0), dv2 = vv2.GetDevice(0);
+    // Constructed once, OUTSIDE the timed region: the driver and its yield
+    // stack allocate. The stencil is single-block (per-block caches) but
+    // keeps its original thread count.
+    YieldRunner srunner(1, threads);
+
+    for (u32 r = 0; r < repeat; ++r) {
+      RunYieldable(1, 32, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                              gy::YieldStackView sv) {
+        InitVec<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, du, dv, du2, dv2, dim,
+                                                 vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      vu.ResetStats();
+      const double t0 = NowMs();
+      auto a = du, b = dv, c = du2, d = dv2;
+      for (u32 s = 0; s < steps; ++s) {
+        srunner.Run([&](dim3 g, dim3 tb, gy::YieldableView<> vw,
+                        gy::YieldStackView sv) {
+          GrayScottHold<<<g, tb, CLIO_YIELD_SMEM_BYTES>>>(gpu, a, b, c, d, dim,
+                                                          vw, sv);
+        });
+        auto ta = a; a = c; c = ta;
+        auto tb = b; b = d; d = tb;
+      }
+      ctp::GpuApi::Synchronize();
+      const double ms = NowMs() - t0;
+      if (ms < vec_ms) vec_ms = ms;
+      if (r + 1 == repeat) {
+        // Compare the vector's final state against the raw run's.
+        float *cu = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+        float *cv = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+        srunner.Run([&](dim3 g, dim3 tb, gy::YieldableView<> vw,
+                        gy::YieldStackView sv) {
+          VecToRaw<<<g, tb, CLIO_YIELD_SMEM_BYTES>>>(gpu, a, cu, dim, vw, sv);
+        });
+        srunner.Run([&](dim3 g, dim3 tb, gy::YieldableView<> vw,
+                        gy::YieldStackView sv) {
+          VecToRaw<<<g, tb, CLIO_YIELD_SMEM_BYTES>>>(gpu, b, cv, dim, vw, sv);
+        });
+        ctp::GpuApi::Synchronize();
+        std::vector<float> hu(cells), hv(cells), hru(cells), hrv(cells);
+        ctp::GpuApi::Memcpy(hu.data(), cu, cells * sizeof(float));
+        ctp::GpuApi::Memcpy(hv.data(), cv, cells * sizeof(float));
+        ctp::GpuApi::Memcpy(hru.data(), ru, cells * sizeof(float));
+        ctp::GpuApi::Memcpy(hrv.data(), rv, cells * sizeof(float));
+        u64 bad = 0;
+        double worst = 0.0;
+        for (u64 i = 0; i < cells; ++i) {
+          const double eu = std::fabs(hu[i] - hru[i]);
+          const double ev = std::fabs(hv[i] - hrv[i]);
+          if (eu > worst) worst = eu;
+          if (ev > worst) worst = ev;
+          if (eu > 1e-5 || ev > 1e-5) ++bad;
+        }
+        std::printf("  agreement: %llu/%llu cells differ, worst |delta|=%.3e\n",
+                    (unsigned long long) bad, (unsigned long long) cells,
+                    worst);
+        if (bad != 0) {
+          std::fprintf(stderr, "RESULTS DISAGREE -- timings are void\n");
+          return 1;
+        }
+        ctp::GpuApi::Free(cu);
+        ctp::GpuApi::Free(cv);
+      }
+    }
+    // ---- fast path, when each field is a single page ----
+    if (pages == 1) {
+      for (u32 r = 0; r < repeat; ++r) {
+        RunYieldable(1, 32, [&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                                gy::YieldStackView sv) {
+          InitVec<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu, du, dv, du2, dv2, dim,
+                                                   vw, sv);
+        });
+        ctp::GpuApi::Synchronize();
+        const double t0 = NowMs();
+        auto a = du, b = dv, c = du2, d = dv2;
+        for (u32 s2 = 0; s2 < steps; ++s2) {
+          srunner.Run([&](dim3 g, dim3 tb, gy::YieldableView<> vw,
+                          gy::YieldStackView sv) {
+            GrayScottHold<<<g, tb, CLIO_YIELD_SMEM_BYTES>>>(gpu, a, b, c, d,
+                                                            dim, vw, sv);
+          });
+          auto ta = a; a = c; c = ta;
+          auto tb = b; b = d; d = tb;
+        }
+        ctp::GpuApi::Synchronize();
+        const double ms = NowMs() - t0;
+        if (ms < hold_ms) hold_ms = ms;
+        if (r + 1 == repeat) {
+          float *cu = ctp::GpuApi::Malloc<float>(cells * sizeof(float));
+          srunner.Run([&](dim3 g, dim3 tb, gy::YieldableView<> vw,
+                          gy::YieldStackView sv) {
+            VecToRaw<<<g, tb, CLIO_YIELD_SMEM_BYTES>>>(gpu, a, cu, dim, vw,
+                                                       sv);
+          });
+          ctp::GpuApi::Synchronize();
+          std::vector<float> hu(cells), hru(cells);
+          ctp::GpuApi::Memcpy(hu.data(), cu, cells * sizeof(float));
+          ctp::GpuApi::Memcpy(hru.data(), ru, cells * sizeof(float));
+          u64 bad = 0;
+          for (u64 i = 0; i < cells; ++i) {
+            if (std::fabs(hu[i] - hru[i]) > 1e-5) ++bad;
+          }
+          std::printf("  HoldPage agreement: %llu/%llu cells differ\n",
+                      (unsigned long long) bad, (unsigned long long) cells);
+          if (bad != 0) {
+            std::fprintf(stderr, "HOLD RESULTS DISAGREE -- timings void\n");
+            return 1;
+          }
+          ctp::GpuApi::Free(cu);
+        }
+      }
+    }
+    const auto st = vu.ReadStats(0);
+    std::printf("  vector I/O during timing: faults=%llu puts=%llu evicts=%llu"
+                " (must be 0)\n",
+                (unsigned long long) st.faults, (unsigned long long) st.puts,
+                (unsigned long long) st.evicts);
+  }
+
+  // 12 element accesses per cell per step: 10 reads + 2 writes.
+  const double accesses =
+      static_cast<double>(cells) * static_cast<double>(steps) * 12.0;
+  std::printf(
+      "\n  raw pointer      %8.2f ms   (%.2f ns/access, %u blocks)\n"
+      "  raw 1-block      %8.2f ms   (%.2f ns/access)\n"
+      "  gpu_vector       %8.2f ms   (%.2f ns/access, 1 block: per-block "
+      "caches)\n"
+      "  slowdown         %8.2fx   (vs raw 1-block, same launch)\n"
+      "  added cost       %8.2f ns/access\n",
+      raw_ms, raw_ms * 1e6 / accesses, blocks, raw1_ms,
+      raw1_ms * 1e6 / accesses, vec_ms, vec_ms * 1e6 / accesses,
+      vec_ms / raw1_ms, (vec_ms - raw1_ms) * 1e6 / accesses);
+  if (hold_ms < 1e29) {
+    std::printf(
+        "  gpu_vector+Hold  %8.2f ms   (%.2f ns/access)\n"
+        "  slowdown vs raw  %8.2fx\n"
+        "  speedup vs fault %8.2fx\n",
+        hold_ms, hold_ms * 1e6 / accesses, hold_ms / raw1_ms,
+        vec_ms / hold_ms);
+  } else {
+    std::printf("  gpu_vector+Hold      n/a   (needs 1 page/field; use "
+                "--page-kb >= field size)\n");
+  }
+
+  BenchFlushData();
+  clio::run::CLIO_RUNTIME_FINALIZE();
+  return 0;
+}
+
+#endif  // !CTP_IS_DEVICE_PASS

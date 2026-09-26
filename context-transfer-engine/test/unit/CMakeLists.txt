@@ -1177,6 +1177,41 @@ install(TARGETS test_cache_config_units
 endif()  # TARGET clio_cte_cache_client
 
 #------------------------------------------------------------------------------
+# Checkpoint chimod (vector.Copy lazy copies): a fault-handled tag resolves
+# missing blobs from its source tag -- get fault, put-side materialise-then-
+# merge, copy/source independence, and the source-absent fallback.
+if(TARGET clio_cte_checkpoint_client)
+add_executable(test_checkpoint_fault test_checkpoint_fault.cc)
+target_include_directories(test_checkpoint_fault PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/checkpoint/include
+)
+target_link_libraries(test_checkpoint_fault
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_checkpoint_runtime
+    clio_cte_checkpoint_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_checkpoint_fault
+    COMMAND test_checkpoint_fault)
+
+set_tests_properties(
+    cte_checkpoint_fault
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;checkpoint;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()  # TARGET clio_cte_checkpoint_client
+
+#------------------------------------------------------------------------------
 # Indexer chimod behavioral coverage (issue #905): scope, async drain +
 # search barrier, maintenance verbs, kReindexScan, first-insertion backfill.
 #------------------------------------------------------------------------------
@@ -1589,11 +1624,26 @@ if(CLIO_CORE_ENABLE_ROCM)
   )
   target_compile_options(test_cte_devmem_putget PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:--generate-code=arch=compute_89,code=sm_89>"
+    # HIP_STANDARD 20 on the target does NOT reach the command line here (the
+    # source gets its language from set_source_files_properties, and no -std
+    # was emitted at all -- verified in compile_commands.json). Say it
+    # outright: without C++20 this TU pulls in task.h -> <coroutine> and dies
+    # with "the <coroutine> header requires -fcoroutines".
+    "$<$<COMPILE_LANGUAGE:HIP>:-std=c++20>"
   )
+  # CUDA_STANDARD 17 here was a copy-paste from the CUDA branch above and was
+  # wrong twice over: it names the CUDA language on a HIP target, and 17 is
+  # too old for a runtime whose task/ipc headers are C++20 coroutines -- this
+  # target failed with "<coroutine> requires -fcoroutines" while the rest of
+  # the ROCm build was clean. HIP_STANDARD is the property that actually
+  # applies under HIP_PLATFORM=amd; the CUDA_* ones are kept (at 20) because
+  # HIP_PLATFORM=nvidia really does route this through the CUDA language.
   set_target_properties(test_cte_devmem_putget PROPERTIES
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-    CUDA_STANDARD 17
+    CUDA_STANDARD 20
     CUDA_STANDARD_REQUIRED ON
+    HIP_STANDARD 20
+    HIP_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   target_include_directories(test_cte_devmem_putget PUBLIC
@@ -1998,3 +2048,36 @@ install(TARGETS test_safe_bdev_recovery_e2e
 )
 
 endif()  # TARGET clio_safe_bdev_runtime
+
+# Batched POD paging: PodMultiPutBlob / PodMultiGetBlob / PodMultiScore.
+# Needs the compressor client for the interposed-batch case.
+if(TARGET clio_cte_compressor_client)
+add_executable(test_pod_multi_paging test_pod_multi_paging.cc)
+target_include_directories(test_pod_multi_paging PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+)
+target_link_libraries(test_pod_multi_paging
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_compressor_runtime
+    clio_cte_compressor_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_pod_multi_paging
+    COMMAND test_pod_multi_paging)
+
+set_tests_properties(
+    cte_pod_multi_paging
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;cte;pod"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()

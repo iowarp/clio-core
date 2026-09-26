@@ -113,6 +113,13 @@ std::vector<TargetInfo> MaxBwDpe::SelectTargets(const std::vector<TargetInfo>& t
   // vs the file at 741 MB/s), where it put the cache primary on disk, made it
   // survive a reboot, and broke cte_replication_persist_integration.
   //
+  // The GPU tier shows the same failure from the other end: write_bandwidth_mbps_
+  // comes from InferWallClockTime(), a PREDICTION with no notion of device type,
+  // and it rated a kHbm tier at 118 MB/s against host RAM at 1600 MB/s. A config
+  // declaring `hbm score 1.0` above `ram score 0.2` therefore placed every blob
+  // on RAM and the GPU tier never received one -- so every "GPU tier" number
+  // measured on that config was really a host-tier number.
+  //
   // The scores in the YAML are an explicit statement about which tier data of
   // a given temperature belongs on. Bandwidth is an estimate -- sometimes a
   // cold-model one. When they disagree, the declared intent wins; among tiers
@@ -151,6 +158,13 @@ std::vector<TargetInfo> MaxBwDpe::SelectTargets(const std::vector<TargetInfo>& t
 
   HLOG(kDebug, "MaxBwDpe::SelectTargets: returning {} targets ({} preferred, {} fallback)",
        result.size(), low_score_targets.size(), high_score_targets.size());
+  for (size_t i = 0; i < result.size(); ++i) {
+    HLOG(kDebug, "  RANK[{}] pool=({},{}) score={} write_bw={} remaining={}", i,
+         result[i].bdev_client_.pool_id_.major_,
+         result[i].bdev_client_.pool_id_.minor_, result[i].target_score_,
+         result[i].perf_metrics_.write_bandwidth_mbps_,
+         result[i].remaining_space_);
+  }
 
   return result;
 }

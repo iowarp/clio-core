@@ -21,7 +21,16 @@ add_subdirectory(lmcache)
 # available for the device-link step; otherwise the CMake generate step aborts with
 # "_CMAKE_CUDA_RDC_FLAG not set" because the unresolved 'ggml' target breaks CUDA
 # property propagation.
-if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_LLAMA_SERVER)
+# weights/ registers a custom ggml BACKEND, so it is pinned to ggml's
+# ggml_backend_i / ggml_backend_buffer_i layout. Upstream reshaped those
+# structs, so its positional initializers now bind the wrong slots and it does
+# not compile (invalid conversions at ggml_iowarp_backend.cc:92-105, 757-765).
+# The switch exists so an otherwise-good tree can still be built while that is
+# repaired; it defaults ON so nobody silently loses the backend.
+option(CLIO_CORE_ENABLE_LLAMA_WEIGHTS_HOOK
+       "Build the llm-hooks custom ggml weight backend (stale vs current ggml)" ON)
+if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_LLAMA_SERVER
+   AND CLIO_CORE_ENABLE_LLAMA_WEIGHTS_HOOK)
     add_subdirectory(weights)
 else()
     message(STATUS "llm-hooks/weights: skipped (requires CUDA + CLIO_CORE_ENABLE_LLAMA_SERVER=ON)")

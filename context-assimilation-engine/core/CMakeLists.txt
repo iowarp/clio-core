@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
-project(clio_cae_core VERSION 1.0.0)
+# A nested project() resets the directory's enabled languages to C/CXX. When
+# the parent build enabled CUDA, targets defined here still inherit CUDA
+# properties from the interface libraries they link, and CMake then fails
+# generation with "No known features for CUDA compiler" because CUDA was
+# never enabled in THIS scope. Declare it so a fresh CUDA configure works.
+if(CLIO_CORE_ENABLE_CUDA)
+  project(clio_cae_core VERSION 1.0.0 LANGUAGES C CXX CUDA)
+else()
+  project(clio_cae_core VERSION 1.0.0)
+endif()
 
 #------------------------------------------------------------------------------
 # ChiMod utilities and dependencies
