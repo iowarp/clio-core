@@ -184,3 +184,8 @@ production layout: one runtime per node remains the design.
   gate (its checksum is extensive and non-linear in the deck; paging is
   bit-exact against a resident run of the same deck at 2 and 4 ranks, ~4,500
   evictions each).
+- 2026-09-26 19:40 UTC (dev node 3, job 8872501), O(N)-startup libraries
+  (6baa919e tier pool on its own node, 06142bf9 fixed-id create stays Local):
+  pool creates per rank 36 -> 6 at 16 nodes (tier 16 -> 1, clio_cte_core
+  16 -> 1); 16-node stress 8872502 clean (123 s wall); stress ladder 9/9,
+  kmeans ladder, grayscott ladder and the reproducer suite all PASS.
