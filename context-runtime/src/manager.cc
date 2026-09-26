@@ -444,6 +444,17 @@ void RuntimeManager::ClientFinalize() {
     return;
   }
 
+  // An embedded process (client and runtime in one) shares the pool manager
+  // and the peer connection pool with its own server. Tearing them down under
+  // the running workers empties the admin pool while the network worker still
+  // routes to it: every send then fails RouteLocal (Dne), is re-queued, and
+  // fails again until the workers stop -- thousands of ERROR lines per clean
+  // exit -- and the peers lose their DEALER connections early. Stop the server
+  // first, in the order CLIO_RUNTIME_FINALIZE and ~RuntimeManager already use.
+  if (is_runtime_mode_) {
+    ServerFinalize();
+  }
+
   // Leak shared-context ZMQ sockets on Windows during teardown (see
   // ServerFinalize) to avoid libzmq's WSASTARTUP signaler assertion.
   ctp::lbm::sock::SetSocketLibShutdown();

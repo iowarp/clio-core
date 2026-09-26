@@ -83,6 +83,12 @@ inline bool GetPeers(clio::cte::core::Client &cte,
                      const char *what, const char *prefix) {
   std::vector<size_t> todo(gets.size());
   for (size_t i = 0; i < gets.size(); ++i) todo[i] = i;
+  // Per peer: how many gets failed and with what, so a timeout names the
+  // failure (a fast rc=1 "not found" and a 120 s "generation never reached"
+  // are different bugs) instead of only the peer.
+  std::vector<unsigned> attempts(gets.size(), 0);
+  std::vector<unsigned> last_rc(gets.size(), 0);
+  const auto t_start = std::chrono::steady_clock::now();
   while (!todo.empty()) {
     using FutT = decltype(cte.AsyncGetBlob(tag, gets[0].name, 0, 0, 0u,
                                            gets[0].dst,
@@ -99,13 +105,26 @@ inline bool GetPeers(clio::cte::core::Client &cte,
     std::vector<size_t> again;
     for (size_t j = 0; j < futs.size(); ++j) {
       futs[j].Wait();
-      if (futs[j]->GetReturnCode() != 0) again.push_back(todo[j]);
+      const unsigned rc = futs[j]->GetReturnCode();
+      if (rc != 0) {
+        again.push_back(todo[j]);
+        ++attempts[todo[j]];
+        last_rc[todo[j]] = rc;
+      }
     }
     todo.swap(again);
     if (todo.empty()) break;
     if (expired()) {
-      std::fprintf(stderr, "  %s[%s]: timed out waiting for %s\n", what,
-                   prefix, gets[todo[0]].name.c_str());
+      const double waited_s =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        t_start).count();
+      for (size_t i : todo) {
+        std::fprintf(stderr,
+                     "  %s[%s]: timed out waiting for %s after %.1f s: "
+                     "%u failed get(s), last rc=%u (%d)\n",
+                     what, prefix, gets[i].name.c_str(), waited_s,
+                     attempts[i], last_rc[i], static_cast<int>(last_rc[i]));
+      }
       return false;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));

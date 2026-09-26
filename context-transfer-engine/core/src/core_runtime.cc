@@ -1857,6 +1857,25 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
     pi_t1 = std::chrono::steady_clock::now();
 
+    // Drain in-flight readers before touching a byte. PutBlob overwrites the
+    // blob's extents IN PLACE, and a GetBlob pinned mid-ReadData on the same
+    // extents would return a mixture of the old and the new bytes with rc=0.
+    // Measured, not hypothetical: clio_cte_vector_stress (4 co-located
+    // nodes, generational 1 MB pages) read pages whose header carried the
+    // new generation and whose tail still held the old one -- word 102608
+    // of 131072 in one run, word 121336 in another -- on both the scalar
+    // and the PodMultiPutBlob paths. Readers back off un-pinned while the
+    // drain bit is set (TryPinRead), so this never waits on a reader that is
+    // itself waiting; and a reader that pinned before the token was taken
+    // finishes with a consistent OLD page. Same discipline as every
+    // extent-freeing mutator (#753); the guard re-admits readers on every
+    // exit below.
+    blob_info_ptr->BeginDrainReaders();
+    BlobReaderDrainGuard reader_drain_guard(blob_info_ptr.get());
+    while (blob_info_ptr->HasReadPins()) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+
     // Droppability: decided at creation, never revisited. Both branches run
     // under the write token, like every other mutation of this blob.
     // See kCtePutDroppable.
