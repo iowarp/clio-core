@@ -30,19 +30,22 @@ pernode=${BENCH_PERNODE_MB:-2048}
 export BENCH_CAP=${BENCH_CAP:-300}
 
 # Per-workload: binary, argument line for a deck of <total MB> with <slots>
-# frames per block, and how to read the result line.
+# frames per block, how to read the result line, and whether the checksum is
+# EXTENSIVE (a sum over the whole grid, so it scales with the deck: grayscott's
+# v_checksum doubled exactly when rung 2 doubled the deck) or intensive
+# (kmeans's centroids). Extensive checksums are compared per MB of deck.
 case "${wl}" in
   kmeans)
     exe=${3:-${root}/build-spike/clio_kmeans_paged_newcoro_aot_x_ckpt2}
     args() { echo "--data-mb $1 --iters 3 --page-kb 1024 --blocks 256 --threads 256 --slots $2 --publish-seed --repeat 1"; }
     result_re='^KMEANS mode=paged'; checksum_key='centroid_checksum'
-    blocks=256; ooc_slots=2 ;;
+    blocks=256; ooc_slots=2; extensive=0 ;;
   grayscott)
     exe=${3:-${root}/build-spike/clio_grayscott_paged_newcoro_aot_x_fc2_ct8}
     export IGC_FunctionControl=2
     args() { echo "--data-mb $1 --steps 3 --page-kb 1024 --blocks 128 --threads 256 --slots $2 --two-phase --ooc --repeat 1"; }
     result_re='^GRAYSCOTT mode=paged'; checksum_key='v_checksum'
-    blocks=128; ooc_slots=8 ;;
+    blocks=128; ooc_slots=8; extensive=1 ;;
   *) echo "bench_ladder: unknown workload ${wl}"; exit 2 ;;
 esac
 # <blocks> x 1 MB pages: <pernode> MB resident needs pernode/blocks slots.
@@ -69,11 +72,14 @@ rung() {  # rung <k> <ranks> <slots> <label>
     cs=$(field "${dir}/rank${r}.log" "${checksum_key}")
     [ "${cs}" = "${cs0}" ] || { echo "FAIL rung ${k}: rank ${r} checksum ${cs} != rank 0 ${cs0}"; return 1; }
   done
-  if [ -n "${LADDER_CS:-}" ] && ! awk -v a="${cs0}" -v b="${LADDER_CS}" -v t="${BENCH_LADDER_RTOL:-1e-6}" \
+  # Compare against rung 1: per MB of deck when the checksum is extensive.
+  local norm
+  norm=$(awk -v c="${cs0}" -v mb="$(( per * n ))" -v e="${extensive}" 'BEGIN { printf "%.12g", (e ? c / mb : c) }')
+  if [ -n "${LADDER_CS:-}" ] && ! awk -v a="${norm}" -v b="${LADDER_CS}" -v t="${BENCH_LADDER_RTOL:-1e-6}" \
         'BEGIN { d = a - b; if (d < 0) d = -d; m = (b < 0 ? -b : b); if (m == 0) m = 1; exit !(d / m <= t) }'; then
-    echo "FAIL rung ${k}: checksum ${cs0} vs rung 1's ${LADDER_CS} differs by more than ${BENCH_LADDER_RTOL:-1e-6} (paging changed the answer)"; return 1
+    echo "FAIL rung ${k}: checksum ${cs0} (${norm} per MB) vs rung 1's ${LADDER_CS} differs by more than ${BENCH_LADDER_RTOL:-1e-6} (paging changed the answer)"; return 1
   fi
-  LADDER_CS=${cs0}
+  LADDER_CS=${norm}
   ev=$(field "${dir}/rank0.log" evicts)
   if [ "${label}" = "out of core" ] && [ "${ev:-0}" -eq 0 ]; then
     echo "FAIL rung ${k}: 0 evictions; the cache held the deck, so nothing was tested"; return 1
