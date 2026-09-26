@@ -110,6 +110,15 @@ set(CLIENT_RETRY_TEST_SOURCES
   test_client_retry.cc
 )
 
+# Worker load-reservation test executable. ReservationUs is a static member
+# function, so this needs no worker, no orchestrator and no runtime -- which is
+# the point: the values it guards against (non-positive, NaN, past the integer
+# range) are exactly the ones a scheduler run does not reliably produce.
+set(WORKER_RESERVATION_TEST_TARGET clio_run_worker_reservation_tests)
+set(WORKER_RESERVATION_TEST_SOURCES
+  test_worker_reservation.cc
+)
+
 # Bdev AllocPolicy test executable (pure host: no server, no IPC, no GPU)
 set(BDEV_ALLOC_POLICY_TEST_TARGET clio_run_bdev_alloc_policy_tests)
 set(BDEV_ALLOC_POLICY_TEST_SOURCES
@@ -682,6 +691,26 @@ set_target_properties(${QUEUE_DEPTH_FLURRY_TEST_TARGET} PROPERTIES
 )
 endif()
 
+# Create Worker load-reservation test executable (pure: no server, no GPU).
+add_executable(${WORKER_RESERVATION_TEST_TARGET} ${WORKER_RESERVATION_TEST_SOURCES})
+
+target_include_directories(${WORKER_RESERVATION_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+)
+
+target_link_libraries(${WORKER_RESERVATION_TEST_TARGET}
+  clio_run_cxx                # Main CLIO Runtime library
+  ctp::cxx                    # ClioCtp library
+  ${CMAKE_THREAD_LIBS_INIT}   # Threading support
+)
+
+set_target_properties(${WORKER_RESERVATION_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Create Bdev AllocPolicy test executable.
 # Exercises CreateParams (serialization + YAML `alloc:` parsing) and drives
 # MemBdevTransport directly, so it needs no runtime server and no GPU.
@@ -1196,6 +1225,17 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 120
   )
 
+  # Worker load-reservation Tests (no server, no GPU — safe to run anywhere)
+  add_test(
+    NAME cr_worker_reservation_tests
+    COMMAND ${WORKER_RESERVATION_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_worker_reservation_tests PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 60
+  )
+
   # Bdev AllocPolicy Tests (no server, no GPU — safe to run anywhere)
   add_test(
     NAME cr_bdev_alloc_policy_tests
@@ -1523,6 +1563,7 @@ set(_install_test_targets
   ${STREAMING_TEST_TARGET}
   ${RUNTIME_CLEANUP_TEST_TARGET}
   ${IPC_ERRORS_TEST_TARGET}
+  ${WORKER_RESERVATION_TEST_TARGET}
 )
 if(NOT WIN32)
   list(APPEND _install_test_targets

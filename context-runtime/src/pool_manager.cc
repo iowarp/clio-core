@@ -702,10 +702,17 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
     CLIO_CO_RETURN;
   }
 
-  // Cast generic Task to BaseCreateTask to access pool operation parameters
-  auto* create_task = reinterpret_cast<
-      clio::run::admin::BaseCreateTask<clio::run::admin::CreateParams>*>(
-      task.get());
+  // Cast generic Task to the create task's pool-operation fields. Every create
+  // task reaching here is SOME BaseCreateTask instantiation -- admin's own,
+  // GetOrCreatePoolTask<XConfig>, ComposeTask<XConfig> -- and which one depends
+  // on the calling ChiMod, so there is no instantiation to name. They all share
+  // CreatePoolFields, which carries exactly the fields this function reads, so
+  // the downcast is to that: an ordinary derived-class cast rather than the
+  // reinterpret_cast to one arbitrary instantiation this used to do, which was
+  // undefined behaviour and which UBSan reported on every test that creates a
+  // pool.
+  auto* create_task =
+      static_cast<clio::run::admin::CreatePoolFields*>(task.get());
 
   // Debug: Log do_compose_ value after cast
   HLOG(kDebug, "PoolManager::CreatePool: After cast, do_compose_={}, is_admin_={}",
