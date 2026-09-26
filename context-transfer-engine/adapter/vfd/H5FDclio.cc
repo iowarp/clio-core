@@ -71,6 +71,10 @@
 #include <string>
 #include <vector>
 
+/* The trace header carries H5FD_MEM_DRAW as a literal; check it against HDF5. */
+static_assert(static_cast<int>(H5FD_MEM_DRAW) == clio::vfdtrace::kMemDraw,
+              "H5FDclio_trace.h kMemDraw must equal HDF5's H5FD_MEM_DRAW");
+
 /* The driver identification number, initialized at runtime */
 static hid_t H5FD_CLIO_g = H5I_INVALID_HID;
 
