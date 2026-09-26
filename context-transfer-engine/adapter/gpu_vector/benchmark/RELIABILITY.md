@@ -61,6 +61,17 @@ production layout: one runtime per node remains the design.
 
 ## Other findings
 
+- N^2 startup pool creation. The yaml has ONE tier line, but the CTE
+  registers each node's tier as its own pool (`ram::<tier>_node<k>`) and every
+  pool is created by broadcast with a container on EVERY node: node 5's log
+  at 16 nodes shows it creating `_node0`, `_node7`, `_node6`, `_node14`, ...
+  So each node runs N pool creates, N^2 cluster-wide (4096 at 64 nodes), and
+  this is what saturated node 5 long enough to trip the 15 s probe rule
+  (defect 12). Seeding still started after 4.4 s at 64 nodes, so it is not
+  yet the bottleneck, but a per-node DRAM tier only needs one container, on
+  its own node: creating it with a single-container query instead of a
+  broadcast would make startup O(N) and remove the stall. Open.
+
 - `runtime.task_progress_interval_ms` defaults to 5000 (on); the header said
   "default 0 = disabled". Comment and default yaml corrected.
 - The generational-get wait passed a millisecond nap to `yield()`, which takes
