@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 
 #include <chrono>
+#include <thread>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -137,6 +138,100 @@ inline bool Ambiguous(const char *path) {
      it, so it is ambiguous too. */
   const int64_t age_ns = now_ns - mtime_ns;
   return age_ns < 0 || static_cast<uint64_t>(age_ns) < GranularityNs();
+}
+
+/* How long a close may wait for the mtime to settle. DEFAULTS TO 0 -- no wait,
+ * which makes SettleForStamp behave exactly like Ambiguous() and preserves the
+ * fail-closed rule as it stands.
+ *
+ * Waiting is opt-in because it does NOT close the window it appears to. The
+ * stamp is written after the under-VOL has closed the file (its size and mtime
+ * are not final until then), so the file is UNLOCKED for the whole wait: a
+ * writer that modifies it in the same timestamp tick as our last write leaves
+ * mtime identical, the re-stat sees nothing, and we would stamp a file whose
+ * contents no longer match what was staged -- the stale-cache bug the stamp
+ * exists to prevent, and the one vol/instant_reopen pins.
+ *
+ * Timing cannot fix that: mtime at tick granularity cannot distinguish two
+ * writes in one tick, and a content digest would have to READ the whole file at
+ * open, which is the read the cache exists to avoid. Settling under the file
+ * lock (stamping before the native close) would make it sound, but the mtime is
+ * not final there.
+ *
+ * So this is a knob for a deployment that has decided the race is acceptable --
+ * a single-writer pipeline, say -- in exchange for write-side staging that
+ * survives to the next open. Set it to about two granules to enable.
+ *
+ * A property of the filesystem, like GranularityNs, so one knob governs both
+ * connectors. */
+inline uint64_t SettleMaxWaitNs() {
+  static const uint64_t v = []() -> uint64_t {
+    const char *e = std::getenv("CLIO_STAMP_SETTLE_MAX_NS");
+    if (e != nullptr && *e != '\0') {
+      char *end = nullptr;
+      unsigned long long n = std::strtoull(e, &end, 10);
+      if (end != e && *end == '\0') return static_cast<uint64_t>(n);
+    }
+    return 0;
+  }();
+  return v;
+}
+
+/* Wait until this file's mtime CAN discriminate a later write, then report
+ * whether it does.
+ *
+ * Ambiguous() answers "can mtime tell?" and the connectors' close paths used to
+ * withhold the stamp whenever it said no. But at a writing close the answer is
+ * ALWAYS no -- the session just wrote the file, so its mtime is fresh by
+ * construction -- which meant a writer never stamped, the next open found no
+ * stamp, failed closed, and dropped the very image the write had just staged.
+ * The staging was therefore pure cost in the commonest pattern there is: write
+ * a file, then read it back.
+ *
+ * Waiting fixes it at the source. Sleep only until the file's mtime is one
+ * granule old, then re-stat. Once `now > mtime + granularity`, any subsequent
+ * write must land on a later tick and so must change mtime -- which is exactly
+ * the property a stamp needs. The wait is bounded by one granule (10 ms by
+ * default, and typically less, since some of it has already elapsed), paid once
+ * per close that has something staged to vouch for.
+ *
+ * Returns false if the file cannot be stat'd, or if it changed underneath us
+ * while we waited -- in both cases the caller must withhold the stamp exactly
+ * as before. A change during the wait means another writer is active, which is
+ * the multi-process case and stays undefined.
+ *
+ * `max_wait_ns` bounds the sleep so a pathological granularity setting cannot
+ * hang a close; 0 means "do not wait", restoring the old withhold-always
+ * behaviour. */
+inline bool SettleForStamp(const char *path, uint64_t max_wait_ns) {
+  struct stat st;
+  if (!path || stat(path, &st) != 0) return false;
+  long long sec = 0, nsec = 0;
+  StatMtime(st, &sec, &nsec);
+  const int64_t mtime_ns =
+      static_cast<int64_t>(sec) * 1000000000LL + static_cast<int64_t>(nsec);
+  const int64_t ready_ns =
+      mtime_ns + static_cast<int64_t>(GranularityNs()) + 1;
+  const int64_t now_ns = static_cast<int64_t>(RealtimeNowNs());
+  if (now_ns < ready_ns) {
+    int64_t wait_ns = ready_ns - now_ns;
+    /* An mtime in the future (clock skew, or a network filesystem stamping
+       from another host) would ask for an unbounded sleep. Refuse rather than
+       wait: nothing can be concluded from such a timestamp anyway. */
+    if (wait_ns > static_cast<int64_t>(max_wait_ns)) return false;
+    std::this_thread::sleep_for(std::chrono::nanoseconds(wait_ns));
+  }
+  /* Re-stat: the file must not have moved while we waited, or the stamp we are
+     about to take describes a state that is already gone. */
+  struct stat after;
+  if (stat(path, &after) != 0) return false;
+  long long sec2 = 0, nsec2 = 0;
+  StatMtime(after, &sec2, &nsec2);
+  if (sec2 != sec || nsec2 != nsec || after.st_size != st.st_size ||
+      after.st_ino != st.st_ino || after.st_dev != st.st_dev) {
+    return false;
+  }
+  return !Ambiguous(path);
 }
 
 }  // namespace clio::adapter::stamp

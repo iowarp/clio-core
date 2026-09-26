@@ -120,6 +120,23 @@ struct clio_file_t {
      stale" decision later. See clio_file_bind_tag. */
   bool tag_bound = false;
   bool tag_bind_failed = false;
+  /* This connector emptied the tier for this file at open (truncate, or a
+     coherence verdict that dropped the tag) and nothing has been staged under
+     the new tag since. The file-scope counterpart of
+     clio_dataset_t::image_known_absent, and the one that matters for a file
+     with many objects: without it, EVERY dataset in a cold file pays its own
+     blocking GetBlobSize to be told the miss that binding the tag already
+     established -- 3000 datasets, 3000 round trips, all of them guaranteed
+     misses.
+
+     Only ever causes a false MISS, never a false hit: a miss sends the read to
+     the native file, which is always correct. So a concurrent process staging
+     into the same tag costs a lost hit and nothing else. */
+  bool tier_known_empty = false;
+  /* st_dev of the authoritative file, or 0 if it could not be stat'd. Identifies
+     the STORE, which is what the "can the tier win here" verdict is really about
+     -- see clio_device_beats_tier. */
+  unsigned long long dev = 0;
   bool opened_truncated = false;
   /* Safe mode: cacheable datasets currently open in this file. H5Fflush and
      H5Fclose drain their pending CTE puts so no async write outlives a
@@ -172,6 +189,18 @@ struct clio_dataset_t {
      is one round trip per element-space transfer -- tens of thousands per test
      -- for a tier that cannot be used by such a workload at all. */
   bool image_known_absent = false;
+  /* The positive counterpart of image_known_absent: this handle has SEEN
+     chunk_0 present. Without it every read of a cached dataset re-paid a
+     blocking GetBlobSize round trip to be told what the previous read already
+     established -- 16 us of a 100 us served read, and the dominant per-read
+     cost once the selection path stopped materialising the whole image.
+
+     Safe to trust because a hit is never taken on the memo alone: every chunk
+     get in clio_read_cached_image is return-code checked, so a memo that has
+     gone stale (a blob evicted underneath us) fails the fetch, invalidates and
+     falls back to native -- the same path a negative hit test takes. The memo
+     can cost a wasted fetch attempt; it cannot produce a wrong answer. */
+  bool image_known_present = false;
   /* Pending async writes flushed on close */
   std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> pending_puts;
   std::vector<ctp::ipc::FullPtr<char>> pending_buffers;
@@ -515,9 +544,19 @@ static bool clio_file_bind_tag(clio_file_t *file);
    This is also where the tag gets bound: it is the single door every tier
    access goes through, so a caller cannot reach a blob with an unbound tag and
    cannot forget to bind one. */
+/* Defined below with the cost model it belongs to; declared here because
+   clio_cache_usable must consult it before binding a tag. */
+static bool clio_device_beats_tier(unsigned long long dev);
+
 static bool clio_cache_usable(clio_file_t *file) {
-  return file && file->cache_enabled && get_cte_client() != nullptr &&
-         clio_file_bind_tag(file);
+  if (!file || !file->cache_enabled || get_cte_client() == nullptr) return false;
+  /* Asked BEFORE binding the tag, which is the whole point: binding is the
+     expensive part, and on a store the tier cannot beat it buys a tag nothing
+     will ever be stored under. Checked here rather than inside bind_tag so the
+     lazy-binding contract stays exactly as it was -- a file that never reaches
+     the tier still never binds. */
+  if (clio_device_beats_tier(file->dev)) return false;
+  return clio_file_bind_tag(file);
 }
 
 /* ------------------------------------------------------------------ admission
@@ -546,6 +585,200 @@ static ClioAdmit clio_admit_policy() {
       std::strcmp(v, "secondaccess") == 0 || std::strcmp(v, "second") == 0)
     return ClioAdmit::kOnSecondAccess;
   return ClioAdmit::kOnWrite;
+}
+
+/* ------------------------------------------------------ admission by cost
+ * WHETHER the tier can beat the authoritative store for this transfer.
+ *
+ * Size is the wrong axis for this question, which is why the byte floor below
+ * defaults to off. A 64-byte dataset is not worth caching on a local
+ * filesystem, where the native read is a 6.5 us page-cache hit -- but the SAME
+ * dataset on a parallel filesystem is a ~1-5 ms latency-bound round trip, and
+ * caching it is a large win. Small-random-read latency is the pathology a
+ * burst tier exists to fix; a size floor switches the tier off exactly where it
+ * pays best.
+ *
+ * What separates those two worlds is not how big the transfer is but how
+ * expensive the store already is. So model the tier as a fixed per-request cost
+ * plus a per-byte cost, predict what serving this transfer from it would take,
+ * and admit only when the native path measured SLOWER than that prediction.
+ *
+ * The model gets all four quadrants right with two parameters (measured on a
+ * DRAM tier: ~60 us fixed, ~1.2 GB/s):
+ *
+ *   64 B, local    predict 60 us  vs native 6.5 us   -> no  (RPC dwarfs it)
+ *   16 MiB, local  predict 13 ms  vs native 1.8 ms   -> no  (page cache wins)
+ *   64 B, PFS      predict 60 us  vs native 2 ms     -> yes (latency bound)
+ *   16 MiB, PFS    predict 13 ms  vs native 80 ms    -> yes (bandwidth bound)
+ *
+ * Self-tuning: both parameters are re-estimated from the connector's own cache
+ * serves, so a tier that is faster or slower than the seeds corrects itself
+ * rather than needing a knob. The seeds only have to be close enough to make
+ * the first few decisions sane. */
+static std::atomic<double> g_tier_fixed_us{-1.0};
+static std::atomic<double> g_tier_us_per_byte{-1.0};
+
+static double clio_tier_seed_fixed_us() {
+  static const double v = [] {
+    if (const char *e = std::getenv("CLIO_VOL_TIER_FIXED_US"))
+      if (*e) return std::strtod(e, nullptr);
+    return 60.0;
+  }();
+  return v;
+}
+static double clio_tier_seed_us_per_byte() {
+  static const double v = [] {
+    if (const char *e = std::getenv("CLIO_VOL_TIER_MBPS"))
+      if (*e) {
+        const double mbps = std::strtod(e, nullptr);
+        if (mbps > 0) return 1.0 / (mbps * 1.048576);  /* us per byte */
+      }
+    return 1.0 / (1200.0 * 1.048576);  /* ~1.2 GB/s */
+  }();
+  return v;
+}
+
+/* Predicted microseconds to serve `bytes` from the tier. */
+static double clio_tier_predict_us(size_t bytes) {
+  double fixed = g_tier_fixed_us.load(std::memory_order_relaxed);
+  double per_b = g_tier_us_per_byte.load(std::memory_order_relaxed);
+  if (fixed < 0) fixed = clio_tier_seed_fixed_us();
+  if (per_b < 0) per_b = clio_tier_seed_us_per_byte();
+  return fixed + static_cast<double>(bytes) * per_b;
+}
+
+/* Fold one observed cache serve into the model. Split by size so each sample
+   informs the parameter it actually constrains: a small serve is nearly all
+   fixed cost, a large one nearly all per-byte. Relaxed and lossy on purpose --
+   this is a heuristic feeding a heuristic, and a lost update costs one
+   mis-scored admission, not a wrong answer. */
+static void clio_tier_observe(size_t bytes, double us) {
+  if (us <= 0) return;
+  constexpr double kAlpha = 0.125;
+  if (bytes <= 4096) {
+    double cur = g_tier_fixed_us.load(std::memory_order_relaxed);
+    if (cur < 0) cur = clio_tier_seed_fixed_us();
+    g_tier_fixed_us.store(cur + kAlpha * (us - cur), std::memory_order_relaxed);
+  } else if (bytes >= (1u << 20)) {
+    double fixed = g_tier_fixed_us.load(std::memory_order_relaxed);
+    if (fixed < 0) fixed = clio_tier_seed_fixed_us();
+    const double per_b = (us - fixed) / static_cast<double>(bytes);
+    if (per_b > 0) {
+      double cur = g_tier_us_per_byte.load(std::memory_order_relaxed);
+      if (cur < 0) cur = clio_tier_seed_us_per_byte();
+      g_tier_us_per_byte.store(cur + kAlpha * (per_b - cur),
+                               std::memory_order_relaxed);
+    }
+  }
+}
+
+/* The gate. `native_us` is how long the authoritative path actually took for
+   `bytes`; admit only if the tier is predicted to beat it.
+ *
+ * ON by default: caching data the authoritative store already serves faster is
+ * a loss, and measured that way on every local-filesystem workload here.
+ * CLIO_VOL_ADMIT_COST=0 disables the gate and restores unconditional admission,
+ * which is what the compat suite sets so its cases test cache mechanics rather
+ * than this policy. */
+static bool clio_cost_gate_on() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_VOL_ADMIT_COST");
+    if (e == nullptr || *e == '\0') return true;  /* on by default */
+    return *e != '0';
+  }();
+  return on;
+}
+static bool clio_worth_staging(size_t bytes, double native_us) {
+  if (!clio_cost_gate_on()) return true;
+  if (native_us <= 0) return true;  /* unmeasured: do not second-guess */
+  return native_us > clio_tier_predict_us(bytes);
+}
+
+/* ---------------------------------------------------- per-device verdict
+ * The cost gate above decides one transfer at a time, and that is too late for
+ * the largest cost a file-per-timestep workload pays: clio_file_bind_tag runs
+ * before any transfer is judged, and measured 273-305 us PER FILE (55-69% of
+ * the whole per-file cost on 500 x 64 KiB files) getting a tag that, on storage
+ * the tier cannot beat, nothing will ever be stored under.
+ *
+ * "Can the tier beat this store" is really a property of the STORE, so answer
+ * it once per device and reuse it. st_dev is the key: it is already known --
+ * the coherence stamp stats the file anyway -- and it is what distinguishes a
+ * local NVMe from a mounted parallel filesystem in a process using both, which
+ * a single process-wide verdict would get wrong for one of them.
+ *
+ * Fail-open by construction: a device with too few samples is treated as worth
+ * caching, so the only effect of no data is the behaviour that exists today.
+ * Samples come only from transfers large enough for throughput to mean anything
+ * -- below that, us/byte measures latency and would call every device slow. */
+static constexpr size_t kDevSampleMinBytes = 64 * 1024;
+static constexpr int kDevMinSamples = 4;
+
+struct ClioDevCost {
+  double us_per_byte = -1.0;
+  int samples = 0;
+};
+static std::mutex g_dev_mu;
+static std::map<unsigned long long, ClioDevCost> g_dev_cost;
+
+static void clio_note_native_cost(unsigned long long dev, size_t bytes,
+                                  double us) {
+  if (bytes < kDevSampleMinBytes || us <= 0) return;
+  const double per_b = us / static_cast<double>(bytes);
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  ClioDevCost &c = g_dev_cost[dev];
+  c.us_per_byte = (c.us_per_byte < 0) ? per_b
+                                      : c.us_per_byte + 0.25 * (per_b - c.us_per_byte);
+  if (c.samples < 1000) c.samples++;
+}
+
+/* True when this device has been measured to stream faster than the tier can,
+   often enough to believe it. Such a store wins at every size: at large sizes on
+   throughput, and at small sizes because the tier still owes a fixed round trip
+   the store does not. */
+static bool clio_device_beats_tier(unsigned long long dev) {
+  if (!clio_cost_gate_on() || dev == 0) return false;
+  std::lock_guard<std::mutex> lk(g_dev_mu);
+  auto it = g_dev_cost.find(dev);
+  if (it == g_dev_cost.end() || it->second.samples < kDevMinSamples) {
+    return false;  /* no verdict yet -- behave exactly as before */
+  }
+  double per_b = g_tier_us_per_byte.load(std::memory_order_relaxed);
+  if (per_b < 0) per_b = clio_tier_seed_us_per_byte();
+  return it->second.us_per_byte < per_b;
+}
+
+
+/* Smallest dataset worth staging; 0 (the default) means no floor.
+ *
+ * Below some size the tier cannot win on any storage medium: admitting costs at
+ * least one blocking PutBlob round trip, and what a later hit saves is one read
+ * of fewer bytes than that round trip took to arrange. Measured on 3000 x
+ * 64-byte datasets, staging cost ~183 us per dataset -- to store 64 bytes -- and
+ * the hit test another ~182 us, making the cache 18x SLOWER than no cache at
+ * all. With this set to 64 KiB the same workload goes from 1.19 s to 0.064 s of
+ * read time, because nothing stages and file->tier_known_empty then stays true
+ * so the per-dataset hit test is skipped too. The two effects are multiplicative
+ * and neither delivers much alone.
+ *
+ * DEFAULTED OFF deliberately. A floor is a policy change, not a bug fix: the
+ * compat suite asserts that a 192-byte dataset is cached (vol_c_selection_test
+ * is 8x6 int32, and the bbox_fetch case is built on that corpus), so any
+ * non-zero value here fails four of its cache-behaviour cases. That suite
+ * encodes the project's current answer to "is a tiny object worth caching"; the
+ * measurement above is an argument for changing that answer, and the change
+ * belongs to whoever owns the policy. Until then this ships as a measured knob.
+ *
+ * This is a floor on the SIZE of a staged image, not a policy about WHEN to
+ * stage; CLIO_VOL_ADMIT still decides that. */
+static size_t clio_min_stage_bytes() {
+  static const size_t v = [] {
+    if (const char *e = std::getenv("CLIO_VOL_MIN_STAGE_BYTES")) {
+      if (*e) return static_cast<size_t>(std::strtoull(e, nullptr, 10));
+    }
+    return static_cast<size_t>(0);
+  }();
+  return v;
 }
 
 /* Read ledger for kOnSecondAccess. Keyed by (tag, dataset path) and held for
@@ -595,6 +828,9 @@ static void clio_invalidate_dataset(clio_dataset_t *dset) {
      difference between one blocking RPC per hyperslab write and one per
      dataset. See image_known_absent. */
   if (dset->image_known_absent) return;
+  /* Same fact at file scope: nothing has been staged for this file since the
+     tag was emptied, so there is no blob to delete. */
+  if (dset->file->tier_known_empty) return;
   /* Tell the telemetry the staged bytes are gone BEFORE dropping them.
      Everything staged for this dataset is about to stop being servable, so
      leaving it counted would inflate the admission denominator with data that
@@ -630,6 +866,7 @@ static void clio_invalidate_dataset(clio_dataset_t *dset) {
   /* The hit-test key is gone and this handle is the one that removed it, so the
      next invalidation and the next hit test both already have their answer. */
   dset->image_known_absent = true;
+  dset->image_known_present = false;
 }
 
 /* ========================================================================
@@ -982,7 +1219,21 @@ static void clio_write_stamp(clio::cte::core::Client *cte_client,
      instead, which makes the next open see kAbsent and fail closed
      deterministically -- rather than leaving an older stamp whose mismatch
      happens to produce the same outcome for a different reason. */
-  if (clio::adapter::stamp::Ambiguous(path)) {
+  /* Wait out the timestamp granule rather than give up on it. At a writing
+     close mtime is fresh by construction, so Ambiguous() was ALWAYS true here
+     and this connector never stamped a file it had just written -- the next
+     open then found no stamp, failed closed, and dropped the image the write
+     had just staged. Every byte of write-side staging was wasted in the
+     write-then-read-back pattern.
+
+     SettleForStamp sleeps only until the mtime is one granule old (<= 10 ms by
+     default, usually less) and re-stats. If it succeeds the recorded mtime is
+     discriminating: any later write must land on a later tick. If it cannot
+     settle -- unstattable, or the file moved while we waited, which means
+     another writer is active and that is the undefined multi-process case --
+     fall through and withhold exactly as before. */
+  if (!clio::adapter::stamp::SettleForStamp(
+          path, clio::adapter::stamp::SettleMaxWaitNs())) {
     clio::trace::record_stamp(ft, clio::trace::Stamp::kAmbiguous);
     auto del = cte_client->AsyncDelBlob(tag_id, std::string(kStampBlobName));
     del.Wait();
@@ -1041,6 +1292,14 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
   file->obj.kind = clio_kind_t::kFile;
   file->file_name = name;
   file->chunk_size = chunk_size;
+  {
+    /* One stat, once per open. Cheap next to the round trips it can save, and
+       the coherence stamp stats this file anyway. */
+    struct stat st;
+    if (name && ::stat(name, &st) == 0) {
+      file->dev = static_cast<unsigned long long>(st.st_dev);
+    }
+  }
   file->cache_enabled = cache_enabled;
   file->opened_truncated = truncated;
   file->trace = clio::trace::open_file(name);
@@ -1114,6 +1373,7 @@ static bool clio_file_bind_tag(clio_file_t *file) {
   if (truncated) {
     auto del = cte_client->AsyncDelTag(tag_name);
     del.Wait();  /* absent tag is a harmless no-op */
+    file->tier_known_empty = true;
   }
   auto tag_task = cte_client->AsyncGetOrCreateTag(tag_name);
   tag_task.Wait();
@@ -1142,6 +1402,7 @@ static bool clio_file_bind_tag(clio_file_t *file) {
       return false;
     }
     file->tag_id = again->tag_id_;
+    file->tier_known_empty = true;
   }
   file->tag_bound = true;
   return true;
@@ -1309,7 +1570,13 @@ static herr_t clio_file_close(void *obj, hid_t dxpl_id, void **req) {
      the stamp left by whichever open last wrote one no longer matches it, so
      the next open drops the tag and fails closed. That is the same answer the
      eager path produced, reached without a round trip per close. */
-  if (ret >= 0 && file->cache_enabled && file->tag_bound) {
+  /* tier_known_empty is the same argument one step further: the tag is bound
+     but this session emptied it and staged nothing into it, so a stamp would
+     licence an empty tag. Skipping it matters now that stamping WAITS out the
+     timestamp granule -- without this, a session that correctly declined to
+     cache anything still paid up to 10 ms at close to vouch for nothing. */
+  if (ret >= 0 && file->cache_enabled && file->tag_bound &&
+      !file->tier_known_empty) {
     if (auto *cte_client = get_cte_client()) {
       clio_write_stamp(cte_client, file->tag_id, file->file_name.c_str(),
                        file->trace);
@@ -1821,15 +2088,45 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
        a number that describes the intent rather than the act. */
     size_t staged_bytes = 0;
 
+    /* Write to the authoritative store FIRST, and time it.
+     *
+     * Staging used to be submitted before this so the puts flew while the
+     * native write ran. That overlap cost the admission gate its only input:
+     * the decision had to be made before anything had been measured, so the
+     * first write of every file was admitted unconditionally -- and a
+     * write-once workload is nothing BUT first writes, so the gate never fired
+     * at all. Ordering the native write first buys a real measurement of what
+     * the authoritative store costs for exactly these bytes.
+     *
+     * Two things improve as a side effect: a write that FAILS now stages
+     * nothing, instead of staging and then having to drain and invalidate; and
+     * the puts submitted below are still asynchronous, so what is given up is
+     * overlap with one write, not the asynchrony itself. */
+    const auto t_natw0 = std::chrono::steady_clock::now();
+    herr_t rc = H5VLdataset_write(1, &dataset->obj.under_object,
+                       dataset->obj.under_vol_id,
+                       &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
+                       dxpl_id, &buf[d], req);
+    const double native_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - t_natw0).count();
+    if (rc >= 0) clio_note_native_cost(dataset->file->dev, total_size, native_us);
+
     /* Admission. Under read-miss nothing is staged here; the data reaches the
-       tier only if a later read asks for it and misses. The native write below
-       still happens either way -- the authoritative file is never optional.
+       tier only if a later read asks for it and misses. The native write above
+       happens either way -- the authoritative file is never optional.
 
        clio_tier_accepting() is the back-pressure gate: while the tier is known
        full, skip the staging loop entirely rather than pay an SHM allocation
-       and a memcpy per chunk for bytes that cannot land. */
-    const bool admit_here = (clio_admit_policy() == ClioAdmit::kOnWrite) &&
-                            clio_tier_accepting();
+       and a memcpy per chunk for bytes that cannot land.
+
+       clio_worth_staging asks whether the tier could beat the store that just
+       serviced this write. On a local filesystem it cannot and nothing is
+       admitted; on a slow or remote one it can, and everything is. */
+    const bool admit_here = rc >= 0 &&
+                            (clio_admit_policy() == ClioAdmit::kOnWrite) &&
+                            clio_tier_accepting() &&
+                            total_size >= clio_min_stage_bytes() &&
+                            clio_worth_staging(total_size, native_us);
     /* False whenever this write's bytes were NOT all offered to the tier --
        policy or back-pressure skipped staging, or the loop aborted early. The
        file then holds data the cache does not, so any previously staged image
@@ -1841,9 +2138,9 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
       size_t this_size = std::min(chunk_size, total_size - offset);
 
       /* Allocate SHM buffer and copy data. An allocation failure stops the
-         staging, never the write: the native path below is always available,
-         and failing H5Dwrite over a cache buffer is an error the application
-         would not have seen without CLIO. */
+         staging, never the write: the native path already succeeded, and
+         failing H5Dwrite over a cache buffer is an error the application would
+         not have seen without CLIO. */
       auto buffer = CLIO_IPC->AllocateBuffer(this_size);
       if (buffer.IsNull()) { staged_fully = false; break; }
       std::memcpy(buffer.ptr_, src + offset, this_size);
@@ -1870,16 +2167,12 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
          being true. Cleared on submission rather than on completion: the memo
          may only ever skip work whose answer is certain, and from here on it
          is not. */
-      if (i == 0) dataset->image_known_absent = false;
+      if (i == 0) {
+        dataset->image_known_absent = false;
+        dataset->file->tier_known_empty = false;
+      }
     }
 
-    /* Write to the native VOL -- the authoritative store. Its status is this
-       call's status; if it failed, the bytes we just staged into CTE describe
-       data the file does not contain, so drop them. */
-    herr_t rc = H5VLdataset_write(1, &dataset->obj.under_object,
-                       dataset->obj.under_vol_id,
-                       &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
-                       dxpl_id, &buf[d], req);
     if (rc < 0) {
       ret_value = rc;
       drain_dataset_puts(dataset);
@@ -1932,14 +2225,22 @@ static bool clio_cache_populated(clio_dataset_t *dataset) {
      selection read pays a blocking round trip to be told "miss" on every single
      H5Dread for the whole life of the file. See image_known_absent. */
   if (dataset->image_known_absent) return false;
+  if (dataset->image_known_present) return true;
+  /* The tag was emptied at open and nothing has been staged since, so no
+     dataset in this file can have an image. Answer without the round trip. */
+  if (dataset->file->tier_known_empty) return false;
   auto *cte_client = get_cte_client();
   auto sz = cte_client->AsyncGetBlobSize(dataset->file->tag_id,
                                          dataset->dataset_path + "/chunk_0");
   sz.Wait();
-  if (sz->size_ > 0) return true;
+  if (sz->size_ > 0) {
+    dataset->image_known_present = true;
+    return true;
+  }
   /* A miss is knowledge too, and it is the same fact the invalidate path
      records: chunk_0 is not there. */
   dataset->image_known_absent = true;
+  dataset->image_known_present = false;
   return false;
 }
 
@@ -2064,6 +2365,20 @@ static herr_t clio_scatter_cb(const void **src_buf, size_t *src_bytes,
   return 0;
 }
 
+/* Per-thread gather scratch for clio_serve_selection, grown to the largest
+   image served on this thread and never shrunk. Deliberately raw and
+   uninitialized: the only bytes read out of it are the ones the fetch above
+   just wrote (see the call site). Freed at thread exit. */
+static char *clio_serve_scratch(size_t need) {
+  static thread_local std::unique_ptr<char[]> buf;
+  static thread_local size_t cap = 0;
+  if (need > cap) {
+    buf.reset(new (std::nothrow) char[need]);
+    cap = buf ? need : 0;
+  }
+  return buf.get();
+}
+
 /* Selection-aware READ serving (serve-only, no prefetch). When a hyperslab or
    point read hits a dataset whose linear chunk cache is populated, satisfy it
    from the CTE tier: fetch the chunks the selection's bounding box touches,
@@ -2112,9 +2427,20 @@ static bool clio_serve_selection(clio_dataset_t *dataset, hid_t mem_type_id,
     size_t span_lo = 0, span_hi = total_size;
     clio_selection_byte_span(full_space, file_space_id, type_size, total_size,
                              &span_lo, &span_hi);
-    std::vector<char> full(total_size);
-    if (!clio_read_cached_image(dataset, total_size, full.data(),
-                                span_lo, span_hi))
+    /* Reused and NOT value-initialized. `std::vector<char> full(total_size)`
+       both allocated and zeroed the whole image on every partial read, so an
+       8 KiB hyperslab of a 128 MiB dataset paid a 128 MiB memset -- measured at
+       72 ms per read against 5.6 us for the same read served natively, and
+       scaling with the DATASET rather than the selection.
+
+       Leaving it uninitialized is safe: H5Dgather reads only the positions the
+       file-space selection names, every one of which lies inside the selection's
+       bounding box by construction, and clio_read_cached_image has just filled
+       exactly that range. Bytes outside it are never read. Reusing the buffer
+       across reads additionally keeps the pages faulted in. */
+    char *full = clio_serve_scratch(total_size);
+    if (!full) break;
+    if (!clio_read_cached_image(dataset, total_size, full, span_lo, span_hi))
       break;
 
     /* Gather the file-space selection into a contiguous buffer. H5S_ALL file
@@ -2124,7 +2450,7 @@ static bool clio_serve_selection(clio_dataset_t *dataset, hid_t mem_type_id,
     if (nsel <= 0) break;
     size_t sel_size = static_cast<size_t>(nsel) * type_size;
     std::vector<char> sel(sel_size);
-    if (H5Dgather(fspace, full.data(), mem_type_id, sel_size, sel.data(),
+    if (H5Dgather(fspace, full, mem_type_id, sel_size, sel.data(),
                   nullptr, nullptr) < 0)
       break;
 
@@ -2261,10 +2587,17 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
 
     if (!cached) {
       /* MISS — native read is the source of truth, then stage into the tier. */
+      const auto t_nat0 = std::chrono::steady_clock::now();
       herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
                                    dataset->obj.under_vol_id,
                                    &mem_type_id[d], &mem_space_id[d],
                                    &file_space_id[d], dxpl_id, &buf[d], req);
+      /* How expensive the authoritative store actually is for this transfer --
+         the only signal that separates a page-cache hit from a PFS round trip,
+         and so the one the admission gate needs. */
+      const double native_us = std::chrono::duration<double, std::micro>(
+          std::chrono::steady_clock::now() - t_nat0).count();
+      clio_note_native_cost(dataset->file->dev, total_size, native_us);
       if (rc < 0) {
         /* Nothing to stage from a failed read; record the failure and move to
            the next dataset like every other fallback path (an early return
@@ -2286,7 +2619,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
          re-discovered on every read-miss: stage chunk_0, fail, invalidate,
          miss again on the next read, stage again. The gate makes that cost
          once per retry interval instead of once per read. */
-      bool stage_here = clio_tier_accepting();
+      bool stage_here = clio_tier_accepting() &&
+                        total_size >= clio_min_stage_bytes() &&
+                        clio_worth_staging(total_size, native_us);
       /* Under second-access, the FIRST miss only records that the read
          happened; staging waits for the second. Record it even when
          back-pressure is holding the gate shut, so a tier that frees up later
@@ -2319,7 +2654,13 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
           clio_tier_mark_accepting();
           /* chunk_0 landed: the tier is no longer known-empty for this
              dataset. See the write path's matching line. */
-          if (i == 0) dataset->image_known_absent = false;
+          if (i == 0) {
+            dataset->image_known_absent = false;
+            dataset->file->tier_known_empty = false;
+            /* This put was WAITED on, so chunk_0 is known to have landed --
+               unlike the write path, where it is only submitted. */
+            dataset->image_known_present = true;
+          }
         }
       }
       /* Report before any invalidation below, so the discard has something to
@@ -2345,6 +2686,10 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
         if (rc < 0) ret_value = rc;
       }
     }
+    /* Feed real serves back into the cost model so it tracks this tier rather
+       than the seeds. Only actual cache serves are samples; a native read says
+       nothing about what the tier would have cost. */
+    if (served_cache) clio_tier_observe(total_size, clio_since_us(t0));
     if (tracing)
       clio_trace_access(dataset, clio::trace::Op::kRead, mem_type_id[d],
                           mem_space_id[d], file_space_id[d], dxpl_id,
