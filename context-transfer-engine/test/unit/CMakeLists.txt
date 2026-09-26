@@ -128,6 +128,13 @@ add_executable(test_concurrent_same_blob
     test_concurrent_same_blob.cc
 )
 
+# Torn-read regression (RELIABILITY.md defects 8 and 11): readers of a blob
+# being overwritten in place must see one whole version, on the runtime path
+# (reader drain) and on the zero-IPC fast path (content seqlock).
+add_executable(test_torn_read
+    test_torn_read.cc
+)
+
 # Vectored PutBlob/GetBlob (#820): N regions in one task, one write-token
 # acquire. Asserts equivalence with N single puts, list-order overlap
 # resolution, and union-range allocation.
@@ -492,6 +499,21 @@ target_link_libraries(test_concurrent_same_blob
     clio::run::bdev_client
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# Link test_torn_read (defects 8/11) - same deps.
+target_link_libraries(test_torn_read
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+target_include_directories(test_torn_read PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
 )
 
 # Link test_vectored_blob_io (#820 vectored blob I/O) - same deps.
@@ -888,6 +910,16 @@ set_tests_properties(
         TIMEOUT 300
         LABELS "regression;wakeup;runtime"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;WAKEUP_ITERS=400"
+)
+
+add_test(NAME cte_torn_read
+    COMMAND test_torn_read)
+set_tests_properties(
+    cte_torn_read
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "regression;concurrent;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
 add_test(NAME cte_concurrent_same_blob_all

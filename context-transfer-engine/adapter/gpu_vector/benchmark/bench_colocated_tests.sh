@@ -7,17 +7,20 @@
 #   bench_colocated_tests.sh <workdir> [case ...]
 #
 # Cases (default: all): smoke, range_split, targets_race, targets_race_control,
-# peer_death, probe_ooc. Needs the kmeans benchmark binary
-# (BENCH_KMEANS, default build-spike/clio_kmeans_paged_newcoro_aot_x_ckpt2)
-# and a GPU node with at least 4 tiles. Exit status: number of failed cases.
+# peer_death, probe_ooc, late_peer. Needs the kmeans benchmark binary
+# (BENCH_KMEANS, default build-spike/clio_kmeans_paged_newcoro_aot_x_ckpt2),
+# the CPU stress binary (BENCH_STRESS, default build-fresh/bin/
+# clio_cte_vector_stress) and a GPU node with at least 4 tiles. Exit status:
+# number of failed cases.
 set -u
 workdir=${1:?usage: bench_colocated_tests.sh <workdir> [case ...]}
 shift
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "${here}/../../../.." && pwd)
 km=${BENCH_KMEANS:-${root}/build-spike/clio_kmeans_paged_newcoro_aot_x_ckpt2}
+stress=${BENCH_STRESS:-${root}/build-fresh/bin/clio_cte_vector_stress}
 export IGC_FunctionControl=3
-cases=("$@"); [ ${#cases[@]} -eq 0 ] && cases=(smoke range_split targets_race targets_race_control peer_death probe_ooc)
+cases=("$@"); [ ${#cases[@]} -eq 0 ] && cases=(smoke range_split targets_race targets_race_control peer_death probe_ooc late_peer)
 failed=0
 
 # strip <log>: the log without colour codes and source prefixes.
@@ -84,6 +87,21 @@ case_probe_ooc() {
   expect probe_ooc "both ranks exit 0" grep -q 'worst exit=0' "${d}.out"
   expect probe_ooc "evictions happened (really out of core)" bash -c "grep -aoE 'evicts=[1-9][0-9]*' '${d}/rank0.log' | grep -q ."
   expect probe_ooc "no replica declared Gone" bash -c "! grep -aq 'Gone on its node' '${d}/rank0.log' '${d}/rank1.log'"
+}
+
+case_late_peer() {
+  # Defect 13: rank 1 starts 6 s late, so rank 0's first broadcast reaches a
+  # runtime that is listening but has not composed the CTE pool. The early
+  # tasks must be held and replayed, never dropped ("Container not found")
+  # nor run on the uninitialised static container ("still absent").
+  local d="${workdir}/late_peer"
+  BENCH_RANK_DELAY_1=6 BENCH_CAP=200 CLIO_MAIN_SEGMENT_SIZE=8G \
+    BENCH_TIERS="ram::cte_stress_dram|ram|20000MB|0.5" \
+    bash "${here}/run_colocated.sh" 2 "${d}" "${stress}" --pages-per-node 256 --page-kb 1024 --threads 8 --steps 2 --halo 1 --stream 1 --batch 16 --barrier-timeout 60 > "${d}.out" 2>&1
+  expect late_peer "both ranks exit 0" grep -q 'worst exit=0' "${d}.out"
+  expect late_peer "no task dropped for a missing container" bash -c "! grep -aq 'Container not found' '${d}/rank0.log' '${d}/rank1.log'"
+  expect late_peer "no put stranded on the static container" bash -c "! grep -aq 'still absent' '${d}/rank1.log'"
+  expect late_peer "no STRESS errors" bash -c "! grep -aq 'STRESS ERROR' '${d}/rank0.log' '${d}/rank1.log'"
 }
 
 mkdir -p "${workdir}"

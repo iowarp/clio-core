@@ -42,10 +42,11 @@ same configuration at small scale.
    defects 8-11 in the core with no GPU involved.
 10. Open: the barrier miss (defect 9) has not recurred in 2,400+ gate
     rounds since the reader drain; keep the diagnostics armed and watch the
-    16-node stress runs. A unit test for the torn-read cases (concurrent
-    put/get on one blob, byte verification, both the RPC and the zero-IPC
-    path) belongs in context-transfer-engine/test/unit once the test tree
-    is built here.
+    16-node stress runs. DONE: `test_torn_read` (ctest `cte_torn_read`,
+    context-transfer-engine/test/unit) overwrites 8 blobs from 4 threads
+    while 8 threads read and verify, generational (runtime path) and plain
+    (zero-IPC path): 0 torn in ~17k puts / ~40k gets per case. The
+    startup-skew drop (defect 13) is `late_peer` in bench_colocated_tests.sh.
 
 ## Enabler: several runtimes on one node
 
