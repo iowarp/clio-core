@@ -202,6 +202,16 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       if (!existing_pool_id.IsNull()) {
         return clio::run::PoolQuery::Local();
       }
+      // A create that names a FIXED pool id is satisfied by that id existing
+      // here whatever the pool was called when it was composed: the CTE
+      // client asks for "clio_cte_core" at 512.0 while compose named the
+      // same pool "cte_core", so the name check missed and every client
+      // init broadcast a no-op create to every node -- N per node, N^2
+      // cluster-wide, on top of the real work (16 per rank at 16 nodes).
+      if (!typed->new_pool_id_.IsNull() &&
+          pool_manager->GetPoolInfo(typed->new_pool_id_) != nullptr) {
+        return clio::run::PoolQuery::Local();
+      }
       return clio::run::PoolQuery::Broadcast();
     }
     default:
