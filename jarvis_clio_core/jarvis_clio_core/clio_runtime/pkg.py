@@ -132,19 +132,19 @@ class ClioRuntime(Service):
                 'msg': ('Whether SWIM membership detection runs. When false, '
                         'the HeartbeatProbe periodic is a no-op: no direct/'
                         'indirect probes, no suspicion timeouts, no SetDead, '
-                        'no recovery. Use only on stable multi-node setups '
-                        'where you trust nodes not to disappear mid-run.'),
+                        'no recovery. Off by default: a wide collective '
+                        'starves probe replies and the detector declares '
+                        'healthy nodes dead.'),
                 'type': bool,
-                'default': True
+                'default': False
             },
             {
                 'name': 'swim_direct_probe_timeout_sec',
                 'msg': ('SWIM direct-probe timeout (seconds). A peer that '
                         'doesn\'t reply to a Heartbeat within this window is '
-                        'escalated to indirect probing. Default 30s matches '
-                        'the prior hard-coded value.'),
+                        'escalated to indirect probing.'),
                 'type': float,
-                'default': 30.0
+                'default': 300.0
             },
             {
                 'name': 'swim_indirect_probe_timeout_sec',
@@ -152,15 +152,17 @@ class ClioRuntime(Service):
                         'node\'s indirect probe doesn\'t return within this '
                         'window the target is marked suspected.'),
                 'type': float,
-                'default': 15.0
+                'default': 150.0
             },
             {
                 'name': 'swim_suspicion_timeout_sec',
                 'msg': ('SWIM suspicion timeout (seconds). A node that stays '
                         'in the suspected state this long is promoted to '
-                        'dead, triggering SetDead + recovery.'),
+                        'dead, triggering SetDead + recovery. One hour by '
+                        'default, sized for volatility rather than detection '
+                        'speed.'),
                 'type': float,
-                'default': 60.0
+                'default': 3600.0
             },
             {
                 'name': 'do_start',

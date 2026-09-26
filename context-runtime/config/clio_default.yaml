@@ -109,11 +109,14 @@ runtime:
 # already kills the whole allocation if a node dies. Turn it on for a
 # long-lived service deployment and size the timeouts for the widest
 # collective that deployment issues.
+# The timeouts are sized for volatility, not detection speed: a node has to
+# be unreachable for about an hour before recovery redistributes its
+# containers. The old 30 / 15 / 60 s defaults fired inside healthy runs.
 swim:
   enabled: false                        # default: false
-  direct_probe_timeout_sec: 30.0        # default: 30.0 -- direct probe reply deadline
-  indirect_probe_timeout_sec: 15.0      # default: 15.0 -- indirect (relayed) probe deadline
-  suspicion_timeout_sec: 60.0           # default: 60.0 -- suspect -> dead, triggers recovery
+  direct_probe_timeout_sec: 300.0       # default: 300.0 -- direct probe reply deadline
+  indirect_probe_timeout_sec: 150.0     # default: 150.0 -- indirect (relayed) probe deadline
+  suspicion_timeout_sec: 3600.0         # default: 3600.0 -- suspect -> dead, triggers recovery
 
 # Only clio_bdev is strictly required. Drop the CAE or CTE entry if you
 # don't need it.

@@ -561,10 +561,15 @@ class ConfigManager : public ctp::BaseConfig {
   // as a detector, so the honest default is off. A deployment that genuinely
   // needs failure detection turns it on with `swim: enabled: true` and sizes
   // the timeouts for its own collective width.
+  //
+  // The defaults below are sized for volatility, not detection speed: a node
+  // has to be unreachable for about an hour (5 min direct probe, 2.5 min
+  // indirect probe, 1 h suspicion) before recovery redistributes its
+  // containers. The old 30 s / 15 s / 60 s defaults fired inside healthy runs.
   bool swim_enabled_ = false;
-  float swim_direct_probe_timeout_sec_ = 30.0f;
-  float swim_indirect_probe_timeout_sec_ = 15.0f;
-  float swim_suspicion_timeout_sec_ = 60.0f;
+  float swim_direct_probe_timeout_sec_ = 300.0f;
+  float swim_indirect_probe_timeout_sec_ = 150.0f;
+  float swim_suspicion_timeout_sec_ = 3600.0f;
 
   // Web dashboard (issue #990). viz_enabled_explicit_ records whether the YAML
   // or the environment stated a preference, so the daemon CLI can supply a
