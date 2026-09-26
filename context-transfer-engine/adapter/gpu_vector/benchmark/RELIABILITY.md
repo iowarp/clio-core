@@ -152,3 +152,12 @@ production layout: one runtime per node remains the design.
   every step, 2000 gate rounds) PASS, 8 co-located runtimes PASS (500 rounds,
   ~1 ms each), 30-step soak at 4 ranks PASS (172k gets/rank, 0 errors),
   8 ranks scalar PASS. The barrier miss has not recurred (2,900+ rounds).
+- 2026-09-26 15:40 UTC, 16 nodes (job 8872285, debug-scaling), first
+  multi-node stress run with the liveness guard: 8 GB of 1 MB pages per node,
+  32 threads, batches of 16, halo 1 + 2 random reads per page, 6 steps, two
+  checkpoints, 200 gate rounds. 196,608 verified gets per node (3.1 M total,
+  ~25% served the next generation), 0 get/put/checkpoint errors, 0
+  mismatches, 0 nodes declared dead, 200/200 barrier rounds (1.1 ms each,
+  slowest 9.8 ms), every rank exit 0. Timed region 109 s; seed 4.5 s;
+  checkpoint of 8192 pages 10.5 s. The previous attempt (8872256, 15 s
+  probe-silence rule) never left startup.
