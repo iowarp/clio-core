@@ -37,6 +37,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <list>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -167,6 +168,14 @@ class IpcManagerRun2Run {
    * per-task (or default) timeout.
    */
   void ProcessRetryQueues();
+
+  /**
+   * Replay inbound archives that were deferred because a task in them
+   * addressed a pool this node had not composed yet (see RecvIn), and drop
+   * the ones older than kDeferredRecvTimeoutSec. Called from the same net
+   * tick as ProcessRetryQueues.
+   */
+  void ReplayDeferredRecv();
 
   /**
    * Scan send_map_ for tasks waiting on nodes that have been marked dead and
@@ -418,6 +427,28 @@ class IpcManagerRun2Run {
   mutable std::mutex retry_queues_mutex_;
   std::deque<RetryEntry> send_in_retry_;
   std::deque<RetryEntry> send_out_retry_;
+
+  /**
+   * An inbound archive that arrived before this node composed the pool one
+   * of its tasks addresses. Startup skew, not an error: at 64 nodes the
+   * first broadcast GetOrCreateTag reached four nodes whose CTE container
+   * did not exist yet; RecvInHandleOne dropped the replicas, the origin's
+   * progress probes answered Gone twice, and the origins failed with
+   * kRun2RunNetworkTimeoutRC before the run had seeded. The archive is
+   * pristine (no task consumed, bulk frames still attached), so it is held
+   * whole and replayed once every container it needs exists.
+   */
+  struct DeferredRecv {
+    clio::run::LoadTaskArchive archive;
+    ctp::lbm::Transport *transport;
+    std::chrono::steady_clock::time_point arrived;
+  };
+  static constexpr float kDeferredRecvTimeoutSec = 120.0f;
+  /** True when every task in the archive has its container on this node. */
+  static bool AllContainersPresent(clio::run::PoolManager *pool_manager,
+                                   const clio::run::LoadTaskArchive &archive);
+  std::mutex deferred_recv_mutex_;
+  std::list<DeferredRecv> deferred_recv_;  // list: erase never moves an archive
 };
 
 }  // namespace clio::run

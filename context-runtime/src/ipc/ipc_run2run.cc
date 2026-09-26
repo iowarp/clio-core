@@ -597,11 +597,79 @@ int IpcManagerRun2Run::RecvIn(clio::run::LoadTaskArchive &archive,
     return 0;
   }
 
+  // A task for a pool this node has not composed yet is held, not dropped:
+  // the sender is simply ahead of us in startup. Whole-archive, so no task
+  // is consumed twice; ReplayDeferredRecv retries it from the net tick.
+  if (!AllContainersPresent(pool_manager, archive)) {
+    std::lock_guard<std::mutex> lk(deferred_recv_mutex_);
+    deferred_recv_.push_back(DeferredRecv{std::move(archive), lbm_transport,
+                                          std::chrono::steady_clock::now()});
+    return 0;
+  }
+
   for (const auto &task_info : task_infos) {
     RecvInHandleOne(ipc_manager, pool_manager, task_info, archive, lbm_transport);
   }
 
   return 0;
+}
+
+bool IpcManagerRun2Run::AllContainersPresent(
+    clio::run::PoolManager *pool_manager,
+    const clio::run::LoadTaskArchive &archive) {
+  // The REAL local container, not the static one. A task that reaches this
+  // node over the network was routed here because the address map says this
+  // node hosts its container, so that is what it must run on. The static
+  // container exists from the moment the pool's metadata does -- before the
+  // real one is registered and long before its Create runs -- and a task
+  // admitted on that evidence executed on the static instance: two puts
+  // waited 120 s for targets that instance would never register while the
+  // real container was ready 180 ms later (late-peer reproducer, trial 3).
+  for (const auto &task_info : archive.GetTaskInfos()) {
+    if (!pool_manager->GetContainer(task_info.pool_id_, kInvalidContainerId)
+             .get()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void IpcManagerRun2Run::ReplayDeferredRecv() {
+  auto *ipc_manager = CLIO_IPC;
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  std::list<DeferredRecv> ready;
+  {
+    std::lock_guard<std::mutex> lk(deferred_recv_mutex_);
+    if (deferred_recv_.empty()) return;
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = deferred_recv_.begin(); it != deferred_recv_.end();) {
+      if (AllContainersPresent(pool_manager, it->archive)) {
+        ready.splice(ready.end(), deferred_recv_, it++);
+        continue;
+      }
+      const float waited =
+          std::chrono::duration<float>(now - it->arrived).count();
+      if (waited >= kDeferredRecvTimeoutSec) {
+        const auto &infos = it->archive.GetTaskInfos();
+        HLOG(kError,
+             "[RecvIn] dropping {} deferred task(s) (first: pool {} method {} "
+             "from node {}): its pool was never composed here in {} s",
+             infos.size(), infos.front().pool_id_, infos.front().method_id_,
+             infos.front().task_id_.node_id_,
+             static_cast<clio::run::u32>(waited));
+        it = deferred_recv_.erase(it);
+        continue;
+      }
+      ++it;
+    }
+  }
+  for (auto &d : ready) {
+    HLOG(kInfo, "[RecvIn] replaying {} deferred task(s) now that their pool exists",
+         d.archive.GetTaskInfos().size());
+    for (const auto &task_info : d.archive.GetTaskInfos()) {
+      RecvInHandleOne(ipc_manager, pool_manager, task_info, d.archive, d.transport);
+    }
+  }
 }
 
 // =============================================================================
@@ -1048,6 +1116,7 @@ clio::run::u64 IpcManagerRun2Run::RerouteRetryEntry(RetryEntry &entry) {
 // =============================================================================
 
 void IpcManagerRun2Run::ProcessRetryQueues() {
+  ReplayDeferredRecv();
   auto *ipc_manager = CLIO_IPC;
   auto now = std::chrono::steady_clock::now();
 
