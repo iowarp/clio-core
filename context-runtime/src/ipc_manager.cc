@@ -1900,6 +1900,22 @@ void IpcManager::SetDead(u64 node_id) {
        it->second.ip_address);
 }
 
+void IpcManager::NoteHeardFrom(u64 node_id) {
+  if (node_id >= kHeardSlots) return;
+  const u64 now = static_cast<u64>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  last_heard_ns_[node_id].store(now, std::memory_order_relaxed);
+}
+
+u64 IpcManager::NsSinceHeardFrom(u64 node_id) const {
+  if (node_id >= kHeardSlots) return ~0ull;
+  const u64 last = last_heard_ns_[node_id].load(std::memory_order_relaxed);
+  if (last == 0) return ~0ull;
+  const u64 now = static_cast<u64>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  return now > last ? now - last : 0;
+}
+
 void IpcManager::SetAlive(u64 node_id) {
   // Every confirmed membership change advances the epoch (issue #856):
   // recovery claims are scoped by (epoch, dead node), so a node that dies,

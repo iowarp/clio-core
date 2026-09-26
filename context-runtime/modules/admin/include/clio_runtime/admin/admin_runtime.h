@@ -439,7 +439,7 @@ private:
    * timer fails a sent task whose target never answers, so counting failed
    * completions is not enough. Three probe intervals of silence it is.
    */
-  static constexpr double kProbeSilenceSec = 15.0;
+  static constexpr double kProbeSilenceSec = 30.0;
   std::vector<PendingProgressQuery> pending_progress_queries_;
   /**
    * Consecutive liveness probes to a node that came back with an error (no

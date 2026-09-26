@@ -481,6 +481,7 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   {
     clio::run::u64 sender = task_info.task_id_.node_id_;
     auto *im = CLIO_IPC;
+    if (im != nullptr) im->NoteHeardFrom(sender);
     if (im != nullptr && sender != im->GetNodeId() && !im->IsAlive(sender)) {
       HLOG(kWarning,
            "[RecvIn] node {} was marked dead but just sent us a task — "
@@ -647,6 +648,8 @@ int IpcManagerRun2Run::RecvOutDeserialize(
     }
 
     container->LoadTask(origin_task->method_, archive, replica);
+    // The completer id is the node that answered: proof of life.
+    if (auto *im = CLIO_IPC) im->NoteHeardFrom(replica->completer_.load());
   }
 
   return 0;

@@ -826,6 +826,17 @@ class IpcManager {
   void SetAlive(u64 node_id);
 
   /**
+   * Record that a message (a task or a response) just arrived from node_id.
+   * Proof of life that does not depend on how busy that node's workers are:
+   * a liveness probe is a task, so a node saturated by startup pool creates
+   * can be silent to probes for tens of seconds while it is visibly sending.
+   * Cheap (one relaxed atomic store), called from the receive threads.
+   */
+  void NoteHeardFrom(u64 node_id);
+  /** Nanoseconds since the last message from node_id; ~0ull if never. */
+  u64 NsSinceHeardFrom(u64 node_id) const;
+
+  /**
    * Get the SWIM node state for a node
    * @param node_id Node to query
    * @return NodeState (kDead for unknown nodes)
@@ -1795,6 +1806,10 @@ class IpcManager {
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host
+  /** Last-heard-from steady-clock ns per node id (see NoteHeardFrom). */
+  static constexpr u64 kHeardSlots = 65536;
+  std::unique_ptr<std::atomic<u64>[]> last_heard_ns_{
+      new std::atomic<u64>[kHeardSlots]()};
   /** Confirmed membership changes; see GetMembershipEpoch (issue #856). */
   std::atomic<u64> membership_epoch_{0};
   mutable std::vector<Host>
