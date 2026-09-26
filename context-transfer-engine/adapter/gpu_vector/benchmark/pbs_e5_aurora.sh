@@ -145,6 +145,9 @@ run_cell() {
     r=${PALS_RANKID:-${PMI_RANK:-0}}
     cd "$BENCH_RANK_DIR"
     ulimit -c 0
+    # Read-only: /dev/shm occupancy at rank start (a crashed run leaves its
+    # segments behind; a full tmpfs would starve the RAM tiers of this run).
+    { echo "SHM at start on $(hostname): $(df -k /dev/shm | awk "NR==2{printf \"%.1f of %.1f GB used\", \$3/1048576, \$2/1048576}")"; ls /dev/shm 2>/dev/null | grep -c clio | sed "s/^/  clio segments: /"; } > "rank$r.shm" 2>&1
     en() { cat /sys/class/drm/card0/device/hwmon/hwmon*/energy1_input 2>/dev/null | tr "\n" " "; }
     e0=$(en)
     timeout --signal=TERM --kill-after=10s "$BENCH_RANK_CAP" \
