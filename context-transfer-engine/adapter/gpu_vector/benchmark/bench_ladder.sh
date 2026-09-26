@@ -39,7 +39,7 @@ case "${wl}" in
     exe=${3:-${root}/build-spike/clio_kmeans_paged_newcoro_aot_x_ckpt2}
     args() { echo "--data-mb $1 --iters 3 --page-kb 1024 --blocks 256 --threads 256 --slots $2 --publish-seed --repeat 1"; }
     result_re='^KMEANS mode=paged'; checksum_key='centroid_checksum'
-    blocks=256; ooc_slots=2; extensive=0; rtol=1e-6 ;;
+    blocks=256; ooc_slots=2; extensive=0; rtol=1e-6; ooc_mult=16 ;;
   grayscott)
     exe=${3:-${root}/build-spike/clio_grayscott_paged_newcoro_aot_x_fc2_ct8}
     export IGC_FunctionControl=2
@@ -47,15 +47,18 @@ case "${wl}" in
     result_re='^GRAYSCOTT mode=paged'; checksum_key='v_checksum'
     # Per MB the sum is only APPROXIMATELY deck-invariant: a larger grid has
     # a smaller boundary fraction, measured at 1.07e-6 between 2 and 4 GB.
-    blocks=128; ooc_slots=8; extensive=1; rtol=1e-4 ;;
+    # Two arrays (u, v) share the deck, so per block the frames are half the
+    # kmeans figure: 2048 MB / (2 x 128) = 8 = exactly the floor, resident.
+    blocks=128; ooc_slots=8; extensive=1; rtol=1e-4; ooc_mult=32 ;;
   *) echo "bench_ladder: unknown workload ${wl}"; exit 2 ;;
 esac
 # <blocks> x 1 MB pages: <pernode> MB resident needs pernode/blocks slots.
 # The vector keeps at least 8 frames per block whatever --slots says, so an
-# out-of-core rung needs a deck above 8 x blocks MB or it is silently
-# resident; the out-of-core rungs use twice that floor at least.
+# out-of-core rung needs a deck above 8 x blocks MB (x2 for grayscott's two
+# arrays) or it is silently resident; the out-of-core rungs use twice that
+# floor at least (ooc_mult per workload).
 resident_slots=$(( pernode / blocks + 8 ))
-ooc_pernode=$(( pernode > 16 * blocks ? pernode : 16 * blocks ))
+ooc_pernode=$(( pernode > ooc_mult * blocks ? pernode : ooc_mult * blocks ))
 
 # field <log> <key>: the value of key=... on the result line.
 field() { grep -a "${result_re}" "$1" | tail -1 | grep -oE "${2}=[-0-9.]+" | cut -d= -f2; }
