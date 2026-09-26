@@ -118,3 +118,5 @@ production layout: one runtime per node remains the design.
   without the wait), peer_death (dead peer detected, no hang), probe_ooc
   (out of core, probe on, zero Gone). Ladder out-of-core rungs now sized
   above the 8-frames-per-block floor.
+- 2026-09-26 07:32 UTC: bench_ladder.sh kmeans LADDER PASS (run 45): 1 resident,
+  2 resident, 2 out of core (1514 evicts), 4 out of core (1511 evicts).

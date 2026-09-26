@@ -1644,8 +1644,8 @@ void Runtime::ScanTaskProgress() {
         it->silence_reported = true;
         HLOG(kError,
              "[TaskProgress] node {} has not answered a liveness probe for "
-             "{:.1f} s; marking it dead so the tasks waiting on it can fail",
-             it->target_node_id, silent_s);
+             "{} s; marking it dead so the tasks waiting on it can fail",
+             it->target_node_id, static_cast<clio::run::u32>(silent_s));
         ipc_manager->SetDead(it->target_node_id);
       }
       ++it;
