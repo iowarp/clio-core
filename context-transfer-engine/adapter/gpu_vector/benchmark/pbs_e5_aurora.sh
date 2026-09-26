@@ -76,7 +76,7 @@ cell_deck() {
   case "${wl}" in
     kmeans)
       # 1024 work-groups; budget GB = slots x 1024 x 1 MB.
-      EXE="${ROOT}/build-spike/clio_kmeans_paged_newcoro_aot${E5_SFX_kmeans:-_x_ct}"
+      EXE="${ROOT}/build-spike/clio_kmeans_paged_newcoro_aot${E5_SFX_kmeans:-_x_ckpt2}"
       ARGS="--data-mb ${DATA_MB} --iters ${E5_ITERS_kmeans:-8} --page-kb 1024 --blocks 1024 --threads 256 --slots ${gb} --publish-seed${E5_KM_REPEAT:+ --repeat ${E5_KM_REPEAT}} ${E5_KM_EXTRA:-}"
       FC=3 ;;
     grayscott)
@@ -97,6 +97,7 @@ run_cell() {
   cell_deck "${wl}" "${gb}"
   if [ -z "${EXE}" ] || [ ! -x "${EXE}" ] || ! bench_check_binary "${EXE}"; then
     echo "RESULT e5/${label}x${NRANKS}: NO-EXECUTABLE (${EXE})"
+    LAST_RC=99; LAST_DIR=""  # the retry loop below reads these (set -u)
     return
   fi
   mkdir -p "${rundir}"; rm -f "${rundir}"/rank*.log
