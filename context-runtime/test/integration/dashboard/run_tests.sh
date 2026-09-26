@@ -1,10 +1,16 @@
 #!/bin/bash
-# Dashboard Integration Test for CLIO Runtime Runtime
+# Dashboard Integration Test for CLIO Runtime
 #
-# Spins up a 4-node cluster with context-visualizer dashboard and validates:
-#   - Topology API returns all nodes
-#   - Worker stats and system stats APIs work
-#   - Shutdown and restart of individual nodes via the dashboard API
+# Spins up a 4-node cluster whose node1 daemon serves the BUILT-IN web
+# dashboard (issue #990) and validates the cluster-facing read paths:
+#   - /api/topology lists every node
+#   - /api/nodes/{n}/workers and /api/nodes/{n}/system_stats answer for the
+#     local node AND for a remote node (the cross-node Monitor forward)
+#   - /api/pools and /api/chimods answer
+#
+# Node shutdown/restart via the dashboard was a feature of the retired Python
+# visualizer and was deliberately not carried into the built-in dashboard
+# (unauthenticated destructive endpoints); those flows now live with the CLI.
 #
 # Usage:
 #   bash run_tests.sh all      # setup, run tests, teardown
@@ -176,7 +182,15 @@ run_tests() {
     log_info "Running dashboard integration tests against $DASHBOARD_URL"
     log_info ""
 
-    # --- Test 1: Topology lists all 4 nodes ---
+    # --- Liveness ---
+    assert_curl \
+        "GET /api/health answers ok" \
+        "$DASHBOARD_URL/api/health" \
+        "GET" \
+        "ok" \
+        "true"
+
+    # --- Topology lists all 4 nodes ---
     assert_curl \
         "GET /api/topology returns $NUM_NODES nodes" \
         "$DASHBOARD_URL/api/topology" \
@@ -184,191 +198,78 @@ run_tests() {
         "nodes" \
         "$NUM_NODES"
 
-    # --- Test 2: Worker stats for node 0 ---
+    # --- Local node reads ---
     assert_curl \
-        "GET /api/node/0/workers returns worker data" \
-        "$DASHBOARD_URL/api/node/0/workers" \
+        "GET /api/nodes/local/workers returns worker data" \
+        "$DASHBOARD_URL/api/nodes/local/workers" \
         "GET" \
         "workers" \
         "1"
 
-    # --- Test 3: System stats for node 0 ---
     assert_curl \
-        "GET /api/node/0/system_stats returns entries" \
-        "$DASHBOARD_URL/api/node/0/system_stats" \
+        "GET /api/nodes/local/system_stats returns entries" \
+        "$DASHBOARD_URL/api/nodes/local/system_stats" \
         "GET" \
         "entries" \
         "1"
 
-    # --- Test 4: Shutdown node 3 (last node, 0-indexed) ---
-    # Find the highest node_id from topology
-    local last_node_id
-    last_node_id=$(curl -sf --max-time 10 "$DASHBOARD_URL/api/topology" | python3 -c "
+    # --- Cross-node forward: pick a node OTHER than the dashboard's own ---
+    # This is the physical:N Monitor path a single-node ctest cannot exercise.
+    local self_id remote_id
+    self_id=$(curl -sf --max-time 10 "$DASHBOARD_URL/api/health" | python3 -c "
+import sys, json
+print(json.load(sys.stdin)['node_id'])
+" 2>/dev/null) || self_id=0
+    remote_id=$(curl -sf --max-time 15 "$DASHBOARD_URL/api/topology" | python3 -c "
 import sys, json
 nodes = json.load(sys.stdin)['nodes']
-print(max(n['node_id'] for n in nodes))
-" 2>/dev/null) || last_node_id=3
+alive = [n['node_id'] for n in nodes if n.get('alive') and n['node_id'] != $self_id]
+print(alive[0] if alive else '')
+" 2>/dev/null) || remote_id=""
 
-    assert_curl \
-        "POST shutdown node $last_node_id" \
-        "$DASHBOARD_URL/api/topology/node/$last_node_id/shutdown" \
-        "POST" \
-        "success" \
-        "true"
-
-    # --- Test 5: Restart the node immediately ---
-    # NOTE: We restart right after shutdown (no topology check in between)
-    # because calling the topology API while a node is dead can block the
-    # Flask process (the C extension holds the GIL during broadcast retries).
-    log_info "Waiting 3s for node $last_node_id to shut down..."
-    sleep 3
-
-    assert_curl \
-        "POST restart node $last_node_id" \
-        "$DASHBOARD_URL/api/topology/node/$last_node_id/restart" \
-        "POST" \
-        "success" \
-        "true"
-
-    log_info "Waiting 15s for node $last_node_id to restart and rejoin cluster..."
-    sleep 15
-
-    # --- Test 6: Topology should show the node again ---
-    log_info "Test: Topology shows node $last_node_id again after restart"
-    local node_count
-    node_count=$(curl -sf --max-time 15 "$DASHBOARD_URL/api/topology" | python3 -c "
-import sys, json
-print(len(json.load(sys.stdin)['nodes']))
-" 2>/dev/null) || node_count=0
-
-    if [ "$node_count" -ge "$NUM_NODES" ]; then
-        log_success "Topology shows $node_count nodes -- node $last_node_id is back"
-        PASSED=$((PASSED + 1))
+    if [ -n "$remote_id" ]; then
+        assert_curl \
+            "GET /api/nodes/$remote_id/workers (cross-node forward)" \
+            "$DASHBOARD_URL/api/nodes/$remote_id/workers" \
+            "GET" \
+            "workers" \
+            "1"
+        assert_curl \
+            "GET /api/nodes/$remote_id/system_stats (cross-node forward)" \
+            "$DASHBOARD_URL/api/nodes/$remote_id/system_stats" \
+            "GET" \
+            "entries" \
+            "1"
     else
-        log_warning "Topology shows $node_count nodes -- restart may still be in progress"
+        log_error "No alive remote node found for the cross-node forward test"
+        FAILED=$((FAILED + 1))
     fi
 
-    # --- Stress test: multi-node shutdown-restart ---
-    local stress_rounds=${STRESS_ROUNDS:-3}
-    # Non-leader nodes (node 0 is leader / dashboard host)
-    local candidate_nodes=(1 2 3)
-    log_info ""
-    log_info "========================================="
-    log_info "  Stress test: $stress_rounds rounds, multi-node shutdown-restart"
-    log_info "  Candidate nodes: ${candidate_nodes[*]}"
-    log_info "========================================="
-
-    for round in $(seq 1 "$stress_rounds"); do
-        # Pick 1-3 random non-leader nodes to shut down
-        local num_targets=$(( RANDOM % ${#candidate_nodes[@]} + 1 ))
-        local shuffled=($(printf '%s\n' "${candidate_nodes[@]}" | shuf))
-        local targets=("${shuffled[@]:0:$num_targets}")
-
-        log_info ""
-        log_info "--- Round $round/$stress_rounds: shutdown nodes [${targets[*]}] ---"
-
-        # Shutdown all targets
-        for target in "${targets[@]}"; do
-            assert_curl \
-                "Round $round: shutdown node $target" \
-                "$DASHBOARD_URL/api/topology/node/$target/shutdown" \
-                "POST" \
-                "success" \
-                "true"
-        done
-
-        log_info "Waiting 5s for nodes to shut down..."
-        sleep 5
-
-        # Restart all targets
-        for target in "${targets[@]}"; do
-            assert_curl \
-                "Round $round: restart node $target" \
-                "$DASHBOARD_URL/api/topology/node/$target/restart" \
-                "POST" \
-                "success" \
-                "true"
-        done
-
-        log_info "Waiting 15s for nodes to rejoin..."
-        sleep 15
-
-        # Verify all nodes are back
-        local alive_count
-        alive_count=$(curl -sf --max-time 15 "$DASHBOARD_URL/api/topology" | python3 -c "
-import sys, json
-nodes = json.load(sys.stdin)['nodes']
-print(sum(1 for n in nodes if n.get('alive', False)))
-" 2>/dev/null) || alive_count=0
-
-        if [ "$alive_count" -ge "$NUM_NODES" ]; then
-            log_success "Round $round: All $alive_count nodes alive"
-            PASSED=$((PASSED + 1))
-        else
-            log_error "Round $round: Only $alive_count/$NUM_NODES nodes alive"
-            FAILED=$((FAILED + 1))
-        fi
-    done
-
-    # --- Final test: shutdown ALL nodes (including leader), then restart ALL ---
-    # Shut down non-leader nodes first, leader (node 0) last so the
-    # dashboard client can route the shutdown commands.
-    log_info ""
-    log_info "========================================="
-    log_info "  Final: shutdown ALL nodes, then restart ALL"
-    log_info "========================================="
-
-    for target in "${candidate_nodes[@]}"; do
-        assert_curl \
-            "Final: shutdown node $target" \
-            "$DASHBOARD_URL/api/topology/node/$target/shutdown" \
-            "POST" \
-            "success" \
-            "true"
-    done
-    # Leader last — after this the C++ client is dead
+    # --- Pool and module inventories ---
     assert_curl \
-        "Final: shutdown node 0 (leader)" \
-        "$DASHBOARD_URL/api/topology/node/0/shutdown" \
-        "POST" \
-        "success" \
-        "true"
+        "GET /api/pools lists composed pools" \
+        "$DASHBOARD_URL/api/pools" \
+        "GET" \
+        "pools" \
+        "1"
 
-    log_info "Waiting 5s for all nodes to shut down..."
-    sleep 5
-
-    # Restart leader first so the cluster has a coordinator,
-    # then restart the rest
     assert_curl \
-        "Final: restart node 0 (leader)" \
-        "$DASHBOARD_URL/api/topology/node/0/restart" \
-        "POST" \
-        "success" \
-        "true"
-    for target in "${candidate_nodes[@]}"; do
-        assert_curl \
-            "Final: restart node $target" \
-            "$DASHBOARD_URL/api/topology/node/$target/restart" \
-            "POST" \
-            "success" \
-            "true"
-    done
+        "GET /api/chimods lists loaded modules" \
+        "$DASHBOARD_URL/api/chimods" \
+        "GET" \
+        "chimods" \
+        "1"
 
-    log_info "Waiting 20s for all nodes to rejoin..."
-    sleep 20
-
-    local alive_count
-    alive_count=$(curl -sf --max-time 15 "$DASHBOARD_URL/api/topology" | python3 -c "
-import sys, json
-nodes = json.load(sys.stdin)['nodes']
-print(sum(1 for n in nodes if n.get('alive', False)))
-" 2>/dev/null) || alive_count=0
-
-    if [ "$alive_count" -ge "$NUM_NODES" ]; then
-        log_success "Final: All $alive_count nodes alive after full cluster restart"
+    # --- The dashboard shell itself is served ---
+    log_info "Test: GET /viz/clio_admin/index.html serves the dashboard shell"
+    local page_code
+    page_code=$(curl -s --max-time 15 -o /dev/null -w '%{http_code}' \
+        "$DASHBOARD_URL/viz/clio_admin/index.html" 2>/dev/null) || page_code=000
+    if [ "$page_code" = "200" ]; then
+        log_success "dashboard shell served (HTTP 200)"
         PASSED=$((PASSED + 1))
     else
-        log_error "Final: Only $alive_count/$NUM_NODES nodes alive"
+        log_error "dashboard shell -- HTTP $page_code"
         FAILED=$((FAILED + 1))
     fi
 

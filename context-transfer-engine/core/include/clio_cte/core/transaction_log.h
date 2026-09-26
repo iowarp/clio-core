@@ -82,6 +82,18 @@ enum class TxnType : uint8_t {
    * layout at log time (full replacement on replay, not a delta).
    */
   kExtendReplica = 7,
+  /**
+   * Blob is an expendable cache copy (kCtePutDroppable).
+   *
+   * Separate from kCreateNewBlob because droppability is classified under the
+   * per-blob write token, which is acquired after the create record is
+   * written. Without this record, replay restores every blob as authoritative,
+   * and since droppability is write-once it can never be marked again.
+   *
+   * Appending a type is safe for an older runtime: replay ignores types it
+   * does not recognise.
+   */
+  kSetBlobDroppable = 8,
 };
 
 /** A single block entry within TxnExtendBlob */
@@ -94,6 +106,13 @@ struct TxnExtendBlobBlock {
 };
 
 /** Payload: create a new blob (metadata only, no blocks yet) */
+struct TxnSetBlobDroppable {
+  clio::run::u32 tag_major_;
+  clio::run::u32 tag_minor_;
+  std::string blob_name_;
+  clio::run::u32 droppable_;
+};
+
 struct TxnCreateNewBlob {
   clio::run::u32 tag_major_;
   clio::run::u32 tag_minor_;
@@ -183,6 +202,15 @@ class TransactionLog {
   }
 
   // ---- Log helpers for each transaction type ----
+
+  void Log(TxnType type, const TxnSetBlobDroppable &txn) {
+    buffer_.clear();
+    WriteU32(buffer_, txn.tag_major_);
+    WriteU32(buffer_, txn.tag_minor_);
+    WriteString(buffer_, txn.blob_name_);
+    WriteU32(buffer_, txn.droppable_);
+    WriteRecord(type, buffer_);
+  }
 
   void Log(TxnType type, const TxnCreateNewBlob &txn) {
     buffer_.clear();
@@ -339,6 +367,17 @@ class TransactionLog {
   }
 
   // ---- Static deserialization helpers ----
+
+  static TxnSetBlobDroppable DeserializeSetBlobDroppable(
+      const std::vector<char> &data) {
+    TxnSetBlobDroppable txn;
+    size_t off = 0;
+    txn.tag_major_ = ReadU32(data, off);
+    txn.tag_minor_ = ReadU32(data, off);
+    txn.blob_name_ = ReadString(data, off);
+    txn.droppable_ = ReadU32(data, off);
+    return txn;
+  }
 
   static TxnCreateNewBlob DeserializeCreateNewBlob(const std::vector<char> &data) {
     TxnCreateNewBlob txn;

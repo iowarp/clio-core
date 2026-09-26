@@ -169,3 +169,13 @@ abrt_bt.so
 # Per-session HDF5 artifacts written by demo/benchmark runs (UUID-named .h5).
 # Generated output, never source.
 demologs/
+
+# Locally staged HDF5 install prefixes for the Windows VFD build. Neither
+# HDF_Group's installer nor vcpkg ships a usable HDF5 dev install on Windows,
+# so VFD_WINDOWS_FINDINGS.md's recipe stages an existing HDF5 *build* tree into
+# a prefix here (`cmake --install . --prefix .hdf5-serial`). ~115 MB of copied
+# binaries -- generated output, and following that recipe should not leave the
+# next person one `git add -A` away from committing it.
+.hdf5-serial/
+.hdf5-install/
+run_tests.lf.sh

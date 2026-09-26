@@ -1,0 +1,61 @@
+# Compose config for the summarize-and-store test.
+#
+# CAE core (512.0) -> summarizer (401.0) -> CTE core (513.0). The
+# label_endpoint points at the in-process HTTP stub the test binds on port
+# 21434, which answers every request with a canned Ollama-shaped JSON body —
+# so the full summarize-and-store path runs with no model installed.
+#
+# kStubPort in test_summarizer_store.cc MUST match the port below.
+
+networking:
+  port: 9418
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "256MB"
+
+  # CTE core at the bottom of the chain. Composed FIRST: an interposer's
+  # next_pool_id must already exist when its container is created.
+  - mod_name: clio_cte_core
+    pool_name: cte_core
+    pool_query: local
+    pool_id: "513.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "128MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+
+  # Summarizer interposer. One rule: any blob named `doc_*` in a `.txt` tag.
+  - mod_name: clio_cae_summarizer
+    pool_name: clio_cae_summarizer
+    pool_query: local
+    pool_id: "401.0"
+    next_pool_id: "513.0"
+    label_endpoint: "http://127.0.0.1:21434"
+    label_prompts:
+      summarize: "Summarize this document:"
+    label_matches:
+      - tag_re: ".*\\.txt$"
+        blob_re: "doc_.*"
+        model: "stub-model"
+        prompt: "summarize"
+        context_length: 4096
+        num_predict: 32
+
+  # CAE core at the entrypoint, forwarding through the summarizer.
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "512.0"
+    next_pool_id: "401.0"

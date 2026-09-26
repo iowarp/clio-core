@@ -1010,6 +1010,22 @@ def _env(mode):
     if mode == "vol":
         e["HDF5_PLUGIN_PATH"] = BIN
         e["HDF5_VOL_CONNECTOR"] = "clio"
+        # Pin ADMISSION so these cases test cache MECHANICS, not cache POLICY.
+        #
+        # The connector decides what to admit by comparing the tier against the
+        # store it would replace, and this suite runs on a local filesystem
+        # where declining to cache is the CORRECT answer -- a page-cache read is
+        # faster than any round trip to the tier. Left to the default, the
+        # cases below that assert a hit (c_selection, cache_reuse, bbox_fetch,
+        # telemetry) would fail for a connector behaving exactly as designed,
+        # and the whole suite would have to be re-tuned every time the policy
+        # moved. The corpus is deliberately tiny -- vol_c_selection_test is
+        # 8x6 int32, 192 bytes -- which is precisely the size a cost-based
+        # policy refuses on fast storage.
+        #
+        # The policy itself is measured separately; this pin is only so a
+        # mechanics regression cannot hide behind a policy change.
+        e["CLIO_VOL_ADMIT_COST"] = "0"
     elif mode == "vfd":
         e["HDF5_PLUGIN_PATH"] = BIN
         e["HDF5_DRIVER"] = "clio_vfd"
@@ -1562,6 +1578,54 @@ def _run_instant_reopen_check():
     return {"vol/instant_reopen": checks}
 
 
+def _dset_entry(summary, name):
+    """Look up a dataset in a telemetry summary by HDF5 name.
+
+    The summary keys a dataset by whatever name HDF5 handed the VOL callback,
+    and that is not stable across platforms: Linux records "m" while macOS
+    records "/m" for the very same root dataset. HDF5 treats the two as the
+    same object, so a check that hardcodes one spelling fails on the other --
+    which is exactly what made vol/telemetry and vol/bbox_fetch fail on every
+    macOS adapters run ("has datasets=['/m'], missing what the check asked for
+    (KeyError: 'm')") while Linux stayed green.
+
+    Accept either spelling rather than asserting a convention HDF5 does not
+    guarantee.
+    """
+    dsets = summary["datasets"]
+    for candidate in (name, "/" + name.lstrip("/"), name.lstrip("/")):
+        if candidate in dsets:
+            return dsets[candidate]
+    raise KeyError(name)
+
+
+def _summary_failure_detail(path, exc):
+    """Say what the summary actually contained when a lookup into it failed.
+
+    `KeyError: 'm'` was the entire diagnostic these checks emitted on macOS --
+    it named the key we wanted and nothing about what was there instead, so a
+    reader could not tell an empty `datasets` (nothing was traced at all) from
+    a renamed key (traced under a different path) without a macOS runner in
+    hand. Both fail identically; only one is a tracing bug. Print the keys, the
+    file, and the top-level shape so the log answers that on its own.
+    """
+    try:
+        blob = json.load(open(path))
+    except Exception as e:                      # not JSON at all
+        size = os.path.getsize(path) if os.path.exists(path) else -1
+        return f"summary at {path} is not readable JSON ({e}); {size}B on disk"
+    dsets = blob.get("datasets")
+    if dsets is None:
+        return (f"summary {os.path.basename(path)} has no 'datasets' key at all; "
+                f"top-level keys={sorted(blob.keys())} ({type(exc).__name__}: {exc})")
+    if not dsets:
+        return (f"summary {os.path.basename(path)} has an EMPTY 'datasets' map -- "
+                f"no dataset access was traced; producer="
+                f"{blob.get('producer')!r} file={blob.get('file')!r}")
+    return (f"summary {os.path.basename(path)} has datasets={sorted(dsets.keys())}, "
+            f"missing what the check asked for ({type(exc).__name__}: {exc})")
+
+
 def _run_bbox_fetch_check():
     """§4(A): does serving a selection fetch only the chunks its bounding box
     touches, or the whole cached image?
@@ -1596,7 +1660,7 @@ def _run_bbox_fetch_check():
     detail = ""
     if summaries:
         try:
-            d = json.load(open(summaries[0]))["datasets"]["m"]
+            d = _dset_entry(json.load(open(summaries[0])), "m")
             served = d["read_served"]["cache"]
             fetched = d["bytes_fetched_from_tier"]
             whole_image_cost = served * image_bytes
@@ -1604,7 +1668,7 @@ def _run_bbox_fetch_check():
             detail = (f"fetched {fetched}B for {served} cache-served reads; "
                       f"whole-image would be {whole_image_cost}B")
         except Exception as e:
-            detail = f"summary unreadable: {e}"
+            detail = _summary_failure_detail(summaries[0], e)
     checks["fetch_narrowed"] = narrowed
     ok = all(checks.values())
     print(f"  {'bbox_fetch':<20} {'PASS' if ok else 'FAIL'}  ({detail})")
@@ -1637,7 +1701,7 @@ def _run_trace_check():
     if summaries:
         try:
             s = json.load(open(summaries[0]))
-            d = s["datasets"]["m"]
+            d = _dset_entry(s, "m")
             hr = d["cache_hit_rate"]
             lay = d["layout"]
             fields_ok = (d["reads"] > 0 and d["writes"] > 0 and 0.0 <= hr <= 1.0
@@ -1650,8 +1714,11 @@ def _run_trace_check():
                          # latency split is present and non-negative
                          and d["read_latency_us"]["cache_mean"] >= 0.0)
             repeat_ok = d["max_repeated_selection"] >= 2  # A and B read the same hyperslab
-        except Exception:
-            pass
+        except Exception as e:
+            # Was a bare `except: pass`, so this check reported FAIL with no
+            # reason at all -- on macOS it failed for the same missing-'m' key
+            # as bbox_fetch and the log said only "telemetry FAIL". Say why.
+            print(f"    telemetry: {_summary_failure_detail(summaries[0], e)}")
     checks["fields_sane"] = fields_ok
     checks["repeat_detected"] = repeat_ok
 
@@ -1670,7 +1737,7 @@ def _run_trace_check():
             s = json.load(open(summaries[0]))
             recs = [json.loads(l) for l in open(jsonls[0]) if l.strip()]
             writes = [r for r in recs if r.get("op") == "write"]
-            ws = s["datasets"]["m"]["write_staged"]
+            ws = _dset_entry(s, "m")["write_staged"]
             write_ok = (
                 bool(writes)
                 and all(r["served"] != "cache" for r in writes)

@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clio Pools</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-brand">Clio</div>
+    <ul class="nav-links">
+      <li><a href="index.html">Cluster</a></li>
+      <li><a href="pools.html">Pools</a></li>
+      <li><a href="config.html">Config</a></li>
+    </ul>
+    <div class="nav-status" id="conn-status">connecting…</div>
+  </nav>
+
+  <main class="content">
+    <h1>Pools</h1>
+    <div id="errors"></div>
+    <div class="row">
+      <button id="add-pool-btn">Add Pool</button>
+      <span class="sub" id="add-pool-msg"></span>
+    </div>
+
+    <!-- Add Pool: pick a loaded ChiMod, then fill the form IT provides
+         (GET /api/mod/<mod>/create). Modules without a form get the generic
+         compose editor: identity fields plus raw YAML for module params. -->
+    <div class="card" id="add-pool-panel" style="display:none; margin:1rem 0;">
+      <h3>Add pool</h3>
+      <div class="row">
+        <input id="ap-search" size="18" placeholder="search modules…">
+        <select id="ap-module"></select>
+      </div>
+      <div id="ap-form" style="margin-top:0.75rem;"></div>
+      <div class="row" style="margin-top:0.75rem;">
+        <button id="ap-validate">Validate</button>
+        <button id="ap-create">Create</button>
+        <button id="ap-cancel">Cancel</button>
+      </div>
+      <div class="sub" id="ap-result"></div>
+    </div>
+
+    <!-- Pools, grouped into one section per ChiMod. Each card navigates to the
+         pool's website (its module's page with ?pool=, or the generic pool page
+         when the module ships none); the corner "x" shuts the pool down. -->
+    <div id="pools"><div class="empty">loading pools…</div></div>
+
+    <h2>Monitor explorer</h2>
+    <p class="sub">
+      Forwards any query to a pool's own <code>Monitor()</code> handler. This is
+      the same endpoint a ChiMod's own dashboard page uses, so whatever a module
+      answers here it can render for itself.
+    </p>
+    <div class="row">
+      <input id="pool" size="10" placeholder="pool id" value="">
+      <input id="query" size="18" placeholder="query" value="stats">
+      <select id="routing">
+        <option value="local">local</option>
+        <option value="broadcast">broadcast</option>
+      </select>
+      <button id="run">Query</button>
+    </div>
+    <pre id="result">Pick a pool above, or click a row.</pre>
+  </main>
+
+  <script src="js/api.js"></script>
+  <script src="js/pools.js"></script>
+</body>
+</html>

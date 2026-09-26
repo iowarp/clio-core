@@ -12,6 +12,13 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
+  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
+  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
+  # single bad commit turns every later push red. A merge_group run is that
+  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
+  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -32,16 +39,25 @@ jobs:
   # node containers, with gcov pulled out of the nodes) is folded in next; until
   # then it still runs, without coverage, in cluster-tests.yml.
   # ---- Matrix tier selection (issue #921) -----------------------------------
-  # A pull request runs the `unit amd64` phase only; the full phase sweep runs
-  # on push to main/dev. Every PR commit fanning out to six phases plus four
+  # A pull request runs `unit amd64` and `cae`; the full phase sweep runs on
+  # push to main/dev. Every PR commit fanning out to six phases plus four
   # variant jobs made Linux the slowest gate and multiplied flake exposure
-  # without multiplying signal -- the non-unit phases each scope themselves to
+  # without multiplying signal -- the remaining phases each scope themselves to
   # one subtree and rarely fail alone. They still gate what lands, at the merge
   # point rather than on every push to a branch.
   #
-  # `unit amd64` is the PR phase because it is the only one that runs the core
+  # `unit amd64` is a PR phase because it is the only one that runs the core
   # suite (everything except adapter/integration/docker/cae/cee), so a
   # regression in the runtime, transport, or CTE shows up there first.
+  #
+  # `cae` is a PR phase because it is the ONLY phase that runs the CAE suite at
+  # all: those tests are label-gated (`ctest -L cae`) and the `unit` phase's
+  # default exclude set drops every CAE test carrying `integration` -- which is
+  # most of the ones that exercise a live runtime, since that label is what
+  # keeps them off macOS (issue #504). Without this phase a PR touching CAE
+  # skipped its own tests entirely and reported near-zero patch coverage, so a
+  # CAE regression only surfaced after merge. It is amd64-only and scoped to
+  # */context-assimilation-engine/*, so it adds one job, not a sweep.
   #
   # The phase list lives here as JSON rather than as a `strategy.matrix.include`
   # block because a job-level `if:` cannot see the `matrix` context -- filtering
@@ -73,6 +89,7 @@ jobs:
   #              server's Python deps, both installed in the job below.
   matrix-tier:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       phases: ${{ steps.pick.outputs.phases }}
       full: ${{ steps.pick.outputs.full }}
@@ -92,7 +109,7 @@ jobs:
           JSON
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "full=false" >> "$GITHUB_OUTPUT"
-            sel=$(jq -c '{include: [.[] | select(.phase == "unit" and .arch == "amd64")]}' /tmp/phases.json)
+            sel=$(jq -c '{include: [.[] | select((.phase == "unit" and .arch == "amd64") or .phase == "cae")]}' /tmp/phases.json)
           else
             echo "full=true" >> "$GITHUB_OUTPUT"
             sel=$(jq -c '{include: .}' /tmp/phases.json)
@@ -113,7 +130,9 @@ jobs:
         with:
           submodules: recursive
       - name: Install lcov (+ phase deps)
-        run: sudo apt-get update && sudo apt-get install -y lcov ${{ matrix.apt }}
+        run: |
+          bash CI/retry.sh sudo apt-get update
+          bash CI/retry.sh sudo apt-get install -y lcov ${{ matrix.apt }}
       - name: Install project dependencies (CI/ci-deps.sh)
         run: |
           chmod +x CI/ci-deps.sh
@@ -194,11 +213,11 @@ jobs:
               export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
               git config --global --add safe.directory /workspace
               (dpkg -s libboost-context-dev >/dev/null 2>&1) || \
-                (apt-get update -qq && apt-get install -y -qq libboost-context-dev libboost-dev)
+                (for i in 1 2 3; do apt-get update -qq && apt-get install -y -qq libboost-context-dev libboost-dev && break || sleep 5; done)
               cmake --preset boost
               cmake --build build-boost -j"$(nproc)"
               cd build-boost
-              # -LE "force_net": the CLIO_FORCE_NET loopback-network stress
+              # -LE "force_net|flaky": the CLIO_FORCE_NET loopback-network stress
               # variants are single-node net-path tests (some CI-only flaky,
               # e.g. #579); they are covered by the leak + cluster jobs and do
               # not belong in this containerized build. Excluded by label so
@@ -219,7 +238,7 @@ jobs:
               #    with a transient container-resource limit rather than a code
               #    bug. Tracked for a deeper in-container bdev-allocation fix.
               #  * ctp_async_io -- unrelated deps-cpu incompatibility.
-              ctest --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama|force_net" -E "ctp_async_io|cte_tiered_storage_all|cte_tiered_dram_default_all"
+              ctest --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama|force_net|flaky" -E "ctp_async_io|cte_tiered_storage_all|cte_tiered_dram_default_all"
             '
 
   boost-native:
@@ -238,7 +257,9 @@ jobs:
         with:
           submodules: recursive
       - name: Install system libraries
-        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev liburing-dev
+        run: |
+          bash CI/retry.sh sudo apt-get update
+          bash CI/retry.sh sudo apt-get install -y libhdf5-dev liburing-dev
       - name: Install dependencies (conda env, incl. Boost.Context)
         run: |
           chmod +x CI/ci-deps.sh
@@ -255,7 +276,13 @@ jobs:
           conda activate iowarp
           cmake --preset boost
           cmake --build build-boost -j"$(nproc)"
-          ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama"
+          ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama|flaky"
+      - name: Report retried-but-passed tests
+        if: always()
+        shell: bash
+        # A green check must not mean "some test failed and we retried until it
+        # did not" (#919/#921). Reports only -- never fails the job.
+        run: bash CI/report_flaky_tests.sh build-boost/Testing/Temporary/LastTest.log "linux boost ${{ matrix.os }}"
 
   # ---- Sanitizers: asan / ubsan / msan --------------------------------------
   sanitizers:
@@ -278,13 +305,13 @@ jobs:
       - name: Install sanitizer runtime libraries (ASan/UBSan)
         if: matrix.sanitizer != 'msan'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libasan8 libubsan1 libhdf5-dev
+          bash CI/retry.sh sudo apt-get update
+          bash CI/retry.sh sudo apt-get install -y libasan8 libubsan1 libhdf5-dev
       - name: Install Clang for MSan
         if: matrix.sanitizer == 'msan'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm libhdf5-dev
+          bash CI/retry.sh sudo apt-get update
+          bash CI/retry.sh sudo apt-get install -y clang llvm libhdf5-dev
       - name: Build and test with ${{ matrix.sanitizer }}
         run: |
           chmod +x CI/ci-deps.sh CI/run_sanitizers.sh
@@ -314,8 +341,8 @@ jobs:
           submodules: recursive
       - name: Install system libraries
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libhdf5-dev liburing-dev
+          bash CI/retry.sh sudo apt-get update
+          bash CI/retry.sh sudo apt-get install -y libhdf5-dev liburing-dev
       - name: Install dependencies (conda env)
         run: |
           chmod +x CI/ci-deps.sh

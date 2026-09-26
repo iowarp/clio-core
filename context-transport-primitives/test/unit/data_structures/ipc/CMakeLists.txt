@@ -119,6 +119,23 @@ add_test(NAME ctp_ipc_lease COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_lease_exec)
 set_tests_properties(ctp_ipc_lease PROPERTIES TIMEOUT 120)
 
+# msan_skip: these three assert cleanly under MSan, but Catch2 fails them
+# anyway. Before each test case the prebuilt libCatch2.so installs its crash
+# handler, and the `struct sigaction` it passes sits on stack our instrumented
+# test bodies just poisoned -- MSan's sigaction interceptor then reports memory
+# that belongs to a frame we do not compile. Measured on build-msan: 36 / 78 /
+# 31 warnings per run, every one of them that same call.
+#
+# Nothing narrower works. The ignorelist cannot reach a check that fires inside
+# libCatch2.so; ignorelisting the test bodies stops the poisoning but also
+# leaves every object they construct unpoisoned, which is exactly the memory
+# these tests exist to check; and building Catch2 from source under MSan just
+# swaps the sigaction reports for reports from Catch2's own reporter against an
+# uninstrumented libstdc++ (tried, still non-zero). An MSan-instrumented libc++
+# would fix this properly; until then these run under asan/ubsan only.
+set_tests_properties(ctp_ipc_string ctp_ipc_unordered_map ctp_ipc_lease
+        PROPERTIES LABELS "msan_skip")
+
 add_test(NAME ctp_ring_buffer COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_exec)
 add_test(NAME ctp_ring_buffer_spsc COMMAND

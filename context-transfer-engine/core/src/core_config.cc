@@ -34,6 +34,7 @@
 #include <clio_cte/core/core_config.h>
 #include <clio_runtime/bdev/bdev_tasks.h>
 #include <yaml-cpp/yaml.h>
+#include <clio_ctp/util/msan.h>
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
@@ -61,6 +62,8 @@ bool Config::LoadFromFile(const std::string &config_file_path) {
     
     // Load and parse YAML
     YAML::Node root = YAML::LoadFile(config_file_path);
+    // yaml-cpp is a prebuilt .so; its scalars carry no MSan shadow.
+    ctp::MsanUnpoisonYaml(root);
     
     // Parse configuration using base class method
     if (!ParseYamlNode(root)) {
@@ -95,6 +98,7 @@ bool Config::LoadFromString(const std::string &yaml_string) {
 
     // Load and parse YAML from string
     YAML::Node root = YAML::Load(yaml_string);
+    ctp::MsanUnpoisonYaml(root);  // see LoadFromFile
 
     // Parse configuration using base class method
     if (!ParseYamlNode(root)) {
@@ -309,24 +313,6 @@ bool Config::ParseYamlNode(const YAML::Node &node) {
   }
   if (node["organizer_period_ms"]) {
     organizer_.period_ms_ = node["organizer_period_ms"].as<clio::run::u32>();
-  }
-
-  // Parse GPU metadata cache configuration (optional)
-  if (node["gpu_metadata_cache"]) {
-    const YAML::Node &gmc = node["gpu_metadata_cache"];
-    if (gmc["enabled"]) {
-      gpu_metadata_cache_.enabled_ = gmc["enabled"].as<bool>();
-    }
-    if (gmc["capacity"]) {
-      std::string cap_str = gmc["capacity"].as<std::string>();
-      ParseSizeString(cap_str, gpu_metadata_cache_.capacity_bytes_);
-    }
-    if (gmc["max_blobs"]) {
-      gpu_metadata_cache_.max_blobs_ = gmc["max_blobs"].as<clio::run::u32>();
-    }
-    if (gmc["max_tags"]) {
-      gpu_metadata_cache_.max_tags_ = gmc["max_tags"].as<clio::run::u32>();
-    }
   }
 
   // Parse environment variable configuration

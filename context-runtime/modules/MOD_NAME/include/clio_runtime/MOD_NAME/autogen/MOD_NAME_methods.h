@@ -26,8 +26,10 @@ GLOBAL_CROSS_CONST clio::run::u32 kTestLargeOutput = 24;
 GLOBAL_CROSS_CONST clio::run::u32 kGpuSubmit = 25;
 GLOBAL_CROSS_CONST clio::run::u32 kSubtaskTest = 26;
 GLOBAL_CROSS_CONST clio::run::u32 kManyToOneSum = 27;
+GLOBAL_CROSS_CONST clio::run::u32 kAllReduce = 28;
+GLOBAL_CROSS_CONST clio::run::u32 kBarrier = 29;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 28;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 30;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -43,6 +45,8 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[25] = "GpuSubmit";
     v[26] = "SubtaskTest";
     v[27] = "ManyToOneSum";
+    v[28] = "AllReduce";
+    v[29] = "Barrier";
     return v;
   }();
   return names;

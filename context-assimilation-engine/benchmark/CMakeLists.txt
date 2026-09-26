@@ -1,7 +1,8 @@
 # CAE benchmark directory CMakeLists.txt
 cmake_minimum_required(VERSION 3.20)
 
-# clio_cae_label_bench — stresses CAE's transparent-labeling PutBlob path.
+# clio_cae_label_bench — stresses the summarizer chimod's PutBlob path
+# (CAE core -> summarizer -> CTE core).
 # Uses POSIX-only APIs (mkstemps, /tmp); skip on Windows.
 if(NOT WIN32)
   add_executable(clio_cae_label_bench

@@ -171,9 +171,11 @@ install(TARGETS test_cae_comprehensive DESTINATION bin)
 # Test 4b: CAE Config/Task Unit Tests (pure, no runtime)
 #------------------------------------------------------------------------------
 # Header-only coverage for core_tasks.h that the runtime tests never touch:
-#   - CreateParams::LoadConfig YAML parsing (all fields + empty + malformed)
-#   - CreateParams / LabelMatch serialize round-trips
+#   - CreateParams::LoadConfig YAML parsing (next_pool_id + empty + malformed)
+#   - CreateParams serialize round-trip
 #   - CreateParams copy and compose-pool-id constructors
+# The summarization config moved to the summarizer chimod; its equivalent
+# coverage is test_summarizer_config_units below.
 # No CLIO runtime, CTE client, or network — runs in milliseconds.
 #------------------------------------------------------------------------------
 resolve_yaml_cpp_target()
@@ -203,6 +205,85 @@ add_test(NAME cae_config_units COMMAND test_cae_config_units)
 set_tests_properties(cae_config_units PROPERTIES
   TIMEOUT 60
   LABELS "coverage;cae;config;msan_skip"
+)
+
+#------------------------------------------------------------------------------
+# Test 4c: Summarizer Config/Task Unit Tests (pure, no runtime)
+#------------------------------------------------------------------------------
+# The summarization half of what test_cae_config_units used to cover, now
+# against summarizer_tasks.h:
+#   - SummarizerConfig::LoadConfig YAML parsing (all label_* fields + empty +
+#     malformed)
+#   - SummarizerConfig / LabelMatch serialize round-trips
+#   - SummarizerConfig copy and compose-pool-id constructors
+# Labeled "cae" so the CI coverage `cae` phase (`ctest -L cae`) keeps running
+# it now that the code lives outside context-assimilation-engine/core.
+#------------------------------------------------------------------------------
+add_executable(test_summarizer_config_units
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_config_units.cc
+)
+
+target_include_directories(test_summarizer_config_units
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_summarizer_config_units
+  PRIVATE
+    clio_cae_summarizer_client
+    clio_cte_core_client
+    clio::run::cxx
+    ctp::cxx
+    ${YAML_CPP_LIBS}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+install(TARGETS test_summarizer_config_units DESTINATION bin)
+
+add_test(NAME summarizer_config_units COMMAND test_summarizer_config_units)
+set_tests_properties(summarizer_config_units PROPERTIES
+  TIMEOUT 60
+  LABELS "coverage;cae;summarizer;config;msan_skip"
+)
+
+#------------------------------------------------------------------------------
+# Test 4d: Summarizer rule/chunking Unit Tests (pure, no runtime)
+#------------------------------------------------------------------------------
+# FindLabelMatch and SplitPayload from summarizer_rules.h: rule precedence, the
+# regex_search semantics and invalid-regex skip, and the chunk-boundary
+# arithmetic (chunking disabled, empty payload, template deduction, sanity
+# floor). Deliberately NOT labeled "integration": those two functions are the
+# decision logic of the whole module, and the tests that drive them through a
+# live PutBlob are integration-labeled -- which excludes them from the default
+# (and PR) coverage phase. Testing them directly keeps them measured.
+#------------------------------------------------------------------------------
+add_executable(test_summarizer_rules
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_rules.cc
+)
+
+target_include_directories(test_summarizer_rules
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_summarizer_rules
+  PRIVATE
+    clio_cae_summarizer_client
+    clio_cte_core_client
+    clio::run::cxx
+    ctp::cxx
+    ${YAML_CPP_LIBS}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+install(TARGETS test_summarizer_rules DESTINATION bin)
+
+add_test(NAME summarizer_rules COMMAND test_summarizer_rules)
+set_tests_properties(summarizer_rules PROPERTIES
+  TIMEOUT 60
+  LABELS "coverage;cae;summarizer;rules;msan_skip"
 )
 
 # Register individual test cases with CTest
@@ -466,28 +547,31 @@ set_tests_properties(
 )
 
 #------------------------------------------------------------------------------
-# Test 7b: CAE labeling-dispatch + semantic-search forward (no Ollama)
+# Test 7b: summarizer dispatch + semantic-search forward (no Ollama)
 #------------------------------------------------------------------------------
-# Exercises the CAE-side transparent-labeling dispatch that runs before any LLM
-# call (FindLabelMatch incl. its regex_error catch, the matching + no-match
-# paths, prompt resolution/chunking, and the graceful OllamaGenerate failure)
-# plus the SemanticSearch BM25 forward. The label_endpoint is a dead port, so
-# unlike the Ollama-gated labeling tests this one needs no live model.
+# Exercises the summarizer-side dispatch that runs before any LLM call (tag
+# name resolution, FindLabelMatch incl. its regex_error catch, the matching +
+# no-match paths, prompt resolution/chunking, and the graceful OllamaGenerate
+# failure) plus the SemanticSearch forward through the interposition default.
+# The label_endpoint is a dead port, so unlike the Ollama-gated summarization
+# tests this one needs no live model.
 #------------------------------------------------------------------------------
-add_executable(test_cae_labeling_dispatch
-  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_labeling_dispatch.cc
+add_executable(test_summarizer_dispatch
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_dispatch.cc
 )
 
-target_include_directories(test_cae_labeling_dispatch
+target_include_directories(test_summarizer_dispatch
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/context-runtime/test
 )
 
-target_link_libraries(test_cae_labeling_dispatch
+target_link_libraries(test_summarizer_dispatch
   PRIVATE
     clio_cae_core_client
     clio_cae_core_runtime
+    clio_cae_summarizer_client
+    clio_cae_summarizer_runtime
     clio_cte_core_client
     clio_cte_core_runtime
     clio::run::admin_runtime
@@ -500,18 +584,18 @@ target_link_libraries(test_cae_labeling_dispatch
     ${CMAKE_THREAD_LIBS_INIT}
 )
 
-add_custom_command(TARGET test_cae_labeling_dispatch POST_BUILD
+add_custom_command(TARGET test_summarizer_dispatch POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_labeling_dispatch_config.yaml
-    ${CMAKE_CURRENT_BINARY_DIR}/test_cae_labeling_dispatch_config.yaml
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_dispatch_config.yaml
+    ${CMAKE_CURRENT_BINARY_DIR}/test_summarizer_dispatch_config.yaml
 )
 
-install(TARGETS test_cae_labeling_dispatch DESTINATION bin)
+install(TARGETS test_summarizer_dispatch DESTINATION bin)
 
-add_test(NAME cae_labeling_dispatch COMMAND test_cae_labeling_dispatch)
+add_test(NAME summarizer_dispatch COMMAND test_summarizer_dispatch)
 
 set_tests_properties(
-    cae_labeling_dispatch
+    summarizer_dispatch
     PROPERTIES
         TIMEOUT 180
         # Labeled "cae" so the CI coverage `cae` phase (`ctest -L cae`) runs it
@@ -520,9 +604,80 @@ set_tests_properties(
         # and string-assim tests it drives the CAE->CTE forward GetBlob path,
         # which hangs on the macOS loopback data path (issue #504). `-L cae`
         # ignores the integration exclusion, so coverage is unaffected.
-        LABELS "coverage;cae;labeling;dispatch;integration;msan_skip"
+        LABELS "coverage;cae;summarizer;labeling;dispatch;integration;msan_skip"
         RESOURCE_LOCK "clio_runtime"
 )
+
+#------------------------------------------------------------------------------
+# Test 7c: summarizer summarize-and-store (no Ollama)
+#------------------------------------------------------------------------------
+# The SUCCESS half of the summarization path — prompt the model, then write the
+# response back as `{name}_label`. Tests 8 & 9 cover it only with a live Ollama,
+# so on a machine without a model it had no coverage at all. Here an in-process
+# HTTP stub answers like Ollama, so the whole path runs hermetically.
+#
+# Gated on CAE_SUMMARIZATION_ENABLED for the same reason as the label-client
+# test below: without libcurl, OllamaGenerate compiles to a stub that always
+# fails, so no summary is ever produced and the whole point of this test is
+# unreachable. (Windows CI has no libcurl; summarizer_dispatch still covers
+# the interposition there, since it EXPECTS inference to fail.)
+#------------------------------------------------------------------------------
+if(CAE_SUMMARIZATION_ENABLED)
+add_executable(test_summarizer_store
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_store.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/summarizer_http_stub.cc
+)
+
+target_include_directories(test_summarizer_store
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_summarizer_store
+  PRIVATE
+    clio_cae_core_client
+    clio_cae_core_runtime
+    clio_cae_summarizer_client
+    clio_cae_summarizer_runtime
+    clio_cte_core_client
+    clio_cte_core_runtime
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    clio::run::cxx
+    ctp::cxx
+    ctp::configure
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+if(WIN32)
+  # The in-process HTTP stub uses Winsock directly.
+  target_link_libraries(test_summarizer_store PRIVATE ws2_32)
+endif()
+
+add_custom_command(TARGET test_summarizer_store POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_store_config.yaml
+    ${CMAKE_CURRENT_BINARY_DIR}/test_summarizer_store_config.yaml
+)
+
+install(TARGETS test_summarizer_store DESTINATION bin)
+
+add_test(NAME summarizer_store COMMAND test_summarizer_store)
+
+set_tests_properties(
+    summarizer_store
+    PROPERTIES
+        TIMEOUT 180
+        # Same labeling rationale as summarizer_dispatch: "cae" keeps it in the
+        # CI coverage phase, "integration" keeps it out of the macOS/default
+        # runs that cannot drive the forward GetBlob path (issue #504).
+        LABELS "coverage;cae;summarizer;store;integration;msan_skip"
+        RESOURCE_LOCK "clio_runtime"
+)
+endif()  # CAE_SUMMARIZATION_ENABLED
 
 # Tests 8 & 9 (LLM labeling + semantic search) require a running Ollama
 # service, so they are gated behind CLIO_CAE_ENABLE_SUMMARY (OFF by default) —
@@ -530,28 +685,30 @@ set_tests_properties(
 if(CLIO_CAE_ENABLE_SUMMARY)
 
 #------------------------------------------------------------------------------
-# Test 8: CAE Transparent Labeling Integration Test (uses local Ollama)
+# Test 8: Summarizer Transparent Labeling Integration Test (local Ollama)
 #------------------------------------------------------------------------------
-# Brings up CAE with label_matches pointing at a local Ollama instance
-# (127.0.0.1:11434, gemma3:1b). Verifies that a PutBlob whose tag+blob
-# name matches the rule produces a `{name}_label` blob with non-empty
+# Brings up the summarizer chimod with label_matches pointing at a local
+# Ollama instance (127.0.0.1:11434, gemma3:1b). Verifies that a PutBlob whose
+# tag+blob name matches the rule produces a `{name}_label` blob with non-empty
 # contents. CAE_LABEL_TEST_SKIP=1 short-circuits the test for environments
 # without Ollama.
 #------------------------------------------------------------------------------
-add_executable(test_cae_labeling
-  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_labeling.cc
+add_executable(test_summarizer_labeling
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_labeling.cc
 )
 
-target_include_directories(test_cae_labeling
+target_include_directories(test_summarizer_labeling
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/context-runtime/test
 )
 
-target_link_libraries(test_cae_labeling
+target_link_libraries(test_summarizer_labeling
   PRIVATE
     clio_cae_core_client
     clio_cae_core_runtime
+    clio_cae_summarizer_client
+    clio_cae_summarizer_runtime
     clio_cte_core_client
     clio_cte_core_runtime
     clio::run::admin_runtime
@@ -564,50 +721,52 @@ target_link_libraries(test_cae_labeling
     ${CMAKE_THREAD_LIBS_INIT}
 )
 
-add_custom_command(TARGET test_cae_labeling POST_BUILD
+add_custom_command(TARGET test_summarizer_labeling POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_labeling_config.yaml
-    ${CMAKE_CURRENT_BINARY_DIR}/test_cae_labeling_config.yaml
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_labeling_config.yaml
+    ${CMAKE_CURRENT_BINARY_DIR}/test_summarizer_labeling_config.yaml
 )
 
-install(TARGETS test_cae_labeling DESTINATION bin)
+install(TARGETS test_summarizer_labeling DESTINATION bin)
 
-add_test(NAME cae_labeling_ollama
-    COMMAND test_cae_labeling)
+add_test(NAME summarizer_labeling_ollama
+    COMMAND test_summarizer_labeling)
 
 # 5-min timeout — gemma3:1b on CPU is usually under 10s but cold-start
 # weights can take longer. msan_skip because libcurl/openssl aren't
 # instrumented and we don't run a real LLM under MSan anyway.
 set_tests_properties(
-    cae_labeling_ollama
+    summarizer_labeling_ollama
     PROPERTIES
         TIMEOUT 300
-        LABELS "cae;labeling;ollama;integration;msan_skip"
+        LABELS "cae;summarizer;labeling;ollama;integration;msan_skip"
         RESOURCE_LOCK "clio_runtime"
 )
 
 #------------------------------------------------------------------------------
-# Test 9: CAE labels 10 docs; CTE SemanticSearch returns top-5
+# Test 9: summarizer labels 10 docs; CTE SemanticSearch returns top-5
 #------------------------------------------------------------------------------
-# Puts 10 short documents through CAE (auto-labels via local Ollama),
-# then exercises the new CTE/CAE SemanticSearch API: BM25-ranked top-5
-# results for a natural-language query. Validates the full
-# transparent-labeling → keyword-search pipeline.
+# Puts 10 short documents through the CAE core -> summarizer -> indexer chain
+# (auto-summarized via local Ollama), then exercises the SemanticSearch API:
+# BM25-ranked top-5 results for a natural-language query. Validates the full
+# transparent-summarization → keyword-search pipeline.
 #------------------------------------------------------------------------------
-add_executable(test_cae_semantic_search
-  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_semantic_search.cc
+add_executable(test_summarizer_semantic_search
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_semantic_search.cc
 )
 
-target_include_directories(test_cae_semantic_search
+target_include_directories(test_summarizer_semantic_search
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/context-runtime/test
 )
 
-target_link_libraries(test_cae_semantic_search
+target_link_libraries(test_summarizer_semantic_search
   PRIVATE
     clio_cae_core_client
     clio_cae_core_runtime
+    clio_cae_summarizer_client
+    clio_cae_summarizer_runtime
     clio_cte_core_client
     clio_cte_core_runtime
     clio::run::admin_runtime
@@ -620,24 +779,24 @@ target_link_libraries(test_cae_semantic_search
     ${CMAKE_THREAD_LIBS_INIT}
 )
 
-add_custom_command(TARGET test_cae_semantic_search POST_BUILD
+add_custom_command(TARGET test_summarizer_semantic_search POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_semantic_search_config.yaml
-    ${CMAKE_CURRENT_BINARY_DIR}/test_cae_semantic_search_config.yaml
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_semantic_search_config.yaml
+    ${CMAKE_CURRENT_BINARY_DIR}/test_summarizer_semantic_search_config.yaml
 )
 
-install(TARGETS test_cae_semantic_search DESTINATION bin)
+install(TARGETS test_summarizer_semantic_search DESTINATION bin)
 
-add_test(NAME cae_semantic_search
-    COMMAND test_cae_semantic_search)
+add_test(NAME summarizer_semantic_search
+    COMMAND test_summarizer_semantic_search)
 
 # 10 sequential Ollama inferences + a server-side BM25 sweep — give
 # this enough wall budget for cold-start model load on slower CI.
 set_tests_properties(
-    cae_semantic_search
+    summarizer_semantic_search
     PROPERTIES
         TIMEOUT 600
-        LABELS "cae;cte;bm25;semantic-search;ollama;integration;msan_skip"
+        LABELS "cae;summarizer;cte;bm25;semantic-search;ollama;integration;msan_skip"
         RESOURCE_LOCK "clio_runtime"
 )
 
@@ -770,25 +929,26 @@ endif()
 message(STATUS "")
 
 # ------------------------------------------------------------------------------
-# Label client (Ollama HTTP) unit tests — uses an in-process HTTP fixture.
-# Without libcurl OllamaGenerate is a stub that always fails, so the success
-# paths can't pass; only build/register the test when labeling is enabled
-# (CAE_LABELING_ENABLED is inherited from core/CMakeLists.txt).
+# Summarizer label client (Ollama HTTP) unit tests — uses an in-process HTTP
+# fixture. Without libcurl OllamaGenerate is a stub that always fails, so the
+# success paths can't pass; only build/register the test when summarization is
+# enabled (CAE_SUMMARIZATION_ENABLED is set in context-assimilation-engine/CMakeLists.txt).
 # ------------------------------------------------------------------------------
-if(CAE_LABELING_ENABLED)
-  add_executable(test_cae_label_client
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_label_client.cc
+if(CAE_SUMMARIZATION_ENABLED)
+  add_executable(test_summarizer_label_client
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_label_client.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/summarizer_http_stub.cc
   )
 
-  target_include_directories(test_cae_label_client
+  target_include_directories(test_summarizer_label_client
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}
   )
 
-  target_link_libraries(test_cae_label_client
+  target_link_libraries(test_summarizer_label_client
     PRIVATE
-      clio_cae_core_runtime
-      clio_cae_core_client
+      clio_cae_summarizer_runtime
+      clio_cae_summarizer_client
       clio_cte_core_client
       clio::run::admin_runtime
       clio::run::bdev_runtime
@@ -798,21 +958,65 @@ if(CAE_LABELING_ENABLED)
 
   if(WIN32)
     # The in-process HTTP fixture uses Winsock directly.
-    target_link_libraries(test_cae_label_client PRIVATE ws2_32)
+    target_link_libraries(test_summarizer_label_client PRIVATE ws2_32)
   endif()
 
-  add_test(NAME cae_label_client_all COMMAND test_cae_label_client)
+  add_test(NAME summarizer_label_client_all COMMAND test_summarizer_label_client)
   # msan_skip: the label client drives HTTP through the uninstrumented
   # libcurl.so (and poll() over its sockets) and prints counts through
   # SimpleTest::print_summary (uninstrumented libstdc++ ostream). All reported
   # reads originate in third-party libraries MSan cannot instrument.
-  set_tests_properties(cae_label_client_all PROPERTIES
+  set_tests_properties(summarizer_label_client_all PROPERTIES
     TIMEOUT 60
-    LABELS "cae;msan_skip"
+    LABELS "cae;summarizer;msan_skip"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
   )
 
-  install(TARGETS test_cae_label_client DESTINATION bin)
+  install(TARGETS test_summarizer_label_client DESTINATION bin)
+
+  #----------------------------------------------------------------------------
+  # GenerateSummary (chunk-and-concatenate) tests — stub server, no runtime.
+  #----------------------------------------------------------------------------
+  # The partial-failure and multi-chunk-join semantics that only a live model
+  # could reach before. Same libcurl gate as the label-client test above (the
+  # loop calls OllamaGenerate), but NO "integration" label: it needs no runtime,
+  # so it stays in the default/PR coverage phase.
+  #----------------------------------------------------------------------------
+  add_executable(test_summarizer_inference
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_inference.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/summarizer_http_stub.cc
+  )
+
+  target_include_directories(test_summarizer_inference
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  target_link_libraries(test_summarizer_inference
+    PRIVATE
+      clio_cae_summarizer_runtime
+      clio_cae_summarizer_client
+      clio_cte_core_client
+      clio::run::admin_runtime
+      clio::run::bdev_runtime
+      ctp::cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+  if(WIN32)
+    target_link_libraries(test_summarizer_inference PRIVATE ws2_32)
+  endif()
+
+  add_test(NAME summarizer_inference COMMAND test_summarizer_inference)
+  # msan_skip for the same reason as the label client: HTTP through an
+  # uninstrumented libcurl.
+  set_tests_properties(summarizer_inference PROPERTIES
+    TIMEOUT 120
+    LABELS "coverage;cae;summarizer;inference;msan_skip"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+  )
+
+  install(TARGETS test_summarizer_inference DESTINATION bin)
 endif()
 
 #------------------------------------------------------------------------------

@@ -14,8 +14,15 @@ endif()
 message(STATUS "VFD: building against HDF5 ${HDF5_VERSION} (${HDF5_INCLUDE_DIRS})")
 
 # Dynamically loaded VFDs must be shared libraries.
-add_library(clio_vfd SHARED
-  ${CMAKE_CURRENT_SOURCE_DIR}/H5FDclio.cc)
+set(CLIO_VFD_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/H5FDclio.cc)
+if(WIN32)
+  # Win32 half of the platform layer. A separate translation unit so that
+  # <windows.h> -- and the macros it defines over ordinary identifiers like
+  # Yield() -- never reaches the driver body or clio's headers.
+  list(APPEND CLIO_VFD_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/H5FDclio_compat_win.cc)
+endif()
+
+add_library(clio_vfd SHARED ${CLIO_VFD_SOURCES})
 set_target_properties(clio_vfd PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
@@ -32,6 +39,23 @@ target_link_libraries(clio_vfd
   ctp::cxx
   ctp::interceptor
   ${HDF5_LIBRARIES})
+
+# Flips CLIO_VFD_API (H5FDclio.h) to dllexport for this target; every consumer
+# leaves it undefined and gets dllimport.
+target_compile_definitions(clio_vfd PRIVATE CLIO_VFD_BUILD)
+
+if(WIN32 AND NOT HDF5_USE_STATIC_LIBRARIES)
+  # HDF5's public GLOBALS -- H5P_CLS_FILE_ACCESS_ID_g, which H5Pset_fapl_clio
+  # reaches through the H5P_FILE_ACCESS macro -- are declared H5_DLLVAR, and
+  # H5api_adpt.h only expands that to __declspec(dllimport) when the CONSUMER
+  # defines H5_BUILT_AS_DYNAMIC_LIB. Without it MSVC emits a plain extern and
+  # the link fails with LNK2019 on that symbol; functions are unaffected, so
+  # the build gets all the way to linking before anything complains.
+  #
+  # Guarded on HDF5_USE_STATIC_LIBRARIES because the macro would be wrong for a
+  # static HDF5, where the globals are ordinary externs.
+  target_compile_definitions(clio_vfd PRIVATE H5_BUILT_AS_DYNAMIC_LIB)
+endif()
 
 # -----------------------------------------------------------------------------
 # Install

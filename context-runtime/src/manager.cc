@@ -35,6 +35,7 @@
  * CLIO Runtime manager implementation
  */
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +56,21 @@ extern "C" void __gcov_dump(void);
 
 // Global pointer variable definition for CLIO Runtime manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::RuntimeManager, g_runtime_manager);
+
+/**
+ * Set by RuntimeManager::ServerFinalize, polled by the RequestStop watchdog.
+ *
+ * Deliberately NOT a RuntimeManager member. The watchdog thread is detached —
+ * it has to survive a teardown that wedges, which is the whole point of it —
+ * so it is typically parked between two 100 ms ticks when the normal exit path
+ * finishes, and the atexit handler below then deletes the manager out from
+ * under it. The next tick read a freed object: AddressSanitizer caught exactly
+ * that (heap-use-after-free in the watchdog lambda, freed by
+ * RuntimeManagerCleanupAtExit), and it failed every shutdown-battletest plus
+ * cfs_shm_read in the asan build. Static storage outlives every thread, so the
+ * flag is readable for as long as a detached watchdog can possibly look at it.
+ */
+static std::atomic<bool> g_finalize_complete{false};
 
 static void RuntimeManagerCleanupAtExit() {
   // exchange, not load-then-store: this runs from atexit while other threads
@@ -410,15 +426,10 @@ bool RuntimeManager::ServerInit() {
   // set up the gpu2cpu_queue + gpu2cpu_copy_backend at server-init
   // time.
 
-  // Start local server last - after all other initialization is complete
-  // This ensures clients can connect only when runtime is fully ready
-  if (!ipc_manager->StartLocalServer()) {
-    HLOG(kError,
-         "Failed to start local server - runtime initialization failed");
-    is_runtime_mode_ = false;
-    runtime_is_initializing_ = false;
-    return false;
-  }
+  // NOTE: the local server port is no longer claimed here. It is bound at the
+  // very top of IpcManager::ServerInit (issue #1015), because that bind is the
+  // atomic claim deciding which of several racing processes becomes this node's
+  // runtime -- a decision that cannot wait until initialization is complete.
 
   is_runtime_initialized_ = true;
   is_initialized_ = true;
@@ -504,6 +515,14 @@ void RuntimeManager::ServerFinalize() {
   // StopWorkers / ClearClientPool below.
   ctp::lbm::sock::SetSocketLibShutdown();
 
+  // Stop the web dashboard first (issue #990). Its request handlers submit
+  // tasks and wait on Futures, so they must be drained before the workers stop:
+  // a handler that started after StopWorkers() would wait out its whole timeout
+  // for a task nothing will ever run. Stop() waits for in-flight requests.
+  if (auto *viz = CLIO_VIZ) {
+    viz->Stop();
+  }
+
   // Flush in-flight (non-periodic) tasks and the net queues while the workers
   // are still running, so client/runtime work completes on its normal path and
   // its task + Future allocations are reclaimed instead of being abandoned by
@@ -558,7 +577,7 @@ void RuntimeManager::ServerFinalize() {
 
   // Signal the RequestStop watchdog (if any) that teardown completed so it
   // stands down instead of force-exiting. Must be the last statement here.
-  finalize_complete_.store(true);
+  g_finalize_complete.store(true, std::memory_order_release);
 }
 
 namespace {
@@ -622,11 +641,14 @@ void RuntimeManager::RequestStop(StopMode mode, u32 grace_period_ms) {
   // at escalation time — the logging system may be part of what wedged.
   const u64 deadline_ms =
       static_cast<u64>(grace_period_ms) + kShutdownTeardownMarginMs;
-  std::thread([this, deadline_ms]() {
+  // Captures nothing but the deadline: `this` must not outlive the exit path
+  // into a detached thread (see g_finalize_complete).
+  g_finalize_complete.store(false, std::memory_order_release);
+  std::thread([deadline_ms]() {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(deadline_ms);
     while (std::chrono::steady_clock::now() < deadline) {
-      if (finalize_complete_.load()) {
+      if (g_finalize_complete.load(std::memory_order_acquire)) {
         return;  // teardown finished; normal process exit proceeds
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(100));

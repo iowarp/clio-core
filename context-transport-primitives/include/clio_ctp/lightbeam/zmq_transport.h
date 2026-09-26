@@ -48,6 +48,7 @@
 
 #include "clio_ctp/introspect/system_info.h"
 #include "clio_ctp/util/logging.h"
+#include "clio_ctp/util/msan.h"
 #include "lightbeam.h"
 #include "posix_socket.h"
 
@@ -171,6 +172,14 @@ class ZeroMqTransport : public Transport {
         port_(port),
         use_shared_ctx_(use_shared_ctx),
         zmq_fired_action_(nullptr) {
+    // Everything below is a call into libzmq, which is a prebuilt .so with no
+    // MSan instrumentation: creating the socket, setting options, resolving
+    // and connecting the endpoint, polling for writability. libzmq hands libc
+    // buffers it filled itself -- the pollfd array, the resolved address, the
+    // signaler pipe -- so MSan's interceptors report memory belonging to
+    // frames we never compile. Suppress just those checks for the duration of
+    // setup; instrumented code here is still checked normally.
+    ctp::MsanInterceptorCheckGuard msan_guard;
     type_ = TransportType::kZeroMq;
     sock::InitSocketLib();
 
