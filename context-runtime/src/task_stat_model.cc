@@ -135,9 +135,18 @@ bool TaskStatModelSnapshot::Save(const std::string &path) const {
     // would happily load as the learned model.
     const std::string tmp_path = path + ".tmp";
     {
+      // The models directory does not exist on a fresh node; every runtime
+      // start then logged an ERROR per container and learned nothing across
+      // runs. Create it (best effort) before complaining.
+      std::error_code dir_ec;
+      std::filesystem::create_directories(
+          std::filesystem::path(path).parent_path(), dir_ec);
       std::ofstream ofs(tmp_path, std::ios::trunc);
       if (!ofs.is_open()) {
-        HLOG(kError, "TaskStatModel: failed to open {} for writing", tmp_path);
+        HLOG(kWarning,
+             "TaskStatModel: cannot write {} (directory create: {}); the "
+             "model will not persist across runs",
+             tmp_path, dir_ec ? dir_ec.message() : "ok");
         return false;
       }
       ofs << out.c_str() << "\n";

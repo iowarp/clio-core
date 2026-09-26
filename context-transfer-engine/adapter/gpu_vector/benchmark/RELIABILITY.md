@@ -63,6 +63,15 @@ production layout: one runtime per node remains the design.
 
 ## Other findings
 
+- Shared model directory. The learned task-stat models were saved under
+  `<conf_dir>/models` with `conf_dir` defaulting to `/tmp/clio`, shared by
+  every user of a node. On the login node that directory belonged to another
+  user: every runtime start logged an ERROR per container (the model could
+  not be written) and `RestoreModel` happily loaded the other user's models.
+  Fixed: `conf_dir` defaults to the per-user runtime directory
+  (`/tmp/clio_$USER`, the memfd directory); `runtime.conf_dir` still
+  overrides. The models directory is created on first save.
+
 - N^2 startup pool creation. The yaml has ONE tier line, but the CTE
   registers each node's tier as its own pool (`ram::<tier>_node<k>`) and every
   pool is created by broadcast with a container on EVERY node: node 5's log

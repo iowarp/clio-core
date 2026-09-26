@@ -411,6 +411,12 @@ void ConfigManager::LoadDefault() {
   // Set default configuration values
   num_threads_ = 4;
   queue_depth_ = 1024;
+  // Per-user by default (/tmp/clio_$USER, the same directory as the memfd
+  // links): the learned task-stat models live under <conf_dir>/models, and a
+  // shared /tmp/clio on a multi-user node meant one user's runtimes could not
+  // write the models (an ERROR per container at every start) and would
+  // RESTORE another user's. runtime.conf_dir in the yaml overrides.
+  conf_dir_ = ctp::SystemInfo::GetMemfdDir();
 
   main_segment_size_ = 0;                         // 0 means auto-calculate
   client_data_segment_size_ = 512 * 1024 * 1024;  // 512MB
@@ -481,7 +487,8 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
           runtime["task_progress_interval_ms"].as<u32>();
     }
 
-    // Configuration directory for persistent runtime config
+    // Configuration directory for persistent runtime config; the default is
+    // the per-user directory set in LoadDefault (see there).
     if (runtime["conf_dir"]) {
       conf_dir_ = runtime["conf_dir"].as<std::string>();
     }

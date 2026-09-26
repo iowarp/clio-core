@@ -1034,7 +1034,7 @@ bool IpcManager::ServerInitShm() {
     {
       const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
       if (budget > 0 && main_segment_size > budget / 2) {
-        HLOG(kWarning,
+        HLOG(kInfo,
              "Main segment: requested {} bytes exceeds half the memory "
              "budget ({} bytes); clamping to {} bytes",
              main_segment_size, budget, budget / 2);
@@ -1133,7 +1133,7 @@ bool IpcManager::ServerInitShm() {
       size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
       if (budget > 0 && metadata_segment_size > budget / 2) {
         size_t clamped = budget / 2;
-        HLOG(kWarning,
+        HLOG(kInfo,
              "Metadata segment: requested {} bytes exceeds half the memory "
              "budget ({} bytes); clamping to {} bytes",
              metadata_segment_size, budget, clamped);
