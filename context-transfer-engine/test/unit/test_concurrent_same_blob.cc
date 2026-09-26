@@ -65,6 +65,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -87,10 +88,49 @@ int FromEnv(const char *name, int dflt) {
   return dflt;
 }
 
+/**
+ * SAME_BLOB_FLUSH=1: run against a self-contained two-tier config (RAM +
+ * temporary file tier) with the periodic FlushData every 500 ms, so the
+ * flush's move-to-persistent-tier races the writers. This is the
+ * configuration under which the blob lost 0.4-240 MB before FlushData held
+ * the write token across its place-and-swap and sized the move under it
+ * (RELIABILITY.md defect 14). Written before CLIO_INIT so the runtime
+ * composes from it instead of whatever ~/.clio/clio.yaml holds.
+ */
+static void MaybeWriteFlushConfig() {
+  const char *on = std::getenv("SAME_BLOB_FLUSH");
+  if (on == nullptr || *on == '\0' || *on == '0') return;
+  const char *d = clio::run::env::GetCompat("TEST_DATA_DIR");
+  std::string dir = (d && *d) ? d : ".";
+  std::string path = dir + "/same_blob_flush.yaml";
+  std::string tier = dir + "/same_blob_flush_tier.dat";
+  std::remove(tier.c_str());
+  std::string yaml =
+      "runtime:\n  num_threads: 4\n  queue_depth: 1024\ncompose:\n"
+      "  - mod_name: clio_cte_core\n    pool_name: clio_cte\n"
+      "    pool_query: local\n    pool_id: 512.0\n"
+      "    targets:\n      neighborhood: 1\n"
+      "    storage:\n"
+      "      - path: \"ram::same_blob_flush_dram\"\n        bdev_type: \"ram\"\n"
+      "        capacity_limit: \"4GB\"\n        score: 1.0\n"
+      "      - path: \"" + tier + "\"\n        bdev_type: \"file\"\n"
+      "        capacity_limit: \"4GB\"\n        score: 0.2\n"
+      "        persistence_level: \"temporary\"\n"
+      "    performance:\n      flush_data_period_ms: 500\n"
+      "      flush_data_min_persistence: 1\n"
+      "    dpe:\n      dpe_type: \"max_bw\"\n";
+  FILE *f = std::fopen(path.c_str(), "w");
+  REQUIRE(f != nullptr);
+  std::fputs(yaml.c_str(), f);
+  std::fclose(f);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", path.c_str(), 1);
+}
+
 class Fixture {
  public:
   bool initialized_ = false;
   Fixture() {
+    MaybeWriteFlushConfig();
     bool ok = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
     REQUIRE(ok);
     std::this_thread::sleep_for(std::chrono::milliseconds(300));

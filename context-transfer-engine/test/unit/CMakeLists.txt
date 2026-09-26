@@ -940,6 +940,27 @@ set_tests_properties(
 # of the merge path was ~0. Reusing this test means the merged path is checked
 # by the strongest correctness assertion there is (each thread's disjoint region
 # must survive intact), not a bespoke smoke test.
+# Same-blob writes racing the periodic FlushData move to a persistent tier
+# (RELIABILITY.md defect 14): the flush must hold the write token across its
+# place-and-swap and size the move under it.
+add_test(NAME cte_concurrent_same_blob_flush
+    COMMAND test_concurrent_same_blob)
+
+set_tests_properties(
+    cte_concurrent_same_blob_flush
+    PROPERTIES
+        TIMEOUT 300  # 5 minute timeout -> a hang trips this
+        LABELS "regression;concurrent;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100;SAME_BLOB_FLUSH=1"
+)
+
+# issue #820: run the SAME rigorous same-blob correctness test again, this time
+# THROUGH the batching merge path (CLIO_CTE_BATCHING + CLIO_BATCH_LANE). Without
+# these env vars BuildBatch returns at its policy gate and SmashBatch /
+# CompleteBatchParents / the inline-exec sink never run -- which is why coverage
+# of the merge path was ~0. Reusing this test means the merged path is checked
+# by the strongest correctness assertion there is (each thread's disjoint region
+# must survive intact), not a bespoke smoke test.
 add_test(NAME cte_concurrent_same_blob_batched
     COMMAND test_concurrent_same_blob)
 set_tests_properties(

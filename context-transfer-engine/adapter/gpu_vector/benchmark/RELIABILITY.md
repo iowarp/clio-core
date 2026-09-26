@@ -47,7 +47,10 @@ same configuration at small scale.
     context-transfer-engine/test/unit) overwrites 8 blobs from 4 threads
     while 8 threads read and verify, generational (runtime path) and plain
     (zero-IPC path): 0 torn in ~17k puts / ~40k gets per case. The
-    startup-skew drop (defect 13) is `late_peer` in bench_colocated_tests.sh.
+    startup-skew drop (defect 13) is `late_peer` in bench_colocated_tests.sh;
+    the flush race (defect 14) is ctest `cte_concurrent_same_blob_flush`
+    (`SAME_BLOB_FLUSH=1`: self-contained two-tier config, FlushData every
+    500 ms racing 8 writers; 5-6 flushes per run, 0 lost bytes).
 
 ## Enabler: several runtimes on one node
 
