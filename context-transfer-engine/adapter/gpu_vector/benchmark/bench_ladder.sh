@@ -9,11 +9,19 @@
 #   rung 4  4 ranks, out of core    (broadcast fan-out, four-way hashing)
 #
 # Gates, per rung: every rank exits 0; every rank reports the same checksum;
-# the checksum matches rung 1's within BENCH_LADDER_RTOL (default per workload, 1e-6 for kmeans:
-# kmeans's checksum is an atomically accumulated float whose summation order
-# follows the layout, so bit-equality across rank counts is not expected); an
-# out-of-core rung must report evictions > 0 (a run that never evicted proves
-# nothing). The ladder stops at the first failed rung and leaves its logs in
+# an out-of-core rung must report evictions > 0 (a run that never evicted
+# proves nothing); and paging must not change the answer. How the last gate
+# is checked depends on the workload's checksum:
+#   intensive (kmeans's centroids): every rung is compared with rung 1 within
+#     BENCH_LADDER_RTOL (1e-6: the atomically accumulated float's summation
+#     order follows the layout, so bit-equality across rank counts is not
+#     expected);
+#   extensive (grayscott's v_checksum, a sum over the whole grid): its value
+#     depends on the deck, and not linearly (653.24/MB at 2 GB, 655.16/MB at
+#     8 GB), so it is compared only with a RESIDENT run of the same deck and
+#     rank count, and then exactly -- measured bit-identical resident vs
+#     4,400 evictions at 1 and 2 ranks.
+# The ladder stops at the first failed rung and leaves its logs in
 # <workdir>/rung<k>/ for the diagnosis.
 #
 #   bench_ladder.sh <workload> <workdir> [exe]
@@ -57,14 +65,17 @@ esac
 # out-of-core rung needs a deck above 8 x blocks MB (x2 for grayscott's two
 # arrays) or it is silently resident; the out-of-core rungs use twice that
 # floor at least (ooc_mult per workload).
-resident_slots=$(( pernode / blocks + 8 ))
 ooc_pernode=$(( pernode > ooc_mult * blocks ? pernode : ooc_mult * blocks ))
+# An extensive checksum is compared resident-vs-paged on the SAME deck, so
+# every rung uses the out-of-core deck.
+[ "${extensive}" -eq 1 ] && pernode=${ooc_pernode}
+resident_slots=$(( pernode / blocks + 8 ))
 
 # field <log> <key>: the value of key=... on the result line.
 field() { grep -a "${result_re}" "$1" | tail -1 | grep -oE "${2}=[-0-9.]+" | cut -d= -f2; }
 
-rung() {  # rung <k> <ranks> <slots> <label>
-  local k=$1 n=$2 slots=$3 label=$4 r rc cs cs0 ev per
+rung() {  # rung <k> <ranks> <slots> <label> <ref|check|none>
+  local k=$1 n=$2 slots=$3 label=$4 cmp=$5 r rc cs cs0 ev per
   local dir="${workdir}/rung${k}"  # separate: a single local expands before assigning
   per=${pernode}; [ "${label}" = "out of core" ] && per=${ooc_pernode}
   echo "=== rung ${k}: ${n} rank(s), ${label}, ${per} MB/node, ${slots} slots/block"
@@ -77,14 +88,15 @@ rung() {  # rung <k> <ranks> <slots> <label>
     cs=$(field "${dir}/rank${r}.log" "${checksum_key}")
     [ "${cs}" = "${cs0}" ] || { echo "FAIL rung ${k}: rank ${r} checksum ${cs} != rank 0 ${cs0}"; return 1; }
   done
-  # Compare against rung 1: per MB of deck when the checksum is extensive.
-  local norm
-  norm=$(awk -v c="${cs0}" -v mb="$(( per * n ))" -v e="${extensive}" 'BEGIN { printf "%.12g", (e ? c / mb : c) }')
-  if [ -n "${LADDER_CS:-}" ] && ! awk -v a="${norm}" -v b="${LADDER_CS}" -v t="${BENCH_LADDER_RTOL:-${rtol}}" \
-        'BEGIN { d = a - b; if (d < 0) d = -d; m = (b < 0 ? -b : b); if (m == 0) m = 1; exit !(d / m <= t) }'; then
-    echo "FAIL rung ${k}: checksum ${cs0} (${norm} per MB) vs rung 1's ${LADDER_CS} differs by more than ${BENCH_LADDER_RTOL:-${rtol}} (paging changed the answer)"; return 1
+  if [ "${cmp}" = "check" ]; then
+    if [ "${extensive}" -eq 1 ]; then
+      [ "${cs0}" = "${LADDER_CS}" ] || { echo "FAIL rung ${k}: checksum ${cs0} != the resident run's ${LADDER_CS} on the same deck (paging changed the answer)"; return 1; }
+    elif ! awk -v a="${cs0}" -v b="${LADDER_CS}" -v t="${BENCH_LADDER_RTOL:-${rtol}}" \
+          'BEGIN { d = a - b; if (d < 0) d = -d; m = (b < 0 ? -b : b); if (m == 0) m = 1; exit !(d / m <= t) }'; then
+      echo "FAIL rung ${k}: checksum ${cs0} vs rung 1's ${LADDER_CS} differs by more than ${BENCH_LADDER_RTOL:-${rtol}} (paging changed the answer)"; return 1
+    fi
   fi
-  LADDER_CS=${norm}
+  [ "${cmp}" = "ref" ] && LADDER_CS=${cs0}
   ev=$(field "${dir}/rank0.log" evicts)
   if [ "${label}" = "out of core" ] && [ "${ev:-0}" -eq 0 ]; then
     echo "FAIL rung ${k}: 0 evictions; the cache held the deck, so nothing was tested"; return 1
@@ -94,8 +106,16 @@ rung() {  # rung <k> <ranks> <slots> <label>
 
 mkdir -p "${workdir}"
 LADDER_CS=""
-rung 1 1 "${resident_slots}" resident   || exit 1
-rung 2 2 "${resident_slots}" resident   || exit 1
-rung 3 2 "${ooc_slots}"      "out of core" || exit 1
-rung 4 4 "${ooc_slots}"      "out of core" || exit 1
+if [ "${extensive}" -eq 0 ]; then
+  rung 1  1 "${resident_slots}" resident      ref   || exit 1
+  rung 2  2 "${resident_slots}" resident      check || exit 1
+  rung 3  2 "${ooc_slots}"      "out of core" check || exit 1
+  rung 4  4 "${ooc_slots}"      "out of core" check || exit 1
+else
+  rung 1  1 "${resident_slots}" resident      none  || exit 1
+  rung 2  2 "${resident_slots}" resident      ref   || exit 1
+  rung 3  2 "${ooc_slots}"      "out of core" check || exit 1
+  rung 4r 4 "${resident_slots}" resident      ref   || exit 1
+  rung 4  4 "${ooc_slots}"      "out of core" check || exit 1
+fi
 echo "LADDER PASS: ${wl} is cleared for multi-node runs"
