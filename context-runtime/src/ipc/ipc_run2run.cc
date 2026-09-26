@@ -156,7 +156,8 @@ void IpcManagerRun2Run::SendInTransmitReplica(
   auto *config_manager = CLIO_CONFIG_MANAGER;
   const clio::run::Host *target_host = ipc_manager->GetHost(target_node_id);
 
-  int port = static_cast<int>(config_manager->GetPort());
+  int port =
+      static_cast<int>(target_host->PortOr(config_manager->GetPort()));
   ctp::lbm::Transport *lbm_transport =
       ipc_manager->GetOrCreateClient(target_host->ip_address, port);
 
@@ -348,7 +349,8 @@ int IpcManagerRun2Run::SendOutTransmit(
   clio::run::ContainerHold container =
       CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_).get();
   auto *config_manager = CLIO_CONFIG_MANAGER;
-  int port = static_cast<int>(config_manager->GetPort());
+  int port =
+      static_cast<int>(target_host->PortOr(config_manager->GetPort()));
 
   // Prefer the dedicated dial-back connection resolved at RecvIn (stored on the
   // task's FutureShm). Fall back to resolving the peer connection by address if
@@ -425,14 +427,6 @@ void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_ta
   // RecvInHandleOne and stored in this task's RunContext). It is freed
   // automatically when the RunContext (and its Future copy) is destroyed by
   // DelTask below — no manual capture/FreeBuffer needed.
-  size_t recv_key = origin_task->task_id_.net_key_ ^
-                    (static_cast<size_t>(origin_task->task_id_.replica_id_) *
-                     0x9e3779b97f4a7c15ULL);
-  {
-    std::lock_guard<std::mutex> lk(recv_map_mutex_);
-    recv_map_.erase(recv_key);
-  }
-
   clio::run::u64 target_node_id = origin_task->pool_query_.GetReturnNode();
 
   if (!ipc_manager->IsAlive(target_node_id)) {
@@ -454,7 +448,12 @@ void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_ta
 
   int rc = SendOutTransmit(ipc_manager, origin_task,
                            target_node_id, target_host);
-  (void)rc;
+  // The replica stays visible to QueryTaskProgress until its response has
+  // actually left. Erasing before the send made a response parked in
+  // send_out_retry_ look Gone to the origin, which then failed the task.
+  if (rc == 0) {
+    EraseRecvEntry(origin_task);
+  }
   // Task frees via RAII when its shared_ptr owners drop (the by-value
   // origin_task handle here, plus the RunContext/send_map_ entry) — no
   // explicit DelTask.
@@ -827,6 +826,7 @@ void IpcManagerRun2Run::RegisterOriginProgress(
     prog.replicas[i].accounted = (replica_targets[i] == kInvalidNodeId);
   }
   std::lock_guard<std::mutex> lk(send_map_mutex_);
+  prog.gen = ++progress_gen_;
   progress_map_[net_key] = std::move(prog);
 }
 
@@ -884,17 +884,53 @@ std::vector<StuckReplica> IpcManagerRun2Run::CollectStuckReplicas(
         continue;
       }
       stuck.push_back({static_cast<clio::run::u64>(kv.first), rid,
-                       rp.target_node_id});
+                       rp.target_node_id, prog.gen});
     }
   }
   return stuck;
 }
 
+void IpcManagerRun2Run::EraseRecvEntry(
+    const clio::run::shared_ptr<clio::run::Task> &task) {
+  const size_t recv_key =
+      task->task_id_.net_key_ ^
+      (static_cast<size_t>(task->task_id_.replica_id_) * 0x9e3779b97f4a7c15ULL);
+  std::lock_guard<std::mutex> lk(recv_map_mutex_);
+  recv_map_.erase(recv_key);
+}
+
 void IpcManagerRun2Run::HandleTaskProgressResult(clio::run::u64 net_key,
                                                  clio::run::u32 replica_id,
-                                                 bool gone) {
+                                                 bool gone,
+                                                 clio::run::u64 gen) {
   if (!gone) {
     return;  // still running on its node -> keep waiting
+  }
+  // A probe's answer applies only to the origin it was fired for. gen == 0
+  // is the dead-node and send-failure paths, which act on live state.
+  if (gen != 0) {
+    std::lock_guard<std::mutex> lk(send_map_mutex_);
+    auto pit = progress_map_.find(static_cast<size_t>(net_key));
+    if (pit == progress_map_.end() || pit->second.gen != gen) {
+      HLOG(kDebug,
+           "[TaskProgress] stale Gone for net_key {} gen {} ignored: the key "
+           "now names a newer origin",
+           net_key, gen);
+      return;
+    }
+    if (replica_id < pit->second.replicas.size()) {
+      ReplicaProgress &rp = pit->second.replicas[replica_id];
+      if (rp.accounted) {
+        return;
+      }
+      if (++rp.gone_strikes < kGoneStrikesToFail) {
+        HLOG(kWarning,
+             "[TaskProgress] replica {} of net_key {} answered Gone ({}/{}); "
+             "re-probing before declaring it lost",
+             replica_id, net_key, rp.gone_strikes, kGoneStrikesToFail);
+        return;
+      }
+    }
   }
   // Claim the accounting transition; bail if a real response already took it.
   if (!MarkReplicaAccounted(static_cast<size_t>(net_key), replica_id)) {
@@ -960,7 +996,8 @@ bool IpcManagerRun2Run::RetrySendToNode(RetryEntry &entry, clio::run::u64 node_i
     return false;
   }
 
-  int port = static_cast<int>(config_manager->GetPort());
+  int port =
+      static_cast<int>(target_host->PortOr(config_manager->GetPort()));
   ctp::lbm::Transport *lbm_transport =
       ipc_manager->GetOrCreateClient(target_host->ip_address, port);
   if (!lbm_transport) {
@@ -1090,6 +1127,7 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
     if (elapsed >= out_task_timeout) {
       HLOG(kError, "[RetryQueue] SendOut task timed out after {}s for node {}",
            elapsed, it->target_node_id);
+      EraseRecvEntry(it->task);  // the response is dropped; now it is Gone
       it = send_out_retry_.erase(it);
     } else if (ipc_manager->IsAlive(it->target_node_id)) {
       clio::run::shared_ptr<clio::run::Task> retry_task = it->task;
@@ -1240,6 +1278,7 @@ void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
     HLOG(kInfo,
          "[FlushStale] Discarding SendOut retry for restarted node {}",
          node_id);
+    EraseRecvEntry(it->task);
     it = send_out_retry_.erase(it);
   }
   }  // release retry_queues_mutex_ before completing origins

@@ -1708,6 +1708,33 @@ u64 IpcManager::GetNodeId() const {
   return this_host_.node_id;
 }
 
+/**
+ * Split a hostfile entry of the form "host:port" into its parts.
+ *
+ * Only a trailing ":<digits>" on an entry with exactly one ':' is a port; a
+ * bare IPv6 address has several colons and no port, and is left whole.
+ *
+ * @param entry the hostfile entry as read
+ * @param host receives the host part (the whole entry when there is no port)
+ * @param port receives the port, or 0 when the entry names none
+ */
+static void SplitHostPort(const std::string &entry, std::string &host,
+                          u32 &port) {
+  host = entry;
+  port = 0;
+  const size_t colon = entry.rfind(':');
+  if (colon == std::string::npos || colon == 0 || colon + 1 >= entry.size() ||
+      entry.find(':') != colon) {
+    return;
+  }
+  const std::string digits = entry.substr(colon + 1);
+  if (digits.find_first_not_of("0123456789") != std::string::npos) {
+    return;
+  }
+  host = entry.substr(0, colon);
+  port = static_cast<u32>(std::stoul(digits));
+}
+
 bool IpcManager::LoadHostfile() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
   std::string hostfile_path = config->GetHostfilePath();
@@ -1771,10 +1798,13 @@ bool IpcManager::LoadHostfile() {
     HLOG(kDebug, "=== Container to Node ID Mapping (Linear Offset) ===");
     for (size_t offset = 0; offset < host_ips.size(); ++offset) {
       u64 node_id = static_cast<u64>(offset);
-      Host host(host_ips[offset], node_id);
+      std::string name;
+      u32 entry_port = 0;
+      SplitHostPort(host_ips[offset], name, entry_port);
+      Host host(name, node_id, entry_port);
       hostfile_map_[node_id] = host;
-      HLOG(kDebug, "  Hostfile[{}]: {} -> Node ID: {}", offset,
-           host_ips[offset], node_id);
+      HLOG(kDebug, "  Hostfile[{}]: {} port {} -> Node ID: {}", offset, name,
+           entry_port, node_id);
     }
     HLOG(kDebug, "=== Total hosts loaded: {} ===", hostfile_map_.size());
     if (hostfile_map_.empty()) {
@@ -2094,6 +2124,13 @@ bool IpcManager::IdentifyThisHost() {
                  suffix_match ||
                  HostMatchesLocalIp(host.ip_address, local_ips);
     if (!is_me) continue;
+    // An entry that names a port is this process only if the port is ours:
+    // that is how several runtimes on one host tell themselves apart.
+    if (host.port != 0 && host.port != port) {
+      HLOG(kDebug, "Hostfile entry {}:{} is local but not our port {}",
+           host.ip_address, host.port, port);
+      continue;
+    }
 
     // Bind to whatever address the hostfile entry advertises so an
     // override like CLIO_BIND_ADDR=127.0.0.1 actually pins the listener
@@ -4893,11 +4930,6 @@ std::vector<PoolQuery> IpcManager::ResolveRangeQuery(
     return {query};  // Fallback to original query
   }
 
-  auto *config_manager = CLIO_CONFIG_MANAGER;
-  if (config_manager == nullptr) {
-    return {query};  // Fallback to original query
-  }
-
   u32 range_offset = query.GetRangeOffset();
   u32 range_count = query.GetRangeCount();
 
@@ -4922,36 +4954,21 @@ std::vector<PoolQuery> IpcManager::ResolveRangeQuery(
     return {PoolQuery::DirectId(container_id)};
   }
 
+  // ONE QUERY PER CONTAINER. This used to split a range wider than
+  // networking.neighborhood_size into at most neighborhood_size
+  // multi-container sub-ranges, each sent to the node owning its first
+  // container. Nothing fans a received range out to its remaining
+  // containers (RecvInHandleOne marks every received task routed, so the
+  // receiver runs it locally once), and the origin counted one replica per
+  // sub-range, so a 64-node Broadcast with the default neighborhood of 32
+  // created a pool on nodes 0 and 32 only and reported success. The fan-out
+  // is O(containers) from the origin, as it always was for ranges no wider
+  // than the neighborhood.
   std::vector<PoolQuery> result_queries;
-
-  // Get neighborhood size from configuration (maximum number of queries)
-  u32 neighborhood_size = config_manager->GetNeighborhoodSize();
-
-  // Calculate queries needed, capped at neighborhood_size
-  u32 ideal_queries = (range_count + neighborhood_size - 1) / neighborhood_size;
-  u32 queries_to_create = std::min(ideal_queries, neighborhood_size);
-
-  // Create one query per container
-  if (queries_to_create <= 1) {
-    queries_to_create = range_count;
+  result_queries.reserve(range_count);
+  for (u32 i = 0; i < range_count; ++i) {
+    result_queries.push_back(PoolQuery::Range(range_offset + i, 1));
   }
-
-  u32 containers_per_query = range_count / queries_to_create;
-  u32 remaining_containers = range_count % queries_to_create;
-
-  u32 current_offset = range_offset;
-  for (u32 i = 0; i < queries_to_create; ++i) {
-    u32 current_count = containers_per_query;
-    if (i < remaining_containers) {
-      current_count++;  // Distribute remainder across first queries
-    }
-
-    if (current_count > 0) {
-      result_queries.push_back(PoolQuery::Range(current_offset, current_count));
-      current_offset += current_count;
-    }
-  }
-
   return result_queries;
 }
 

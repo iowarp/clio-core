@@ -428,6 +428,7 @@ private:
     clio::run::Future<QueryTaskProgressTask> future;
     size_t net_key;
     clio::run::u32 replica_id;
+    clio::run::u64 gen;  // the origin's OriginProgress::gen when fired
   };
   std::vector<PendingProgressQuery> pending_progress_queries_;
 

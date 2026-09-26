@@ -328,7 +328,7 @@ class ConfigManager : public ctp::BaseConfig {
    * each interval. This is the anti-hang mechanism that works even when a
    * task's ttl is infinite. 0 disables the periodic check.
    * Overridable via env CLIO_TASK_PROGRESS_INTERVAL_MS.
-   * @return Interval in ms (default: 0 = disabled)
+   * @return Interval in ms (default: 5000)
    */
   u32 GetTaskProgressIntervalMs() const { return task_progress_interval_ms_; }
 

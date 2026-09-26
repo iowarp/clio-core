@@ -477,6 +477,15 @@ private:
   std::vector<TargetInfo> target_list_;
   ctp::priv::unordered_map_ll<std::string, clio::run::PoolId>
       target_name_to_id_; // reverse lookup: target_name -> target_id
+  /**
+   * Set once Create has finished registering this container's storage
+   * targets, whether or not every registration succeeded. The container is
+   * reachable before Create runs (PoolManager registers it first), so a
+   * remote put can arrive while target_list_ is still empty; ExtendBlob waits
+   * on this flag, bounded, instead of refusing that put (rc 11 to the
+   * client, fatal on the GPU flush path).
+   */
+  std::atomic<bool> targets_ready_{false};
 
   // Tag management data structures (using ctp::priv::unordered_map_ll for thread-safe
   // concurrent access)

@@ -81,12 +81,27 @@ struct ReplicaProgress {
   // post-recovery container mapping, or fails the replica after its bounded
   // timeout). This flag stops the dead-node scan from enqueuing duplicates.
   bool redispatched = false;
+  // Consecutive QueryTaskProgress answers of Gone. A single Gone is not
+  // proof: a probe queued behind a backlog answers after the replica has
+  // finished. The replica is declared lost only after kGoneStrikesToFail
+  // answers, an interval apart.
+  clio::run::u32 gone_strikes = 0;
 };
+
+/** Gone answers, one probe interval apart, before a replica is declared lost. */
+constexpr clio::run::u32 kGoneStrikesToFail = 2;
 
 /** Per-origin progress state, keyed by net_key in progress_map_ (issue #628). */
 struct OriginProgress {
   std::chrono::steady_clock::time_point enqueue_time;
   std::vector<ReplicaProgress> replicas;  // indexed by replica_id
+  // net_key is the origin task's heap address, which the allocator reuses as
+  // soon as the task is freed. A probe answered late (the target was
+  // backlogged) can therefore name a key that now belongs to a NEWER task;
+  // applying its Gone failed healthy puts at 16 and 64 nodes. Every
+  // registration gets a fresh generation, probes carry it, and an answer
+  // whose generation no longer matches is dropped.
+  clio::run::u64 gen = 0;
   // Admin-pool origins are tracked for the dead-node scan but must never be
   // PROBED: QueryTaskProgress is itself an admin cross-node task, so probing
   // admin origins would recurse (issue #896).
@@ -98,6 +113,7 @@ struct StuckReplica {
   clio::run::u64 net_key;
   clio::run::u32 replica_id;
   clio::run::u64 target_node_id;
+  clio::run::u64 gen;  // OriginProgress::gen at collection time
 };
 
 /**
@@ -224,8 +240,17 @@ class IpcManagerRun2Run {
    * accounted for, complete the origin with a network-timeout RC (partial
    * results from the replicas that did answer are preserved).
    */
+  /**
+   * Forget a received replica once its response has left this node (or was
+   * dropped), so QueryTaskProgress stops answering Running for it.
+   * @param task the replica task as received (its task_id_ carries net_key
+   *        and replica_id, which key recv_map_)
+   */
+  void EraseRecvEntry(const clio::run::shared_ptr<clio::run::Task> &task);
+
   void HandleTaskProgressResult(clio::run::u64 net_key,
-                                clio::run::u32 replica_id, bool gone);
+                                clio::run::u32 replica_id, bool gone,
+                                clio::run::u64 gen = 0);
 
  private:
   // ---------------------------------------------------------------------------
@@ -365,6 +390,7 @@ class IpcManagerRun2Run {
   // Per-origin cross-node progress state, keyed by net_key (issue #628).
   // Guarded by send_map_mutex_ (updated in lock-step with send_map_).
   std::unordered_map<size_t, OriginProgress> progress_map_;
+  clio::run::u64 progress_gen_ = 0;  // last OriginProgress::gen issued; under send_map_mutex_
   // Throttle: last time CollectStuckReplicas actually ran a scan pass.
   std::chrono::steady_clock::time_point last_progress_scan_{};
 

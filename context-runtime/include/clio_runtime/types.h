@@ -136,6 +136,13 @@ class RuntimeManager;
 struct Host {
   std::string ip_address;  // IP address as string (IPv4 or IPv6)
   u64 node_id;             // 64-bit representation of IP address
+  /**
+   * The port this host's runtime listens on, from a "host:port" hostfile
+   * entry; 0 means the configured networking.port. A port per entry lets
+   * several runtimes share one host (each picks the entry whose port is its
+   * own), which is how the distributed tests run on a single node.
+   */
+  u32 port;
   NodeState state;         // SWIM failure detection state
   std::chrono::steady_clock::time_point state_changed_at;
   /**
@@ -156,6 +163,7 @@ struct Host {
    */
   Host()
       : node_id(0),
+        port(0),
         state(NodeState::kAlive),
         state_changed_at(std::chrono::steady_clock::now()),
         last_inbound(std::chrono::steady_clock::now()) {}
@@ -166,14 +174,23 @@ struct Host {
    * @param ip IP address string
    * @param id Node ID (typically offset in hostfile)
    */
-  Host(const std::string &ip, u64 id)
+  Host(const std::string &ip, u64 id, u32 listen_port = 0)
       : ip_address(ip),
         node_id(id),
+        port(listen_port),
         state(NodeState::kAlive),
         state_changed_at(std::chrono::steady_clock::now()),
         last_inbound(std::chrono::steady_clock::now()) {}
 
   bool IsAlive() const { return state == NodeState::kAlive; }
+
+  /**
+   * The port to dial this host on.
+   * @param default_port the runtime's configured networking.port, used when
+   *        the hostfile entry named no port of its own
+   * @return the entry's port if it has one, otherwise default_port
+   */
+  u32 PortOr(u32 default_port) const { return port != 0 ? port : default_port; }
 
   /**
    * Stream output operator for Host
@@ -197,7 +214,8 @@ struct Host {
         state_name = "dead";
         break;
     }
-    os << "Host(ip=" << host.ip_address << ", node_id=" << host.node_id
+    os << "Host(ip=" << host.ip_address << ", port=" << host.port
+       << ", node_id=" << host.node_id
        << ", state=" << state_name << ")";
     return os;
   }

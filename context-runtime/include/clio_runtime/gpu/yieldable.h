@@ -61,6 +61,7 @@
 #define CLIO_RUNTIME_GPU_YIELDABLE_H_
 
 #include <cstdio>
+#include <cstdlib>
 #include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/types.h>
 
@@ -473,6 +474,38 @@ class Yieldable {
    * Returns the number of rounds executed.
    */
   /**
+   * Wall-clock bound on a RunToCompletion loop (CLIO_GV_WALL_CAP_MS; unset or
+   * 0 = none).
+   *
+   * The round cap counts relaunches, and 2,000,000 of them is minutes of a
+   * whole allocation parked behind one dead peer. A time bound reports the
+   * same livelock in seconds. Sets hit_round_cap_ so callers treat it as the
+   * same condition.
+   * @param wall_t0 when the loop started
+   * @param rounds rounds completed so far, for the message
+   * @return true when the bound is exceeded and the loop must stop
+   */
+  bool WallCapHit(std::chrono::steady_clock::time_point wall_t0,
+                  clio::run::u32 rounds) {
+    static const long long cap_ms = [] {
+      const char *e = std::getenv("CLIO_GV_WALL_CAP_MS");
+      return (e != nullptr && *e) ? std::atoll(e) : 0LL;
+    }();
+    if (cap_ms <= 0) return false;
+    const long long elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - wall_t0).count();
+    if (elapsed_ms < cap_ms) return false;
+    hit_round_cap_ = true;
+    std::fprintf(stderr,
+                 "[yieldable] WALL CAP HIT after %lld ms (%u rounds) with %u "
+                 "block(s) still suspended -- faults are not being satisfied.\n",
+                 elapsed_ms, rounds, num_pending_);
+    std::fflush(stderr);
+    return true;
+  }
+
+  /**
    * `service` may return void, or bool to ABORT: returning false stops the
    * loop immediately.
    *
@@ -488,8 +521,12 @@ class Yieldable {
   clio::run::u32 RunToCompletion(LaunchFn &&launch, ServiceFn &&service,
                                  clio::run::u32 max_rounds = 0) {
     clio::run::u32 rounds = 0;
+    const auto wall_t0 = std::chrono::steady_clock::now();
     while (Round(launch)) {
       ++rounds;
+      if (WallCapHit(wall_t0, rounds)) {
+        break;
+      }
       if (max_rounds != 0 && rounds >= max_rounds) {
         hit_round_cap_ = true;
         // LOUD ON PURPOSE. Hitting the cap means blocks kept parking and
@@ -560,8 +597,12 @@ class Yieldable {
                                  clio::run::u32 max_rounds,
                                  ResumeWhenFn &&resume_when) {
     clio::run::u32 rounds = 0;
+    const auto wall_t0 = std::chrono::steady_clock::now();
     while (Round(launch, resume_when)) {
       ++rounds;
+      if (WallCapHit(wall_t0, rounds)) {
+        break;
+      }
       if (max_rounds != 0 && rounds >= max_rounds) {
         hit_round_cap_ = true;   // see HitRoundCap(): never silent again
         std::fprintf(stderr,

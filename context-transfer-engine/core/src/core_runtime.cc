@@ -597,6 +597,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // for_each over registered_targets_ does not have to scan 100K empty slots
   // on every PutBlob.
   static const size_t kTargetMapSize = 64;
+  targets_ready_.store(false, std::memory_order_release);
   registered_targets_ =
       ctp::priv::unordered_map_ll<clio::run::PoolId, TargetInfo>(kTargetMapSize);
   target_name_to_id_ =
@@ -776,6 +777,19 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
              "with bdev_id=({},{}) attach_existing={}",
              client_.pool_id_, target_path, device.bdev_type_, capacity_bytes,
              target_node, i, bdev_id.major_, bdev_id.minor_, attach_existing);
+        // TEST HOOK: CLIO_CTE_REGISTER_DELAY_MS stretches this container's
+        // registration so a peer that is already seeding can be shown
+        // putting into an empty target list (the 64-node startup race).
+        static const clio::run::u64 reg_delay_us = [] {
+          const char *e = std::getenv("CLIO_CTE_REGISTER_DELAY_MS");
+          return (e != nullptr && *e) ? std::strtoull(e, nullptr, 10) * 1000ull
+                                      : 0ull;
+        }();
+        if (reg_delay_us != 0) {
+          HLOG(kWarning, "cte_core Create: test delay of {} ms before registering {}",
+               reg_delay_us / 1000, target_path);
+          CLIO_CO_AWAIT(clio::run::yield(static_cast<double>(reg_delay_us)));
+        }
         auto reg_task = client_.AsyncRegisterTarget(
             target_path, bdev_type, capacity_bytes, target_query, bdev_id,
             clio::run::PoolQuery::Dynamic(), attach_existing);
@@ -785,8 +799,12 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
           HLOG(kDebug, "  - Registered target: {} on node {}", target_path,
                target_node);
         } else {
-          HLOG(kWarning,
-               "  - Failed to register target {} on node {} (error code: {})",
+          // Left unregistered, this node refuses every put it owns for the
+          // whole run (rc 11), which looks exactly like the startup race
+          // below. Say so loudly.
+          HLOG(kError,
+               "Failed to register target {} on node {} (error code: {}); "
+               "this container will refuse puts",
                target_path, target_node, result);
         }
       }
@@ -794,6 +812,12 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   } else {
     HLOG(kWarning, "Warning: No storage devices configured");
   }
+  {
+    clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+    HLOG(kInfo, "cte_core Create: {} storage target(s) registered; accepting puts",
+         target_list_.size());
+  }
+  targets_ready_.store(true, std::memory_order_release);
 
   // Queue management has been removed - queues are now managed by CLIO Runtime
   // runtime Local queues (kTargetManagementQueue, kTagManagementQueue,
@@ -2729,7 +2753,9 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           const double nap_ms = (waited_ns < 2ull * 1000 * 1000)   ? 0.05
                                 : (waited_ns < 50ull * 1000 * 1000) ? 1.0
                                                                     : 25.0;
-          CLIO_CO_AWAIT(clio::run::yield(nap_ms));
+          // yield() takes microseconds; passing the millisecond value made
+          // every nap ~0 and the wait a hot spin.
+          CLIO_CO_AWAIT(clio::run::yield(nap_ms * 1000.0));
         }
         blob_info_ptr = CheckBlobExists(blob_name, tag_id);
       }
@@ -7665,7 +7691,7 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
   // Re-read the canonical value here so placement always sees real free space
   // (same reason GetCapacity iterates registered_targets_ directly).
   std::vector<TargetInfo> available_targets;
-  {
+  const auto snapshot_targets = [&]() {
     clio::run::ScopedCoRwReadLock read_lock(target_lock_);
     available_targets = target_list_;
     for (auto &t : available_targets) {
@@ -7676,8 +7702,44 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
                 .load(std::memory_order_relaxed);
       }
     }
+  };
+  snapshot_targets();
+  // STARTUP RACE. This container is reachable before its Create has run
+  // (PoolManager registers it first), and Create then awaits one broadcast
+  // bdev create per target, which takes longer the more nodes there are.
+  // A peer that finished its own startup earlier can send a put here in
+  // that window; at 64 nodes a subset of nodes refused every seeding put
+  // this way (rc 11), which the GPU flush path can only treat as fatal.
+  // Wait for Create to finish, bounded, instead of refusing.
+  if (available_targets.empty() &&
+      !targets_ready_.load(std::memory_order_acquire)) {
+    // CLIO_CTE_TARGETS_READY_WAIT_MS overrides the bound; 0 restores the old
+    // behaviour (refuse at once), which the startup-race test relies on.
+    static const clio::run::u64 kTargetsReadyWaitNs = [] {
+      const char *e = std::getenv("CLIO_CTE_TARGETS_READY_WAIT_MS");
+      const clio::run::u64 ms =
+          (e != nullptr && *e) ? std::strtoull(e, nullptr, 10) : 120000ull;
+      return ms * 1000ull * 1000ull;
+    }();
+    constexpr double kTargetsReadyPollUs = 1000.0;
+    const clio::run::u64 wait_t0 = GetCurrentTimeNs();
+    HLOG(kWarning,
+         "ExtendBlob: a put arrived before this container registered any "
+         "storage target; waiting for Create to finish");
+    while (!targets_ready_.load(std::memory_order_acquire) &&
+           GetCurrentTimeNs() - wait_t0 < kTargetsReadyWaitNs) {
+      CLIO_CO_AWAIT(clio::run::yield(kTargetsReadyPollUs));
+    }
+    snapshot_targets();
+    HLOG(kInfo, "ExtendBlob: targets {} after {} ms",
+         available_targets.empty() ? "still absent" : "registered",
+         (GetCurrentTimeNs() - wait_t0) / 1000000.0);
   }
   if (available_targets.empty()) {
+    HLOG(kError,
+         "ExtendBlob: no storage target registered on this container; the "
+         "put of {} byte(s) is refused (clients see rc 11)",
+         additional_size);
     if (shortfall != nullptr) {
       *shortfall = additional_size;
     }

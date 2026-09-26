@@ -1621,7 +1621,8 @@ void Runtime::ScanTaskProgress() {
     if (it->future->GetReturnCode() == 0) {
       bool gone = (it->future->status_ == 0);
       run2run->HandleTaskProgressResult(
-          static_cast<clio::run::u64>(it->net_key), it->replica_id, gone);
+          static_cast<clio::run::u64>(it->net_key), it->replica_id, gone,
+          it->gen);
     }
     it = pending_progress_queries_.erase(it);
   }
@@ -1653,7 +1654,8 @@ void Runtime::ScanTaskProgress() {
     HLOG(kDebug, "[TaskProgress] fire probe net_key={} replica={} -> node {}",
          sr.net_key, sr.replica_id, sr.target_node_id);
     pending_progress_queries_.push_back(
-        {std::move(fut), static_cast<size_t>(sr.net_key), sr.replica_id});
+        {std::move(fut), static_cast<size_t>(sr.net_key), sr.replica_id,
+         sr.gen});
   }
 }
 
