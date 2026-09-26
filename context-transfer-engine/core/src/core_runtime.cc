@@ -431,6 +431,7 @@ bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
   // Carries the block-layout generation to the client, which compares it
   // before and after copying a payload (issue #817).
   out->placement_gen_ = info.placement_gen_;
+  out->content_seq_ = info.content_seq_;
   // Carry the authoritative transform state across verbatim (issue #818),
   // plus the flag-word mirror so a client that only looks at flags_ refuses
   // too.
@@ -1875,6 +1876,27 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     while (blob_info_ptr->HasReadPins()) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
+
+    // Content seqlock, writer half (BlobInfo::content_seq_). The drain above
+    // covers readers that come through this runtime; a zero-IPC client copies
+    // the extents straight out of the RAM tier and pins nothing, so it needs
+    // a signal of its own: odd while this put may be mutating the extents in
+    // place, even again on every exit. Published to the mirror both times so
+    // TryReadBlobShm sees it. Declared after the drain guard, so readers are
+    // re-admitted only once the sequence is even again.
+    const std::string seq_key = std::to_string(tag_id.major_) + "." +
+                                std::to_string(tag_id.minor_) + "." + blob_name;
+    ++blob_info_ptr->content_seq_;
+    MirrorBlobToShm(seq_key, *blob_info_ptr);
+    struct ContentSeqGuard {
+      Runtime *rt;
+      BlobInfo *blob;
+      const std::string &key;
+      ~ContentSeqGuard() {
+        ++blob->content_seq_;
+        rt->MirrorBlobToShm(key, *blob);
+      }
+    } content_seq_guard{this, blob_info_ptr.get(), seq_key};
 
     // Droppability: decided at creation, never revisited. Both branches run
     // under the write token, like every other mutation of this blob.

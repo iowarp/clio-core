@@ -629,7 +629,7 @@ void DefaultScheduler::LoadBalance() {
   // workload distribution (how many quick vs 1-second tasks it actually ran).
   // It adapts continuously as RecordCompletion folds in each finished task.
   if (tick % 10 == 0) {
-    HLOG(kWarning,
+    HLOG(kDebug,
          "[#781 PDF] observed exec-time bins (cumulative): "
          "<10us={} <50us={} <500us={} <10ms={} <50ms={} <500ms={} <1s={} "
          ">=1s={} | stalls_detected={}",
@@ -640,9 +640,9 @@ void DefaultScheduler::LoadBalance() {
          stalls_detected_.load());
     // WHICH tasks own the slow bins: pool.method, count, summed and worst
     // wall time in ms, the eight largest by summed time.
-    HLOG(kWarning, "[#781 METHODS] wall time by pool.method (top 8):{}",
+    HLOG(kDebug, "[#781 METHODS] wall time by pool.method (top 8):{}",
          MethodTimeReport(8));
-    HLOG(kWarning, "[#785] lane rescues performed: {}",
+    HLOG(kDebug, "[#785] lane rescues performed: {}",
          rescues_performed_.load());
     size_t nq, nm, nh;
     {
@@ -651,7 +651,7 @@ void DefaultScheduler::LoadBalance() {
       nm = class_workers_[kMediumClass].size();
       nh = class_workers_[kHeavyClass].size();
     }
-    HLOG(kWarning,
+    HLOG(kDebug,
          "[sched] cost classes: quick {} workers ({} routed, +{}/-{}) | "
          "medium {} workers ({} routed, +{}/-{}) | heavy {} workers "
          "({} routed, +{}/-{})",
@@ -963,7 +963,7 @@ void DefaultScheduler::LoadBalance() {
       // did or did not fire.
       static u64 hb_tick = 0;
       if (outstanding > 0 && (++hb_tick % 4 == 0)) {
-        HLOG(kError,
+        HLOG(kDebug,
              "[HANGWATCH-HB] processed={} outstanding={} (queued={} blocked={} "
              "retry={} periodic={}) live={} live_stalled={}",
              processed, outstanding, ob_queued, ob_blocked, ob_retry,

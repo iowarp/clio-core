@@ -187,6 +187,16 @@ class Client : public clio::run::ContainerClient {
   bool HasShmCache() const { return shm_root_ != nullptr; }
 
   /**
+   * The stamp a zero-copy view hands out and CheckBlobGenShm re-checks:
+   * the placement generation (layout moved) and the content sequence
+   * (in-place overwrite started or finished) together, so a consumer
+   * that raced either one discards what it read.
+   */
+  static clio::run::u64 ShmReadStamp(const ShmBlobRecord &rec) {
+    return (rec.content_seq_ << 32) | (rec.placement_gen_ & 0xffffffffull);
+  }
+
+  /**
    * Zero-IPC metadata read.
    *
    * @return true if a consistent record was found in shared memory. false
@@ -266,6 +276,12 @@ class Client : public clio::run::ContainerClient {
     const clio::run::u32 src_nblocks =
         primary_ok ? rec.num_blocks_ : rec.rep_num_blocks_;
     const clio::run::u64 gen_before = rec.placement_gen_;
+    // An in-place put is mid-flight (odd sequence): the bytes are torn by
+    // construction. Take the RPC path, which waits for the writer.
+    const clio::run::u64 seq_before = rec.content_seq_;
+    if (seq_before & 1) {
+      return false;
+    }
 
     size_t copied = 0;
     clio::run::u64 want_from = offset;
@@ -296,8 +312,8 @@ class Client : public clio::run::ContainerClient {
     if (!TryGetBlobRecordShm(tag_id, blob_name, &after)) {
       return false;
     }
-    if (after.placement_gen_ != gen_before) {
-      return false;
+    if (after.placement_gen_ != gen_before || after.content_seq_ != seq_before) {
+      return false;  // moved, or overwritten in place, while we copied
     }
     return true;
   }
@@ -354,7 +370,10 @@ class Client : public clio::run::ContainerClient {
     }
     *ptr = base + src.target_offset_;
     *size = primary_view ? rec.total_size_ : rec.rep_total_size_;
-    *gen = rec.placement_gen_;
+    if (rec.content_seq_ & 1) {
+      return false;  // in-place put mid-flight
+    }
+    *gen = ShmReadStamp(rec);
     return true;
   }
 
@@ -367,7 +386,7 @@ class Client : public clio::run::ContainerClient {
     if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
       return false;
     }
-    return rec.placement_gen_ == gen;
+    return ShmReadStamp(rec) == gen;
   }
 
   /** Zero-IPC tag-name lookup. */

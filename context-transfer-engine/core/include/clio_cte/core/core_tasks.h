@@ -1125,6 +1125,16 @@ struct BlobInfo {
   // must call BumpPlacementGen() and re-publish the mirror -- a stale mirror
   // with an unchanged generation is exactly the case the check cannot see.
   clio::run::u64 placement_gen_;
+  /**
+   * Content sequence: a seqlock over IN-PLACE overwrites, which leave
+   * placement_gen_ alone. PutBlob bumps it to ODD before the first byte of
+   * an in-place write lands and to EVEN after the last, republishing the
+   * shm mirror both times; a zero-IPC reader refuses an odd value and
+   * discards a copy across which it changed. Without it a client memcpy
+   * racing a put returned pages that were half old, half new, rc=0
+   * (clio_cte_vector_stress, 64 threads, one rank: 3 torn pages in 11 s).
+   */
+  clio::run::u64 content_seq_;
 
 #if CTP_IS_HOST
   /**
@@ -1247,7 +1257,8 @@ struct BlobInfo {
         write_owner_(0),
         read_state_(0),
         total_size_cache_(0),
-        placement_gen_(0) {
+        placement_gen_(0),
+        content_seq_(0) {
     prealloc_lock_.Init();
   }
 
@@ -1269,7 +1280,8 @@ struct BlobInfo {
         write_owner_(0),
         read_state_(0),
         total_size_cache_(0),
-        placement_gen_(0) {
+        placement_gen_(0),
+        content_seq_(0) {
     prealloc_lock_.Init();
   }
 
@@ -1292,7 +1304,8 @@ struct BlobInfo {
         write_owner_(0),
         read_state_(0),
         total_size_cache_(0),
-        placement_gen_(0) {
+        placement_gen_(0),
+        content_seq_(0) {
     prealloc_lock_.Init();
   }
 #endif
@@ -1315,7 +1328,8 @@ struct BlobInfo {
         write_owner_(0),  // a fresh copy is unlocked; never inherit lock state
         read_state_(0),  // ...and has no readers pinned
         total_size_cache_(other.total_size_cache_),
-        placement_gen_(other.placement_gen_) {
+        placement_gen_(other.placement_gen_),
+        content_seq_(other.content_seq_) {
     prealloc_lock_.Init();
   }
 
@@ -1336,6 +1350,7 @@ struct BlobInfo {
       preallocated_size_ = other.preallocated_size_;
       total_size_cache_ = other.total_size_cache_;
       placement_gen_ = other.placement_gen_;
+      content_seq_ = other.content_seq_;
     }
     return *this;
   }
@@ -4534,24 +4549,12 @@ struct GetBlobSizeTask : public clio::run::Task {
     // destroys this ORIGIN's identity and re-assigns IN shm members across
     // allocator segments. See Task::AggregateOut for the full contract.
     auto replica = other_base.template Cast<GetBlobSizeTask>();
-    // TEMPORARY DIAGNOSTIC (cluster coherence bug #2). Does this aggregation
-    // even run for the 4-node barrier, and does the base's sticky-error rule
-    // poison the result?
-    //
-    // Task::AggregateOut takes ANY non-zero replica rc. GetBlobSize is an
-    // owner-shard query: the owner answers rc=0/size=1, non-owners legitimately
-    // answer rc=1/size=0. size_ merges with MAX (correct), but rc would come
-    // back 1 -- and Barrier() requires `rc == 0 && size == 1`, so it could
-    // never be satisfied. Before fb735bdb the whole-task Copy() overwrote rc
-    // with the LAST replica's, which often landed on 0.
-    //
-    // If this line never appears, there is no N->1 gather here and that whole
-    // story is wrong.
-    HLOG(kWarning,
-         "[AGG-GBS] origin rc={} size={} <- replica rc={} size={}",
-         GetReturnCode(), static_cast<unsigned long long>(size_),
-         replica->GetReturnCode(),
-         static_cast<unsigned long long>(replica->size_));
+    // This N->1 gather does run (the former diagnostic here printed once per
+    // replica of every broadcast GetBlobSize -- the checkpoint's size-0
+    // materialise gets alone made it the loudest line in a clean run).
+    // Task::AggregateOut takes ANY non-zero replica rc, and GetBlobSize is
+    // an owner-shard query where non-owners legitimately answer rc=1/size=0;
+    // size_ merges with MAX below, which is the part this override owns.
     // The blob lives on one shard; non-owners answer 0, so max yields the
     // owner's size for one replica and for many.
     if (replica->size_ > size_) {
