@@ -70,7 +70,7 @@ production layout: one runtime per node remains the design.
   (defect 12). Seeding still started after 4.4 s at 64 nodes, so it is not
   yet the bottleneck, but a per-node DRAM tier only needs one container, on
   its own node: creating it with a single-container query instead of a
-  broadcast would make startup O(N) and remove the stall. Open.
+  broadcast would make startup O(N) and remove the stall. FIXED (6baa919e): RegisterTarget creates the tier pool on its own node (Local / Physical(node) + address map for remote targets); at 16 nodes tier pool creates per rank went 16 -> 1, run clean. A second N-fold, every CTE client init broadcasting GetOrCreatePool('clio_cte_core') because the admin scheduler checked existence by name only and compose had named 512.0 'cte_core', is fixed in admin ScheduleTask (fixed-id check); verification pending.
 
 - `runtime.task_progress_interval_ms` defaults to 5000 (on); the header said
   "default 0 = disabled". Comment and default yaml corrected.
