@@ -207,6 +207,40 @@ set_tests_properties(cae_config_units PROPERTIES
   LABELS "coverage;cae;config;msan_skip"
 )
 
+
+#------------------------------------------------------------------------------
+# Test 4b: OMNI loader unit tests (pure, no runtime)
+#------------------------------------------------------------------------------
+# LoadOmni used to live inside util/clio_cae.cc next to main(), which made it
+# unlinkable from a test and left the file at 0% coverage. It is now its own
+# translation unit (cae_omni_loader) so the YAML validation can be tested.
+add_executable(test_cae_omni_loader
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_omni_loader.cc
+)
+
+target_include_directories(test_cae_omni_loader
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_cae_omni_loader
+  PRIVATE
+    cae_omni_loader
+    clio_cae_core_client
+    clio::run::cxx
+    ctp::cxx
+    ${YAML_CPP_LIBS}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+install(TARGETS test_cae_omni_loader DESTINATION bin)
+
+add_test(NAME cae_omni_loader COMMAND test_cae_omni_loader)
+set_tests_properties(cae_omni_loader PROPERTIES
+  TIMEOUT 60
+  LABELS "coverage;cae;omni;msan_skip"
+)
 #------------------------------------------------------------------------------
 # Test 4c: Summarizer Config/Task Unit Tests (pure, no runtime)
 #------------------------------------------------------------------------------

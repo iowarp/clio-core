@@ -159,6 +159,80 @@ if [ -n "${PHASE_CTEST_INCLUDE_LABELS}" ]; then
     print_info "Phased run: labels='${PHASE_CTEST_INCLUDE_LABELS}' extra_cmake='${PHASE_CMAKE_ARGS}'"
 fi
 
+
+# ---------------------------------------------------------------------------
+# CDash coverage scoping (PHASE_CDASH_KEEP).
+#
+# ctest_coverage() has no include filter, so a phase that runs only its own
+# labelled tests otherwise reports WHOLE-BUILD coverage measured under a
+# partial test run -- the fuse adapter's ~97% showed up as a ~36% whole-repo
+# headline. The only lever is CTEST_CUSTOM_COVERAGE_EXCLUDE, so we emit the
+# complement of the kept set: everything the phase does NOT own.
+#
+# The walk is recursive rather than a flat sweep of top-level components
+# because a kept path can be deep. Keeping context-runtime/modules/bdev by the
+# flat rule kept context-runtime whole (it is an ancestor), which put every
+# other runtime module back in the denominator and defeated the scoping. At
+# each level a directory is one of three things:
+#   - inside a kept path      -> keep the subtree, emit nothing
+#   - an ancestor of one      -> descend, so its unrelated siblings are still
+#                                excluded individually
+#   - anything else           -> exclude the whole subtree
+# A kept path may also be a single FILE (the prediction phase keeps
+# context-transport-primitives/src/system_info.cc), so an ancestor directory
+# excludes its non-kept sibling files by name as well.
+# ---------------------------------------------------------------------------
+_cdash_path_is_kept() {
+    # $1: repo-relative path. True when it sits inside (or is) a kept path.
+    local p="$1" k
+    for k in ${PHASE_CDASH_KEEP}; do
+        k="${k%/}"
+        [ "${p}" = "${k}" ] && return 0
+        case "${p}/" in "${k}"/*) return 0;; esac
+    done
+    return 1
+}
+
+_cdash_dir_is_ancestor() {
+    # $1: repo-relative dir. True when a kept path lives underneath it.
+    local p="$1" k
+    for k in ${PHASE_CDASH_KEEP}; do
+        k="${k%/}"
+        case "${k}/" in "${p}"/*) return 0;; esac
+    done
+    return 1
+}
+
+_cdash_emit_excludes() {
+    # $1: absolute directory. Appends CMake regexes to the global _excludes.
+    local dir="$1" rel child crel
+    rel="${dir#"${REPO_ROOT}/"}"
+
+    _cdash_path_is_kept "${rel}" && return 0
+
+    if _cdash_dir_is_ancestor "${rel}"; then
+        for child in "${dir}"/*; do
+            [ -e "${child}" ] || continue
+            case "${child##*/}" in .*) continue;; esac
+            crel="${child#"${REPO_ROOT}/"}"
+            if [ -d "${child}" ]; then
+                _cdash_emit_excludes "${child}"
+            else
+                # Only source files carry gcov data; anchor with $ so the
+                # regex cannot swallow a longer sibling name.
+                case "${child##*/}" in
+                    *.cc|*.c|*.cpp|*.cxx|*.h|*.hpp) ;;
+                    *) continue;;
+                esac
+                _cdash_path_is_kept "${crel}" || \
+                    _excludes="${_excludes}    \".*/${crel}\$\"\n"
+            fi
+        done
+        return 0
+    fi
+
+    _excludes="${_excludes}    \".*/${rel}/.*\"\n"
+}
 # Detect lcov version for RC option compatibility.
 # lcov 1.x uses 'lcov_branch_coverage' and 'geninfo_unexecuted_blocks';
 # lcov 2.x renamed them and treats unknown keys as fatal errors.
@@ -263,42 +337,41 @@ if [ "$DO_CTEST" = true ]; then
     if [ -n "${SITE_NAME}" ]; then
         print_info "Running tests and submitting to CDash (site: ${SITE_NAME})..."
 
-        # Scope the CDash coverage submission to the subtree this phase owns
-        # (PHASE_CDASH_KEEP, e.g. "context-transfer-engine/adapter" for the fuse
-        # phase). ctest_coverage() has no include filter and otherwise reports
-        # WHOLE-BUILD coverage measured under a partial (labelled) test run, so
-        # the fuse adapter's ~97% got diluted into a ~36% whole-repo headline.
-        # We exclude every OTHER source component so the CDash phase build
-        # reports the phase's own code, mirroring the Codecov extract scoping.
+        # Scope the CDash submission to the subtree this phase owns; see
+        # _cdash_emit_excludes above for why the complement is emitted.
         CDASH_SCOPE_BLOCK=""
         if [ -n "${PHASE_CDASH_KEEP:-}" ]; then
             print_info "Scoping CDash coverage to: ${PHASE_CDASH_KEEP}"
+            # A kept path that does not exist would match nothing, excluding
+            # the entire build and reporting 0% instead of failing loudly.
+            for _k in ${PHASE_CDASH_KEEP}; do
+                if [ ! -e "${REPO_ROOT}/${_k%/}" ]; then
+                    print_error "PHASE_CDASH_KEEP path not found: ${_k}"
+                    exit 1
+                fi
+            done
+            # The walk below only visits $REPO_ROOT/context-*, so third-party
+            # and fetched trees are never seen and land in the phase's
+            # denominator. cee builds nanobind Python bindings: build/_deps
+            # contributed 4408 of its 5340 instrumented lines at 39.4%, pinning
+            # the phase at 54.60% while its own code sits at 88.3%. The lcov
+            # --remove list already drops these on the Codecov side; this is the
+            # CDash half of that pair, and the two must stay in sync.
             _excludes=""
-            while IFS= read -r comp; do
-                [ -z "${comp}" ] && continue
-                rel="${comp#"${REPO_ROOT}/"}"
-                keep_it=0
-                for k in ${PHASE_CDASH_KEEP}; do
-                    k="${k%/}"
-                    # keep if the component is under a kept path, OR is an
-                    # ancestor of one (so parents like context-transfer-engine
-                    # are not excluded wholesale).
-                    case "${rel}/" in "${k}"/*) keep_it=1;; esac
-                    case "${k}/" in "${rel}"/*) keep_it=1;; esac
-                done
-                [ "${keep_it}" = 0 ] && _excludes="${_excludes}    \".*/${rel}/.*\"\n"
-            done < <(
-                { find "${REPO_ROOT}" -mindepth 1 -maxdepth 1 -type d \
-                       -name 'context-*';
-                  find "${REPO_ROOT}/context-transfer-engine" -mindepth 1 -maxdepth 1 \
-                       -type d 2>/dev/null; } | sort -u
-            )
+            for _tp in _deps external catch2 nanobind miniconda3 benchmark; do
+                _excludes="${_excludes}    \".*/${_tp}/.*\"\n"
+            done
+            for _comp in "${REPO_ROOT}"/context-*; do
+                [ -d "${_comp}" ] || continue
+                _cdash_emit_excludes "${_comp}"
+            done
             if [ -n "${_excludes}" ]; then
                 # Seed CTEST_CUSTOM_COVERAGE_EXCLUDE with the complement of the
                 # kept subtree. The build's generated CTestCustom.cmake (read by
                 # ctest_coverage()) then appends its own entries (e.g.
                 # fuse_cte_main.cc) to this, so both are honoured.
                 CDASH_SCOPE_BLOCK=$(printf 'set(CTEST_CUSTOM_COVERAGE_EXCLUDE\n%b)' "${_excludes}")
+                print_info "CDash exclusions: $(printf '%b' "${_excludes}" | grep -c . ) entries"
             fi
         fi
 
@@ -513,6 +586,7 @@ lcov --remove coverage_all.info \
      '*/local_sched.cc' \
      '*/globus_file_assimilator.cc' \
      '*/fuse_cte_main.cc' \
+     '*/util/clio_cae.cc' \
      --output-file coverage_filtered.info \
      "${LCOV_IGNORE_OPTS[@]}" \
      2>&1 | grep -E "Removed|Summary|lines|functions" | tail -5 || true

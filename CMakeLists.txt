@@ -1258,9 +1258,14 @@ if(CLIO_CORE_ENABLE_TESTS)
     # codecov.yml ignore list.
     #   * fuse_cte_main.cc — FUSE process entry / mount glue (fuse_main + the
     #     apptainer --fusemount fd-injection path); not unit-testable.
+    #   * util/clio_cae.cc — CAE OMNI ingest process entry (CLIO_INIT, the
+    #     IPC handle check, the ParseOmni round-trip); not unit-testable.
+    #     Its OMNI parsing lives in core/src/omni_loader.cc and is covered
+    #     by test_cae_omni_loader.
     file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
          "set(CTEST_CUSTOM_COVERAGE_EXCLUDE \${CTEST_CUSTOM_COVERAGE_EXCLUDE}\n"
-         "    \".*/fuse_cte_main\\\\.cc\")\n")
+         "    \".*/fuse_cte_main\\\\.cc\"\n"
+         "    \".*/util/clio_cae\\\\.cc\")\n")
 
     # -----------------------------------------------------------------------
     # Test cleanup fixture (pre + post)

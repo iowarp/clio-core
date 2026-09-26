@@ -82,11 +82,27 @@ jobs:
   #              adapter (== the codecov "fuse" component) instead of a
   #              whole-repo number diluted by code the fuse-only selection does
   #              not exercise.
-  #   cae/cee    Context Assimilation / Exploration Engine.
+  #   cae/cee    Context Assimilation / Exploration Engine. Both carry
+  #              cdash_scope for the same reason fuse does: the subtrees sit at
+  #              ~85% and ~78% on Codecov, but the CDash headline measured the
+  #              whole phase build under a cae-only/cee-only test selection and
+  #              read 64% and 33%. cee is the starkest -- a 784-line subtree
+  #              against a 36k-line denominator, which no amount of CEE testing
+  #              could ever lift.
   #   prediction Stands up the real Python model server and drives a LightGBM
   #              inference through the C++ prediction path and the bdev
   #              Monitor("stats") entry point. Needs the Git-LFS models and the
-  #              server's Python deps, both installed in the job below.
+  #              server's Python deps, both installed in the job below. Its
+  #              cdash_scope is the first one that is not a top-level
+  #              component: keeping context-runtime/modules/bdev (plus the one
+  #              system_info.cc file) is what forced the exclusion generator to
+  #              recurse, since the old flat sweep kept all of context-runtime
+  #              as an ancestor. Scoping alone only took it from 18% to ~21%
+  #              though: the phase claimed the bdev subtree but ran just the
+  #              two prediction_e2e tests, while the bdev suite that covers it
+  #              (~83%) ran in the unit phase. Hence the `bdev` label in the
+  #              selection -- a phase should run the tests for the code it
+  #              measures.
   matrix-tier:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -102,9 +118,9 @@ jobs:
             {"phase":"unit","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.unit","flag":"unit","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_LLAMA=ON","labels":"","extract":""},
             {"phase":"unit","arch":"arm64","os":"ubuntu-24.04-arm","site":"ubu-24.arm64.unit","flag":"unit","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_LLAMA=ON","labels":"","extract":""},
             {"phase":"fuse","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.fuse","flag":"fuse","apt":"libfuse3-dev fuse3","pkgconfig":"/usr/lib/x86_64-linux-gnu/pkgconfig","cmake_args":"-DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON -DCLIO_CTE_ENABLE_FILESYSTEM=ON","labels":"fuse|adapter","exclude_labels":"docker|copy_workspace|integration","extract":"*/context-transfer-engine/adapter/* */context-transfer-engine/filesystem/*","cdash_scope":"context-transfer-engine/adapter"},
-            {"phase":"cae","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.cae","flag":"cae","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_CAE=ON","labels":"cae","extract":"*/context-assimilation-engine/*"},
-            {"phase":"cee","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.cee","flag":"cee","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_CEE=ON","labels":"cee","extract":"*/context-exploration-engine/*"},
-            {"phase":"prediction","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.prediction","flag":"prediction","apt":"python3-venv","cmake_args":"","labels":"prediction_e2e","extract":"*/hw_failure_monitor/* */context-transport-primitives/src/system_info.cc */context-runtime/modules/bdev/*"}
+            {"phase":"cae","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.cae","flag":"cae","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_CAE=ON","labels":"cae","extract":"*/context-assimilation-engine/*","cdash_scope":"context-assimilation-engine"},
+            {"phase":"cee","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.cee","flag":"cee","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_CEE=ON","labels":"cee","extract":"*/context-exploration-engine/*","cdash_scope":"context-exploration-engine"},
+            {"phase":"prediction","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.prediction","flag":"prediction","apt":"python3-venv","cmake_args":"","labels":"prediction_e2e|bdev","extract":"*/hw_failure_monitor/* */context-transport-primitives/src/system_info.cc */context-runtime/modules/bdev/*","cdash_scope":"context-runtime/modules/bdev context-transport-primitives/src/system_info.cc"}
           ]
           JSON
           if [ "${{ github.event_name }}" = "pull_request" ]; then
