@@ -20,6 +20,7 @@
 #include <unordered_set>
 
 #include "clio_ctp/util/logging.h"
+#include "clio_ctp/util/msan.h"
 
 namespace clio::run {
 
@@ -85,6 +86,9 @@ bool RestartLog::AppendRm(const std::string& container_path) {
 std::vector<RestartLog::Entry> RestartLog::ReadAll() const {
   std::vector<Entry> entries;
   std::ifstream ifs(log_path_, std::ios::binary);
+  // Stream state belongs to uninstrumented libstdc++.so, so is_open() and
+  // every read() result below are read out of memory MSan never saw written.
+  CTP_MSAN_UNPOISON_OBJ(ifs);
   if (!ifs.is_open()) {
     return entries;  // No log yet → empty.
   }

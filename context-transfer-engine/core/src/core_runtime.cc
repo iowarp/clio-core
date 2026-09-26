@@ -62,6 +62,7 @@
 #include "clio_runtime/worker.h"
 #include "clio_ctp/util/gpu_api.h"
 #include "clio_ctp/util/logging.h"
+#include "clio_ctp/util/msan.h"
 #include "clio_ctp/util/timer.h"
 
 namespace clio::cte::core {
@@ -5615,6 +5616,9 @@ void Runtime::RestoreMetadataFromLog() {
   }
 
   std::ifstream ifs(log_path, std::ios::binary);
+  // Stream state belongs to uninstrumented libstdc++.so: is_open(), peek() and
+  // good() below all read bytes MSan never saw written.
+  CTP_MSAN_UNPOISON_OBJ(ifs);
   if (!ifs.is_open()) {
     HLOG(kError, "RestoreMetadataFromLog: Failed to open log file: {}",
          log_path);

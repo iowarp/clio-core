@@ -34,6 +34,7 @@
 #include <clio_cte/core/core_config.h>
 #include <clio_runtime/bdev/bdev_tasks.h>
 #include <yaml-cpp/yaml.h>
+#include <clio_ctp/util/msan.h>
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
@@ -61,6 +62,8 @@ bool Config::LoadFromFile(const std::string &config_file_path) {
     
     // Load and parse YAML
     YAML::Node root = YAML::LoadFile(config_file_path);
+    // yaml-cpp is a prebuilt .so; its scalars carry no MSan shadow.
+    ctp::MsanUnpoisonYaml(root);
     
     // Parse configuration using base class method
     if (!ParseYamlNode(root)) {
@@ -95,6 +98,7 @@ bool Config::LoadFromString(const std::string &yaml_string) {
 
     // Load and parse YAML from string
     YAML::Node root = YAML::Load(yaml_string);
+    ctp::MsanUnpoisonYaml(root);  // see LoadFromFile
 
     // Parse configuration using base class method
     if (!ParseYamlNode(root)) {

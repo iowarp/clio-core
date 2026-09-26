@@ -38,6 +38,7 @@
 #include <clio_runtime/config_manager.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <yaml-cpp/yaml.h>
+#include <clio_ctp/util/msan.h>
 
 #include <cctype>
 #include <string>
@@ -304,6 +305,11 @@ struct CreateParams {
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
     // Parse YAML config string
     YAML::Node config = YAML::Load(pool_config.config_);
+    // yaml-cpp is a prebuilt .so: the scalars its scanner just
+    // produced carry no MSan shadow, so every key lookup and
+    // .as<>() below reads memory it has no record of. One walk
+    // here covers the whole tree.
+    ctp::MsanUnpoisonYaml(config);
 
     // Load bdev type (optional, defaults to kFile)
     if (config["bdev_type"]) {

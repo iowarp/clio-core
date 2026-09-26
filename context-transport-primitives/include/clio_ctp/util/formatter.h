@@ -45,17 +45,8 @@
 #include "clio_ctp/types/argpack.h"
 
 // MSan: unpoison strings produced by uninstrumented libstdc++ stringstream
-#if defined(__has_feature)
-#if __has_feature(memory_sanitizer)
-#include <sanitizer/msan_interface.h>
-#define CTP_MSAN_UNPOISON_STRING(s) \
-  __msan_unpoison((s).data(), (s).size())
-#else
-#define CTP_MSAN_UNPOISON_STRING(s) ((void)0)
-#endif
-#else
-#define CTP_MSAN_UNPOISON_STRING(s) ((void)0)
-#endif
+#include "clio_ctp/util/msan.h"
+
 
 namespace ctp {
 

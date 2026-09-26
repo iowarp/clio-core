@@ -37,6 +37,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/config_manager.h>
 #include <yaml-cpp/yaml.h>
+#include <clio_ctp/util/msan.h>
 
 #include <string>
 #include <vector>
@@ -191,6 +192,11 @@ struct CreateParams {
    */
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
     YAML::Node config = YAML::Load(pool_config.config_);
+    // yaml-cpp is a prebuilt .so: the scalars its scanner just
+    // produced carry no MSan shadow, so every key lookup and
+    // .as<>() below reads memory it has no record of. One walk
+    // here covers the whole tree.
+    ctp::MsanUnpoisonYaml(config);
 
     if (config["max_failures"]) {
       max_failures_ = config["max_failures"].as<clio::run::u32>();

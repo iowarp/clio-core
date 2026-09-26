@@ -69,6 +69,7 @@
 #include "clio_runtime/runtime_pid_record.h"
 #include "clio_runtime/scheduler/scheduler_factory.h"
 #include "clio_runtime/task_archives.h"
+#include "clio_ctp/util/msan.h"
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM
 #include <clio_ctp/util/gpu_api.h>
@@ -3130,8 +3131,12 @@ size_t IpcManager::ClearUserIpcs() {
     // /proc/<pid>/fd/N; if that pid is alive and isn't us, keep the entry.
     std::error_code ec;
     auto target = std::filesystem::read_symlink(full_path, ec);
+    // See UnlinkOwnPidEntries: uninstrumented libstdc++.so filled this path,
+    // and its destructor is reported at the end of the iteration.
+    CTP_MSAN_UNPOISON_PATH(target);
     if (!ec) {
-      const std::string t = target.string();
+      std::string t = target.string();
+      CTP_MSAN_UNPOISON_STRING(t);
       constexpr const char *kProc = "/proc/";
       if (t.rfind(kProc, 0) == 0) {
         int owner_pid = std::atoi(t.c_str() + std::strlen(kProc));
@@ -3152,8 +3157,10 @@ size_t IpcManager::ClearUserIpcs() {
     // are not /proc symlinks (macOS/BSD).
     if (name.rfind(kRuntimePidRecordPrefix, 0) == 0) {
       std::ifstream pid_file(full_path);
+      CTP_MSAN_UNPOISON_OBJ(pid_file);  // stream state is libstdc++.so's
       std::string pid_line;
       if (pid_file.is_open() && std::getline(pid_file, pid_line)) {
+        CTP_MSAN_UNPOISON_STRING(pid_line);
         int owner_pid = std::atoi(pid_line.c_str());
         if (owner_pid > 0 && owner_pid != current_pid &&
             ctp::SystemInfo::IsProcessAlive(owner_pid)) {
@@ -3201,8 +3208,14 @@ size_t IpcManager::UnlinkOwnPidEntries() {
     bool owned = false;
     std::error_code ec;
     auto target = std::filesystem::read_symlink(full_path, ec);
+    // read_symlink is implemented in uninstrumented libstdc++.so, so the path
+    // it returns -- pathname and component list alike -- carries no shadow;
+    // even its destructor at the end of this iteration is reported.
+    CTP_MSAN_UNPOISON_PATH(target);
     if (!ec) {
-      owned = target.string().rfind(own_proc_prefix, 0) == 0;
+      std::string target_str = target.string();
+      CTP_MSAN_UNPOISON_STRING(target_str);
+      owned = target_str.rfind(own_proc_prefix, 0) == 0;
     } else {
       for (const auto &prefix : own_name_prefixes) {
         if (name.rfind(prefix, 0) == 0) {

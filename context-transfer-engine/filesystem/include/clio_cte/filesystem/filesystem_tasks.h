@@ -23,6 +23,7 @@
 #define CLIO_CTE_FILESYSTEM_FILESYSTEM_TASKS_H_
 
 #include <string>
+#include <clio_ctp/util/msan.h>
 #include <vector>
 
 #include <clio_runtime/clio_runtime.h>
@@ -87,6 +88,11 @@ struct FilesystemConfig {
     }
     try {
       YAML::Node node = YAML::Load(pool_config.config_);
+      // yaml-cpp is a prebuilt .so: the scalars its scanner just
+      // produced carry no MSan shadow, so every key lookup and
+      // .as<>() below reads memory it has no record of. One walk
+      // here covers the whole tree.
+      ctp::MsanUnpoisonYaml(node);
       if (node["next_pool_id"]) {
         next_pool_id_ = clio::run::PoolId::FromString(
             node["next_pool_id"].as<std::string>());

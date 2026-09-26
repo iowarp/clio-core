@@ -67,6 +67,7 @@
 
 #include "clio_ctp/introspect/system_info.h"
 #include "clio_ctp/util/config_parse.h"
+#include "clio_ctp/util/msan.h"
 
 // Downstream POSIX tests that include this header (test_clio_run_cli,
 // test_cte_fallback, ...) call kill()/waitpid()/open() directly and have long
@@ -225,10 +226,18 @@ class RuntimeServer {
    */
   static bool ServerLogHasAdminPool(const std::string &log_path) {
     std::ifstream f(log_path, std::ios::binary);
+    CTP_MSAN_UNPOISON_OBJ(f);
     if (!f) return false;
     std::ostringstream ss;
+    CTP_MSAN_UNPOISON_OBJ(ss);
     ss << f.rdbuf();
-    return ss.str().find("Admin chimod pool created successfully") !=
+    // Every byte here was moved by uninstrumented libstdc++.so -- the stream
+    // objects' own state and the log text they copied -- so under MSan the
+    // find() below searches memory it considers uninitialized. This readiness
+    // check runs in a poll loop, which is why it dominated the report counts.
+    std::string contents = ss.str();
+    CTP_MSAN_UNPOISON_STRING(contents);
+    return contents.find("Admin chimod pool created successfully") !=
            std::string::npos;
   }
 
