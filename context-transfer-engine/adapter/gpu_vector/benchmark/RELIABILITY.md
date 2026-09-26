@@ -190,3 +190,8 @@ production layout: one runtime per node remains the design.
   pool creates per rank 36 -> 6 at 16 nodes (tier 16 -> 1, clio_cte_core
   16 -> 1); 16-node stress 8872502 clean (123 s wall); stress ladder 9/9,
   kmeans ladder, grayscott ladder and the reproducer suite all PASS.
+- 2026-09-26 20:45 UTC, 64 nodes (job 8872587), O(N) startup + inbound
+  deferral (cf86f33d): all 64 ranks clean, 0 errors/mismatches, 0 nodes
+  declared dead, 200/200 gate rounds, 132 s wall (172 s before the startup
+  work); 6 pool creates per rank. Stress ladder 9/9 and kmeans GPU ladder
+  PASS on the same libraries (dev node 4).
