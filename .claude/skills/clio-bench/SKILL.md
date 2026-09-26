@@ -30,6 +30,10 @@ behind them.
    on ONE node with co-located runtimes, gating on clean exits, checksum
    agreement, and evictions > 0 for out-of-core rungs. A configuration that
    has not passed the ladder is not submitted anywhere.
+   After any runtime change, also run `bench_colocated_tests.sh <workdir>`:
+   the reproducers of the known defects as pass/fail cases (smoke, range
+   split, targets race with and without the fix, peer death, probe out of
+   core), ~10 minutes on one node.
 5. **Iterate on a held dev node**, not on the queue: `qsub -v
    DEVNODE_DIR=<flare dir> pbs_devnode_aurora.sh` (1 node, debug queue, 1 h)
    executes scripts dropped into `<dir>/queue/`, output in `<dir>/out/`.

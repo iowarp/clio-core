@@ -20,8 +20,12 @@
 #                       Range queries the receiver runs only locally.
 #   BENCH_RT_THREADS    runtime.num_threads (default 8)
 #   BENCH_QUEUE_DEPTH   runtime and gpu queue_depth (default 8192)
-#   BENCH_PROGRESS_MS   runtime.task_progress_interval_ms (default 0 = off; the
-#                       probe reported live replicas Gone on backlogged nodes)
+#   BENCH_PROGRESS_MS   runtime.task_progress_interval_ms (default 5000). It was
+#                       turned off during the evaluation because the probe
+#                       reported live replicas Gone on backlogged nodes; that is
+#                       fixed (generations, two strikes), and with SWIM off the
+#                       probe is also what notices a dead peer (three unanswered
+#                       probes mark the node dead).
 #   BENCH_DPE           cte_core dpe_type (default max_bw)
 #
 # SWIM is always off: its detector declares busy nodes dead in wide collectives.
@@ -57,7 +61,7 @@ runtime:
   num_threads: ${BENCH_RT_THREADS:-8}
   queue_depth: ${BENCH_QUEUE_DEPTH:-8192}
   first_busy_wait: 10000000
-  task_progress_interval_ms: ${BENCH_PROGRESS_MS:-0}
+  task_progress_interval_ms: ${BENCH_PROGRESS_MS:-5000}
 
 gpu:
   queue_depth: ${BENCH_QUEUE_DEPTH:-8192}
@@ -84,22 +88,26 @@ EOF
 
 # bench_check_binary <exe>
 #
-# Refuse a benchmark binary that is OLDER than the runtime libraries it links.
-# The benchmarks compile runtime headers (Host, task structs, ...) into
-# themselves, so a library rebuilt after a struct change leaves an old binary
-# reading fields at stale offsets: it crashed inside main() ~7 s into every
-# run and looked like a runtime bug for an hour. BENCH_ALLOW_STALE=1 overrides.
+# Refuse a benchmark binary that is OLDER than a runtime or gpu_vector header.
+# The benchmarks compile those headers (Host, task structs, the device
+# vector) into themselves, so a header changed after the build leaves an old
+# binary reading fields at stale offsets: it crashed inside main() ~7 s into
+# every run and looked like a runtime bug for an hour. Headers, not the
+# libraries: a relinked library with unchanged headers is harmless.
+# BENCH_ALLOW_STALE=1 overrides.
 bench_check_binary() {
-  local exe=$1 lib
-  local libdir
-  libdir=$(dirname "${exe}")/../build-fresh/bin
-  [ -d "${libdir}" ] || return 0
-  for lib in libclio_run_cxx.so libclio_cte_core_runtime.so libclio_cte_core_client.so; do
-    if [ "${libdir}/${lib}" -nt "${exe}" ]; then
-      echo "STALE BINARY: ${exe} is older than ${lib}; rebuild it (BENCH_ALLOW_STALE=1 to run anyway)"
-      [ "${BENCH_ALLOW_STALE:-0}" = 1 ] || return 1
-    fi
-  done
+  local exe=$1 root newer
+  root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
+  # Module client headers count too; *_runtime.h files are server-side only.
+  newer=$(find "${root}/context-runtime/include" "${root}/context-transport-primitives/include" \
+               "${root}/context-runtime/modules"/*/include \
+               "${root}/context-transfer-engine/core/include" \
+               "${root}/context-transfer-engine/adapter/gpu_vector/include" \
+               -name '*.h' ! -name '*_runtime.h' -newer "${exe}" -print -quit 2>/dev/null)
+  if [ -n "${newer}" ]; then
+    echo "STALE BINARY: ${exe} is older than ${newer}; rebuild it (BENCH_ALLOW_STALE=1 to run anyway)"
+    [ "${BENCH_ALLOW_STALE:-0}" = 1 ] || return 1
+  fi
   return 0
 }
 

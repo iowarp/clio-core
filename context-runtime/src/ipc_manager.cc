@@ -1890,9 +1890,10 @@ void IpcManager::SetDead(u64 node_id) {
   {
     std::lock_guard<std::mutex> lock(client_pool_mutex_);
     auto *config_manager = CLIO_CONFIG_MANAGER;
-    int port = static_cast<int>(config_manager->GetPort());
+    int port = static_cast<int>(it->second.PortOr(config_manager->GetPort()));
     std::string key = it->second.ip_address + ":" + std::to_string(port);
     client_pool_.erase(key);
+    client_pool_.erase(key + "#resp");
   }
 
   HLOG(kWarning, "IpcManager: Node {} ({}) marked as DEAD", node_id,

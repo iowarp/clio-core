@@ -429,14 +429,34 @@ private:
     size_t net_key;
     clio::run::u32 replica_id;
     clio::run::u64 gen;  // the origin's OriginProgress::gen when fired
+    clio::run::u64 target_node_id;  // the node probed
+    std::chrono::steady_clock::time_point fired_at;
+    bool silence_reported = false;  // the silence bound was already acted on
   };
+  /**
+   * How long a probe may go unanswered before its target is declared dead.
+   * A probe to a node that is gone never completes at all: no origin-side
+   * timer fails a sent task whose target never answers, so counting failed
+   * completions is not enough. Three probe intervals of silence it is.
+   */
+  static constexpr double kProbeSilenceSec = 15.0;
   std::vector<PendingProgressQuery> pending_progress_queries_;
+  /**
+   * Consecutive liveness probes to a node that came back with an error (no
+   * answer within the probe's own bound). With SWIM off nothing else ever
+   * marks a node dead, so a rank whose peer died sat in GetOrCreateTag
+   * forever. After kProbeFailuresToDeclareDead in a row the node is marked
+   * dead and the dead-node scan fails its outstanding tasks.
+   */
+  std::unordered_map<clio::run::u64, clio::run::u32> probe_failures_;
+  static constexpr clio::run::u32 kProbeFailuresToDeclareDead = 3;
 
   /**
    * Periodic cross-node task-progress validity check (issue #628). Reaps
    * completed probes (Gone -> complete the origin) and fires new probes for
    * replicas the origin has waited on beyond task_progress_interval_ms.
    */
+  void NoteProbeFailure(clio::run::u64 node_id);
   void ScanTaskProgress();
   std::mt19937 probe_rng_{std::random_device{}()};
 

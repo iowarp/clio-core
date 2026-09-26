@@ -1598,6 +1598,33 @@ clio::run::TaskResume Runtime::QueryTaskProgress(
   CLIO_TASK_BODY_END
 }
 
+/**
+ * Record a liveness probe to node_id that returned an error, and mark the
+ * node dead after kProbeFailuresToDeclareDead consecutive ones.
+ *
+ * A probe fails when the target does not answer within the probe's own net
+ * timeout. One failure is inconclusive (the target may be busy); three in a
+ * row, an interval apart, means the node is not there. Marking it dead lets
+ * ScanSendMapTimeouts fail the tasks waiting on it instead of hanging.
+ * @param node_id the probed node
+ */
+void Runtime::NoteProbeFailure(clio::run::u64 node_id) {
+  auto *ipc_manager = CLIO_IPC;
+  const clio::run::u32 failures = ++probe_failures_[node_id];
+  if (failures < kProbeFailuresToDeclareDead) {
+    HLOG(kWarning,
+         "[TaskProgress] node {} did not answer a liveness probe ({}/{})",
+         node_id, failures, kProbeFailuresToDeclareDead);
+    return;
+  }
+  HLOG(kError,
+       "[TaskProgress] node {} failed {} consecutive liveness probes; marking "
+       "it dead so the tasks waiting on it can fail",
+       node_id, failures);
+  probe_failures_.erase(node_id);
+  ipc_manager->SetDead(node_id);
+}
+
 // Origin-side periodic task-progress validity check (issue #628). Fire-and-poll:
 // reap completed probes, then fire new ones for replicas outstanding beyond the
 // configured interval. Never awaits, so the net-processing tick that drives the
@@ -1607,9 +1634,20 @@ void Runtime::ScanTaskProgress() {
   auto *run2run = ipc_manager->GetRun2Run();
 
   // 1. Reap completed probes.
+  const auto now = std::chrono::steady_clock::now();
   for (auto it = pending_progress_queries_.begin();
        it != pending_progress_queries_.end();) {
     if (!it->future.IsComplete()) {
+      const double silent_s =
+          std::chrono::duration<double>(now - it->fired_at).count();
+      if (!it->silence_reported && silent_s >= kProbeSilenceSec) {
+        it->silence_reported = true;
+        HLOG(kError,
+             "[TaskProgress] node {} has not answered a liveness probe for "
+             "{:.1f} s; marking it dead so the tasks waiting on it can fail",
+             it->target_node_id, silent_s);
+        ipc_manager->SetDead(it->target_node_id);
+      }
       ++it;
       continue;
     }
@@ -1623,6 +1661,9 @@ void Runtime::ScanTaskProgress() {
       run2run->HandleTaskProgressResult(
           static_cast<clio::run::u64>(it->net_key), it->replica_id, gone,
           it->gen);
+      probe_failures_.erase(it->target_node_id);
+    } else {
+      NoteProbeFailure(it->target_node_id);
     }
     it = pending_progress_queries_.erase(it);
   }
@@ -1655,7 +1696,7 @@ void Runtime::ScanTaskProgress() {
          sr.net_key, sr.replica_id, sr.target_node_id);
     pending_progress_queries_.push_back(
         {std::move(fut), static_cast<size_t>(sr.net_key), sr.replica_id,
-         sr.gen});
+         sr.gen, sr.target_node_id, std::chrono::steady_clock::now(), false});
   }
 }
 
