@@ -329,14 +329,30 @@ void HiwaterRename(const std::string &from, const std::string &to) {
 
 // Drain every page-blob key of `path`'s file (sieve writes register under
 // (tag, page-name), NOT under the cfs FileKey) up to `hiwater` bytes.
-void DrainSievePages(const clio::cte::core::TagId &tag,
-                     clio::run::u64 hiwater) {
-  if (tag.IsNull() || hiwater == 0) return;
+/**
+ * Land every deferred page write of a file and report whether any failed.
+ *
+ * Failed page puts latch their error under the PAGE key; nothing ever read
+ * those latches, so a write the store rejected (tier full, bdev write
+ * failure) was acknowledged to write(2), fsync(2) and close(2) alike and the
+ * bytes silently read back as zeros (8-node shared-file run, full RAM tier).
+ * @param tag     the file's tag
+ * @param hiwater extent of the writes to drain
+ * @return 0, or the first errno-style error latched by a page write
+ */
+int DrainSievePages(const clio::cte::core::TagId &tag,
+                    clio::run::u64 hiwater) {
+  if (tag.IsNull() || hiwater == 0) return 0;
+  int first_err = 0;
   for (clio::run::u64 off = 0; off < hiwater;
        off += clio::cte::filesystem::kFsPageSize) {
-    clio::cte::core::Client::AwaitPendingPuts(
-        tag, clio::cte::filesystem::PageName(off));
+    const std::string page = clio::cte::filesystem::PageName(off);
+    clio::cte::core::Client::AwaitPendingPuts(tag, page);
+    const int e = clio::cte::core::Client::DeferTakeKeyError(
+        clio::cte::core::Client::DeferKeyHash(tag, page));
+    if (e != 0 && first_err == 0) first_err = e;
   }
+  return first_err;
 }
 
 CfsHandle *GetHandle(struct fuse_file_info *fi) {
@@ -1754,7 +1770,12 @@ static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
   clio::cte::core::Client::DeferAwaitKey(
       clio::cte::core::Client::DeferKeyHashName(hp));
   const clio::run::u64 hiwater = HiwaterFor(hp);
-  DrainSievePages(handle->tag, hiwater);
+  const int werr = DrainSievePages(handle->tag, hiwater);
+  if (werr != 0) {
+    // A lost write must fail fsync/close. Latched codes are a mix of errno
+    // values and store return codes, so only ENOSPC is passed through.
+    return werr == ENOSPC ? -ENOSPC : -EIO;
+  }
   if (handle->fh == 0) {
     EnsureCreated(hp);
   }
@@ -1924,6 +1945,15 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
           handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
           buf + done);
       g.Wait();
+      // 0 = read, 1 = the page does not exist (a hole: the pre-zeroed
+      // buffer is the right answer). Anything else -- above all the
+      // network-timeout code a page on a DEAD node completes with -- is an
+      // I/O error. Treating it as a hole returned zeros with success: a
+      // reader got silently corrupted data while a node was down.
+      const int grc = static_cast<int>(g->GetReturnCode());
+      if (grc != 0 && grc != 1) {
+        return -EIO;
+      }
       done += n;
     }
     return static_cast<int>(want);

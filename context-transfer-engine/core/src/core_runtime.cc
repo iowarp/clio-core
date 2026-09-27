@@ -1228,8 +1228,15 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
 
-    // Broadcast operations
+    // GetTagSize backs every stat: a broadcast that waited out the 30 s
+    // retry window for each DEAD node made every stat on every survivor
+    // take 30 s while one node was down. net_timeout 0 skips nodes already
+    // declared dead (live nodes are unaffected; the answer covers the
+    // containers that are reachable).
     case Method::kGetTagSize:
+      return clio::run::PoolQuery::Broadcast(0.0f);
+
+    // Broadcast operations
     case Method::kGetContainedBlobs:
     case Method::kBlobQuery:
     case Method::kEvict:
@@ -7390,7 +7397,25 @@ void Runtime::ReplayTransactionLogs() {
     }
   }
 
-  // Phase 3: Recompute tag total_size_ from blob blocks
+  // Phase 3: Recompute tag total_size_ from surviving blob bytes.
+  //
+  // A blob's PRIMARY blocks_ can be entirely gone at this point: clio-fs
+  // (and any other write-through-to-RAM caller) puts every blob to the
+  // volatile RAM tier first, and RestoreMetadataFromLog / the kExtendBlob
+  // replay above already dropped every volatile block from blocks_ (that
+  // data really did not survive the restart). blob_info.GetTotalSize()
+  // therefore reports 0 for such a blob even when the replication chimod's
+  // write-through gave it a fully durable REPLICA on a non-volatile target
+  // -- replicas_ went through the SAME volatile filter (kExtendReplica /
+  // the type-4 snapshot entries) and kept their blocks precisely because
+  // they are not volatile. Summing GetTotalSize() alone zeroed every such
+  // file's reported size on every restart (graceful or crash), even though
+  // GetBlob's replica fallback (replication::Runtime::GetBlob) could still
+  // serve the bytes. Fall back to the best surviving replica's size,
+  // mirroring the same rule replication::Runtime::GetBlobSize already
+  // applies at read time: only when the primary itself reports empty, not
+  // when it merely differs from a replica (a genuinely partial primary
+  // still wins as the freshest copy).
   tag_id_to_info_.for_each([&](const TagId &tag_id, std::shared_ptr<TagInfo> &tag_info_sp) { TagInfo &tag_info = *tag_info_sp; (void)tag_info;
     clio::run::u64 total = 0;
     std::string tag_prefix = std::to_string(tag_id.major_) + "." +
@@ -7399,7 +7424,15 @@ void Runtime::ReplayTransactionLogs() {
         [&tag_prefix, &total](const std::string &key,
                               const std::shared_ptr<BlobInfo> &blob_info_sp) { const BlobInfo &blob_info = *blob_info_sp; (void)blob_info;
           if (key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
-            total += blob_info.GetTotalSize();
+            clio::run::u64 blob_total = blob_info.GetTotalSize();
+            if (blob_total == 0) {
+              for (const auto &rep : blob_info.replicas_) {
+                if (rep.total_size_cache_ > blob_total) {
+                  blob_total = rep.total_size_cache_;
+                }
+              }
+            }
+            total += blob_total;
           }
         });
     tag_info.total_size_ = total;

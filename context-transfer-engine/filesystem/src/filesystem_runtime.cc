@@ -758,8 +758,17 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
                                /*flags*/ 0u, dst + done,
                                clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(g);
-    // A miss/short read just leaves the pre-zeroed bytes as zeros (a hole is
-    // not an error), so the return code is intentionally ignored here.
+    // A miss (rc 1) leaves the pre-zeroed bytes as zeros -- a hole is not an
+    // error. Any other code (a page on an unreachable node completes with
+    // the network-timeout RC) must fail the read, not read as zeros.
+    {
+      const int grc = static_cast<int>(g->GetReturnCode());
+      if (grc != 0 && grc != 1) {
+        task->bytes_read_ = 0;
+        task->return_code_ = EIO;
+        CLIO_CO_RETURN;
+      }
+    }
     done += to_read;
     cur += to_read;
   }
