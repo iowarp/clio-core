@@ -156,6 +156,19 @@ inline std::string XattrKey(const clio::cte::core::TagId &t) {
   return std::to_string((static_cast<clio::run::u64>(t.major_) << 32) |
                         static_cast<clio::run::u64>(t.minor_));
 }
+/** On-disk record of a file's persistent metadata (see meta_tag_id_). */
+struct FsMetaRecord {
+  clio::run::u32 magic_;    /**< kFsMetaMagic */
+  clio::run::u32 mode_;     /**< permission bits, 0xFFFFFFFF = none */
+  clio::run::u32 uid_;      /**< owner, 0xFFFFFFFF = none */
+  clio::run::u32 gid_;      /**< group, 0xFFFFFFFF = none */
+  clio::run::u64 size_;     /**< logical size */
+  clio::run::u64 atime_;    /**< utimens overrides (ns, 0 = none) */
+  clio::run::u64 mtime_;
+  clio::run::u64 ctime_;
+};
+static constexpr clio::run::u32 kFsMetaMagic = 0xC11F5E7Au;
+
 inline void PutU32(std::string &out, clio::run::u32 v) {
   char b[4];
   std::memcpy(b, &v, 4);  // host is little-endian on all supported targets
@@ -231,6 +244,15 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     CLIO_CO_AWAIT(xt);
     if (xt->GetReturnCode() == 0) {
       xattr_tag_id_ = xt->tag_id_;
+    }
+  }
+  {
+    auto mt = cte_.AsyncGetOrCreateTag("_clio_fs_meta",
+                                       clio::cte::core::TagId::GetNull(),
+                                       clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(mt);
+    if (mt->GetReturnCode() == 0) {
+      meta_tag_id_ = mt->tag_id_;
     }
   }
   // issue #817: bring up the shared-memory attribute mirror, so clients can
@@ -427,6 +449,104 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
   CLIO_TASK_BODY_END
 }
 
+// ---- persistent per-file metadata (meta_tag_id_) ----
+
+// Write the persistent record of FileInfo `fiptr` (a shared_ptr), keyed by
+// its tag. Fields are snapshotted under meta_mu_; the put runs unlocked.
+// Best-effort only for the caller's result code: an unwritable record is
+// logged, the in-memory state (what stat serves) is already correct.
+#define CLIO_FSMETA_STORE(fiptr)                                             \
+  do {                                                                       \
+    if (!meta_tag_id_.IsNull() && (fiptr) != nullptr) {                      \
+      FsMetaRecord _r;                                                       \
+      std::string _mk;                                                       \
+      {                                                                      \
+        std::lock_guard<std::mutex> _g(meta_mu_);                            \
+        _r.magic_ = kFsMetaMagic;                                            \
+        _r.mode_ = (fiptr)->set_mode_;                                       \
+        _r.uid_ = (fiptr)->set_uid_;                                         \
+        _r.gid_ = (fiptr)->set_gid_;                                         \
+        _r.size_ = (fiptr)->size_.load();                                    \
+        _r.atime_ = (fiptr)->set_atime_;                                     \
+        _r.mtime_ = (fiptr)->set_mtime_;                                     \
+        _r.ctime_ = (fiptr)->set_ctime_;                                     \
+        _mk = XattrKey((fiptr)->tag_id_);                                    \
+      }                                                                      \
+      auto *_mipc = CLIO_IPC;                                                \
+      ctp::ipc::FullPtr<char> _mb = _mipc->AllocateBuffer(sizeof(_r));       \
+      if (!_mb.IsNull()) {                                                   \
+        std::memcpy(_mb.ptr_, &_r, sizeof(_r));                              \
+        auto _mp = cte_.AsyncPutBlob(meta_tag_id_, _mk, 0, sizeof(_r),       \
+                                     _mb.shm_.template Cast<void>(), -1.0f,  \
+                                     clio::cte::core::Context(),              \
+                                     clio::cte::core::kCtePutReplace,         \
+                                     clio::run::PoolQuery::Dynamic());       \
+        CLIO_CO_AWAIT(_mp);                                                  \
+        if (_mp->GetReturnCode() != 0) {                                     \
+          HLOG(kError, "filesystem: persisting metadata of {} failed rc={}", \
+               _mk, _mp->GetReturnCode());                                   \
+        }                                                                    \
+        _mipc->FreeBuffer(_mb);                                              \
+      }                                                                      \
+    }                                                                        \
+  } while (0)
+
+// Make sure by_tag_ holds a record for `tagv` (TagId), loading the persistent
+// one if this container has none yet (first touch after a restart, or of a
+// file only ever seen by name). `seed_size` seeds a record that has no stored
+// copy; `is_dir` keeps directory records out of by_path_ (Getattr's tracked
+// branch treats by_path_ entries as regular files).
+#define CLIO_FSMETA_ENSURE(tagv, pathv, seed_size, is_dir)                    \
+  do {                                                                       \
+    const clio::run::u64 _ep =                                               \
+        (static_cast<clio::run::u64>((tagv).major_) << 32) |                 \
+        static_cast<clio::run::u64>((tagv).minor_);                          \
+    bool _have = false;                                                      \
+    {                                                                        \
+      std::lock_guard<std::mutex> _g(meta_mu_);                              \
+      auto _it = by_tag_.find(_ep);                                          \
+      _have = (_it != by_tag_.end() && _it->second->tag_id_ == (tagv));      \
+    }                                                                        \
+    if (!_have && !(tagv).IsNull()) {                                        \
+      FsMetaRecord _r;                                                       \
+      bool _got = false;                                                     \
+      if (!meta_tag_id_.IsNull()) {                                          \
+        auto *_eipc = CLIO_IPC;                                              \
+        ctp::ipc::FullPtr<char> _eb = _eipc->AllocateBuffer(sizeof(_r));     \
+        if (!_eb.IsNull()) {                                                 \
+          std::memset(_eb.ptr_, 0, sizeof(_r));                              \
+          auto _eg = cte_.AsyncGetBlob(meta_tag_id_, XattrKey(tagv), 0,      \
+                                       sizeof(_r), 0u,                       \
+                                       _eb.shm_.template Cast<void>(),       \
+                                       clio::run::PoolQuery::Dynamic());     \
+          CLIO_CO_AWAIT(_eg);                                                \
+          if (_eg->GetReturnCode() == 0) {                                   \
+            std::memcpy(&_r, _eb.ptr_, sizeof(_r));                          \
+            _got = (_r.magic_ == kFsMetaMagic);                              \
+          }                                                                  \
+          _eipc->FreeBuffer(_eb);                                            \
+        }                                                                    \
+      }                                                                      \
+      std::lock_guard<std::mutex> _g(meta_mu_);                              \
+      auto &_slot = by_tag_[_ep];                                            \
+      if (_slot == nullptr || _slot->tag_id_ != (tagv)) {                    \
+        _slot = std::make_shared<FileInfo>();                                \
+        _slot->tag_id_ = (tagv);                                             \
+        _slot->path_ = (pathv);                                              \
+        _slot->size_.store(_got ? _r.size_ : (seed_size));                   \
+        if (_got) {                                                          \
+          _slot->set_mode_ = _r.mode_;                                       \
+          _slot->set_uid_ = _r.uid_;                                         \
+          _slot->set_gid_ = _r.gid_;                                         \
+          _slot->set_atime_ = _r.atime_;                                     \
+          _slot->set_mtime_ = _r.mtime_;                                     \
+          _slot->set_ctime_ = _r.ctime_;                                     \
+        }                                                                    \
+        if (!(is_dir)) by_path_.emplace((pathv), _slot);                     \
+      }                                                                      \
+    }                                                                        \
+  } while (0)
+
 clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // "next_pool": the pool this filesystem stores page blobs through (the top
@@ -499,8 +619,14 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
     }
   }
 
+  // An existing file first touched here since a restart: load its persisted
+  // record (logical size, mode, owner, times) before binding a handle to it.
+  if (existed) {
+    CLIO_FSMETA_ENSURE(tag_id, path, size, false);
+  }
   // Register the handle + per-file logical size (source of truth henceforth).
   clio::run::u64 handle = next_handle_.fetch_add(1);
+  std::shared_ptr<FileInfo> opened_fi;
   {
     std::lock_guard<std::mutex> g(meta_mu_);
     auto it = by_path_.find(path);
@@ -530,6 +656,7 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
     // make copied binaries executable — getattr otherwise synthesizes 0644).
     if (!existed) fi->set_mode_ = task->mode_ & 07777u;
     handles_[handle] = fi;
+    opened_fi = fi;
     // Publish under the lock: the override fields read by MirrorFile are
     // guarded by meta_mu_, and this is the first point at which the path's
     // tag binding is settled.
@@ -541,9 +668,11 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
   task->created_ = existed ? 0u : 1u;
   task->tag_packed_ = (static_cast<clio::run::u64>(tag_id.major_) << 32) |
                       static_cast<clio::run::u64>(tag_id.minor_);
-  // Creating a new file updates its parent directory's mtime/ctime.
+  // Creating a new file updates its parent directory's mtime/ctime, and its
+  // creation mode must survive a restart.
   if (!existed) {
     CLIO_FS_TOUCH_DIR(ParentDir(path));
+    CLIO_FSMETA_STORE(opened_fi);
   }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
@@ -581,6 +710,7 @@ clio::run::TaskResume Runtime::AdvanceSize(
     }
     task->old_size_ = old;
   }
+  CLIO_FSMETA_STORE(fi);  // the logical size is durable once close returns
   {
     // Publish under the file's CURRENT path — but only while that path still
     // maps to THIS FileInfo. A concurrent Rename erases the source's mirror
@@ -1133,6 +1263,7 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
       // FileInfo, exactly as for files; without reading them back every
       // directory reported 0755 (rsync -a re-sent every directory, and
       // mkdir -m 700 was silently ignored).
+      CLIO_FSMETA_ENSURE(tag->tag_id_, dir, 0, true);
       {
         const clio::run::u64 dpacked =
             (static_cast<clio::run::u64>(tag->tag_id_.major_) << 32) |
@@ -1174,6 +1305,10 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
       task->mtime_ = s->mtime_;
       task->atime_ = s->atime_;
     }
+    // First touch of this file here (after a restart, or a name never
+    // opened): load its persisted record, seeding with the physical size.
+    CLIO_FSMETA_ENSURE(tid, path,
+                       (s->GetReturnCode() == 0) ? s->tag_size_ : 0, false);
     // Another NAME of this file (the canonical path of a hard link, say) may
     // hold the live record: its logical size and mode/owner/time overrides
     // belong to the FILE, not to the name that was opened. Without this a
@@ -1245,6 +1380,7 @@ clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &tas
           MirrorFile(tfi->path_, *tfi);
         }
       }
+      CLIO_FSMETA_STORE(tfi);  // the new logical size must survive a restart
     }
     if (t_new < t_old) {
       clio::run::u64 boundary_page = t_new / kFsPageSize;
@@ -1350,16 +1486,20 @@ clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &tas
         old_size = s->tag_size_;
       }
     }
-    std::lock_guard<std::mutex> g(meta_mu_);
-    auto it = by_path_.find(path);
-    if (it != by_path_.end() && it->second->tag_id_ != tag_id) {
-      by_path_.erase(it);  // stale binding to a dead tag: rebind below
+    std::shared_ptr<FileInfo> fi;
+    {
+      std::lock_guard<std::mutex> g(meta_mu_);
+      auto it = by_path_.find(path);
+      if (it != by_path_.end() && it->second->tag_id_ != tag_id) {
+        by_path_.erase(it);  // stale binding to a dead tag: rebind below
+      }
+      fi = BindFileInfoLocked(path, tag_id, new_size);
+      fi->size_.store(new_size);
+      // Materialized names must reach the mirror, or a COMPLETE parent dir
+      // would answer authoritative ENOENT for a file that now exists.
+      MirrorFile(path, *fi);
     }
-    auto fi = BindFileInfoLocked(path, tag_id, new_size);
-    fi->size_.store(new_size);
-    // Materialized names must reach the mirror, or a COMPLETE parent dir
-    // would answer authoritative ENOENT for a file that now exists.
-    MirrorFile(path, *fi);
+    CLIO_FSMETA_STORE(fi);  // the new logical size must survive a restart
   }
 
   // Shrink: free the page-blob data beyond new_size so the truncated bytes are
@@ -2155,13 +2295,18 @@ clio::run::TaskResume Runtime::Utimens(clio::run::shared_ptr<UtimensTask> &task)
                                          clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(dt);
       if (dt->GetReturnCode() == 0) {
-        std::lock_guard<std::mutex> g(meta_mu_);
-        auto slot = DirInfoLocked(dt->tag_id_, path);
-        if (a_now) slot->set_atime_ = now;
-        else if (a_set) slot->set_atime_ = task->atime_ns_;
-        if (m_now) slot->set_mtime_ = now;
-        else if (m_set) slot->set_mtime_ = task->mtime_ns_;
-        slot->set_ctime_ = now;
+        CLIO_FSMETA_ENSURE(dt->tag_id_, path, 0, true);
+        std::shared_ptr<FileInfo> slot;
+        {
+          std::lock_guard<std::mutex> g(meta_mu_);
+          slot = DirInfoLocked(dt->tag_id_, path);
+          if (a_now) slot->set_atime_ = now;
+          else if (a_set) slot->set_atime_ = task->atime_ns_;
+          if (m_now) slot->set_mtime_ = now;
+          else if (m_set) slot->set_mtime_ = task->mtime_ns_;
+          slot->set_ctime_ = now;
+        }
+        CLIO_FSMETA_STORE(slot);
       }
       task->return_code_ = 0;
       CLIO_CO_RETURN;
@@ -2195,9 +2340,11 @@ clio::run::TaskResume Runtime::Utimens(clio::run::shared_ptr<UtimensTask> &task)
         static_cast<clio::run::u32>(packed >> 32),
         static_cast<clio::run::u32>(packed & 0xffffffffULL));
   }
+  CLIO_FSMETA_ENSURE(tag_id, path, 0, false);
+  std::shared_ptr<FileInfo> fi;
   {
     std::lock_guard<std::mutex> g(meta_mu_);
-    std::shared_ptr<FileInfo> fi = BindFileInfoLocked(path, tag_id, 0);
+    fi = BindFileInfoLocked(path, tag_id, 0);
     if (a_now) fi->set_atime_ = now;
     else if (a_set) fi->set_atime_ = task->atime_ns_;
     if (m_now) fi->set_mtime_ = now;
@@ -2205,6 +2352,7 @@ clio::run::TaskResume Runtime::Utimens(clio::run::shared_ptr<UtimensTask> &task)
     fi->set_ctime_ = now;  // utimens always advances ctime
     MirrorFile(path, *fi);
   }
+  CLIO_FSMETA_STORE(fi);
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -2231,11 +2379,16 @@ clio::run::TaskResume Runtime::Chown(clio::run::shared_ptr<ChownTask> &task) {
                                          clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(dt);
       if (dt->GetReturnCode() == 0) {
-        std::lock_guard<std::mutex> g(meta_mu_);
-        auto slot = DirInfoLocked(dt->tag_id_, path);
-        if (task->uid_ != 0xFFFFFFFFu) slot->set_uid_ = task->uid_;
-        if (task->gid_ != 0xFFFFFFFFu) slot->set_gid_ = task->gid_;
-        if (task->mode_ != 0xFFFFFFFFu) slot->set_mode_ = task->mode_ & 07777u;
+        CLIO_FSMETA_ENSURE(dt->tag_id_, path, 0, true);
+        std::shared_ptr<FileInfo> slot;
+        {
+          std::lock_guard<std::mutex> g(meta_mu_);
+          slot = DirInfoLocked(dt->tag_id_, path);
+          if (task->uid_ != 0xFFFFFFFFu) slot->set_uid_ = task->uid_;
+          if (task->gid_ != 0xFFFFFFFFu) slot->set_gid_ = task->gid_;
+          if (task->mode_ != 0xFFFFFFFFu) slot->set_mode_ = task->mode_ & 07777u;
+        }
+        CLIO_FSMETA_STORE(slot);
       }
       // ctime only: chmod/chown/utimens change a directory's METADATA, not
       // its entries, so its mtime must not move (a mtime bump here also
@@ -2280,11 +2433,15 @@ clio::run::TaskResume Runtime::Chown(clio::run::shared_ptr<ChownTask> &task) {
     CLIO_CO_AWAIT(s);
     if (s->GetReturnCode() == 0) cur_size = s->tag_size_;
   }
+  // Load the persisted record first so this update does not drop the
+  // fields it leaves alone (e.g. a chmod after a restart keeping the owner).
+  CLIO_FSMETA_ENSURE(tag_id, path, cur_size, false);
+  std::shared_ptr<FileInfo> fi;
   {
     std::lock_guard<std::mutex> g(meta_mu_);
     // An already-tracked record keeps its live size_; a new one is seeded
     // with the current size so getattr doesn't report 0.
-    std::shared_ptr<FileInfo> fi = BindFileInfoLocked(path, tag_id, cur_size);
+    fi = BindFileInfoLocked(path, tag_id, cur_size);
     // 0xFFFFFFFF means "leave this field unchanged" (POSIX (uid_t)-1).
     if (task->uid_ != 0xFFFFFFFFu) fi->set_uid_ = task->uid_;
     if (task->gid_ != 0xFFFFFFFFu) fi->set_gid_ = task->gid_;
@@ -2293,6 +2450,7 @@ clio::run::TaskResume Runtime::Chown(clio::run::shared_ptr<ChownTask> &task) {
     fi->set_ctime_ = clio::cte::core::GetWallTimeNs();  // chown/chmod advances ctime
     MirrorFile(path, *fi);
   }
+  CLIO_FSMETA_STORE(fi);
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

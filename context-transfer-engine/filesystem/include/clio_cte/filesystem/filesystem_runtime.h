@@ -206,6 +206,12 @@ class Runtime : public clio::run::Container {
   // GetTagSize (i.e. the reported st_size). Resolved once at Create.
   clio::cte::core::TagId xattr_tag_id_ = clio::cte::core::TagId::GetNull();
 
+  // Global PERSISTENT metadata store: one fixed-size record per file or dir
+  // (logical size + mode/owner/time overrides), named by the packed tag id.
+  // FileInfo is in-memory; without this every chmod/chown/utimens and every
+  // logical size (sparse, truncated) was lost on restart. Resolved at Create.
+  clio::cte::core::TagId meta_tag_id_ = clio::cte::core::TagId::GetNull();
+
   // ---- per-file logical-size metadata + handle table ----
   struct FileInfo {
     clio::cte::core::TagId tag_id_;
