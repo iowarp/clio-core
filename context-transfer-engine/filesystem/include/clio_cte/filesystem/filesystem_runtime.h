@@ -396,6 +396,12 @@ class Runtime : public clio::run::Container {
   void QueuePurge(const PurgeItem &item);
   /** Drain queued purges (periodic ShardOp body). */
   clio::run::TaskResume PurgeDrain();
+  /**
+   * Delete, on THIS container only, the pages of every id in `req.str_`
+   * (packed u64s). One such request per container replaces a cluster-wide
+   * broadcast per deleted file.
+   */
+  clio::run::TaskResume PurgeLocal(const FsReq &req);
   /** Start the periodic purge drain once (call from a task body). */
   void EnsurePurgeDrain();
 
@@ -499,6 +505,7 @@ enum FsShardOp : clio::run::u32 {
   kShardInodeTruncate = 15, ///< truncate an inode
   kShardInodeXattr = 16,    ///< xattr get/set/list/remove
   kShardPurgeDrain = 17,    ///< periodic: purge dead inodes' data
+  kShardPurgeLocal = 18,    ///< drop this container's pages of a batch of ids
 };
 
 /** Insert flags (FsReq::flags_ of kShardInsert). */

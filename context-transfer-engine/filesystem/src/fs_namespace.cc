@@ -276,6 +276,9 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
       CLIO_CO_AWAIT(InodeXattr(req, resp));
       rc = static_cast<int>(resp.rc_);
       break;
+    case kShardPurgeLocal:
+      CLIO_CO_AWAIT(PurgeLocal(req));
+      break;
     default:
       rc = EINVAL;
       break;
@@ -816,15 +819,29 @@ clio::run::TaskResume Runtime::PurgeDrain() {
     std::lock_guard<std::mutex> g(purge_mu_);
     work.swap(purge_pending_);
   }
-  for (const PurgeItem &item : work) {
-    if (item.data_) {
-      // Pages are hash-spread across every node, so the purge asks all of
-      // them (skipping nodes already known dead). Off the unlink path.
-      auto d = cte_.AsyncDelTag(item.id_, clio::run::PoolQuery::Broadcast(0.0f));
-      CLIO_CO_AWAIT(d);
+  // Pages are hash-spread over every node. Ship each node ONE request per
+  // batch of dead ids (it deletes its own pages locally) instead of one
+  // cluster-wide broadcast per file: 10k unlinks were 10k broadcasts that
+  // saturated the network worker and stalled every other remote request.
+  constexpr size_t kPurgeBatch = 512;
+  for (size_t i = 0; i < work.size(); i += kPurgeBatch) {
+    FsReq batch;
+    FsEnc enc(&batch.str_);
+    const size_t end = std::min(work.size(), i + kPurgeBatch);
+    for (size_t j = i; j < end; ++j) {
+      if (work[j].data_) enc.U64(FsPack(work[j].id_));
     }
-    if (item.xattr_ && !xattr_tag_id_.IsNull()) {
-      auto x = cte_.AsyncDelBlob(xattr_tag_id_, std::to_string(FsPack(item.id_)),
+    if (!batch.str_.empty()) {
+      const clio::run::u32 n = NumContainers();
+      for (clio::run::u32 c = 0; c < n; ++c) {
+        FsResp ignored;  // an unreachable node keeps its pages (a leak)
+        CLIO_CO_AWAIT(CallShard(c, kShardPurgeLocal, batch, ignored));
+      }
+    }
+    for (size_t j = i; j < end; ++j) {
+      if (!work[j].xattr_ || xattr_tag_id_.IsNull()) continue;
+      auto x = cte_.AsyncDelBlob(xattr_tag_id_,
+                                 std::to_string(FsPack(work[j].id_)),
                                  clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(x);
     }
@@ -833,6 +850,20 @@ clio::run::TaskResume Runtime::PurgeDrain() {
   constexpr clio::run::u64 kCompactBytes = 256ull << 20;
   if (log_.IsOpen() && log_.BytesSinceCompact() > kCompactBytes) {
     CompactLog();
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::PurgeLocal(const FsReq &req) {
+  CLIO_TASK_BODY_BEGIN
+  FsDec dec(req.str_.data(), req.str_.size());
+  clio::run::u64 packed = 0;
+  while (dec.U64(&packed)) {
+    // Local: this container's accounting share and page blobs of the file
+    // (a miss -- no pages here -- returns at once).
+    auto d = cte_.AsyncDelTag(FsUnpack(packed), clio::run::PoolQuery::Local());
+    CLIO_CO_AWAIT(d);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
