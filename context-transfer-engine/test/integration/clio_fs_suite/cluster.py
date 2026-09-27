@@ -165,6 +165,13 @@ class Cluster:
         # would override the binaries' RUNPATH and load mismatched libs.
         'LD_LIBRARY_PATH': self.bin_dir,
     }
+    # Failure detection: the runtime defaults (30 s silence + 30 s retry per
+    # send) ride out restarts but stall every op on a dead node for 30 s;
+    # a filesystem deployment wants a prompt EIO. Overridable per run.
+    e['CLIO_PROBE_SILENCE_S'] = os.environ.get('CLIO_SUITE_PROBE_SILENCE_S',
+                                               '10')
+    e['CLIO_NET_RETRY_TIMEOUT_S'] = os.environ.get(
+        'CLIO_SUITE_NET_RETRY_TIMEOUT_S', '10')
     if self.attr_cache_s is not None:
       e['CLIO_FUSE_ATTR_CACHE_S'] = str(self.attr_cache_s)
     e.update(self.extra_env)

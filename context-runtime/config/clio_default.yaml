@@ -43,6 +43,15 @@ runtime:
   task_progress_interval_ms: 5000      # default: 5000 -- how long a cross-node task may sit
                                        # quietly before the origin probes its node (issue #628);
                                        # 0 disables. Env CLIO_TASK_PROGRESS_INTERVAL_MS overrides.
+  # Failure-detection knobs (environment only):
+  #   CLIO_PROBE_SILENCE_S     default 30 -- a peer silent this long is declared
+  #                            dead and the tasks waiting on it fail.
+  #   CLIO_NET_RETRY_TIMEOUT_S default 30 -- how long a send to an unreachable
+  #                            peer is retried before its task fails (network-
+  #                            timeout RC). Lower both (e.g. 5) for a filesystem
+  #                            deployment that prefers a prompt EIO over a 30 s
+  #                            stall per operation while a node is down; keep
+  #                            the defaults to ride out peer restarts.
   learning_rate: 0.2                   # SGD learning rate for task load prediction model
   # conf_dir: /tmp/clio_$USER          # default: the per-user runtime directory (same
                                        # as the memfd links). Learned task-stat models are

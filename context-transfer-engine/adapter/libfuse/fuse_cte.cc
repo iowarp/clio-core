@@ -69,6 +69,7 @@
 #include "clio_cte/core/content_transfer_engine.h"
 #include "clio_cte/core/core_client.h"  // CLIO_CTE_CLIENT + GetCapacity
 #include "clio_cte/filesystem/filesystem_client.h"
+#include "clio_cte/replication/replication_tasks.h"  // FlushTagTask (fsync barrier)
 
 // Bridge the POSIX type spellings the callbacks use to the concrete types
 // each platform's FUSE layer expects in `struct fuse_operations`. On Linux
@@ -219,6 +220,71 @@ bool MultiNode() {
     return hosts > 1;
   }();
   return v;
+}
+
+/**
+ * Whether fsync/close must force a replication durability barrier before
+ * they can honor "once fsync returns, the bytes survive a crash".
+ *
+ * SYNCHRONOUS write-through (replication's replicate_period_ms_ == 0, or no
+ * replication chained above the core pool at all) already gives fsync this
+ * guarantee for free: PutBlob does not ack until the durable copy exists (or
+ * there is no separate durable copy to wait for). ASYNCHRONOUS write-through
+ * (replicate_period_ms_ > 0, the product default 50 ms) acks the primary
+ * write immediately and copies it to the replica on the next periodic sweep
+ * -- a crash inside that window would otherwise lose bytes fsync already
+ * told the caller were safe.
+ *
+ * Decided ONCE, at mount time, with a single Monitor round trip to the data
+ * pool (CLIO_CTE_CLIENT's pool_id_, the top of the write chain): asks the
+ * pool whether it understands "replicate_period_ms" (only the replication
+ * chimod does) and, if so, whether that period is nonzero. A bare core pool
+ * (or any future chain module that does not recognise the query) leaves
+ * `results_` empty and this returns false -- so the fsync/close path pays
+ * NOTHING per call, and nothing extra at all, when replication is not in the
+ * chain or is already synchronous.
+ * @return true iff fsync must FlushTag before it can return success
+ */
+static bool NeedsReplicationFlushBarrier() {
+  static const bool v = [] {
+    auto *cte_c = CLIO_CTE_CLIENT;
+    if (cte_c == nullptr) return false;
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<clio::cte::core::MonitorTask>(
+        clio::run::CreateTaskId(), cte_c->pool_id_, clio::run::PoolQuery::Local(),
+        std::string("replicate_period_ms"));
+    auto fut = ipc->Send(task);
+    fut.Wait();
+    if (fut->GetReturnCode() != 0 || fut->results_.empty()) return false;
+    const std::string &period_str = fut->results_.begin()->second;
+    return std::strtol(period_str.c_str(), nullptr, 10) > 0;
+  }();
+  return v;
+}
+
+/**
+ * Force the file's tag up to date on its persistent replica(s) -- the
+ * async-write-through durability barrier NeedsReplicationFlushBarrier()
+ * decided is necessary. No-op (and never called) when replication is absent
+ * or already synchronous.
+ * @param tag the file's tag id (its page blobs live under this key)
+ * @return 0 on success, or a negative errno
+ */
+static int FlushReplicationBarrier(const clio::cte::core::TagId &tag) {
+  if (tag.IsNull() || !NeedsReplicationFlushBarrier()) return 0;
+  auto *cte_c = CLIO_CTE_CLIENT;
+  auto *ipc = CLIO_CPU_IPC;
+  auto task = ipc->NewTask<clio::cte::replication::FlushTagTask>(
+      clio::run::CreateTaskId(), cte_c->pool_id_, clio::run::PoolQuery::Dynamic(),
+      tag, /*replica=*/1, /*min_score=*/0.0f, clio::cte::core::Context());
+  auto fut = ipc->Send(task);
+  fut.Wait();
+  // FlushTag is best-effort sweeping (see replication_runtime.cc): a
+  // per-blob failure is reported but does not abort the sweep, so a nonzero
+  // rc here means at least one blob could not be made durable. Surface it as
+  // EIO rather than silently acking a durability guarantee that did not
+  // actually hold.
+  return fut->GetReturnCode() == 0 ? 0 : -EIO;
 }
 
 /**
@@ -1761,9 +1827,12 @@ int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
 
 /**
  * Land a file's deferred writes and publish its logical size to the
- * namespace home, synchronously.
+ * namespace home, synchronously. When replication is chained and
+ * asynchronous, also forces the file's tag up to date on its persistent
+ * replica(s) before returning -- see FlushReplicationBarrier.
  * @param handle the open file whose writes should become visible
- * @return 0, or a negative errno if the size could not be published
+ * @return 0, or a negative errno if the size (or the replication barrier)
+ *         could not be published
  */
 static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
   auto *cfs = CLIO_CFS_CLIENT;
@@ -1786,6 +1855,14 @@ static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
         hiwater);
     t.Wait();
     if (t->GetReturnCode() != 0) return -EIO;
+    // fsync's durability contract covers only what THIS handle wrote
+    // (hiwater != 0), and only once the sieve drain above landed it on the
+    // primary -- the barrier now waits for the async replica sweep to catch
+    // up to that same primary state. A no-op call (see
+    // NeedsReplicationFlushBarrier) when replication is absent or already
+    // synchronous.
+    int berr = FlushReplicationBarrier(handle->tag);
+    if (berr != 0) return berr;
   }
   return 0;
 }

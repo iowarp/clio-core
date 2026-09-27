@@ -1650,7 +1650,7 @@ void Runtime::ScanTaskProgress() {
     if (!it->future.IsComplete()) {
       const double silent_s =
           std::chrono::duration<double>(now - it->fired_at).count();
-      if (!it->silence_reported && silent_s >= kProbeSilenceSec) {
+      if (!it->silence_reported && silent_s >= ProbeSilenceSec()) {
         // A probe is a task: a node whose workers are saturated (16 nodes
         // creating 16 tier pools x 16 containers each at startup) answers
         // none for tens of seconds while it is plainly alive and sending.
@@ -1659,7 +1659,7 @@ void Runtime::ScanTaskProgress() {
         // node 5 dead during Create, 748 times, and the run never seeded.
         const clio::run::u64 heard_ns =
             ipc_manager->NsSinceHeardFrom(it->target_node_id);
-        if (heard_ns / 1e9 < kProbeSilenceSec) {
+        if (heard_ns / 1e9 < ProbeSilenceSec()) {
           HLOG(kWarning,
                "[TaskProgress] node {} has not answered a liveness probe for "
                "{} s but sent us a message {} s ago: busy, not dead; "

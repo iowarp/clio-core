@@ -53,6 +53,15 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
 
 clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  // "replicate_period_ms": lets a data-path client (the FUSE adapter) learn,
+  // once at mount time, whether this pool's write-through is synchronous (0
+  // -- PutBlob already blocks on the replica write, so fsync needs no extra
+  // barrier) or asynchronous (>0 -- fsync must force a FlushTag sweep of the
+  // file's tag before the durability contract holds). See fuse_cte.cc's
+  // NeedsReplicationFlushBarrier().
+  if (task->query_ == "replicate_period_ms") {
+    task->results_[container_id_] = std::to_string(config_.replicate_period_ms_);
+  }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

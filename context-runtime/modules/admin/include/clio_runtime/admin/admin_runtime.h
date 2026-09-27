@@ -440,6 +440,24 @@ private:
    * completions is not enough. Three probe intervals of silence it is.
    */
   static constexpr double kProbeSilenceSec = 30.0;
+
+  /**
+   * Silence (no liveness-probe answer, no inbound bytes) after which a peer
+   * is declared dead so the tasks waiting on it fail. Default
+   * kProbeSilenceSec; CLIO_PROBE_SILENCE_S overrides it.
+   * @return the silence window in seconds
+   */
+  static double ProbeSilenceSec() {
+    static const double v = [] {
+      const char *e = std::getenv("CLIO_PROBE_SILENCE_S");
+      if (e != nullptr && *e != '\0') {
+        const double d = std::strtod(e, nullptr);
+        if (d > 0.0) return d;
+      }
+      return kProbeSilenceSec;
+    }();
+    return v;
+  }
   /**
    * Idle liveness. A peer this node has heard from before, then nothing for
    * kIdleProbeSec, gets a probe even with no task in flight to it, so a

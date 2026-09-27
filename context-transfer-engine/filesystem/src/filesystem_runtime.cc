@@ -494,8 +494,8 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
 // Make sure by_tag_ holds a record for `tagv` (TagId), loading the persistent
 // one if this container has none yet (first touch after a restart, or of a
 // file only ever seen by name). `seed_size` seeds a record that has no stored
-// copy; `is_dir` keeps directory records out of by_path_ (Getattr's tracked
-// branch treats by_path_ entries as regular files).
+// copy. Records go into by_tag_ only (never by_path_, whose entries Getattr's
+// tracked branch reports as regular files); `is_dir` is informational.
 #define CLIO_FSMETA_ENSURE(tagv, pathv, seed_size, is_dir)                    \
   do {                                                                       \
     const clio::run::u64 _ep =                                               \
@@ -542,7 +542,10 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
           _slot->set_mtime_ = _r.mtime_;                                     \
           _slot->set_ctime_ = _r.ctime_;                                     \
         }                                                                    \
-        if (!(is_dir)) by_path_.emplace((pathv), _slot);                     \
+        (void)(is_dir);  /* by_tag_ only: a by_path_ entry makes getattr's   \
+                          * tracked branch report a regular file, which     \
+                          * turned a stat'ed SYMLINK into a file (EIO/EINVAL \
+                          * from lstat/readlink). Bind/Open find it by tag. */ \
       }                                                                      \
     }                                                                        \
   } while (0)

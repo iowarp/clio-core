@@ -36,6 +36,7 @@
 
 #include <clio_runtime/clio_runtime.h>
 
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -180,26 +181,75 @@ struct TxnDelTag {
 };
 
 /**
+ * One record read back from a WAL shard by TransactionLog::Load(): the
+ * transaction type, its GLOBAL sequence number (see seq_counter_ below), and
+ * the raw (type-specific) payload bytes to hand to the matching
+ * Deserialize*() helper.
+ */
+struct WalRecord {
+  TxnType type_;
+  clio::run::u64 seq_;
+  std::vector<char> payload_;
+};
+
+/**
  * Header-only Write-Ahead Transaction Log.
  *
  * Record format on disk:
- *   [u8 txn_type][u32 payload_size][payload bytes]
+ *   [u8 txn_type][u64 seq][u32 payload_size][payload bytes]
  *
  * The payload bytes are a simple binary serialization (not cereal) so the
  * on-disk format is self-contained.
+ *
+ * Every shard file opens with a 4-byte format magic (kWalMagic) so a reader
+ * can tell this (post-sequence-number) format apart from the pre-existing
+ * one that had no magic and no per-record seq. This branch is new (no
+ * deployed WAL predates it), so an old-format file is simply rejected with a
+ * log line rather than parsed -- see Load().
  */
 class TransactionLog {
  public:
+  /** Format marker written as the first 4 bytes of every WAL shard file
+   *  created by this (sequence-numbered) record format. */
+  static constexpr uint32_t kWalMagic = 0x57414C32;  // "WAL2"
+
   TransactionLog() = default;
   ~TransactionLog() { Close(); }
 
-  /** Open (or create) the WAL file in append mode. */
+  /** Open (or create) the WAL file in append mode. A brand-new (empty or
+   *  absent) file gets the format magic written first; an existing file is
+   *  left exactly as it is -- appending must never rewrite bytes a
+   *  not-yet-replayed reader may still need. */
   void Open(const std::string &file_path, clio::run::u64 capacity_bytes) {
     file_path_ = file_path;
     capacity_bytes_ = capacity_bytes;
     buffer_.reserve(4096);
-    ofs_.open(file_path_,
-              std::ios::binary | std::ios::app);
+    namespace fs = std::filesystem;
+    const bool is_new = !fs::exists(file_path_) ||
+                        fs::file_size(file_path_) == 0;
+    ofs_.open(file_path_, std::ios::binary | std::ios::app);
+    if (is_new && ofs_.is_open()) {
+      WriteMagic();
+    }
+  }
+
+  /**
+   * Global sequence-number source for records this log writes (issue: WAL
+   * cross-shard replay ordering). Records are sharded per-worker
+   * (blob_txn_logs_[wid % N] / tag_txn_logs_[wid % N]), so two records for
+   * the SAME blob can land in different shard files; ReplayTransactionLogs
+   * used to apply shards strictly in file-index order, which is not the
+   * same as the order the records were actually written in and could apply
+   * a full-block-replacement record (kExtendBlob/kExtendReplica) OUT of
+   * order, regressing a blob to an earlier, shorter layout. Every shard of
+   * one core container now draws its per-record seq from the SAME atomic
+   * counter (owned by Runtime, one per container), so merging every
+   * shard's records by seq at replay recovers true write order regardless
+   * of which shard each record landed in. Not owned: the counter outlives
+   * this object for the container's whole lifetime.
+   */
+  void SetSeqCounter(std::atomic<clio::run::u64> *seq_counter) {
+    seq_counter_ = seq_counter;
   }
 
   // ---- Log helpers for each transaction type ----
@@ -327,20 +377,40 @@ class TransactionLog {
   }
 
   /**
-   * Load all entries from the WAL file on disk.
-   * Returns a vector of (TxnType, raw payload bytes).
+   * Load every record from the WAL file on disk, each carrying the GLOBAL
+   * seq it was written with (see SetSeqCounter). A file that does not open
+   * with kWalMagic predates the sequence-numbered format (or is corrupt);
+   * it is not parseable as this format, so it is rejected wholesale with a
+   * log line rather than guessed at record-by-record -- this branch is new,
+   * so no deployed WAL is expected to be in the old, magic-less format.
    */
-  std::vector<std::pair<TxnType, std::vector<char>>> Load() const {
-    std::vector<std::pair<TxnType, std::vector<char>>> entries;
+  std::vector<WalRecord> Load() const {
+    std::vector<WalRecord> entries;
     namespace fs = std::filesystem;
     if (!fs::exists(file_path_)) return entries;
 
     std::ifstream ifs(file_path_, std::ios::binary);
     if (!ifs.is_open()) return entries;
 
+    uint32_t magic = 0;
+    ifs.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+    if (!ifs.good() || magic != kWalMagic) {
+      HLOG(kWarning,
+           "TransactionLog::Load: '{}' is not a sequence-numbered WAL file "
+           "(missing/mismatched format magic) -- ignoring it. Old-format "
+           "WALs from before this change are not replayable; wipe the "
+           "metadata_log_path to start a fresh log.",
+           file_path_);
+      return entries;
+    }
+
     while (ifs.peek() != EOF) {
       uint8_t type_byte;
       ifs.read(reinterpret_cast<char *>(&type_byte), sizeof(type_byte));
+      if (!ifs.good()) break;
+
+      clio::run::u64 seq = 0;
+      ifs.read(reinterpret_cast<char *>(&seq), sizeof(seq));
       if (!ifs.good()) break;
 
       uint32_t payload_size;
@@ -352,18 +422,25 @@ class TransactionLog {
       if (!ifs.good() && static_cast<uint32_t>(ifs.gcount()) != payload_size)
         break;
 
-      entries.emplace_back(static_cast<TxnType>(type_byte), std::move(payload));
+      entries.push_back(
+          WalRecord{static_cast<TxnType>(type_byte), seq, std::move(payload)});
     }
     return entries;
   }
 
-  /** Truncate the WAL file (called after a full snapshot compaction) */
+  /** Truncate the WAL file (called after a full snapshot compaction). The
+   *  freshly-truncated file gets the format magic rewritten immediately, so
+   *  a crash right after truncation still leaves a well-formed (if empty)
+   *  file rather than one Load() would reject. */
   void Truncate() {
     if (ofs_.is_open()) {
       ofs_.close();
     }
     // Re-open in truncate mode then re-open in append mode
     ofs_.open(file_path_, std::ios::binary | std::ios::trunc);
+    if (ofs_.is_open()) {
+      WriteMagic();
+    }
     ofs_.close();
     ofs_.open(file_path_, std::ios::binary | std::ios::app);
   }
@@ -506,15 +583,52 @@ class TransactionLog {
    */
   std::mutex mu_;
 
-  /** Write a complete record: [u8 type][u32 size][payload] */
+  /** Shared global sequence-number source (see SetSeqCounter). Null means
+   *  "not wired up yet" (e.g. a standalone TransactionLog used in a unit
+   *  test), in which case every record logs seq 0 -- replay still works
+   *  within a single shard (insertion order == seq order there), it just
+   *  cannot be merged across shards. */
+  std::atomic<clio::run::u64> *seq_counter_ = nullptr;
+
+  /** Next global seq for a record this log is about to write. */
+  clio::run::u64 NextSeq() {
+    if (seq_counter_ == nullptr) return 0;
+    return seq_counter_->fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+
+  /** Write the format magic as the first bytes of the (empty) file. */
+  void WriteMagic() {
+    uint32_t magic = kWalMagic;
+    ofs_.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+  }
+
+  /**
+   * Write a complete record: [u8 type][u64 seq][u32 size][payload], then
+   * flush() the C++ stream buffer to the OS immediately.
+   *
+   * Without this, a record sits in the ofstream's userspace buffer (libstdc++
+   * default ~a few KB) until it fills, something else calls Sync(), or the
+   * file is closed -- none of which a SIGKILL waits for. The periodic
+   * FlushMetadata task only Sync()s every flush_metadata_period_ms_ (default
+   * 5000 ms), so a crash between periods could lose every WAL record written
+   * since the last one, however long ago that data was actually acked to the
+   * client via fsync(). flush() pushes the buffer out via write(2); the
+   * bytes then survive THIS process dying (they are in the kernel page
+   * cache), which is the durability contract callers of fsync()/close() are
+   * relying on. It is not an fsync(2) -- surviving raw power loss still
+   * needs Sync()/Close(), which already run at the existing checkpoints.
+   */
   void WriteRecord(TxnType type, const std::vector<char> &payload) {
     if (!ofs_.is_open()) return;
     uint8_t type_byte = static_cast<uint8_t>(type);
+    clio::run::u64 seq = NextSeq();
     uint32_t payload_size = static_cast<uint32_t>(payload.size());
     ofs_.write(reinterpret_cast<const char *>(&type_byte), sizeof(type_byte));
+    ofs_.write(reinterpret_cast<const char *>(&seq), sizeof(seq));
     ofs_.write(reinterpret_cast<const char *>(&payload_size),
                sizeof(payload_size));
     ofs_.write(payload.data(), payload_size);
+    ofs_.flush();
   }
 
   // ---- Serialization primitives ----

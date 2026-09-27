@@ -582,6 +582,17 @@ private:
   std::vector<std::unique_ptr<TransactionLog>> tag_txn_logs_;
 
   /**
+   * Global monotonic sequence source for every WAL record this container's
+   * shards (blob_txn_logs_ and tag_txn_logs_) write -- ONE counter shared by
+   * every shard, so replay can merge them back into true write order (see
+   * TransactionLog::SetSeqCounter). Starts at 1 for a fresh container;
+   * ReplayTransactionLogs seeds it past the highest seq it saw in the WAL so
+   * new records keep increasing across a restart instead of colliding with
+   * (or racing behind) old ones still on disk before the next compaction.
+   */
+  std::atomic<clio::run::u64> next_wal_seq_{1};
+
+  /**
    * Get access to configuration manager
    */
   const Config &GetConfig() const;
@@ -870,9 +881,49 @@ private:
   void RestoreMetadataFromLog();
 
   /**
-   * Replay transaction logs on top of restored snapshot during restart
+   * Replay transaction logs on top of restored snapshot during restart.
+   *
+   * Loads every shard of the tag and blob WALs, merges them into one list
+   * ordered by each record's global seq (see TransactionLog::SetSeqCounter),
+   * and applies them in that true write order via the ApplyWal* helpers
+   * below -- shards are per-WORKER, not per-blob/tag, so replaying shard
+   * files strictly in file-index order could apply an older, shorter
+   * full-replacement record (kExtendBlob/kExtendReplica) after a newer,
+   * complete one.
    */
   void ReplayTransactionLogs();
+
+  /** Apply one replayed kCreateTag record; bumps max_minor/tags_replayed. */
+  void ApplyWalCreateTag(const std::vector<char> &payload,
+                         clio::run::u32 &max_minor,
+                         clio::run::u32 &tags_replayed);
+  /** Apply one replayed kDelTag record: erase the tag and its blobs. */
+  void ApplyWalDelTag(const std::vector<char> &payload,
+                      clio::run::u32 &tags_replayed);
+  /** Apply one replayed kCreateNewBlob record, carrying forward any
+   *  transform/droppable/replica/block state already seen for this key. */
+  void ApplyWalCreateNewBlob(const std::vector<char> &payload,
+                             clio::run::u32 &blobs_replayed);
+  /** Apply one replayed kExtendBlob record (full primary-block replacement,
+   *  volatile targets filtered out). */
+  void ApplyWalExtendBlob(const std::vector<char> &payload,
+                          clio::run::u32 &blobs_replayed);
+  /** Apply one replayed kExtendReplica record (full one-replica-block
+   *  replacement, volatile targets filtered out). */
+  void ApplyWalExtendReplica(const std::vector<char> &payload,
+                             clio::run::u32 &blobs_replayed);
+  /** Apply one replayed kClearBlob record. */
+  void ApplyWalClearBlob(const std::vector<char> &payload,
+                         clio::run::u32 &blobs_replayed);
+  /** Apply one replayed kSetBlobTransform record. */
+  void ApplyWalSetBlobTransform(const std::vector<char> &payload,
+                                clio::run::u32 &blobs_replayed);
+  /** Apply one replayed kSetBlobDroppable record. */
+  void ApplyWalSetBlobDroppable(const std::vector<char> &payload,
+                                clio::run::u32 &blobs_replayed);
+  /** Apply one replayed kDelBlob record. */
+  void ApplyWalDelBlob(const std::vector<char> &payload,
+                       clio::run::u32 &blobs_replayed);
 
   /**
    * Retrieve telemetry entries for analysis (non-destructive peek)

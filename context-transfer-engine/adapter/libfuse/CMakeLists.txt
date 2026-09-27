@@ -74,6 +74,9 @@ target_link_libraries(clio_cte_fuse
     ${FUSE3_LIBRARIES}
     clio_cte_filesystem_client  # the FUSE adapter now delegates to the chimod
     clio_cte_core_client
+    clio_cte_replication_client  # FlushTagTask, for the async-replication
+                                 # fsync durability barrier (header-only use;
+                                 # no replication pool required at runtime)
     ctp::cxx)
 
 # EXPERIMENTAL low-level adapter (issue #1007 follow-up): same delegated
@@ -102,6 +105,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       ${FUSE3_LIBRARIES}
       clio_cte_filesystem_client
       clio_cte_core_client
+      clio_cte_replication_client
       ctp::cxx)
 endif()
 

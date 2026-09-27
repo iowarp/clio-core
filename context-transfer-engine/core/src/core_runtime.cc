@@ -937,10 +937,16 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       blob_txn_logs_[i]->Open(config_.performance_.metadata_log_path_ +
                                   ".blob." + std::to_string(i),
                               per_worker_capacity);
+      // Every shard of this container draws its per-record seq from the SAME
+      // atomic (next_wal_seq_), so ReplayTransactionLogs can merge shards
+      // back into true write order regardless of which worker's shard a
+      // record landed in (see TransactionLog::SetSeqCounter docstring).
+      blob_txn_logs_[i]->SetSeqCounter(&next_wal_seq_);
       tag_txn_logs_[i] = std::make_unique<TransactionLog>();
       tag_txn_logs_[i]->Open(
           config_.performance_.metadata_log_path_ + ".tag." + std::to_string(i),
           per_worker_capacity);
+      tag_txn_logs_[i]->SetSeqCounter(&next_wal_seq_);
     }
     HLOG(kInfo, "WAL: Opened {} blob and {} tag transaction logs", num_workers,
          num_workers);
@@ -7083,317 +7089,81 @@ void Runtime::ReplayTransactionLogs() {
   const std::string &log_path = config_.performance_.metadata_log_path_;
   if (log_path.empty()) return;
 
+  // Merge every shard of BOTH the tag and blob WALs into one list ordered by
+  // each record's GLOBAL seq (TransactionLog::SetSeqCounter), then apply in
+  // that true write order -- not shard-file order.
+  //
+  // Shards are per-WORKER (blob_txn_logs_[wid % N] / tag_txn_logs_[wid % N]),
+  // NOT per-blob or per-tag: two records for the SAME blob (its primary
+  // kExtendBlob and a later kExtendReplica from an async replication sweep,
+  // say) can be logged by two different workers and so land in two
+  // different shard files. The old code replayed shard 0 in full, then
+  // shard 1, etc. -- if the NEWER record happened to land in the
+  // lower-indexed shard, replaying shard order applied the OLDER, shorter
+  // full-block-replacement record last and silently regressed the blob to a
+  // stale layout (observed as a handful of bytes going missing/zero at
+  // restart, non-deterministically, depending on worker scheduling). Sorting
+  // the merged list by seq recovers the actual order the records were
+  // written in, independent of which shard each one landed in.
+  std::vector<WalRecord> all;
+  for (size_t i = 0;; ++i) {
+    std::string p = log_path + ".tag." + std::to_string(i);
+    if (!std::filesystem::exists(p)) break;
+    TransactionLog loader;
+    loader.Open(p, 0);
+    for (auto &rec : loader.Load()) all.push_back(std::move(rec));
+    loader.Close();
+  }
+  for (size_t i = 0;; ++i) {
+    std::string p = log_path + ".blob." + std::to_string(i);
+    if (!std::filesystem::exists(p)) break;
+    TransactionLog loader;
+    loader.Open(p, 0);
+    for (auto &rec : loader.Load()) all.push_back(std::move(rec));
+    loader.Close();
+  }
+  std::stable_sort(all.begin(), all.end(),
+                   [](const WalRecord &a, const WalRecord &b) {
+                     return a.seq_ < b.seq_;
+                   });
+
   clio::run::u32 tags_replayed = 0;
   clio::run::u32 blobs_replayed = 0;
   clio::run::u32 max_minor = next_tag_id_minor_.load();
+  clio::run::u64 max_seq = 0;
 
-  // Phase 1: Replay all tag logs first (tags must exist before blob ops)
-  for (size_t i = 0;; ++i) {
-    std::string tag_log_path = log_path + ".tag." + std::to_string(i);
-    if (!std::filesystem::exists(tag_log_path)) break;
-
-    TransactionLog loader;
-    loader.Open(tag_log_path, 0);
-    auto entries = loader.Load();
-    loader.Close();
-
-    for (const auto &[type, payload] : entries) {
-      if (type == TxnType::kCreateTag) {
-        auto txn = TransactionLog::DeserializeCreateTag(payload);
-        TagId tag_id{txn.tag_major_, txn.tag_minor_};
-        tag_name_to_id_.insert_or_assign(txn.tag_name_, tag_id);
-        TagInfo tag_info(txn.tag_name_, tag_id);
-        tag_id_to_info_.insert_or_assign(tag_id, std::make_shared<TagInfo>(tag_info));
-        if (tag_id.minor_ >= max_minor) max_minor = tag_id.minor_ + 1;
-        tags_replayed++;
-      } else if (type == TxnType::kDelTag) {
-        auto txn = TransactionLog::DeserializeDelTag(payload);
-        TagId tag_id{txn.tag_major_, txn.tag_minor_};
-        // Erase tag name mapping
-        tag_name_to_id_.erase(txn.tag_name_);
-        // Erase all blobs belonging to this tag
-        std::string tag_prefix = std::to_string(tag_id.major_) + "." +
-                                 std::to_string(tag_id.minor_) + ".";
-        std::vector<std::string> keys_to_erase;
-        tag_blob_name_to_info_.for_each(
-            [&tag_prefix, &keys_to_erase](const std::string &key,
-                                          const std::shared_ptr<BlobInfo> &) {
-              if (key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
-                keys_to_erase.push_back(key);
-              }
-            });
-        for (const auto &key : keys_to_erase) {
-          tag_blob_name_to_info_.erase(key);
-          shm_cache_.EraseBlob(key);  // issue #783: keep the mirror from going stale
-        }
-        tag_id_to_info_.erase(tag_id);
-        tags_replayed++;
-      }
-    }
-  }
-
-  // Phase 2: Replay all blob logs
-  for (size_t i = 0;; ++i) {
-    std::string blob_log_path = log_path + ".blob." + std::to_string(i);
-    if (!std::filesystem::exists(blob_log_path)) break;
-
-    TransactionLog loader;
-    loader.Open(blob_log_path, 0);
-    auto entries = loader.Load();
-    loader.Close();
-
-    for (const auto &[type, payload] : entries) {
-      if (type == TxnType::kCreateNewBlob) {
-        auto txn = TransactionLog::DeserializeCreateNewBlob(payload);
-        TagId tag_id{txn.tag_major_, txn.tag_minor_};
-        std::string composite_key = std::to_string(tag_id.major_) + "." +
-                                    std::to_string(tag_id.minor_) + "." +
-                                    txn.blob_name_;
-        BlobInfo blob_info;
-        blob_info.blob_name_ = txn.blob_name_;
-        blob_info.score_ = txn.score_;
-        // Carry over any transform mark already restored for this key (issue
-        // #818). The WAL is only truncated once it exceeds a size threshold,
-        // so a kCreateNewBlob record can outlive the metadata flush that
-        // recorded the blob's transform state -- and this insert_or_assign
-        // would otherwise reset that state to "untransformed", i.e. fail open
-        // into direct reads of codec bytes. A later kSetBlobTransform record,
-        // when present, ORs in on top of this.
-        {
-          std::shared_ptr<BlobInfo> existing =
-              tag_blob_name_to_info_.get(composite_key);
-          if (existing) {
-            blob_info.transform_flags_ = existing->transform_flags_;
-            // Carry DROPPABILITY too -- same outlives-the-flush hazard.
-            // Replaying the create record would reset it, and the field is
-            // write-once so nothing could mark it again.
-            blob_info.droppable_ = existing->droppable_;
-            // Carry the REPLICAS too (issue #886) — same outlives-the-flush
-            // hazard as the transform mark: the metadata snapshot (or an
-            // earlier WAL shard's kExtendReplica) restored this blob's
-            // replica layouts, and a kCreateNewBlob record surviving the
-            // flush would otherwise reset the blob and silently destroy
-            // them. Which shard a blob's records land in is per-worker, so
-            // the loss was nondeterministic (caught by the persist test).
-            blob_info.replicas_ = existing->replicas_;
-            // Carry the BLOCKS too (issue #905) — third instance of the
-            // same hazard: the snapshot restored this blob's block layout,
-            // and replaying the create record would zero it, so every
-            // restart reported size 0 and lost the persistent primary
-            // bytes' placement (caught by the indexer rebuild test). A
-            // later kExtendBlob record, when present, still replaces the
-            // layout wholesale; a replayed kDelBlob removed the entry, so
-            // a genuine delete+recreate never reaches this carry-over.
-            blob_info.blocks_ = existing->blocks_;
-            blob_info.RecomputeTotalSize();
-          }
-        }
-        tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
-        MirrorBlobToShm(composite_key, blob_info);
-        blobs_replayed++;
-
-      } else if (type == TxnType::kExtendBlob) {
-        auto txn = TransactionLog::DeserializeExtendBlob(payload);
-        TagId tag_id{txn.tag_major_, txn.tag_minor_};
-        std::string composite_key = std::to_string(tag_id.major_) + "." +
-                                    std::to_string(tag_id.minor_) + "." +
-                                    txn.blob_name_;
-        std::shared_ptr<BlobInfo> blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
-        // WAL shards are per-WORKER (blob_txn_logs_[wid % N]), NOT per-blob,
-        // and replay walks shards in index order rather than in time order.
-        // A blob's kCreateNewBlob is logged by the worker that served the
-        // PutBlob, while its replica records are logged by the ASYNC
-        // replication sweep running on a DIFFERENT worker -- so the two land
-        // in different shards and this record can be replayed BEFORE the blob
-        // exists. Skipping it then loses the layout permanently: the later
-        // kCreateNewBlob recreates the blob with an empty blocks_, and the
-        // copy is gone with no error anywhere (issue #886 -- the same
-        // per-worker-shard hazard already documented on that carry-over).
-        // Create the blob instead, so replay is order-independent; the
-        // kCreateNewBlob that follows carries this state forward.
-        if (!blob_info_ptr) {
-          BlobInfo fresh;
-          fresh.blob_name_ = txn.blob_name_;
-          tag_blob_name_to_info_.insert_or_assign(
-              composite_key, std::make_shared<BlobInfo>(fresh));
-          blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
-        }
-        if (blob_info_ptr) {
-          // Replace blocks with replayed blocks (full replacement semantics)
-          blob_info_ptr->blocks_.clear();
-          for (const auto &tb : txn.new_blocks_) {
-            clio::run::PoolId bdev_pool_id(tb.bdev_major_, tb.bdev_minor_);
-            // Filter volatile targets (matching RestoreMetadataFromLog)
-            bool is_volatile = false;
-            {
-              clio::run::ScopedCoRwReadLock read_lock(target_lock_);
-              TargetInfo *tinfo = registered_targets_.find(bdev_pool_id);
-              if (tinfo && tinfo->persistence_level_ ==
-                               clio::run::bdev::PersistenceLevel::kVolatile) {
-                is_volatile = true;
-              }
-            }
-            if (is_volatile) {
-              continue;
-            }
-            clio::run::bdev::Client bdev_client(bdev_pool_id);
-            BlobBlock block(bdev_client, tb.target_query_, tb.target_offset_,
-                            tb.size_);
-            blob_info_ptr->blocks_.push_back(block);
-          }
-          blob_info_ptr->RecomputeTotalSize();  // blocks_ rebuilt: resync cache
-        }
-        blobs_replayed++;
-
-      } else if (type == TxnType::kExtendReplica) {
-        // issue #886: full replacement of ONE replica's layout, same
-        // volatile-target filtering as kExtendBlob. NOTE: this record does
-        // NOT reliably follow the kCreateNewBlob that made the blob exist.
-        // The write token orders the two in TIME, but the WAL is sharded per
-        // worker and replayed in shard-index order, so a later write can be
-        // replayed first. See the upsert below.
-        auto txn = TransactionLog::DeserializeExtendReplica(payload);
-        TagId tag_id{txn.tag_major_, txn.tag_minor_};
-        std::string composite_key = std::to_string(tag_id.major_) + "." +
-                                    std::to_string(tag_id.minor_) + "." +
-                                    txn.blob_name_;
-        std::shared_ptr<BlobInfo> blob_info_ptr =
-            tag_blob_name_to_info_.get(composite_key);
-        // WAL shards are per-WORKER (blob_txn_logs_[wid % N]), NOT per-blob,
-        // and replay walks shards in index order rather than in time order.
-        // A blob's kCreateNewBlob is logged by the worker that served the
-        // PutBlob, while its replica records are logged by the ASYNC
-        // replication sweep running on a DIFFERENT worker -- so the two land
-        // in different shards and this record can be replayed BEFORE the blob
-        // exists. Skipping it then loses the layout permanently: the later
-        // kCreateNewBlob recreates the blob with an empty replicas_, and the
-        // copy is gone with no error anywhere (issue #886 -- the same
-        // per-worker-shard hazard already documented on that carry-over).
-        // Create the blob instead, so replay is order-independent; the
-        // kCreateNewBlob that follows carries this state forward.
-        if (!blob_info_ptr) {
-          BlobInfo fresh;
-          fresh.blob_name_ = txn.blob_name_;
-          tag_blob_name_to_info_.insert_or_assign(
-              composite_key, std::make_shared<BlobInfo>(fresh));
-          blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
-        }
-        if (blob_info_ptr && txn.replica_ > 0) {
-          Replica *rep = blob_info_ptr->GetReplica(
-              static_cast<int>(txn.replica_), /*create=*/true);
-          rep->name_ = txn.replica_name_;
-          rep->score_ = txn.score_;
-          rep->flags_ = txn.flags_;
-          rep->transform_flags_ = txn.transform_flags_;
-          rep->min_score_ = txn.min_score_;
-          rep->blocks_.clear();
-          rep->total_size_cache_ = 0;
-          for (const auto &tb : txn.new_blocks_) {
-            clio::run::PoolId bdev_pool_id(tb.bdev_major_, tb.bdev_minor_);
-            bool is_volatile = false;
-            {
-              clio::run::ScopedCoRwReadLock read_lock(target_lock_);
-              TargetInfo *tinfo = registered_targets_.find(bdev_pool_id);
-              if (tinfo && tinfo->persistence_level_ ==
-                               clio::run::bdev::PersistenceLevel::kVolatile) {
-                is_volatile = true;
-              }
-            }
-            if (is_volatile) {
-              continue;
-            }
-            clio::run::bdev::Client bdev_client(bdev_pool_id);
-            BlobBlock block(bdev_client, tb.target_query_, tb.target_offset_,
-                            tb.size_);
-            rep->blocks_.push_back(block);
-            rep->total_size_cache_ += tb.size_;
-          }
-        }
-        blobs_replayed++;
-
-      } else if (type == TxnType::kClearBlob) {
-        auto txn = TransactionLog::DeserializeClearBlob(payload);
-        TagId tag_id{txn.tag_major_, txn.tag_minor_};
-        std::string composite_key = std::to_string(tag_id.major_) + "." +
-                                    std::to_string(tag_id.minor_) + "." +
-                                    txn.blob_name_;
-        std::shared_ptr<BlobInfo> blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
-        if (blob_info_ptr) {
-          blob_info_ptr->blocks_.clear();
-          blob_info_ptr->total_size_cache_ = 0;  // blocks_ cleared
-        }
-        blobs_replayed++;
-
-      } else if (type == TxnType::kSetBlobTransform) {
-        // issue #818. This reinstates the transform bit on top of the
-        // default-constructed BlobInfo that kCreateNewBlob inserts. NOTE: the
-        // mark is logged later in the put than the create, but "later in time"
-        // does not mean "later in replay" -- records are applied in log order
-        // only WITHIN a shard, and the WAL is sharded per worker. Losing this
-        // bit fails OPEN into direct reads of codec bytes, so the record must
-        // survive either replay order.
-        auto txn = TransactionLog::DeserializeSetBlobTransform(payload);
-        TagId tag_id{txn.tag_major_, txn.tag_minor_};
-        std::string composite_key = std::to_string(tag_id.major_) + "." +
-                                    std::to_string(tag_id.minor_) + "." +
-                                    txn.blob_name_;
-        std::shared_ptr<BlobInfo> blob_info_ptr =
-            tag_blob_name_to_info_.get(composite_key);
-        // Same per-worker-shard hazard as kExtendReplica: this record and the
-        // blob's kCreateNewBlob are logged by different workers and therefore
-        // may live in different WAL shards, which replay walks in index order.
-        // Dropping it when the blob is not there yet loses the transform mark
-        // permanently. Create the blob instead; the kCreateNewBlob replayed
-        // afterwards carries the field forward.
-        if (!blob_info_ptr) {
-          BlobInfo fresh;
-          fresh.blob_name_ = txn.blob_name_;
-          tag_blob_name_to_info_.insert_or_assign(
-              composite_key, std::make_shared<BlobInfo>(fresh));
-          blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
-        }
-        if (blob_info_ptr) {
-          blob_info_ptr->transform_flags_ |= txn.transform_flags_;
-          MirrorBlobToShm(composite_key, *blob_info_ptr);
-          blobs_replayed++;
-        }
-
-      } else if (type == TxnType::kSetBlobDroppable) {
-        auto txn = TransactionLog::DeserializeSetBlobDroppable(payload);
-        TagId tag_id{txn.tag_major_, txn.tag_minor_};
-        std::string composite_key = std::to_string(tag_id.major_) + "." +
-                                    std::to_string(tag_id.minor_) + "." +
-                                    txn.blob_name_;
-        std::shared_ptr<BlobInfo> blob_info_ptr =
-            tag_blob_name_to_info_.get(composite_key);
-        // Same per-worker-shard hazard as kExtendReplica: this record and the
-        // blob's kCreateNewBlob are logged by different workers and therefore
-        // may live in different WAL shards, which replay walks in index order.
-        // Dropping it when the blob is not there yet loses droppability, which is write-once
-        // permanently. Create the blob instead; the kCreateNewBlob replayed
-        // afterwards carries the field forward.
-        if (!blob_info_ptr) {
-          BlobInfo fresh;
-          fresh.blob_name_ = txn.blob_name_;
-          tag_blob_name_to_info_.insert_or_assign(
-              composite_key, std::make_shared<BlobInfo>(fresh));
-          blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
-        }
-        if (blob_info_ptr) {
-          blob_info_ptr->droppable_ = txn.droppable_;
-          MirrorBlobToShm(composite_key, *blob_info_ptr);
-          blobs_replayed++;
-        }
-
-      } else if (type == TxnType::kDelBlob) {
-        auto txn = TransactionLog::DeserializeDelBlob(payload);
-        TagId tag_id{txn.tag_major_, txn.tag_minor_};
-        std::string composite_key = std::to_string(tag_id.major_) + "." +
-                                    std::to_string(tag_id.minor_) + "." +
-                                    txn.blob_name_;
-        tag_blob_name_to_info_.erase(composite_key);
-        blobs_replayed++;
-      }
+  for (const WalRecord &rec : all) {
+    if (rec.seq_ > max_seq) max_seq = rec.seq_;
+    switch (rec.type_) {
+      case TxnType::kCreateTag:
+        ApplyWalCreateTag(rec.payload_, max_minor, tags_replayed);
+        break;
+      case TxnType::kDelTag:
+        ApplyWalDelTag(rec.payload_, tags_replayed);
+        break;
+      case TxnType::kCreateNewBlob:
+        ApplyWalCreateNewBlob(rec.payload_, blobs_replayed);
+        break;
+      case TxnType::kExtendBlob:
+        ApplyWalExtendBlob(rec.payload_, blobs_replayed);
+        break;
+      case TxnType::kExtendReplica:
+        ApplyWalExtendReplica(rec.payload_, blobs_replayed);
+        break;
+      case TxnType::kClearBlob:
+        ApplyWalClearBlob(rec.payload_, blobs_replayed);
+        break;
+      case TxnType::kSetBlobTransform:
+        ApplyWalSetBlobTransform(rec.payload_, blobs_replayed);
+        break;
+      case TxnType::kSetBlobDroppable:
+        ApplyWalSetBlobDroppable(rec.payload_, blobs_replayed);
+        break;
+      case TxnType::kDelBlob:
+        ApplyWalDelBlob(rec.payload_, blobs_replayed);
+        break;
+      default:
+        break;
     }
   }
 
@@ -7444,8 +7214,287 @@ void Runtime::ReplayTransactionLogs() {
     next_tag_id_minor_.store(max_minor);
   }
 
+  // Phase 5: Reseed the global WAL sequence counter past everything just
+  // replayed. The persistent blob_txn_logs_/tag_txn_logs_ shards are opened
+  // (and wired to next_wal_seq_ via SetSeqCounter) right after this
+  // function returns, so every record logged after this restart must sort
+  // AFTER the highest seq seen here -- otherwise a fresh record could reuse
+  // a seq an old, not-yet-compacted WAL record still holds, and the merge
+  // sort in a FUTURE replay would no longer reflect true write order.
+  clio::run::u64 next_seq = next_wal_seq_.load();
+  if (max_seq + 1 > next_seq) {
+    next_wal_seq_.store(max_seq + 1);
+  }
+
   HLOG(kInfo, "ReplayTransactionLogs: Replayed {} tag ops and {} blob ops",
        tags_replayed, blobs_replayed);
+}
+
+void Runtime::ApplyWalCreateTag(const std::vector<char> &payload,
+                                clio::run::u32 &max_minor,
+                                clio::run::u32 &tags_replayed) {
+  auto txn = TransactionLog::DeserializeCreateTag(payload);
+  TagId tag_id{txn.tag_major_, txn.tag_minor_};
+  tag_name_to_id_.insert_or_assign(txn.tag_name_, tag_id);
+  TagInfo tag_info(txn.tag_name_, tag_id);
+  tag_id_to_info_.insert_or_assign(tag_id, std::make_shared<TagInfo>(tag_info));
+  if (tag_id.minor_ >= max_minor) max_minor = tag_id.minor_ + 1;
+  tags_replayed++;
+}
+
+void Runtime::ApplyWalDelTag(const std::vector<char> &payload,
+                             clio::run::u32 &tags_replayed) {
+  auto txn = TransactionLog::DeserializeDelTag(payload);
+  TagId tag_id{txn.tag_major_, txn.tag_minor_};
+  // Erase tag name mapping
+  tag_name_to_id_.erase(txn.tag_name_);
+  // Erase all blobs belonging to this tag
+  std::string tag_prefix = std::to_string(tag_id.major_) + "." +
+                           std::to_string(tag_id.minor_) + ".";
+  std::vector<std::string> keys_to_erase;
+  tag_blob_name_to_info_.for_each(
+      [&tag_prefix, &keys_to_erase](const std::string &key,
+                                    const std::shared_ptr<BlobInfo> &) {
+        if (key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
+          keys_to_erase.push_back(key);
+        }
+      });
+  for (const auto &key : keys_to_erase) {
+    tag_blob_name_to_info_.erase(key);
+    shm_cache_.EraseBlob(key);  // issue #783: keep the mirror from going stale
+  }
+  tag_id_to_info_.erase(tag_id);
+  tags_replayed++;
+}
+
+void Runtime::ApplyWalCreateNewBlob(const std::vector<char> &payload,
+                                    clio::run::u32 &blobs_replayed) {
+  auto txn = TransactionLog::DeserializeCreateNewBlob(payload);
+  TagId tag_id{txn.tag_major_, txn.tag_minor_};
+  std::string composite_key = std::to_string(tag_id.major_) + "." +
+                              std::to_string(tag_id.minor_) + "." +
+                              txn.blob_name_;
+  BlobInfo blob_info;
+  blob_info.blob_name_ = txn.blob_name_;
+  blob_info.score_ = txn.score_;
+  // Carry over any transform mark already restored for this key (issue
+  // #818). The WAL is only truncated once it exceeds a size threshold, so a
+  // kCreateNewBlob record can outlive the metadata flush that recorded the
+  // blob's transform state -- and this insert_or_assign would otherwise
+  // reset that state to "untransformed", i.e. fail open into direct reads
+  // of codec bytes. A later kSetBlobTransform record, when present, ORs in
+  // on top of this. With merge-by-seq replay this record is now applied in
+  // true write order, so "existing" here really does mean "everything
+  // written before this create" rather than "whatever a prior, possibly
+  // out-of-order shard happened to leave behind".
+  {
+    std::shared_ptr<BlobInfo> existing =
+        tag_blob_name_to_info_.get(composite_key);
+    if (existing) {
+      blob_info.transform_flags_ = existing->transform_flags_;
+      // Carry DROPPABILITY too -- same outlives-the-flush hazard.
+      // Replaying the create record would reset it, and the field is
+      // write-once so nothing could mark it again.
+      blob_info.droppable_ = existing->droppable_;
+      // Carry the REPLICAS too (issue #886) — same outlives-the-flush
+      // hazard as the transform mark.
+      blob_info.replicas_ = existing->replicas_;
+      // Carry the BLOCKS too (issue #905) — third instance of the same
+      // hazard. A later kExtendBlob record, when present, still replaces
+      // the layout wholesale; a replayed kDelBlob removed the entry, so a
+      // genuine delete+recreate never reaches this carry-over.
+      blob_info.blocks_ = existing->blocks_;
+      blob_info.RecomputeTotalSize();
+    }
+  }
+  tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
+  MirrorBlobToShm(composite_key, blob_info);
+  blobs_replayed++;
+}
+
+void Runtime::ApplyWalExtendBlob(const std::vector<char> &payload,
+                                 clio::run::u32 &blobs_replayed) {
+  auto txn = TransactionLog::DeserializeExtendBlob(payload);
+  TagId tag_id{txn.tag_major_, txn.tag_minor_};
+  std::string composite_key = std::to_string(tag_id.major_) + "." +
+                              std::to_string(tag_id.minor_) + "." +
+                              txn.blob_name_;
+  std::shared_ptr<BlobInfo> blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
+  // A blob's kCreateNewBlob and its kExtendBlob records are logged by
+  // whichever worker served each PutBlob, which can differ call to call --
+  // create the blob here too so replay never depends on which record a
+  // merge-by-seq sort (or, for a still-unreplayed old WAL, a lucky shard
+  // order) happened to apply first.
+  if (!blob_info_ptr) {
+    BlobInfo fresh;
+    fresh.blob_name_ = txn.blob_name_;
+    tag_blob_name_to_info_.insert_or_assign(
+        composite_key, std::make_shared<BlobInfo>(fresh));
+    blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
+  }
+  if (blob_info_ptr) {
+    // Replace blocks with replayed blocks (full replacement semantics)
+    blob_info_ptr->blocks_.clear();
+    for (const auto &tb : txn.new_blocks_) {
+      clio::run::PoolId bdev_pool_id(tb.bdev_major_, tb.bdev_minor_);
+      // Filter volatile targets (matching RestoreMetadataFromLog)
+      bool is_volatile = false;
+      {
+        clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+        TargetInfo *tinfo = registered_targets_.find(bdev_pool_id);
+        if (tinfo && tinfo->persistence_level_ ==
+                         clio::run::bdev::PersistenceLevel::kVolatile) {
+          is_volatile = true;
+        }
+      }
+      if (is_volatile) {
+        continue;
+      }
+      clio::run::bdev::Client bdev_client(bdev_pool_id);
+      BlobBlock block(bdev_client, tb.target_query_, tb.target_offset_,
+                      tb.size_);
+      blob_info_ptr->blocks_.push_back(block);
+    }
+    blob_info_ptr->RecomputeTotalSize();  // blocks_ rebuilt: resync cache
+  }
+  blobs_replayed++;
+}
+
+void Runtime::ApplyWalExtendReplica(const std::vector<char> &payload,
+                                    clio::run::u32 &blobs_replayed) {
+  // issue #886: full replacement of ONE replica's layout, same
+  // volatile-target filtering as kExtendBlob.
+  auto txn = TransactionLog::DeserializeExtendReplica(payload);
+  TagId tag_id{txn.tag_major_, txn.tag_minor_};
+  std::string composite_key = std::to_string(tag_id.major_) + "." +
+                              std::to_string(tag_id.minor_) + "." +
+                              txn.blob_name_;
+  std::shared_ptr<BlobInfo> blob_info_ptr =
+      tag_blob_name_to_info_.get(composite_key);
+  // Create the blob if this record's own worker beat the create record's
+  // worker into the (now merge-by-seq-ordered) replay stream -- true write
+  // order still does not guarantee kCreateNewBlob precedes every record
+  // that references the same blob, since a replica write-through can be
+  // logged concurrently with the primary's own create on a different
+  // worker. Creating here keeps replay order-independent regardless.
+  if (!blob_info_ptr) {
+    BlobInfo fresh;
+    fresh.blob_name_ = txn.blob_name_;
+    tag_blob_name_to_info_.insert_or_assign(
+        composite_key, std::make_shared<BlobInfo>(fresh));
+    blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
+  }
+  if (blob_info_ptr && txn.replica_ > 0) {
+    Replica *rep = blob_info_ptr->GetReplica(
+        static_cast<int>(txn.replica_), /*create=*/true);
+    rep->name_ = txn.replica_name_;
+    rep->score_ = txn.score_;
+    rep->flags_ = txn.flags_;
+    rep->transform_flags_ = txn.transform_flags_;
+    rep->min_score_ = txn.min_score_;
+    rep->blocks_.clear();
+    rep->total_size_cache_ = 0;
+    for (const auto &tb : txn.new_blocks_) {
+      clio::run::PoolId bdev_pool_id(tb.bdev_major_, tb.bdev_minor_);
+      bool is_volatile = false;
+      {
+        clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+        TargetInfo *tinfo = registered_targets_.find(bdev_pool_id);
+        if (tinfo && tinfo->persistence_level_ ==
+                         clio::run::bdev::PersistenceLevel::kVolatile) {
+          is_volatile = true;
+        }
+      }
+      if (is_volatile) {
+        continue;
+      }
+      clio::run::bdev::Client bdev_client(bdev_pool_id);
+      BlobBlock block(bdev_client, tb.target_query_, tb.target_offset_,
+                      tb.size_);
+      rep->blocks_.push_back(block);
+      rep->total_size_cache_ += tb.size_;
+    }
+  }
+  blobs_replayed++;
+}
+
+void Runtime::ApplyWalClearBlob(const std::vector<char> &payload,
+                                clio::run::u32 &blobs_replayed) {
+  auto txn = TransactionLog::DeserializeClearBlob(payload);
+  TagId tag_id{txn.tag_major_, txn.tag_minor_};
+  std::string composite_key = std::to_string(tag_id.major_) + "." +
+                              std::to_string(tag_id.minor_) + "." +
+                              txn.blob_name_;
+  std::shared_ptr<BlobInfo> blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
+  if (blob_info_ptr) {
+    blob_info_ptr->blocks_.clear();
+    blob_info_ptr->total_size_cache_ = 0;  // blocks_ cleared
+  }
+  blobs_replayed++;
+}
+
+void Runtime::ApplyWalSetBlobTransform(const std::vector<char> &payload,
+                                       clio::run::u32 &blobs_replayed) {
+  // issue #818. This reinstates the transform bit on top of the
+  // default-constructed BlobInfo that kCreateNewBlob inserts. The mark is
+  // logged later in the put than the create, but merge-by-seq replay now
+  // applies both in the order they were actually written, so this simply
+  // reflects true write order rather than needing an order-independent
+  // create-if-absent as a fallback... except a replica-write-through and its
+  // blob's own create can still race across workers, so keep the guard.
+  auto txn = TransactionLog::DeserializeSetBlobTransform(payload);
+  TagId tag_id{txn.tag_major_, txn.tag_minor_};
+  std::string composite_key = std::to_string(tag_id.major_) + "." +
+                              std::to_string(tag_id.minor_) + "." +
+                              txn.blob_name_;
+  std::shared_ptr<BlobInfo> blob_info_ptr =
+      tag_blob_name_to_info_.get(composite_key);
+  if (!blob_info_ptr) {
+    BlobInfo fresh;
+    fresh.blob_name_ = txn.blob_name_;
+    tag_blob_name_to_info_.insert_or_assign(
+        composite_key, std::make_shared<BlobInfo>(fresh));
+    blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
+  }
+  if (blob_info_ptr) {
+    blob_info_ptr->transform_flags_ |= txn.transform_flags_;
+    MirrorBlobToShm(composite_key, *blob_info_ptr);
+    blobs_replayed++;
+  }
+}
+
+void Runtime::ApplyWalSetBlobDroppable(const std::vector<char> &payload,
+                                       clio::run::u32 &blobs_replayed) {
+  auto txn = TransactionLog::DeserializeSetBlobDroppable(payload);
+  TagId tag_id{txn.tag_major_, txn.tag_minor_};
+  std::string composite_key = std::to_string(tag_id.major_) + "." +
+                              std::to_string(tag_id.minor_) + "." +
+                              txn.blob_name_;
+  std::shared_ptr<BlobInfo> blob_info_ptr =
+      tag_blob_name_to_info_.get(composite_key);
+  if (!blob_info_ptr) {
+    BlobInfo fresh;
+    fresh.blob_name_ = txn.blob_name_;
+    tag_blob_name_to_info_.insert_or_assign(
+        composite_key, std::make_shared<BlobInfo>(fresh));
+    blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
+  }
+  if (blob_info_ptr) {
+    blob_info_ptr->droppable_ = txn.droppable_;
+    MirrorBlobToShm(composite_key, *blob_info_ptr);
+    blobs_replayed++;
+  }
+}
+
+void Runtime::ApplyWalDelBlob(const std::vector<char> &payload,
+                              clio::run::u32 &blobs_replayed) {
+  auto txn = TransactionLog::DeserializeDelBlob(payload);
+  TagId tag_id{txn.tag_major_, txn.tag_minor_};
+  std::string composite_key = std::to_string(tag_id.major_) + "." +
+                              std::to_string(tag_id.minor_) + "." +
+                              txn.blob_name_;
+  tag_blob_name_to_info_.erase(composite_key);
+  blobs_replayed++;
 }
 
 // GetWorkRemaining implementation (required pure virtual method)
