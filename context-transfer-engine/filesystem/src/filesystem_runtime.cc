@@ -290,6 +290,31 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 // (set_mode_/set_uid_/set_gid_/set_atime_/...) are live, since those are
 // guarded by it. size_ is atomic and safe to read either way.
 
+std::shared_ptr<Runtime::FileInfo> Runtime::BindFileInfoLocked(
+    const std::string &path, const clio::cte::core::TagId &tag,
+    clio::run::u64 seed_size) {
+  const clio::run::u64 packed =
+      (static_cast<clio::run::u64>(tag.major_) << 32) |
+      static_cast<clio::run::u64>(tag.minor_);
+  auto pit = by_path_.find(path);
+  if (pit != by_path_.end() && pit->second->tag_id_ == tag) {
+    by_tag_[packed] = pit->second;
+    return pit->second;
+  }
+  auto tit = by_tag_.find(packed);
+  if (!tag.IsNull() && tit != by_tag_.end() && tit->second->tag_id_ == tag) {
+    by_path_[path] = tit->second;  // another name of the same file
+    return tit->second;
+  }
+  auto fi = std::make_shared<FileInfo>();
+  fi->tag_id_ = tag;
+  fi->path_ = path;
+  fi->size_.store(seed_size);
+  by_path_[path] = fi;
+  if (!tag.IsNull()) by_tag_[packed] = fi;
+  return fi;
+}
+
 void Runtime::MirrorFile(const std::string &path, const FileInfo &fi,
                          clio::run::u32 extra_flags) {
   if (!shm_fs_cache_.IsEnabled()) {
@@ -426,17 +451,17 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
     // freshly resolved one, bind a new FileInfo to the correct tag, replacing the
     // stale mapping (any still-open handle keeps its own shared_ptr, so an
     // open-unlink-recreate on the same name stays correctly separated).
-    if (it != by_path_.end() && it->second->tag_id_ == tag_id) {
-      fi = it->second;
-      size = fi->size_.load();  // keep the live logical size if already open
-    } else {
-      fi = std::make_shared<FileInfo>();
-      fi->tag_id_ = tag_id;
-      fi->path_ = path;
-      fi->size_.store(size);
-      by_path_[path] = fi;
-      by_tag_[(static_cast<clio::run::u64>(tag_id.major_) << 32) |
-              static_cast<clio::run::u64>(tag_id.minor_)] = fi;
+    // A live record (this name, or another name of the same tag) holds the
+    // authoritative logical size; the tag's physical size can disagree
+    // (sparse writes, a shrink whose pages are not yet freed).
+    const clio::run::u64 packed_id =
+        (static_cast<clio::run::u64>(tag_id.major_) << 32) |
+        static_cast<clio::run::u64>(tag_id.minor_);
+    const bool live = (it != by_path_.end() && it->second->tag_id_ == tag_id) ||
+                      by_tag_.count(packed_id) != 0;
+    fi = BindFileInfoLocked(path, tag_id, size);
+    if (live) {
+      size = fi->size_.load();
     }
     // A fresh O_CREAT carries the caller's mode (cp/install rely on this to
     // make copied binaries executable — getattr otherwise synthesizes 0644).
@@ -475,9 +500,14 @@ clio::run::TaskResume Runtime::AdvanceSize(
     task->return_code_ = ENOENT;
     CLIO_CO_RETURN;
   }
-  clio::run::u64 want = task->size_;
-  clio::run::u64 old = fi->size_.load();
-  while (want > old && !fi->size_.compare_exchange_weak(old, want)) {
+  if (task->reserve_ != 0) {
+    task->old_size_ = fi->size_.fetch_add(task->size_);
+  } else {
+    clio::run::u64 want = task->size_;
+    clio::run::u64 old = fi->size_.load();
+    while (want > old && !fi->size_.compare_exchange_weak(old, want)) {
+    }
+    task->old_size_ = old;
   }
   {
     // Publish under the file's CURRENT path — but only while that path still
@@ -1202,20 +1232,14 @@ clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &tas
     }
     std::lock_guard<std::mutex> g(meta_mu_);
     auto it = by_path_.find(path);
-    if (it == by_path_.end()) {
-      auto fi = std::make_shared<FileInfo>();
-      fi->tag_id_ = tag_id;
-      fi->path_ = path;
-      fi->size_.store(new_size);
-      by_path_[path] = fi;
-      // Materialized names must reach the mirror, or a COMPLETE parent dir
-      // would answer authoritative ENOENT for a file that now exists.
-      MirrorFile(path, *fi);
-    } else {
-      it->second->tag_id_ = tag_id;
-      it->second->size_.store(new_size);
-      MirrorFile(path, *it->second);
+    if (it != by_path_.end() && it->second->tag_id_ != tag_id) {
+      by_path_.erase(it);  // stale binding to a dead tag: rebind below
     }
+    auto fi = BindFileInfoLocked(path, tag_id, new_size);
+    fi->size_.store(new_size);
+    // Materialized names must reach the mirror, or a COMPLETE parent dir
+    // would answer authoritative ENOENT for a file that now exists.
+    MirrorFile(path, *fi);
   }
 
   // Shrink: free the page-blob data beyond new_size so the truncated bytes are
@@ -2021,16 +2045,7 @@ clio::run::TaskResume Runtime::Utimens(clio::run::shared_ptr<UtimensTask> &task)
   }
   {
     std::lock_guard<std::mutex> g(meta_mu_);
-    auto it = by_path_.find(path);
-    std::shared_ptr<FileInfo> fi;
-    if (it != by_path_.end()) {
-      fi = it->second;
-    } else {
-      fi = std::make_shared<FileInfo>();
-      fi->tag_id_ = tag_id;
-      fi->path_ = path;
-      by_path_[path] = fi;
-    }
+    std::shared_ptr<FileInfo> fi = BindFileInfoLocked(path, tag_id, 0);
     if (a_now) fi->set_atime_ = now;
     else if (a_set) fi->set_atime_ = task->atime_ns_;
     if (m_now) fi->set_mtime_ = now;
@@ -2097,17 +2112,9 @@ clio::run::TaskResume Runtime::Chown(clio::run::shared_ptr<ChownTask> &task) {
   }
   {
     std::lock_guard<std::mutex> g(meta_mu_);
-    auto it = by_path_.find(path);
-    std::shared_ptr<FileInfo> fi;
-    if (it != by_path_.end()) {
-      fi = it->second;  // already tracked: do NOT overwrite its live size_.
-    } else {
-      fi = std::make_shared<FileInfo>();
-      fi->tag_id_ = tag_id;
-      fi->path_ = path;
-      fi->size_.store(cur_size);  // seed size so getattr doesn't report 0
-      by_path_[path] = fi;
-    }
+    // An already-tracked record keeps its live size_; a new one is seeded
+    // with the current size so getattr doesn't report 0.
+    std::shared_ptr<FileInfo> fi = BindFileInfoLocked(path, tag_id, cur_size);
     // 0xFFFFFFFF means "leave this field unchanged" (POSIX (uid_t)-1).
     if (task->uid_ != 0xFFFFFFFFu) fi->set_uid_ = task->uid_;
     if (task->gid_ != 0xFFFFFFFFu) fi->set_gid_ = task->gid_;

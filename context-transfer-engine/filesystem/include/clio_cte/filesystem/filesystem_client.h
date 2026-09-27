@@ -269,6 +269,22 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+  /**
+   * Reserve `len` bytes at the end of a file, cluster-wide: the home grows
+   * the logical size atomically and reports the old end in old_size_ (the
+   * offset an O_APPEND write must use).
+   * @param tag_packed the file's packed TagId
+   * @param len        bytes being appended
+   */
+  clio::run::Future<AdvanceSizeTask> AsyncReserveAppend(
+      clio::run::u64 tag_packed, clio::run::u64 len) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<AdvanceSizeTask>(clio::run::CreateTaskId(),
+                                              pool_id_, MetaQuery(),
+                                              tag_packed, len, 1u);
+    return ipc->Send(task);
+  }
+
   /** Batched sieve-flushed creation (see MultiCreateTask). */
   clio::run::Future<MultiCreateTask> AsyncMultiCreate(
       const std::string &packed) {

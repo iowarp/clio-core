@@ -75,7 +75,11 @@ while read -r t; do
     sleep 1; waited=$((waited+1))
   done
   if [ "${hung}" -eq 1 ]; then
-    # release D-state waiters first, THEN kill the check tree
+    # release D-state waiters first (abort the FUSE connection so blocked
+    # callers get ENOTCONN), THEN kill the check tree
+    for c in $(awk -v m="${TEST_DIR}" '$5==m {split($3,a,":"); print a[2]}' /proc/self/mountinfo); do
+      echo 1 > "/sys/fs/fuse/connections/${c}/abort" 2>/dev/null
+    done
     fusermount3 -uz "${TEST_DIR}" 2>/dev/null; umount -l "${TEST_DIR}" 2>/dev/null
     pkill -9 -x clio_cte_fuse 2>/dev/null
     kill -9 "${cpid}" 2>/dev/null; pkill -9 -P "${cpid}" 2>/dev/null

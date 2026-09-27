@@ -274,24 +274,40 @@ struct MultiCreateTask : public clio::run::Task {
  */
 struct AdvanceSizeTask : public clio::run::Task {
   IN clio::run::u64 tag_packed_;
+  /** Raise mode: the new size (never lowers it). Reserve mode: a length. */
   IN clio::run::u64 size_;
-  AdvanceSizeTask() : clio::run::Task(), tag_packed_(0), size_(0) {}
+  /**
+   * Nonzero = RESERVE: atomically grow the file by size_ bytes and return the
+   * previous size in old_size_. This is the O_APPEND offset for a writer on a
+   * node whose kernel cannot know the file's current end (another node may
+   * have appended since); the reservation is linearized at the home.
+   */
+  IN clio::run::u32 reserve_;
+  OUT clio::run::u64 old_size_;
+  AdvanceSizeTask()
+      : clio::run::Task(), tag_packed_(0), size_(0), reserve_(0),
+        old_size_(0) {}
   explicit AdvanceSizeTask(const clio::run::TaskId &task_id,
                            const clio::run::PoolId &pool_id,
                            const clio::run::PoolQuery &pool_query,
-                           clio::run::u64 tag_packed, clio::run::u64 size)
+                           clio::run::u64 tag_packed, clio::run::u64 size,
+                           clio::run::u32 reserve = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kAdvanceSize),
-        tag_packed_(tag_packed), size_(size) {}
+        tag_packed_(tag_packed), size_(size), reserve_(reserve),
+        old_size_(0) {}
   void Copy(const ctp::ipc::FullPtr<AdvanceSizeTask> &o) {
     // Base fields first (pool id, method, query, flags): a forwarded copy
     // without them reached SendIn with a null pool and crashed the node.
     clio::run::Task::Copy(o.template Cast<clio::run::Task>());
-    tag_packed_ = o->tag_packed_; size_ = o->size_;
+    tag_packed_ = o->tag_packed_; size_ = o->size_; reserve_ = o->reserve_;
+    old_size_ = o->old_size_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(tag_packed_, size_);
+    Task::SerializeIn(ar); ar(tag_packed_, size_, reserve_);
   }
-  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(old_size_);
+  }
 };
 
 /** Read: page-loop GetBlob over [offset, offset+size). */

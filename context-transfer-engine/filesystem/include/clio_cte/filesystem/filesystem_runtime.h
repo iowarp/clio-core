@@ -251,6 +251,26 @@ class Runtime : public clio::run::Container {
    * Caller may hold meta_mu_ or not: the mirror is independent of it, and the
    * SHM map has its own per-slot seqlock.
    */
+  /**
+   * The ONE tracking record for (path, tag), created if needed. Caller holds
+   * meta_mu_.
+   *
+   * A file's logical size and mode/owner/time overrides must live in a single
+   * FileInfo per TAG: the size a close publishes is looked up by tag
+   * (AdvanceSize), while getattr reads by path. Handlers used to mint a fresh
+   * FileInfo per path, so a second name for the same tag (a hard link, a path
+   * truncated or chmod'ed before it was opened) got its own record: a write
+   * through one name never reached stat of the other (hard link read the old
+   * size on another node; fsx lost a file's size after a remote truncate).
+   * @param path       the name being operated on
+   * @param tag        the tag the name resolves to
+   * @param seed_size  logical size for a brand-new record
+   * @return the shared record, bound under both path and tag
+   */
+  std::shared_ptr<FileInfo> BindFileInfoLocked(const std::string &path,
+                                               const clio::cte::core::TagId &tag,
+                                               clio::run::u64 seed_size);
+
   void MirrorFile(const std::string &path, const FileInfo &fi,
                   clio::run::u32 extra_flags = 0);
 

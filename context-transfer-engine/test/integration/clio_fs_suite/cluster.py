@@ -320,6 +320,14 @@ compose:
   def mount(self, host, timeout=90):
     """Start clio_cte_fuse on host and wait for a usable mount."""
     log = self.log_path(host, 'fuse')
+    # Any mount still at the mountpoint is a stale one (dead daemon): the
+    # setuid fusermount3 then fails with EACCES on it. Clear it first.
+    for _ in range(10):
+      rc, _ = sh(host, f'grep -q " {self.mnt} " /proc/self/mountinfo')
+      if rc != 0:
+        break
+      self.force_unmount(host)
+      time.sleep(0.5)
     sh(host, f'{self.seal_mnt_cmd()}; echo "=== {time.ctime()} mount" >> {log};'
              f' {self.env_prefix()} nohup {self._gdb("fuse")}'
              f'{self.bin_dir}/clio_cte_fuse '

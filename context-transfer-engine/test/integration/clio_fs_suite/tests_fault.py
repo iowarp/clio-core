@@ -391,3 +391,43 @@ def t_chaos(ctx):
     time.sleep(2)
     for r0, e0 in exp_all:
       audit_all(ctx, r0, e0, f'round {rnd} ({what} crash on node{v})')
+
+
+@test('home_node_loss_bounded', 'fault', min_nodes=2, redeploy_after=True,
+      timeout=3600)
+def t_home_loss(ctx):
+  """SIGKILL the METADATA HOME (node 0).  The namespace lives there, so the
+  other nodes cannot make progress -- but every op must FAIL inside
+  OP_DEADLINE, never hang; after the home restarts, every node sees the
+  whole dataset again."""
+  n = len(ctx.hosts)
+  root, exp = build_dataset(ctx, 'h', per_node=6)
+  home = ctx.hosts[0]
+  ctx.cl.kill_fuse(home)
+  ctx.cl.kill_runtime(home)
+  time.sleep(2)
+  hangs, errs, oks = 0, 0, 0
+  for i in range(1, n):
+    for rel in sorted(exp)[:6]:
+      r = ctx.a(i).call('stat', timeout=OP_DEADLINE, path=f'{root}/{rel}')
+      if r.get('hang'):
+        hangs += 1
+      elif r['ok']:
+        oks += 1
+      else:
+        errs += 1
+    r = ctx.a(i).call('write_file', timeout=OP_DEADLINE,
+                      path=f'{root}/while_home_down_{i}', size=4096, seed=1)
+    if r.get('hang'):
+      hangs += 1
+  ctx.metrics.update({'ops_ok_while_home_down': oks,
+                      'ops_err_while_home_down': errs,
+                      'ops_hung_while_home_down': hangs})
+  ctx.check(hangs == 0, f'{hangs} ops HUNG while the metadata home was down')
+  ctx.cl.start_runtime(home, 'restart')
+  ctx.check(ctx.cl.runtime_up(home), 'home restart')
+  time.sleep(3)
+  ctx.check(ctx.cl.mount(home), 'home remount')
+  ctx.cl.agents.pop(home, None)
+  time.sleep(2)
+  audit_all(ctx, root, exp, 'after the metadata home restarted')

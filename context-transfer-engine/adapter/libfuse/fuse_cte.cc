@@ -121,6 +121,9 @@ struct CfsHandle {
   clio::cte::core::TagId tag = clio::cte::core::TagId::GetNull();
   // Guards `path`, which follows renames of the open file (see HandlePath).
   std::mutex path_mu;
+  // Opened with O_APPEND: on a multi-node mount every write's offset is
+  // reserved at the namespace home (see cte_fuse_write).
+  bool append = false;
 };
 
 /**
@@ -194,7 +197,28 @@ bool MultiNode() {
   return v;
 }
 
-// Logical-size high-water for files with UNFLUSHED sieve writes: the chimod
+/**
+ * Whether O_EXCL creates may take the SIEVE-CREATE shortcut (mint the tag
+ * locally, create it on the server later in a MultiCreate batch).
+ *
+ * Opt-in (CLIO_FUSE_SIEVE_CREATE=1) and never on a multi-node mount. The
+ * deferred create races the operations git performs right after writing a
+ * loose object -- close, link(tmp, final), unlink(tmp) -- and `git add` of
+ * 60 files left ~3 object files empty and ~3 missing (git fsck: "missing
+ * blob"); with synchronous creates the same run is clean. On multi-node the
+ * shortcut is also unsound because O_EXCL rests on this mount's negative
+ * lookup alone.
+ * @return true when the shortcut may be used
+ */
+bool SieveCreateEnabled() {
+  static const bool v = [] {
+    const char *e = getenv("CLIO_FUSE_SIEVE_CREATE");
+    return e != nullptr && *e == '1';
+  }();
+  return v && SieveDataEnabled() && !MultiNode();
+}
+
+// Logical-size high-water for files with UNFLUSHED sieve writes: the chimod// Logical-size high-water for files with UNFLUSHED sieve writes: the chimod
 // only learns the size at close (CloseTask::advance_size_), so getattr and
 // read-clamping consult this in the meantime. Path-keyed; renames move the
 // entry, the closer erases it once the size-carrying close has been sent.
@@ -1243,6 +1267,12 @@ static int cte_fuse_getattr(const char *path, cte_stat_t *stbuf,
 int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
                             struct fuse_file_info *fi) {
   (void)fi;
+  // An explicit utimens supersedes the write-time overlay (rsync/cp -a set
+  // the source's mtime right after writing; the overlay must not win).
+  {
+    std::lock_guard<std::mutex> lk(g_hw_mtx);
+    g_wtime.erase(std::string(path));
+  }
   // Translate the POSIX (atime, mtime) timespec pair into the chimod's flag
   // encoding: bit0/bit1 = explicit atime/mtime, bit2/bit3 = UTIME_NOW (resolved
   // server-side so it shares the tag clock). UTIME_OMIT leaves a field alone.
@@ -1539,7 +1569,7 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
   // no task. The kernel's authoritative negative LOOKUP just preceded this
   // CREATE, and the kernel serializes same-path creation, so exclusivity
   // holds without asking the chimod.
-  if (SieveDataEnabled() && !MultiNode() && (fi->flags & O_EXCL) &&
+  if (SieveCreateEnabled() && (fi->flags & O_EXCL) &&
       CLIO_CTE_CLIENT != nullptr) {
     auto *handle = new CfsHandle();
     handle->fh = 0;  // no server handle; data ops key off the tag
@@ -1572,7 +1602,9 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
         g_closer.detach();
       }
     }
-    fi->fh = reinterpret_cast<uint64_t>(handle);
+    handle->append = (fi->flags & O_APPEND) != 0;
+    if (handle->append && MultiNode()) fi->direct_io = 1;  // offset is ours
+  fi->fh = reinterpret_cast<uint64_t>(handle);
     MaybeDirectIo(fi);
     return 0;
   }
@@ -1590,6 +1622,8 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
   handle->tag = clio::cte::core::TagId(
       static_cast<clio::run::u32>(t->tag_packed_ >> 32),
       static_cast<clio::run::u32>(t->tag_packed_ & 0xffffffffULL));
+  handle->append = (fi->flags & O_APPEND) != 0;
+  if (handle->append && MultiNode()) fi->direct_io = 1;  // offset is ours
   fi->fh = reinterpret_cast<uint64_t>(handle);
   MaybeDirectIo(fi);
   MaybeTruncateOnOpen(cfs, p, fi->flags);
@@ -1609,7 +1643,9 @@ int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
       handle->fh = 0;
       handle->path = p;
       handle->tag = pc.tag;
-      fi->fh = reinterpret_cast<uint64_t>(handle);
+      handle->append = (fi->flags & O_APPEND) != 0;
+      if (handle->append && MultiNode()) fi->direct_io = 1;  // offset is ours
+  fi->fh = reinterpret_cast<uint64_t>(handle);
       MaybeDirectIo(fi);
       if (fi->flags & O_TRUNC) HiwaterClamp(p, 0);
       return 0;
@@ -1629,6 +1665,8 @@ int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   handle->tag = clio::cte::core::TagId(
       static_cast<clio::run::u32>(t->tag_packed_ >> 32),
       static_cast<clio::run::u32>(t->tag_packed_ & 0xffffffffULL));
+  handle->append = (fi->flags & O_APPEND) != 0;
+  if (handle->append && MultiNode()) fi->direct_io = 1;  // offset is ours
   fi->fh = reinterpret_cast<uint64_t>(handle);
   MaybeDirectIo(fi);
   MaybeTruncateOnOpen(cfs, p, fi->flags);
@@ -1672,11 +1710,15 @@ int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
   const std::string p =
       handle ? HandlePath(handle, path) : std::string(path ? path : "");
   if (p.empty()) return 0;
-  if (handle != nullptr && MultiNode()) {
-    // CLOSE-TO-OPEN across nodes: once close(2) returns, an open on ANY
-    // node must see this file's bytes and size. release() is delivered
-    // after close(2) has already returned (and is asynchronous here), so
-    // the drain + size push has to happen in flush, which close(2) awaits.
+  if (handle != nullptr && (MultiNode() || HiwaterFor(p) != 0)) {
+    // CLOSE-TO-OPEN: once close(2) returns, an open on ANY node -- or any
+    // later operation on THIS one -- must see the file's bytes and size.
+    // release() is delivered after close(2) has already returned (and is
+    // asynchronous here), so the drain + size push happens in flush, which
+    // close(2) awaits. Only files this handle wrote pay for it. Leaving it
+    // to the lazy closer let git's close -> link(tmp, obj) -> unlink(tmp)
+    // outrun the size push: `git add` of a source tree left loose objects
+    // empty or missing (git fsck "missing blob"), even on one node.
     int rc = PublishOnClose(handle, p);
     if (rc != 0) return rc;
   }
@@ -1840,6 +1882,19 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
   // logical size rides the hiwater map until close carries it to the
   // chimod. Falls back to the cfs deferred WriteTask pipeline when the tag
   // is unknown or CLIO_FUSE_SIEVE=0.
+  // O_APPEND across nodes: the kernel derived `offset` from ITS cached size,
+  // which another node's appends have already moved past -- two nodes each
+  // appending 200 records lost half of them. Reserve the real end at the
+  // namespace home instead (atomic there), and write at the reserved offset.
+  if (handle->append && MultiNode() && !handle->tag.IsNull()) {
+    auto r = CLIO_CFS_CLIENT->AsyncReserveAppend(
+        (static_cast<clio::run::u64>(handle->tag.major_) << 32) |
+            static_cast<clio::run::u64>(handle->tag.minor_),
+        static_cast<clio::run::u64>(size));
+    r.Wait();
+    if (r->GetReturnCode() != 0) return -EIO;
+    offset = static_cast<cte_off_t>(r->old_size_);
+  }
   auto *cte = CLIO_CTE_CLIENT;
   if (SieveDataEnabled() && cte != nullptr && !handle->tag.IsNull()) {
     size_t done = 0;

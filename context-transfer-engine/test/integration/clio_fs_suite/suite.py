@@ -158,6 +158,7 @@ def load_tests():
   import tests_dist  # noqa: F401
   import tests_fault  # noqa: F401
   import tests_apps  # noqa: F401
+  import tests_perf  # noqa: F401
 
 
 def slurm_hosts():
@@ -248,7 +249,7 @@ def main():
   ap.add_argument('--hosts', default='')
   ap.add_argument('--nodes', type=int, default=0,
                   help='use only the first N hosts')
-  ap.add_argument('--groups', default='posix,dist,apps,fault')
+  ap.add_argument('--groups', default='posix,dist,apps,perf,fault')
   ap.add_argument('--only', default='')
   ap.add_argument('--skip', default='')
   ap.add_argument('--profile', default='persistent',
