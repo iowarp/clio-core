@@ -2726,7 +2726,19 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
       }
     }
   }
-  lane.Push(future);
+  {
+    // Never block: the net worker is this ring's only consumer AND one of
+    // its producers (see net_overflow_). Spill instead of waiting for space.
+    std::lock_guard<std::mutex> push_lk(net_push_mu_);
+    auto &spill = net_overflow_[priority_idx];
+    if (!spill.empty() || lane.Size() + 1 >= lane.GetDepth()) {
+      spill.push_back(future);
+      net_overflow_size_[priority_idx].fetch_add(1, std::memory_order_relaxed);
+      was_empty = was_empty || spill.size() == 1;
+    } else {
+      lane.Push(future);
+    }
+  }
 
   // Pick the worker that drains this priority's queue. Cross-node Send
   // priorities (kSendIn{Latency,IO} / kSendOut{Latency,IO}) are owned
@@ -2780,7 +2792,21 @@ bool IpcManager::TryPopNetTask(NetQueuePriority priority,
   u32 priority_idx = static_cast<u32>(priority);
   auto &lane = net_queue_->GetLane(0, priority_idx);
 
-  if (lane.Pop(future)) {
+  bool popped = lane.Pop(future);
+  if (!popped &&
+      net_overflow_size_[priority_idx].load(std::memory_order_relaxed) != 0) {
+    // The ring is empty, so every spilled task is now the oldest: serve the
+    // spill in order until producers can use the ring again.
+    std::lock_guard<std::mutex> push_lk(net_push_mu_);
+    auto &spill = net_overflow_[priority_idx];
+    if (!spill.empty()) {
+      future = spill.front();
+      spill.pop_front();
+      net_overflow_size_[priority_idx].fetch_sub(1, std::memory_order_relaxed);
+      popped = true;
+    }
+  }
+  if (popped) {
     if (netqprof::On()) {
       uint64_t pushed =
           netqprof::push_ns[priority_idx].load(std::memory_order_relaxed);

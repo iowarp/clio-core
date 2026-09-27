@@ -169,6 +169,33 @@ def slurm_hosts():
   return out.split()
 
 
+def snapshot_bins(src, dst):
+  """Copy the daemon, the FUSE adapter and every shared library into the run
+  directory, so a rebuild during a long run cannot swap binaries under it
+  (a redeploy would otherwise mix old and new builds in one result set).
+  RUNPATH is $ORIGIN, so the copies resolve each other.
+  @return the directory to run the binaries from
+  """
+  import shutil
+  os.makedirs(dst, exist_ok=True)
+  for name in os.listdir(src):
+    if name in ('clio_run', 'clio_cte_fuse') or (name.startswith('lib') and
+                                                 '.so' in name):
+      sp = os.path.join(src, name)
+      dp = os.path.join(dst, name)
+      if os.path.islink(sp):
+        if os.path.lexists(dp):
+          os.unlink(dp)
+        os.symlink(os.readlink(sp), dp)
+      else:
+        shutil.copy2(sp, dp)
+  return dst
+
+
+def cluster_mnt(cl):
+  return cl.mnt
+
+
 def redeploy(cl, log):
   log('redeploying cluster')
   cl.close_agents()
@@ -186,6 +213,11 @@ def run_one(cl, t, hosts, log):
          'doc': t['doc']}
   t0 = time.time()
   try:
+    # Every node's mount must be live: a test op on a dead mount would write
+    # into the raw directory underneath and pass against local disk.
+    for i in range(len(hosts)):
+      if not ctx.ok(i, 'is_mounted', mnt=cluster_mnt(cl), timeout=30):
+        raise TestFailure(f'node{i} {hosts[i]}: clio-fs is not mounted')
     ctx.ok(0, 'makedirs', path=ctx.dir, timeout=60)
     t['fn'](ctx)
     rec['status'] = 'PASS'
@@ -255,7 +287,9 @@ def main():
   order = {'posix': 0, 'dist': 1, 'apps': 2, 'perf': 3, 'fault': 4}
   sel.sort(key=lambda t: order.get(t['group'], 9))
 
-  cl = Cluster(hosts, os.path.abspath(args.bin), os.path.abspath(args.out),
+  bin_dir = snapshot_bins(os.path.abspath(args.bin),
+                          os.path.join(os.path.abspath(args.out), 'bin'))
+  cl = Cluster(hosts, bin_dir, os.path.abspath(args.out),
                profile=args.profile, port=args.port,
                attr_cache_s=args.attr_cache)
   log(f'hosts={hosts} profile={args.profile} tests={len(sel)}')

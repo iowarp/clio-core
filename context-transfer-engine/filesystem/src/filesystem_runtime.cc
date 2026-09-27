@@ -89,7 +89,7 @@ inline const char *SymlinkMarker() { return "__clio_symlink__"; }
     CLIO_CO_AWAIT(_tp);                                                      \
     if (_tp->GetReturnCode() == 0) {                                         \
       auto _tt = cte_.AsyncTruncateBlob(_tp->tag_id_, TsTouchBlob(), 0,      \
-                                        clio::run::PoolQuery::Dynamic());    \
+                                        clio::run::PoolQuery::Local());      \
       CLIO_CO_AWAIT(_tt);                                                    \
     }                                                                        \
   } while (0)
@@ -377,6 +377,14 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
     tag_id = t->tag_id_;
     existed = (t->created_ == 0);
     size = t->tag_size_;
+    // O_EXCL is decided HERE, by the core insert that won: of several
+    // racing creators (other nodes included) exactly one sees created_=1.
+    // The kernel's negative lookup only covers this node's own mount.
+    if (existed && (task->flags_ & O_EXCL)) {
+      task->handle_ = 0;
+      task->return_code_ = EEXIST;
+      CLIO_CO_RETURN;
+    }
   } else {
     // Honor O_CREAT-less opens: a plain open of a missing file must fail
     // (handle_=0 -> ENOENT), never create. The exact query resolves the id
@@ -1141,7 +1149,7 @@ clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &tas
     } else {
       // Grow (or same size): stamp mtime/ctime via the timestamp-touch blob.
       auto tb = cte_.AsyncTruncateBlob(t_tag, TsTouchBlob(), 0,
-                                       clio::run::PoolQuery::Dynamic());
+                                       clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(tb);
     }
     task->return_code_ = 0;
@@ -1234,8 +1242,12 @@ clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &tas
     // data (writes only create pages up to EOF, and shrink deletes past it), so
     // TruncateBlob finds it missing and only bumps mtime/ctime.
     clio::run::u64 touch_page = new_size / kFsPageSize + 1;
+    // Local, not Dynamic: this is a timestamp stamp on a blob that does not
+    // exist, which only the container holding the NAMED tag (the namespace
+    // home, where this handler runs) records. Dynamic now hashes
+    // TruncateBlob to the blob's owner, whose nameless seed drops it.
     auto tb = cte_.AsyncTruncateBlob(tag_id, std::to_string(touch_page),
-                                     0, clio::run::PoolQuery::Dynamic());
+                                     0, clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(tb);
   }
 
@@ -1345,6 +1357,12 @@ clio::run::TaskResume Runtime::Mkdir(clio::run::shared_ptr<MkdirTask> &task) {
                                     clio::cte::core::TagId::GetNull(),
                                     clio::run::PoolQuery::Dynamic());
   CLIO_CO_AWAIT(t);
+  if (t->GetReturnCode() == 0 && t->created_ == 0) {
+    // Another mkdir of the same name (possibly from another node) won the
+    // marker insert between our EEXIST probes above and this create.
+    task->return_code_ = EEXIST;
+    CLIO_CO_RETURN;
+  }
   if (t->GetReturnCode() == 0) {
     CLIO_FS_TOUCH_DIR(ParentDir(path));  // new subdir => parent mtime/ctime
     // A just-born dir is trivially COMPLETE in the mirror: publishing that
@@ -1631,7 +1649,7 @@ clio::run::TaskResume Runtime::Link(clio::run::shared_ptr<LinkTask> &task) {
       CLIO_CO_AWAIT(tt);
       if (tt->GetReturnCode() == 0) {
         auto tc = cte_.AsyncTruncateBlob(tt->tag_id_, TsCtimeBlob(), 0,
-                                         clio::run::PoolQuery::Dynamic());
+                                         clio::run::PoolQuery::Local());
         CLIO_CO_AWAIT(tc);
       }
     }

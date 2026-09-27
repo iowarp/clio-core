@@ -604,7 +604,8 @@ private:
    * Helper function to get or assign a tag ID
    */
   TagId GetOrAssignTagId(const std::string &tag_name,
-                         const TagId &preferred_id = TagId::GetNull());
+                         const TagId &preferred_id = TagId::GetNull(),
+                         bool *created = nullptr);
 
   /**
    * Get-or-create the chain of tags for an absolute path, returning the id of
@@ -612,9 +613,12 @@ private:
    * stored relative to its parent as "$tagid{parent}/leaf") and returns the id
    * of "/a/b/c". Non-absolute names are created as a single flat tag.
    * preferred_id (if set) is applied to the deepest tag only.
+   * @param created if non-null, set to true iff THIS call inserted the
+   *        deepest tag (exactly one of several racing creators sees true)
    */
   TagId GetOrCreateTagChain(const std::string &name,
-                            const TagId &preferred_id = TagId::GetNull());
+                            const TagId &preferred_id = TagId::GetNull(),
+                            bool *created = nullptr);
 
   /**
    * Resolve an absolute path to an existing tag id by walking the hierarchy

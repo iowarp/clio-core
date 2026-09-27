@@ -1291,7 +1291,9 @@ class IpcManager {
     if (net_queue_.IsNull()) {
       return 0;
     }
-    return net_queue_->GetLane(0, static_cast<u32>(priority)).Size();
+    const u32 p = static_cast<u32>(priority);
+    return net_queue_->GetLane(0, p).Size() +
+           net_overflow_size_[p].load(std::memory_order_relaxed);
   }
 
   /**
@@ -1701,6 +1703,22 @@ class IpcManager {
 
   // Network queue for send operations (one lane, two priorities)
   ctp::ipc::FullPtr<NetQueue> net_queue_;
+
+  /**
+   * Spill-over for net_queue_ when a priority's ring is full.
+   *
+   * The ring waits for space when full, and its only consumer is the net
+   * worker -- which itself enqueues net tasks (liveness probes from
+   * ScanTaskProgress, retries, responses). Under a burst of cross-node
+   * metadata traffic the ring filled, the net worker blocked pushing into
+   * its own queue, and the node wedged for good (R-state spin in
+   * EnqueueNetTask, peers declaring it dead). Enqueues are serialized by
+   * net_push_mu_ so the space check and the push are atomic; once a
+   * priority has spilled, later tasks queue behind the spill to keep FIFO.
+   */
+  std::mutex net_push_mu_;
+  std::deque<Future<Task>> net_overflow_[kNetQueueNumPriorities];
+  std::atomic<size_t> net_overflow_size_[kNetQueueNumPriorities] = {};
 
   // Net workers' lane pointers for signaling on EnqueueNetTask. With the
   // recv/send split, send-side priorities wake net_send_lane_ and

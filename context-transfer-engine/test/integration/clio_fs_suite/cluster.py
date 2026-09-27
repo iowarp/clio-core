@@ -250,14 +250,43 @@ compose:
              f'pkill -9 -u $USER -f "[c]lio_run" ; sleep 0.5; '
              f'rm -rf {self.local_root}/data {self.local_root}/memfd '
              f'{self.local_root}/conf; '
-             f'mkdir -p {self.local_root}/data {self.mnt}', timeout=60)
+             f'mkdir -p {self.local_root}/data; {self.seal_mnt_cmd()}',
+       timeout=60)
+
+  def seal_mnt_cmd(self):
+    """Shell snippet leaving an EMPTY raw mountpoint (only when nothing is
+    mounted there; fusermount needs it writable, so it cannot be sealed). A test op that runs after its FUSE mount died
+    must fail loudly -- otherwise it silently writes into the node-local
+    directory underneath and later runs read that junk back as if it were
+    clio-fs state."""
+    m = self.mnt
+    return (f'if ! grep -q " {m} " /proc/self/mountinfo; then '
+            f'chmod -R u+w {m} 2>/dev/null; rm -rf {m}; mkdir -p {m}; fi')
 
   def start_runtime(self, host, mode='start'):
     """Launch `clio_run <mode>` (start|restart) detached on host."""
     log = self.log_path(host, 'runtime')
-    cmd = (f'{self.env_prefix()} nohup {self.bin_dir}/clio_run {mode} '
+    # CLIO_SUITE_GDB=1 runs the daemon under gdb and dumps every thread's
+    # stack into the runtime log if it crashes (silent SIGSEGV otherwise).
+    cmd = (f'{self.env_prefix()} nohup {self._gdb("runtime")}'
+           f'{self.bin_dir}/clio_run {mode} '
            f'--no-viz </dev/null >>{log} 2>&1 &')
     sh(host, f'echo "=== {time.ctime()} clio_run {mode}" >> {log}; {cmd}')
+
+  def gdb_prefix(self):
+    """Command prefix running a daemon under gdb when CLIO_SUITE_GDB=1: a
+    crash (or a SIGUSR2 sent to a hung daemon) then dumps every thread's
+    stack into the daemon's log instead of dying silently."""
+    return self._gdb('1')
+
+  def _gdb(self, which):
+    want = os.environ.get('CLIO_SUITE_GDB', '')
+    if want not in ('1', which):
+      return ''
+    return ('gdb -q -batch -nx -ex "set startup-with-shell off" '
+            '-ex "handle SIGUSR1 nostop noprint pass" '
+            '-ex "handle SIGPIPE nostop noprint pass" '
+            '-ex run -ex "thread apply all bt 25" --args ')
 
   def runtime_up(self, host, timeout=180):
     """Wait until the daemon on host listens on its port."""
@@ -270,7 +299,7 @@ compose:
     return False
 
   def runtime_pid(self, host):
-    rc, out = sh(host, 'pgrep -u $USER -f "[c]lio_run (start|restart)"')
+    rc, out = sh(host, 'pgrep -u $USER -f "^[^ ]*[c]lio_run (start|restart)"')
     return [int(x) for x in out.split()] if rc == 0 else []
 
   def stop_runtime(self, host, timeout=60):
@@ -291,8 +320,9 @@ compose:
   def mount(self, host, timeout=90):
     """Start clio_cte_fuse on host and wait for a usable mount."""
     log = self.log_path(host, 'fuse')
-    sh(host, f'mkdir -p {self.mnt}; echo "=== {time.ctime()} mount" >> {log};'
-             f' {self.env_prefix()} nohup {self.bin_dir}/clio_cte_fuse '
+    sh(host, f'{self.seal_mnt_cmd()}; echo "=== {time.ctime()} mount" >> {log};'
+             f' {self.env_prefix()} nohup {self._gdb("fuse")}'
+             f'{self.bin_dir}/clio_cte_fuse '
              f'{self.mnt} -f </dev/null >>{log} 2>&1 &')
     t0 = time.time()
     while time.time() - t0 < timeout:

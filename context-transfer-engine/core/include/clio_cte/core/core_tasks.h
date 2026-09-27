@@ -3022,6 +3022,14 @@ struct MultiPutBlobTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
     ar(route_tag_id_, route_blob_, data_, data_len_, descs_, context_);
+    // The payload must travel with the task. The batch is routed by its
+    // FIRST blob, which on a multi-node pool is often another node; shipping
+    // only the staging pointer made the receiver dereference an address in
+    // the SENDER's shared memory (SIGSEGV in MultiPutBatchView::Attach, the
+    // node then dropped out of the cluster). Same bulk contract as PutBlob:
+    // a co-located SHM hop still passes the pointer, a network hop copies
+    // into a receiver-owned buffer (TASK_DATA_OWNER, freed by ~this).
+    ar.bulk(data_, data_len_, BULK_XFER);
   }
 
   template <typename Archive>

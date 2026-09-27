@@ -105,7 +105,10 @@ struct DestroyTask : public clio::run::Task {
   explicit DestroyTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                        const clio::run::PoolQuery &pool_query)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kDestroy) {}
-  void Copy(const ctp::ipc::FullPtr<DestroyTask>& other) { (void)other; }
+  void Copy(const ctp::ipc::FullPtr<DestroyTask>& other) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(other.template Cast<clio::run::Task>()); (void)other; }
   template <typename Ar> void SerializeIn(Ar &ar) { Task::SerializeIn(ar); }
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };
@@ -132,6 +135,9 @@ struct OpenTask : public clio::run::Task {
         path_(CTP_MALLOC, path), flags_(flags), mode_(mode), handle_(0),
         size_(0), created_(0), tag_packed_(0) {}
   void Copy(const ctp::ipc::FullPtr<OpenTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; flags_ = o->flags_; mode_ = o->mode_;
     handle_ = o->handle_; size_ = o->size_; created_ = o->created_;
     tag_packed_ = o->tag_packed_;
@@ -159,6 +165,9 @@ struct CloseTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kClose),
         handle_(handle), advance_size_(advance_size) {}
   void Copy(const ctp::ipc::FullPtr<CloseTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     handle_ = o->handle_; advance_size_ = o->advance_size_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -242,6 +251,9 @@ struct MultiCreateTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiCreate),
         packed_(CTP_MALLOC, packed), num_ok_(0), first_rc_(0) {}
   void Copy(const ctp::ipc::FullPtr<MultiCreateTask> &o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     packed_ = o->packed_; num_ok_ = o->num_ok_; first_rc_ = o->first_rc_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -271,6 +283,9 @@ struct AdvanceSizeTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kAdvanceSize),
         tag_packed_(tag_packed), size_(size) {}
   void Copy(const ctp::ipc::FullPtr<AdvanceSizeTask> &o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     tag_packed_ = o->tag_packed_; size_ = o->size_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -296,6 +311,9 @@ struct ReadTask : public clio::run::Task {
         handle_(handle), offset_(offset), size_(size), data_(data),
         bytes_read_(0) {}
   void Copy(const ctp::ipc::FullPtr<ReadTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     handle_ = o->handle_; offset_ = o->offset_; size_ = o->size_;
     data_ = o->data_; bytes_read_ = o->bytes_read_;
   }
@@ -327,6 +345,9 @@ struct WriteTask : public clio::run::Task {
         handle_(handle), offset_(offset), size_(size), data_(data),
         bytes_written_(0), new_size_(0) {}
   void Copy(const ctp::ipc::FullPtr<WriteTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     handle_ = o->handle_; offset_ = o->offset_; size_ = o->size_;
     data_ = o->data_; bytes_written_ = o->bytes_written_;
     new_size_ = o->new_size_;
@@ -359,6 +380,9 @@ struct AppendTask : public clio::run::Task {
         handle_(handle), size_(size), data_(data), offset_(0),
         bytes_written_(0), new_size_(0) {}
   void Copy(const ctp::ipc::FullPtr<AppendTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     handle_ = o->handle_; size_ = o->size_; data_ = o->data_;
     offset_ = o->offset_; bytes_written_ = o->bytes_written_;
     new_size_ = o->new_size_;
@@ -401,6 +425,9 @@ struct GetattrTask : public clio::run::Task {
         ctime_(0), mtime_(0), atime_(0), is_symlink_(0),
         uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu), nlink_(1) {}
   void Copy(const ctp::ipc::FullPtr<GetattrTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; exists_ = o->exists_; is_dir_ = o->is_dir_;
     size_ = o->size_; ino_ = o->ino_; ctime_ = o->ctime_;
     mtime_ = o->mtime_; atime_ = o->atime_; is_symlink_ = o->is_symlink_;
@@ -444,6 +471,9 @@ struct TruncateTask : public clio::run::Task {
         path_(CTP_MALLOC, path), new_size_(new_size),
         tag_packed_(tag_packed), old_extent_(old_extent) {}
   void Copy(const ctp::ipc::FullPtr<TruncateTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; new_size_ = o->new_size_; tag_packed_ = o->tag_packed_;
     old_extent_ = o->old_extent_;
   }
@@ -472,6 +502,9 @@ struct UtimensTask : public clio::run::Task {
         path_(CTP_MALLOC, path), atime_ns_(atime_ns), mtime_ns_(mtime_ns),
         flags_(flags) {}
   void Copy(const ctp::ipc::FullPtr<UtimensTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; atime_ns_ = o->atime_ns_; mtime_ns_ = o->mtime_ns_;
     flags_ = o->flags_;
   }
@@ -501,6 +534,9 @@ struct ChownTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kChown),
         path_(CTP_MALLOC, path), uid_(uid), gid_(gid), mode_(mode) {}
   void Copy(const ctp::ipc::FullPtr<ChownTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; uid_ = o->uid_; gid_ = o->gid_; mode_ = o->mode_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -518,7 +554,10 @@ struct ChownTask : public clio::run::Task {
                   const clio::run::PoolQuery &pool_query, const std::string &path)   \
         : clio::run::Task(task_id, pool_id, pool_query, METHOD),                     \
           path_(CTP_MALLOC, path) {}                                           \
-    void Copy(const ctp::ipc::FullPtr<NAME>& o) { path_ = o->path_; }          \
+    void Copy(const ctp::ipc::FullPtr<NAME>& o) {                              \
+      clio::run::Task::Copy(o.template Cast<clio::run::Task>());               \
+      path_ = o->path_;                                                        \
+    }                                                                          \
     template <typename Ar> void SerializeIn(Ar &ar) {                          \
       Task::SerializeIn(ar); ar(path_);                                        \
     }                                                                          \
@@ -541,6 +580,9 @@ struct RenameTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kRename),
         src_(CTP_MALLOC, src), dst_(CTP_MALLOC, dst) {}
   void Copy(const ctp::ipc::FullPtr<RenameTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     src_ = o->src_; dst_ = o->dst_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -564,6 +606,9 @@ struct LinkTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kLink),
         target_(CTP_MALLOC, target), link_(CTP_MALLOC, link) {}
   void Copy(const ctp::ipc::FullPtr<LinkTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     target_ = o->target_; link_ = o->link_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -587,6 +632,9 @@ struct SymlinkTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kSymlink),
         target_(CTP_MALLOC, target), path_(CTP_MALLOC, path) {}
   void Copy(const ctp::ipc::FullPtr<SymlinkTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     target_ = o->target_; path_ = o->path_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -608,6 +656,9 @@ struct ReadlinkTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kReadlink),
         path_(CTP_MALLOC, path), target_(CTP_MALLOC) {}
   void Copy(const ctp::ipc::FullPtr<ReadlinkTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; target_ = o->target_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -640,6 +691,9 @@ struct SetxattrTask : public clio::run::Task {
         path_(CTP_MALLOC, path), name_(CTP_MALLOC, name),
         value_(CTP_MALLOC, value), flags_(flags) {}
   void Copy(const ctp::ipc::FullPtr<SetxattrTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; name_ = o->name_; value_ = o->value_; flags_ = o->flags_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -669,6 +723,9 @@ struct GetxattrTask : public clio::run::Task {
         path_(CTP_MALLOC, path), name_(CTP_MALLOC, name), value_(CTP_MALLOC),
         found_(0) {}
   void Copy(const ctp::ipc::FullPtr<GetxattrTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; name_ = o->name_; value_ = o->value_; found_ = o->found_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -694,6 +751,9 @@ struct ListxattrTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kListxattr),
         path_(CTP_MALLOC, path), names_(CTP_MALLOC) {}
   void Copy(const ctp::ipc::FullPtr<ListxattrTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; names_ = o->names_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -719,6 +779,9 @@ struct RemovexattrTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kRemovexattr),
         path_(CTP_MALLOC, path), name_(CTP_MALLOC, name) {}
   void Copy(const ctp::ipc::FullPtr<RemovexattrTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; name_ = o->name_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -740,6 +803,9 @@ struct ReaddirTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kReaddir),
         path_(CTP_MALLOC, path), entries_(CTP_MALLOC), inos_(CTP_MALLOC) {}
   void Copy(const ctp::ipc::FullPtr<ReaddirTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; entries_ = o->entries_; inos_ = o->inos_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -761,6 +827,9 @@ struct StatSizeTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kStatSize),
         path_(CTP_MALLOC, path), exists_(0), size_(0) {}
   void Copy(const ctp::ipc::FullPtr<StatSizeTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; exists_ = o->exists_; size_ = o->size_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
@@ -820,6 +889,9 @@ struct AppendSequenceTask : public clio::run::Task {
                               const clio::run::PoolQuery &pool_query)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kAppendSequence) {}
   void Copy(const ctp::ipc::FullPtr<AppendSequenceTask> &o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     Task::Copy(o.template Cast<Task>());
   }
   template <typename Ar> void SerializeIn(Ar &ar) { Task::SerializeIn(ar); }
@@ -845,6 +917,9 @@ struct AppendCollectTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kAppendCollect),
         tag_id_(tag_id), entries_(entries), new_size_(0) {}
   void Copy(const ctp::ipc::FullPtr<AppendCollectTask> &o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     Task::Copy(o.template Cast<Task>());
     tag_id_ = o->tag_id_; entries_ = o->entries_; new_size_ = o->new_size_;
   }
@@ -880,6 +955,9 @@ struct AppendPlanTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kAppendPlan),
         tag_id_(tag_id), entries_(entries) {}
   void Copy(const ctp::ipc::FullPtr<AppendPlanTask> &o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     Task::Copy(o.template Cast<Task>());
     tag_id_ = o->tag_id_; entries_ = o->entries_;
   }
@@ -906,6 +984,9 @@ struct AppendExecutionTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kAppendExecution),
         tag_id_(tag_id), staging_tag_id_(staging_tag_id), steps_(steps) {}
   void Copy(const ctp::ipc::FullPtr<AppendExecutionTask> &o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     Task::Copy(o.template Cast<Task>());
     tag_id_ = o->tag_id_; staging_tag_id_ = o->staging_tag_id_;
     steps_ = o->steps_;

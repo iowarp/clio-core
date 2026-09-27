@@ -196,13 +196,59 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
   }
 }
 
+/**
+ * Merge a single remote replica's result into the originating task.
+ *
+ * Every filesystem task goes to exactly ONE container (the namespace home),
+ * so "aggregating" its reply is taking the replica's fields wholesale. The
+ * task types define no AggregateOut of their own, and the base one moves
+ * only a nonzero return code: a task answered by another node came back
+ * with every OUT field at its default (mkdir reported ENOENT for a
+ * directory it had just created, readdir came back empty). The copy also
+ * overwrites the base fields, so the originating task's identity (the ids
+ * and query its completion and reply routing key off) is restored after.
+ * @param orig    the task the local runtime is completing
+ * @param replica the reply deserialized from the remote container
+ */
+template <typename TaskT>
+static void TakeReplicaResult(clio::run::shared_ptr<clio::run::Task> &orig,
+                              const clio::run::shared_ptr<clio::run::Task> &replica) {
+  auto dst = orig.template Cast<TaskT>();
+  const clio::run::PoolId pool_id = dst->pool_id_;
+  const clio::run::TaskId task_id = dst->task_id_;
+  const clio::run::PoolQuery pool_query = dst->pool_query_;
+  const clio::run::u32 method = dst->method_;
+  const auto task_flags = dst->task_flags_;
+  const double period_ns = dst->period_ns_;
+  const auto task_group = dst->task_group_;
+  dst->Copy(ctp::ipc::FullPtr<TaskT>(replica.template Cast<TaskT>().get()));
+  dst->pool_id_ = pool_id;
+  dst->task_id_ = task_id;
+  dst->pool_query_ = pool_query;
+  dst->method_ = method;
+  dst->task_flags_ = task_flags;
+  dst->period_ns_ = period_ns;
+  dst->task_group_ = task_group;
+}
+
 void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task,
                            const clio::run::shared_ptr<clio::run::Task> &replica_task) {
   switch (method) {
+    // The append pipeline's collectives keep their own (default) merge.
+    case Method::kAppendSequence:
+    case Method::kAppendCollect:
+    case Method::kAppendPlan:
+    case Method::kAppendExecution:
+      orig_task->AggregateOut(
+          ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      return;
+    default:
+      break;
+  }
+  switch (method) {
 #define X(MID, TASK, HANDLER)                                            \
     case Method::MID:                                                    \
-      orig_task.template Cast<TASK>()->AggregateOut(                     \
-          ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));       \
+      TakeReplicaResult<TASK>(orig_task, replica_task);                  \
       break;
     CLIO_FS_FOR_EACH_METHOD(X)
 #undef X

@@ -234,6 +234,38 @@ void ZeroReadTail(const ctp::ipc::ShmPtr<> &dst, size_t from, size_t size) {
   std::memset(base + from, 0, size - from);
 }
 
+/**
+ * Container that owns the absolute-path namespace (the "metadata home").
+ * Every hierarchical tag record lives there; blob data stays hash-spread.
+ * Configured with CLIO_CTE_META_HOME (a container == node id); default 0.
+ * @return the home container id, clamped to the cluster size
+ */
+clio::run::u32 MetaHomeContainer() {
+  static const clio::run::u32 home = [] {
+    const char *e = clio::run::env::GetCompat("CTE_META_HOME");
+    unsigned long v = (e != nullptr) ? std::strtoul(e, nullptr, 10) : 0;
+    return static_cast<clio::run::u32>(v);
+  }();
+  auto *ipc = CLIO_IPC;
+  const size_t n = ipc != nullptr ? ipc->GetNumHosts() : 1;
+  return n > 0 ? static_cast<clio::run::u32>(home % n) : 0;
+}
+
+/** Pool query that reaches the namespace home (Local when we are it). */
+clio::run::PoolQuery MetaHomeQuery() {
+  return clio::run::PoolQuery::DirectId(
+      clio::run::ContainerId(MetaHomeContainer()));
+}
+
+/**
+ * True when a tag id was minted by the namespace home. Server-minted ids
+ * carry the minting node in major_, and hierarchical tags are minted only on
+ * the home, so by-id operations on them can be routed without the name.
+ */
+bool IsMetaHomeTag(const TagId &id) {
+  return !id.IsNull() && id.major_ == MetaHomeContainer();
+}
+
 // True for absolute-path names that participate in the hierarchy.
 bool IsHierPath(const std::string &name) {
   return !name.empty() && name[0] == '/';
@@ -1057,10 +1089,14 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
     case Method::kGetTargetInfo:
       return clio::run::PoolQuery::Local();
 
-    // GetOrCreateTag: check local tag cache, hash to container if not found
+    // GetOrCreateTag: absolute paths live on the namespace home; flat
+    // names check the local tag cache, then hash to their owner container.
     case Method::kGetOrCreateTag: {
       auto typed = task.template Cast<GetOrCreateTagTask<CreateParams>>();
       std::string tag_name = typed->tag_name_.str();
+      if (IsHierPath(tag_name)) {
+        return MetaHomeQuery();
+      }
       bool tag_exists = false;
       {
         tag_exists = (tag_name_to_id_.find(tag_name) != nullptr);
@@ -1126,10 +1162,75 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
 
+    // Namespace operations on absolute paths. A hierarchical name's whole
+    // parent chain is stored as "$tagid{parent}/leaf" records on ONE
+    // container, so every op that creates, resolves, renames or deletes one
+    // must run there. Before this, these fell to the default (Local): a
+    // rename or unlink only mutated the caller's own container, a directory
+    // got a second tag on each node that created under it, and two nodes
+    // could both win O_EXCL on the same name.
+    case Method::kRenameTag: {
+      auto typed = task.template Cast<RenameTagTask>();
+      if (IsHierPath(typed->old_name_.str()) ||
+          IsHierPath(typed->new_name_.str())) {
+        return MetaHomeQuery();
+      }
+      return task->pool_query_;
+    }
+    case Method::kGetOrCreateTagAlias: {
+      auto typed = task.template Cast<GetOrCreateTagAliasTask>();
+      if (IsHierPath(typed->existing_name_.str()) ||
+          IsHierPath(typed->alias_name_.str())) {
+        return MetaHomeQuery();
+      }
+      return task->pool_query_;
+    }
+    case Method::kDelTag: {
+      auto typed = task.template Cast<DelTagTask>();
+      if (IsHierPath(typed->tag_name_.str())) {
+        return MetaHomeQuery();
+      }
+      if (typed->tag_name_.str().empty() && IsMetaHomeTag(typed->tag_id_)) {
+        return MetaHomeQuery();
+      }
+      return task->pool_query_;
+    }
+    case Method::kGetNumAliases: {
+      auto typed = task.template Cast<GetNumAliasesTask>();
+      if (IsHierPath(typed->tag_name_.str()) ||
+          (typed->tag_name_.str().empty() && IsMetaHomeTag(typed->tag_id_))) {
+        return MetaHomeQuery();
+      }
+      return task->pool_query_;
+    }
+    case Method::kGetTagName: {
+      auto typed = task.template Cast<GetTagNameTask>();
+      if (IsMetaHomeTag(typed->tag_id_)) {
+        return MetaHomeQuery();
+      }
+      return task->pool_query_;
+    }
+    case Method::kTagQuery: {
+      // An anchored absolute-path pattern can only match hierarchical names,
+      // which all live on the home: ask it alone (a broadcast also returned
+      // per-node duplicates). Anything else still fans out.
+      auto typed = task.template Cast<TagQueryTask>();
+      const std::string re = typed->tag_regex_.str();
+      if (re.size() >= 2 && re[0] == '^' && re[1] == '/') {
+        return MetaHomeQuery();
+      }
+      return clio::run::PoolQuery::Broadcast();
+    }
+    case Method::kTruncateBlob: {
+      // Blob-keyed: it must reach the container that OWNS the blob. The
+      // default (Local) silently truncated nothing on every other node.
+      auto typed = task.template Cast<TruncateBlobTask>();
+      return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
+    }
+
     // Broadcast operations
     case Method::kGetTagSize:
     case Method::kGetContainedBlobs:
-    case Method::kTagQuery:
     case Method::kBlobQuery:
     case Method::kEvict:
     case Method::kReorganizeHint:
@@ -1606,7 +1707,12 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
     clio::run::u32 local_node_id = ipc_manager->GetNodeId();
 
     // Check if this is a returning task from a remote canonical node
+    // Hierarchical (absolute-path) names are never cached as flat remote
+    // bindings: they are created only on the namespace home, through the
+    // chain, so a preferred id is adopted INTO the hierarchy below instead of
+    // being inserted as a flat key the hierarchy walk cannot find.
     bool is_remote_tag =
+        !IsHierPath(tag_name) &&
         (preferred_id.major_ != 0 && preferred_id.major_ != local_node_id);
 
     if (is_remote_tag) {
@@ -1622,24 +1728,17 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
       CLIO_CO_RETURN;
     }
 
-    // Existence probe BEFORE the chain, so the caller learns whether this
-    // call created the tag — clio-fs Open previously paid a separate
-    // TagQuery round trip for exactly this bit. (Two racing creators may
-    // both report created_=1; the callers' create-side effects are
-    // idempotent, and blob-level correctness never keys off created_.)
-    bool tag_existed;
-    if (IsHierPath(tag_name)) {
-      tag_existed = !ResolvePathToIdLocked(tag_name).IsNull();
-    } else {
-      tag_existed = (tag_name_to_id_.find(tag_name) != nullptr);
-    }
-
+    // created_ comes from the insert that actually won, so of several racing
+    // creators of one name exactly one sees created_=1 -- O_EXCL and mkdir
+    // exclusivity across nodes key off it.
+    //
     // Absolute paths are created as a hierarchy ("/a/b/c" -> "/", "/a", "/a/b",
     // "/a/b/c") with each child stored relative to its parent; the returned id
     // is the deepest tag. Flat names create a single tag (legacy behavior).
-    TagId tag_id = GetOrCreateTagChain(tag_name, preferred_id);
+    bool leaf_created = false;
+    TagId tag_id = GetOrCreateTagChain(tag_name, preferred_id, &leaf_created);
     task->tag_id_ = tag_id;
-    task->created_ = tag_existed ? 0u : 1u;
+    task->created_ = leaf_created ? 1u : 0u;
 
     auto now = GetCurrentTimeNs();
     {
@@ -5982,8 +6081,10 @@ clio::run::bdev::PersistenceLevel Runtime::GetPersistenceLevelForTarget(
 }
 
 TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
-                                const TagId &preferred_id) {
-
+                                const TagId &preferred_id, bool *created) {
+  if (created != nullptr) {
+    *created = false;
+  }
   // Check if tag already exists
   TagId *existing_tag_id_ptr = tag_name_to_id_.find(tag_name);
   if (existing_tag_id_ptr != nullptr) {
@@ -6031,6 +6132,9 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
   // under the first id were orphaned, surfacing as git refs pointing at
   // 'nonexistent' objects. The winner's id IS the tag.
   const bool won = tag_name_to_id_.insert(tag_name, tag_id).inserted;
+  if (created != nullptr) {
+    *created = won;
+  }
   if (!won) {
     TagId *winner = tag_name_to_id_.find(tag_name);
     if (winner != nullptr) {
@@ -6150,14 +6254,15 @@ void Runtime::RebuildTagSearchIndexLocked() {
 }
 
 TagId Runtime::GetOrCreateTagChain(const std::string &name,
-                                   const TagId &preferred_id) {
+                                   const TagId &preferred_id, bool *created) {
   if (!IsHierPath(name)) {
     // Non-path tag: a single flat tag stored verbatim (legacy behavior).
-    return GetOrAssignTagId(name, preferred_id);
+    return GetOrAssignTagId(name, preferred_id, created);
   }
   // Every absolute path is rooted at the "/" tag (stored literally).
-  TagId parent = GetOrAssignTagId(std::string("/"));
   std::vector<std::string> comps = SplitPathComponents(name);
+  TagId parent = GetOrAssignTagId(std::string("/"), TagId::GetNull(),
+                                  comps.empty() ? created : nullptr);
   if (comps.empty()) {
     // name was "/" (or all slashes): the root tag itself.
     return parent;
@@ -6166,7 +6271,8 @@ TagId Runtime::GetOrCreateTagChain(const std::string &name,
     const bool is_leaf = (i + 1 == comps.size());
     // preferred_id (a cross-node hint) only applies to the deepest tag.
     TagId id = GetOrAssignTagId(MakeRelativeName(parent, comps[i]),
-                                is_leaf ? preferred_id : TagId::GetNull());
+                                is_leaf ? preferred_id : TagId::GetNull(),
+                                is_leaf ? created : nullptr);
     parent = id;
   }
   return parent;
