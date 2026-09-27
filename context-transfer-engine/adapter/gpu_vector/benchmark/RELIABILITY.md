@@ -263,3 +263,8 @@ production layout: one runtime per node remains the design.
   the survivor). Fix in progress: idle liveness probes in ScanTaskProgress
   (peers heard from before, silent 10 s, heard-from guard), an atomic
   dead-node count, and GetPeers giving up as soon as a node is dead.
+- 2026-09-27 06:41 UTC, job 8873942: 64-node CTE stress on the idle-probe
+  libraries (probes on, 5 s interval): 64/64, 12.6 M gets, 3.7 M puts,
+  0 errors, 0 mismatches, 0 network timeouts, 0 dead marks, 0 busy re-arms,
+  0 probe-failure warnings, 125 s. Defect 15 closed (commits 7373c069,
+  e7a57d40, a6fc7bad pushed to gpu-coro-port).
