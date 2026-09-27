@@ -261,14 +261,21 @@ class Client : public clio::run::ContainerClient {
     // Bound by the CACHED PREFIX, not by the blob's total size: a truncated
     // primary record describes only its first kMaxInlineBlocks blocks, and a
     // read past them has no block to resolve against.
-    const bool primary_ok =
-        rec.IsDirectReadable() && offset + size <= rec.CoveredBytes();
+    //
+    // AND by the DECLARED size: a block's capacity can exceed the bytes the
+    // blob holds (whole-block allocation, recycled extents), so a range past
+    // total_size_ but inside CoveredBytes() would copy stale bytes -- another
+    // file's data -- where a short read belongs. The RPC path clamps it.
+    const bool primary_ok = rec.IsDirectReadable() &&
+                            offset + size <= rec.CoveredBytes() &&
+                            offset + size <= rec.total_size_;
     // Serving-replica reads only for STACK-bound clients (AttachShmCacheOf):
     // they alias the whole interposer chain, whose task path returns
     // producer bytes. A direct core client keeps stored-bytes semantics.
     const bool replica_ok = shm_replica_serving_ && !primary_ok &&
                             rec.HasServableReplica() &&
-                            offset + size <= rec.RepCoveredBytes();
+                            offset + size <= rec.RepCoveredBytes() &&
+                            offset + size <= rec.rep_total_size_;
     if (!primary_ok && !replica_ok) {
       return false;  // transformed/file/remote/GPU-tier and no serving replica
     }

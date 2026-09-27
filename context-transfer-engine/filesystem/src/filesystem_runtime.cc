@@ -240,7 +240,25 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
         capacity = static_cast<size_t>(v);
       }
     }
-    if (shm_fs_cache_.Create(capacity, task->new_pool_id_)) {
+    // The mirror is NODE-LOCAL derived state that only this container's own
+    // handlers keep honest, yet clients treat its tombstones and complete-dir
+    // misses as AUTHORITATIVE ENOENT. On a multi-node deployment every other
+    // node mutates the same namespace without touching this mirror, so a
+    // mkdir on node A read ENOENT forever on node B (and a remote unlink or
+    // resize left a live-looking record here). Coherence across nodes needs
+    // the RPC path, so the mirror is off unless the operator opts back in
+    // for a deployment whose files are never shared between nodes.
+    auto *ipc = CLIO_IPC;
+    const bool multi_node = ipc != nullptr && ipc->GetNumHosts() > 1;
+    const char *force = clio::run::env::GetCompat("CFS_SHM_MIRROR_MULTINODE");
+    const bool forced = force != nullptr && *force == '1';
+    if (multi_node && !forced) {
+      HLOG(kInfo,
+           "filesystem: shared-memory attribute cache disabled on a {}-node "
+           "deployment (node-local mirror cannot stay coherent); set "
+           "CLIO_CFS_SHM_MIRROR_MULTINODE=1 to force it on",
+           ipc->GetNumHosts());
+    } else if (shm_fs_cache_.Create(capacity, task->new_pool_id_)) {
       HLOG(kInfo,
            "filesystem: shared-memory attribute cache enabled (files={}, "
            "root_off={})",

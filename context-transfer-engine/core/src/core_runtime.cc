@@ -197,6 +197,43 @@ std::string EscapeRegexLiteral(const std::string &s) {
   return out;
 }
 
+/**
+ * Length of the part of [offset, offset + size) that lies inside a blob of
+ * `declared` bytes.
+ * @param offset   first byte of the requested range
+ * @param size     requested length
+ * @param declared the blob's declared (logical) size
+ * @return bytes that may be read; 0 when the range starts at/after the end
+ */
+size_t ClampToDeclared(size_t offset, size_t size, size_t declared) {
+  if (offset >= declared) {
+    return 0;
+  }
+  return std::min(size, declared - offset);
+}
+
+/**
+ * Zero bytes [from, size) of a read destination.
+ *
+ * Used for the part of a GetBlob request that lies past the blob's declared
+ * end, so a short read never exposes the destination buffer's old contents.
+ * Device (GPU) destinations are left alone: they are not host-addressable.
+ * @param dst  destination buffer (shared or private-memory pointer)
+ * @param from first byte to clear (the bytes actually read end here)
+ * @param size total requested length
+ */
+void ZeroReadTail(const ctp::ipc::ShmPtr<> &dst, size_t from, size_t size) {
+  if (from >= size || dst.IsNull()) {
+    return;
+  }
+  auto *ipc = CLIO_IPC;
+  char *base = ipc->ToFullPtr<char>(dst.template Cast<char>()).ptr_;
+  if (base == nullptr || ctp::IsDevicePointer(base)) {
+    return;
+  }
+  std::memset(base + from, 0, size - from);
+}
+
 // True for absolute-path names that participate in the hierarchy.
 bool IsHierPath(const std::string &name) {
   return !name.empty() && name[0] == '/';
@@ -3092,6 +3129,18 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
             ? blob_info_ptr->GetReplica(replica_sel, false)->blocks_
             : blob_info_ptr->blocks_);
 
+    // A block's CAPACITY can exceed the blob's declared size (whole-block
+    // allocation, a preallocated page, extents recycled from a freed blob),
+    // and ReadData copies whatever the blocks cover. Reading past the
+    // declared size therefore handed back stale bytes -- another file's
+    // data -- instead of a short read: a sparse file grown by ftruncate read
+    // copies of its own first write every 128 KiB inside the hole. Clamp
+    // every read to the declared size so past-EOF stays a true short read.
+    const size_t declared_size =
+        replica_sel > 0
+            ? blob_info_ptr->GetReplica(replica_sel, false)->total_size_cache_
+            : blob_info_ptr->GetTotalSize();
+
     // Step 2: Read data from blob blocks (no lock held during I/O).
     // In emulation mode (issue #747) the read is skipped entirely — the
     // caller's buffer is left untouched and no WAL/bdev traffic happens;
@@ -3105,7 +3154,13 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         for (size_t i = 0; i < task->segments_.size(); ++i) {
           const auto &seg = task->segments_[i];
           clio::run::u32 read_result = 0;
-          CLIO_CO_AWAIT(ReadData(blocks_snapshot, seg.data_, seg.size_,
+          const size_t seg_len =
+              ClampToDeclared(seg.blob_off_, seg.size_, declared_size);
+          ZeroReadTail(seg.data_, seg_len, seg.size_);
+          if (seg_len == 0) {
+            continue;
+          }
+          CLIO_CO_AWAIT(ReadData(blocks_snapshot, seg.data_, seg_len,
                             seg.blob_off_, read_result));
           if (read_result != 0) {
             task->return_code_ = read_result;
@@ -3119,8 +3174,18 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       size_t covered = 0;
       clio_evlat_add(5, clio::run::CycleNow() - ev_g0);   // metadata phase
       { const unsigned long long ev_r0 = clio::run::CycleNow();
-      CLIO_CO_AWAIT(ReadData(blocks_snapshot, blob_data_ptr, size, offset,
-                        read_result, &covered));
+      const size_t read_len = ClampToDeclared(offset, size, declared_size);
+      if (read_len > 0) {
+        CLIO_CO_AWAIT(ReadData(blocks_snapshot, blob_data_ptr, read_len,
+                               offset, read_result, &covered));
+      }
+      // The part of the request past the blob's end must come back as
+      // ZEROS, not as whatever the destination held: for a client read the
+      // destination is a recycled shared staging buffer whose full `size`
+      // bytes are copied back to the caller, so a short read handed the
+      // client stale staging contents (copies of an old sieve page appeared
+      // every 128 KiB inside a sparse file's hole after ftruncate-grow).
+      ZeroReadTail(blob_data_ptr, read_len, size);
       clio_evlat_add(4, clio::run::CycleNow() - ev_r0); }  // ReadData await
 
       if (read_result != 0) {
