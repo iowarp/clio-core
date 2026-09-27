@@ -1744,7 +1744,7 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
     {
       std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
       if (tag_info_ptr != nullptr) {
-        tag_info_ptr->last_read_ = now;
+        tag_info_ptr->last_read_ = GetWallTimeNs()  /* atime: wall clock */;
         // FAULT HANDLER registration (checkpointing / lazy copy): remember
         // which pool resolves this tag's missing blobs and with what params.
         // Re-registering overwrites -- the tag has ONE handler.
@@ -2514,7 +2514,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         TagInfo seed;
         seed.tag_id_ = tag_id;
         seed.last_modified_ = GetWallTimeNs();
-        seed.last_read_ = now;
+        seed.last_read_ = GetWallTimeNs();  // atime: wall clock
         seed.last_changed_ = seed.last_modified_;
         seed.total_size_ = 0;
         tag_info_ptr = std::make_shared<TagInfo>(seed);
@@ -3336,7 +3336,7 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     {
       std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
       if (tag_info_ptr != nullptr) {
-        tag_info_ptr->last_read_ = now;
+        tag_info_ptr->last_read_ = GetWallTimeNs()  /* atime: wall clock */;
         MirrorTagShm(tag_id, *tag_info_ptr);
       }
     }
@@ -5931,7 +5931,7 @@ clio::run::TaskResume Runtime::GetTagSize(clio::run::shared_ptr<GetTagSizeTask> 
 
     // Update access timestamp and return the total size
     auto now = GetCurrentTimeNs();
-    tag_info_ptr->last_read_ = now;
+    tag_info_ptr->last_read_ = GetWallTimeNs()  /* atime: wall clock */;
     task->return_code_ = 0;
 
     // Log telemetry for GetTagSize operation

@@ -271,6 +271,23 @@ class Runtime : public clio::run::Container {
                                                const clio::cte::core::TagId &tag,
                                                clio::run::u64 seed_size);
 
+  /**
+   * Record holding a DIRECTORY's mode/owner/time overrides, keyed by the
+   * dir's own tag in by_tag_ only (by_path_ is files). Caller holds meta_mu_.
+   * @param tag  the directory's tag
+   * @param path the directory's path (informational)
+   * @return the directory's record, created if needed
+   */
+  std::shared_ptr<FileInfo> DirInfoLocked(const clio::cte::core::TagId &tag,
+                                          const std::string &path);
+
+  /**
+   * Drop a directory's utimens mtime override after an entry change (which
+   * sets the directory's real mtime). Takes meta_mu_.
+   * @param tag the directory's tag
+   */
+  void ClearDirTimeOverrides(const clio::cte::core::TagId &tag);
+
   void MirrorFile(const std::string &path, const FileInfo &fi,
                   clio::run::u32 extra_flags = 0);
 

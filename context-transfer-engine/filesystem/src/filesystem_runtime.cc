@@ -91,6 +91,20 @@ inline const char *SymlinkMarker() { return "__clio_symlink__"; }
       auto _tt = cte_.AsyncTruncateBlob(_tp->tag_id_, TsTouchBlob(), 0,      \
                                         clio::run::PoolQuery::Local());      \
       CLIO_CO_AWAIT(_tt);                                                    \
+      ClearDirTimeOverrides(_tp->tag_id_);                                   \
+    }                                                                        \
+  } while (0)
+/** Bump only the ctime of directory `dirpath` (its tag's ctime sentinel). */
+#define CLIO_FS_TOUCH_DIR_CTIME(dirpath)                                    \
+  do {                                                                       \
+    auto _tp = cte_.AsyncGetOrCreateTag(                                     \
+        (dirpath), clio::cte::core::TagId::GetNull(),                        \
+        clio::run::PoolQuery::Dynamic());                                    \
+    CLIO_CO_AWAIT(_tp);                                                      \
+    if (_tp->GetReturnCode() == 0) {                                         \
+      auto _tc = cte_.AsyncTruncateBlob(_tp->tag_id_, TsCtimeBlob(), 0,      \
+                                        clio::run::PoolQuery::Local());      \
+      CLIO_CO_AWAIT(_tc);                                                    \
     }                                                                        \
   } while (0)
 /** Escape regex metacharacters for an exact TagQuery match (from libfuse). */
@@ -290,6 +304,31 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 // (set_mode_/set_uid_/set_gid_/set_atime_/...) are live, since those are
 // guarded by it. size_ is atomic and safe to read either way.
 
+std::shared_ptr<Runtime::FileInfo> Runtime::DirInfoLocked(
+    const clio::cte::core::TagId &tag, const std::string &path) {
+  const clio::run::u64 packed =
+      (static_cast<clio::run::u64>(tag.major_) << 32) |
+      static_cast<clio::run::u64>(tag.minor_);
+  auto &slot = by_tag_[packed];
+  if (slot == nullptr || slot->tag_id_ != tag) {
+    slot = std::make_shared<FileInfo>();
+    slot->tag_id_ = tag;
+    slot->path_ = path;
+  }
+  return slot;
+}
+
+void Runtime::ClearDirTimeOverrides(const clio::cte::core::TagId &tag) {
+  const clio::run::u64 packed =
+      (static_cast<clio::run::u64>(tag.major_) << 32) |
+      static_cast<clio::run::u64>(tag.minor_);
+  std::lock_guard<std::mutex> g(meta_mu_);
+  auto it = by_tag_.find(packed);
+  if (it != by_tag_.end() && it->second->tag_id_ == tag) {
+    it->second->set_mtime_ = 0;  // the entry change IS the new mtime
+  }
+}
+
 std::shared_ptr<Runtime::FileInfo> Runtime::BindFileInfoLocked(
     const std::string &path, const clio::cte::core::TagId &tag,
     clio::run::u64 seed_size) {
@@ -319,6 +358,13 @@ void Runtime::MirrorFile(const std::string &path, const FileInfo &fi,
                          clio::run::u32 extra_flags) {
   if (!shm_fs_cache_.IsEnabled()) {
     return;
+  }
+  // A record shared by several NAMES (hard links) is refreshed on size
+  // changes only under its primary path (fi.path_), so a secondary name's
+  // mirror entry would serve a stale size forever: publish it refusing the
+  // fast path, which sends its stat to the task and the shared record.
+  if (path != fi.path_) {
+    extra_flags |= kShmFileNoFastPath;
   }
   ShmFileRecord rec;
   rec.tag_id_ = fi.tag_id_;
@@ -499,6 +545,15 @@ clio::run::TaskResume Runtime::AdvanceSize(
   if (fi == nullptr) {
     task->return_code_ = ENOENT;
     CLIO_CO_RETURN;
+  }
+  // A size push means the file was WRITTEN (the adapter only sends one for
+  // a handle that wrote), and a write supersedes any utimens mtime override
+  // -- the data path goes straight to the page blobs and never passes the
+  // Write handler that used to clear it, so an old `touch -d` mtime stuck
+  // to the file through every later write.
+  {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    fi->set_mtime_ = 0;
   }
   if (task->reserve_ != 0) {
     task->old_size_ = fi->size_.fetch_add(task->size_);
@@ -1048,6 +1103,26 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
         task->mtime_ = ds->mtime_;
         task->atime_ = ds->atime_;
       }
+      // chmod/chown/utimens on a directory record overrides in the dir tag's
+      // FileInfo, exactly as for files; without reading them back every
+      // directory reported 0755 (rsync -a re-sent every directory, and
+      // mkdir -m 700 was silently ignored).
+      {
+        const clio::run::u64 dpacked =
+            (static_cast<clio::run::u64>(tag->tag_id_.major_) << 32) |
+            static_cast<clio::run::u64>(tag->tag_id_.minor_);
+        std::lock_guard<std::mutex> g(meta_mu_);
+        auto it = by_tag_.find(dpacked);
+        if (it != by_tag_.end() && it->second->tag_id_ == tag->tag_id_) {
+          const FileInfo &fi = *it->second;
+          if (fi.set_mtime_ != 0) task->mtime_ = fi.set_mtime_;
+          if (fi.set_atime_ != 0) task->atime_ = fi.set_atime_;
+          if (fi.set_ctime_ > task->ctime_) task->ctime_ = fi.set_ctime_;
+          task->uid_ = fi.set_uid_;
+          task->gid_ = fi.set_gid_;
+          task->mode_ = fi.set_mode_;
+        }
+      }
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
@@ -1072,6 +1147,25 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
       task->ctime_ = s->ctime_;
       task->mtime_ = s->mtime_;
       task->atime_ = s->atime_;
+    }
+    // Another NAME of this file (the canonical path of a hard link, say) may
+    // hold the live record: its logical size and mode/owner/time overrides
+    // belong to the FILE, not to the name that was opened. Without this a
+    // fresh hard link stat'ed 0644 while its source was 0444 (git's local
+    // clone aborts: "hardlink different from source").
+    {
+      std::lock_guard<std::mutex> g(meta_mu_);
+      auto it = by_tag_.find(packed);
+      if (it != by_tag_.end() && it->second->tag_id_ == tid) {
+        const FileInfo &fi = *it->second;
+        task->size_ = fi.size_.load();
+        if (fi.set_mtime_ != 0) task->mtime_ = fi.set_mtime_;
+        if (fi.set_atime_ != 0) task->atime_ = fi.set_atime_;
+        if (fi.set_ctime_ > task->ctime_) task->ctime_ = fi.set_ctime_;
+        task->uid_ = fi.set_uid_;
+        task->gid_ = fi.set_gid_;
+        task->mode_ = fi.set_mode_;
+      }
     }
     // Symlink probe: only in the exact-file branch (one extra RPC per file
     // stat). A tag carrying the reserved marker blob is a symlink; its size is
@@ -2010,7 +2104,27 @@ clio::run::TaskResume Runtime::Utimens(clio::run::shared_ptr<UtimensTask> &task)
     auto q = cte_.AsyncTagQuery(child_re, 1, clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(q);
     if (q->GetReturnCode() == 0 && !q->results_.empty()) {
-      CLIO_FS_TOUCH_DIR(path);
+      // Bump ctime (and the natural mtime) first: the touch clears any older
+      // override, then the requested exact values are recorded on the dir's
+      // own record (Getattr's dir branch reads them). Before, a directory's
+      // utimens lived only in the adapter's 2 s overlay: rsync -a / cp -a
+      // restored directory mtimes that reverted seconds later.
+      // ctime only: chmod/chown/utimens change a directory's METADATA, not
+      // its entries, so its mtime must not move (a mtime bump here also
+      // raced rsync's detached utimens of the same dir and undid it).
+      CLIO_FS_TOUCH_DIR_CTIME(path);
+      auto dt = cte_.AsyncGetOrCreateTag(path, clio::cte::core::TagId::GetNull(),
+                                         clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(dt);
+      if (dt->GetReturnCode() == 0) {
+        std::lock_guard<std::mutex> g(meta_mu_);
+        auto slot = DirInfoLocked(dt->tag_id_, path);
+        if (a_now) slot->set_atime_ = now;
+        else if (a_set) slot->set_atime_ = task->atime_ns_;
+        if (m_now) slot->set_mtime_ = now;
+        else if (m_set) slot->set_mtime_ = task->mtime_ns_;
+        slot->set_ctime_ = now;
+      }
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
@@ -2070,7 +2184,25 @@ clio::run::TaskResume Runtime::Chown(clio::run::shared_ptr<ChownTask> &task) {
     auto q = cte_.AsyncTagQuery(child_re, 1, clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(q);
     if (q->GetReturnCode() == 0 && !q->results_.empty()) {
-      CLIO_FS_TOUCH_DIR(path);
+      // Directory: keep its mode/owner overrides keyed by the dir's own tag
+      // (by_tag_ only -- by_path_ holds FILES and getattr's tracked branch
+      // would report a dir found there as a regular file). Getattr's dir
+      // branch reads them back; before, chmod/chown of a directory was a
+      // silent no-op.
+      auto dt = cte_.AsyncGetOrCreateTag(path, clio::cte::core::TagId::GetNull(),
+                                         clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(dt);
+      if (dt->GetReturnCode() == 0) {
+        std::lock_guard<std::mutex> g(meta_mu_);
+        auto slot = DirInfoLocked(dt->tag_id_, path);
+        if (task->uid_ != 0xFFFFFFFFu) slot->set_uid_ = task->uid_;
+        if (task->gid_ != 0xFFFFFFFFu) slot->set_gid_ = task->gid_;
+        if (task->mode_ != 0xFFFFFFFFu) slot->set_mode_ = task->mode_ & 07777u;
+      }
+      // ctime only: chmod/chown/utimens change a directory's METADATA, not
+      // its entries, so its mtime must not move (a mtime bump here also
+      // raced rsync's detached utimens of the same dir and undid it).
+      CLIO_FS_TOUCH_DIR_CTIME(path);
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }

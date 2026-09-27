@@ -175,9 +175,33 @@ bool MultiNode() {
     if (const char *e = getenv("CLIO_FUSE_MULTINODE")) {
       return *e == '1';
     }
-    auto *cfg = CLIO_CONFIG_MANAGER;
-    if (cfg == nullptr) return false;
-    const std::string hf = cfg->GetHostfilePath();
+    // Read the hostfile path straight from the server config: this runs
+    // from cte_fuse_init, BEFORE CLIO_INIT has loaded the config manager,
+    // and the answer is cached for the life of the mount.
+    std::string hf;
+    if (const char *conf = getenv("CLIO_SERVER_CONF")) {
+      FILE *cf = fopen(conf, "r");
+      if (cf != nullptr) {
+        char cl[1024];
+        while (fgets(cl, sizeof(cl), cf) != nullptr) {
+          const char *k = strstr(cl, "hostfile:");
+          if (k == nullptr || cl[0] == '#') continue;
+          const char *v = k + strlen("hostfile:");
+          while (*v == ' ' || *v == '\t' || *v == '"' || *v == '\'') ++v;
+          std::string val(v);
+          while (!val.empty() && strchr(" \t\r\n\"'", val.back())) {
+            val.pop_back();
+          }
+          hf = val;
+          break;
+        }
+        fclose(cf);
+      }
+    }
+    if (hf.empty()) {
+      auto *cfg = CLIO_CONFIG_MANAGER;
+      if (cfg != nullptr) hf = cfg->GetHostfilePath();
+    }
     if (hf.empty()) return false;
     FILE *f = fopen(hf.c_str(), "r");
     if (f == nullptr) return false;
@@ -238,11 +262,18 @@ static clio::run::u64 WallNowNs() {
           .count());
 }
 
+void TimesOverlayDropMtime(const std::string &p);
+
 void HiwaterRaise(const std::string &path, clio::run::u64 end) {
-  std::lock_guard<std::mutex> lk(g_hw_mtx);
-  auto &v = g_hiwater[path];
-  if (end > v) v = end;
-  g_wtime[path] = WallNowNs();
+  {
+    std::lock_guard<std::mutex> lk(g_hw_mtx);
+    auto &v = g_hiwater[path];
+    if (end > v) v = end;
+    g_wtime[path] = WallNowNs();
+  }
+  // A write supersedes a pending utimens mtime (the 2 s overlay would
+  // otherwise keep reporting the stamped time over the write).
+  TimesOverlayDropMtime(path);
 }
 
 /**
@@ -464,6 +495,16 @@ void TimesOverlaySet(const std::string &p, clio::run::u64 a,
                      clio::run::u64 m, clio::run::u64 c) {
   std::lock_guard<std::mutex> lk(g_to_mtx);
   g_times_overlay[p] = TimesOverlay{a, m, c, std::chrono::steady_clock::now()};
+}
+
+/**
+ * Forget the mtime part of a path's utimens overlay (a later write owns it).
+ * @param p the file's path
+ */
+void TimesOverlayDropMtime(const std::string &p) {
+  std::lock_guard<std::mutex> lk(g_to_mtx);
+  auto it = g_times_overlay.find(p);
+  if (it != g_times_overlay.end()) it->second.mtime_ns = 0;
 }
 
 bool TimesOverlayGet(const std::string &p, TimesOverlay *out) {
@@ -765,7 +806,12 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   // after a hard link) can read stale for up to the TTL. Workloads that need
   // strict coherence run with CLIO_FUSE_ATTR_CACHE_S=0, which restores the
   // old every-op-goes-to-the-chimod behavior exactly.
-  double attr_ttl = 1.0;
+  // Multi-node mounts default to 0: with a TTL the kernel keeps the size it
+  // last saw for up to the TTL, and neither stat nor open refreshes it, so a
+  // reader on another node clamped reads to a pre-extension size (close-to-
+  // open broken; the cross-node fsx model check diverged right after a
+  // remote truncate). An explicit CLIO_FUSE_ATTR_CACHE_S opts back in.
+  double attr_ttl = MultiNode() ? 0.0 : 1.0;
   if (const char *ttl_env = getenv("CLIO_FUSE_ATTR_CACHE_S")) {
     if (*ttl_env != '\0') attr_ttl = atof(ttl_env);
   }
@@ -1308,14 +1354,15 @@ int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
   flags |= 0x4u | 0x8u;
 #endif
   auto *cfs = CLIO_CFS_CLIENT;
-  // Fire-and-forget by default: the kernel's writeback SETATTR stamps mtime
-  // on EVERY dirtied file at flush time, and awaiting each one put a full
-  // round trip per file on checkout-shaped workloads. A utimens on a missing
-  // path is silently dropped in detached mode (the next getattr tells the
-  // truth); CLIO_FUSE_ASYNC_UTIMENS=0 restores the awaited call.
+  // AWAITED by default. Fire-and-forget (CLIO_FUSE_ASYNC_UTIMENS=1) was
+  // built for writeback-cache SETATTR storms, but writeback is off by
+  // default, and a detached stamp REORDERS with the caller's next
+  // operations: rsync -a / cp -a / tar restore a directory's mtime and a
+  // later dir operation could land first and undo it (a second rsync
+  // re-sent directories), and a missing path's stamp was dropped silently.
   static const bool async_utimens = [] {
     const char *e = getenv("CLIO_FUSE_ASYNC_UTIMENS");
-    return e == nullptr || *e != '0';
+    return e != nullptr && *e == '1' && !MultiNode();
   }();
   if (async_utimens) {
     std::string p(path);
@@ -1507,13 +1554,20 @@ static bool NameTooLong(const char *path) {
 }
 
 int cte_fuse_mkdir(const char *path, cte_mode_t mode) {
-  (void)mode;
   if (NameTooLong(path)) return -ENAMETOOLONG;
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncMkdir(std::string(path));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());  // errno-style (0/EEXIST/EIO)
-  return rc == 0 ? 0 : -rc;
+  if (rc != 0) return -rc;
+  // The kernel hands us the umask-applied mode; anything but the synthesized
+  // default must be recorded (mkdir -m 700 / private temp dirs).
+  const clio::run::u32 perm = static_cast<clio::run::u32>(mode) & 07777u;
+  if (perm != 0755u) {
+    auto c = cfs->AsyncChmod(std::string(path), perm);
+    c.Wait();
+  }
+  return 0;
 }
 
 int cte_fuse_rmdir(const char *path) {
