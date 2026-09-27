@@ -785,6 +785,9 @@ clio::run::TaskResume Runtime::InodeTruncate(const FsReq &req, FsResp &resp) {
     CLIO_CO_AWAIT(zp);
     ipc->FreeBuffer(zbuf);
     if (zp->GetReturnCode() != 0) {
+      HLOG(kWarning, "filesystem: zeroing truncated tail of {} page {} "
+           "[{}, +{}) failed rc={}", req.id_, boundary_page, zoff, zlen,
+           zp->GetReturnCode());
       resp.rc_ = EIO;
       CLIO_CO_RETURN;
     }

@@ -777,6 +777,10 @@ clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &tas
   // gone for everyone but this descriptor's stale view).
   task->return_code_ =
       (tr.rc_ == ENOENT && task->tag_packed_ != 0) ? 0 : tr.rc_;
+  if (task->return_code_ != 0) {
+    HLOG(kWarning, "filesystem: truncate of {} (id {}) to {} failed rc={}",
+         path, r.id_, r.a_, task->return_code_);
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

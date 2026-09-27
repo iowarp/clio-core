@@ -5606,15 +5606,21 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
       // The self entry is keyed by exactly del_abs, so delete it directly --
       // no need to compile a std::regex to rediscover a key we already hold
       // (#680; this runs on every unlink/rmdir). Delete() is a no-op if absent.
-      tag_search_.Delete(del_abs);
-      // Descendants still need the trigram-prefiltered prefix search; a leaf
-      // (the common case for file unlink) matches nothing and returns fast.
-      std::string esc = EscapeRegexLiteral(del_abs);
-      auto descendants = tag_search_.Search("^" + esc + "/.*");
-      // keys() is a snapshot independent of the engine's maps, so deleting from
-      // the engine while iterating it is safe.
-      for (const auto &k : descendants.keys()) {
-        tag_search_.Delete(k);
+      if (!del_abs.empty()) tag_search_.Delete(del_abs);
+      // Descendants need the prefix search -- but only a hierarchy node can
+      // have any. For a flat or NAMELESS tag (a node's accounting share of a
+      // file whose pages it holds) del_abs is "" and the pattern "^/.*"
+      // matched every path on the node: an O(all tags) sweep per delete.
+      TagId sweep_parent;
+      std::string sweep_leaf;
+      if (canonical == "/" || ParseTagRef(canonical, sweep_parent, sweep_leaf)) {
+        std::string esc = EscapeRegexLiteral(del_abs);
+        auto descendants = tag_search_.Search("^" + esc + "/.*");
+        // keys() is a snapshot independent of the engine's maps, so deleting
+        // from the engine while iterating it is safe.
+        for (const auto &k : descendants.keys()) {
+          tag_search_.Delete(k);
+        }
       }
     }
 
@@ -8634,6 +8640,7 @@ clio::run::TaskResume Runtime::ModifyExistingData(
   // Vector to store async write tasks for later waiting
   std::vector<clio::run::Future<clio::run::bdev::WriteTask>> write_tasks;
   std::vector<size_t> expected_write_sizes;
+  std::vector<std::pair<clio::run::u64, clio::run::u64>> write_targets;
 
   // Step 2: Store the offset of the block in the blob. Normally the first block
   // is at offset 0; a tail-write hint lets the caller start mid-list (the block
@@ -8733,6 +8740,8 @@ clio::run::TaskResume Runtime::ModifyExistingData(
                                                   data_ptr, write_size);
       write_tasks.push_back(std::move(write_task));
       expected_write_sizes.push_back(write_size);
+      write_targets.emplace_back(block.bdev_client_.pool_id_.ToU64(),
+                                 bdev_block.offset_);
       timer.Pause();
       t_async_send_ms += timer.GetMsec();
       timer.Reset();
@@ -8768,8 +8777,10 @@ clio::run::TaskResume Runtime::ModifyExistingData(
       // LCOV_EXCL_START same issue-#705 race, after the settle gave up.
       HLOG(kError,
            "ModifyExistingData: WRITE FAILED - task[{}] wrote {} bytes, "
-           "expected {}",
-           task_idx, task->bytes_written_, expected_size);
+           "expected {} (bdev pool {} offset {} rc={})",
+           task_idx, task->bytes_written_, expected_size,
+           write_targets[task_idx].first, write_targets[task_idx].second,
+           task->GetReturnCode());
       error_code = 1;
       CLIO_CO_RETURN;
       // LCOV_EXCL_STOP
