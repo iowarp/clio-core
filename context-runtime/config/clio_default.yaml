@@ -52,6 +52,11 @@ runtime:
   #                            deployment that prefers a prompt EIO over a 30 s
   #                            stall per operation while a node is down; keep
   #                            the defaults to ride out peer restarts.
+  #   CLIO_NET_DEAD_FAIL_FAST  default 0 -- 1 = a task addressed to a peer
+  #                            already declared dead fails immediately instead
+  #                            of waiting out the retry window (recommended for
+  #                            filesystem deployments: a path lookup is one RPC
+  #                            per component, so the window multiplies).
   learning_rate: 0.2                   # SGD learning rate for task load prediction model
   # conf_dir: /tmp/clio_$USER          # default: the per-user runtime directory (same
                                        # as the memfd links). Learned task-stat models are

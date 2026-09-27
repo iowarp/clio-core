@@ -288,7 +288,8 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
 
     if (!ipc_manager->IsAlive(target_node_id)) {
       float net_timeout = origin_task->pool_query_.GetNetTimeout();
-      if (net_timeout >= 0 && net_timeout < 0.001f) {
+      if ((net_timeout >= 0 && net_timeout < 0.001f) ||
+          Run2RunFailFastDead()) {
         HLOG(kWarning,
              "[SendIn] Task {} target node {} is dead, net_timeout=0 -> skip",
              origin_task->task_id_, target_node_id);

@@ -172,6 +172,8 @@ class Cluster:
                                                '10')
     e['CLIO_NET_RETRY_TIMEOUT_S'] = os.environ.get(
         'CLIO_SUITE_NET_RETRY_TIMEOUT_S', '10')
+    e['CLIO_NET_DEAD_FAIL_FAST'] = os.environ.get(
+        'CLIO_SUITE_NET_DEAD_FAIL_FAST', '1')
     if self.attr_cache_s is not None:
       e['CLIO_FUSE_ATTR_CACHE_S'] = str(self.attr_cache_s)
     e.update(self.extra_env)

@@ -75,6 +75,24 @@ static constexpr float kRun2RunRetryTimeoutSec = 30.0f;
  * a node is down lowers it.
  * @return the retry window in seconds
  */
+/**
+ * CLIO_NET_DEAD_FAIL_FAST=1: a task addressed to a peer already DECLARED
+ * dead fails at once (network-timeout RC; a broadcast answers from the
+ * reachable peers) instead of waiting out the retry window. For clients
+ * such as a filesystem, where one user operation is a chain of RPCs (a path
+ * lookup is one per component), the retry window otherwise multiplies into
+ * minutes per syscall while a node is down. Off by default: the retry
+ * window is what lets tasks ride out a peer's restart.
+ * @return true when fail-fast is enabled
+ */
+inline bool Run2RunFailFastDead() {
+  static const bool v = [] {
+    const char *e = std::getenv("CLIO_NET_DEAD_FAIL_FAST");
+    return e != nullptr && *e == '1';
+  }();
+  return v;
+}
+
 inline float Run2RunRetryTimeoutSec() {
   static const float v = [] {
     const char *e = std::getenv("CLIO_NET_RETRY_TIMEOUT_S");
