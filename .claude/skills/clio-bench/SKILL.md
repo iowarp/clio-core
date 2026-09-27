@@ -43,6 +43,10 @@ behind them.
    into "wrong checksum, no error". Build it with
    `context-transfer-engine/benchmark/build_stress_aurora.sh`; it is
    subject to the same staleness check as the GPU binaries.
+   Bandwidth rungs `bw_2r bw_4r_scalar` (not in the default set) exercise
+   `--bw`, the IOR-shaped write / read-back / read-shifted mode that
+   `context-transfer-engine/benchmark/pbs_bw_aurora.sh` runs at scale next to
+   IOR on the DAOS pool (`IOWarp`); run them before submitting that job.
 5. **Iterate on a held dev node**, not on the queue: `qsub -v
    DEVNODE_DIR=<flare dir> pbs_devnode_aurora.sh` (1 node, debug queue, 1 h)
    executes scripts dropped into `<dir>/queue/`, output in `<dir>/out/`.

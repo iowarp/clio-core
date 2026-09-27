@@ -90,6 +90,25 @@ cell_deck() {
 }
 
 # ---- one cell --------------------------------------------------------------
+# Kill the previous cell's stragglers on every node and wait for the runtime
+# ports to close. FAILFAST kills the launcher, but the ranks it tore down take
+# seconds to exit; the next cell's ranks then found port 9461 bound, attached
+# as CLIENTS to a dying runtime and segfaulted on all 63 surviving nodes
+# (8873625: one GPU fault turned into two failed cells).
+e5_sweep() {
+  mpiexec -n "${NRANKS}" --ppn 1 --hosts "$(sort -u "${PBS_NODEFILE}" | paste -sd,)" bash -c '
+    pkill -KILL -f "clio_[a-z_]*_paged_newcoro_ao[t]" 2>/dev/null
+    for i in $(seq 1 60); do
+      busy=0
+      for port in 9460 9461; do
+        (exec 3<>/dev/tcp/127.0.0.1/${port}) 2>/dev/null && busy=1
+      done
+      [ "${busy}" = 0 ] && exit 0
+      sleep 1
+    done
+    echo "SWEEP: runtime port still bound on $(hostname) after 60 s"' 2>&1 | head -5
+}
+
 run_cell() {
   local wl=${1%%:*} gb=${1#*:}
   local label="${wl}_hbm${gb}"
@@ -100,6 +119,7 @@ run_cell() {
     LAST_RC=99; LAST_DIR=""  # the retry loop below reads these (set -u)
     return
   fi
+  e5_sweep
   mkdir -p "${rundir}"; rm -f "${rundir}"/rank*.log
   e5_conf "${rundir}"
   echo "--- ${label}: ${ARGS} ---"

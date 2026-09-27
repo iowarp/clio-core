@@ -213,3 +213,53 @@ production layout: one runtime per node remains the design.
   (97250a23 FlushData atomic move + WAL mutex, 689f47e3 flush-race test):
   stress ladder 9/9, kmeans GPU ladder PASS, colocated suite 21/21 (7 cases
   including late_peer); torn-read test and both same-blob variants pass.
+- 2026-09-27 03:40 UTC: `clio_cte_vector_stress --bw` added (write, read
+  back, read the next node's pages, barrier-fenced, BW line per node) with
+  ladder rungs bw_2r / bw_4r_scalar (pass, 0 errors); `pbs_bw_aurora.sh`
+  runs 100 GiB through IOR on DAOS (DFS ppn 8/32, POSIX+pil4dfs) and through
+  clio (t32b16, t64b32) on the same 64 nodes; job 8873592. GPU binaries
+  rebuilt on the final libraries; E5 64-node GPU rerun queued behind it.
+- 2026-09-27 04:37 UTC, jobs 8873592 / 8873651 (64 nodes, 100 GiB per
+  phase, 1 MiB transfers, GB/s by the slowest node): DAOS DFS, default
+  container (rd_fac 3): 249 write / 468 read at 8 ranks per node, 352 / 550
+  at 32; rd_fac 0 SX container at 32 ranks: 952 / 1034; POSIX via dfuse +
+  pil4dfs at 8 ranks: 230 / 421. clio (1 embedded runtime per node, 32
+  client threads, batches of 16): cold write 84-92, warm rewrite 160-191,
+  read 133-165, shifted read 163-187; CLIO_PREFAULT=4GB lifts the cold
+  write to 122-131; 16 or 32 runtime workers do not beat 8. Zero errors in
+  all six clio runs. Cold memory (sparse RAM tier populated in the write
+  path, sparse main segment) is a 2.3x factor on first-touch writes.
+  Harness: the dfuse launcher's dbcast hung 20 min once (killed by hand);
+  IOR DFS refuses an object class the container's rd_fac cannot honour.
+- 2026-09-27 05:10 UTC, GPU host-address fault ROOT CAUSE (defect 6's open
+  half). E5 at 64 nodes on the 04:00 libraries failed 4 of 4 cell attempts
+  on four distinct nodes (8873625, 8873678): kmeans rank 62 OUT_OF_RESOURCES,
+  rank 40 and rank 5 "Segmentation fault from GPU at 0x14.. NotPresent
+  Read", grayscott ranks 57 and 60 OUT_OF_RESOURCES; 16 nodes passed twice.
+  Cause: GpuApi::Memcpy on SYCL was a raw queue memcpy, and gpu_vector
+  uploads pages from std::vector staging (PrefetchShared, Copy, table and
+  task uploads), so Level Zero mapped PAGEABLE heap as a userptr; the
+  compute nodes run THP 'always' with khugepaged active (33k collapses on
+  one node), which moves those pages under the mapping mid-copy. The SYCL
+  build also took the device-task slot scratch from new[] (GPU writes it via
+  the ring stream). Fix: GpuApi::Memcpy and MemcpyAsync(stream=nullptr)
+  route through DeviceAwareMemcpy's per-thread pinned USM bounce
+  (gpu_api.h); the slot scratch comes from a USM-host slab pool on SYCL as
+  it does from cudaHostAlloc on CUDA (ipc_gpu2cpu.cc). Harness: pbs_e5
+  e5_sweep() kills stragglers and waits for the runtime ports between
+  cells (a dying cell's port made the next cell's 63 ranks attach as
+  clients and segfault). Validation on the fixed libraries (dev node
+  8873806): stress ladder 6/6, kmeans ladder PASS, grayscott ladder PASS;
+  E5 64 nodes resubmitted (8873847).
+- 2026-09-27 05:48 UTC, job 8873847: E5 at 64 nodes on the pinned-bounce
+  libraries PASSES: kmeans 64/64 (161 s, checksum 30720.000051, matching
+  the ladder), grayscott 64/64 (345 s, v_checksum 3185441526.3441 identical
+  on every rank). The old binaries were 0/4 on the same cells an hour
+  earlier. Defect 6's GPU host-address fault is closed.
+- Open, defect 15: a survivor that waits on a blob it owns itself never
+  sends the dead peer anything, so no liveness probe fires and it fails only
+  through its own collective timeout (120 s). peer_death reproduces it 2 of
+  4 runs (the kill lands around iteration 175, whose reduce blob hashes to
+  the survivor). Fix in progress: idle liveness probes in ScanTaskProgress
+  (peers heard from before, silent 10 s, heard-from guard), an atomic
+  dead-node count, and GetPeers giving up as soon as a node is dead.

@@ -17,6 +17,8 @@
 #   fast_1r_nogen    1 rank, 64 threads, non-generational LOCAL reads      (torn read, zero-IPC path)
 #   bar_4r           4 ranks, 300 barrier-only rounds                      (gate exchange)
 #   soak_4r          4 ranks, 12 steps, checkpoint every step, 2000 rounds
+#   bw_2r, bw_4r_scalar  bandwidth mode (write, read back, read shifted); not
+#                    in the default set, run before a pbs_bw_aurora.sh job
 #
 # Environment: BENCH_TIERS / CLIO_MAIN_SEGMENT_SIZE as run_colocated.sh reads
 # them (defaults below suit a 512 GB node), STRESS_EXE to override the binary.
@@ -45,6 +47,8 @@ args() {
     fast_1r_nogen) echo 1 300 --pages-per-node 2048 --page-kb 1024 --threads 64 --steps 6 --halo 2 --stream 4 --batch 1 --no-gen ;;
     bar_4r)        echo 4 300 --pages-per-node 64 --page-kb 64 --threads 4 --steps 1 --halo 1 --stream 0 --batch 1 --barriers 300 ;;
     soak_4r)       echo 4 500 --pages-per-node 512 --page-kb 1024 --threads 16 --steps 12 --halo 1 --stream 2 --batch 16 --ckpt-every 1 --barriers 2000 ;;
+    bw_2r)         echo 2 300 --bw --pages-per-node 512 --page-kb 1024 --threads 16 --batch 16 ;;
+    bw_4r_scalar)  echo 4 300 --bw --pages-per-node 256 --page-kb 1024 --threads 8 --batch 1 ;;
     *) return 1 ;;
   esac
 }
@@ -59,7 +63,7 @@ rung() {
   BENCH_CAP=${cap} bash "${bench}/run_colocated.sh" "${n}" "${dir}" "${exe}" "$@" --barrier-timeout 60 > "${dir}.out" 2>&1
   rc=$?
   for (( r = 0; r < n; ++r )); do
-    grep -a '^STRESS \|^  barriers' "${dir}/rank${r}.log" | cut -c1-300
+    grep -a '^STRESS \|^BW \|^  barriers\|^  write' "${dir}/rank${r}.log" | cut -c1-300
     grep -a '^STRESS ERROR\|timed out' "${dir}/rank${r}.log" | head -4
   done
   grep -a 'STALE' "${dir}.out" | head -1

@@ -61,6 +61,10 @@
  * node count where the vector fails, the defect is on the device side; if it
  * fails, it is clio-core's.
  *
+ * --bw replaces the steps with IOR's shape (write, read back, read the next
+ * node's pages, each barrier-fenced and timed) and prints a BW line, for
+ * comparing clio's transfer rate with a parallel file system's.
+ *
  * One process per node; each embeds its runtime (CLIO_INIT(kClient, true))
  * unless CLIO_STRESS_ATTACH=1. Runs under run_colocated.sh unchanged.
  */
@@ -101,6 +105,7 @@ struct Args {
   u32 ckpt_every = 0;         // checkpoint after every k steps; 0 = never
   int barrier_timeout_s = 300;
   u32 barriers = 0;           // extra barrier-only rounds after the steps
+  bool bw = false;            // bandwidth mode: write, read back, read shifted
   u32 max_error_lines = 8;
 };
 
@@ -122,12 +127,13 @@ bool ParseArgs(int argc, char **argv, Args &a) {
     else if (k == "--ckpt-every") a.ckpt_every = static_cast<u32>(std::atoi(next()));
     else if (k == "--barrier-timeout") a.barrier_timeout_s = std::atoi(next());
     else if (k == "--barriers") a.barriers = static_cast<u32>(std::atoi(next()));
+    else if (k == "--bw") a.bw = true;
     else {
       std::fprintf(stderr,
                    "usage: %s [--nodes N --node r] [--pages-per-node P] "
                    "[--page-kb K] [--threads T] [--steps S] [--halo H] "
                    "[--stream R] [--no-gen] [--batch B] [--ckpt-every k] "
-                   "[--barrier-timeout s] [--barriers N]\n",
+                   "[--barrier-timeout s] [--barriers N] [--bw]\n",
                    argv[0]);
       return false;
     }
@@ -229,8 +235,81 @@ class VectorStress {
     return true;
   }
 
+  /**
+   * Bandwidth mode: the IOR write/read shape over the CTE, for comparing a
+   * parallel file system's transfer rate with clio's. Barrier-fenced phases
+   * over P pages per node: write them, read them back, read the next node's
+   * pages (IOR's -C reorder: a reader never sees its own writer's caches),
+   * then write and read them once more warm. Blob names hash to owners, so every phase moves
+   * (N-1)/N of its bytes over the network regardless of who wrote them.
+   * Each phase is timed locally from the barrier that opens it to this
+   * node's last completion; the job script takes the slowest node, as IOR
+   * does, and divides the aggregate bytes by it.
+   */
+  bool RunBandwidth() {
+    const u64 first = a_.node * a_.pages_per_node;
+    const u64 bytes = a_.pages_per_node * page_bytes_;
+    const u64 shifted = ((a_.node + 1) % a_.nodes) * a_.pages_per_node;
+    std::printf("cte bandwidth: nodes=%u node=%u pages/node=%llu page_kb=%llu threads=%u "
+                "batch=%u bytes/node=%llu\n",
+                a_.nodes, a_.node, (unsigned long long)a_.pages_per_node,
+                (unsigned long long)a_.page_kb, a_.threads, a_.batch,
+                (unsigned long long)bytes);
+    if (!Sync(0)) return false;
+    auto t = Clock::now();
+    RunPhase("bw-write", first, /*gen=*/1, /*read=*/false);
+    const double write_ms = Ms(t);
+    if (!Sync(1)) return false;
+    const double write_sync_ms = Ms(t);
+    t = Clock::now();
+    RunReadPhase(first, /*gen=*/1);
+    const double read_ms = Ms(t);
+    if (!Sync(2)) return false;
+    const double read_sync_ms = Ms(t);
+    t = Clock::now();
+    RunReadPhase(shifted, /*gen=*/1);
+    const double shift_ms = Ms(t);
+    if (!Sync(3)) return false;
+    const double shift_sync_ms = Ms(t);
+    // Warm pass: the same pages written again (generation 2) and read back.
+    // The first write paid for every page of tier memory the node had never
+    // touched (sparse mappings populate in the I/O path) and for every
+    // buffer the runtime's allocators handed out cold; this pass reuses all
+    // of it, so the gap between write and rewrite is the cold-memory cost.
+    t = Clock::now();
+    RunPhase("bw-rewrite", first, /*gen=*/2, /*read=*/false);
+    const double rewrite_ms = Ms(t);
+    if (!Sync(4)) return false;
+    t = Clock::now();
+    RunReadPhase(first, /*gen=*/2);
+    const double reread_ms = Ms(t);
+    if (!Sync(5)) return false;
+    const double gb = static_cast<double>(bytes) / 1e9;
+    std::printf("  write %.1f ms (%.2f GB/s/node), read-back %.1f ms (%.2f GB/s/node), "
+                "read-shifted %.1f ms (%.2f GB/s/node), rewrite %.1f ms (%.2f GB/s/node), "
+                "re-read %.1f ms (%.2f GB/s/node), errors=%llu\n",
+                write_ms, gb / (write_ms / 1e3), read_ms, gb / (read_ms / 1e3), shift_ms,
+                gb / (shift_ms / 1e3), rewrite_ms, gb / (rewrite_ms / 1e3), reread_ms,
+                gb / (reread_ms / 1e3), (unsigned long long)Errors());
+    std::fprintf(stderr,
+                 "BW nodes=%u node=%u bytes=%llu page_kb=%llu threads=%u batch=%u "
+                 "write_ms=%.1f write_sync_ms=%.1f read_ms=%.1f read_sync_ms=%.1f "
+                 "shift_ms=%.1f shift_sync_ms=%.1f rewrite_ms=%.1f reread_ms=%.1f "
+                 "gets=%llu puts=%llu get_errors=%llu put_errors=%llu mismatches=%llu\n",
+                 a_.nodes, a_.node, (unsigned long long)bytes, (unsigned long long)a_.page_kb,
+                 a_.threads, a_.batch, write_ms, write_sync_ms, read_ms, read_sync_ms,
+                 shift_ms, shift_sync_ms, rewrite_ms, reread_ms,
+                 (unsigned long long)st_.gets.load(),
+                 (unsigned long long)st_.puts.load(),
+                 (unsigned long long)st_.get_errors.load(),
+                 (unsigned long long)st_.put_errors.load(),
+                 (unsigned long long)st_.mismatches.load());
+    return Errors() == 0;
+  }
+
   /** @brief Seed, then run the steps; returns false on any failure. */
   bool Run() {
+    if (a_.bw) return RunBandwidth();
     const u64 first = a_.node * a_.pages_per_node;
     std::printf("cte vector stress: nodes=%u node=%u pages/node=%llu page_kb=%llu "
                 "threads=%u steps=%u halo=%u stream=%u gen=%d\n",
@@ -350,6 +429,33 @@ class VectorStress {
       ts.emplace_back([=] { Worker(what, lo, hi, gen, read, t); });
     }
     for (auto &th : ts) th.join();
+  }
+
+  /** @brief Read-only phase: pages [first, first+P) at gen, split across the threads. */
+  void RunReadPhase(u64 first, u64 gen) {
+    std::vector<std::thread> ts;
+    ts.reserve(a_.threads);
+    const u64 per = (a_.pages_per_node + a_.threads - 1) / a_.threads;
+    for (u32 t = 0; t < a_.threads; ++t) {
+      const u64 lo = first + t * per;
+      const u64 hi = std::min(first + a_.pages_per_node, lo + per);
+      if (lo >= hi) break;
+      ts.emplace_back([=] { ReadWorker(lo, hi, gen); });
+    }
+    for (auto &th : ts) th.join();
+  }
+
+  /** @brief One thread's share of a read phase: fetch and verify [lo, hi) at gen. */
+  void ReadWorker(u64 lo, u64 hi, u64 gen) {
+    auto *cte = CLIO_CTE_CLIENT;
+    std::vector<Slot> gets = AllocSlots(a_.batch);
+    u32 ng = 0;
+    for (u64 p = lo; p < hi; ++p) {
+      gets[ng].page = p; gets[ng].gen = gen;
+      if (++ng == a_.batch) { IssueGets(cte, gets, ng); ng = 0; }
+    }
+    if (ng) IssueGets(cte, gets, ng);
+    FreeSlots(gets);
   }
 
   /** A page buffer in shared memory plus what it currently holds. */
