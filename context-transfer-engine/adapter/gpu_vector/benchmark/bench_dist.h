@@ -114,6 +114,17 @@ inline bool GetPeers(clio::cte::core::Client &cte,
     }
     todo.swap(again);
     if (todo.empty()) break;
+    // A dead node never publishes: fail now, not at the timeout. The
+    // runtime marks a peer dead after 30 s of silence (idle probes), which
+    // is what turns a lost rank into a fast, named failure everywhere.
+    if (CLIO_IPC->DeadNodeCount() != 0) {
+      std::fprintf(stderr,
+                   "  %s[%s]: %u node(s) marked dead while waiting for %s; "
+                   "giving up\n",
+                   what, prefix, CLIO_IPC->DeadNodeCount(),
+                   gets[todo[0]].name.c_str());
+      return false;
+    }
     if (expired()) {
       const double waited_s =
           std::chrono::duration<double>(std::chrono::steady_clock::now() -

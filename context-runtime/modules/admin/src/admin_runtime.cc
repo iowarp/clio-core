@@ -1686,10 +1686,12 @@ void Runtime::ScanTaskProgress() {
          it->net_key, it->replica_id, it->future->GetReturnCode(),
          it->future->status_);
     if (it->future->GetReturnCode() == 0) {
-      bool gone = (it->future->status_ == 0);
-      run2run->HandleTaskProgressResult(
-          static_cast<clio::run::u64>(it->net_key), it->replica_id, gone,
-          it->gen);
+      if (it->net_key != kIdleProbeKey) {
+        bool gone = (it->future->status_ == 0);
+        run2run->HandleTaskProgressResult(
+            static_cast<clio::run::u64>(it->net_key), it->replica_id, gone,
+            it->gen);
+      }
       probe_failures_.erase(it->target_node_id);
     } else {
       NoteProbeFailure(it->target_node_id);
@@ -1726,6 +1728,37 @@ void Runtime::ScanTaskProgress() {
     pending_progress_queries_.push_back(
         {std::move(fut), static_cast<size_t>(sr.net_key), sr.replica_id,
          sr.gen, sr.target_node_id, std::chrono::steady_clock::now(), false});
+  }
+
+  // 3. Idle liveness probes (see kIdleProbeSec): peers heard from before and
+  // silent since, with nothing in flight to them. One probe per peer at a
+  // time; an answer refreshes the heard-from stamp, silence past
+  // kProbeSilenceSec without any message marks the peer dead above.
+  if (interval_ms != 0) {
+    const clio::run::u64 self = ipc_manager->GetNodeId();
+    for (clio::run::u64 node : ipc_manager->GetNodeIds()) {
+      if (node == self) continue;
+      if (ipc_manager->GetNodeState(node) == clio::run::NodeState::kDead) continue;
+      const clio::run::u64 heard_ns = ipc_manager->NsSinceHeardFrom(node);
+      if (heard_ns == ~clio::run::u64(0) || heard_ns / 1e9 < kIdleProbeSec) continue;
+      bool outstanding = false;
+      for (const auto &pq : pending_progress_queries_) {
+        if (pq.target_node_id == node) { outstanding = true; break; }
+      }
+      if (outstanding) continue;
+      clio::run::PoolQuery q =
+          clio::run::PoolQuery::Physical(static_cast<clio::run::u32>(node));
+      q.SetNetTimeout(5.0f);
+      auto task = ipc_manager->NewTask<QueryTaskProgressTask>(
+          clio::run::CreateTaskId(), clio::run::kAdminPoolId, q, kIdleProbeKey,
+          0u);
+      auto fut = ipc_manager->Send(task);
+      HLOG(kDebug, "[TaskProgress] idle probe -> node {} (silent {} s)", node,
+           static_cast<clio::run::u32>(heard_ns / 1e9));
+      pending_progress_queries_.push_back(
+          {std::move(fut), kIdleProbeKey, 0u, 0ull, node,
+           std::chrono::steady_clock::now(), false});
+    }
   }
 }
 

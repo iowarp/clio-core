@@ -835,6 +835,13 @@ class IpcManager {
   void NoteHeardFrom(u64 node_id);
   /** Nanoseconds since the last message from node_id; ~0ull if never. */
   u64 NsSinceHeardFrom(u64 node_id) const;
+  /** Every node id in the hostfile (fixed after init; safe from any thread). */
+  std::vector<u64> GetNodeIds() const;
+  /** Number of nodes marked dead so far; a collective can never complete
+   *  once this is non-zero. Readable from any thread. */
+  u32 DeadNodeCount() const {
+    return dead_count_.load(std::memory_order_acquire);
+  }
 
   /**
    * Get the SWIM node state for a node
@@ -1800,6 +1807,7 @@ class IpcManager {
 
   // Dead node tracking for failure detection
   std::vector<DeadNodeEntry> dead_nodes_;
+  std::atomic<u32> dead_count_{0};  ///< dead_nodes_.size(), for other threads
 
   // Self-fencing flag for partition detection (SWIM protocol)
   bool self_fenced_ = false;

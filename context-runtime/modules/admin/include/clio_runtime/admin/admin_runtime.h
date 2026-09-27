@@ -440,6 +440,17 @@ private:
    * completions is not enough. Three probe intervals of silence it is.
    */
   static constexpr double kProbeSilenceSec = 30.0;
+  /**
+   * Idle liveness. A peer this node has heard from before, then nothing for
+   * kIdleProbeSec, gets a probe even with no task in flight to it, so a
+   * node waiting on data that peer will never publish (a barrier or reduce
+   * blob it happens to own itself) learns of the death through the silence
+   * bound above instead of its own collective timeout. Peers never heard
+   * from are left alone: a late starter is not a dead one.
+   */
+  static constexpr double kIdleProbeSec = 10.0;
+  /** net_key of an idle probe: no replica behind it, liveness only. */
+  static constexpr size_t kIdleProbeKey = ~size_t(0);
   std::vector<PendingProgressQuery> pending_progress_queries_;
   /**
    * Consecutive liveness probes to a node that came back with an error (no

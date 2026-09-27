@@ -1885,6 +1885,7 @@ void IpcManager::SetDead(u64 node_id) {
   entry.node_id = node_id;
   entry.detected_at = std::chrono::steady_clock::now();
   dead_nodes_.push_back(entry);
+  dead_count_.fetch_add(1, std::memory_order_acq_rel);
 
   // Remove cached client connections to the dead node
   {
@@ -1905,6 +1906,13 @@ void IpcManager::NoteHeardFrom(u64 node_id) {
   const u64 now = static_cast<u64>(
       std::chrono::steady_clock::now().time_since_epoch().count());
   last_heard_ns_[node_id].store(now, std::memory_order_relaxed);
+}
+
+std::vector<u64> IpcManager::GetNodeIds() const {
+  std::vector<u64> ids;
+  ids.reserve(hostfile_map_.size());
+  for (const auto &kv : hostfile_map_) ids.push_back(kv.first);
+  return ids;
 }
 
 u64 IpcManager::NsSinceHeardFrom(u64 node_id) const {
