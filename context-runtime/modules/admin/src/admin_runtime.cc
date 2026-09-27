@@ -219,6 +219,16 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
   }
 }
 
+bool Runtime::IsComposedPool(const clio::run::PoolId &pool_id) {
+  if (pool_id.IsNull()) return false;
+  auto *config = CLIO_CONFIG_MANAGER;
+  if (config == nullptr) return false;
+  for (const auto &pc : config->GetComposeConfig().pools_) {
+    if (pc.pool_id_ == pool_id) return true;
+  }
+  return false;
+}
+
 clio::run::TaskResume Runtime::GetOrCreatePool(
     clio::run::shared_ptr<
         clio::run::admin::GetOrCreatePoolTask<clio::run::admin::CreateParams>>
@@ -240,6 +250,22 @@ clio::run::TaskResume Runtime::GetOrCreatePool(
   // Initialize output values
   task->return_code_ = 0;
   task->error_message_ = "";
+
+  // A client's create-or-bind can arrive before the server's own compose has
+  // created the pools its config defines (the port accepts clients first).
+  // Creating it here with the client's default parameters would silently
+  // replace the configured ones -- e.g. a filesystem pool without its
+  // metadata log, or over the bare core instead of the replication chain.
+  // Wait (cooperatively) for compose to create such a pool, then bind to it.
+  if (!task->do_compose_ && IsComposedPool(task->new_pool_id_)) {
+    auto *rm = CLIO_RUNTIME_MANAGER;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (rm != nullptr && !rm->compose_done_.load(std::memory_order_acquire) &&
+           !pool_manager->HasPool(task->new_pool_id_) &&
+           std::chrono::steady_clock::now() - t0 < std::chrono::seconds(300)) {
+      CLIO_CO_AWAIT(clio::run::yield(2000));
+    }
+  }
 
   try {
     // Use the simplified PoolManager API that extracts all parameters from the

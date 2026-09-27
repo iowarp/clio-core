@@ -159,6 +159,13 @@ class RuntimeManager {
 
  public:
   bool is_restart_ = false;  /**< If true, force restart on compose pools and replay WAL */
+  /**
+   * Set once ServerInit has finished composing the server config's pools
+   * (and replaying the restart log), successfully or not. The port accepts
+   * clients before that, so a client's create-or-bind of a configured pool
+   * waits on this instead of creating it with its own default parameters.
+   */
+  std::atomic<bool> compose_done_{false};
 
  private:
   bool is_initialized_ = false;

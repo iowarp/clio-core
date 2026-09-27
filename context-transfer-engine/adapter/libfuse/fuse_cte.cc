@@ -453,12 +453,32 @@ std::mutex g_flush_mtx;  // held across an ENTIRE flush (swap + Wait + retire)
 std::unordered_map<std::string, PendingCreate> g_pending_creates;
 std::vector<clio::cte::filesystem::MultiCreateEnt> g_create_queue;
 
-clio::cte::core::TagId MintTagId() {
-  static std::atomic<clio::run::u32> counter{1};
+/**
+ * Mint a file id client-side for sieve create. The id names its inode's home
+ * -- the container owning the file's directory (hash of the parent path),
+ * which is where the MultiCreate entry lands -- plus this node, and its minor
+ * starts at a per-process epoch so a restarted FUSE daemon does not reissue
+ * the ids of its previous life. The home rejects any id it already holds.
+ * @param path the file being created
+ * @return the minted id
+ */
+clio::cte::core::TagId MintTagId(const std::string &path) {
+  static const clio::run::u32 epoch = static_cast<clio::run::u32>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  static std::atomic<clio::run::u32> counter{0};
   auto *ipc = CLIO_IPC;
-  clio::run::u32 node = ipc != nullptr ? ipc->GetNodeId() : 1;
+  const clio::run::u32 node = ipc != nullptr ? ipc->GetNodeId() : 0;
+  const clio::run::u32 hosts =
+      ipc != nullptr ? static_cast<clio::run::u32>(ipc->GetNumHosts()) : 1;
+  const clio::run::u32 home = clio::cte::filesystem::FsDirContainer(
+      clio::cte::filesystem::FsParentDir(path), hosts);
+  const clio::run::u32 major = clio::cte::filesystem::kFsClientIdFlag |
+                               ((node & 0x3FFFu) << 16) |
+                               (home & clio::cte::filesystem::kFsHomeMask);
   return clio::cte::core::TagId(
-      node, 0x80000000u | counter.fetch_add(1, std::memory_order_relaxed));
+      major, (epoch << 20) + counter.fetch_add(1, std::memory_order_relaxed));
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +525,22 @@ std::vector<std::string> LinkGroupDrop(const std::string &p) {
   out.assign(g->begin(), g->end());
   if (g->size() <= 1) {
     for (const auto &m : *g) g_link_groups.erase(m);
+  }
+  return out;
+}
+
+/**
+ * The other names of `p`'s hard-link group (empty when it has none).
+ * @param p a path
+ * @return sibling paths, excluding `p`
+ */
+std::vector<std::string> LinkGroupSiblings(const std::string &p) {
+  std::lock_guard<std::mutex> lk(g_lg_mtx);
+  std::vector<std::string> out;
+  auto it = g_link_groups.find(p);
+  if (it == g_link_groups.end()) return out;
+  for (const auto &m : *it->second) {
+    if (m != p) out.push_back(m);
   }
   return out;
 }
@@ -1725,7 +1761,7 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
     auto *handle = new CfsHandle();
     handle->fh = 0;  // no server handle; data ops key off the tag
     handle->path = p;
-    handle->tag = MintTagId();
+    handle->tag = MintTagId(p);
     {
       PendingCreate pc;
       pc.tag = handle->tag;
@@ -1888,6 +1924,10 @@ int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
     // empty or missing (git fsck "missing blob"), even on one node.
     int rc = PublishOnClose(handle, p);
     if (rc != 0) return rc;
+    // The kernel caches each NAME separately: data and size written through
+    // this name stay invisible through its hard links until their cached
+    // pages and attrs are dropped (write via b, read via a saw the old file).
+    for (const auto &sib : LinkGroupSiblings(p)) InvalidatePath(sib);
   }
   int err = clio::cte::core::Client::DeferTakeKeyError(
       clio::cte::core::Client::DeferKeyHashName(p));
@@ -2165,24 +2205,13 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
       // Authoritative fallback (generic/729 residue): a refused/absent
       // mirror record left the tag unresolved, the sieve drain silently
       // skipped, and a pending write from the file's previous open session
-      // landed AFTER the truncate. Ask the server; escape the path for an
-      // exact-match regex.
-      auto *cte_q = CLIO_CTE_CLIENT;
-      if (cte_q != nullptr) {
-        std::string re = "^";
-        for (char c : p) {
-          if (std::strchr("\\^$.|?*+()[]{}", c) != nullptr) re += '\\';
-          re += c;
-        }
-        re += "$";
-        auto q = cte_q->AsyncTagQuery(re, 1);
-        q.Wait();
-        if (q->GetReturnCode() == 0 && !q->result_ids_.empty()) {
-          clio::run::u64 packed = q->result_ids_[0];
-          tr_tag = clio::cte::core::TagId(
-              static_cast<clio::run::u32>(packed >> 32),
-              static_cast<clio::run::u32>(packed & 0xffffffffULL));
-        }
+      // landed AFTER the truncate. Ask the owner of the name (its inode
+      // number IS the packed id).
+      auto g = cfs->AsyncGetattr(p);
+      g.Wait();
+      if (g->GetReturnCode() == 0 && g->exists_ && !g->is_dir_ &&
+          g->ino_ > 1) {
+        tr_tag = clio::cte::filesystem::FsUnpack(g->ino_);
       }
     }
     EnsureCreated(p);
@@ -2201,7 +2230,9 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
                          static_cast<clio::run::u64>(tr_tag.minor_)),
       tr_old_extent);
   t.Wait();
-  return t->GetReturnCode() == 0 ? 0 : -EIO;
+  const clio::run::u32 trc = t->GetReturnCode();
+  if (trc == 0) return 0;
+  return trc < 4096 ? -static_cast<int>(trc) : -EIO;
 }
 
 #ifdef __linux__

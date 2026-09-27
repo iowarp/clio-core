@@ -69,16 +69,24 @@ struct FilesystemConfig {
   static constexpr const char* chimod_lib_name = "clio_cte_filesystem";
 
   clio::run::PoolId next_pool_id_;  ///< CTE core pool id (e.g. 512.0)
+  /**
+   * Node-local file persisting this container's slice of the namespace
+   * (directory entries/attributes and the inodes it is home for). Empty =
+   * the namespace is volatile (lost on restart). "~" and $VARS expand; the
+   * container id is appended so co-located containers never share a file.
+   */
+  std::string metadata_log_path_;
 
   FilesystemConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
   FilesystemConfig(const clio::run::PoolId &pool_id, const FilesystemConfig &other)
-      : next_pool_id_(other.next_pool_id_) {
+      : next_pool_id_(other.next_pool_id_),
+        metadata_log_path_(other.metadata_log_path_) {
     (void)pool_id;
   }
 
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(next_pool_id_);
+    ar(next_pool_id_, metadata_log_path_);
   }
 
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
@@ -90,6 +98,9 @@ struct FilesystemConfig {
       if (node["next_pool_id"]) {
         next_pool_id_ = clio::run::PoolId::FromString(
             node["next_pool_id"].as<std::string>());
+      }
+      if (node["metadata_log_path"]) {
+        metadata_log_path_ = node["metadata_log_path"].as<std::string>();
       }
     } catch (...) {
       // best-effort
@@ -869,6 +880,38 @@ struct StatSizeTask : public clio::run::Task {
 // out into 1 MiB file pages, and dispatches AppendExecution slices (<=16 MiB
 // each) that GetBlob->PutBlob->DelBlob the data into the file pages.
 // ===========================================================================
+
+/**
+ * ShardOp (internal): one operation on namespace state owned by the target
+ * container -- a directory's entries/attributes (routed by hash of the
+ * directory path) or an inode (routed to its home). A public filesystem task
+ * runs where its first piece of state lives and sends a ShardOp for any
+ * other piece, so no container ever holds state it does not own. The
+ * request and response are FsEnc-encoded (see filesystem_runtime.cc); the
+ * task itself is just two byte strings.
+ */
+struct ShardOpTask : public clio::run::Task {
+  IN clio::run::u32 op_;               ///< FsShardOp code
+  IN clio::run::priv::string req_;     ///< encoded request
+  OUT clio::run::priv::string resp_;   ///< encoded response
+  ShardOpTask() : clio::run::Task(), op_(0), req_(CTP_MALLOC), resp_(CTP_MALLOC) {}
+  explicit ShardOpTask(const clio::run::TaskId &task_id,
+                       const clio::run::PoolId &pool_id,
+                       const clio::run::PoolQuery &pool_query,
+                       clio::run::u32 op, const std::string &req)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kShardOp),
+        op_(op), req_(CTP_MALLOC, req), resp_(CTP_MALLOC) {}
+  void Copy(const ctp::ipc::FullPtr<ShardOpTask> &o) {
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
+    op_ = o->op_; req_ = o->req_; resp_ = o->resp_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(op_, req_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(resp_);
+  }
+};
 
 /** One pending append: a staged data blob waiting to be merged into a file. */
 struct AppendEntry {

@@ -234,38 +234,6 @@ void ZeroReadTail(const ctp::ipc::ShmPtr<> &dst, size_t from, size_t size) {
   std::memset(base + from, 0, size - from);
 }
 
-/**
- * Container that owns the absolute-path namespace (the "metadata home").
- * Every hierarchical tag record lives there; blob data stays hash-spread.
- * Configured with CLIO_CTE_META_HOME (a container == node id); default 0.
- * @return the home container id, clamped to the cluster size
- */
-clio::run::u32 MetaHomeContainer() {
-  static const clio::run::u32 home = [] {
-    const char *e = clio::run::env::GetCompat("CTE_META_HOME");
-    unsigned long v = (e != nullptr) ? std::strtoul(e, nullptr, 10) : 0;
-    return static_cast<clio::run::u32>(v);
-  }();
-  auto *ipc = CLIO_IPC;
-  const size_t n = ipc != nullptr ? ipc->GetNumHosts() : 1;
-  return n > 0 ? static_cast<clio::run::u32>(home % n) : 0;
-}
-
-/** Pool query that reaches the namespace home (Local when we are it). */
-clio::run::PoolQuery MetaHomeQuery() {
-  return clio::run::PoolQuery::DirectId(
-      clio::run::ContainerId(MetaHomeContainer()));
-}
-
-/**
- * True when a tag id was minted by the namespace home. Server-minted ids
- * carry the minting node in major_, and hierarchical tags are minted only on
- * the home, so by-id operations on them can be routed without the name.
- */
-bool IsMetaHomeTag(const TagId &id) {
-  return !id.IsNull() && id.major_ == MetaHomeContainer();
-}
-
 // True for absolute-path names that participate in the hierarchy.
 bool IsHierPath(const std::string &name) {
   return !name.empty() && name[0] == '/';
@@ -1042,6 +1010,7 @@ Runtime::~Runtime() {
   tag_name_to_id_.clear();
   tag_id_to_info_.clear();
   tag_blob_name_to_info_.clear();
+  BlobIndexClear();
   storage_devices_.clear();
   target_locks_.clear();
   tag_locks_.clear();
@@ -1069,6 +1038,7 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
     tag_name_to_id_.clear();
     tag_id_to_info_.clear();
     tag_blob_name_to_info_.clear();
+    BlobIndexClear();
 
     // Reset atomic counters
     next_tag_id_minor_.store(1);
@@ -1101,14 +1071,12 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
     case Method::kGetTargetInfo:
       return clio::run::PoolQuery::Local();
 
-    // GetOrCreateTag: absolute paths live on the namespace home; flat
-    // names check the local tag cache, then hash to their owner container.
+    // GetOrCreateTag: check the local tag cache, then hash the name to its
+    // owner container. There is no central metadata node: every name has
+    // exactly one hash-chosen owner.
     case Method::kGetOrCreateTag: {
       auto typed = task.template Cast<GetOrCreateTagTask<CreateParams>>();
       std::string tag_name = typed->tag_name_.str();
-      if (IsHierPath(tag_name)) {
-        return MetaHomeQuery();
-      }
       bool tag_exists = false;
       {
         tag_exists = (tag_name_to_id_.find(tag_name) != nullptr);
@@ -1174,65 +1142,8 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
 
-    // Namespace operations on absolute paths. A hierarchical name's whole
-    // parent chain is stored as "$tagid{parent}/leaf" records on ONE
-    // container, so every op that creates, resolves, renames or deletes one
-    // must run there. Before this, these fell to the default (Local): a
-    // rename or unlink only mutated the caller's own container, a directory
-    // got a second tag on each node that created under it, and two nodes
-    // could both win O_EXCL on the same name.
-    case Method::kRenameTag: {
-      auto typed = task.template Cast<RenameTagTask>();
-      if (IsHierPath(typed->old_name_.str()) ||
-          IsHierPath(typed->new_name_.str())) {
-        return MetaHomeQuery();
-      }
-      return task->pool_query_;
-    }
-    case Method::kGetOrCreateTagAlias: {
-      auto typed = task.template Cast<GetOrCreateTagAliasTask>();
-      if (IsHierPath(typed->existing_name_.str()) ||
-          IsHierPath(typed->alias_name_.str())) {
-        return MetaHomeQuery();
-      }
-      return task->pool_query_;
-    }
-    case Method::kDelTag: {
-      auto typed = task.template Cast<DelTagTask>();
-      if (IsHierPath(typed->tag_name_.str())) {
-        return MetaHomeQuery();
-      }
-      if (typed->tag_name_.str().empty() && IsMetaHomeTag(typed->tag_id_)) {
-        return MetaHomeQuery();
-      }
-      return task->pool_query_;
-    }
-    case Method::kGetNumAliases: {
-      auto typed = task.template Cast<GetNumAliasesTask>();
-      if (IsHierPath(typed->tag_name_.str()) ||
-          (typed->tag_name_.str().empty() && IsMetaHomeTag(typed->tag_id_))) {
-        return MetaHomeQuery();
-      }
-      return task->pool_query_;
-    }
-    case Method::kGetTagName: {
-      auto typed = task.template Cast<GetTagNameTask>();
-      if (IsMetaHomeTag(typed->tag_id_)) {
-        return MetaHomeQuery();
-      }
-      return task->pool_query_;
-    }
-    case Method::kTagQuery: {
-      // An anchored absolute-path pattern can only match hierarchical names,
-      // which all live on the home: ask it alone (a broadcast also returned
-      // per-node duplicates). Anything else still fans out.
-      auto typed = task.template Cast<TagQueryTask>();
-      const std::string re = typed->tag_regex_.str();
-      if (re.size() >= 2 && re[0] == '^' && re[1] == '/') {
-        return MetaHomeQuery();
-      }
+    case Method::kTagQuery:
       return clio::run::PoolQuery::Broadcast();
-    }
     case Method::kTruncateBlob: {
       // Blob-keyed: it must reach the container that OWNS the blob. The
       // default (Local) silently truncated nothing on every other node.
@@ -1727,9 +1638,9 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
 
     // Check if this is a returning task from a remote canonical node
     // Hierarchical (absolute-path) names are never cached as flat remote
-    // bindings: they are created only on the namespace home, through the
-    // chain, so a preferred id is adopted INTO the hierarchy below instead of
-    // being inserted as a flat key the hierarchy walk cannot find.
+    // bindings: they are created through the chain on the container the name
+    // hashes to, so a preferred id is adopted INTO the hierarchy below instead
+    // of being inserted as a flat key the hierarchy walk cannot find.
     bool is_remote_tag =
         !IsHierPath(tag_name) &&
         (preferred_id.major_ != 0 && preferred_id.major_ != local_node_id);
@@ -4744,6 +4655,7 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
                                  std::to_string(tag_id.minor_) + "." +
                                  blob_name;
       tag_blob_name_to_info_.erase(compound_key);
+      BlobIndexErase(compound_key);
       // Mirror the erase too. A stale cache entry for a deleted blob is worse
       // than a miss: a client would read metadata for something gone.
       shm_cache_.EraseBlob(compound_key);
@@ -5712,28 +5624,35 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
     // from the target. A flat or leaf tag has no descendants and deletes only
     // itself; a directory tag deletes its entire subtree (rm -r semantics).
     std::vector<TagId> to_delete;
-    std::unordered_map<std::string, TagId> prefix_to_id;  // "M.m." -> id
     // Alias absolute names of the deleted tags. Canonical names live under
     // del_abs and were removed by the prefix cleanup above, but an alias can
     // resolve OUTSIDE that subtree (e.g. a hard link elsewhere), so collect and
     // remove those from the search index too. (#598)
     std::vector<std::string> dead_alias_abs;
     {
+      // Only a hierarchy node ("/" or "$tagid{parent}/leaf") can have
+      // children; a flat or nameless tag deletes just itself, without the
+      // O(all tags) scan that building the child map costs.
+      TagId unused_parent;
+      std::string unused_leaf;
+      const bool may_have_children =
+          canonical == "/" ||
+          ParseTagRef(canonical, unused_parent, unused_leaf);
       std::unordered_map<TagId, std::vector<TagId>> children;
-      tag_id_to_info_.for_each([&](const TagId &id, const std::shared_ptr<TagInfo> &info_sp) { const TagInfo &info = *info_sp; (void)info;
-        TagId parent;
-        std::string leaf;
-        if (ParseTagRef(info.tag_name_.str(), parent, leaf)) {
-          children[parent].push_back(id);
-        }
-      }, ctp::priv::ForEachLock::kShared);
+      if (may_have_children) {
+        tag_id_to_info_.for_each([&](const TagId &id, const std::shared_ptr<TagInfo> &info_sp) { const TagInfo &info = *info_sp; (void)info;
+          TagId parent;
+          std::string leaf;
+          if (ParseTagRef(info.tag_name_.str(), parent, leaf)) {
+            children[parent].push_back(id);
+          }
+        }, ctp::priv::ForEachLock::kShared);
+      }
       std::vector<TagId> frontier{tag_id};
       while (!frontier.empty()) {
         TagId cur = frontier.back();
         frontier.pop_back();
         to_delete.push_back(cur);
-        prefix_to_id[std::to_string(cur.major_) + "." +
-                     std::to_string(cur.minor_) + "."] = cur;
         std::shared_ptr<TagInfo> cinfo = tag_id_to_info_.get(cur);
         if (cinfo != nullptr) {
           for (size_t i = 0; i < cinfo->aliases_.size(); ++i) {
@@ -5752,33 +5671,14 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
       }
     }
 
-    // Step 4: collect every blob across all those tags in a single metadata
-    // scan. Keys are "major.minor.blobname"; match by the "major.minor."
-    // prefix against the deletion set.
-    auto compound_prefix = [](const std::string &key) -> std::string {
-      size_t d1 = key.find('.');
-      if (d1 == std::string::npos) return std::string();
-      size_t d2 = key.find('.', d1 + 1);
-      if (d2 == std::string::npos) return std::string();
-      return key.substr(0, d2 + 1);
-    };
+    // Step 4: collect every blob this container holds under those tags,
+    // from the per-tag index (no scan of the whole blob table).
     std::vector<std::pair<TagId, std::string>> blobs_to_delete;
-    {
-      // tag_blob_name_to_info_ is self-locking (unordered_map_ll); no outer
-      // map lock is needed. The removed blob_map_lock_ let coroutines hold a
-      // reader across suspension while for_each took the map's exclusive lock,
-      // which deadlocked under concurrency (issue #680: 089/100/208/323).
-      tag_blob_name_to_info_.for_each(
-          [&](const std::string &compound_key, const std::shared_ptr<BlobInfo> &blob_info_sp) { const BlobInfo &blob_info = *blob_info_sp; (void)blob_info;
-            (void)blob_info;
-            auto it = prefix_to_id.find(compound_prefix(compound_key));
-            if (it != prefix_to_id.end()) {
-              blobs_to_delete.emplace_back(
-                  it->second, compound_key.substr(it->first.size()));
-            }
-          }, ctp::priv::ForEachLock::kShared);
+    for (const TagId &del_id : to_delete) {
+      for (auto &name : BlobIndexNames(del_id)) {
+        blobs_to_delete.emplace_back(del_id, std::move(name));
+      }
     }
-
     // Step 5: delete blobs in bounded-concurrency batches.
     constexpr size_t kMaxConcurrentDelBlobTasks = 32;
     std::vector<clio::run::Future<DelBlobTask>> async_tasks;
@@ -5801,20 +5701,15 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
       }
     }
 
-    // Step 6: erase blob-name mappings for all deleted tags.
-    {
-      std::vector<std::string> keys_to_erase;
-      tag_blob_name_to_info_.for_each(
-          [&](const std::string &compound_key, const std::shared_ptr<BlobInfo> &blob_info_sp) { const BlobInfo &blob_info = *blob_info_sp; (void)blob_info;
-            (void)blob_info;
-            if (prefix_to_id.count(compound_prefix(compound_key)) != 0) {
-              keys_to_erase.push_back(compound_key);
-            }
-          }, ctp::priv::ForEachLock::kShared);
-      for (const auto &key : keys_to_erase) {
-        tag_blob_name_to_info_.erase(key);
-        shm_cache_.EraseBlob(key);  // issue #783: keep the mirror from going stale
-      }
+    // Step 6: erase blob-name mappings for all deleted tags (a DelBlob
+    // above that failed or raced still leaves its key here).
+    for (const auto &tb : blobs_to_delete) {
+      const std::string key = std::to_string(tb.first.major_) + "." +
+                              std::to_string(tb.first.minor_) + "." +
+                              tb.second;
+      tag_blob_name_to_info_.erase(key);
+      BlobIndexErase(key);
+      shm_cache_.EraseBlob(key);  // issue #783: keep the mirror from going stale
     }
 
     // Step 7: erase each tag's name binding(s) + aliases, WAL-log the delete,
@@ -6127,6 +6022,61 @@ clio::run::bdev::PersistenceLevel Runtime::GetPersistenceLevelForTarget(
     }
   }
   return clio::run::bdev::PersistenceLevel::kVolatile;
+}
+
+namespace {
+/**
+ * Split "major.minor.blob_name" into a tag id and a blob name.
+ * @return false when the key is malformed
+ */
+bool SplitBlobKey(const std::string &key, TagId *tag, std::string *name) {
+  const size_t d1 = key.find('.');
+  if (d1 == std::string::npos) return false;
+  const size_t d2 = key.find('.', d1 + 1);
+  if (d2 == std::string::npos) return false;
+  tag->major_ = static_cast<clio::run::u32>(
+      std::strtoul(key.c_str(), nullptr, 10));
+  tag->minor_ = static_cast<clio::run::u32>(
+      std::strtoul(key.c_str() + d1 + 1, nullptr, 10));
+  *name = key.substr(d2 + 1);
+  return true;
+}
+}  // namespace
+
+void Runtime::BlobIndexAdd(const std::string &composite_key) {
+  TagId tag;
+  std::string name;
+  if (!SplitBlobKey(composite_key, &tag, &name)) return;
+  auto &st = blob_index_[std::hash<TagId>()(tag) % kBlobIndexStripes];
+  std::lock_guard<std::mutex> g(st.mu_);
+  st.tags_[tag].insert(std::move(name));
+}
+
+void Runtime::BlobIndexErase(const std::string &composite_key) {
+  TagId tag;
+  std::string name;
+  if (!SplitBlobKey(composite_key, &tag, &name)) return;
+  auto &st = blob_index_[std::hash<TagId>()(tag) % kBlobIndexStripes];
+  std::lock_guard<std::mutex> g(st.mu_);
+  auto it = st.tags_.find(tag);
+  if (it == st.tags_.end()) return;
+  it->second.erase(name);
+  if (it->second.empty()) st.tags_.erase(it);
+}
+
+std::vector<std::string> Runtime::BlobIndexNames(const TagId &tag) {
+  auto &st = blob_index_[std::hash<TagId>()(tag) % kBlobIndexStripes];
+  std::lock_guard<std::mutex> g(st.mu_);
+  auto it = st.tags_.find(tag);
+  if (it == st.tags_.end()) return {};
+  return std::vector<std::string>(it->second.begin(), it->second.end());
+}
+
+void Runtime::BlobIndexClear() {
+  for (auto &st : blob_index_) {
+    std::lock_guard<std::mutex> g(st.mu_);
+    st.tags_.clear();
+  }
 }
 
 TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
@@ -7069,6 +7019,7 @@ void Runtime::RestoreMetadataFromLog() {
       blob_info.RecomputeTotalSize();
 
       tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
+      BlobIndexAdd(composite_key);
       MirrorBlobToShm(composite_key, blob_info);
       blobs_restored++;
 
@@ -7361,6 +7312,7 @@ void Runtime::ApplyWalDelTag(const std::vector<char> &payload,
       });
   for (const auto &key : keys_to_erase) {
     tag_blob_name_to_info_.erase(key);
+    BlobIndexErase(key);
     shm_cache_.EraseBlob(key);  // issue #783: keep the mirror from going stale
   }
   tag_id_to_info_.erase(tag_id);
@@ -7471,6 +7423,7 @@ void Runtime::ApplyWalCreateNewBlob(const std::vector<char> &payload,
     }
   }
   tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
+      BlobIndexAdd(composite_key);
   MirrorBlobToShm(composite_key, blob_info);
   blobs_replayed++;
 }
@@ -7493,6 +7446,7 @@ void Runtime::ApplyWalExtendBlob(const std::vector<char> &payload,
     fresh.blob_name_ = txn.blob_name_;
     tag_blob_name_to_info_.insert_or_assign(
         composite_key, std::make_shared<BlobInfo>(fresh));
+    BlobIndexAdd(composite_key);
     blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
   }
   if (blob_info_ptr) {
@@ -7545,6 +7499,7 @@ void Runtime::ApplyWalExtendReplica(const std::vector<char> &payload,
     fresh.blob_name_ = txn.blob_name_;
     tag_blob_name_to_info_.insert_or_assign(
         composite_key, std::make_shared<BlobInfo>(fresh));
+    BlobIndexAdd(composite_key);
     blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
   }
   if (blob_info_ptr && txn.replica_ > 0) {
@@ -7617,6 +7572,7 @@ void Runtime::ApplyWalSetBlobTransform(const std::vector<char> &payload,
     fresh.blob_name_ = txn.blob_name_;
     tag_blob_name_to_info_.insert_or_assign(
         composite_key, std::make_shared<BlobInfo>(fresh));
+    BlobIndexAdd(composite_key);
     blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
   }
   if (blob_info_ptr) {
@@ -7640,6 +7596,7 @@ void Runtime::ApplyWalSetBlobDroppable(const std::vector<char> &payload,
     fresh.blob_name_ = txn.blob_name_;
     tag_blob_name_to_info_.insert_or_assign(
         composite_key, std::make_shared<BlobInfo>(fresh));
+    BlobIndexAdd(composite_key);
     blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
   }
   if (blob_info_ptr) {
@@ -7657,6 +7614,7 @@ void Runtime::ApplyWalDelBlob(const std::vector<char> &payload,
                               std::to_string(tag_id.minor_) + "." +
                               txn.blob_name_;
   tag_blob_name_to_info_.erase(composite_key);
+  BlobIndexErase(composite_key);
   blobs_replayed++;
 }
 
@@ -8053,6 +8011,7 @@ std::shared_ptr<BlobInfo> Runtime::CreateNewBlob(const std::string &blob_name,
   // whose write token then serializes them as designed.
   const bool won =
       tag_blob_name_to_info_.insert(composite_key, new_blob_info).inserted;
+  if (won) BlobIndexAdd(composite_key);
   // Re-fetch through get(): it copies the shared_ptr UNDER the map's read
   // lock (the InsertResult's value pointer is only stable while the bucket
   // lock is held, and a concurrent DelBlob may erase the node).

@@ -35,8 +35,14 @@
 #define WRPCTE_CORE_RUNTIME_H_
 
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <atomic>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/comutex.h>
 #include <clio_runtime/corwlock.h>
@@ -505,6 +511,39 @@ private:
   ctp::priv::unordered_map_ll<TagId, std::shared_ptr<TagInfo>> tag_id_to_info_; // tag_id -> TagInfo
   ctp::priv::unordered_map_ll<std::string, std::shared_ptr<BlobInfo>>
       tag_blob_name_to_info_; // "tag_id.blob_name" -> BlobInfo
+
+  // Per-tag index over tag_blob_name_to_info_: which blob names this
+  // container holds for each tag. DelTag used to find a tag's blobs by
+  // scanning EVERY blob here (and every tag, for descendants), so deleting
+  // N files cost O(N x total blobs) -- 10k unlinks stalled the node for
+  // tens of seconds. Striped by tag to keep the blob create path uncontended.
+  // Every insert/erase of tag_blob_name_to_info_ goes through
+  // BlobIndexAdd / BlobIndexErase.
+  struct BlobIndexStripe {
+    std::mutex mu_;
+    std::unordered_map<TagId, std::unordered_set<std::string>> tags_;
+  };
+  static constexpr size_t kBlobIndexStripes = 64;
+  std::array<BlobIndexStripe, kBlobIndexStripes> blob_index_;
+
+  /**
+   * Record that this container holds blob `composite_key`.
+   * @param composite_key "major.minor.blob_name"
+   */
+  void BlobIndexAdd(const std::string &composite_key);
+  /**
+   * Forget blob `composite_key`.
+   * @param composite_key "major.minor.blob_name"
+   */
+  void BlobIndexErase(const std::string &composite_key);
+  /**
+   * Blob names this container holds for `tag`.
+   * @param tag tag id
+   * @return names (possibly empty)
+   */
+  std::vector<std::string> BlobIndexNames(const TagId &tag);
+  /** Drop the whole index (container reset). */
+  void BlobIndexClear();
 
   // Secondary search index: absolute resolved tag name -> tag id. Lets TagQuery
   // answer regex queries via a trigram prefilter instead of scanning every tag

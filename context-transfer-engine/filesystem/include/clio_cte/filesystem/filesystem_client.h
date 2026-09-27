@@ -24,6 +24,7 @@
 #include <vector>
 #include <mutex>
 #include <clio_cte/filesystem/filesystem_tasks.h>
+#include <clio_cte/filesystem/fs_shard.h>
 #include <clio_cte/filesystem/shm_fs_cache.h>
 
 namespace clio::cte::filesystem {
@@ -214,30 +215,7 @@ class Client : public clio::cte::core::Client {
 
 #if CTP_IS_HOST
   /**
-   * Where every filesystem-chimod task is sent: the namespace ("metadata")
-   * home container.
-   *
-   * The chimod's state -- open-file table, logical sizes, mode/owner/time
-   * overrides, the append pipeline -- is per container, and the core keeps
-   * every absolute-path tag on one container. Sending each client's tasks to
-   * its OWN node's container (the old PoolQuery::Local) gave every node a
-   * private view of sizes, modes and open files. The home is
-   * CLIO_CTE_META_HOME (container == node id, default 0; it must match the
-   * runtime's setting). On a single node it resolves to the local container.
-   * Page-blob data does not come through here and stays hash-spread.
-   * @return a DirectId query naming the home container
-   */
-  static clio::run::PoolQuery MetaQuery() {
-    static const clio::run::u32 home = [] {
-      const char *e = clio::run::env::GetCompat("CTE_META_HOME");
-      return static_cast<clio::run::u32>(
-          e != nullptr ? std::strtoul(e, nullptr, 10) : 0);
-    }();
-    return clio::run::PoolQuery::DirectId(clio::run::ContainerId(home));
-  }
-
-  /**
-   * Ask the namespace home which pool this filesystem stores its page blobs
+   * Ask the local filesystem container which pool it stores its page blobs
    * through (the top of its interposition chain, e.g. replication).
    * @param out receives the pool id on success
    * @return true when the home answered with a valid pool id
@@ -245,7 +223,8 @@ class Client : public clio::cte::core::Client {
   bool GetDataPoolId(clio::run::PoolId *out) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<MonitorTask>(clio::run::CreateTaskId(), pool_id_,
-                                          MetaQuery(), std::string("next_pool"));
+                                          clio::run::PoolQuery::Local(),
+                                          std::string("next_pool"));
     auto fut = ipc->Send(task);
     fut.Wait();
     if (fut->GetReturnCode() != 0 || fut->results_.empty()) {
@@ -280,7 +259,7 @@ class Client : public clio::cte::core::Client {
                                   clio::run::u32 mode = 0644) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<OpenTask>(clio::run::CreateTaskId(), pool_id_,
-                                       MetaQuery(), path, flags,
+                                       FsEntryQuery(path), path, flags,
                                        mode);
     return ipc->Send(task);
   }
@@ -291,7 +270,7 @@ class Client : public clio::cte::core::Client {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<AdvanceSizeTask>(clio::run::CreateTaskId(),
                                               pool_id_,
-                                              MetaQuery(),
+                                              FsInodeQuery(tag_packed),
                                               tag_packed, size);
     return ipc->Send(task);
   }
@@ -307,7 +286,7 @@ class Client : public clio::cte::core::Client {
       clio::run::u64 tag_packed, clio::run::u64 len) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<AdvanceSizeTask>(clio::run::CreateTaskId(),
-                                              pool_id_, MetaQuery(),
+                                              pool_id_, FsInodeQuery(tag_packed),
                                               tag_packed, len, 1u);
     return ipc->Send(task);
   }
@@ -318,7 +297,7 @@ class Client : public clio::cte::core::Client {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<MultiCreateTask>(clio::run::CreateTaskId(),
                                               pool_id_,
-                                              MetaQuery(),
+                                              clio::run::PoolQuery::Local(),
                                               packed);
     return ipc->Send(task);
   }
@@ -327,7 +306,7 @@ class Client : public clio::cte::core::Client {
                                           clio::run::u64 advance_size = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<CloseTask>(clio::run::CreateTaskId(), pool_id_,
-                                        MetaQuery(), handle,
+                                        FsHandleQuery(handle), handle,
                                         advance_size);
     return ipc->Send(task);
   }
@@ -342,7 +321,7 @@ class Client : public clio::cte::core::Client {
                           clio::run::u64 advance_size = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<CloseTask>(clio::run::CreateTaskId(), pool_id_,
-                                        MetaQuery(), handle,
+                                        FsHandleQuery(handle), handle,
                                         advance_size);
     // Flag must be set before Send (same ordering rule as the PutBlob
     // staging flags).
@@ -354,7 +333,7 @@ class Client : public clio::cte::core::Client {
                                   clio::run::u64 size, ctp::ipc::ShmPtr<> data) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ReadTask>(clio::run::CreateTaskId(), pool_id_,
-                                       MetaQuery(), handle, offset,
+                                       FsHandleQuery(handle), handle, offset,
                                        size, data);
     return ipc->Send(task);
   }
@@ -363,7 +342,7 @@ class Client : public clio::cte::core::Client {
                                     clio::run::u64 size, ctp::ipc::ShmPtr<> data) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<WriteTask>(clio::run::CreateTaskId(), pool_id_,
-                                        MetaQuery(), handle, offset,
+                                        FsHandleQuery(handle), handle, offset,
                                         size, data);
     return ipc->Send(task);
   }
@@ -372,7 +351,7 @@ class Client : public clio::cte::core::Client {
                                       ctp::ipc::ShmPtr<> data) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<AppendTask>(clio::run::CreateTaskId(), pool_id_,
-                                         MetaQuery(), handle, size,
+                                         FsHandleQuery(handle), handle, size,
                                          data);
     return ipc->Send(task);
   }
@@ -380,7 +359,7 @@ class Client : public clio::cte::core::Client {
   clio::run::Future<GetattrTask> AsyncGetattr(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<GetattrTask>(clio::run::CreateTaskId(), pool_id_,
-                                          MetaQuery(), path);
+                                          FsEntryQuery(path), path);
     return ipc->Send(task);
   }
 
@@ -390,7 +369,7 @@ class Client : public clio::cte::core::Client {
                                           clio::run::u64 old_extent = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<TruncateTask>(clio::run::CreateTaskId(), pool_id_,
-                                           MetaQuery(), path,
+                                           (tag_packed != 0 ? FsInodeQuery(tag_packed) : FsEntryQuery(path)), path,
                                            new_size, tag_packed, old_extent);
     return ipc->Send(task);
   }
@@ -398,7 +377,7 @@ class Client : public clio::cte::core::Client {
   clio::run::Future<UnlinkTask> AsyncUnlink(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<UnlinkTask>(clio::run::CreateTaskId(), pool_id_,
-                                         MetaQuery(), path);
+                                         FsEntryQuery(path), path);
     return ipc->Send(task);
   }
 
@@ -408,7 +387,7 @@ class Client : public clio::cte::core::Client {
                                               clio::run::u32 flags) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<UtimensTask>(clio::run::CreateTaskId(), pool_id_,
-                                          MetaQuery(), path,
+                                          FsEntryQuery(path), path,
                                           atime_ns, mtime_ns, flags);
     return ipc->Send(task);
   }
@@ -421,7 +400,7 @@ class Client : public clio::cte::core::Client {
                             clio::run::u64 mtime_ns, clio::run::u32 flags) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<UtimensTask>(clio::run::CreateTaskId(), pool_id_,
-                                          MetaQuery(), path,
+                                          FsEntryQuery(path), path,
                                           atime_ns, mtime_ns, flags);
     task.get()->task_flags_.SetBits(TASK_FIRE_AND_FORGET);
     ipc->Send(task);
@@ -433,7 +412,7 @@ class Client : public clio::cte::core::Client {
                                           clio::run::u32 mode = 0xFFFFFFFFu) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ChownTask>(clio::run::CreateTaskId(), pool_id_,
-                                        MetaQuery(), path, uid,
+                                        FsEntryQuery(path), path, uid,
                                         gid, mode);
     return ipc->Send(task);
   }
@@ -448,14 +427,14 @@ class Client : public clio::cte::core::Client {
   clio::run::Future<MkdirTask> AsyncMkdir(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<MkdirTask>(clio::run::CreateTaskId(), pool_id_,
-                                        MetaQuery(), path);
+                                        FsEntryQuery(path), path);
     return ipc->Send(task);
   }
 
   clio::run::Future<RmdirTask> AsyncRmdir(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<RmdirTask>(clio::run::CreateTaskId(), pool_id_,
-                                        MetaQuery(), path);
+                                        FsEntryQuery(path), path);
     return ipc->Send(task);
   }
 
@@ -463,7 +442,7 @@ class Client : public clio::cte::core::Client {
                                       const std::string &dst) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<RenameTask>(clio::run::CreateTaskId(), pool_id_,
-                                         MetaQuery(), src, dst);
+                                         FsEntryQuery(src), src, dst);
     return ipc->Send(task);
   }
 
@@ -471,7 +450,7 @@ class Client : public clio::cte::core::Client {
                                   const std::string &link) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<LinkTask>(clio::run::CreateTaskId(), pool_id_,
-                                       MetaQuery(), target, link);
+                                       FsEntryQuery(link), target, link);
     return ipc->Send(task);
   }
 
@@ -479,7 +458,7 @@ class Client : public clio::cte::core::Client {
                                               const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<SymlinkTask>(clio::run::CreateTaskId(), pool_id_,
-                                          MetaQuery(), target,
+                                          FsEntryQuery(path), target,
                                           path);
     return ipc->Send(task);
   }
@@ -487,7 +466,7 @@ class Client : public clio::cte::core::Client {
   clio::run::Future<ReadlinkTask> AsyncReadlink(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ReadlinkTask>(clio::run::CreateTaskId(), pool_id_,
-                                           MetaQuery(), path);
+                                           FsEntryQuery(path), path);
     return ipc->Send(task);
   }
 
@@ -497,7 +476,7 @@ class Client : public clio::cte::core::Client {
                                                 clio::run::u32 flags) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<SetxattrTask>(clio::run::CreateTaskId(), pool_id_,
-                                           MetaQuery(), path,
+                                           FsEntryQuery(path), path,
                                            name, value, flags);
     return ipc->Send(task);
   }
@@ -506,7 +485,7 @@ class Client : public clio::cte::core::Client {
                                                 const std::string &name) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<GetxattrTask>(clio::run::CreateTaskId(), pool_id_,
-                                           MetaQuery(), path,
+                                           FsEntryQuery(path), path,
                                            name);
     return ipc->Send(task);
   }
@@ -514,7 +493,7 @@ class Client : public clio::cte::core::Client {
   clio::run::Future<ListxattrTask> AsyncListxattr(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ListxattrTask>(clio::run::CreateTaskId(), pool_id_,
-                                            MetaQuery(), path);
+                                            FsEntryQuery(path), path);
     return ipc->Send(task);
   }
 
@@ -523,8 +502,29 @@ class Client : public clio::cte::core::Client {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<RemovexattrTask>(clio::run::CreateTaskId(),
                                               pool_id_,
-                                              MetaQuery(),
+                                              FsEntryQuery(path),
                                               path, name);
+    return ipc->Send(task);
+  }
+
+  /**
+   * Internal: run one ShardOp on the container `pool_query` names (the
+   * owner of the directory or inode the request addresses).
+   * @param op FsShardOp code
+   * @param req encoded request
+   * @param pool_query owner container
+   * @param period_us nonzero = periodic task with this period
+   */
+  clio::run::Future<ShardOpTask> AsyncShardOp(
+      clio::run::u32 op, const std::string &req,
+      const clio::run::PoolQuery &pool_query, double period_us = 0.0) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<ShardOpTask>(clio::run::CreateTaskId(), pool_id_,
+                                          pool_query, op, req);
+    if (period_us > 0.0) {
+      task->SetPeriod(period_us, clio::run::kMicro);
+      task->SetFlags(TASK_PERIODIC);
+    }
     return ipc->Send(task);
   }
 
@@ -577,14 +577,14 @@ class Client : public clio::cte::core::Client {
   clio::run::Future<ReaddirTask> AsyncReaddir(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ReaddirTask>(clio::run::CreateTaskId(), pool_id_,
-                                          MetaQuery(), path);
+                                          FsDirQuery(FsNormPath(path)), path);
     return ipc->Send(task);
   }
 
   clio::run::Future<StatSizeTask> AsyncStatSize(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<StatSizeTask>(clio::run::CreateTaskId(), pool_id_,
-                                           MetaQuery(), path);
+                                           FsEntryQuery(path), path);
     return ipc->Send(task);
   }
 

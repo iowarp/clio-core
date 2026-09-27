@@ -21,6 +21,7 @@ namespace clio::cte::filesystem {
   X(kClose, CloseTask, Close)             \
   X(kMultiCreate, MultiCreateTask, MultiCreate) \
   X(kAdvanceSize, AdvanceSizeTask, AdvanceSize) \
+  X(kShardOp, ShardOpTask, ShardOp)       \
   X(kRead, ReadTask, Read)                \
   X(kWrite, WriteTask, Write)             \
   X(kGetattr, GetattrTask, Getattr)       \
@@ -51,6 +52,13 @@ void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_nam
   clio::run::Container::Init(pool_id, pool_name, container_id);
   DefineModel(Method::kMaxMethodId);
   SetMethodNames(Method::GetMethodNames());
+}
+
+void Runtime::Restart(const clio::run::PoolId &pool_id,
+                      const std::string &pool_name,
+                      clio::run::u32 container_id) {
+  is_restart_ = true;
+  Init(pool_id, pool_name, container_id);
 }
 
 clio::run::u64 Runtime::GetWorkRemaining() const { return 0; }
@@ -199,8 +207,9 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
 /**
  * Merge a single remote replica's result into the originating task.
  *
- * Every filesystem task goes to exactly ONE container (the namespace home),
- * so "aggregating" its reply is taking the replica's fields wholesale. The
+ * Every filesystem task goes to exactly ONE container (the hash-chosen owner
+ * of the state it touches), so "aggregating" its reply is taking the
+ * replica's fields wholesale. The
  * task types define no AggregateOut of their own, and the base one moves
  * only a nonzero return code: a task answered by another node came back
  * with every OUT field at its default (mkdir reported ENOENT for a

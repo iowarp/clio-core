@@ -394,22 +394,23 @@ def t_chaos(ctx):
       audit_all(ctx, r0, e0, f'round {rnd} ({what} crash on node{v})')
 
 
-@test('home_node_loss_bounded', 'fault', min_nodes=2, redeploy_after=True,
+@test('any_node_loss_bounded', 'fault', min_nodes=2, redeploy_after=True,
       timeout=3600)
-def t_home_loss(ctx):
-  """SIGKILL the METADATA HOME (node 0).  The namespace lives there, so the
-  other nodes cannot make progress -- but every op must FAIL inside
-  OP_DEADLINE, never hang; after the home restarts, every node sees the
-  whole dataset again."""
+def t_node_loss_partial(ctx):
+  """SIGKILL one node (the last).  The namespace is hash-sharded, so only the
+  entries and inodes that node owns become unavailable: every op on a
+  survivor must finish inside OP_DEADLINE (fail fast on the dead shard,
+  never hang), most of the namespace must stay reachable, and after the node
+  restarts every node sees the whole dataset again."""
   n = len(ctx.hosts)
   root, exp = build_dataset(ctx, 'h', per_node=6)
-  home = ctx.hosts[0]
-  ctx.cl.kill_fuse(home)
-  ctx.cl.kill_runtime(home)
+  victim = ctx.hosts[-1]
+  ctx.cl.kill_fuse(victim)
+  ctx.cl.kill_runtime(victim)
   time.sleep(2)
   hangs, errs, oks = 0, 0, 0
-  for i in range(1, n):
-    for rel in sorted(exp)[:6]:
+  for i in range(0, n - 1):
+    for rel in sorted(exp):
       r = ctx.a(i).call('stat', timeout=OP_DEADLINE, path=f'{root}/{rel}')
       if r.get('hang'):
         hangs += 1
@@ -418,17 +419,20 @@ def t_home_loss(ctx):
       else:
         errs += 1
     r = ctx.a(i).call('write_file', timeout=OP_DEADLINE,
-                      path=f'{root}/while_home_down_{i}', size=4096, seed=1)
+                      path=f'{root}/while_node_down_{i}', size=4096, seed=1)
     if r.get('hang'):
       hangs += 1
-  ctx.metrics.update({'ops_ok_while_home_down': oks,
-                      'ops_err_while_home_down': errs,
-                      'ops_hung_while_home_down': hangs})
-  ctx.check(hangs == 0, f'{hangs} ops HUNG while the metadata home was down')
-  ctx.cl.start_runtime(home, 'restart')
-  ctx.check(ctx.cl.runtime_up(home), 'home restart')
+  total = max(1, oks + errs + hangs)
+  ctx.metrics.update({'stat_ok_while_node_down': oks,
+                      'stat_err_while_node_down': errs,
+                      'ops_hung_while_node_down': hangs,
+                      'reachable_fraction': round(oks / total, 2)})
+  ctx.check(hangs == 0, f'{hangs} ops HUNG while one node was down')
+  ctx.check(oks > 0, 'no part of the namespace stayed reachable')
+  ctx.cl.start_runtime(victim, 'restart')
+  ctx.check(ctx.cl.runtime_up(victim), 'victim restart')
   time.sleep(3)
-  ctx.check(ctx.cl.mount(home), 'home remount')
-  ctx.cl.agents.pop(home, None)
+  ctx.check(ctx.cl.mount(victim), 'victim remount')
+  ctx.cl.agents.pop(victim, None)
   time.sleep(2)
-  audit_all(ctx, root, exp, 'after the metadata home restarted')
+  audit_all(ctx, root, exp, 'after the lost node restarted')

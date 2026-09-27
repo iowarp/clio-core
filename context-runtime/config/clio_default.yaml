@@ -55,8 +55,9 @@ runtime:
   #   CLIO_NET_DEAD_FAIL_FAST  default 0 -- 1 = a task addressed to a peer
   #                            already declared dead fails immediately instead
   #                            of waiting out the retry window (recommended for
-  #                            filesystem deployments: a path lookup is one RPC
-  #                            per component, so the window multiplies).
+  #                            filesystem deployments: an operation on a name
+  #                            owned by the dead node then fails with EIO at
+  #                            once instead of stalling).
   learning_rate: 0.2                   # SGD learning rate for task load prediction model
   # conf_dir: /tmp/clio_$USER          # default: the per-user runtime directory (same
                                        # as the memfd links). Learned task-stat models are
@@ -380,3 +381,11 @@ compose:
     pool_query: local
     pool_id: "560.0"
     next_pool_id: "563.0"               # chain top (cache) — see entries above
+    # The namespace is HASH-SHARDED across every node -- there is no metadata
+    # server. A directory's entries and attributes live on the node its path
+    # hashes to; a file's inode (size, mode, times, links, open handles) on
+    # the node that created it (also chosen by hashing its directory). Each
+    # node persists exactly its own slice in this node-local append-only log
+    # (the container id is appended to the name); `clio_run restart` replays
+    # it, a fresh `start` discards it. Default: unset = volatile namespace.
+    # metadata_log_path: "/mnt/nvme/$USER/clio/cfs_namespace_log"

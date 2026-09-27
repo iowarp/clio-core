@@ -292,6 +292,13 @@ bool RuntimeManager::ServerInit() {
     return false;
   }
 
+  // Whatever happens below (success, a failed compose, an ephemeral
+  // runtime), mark composition finished when ServerInit returns.
+  struct ComposeDoneGuard {
+    std::atomic<bool> &flag_;
+    ~ComposeDoneGuard() { flag_.store(true, std::memory_order_release); }
+  } compose_done_guard{compose_done_};
+
   // Process compose section if present — unless this runtime is ephemeral
   // (--ephemeral / CLIO_EPHEMERAL), in which case it starts bare and is
   // composed explicitly (e.g. a spawned per-app runtime backed by a main

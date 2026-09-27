@@ -16,7 +16,7 @@ and that it survives daemon crashes, node loss and restarts.
 | `tests_dist.py` | cross-node coherence, races, shared files, storms (14 tests) |
 | `tests_apps.py` | tar / git / make / sqlite / rsync on the mount |
 | `tests_perf.py` | mdtest/IOR-shaped scaling measurements |
-| `tests_fault.py` | crash + restart, node loss, home loss, FUSE crash, chaos |
+| `tests_fault.py` | crash + restart, node loss (partial availability of the hash-sharded namespace), FUSE crash, chaos |
 | `fsx_model.py` | fsx-style model checker (single node or rotating across nodes) |
 
 ## Running

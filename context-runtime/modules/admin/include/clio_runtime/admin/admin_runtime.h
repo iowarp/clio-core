@@ -132,6 +132,13 @@ public:
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
 
   /**
+   * True when the server config's compose section defines pool `pool_id`.
+   * @param pool_id requested pool id
+   * @return whether compose will create it
+   */
+  static bool IsComposedPool(const clio::run::PoolId &pool_id);
+
+  /**
    * Handle GetOrCreatePool task - Pool get-or-create operation (IS_ADMIN=false)
    * This is a coroutine that can co_await nested Create methods
    */
