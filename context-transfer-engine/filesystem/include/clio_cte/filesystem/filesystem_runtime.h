@@ -227,6 +227,15 @@ class Runtime : public clio::run::Container {
     clio::run::u32 set_mode_{0xFFFFFFFFu};
   };
   std::mutex meta_mu_;
+  /**
+   * Serializes Rename. A rename is several steps (core RenameTag, then the
+   * by_path_ rebinding, mirror, parent touches) with co_awaits between them;
+   * concurrent renames onto one target interleaved those steps, and the
+   * target ended up with one source's tag in the core but another source's
+   * FileInfo (size) here -- a torn file (4 nodes renaming onto one name).
+   * Acquired with a cooperative yield loop (never blocks the worker thread).
+   */
+  std::atomic<bool> rename_busy_{false};
   std::unordered_map<clio::run::u64, std::shared_ptr<FileInfo>> handles_;
   std::unordered_map<std::string, std::shared_ptr<FileInfo>> by_path_;
   // Tag-keyed index over the same FileInfo objects (see AdvanceSizeTask):

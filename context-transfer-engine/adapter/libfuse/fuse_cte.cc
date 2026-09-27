@@ -875,6 +875,21 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
     fprintf(stderr, "WARNING: CTE core client init failed; statfs capacity=0\n");
   }
+  // Store page blobs through the SAME pool the filesystem chimod uses (the
+  // top of its chain -- replication in a persistent deployment), not the
+  // bare core pool CLIO_CTE_CLIENT_INIT binds: sieve writes went straight to
+  // 512.0 and so never got a persistent replica -- every fsync'd byte sat in
+  // the RAM tier and a restart brought files back with size 0.
+  {
+    clio::run::PoolId data_pool;
+    auto *cte_c = CLIO_CTE_CLIENT;
+    if (cte_c != nullptr && CLIO_CFS_CLIENT->GetDataPoolId(&data_pool) &&
+        !(data_pool == cte_c->pool_id_)) {
+      fprintf(stderr, "clio_cte_fuse: data pool %u.%u (filesystem chain)\n",
+              data_pool.major_, data_pool.minor_);
+      cte_c->pool_id_ = data_pool;
+    }
+  }
   return nullptr;
 }
 

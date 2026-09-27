@@ -126,7 +126,7 @@ class Cluster:
   def __init__(self, hosts, bin_dir, run_dir, profile='persistent',
                port=9519, attr_cache_s=None, num_threads=8,
                ram_gb=8, disk_gb=40, local_root=None, net_suffix='-40g',
-               extra_env=None):
+               extra_env=None, replicate_period_ms=0):
     self.hosts = list(hosts)
     self.bin_dir = bin_dir
     self.run_dir = run_dir            # shared (NFS): configs, logs, results
@@ -141,6 +141,9 @@ class Cluster:
     self.local_root = local_root or f'/mnt/nvme/{user}/clio_fs_suite'
     self.mnt = f'{self.local_root}/mnt'
     self.extra_env = extra_env or {}
+    # 0 = synchronous write-through to the persistent replica (a put acks
+    # only once its durable copy exists); >0 = async sweep every N ms.
+    self.replicate_period_ms = replicate_period_ms
     self.agents = {}
     self.agent_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  'agent.py')
@@ -200,6 +203,7 @@ class Cluster:
                '    pool_id: "561.0"\n'
                '    next_pool_id: "512.0"\n'
                '    num_replicas: 1\n'
+               f'    replicate_period_ms: {self.replicate_period_ms}\n'
                '    cache_score: 1.0\n'
                '    replica_score: 0.2\n')
       fs_next = '561.0'

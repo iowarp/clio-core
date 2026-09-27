@@ -236,7 +236,34 @@ class Client : public clio::cte::core::Client {
     return clio::run::PoolQuery::DirectId(clio::run::ContainerId(home));
   }
 
-  /** Create/initialize the filesystem container over a CTE core pool. */
+  /**
+   * Ask the namespace home which pool this filesystem stores its page blobs
+   * through (the top of its interposition chain, e.g. replication).
+   * @param out receives the pool id on success
+   * @return true when the home answered with a valid pool id
+   */
+  bool GetDataPoolId(clio::run::PoolId *out) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<MonitorTask>(clio::run::CreateTaskId(), pool_id_,
+                                          MetaQuery(), std::string("next_pool"));
+    auto fut = ipc->Send(task);
+    fut.Wait();
+    if (fut->GetReturnCode() != 0 || fut->results_.empty()) {
+      return false;
+    }
+    const std::string v = fut->results_.begin()->second;
+    const size_t dot = v.find('.');
+    if (dot == std::string::npos) {
+      return false;
+    }
+    *out = clio::run::PoolId(
+        static_cast<clio::run::u32>(std::strtoul(v.c_str(), nullptr, 10)),
+        static_cast<clio::run::u32>(
+            std::strtoul(v.c_str() + dot + 1, nullptr, 10)));
+    return !out->IsNull();
+  }
+
+  /** Create/initialize the filesystem container over a CTE core pool. */  /** Create/initialize the filesystem container over a CTE core pool. */
   clio::run::Future<CreateTask> AsyncCreate(const clio::run::PoolQuery &pool_query,
                                       const std::string &pool_name,
                                       const clio::run::PoolId &custom_pool_id,

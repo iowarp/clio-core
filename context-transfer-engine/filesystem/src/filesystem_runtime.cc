@@ -286,9 +286,17 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 
   HLOG(kInfo, "filesystem: Create over CTE core pool {}",
        next_pool_id_.ToString());
-  // The root of a fresh mount is COMPLETE: nothing exists yet, and every
-  // later top-level name goes through handlers that keep the mirror honest.
-  MirrorDir("/", clio::cte::core::TagId::GetNull(), /*complete=*/true);
+  // The root is COMPLETE in the mirror only when the namespace really is
+  // empty: a complete dir turns every mirror miss under it into
+  // authoritative ENOENT. After a restart (or over a pre-existing core pool)
+  // the root already has children the mirror has never seen, and marking it
+  // complete made the whole recovered namespace read ENOENT on a single node.
+  {
+    auto q = cte_.AsyncTagQuery("^/[^/]+$", 1, clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(q);
+    const bool empty = (q->GetReturnCode() == 0 && q->results_.empty());
+    MirrorDir("/", clio::cte::core::TagId::GetNull(), /*complete=*/empty);
+  }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -421,6 +429,15 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
 
 clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  // "next_pool": the pool this filesystem stores page blobs through (the top
+  // of the interposition chain). Data-path clients (the FUSE adapter writes
+  // pages directly) must target it too, not the bare core pool, or their
+  // bytes bypass replication and never get a persistent copy.
+  if (task->query_ == "next_pool") {
+    task->results_[container_id_] =
+        std::to_string(next_pool_id_.major_) + "." +
+        std::to_string(next_pool_id_.minor_);
+  }
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -1554,8 +1571,20 @@ clio::run::TaskResume Runtime::Rmdir(clio::run::shared_ptr<RmdirTask> &task) {
   CLIO_TASK_BODY_END
 }
 
+namespace {
+/** Releases an atomic busy flag when the owning scope (coroutine) exits. */
+struct BusyFlagGuard {
+  std::atomic<bool> &flag_;
+  ~BusyFlagGuard() { flag_.store(false, std::memory_order_release); }
+};
+}  // namespace
+
 clio::run::TaskResume Runtime::Rename(clio::run::shared_ptr<RenameTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  while (rename_busy_.exchange(true, std::memory_order_acquire)) {
+    CLIO_CO_AWAIT(clio::run::yield(20));
+  }
+  BusyFlagGuard rename_guard{rename_busy_};
   std::string src = task->src_.str();
   std::string dst = task->dst_.str();
   if (src == dst) {
