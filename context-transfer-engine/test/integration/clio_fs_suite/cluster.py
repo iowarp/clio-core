@@ -125,7 +125,7 @@ class Cluster:
 
   def __init__(self, hosts, bin_dir, run_dir, profile='persistent',
                port=9519, attr_cache_s=None, num_threads=8,
-               ram_gb=8, disk_gb=40, local_root=None, net_suffix='-40g',
+               ram_gb=8, disk_gb=20, local_root=None, net_suffix='-40g',
                extra_env=None, replicate_period_ms=0):
     self.hosts = list(hosts)
     self.bin_dir = bin_dir
@@ -429,7 +429,8 @@ compose:
         return 'runtime not running'
       if not self.fuse_pid(h):
         return 'fuse not running'
-      rc, out = sh(h, f'timeout 15 stat -f {self.mnt} >/dev/null && '
+      rc, out = sh(h, f'grep -q " {self.mnt} " /proc/self/mountinfo && '
+                      f'timeout 15 stat -f {self.mnt} >/dev/null && '
                       f'timeout 15 ls {self.mnt} >/dev/null', timeout=40)
       return None if rc == 0 else f'mount unusable rc={rc} {out[-200:]}'
     res = parallel(chk, self.hosts)

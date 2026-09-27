@@ -372,6 +372,17 @@ public:
   clio::run::TaskResume DelTag(clio::run::shared_ptr<DelTagTask> &task);
 
   /**
+   * WAL-log the FULL current name identity (canonical name + every alias)
+   * of `info` (issue: renames/hard links lost on crash). Call after ANY
+   * mutation of TagInfo::tag_name_/aliases_ -- RenameTag, a new
+   * GetOrCreateTagAlias bind, DelTag's alias-unlink, and DelTag's
+   * promote-alias-to-canonical. No-op when the WAL is not configured.
+   * @param tag_id the tag whose identity changed
+   * @param info the tag's CURRENT (post-mutation) TagInfo
+   */
+  void LogTagIdentity(const TagId &tag_id, const TagInfo &info);
+
+  /**
    * GetTagName (Method::kGetTagName) - resolve a TagId to its full, absolute
    * tag name by walking the stored relative "$tagid{parent}/leaf" references.
    * Broadcast op; the container owning the tag's metadata answers.
@@ -897,9 +908,14 @@ private:
   void ApplyWalCreateTag(const std::vector<char> &payload,
                          clio::run::u32 &max_minor,
                          clio::run::u32 &tags_replayed);
-  /** Apply one replayed kDelTag record: erase the tag and its blobs. */
+  /** Apply one replayed kDelTag record: erase the tag, its blobs, and every
+   *  alias name binding it carried at delete time. */
   void ApplyWalDelTag(const std::vector<char> &payload,
                       clio::run::u32 &tags_replayed);
+  /** Apply one replayed kSetTagIdentity record: full replacement of a tag's
+   *  canonical name + alias list (rename / hard link / unlink survival). */
+  void ApplyWalSetTagIdentity(const std::vector<char> &payload,
+                             clio::run::u32 &tags_replayed);
   /** Apply one replayed kCreateNewBlob record, carrying forward any
    *  transform/droppable/replica/block state already seen for this key. */
   void ApplyWalCreateNewBlob(const std::vector<char> &payload,
@@ -924,6 +940,21 @@ private:
   /** Apply one replayed kDelBlob record. */
   void ApplyWalDelBlob(const std::vector<char> &payload,
                        clio::run::u32 &blobs_replayed);
+
+  /**
+   * Reserve, on every bdev target a surviving restored block references, the
+   * byte range that block occupies -- called once during Create() on a
+   * restart, after RestoreMetadataFromLog/ReplayTransactionLogs, and before
+   * this container accepts new PutBlob traffic.
+   *
+   * The bdev block allocators (Heap::heap_ in block_allocator.h) are pure
+   * in-memory bump allocators with no persistence of their own: a fresh
+   * Create() resets the cursor to 0, with no idea that restored blob/replica
+   * layouts already occupy bytes further out. Without this, the first new
+   * write after a restart can be handed offset 0 -- already owned by a
+   * restored blob -- and silently overwrite its still-live bytes.
+   */
+  void ReserveRestoredBlockSpace();
 
   /**
    * Retrieve telemetry entries for analysis (non-destructive peek)

@@ -921,6 +921,12 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     // per-insert indexing), so rebuild the regex search index once from the
     // final tag set (#598).
     RebuildTagSearchIndexLocked();
+    // Teach every bdev target's (currently fresh, cursor-at-0) block
+    // allocator about the bytes the just-restored blobs/replicas already
+    // occupy, BEFORE this container's pool is reachable for new PutBlobs.
+    // No co_await between here and targets_ready_ above having been set, so
+    // nothing else can interleave on this worker in that window.
+    ReserveRestoredBlockSpace();
   }
 
   // Open WAL files if metadata_log_path is configured
@@ -5311,6 +5317,20 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
   CLIO_TASK_BODY_END
 }
 
+void Runtime::LogTagIdentity(const TagId &tag_id, const TagInfo &info) {
+  if (tag_txn_logs_.empty()) return;
+  TxnSetTagIdentity txn;
+  txn.tag_major_ = tag_id.major_;
+  txn.tag_minor_ = tag_id.minor_;
+  txn.canonical_name_ = info.tag_name_.str();
+  txn.aliases_.reserve(info.aliases_.size());
+  for (size_t i = 0; i < info.aliases_.size(); ++i) {
+    txn.aliases_.push_back(info.aliases_[i].str());
+  }
+  clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+  tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kSetTagIdentity, txn);
+}
+
 clio::run::TaskResume Runtime::RenameTag(clio::run::shared_ptr<RenameTagTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
@@ -5402,6 +5422,7 @@ clio::run::TaskResume Runtime::RenameTag(clio::run::shared_ptr<RenameTagTask> &t
         for (const auto &k : movers) {
           tag_search_.Rename(k, new_abs + k.substr(old_abs.size()));
         }
+        LogTagIdentity(tag_id, *info);
       }
       task->tag_id_ = tag_id;
       task->return_code_ = 0;
@@ -5425,6 +5446,7 @@ clio::run::TaskResume Runtime::RenameTag(clio::run::shared_ptr<RenameTagTask> &t
         info->tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, new_name);
         info->last_modified_ = GetWallTimeNs();
         info->last_changed_ = info->last_modified_;  // rename => ctime bump
+        LogTagIdentity(tag_id, *info);
       }
     }
     // Flat tags have no hierarchy, so the index key is the verbatim name; move
@@ -5516,6 +5538,7 @@ clio::run::TaskResume Runtime::GetOrCreateTagAlias(
           }
           info->last_modified_ = GetWallTimeNs();
           info->last_changed_ = info->last_modified_;  // link added => ctime
+          LogTagIdentity(tag_id, *info);
         }
       }
     }
@@ -5630,6 +5653,7 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
         }
         tag_info_ptr->last_changed_ = GetWallTimeNs();  // unlink => ctime
         tag_info_ptr->last_modified_ = tag_info_ptr->last_changed_;
+        LogTagIdentity(tag_id, *tag_info_ptr);
       }
       task->return_code_ = 0;
       CLIO_CO_RETURN;
@@ -5657,6 +5681,7 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
         tinfo->tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, new_canonical);
         tinfo->last_changed_ = GetWallTimeNs();   // unlink => ctime
         tinfo->last_modified_ = tinfo->last_changed_;
+        LogTagIdentity(tag_id, *tinfo);
         task->return_code_ = 0;
         CLIO_CO_RETURN;
       }
@@ -5800,6 +5825,7 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
                              : CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
     for (const TagId &del_id : to_delete) {
       std::string del_name;
+      std::vector<std::string> del_aliases;
       {
         std::shared_ptr<TagInfo> info = tag_id_to_info_.get(del_id);
         if (info != nullptr) {
@@ -5808,8 +5834,13 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
           if (!info->tag_name_.empty()) {
             tag_name_to_id_.erase(info->tag_name_.str());
           }
-          // Cascade: remove every alias name bound to this tag.
+          // Cascade: remove every alias name bound to this tag. Captured
+          // into del_aliases BEFORE erasing so the WAL record below can
+          // replay the same cleanup (issue: aliases dangling in
+          // tag_name_to_id_ after a replayed delete otherwise).
+          del_aliases.reserve(info->aliases_.size());
           for (size_t i = 0; i < info->aliases_.size(); ++i) {
+            del_aliases.push_back(info->aliases_[i].str());
             tag_name_to_id_.erase(info->aliases_[i].str());
           }
         }
@@ -5819,6 +5850,7 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
         txn.tag_name_ = del_name;
         txn.tag_major_ = del_id.major_;
         txn.tag_minor_ = del_id.minor_;
+        txn.aliases_ = del_aliases;
         tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
       }
       {
@@ -5851,6 +5883,7 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
         break;  // non-empty directory: this and all higher ancestors persist
       }
       std::string anc_name;
+      std::vector<std::string> anc_aliases;
       {
         std::shared_ptr<TagInfo> info = tag_id_to_info_.get(anc);
         if (info == nullptr) continue;
@@ -5859,7 +5892,9 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
         if (!info->tag_name_.empty()) {
           tag_name_to_id_.erase(anc_name);
         }
+        anc_aliases.reserve(info->aliases_.size());
         for (size_t i = 0; i < info->aliases_.size(); ++i) {
+          anc_aliases.push_back(info->aliases_[i].str());
           tag_name_to_id_.erase(info->aliases_[i].str());
         }
         tag_search_.Delete(anc_abs);
@@ -5870,6 +5905,7 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
         txn.tag_name_ = anc_name;
         txn.tag_major_ = anc.major_;
         txn.tag_minor_ = anc.minor_;
+        txn.aliases_ = anc_aliases;
         tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
       }
     }
@@ -6318,11 +6354,15 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       CLIO_CO_RETURN;
     }
 
-    // Write TagInfo entries (entry_type 0)
+    // Write TagInfo entries (entry_type 5: name + total_size + aliases; see
+    // RestoreMetadataFromLog -- carrying aliases_ here is what lets a hard
+    // link survive a restart even when the WAL that recorded it has since
+    // been compacted into this snapshot).
     tag_id_to_info_.for_each([&](const TagId &id, const std::shared_ptr<TagInfo> &info_sp) { const TagInfo &info = *info_sp; (void)info;
-      uint8_t entry_type = 0;
+      uint8_t entry_type = 5;
       uint32_t name_len = static_cast<uint32_t>(info.tag_name_.size());
       clio::run::u64 total_size = info.total_size_;
+      uint32_t num_aliases = static_cast<uint32_t>(info.aliases_.size());
       ofs.write(reinterpret_cast<const char *>(&entry_type),
                 sizeof(entry_type));
       ofs.write(reinterpret_cast<const char *>(&name_len), sizeof(name_len));
@@ -6330,6 +6370,14 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       ofs.write(reinterpret_cast<const char *>(&id), sizeof(id));
       ofs.write(reinterpret_cast<const char *>(&total_size),
                 sizeof(total_size));
+      ofs.write(reinterpret_cast<const char *>(&num_aliases),
+                sizeof(num_aliases));
+      for (const auto &alias : info.aliases_) {
+        uint32_t alias_len = static_cast<uint32_t>(alias.size());
+        ofs.write(reinterpret_cast<const char *>(&alias_len),
+                  sizeof(alias_len));
+        ofs.write(alias.data(), alias_len);
+      }
       task->entries_flushed_++;
     });
 
@@ -6854,7 +6902,7 @@ void Runtime::RestoreMetadataFromLog() {
     if (!ifs.good()) break;
 
     if (entry_type == 0) {
-      // TagInfo entry
+      // TagInfo entry (legacy layout, no aliases -- see type 5).
       uint32_t name_len;
       ifs.read(reinterpret_cast<char *>(&name_len), sizeof(name_len));
       std::string tag_name(name_len, '\0');
@@ -6870,6 +6918,48 @@ void Runtime::RestoreMetadataFromLog() {
       tag_name_to_id_.insert_or_assign(tag_name, tag_id);
       TagInfo tag_info(tag_name, tag_id);
       tag_info.total_size_ = total_size;
+      tag_id_to_info_.insert_or_assign(tag_id, std::make_shared<TagInfo>(tag_info));
+
+      if (tag_id.minor_ >= max_minor) {
+        max_minor = tag_id.minor_ + 1;
+      }
+      tags_restored++;
+
+    } else if (entry_type == 5) {
+      // TagInfo entry WITH aliases (issue: renames/hard links lost on
+      // crash). FlushMetadata writes this type exclusively now; type 0 is
+      // only read for a snapshot file left by an older binary.
+      uint32_t name_len;
+      ifs.read(reinterpret_cast<char *>(&name_len), sizeof(name_len));
+      std::string tag_name(name_len, '\0');
+      ifs.read(tag_name.data(), name_len);
+      TagId tag_id;
+      ifs.read(reinterpret_cast<char *>(&tag_id), sizeof(tag_id));
+      clio::run::u64 total_size;
+      ifs.read(reinterpret_cast<char *>(&total_size), sizeof(total_size));
+      uint32_t num_aliases;
+      ifs.read(reinterpret_cast<char *>(&num_aliases), sizeof(num_aliases));
+      if (!ifs.good()) break;
+      std::vector<std::string> aliases;
+      aliases.reserve(num_aliases);
+      for (uint32_t i = 0; i < num_aliases; ++i) {
+        uint32_t alias_len;
+        ifs.read(reinterpret_cast<char *>(&alias_len), sizeof(alias_len));
+        std::string alias(alias_len, '\0');
+        ifs.read(alias.data(), alias_len);
+        if (!ifs.good()) break;
+        aliases.push_back(alias);
+      }
+      if (!ifs.good()) break;
+
+      tag_name_to_id_.insert_or_assign(tag_name, tag_id);
+      TagInfo tag_info(tag_name, tag_id);
+      tag_info.total_size_ = total_size;
+      for (const auto &alias : aliases) {
+        tag_name_to_id_.insert_or_assign(alias, tag_id);
+        tag_info.aliases_.push_back(
+            clio::run::priv::string(CLIO_PRIV_ALLOC, alias));
+      }
       tag_id_to_info_.insert_or_assign(tag_id, std::make_shared<TagInfo>(tag_info));
 
       if (tag_id.minor_ >= max_minor) {
@@ -7141,6 +7231,9 @@ void Runtime::ReplayTransactionLogs() {
       case TxnType::kDelTag:
         ApplyWalDelTag(rec.payload_, tags_replayed);
         break;
+      case TxnType::kSetTagIdentity:
+        ApplyWalSetTagIdentity(rec.payload_, tags_replayed);
+        break;
       case TxnType::kCreateNewBlob:
         ApplyWalCreateNewBlob(rec.payload_, blobs_replayed);
         break;
@@ -7248,6 +7341,13 @@ void Runtime::ApplyWalDelTag(const std::vector<char> &payload,
   TagId tag_id{txn.tag_major_, txn.tag_minor_};
   // Erase tag name mapping
   tag_name_to_id_.erase(txn.tag_name_);
+  // Erase every alias binding this tag carried at delete time too -- without
+  // this a hard-linked tag deleted before a crash left its alias names
+  // dangling in tag_name_to_id_ after restart (resolvable to a TagId with no
+  // TagInfo behind it).
+  for (const auto &alias : txn.aliases_) {
+    tag_name_to_id_.erase(alias);
+  }
   // Erase all blobs belonging to this tag
   std::string tag_prefix = std::to_string(tag_id.major_) + "." +
                            std::to_string(tag_id.minor_) + ".";
@@ -7264,6 +7364,59 @@ void Runtime::ApplyWalDelTag(const std::vector<char> &payload,
     shm_cache_.EraseBlob(key);  // issue #783: keep the mirror from going stale
   }
   tag_id_to_info_.erase(tag_id);
+  tags_replayed++;
+}
+
+void Runtime::ApplyWalSetTagIdentity(const std::vector<char> &payload,
+                                     clio::run::u32 &tags_replayed) {
+  auto txn = TransactionLog::DeserializeSetTagIdentity(payload);
+  TagId tag_id{txn.tag_major_, txn.tag_minor_};
+  // Merge-by-seq replay preserves true write order, so the kCreateTag that
+  // made this tag (or the snapshot's type-5 entry) should already be here --
+  // in fact the NORMAL case is a snapshot-restored tag with no kCreateTag in
+  // the WAL at all (compacted away), just this record for a rename/link made
+  // afterward. Create-if-absent is still a defensive fallback, matching every
+  // other ApplyWal* handler.
+  std::shared_ptr<TagInfo> info = tag_id_to_info_.get(tag_id);
+  if (info == nullptr) {
+    TagInfo fresh(txn.canonical_name_, tag_id);
+    tag_id_to_info_.insert_or_assign(tag_id, std::make_shared<TagInfo>(fresh));
+    info = tag_id_to_info_.get(tag_id);
+  }
+  if (info == nullptr) return;
+
+  const std::string old_canonical = info->tag_name_.str();
+  std::vector<std::string> old_aliases;
+  old_aliases.reserve(info->aliases_.size());
+  for (size_t i = 0; i < info->aliases_.size(); ++i) {
+    old_aliases.push_back(info->aliases_[i].str());
+  }
+
+  if (old_canonical != txn.canonical_name_) {
+    if (!old_canonical.empty()) {
+      tag_name_to_id_.erase(old_canonical);
+    }
+    tag_name_to_id_.insert_or_assign(txn.canonical_name_, tag_id);
+  }
+  // Drop any alias this record no longer carries (an unlinked hard link).
+  for (const auto &old_alias : old_aliases) {
+    bool still_present = false;
+    for (const auto &new_alias : txn.aliases_) {
+      if (old_alias == new_alias) { still_present = true; break; }
+    }
+    if (!still_present) {
+      tag_name_to_id_.erase(old_alias);
+    }
+  }
+  // Bind every alias this record carries (idempotent for ones already bound).
+  clio::run::priv::vector<clio::run::priv::string> new_aliases(CLIO_PRIV_ALLOC);
+  for (const auto &alias : txn.aliases_) {
+    tag_name_to_id_.insert_or_assign(alias, tag_id);
+    new_aliases.push_back(clio::run::priv::string(CLIO_PRIV_ALLOC, alias));
+  }
+
+  info->tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, txn.canonical_name_);
+  info->aliases_ = new_aliases;
   tags_replayed++;
 }
 
@@ -7495,6 +7648,69 @@ void Runtime::ApplyWalDelBlob(const std::vector<char> &payload,
                               txn.blob_name_;
   tag_blob_name_to_info_.erase(composite_key);
   blobs_replayed++;
+}
+
+void Runtime::ReserveRestoredBlockSpace() {
+  // Highest (offset + size) any surviving block references, per bdev
+  // target. Only non-volatile targets can appear here at all: the restore
+  // path (RestoreMetadataFromLog / ApplyWalExtendBlob / ApplyWalExtendReplica)
+  // already dropped every volatile (RAM-tier) block, so this is exactly the
+  // set of targets whose ON-DISK bytes are still live and must not be
+  // reallocated.
+  std::unordered_map<clio::run::PoolId, clio::run::u64> reserve_end;
+  auto scan_blocks = [&](const clio::run::priv::vector<BlobBlock> &blocks) {
+    for (const auto &block : blocks) {
+      clio::run::u64 end = block.target_offset_ + block.size_;
+      clio::run::u64 &cur = reserve_end[block.bdev_client_.pool_id_];
+      if (end > cur) cur = end;
+    }
+  };
+  tag_blob_name_to_info_.for_each(
+      [&](const std::string &, const std::shared_ptr<BlobInfo> &blob_info_sp) {
+        const BlobInfo &blob_info = *blob_info_sp;
+        scan_blocks(blob_info.blocks_);
+        for (const auto &rep : blob_info.replicas_) {
+          scan_blocks(rep.blocks_);
+        }
+      });
+  if (reserve_end.empty()) return;
+
+  for (const auto &kv : reserve_end) {
+    const clio::run::PoolId &bdev_pool_id = kv.first;
+    clio::run::u64 reserve_bytes = kv.second;
+    if (reserve_bytes == 0) continue;
+    // Same INLINE path AllocateFromTarget uses for a local bdev container:
+    // a direct, synchronous call into the live block allocator (no task
+    // round trip, no co_await -- this runs inside Create(), before the pool
+    // is reachable, and must not yield here).
+    auto dc = CLIO_POOL_MANAGER->GetRealOrStaticContainer(bdev_pool_id);
+    clio::run::ContainerHold c = dc.get();
+    if (!c) {
+      HLOG(kWarning,
+           "ReserveRestoredBlockSpace: bdev target {}.{} not found locally; "
+           "{} restored bytes there are NOT protected from reallocation",
+           bdev_pool_id.major_, bdev_pool_id.minor_, reserve_bytes);
+      continue;
+    }
+    clio::run::u64 alloc_size = reserve_bytes;
+    std::vector<clio::run::bdev::Block> out_blocks;
+    // One-shot allocation covering [0, reserve_bytes). Deliberately never
+    // freed: this permanently reserves the prefix so no later PutBlob can
+    // land on a restored blob's bytes. It costs capacity (freed gaps inside
+    // the prefix are not reclaimed), never correctness.
+    bool ok = c->InlineOp(clio::run::bdev::Method::kAllocateBlocks,
+                         &alloc_size, &out_blocks);
+    HLOG(kInfo,
+         "ReserveRestoredBlockSpace: bdev target {}.{} reserved {} bytes "
+         "for restored blobs (ok={})",
+         bdev_pool_id.major_, bdev_pool_id.minor_, reserve_bytes, ok);
+    if (!ok) {
+      HLOG(kError,
+           "ReserveRestoredBlockSpace: FAILED to reserve {} bytes on bdev "
+           "target {}.{} -- new writes there may overwrite restored data",
+           reserve_bytes, bdev_pool_id.major_, bdev_pool_id.minor_);
+    }
+  }
 }
 
 // GetWorkRemaining implementation (required pure virtual method)

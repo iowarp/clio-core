@@ -96,6 +96,20 @@ enum class TxnType : uint8_t {
    * does not recognise.
    */
   kSetBlobDroppable = 8,
+  /**
+   * Full replacement of a tag's name identity: its canonical name plus every
+   * alias (hard link) bound to it (issue: renames/hard links lost on crash).
+   *
+   * RenameTag and GetOrCreateTagAlias/DelTag's alias-unlink and
+   * promote-alias-to-canonical paths mutated TagInfo::tag_name_/aliases_ and
+   * tag_name_to_id_ purely in memory, with no WAL record at all -- only the
+   * ORIGINAL kCreateTag binding survived a restart, so a rename or hard link
+   * made after the last FlushMetadata snapshot (and before a crash) vanished.
+   * A full-identity record (not a delta) after ANY of those mutations is
+   * simplest to replay correctly regardless of which shard/seq order the
+   * records land in -- see ApplyWalSetTagIdentity.
+   */
+  kSetTagIdentity = 9,
 };
 
 /** A single block entry within TxnExtendBlob */
@@ -173,11 +187,24 @@ struct TxnCreateTag {
   clio::run::u32 tag_minor_;
 };
 
-/** Payload: delete a tag */
+/** Payload: delete a tag. `aliases_` is the FULL alias list at the moment of
+ *  delete, captured so replay can drop every alias's tag_name_to_id_
+ *  binding, not just the canonical name -- otherwise a hard-linked tag
+ *  deleted before a crash left its alias names dangling after restart. */
 struct TxnDelTag {
   std::string tag_name_;
   clio::run::u32 tag_major_;
   clio::run::u32 tag_minor_;
+  std::vector<std::string> aliases_;
+};
+
+/** Payload: full replacement of a tag's name identity (issue: renames/hard
+ *  links lost on crash). See TxnType::kSetTagIdentity. */
+struct TxnSetTagIdentity {
+  clio::run::u32 tag_major_;
+  clio::run::u32 tag_minor_;
+  std::string canonical_name_;
+  std::vector<std::string> aliases_;
 };
 
 /**
@@ -357,6 +384,17 @@ class TransactionLog {
     WriteString(buffer_, txn.tag_name_);
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
+    WriteStringVector(buffer_, txn.aliases_);
+    WriteRecord(type, buffer_);
+  }
+
+  void Log(TxnType type, const TxnSetTagIdentity &txn) {
+    std::lock_guard<std::mutex> lk(mu_);
+    buffer_.clear();
+    WriteU32(buffer_, txn.tag_major_);
+    WriteU32(buffer_, txn.tag_minor_);
+    WriteString(buffer_, txn.canonical_name_);
+    WriteStringVector(buffer_, txn.aliases_);
     WriteRecord(type, buffer_);
   }
 
@@ -565,6 +603,21 @@ class TransactionLog {
     txn.tag_name_ = ReadString(data, off);
     txn.tag_major_ = ReadU32(data, off);
     txn.tag_minor_ = ReadU32(data, off);
+    // Older (pre-alias-tracking) records end here: no aliases_ to read.
+    if (off < data.size()) {
+      txn.aliases_ = ReadStringVector(data, off);
+    }
+    return txn;
+  }
+
+  static TxnSetTagIdentity DeserializeSetTagIdentity(
+      const std::vector<char> &data) {
+    TxnSetTagIdentity txn;
+    size_t off = 0;
+    txn.tag_major_ = ReadU32(data, off);
+    txn.tag_minor_ = ReadU32(data, off);
+    txn.canonical_name_ = ReadString(data, off);
+    txn.aliases_ = ReadStringVector(data, off);
     return txn;
   }
 
@@ -652,6 +705,14 @@ class TransactionLog {
     const char *p = reinterpret_cast<const char *>(ptr);
     buf.insert(buf.end(), p, p + len);
   }
+  /** [u32 count][WriteString each] -- used for TagInfo::aliases_. */
+  static void WriteStringVector(std::vector<char> &buf,
+                                const std::vector<std::string> &v) {
+    WriteU32(buf, static_cast<clio::run::u32>(v.size()));
+    for (const auto &s : v) {
+      WriteString(buf, s);
+    }
+  }
 
   // ---- Deserialization primitives ----
   static clio::run::u32 ReadU32(const std::vector<char> &data, size_t &off) {
@@ -677,6 +738,16 @@ class TransactionLog {
     std::string s(data.data() + off, len);
     off += len;
     return s;
+  }
+  static std::vector<std::string> ReadStringVector(
+      const std::vector<char> &data, size_t &off) {
+    clio::run::u32 count = ReadU32(data, off);
+    std::vector<std::string> v;
+    v.reserve(count);
+    for (clio::run::u32 i = 0; i < count; ++i) {
+      v.push_back(ReadString(data, off));
+    }
+    return v;
   }
   static void ReadRaw(const std::vector<char> &data, size_t &off, void *ptr,
                       size_t len) {

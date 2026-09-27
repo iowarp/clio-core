@@ -235,6 +235,13 @@ def run_one(cl, t, hosts, log):
     rec['status'] = 'ERROR'
     rec['error'] = f'{type(e).__name__}: {e}\n{traceback.format_exc()[-2000:]}'
   rec['secs'] = round(time.time() - t0, 2)
+  if rec['status'] == 'PASS':
+    # Free the test's data: later tests (and the disk tier on nodes with
+    # little NVMe headroom) must not inherit it. Also exercises unlink/rmdir
+    # of whole trees at scale.
+    r = cl.agent(hosts[0]).call('rmtree', timeout=900, path=ctx.dir)
+    if not r.get('ok'):
+      ctx.notes.append(f'cleanup rmtree failed: {r.get("err")}')
   rec['notes'] = ctx.notes
   rec['metrics'] = ctx.metrics
   if ctx.hang_hosts:

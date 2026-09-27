@@ -59,9 +59,10 @@ def build_dataset(ctx, tag, per_node=12):
     exp.update(local)
   # Rename a file across node dirs so metadata of one node references
   # another node's data (exercises the cross-node rename path + recovery).
-  if n > 1:
-    src = next(k for k in sorted(exp) if k.startswith('node0/f')
-               and exp[k][0] == 'f')
+  cands = [k for k in sorted(exp) if k.startswith('node0/') and
+           exp[k][0] == 'f']
+  if n > 1 and cands:
+    src = cands[0]
     dst = f'node{n - 1}/moved_from_node0'
     ctx.ok(n - 1, 'rename', src=f'{root}/{src}', dst=f'{root}/{dst}')
     exp[dst] = exp.pop(src)
