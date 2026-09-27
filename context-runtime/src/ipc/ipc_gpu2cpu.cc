@@ -381,7 +381,7 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
     // makes the async completion path actually asynchronous. These buffers
     // are per device-task-slot and long-lived, so the pinning cost is paid
     // once per slot, not per task.
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_CUDA || CTP_ENABLE_SYCL
     // Slot scratch must be PINNED (pageable makes every completion copy an
     // internally staged synchronous one -- measured as the difference
     // between a working and a crawling MoE fault pipeline) and must NOT be
@@ -402,9 +402,24 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
         if (n > left) {
           const size_t slab = n > (64u << 20) ? n : (64u << 20);
           void *p = nullptr;
+#if CTP_ENABLE_CUDA
           if (cudaHostAlloc(&p, slab, cudaHostAllocDefault) != cudaSuccess) {
             return nullptr;
           }
+#else
+          // SYCL: USM host memory. The GPU writes task PODs and completion
+          // flags into this scratch through the ring stream; heap memory
+          // there is a pageable userptr the driver can lose under THP
+          // collapse (the host-address NotPresent faults at 64 nodes).
+          try {
+            p = ctp::GpuApi::MallocHost<char>(slab);
+          } catch (const sycl::exception &) {
+            p = nullptr;
+          }
+          if (p == nullptr) {
+            return nullptr;
+          }
+#endif
           cur = static_cast<char *>(p);
           left = slab;
         }

@@ -120,6 +120,9 @@ __global__ void CtpCopyKernel(char *dst, const char *src, size_t n) {
 }
 #endif
 
+// Defined after the class; GpuApi::Memcpy's SYCL branch routes through it.
+inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n);
+
 class GpuApi {
  public:
   static void SetDevice(int gpu_id) {
@@ -748,7 +751,14 @@ class GpuApi {
 #elif CTP_ENABLE_CUDA
     CUDA_ERROR_CHECK(cudaMemcpy(dst, src, size, cudaMemcpyDefault));
 #elif CTP_ENABLE_SYCL
-    SyclQueue().memcpy(dst, src, size).wait_and_throw();
+    // NEVER hand Level Zero a pageable host pointer. A direct queue memcpy
+    // from a heap buffer (std::vector page staging in gpu_vector) maps it as
+    // a userptr; the compute nodes run THP in 'always' mode and khugepaged
+    // moves such pages under the mapping, which surfaced as intermittent
+    // single-rank "Segmentation fault from GPU at <host addr> NotPresent"
+    // (E5 64 nodes: 8873678 rank 40, 8872xxx rank 46). DeviceAwareMemcpy
+    // bounces a pageable side through this thread's pinned USM buffer.
+    DeviceAwareMemcpy(dst, src, size);
 #endif
   }
 
@@ -1049,7 +1059,7 @@ class GpuApi {
         // below polls the stream.
         static_cast<sycl::queue *>(stream)->memcpy(dst, src, size);
       } else {
-        SyclCopySync(SyclQueue(), dst, src, size);
+        DeviceAwareMemcpy(dst, src, size);  // pinned bounce for a pageable side
       }
     }
 #endif
