@@ -313,12 +313,14 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // authoritative ENOENT. After a restart (or over a pre-existing core pool)
   // the root already has children the mirror has never seen, and marking it
   // complete made the whole recovered namespace read ENOENT on a single node.
-  {
-    auto q = cte_.AsyncTagQuery("^/[^/]+$", 1, clio::run::PoolQuery::Dynamic());
-    CLIO_CO_AWAIT(q);
-    const bool empty = (q->GetReturnCode() == 0 && q->results_.empty());
-    MirrorDir("/", clio::cte::core::TagId::GetNull(), /*complete=*/empty);
-  }
+  //
+  // Never claim it at Create: the probe that used to decide it (a TagQuery
+  // for "^/[^/]+$") could come back empty right after a restart that
+  // restored a large namespace, and one wrong "complete" makes every stat
+  // under / read ENOENT for the life of the daemon while readdir (which asks
+  // the core) still lists the names. Only the root's own negative lookups
+  // lose the fast path; directories created from now on are still complete.
+  MirrorDir("/", clio::cte::core::TagId::GetNull(), /*complete=*/false);
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

@@ -7378,6 +7378,16 @@ void Runtime::ApplyWalSetTagIdentity(const std::vector<char> &payload,
   // afterward. Create-if-absent is still a defensive fallback, matching every
   // other ApplyWal* handler.
   std::shared_ptr<TagInfo> info = tag_id_to_info_.get(tag_id);
+  // Was this tag missing from tag_id_to_info_ entirely before this record?
+  // If so, tag_name_to_id_ cannot have a binding for it either yet -- the
+  // canonical-name bind below must run UNCONDITIONALLY in that case, even
+  // though info->tag_name_ (freshly seeded with txn.canonical_name_ two
+  // lines down) will equal txn.canonical_name_ and so look like a no-op
+  // rename. Missing this left the tag resolvable by id/readdir (it is in
+  // tag_id_to_info_) but NOT by path (ResolvePathToIdLocked walks
+  // tag_name_to_id_ only) -- every one of its descendants then read back
+  // ENOENT after a restart.
+  const bool was_absent = (info == nullptr);
   if (info == nullptr) {
     TagInfo fresh(txn.canonical_name_, tag_id);
     tag_id_to_info_.insert_or_assign(tag_id, std::make_shared<TagInfo>(fresh));
@@ -7392,8 +7402,8 @@ void Runtime::ApplyWalSetTagIdentity(const std::vector<char> &payload,
     old_aliases.push_back(info->aliases_[i].str());
   }
 
-  if (old_canonical != txn.canonical_name_) {
-    if (!old_canonical.empty()) {
+  if (was_absent || old_canonical != txn.canonical_name_) {
+    if (!old_canonical.empty() && old_canonical != txn.canonical_name_) {
       tag_name_to_id_.erase(old_canonical);
     }
     tag_name_to_id_.insert_or_assign(txn.canonical_name_, tag_id);
