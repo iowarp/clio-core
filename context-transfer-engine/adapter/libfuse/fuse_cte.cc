@@ -481,6 +481,20 @@ clio::cte::core::TagId MintTagId(const std::string &path) {
       major, (epoch << 20) + counter.fetch_add(1, std::memory_order_relaxed));
 }
 
+/**
+ * Map a filesystem task's return code to a FUSE result. The chimod answers
+ * with errno values, but a task that failed in the runtime (an unreachable
+ * node, a network timeout) carries a runtime code; passed through raw it
+ * surfaced as a nonsense errno (mkdir: ERANGE). Those become EIO.
+ * @param rc task return code
+ * @return 0 or a negative errno
+ */
+static inline int FsErrno(int rc) {
+  if (rc == 0) return 0;
+  if (rc > 0 && rc < 4096) return -rc;
+  return -EIO;
+}
+
 // ---------------------------------------------------------------------------
 // Hard-link groups (issue #1007 follow-up): the kernel does NOT invalidate a
 // link TARGET's cached attrs when a sibling name is linked or unlinked, so a
@@ -1544,7 +1558,7 @@ int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
   auto t = cfs->AsyncUtimens(std::string(path), atime_ns, mtime_ns, flags);
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());
-  return rc == 0 ? 0 : -rc;
+  return FsErrno(rc);
 }
 
 // chmod records the permission bits as a per-file override in the chimod
@@ -1706,7 +1720,7 @@ int cte_fuse_mkdir(const char *path, cte_mode_t mode) {
   auto t = cfs->AsyncMkdir(std::string(path));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());  // errno-style (0/EEXIST/EIO)
-  if (rc != 0) return -rc;
+  if (rc != 0) return FsErrno(rc);
   // The kernel hands us the umask-applied mode; anything but the synthesized
   // default must be recorded (mkdir -m 700 / private temp dirs).
   const clio::run::u32 perm = static_cast<clio::run::u32>(mode) & 07777u;
@@ -1723,7 +1737,7 @@ int cte_fuse_rmdir(const char *path) {
   auto t = cfs->AsyncRmdir(std::string(path));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());  // 0/ENOTEMPTY/ENOENT/EIO
-  return rc == 0 ? 0 : -rc;
+  return FsErrno(rc);
 }
 
 // ============================================================================
@@ -2174,7 +2188,7 @@ int cte_fuse_unlink(const char *path) {
       InvalidatePath(sib);  // their nlink/ctime changed under the TTL
     }
   }
-  return rc == 0 ? 0 : -rc;
+  return FsErrno(rc);
 }
 
 int cte_fuse_truncate(const char *path, cte_off_t size,
@@ -2354,7 +2368,7 @@ int cte_fuse_link(const char *from, const char *to) {
     LinkGroupJoin(std::string(from), std::string(to));
     InvalidatePath(std::string(from));  // nlink/ctime changed under the TTL
   }
-  return rc == 0 ? 0 : -rc;  // chimod returns errno-style codes
+  return FsErrno(rc);  // chimod returns errno-style codes
 }
 
 int cte_fuse_symlink(const char *target, const char *path) {
@@ -2365,7 +2379,7 @@ int cte_fuse_symlink(const char *target, const char *path) {
   auto t = cfs->AsyncSymlink(std::string(target), std::string(path));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());  // 0/EEXIST/EIO
-  return rc == 0 ? 0 : -rc;  // chimod returns errno-style codes
+  return FsErrno(rc);  // chimod returns errno-style codes
 }
 
 int cte_fuse_readlink(const char *path, char *buf, size_t size) {
@@ -2379,7 +2393,7 @@ int cte_fuse_readlink(const char *path, char *buf, size_t size) {
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());  // 0/ENOENT/EINVAL
   if (rc != 0) {
-    return -rc;
+    return FsErrno(rc);
   }
   std::string target = t->target_.str();
   size_t n = std::min(target.size(), size - 1);
@@ -2401,7 +2415,7 @@ static int cte_fuse_setxattr(const char *path, const char *name,
                               static_cast<unsigned int>(flags));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());
-  return rc == 0 ? 0 : -rc;  // EEXIST/ENODATA/ENOENT/EIO -> negative errno
+  return FsErrno(rc);  // EEXIST/ENODATA/ENOENT/EIO -> negative errno
 }
 
 static int cte_fuse_getxattr(const char *path, const char *name, char *value,
@@ -2439,7 +2453,7 @@ static int cte_fuse_getxattr(const char *path, const char *name, char *value,
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());
   if (rc != 0) {
-    return -rc;  // ENOENT (file absent)
+    return FsErrno(rc);  // ENOENT (file absent)
   }
   if (t->found_ == 0) {
     return -ENODATA;  // attribute not present
@@ -2488,7 +2502,7 @@ static int cte_fuse_listxattr(const char *path, char *list, size_t size) {
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());
   if (rc != 0) {
-    return -rc;  // ENOENT
+    return FsErrno(rc);  // ENOENT
   }
   std::string names = t->names_.str();
   size_t len = names.size();
@@ -2508,7 +2522,7 @@ static int cte_fuse_removexattr(const char *path, const char *name) {
   auto t = cfs->AsyncRemovexattr(std::string(path), std::string(name));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());
-  return rc == 0 ? 0 : -rc;  // ENODATA/ENOENT/EIO -> negative errno
+  return FsErrno(rc);  // ENODATA/ENOENT/EIO -> negative errno
 }
 
 #ifndef RENAME_NOREPLACE
@@ -2570,7 +2584,7 @@ int cte_fuse_rename(const char *from, const char *to,
   t.Wait();
   if (t->GetReturnCode() == 0) LinkGroupRename(std::string(from), std::string(to));
   int rc = static_cast<int>(t->GetReturnCode());
-  return rc == 0 ? 0 : -rc;  // chimod returns errno-style codes (ENOENT/EIO)
+  return FsErrno(rc);  // chimod returns errno-style codes (ENOENT/EIO)
 }
 
 // ============================================================================

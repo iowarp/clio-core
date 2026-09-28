@@ -494,6 +494,22 @@ private:
    */
   void NoteProbeFailure(clio::run::u64 node_id);
   void ScanTaskProgress();
+  /**
+   * Step 1 of ScanTaskProgress: reap answered probes and act on silent ones,
+   * in ONE compaction pass (the per-item vector::erase this replaced was
+   * O(n^2): thousands of probes under load held the network worker for 25 s).
+   * @param now scan time
+   * @param judge false when this node's own scan was delayed, so a probe's
+   *        silence says nothing about its target (re-arm instead of kill)
+   */
+  void ReapProgressProbes(std::chrono::steady_clock::time_point now,
+                          bool judge);
+  /** Step 2: probe replicas outstanding beyond the interval (bounded). */
+  void FireStuckProbes(clio::run::u32 interval_ms);
+  /** Step 3: probe silent idle peers, one probe per peer at a time. */
+  void FireIdleProbes();
+  /** When ScanTaskProgress last ran (detects this node's own stalls). */
+  std::chrono::steady_clock::time_point last_progress_scan_{};
   std::mt19937 probe_rng_{std::random_device{}()};
 
   // SWIM probe / suspicion timeouts. The prior 5 s direct + 3 s

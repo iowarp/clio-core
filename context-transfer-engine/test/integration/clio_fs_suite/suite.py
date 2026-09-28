@@ -249,6 +249,19 @@ def run_one(cl, t, hosts, log):
   return rec
 
 
+def count_stalls(cl, hosts):
+  """Scheduler 'worker N STALLED' warnings so far in each daemon's log (a
+  runtime worker stuck in one task >1 s); attributed per test in the notes."""
+  out = {}
+  for h in hosts:
+    try:
+      with open(cl.log_path(h, 'runtime'), 'rb') as f:
+        out[h] = f.read().count(b'STALLED on one task')
+    except OSError:
+      out[h] = 0
+  return out
+
+
 def main():
   ap = argparse.ArgumentParser()
   ap.add_argument('--bin', required=True)
@@ -314,7 +327,13 @@ def main():
     for t in sel:
       nh = hosts if t['max_nodes'] is None else hosts[:t['max_nodes']]
       log(f'RUN  {t["group"]}/{t["name"]} on {len(nh)} node(s)')
+      stalls0 = count_stalls(cl, hosts)
       rec = run_one(cl, t, nh, log)
+      stalls1 = count_stalls(cl, hosts)
+      grew = {h: stalls1[h] - stalls0.get(h, 0) for h in stalls1
+              if stalls1[h] > stalls0.get(h, 0)}
+      if grew:
+        rec.setdefault('notes', []).append(f'worker stall warnings: {grew}')
       log(f'{rec["status"]:5} {t["name"]} ({rec["secs"]}s) '
           f'{rec.get("error", "")[:400]}')
       for n in rec['notes']:

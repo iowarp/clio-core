@@ -18,6 +18,10 @@
 #include "clio_runtime/types.h"
 #include "clio_run_commands.h"
 
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+
 namespace {
 volatile sig_atomic_t g_keep_running = 1;
 
@@ -315,7 +319,23 @@ std::string FindRecoverableState() {
   return "";
 }
 
+/**
+ * Let a debugger attach to this daemon when CLIO_ALLOW_PTRACE=1. Hosts with
+ * kernel.yama.ptrace_scope=1 only allow tracing of descendants, so a hung or
+ * stalled runtime could not be sampled with `gdb -p` without restarting it
+ * under gdb (which yields one snapshot and then kills it). Opt-in only.
+ */
+static void MaybeAllowPtrace() {
+#if defined(__linux__) && defined(PR_SET_PTRACER)
+  const char *e = std::getenv("CLIO_ALLOW_PTRACE");
+  if (e != nullptr && e[0] == '1') {
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+  }
+#endif
+}
+
 int RuntimeStart(int argc, char* argv[]) {
+  MaybeAllowPtrace();
   bool induct = false;
   bool fresh = false;
   bool ephemeral = false;
@@ -409,6 +429,7 @@ int RuntimeStart(int argc, char* argv[]) {
 }
 
 int RuntimeRestart(int argc, char* argv[]) {
+  MaybeAllowPtrace();
   bool induct = false;
   for (int i = 0; i < argc; ++i) {
     VizArg viz_arg = ParseVizArg(argc, argv, i);

@@ -176,6 +176,11 @@ class Cluster:
         'CLIO_SUITE_NET_DEAD_FAIL_FAST', '1')
     if self.attr_cache_s is not None:
       e['CLIO_FUSE_ATTR_CACHE_S'] = str(self.attr_cache_s)
+    # CLIO_SUITE_PASS_<NAME>=v exports <NAME>=v to every daemon, mount and
+    # agent (e.g. CLIO_SUITE_PASS_CLIO_ALLOW_PTRACE=1 to gdb -p a daemon).
+    for k, v in os.environ.items():
+      if k.startswith('CLIO_SUITE_PASS_'):
+        e[k[len('CLIO_SUITE_PASS_'):]] = v
     e.update(self.extra_env)
     return e
 
