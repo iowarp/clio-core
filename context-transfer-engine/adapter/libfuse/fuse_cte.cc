@@ -933,8 +933,22 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   if (const char *ttl_env = getenv("CLIO_FUSE_ATTR_CACHE_S")) {
     if (*ttl_env != '\0') attr_ttl = atof(ttl_env);
   }
+  // The ENTRY (name -> inode) cache is kept even on multi-node mounts. The
+  // namespace is hash-sharded, so with a zero entry TTL every path component
+  // of every syscall was its own round trip to that component's owner
+  // (~0.7 ms each at 8 nodes): git's deep .git/objects paths made a single
+  // clone >60x slower than on one node. A cached dentry cannot serve a stale
+  // ANSWER here: this is the high-level API, which re-resolves the full path
+  // at the owner for every getattr/open, so a name another node removed or
+  // renamed fails ENOENT at once. Attributes (size) and negative entries
+  // stay uncached on multi-node, so close-to-open and remote creates are
+  // exact. CLIO_FUSE_ENTRY_CACHE_S overrides.
+  double entry_ttl = MultiNode() ? 1.0 : attr_ttl;
+  if (const char *ttl_env = getenv("CLIO_FUSE_ENTRY_CACHE_S")) {
+    if (*ttl_env != '\0') entry_ttl = atof(ttl_env);
+  }
   cfg->attr_timeout = attr_ttl;
-  cfg->entry_timeout = attr_ttl;
+  cfg->entry_timeout = entry_ttl;
   cfg->negative_timeout = attr_ttl;
   // Writeback cache: OFF by default. Enabling it batches write()s in the
   // kernel page cache, but the kernel then requires the filesystem to be a
