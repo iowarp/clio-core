@@ -67,7 +67,10 @@ while read -r t; do
   n=$((n+1))
   if ! mount_fresh; then echo "${t} : MOUNTFAIL" | tee -a "${RESULTS}"; continue; fi
   OUT=$(mktemp)
-  ./check "${t}" >"${OUT}" 2>&1 &
+  # Own session/process group, so a hang can kill the WHOLE test tree: the
+  # old `pkill -P` reached only check's direct children, and grandchildren
+  # (e.g. vfstest) kept running against later tests' mounts, failing them.
+  setsid ./check "${t}" >"${OUT}" 2>&1 &
   cpid=$!
   waited=0; hung=1
   while [ "${waited}" -lt "${TIMEOUT}" ]; do
@@ -82,7 +85,7 @@ while read -r t; do
     done
     fusermount3 -uz "${TEST_DIR}" 2>/dev/null; umount -l "${TEST_DIR}" 2>/dev/null
     pkill -9 -x clio_cte_fuse 2>/dev/null
-    kill -9 "${cpid}" 2>/dev/null; pkill -9 -P "${cpid}" 2>/dev/null
+    kill -9 -- "-${cpid}" 2>/dev/null; kill -9 "${cpid}" 2>/dev/null
     echo "${t} : HANG  (${n}/${total})" | tee -a "${RESULTS}"
   elif grep -q '^Passed all' "${OUT}"; then echo "${t} : pass  (${n}/${total})" | tee -a "${RESULTS}"
   elif grep -q '^Not run:' "${OUT}"; then echo "${t} : notrun  (${n}/${total})" | tee -a "${RESULTS}"
