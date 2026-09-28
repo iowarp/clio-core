@@ -48,7 +48,15 @@ teardown() {
 trap 'teardown; exit 0' EXIT
 
 mount_fresh() {
-  teardown; sleep 0.4
+  teardown
+  # The previous daemon must be GONE before remounting: a lazily-detached
+  # old mount still answered `mountpoint`, check then found no live mount
+  # and failed the test on "could not mount clio_test" (a harness race that
+  # failed generic/014, 075, 114, 134, 248 only inside a full sweep).
+  for _ in $(seq 1 50); do
+    pgrep -x clio_cte_fuse >/dev/null 2>&1 || break; sleep 0.1
+  done
+  sleep 0.2
   # Load the same 2g DRAM-tier config the real runner uses; otherwise the daemon
   # falls back to a ~100 MB default tier that starves large-write/O_DIRECT tests
   # with ENOSPC (a sweep-only false failure). Matches run_clio_xfstests.sh.
@@ -56,7 +64,13 @@ mount_fresh() {
     CLIO_REPO_PATH="${BUILD_BIN}" LD_LIBRARY_PATH="${BUILD_BIN}:${HOME}/.local/lib:${LD_LIBRARY_PATH:-}" \
     CLIO_WITH_RUNTIME=1 CLIO_BIND_ADDR=127.0.0.1 \
     "${FUSE_BIN}" "${TEST_DIR}" -o fsname=clio_test -f >/dev/null 2>&1 &
-  for _ in $(seq 1 50); do mountpoint -q "${TEST_DIR}" && return 0; sleep 0.2; done
+  for _ in $(seq 1 50); do
+    if mountpoint -q "${TEST_DIR}" && touch "${TEST_DIR}/.clio_probe" 2>/dev/null &&
+       rm -f "${TEST_DIR}/.clio_probe"; then
+      return 0
+    fi
+    sleep 0.2
+  done
   return 1
 }
 
