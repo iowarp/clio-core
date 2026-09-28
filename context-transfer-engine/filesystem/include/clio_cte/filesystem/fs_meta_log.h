@@ -54,6 +54,7 @@
 #include <vector>
 
 #include <clio_runtime/clio_runtime.h>
+#include <clio_cte/core/record_log.h>
 
 namespace clio::cte::filesystem {
 
@@ -69,59 +70,58 @@ enum class FsLogRec : clio::run::u32 {
   kNextId = 8,    /**< id-mint reservation high-water mark */
 };
 
-/** One container's append-only metadata log (thread-safe). */
+/** One container's append-only metadata log (a typed RecordLog). */
 class FsMetaLog {
  public:
-  FsMetaLog() = default;
-  ~FsMetaLog();
-  FsMetaLog(const FsMetaLog &) = delete;
-  FsMetaLog &operator=(const FsMetaLog &) = delete;
-
   /**
    * Open (creating parent directories and the file) for replay + append.
    * @param path log file path
    * @return true on success
    */
-  bool Open(const std::string &path);
+  bool Open(const std::string &path) { return log_.Open(path); }
 
   /** @return true once Open succeeded. */
-  bool IsOpen() const { return fd_ >= 0; }
+  bool IsOpen() const { return log_.IsOpen(); }
 
   /**
-   * Replay every intact record in order, then cut the file after the last
-   * intact one (a crash can leave a torn final record).
+   * Replay every intact record in order; cuts a torn tail.
    * @param fn called with (record type, payload) per record
    * @return number of records replayed
    */
-  size_t Replay(const std::function<void(FsLogRec, const std::string &)> &fn);
+  size_t Replay(const std::function<void(FsLogRec, const std::string &)> &fn) {
+    return log_.Replay([&fn](clio::run::u32 t, const std::string &p) {
+      fn(static_cast<FsLogRec>(t), p);
+    });
+  }
 
   /**
-   * Append one record with a single write(2). No-op when not open.
+   * Append one record. No-op when not open.
    * @param type record type
    * @param payload encoded record body
    */
-  void Append(FsLogRec type, const std::string &payload);
+  void Append(FsLogRec type, const std::string &payload) {
+    log_.Append(static_cast<clio::run::u32>(type), payload);
+  }
 
   /**
-   * Atomically replace the log with `records` (write temp, fsync, rename)
-   * and keep appending to the new file.
+   * Atomically replace the log with a snapshot.
    * @param records full snapshot of the live state
-   * @return true on success (the old log stays in place on failure)
+   * @return true on success
    */
-  bool Rewrite(const std::vector<std::pair<FsLogRec, std::string>> &records);
+  bool Rewrite(const std::vector<std::pair<FsLogRec, std::string>> &records) {
+    std::vector<std::pair<clio::run::u32, std::string>> raw;
+    raw.reserve(records.size());
+    for (const auto &r : records) {
+      raw.emplace_back(static_cast<clio::run::u32>(r.first), r.second);
+    }
+    return log_.Rewrite(raw);
+  }
 
   /** @return bytes appended since the last Open/Rewrite. */
-  clio::run::u64 BytesSinceCompact() const { return since_compact_; }
+  clio::run::u64 BytesSinceCompact() const { return log_.BytesSinceCompact(); }
 
  private:
-  /** Serialize one record into `out`. */
-  static void Frame(FsLogRec type, const std::string &payload,
-                    std::string *out);
-
-  std::string path_;
-  int fd_ = -1;
-  std::mutex mu_;
-  clio::run::u64 since_compact_ = 0;
+  clio::cte::core::RecordLog log_;
 };
 
 }  // namespace clio::cte::filesystem

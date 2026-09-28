@@ -1227,6 +1227,34 @@ set_tests_properties(
 )
 endif()  # TARGET clio_cte_cache_client
 
+if(TARGET clio_cte_stream_client)
+add_executable(test_stream_append test_stream_append.cc)
+target_include_directories(test_stream_append PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/stream/include
+)
+target_link_libraries(test_stream_append
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_stream_runtime
+    clio_cte_stream_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+add_test(NAME cte_stream_append COMMAND test_stream_append)
+set_tests_properties(
+    cte_stream_append
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;stream;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()  # TARGET clio_cte_stream_client
+
 #------------------------------------------------------------------------------
 # Checkpoint chimod (vector.Copy lazy copies): a fault-handled tag resolves
 # missing blobs from its source tag -- get fault, put-side materialise-then-

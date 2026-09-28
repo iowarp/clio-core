@@ -30,7 +30,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-#include <clio_cte/filesystem/fs_meta_log.h>
+#include <clio_cte/core/record_log.h>
 
 #include <cerrno>
 #include <cstring>
@@ -40,7 +40,7 @@
 
 #include <filesystem>
 
-namespace clio::cte::filesystem {
+namespace clio::cte::core {
 
 namespace {
 constexpr clio::run::u32 kRecMagic = 0xC1F5E6A1u;
@@ -86,11 +86,11 @@ std::string Slurp(int fd) {
 }
 }  // namespace
 
-FsMetaLog::~FsMetaLog() {
+RecordLog::~RecordLog() {
   if (fd_ >= 0) ::close(fd_);
 }
 
-bool FsMetaLog::Open(const std::string &path) {
+bool RecordLog::Open(const std::string &path) {
   std::lock_guard<std::mutex> g(mu_);
   path_ = path;
   std::error_code ec;
@@ -101,11 +101,11 @@ bool FsMetaLog::Open(const std::string &path) {
   return fd_ >= 0;
 }
 
-void FsMetaLog::Frame(FsLogRec type, const std::string &payload,
+void RecordLog::Frame(clio::run::u32 type, const std::string &payload,
                       std::string *out) {
   const clio::run::u32 magic = kRecMagic;
   const clio::run::u32 len = static_cast<clio::run::u32>(payload.size());
-  const char t = static_cast<char>(static_cast<clio::run::u32>(type) & 0xFF);
+  const char t = static_cast<char>(type & 0xFF);
   clio::run::u32 sum = Fnv1a(&t, 1);
   sum = Fnv1a(payload.data(), payload.size(), sum);
   out->append(reinterpret_cast<const char *>(&magic), 4);
@@ -115,8 +115,8 @@ void FsMetaLog::Frame(FsLogRec type, const std::string &payload,
   out->append(reinterpret_cast<const char *>(&sum), 4);
 }
 
-size_t FsMetaLog::Replay(
-    const std::function<void(FsLogRec, const std::string &)> &fn) {
+size_t RecordLog::Replay(
+    const std::function<void(clio::run::u32, const std::string &)> &fn) {
   std::lock_guard<std::mutex> g(mu_);
   if (fd_ < 0) return 0;
   const std::string all = Slurp(fd_);
@@ -133,7 +133,7 @@ size_t FsMetaLog::Replay(
     const char *body = all.data() + off + 8;  // type byte + payload
     std::memcpy(&sum, body + 1 + len, 4);
     if (Fnv1a(body, 1 + len) != sum) break;
-    fn(static_cast<FsLogRec>(static_cast<unsigned char>(body[0])),
+    fn(static_cast<clio::run::u32>(static_cast<unsigned char>(body[0])),
        std::string(body + 1, len));
     off += kRecHeader + len + kRecTrailer;
     ++n;
@@ -142,29 +142,29 @@ size_t FsMetaLog::Replay(
     // A torn or corrupt tail: everything after the last intact record is
     // unacknowledged work from a crash. Cut it so appends stay parseable.
     if (::ftruncate(fd_, static_cast<off_t>(off)) != 0) {
-      HLOG(kError, "fs meta log: truncating torn tail of {} failed: {}",
+      HLOG(kError, "record log: truncating torn tail of {} failed: {}",
            path_, std::strerror(errno));
     }
   }
   return n;
 }
 
-void FsMetaLog::Append(FsLogRec type, const std::string &payload) {
+void RecordLog::Append(clio::run::u32 type, const std::string &payload) {
   std::string rec;
   rec.reserve(payload.size() + kRecHeader + kRecTrailer);
   Frame(type, payload, &rec);
   std::lock_guard<std::mutex> g(mu_);
   if (fd_ < 0) return;
   if (!WriteAll(fd_, rec.data(), rec.size())) {
-    HLOG(kError, "fs meta log: append to {} failed: {}", path_,
+    HLOG(kError, "record log: append to {} failed: {}", path_,
          std::strerror(errno));
     return;
   }
   since_compact_ += rec.size();
 }
 
-bool FsMetaLog::Rewrite(
-    const std::vector<std::pair<FsLogRec, std::string>> &records) {
+bool RecordLog::Rewrite(
+    const std::vector<std::pair<clio::run::u32, std::string>> &records) {
   std::string buf;
   for (const auto &r : records) Frame(r.first, r.second, &buf);
   std::lock_guard<std::mutex> g(mu_);
@@ -186,4 +186,4 @@ bool FsMetaLog::Rewrite(
   return true;
 }
 
-}  // namespace clio::cte::filesystem
+}  // namespace clio::cte::core

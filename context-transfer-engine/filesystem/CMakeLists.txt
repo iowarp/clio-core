@@ -10,7 +10,6 @@ add_clio_module_runtime(
   SOURCES
     src/filesystem_runtime.cc
     src/fs_namespace.cc
-    src/fs_meta_log.cc
     src/autogen/filesystem_lib_exec.cc
 )
 

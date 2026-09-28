@@ -95,6 +95,15 @@ else()
     message(STATUS "CTE: cache chimod disabled (use -DCLIO_CTE_ENABLE_CACHE=ON)")
 endif()
 
+# Stream chimod -- byte-stream layer with deferred append pipeline
+option(CLIO_CTE_ENABLE_STREAM "Build the stream chimod" ON)
+if(CLIO_CTE_ENABLE_STREAM)
+    message(STATUS "CTE: building stream chimod")
+    add_subdirectory(stream)
+else()
+    message(STATUS "CTE: stream chimod disabled (use -DCLIO_CTE_ENABLE_STREAM=ON)")
+endif()
+
 # Checkpoint chimod -- the fault handler behind vector.Copy's lazy copies.
 option(CLIO_CTE_ENABLE_CHECKPOINT "Build the checkpoint chimod" ON)
 if(CLIO_CTE_ENABLE_CHECKPOINT)
