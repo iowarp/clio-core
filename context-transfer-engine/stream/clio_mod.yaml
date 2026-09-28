@@ -14,5 +14,4 @@ kSizeOp: 10     # get / max / reserve / set / drop a stream's logical size
 kAppend: 11     # stage bytes for a deferred append (runs on the caller's node)
 kFlush: 12      # wait until this node's appends to a stream are merged
 kSequence: 13   # periodic: drain this node's pending appends
-kCollect: 14    # ManyToOne: gather every node's batch at the stream home
-kPlan: 15       # order the batch, reserve the tail, copy into pages
+kPlan: 14       # at the stream home: order a batch, reserve the tail, copy

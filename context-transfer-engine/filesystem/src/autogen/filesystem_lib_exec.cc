@@ -26,7 +26,6 @@ namespace clio::cte::filesystem {
   X(kWrite, WriteTask, Write)             \
   X(kGetattr, GetattrTask, Getattr)       \
   X(kTruncate, TruncateTask, Truncate)    \
-  X(kAppend, AppendTask, Append)          \
   X(kReaddir, ReaddirTask, Readdir)       \
   X(kMkdir, MkdirTask, Mkdir)             \
   X(kRmdir, RmdirTask, Rmdir)             \
@@ -34,10 +33,6 @@ namespace clio::cte::filesystem {
   X(kRename, RenameTask, Rename)          \
   X(kLink, LinkTask, Link)                \
   X(kStatSize, StatSizeTask, StatSize)    \
-  X(kAppendSequence, AppendSequenceTask, AppendSequence)    \
-  X(kAppendCollect, AppendCollectTask, AppendCollect)       \
-  X(kAppendExecution, AppendExecutionTask, AppendExecution) \
-  X(kAppendPlan, AppendPlanTask, AppendPlan)                \
   X(kUtimens, UtimensTask, Utimens)   \
   X(kSymlink, SymlinkTask, Symlink)   \
   X(kReadlink, ReadlinkTask, Readlink)   \
@@ -243,18 +238,6 @@ static void TakeReplicaResult(clio::run::shared_ptr<clio::run::Task> &orig,
 void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task,
                            const clio::run::shared_ptr<clio::run::Task> &replica_task) {
   switch (method) {
-    // The append pipeline's collectives keep their own (default) merge.
-    case Method::kAppendSequence:
-    case Method::kAppendCollect:
-    case Method::kAppendPlan:
-    case Method::kAppendExecution:
-      orig_task->AggregateOut(
-          ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
-      return;
-    default:
-      break;
-  }
-  switch (method) {
 #define X(MID, TASK, HANDLER)                                            \
     case Method::MID:                                                    \
       TakeReplicaResult<TASK>(orig_task, replica_task);                  \
@@ -270,12 +253,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
 
 void Runtime::AggregateIn(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &agg_task,
                           const clio::run::shared_ptr<clio::run::Task> &member_task) {
-  // Only AppendCollect combines member inputs (ManyToOne). All other methods
-  // keep the default no-op (the aggregate is a copy of the first member).
-  if (method == Method::kAppendCollect) {
-    agg_task.template Cast<AppendCollectTask>()->AggregateIn(
-        ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
-  }
+  // No filesystem method is a ManyToOne collective: the aggregate is a
+  // copy of the first member.
+  (void)method;
+  (void)agg_task;
+  (void)member_task;
 }
 
 #undef CLIO_FS_FOR_EACH_METHOD

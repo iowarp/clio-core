@@ -39,14 +39,6 @@ inline clio::run::u64 NowUtcNs() {
           .count());
 }
 
-/**
- * Reserved name for a staged append data blob. The "_append/" prefix can't
- * collide with the numeric page-blob names ("0","1", ...); node id keeps it
- * unique across nodes, the logical counter within a node.
- */
-inline std::string MakeDataBlobId(clio::run::u32 node_id, clio::run::u64 logical) {
-  return "_append/" + std::to_string(node_id) + "." + std::to_string(logical);
-}
 
 /** Stable inode number: the packed id (0 maps to 1: st_ino 0 = no inode). */
 inline clio::run::u64 InoFromPacked(clio::run::u64 packed) {
@@ -129,14 +121,35 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // assigned pool id from the CreateTask (pool_id_ isn't reliable yet here).
   self_.Init(task->new_pool_id_);
 
-  // Global append-staging tag (shared by all files): append data blobs live
-  // here so they don't inflate any file's GetTagSize.
+  // Every file's logical size and deferred appends belong to the stream
+  // pool. Deployments compose it before this pool; create it with defaults
+  // (over the same chain, logging next to the namespace log) otherwise.
+  stream_.Init(cfg.stream_pool_id_);
   {
-    auto st = cte_.AsyncGetOrCreateTag("_clio_append_staging",
-                                       clio::cte::core::TagId::GetNull(),
-                                       clio::run::PoolQuery::Dynamic());
-    CLIO_CO_AWAIT(st);
-    if (st->GetReturnCode() == 0) staging_tag_id_ = st->tag_id_;
+    clio::cte::stream::StreamConfig sc;
+    sc.next_pool_id_ = next_pool_id_;
+    if (!cfg.metadata_log_path_.empty()) {
+      sc.log_path_ =
+          ctp::ConfigParse::ExpandPath(cfg.metadata_log_path_) + ".stream";
+    }
+    auto sp = stream_.AsyncCreate(clio::run::PoolQuery::Dynamic(),
+                                  clio::cte::stream::kStreamPoolName,
+                                  cfg.stream_pool_id_, sc);
+    CLIO_CO_AWAIT(sp);
+    if (sp->GetReturnCode() != 0) {
+      HLOG(kError, "filesystem: stream pool {} unavailable (rc {}); file "
+           "sizes cannot be tracked", cfg.stream_pool_id_,
+           sp->GetReturnCode());
+    }
+    auto *pm = CLIO_POOL_MANAGER;
+    clio::run::ContainerHold h =
+        pm->GetRealOrStaticContainer(cfg.stream_pool_id_).get();
+    if (h && dynamic_cast<clio::cte::stream::Runtime *>(&*h) != nullptr) {
+      stream_hold_ = h;
+    } else {
+      HLOG(kError, "filesystem: no local stream container for pool {}",
+           cfg.stream_pool_id_);
+    }
   }
   // Global xattr-store tag: each file's xattrs live in ONE blob here, named
   // by the file's packed id.
@@ -260,7 +273,7 @@ void Runtime::MirrorFile(const std::string &path, const FileInfo &fi,
   if (path != fi.path_ || fi.nlink_ > 1) extra_flags |= kShmFileNoFastPath;
   ShmFileRecord rec;
   rec.tag_id_ = fi.tag_id_;
-  rec.size_ = fi.size_.load();
+  rec.size_ = FileSize(fi);
   rec.ino_ = InoFromPacked(FsPack(fi.tag_id_));
   rec.ov_atime_ns_ = fi.atime_;
   rec.ov_mtime_ns_ = fi.mtime_;
@@ -425,6 +438,33 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
   CLIO_TASK_BODY_END
 }
 
+clio::run::u64 Runtime::FileSize(const FileInfo &fi) {
+  if (fi.type_ == kFsTypeSymlink) return fi.symlink_.size();
+  if (!stream_hold_) return 0;
+  // This container is the inode's home and therefore its stream's home: the
+  // size is read from the co-located stream container, no task, no network.
+  auto &stream = static_cast<clio::cte::stream::Runtime &>(*stream_hold_);
+  clio::run::u64 size = 0;
+  stream.LocalSize(fi.tag_id_, &size);
+  return size;
+}
+
+clio::run::TaskResume Runtime::FileSizeOp(clio::cte::core::TagId tag,
+                                          clio::cte::stream::StreamSizeOp op,
+                                          clio::run::u64 value,
+                                          clio::run::u64 *old_size,
+                                          clio::run::u64 *new_size,
+                                          clio::run::u32 *rc) {
+  CLIO_TASK_BODY_BEGIN
+  auto f = stream_.AsyncSizeOp(tag, container_id_, op, value);
+  CLIO_CO_AWAIT(f);
+  *rc = f->GetReturnCode();
+  if (old_size != nullptr) *old_size = f->old_size_;
+  if (new_size != nullptr) *new_size = f->new_size_;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::AdvanceSize(
     clio::run::shared_ptr<AdvanceSizeTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -434,21 +474,25 @@ clio::run::TaskResume Runtime::AdvanceSize(
     CLIO_CO_RETURN;
   }
   // A size push means the file was WRITTEN (the adapter only sends one for a
-  // handle that wrote): it is the file's new mtime.
-  if (task->reserve_ != 0) {
-    task->old_size_ = fi->size_.fetch_add(task->size_);
-  } else {
-    clio::run::u64 want = task->size_;
-    clio::run::u64 old = fi->size_.load();
-    while (want > old && !fi->size_.compare_exchange_weak(old, want)) {
+  // handle that wrote): it is the file's new mtime. The size itself lives in
+  // the file's stream (durable in the stream log once this returns).
+  {
+    clio::run::u32 rc = 0;
+    CLIO_CO_AWAIT(FileSizeOp(fi->tag_id_,
+                             task->reserve_ != 0
+                                 ? clio::cte::stream::StreamSizeOp::kReserve
+                                 : clio::cte::stream::StreamSizeOp::kMax,
+                             task->size_, &task->old_size_, nullptr, &rc));
+    if (rc != 0) {
+      task->return_code_ = EIO;
+      CLIO_CO_RETURN;
     }
-    task->old_size_ = old;
   }
   {
     std::lock_guard<std::mutex> g(meta_mu_);
     const clio::run::u64 now = clio::cte::core::GetWallTimeNs();
     fi->mtime_ = fi->ctime_ = now;
-    LogInode(*fi);  // the logical size is durable once close returns
+    LogInode(*fi);
     if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
   }
   task->return_code_ = 0;
@@ -495,21 +539,30 @@ clio::run::TaskResume Runtime::MultiCreate(
 clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
   CLIO_TASK_BODY_BEGIN
   EnsurePurgeDrain();
-  std::lock_guard<std::mutex> g(meta_mu_);
-  auto it = handles_.find(task->handle_);
-  if (it != handles_.end()) {
-    std::shared_ptr<FileInfo> fi = it->second;
-    handles_.erase(it);
-    if (fi->open_count_ > 0) fi->open_count_--;
-    // Sieve-written files advance their logical size at close: the handle's
-    // FileInfo tracks the file across renames.
-    if (task->advance_size_ != 0) {
-      clio::run::u64 want = task->advance_size_;
-      clio::run::u64 old = fi->size_.load();
-      while (want > old && !fi->size_.compare_exchange_weak(old, want)) {
-      }
-      fi->dirty_ = true;
+  std::shared_ptr<FileInfo> fi;
+  {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    auto it = handles_.find(task->handle_);
+    if (it != handles_.end()) {
+      fi = it->second;
+      handles_.erase(it);
     }
+  }
+  if (fi == nullptr) {
+    task->return_code_ = 0;
+    CLIO_CO_RETURN;
+  }
+  // Sieve-written files advance their logical size at close: the handle's
+  // FileInfo tracks the file across renames.
+  if (task->advance_size_ != 0) {
+    clio::run::u32 rc = 0;
+    CLIO_CO_AWAIT(FileSizeOp(fi->tag_id_, clio::cte::stream::StreamSizeOp::kMax,
+                             task->advance_size_, nullptr, nullptr, &rc));
+  }
+  {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    if (fi->open_count_ > 0) fi->open_count_--;
+    if (task->advance_size_ != 0) fi->dirty_ = true;
     if (fi->orphan_ && fi->open_count_ == 0) {
       DropInodeLocked(fi);
     } else if (fi->dirty_) {
@@ -542,7 +595,7 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
     CLIO_CO_RETURN;
   }
   clio::cte::core::TagId tag_id = fi->tag_id_;
-  clio::run::u64 file_size = fi->size_.load();
+  clio::run::u64 file_size = FileSize(*fi);
 
   auto *ipc = CLIO_IPC;
   // Read directly into the task's payload via the PRIVATE-memory GetBlob path
@@ -630,8 +683,12 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     cur += to_write;
   }
   clio::run::u64 end = task->offset_ + done;
-  clio::run::u64 old = fi->size_.load();
-  while (end > old && !fi->size_.compare_exchange_weak(old, end)) {
+  clio::run::u64 new_size = 0;
+  {
+    clio::run::u32 rc = 0;
+    CLIO_CO_AWAIT(FileSizeOp(tag_id, clio::cte::stream::StreamSizeOp::kMax,
+                             end, nullptr, &new_size, &rc));
+    if (rc != 0) ok = false;
   }
   {
     // Published AFTER every PutBlob completed, so the mirror can lag the
@@ -643,65 +700,12 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
   }
   task->bytes_written_ = done;
-  task->new_size_ = fi->size_.load();
+  task->new_size_ = new_size;
   task->return_code_ = ok ? 0 : EIO;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Append(clio::run::shared_ptr<AppendTask> &task) {
-  CLIO_TASK_BODY_BEGIN
-  CLIO_FS_LOOKUP(fi, task->handle_);
-  if (!fi) {
-    task->return_code_ = EBADF;
-    CLIO_CO_RETURN;
-  }
-  clio::cte::core::TagId tag_id = fi->tag_id_;
-  clio::run::u64 want = task->size_;
-  // Deferred append: stamp a global order (UTC + per-node counter) and stage
-  // the bytes; the AppendSequence -> AppendCollect -> AppendExecution
-  // pipeline merges them into the file tail later.
-  clio::run::u64 logical = append_logical_.fetch_add(1) + 1;
-  clio::run::u64 utc_ns = NowUtcNs();
-  clio::run::u32 node_id = CLIO_IPC->GetNodeId();
-  std::string data_blob_id = MakeDataBlobId(node_id, logical);
-  auto p = cte_.AsyncPutBlob(staging_tag_id_, data_blob_id, 0, want,
-                             task->data_, -1.0f, clio::cte::core::Context(), 0u,
-                             clio::run::PoolQuery::Dynamic());
-  CLIO_CO_AWAIT(p);
-  if (p->GetReturnCode() != 0) {
-    task->return_code_ = EIO;
-    CLIO_CO_RETURN;
-  }
-  bool need_start = false;
-  {
-    std::lock_guard<std::mutex> g(append_mu_);
-    append_pending_.push_back(
-        PendingAppend{tag_id, AppendEntry{data_blob_id, want, utc_ns, logical}});
-    if (!append_seq_started_) {
-      append_seq_started_ = true;
-      need_start = true;
-    }
-  }
-  if (need_start) {
-    // Periodic local drain (1 ms); a periodic task never completes.
-    self_.AsyncAppendSequence(/*period_us=*/1000.0, clio::run::PoolQuery::Local());
-  }
-  clio::run::u64 newsz = fi->size_.fetch_add(want) + want;
-  {
-    std::lock_guard<std::mutex> g(meta_mu_);
-    const clio::run::u64 now = clio::cte::core::GetWallTimeNs();
-    fi->mtime_ = fi->ctime_ = now;
-    fi->dirty_ = true;
-    if (!fi->path_.empty()) MirrorFile(fi->path_, *fi, kShmFilePendingAppend);
-  }
-  task->offset_ = newsz - want;
-  task->bytes_written_ = want;
-  task->new_size_ = newsz;
-  task->return_code_ = 0;
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
 
 // ===========================================================================
 // Stat / truncate
@@ -1553,168 +1557,9 @@ clio::run::TaskResume Runtime::Removexattr(
 // Deferred-append pipeline handlers
 // ===========================================================================
 
-clio::run::TaskResume Runtime::AppendSequence(
-    clio::run::shared_ptr<AppendSequenceTask> &task) {
-  CLIO_TASK_BODY_BEGIN
-  // Drain the per-node pending queue, then group entries by tag.
-  std::vector<PendingAppend> drained;
-  {
-    std::lock_guard<std::mutex> g(append_mu_);
-    drained.swap(append_pending_);
-  }
-  if (drained.empty()) {
-    task->return_code_ = 0;
-    CLIO_CO_RETURN;
-  }
-  std::unordered_map<clio::cte::core::TagId, std::vector<AppendEntry>> by_tag;
-  for (auto &pa : drained) {
-    by_tag[pa.tag_id_].push_back(pa.entry_);
-  }
-  // One AppendCollect per tag, routed ManyToOne so every node's batch for the
-  // same tag aggregates at that tag's sequencer. Awaited one tag at a time:
-  // the CPU await path supports a single outstanding subtask future.
-  for (auto &kv : by_tag) {
-    const clio::cte::core::TagId &tag = kv.first;
-    clio::run::u32 chash = static_cast<clio::run::u32>(FsMix64(FsPack(tag)));
-    auto q = clio::run::PoolQuery::ManyToOne(chash, FsPack(tag),
-                                             /*batch_for_ns=*/50000);
-    auto f = self_.AsyncAppendCollect(tag, kv.second, q);
-    CLIO_CO_AWAIT(f);
-  }
-  task->return_code_ = 0;
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
 
-clio::run::TaskResume Runtime::AppendCollect(
-    clio::run::shared_ptr<AppendCollectTask> &task) {
-  CLIO_TASK_BODY_BEGIN
-  // Runs ONCE per batch as the ManyToOne aggregate. The merge must suspend,
-  // which the aggregate cannot, so it is delegated to AppendPlan and AWAITED:
-  // that keeps this aggregate (AppendPlan's parent) alive and holds the
-  // batch claim so no second batch for the tag merges concurrently.
-  std::vector<AppendEntry> entries(task->entries_.begin(),
-                                   task->entries_.end());
-  auto f =
-      self_.AsyncAppendPlan(task->tag_id_, entries, clio::run::PoolQuery::Local());
-  CLIO_CO_AWAIT(f);
-  task->new_size_ = 0;  // settled by the merge; members don't read it
-  task->return_code_ = 0;
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
 
-clio::run::TaskResume Runtime::AppendPlan(clio::run::shared_ptr<AppendPlanTask> &task) {
-  CLIO_TASK_BODY_BEGIN
-  clio::cte::core::TagId tag_id = task->tag_id_;
-  std::vector<AppendEntry> entries(task->entries_.begin(),
-                                   task->entries_.end());
-  std::sort(entries.begin(), entries.end(),
-            [](const AppendEntry &a, const AppendEntry &b) {
-              if (a.utc_ns_ != b.utc_ns_) return a.utc_ns_ < b.utc_ns_;
-              return a.logical_ < b.logical_;
-            });
-  // Tail = the file's merged content size (staged bytes live elsewhere); at
-  // most one batch per tag merges at a time, so this read is stable.
-  clio::run::u64 cur_size = 0;
-  {
-    auto s = cte_.AsyncGetTagSize(tag_id, clio::run::PoolQuery::Dynamic());
-    CLIO_CO_AWAIT(s);
-    cur_size = (s->GetReturnCode() == 0) ? s->tag_size_ : 0;
-  }
-  std::vector<AppendPlanStep> plan;
-  clio::run::u64 file_off = cur_size;
-  for (auto &e : entries) {
-    clio::run::u64 remaining = e.data_blob_size_;
-    clio::run::u64 doff = 0;
-    while (remaining > 0) {
-      clio::run::u64 page = file_off / kFsPageSize;
-      clio::run::u64 page_off = file_off % kFsPageSize;
-      clio::run::u64 step = std::min(kFsPageSize - page_off, remaining);
-      plan.push_back(AppendPlanStep{page, e.data_blob_id_, page_off, doff, step,
-                                    e.data_blob_size_});
-      file_off += step;
-      doff += step;
-      remaining -= step;
-    }
-  }
-  // Slices of up to 16 MiB; a data blob never spans two slices, so exactly
-  // one execution task deletes it. Awaited one at a time (single
-  // outstanding future).
-  constexpr clio::run::u64 kMaxExecBytes = 16ull * 1024 * 1024;
-  clio::run::u32 spread = 0;
-  size_t i = 0;
-  while (i < plan.size()) {
-    std::vector<AppendPlanStep> slice;
-    clio::run::u64 bytes = 0;
-    while (i < plan.size()) {
-      slice.push_back(plan[i]);
-      bytes += plan[i].size_;
-      ++i;
-      bool at_blob_boundary =
-          (i >= plan.size()) ||
-          (plan[i].data_blob_id_ != slice.back().data_blob_id_);
-      if (bytes >= kMaxExecBytes && at_blob_boundary) break;
-    }
-    auto q = clio::run::PoolQuery::DirectHash(spread++);
-    auto f = self_.AsyncAppendExecution(tag_id, staging_tag_id_, slice, q);
-    CLIO_CO_AWAIT(f);
-  }
-  task->return_code_ = 0;
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
 
-clio::run::TaskResume Runtime::AppendExecution(
-    clio::run::shared_ptr<AppendExecutionTask> &task) {
-  CLIO_TASK_BODY_BEGIN
-  clio::cte::core::TagId tag_id = task->tag_id_;
-  clio::cte::core::TagId staging = task->staging_tag_id_;
-  auto *ipc = CLIO_IPC;
-  const size_t n = task->steps_.size();
-  bool ok = true;
-  // Strictly sequential: at most one subtask future may be outstanding (the
-  // CPU await path does not record which future a coroutine waits on).
-  for (size_t i = 0; i < n && ok; ++i) {
-    const AppendPlanStep &s = task->steps_[i];
-    ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(s.size_);
-    if (buf.IsNull()) {
-      ok = false;
-      break;
-    }
-    auto g = cte_.AsyncGetBlob(staging, s.data_blob_id_, s.off_in_data_,
-                               s.size_, 0u, buf.shm_.template Cast<void>(),
-                               clio::run::PoolQuery::Dynamic());
-    CLIO_CO_AWAIT(g);
-    auto p = cte_.AsyncPutBlob(
-        tag_id, std::to_string(s.file_page_), s.off_in_page_, s.size_,
-        buf.shm_.template Cast<void>(), -1.0f, clio::cte::core::Context(), 0u,
-        clio::run::PoolQuery::Dynamic());
-    CLIO_CO_AWAIT(p);
-    if (p->GetReturnCode() != 0) ok = false;
-    ipc->FreeBuffer(buf);
-  }
-  std::unordered_set<std::string> seen;
-  for (const auto &s : task->steps_) {
-    if (seen.insert(s.data_blob_id_).second) {
-      auto d = cte_.AsyncDelBlob(staging, s.data_blob_id_,
-                                 clio::run::PoolQuery::Dynamic());
-      CLIO_CO_AWAIT(d);
-    }
-  }
-  // The tail lives in the file's own pages again: re-publish without the
-  // pending-append refusal.
-  if (ok) {
-    std::shared_ptr<FileInfo> fi = FindInode(FsPack(tag_id));
-    if (fi != nullptr) {
-      std::lock_guard<std::mutex> g(meta_mu_);
-      if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
-    }
-  }
-  task->return_code_ = ok ? 0 : EIO;
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
 
 #undef CLIO_FS_LOOKUP
 #undef CLIO_FS_RESOLVE

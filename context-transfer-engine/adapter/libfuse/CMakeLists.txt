@@ -77,6 +77,7 @@ target_link_libraries(clio_cte_fuse
     clio_cte_replication_client  # FlushTagTask, for the async-replication
                                  # fsync durability barrier (header-only use;
                                  # no replication pool required at runtime)
+    clio_cte_stream_client       # deferred O_APPEND (StreamClient)
     ctp::cxx)
 
 # EXPERIMENTAL low-level adapter (issue #1007 follow-up): same delegated
@@ -106,6 +107,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       clio_cte_filesystem_client
       clio_cte_core_client
       clio_cte_replication_client
+      clio_cte_stream_client
       ctp::cxx)
 endif()
 

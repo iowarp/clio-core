@@ -347,15 +347,6 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
-  clio::run::Future<AppendTask> AsyncAppend(clio::run::u64 handle, clio::run::u64 size,
-                                      ctp::ipc::ShmPtr<> data) {
-    auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<AppendTask>(clio::run::CreateTaskId(), pool_id_,
-                                         FsHandleQuery(handle), handle, size,
-                                         data);
-    return ipc->Send(task);
-  }
-
   clio::run::Future<GetattrTask> AsyncGetattr(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<GetattrTask>(clio::run::CreateTaskId(), pool_id_,
@@ -525,52 +516,6 @@ class Client : public clio::cte::core::Client {
       task->SetPeriod(period_us, clio::run::kMicro);
       task->SetFlags(TASK_PERIODIC);
     }
-    return ipc->Send(task);
-  }
-
-  // ---- deferred-append pipeline ----
-  /** Kick off (or tick) the periodic local pending-append drain. */
-  clio::run::Future<AppendSequenceTask> AsyncAppendSequence(
-      double period_us = 0.0,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
-    auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<AppendSequenceTask>(clio::run::CreateTaskId(), pool_id_,
-                                                 pool_query);
-    if (period_us > 0.0) {
-      task->SetPeriod(period_us, clio::run::kMicro);
-      task->SetFlags(TASK_PERIODIC);
-    }
-    return ipc->Send(task);
-  }
-
-  /** Collect one tag's pending appends at its sequencer (ManyToOne batch). */
-  clio::run::Future<AppendCollectTask> AsyncAppendCollect(
-      const clio::cte::core::TagId &tag_id,
-      const std::vector<AppendEntry> &entries, const clio::run::PoolQuery &pool_query) {
-    auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<AppendCollectTask>(clio::run::CreateTaskId(), pool_id_,
-                                                pool_query, tag_id, entries);
-    return ipc->Send(task);
-  }
-
-  /** Plan + dispatch one tag's batch (suspendable; submitted by AppendCollect). */
-  clio::run::Future<AppendPlanTask> AsyncAppendPlan(
-      const clio::cte::core::TagId &tag_id,
-      const std::vector<AppendEntry> &entries, const clio::run::PoolQuery &pool_query) {
-    auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<AppendPlanTask>(clio::run::CreateTaskId(), pool_id_,
-                                             pool_query, tag_id, entries);
-    return ipc->Send(task);
-  }
-
-  /** Apply a slice of the merge plan (GetBlob->PutBlob->DelBlob). */
-  clio::run::Future<AppendExecutionTask> AsyncAppendExecution(
-      const clio::cte::core::TagId &tag_id,
-      const clio::cte::core::TagId &staging_tag_id,
-      const std::vector<AppendPlanStep> &steps, const clio::run::PoolQuery &pool_query) {
-    auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<AppendExecutionTask>(
-        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, staging_tag_id, steps);
     return ipc->Send(task);
   }
 

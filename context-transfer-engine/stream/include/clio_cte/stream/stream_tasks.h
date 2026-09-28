@@ -286,49 +286,8 @@ struct SequenceTask : public clio::run::Task {
 };
 
 /**
- * Collect: ManyToOne per stream. Every node's batch for the stream is folded
- * (AggregateIn) at the stream's home, which merges the union once.
- */
-struct CollectTask : public clio::run::Task {
-  IN clio::cte::core::TagId tag_id_;
-  IN std::vector<AppendEntry> entries_;
-  OUT clio::run::u64 new_size_;
-
-  CollectTask()
-      : clio::run::Task(), tag_id_(clio::cte::core::TagId::GetNull()),
-        new_size_(0) {}
-  explicit CollectTask(const clio::run::TaskId &task_id,
-                       const clio::run::PoolId &pool_id,
-                       const clio::run::PoolQuery &pool_query,
-                       const clio::cte::core::TagId &tag_id,
-                       const std::vector<AppendEntry> &entries)
-      : clio::run::Task(task_id, pool_id, pool_query, Method::kCollect),
-        tag_id_(tag_id), entries_(entries), new_size_(0) {}
-  void Copy(const ctp::ipc::FullPtr<CollectTask> &o) {
-    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
-    tag_id_ = o->tag_id_; entries_ = o->entries_; new_size_ = o->new_size_;
-  }
-  /** Merge OUT fields only. */
-  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &b) {
-    Task::AggregateOut(b);
-    new_size_ = b.template Cast<CollectTask>()->new_size_;
-  }
-  /** ManyToOne: fold a member's entries into this aggregate. */
-  void AggregateIn(const ctp::ipc::FullPtr<clio::run::Task> &member_base) {
-    auto m = member_base.template Cast<CollectTask>();
-    entries_.insert(entries_.end(), m->entries_.begin(), m->entries_.end());
-  }
-  template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(tag_id_, entries_);
-  }
-  template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(new_size_);
-  }
-};
-
-/**
- * Plan: a regular (suspendable) task run at the home for one collected
- * batch: order it, reserve the tail, persist the plan, copy, finish.
+ * Plan: one node's batch of appends to a stream, sent to the stream's home,
+ * which orders it, reserves the tail, persists the plan, copies, finishes.
  */
 struct PlanTask : public clio::run::Task {
   IN clio::cte::core::TagId tag_id_;

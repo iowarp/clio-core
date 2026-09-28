@@ -21,6 +21,10 @@ add_clio_module_client(
 # The filesystem chimod is an interface over the CTE core — link its client
 # (and pull in the core headers for TagId/Context/the core client API).
 target_link_libraries(clio_cte_filesystem_runtime PUBLIC clio_cte_core_client)
+# File sizes and deferred appends are the stream module's (in-process size
+# reads call into the co-located stream container).
+target_link_libraries(clio_cte_filesystem_runtime PUBLIC
+    clio_cte_stream_runtime clio_cte_stream_client)
 target_link_libraries(clio_cte_filesystem_client PUBLIC clio_cte_core_client)
 target_include_directories(clio_cte_filesystem_runtime PRIVATE
     ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include)

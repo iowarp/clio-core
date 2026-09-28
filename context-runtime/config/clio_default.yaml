@@ -366,6 +366,26 @@ compose:
     next_pool_id: "564.0"               # indexer — see entry above
     min_score: 0.5                      # cache copies' score floor
 
+  # === Stream (byte-stream layer over CTE tags) ===
+  # Owns what makes a tag a byte stream: its page layout (1 MiB page blobs
+  # named by page index), its authoritative logical size, and deferred
+  # appends. Each stream has a HOME container chosen by the caller (clio-fs
+  # uses the file's inode home) that owns its size and merges its appends:
+  # an append is staged as a blob on the writer's node and returns at once;
+  # every node ships its batch to the home each 1 ms, where the combined
+  # batch is ordered, its range reserved from the size, and copied into the
+  # pages. The filesystem creates this pool with defaults if it is not
+  # composed; compose it BEFORE the filesystem to configure it.
+  - mod_name: clio_cte_stream
+    pool_name: clio_cte_stream
+    pool_query: local
+    pool_id: "565.0"
+    next_pool_id: "563.0"               # data path: the chain top (cache)
+    # Node-local log of the sizes, merge plans and merged-append names of
+    # the streams this node homes (the container id is appended). Without it
+    # file sizes do not survive `clio_run restart`. Default: unset.
+    # log_path: "/mnt/nvme/$USER/clio/cte_stream_log"
+
   # === Context Filesystem (CFS) ===
   # POSIX-style filesystem chimod that the libfuse / POSIX adapters drive. It
   # sits at the canonical filesystem pool 560.0 (clio::cte::filesystem::
@@ -389,3 +409,6 @@ compose:
     # (the container id is appended to the name); `clio_run restart` replays
     # it, a fresh `start` discards it. Default: unset = volatile namespace.
     # metadata_log_path: "/mnt/nvme/$USER/clio/cfs_namespace_log"
+    # Stream pool holding every file's logical size and merging deferred
+    # O_APPEND writes (see the clio_cte_stream entry). Default: "565.0".
+    # stream_pool_id: "565.0"

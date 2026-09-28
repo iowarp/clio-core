@@ -33,7 +33,7 @@
 
 /**
  * Stream runtime: lifecycle, the origin side of deferred appends (Append,
- * Flush, Sequence) and restart recovery. The home side (SizeOp, Collect,
+ * Flush, Sequence) and restart recovery. The home side (SizeOp,
  * Plan and the merge) is in stream_home.cc; persistence in stream_log.cc.
  */
 
@@ -256,8 +256,12 @@ clio::run::TaskResume Runtime::Sequence(
   {
     std::lock_guard<std::mutex> g(q_mu_);
     std::vector<PendingAppend> later;
+    for (auto it = hold_until_.begin(); it != hold_until_.end();) {
+      it = it->second <= now ? hold_until_.erase(it) : std::next(it);
+    }
     for (auto &p : queue_) {
-      (p.not_before_ns_ <= now ? ready : later).push_back(std::move(p));
+      const bool held = hold_until_.count(p.tag_) != 0;
+      (held ? later : ready).push_back(std::move(p));
     }
     queue_.swap(later);
   }
@@ -267,24 +271,28 @@ clio::run::TaskResume Runtime::Sequence(
   for (auto &p : ready) {
     groups[{Client::TagKey(p.tag_), p.home_}].push_back(std::move(p));
   }
-  // One Collect per stream, awaited one at a time (a coroutine may have only
-  // one outstanding subtask future).
+  // One Plan per stream, sent straight to its home and awaited one at a time
+  // (a coroutine may have only one outstanding subtask future). The home
+  // serializes merges per stream, so batches from several nodes interleave
+  // safely.
   for (auto &kv : groups) {
     std::vector<PendingAppend> &batch = kv.second;
     std::vector<AppendEntry> entries;
     entries.reserve(batch.size());
     for (const auto &p : batch) entries.push_back(p.entry_);
-    auto f = self_.AsyncCollect(batch.front().tag_, batch.front().home_,
-                                entries);
+    auto f = self_.AsyncPlan(batch.front().tag_, batch.front().home_,
+                             entries);
     CLIO_CO_AWAIT(f);
     std::lock_guard<std::mutex> g(q_mu_);
     if (f->GetReturnCode() != 0) {
-      // Home unreachable or the merge failed: retry the batch later. The
-      // home dedupes by staged name, so a retry never merges twice.
-      for (auto &p : batch) {
-        p.not_before_ns_ = now + kShipRetryNs;
-        queue_.push_back(std::move(p));
-      }
+      // Home unreachable or the merge failed: retry the batch later, ahead
+      // of anything newer for the stream (held until then). The home dedupes
+      // by staged name, so a retry never merges twice.
+      hold_until_[batch.front().tag_] = now + kShipRetryNs;
+      std::vector<PendingAppend> requeue(std::make_move_iterator(batch.begin()),
+                                         std::make_move_iterator(batch.end()));
+      for (auto &p : queue_) requeue.push_back(std::move(p));
+      queue_.swap(requeue);
       continue;
     }
     auto it = local_pending_.find(batch.front().tag_);
@@ -336,10 +344,11 @@ clio::run::TaskResume Runtime::RecoverStaged() {
   for (const auto &name : list->blob_names_) {
     PendingAppend p;
     if (!ParseStagedName(name, &p.tag_, &p.home_, &p.entry_)) continue;
-    // Re-ship what this node accepted (its queue died with it) and what it
-    // homes (in-flight batches aimed at it died with it). The home dedupes
-    // by name, so an entry recovered by both nodes merges once.
-    if (p.entry_.origin_ != node_ && p.home_ != node_) continue;
+    // Re-ship only what this node accepted: its queue died with it. Appends
+    // other nodes accepted are still queued there and are retried until
+    // their home confirms the merge; shipping them from here too would race
+    // those retries and reorder a writer's appends.
+    if (p.entry_.origin_ != node_) continue;
     auto sz = cte_.AsyncGetBlobSize(staging_tag_, name);
     CLIO_CO_AWAIT(sz);
     if (sz->GetReturnCode() != 0 || sz->size_ == 0) continue;

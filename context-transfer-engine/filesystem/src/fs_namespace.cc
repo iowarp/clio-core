@@ -656,7 +656,6 @@ std::shared_ptr<Runtime::FileInfo> Runtime::NewInode(
   fi->type_ = type;
   fi->mode_ = mode == 0xFFFFFFFFu ? mode : (mode & 07777u);
   fi->symlink_ = symlink;
-  fi->size_.store(type == kFsTypeSymlink ? symlink.size() : 0);
   const clio::run::u64 now = NowNs();
   fi->atime_ = fi->mtime_ = fi->ctime_ = now;
   std::lock_guard<std::mutex> g(meta_mu_);
@@ -674,7 +673,7 @@ std::shared_ptr<Runtime::FileInfo> Runtime::FindInode(clio::run::u64 packed) {
 void Runtime::InodeAttrLocked(const FileInfo &fi, FsAttr *attr) {
   attr->id_ = FsPack(fi.tag_id_);
   attr->type_ = fi.type_;
-  attr->size_ = fi.size_.load();
+  attr->size_ = FileSize(fi);
   attr->nlink_ = fi.nlink_;
   attr->mode_ = fi.mode_;
   attr->uid_ = fi.uid_;
@@ -778,8 +777,17 @@ clio::run::TaskResume Runtime::InodeTruncate(const FsReq &req, FsResp &resp) {
   }
   const clio::cte::core::TagId tag = fi->tag_id_;
   const clio::run::u64 new_size = req.a_;
-  clio::run::u64 old_size = std::max<clio::run::u64>(fi->size_.load(), req.b_);
-  fi->size_.store(new_size);
+  clio::run::u64 old_size = 0;
+  {
+    clio::run::u32 rc = 0;
+    CLIO_CO_AWAIT(FileSizeOp(tag, clio::cte::stream::StreamSizeOp::kSet,
+                             new_size, &old_size, nullptr, &rc));
+    if (rc != 0) {
+      resp.rc_ = EIO;
+      CLIO_CO_RETURN;
+    }
+  }
+  old_size = std::max<clio::run::u64>(old_size, req.b_);
   {
     std::lock_guard<std::mutex> g(meta_mu_);
     const clio::run::u64 now = NowNs();
@@ -864,7 +872,14 @@ clio::run::TaskResume Runtime::PurgeDrain() {
     FsEnc enc(&batch.str_);
     const size_t end = std::min(work.size(), i + kPurgeBatch);
     for (size_t j = i; j < end; ++j) {
-      if (work[j].data_) enc.U64(FsPack(work[j].id_));
+      if (!work[j].data_) continue;
+      enc.U64(FsPack(work[j].id_));
+      // Forget the stream first: a deferred append still in flight is then
+      // discarded instead of re-creating pages after the purge below.
+      clio::run::u32 rc = 0;
+      CLIO_CO_AWAIT(FileSizeOp(work[j].id_,
+                               clio::cte::stream::StreamSizeOp::kDrop, 0,
+                               nullptr, nullptr, &rc));
     }
     if (!batch.str_.empty()) {
       const clio::run::u32 n = NumContainers();
@@ -998,7 +1013,7 @@ std::string Runtime::EncInode(const FileInfo &fi) {
   FsEnc e(&p);
   e.U64(FsPack(fi.tag_id_));
   e.U32(fi.type_);
-  e.U64(fi.size_.load());
+  e.U64(0);  // retired: sizes live in the stream pool's log
   e.U32(fi.nlink_);
   e.U32(fi.mode_);
   e.U32(fi.uid_);
@@ -1089,7 +1104,7 @@ void Runtime::ApplyLogRecord(FsLogRec type, const std::string &payload) {
         return;
       }
       fi->tag_id_ = FsUnpack(id);
-      fi->size_.store(size);
+      (void)size;  // retired field (sizes live in the stream pool's log)
       fi->orphan_ = (flags & 1u) != 0;
       fi->has_xattr_ = (flags & 2u) != 0;
       by_tag_[id] = fi;

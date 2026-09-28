@@ -19,7 +19,6 @@ kRead: 12
 kWrite: 13
 kGetattr: 14
 kTruncate: 15
-kAppend: 16
 kReaddir: 17
 kMkdir: 18
 kRmdir: 19
@@ -27,10 +26,6 @@ kUnlink: 20
 kRename: 21
 kStatSize: 22
 kLink: 23
-kAppendSequence: 24
-kAppendCollect: 25
-kAppendExecution: 26
-kAppendPlan: 27
 kUtimens: 28
 kSymlink: 29
 kReadlink: 30

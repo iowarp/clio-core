@@ -48,7 +48,6 @@ namespace clio::cte::stream {
   X(kAppend, AppendTask, Append)           \
   X(kFlush, FlushTask, Flush)              \
   X(kSequence, SequenceTask, Sequence)     \
-  X(kCollect, CollectTask, Collect)        \
   X(kPlan, PlanTask, Plan)
 
 void Runtime::Init(const clio::run::PoolId &pool_id,
@@ -224,12 +223,10 @@ void Runtime::AggregateOut(
 void Runtime::AggregateIn(
     clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &agg_task,
     const clio::run::shared_ptr<clio::run::Task> &member_task) {
-  // Only Collect combines member inputs (ManyToOne); every other method keeps
-  // the default (the aggregate is a copy of the first member).
-  if (method == Method::kCollect) {
-    agg_task.template Cast<CollectTask>()->AggregateIn(
-        ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
-  }
+  // No stream method is a ManyToOne collective.
+  (void)method;
+  (void)agg_task;
+  (void)member_task;
 }
 
 #undef CLIO_STREAM_FOR_EACH_METHOD

@@ -251,31 +251,98 @@ def t_shared_disjoint(ctx):
 
 @test('xnode_append_many_writers', 'dist', min_nodes=2)
 def t_xappend(ctx):
-  """O_APPEND from every node concurrently: no record lost or overwritten."""
+  """O_APPEND from every node concurrently: every record lands exactly once,
+  each writer's records in its own order, and every node reads the same
+  file."""
   n = len(ctx.hosts)
   p = ctx.p('journal')
   ctx.ok(0, 'write_file', path=p, size=0, seed=0)
   _vis(ctx, n - 1, lambda: (ctx.call(n - 1, 'exists', path=p).get('ret'),
                             None), 'create')
-  per = 200
+  per = 2000
+  res = {}
 
   def app(i):
-    h = ctx.ok(i, 'open', path=p, flags='wa')
-    for k in range(per):
-      rec = f'N{i:02d}R{k:05d}'.ljust(31, '.') + '\n'
-      ctx.ok(i, 'fwrite', h=h, data_hex=rec.encode().hex())
-    ctx.ok(i, 'close', h=h)
+    res[i] = ctx.ok(i, 'append_records', timeout=600, path=p, writer=i,
+                    count=per)
+  t0 = time.time()
   ctx.each(app)
-  data = bytes.fromhex(ctx.ok(0, 'read_hex', path=p)).decode(errors='replace')
-  lines = data.split('\n')[:-1]
-  want = {f'N{i:02d}R{k:05d}'.ljust(31, '.') for i in range(n)
-          for k in range(per)}
-  got = set(lines)
-  ctx.check(len(data) == 32 * n * per,
-            f'journal size {len(data)} != {32 * n * per} '
-            f'(lost/overwritten appends)')
-  ctx.check(got == want, f'missing {len(want - got)} records, '
-                         f'garbage {len(got - want)}')
+  ctx.metrics['appends_per_s'] = round(n * per / (time.time() - t0))
+  acked = {i: runs_to_set(res[i]['acked']) for i in range(n)}
+  for i in range(n):
+    ctx.check(res[i]['nfail'] == 0 and res[i]['close_err'] is None,
+              f'node{i} append failures: {res[i]["fails"][:3]} '
+              f'close: {res[i]["close_err"]}')
+  for i in range(n):
+    check_records(ctx, i, p, acked, {})
+
+
+def runs_to_set(runs):
+  """[[first, last], ...] -> set of ints."""
+  out = set()
+  for a, b in runs:
+    out.update(range(a, b + 1))
+  return out
+
+
+def check_records(ctx, i, path, acked, maybe, reclen=64, zeros_ok=False):
+  """Node i reads an append_records file: whole records only, each writer's
+  records in its own order and at most once, every `acked` record present,
+  and nothing but acked or 'maybe' writes. zeros_ok tolerates zero-filled
+  records (writes lost in a crash before they were fsync'd)."""
+  r = ctx.ok(i, 'scan_records', timeout=600, path=path, reclen=reclen)
+  zero = sum(b - a for a, b in r.get('zero_runs', [])) // reclen
+  if zeros_ok and zero:
+    ctx.metrics[f'node{i}_zero_records'] = zero
+    ctx.check(r['tail'] == 0 and r['nonzero_bad'] == 0,
+              f'node{i}: garbage (non-zero) records at {r["bad"][:5]}')
+  else:
+    ctx.check(r['tail'] == 0 and not r['bad'],
+            f'node{i}: torn/garbage records at {r["bad"][:5]} '
+            f'(tail {r["tail"]} bytes, size {r["size"]}, zero runs '
+            f'{r.get("zero_runs")}, first bad '
+            f'{bytes.fromhex(r["bad_sample"])[:40]!r})')
+  for w, want in acked.items():
+    got = r['by_writer'].get(str(w), [])
+    viol = [j for j in range(len(got) - 1) if got[j] >= got[j + 1]]
+    ctx.check(not viol,
+              f'node{i}: writer {w} records out of order or duplicated '
+              f'({len(viol)} times; first at #{viol[0] if viol else 0}: '
+              f'{got[max(0, viol[0] - 3):viol[0] + 4] if viol else []}; '
+              f'{len(got)} records, {len(got) - len(set(got))} duplicates)')
+    missing = want - set(got)
+    ctx.check(not missing, f'node{i}: writer {w} lost {len(missing)} '
+                           f'acknowledged appends, e.g. {sorted(missing)[:5]}')
+    extra = set(got) - want - maybe.get(w, set())
+    ctx.check(not extra, f'node{i}: writer {w} has {len(extra)} records it '
+                         f'never wrote, e.g. {sorted(extra)[:5]}')
+  return r
+
+
+@test('xnode_append_burst', 'dist', min_nodes=2, timeout=1800)
+def t_xappend_burst(ctx):
+  """Several writers per node O_APPEND small records to one file at full
+  speed (deferred appends batch at the file's home)."""
+  n = len(ctx.hosts)
+  p = ctx.p('burst')
+  ctx.ok(0, 'write_file', path=p, size=0, seed=0)
+  _vis(ctx, n - 1, lambda: (ctx.call(n - 1, 'exists', path=p).get('ret'),
+                            None), 'create')
+  per = 5000
+  res = {}
+
+  def app(i):
+    res[i] = ctx.ok(i, 'append_records', timeout=900, path=p, writer=i,
+                    count=per, reclen=128)
+  t0 = time.time()
+  ctx.each(app)
+  dt = time.time() - t0
+  ctx.metrics['appends_per_s'] = round(n * per / dt)
+  ctx.metrics['append_MiB_per_s'] = round(n * per * 128 / dt / (1 << 20), 2)
+  acked = {i: runs_to_set(res[i]['acked']) for i in range(n)}
+  for i in range(n):
+    ctx.check(res[i]['nfail'] == 0, f'node{i}: {res[i]["fails"][:3]}')
+  check_records(ctx, n - 1, p, acked, {}, reclen=128)
 
 
 @test('xnode_metadata_attrs', 'dist', min_nodes=2)

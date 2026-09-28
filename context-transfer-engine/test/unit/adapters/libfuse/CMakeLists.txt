@@ -146,6 +146,7 @@ if(TARGET clio_cte_fuse)
         clio_cte_core_runtime
         clio_cte_core_client
         clio_cte_replication_client  # fuse_cte.cc's fsync durability barrier
+        clio_cte_stream_client       # fuse_cte.cc's deferred O_APPEND
         clio::run::admin_runtime
         clio::run::admin_client
         clio::run::bdev_runtime

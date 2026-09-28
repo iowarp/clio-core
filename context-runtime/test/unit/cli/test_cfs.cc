@@ -24,6 +24,8 @@
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/filesystem/filesystem_client.h>
+#include <clio_cte/filesystem/fs_shard.h>
+#include <clio_cte/stream/stream_client.h>
 #include <clio_cte/core/core_client.h>
 
 #include "runtime_server.h"
@@ -527,15 +529,12 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     REQUIRE(ex == 0);  // directory gone
   }
 
-  // ---- Deferred-append pipeline ----
-  // Fire many appends concurrently (without awaiting each), so they pile into
-  // the pending queue and the periodic AppendSequence drains them across
-  // SEVERAL ManyToOne AppendCollect batches. Each append is placed locally +
-  // queued; AppendCollect (sorted by UTC/logical) plans the merge against the
-  // file tail and AppendExecution writes it into the pages. Because at most one
-  // aggregate per tag runs at a time (BatchManager serialization), successive
-  // batches see a fully-settled tail, so the bytes land in submission order and
-  // span page boundaries cleanly. Verify the exact ordered concatenation.
+  // ---- Deferred appends (stream pool) ----
+  // Fire many appends concurrently (without awaiting each) through the stream
+  // pool the filesystem delegates file sizes and appends to. The file's
+  // stream home is its inode home. After a Flush every append is merged: the
+  // file is exactly kNum back-to-back kChunk regions, each one distinct
+  // marker, all present once (concurrent appends have no pinned order).
   {
     const std::string apath = "/append_test.bin";
     auto aop = cfs.AsyncOpen(apath, O_CREAT | O_RDWR, 0644);
@@ -543,55 +542,50 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     REQUIRE(aop->GetReturnCode() == 0);
     clio::run::u64 ah = aop->handle_;
     REQUIRE(ah != 0);
+    const clio::run::u64 packed = aop->tag_packed_;
+    REQUIRE(clio::cte::filesystem::FsIdHasHome(packed));
+    const clio::run::u32 home = clio::cte::filesystem::FsIdHome(packed);
+    const clio::cte::core::TagId tag = clio::cte::filesystem::FsUnpack(packed);
+    clio::cte::stream::Client stream;
 
     constexpr clio::run::u64 kChunk = 4096;
     constexpr int kNum = 16;  // concurrent stress (probe for corruption)
     std::vector<ctp::ipc::FullPtr<char>> abufs;
-    std::vector<clio::run::Future<clio::cte::filesystem::AppendTask>> afuts;
+    std::vector<clio::run::Future<clio::cte::stream::AppendTask>> afuts;
     for (int c = 0; c < kNum; ++c) {
       char mark = static_cast<char>('a' + c);
       ctp::ipc::FullPtr<char> ab = ipc->AllocateBuffer(kChunk);
       REQUIRE(!ab.IsNull());
       memset(ab.ptr_, mark, kChunk);
       abufs.push_back(ab);
-      afuts.push_back(cfs.AsyncAppend(ah, kChunk, ab.shm_.template Cast<void>()));
+      afuts.push_back(stream.AsyncAppend(tag, home,
+                                         ab.shm_.template Cast<void>(), kChunk));
     }
     for (auto &f : afuts) { f.Wait(); REQUIRE(f->GetReturnCode() == 0); }
     for (auto &ab : abufs) ipc->FreeBuffer(ab);
     const clio::run::u64 total = kChunk * kNum;
+    auto fl = stream.AsyncFlush(tag, home);
+    fl.Wait();
+    REQUIRE(fl->GetReturnCode() == 0);
+    REQUIRE(fl->size_ == total);
 
-    // Concurrent appends are ordered by (UTC, logical), not submission order, so
-    // we don't pin the order. The pipeline (periodic AppendSequence -> ManyToOne
-    // AppendCollect -> AppendPlan -> AppendExecution) must merge them with no
-    // overlap or corruption: poll-read until the file is exactly kNum back-to-
-    // back kChunk regions, each a single distinct marker, all present once.
-    bool matched = false;
-    for (int attempt = 0; attempt < 400 && !matched; ++attempt) {
-      ctp::ipc::FullPtr<char> rb = ipc->AllocateBuffer(total);
-      REQUIRE(!rb.IsNull());
-      memset(rb.ptr_, 0, total);
-      auto r = cfs.AsyncRead(ah, 0, total, rb.shm_.template Cast<void>());
-      r.Wait();
-      bool ok = (r->GetReturnCode() == 0 && r->bytes_read_ == total);
-      if (ok) {
-        std::set<char> seen;
-        for (int c = 0; c < kNum && ok; ++c) {
-          const char *region = rb.ptr_ + static_cast<size_t>(c) * kChunk;
-          char m = region[0];
-          for (clio::run::u64 i = 0; i < kChunk; ++i) {
-            if (region[i] != m) { ok = false; break; }
-          }
-          if (ok && m >= 'a' && m < 'a' + kNum) seen.insert(m);
-          else ok = false;
-        }
-        if (ok && seen.size() == static_cast<size_t>(kNum)) matched = true;
-      }
-      ipc->FreeBuffer(rb);
-      if (!matched) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-      }
+    ctp::ipc::FullPtr<char> rb = ipc->AllocateBuffer(total);
+    REQUIRE(!rb.IsNull());
+    memset(rb.ptr_, 0, total);
+    auto r = cfs.AsyncRead(ah, 0, total, rb.shm_.template Cast<void>());
+    r.Wait();
+    REQUIRE(r->GetReturnCode() == 0);
+    REQUIRE(r->bytes_read_ == total);
+    std::set<char> seen;
+    for (int c = 0; c < kNum; ++c) {
+      const char *region = rb.ptr_ + static_cast<size_t>(c) * kChunk;
+      const char m = region[0];
+      for (clio::run::u64 i = 0; i < kChunk; ++i) REQUIRE(region[i] == m);
+      REQUIRE((m >= 'a' && m < 'a' + kNum));
+      seen.insert(m);
     }
-    REQUIRE(matched);  // all appends merged intact into their own regions
+    REQUIRE(seen.size() == static_cast<size_t>(kNum));
+    ipc->FreeBuffer(rb);
 
     auto acl = cfs.AsyncClose(ah);
     acl.Wait();

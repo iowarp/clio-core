@@ -255,6 +255,86 @@ class Agent:
       os.close(fd)
     return h.hexdigest()
 
+  def op_append_records(self, path, writer, count, reclen=64, start=0,
+                        close=True, max_secs=0.0, fsync_every=0):
+    """O_APPEND `count` self-identifying records (W<writer>R<seq>, padded to
+    reclen bytes incl. the newline) with one write(2) each. Stops early after
+    max_secs (0 = never). Returns the acknowledged seqs as [first, last]
+    runs, the failed writes, and the close() result."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    acked, fails, t0 = [], [], time.time()
+    synced = []  # [last seq covered, wall time] per successful fsync
+    try:
+      for k in range(start, start + count):
+        if max_secs and time.time() - t0 > max_secs:
+          break
+        rec = f'W{writer:03d}R{k:07d}'.ljust(reclen - 1, '.') + '\n'
+        try:
+          if os.write(fd, rec.encode()) == reclen:
+            if acked and acked[-1][1] == k - 1:
+              acked[-1][1] = k
+            else:
+              acked.append([k, k])
+          else:
+            fails.append([k, 'short'])
+        except OSError as e:
+          fails.append([k, _err(e)['err']])
+          if len(fails) > 200:
+            break
+        if fsync_every and (k + 1) % fsync_every == 0:
+          try:
+            os.fsync(fd)
+            synced.append([k, time.time()])
+          except OSError:
+            pass
+    finally:
+      close_err = None
+      if close:
+        try:
+          os.close(fd)
+        except OSError as e:
+          close_err = _err(e)['err']
+    return {'acked': acked, 'fails': fails[:20], 'nfail': len(fails),
+            'close_err': close_err, 'synced': synced}
+
+  def op_scan_records(self, path, reclen=64):
+    """Parse a file of append_records records. Returns the byte size, each
+    writer's seqs in file order, and the offsets of unparseable records."""
+    with open(path, 'rb') as f:
+      data = f.read()
+    by_writer, bad, bad_sample, nonzero_bad = {}, [], '', 0
+    for off in range(0, len(data) - len(data) % reclen, reclen):
+      rec = data[off:off + reclen]
+      try:
+        txt = rec.decode()
+        w, k = int(txt[1:4]), int(txt[5:12])
+        ok = (txt[0] == 'W' and txt[4] == 'R' and txt.endswith('\n') and
+              txt == f'W{w:03d}R{k:07d}'.ljust(reclen - 1, '.') + '\n')
+      except (UnicodeDecodeError, ValueError):
+        ok = False
+      if not ok:
+        if rec != bytes(reclen):
+          nonzero_bad += 1
+        if not bad:
+          bad_sample = rec.hex()
+        if len(bad) < 20:
+          bad.append(off)
+        continue
+      by_writer.setdefault(str(w), []).append(k)
+    zero_runs, start = [], None
+    for off in range(0, len(data) - len(data) % reclen, reclen):
+      z = data[off:off + reclen] == bytes(reclen)
+      if z and start is None:
+        start = off
+      if not z and start is not None:
+        zero_runs.append([start, off])
+        start = None
+    if start is not None:
+      zero_runs.append([start, len(data)])
+    return {'size': len(data), 'by_writer': by_writer, 'bad': bad,
+            'tail': len(data) % reclen, 'bad_sample': bad_sample,
+            'zero_runs': zero_runs[:10], 'nonzero_bad': nonzero_bad}
+
   def op_verify_file(self, path, size, seed, chunk=1 << 20):
     """Read path; check size and content against pattern(seed)."""
     st = os.stat(path)

@@ -38,12 +38,13 @@
  *  - HOME of the streams routed to it: owns each stream's logical size and
  *    merges its deferred appends (Plan), persisting both in a RecordLog.
  *  - ORIGIN of the appends submitted on its node: stages the bytes as a
- *    self-describing blob, queues the entry, and ships batches to each
- *    stream's home every kSequencePeriodUs (Sequence -> Collect -> Plan).
+ *    self-describing blob, queues the entry, and ships its batch for each
+ *    stream straight to that stream's home every kSequencePeriodUs
+ *    (Sequence -> Plan).
  *
  * Staged blob name: "sa.<major>.<minor>.<home>.<clock>.<origin>.<counter>"
  * (hex). It carries everything needed to merge the append, so a restarted
- * container can find and re-queue staged appends it is responsible for.
+ * container can find and re-queue the staged appends it had accepted.
  */
 #ifndef CLIO_CTE_STREAM_STREAM_RUNTIME_H_
 #define CLIO_CTE_STREAM_STREAM_RUNTIME_H_
@@ -76,7 +77,6 @@ struct PendingAppend {
   clio::cte::core::TagId tag_;
   clio::run::u32 home_ = 0;
   AppendEntry entry_;
-  clio::run::u64 not_before_ns_ = 0;  ///< retry backoff after a failed ship
   clio::run::u64 local_seq_ = 0;      ///< this node's enqueue order
 };
 
@@ -111,8 +111,6 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume Flush(clio::run::shared_ptr<FlushTask> &task);
   /** Periodic: ship queued appends to their homes (origin). */
   clio::run::TaskResume Sequence(clio::run::shared_ptr<SequenceTask> &task);
-  /** ManyToOne aggregate: merge the combined batch via Plan (home). */
-  clio::run::TaskResume Collect(clio::run::shared_ptr<CollectTask> &task);
   /** Order, reserve, persist and copy one batch (home). */
   clio::run::TaskResume Plan(clio::run::shared_ptr<PlanTask> &task);
 
@@ -256,7 +254,7 @@ class Runtime : public clio::run::Container {
   void Enqueue(PendingAppend p);
   /** Start the periodic drain if it is not running. */
   void EnsureSequence();
-  /** Restart: re-queue staged appends this node originated or homes. */
+  /** Restart: re-queue the staged appends this node originated. */
   clio::run::TaskResume RecoverStaged();
   /** Restart: finish plans that were in flight at the crash. */
   clio::run::TaskResume FinishOpenPlans();
@@ -279,7 +277,11 @@ class Runtime : public clio::run::Container {
 
   // origin side, guarded by q_mu_
   std::mutex q_mu_;
-  std::vector<PendingAppend> queue_;
+  std::vector<PendingAppend> queue_;  ///< in acceptance order
+  /** Streams whose last batch failed to reach the home: nothing of theirs
+   *  ships before this time, so a retry is never overtaken by newer
+   *  appends from this node. */
+  std::unordered_map<clio::cte::core::TagId, clio::run::u64> hold_until_;
   /** Per stream: local_seq_ of this node's queued appends not yet merged. */
   std::unordered_map<clio::cte::core::TagId, std::set<clio::run::u64>>
       local_pending_;

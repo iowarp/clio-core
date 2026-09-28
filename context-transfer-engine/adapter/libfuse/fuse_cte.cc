@@ -69,6 +69,8 @@
 #include "clio_cte/core/content_transfer_engine.h"
 #include "clio_cte/core/core_client.h"  // CLIO_CTE_CLIENT + GetCapacity
 #include "clio_cte/filesystem/filesystem_client.h"
+#include "clio_cte/filesystem/fs_shard.h"
+#include "clio_cte/stream/stream_client.h"  // deferred O_APPEND
 #include "clio_cte/replication/replication_tasks.h"  // FlushTagTask (fsync barrier)
 
 // Bridge the POSIX type spellings the callbacks use to the concrete types
@@ -122,9 +124,11 @@ struct CfsHandle {
   clio::cte::core::TagId tag = clio::cte::core::TagId::GetNull();
   // Guards `path`, which follows renames of the open file (see HandlePath).
   std::mutex path_mu;
-  // Opened with O_APPEND: on a multi-node mount every write's offset is
-  // reserved at the namespace home (see cte_fuse_write).
+  // Opened with O_APPEND (see AppendModeOf / cte_fuse_write).
   bool append = false;
+  // Deferred appends accepted through this handle and not yet flushed: a
+  // read, fstat, fsync or close through it first waits for their merge.
+  std::atomic<bool> appended{false};
 };
 
 /**
@@ -1410,8 +1414,16 @@ static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
   return 0;
 }
 
+static int FlushAppends(CfsHandle *handle, const std::string &hp);
+
 int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
                           struct fuse_file_info *fi) {
+  // fstat through a handle with deferred appends sees them.
+  CfsHandle *handle = fi != nullptr ? GetHandle(fi) : nullptr;
+  if (handle != nullptr) {
+    const int aerr = FlushAppends(handle, HandlePath(handle, path));
+    if (aerr != 0) return aerr;
+  }
   int rc = cte_fuse_getattr_stat_inner(path, stbuf, fi);
   if (rc != 0) return rc;
   TimesOverlay ov;
@@ -1898,6 +1910,88 @@ int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
  * @return 0, or a negative errno if the size (or the replication barrier)
  *         could not be published
  */
+// ============================================================================
+// O_APPEND
+// ============================================================================
+
+/** How an O_APPEND write finds its offset (CLIO_FUSE_APPEND). */
+enum class AppendMode {
+  kKernel,    ///< the kernel's cached size (one node: its size is exact)
+  kReserve,   ///< reserve the end at the file's stream home, then write
+  kDeferred,  ///< stage the bytes; the stream home merges them at the end
+};
+
+/**
+ * The mount's O_APPEND mode: CLIO_FUSE_APPEND=kernel|reserve|deferred.
+ * Default: kernel on one node, deferred on a multi-node mount (another
+ * node's appends move the end past the kernel's cached size).
+ * @return the mode
+ */
+static AppendMode AppendModeOf() {
+  static const AppendMode mode = [] {
+    const char *e = getenv("CLIO_FUSE_APPEND");
+    const std::string v = e != nullptr ? e : "";
+    if (v == "kernel") return AppendMode::kKernel;
+    if (v == "reserve") return AppendMode::kReserve;
+    if (v == "deferred") return AppendMode::kDeferred;
+    return MultiNode() ? AppendMode::kDeferred : AppendMode::kKernel;
+  }();
+  return mode;
+}
+
+/** @return the stream pool client (file sizes and deferred appends). */
+static clio::cte::stream::Client &StreamClient() {
+  static clio::cte::stream::Client client;
+  return client;
+}
+
+/**
+ * Pack a tag id.
+ * @param tag tag id
+ * @return (major << 32) | minor
+ */
+static clio::run::u64 PackTag(const clio::cte::core::TagId &tag) {
+  return (static_cast<clio::run::u64>(tag.major_) << 32) |
+         static_cast<clio::run::u64>(tag.minor_);
+}
+
+/**
+ * Wait until this handle's deferred appends are merged into the file, then
+ * stamp the file's mtime at its inode home. No-op without pending appends.
+ * @param handle open file
+ * @param hp the handle's current path
+ * @return 0 or -errno
+ */
+static int FlushAppends(CfsHandle *handle, const std::string &hp) {
+  if (!handle->appended.exchange(false)) return 0;
+  const clio::run::u64 packed = PackTag(handle->tag);
+  auto f = StreamClient().AsyncFlush(handle->tag,
+                                     clio::cte::filesystem::FsIdHome(packed));
+  f.Wait();
+  if (f->GetReturnCode() != 0) return -EIO;
+  if (handle->fh == 0) EnsureCreated(hp);
+  auto t = CLIO_CFS_CLIENT->AsyncAdvanceSize(packed, f->size_);
+  t.Wait();
+  return t->GetReturnCode() == 0 ? 0 : -EIO;
+}
+
+/**
+ * Deferred O_APPEND write: stage the bytes on this node; the file's stream
+ * home appends them at the end in its next merge.
+ * @param handle open O_APPEND file with a known tag whose id has a home
+ * @param buf bytes
+ * @param size byte count
+ * @return bytes written or -errno
+ */
+static int DeferredAppend(CfsHandle *handle, const char *buf, size_t size) {
+  const clio::run::u64 packed = PackTag(handle->tag);
+  const clio::run::u32 rc = StreamClient().Append(
+      handle->tag, clio::cte::filesystem::FsIdHome(packed), buf, size);
+  if (rc != 0) return -EIO;
+  handle->appended.store(true);
+  return static_cast<int>(size);
+}
+
 static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
   auto *cfs = CLIO_CFS_CLIENT;
   clio::cte::core::Client::DeferAwaitKey(
@@ -1912,6 +2006,8 @@ static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
   if (handle->fh == 0) {
     EnsureCreated(hp);
   }
+  const int aerr = FlushAppends(handle, hp);
+  if (aerr != 0) return aerr;
   if (hiwater != 0 && !handle->tag.IsNull()) {
     auto t = cfs->AsyncAdvanceSize(
         (static_cast<clio::run::u64>(handle->tag.major_) << 32) |
@@ -1941,7 +2037,8 @@ int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
   const std::string p =
       handle ? HandlePath(handle, path) : std::string(path ? path : "");
   if (p.empty()) return 0;
-  if (handle != nullptr && (MultiNode() || HiwaterFor(p) != 0)) {
+  if (handle != nullptr &&
+      (MultiNode() || HiwaterFor(p) != 0 || handle->appended.load())) {
     // CLOSE-TO-OPEN: once close(2) returns, an open on ANY node -- or any
     // later operation on THIS one -- must see the file's bytes and size.
     // release() is delivered after close(2) has already returned (and is
@@ -1985,8 +2082,11 @@ int cte_fuse_fsync(const char *path, int /*datasync*/,
 int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
   auto *handle = GetHandle(fi);
   if (!handle) return 0;
-  (void)HandlePath(handle, path);  // adopt a rename that happened while open
+  const std::string rp = HandlePath(handle, path);  // adopt a rename
   auto *cfs = CLIO_CFS_CLIENT;
+  // Normally flush (close(2)) already merged this handle's deferred appends;
+  // a handle released without a flush must not drop them.
+  (void)FlushAppends(handle, rp);
   // Fire-and-forget by default: every write was already awaited (or flushed
   // by the kernel before release under writeback caching), so Close's only
   // effect is server-side handle bookkeeping — and release() runs once per
@@ -2057,6 +2157,9 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
   if (size > static_cast<size_t>(INT_MAX))
     size = static_cast<size_t>(INT_MAX);
   if (size == 0) return 0;
+  // Read-your-appends: this handle's deferred appends land first.
+  const int aerr = FlushAppends(handle, hp);
+  if (aerr != 0) return aerr;
 
   // SIEVE-DIRECT read: page-wise AsyncGetBlobDefer — sieve/pending bytes
   // served from their staging (RYW, no wait), settled bytes from the SHM
@@ -2128,9 +2231,16 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
   // is unknown or CLIO_FUSE_SIEVE=0.
   // O_APPEND across nodes: the kernel derived `offset` from ITS cached size,
   // which another node's appends have already moved past -- two nodes each
-  // appending 200 records lost half of them. Reserve the real end at the
-  // namespace home instead (atomic there), and write at the reserved offset.
-  if (handle->append && MultiNode() && !handle->tag.IsNull()) {
+  // appending 200 records lost half of them. Either stage the bytes for the
+  // file's stream home to append at the real end (deferred, no round trip
+  // to the home per write), or reserve the end there first and write at it.
+  if (handle->append && !handle->tag.IsNull() &&
+      AppendModeOf() == AppendMode::kDeferred &&
+      clio::cte::filesystem::FsIdHasHome(PackTag(handle->tag))) {
+    return DeferredAppend(handle, buf, size);
+  }
+  if (handle->append && !handle->tag.IsNull() &&
+      AppendModeOf() != AppendMode::kKernel) {
     auto r = CLIO_CFS_CLIENT->AsyncReserveAppend(
         (static_cast<clio::run::u64>(handle->tag.major_) << 32) |
             static_cast<clio::run::u64>(handle->tag.minor_),

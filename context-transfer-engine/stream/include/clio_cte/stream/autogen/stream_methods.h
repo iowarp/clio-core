@@ -49,9 +49,8 @@ GLOBAL_CROSS_CONST clio::run::u32 kSizeOp = 10;
 GLOBAL_CROSS_CONST clio::run::u32 kAppend = 11;
 GLOBAL_CROSS_CONST clio::run::u32 kFlush = 12;
 GLOBAL_CROSS_CONST clio::run::u32 kSequence = 13;
-GLOBAL_CROSS_CONST clio::run::u32 kCollect = 14;
-GLOBAL_CROSS_CONST clio::run::u32 kPlan = 15;
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 16;
+GLOBAL_CROSS_CONST clio::run::u32 kPlan = 14;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 15;
 
 /** @return method-id -> name table (monitoring / logs). */
 inline const std::vector<std::string> &GetMethodNames() {
@@ -64,7 +63,6 @@ inline const std::vector<std::string> &GetMethodNames() {
     v[kAppend] = "Append";
     v[kFlush] = "Flush";
     v[kSequence] = "Sequence";
-    v[kCollect] = "Collect";
     v[kPlan] = "Plan";
     return v;
   }();

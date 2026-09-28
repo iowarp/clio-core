@@ -16,7 +16,7 @@ import time
 
 from cluster import parallel
 from suite import test
-from tests_dist import _tags_match
+from tests_dist import _tags_match, check_records, runs_to_set
 
 MiB = 1 << 20
 OP_DEADLINE = 60  # seconds any single op may take while a node is down
@@ -515,3 +515,74 @@ def t_tag_names_restart(ctx):
   for i in range(n):
     _tags_match(ctx, i, r, want, f'after {vh} restarted')
 
+
+def inode_home(ctx, i, path):
+  """Container that homes `path`'s inode (encoded in its inode number), or
+  None if the id carries no home."""
+  ino = ctx.ok(i, 'stat', path=path)['ino']
+  major = ino >> 32
+  if major & (0x40000000 | 0x80000000):
+    return major & 0xFFFF
+  return None
+
+
+@test('append_home_restart', 'fault', min_nodes=2, redeploy_after=True,
+      timeout=1800)
+def t_append_home_restart(ctx):
+  """Writers keep O_APPENDing (fsync every 500 records) to a file while its
+  home -- which owns its size and merges its appends -- is SIGKILLed and
+  restarted. Every append fsync'd before the crash survives exactly once, in
+  its writer's order; appends not yet fsync'd may be lost (as POSIX allows),
+  never duplicated or garbled, and writers carry on after the restart."""
+  import threading
+  n = len(ctx.hosts)
+  p = ctx.p('journal')
+  ctx.ok(0, 'write_file', path=p, size=0, seed=0)
+  home = inode_home(ctx, 0, p)
+  victim = home
+  if home is None or home >= n:
+    victim = n - 1
+    ctx.note(f'inode number does not carry the home ({home}); killing '
+             f'node{victim} instead')
+  writers = [i for i in range(n) if i != victim]
+  res = {}
+
+  def app(i):
+    res[i] = ctx.a(i).call('append_records', timeout=600, path=p, writer=i,
+                           count=10 ** 7, max_secs=20, fsync_every=500)
+  ts = [threading.Thread(target=app, args=(i,)) for i in writers]
+  for t in ts:
+    t.start()
+  time.sleep(4)
+  vh = ctx.hosts[victim]
+  t_kill = time.time()
+  ctx.cl.kill_fuse(vh)
+  ctx.cl.kill_runtime(vh)
+  time.sleep(5)
+  ctx.cl.start_runtime(vh, 'restart')
+  ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
+  time.sleep(3)
+  ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
+  ctx.cl.agents.pop(vh, None)
+  for t in ts:
+    t.join()
+  durable, maybe = {}, {}
+  for i in writers:
+    r = res.get(i) or {}
+    ctx.check(r.get('ok'), f'node{i} writer: {r.get("err") or r}')
+    ret = r.get('ret') or {}
+    acked = runs_to_set(ret.get('acked', []))
+    # fsyncs that completed a clear second before the kill (node clocks agree
+    # to NTP precision) bound what must survive.
+    upto = max([k for k, ts_ in ret.get('synced', []) if ts_ < t_kill - 1.0],
+               default=-1)
+    durable[i] = {k for k in acked if k <= upto}
+    top = max(acked) if acked else -1
+    maybe[i] = set(range(0, top + 1)) - durable[i]
+    ctx.metrics[f'node{i}_acked'] = len(acked)
+    ctx.metrics[f'node{i}_durable_before_kill'] = len(durable[i])
+    ctx.metrics[f'node{i}_failed'] = ret.get('nfail', 0)
+    post = len([k for k, ts_ in ret.get('synced', []) if ts_ > t_kill + 5])
+    ctx.check(post > 0, f'node{i}: no fsync succeeded after {vh} restarted')
+  for i in writers + [victim]:
+    check_records(ctx, i, p, durable, maybe, zeros_ok=True)

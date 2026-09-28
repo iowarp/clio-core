@@ -33,7 +33,7 @@
 
 /**
  * Stream runtime, home side: logical sizes (SizeOp) and the merge of
- * deferred appends (Collect -> Plan -> ExecutePlan). A plan reserves its
+ * deferred appends (Plan -> ExecutePlan). A plan reserves its
  * byte range, is persisted, then copied; it stays open (and is retried at
  * the same offsets) until every copy succeeded.
  */
@@ -82,6 +82,7 @@ clio::run::u64 Runtime::ApplySizeOpLocked(const clio::cte::core::TagId &tag,
   auto it = streams_.find(tag);
   *old_size = it == streams_.end() ? 0 : it->second.size_;
   if (op == StreamSizeOp::kGet) return *old_size;
+
   if (op == StreamSizeOp::kDrop) {
     if (it != streams_.end()) streams_.erase(it);
     dropped_[tag] = clio::cte::core::GetWallTimeNs();
@@ -132,22 +133,6 @@ clio::run::TaskResume Runtime::SizeOp(clio::run::shared_ptr<SizeOpTask> &task) {
 // ===========================================================================
 // Merge
 // ===========================================================================
-
-clio::run::TaskResume Runtime::Collect(
-    clio::run::shared_ptr<CollectTask> &task) {
-  CLIO_TASK_BODY_BEGIN
-  // Runs once per batch as the ManyToOne aggregate. The merge suspends, so it
-  // runs as a regular task (Plan) that this aggregate awaits: that keeps the
-  // aggregate alive and its members waiting until the bytes are in place.
-  std::vector<AppendEntry> entries(task->entries_.begin(),
-                                   task->entries_.end());
-  auto f = self_.AsyncPlan(task->tag_id_, entries);
-  CLIO_CO_AWAIT(f);
-  task->new_size_ = f->new_size_;
-  task->return_code_ = f->GetReturnCode();
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
 
 void Runtime::DedupeLocked(std::vector<AppendEntry> *entries) {
   if (merged_names_.size() > kMaxMergedNames) {
@@ -300,6 +285,11 @@ clio::run::TaskResume Runtime::CopySlice(const StreamPlan *plan, size_t first,
                                buf.ptr_ + pos);
     CLIO_CO_AWAIT(g);
     have[k - first] = g->GetReturnCode() == 0;
+    if (!have[k - first]) {
+      HLOG(kWarning, "stream: staged append {} of {}.{} unreadable (rc {}); "
+           "treating it as merged before a restart", e.staged_name_,
+           plan->tag_.major_, plan->tag_.minor_, g->GetReturnCode());
+    }
     pos += e.size_;
   }
   size_t k = first;

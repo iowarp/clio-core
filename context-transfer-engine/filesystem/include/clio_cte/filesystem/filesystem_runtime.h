@@ -20,6 +20,8 @@
 #include <clio_cte/filesystem/filesystem_client.h>
 #include <clio_cte/filesystem/filesystem_tasks.h>
 #include <clio_cte/filesystem/fs_meta_log.h>
+#include <clio_cte/stream/stream_client.h>
+#include <clio_cte/stream/stream_runtime.h>
 #include <clio_cte/filesystem/fs_shard.h>
 #include <clio_cte/filesystem/shm_fs_cache.h>
 
@@ -83,14 +85,6 @@ class Runtime : public clio::run::Container {
         stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
         return stat;
       }
-      case Method::kAppend: {
-        const auto *t = static_cast<const AppendTask *>(task);
-        stat.io_size_ = t->size_;
-        stat.compute_ =
-            static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
-        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
-        return stat;
-      }
       case Method::kReaddir:
         // A listing is a trigram regex query over the tag index plus one
         // result marshalled per entry — CPU-bound, and by far the most
@@ -144,7 +138,6 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume AdvanceSize(clio::run::shared_ptr<AdvanceSizeTask> &task);
   clio::run::TaskResume Read(clio::run::shared_ptr<ReadTask> &task);
   clio::run::TaskResume Write(clio::run::shared_ptr<WriteTask> &task);
-  clio::run::TaskResume Append(clio::run::shared_ptr<AppendTask> &task);
   clio::run::TaskResume Getattr(clio::run::shared_ptr<GetattrTask> &task);
   clio::run::TaskResume Truncate(clio::run::shared_ptr<TruncateTask> &task);
   clio::run::TaskResume Unlink(clio::run::shared_ptr<UnlinkTask> &task);
@@ -163,11 +156,6 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume Readdir(clio::run::shared_ptr<ReaddirTask> &task);
   clio::run::TaskResume StatSize(clio::run::shared_ptr<StatSizeTask> &task);
   clio::run::TaskResume ShardOp(clio::run::shared_ptr<ShardOpTask> &task);
-  // ---- deferred-append pipeline ----
-  clio::run::TaskResume AppendSequence(clio::run::shared_ptr<AppendSequenceTask> &task);
-  clio::run::TaskResume AppendCollect(clio::run::shared_ptr<AppendCollectTask> &task);
-  clio::run::TaskResume AppendPlan(clio::run::shared_ptr<AppendPlanTask> &task);
-  clio::run::TaskResume AppendExecution(clio::run::shared_ptr<AppendExecutionTask> &task);
 
   // ---- Container virtuals (defined in autogen/filesystem_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
@@ -244,21 +232,22 @@ class Runtime : public clio::run::Container {
   // Client bound to THIS filesystem pool, for self-submitted tasks (the
   // append pipeline, and ShardOps to the owners of other namespace state).
   Client self_;
-  // Staging tag for append data blobs. Append writes the bytes here (NOT under
-  // the file's tag) so GetTagSize(file_tag) reports the true file tail,
-  // unpolluted by still-unmerged staged appends. Resolved once at Create.
-  clio::cte::core::TagId staging_tag_id_ = clio::cte::core::TagId::GetNull();
   // Global store for per-file extended attributes. Each file's xattrs live in
   // ONE serialized blob under this tag, named by the file's packed tag id
   // (decimal string). Kept OUT of the file's own tag so xattrs never inflate
   // GetTagSize (i.e. the reported st_size). Resolved once at Create.
   clio::cte::core::TagId xattr_tag_id_ = clio::cte::core::TagId::GetNull();
+  // Every file is a stream (clio::cte::stream): the stream pool owns its
+  // logical size and merges its deferred appends. A file's stream home is
+  // its inode home, so size reads are in-process (StreamLocal).
+  clio::cte::stream::Client stream_;
+  /** This node's stream container (resolved in Create; empty if absent). */
+  clio::run::ContainerHold stream_hold_;
 
   // ---- inodes this container is home for ----
   struct FileInfo {
     clio::cte::core::TagId tag_id_;
     std::string path_;                       ///< a current name (mirror only)
-    std::atomic<clio::run::u64> size_{0};    ///< logical size
     // Everything below is guarded by meta_mu_.
     clio::run::u32 type_ = kFsTypeFile;      ///< file or symlink
     clio::run::u32 nlink_ = 1;
@@ -270,7 +259,7 @@ class Runtime : public clio::run::Container {
     clio::run::u32 open_count_ = 0;          ///< live handles
     bool orphan_ = false;     ///< last name gone while open: purge at close
     bool has_xattr_ = false;  ///< an xattr blob may exist
-    bool dirty_ = false;      ///< size changed since last logged
+    bool dirty_ = false;      ///< times changed since last logged
   };
   std::mutex meta_mu_;  ///< guards handles_, by_tag_ and FileInfo fields
   std::unordered_map<clio::run::u64, std::shared_ptr<FileInfo>> handles_;
@@ -375,7 +364,7 @@ class Runtime : public clio::run::Container {
   /** @return the inode `packed` (nullptr if not homed here). */
   std::shared_ptr<FileInfo> FindInode(clio::run::u64 packed);
   /** Fill `attr` from an inode (meta_mu_ held). */
-  static void InodeAttrLocked(const FileInfo &fi, FsAttr *attr);
+  void InodeAttrLocked(const FileInfo &fi, FsAttr *attr);
   /** Open inode: allocate a handle (O_TRUNC is applied by the caller). */
   int InodeOpenLocal(const FsReq &req, FsResp &resp);
   /**
@@ -429,6 +418,28 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume FlushNames();
   /** Encode every live entry this container owns as kAddName records. */
   std::string EncodeShardNames();
+
+  // ---- file sizes (owned by the stream pool) ----
+  /**
+   * Logical size of an inode this container is home for (no network).
+   * @param fi the inode
+   * @return symlink target length, or the file's stream size
+   */
+  clio::run::u64 FileSize(const FileInfo &fi);
+  /**
+   * Change a file's size at its stream (this container is its home).
+   * @param tag file tag
+   * @param op size operation
+   * @param value operand
+   * @param old_size receives the size before (may be null)
+   * @param new_size receives the size after (may be null)
+   * @param rc receives the return code
+   */
+  clio::run::TaskResume FileSizeOp(clio::cte::core::TagId tag,
+                                   clio::cte::stream::StreamSizeOp op,
+                                   clio::run::u64 value,
+                                   clio::run::u64 *old_size,
+                                   clio::run::u64 *new_size, clio::run::u32 *rc);
   /** Restart catch-up: pull every peer's names into this node (drain body). */
   clio::run::TaskResume CatchUpNames();
 
@@ -497,20 +508,6 @@ class Runtime : public clio::run::Container {
   /** Re-publish a path refusing the client fast path. */
   void MirrorRefuse(const std::string &path);
 
-  // ---- deferred-append pipeline state ----
-  // Per-node logical append counter (orders appends sharing a UTC tick).
-  std::atomic<clio::run::u64> append_logical_{0};
-  // Pending appends placed locally, awaiting the periodic AppendSequence drain.
-  // Multi-producer (worker threads running Append), single-consumer
-  // (AppendSequence) — guarded by a mutex rather than a fixed-capacity ring so
-  // a burst of appends can never be silently dropped.
-  struct PendingAppend {
-    clio::cte::core::TagId tag_id_;
-    AppendEntry entry_;
-  };
-  std::mutex append_mu_;
-  std::vector<PendingAppend> append_pending_;
-  bool append_seq_started_ = false;  // periodic AppendSequence kicked off once
 };
 
 /** ShardOp codes (see Runtime::ExecShardOp). */

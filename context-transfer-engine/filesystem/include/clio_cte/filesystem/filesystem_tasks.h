@@ -76,17 +76,26 @@ struct FilesystemConfig {
    * container id is appended so co-located containers never share a file.
    */
   std::string metadata_log_path_;
+  /**
+   * Stream pool that owns every file's logical size and merges deferred
+   * appends (clio::cte::stream). Created with defaults (over next_pool_id_,
+   * logging next to metadata_log_path_) if the deployment did not compose it.
+   */
+  clio::run::PoolId stream_pool_id_;
 
-  FilesystemConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
+  FilesystemConfig()
+      : next_pool_id_(clio::run::PoolId::GetNull()),
+        stream_pool_id_(565, 0) {}
   FilesystemConfig(const clio::run::PoolId &pool_id, const FilesystemConfig &other)
       : next_pool_id_(other.next_pool_id_),
-        metadata_log_path_(other.metadata_log_path_) {
+        metadata_log_path_(other.metadata_log_path_),
+        stream_pool_id_(other.stream_pool_id_) {
     (void)pool_id;
   }
 
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(next_pool_id_, metadata_log_path_);
+    ar(next_pool_id_, metadata_log_path_, stream_pool_id_);
   }
 
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
@@ -101,6 +110,10 @@ struct FilesystemConfig {
       }
       if (node["metadata_log_path"]) {
         metadata_log_path_ = node["metadata_log_path"].as<std::string>();
+      }
+      if (node["stream_pool_id"]) {
+        stream_pool_id_ = clio::run::PoolId::FromString(
+            node["stream_pool_id"].as<std::string>());
       }
     } catch (...) {
       // best-effort
@@ -388,40 +401,6 @@ struct WriteTask : public clio::run::Task {
   }
 };
 
-/** Append: write at the current logical size, then advance it. */
-struct AppendTask : public clio::run::Task {
-  IN clio::run::u64 handle_;
-  IN clio::run::u64 size_;
-  IN ctp::ipc::ShmPtr<> data_;
-  OUT clio::run::u64 offset_;          // where the data landed (old logical size)
-  OUT clio::run::u64 bytes_written_;
-  OUT clio::run::u64 new_size_;
-  AppendTask()
-      : clio::run::Task(), handle_(0), size_(0),
-        data_(ctp::ipc::ShmPtr<>::GetNull()), offset_(0), bytes_written_(0),
-        new_size_(0) {}
-  explicit AppendTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
-                      const clio::run::PoolQuery &pool_query, clio::run::u64 handle,
-                      clio::run::u64 size, ctp::ipc::ShmPtr<> data)
-      : clio::run::Task(task_id, pool_id, pool_query, Method::kAppend),
-        handle_(handle), size_(size), data_(data), offset_(0),
-        bytes_written_(0), new_size_(0) {}
-  void Copy(const ctp::ipc::FullPtr<AppendTask>& o) {
-    // Base fields first (pool id, method, query, flags): a forwarded copy
-    // without them reached SendIn with a null pool and crashed the node.
-    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
-    handle_ = o->handle_; size_ = o->size_; data_ = o->data_;
-    offset_ = o->offset_; bytes_written_ = o->bytes_written_;
-    new_size_ = o->new_size_;
-  }
-  template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(handle_, size_, data_);
-    ar.bulk(data_, size_, BULK_XFER);
-  }
-  template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(offset_, bytes_written_, new_size_);
-  }
-};
 
 /** Getattr: exists / is-dir / logical size for a path. */
 struct GetattrTask : public clio::run::Task {
@@ -867,20 +846,6 @@ struct StatSizeTask : public clio::run::Task {
   }
 };
 
-// ===========================================================================
-// Deferred-append pipeline
-//
-// Appends are NOT applied to the tail synchronously. Instead Append stamps a
-// (UTC, logical) order, writes the bytes as a standalone "data blob" under the
-// file's tag, and queues a pending entry. A periodic AppendSequence drains the
-// per-node queue and, per tag, submits an AppendCollect routed ManyToOne to the
-// tag's sequencer. There the batched members' entries are combined (AggregateIn)
-// into one global, timestamp-sorted batch (the "plan" phase): it reads the file
-// tail (GetTagSize minus this batch's still-staged data), lays each data blob
-// out into 1 MiB file pages, and dispatches AppendExecution slices (<=16 MiB
-// each) that GetBlob->PutBlob->DelBlob the data into the file pages.
-// ===========================================================================
-
 /**
  * ShardOp (internal): one operation on namespace state owned by the target
  * container -- a directory's entries/attributes (routed by hash of the
@@ -913,148 +878,11 @@ struct ShardOpTask : public clio::run::Task {
   }
 };
 
-/** One pending append: a staged data blob waiting to be merged into a file. */
-struct AppendEntry {
-  std::string data_blob_id_;     ///< name of the staged blob (under file tag)
-  clio::run::u64 data_blob_size_ = 0;  ///< staged blob length in bytes
-  clio::run::u64 utc_ns_ = 0;          ///< wallclock at placement (primary sort key)
-  clio::run::u64 logical_ = 0;         ///< per-node logical counter (tiebreak)
-  template <class Ar> void serialize(Ar &ar) {
-    ar(data_blob_id_, data_blob_size_, utc_ns_, logical_);
-  }
-};
 
-/** One merge step: copy [size_] bytes of a data blob into a file page blob. */
-struct AppendPlanStep {
-  clio::run::u64 file_page_ = 0;       ///< destination file page index (blob name)
-  std::string data_blob_id_;     ///< source staged blob
-  clio::run::u64 off_in_page_ = 0;     ///< destination offset within the file page
-  clio::run::u64 off_in_data_ = 0;     ///< source offset within the data blob
-  clio::run::u64 size_ = 0;            ///< bytes copied by this step (<= data size)
-  clio::run::u64 data_blob_size_ = 0;  ///< full data blob size (the final step for a
-                                 ///< blob has size_==data_blob_size_ so its
-                                 ///< DelBlob can't race a partial copy)
-  template <class Ar> void serialize(Ar &ar) {
-    ar(file_page_, data_blob_id_, off_in_page_, off_in_data_, size_,
-       data_blob_size_);
-  }
-};
 
-/** AppendSequence: periodic local trigger to drain the pending-append queue. */
-struct AppendSequenceTask : public clio::run::Task {
-  AppendSequenceTask() : clio::run::Task() {}
-  explicit AppendSequenceTask(const clio::run::TaskId &task_id,
-                              const clio::run::PoolId &pool_id,
-                              const clio::run::PoolQuery &pool_query)
-      : clio::run::Task(task_id, pool_id, pool_query, Method::kAppendSequence) {}
-  void Copy(const ctp::ipc::FullPtr<AppendSequenceTask> &o) {
-    // Base fields first (pool id, method, query, flags): a forwarded copy
-    // without them reached SendIn with a null pool and crashed the node.
-    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
-    Task::Copy(o.template Cast<Task>());
-  }
-  template <typename Ar> void SerializeIn(Ar &ar) { Task::SerializeIn(ar); }
-  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
-};
 
-/**
- * AppendCollect: ManyToOne collective per tag. Each node submits its pending
- * entries for the tag; AggregateIn concatenates them at the sequencer; the
- * single aggregate run sorts + plans + dispatches the merge.
- */
-struct AppendCollectTask : public clio::run::Task {
-  IN clio::cte::core::TagId tag_id_;
-  IN std::vector<AppendEntry> entries_;
-  OUT clio::run::u64 new_size_;  ///< file logical size after the batch is applied
-  AppendCollectTask()
-      : clio::run::Task(), tag_id_(clio::cte::core::TagId::GetNull()), new_size_(0) {}
-  explicit AppendCollectTask(const clio::run::TaskId &task_id,
-                             const clio::run::PoolId &pool_id,
-                             const clio::run::PoolQuery &pool_query,
-                             const clio::cte::core::TagId &tag_id,
-                             const std::vector<AppendEntry> &entries)
-      : clio::run::Task(task_id, pool_id, pool_query, Method::kAppendCollect),
-        tag_id_(tag_id), entries_(entries), new_size_(0) {}
-  void Copy(const ctp::ipc::FullPtr<AppendCollectTask> &o) {
-    // Base fields first (pool id, method, query, flags): a forwarded copy
-    // without them reached SendIn with a null pool and crashed the node.
-    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
-    Task::Copy(o.template Cast<Task>());
-    tag_id_ = o->tag_id_; entries_ = o->entries_; new_size_ = o->new_size_;
-  }
-  template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(tag_id_, entries_);
-  }
-  template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(new_size_);
-  }
-  /** ManyToOne: fold a batched member's pending entries into this aggregate. */
-  void AggregateIn(const ctp::ipc::FullPtr<clio::run::Task> &member_base) {
-    auto m = member_base.template Cast<AppendCollectTask>();
-    entries_.insert(entries_.end(), m->entries_.begin(), m->entries_.end());
-  }
-};
 
-/**
- * AppendPlan: a REGULAR (suspendable) task that does the heavy planning work
- * for one tag's batch. Submitted by the synchronous AppendCollect aggregate
- * (the ManyToOne synthetic aggregate task can't itself suspend). Sorts the
- * batch, reads the file tail, builds the page-merge plan, and dispatches
- * AppendExecution slices.
- */
-struct AppendPlanTask : public clio::run::Task {
-  IN clio::cte::core::TagId tag_id_;
-  IN std::vector<AppendEntry> entries_;
-  AppendPlanTask()
-      : clio::run::Task(), tag_id_(clio::cte::core::TagId::GetNull()) {}
-  explicit AppendPlanTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
-                          const clio::run::PoolQuery &pool_query,
-                          const clio::cte::core::TagId &tag_id,
-                          const std::vector<AppendEntry> &entries)
-      : clio::run::Task(task_id, pool_id, pool_query, Method::kAppendPlan),
-        tag_id_(tag_id), entries_(entries) {}
-  void Copy(const ctp::ipc::FullPtr<AppendPlanTask> &o) {
-    // Base fields first (pool id, method, query, flags): a forwarded copy
-    // without them reached SendIn with a null pool and crashed the node.
-    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
-    Task::Copy(o.template Cast<Task>());
-    tag_id_ = o->tag_id_; entries_ = o->entries_;
-  }
-  template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(tag_id_, entries_);
-  }
-  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
-};
 
-/** AppendExecution: apply a slice of the merge plan (GetBlob->PutBlob->DelBlob). */
-struct AppendExecutionTask : public clio::run::Task {
-  IN clio::cte::core::TagId tag_id_;          // destination file tag
-  IN clio::cte::core::TagId staging_tag_id_;  // source staged data blobs
-  IN std::vector<AppendPlanStep> steps_;
-  AppendExecutionTask()
-      : clio::run::Task(), tag_id_(clio::cte::core::TagId::GetNull()),
-        staging_tag_id_(clio::cte::core::TagId::GetNull()) {}
-  explicit AppendExecutionTask(const clio::run::TaskId &task_id,
-                               const clio::run::PoolId &pool_id,
-                               const clio::run::PoolQuery &pool_query,
-                               const clio::cte::core::TagId &tag_id,
-                               const clio::cte::core::TagId &staging_tag_id,
-                               const std::vector<AppendPlanStep> &steps)
-      : clio::run::Task(task_id, pool_id, pool_query, Method::kAppendExecution),
-        tag_id_(tag_id), staging_tag_id_(staging_tag_id), steps_(steps) {}
-  void Copy(const ctp::ipc::FullPtr<AppendExecutionTask> &o) {
-    // Base fields first (pool id, method, query, flags): a forwarded copy
-    // without them reached SendIn with a null pool and crashed the node.
-    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
-    Task::Copy(o.template Cast<Task>());
-    tag_id_ = o->tag_id_; staging_tag_id_ = o->staging_tag_id_;
-    steps_ = o->steps_;
-  }
-  template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(tag_id_, staging_tag_id_, steps_);
-  }
-  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
-};
 
 }  // namespace clio::cte::filesystem
 

@@ -43,9 +43,6 @@
 
 namespace clio::cte::stream {
 
-/** How long a Collect waits to batch other nodes' appends (ns). */
-GLOBAL_CROSS_CONST clio::run::u64 kCollectBatchNs = 50000;
-
 /**
  * Client of the stream pool.
  *
@@ -199,35 +196,20 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
-   * Send this node's batch for a stream to its home (runtime-internal).
+   * Send this node's batch of appends to a stream's home, which merges it
+   * (runtime-internal).
    * @param tag stream tag
    * @param home the stream's home container
-   * @param entries this node's pending appends for the stream
-   * @return future; completes once the home merged the combined batch
-   */
-  clio::run::Future<CollectTask> AsyncCollect(
-      const clio::cte::core::TagId &tag, clio::run::u32 home,
-      const std::vector<AppendEntry> &entries) {
-    auto *ipc = CLIO_CPU_IPC;
-    auto q = clio::run::PoolQuery::ManyToOne(home, TagKey(tag),
-                                             kCollectBatchNs);
-    auto task = ipc->NewTask<CollectTask>(clio::run::CreateTaskId(), pool_id_,
-                                          q, tag, entries);
-    return ipc->Send(task);
-  }
-
-  /**
-   * Merge a collected batch on this (home) node (runtime-internal).
-   * @param tag stream tag
-   * @param entries the combined batch
-   * @return future
+   * @param entries this node's pending appends for the stream, in order
+   * @return future; completes once the bytes are in place
    */
   clio::run::Future<PlanTask> AsyncPlan(const clio::cte::core::TagId &tag,
+                                        clio::run::u32 home,
                                         const std::vector<AppendEntry> &entries) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<PlanTask>(clio::run::CreateTaskId(), pool_id_,
-                                       clio::run::PoolQuery::Local(), tag,
-                                       entries);
+                                       clio::run::PoolQuery::DirectId(home),
+                                       tag, entries);
     return ipc->Send(task);
   }
 #endif  // CTP_IS_HOST
