@@ -367,6 +367,21 @@ void HiwaterErase(const std::string &path) {
   g_hiwater.erase(path);
   g_wtime.erase(path);
 }
+/**
+ * Drop a path's hiwater entry after `pushed` was adopted by the chimod --
+ * unless a newer write raised it past that: a deferred close runs after the
+ * application moved on, and erasing unconditionally lost the size of writes
+ * made through a later handle (fsx saw the file shrink to the old size).
+ * @param path the file's path
+ * @param pushed the size the close just carried to the chimod
+ */
+void HiwaterEraseIfCovered(const std::string &path, clio::run::u64 pushed) {
+  std::lock_guard<std::mutex> lk(g_hw_mtx);
+  auto it = g_hiwater.find(path);
+  if (it == g_hiwater.end() || it->second > pushed) return;
+  g_hiwater.erase(it);
+  g_wtime.erase(path);
+}
 // Truncate invalidates any unflushed-write extent past the new size; without
 // this, getattr's hiwater overlay kept reporting the pre-truncate size.
 void HiwaterClamp(const std::string &path, clio::run::u64 size) {
@@ -791,7 +806,7 @@ void CloserMain() {
                   static_cast<clio::run::u64>(pc.tag.minor_),
               pc.hiwater);
           t.Wait();
-          HiwaterErase(pc.path);
+          HiwaterEraseIfCovered(pc.path, pc.hiwater);
         }
       } else if (pc.hiwater != 0) {
         // AWAITED: the hiwater entry may only be dropped once the chimod
@@ -799,7 +814,7 @@ void CloserMain() {
         // the stale pre-close size.
         auto t = CLIO_CFS_CLIENT->AsyncClose(pc.fh, pc.hiwater);
         t.Wait();
-        HiwaterErase(pc.path);
+        HiwaterEraseIfCovered(pc.path, pc.hiwater);
       } else {
         CLIO_CFS_CLIENT->AsyncCloseDetached(pc.fh);
       }
@@ -862,13 +877,13 @@ void CloserBarrier() {
                   static_cast<clio::run::u64>(pc.tag.minor_),
               pc.hiwater);
           t.Wait();
-          HiwaterErase(pc.path);
+          HiwaterEraseIfCovered(pc.path, pc.hiwater);
         }
       } else {
         if (pc.hiwater != 0) {
           auto t = CLIO_CFS_CLIENT->AsyncClose(pc.fh, pc.hiwater);
           t.Wait();
-          HiwaterErase(pc.path);
+          HiwaterEraseIfCovered(pc.path, pc.hiwater);
         } else {
           CLIO_CFS_CLIENT->AsyncCloseDetached(pc.fh);
         }
@@ -2130,12 +2145,12 @@ int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
                 static_cast<clio::run::u64>(handle->tag.minor_),
             hiwater);
         tt.Wait();
-        HiwaterErase(handle->path);
+        HiwaterEraseIfCovered(handle->path, hiwater);
       }
     } else {
       auto t = cfs->AsyncClose(handle->fh, hiwater);
       t.Wait();
-      if (hiwater != 0) HiwaterErase(handle->path);
+      if (hiwater != 0) HiwaterEraseIfCovered(handle->path, hiwater);
       rc = (t->GetReturnCode() == 0) ? 0 : -EIO;
     }
   }

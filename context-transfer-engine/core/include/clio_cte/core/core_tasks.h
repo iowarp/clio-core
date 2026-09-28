@@ -891,6 +891,10 @@ static constexpr clio::run::u32 REPLICA_UPDATE_ONLY = 0x8;
 static constexpr clio::run::u32 REPLICA_VERIFY_COMPLETE = 0x10;
 /** Return code of an UPDATE_ONLY replica write against an absent slot. */
 static constexpr clio::run::u32 kReplicaAbsentRc = 12;
+/** PutBlob with Context::kPutIfAbsent found the blob already there. */
+static constexpr clio::run::u32 kPutExistsRc = 60;
+/** PutBlob with Context::kPutIfVersion found a different version. */
+static constexpr clio::run::u32 kPutVersionMismatchRc = 61;
 
 /**
  * One replica of a blob's data (issue #886): an independent block list,
@@ -1072,6 +1076,10 @@ struct BlobInfo {
   // Non-zero when this blob is an expendable cache copy the tier may evict.
   // Write-once: set at creation, never changed. See kCtePutDroppable.
   clio::run::u32 droppable_;
+  /** A shadow copy of a blob another container owns (Context::kShadowCopy).
+   *  In memory only: a restarted container relearns it from the next
+   *  mirrored write. */
+  bool shadow_ = false;
   int compress_lib_;     // Compression library ID *requested* for this blob
                          // (0 = none). Provenance/telemetry only -- NOT a
                          // reliable answer to "is this blob compressed?";
@@ -1321,6 +1329,7 @@ struct BlobInfo {
         access_count_(other.access_count_),
         transform_flags_(other.transform_flags_),
         droppable_(other.droppable_),
+        shadow_(other.shadow_),
         compress_lib_(other.compress_lib_),
         compress_preset_(other.compress_preset_),
         trace_key_(other.trace_key_),
@@ -1344,6 +1353,8 @@ struct BlobInfo {
       last_read_ = other.last_read_;
       access_count_ = other.access_count_;
       transform_flags_ = other.transform_flags_;
+      droppable_ = other.droppable_;
+      shadow_ = other.shadow_;
       compress_lib_ = other.compress_lib_;
       compress_preset_ = other.compress_preset_;
       trace_key_ = other.trace_key_;
@@ -1744,6 +1755,23 @@ struct Context {
    *  fault, or the handler's own materialising get/put would re-fault and
    *  recurse forever. */
   static constexpr clio::run::u32 kNoFault = 1u << 2;
+  /** kPutIfAbsent -- conditional PutBlob: fail with kPutExistsRc if the blob
+   *  already exists (a put completed on it, or it holds data). Decided at the
+   *  owner under the blob's write token, so of two racing conditional puts
+   *  exactly one wins. Primary puts only (replica_ == 0); ignored by
+   *  MultiPutBlob. */
+  static constexpr clio::run::u32 kPutIfAbsent = 1u << 3;
+  /** kPutIfVersion -- compare-and-swap PutBlob: apply only if the blob's
+   *  current version equals version_ (an absent blob is version 0), else
+   *  fail with kPutVersionMismatchRc. On success version_ returns the new
+   *  version, so a caller can chain. Versions come from GetBlob (version_)
+   *  or a previous put. Same scope as kPutIfAbsent. */
+  static constexpr clio::run::u32 kPutIfVersion = 1u << 4;
+  /** kShadowCopy -- this put writes a SHADOW copy of a blob another
+   *  container owns (replication remote_copies, or a failover write while
+   *  the owner is down). Shadows are left out of blob listings, queries and
+   *  tag sizes, so a blob is never counted twice. */
+  static constexpr clio::run::u32 kShadowCopy = 1u << 5;
 
   /**
    * Fault-handler parameters (checkpointing / lazy copy). When the core

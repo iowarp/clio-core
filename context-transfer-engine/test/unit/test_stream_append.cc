@@ -288,13 +288,20 @@ TEST_CASE("Stream appends to a dropped stream are discarded", "[stream]") {
   REQUIRE((sz->GetReturnCode() != 0 || sz->size_ == 0));
   auto st = cte->AsyncGetOrCreateTag("_clio_stream_staging");
   st.Wait();
-  auto blobs = cte->AsyncGetContainedBlobs(st->tag_id_);
-  blobs.Wait();
   char prefix[64];
   std::snprintf(prefix, sizeof(prefix), "sa.%x.%x.", tag.major_, tag.minor_);
-  for (const auto &n : blobs->blob_names_) {
-    REQUIRE(n.rfind(prefix, 0) != 0);  // no staged bytes left behind
+  // Discarded staged bytes are reaped in the background: wait for it.
+  bool clean = false;
+  for (int attempt = 0; attempt < 100 && !clean; ++attempt) {
+    auto blobs = cte->AsyncGetContainedBlobs(st->tag_id_);
+    blobs.Wait();
+    clean = true;
+    for (const auto &n : blobs->blob_names_) {
+      if (n.rfind(prefix, 0) == 0) clean = false;
+    }
+    if (!clean) std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
+  REQUIRE(clean);  // no staged bytes left behind
 }
 
 SIMPLE_TEST_MAIN()

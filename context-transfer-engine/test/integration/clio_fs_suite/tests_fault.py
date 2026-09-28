@@ -549,7 +549,7 @@ def t_append_home_restart(ctx):
 
   def app(i):
     res[i] = ctx.a(i).call('append_records', timeout=600, path=p, writer=i,
-                           count=10 ** 7, max_secs=20, fsync_every=500)
+                           count=10 ** 7, max_secs=30, fsync_every=500)
   ts = [threading.Thread(target=app, args=(i,)) for i in writers]
   for t in ts:
     t.start()
@@ -582,7 +582,76 @@ def t_append_home_restart(ctx):
     ctx.metrics[f'node{i}_acked'] = len(acked)
     ctx.metrics[f'node{i}_durable_before_kill'] = len(durable[i])
     ctx.metrics[f'node{i}_failed'] = ret.get('nfail', 0)
-    post = len([k for k, ts_ in ret.get('synced', []) if ts_ > t_kill + 5])
-    ctx.check(post > 0, f'node{i}: no fsync succeeded after {vh} restarted')
+    # The writer recovers: after its last error (a write or fsync that hit
+    # the outage) at least one fsync succeeds.
+    last_err = max([k for k, _ in ret.get('fails', [])] +
+                   [k for k, _ in ret.get('fsync_fails', [])], default=-1)
+    ok_after = [k for k, _ in ret.get('synced', []) if k > last_err]
+    ctx.metrics[f'node{i}_fsync_failed'] = len(ret.get('fsync_fails', []))
+    ctx.check(ok_after, f'node{i}: no fsync succeeded after its last error '
+                        f'(seq {last_err}); fsync errors '
+                        f'{ret.get("fsync_fails", [])[:5]}')
   for i in writers + [victim]:
     check_records(ctx, i, p, durable, maybe, zeros_ok=True)
+
+
+@test('data_available_while_page_owner_down', 'fault', min_nodes=3,
+      redeploy_after=True, timeout=1800)
+def t_data_failover(ctx):
+  """Files whose names and inodes live on survivors stay fully readable and
+  writable while the node holding some of their pages is down (the
+  replication chimod's remote copies + core failover), and every change
+  made meanwhile is on the returning node afterwards (handoff)."""
+  n = len(ctx.hosts)
+  root = ctx.p('fo')
+  ctx.ok(0, 'mkdir', path=root)
+  rel = root[len(ctx.cl.mnt):]
+  owners = {fs_dir_owner(d, n) for d in ['/'] + [
+      '/' + '/'.join(rel.strip('/').split('/')[:k])
+      for k in range(1, len(rel.strip('/').split('/')) + 1)]}
+  victim = next((i for i in range(n - 1, 0, -1) if i not in owners), None)
+  if victim is None:
+    ctx.note('every node owns part of the path; nothing to test')
+    return
+  size = 8 * MiB
+  files = [f'{root}/f{k}' for k in range(8)]
+  for k, p in enumerate(files):
+    ctx.ok(0, 'write_file', path=p, size=size, seed=100 + k, fsync=True)
+  vh = ctx.hosts[victim]
+  ctx.cl.kill_fuse(vh)
+  ctx.cl.kill_runtime(vh)
+  time.sleep(3)
+  survivors = [i for i in range(n) if i != victim]
+  bad = []
+  for i in survivors:
+    for k, p in enumerate(files):
+      r = ctx.a(i).call('verify_file', timeout=OP_DEADLINE, path=p, size=size,
+                        seed=100 + k)
+      if not (r.get('ok') and r['ret']['ok']):
+        bad.append((i, p, r.get('err') or r.get('ret')))
+  ctx.metrics['unreadable_while_down'] = len(bad)
+  ctx.check(not bad, f'{len(bad)} reads failed while node{victim} was down, '
+                     f'e.g. {bad[:2]}')
+  # Changes while it is down: new files and an overwrite.
+  w = survivors[0]
+  ctx.ok(w, 'write_file', path=files[0], size=size, seed=900, fsync=True)
+  new = [f'{root}/n{k}' for k in range(3)]
+  for k, p in enumerate(new):
+    ctx.ok(w, 'write_file', path=p, size=3 * MiB, seed=950 + k, fsync=True)
+  ctx.cl.start_runtime(vh, 'restart')
+  ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
+  time.sleep(3)
+  ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
+  ctx.cl.agents.pop(vh, None)
+  time.sleep(2)
+  want = [(files[0], size, 900)] + [(p, size, 100 + k)
+                                    for k, p in enumerate(files) if k > 0]
+  want += [(p, 3 * MiB, 950 + k) for k, p in enumerate(new)]
+  stale = []
+  for i in range(n):
+    for p, sz, seed in want:
+      r = ctx.call(i, 'verify_file', path=p, size=sz, seed=seed)
+      if not (r.get('ok') and r['ret']['ok']):
+        stale.append((i, p, r.get('err') or r.get('ret')))
+  ctx.check(not stale, f'{len(stale)} reads wrong after node{victim} '
+                       f'returned, e.g. {stale[:2]}')

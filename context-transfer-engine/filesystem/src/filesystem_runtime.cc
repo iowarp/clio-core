@@ -331,6 +331,13 @@ clio::run::TaskResume Runtime::StatEntry(const std::string &path,
     // (crash between rmdir's halves) is recreated rather than reported gone.
     if (e.state_ == kEntLive) r.flags_ = kAttrRepair;
     CLIO_CO_AWAIT(CallShard(DirOwner(path), kShardDirAttr, r, resp));
+  } else if (InodeOwner(r.id_) != container_id_) {
+    // Another container homes it: its record (cached here after the first
+    // read, invalidated on change) answers without a hop to the home.
+    CLIO_CO_AWAIT(ReadInodeRecord(r.id_, resp));
+    if (resp.rc_ == ENOENT) {  // no record (yet): ask the home
+      CLIO_CO_AWAIT(CallShard(InodeOwner(r.id_), kShardInodeStat, r, resp));
+    }
   } else {
     CLIO_CO_AWAIT(CallShard(InodeOwner(r.id_), kShardInodeStat, r, resp));
   }
@@ -468,6 +475,7 @@ clio::run::TaskResume Runtime::FileSizeOp(clio::cte::core::TagId tag,
 clio::run::TaskResume Runtime::AdvanceSize(
     clio::run::shared_ptr<AdvanceSizeTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  CLIO_CO_AWAIT(EnsureInode(task->tag_packed_));
   std::shared_ptr<FileInfo> fi = FindInode(task->tag_packed_);
   if (fi == nullptr) {
     task->return_code_ = ENOENT;
@@ -495,6 +503,7 @@ clio::run::TaskResume Runtime::AdvanceSize(
     LogInode(*fi);
     if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
   }
+  CLIO_CO_AWAIT(FlushInodes());  // the record carries the new size and mtime
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -571,6 +580,7 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
       if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
     }
   }
+  CLIO_CO_AWAIT(FlushInodes());
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

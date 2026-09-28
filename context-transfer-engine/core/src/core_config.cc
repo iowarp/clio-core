@@ -349,6 +349,8 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
   emitter << YAML::Key << "neighborhood" << YAML::Value << targets_.neighborhood_;
   emitter << YAML::Key << "default_target_timeout_ms" << YAML::Value << targets_.default_target_timeout_ms_;
   emitter << YAML::Key << "poll_period_ms" << YAML::Value << targets_.poll_period_ms_;
+  emitter << YAML::Key << "failover_to_successor" << YAML::Value
+          << targets_.failover_to_successor_;
   emitter << YAML::EndMap;
   
   // Emit storage configuration
@@ -449,6 +451,9 @@ bool Config::ParseTargetConfig(const YAML::Node &node) {
 
   if (node["poll_period_ms"]) {
     targets_.poll_period_ms_ = node["poll_period_ms"].as<clio::run::u32>();
+  }
+  if (node["failover_to_successor"]) {
+    targets_.failover_to_successor_ = node["failover_to_successor"].as<bool>();
   }
 
   return true;

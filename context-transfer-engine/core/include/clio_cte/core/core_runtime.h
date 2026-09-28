@@ -39,6 +39,7 @@
 #include <memory>
 #include <atomic>
 #include <functional>
+#include <clio_cte/core/blob_placement.h>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -893,6 +894,48 @@ private:
                              clio::run::u64 *shortfall = nullptr);
 
   /**
+   * Invalidate every registered remote cached copy of a blob (issue #886
+   * coherence) and clear the registrations. Called by every operation that
+   * changes or removes a blob's bytes (put, delete, truncate) at its owner,
+   * under the blob's write token, before the operation completes.
+   * @param tag_id blob's tag
+   * @param blob_name blob name
+   * @param blob_info the blob (owner copy)
+   * @param keep_node a node whose copy stays valid (the writer of a put that
+   *        registered with it), or ~0 for none
+   */
+  clio::run::TaskResume InvalidateCachedCopies(const TagId &tag_id,
+                                               const std::string &blob_name,
+                                               BlobInfo &blob_info,
+                                               clio::run::u64 keep_node);
+
+  /**
+   * Shrink replica `idx` (0-based slot) of a blob to at most `new_size`
+   * bytes, freeing the dropped extents and logging the new layout, so a
+   * truncated blob never re-serves (or refills its primary with) bytes past
+   * its new end from a longer replica.
+   * @param tag_id blob's tag
+   * @param blob_name blob name
+   * @param blob_info the blob
+   * @param idx replica slot (replicas_ index)
+   * @param new_size new size
+   */
+  clio::run::TaskResume ShrinkReplica(const TagId &tag_id,
+                                      const std::string &blob_name,
+                                      BlobInfo &blob_info, size_t idx,
+                                      clio::run::u64 new_size);
+
+  /**
+   * WAL: full-replacement record of one replica's layout.
+   * @param tag_id blob's tag
+   * @param blob_name blob name
+   * @param replica_idx 1-based replica index
+   * @param rep the replica
+   */
+  void LogReplicaLayout(const TagId &tag_id, const std::string &blob_name,
+                        clio::run::u32 replica_idx, const Replica &rep);
+
+  /**
    * Write data to existing blob blocks
    * @param blocks Vector of blob blocks to write to
    * @param data Pointer to data to write
@@ -1139,6 +1182,18 @@ private:
    */
   clio::run::PoolQuery HashBlobToContainer(const TagId &tag_id,
                                      const std::string &blob_name);
+
+  /**
+   * Whether this container lists / counts a blob: always its own; a shadow
+   * copy only while it stands in for the copy's dead owner.
+   * @param blob_info the blob
+   * @param tag_id its tag
+   * @param blob_name its name
+   * @return true if it belongs in this container's answers
+   */
+  bool ServesBlob(const BlobInfo &blob_info, const TagId &tag_id,
+                  const std::string &blob_name);
+
 };
 
 } // namespace clio::cte::core

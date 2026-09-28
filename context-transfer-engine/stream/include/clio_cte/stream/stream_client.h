@@ -201,15 +201,17 @@ class Client : public clio::run::ContainerClient {
    * @param tag stream tag
    * @param home the stream's home container
    * @param entries this node's pending appends for the stream, in order
+   * @param payload their bytes, concatenated (entries' payload_off_)
    * @return future; completes once the bytes are in place
    */
   clio::run::Future<PlanTask> AsyncPlan(const clio::cte::core::TagId &tag,
                                         clio::run::u32 home,
-                                        const std::vector<AppendEntry> &entries) {
+                                        const std::vector<AppendEntry> &entries,
+                                        const std::string &payload) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<PlanTask>(clio::run::CreateTaskId(), pool_id_,
                                        clio::run::PoolQuery::DirectId(home),
-                                       tag, entries);
+                                       tag, entries, payload);
     return ipc->Send(task);
   }
 #endif  // CTP_IS_HOST

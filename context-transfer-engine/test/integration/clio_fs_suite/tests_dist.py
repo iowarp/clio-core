@@ -456,6 +456,45 @@ def t_tag_names(ctx):
     _tags_match(ctx, i, r, want, 'after unlinking a hard-linked name')
 
 
+@test('xnode_truncate_cache_coherence', 'dist', min_nodes=2)
+def t_trunc_coherence(ctx):
+  """Node B caches a file's pages; node A truncates it and writes past the
+  old end. B must read zeros in the hole and the new bytes after it -- never
+  the old bytes from its cached copies of the truncated pages."""
+  from agent import pattern
+  a, b = 0, 1
+  p = ctx.p('tc')
+  size = 2 * MiB
+  ctx.ok(a, 'write_file', path=p, size=size, seed=1)
+  r = ctx.call(b, 'verify_file', path=p, size=size, seed=1)  # B caches
+  ctx.check(r['ok'] and r['ret']['ok'], f'initial read on node{b}: {r}')
+  model = bytearray(pattern(1, 0, size))  # what the file must contain
+  for rnd in range(3):
+    keep = 100 + rnd * 4096
+    tail_off = MiB + MiB // 2 + rnd * 777
+    ctx.ok(a, 'truncate', path=p, size=keep)
+    del model[keep:]
+    h = ctx.ok(a, 'open', path=p, flags='w')
+    ctx.ok(a, 'fpwrite', h=h, off=tail_off, length=1000, seed=2 + rnd)
+    ctx.ok(a, 'close', h=h)
+    model.extend(bytes(tail_off - len(model)))
+    model.extend(pattern(2 + rnd, tail_off, 1000))
+    want = bytes(model)
+
+    def f(want=want):
+      got = bytes.fromhex(ctx.ok(b, 'read_hex', path=p))
+      if got == want:
+        return True, None
+      bad = next((k for k in range(min(len(got), len(want)))
+                  if got[k] != want[k]), min(len(got), len(want)))
+      return False, f'len {len(got)} vs {len(want)}, first diff at {bad}'
+    done, info, dt = ctx.eventually(f, timeout=VIS_TIMEOUT)
+    ctx.check(done, f'round {rnd}: node{b} read stale bytes after node{a} '
+                    f'truncated and re-extended: {info}')
+    # B re-caches the new content for the next round.
+    r = ctx.call(b, 'read_hex', path=p, off=0, length=4096)
+
+
 @test('xnode_fsx', 'dist', min_nodes=2, timeout=2400)
 def t_xfsx(ctx):
   """fsx model check with every op on a different node (close-to-open)."""

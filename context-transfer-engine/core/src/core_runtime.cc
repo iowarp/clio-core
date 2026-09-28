@@ -1964,6 +1964,28 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
     pi_t1 = std::chrono::steady_clock::now();
 
+    // Conditional puts (Context::kPutIfAbsent / kPutIfVersion), decided under
+    // the write token so two racing conditional puts cannot both win.
+    if (task->context_.replica_ == 0 &&
+        (task->context_.op_flags_ &
+         (Context::kPutIfAbsent | Context::kPutIfVersion)) != 0) {
+      const bool exists = blob_info_ptr->last_modified_ != 0 ||
+                          blob_info_ptr->GetTotalSize() > 0;
+      const clio::run::u64 cur_version =
+          exists ? blob_info_ptr->last_modified_ : 0;
+      if ((task->context_.op_flags_ & Context::kPutIfAbsent) && exists) {
+        task->return_code_ = kPutExistsRc;
+        task->context_.version_ = cur_version;
+        CLIO_CO_RETURN;
+      }
+      if ((task->context_.op_flags_ & Context::kPutIfVersion) &&
+          cur_version != task->context_.version_) {
+        task->return_code_ = kPutVersionMismatchRc;
+        task->context_.version_ = cur_version;
+        CLIO_CO_RETURN;
+      }
+    }
+
     // Drain in-flight readers before touching a byte. PutBlob overwrites the
     // blob's extents IN PLACE, and a GetBlob pinned mid-ReadData on the same
     // extents would return a mixture of the old and the new bytes with rc=0.
@@ -2396,8 +2418,12 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     clio::run::u64 new_blob_size = blob_info_ptr->GetTotalSize();
     clio::run::i64 size_change = static_cast<clio::run::i64>(new_blob_size) -
                            static_cast<clio::run::i64>(old_blob_size);
-    auto now = GetCurrentTimeNs();
+    // last_modified_ doubles as the blob's content version (cache coherence,
+    // conditional puts): strictly increasing per blob.
+    auto now = std::max<clio::run::u64>(GetCurrentTimeNs(),
+                                        blob_info_ptr->last_modified_ + 1);
     blob_info_ptr->last_modified_ = now;
+    task->context_.version_ = now;
     blob_info_ptr->access_count_++;  // frequency input for the data organizer
     blob_info_ptr->score_ = blob_score;
     // GENERATIONAL PUT: see the note on the replica path above.
@@ -2423,7 +2449,10 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
     }
 
-    {
+    if (task->context_.op_flags_ & Context::kShadowCopy) {
+      blob_info_ptr->shadow_ = true;  // another container owns this blob
+    }
+    if (!blob_info_ptr->shadow_) {
       // Write lock: we may need to insert a fresh tag_info entry. The
       // tag's name lives on whichever container `GetOrCreateTag`'s
       // `DirectHash(tag_name)` selected; this container only owns the
@@ -2484,39 +2513,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // and refetches the new bytes. The registration list is snapshotted
     // (a re-registration during the awaits below must not dangle this
     // iteration) and cleared: caches re-register when they re-populate.
-    if (!blob_info_ptr->replica_nodes_.empty() && !task->context_.emulate_) {
-      std::vector<clio::run::u64> inval_nodes;
-      for (size_t ni = 0; ni < blob_info_ptr->replica_nodes_.size(); ++ni) {
-        inval_nodes.push_back(blob_info_ptr->replica_nodes_[ni]);
-      }
-      blob_info_ptr->replica_nodes_.clear();
-      const clio::run::u64 self_node = CLIO_IPC->GetNodeId();
-      HLOG(kInfo, "[COH] put blob={} inval {} node(s) (origin={} ver={})",
-           blob_name, inval_nodes.size(), task->context_.origin_node_,
-           blob_info_ptr->last_modified_);
-      for (size_t ni = 0; ni < inval_nodes.size(); ++ni) {
-        if (inval_nodes[ni] == self_node) {
-          continue;  // this container IS the owner; nothing cached here
-        }
-        if (inval_nodes[ni] == task->context_.origin_node_) {
-          // The WRITER's own local copy holds these very bytes — it is the
-          // one registered copy that must SURVIVE this put (issue #886
-          // locality: register-with-put). It is re-registered below.
-          continue;
-        }
-        auto inval = client_.AsyncDelBlob(
-            tag_id, blob_name,
-            clio::run::PoolQuery::Physical(
-                static_cast<clio::run::u32>(inval_nodes[ni])));
-        CLIO_CO_AWAIT(inval);
-        if (inval->GetReturnCode() != 0) {
-          // Best-effort: "not found" just means the cache was already gone,
-          // and a dead node's cache dies with it either way.
-          HLOG(kDebug,
-               "PutBlob: cache invalidation on node {} returned rc={}",
-               inval_nodes[ni], inval->GetReturnCode());
-        }
-      }
+    if (!task->context_.emulate_) {
+      CLIO_CO_AWAIT(InvalidateCachedCopies(tag_id, blob_name, *blob_info_ptr,
+                                           task->context_.origin_node_));
     }
     // Register-with-put (issue #886 locality): the writer declared it holds
     // a raw node-local copy of exactly these bytes. Recording it HERE —
@@ -4590,6 +4589,11 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
 
+    // Remote cached copies must not outlive the blob: a page deleted and later
+    // re-created would otherwise be served from a copy no one invalidates.
+    CLIO_CO_AWAIT(InvalidateCachedCopies(tag_id, blob_name, *blob_info_ptr,
+                                         ~0ULL));
+
     // Step 2: Get blob size before deletion for tag size accounting
     clio::run::u64 blob_size = blob_info_ptr->GetTotalSize();
 
@@ -4631,8 +4635,8 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
       // entries
     }
 
-    // Step 3: Update tag's total_size_
-    {
+    // Step 3: Update tag's total_size_ (shadow copies never entered it)
+    if (!blob_info_ptr->shadow_) {
       std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
       if (tag_info_ptr != nullptr) {
         if (blob_size <= tag_info_ptr->total_size_) {
@@ -5165,6 +5169,14 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
       CLIO_CO_RETURN;
     }
     clio::run::u64 final_size = blob_info_ptr->GetTotalSize();
+    // Replicas shrink with the primary, and no node may keep serving the old
+    // bytes from a cached copy.
+    for (size_t ri = 0; ri < blob_info_ptr->replicas_.size(); ++ri) {
+      CLIO_CO_AWAIT(ShrinkReplica(tag_id, blob_name, *blob_info_ptr, ri,
+                                  new_size));
+    }
+    CLIO_CO_AWAIT(InvalidateCachedCopies(tag_id, blob_name, *blob_info_ptr,
+                                         ~0ULL));
 
     // issue #817: republish the resized block list. ResizeBlob returned the
     // dropped blocks to the bdev free pool, so a mirror still describing them
@@ -5177,8 +5189,8 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
       MirrorBlobToShm(shm_key, *blob_info_ptr);
     }
 
-    // Update the tag's total_size_ by the delta.
-    {
+    // Update the tag's total_size_ by the delta (not for shadow copies).
+    if (!blob_info_ptr->shadow_) {
       std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
       if (tag_info_ptr != nullptr) {
         if (final_size >= old_size) {
@@ -5199,8 +5211,9 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
     }
 
     // WAL: record the resized block list (full-replacement semantics), so a
-    // restart replays the truncated blob.
-    if (!blob_txn_logs_.empty() && !blob_info_ptr->blocks_.empty()) {
+    // restart replays the truncated blob -- also when nothing is left: a
+    // truncate to 0 that was not logged came back at full length.
+    if (!blob_txn_logs_.empty()) {
       clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
       TxnExtendBlob txn;
       txn.tag_major_ = tag_id.major_;
@@ -8813,6 +8826,105 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::InvalidateCachedCopies(
+    const TagId &tag_id, const std::string &blob_name, BlobInfo &blob_info,
+    clio::run::u64 keep_node) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  if (blob_info.replica_nodes_.empty()) CLIO_CO_RETURN;
+  // Snapshot and clear: a re-registration during the awaits below must not
+  // dangle this iteration; caches re-register when they re-populate.
+  std::vector<clio::run::u64> inval_nodes;
+  for (size_t ni = 0; ni < blob_info.replica_nodes_.size(); ++ni) {
+    inval_nodes.push_back(blob_info.replica_nodes_[ni]);
+  }
+  blob_info.replica_nodes_.clear();
+  const clio::run::u64 self_node = CLIO_IPC->GetNodeId();
+  HLOG(kInfo, "[COH] blob={} inval {} node(s) (keep={} ver={})", blob_name,
+       inval_nodes.size(), keep_node, blob_info.last_modified_);
+  for (clio::run::u64 node : inval_nodes) {
+    // This container IS the owner (nothing cached here); a put's writer
+    // holds these very bytes and is re-registered by the put.
+    if (node == self_node || node == keep_node) continue;
+    auto inval = client_.AsyncDelBlob(
+        tag_id, blob_name,
+        clio::run::PoolQuery::Physical(static_cast<clio::run::u32>(node)));
+    CLIO_CO_AWAIT(inval);
+    if (inval->GetReturnCode() != 0) {
+      // Best-effort: "not found" means the copy was already gone, and a dead
+      // node's cache dies with it.
+      HLOG(kDebug, "cache invalidation of {} on node {} returned rc={}",
+           blob_name, node, inval->GetReturnCode());
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ShrinkReplica(const TagId &tag_id,
+                                             const std::string &blob_name,
+                                             BlobInfo &blob_info, size_t idx,
+                                             clio::run::u64 new_size) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  if (idx >= blob_info.replicas_.size()) CLIO_CO_RETURN;
+  clio::run::u64 rep_size = 0;
+  for (const auto &blk : blob_info.replicas_[idx].blocks_) rep_size += blk.size_;
+  if (rep_size <= new_size) CLIO_CO_RETURN;
+  // Reuse the primary's shrink path on a scratch BlobInfo holding the
+  // replica's blocks (it trims the boundary block and frees the rest).
+  BlobInfo scratch;
+  scratch.blocks_ = blob_info.replicas_[idx].blocks_;
+  scratch.RecomputeTotalSize();
+  clio::run::u32 err = 0;
+  CLIO_CO_AWAIT(ResizeBlob(scratch, new_size,
+                           blob_info.replicas_[idx].score_, err, 0));
+  Replica &rep = blob_info.replicas_[idx];
+  rep.blocks_ = scratch.blocks_;
+  rep.total_size_cache_ = new_size;
+  if (err != 0) {
+    HLOG(kWarning, "ShrinkReplica: replica {} of {} resize rc={}", idx + 1,
+         blob_name, err);
+  }
+  LogReplicaLayout(tag_id, blob_name, static_cast<clio::run::u32>(idx + 1),
+                   rep);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::LogReplicaLayout(const TagId &tag_id,
+                               const std::string &blob_name,
+                               clio::run::u32 replica_idx,
+                               const Replica &rep) {
+  if (blob_txn_logs_.empty()) return;
+  clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+  TxnExtendReplica txn;
+  txn.tag_major_ = tag_id.major_;
+  txn.tag_minor_ = tag_id.minor_;
+  txn.blob_name_ = blob_name;
+  txn.replica_ = replica_idx;
+  txn.replica_name_ = rep.name_.str();
+  txn.score_ = rep.score_;
+  txn.flags_ = rep.flags_;
+  txn.transform_flags_ = rep.transform_flags_;
+  txn.min_score_ = rep.min_score_;
+  for (const auto &blk : rep.blocks_) {
+    TxnExtendBlobBlock tb;
+    tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
+    tb.bdev_minor_ = blk.bdev_client_.pool_id_.minor_;
+    tb.target_query_ = blk.target_query_;
+    tb.target_offset_ = blk.target_offset_;
+    tb.size_ = blk.size_;
+    txn.new_blocks_.push_back(tb);
+  }
+  blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendReplica,
+                                                   txn);
+}
+
 clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 new_size,
                                     float blob_score, clio::run::u32 &error_code,
                                     int min_persistence_level,
@@ -9898,13 +10010,16 @@ clio::run::TaskResume Runtime::GetContainedBlobs(
 
     // Iterate through tag_blob_name_to_info_ and filter by prefix
     tag_blob_name_to_info_.for_each(
-        [&prefix, &task](const std::string &composite_key,
-                         const std::shared_ptr<BlobInfo> &blob_info_sp) { const BlobInfo &blob_info = *blob_info_sp; (void)blob_info;
+        [this, &prefix, &task, &tag_id](
+            const std::string &composite_key,
+            const std::shared_ptr<BlobInfo> &blob_info_sp) {
           // Check if composite key starts with the tag prefix
           if (composite_key.rfind(prefix, 0) == 0) {
             // Extract blob name (everything after the prefix)
             std::string blob_name = composite_key.substr(prefix.length());
-            task->blob_names_.push_back(blob_name);
+            if (ServesBlob(*blob_info_sp, tag_id, blob_name)) {
+              task->blob_names_.push_back(blob_name);
+            }
           }
         });
 
@@ -10033,12 +10148,13 @@ clio::run::TaskResume Runtime::BlobQuery(clio::run::shared_ptr<BlobQueryTask> &t
 
       // Iterate and collect matching blobs for this tag
       tag_blob_name_to_info_.for_each(
-          [&prefix, &blob_pattern, &tag_name, &task](
-              const std::string &composite_key, const std::shared_ptr<BlobInfo> &blob_info_sp) { const BlobInfo &blob_info = *blob_info_sp; (void)blob_info;
-            (void)blob_info;
+          [this, &prefix, &blob_pattern, &tag_name, &tag_id, &task](
+              const std::string &composite_key,
+              const std::shared_ptr<BlobInfo> &blob_info_sp) {
             if (composite_key.rfind(prefix, 0) == 0) {
               std::string blob_name = composite_key.substr(prefix.length());
-              if (std::regex_match(blob_name, blob_pattern)) {
+              if (ServesBlob(*blob_info_sp, tag_id, blob_name) &&
+                  std::regex_match(blob_name, blob_pattern)) {
                 // Increase total matched counter (counts all matches)
                 task->total_blobs_matched_++;
                 // Respect max_blobs_ if set
@@ -10153,19 +10269,37 @@ clio::run::TaskResume Runtime::TemporalSearch(
 // Helper Functions for Dynamic Scheduling
 // ==============================================================================
 
+bool Runtime::ServesBlob(const BlobInfo &blob_info, const TagId &tag_id,
+                         const std::string &blob_name) {
+  if (!blob_info.shadow_) return true;
+  // A shadow copy counts only while this container stands in for its dead
+  // owner; otherwise the owner lists it.
+  auto *pm = CLIO_POOL_MANAGER;
+  const clio::run::PoolInfo *info = pm->GetPoolInfo(pool_id_);
+  const clio::run::u32 n = info != nullptr ? info->num_containers_ : 0;
+  if (n <= 1) return true;
+  const clio::run::u32 owner = BlobHash(tag_id, blob_name) % n;
+  return FailoverContainer(pool_id_, owner) == container_id_;
+}
+
 clio::run::PoolQuery Runtime::HashBlobToContainer(const TagId &tag_id,
                                             const std::string &blob_name) {
-  // Compute hash from tag_id and blob_name
-  std::hash<std::string> string_hasher;
-  std::hash<clio::run::u32> u32_hasher;
-
-  // Combine tag_id major, minor, and blob_name into a single hash
-  clio::run::u32 hash_value = u32_hasher(tag_id.major_);
-  hash_value ^= u32_hasher(tag_id.minor_) + 0x9e3779b9 + (hash_value << 6) +
-                (hash_value >> 2);
-  hash_value ^= static_cast<clio::run::u32>(string_hasher(blob_name)) + 0x9e3779b9 +
-                (hash_value << 6) + (hash_value >> 2);
-
+  const clio::run::u32 hash_value = BlobHash(tag_id, blob_name);
+  if (config_.targets_.failover_to_successor_) {
+    // The owner's node is dead: its successor holds the replication
+    // chimod's shadow copy and serves the blob until the owner returns.
+    auto *pm = CLIO_POOL_MANAGER;
+    const clio::run::PoolInfo *info = pm->GetPoolInfo(pool_id_);
+    const clio::run::u32 n = info != nullptr ? info->num_containers_ : 0;
+    if (n > 1) {
+      const clio::run::u32 owner = hash_value % n;
+      const clio::run::u32 target = FailoverContainer(pool_id_, owner);
+      if (target != owner) {
+        return clio::run::PoolQuery::DirectId(
+            static_cast<clio::run::ContainerId>(target));
+      }
+    }
+  }
   return clio::run::PoolQuery::DirectHash(hash_value);
 }
 

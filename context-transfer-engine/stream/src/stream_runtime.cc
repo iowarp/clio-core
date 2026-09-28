@@ -40,6 +40,7 @@
 #include <clio_cte/stream/stream_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <map>
@@ -70,11 +71,14 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   cte_ = clio::cte::core::Client(config_.next_pool_id_.IsNull()
                                      ? clio::cte::core::kCtePoolId
                                      : config_.next_pool_id_);
+  staging_ = clio::cte::core::Client(config_.staging_pool_id_.IsNull()
+                                         ? cte_.pool_id_
+                                         : config_.staging_pool_id_);
   self_.Init(task->new_pool_id_);
   auto *ipc = CLIO_IPC;
   node_ = ipc->GetNodeId();
   {
-    auto st = cte_.AsyncGetOrCreateTag(kStagingTagName,
+    auto st = staging_.AsyncGetOrCreateTag(kStagingTagName,
                                        clio::cte::core::TagId::GetNull(),
                                        clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(st);
@@ -194,9 +198,14 @@ clio::run::TaskResume Runtime::Append(clio::run::shared_ptr<AppendTask> &task) {
     p.entry_.counter_ = ++counter_;
   }
   p.entry_.staged_name_ = MakeStagedName(p.tag_, p.home_, p.entry_);
+  {
+    auto *ipc = CLIO_IPC;
+    const char *src = ipc->ToFullPtr<char>(task->data_.template Cast<char>()).ptr_;
+    p.data_.assign(src, task->size_);  // shipped inline to the home
+  }
   // The staged blob is the durable record of the append: once this put
   // returns, a crash anywhere cannot lose it (RecoverStaged re-queues it).
-  auto put = cte_.AsyncPutBlob(staging_tag_, p.entry_.staged_name_, 0,
+  auto put = staging_.AsyncPutBlob(staging_tag_, p.entry_.staged_name_, 0,
                                task->size_, task->data_, -1.0f,
                                clio::cte::core::Context(), 0u,
                                clio::run::PoolQuery::Dynamic());
@@ -221,7 +230,7 @@ clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {
     std::lock_guard<std::mutex> g(q_mu_);
     target = enq_seq_;
   }
-  double waited_us = 0.0;
+  const auto t0 = std::chrono::steady_clock::now();
   for (;;) {
     bool done = true;
     {
@@ -231,6 +240,8 @@ clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {
              *it->second.begin() > target;
     }
     if (done) break;
+    const double waited_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - t0).count();
     if (waited_us >= kFlushDeadlineUs) {
       HLOG(kError, "stream: flush of {}.{} timed out with appends unmerged",
            task->tag_id_.major_, task->tag_id_.minor_);
@@ -238,7 +249,6 @@ clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {
       CLIO_CO_RETURN;
     }
     CLIO_CO_AWAIT(clio::run::yield(kFlushPollUs));
-    waited_us += kFlushPollUs;
   }
   auto s = self_.AsyncSizeOp(task->tag_id_, task->home_, StreamSizeOp::kGet);
   CLIO_CO_AWAIT(s);
@@ -271,38 +281,72 @@ clio::run::TaskResume Runtime::Sequence(
   for (auto &p : ready) {
     groups[{Client::TagKey(p.tag_), p.home_}].push_back(std::move(p));
   }
-  // One Plan per stream, sent straight to its home and awaited one at a time
-  // (a coroutine may have only one outstanding subtask future). The home
-  // serializes merges per stream, so batches from several nodes interleave
-  // safely.
+  // Each stream's batch goes straight to its home in chunks of at most
+  // kMaxSliceBytes of inline bytes, awaited one at a time (a coroutine may
+  // have only one outstanding subtask future). The home serializes merges
+  // per stream, so batches from several nodes interleave safely.
   for (auto &kv : groups) {
     std::vector<PendingAppend> &batch = kv.second;
-    std::vector<AppendEntry> entries;
-    entries.reserve(batch.size());
-    for (const auto &p : batch) entries.push_back(p.entry_);
-    auto f = self_.AsyncPlan(batch.front().tag_, batch.front().home_,
-                             entries);
-    CLIO_CO_AWAIT(f);
-    std::lock_guard<std::mutex> g(q_mu_);
-    if (f->GetReturnCode() != 0) {
-      // Home unreachable or the merge failed: retry the batch later, ahead
-      // of anything newer for the stream (held until then). The home dedupes
-      // by staged name, so a retry never merges twice.
-      hold_until_[batch.front().tag_] = now + kShipRetryNs;
-      std::vector<PendingAppend> requeue(std::make_move_iterator(batch.begin()),
-                                         std::make_move_iterator(batch.end()));
+    size_t i = 0;
+    while (i < batch.size()) {
+      std::vector<PendingAppend> chunk;
+      clio::run::u64 bytes = 0;
+      while (i < batch.size() &&
+             (chunk.empty() || bytes + batch[i].data_.size() <= kMaxSliceBytes)) {
+        bytes += batch[i].data_.size();
+        chunk.push_back(std::move(batch[i++]));
+      }
+      bool ok = false;
+      CLIO_CO_AWAIT(ShipChunk(&chunk, &ok));
+      if (ok) continue;
+      // Home unreachable or the merge failed: retry this chunk and the rest
+      // of the batch later, ahead of anything newer for the stream (held
+      // until then). The home dedupes by staged name, so a retry never
+      // merges twice.
+      std::lock_guard<std::mutex> g(q_mu_);
+      hold_until_[chunk.front().tag_] = now + kShipRetryNs;
+      std::vector<PendingAppend> requeue(std::make_move_iterator(chunk.begin()),
+                                         std::make_move_iterator(chunk.end()));
+      for (; i < batch.size(); ++i) requeue.push_back(std::move(batch[i]));
       for (auto &p : queue_) requeue.push_back(std::move(p));
       queue_.swap(requeue);
-      continue;
     }
-    auto it = local_pending_.find(batch.front().tag_);
+  }
+  CLIO_CO_AWAIT(ReapStaged());
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ShipChunk(
+    const std::vector<PendingAppend> *chunk, bool *ok) {
+  CLIO_TASK_BODY_BEGIN
+  std::vector<AppendEntry> entries;
+  std::string payload;
+  entries.reserve(chunk->size());
+  for (const auto &p : *chunk) {
+    AppendEntry e = p.entry_;
+    if (p.data_.size() == e.size_) {
+      e.payload_off_ = payload.size();
+      payload += p.data_;
+    } else {
+      e.payload_off_ = kNoPayload;  // re-queued after a restart: staged only
+    }
+    entries.push_back(std::move(e));
+  }
+  auto f = self_.AsyncPlan(chunk->front().tag_, chunk->front().home_, entries,
+                           payload);
+  CLIO_CO_AWAIT(f);
+  *ok = f->GetReturnCode() == 0;
+  if (*ok) {
+    std::lock_guard<std::mutex> g(q_mu_);
+    auto it = local_pending_.find(chunk->front().tag_);
     if (it != local_pending_.end()) {
-      for (const auto &p : batch) it->second.erase(p.local_seq_);
+      for (const auto &p : *chunk) it->second.erase(p.local_seq_);
       if (it->second.empty()) local_pending_.erase(it);
     }
-    pending_count_.fetch_sub(batch.size());
+    pending_count_.fetch_sub(chunk->size());
   }
-  task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -322,7 +366,7 @@ clio::run::TaskResume Runtime::FinishOpenPlans() {
             [](const StreamPlan &a, const StreamPlan &b) { return a.id_ < b.id_; });
   for (const auto &plan : plans) {
     bool ok = true;
-    CLIO_CO_AWAIT(ExecutePlan(plan, &ok));
+    CLIO_CO_AWAIT(ExecutePlan(plan, nullptr, &ok));
     std::lock_guard<std::mutex> g(mu_);
     LogDoneLocked(plan.id_);
     open_plans_.erase(plan.id_);
@@ -337,7 +381,7 @@ clio::run::TaskResume Runtime::FinishOpenPlans() {
 
 clio::run::TaskResume Runtime::RecoverStaged() {
   CLIO_TASK_BODY_BEGIN
-  auto list = cte_.AsyncGetContainedBlobs(staging_tag_,
+  auto list = staging_.AsyncGetContainedBlobs(staging_tag_,
                                           clio::run::PoolQuery::Broadcast());
   CLIO_CO_AWAIT(list);
   size_t requeued = 0;
@@ -349,7 +393,7 @@ clio::run::TaskResume Runtime::RecoverStaged() {
     // their home confirms the merge; shipping them from here too would race
     // those retries and reorder a writer's appends.
     if (p.entry_.origin_ != node_) continue;
-    auto sz = cte_.AsyncGetBlobSize(staging_tag_, name);
+    auto sz = staging_.AsyncGetBlobSize(staging_tag_, name);
     CLIO_CO_AWAIT(sz);
     if (sz->GetReturnCode() != 0 || sz->size_ == 0) continue;
     p.entry_.size_ = sz->size_;

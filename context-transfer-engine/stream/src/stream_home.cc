@@ -41,6 +41,7 @@
 #include <clio_cte/stream/stream_runtime.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cerrno>
 
 namespace clio::cte::stream {
@@ -178,14 +179,14 @@ clio::run::TaskResume Runtime::Plan(clio::run::shared_ptr<PlanTask> &task) {
     CLIO_CO_AWAIT(clio::run::yield(kBusyPollUs));
   }
   if (dropped) {  // appends that raced an unlink: discard their bytes
-    CLIO_CO_AWAIT(DeleteStaged(entries));
+    QueueStagedDelete(entries);
     task->return_code_ = 0;
     CLIO_CO_RETURN;
   }
   bool ok = true;
   for (const auto &old : retry) {  // earlier plans whose copy failed
     bool rok = true;
-    CLIO_CO_AWAIT(ExecutePlan(old, &rok));
+    CLIO_CO_AWAIT(ExecutePlan(old, nullptr, &rok));
     std::lock_guard<std::mutex> g(mu_);
     if (rok) {
       LogDoneLocked(old.id_);
@@ -217,7 +218,7 @@ clio::run::TaskResume Runtime::Plan(clio::run::shared_ptr<PlanTask> &task) {
   }
   if (!plan.entries_.empty()) {
     bool pok = true;
-    CLIO_CO_AWAIT(ExecutePlan(plan, &pok));
+    CLIO_CO_AWAIT(ExecutePlan(plan, &task->payload_, &pok));
     std::lock_guard<std::mutex> g(mu_);
     if (pok) {
       LogDoneLocked(plan.id_);
@@ -236,7 +237,9 @@ clio::run::TaskResume Runtime::Plan(clio::run::shared_ptr<PlanTask> &task) {
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::ExecutePlan(StreamPlan plan, bool *ok) {
+clio::run::TaskResume Runtime::ExecutePlan(StreamPlan plan,
+                                           const std::string *payload,
+                                           bool *ok) {
   CLIO_TASK_BODY_BEGIN
   *ok = true;
   size_t i = 0;
@@ -250,21 +253,23 @@ clio::run::TaskResume Runtime::ExecutePlan(StreamPlan plan, bool *ok) {
       ++j;
     }
     bool sok = true;
-    CLIO_CO_AWAIT(CopySlice(&plan, i, j, off, &sok));
+    CLIO_CO_AWAIT(CopySlice(&plan, payload, i, j, off, &sok));
     *ok = *ok && sok;
     off += bytes;
     i = j;
   }
-  // Staged bytes are dropped only once every copy landed; a failed plan
-  // keeps them for the retry.
-  if (*ok) CLIO_CO_AWAIT(DeleteStaged(plan.entries_));
+  // Staged bytes are dropped only once every copy landed (in the
+  // background: merged names are remembered, so a staged blob that outlives
+  // a crash is never merged twice); a failed plan keeps them for the retry.
+  if (*ok) QueueStagedDelete(plan.entries_);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::CopySlice(const StreamPlan *plan, size_t first,
-                                         size_t last, clio::run::u64 off,
-                                         bool *ok) {
+clio::run::TaskResume Runtime::CopySlice(const StreamPlan *plan,
+                                         const std::string *payload,
+                                         size_t first, size_t last,
+                                         clio::run::u64 off, bool *ok) {
   CLIO_TASK_BODY_BEGIN
   auto *ipc = CLIO_IPC;
   clio::run::u64 bytes = 0;
@@ -281,8 +286,15 @@ clio::run::TaskResume Runtime::CopySlice(const StreamPlan *plan, size_t first,
   clio::run::u64 pos = 0;
   for (size_t k = first; k < last; ++k) {
     const AppendEntry &e = plan->entries_[k];
-    auto g = cte_.AsyncGetBlob(staging_tag_, e.staged_name_, 0, e.size_, 0u,
-                               buf.ptr_ + pos);
+    if (payload != nullptr && e.payload_off_ != kNoPayload &&
+        e.payload_off_ + e.size_ <= payload->size()) {
+      std::memcpy(buf.ptr_ + pos, payload->data() + e.payload_off_, e.size_);
+      have[k - first] = true;  // carried inline by the origin
+      pos += e.size_;
+      continue;
+    }
+    auto g = staging_.AsyncGetBlob(staging_tag_, e.staged_name_, 0, e.size_,
+                                   0u, buf.ptr_ + pos);
     CLIO_CO_AWAIT(g);
     have[k - first] = g->GetReturnCode() == 0;
     if (!have[k - first]) {
@@ -323,11 +335,28 @@ clio::run::TaskResume Runtime::CopySlice(const StreamPlan *plan, size_t first,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::DeleteStaged(std::vector<AppendEntry> entries) {
+void Runtime::QueueStagedDelete(const std::vector<AppendEntry> &entries) {
+  {
+    std::lock_guard<std::mutex> g(q_mu_);
+    for (const auto &e : entries) to_delete_.push_back(e.staged_name_);
+  }
+  EnsureSequence();  // the reaper runs on the drain tick
+}
+
+clio::run::TaskResume Runtime::ReapStaged() {
   CLIO_TASK_BODY_BEGIN
-  for (const auto &e : entries) {
-    auto d = cte_.AsyncDelBlob(staging_tag_, e.staged_name_);
-    CLIO_CO_AWAIT(d);
+  constexpr size_t kReapPerTick = 512;
+  std::vector<std::string> batch;
+  {
+    std::lock_guard<std::mutex> g(q_mu_);
+    const size_t n = std::min(kReapPerTick, to_delete_.size());
+    batch.assign(std::make_move_iterator(to_delete_.end() - n),
+                 std::make_move_iterator(to_delete_.end()));
+    to_delete_.resize(to_delete_.size() - n);
+  }
+  for (const auto &name : batch) {
+    auto d = staging_.AsyncDelBlob(staging_tag_, name);
+    CLIO_CO_AWAIT(d);  // best effort: a leftover is re-queued and deduped
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

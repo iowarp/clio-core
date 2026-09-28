@@ -264,6 +264,7 @@ class Agent:
     fd = os.open(path, os.O_WRONLY | os.O_APPEND)
     acked, fails, t0 = [], [], time.time()
     synced = []  # [last seq covered, wall time] per successful fsync
+    fsync_fails = []  # [last seq covered, error] per failed fsync
     try:
       for k in range(start, start + count):
         if max_secs and time.time() - t0 > max_secs:
@@ -285,8 +286,8 @@ class Agent:
           try:
             os.fsync(fd)
             synced.append([k, time.time()])
-          except OSError:
-            pass
+          except OSError as e:
+            fsync_fails.append([k, _err(e)['err']])
     finally:
       close_err = None
       if close:
@@ -295,7 +296,8 @@ class Agent:
         except OSError as e:
           close_err = _err(e)['err']
     return {'acked': acked, 'fails': fails[:20], 'nfail': len(fails),
-            'close_err': close_err, 'synced': synced}
+            'close_err': close_err, 'synced': synced,
+            'fsync_fails': fsync_fails[:50]}
 
   def op_scan_records(self, path, reclen=64):
     """Parse a file of append_records records. Returns the byte size, each

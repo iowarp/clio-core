@@ -221,7 +221,8 @@ class Cluster:
                '    num_replicas: 1\n'
                f'    replicate_period_ms: {self.replicate_period_ms}\n'
                '    cache_score: 1.0\n'
-               '    replica_score: 0.2\n')
+               '    replica_score: 0.2\n'
+               '    remote_copies: 1\n')
       fs_next = '561.0'
       # Each node persists its own hash-owned slice of the namespace, and
       # the file sizes / pending appends of the streams it homes.
@@ -252,16 +253,24 @@ compose:
       neighborhood: 1
       default_target_timeout_ms: 30000
       poll_period_ms: 5000
-{chain}  - mod_name: clio_cte_stream
+      failover_to_successor: true
+{chain}  - mod_name: clio_cte_cache
+    pool_name: clio_cte_cache
+    pool_query: local
+    pool_id: "563.0"
+    next_pool_id: "{fs_next}"
+    min_score: 0.5
+  - mod_name: clio_cte_stream
     pool_name: clio_cte_stream
     pool_query: local
     pool_id: "565.0"
-    next_pool_id: "{fs_next}"
+    next_pool_id: "563.0"
+    staging_pool_id: "{fs_next}"
 {stream_extra}  - mod_name: clio_cte_filesystem
     pool_name: clio_cte_filesystem
     pool_query: local
     pool_id: "560.0"
-    next_pool_id: "{fs_next}"
+    next_pool_id: "563.0"
 {fs_extra}"""
     with open(self.conf, 'w') as f:
       f.write(cfg)

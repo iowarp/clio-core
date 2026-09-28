@@ -257,6 +257,11 @@ compose:
       neighborhood: 1                   # Storage nodes CTE can buffer to
       default_target_timeout_ms: 30000   # Timeout for target operations (ms)
       poll_period_ms: 5000               # Target statistics re-scan interval (ms)
+      # While a blob's owner node is dead, route it to the first live
+      # successor container, which holds the replication chimod's remote
+      # copy (see remote_copies below) and serves it until the owner returns.
+      # Default: false (operations on the dead owner's blobs fail).
+      # failover_to_successor: true
 
     # Performance tuning ---------------------------------------------------
     # Uncomment to override defaults:
@@ -317,6 +322,12 @@ compose:
     num_replicas: 1                     # persistent copies per put
     cache_score: 1.0                    # DRAM re-cache placement score
     replica_score: 0.2                  # disk copies' score = drop threshold
+    # Copies of every blob on the next containers by hash (other nodes),
+    # written before a put is acknowledged. With the core's
+    # failover_to_successor, a blob stays readable and writable while its
+    # owner's node is down; changes made meanwhile are handed back when it
+    # returns. Default: 0 (a node's blobs are unavailable while it is down).
+    # remote_copies: 1
 
   # === Compression (optional, issue #886) ===
   # Encoding layer: transparently compresses on the way down and
@@ -381,6 +392,10 @@ compose:
     pool_query: local
     pool_id: "565.0"
     next_pool_id: "563.0"               # data path: the chain top (cache)
+    # Where staged (not yet merged) appends are written. They are written
+    # once and read at most once, after a restart, so skip the cache.
+    # Default: next_pool_id.
+    staging_pool_id: "561.0"            # replication (durable, uncached)
     # Node-local log of the sizes, merge plans and merged-append names of
     # the streams this node homes (the container id is appended). Without it
     # file sizes do not survive `clio_run restart`. Default: unset.

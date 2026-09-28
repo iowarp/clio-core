@@ -9,6 +9,7 @@ project(clio_cte_replication)
 add_clio_module_runtime(
   SOURCES
     src/replication_runtime.cc
+    src/replication_remote.cc
     src/autogen/replication_lib_exec.cc
 )
 

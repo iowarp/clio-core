@@ -455,6 +455,53 @@ class Runtime : public clio::run::Container {
               const Dentry &e, const DirState &ds);
   /** Append an inode record (meta_mu_ held). */
   void LogInode(const FileInfo &fi);
+
+  // ---- inode records in CTE (fs_inode.cc) ----
+  // Each inode's persistent attributes live in a small blob (kInodeBlob) of
+  // the file's own tag: CTE persists and replicates it, the cache chimod
+  // keeps coherent copies on reading nodes, and any node can stat the file
+  // from it. The inode's home keeps a write-through copy (FileInfo) and is
+  // the only writer; open-handle state stays home-only.
+  /**
+   * Mark an inode's record for storing (meta_mu_ held). Every handler that
+   * can dirty an inode calls FlushInodes() before it replies.
+   * @param fi the inode
+   */
+  void MarkInodeDirtyLocked(const FileInfo &fi);
+  /** Store every dirty inode record (serialized per inode). */
+  clio::run::TaskResume FlushInodes();
+  /**
+   * Make sure an inode this container homes is in memory: after a restart
+   * inodes load lazily from their records.
+   * @param packed inode id
+   */
+  clio::run::TaskResume EnsureInode(clio::run::u64 packed);
+  /**
+   * Stat an inode from its record (any container; served from the local
+   * cached copy when there is one).
+   * @param packed inode id
+   * @param resp receives attr_ and str_ (symlink target); rc_ ENOENT if the
+   *        record does not exist
+   */
+  clio::run::TaskResume ReadInodeRecord(clio::run::u64 packed, FsResp &resp);
+  /**
+   * Encode an inode record.
+   * @param fi inode
+   * @param size logical size to record
+   * @return record bytes
+   */
+  static std::string EncInodeRec(const FileInfo &fi, clio::run::u64 size);
+  /**
+   * Decode an inode record.
+   * @param rec record bytes
+   * @param fi receives the attributes
+   * @param size receives the recorded size
+   * @return false if malformed
+   */
+  static bool DecInodeRec(const std::string &rec, FileInfo *fi,
+                          clio::run::u64 *size);
+  std::unordered_set<clio::run::u64> inode_dirty_;    ///< meta_mu_
+  std::unordered_set<clio::run::u64> inode_storing_;  ///< meta_mu_
   /** Apply one replayed log record. */
   void ApplyLogRecord(FsLogRec type, const std::string &payload);
   /**

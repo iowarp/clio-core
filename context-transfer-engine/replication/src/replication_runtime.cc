@@ -39,6 +39,30 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     HLOG(kInfo, "replication: async write-through sweep every {} ms",
          config_.replicate_period_ms_);
   }
+  if (config_.remote_copies_ > 0) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto sweep = ipc->NewTask<HandoffSweepTask>(
+        clio::run::CreateTaskId(), pool_id_, clio::run::PoolQuery::Local());
+    sweep->SetPeriod(500.0, clio::run::kMilli);
+    sweep->SetFlags(TASK_PERIODIC);
+    ipc->Send(sweep);
+    if (is_restart_) {
+      // Pull what the successors changed while this node was down before
+      // serving: otherwise it would answer with its stale copies.
+      const clio::run::u32 n = NumContainers();
+      for (int i = 1; i <= config_.remote_copies_ && i < static_cast<int>(n);
+           ++i) {
+        const clio::run::u32 c = (container_id_ + i) % n;
+        auto pull = ipc->NewTask<HandoffPullTask>(
+            clio::run::CreateTaskId(), task->new_pool_id_,
+            clio::run::PoolQuery::DirectId(c), container_id_);
+        auto f = ipc->Send(pull);
+        CLIO_CO_AWAIT(f);
+        HLOG(kInfo, "replication: container {} handed back {} blob(s) "
+             "(rc {})", c, f->pushed_, f->GetReturnCode());
+      }
+    }
+  }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -149,7 +173,8 @@ clio::run::TaskResume Runtime::ReplicateOne(
 
   clio::run::u64 total = 0;
   {
-    auto size_task = cte->AsyncGetBlobSize(tag_id, blob_name);
+    auto size_task = cte->AsyncGetBlobSize(tag_id, blob_name,
+                                          clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(size_task);
     if (size_task->GetReturnCode() != 0) {
       rc = 10 + size_task->GetReturnCode();
@@ -173,7 +198,8 @@ clio::run::TaskResume Runtime::ReplicateOne(
     ctp::ipc::ShmPtr<> buf_ptr = buf.shm_.template Cast<void>();
 
     auto get_task = cte->AsyncGetBlob(tag_id, blob_name, off, len,
-                                      /*flags=*/0, buf_ptr);
+                                      /*flags=*/0, buf_ptr,
+                                      clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(get_task);
     if (get_task->GetReturnCode() != 0) {
       CLIO_IPC->FreeBuffer(buf);
@@ -192,7 +218,8 @@ clio::run::TaskResume Runtime::ReplicateOne(
     put_ctx.replica_ = replica_idx;
     put_ctx.transform_flags_ = get_task->context_.transform_flags_;
     auto put_task = cte->AsyncPutBlob(tag_id, blob_name, off, len, buf_ptr,
-                                      put_score, put_ctx);
+                                      put_score, put_ctx, 0u,
+                                      clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(put_task);
     CLIO_IPC->FreeBuffer(buf);
     if (put_task->GetReturnCode() != 0) {
@@ -281,7 +308,7 @@ clio::run::TaskResume Runtime::FlushTag(clio::run::shared_ptr<FlushTagTask> &tas
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::PutBlob(
+clio::run::TaskResume Runtime::PutBlobLocal(
     clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Explicit replica addressing (replica-targeted put or kAllReplicas
@@ -291,6 +318,20 @@ clio::run::TaskResume Runtime::PutBlob(
     CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
                            task.template Cast<clio::run::Task>()));
     CLIO_CO_RETURN;
+  }
+  {
+    // A write past the primary's end must not re-grow a primary that lost
+    // its bytes in a restart (see RefillPrimaryBeforeWrite).
+    clio::run::u64 lowest = ~0ULL;
+    clio::cte::core::ForEachBlobRegion(*task,
+        [&lowest](const clio::cte::core::BlobRegion &r) {
+          lowest = std::min(lowest, r.blob_off_);
+          return true;
+        });
+    if (lowest != ~0ULL && lowest > 0) {
+      CLIO_CO_AWAIT(RefillPrimaryBeforeWrite(task->tag_id_,
+                                             task->blob_name_.str(), lowest));
+    }
   }
   // Primary FIRST, forwarded VERBATIM (score, context, vectored segments,
   // flags all intact): the DRAM cache copy must never serve stale bytes, so
@@ -340,10 +381,13 @@ clio::run::TaskResume Runtime::PutBlob(
             return true;
           });
       for (size_t ri = 0; ri < regions.size(); ++ri) {
+        // Local: this container holds the blob (its owner, or the shadow
+        // copy it keeps for a successor role).
         auto put = cte->AsyncPutBlob(task->tag_id_, blob_name,
                                      regions[ri].blob_off_, regions[ri].size_,
                                      regions[ri].data_,
-                                     config_.replica_score_, rep_ctx);
+                                     config_.replica_score_, rep_ctx, 0u,
+                                     clio::run::PoolQuery::Local());
         CLIO_CO_AWAIT(put);
         if (put->GetReturnCode() != 0) {
           task->return_code_ = 30 + put->GetReturnCode();
@@ -352,6 +396,41 @@ clio::run::TaskResume Runtime::PutBlob(
       }
     }
     task->return_code_ = 0;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RefillPrimaryBeforeWrite(
+    const TagId &tag_id, const std::string &blob_name,
+    clio::run::u64 write_off) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  auto *cte = GetCoreClient();
+  auto prim = cte->AsyncGetBlobSize(tag_id, blob_name,
+                                    clio::run::PoolQuery::Local(), 0);
+  CLIO_CO_AWAIT(prim);
+  const clio::run::u64 prim_size =
+      prim->GetReturnCode() == 0 ? prim->size_ : 0;
+  if (prim_size >= write_off) {
+    CLIO_CO_RETURN;  // the common case: the write extends a whole primary
+  }
+  for (int r = 1; r <= config_.num_replicas_; ++r) {
+    auto rs = cte->AsyncGetBlobSize(tag_id, blob_name,
+                                    clio::run::PoolQuery::Local(), r);
+    CLIO_CO_AWAIT(rs);
+    if (rs->GetReturnCode() != 0 || rs->size_ <= prim_size) continue;
+    clio::run::u64 recached = 0;
+    CLIO_CO_AWAIT(RecachePrimary(tag_id, blob_name, r, rs->size_, recached));
+    if (recached < std::min(rs->size_, write_off)) {
+      HLOG(kWarning, "replication: refilling primary {}.{}/{} from replica "
+           "{} stopped at {} of {} bytes; reads below {} may miss",
+           tag_id.major_, tag_id.minor_, blob_name, r, recached, rs->size_,
+           write_off);
+    }
+    break;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -379,7 +458,7 @@ clio::run::TaskResume Runtime::RecachePrimary(const TagId &tag_id,
     get_ctx.replica_ = replica_idx;
     auto get_task = cte->AsyncGetBlob(tag_id, blob_name, off, len,
                                       /*flags=*/0, buf_ptr,
-                                      clio::run::PoolQuery::Dynamic(),
+                                      clio::run::PoolQuery::Local(),
                                       get_ctx);
     CLIO_CO_AWAIT(get_task);
     if (get_task->GetReturnCode() != 0) {
@@ -391,7 +470,8 @@ clio::run::TaskResume Runtime::RecachePrimary(const TagId &tag_id,
     put_ctx.replica_ = 0;
     put_ctx.min_persistence_level_ = 0;
     auto put_task = cte->AsyncPutBlob(tag_id, blob_name, off, len, buf_ptr,
-                                      config_.cache_score_, put_ctx);
+                                      config_.cache_score_, put_ctx, 0u,
+                                      clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(put_task);
     CLIO_IPC->FreeBuffer(buf);
     if (put_task->GetReturnCode() != 0) {
@@ -557,7 +637,7 @@ clio::run::TaskResume Runtime::GetBlob(
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::MultiPutBlob(
+clio::run::TaskResume Runtime::MultiPutBlobLocal(
     clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Explicit replica addressing passes through untouched (same gate as the
@@ -567,6 +647,19 @@ clio::run::TaskResume Runtime::MultiPutBlob(
     CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
                            task.template Cast<clio::run::Task>()));
     CLIO_CO_RETURN;
+  }
+  {
+    // Same guard as the scalar put: no record may re-grow a primary that a
+    // restart emptied (see RefillPrimaryBeforeWrite).
+    clio::cte::core::MultiPutBatchView pre;
+    if (clio::cte::core::MultiPutBatchView::Attach(*task, &pre)) {
+      for (size_t d = 0; d < pre.size(); ++d) {
+        if (!pre.RecordValid(d) || pre.descs_[d].offset_ == 0) continue;
+        CLIO_CO_AWAIT(RefillPrimaryBeforeWrite(pre.descs_[d].tag_id_,
+                                               pre.descs_[d].blob_name_,
+                                               pre.descs_[d].offset_));
+      }
+    }
   }
   // Primary batch on the core, verbatim (zero-copy slices, one completion).
   CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
@@ -608,7 +701,8 @@ clio::run::TaskResume Runtime::MultiPutBlob(
           }
           auto put = cte->AsyncPutBlob(desc.tag_id_, desc.blob_name_,
                                        desc.offset_, desc.size_, slice,
-                                       config_.replica_score_, rep_ctx);
+                                       config_.replica_score_, rep_ctx, 0u,
+                                       clio::run::PoolQuery::Local());
           CLIO_CO_AWAIT(put);
           if (put->GetReturnCode() != 0 && task->first_rc_ == 0) {
             task->first_rc_ = 30 + put->GetReturnCode();

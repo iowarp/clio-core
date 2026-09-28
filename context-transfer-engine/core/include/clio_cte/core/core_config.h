@@ -89,11 +89,16 @@ struct TargetConfig {
   clio::run::u32 neighborhood_;  // Number of targets (nodes CTE can buffer to)
   clio::run::u32 default_target_timeout_ms_;  // Default timeout for target operations
   clio::run::u32 poll_period_ms_;  // Period to rescan targets for statistics
+  /** Route a blob whose owner node is dead to the first live successor
+   *  container (which holds a copy when the replication chimod keeps
+   *  remote_copies). Off: such operations fail until the owner returns. */
+  bool failover_to_successor_;
 
   TargetConfig()
       : neighborhood_(4),
         default_target_timeout_ms_(30000),
-        poll_period_ms_(5000) {}
+        poll_period_ms_(5000),
+        failover_to_successor_(false) {}
 };
 
 /**

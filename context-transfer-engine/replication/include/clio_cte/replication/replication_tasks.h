@@ -55,6 +55,11 @@ struct ReplicationConfig {
   /// coalesce into one replica write). 0 = synchronous write-through (the
   /// put blocks until every replica is written).
   int replicate_period_ms_ = 50;
+  /** Copies of every blob kept on the next containers by hash (on other
+   *  nodes). With the core's failover_to_successor, a blob stays readable
+   *  and writable while its owner's node is down; the changes are handed
+   *  back when the owner returns. 0 = none. */
+  int remote_copies_ = 0;
 
   ReplicationConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
   ReplicationConfig(const clio::run::PoolId &pool_id,
@@ -63,14 +68,15 @@ struct ReplicationConfig {
         num_replicas_(other.num_replicas_),
         cache_score_(other.cache_score_),
         replica_score_(other.replica_score_),
-        replicate_period_ms_(other.replicate_period_ms_) {
+        replicate_period_ms_(other.replicate_period_ms_),
+        remote_copies_(other.remote_copies_) {
     (void)pool_id;
   }
 
   template <class Archive>
   void serialize(Archive &ar) {
     ar(next_pool_id_, num_replicas_, cache_score_, replica_score_,
-       replicate_period_ms_);
+       replicate_period_ms_, remote_copies_);
   }
 
   /** Load configuration from compose YAML (next_pool_id: "major.minor",
@@ -99,6 +105,9 @@ struct ReplicationConfig {
         }
         if (node["replicate_period_ms"]) {
           replicate_period_ms_ = node["replicate_period_ms"].as<int>();
+        }
+        if (node["remote_copies"]) {
+          remote_copies_ = node["remote_copies"].as<int>();
         }
       } catch (...) {
         // Config parsing is best-effort
@@ -186,6 +195,53 @@ struct ReplicateSweepTask : public clio::run::Task {
 };
 
 using MonitorTask = clio::run::admin::MonitorTask;
+
+/** A restarted owner asks a successor to hand back what it changed. */
+struct HandoffPullTask : public clio::run::Task {
+  IN clio::run::u32 owner_;   ///< the returning owner container
+  OUT clio::run::u32 pushed_; ///< blobs handed back
+
+  HandoffPullTask() : clio::run::Task(), owner_(0), pushed_(0) {}
+  explicit HandoffPullTask(const clio::run::TaskId &task_id,
+                           const clio::run::PoolId &pool_id,
+                           const clio::run::PoolQuery &pool_query,
+                           clio::run::u32 owner)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kHandoffPull),
+        owner_(owner), pushed_(0) {}
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(owner_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(pushed_);
+  }
+  /** OUT fields only. */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &o) {
+    Task::AggregateOut(o);
+    pushed_ = o.template Cast<HandoffPullTask>()->pushed_;
+  }
+  void Copy(const ctp::ipc::FullPtr<HandoffPullTask> &o) {
+    Task::Copy(o.template Cast<clio::run::Task>());
+    owner_ = o->owner_; pushed_ = o->pushed_;
+  }
+};
+
+/** Periodic: hand changes back to owners that are alive again. */
+struct HandoffSweepTask : public clio::run::Task {
+  HandoffSweepTask() : clio::run::Task() {}
+  explicit HandoffSweepTask(const clio::run::TaskId &task_id,
+                            const clio::run::PoolId &pool_id,
+                            const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kHandoffSweep) {}
+  template <typename Ar> void SerializeIn(Ar &ar) { Task::SerializeIn(ar); }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+  /** No OUT fields beyond the base. */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &o) {
+    Task::AggregateOut(o);
+  }
+  void Copy(const ctp::ipc::FullPtr<HandoffSweepTask> &o) {
+    Task::Copy(o.template Cast<clio::run::Task>());
+  }
+};
 
 /**
  * ReplicateBlobTask — bring replica `replica_` of one blob up to date with

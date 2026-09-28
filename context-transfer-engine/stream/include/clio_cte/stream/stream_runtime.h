@@ -78,6 +78,9 @@ struct PendingAppend {
   clio::run::u32 home_ = 0;
   AppendEntry entry_;
   clio::run::u64 local_seq_ = 0;      ///< this node's enqueue order
+  /** The appended bytes, shipped inline to the home (empty for an append
+   *  re-queued after a restart: the home reads its staged blob). */
+  std::string data_;
 };
 
 /** One persisted merge plan (in flight until its kDone record). */
@@ -185,24 +188,31 @@ class Runtime : public clio::run::Container {
    */
   void DedupeLocked(std::vector<AppendEntry> *entries);
   /**
-   * Copy a plan's staged bytes into the stream's pages, then delete the
-   * staged blobs. Idempotent: a missing staged blob was already merged.
+   * Copy a plan's bytes into the stream's pages, then queue its staged blobs
+   * for deletion. Idempotent: a missing staged blob was already merged.
    * @param plan the plan to execute
+   * @param payload the bytes carried with the plan (entries' payload_off_),
+   *        or null when replaying a plan after a restart
    * @param ok receives false if any copy failed
    */
-  clio::run::TaskResume ExecutePlan(StreamPlan plan, bool *ok);
+  clio::run::TaskResume ExecutePlan(StreamPlan plan, const std::string *payload,
+                                    bool *ok);
   /**
    * Copy one slice [first, last) of a plan starting at stream offset `off`.
    * @param plan the plan
+   * @param payload inline bytes (may be null)
    * @param first first entry index
    * @param last one past the last entry index
    * @param off stream offset of entry `first`
    * @param ok receives false if any copy failed
    */
-  clio::run::TaskResume CopySlice(const StreamPlan *plan, size_t first,
+  clio::run::TaskResume CopySlice(const StreamPlan *plan,
+                                  const std::string *payload, size_t first,
                                   size_t last, clio::run::u64 off, bool *ok);
-  /** Delete every staged blob of `entries` (best effort). */
-  clio::run::TaskResume DeleteStaged(std::vector<AppendEntry> entries);
+  /** Queue staged blobs for background deletion (merged or discarded). */
+  void QueueStagedDelete(const std::vector<AppendEntry> &entries);
+  /** Delete a bounded batch of queued staged blobs (Sequence tick). */
+  clio::run::TaskResume ReapStaged();
 
   // ---- persistence (stream_log.cc) ----
   /** Log record types. */
@@ -250,6 +260,13 @@ class Runtime : public clio::run::Container {
   static bool ParseStagedName(const std::string &name,
                               clio::cte::core::TagId *tag,
                               clio::run::u32 *home, AppendEntry *e);
+  /**
+   * Ship one chunk of a stream's queued appends (bytes inline) to its home.
+   * @param chunk appends of one stream, in acceptance order
+   * @param ok receives true if the home merged them
+   */
+  clio::run::TaskResume ShipChunk(const std::vector<PendingAppend> *chunk,
+                                  bool *ok);
   /** Queue an entry for shipping (starts the drain on first use). */
   void Enqueue(PendingAppend p);
   /** Start the periodic drain if it is not running. */
@@ -260,7 +277,8 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume FinishOpenPlans();
 
   StreamConfig config_;
-  clio::cte::core::Client cte_;
+  clio::cte::core::Client cte_;      ///< pages
+  clio::cte::core::Client staging_;  ///< staged appends
   Client self_;
   clio::cte::core::TagId staging_tag_;
   clio::run::u32 node_ = 0;
@@ -289,6 +307,8 @@ class Runtime : public clio::run::Container {
   clio::run::u64 counter_ = 0;
   clio::run::u64 enq_seq_ = 0;  ///< last local_seq_ handed out
   bool seq_started_ = false;
+  /** Staged blobs whose appends are merged (or discarded), to delete. */
+  std::vector<std::string> to_delete_;
   std::atomic<clio::run::u64> pending_count_{0};
 };
 

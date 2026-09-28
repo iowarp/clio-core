@@ -107,7 +107,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   cfs.Init(clio::run::PoolId(600, 0));
 
   constexpr clio::run::u64 kSize = 1024 * 1024;  // 1 MiB
-  const std::string path = "clio::/cfs_content.bin";
+  const std::string path = "/cfs_content.bin";  // raw chimod API: absolute paths
 
   // Open (create).
   auto open = cfs.AsyncOpen(path, O_CREAT | O_RDWR, 0644);

@@ -81,13 +81,19 @@ struct AppendEntry {
   clio::run::u64 clock_ = 0;    ///< origin's monotonic clock (primary key)
   clio::run::u32 origin_ = 0;   ///< node that accepted the append
   clio::run::u64 counter_ = 0;  ///< origin's append counter (tiebreak)
+  /** Offset of this append's bytes in the carrying PlanTask::payload_, or
+   *  kNoPayload: the home then reads the staged blob (restart recovery). */
+  clio::run::u64 payload_off_ = ~0ULL;
 
   /** Serialize for the wire. */
   template <class Ar>
   void serialize(Ar &ar) {
-    ar(staged_name_, size_, clock_, origin_, counter_);
+    ar(staged_name_, size_, clock_, origin_, counter_, payload_off_);
   }
 };
+
+/** AppendEntry::payload_off_ value: the bytes are not carried inline. */
+GLOBAL_CROSS_CONST clio::run::u64 kNoPayload = ~0ULL;
 
 /** Container creation params. */
 struct StreamConfig {
@@ -98,17 +104,24 @@ struct StreamConfig {
   /** Base path of each container's durable log ("" = no persistence). The
    *  container appends "." + its container id. */
   std::string log_path_;
+  /** Pool staged appends are written to (default: next_pool_id_). Staged
+   *  bytes are written once and read at most once (after a restart), so a
+   *  deployment points this below any cache layer. */
+  clio::run::PoolId staging_pool_id_;
 
-  StreamConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
+  StreamConfig()
+      : next_pool_id_(clio::run::PoolId::GetNull()),
+        staging_pool_id_(clio::run::PoolId::GetNull()) {}
   StreamConfig(const clio::run::PoolId &pool_id, const StreamConfig &other)
-      : next_pool_id_(other.next_pool_id_), log_path_(other.log_path_) {
+      : next_pool_id_(other.next_pool_id_), log_path_(other.log_path_),
+        staging_pool_id_(other.staging_pool_id_) {
     (void)pool_id;
   }
 
   /** Serialize every field. */
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(next_pool_id_, log_path_);
+    ar(next_pool_id_, log_path_, staging_pool_id_);
   }
 
   /**
@@ -128,6 +141,10 @@ struct StreamConfig {
         }
       }
       if (node["log_path"]) log_path_ = node["log_path"].as<std::string>();
+      if (node["staging_pool_id"]) {
+        staging_pool_id_ = clio::run::PoolId::FromString(
+            node["staging_pool_id"].as<std::string>());
+      }
     } catch (...) {
       // Config parsing is best-effort: defaults apply.
     }
@@ -292,6 +309,7 @@ struct SequenceTask : public clio::run::Task {
 struct PlanTask : public clio::run::Task {
   IN clio::cte::core::TagId tag_id_;
   IN std::vector<AppendEntry> entries_;
+  IN std::string payload_;  ///< the entries' bytes (see payload_off_)
   OUT clio::run::u64 new_size_;
 
   PlanTask()
@@ -301,12 +319,14 @@ struct PlanTask : public clio::run::Task {
                     const clio::run::PoolId &pool_id,
                     const clio::run::PoolQuery &pool_query,
                     const clio::cte::core::TagId &tag_id,
-                    const std::vector<AppendEntry> &entries)
+                    const std::vector<AppendEntry> &entries,
+                    const std::string &payload)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kPlan),
-        tag_id_(tag_id), entries_(entries), new_size_(0) {}
+        tag_id_(tag_id), entries_(entries), payload_(payload), new_size_(0) {}
   void Copy(const ctp::ipc::FullPtr<PlanTask> &o) {
     clio::run::Task::Copy(o.template Cast<clio::run::Task>());
-    tag_id_ = o->tag_id_; entries_ = o->entries_; new_size_ = o->new_size_;
+    tag_id_ = o->tag_id_; entries_ = o->entries_; payload_ = o->payload_;
+    new_size_ = o->new_size_;
   }
   /** Merge OUT fields only. */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &b) {
@@ -314,7 +334,7 @@ struct PlanTask : public clio::run::Task {
     new_size_ = b.template Cast<PlanTask>()->new_size_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(tag_id_, entries_);
+    Task::SerializeIn(ar); ar(tag_id_, entries_, payload_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
     Task::SerializeOut(ar); ar(new_size_);

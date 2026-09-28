@@ -222,6 +222,9 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
                                            FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   int rc = 0;
+  if (op >= kShardInodeStat && op <= kShardInodeXattr) {
+    CLIO_CO_AWAIT(EnsureInode(req.id_));  // lazily loaded after a restart
+  }
   switch (op) {
     case kShardLookup: {
       std::lock_guard<std::mutex> g(ns_mu_);
@@ -295,6 +298,8 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
       rc = EINVAL;
       break;
   }
+  // Inode changes are durable (in CTE) before the caller hears about them.
+  CLIO_CO_AWAIT(FlushInodes());
   resp.rc_ = static_cast<clio::run::u32>(rc);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -714,7 +719,7 @@ void Runtime::DropInodeLocked(const std::shared_ptr<FileInfo> &fi) {
   log_.Append(FsLogRec::kInodeDel, p);
   PurgeItem item;
   item.id_ = fi->tag_id_;
-  item.data_ = fi->type_ == kFsTypeFile;
+  item.data_ = true;  // pages and the inode record (symlinks have one too)
   item.xattr_ = fi->has_xattr_;
   QueuePurge(item);
 }
@@ -856,6 +861,7 @@ clio::run::TaskResume Runtime::PurgeDrain() {
   // Names first: a create-then-unlink must reach each node as add, remove,
   // then the page purge.
   CLIO_CO_AWAIT(FlushNames());
+  CLIO_CO_AWAIT(FlushInodes());  // anything a handler left dirty
   if (catchup_pending_) CLIO_CO_AWAIT(CatchUpNames());
   std::vector<PurgeItem> work;
   {
@@ -1047,7 +1053,11 @@ void Runtime::LogEnt(bool put, const std::string &dir, const std::string &leaf,
 }
 
 void Runtime::LogInode(const FileInfo &fi) {
-  log_.Append(FsLogRec::kInodePut, EncInode(fi));
+  // The inode's record lives in CTE (FlushInodes stores it before the change
+  // is acknowledged). The namespace log only tracks orphans -- unlinked while
+  // open -- so a restart can destroy them.
+  MarkInodeDirtyLocked(fi);
+  if (fi.orphan_) log_.Append(FsLogRec::kInodePut, EncInode(fi));
 }
 
 void Runtime::ApplyLogRecord(FsLogRec type, const std::string &payload) {
@@ -1196,7 +1206,9 @@ void Runtime::CompactLog() {
     }
   }
   for (const auto &kv : by_tag_) {
-    recs.emplace_back(FsLogRec::kInodePut, EncInode(*kv.second));
+    if (kv.second->orphan_) {
+      recs.emplace_back(FsLogRec::kInodePut, EncInode(*kv.second));
+    }
   }
   if (!log_.Rewrite(recs)) {
     HLOG(kError, "filesystem: compacting metadata log {} failed", log_path_);
