@@ -4321,6 +4321,156 @@ struct GetNumAliasesTask : public clio::run::Task {
   }
 };
 
+/** Operations carried by UpdateTagNamesTask (see EncodeTagNameOp). */
+enum class TagNameOp : clio::run::u32 {
+  kAddName = 1,     ///< bind `name` to the tag (canonical if it has none, else an alias)
+  kRemoveName = 2,  ///< unbind `name` from the tag
+  kRename = 3,      ///< rebind the tag's `name` to `name2` (O(1): children keep their ids)
+  kSetRoot = 4,     ///< bind "/" to the tag (the hierarchy's root)
+  kResetPublished = 5,  ///< drop every published "$tagid{..}" name (restart resync)
+};
+
+/**
+ * Stored hierarchical form of a child name: "$tagid{<major>.<minor>}/<leaf>"
+ * relative to its parent tag, so moving a directory re-keys ONE name. The
+ * core resolves it to an absolute path for its search index.
+ * @param parent parent tag id
+ * @param leaf single path component
+ * @return stored name
+ */
+inline std::string MakeTagRefName(const TagId &parent, const std::string &leaf) {
+  return "$tagid{" + std::to_string(parent.major_) + "." +
+         std::to_string(parent.minor_) + "}/" + leaf;
+}
+
+/**
+ * Append one tag-name operation to an UpdateTagNames batch.
+ * Record: [u32 op][u32 major][u32 minor][u64 seq][u32 len][name][u32 len][name2]
+ * @param out batch buffer
+ * @param op operation
+ * @param tag tag id
+ * @param seq last-writer-wins stamp (wall-clock ns at the name's owner)
+ * @param name stored name (see MakeTagRefName)
+ * @param name2 new stored name (kRename only)
+ */
+inline void EncodeTagNameOp(std::string *out, TagNameOp op, const TagId &tag,
+                            clio::run::u64 seq, const std::string &name,
+                            const std::string &name2 = std::string()) {
+  auto put32 = [out](clio::run::u32 v) {
+    out->append(reinterpret_cast<const char *>(&v), sizeof(v));
+  };
+  put32(static_cast<clio::run::u32>(op));
+  put32(tag.major_);
+  put32(tag.minor_);
+  out->append(reinterpret_cast<const char *>(&seq), sizeof(seq));
+  put32(static_cast<clio::run::u32>(name.size()));
+  out->append(name);
+  put32(static_cast<clio::run::u32>(name2.size()));
+  out->append(name2);
+}
+
+/** One decoded tag-name operation. */
+struct TagNameOpRec {
+  TagNameOp op_ = TagNameOp::kAddName;
+  TagId tag_;
+  clio::run::u64 seq_ = 0;
+  std::string name_;
+  std::string name2_;
+};
+
+/**
+ * Decode an UpdateTagNames batch.
+ * @param data batch bytes
+ * @param len batch length
+ * @param out decoded records (in order)
+ * @return false on a malformed batch (records before the damage are kept)
+ */
+inline bool DecodeTagNameOps(const char *data, size_t len,
+                             std::vector<TagNameOpRec> *out) {
+  size_t off = 0;
+  auto get = [&](void *dst, size_t n) {
+    if (off + n > len) return false;
+    std::memcpy(dst, data + off, n);
+    off += n;
+    return true;
+  };
+  auto get_str = [&](std::string *s) {
+    clio::run::u32 n = 0;
+    if (!get(&n, sizeof(n)) || off + n > len) return false;
+    s->assign(data + off, n);
+    off += n;
+    return true;
+  };
+  while (off < len) {
+    TagNameOpRec r;
+    clio::run::u32 op = 0;
+    if (!get(&op, 4) || !get(&r.tag_.major_, 4) || !get(&r.tag_.minor_, 4) ||
+        !get(&r.seq_, 8) || !get_str(&r.name_) || !get_str(&r.name2_)) {
+      return false;
+    }
+    r.op_ = static_cast<TagNameOp>(op);
+    out->push_back(std::move(r));
+  }
+  return true;
+}
+
+/**
+ * UpdateTagNames task - apply a batch of tag-name operations to this
+ * container's name table and search index. Sent as a Broadcast so EVERY
+ * container holds every name: each can resolve "$tagid{parent}/leaf" names
+ * to absolute paths and answer TagQuery/BlobQuery/SemanticSearch locally.
+ * Idempotent and order-tolerant: per-name last-writer-wins by seq, and a
+ * name whose parent has not arrived yet is parked until it does.
+ */
+struct UpdateTagNamesTask : public clio::run::Task {
+  IN clio::run::priv::string ops_;  // EncodeTagNameOp records
+  OUT clio::run::u32 applied_;      // records applied (not superseded)
+
+  // SHM constructor
+  UpdateTagNamesTask()
+      : clio::run::Task(), ops_(CLIO_PRIV_ALLOC), applied_(0) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit UpdateTagNamesTask(const clio::run::TaskId &task_id,
+                                            const clio::run::PoolId &pool_id,
+                                            const clio::run::PoolQuery &pool_query,
+                                            const std::string &ops)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kUpdateTagNames),
+        ops_(CLIO_PRIV_ALLOC, ops),
+        applied_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kUpdateTagNames;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(ops_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(applied_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<UpdateTagNamesTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    ops_ = other->ops_;
+    applied_ = other->applied_;
+  }
+
+  // Broadcast aggregation: report the largest per-container count.
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<UpdateTagNamesTask>();
+    if (other->applied_ > applied_) applied_ = other->applied_;
+  }
+};
+
 /**
  * PollTelemetryLog task - Poll telemetry log with minimum logical time filter
  */

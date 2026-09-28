@@ -38,6 +38,7 @@
 #include <array>
 #include <memory>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -388,6 +389,45 @@ public:
    */
   void LogTagIdentity(const TagId &tag_id, const TagInfo &info);
 
+  // ---- published tag names (UpdateTagNames) ----
+  /** Serializes every name operation (no suspension inside). */
+  std::mutex tag_names_mu_;
+  /** Last-writer-wins stamp per stored name (kept for removed names too). */
+  std::unordered_map<std::string, clio::run::u64> name_seq_;
+  /** Names that cannot resolve yet, keyed by the ancestor they wait for. */
+  std::unordered_map<TagId, std::vector<std::pair<TagId, std::string>>>
+      parked_names_;
+  /**
+   * Apply one decoded name operation unless a newer one for the same name
+   * was already applied. Caller holds tag_names_mu_.
+   * @return true if applied
+   */
+  bool ApplyTagNameOp(const TagNameOpRec &r);
+  /** Bind `name` to `id` (canonical if it has none, else alias). */
+  void TnAddName(const TagId &id, const std::string &name);
+  /** Unbind `name` from `id`; drops a name-less, data-less tag. */
+  void TnRemoveName(const TagId &id, const std::string &name);
+  /** Rebind `id`'s name `from` to `to`, re-keying its indexed subtree. */
+  void TnRename(const TagId &id, const std::string &from, const std::string &to);
+  /**
+   * Resolve a stored name to an absolute path, failing (instead of guessing)
+   * when an ancestor is unknown or name-less.
+   * @param stored stored name ("/", "$tagid{P}/leaf", or flat)
+   * @param abs receives the absolute path
+   * @param blocker receives the first ancestor that could not be resolved
+   * @return true if fully resolved
+   */
+  bool ResolveNameStrict(const std::string &stored, std::string *abs,
+                         TagId *blocker);
+  /** Index `id` under `name`'s absolute path, or park it until resolvable. */
+  void IndexOrParkName(const TagId &id, const std::string &name);
+  /** Retry names parked on `parent` (it just gained a name). */
+  void UnparkNames(const TagId &parent);
+  /** Move every search-index key at or under old_abs to new_abs. */
+  void RekeyIndexSubtree(const std::string &old_abs, const std::string &new_abs);
+  /** Replace `id`'s TagInfo with a copy edited by `edit` (readers stay safe). */
+  void EditTagInfo(const TagId &id, const std::function<void(TagInfo &)> &edit);
+
   /**
    * GetTagName (Method::kGetTagName) - resolve a TagId to its full, absolute
    * tag name by walking the stored relative "$tagid{parent}/leaf" references.
@@ -413,6 +453,15 @@ public:
    * owns the tag answers.
    */
   clio::run::TaskResume GetNumAliases(clio::run::shared_ptr<GetNumAliasesTask> &task);
+
+  /**
+   * UpdateTagNames (Method::kUpdateTagNames) - apply a batch of tag-name
+   * operations (add / remove / rename / set root) to this container's name
+   * table and search index. Broadcast by the publisher, so every container
+   * holds every name.
+   */
+  clio::run::TaskResume UpdateTagNames(
+      clio::run::shared_ptr<UpdateTagNamesTask> &task);
 
   /**
    * Schedule a task by resolving Dynamic pool queries.

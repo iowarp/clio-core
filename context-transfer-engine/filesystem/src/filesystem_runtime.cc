@@ -157,6 +157,27 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     }
     RecoverShard(lp, is_restart_);
   }
+  // Mirror the namespace into CTE tag names (async). The root first; on a
+  // restart this node missed broadcasts while down, so drop its published
+  // names, re-add the ones this container owns, and pull the rest from peers.
+  PublishName(clio::cte::core::TagNameOp::kSetRoot, FsRootId(), "/");
+  if (is_restart_) {
+    std::string reset;
+    clio::cte::core::EncodeTagNameOp(
+        &reset, clio::cte::core::TagNameOp::kResetPublished, FsRootId(),
+        clio::cte::core::GetWallTimeNs(), std::string());
+    clio::cte::core::EncodeTagNameOp(
+        &reset, clio::cte::core::TagNameOp::kSetRoot, FsRootId(),
+        clio::cte::core::GetWallTimeNs(), "/");
+    reset += EncodeShardNames();
+    auto u = cte_.AsyncUpdateTagNames(reset, clio::run::PoolQuery::Local());
+    CLIO_CO_AWAIT(u);
+    const clio::run::u32 n = NumContainers();
+    for (clio::run::u32 c = 0; c < n; ++c) {
+      if (c != container_id_) catchup_missing_.insert(c);
+    }
+    catchup_pending_ = !catchup_missing_.empty();
+  }
 
   // issue #817: shared-memory attribute mirror. Node-local derived state that
   // clients treat as authoritative, so it is only safe when this node owns
@@ -187,6 +208,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // Never claim the root complete: after a restart it has children the
   // mirror has never seen.
   MirrorDir("/", FsRootId(), /*complete=*/false);
+  EnsurePurgeDrain();  // also broadcasts the queued tag names
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -929,11 +951,11 @@ clio::run::TaskResume Runtime::RenameFile(const std::string &src,
   ins.leaf_ = FsLeaf(dst);
   ins.id_ = id;
   ins.type_ = se.type_;
-  ins.flags_ = kInsReplace | kInsFailBusy;
+  ins.flags_ = kInsReplace | kInsFailBusy | kInsNoTagName;
   FsResp ir;
   CLIO_CO_AWAIT(CallShard(DirOwner(ins.dir_), kShardInsert, ins, ir));
   const bool same = ir.rc_ == 0 && ir.old_id_ == id;
-  s.flags_ = (ir.rc_ != 0 || same) ? kRmRestore : 0u;
+  s.flags_ = (ir.rc_ != 0 || same) ? kRmRestore : kRmNoTagName;
   FsResp fr;
   CLIO_CO_AWAIT(CallShard(o1, kShardRemove, s, fr));
   // Drop the handoff link. A failed or no-op rename keeps the source as the
@@ -945,6 +967,19 @@ clio::run::TaskResume Runtime::RenameFile(const std::string &src,
   }
   if (!same && ir.old_id_ != 0) {
     CLIO_CO_AWAIT(UnlinkInode(ir.old_id_, dst));  // the replaced destination
+  }
+  if (!same) {
+    // ONE name change for the whole move (the per-owner steps publish none).
+    const std::string to = clio::cte::core::MakeTagRefName(
+        FsUnpack(ir.attr_.id_), FsLeaf(dst));
+    if (ir.old_id_ != 0) {
+      PublishName(clio::cte::core::TagNameOp::kRemoveName,
+                  FsUnpack(ir.old_id_), to);
+    }
+    PublishName(clio::cte::core::TagNameOp::kRename, se.id_,
+                clio::cte::core::MakeTagRefName(FsUnpack(sr.attr_.id_),
+                                                FsLeaf(src)),
+                to);
   }
   rc = 0;
   CLIO_CO_RETURN;
@@ -1052,10 +1087,24 @@ clio::run::TaskResume Runtime::RenameDir(const std::string &src,
     ins.leaf_ = FsLeaf(dst);
     ins.id_ = id;
     ins.type_ = kFsTypeDir;
-    ins.flags_ = kInsReplace | kInsReplaceDir | kInsFailBusy;
+    ins.flags_ = kInsReplace | kInsReplaceDir | kInsFailBusy | kInsNoTagName;
     FsResp ir;
     CLIO_CO_AWAIT(CallShard(DirOwner(ins.dir_), kShardInsert, ins, ir));
     rc = static_cast<int>(ir.rc_);
+    if (rc == 0) {
+      // O(1): the directory's children are named relative to its id, so the
+      // move is one name change no matter how large the subtree is.
+      const std::string to = clio::cte::core::MakeTagRefName(
+          FsUnpack(ir.attr_.id_), FsLeaf(dst));
+      if (ir.old_id_ != 0) {
+        PublishName(clio::cte::core::TagNameOp::kRemoveName,
+                    FsUnpack(ir.old_id_), to);
+      }
+      PublishName(clio::cte::core::TagNameOp::kRename, se.id_,
+                  clio::cte::core::MakeTagRefName(FsUnpack(sr.attr_.id_),
+                                                  FsLeaf(src)),
+                  to);
+    }
   }
   // Commit: drop the old states + the source entry. Abort: drop the new
   // states, unfreeze the old ones, restore the source entry.
@@ -1072,7 +1121,7 @@ clio::run::TaskResume Runtime::RenameDir(const std::string &src,
       CLIO_CO_AWAIT(CallShard(DirOwner(y.dir_), kShardDirDrop, y, yr));
     }
   }
-  s.flags_ = rc == 0 ? 0u : kRmRestore;
+  s.flags_ = rc == 0 ? kRmNoTagName : kRmRestore;
   FsResp fr;
   CLIO_CO_AWAIT(CallShard(o1, kShardRemove, s, fr));
   CLIO_CO_RETURN;

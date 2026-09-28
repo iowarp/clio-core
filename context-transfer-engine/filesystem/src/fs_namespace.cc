@@ -279,6 +279,18 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
     case kShardPurgeLocal:
       CLIO_CO_AWAIT(PurgeLocal(req));
       break;
+    case kShardRepublish: {
+      // A restarted node asks for this container's names (it reset its own).
+      const std::string batch = EncodeShardNames();
+      if (!batch.empty()) {
+        auto u = cte_.AsyncUpdateTagNames(
+            batch, clio::run::PoolQuery::DirectId(
+                       static_cast<clio::run::ContainerId>(req.a_)));
+        CLIO_CO_AWAIT(u);
+        rc = static_cast<int>(u->GetReturnCode());
+      }
+      break;
+    }
     default:
       rc = EINVAL;
       break;
@@ -360,6 +372,8 @@ int Runtime::InsertEntry(const FsReq &req, FsResp &resp) {
     it->second.state_ = kEntLive;
     TouchDirLocked(*ds);
     LogEnt(true, req.dir_, req.leaf_, it->second, *ds);
+    PublishName(clio::cte::core::TagNameOp::kAddName, it->second.id_,
+                clio::cte::core::MakeTagRefName(ds->id_, req.leaf_));
     return 0;
   }
   if (it != ds->ents_.end()) {
@@ -378,12 +392,19 @@ int Runtime::InsertEntry(const FsReq &req, FsResp &resp) {
     if (e.type_ == kFsTypeDir && (f & kInsReplaceDir) == 0) return ENOTEMPTY;
     resp.old_id_ = FsPack(e.id_);
     resp.old_type_ = e.type_;
+    const clio::cte::core::TagId victim = e.id_;
     e.id_ = FsUnpack(req.id_);
     e.type_ = req.type_;
     TouchDirLocked(*ds);
     LogEnt(true, req.dir_, req.leaf_, e, *ds);
+    if ((f & kInsNoTagName) == 0) {
+      const std::string tn = clio::cte::core::MakeTagRefName(ds->id_, req.leaf_);
+      PublishName(clio::cte::core::TagNameOp::kRemoveName, victim, tn);
+      PublishName(clio::cte::core::TagNameOp::kAddName, e.id_, tn);
+    }
     resp.id_ = req.id_;
     resp.type_ = req.type_;
+    resp.attr_.id_ = FsPack(ds->id_);  // the directory's id (tag parent)
     return 0;
   }
   Dentry e;
@@ -405,10 +426,15 @@ int Runtime::InsertEntry(const FsReq &req, FsResp &resp) {
   if (e.state_ == kEntLive) {
     TouchDirLocked(*ds);
     LogEnt(true, req.dir_, req.leaf_, e, *ds);
+    if ((f & kInsNoTagName) == 0) {
+      PublishName(clio::cte::core::TagNameOp::kAddName, e.id_,
+                  clio::cte::core::MakeTagRefName(ds->id_, req.leaf_));
+    }
   }
   resp.id_ = FsPack(e.id_);
   resp.type_ = e.type_;
   resp.created_ = 1;
+  resp.attr_.id_ = FsPack(ds->id_);  // the directory's id (tag parent)
   return 0;
 }
 
@@ -444,6 +470,7 @@ int Runtime::RemoveEntry(const FsReq &req, FsResp &resp) {
   if ((f & kRmDirOnly) != 0 && e.type_ != kFsTypeDir) return ENOTDIR;
   resp.old_id_ = FsPack(e.id_);
   resp.old_type_ = e.type_;
+  resp.attr_.id_ = FsPack(ds.id_);  // the directory's id (tag parent)
   if ((f & kRmMarkLeaving) != 0) {
     e.state_ = kEntLeaving;
     return 0;
@@ -452,6 +479,10 @@ int Runtime::RemoveEntry(const FsReq &req, FsResp &resp) {
   ds.ents_.erase(it);
   TouchDirLocked(ds);
   LogEnt(false, req.dir_, req.leaf_, gone, ds);
+  if ((f & kRmNoTagName) == 0) {
+    PublishName(clio::cte::core::TagNameOp::kRemoveName, gone.id_,
+                clio::cte::core::MakeTagRefName(ds.id_, req.leaf_));
+  }
   return 0;
 }
 
@@ -814,6 +845,10 @@ void Runtime::QueuePurge(const PurgeItem &item) {
 
 clio::run::TaskResume Runtime::PurgeDrain() {
   CLIO_TASK_BODY_BEGIN
+  // Names first: a create-then-unlink must reach each node as add, remove,
+  // then the page purge.
+  CLIO_CO_AWAIT(FlushNames());
+  if (catchup_pending_) CLIO_CO_AWAIT(CatchUpNames());
   std::vector<PurgeItem> work;
   {
     std::lock_guard<std::mutex> g(purge_mu_);
@@ -864,6 +899,77 @@ clio::run::TaskResume Runtime::PurgeLocal(const FsReq &req) {
     // (a miss -- no pages here -- returns at once).
     auto d = cte_.AsyncDelTag(FsUnpack(packed), clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(d);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+// ===========================================================================
+// CTE tag-name publisher
+// ===========================================================================
+
+void Runtime::PublishName(clio::cte::core::TagNameOp op,
+                          const clio::cte::core::TagId &id,
+                          const std::string &name, const std::string &name2) {
+  std::lock_guard<std::mutex> g(tn_mu_);
+  clio::cte::core::EncodeTagNameOp(&tn_batch_, op, id, NowNs(), name, name2);
+}
+
+clio::run::TaskResume Runtime::FlushNames() {
+  CLIO_TASK_BODY_BEGIN
+  std::string batch;
+  {
+    std::lock_guard<std::mutex> g(tn_mu_);
+    batch.swap(tn_batch_);
+  }
+  if (!batch.empty()) {
+    // One broadcast per drain tick carries every change since the last one.
+    // A node that is down misses it and resyncs when it restarts.
+    auto u = cte_.AsyncUpdateTagNames(batch,
+                                      clio::run::PoolQuery::Broadcast(0.0f));
+    CLIO_CO_AWAIT(u);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+std::string Runtime::EncodeShardNames() {
+  std::string out;
+  const clio::run::u64 now = NowNs();
+  std::lock_guard<std::mutex> g(ns_mu_);
+  for (const auto &kv : dirs_) {
+    const DirState &ds = *kv.second;
+    for (const auto &ent : ds.ents_) {
+      if (ent.second.state_ == kEntPending) continue;
+      clio::cte::core::EncodeTagNameOp(
+          &out, clio::cte::core::TagNameOp::kAddName, ent.second.id_, now,
+          clio::cte::core::MakeTagRefName(ds.id_, ent.first));
+    }
+  }
+  return out;
+}
+
+clio::run::TaskResume Runtime::CatchUpNames() {
+  CLIO_TASK_BODY_BEGIN
+  // Every peer re-sends the names it owns to this node. Peers still coming
+  // up are retried on later ticks (about 1 s apart, up to ~2 minutes).
+  if (++catchup_attempts_ % 50 != 1) CLIO_CO_RETURN;
+  std::vector<clio::run::u32> peers(catchup_missing_.begin(),
+                                    catchup_missing_.end());
+  for (clio::run::u32 c : peers) {
+    FsReq r;
+    r.a_ = container_id_;
+    FsResp resp;
+    CLIO_CO_AWAIT(CallShard(c, kShardRepublish, r, resp));
+    if (resp.rc_ == 0) catchup_missing_.erase(c);
+  }
+  if (catchup_missing_.empty() || catchup_attempts_ > 50 * 120) {
+    if (!catchup_missing_.empty()) {
+      HLOG(kWarning, "filesystem: {} peers never re-sent their names; CTE "
+           "search on this node misses their part of the namespace",
+           catchup_missing_.size());
+    }
+    catchup_pending_ = false;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

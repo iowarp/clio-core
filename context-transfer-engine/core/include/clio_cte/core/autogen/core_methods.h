@@ -103,7 +103,12 @@ GLOBAL_CROSS_CONST clio::run::u32 kPodMultiScore = 53;
 // DataOrganizer::Reorganize through Runtime::OrganizerHint(). Broadcast.
 GLOBAL_CROSS_CONST clio::run::u32 kReorganizeHint = 54;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 55;
+// Batched, broadcast tag-NAME maintenance (add / remove / rename a name,
+// set the root) for tags whose data and ids are owned elsewhere -- the
+// filesystem chimod publishes its namespace here so tag search sees paths.
+GLOBAL_CROSS_CONST clio::run::u32 kUpdateTagNames = 55;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 56;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -138,6 +143,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[38] = "RenameTag";
     v[39] = "GetOrCreateTagAlias";
     v[40] = "GetTagName";
+    v[55] = "UpdateTagNames";
     v[41] = "GetCapacity";
     v[42] = "GetNumAliases";
     v[43] = "PodPutBlob";

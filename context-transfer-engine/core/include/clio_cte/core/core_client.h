@@ -3603,6 +3603,23 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Publish a batch of tag-name operations (see EncodeTagNameOp). Sent as a
+   * Broadcast so every container can resolve and search the names; dead
+   * nodes are skipped (they catch up from the publisher after restart).
+   * @param ops encoded batch
+   * @param pool_query default Broadcast(0.0f)
+   */
+  clio::run::Future<UpdateTagNamesTask> AsyncUpdateTagNames(
+      const std::string &ops,
+      const clio::run::PoolQuery &pool_query =
+          clio::run::PoolQuery::Broadcast(0.0f)) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<UpdateTagNamesTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, ops);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Asynchronous poll telemetry log - returns immediately
    * @param minimum_logical_time Minimum logical time filter
    * @param pool_query Pool query for task routing (default: Dynamic)

@@ -211,6 +211,12 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(GetNumAliases(typed_task));
       break;
     }
+    case Method::kUpdateTagNames: {
+      // Cast task FullPtr to specific type
+      auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
+      CLIO_CO_AWAIT(UpdateTagNames(typed_task));
+      break;
+    }
     case Method::kPollTelemetryLog: {
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
@@ -461,6 +467,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kUpdateTagNames: {
+      auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kPollTelemetryLog: {
       auto& typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
       archive << *typed_task;
@@ -688,6 +699,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kGetNumAliases: {
       auto& typed_task = task_ptr.template Cast<GetNumAliasesTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kUpdateTagNames: {
+      auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
       archive >> *typed_task;
       break;
     }
@@ -946,6 +962,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
     }
     case Method::kGetNumAliases: {
       auto& typed_task = task_ptr.template Cast<GetNumAliasesTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kUpdateTagNames: {
+      auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task;
       break;
@@ -1217,6 +1239,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kGetNumAliases: {
       auto& typed_task = task_ptr.template Cast<GetNumAliasesTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kUpdateTagNames: {
+      auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -1623,6 +1651,17 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kUpdateTagNames: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<UpdateTagNamesTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<UpdateTagNamesTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<UpdateTagNamesTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kPollTelemetryLog: {
       // Allocate new task
       auto new_task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
@@ -1908,6 +1947,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<GetNumAliasesTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kUpdateTagNames: {
+      auto new_task_ptr = ipc_manager->NewTask<UpdateTagNamesTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kPollTelemetryLog: {
       auto new_task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
@@ -2122,6 +2165,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kGetNumAliases: {
       auto& typed_task = orig_task.template Cast<GetNumAliasesTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kUpdateTagNames: {
+      auto& typed_task = orig_task.template Cast<UpdateTagNamesTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }

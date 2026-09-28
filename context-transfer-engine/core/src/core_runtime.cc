@@ -5928,6 +5928,333 @@ clio::run::TaskResume Runtime::GetCapacity(
   CLIO_TASK_BODY_END
 }
 
+// ===========================================================================
+// Published tag names (UpdateTagNames)
+//
+// A publisher (the filesystem chimod) owns a namespace elsewhere and mirrors
+// it here as hierarchical names "$tagid{parent}/leaf" so tag search sees
+// paths. Batches arrive asynchronously and from many publishers, so every
+// operation is idempotent, ordered per name by last-writer-wins, and a name
+// whose ancestor has not arrived yet is parked instead of indexed wrong.
+// ===========================================================================
+
+
+void Runtime::EditTagInfo(const TagId &id,
+                          const std::function<void(TagInfo &)> &edit) {
+  std::shared_ptr<TagInfo> cur = tag_id_to_info_.get(id);
+  TagInfo next;
+  if (cur != nullptr) {
+    next = *cur;
+  } else {
+    next.tag_id_ = id;
+    const auto now = GetWallTimeNs();
+    next.last_changed_ = next.last_modified_ = next.last_read_ = now;
+  }
+  edit(next);
+  // Replace, never mutate in place: tag_name_ is read lock-free by scans.
+  tag_id_to_info_.insert_or_assign(id, std::make_shared<TagInfo>(next));
+}
+
+bool Runtime::ResolveNameStrict(const std::string &stored, std::string *abs,
+                                TagId *blocker) {
+  std::vector<std::string> parts;
+  std::string cur = stored;
+  for (int depth = 0; depth < 256; ++depth) {
+    if (cur == "/") {
+      std::string out;
+      for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+        out += "/" + *it;
+      }
+      *abs = out.empty() ? "/" : out;
+      return true;
+    }
+    TagId parent;
+    std::string leaf;
+    if (!ParseTagRef(cur, parent, leaf)) {
+      if (!parts.empty()) return false;  // a flat name cannot be a parent
+      *abs = cur;
+      return true;
+    }
+    parts.push_back(leaf);
+    std::shared_ptr<TagInfo> pinfo = tag_id_to_info_.get(parent);
+    if (pinfo == nullptr || pinfo->tag_name_.empty()) {
+      *blocker = parent;
+      return false;
+    }
+    cur = pinfo->tag_name_.str();
+  }
+  return false;
+}
+
+void Runtime::IndexOrParkName(const TagId &id, const std::string &name) {
+  std::string abs;
+  TagId blocker;
+  if (ResolveNameStrict(name, &abs, &blocker)) {
+    tag_search_.Insert(abs, id);
+  } else if (!blocker.IsNull()) {
+    parked_names_[blocker].emplace_back(id, name);
+  }
+}
+
+void Runtime::UnparkNames(const TagId &parent) {
+  auto it = parked_names_.find(parent);
+  if (it == parked_names_.end()) return;
+  std::vector<std::pair<TagId, std::string>> waiting = std::move(it->second);
+  parked_names_.erase(it);
+  for (const auto &w : waiting) {
+    TagId *bound = tag_name_to_id_.find(w.second);
+    if (bound != nullptr && *bound == w.first) {
+      IndexOrParkName(w.first, w.second);  // may park again, higher up
+    }
+  }
+}
+
+void Runtime::RekeyIndexSubtree(const std::string &old_abs,
+                                const std::string &new_abs) {
+  if (old_abs == new_abs) return;
+  const std::string esc = EscapeRegexLiteral(old_abs);
+  // Hold each result by value: range-for over Search(...).keys() would
+  // iterate a member of a destroyed temporary.
+  auto self = tag_search_.Search("^" + esc + "$");
+  auto below = tag_search_.Search("^" + esc + "/.*");
+  std::vector<std::string> movers = self.keys();
+  const auto &below_keys = below.keys();
+  movers.insert(movers.end(), below_keys.begin(), below_keys.end());
+  for (const auto &k : movers) {
+    tag_search_.Rename(k, new_abs + k.substr(old_abs.size()));
+  }
+}
+
+void Runtime::TnAddName(const TagId &id, const std::string &name) {
+  TagId *bound = tag_name_to_id_.find(name);
+  if (bound != nullptr && *bound == id) return;
+  if (bound != nullptr) TnRemoveName(TagId(*bound), name);  // copy: entry erased
+  std::shared_ptr<TagInfo> cur = tag_id_to_info_.get(id);
+  const bool was_nameless = cur == nullptr || cur->tag_name_.empty();
+  EditTagInfo(id, [&](TagInfo &t) {
+    if (t.tag_name_.empty()) {
+      t.tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, name);
+      return;
+    }
+    if (t.tag_name_.str() == name) return;
+    for (size_t i = 0; i < t.aliases_.size(); ++i) {
+      if (t.aliases_[i].str() == name) return;
+    }
+    t.aliases_.push_back(clio::run::priv::string(CLIO_PRIV_ALLOC, name));
+  });
+  tag_name_to_id_.insert_or_assign(name, id);
+  IndexOrParkName(id, name);
+  if (was_nameless) UnparkNames(id);
+  std::shared_ptr<TagInfo> now = tag_id_to_info_.get(id);
+  if (now != nullptr) LogTagIdentity(id, *now);
+}
+
+void Runtime::TnRemoveName(const TagId &id, const std::string &name) {
+  TagId *bound = tag_name_to_id_.find(name);
+  if (bound != nullptr && *bound == id) tag_name_to_id_.erase(name);
+  std::shared_ptr<TagInfo> cur = tag_id_to_info_.get(id);
+  if (cur == nullptr) return;
+  std::string abs;
+  TagId blocker;
+  const bool resolved = ResolveNameStrict(name, &abs, &blocker);
+  const bool canonical = cur->tag_name_.str() == name;
+  std::string promoted;
+  EditTagInfo(id, [&](TagInfo &t) {
+    if (canonical) {
+      if (!t.aliases_.empty()) {
+        promoted = t.aliases_[0].str();
+        t.aliases_.erase(t.aliases_.begin());
+      }
+      t.tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, promoted);
+      return;
+    }
+    for (size_t i = 0; i < t.aliases_.size(); ++i) {
+      if (t.aliases_[i].str() == name) {
+        t.aliases_.erase(t.aliases_.begin() + i);
+        break;
+      }
+    }
+  });
+  if (resolved) {
+    std::string new_abs;
+    TagId b2;
+    if (canonical && !promoted.empty() &&
+        ResolveNameStrict(promoted, &new_abs, &b2)) {
+      // Children now hang off the promoted name. Drop the promoted name's own
+      // key first (it is re-created by the subtree move), then move.
+      tag_search_.Delete(new_abs);
+      RekeyIndexSubtree(abs, new_abs);
+    } else {
+      tag_search_.Delete(abs);
+    }
+  }
+  std::shared_ptr<TagInfo> now = tag_id_to_info_.get(id);
+  if (now == nullptr) return;
+  if (now->tag_name_.empty() && now->aliases_.empty() &&
+      now->total_size_ == 0 && BlobIndexNames(id).empty()) {
+    tag_id_to_info_.erase(id);  // a pure name record (e.g. a directory)
+  }
+  LogTagIdentity(id, *now);
+}
+
+void Runtime::TnRename(const TagId &id, const std::string &from,
+                       const std::string &to) {
+  TagId *other = tag_name_to_id_.find(to);
+  if (other != nullptr && !(*other == id)) TnRemoveName(TagId(*other), to);
+  std::shared_ptr<TagInfo> cur = tag_id_to_info_.get(id);
+  bool has_from = cur != nullptr && cur->tag_name_.str() == from;
+  const bool canonical = has_from;
+  for (size_t i = 0; cur != nullptr && !has_from && i < cur->aliases_.size();
+       ++i) {
+    has_from = cur->aliases_[i].str() == from;
+  }
+  if (!has_from) {  // never saw the old name: this is just a bind
+    TnAddName(id, to);
+    return;
+  }
+  std::string old_abs, new_abs;
+  TagId b1, b2;
+  const bool old_ok = ResolveNameStrict(from, &old_abs, &b1);
+  TagId *bound = tag_name_to_id_.find(from);
+  if (bound != nullptr && *bound == id) tag_name_to_id_.erase(from);
+  tag_name_to_id_.insert_or_assign(to, id);
+  EditTagInfo(id, [&](TagInfo &t) {
+    if (canonical) {
+      t.tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, to);
+    } else {
+      for (size_t i = 0; i < t.aliases_.size(); ++i) {
+        if (t.aliases_[i].str() == from) {
+          t.aliases_[i] = clio::run::priv::string(CLIO_PRIV_ALLOC, to);
+        }
+      }
+    }
+    t.last_changed_ = GetWallTimeNs();
+  });
+  const bool new_ok = ResolveNameStrict(to, &new_abs, &b2);
+  if (canonical && old_ok && new_ok) {
+    RekeyIndexSubtree(old_abs, new_abs);  // O(subtree) index keys, no messages
+  } else {
+    if (old_ok) tag_search_.Delete(old_abs);
+    IndexOrParkName(id, to);
+  }
+  std::shared_ptr<TagInfo> now = tag_id_to_info_.get(id);
+  if (now != nullptr) LogTagIdentity(id, *now);
+}
+
+bool Runtime::ApplyTagNameOp(const TagNameOpRec &r) {
+  auto stamp = [this](const std::string &n) {
+    auto it = name_seq_.find(n);
+    return it == name_seq_.end() ? 0ULL : it->second;
+  };
+  switch (r.op_) {
+    case TagNameOp::kAddName:
+    case TagNameOp::kRemoveName:
+      if (r.seq_ < stamp(r.name_)) return false;  // a newer op owns the name
+      name_seq_[r.name_] = r.seq_;
+      if (r.op_ == TagNameOp::kAddName) TnAddName(r.tag_, r.name_);
+      else TnRemoveName(r.tag_, r.name_);
+      return true;
+    case TagNameOp::kRename: {
+      const bool from_ok = r.seq_ >= stamp(r.name_);
+      const bool to_ok = r.seq_ >= stamp(r.name2_);
+      if (from_ok) name_seq_[r.name_] = r.seq_;
+      if (to_ok) name_seq_[r.name2_] = r.seq_;
+      if (from_ok && to_ok) TnRename(r.tag_, r.name_, r.name2_);
+      else if (to_ok) TnAddName(r.tag_, r.name2_);
+      else if (from_ok) TnRemoveName(r.tag_, r.name_);
+      return from_ok || to_ok;
+    }
+    case TagNameOp::kSetRoot: {
+      TagId *bound = tag_name_to_id_.find(std::string("/"));
+      if (bound != nullptr && !(*bound == r.tag_)) {
+        HLOG(kWarning, "UpdateTagNames: \"/\" is already tag {}.{}; the "
+             "published root {}.{} resolves for search but not by exact path",
+             bound->major_, bound->minor_, r.tag_.major_, r.tag_.minor_);
+      } else {
+        tag_name_to_id_.insert_or_assign(std::string("/"), r.tag_);
+      }
+      std::shared_ptr<TagInfo> cur = tag_id_to_info_.get(r.tag_);
+      const bool was_nameless = cur == nullptr || cur->tag_name_.empty();
+      EditTagInfo(r.tag_, [](TagInfo &t) {
+        t.tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, "/");
+      });
+      if (was_nameless) UnparkNames(r.tag_);
+      return true;
+    }
+    case TagNameOp::kResetPublished: {
+      // A restarted node missed every broadcast while it was down; its
+      // publishers re-send the live namespace, so first forget all published
+      // (hierarchical) names instead of keeping ones deleted meanwhile.
+      std::vector<TagId> ids;
+      tag_id_to_info_.for_each(
+          [&](const TagId &id, const std::shared_ptr<TagInfo> &info) {
+            if (info->tag_name_.str().rfind("$tagid{", 0) == 0) {
+              ids.push_back(id);
+            }
+          },
+          ctp::priv::ForEachLock::kShared);
+      for (const TagId &id : ids) {
+        std::shared_ptr<TagInfo> info = tag_id_to_info_.get(id);
+        if (info == nullptr) continue;
+        std::vector<std::string> names{info->tag_name_.str()};
+        for (size_t i = 0; i < info->aliases_.size(); ++i) {
+          names.push_back(info->aliases_[i].str());
+        }
+        for (auto it = names.rbegin(); it != names.rend(); ++it) {
+          TnRemoveName(id, *it);  // aliases first, so none gets promoted
+        }
+      }
+      parked_names_.clear();
+      name_seq_.clear();
+      // Removal order can leave children's index keys behind their parents';
+      // rebuild the index from the (now published-name-free) tag table.
+      RebuildTagSearchIndexLocked();
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+clio::run::TaskResume Runtime::UpdateTagNames(
+    clio::run::shared_ptr<UpdateTagNamesTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  std::vector<TagNameOpRec> ops;
+  const std::string buf = task->ops_.str();
+  if (!DecodeTagNameOps(buf.data(), buf.size(), &ops)) {
+    HLOG(kWarning, "UpdateTagNames: malformed batch; applying {} records",
+         ops.size());
+  }
+  clio::run::u32 applied = 0;
+  {
+    std::lock_guard<std::mutex> g(tag_names_mu_);
+    for (const auto &r : ops) {
+      try {
+        if (ApplyTagNameOp(r)) ++applied;
+      } catch (const std::exception &e) {
+        // One bad record must not take the node down (or its whole batch).
+        HLOG(kError, "UpdateTagNames: op {} on tag {}.{} ('{}' -> '{}') "
+             "failed: {}", static_cast<clio::run::u32>(r.op_), r.tag_.major_,
+             r.tag_.minor_, r.name_, r.name2_, e.what());
+
+      }
+    }
+    // Bound the last-writer-wins stamps: drop ones older than 10 minutes
+    // (a reordering window of minutes is far beyond any batch delay).
+    constexpr size_t kMaxStamps = 4u << 20;
+    if (name_seq_.size() > kMaxStamps) {
+      const clio::run::u64 cutoff = GetWallTimeNs() - 600ULL * 1000000000ULL;
+      for (auto it = name_seq_.begin(); it != name_seq_.end();) {
+        it = it->second < cutoff ? name_seq_.erase(it) : std::next(it);
+      }
+    }
+  }
+  task->applied_ = applied;
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::GetNumAliases(
     clio::run::shared_ptr<GetNumAliasesTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -7364,7 +7691,9 @@ void Runtime::ApplyWalSetTagIdentity(const std::vector<char> &payload,
     if (!old_canonical.empty() && old_canonical != txn.canonical_name_) {
       tag_name_to_id_.erase(old_canonical);
     }
-    tag_name_to_id_.insert_or_assign(txn.canonical_name_, tag_id);
+    if (!txn.canonical_name_.empty()) {  // a name-less tag binds nothing
+      tag_name_to_id_.insert_or_assign(txn.canonical_name_, tag_id);
+    }
   }
   // Drop any alias this record no longer carries (an unlinked hard link).
   for (const auto &old_alias : old_aliases) {

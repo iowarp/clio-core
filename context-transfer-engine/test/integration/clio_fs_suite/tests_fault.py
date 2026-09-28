@@ -16,9 +16,40 @@ import time
 
 from cluster import parallel
 from suite import test
+from tests_dist import _tags_match
 
 MiB = 1 << 20
 OP_DEADLINE = 60  # seconds any single op may take while a node is down
+
+
+def fs_dir_owner(path, n):
+  """Container (= node index) owning directory `path` (mount-relative) among
+  n nodes; mirrors FsPathHash / FsDirContainer in fs_shard.h."""
+  m = (1 << 64) - 1
+  h = 0xCBF29CE484222325
+  for c in path.encode():
+    h = ((h ^ c) * 0x100000001B3) & m
+  h = (h + 0x9E3779B97F4A7C15) & m
+  h = ((h ^ (h >> 30)) * 0xBF58476D1CE4E5B9) & m
+  h = ((h ^ (h >> 27)) * 0x94D049BB133111EB) & m
+  h ^= h >> 31
+  return ((h ^ (h >> 32)) & 0xffffffff) % n
+
+
+def victim_off_path(ctx, root):
+  """Highest node index owning none of root's ancestor directories, so the
+  loss hits a shard of the dataset instead of the path every entry is under
+  (that case is the known no-metadata-replica limit, not what is measured).
+  Falls back to the last node."""
+  n = len(ctx.hosts)
+  rel = root[len(ctx.cl.mnt):]
+  parts = [p for p in rel.split('/') if p]
+  dirs = ['/'] + ['/' + '/'.join(parts[:k]) for k in range(1, len(parts) + 1)]
+  owners = {fs_dir_owner(d, n) for d in dirs}
+  for i in range(n - 1, 0, -1):
+    if i not in owners:
+      return i
+  return n - 1
 
 
 def build_dataset(ctx, tag, per_node=12):
@@ -397,19 +428,22 @@ def t_chaos(ctx):
 @test('any_node_loss_bounded', 'fault', min_nodes=2, redeploy_after=True,
       timeout=3600)
 def t_node_loss_partial(ctx):
-  """SIGKILL one node (the last).  The namespace is hash-sharded, so only the
-  entries and inodes that node owns become unavailable: every op on a
+  """SIGKILL one node (one owning no ancestor of the dataset root).  The
+  namespace is hash-sharded, so only the entries and inodes that node owns
+  become unavailable: every op on a
   survivor must finish inside OP_DEADLINE (fail fast on the dead shard,
   never hang), most of the namespace must stay reachable, and after the node
   restarts every node sees the whole dataset again."""
   n = len(ctx.hosts)
   root, exp = build_dataset(ctx, 'h', per_node=6)
-  victim = ctx.hosts[-1]
+  vi = victim_off_path(ctx, root)
+  victim = ctx.hosts[vi]
+  ctx.note(f'victim node{vi} (owns none of the dataset root\'s ancestors)')
   ctx.cl.kill_fuse(victim)
   ctx.cl.kill_runtime(victim)
   time.sleep(2)
   hangs, errs, oks = 0, 0, 0
-  for i in range(0, n - 1):
+  for i in [k for k in range(n) if k != vi]:
     for rel in sorted(exp):
       r = ctx.a(i).call('stat', timeout=OP_DEADLINE, path=f'{root}/{rel}')
       if r.get('hang'):
@@ -436,3 +470,48 @@ def t_node_loss_partial(ctx):
   ctx.cl.agents.pop(victim, None)
   time.sleep(2)
   audit_all(ctx, root, exp, 'after the lost node restarted')
+
+
+@test('tag_names_after_restart', 'fault', min_nodes=2, redeploy_after=True,
+      timeout=1800)
+def t_tag_names_restart(ctx):
+  """A restarted node rebuilds its tag-name mirror: it republishes its own
+  directory shard and pulls every peer's, so path search on it (and on the
+  peers) again matches the namespace, including names created while it was
+  down."""
+  n = len(ctx.hosts)
+  r = ctx.dir
+  want = {'/'}
+  for i in range(n):
+    ctx.ok(i, 'mkdir', path=f'{r}/n{i}')
+    res = ctx.ok(i, 'create_many', dirpath=f'{r}/n{i}', prefix='f',
+                 count=100)
+    ctx.check(not res['fails'], f'create_many node{i}: {res["fails"][:3]}')
+    want.add(f'/n{i}')
+    want.update(f'/n{i}/f{k}' for k in range(100))
+  ctx.ok(0, 'rename', src=f'{r}/n0', dst=f'{r}/n0moved')
+  want = {w.replace('/n0', '/n0moved', 1) if w.startswith('/n0') else w
+          for w in want}
+  for i in range(n):
+    _tags_match(ctx, i, r, want, 'before restart')
+  victim = n - 1
+  vh = ctx.hosts[victim]
+  ctx.cl.kill_fuse(vh)
+  ctx.cl.kill_runtime(vh)
+  time.sleep(2)
+  # Names created on survivors while the victim is down.  Directories owned
+  # by the victim are unreachable, so create in fresh ones and keep those
+  # that succeed.
+  for k in range(8):
+    p = f'{r}/during{k}'
+    res = ctx.a(0).call('mkdir', timeout=OP_DEADLINE, path=p)
+    if res.get('ok'):
+      want.add(f'/during{k}')
+  ctx.cl.start_runtime(vh, 'restart')
+  ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
+  time.sleep(3)
+  ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
+  ctx.cl.agents.pop(vh, None)
+  for i in range(n):
+    _tags_match(ctx, i, r, want, f'after {vh} restarted')
+

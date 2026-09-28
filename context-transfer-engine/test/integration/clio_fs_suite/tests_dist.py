@@ -8,8 +8,11 @@ VIS_TIMEOUT is a failure; staleness inside it is reported as a metric.
 """
 
 import random
+import re
+import shlex
 import time
 
+from cluster import sh
 from suite import test
 
 MiB = 1 << 20
@@ -21,6 +24,37 @@ def _vis(ctx, i, fn, what):
   done, info, dt = ctx.eventually(fn, timeout=VIS_TIMEOUT)
   ctx.check(done, f'node{i}: {what} not visible after {VIS_TIMEOUT}s: {info}')
   key = f'max_stale_s_{what.split()[0]}'
+  ctx.metrics[key] = round(max(ctx.metrics.get(key, 0), dt), 2)
+
+
+def tag_index_paths(ctx, i, root):
+  """Absolute CTE tag names at or under mount-relative dir root, as seen by
+  node i's tag search index (cte_search --tag-query).  Returns (set, err)."""
+  rel = root[len(ctx.cl.mnt):] or '/'
+  rx = '^' + re.escape(rel) + '(/.*)?$'
+  cmd = (f'{ctx.cl.env_prefix()} {ctx.cl.bin_dir}/cte_search '
+         f'{shlex.quote(rx)} --tag-query')
+  rc, out = sh(ctx.hosts[i], cmd, timeout=60)
+  if rc != 0:
+    return None, out[-500:]
+  names = {l.strip() for l in out.splitlines() if l.startswith('/')}
+  return {n[len(rel):] or '/' for n in names}, None
+
+
+def _tags_match(ctx, i, root, want, what):
+  """Wait until node i's tag index under root equals want (relative names)."""
+  last = {}
+
+  def f():
+    got, err = tag_index_paths(ctx, i, root)
+    last['got'], last['err'] = got, err
+    return got == want, None
+  done, _, dt = ctx.eventually(f, timeout=60, period=1.0)
+  got = last['got'] or set()
+  ctx.check(done, f'node{i} tag index {what}: missing '
+                  f'{sorted(want - got)[:8]} extra {sorted(got - want)[:8]}'
+                  f'{" err " + last["err"] if last["err"] else ""}')
+  key = 'max_tag_lag_s'
   ctx.metrics[key] = round(max(ctx.metrics.get(key, 0), dt), 2)
 
 
@@ -300,6 +334,59 @@ def t_xlinks(ctx):
     r = ctx.call(0, 'verify_file', path=ctx.p('t'), size=2 * MiB, seed=4)
     return r['ok'] and r['ret']['ok'], r.get('ret') or r.get('err')
   _vis(ctx, 0, h, 'link-write')
+
+
+@test('xnode_tag_names', 'dist', min_nodes=2, timeout=1800)
+def t_tag_names(ctx):
+  """The CTE tag namespace mirrors clio-fs paths on every node: create,
+  rename (a directory with a subtree), cross-directory move, rename over an
+  existing file, unlink, rmdir and hard link, issued back to back with no
+  pauses, are all reflected by path in every node's tag search index."""
+  n = len(ctx.hosts)
+  r = ctx.dir
+  want = {'/'}
+
+  def mk(i, rel):
+    ctx.ok(i, 'mkdir', path=r + rel)
+    want.add(rel)
+
+  def wr(i, rel):
+    ctx.ok(i, 'write_file', path=r + rel, size=64, seed=len(rel))
+    want.add(rel)
+
+  def mv(i, a, b):
+    ctx.ok(i, 'rename', src=r + a, dst=r + b)
+    for w in [w for w in want if w == a or w.startswith(a + '/')]:
+      want.discard(w)
+      want.add(b + w[len(a):])
+  # Deep tree from node 0, then renames from other nodes, no pauses.
+  mk(0, '/d1'); mk(0, '/d1/sub'); mk(0, '/d1/sub/deep')
+  wr(0, '/d1/f1'); wr(0, '/d1/sub/f2'); wr(0, '/d1/sub/deep/f3')
+  mv(1 % n, '/d1', '/d2')
+  mk(1 % n, '/x')
+  mv(0, '/d2/sub', '/x/moved')
+  wr(0, '/x/victim'); wr(1 % n, '/x/src')
+  mv(0, '/x/src', '/x/victim')          # rename over an existing file
+  wr(1 % n, '/x/gone'); ctx.ok(0, 'unlink', path=r + '/x/gone')
+  mk(0, '/x/rmd'); ctx.ok(1 % n, 'rmdir', path=r + '/x/rmd')
+  ctx.ok(0, 'link', src=r + '/d2/f1', dst=r + '/x/f1link')
+  want.add('/x/f1link')
+  want -= {'/x/gone', '/x/rmd'}
+  # A directory per node with many entries, owners spread by hashing.
+  for i in range(n):
+    mk(i, f'/many{i}')
+    res = ctx.ok(i, 'create_many', dirpath=f'{r}/many{i}', prefix='e',
+                 count=200)
+    ctx.check(not res['fails'], f'create_many node{i}: {res["fails"][:3]}')
+    want.update(f'/many{i}/e{k}' for k in range(200))
+  mv(0, '/many0', '/x/many0moved')
+  for i in range(n):
+    _tags_match(ctx, i, r, want, 'after namespace churn')
+  # Unlinking the original name leaves the hard link's name.
+  ctx.ok(0, 'unlink', path=r + '/d2/f1')
+  want.discard('/d2/f1')
+  for i in range(n):
+    _tags_match(ctx, i, r, want, 'after unlinking a hard-linked name')
 
 
 @test('xnode_fsx', 'dist', min_nodes=2, timeout=2400)

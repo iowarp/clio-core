@@ -405,6 +405,33 @@ class Runtime : public clio::run::Container {
   /** Start the periodic purge drain once (call from a task body). */
   void EnsurePurgeDrain();
 
+  // ---- CTE tag-name publisher (async mirror of the namespace) ----
+  // Every file and directory is also a CTE tag named "$tagid{parent}/leaf",
+  // so CTE search (TagQuery / BlobQuery / SemanticSearch, the indexer) sees
+  // paths. The directory owner stays authoritative; name changes are queued
+  // here and broadcast in batches by the periodic drain.
+  std::mutex tn_mu_;             ///< guards tn_batch_ (taken after ns_mu_)
+  std::string tn_batch_;         ///< EncodeTagNameOp records not yet sent
+  bool catchup_pending_ = false; ///< restart: rebuild names on this node
+  int catchup_attempts_ = 0;
+  std::unordered_set<clio::run::u32> catchup_missing_;  ///< peers not yet heard
+  /**
+   * Queue one name operation for broadcast.
+   * @param op operation
+   * @param id tag id (the file/dir id)
+   * @param name stored name ("$tagid{parent}/leaf")
+   * @param name2 new stored name (rename only)
+   */
+  void PublishName(clio::cte::core::TagNameOp op,
+                   const clio::cte::core::TagId &id, const std::string &name,
+                   const std::string &name2 = std::string());
+  /** Broadcast queued name operations (drain body). */
+  clio::run::TaskResume FlushNames();
+  /** Encode every live entry this container owns as kAddName records. */
+  std::string EncodeShardNames();
+  /** Restart catch-up: pull every peer's names into this node (drain body). */
+  clio::run::TaskResume CatchUpNames();
+
   // ---- persistence (fs_namespace.cc) ----
   /** Encode a directory state record. */
   static std::string EncDirPut(const std::string &path, const DirState &ds);
@@ -506,6 +533,7 @@ enum FsShardOp : clio::run::u32 {
   kShardInodeXattr = 16,    ///< xattr get/set/list/remove
   kShardPurgeDrain = 17,    ///< periodic: purge dead inodes' data
   kShardPurgeLocal = 18,    ///< drop this container's pages of a batch of ids
+  kShardRepublish = 19,     ///< send this container's names to node req.a_
 };
 
 /** Insert flags (FsReq::flags_ of kShardInsert). */
@@ -517,6 +545,7 @@ enum : clio::run::u32 {
   kInsNewInode = 16u,    ///< mint + create the inode here (create/symlink)
   kInsPending = 32u,     ///< insert invisible (mkdir reservation)
   kInsCommit = 64u,      ///< make a pending entry live
+  kInsNoTagName = 128u,  ///< do not publish the name (rename publishes once)
 };
 
 /** Remove flags (FsReq::flags_ of kShardRemove). */
@@ -526,6 +555,7 @@ enum : clio::run::u32 {
   kRmMarkLeaving = 4u,   ///< only mark the entry leaving (two-phase remove)
   kRmRestore = 8u,       ///< make a leaving entry live again (abort)
   kRmFailBusy = 16u,     ///< EBUSY instead of waiting on a busy name
+  kRmNoTagName = 32u,    ///< do not publish the removal (rename publishes once)
 };
 
 /** xattr sub-ops (FsReq::type_ of kShardInodeXattr). */

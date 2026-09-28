@@ -6,6 +6,8 @@
  *                         match the given regexes.
  *   semantic            — SemanticSearch: BM25 keyword ranking over blob bytes.
  *   temporal            — TemporalSearch: filter by last_modified timestamp.
+ *   tag-query           — TagQuery: list matching tags, including tags that
+ *                         hold no blobs (clio-fs directories).
  *
  * Usage examples
  * --------------
@@ -101,6 +103,7 @@ struct Args {
   uint32_t max_results = 0;
   std::string format = "names";  // names | table | json
   bool tags_only = false;        // print only unique tag names
+  bool tag_query = false;        // TagQuery: match tags, blobs or not
 };
 
 static void PrintUsage(const char *prog) {
@@ -122,6 +125,8 @@ static void PrintUsage(const char *prog) {
     "  --max N              Maximum results (0 = unlimited)\n"
     "  --format FMT         Output format: names (default), table, json\n"
     "  --tags-only          List only unique matching tag names\n"
+    "  --tag-query          List matching tags, including tags with no blobs\n"
+    "                       (e.g. clio-fs directories)\n"
     "  --help               Show this message\n"
     "\n"
     "Examples:\n"
@@ -185,6 +190,9 @@ static Args ParseArgs(int argc, char **argv) {
       }
     } else if (flag == "--tags-only") {
       a.tags_only = true;
+    } else if (flag == "--tag-query") {
+      a.tag_query = true;
+      ++mode_count;
     } else {
       std::cerr << "error: unknown option: " << flag << "\n";
       std::exit(1);
@@ -192,7 +200,8 @@ static Args ParseArgs(int argc, char **argv) {
   }
 
   if (mode_count > 1) {
-    std::cerr << "error: --semantic, --since, and --time-begin are mutually exclusive\n";
+    std::cerr << "error: --semantic, --since, --time-begin and --tag-query "
+                 "are mutually exclusive\n";
     std::exit(1);
   }
 
@@ -378,6 +387,14 @@ static int RunSearch(clio::cte::core::Client *client, const Args &a) {
         std::cout << TagStr(r.tag_id_) << "/" << r.blob_name_ << "\n";
       }
     }
+    return 0;
+  }
+
+  if (a.tag_query) {
+    auto task = client->AsyncTagQuery(a.tag_re, a.max_results, pool_query);
+    task.Wait();
+    if (task->results_.empty()) { std::cout << "(no results)\n"; return 0; }
+    PrintTagsOnly(task->results_);
     return 0;
   }
 
