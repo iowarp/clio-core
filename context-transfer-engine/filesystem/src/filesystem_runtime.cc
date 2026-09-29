@@ -397,8 +397,11 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
   }
   CLIO_FS_PARENT(path, pe, perc);
   if (perc != 0) {
-    // handle_ = 0 means ENOENT to the client.
-    task->return_code_ = perc == ENOENT ? 0 : perc;
+    // handle_ = 0 means ENOENT to the client. A create whose parent is gone
+    // says so outright: a caller that forgets to check the handle must not
+    // think it created a file in a removed directory.
+    task->return_code_ =
+        (perc == ENOENT && (task->flags_ & O_CREAT) == 0) ? 0 : perc;
     CLIO_CO_RETURN;
   }
   FsReq r;

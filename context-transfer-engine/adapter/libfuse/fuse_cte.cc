@@ -1973,8 +1973,9 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
   auto t = cfs->AsyncOpen(p, O_CREAT | O_RDWR | (fi->flags & O_EXCL),
                           static_cast<clio::run::u32>(mode));
   t.Wait();
-  if (t->GetReturnCode() == EEXIST) return -EEXIST;
-  if (t->GetReturnCode() != 0) return -EIO;
+  // ENOENT: the parent is gone (e.g. an rmdir on another node won the race).
+  if (t->GetReturnCode() != 0) return FsErrno(t->GetReturnCode());
+  if (t->handle_ == 0) return -ENOENT;
 
   auto *handle = new CfsHandle();
   handle->fh = t->handle_;
@@ -2017,8 +2018,7 @@ int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   // handle==0 so we can surface ENOENT.
   auto t = cfs->AsyncOpen(p, static_cast<clio::run::u32>(fi->flags), 0644);
   t.Wait();
-  if (t->GetReturnCode() == EEXIST) return -EEXIST;
-  if (t->GetReturnCode() != 0) return -EIO;
+  if (t->GetReturnCode() != 0) return FsErrno(t->GetReturnCode());
   if (t->handle_ == 0) return -ENOENT;
 
   auto *handle = new CfsHandle();

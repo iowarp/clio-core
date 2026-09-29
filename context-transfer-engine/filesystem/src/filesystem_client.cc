@@ -99,8 +99,9 @@ int Client::OpenFd(const std::string &raw_path, int flags, int mode) {
   auto t = AsyncOpen(path, static_cast<clio::run::u32>(flags),
                           static_cast<clio::run::u32>(mode));
   t.Wait();
-  if (t->GetReturnCode() != 0) {
-    errno = EIO;
+  const clio::run::u32 rc = t->GetReturnCode();
+  if (rc != 0) {
+    errno = rc < 4096 ? static_cast<int>(rc) : EIO;
     return -1;
   }
   if (t->handle_ == 0) {
