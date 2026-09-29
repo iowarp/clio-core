@@ -605,7 +605,16 @@ namespace {
  */
 bool ForeignBlobKey(clio::run::PoolId pool, clio::run::u32 me,
                     const std::string &composite_key) {
-  const clio::run::u32 n = PoolContainers(pool);
+  // During WAL replay at restart the pool's metadata may not be registered
+  // yet (PoolContainers() == 0); its geometry is the hostfile size by
+  // construction (issue #856), so fall back to that rather than treating
+  // every replayed copy as owned -- which published a restarted node's
+  // stale copies of other nodes' blobs to its own clients (zeros read).
+  clio::run::u32 n = PoolContainers(pool);
+  if (n == 0) {
+    auto *ipc = CLIO_IPC;
+    n = static_cast<clio::run::u32>(ipc->GetNumHosts());
+  }
   if (n <= 1) return false;
   const size_t d1 = composite_key.find('.');
   const size_t d2 = d1 == std::string::npos ? d1
@@ -1518,23 +1527,31 @@ clio::run::TaskResume Runtime::StatTargets(clio::run::shared_ptr<StatTargetsTask
     for (const auto &target_id : target_ids) {
       // Copy bdev_client under read lock for the async call
       clio::run::bdev::Client bdev_client_copy;
+      clio::run::PoolQuery stat_query;
       bool found = false;
       {
         clio::run::ScopedCoRwReadLock read_lock(target_lock_);
         TargetInfo *target_info = registered_targets_.find(target_id);
         if (target_info != nullptr) {
           bdev_client_copy = target_info->bdev_client_;
+          stat_query = target_info->target_query_;
           found = true;
         }
       }
       if (!found) continue;
 
-      // Perform async stats query WITHOUT holding lock
+      // Ask the bdev WHERE IT LIVES (target_query_, as every data op does):
+      // the default Local query read this node's container of the pool --
+      // another node's device, or a passive safe_bdev container's zeros.
       clio::run::u64 remaining_size;
-      auto stats_task = bdev_client_copy.AsyncGetStats();
+      auto stats_task = bdev_client_copy.AsyncGetStats(stat_query);
       CLIO_CO_AWAIT(stats_task);
+      if (stats_task->GetReturnCode() != 0) {
+        continue;  // no answer: keep the last known figures, not garbage
+      }
       clio::run::bdev::PerfMetrics perf_metrics = stats_task->metrics_;
       remaining_size = stats_task->remaining_size_;
+      const clio::run::u64 total_size = stats_task->total_size_;
 
       // Re-acquire write lock to update target info. Mutate the map and the
       // mirror in target_list_ in lockstep so DPE selection sees fresh stats.
@@ -1544,6 +1561,9 @@ clio::run::TaskResume Runtime::StatTargets(clio::run::shared_ptr<StatTargetsTask
         if (target_info != nullptr) {
           target_info->perf_metrics_ = perf_metrics;
           target_info->remaining_space_ = remaining_size;
+          // The device's capacity can change (a safe_bdev member added,
+          // lost or replaced); df and the dashboard follow within a period.
+          if (total_size != 0) target_info->max_capacity_ = total_size;
           target_info->expected_ttl_days_ = stats_task->predicted_ttl_days_;
 
           float manual_score =
@@ -1568,6 +1588,7 @@ clio::run::TaskResume Runtime::StatTargets(clio::run::shared_ptr<StatTargetsTask
             if (t.bdev_client_.pool_id_ == target_id) {
               t.perf_metrics_ = target_info->perf_metrics_;
               t.remaining_space_ = target_info->remaining_space_;
+              t.max_capacity_ = target_info->max_capacity_;
               t.target_score_ = target_info->target_score_;
               t.expected_ttl_days_ = target_info->expected_ttl_days_;
               break;
@@ -5680,8 +5701,14 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
       size_t batch_end =
           std::min(i + kMaxConcurrentDelBlobTasks, blobs_to_delete.size());
       for (size_t j = i; j < batch_end; ++j) {
-        async_tasks.push_back(client_.AsyncDelBlob(blobs_to_delete[j].first,
-                                                   blobs_to_delete[j].second));
+        // LOCAL: DelTag runs on every container, and each deletes the copies
+        // IT holds -- its own blobs and the shadow copies it keeps for other
+        // containers. Routed by hash, a shadow's delete went to the owner
+        // (which had deleted its own already), failed, and the shadow's
+        // blocks were never freed: space leaked on every file delete.
+        async_tasks.push_back(client_.AsyncDelBlob(
+            blobs_to_delete[j].first, blobs_to_delete[j].second,
+            clio::run::PoolQuery::Local()));
       }
       for (auto t : async_tasks) {
         CLIO_CO_AWAIT(t);
@@ -5900,8 +5927,18 @@ clio::run::TaskResume Runtime::GetCapacity(
   clio::run::u64 remaining = 0;
   {
     clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+    // Count only the targets that live on THIS container's node: with a
+    // neighborhood > 1 each device is also registered by its neighbors (and
+    // an attached pool by every node), and the broadcast sums every node's
+    // answer, so counting all of them multiplied the capacity.
+    const clio::run::u32 me = container_id_;
     registered_targets_.for_each(
-        [&total, &remaining](const clio::run::PoolId & /*key*/, const TargetInfo &t) {
+        [&total, &remaining, me](const clio::run::PoolId & /*key*/,
+                                 const TargetInfo &t) {
+          if (t.target_query_.IsDirectHashMode() &&
+              t.target_query_.GetHash() != me) {
+            return;
+          }
           total += t.max_capacity_;
           remaining += t.remaining_space_;
         });

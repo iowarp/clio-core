@@ -612,8 +612,10 @@ clio::run::TaskResume Runtime::GetStats(clio::run::shared_ptr<GetStatsTask> &tas
 
   if (transport_) {
     task->remaining_size_ = transport_->GetRemainingSize();
+    task->total_size_ = transport_->GetCapacity();
   } else {
     task->remaining_size_ = 0;
+    task->total_size_ = 0;
   }
 
   // Expose the latest ML-predicted TTL so the CTE can make

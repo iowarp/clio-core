@@ -493,6 +493,26 @@ bool Runtime::LoadMemberManifest(std::vector<MemberManifestEntry> &out) const {
 // Method handlers
 //===========================================================================
 
+clio::run::TaskResume Runtime::QueryMemberSlots(clio::run::bdev::Client client,
+                                                clio::run::PoolQuery q,
+                                                clio::run::u64 &slots,
+                                                bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = false;
+  slots = 0;
+  auto st = client.AsyncGetStats(q);
+  CLIO_CO_AWAIT(st);
+  if (st->return_code_ != 0) CLIO_CO_RETURN;
+  // The device's own allocatable size (safe_bdev never allocates through the
+  // member's allocator, so remaining == total for a member).
+  const clio::run::u64 bytes =
+      st->total_size_ != 0 ? st->total_size_ : st->remaining_size_;
+  slots = bytes > kSuperblockSize ? (bytes - kSuperblockSize) / kChunkLen : 0;
+  ok = true;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 std::vector<Runtime::DataSeatSpec> Runtime::BuildDataMemberPlan(
     const CreateParams &params,
     const std::vector<MemberManifestEntry> &manifest) const {
@@ -553,20 +573,20 @@ clio::run::TaskResume Runtime::SeatDataMember(DataSeatSpec spec, int col,
          col, desc.pool_name_);
     CLIO_CO_RETURN;
   }
-  auto stats = data_clients_.back().AsyncGetStats();
-  CLIO_CO_AWAIT(stats);
-  if (stats->return_code_ != 0) {
+  clio::run::u64 cap_slots = 0;
+  bool qok = false;
+  CLIO_CO_AWAIT(QueryMemberSlots(data_clients_.back(), MemberQuery(slot),
+                                 cap_slots, qok));
+  if (!qok) {
     HLOG(kError, "safe_bdev Create: GetStats failed for member '{}'",
          desc.pool_name_);
     rc = 1;
     CLIO_CO_RETURN;
   }
-  const clio::run::u64 remaining = stats->remaining_size_;
-  const clio::run::u64 avail =
-      (remaining > kSuperblockSize) ? (remaining - kSuperblockSize) : 0;
+  const clio::run::u64 avail = cap_slots * kChunkLen;
   data_members_.push_back(slot);
   MemberAlloc a;
-  a.cap_slots_ = avail / kChunkLen;
+  a.cap_slots_ = cap_slots;
   data_alloc_.push_back(std::move(a));
 
   MemberSuperblock sb;
@@ -823,6 +843,14 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     }
   }
   parity_level_ = static_cast<clio::run::u32>(parity_members_.size());
+  for (size_t j = 0; j < parity_members_.size(); ++j) {
+    clio::run::u64 slots = 0;
+    bool qok = false;
+    CLIO_CO_AWAIT(QueryMemberSlots(parity_clients_[j], ParityQuery(j), slots,
+                                   qok));
+    if (qok) parity_members_[j].cap_slots_ = slots;
+  }
+  ClampDataCaps();
 
   // NOTE: dirty_slots_ stays EMPTY on restart. Parity is durably persisted on
   // the parity members (they are real bdevs that survive the reboot), and the
@@ -1296,21 +1324,40 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::GetStats(clio::run::shared_ptr<GetStatsTask> &task) {
-  CLIO_TASK_BODY_BEGIN
-  // Full aggregate capacity: every active data member contributes its own
-  // remaining slots (bump headroom + reusable frees). No stranding.
-  clio::run::u64 remaining = 0;
-  {
-    // data_alloc_ is mutated by concurrent AllocateBlocks/FreeBlocks.
-    std::lock_guard<std::mutex> alloc_g(alloc_mu_);
-    for (size_t d = 0; d < data_alloc_.size(); ++d) {
-      if (data_members_[d].state_ == ec::EcState::kActive) {
-        remaining += data_alloc_[d].RemainingSlots() * kChunkLen;
-      }
+void Runtime::ArrayCapacity(clio::run::u64 *total,
+                            clio::run::u64 *remaining) {
+  *total = 0;
+  *remaining = 0;
+  // data_alloc_ is mutated by concurrent AllocateBlocks/FreeBlocks.
+  std::lock_guard<std::mutex> alloc_g(alloc_mu_);
+  for (size_t d = 0; d < data_alloc_.size(); ++d) {
+    if (data_members_[d].state_ == ec::EcState::kActive) {
+      *remaining += data_alloc_[d].RemainingSlots() * kChunkLen;
+      *total += data_alloc_[d].cap_slots_ * kChunkLen;
+    } else {
+      // Its data is still stored (reconstructable): it stays "used", and
+      // only its free space leaves the array.
+      *total += data_alloc_[d].live_.size() * kChunkLen;
     }
   }
+}
+
+clio::run::TaskResume Runtime::GetStats(clio::run::shared_ptr<GetStatsTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  // The array's usable capacity (after parity: data members only, each
+  // clamped to what the parity members cover) and what is left of it. A
+  // down member keeps only its live chunks in the total (they are still
+  // stored, served degraded) and none of its free space: it takes no
+  // allocations. A passive container of a distributed array holds
+  // none of it and answers zeros (callers count the home's answer).
+  clio::run::u64 remaining = 0;
+  clio::run::u64 total = 0;
+  if (IsHome()) {
+    FaultMembersOnDeadNodes();
+    ArrayCapacity(&total, &remaining);
+  }
   task->remaining_size_ = remaining;
+  task->total_size_ = total;
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -1342,7 +1389,7 @@ clio::run::TaskResume Runtime::AddBdev(clio::run::shared_ptr<AddBdevTask> &task)
 
     for (size_t i = 0; i < data_clients_.size(); ++i) {
       if (data_members_[i].state_ != ec::EcState::kActive) continue;
-      auto stats = data_clients_[i].AsyncGetStats();
+      auto stats = data_clients_[i].AsyncGetStats(DataQuery(i));
       CLIO_CO_AWAIT(stats);
       if (stats->return_code_ == 0 && stats->predicted_ttl_days_ < lowest_ttl) {
         lowest_ttl = stats->predicted_ttl_days_;
@@ -1352,7 +1399,7 @@ clio::run::TaskResume Runtime::AddBdev(clio::run::shared_ptr<AddBdevTask> &task)
     }
     for (size_t i = 0; i < parity_clients_.size(); ++i) {
       if (parity_members_[i].state_ != ec::EcState::kActive) continue;
-      auto stats = parity_clients_[i].AsyncGetStats();
+      auto stats = parity_clients_[i].AsyncGetStats(ParityQuery(i));
       CLIO_CO_AWAIT(stats);
       if (stats->return_code_ == 0 && stats->predicted_ttl_days_ < lowest_ttl) {
         lowest_ttl = stats->predicted_ttl_days_;
@@ -1415,19 +1462,21 @@ clio::run::TaskResume Runtime::AddBdev(clio::run::shared_ptr<AddBdevTask> &task)
     // so new writes land on it and dirty the slots they widen, which BuildParity
     // re-parities. Existing data on other members is untouched.
     data_clients_.emplace_back(task->member_pool_id_);
-    auto stats = data_clients_.back().AsyncGetStats();
-    CLIO_CO_AWAIT(stats);
-    if (stats->return_code_ != 0) {
+    MemberSlot probe;
+    probe.node_id_ = task->node_id_;
+    clio::run::u64 cap_slots = 0;
+    bool qok = false;
+    CLIO_CO_AWAIT(QueryMemberSlots(data_clients_.back(), MemberQuery(probe),
+                                   cap_slots, qok));
+    if (!qok) {
       HLOG(kError, "safe_bdev AddBdev: GetStats failed for data member '{}'",
            task->pool_name_.str());
       data_clients_.pop_back();
       task->return_code_ = 1;
       CLIO_CO_RETURN;
     }
-    const clio::run::u64 remaining = stats->remaining_size_;
-    const clio::run::u64 avail =
-        (remaining > kSuperblockSize) ? (remaining - kSuperblockSize) : 0;
-    const clio::run::u64 cap_slots = avail / kChunkLen;
+    // A data slot needs its parity slot on every parity member.
+    cap_slots = std::min(cap_slots, MinParityCap());
 
     const int new_col = static_cast<int>(data_members_.size());
     MemberSlot slot;
@@ -1512,6 +1561,23 @@ clio::run::TaskResume Runtime::AddBdev(clio::run::shared_ptr<AddBdevTask> &task)
   // every written slot so BuildParity computes the new parity column off the
   // critical path.
   parity_clients_.emplace_back(task->member_pool_id_);
+  clio::run::u64 par_slots = 0;
+  {
+    MemberSlot probe;
+    probe.node_id_ = task->node_id_;
+    bool qok = false;
+    CLIO_CO_AWAIT(QueryMemberSlots(parity_clients_.back(), MemberQuery(probe),
+                                   par_slots, qok));
+    if (!qok || par_slots < MaxDataHighWater()) {
+      // Parity for slots already written would land past its end.
+      HLOG(kError, "safe_bdev AddBdev: parity member '{}' holds {} slots, "
+           "the data already uses {}; refused", task->pool_name_.str(),
+           par_slots, MaxDataHighWater());
+      parity_clients_.pop_back();
+      task->return_code_ = 5;
+      CLIO_CO_RETURN;
+    }
+  }
   MemberSlot slot;
   slot.pool_id_ = task->member_pool_id_;
   slot.pool_name_ = task->pool_name_.str();
@@ -1519,9 +1585,14 @@ clio::run::TaskResume Runtime::AddBdev(clio::run::shared_ptr<AddBdevTask> &task)
   slot.role_ = ec::EcRole::kParity;
   slot.state_ = ec::EcState::kActive;
   slot.index_ = static_cast<int>(parity_level_);
+  slot.cap_slots_ = par_slots;
   const size_t new_j = parity_members_.size();
   parity_members_.push_back(slot);
   ++parity_level_;
+  {
+    std::lock_guard<std::mutex> g(alloc_mu_);
+    ClampDataCaps();  // no data slot may outgrow this parity member
+  }
 
   {
     std::lock_guard<std::mutex> g(slot_mu_);
@@ -1782,9 +1853,41 @@ clio::run::TaskResume Runtime::RecoverBdev(clio::run::shared_ptr<RecoverBdevTask
   const bool is_data = (failed_col >= 0);
   const int idx = is_data ? failed_col : failed_par;
 
+  // Size the replacement BEFORE seating it: it must hold every slot the
+  // member already used (a data member's own, or -- for parity -- any data
+  // member's), or rebuilt chunks would land past its end.
+  clio::run::u64 new_slots = 0;
+  {
+    MemberSlot probe;
+    probe.node_id_ = task->node_id_;
+    bool qok = false;
+    CLIO_CO_AWAIT(QueryMemberSlots(clio::run::bdev::Client(task->new_pool_id_),
+                                   MemberQuery(probe), new_slots, qok));
+    const clio::run::u64 need =
+        is_data ? data_alloc_[static_cast<size_t>(idx)].high_water_
+                : MaxDataHighWater();
+    if (!qok || new_slots < need) {
+      HLOG(kError, "safe_bdev RecoverBdev: replacement '{}' holds {} slots, "
+           "the member needs {}; refused", task->pool_name_.str(), new_slots,
+           need);
+      task->return_code_ = 5;
+      CLIO_CO_RETURN;
+    }
+  }
+
   auto &client = is_data ? data_clients_[static_cast<size_t>(idx)]
                          : parity_clients_[static_cast<size_t>(idx)];
   client = clio::run::bdev::Client(task->new_pool_id_);
+  {
+    // The member now has the replacement's capacity, not the old disk's.
+    std::lock_guard<std::mutex> g(alloc_mu_);
+    if (is_data) {
+      data_alloc_[static_cast<size_t>(idx)].cap_slots_ = new_slots;
+    } else {
+      parity_members_[static_cast<size_t>(idx)].cap_slots_ = new_slots;
+    }
+    ClampDataCaps();
+  }
   MemberSlot &m = is_data ? data_members_[static_cast<size_t>(idx)]
                           : parity_members_[static_cast<size_t>(idx)];
   m.pool_id_ = task->new_pool_id_;
@@ -2041,17 +2144,22 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> pk(sbuf);
-    // 15 = the 14 scalar stats below plus the trailing "members" array. The
+    // 17 = the 16 scalar stats below plus the trailing "members" array. The
     // count was 14 while 15 pairs were packed, so a spec-conforming unpacker
     // (msgpack::unpack reads exactly the declared map) silently DROPPED the
     // members roster -- found by the dashboard's member-table test (#990).
-    pk.pack_map(15);
+    clio::run::u64 cap_total = 0, cap_remaining = 0;
+    if (IsHome()) ArrayCapacity(&cap_total, &cap_remaining);
+    pk.pack_map(17);
     pk.pack("pool_name");     pk.pack(pool_name_);
     pk.pack("max_failures");  pk.pack(max_failures_);
     pk.pack("data_count");
     pk.pack(static_cast<clio::run::u32>(data_members_.size()));
     pk.pack("parity_level");  pk.pack(parity_level_);
     pk.pack("total_slots");   pk.pack(total_slots);
+    // Usable bytes, as GetStats (and so df) reports them.
+    pk.pack("total_capacity");      pk.pack(cap_total);
+    pk.pack("remaining_capacity");  pk.pack(cap_remaining);
     pk.pack("written_slots"); pk.pack(written);
     pk.pack("dirty_slots");   pk.pack(dirty);
     pk.pack("reattached_members"); pk.pack(reattached_members_);

@@ -107,6 +107,7 @@ struct Args {
   bool tags_only = false;        // print only unique tag names
   bool tag_query = false;        // TagQuery: match tags, blobs or not
   bool blob_info = false;        // --blob-info: tag_re = "major.minor"
+  bool local = false;            // --local: blob-info of THIS node's copy
 };
 
 static void PrintUsage(const char *prog) {
@@ -133,6 +134,8 @@ static void PrintUsage(const char *prog) {
     "                       name: print its primary blocks and the size and\n"
     "                       leading bytes of the primary and replica 1\n"
     "                       (e.g. clio-fs directories)\n"
+    "  --local              with --blob-info: this node's copy, not the\n"
+    "                       owner's (routing Local instead of by hash)\n"
     "  --help               Show this message\n"
     "\n"
     "Examples:\n"
@@ -199,6 +202,8 @@ static Args ParseArgs(int argc, char **argv) {
     } else if (flag == "--blob-info") {
       a.blob_info = true;
       ++mode_count;
+    } else if (flag == "--local") {
+      a.local = true;
     } else if (flag == "--tag-query") {
       a.tag_query = true;
       ++mode_count;
@@ -354,7 +359,9 @@ static int RunBlobInfo(clio::cte::core::Client *client, const Args &a) {
     std::cerr << "error: --blob-info needs a tag id major.minor\n";
     return 1;
   }
-  auto info = client->AsyncGetBlobInfo(tag, a.blob_re);
+  const clio::run::PoolQuery q =
+      a.local ? clio::run::PoolQuery::Local() : clio::run::PoolQuery::Dynamic();
+  auto info = client->AsyncGetBlobInfo(tag, a.blob_re, q);
   info.Wait();
   std::cout << "primary rc=" << info->GetReturnCode()
             << " total_size=" << info->total_size_ << "\n";
@@ -364,8 +371,7 @@ static int RunBlobInfo(clio::cte::core::Client *client, const Args &a) {
               << " size=" << b.block_size_ << "\n";
   }
   for (int rep = 0; rep <= 1; ++rep) {
-    auto sz = client->AsyncGetBlobSize(tag, a.blob_re,
-                                       clio::run::PoolQuery::Dynamic(), rep);
+    auto sz = client->AsyncGetBlobSize(tag, a.blob_re, q, rep);
     sz.Wait();
     std::cout << "replica " << rep << ": size rc=" << sz->GetReturnCode()
               << " size=" << sz->size_;
@@ -374,8 +380,7 @@ static int RunBlobInfo(clio::cte::core::Client *client, const Args &a) {
       clio::cte::core::Context ctx;
       ctx.replica_ = rep;
       auto g = client->AsyncGetBlob(tag, a.blob_re, 0, buf.size(), 0u,
-                                    buf.data(), clio::run::PoolQuery::Dynamic(),
-                                    ctx);
+                                    buf.data(), q, ctx);
       g.Wait();
       size_t zeros = 0;
       for (char c : buf) zeros += (c == 0);

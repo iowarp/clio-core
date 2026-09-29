@@ -40,6 +40,7 @@
 #include <clio_runtime/bdev/transports/block_allocator.h>  // bdev::Block, LiveBlock
 #include <clio_runtime/bdev/bdev_alloc_log.h>  // bdev::AllocatorLog (reused WAL)
 
+#include <algorithm>
 #include <cstdio>  // std::FILE
 #include <map>
 #include <memory>
@@ -266,6 +267,9 @@ class Runtime : public clio::run::Container {
     // completes. RebuildMember is idempotent, so re-running after a crash is
     // safe.
     bool recovering_ = false;
+    /** PARITY members: chunk slots the device holds (a data member's
+     *  slot s needs parity slot s on every parity member). */
+    clio::run::u64 cap_slots_ = ~0ULL;
   };
 
   // Per-DATA-member slot allocator (parallel to data_members_, indexed by data
@@ -473,6 +477,48 @@ class Runtime : public clio::run::Container {
     }
     return mem;  // ascending by construction
   }
+
+  /** @return slots of the smallest parity member (~0 with none): no data
+   *  member may allocate a slot past it -- its parity would not fit. */
+  clio::run::u64 MinParityCap() const {
+    clio::run::u64 m = ~0ULL;
+    for (const auto &p : parity_members_) m = std::min(m, p.cap_slots_);
+    return m;
+  }
+  /** @return the highest slot any data member has used (+1). */
+  clio::run::u64 MaxDataHighWater() const {
+    clio::run::u64 m = 0;
+    for (const auto &a : data_alloc_) m = std::max(m, a.high_water_);
+    return m;
+  }
+  /** Clamp every data member's capacity to what the parity members can
+   *  cover (never below what it already used). Caller holds alloc_mu_ or
+   *  has exclusive access (Create). */
+  void ClampDataCaps() {
+    const clio::run::u64 lim = MinParityCap();
+    for (auto &a : data_alloc_) {
+      a.cap_slots_ = std::max(a.high_water_, std::min(a.cap_slots_, lim));
+    }
+  }
+  /**
+   * Chunk slots a member device can hold, from its bdev stats.
+   * @param client the member's bdev client
+   * @param q route to the member
+   * @param slots receives the slot count
+   * @param ok receives false if the device did not answer
+   */
+  clio::run::TaskResume QueryMemberSlots(clio::run::bdev::Client client,
+                                         clio::run::PoolQuery q,
+                                         clio::run::u64 &slots, bool &ok);
+
+  /**
+   * The array's usable capacity and what is left of it: active data members
+   * contribute their (parity-clamped) slots, a down member only its live
+   * chunks -- still stored, served degraded -- and no free space.
+   * @param total receives usable bytes
+   * @param remaining receives free usable bytes
+   */
+  void ArrayCapacity(clio::run::u64 *total, clio::run::u64 *remaining);
 
   /** @return true if any data member holding a chunk of stripe `s` is down. */
   bool StripeHasDownMember(clio::run::u64 s) const {

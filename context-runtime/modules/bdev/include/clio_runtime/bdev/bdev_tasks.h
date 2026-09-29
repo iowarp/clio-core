@@ -803,16 +803,22 @@ struct GetStatsTask : public clio::run::Task {
   // Task-specific data (no inputs)
   OUT PerfMetrics metrics_;            // Performance metrics
   OUT clio::run::u64 remaining_size_;  // Remaining allocatable space
+  /** The device's allocatable capacity (its configured size -- not the
+   *  physical disk under a file bdev). 0 = unknown. */
+  OUT clio::run::u64 total_size_;
   OUT clio::run::u32 predicted_ttl_days_; // Predicted device TTL in days (999999 = healthy)
 
   /** SHM default constructor */
-  GetStatsTask() : clio::run::Task(), remaining_size_(0), predicted_ttl_days_(999999) {}
+  GetStatsTask()
+      : clio::run::Task(), remaining_size_(0), total_size_(0),
+        predicted_ttl_days_(999999) {}
 
   /** Emplace constructor */
   explicit GetStatsTask(const clio::run::TaskId &task_node,
                         const clio::run::PoolId &pool_id,
                         const clio::run::PoolQuery &pool_query)
-      : clio::run::Task(task_node, pool_id, pool_query, 10), remaining_size_(0), predicted_ttl_days_(999999) {
+      : clio::run::Task(task_node, pool_id, pool_query, 10), remaining_size_(0),
+        total_size_(0), predicted_ttl_days_(999999) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -832,7 +838,7 @@ struct GetStatsTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(metrics_, remaining_size_, predicted_ttl_days_);
+    ar(metrics_, remaining_size_, total_size_, predicted_ttl_days_);
   }
 
   /**
@@ -845,6 +851,7 @@ struct GetStatsTask : public clio::run::Task {
     // Copy GetStatsTask-specific fields
     metrics_ = other->metrics_;
     remaining_size_ = other->remaining_size_;
+    total_size_ = other->total_size_;
     predicted_ttl_days_ = other->predicted_ttl_days_;
   }
 
@@ -865,6 +872,7 @@ struct GetStatsTask : public clio::run::Task {
       metrics_ = replica->metrics_;
     }
     remaining_size_ += replica->remaining_size_;
+    total_size_ += replica->total_size_;
     if (replica->predicted_ttl_days_ < predicted_ttl_days_) {
       predicted_ttl_days_ = replica->predicted_ttl_days_;
     }

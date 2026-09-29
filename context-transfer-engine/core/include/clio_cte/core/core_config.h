@@ -71,7 +71,7 @@ struct PerformanceConfig {
         // saturating the bdev pool's worker (50 ms default fired
         // 20×/s and starved real PutBlob/GetBlob traffic on a single-
         // worker setup).
-        stat_targets_period_ms_(5000),
+        stat_targets_period_ms_(1000),
         max_concurrent_operations_(64),
         score_threshold_(0.7f),
         score_difference_threshold_(0.05f),

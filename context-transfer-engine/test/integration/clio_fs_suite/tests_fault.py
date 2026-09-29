@@ -727,10 +727,20 @@ def blob_info_notes(ctx, path, verdict):
   failed verify mismatched in, to tell a stale copy from a lost one."""
   mm = verdict.get('mismatch') if isinstance(verdict, dict) else None
   page = (mm or {}).get('offset', 0) // MiB
+  # Re-read at once from every node: a transient window (a stale liveness
+  # view routing to a restart-emptied copy) reads right again seconds later.
+  off = (mm or {}).get('offset', 0)
+  for i in range(len(ctx.hosts)):
+    rv = ctx.a(i).call('read_hex', timeout=30, path=path, off=off, length=16)
+    ctx.note(f'node{i} re-read @{off}: '
+             f'{str(rv.get("ret") if rv.get("ok") else rv.get("err"))[:60]}')
   ino = ctx.ok(0, 'stat', path=path)['ino']
   tag = f'{ino >> 32}.{ino & 0xffffffff}'
   cl = ctx.cl
   for h in ctx.hosts:
-    _, out = sh(h, f'{cl.env_prefix()} {cl.bin_dir}/cte_search {tag} {page} '
-                   f'--blob-info 2>&1 | grep -v INFO | tail -4', timeout=60)
-    ctx.note(f'{h} page {page} of {tag}: {out.strip()}')
+    for flag in ('', ' --local'):
+      _, out = sh(h, f'{cl.env_prefix()} {cl.bin_dir}/cte_search {tag} {page} '
+                     f'--blob-info{flag} 2>&1 | grep -v INFO | tail -4',
+                  timeout=60)
+      ctx.note(f'{h} page {page} of {tag}{flag or " (owner)"}: '
+               f'{out.strip()}')

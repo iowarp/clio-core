@@ -291,7 +291,10 @@ compose:
     # Performance tuning ---------------------------------------------------
     # Uncomment to override defaults:
     # performance:
-    #   stat_targets_period_ms: 50       # Periodic StatTargets interval (ms)
+    #   stat_targets_period_ms: 1000     # How often each target's capacity and
+    #                                    # free space are re-read from its bdev
+    #                                    # (df and the dashboard follow within
+    #                                    # one period). Default 1000.
     #   max_concurrent_operations: 64    # Max concurrent I/O operations
     #   score_threshold: 0.7             # Score above which blobs are reorganized
     #   score_difference_threshold: 0.05 # Min score delta to trigger reorganization
