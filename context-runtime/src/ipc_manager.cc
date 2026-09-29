@@ -4478,6 +4478,18 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     // If container is plugged or gone, add to retry queue
     if (result == RouteResult::Retry || result == RouteResult::Dne) {
       Worker *worker = CLIO_CUR_WORKER;
+      auto *pool_manager = CLIO_POOL_MANAGER;
+      if (task_ptr->IsPeriodic() && pool_manager != nullptr &&
+          pool_manager->WasDestroyed(task_ptr->pool_id_)) {
+        // A periodic task of a pool destroyed on this node: nothing will
+        // ever serve it again. Retrying re-queued it -- and logged an error
+        // -- every period, forever. Retire it.
+        HLOG(kDebug, "RouteTask: retiring periodic task of destroyed pool {} "
+             "(method {})", task_ptr->pool_id_, task_ptr->method_);
+        task_ptr->SetReturnCode(1);
+        future.SetComplete();
+        return result;
+      }
       HLOG(kError, "RouteTask: RouteLocal returned {} for pool={} method={}, worker={}",
            (int)result, task_ptr->pool_id_, task_ptr->method_,
            worker ? (int)worker->GetId() : -1);

@@ -502,6 +502,11 @@ void PoolManager::PlugContainer(PoolId pool_id, ContainerId container_id) {
   }
 }
 
+bool PoolManager::WasDestroyed(PoolId pool_id) const {
+  std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
+  return destroyed_pools_.count(pool_id) != 0;
+}
+
 bool PoolManager::HasPool(PoolId pool_id) const {
   if (!is_initialized_) {
     return false;
@@ -791,6 +796,11 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
 
   // Store pool metadata first so InitAddressMap can find it
   UpdatePoolMetadata(target_pool_id, pool_info);
+  {
+    // Re-created under a destroyed id: its periodic tasks are live again.
+    std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
+    destroyed_pools_.erase(target_pool_id);
+  }
 
   // Initialize address map for the pool (ContainerId -> NodeId)
   InitAddressMap(target_pool_id, num_containers);
@@ -966,6 +976,10 @@ TaskResume PoolManager::DestroyPool(PoolId pool_id) {
   // Remove pool metadata
   ErasePoolMetadata(pool_id);
   LogPool(false, PoolLogEntry{pool_id, "", "", "", false});
+  {
+    std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
+    destroyed_pools_.insert(pool_id);
+  }
 
   HLOG(kInfo, "PoolManager: Destroyed complete pool {}", pool_id);
   CLIO_CO_RETURN;

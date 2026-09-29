@@ -35,6 +35,7 @@
 #define CLIO_RUNTIME_INCLUDE_MANAGERS_POOL_MANAGER_H_
 
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -226,6 +227,15 @@ class PoolManager {
    * @return true if pool exists locally, false otherwise
    */
   bool HasPool(PoolId pool_id) const;
+
+  /**
+   * Whether this node destroyed `pool_id` and has not re-created it since.
+   * Routing retires a periodic task of such a pool instead of retrying it
+   * forever.
+   * @param pool_id Pool identifier
+   * @return true if the pool was destroyed here and not re-created
+   */
+  bool WasDestroyed(PoolId pool_id) const;
 
   /**
    * Check if a specific container exists on this node for a given pool
@@ -477,6 +487,9 @@ class PoolManager {
   // always scoped to a single map operation so the lock is never held across
   // CreatePool's co_await.
   mutable std::shared_mutex pool_metadata_mutex_;
+  /** Pools destroyed on this node and not re-created (see WasDestroyed). */
+  std::unordered_set<PoolId> destroyed_pools_;
+  mutable std::mutex destroyed_pools_mu_;
 
   // Pool ID counter for generating unique IDs (used as minor number)
   std::atomic<u32> next_pool_minor_{5}; // Start at 5 for safety, 1 reserved for admin
