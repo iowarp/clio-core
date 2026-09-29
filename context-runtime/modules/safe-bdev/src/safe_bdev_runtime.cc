@@ -125,7 +125,7 @@ clio::run::TaskResume Runtime::WriteDataSegment(size_t d, clio::run::u64 offset,
   }
   std::memcpy(buf.ptr_, src, len);
   auto fut = data_clients_[d].AsyncWrite(
-      MemberQuery(), MemberBlocks(offset, len),
+      DataQuery(d), MemberBlocks(offset, len),
       buf.shm_.template Cast<void>(), len);
   CLIO_CO_AWAIT(fut);
   ok = (fut->return_code_ == 0) && (fut->bytes_written_ == len);
@@ -146,7 +146,7 @@ clio::run::TaskResume Runtime::ReadDataSegment(size_t d, clio::run::u64 offset,
     CLIO_CO_RETURN;
   }
   auto fut = data_clients_[d].AsyncRead(
-      MemberQuery(), MemberBlocks(offset, len),
+      DataQuery(d), MemberBlocks(offset, len),
       buf.shm_.template Cast<void>(), len);
   CLIO_CO_AWAIT(fut);
   if (fut->return_code_ == 0 && fut->bytes_read_ == len) {
@@ -193,7 +193,7 @@ clio::run::TaskResume Runtime::WriteSuperblock(bool is_parity, size_t idx,
 
   // The superblock lives at absolute offset 0 on the member.
   auto &client = is_parity ? parity_clients_[idx] : data_clients_[idx];
-  auto fut = client.AsyncWrite(MemberQuery(),
+  auto fut = client.AsyncWrite(is_parity ? ParityQuery(idx) : DataQuery(idx),
                                MemberBlocks(0, kSuperblockSize),
                                buf.shm_.template Cast<void>(), kSuperblockSize);
   CLIO_CO_AWAIT(fut);
@@ -221,7 +221,7 @@ clio::run::TaskResume Runtime::ReadSuperblock(bool is_parity, size_t idx,
   }
   std::memset(buf.ptr_, 0, kSuperblockSize);
   auto &client = is_parity ? parity_clients_[idx] : data_clients_[idx];
-  auto fut = client.AsyncRead(MemberQuery(), MemberBlocks(0, kSuperblockSize),
+  auto fut = client.AsyncRead(is_parity ? ParityQuery(idx) : DataQuery(idx), MemberBlocks(0, kSuperblockSize),
                               buf.shm_.template Cast<void>(), kSuperblockSize);
   CLIO_CO_AWAIT(fut);
   if (fut->return_code_ == 0 && fut->bytes_read_ == kSuperblockSize) {
@@ -293,7 +293,7 @@ clio::run::TaskResume Runtime::ReconstructStripe(
       CLIO_CO_RETURN;
     }
     auto fut = parity_clients_[static_cast<size_t>(j)].AsyncRead(
-        MemberQuery(), MemberBlocks(off, kChunkLen),
+        ParityQuery(static_cast<size_t>(j)), MemberBlocks(off, kChunkLen),
         rbuf.shm_.template Cast<void>(), kChunkLen);
     CLIO_CO_AWAIT(fut);
     rd_ok = (fut->return_code_ == 0) && (fut->bytes_read_ == kChunkLen);
@@ -614,10 +614,46 @@ clio::run::TaskResume Runtime::SeatDataMember(DataSeatSpec spec, int col,
   CLIO_TASK_BODY_END
 }
 
+void Runtime::FaultMembersOnDeadNodes() {
+  if (!distributed_) return;
+  auto *ipc = CLIO_IPC;
+  bool changed = false;
+  auto check = [&](MemberSlot &m, const char *kind, size_t i) {
+    if (m.state_ != ec::EcState::kActive || ipc->IsAlive(m.node_id_)) return;
+    m.state_ = ec::EcState::kFaulty;
+    changed = true;
+    HLOG(kWarning, "safe_bdev: {} member {} ('{}') is on dead node {}; "
+         "marked faulty", kind, i, m.pool_name_, m.node_id_);
+  };
+  for (size_t i = 0; i < data_members_.size(); ++i) {
+    check(data_members_[i], "data", i);
+  }
+  for (size_t i = 0; i < parity_members_.size(); ++i) {
+    check(parity_members_[i], "parity", i);
+  }
+  if (changed) PersistMemberManifest();
+}
+
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
 
   CreateParams params = task->GetParams();
+
+  // A distributed array runs on its first member's node; the pool's other
+  // containers stay passive (their nodes' disks are reached from the home).
+  distributed_ = params.distributed_;
+  is_home_ = true;
+  if (distributed_ && !params.members_.empty()) {
+    auto *ipc = CLIO_IPC;
+    is_home_ = ipc->GetNodeId() == params.members_[0].node_id_;
+    if (!is_home_) {
+      HLOG(kInfo, "safe_bdev Create: distributed array '{}' runs on node {}; "
+           "this container is passive", task->pool_name_.str(),
+           params.members_[0].node_id_);
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+  }
 
   max_failures_ = params.max_failures_;
   parity_level_ = 0;
@@ -792,9 +828,9 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // unclean shutdown is the same bounded gap as the pre-existing design.
 
   if (alloc_log_.enabled()) {
-    client_.AsyncFlushAllocLog(MemberQuery(), kFlushAllocLogPeriodUs);
+    client_.AsyncFlushAllocLog(SelfQuery(), kFlushAllocLogPeriodUs);
   }
-  client_.AsyncBuildParity(MemberQuery(), /*max_batch=*/0,
+  client_.AsyncBuildParity(SelfQuery(), /*max_batch=*/0,
                            /*period_us=*/kBuildParityPeriodUs);
 
   CLIO_CO_AWAIT(ResumeRecoveries());
@@ -808,6 +844,13 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 clio::run::TaskResume Runtime::AllocateBlocks(
     clio::run::shared_ptr<AllocateBlocksTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  if (!IsHome()) {
+    HLOG(kError, "safe_bdev: {} sent to a passive container of a distributed "
+         "array; route it to the array's home node", "AllocateBlocks");
+    task->return_code_ = kNotHomeRc;
+    CLIO_CO_RETURN;
+  }
+  FaultMembersOnDeadNodes();
   // Per-chunk round-robin over the non-full, active data members. Each kChunkLen
   // chunk of the request takes one whole SLOT on the next member; the returned
   // block bands (member,slot) into a logical offset (§ addressing). A multi-
@@ -882,6 +925,13 @@ clio::run::TaskResume Runtime::AllocateBlocks(
 
 clio::run::TaskResume Runtime::FreeBlocks(clio::run::shared_ptr<FreeBlocksTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  if (!IsHome()) {
+    HLOG(kError, "safe_bdev: {} sent to a passive container of a distributed "
+         "array; route it to the array's home node", "FreeBlocks");
+    task->return_code_ = kNotHomeRc;
+    CLIO_CO_RETURN;
+  }
+  FaultMembersOnDeadNodes();
   // Decode each block to (member d, slot s) and release the slot on that member.
   // The slot leaves the stripe -> if the stripe still has members, mark it dirty
   // so BuildParity re-derives the narrower parity; if it is now empty, forget it.
@@ -954,7 +1004,7 @@ clio::run::TaskResume Runtime::StoreDegradedParity(clio::run::u64 s,
     codec->EncodeParityShard(j, ptrs, kChunkLen,
                              reinterpret_cast<uint8_t *>(buf.ptr_));
     auto fut = parity_clients_[static_cast<size_t>(j)].AsyncWrite(
-        MemberQuery(), MemberBlocks(SlotPhysOffset(s), kChunkLen),
+        ParityQuery(static_cast<size_t>(j)), MemberBlocks(SlotPhysOffset(s), kChunkLen),
         buf.shm_.template Cast<void>(), kChunkLen);
     CLIO_CO_AWAIT(fut);
     const bool wok =
@@ -971,6 +1021,13 @@ clio::run::TaskResume Runtime::StoreDegradedParity(clio::run::u64 s,
 
 clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  if (!IsHome()) {
+    HLOG(kError, "safe_bdev: {} sent to a passive container of a distributed "
+         "array; route it to the array's home node", "Write");
+    task->return_code_ = kNotHomeRc;
+    CLIO_CO_RETURN;
+  }
+  FaultMembersOnDeadNodes();
   if (data_members_.empty() || task->blocks_.size() == 0) {
     task->return_code_ = 1;
     CLIO_CO_RETURN;
@@ -994,21 +1051,19 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   bool dispatch_ok = true;
   // Stripes with a chunk of this write on a DOWN member, reconstructed
   // before any member write lands (see DegradedStripe).
+  // A stripe counts as degraded when ANY of its data members is down, not
+  // only when this write lands on the down one: a plain write into it would
+  // dirty the slot, and a dirty stripe with a down member can never be
+  // rebuilt -- the down member's chunk there would become unreadable.
   std::map<clio::run::u64, DegradedStripe> degraded;
   for (size_t bi = 0; bi < task->blocks_.size(); ++bi) {
     const clio::run::u64 off = task->blocks_[bi].offset_;
     const clio::run::u64 len = task->blocks_[bi].size_;
-    clio::run::u32 d = 0;
-    clio::run::u64 s0 = 0, w0 = 0;
-    Unband(off, d, s0, w0);
-    if (len == 0 || d >= data_members_.size() ||
-        data_members_[d].state_ == ec::EcState::kActive) {
-      continue;
-    }
+    if (len == 0) continue;
     for (clio::run::u64 c = off / kChunkLen; c <= (off + len - 1) / kChunkLen;
          ++c) {
       const clio::run::u64 s = c % kSlotsPerMember;
-      if (degraded.count(s) != 0) continue;
+      if (degraded.count(s) != 0 || !StripeHasDownMember(s)) continue;
       bool lok = false;
       CLIO_CO_AWAIT(LoadDegradedStripe(s, degraded[s], lok));
       if (!lok) {
@@ -1070,7 +1125,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
       std::memcpy(seg.ptr_, data.ptr_ + buf_pos, len);
       bufs.push_back(seg);
       futs.push_back(data_clients_[d].AsyncWrite(
-          MemberQuery(), MemberBlocks(phys, len),
+          DataQuery(d), MemberBlocks(phys, len),
           seg.shm_.template Cast<void>(), len));
     }
     // Mark every slot this block spans dirty (contiguous slots on member d).
@@ -1126,6 +1181,13 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
 
 clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  if (!IsHome()) {
+    HLOG(kError, "safe_bdev: {} sent to a passive container of a distributed "
+         "array; route it to the array's home node", "Read");
+    task->return_code_ = kNotHomeRc;
+    CLIO_CO_RETURN;
+  }
+  FaultMembersOnDeadNodes();
   if (data_members_.empty() || task->blocks_.size() == 0) {
     task->return_code_ = 1;
     CLIO_CO_RETURN;
@@ -1251,6 +1313,13 @@ clio::run::TaskResume Runtime::GetStats(clio::run::shared_ptr<GetStatsTask> &tas
 
 clio::run::TaskResume Runtime::AddBdev(clio::run::shared_ptr<AddBdevTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  if (!IsHome()) {
+    HLOG(kError, "safe_bdev: {} sent to a passive container of a distributed "
+         "array; route it to the array's home node", "AddBdev");
+    task->return_code_ = kNotHomeRc;
+    CLIO_CO_RETURN;
+  }
+  FaultMembersOnDeadNodes();
 
   const bool as_parity = (task->as_parity_ != 0);
 
@@ -1307,7 +1376,7 @@ clio::run::TaskResume Runtime::AddBdev(clio::run::shared_ptr<AddBdevTask> &task)
       // onto the new pool, then bring the slot back online pointing at
       // the new pool.
       auto rec_fut = client_.AsyncRecoverBdev(
-          MemberQuery(), failed_pool_id, task->pool_name_.str(),
+          SelfQuery(), failed_pool_id, task->pool_name_.str(),
           task->node_id_, task->member_pool_id_);
       CLIO_CO_AWAIT(rec_fut);
 
@@ -1477,6 +1546,13 @@ clio::run::TaskResume Runtime::AddBdev(clio::run::shared_ptr<AddBdevTask> &task)
 
 clio::run::TaskResume Runtime::RemoveBdev(clio::run::shared_ptr<RemoveBdevTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  if (!IsHome()) {
+    HLOG(kError, "safe_bdev: {} sent to a passive container of a distributed "
+         "array; route it to the array's home node", "RemoveBdev");
+    task->return_code_ = kNotHomeRc;
+    CLIO_CO_RETURN;
+  }
+  FaultMembersOnDeadNodes();
   const auto apply = [&](MemberSlot &m, const char *kind, size_t idx) {
     if (task->was_faulty_ != 0) {
       m.state_ = ec::EcState::kFaulty;
@@ -1635,8 +1711,10 @@ clio::run::TaskResume Runtime::RebuildMember(bool is_data, int idx, bool &ok,
     }
 
     recovery_ops_in_flight_.store(1, std::memory_order_relaxed);
-    auto fut = client.AsyncWrite(MemberQuery(),
-                                 MemberBlocks(SlotPhysOffset(s), kChunkLen),
+    const clio::run::PoolQuery q =
+        is_data ? DataQuery(static_cast<size_t>(idx))
+                : ParityQuery(static_cast<size_t>(idx));
+    auto fut = client.AsyncWrite(q, MemberBlocks(SlotPhysOffset(s), kChunkLen),
                                  buf.shm_.template Cast<void>(), kChunkLen);
     CLIO_CO_AWAIT(fut);
     const bool wok =
@@ -1658,6 +1736,13 @@ clio::run::TaskResume Runtime::RebuildMember(bool is_data, int idx, bool &ok,
 
 clio::run::TaskResume Runtime::RecoverBdev(clio::run::shared_ptr<RecoverBdevTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  if (!IsHome()) {
+    HLOG(kError, "safe_bdev: {} sent to a passive container of a distributed "
+         "array; route it to the array's home node", "RecoverBdev");
+    task->return_code_ = kNotHomeRc;
+    CLIO_CO_RETURN;
+  }
+  FaultMembersOnDeadNodes();
 
   int failed_col = -1;
   int failed_par = -1;
@@ -1778,6 +1863,13 @@ clio::run::TaskResume Runtime::ResumeRecoveries() {
 
 clio::run::TaskResume Runtime::BuildParity(clio::run::shared_ptr<BuildParityTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  if (!IsHome()) {
+    HLOG(kError, "safe_bdev: {} sent to a passive container of a distributed "
+         "array; route it to the array's home node", "BuildParity");
+    task->return_code_ = kNotHomeRc;
+    CLIO_CO_RETURN;
+  }
+  FaultMembersOnDeadNodes();
   if (parity_level_ == 0) {
     std::lock_guard<std::mutex> g(slot_mu_);
     dirty_slots_.clear();
@@ -1858,7 +1950,7 @@ clio::run::TaskResume Runtime::BuildParity(clio::run::shared_ptr<BuildParityTask
       codec->EncodeParityShard(j, ptrs, kChunkLen,
                                reinterpret_cast<uint8_t *>(buf.ptr_));
       auto fut = parity_clients_[static_cast<size_t>(j)].AsyncWrite(
-          MemberQuery(), MemberBlocks(SlotPhysOffset(s), kChunkLen),
+          ParityQuery(static_cast<size_t>(j)), MemberBlocks(SlotPhysOffset(s), kChunkLen),
           buf.shm_.template Cast<void>(), kChunkLen);
       CLIO_CO_AWAIT(fut);
       wr_ok = (fut->return_code_ == 0) && (fut->bytes_written_ == kChunkLen);

@@ -350,6 +350,11 @@ class Runtime : public clio::run::Container {
   mutable std::mutex member_log_mu_;
   mutable clio::run::u64 member_log_records_ = 0;
   clio::run::u32 max_failures_;           // Fault-tolerance target (M == m_max)
+  /** Return code of an operation sent to a passive (non-home) container of
+   *  a distributed array. */
+  static constexpr clio::run::u32 kNotHomeRc = 40;
+  bool distributed_ = false;  // CreateParams::distributed_
+  bool is_home_ = true;       // distributed: this node runs the array
   clio::run::u32 parity_level_;           // Parity members added so far (m)
   clio::run::u32 reattached_members_;     // Members recognized as ours at Create
 
@@ -463,6 +468,17 @@ class Runtime : public clio::run::Container {
     return mem;  // ascending by construction
   }
 
+  /** @return true if any data member holding a chunk of stripe `s` is down. */
+  bool StripeHasDownMember(clio::run::u64 s) const {
+    for (int d : StripeMembers(s)) {
+      if (data_members_[static_cast<size_t>(d)].state_ !=
+          ec::EcState::kActive) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** RS codec for a stripe of width `k` (RS(k, max_failures_)); cached. */
   ec::ReedSolomon *GetCodec(int k) {
     auto it = rs_cache_.find(k);
@@ -475,8 +491,34 @@ class Runtime : public clio::run::Container {
     return it->second.get();
   }
 
-  /** Per-member pool query (members are independent local bdev pools). */
-  clio::run::PoolQuery MemberQuery() const { return clio::run::PoolQuery::Local(); }
+  /** Query for this array's own pool (periodic self-tasks). */
+  clio::run::PoolQuery SelfQuery() const { return clio::run::PoolQuery::Local(); }
+  /**
+   * Route to one member's container: its node's in a distributed array,
+   * this node's otherwise.
+   * @param m the member
+   */
+  clio::run::PoolQuery MemberQuery(const MemberSlot &m) const {
+    return distributed_ ? clio::run::PoolQuery::Physical(m.node_id_)
+                        : clio::run::PoolQuery::Local();
+  }
+  /** @return route to data member `d`. */
+  clio::run::PoolQuery DataQuery(size_t d) const {
+    return MemberQuery(data_members_[d]);
+  }
+  /** @return route to parity member `j`. */
+  clio::run::PoolQuery ParityQuery(size_t j) const {
+    return MemberQuery(parity_members_[j]);
+  }
+  /**
+   * Distributed array: mark every active member whose node has died faulty
+   * (the node-level "unplugged disk"); degraded reads and writes then route
+   * around it until RecoverBdev. No-op for a node-local array.
+   */
+  void FaultMembersOnDeadNodes();
+  /** @return true if this container runs the array (always, unless the
+   *  array is distributed and this is not its home node). */
+  bool IsHome() const { return !distributed_ || is_home_; }
 
   /**
    * Automatic down-detection for a DATA member. Inspect a member-bdev future's

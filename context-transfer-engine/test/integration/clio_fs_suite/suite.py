@@ -159,6 +159,7 @@ def load_tests():
   import tests_fault  # noqa: F401
   import tests_apps  # noqa: F401
   import tests_perf  # noqa: F401
+  import tests_bdev  # noqa: F401
 
 
 def slurm_hosts():
@@ -180,7 +181,8 @@ def snapshot_bins(src, dst):
   import shutil
   os.makedirs(dst, exist_ok=True)
   for name in os.listdir(src):
-    if name in ('clio_run', 'clio_cte_fuse', 'cte_search') or (
+    if name in ('clio_run', 'clio_cte_fuse', 'cte_search',
+                'clio_safe_bdev_dist_stress') or (
         name.startswith('lib') and '.so' in name):
       sp = os.path.join(src, name)
       dp = os.path.join(dst, name)

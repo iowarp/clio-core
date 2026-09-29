@@ -167,6 +167,31 @@ compose:
   #   bdev_type: file                    # Options: file, ram, hbm, pinned, noop
   #   capacity: "100GB"
 
+  # === Safe Block Device (erasure-coded array over member bdevs) ===
+  # One logical device over several member bdevs (disks): data members plus
+  # up to max_failures dedicated Reed-Solomon parity members. Members are
+  # bdev pools created before it (above); more can be added at runtime
+  # (AddBdev), failed ones rebuilt onto new disks (RecoverBdev). With
+  # alloc_log set, the array's membership -- including members added or
+  # replaced at runtime -- is restored from "<alloc_log>.members" at restart.
+  # - mod_name: clio_safe_bdev
+  #   pool_name: safe_array
+  #   pool_query: local
+  #   pool_id: "350.0"
+  #   max_failures: 1               # parity members the array may take
+  #   alloc_log: "/var/lib/clio/safe_array.alog"
+  #   # distributed: false          # true: each member is the container of
+  #   #                             # its pool on node `node_id` (disks on
+  #   #                             # different nodes); the array runs on the
+  #   #                             # first member's node, and a member whose
+  #   #                             # node dies is marked faulty. false: every
+  #   #                             # member is this node's container.
+  #   members:
+  #     - pool_name: "/mnt/nvme/disk0.bin"
+  #       node_id: 0
+  #       pool_id_major: 301
+  #       pool_id_minor: 0
+
   # === Context Assimilation Engine (CAE) ===
   # Assimilation / discovery entrypoint at its own pool 400.0
   # (clio::cae::core::kCaePoolId). CEE calls ParseOmni here; CAE forwards

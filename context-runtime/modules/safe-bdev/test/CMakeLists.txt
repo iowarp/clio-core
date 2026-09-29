@@ -176,3 +176,26 @@ if(CLIO_CORE_ENABLE_TESTS)
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10502;CLIO_NUM_THREADS=16"
   )
 endif()
+
+# Distributed driver (not a ctest: it needs a live multi-node runtime and a
+# harness that kills a node; see test/integration/safe-bdev/dist_stress.py).
+add_executable(clio_safe_bdev_dist_stress test_safe_bdev_dist_stress.cc)
+target_include_directories(clio_safe_bdev_dist_stress PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test
+  ${CLIO_RUN_ROOT}/modules/admin/include
+  ${CLIO_RUN_ROOT}/modules/bdev/include
+  ${CLIO_RUN_ROOT}/modules/safe-bdev/include
+)
+target_link_libraries(clio_safe_bdev_dist_stress
+  clio_admin_client
+  clio_bdev_client
+  clio_safe_bdev_client
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+set_target_properties(clio_safe_bdev_dist_stress PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
