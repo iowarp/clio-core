@@ -45,6 +45,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -375,6 +376,11 @@ class Runtime : public clio::run::Container {
   // (never held across a co_await). A slot is safe to reconstruct only when NOT
   // dirty -- degraded reads / recovery refuse a dirty (unprotected) slot.
   std::set<clio::run::u64> dirty_slots_;
+  /** Bumped by every dirty mark of a slot (slot_mu_). BuildParity clears a
+   *  slot only if its generation is unchanged since it read the stripe: a
+   *  write that re-dirtied it mid-build (the slot already in the set, so the
+   *  insert was a no-op) must not be erased along with the stale parity. */
+  std::unordered_map<clio::run::u64, clio::run::u64> slot_gen_;
   std::set<clio::run::u64> written_slots_;
   mutable std::mutex slot_mu_;
 
@@ -403,6 +409,7 @@ class Runtime : public clio::run::Container {
     std::lock_guard<std::mutex> g(slot_mu_);
     written_slots_.insert(s);
     dirty_slots_.insert(s);
+    ++slot_gen_[s];
   }
   /** Note a slot no longer holds data (last live chunk freed): drop it from the
    *  written set once no data member has it live. Caller ensures liveness check

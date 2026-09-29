@@ -136,3 +136,43 @@ install(TARGETS ${SAFE_BDEV_TEST_TARGET}
 
 message(STATUS "Safe-bdev module tests configured:")
 message(STATUS "  Test target: ${SAFE_BDEV_TEST_TARGET}")
+
+# Membership stress (grow 1 -> 2 -> 4 data disks, unplug, recover, with and
+# without concurrent I/O). File members stand in for disks; their backing
+# files go under $CLIO_SAFE_STRESS_DIR.
+set(SAFE_BDEV_STRESS_TARGET clio_safe_bdev_stress_tests)
+add_executable(${SAFE_BDEV_STRESS_TARGET} test_safe_bdev_stress.cc)
+target_include_directories(${SAFE_BDEV_STRESS_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test
+  ${CLIO_RUN_ROOT}/modules/admin/include
+  ${CLIO_RUN_ROOT}/modules/bdev/include
+  ${CLIO_RUN_ROOT}/modules/safe-bdev/include
+)
+target_link_libraries(${SAFE_BDEV_STRESS_TARGET}
+  clio_admin_runtime
+  clio_admin_client
+  clio_bdev_runtime
+  clio_bdev_client
+  clio_safe_bdev_runtime
+  clio_safe_bdev_client
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+set_target_properties(${SAFE_BDEV_STRESS_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+if(CLIO_CORE_ENABLE_TESTS)
+  add_test(
+    NAME cr_safe_bdev_stress_tests
+    COMMAND ${SAFE_BDEV_STRESS_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_safe_bdev_stress_tests PROPERTIES
+    TIMEOUT 600
+    LABELS "msan_skip"
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10502;CLIO_NUM_THREADS=16"
+  )
+endif()

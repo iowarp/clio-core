@@ -936,9 +936,16 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   }
 
   bool ok = dispatch_ok;
-  for (auto &f : futs) {
+  for (size_t i = 0; i < futs.size(); ++i) {
+    auto &f = futs[i];
     CLIO_CO_AWAIT(f);
-    if (f->return_code_ != 0) {
+    // A member write is done only when all its bytes are: a short count
+    // (or a zero return code with nothing written) must fail the write, not
+    // mark the stripe dirty over bytes that never landed.
+    if (f->return_code_ != 0 || f->bytes_written_ != f->length_) {
+      HLOG(kWarning, "safe_bdev Write: member write {} of {} returned rc={} "
+           "with {} of {} bytes", i, futs.size(), f->return_code_,
+           f->bytes_written_, f->length_);
       ok = false;
     }
   }
@@ -1229,10 +1236,18 @@ clio::run::TaskResume Runtime::AddBdev(clio::run::shared_ptr<AddBdevTask> &task)
       CLIO_CO_AWAIT(WriteSuperblock(/*is_parity=*/false,
                                     static_cast<size_t>(new_col), wr_ok));
       if (!wr_ok) {
-        HLOG(kWarning,
-             "safe_bdev AddBdev: superblock write failed for new data member "
-             "'{}' (seated; will be re-stamped on next attach)",
+        // The member cannot be written: refuse it, as for the other
+        // unusable-member cases above, instead of seating a column whose
+        // every write would fail.
+        HLOG(kError,
+             "safe_bdev AddBdev: REFUSING data member '{}' -- its superblock "
+             "cannot be written",
              task->pool_name_.str());
+        data_members_.pop_back();
+        data_alloc_.pop_back();
+        data_clients_.pop_back();
+        task->return_code_ = 3;
+        CLIO_CO_RETURN;
       }
     }
 
@@ -1274,6 +1289,7 @@ clio::run::TaskResume Runtime::AddBdev(clio::run::shared_ptr<AddBdevTask> &task)
     std::lock_guard<std::mutex> g(slot_mu_);
     for (clio::run::u64 s : written_slots_) {
       dirty_slots_.insert(s);
+      ++slot_gen_[s];
     }
   }
   HLOG(kInfo,
@@ -1285,10 +1301,14 @@ clio::run::TaskResume Runtime::AddBdev(clio::run::shared_ptr<AddBdevTask> &task)
     bool wr_ok = false;
     CLIO_CO_AWAIT(WriteSuperblock(/*is_parity=*/true, new_j, wr_ok));
     if (!wr_ok) {
-      HLOG(kWarning,
+      HLOG(kError,
            "safe_bdev AddBdev: superblock write failed for new parity member "
-           "'{}' (member seated; will be re-stamped on next attach)",
+           "'{}'; seated faulty",
            task->pool_name_.str());
+      parity_members_[new_j].state_ = ec::EcState::kFaulty;
+      PersistMemberManifest();
+      task->return_code_ = 3;
+      CLIO_CO_RETURN;
     }
   }
 
@@ -1613,10 +1633,12 @@ clio::run::TaskResume Runtime::BuildParity(clio::run::shared_ptr<BuildParityTask
   // dirty set knows every stripe is protected. A slot that cannot be built (a
   // stripe member is down) is left dirty for a later pass.
   std::vector<clio::run::u64> batch;
+  std::unordered_map<clio::run::u64, clio::run::u64> batch_gen;
   {
     std::lock_guard<std::mutex> g(slot_mu_);
     for (clio::run::u64 s : dirty_slots_) {
       batch.push_back(s);
+      batch_gen[s] = slot_gen_[s];
       if (task->max_batch_ != 0 &&
           batch.size() >= static_cast<size_t>(task->max_batch_)) {
         break;
@@ -1691,8 +1713,12 @@ clio::run::TaskResume Runtime::BuildParity(clio::run::shared_ptr<BuildParityTask
       continue;  // leave dirty; retry next pass
     }
     {
+      // Clear only if no write re-dirtied the slot while this pass read it;
+      // otherwise the parity just written may predate that write.
       std::lock_guard<std::mutex> g2(slot_mu_);
-      dirty_slots_.erase(s);
+      if (slot_gen_[s] == batch_gen[s]) {
+        dirty_slots_.erase(s);
+      }
     }
     ++built;
   }
