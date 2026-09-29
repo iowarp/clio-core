@@ -236,6 +236,14 @@ class Array {
   bool WriteOne(clio::run::u32 seed);
 
   /**
+   * Overwrite every recorded block in place with a new pattern (as the CTE
+   * rewrites a page), recording the new seed.
+   * @param seed_base first new seed
+   * @return blocks the array refused
+   */
+  size_t OverwriteAll(clio::run::u32 seed_base);
+
+  /**
    * Read back every recorded block.
    * @param what label for the log
    * @return blocks that failed to read or mismatched
@@ -294,6 +302,31 @@ bool Array::WriteOne(clio::run::u32 seed) {
   std::lock_guard<std::mutex> g(mu_);
   stored_.push_back(std::move(s));
   return true;
+}
+
+size_t Array::OverwriteAll(clio::run::u32 seed_base) {
+  std::lock_guard<std::mutex> g(mu_);
+  size_t refused = 0;
+  for (size_t i = 0; i < stored_.size(); ++i) {
+    Stored &st = stored_[i];
+    const clio::run::u32 seed = seed_base + static_cast<clio::run::u32>(i);
+    clio::run::priv::vector<bd::Block> wb(CTP_MALLOC);
+    for (const auto &b : st.blocks) wb.push_back(b);
+    const auto pat = Pattern(seed);
+    auto buf = CLIO_IPC->AllocateBuffer(kIoLen);
+    if (buf.IsNull()) return stored_.size();
+    memcpy(buf.ptr_, pat.data(), kIoLen);
+    auto w = safe_.AsyncWrite(clio::run::PoolQuery::Dynamic(), wb,
+                              buf.shm_.template Cast<void>(), kIoLen);
+    w.Wait();
+    if (w->GetReturnCode() == 0 && w->bytes_written_ == kIoLen) {
+      st.seed = seed;
+    } else {
+      ++refused;
+    }
+    CLIO_IPC->FreeBuffer(buf);
+  }
+  return refused;
 }
 
 bool Array::ReadMatches(const Stored &s) {
@@ -536,6 +569,34 @@ TEST_CASE("safe_bdev_stress_restart_after_growth", "[safe_bdev][stress]") {
   WriteMany(a, &seed, 20);
   REQUIRE(a.BuildParity() == 0);
   REQUIRE(a.VerifyAll("after restart + recovery") == 0);
+}
+
+TEST_CASE("safe_bdev_stress_overwrite_while_degraded", "[safe_bdev][stress]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  Array a("sbs_ovw",
+          97000u + static_cast<clio::run::u32>(getpid() & 0xFFF) * 64);
+  clio::run::u32 seed = 1;
+  Disk d[4], p0;
+  REQUIRE(a.NewDisk(&d[0]));
+  REQUIRE(a.Create(d[0], 1) == 0);
+  for (int i = 1; i < 4; ++i) {
+    REQUIRE(a.NewDisk(&d[i]));
+    REQUIRE(a.Add(d[i], false) == 0);
+  }
+  REQUIRE(a.NewDisk(&p0));
+  REQUIRE(a.Add(p0, true) == 0);
+  WriteMany(a, &seed, 40);
+  REQUIRE(a.BuildParity() == 0);
+  // A disk dies; the pages on it are rewritten while it is gone. The new
+  // bytes must live in the parity (nothing else holds them).
+  REQUIRE(a.Unplug(d[1]) == 0);
+  REQUIRE(a.OverwriteAll(5000) == 0);
+  REQUIRE(a.VerifyAll("overwritten while d1 down") == 0);
+  Disk d1b;
+  REQUIRE(a.NewDisk(&d1b));
+  REQUIRE(a.Recover(d[1], d1b) == 0);
+  REQUIRE(a.VerifyAll("d1 recovered after overwrites") == 0);
 }
 
 TEST_CASE("safe_bdev_stress_io_during_membership", "[safe_bdev][stress]") {

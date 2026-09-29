@@ -601,6 +601,35 @@ class Runtime : public clio::run::Container {
   void WriteMemberRecord(std::FILE *f, const MemberSlot &m,
                          clio::run::u32 role) const;
 
+  /**
+   * A stripe a write touches while one of its data members is down, held
+   * across the write: reconstructed BEFORE any member write lands (its
+   * parity is still consistent then), overlaid with every byte the write
+   * puts in the stripe, and re-encoded into every live parity shard after.
+   */
+  struct DegradedStripe {
+    std::vector<int> members;                  // StripeMembers(s)
+    std::vector<std::vector<uint8_t>> chunks;  // by stripe position
+  };
+  /**
+   * Reconstruct stripe `s` for a degraded write. Refuses (ok=false) when its
+   * parity is stale: the down member's bytes would then exist nowhere.
+   * @param s slot
+   * @param out receives the stripe
+   * @param ok receives success
+   */
+  clio::run::TaskResume LoadDegradedStripe(clio::run::u64 s,
+                                           DegradedStripe &out, bool &ok);
+  /**
+   * Re-encode a degraded stripe's parity and write every live shard.
+   * @param s slot
+   * @param st the overlaid stripe
+   * @param ok receives true if at least one parity shard was written
+   */
+  clio::run::TaskResume StoreDegradedParity(clio::run::u64 s,
+                                            const DegradedStripe &st,
+                                            bool &ok);
+
   /** One data column to seat at Create: where it is and what state the
    *  manifest left it in. */
   struct DataSeatSpec {

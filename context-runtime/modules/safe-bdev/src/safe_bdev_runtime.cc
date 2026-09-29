@@ -913,6 +913,62 @@ clio::run::TaskResume Runtime::FreeBlocks(clio::run::shared_ptr<FreeBlocksTask> 
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::LoadDegradedStripe(clio::run::u64 s,
+                                                  DegradedStripe &out,
+                                                  bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = false;
+  if (IsSlotDirty(s)) {
+    HLOG(kError, "safe_bdev Write: slot {} has a down member and stale "
+         "parity; refusing the write (it could not be recovered)", s);
+    CLIO_CO_RETURN;
+  }
+  out.members = StripeMembers(s);
+  CLIO_CO_AWAIT(ReconstructStripe(s, out.members, /*exclude_member=*/-1,
+                                  out.chunks, ok));
+  if (!ok) {
+    HLOG(kError, "safe_bdev Write: cannot reconstruct slot {} for a write to "
+         "a down member", s);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::StoreDegradedParity(clio::run::u64 s,
+                                                   const DegradedStripe &st,
+                                                   bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = false;
+  std::vector<const uint8_t *> ptrs(st.chunks.size());
+  for (size_t i = 0; i < st.chunks.size(); ++i) ptrs[i] = st.chunks[i].data();
+  ec::ReedSolomon *codec = GetCodec(static_cast<int>(st.members.size()));
+  auto *ipc = CLIO_IPC;
+  int written = 0;
+  for (int j = 0; j < static_cast<int>(parity_level_); ++j) {
+    if (parity_members_[static_cast<size_t>(j)].state_ !=
+        ec::EcState::kActive) {
+      continue;
+    }
+    ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(kChunkLen);
+    if (buf.IsNull()) CLIO_CO_RETURN;
+    codec->EncodeParityShard(j, ptrs, kChunkLen,
+                             reinterpret_cast<uint8_t *>(buf.ptr_));
+    auto fut = parity_clients_[static_cast<size_t>(j)].AsyncWrite(
+        MemberQuery(), MemberBlocks(SlotPhysOffset(s), kChunkLen),
+        buf.shm_.template Cast<void>(), kChunkLen);
+    CLIO_CO_AWAIT(fut);
+    const bool wok =
+        fut->return_code_ == 0 && fut->bytes_written_ == kChunkLen;
+    MaybeFaultParity(static_cast<size_t>(j), fut->io_error_);
+    ipc->FreeBuffer(buf);
+    if (!wok) CLIO_CO_RETURN;
+    ++written;
+  }
+  ok = written > 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   CLIO_TASK_BODY_BEGIN
   if (data_members_.empty() || task->blocks_.size() == 0) {
@@ -934,7 +990,34 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   std::vector<clio::run::Future<WriteTask>> futs;
   std::vector<ctp::ipc::FullPtr<char>> bufs;
   std::set<clio::run::u64> touched;
+  // (block index, its offset in the task buffer) for blocks on down members.
   bool dispatch_ok = true;
+  // Stripes with a chunk of this write on a DOWN member, reconstructed
+  // before any member write lands (see DegradedStripe).
+  std::map<clio::run::u64, DegradedStripe> degraded;
+  for (size_t bi = 0; bi < task->blocks_.size(); ++bi) {
+    const clio::run::u64 off = task->blocks_[bi].offset_;
+    const clio::run::u64 len = task->blocks_[bi].size_;
+    clio::run::u32 d = 0;
+    clio::run::u64 s0 = 0, w0 = 0;
+    Unband(off, d, s0, w0);
+    if (len == 0 || d >= data_members_.size() ||
+        data_members_[d].state_ == ec::EcState::kActive) {
+      continue;
+    }
+    for (clio::run::u64 c = off / kChunkLen; c <= (off + len - 1) / kChunkLen;
+         ++c) {
+      const clio::run::u64 s = c % kSlotsPerMember;
+      if (degraded.count(s) != 0) continue;
+      bool lok = false;
+      CLIO_CO_AWAIT(LoadDegradedStripe(s, degraded[s], lok));
+      if (!lok) {
+        task->bytes_written_ = 0;
+        task->return_code_ = 1;
+        CLIO_CO_RETURN;
+      }
+    }
+  }
 
   for (size_t bi = 0; bi < task->blocks_.size() && dispatch_ok; ++bi) {
     const clio::run::u64 off = task->blocks_[bi].offset_;
@@ -953,7 +1036,32 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     }
     const clio::run::u64 phys = SlotPhysOffset(s0) + within;
 
-    if (data_members_[d].state_ == ec::EcState::kActive) {
+    // Overlay this block's bytes on any degraded stripe it lands in (the
+    // down member's chunk gets them only this way).
+    for (clio::run::u64 cur = off; cur < off + len;) {
+      clio::run::u32 dd = 0;
+      clio::run::u64 slot = 0, w = 0;
+      Unband(cur, dd, slot, w);
+      const clio::run::u64 n =
+          std::min<clio::run::u64>(off + len - cur, kChunkLen - w);
+      auto it = degraded.find(slot);
+      if (it != degraded.end()) {
+        const auto &mem = it->second.members;
+        for (size_t p = 0; p < mem.size(); ++p) {
+          if (mem[p] == static_cast<int>(dd)) {
+            std::memcpy(it->second.chunks[p].data() + w,
+                        data.ptr_ + buf_pos + (cur - off), n);
+          }
+        }
+      }
+      cur += n;
+    }
+    if (data_members_[d].state_ != ec::EcState::kActive) {
+      buf_pos += len;  // down member: its bytes live in the parity only
+      bytes_written += len;
+      continue;
+    }
+    {
       ctp::ipc::FullPtr<char> seg = ipc->AllocateBuffer(len);
       if (seg.IsNull()) {
         dispatch_ok = false;
@@ -992,6 +1100,15 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   for (auto &b : bufs) {
     ipc->FreeBuffer(b);
   }
+  // Degraded stripes: the healthy chunks have landed; write the parity of
+  // the overlaid stripe. These slots come out with current parity and are
+  // not dirtied (a dirty slot with a down member is unreadable).
+  for (auto &kv : degraded) {
+    if (!ok) break;
+    bool pok = false;
+    CLIO_CO_AWAIT(StoreDegradedParity(kv.first, kv.second, pok));
+    ok = pok;
+  }
   if (!ok) {
     task->bytes_written_ = 0;
     task->return_code_ = 1;
@@ -999,7 +1116,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   }
 
   for (clio::run::u64 s : touched) {
-    MarkSlotDirty(s);
+    if (degraded.count(s) == 0) MarkSlotDirty(s);
   }
   task->bytes_written_ = bytes_written;
   task->return_code_ = 0;
