@@ -660,6 +660,24 @@ clio::run::TaskResume Runtime::SetLifespan(
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::FlushAllocLog(
+    clio::run::shared_ptr<FlushAllocLogTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  if (transport_) {
+    transport_->FlushAllocLog();
+  }
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::Sync(clio::run::shared_ptr<SyncTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  task->return_code_ = (transport_ && !transport_->Sync()) ? 1 : 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Final perf-stats save (unthrottled) so the next session inherits

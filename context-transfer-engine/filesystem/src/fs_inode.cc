@@ -121,11 +121,28 @@ clio::run::TaskResume Runtime::FlushInodes() {
     clio::cte::core::Context meta_ctx;
     meta_ctx.op_flags_ |= clio::cte::core::Context::kMetaBlob;
     for (const auto &w : work) {
+      // An inode record (size, mode, symlink target) goes straight to a
+      // non-volatile tier: on the RAM tier a restart dropped it, and with it
+      // every file nobody had fsync'd -- a symlink vanished even across a
+      // graceful restart. A deployment with no such tier keeps it in RAM.
+      meta_ctx.min_persistence_level_ = inode_volatile_only_ ? 0 : 1;
       auto p = cte_.AsyncPutBlob(FsUnpack(w.first), kInodeBlob, 0,
                                  w.second.size(), w.second.data(), -1.0f,
                                  meta_ctx, 0u,
                                  clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(p);
+      if (p->GetReturnCode() != 0 && !inode_volatile_only_) {
+        meta_ctx.min_persistence_level_ = 0;
+        p = cte_.AsyncPutBlob(FsUnpack(w.first), kInodeBlob, 0,
+                              w.second.size(), w.second.data(), -1.0f,
+                              meta_ctx, 0u, clio::run::PoolQuery::Dynamic());
+        CLIO_CO_AWAIT(p);
+        if (p->GetReturnCode() == 0) {
+          HLOG(kWarning, "filesystem: no non-volatile CTE tier accepts inode "
+               "records; they stay in RAM and do not survive a restart");
+          inode_volatile_only_ = true;
+        }
+      }
       std::lock_guard<std::mutex> g(meta_mu_);
       inode_storing_.erase(w.first);
       if (p->GetReturnCode() != 0) {

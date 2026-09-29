@@ -91,6 +91,13 @@ class RecordLog {
   void Append(clio::run::u32 type, const std::string &payload);
 
   /**
+   * fsync the log so every appended record survives power loss (Append
+   * alone survives only a process crash).
+   * @return true on success, or when the log is not open
+   */
+  bool Sync();
+
+  /**
    * Atomically replace the log with `records` (write temp, fsync, rename)
    * and keep appending to the new file.
    * @param records full snapshot of the live state

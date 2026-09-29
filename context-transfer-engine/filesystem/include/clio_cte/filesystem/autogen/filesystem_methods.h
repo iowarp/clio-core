@@ -44,8 +44,9 @@ GLOBAL_CROSS_CONST clio::run::u32 kChown = 35;            // set file owner uid/
 GLOBAL_CROSS_CONST clio::run::u32 kMultiCreate = 36;      // batched file creation (sieve flush)
 GLOBAL_CROSS_CONST clio::run::u32 kAdvanceSize = 37;      // tag-keyed logical-size advance
 GLOBAL_CROSS_CONST clio::run::u32 kShardOp = 38;          // internal: op on hash-owned ns state
+GLOBAL_CROSS_CONST clio::run::u32 kSyncMeta = 39;         // fsync the namespace log (broadcast)
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 39;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 40;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {

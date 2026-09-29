@@ -8,6 +8,7 @@
 #include <clio_runtime/bdev/transports/fs_bdev_transport.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/manager.h>
 #include <clio_runtime/worker.h>
 #include <clio_runtime/work_orchestrator.h>
 #include <fcntl.h>
@@ -201,11 +202,122 @@ bool FsBdevTransport::Init(const CreateParams& params,
   size_t num_workers = work_orchestrator ? work_orchestrator->GetWorkerCount() : 16;
   allocator_.Init(num_workers, file_size, params.alignment_);
 
+  return OpenAllocLog(params);
+}
+
+bool FsBdevTransport::OpenAllocLog(const CreateParams& params) {
+  // An explicit alloc_log always recovers. The default log recovers only on
+  // a runtime restart: a fresh start has no metadata referencing the old
+  // bytes, so their allocations are garbage and the log starts empty.
+  const bool explicit_path = !params.alloc_log_path_.empty();
+  const std::string path =
+      explicit_path ? params.alloc_log_path_ : file_path_ + ".alloc_log";
+  auto *manager = CLIO_RUNTIME_MANAGER;
+  const bool recover =
+      explicit_path || (manager != nullptr && manager->is_restart_);
+  if (!recover) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+  if (!alloc_log_.Open(path, recover)) {
+    HLOG(kError, "Cannot open allocator log {} for bdev {} ({})", path,
+         file_path_, strerror(errno));
+    return false;
+  }
+  has_alloc_log_ = true;
+  const std::vector<LiveBlock> &live = alloc_log_.live(/*group_id=*/0);
+  if (!live.empty()) {
+    std::vector<std::pair<clio::run::u64, clio::run::u64>> ext;
+    ext.reserve(live.size());
+    for (const auto &b : live) {
+      ext.emplace_back(b.offset, b.size);
+    }
+    allocator_.InitFromLive(ext);
+    HLOG(kInfo, "bdev {}: recovered {} live blocks from {}; {} bytes free",
+         file_path_, live.size(), path, allocator_.GetRemainingSize());
+  }
+  // Start from a compact log so it tracks the live set, not history.
+  alloc_log_.Compact();
+  sync_stop_ = false;
+  sync_thread_ = std::thread(&FsBdevTransport::AllocLogSyncLoop, this);
   return true;
+}
+
+bool FsBdevTransport::Sync() {
+  // Data first, then the allocator state that references it: a crash in
+  // between leaves synced bytes in blocks the log may not show yet (the
+  // CTE's own WAL still does), never a logged block whose bytes are lost.
+  const int fd = ::open(file_path_.c_str(), O_RDONLY);
+  if (fd < 0) {
+    HLOG(kError, "bdev Sync: cannot open {} ({})", file_path_,
+         strerror(errno));
+    return false;
+  }
+  const int rc = ::fdatasync(fd);
+  const int err = errno;
+  ::close(fd);
+  if (rc != 0) {
+    HLOG(kError, "bdev Sync: fdatasync {} failed ({})", file_path_,
+         strerror(err));
+    return false;
+  }
+  FlushAllocLog();
+  return true;
+}
+
+void FsBdevTransport::AllocLogSyncLoop() {
+  std::unique_lock<std::mutex> lock(sync_mu_);
+  while (!sync_stop_) {
+    sync_cv_.wait_for(lock, std::chrono::milliseconds(kAllocLogSyncPeriodMs),
+                      [this] { return sync_stop_; });
+    lock.unlock();
+    FlushAllocLog();
+    lock.lock();
+  }
+}
+
+void FsBdevTransport::StopAllocLogSync() {
+  {
+    std::lock_guard<std::mutex> lock(sync_mu_);
+    sync_stop_ = true;
+  }
+  sync_cv_.notify_all();
+  if (sync_thread_.joinable()) {
+    sync_thread_.join();
+  }
+}
+
+void FsBdevTransport::LogBlocks(const std::vector<Block>& blocks,
+                                bool is_free) {
+  if (!has_alloc_log_) return;
+  for (const Block &b : blocks) {
+    if (is_free) {
+      alloc_log_.LogFree(/*group_id=*/0, b.offset_, b.size_, b.block_type_);
+    } else {
+      alloc_log_.LogAlloc(/*group_id=*/0, b.offset_, b.size_, b.block_type_);
+    }
+  }
+  alloc_log_.Append();
+}
+
+void FsBdevTransport::FlushAllocLog() {
+  if (!has_alloc_log_) return;
+  alloc_log_.Flush();
+  // Compact once history dominates: the log is then bounded by ~2x the
+  // live-block count instead of growing with every allocate/free.
+  constexpr clio::run::u64 kMinCompactRecords = 4096;
+  const clio::run::u64 live = alloc_log_.live_block_count();
+  if (alloc_log_.records_on_disk() > std::max(kMinCompactRecords, 2 * live)) {
+    alloc_log_.Compact();
+  }
 }
 
 void FsBdevTransport::Destroy() {
   CleanupWorkerIOContexts();
+  StopAllocLogSync();
+  if (has_alloc_log_) {
+    alloc_log_.Close();
+  }
 }
 
 bool FsBdevTransport::AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) {
@@ -230,6 +342,8 @@ bool FsBdevTransport::AllocateBlocks(size_t size, int worker_id, std::vector<Blo
     blocks.clear();
     return false;
   }
+  // Logged BEFORE the caller can write into or reference the blocks.
+  LogBlocks(blocks, /*is_free=*/false);
   return true;
 }
 
@@ -285,6 +399,9 @@ bool FsBdevTransport::EnsureFileBacked(clio::run::u64 end_offset) {
 }
 
 void FsBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& blocks) {
+  // Logged BEFORE reuse is possible: a crash between the two leaves the
+  // blocks allocated in the log (a leak), never free while still in use.
+  LogBlocks(blocks, /*is_free=*/true);
   allocator_.FreeBlocks(worker_id, blocks);
 }
 

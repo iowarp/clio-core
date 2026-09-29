@@ -23,3 +23,4 @@ kGetStats: 14           # Get performance statistics
 kUpdate: 15             # Update GPU container with device pointers
 kSetLifespan: 16        # Inject predicted device lifespan in days
 kFlushAllocLog: 17      # Flush/compact the persistent allocator-state WAL
+kSync: 18               # Make written data and allocator state durable (fdatasync)

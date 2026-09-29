@@ -3857,6 +3857,27 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * fsync(2) for one tag - asynchronous. Broadcast by default so every
+   * container makes the blobs it holds durable (see SyncTagTask).
+   * @param tag_id tag whose blobs must become durable
+   * @param pool_query routing (default: Broadcast)
+   * @param min_persistence minimum tier level; < 0 uses the configured
+   *        flush_data_min_persistence
+   * @return future for the SyncTagTask (rc kSyncNoSpaceRc / kSyncIoRc on
+   *         failure; deferred_ = 1 when fsync_mode is "deferred")
+   */
+  clio::run::Future<SyncTagTask> AsyncSyncTag(
+      const TagId &tag_id,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast(),
+      int min_persistence = -1) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<SyncTagTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
+        min_persistence);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Asynchronous dynamic reorganize - periodic internal data-organizer driver
    * (issue #738). Spawned from the CTE server's Create() once per configured
    * organizer replica; each firing delegates to the configured DataOrganizer.

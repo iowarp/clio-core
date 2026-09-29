@@ -5361,6 +5361,97 @@ struct FlushDataTask : public clio::run::Task {
 };
 
 /**
+ * SyncTagTask - fsync(2) for one tag: make every blob of the tag durable.
+ *
+ * Broadcast so every core container handles the blobs it owns (primaries,
+ * shadows and persistent replicas alike). Each container moves any of those
+ * blobs still on a tier below the persistence level to one at or above it,
+ * syncs every bdev that holds their blocks, then syncs its metadata WAL. With
+ * performance.fsync_mode "deferred" the container does nothing and reports
+ * deferred_ = 1 so a caller can skip later syncs.
+ */
+/** SyncTag return code: a persistent tier had no room for the tag's bytes. */
+static constexpr clio::run::u32 kSyncNoSpaceRc = 28;  // ENOSPC
+/** SyncTag return code: a device sync or a read of the tag's bytes failed. */
+static constexpr clio::run::u32 kSyncIoRc = 5;  // EIO
+
+struct SyncTagTask : public clio::run::Task {
+  IN TagId tag_id_;              ///< Tag whose blobs must become durable
+  IN int min_persistence_;       ///< Minimum tier level; < 0 = config default
+  OUT clio::run::u32 deferred_;  ///< 1 when fsync_mode is "deferred"
+  OUT clio::run::u64 blobs_moved_;  ///< Blobs moved to a persistent tier
+  OUT clio::run::u64 bdevs_synced_; ///< Devices synced (summed over nodes)
+  /** Core containers that handled the sync (summed). 0 means a module in
+   *  front of the core dropped it -- nothing was made durable. */
+  OUT clio::run::u32 containers_;
+
+  /** SHM default constructor */
+  SyncTagTask()
+      : clio::run::Task(),
+        tag_id_(TagId::GetNull()),
+        min_persistence_(-1),
+        deferred_(0),
+        blobs_moved_(0),
+        bdevs_synced_(0),
+        containers_(0) {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit SyncTagTask(const clio::run::TaskId &task_id,
+                                     const clio::run::PoolId &pool_id,
+                                     const clio::run::PoolQuery &pool_query,
+                                     const TagId &tag_id,
+                                     int min_persistence = -1)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kSyncTag),
+        tag_id_(tag_id),
+        min_persistence_(min_persistence),
+        deferred_(0),
+        blobs_moved_(0),
+        bdevs_synced_(0),
+        containers_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kSyncTag;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /** Serialize IN and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, min_persistence_);
+  }
+
+  /** Serialize OUT and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(deferred_, blobs_moved_, bdevs_synced_, containers_);
+  }
+
+  /** Copy from another SyncTagTask */
+  void Copy(const ctp::ipc::FullPtr<SyncTagTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    min_persistence_ = other->min_persistence_;
+    deferred_ = other->deferred_;
+    blobs_moved_ = other->blobs_moved_;
+    bdevs_synced_ = other->bdevs_synced_;
+    containers_ = other->containers_;
+  }
+
+  /** AggregateOut: sums the counts; deferred if any container defers. */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto replica = other_base.template Cast<SyncTagTask>();
+    deferred_ |= replica->deferred_;
+    blobs_moved_ += replica->blobs_moved_;
+    bdevs_synced_ += replica->bdevs_synced_;
+    containers_ += replica->containers_;
+  }
+};
+
+/**
  * DynamicReorganizeTask - Periodic driver for the internal data organizer
  * (issue #738).
  *

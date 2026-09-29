@@ -219,6 +219,100 @@ public:
    * slot's metadata (flags, min_score) survives so the next cache write
    * refills it. freed_bytes reports the physical footprint returned.
    */
+  /** MoveBlobToPersistent outcomes. */
+  static constexpr clio::run::u32 kMoveDone = 0;         ///< moved, or nothing to move
+  static constexpr clio::run::u32 kMoveNoRoom = 1;       ///< persistent budget too small
+  static constexpr clio::run::u32 kMovePlaceFailed = 2;  ///< placement/write failed
+  static constexpr clio::run::u32 kMoveSkipped = 3;      ///< could not read the blob
+
+  /**
+   * Move one blob whose blocks sit below `target_level` onto tiers at or above
+   * it, atomically under its write token (the FlushData / SyncTag move).
+   * @param composite_key "major.minor.name" key of the blob
+   * @param tag_id the blob's tag
+   * @param blob_name the blob's name
+   * @param score placement score for the new layout
+   * @param target_level minimum persistence level to move to
+   * @param budget free bytes on qualifying tiers; debited by the move
+   * @param size OUT bytes moved (kMoveDone) or needed (kMoveNoRoom)
+   * @param rc OUT one of the kMove* outcomes
+   */
+  clio::run::TaskResume MoveBlobToPersistent(const std::string &composite_key,
+                                             const TagId &tag_id,
+                                             const std::string &blob_name,
+                                             float score, int target_level,
+                                             clio::run::u64 &budget,
+                                             clio::run::u64 &size,
+                                             clio::run::u32 &rc);
+
+  /**
+   * Place `total_size` bytes of `data` on tiers at or above `target_level`
+   * and swap them in as the blob's layout (caller holds the write token and
+   * the reader drain), then free the old layout and WAL the new one.
+   * @param blob_info blob being moved
+   * @param composite_key its "major.minor.name" key (SHM mirror)
+   * @param tag_id its tag
+   * @param blob_name its name
+   * @param score placement score
+   * @param data buffer holding the blob's current bytes
+   * @param total_size bytes in `data`
+   * @param target_level minimum persistence level
+   * @param rc OUT kMoveDone or kMovePlaceFailed
+   */
+  clio::run::TaskResume RelocateBlob(BlobInfo &blob_info,
+                                     const std::string &composite_key,
+                                     const TagId &tag_id,
+                                     const std::string &blob_name, float score,
+                                     ctp::ipc::ShmPtr<> data,
+                                     clio::run::u64 total_size,
+                                     int target_level, clio::run::u32 &rc);
+
+  /**
+   * Append a full-replacement kExtendBlob WAL record of the blob's layout.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob's name
+   * @param blob_info the blob (its blocks_ are recorded)
+   */
+  void LogBlobLayout(const TagId &tag_id, const std::string &blob_name,
+                     const BlobInfo &blob_info);
+
+  /**
+   * Whether any block sits on a target below persistence `level`. Caller
+   * holds target_lock_ (read).
+   * @param blocks blocks to check
+   * @param level persistence level
+   * @return true if at least one block is below `level`
+   */
+  bool HasBlocksBelowLevelLocked(const clio::run::priv::vector<BlobBlock> &blocks,
+                                 int level);
+
+  /**
+   * Free bytes on every target at or above persistence `level`.
+   * @param level persistence level
+   * @return summed remaining space
+   */
+  clio::run::u64 PersistentBudget(int level);
+
+  /**
+   * fsync(2) for one tag on this container (Method::kSyncTag): move the
+   * tag's blobs to a persistent tier, sync their devices, then the WAL.
+   * @param task sync task (see SyncTagTask)
+   */
+  clio::run::TaskResume SyncTag(clio::run::shared_ptr<SyncTagTask> &task);
+
+  /**
+   * Sync every non-volatile device holding a block of the named blobs
+   * (primaries and durable replicas), all in parallel.
+   * @param prefix "major.minor." key prefix of the tag
+   * @param names blob names in the tag
+   * @param synced OUT devices synced
+   * @param rc OUT 0, or 1 if any device failed to sync
+   */
+  clio::run::TaskResume SyncTagDevices(const std::string &prefix,
+                                       const std::vector<std::string> &names,
+                                       clio::run::u64 &synced,
+                                       clio::run::u32 &rc);
+
   clio::run::TaskResume ReclaimCacheReplica(const TagId &tag_id,
                                             const std::string &blob_name,
                                             clio::run::u64 &freed_bytes,
@@ -1086,6 +1180,18 @@ private:
    * restored blob -- and silently overwrite its still-live bytes.
    */
   void ReserveRestoredBlockSpace();
+
+  /**
+   * Register the graceful-stop hook that moves RAM-tier data to a persistent
+   * tier (FlushData) before the runtime exits. Removed again by Destroy.
+   */
+  void RegisterStopFlush();
+
+  /** fsync, close and drop every WAL shard (teardown). */
+  void SyncAndCloseLogs();
+
+  /** RuntimeManager stop-hook id (0 = none registered). */
+  clio::run::u64 stop_hook_id_ = 0;
 
   /**
    * Forget every restored REPLICA_CACHE layout -- called once during Create()

@@ -136,6 +136,11 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume Close(clio::run::shared_ptr<CloseTask> &task);
   clio::run::TaskResume MultiCreate(clio::run::shared_ptr<MultiCreateTask> &task);
   clio::run::TaskResume AdvanceSize(clio::run::shared_ptr<AdvanceSizeTask> &task);
+  /**
+   * fsync this container's namespace log (Method::kSyncMeta).
+   * @param task sync task; rc 5 (EIO) if the fsync failed
+   */
+  clio::run::TaskResume SyncMeta(clio::run::shared_ptr<SyncMetaTask> &task);
   clio::run::TaskResume Read(clio::run::shared_ptr<ReadTask> &task);
   clio::run::TaskResume Write(clio::run::shared_ptr<WriteTask> &task);
   clio::run::TaskResume Getattr(clio::run::shared_ptr<GetattrTask> &task);
@@ -468,6 +473,9 @@ class Runtime : public clio::run::Container {
    * @param fi the inode
    */
   void MarkInodeDirtyLocked(const FileInfo &fi);
+  /** Set once a non-volatile placement of an inode record failed but a RAM
+   *  one succeeded: the deployment has no persistent tier to put them on. */
+  bool inode_volatile_only_ = false;
   /** Store every dirty inode record (serialized per inode). */
   clio::run::TaskResume FlushInodes();
   /**

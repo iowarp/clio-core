@@ -282,6 +282,12 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(FlushData(typed_task));
       break;
     }
+    case Method::kSyncTag: {
+      // Cast task FullPtr to specific type
+      auto& typed_task = task_ptr.template Cast<SyncTagTask>();
+      CLIO_CO_AWAIT(SyncTag(typed_task));
+      break;
+    }
     case Method::kSemanticSearch: {
       // Moved to the indexer chimod (issue #905): the core no longer owns
       // the search index. An explicit error beats the default's silent
@@ -527,6 +533,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kSyncTag: {
+      auto& typed_task = task_ptr.template Cast<SyncTagTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kSemanticSearch: {
       auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
       archive << *typed_task;
@@ -759,6 +770,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kFlushData: {
       auto& typed_task = task_ptr.template Cast<FlushDataTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kSyncTag: {
+      auto& typed_task = task_ptr.template Cast<SyncTagTask>();
       archive >> *typed_task;
       break;
     }
@@ -1038,6 +1054,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       archive >> *typed_task;
       break;
     }
+    case Method::kSyncTag: {
+      auto& typed_task = task_ptr.template Cast<SyncTagTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
     case Method::kSemanticSearch: {
       auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
       archive >> *typed_task;
@@ -1311,6 +1333,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kFlushData: {
       auto& typed_task = task_ptr.template Cast<FlushDataTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kSyncTag: {
+      auto& typed_task = task_ptr.template Cast<SyncTagTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -1783,6 +1811,17 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kSyncTag: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<SyncTagTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<SyncTagTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<SyncTagTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kSemanticSearch: {
       auto new_task_ptr = ipc_manager->NewTask<SemanticSearchTask>();
       if (!new_task_ptr.IsNull()) {
@@ -1993,6 +2032,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
     }
     case Method::kFlushData: {
       auto new_task_ptr = ipc_manager->NewTask<FlushDataTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kSyncTag: {
+      auto new_task_ptr = ipc_manager->NewTask<SyncTagTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
     case Method::kSemanticSearch: {
@@ -2225,6 +2268,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kFlushData: {
       auto& typed_task = orig_task.template Cast<FlushDataTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kSyncTag: {
+      auto& typed_task = orig_task.template Cast<SyncTagTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }

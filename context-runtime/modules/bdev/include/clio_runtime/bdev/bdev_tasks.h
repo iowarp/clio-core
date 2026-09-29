@@ -980,6 +980,50 @@ struct FlushAllocLogTask : public clio::run::Task {
 };
 
 /**
+ * SyncTask - Make every byte written to this bdev, and its allocator state,
+ * durable (fdatasync on a file bdev; a no-op for memory tiers). The fsync
+ * path of the CTE sends one per bdev that holds a synced file's blocks.
+ */
+struct SyncTask : public clio::run::Task {
+  /** SHM default constructor */
+  CTP_CROSS_FUN SyncTask() : clio::run::Task() {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit SyncTask(const clio::run::TaskId &task_node,
+                                  const clio::run::PoolId &pool_id,
+                                  const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kSync) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kSync;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /** Serialize IN and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+  }
+
+  /** Serialize OUT and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  /** Copy from another SyncTask */
+  void Copy(const ctp::ipc::FullPtr<SyncTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+  }
+
+  /** AggregateOut replica results into this task (no OUT fields). */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+  }
+};
+
+/**
  * UpdateTask - Send device/pinned memory pointers to the GPU container.
  * Called by the CPU bdev runtime after allocating kHbm or kPinned memory,
  * so the GPU-side GpuRuntime container can perform direct device memcpy.

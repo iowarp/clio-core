@@ -264,6 +264,17 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+  /**
+   * fsync the namespace log on every container (see SyncMetaTask).
+   * @return future; rc != 0 if any container failed to sync
+   */
+  clio::run::Future<SyncMetaTask> AsyncSyncMeta() {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<SyncMetaTask>(clio::run::CreateTaskId(), pool_id_,
+                                           clio::run::PoolQuery::Broadcast());
+    return ipc->Send(task);
+  }
+
   /** Tag-keyed size advance (see AdvanceSizeTask). */
   clio::run::Future<AdvanceSizeTask> AsyncAdvanceSize(
       clio::run::u64 tag_packed, clio::run::u64 size) {

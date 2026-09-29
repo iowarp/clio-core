@@ -55,6 +55,7 @@ extern "C" void clio_cte_locate_register(
               unsigned long long *, unsigned long long *),
     void *ctx);
 #include <clio_runtime/admin/admin_client.h>
+#include <clio_runtime/manager.h>
 #include <clio_cte/core/core_config.h>
 #include <clio_cte/core/dpe/dpe.h>
 #include <clio_cte/core/core_runtime.h>
@@ -993,6 +994,12 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   }
 
   // Spawn periodic FlushData if configured
+  // A graceful stop moves RAM-tier data to a persistent tier before the
+  // process exits (unmount-style): only persistent bytes survive a restart.
+  if (!config_.performance_.metadata_log_path_.empty()) {
+    RegisterStopFlush();
+  }
+
   if (config_.performance_.flush_data_period_ms_ > 0) {
     client_.AsyncFlushData(clio::run::PoolQuery::Local(),
                            config_.performance_.flush_data_min_persistence_,
@@ -1038,20 +1045,53 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_END
 }
 
+void Runtime::RegisterStopFlush() {
+  auto *manager = CLIO_RUNTIME_MANAGER;
+  if (manager == nullptr) return;
+  const clio::run::PoolId pool_id = client_.pool_id_;
+  const int level = config_.performance_.flush_data_min_persistence_;
+  stop_hook_id_ = manager->AddStopHook([pool_id, level]() {
+    auto *mgr = CLIO_RUNTIME_MANAGER;
+    const float max_s =
+        static_cast<float>(mgr->GetStopGracePeriodMs()) / 1000.0f;
+    Client client(pool_id);
+    auto flush = client.AsyncFlushData(clio::run::PoolQuery::Local(), level);
+    if (!flush.Wait(max_s)) {
+      HLOG(kWarning, "cte_core stop: moving RAM-tier data to disk did not "
+           "finish within the {} s grace period; unflushed, un-fsync'd data "
+           "is lost (raise clio_run stop --grace-period)", max_s);
+    }
+  });
+}
+
+void Runtime::SyncAndCloseLogs() {
+  for (auto &log : blob_txn_logs_) {
+    if (log) {
+      log->Sync();
+      log->Close();
+    }
+  }
+  blob_txn_logs_.clear();
+  for (auto &log : tag_txn_logs_) {
+    if (log) {
+      log->Sync();
+      log->Close();
+    }
+  }
+  tag_txn_logs_.clear();
+}
+
 Runtime::~Runtime() {
   // Mirror Destroy()'s cleanup so deleting the container on graceful shutdown
   // frees this module's runtime-heap state (the member containers below are
   // also RAII, but closing the WAL files explicitly here is the safe, intended
   // teardown). Destructor-safe: no task/RunContext, no coroutine, no worker
   // state access.
-  for (auto &log : blob_txn_logs_) {
-    if (log) log->Close();
+  if (stop_hook_id_ != 0) {
+    auto *manager = CLIO_RUNTIME_MANAGER;
+    if (manager != nullptr) manager->RemoveStopHook(stop_hook_id_);
   }
-  blob_txn_logs_.clear();
-  for (auto &log : tag_txn_logs_) {
-    if (log) log->Close();
-  }
-  tag_txn_logs_.clear();
+  SyncAndCloseLogs();
 
   registered_targets_.clear();
   target_list_.clear();
@@ -1068,15 +1108,13 @@ Runtime::~Runtime() {
 clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
-    // Close WAL files before clearing data structures
-    for (auto &log : blob_txn_logs_) {
-      if (log) log->Close();
+    if (stop_hook_id_ != 0) {
+      auto *manager = CLIO_RUNTIME_MANAGER;
+      if (manager != nullptr) manager->RemoveStopHook(stop_hook_id_);
+      stop_hook_id_ = 0;
     }
-    blob_txn_logs_.clear();
-    for (auto &log : tag_txn_logs_) {
-      if (log) log->Close();
-    }
-    tag_txn_logs_.clear();
+    // Close WAL files (durably) before clearing data structures
+    SyncAndCloseLogs();
 
     // Clear all registered targets and their associated data
     registered_targets_.clear();
@@ -6658,9 +6696,19 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     // the flush forever.
     constexpr clio::run::u64 kFlushTokenMaxSpins = 200000;
 
-    std::ofstream ofs(log_path, std::ios::binary | std::ios::trunc);
+    // Every WAL record up to here has already been applied in memory, so the
+    // snapshot below contains it; records logged while the snapshot is being
+    // built (it yields on write tokens) might not be, and must survive the
+    // WAL truncation that follows.
+    const clio::run::u64 snapshot_seq = next_wal_seq_.load();
+
+    // Build the snapshot beside the live one and swap it in durably: writing
+    // the live file in place left a truncated snapshot -- and the blobs only
+    // it recorded lost -- whenever the process died mid-flush.
+    const std::string tmp_path = log_path + ".tmp";
+    std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
     if (!ofs.is_open()) {
-      HLOG(kError, "FlushMetadata: Failed to open log file: {}", log_path);
+      HLOG(kError, "FlushMetadata: Failed to open log file: {}", tmp_path);
       task->return_code_ = 1;
       CLIO_CO_RETURN;
     }
@@ -6861,6 +6909,12 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     }
 
     ofs.close();
+    if (ofs.fail() || !TransactionLog::DurableReplace(tmp_path, log_path)) {
+      HLOG(kError, "FlushMetadata: could not write snapshot {}; the previous "
+           "snapshot and the WAL stay authoritative", log_path);
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    }
 
     // WAL: sync and compact transaction logs after snapshot
     if (!blob_txn_logs_.empty()) {
@@ -6880,10 +6934,10 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       if (total_wal_size >
           config_.performance_.transaction_log_capacity_bytes_) {
         for (auto &log : blob_txn_logs_) {
-          if (log) log->Truncate();
+          if (log) log->TruncateThrough(snapshot_seq);
         }
         for (auto &log : tag_txn_logs_) {
-          if (log) log->Truncate();
+          if (log) log->TruncateThrough(snapshot_seq);
         }
         HLOG(kDebug, "FlushMetadata: Truncated WAL files (was {} bytes)",
              total_wal_size);
@@ -7005,44 +7059,18 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
   HLOG(kDebug, "FlushData: Found {} blobs with volatile blocks to flush",
        blobs_to_flush.size());
 
-  // Flush each blob: read data, free volatile blocks, re-put with persistence
+  // Move each blob to a persistent tier (read, place, swap -- see
+  // MoveBlobToPersistent). Out of room or a failed placement ends the flush:
+  // the budget only shrinks, so every further attempt would fail the same way.
   for (size_t entry_idx = 0; entry_idx < blobs_to_flush.size(); ++entry_idx) {
     const auto &entry = blobs_to_flush[entry_idx];
-    std::shared_ptr<BlobInfo> blob_info_ptr = tag_blob_name_to_info_.get(entry.composite_key);
-    if (!blob_info_ptr || blob_info_ptr->blocks_.empty()) continue;
-    // Take the write token and drain readers FIRST, and size the move from
-    // the blob AS IT IS under the token. entry.total_size is the candidate
-    // scan's view, taken before any token; a blob still being written had
-    // grown by hundreds of MB by the time its turn came, and moving
-    // entry.total_size bytes truncated it to that stale length (traced:
-    // flush-begin size=435812589 while the blob was 810844809 bytes long;
-    // RELIABILITY.md defect 14). The token is held until the swap below.
-    clio::run::u64 flush_tok =
-        reinterpret_cast<clio::run::u64>(clio::run::GetCurrentTask().get());
-    if (flush_tok == 0) {
-      flush_tok = reinterpret_cast<clio::run::u64>(&entry_idx);
-    }
-    while (!blob_info_ptr->TryLockWrite(flush_tok)) {
-      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
-    }
-    blob_info_ptr->BeginDrainReaders();
-    while (blob_info_ptr->HasReadPins()) {
-      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
-    }
-    clio::run::u64 total_size = blob_info_ptr->GetTotalSize();
-    if (total_size == 0 || blob_info_ptr->blocks_.empty()) {
-      blob_info_ptr->EndDrainReaders();
-      blob_info_ptr->UnlockWrite(flush_tok);
-      continue;
-    }
-
-    // Out of room on the persistent tiers. STOP -- do not attempt the blob and
-    // do not walk the rest. The budget only shrinks from here, so every
-    // further attempt is one more blob destroyed for one more failed put; the
-    // old behavior was to keep going and emit an error per blob, which is how
-    // a single undersized tier produced megabytes of log and a truncated
-    // dataset. One line naming the shortfall is what an operator can act on.
-    if (total_size > flush_budget) {
+    clio::run::u64 size = 0;
+    clio::run::u32 move_rc = kMoveDone;
+    CLIO_CO_AWAIT(MoveBlobToPersistent(entry.composite_key, entry.tag_id,
+                                       entry.blob_name, entry.score,
+                                       target_level, flush_budget, size,
+                                       move_rc));
+    if (move_rc == kMoveNoRoom) {
       clio::run::u64 bytes_declined = 0;
       for (size_t j = entry_idx; j < blobs_to_flush.size(); ++j) {
         bytes_declined += blobs_to_flush[j].total_size;
@@ -7053,132 +7081,306 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
            "{}. Flushed {} blob(s) ({} byte(s)) before stopping. The tier must "
            "be at least as large as the data being flushed.",
            target_level, blobs_to_flush.size() - entry_idx,
-           blobs_to_flush.size(), bytes_declined, flush_budget, total_size,
+           blobs_to_flush.size(), bytes_declined, flush_budget, size,
            task->blobs_flushed_, task->bytes_flushed_);
-      blob_info_ptr->EndDrainReaders();
-      blob_info_ptr->UnlockWrite(flush_tok);
       break;
     }
-
-    // Step 1: Allocate buffer and read data from current blocks
-    auto *ipc_manager = CLIO_IPC;
-    ctp::ipc::FullPtr<char> buffer = ipc_manager->AllocateBuffer(total_size);
-    if (buffer.IsNull()) {
-      HLOG(kError,
-           "FlushData: Failed to allocate buffer of size {} for blob {}",
-           total_size, entry.blob_name);
-      blob_info_ptr->EndDrainReaders();
-      blob_info_ptr->UnlockWrite(flush_tok);
-      continue;
-    }
-
-    ctp::ipc::ShmPtr<> shm_ptr(buffer.shm_);
-    clio::run::u32 read_error = 0;
-    CLIO_CO_AWAIT(ReadData(blob_info_ptr->blocks_, shm_ptr, total_size, 0,
-                      read_error));
-    if (read_error != 0) {
-      HLOG(kError, "FlushData: Failed to read blob data for {}",
-           entry.blob_name);
-      blob_info_ptr->EndDrainReaders();
-      blob_info_ptr->UnlockWrite(flush_tok);
-      ipc_manager->FreeBuffer(buffer);
-      continue;
-    }
-
-    // Step 2: move the snapshot to a persistent tier ATOMICALLY -- place it,
-    // write it and swap the layout while still holding the write token and
-    // the reader drain (the same inline place-and-swap ReorganizeBlobInternal
-    // uses). The previous sequence freed the volatile blocks, recomputed the
-    // (now smaller) size, released the token and re-put the snapshot through an
-    // AsyncPutBlob subtask. In that window concurrent puts saw a shrunken
-    // blob, zero-filled "holes" over live data, and the re-put then overwrote
-    // whatever they had written since the snapshot: test_concurrent_same_blob
-    // lost 0.4-240 MB per run with a persistent tier and the default 10 s
-    // flush (RELIABILITY.md defect 14).
-    BlobInfo staging;
-    staging.blob_name_ = blob_info_ptr->blob_name_;
-    staging.score_ = entry.score;
-    if (TracePutEnv()) {
-      HLOG(kInfo, "[TRACE-PUT] flush-begin blob='{}' size={} nblocks={} tok={}",
-           entry.blob_name, total_size, blob_info_ptr->blocks_.size(), flush_tok);
-    }
-    clio::run::u32 place_rc = 0;
-    CLIO_CO_AWAIT(ExtendBlob(staging, 0, total_size, entry.score, place_rc,
-                             target_level, /*preallocate=*/0));
-    clio::run::u32 write_rc = 0;
-    if (place_rc == 0) {
-      CLIO_CO_AWAIT(ModifyExistingData(staging.blocks_, shm_ptr, total_size, 0,
-                                       write_rc));
-    }
-    if (place_rc != 0 || write_rc != 0) {
-      // The blob is untouched: give back what staging took and stop, rather
-      // than feed the rest of the list to the same failure.
-      clio::run::u32 free_rc = 0;
-      CLIO_CO_AWAIT(FreeAllBlobBlocks(staging, free_rc));
-      blob_info_ptr->EndDrainReaders();
-      blob_info_ptr->UnlockWrite(flush_tok);
-      HLOG(kError,
-           "FlushData: could not place {} byte(s) of blob {} on a tier at "
-           "level >= {} (place rc {}, write rc {}); the blob stays where it "
-           "is. Stopping the flush; {} blob(s) remain unflushed.",
-           total_size, entry.blob_name, target_level, place_rc, write_rc,
+    if (move_rc == kMovePlaceFailed) {
+      HLOG(kError, "FlushData: stopping; {} blob(s) remain unflushed.",
            blobs_to_flush.size() - entry_idx - 1);
-      ipc_manager->FreeBuffer(buffer);
       break;
     }
-    // Swap in the persistent layout, then free the old one (volatile and
-    // non-volatile alike: the blob was rewritten in full before too), still
-    // under the token and the drain so no reader holds a freed extent.
-    BlobInfo old_layout;
-    old_layout.blocks_ = std::move(blob_info_ptr->blocks_);
-    blob_info_ptr->blocks_ = std::move(staging.blocks_);
-    blob_info_ptr->total_size_cache_ = staging.total_size_cache_;
-    blob_info_ptr->BumpPlacementGen();  // #817: blocks moved under readers
-    {
-      clio::run::u32 free_rc = 0;
-      CLIO_CO_AWAIT(FreeAllBlobBlocks(old_layout, free_rc));
-      if (free_rc != 0) {
-        HLOG(kWarning, "FlushData: freeing the old layout of blob {} returned {}",
-             entry.blob_name, free_rc);
-      }
+    if (move_rc == kMoveDone && size > 0) {
+      task->blobs_flushed_++;
+      task->bytes_flushed_ += size;
     }
-    if (!blob_txn_logs_.empty()) {
-      clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
-      TxnExtendBlob txn;
-      txn.tag_major_ = entry.tag_id.major_;
-      txn.tag_minor_ = entry.tag_id.minor_;
-      txn.blob_name_ = entry.blob_name;
-      for (const auto &blk : blob_info_ptr->blocks_) {
-        TxnExtendBlobBlock tb;
-        tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
-        tb.bdev_minor_ = blk.bdev_client_.pool_id_.minor_;
-        tb.target_query_ = blk.target_query_;
-        tb.target_offset_ = blk.target_offset_;
-        tb.size_ = blk.size_;
-        txn.new_blocks_.push_back(tb);
-      }
-      blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendBlob,
-                                                       txn);
-    }
-    MirrorBlobToShm(entry.composite_key, *blob_info_ptr);
-    if (TracePutEnv()) {
-      HLOG(kInfo, "[TRACE-PUT] flush-end blob='{}' size={} nblocks={} tok={}",
-           entry.blob_name, blob_info_ptr->GetTotalSize(),
-           blob_info_ptr->blocks_.size(), flush_tok);
-    }
-    blob_info_ptr->EndDrainReaders();
-    blob_info_ptr->UnlockWrite(flush_tok);
-    task->blobs_flushed_++;
-    task->bytes_flushed_ += total_size;
-    // Debit what this blob took, so the budget tracks the tier as the flush
-    // consumes it rather than only as it looked at the start.
-    flush_budget -= std::min(flush_budget, total_size);
-    ipc_manager->FreeBuffer(buffer);
   }
 
   task->return_code_ = 0;
   HLOG(kDebug, "FlushData: Flushed {} blobs ({} bytes)", task->blobs_flushed_,
        task->bytes_flushed_);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::MoveBlobToPersistent(
+    const std::string &composite_key, const TagId &tag_id,
+    const std::string &blob_name, float score, int target_level,
+    clio::run::u64 &budget, clio::run::u64 &size, clio::run::u32 &rc) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  rc = kMoveDone;
+  size = 0;
+  std::shared_ptr<BlobInfo> blob_info_ptr =
+      tag_blob_name_to_info_.get(composite_key);
+  if (!blob_info_ptr || blob_info_ptr->blocks_.empty()) CLIO_CO_RETURN;
+  // Take the write token and drain readers FIRST, and size the move from the
+  // blob AS IT IS under the token: a candidate scan's size is stale for a
+  // blob still being written, and moving that many bytes truncated it
+  // (RELIABILITY.md defect 14). The token is held until the swap.
+  clio::run::u64 tok = reinterpret_cast<clio::run::u64>(&size);
+  while (!blob_info_ptr->TryLockWrite(tok)) {
+    CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+  }
+  blob_info_ptr->BeginDrainReaders();
+  while (blob_info_ptr->HasReadPins()) {
+    CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+  }
+  const clio::run::u64 total_size = blob_info_ptr->GetTotalSize();
+  bool below = false;
+  {
+    clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+    below = HasBlocksBelowLevelLocked(blob_info_ptr->blocks_, target_level);
+  }
+  ctp::ipc::FullPtr<char> buffer;
+  auto *ipc_manager = CLIO_IPC;
+  if (total_size == 0 || blob_info_ptr->blocks_.empty() || !below) {
+    // Nothing (left) to move.
+  } else if (total_size > budget) {
+    rc = kMoveNoRoom;
+    size = total_size;
+  } else {
+    buffer = ipc_manager->AllocateBuffer(total_size);
+    clio::run::u32 read_error = 1;
+    if (!buffer.IsNull()) {
+      CLIO_CO_AWAIT(ReadData(blob_info_ptr->blocks_,
+                             ctp::ipc::ShmPtr<>(buffer.shm_), total_size, 0,
+                             read_error));
+    }
+    if (read_error != 0) {
+      HLOG(kError, "MoveBlobToPersistent: could not read blob {} ({} bytes)",
+           blob_name, total_size);
+      rc = kMoveSkipped;
+    } else {
+      CLIO_CO_AWAIT(RelocateBlob(*blob_info_ptr, composite_key, tag_id,
+                                 blob_name, score,
+                                 ctp::ipc::ShmPtr<>(buffer.shm_), total_size,
+                                 target_level, rc));
+      if (rc == kMoveDone) {
+        size = total_size;
+        budget -= std::min(budget, total_size);
+      }
+    }
+  }
+  blob_info_ptr->EndDrainReaders();
+  blob_info_ptr->UnlockWrite(tok);
+  if (!buffer.IsNull()) ipc_manager->FreeBuffer(buffer);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RelocateBlob(
+    BlobInfo &blob_info, const std::string &composite_key, const TagId &tag_id,
+    const std::string &blob_name, float score, ctp::ipc::ShmPtr<> data,
+    clio::run::u64 total_size, int target_level, clio::run::u32 &rc) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  rc = kMoveDone;
+  // Place, write and swap while the caller holds the write token and the
+  // reader drain (the inline place-and-swap ReorganizeBlobInternal uses).
+  // Freeing first and re-putting later let concurrent puts see a shrunken
+  // blob and the re-put overwrite them (RELIABILITY.md defect 14).
+  BlobInfo staging;
+  staging.blob_name_ = blob_info.blob_name_;
+  staging.score_ = score;
+  if (TracePutEnv()) {
+    HLOG(kInfo, "[TRACE-PUT] flush-begin blob='{}' size={} nblocks={}",
+         blob_name, total_size, blob_info.blocks_.size());
+  }
+  clio::run::u32 place_rc = 0;
+  CLIO_CO_AWAIT(ExtendBlob(staging, 0, total_size, score, place_rc,
+                           target_level, /*preallocate=*/0));
+  clio::run::u32 write_rc = 0;
+  if (place_rc == 0) {
+    CLIO_CO_AWAIT(ModifyExistingData(staging.blocks_, data, total_size, 0,
+                                     write_rc));
+  }
+  if (place_rc != 0 || write_rc != 0) {
+    // The blob is untouched: give back what staging took.
+    clio::run::u32 free_rc = 0;
+    CLIO_CO_AWAIT(FreeAllBlobBlocks(staging, free_rc));
+    HLOG(kError,
+         "RelocateBlob: could not place {} byte(s) of blob {} on a tier at "
+         "level >= {} (place rc {}, write rc {}); the blob stays where it is.",
+         total_size, blob_name, target_level, place_rc, write_rc);
+    rc = kMovePlaceFailed;
+    CLIO_CO_RETURN;
+  }
+  // Swap in the persistent layout, then free the old one, still under the
+  // token and the drain so no reader holds a freed extent.
+  BlobInfo old_layout;
+  old_layout.blocks_ = std::move(blob_info.blocks_);
+  blob_info.blocks_ = std::move(staging.blocks_);
+  blob_info.total_size_cache_ = staging.total_size_cache_;
+  blob_info.BumpPlacementGen();  // #817: blocks moved under readers
+  {
+    clio::run::u32 free_rc = 0;
+    CLIO_CO_AWAIT(FreeAllBlobBlocks(old_layout, free_rc));
+    if (free_rc != 0) {
+      HLOG(kWarning, "RelocateBlob: freeing the old layout of blob {} "
+           "returned {}", blob_name, free_rc);
+    }
+  }
+  LogBlobLayout(tag_id, blob_name, blob_info);
+  MirrorBlobToShm(composite_key, blob_info);
+  if (TracePutEnv()) {
+    HLOG(kInfo, "[TRACE-PUT] flush-end blob='{}' size={} nblocks={}",
+         blob_name, blob_info.GetTotalSize(), blob_info.blocks_.size());
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::LogBlobLayout(const TagId &tag_id, const std::string &blob_name,
+                            const BlobInfo &blob_info) {
+  if (blob_txn_logs_.empty()) return;
+  clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+  TxnExtendBlob txn;
+  txn.tag_major_ = tag_id.major_;
+  txn.tag_minor_ = tag_id.minor_;
+  txn.blob_name_ = blob_name;
+  for (const auto &blk : blob_info.blocks_) {
+    TxnExtendBlobBlock tb;
+    tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
+    tb.bdev_minor_ = blk.bdev_client_.pool_id_.minor_;
+    tb.target_query_ = blk.target_query_;
+    tb.target_offset_ = blk.target_offset_;
+    tb.size_ = blk.size_;
+    txn.new_blocks_.push_back(tb);
+  }
+  blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendBlob, txn);
+}
+
+bool Runtime::HasBlocksBelowLevelLocked(
+    const clio::run::priv::vector<BlobBlock> &blocks, int level) {
+  for (const auto &block : blocks) {
+    TargetInfo *tinfo = registered_targets_.find(block.bdev_client_.pool_id_);
+    if (tinfo && static_cast<int>(tinfo->persistence_level_) < level) {
+      return true;
+    }
+  }
+  return false;
+}
+
+clio::run::u64 Runtime::PersistentBudget(int level) {
+  clio::run::u64 budget = 0;
+  clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+  for (const auto &t : target_list_) {
+    if (static_cast<int>(t.persistence_level_) < level) continue;
+    TargetInfo *tinfo = registered_targets_.find(t.bdev_client_.pool_id_);
+    if (tinfo != nullptr) budget += tinfo->remaining_space_;
+  }
+  return budget;
+}
+
+clio::run::TaskResume Runtime::SyncTag(
+    clio::run::shared_ptr<SyncTagTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  task->deferred_ = 0;
+  task->blobs_moved_ = 0;
+  task->bdevs_synced_ = 0;
+  task->containers_ = 1;
+  task->return_code_ = 0;
+  if (config_.performance_.fsync_deferred_) {
+    task->deferred_ = 1;  // durability is the periodic flushes' job
+    CLIO_CO_RETURN;
+  }
+  const int level = task->min_persistence_ >= 0
+                        ? task->min_persistence_
+                        : config_.performance_.flush_data_min_persistence_;
+  const TagId tag = task->tag_id_;
+  const std::vector<std::string> names = BlobIndexNames(tag);
+  const std::string prefix =
+      std::to_string(tag.major_) + "." + std::to_string(tag.minor_) + ".";
+  // 1. Bytes still below the persistence level move up first. With no tier
+  //    at that level there is nothing durable to move to (a RAM-only
+  //    deployment): fsync then means what it means on tmpfs.
+  clio::run::u64 budget = PersistentBudget(level);
+  for (size_t i = 0; i < names.size() && budget > 0; ++i) {
+    std::shared_ptr<BlobInfo> info = tag_blob_name_to_info_.get(prefix + names[i]);
+    if (!info) continue;
+    clio::run::u64 size = 0;
+    clio::run::u32 move_rc = kMoveDone;
+    CLIO_CO_AWAIT(MoveBlobToPersistent(prefix + names[i], tag, names[i],
+                                       info->score_, level, budget, size,
+                                       move_rc));
+    if (move_rc == kMoveNoRoom || move_rc == kMovePlaceFailed) {
+      task->return_code_ = kSyncNoSpaceRc;
+      CLIO_CO_RETURN;
+    }
+    if (move_rc == kMoveSkipped) {
+      task->return_code_ = kSyncIoRc;
+      CLIO_CO_RETURN;
+    }
+    if (size > 0) task->blobs_moved_++;
+  }
+  // 2. The devices holding the tag's bytes, then 3. the WAL locating them.
+  clio::run::u32 dev_rc = 0;
+  clio::run::u64 synced = 0;
+  CLIO_CO_AWAIT(SyncTagDevices(prefix, names, synced, dev_rc));
+  task->bdevs_synced_ = synced;
+  if (dev_rc != 0) {
+    task->return_code_ = kSyncIoRc;
+    CLIO_CO_RETURN;
+  }
+  for (auto &log : blob_txn_logs_) {
+    if (log) log->Sync();
+  }
+  for (auto &log : tag_txn_logs_) {
+    if (log) log->Sync();
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::SyncTagDevices(
+    const std::string &prefix, const std::vector<std::string> &names,
+    clio::run::u64 &synced, clio::run::u32 &rc) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  synced = 0;
+  // Every non-volatile device holding a block of the tag's primaries or
+  // durable replicas (REPLICA_CACHE copies are expendable by design).
+  std::unordered_map<clio::run::PoolId, clio::run::PoolQuery> devices;
+  {
+    clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+    auto add = [&](const clio::run::priv::vector<BlobBlock> &blocks) {
+      for (const auto &b : blocks) {
+        TargetInfo *t = registered_targets_.find(b.bdev_client_.pool_id_);
+        if (t == nullptr || t->persistence_level_ ==
+                                clio::run::bdev::PersistenceLevel::kVolatile) {
+          continue;
+        }
+        devices.emplace(b.bdev_client_.pool_id_, b.target_query_);
+      }
+    };
+    for (const auto &name : names) {
+      std::shared_ptr<BlobInfo> info = tag_blob_name_to_info_.get(prefix + name);
+      if (!info) continue;
+      add(info->blocks_);
+      for (const auto &rep : info->replicas_) {
+        if (!(rep.flags_ & REPLICA_CACHE)) add(rep.blocks_);
+      }
+    }
+  }
+  std::vector<clio::run::Future<clio::run::bdev::SyncTask>> futs;
+  futs.reserve(devices.size());
+  for (const auto &d : devices) {
+    clio::run::bdev::Client bdev(d.first);
+    futs.push_back(bdev.AsyncSync(d.second));
+  }
+  for (auto &f : futs) {
+    CLIO_CO_AWAIT(f);
+    if (f->GetReturnCode() != 0) rc = 1;
+    ++synced;
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -8026,6 +8228,18 @@ void Runtime::ReserveRestoredBlockSpace() {
     const clio::run::PoolId &bdev_pool_id = kv.first;
     clio::run::u64 reserve_bytes = kv.second;
     if (reserve_bytes == 0) continue;
+    // A file bdev rebuilds its own allocator from its allocator log on
+    // restart -- covering blocks every client placed there, not just ours --
+    // so reserving the prefix again would only burn capacity past its
+    // recovered cursor.
+    bool self_recovering = false;
+    {
+      clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+      TargetInfo *tinfo = registered_targets_.find(bdev_pool_id);
+      self_recovering = tinfo != nullptr &&
+                        tinfo->bdev_type_ == clio::run::bdev::BdevType::kFile;
+    }
+    if (self_recovering) continue;
     // Same INLINE path AllocateFromTarget uses for a local bdev container:
     // a direct, synchronous call into the live block allocator (no task
     // round trip, no co_await -- this runs inside Create(), before the pool

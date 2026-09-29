@@ -36,6 +36,9 @@
 
 #include <clio_runtime/clio_runtime.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <cstring>
 #include <filesystem>
@@ -400,9 +403,54 @@ class TransactionLog {
 
   /** Flush pending writes to disk */
   void Sync() {
+    std::lock_guard<std::mutex> lk(mu_);
     if (ofs_.is_open()) {
       ofs_.flush();
+      FsyncPath(file_path_);
     }
+  }
+
+  /**
+   * fsync a file by path (works on any open of the inode, so a read-only
+   * descriptor suffices).
+   * @param path file to sync
+   * @return true on success
+   */
+  static bool FsyncPath(const std::string &path) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+  }
+
+  /**
+   * fsync the directory holding `path`, making a create or rename of it
+   * durable.
+   * @param path file whose parent directory is synced
+   * @return true on success
+   */
+  static bool FsyncParentDir(const std::string &path) {
+    std::filesystem::path parent = std::filesystem::path(path).parent_path();
+    if (parent.empty()) parent = ".";
+    return FsyncPath(parent.string());
+  }
+
+  /**
+   * Durably replace `path` with `tmp_path`: fsync the new file, rename it
+   * over the old one, fsync the directory. A crash at any point leaves
+   * either the complete old file or the complete new one.
+   * @param tmp_path fully written replacement
+   * @param path destination
+   * @return true on success
+   */
+  static bool DurableReplace(const std::string &tmp_path,
+                             const std::string &path) {
+    if (!FsyncPath(tmp_path)) return false;
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, path, ec);
+    if (ec) return false;
+    return FsyncParentDir(path);
   }
 
   /** Return current on-disk file size */
@@ -470,16 +518,40 @@ class TransactionLog {
    *  freshly-truncated file gets the format magic rewritten immediately, so
    *  a crash right after truncation still leaves a well-formed (if empty)
    *  file rather than one Load() would reject. */
-  void Truncate() {
+  void Truncate() { TruncateThrough(~clio::run::u64(0)); }
+
+  /**
+   * Drop every record whose global seq is <= `seq` -- the ones a snapshot
+   * taken after `seq` was issued already contains -- and keep the rest. A
+   * record logged while the snapshot was being built (seq > `seq`) may
+   * describe state the snapshot never saw, so dropping it would lose that
+   * update on the next restart. The shard is rewritten to a temp file and
+   * durably renamed over the original.
+   * @param seq highest seq the snapshot covers
+   */
+  void TruncateThrough(clio::run::u64 seq) {
+    std::lock_guard<std::mutex> lk(mu_);
     if (ofs_.is_open()) {
+      ofs_.flush();
       ofs_.close();
     }
-    // Re-open in truncate mode then re-open in append mode
-    ofs_.open(file_path_, std::ios::binary | std::ios::trunc);
-    if (ofs_.is_open()) {
-      WriteMagic();
+    std::vector<WalRecord> keep;
+    for (auto &rec : Load()) {
+      if (rec.seq_ > seq) keep.push_back(std::move(rec));
     }
-    ofs_.close();
+    const std::string tmp = file_path_ + ".tmp";
+    {
+      std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+      uint32_t magic = kWalMagic;
+      out.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+      for (const auto &rec : keep) {
+        WriteRecordTo(out, rec.type_, rec.seq_, rec.payload_);
+      }
+    }
+    if (!DurableReplace(tmp, file_path_)) {
+      HLOG(kError, "TransactionLog: could not rewrite {}; keeping it whole",
+           file_path_);
+    }
     ofs_.open(file_path_, std::ios::binary | std::ios::app);
   }
 
@@ -673,15 +745,21 @@ class TransactionLog {
    */
   void WriteRecord(TxnType type, const std::vector<char> &payload) {
     if (!ofs_.is_open()) return;
-    uint8_t type_byte = static_cast<uint8_t>(type);
-    clio::run::u64 seq = NextSeq();
-    uint32_t payload_size = static_cast<uint32_t>(payload.size());
-    ofs_.write(reinterpret_cast<const char *>(&type_byte), sizeof(type_byte));
-    ofs_.write(reinterpret_cast<const char *>(&seq), sizeof(seq));
-    ofs_.write(reinterpret_cast<const char *>(&payload_size),
-               sizeof(payload_size));
-    ofs_.write(payload.data(), payload_size);
+    WriteRecordTo(ofs_, type, NextSeq(), payload);
     ofs_.flush();
+  }
+
+  /** Serialize one record [u8 type][u64 seq][u32 size][payload] to `out`. */
+  static void WriteRecordTo(std::ofstream &out, TxnType type,
+                            clio::run::u64 seq,
+                            const std::vector<char> &payload) {
+    uint8_t type_byte = static_cast<uint8_t>(type);
+    uint32_t payload_size = static_cast<uint32_t>(payload.size());
+    out.write(reinterpret_cast<const char *>(&type_byte), sizeof(type_byte));
+    out.write(reinterpret_cast<const char *>(&seq), sizeof(seq));
+    out.write(reinterpret_cast<const char *>(&payload_size),
+              sizeof(payload_size));
+    out.write(payload.data(), payload_size);
   }
 
   // ---- Serialization primitives ----

@@ -294,6 +294,52 @@ static int FlushReplicationBarrier(const clio::cte::core::TagId &tag) {
 }
 
 /**
+ * CTE performance.fsync_mode as learned from the first SyncTag reply:
+ * -1 not yet known, 0 "durable", 1 "deferred" (fsync skips the device sync).
+ */
+static std::atomic<int> g_fsync_deferred{-1};
+
+/**
+ * fsync(2)'s durability step: make every blob of `tag` durable on a
+ * persistent tier (SyncTag, broadcast) and then the namespace log (SyncMeta),
+ * so the bytes, the size and the name all survive power loss. With
+ * fsync_mode "deferred" the first reply says so and later calls return at
+ * once, leaving durability to the periodic flushes.
+ * @param tag the file's tag; null syncs only the namespace (fsyncdir)
+ * @return 0, -ENOSPC when no persistent tier had room, or -EIO
+ */
+static int SyncDurable(const clio::cte::core::TagId &tag) {
+  if (g_fsync_deferred.load(std::memory_order_relaxed) == 1) return 0;
+  auto *cte_c = CLIO_CTE_CLIENT;
+  if (cte_c != nullptr && !tag.IsNull()) {
+    auto fut = cte_c->AsyncSyncTag(tag);
+    fut.Wait();
+    const bool deferred = fut->deferred_ != 0;
+    g_fsync_deferred.store(deferred ? 1 : 0, std::memory_order_relaxed);
+    if (deferred) return 0;
+    if (fut->containers_ == 0) {
+      // A module in front of the core dropped the sync: nothing was made
+      // durable, so fsync must not claim it was.
+      static std::once_flag warned;
+      std::call_once(warned, [&] {
+        HLOG(kError, "clio_cte_fuse: fsync reached no CTE core container "
+             "through pool {}.{}; fsync fails with EIO", cte_c->pool_id_.major_,
+             cte_c->pool_id_.minor_);
+      });
+      return -EIO;
+    }
+    const clio::run::u32 rc = fut->GetReturnCode();
+    if (rc == clio::cte::core::kSyncNoSpaceRc) return -ENOSPC;
+    if (rc != 0) return -EIO;
+  }
+  auto *cfs = CLIO_CFS_CLIENT;
+  if (cfs == nullptr) return 0;
+  auto meta = cfs->AsyncSyncMeta();
+  meta.Wait();
+  return meta->GetReturnCode() == 0 ? 0 : -EIO;
+}
+
+/**
  * Whether O_EXCL creates may take the SIEVE-CREATE shortcut (mint the tag
  * locally, create it on the server later in a MultiCreate batch).
  *
@@ -2141,7 +2187,25 @@ int cte_fuse_fsync(const char *path, int /*datasync*/,
   }
   auto *cfs = CLIO_CFS_CLIENT;
   if (CfsFlushCompat(cfs, p) != 0) return -errno;
-  return 0;
+  // Everything above landed the bytes on the store; fsync's contract is
+  // that they are ON A PERSISTENT DEVICE when it returns.
+  return SyncDurable(handle != nullptr ? handle->tag
+                                       : clio::cte::core::TagId::GetNull());
+}
+
+/**
+ * fsyncdir(2): make the namespace (directory entries) durable.
+ * @param path directory path (unused: the namespace log is synced whole)
+ * @param datasync unused (entries have no separate data)
+ * @param fi unused
+ * @return 0 or a negative errno
+ */
+int cte_fuse_fsyncdir(const char * /*path*/, int /*datasync*/,
+                      struct fuse_file_info * /*fi*/) {
+  // A directory's entries live in the namespace log, not in a tag: syncing
+  // it makes creates, renames and unlinks under the directory durable (the
+  // write-tmp, fsync, rename, fsync-dir pattern).
+  return SyncDurable(clio::cte::core::TagId::GetNull());
 }
 
 int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
@@ -2905,6 +2969,7 @@ const struct fuse_operations cte_fuse_ops = {
     .listxattr = cte_fuse_listxattr,
     .removexattr = cte_fuse_removexattr,
     .readdir = cte_fuse_readdir,
+    .fsyncdir = cte_fuse_fsyncdir,
     .init = cte_fuse_init,
     .destroy = cte_fuse_destroy,
     .create = cte_fuse_create,

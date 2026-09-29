@@ -163,6 +163,17 @@ void RecordLog::Append(clio::run::u32 type, const std::string &payload) {
   since_compact_ += rec.size();
 }
 
+bool RecordLog::Sync() {
+  std::lock_guard<std::mutex> g(mu_);
+  if (fd_ < 0) return true;
+  if (::fsync(fd_) != 0) {
+    HLOG(kError, "record log: fsync of {} failed: {}", path_,
+         std::strerror(errno));
+    return false;
+  }
+  return true;
+}
+
 bool RecordLog::Rewrite(
     const std::vector<std::pair<clio::run::u32, std::string>> &records) {
   std::string buf;

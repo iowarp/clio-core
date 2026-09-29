@@ -8,10 +8,13 @@
 
 #include <clio_runtime/bdev/transports/bdev_transport.h>
 #include <clio_runtime/bdev/transports/block_allocator.h>
+#include <clio_runtime/bdev/bdev_alloc_log.h>
 #include <clio_ctp/io/async_io_factory.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
 
 namespace clio::run::bdev {
 
@@ -44,7 +47,33 @@ class FsBdevTransport : public BdevTransport {
   clio::run::u64 GetCapacity() const override { return allocator_.GetCapacity(); }
   clio::run::u64 GetRemainingSize() const override { return allocator_.GetRemainingSize(); }
 
+  void FlushAllocLog() override;
+  bool Sync() override;
+
  private:
+  /**
+   * Persistent allocator state. Without it the bump allocator restarts at
+   * offset 0 and a restart hands out bytes that live data -- placed by ANY
+   * client, local or remote -- still occupies.
+   */
+  AllocatorLog alloc_log_;
+  bool has_alloc_log_ = false;
+
+  // The log's fsync runs on its own thread, owned by the transport, so it
+  // ends with the pool: a runtime periodic task outlives a destroyed pool
+  // and retries forever.
+  static constexpr int kAllocLogSyncPeriodMs = 50;
+  std::thread sync_thread_;
+  std::mutex sync_mu_;
+  std::condition_variable sync_cv_;
+  bool sync_stop_ = false;
+
+  /** Sync-thread body: FlushAllocLog every kAllocLogSyncPeriodMs until
+   *  StopAllocLogSync. */
+  void AllocLogSyncLoop();
+
+  /** Stop and join the sync thread (idempotent). */
+  void StopAllocLogSync();
   StandardBlockAllocator allocator_;
   std::vector<WorkerIOContext> io_contexts_;
   std::string file_path_;
@@ -67,6 +96,22 @@ class FsBdevTransport : public BdevTransport {
    *  granularity, capped at capacity). Returns false if the extension fails
    *  (e.g. the disk is genuinely full). */
   bool EnsureFileBacked(clio::run::u64 end_offset);
+
+  /**
+   * Open the allocator-state log and, when recovering, rebuild the allocator
+   * from it. Called from Init after allocator_.Init.
+   * @param params Create parameters (alloc_log_path_ overrides the default
+   *               "<file>.alloc_log" and always recovers)
+   * @return false if the log cannot be opened
+   */
+  bool OpenAllocLog(const CreateParams& params);
+
+  /**
+   * Append one record per block to the allocator log and hand them to the OS.
+   * @param blocks Blocks just allocated or freed
+   * @param is_free true for frees, false for allocations
+   */
+  void LogBlocks(const std::vector<Block>& blocks, bool is_free);
 };
 
 } // namespace clio::run::bdev

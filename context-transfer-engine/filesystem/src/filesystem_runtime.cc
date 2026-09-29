@@ -472,6 +472,14 @@ clio::run::TaskResume Runtime::FileSizeOp(clio::cte::core::TagId tag,
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::SyncMeta(
+    clio::run::shared_ptr<SyncMetaTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  task->return_code_ = log_.Sync() ? 0 : 5;  // EIO
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::AdvanceSize(
     clio::run::shared_ptr<AdvanceSizeTask> &task) {
   CLIO_TASK_BODY_BEGIN

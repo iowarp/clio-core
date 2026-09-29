@@ -104,6 +104,12 @@ class FsMetaLog {
   }
 
   /**
+   * fsync the namespace log (see RecordLog::Sync).
+   * @return true on success
+   */
+  bool Sync() { return log_.Sync(); }
+
+  /**
    * Atomically replace the log with a snapshot.
    * @param records full snapshot of the live state
    * @return true on success

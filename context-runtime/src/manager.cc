@@ -615,6 +615,10 @@ void RuntimeManager::ServerFinalize() {
   // its task + Future allocations are reclaimed instead of being abandoned by
   // the abrupt StopWorkers() below. The budget is the stop grace period
   // (default 5000 ms; overridden by clio_run stop --grace-period).
+  // Modules flush volatile state to durable storage first (e.g. the CTE
+  // moves RAM-tier data to disk), while the workers can still run it.
+  RunStopHooks();
+
   DrainPendingTasks(stop_grace_period_ms_.load());
 
   // Stop workers and finalize server components
@@ -694,6 +698,34 @@ constexpr u64 kForceAckFlushMs = 500;
   std::_Exit(exit_code);
 }
 }  // namespace
+
+u64 RuntimeManager::AddStopHook(std::function<void()> hook) {
+  std::lock_guard<std::mutex> lk(stop_hooks_mu_);
+  const u64 id = next_stop_hook_++;
+  stop_hooks_[id] = std::move(hook);
+  return id;
+}
+
+void RuntimeManager::RemoveStopHook(u64 id) {
+  std::lock_guard<std::mutex> lk(stop_hooks_mu_);
+  stop_hooks_.erase(id);
+}
+
+void RuntimeManager::RunStopHooks() {
+  std::map<u64, std::function<void()>> hooks;
+  {
+    std::lock_guard<std::mutex> lk(stop_hooks_mu_);
+    hooks.swap(stop_hooks_);
+  }
+  for (auto &kv : hooks) {
+    try {
+      kv.second();
+    } catch (const std::exception &e) {
+      HLOG(kError, "ServerFinalize: stop hook {} threw: {}", kv.first,
+           e.what());
+    }
+  }
+}
 
 void RuntimeManager::RequestStop(StopMode mode, u32 grace_period_ms) {
   if (!is_runtime_mode_) {

@@ -334,6 +334,24 @@ struct AdvanceSizeTask : public clio::run::Task {
   }
 };
 
+/**
+ * SyncMeta: fsync the namespace log (directory entries, directory state,
+ * orphan inodes) so creates, renames and unlinks survive power loss.
+ * Broadcast: every container fsyncs the log of the namespace shard it owns.
+ */
+struct SyncMetaTask : public clio::run::Task {
+  SyncMetaTask() : clio::run::Task() {}
+  explicit SyncMetaTask(const clio::run::TaskId &task_id,
+                        const clio::run::PoolId &pool_id,
+                        const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kSyncMeta) {}
+  void Copy(const ctp::ipc::FullPtr<SyncMetaTask> &o) {
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) { Task::SerializeIn(ar); }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
 /** Read: page-loop GetBlob over [offset, offset+size). */
 struct ReadTask : public clio::run::Task {
   IN clio::run::u64 handle_;

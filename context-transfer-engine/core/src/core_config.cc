@@ -342,6 +342,8 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
           << YAML::Value << FormatSizeBytes(performance_.transaction_log_capacity_bytes_);
   emitter << YAML::Key << "flush_data_period_ms" << YAML::Value << performance_.flush_data_period_ms_;
   emitter << YAML::Key << "flush_data_min_persistence" << YAML::Value << performance_.flush_data_min_persistence_;
+  emitter << YAML::Key << "fsync_mode" << YAML::Value
+          << (performance_.fsync_deferred_ ? "deferred" : "durable");
   emitter << YAML::EndMap;
 
   // Emit target configuration
@@ -435,6 +437,16 @@ bool Config::ParsePerformanceConfig(const YAML::Node &node) {
   if (node["transaction_log_capacity"]) {
     std::string cap_str = node["transaction_log_capacity"].as<std::string>();
     ParseSizeString(cap_str, performance_.transaction_log_capacity_bytes_);
+  }
+
+  if (node["fsync_mode"]) {
+    const std::string mode = node["fsync_mode"].as<std::string>();
+    if (mode != "durable" && mode != "deferred") {
+      HLOG(kError, "Config error: fsync_mode must be \"durable\" or "
+           "\"deferred\", got \"{}\"", mode);
+      return false;
+    }
+    performance_.fsync_deferred_ = (mode == "deferred");
   }
 
   return true;

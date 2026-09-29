@@ -64,6 +64,12 @@ struct PerformanceConfig {
                                     // (1=temp-nonvolatile)
   clio::run::u64
       transaction_log_capacity_bytes_;  // Total WAL capacity (default 32MB)
+  /** fsync(2) through clio-fs: false ("durable", the default) returns only
+   *  once the file's bytes sit on a tier at flush_data_min_persistence or
+   *  above and are synced to the device, with the metadata WAL that locates
+   *  them; true ("deferred") returns at once and leaves durability to the
+   *  periodic flush_data / flush_metadata tasks. */
+  bool fsync_deferred_;
 
   PerformanceConfig()
       : target_stat_interval_ms_(5000),
@@ -79,7 +85,8 @@ struct PerformanceConfig {
         metadata_log_path_(""),
         flush_data_period_ms_(10000),
         flush_data_min_persistence_(1),
-        transaction_log_capacity_bytes_(32ULL * 1024ULL * 1024ULL) {}
+        transaction_log_capacity_bytes_(32ULL * 1024ULL * 1024ULL),
+        fsync_deferred_(false) {}
 };
 
 /**

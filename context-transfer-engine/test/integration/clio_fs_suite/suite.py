@@ -275,7 +275,13 @@ def main():
   ap.add_argument('--only', default='')
   ap.add_argument('--skip', default='')
   ap.add_argument('--profile', default='persistent',
-                  choices=['persistent', 'ram'])
+                  choices=['persistent', 'persistent_norepl', 'ram'],
+                  help='persistent_norepl: disk tier + WALs but no '
+                       'replication chimod and no periodic data flush, so '
+                       'only fsync itself moves data off the RAM tier')
+  ap.add_argument('--fsync-mode', default=None,
+                  choices=['durable', 'deferred'],
+                  help='CTE performance.fsync_mode (default: CTE default)')
   ap.add_argument('--attr-cache', default=None,
                   help='CLIO_FUSE_ATTR_CACHE_S for the mounts')
   ap.add_argument('--port', type=int, default=9519)
@@ -314,7 +320,7 @@ def main():
                           os.path.join(os.path.abspath(args.out), 'bin'))
   cl = Cluster(hosts, bin_dir, os.path.abspath(args.out),
                profile=args.profile, port=args.port,
-               attr_cache_s=args.attr_cache)
+               attr_cache_s=args.attr_cache, fsync_mode=args.fsync_mode)
   log(f'hosts={hosts} profile={args.profile} tests={len(sel)}')
   ok, msg = cl.up(wipe=True)
   log(f'deploy: {msg}')

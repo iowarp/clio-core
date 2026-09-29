@@ -22,6 +22,7 @@ namespace clio::cte::filesystem {
   X(kMultiCreate, MultiCreateTask, MultiCreate) \
   X(kAdvanceSize, AdvanceSizeTask, AdvanceSize) \
   X(kShardOp, ShardOpTask, ShardOp)       \
+  X(kSyncMeta, SyncMetaTask, SyncMeta)    \
   X(kRead, ReadTask, Read)                \
   X(kWrite, WriteTask, Write)             \
   X(kGetattr, GetattrTask, Getattr)       \

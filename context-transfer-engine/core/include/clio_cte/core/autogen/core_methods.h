@@ -108,7 +108,11 @@ GLOBAL_CROSS_CONST clio::run::u32 kReorganizeHint = 54;
 // filesystem chimod publishes its namespace here so tag search sees paths.
 GLOBAL_CROSS_CONST clio::run::u32 kUpdateTagNames = 55;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 56;
+// fsync(2) for one tag: move its blobs to a persistent tier and sync the
+// devices and WAL that hold them. Broadcast.
+GLOBAL_CROSS_CONST clio::run::u32 kSyncTag = 56;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 57;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -144,6 +148,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[39] = "GetOrCreateTagAlias";
     v[40] = "GetTagName";
     v[55] = "UpdateTagNames";
+    v[56] = "SyncTag";
     v[41] = "GetCapacity";
     v[42] = "GetNumAliases";
     v[43] = "PodPutBlob";

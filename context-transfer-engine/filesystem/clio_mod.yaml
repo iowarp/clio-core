@@ -39,3 +39,4 @@ kAdvanceSize: 37
 # Internal: one operation on hash-owned namespace state (directory entries
 # by hash of the directory path, inodes at their home container).
 kShardOp: 38
+kSyncMeta: 39        # fsync the namespace log (broadcast; fsync/fsyncdir)
