@@ -129,6 +129,8 @@ struct CfsHandle {
   // Deferred appends accepted through this handle and not yet flushed: a
   // read, fstat, fsync or close through it first waits for their merge.
   std::atomic<bool> appended{false};
+  // Opened with O_NOATIME, or atime already touched by a read through it.
+  std::atomic<bool> atime_done{false};
 };
 
 /**
@@ -474,8 +476,11 @@ int DrainSievePages(const clio::cte::core::TagId &tag,
        off += clio::cte::filesystem::kFsPageSize) {
     const std::string page = clio::cte::filesystem::PageName(off);
     clio::cte::core::Client::AwaitPendingPuts(tag, page);
-    const int e = clio::cte::core::Client::DeferTakeKeyError(
+    int e = clio::cte::core::Client::DeferTakeKeyError(
         clio::cte::core::Client::DeferKeyHash(tag, page));
+    // Page latches hold store return codes: a full store is ENOSPC, as on
+    // ext4, not the EIO every other failure becomes.
+    if (e == static_cast<int>(clio::cte::core::kPutNoSpaceRc)) e = ENOSPC;
     if (e != 0 && first_err == 0) first_err = e;
   }
   return first_err;
@@ -1886,6 +1891,7 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
       }
     }
     handle->append = (fi->flags & O_APPEND) != 0;
+    handle->atime_done = (fi->flags & O_NOATIME) != 0;
     if (handle->append && MultiNode()) fi->direct_io = 1;  // offset is ours
   fi->fh = reinterpret_cast<uint64_t>(handle);
     MaybeDirectIo(fi);
@@ -1906,6 +1912,7 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
       static_cast<clio::run::u32>(t->tag_packed_ >> 32),
       static_cast<clio::run::u32>(t->tag_packed_ & 0xffffffffULL));
   handle->append = (fi->flags & O_APPEND) != 0;
+  handle->atime_done = (fi->flags & O_NOATIME) != 0;
   if (handle->append && MultiNode()) fi->direct_io = 1;  // offset is ours
   fi->fh = reinterpret_cast<uint64_t>(handle);
   MaybeDirectIo(fi);
@@ -1927,6 +1934,7 @@ int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
       handle->path = p;
       handle->tag = pc.tag;
       handle->append = (fi->flags & O_APPEND) != 0;
+      handle->atime_done = (fi->flags & O_NOATIME) != 0;
       if (handle->append && MultiNode()) fi->direct_io = 1;  // offset is ours
   fi->fh = reinterpret_cast<uint64_t>(handle);
       MaybeDirectIo(fi);
@@ -1949,6 +1957,7 @@ int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
       static_cast<clio::run::u32>(t->tag_packed_ >> 32),
       static_cast<clio::run::u32>(t->tag_packed_ & 0xffffffffULL));
   handle->append = (fi->flags & O_APPEND) != 0;
+  handle->atime_done = (fi->flags & O_NOATIME) != 0;
   if (handle->append && MultiNode()) fi->direct_io = 1;  // offset is ours
   fi->fh = reinterpret_cast<uint64_t>(handle);
   MaybeDirectIo(fi);
@@ -2204,11 +2213,51 @@ int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
 // Read / Write — delegated to the chimod's page-based I/O
 // ============================================================================
 
+/** How reads move atime (CLIO_FUSE_ATIME, or the noatime/strictatime/
+ *  relatime mount option; see fuse_cte_main.cc). */
+enum class AtimeMode { kOff, kRelatime, kStrict };
+
+/** @return the mount's atime mode (default relatime, as on Linux). */
+static AtimeMode AtimeModeOf() {
+  static const AtimeMode mode = [] {
+    const char *e = std::getenv("CLIO_FUSE_ATIME");
+    if (e == nullptr) return AtimeMode::kRelatime;
+    if (std::strcmp(e, "0") == 0 || std::strcmp(e, "noatime") == 0) {
+      return AtimeMode::kOff;
+    }
+    if (std::strcmp(e, "strict") == 0 || std::strcmp(e, "strictatime") == 0) {
+      return AtimeMode::kStrict;
+    }
+    return AtimeMode::kRelatime;
+  }();
+  return mode;
+}
+
+/**
+ * First read through an open file: let the file's owner advance atime by
+ * the relatime rule (FUSE leaves atime to the filesystem; nothing moved it
+ * before, generic/192). Once per open, so a streaming read pays one round
+ * trip, and not at all for O_NOATIME opens.
+ * @param handle the open file
+ * @param hp its current path
+ */
+static void TouchAtimeOnRead(CfsHandle *handle, const std::string &hp) {
+  const AtimeMode mode = AtimeModeOf();
+  if (mode == AtimeMode::kOff || handle->atime_done.exchange(true)) return;
+  clio::run::u32 flags = clio::cte::filesystem::kUtimensAccess;
+  if (mode == AtimeMode::kStrict) {
+    flags |= clio::cte::filesystem::kUtimensAccessStrict;
+  }
+  auto t = CLIO_CFS_CLIENT->AsyncUtimens(hp, 0, 0, flags);
+  t.Wait();
+}
+
 int cte_fuse_read(const char *path, char *buf, size_t size,
                          cte_off_t offset, struct fuse_file_info *fi) {
   auto *handle = GetHandle(fi);
   if (!handle) return -EBADF;
   const std::string hp = HandlePath(handle, path);
+  TouchAtimeOnRead(handle, hp);
 
   if (size > static_cast<size_t>(INT_MAX))
     size = static_cast<size_t>(INT_MAX);

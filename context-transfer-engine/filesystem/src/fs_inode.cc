@@ -115,10 +115,15 @@ clio::run::TaskResume Runtime::FlushInodes() {
         it = inode_dirty_.erase(it);  // dropped inodes need no record
       }
     }
+    // kMetaBlob: storing the record is not a change to the file. Without
+    // it every record write (an atime move on read included) advanced the
+    // tag's ctime, which stat reports (generic/003).
+    clio::cte::core::Context meta_ctx;
+    meta_ctx.op_flags_ |= clio::cte::core::Context::kMetaBlob;
     for (const auto &w : work) {
       auto p = cte_.AsyncPutBlob(FsUnpack(w.first), kInodeBlob, 0,
                                  w.second.size(), w.second.data(), -1.0f,
-                                 clio::cte::core::Context(), 0u,
+                                 meta_ctx, 0u,
                                  clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(p);
       std::lock_guard<std::mutex> g(meta_mu_);

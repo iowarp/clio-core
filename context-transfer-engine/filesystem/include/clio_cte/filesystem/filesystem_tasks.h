@@ -489,9 +489,16 @@ struct TruncateTask : public clio::run::Task {
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };
 
+/** UtimensTask flag: a read of the file. The owner advances atime by the
+ *  relatime rule and leaves mtime and ctime alone; other bits are ignored. */
+GLOBAL_CROSS_CONST clio::run::u32 kUtimensAccess = 16u;
+/** With kUtimensAccess: strictatime -- every read moves atime. */
+GLOBAL_CROSS_CONST clio::run::u32 kUtimensAccessStrict = 32u;
+
 /** Utimens: set a file's atime/mtime (ns). flags bit0=set atime, bit1=set
  *  mtime; a cleared bit means UTIME_OMIT (leave that stamp). ctime always
- *  bumps. UTIME_NOW is resolved to a concrete ns value by the adapter. */
+ *  bumps (except for kUtimensAccess). UTIME_NOW is resolved to a concrete
+ *  ns value by the adapter. */
 struct UtimensTask : public clio::run::Task {
   IN clio::run::priv::string path_;
   IN clio::run::u64 atime_ns_;

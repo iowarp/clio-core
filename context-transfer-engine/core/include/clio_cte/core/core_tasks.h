@@ -891,6 +891,9 @@ static constexpr clio::run::u32 REPLICA_UPDATE_ONLY = 0x8;
 static constexpr clio::run::u32 REPLICA_VERIFY_COMPLETE = 0x10;
 /** Return code of an UPDATE_ONLY replica write against an absent slot. */
 static constexpr clio::run::u32 kReplicaAbsentRc = 12;
+/** PutBlob could not place the bytes: every eligible tier is full (10 +
+ *  ExtendBlob's out-of-space code). A filesystem reports it as ENOSPC. */
+static constexpr clio::run::u32 kPutNoSpaceRc = 13;
 /** PutBlob with Context::kPutIfAbsent found the blob already there. */
 static constexpr clio::run::u32 kPutExistsRc = 60;
 /** PutBlob with Context::kPutIfVersion found a different version. */
@@ -1772,6 +1775,10 @@ struct Context {
    *  the owner is down). Shadows are left out of blob listings, queries and
    *  tag sizes, so a blob is never counted twice. */
   static constexpr clio::run::u32 kShadowCopy = 1u << 5;
+  /** kMetaBlob -- the blob holds the tag's own metadata (e.g. clio-fs
+   *  inode records), not its content: the put does not stamp the tag's
+   *  modify/change times. Size accounting is unchanged. */
+  static constexpr clio::run::u32 kMetaBlob = 1u << 6;
 
   /**
    * Fault-handler parameters (checkpointing / lazy copy). When the core

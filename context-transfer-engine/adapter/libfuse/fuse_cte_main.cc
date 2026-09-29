@@ -55,6 +55,7 @@
 #include <cstdio>   // snprintf, fprintf
 #include <cstdlib>  // atoi, getenv
 #include <cstring>  // strncmp, strerror
+#include <string>
 #include <vector>
 #include <fcntl.h>
 
@@ -134,8 +135,61 @@ static void DefaultMountServerWait() {
   }
 }
 
+/**
+ * Take the atime mount options (-o noatime / strictatime / relatime and
+ * their negations) out of argv and carry the choice to the read path as
+ * CLIO_FUSE_ATIME. FUSE leaves atime to the filesystem, so the kernel flag
+ * would change nothing -- and libfuse rejects relatime/strictatime as
+ * unknown, failing the mount. An explicit CLIO_FUSE_ATIME wins. The option
+ * strings are rewritten in place (they only shrink); one left empty becomes
+ * "rw".
+ * @param argc argument count
+ * @param argv arguments (modified)
+ */
+static void AtimeFromMountOptions(int argc, char *argv[]) {
+  const char *mode = nullptr;
+  for (int i = 1; i < argc; ++i) {
+    char *opts = nullptr;
+    if (std::strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+      opts = argv[++i];
+    } else if (std::strncmp(argv[i], "-o", 2) == 0) {
+      opts = argv[i] + 2;
+    } else {
+      continue;
+    }
+    std::string kept;
+    std::string all(opts);
+    size_t pos = 0;
+    while (pos <= all.size()) {
+      size_t end = all.find(',', pos);
+      if (end == std::string::npos) end = all.size();
+      const std::string tok = all.substr(pos, end - pos);
+      pos = end + 1;
+      if (tok == "noatime") { mode = "0"; continue; }
+      if (tok == "strictatime") { mode = "strict"; continue; }
+      if (tok == "relatime" || tok == "atime") { mode = "relatime"; continue; }
+      if (tok == "norelatime" || tok == "nostrictatime" ||
+          tok == "nodiratime" || tok == "diratime") {
+        continue;
+      }
+      if (tok.empty()) continue;
+      if (!kept.empty()) kept += ',';
+      kept += tok;
+    }
+    if (kept.empty()) kept = "rw";
+    std::memcpy(opts, kept.c_str(), kept.size() + 1);
+  }
+  if (mode == nullptr || std::getenv("CLIO_FUSE_ATIME") != nullptr) return;
+#ifdef _WIN32
+  _putenv_s("CLIO_FUSE_ATIME", mode);
+#else
+  setenv("CLIO_FUSE_ATIME", mode, 1);
+#endif
+}
+
 int main(int argc, char *argv[]) {
   DefaultMountServerWait();
+  AtimeFromMountOptions(argc, argv);
 #if defined(_WIN32) || defined(__APPLE__)
   // Native Windows (WinFsp) and macOS (macFUSE): no Apptainer-style
   // /dev/fuse fd injection. fuse_main() parses argv (on Windows the

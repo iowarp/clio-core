@@ -594,9 +594,43 @@ bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
   return true;
 }
 
+namespace {
+/**
+ * Whether a blob, named by its composite key "major.minor.name", hashes to
+ * another container of `pool` (a remote copy or failover write kept here).
+ * @param pool the core pool
+ * @param me this container
+ * @param composite_key the blob's key
+ * @return true if another container owns it
+ */
+bool ForeignBlobKey(clio::run::PoolId pool, clio::run::u32 me,
+                    const std::string &composite_key) {
+  const clio::run::u32 n = PoolContainers(pool);
+  if (n <= 1) return false;
+  const size_t d1 = composite_key.find('.');
+  const size_t d2 = d1 == std::string::npos ? d1
+                                            : composite_key.find('.', d1 + 1);
+  if (d2 == std::string::npos) return false;
+  const TagId tag(static_cast<clio::run::u32>(
+                      std::strtoul(composite_key.c_str(), nullptr, 10)),
+                  static_cast<clio::run::u32>(std::strtoul(
+                      composite_key.c_str() + d1 + 1, nullptr, 10)));
+  return BlobHash(tag, composite_key.substr(d2 + 1)) % n != me;
+}
+}  // namespace
+
 void Runtime::MirrorBlobToShm(const std::string &composite_key,
                               const BlobInfo &info) {
   if (!shm_cache_.IsEnabled()) {
+    return;
+  }
+  // Only the owner publishes a blob to this node's clients. A copy kept
+  // here for another container (a remote copy, a failover write -- the
+  // shadow flag does not survive a restart, so check the hash too) is not
+  // authoritative: served from the mirror it read stale, or zeros once a
+  // restart had emptied its RAM tier.
+  if (info.shadow_ || ForeignBlobKey(pool_id_, container_id_, composite_key)) {
+    shm_cache_.EraseBlob(composite_key);
     return;
   }
   ShmBlobRecord rec;
@@ -2480,9 +2514,11 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         tag_id_to_info_.insert_or_assign(tag_id, tag_info_ptr);
       }
       if (tag_info_ptr) {
-        tag_info_ptr->last_modified_ = GetWallTimeNs();
-        tag_info_ptr->last_changed_ =
-            tag_info_ptr->last_modified_;  // size change => ctime bump
+        if ((task->context_.op_flags_ & Context::kMetaBlob) == 0) {
+          tag_info_ptr->last_modified_ = GetWallTimeNs();
+          tag_info_ptr->last_changed_ =
+              tag_info_ptr->last_modified_;  // size change => ctime bump
+        }
         if (size_change >= 0) {
           tag_info_ptr->total_size_ += static_cast<clio::run::u64>(size_change);
         } else {

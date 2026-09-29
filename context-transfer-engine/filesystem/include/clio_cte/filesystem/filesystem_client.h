@@ -695,7 +695,8 @@ class Client : public clio::cte::core::Client {
       if (fut->GetReturnCode() == 0) {
         ret = static_cast<FsSsize>(fut->bytes_written_);
       } else {
-        errno = EIO;
+        // The chimod reports a full store as ENOSPC; all else is EIO.
+        errno = fut->GetReturnCode() == ENOSPC ? ENOSPC : EIO;
         ret = -1;
       }
       PoolFreeStaging(staging, count);

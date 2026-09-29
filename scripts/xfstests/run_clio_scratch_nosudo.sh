@@ -85,10 +85,12 @@ install_mount_helper() {
   cat > "${SHADOW_SBIN}/mount.fuse.${SUBTYP}" <<EOF
 #!/bin/bash
 # mount(8) invokes: mount.fuse.${SUBTYP} <device> <mountpoint> [-o opts]
-dev="\$1"; mnt="\$2"
+dev="\$1"; mnt="\$2"; opts=""
+[ "\${3:-}" = "-o" ] && opts=",\$4"
 case "\$dev" in *scratch*) port=${SCRATCH_PORT} ;; *) port=${TEST_PORT} ;; esac
+# The test's own mount options (noatime, strictatime, ...) ride along.
 exec env ${CLIO_ENV[*]} CLIO_PORT=\$port CLIO_WITH_RUNTIME=0 \\
-  "${CLF}" "\$mnt" -o "fsname=\$dev,allow_other,default_permissions"
+  "${CLF}" "\$mnt" -o "fsname=\$dev,allow_other,default_permissions\$opts"
 EOF
   chmod +x "${SHADOW_SBIN}/mount.fuse.${SUBTYP}"
   mount --bind "${SHADOW_SBIN}" /usr/sbin || return 1

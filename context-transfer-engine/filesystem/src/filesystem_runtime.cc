@@ -95,7 +95,7 @@ inline std::vector<std::pair<std::string, std::string>> DeserializeXattrs(
 enum : clio::run::u32 {
   kSetAtime = 1u, kSetMtime = 2u, kSetAtimeNow = 4u, kSetMtimeNow = 8u,
   kSetUid = 16u, kSetGid = 32u, kSetMode = 64u, kAttrRepair = 128u,
-  kSetCtimeOnly = 256u,
+  kSetCtimeOnly = 256u, kAccessTouch = 512u, kAccessStrict = 1024u,
 };
 
 /** Random backoff (us) for a two-party operation that lost a race. */
@@ -666,6 +666,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   clio::run::u64 done = 0;
   clio::run::u64 cur = task->offset_;
   bool ok = true;
+  bool no_space = false;  // the store is full: ENOSPC, not EIO
   while (done < want) {
     clio::run::u64 page_off = cur % kFsPageSize;
     clio::run::u64 to_write = std::min(kFsPageSize - page_off, want - done);
@@ -688,7 +689,11 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
                                clio::cte::core::Context::Preallocate(prealloc),
                                /*flags*/ 0u, clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(p);
-    if (p->GetReturnCode() != 0) { ok = false; break; }
+    if (p->GetReturnCode() != 0) {
+      ok = false;
+      no_space = p->GetReturnCode() == clio::cte::core::kPutNoSpaceRc;
+      break;
+    }
     done += to_write;
     cur += to_write;
   }
@@ -711,7 +716,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   }
   task->bytes_written_ = done;
   task->new_size_ = new_size;
-  task->return_code_ = ok ? 0 : EIO;
+  task->return_code_ = ok ? 0 : (no_space ? ENOSPC : EIO);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -1310,7 +1315,12 @@ clio::run::TaskResume Runtime::Utimens(clio::run::shared_ptr<UtimensTask> &task)
   FsReq r;
   // Same bit layout as the task: bit0/1 explicit atime/mtime, bit2/3 NOW
   // (resolved on the owner so the stamp shares its clock).
-  r.flags_ = task->flags_ & (kSetAtime | kSetMtime | kSetAtimeNow | kSetMtimeNow);
+  r.flags_ = task->flags_ &
+             (kSetAtime | kSetMtime | kSetAtimeNow | kSetMtimeNow);
+  if (task->flags_ & kUtimensAccess) {
+    r.flags_ = kAccessTouch |
+               ((task->flags_ & kUtimensAccessStrict) ? kAccessStrict : 0u);
+  }
   r.a_ = task->atime_ns_;
   r.b_ = task->mtime_ns_;
   int rc = 0;

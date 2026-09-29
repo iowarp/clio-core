@@ -141,6 +141,10 @@ enum : clio::run::u32 {
   kSetAtime = 1u, kSetMtime = 2u, kSetAtimeNow = 4u, kSetMtimeNow = 8u,
   kSetUid = 16u, kSetGid = 32u, kSetMode = 64u, kAttrRepair = 128u,
   kSetCtimeOnly = 256u,
+  // A read: advance atime by the relatime rule, never ctime (see
+  // InodeSetAttr). Set from the UtimensTask flag kUtimensAccess.
+  kAccessTouch = 512u,
+  kAccessStrict = 1024u,  // with kAccessTouch: strictatime, always move
 };
 }  // namespace
 
@@ -545,6 +549,10 @@ int Runtime::DirAttrOp(const FsReq &req, FsResp &resp) {
   }
   const clio::run::u64 now = NowNs();
   bool changed = false;
+  if (f & kAccessTouch) {  // directory reads do not track atime
+    DirAttrLocked(*ds, &resp.attr_);
+    return 0;
+  }
   if (f & kSetAtimeNow) { ds->atime_ = now; changed = true; }
   else if (f & kSetAtime) { ds->atime_ = req.a_; changed = true; }
   if (f & kSetMtimeNow) { ds->mtime_ = now; changed = true; }
@@ -758,6 +766,20 @@ int Runtime::InodeSetAttr(const FsReq &req, FsResp &resp) {
   if (it == by_tag_.end()) return ENOENT;
   FileInfo &fi = *it->second;
   const clio::run::u64 now = NowNs();
+  if (f & kAccessTouch) {
+    // relatime (the Linux default): a read moves atime only when it is not
+    // newer than the last change or is a day old. A read is not a change,
+    // so ctime stays.
+    constexpr clio::run::u64 kDayNs = 86400ull * 1000000000ull;
+    if ((f & kAccessStrict) || fi.atime_ <= fi.mtime_ ||
+        fi.atime_ <= fi.ctime_ || now - fi.atime_ >= kDayNs) {
+      fi.atime_ = now;
+      LogInode(fi);
+      if (!fi.path_.empty()) MirrorFile(fi.path_, fi);
+    }
+    InodeAttrLocked(fi, &resp.attr_);
+    return 0;
+  }
   if (f & kSetAtimeNow) fi.atime_ = now;
   else if (f & kSetAtime) fi.atime_ = req.a_;
   if (f & kSetMtimeNow) fi.mtime_ = now;
