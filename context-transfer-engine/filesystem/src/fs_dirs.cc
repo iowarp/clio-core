@@ -1101,7 +1101,7 @@ clio::run::TaskResume Runtime::DirBlocks(clio::run::u64 dir,
     }
     // Cached blocks load without suspending: let a large listing share the
     // worker.
-    if (out->size() % 64 == 0) CLIO_CO_AWAIT(clio::run::yield(0));
+    if (out->size() % 64 == 0) CLIO_CO_AWAIT(clio::run::yield(1.0));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
