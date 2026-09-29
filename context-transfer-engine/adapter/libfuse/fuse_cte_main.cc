@@ -55,6 +55,7 @@
 #include <cstdio>   // snprintf, fprintf
 #include <cstdlib>  // atoi, getenv
 #include <cstring>  // strncmp, strerror
+#include <vector>
 #include <fcntl.h>
 
 #ifndef _WIN32
@@ -87,6 +88,35 @@ static ssize_t cte_custom_read(int fd, void *buf, size_t buf_len,
 }
 #endif  // !__APPLE__ && FUSE_VERSION >= 3.14
 #endif  // _WIN32
+
+/**
+ * Whether the kernel should enforce permission bits (FUSE
+ * default_permissions): mode, owner and group are checked against every
+ * access like on ext4. CLIO_FUSE_PERMISSIONS=0 turns it off.
+ * @return true unless disabled
+ */
+static bool EnforcePermissions() {
+  const char *e = std::getenv("CLIO_FUSE_PERMISSIONS");
+  return e == nullptr || std::strcmp(e, "0") != 0;
+}
+
+/**
+ * argv for fuse_main, plus "-o default_permissions" when enforced.
+ * @param argc argument count
+ * @param argv arguments
+ * @return null-terminated argument vector (size() - 1 arguments)
+ */
+static std::vector<char *> MountArgv(int argc, char *argv[]) {
+  static char opt_flag[] = "-o";
+  static char opt_perm[] = "default_permissions";
+  std::vector<char *> v(argv, argv + argc);
+  if (EnforcePermissions()) {
+    v.push_back(opt_flag);
+    v.push_back(opt_perm);
+  }
+  v.push_back(nullptr);
+  return v;
+}
 
 int main(int argc, char *argv[]) {
 #if defined(_WIN32) || defined(__APPLE__)
@@ -123,7 +153,9 @@ int main(int argc, char *argv[]) {
 
   if (prefd == -1) {
     cte_fuse_mark_session_live();
-  return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
+    std::vector<char *> mount_argv = MountArgv(argc, argv);
+    return fuse_main(static_cast<int>(mount_argv.size()) - 1,
+                     mount_argv.data(), &cte_fuse_ops, nullptr);
   }
 
 #if FUSE_VERSION < FUSE_MAKE_VERSION(3, 14)
@@ -177,6 +209,7 @@ int main(int argc, char *argv[]) {
                mountpoint, prefd);
 
   struct fuse_args args = FUSE_ARGS_INIT(new_argc, argv);
+  if (EnforcePermissions()) fuse_opt_add_arg(&args, "-odefault_permissions");
   struct fuse *fuse =
       (cte_fuse_mark_session_live(),
        fuse_new(&args, &cte_fuse_ops, sizeof(cte_fuse_ops), nullptr));

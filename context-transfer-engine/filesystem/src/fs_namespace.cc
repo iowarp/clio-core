@@ -801,18 +801,27 @@ clio::run::TaskResume Runtime::InodeTruncate(const FsReq &req, FsResp &resp) {
     if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
     InodeAttrLocked(*fi, &resp.attr_);
   }
-  if (new_size >= old_size) CLIO_CO_RETURN;
-  // Shrink: trim the boundary page and physically ZERO its surviving tail
-  // (a later write past EOF re-extends over it; the old bytes must not
-  // reappear inside what is now a hole), then drop whole pages beyond it.
+  // The pages are the truth, not the size: a client pushes a file's size
+  // lazily (at close), so the recorded size can trail bytes already stored.
+  // Cut whatever the boundary page holds past the new end, and let the page
+  // walk below go past the recorded end while pages exist.
   const clio::run::u64 boundary_page = new_size / kFsPageSize;
   const clio::run::u64 boundary_off = new_size % kFsPageSize;
   {
-    auto tb = cte_.AsyncTruncateBlob(tag, std::to_string(boundary_page),
-                                     boundary_off,
-                                     clio::run::PoolQuery::Dynamic());
-    CLIO_CO_AWAIT(tb);
+    auto bs = cte_.AsyncGetBlobSize(tag, std::to_string(boundary_page));
+    CLIO_CO_AWAIT(bs);
+    if (bs->GetReturnCode() == 0 && bs->size_ > boundary_off) {
+      auto tb = cte_.AsyncTruncateBlob(tag, std::to_string(boundary_page),
+                                       boundary_off,
+                                       clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(tb);
+      old_size = std::max(old_size, boundary_page * kFsPageSize + bs->size_);
+    }
   }
+  if (new_size >= old_size) CLIO_CO_RETURN;
+  // Shrink: physically ZERO the boundary page's surviving tail (a later
+  // write past EOF re-extends over it; the old bytes must not reappear
+  // inside what is now a hole), then drop whole pages beyond it.
   const clio::run::u64 page_tail_end =
       std::min(kFsPageSize, old_size - boundary_page * kFsPageSize);
   constexpr clio::run::u64 kZChunk = 64 * 1024;
@@ -840,11 +849,16 @@ clio::run::TaskResume Runtime::InodeTruncate(const FsReq &req, FsResp &resp) {
     }
     zoff += zlen;
   }
+  // Pages up to the recorded end, then on while they exist (the recorded
+  // end may trail stored pages; see above). Bounded probe past the end.
+  constexpr clio::run::u64 kMaxProbePages = 64;
   const clio::run::u64 last_page = (old_size - 1) / kFsPageSize;
-  for (clio::run::u64 pg = boundary_page + 1; pg <= last_page; ++pg) {
+  for (clio::run::u64 pg = boundary_page + 1;
+       pg <= last_page + kMaxProbePages; ++pg) {
     auto d = cte_.AsyncDelBlob(tag, std::to_string(pg),
                                clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(d);
+    if (pg > last_page && d->GetReturnCode() != 0) break;  // past the data
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

@@ -412,8 +412,47 @@ void HiwaterRename(const std::string &from, const std::string &to) {
   }
 }
 
+// Per-tag extent of page writes not yet drained. Unlike the hiwater overlay
+// (a SIZE hint that a lazy closer may erase once the size is published),
+// only a drain clears this, so a drain never skips a page a handle wrote:
+// a write, fsync, O_TRUNC sequence whose previous open's closer erased the
+// hiwater left the write in the sieve, and it landed after the truncate.
+std::mutex g_dirty_mtx;
+std::unordered_map<clio::run::u64, clio::run::u64> g_dirty_end;
+
+/**
+ * Record that page writes of `tag` reach `end` bytes.
+ * @param tag the file's tag
+ * @param end byte offset one past the write
+ */
+void DirtyRaise(const clio::cte::core::TagId &tag, clio::run::u64 end) {
+  const clio::run::u64 k =
+      (static_cast<clio::run::u64>(tag.major_) << 32) | tag.minor_;
+  std::lock_guard<std::mutex> lk(g_dirty_mtx);
+  auto &v = g_dirty_end[k];
+  if (end > v) v = end;
+}
+
+/**
+ * Take (and clear) the undrained write extent of `tag`. Taken BEFORE the
+ * drain, so a write racing the drain re-records itself.
+ * @param tag the file's tag
+ * @return the extent, 0 if nothing was written since the last drain
+ */
+clio::run::u64 DirtyTake(const clio::cte::core::TagId &tag) {
+  const clio::run::u64 k =
+      (static_cast<clio::run::u64>(tag.major_) << 32) | tag.minor_;
+  std::lock_guard<std::mutex> lk(g_dirty_mtx);
+  auto it = g_dirty_end.find(k);
+  if (it == g_dirty_end.end()) return 0;
+  const clio::run::u64 v = it->second;
+  g_dirty_end.erase(it);
+  return v;
+}
+
 // Drain every page-blob key of `path`'s file (sieve writes register under
-// (tag, page-name), NOT under the cfs FileKey) up to `hiwater` bytes.
+// (tag, page-name), NOT under the cfs FileKey) up to `hiwater` bytes, or
+// further if the file's page writes reached further (see DirtyRaise).
 /**
  * Land every deferred page write of a file and report whether any failed.
  *
@@ -427,7 +466,9 @@ void HiwaterRename(const std::string &from, const std::string &to) {
  */
 int DrainSievePages(const clio::cte::core::TagId &tag,
                     clio::run::u64 hiwater) {
-  if (tag.IsNull() || hiwater == 0) return 0;
+  if (tag.IsNull()) return 0;
+  hiwater = std::max(hiwater, DirtyTake(tag));
+  if (hiwater == 0) return 0;
   int first_err = 0;
   for (clio::run::u64 off = 0; off < hiwater;
        off += clio::cte::filesystem::kFsPageSize) {
@@ -2278,6 +2319,7 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
       if (rc != 0) return -EIO;
       done += n;
     }
+    DirtyRaise(handle->tag, static_cast<clio::run::u64>(offset) + size);
     HiwaterRaise(hp, static_cast<clio::run::u64>(offset) + size);
     return static_cast<int>(size);
   }
