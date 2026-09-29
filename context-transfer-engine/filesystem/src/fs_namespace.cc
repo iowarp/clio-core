@@ -32,18 +32,17 @@
  */
 
 /**
- * The hash-sharded namespace: the state each filesystem container owns
- * (directories whose path hashes to it, inodes it minted), the ShardOp
- * primitives other containers invoke on that state, and its persistence.
+ * Transport between filesystem containers (ShardOp), inodes, the deferred
+ * data purge, the CTE tag-name publisher and the small per-container system
+ * records (id reservations, orphans). Directories live in fs_dirs.cc.
  *
- * Every primitive is a short critical section with no suspension inside, so
- * the multi-step operations built from them (mkdir, rmdir, rename, link)
- * keep consistency with per-entry states instead of locks held across
- * network round trips: a PENDING entry is reserved but invisible, a LEAVING
- * entry is still visible but cannot be mutated by anyone else. Operations
- * that must wait on such an entry yield and retry; two-party operations
- * (rename, link) fail EBUSY instead and back off, which is what keeps two
- * crossing renames from deadlocking or building a directory cycle.
+ * Multi-step operations (mkdir, rmdir, rename, link) keep consistency with
+ * per-entry states instead of locks held across network round trips: a
+ * PENDING entry is reserved but invisible, a LEAVING entry is still visible
+ * but cannot be mutated by anyone else. Operations that must wait on such an
+ * entry yield and retry; two-party operations (rename, link) fail EBUSY
+ * instead and back off, which is what keeps two crossing renames from
+ * deadlocking or building a directory cycle.
  */
 #include <cerrno>
 #include <fcntl.h>
@@ -55,6 +54,7 @@
 
 #include <clio_ctp/util/config_parse.h>
 #include <clio_runtime/pool_manager.h>
+#include <clio_cte/core/blob_placement.h>
 #include <clio_cte/filesystem/filesystem_runtime.h>
 
 namespace clio::cte::filesystem {
@@ -81,6 +81,8 @@ void EncReq(const Runtime::FsReq &r, std::string *out) {
   e.U32(r.mode_);
   e.U32(r.uid_);
   e.U32(r.gid_);
+  e.U64(r.dir_id_);
+  e.U32(r.block_);
 }
 
 /** Decode a request. @return false on a malformed buffer */
@@ -89,7 +91,8 @@ bool DecReq(const std::string &s, Runtime::FsReq *r) {
   return d.Str(&r->dir_) && d.Str(&r->leaf_) && d.Str(&r->str_) &&
          d.Str(&r->str2_) && d.U64(&r->id_) && d.U64(&r->a_) &&
          d.U64(&r->b_) && d.U32(&r->type_) && d.U32(&r->flags_) &&
-         d.U32(&r->mode_) && d.U32(&r->uid_) && d.U32(&r->gid_);
+         d.U32(&r->mode_) && d.U32(&r->uid_) && d.U32(&r->gid_) &&
+         d.U64(&r->dir_id_) && d.U32(&r->block_);
 }
 
 /** Encode attributes. */
@@ -168,13 +171,15 @@ clio::run::u32 Runtime::NumContainers() {
   return n == 0 ? 1u : static_cast<clio::run::u32>(n);
 }
 
-clio::run::u32 Runtime::DirOwner(const std::string &dir) {
-  return FsDirContainer(dir, NumContainers());
-}
-
 clio::run::u32 Runtime::InodeOwner(clio::run::u64 packed) {
-  if (FsIdHasHome(packed)) return FsIdHome(packed);
-  return static_cast<clio::run::u32>(FsMix64(packed)) % NumContainers();
+  const clio::run::u32 home =
+      FsIdHasHome(packed)
+          ? FsIdHome(packed)
+          : static_cast<clio::run::u32>(FsMix64(packed)) % NumContainers();
+  // While the home's node is dead its successor serves the inode, loaded
+  // from its CTE record (which replication keeps reachable) -- the same
+  // rule the CTE uses for the dead node's blobs.
+  return clio::cte::core::FailoverContainer(pool_id_, home);
 }
 
 clio::run::TaskResume Runtime::CallShard(clio::run::u32 target,
@@ -222,45 +227,117 @@ clio::run::TaskResume Runtime::ShardOp(clio::run::shared_ptr<ShardOpTask> &task)
   CLIO_TASK_BODY_END
 }
 
+clio::run::Future<ShardOpTask> Runtime::SendShard(clio::run::u32 target,
+                                                  clio::run::u32 op,
+                                                  const FsReq &req) {
+  std::string enc;
+  EncReq(req, &enc);
+  return self_.AsyncShardOp(
+      op, enc,
+      clio::run::PoolQuery::DirectId(
+          static_cast<clio::run::ContainerId>(target)));
+}
+
+bool Runtime::ReadShardResp(clio::run::Future<ShardOpTask> &f, FsResp *resp) {
+  *resp = FsResp();
+  if (f->GetReturnCode() != 0 || !DecResp(f->resp_.str(), resp)) {
+    *resp = FsResp();
+    resp->rc_ = EIO;
+    return false;
+  }
+  return true;
+}
+
 clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
                                            FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   int rc = 0;
-  if (op >= kShardInodeStat && op <= kShardInodeXattr) {
-    CLIO_CO_AWAIT(EnsureInode(req.id_));  // lazily loaded after a restart
-  }
   switch (op) {
-    case kShardLookup: {
-      std::lock_guard<std::mutex> g(ns_mu_);
-      Dentry e;
-      rc = LookupLocked(req.dir_, req.leaf_, &e);
-      resp.id_ = FsPack(e.id_);
-      resp.type_ = e.type_;
+    case kShardInsert:
+    case kShardRemove:
+      CLIO_CO_AWAIT(EntryMutation(op, req, resp));
+      rc = static_cast<int>(resp.rc_);
+      break;
+    case kShardDirCreate:
+      CLIO_CO_AWAIT(DirCreate(req, resp));
+      rc = static_cast<int>(resp.rc_);
+      break;
+    case kShardBlockSeal:
+      CLIO_CO_AWAIT(SealBlock(req, resp));
+      rc = static_cast<int>(resp.rc_);
+      break;
+    case kShardDirAttr:
+      CLIO_CO_AWAIT(DirAttrOp(req, resp));
+      rc = static_cast<int>(resp.rc_);
+      break;
+    case kShardBlockFetch:
+      CLIO_CO_AWAIT(ServeBlockFetch(req, resp));
+      rc = static_cast<int>(resp.rc_);
+      break;
+    case kShardBlockPush: rc = ApplyBlockPush(req); break;
+    case kShardBlockInstall:
+      CLIO_CO_AWAIT(InstallBlock(req, resp));
+      rc = static_cast<int>(resp.rc_);
+      break;
+    case kShardBlockDrop:
+      CLIO_CO_AWAIT(DropBlock(req, resp));
+      rc = static_cast<int>(resp.rc_);
+      break;
+    case kShardInodePush: rc = ApplyInodePush(req); break;
+    case kShardPurgeLocal:
+      CLIO_CO_AWAIT(PurgeLocal(req));
+      break;
+    case kShardRepublish: {
+      // A restarted node asks for this container's names (it reset its own).
+      std::string batch;
+      CLIO_CO_AWAIT(EncodeHomeNames(&batch));
+      if (!batch.empty()) {
+        auto u = cte_.AsyncUpdateTagNames(
+            batch, clio::run::PoolQuery::DirectId(
+                       static_cast<clio::run::ContainerId>(req.a_)));
+        CLIO_CO_AWAIT(u);
+        rc = static_cast<int>(u->GetReturnCode());
+      }
       break;
     }
-    case kShardInsert:
-      while ((rc = InsertEntry(req, resp)) == kFsRetry) {
-        CLIO_CO_AWAIT(clio::run::yield(50));
+    default:
+      if (op >= kShardInodeStat && op <= kShardInodeXattr) {
+        CLIO_CO_AWAIT(ExecInodeOp(op, req, resp, rc));
+      } else {
+        rc = EINVAL;
       }
       break;
-    case kShardRemove:
-      while ((rc = RemoveEntry(req, resp)) == kFsRetry) {
-        CLIO_CO_AWAIT(clio::run::yield(50));
-      }
-      break;
-    case kShardDirCreate: rc = DirCreate(req); break;
-    case kShardDirRetire: rc = DirRetire(req); break;
-    case kShardDirAttr: rc = DirAttrOp(req, resp); break;
-    case kShardDirExport: rc = DirExport(req, resp); break;
-    case kShardDirImport: rc = DirImport(req); break;
-    case kShardDirDrop: rc = DirDropOrUnmark(req, true); break;
-    case kShardDirUnmark: rc = DirDropOrUnmark(req, false); break;
+  }
+  // Inode changes are durable (in CTE) and pushed before the caller hears.
+  // Not for cache traffic (pushes, fetches): those change no inode, and a
+  // push handler that waited for this node's own inode stores -- which push
+  // back to the sender, whose handler waits the same way -- deadlocked two
+  // nodes storing inodes cached on each other.
+  if (op != kShardBlockPush && op != kShardInodePush &&
+      op != kShardBlockFetch) {
+    CLIO_CO_AWAIT(FlushInodes());
+  }
+  resp.rc_ = static_cast<clio::run::u32>(rc);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ExecInodeOp(clio::run::u32 op, const FsReq &req,
+                                           FsResp &resp, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  CLIO_CO_AWAIT(EnsureInode(req.id_));  // lazily loaded after a restart
+  switch (op) {
     case kShardInodeStat: {
       auto fi = FindInode(req.id_);
       if (fi == nullptr) { rc = ENOENT; break; }
       std::lock_guard<std::mutex> g(meta_mu_);
       InodeAttrLocked(*fi, &resp.attr_);
       resp.str_ = fi->symlink_;
+      // A stat from another container caches the result: register it, so
+      // every later change reaches it before being acknowledged.
+      const clio::run::u32 who = static_cast<clio::run::u32>(req.a_);
+      if (req.b_ != 0 && who != container_id_) fi->holders_[who] = reg_seq_++;
       break;
     }
     case kShardInodeOpen:
@@ -283,363 +360,12 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
       CLIO_CO_AWAIT(InodeXattr(req, resp));
       rc = static_cast<int>(resp.rc_);
       break;
-    case kShardPurgeLocal:
-      CLIO_CO_AWAIT(PurgeLocal(req));
-      break;
-    case kShardRepublish: {
-      // A restarted node asks for this container's names (it reset its own).
-      const std::string batch = EncodeShardNames();
-      if (!batch.empty()) {
-        auto u = cte_.AsyncUpdateTagNames(
-            batch, clio::run::PoolQuery::DirectId(
-                       static_cast<clio::run::ContainerId>(req.a_)));
-        CLIO_CO_AWAIT(u);
-        rc = static_cast<int>(u->GetReturnCode());
-      }
-      break;
-    }
     default:
       rc = EINVAL;
       break;
   }
-  // Inode changes are durable (in CTE) before the caller hears about them.
-  CLIO_CO_AWAIT(FlushInodes());
-  resp.rc_ = static_cast<clio::run::u32>(rc);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
-}
-
-// ===========================================================================
-// Directory state
-// ===========================================================================
-
-void Runtime::TouchDirLocked(DirState &ds) {
-  const clio::run::u64 now = NowNs();
-  ds.mtime_ = now;
-  ds.ctime_ = now;
-}
-
-void Runtime::DirAttrLocked(const DirState &ds, FsAttr *attr) {
-  attr->id_ = FsPack(ds.id_);
-  attr->type_ = kFsTypeDir;
-  attr->size_ = 0;
-  attr->nlink_ = 2;
-  attr->mode_ = ds.mode_;
-  attr->uid_ = ds.uid_;
-  attr->gid_ = ds.gid_;
-  attr->atime_ = ds.atime_;
-  attr->mtime_ = ds.mtime_;
-  attr->ctime_ = ds.ctime_;
-}
-
-namespace {
-/**
- * The directory state for `dir` (ns_mu_ held), creating the root on first
- * use: "/" exists by definition, so its owner materializes it lazily instead
- * of depending on a bootstrap step that could run before the pool is sized.
- */
-template <typename MapT, typename StateT>
-StateT *FindDir(MapT &dirs, const std::string &dir,
-                const std::function<void(const std::string &, StateT &)> &log) {
-  auto it = dirs.find(dir);
-  if (it != dirs.end()) return it->second.get();
-  if (dir != "/") return nullptr;
-  auto st = std::make_shared<StateT>();
-  st->id_ = FsRootId();
-  const clio::run::u64 now = NowNs();
-  st->atime_ = st->mtime_ = st->ctime_ = now;
-  dirs[dir] = st;
-  log(dir, *st);
-  return st.get();
-}
-}  // namespace
-
-int Runtime::LookupLocked(const std::string &dir, const std::string &leaf,
-                          Dentry *out) {
-  DirState *ds = FindDir<decltype(dirs_), DirState>(
-      dirs_, dir, [this](const std::string &p, DirState &s) { LogDirPut(p, s); });
-  if (ds == nullptr || ds->retiring_) return ENOENT;
-  auto it = ds->ents_.find(leaf);
-  if (it == ds->ents_.end() || it->second.state_ == kEntPending) return ENOENT;
-  *out = it->second;
-  return 0;
-}
-
-int Runtime::InsertEntry(const FsReq &req, FsResp &resp) {
-  const clio::run::u32 f = req.flags_;
-  std::lock_guard<std::mutex> g(ns_mu_);
-  DirState *ds = FindDir<decltype(dirs_), DirState>(
-      dirs_, req.dir_, [this](const std::string &p, DirState &s) { LogDirPut(p, s); });
-  if (ds == nullptr || ds->retiring_) return ENOENT;
-  if (ds->moving_) return (f & kInsFailBusy) ? EBUSY : kFsRetry;
-  auto it = ds->ents_.find(req.leaf_);
-  if ((f & kInsCommit) != 0) {
-    if (it == ds->ents_.end() || it->second.state_ != kEntPending ||
-        FsPack(it->second.id_) != req.id_) {
-      return ENOENT;
-    }
-    it->second.state_ = kEntLive;
-    TouchDirLocked(*ds);
-    LogEnt(true, req.dir_, req.leaf_, it->second, *ds);
-    PublishName(clio::cte::core::TagNameOp::kAddName, it->second.id_,
-                clio::cte::core::MakeTagRefName(ds->id_, req.leaf_));
-    return 0;
-  }
-  if (it != ds->ents_.end()) {
-    Dentry &e = it->second;
-    if (e.state_ != kEntLive) return (f & kInsFailBusy) ? EBUSY : kFsRetry;
-    resp.id_ = FsPack(e.id_);
-    resp.type_ = e.type_;
-    if ((f & kInsExcl) != 0) return EEXIST;
-    if ((f & (kInsReplace | kInsReplaceDir)) == 0) return 0;  // open existing
-    if (FsPack(e.id_) == req.id_) {  // rename onto another link of itself
-      resp.old_id_ = req.id_;
-      return 0;
-    }
-    if (e.type_ == kFsTypeDir && req.type_ != kFsTypeDir) return EISDIR;
-    if (e.type_ != kFsTypeDir && req.type_ == kFsTypeDir) return ENOTDIR;
-    if (e.type_ == kFsTypeDir && (f & kInsReplaceDir) == 0) return ENOTEMPTY;
-    resp.old_id_ = FsPack(e.id_);
-    resp.old_type_ = e.type_;
-    const clio::cte::core::TagId victim = e.id_;
-    e.id_ = FsUnpack(req.id_);
-    e.type_ = req.type_;
-    TouchDirLocked(*ds);
-    LogEnt(true, req.dir_, req.leaf_, e, *ds);
-    if ((f & kInsNoTagName) == 0) {
-      const std::string tn = clio::cte::core::MakeTagRefName(ds->id_, req.leaf_);
-      PublishName(clio::cte::core::TagNameOp::kRemoveName, victim, tn);
-      PublishName(clio::cte::core::TagNameOp::kAddName, e.id_, tn);
-    }
-    resp.id_ = req.id_;
-    resp.type_ = req.type_;
-    resp.attr_.id_ = FsPack(ds->id_);  // the directory's id (tag parent)
-    return 0;
-  }
-  Dentry e;
-  e.type_ = req.type_;
-  e.state_ = (f & kInsPending) ? kEntPending : kEntLive;
-  if ((f & kInsNewInode) != 0) {
-    clio::run::u64 want = req.id_;
-    if (want != 0 && (InodeOwner(want) != container_id_ ||
-                      FindInode(want) != nullptr)) {
-      return EEXIST;  // a client-minted id that is not ours or is taken
-    }
-    e.id_ = want != 0 ? FsUnpack(want) : MintId();
-    NewInode(e.id_, req.type_, req.mode_, req.str_,
-             FsJoin(req.dir_, req.leaf_));
-  } else {
-    e.id_ = req.id_ != 0 ? FsUnpack(req.id_) : MintId();
-  }
-  ds->ents_[req.leaf_] = e;
-  if (e.state_ == kEntLive) {
-    TouchDirLocked(*ds);
-    LogEnt(true, req.dir_, req.leaf_, e, *ds);
-    if ((f & kInsNoTagName) == 0) {
-      PublishName(clio::cte::core::TagNameOp::kAddName, e.id_,
-                  clio::cte::core::MakeTagRefName(ds->id_, req.leaf_));
-    }
-  }
-  resp.id_ = FsPack(e.id_);
-  resp.type_ = e.type_;
-  resp.created_ = 1;
-  resp.attr_.id_ = FsPack(ds->id_);  // the directory's id (tag parent)
-  return 0;
-}
-
-int Runtime::RemoveEntry(const FsReq &req, FsResp &resp) {
-  const clio::run::u32 f = req.flags_;
-  std::lock_guard<std::mutex> g(ns_mu_);
-  auto dit = dirs_.find(req.dir_);
-  if (dit == dirs_.end()) return ENOENT;
-  DirState &ds = *dit->second;
-  if (ds.moving_ && (f & kRmRestore) == 0) {
-    return (f & kRmFailBusy) ? EBUSY : kFsRetry;
-  }
-  auto it = ds.ents_.find(req.leaf_);
-  if (it == ds.ents_.end()) return ENOENT;
-  Dentry &e = it->second;
-  const bool mine = req.id_ != 0 && FsPack(e.id_) == req.id_;
-  if ((f & kRmRestore) != 0) {
-    if (mine && e.state_ == kEntLeaving) e.state_ = kEntLive;
-    return 0;
-  }
-  if (req.id_ != 0 && !mine) return ENOENT;  // replaced underneath us
-  if (e.state_ == kEntPending && mine) {    // abort a reservation
-    ds.ents_.erase(it);
-    return 0;
-  }
-  // A leaving entry may only be finished by the operation that marked it
-  // (which names the id); everyone else waits for the outcome.
-  if (e.state_ != kEntLive && !(e.state_ == kEntLeaving && mine &&
-                                (f & kRmMarkLeaving) == 0)) {
-    return (f & kRmFailBusy) ? EBUSY : kFsRetry;
-  }
-  if ((f & kRmNonDir) != 0 && e.type_ == kFsTypeDir) return EISDIR;
-  if ((f & kRmDirOnly) != 0 && e.type_ != kFsTypeDir) return ENOTDIR;
-  resp.old_id_ = FsPack(e.id_);
-  resp.old_type_ = e.type_;
-  resp.attr_.id_ = FsPack(ds.id_);  // the directory's id (tag parent)
-  if ((f & kRmMarkLeaving) != 0) {
-    e.state_ = kEntLeaving;
-    return 0;
-  }
-  Dentry gone = e;
-  ds.ents_.erase(it);
-  TouchDirLocked(ds);
-  LogEnt(false, req.dir_, req.leaf_, gone, ds);
-  if ((f & kRmNoTagName) == 0) {
-    PublishName(clio::cte::core::TagNameOp::kRemoveName, gone.id_,
-                clio::cte::core::MakeTagRefName(ds.id_, req.leaf_));
-  }
-  return 0;
-}
-
-int Runtime::DirCreate(const FsReq &req) {
-  std::lock_guard<std::mutex> g(ns_mu_);
-  auto &slot = dirs_[req.dir_];
-  if (slot != nullptr && !slot->ents_.empty()) {
-    // A state with entries but no parent entry: left by a crash between the
-    // two halves of an earlier rename or rmdir. The caller just proved the
-    // name absent, so the new directory replaces it.
-    HLOG(kWarning, "filesystem: mkdir {} replaces an orphaned listing ({} "
-         "entries)", req.dir_, slot->ents_.size());
-  }
-  slot = std::make_shared<DirState>();
-  slot->id_ = FsUnpack(req.id_);
-  slot->mode_ = req.mode_;
-  slot->uid_ = req.uid_;
-  slot->gid_ = req.gid_;
-  const clio::run::u64 now = NowNs();
-  slot->atime_ = slot->mtime_ = slot->ctime_ = now;
-  LogDirPut(req.dir_, *slot);
-  return 0;
-}
-
-int Runtime::DirRetire(const FsReq &req) {
-  std::lock_guard<std::mutex> g(ns_mu_);
-  auto it = dirs_.find(req.dir_);
-  if (it == dirs_.end()) return 0;  // already gone (crash between halves)
-  DirState &ds = *it->second;
-  if (ds.moving_) return EBUSY;
-  if (!ds.ents_.empty()) return ENOTEMPTY;
-  dirs_.erase(it);
-  std::string p;
-  FsEnc(&p).Str(req.dir_);
-  log_.Append(FsLogRec::kDirDel, p);
-  return 0;
-}
-
-int Runtime::DirAttrOp(const FsReq &req, FsResp &resp) {
-  const clio::run::u32 f = req.flags_;
-  std::lock_guard<std::mutex> g(ns_mu_);
-  DirState *ds = FindDir<decltype(dirs_), DirState>(
-      dirs_, req.dir_, [this](const std::string &p, DirState &s) { LogDirPut(p, s); });
-  if (ds == nullptr) {
-    if ((f & kAttrRepair) == 0 || req.id_ == 0) return ENOENT;
-    // The parent's live entry says this directory exists but its listing is
-    // gone (crash between rmdir's two halves): recreate it empty.
-    auto st = std::make_shared<DirState>();
-    st->id_ = FsUnpack(req.id_);
-    const clio::run::u64 now = NowNs();
-    st->atime_ = st->mtime_ = st->ctime_ = now;
-    dirs_[req.dir_] = st;
-    LogDirPut(req.dir_, *st);
-    ds = st.get();
-  }
-  const clio::run::u64 now = NowNs();
-  bool changed = false;
-  if (f & kAccessTouch) {  // directory reads do not track atime
-    DirAttrLocked(*ds, &resp.attr_);
-    return 0;
-  }
-  if (f & kSetAtimeNow) { ds->atime_ = now; changed = true; }
-  else if (f & kSetAtime) { ds->atime_ = req.a_; changed = true; }
-  if (f & kSetMtimeNow) { ds->mtime_ = now; changed = true; }
-  else if (f & kSetMtime) { ds->mtime_ = req.b_; changed = true; }
-  if (f & kSetUid) { ds->uid_ = req.uid_; changed = true; }
-  if (f & kSetGid) { ds->gid_ = req.gid_; changed = true; }
-  if (f & kSetMode) { ds->mode_ = req.mode_ & 07777u; changed = true; }
-  if (changed || (f & kSetCtimeOnly)) {
-    ds->ctime_ = now;
-    LogDirPut(req.dir_, *ds);
-  }
-  DirAttrLocked(*ds, &resp.attr_);
-  return 0;
-}
-
-int Runtime::DirExport(const FsReq &req, FsResp &resp) {
-  std::lock_guard<std::mutex> g(ns_mu_);
-  auto it = dirs_.find(req.dir_);
-  if (it == dirs_.end()) return ENOENT;
-  DirState &ds = *it->second;
-  if (ds.moving_ || ds.retiring_) return EBUSY;
-  for (const auto &kv : ds.ents_) {
-    if (kv.second.state_ != kEntLive) return EBUSY;  // an op is mid-flight
-  }
-  ds.moving_ = true;
-  std::string blob;
-  FsEnc e(&blob);
-  e.U64(FsPack(ds.id_));
-  e.U32(ds.mode_);
-  e.U32(ds.uid_);
-  e.U32(ds.gid_);
-  e.U64(ds.atime_);
-  e.U64(ds.mtime_);
-  e.U64(ds.ctime_);
-  e.U32(static_cast<clio::run::u32>(ds.ents_.size()));
-  for (const auto &kv : ds.ents_) {
-    e.Str(kv.first);
-    e.U64(FsPack(kv.second.id_));
-    e.U32(kv.second.type_);
-  }
-  resp.str_ = std::move(blob);
-  DirAttrLocked(ds, &resp.attr_);
-  return 0;
-}
-
-int Runtime::DirImport(const FsReq &req) {
-  auto st = std::make_shared<DirState>();
-  FsDec d(req.str_.data(), req.str_.size());
-  clio::run::u64 id = 0;
-  clio::run::u32 n = 0;
-  if (!d.U64(&id) || !d.U32(&st->mode_) || !d.U32(&st->uid_) ||
-      !d.U32(&st->gid_) || !d.U64(&st->atime_) || !d.U64(&st->mtime_) ||
-      !d.U64(&st->ctime_) || !d.U32(&n)) {
-    return EINVAL;
-  }
-  st->id_ = FsUnpack(id);
-  for (clio::run::u32 i = 0; i < n; ++i) {
-    std::string leaf;
-    clio::run::u64 cid = 0;
-    Dentry e;
-    if (!d.Str(&leaf) || !d.U64(&cid) || !d.U32(&e.type_)) return EINVAL;
-    e.id_ = FsUnpack(cid);
-    st->ents_[leaf] = e;
-  }
-  std::lock_guard<std::mutex> g(ns_mu_);
-  dirs_[req.dir_] = st;
-  LogDirPut(req.dir_, *st);
-  for (const auto &kv : st->ents_) {
-    LogEnt(true, req.dir_, kv.first, kv.second, *st);
-  }
-  return 0;
-}
-
-int Runtime::DirDropOrUnmark(const FsReq &req, bool drop) {
-  std::lock_guard<std::mutex> g(ns_mu_);
-  auto it = dirs_.find(req.dir_);
-  if (it == dirs_.end()) return 0;
-  if (req.id_ != 0 && FsPack(it->second->id_) != req.id_) return 0;
-  if (!drop) {
-    it->second->moving_ = false;
-    return 0;
-  }
-  dirs_.erase(it);
-  std::string p;
-  FsEnc(&p).Str(req.dir_);
-  log_.Append(FsLogRec::kDirDel, p);
-  return 0;
 }
 
 // ===========================================================================
@@ -648,14 +374,10 @@ int Runtime::DirDropOrUnmark(const FsReq &req, bool drop) {
 
 clio::cte::core::TagId Runtime::MintId() {
   std::lock_guard<std::mutex> g(meta_mu_);
-  if (next_minor_ >= minted_hi_) {
-    // Reserve ids in blocks and log the reservation BEFORE using any of
-    // them, so a restart can never hand out an id that is still in use.
-    minted_hi_ = next_minor_ + 4096;
-    std::string p;
-    FsEnc(&p).U32(minted_hi_);
-    log_.Append(FsLogRec::kNextId, p);
-  }
+  // Only ids covered by the durable reservation are handed out, so a
+  // restart can never mint one that is still in use (EnsureIdReserve keeps
+  // the reservation ahead; null asks the caller to wait for it).
+  if (next_minor_ >= minted_hi_) return clio::cte::core::TagId::GetNull();
   return clio::cte::core::TagId(kFsIdFlag | (container_id_ & kFsHomeMask),
                                 next_minor_++);
 }
@@ -721,10 +443,11 @@ void Runtime::DropInodeLocked(const std::shared_ptr<FileInfo> &fi) {
     return;
   }
   const clio::run::u64 packed = FsPack(fi->tag_id_);
+  if (fi->orphan_) {
+    std::lock_guard<std::mutex> g(purge_mu_);
+    orphans_dirty_ = true;  // it leaves the orphan record
+  }
   by_tag_.erase(packed);
-  std::string p;
-  FsEnc(&p).U64(packed);
-  log_.Append(FsLogRec::kInodeDel, p);
   PurgeItem item;
   item.id_ = fi->tag_id_;
   item.data_ = true;  // pages and the inode record (symlinks have one too)
@@ -938,11 +661,7 @@ clio::run::TaskResume Runtime::PurgeDrain() {
       CLIO_CO_AWAIT(x);
     }
   }
-  // Keep the log proportional to the live state.
-  constexpr clio::run::u64 kCompactBytes = 256ull << 20;
-  if (log_.IsOpen() && log_.BytesSinceCompact() > kCompactBytes) {
-    CompactLog();
-  }
+  CLIO_CO_AWAIT(StoreOrphans());
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -990,22 +709,6 @@ clio::run::TaskResume Runtime::FlushNames() {
   CLIO_TASK_BODY_END
 }
 
-std::string Runtime::EncodeShardNames() {
-  std::string out;
-  const clio::run::u64 now = NowNs();
-  std::lock_guard<std::mutex> g(ns_mu_);
-  for (const auto &kv : dirs_) {
-    const DirState &ds = *kv.second;
-    for (const auto &ent : ds.ents_) {
-      if (ent.second.state_ == kEntPending) continue;
-      clio::cte::core::EncodeTagNameOp(
-          &out, clio::cte::core::TagNameOp::kAddName, ent.second.id_, now,
-          clio::cte::core::MakeTagRefName(ds.id_, ent.first));
-    }
-  }
-  return out;
-}
-
 clio::run::TaskResume Runtime::CatchUpNames() {
   CLIO_TASK_BODY_BEGIN
   // Every peer re-sends the names it owns to this node. Peers still coming
@@ -1033,222 +736,173 @@ clio::run::TaskResume Runtime::CatchUpNames() {
 }
 
 // ===========================================================================
-// Persistence
+// System records: id reservations and orphans (CTE blobs in sys_tag_id_)
 // ===========================================================================
 
-std::string Runtime::EncDirPut(const std::string &path, const DirState &ds) {
-  std::string p;
-  FsEnc e(&p);
-  e.Str(path);
-  e.U64(FsPack(ds.id_));
-  e.U32(ds.mode_);
-  e.U32(ds.uid_);
-  e.U32(ds.gid_);
-  e.U64(ds.atime_);
-  e.U64(ds.mtime_);
-  e.U64(ds.ctime_);
-  return p;
+namespace {
+/** Blob holding container `c`'s id reservation. */
+std::string IdsBlob(clio::run::u32 c) { return "ids." + std::to_string(c); }
+/** Blob holding container `c`'s orphan list. */
+std::string OrphansBlob(clio::run::u32 c) {
+  return "orphans." + std::to_string(c);
 }
-
-std::string Runtime::EncInode(const FileInfo &fi) {
-  std::string p;
-  FsEnc e(&p);
-  e.U64(FsPack(fi.tag_id_));
-  e.U32(fi.type_);
-  e.U64(0);  // retired: sizes live in the stream pool's log
-  e.U32(fi.nlink_);
-  e.U32(fi.mode_);
-  e.U32(fi.uid_);
-  e.U32(fi.gid_);
-  e.U64(fi.atime_);
-  e.U64(fi.mtime_);
-  e.U64(fi.ctime_);
-  e.U32((fi.orphan_ ? 1u : 0u) | (fi.has_xattr_ ? 2u : 0u));
-  e.Str(fi.symlink_);
-  e.Str(fi.path_);
-  return p;
+/** Context for a clio-fs system record (non-volatile tier when possible). */
+clio::cte::core::Context SysCtx(bool volatile_only) {
+  clio::cte::core::Context ctx;
+  ctx.op_flags_ |= clio::cte::core::Context::kMetaBlob;
+  ctx.min_persistence_level_ = volatile_only ? 0 : 1;
+  return ctx;
 }
-
-void Runtime::LogDirPut(const std::string &path, const DirState &ds) {
-  log_.Append(FsLogRec::kDirPut, EncDirPut(path, ds));
-}
-
-void Runtime::LogEnt(bool put, const std::string &dir, const std::string &leaf,
-                     const Dentry &e, const DirState &ds) {
-  std::string p;
-  FsEnc enc(&p);
-  enc.Str(dir);
-  enc.Str(leaf);
-  if (put) {
-    enc.U64(FsPack(e.id_));
-    enc.U32(e.type_);
-  }
-  enc.U64(ds.mtime_);
-  enc.U64(ds.ctime_);
-  log_.Append(put ? FsLogRec::kEntPut : FsLogRec::kEntDel, p);
-}
+}  // namespace
 
 void Runtime::LogInode(const FileInfo &fi) {
-  // The inode's record lives in CTE (FlushInodes stores it before the change
-  // is acknowledged). The namespace log only tracks orphans -- unlinked while
-  // open -- so a restart can destroy them.
+  // The inode's record lives in CTE (FlushInodes stores and pushes it before
+  // the change is acknowledged). Orphans are also listed in this container's
+  // orphan record, so a restart can destroy them.
   MarkInodeDirtyLocked(fi);
-  if (fi.orphan_) log_.Append(FsLogRec::kInodePut, EncInode(fi));
+  if (fi.orphan_) {
+    std::lock_guard<std::mutex> g(purge_mu_);
+    orphans_dirty_ = true;
+  }
 }
 
-void Runtime::ApplyLogRecord(FsLogRec type, const std::string &payload) {
-  FsDec d(payload.data(), payload.size());
-  std::string dir, leaf;
-  clio::run::u64 id = 0, mt = 0, ct = 0;
-  switch (type) {
-    case FsLogRec::kDirPut: {
-      auto st = std::make_shared<DirState>();
-      if (!d.Str(&dir) || !d.U64(&id) || !d.U32(&st->mode_) ||
-          !d.U32(&st->uid_) || !d.U32(&st->gid_) || !d.U64(&st->atime_) ||
-          !d.U64(&st->mtime_) || !d.U64(&st->ctime_)) {
-        return;
+clio::run::TaskResume Runtime::EnsureIdReserve(clio::run::u32 margin) {
+  CLIO_TASK_BODY_BEGIN
+  for (;;) {
+    clio::run::u32 want = 0;
+    bool go = false;
+    {
+      std::lock_guard<std::mutex> g(meta_mu_);
+      if (minted_hi_ >= next_minor_ + margin) break;
+      if (!reserving_) {
+        reserving_ = go = true;
+        want = next_minor_ + margin + 4096;
       }
-      st->id_ = FsUnpack(id);
-      auto &slot = dirs_[dir];
-      if (slot != nullptr && slot->id_ == st->id_) {
-        st->ents_ = std::move(slot->ents_);  // an attribute update
-      }
-      slot = st;
-      return;
     }
-    case FsLogRec::kDirDel:
-      if (d.Str(&dir)) dirs_.erase(dir);
-      return;
-    case FsLogRec::kEntPut:
-    case FsLogRec::kEntDel: {
-      Dentry e;
-      const bool put = type == FsLogRec::kEntPut;
-      if (!d.Str(&dir) || !d.Str(&leaf)) return;
-      if (put && (!d.U64(&id) || !d.U32(&e.type_))) return;
-      if (!d.U64(&mt) || !d.U64(&ct)) return;
-      auto &slot = dirs_[dir];
-      if (slot == nullptr) slot = std::make_shared<DirState>();
-      if (put) {
-        e.id_ = FsUnpack(id);
-        slot->ents_[leaf] = e;
-      } else {
-        slot->ents_.erase(leaf);
-      }
-      slot->mtime_ = mt;
-      slot->ctime_ = ct;
-      return;
+    if (!go) {
+      CLIO_CO_AWAIT(clio::run::yield(20.0));
+      continue;
     }
-    case FsLogRec::kInodePut: {
-      auto fi = std::make_shared<FileInfo>();
-      clio::run::u64 size = 0;
-      clio::run::u32 flags = 0;
-      if (!d.U64(&id) || !d.U32(&fi->type_) || !d.U64(&size) ||
-          !d.U32(&fi->nlink_) || !d.U32(&fi->mode_) || !d.U32(&fi->uid_) ||
-          !d.U32(&fi->gid_) || !d.U64(&fi->atime_) || !d.U64(&fi->mtime_) ||
-          !d.U64(&fi->ctime_) || !d.U32(&flags) || !d.Str(&fi->symlink_) ||
-          !d.Str(&fi->path_)) {
-        return;
+    bool ok = true;
+    if (!sys_tag_id_.IsNull()) {
+      std::string rec;
+      FsEnc(&rec).U32(want);
+      auto p = cte_.AsyncPutBlob(sys_tag_id_, IdsBlob(container_id_), 0,
+                                 rec.size(), rec.data(), -1.0f,
+                                 SysCtx(inode_volatile_only_), 0u,
+                                 clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(p);
+      ok = p->GetReturnCode() == 0;
+      if (!ok) {
+        HLOG(kError, "filesystem: storing the id reservation failed (rc {}); "
+             "ids minted now could repeat after a restart",
+             p->GetReturnCode());
       }
-      fi->tag_id_ = FsUnpack(id);
-      (void)size;  // retired field (sizes live in the stream pool's log)
-      fi->orphan_ = (flags & 1u) != 0;
-      fi->has_xattr_ = (flags & 2u) != 0;
-      by_tag_[id] = fi;
-      return;
     }
-    case FsLogRec::kInodeDel:
-      if (d.U64(&id)) by_tag_.erase(id);
-      return;
-    case FsLogRec::kNextId: {
+    {
+      std::lock_guard<std::mutex> g(meta_mu_);
+      reserving_ = false;
+      // Unavailability must not stop creates: advance anyway (logged above).
+      minted_hi_ = std::max(minted_hi_, want);
+    }
+    break;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::StoreOrphans() {
+  CLIO_TASK_BODY_BEGIN
+  {
+    std::lock_guard<std::mutex> g(purge_mu_);
+    if (!orphans_dirty_ || sys_tag_id_.IsNull()) CLIO_CO_RETURN;
+    orphans_dirty_ = false;
+  }
+  std::string rec;
+  {
+    FsEnc e(&rec);
+    std::lock_guard<std::mutex> g(meta_mu_);
+    std::vector<clio::run::u64> ids;
+    for (const auto &kv : by_tag_) {
+      if (kv.second->orphan_) ids.push_back(kv.first);
+    }
+    e.U32(static_cast<clio::run::u32>(ids.size()));
+    for (clio::run::u64 id : ids) e.U64(id);
+  }
+  auto p = cte_.AsyncPutBlob(sys_tag_id_, OrphansBlob(container_id_), 0,
+                             rec.size(), rec.data(), -1.0f,
+                             SysCtx(inode_volatile_only_), 0u,
+                             clio::run::PoolQuery::Dynamic());
+  CLIO_CO_AWAIT(p);
+  if (p->GetReturnCode() != 0) {
+    std::lock_guard<std::mutex> g(purge_mu_);
+    orphans_dirty_ = true;  // retried by the next drain tick
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::LoadSysRecords() {
+  CLIO_TASK_BODY_BEGIN
+  if (sys_tag_id_.IsNull()) CLIO_CO_RETURN;
+  std::string rec;
+  {
+    auto sz = cte_.AsyncGetBlobSize(sys_tag_id_, IdsBlob(container_id_));
+    CLIO_CO_AWAIT(sz);
+    if (sz->GetReturnCode() == 0 && sz->size_ >= 4) {
+      rec.assign(sz->size_, '\0');
+      auto g = cte_.AsyncGetBlob(sys_tag_id_, IdsBlob(container_id_), 0,
+                                 rec.size(), 0u, rec.data());
+      CLIO_CO_AWAIT(g);
       clio::run::u32 hi = 0;
-      if (d.U32(&hi)) minted_hi_ = std::max(minted_hi_, hi);
-      return;
-    }
-    default:
-      return;
-  }
-}
-
-void Runtime::RecoverShard(const std::string &log_path, bool replay) {
-  log_path_ = log_path;
-  if (log_path.empty()) {
-    HLOG(kWarning, "filesystem: no metadata_log_path -- this node's slice of "
-         "the namespace is volatile");
-    return;
-  }
-  if (!log_.Open(log_path)) {
-    HLOG(kError, "filesystem: cannot open metadata log {}: {}", log_path,
-         std::strerror(errno));
-    return;
-  }
-  if (!replay) {
-    // Fresh start: whatever an earlier run left here describes data that is
-    // not being recovered. Start from an empty namespace.
-    CompactLog();
-    HLOG(kInfo, "filesystem: fresh namespace (metadata log {})", log_path);
-    return;
-  }
-  size_t n = 0;
-  {
-    std::lock_guard<std::mutex> g1(ns_mu_);
-    std::lock_guard<std::mutex> g2(meta_mu_);
-    n = log_.Replay([this](FsLogRec t, const std::string &p) {
-      ApplyLogRecord(t, p);
-    });
-    // Everything reserved before the crash may be in use: start past it.
-    next_minor_ = std::max<clio::run::u32>(minted_hi_, 1);
-    minted_hi_ = next_minor_;
-    // Handles do not survive a restart, so an orphan (unlinked while open)
-    // can be destroyed now.
-    std::vector<std::shared_ptr<FileInfo>> orphans;
-    for (auto &kv : by_tag_) {
-      if (kv.second->orphan_ || kv.second->nlink_ == 0) {
-        orphans.push_back(kv.second);
+      FsDec d(rec.data(), rec.size());
+      if (g->GetReturnCode() == 0 && d.U32(&hi)) {
+        // Everything reserved before the restart may be in use: start past it.
+        std::lock_guard<std::mutex> lk(meta_mu_);
+        next_minor_ = std::max<clio::run::u32>(hi, 1);
+        minted_hi_ = next_minor_;
       }
     }
-    for (auto &fi : orphans) {
-      fi->open_count_ = 0;
-      DropInodeLocked(fi);
-    }
   }
-  CompactLog();
-  HLOG(kInfo, "filesystem: recovered {} log records from {} ({} dirs, {} "
-       "inodes)", n, log_path, dirs_.size(), by_tag_.size());
-}
-
-void Runtime::CompactLog() {
-  if (!log_.IsOpen()) return;
-  std::lock_guard<std::mutex> g1(ns_mu_);
-  std::lock_guard<std::mutex> g2(meta_mu_);
-  std::vector<std::pair<FsLogRec, std::string>> recs;
+  std::vector<clio::run::u64> orphans;
   {
-    std::string p;
-    FsEnc(&p).U32(std::max(minted_hi_, next_minor_));
-    recs.emplace_back(FsLogRec::kNextId, std::move(p));
-  }
-  for (const auto &kv : dirs_) {
-    recs.emplace_back(FsLogRec::kDirPut, EncDirPut(kv.first, *kv.second));
-    for (const auto &ent : kv.second->ents_) {
-      if (ent.second.state_ == kEntPending) continue;
-      std::string p;
-      FsEnc e(&p);
-      e.Str(kv.first);
-      e.Str(ent.first);
-      e.U64(FsPack(ent.second.id_));
-      e.U32(ent.second.type_);
-      e.U64(kv.second->mtime_);
-      e.U64(kv.second->ctime_);
-      recs.emplace_back(FsLogRec::kEntPut, std::move(p));
+    auto sz = cte_.AsyncGetBlobSize(sys_tag_id_, OrphansBlob(container_id_));
+    CLIO_CO_AWAIT(sz);
+    if (sz->GetReturnCode() == 0 && sz->size_ >= 4) {
+      rec.assign(sz->size_, '\0');
+      auto g = cte_.AsyncGetBlob(sys_tag_id_, OrphansBlob(container_id_), 0,
+                                 rec.size(), 0u, rec.data());
+      CLIO_CO_AWAIT(g);
+      FsDec d(rec.data(), rec.size());
+      clio::run::u32 n = 0;
+      clio::run::u64 id = 0;
+      if (g->GetReturnCode() == 0 && d.U32(&n)) {
+        for (clio::run::u32 i = 0; i < n && d.U64(&id); ++i) {
+          orphans.push_back(id);
+        }
+      }
     }
   }
-  for (const auto &kv : by_tag_) {
-    if (kv.second->orphan_) {
-      recs.emplace_back(FsLogRec::kInodePut, EncInode(*kv.second));
+  // Handles do not survive a restart: an inode unlinked while open can go.
+  for (clio::run::u64 id : orphans) {
+    CLIO_CO_AWAIT(EnsureInode(id));
+    std::lock_guard<std::mutex> g(meta_mu_);
+    auto it = by_tag_.find(id);
+    if (it == by_tag_.end()) continue;
+    std::shared_ptr<FileInfo> fi = it->second;
+    fi->open_count_ = 0;
+    fi->orphan_ = false;
+    DropInodeLocked(fi);
+  }
+  if (!orphans.empty()) {
+    {
+      std::lock_guard<std::mutex> g(purge_mu_);
+      orphans_dirty_ = true;
     }
+    CLIO_CO_AWAIT(StoreOrphans());
   }
-  if (!log_.Rewrite(recs)) {
-    HLOG(kError, "filesystem: compacting metadata log {} failed", log_path_);
-  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 }  // namespace clio::cte::filesystem

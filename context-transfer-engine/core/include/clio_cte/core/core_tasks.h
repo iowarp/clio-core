@@ -5370,6 +5370,65 @@ struct FlushDataTask : public clio::run::Task {
  * performance.fsync_mode "deferred" the container does nothing and reports
  * deferred_ = 1 so a caller can skip later syncs.
  */
+/**
+ * ListLocalBlobsTask - list the blobs a container holds (by tag id, not tag
+ * name) whose names match a pattern. For modules that keep state in blobs
+ * of nameless tags and must find it again after a restart.
+ */
+struct ListLocalBlobsTask : public clio::run::Task {
+  IN clio::run::priv::string blob_regex_;  ///< full-match on blob names
+  OUT std::vector<clio::run::u64> tag_ids_;  ///< packed (major << 32 | minor)
+  OUT std::vector<std::string> blob_names_;  ///< parallel to tag_ids_
+
+  /** SHM default constructor */
+  ListLocalBlobsTask() : clio::run::Task(), blob_regex_(CLIO_PRIV_ALLOC) {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit ListLocalBlobsTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const std::string &blob_regex)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kListLocalBlobs),
+        blob_regex_(CLIO_PRIV_ALLOC, blob_regex) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kListLocalBlobs;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /** Serialize IN and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(blob_regex_);
+  }
+
+  /** Serialize OUT and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(tag_ids_, blob_names_);
+  }
+
+  /** Copy from another ListLocalBlobsTask */
+  void Copy(const ctp::ipc::FullPtr<ListLocalBlobsTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    blob_regex_ = other->blob_regex_;
+    tag_ids_ = other->tag_ids_;
+    blob_names_ = other->blob_names_;
+  }
+
+  /** AggregateOut: concatenate the per-container lists. */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<ListLocalBlobsTask>();
+    tag_ids_.insert(tag_ids_.end(), other->tag_ids_.begin(),
+                    other->tag_ids_.end());
+    blob_names_.insert(blob_names_.end(), other->blob_names_.begin(),
+                       other->blob_names_.end());
+  }
+};
+
 /** SyncTag return code: a persistent tier had no room for the tag's bytes. */
 static constexpr clio::run::u32 kSyncNoSpaceRc = 28;  // ENOSPC
 /** SyncTag return code: a device sync or a read of the tag's bytes failed. */

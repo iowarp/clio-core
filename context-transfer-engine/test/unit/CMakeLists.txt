@@ -1245,6 +1245,20 @@ set_tests_properties(cte_reorganize_no_loss PROPERTIES
     LABELS "unit;cte"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
 
+add_executable(test_fs_dir_block test_fs_dir_block.cc)
+target_include_directories(test_fs_dir_block PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/filesystem/include)
+target_link_libraries(test_fs_dir_block
+    clio_cte_core_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT})
+add_test(NAME cte_fs_dir_block COMMAND test_fs_dir_block)
+set_tests_properties(cte_fs_dir_block PROPERTIES
+    TIMEOUT 120
+    LABELS "unit;cte"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")
+
 add_executable(test_cte_conditional_put test_cte_conditional_put.cc)
 target_include_directories(test_cte_conditional_put PRIVATE
     ${CMAKE_SOURCE_DIR}/context-runtime/test)

@@ -38,6 +38,8 @@
  * container (through the cache chain) to stat the file.
  */
 
+#include <algorithm>
+#include <clio_cte/core/blob_placement.h>
 #include <clio_cte/filesystem/filesystem_runtime.h>
 
 namespace clio::cte::filesystem {
@@ -89,13 +91,52 @@ void Runtime::MarkInodeDirtyLocked(const FileInfo &fi) {
   inode_dirty_.insert(FsPack(fi.tag_id_));
 }
 
+namespace {
+/** Encode the attributes an inode push carries (attrs + symlink target). */
+std::string EncInodePush(const Runtime::FsAttr &a, const std::string &link) {
+  std::string out;
+  FsEnc e(&out);
+  e.U64(a.id_);
+  e.U32(a.type_);
+  e.U64(a.size_);
+  e.U32(a.nlink_);
+  e.U32(a.mode_);
+  e.U32(a.uid_);
+  e.U32(a.gid_);
+  e.U64(a.atime_);
+  e.U64(a.mtime_);
+  e.U64(a.ctime_);
+  e.Str(link);
+  return out;
+}
+
+/** Decode what EncInodePush wrote. @return false if malformed */
+bool DecInodePush(const std::string &s, Runtime::FsAttr *a, std::string *link) {
+  FsDec d(s.data(), s.size());
+  return d.U64(&a->id_) && d.U32(&a->type_) && d.U64(&a->size_) &&
+         d.U32(&a->nlink_) && d.U32(&a->mode_) && d.U32(&a->uid_) &&
+         d.U32(&a->gid_) && d.U64(&a->atime_) && d.U64(&a->mtime_) &&
+         d.U64(&a->ctime_) && d.Str(link);
+}
+
+/** One inode record to store and push. */
+struct InodeWork {
+  clio::run::u64 packed = 0;
+  std::string rec;                      ///< the CTE record
+  std::string push;                     ///< EncInodePush of the same state
+  std::map<clio::run::u32, clio::run::u64> holders;  ///< caching it (+ reg)
+  bool resync = false;  ///< holders unknown: pushed to every container
+};
+}  // namespace
+
 clio::run::TaskResume Runtime::FlushInodes() {
   CLIO_TASK_BODY_BEGIN
-  // Store what is dirty now. An inode another task is storing stays dirty
-  // and is picked up after it finishes: that store may predate this task's
-  // change, which must be durable before this task replies.
+  // Store what is dirty now, then push it to every container caching the
+  // inode. An inode another task is storing stays dirty and is picked up
+  // after it finishes: that store may predate this task's change, which must
+  // be durable and pushed before this task replies.
   for (;;) {
-    std::vector<std::pair<clio::run::u64, std::string>> work;
+    std::vector<InodeWork> work;
     size_t busy = 0;
     {
       std::lock_guard<std::mutex> g(meta_mu_);
@@ -108,34 +149,42 @@ clio::run::TaskResume Runtime::FlushInodes() {
         }
         auto fit = by_tag_.find(packed);
         if (fit != by_tag_.end()) {
+          const FileInfo &fi = *fit->second;
           inode_storing_.insert(packed);
-          work.emplace_back(packed,
-                            EncInodeRec(*fit->second, FileSize(*fit->second)));
+          InodeWork w;
+          w.packed = packed;
+          w.rec = EncInodeRec(fi, FileSize(fi));
+          FsAttr a;
+          InodeAttrLocked(fi, &a);
+          w.push = EncInodePush(a, fi.symlink_);
+          w.holders = fi.holders_;
+          if (fi.holders_unknown_) {
+            fit->second->holders_unknown_ = false;
+            w.resync = true;
+            for (clio::run::u32 c = 0; c < NumContainers(); ++c) {
+              if (c != container_id_) w.holders.emplace(c, 0);
+            }
+          }
+          work.push_back(std::move(w));
         }
         it = inode_dirty_.erase(it);  // dropped inodes need no record
       }
     }
-    // kMetaBlob: storing the record is not a change to the file. Without
-    // it every record write (an atime move on read included) advanced the
-    // tag's ctime, which stat reports (generic/003).
-    clio::cte::core::Context meta_ctx;
-    meta_ctx.op_flags_ |= clio::cte::core::Context::kMetaBlob;
-    for (const auto &w : work) {
-      // An inode record (size, mode, symlink target) goes straight to a
-      // non-volatile tier: on the RAM tier a restart dropped it, and with it
-      // every file nobody had fsync'd -- a symlink vanished even across a
-      // graceful restart. A deployment with no such tier keeps it in RAM.
+    for (const InodeWork &w : work) {
+      // kMetaBlob: storing the record is not a change to the file (no ctime
+      // bump); a non-volatile tier keeps it across a restart.
+      clio::cte::core::Context meta_ctx;
+      meta_ctx.op_flags_ |= clio::cte::core::Context::kMetaBlob;
       meta_ctx.min_persistence_level_ = inode_volatile_only_ ? 0 : 1;
-      auto p = cte_.AsyncPutBlob(FsUnpack(w.first), kInodeBlob, 0,
-                                 w.second.size(), w.second.data(), -1.0f,
-                                 meta_ctx, 0u,
-                                 clio::run::PoolQuery::Dynamic());
+      auto p = cte_.AsyncPutBlob(FsUnpack(w.packed), kInodeBlob, 0,
+                                 w.rec.size(), w.rec.data(), -1.0f, meta_ctx,
+                                 0u, clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(p);
       if (p->GetReturnCode() != 0 && !inode_volatile_only_) {
         meta_ctx.min_persistence_level_ = 0;
-        p = cte_.AsyncPutBlob(FsUnpack(w.first), kInodeBlob, 0,
-                              w.second.size(), w.second.data(), -1.0f,
-                              meta_ctx, 0u, clio::run::PoolQuery::Dynamic());
+        p = cte_.AsyncPutBlob(FsUnpack(w.packed), kInodeBlob, 0, w.rec.size(),
+                              w.rec.data(), -1.0f, meta_ctx, 0u,
+                              clio::run::PoolQuery::Dynamic());
         CLIO_CO_AWAIT(p);
         if (p->GetReturnCode() == 0) {
           HLOG(kWarning, "filesystem: no non-volatile CTE tier accepts inode "
@@ -143,12 +192,56 @@ clio::run::TaskResume Runtime::FlushInodes() {
           inode_volatile_only_ = true;
         }
       }
+      std::vector<clio::run::u32> gone;
+      if (!w.holders.empty()) {
+        std::vector<std::pair<clio::run::u32, clio::run::Future<ShardOpTask>>>
+            fs;
+        for (const auto &hv : w.holders) {
+          const clio::run::u32 h = hv.first;
+          if (!clio::cte::core::ContainerNodeAlive(pool_id_, h)) {
+            gone.push_back(h);
+            continue;
+          }
+          FsReq r;
+          r.id_ = w.packed;
+          r.str_ = w.push;
+          fs.emplace_back(h, SendShard(h, kShardInodePush, r));
+        }
+        for (auto &hf : fs) {
+          CLIO_CO_AWAIT(hf.second);
+          FsResp resp;
+          // Unreachable or no longer caching it: it refetches on next use.
+          if (!ReadShardResp(hf.second, &resp) || resp.rc_ == ENOENT) {
+            gone.push_back(hf.first);
+          }
+        }
+      }
       std::lock_guard<std::mutex> g(meta_mu_);
-      inode_storing_.erase(w.first);
+      inode_storing_.erase(w.packed);
+      auto fit = by_tag_.find(w.packed);
+      if (fit != by_tag_.end()) {
+        if (w.resync) {
+          // Everyone who took the push caches it: register them.
+          for (const auto &hv : w.holders) {
+            if (std::find(gone.begin(), gone.end(), hv.first) == gone.end() &&
+                fit->second->holders_.count(hv.first) == 0) {
+              fit->second->holders_[hv.first] = reg_seq_++;
+            }
+          }
+        }
+        for (clio::run::u32 h : gone) {
+          // Only the registration this push went to (see CommitBlock).
+          auto hit = fit->second->holders_.find(h);
+          if (hit != fit->second->holders_.end() &&
+              hit->second == w.holders.at(h)) {
+            fit->second->holders_.erase(hit);
+          }
+        }
+      }
       if (p->GetReturnCode() != 0) {
         HLOG(kWarning, "filesystem: storing inode {:x} failed (rc {}); will "
-             "retry", w.first, p->GetReturnCode());
-        if (by_tag_.count(w.first) != 0) inode_dirty_.insert(w.first);
+             "retry", w.packed, p->GetReturnCode());
+        if (fit != by_tag_.end()) inode_dirty_.insert(w.packed);
       }
     }
     if (busy == 0 && work.empty()) break;
@@ -159,41 +252,76 @@ clio::run::TaskResume Runtime::FlushInodes() {
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::ReadInodeRecord(clio::run::u64 packed,
-                                               FsResp &resp) {
+clio::run::TaskResume Runtime::StatInode(clio::run::u64 packed,
+                                         FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
-  const clio::cte::core::TagId tag = FsUnpack(packed);
-  resp.rc_ = ENOENT;
-  auto sz = cte_.AsyncGetBlobSize(tag, kInodeBlob);
-  CLIO_CO_AWAIT(sz);
-  if (sz->GetReturnCode() != 0 || sz->size_ == 0) CLIO_CO_RETURN;
-  std::string rec(sz->size_, '\0');
-  auto g = cte_.AsyncGetBlob(tag, kInodeBlob, 0, rec.size(), 0u, rec.data());
-  CLIO_CO_AWAIT(g);
-  if (g->GetReturnCode() != 0) {
-    resp.rc_ = EIO;
+  resp = FsResp();
+  const clio::run::u32 home = InodeOwner(packed);
+  if (home == container_id_) {
+    CLIO_CO_AWAIT(EnsureInode(packed));
+    std::shared_ptr<FileInfo> fi = FindInode(packed);
+    if (fi == nullptr) {
+      resp.rc_ = ENOENT;
+      CLIO_CO_RETURN;
+    }
+    std::lock_guard<std::mutex> g(meta_mu_);
+    InodeAttrLocked(*fi, &resp.attr_);
+    resp.str_ = fi->symlink_;
     CLIO_CO_RETURN;
   }
-  FileInfo fi;
-  clio::run::u64 size = 0;
-  if (!DecInodeRec(rec, &fi, &size)) {
-    resp.rc_ = EIO;
-    CLIO_CO_RETURN;
+  bool fetch = false;
+  {
+    std::lock_guard<std::mutex> g(icache_mu_);
+    auto it = icache_.find(packed);
+    if (it != icache_.end() && it->second.home_ == home) {
+      resp.attr_ = it->second.attr_;
+      resp.str_ = it->second.symlink_;
+      CLIO_CO_RETURN;
+    }
+    if (iloading_.count(packed) == 0) {
+      InodeCacheEnt none;
+      none.home_ = ~0u;
+      iloading_[packed] = none;
+      fetch = true;
+    }
   }
-  resp.attr_.id_ = packed;
-  resp.attr_.type_ = fi.type_;
-  resp.attr_.size_ = fi.type_ == kFsTypeSymlink ? fi.symlink_.size() : size;
-  resp.attr_.nlink_ = fi.nlink_;
-  resp.attr_.mode_ = fi.mode_;
-  resp.attr_.uid_ = fi.uid_;
-  resp.attr_.gid_ = fi.gid_;
-  resp.attr_.atime_ = fi.atime_;
-  resp.attr_.mtime_ = fi.mtime_;
-  resp.attr_.ctime_ = fi.ctime_;
-  resp.str_ = fi.symlink_;
-  resp.rc_ = 0;
+  FsReq r;
+  r.id_ = packed;
+  r.a_ = container_id_;
+  r.b_ = fetch ? 1u : 0u;  // register for pushes only when we will cache it
+  CLIO_CO_AWAIT(CallShard(home, kShardInodeStat, r, resp));
+  if (!fetch) CLIO_CO_RETURN;
+  std::lock_guard<std::mutex> g(icache_mu_);
+  auto lit = iloading_.find(packed);
+  if (resp.rc_ == 0) {
+    InodeCacheEnt ent;
+    ent.attr_ = resp.attr_;
+    ent.symlink_ = resp.str_;
+    // A push that raced the fetch is newer than what the fetch returned.
+    if (lit != iloading_.end() && lit->second.home_ != ~0u) ent = lit->second;
+    ent.home_ = home;
+    icache_[packed] = ent;
+  }
+  if (lit != iloading_.end()) iloading_.erase(lit);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+int Runtime::ApplyInodePush(const FsReq &req) {
+  InodeCacheEnt ent;
+  if (!DecInodePush(req.str_, &ent.attr_, &ent.symlink_)) return EINVAL;
+  std::lock_guard<std::mutex> g(icache_mu_);
+  auto lit = iloading_.find(req.id_);
+  if (lit != iloading_.end()) {
+    ent.home_ = 0;  // any value but ~0u: "a push arrived"
+    lit->second = ent;
+    return 0;
+  }
+  auto it = icache_.find(req.id_);
+  if (it == icache_.end()) return ENOENT;
+  ent.home_ = it->second.home_;
+  it->second = ent;
+  return 0;
 }
 
 clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed) {
@@ -216,6 +344,17 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed) {
     CLIO_CO_RETURN;
   }
   fi->tag_id_ = tag;
+  // Containers caching its attrs registered with an earlier incarnation of
+  // this home: the next change goes to every container.
+  fi->holders_unknown_ = NumContainers() > 1;
+  if (fi->type_ != kFsTypeSymlink && size != 0) {
+    // This container's stream may never have seen the file (it stands in
+    // for a dead home, or its stream log lost the tail): the record's size
+    // is a floor (kMax never lowers a size the stream already has).
+    clio::run::u32 src = 0;
+    CLIO_CO_AWAIT(FileSizeOp(tag, clio::cte::stream::StreamSizeOp::kMax, size,
+                             nullptr, nullptr, &src));
+  }
   std::lock_guard<std::mutex> lk(meta_mu_);
   by_tag_.emplace(packed, fi);  // a racing loader may have won: keep it
   CLIO_CO_RETURN;

@@ -3857,6 +3857,23 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * List the blobs (tag id + name) whose names fully match `blob_regex` on
+   * the containers `pool_query` reaches - asynchronous. Local() lists this
+   * node's blobs; Broadcast() the whole cluster's.
+   * @param blob_regex std::regex over blob names
+   * @param pool_query routing (default: Local)
+   * @return future for the ListLocalBlobsTask
+   */
+  clio::run::Future<ListLocalBlobsTask> AsyncListLocalBlobs(
+      const std::string &blob_regex,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<ListLocalBlobsTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, blob_regex);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * fsync(2) for one tag - asynchronous. Broadcast by default so every
    * container makes the blobs it holds durable (see SyncTagTask).
    * @param tag_id tag whose blobs must become durable

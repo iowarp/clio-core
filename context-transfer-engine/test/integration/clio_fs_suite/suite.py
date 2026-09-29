@@ -160,6 +160,7 @@ def load_tests():
   import tests_apps  # noqa: F401
   import tests_perf  # noqa: F401
   import tests_bdev  # noqa: F401
+  import tests_dirs  # noqa: F401
 
 
 def slurm_hosts():
@@ -271,7 +272,7 @@ def main():
   ap.add_argument('--hosts', default='')
   ap.add_argument('--nodes', type=int, default=0,
                   help='use only the first N hosts')
-  ap.add_argument('--groups', default='posix,dist,apps,perf,fault')
+  ap.add_argument('--groups', default='posix,dist,dirs,apps,perf,fault')
   ap.add_argument('--only', default='')
   ap.add_argument('--skip', default='')
   ap.add_argument('--profile', default='persistent',
@@ -279,6 +280,8 @@ def main():
                   help='persistent_norepl: disk tier + WALs but no '
                        'replication chimod and no periodic data flush, so '
                        'only fsync itself moves data off the RAM tier')
+  ap.add_argument('--disk-gb', type=int, default=20,
+                  help='size of each node\'s disk tier (GB)')
   ap.add_argument('--fsync-mode', default=None,
                   choices=['durable', 'deferred'],
                   help='CTE performance.fsync_mode (default: CTE default)')
@@ -313,14 +316,16 @@ def main():
          (not only or t['name'] in only) and t['name'] not in skip and
          len(hosts) >= t['min_nodes']]
   # Fault tests last: they deliberately break the deployment.
-  order = {'posix': 0, 'dist': 1, 'apps': 2, 'perf': 3, 'fault': 4}
+  order = {'posix': 0, 'dist': 1, 'dirs': 2, 'apps': 3, 'perf': 4,
+           'fault': 5}
   sel.sort(key=lambda t: order.get(t['group'], 9))
 
   bin_dir = snapshot_bins(os.path.abspath(args.bin),
                           os.path.join(os.path.abspath(args.out), 'bin'))
   cl = Cluster(hosts, bin_dir, os.path.abspath(args.out),
                profile=args.profile, port=args.port,
-               attr_cache_s=args.attr_cache, fsync_mode=args.fsync_mode)
+               attr_cache_s=args.attr_cache, fsync_mode=args.fsync_mode,
+               disk_gb=args.disk_gb)
   log(f'hosts={hosts} profile={args.profile} tests={len(sel)}')
   ok, msg = cl.up(wipe=True)
   log(f'deploy: {msg}')

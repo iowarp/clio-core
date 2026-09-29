@@ -112,7 +112,11 @@ GLOBAL_CROSS_CONST clio::run::u32 kUpdateTagNames = 55;
 // devices and WAL that hold them. Broadcast.
 GLOBAL_CROSS_CONST clio::run::u32 kSyncTag = 56;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 57;
+// List a container's blobs (tag id + name) matching a name pattern, for
+// modules whose state lives in blobs of nameless tags.
+GLOBAL_CROSS_CONST clio::run::u32 kListLocalBlobs = 57;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 58;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -149,6 +153,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[40] = "GetTagName";
     v[55] = "UpdateTagNames";
     v[56] = "SyncTag";
+    v[57] = "ListLocalBlobs";
     v[41] = "GetCapacity";
     v[42] = "GetNumAliases";
     v[43] = "PodPutBlob";

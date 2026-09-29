@@ -82,20 +82,28 @@ struct FilesystemConfig {
    * logging next to metadata_log_path_) if the deployment did not compose it.
    */
   clio::run::PoolId stream_pool_id_;
+  /**
+   * Entries a directory block holds before it splits in two (YAML
+   * `dir_split_entries`). Small directories stay one block on one node; a
+   * large one spreads over the cluster in blocks of about this many entries.
+   */
+  clio::run::u32 dir_split_entries_;
 
   FilesystemConfig()
       : next_pool_id_(clio::run::PoolId::GetNull()),
-        stream_pool_id_(565, 0) {}
+        stream_pool_id_(565, 0),
+        dir_split_entries_(1024) {}
   FilesystemConfig(const clio::run::PoolId &pool_id, const FilesystemConfig &other)
       : next_pool_id_(other.next_pool_id_),
         metadata_log_path_(other.metadata_log_path_),
-        stream_pool_id_(other.stream_pool_id_) {
+        stream_pool_id_(other.stream_pool_id_),
+        dir_split_entries_(other.dir_split_entries_) {
     (void)pool_id;
   }
 
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(next_pool_id_, metadata_log_path_, stream_pool_id_);
+    ar(next_pool_id_, metadata_log_path_, stream_pool_id_, dir_split_entries_);
   }
 
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
@@ -114,6 +122,9 @@ struct FilesystemConfig {
       if (node["stream_pool_id"]) {
         stream_pool_id_ = clio::run::PoolId::FromString(
             node["stream_pool_id"].as<std::string>());
+      }
+      if (node["dir_split_entries"]) {
+        dir_split_entries_ = node["dir_split_entries"].as<clio::run::u32>();
       }
     } catch (...) {
       // best-effort

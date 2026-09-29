@@ -465,14 +465,14 @@ compose:
     pool_query: local
     pool_id: "560.0"
     next_pool_id: "563.0"               # chain top (cache) — see entries above
-    # The namespace is HASH-SHARDED across every node -- there is no metadata
-    # server. A directory's entries and attributes live on the node its path
-    # hashes to; a file's inode (size, mode, times, links, open handles) on
-    # the node that created it (also chosen by hashing its directory). Each
-    # node persists exactly its own slice in this node-local append-only log
-    # (the container id is appended to the name); `clio_run restart` replays
-    # it, a fresh `start` discards it. Default: unset = volatile namespace.
+    # The namespace is stored in the CTE -- no metadata server, no log:
+    # directories are split into directory blocks (one CTE blob each), inodes
+    # are one CTE blob each, and every node caches what it reads while each
+    # block's home pushes every change before acknowledging it.
+    # metadata_log_path only names this node's stream log (<path>.stream).
     # metadata_log_path: "/mnt/nvme/$USER/clio/cfs_namespace_log"
+    # Entries a directory block holds before it splits (default 1024).
+    # dir_split_entries: 1024
     # Stream pool holding every file's logical size and merging deferred
     # O_APPEND writes (see the clio_cte_stream entry). Default: "565.0".
     # stream_pool_id: "565.0"

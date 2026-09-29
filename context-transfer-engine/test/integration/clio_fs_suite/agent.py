@@ -543,6 +543,105 @@ class Agent:
           break
     return {'fails': fails}
 
+  def op_meta_storm(self, dirpath, prefix, count, procs=8, mode='create'):
+    """Run a metadata storm from `procs` processes in parallel on one
+    directory: process p handles names f'{prefix}{p}_{i}' for i < count.
+    mode: 'create' (O_CREAT|O_EXCL), 'stat' or 'unlink'.  Returns the op
+    count, the wall seconds and the first failures."""
+    script = r'''
+import os, sys, json, time
+d, prefix, p, count, mode = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+fails = []
+t0 = time.time()
+for i in range(count):
+  path = os.path.join(d, f'{prefix}{p}_{i}')
+  try:
+    if mode == 'create':
+      os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644))
+    elif mode == 'stat':
+      os.stat(path)
+    else:
+      os.unlink(path)
+  except OSError as e:
+    fails.append([path, os.strerror(e.errno)])
+    if len(fails) > 10: break
+print(json.dumps({'fails': fails, 'secs': time.time() - t0}))
+'''
+    t0 = time.time()
+    ps = [subprocess.Popen([sys.executable, '-c', script, dirpath, prefix,
+                            str(p), str(count), mode],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+          for p in range(procs)]
+    fails = []
+    for pr in ps:
+      out, err = pr.communicate()
+      try:
+        fails += json.loads(out.decode())['fails']
+      except Exception:  # noqa: BLE001 -- report the child's crash
+        fails.append(['<proc>', (err or out).decode()[-300:]])
+    return {'ops': procs * count, 'secs': time.time() - t0,
+            'fails': fails[:20], 'nfails': len(fails)}
+
+  def op_rename_storm(self, root, dirs, iters, seed):
+    """Rename random directories of `dirs` (paths relative to root) into one
+    another for `iters` rounds; the set of names each directory has is
+    tracked so later rounds keep hitting live directories.  Returns errno
+    counts; the caller checks the tree afterwards."""
+    rng = random.Random(seed)
+    names = list(dirs)
+    counts = {}
+    for _ in range(iters):
+      a, b = rng.choice(names), rng.choice(names)
+      src = os.path.join(root, a)
+      leaf = f'm{seed}_{rng.randrange(1 << 30)}'
+      dst = os.path.join(root, b, leaf)
+      try:
+        os.rename(src, dst)
+        counts['ok'] = counts.get('ok', 0) + 1
+        # Anything under a moved: its relative names change.
+        rel = os.path.relpath(dst, root)
+        names = [rel + x[len(a):] if x == a or x.startswith(a + '/') else x
+                 for x in names]
+      except OSError as e:
+        k = errno_mod.errorcode.get(e.errno, str(e.errno))
+        counts[k] = counts.get(k, 0) + 1
+        if e.errno == errno_mod.ENOENT:
+          # Another node moved it: learn the tree as it is now.
+          names = [os.path.relpath(os.path.join(dp, d), root)
+                   for dp, dns, _ in os.walk(root) for d in dns] or names
+    return counts
+
+  def op_race_dirs(self, paths, mode, seed):
+    """One side of an rmdir-vs-create race: visit `paths` in a seeded random
+    order and either rmdir each (mode 'rmdir') or create a file inside each
+    (mode 'create').  Returns {path: errno name or 'ok'}."""
+    order = list(paths)
+    random.Random(seed).shuffle(order)
+    out = {}
+    for d in order:
+      try:
+        if mode == 'rmdir':
+          os.rmdir(d)
+        else:
+          os.close(os.open(os.path.join(d, 'x'), os.O_CREAT | os.O_WRONLY,
+                           0o644))
+        out[d] = 'ok'
+      except OSError as e:
+        out[d] = errno_mod.errorcode.get(e.errno, str(e.errno))
+    return out
+
+  def op_readdir_check(self, path, rounds=1):
+    """List `path` `rounds` times; report the entry counts and any names
+    listed twice within one listing."""
+    sizes, dups = [], []
+    for _ in range(rounds):
+      names = os.listdir(path)
+      sizes.append(len(names))
+      if len(set(names)) != len(names):
+        seen = set()
+        dups += [x for x in names if x in seen or seen.add(x)][:5]
+    return {'sizes': sizes, 'dups': dups[:20]}
+
   def op_tree_manifest(self, root):
     """Walk root; return {relpath: [type, size, perm, sha256|target]}."""
     out = {}

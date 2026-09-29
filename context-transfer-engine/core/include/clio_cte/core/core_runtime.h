@@ -301,6 +301,15 @@ public:
   clio::run::TaskResume SyncTag(clio::run::shared_ptr<SyncTagTask> &task);
 
   /**
+   * List this container's blobs whose names match a pattern, by tag id
+   * (Method::kListLocalBlobs). Shadow copies count only while they stand in
+   * for a dead owner (ServesBlob).
+   * @param task list task
+   */
+  clio::run::TaskResume ListLocalBlobs(
+      clio::run::shared_ptr<ListLocalBlobsTask> &task);
+
+  /**
    * Sync every non-volatile device holding a block of the named blobs
    * (primaries and durable replicas), all in parallel.
    * @param prefix "major.minor." key prefix of the tag

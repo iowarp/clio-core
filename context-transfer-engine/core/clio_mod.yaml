@@ -65,3 +65,4 @@ kEvict: 47             # Score-driven capacity eviction: free lowest-score blobs
 kReorganizeHint: 54     # Set the organizer phase hint (organizer_hint_) for the data organizer
 kUpdateTagNames: 55     # Batched broadcast tag-name add/remove/rename (filesystem namespace mirror)
 kSyncTag: 56            # fsync for one tag: blobs to a persistent tier, sync devices + WAL (broadcast)
+kListLocalBlobs: 57     # list blobs (tag id + name) matching a name pattern on the queried containers

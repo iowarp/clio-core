@@ -7337,6 +7337,35 @@ clio::run::TaskResume Runtime::SyncTag(
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::ListLocalBlobs(
+    clio::run::shared_ptr<ListLocalBlobsTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  task->tag_ids_.clear();
+  task->blob_names_.clear();
+  task->return_code_ = 0;
+  try {
+    const std::regex pattern(task->blob_regex_.str());
+    tag_blob_name_to_info_.for_each(
+        [&](const std::string &key, const std::shared_ptr<BlobInfo> &info) {
+          TagId tag;
+          std::string name;
+          if (!SplitBlobKey(key, &tag, &name)) return;
+          if (!std::regex_match(name, pattern)) return;
+          if (!ServesBlob(*info, tag, name)) return;
+          task->tag_ids_.push_back(
+              (static_cast<clio::run::u64>(tag.major_) << 32) | tag.minor_);
+          task->blob_names_.push_back(name);
+        },
+        ctp::priv::ForEachLock::kShared);
+  } catch (const std::exception &e) {
+    HLOG(kError, "ListLocalBlobs: bad pattern '{}': {}",
+         task->blob_regex_.str(), e.what());
+    task->return_code_ = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::SyncTagDevices(
     const std::string &prefix, const std::vector<std::string> &names,
     clio::run::u64 &synced, clio::run::u32 &rc) {
