@@ -14,7 +14,8 @@
 #
 # Usage:
 #   scripts/xfstests/run_generic_sweep.sh <testlist-file> <results-file>
-# Env: CLIO_BUILD_DIR, PERTEST_TIMEOUT (default 75s).
+# Env: CLIO_BUILD_DIR, PERTEST_TIMEOUT (default 75s), PERTEST_LONG_TIMEOUT
+# (default 600s, for the tests in LONG_TESTS).
 set -u
 
 LISTFILE="${1:?usage: run_generic_sweep.sh <testlist> <results>}"
@@ -26,6 +27,12 @@ FUSE_BIN="${BUILD_BIN}/clio_cte_fuse"
 XFSTESTS_DIR="${REPO_ROOT}/external/xfstests"
 TEST_DIR=/tmp/clio_xfs_test
 TIMEOUT="${PERTEST_TIMEOUT:-75}"
+# Tests that are long BY DESIGN, not hung: generic/208 runs a fixed 200 s,
+# 521/522 are 1,000,000-op fsx soaks, 074 is multi-process fstest over
+# 10-30 MB files. On clio-fs they took 201 / 240 / 193 / 224 s and passed;
+# a flat budget reported every one of them as HANG. They get LONG_TIMEOUT.
+LONG_TESTS=" generic/074 generic/208 generic/521 generic/522 "
+LONG_TIMEOUT="${PERTEST_LONG_TIMEOUT:-600}"
 
 # namespaced root so ./check runs unprivileged
 if [ "$(id -u)" -ne 0 ] && [ -z "${INNS:-}" ]; then
@@ -90,8 +97,12 @@ while read -r t; do
   # (e.g. vfstest) kept running against later tests' mounts, failing them.
   setsid ./check "${t}" >"${OUT}" 2>&1 &
   cpid=$!
+  budget="${TIMEOUT}"
+  case "${LONG_TESTS}" in *" ${t} "*)
+    [ "${LONG_TIMEOUT}" -gt "${budget}" ] && budget="${LONG_TIMEOUT}" ;;
+  esac
   waited=0; hung=1
-  while [ "${waited}" -lt "${TIMEOUT}" ]; do
+  while [ "${waited}" -lt "${budget}" ]; do
     kill -0 "${cpid}" 2>/dev/null || { hung=0; break; }
     sleep 1; waited=$((waited+1))
   done
