@@ -328,6 +328,11 @@ compose:
     # owner's node is down; changes made meanwhile are handed back when it
     # returns. Default: 0 (a node's blobs are unavailable while it is down).
     # remote_copies: 1
+    # Base path of the handoff log (one file per container, suffixed
+    # ".<container>"): the changes a container made while covering for a dead
+    # owner, so they are still handed back if THIS node restarts before the
+    # owner returns. Default: "" (kept in memory only).
+    # handoff_log_path: "/var/lib/clio/cte_handoff_log"
 
   # === Compression (optional, issue #886) ===
   # Encoding layer: transparently compresses on the way down and

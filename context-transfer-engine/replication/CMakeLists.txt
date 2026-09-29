@@ -10,6 +10,7 @@ add_clio_module_runtime(
   SOURCES
     src/replication_runtime.cc
     src/replication_remote.cc
+    src/replication_handoff_log.cc
     src/autogen/replication_lib_exec.cc
 )
 

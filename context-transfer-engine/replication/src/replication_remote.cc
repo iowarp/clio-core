@@ -88,6 +88,7 @@ void Runtime::NoteHandoff(clio::run::u32 owner, const TagId &tag,
   const std::string key = std::to_string(tag.major_) + "." +
                           std::to_string(tag.minor_) + "." + name;
   handoff_[owner][key] = HandoffEntry{tag, name, deleted};
+  LogHandoff(kHandoffNote, owner, handoff_[owner][key]);
 }
 
 // ===========================================================================
@@ -293,7 +294,6 @@ clio::run::TaskResume Runtime::PushOne(HandoffEntry e, clio::run::u32 owner,
                                        bool *ok) {
   CLIO_TASK_BODY_BEGIN
   *ok = false;
-  auto *core = GetCoreClient();
   const auto to_owner = clio::run::PoolQuery::DirectId(owner);
   if (e.deleted_) {
     auto d = Self()->AsyncDelBlob(e.tag_, e.name_, to_owner);
@@ -301,8 +301,11 @@ clio::run::TaskResume Runtime::PushOne(HandoffEntry e, clio::run::u32 owner,
     *ok = true;  // gone at the owner either way
     CLIO_CO_RETURN;
   }
-  auto sz = core->AsyncGetBlobSize(e.tag_, e.name_,
-                                   clio::run::PoolQuery::Local(), 0);
+  // Read through THIS container's replication layer, not the raw core: a
+  // restart here emptied the RAM-tier primary, and only this layer falls
+  // back to the durable replica (the raw read handed back zeros).
+  auto sz = Self()->AsyncGetBlobSize(e.tag_, e.name_,
+                                     clio::run::PoolQuery::Local(), 0);
   CLIO_CO_AWAIT(sz);
   if (sz->GetReturnCode() != 0) {  // deleted again since: nothing to send
     *ok = true;
@@ -314,8 +317,8 @@ clio::run::TaskResume Runtime::PushOne(HandoffEntry e, clio::run::u32 owner,
     auto buf = CLIO_IPC->AllocateBuffer(len);
     if (buf.IsNull()) CLIO_CO_RETURN;
     ctp::ipc::ShmPtr<> ptr = buf.shm_.template Cast<void>();
-    auto g = core->AsyncGetBlob(e.tag_, e.name_, off, len, 0u, ptr,
-                                clio::run::PoolQuery::Local());
+    auto g = Self()->AsyncGetBlob(e.tag_, e.name_, off, len, 0u, ptr,
+                                  clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(g);
     bool good = g->GetReturnCode() == 0;
     if (good) {
@@ -358,9 +361,16 @@ clio::run::TaskResume Runtime::PushHandoff(clio::run::u32 owner,
     auto e = it->second.find(w.first);
     // A newer failover change to the same blob stays for the next round.
     if (e != it->second.end() && e->second.deleted_ == w.second.deleted_) {
+      LogHandoff(kHandoffDone, owner, w.second);
       it->second.erase(e);
     }
     if (it->second.empty()) handoff_.erase(it);
+  }
+  {
+    std::lock_guard<std::mutex> g(handoff_mu_);
+    if (handoff_log_.BytesSinceCompact() > kHandoffCompactBytes) {
+      CompactHandoffLogLocked();
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

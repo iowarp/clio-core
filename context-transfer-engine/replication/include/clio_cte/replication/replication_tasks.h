@@ -60,6 +60,10 @@ struct ReplicationConfig {
    *  and writable while its owner's node is down; the changes are handed
    *  back when the owner returns. 0 = none. */
   int remote_copies_ = 0;
+  /** Base path of the handoff log (one file per container, suffixed
+   *  ".<container>"): the changes this container made for a dead owner,
+   *  so a restart here still hands them back. Empty = in memory only. */
+  std::string handoff_log_path_;
 
   ReplicationConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
   ReplicationConfig(const clio::run::PoolId &pool_id,
@@ -69,14 +73,15 @@ struct ReplicationConfig {
         cache_score_(other.cache_score_),
         replica_score_(other.replica_score_),
         replicate_period_ms_(other.replicate_period_ms_),
-        remote_copies_(other.remote_copies_) {
+        remote_copies_(other.remote_copies_),
+        handoff_log_path_(other.handoff_log_path_) {
     (void)pool_id;
   }
 
   template <class Archive>
   void serialize(Archive &ar) {
     ar(next_pool_id_, num_replicas_, cache_score_, replica_score_,
-       replicate_period_ms_, remote_copies_);
+       replicate_period_ms_, remote_copies_, handoff_log_path_);
   }
 
   /** Load configuration from compose YAML (next_pool_id: "major.minor",
@@ -108,6 +113,9 @@ struct ReplicationConfig {
         }
         if (node["remote_copies"]) {
           remote_copies_ = node["remote_copies"].as<int>();
+        }
+        if (node["handoff_log_path"]) {
+          handoff_log_path_ = node["handoff_log_path"].as<std::string>();
         }
       } catch (...) {
         // Config parsing is best-effort

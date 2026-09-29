@@ -14,7 +14,7 @@ Each test leaves the cluster redeployed from scratch (redeploy_after).
 import random
 import time
 
-from cluster import parallel
+from cluster import parallel, sh
 from suite import test
 from tests_dist import _tags_match, check_records, runs_to_set
 
@@ -655,3 +655,82 @@ def t_data_failover(ctx):
         stale.append((i, p, r.get('err') or r.get('ret')))
   ctx.check(not stale, f'{len(stale)} reads wrong after node{victim} '
                        f'returned, e.g. {stale[:2]}')
+
+
+@test('handoff_survives_successor_restart', 'fault', min_nodes=3,
+      redeploy_after=True, timeout=1800)
+def t_handoff_successor_restart(ctx):
+  """A node covering for a dead owner restarts before the owner returns:
+  the changes it made meanwhile must still be handed back (the replication
+  chimod's handoff log), not forgotten with its memory."""
+  n = len(ctx.hosts)
+  root = ctx.p('hs')
+  ctx.ok(0, 'mkdir', path=root)
+  rel = root[len(ctx.cl.mnt):]
+  owners = {fs_dir_owner(d, n) for d in ['/'] + [
+      '/' + '/'.join(rel.strip('/').split('/')[:k])
+      for k in range(1, len(rel.strip('/').split('/')) + 1)]}
+  # The owner that goes down must hold none of the path's directories (it
+  # stays down while the files are used); its successor, which covers for
+  # it, is only down while nothing touches the path. Node 0 writes, so it
+  # is neither.
+  pick = next(((v, (v + 1) % n) for v in range(n - 1, 0, -1)
+               if v not in owners and (v + 1) % n != 0), None)
+  if pick is None:
+    ctx.note('no owner/successor pair clear of the path; nothing to test')
+    return
+  victim, succ = pick
+  size = 8 * MiB
+  files = [f'{root}/f{k}' for k in range(8)]
+  for k, p in enumerate(files):
+    ctx.ok(0, 'write_file', path=p, size=size, seed=300 + k, fsync=True)
+  vh, sh_ = ctx.hosts[victim], ctx.hosts[succ]
+  ctx.cl.kill_fuse(vh)
+  ctx.cl.kill_runtime(vh)
+  time.sleep(3)
+  # Overwrite every file while the owner is down (some pages are the
+  # victim's, now written at its successor).
+  for k, p in enumerate(files):
+    ctx.ok(0, 'write_file', path=p, size=size, seed=700 + k, fsync=True)
+  # The successor crashes and comes back while the owner is still down.
+  ctx.cl.kill_fuse(sh_)
+  ctx.cl.kill_runtime(sh_)
+  time.sleep(2)
+  ctx.cl.start_runtime(sh_, 'restart')
+  ctx.check(ctx.cl.runtime_up(sh_), f'{sh_} runtime did not restart')
+  time.sleep(3)
+  ctx.check(ctx.cl.mount(sh_), f'{sh_} remount failed')
+  ctx.cl.agents.pop(sh_, None)
+  # Now the owner returns and must get the successor's changes.
+  ctx.cl.start_runtime(vh, 'restart')
+  ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
+  time.sleep(3)
+  ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
+  ctx.cl.agents.pop(vh, None)
+  time.sleep(2)
+  stale = []
+  for i in range(n):
+    for k, p in enumerate(files):
+      r = ctx.call(i, 'verify_file', path=p, size=size, seed=700 + k)
+      if not (r.get('ok') and r['ret']['ok']):
+        stale.append((i, p, r.get('err') or r.get('ret')))
+  ctx.metrics['stale_after_return'] = len(stale)
+  if stale:
+    blob_info_notes(ctx, stale[0][1], stale[0][2])
+  ctx.check(not stale, f'{len(stale)} reads wrong after node{victim} '
+                       f'returned (node{succ} restarted meanwhile), '
+                       f'e.g. {stale[:2]}')
+
+
+def blob_info_notes(ctx, path, verdict):
+  """Note every node's view (cte_search --blob-info) of the page blob a
+  failed verify mismatched in, to tell a stale copy from a lost one."""
+  mm = verdict.get('mismatch') if isinstance(verdict, dict) else None
+  page = (mm or {}).get('offset', 0) // MiB
+  ino = ctx.ok(0, 'stat', path=path)['ino']
+  tag = f'{ino >> 32}.{ino & 0xffffffff}'
+  cl = ctx.cl
+  for h in ctx.hosts:
+    _, out = sh(h, f'{cl.env_prefix()} {cl.bin_dir}/cte_search {tag} {page} '
+                   f'--blob-info 2>&1 | grep -v INFO | tail -4', timeout=60)
+    ctx.note(f'{h} page {page} of {tag}: {out.strip()}')

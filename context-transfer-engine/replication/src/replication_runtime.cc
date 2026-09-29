@@ -40,6 +40,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
          config_.replicate_period_ms_);
   }
   if (config_.remote_copies_ > 0) {
+    OpenHandoffLog();
     auto *ipc = CLIO_CPU_IPC;
     auto sweep = ipc->NewTask<HandoffSweepTask>(
         clio::run::CreateTaskId(), pool_id_, clio::run::PoolQuery::Local());

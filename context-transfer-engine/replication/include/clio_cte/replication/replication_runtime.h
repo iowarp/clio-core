@@ -15,6 +15,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_interposer.h>
+#include <clio_cte/core/record_log.h>
 #include <clio_cte/replication/replication_client.h>
 #include <clio_cte/replication/replication_tasks.h>
 
@@ -295,9 +296,27 @@ class Runtime : public clio::cte::core::CoreInterposer {
    *  target node's replication container, so its local replicas apply. */
   clio::cte::core::Client *Self();
   std::unique_ptr<clio::cte::core::Client> self_client_;
+  /** Open the handoff log; on a restart, replay it into handoff_. */
+  void OpenHandoffLog();
+  /**
+   * Log one handoff change (a note or its completion).
+   * @param type kHandoffNote or kHandoffDone
+   * @param owner owner container
+   * @param e the entry
+   */
+  void LogHandoff(clio::run::u32 type, clio::run::u32 owner,
+                  const HandoffEntry &e);
+  /** Rewrite the log as a snapshot of handoff_ once it has grown. Caller
+   *  holds handoff_mu_. */
+  void CompactHandoffLogLocked();
+  static constexpr clio::run::u32 kHandoffNote = 1;
+  static constexpr clio::run::u32 kHandoffDone = 2;
+  /** Log bytes after which the handoff log is rewritten as a snapshot. */
+  static constexpr clio::run::u64 kHandoffCompactBytes = 4ull << 20;
   std::mutex handoff_mu_;
   std::unordered_map<clio::run::u32,
                      std::unordered_map<std::string, HandoffEntry>> handoff_;
+  clio::cte::core::RecordLog handoff_log_;
   bool is_restart_ = false;
 };
 

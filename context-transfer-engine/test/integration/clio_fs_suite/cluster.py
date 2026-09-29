@@ -222,7 +222,8 @@ class Cluster:
                f'    replicate_period_ms: {self.replicate_period_ms}\n'
                '    cache_score: 1.0\n'
                '    replica_score: 0.2\n'
-               '    remote_copies: 1\n')
+               '    remote_copies: 1\n'
+               f'    handoff_log_path: "{lr}/data/cte_handoff_log"\n')
       fs_next = '561.0'
       # Each node persists its own hash-owned slice of the namespace, and
       # the file sizes / pending appends of the streams it homes.
