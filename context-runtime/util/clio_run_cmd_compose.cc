@@ -7,7 +7,7 @@
 #include <clio_runtime/admin/admin_client.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/config_manager.h>
-#include <clio_runtime/restart_log.h>
+#include <clio_runtime/pool_manager.h>
 
 #include "clio_run_commands.h"
 
@@ -110,17 +110,11 @@ int ComposeStart(const std::string& path) {
     }
   }
 
-  // Register the file for restart iff it declares at least one restartable
-  // pool. The WAL keys on the absolute compose-file path.
+  // Pools with `restart: true` are recorded by every node that holds one in
+  // its pool log (the one restart registry), so nothing is registered here.
   if (any_restart) {
-    clio::run::RestartLog log;
-    std::string abs = AbsPath(path);
-    if (log.AppendAdd(abs)) {
-      log.Compact();
-      HLOG(kInfo, "Registered '{}' for restart in {}", abs, log.path());
-    } else {
-      HLOG(kWarning, "Failed to register '{}' in restart log", abs);
-    }
+    HLOG(kInfo, "Restartable pools of '{}' are recorded in each node's pool "
+         "log", AbsPath(path));
   }
 
   HLOG(kSuccess, "compose start: all {} pools created", compose.pools_.size());
@@ -169,28 +163,34 @@ int ComposeRm(const std::string& path) {
   ClientFinalizeGuard guard;
   int rc = DestroyComposePools(path);
 
-  // Unregister from restart regardless of stop result; a dangling rm with no
-  // matching add is dropped by Compact(). The compose file itself is kept.
-  clio::run::RestartLog log;
-  std::string abs = AbsPath(path);
-  if (log.AppendRm(abs)) {
-    log.Compact();
-    HLOG(kInfo, "Unregistered '{}' from restart", abs);
-  } else {
-    HLOG(kWarning, "Failed to unregister '{}' from restart log", abs);
-  }
+  // DestroyPool removes each pool from the nodes' pool logs; the compose
+  // file itself is kept.
   return rc;
 }
 
 int ComposeList(bool restartable) {
   if (restartable) {
-    // Restartable set comes purely from the WAL — no daemon query needed.
-    clio::run::RestartLog log;
-    std::vector<std::string> live = log.LiveSet();
-    std::cout << "Restartable containers (" << live.size() << "):\n";
-    for (const auto& p : live) {
-      std::cout << "  " << p << "\n";
+    // The restartable set is every node pool log under this host's conf_dir
+    // (<conf_dir>/wal/pools.<node>.bin) -- no daemon query needed.
+    auto *cfg = CLIO_CONFIG_MANAGER;
+    cfg->Init();
+    const std::filesystem::path wal = cfg->GetConfDir() + "/wal";
+    std::error_code ec;
+    size_t n = 0;
+    for (const auto &f : std::filesystem::directory_iterator(wal, ec)) {
+      const std::string name = f.path().filename().string();
+      if (name.rfind("pools.", 0) != 0 || f.path().extension() != ".bin") {
+        continue;
+      }
+      for (const auto &e :
+           clio::run::PoolManager::ReadPoolLogFile(f.path().string())) {
+        std::cout << "  " << e.pool_name << "  (pool_id=" << e.pool_id
+                  << ", " << e.chimod_name << ", "
+                  << (e.compose ? "compose" : "api") << ", " << name << ")\n";
+        ++n;
+      }
     }
+    std::cout << "Restartable pools: " << n << "\n";
     return 0;
   }
 

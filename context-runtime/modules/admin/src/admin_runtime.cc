@@ -44,7 +44,6 @@
 #include <clio_runtime/manager.h>
 #include <clio_runtime/module_manager.h>
 #include <clio_runtime/pool_manager.h>
-#include <clio_runtime/restart_log.h>
 #include <clio_runtime/task_archives.h>
 #include <clio_runtime/worker.h>
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
@@ -1364,58 +1363,31 @@ clio::run::TaskResume Runtime::RestartContainers(
   task->error_message_ = "";
 
   try {
-    // The restart registry is the RestartLog write-ahead log
-    // (~/.clio/restart_log.bin), the same persistent registry that
-    // manager.cc replays at startup. Each live entry is the absolute path of
-    // a compose file registered via `clio_run compose start`. Re-compose each
-    // pool found there; pools already live (e.g. recovered at server-init
-    // time) come back as the existing pool with rc=0 and are still counted.
-    namespace fs = std::filesystem;
-    clio::run::RestartLog restart_log;
-    std::vector<std::string> containers = restart_log.LiveSet();
-    if (containers.empty()) {
-      HLOG(kDebug, "Admin: No restartable containers registered in {}",
-           restart_log.path());
-      task->SetReturnCode(0);
-      CLIO_CO_RETURN;
-    }
-
-    for (const auto &container_path : containers) {
-      std::error_code ec;
-      if (!fs::exists(container_path, ec) || ec) {
-        HLOG(kWarning, "Admin: registered container '{}' no longer exists, "
-             "skipping", container_path);
-        continue;
-      }
-
-      // Load pool config from the registered compose file
-      clio::run::ConfigManager file_config;
-      if (!file_config.LoadYaml(container_path)) {
-        HLOG(kError, "Admin: Failed to load restart config: {}",
-             container_path);
-        continue;
-      }
-
-      for (auto pool_config : file_config.GetComposeConfig().pools_) {
-        pool_config.restart_ = true;
-        HLOG(kInfo, "Admin: Restarting pool {} (module: {})",
-             pool_config.pool_name_, pool_config.mod_name_);
-
-        auto future = client_.AsyncCompose(pool_config);
-        CLIO_CO_AWAIT(future);
-
-        clio::run::u32 rc = future->GetReturnCode();
-        if (rc != 0) {
-          HLOG(kError, "Admin: Failed to restart pool {}: rc={}",
-               pool_config.pool_name_, rc);
-          continue;
-        }
-
+    // The restart registry is this node's pool log (PoolManager): every
+    // durable pool, compose `restart: true` or API-created with
+    // SetPersistent. Re-create the ones missing here; pools already live
+    // (e.g. recovered at server init) still count.
+    auto *pool_manager = CLIO_POOL_MANAGER;
+    const auto pools = pool_manager->LoadPoolLog();
+    pool_manager->SetReplayingPools(true);
+    for (const auto &e : pools) {
+      if (!pool_manager->FindPoolByName(e.pool_name).IsNull()) {
         task->containers_restarted_++;
-        HLOG(kInfo, "Admin: Successfully restarted pool {}",
-             pool_config.pool_name_);
+        continue;
       }
+      HLOG(kInfo, "Admin: Restarting pool {} (module: {})", e.pool_name,
+           e.chimod_name);
+      auto future = client_.AsyncRecreatePool(e);
+      CLIO_CO_AWAIT(future);
+      const clio::run::u32 rc = future->GetReturnCode();
+      if (rc != 0) {
+        HLOG(kError, "Admin: Failed to restart pool {}: rc={}", e.pool_name,
+             rc);
+        continue;
+      }
+      task->containers_restarted_++;
     }
+    pool_manager->SetReplayingPools(false);
 
     task->SetReturnCode(0);
     HLOG(kInfo, "Admin: RestartContainers completed, {} containers restarted",

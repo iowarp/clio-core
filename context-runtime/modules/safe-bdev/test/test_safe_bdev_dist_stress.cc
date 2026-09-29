@@ -87,6 +87,7 @@ bool NodeDisk(const std::string &name, clio::run::PoolId id,
   d->id = id;
   d->node = node;
   clio::run::bdev::Client c(id);
+  c.SetPersistent(true);  // a disk: every node re-creates it on restart
   auto t = c.AsyncCreate(q, d->path, id,
                          clio::run::bdev::BdevType::kFile, kMemberSize);
   t.Wait();
@@ -188,11 +189,8 @@ TEST_CASE("safe_bdev_distributed_live_growth_rejoin",
   REQUIRE(a.VerifyAll("node 2 down") == 0);
   REQUIRE(a.OverwriteAll(9000) == 0);
   WaitFor("restart2");
-  // A pool created through the API is not in the restarted node's compose:
-  // re-create the replacement disk everywhere (a broadcast GetOrCreate adds
-  // the missing container on the rejoined node; the others already have it).
-  REQUIRE(NodeDisk("l2b", clio::run::PoolId(base + 11, 0), 2, &d2b,
-                   clio::run::PoolQuery::Broadcast()));
+  // The replacement disk was created through the API before node 2 died; the
+  // restarted node re-creates its container from its pool log by itself.
   REQUIRE(a.Recover(d[2], d2b) == 0);
   REQUIRE(a.VerifyAll("node 2 rejoined and rebuilt") == 0);
 }

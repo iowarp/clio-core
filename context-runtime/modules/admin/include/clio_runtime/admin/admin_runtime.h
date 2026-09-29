@@ -263,10 +263,9 @@ public:
   clio::run::TaskResume RegisterMemory(clio::run::shared_ptr<RegisterMemoryTask> &task);
 
   /**
-   * Handle RestartContainers - Re-create pools from the restart registry.
-   * Reads the RestartLog write-ahead log (~/.clio/restart_log.bin), the same
-   * persistent registry replayed at startup, and re-composes each registered
-   * compose file.
+   * Handle RestartContainers - Re-create pools from the restart registry:
+   * this node's pool log (PoolManager::LoadPoolLog), the same registry the
+   * runtime replays on a restart -- durable compose and API pools alike.
    */
   clio::run::TaskResume RestartContainers(clio::run::shared_ptr<RestartContainersTask> &task);
 

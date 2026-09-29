@@ -238,6 +238,44 @@ bool RuntimeManager::ClientInit() {
 
 namespace {
 /**
+ * Restart replay of this node's pool log -- the one restart registry: every
+ * durable pool (compose `restart: true`, or API-created by a client with
+ * SetPersistent) is re-created here, in creation order, taking the
+ * Restart() path. A fresh start forgets them instead: it begins a new
+ * cluster lifetime, and test pools must never come back.
+ * @param is_restart true for `restart` (or a start that found state)
+ */
+void ReplayPoolLog(bool is_restart) {
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  auto *admin = CLIO_ADMIN;
+  if (!is_restart) {
+    pool_manager->ClearPoolLog();
+    return;
+  }
+  const auto pools = pool_manager->LoadPoolLog();
+  if (pools.empty() || admin == nullptr) return;
+  pool_manager->SetReplayingPools(true);
+  size_t made = 0;
+  for (const auto &e : pools) {
+    if (!pool_manager->FindPoolByName(e.pool_name).IsNull()) {
+      ++made;  // already back (e.g. from the server config's compose)
+      continue;
+    }
+    auto fut = admin->AsyncRecreatePool(e);
+    fut.Wait();
+    if (fut->GetReturnCode() == 0) {
+      ++made;
+    } else {
+      HLOG(kError, "Restart: could not re-create pool '{}' ({}): rc={}",
+           e.pool_name, e.chimod_name, fut->GetReturnCode());
+    }
+  }
+  pool_manager->SetReplayingPools(false);
+  HLOG(kInfo, "Restart: {} of {} durable pool(s) back from {}", made,
+       pools.size(), pool_manager->PoolLogPath());
+}
+
+/**
  * Raise this process's open-file soft limit to its hard limit. Every file
  * bdev opens its backing file once per worker, so an array of several disks
  * on 16 workers runs past the usual 1024 soft limit, and the next member's
@@ -388,13 +426,17 @@ bool RuntimeManager::ServerInit() {
     }
   }
 
-  // Replay the restart write-ahead log: re-compose every "container" (compose
-  // file) that was registered for restart via `clio_run compose start`. This
-  // is the persistent-restart registry (~/.clio/restart_log.bin) and runs on
-  // every startup (both `start` and `restart`), independently of whether the
-  // server config had a compose section. On a recovery (`restart`) the pools
-  // take the Restart() path; on a fresh `start` they Init().
-  {
+  if (!config_manager->IsEphemeral()) {
+    ReplayPoolLog(is_restart_);
+  }
+
+  // LEGACY migration: compose files registered in the old restart log
+  // (~/.clio/restart_log.bin) by `clio_run compose start` before the pool
+  // log became the one restart registry. Nothing registers there any more
+  // (only entries whose file is gone are pruned):
+  // on a restart their pools are re-composed with restart semantics, which
+  // records them in this node's pool log like any durable compose pool.
+  if (is_restart_) {
     clio::run::RestartLog restart_log;
     std::vector<std::string> containers = restart_log.LiveSet();
     if (!containers.empty()) {

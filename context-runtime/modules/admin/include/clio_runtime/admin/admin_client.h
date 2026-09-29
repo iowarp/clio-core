@@ -39,6 +39,7 @@
 #include "clio_ctp/data_structures/serialization/global_serialize.h"
 
 #include "admin_tasks.h"
+#include <clio_runtime/pool_manager.h>
 
 /**
  * Client API for Admin ChiMod
@@ -366,6 +367,36 @@ class Client : public clio::run::ContainerClient {
 
     return ipc_manager->Send(task);
   }
+
+#if CTP_IS_HOST
+  /**
+   * Re-create THIS node's container of a durable pool from its pool-log
+   * entry (restart replay). Compose entries are re-composed with restart
+   * semantics; API entries re-run their create with the recorded params.
+   * @param e the pool-log entry
+   * @return Future for the create task
+   */
+  clio::run::Future<GetOrCreatePoolTask<CreateParams>> AsyncRecreatePool(
+      const clio::run::PoolManager::PoolLogEntry &e) {
+    auto* ipc_manager = CLIO_IPC;
+    auto task = ipc_manager->NewTask<GetOrCreatePoolTask<CreateParams>>(
+        clio::run::CreateTaskId(), clio::run::kAdminPoolId,
+        clio::run::PoolQuery::Local(), e.chimod_name, e.pool_name, e.pool_id,
+        nullptr);
+    task->do_compose_ = e.compose;
+    clio::run::priv::string raw(CLIO_PRIV_ALLOC, e.chimod_params);
+    if (e.compose) {
+      auto pool_config =
+          clio::run::Task::Deserialize<clio::run::PoolConfig>(raw);
+      pool_config.restart_ = true;
+      clio::run::Task::Serialize(CLIO_PRIV_ALLOC, task->chimod_params_,
+                                 pool_config);
+    } else {
+      task->chimod_params_ = raw;  // byte for byte: binary CreateParams
+    }
+    return ipc_manager->Send(task);
+  }
+#endif
 
   /**
    * ListContainers - Enumerate active pools/containers in the local daemon.

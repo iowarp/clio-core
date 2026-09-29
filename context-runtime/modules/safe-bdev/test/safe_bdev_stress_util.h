@@ -165,6 +165,7 @@ class Array {
     first_ = first;
     max_failures_ = max_failures;
     distributed_ = distributed;
+    safe_.SetPersistent(distributed);  // a real multi-node array is durable
     std::vector<sb::MemberBdevDesc> m;
     m.emplace_back(first.path, first.node, first.id);
     log_ = (StressDir() / (tag_ + "_" + std::to_string(getpid()) + ".alog"))
