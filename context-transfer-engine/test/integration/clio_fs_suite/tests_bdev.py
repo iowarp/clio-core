@@ -60,11 +60,42 @@ def t_safe_bdev_node_loss(ctx):
       cl.kill_runtime(victim)
       time.sleep(25)  # past failure detection: the node is declared dead
 
-  rc, tail = _drive(ctx, 'clio_safe_bdev_dist_stress',
+  rc, tail = _drive(ctx, 'clio_safe_bdev_dist_stress node_loss',
                     {'CLIO_SBD_NODES': str(len(ctx.hosts)),
                      'CLIO_SAFE_STRESS_DIR': local}, on_wait)
   for line in tail.split('\n'):
     if 'stress [' in line or 'marked faulty' in line:
+      ctx.note(line[-200:])
+  ctx.check(rc == 0 and '[PASS]' in tail,
+            f'driver failed rc={rc}: ' + tail[-1500:])
+
+
+@test('safe_bdev_live_growth_rejoin', 'bdev', min_nodes=4, redeploy_after=True,
+      timeout=1800)
+def t_safe_bdev_live_growth_rejoin(ctx):
+  """Writers keep going while a safe_bdev array grows from one node's disk
+  to four nodes'; a node then dies, overwrites land degraded, and when the
+  node is repaired and restarted its disk is rebuilt there."""
+  cl = ctx.cl
+  local = f'{cl.local_root}/data/sbd'
+  parallel(lambda h: sh(h, f'rm -rf {local}; mkdir -p {local}'), cl.hosts)
+  victim = cl.hosts[2]
+
+  def on_wait(step):
+    if step == 'kill2':
+      cl.kill_fuse(victim)
+      cl.kill_runtime(victim)
+      time.sleep(25)
+    elif step == 'restart2':
+      cl.start_runtime(victim, 'restart')
+      ctx.check(cl.runtime_up(victim), f'{victim} did not restart')
+      time.sleep(15)  # rejoin: the node is declared alive again
+
+  rc, tail = _drive(ctx, 'clio_safe_bdev_dist_stress live_growth',
+                    {'CLIO_SBD_NODES': str(len(ctx.hosts)),
+                     'CLIO_SAFE_STRESS_DIR': local}, on_wait)
+  for line in tail.split('\n'):
+    if 'stress [' in line:
       ctx.note(line[-200:])
   ctx.check(rc == 0 and '[PASS]' in tail,
             f'driver failed rc={rc}: ' + tail[-1500:])
