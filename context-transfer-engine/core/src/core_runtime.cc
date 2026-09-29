@@ -932,6 +932,12 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     // per-insert indexing), so rebuild the regex search index once from the
     // final tag set (#598).
     RebuildTagSearchIndexLocked();
+    // Node-local cache copies missed any invalidation sent while this node
+    // was down; never serve them after a restart.
+    size_t dropped = DropRestoredCacheReplicas();
+    if (dropped > 0) {
+      HLOG(kInfo, "cte_core Create: dropped {} restored cache copies", dropped);
+    }
     // Teach every bdev target's (currently fresh, cursor-at-0) block
     // allocator about the bytes the just-restored blobs/replicas already
     // occupy, BEFORE this container's pool is reachable for new PutBlobs.
@@ -7973,6 +7979,22 @@ void Runtime::ApplyWalDelBlob(const std::vector<char> &payload,
   tag_blob_name_to_info_.erase(composite_key);
   BlobIndexErase(composite_key);
   blobs_replayed++;
+}
+
+size_t Runtime::DropRestoredCacheReplicas() {
+  size_t dropped = 0;
+  tag_blob_name_to_info_.for_each(
+      [&](const std::string &, const std::shared_ptr<BlobInfo> &blob_info_sp) {
+        for (auto &rep : blob_info_sp->replicas_) {
+          if (!(rep.flags_ & REPLICA_CACHE) || rep.total_size_cache_ == 0) {
+            continue;
+          }
+          rep.blocks_.clear();
+          rep.total_size_cache_ = 0;
+          ++dropped;
+        }
+      });
+  return dropped;
 }
 
 void Runtime::ReserveRestoredBlockSpace() {

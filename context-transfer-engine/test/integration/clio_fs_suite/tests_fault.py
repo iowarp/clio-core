@@ -732,7 +732,9 @@ def blob_info_notes(ctx, path, verdict):
   off = (mm or {}).get('offset', 0)
   for i in range(len(ctx.hosts)):
     rv = ctx.a(i).call('read_hex', timeout=30, path=path, off=off, length=16)
-    ctx.note(f'node{i} re-read @{off}: '
+    st = ctx.a(i).call('stat', timeout=30, path=path)
+    ino = (st.get('ret') or {}).get('ino') if st.get('ok') else st.get('err')
+    ctx.note(f'node{i} ino {ino} re-read @{off}: '
              f'{str(rv.get("ret") if rv.get("ok") else rv.get("err"))[:60]}')
   ino = ctx.ok(0, 'stat', path=path)['ino']
   tag = f'{ino >> 32}.{ino & 0xffffffff}'

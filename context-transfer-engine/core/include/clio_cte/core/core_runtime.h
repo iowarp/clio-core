@@ -1088,6 +1088,22 @@ private:
   void ReserveRestoredBlockSpace();
 
   /**
+   * Forget every restored REPLICA_CACHE layout -- called once during Create()
+   * on a restart, after the metadata log and WALs are replayed and BEFORE
+   * ReserveRestoredBlockSpace, so the bytes those copies occupied are simply
+   * never re-reserved (reclaimed without a free round trip).
+   *
+   * A cache copy is correct only while this node takes part in the
+   * register/invalidate protocol (see the cache interposer): a foreign write
+   * that lands while the node is down invalidates nothing here, so a copy
+   * restored from the log may be stale, or may reference blocks the replay
+   * could not vouch for. The authoritative chain refills it on demand.
+   *
+   * @return number of cache copies dropped
+   */
+  size_t DropRestoredCacheReplicas();
+
+  /**
    * Retrieve telemetry entries for analysis (non-destructive peek)
    * @param entries Vector to store retrieved entries
    * @param max_entries Maximum number of entries to retrieve
