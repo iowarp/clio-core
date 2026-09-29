@@ -1261,7 +1261,13 @@ void PoolManager::ReplayAddressTableWAL() {
 
   size_t entries_replayed = 0;
   for (const auto &dir_entry : fs::directory_iterator(wal_dir)) {
-    if (dir_entry.path().extension() != ".bin") continue;
+    // Only this WAL's own files: the directory also holds other logs (the
+    // pool log, pools.<node>.bin), whose records parsed as mappings here
+    // produced garbage pool ids -- and could remap a real pool's containers.
+    if (dir_entry.path().extension() != ".bin" ||
+        dir_entry.path().filename().string().rfind("domain_table.", 0) != 0) {
+      continue;
+    }
 
     std::ifstream ifs(dir_entry.path(), std::ios::binary);
     if (!ifs.is_open()) continue;
