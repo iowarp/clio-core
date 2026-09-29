@@ -350,6 +350,12 @@ class Runtime : public clio::run::Container {
   mutable std::mutex member_log_mu_;
   mutable clio::run::u64 member_log_records_ = 0;
   clio::run::u32 max_failures_;           // Fault-tolerance target (M == m_max)
+  /** Most data (and, separately, parity) members an array can hold. The
+   *  member vectors reserve this at Create, so AddBdev's append never
+   *  reallocates them under a concurrent data-plane task holding a
+   *  reference or index into them (the membership paths are not locked
+   *  against I/O). */
+  static constexpr size_t kMaxMembers = 256;
   /** Return code of an operation sent to a passive (non-home) container of
    *  a distributed array. */
   static constexpr clio::run::u32 kNotHomeRc = 40;
@@ -403,10 +409,10 @@ class Runtime : public clio::run::Container {
   // read data_alloc_ (StripeMembers, ForgetSlotIfEmpty) require the caller to
   // hold alloc_mu_ and must not re-acquire it.
   //
-  // NOT covered: the membership-change paths (AddBdev / RemoveBdev /
-  // RecoverBdev) push_back/pop_back on data_alloc_ across co_awaits, which can
-  // reallocate the vector under a concurrent data-plane task. Serializing
-  // those against I/O needs a suspension-aware lock (CoMutex), not this one.
+  // The membership-change paths (AddBdev / RemoveBdev / RecoverBdev)
+  // push_back/pop_back on the member vectors across co_awaits without this
+  // lock; the vectors reserve kMaxMembers at Create, so those appends never
+  // reallocate under a concurrent data-plane task.
   mutable std::mutex alloc_mu_;
 
   /** Mark a slot as holding data and needing (re)parity. */

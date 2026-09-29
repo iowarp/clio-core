@@ -663,6 +663,11 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   data_clients_.clear();
   parity_clients_.clear();
   data_alloc_.clear();
+  data_members_.reserve(kMaxMembers);
+  data_clients_.reserve(kMaxMembers);
+  data_alloc_.reserve(kMaxMembers);
+  parity_members_.reserve(kMaxMembers);
+  parity_clients_.reserve(kMaxMembers);
   rs_cache_.clear();
   reattached_members_ = 0;
   {
@@ -1322,6 +1327,13 @@ clio::run::TaskResume Runtime::AddBdev(clio::run::shared_ptr<AddBdevTask> &task)
   FaultMembersOnDeadNodes();
 
   const bool as_parity = (task->as_parity_ != 0);
+  if ((as_parity ? parity_members_.size() : data_members_.size()) >=
+      kMaxMembers) {
+    HLOG(kError, "safe_bdev AddBdev: the array already has {} {} members",
+         kMaxMembers, as_parity ? "parity" : "data");
+    task->return_code_ = 4;
+    CLIO_CO_RETURN;
+  }
 
   if (!as_parity) {
     clio::run::u32 lowest_ttl = 7;
