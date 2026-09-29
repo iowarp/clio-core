@@ -952,6 +952,48 @@ clio::run::TaskResume Runtime::DelTag(
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::UpdateTagNames(
+    clio::run::shared_ptr<clio::cte::core::UpdateTagNamesTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kUpdateTagNames,
+                              task.template Cast<clio::run::Task>()));
+  {
+    // A directory rename changes the path of every file below it, which a
+    // per-id cache cannot express: drop the cache and re-resolve lazily.
+    std::lock_guard<std::mutex> lock(index_mutex_);
+    tag_names_.clear();
+    doc_names_stale_ = true;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RefreshDocNames() {
+  CLIO_TASK_BODY_BEGIN
+  std::vector<TagId> ids;
+  {
+    std::lock_guard<std::mutex> lock(index_mutex_);
+    if (!doc_names_stale_) CLIO_CO_RETURN;
+    doc_names_stale_ = false;
+    std::unordered_set<clio::run::u64> seen;
+    for (const auto &kv : index_) {
+      if (seen.insert(TagKey(kv.second.tag_id_)).second) {
+        ids.push_back(kv.second.tag_id_);
+      }
+    }
+  }
+  for (const TagId &id : ids) {
+    std::string name;
+    CLIO_CO_AWAIT(ResolveTagName(id, &name));
+    std::lock_guard<std::mutex> lock(index_mutex_);
+    for (auto &kv : index_) {
+      if (TagKey(kv.second.tag_id_) == TagKey(id)) kv.second.tag_name_ = name;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::RenameTag(
     clio::run::shared_ptr<clio::cte::core::RenameTagTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -985,6 +1027,7 @@ clio::run::TaskResume Runtime::SemanticSearch(
   // Read-your-writes barrier: indexing is asynchronous, so bring the index
   // current with every acked mutation BEFORE evaluating the query.
   CLIO_CO_AWAIT(DrainPendingIndex());
+  CLIO_CO_AWAIT(RefreshDocNames());  // names re-parented by UpdateTagNames
   {
     std::string tag_regex_str = task->tag_regex_.str();
     std::string blob_regex_str = task->blob_regex_.str();

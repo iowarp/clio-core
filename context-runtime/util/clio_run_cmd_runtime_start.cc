@@ -2,7 +2,10 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <vector>
 #include <string>
 #include <thread>
 
@@ -14,6 +17,10 @@
 #include "clio_runtime/singletons.h"
 #include "clio_runtime/types.h"
 #include "clio_run_commands.h"
+
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 namespace {
 volatile sig_atomic_t g_keep_running = 1;
@@ -157,10 +164,12 @@ void PrintVizUsage() {
 }
 
 void PrintRuntimeStartUsage() {
-  HIPRINT("Usage: clio runtime start [--induct] [--ephemeral] [viz options]");
-  HIPRINT("  Starts the Clio runtime server");
+  HIPRINT("Usage: clio runtime start [--induct] [--ephemeral] [--fresh] [viz options]");
+  HIPRINT("  Starts the Clio runtime server. If the configuration's persistent");
+  HIPRINT("  metadata log already holds state, start RECOVERS it (as restart)");
   HIPRINT("  --induct: Register this node with all existing cluster nodes");
   HIPRINT("  --ephemeral: Skip the default compose; start bare (admin only)");
+  HIPRINT("  --fresh: Ignore existing persistent state (do not recover it)");
   PrintVizUsage();
 }
 
@@ -251,8 +260,86 @@ void EnableVizForDaemon() {
 
 }  // namespace
 
+/**
+ * Expand ${VAR} references in a config value from the environment.
+ * @param v the raw value
+ * @return the expanded value
+ */
+std::string ExpandEnvVars(const std::string &v) {
+  std::string out;
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (v[i] == '$' && i + 1 < v.size() && v[i + 1] == '{') {
+      size_t end = v.find('}', i + 2);
+      if (end != std::string::npos) {
+        const char *e = std::getenv(v.substr(i + 2, end - i - 2).c_str());
+        out += (e != nullptr) ? e : "";
+        i = end;
+        continue;
+      }
+    }
+    out += v[i];
+  }
+  return out;
+}
+
+/**
+ * Find persistent state a fresh start would discard: a non-empty
+ * `metadata_log_path` of any pool in the server config.
+ *
+ * A plain `start` over such state used to come up EMPTY -- every file of a
+ * persistent clio-fs deployment vanished because only `restart` replays the
+ * logs -- which is the wrong default for an operator restarting a service.
+ * @return the first recoverable log path, or "" when there is none
+ */
+std::string FindRecoverableState() {
+  std::string conf;
+  if (const char *e = std::getenv("CLIO_SERVER_CONF")) {
+    conf = e;
+  } else if (const char *h = std::getenv("HOME")) {
+    conf = std::string(h) + "/.clio/clio.yaml";
+  }
+  std::ifstream in(conf);
+  std::string line;
+  while (std::getline(in, line)) {
+    const size_t hash = line.find('#');
+    if (hash != std::string::npos) line.resize(hash);
+    const size_t k = line.find("metadata_log_path:");
+    if (k == std::string::npos) continue;
+    std::string v = line.substr(k + std::strlen("metadata_log_path:"));
+    const char *trim = " \t\"'\r";
+    v.erase(0, v.find_first_not_of(trim));
+    v.erase(v.find_last_not_of(trim) + 1);
+    v = ExpandEnvVars(v);
+    std::error_code ec;
+    if (!v.empty() && std::filesystem::exists(v, ec) &&
+        std::filesystem::file_size(v, ec) > 0) {
+      return v;
+    }
+  }
+  return "";
+}
+
+/**
+ * Let a debugger attach to this daemon when CLIO_ALLOW_PTRACE=1. Hosts with
+ * kernel.yama.ptrace_scope=1 only allow tracing of descendants, so a hung or
+ * stalled runtime could not be sampled with `gdb -p` without restarting it
+ * under gdb (which yields one snapshot and then kills it). Opt-in only.
+ */
+static void MaybeAllowPtrace() {
+#if defined(__linux__) && defined(PR_SET_PTRACER)
+  const char *e = std::getenv("CLIO_ALLOW_PTRACE");
+  if (e != nullptr && e[0] == '1') {
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+  }
+#endif
+}
+
 int RuntimeStart(int argc, char* argv[]) {
+  MaybeAllowPtrace();
   bool induct = false;
+  bool fresh = false;
+  bool ephemeral = false;
+  std::vector<char *> restart_args;
   for (int i = 0; i < argc; ++i) {
     VizArg viz_arg = ParseVizArg(argc, argv, i);
     if (viz_arg == VizArg::kBadValue) {
@@ -262,9 +349,14 @@ int RuntimeStart(int argc, char* argv[]) {
     if (viz_arg == VizArg::kConsumed) {
       continue;
     }
+    if (std::strcmp(argv[i], "--fresh") == 0) {
+      fresh = true;
+      continue;
+    }
     if (std::strcmp(argv[i], "--induct") == 0) {
       induct = true;
     } else if (std::strcmp(argv[i], "--ephemeral") == 0) {
+      ephemeral = true;
       // Skip the default compose: start bare (admin only), to be composed
       // explicitly. Communicated to ConfigManager via CLIO_EPHEMERAL, read
       // during the CLIO_INIT below.
@@ -277,6 +369,23 @@ int RuntimeStart(int argc, char* argv[]) {
       HLOG(kError, "Unknown argument: {}", argv[i]);
       PrintRuntimeStartUsage();
       return 1;
+    }
+  }
+
+  if (!fresh && !ephemeral) {
+    const std::string state = FindRecoverableState();
+    if (!state.empty()) {
+      HLOG(kWarning,
+           "Persistent state found at {}: recovering it (as `restart`). "
+           "Pass --fresh to start empty instead.",
+           state);
+      for (int i = 0; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--fresh") != 0) {
+          restart_args.push_back(argv[i]);
+        }
+      }
+      return RuntimeRestart(static_cast<int>(restart_args.size()),
+                            restart_args.data());
     }
   }
 
@@ -320,6 +429,7 @@ int RuntimeStart(int argc, char* argv[]) {
 }
 
 int RuntimeRestart(int argc, char* argv[]) {
+  MaybeAllowPtrace();
   bool induct = false;
   for (int i = 0; i < argc; ++i) {
     VizArg viz_arg = ParseVizArg(argc, argv, i);

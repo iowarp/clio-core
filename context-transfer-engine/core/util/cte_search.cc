@@ -6,6 +6,8 @@
  *                         match the given regexes.
  *   semantic            — SemanticSearch: BM25 keyword ranking over blob bytes.
  *   temporal            — TemporalSearch: filter by last_modified timestamp.
+ *   tag-query           — TagQuery: list matching tags, including tags that
+ *                         hold no blobs (clio-fs directories).
  *
  * Usage examples
  * --------------
@@ -27,6 +29,8 @@
 #include <clio_ctp/util/logging.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -101,6 +105,9 @@ struct Args {
   uint32_t max_results = 0;
   std::string format = "names";  // names | table | json
   bool tags_only = false;        // print only unique tag names
+  bool tag_query = false;        // TagQuery: match tags, blobs or not
+  bool blob_info = false;        // --blob-info: tag_re = "major.minor"
+  bool local = false;            // --local: blob-info of THIS node's copy
 };
 
 static void PrintUsage(const char *prog) {
@@ -122,6 +129,13 @@ static void PrintUsage(const char *prog) {
     "  --max N              Maximum results (0 = unlimited)\n"
     "  --format FMT         Output format: names (default), table, json\n"
     "  --tags-only          List only unique matching tag names\n"
+    "  --tag-query          List matching tags, including tags with no blobs\n"
+    "  --blob-info          tag_re is a tag id \"major.minor\", blob_re a blob\n"
+    "                       name: print its primary blocks and the size and\n"
+    "                       leading bytes of the primary and replica 1\n"
+    "                       (e.g. clio-fs directories)\n"
+    "  --local              with --blob-info: this node's copy, not the\n"
+    "                       owner's (routing Local instead of by hash)\n"
     "  --help               Show this message\n"
     "\n"
     "Examples:\n"
@@ -185,6 +199,14 @@ static Args ParseArgs(int argc, char **argv) {
       }
     } else if (flag == "--tags-only") {
       a.tags_only = true;
+    } else if (flag == "--blob-info") {
+      a.blob_info = true;
+      ++mode_count;
+    } else if (flag == "--local") {
+      a.local = true;
+    } else if (flag == "--tag-query") {
+      a.tag_query = true;
+      ++mode_count;
     } else {
       std::cerr << "error: unknown option: " << flag << "\n";
       std::exit(1);
@@ -192,7 +214,8 @@ static Args ParseArgs(int argc, char **argv) {
   }
 
   if (mode_count > 1) {
-    std::cerr << "error: --semantic, --since, and --time-begin are mutually exclusive\n";
+    std::cerr << "error: --semantic, --since, --time-begin and --tag-query "
+                 "are mutually exclusive\n";
     std::exit(1);
   }
 
@@ -323,7 +346,55 @@ static Mode DetermineMode(const Args &a) {
   return Mode::kRegex;
 }
 
+/**
+ * Print where one blob's bytes live: primary blocks, and the size and first
+ * bytes of the primary and of replica 1 (debugging aid).
+ * @param client CTE client
+ * @param a parsed args (tag_re = "major.minor", blob_re = blob name)
+ * @return process exit code
+ */
+static int RunBlobInfo(clio::cte::core::Client *client, const Args &a) {
+  clio::cte::core::TagId tag;
+  if (std::sscanf(a.tag_re.c_str(), "%u.%u", &tag.major_, &tag.minor_) != 2) {
+    std::cerr << "error: --blob-info needs a tag id major.minor\n";
+    return 1;
+  }
+  const clio::run::PoolQuery q =
+      a.local ? clio::run::PoolQuery::Local() : clio::run::PoolQuery::Dynamic();
+  auto info = client->AsyncGetBlobInfo(tag, a.blob_re, q);
+  info.Wait();
+  std::cout << "primary rc=" << info->GetReturnCode()
+            << " total_size=" << info->total_size_ << "\n";
+  for (const auto &b : info->blocks_) {
+    std::cout << "  block pool=" << b.target_pool_id_.major_ << "."
+              << b.target_pool_id_.minor_ << " off=" << b.block_offset_
+              << " size=" << b.block_size_ << "\n";
+  }
+  for (int rep = 0; rep <= 1; ++rep) {
+    auto sz = client->AsyncGetBlobSize(tag, a.blob_re, q, rep);
+    sz.Wait();
+    std::cout << "replica " << rep << ": size rc=" << sz->GetReturnCode()
+              << " size=" << sz->size_;
+    if (sz->GetReturnCode() == 0 && sz->size_ > 0) {
+      std::string buf(std::min<clio::run::u64>(sz->size_, 32), '\0');
+      clio::cte::core::Context ctx;
+      ctx.replica_ = rep;
+      auto g = client->AsyncGetBlob(tag, a.blob_re, 0, buf.size(), 0u,
+                                    buf.data(), q, ctx);
+      g.Wait();
+      size_t zeros = 0;
+      for (char c : buf) zeros += (c == 0);
+      std::cout << " read rc=" << g->GetReturnCode() << " head=\"";
+      for (char c : buf) std::cout << (std::isprint(static_cast<unsigned char>(c)) ? c : '.');
+      std::cout << "\" zeros=" << zeros;
+    }
+    std::cout << "\n";
+  }
+  return 0;
+}
+
 static int RunSearch(clio::cte::core::Client *client, const Args &a) {
+  if (a.blob_info) return RunBlobInfo(client, a);
   auto pool_query = clio::run::PoolQuery::Broadcast();
   Mode mode = DetermineMode(a);
 
@@ -378,6 +449,14 @@ static int RunSearch(clio::cte::core::Client *client, const Args &a) {
         std::cout << TagStr(r.tag_id_) << "/" << r.blob_name_ << "\n";
       }
     }
+    return 0;
+  }
+
+  if (a.tag_query) {
+    auto task = client->AsyncTagQuery(a.tag_re, a.max_results, pool_query);
+    task.Wait();
+    if (task->results_.empty()) { std::cout << "(no results)\n"; return 0; }
+    PrintTagsOnly(task->results_);
     return 0;
   }
 

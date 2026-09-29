@@ -40,11 +40,13 @@
 #include <clio_runtime/bdev/transports/block_allocator.h>  // bdev::Block, LiveBlock
 #include <clio_runtime/bdev/bdev_alloc_log.h>  // bdev::AllocatorLog (reused WAL)
 
+#include <algorithm>
 #include <cstdio>  // std::FILE
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -265,6 +267,9 @@ class Runtime : public clio::run::Container {
     // completes. RebuildMember is idempotent, so re-running after a crash is
     // safe.
     bool recovering_ = false;
+    /** PARITY members: chunk slots the device holds (a data member's
+     *  slot s needs parity slot s on every parity member). */
+    clio::run::u64 cap_slots_ = ~0ULL;
   };
 
   // Per-DATA-member slot allocator (parallel to data_members_, indexed by data
@@ -349,6 +354,17 @@ class Runtime : public clio::run::Container {
   mutable std::mutex member_log_mu_;
   mutable clio::run::u64 member_log_records_ = 0;
   clio::run::u32 max_failures_;           // Fault-tolerance target (M == m_max)
+  /** Most data (and, separately, parity) members an array can hold. The
+   *  member vectors reserve this at Create, so AddBdev's append never
+   *  reallocates them under a concurrent data-plane task holding a
+   *  reference or index into them (the membership paths are not locked
+   *  against I/O). */
+  static constexpr size_t kMaxMembers = 256;
+  /** Return code of an operation sent to a passive (non-home) container of
+   *  a distributed array. */
+  static constexpr clio::run::u32 kNotHomeRc = 40;
+  bool distributed_ = false;  // CreateParams::distributed_
+  bool is_home_ = true;       // distributed: this node runs the array
   clio::run::u32 parity_level_;           // Parity members added so far (m)
   clio::run::u32 reattached_members_;     // Members recognized as ours at Create
 
@@ -375,6 +391,11 @@ class Runtime : public clio::run::Container {
   // (never held across a co_await). A slot is safe to reconstruct only when NOT
   // dirty -- degraded reads / recovery refuse a dirty (unprotected) slot.
   std::set<clio::run::u64> dirty_slots_;
+  /** Bumped by every dirty mark of a slot (slot_mu_). BuildParity clears a
+   *  slot only if its generation is unchanged since it read the stripe: a
+   *  write that re-dirtied it mid-build (the slot already in the set, so the
+   *  insert was a no-op) must not be erased along with the stale parity. */
+  std::unordered_map<clio::run::u64, clio::run::u64> slot_gen_;
   std::set<clio::run::u64> written_slots_;
   mutable std::mutex slot_mu_;
 
@@ -392,10 +413,10 @@ class Runtime : public clio::run::Container {
   // read data_alloc_ (StripeMembers, ForgetSlotIfEmpty) require the caller to
   // hold alloc_mu_ and must not re-acquire it.
   //
-  // NOT covered: the membership-change paths (AddBdev / RemoveBdev /
-  // RecoverBdev) push_back/pop_back on data_alloc_ across co_awaits, which can
-  // reallocate the vector under a concurrent data-plane task. Serializing
-  // those against I/O needs a suspension-aware lock (CoMutex), not this one.
+  // The membership-change paths (AddBdev / RemoveBdev / RecoverBdev)
+  // push_back/pop_back on the member vectors across co_awaits without this
+  // lock; the vectors reserve kMaxMembers at Create, so those appends never
+  // reallocate under a concurrent data-plane task.
   mutable std::mutex alloc_mu_;
 
   /** Mark a slot as holding data and needing (re)parity. */
@@ -403,6 +424,7 @@ class Runtime : public clio::run::Container {
     std::lock_guard<std::mutex> g(slot_mu_);
     written_slots_.insert(s);
     dirty_slots_.insert(s);
+    ++slot_gen_[s];
   }
   /** Note a slot no longer holds data (last live chunk freed): drop it from the
    *  written set once no data member has it live. Caller ensures liveness check
@@ -456,6 +478,59 @@ class Runtime : public clio::run::Container {
     return mem;  // ascending by construction
   }
 
+  /** @return slots of the smallest parity member (~0 with none): no data
+   *  member may allocate a slot past it -- its parity would not fit. */
+  clio::run::u64 MinParityCap() const {
+    clio::run::u64 m = ~0ULL;
+    for (const auto &p : parity_members_) m = std::min(m, p.cap_slots_);
+    return m;
+  }
+  /** @return the highest slot any data member has used (+1). */
+  clio::run::u64 MaxDataHighWater() const {
+    clio::run::u64 m = 0;
+    for (const auto &a : data_alloc_) m = std::max(m, a.high_water_);
+    return m;
+  }
+  /** Clamp every data member's capacity to what the parity members can
+   *  cover (never below what it already used). Caller holds alloc_mu_ or
+   *  has exclusive access (Create). */
+  void ClampDataCaps() {
+    const clio::run::u64 lim = MinParityCap();
+    for (auto &a : data_alloc_) {
+      a.cap_slots_ = std::max(a.high_water_, std::min(a.cap_slots_, lim));
+    }
+  }
+  /**
+   * Chunk slots a member device can hold, from its bdev stats.
+   * @param client the member's bdev client
+   * @param q route to the member
+   * @param slots receives the slot count
+   * @param ok receives false if the device did not answer
+   */
+  clio::run::TaskResume QueryMemberSlots(clio::run::bdev::Client client,
+                                         clio::run::PoolQuery q,
+                                         clio::run::u64 &slots, bool &ok);
+
+  /**
+   * The array's usable capacity and what is left of it: active data members
+   * contribute their (parity-clamped) slots, a down member only its live
+   * chunks -- still stored, served degraded -- and no free space.
+   * @param total receives usable bytes
+   * @param remaining receives free usable bytes
+   */
+  void ArrayCapacity(clio::run::u64 *total, clio::run::u64 *remaining);
+
+  /** @return true if any data member holding a chunk of stripe `s` is down. */
+  bool StripeHasDownMember(clio::run::u64 s) const {
+    for (int d : StripeMembers(s)) {
+      if (data_members_[static_cast<size_t>(d)].state_ !=
+          ec::EcState::kActive) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** RS codec for a stripe of width `k` (RS(k, max_failures_)); cached. */
   ec::ReedSolomon *GetCodec(int k) {
     auto it = rs_cache_.find(k);
@@ -468,8 +543,34 @@ class Runtime : public clio::run::Container {
     return it->second.get();
   }
 
-  /** Per-member pool query (members are independent local bdev pools). */
-  clio::run::PoolQuery MemberQuery() const { return clio::run::PoolQuery::Local(); }
+  /** Query for this array's own pool (periodic self-tasks). */
+  clio::run::PoolQuery SelfQuery() const { return clio::run::PoolQuery::Local(); }
+  /**
+   * Route to one member's container: its node's in a distributed array,
+   * this node's otherwise.
+   * @param m the member
+   */
+  clio::run::PoolQuery MemberQuery(const MemberSlot &m) const {
+    return distributed_ ? clio::run::PoolQuery::Physical(m.node_id_)
+                        : clio::run::PoolQuery::Local();
+  }
+  /** @return route to data member `d`. */
+  clio::run::PoolQuery DataQuery(size_t d) const {
+    return MemberQuery(data_members_[d]);
+  }
+  /** @return route to parity member `j`. */
+  clio::run::PoolQuery ParityQuery(size_t j) const {
+    return MemberQuery(parity_members_[j]);
+  }
+  /**
+   * Distributed array: mark every active member whose node has died faulty
+   * (the node-level "unplugged disk"); degraded reads and writes then route
+   * around it until RecoverBdev. No-op for a node-local array.
+   */
+  void FaultMembersOnDeadNodes();
+  /** @return true if this container runs the array (always, unless the
+   *  array is distributed and this is not its home node). */
+  bool IsHome() const { return !distributed_ || is_home_; }
 
   /**
    * Automatic down-detection for a DATA member. Inspect a member-bdev future's
@@ -593,6 +694,67 @@ class Runtime : public clio::run::Container {
   /** Write one member record to an open file handle (append or compact). */
   void WriteMemberRecord(std::FILE *f, const MemberSlot &m,
                          clio::run::u32 role) const;
+
+  /**
+   * A stripe a write touches while one of its data members is down, held
+   * across the write: reconstructed BEFORE any member write lands (its
+   * parity is still consistent then), overlaid with every byte the write
+   * puts in the stripe, and re-encoded into every live parity shard after.
+   */
+  struct DegradedStripe {
+    std::vector<int> members;                  // StripeMembers(s)
+    std::vector<std::vector<uint8_t>> chunks;  // by stripe position
+  };
+  /**
+   * Reconstruct stripe `s` for a degraded write. Refuses (ok=false) when its
+   * parity is stale: the down member's bytes would then exist nowhere.
+   * @param s slot
+   * @param out receives the stripe
+   * @param ok receives success
+   */
+  clio::run::TaskResume LoadDegradedStripe(clio::run::u64 s,
+                                           DegradedStripe &out, bool &ok);
+  /**
+   * Re-encode a degraded stripe's parity and write every live shard.
+   * @param s slot
+   * @param st the overlaid stripe
+   * @param ok receives true if at least one parity shard was written
+   */
+  clio::run::TaskResume StoreDegradedParity(clio::run::u64 s,
+                                            const DegradedStripe &st,
+                                            bool &ok);
+
+  /** One data column to seat at Create: where it is and what state the
+   *  manifest left it in. */
+  struct DataSeatSpec {
+    MemberBdevDesc desc;
+    clio::run::u32 state = 0;  // ec::EcState as persisted (0 = active)
+    bool recovering = false;
+  };
+  /**
+   * The data columns to seat: the configured members, overridden and
+   * extended by the manifest. The manifest is the truth for membership: a
+   * column recovered onto another disk, a faulty column, and every data
+   * member added at runtime (which the config never listed) all come from
+   * it, so a restart brings back the array that was running.
+   * @param params Create parameters (configured members)
+   * @param manifest replayed member manifest (may be empty)
+   * @return one spec per data column, in column order
+   */
+  std::vector<DataSeatSpec> BuildDataMemberPlan(
+      const CreateParams &params,
+      const std::vector<MemberManifestEntry> &manifest) const;
+  /**
+   * Seat data column `col`: size its allocator from the member, then
+   * stamp (fresh) or re-attach (ours) its superblock; refuse a foreign one.
+   * A column the manifest recorded as faulty/removed is seated without
+   * touching its device (it may be gone) and takes no new allocations.
+   * @param spec the column
+   * @param col its index
+   * @param rc receives 0, or the Create return code (1 I/O, 2 foreign)
+   */
+  clio::run::TaskResume SeatDataMember(DataSeatSpec spec, int col,
+                                       clio::run::u32 &rc);
 
   /** Reconstruct + write EVERY slot this member participates in onto its
    *  (already-seated) client. Idempotent: safe to re-run after an interrupted

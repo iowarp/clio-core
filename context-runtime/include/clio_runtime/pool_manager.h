@@ -35,6 +35,7 @@
 #define CLIO_RUNTIME_INCLUDE_MANAGERS_POOL_MANAGER_H_
 
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -228,6 +229,15 @@ class PoolManager {
   bool HasPool(PoolId pool_id) const;
 
   /**
+   * Whether this node destroyed `pool_id` and has not re-created it since.
+   * Routing retires a periodic task of such a pool instead of retrying it
+   * forever.
+   * @param pool_id Pool identifier
+   * @return true if the pool was destroyed here and not re-created
+   */
+  bool WasDestroyed(PoolId pool_id) const;
+
+  /**
    * Check if a specific container exists on this node for a given pool
    * @param pool_id Pool identifier
    * @param container_id Container identifier
@@ -363,7 +373,53 @@ class PoolManager {
    */
   void ReplayAddressTableWAL();
 
+  /** One durable pool as this node's pool log keeps it: what re-creating
+   *  its container here after a restart takes. */
+  struct PoolLogEntry {
+    PoolId pool_id;
+    std::string pool_name;
+    std::string chimod_name;
+    /** Compose: the serialized PoolConfig. API: the ChiMod's serialized
+     *  CreateParams. */
+    std::string chimod_params;
+    bool compose = false;
+  };
+
+  /**
+   * Record (add) or forget (!add) a durable pool in this node's pool log,
+   * <conf_dir>/wal/pools.<node>.bin -- the ONE restart registry for every
+   * pool, however it was created: compose pools with `restart: true` and
+   * API pools created by a client with SetPersistent(true).
+   * @param add true on create, false on destroy
+   * @param e the pool
+   */
+  void LogPool(bool add, const PoolLogEntry &e);
+
+  /**
+   * The live entries of this node's pool log, in creation order (a pool may
+   * need one created before it, e.g. an array's member disks), compacting
+   * the log to that set.
+   * @return live entries
+   */
+  std::vector<PoolLogEntry> LoadPoolLog();
+
+  /** Read the live entries of a pool log file without compacting it.
+   *  @param path the log file  @return live entries */
+  static std::vector<PoolLogEntry> ReadPoolLogFile(const std::string &path);
+
+  /** Forget every durable pool of this node: a fresh (non-restart) start
+   *  begins a new cluster lifetime. */
+  void ClearPoolLog();
+
+  /** @return path of this node's pool log. */
+  std::string PoolLogPath() const;
+
+  /** While true, pools being created are re-creations from the pool log:
+   *  their containers take the Restart() path and are not logged again. */
+  void SetReplayingPools(bool v) { replaying_pools_ = v; }
+
  private:
+  bool replaying_pools_ = false;
   /**
    * Internal: Get a DynamicContainer by PoolId and ContainerId (no fallback to
    * local container; no plug check)
@@ -431,6 +487,9 @@ class PoolManager {
   // always scoped to a single map operation so the lock is never held across
   // CreatePool's co_await.
   mutable std::shared_mutex pool_metadata_mutex_;
+  /** Pools destroyed on this node and not re-created (see WasDestroyed). */
+  std::unordered_set<PoolId> destroyed_pools_;
+  mutable std::mutex destroyed_pools_mu_;
 
   // Pool ID counter for generating unique IDs (used as minor number)
   std::atomic<u32> next_pool_minor_{5}; // Start at 5 for safety, 1 reserved for admin

@@ -1983,10 +1983,6 @@ TEST_CASE("bdev_parallel_io_operations", "[bdev][parallel][io]") {
 //==============================================================================
 // ALLOCATOR WAL (PERSISTENT ALLOCATOR STATE) TESTS
 //==============================================================================
-#if 0  // WIP (PR #663): the bdev alloc-log WAL is dormant on dev's rewritten
-       // bdev_runtime (FlushAllocLog handler + persistence not yet ported).
-       // Re-enable these tests once the bdev WAL is wired up.
-//
 // These tests exercise the persistent allocator-state log (WAL). They use a
 // FILE-backed bdev so written data survives a pool destroy, and a SECOND bdev
 // pool pointing at the SAME data file + SAME alloc-log file to simulate
@@ -2078,7 +2074,8 @@ TEST_CASE("bdev_alloc_log_recover_no_collision",
     // not call the bdev Destroy handler, so flush explicitly.)
     FlushLog(client);
     auto destroy_task =
-        CLIO_ADMIN->AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+        clio::run::admin::Client(clio::run::kAdminPoolId)
+            .AsyncDestroyPool(clio::run::PoolQuery::Dynamic(), pool_id);
     destroy_task.Wait();
     std::this_thread::sleep_for(200ms);
   }
@@ -2123,7 +2120,8 @@ TEST_CASE("bdev_alloc_log_recover_no_collision",
     }
 
     auto destroy_task =
-        CLIO_ADMIN->AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+        clio::run::admin::Client(clio::run::kAdminPoolId)
+            .AsyncDestroyPool(clio::run::PoolQuery::Dynamic(), pool_id);
     destroy_task.Wait();
   }
 
@@ -2162,7 +2160,8 @@ TEST_CASE("bdev_alloc_log_free_then_recover_reuse",
     // Persist the WAL (allocs of A/B/C + free of B) before destroying.
     FlushLog(client);
     auto destroy_task =
-        CLIO_ADMIN->AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+        clio::run::admin::Client(clio::run::kAdminPoolId)
+            .AsyncDestroyPool(clio::run::PoolQuery::Dynamic(), pool_id);
     destroy_task.Wait();
     std::this_thread::sleep_for(200ms);
   }
@@ -2189,7 +2188,8 @@ TEST_CASE("bdev_alloc_log_free_then_recover_reuse",
     REQUIRE_FALSE(RangesOverlap(more.offset_, more.size_, c.offset_, c.size_));
 
     auto destroy_task =
-        CLIO_ADMIN->AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+        clio::run::admin::Client(clio::run::kAdminPoolId)
+            .AsyncDestroyPool(clio::run::PoolQuery::Dynamic(), pool_id);
     destroy_task.Wait();
   }
 
@@ -2253,7 +2253,6 @@ TEST_CASE("bdev_alloc_log_compaction", "[bdev][alloc_log][compact]") {
 
   ctp::SystemInfo::RemoveFile(log_path);
 }
-#endif  // WIP #663: bdev alloc-log WAL tests (dormant feature)
 
 //==============================================================================
 // ManyToOne collective batch + aggregate (#587)

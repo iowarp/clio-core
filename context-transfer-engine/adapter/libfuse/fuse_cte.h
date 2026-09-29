@@ -519,6 +519,8 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
 int cte_fuse_release(const char *path, struct fuse_file_info *fi);
 int cte_fuse_flush(const char *path, struct fuse_file_info *fi);
 int cte_fuse_fsync(const char *path, int datasync, struct fuse_file_info *fi);
+int cte_fuse_fsyncdir(const char *path, int datasync,
+                      struct fuse_file_info *fi);
 int cte_fuse_mkdir(const char *path, cte_mode_t mode);
 int cte_fuse_rmdir(const char *path);
 int cte_fuse_unlink(const char *path);

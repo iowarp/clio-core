@@ -108,6 +108,19 @@ class BdevTransport {
    * Get the remaining allocatable size
    */
   virtual clio::run::u64 GetRemainingSize() const = 0;
+
+  /**
+   * Make the allocator-state log durable (fsync) and compact it once it has
+   * grown well past the live-block count. No-op without a log.
+   */
+  virtual void FlushAllocLog() {}
+
+  /**
+   * Make every completed write durable, then the allocator state. Memory
+   * tiers have nothing to sync.
+   * @return false if the device could not be synced
+   */
+  virtual bool Sync() { return true; }
 };
 
 /**

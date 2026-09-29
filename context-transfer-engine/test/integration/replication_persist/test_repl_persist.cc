@@ -196,14 +196,16 @@ static int VerifyBlobs() {
 
   int verified = 0;
   for (int i = 0; i < kNumBlobs; ++i) {
-    // The DRAM primary must be GONE: volatile blocks are filtered at
-    // metadata replay. This is the premise of the whole feature — the cache
-    // copy dies with the machine, the replica does not.
+    // The DRAM primary is either gone (volatile blocks are filtered at
+    // metadata replay) or -- because a graceful stop moves RAM-tier data to
+    // a persistent tier before exiting -- whole. A partial one is a bug; a
+    // surviving one's bytes are checked by the interposed read below.
     auto psz = cte.AsyncGetBlobSize(tag_id, BlobName(i));
     psz.Wait();
-    if (psz->GetReturnCode() != 0 || psz->size_ != 0) {
-      HLOG(kError, "Phase 2: blob {} primary survived reboot?! size={} rc={}",
-           i, psz->size_, psz->GetReturnCode());
+    if (psz->GetReturnCode() == 0 && psz->size_ != 0 &&
+        psz->size_ != kBlobSize) {
+      HLOG(kError, "Phase 2: blob {} primary came back PARTIAL: size={}", i,
+           psz->size_);
       return 1;
     }
     // The disk replica must be fully intact.
@@ -273,9 +275,13 @@ static int VerifyBlobs() {
                                       /*flags=*/0,
                                       ctp::ipc::ShmPtr<>(buf.shm_));
       get.Wait();
-      if (get->GetReturnCode() != 0 || buf.ptr_[0] != PatternByte(i)) {
-        HLOG(kError, "Phase 2: blob {} interposed GetBlob failed rc={}",
-             i, get->GetReturnCode());
+      bool whole = get->GetReturnCode() == 0;
+      for (clio::run::u64 b = 0; whole && b < kBlobSize; ++b) {
+        whole = buf.ptr_[b] == PatternByte(i);
+      }
+      if (!whole) {
+        HLOG(kError, "Phase 2: blob {} interposed GetBlob failed or returned "
+             "wrong bytes (rc={})", i, get->GetReturnCode());
         return 1;
       }
       auto psz2 = cte.AsyncGetBlobSize(tag_id, BlobName(i));

@@ -261,14 +261,21 @@ class Client : public clio::run::ContainerClient {
     // Bound by the CACHED PREFIX, not by the blob's total size: a truncated
     // primary record describes only its first kMaxInlineBlocks blocks, and a
     // read past them has no block to resolve against.
-    const bool primary_ok =
-        rec.IsDirectReadable() && offset + size <= rec.CoveredBytes();
+    //
+    // AND by the DECLARED size: a block's capacity can exceed the bytes the
+    // blob holds (whole-block allocation, recycled extents), so a range past
+    // total_size_ but inside CoveredBytes() would copy stale bytes -- another
+    // file's data -- where a short read belongs. The RPC path clamps it.
+    const bool primary_ok = rec.IsDirectReadable() &&
+                            offset + size <= rec.CoveredBytes() &&
+                            offset + size <= rec.total_size_;
     // Serving-replica reads only for STACK-bound clients (AttachShmCacheOf):
     // they alias the whole interposer chain, whose task path returns
     // producer bytes. A direct core client keeps stored-bytes semantics.
     const bool replica_ok = shm_replica_serving_ && !primary_ok &&
                             rec.HasServableReplica() &&
-                            offset + size <= rec.RepCoveredBytes();
+                            offset + size <= rec.RepCoveredBytes() &&
+                            offset + size <= rec.rep_total_size_;
     if (!primary_ok && !replica_ok) {
       return false;  // transformed/file/remote/GPU-tier and no serving replica
     }
@@ -3596,6 +3603,23 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Publish a batch of tag-name operations (see EncodeTagNameOp). Sent as a
+   * Broadcast so every container can resolve and search the names; dead
+   * nodes are skipped (they catch up from the publisher after restart).
+   * @param ops encoded batch
+   * @param pool_query default Broadcast(0.0f)
+   */
+  clio::run::Future<UpdateTagNamesTask> AsyncUpdateTagNames(
+      const std::string &ops,
+      const clio::run::PoolQuery &pool_query =
+          clio::run::PoolQuery::Broadcast(0.0f)) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<UpdateTagNamesTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, ops);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Asynchronous poll telemetry log - returns immediately
    * @param minimum_logical_time Minimum logical time filter
    * @param pool_query Pool query for task routing (default: Dynamic)
@@ -3829,6 +3853,27 @@ class Client : public clio::run::ContainerClient {
       task->SetFlags(TASK_PERIODIC);
     }
 
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * fsync(2) for one tag - asynchronous. Broadcast by default so every
+   * container makes the blobs it holds durable (see SyncTagTask).
+   * @param tag_id tag whose blobs must become durable
+   * @param pool_query routing (default: Broadcast)
+   * @param min_persistence minimum tier level; < 0 uses the configured
+   *        flush_data_min_persistence
+   * @return future for the SyncTagTask (rc kSyncNoSpaceRc / kSyncIoRc on
+   *         failure; deferred_ = 1 when fsync_mode is "deferred")
+   */
+  clio::run::Future<SyncTagTask> AsyncSyncTag(
+      const TagId &tag_id,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast(),
+      int min_persistence = -1) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<SyncTagTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
+        min_persistence);
     return ipc_manager->Send(task);
   }
 

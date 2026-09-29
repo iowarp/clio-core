@@ -342,6 +342,8 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
           << YAML::Value << FormatSizeBytes(performance_.transaction_log_capacity_bytes_);
   emitter << YAML::Key << "flush_data_period_ms" << YAML::Value << performance_.flush_data_period_ms_;
   emitter << YAML::Key << "flush_data_min_persistence" << YAML::Value << performance_.flush_data_min_persistence_;
+  emitter << YAML::Key << "fsync_mode" << YAML::Value
+          << (performance_.fsync_deferred_ ? "deferred" : "durable");
   emitter << YAML::EndMap;
 
   // Emit target configuration
@@ -349,6 +351,8 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
   emitter << YAML::Key << "neighborhood" << YAML::Value << targets_.neighborhood_;
   emitter << YAML::Key << "default_target_timeout_ms" << YAML::Value << targets_.default_target_timeout_ms_;
   emitter << YAML::Key << "poll_period_ms" << YAML::Value << targets_.poll_period_ms_;
+  emitter << YAML::Key << "failover_to_successor" << YAML::Value
+          << targets_.failover_to_successor_;
   emitter << YAML::EndMap;
   
   // Emit storage configuration
@@ -435,6 +439,16 @@ bool Config::ParsePerformanceConfig(const YAML::Node &node) {
     ParseSizeString(cap_str, performance_.transaction_log_capacity_bytes_);
   }
 
+  if (node["fsync_mode"]) {
+    const std::string mode = node["fsync_mode"].as<std::string>();
+    if (mode != "durable" && mode != "deferred") {
+      HLOG(kError, "Config error: fsync_mode must be \"durable\" or "
+           "\"deferred\", got \"{}\"", mode);
+      return false;
+    }
+    performance_.fsync_deferred_ = (mode == "deferred");
+  }
+
   return true;
 }
 
@@ -449,6 +463,9 @@ bool Config::ParseTargetConfig(const YAML::Node &node) {
 
   if (node["poll_period_ms"]) {
     targets_.poll_period_ms_ = node["poll_period_ms"].as<clio::run::u32>();
+  }
+  if (node["failover_to_successor"]) {
+    targets_.failover_to_successor_ = node["failover_to_successor"].as<bool>();
   }
 
   return true;

@@ -891,6 +891,13 @@ static constexpr clio::run::u32 REPLICA_UPDATE_ONLY = 0x8;
 static constexpr clio::run::u32 REPLICA_VERIFY_COMPLETE = 0x10;
 /** Return code of an UPDATE_ONLY replica write against an absent slot. */
 static constexpr clio::run::u32 kReplicaAbsentRc = 12;
+/** PutBlob could not place the bytes: every eligible tier is full (10 +
+ *  ExtendBlob's out-of-space code). A filesystem reports it as ENOSPC. */
+static constexpr clio::run::u32 kPutNoSpaceRc = 13;
+/** PutBlob with Context::kPutIfAbsent found the blob already there. */
+static constexpr clio::run::u32 kPutExistsRc = 60;
+/** PutBlob with Context::kPutIfVersion found a different version. */
+static constexpr clio::run::u32 kPutVersionMismatchRc = 61;
 
 /**
  * One replica of a blob's data (issue #886): an independent block list,
@@ -1072,6 +1079,10 @@ struct BlobInfo {
   // Non-zero when this blob is an expendable cache copy the tier may evict.
   // Write-once: set at creation, never changed. See kCtePutDroppable.
   clio::run::u32 droppable_;
+  /** A shadow copy of a blob another container owns (Context::kShadowCopy).
+   *  In memory only: a restarted container relearns it from the next
+   *  mirrored write. */
+  bool shadow_ = false;
   int compress_lib_;     // Compression library ID *requested* for this blob
                          // (0 = none). Provenance/telemetry only -- NOT a
                          // reliable answer to "is this blob compressed?";
@@ -1321,6 +1332,7 @@ struct BlobInfo {
         access_count_(other.access_count_),
         transform_flags_(other.transform_flags_),
         droppable_(other.droppable_),
+        shadow_(other.shadow_),
         compress_lib_(other.compress_lib_),
         compress_preset_(other.compress_preset_),
         trace_key_(other.trace_key_),
@@ -1344,6 +1356,8 @@ struct BlobInfo {
       last_read_ = other.last_read_;
       access_count_ = other.access_count_;
       transform_flags_ = other.transform_flags_;
+      droppable_ = other.droppable_;
+      shadow_ = other.shadow_;
       compress_lib_ = other.compress_lib_;
       compress_preset_ = other.compress_preset_;
       trace_key_ = other.trace_key_;
@@ -1744,6 +1758,27 @@ struct Context {
    *  fault, or the handler's own materialising get/put would re-fault and
    *  recurse forever. */
   static constexpr clio::run::u32 kNoFault = 1u << 2;
+  /** kPutIfAbsent -- conditional PutBlob: fail with kPutExistsRc if the blob
+   *  already exists (a put completed on it, or it holds data). Decided at the
+   *  owner under the blob's write token, so of two racing conditional puts
+   *  exactly one wins. Primary puts only (replica_ == 0); ignored by
+   *  MultiPutBlob. */
+  static constexpr clio::run::u32 kPutIfAbsent = 1u << 3;
+  /** kPutIfVersion -- compare-and-swap PutBlob: apply only if the blob's
+   *  current version equals version_ (an absent blob is version 0), else
+   *  fail with kPutVersionMismatchRc. On success version_ returns the new
+   *  version, so a caller can chain. Versions come from GetBlob (version_)
+   *  or a previous put. Same scope as kPutIfAbsent. */
+  static constexpr clio::run::u32 kPutIfVersion = 1u << 4;
+  /** kShadowCopy -- this put writes a SHADOW copy of a blob another
+   *  container owns (replication remote_copies, or a failover write while
+   *  the owner is down). Shadows are left out of blob listings, queries and
+   *  tag sizes, so a blob is never counted twice. */
+  static constexpr clio::run::u32 kShadowCopy = 1u << 5;
+  /** kMetaBlob -- the blob holds the tag's own metadata (e.g. clio-fs
+   *  inode records), not its content: the put does not stamp the tag's
+   *  modify/change times. Size accounting is unchanged. */
+  static constexpr clio::run::u32 kMetaBlob = 1u << 6;
 
   /**
    * Fault-handler parameters (checkpointing / lazy copy). When the core
@@ -3022,6 +3057,14 @@ struct MultiPutBlobTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
     ar(route_tag_id_, route_blob_, data_, data_len_, descs_, context_);
+    // The payload must travel with the task. The batch is routed by its
+    // FIRST blob, which on a multi-node pool is often another node; shipping
+    // only the staging pointer made the receiver dereference an address in
+    // the SENDER's shared memory (SIGSEGV in MultiPutBatchView::Attach, the
+    // node then dropped out of the cluster). Same bulk contract as PutBlob:
+    // a co-located SHM hop still passes the pointer, a network hop copies
+    // into a receiver-owned buffer (TASK_DATA_OWNER, freed by ~this).
+    ar.bulk(data_, data_len_, BULK_XFER);
   }
 
   template <typename Archive>
@@ -4313,6 +4356,156 @@ struct GetNumAliasesTask : public clio::run::Task {
   }
 };
 
+/** Operations carried by UpdateTagNamesTask (see EncodeTagNameOp). */
+enum class TagNameOp : clio::run::u32 {
+  kAddName = 1,     ///< bind `name` to the tag (canonical if it has none, else an alias)
+  kRemoveName = 2,  ///< unbind `name` from the tag
+  kRename = 3,      ///< rebind the tag's `name` to `name2` (O(1): children keep their ids)
+  kSetRoot = 4,     ///< bind "/" to the tag (the hierarchy's root)
+  kResetPublished = 5,  ///< drop every published "$tagid{..}" name (restart resync)
+};
+
+/**
+ * Stored hierarchical form of a child name: "$tagid{<major>.<minor>}/<leaf>"
+ * relative to its parent tag, so moving a directory re-keys ONE name. The
+ * core resolves it to an absolute path for its search index.
+ * @param parent parent tag id
+ * @param leaf single path component
+ * @return stored name
+ */
+inline std::string MakeTagRefName(const TagId &parent, const std::string &leaf) {
+  return "$tagid{" + std::to_string(parent.major_) + "." +
+         std::to_string(parent.minor_) + "}/" + leaf;
+}
+
+/**
+ * Append one tag-name operation to an UpdateTagNames batch.
+ * Record: [u32 op][u32 major][u32 minor][u64 seq][u32 len][name][u32 len][name2]
+ * @param out batch buffer
+ * @param op operation
+ * @param tag tag id
+ * @param seq last-writer-wins stamp (wall-clock ns at the name's owner)
+ * @param name stored name (see MakeTagRefName)
+ * @param name2 new stored name (kRename only)
+ */
+inline void EncodeTagNameOp(std::string *out, TagNameOp op, const TagId &tag,
+                            clio::run::u64 seq, const std::string &name,
+                            const std::string &name2 = std::string()) {
+  auto put32 = [out](clio::run::u32 v) {
+    out->append(reinterpret_cast<const char *>(&v), sizeof(v));
+  };
+  put32(static_cast<clio::run::u32>(op));
+  put32(tag.major_);
+  put32(tag.minor_);
+  out->append(reinterpret_cast<const char *>(&seq), sizeof(seq));
+  put32(static_cast<clio::run::u32>(name.size()));
+  out->append(name);
+  put32(static_cast<clio::run::u32>(name2.size()));
+  out->append(name2);
+}
+
+/** One decoded tag-name operation. */
+struct TagNameOpRec {
+  TagNameOp op_ = TagNameOp::kAddName;
+  TagId tag_;
+  clio::run::u64 seq_ = 0;
+  std::string name_;
+  std::string name2_;
+};
+
+/**
+ * Decode an UpdateTagNames batch.
+ * @param data batch bytes
+ * @param len batch length
+ * @param out decoded records (in order)
+ * @return false on a malformed batch (records before the damage are kept)
+ */
+inline bool DecodeTagNameOps(const char *data, size_t len,
+                             std::vector<TagNameOpRec> *out) {
+  size_t off = 0;
+  auto get = [&](void *dst, size_t n) {
+    if (off + n > len) return false;
+    std::memcpy(dst, data + off, n);
+    off += n;
+    return true;
+  };
+  auto get_str = [&](std::string *s) {
+    clio::run::u32 n = 0;
+    if (!get(&n, sizeof(n)) || off + n > len) return false;
+    s->assign(data + off, n);
+    off += n;
+    return true;
+  };
+  while (off < len) {
+    TagNameOpRec r;
+    clio::run::u32 op = 0;
+    if (!get(&op, 4) || !get(&r.tag_.major_, 4) || !get(&r.tag_.minor_, 4) ||
+        !get(&r.seq_, 8) || !get_str(&r.name_) || !get_str(&r.name2_)) {
+      return false;
+    }
+    r.op_ = static_cast<TagNameOp>(op);
+    out->push_back(std::move(r));
+  }
+  return true;
+}
+
+/**
+ * UpdateTagNames task - apply a batch of tag-name operations to this
+ * container's name table and search index. Sent as a Broadcast so EVERY
+ * container holds every name: each can resolve "$tagid{parent}/leaf" names
+ * to absolute paths and answer TagQuery/BlobQuery/SemanticSearch locally.
+ * Idempotent and order-tolerant: per-name last-writer-wins by seq, and a
+ * name whose parent has not arrived yet is parked until it does.
+ */
+struct UpdateTagNamesTask : public clio::run::Task {
+  IN clio::run::priv::string ops_;  // EncodeTagNameOp records
+  OUT clio::run::u32 applied_;      // records applied (not superseded)
+
+  // SHM constructor
+  UpdateTagNamesTask()
+      : clio::run::Task(), ops_(CLIO_PRIV_ALLOC), applied_(0) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit UpdateTagNamesTask(const clio::run::TaskId &task_id,
+                                            const clio::run::PoolId &pool_id,
+                                            const clio::run::PoolQuery &pool_query,
+                                            const std::string &ops)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kUpdateTagNames),
+        ops_(CLIO_PRIV_ALLOC, ops),
+        applied_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kUpdateTagNames;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(ops_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(applied_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<UpdateTagNamesTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    ops_ = other->ops_;
+    applied_ = other->applied_;
+  }
+
+  // Broadcast aggregation: report the largest per-container count.
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<UpdateTagNamesTask>();
+    if (other->applied_ > applied_) applied_ = other->applied_;
+  }
+};
+
 /**
  * PollTelemetryLog task - Poll telemetry log with minimum logical time filter
  */
@@ -5164,6 +5357,97 @@ struct FlushDataTask : public clio::run::Task {
     // Each node flushes its own data, so the collective totals are SUMS.
     bytes_flushed_ += replica->bytes_flushed_;
     blobs_flushed_ += replica->blobs_flushed_;
+  }
+};
+
+/**
+ * SyncTagTask - fsync(2) for one tag: make every blob of the tag durable.
+ *
+ * Broadcast so every core container handles the blobs it owns (primaries,
+ * shadows and persistent replicas alike). Each container moves any of those
+ * blobs still on a tier below the persistence level to one at or above it,
+ * syncs every bdev that holds their blocks, then syncs its metadata WAL. With
+ * performance.fsync_mode "deferred" the container does nothing and reports
+ * deferred_ = 1 so a caller can skip later syncs.
+ */
+/** SyncTag return code: a persistent tier had no room for the tag's bytes. */
+static constexpr clio::run::u32 kSyncNoSpaceRc = 28;  // ENOSPC
+/** SyncTag return code: a device sync or a read of the tag's bytes failed. */
+static constexpr clio::run::u32 kSyncIoRc = 5;  // EIO
+
+struct SyncTagTask : public clio::run::Task {
+  IN TagId tag_id_;              ///< Tag whose blobs must become durable
+  IN int min_persistence_;       ///< Minimum tier level; < 0 = config default
+  OUT clio::run::u32 deferred_;  ///< 1 when fsync_mode is "deferred"
+  OUT clio::run::u64 blobs_moved_;  ///< Blobs moved to a persistent tier
+  OUT clio::run::u64 bdevs_synced_; ///< Devices synced (summed over nodes)
+  /** Core containers that handled the sync (summed). 0 means a module in
+   *  front of the core dropped it -- nothing was made durable. */
+  OUT clio::run::u32 containers_;
+
+  /** SHM default constructor */
+  SyncTagTask()
+      : clio::run::Task(),
+        tag_id_(TagId::GetNull()),
+        min_persistence_(-1),
+        deferred_(0),
+        blobs_moved_(0),
+        bdevs_synced_(0),
+        containers_(0) {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit SyncTagTask(const clio::run::TaskId &task_id,
+                                     const clio::run::PoolId &pool_id,
+                                     const clio::run::PoolQuery &pool_query,
+                                     const TagId &tag_id,
+                                     int min_persistence = -1)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kSyncTag),
+        tag_id_(tag_id),
+        min_persistence_(min_persistence),
+        deferred_(0),
+        blobs_moved_(0),
+        bdevs_synced_(0),
+        containers_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kSyncTag;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /** Serialize IN and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, min_persistence_);
+  }
+
+  /** Serialize OUT and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(deferred_, blobs_moved_, bdevs_synced_, containers_);
+  }
+
+  /** Copy from another SyncTagTask */
+  void Copy(const ctp::ipc::FullPtr<SyncTagTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    min_persistence_ = other->min_persistence_;
+    deferred_ = other->deferred_;
+    blobs_moved_ = other->blobs_moved_;
+    bdevs_synced_ = other->bdevs_synced_;
+    containers_ = other->containers_;
+  }
+
+  /** AggregateOut: sums the counts; deferred if any container defers. */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto replica = other_base.template Cast<SyncTagTask>();
+    deferred_ |= replica->deferred_;
+    blobs_moved_ += replica->blobs_moved_;
+    bdevs_synced_ += replica->bdevs_synced_;
+    containers_ += replica->containers_;
   }
 };
 

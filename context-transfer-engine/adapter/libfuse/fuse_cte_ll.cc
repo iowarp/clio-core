@@ -354,6 +354,21 @@ void ll_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
   fuse_reply_err(req, rc == 0 ? 0 : -rc);
 }
 
+/**
+ * Low-level fsyncdir: resolve the inode and reply with cte_fuse_fsyncdir.
+ * @param req FUSE request
+ * @param ino directory inode
+ * @param datasync nonzero for fdatasync semantics
+ * @param fi open-directory info
+ */
+void ll_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync,
+                 struct fuse_file_info *fi) {
+  std::string path = PathOf(ino);
+  if (path.empty()) return (void)fuse_reply_err(req, ENOENT);
+  int rc = cte_fuse_fsyncdir(path.c_str(), datasync, fi);
+  fuse_reply_err(req, rc == 0 ? 0 : -rc);
+}
+
 void ll_unlink(fuse_req_t req, fuse_ino_t parent, const char *name) {
   std::string path = ChildPath(parent, name);
   if (path.empty()) return (void)fuse_reply_err(req, ENOENT);
@@ -534,6 +549,7 @@ const struct fuse_lowlevel_ops kLLOps = [] {
   ops.readdir = ll_readdir;
   ops.readdirplus = ll_readdirplus;
   ops.releasedir = ll_releasedir;
+  ops.fsyncdir = ll_fsyncdir;
   return ops;
 }();
 

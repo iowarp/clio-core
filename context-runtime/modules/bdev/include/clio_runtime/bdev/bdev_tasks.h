@@ -803,16 +803,22 @@ struct GetStatsTask : public clio::run::Task {
   // Task-specific data (no inputs)
   OUT PerfMetrics metrics_;            // Performance metrics
   OUT clio::run::u64 remaining_size_;  // Remaining allocatable space
+  /** The device's allocatable capacity (its configured size -- not the
+   *  physical disk under a file bdev). 0 = unknown. */
+  OUT clio::run::u64 total_size_;
   OUT clio::run::u32 predicted_ttl_days_; // Predicted device TTL in days (999999 = healthy)
 
   /** SHM default constructor */
-  GetStatsTask() : clio::run::Task(), remaining_size_(0), predicted_ttl_days_(999999) {}
+  GetStatsTask()
+      : clio::run::Task(), remaining_size_(0), total_size_(0),
+        predicted_ttl_days_(999999) {}
 
   /** Emplace constructor */
   explicit GetStatsTask(const clio::run::TaskId &task_node,
                         const clio::run::PoolId &pool_id,
                         const clio::run::PoolQuery &pool_query)
-      : clio::run::Task(task_node, pool_id, pool_query, 10), remaining_size_(0), predicted_ttl_days_(999999) {
+      : clio::run::Task(task_node, pool_id, pool_query, 10), remaining_size_(0),
+        total_size_(0), predicted_ttl_days_(999999) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -832,7 +838,7 @@ struct GetStatsTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(metrics_, remaining_size_, predicted_ttl_days_);
+    ar(metrics_, remaining_size_, total_size_, predicted_ttl_days_);
   }
 
   /**
@@ -845,6 +851,7 @@ struct GetStatsTask : public clio::run::Task {
     // Copy GetStatsTask-specific fields
     metrics_ = other->metrics_;
     remaining_size_ = other->remaining_size_;
+    total_size_ = other->total_size_;
     predicted_ttl_days_ = other->predicted_ttl_days_;
   }
 
@@ -865,6 +872,7 @@ struct GetStatsTask : public clio::run::Task {
       metrics_ = replica->metrics_;
     }
     remaining_size_ += replica->remaining_size_;
+    total_size_ += replica->total_size_;
     if (replica->predicted_ttl_days_ < predicted_ttl_days_) {
       predicted_ttl_days_ = replica->predicted_ttl_days_;
     }
@@ -968,6 +976,50 @@ struct FlushAllocLogTask : public clio::run::Task {
     // allocator segments. See Task::AggregateOut for the full contract.
     // This task declares no OUT fields, so the base call above (return code +
     // completer) is the entire merge.
+  }
+};
+
+/**
+ * SyncTask - Make every byte written to this bdev, and its allocator state,
+ * durable (fdatasync on a file bdev; a no-op for memory tiers). The fsync
+ * path of the CTE sends one per bdev that holds a synced file's blocks.
+ */
+struct SyncTask : public clio::run::Task {
+  /** SHM default constructor */
+  CTP_CROSS_FUN SyncTask() : clio::run::Task() {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit SyncTask(const clio::run::TaskId &task_node,
+                                  const clio::run::PoolId &pool_id,
+                                  const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kSync) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kSync;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /** Serialize IN and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+  }
+
+  /** Serialize OUT and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  /** Copy from another SyncTask */
+  void Copy(const ctp::ipc::FullPtr<SyncTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+  }
+
+  /** AggregateOut replica results into this task (no OUT fields). */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
   }
 };
 

@@ -132,6 +132,13 @@ public:
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
 
   /**
+   * True when the server config's compose section defines pool `pool_id`.
+   * @param pool_id requested pool id
+   * @return whether compose will create it
+   */
+  static bool IsComposedPool(const clio::run::PoolId &pool_id);
+
+  /**
    * Handle GetOrCreatePool task - Pool get-or-create operation (IS_ADMIN=false)
    * This is a coroutine that can co_await nested Create methods
    */
@@ -256,10 +263,9 @@ public:
   clio::run::TaskResume RegisterMemory(clio::run::shared_ptr<RegisterMemoryTask> &task);
 
   /**
-   * Handle RestartContainers - Re-create pools from the restart registry.
-   * Reads the RestartLog write-ahead log (~/.clio/restart_log.bin), the same
-   * persistent registry replayed at startup, and re-composes each registered
-   * compose file.
+   * Handle RestartContainers - Re-create pools from the restart registry:
+   * this node's pool log (PoolManager::LoadPoolLog), the same registry the
+   * runtime replays on a restart -- durable compose and API pools alike.
    */
   clio::run::TaskResume RestartContainers(clio::run::shared_ptr<RestartContainersTask> &task);
 
@@ -440,6 +446,24 @@ private:
    * completions is not enough. Three probe intervals of silence it is.
    */
   static constexpr double kProbeSilenceSec = 30.0;
+
+  /**
+   * Silence (no liveness-probe answer, no inbound bytes) after which a peer
+   * is declared dead so the tasks waiting on it fail. Default
+   * kProbeSilenceSec; CLIO_PROBE_SILENCE_S overrides it.
+   * @return the silence window in seconds
+   */
+  static double ProbeSilenceSec() {
+    static const double v = [] {
+      const char *e = std::getenv("CLIO_PROBE_SILENCE_S");
+      if (e != nullptr && *e != '\0') {
+        const double d = std::strtod(e, nullptr);
+        if (d > 0.0) return d;
+      }
+      return kProbeSilenceSec;
+    }();
+    return v;
+  }
   /**
    * Idle liveness. A peer this node has heard from before, then nothing for
    * kIdleProbeSec, gets a probe even with no task in flight to it, so a
@@ -469,6 +493,22 @@ private:
    */
   void NoteProbeFailure(clio::run::u64 node_id);
   void ScanTaskProgress();
+  /**
+   * Step 1 of ScanTaskProgress: reap answered probes and act on silent ones,
+   * in ONE compaction pass (the per-item vector::erase this replaced was
+   * O(n^2): thousands of probes under load held the network worker for 25 s).
+   * @param now scan time
+   * @param judge false when this node's own scan was delayed, so a probe's
+   *        silence says nothing about its target (re-arm instead of kill)
+   */
+  void ReapProgressProbes(std::chrono::steady_clock::time_point now,
+                          bool judge);
+  /** Step 2: probe replicas outstanding beyond the interval (bounded). */
+  void FireStuckProbes(clio::run::u32 interval_ms);
+  /** Step 3: probe silent idle peers, one probe per peer at a time. */
+  void FireIdleProbes();
+  /** When ScanTaskProgress last ran (detects this node's own stalls). */
+  std::chrono::steady_clock::time_point last_progress_scan_{};
   std::mt19937 probe_rng_{std::random_device{}()};
 
   // SWIM probe / suspicion timeouts. The prior 5 s direct + 3 s

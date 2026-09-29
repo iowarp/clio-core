@@ -7,6 +7,8 @@
 
 #include <clio_runtime/bdev/transports/block_allocator.h>
 
+#include <algorithm>
+
 namespace clio::run::bdev {
 
 // The implementation of WorkerBlockMap, GlobalBlockMap, Heap 
@@ -148,6 +150,33 @@ bool GlobalBlockMap::FreeBlock(int worker, Block &block) {
   return true;
 }
 
+void GlobalBlockMap::SeedFreeRange(clio::run::u64 offset, clio::run::u64 size) {
+  if (size == 0 || worker_maps_.empty()) {
+    return;
+  }
+  const size_t kMaxIdx =
+      static_cast<size_t>(BlockSizeCategory::kMaxCategories) - 1;
+  clio::run::ScopedCoMutex lock(worker_locks_[0]);
+  clio::run::u64 cur = offset;
+  clio::run::u64 left = size;
+  while (left > 0) {
+    // Largest class that fits what is left; a tail below the smallest class
+    // is filed there anyway (AllocateBlock checks the real size).
+    size_t idx = 0;
+    for (size_t i = kMaxIdx + 1; i-- > 0;) {
+      if (kBlockSizes[i] <= left) {
+        idx = i;
+        break;
+      }
+    }
+    clio::run::u64 chunk = std::min<clio::run::u64>(left, kBlockSizes[idx]);
+    worker_maps_[0].FreeBlock(
+        Block(cur, chunk, static_cast<clio::run::u32>(idx)));
+    cur += chunk;
+    left -= chunk;
+  }
+}
+
 Heap::Heap() : heap_(0), total_size_(0), alignment_(4096) {}
 
 void Heap::Init(clio::run::u64 total_size, clio::run::u32 alignment) {
@@ -253,6 +282,33 @@ bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vec
   }
   blocks.clear();
   return false;
+}
+
+void StandardBlockAllocator::InitFromLive(
+    const std::vector<std::pair<clio::run::u64, clio::run::u64>>& live) {
+  // Aligned footprints, sorted by offset; overlapping records (a stale alloc
+  // record whose free was lost) merge rather than double count.
+  std::vector<std::pair<clio::run::u64, clio::run::u64>> ext;
+  ext.reserve(live.size());
+  for (const auto& e : live) {
+    if (e.second == 0) continue;
+    ext.emplace_back(e.first, e.first + AlignSize(e.second));
+  }
+  std::sort(ext.begin(), ext.end());
+  clio::run::u64 cursor = 0;
+  clio::run::u64 used = 0;
+  for (const auto& e : ext) {
+    if (e.first > cursor) {
+      global_block_map_.SeedFreeRange(cursor, e.first - cursor);
+    }
+    clio::run::u64 start = std::max(e.first, cursor);
+    if (e.second > start) {
+      used += e.second - start;
+      cursor = e.second;
+    }
+  }
+  heap_.SetCursor(cursor);
+  allocated_bytes_.store(used, std::memory_order_relaxed);
 }
 
 void StandardBlockAllocator::FreeBlocks(int worker_id, const std::vector<Block>& blocks) {

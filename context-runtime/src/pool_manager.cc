@@ -502,6 +502,11 @@ void PoolManager::PlugContainer(PoolId pool_id, ContainerId container_id) {
   }
 }
 
+bool PoolManager::WasDestroyed(PoolId pool_id) const {
+  std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
+  return destroyed_pools_.count(pool_id) != 0;
+}
+
 bool PoolManager::HasPool(PoolId pool_id) const {
   if (!is_initialized_) {
     return false;
@@ -791,6 +796,11 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
 
   // Store pool metadata first so InitAddressMap can find it
   UpdatePoolMetadata(target_pool_id, pool_info);
+  {
+    // Re-created under a destroyed id: its periodic tasks are live again.
+    std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
+    destroyed_pools_.erase(target_pool_id);
+  }
 
   // Initialize address map for the pool (ContainerId -> NodeId)
   InitAddressMap(target_pool_id, num_containers);
@@ -841,6 +851,8 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
       pool_config =
           clio::run::Task::Deserialize<clio::run::PoolConfig>(create_task->chimod_params_);
       is_restart = pool_config.restart_;
+    } else if (replaying_pools_) {
+      is_restart = true;  // re-created from the pool log after a restart
     }
 
     // Initialize container with pool ID, name, and container ID
@@ -913,6 +925,24 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   // Set success results
   was_created = true;
   (void)was_created;  // Suppress unused variable warning
+  // Durable pools (compose `restart: true`, or an API create from a client
+  // with SetPersistent) go to this node's pool log -- the one restart
+  // registry. Re-creations from the log itself are already there.
+  if (!create_task->is_admin_ && !replaying_pools_) {
+    // From the params captured at entry: chimod_params_ is INOUT, and a
+    // module's Create may have rewritten it by now (reading it here as a
+    // PoolConfig overran it and threw bad_alloc mid-compose).
+    bool durable = create_task->persist_;
+    if (create_task->do_compose_) {
+      durable = clio::run::Task::Deserialize<clio::run::PoolConfig>(
+                    clio::run::priv::string(CLIO_PRIV_ALLOC, chimod_params))
+                    .restart_;
+    }
+    if (durable) {
+      LogPool(true, PoolLogEntry{target_pool_id, pool_name, chimod_name,
+                                 chimod_params, create_task->do_compose_});
+    }
+  }
   // Note: create_task->new_pool_id_ already contains target_pool_id
 
   HLOG(kInfo,
@@ -945,6 +975,11 @@ TaskResume PoolManager::DestroyPool(PoolId pool_id) {
 
   // Remove pool metadata
   ErasePoolMetadata(pool_id);
+  LogPool(false, PoolLogEntry{pool_id, "", "", "", false});
+  {
+    std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
+    destroyed_pools_.insert(pool_id);
+  }
 
   HLOG(kInfo, "PoolManager: Destroyed complete pool {}", pool_id);
   CLIO_CO_RETURN;
@@ -1240,7 +1275,13 @@ void PoolManager::ReplayAddressTableWAL() {
 
   size_t entries_replayed = 0;
   for (const auto &dir_entry : fs::directory_iterator(wal_dir)) {
-    if (dir_entry.path().extension() != ".bin") continue;
+    // Only this WAL's own files: the directory also holds other logs (the
+    // pool log, pools.<node>.bin), whose records parsed as mappings here
+    // produced garbage pool ids -- and could remap a real pool's containers.
+    if (dir_entry.path().extension() != ".bin" ||
+        dir_entry.path().filename().string().rfind("domain_table.", 0) != 0) {
+      continue;
+    }
 
     std::ifstream ifs(dir_entry.path(), std::ios::binary);
     if (!ifs.is_open()) continue;
@@ -1264,6 +1305,108 @@ void PoolManager::ReplayAddressTableWAL() {
   }
 
   HLOG(kInfo, "ReplayAddressTableWAL: Replayed {} entries", entries_replayed);
+}
+
+// ===========================================================================
+// Pool log: the one restart registry for durable pools (compose and API)
+// ===========================================================================
+
+namespace {
+/** Append a length-prefixed string. */
+void PutStr(std::ofstream &o, const std::string &v) {
+  const u32 n = static_cast<u32>(v.size());
+  o.write(reinterpret_cast<const char *>(&n), sizeof(n));
+  o.write(v.data(), n);
+}
+/** Read a length-prefixed string; false at a torn tail. */
+bool GetStr(std::ifstream &i, std::string *v) {
+  u32 n = 0;
+  if (!i.read(reinterpret_cast<char *>(&n), sizeof(n))) return false;
+  if (n > (64u << 20)) return false;  // garbage length: torn record
+  v->resize(n);
+  return n == 0 || static_cast<bool>(i.read(&(*v)[0], n));
+}
+/** Write one record: [u8 op][u8 compose][PoolId][name][chimod][params]. */
+void PutRecord(std::ofstream &o, bool add, const PoolManager::PoolLogEntry &e) {
+  const uint8_t op = add ? 1 : 0;
+  const uint8_t compose = e.compose ? 1 : 0;
+  o.write(reinterpret_cast<const char *>(&op), sizeof(op));
+  o.write(reinterpret_cast<const char *>(&compose), sizeof(compose));
+  o.write(reinterpret_cast<const char *>(&e.pool_id), sizeof(e.pool_id));
+  PutStr(o, e.pool_name);
+  PutStr(o, e.chimod_name);
+  PutStr(o, e.chimod_params);
+}
+}  // namespace
+
+std::string PoolManager::PoolLogPath() const {
+  auto *config_manager = CLIO_CONFIG_MANAGER;
+  auto *ipc_manager = CLIO_IPC;
+  return config_manager->GetConfDir() + "/wal/pools." +
+         std::to_string(ipc_manager->GetNodeId()) + ".bin";
+}
+
+void PoolManager::LogPool(bool add, const PoolLogEntry &e) {
+  if (CLIO_CONFIG_MANAGER == nullptr) return;
+  const std::string path = PoolLogPath();
+  std::error_code ec;
+  std::filesystem::create_directories(
+      std::filesystem::path(path).parent_path(), ec);
+  std::ofstream ofs(path, std::ios::binary | std::ios::app);
+  if (!ofs.is_open()) {
+    HLOG(kError, "PoolManager: cannot open pool log {}; pool {} will not be "
+         "re-created after a restart", path, e.pool_id);
+    return;
+  }
+  PutRecord(ofs, add, e);
+  ofs.flush();
+}
+
+std::vector<PoolManager::PoolLogEntry> PoolManager::ReadPoolLogFile(
+    const std::string &path) {
+  std::vector<PoolLogEntry> live;
+  std::ifstream ifs(path, std::ios::binary);
+  if (!ifs.is_open()) return live;
+  while (true) {
+    uint8_t op = 0, compose = 0;
+    PoolLogEntry e;
+    if (!ifs.read(reinterpret_cast<char *>(&op), sizeof(op))) break;
+    if (!ifs.read(reinterpret_cast<char *>(&compose), sizeof(compose)) ||
+        !ifs.read(reinterpret_cast<char *>(&e.pool_id), sizeof(e.pool_id)) ||
+        !GetStr(ifs, &e.pool_name) || !GetStr(ifs, &e.chimod_name) ||
+        !GetStr(ifs, &e.chimod_params)) {
+      break;  // torn tail from a crash mid-append
+    }
+    e.compose = compose != 0;
+    auto it = std::find_if(live.begin(), live.end(),
+                           [&](const PoolLogEntry &x) {
+                             return x.pool_id == e.pool_id;
+                           });
+    if (it != live.end()) live.erase(it);
+    if (op == 1) live.push_back(std::move(e));
+  }
+  return live;
+}
+
+std::vector<PoolManager::PoolLogEntry> PoolManager::LoadPoolLog() {
+  if (CLIO_CONFIG_MANAGER == nullptr) return {};
+  const std::string path = PoolLogPath();
+  std::vector<PoolLogEntry> live = ReadPoolLogFile(path);
+  if (!std::filesystem::exists(path)) return live;
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
+    for (const auto &e : live) PutRecord(ofs, true, e);
+  }
+  std::error_code ec;
+  std::filesystem::rename(tmp, path, ec);
+  return live;
+}
+
+void PoolManager::ClearPoolLog() {
+  if (CLIO_CONFIG_MANAGER == nullptr) return;
+  std::error_code ec;
+  std::filesystem::remove(PoolLogPath(), ec);
 }
 
 }  // namespace clio::run

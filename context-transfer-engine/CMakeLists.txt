@@ -52,6 +52,15 @@ else()
     message(STATUS "CTE: Compression disabled - skipping compressor chimod (use -DWRP_CTE_ENABLE_COMPRESS=ON to enable)")
 endif()
 
+# Stream chimod -- byte-stream layer with deferred append pipeline
+option(CLIO_CTE_ENABLE_STREAM "Build the stream chimod" ON)
+if(CLIO_CTE_ENABLE_STREAM)
+    message(STATUS "CTE: building stream chimod")
+    add_subdirectory(stream)
+else()
+    message(STATUS "CTE: stream chimod disabled (use -DCLIO_CTE_ENABLE_STREAM=ON)")
+endif()
+
 # Add the filesystem ChiMod (a filesystem interface over the CTE; the I/O
 # interceptors delegate to it). Default OFF while scaffolding (#552) so the
 # in-progress chimod can't break the default build; flip ON to develop it.
@@ -68,6 +77,10 @@ if((CLIO_CTE_ENABLE_FUSE_ADAPTER OR CLIO_CTE_ENABLE_POSIX_ADAPTER OR
         "Build the filesystem chimod (WIP, #552)" FORCE)
 endif()
 if(CLIO_CTE_ENABLE_FILESYSTEM)
+    if(NOT TARGET clio_cte_stream_runtime)
+        message(FATAL_ERROR "The filesystem chimod requires the stream chimod "
+                            "(-DCLIO_CTE_ENABLE_STREAM=ON)")
+    endif()
     message(STATUS "CTE: building filesystem chimod")
     add_subdirectory(filesystem)
 else()

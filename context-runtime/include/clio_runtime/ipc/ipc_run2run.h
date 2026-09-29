@@ -34,6 +34,7 @@
 #ifndef CLIO_RUNTIME_IPC_RUN2RUN_H_
 #define CLIO_RUNTIME_IPC_RUN2RUN_H_
 
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -65,6 +66,44 @@ static constexpr clio::run::u64 kInvalidNodeId = ~clio::run::u64(0);
 
 /** How long (seconds) to keep a task in the retry queue before failing it */
 static constexpr float kRun2RunRetryTimeoutSec = 30.0f;
+
+/**
+ * How long a send to an unreachable node is retried before its task fails
+ * with kRun2RunNetworkTimeoutRC. Default kRun2RunRetryTimeoutSec (rides out a
+ * peer restart); CLIO_NET_RETRY_TIMEOUT_S overrides it -- a filesystem
+ * deployment that prefers a prompt EIO over a 30 s stall per operation while
+ * a node is down lowers it.
+ * @return the retry window in seconds
+ */
+/**
+ * CLIO_NET_DEAD_FAIL_FAST=1: a task addressed to a peer already DECLARED
+ * dead fails at once (network-timeout RC; a broadcast answers from the
+ * reachable peers) instead of waiting out the retry window. For clients
+ * such as a filesystem, where one user operation is a chain of RPCs (a path
+ * lookup is one per component), the retry window otherwise multiplies into
+ * minutes per syscall while a node is down. Off by default: the retry
+ * window is what lets tasks ride out a peer's restart.
+ * @return true when fail-fast is enabled
+ */
+inline bool Run2RunFailFastDead() {
+  static const bool v = [] {
+    const char *e = std::getenv("CLIO_NET_DEAD_FAIL_FAST");
+    return e != nullptr && *e == '1';
+  }();
+  return v;
+}
+
+inline float Run2RunRetryTimeoutSec() {
+  static const float v = [] {
+    const char *e = std::getenv("CLIO_NET_RETRY_TIMEOUT_S");
+    if (e != nullptr && *e != '\0') {
+      const float f = std::strtof(e, nullptr);
+      if (f > 0.0f) return f;
+    }
+    return kRun2RunRetryTimeoutSec;
+  }();
+  return v;
+}
 
 /** Entry in a retry queue for tasks that could not be sent */
 struct RetryEntry {

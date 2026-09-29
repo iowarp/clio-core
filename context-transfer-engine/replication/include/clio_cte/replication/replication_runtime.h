@@ -15,6 +15,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_interposer.h>
+#include <clio_cte/core/record_log.h>
 #include <clio_cte/replication/replication_client.h>
 #include <clio_cte/replication/replication_tasks.h>
 
@@ -117,6 +118,9 @@ class Runtime : public clio::cte::core::CoreInterposer {
       clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
 
   // ---- Container virtuals (defined in autogen/replication_lib_exec.cc) ----
+  /** Recovery start (`clio_run restart`): Create pulls the handoff. */
+  void Restart(const clio::run::PoolId &pool_id, const std::string &pool_name,
+               clio::run::u32 container_id = 0) override;
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
             clio::run::u32 container_id = 0) override;
   clio::run::TaskResume Run(clio::run::u32 method,
@@ -165,11 +169,45 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * Best-effort: a failed chunk stops the copy without failing the read that
    * triggered it. recached reports bytes restored.
    */
+  // ---- remote copies and failover (replication_remote.cc) ----
+  /** Delete a blob; at its owner, also its remote copies. */
+  clio::run::TaskResume DelBlob(
+      clio::run::shared_ptr<clio::cte::core::DelBlobTask> &task);
+  /** Truncate a blob; at its owner, also its remote copies. */
+  clio::run::TaskResume TruncateBlob(
+      clio::run::shared_ptr<clio::cte::core::TruncateBlobTask> &task);
+  /** Hand back to `owner_` every blob this container changed for it. */
+  clio::run::TaskResume HandoffPull(clio::run::shared_ptr<HandoffPullTask> &task);
+  /** Periodic: hand changes back to owners that are alive again. */
+  clio::run::TaskResume HandoffSweep(
+      clio::run::shared_ptr<HandoffSweepTask> &task);
+  /** The original PutBlob: primary plus this node's replicas. */
+  clio::run::TaskResume PutBlobLocal(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task);
+  /** The original MultiPutBlob: primary batch plus this node's replicas. */
+  clio::run::TaskResume MultiPutBlobLocal(
+      clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
+
   clio::run::TaskResume RecachePrimary(const TagId &tag_id,
                                        const std::string &blob_name,
                                        int replica_idx,
                                        clio::run::u64 rep_size,
                                        clio::run::u64 &recached);
+
+  /**
+   * Before a primary write that starts at `write_off`: if the primary holds
+   * fewer than `write_off` bytes but a replica holds more (the primary's
+   * volatile blocks were dropped by a restart), copy that replica back into
+   * the primary first. Otherwise the write would re-grow the primary over
+   * [0, write_off) with unfilled blocks, which then shadow the intact
+   * replica: every read of that range returns zeros.
+   * @param tag_id blob's tag
+   * @param blob_name blob name
+   * @param write_off lowest offset the pending write touches
+   */
+  clio::run::TaskResume RefillPrimaryBeforeWrite(const TagId &tag_id,
+                                                 const std::string &blob_name,
+                                                 clio::run::u64 write_off);
 
   /**
    * Populate THIS node's local cache copy of a remote blob (issue #886
@@ -206,6 +244,80 @@ class Runtime : public clio::cte::core::CoreInterposer {
    *  simply re-inserts and is caught next period. */
   std::mutex pending_mtx_;
   std::unordered_map<std::string, std::pair<TagId, std::string>> pending_;
+
+  // ---- remote copies and failover (replication_remote.cc) ----
+  /** A blob changed here while its owner was down. */
+  struct HandoffEntry {
+    TagId tag_;
+    std::string name_;
+    bool deleted_ = false;
+  };
+  /** @return containers in this pool. */
+  clio::run::u32 NumContainers() const;
+  /** @return the container that owns a blob by hash. */
+  clio::run::u32 OwnerOf(const TagId &tag, const std::string &name) const;
+  /** @return true if `container`'s node is alive. */
+  bool ContainerAlive(clio::run::u32 container) const;
+  /**
+   * Record a change made here on behalf of a dead owner.
+   * @param owner the owner container
+   * @param tag blob's tag
+   * @param name blob name
+   * @param deleted true for a delete, false for a write/truncate
+   */
+  void NoteHandoff(clio::run::u32 owner, const TagId &tag,
+                   const std::string &name, bool deleted);
+  /**
+   * Mirror one written range to this blob's remote copies (owner side).
+   * @param tag blob's tag
+   * @param name blob name
+   * @param off offset of the range
+   * @param size size of the range
+   * @param data the bytes
+   * @param score blob score
+   */
+  clio::run::TaskResume MirrorRange(TagId tag, std::string name,
+                                    clio::run::u64 off, clio::run::u64 size,
+                                    ctp::ipc::ShmPtr<> data, float score);
+  /**
+   * Hand back every change recorded for `owner` to it.
+   * @param owner the returned owner
+   * @param pushed receives the number of blobs handed back
+   */
+  clio::run::TaskResume PushHandoff(clio::run::u32 owner, clio::run::u32 *pushed);
+  /**
+   * Copy this container's shadow of one blob to its owner.
+   * @param e the blob
+   * @param owner owner container
+   * @param ok receives true on success
+   */
+  clio::run::TaskResume PushOne(HandoffEntry e, clio::run::u32 owner, bool *ok);
+  /** Client bound to THIS (replication) pool: mirrored ops run through the
+   *  target node's replication container, so its local replicas apply. */
+  clio::cte::core::Client *Self();
+  std::unique_ptr<clio::cte::core::Client> self_client_;
+  /** Open the handoff log; on a restart, replay it into handoff_. */
+  void OpenHandoffLog();
+  /**
+   * Log one handoff change (a note or its completion).
+   * @param type kHandoffNote or kHandoffDone
+   * @param owner owner container
+   * @param e the entry
+   */
+  void LogHandoff(clio::run::u32 type, clio::run::u32 owner,
+                  const HandoffEntry &e);
+  /** Rewrite the log as a snapshot of handoff_ once it has grown. Caller
+   *  holds handoff_mu_. */
+  void CompactHandoffLogLocked();
+  static constexpr clio::run::u32 kHandoffNote = 1;
+  static constexpr clio::run::u32 kHandoffDone = 2;
+  /** Log bytes after which the handoff log is rewritten as a snapshot. */
+  static constexpr clio::run::u64 kHandoffCompactBytes = 4ull << 20;
+  std::mutex handoff_mu_;
+  std::unordered_map<clio::run::u32,
+                     std::unordered_map<std::string, HandoffEntry>> handoff_;
+  clio::cte::core::RecordLog handoff_log_;
+  bool is_restart_ = false;
 };
 
 }  // namespace clio::cte::replication

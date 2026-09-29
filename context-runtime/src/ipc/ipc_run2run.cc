@@ -288,10 +288,25 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
 
     if (!ipc_manager->IsAlive(target_node_id)) {
       float net_timeout = origin_task->pool_query_.GetNetTimeout();
-      if (net_timeout >= 0 && net_timeout < 0.001f) {
-        HLOG(kWarning,
-             "[SendIn] Task {} target node {} is dead, net_timeout=0 -> skip",
-             origin_task->task_id_, target_node_id);
+      if ((net_timeout >= 0 && net_timeout < 0.001f) ||
+          Run2RunFailFastDead()) {
+        // Rate-limited: with a node down every task routed to it lands here,
+        // and one synchronous log line per task on the network worker was
+        // itself enough to stall it.
+        static std::atomic<clio::run::u64> skip_logged{0};
+        if (skip_logged.fetch_add(1, std::memory_order_relaxed) % 1000 == 0) {
+          HLOG(kWarning,
+               "[SendIn] Task {} target node {} is dead -> skip (fail fast); "
+               "{} such skips so far",
+               origin_task->task_id_, target_node_id, skip_logged.load());
+        }
+        // A broadcast may legitimately answer from the reachable subset, but
+        // a single-target task that skips its ONLY target produced no result
+        // at all: completing it with rc 0 handed the caller an empty success
+        // (a read of a dead node's blob came back as zeros).
+        if (!origin_task->pool_query_.IsBroadcastMode()) {
+          origin_task->SetReturnCode(kRun2RunNetworkTimeoutRC);
+        }
         // Issue #856: if this skip is the LAST replica to be accounted (every
         // other replica already responded), nobody else will ever observe
         // completed == size — the origin would never complete and its awaiting
@@ -1129,7 +1144,7 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
 
   for (auto it = send_in_retry_.begin(); it != send_in_retry_.end();) {
     float elapsed = std::chrono::duration<float>(now - it->enqueued_at).count();
-    float task_timeout = kRun2RunRetryTimeoutSec;
+    float task_timeout = Run2RunRetryTimeoutSec();
     float task_net_timeout = it->task->pool_query_.GetNetTimeout();
     if (task_net_timeout >= 0) {
       task_timeout = task_net_timeout;
@@ -1190,7 +1205,7 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
 
   for (auto it = send_out_retry_.begin(); it != send_out_retry_.end();) {
     float elapsed = std::chrono::duration<float>(now - it->enqueued_at).count();
-    float out_task_timeout = kRun2RunRetryTimeoutSec;
+    float out_task_timeout = Run2RunRetryTimeoutSec();
     float out_task_net_timeout = it->task->pool_query_.GetNetTimeout();
     if (out_task_net_timeout >= 0) {
       out_task_timeout = out_task_net_timeout;
@@ -1258,7 +1273,7 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
       }
       clio::run::shared_ptr<clio::run::Task> &origin_task = *sit;
 
-      float task_timeout = kRun2RunRetryTimeoutSec;
+      float task_timeout = Run2RunRetryTimeoutSec();
       float task_net_timeout = origin_task->pool_query_.GetNetTimeout();
       if (task_net_timeout >= 0) {
         task_timeout = task_net_timeout;
@@ -1283,11 +1298,13 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
     }
   }
 
-  for (const auto &dr : to_fail) {
+  if (!to_fail.empty()) {
     HLOG(kError,
-         "[ScanSendMapTimeouts] replica {} of net_key {} timed out waiting "
-         "for dead node {}; completing with network-timeout RC",
-         dr.replica_id, dr.net_key, dr.node_id);
+         "[ScanSendMapTimeouts] {} replicas timed out waiting for dead nodes "
+         "(e.g. node {}); completing them with network-timeout RC",
+         to_fail.size(), to_fail.front().node_id);
+  }
+  for (const auto &dr : to_fail) {
     // Exactly-once (issue #856): HandleTaskProgressResult claims the
     // accounting transition (MarkReplicaAccounted) before counting, and the
     // final count funnels through RecvOutCompleteOriginTask, whose

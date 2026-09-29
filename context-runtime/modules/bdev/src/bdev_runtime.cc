@@ -612,8 +612,10 @@ clio::run::TaskResume Runtime::GetStats(clio::run::shared_ptr<GetStatsTask> &tas
 
   if (transport_) {
     task->remaining_size_ = transport_->GetRemainingSize();
+    task->total_size_ = transport_->GetCapacity();
   } else {
     task->remaining_size_ = 0;
+    task->total_size_ = 0;
   }
 
   // Expose the latest ML-predicted TTL so the CTE can make
@@ -654,6 +656,24 @@ clio::run::TaskResume Runtime::SetLifespan(
   CLIO_TASK_BODY_BEGIN
   predicted_ttl_days_.store(task->lifespan_days_, std::memory_order_relaxed);
   task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::FlushAllocLog(
+    clio::run::shared_ptr<FlushAllocLogTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  if (transport_) {
+    transport_->FlushAllocLog();
+  }
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::Sync(clio::run::shared_ptr<SyncTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  task->return_code_ = (transport_ && !transport_->Sync()) ? 1 : 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
