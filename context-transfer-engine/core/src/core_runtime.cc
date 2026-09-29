@@ -3581,51 +3581,16 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
     // finish (they never wait while pinned), new readers back off until the
     // guard clears the drain bit at scope exit, and the write token above
     // guarantees at most one drainer.
-    blob_info.BeginDrainReaders();
-    BlobReaderDrainGuard reader_drain_guard(&blob_info);
-    while (blob_info.HasReadPins()) {
-      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
-    }
-
-    bool cleared = false;
-    CLIO_CO_AWAIT(ClearBlob(blob_info, current_score, 0, blob_size, cleared));
-    if (!cleared) {
-      // LCOV_EXCL_START ClearBlob only rejects inputs Steps 1-4 already
-      // validated (score range, offset 0, non-empty blob).
-      HLOG(kWarning, "ReorganizeBlob: ClearBlob failed for blob={}", blob_name);
-      ipc_manager->FreeBuffer(blob_data_buffer);
-      rc = 6;  // Blob untouched
-      CLIO_CO_RETURN;
-      // LCOV_EXCL_STOP
-    }
-    // Re-publish the SHM mirror NOW, with the emptied layout and its fresh
-    // placement_gen_. A zero-IPC SHM client mid-copy on the OLD mirror record
-    // re-reads the generation after copying and discards the bytes; a client
-    // arriving later sees the empty record and falls back to the task path,
-    // where the GetBlobImpl torn-layout guard holds it until the move is done.
-    {
-      std::string shm_key = std::to_string(tag_id.major_) + "." +
-                            std::to_string(tag_id.minor_) + "." + blob_name;
-      MirrorBlobToShm(shm_key, blob_info);
-    }
-
-    // Step 7: Allocate and write the new placement into a LOCAL staging
-    // BlobInfo, then publish it into blob_info in one co_await-free step.
-    // Staging keeps the allocated-but-unwritten blocks invisible: a reader
-    // released by the torn-layout guard can never snapshot half-written
-    // blocks, only the empty layout (and wait again) or the finished one.
-    //
-    // Placement can fail transiently near a full tier (the DPE ranks targets
-    // from a remaining-space snapshot that lags the ClearBlob credit), so:
-    // attempt 0 and 1 target new_score; attempt 2 falls back to restoring at
-    // current_score — the capacity the blob occupied before Step 6.5 is free
-    // again, so the restore has the same space the original placement had.
+    // Issue #1097: place the new copy FIRST, while the old blocks still hold
+    // the data, and free the old placement only once the copy is written.
+    // Clearing first and re-placing afterwards destroyed the blob whenever
+    // the re-placement failed (capacity pressure): reorganizing is an
+    // optimization and must never lose data, so a move that finds no room
+    // leaves the blob exactly where it was.
     BlobInfo staging;
-    int attempt = 0;
     bool placed = false;
-    float placed_score = new_score;
-    for (attempt = 0; attempt < 3; ++attempt) {
-      placed_score = (attempt < 2) ? new_score : current_score;
+    const float placed_score = new_score;
+    for (int attempt = 0; attempt < 2 && !placed; ++attempt) {
       clio::run::u32 place_rc = 0;
       CLIO_CO_AWAIT(ExtendBlob(staging, 0, blob_size, placed_score, place_rc,
                                /*min_persistence_level=*/0,
@@ -3635,47 +3600,50 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
         CLIO_CO_AWAIT(ModifyExistingData(
             staging.blocks_, blob_data_buffer.shm_.template Cast<void>(),
             blob_size, 0, write_rc, 0, 0));
-        if (write_rc == 0) {
-          placed = true;
-          break;
+        placed = write_rc == 0;
+        if (!placed) {
+          HLOG(kWarning, "Reorganize copy write failed: blob={}, score={}, "
+               "rc={}", blob_name, placed_score, write_rc);
         }
-        HLOG(kWarning,
-             "Reorganize re-place write failed: blob={}, score={}, rc={}",
-             blob_name, placed_score, write_rc);
       } else {
-        HLOG(kWarning,
-             "Reorganize re-place allocation failed: blob={}, score={}, rc={}",
-             blob_name, placed_score, place_rc);
+        HLOG(kDebug, "Reorganize copy allocation failed: blob={}, score={}, "
+             "rc={}", blob_name, placed_score, place_rc);
       }
-      // LCOV_EXCL_START error-recovery: requires a placement failure racing a
-      // just-freed tier; not deterministically triggerable in a unit test.
-      // Return any partial allocation before the next attempt.
-      clio::run::u32 free_rc = 0;
-      CLIO_CO_AWAIT(FreeAllBlobBlocks(staging, free_rc));
-      // LCOV_EXCL_STOP
+      if (!placed) {
+        clio::run::u32 free_rc = 0;
+        CLIO_CO_AWAIT(FreeAllBlobBlocks(staging, free_rc));
+      }
     }
-
+    ipc_manager->FreeBuffer(blob_data_buffer);
     if (!placed) {
-      // LCOV_EXCL_START three placement failures in a row, including at the
-      // blob's original score into its own just-freed capacity.
-      HLOG(kError,
-           "Failed to re-place blob during reorganization: blob={} — blob "
-           "data LOST (entry kept, size 0)",
-           blob_name);
-      ipc_manager->FreeBuffer(blob_data_buffer);
-      rc = 7;  // Re-place failed
+      HLOG(kWarning, "ReorganizeBlob: no room to move blob={} to score {}; "
+           "left in place at score {}", blob_name, new_score, current_score);
+      rc = 7;  // Move failed; blob intact at its original placement
       CLIO_CO_RETURN;
-      // LCOV_EXCL_STOP
     }
 
-    // Publish the finished placement. No co_await between these statements,
-    // so the swap is atomic with respect to every other task on this worker;
-    // cross-process SHM readers are covered by the placement_gen_ bump + the
-    // mirror re-publish below.
+    // Swap in the new layout (readers drained: none holds the old extents),
+    // then return the old placement to its targets.
+    blob_info.BeginDrainReaders();
+    BlobReaderDrainGuard reader_drain_guard(&blob_info);
+    while (blob_info.HasReadPins()) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+    BlobInfo old_layout;
+    old_layout.blocks_ = std::move(blob_info.blocks_);
+    old_layout.RecomputeTotalSize();
     blob_info.blocks_ = std::move(staging.blocks_);
     blob_info.total_size_cache_ = staging.total_size_cache_;
     blob_info.score_ = placed_score;
     blob_info.BumpPlacementGen();
+    {
+      clio::run::u32 free_rc = 0;
+      CLIO_CO_AWAIT(FreeAllBlobBlocks(old_layout, free_rc));
+      if (free_rc != 0) {
+        HLOG(kWarning, "ReorganizeBlob: freeing the old placement of blob={} "
+             "failed (rc {}); its space leaks", blob_name, free_rc);
+      }
+    }
 
     // WAL: log the new block layout (kExtendBlob replays with full-replacement
     // semantics, so this single record captures the whole move). Deliberately
@@ -3709,19 +3677,6 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
       std::string shm_key = std::to_string(tag_id.major_) + "." +
                             std::to_string(tag_id.minor_) + "." + blob_name;
       MirrorBlobToShm(shm_key, blob_info);
-    }
-
-    ipc_manager->FreeBuffer(blob_data_buffer);
-
-    if (attempt == 2) {
-      // LCOV_EXCL_START reachable only via the double placement failure above.
-      HLOG(kWarning,
-           "ReorganizeBlob: move to new_score={} failed; blob={} restored at "
-           "original score {}",
-           new_score, blob_name, current_score);
-      rc = 7;  // Move failed (blob intact at its original score)
-      CLIO_CO_RETURN;
-      // LCOV_EXCL_STOP
     }
 
     // Success
@@ -3899,27 +3854,16 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
     // reasoning as the primary flow). While the blocks sit in staging the
     // replica reads as size 0 + write-locked, which the GetBlob replica
     // torn-layout guard treats as mid-mutation.
-    rep = blob_info.GetReplica(replica_idx, /*create=*/false);
+    // Issue #1097 (replica half): place the moved copy FIRST, while the old
+    // extents still hold the bytes; drop the old placement only after the
+    // copy is written. A move that finds no room leaves the replica intact.
+    const int min_pers =
+        blob_info.GetReplica(replica_idx, /*create=*/false)
+            ->MinPersistenceLevel(0);
     BlobInfo staging;
-    staging.blocks_ = std::move(rep->blocks_);
-    rep->blocks_.clear();
-    rep->total_size_cache_ = 0;
-    staging.RecomputeTotalSize();
-    {
-      clio::run::u32 free_rc = 0;
-      CLIO_CO_AWAIT(FreeAllBlobBlocks(staging, free_rc));
-    }
-
-    // Re-place at the new score. REPLICA_PERSISTENT keeps the placement off
-    // volatile tiers even when the new score points at one — the durability
-    // contract survives migration. Last attempt falls back to the old score
-    // into the just-freed capacity, like the primary flow.
-    const int min_pers = rep->MinPersistenceLevel(0);
     bool placed = false;
-    float placed_score = new_score;
-    int attempt = 0;
-    for (attempt = 0; attempt < 3; ++attempt) {
-      placed_score = (attempt < 2) ? new_score : current_score;
+    const float placed_score = new_score;
+    for (int attempt = 0; attempt < 2 && !placed; ++attempt) {
       clio::run::u32 place_rc = 0;
       CLIO_CO_AWAIT(ExtendBlob(staging, 0, rep_size, placed_score, place_rc,
                                min_pers, /*preallocate=*/0));
@@ -3928,35 +3872,35 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
         CLIO_CO_AWAIT(ModifyExistingData(
             staging.blocks_, data_buffer.shm_.template Cast<void>(), rep_size,
             0, write_rc, 0, 0));
-        if (write_rc == 0) {
-          placed = true;
-          break;
-        }
+        placed = write_rc == 0;
       }
-      // LCOV_EXCL_START error-recovery, same shape as the primary flow.
-      clio::run::u32 free_rc = 0;
-      CLIO_CO_AWAIT(FreeAllBlobBlocks(staging, free_rc));
-      // LCOV_EXCL_STOP
+      if (!placed) {
+        clio::run::u32 free_rc = 0;
+        CLIO_CO_AWAIT(FreeAllBlobBlocks(staging, free_rc));
+      }
     }
-
+    ipc_manager->FreeBuffer(data_buffer);
     if (!placed) {
-      // LCOV_EXCL_START three placement failures in a row.
-      HLOG(kError,
-           "ReorganizeReplica: re-place failed: blob={} replica={} — replica "
-           "data LOST (entry kept, size 0)",
-           blob_name, replica_idx);
-      ipc_manager->FreeBuffer(data_buffer);
-      rc = 7;
+      HLOG(kWarning, "ReorganizeReplica: no room to move blob={} replica={} "
+           "to score {}; left in place", blob_name, replica_idx, new_score);
+      rc = 7;  // Move failed; replica intact
       CLIO_CO_RETURN;
-      // LCOV_EXCL_STOP
     }
 
-    // Publish (co_await-free). No SHM mirror / placement-gen churn: the
-    // mirror publishes the PRIMARY's layout, which this move never touched.
+    // Publish (readers were drained above), then free the old placement. No
+    // SHM mirror / placement-gen churn: the mirror publishes the PRIMARY's
+    // layout, which this move never touched.
     rep = blob_info.GetReplica(replica_idx, /*create=*/false);
+    BlobInfo old_layout;
+    old_layout.blocks_ = std::move(rep->blocks_);
+    old_layout.RecomputeTotalSize();
     rep->blocks_ = std::move(staging.blocks_);
     rep->total_size_cache_ = staging.total_size_cache_;
     rep->score_ = placed_score;
+    {
+      clio::run::u32 free_rc = 0;
+      CLIO_CO_AWAIT(FreeAllBlobBlocks(old_layout, free_rc));
+    }
 
     // WAL: one kExtendReplica record captures the whole move (logged after
     // the publish; a crash mid-move replays the pre-move layout).
@@ -3985,14 +3929,6 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
                                                        txn);
     }
 
-    ipc_manager->FreeBuffer(data_buffer);
-
-    if (attempt == 2) {
-      // LCOV_EXCL_START restored at the original score after a failed move.
-      rc = 7;
-      CLIO_CO_RETURN;
-      // LCOV_EXCL_STOP
-    }
     rc = 0;
     HLOG(kDebug, "ReorganizeReplica completed: blob={} replica={} score={}",
          blob_name, replica_idx, placed_score);
