@@ -118,7 +118,24 @@ static std::vector<char *> MountArgv(int argc, char *argv[]) {
   return v;
 }
 
+/**
+ * Default the runtime-connect wait (CLIO_WAIT_SERVER) to 10 minutes for the
+ * mount unless the caller set it. A mount started with the runtime after a
+ * reboot must outlast the runtime's recovery (WAL replay), which can take
+ * longer than the generic 30 s client default; giving up leaves a dead mount.
+ */
+static void DefaultMountServerWait() {
+  if (std::getenv("CLIO_WAIT_SERVER") == nullptr) {
+#ifdef _WIN32
+    _putenv_s("CLIO_WAIT_SERVER", "600");
+#else
+    setenv("CLIO_WAIT_SERVER", "600", 0);
+#endif
+  }
+}
+
 int main(int argc, char *argv[]) {
+  DefaultMountServerWait();
 #if defined(_WIN32) || defined(__APPLE__)
   // Native Windows (WinFsp) and macOS (macFUSE): no Apptainer-style
   // /dev/fuse fd injection. fuse_main() parses argv (on Windows the

@@ -43,6 +43,10 @@ teardown() {
   fusermount3 -uz "${TEST_DIR}" 2>/dev/null
   umount -l "${TEST_DIR}" 2>/dev/null
   pkill -9 -x clio_cte_fuse 2>/dev/null; pkill -9 -x clio_run 2>/dev/null
+  # vfstest re-parents itself out of check's process group, so a hung test's
+  # vfstest outlives the kill below and lingers for hours; one left on a
+  # node coincided with that node's clio runtime wedging at startup.
+  pkill -9 -f "${XFSTESTS_DIR}/src/vfs/vfstest" 2>/dev/null
   rm -rf "/tmp/clio_$(id -un)" /dev/shm/clio_run* 2>/dev/null
 }
 trap 'teardown; exit 0' EXIT

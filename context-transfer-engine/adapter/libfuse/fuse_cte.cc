@@ -2466,6 +2466,19 @@ static int cte_fuse_write_zeros(struct fuse_file_info *fi, cte_off_t off,
 //     hole-reads-as-zero model and unblocks the fzero xfstests.
 // Layout-shifting modes (punch hole, collapse/insert range) would need a
 // chimod-level block-dealloc/shift op and still return EOPNOTSUPP.
+/**
+ * Bytes the store can still take, cluster-wide (the statfs figure).
+ * @return remaining capacity, or ~0 when it cannot be determined
+ */
+static clio::run::u64 StoreRemainingBytes() {
+  auto *cte = CLIO_CTE_CLIENT;
+  if (cte == nullptr) return ~0ULL;
+  auto t = cte->AsyncGetCapacity(clio::run::PoolQuery::Broadcast());
+  t.Wait();
+  if (t->return_code_ != 0) return ~0ULL;
+  return t->remaining_capacity_;
+}
+
 static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
                               cte_off_t length, struct fuse_file_info *fi) {
   const int kSupportedModes = FALLOC_FL_KEEP_SIZE | FALLOC_FL_ZERO_RANGE;
@@ -2503,8 +2516,14 @@ static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
     return 0;
   }
 
+  // fallocate promises the space: a request the store cannot hold fails
+  // now with ENOSPC (as on ext4), not at some later write. Pages are not
+  // reserved, so concurrent writers can still use the space first.
+  if (static_cast<clio::run::u64>(length) > StoreRemainingBytes()) {
+    return -ENOSPC;
+  }
   if (mode & FALLOC_FL_KEEP_SIZE) {
-    return 0;  // no size change requested, and there is nothing to reserve
+    return 0;  // no size change requested
   }
 
   // mode == 0: extend EOF to offset+length if the file is currently shorter.
