@@ -11,6 +11,9 @@
 #include <clio_runtime/worker.h>
 #include <clio_runtime/work_orchestrator.h>
 #include <fcntl.h>
+#ifndef _WIN32
+#include <unistd.h>  // close (ReserveFileSpace)
+#endif
 
 namespace clio::run::bdev {
 
@@ -42,6 +45,36 @@ std::unique_ptr<ctp::AsyncIO> OpenBackingFile(clio::run::u32 io_depth,
   return nullptr;
 }
 
+/**
+ * Reserve real disk blocks for [from, to) of the backing file. ftruncate
+ * alone makes a SPARSE extent: it never fails for lack of space, so a full
+ * disk showed up later as failed writes (EIO to the application) instead
+ * of as a full device at allocation time.
+ * @param file_path backing file
+ * @param from start of the new extent
+ * @param to end of the new extent
+ * @return 0, or the errno (ENOSPC when the disk cannot hold it). A
+ *         filesystem without fallocate support keeps the sparse extent (0).
+ */
+int ReserveFileSpace(const std::string &file_path, clio::run::u64 from,
+                     clio::run::u64 to) {
+#ifdef __linux__
+  if (to <= from) return 0;
+  const int fd = open(file_path.c_str(), O_RDWR);
+  if (fd < 0) return errno;
+  const int rc = posix_fallocate(fd, static_cast<off_t>(from),
+                                 static_cast<off_t>(to - from));
+  close(fd);
+  if (rc == EOPNOTSUPP || rc == EINVAL) return 0;
+  return rc;
+#else
+  (void)file_path;
+  (void)from;
+  (void)to;
+  return 0;
+#endif
+}
+
 }  // namespace
 
 bool WorkerIOContext::Init(const std::string &file_path, clio::run::u32 io_depth,
@@ -50,7 +83,8 @@ bool WorkerIOContext::Init(const std::string &file_path, clio::run::u32 io_depth
 
   async_io_ = OpenBackingFile(io_depth, file_path);
   if (!async_io_) {
-    HLOG(kError, "Worker {} failed to open file {}", worker_id, file_path);
+    HLOG(kError, "Worker {} failed to open file {} ({})", worker_id,
+         file_path, std::strerror(errno));
     return false;
   }
 
@@ -135,6 +169,14 @@ bool FsBdevTransport::Init(const CreateParams& params,
       setup_io->Close();
       return false;
     }
+    const int rrc = ReserveFileSpace(file_path_, 0, initial);
+    if (rrc != 0) {
+      HLOG(kError, "Cannot reserve {} bytes for bdev file {} ({})", initial,
+           file_path_, std::strerror(rrc));
+      setup_io->Truncate(0);
+      setup_io->Close();
+      return false;
+    }
     file_backed_bytes_.store(initial, std::memory_order_relaxed);
   } else {
     // Existing file: its current extent is the already-backed prefix (capped
@@ -147,7 +189,12 @@ bool FsBdevTransport::Init(const CreateParams& params,
   setup_io->Close();
 
   if (!InitializeWorkerIOContexts()) {
-    HLOG(kWarning, "Failed to initialize per-worker I/O contexts");
+    // A worker that cannot open the file fails every I/O it is handed: refuse
+    // the device rather than create one that errors intermittently.
+    HLOG(kError, "Failed to open {} on every worker; refusing the device",
+         file_path_);
+    CleanupWorkerIOContexts();  // release the descriptors that did open
+    return false;
   }
 
   clio::run::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
@@ -212,6 +259,17 @@ bool FsBdevTransport::EnsureFileBacked(clio::run::u64 end_offset) {
     return false;
   }
   bool ok = io->Truncate(static_cast<size_t>(target));
+  if (ok) {
+    const int rrc = ReserveFileSpace(file_path_, backed, target);
+    if (rrc != 0) {
+      // Out of disk: undo the sparse growth so the file never claims space
+      // it does not have; the allocation fails as a full device.
+      HLOG(kWarning, "EnsureFileBacked: no disk space to grow {} to {} "
+           "bytes ({})", file_path_, target, std::strerror(rrc));
+      io->Truncate(static_cast<size_t>(backed));
+      ok = false;
+    }
+  }
   io->Close();
   if (!ok) {
     HLOG(kError,

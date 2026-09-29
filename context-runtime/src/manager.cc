@@ -44,6 +44,10 @@
 #include <iostream>
 #include <thread>
 
+#ifndef _WIN32
+#include <sys/resource.h>  // RaiseFdLimit
+#endif
+
 #include "clio_runtime/admin/admin_client.h"
 #include "clio_runtime/restart_log.h"
 #include "clio_runtime/singletons.h"
@@ -232,11 +236,34 @@ bool RuntimeManager::ClientInit() {
   return true;
 }
 
+namespace {
+/**
+ * Raise this process's open-file soft limit to its hard limit. Every file
+ * bdev opens its backing file once per worker, so an array of several disks
+ * on 16 workers runs past the usual 1024 soft limit, and the next member's
+ * workers then fail to open it. Storage daemons raise the limit themselves.
+ */
+void RaiseFdLimit() {
+#ifndef _WIN32
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur >= rl.rlim_max) {
+    return;
+  }
+  const rlim_t old = rl.rlim_cur;
+  rl.rlim_cur = rl.rlim_max;
+  if (setrlimit(RLIMIT_NOFILE, &rl) == 0) {
+    HLOG(kDebug, "Raised open-file limit from {} to {}", old, rl.rlim_cur);
+  }
+#endif
+}
+}  // namespace
+
 bool RuntimeManager::ServerInit() {
   if (is_runtime_initialized_ || runtime_is_initializing_ ||
       client_is_initializing_) {
     return true;
   }
+  RaiseFdLimit();
 
   // Set mode flags at the start
   is_runtime_mode_ = true;
