@@ -493,6 +493,127 @@ bool Runtime::LoadMemberManifest(std::vector<MemberManifestEntry> &out) const {
 // Method handlers
 //===========================================================================
 
+std::vector<Runtime::DataSeatSpec> Runtime::BuildDataMemberPlan(
+    const CreateParams &params,
+    const std::vector<MemberManifestEntry> &manifest) const {
+  std::vector<DataSeatSpec> plan;
+  for (const auto &d : params.members_) {
+    DataSeatSpec spec;
+    spec.desc = d;
+    plan.push_back(spec);
+  }
+  std::vector<const MemberManifestEntry *> data;
+  for (const auto &e : manifest) {
+    if (e.role_ == 0) data.push_back(&e);
+  }
+  std::sort(data.begin(), data.end(),
+            [](const MemberManifestEntry *a, const MemberManifestEntry *b) {
+              return a->index_ < b->index_;
+            });
+  for (const MemberManifestEntry *e : data) {
+    if (e->index_ > plan.size()) {
+      HLOG(kError, "safe_bdev Create: manifest data column {} leaves a gap "
+           "after column {}; ignoring it", e->index_, plan.size());
+      continue;
+    }
+    if (e->index_ == plan.size()) plan.emplace_back();  // added at runtime
+    DataSeatSpec &spec = plan[e->index_];
+    spec.desc = MemberBdevDesc(e->pool_name_, e->node_id_,
+                               clio::run::PoolId(e->pool_major_,
+                                                 e->pool_minor_));
+    spec.state = e->state_;
+    spec.recovering = e->recovering_ != 0;
+  }
+  return plan;
+}
+
+clio::run::TaskResume Runtime::SeatDataMember(DataSeatSpec spec, int col,
+                                              clio::run::u32 &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  const MemberBdevDesc &desc = spec.desc;
+  data_clients_.emplace_back(desc.pool_id_);
+  MemberSlot slot;
+  slot.pool_id_ = desc.pool_id_;
+  slot.pool_name_ = desc.pool_name_;
+  slot.node_id_ = desc.node_id_;
+  slot.role_ = ec::EcRole::kData;
+  slot.state_ = ec::EcState::kActive;
+  slot.index_ = col;
+  const bool down = !spec.recovering &&
+                    spec.state != static_cast<clio::run::u32>(
+                                      ec::EcState::kActive);
+  if (down) {
+    // Faulty/removed when the array stopped: its device may be gone, so do
+    // not touch it. Reads reconstruct its chunks; it takes no allocations.
+    slot.state_ = static_cast<ec::EcState>(spec.state);
+    data_members_.push_back(slot);
+    data_alloc_.emplace_back();
+    HLOG(kWarning, "safe_bdev Create: data column {} ('{}') restored as down",
+         col, desc.pool_name_);
+    CLIO_CO_RETURN;
+  }
+  auto stats = data_clients_.back().AsyncGetStats();
+  CLIO_CO_AWAIT(stats);
+  if (stats->return_code_ != 0) {
+    HLOG(kError, "safe_bdev Create: GetStats failed for member '{}'",
+         desc.pool_name_);
+    rc = 1;
+    CLIO_CO_RETURN;
+  }
+  const clio::run::u64 remaining = stats->remaining_size_;
+  const clio::run::u64 avail =
+      (remaining > kSuperblockSize) ? (remaining - kSuperblockSize) : 0;
+  data_members_.push_back(slot);
+  MemberAlloc a;
+  a.cap_slots_ = avail / kChunkLen;
+  data_alloc_.push_back(std::move(a));
+
+  MemberSuperblock sb;
+  bool present = false;
+  bool sb_ok = false;
+  CLIO_CO_AWAIT(ReadSuperblock(/*is_parity=*/false, static_cast<size_t>(col),
+                               sb, present, sb_ok));
+  if (!sb_ok) {
+    HLOG(kError, "safe_bdev Create: superblock read failed for member '{}'",
+         desc.pool_name_);
+    rc = 1;
+    CLIO_CO_RETURN;
+  }
+  if (!present) {
+    bool wr_ok = false;
+    CLIO_CO_AWAIT(WriteSuperblock(/*is_parity=*/false,
+                                  static_cast<size_t>(col), wr_ok));
+    if (!wr_ok) {
+      HLOG(kError, "safe_bdev Create: superblock write failed for fresh "
+           "member '{}'", desc.pool_name_);
+      rc = 1;
+      CLIO_CO_RETURN;
+    }
+    HLOG(kInfo, "safe_bdev Create: initialized fresh member '{}' (slot {}, "
+         "{} slots)", desc.pool_name_, col, avail / kChunkLen);
+  } else if (sb.array_major == static_cast<uint64_t>(pool_id_.major_) &&
+             sb.array_minor == static_cast<uint64_t>(pool_id_.minor_)) {
+    ++reattached_members_;
+    HLOG(kInfo, "safe_bdev Create: re-attached member '{}' (slot {})",
+         desc.pool_name_, col);
+  } else {
+    HLOG(kError, "safe_bdev Create: REFUSING member '{}' -- initialized by a "
+         "FOREIGN array ({},{}); this array is ({},{})", desc.pool_name_,
+         sb.array_major, sb.array_minor, pool_id_.major_, pool_id_.minor_);
+    rc = 2;
+    CLIO_CO_RETURN;
+  }
+  if (spec.recovering) {
+    // Mid-recovery onto this member: stays non-active (degraded reads serve
+    // it) until ResumeRecoveries() finishes the rebuild.
+    data_members_.back().state_ = ec::EcState::kFaulty;
+    data_members_.back().recovering_ = true;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
 
@@ -525,27 +646,22 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   const bool have_manifest = LoadMemberManifest(manifest);
 
   std::vector<MemberManifestEntry> eff_parity;  // parity members from manifest
-  std::vector<bool> data_recovering(params.members_.size(), false);
   if (have_manifest) {
     for (const auto &e : manifest) {
-      if (e.role_ == 1) {
-        eff_parity.push_back(e);
-      } else if (e.recovering_ != 0 && e.index_ < data_recovering.size()) {
-        data_recovering[e.index_] = true;
-      }
+      if (e.role_ == 1) eff_parity.push_back(e);
     }
     std::sort(eff_parity.begin(), eff_parity.end(),
               [](const MemberManifestEntry &a, const MemberManifestEntry &b) {
                 return a.index_ < b.index_;
               });
-    HLOG(kInfo,
-         "safe_bdev Create: manifest '{}' augments membership with {} parity "
-         "member(s); {} data column(s) mid-recovery",
-         members_manifest_path_, eff_parity.size(),
-         std::count(data_recovering.begin(), data_recovering.end(), true));
+    HLOG(kInfo, "safe_bdev Create: manifest '{}' restores {} parity member(s)",
+         members_manifest_path_, eff_parity.size());
   }
+  const std::vector<DataSeatSpec> plan =
+      BuildDataMemberPlan(params, have_manifest ? manifest
+                                                : std::vector<MemberManifestEntry>());
 
-  const int k0 = static_cast<int>(params.members_.size());
+  const int k0 = static_cast<int>(plan.size());
   if (k0 <= 0) {
     HLOG(kError, "safe_bdev Create: no member bdevs supplied");
     task->return_code_ = 1;
@@ -563,89 +679,13 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   const bool recovered =
       alloc_log_.enabled() && !alloc_log_.groups().empty();
 
-  // Seat each data member as a DATA column, sizing its slot allocator from the
-  // member's own capacity (per-member -> full aggregate capacity). Classify the
-  // superblock: blank -> FRESH (stamp identity); present+ours -> re-attach;
-  // present+foreign -> REFUSE.
-  int col = 0;
-  for (const auto &desc : params.members_) {
-    data_clients_.emplace_back(desc.pool_id_);
-    auto stats = data_clients_.back().AsyncGetStats();
-    CLIO_CO_AWAIT(stats);
-    if (stats->return_code_ != 0) {
-      HLOG(kError, "safe_bdev Create: GetStats failed for member '{}'",
-           desc.pool_name_);
-      task->return_code_ = 1;
+  // Seat each data column (see BuildDataMemberPlan / SeatDataMember).
+  for (size_t col = 0; col < plan.size(); ++col) {
+    clio::run::u32 seat_rc = 0;
+    CLIO_CO_AWAIT(SeatDataMember(plan[col], static_cast<int>(col), seat_rc));
+    if (seat_rc != 0) {
+      task->return_code_ = seat_rc;
       CLIO_CO_RETURN;
-    }
-    const clio::run::u64 remaining = stats->remaining_size_;
-    const clio::run::u64 avail =
-        (remaining > kSuperblockSize) ? (remaining - kSuperblockSize) : 0;
-    const clio::run::u64 cap_slots = avail / kChunkLen;
-
-    MemberSlot slot;
-    slot.pool_id_ = desc.pool_id_;
-    slot.pool_name_ = desc.pool_name_;
-    slot.node_id_ = desc.node_id_;
-    slot.role_ = ec::EcRole::kData;
-    slot.state_ = ec::EcState::kActive;
-    slot.index_ = col;
-    data_members_.push_back(slot);
-    MemberAlloc a;
-    a.cap_slots_ = cap_slots;
-    data_alloc_.push_back(std::move(a));
-
-    MemberSuperblock sb;
-    bool present = false;
-    bool sb_ok = false;
-    CLIO_CO_AWAIT(ReadSuperblock(/*is_parity=*/false, static_cast<size_t>(col),
-                                 sb, present, sb_ok));
-    if (!sb_ok) {
-      HLOG(kError, "safe_bdev Create: superblock read failed for member '{}'",
-           desc.pool_name_);
-      task->return_code_ = 1;
-      CLIO_CO_RETURN;
-    }
-    if (!present) {
-      bool wr_ok = false;
-      CLIO_CO_AWAIT(WriteSuperblock(/*is_parity=*/false,
-                                    static_cast<size_t>(col), wr_ok));
-      if (!wr_ok) {
-        HLOG(kError,
-             "safe_bdev Create: superblock write failed for fresh member '{}'",
-             desc.pool_name_);
-        task->return_code_ = 1;
-        CLIO_CO_RETURN;
-      }
-      HLOG(kInfo,
-           "safe_bdev Create: initialized fresh member '{}' (slot {}, {} slots)",
-           desc.pool_name_, col, cap_slots);
-    } else if (sb.array_major == static_cast<uint64_t>(pool_id_.major_) &&
-               sb.array_minor == static_cast<uint64_t>(pool_id_.minor_)) {
-      ++reattached_members_;
-      HLOG(kInfo,
-           "safe_bdev Create: re-attached member '{}' (slot {}) already owned "
-           "by this array ({},{})",
-           desc.pool_name_, col, pool_id_.major_, pool_id_.minor_);
-    } else {
-      HLOG(kError,
-           "safe_bdev Create: REFUSING member '{}' — already initialized by a "
-           "FOREIGN array ({},{}); this array is ({},{})",
-           desc.pool_name_, sb.array_major, sb.array_minor, pool_id_.major_,
-           pool_id_.minor_);
-      task->return_code_ = 2;
-      CLIO_CO_RETURN;
-    }
-    ++col;
-  }
-
-  // A data member restored from the manifest as mid-recovery stays non-active
-  // (kFaulty + recovering) so degraded reads serve its data until
-  // ResumeRecoveries() finishes the rebuild.
-  for (size_t i = 0; i < data_members_.size(); ++i) {
-    if (i < data_recovering.size() && data_recovering[i]) {
-      data_members_[i].state_ = ec::EcState::kFaulty;
-      data_members_[i].recovering_ = true;
     }
   }
 

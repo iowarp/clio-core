@@ -601,6 +601,38 @@ class Runtime : public clio::run::Container {
   void WriteMemberRecord(std::FILE *f, const MemberSlot &m,
                          clio::run::u32 role) const;
 
+  /** One data column to seat at Create: where it is and what state the
+   *  manifest left it in. */
+  struct DataSeatSpec {
+    MemberBdevDesc desc;
+    clio::run::u32 state = 0;  // ec::EcState as persisted (0 = active)
+    bool recovering = false;
+  };
+  /**
+   * The data columns to seat: the configured members, overridden and
+   * extended by the manifest. The manifest is the truth for membership: a
+   * column recovered onto another disk, a faulty column, and every data
+   * member added at runtime (which the config never listed) all come from
+   * it, so a restart brings back the array that was running.
+   * @param params Create parameters (configured members)
+   * @param manifest replayed member manifest (may be empty)
+   * @return one spec per data column, in column order
+   */
+  std::vector<DataSeatSpec> BuildDataMemberPlan(
+      const CreateParams &params,
+      const std::vector<MemberManifestEntry> &manifest) const;
+  /**
+   * Seat data column `col`: size its allocator from the member, then
+   * stamp (fresh) or re-attach (ours) its superblock; refuse a foreign one.
+   * A column the manifest recorded as faulty/removed is seated without
+   * touching its device (it may be gone) and takes no new allocations.
+   * @param spec the column
+   * @param col its index
+   * @param rc receives 0, or the Create return code (1 I/O, 2 foreign)
+   */
+  clio::run::TaskResume SeatDataMember(DataSeatSpec spec, int col,
+                                       clio::run::u32 &rc);
+
   /** Reconstruct + write EVERY slot this member participates in onto its
    *  (already-seated) client. Idempotent: safe to re-run after an interrupted
    *  recovery. On return `ok` reports I/O success and `completed` is false only

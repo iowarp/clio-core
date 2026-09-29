@@ -63,6 +63,7 @@
 #include <clio_runtime/bdev/bdev_tasks.h>
 #include <clio_runtime/safe_bdev/safe_bdev_client.h>
 #include <clio_runtime/safe_bdev/safe_bdev_tasks.h>
+#include <clio_runtime/admin/admin_client.h>
 
 using namespace std::chrono_literals;
 
@@ -158,6 +159,8 @@ class Array {
    * @return create rc
    */
   clio::run::u32 Create(const Disk &first, clio::run::u32 max_failures) {
+    first_ = first;
+    max_failures_ = max_failures;
     std::vector<sb::MemberBdevDesc> m;
     m.emplace_back(first.path, 0, first.id);
     log_ = (StressDir() / (tag_ + "_" + std::to_string(getpid()) + ".alog"))
@@ -169,6 +172,29 @@ class Array {
                                safe_.pool_id_, max_failures, m, log_);
     t.Wait();
     safe_.pool_id_ = t->new_pool_id_;
+    return t->GetReturnCode();
+  }
+
+  /**
+   * Stop the array (flush its logs, destroy the pool) and start it again
+   * from its ORIGINAL configuration -- the one disk it was created with --
+   * as a reboot would. Everything else must come back from its own logs.
+   * @return the re-create rc
+   */
+  clio::run::u32 Restart() {
+    auto fl = safe_.AsyncFlushAllocLog(clio::run::PoolQuery::Dynamic(), 0);
+    fl.Wait();
+    clio::run::admin::Client admin(clio::run::kAdminPoolId);
+    auto d = admin.AsyncDestroyPool(clio::run::PoolQuery::Dynamic(),
+                                    safe_.pool_id_);
+    d.Wait();
+    if (d->GetReturnCode() != 0) return 100 + d->GetReturnCode();
+    std::this_thread::sleep_for(200ms);
+    std::vector<sb::MemberBdevDesc> m;
+    m.emplace_back(first_.path, 0, first_.id);
+    auto t = safe_.AsyncCreate(clio::run::PoolQuery::Dynamic(), tag_,
+                               safe_.pool_id_, max_failures_, m, log_);
+    t.Wait();
     return t->GetReturnCode();
   }
 
@@ -237,6 +263,8 @@ class Array {
   clio::run::u32 base_;
   clio::run::u32 next_disk_ = 0;
   std::string log_;
+  Disk first_;
+  clio::run::u32 max_failures_ = 1;
   sb::Client safe_;
   std::mutex mu_;
   std::vector<Stored> stored_;
@@ -470,6 +498,44 @@ TEST_CASE("safe_bdev_stress_two_data_lost", "[safe_bdev][stress]") {
   REQUIRE(a.Unplug(d[1]) == 0);
   REQUIRE(a.Unplug(d[3]) == 0);
   REQUIRE(a.VerifyAll("two data disks lost") == 0);
+}
+
+TEST_CASE("safe_bdev_stress_restart_after_growth", "[safe_bdev][stress]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  Array a("sbs_rst",
+          96000u + static_cast<clio::run::u32>(getpid() & 0xFFF) * 64);
+  clio::run::u32 seed = 1;
+  Disk d[4], p0, p1;
+  REQUIRE(a.NewDisk(&d[0]));
+  REQUIRE(a.Create(d[0], 2) == 0);
+  REQUIRE(a.NewDisk(&p0));
+  REQUIRE(a.Add(p0, true) == 0);
+  WriteMany(a, &seed, 20);
+  for (int i = 1; i < 4; ++i) {
+    REQUIRE(a.NewDisk(&d[i]));
+    REQUIRE(a.Add(d[i], false) == 0);
+  }
+  REQUIRE(a.NewDisk(&p1));
+  REQUIRE(a.Add(p1, true) == 0);
+  WriteMany(a, &seed, 40);
+  REQUIRE(a.BuildParity() == 0);
+  // One disk replaced, another left unplugged when the array stops.
+  REQUIRE(a.Unplug(d[1]) == 0);
+  Disk d1b;
+  REQUIRE(a.NewDisk(&d1b));
+  REQUIRE(a.Recover(d[1], d1b) == 0);
+  REQUIRE(a.Unplug(d[2]) == 0);
+  REQUIRE(a.VerifyAll("before restart") == 0);
+
+  REQUIRE(a.Restart() == 0);
+  REQUIRE(a.VerifyAll("after restart (d2 still out)") == 0);
+  Disk d2b;
+  REQUIRE(a.NewDisk(&d2b));
+  REQUIRE(a.Recover(d[2], d2b) == 0);
+  WriteMany(a, &seed, 20);
+  REQUIRE(a.BuildParity() == 0);
+  REQUIRE(a.VerifyAll("after restart + recovery") == 0);
 }
 
 TEST_CASE("safe_bdev_stress_io_during_membership", "[safe_bdev][stress]") {
