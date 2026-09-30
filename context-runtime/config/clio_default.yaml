@@ -315,7 +315,13 @@ compose:
     #                                    #   to pay on Gray-Scott -- see its header)
     #   organizer_tasks: 1               # Periodic replicas (blob space is hash-partitioned)
     #   organizer_period_ms: 5000        # Period between organizer rounds (ms)
-    #   flush_metadata_period_ms: 5000   # Metadata flush interval (ms)
+    #   flush_metadata_period_ms: 5000   # Metadata flush interval (ms): syncs
+    #                                    # the metadata WAL each period. The full
+    #                                    # snapshot (a pass over every blob) is
+    #                                    # rebuilt only when the WAL exceeds
+    #                                    # transaction_log_capacity, or at most
+    #                                    # once a minute to persist blob score
+    #                                    # changes the WAL does not record.
     #   flush_data_period_ms: 10000      # Data flush interval (ms)
     #   flush_data_min_persistence: 1    # Min persistence level (1=temp-nonvolatile)
     #   fsync_mode: "durable"            # fsync(2) on clio-fs. "durable": returns

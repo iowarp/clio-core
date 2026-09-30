@@ -154,6 +154,24 @@ constexpr bool CteAllocIsCapacityFailure(clio::run::u32 rc) {
 // placement engine's target choice, which is not exposed here.
 constexpr float kCteEvictAnyTier = 0.0f;
 
+// A metadata snapshot slower than this is reported (milliseconds).
+constexpr double kSlowSnapshotMs = 1000.0;
+
+// Unlogged metadata changes (blob scores) wait at most this long for a full
+// snapshot (milliseconds).
+constexpr clio::run::u64 kSnapshotMaxAgeMs = 60000;
+
+/**
+ * Milliseconds on the steady clock (for snapshot pacing).
+ * @return current steady-clock time in ms
+ */
+clio::run::u64 SteadyNowMs() {
+  return static_cast<clio::run::u64>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
 // #680 per-blob write-token re-check period (microseconds). Default 10us: a
 // loser is parked ONLY during active same-blob write contention, where a fast
 // hand-off beats the CPU saved by sleeping. 10us lands in the worker's fastest
@@ -2525,6 +2543,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     blob_info_ptr->last_modified_ = now;
     task->context_.version_ = now;
     blob_info_ptr->access_count_++;  // frequency input for the data organizer
+    if (blob_info_ptr->score_ != blob_score) snapshot_dirty_.store(true);
     blob_info_ptr->score_ = blob_score;
     // GENERATIONAL PUT: see the note on the replica path above.
     if (task->context_.op_flags_ & Context::kGenerational) {
@@ -3595,6 +3614,7 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
         }
         clio::run::u32 free_rc = 0;
         CLIO_CO_AWAIT(FreeAllBlobBlocks(blob_info, free_rc));
+        if (blob_info.score_ != new_score) snapshot_dirty_.store(true);
         blob_info.score_ = new_score;
         // The primary's bytes leave the tag (same bookkeeping as DelBlob):
         // GetTagSize stays equal to the sum of primary sizes.
@@ -3736,6 +3756,7 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
     old_layout.RecomputeTotalSize();
     blob_info.blocks_ = std::move(staging.blocks_);
     blob_info.total_size_cache_ = staging.total_size_cache_;
+    if (blob_info.score_ != placed_score) snapshot_dirty_.store(true);
     blob_info.score_ = placed_score;
     blob_info.BumpPlacementGen();
     {
@@ -6687,6 +6708,43 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     CLIO_CO_RETURN;
   }
 
+  {
+    // The WAL is what makes each change durable: sync it every period. The
+    // full snapshot below is compaction -- it costs a pass over every blob,
+    // taking each one's write token -- so rebuild it only when the WAL must
+    // be truncated, or when a change the WAL does not record is pending and
+    // the last snapshot is old enough.
+    clio::run::u64 wal_bytes = 0;
+    for (auto &log : blob_txn_logs_) {
+      if (log) {
+        log->Sync();
+        wal_bytes += log->Size();
+      }
+    }
+    for (auto &log : tag_txn_logs_) {
+      if (log) {
+        log->Sync();
+        wal_bytes += log->Size();
+      }
+    }
+    const clio::run::u64 now_ms = SteadyNowMs();
+    const clio::run::u64 last_ms = last_snapshot_ms_.load();
+    const bool must_compact =
+        wal_bytes > config_.performance_.transaction_log_capacity_bytes_;
+    const bool unlogged_due =
+        snapshot_dirty_.load() &&
+        (last_ms == 0 || now_ms - last_ms >= kSnapshotMaxAgeMs);
+    // An explicit (one-shot) flush always writes the snapshot: callers ask
+    // for one. Only the periodic task may skip it.
+    const bool have_wal = !blob_txn_logs_.empty();
+    if (have_wal && task->IsPeriodic() && !must_compact && !unlogged_due) {
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+    snapshot_dirty_.store(false);  // changes after this point set it again
+    last_snapshot_ms_.store(now_ms);
+  }
+
   try {
     namespace fs = std::filesystem;
     fs::create_directories(fs::path(log_path).parent_path());
@@ -6702,6 +6760,7 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     // built (it yields on write tokens) might not be, and must survive the
     // WAL truncation that follows.
     const clio::run::u64 snapshot_seq = next_wal_seq_.load();
+    const auto snapshot_t0 = std::chrono::steady_clock::now();
 
     // Build the snapshot beside the live one and swap it in durably: writing
     // the live file in place left a truncated snapshot -- and the blobs only
@@ -6946,6 +7005,17 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     }
 
     task->return_code_ = 0;
+    const double snapshot_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - snapshot_t0).count();
+    // A full snapshot runs every flush_metadata_period_ms and takes every
+    // blob's write token in turn; when it costs on the order of the period it
+    // competes with foreground I/O the whole time. Say so.
+    if (snapshot_ms > kSlowSnapshotMs) {
+      HLOG(kWarning, "FlushMetadata: snapshot of {} entries took {} ms "
+           "(period {} ms)", task->entries_flushed_,
+           static_cast<clio::run::u64>(snapshot_ms),
+           config_.performance_.flush_metadata_period_ms_);
+    }
     HLOG(kDebug, "FlushMetadata: Flushed {} entries to {}",
          task->entries_flushed_, log_path);
   } catch (const std::exception &e) {

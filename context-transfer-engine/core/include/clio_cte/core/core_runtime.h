@@ -796,6 +796,18 @@ private:
   std::atomic<clio::run::u64> next_wal_seq_{1};
 
   /**
+   * Set when metadata the WAL does not record changes (a blob's score after
+   * its creation). FlushMetadata only rebuilds the full snapshot when it has
+   * to: to compact an oversized WAL, or -- at most every
+   * kSnapshotMaxAgeMs -- to persist such unlogged changes. Everything else
+   * is durable through the WAL, which every flush syncs.
+   */
+  std::atomic<bool> snapshot_dirty_{false};
+  /** Steady-clock time of the last full snapshot (ms since epoch of the
+   *  steady clock; 0 = none yet). */
+  std::atomic<clio::run::u64> last_snapshot_ms_{0};
+
+  /**
    * Get access to configuration manager
    */
   const Config &GetConfig() const;
