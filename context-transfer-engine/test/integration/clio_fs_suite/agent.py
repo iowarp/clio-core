@@ -36,6 +36,8 @@ import sys
 import threading
 import time
 
+import stress_records as sr
+
 BLOCK = 65536  # Granularity of the deterministic data pattern.
 
 _libc = ctypes.CDLL(None, use_errno=True)
@@ -361,6 +363,30 @@ class Agent:
     res['ok'] = res['size_ok'] and res['mismatch'] is None and \
         'extra_bytes' not in res
     return res
+
+  # -- self-verifying records (stress_records.py) ------------------------
+  def op_rec_write(self, path, name, runs, writer, gen, fsync=False,
+                   blk=sr.BLK):
+    """Write records of (writer, gen) over block runs of file `name`."""
+    return sr.write_runs(path, sr.file_id_of(name), runs, writer, gen,
+                         fsync, blk)
+
+  def op_rec_scan(self, path, name, nblocks, blk=sr.BLK):
+    """Classify every block of a record file (see stress_records.scan)."""
+    return sr.scan(path, sr.file_id_of(name), nblocks, blk)
+
+  def op_rec_shared_stress(self, path, name, nblocks, writer_base, writers,
+                           readers, secs, seed, blk=sr.BLK):
+    """Concurrent overwriters + readers on one shared record file."""
+    return sr.SharedFileStress(path, sr.file_id_of(name), nblocks,
+                               writer_base, writers, readers, secs, seed,
+                               blk).run()
+
+  def op_rec_fileset(self, dirpath, writer, nfiles, blocks, secs, seed,
+                     log_path=None, blk=sr.BLK):
+    """Rewrite a cycling set of record files, logging each fsynced one."""
+    return sr.FileSetWriter(dirpath, writer, nfiles, blocks, secs, seed,
+                            blk, log_path).run()
 
   def op_sha256(self, path, chunk=1 << 20):
     h = hashlib.sha256()

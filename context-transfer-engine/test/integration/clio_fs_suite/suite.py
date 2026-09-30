@@ -162,6 +162,7 @@ def load_tests():
   import tests_bdev  # noqa: F401
   import tests_dirs  # noqa: F401
   import tests_capacity  # noqa: F401
+  import tests_stress  # noqa: F401
 
 
 def slurm_hosts():
@@ -277,12 +278,20 @@ def main():
   ap.add_argument('--only', default='')
   ap.add_argument('--skip', default='')
   ap.add_argument('--profile', default='persistent',
-                  choices=['persistent', 'persistent_norepl', 'ram'],
+                  choices=['persistent', 'persistent_norepl', 'ram',
+                           'tiered'],
                   help='persistent_norepl: disk tier + WALs but no '
                        'replication chimod and no periodic data flush, so '
                        'only fsync itself moves data off the RAM tier')
   ap.add_argument('--disk-gb', type=int, default=20,
                   help='size of each node\'s disk tier (GB)')
+  ap.add_argument('--ram-mb', type=int, default=512,
+                  help='tiered profile: RAM tier per node (MB)')
+  ap.add_argument('--fast-mb', type=int, default=2048,
+                  help='tiered profile: fast file tier per node (MB)')
+  ap.add_argument('--organizer', default='frecency',
+                  choices=['none', 'frecency', 'cyclic', 'scatter', 'hotset'],
+                  help='tiered profile: CTE data organizer (tier migration)')
   ap.add_argument('--fsync-mode', default=None,
                   choices=['durable', 'deferred'],
                   help='CTE performance.fsync_mode (default: CTE default)')
@@ -318,7 +327,7 @@ def main():
          len(hosts) >= t['min_nodes']]
   # Fault tests last: they deliberately break the deployment.
   order = {'posix': 0, 'dist': 1, 'dirs': 2, 'apps': 3, 'perf': 4,
-           'fault': 5}
+           'stress': 5, 'fault': 6}
   sel.sort(key=lambda t: order.get(t['group'], 9))
 
   bin_dir = snapshot_bins(os.path.abspath(args.bin),
@@ -326,7 +335,8 @@ def main():
   cl = Cluster(hosts, bin_dir, os.path.abspath(args.out),
                profile=args.profile, port=args.port,
                attr_cache_s=args.attr_cache, fsync_mode=args.fsync_mode,
-               disk_gb=args.disk_gb)
+               disk_gb=args.disk_gb, ram_mb=args.ram_mb,
+               fast_mb=args.fast_mb, organizer=args.organizer)
   log(f'hosts={hosts} profile={args.profile} tests={len(sel)}')
   ok, msg = cl.up(wipe=True)
   log(f'deploy: {msg}')

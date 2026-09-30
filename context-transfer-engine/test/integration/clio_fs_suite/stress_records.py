@@ -1,0 +1,320 @@
+"""Self-verifying block records for the clio-fs data-integrity stress tests.
+
+Every BLK-byte block a stress test writes is a record that names itself:
+
+  [ 8 B magic "CLIOREC1" | u64 file_id | u64 block | u32 writer | u32 gen |
+    u32 crc of the header | 28 B reserved (zero) | payload ]
+
+The payload is the SHA-256 of the 64-byte header repeated to fill the block.
+A read therefore classifies every block on its own, with no side table:
+
+  (writer, gen)  an intact record written for exactly this file and block
+  ZERO           all zero bytes (a hole, or never written)
+  CORRUPT        anything else: a torn mix of two writes, garbage, a
+                 truncated block, a bad checksum
+  FOREIGN        an intact record of ANOTHER file or block -- data that
+                 leaked (a freed extent reused without clearing, a tier
+                 migration that copied the wrong blob, a misplaced page)
+
+The tests model which (writer, gen) each block may legally hold; anything
+CORRUPT or FOREIGN is data corruption, and a block holding an older version
+than one whose fsync completed is data loss.
+"""
+
+import hashlib
+import os
+import random
+import struct
+import threading
+import time
+import zlib
+
+BLK = 4096
+MAGIC = b'CLIOREC1'
+_HDR = struct.Struct('<8sQQIII28x')  # 64 bytes
+ZERO = -1
+CORRUPT = -2
+FOREIGN = -3
+
+
+def make_block(file_id, block, writer, gen, blk=BLK):
+  """Encode one self-verifying record.
+
+  Args:
+    file_id: 64-bit id of the file (distinguishes files in a leak).
+    block: block index within the file.
+    writer: id of the writing process.
+    gen: version written by that writer (monotonic per writer).
+    blk: block size in bytes (a multiple of 32, >= 128).
+  Returns:
+    blk bytes.
+  """
+  head = struct.pack('<8sQQII', MAGIC, file_id, block, writer, gen)
+  crc = zlib.crc32(head) & 0xffffffff
+  hdr = _HDR.pack(MAGIC, file_id, block, writer, gen, crc)
+  dig = hashlib.sha256(hdr).digest()
+  return hdr + dig * ((blk - len(hdr)) // len(dig))
+
+
+def classify(data, file_id, block, blk=BLK):
+  """Classify one block read back.
+
+  Args:
+    data: the bytes read (may be short at EOF).
+    file_id: the file it was read from.
+    block: its block index.
+    blk: block size.
+  Returns:
+    (writer, gen) for an intact record of this block, else
+    (ZERO, 0), (CORRUPT, 0) or (FOREIGN, 0).
+  """
+  if len(data) == blk and data.count(0) == blk:
+    return (ZERO, 0)
+  if len(data) != blk or data[:8] != MAGIC:
+    return (CORRUPT, 0)
+  magic, fid, blkno, writer, gen, crc = _HDR.unpack(data[:_HDR.size])
+  head = struct.pack('<8sQQII', magic, fid, blkno, writer, gen)
+  if zlib.crc32(head) & 0xffffffff != crc:
+    return (CORRUPT, 0)
+  dig = hashlib.sha256(data[:_HDR.size]).digest()
+  if data[_HDR.size:] != dig * ((blk - _HDR.size) // len(dig)):
+    return (CORRUPT, 0)
+  if fid != file_id or blkno != block:
+    return (FOREIGN, 0)
+  return (writer, gen)
+
+
+def file_id_of(name):
+  """Stable 64-bit id for a file name."""
+  return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], 'little')
+
+
+def write_runs(path, file_id, runs, writer, gen, fsync, blk=BLK,
+               chunk_blocks=256):
+  """pwrite records for block runs [[start, count], ...] of one file.
+
+  Args:
+    path: file (created if missing, never truncated).
+    file_id: record file id.
+    runs: block runs to write.
+    writer: record writer id.
+    gen: record version.
+    fsync: fsync before closing.
+    blk: block size.
+    chunk_blocks: blocks per write(2).
+  Returns:
+    bytes written.
+  """
+  fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+  total = 0
+  try:
+    for start, count in runs:
+      b = start
+      while b < start + count:
+        n = min(chunk_blocks, start + count - b)
+        buf = b''.join(make_block(file_id, b + i, writer, gen, blk)
+                       for i in range(n))
+        w = os.pwrite(fd, buf, b * blk)
+        if w != len(buf):
+          raise OSError(5, f'short write {w}/{len(buf)} at block {b}')
+        total += w
+        b += n
+    if fsync:
+      os.fsync(fd)
+  finally:
+    os.close(fd)
+  return total
+
+
+def scan(path, file_id, nblocks, blk=BLK, chunk_blocks=256):
+  """Classify every block of a file.
+
+  Args:
+    path: file to read.
+    file_id: its record file id.
+    nblocks: blocks to classify (past EOF reads as short: CORRUPT unless the
+      caller treats it as absent -- see the returned size).
+    blk: block size.
+    chunk_blocks: blocks per read(2).
+  Returns:
+    {'size': file size, 'runs': [[start, count, writer, gen], ...]}
+    with consecutive blocks of the same (writer, gen) merged.
+  """
+  size = os.stat(path).st_size
+  runs = []
+  fd = os.open(path, os.O_RDONLY)
+  try:
+    b = 0
+    while b < nblocks:
+      n = min(chunk_blocks, nblocks - b)
+      data = os.pread(fd, n * blk, b * blk)
+      for i in range(n):
+        piece = data[i * blk:(i + 1) * blk]
+        if not piece and (b + i) * blk >= size:
+          w, g = ZERO, 0  # past EOF: never written
+        else:
+          w, g = classify(piece, file_id, b + i, blk)
+        if runs and runs[-1][2] == w and runs[-1][3] == g and \
+            runs[-1][0] + runs[-1][1] == b + i:
+          runs[-1][1] += 1
+        else:
+          runs.append([b + i, 1, w, g])
+      b += n
+  finally:
+    os.close(fd)
+  return {'size': size, 'runs': runs}
+
+
+def _now():
+  return time.time()
+
+
+class SharedFileStress:
+  """Concurrent single-block overwriters and readers on one shared file.
+
+  Each writer thread overwrites random blocks with (writer, gen) records,
+  gen increasing, and fsyncs after each write so the version is visible to
+  every node on its next open (close-to-open). It logs
+  [block, gen, t_issue, t_acked]. Each reader thread repeatedly opens the
+  file, reads one random block, closes it, and logs
+  [block, writer, gen, t_open, t_done] -- the orchestrator checks every
+  observation against all writers' logs.
+  """
+
+  def __init__(self, path, file_id, nblocks, writer_base, writers, readers,
+               secs, seed, blk=BLK, max_obs=40000):
+    self.path = path
+    self.file_id = file_id
+    self.nblocks = nblocks
+    self.writer_base = writer_base
+    self.nwriters = writers
+    self.nreaders = readers
+    self.secs = secs
+    self.seed = seed
+    self.blk = blk
+    self.max_obs = max_obs
+    self.writes = {}   # writer id -> [[block, gen, t_issue, t_ack], ...]
+    self.inflight = {}  # writer id -> [block, gen, t_issue] or None
+    self.obs = []
+    self.errors = []
+    self.lock = threading.Lock()
+
+  def _writer(self, k):
+    wid = self.writer_base + k
+    rng = random.Random(f'{self.seed}:w{wid}')
+    log = []
+    self.writes[wid] = log
+    gen = 0
+    t_end = _now() + self.secs
+    fd = os.open(self.path, os.O_WRONLY)
+    try:
+      while _now() < t_end:
+        b = rng.randrange(self.nblocks)
+        gen += 1
+        rec = make_block(self.file_id, b, wid, gen, self.blk)
+        t0 = _now()
+        self.inflight[wid] = [b, gen, t0]
+        try:
+          if os.pwrite(fd, rec, b * self.blk) != self.blk:
+            raise OSError(5, 'short write')
+          os.fsync(fd)
+        except OSError as e:
+          with self.lock:
+            self.errors.append(f'writer {wid} block {b} gen {gen}: {e}')
+          # Unknown outcome: stays in flight (may or may not have landed).
+          self.inflight[wid] = [b, gen, t0]
+          break
+        log.append([b, gen, t0, _now()])
+        self.inflight[wid] = None
+    finally:
+      os.close(fd)
+
+  def _reader(self, k):
+    rng = random.Random(f'{self.seed}:r{self.writer_base}:{k}')
+    t_end = _now() + self.secs
+    while _now() < t_end:
+      b = rng.randrange(self.nblocks)
+      t0 = _now()
+      try:
+        fd = os.open(self.path, os.O_RDONLY)
+        try:
+          data = os.pread(fd, self.blk, b * self.blk)
+        finally:
+          os.close(fd)
+      except OSError as e:
+        with self.lock:
+          self.errors.append(f'reader block {b}: {e}')
+        continue
+      w, g = classify(data, self.file_id, b, self.blk)
+      with self.lock:
+        if len(self.obs) < self.max_obs or w < 0 and w != ZERO:
+          self.obs.append([b, w, g, t0, _now()])
+
+  def run(self):
+    """Run all threads to completion; return the logs."""
+    ts = [threading.Thread(target=self._writer, args=(k,))
+          for k in range(self.nwriters)]
+    ts += [threading.Thread(target=self._reader, args=(k,))
+           for k in range(self.nreaders)]
+    for t in ts:
+      t.start()
+    for t in ts:
+      t.join()
+    return {'writes': {str(k): v for k, v in self.writes.items()},
+            'inflight': {str(k): v for k, v in self.inflight.items() if v},
+            'obs': self.obs, 'errors': self.errors[:50],
+            'nerrors': len(self.errors)}
+
+
+class FileSetWriter:
+  """Keeps writing whole files of records until told to stop or killed.
+
+  Used by the crash test: each file is written, fsynced and then logged as
+  durable (with its version), so after a crash of every daemon the test
+  knows exactly which versions must have survived. Files cycle through a
+  fixed set of names so later rounds overwrite earlier (fsynced) versions.
+  """
+
+  def __init__(self, dirpath, writer, nfiles, blocks_per_file, secs, seed,
+               blk=BLK, log_path=None):
+    self.dirpath = dirpath
+    self.writer = writer
+    self.nfiles = nfiles
+    self.bpf = blocks_per_file
+    self.secs = secs
+    self.seed = seed
+    self.blk = blk
+    self.log_path = log_path
+
+  def run(self):
+    """Write rounds until secs elapse (or an error); return the log."""
+    durable = {}   # name -> last fsynced gen
+    started = {}   # name -> gen being written when we stopped / failed
+    errors = []
+    gen = 0
+    t_end = _now() + self.secs
+    logf = open(self.log_path, 'a') if self.log_path else None
+    try:
+      while _now() < t_end:
+        gen += 1
+        name = f'w{self.writer}_f{(gen - 1) % self.nfiles}'
+        path = os.path.join(self.dirpath, name)
+        started[name] = gen
+        try:
+          write_runs(path, file_id_of(name), [[0, self.bpf]], self.writer,
+                     gen, fsync=True, blk=self.blk)
+        except OSError as e:
+          errors.append(f'{name} gen {gen}: {e}')
+          break
+        durable[name] = gen
+        started.pop(name, None)
+        if logf:
+          # Durable log on the (NFS) results dir: survives the crash.
+          logf.write(f'{name} {gen}\n')
+          logf.flush()
+          os.fsync(logf.fileno())
+    finally:
+      if logf:
+        logf.close()
+    return {'durable': durable, 'started': started, 'errors': errors[:20],
+            'rounds': gen}

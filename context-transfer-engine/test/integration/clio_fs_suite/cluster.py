@@ -126,7 +126,9 @@ class Cluster:
   def __init__(self, hosts, bin_dir, run_dir, profile='persistent',
                port=9519, attr_cache_s=None, num_threads=8,
                ram_gb=8, disk_gb=20, local_root=None, net_suffix='-40g',
-               extra_env=None, replicate_period_ms=0, fsync_mode=None):
+               extra_env=None, replicate_period_ms=0, fsync_mode=None,
+               ram_mb=512, fast_mb=2048, organizer='frecency',
+               organizer_period_ms=2000):
     self.hosts = list(hosts)
     self.bin_dir = bin_dir
     self.run_dir = run_dir            # shared (NFS): configs, logs, results
@@ -146,6 +148,14 @@ class Cluster:
     self.replicate_period_ms = replicate_period_ms
     # CTE performance.fsync_mode ('durable' / 'deferred'); None = default.
     self.fsync_mode = fsync_mode
+    # Profile 'tiered': three small tiers per node so ordinary workloads
+    # overflow the upper ones -- RAM (ram_mb), a fast file tier (fast_mb)
+    # and a slow file tier (disk_gb) -- with `organizer` migrating blobs
+    # between them every organizer_period_ms while tests read and write.
+    self.ram_mb = ram_mb
+    self.fast_mb = fast_mb
+    self.organizer = organizer
+    self.organizer_period_ms = organizer_period_ms
     self.agents = {}
     self.agent_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  'agent.py')
@@ -197,17 +207,26 @@ class Cluster:
       for h in self.hosts:
         f.write(f'{h}{self.net_suffix}\n')
     lr = self.local_root
+    tiered = self.profile == 'tiered'
+    ram_cap = f'{self.ram_mb}MB' if tiered else f'{self.ram_gb}GB'
     storage = [
         f'      - path: "ram::clio_fs_ram"\n'
         f'        bdev_type: "ram"\n'
-        f'        capacity_limit: "{self.ram_gb}GB"\n'
+        f'        capacity_limit: "{ram_cap}"\n'
         f'        score: 1.0\n']
     perf = ''
     chain = ''
     fs_next = '512.0'
     fs_extra = ''
     stream_extra = ''
-    if self.profile in ('persistent', 'persistent_norepl'):
+    if tiered:
+      storage.append(
+          f'      - path: "{lr}/data/cte_fast_tier.dat"\n'
+          f'        bdev_type: "file"\n'
+          f'        capacity_limit: "{self.fast_mb}MB"\n'
+          f'        score: 0.6\n'
+          f'        persistence_level: "temporary"\n')
+    if self.profile in ('persistent', 'persistent_norepl', 'tiered'):
       storage.append(
           f'      - path: "{lr}/data/cte_disk_tier.dat"\n'
           f'        bdev_type: "file"\n'
@@ -227,7 +246,12 @@ class Cluster:
       # Nothing but fsync may move bytes off the RAM tier: no replica on the
       # disk tier, and the periodic volatile->disk flush pushed out an hour.
       perf += '      flush_data_period_ms: 3600000\n'
-    if self.profile == 'persistent':
+    organizer = ''
+    if tiered:
+      perf += '      flush_data_period_ms: 2000\n'
+      organizer = (f'    organizer: "{self.organizer}"\n'
+                   f'    organizer_period_ms: {self.organizer_period_ms}\n')
+    if self.profile in ('persistent', 'tiered'):
       chain = ('  - mod_name: clio_cte_replication\n'
                '    pool_name: clio_cte_replication\n'
                '    pool_query: local\n'
@@ -259,7 +283,7 @@ compose:
     pool_query: local
     pool_id: "512.0"
     storage:
-{''.join(storage)}{perf}    dpe:
+{''.join(storage)}{perf}{organizer}    dpe:
       dpe_type: "max_bw"
     targets:
       neighborhood: 1
