@@ -31,6 +31,10 @@
 namespace clio::cte::filesystem {
 
 namespace {
+/** Resends of a size update whose inode home died in flight, and the wait
+ *  between them (us) while the cluster marks the node dead. */
+constexpr int kAdvanceRetries = 10;
+constexpr double kAdvanceRetryUs = 1000000.0;
 /** UTC wallclock nanoseconds (system_clock) — the primary append order key. */
 inline clio::run::u64 NowUtcNs() {
   return static_cast<clio::run::u64>(
@@ -530,19 +534,29 @@ clio::run::TaskResume Runtime::SyncMeta(
 clio::run::TaskResume Runtime::AdvanceSize(
     clio::run::shared_ptr<AdvanceSizeTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  {
-    // Clients send it here (Local); it runs on the inode's live home.
+  // Clients send it here (Local); it runs on the inode's live home. When
+  // that home dies with the forward in flight (before the cluster declares
+  // it dead, so InodeOwner still named it), re-resolve and send again: a
+  // size advance (max) is idempotent. An append reservation adds, so it is
+  // not resent -- its caller sees the failure.
+  for (int attempt = 0;; ++attempt) {
     const clio::run::u32 owner = InodeOwner(task->tag_packed_);
-    if (owner != container_id_) {
-      auto f = self_.AsyncAdvanceSizeAt(
-          clio::run::PoolQuery::DirectId(
-              static_cast<clio::run::ContainerId>(owner)),
-          task->tag_packed_, task->size_, task->reserve_);
-      CLIO_CO_AWAIT(f);
-      task->old_size_ = f->old_size_;
-      task->return_code_ = f->GetReturnCode();
+    if (owner == container_id_) break;
+    auto f = self_.AsyncAdvanceSizeAt(
+        clio::run::PoolQuery::DirectId(
+            static_cast<clio::run::ContainerId>(owner)),
+        task->tag_packed_, task->size_, task->reserve_);
+    CLIO_CO_AWAIT(f);
+    task->old_size_ = f->old_size_;
+    task->return_code_ = f->GetReturnCode();
+    if (task->reserve_ || attempt >= kAdvanceRetries ||
+        !clio::cte::core::IsNodeLostRc(task->GetReturnCode())) {
       CLIO_CO_RETURN;
     }
+    HLOG(kWarning, "filesystem: the home of inode {} was lost with a size "
+         "update in flight; resending (attempt {})", task->tag_packed_,
+         attempt + 1);
+    CLIO_CO_AWAIT(clio::run::yield(kAdvanceRetryUs));
   }
   CLIO_CO_AWAIT(EnsureInode(task->tag_packed_));
   std::shared_ptr<FileInfo> fi = FindInode(task->tag_packed_);

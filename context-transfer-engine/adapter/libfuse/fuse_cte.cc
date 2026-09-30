@@ -328,7 +328,24 @@ static int SyncOneTag(const clio::cte::core::TagId &tag) {
   }
   const clio::run::u32 rc = fut->GetReturnCode();
   if (rc == clio::cte::core::kSyncNoSpaceRc) return -ENOSPC;
-  return rc == 0 ? 0 : -EIO;
+  if (clio::cte::core::IsNodeLostRc(rc)) {
+    // The sync is broadcast to every core container; one whose node died
+    // answers with the lost-node code. It cannot hold bytes written through
+    // this mount since it died -- those puts failed and were resent to the
+    // live successor (ResendIfNodeLost) -- and what it held before is
+    // durable already or lives on in its replicas. The live containers
+    // synced (containers_ > 0), so the fsync holds.
+    HLOG(kWarning, "clio_cte_fuse: fsync of tag {}.{}: a container's node "
+         "is down; the live containers synced", tag.major_, tag.minor_);
+    return 0;
+  }
+  if (rc != 0) {
+    HLOG(kError, "clio_cte_fuse: fsync of tag {}.{} failed (rc {}); "
+         "reporting EIO", tag.major_, tag.minor_,
+         static_cast<long long>(static_cast<clio::run::i32>(rc)));
+    return -EIO;
+  }
+  return 0;
 }
 
 /**
@@ -2155,7 +2172,11 @@ static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
             static_cast<clio::run::u64>(handle->tag.minor_),
         hiwater);
     t.Wait();
-    if (t->GetReturnCode() != 0) return -EIO;
+    if (t->GetReturnCode() != 0) {
+      HLOG(kError, "clio_cte_fuse: publishing the size of {} failed (rc {}); "
+           "reporting EIO", hp, t->GetReturnCode());
+      return -EIO;
+    }
     // fsync's durability contract covers only what THIS handle wrote
     // (hiwater != 0), and only once the sieve drain above landed it on the
     // primary -- the barrier now waits for the async replica sweep to catch
@@ -2163,7 +2184,11 @@ static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
     // NeedsReplicationFlushBarrier) when replication is absent or already
     // synchronous.
     int berr = FlushReplicationBarrier(handle->tag);
-    if (berr != 0) return berr;
+    if (berr != 0) {
+      HLOG(kError, "clio_cte_fuse: replication barrier for {} failed ({})",
+           hp, berr);
+      return berr;
+    }
   }
   return 0;
 }
@@ -2216,7 +2241,12 @@ int cte_fuse_fsync(const char *path, int /*datasync*/,
     if (rc != 0) return rc;
   }
   auto *cfs = CLIO_CFS_CLIENT;
-  if (CfsFlushCompat(cfs, p) != 0) return -errno;
+  if (CfsFlushCompat(cfs, p) != 0) {
+    const int e = errno;
+    HLOG(kError, "clio_cte_fuse: fsync of {}: flushing the write-behind "
+         "failed (errno {})", p, e);
+    return -e;
+  }
   // Everything above landed the bytes on the store; fsync's contract is
   // that they are ON A PERSISTENT DEVICE when it returns.
   return SyncDurable(handle != nullptr ? handle->tag
