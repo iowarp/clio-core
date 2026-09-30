@@ -154,6 +154,11 @@ constexpr bool CteAllocIsCapacityFailure(clio::run::u32 rc) {
 // placement engine's target choice, which is not exposed here.
 constexpr float kCteEvictAnyTier = 0.0f;
 
+// Resends of a forwarded put whose owner died mid-flight, and the wait
+// between them (us) while the cluster marks the node dead.
+constexpr int kForwardRetries = 10;
+constexpr double kForwardRetryUs = 1000000.0;
+
 // A metadata snapshot slower than this is reported (milliseconds).
 constexpr double kSlowSnapshotMs = 1000.0;
 
@@ -5154,6 +5159,21 @@ clio::run::TaskResume Runtime::MultiPutBlob(
                                         task->context_, /*flags=*/0, owner);
         CLIO_CO_AWAIT(fut);
         rc = fut->GetReturnCode();
+        // The owner died with this put in flight: re-resolve the owner
+        // (failover now names its successor) and write again -- idempotent.
+        for (int attempt = 0; attempt < kForwardRetries && IsNodeLostRc(rc);
+             ++attempt) {
+          HLOG(kWarning, "MultiPutBlob: owner of {}.{}/{} was lost with the "
+               "put in flight; resending (attempt {})", d.tag_id_.major_,
+               d.tag_id_.minor_, d.blob_name_, attempt + 1);
+          CLIO_CO_AWAIT(clio::run::yield(kForwardRetryUs));
+          fut = client_.AsyncPutBlob(
+              d.tag_id_, d.blob_name_, d.offset_, d.size_, src,
+              /*score=*/-1.0f, task->context_, /*flags=*/0,
+              HashBlobToContainer(d.tag_id_, d.blob_name_));
+          CLIO_CO_AWAIT(fut);
+          rc = fut->GetReturnCode();
+        }
         if (rc != 0) break;
       }
     }

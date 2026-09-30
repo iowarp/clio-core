@@ -1545,6 +1545,66 @@ class Client : public clio::run::ContainerClient {
     CLIO_IPC->FreeBuffer(buf);
   }
 
+  /**
+   * A write-behind batch is routed to its first blob's owner. When that node
+   * died with the batch in flight (before the cluster declared it dead, so
+   * failover could not yet route around it), the batch comes back with the
+   * runtime's lost-node code and its bytes were never stored. Resend it --
+   * a put is idempotent -- until failover names a live owner or the tries
+   * run out; the entry then carries the resent batch's outcome.
+   * @param entry a retiring deferred put whose future has completed
+   */
+  static void ResendIfNodeLost(DeferredPut *entry) {
+    constexpr int kTries = 10;
+    constexpr auto kWait = std::chrono::seconds(1);
+    for (int attempt = 0; attempt < kTries; ++attempt) {
+      auto *t = entry->fut_.get();
+      if (t == nullptr || !IsNodeLostRc(t->GetReturnCode())) return;
+      if (t->method_ == Method::kPutBlob) {
+        // A sieve page (one put per page).
+        auto old = entry->fut_.template Cast<PutBlobTask>();
+        PutBlobTask *ot = old.get();
+        if (!ot->segments_.empty()) return;  // vectored: not resent here
+        HLOG(kWarning, "write-behind put lost its owner node in flight; "
+             "resending (attempt {})", attempt + 1);
+        std::this_thread::sleep_for(kWait);
+        auto *ipc_manager = CLIO_CPU_IPC;
+        auto task = ipc_manager->NewTask<PutBlobTask>(
+            clio::run::CreateTaskId(), ot->pool_id_,
+            clio::run::PoolQuery::Dynamic(), ot->tag_id_,
+            ot->blob_name_.str(), ot->offset_, ot->size_, ot->blob_data_,
+            ot->score_, ot->context_, ot->flags_);
+        const bool owned = ot->IsDataOwner();
+        ot->ClearFlags(TASK_DATA_OWNER);
+        if (owned) task.get()->SetFlags(TASK_DATA_OWNER);
+        auto fut = CLIO_RUN_INLINE(task);
+        fut.Wait();
+        entry->fut_ = fut.template Cast<clio::run::Task>();
+        continue;
+      }
+      if (t->method_ != Method::kMultiPutBlob) return;
+      auto old = entry->fut_.template Cast<MultiPutBlobTask>();
+      MultiPutBlobTask *ot = old.get();
+      HLOG(kWarning, "write-behind batch lost its owner node in flight; "
+           "resending (attempt {})", attempt + 1);
+      std::this_thread::sleep_for(kWait);
+      auto *ipc_manager = CLIO_CPU_IPC;
+      auto task = ipc_manager->NewTask<MultiPutBlobTask>(
+          clio::run::CreateTaskId(), ot->pool_id_,
+          clio::run::PoolQuery::Local(), ot->route_tag_id_,
+          ot->route_blob_.str(), ot->data_, ot->data_len_, ot->descs_.str(),
+          ot->context_);
+      // The staging buffer now belongs to the resent batch: exactly one task
+      // may free it.
+      const bool owned = ot->IsDataOwner();
+      ot->ClearFlags(TASK_DATA_OWNER);
+      if (owned) task.get()->SetFlags(TASK_DATA_OWNER);
+      auto fut = CLIO_RUN_INLINE(task);
+      fut.Wait();
+      entry->fut_ = fut.template Cast<clio::run::Task>();
+    }
+  }
+
   static bool DeferAwaitOldest() {
     DeferRegistry &reg = DeferRegistry::Get();
     DeferredPut entry;
@@ -1586,6 +1646,7 @@ class Client : public clio::run::ContainerClient {
       fc->FlushDeferBatch();
     }
     entry.fut_.Wait();
+    ResendIfNodeLost(&entry);
     auto *t = entry.fut_.get();
     int err = 0;
     if (t == nullptr || t->GetReturnCode() != 0) {
@@ -1593,6 +1654,11 @@ class Client : public clio::run::ContainerClient {
       // A full store is ENOSPC (as on ext4); only other failures are EIO.
       err = (t != nullptr && PutRcIsNoSpace(t->GetReturnCode())) ? ENOSPC
                                                                  : EIO;
+      HLOG(kError, "write-behind batch failed (rc {}); latching errno {}",
+           t != nullptr ? static_cast<long long>(
+                              static_cast<clio::run::i32>(t->GetReturnCode()))
+                        : -1LL,
+           err);
     }
     clio::run::u64 bytes = 0;
     for (const auto &e : entry.ents_) bytes += e.size_;
@@ -1666,6 +1732,7 @@ class Client : public clio::run::ContainerClient {
         reg.fifo_.pop_front();
       }
       entry.fut_.Wait();  // already complete — returns immediately
+      ResendIfNodeLost(&entry);
       auto *t = entry.fut_.get();
       int err = 0;
       if (t == nullptr || t->GetReturnCode() != 0) {
@@ -1673,6 +1740,11 @@ class Client : public clio::run::ContainerClient {
         // A full store is ENOSPC (as on ext4); only other failures are EIO.
         err = (t != nullptr && PutRcIsNoSpace(t->GetReturnCode())) ? ENOSPC
                                                                    : EIO;
+        HLOG(kError, "write-behind batch failed (rc {}); latching errno {}",
+             t != nullptr ? static_cast<long long>(static_cast<clio::run::i32>(
+                                t->GetReturnCode()))
+                          : -1LL,
+             err);
       }
       clio::run::u64 bytes = 0;
       for (const auto &e : entry.ents_) bytes += e.size_;

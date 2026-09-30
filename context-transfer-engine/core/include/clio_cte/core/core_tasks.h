@@ -39,6 +39,7 @@
 #include <cassert>
 #include <cstring>
 
+#include <clio_runtime/ipc/ipc_run2run.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/autogen/core_methods.h>
 #include <clio_cte/core/core_config.h>
@@ -894,6 +895,18 @@ static constexpr clio::run::u32 kReplicaAbsentRc = 12;
 /** PutBlob could not place the bytes: every eligible tier is full (10 +
  *  ExtendBlob's out-of-space code). A filesystem reports it as ENOSPC. */
 static constexpr clio::run::u32 kPutNoSpaceRc = 13;
+/**
+ * Whether a task's return code means the node it ran on was lost with the
+ * task in flight (kRun2RunNetworkTimeoutRC): the
+ * task may or may not have run there, so an idempotent op should be resent
+ * once failover names a live owner.
+ * @param rc task return code
+ * @return true for a lost-node failure
+ */
+inline constexpr bool IsNodeLostRc(clio::run::u32 rc) {
+  return rc == static_cast<clio::run::u32>(clio::run::kRun2RunNetworkTimeoutRC);
+}
+
 /** The replication chimod reports a failed write-through (durable) copy as
  *  this offset + the core's PutBlob code. */
 static constexpr clio::run::u32 kReplicaPutRcBase = 30;

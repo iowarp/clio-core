@@ -120,6 +120,14 @@ clio::run::TaskResume Runtime::MirrorRange(TagId tag, std::string name,
   CLIO_TASK_BODY_END
 }
 
+namespace {
+/** Resends of a forwarded put whose owner died mid-flight. */
+constexpr int kForwardRetries = 10;
+/** Wait between those resends (us): the cluster needs a moment to mark the
+ *  node dead, after which failover routes to its successor. */
+constexpr double kForwardRetryUs = 1000000.0;
+}  // namespace
+
 clio::run::TaskResume Runtime::PutBlob(
     clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -195,6 +203,20 @@ clio::run::TaskResume Runtime::MultiPutBlob(
                                     batch.RecordSlice(d), -1.0f, ctx, 0u,
                                     clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(p);
+      // The owner died with this put in flight: re-resolve it (failover now
+      // names the successor) and write again -- a put is idempotent.
+      for (int attempt = 0; attempt < kForwardRetries &&
+                            clio::cte::core::IsNodeLostRc(p->GetReturnCode());
+           ++attempt) {
+        HLOG(kWarning, "replication: owner of {}.{}/{} was lost with the put "
+             "in flight; resending (attempt {})", desc.tag_id_.major_,
+             desc.tag_id_.minor_, desc.blob_name_, attempt + 1);
+        CLIO_CO_AWAIT(clio::run::yield(kForwardRetryUs));
+        p = Self()->AsyncPutBlob(desc.tag_id_, desc.blob_name_, desc.offset_,
+                                 desc.size_, batch.RecordSlice(d), -1.0f, ctx,
+                                 0u, clio::run::PoolQuery::Dynamic());
+        CLIO_CO_AWAIT(p);
+      }
       if (p->GetReturnCode() == 0) {
         task->num_ok_++;
       } else if (task->first_rc_ == 0) {

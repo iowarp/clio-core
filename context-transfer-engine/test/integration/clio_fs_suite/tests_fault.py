@@ -814,3 +814,65 @@ def t_truncate_during_failover(ctx):
   v = ctx.ok(n - 1 if victim != n - 1 else 0, 'verify_file', path=p,
              size=1 * MiB, seed=5)
   ctx.check(not v['mismatch'], f'kept prefix damaged: {v["mismatch"]}')
+
+
+
+@test('open_handle_survives_home_loss', 'fault', min_nodes=2,
+      redeploy_after=True, timeout=1800)
+def t_open_handle_home_loss(ctx):
+  """A process keeps a file open on one node while the file's home (which
+  holds the open handle's state and the file's size) is SIGKILLed. Through
+  the SAME descriptor it keeps writing, fsyncs, stats and reads after
+  failover, and closes it; once the home is back every node reads exactly
+  what was written, before and after the loss."""
+  n = len(ctx.hosts)
+  MiB = 1 << 20
+  p = ctx.p('held')
+  ctx.ok(0, 'write_file', path=p, size=4 * MiB, seed=0, fsync=True)
+  home = inode_home(ctx, 0, p)
+  victim = home if home is not None and home < n else n - 1
+  a = (victim + 1) % n
+  ctx.note(f'home node{victim}; descriptor on node{a}')
+  h = ctx.ok(a, 'open', path=p, flags='rw')
+  ctx.ok(a, 'fpwrite', h=h, off=0, length=MiB, seed=1)
+  ctx.ok(a, 'fsync', h=h)
+  vh = ctx.hosts[victim]
+  ctx.cl.kill_fuse(vh)
+  ctx.cl.kill_runtime(vh)
+  # One write and ONE fsync, never retried: a write-back error is reported
+  # to one fsync only (as on Linux), so a retried fsync would succeed on
+  # bytes that were lost.
+  t0 = time.time()
+  r = ctx.call(a, 'fpwrite', timeout=300, h=h, off=MiB, length=MiB, seed=1)
+  ctx.check(r['ok'], f'write through the open descriptor after the home '
+                     f'died: {r.get("err")}')
+  r = ctx.call(a, 'fsync', timeout=300, h=h)
+  ctx.metrics['write_fsync_after_loss_s'] = round(time.time() - t0, 1)
+  ctx.check(r['ok'], f'fsync through the open descriptor after the home '
+                     f'died: {r.get("err")}')
+  r = ctx.call(a, 'fstat', timeout=60, h=h)
+  ctx.check(r['ok'] and r['ret']['size'] == 4 * MiB,
+            f'fstat after the home died: {r.get("err") or r.get("ret")}')
+  for off, seed in ((0, 1), (MiB, 1), (2 * MiB, 0)):
+    r = ctx.call(a, 'fpread_verify', timeout=60, h=h, off=off, length=MiB,
+                 seed=seed)
+    ctx.check(r['ok'] and r['ret'] is None,
+              f'read at {off} through the open descriptor: '
+              f'{r.get("err") or r.get("ret")}')
+  r = ctx.call(a, 'close', timeout=60, h=h)
+  ctx.check(r['ok'], f'close after the home died: {r.get("err")}')
+  ctx.cl.start_runtime(vh, 'restart')
+  ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
+  time.sleep(3)
+  ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
+  ctx.cl.agents.pop(vh, None)
+  time.sleep(2)
+  for i in range(n):
+    g = ctx.ok(i, 'open', path=p, flags='r')
+    for off, seed in ((0, 1), (MiB, 1), (2 * MiB, 0), (3 * MiB, 0)):
+      mm = ctx.ok(i, 'fpread_verify', h=g, off=off, length=MiB, seed=seed)
+      ctx.check(mm is None, f'node{i} after the home returned, bytes at '
+                            f'{off}: {mm}')
+    st = ctx.ok(i, 'fstat', h=g)
+    ctx.check(st['size'] == 4 * MiB, f'node{i} size {st["size"]}')
+    ctx.ok(i, 'close', h=g)
