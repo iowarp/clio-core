@@ -152,6 +152,12 @@ bool ConfigManager::ClientInit() {
             "Warning: Failed to load configuration from {}, using defaults",
             config_file_path_);
     }
+  } else {
+    // No config file: still per-user (see LoadDefault). The member default
+    // /tmp/clio is shared by every user of the host, so whoever created it
+    // first owned it and every other user's runtime could not write its pool
+    // log there -- durable pools silently failed to come back on a start.
+    conf_dir_ = ctp::SystemInfo::GetMemfdDir();
   }
   ApplyEnvOverrides();
 
