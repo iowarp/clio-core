@@ -308,7 +308,7 @@ class FileSetWriter:
   """
 
   def __init__(self, dirpath, writer, nfiles, blocks_per_file, secs, seed,
-               blk=BLK, log_path=None):
+               blk=BLK, log_path=None, retry=False):
     self.dirpath = dirpath
     self.writer = writer
     self.nfiles = nfiles
@@ -317,6 +317,9 @@ class FileSetWriter:
     self.seed = seed
     self.blk = blk
     self.log_path = log_path
+    # retry: keep going after a failed round (a node was lost; the next
+    # round may succeed once its files fail over) instead of stopping.
+    self.retry = retry
 
   def run(self):
     """Write rounds until secs elapse (or an error); return the log."""
@@ -337,7 +340,10 @@ class FileSetWriter:
                      gen, fsync=True, blk=self.blk)
         except OSError as e:
           errors.append(f'{name} gen {gen}: {e}')
-          break
+          if not self.retry:
+            break
+          time.sleep(1.0)
+          continue
         durable[name] = gen
         started.pop(name, None)
         if logf:
@@ -349,4 +355,4 @@ class FileSetWriter:
       if logf:
         logf.close()
     return {'durable': durable, 'started': started, 'errors': errors[:20],
-            'rounds': gen}
+            'nerrors': len(errors), 'rounds': gen}

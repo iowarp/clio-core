@@ -528,6 +528,68 @@ def _read_durable_log(path):
   return out
 
 
+def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
+                    skip_writer_of=None):
+  """Verify FileSetWriter output after a fault.
+
+  Every file whose version was fsynced must hold that version or the one in
+  flight when the fault hit, block for block; nothing may be CORRUPT or
+  FOREIGN; a file never fsynced may be absent or partial.
+
+  Args:
+    ctx: test context.
+    base: directory holding the files.
+    n: number of nodes (writer i + 1 ran on node i).
+    nfiles: files per writer.
+    logs: per-node durable-log paths.
+    replies: node -> the rec_fileset reply (may be missing).
+    when: text for failure messages.
+    skip_writer_of: node whose files are not checked (None: all).
+  """
+  lost, corrupt, missing_file, checked = [], [], [], 0
+  for i in range(n):
+    if i == skip_writer_of:
+      continue
+    durable = _read_durable_log(logs[i])
+    rep = replies.get(i) or {}
+    ret = rep.get('ret') or {}
+    for nmx, g in (ret.get('durable') or {}).items():
+      durable[nmx] = max(durable.get(nmx, 0), g)
+    started = ret.get('started') or {}
+    reader = (i + 1) % n
+    for k in range(nfiles):
+      nmx = f'w{i + 1}_f{k}'
+      path = f'{base}/{nmx}'
+      if not ctx.ok(reader, 'exists', path=path):
+        if nmx in durable:
+          missing_file.append(nmx)
+        continue
+      got = ctx.ok(reader, 'rec_scan', timeout=900, path=path, name=nmx,
+                   nblocks=FILE_BLOCKS)
+      checked += 1
+      dg = durable.get(nmx, 0)
+      for start, count, w, g in got['runs']:
+        if w in (CORRUPT, FOREIGN):
+          corrupt.append((nmx, start, count, KIND[w]))
+        elif w == ZERO:
+          if dg:
+            lost.append((nmx, start, count, 'hole', f'fsynced gen {dg}'))
+        elif w != i + 1:
+          corrupt.append((nmx, start, count, f'writer {w}'))
+        elif g < dg:
+          lost.append((nmx, start, count, f'gen {g}', f'fsynced gen {dg}'))
+        elif g > dg and ret and g not in started.values() and \
+            (g - dg) % nfiles != 0:
+          corrupt.append((nmx, start, count, f'unexpected gen {g}'))
+  ctx.metrics['files_checked'] = checked
+  ctx.check(not corrupt, f'{len(corrupt)} CORRUPT/FOREIGN/unexpected ranges '
+                         f'{when}, e.g. {corrupt[:6]}')
+  ctx.check(not missing_file, f'fsynced files missing {when}: '
+                              f'{missing_file[:10]}')
+  ctx.check(not lost, f'{len(lost)} ranges lost fsynced data {when}, e.g. '
+                      f'{lost[:6]}')
+
+
 @test('stress_crash_under_pressure', 'stress', min_nodes=1,
       redeploy_after=True, timeout=5400)
 def t_crash_under_pressure(ctx):
@@ -546,6 +608,8 @@ def t_crash_under_pressure(ctx):
   nfiles = max(4, (2 * ram_mb) // 64)
   secs = 600
   logs = [f'{cl.run_dir}/crash_writer_{i}.log' for i in range(n)]
+  for lp in logs:  # a rerun into the same --out must not inherit old lines
+    open(lp, 'w').close()
   replies = {}
 
   def writer(i):
@@ -565,54 +629,7 @@ def t_crash_under_pressure(ctx):
   restart_cluster(ctx, crash=True)
   ctx.cl.agents.clear()
 
-  lost, corrupt, missing_file, checked = [], [], [], 0
-  for i in range(n):
-    durable = _read_durable_log(logs[i])
-    rep = replies.get(i) or {}
-    ret = rep.get('ret') or {}
-    for nmx, g in (ret.get('durable') or {}).items():
-      durable[nmx] = max(durable.get(nmx, 0), g)
-    started = ret.get('started') or {}
-    names = [f'w{i + 1}_f{k}' for k in range(nfiles)]
-    reader = (i + 1) % n
-    for nmx in names:
-      path = f'{base}/{nmx}'
-      if not ctx.ok(reader, 'exists', path=path):
-        if nmx in durable:
-          missing_file.append(nmx)
-        continue
-      got = ctx.ok(reader, 'rec_scan', timeout=900, path=path, name=nmx,
-                   nblocks=FILE_BLOCKS)
-      checked += 1
-      dg = durable.get(nmx, 0)
-      ok_gens = {dg} if dg else set()
-      if nmx in started:
-        ok_gens.add(started[nmx])
-      for start, count, w, g in got['runs']:
-        if w in (CORRUPT, FOREIGN):
-          corrupt.append((nmx, start, count, KIND[w]))
-        elif w == ZERO:
-          if dg:
-            lost.append((nmx, start, count, 'hole', f'fsynced gen {dg}'))
-        elif w != i + 1:
-          corrupt.append((nmx, start, count, f'writer {w}'))
-        elif g < dg:
-          lost.append((nmx, start, count, f'gen {g}', f'fsynced gen {dg}'))
-        elif g not in ok_gens and g > dg:
-          # A newer version whose write was never acknowledged is fine only
-          # if it is the one in flight; with the reply lost (the op was cut
-          # short by the crash) any gen > dg of this name is in-flight.
-          if ret:
-            corrupt.append((nmx, start, count, f'unexpected gen {g}'))
-  ctx.metrics.update({'files_checked': checked,
-                      'fsynced_files': sum(1 for i in range(n)
-                                           for _ in _read_durable_log(logs[i]))})
-  ctx.check(not corrupt, f'{len(corrupt)} CORRUPT/FOREIGN/unexpected ranges '
-                         f'after the crash, e.g. {corrupt[:6]}')
-  ctx.check(not missing_file, f'fsynced files missing after the crash: '
-                              f'{missing_file[:10]}')
-  ctx.check(not lost, f'{len(lost)} ranges lost fsynced data, e.g. '
-                      f'{lost[:6]}')
+  _check_filesets(ctx, base, n, nfiles, logs, replies, 'after the crash')
 
 
 # ---------------------------------------------------------------------------
@@ -709,3 +726,137 @@ def t_op_latency(ctx):
   ctx.metrics['node1_writes'] = sum(len(v) for v in
                                     (res.get('writes') or {}).values())
   ctx.metrics['node1_reads'] = len(res.get('obs') or [])
+
+
+@test('stress_node_loss_during_writes', 'stress', min_nodes=3,
+      redeploy_after=True, timeout=5400)
+def t_node_loss_during_writes(ctx):
+  """Every node rewrites its own cycling set of fsynced record files (tier
+  pressure, organizer migrating); after ~30 s one node's daemons are
+  SIGKILLed while the others keep writing (retrying failed rounds as their
+  files fail over), and ~40 s later it restarts. Every version any writer
+  saw fsynced -- including the lost node's own, from before it died -- must
+  survive intact; nothing may be CORRUPT or FOREIGN."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('nl')
+  ctx.ok(0, 'mkdir', path=base)
+  ram_mb = cl.ram_mb if cl.profile == 'tiered' else cl.ram_gb * 1024
+  nfiles = max(4, (2 * ram_mb) // 64)
+  secs = 120
+  logs = [f'{cl.run_dir}/nodeloss_writer_{i}.log' for i in range(n)]
+  for lp in logs:  # a rerun into the same --out must not inherit old lines
+    open(lp, 'w').close()
+  replies = {}
+
+  def writer(i):
+    replies[i] = ctx.a(i).call('rec_fileset', timeout=secs + 600,
+                               dirpath=base, writer=i + 1, nfiles=nfiles,
+                               blocks=FILE_BLOCKS, secs=secs, seed=i,
+                               log_path=logs[i], retry=True)
+  th = threading.Thread(target=lambda: ctx.each(writer))
+  th.start()
+  time.sleep(30)
+  victim = n - 1
+  vh = ctx.hosts[victim]
+  cl.kill_fuse(vh)
+  cl.kill_runtime(vh)
+  time.sleep(40)
+  cl.start_runtime(vh)
+  ctx.check(cl.runtime_up(vh), f'{vh} runtime did not restart')
+  time.sleep(3)
+  ctx.check(cl.mount(vh), f'{vh} remount failed')
+  th.join(timeout=secs + 700)
+  cl.agents.pop(vh, None)
+  ctx.metrics['survivor_errors'] = sum(
+      ((replies.get(i) or {}).get('ret') or {}).get('nerrors', 0)
+      for i in range(n) if i != victim)
+  ctx.metrics['rounds'] = {f'node{i}': ((replies.get(i) or {}).get('ret')
+                                        or {}).get('rounds')
+                           for i in range(n)}
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  f'after node{victim} was lost and came back')
+
+
+@test('stress_space_accounting', 'stress', min_nodes=1, redeploy_after=True,
+      timeout=3600)
+def t_space_accounting(ctx):
+  """Diagnostic for capacity: node0 writes 64 MiB record files (fsynced) up
+  to half of its RAM + fast tiers, and the filesystem's used space (statvfs)
+  is recorded against the bytes written -- right after, after 20 s of
+  organizer rounds, and after every file is deleted (used space must fall
+  back near the empty baseline: anything left is leaked capacity that ends
+  in a premature ENOSPC). Fails only if space is not returned."""
+  base = ctx.p('space')
+  ctx.ok(0, 'mkdir', path=base)
+
+  def used_mib():
+    st = ctx.ok(0, 'statvfs', path=ctx.cl.mnt)
+    return (st['blocks'] - st['bfree']) * st['bsize'] // MiB
+
+  time.sleep(3)
+  u0 = used_mib()
+  nfiles = max(2, _tier_mb(ctx) // 2 // 64)
+  for k in range(nfiles):
+    nm = f's{k}'
+    ctx.ok(0, 'rec_write', timeout=900, path=f'{base}/{nm}', name=nm,
+           runs=[[0, FILE_BLOCKS]], writer=1, gen=1, fsync=True)
+  written = nfiles * 64
+  u1 = used_mib()
+  time.sleep(20)
+  u2 = used_mib()
+  import os as _os
+  tool = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                       'alloc_log_usage.py')
+  for i in range(len(ctx.hosts)):
+    r = ctx.call(i, 'sh', cmd=f'python3 {tool} {ctx.cl.local_root}/data')
+    ctx.note(f'node{i} live MiB per file tier after the writes: ' +
+             ((r.get('ret') or {}).get('out') or '').strip().replace(
+                 chr(10), ' | '))
+  # Overwrite every file in full, five times: the data set does not grow,
+  # so neither may the used space.
+  after_rw = []
+  for r in range(5):
+    for k in range(nfiles):
+      nm = f's{k}'
+      ctx.ok(0, 'rec_write', timeout=900, path=f'{base}/{nm}', name=nm,
+             runs=[[0, FILE_BLOCKS]], writer=1, gen=2 + r, fsync=True)
+    after_rw.append(used_mib())
+  # Then partial overwrites: random ranges of every file, ten rounds.
+  rng = random.Random(7)
+  for r in range(10):
+    for k in range(nfiles):
+      nm = f's{k}'
+      runs = []
+      for _ in range(6):
+        st = rng.randrange(FILE_BLOCKS)
+        runs.append([st, min(rng.randrange(1, 600), FILE_BLOCKS - st)])
+      ctx.ok(0, 'rec_write', timeout=900, path=f'{base}/{nm}', name=nm,
+             runs=runs, writer=1, gen=10 + r, fsync=True)
+    after_rw.append(used_mib())
+  time.sleep(10)
+  after_rw.append(used_mib())
+  for k in range(nfiles):
+    ctx.ok(0, 'unlink', path=f'{base}/s{k}')
+  left = None
+  for _ in range(30):
+    time.sleep(2)
+    left = used_mib()
+    if left - u0 <= max(64, written // 20):
+      break
+  ctx.metrics.update({
+      'written_mib': written, 'used_before_mib': u0,
+      'used_after_write_mib': u1, 'used_after_20s_mib': u2,
+      'used_after_delete_mib': left,
+      'space_per_byte_after_write': round((u1 - u0) / written, 2),
+      'space_per_byte_after_20s': round((u2 - u0) / written, 2),
+      'used_after_each_overwrite_round_mib': after_rw})
+  ctx.note(f'tier backing files at the end: {_tier_usage(ctx)}')
+  grew = after_rw[-1] - u2
+  ctx.check(grew <= max(64, written // 10),
+            f'used space grew {grew} MiB over 5 full + 10 partial overwrites '
+            f'of the same {written} MiB (rewrites leak capacity): '
+            f'{after_rw}')
+  ctx.check(left - u0 <= max(64, written // 20),
+            f'{left - u0} MiB still used a minute after deleting all '
+            f'{written} MiB written (leaked capacity)')

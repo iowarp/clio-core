@@ -384,10 +384,10 @@ class Agent:
                                blk, sync=sync, truncater=truncater).run()
 
   def op_rec_fileset(self, dirpath, writer, nfiles, blocks, secs, seed,
-                     log_path=None, blk=sr.BLK):
+                     log_path=None, blk=sr.BLK, retry=False):
     """Rewrite a cycling set of record files, logging each fsynced one."""
     return sr.FileSetWriter(dirpath, writer, nfiles, blocks, secs, seed,
-                            blk, log_path).run()
+                            blk, log_path, retry).run()
 
   def op_sha256(self, path, chunk=1 << 20):
     h = hashlib.sha256()
