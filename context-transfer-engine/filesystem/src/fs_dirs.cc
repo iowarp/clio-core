@@ -56,6 +56,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <map>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -1149,26 +1150,66 @@ clio::run::TaskResume Runtime::CollectDir(
     clio::run::u64 dir, std::vector<std::pair<std::string, DirEntry>> *out,
     clio::run::u64 *newest, int &rc) {
   CLIO_TASK_BODY_BEGIN
-  out->clear();
-  *newest = 0;
-  std::vector<clio::run::u32> blocks;
-  CLIO_CO_AWAIT(DirBlocks(dir, &blocks, rc));
-  if (rc != 0) CLIO_CO_RETURN;
-  for (clio::run::u32 k : blocks) {
-    std::shared_ptr<BlockSlot> slot;
-    CLIO_CO_AWAIT(LoadBlock(dir, k, slot, rc));
+  // A listing is one snapshot of this node's copies of every block, taken
+  // under one lock. Every change reaches the copies before its operation is
+  // acknowledged, so at any instant they hold a prefix of each rename's
+  // steps (mark leaving -> insert new -> remove old): a file then shows under
+  // its old name, its new name, or both -- never neither -- and SnapshotDir
+  // drops the leaving duplicate. Reading block by block instead let a
+  // concurrent rename vanish from, or double in, a listing.
+  for (int attempt = 0;; ++attempt) {
+    out->clear();
+    *newest = 0;
+    std::vector<clio::run::u32> blocks;
+    CLIO_CO_AWAIT(DirBlocks(dir, &blocks, rc));
     if (rc != 0) CLIO_CO_RETURN;
-    std::lock_guard<std::mutex> g(ns_mu_);
+    std::vector<std::shared_ptr<BlockSlot>> slots;
+    for (clio::run::u32 k : blocks) {
+      std::shared_ptr<BlockSlot> slot;
+      CLIO_CO_AWAIT(LoadBlock(dir, k, slot, rc));
+      if (rc != 0) CLIO_CO_RETURN;
+      slots.push_back(std::move(slot));
+    }
+    if (SnapshotDir(dir, blocks, slots, out, newest) || attempt >= 8) break;
+    // A copy was dropped for a refetch while we loaded the others: again.
+    CLIO_CO_AWAIT(clio::run::yield(kLoadPollUs));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+bool Runtime::SnapshotDir(
+    clio::run::u64 dir, const std::vector<clio::run::u32> &blocks,
+    const std::vector<std::shared_ptr<BlockSlot>> &slots,
+    std::vector<std::pair<std::string, DirEntry>> *out,
+    clio::run::u64 *newest) {
+  std::lock_guard<std::mutex> g(ns_mu_);
+  // Every copy must still be the cached one: a copy that missed a change is
+  // dropped (and refetched) and no longer receives pushes.
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    auto it = blocks_.find(BlockKey{dir, blocks[i]});
+    if (it == blocks_.end() || it->second != slots[i]) return false;
+  }
+  std::map<std::string, DirEntry> names;  // a name split across blocks: once
+  std::unordered_set<clio::run::u64> live_ids;
+  for (const auto &slot : slots) {
     *newest = std::max(*newest, slot->blk_.mtime_);
     for (const auto &kv : slot->blk_.ents_) {
       if (kv.second.state_ == kDirEntPending) continue;
-      out->emplace_back(kv.first, kv.second);
+      names.emplace(kv.first, kv.second);
+      if (kv.second.state_ == kDirEntLive) live_ids.insert(kv.second.id_);
     }
   }
-  std::sort(out->begin(), out->end(),
-            [](const auto &a, const auto &b) { return a.first < b.first; });
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
+  for (const auto &kv : names) {
+    // A leaving name whose inode is already live under another name is a
+    // rename caught mid-way: list the file once, under its new name.
+    if (kv.second.state_ == kDirEntLeaving &&
+        live_ids.count(kv.second.id_) != 0) {
+      continue;
+    }
+    out->emplace_back(kv.first, kv.second);
+  }
+  return true;
 }
 
 clio::run::TaskResume Runtime::DirStat(clio::run::u64 dir, FsResp &resp) {

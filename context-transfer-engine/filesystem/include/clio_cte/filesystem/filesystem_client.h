@@ -409,6 +409,13 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+  /**
+   * Create every missing ancestor directory of `path` (mkdir -p of its
+   * parent). Existing directories are left alone.
+   * @param path a normalized clio-fs path
+   */
+  void MakeParents(const std::string &path);
+
   /** Fire-and-forget utimens (TASK_FIRE_AND_FORGET; see AsyncCloseDetached).
    *  Timestamp stamping is pure metadata with no caller-visible output — the
    *  kernel's writeback SETATTR issues one per dirtied file, and paying a
@@ -1009,6 +1016,15 @@ class Client : public clio::cte::core::Client {
   /** Bind the filesystem pool on first tracked use. */
   static bool EnsureInit();
 
+  /**
+   * open(2) for a `clio::`-prefixed path (the interception adapters). With
+   * O_CREAT, missing parent directories are created first: the path mirrors
+   * a host path whose directories exist on the host.
+   * @param raw_path path, optionally with the `clio::` prefix
+   * @param flags open flags
+   * @param mode creation mode
+   * @return a descriptor, or -1 with errno set
+   */
   int OpenFd(const std::string &raw_path, int flags, int mode);
   FsSsize ReadFd(int fd, void *buf, size_t count);
   FsSsize WriteFd(int fd, const void *buf, size_t count);

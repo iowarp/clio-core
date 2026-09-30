@@ -195,7 +195,7 @@ class Runtime : public clio::run::Container {
   // ---- Container virtuals (defined in autogen/filesystem_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
             clio::run::u32 container_id = 0) override;
-  /** Recovery start (`clio_run restart`): Create replays the metadata log. */
+  /** Recovering start (a plain `clio_run start`): Create replays the metadata log. */
   void Restart(const clio::run::PoolId &pool_id, const std::string &pool_name,
                clio::run::u32 container_id = 0) override;
   clio::run::TaskResume Run(clio::run::u32 method,
@@ -550,6 +550,22 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume DirBlocks(clio::run::u64 dir,
                                   std::vector<clio::run::u32> *out, int &rc);
+  /**
+   * Snapshot of a directory's listing from this node's block copies, under
+   * one lock (see CollectDir). Pending entries are hidden; a leaving entry
+   * whose inode is live under another name (a rename in progress) is too.
+   * @param dir directory id
+   * @param blocks the directory's block indices
+   * @param slots the loaded copy of each block, in the same order
+   * @param out receives (name, entry) pairs sorted by name
+   * @param newest receives the newest block mtime
+   * @return false if a copy was replaced meanwhile (the caller retries)
+   */
+  bool SnapshotDir(clio::run::u64 dir,
+                   const std::vector<clio::run::u32> &blocks,
+                   const std::vector<std::shared_ptr<BlockSlot>> &slots,
+                   std::vector<std::pair<std::string, DirEntry>> *out,
+                   clio::run::u64 *newest);
   /**
    * List a directory (every block, through the cache).
    * @param dir packed directory id
