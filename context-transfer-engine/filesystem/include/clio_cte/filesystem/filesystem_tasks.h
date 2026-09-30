@@ -277,25 +277,32 @@ struct MultiCreateTask : public clio::run::Task {
   IN clio::run::priv::string packed_;  // EncodeMultiCreate payload
   OUT clio::run::u32 num_ok_;
   OUT clio::run::u32 first_rc_;
+  /** Every entry that failed: (u32 index into the batch, u32 errno) pairs,
+   *  little-endian. The client owes each failure to that file's fsync or
+   *  close. */
+  OUT clio::run::priv::string failed_;
   MultiCreateTask()
-      : clio::run::Task(), packed_(CTP_MALLOC), num_ok_(0), first_rc_(0) {}
+      : clio::run::Task(), packed_(CTP_MALLOC), num_ok_(0), first_rc_(0),
+        failed_(CTP_MALLOC) {}
   explicit MultiCreateTask(const clio::run::TaskId &task_id,
                            const clio::run::PoolId &pool_id,
                            const clio::run::PoolQuery &pool_query,
                            const std::string &packed)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiCreate),
-        packed_(CTP_MALLOC, packed), num_ok_(0), first_rc_(0) {}
+        packed_(CTP_MALLOC, packed), num_ok_(0), first_rc_(0),
+        failed_(CTP_MALLOC) {}
   void Copy(const ctp::ipc::FullPtr<MultiCreateTask> &o) {
     // Base fields first (pool id, method, query, flags): a forwarded copy
     // without them reached SendIn with a null pool and crashed the node.
     clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     packed_ = o->packed_; num_ok_ = o->num_ok_; first_rc_ = o->first_rc_;
+    failed_ = o->failed_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(packed_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(num_ok_, first_rc_);
+    Task::SerializeOut(ar); ar(num_ok_, first_rc_, failed_);
   }
 };
 

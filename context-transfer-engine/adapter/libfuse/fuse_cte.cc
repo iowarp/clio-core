@@ -815,6 +815,57 @@ bool PendingCreateLookup(const std::string &path, PendingCreate *out) {
   return true;
 }
 
+// Creations a MultiCreate batch could not make (e.g. the parent vanished):
+// path -> errno. The open() that "created" such a file already returned, so
+// the failure is owed to that file's fsync/close, like a failed write-back.
+std::mutex g_create_err_mtx;
+std::unordered_map<std::string, int> g_create_errors;
+
+/**
+ * Record the entries of a MultiCreate batch that failed (the task's failed_
+ * list of (index, errno) pairs) against their paths.
+ * @param batch the batch as sent
+ * @param t the completed task (may be null)
+ */
+void RecordCreateFailures(
+    const std::vector<clio::cte::filesystem::MultiCreateEnt> &batch,
+    clio::cte::filesystem::MultiCreateTask *t) {
+  if (t == nullptr) return;
+  if (t->GetReturnCode() != 0) {
+    // The whole batch was refused (undecodable): every entry failed.
+    std::lock_guard<std::mutex> lk(g_create_err_mtx);
+    for (const auto &e : batch) g_create_errors[e.path_] = EIO;
+    HLOG(kError, "clio_cte_fuse: a batch of {} creates failed (rc {})",
+         batch.size(), t->GetReturnCode());
+    return;
+  }
+  const std::string failed = t->failed_.str();
+  clio::cte::filesystem::FsDec d(failed.data(), failed.size());
+  clio::run::u32 idx = 0, rc = 0;
+  std::lock_guard<std::mutex> lk(g_create_err_mtx);
+  while (d.U32(&idx) && d.U32(&rc)) {
+    if (idx >= batch.size()) continue;
+    const int err = (rc > 0 && rc < 4096) ? static_cast<int>(rc) : EIO;
+    g_create_errors[batch[idx].path_] = err;
+    HLOG(kError, "clio_cte_fuse: creating {} failed (errno {}); its "
+         "fsync/close will report it", batch[idx].path_, err);
+  }
+}
+
+/**
+ * Take (report once) a failed batched create of `path`.
+ * @param path the file's path
+ * @return a negative errno, or 0 when its creation did not fail
+ */
+int TakeCreateError(const std::string &path) {
+  std::lock_guard<std::mutex> lk(g_create_err_mtx);
+  auto it = g_create_errors.find(path);
+  if (it == g_create_errors.end()) return 0;
+  const int err = it->second;
+  g_create_errors.erase(it);
+  return -err;
+}
+
 // Ship every queued creation as one MultiCreateTask and WAIT for it, then
 // retire the pending entries (their mirror records now answer getattr).
 void FlushCreates() {
@@ -833,6 +884,7 @@ void FlushCreates() {
   auto t = CLIO_CFS_CLIENT->AsyncMultiCreate(
       clio::cte::filesystem::EncodeMultiCreate(batch));
   t.Wait();
+  RecordCreateFailures(batch, t.get());
   // Retire ONLY after the server owns the metadata: a getattr between
   // retirement and the flush landing would miss both sources. Retire is
   // TAG-MATCHED: if the same path was re-created while this batch flew,
@@ -2163,6 +2215,8 @@ static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
   }
   if (handle->fh == 0) {
     EnsureCreated(hp);
+    const int cerr = TakeCreateError(hp);
+    if (cerr != 0) return cerr;
   }
   const int aerr = FlushAppends(handle, hp);
   if (aerr != 0) return aerr;
@@ -2203,6 +2257,13 @@ int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
   const std::string p =
       handle ? HandlePath(handle, path) : std::string(path ? path : "");
   if (p.empty()) return 0;
+  if (handle != nullptr && handle->fh == 0) {
+    // A batched create (no server handle): its creation may have failed
+    // after open() returned. Surface it even for a file never written to.
+    EnsureCreated(p);
+    const int cerr = TakeCreateError(p);
+    if (cerr != 0) return cerr;
+  }
   if (handle != nullptr &&
       (MultiNode() || HiwaterFor(p) != 0 || handle->appended.load())) {
     // CLOSE-TO-OPEN: once close(2) returns, an open on ANY node -- or any

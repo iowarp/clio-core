@@ -600,13 +600,15 @@ clio::run::TaskResume Runtime::MultiCreate(
   // don't stop the batch; the first is reported.
   task->num_ok_ = 0;
   task->first_rc_ = 0;
+  std::string failed;  // (index, errno) pairs, see MultiCreateTask::failed_
   std::string packed = task->packed_.str();
   std::vector<MultiCreateEnt> ents;
   if (!DecodeMultiCreate(packed.data(), packed.size(), &ents)) {
     task->return_code_ = 1;
     CLIO_CO_RETURN;
   }
-  for (const auto &e : ents) {
+  for (clio::run::u32 idx = 0; idx < ents.size(); ++idx) {
+    const MultiCreateEnt &e = ents[idx];
     const std::string path = FsNormPath(e.path_);
     CLIO_FS_PARENT(path, pe, perc);
     FsResp er;
@@ -625,10 +627,14 @@ clio::run::TaskResume Runtime::MultiCreate(
     }
     if (er.rc_ != 0) {
       if (task->first_rc_ == 0) task->first_rc_ = er.rc_;
+      FsEnc enc(&failed);
+      enc.U32(idx);
+      enc.U32(er.rc_);
       continue;
     }
     task->num_ok_++;
   }
+  task->failed_ = clio::run::priv::string(CTP_MALLOC, failed);
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
