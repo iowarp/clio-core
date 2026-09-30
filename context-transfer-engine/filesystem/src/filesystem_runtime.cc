@@ -741,7 +741,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     CLIO_CO_AWAIT(p);
     if (p->GetReturnCode() != 0) {
       ok = false;
-      no_space = p->GetReturnCode() == clio::cte::core::kPutNoSpaceRc;
+      no_space = clio::cte::core::PutRcIsNoSpace(p->GetReturnCode());
       break;
     }
     done += to_write;

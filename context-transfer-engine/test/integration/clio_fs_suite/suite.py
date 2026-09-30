@@ -161,6 +161,7 @@ def load_tests():
   import tests_perf  # noqa: F401
   import tests_bdev  # noqa: F401
   import tests_dirs  # noqa: F401
+  import tests_capacity  # noqa: F401
 
 
 def slurm_hosts():

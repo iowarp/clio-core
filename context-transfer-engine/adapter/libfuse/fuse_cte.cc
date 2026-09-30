@@ -551,7 +551,9 @@ int DrainSievePages(const clio::cte::core::TagId &tag,
         clio::cte::core::Client::DeferKeyHash(tag, page));
     // Page latches hold store return codes: a full store is ENOSPC, as on
     // ext4, not the EIO every other failure becomes.
-    if (e == static_cast<int>(clio::cte::core::kPutNoSpaceRc)) e = ENOSPC;
+    if (e > 0 && clio::cte::core::PutRcIsNoSpace(static_cast<clio::run::u32>(e))) {
+      e = ENOSPC;
+    }
     if (e != 0 && first_err == 0) first_err = e;
   }
   return first_err;
@@ -2137,7 +2139,10 @@ static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
   if (werr != 0) {
     // A lost write must fail fsync/close. Latched codes are a mix of errno
     // values and store return codes, so only ENOSPC is passed through.
-    return werr == ENOSPC ? -ENOSPC : -EIO;
+    if (werr == ENOSPC) return -ENOSPC;
+    HLOG(kError, "clio_cte_fuse: write-back of {} failed (latched code {}); "
+         "reporting EIO", hp, werr);
+    return -EIO;
   }
   if (handle->fh == 0) {
     EnsureCreated(hp);
@@ -2456,7 +2461,13 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
       int rc = cte->AsyncPutBlobDefer(
           handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
           buf + done);
-      if (rc != 0) return -EIO;
+      if (rc != 0) {
+        // A full store is ENOSPC (as on ext4); anything else is EIO.
+        return (rc > 0 && clio::cte::core::PutRcIsNoSpace(
+                              static_cast<clio::run::u32>(rc)))
+                   ? -ENOSPC
+                   : -EIO;
+      }
       done += n;
     }
     DirtyRaise(handle->tag, static_cast<clio::run::u64>(offset) + size);

@@ -894,6 +894,18 @@ static constexpr clio::run::u32 kReplicaAbsentRc = 12;
 /** PutBlob could not place the bytes: every eligible tier is full (10 +
  *  ExtendBlob's out-of-space code). A filesystem reports it as ENOSPC. */
 static constexpr clio::run::u32 kPutNoSpaceRc = 13;
+/**
+ * Whether a PutBlob return code means the bytes did not fit: 11-13 are
+ * 10 + ExtendBlob's capacity codes (no target with space, no target able to
+ * hold the request, tier exhausted). A filesystem reports all three as
+ * ENOSPC. (Replica-protocol UPDATE_ONLY writes reuse 12 as
+ * kReplicaAbsentRc; this is for ordinary puts.)
+ * @param rc PutBlob return code
+ * @return true for an out-of-space failure
+ */
+inline constexpr bool PutRcIsNoSpace(clio::run::u32 rc) {
+  return rc >= 11 && rc <= kPutNoSpaceRc;
+}
 /** PutBlob with Context::kPutIfAbsent found the blob already there. */
 static constexpr clio::run::u32 kPutExistsRc = 60;
 /** PutBlob with Context::kPutIfVersion found a different version. */
