@@ -55,7 +55,8 @@ def victim_off_path(ctx, root):
 def build_dataset(ctx, tag, per_node=12):
   """Populate a mixed tree from every node; return the expected manifest.
 
-  The manifest maps relpath -> (kind, size, perm, seed/target) and is what
+  The manifest maps relpath -> (kind, size, perm, seed/target[, xattrs])
+  (xattrs: name -> hex value, checked by audit) and is what
   every node must see after the fault + recovery.
   """
   n = len(ctx.hosts)
@@ -83,8 +84,16 @@ def build_dataset(ctx, tag, per_node=12):
       local[rel] = ('f', size, mode, seed)
     ctx.ok(i, 'symlink', target='f0', path=f'{d}/link_to_f0')
     local[f'node{i}/link_to_f0'] = ('l', 'f0')
-    ctx.ok(i, 'setxattr', path=f'{d}/sub', name='user.tag',
-           value_hex=f'{tag}{i}'.encode().hex())
+    xv = f'{tag}{i}'.encode().hex()
+    ctx.ok(i, 'setxattr', path=f'{d}/sub', name='user.tag', value_hex=xv)
+    local[f'node{i}/sub'] = ('d', {'user.tag': xv})
+    # A file's xattr too (the manifest's optional last field: name -> hex).
+    frel = next((k for k in sorted(local) if local[k][0] == 'f'), None)
+    if frel is not None:
+      fv = f'file-{tag}{i}'.encode().hex()
+      ctx.ok(i, 'setxattr', path=f'{root}/{frel}', name='user.kind',
+             value_hex=fv)
+      local[frel] = local[frel] + ({'user.kind': fv},)
     return local
   for local in ctx.each(fill):
     exp.update(local)
@@ -140,6 +149,15 @@ def audit(ctx, i, root, exp, deadline=OP_DEADLINE, subset=None):
           bad.append((rel, 'HANG'))
         elif not r['ok'] or r['ret'] != e[1]:
           bad.append((rel, r.get('err') or r.get('ret')))
+      want_x = e[-1] if isinstance(e[-1], dict) else {}
+      for name, val in want_x.items():
+        r = ctx.a(i).call('getxattr', timeout=deadline, path=p, name=name)
+        if r.get('hang'):
+          hangs += 1
+          bad.append((rel, 'HANG'))
+        elif not r['ok'] or r['ret'] != val:
+          bad.append((rel, f'xattr {name}: {r.get("err") or r.get("ret")}, '
+                           f'want {val}'))
     except Exception as ex:  # pylint: disable=broad-except
       bad.append((rel, repr(ex)))
   return bad, hangs
