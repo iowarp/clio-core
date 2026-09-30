@@ -75,6 +75,8 @@ inline clio::run::u64 NowNs() { return clio::cte::core::GetWallTimeNs(); }
 constexpr double kCommitPollUs = 10.0;
 /** Wait between checks while another task loads the same block (us). */
 constexpr double kLoadPollUs = 20.0;
+/** A block load, wait or commit slower than this is reported (seconds). */
+constexpr double kSlowBlockOpS = 10.0;
 /** How long a home keeps retrying a push to a live holder (s). */
 constexpr double kPushGiveUpS = 60.0;
 
@@ -218,11 +220,14 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   out.reset();
+  auto wait_t0 = std::chrono::steady_clock::now();
+  double next_report_s = kSlowBlockOpS;
   for (int attempt = 0;; ++attempt) {
     const BlockKey key{dir, k};
     const clio::run::u32 home = BlockHome(dir, k);
     const bool mine = home == container_id_;
     bool busy = false;
+    bool busy_commit = false;
     {
       std::lock_guard<std::mutex> g(ns_mu_);
       auto it = blocks_.find(key);
@@ -233,7 +238,7 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
           CLIO_CO_RETURN;
         }
         // Its home moved (failover or return): this copy is not current.
-        if (s.committing_) busy = true;
+        if (s.committing_) busy = busy_commit = true;
         else blocks_.erase(it);
       }
       if (!busy) {
@@ -242,9 +247,19 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
       }
     }
     if (busy) {
+      const double waited = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - wait_t0).count();
+      if (waited > next_report_s) {
+        HLOG(kWarning, "filesystem: waiting {:.0f} s for directory block "
+             "{}/{} (home {}, mine {}): {}", waited, dir, k, home, mine,
+             busy_commit ? "a moved copy is still committing"
+                         : "another task is loading it");
+        next_report_s += kSlowBlockOpS;
+      }
       CLIO_CO_AWAIT(clio::run::yield(kLoadPollUs));
       continue;
     }
+    const auto load_t0 = std::chrono::steady_clock::now();
     auto slot = std::make_shared<BlockSlot>();
     int lrc = 0;
     if (mine) {
@@ -281,6 +296,15 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
         lrc = EIO;
       }
       slot->home_id_ = home;
+    }
+    {
+      const double took = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - load_t0).count();
+      if (took > kSlowBlockOpS) {
+        HLOG(kWarning, "filesystem: loading directory block {}/{} from {} "
+             "took {:.1f} s (rc {})", dir, k, mine ? "its blob" : "its home",
+             took, lrc);
+      }
     }
     {
       std::lock_guard<std::mutex> g(ns_mu_);
@@ -501,11 +525,21 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
       continue;
     }
     int wrc = 0;
+    const auto commit_t0 = std::chrono::steady_clock::now();
     if (!image.empty()) CLIO_CO_AWAIT(WriteBlockBlob(dir, k, image, wrc));
     std::vector<clio::run::u32> gone;
     if (!deltas.empty() && !holders.empty()) {
       const std::string enc = EncodeDirDeltas(deltas);
       CLIO_CO_AWAIT(PushDeltas(holders, enc, &gone));
+    }
+    {
+      const double took = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - commit_t0).count();
+      if (took > kSlowBlockOpS) {
+        HLOG(kWarning, "filesystem: committing directory block {}/{} took "
+             "{:.1f} s ({} holders{})", dir, k, took, holders.size(),
+             resync ? ", resync" : "");
+      }
     }
     {
       std::lock_guard<std::mutex> g(ns_mu_);
