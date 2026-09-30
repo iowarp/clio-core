@@ -342,6 +342,174 @@ def t_shared_concurrent(ctx):
                            f'{final_bad[:5]}')
 
 
+def _node_of(writer):
+  """Node index of a shared-stress writer id (writer_base = 10 * i + 1)."""
+  return (writer - 1) // 10
+
+
+def _buffered_problem(ob, node, by_block):
+  """Check one read of the buffered (no fsync) shared stress; None if ok.
+
+  Writes from the reader's own node are visible once write(2) returned,
+  so a same-node version may not be read after a newer same-node write was
+  acked, nor a hole after one. A version from another node may be read at
+  any time: without fsync its bytes can land later than this node's own
+  write (close-to-open), so it is never "older" in a checkable sense.
+  """
+  b, w, g, t_open, t_done = ob
+  writes = by_block.get(b, [])
+  if w in (CORRUPT, FOREIGN):
+    return f'block {b}: read {KIND[w]} data'
+  same = [x for x in writes if _node_of(x[0]) == node and x[3] is not None]
+  if w == ZERO:
+    if any(x[3] < t_open for x in same):
+      return f'block {b}: read a hole after this node wrote it'
+    return None
+  mine = [x for x in writes if x[0] == w and x[1] == g]
+  if not mine:
+    return f'block {b}: read ({w},{g}) which was never written there'
+  _, _, ti, ta = mine[0]
+  if ti > t_done + SKEW_S:
+    return f'block {b}: read ({w},{g}) before it was written'
+  if _node_of(w) != node:
+    return None
+  for x in same:
+    newer = x[2] > (ta if ta is not None else ti)
+    if newer and x[3] < t_open:
+      return (f'block {b}: read ({w},{g}) after this node wrote '
+              f'({x[0]},{x[1]}) over it')
+  return None
+
+
+def _buffered_candidates(writes):
+  """Final versions allowed without fsync ordering between nodes: every
+  node's last write to the block (a node's own writes stay ordered)."""
+  if not writes:
+    return {(ZERO, 0)}
+  out = set()
+  for w, g, ti, ta in writes:
+    done = ta if ta is not None else ti
+    node = _node_of(w)
+    if not any(_node_of(x[0]) == node and x[2] > done for x in writes):
+      out.add((w, g))
+  return out
+
+
+def _truncate_candidates(writes, truncs, b):
+  """Final versions allowed with a racing truncater: the non-superseded
+  writes, plus a hole if a truncate that cut block b ran after the start
+  of the block's last write."""
+  cand = _final_candidates(writes) if writes else set()
+  last_issue = max((x[2] for x in writes), default=None)
+  cut_after = any(nb <= b and (last_issue is None or
+                               t_done >= last_issue - SKEW_S)
+                  for nb, _, t_done in truncs)
+  if not writes or cut_after:
+    cand.add((ZERO, 0))
+  return cand
+
+
+def _shared_run(ctx, tag, secs, sync, truncater):
+  """Run the shared-file stress on every node; return (results, by_block,
+  final per-node block lists, nb)."""
+  p = ctx.p(tag)
+  nb = 512
+  ctx.ok(0, 'write_file', path=p, size=0, seed=0)
+  ctx.ok(0, 'truncate', path=p, size=nb * sr.BLK)
+
+  def run(i):
+    return ctx.ok(i, 'rec_shared_stress', timeout=secs + 600, path=p,
+                  name=tag, nblocks=nb, writer_base=10 * i + 1, writers=2,
+                  readers=2, secs=secs, seed=i, sync=sync,
+                  truncater=truncater and i == 0)
+  results = ctx.each(run)
+  time.sleep(2)
+  scans = ctx.all_nodes('rec_scan', timeout=900, path=p, name=tag,
+                        nblocks=nb)
+  finals = [_expand(s['ret']['runs'], nb) for s in scans]
+  return results, _index_writes(results), finals, nb
+
+
+@test('stress_shared_file_buffered', 'stress', min_nodes=2,
+      redeploy_after=True, timeout=3600)
+def t_shared_buffered(ctx):
+  """Like stress_shared_file_concurrent but writers never fsync until the
+  end (the write-behind path under contention). A reader on the writer's
+  node must see each write once write(2) returned; other nodes may read any
+  valid version until the final fsync; afterwards all nodes agree and each
+  block holds some node's last write to it. Never CORRUPT/FOREIGN."""
+  results, by_block, finals, nb = _shared_run(ctx, 'shbuf', 90, False,
+                                               False)
+  problems = []
+  for i, r in enumerate(results):
+    for ob in r['obs']:
+      pr = _buffered_problem(ob, i, by_block)
+      if pr:
+        problems.append(pr)
+  diverge, final_bad = [], []
+  for b in range(nb):
+    vals = {f[b] for f in finals}
+    if len(vals) > 1:
+      diverge.append((b, sorted(vals)))
+    cand = _buffered_candidates(by_block.get(b, []))
+    final_bad += [(b, KIND.get(v[0], v)) for v in vals if v not in cand]
+  errs = [e for r in results for e in r['errors']]
+  ctx.metrics.update({
+      'writes': sum(len(v) for v in by_block.values()),
+      'reads_checked': sum(len(r['obs']) for r in results),
+      'bad_reads': len(problems), 'final_divergent_blocks': len(diverge),
+      'final_bad_blocks': len(final_bad)})
+  ctx.check(not errs, f'I/O errors: {errs[:5]}')
+  ctx.check(not problems, f'{len(problems)} wrong reads, e.g. '
+                          f'{problems[:6]}')
+  ctx.check(not diverge, f'{len(diverge)} blocks differ between nodes '
+                         f'after the final fsync, e.g. {diverge[:5]}')
+  ctx.check(not final_bad, f'{len(final_bad)} blocks lost a node\'s last '
+                           f'write, e.g. {final_bad[:5]}')
+
+
+@test('stress_shared_file_truncate_race', 'stress', min_nodes=2,
+      redeploy_after=True, timeout=3600)
+def t_shared_truncate_race(ctx):
+  """Overwriters (fsync each) and readers on every node while node0 keeps
+  shrinking and regrowing the shared file. No read or final block may be
+  CORRUPT or FOREIGN; a version may only vanish (read as a hole) if a
+  truncate cut its block after the last write to it began; an older
+  version must never come back after a newer one or a truncate."""
+  results, by_block, finals, nb = _shared_run(ctx, 'shtr', 90, True, True)
+  truncs = [t for r in results for t in r.get('truncs', [])]
+  bad_reads = []
+  for r in results:
+    for ob in r['obs']:
+      if ob[1] in (CORRUPT, FOREIGN):
+        bad_reads.append(f'block {ob[0]}: {KIND[ob[1]]}')
+      elif ob[1] != ZERO and not any(x[0] == ob[1] and x[1] == ob[2]
+                                     for x in by_block.get(ob[0], [])):
+        bad_reads.append(f'block {ob[0]}: ({ob[1]},{ob[2]}) never written')
+  diverge, final_bad = [], []
+  for b in range(nb):
+    vals = {f[b] for f in finals}
+    if len(vals) > 1:
+      diverge.append((b, sorted(vals)))
+    cand = _truncate_candidates(by_block.get(b, []), truncs, b)
+    final_bad += [(b, KIND.get(v[0], v)) for v in vals if v not in cand]
+  errs = [e for r in results for e in r['errors']]
+  ctx.metrics.update({'writes': sum(len(v) for v in by_block.values()),
+                      'truncates': len(truncs),
+                      'reads_checked': sum(len(r['obs']) for r in results),
+                      'bad_reads': len(bad_reads),
+                      'final_divergent_blocks': len(diverge),
+                      'final_bad_blocks': len(final_bad)})
+  ctx.check(not errs, f'I/O errors: {errs[:5]}')
+  ctx.check(not bad_reads, f'{len(bad_reads)} bad reads, e.g. '
+                           f'{bad_reads[:6]}')
+  ctx.check(not diverge, f'{len(diverge)} blocks differ between nodes, '
+                         f'e.g. {diverge[:5]}')
+  ctx.check(not final_bad, f'{len(final_bad)} blocks hold a version that '
+                           f'should be gone (or lost one), e.g. '
+                           f'{final_bad[:5]}')
+
+
 # ---------------------------------------------------------------------------
 # 3. Crash every daemon while the tiers are full and data is moving
 # ---------------------------------------------------------------------------

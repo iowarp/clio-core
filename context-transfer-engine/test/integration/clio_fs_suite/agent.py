@@ -376,11 +376,12 @@ class Agent:
     return sr.scan(path, sr.file_id_of(name), nblocks, blk)
 
   def op_rec_shared_stress(self, path, name, nblocks, writer_base, writers,
-                           readers, secs, seed, blk=sr.BLK):
+                           readers, secs, seed, blk=sr.BLK, sync=True,
+                           truncater=False):
     """Concurrent overwriters + readers on one shared record file."""
     return sr.SharedFileStress(path, sr.file_id_of(name), nblocks,
                                writer_base, writers, readers, secs, seed,
-                               blk).run()
+                               blk, sync=sync, truncater=truncater).run()
 
   def op_rec_fileset(self, dirpath, writer, nfiles, blocks, secs, seed,
                      log_path=None, blk=sr.BLK):

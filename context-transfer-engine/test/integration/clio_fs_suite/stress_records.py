@@ -182,7 +182,7 @@ class SharedFileStress:
   """
 
   def __init__(self, path, file_id, nblocks, writer_base, writers, readers,
-               secs, seed, blk=BLK, max_obs=40000):
+               secs, seed, blk=BLK, max_obs=40000, sync=True, truncater=False):
     self.path = path
     self.file_id = file_id
     self.nblocks = nblocks
@@ -193,6 +193,12 @@ class SharedFileStress:
     self.seed = seed
     self.blk = blk
     self.max_obs = max_obs
+    # sync=False: no fsync after a write -- the version is visible on this
+    # node once write(2) returns, elsewhere only after the final fsync.
+    self.sync = sync
+    # truncater: one extra thread shrinking/regrowing the file at random.
+    self.truncater = truncater
+    self.truncs = []    # [new_size_blocks, t_issue, t_done]
     self.writes = {}   # writer id -> [[block, gen, t_issue, t_ack], ...]
     self.inflight = {}  # writer id -> [block, gen, t_issue] or None
     self.obs = []
@@ -217,7 +223,8 @@ class SharedFileStress:
         try:
           if os.pwrite(fd, rec, b * self.blk) != self.blk:
             raise OSError(5, 'short write')
-          os.fsync(fd)
+          if self.sync:
+            os.fsync(fd)
         except OSError as e:
           with self.lock:
             self.errors.append(f'writer {wid} block {b} gen {gen}: {e}')
@@ -226,8 +233,28 @@ class SharedFileStress:
           break
         log.append([b, gen, t0, _now()])
         self.inflight[wid] = None
+      if not self.sync:
+        os.fsync(fd)  # publish everything before the final comparison
     finally:
       os.close(fd)
+
+  def _truncator(self):
+    rng = random.Random(f'{self.seed}:t{self.writer_base}')
+    t_end = _now() + self.secs
+    while _now() < t_end:
+      nb = rng.randrange(self.nblocks // 2, self.nblocks + 1)
+      t0 = _now()
+      try:
+        os.truncate(self.path, nb * self.blk)
+      except OSError as e:
+        with self.lock:
+          self.errors.append(f'truncate to {nb}: {e}')
+        continue
+      self.truncs.append([nb, t0, _now()])
+      time.sleep(rng.uniform(0.05, 0.5))
+    # End at full size so every block is addressable for the final scan.
+    os.truncate(self.path, self.nblocks * self.blk)
+    self.truncs.append([self.nblocks, _now(), _now()])
 
   def _reader(self, k):
     rng = random.Random(f'{self.seed}:r{self.writer_base}:{k}')
@@ -245,7 +272,10 @@ class SharedFileStress:
         with self.lock:
           self.errors.append(f'reader block {b}: {e}')
         continue
-      w, g = classify(data, self.file_id, b, self.blk)
+      if not data:
+        w, g = ZERO, 0  # past EOF (a racing truncate): absent, not corrupt
+      else:
+        w, g = classify(data, self.file_id, b, self.blk)
       with self.lock:
         if len(self.obs) < self.max_obs or w < 0 and w != ZERO:
           self.obs.append([b, w, g, t0, _now()])
@@ -256,6 +286,8 @@ class SharedFileStress:
           for k in range(self.nwriters)]
     ts += [threading.Thread(target=self._reader, args=(k,))
            for k in range(self.nreaders)]
+    if self.truncater:
+      ts.append(threading.Thread(target=self._truncator))
     for t in ts:
       t.start()
     for t in ts:
@@ -263,7 +295,7 @@ class SharedFileStress:
     return {'writes': {str(k): v for k, v in self.writes.items()},
             'inflight': {str(k): v for k, v in self.inflight.items() if v},
             'obs': self.obs, 'errors': self.errors[:50],
-            'nerrors': len(self.errors)}
+            'nerrors': len(self.errors), 'truncs': self.truncs}
 
 
 class FileSetWriter:
