@@ -165,8 +165,14 @@ clio::run::u64 Runtime::ApplySizeOpLocked(const clio::cte::core::TagId &tag,
 clio::run::TaskResume Runtime::SizeOp(clio::run::shared_ptr<SizeOpTask> &task) {
   CLIO_TASK_BODY_BEGIN
   const auto op = static_cast<StreamSizeOp>(task->op_);
-  if (op > StreamSizeOp::kDrop) {
+  if (op > StreamSizeOp::kSync) {
     task->return_code_ = EINVAL;
+    CLIO_CO_RETURN;
+  }
+  if (op == StreamSizeOp::kSync) {
+    // Sizes are logged with write(2) only; an fsync of a file makes every
+    // size this home recorded survive power loss.
+    task->return_code_ = log_.Sync() ? 0u : static_cast<clio::run::u32>(EIO);
     CLIO_CO_RETURN;
   }
   for (;;) {

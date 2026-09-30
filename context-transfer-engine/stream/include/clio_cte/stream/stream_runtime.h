@@ -314,6 +314,9 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume RecoverStaged();
   /** Restart: finish plans that were in flight at the crash. */
   clio::run::TaskResume FinishOpenPlans();
+  /** fsync the size log if kLogSyncPeriodMs passed and it has new records
+   *  (called from the Sequence tick). */
+  void SyncLogPeriodically();
 
   StreamConfig config_;
   clio::cte::core::Client cte_;      ///< pages
@@ -339,6 +342,11 @@ class Runtime : public clio::run::Container {
   std::unordered_map<clio::run::u64, StreamPlan> open_plans_;
   clio::run::u64 next_plan_id_ = 1;
   clio::cte::core::RecordLog log_;
+  /** Unforced size-log records are fsynced at least this often (ms), so a
+   *  power loss loses at most this much of them (like ext4's commit). */
+  static constexpr int kLogSyncPeriodMs = 5000;
+  std::chrono::steady_clock::time_point last_log_sync_ =
+      std::chrono::steady_clock::now();
 
   // origin side, guarded by q_mu_
   std::mutex q_mu_;

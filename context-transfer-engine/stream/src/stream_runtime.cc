@@ -275,6 +275,15 @@ clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {
   CLIO_TASK_BODY_END
 }
 
+void Runtime::SyncLogPeriodically() {
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_log_sync_ < std::chrono::milliseconds(kLogSyncPeriodMs)) {
+    return;
+  }
+  last_log_sync_ = now;
+  if (log_.Unsynced()) log_.Sync();
+}
+
 clio::run::TaskResume Runtime::Sequence(
     clio::run::shared_ptr<SequenceTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -289,6 +298,7 @@ clio::run::TaskResume Runtime::Sequence(
     }
     if (finish) CLIO_CO_AWAIT(FinishOpenPlans());
   }
+  SyncLogPeriodically();
   const clio::run::u64 now = clio::cte::core::GetWallTimeNs();
   std::vector<PendingAppend> ready;
   {

@@ -113,6 +113,10 @@ using namespace clio::cae::fuse;
 // are synchronous from FUSE's perspective (the client Waits on each op), so
 // there is no per-fd pending-write queue here anymore.
 
+// Defined below, outside the anonymous namespace; used by fsync's size step.
+static clio::cte::stream::Client &StreamClient();
+static clio::run::u64 PackTag(const clio::cte::core::TagId &tag);
+
 namespace {
 /** Per-open-file state: the chimod handle + the path it was opened on. */
 struct CfsHandle {
@@ -365,6 +369,34 @@ static clio::cte::core::TagId DirTagOf(const std::string &dir) {
 }
 
 /**
+ * fsync(2)'s size step: the file's logical size lives in its stream home's
+ * size log, which records with write(2) only; fsync that log.
+ * @param tag the file's tag (null, or an id without a home: nothing to do)
+ * @return 0 or -EIO
+ */
+static int SyncFileSize(const clio::cte::core::TagId &tag) {
+  if (tag.IsNull()) return 0;
+  const clio::run::u64 packed = PackTag(tag);
+  if (!clio::cte::filesystem::FsIdHasHome(packed)) return 0;
+  auto f = StreamClient().AsyncSizeOp(
+      tag, clio::cte::filesystem::FsIdHome(packed),
+      clio::cte::stream::StreamSizeOp::kSync);
+  f.Wait();
+  const clio::run::u32 rc = f->GetReturnCode();
+  if (rc == 0) return 0;
+  if (clio::cte::core::IsNodeLostRc(rc)) {
+    // The home died: a size it logged is in its log (replayed when it
+    // restarts); sizes set since then are logged by its successor.
+    HLOG(kWarning, "clio_cte_fuse: fsync of the size of {}.{}: its home is "
+         "down", tag.major_, tag.minor_);
+    return 0;
+  }
+  HLOG(kError, "clio_cte_fuse: fsync of the size of {}.{} failed (rc {})",
+       tag.major_, tag.minor_, rc);
+  return -EIO;
+}
+
+/**
  * fsync(2)'s durability step: make the file's blobs (pages and its inode
  * record) durable on a persistent tier, then the directory blocks naming it
  * (in its parent directory's tag), so the bytes, the size and the name all
@@ -378,6 +410,8 @@ static int SyncDurable(const clio::cte::core::TagId &tag,
   int rc = SyncOneTag(tag);
   if (rc != 0) return rc;
   if (g_fsync_deferred.load(std::memory_order_relaxed) == 1) return 0;
+  rc = SyncFileSize(tag);
+  if (rc != 0) return rc;
   return SyncOneTag(DirTagOf(dir));
 }
 

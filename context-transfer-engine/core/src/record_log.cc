@@ -161,17 +161,25 @@ void RecordLog::Append(clio::run::u32 type, const std::string &payload) {
     return;
   }
   since_compact_ += rec.size();
+  unsynced_ = true;
 }
 
 bool RecordLog::Sync() {
   std::lock_guard<std::mutex> g(mu_);
   if (fd_ < 0) return true;
+  if (!unsynced_) return true;
   if (::fsync(fd_) != 0) {
     HLOG(kError, "record log: fsync of {} failed: {}", path_,
          std::strerror(errno));
     return false;
   }
+  unsynced_ = false;
   return true;
+}
+
+bool RecordLog::Unsynced() {
+  std::lock_guard<std::mutex> g(mu_);
+  return fd_ >= 0 && unsynced_;
 }
 
 bool RecordLog::Rewrite(
@@ -189,11 +197,26 @@ bool RecordLog::Rewrite(
     ::unlink(tmp.c_str());
     return false;
   }
+  // The rename is durable only once the directory is: until then a power
+  // loss brings back the old file, and records appended to the new one
+  // (fsynced or not) are gone with it.
+  const size_t slash = path_.find_last_of('/');
+  const std::string dir = slash == std::string::npos ? "." :
+                          slash == 0 ? "/" : path_.substr(0, slash);
+  const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dfd >= 0) {
+    if (::fsync(dfd) != 0) {
+      HLOG(kError, "record log: fsync of directory {} failed: {}", dir,
+           std::strerror(errno));
+    }
+    ::close(dfd);
+  }
   int nfd = ::open(path_.c_str(), O_RDWR | O_APPEND | O_CLOEXEC, 0600);
   if (nfd < 0) return false;
   if (fd_ >= 0) ::close(fd_);
   fd_ = nfd;
   since_compact_ = 0;
+  unsynced_ = false;  // the new file was fsynced before the rename
   return true;
 }
 
