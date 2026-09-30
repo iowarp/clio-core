@@ -53,7 +53,8 @@ constexpr clio::run::u32 kInodeRecMagic = 0x31494643u;  // "CFI1"
 constexpr double kStoreBusyPollUs = 20.0;
 }  // namespace
 
-std::string Runtime::EncInodeRec(const FileInfo &fi, clio::run::u64 size) {
+std::string Runtime::EncInodeRec(const FileInfo &fi, clio::run::u64 size,
+                                 clio::run::u32 writer) {
   std::string p;
   FsEnc e(&p);
   e.U32(kInodeRecMagic);
@@ -68,11 +69,13 @@ std::string Runtime::EncInodeRec(const FileInfo &fi, clio::run::u64 size) {
   e.U64(fi.ctime_);
   e.U32((fi.orphan_ ? 1u : 0u) | (fi.has_xattr_ ? 2u : 0u));
   e.Str(fi.symlink_);
+  // Appended last so older decoders (and older records) still line up.
+  e.U32(writer);
   return p;
 }
 
 bool Runtime::DecInodeRec(const std::string &rec, FileInfo *fi,
-                          clio::run::u64 *size) {
+                          clio::run::u64 *size, clio::run::u32 *writer) {
   FsDec d(rec.data(), rec.size());
   clio::run::u32 magic = 0, flags = 0;
   if (!d.U32(&magic) || magic != kInodeRecMagic || !d.U32(&fi->type_) ||
@@ -84,6 +87,7 @@ bool Runtime::DecInodeRec(const std::string &rec, FileInfo *fi,
   }
   fi->orphan_ = (flags & 1u) != 0;
   fi->has_xattr_ = (flags & 2u) != 0;
+  if (!d.U32(writer)) *writer = kNoRecWriter;
   return true;
 }
 
@@ -153,7 +157,7 @@ clio::run::TaskResume Runtime::FlushInodes() {
           inode_storing_.insert(packed);
           InodeWork w;
           w.packed = packed;
-          w.rec = EncInodeRec(fi, FileSize(fi));
+          w.rec = EncInodeRec(fi, FileSize(fi), container_id_);
           FsAttr a;
           InodeAttrLocked(fi, &a);
           w.push = EncInodePush(a, fi.symlink_);
@@ -350,7 +354,9 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed) {
   CLIO_CO_AWAIT(g);
   auto fi = std::make_shared<FileInfo>();
   clio::run::u64 size = 0;
-  if (g->GetReturnCode() != 0 || !DecInodeRec(rec, fi.get(), &size)) {
+  clio::run::u32 writer = kNoRecWriter;
+  if (g->GetReturnCode() != 0 ||
+      !DecInodeRec(rec, fi.get(), &size, &writer)) {
     HLOG(kError, "filesystem: inode record {} unreadable", packed);
     CLIO_CO_RETURN;
   }
@@ -358,13 +364,29 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed) {
   // Containers caching its attrs registered with an earlier incarnation of
   // this home: the next change goes to every container.
   fi->holders_unknown_ = NumContainers() > 1;
-  if (fi->type_ != kFsTypeSymlink && size != 0) {
-    // This container's stream may never have seen the file (it stands in
-    // for a dead home, or its stream log lost the tail): the record's size
-    // is a floor (kMax never lowers a size the stream already has).
-    clio::run::u32 src = 0;
-    CLIO_CO_AWAIT(FileSizeOp(tag, clio::cte::stream::StreamSizeOp::kMax, size,
-                             nullptr, nullptr, &src));
+  const bool served_elsewhere =
+      writer != kNoRecWriter && writer != container_id_;
+  if (fi->type_ != kFsTypeSymlink) {
+    // Another container stored the latest record: it served the inode while
+    // this one was away (a failover), so this container's stream state is
+    // older than the record -- a truncate there must not be undone by the
+    // larger size this stream still remembers. The record is never behind an
+    // acknowledged size (AdvanceSize and truncate store it before replying),
+    // so it is the size. Otherwise the record is a floor: this container's
+    // stream may hold appends merged after the record was written (kMax never
+    // lowers a size the stream already has).
+    const auto op = served_elsewhere ? clio::cte::stream::StreamSizeOp::kSet
+                                     : clio::cte::stream::StreamSizeOp::kMax;
+    if (stream_hold_) {
+      // The stream is co-located (this container is the inode's home, so it
+      // homes the stream too). Reconciling in-process also releases the
+      // stream if it was restored and held since the restart.
+      auto &stream = static_cast<clio::cte::stream::Runtime &>(*stream_hold_);
+      stream.ReconcileRestored(tag, op, size);
+    } else if (size != 0 || served_elsewhere) {
+      clio::run::u32 src = 0;
+      CLIO_CO_AWAIT(FileSizeOp(tag, op, size, nullptr, nullptr, &src));
+    }
   }
   std::lock_guard<std::mutex> lk(meta_mu_);
   by_tag_.emplace(packed, fi);  // a racing loader may have won: keep it

@@ -174,6 +174,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // records) and loads on demand; only this container's id reservation and
   // orphan list are read up front.
   CLIO_CO_AWAIT(LoadSysRecords());
+  if (is_restart_) CLIO_CO_AWAIT(ReconcileRestoredStreams());
   // Mirror the namespace into CTE tag names (async). The root first; on a
   // restart this node missed broadcasts while down, so drop its published
   // names, re-add the ones this container owns, and pull the rest from peers.
@@ -231,6 +232,30 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   MirrorDir("/", FsRootId(), /*complete=*/false);
   EnsurePurgeDrain();  // also broadcasts the queued tag names
   task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ReconcileRestoredStreams() {
+  CLIO_TASK_BODY_BEGIN
+  if (!stream_hold_) CLIO_CO_RETURN;
+  auto &stream = static_cast<clio::cte::stream::Runtime &>(*stream_hold_);
+  const std::vector<clio::cte::core::TagId> tags = stream.UnverifiedStreams();
+  const auto t0 = std::chrono::steady_clock::now();
+  size_t loaded = 0;
+  for (const clio::cte::core::TagId &tag : tags) {
+    const clio::run::u64 packed = FsPack(tag);
+    if (InodeOwner(packed) != container_id_) continue;
+    // Loading the inode reconciles its stream with the record (see
+    // EnsureInode) and releases it.
+    CLIO_CO_AWAIT(EnsureInode(packed));
+    ++loaded;
+  }
+  stream.ReleaseRestored();  // the rest have no record to reconcile with
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+  HLOG(kInfo, "filesystem: reconciled {} of {} restored file sizes in {} ms",
+       loaded, tags.size(), ms);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

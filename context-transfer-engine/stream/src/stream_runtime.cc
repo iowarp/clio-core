@@ -38,6 +38,7 @@
  */
 
 #include <clio_cte/stream/stream_runtime.h>
+#include <clio_cte/core/blob_placement.h>
 
 #include <algorithm>
 #include <chrono>
@@ -177,6 +178,13 @@ void Runtime::Enqueue(PendingAppend p) {
   EnsureSequence();
 }
 
+clio::run::u32 Runtime::LiveHome(clio::run::u32 home) const {
+  // While the home's node is dead its successor serves the stream (the rule
+  // the CTE and the filesystem use for everything the home owns); sending to
+  // the dead node waits forever.
+  return clio::cte::core::FailoverContainer(pool_id_, home);
+}
+
 clio::run::TaskResume Runtime::Append(clio::run::shared_ptr<AppendTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->bytes_written_ = 0;
@@ -250,7 +258,8 @@ clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {
     }
     CLIO_CO_AWAIT(clio::run::yield(kFlushPollUs));
   }
-  auto s = self_.AsyncSizeOp(task->tag_id_, task->home_, StreamSizeOp::kGet);
+  auto s = self_.AsyncSizeOp(task->tag_id_, LiveHome(task->home_),
+                             StreamSizeOp::kGet);
   CLIO_CO_AWAIT(s);
   task->size_ = s->new_size_;
   task->return_code_ = s->GetReturnCode();
@@ -334,8 +343,8 @@ clio::run::TaskResume Runtime::ShipChunk(
     }
     entries.push_back(std::move(e));
   }
-  auto f = self_.AsyncPlan(chunk->front().tag_, chunk->front().home_, entries,
-                           payload);
+  auto f = self_.AsyncPlan(chunk->front().tag_,
+                           LiveHome(chunk->front().home_), entries, payload);
   CLIO_CO_AWAIT(f);
   *ok = f->GetReturnCode() == 0;
   if (*ok) {

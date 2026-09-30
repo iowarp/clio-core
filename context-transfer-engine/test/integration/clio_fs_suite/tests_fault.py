@@ -746,3 +746,71 @@ def blob_info_notes(ctx, path, verdict):
                   timeout=60)
       ctx.note(f'{h} page {page} of {tag}{flag or " (owner)"}: '
                f'{out.strip()}')
+
+
+@test('truncate_during_failover', 'fault', min_nodes=2, redeploy_after=True,
+      timeout=1800)
+def t_truncate_during_failover(ctx):
+  """A file's home (which owns its size) is SIGKILLed; while it is down a
+  survivor truncates the file (after failover takes the inode over) and
+  appends a tail. When the home comes back it must not resurrect the old,
+  larger size: every node sees the truncated size, the kept prefix and the
+  new tail, and nothing of the old bytes past the cut."""
+  n = len(ctx.hosts)
+  MiB = 1 << 20
+  p = ctx.p('shrink')
+  ctx.ok(0, 'write_file', path=p, size=8 * MiB, seed=5, fsync=True)
+  home = inode_home(ctx, 0, p)
+  victim = home if home is not None and home < n else n - 1
+  a = (victim + 1) % n
+  vh = ctx.hosts[victim]
+  ctx.note(f'home node{victim}; truncating from node{a}')
+  ctx.cl.kill_fuse(vh)
+  ctx.cl.kill_runtime(vh)
+  t0 = time.time()
+  done = False
+  while time.time() - t0 < 90:
+    if ctx.call(a, 'truncate', path=p, size=1 * MiB)['ok']:
+      done = True
+      break
+    time.sleep(2)
+  ctx.metrics['truncate_after_s'] = round(time.time() - t0, 1)
+  ctx.check(done, 'truncate never succeeded while the home was down '
+                  '(no failover within 90 s)')
+  # Two timed steps, so a hang names its half: the append, then the fsync.
+  r = ctx.ok(a, 'sh', cmd=f'timeout 60 python3 -c "import os; '
+                          f'fd=os.open({p!r}, os.O_WRONLY|os.O_APPEND); '
+                          f'os.write(fd, b\'T\'*4096); os.close(fd)"')
+  ctx.check(r['rc'] == 0, f'append after the truncate failed or took over '
+                          f'60 s (rc {r["rc"]}): {r["err"][-300:]}')
+  r = ctx.ok(a, 'sh', cmd=f'timeout 60 python3 -c "import os; '
+                          f'fd=os.open({p!r}, os.O_RDONLY); os.fsync(fd); '
+                          f'os.close(fd)"')
+  ctx.check(r['rc'] == 0, f'fsync while the home is down failed or took '
+                          f'over 60 s (rc {r["rc"]}): {r["err"][-300:]}')
+  want = 1 * MiB + 4096
+  for i in range(n):
+    if i != victim:
+      sz = ctx.ok(i, 'stat', path=p)['size']
+      ctx.check(sz == want, f'node{i} sees size {sz} during the outage, '
+                            f'want {want}')
+  ctx.cl.start_runtime(vh, 'restart')
+  ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
+  time.sleep(3)
+  ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
+  ctx.cl.agents.pop(vh, None)
+  time.sleep(2)
+  for i in range(n):
+    sz = ctx.ok(i, 'stat', path=p)['size']
+    ctx.check(sz == want, f'node{i} sees size {sz} after the home returned, '
+                          f'want {want} (old size resurrected?)')
+    tail = ctx.ok(i, 'sh', cmd=f'python3 -c "f=open({p!r},\'rb\');'
+                               f' f.seek({1 * MiB}); '
+                               f'd=f.read(); print(len(d), set(d)==set(b\'T\'))"'
+                  )['out']
+    ctx.check(tail.strip().endswith(f'{4096} True'),
+              f'node{i}: bytes past the cut are {tail.strip()!r}, want 4096 '
+              f'x "T"')
+  v = ctx.ok(n - 1 if victim != n - 1 else 0, 'verify_file', path=p,
+             size=1 * MiB, seed=5)
+  ctx.check(not v['mismatch'], f'kept prefix damaged: {v["mismatch"]}')

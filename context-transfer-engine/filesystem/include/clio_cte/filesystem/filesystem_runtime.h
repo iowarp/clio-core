@@ -757,18 +757,32 @@ class Runtime : public clio::run::Container {
    * Encode an inode record.
    * @param fi inode
    * @param size logical size to record
+   * @param writer the container storing the record
    * @return record bytes
    */
-  static std::string EncInodeRec(const FileInfo &fi, clio::run::u64 size);
+  static std::string EncInodeRec(const FileInfo &fi, clio::run::u64 size,
+                                 clio::run::u32 writer);
   /**
    * Decode an inode record.
    * @param rec record bytes
    * @param fi receives the attributes
    * @param size receives the recorded size
+   * @param writer receives the container that stored it (kNoRecWriter for a
+   *        record from before the field existed)
    * @return false if malformed
    */
   static bool DecInodeRec(const std::string &rec, FileInfo *fi,
-                          clio::run::u64 *size);
+                          clio::run::u64 *size, clio::run::u32 *writer);
+  /** DecInodeRec's writer for records that do not carry one. */
+  static constexpr clio::run::u32 kNoRecWriter = 0xFFFFFFFFu;
+  /**
+   * After a restart, reconcile every stream this node's stream container
+   * restored from its log with its file's inode record, before the
+   * filesystem serves anything: a file served elsewhere while this node was
+   * down (a truncate there) must not come back with the size this node's
+   * stream log remembers.
+   */
+  clio::run::TaskResume ReconcileRestoredStreams();
   std::unordered_set<clio::run::u64> inode_dirty_;    ///< meta_mu_
   std::unordered_set<clio::run::u64> inode_storing_;  ///< meta_mu_
 

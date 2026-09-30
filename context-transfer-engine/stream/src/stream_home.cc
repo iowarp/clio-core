@@ -68,6 +68,35 @@ bool WaitsForMerge(StreamSizeOp op) {
 // Sizes
 // ===========================================================================
 
+bool Runtime::GatedLocked(const clio::cte::core::TagId &tag) {
+  if (unverified_.empty() || unverified_.count(tag) == 0) return false;
+  if (std::chrono::steady_clock::now() < gate_deadline_) return true;
+  HLOG(kWarning, "stream: {} restored stream(s) were never reconciled after "
+       "{} s; releasing them with their logged sizes", unverified_.size(),
+       kRestoreGateS);
+  unverified_.clear();
+  return false;
+}
+
+std::vector<clio::cte::core::TagId> Runtime::UnverifiedStreams() {
+  std::lock_guard<std::mutex> g(mu_);
+  return std::vector<clio::cte::core::TagId>(unverified_.begin(),
+                                             unverified_.end());
+}
+
+void Runtime::ReconcileRestored(const clio::cte::core::TagId &tag,
+                                StreamSizeOp op, clio::run::u64 value) {
+  std::lock_guard<std::mutex> g(mu_);
+  clio::run::u64 old_size = 0;
+  ApplySizeOpLocked(tag, op, value, &old_size);
+  unverified_.erase(tag);
+}
+
+void Runtime::ReleaseRestored() {
+  std::lock_guard<std::mutex> g(mu_);
+  unverified_.clear();
+}
+
 bool Runtime::LocalSize(const clio::cte::core::TagId &tag,
                         clio::run::u64 *size) {
   std::lock_guard<std::mutex> g(mu_);
@@ -116,8 +145,9 @@ clio::run::TaskResume Runtime::SizeOp(clio::run::shared_ptr<SizeOpTask> &task) {
     {
       std::lock_guard<std::mutex> g(mu_);
       auto it = streams_.find(task->tag_id_);
-      const bool busy = it != streams_.end() && it->second.busy_;
-      if (!busy || !WaitsForMerge(op)) {
+      const bool busy = (it != streams_.end() && it->second.busy_) ||
+                        GatedLocked(task->tag_id_);
+      if (!busy || (!WaitsForMerge(op) && !GatedLocked(task->tag_id_))) {
         task->new_size_ = ApplySizeOpLocked(task->tag_id_, op, task->value_,
                                             &task->old_size_);
         break;
@@ -168,7 +198,7 @@ clio::run::TaskResume Runtime::Plan(clio::run::shared_ptr<PlanTask> &task) {
         break;
       }
       StreamState &st = streams_[tag];
-      if (!st.busy_) {
+      if (!st.busy_ && !GatedLocked(tag)) {
         st.busy_ = true;
         for (auto &kv : open_plans_) {
           if (kv.second.tag_ == tag) retry.push_back(kv.second);

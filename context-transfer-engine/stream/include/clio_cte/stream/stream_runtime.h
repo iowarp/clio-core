@@ -54,6 +54,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <chrono>
 #include <unordered_set>
 #include <vector>
 
@@ -162,7 +163,40 @@ class Runtime : public clio::run::Container {
    */
   bool LocalSize(const clio::cte::core::TagId &tag, clio::run::u64 *size);
 
+  /**
+   * Streams restored from this container's log that the owner of their
+   * sizes (clio-fs) has not reconciled yet. After a restart a stream's size
+   * may be older than the truth: its file was served elsewhere while this
+   * node was down. Size ops and merges on such a stream wait until it is
+   * reconciled or released (at most kRestoreGateS).
+   * @return the unverified stream tags
+   */
+  std::vector<clio::cte::core::TagId> UnverifiedStreams();
+  /**
+   * Apply the authoritative size to a restored stream and release it.
+   * @param tag stream tag
+   * @param op kSet (the size was changed elsewhere) or kMax (a floor)
+   * @param value the size
+   */
+  void ReconcileRestored(const clio::cte::core::TagId &tag, StreamSizeOp op,
+                         clio::run::u64 value);
+  /** Release every restored stream still waiting (nothing to reconcile). */
+  void ReleaseRestored();
+
  private:
+  /**
+   * Whether ops on `tag` must still wait for reconciliation (mu_ held).
+   * @param tag stream tag
+   * @return true while restored-but-unreconciled and within the gate time
+   */
+  bool GatedLocked(const clio::cte::core::TagId &tag);
+  /**
+   * The container serving a stream homed on `home` right now: `home` while
+   * its node is alive, else its failover successor.
+   * @param home the stream's home container
+   * @return the live home
+   */
+  clio::run::u32 LiveHome(clio::run::u32 home) const;
   /** Per-stream home state. */
   struct StreamState {
     clio::run::u64 size_ = 0;
@@ -287,6 +321,12 @@ class Runtime : public clio::run::Container {
   // home side, guarded by mu_
   std::mutex mu_;
   std::unordered_map<clio::cte::core::TagId, StreamState> streams_;
+  /** How long restored streams wait for reconciliation at most (s). */
+  static constexpr int kRestoreGateS = 120;
+  /** Restored streams not yet reconciled (see UnverifiedStreams; mu_). */
+  std::unordered_set<clio::cte::core::TagId> unverified_;
+  /** When the restore gate gives up and releases everything. */
+  std::chrono::steady_clock::time_point gate_deadline_{};
   std::unordered_map<clio::cte::core::TagId, clio::run::u64> dropped_;
   std::unordered_map<std::string, clio::run::u64> merged_names_;
   std::unordered_map<clio::run::u64, StreamPlan> open_plans_;

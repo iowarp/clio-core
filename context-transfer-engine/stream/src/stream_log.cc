@@ -163,6 +163,11 @@ void Runtime::OpenLog() {
     ReplayRecord(t, p);
   });
   CompactLocked();
+  // Every restored size may be stale (its file was served elsewhere while
+  // this node was down): hold them until the owner reconciles them.
+  for (const auto &kv : streams_) unverified_.insert(kv.first);
+  gate_deadline_ = std::chrono::steady_clock::now() +
+                   std::chrono::seconds(kRestoreGateS);
   HLOG(kInfo, "stream: replayed {} log records: {} streams, {} open plans", n,
        streams_.size(), open_plans_.size());
 }
