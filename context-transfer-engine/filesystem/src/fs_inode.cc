@@ -269,21 +269,32 @@ clio::run::TaskResume Runtime::StatInode(clio::run::u64 packed,
     resp.str_ = fi->symlink_;
     CLIO_CO_RETURN;
   }
-  bool fetch = false;
+  bool fetch = false, cached = false;
   {
     std::lock_guard<std::mutex> g(icache_mu_);
     auto it = icache_.find(packed);
     if (it != icache_.end() && it->second.home_ == home) {
       resp.attr_ = it->second.attr_;
       resp.str_ = it->second.symlink_;
-      CLIO_CO_RETURN;
-    }
-    if (iloading_.count(packed) == 0) {
+      cached = true;
+    } else if (iloading_.count(packed) == 0) {
       InodeCacheEnt none;
       none.home_ = ~0u;
       iloading_[packed] = none;
       fetch = true;
     }
+  }
+  if (cached) {
+    // The size is not part of the pushed attributes: writes and truncates
+    // change it at the file's stream, not through the inode. Ask the stream
+    // (on the same home) so a stat is never behind an acknowledged write.
+    if (resp.attr_.type_ == kFsTypeFile) {
+      auto f = stream_.AsyncSizeOp(FsUnpack(packed), home,
+                                   clio::cte::stream::StreamSizeOp::kGet);
+      CLIO_CO_AWAIT(f);
+      if (f->GetReturnCode() == 0) resp.attr_.size_ = f->new_size_;
+    }
+    CLIO_CO_RETURN;
   }
   FsReq r;
   r.id_ = packed;
