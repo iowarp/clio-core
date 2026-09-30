@@ -2162,6 +2162,10 @@ static clio::run::u64 PackTag(const clio::cte::core::TagId &tag) {
          static_cast<clio::run::u64>(tag.minor_);
 }
 
+static std::mutex g_unmerged_mu;  ///< guards g_unmerged_appends
+/** Files with deferred appends this node accepted that may be unmerged. */
+static std::set<clio::run::u64> g_unmerged_appends;
+
 /**
  * Wait until this handle's deferred appends are merged into the file, then
  * stamp the file's mtime at its inode home. No-op without pending appends.
@@ -2172,10 +2176,20 @@ static clio::run::u64 PackTag(const clio::cte::core::TagId &tag) {
 static int FlushAppends(CfsHandle *handle, const std::string &hp) {
   if (!handle->appended.exchange(false)) return 0;
   const clio::run::u64 packed = PackTag(handle->tag);
+  {
+    // The flush merges every append accepted before it, from any handle;
+    // one accepted later registers again once its write returns.
+    std::lock_guard<std::mutex> g(g_unmerged_mu);
+    g_unmerged_appends.erase(packed);
+  }
   auto f = StreamClient().AsyncFlush(handle->tag,
                                      clio::cte::filesystem::FsIdHome(packed));
   f.Wait();
-  if (f->GetReturnCode() != 0) return -EIO;
+  if (f->GetReturnCode() != 0) {
+    std::lock_guard<std::mutex> g(g_unmerged_mu);
+    g_unmerged_appends.insert(packed);
+    return -EIO;
+  }
   if (handle->fh == 0) EnsureCreated(hp);
   auto t = CLIO_CFS_CLIENT->AsyncAdvanceSize(packed, f->size_);
   t.Wait();
@@ -2196,7 +2210,36 @@ static int DeferredAppend(CfsHandle *handle, const char *buf, size_t size) {
       handle->tag, clio::cte::filesystem::FsIdHome(packed), buf, size);
   if (rc != 0) return -EIO;
   handle->appended.store(true);
+  {
+    std::lock_guard<std::mutex> g(g_unmerged_mu);
+    g_unmerged_appends.insert(packed);
+  }
   return static_cast<int>(size);
+}
+
+/**
+ * Merge every deferred append this node accepted for a file before a
+ * truncate: write(2) already returned for them, so they come before the
+ * truncate (as on ext4) -- merged after it, they would reappear past the
+ * cut. No-op, without a round trip, for files with no such appends.
+ * @param tag the file's tag
+ * @return 0 or -EIO (the appends could not be merged: do not truncate)
+ */
+static int MergeAppendsBeforeTruncate(const clio::cte::core::TagId &tag) {
+  const clio::run::u64 packed = PackTag(tag);
+  {
+    std::lock_guard<std::mutex> g(g_unmerged_mu);
+    if (g_unmerged_appends.erase(packed) == 0) return 0;
+  }
+  auto f = StreamClient().AsyncFlush(tag,
+                                     clio::cte::filesystem::FsIdHome(packed));
+  f.Wait();
+  if (f->GetReturnCode() == 0) return 0;
+  HLOG(kError, "clio_cte_fuse: appends to {}.{} could not be merged before "
+       "a truncate (rc {})", tag.major_, tag.minor_, f->GetReturnCode());
+  std::lock_guard<std::mutex> g(g_unmerged_mu);
+  g_unmerged_appends.insert(packed);
+  return -EIO;
 }
 
 static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
@@ -2656,6 +2699,8 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
         clio::cte::core::Client::DeferKeyHashName(p));
     if (!tr_tag.IsNull()) {
       DrainSievePages(tr_tag, HiwaterFor(p));
+      const int aerr = MergeAppendsBeforeTruncate(tr_tag);
+      if (aerr != 0) return aerr;
     }
     tr_old_extent = HiwaterFor(p);
     HiwaterClamp(p, static_cast<clio::run::u64>(size));
