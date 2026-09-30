@@ -803,6 +803,13 @@ private:
    * is durable through the WAL, which every flush syncs.
    */
   std::atomic<bool> snapshot_dirty_{false};
+
+  /**
+   * On a fresh start, delete this container's metadata snapshot and WAL
+   * shards (metadata_log_path and its .blob.N / .tag.N / .tmp siblings), so
+   * nothing from the previous run can be replayed by a later start.
+   */
+  void DiscardPersistentMetadata();
   /** Steady-clock time of the last full snapshot (ms since epoch of the
    *  steady clock; 0 = none yet). */
   std::atomic<clio::run::u64> last_snapshot_ms_{0};

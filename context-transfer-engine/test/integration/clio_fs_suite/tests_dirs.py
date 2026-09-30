@@ -245,7 +245,7 @@ def t_cache_after_home_restart(ctx):
   ctx.cl.kill_fuse(vh)
   ctx.cl.kill_runtime(vh)
   time.sleep(1)
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), 'victim restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), 'victim remount')

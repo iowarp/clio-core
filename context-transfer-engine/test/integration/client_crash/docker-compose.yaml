@@ -52,7 +52,7 @@ services:
       "
         mkdir -p /mnt/cte_ram &&
         echo 'cc-daemon: starting clio_run runtime' &&
-        exec /workspace/build/bin/clio_run runtime start
+        exec /workspace/build/bin/clio_run runtime start --fresh
       "
 
   cc-driver:

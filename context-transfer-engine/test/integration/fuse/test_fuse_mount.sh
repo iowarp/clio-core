@@ -80,7 +80,7 @@ fi
 # process owns the server that clio_cte_fuse (a pure client below) attaches to.
 info "Starting Clio runtime..."
 export CLIO_SERVER_CONF="$CONFIG_FILE"
-CLIO_WITH_RUNTIME=1 "$RUNTIME_BIN" runtime start &
+CLIO_WITH_RUNTIME=1 "$RUNTIME_BIN" runtime start --fresh &
 RUNTIME_PID=$!
 sleep 3
 

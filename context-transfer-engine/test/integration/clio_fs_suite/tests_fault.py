@@ -3,7 +3,7 @@
 What a persistent, reliable deployment must guarantee (and what is checked):
   * Everything acknowledged by fsync()/close() before a graceful stop or a
     crash (SIGKILL of every daemon) is back, byte-exact, with its metadata
-    (names, sizes, modes, links, xattrs) after `clio_run restart`.
+    (names, sizes, modes, links, xattrs) after a stop and `clio_run start`.
   * Losing one node never hangs the survivors: every operation on a
     survivor returns (success or an error) inside a bounded time.
   * A node that comes back rejoins and its data is readable cluster-wide.
@@ -158,7 +158,7 @@ def audit_all(ctx, root, exp, what):
 
 def restart_cluster(ctx, crash):
   """Stop (gracefully or SIGKILL) every daemon and bring it back with
-  `clio_run restart`, then remount."""
+  `clio_run start` (which recovers), then remount."""
   cl = ctx.cl
   cl.close_agents()
   if crash:
@@ -169,7 +169,7 @@ def restart_cluster(ctx, crash):
     parallel(cl.stop_runtime, cl.hosts)
   time.sleep(2)
   t0 = time.time()
-  parallel(lambda h: cl.start_runtime(h, 'restart'), cl.hosts)
+  parallel(lambda h: cl.start_runtime(h), cl.hosts)
   ups = parallel(cl.runtime_up, cl.hosts)
   ctx.check(all(u is True for u in ups), f'runtime restart failed: {ups}')
   time.sleep(3)
@@ -181,7 +181,7 @@ def restart_cluster(ctx, crash):
 @test('graceful_restart_all', 'fault', min_nodes=1, redeploy_after=True,
       timeout=3600)
 def t_graceful(ctx):
-  """Graceful stop of every daemon + `clio_run restart`: all data back."""
+  """Graceful stop of every daemon + `clio_run start`: all data back."""
   root, exp = build_dataset(ctx, 'g')
   audit_all(ctx, root, exp, 'before restart')
   restart_cluster(ctx, crash=False)
@@ -218,21 +218,59 @@ def t_double_crash(ctx):
 @test('plain_start_keeps_data', 'fault', min_nodes=1, redeploy_after=True,
       timeout=3600)
 def t_plain_start(ctx):
-  """Operator runs `clio_run start` (not `restart`) after a clean stop: does
-  a persistent deployment keep its data?"""
+  """Operator stops the deployment and runs `clio_run start` again: a
+  persistent deployment keeps all its data (start recovers by default;
+  only --fresh discards)."""
   root, exp = build_dataset(ctx, 's', per_node=4)
   cl = ctx.cl
   cl.close_agents()
   parallel(cl.unmount, cl.hosts)
   parallel(cl.stop_runtime, cl.hosts)
-  parallel(lambda h: cl.start_runtime(h, 'start'), cl.hosts)
+  parallel(lambda h: cl.start_runtime(h), cl.hosts)
   parallel(cl.runtime_up, cl.hosts)
   time.sleep(3)
   parallel(cl.mount, cl.hosts)
   bad, _ = audit(ctx, 0, root, exp)
   ctx.check(not bad, f'`clio_run start` on an existing persistent '
                      f'deployment lost {len(bad)}/{len(exp)} entries '
-                     f'(e.g. {bad[:3]}); only `restart` replays the WAL')
+                     f'(e.g. {bad[:3]})')
+
+
+@test('fresh_start_discards', 'fault', min_nodes=1, redeploy_after=True,
+      timeout=3600)
+def t_fresh_start(ctx):
+  """`clio_run start --fresh` is the one way to discard state: after it the
+  old dataset is gone -- and STAYS gone across a later (recovering) start,
+  i.e. nothing of the previous run's logs is replayed -- while the
+  filesystem works normally."""
+  root, exp = build_dataset(ctx, 'f', per_node=3)
+  cl = ctx.cl
+
+  def cycle(fresh):
+    cl.close_agents()
+    parallel(cl.unmount, cl.hosts)
+    parallel(cl.stop_runtime, cl.hosts)
+    parallel(lambda h: cl.start_runtime(h, fresh=fresh), cl.hosts)
+    ups = parallel(cl.runtime_up, cl.hosts)
+    ctx.check(all(u is True for u in ups), f'start (fresh={fresh}) failed')
+    time.sleep(3)
+    ms = parallel(cl.mount, cl.hosts)
+    ctx.check(all(m is True for m in ms), f'remount (fresh={fresh}) failed')
+
+  cycle(fresh=True)
+  ctx.check(ctx.ok(0, 'exists', path=root) is False,
+            'the dataset survived `start --fresh`')
+  # --fresh discarded this test's own directory too: make it again.
+  ctx.ok(0, 'makedirs', path=ctx.dir)
+  p = ctx.p('after_fresh')
+  ctx.ok(0, 'write_file', path=p, size=1 << 20, seed=9, fsync=True)
+  cycle(fresh=False)
+  for i in range(len(ctx.hosts)):
+    ctx.check(ctx.ok(i, 'exists', path=root) is False,
+              f'node{i}: the pre-fresh dataset came back after a later start')
+    v = ctx.ok(i, 'verify_file', path=p, size=1 << 20, seed=9)
+    ctx.check(v['size_ok'] and not v['mismatch'],
+              f'node{i}: the file written after --fresh was not recovered')
 
 
 @test('node_loss_survivors_bounded', 'fault', min_nodes=2,
@@ -284,7 +322,7 @@ def t_node_loss(ctx):
                              f'{OP_DEADLINE}s) on survivors after node '
                              f'{vh} died')
   # Bring the victim back.
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
@@ -346,7 +384,7 @@ def t_kill_during_io(ctx):
     acked[i] = o
   ctx.metrics['acked_writes'] = sum(len(v) for v in acked.values())
   ctx.check(not hangs, f'survivor writes hung after {vh} died: {hangs}')
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), 'victim restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), 'victim remount')
@@ -415,7 +453,7 @@ def t_chaos(ctx):
     if what == 'runtime':
       ctx.cl.kill_runtime(vh)
       time.sleep(1)
-      ctx.cl.start_runtime(vh, 'restart')
+      ctx.cl.start_runtime(vh)
       ctx.check(ctx.cl.runtime_up(vh), f'round {rnd} restart')
       time.sleep(3)
     ctx.check(ctx.cl.mount(vh), f'round {rnd} remount')
@@ -463,7 +501,7 @@ def t_node_loss_partial(ctx):
                       'reachable_fraction': round(oks / total, 2)})
   ctx.check(hangs == 0, f'{hangs} ops HUNG while one node was down')
   ctx.check(oks > 0, 'no part of the namespace stayed reachable')
-  ctx.cl.start_runtime(victim, 'restart')
+  ctx.cl.start_runtime(victim)
   ctx.check(ctx.cl.runtime_up(victim), 'victim restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(victim), 'victim remount')
@@ -507,7 +545,7 @@ def t_tag_names_restart(ctx):
     res = ctx.a(0).call('mkdir', timeout=OP_DEADLINE, path=p)
     if res.get('ok'):
       want.add(f'/during{k}')
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
@@ -559,7 +597,7 @@ def t_append_home_restart(ctx):
   ctx.cl.kill_fuse(vh)
   ctx.cl.kill_runtime(vh)
   time.sleep(5)
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
@@ -638,7 +676,7 @@ def t_data_failover(ctx):
   new = [f'{root}/n{k}' for k in range(3)]
   for k, p in enumerate(new):
     ctx.ok(w, 'write_file', path=p, size=3 * MiB, seed=950 + k, fsync=True)
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
@@ -696,13 +734,13 @@ def t_handoff_successor_restart(ctx):
   ctx.cl.kill_fuse(sh_)
   ctx.cl.kill_runtime(sh_)
   time.sleep(2)
-  ctx.cl.start_runtime(sh_, 'restart')
+  ctx.cl.start_runtime(sh_)
   ctx.check(ctx.cl.runtime_up(sh_), f'{sh_} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(sh_), f'{sh_} remount failed')
   ctx.cl.agents.pop(sh_, None)
   # Now the owner returns and must get the successor's changes.
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
@@ -794,7 +832,7 @@ def t_truncate_during_failover(ctx):
       sz = ctx.ok(i, 'stat', path=p)['size']
       ctx.check(sz == want, f'node{i} sees size {sz} during the outage, '
                             f'want {want}')
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
@@ -861,7 +899,7 @@ def t_open_handle_home_loss(ctx):
               f'{r.get("err") or r.get("ret")}')
   r = ctx.call(a, 'close', timeout=60, h=h)
   ctx.check(r['ok'], f'close after the home died: {r.get("err")}')
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')

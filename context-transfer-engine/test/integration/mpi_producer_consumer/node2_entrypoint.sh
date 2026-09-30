@@ -18,7 +18,7 @@ printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n' \
     >> /home/iowarp/.ssh/config
 
 echo '=== Node 2: starting local clio daemon ==='
-/workspace/build/bin/clio_run runtime start &
+/workspace/build/bin/clio_run runtime start --fresh &
 echo "Node 2: daemon PID $!"
 
 echo '=== Node 2: waiting for node1 SSH public key ==='

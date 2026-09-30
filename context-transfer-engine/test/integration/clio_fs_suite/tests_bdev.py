@@ -87,7 +87,7 @@ def t_safe_bdev_live_growth_rejoin(ctx):
       cl.kill_runtime(victim)
       time.sleep(25)
     elif step == 'restart2':
-      cl.start_runtime(victim, 'restart')
+      cl.start_runtime(victim)
       ctx.check(cl.runtime_up(victim), f'{victim} did not restart')
       time.sleep(15)  # rejoin: the node is declared alive again
 

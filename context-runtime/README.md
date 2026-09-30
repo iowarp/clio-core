@@ -87,7 +87,12 @@ sudo cmake --install build/release
 ```bash
 clio_run start          # foreground
 clio_run start &        # background
+clio_run start --fresh  # discard this node's saved state and start empty
 ```
+
+`clio_run start` always recovers the node's persistent state (durable pools,
+metadata logs, allocators, data) — stopping and starting the runtime never
+loses data. Only `--fresh` discards it.
 
 A default configuration is seeded at `~/.clio/clio.yaml` on install. To
 override it, point `CLIO_X` at your own YAML file:

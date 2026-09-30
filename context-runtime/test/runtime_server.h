@@ -115,11 +115,18 @@ class RuntimeServer {
    *   performed") and the daemon stayed alive but unreachable. A serviceable
    *   daemon after a detached spawn proves the transport initializes regardless
    *   of console.
+   * @param recover  Recover the node's persistent state (a plain
+   *   `clio_run start`). Off by default: every test gets an empty node
+   *   (`start --fresh`), because all tests on a host share the conf dir
+   *   (/tmp/clio_$USER) and a recovering start would bring back the pools and
+   *   logs an earlier test left there. Only a test's own recovery phase (after
+   *   stopping a daemon it started) passes true.
    */
   bool Start(unsigned port = 10500,
              const std::string &bind_addr = "127.0.0.1",
              bool ephemeral = false,
-             bool detached = false) {
+             bool detached = false,
+             bool recover = false) {
     port_ = port;
     SetEnv("CLIO_PORT", std::to_string(port));
     SetEnv("CLIO_BIND_ADDR", bind_addr);
@@ -138,6 +145,7 @@ class RuntimeServer {
     // spawn console-less to reproduce issue #721.
     std::vector<std::string> args;
     args.push_back("start");
+    if (!recover) args.push_back("--fresh");
     if (ephemeral) args.push_back("--ephemeral");
     proc_ = ctp::SystemInfo::SpawnProcess(exe, args, log, detached);
     if (!proc_.valid) return false;

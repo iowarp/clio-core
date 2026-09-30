@@ -243,7 +243,8 @@ namespace {
  * SetPersistent) is re-created here, in creation order, taking the
  * Restart() path. A fresh start forgets them instead: it begins a new
  * cluster lifetime, and test pools must never come back.
- * @param is_restart true for `restart` (or a start that found state)
+ * @param is_restart true for a recovering `clio_run start`, false for
+ *        `clio_run start --fresh`
  */
 void ReplayPoolLog(bool is_restart) {
   auto *pool_manager = CLIO_POOL_MANAGER;

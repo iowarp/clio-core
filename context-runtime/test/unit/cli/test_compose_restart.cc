@@ -12,7 +12,7 @@
  * of `compose list` / `compose list --restartable`.
  *
  *   1. ComposeRestart_RestartSurvives — compose a bdev with `restart: true`,
- *      stop the daemon, start a fresh one; the bdev is auto-restarted from the
+ *      stop the daemon and start it again (recovering); the bdev comes back from the
  *      WAL, so `compose list` shows it again.
  *   2. ComposeRestart_StopKeepsRestartable — `compose stop` removes the bdev
  *      from `compose list` but `compose list --restartable` still shows it.
@@ -178,7 +178,9 @@ TEST_CASE("ComposeRestart_RestartSurvives - restart:true survives daemon "
   // Phase 3: fresh daemon. No re-compose — startup WAL replay must bring the
   // bdev back, so `compose list` shows pool 720.0 again.
   clio::run::test::RuntimeServer s2;
-  REQUIRE(s2.Start(kPort));
+  // Recover (a plain `clio_run start`): phase 3 must bring the pool back.
+  REQUIRE(s2.Start(kPort, "127.0.0.1", /*ephemeral=*/false,
+                   /*detached=*/false, /*recover=*/true));
   REQUIRE(s2.WaitForReady());
   {
     std::string out = RunCliCapture({"compose", "list"}, 30);

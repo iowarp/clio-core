@@ -213,9 +213,11 @@ TEST_CASE("CteWalRestart - WAL snapshot, replay on daemon restart",
   REQUIRE_FALSE(server.IsRunning());
   server.Stop();
 
-  // --- Phase 3: fresh daemon; re-compose triggers restart + WAL replay.
+  // --- Phase 3: a new daemon that recovers; re-compose + WAL replay.
   clio::run::test::RuntimeServer server2;
-  REQUIRE(server2.Start(kPort));
+  // Recover (a plain `clio_run start`): this phase must replay the WAL.
+  REQUIRE(server2.Start(kPort, "127.0.0.1", /*ephemeral=*/false,
+                        /*detached=*/false, /*recover=*/true));
   REQUIRE(server2.WaitForReady());
 
   REQUIRE(RunCliTimed({"compose", compose_yaml.string()}, 60) == 0);

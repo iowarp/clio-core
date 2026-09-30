@@ -121,7 +121,7 @@ class Runtime : public clio::run::Container {
   // ---- Container virtuals (autogen/stream_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
             clio::run::u32 container_id = 0) override;
-  /** Recovery start (`clio_run restart`): Create replays the log. */
+  /** Recovering start (a plain `clio_run start`): Create replays the log. */
   void Restart(const clio::run::PoolId &pool_id, const std::string &pool_name,
                clio::run::u32 container_id = 0) override;
   clio::run::TaskResume Run(

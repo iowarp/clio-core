@@ -166,10 +166,10 @@ compose:
   #   pool_id: "302.0"
   #   bdev_type: file                    # Options: file, ram, hbm, pinned, noop
   #   capacity: "100GB"
-  #   # A file bdev logs its allocations to "<pool_name>.alloc_log" and, on a
-  #   # runtime restart, rebuilds its allocator from that log so no live block
-  #   # is handed out twice. A fresh (non-restart) start discards the log.
-  #   # Setting alloc_log moves the log and makes every start recover from it.
+  #   # A file bdev logs its allocations to "<pool_name>.alloc_log" and, on
+  #   # every `clio_run start`, rebuilds its allocator from that log so no live
+  #   # block is handed out twice. `clio_run start --fresh` discards the log.
+  #   # Setting alloc_log moves the log and makes even --fresh recover it.
   #   # alloc_log: "/mnt/nvme/chi_bdev.alloc_log"
 
   # === Safe Block Device (erasure-coded array over member bdevs) ===
@@ -453,7 +453,7 @@ compose:
     staging_pool_id: "561.0"            # replication (durable, uncached)
     # Node-local log of the sizes, merge plans and merged-append names of
     # the streams this node homes (the container id is appended). Without it
-    # file sizes do not survive `clio_run restart`. Default: unset.
+    # file sizes do not survive a stop and `clio_run start`. Default: unset.
     # log_path: "/mnt/nvme/$USER/clio/cte_stream_log"
 
   # === Context Filesystem (CFS) ===

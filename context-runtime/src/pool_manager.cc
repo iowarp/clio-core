@@ -1404,9 +1404,25 @@ std::vector<PoolManager::PoolLogEntry> PoolManager::LoadPoolLog() {
 }
 
 void PoolManager::ClearPoolLog() {
-  if (CLIO_CONFIG_MANAGER == nullptr) return;
+  auto *config_manager = CLIO_CONFIG_MANAGER;
+  if (config_manager == nullptr) return;
   std::error_code ec;
   std::filesystem::remove(PoolLogPath(), ec);
+  // This node's address-table WAL too (domain_table.<pool>.<node>.bin): a
+  // fresh start begins a new cluster lifetime, and a later recovering start
+  // must not remap containers from the previous one.
+  auto *ipc_manager = CLIO_IPC;
+  if (ipc_manager == nullptr) return;
+  const std::string suffix =
+      "." + std::to_string(ipc_manager->GetNodeId()) + ".bin";
+  const std::filesystem::path wal_dir = config_manager->GetConfDir() + "/wal";
+  for (const auto &ent : std::filesystem::directory_iterator(wal_dir, ec)) {
+    const std::string name = ent.path().filename().string();
+    if (name.rfind("domain_table.", 0) == 0 && name.size() > suffix.size() &&
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      std::filesystem::remove(ent.path(), ec);
+    }
+  }
 }
 
 }  // namespace clio::run

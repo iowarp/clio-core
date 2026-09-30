@@ -164,19 +164,13 @@ void PrintVizUsage() {
 }
 
 void PrintRuntimeStartUsage() {
-  HIPRINT("Usage: clio runtime start [--induct] [--ephemeral] [--fresh] [viz options]");
-  HIPRINT("  Starts the Clio runtime server. If the configuration's persistent");
-  HIPRINT("  metadata log already holds state, start RECOVERS it (as restart)");
+  HIPRINT("Usage: clio start [--fresh] [--induct] [--ephemeral] [viz options]");
+  HIPRINT("  Starts the Clio runtime server. It RECOVERS every piece of persistent");
+  HIPRINT("  state it finds (pools, metadata logs, allocators, data); it never");
+  HIPRINT("  discards state unless asked to.");
+  HIPRINT("  --fresh: Discard this node's persistent state and start empty");
   HIPRINT("  --induct: Register this node with all existing cluster nodes");
   HIPRINT("  --ephemeral: Skip the default compose; start bare (admin only)");
-  HIPRINT("  --fresh: Ignore existing persistent state (do not recover it)");
-  PrintVizUsage();
-}
-
-void PrintRuntimeRestartUsage() {
-  HIPRINT("Usage: clio runtime restart [--induct] [viz options]");
-  HIPRINT("  Restarts the Clio runtime, replaying WAL to recover address table");
-  HIPRINT("  --induct: Register this node with all existing cluster nodes");
   PrintVizUsage();
 }
 
@@ -261,93 +255,6 @@ void EnableVizForDaemon() {
 }  // namespace
 
 /**
- * Expand ${VAR} references in a config value from the environment.
- * @param v the raw value
- * @return the expanded value
- */
-std::string ExpandEnvVars(const std::string &v) {
-  std::string out;
-  for (size_t i = 0; i < v.size(); ++i) {
-    if (v[i] == '$' && i + 1 < v.size() && v[i + 1] == '{') {
-      size_t end = v.find('}', i + 2);
-      if (end != std::string::npos) {
-        const char *e = std::getenv(v.substr(i + 2, end - i - 2).c_str());
-        out += (e != nullptr) ? e : "";
-        i = end;
-        continue;
-      }
-    }
-    out += v[i];
-  }
-  return out;
-}
-
-/** Size of a log file holding no records (its header). */
-constexpr std::uintmax_t kEmptyLogBytes = 4;
-
-/**
- * Whether `path`, or any log beside it named `<path>.<suffix>` (the
- * metadata WAL shards `.blob.N` / `.tag.N`, a module's `.stream`, ...), holds
- * records.
- * @param path a configured metadata_log_path
- * @return the first non-empty one, or "" when there is none
- */
-std::string NonEmptyLogAt(const std::string &path) {
-  namespace fs = std::filesystem;
-  std::error_code ec;
-  if (fs::exists(path, ec) && fs::file_size(path, ec) > 0) return path;
-  // The snapshot is only rebuilt when the WAL needs compacting, so a node can
-  // hold all of its metadata in WAL shards with no snapshot file at all.
-  const fs::path p(path);
-  const std::string prefix = p.filename().string() + ".";
-  const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
-  for (const auto &ent : fs::directory_iterator(dir, ec)) {
-    const std::string name = ent.path().filename().string();
-    if (name.compare(0, prefix.size(), prefix) != 0) continue;
-    if (ent.is_regular_file(ec) && ent.file_size(ec) > kEmptyLogBytes) {
-      return ent.path().string();
-    }
-  }
-  return "";
-}
-
-/**
- * Find persistent state a fresh start would discard: a non-empty
- * `metadata_log_path` of any pool in the server config, or a non-empty log
- * beside it (see NonEmptyLogAt).
- *
- * A plain `start` over such state used to come up EMPTY -- every file of a
- * persistent clio-fs deployment vanished because only `restart` replays the
- * logs -- which is the wrong default for an operator restarting a service.
- * @return the first recoverable log path, or "" when there is none
- */
-std::string FindRecoverableState() {
-  std::string conf;
-  if (const char *e = std::getenv("CLIO_SERVER_CONF")) {
-    conf = e;
-  } else if (const char *h = std::getenv("HOME")) {
-    conf = std::string(h) + "/.clio/clio.yaml";
-  }
-  std::ifstream in(conf);
-  std::string line;
-  while (std::getline(in, line)) {
-    const size_t hash = line.find('#');
-    if (hash != std::string::npos) line.resize(hash);
-    const size_t k = line.find("metadata_log_path:");
-    if (k == std::string::npos) continue;
-    std::string v = line.substr(k + std::strlen("metadata_log_path:"));
-    const char *trim = " \t\"'\r";
-    v.erase(0, v.find_first_not_of(trim));
-    v.erase(v.find_last_not_of(trim) + 1);
-    v = ExpandEnvVars(v);
-    if (v.empty()) continue;
-    const std::string found = NonEmptyLogAt(v);
-    if (!found.empty()) return found;
-  }
-  return "";
-}
-
-/**
  * Let a debugger attach to this daemon when CLIO_ALLOW_PTRACE=1. Hosts with
  * kernel.yama.ptrace_scope=1 only allow tracing of descendants, so a hung or
  * stalled runtime could not be sampled with `gdb -p` without restarting it
@@ -366,8 +273,6 @@ int RuntimeStart(int argc, char* argv[]) {
   MaybeAllowPtrace();
   bool induct = false;
   bool fresh = false;
-  bool ephemeral = false;
-  std::vector<char *> restart_args;
   for (int i = 0; i < argc; ++i) {
     VizArg viz_arg = ParseVizArg(argc, argv, i);
     if (viz_arg == VizArg::kBadValue) {
@@ -384,7 +289,6 @@ int RuntimeStart(int argc, char* argv[]) {
     if (std::strcmp(argv[i], "--induct") == 0) {
       induct = true;
     } else if (std::strcmp(argv[i], "--ephemeral") == 0) {
-      ephemeral = true;
       // Skip the default compose: start bare (admin only), to be composed
       // explicitly. Communicated to ConfigManager via CLIO_EPHEMERAL, read
       // during the CLIO_INIT below.
@@ -400,29 +304,22 @@ int RuntimeStart(int argc, char* argv[]) {
     }
   }
 
-  if (!fresh && !ephemeral) {
-    const std::string state = FindRecoverableState();
-    if (!state.empty()) {
-      HLOG(kWarning,
-           "Persistent state found at {}: recovering it (as `restart`). "
-           "Pass --fresh to start empty instead.",
-           state);
-      for (int i = 0; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--fresh") != 0) {
-          restart_args.push_back(argv[i]);
-        }
-      }
-      return RuntimeRestart(static_cast<int>(restart_args.size()),
-                            restart_args.data());
-    }
-  }
-
   std::signal(SIGTERM, SignalHandler);
   std::signal(SIGINT, SignalHandler);
 
-  HLOG(kDebug, "Starting Clio runtime...");
+  // Recovery is the default and only `--fresh` discards state: an operator
+  // (re)starting a service must never lose its data because a flag was
+  // missing.
+  const bool recover = !fresh;
+  if (recover) {
+    HLOG(kInfo, "Starting Clio runtime (recovering persistent state)...");
+  } else {
+    HLOG(kWarning, "Starting Clio runtime with --fresh: this node's "
+         "persistent state is discarded");
+  }
 
-  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kRuntime, true)) {
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kRuntime, true,
+                           /*is_restart=*/recover)) {
     HLOG(kError, "Failed to initialize Clio runtime");
     return 1;
   }
@@ -456,67 +353,3 @@ int RuntimeStart(int argc, char* argv[]) {
   return 0;
 }
 
-int RuntimeRestart(int argc, char* argv[]) {
-  MaybeAllowPtrace();
-  bool induct = false;
-  for (int i = 0; i < argc; ++i) {
-    VizArg viz_arg = ParseVizArg(argc, argv, i);
-    if (viz_arg == VizArg::kBadValue) {
-      PrintRuntimeRestartUsage();
-      return 1;
-    }
-    if (viz_arg == VizArg::kConsumed) {
-      continue;
-    }
-    if (std::strcmp(argv[i], "--induct") == 0) {
-      induct = true;
-    } else if (std::strcmp(argv[i], "--help") == 0 ||
-               std::strcmp(argv[i], "-h") == 0) {
-      PrintRuntimeRestartUsage();
-      return 0;
-    } else {
-      HLOG(kError, "Unknown argument: {}", argv[i]);
-      PrintRuntimeRestartUsage();
-      return 1;
-    }
-  }
-
-  std::signal(SIGTERM, SignalHandler);
-  std::signal(SIGINT, SignalHandler);
-
-  HLOG(kInfo, "Restarting Clio runtime (WAL replay enabled)...");
-
-  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kRuntime, true,
-                           /*is_restart=*/true)) {
-    HLOG(kError, "Failed to restart Clio runtime");
-    return 1;
-  }
-
-  HLOG(kInfo, "Clio runtime restarted successfully");
-
-  if (!InitializeAdminChiMod()) {
-    HLOG(kError, "FATAL ERROR: Failed to find or initialize admin ChiMod");
-    return 1;
-  }
-
-  HLOG(kDebug, "Admin ChiMod initialized successfully with pool ID {}", clio::run::kAdminPoolId);
-
-  EnableVizForDaemon();
-
-  if (induct) {
-    if (!InductNode()) {
-      HLOG(kError, "FATAL ERROR: Failed to induct node into cluster");
-      return 1;
-    }
-  }
-
-  RunUntilStopped();
-
-  HLOG(kDebug, "Shutting down Clio runtime...");
-  // The admin pool is NOT destroyed here — ServerFinalize()'s
-  // DestroyAllContainers() does it after StopWorkers(). See the
-  // "no ShutdownAdminChiMod()" note near the top of this file for why tearing
-  // it down while the workers still run wedges the shutdown.
-  HLOG(kDebug, "Clio runtime stopped (finalization will happen automatically)");
-  return 0;
-}

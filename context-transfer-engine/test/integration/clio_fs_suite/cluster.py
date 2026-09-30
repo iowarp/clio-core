@@ -2,7 +2,7 @@
 """Deploy / tear down / fault-inject a clio-fs cluster over ssh.
 
 One clio_run daemon per node, the filesystem + CTE chain composed from the
-server config on every node (so `clio_run start` and `clio_run restart`
+server config on every node (so `clio_run start` and `clio_run start --fresh`
 bring the whole stack back with no separate compose step), and one
 clio_cte_fuse mount per node at the same node-local path.
 
@@ -311,15 +311,17 @@ compose:
     return (f'if ! grep -q " {m} " /proc/self/mountinfo; then '
             f'chmod -R u+w {m} 2>/dev/null; rm -rf {m}; mkdir -p {m}; fi')
 
-  def start_runtime(self, host, mode='start'):
-    """Launch `clio_run <mode>` (start|restart) detached on host."""
+  def start_runtime(self, host, fresh=False):
+    """Launch `clio_run start` detached on host. It recovers the node's
+    persistent state; fresh=True passes --fresh (discard it, start empty)."""
     log = self.log_path(host, 'runtime')
+    args = 'start --fresh' if fresh else 'start'
     # CLIO_SUITE_GDB=1 runs the daemon under gdb and dumps every thread's
     # stack into the runtime log if it crashes (silent SIGSEGV otherwise).
     cmd = (f'{self.env_prefix()} nohup {self._gdb("runtime")}'
-           f'{self.bin_dir}/clio_run {mode} '
+           f'{self.bin_dir}/clio_run {args} '
            f'--no-viz </dev/null >>{log} 2>&1 &')
-    sh(host, f'echo "=== {time.ctime()} clio_run {mode}" >> {log}; {cmd}')
+    sh(host, f'echo "=== {time.ctime()} clio_run {args}" >> {log}; {cmd}')
 
   def gdb_prefix(self):
     """Command prefix running a daemon under gdb when CLIO_SUITE_GDB=1: a
@@ -432,12 +434,13 @@ compose:
     self.agents = {}
 
   # -- whole-cluster -------------------------------------------------------
-  def up(self, wipe=True, mode='start'):
-    """Bring every node up; return (ok, message)."""
+  def up(self, wipe=True):
+    """Bring every node up; return (ok, message). wipe=True is a new
+    deployment: its data is removed and every daemon starts --fresh."""
     self.write_config()
     if wipe:
       parallel(self.wipe, self.hosts)
-    parallel(lambda h: self.start_runtime(h, mode), self.hosts)
+    parallel(lambda h: self.start_runtime(h, fresh=wipe), self.hosts)
     ups = parallel(self.runtime_up, self.hosts)
     bad = [h for h, ok in zip(self.hosts, ups) if ok is not True]
     if bad:

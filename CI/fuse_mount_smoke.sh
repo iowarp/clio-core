@@ -113,7 +113,7 @@ fi
 
 # --- Start runtime ----------------------------------------------------------
 info "starting Clio runtime"
-clio_run runtime start &
+clio_run runtime start --fresh &
 RUNTIME_PID=$!
 sleep 3
 kill -0 "$RUNTIME_PID" 2>/dev/null || { echo "[smoke] ERROR: runtime died on startup"; exit 1; }

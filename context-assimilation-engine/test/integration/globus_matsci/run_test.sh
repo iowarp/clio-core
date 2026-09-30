@@ -80,7 +80,7 @@ echo ""
 # CTE (pool 512.0) and CAE (pool 400.0) automatically on startup.
 echo "Starting Clio runtime..."
 export CLIO_SERVER_CONF="${RUNTIME_CONF}"
-clio_run runtime start &
+clio_run runtime start --fresh &
 CLIO_PID=$!
 echo "Clio runtime started (PID: ${CLIO_PID})"
 echo ""

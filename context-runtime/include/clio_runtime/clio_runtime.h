@@ -75,8 +75,10 @@ enum class RuntimeMode {
  * @param default_with_runtime Default behavior if CLIO_WITH_RUNTIME env var not set
  *        If true, will start runtime in addition to client initialization
  *        If false, will only initialize client components
- * @param is_restart If true, force restart_=true on compose pools and replay WAL
- *        after compose to recover address table state from before the crash
+ * @param is_restart If true (a plain `clio_run start`), recover the node's
+ *        persistent state: compose pools take their Restart() path and the
+ *        logs are replayed. If false (`clio_run start --fresh`, and the
+ *        in-process runtime of CLIO_RUNTIME_INIT), that state is discarded.
  * @return true if initialization successful, false otherwise
  *
  * Environment variable:

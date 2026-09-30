@@ -178,8 +178,10 @@ class ClioRuntime(Service):
             },
             {
                 'name': 'ephemeral',
-                'msg': ('Start the runtime with `--ephemeral` (a completely '
-                        'fresh session that ignores saved pool/compose state). '
+                'msg': ('Start the runtime with `--fresh --ephemeral` (a '
+                        'completely fresh session that discards saved '
+                        'pool/compose state; `clio_run start` alone recovers '
+                        'it). '
                         'Defaults to true because Jarvis pipelines are '
                         'reproducible test/benchmark runs that should not '
                         'inherit a previous deployment. Set to false for a '
@@ -350,10 +352,12 @@ class ClioRuntime(Service):
              PsshExecInfo(hostfile=self.hostfile)).run()
 
         cmd = 'clio_run runtime start'
-        # Jarvis runs default to a fresh session; a persistent deployment
-        # (ephemeral=false) recomposes saved pools + replays the WAL instead.
+        # Jarvis runs default to a fresh session (--fresh discards saved
+        # state; --ephemeral skips the default compose); a persistent
+        # deployment (ephemeral=false) runs a plain `start`, which recovers
+        # saved pools and replays the WAL.
         if self.config.get('ephemeral', True):
-            cmd += ' --ephemeral'
+            cmd += ' --fresh --ephemeral'
 
         exec_info = PsshExecInfo(
             env=self.env,

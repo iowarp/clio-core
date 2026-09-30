@@ -971,6 +971,8 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     ReserveRestoredBlockSpace();
   }
 
+  if (!is_restart_) DiscardPersistentMetadata();
+
   // Open WAL files if metadata_log_path is configured
   if (!config_.performance_.metadata_log_path_.empty()) {
     clio::run::u32 num_workers =
@@ -7963,6 +7965,33 @@ void Runtime::ReplayTransactionLogs() {
 
   HLOG(kInfo, "ReplayTransactionLogs: Replayed {} tag ops and {} blob ops",
        tags_replayed, blobs_replayed);
+}
+
+void Runtime::DiscardPersistentMetadata() {
+  const std::string &path = config_.performance_.metadata_log_path_;
+  if (path.empty()) return;
+  // A fresh start (`clio_run start --fresh`) begins empty. The WAL shards are
+  // opened in append mode and the snapshot is only rewritten when needed, so
+  // left alone the previous run's metadata would survive and be replayed --
+  // interleaved with this run's records, whose seqs restart at 1 -- by the
+  // next (recovering) start.
+  namespace fs = std::filesystem;
+  const fs::path p(path);
+  const std::string base = p.filename().string();
+  const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+  std::error_code ec;
+  size_t removed = 0;
+  for (const auto &ent : fs::directory_iterator(dir, ec)) {
+    const std::string name = ent.path().filename().string();
+    const bool snapshot = name == base || name == base + ".tmp";
+    const bool shard = name.rfind(base + ".blob.", 0) == 0 ||
+                       name.rfind(base + ".tag.", 0) == 0;
+    if ((snapshot || shard) && fs::remove(ent.path(), ec)) ++removed;
+  }
+  if (removed > 0) {
+    HLOG(kInfo, "cte_core: fresh start discarded {} metadata log file(s) at {}",
+         removed, path);
+  }
 }
 
 void Runtime::ApplyWalCreateTag(const std::vector<char> &payload,

@@ -206,9 +206,10 @@ bool FsBdevTransport::Init(const CreateParams& params,
 }
 
 bool FsBdevTransport::OpenAllocLog(const CreateParams& params) {
-  // An explicit alloc_log always recovers. The default log recovers only on
-  // a runtime restart: a fresh start has no metadata referencing the old
-  // bytes, so their allocations are garbage and the log starts empty.
+  // An explicit alloc_log always recovers. The default log recovers on every
+  // recovering start (a plain `clio_run start`); after `start --fresh` no
+  // metadata references the old bytes, so their allocations are garbage and
+  // the log starts empty.
   const bool explicit_path = !params.alloc_log_path_.empty();
   const std::string path =
       explicit_path ? params.alloc_log_path_ : file_path_ + ".alloc_log";
