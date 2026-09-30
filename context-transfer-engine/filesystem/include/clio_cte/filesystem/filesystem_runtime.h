@@ -35,6 +35,7 @@
 #define CLIO_CTE_FILESYSTEM_FILESYSTEM_RUNTIME_H_
 
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <set>
 #include <memory>
@@ -240,6 +241,20 @@ class Runtime : public clio::run::Container {
   };
 
   /** Request of one ShardOp (a superset; each op reads what it needs). */
+  /** How long a node serves a cached directory block or inode attributes
+   *  without asking the home (ms), measured from when it asked. */
+  static constexpr clio::run::u64 kCacheLeaseMs = 10000;
+  /** Extra the home waits past a lease (ms): the holder's clock started it
+   *  earlier than the home's did. */
+  static constexpr clio::run::u64 kCacheLeaseSlackMs = 2000;
+  /** Steady-clock milliseconds (lease times). @return now */
+  static clio::run::u64 SteadyMs() {
+    return static_cast<clio::run::u64>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+  }
+
   struct FsReq {
     std::string dir_, leaf_, str_, str2_;
     clio::run::u64 id_ = 0, a_ = 0, b_ = 0;
@@ -287,6 +302,9 @@ class Runtime : public clio::run::Container {
   clio::run::u32 split_entries_ = 1024;
   /** Next holder registration number (blocks and inodes). */
   std::atomic<clio::run::u64> reg_seq_{1};
+  /** When this container started (steady ms): a lease granted by an earlier
+   *  incarnation runs out by started_ms_ + kCacheLeaseMs + slack. */
+  clio::run::u64 started_ms_ = 0;
 
   // ---- inodes this container is home for ----
   struct FileInfo {
@@ -309,6 +327,8 @@ class Runtime : public clio::run::Container {
     /** Loaded from its record: who caches it is unknown (the home restarted
      *  or moved), so the next store pushes to every container. */
     bool holders_unknown_ = false;
+    /** When each holder's lease on the cached attributes runs out. */
+    std::map<clio::run::u32, clio::run::u64> holder_lease_ms_;
   };
   std::mutex meta_mu_;  ///< guards handles_, by_tag_ and FileInfo fields
   std::unordered_map<clio::run::u64, std::shared_ptr<FileInfo>> handles_;
@@ -353,6 +373,12 @@ class Runtime : public clio::run::Container {
      *  or moved), so the next commit pushes a snapshot to every container
      *  and registers those that answer. */
     bool holders_unknown_ = false;
+    /** Home: when each holder's lease runs out (steady ms, see
+     *  kCacheLeaseMs); a change is acknowledged only once every holder got
+     *  it or its lease has run out. */
+    std::map<clio::run::u32, clio::run::u64> holder_lease_ms_;
+    /** Copy: served without asking the home until then (steady ms). */
+    clio::run::u64 lease_until_ms_ = 0;
   };
   std::mutex ns_mu_;  ///< guards blocks_, loading_, early_ and every slot
   std::unordered_map<BlockKey, std::shared_ptr<BlockSlot>, BlockKeyHash> blocks_;
@@ -367,6 +393,7 @@ class Runtime : public clio::run::Container {
     FsAttr attr_;
     std::string symlink_;
     clio::run::u32 home_ = 0;  ///< the home that registered this copy
+    clio::run::u64 lease_until_ms_ = 0;  ///< served without asking until
   };
   std::mutex icache_mu_;  ///< guards icache_ and iloading_
   std::unordered_map<clio::run::u64, InodeCacheEnt> icache_;
@@ -478,6 +505,91 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume ServeBlockFetch(const FsReq &req, FsResp &resp);
   /**
+   * Load a block this container is home of from its blob (materializing
+   * "/"), jumping its version past every earlier incarnation's.
+   * @param dir directory id
+   * @param k block index
+   * @param slot the new slot to fill
+   * @param lrc 0 or an errno
+   */
+  clio::run::TaskResume LoadHomeBlock(clio::run::u64 dir, clio::run::u32 k,
+                                      std::shared_ptr<BlockSlot> slot,
+                                      int &lrc);
+  /**
+   * Fetch a copy of a block from its home, registering as a holder and
+   * taking a lease on the copy.
+   * @param dir directory id
+   * @param k block index
+   * @param home the block's home container
+   * @param slot the new slot to fill
+   * @param lrc 0, kFsRedirect or an errno
+   */
+  clio::run::TaskResume FetchBlock(clio::run::u64 dir, clio::run::u32 k,
+                                   clio::run::u32 home,
+                                   std::shared_ptr<BlockSlot> slot, int &lrc);
+  /**
+   * The containers a home block's next push goes to (ns_mu_ held).
+   * @param slot the home block
+   * @param resync true: every other container (holders unknown after a
+   *        reload), with leases no shorter than this incarnation's horizon
+   * @param holders out: containers to push to
+   * @param leases out: their lease ends (steady ms), parallel to holders
+   */
+  void PushTargetsLocked(const BlockSlot &slot, bool resync,
+                         std::vector<clio::run::u32> *holders,
+                         std::vector<clio::run::u64> *leases);
+  /**
+   * Look a block up in this container's cache.
+   * @param key the block
+   * @param home the block's current home
+   * @param out set when the cached slot can be used as is (the home's own,
+   *        or a copy from that home within its lease)
+   * @param expired set to a copy from that home whose lease ran out
+   * @return true when out was set
+   */
+  bool FindCachedBlock(const BlockKey &key, clio::run::u32 home,
+                       std::shared_ptr<BlockSlot> *out,
+                       std::shared_ptr<BlockSlot> *expired);
+  /**
+   * Deregister holders a push found gone. Only the registration the push
+   * went to is removed (a holder that fetched again meanwhile stays), and a
+   * lease is forgotten only once it has run out.
+   * @param gone holders PushToHolders gave up on
+   * @param pushed the registrations (holder -> seq) the push went to
+   * @param holders the block's / inode's current registrations
+   * @param leases the matching lease ends (steady ms)
+   */
+  static void DropGoneHolders(
+      const std::vector<clio::run::u32> &gone,
+      const std::map<clio::run::u32, clio::run::u64> &pushed,
+      std::map<clio::run::u32, clio::run::u64> *holders,
+      std::map<clio::run::u32, clio::run::u64> *leases);
+  /**
+   * Publish a block LoadBlock just loaded (or failed to): clear the loading
+   * mark, apply pushes that raced the fetch, and cache it on success.
+   * @param key the block
+   * @param slot the loaded slot
+   * @param lrc the load's result (the slot is cached only when 0)
+   * @param out set to slot on success
+   */
+  void InstallLoadedBlock(const BlockKey &key, std::shared_ptr<BlockSlot> slot,
+                          int lrc, std::shared_ptr<BlockSlot> *out);
+  /** FsResp::id_ of a fetch whose req.b_ matched the home's version. */
+  static constexpr clio::run::u64 kFetchUnchanged = 1;
+  /**
+   * Renew the lease on a cached (non-home) block whose lease ran out: ask
+   * the home whether it is still at our version and take its image if not.
+   * @param slot the cached block
+   * @param dir directory id
+   * @param k block index
+   * @param home the block's home container
+   * @param rc 0 (copy current, lease renewed), kFsRedirect (not the home
+   *           any more) or an errno (unreachable: never serve the copy)
+   */
+  clio::run::TaskResume RevalidateBlock(std::shared_ptr<BlockSlot> slot,
+                                        clio::run::u64 dir, clio::run::u32 k,
+                                        clio::run::u32 home, int &rc);
+  /**
    * Holder side of a push: apply the deltas in req.str_ to cached copies.
    * @return 0, or ENOENT when some block is not cached here (the home then
    *         stops pushing it here)
@@ -503,12 +615,22 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume CommitBlock(std::shared_ptr<BlockSlot> slot,
                                     clio::run::u64 version, int &rc);
   /**
-   * Send `deltas` to every holder in parallel and wait for them; holders
-   * that are dead or no longer cache the block are returned in `gone`.
+   * Send a push (shard op `op`, request `req`) to every holder of a cached
+   * block or inode in parallel and wait for them. Holders that no longer
+   * cache it, or that could not be reached before their lease ran out, are
+   * returned in `gone`. A holder is never given up on while its lease is
+   * valid: it could still serve the old copy.
+   * @param op kShardBlockPush or kShardInodePush
+   * @param req the push
+   * @param holders containers caching it
+   * @param leases each holder's lease end (steady ms), parallel to holders
+   * @param gone out: holders to deregister
    */
-  clio::run::TaskResume PushDeltas(const std::vector<clio::run::u32> &holders,
-                                   const std::string &deltas,
-                                   std::vector<clio::run::u32> *gone);
+  clio::run::TaskResume PushToHolders(
+      clio::run::u32 op, const FsReq &req,
+      const std::vector<clio::run::u32> &holders,
+      const std::vector<clio::run::u64> &leases,
+      std::vector<clio::run::u32> *gone);
   /** Insert / replace an entry in a home block (ns_mu_ held). */
   int InsertEntryLocked(BlockSlot &slot, const FsReq &req, FsResp &resp);
   /** Remove / mark / restore an entry in a home block (ns_mu_ held). */
@@ -751,6 +873,15 @@ class Runtime : public clio::run::Container {
   /** Set once a non-volatile placement of an inode record failed but a RAM
    *  one succeeded: the deployment has no persistent tier to put them on. */
   bool inode_volatile_only_ = false;
+  /**
+   * Store one inode record in its CTE tag (non-volatile tier first, RAM if
+   * no tier accepts it).
+   * @param packed the inode's packed tag id
+   * @param rec the encoded record (EncInodeRec)
+   * @param rc the PutBlob return code (0 on success)
+   */
+  clio::run::TaskResume StoreInodeRec(clio::run::u64 packed,
+                                      const std::string &rec, int &rc);
   /** Store every dirty inode record and push it to its holders. */
   clio::run::TaskResume FlushInodes();
   /**

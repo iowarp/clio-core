@@ -269,3 +269,53 @@ def t_cache_after_home_restart(ctx):
         misses.append(('list', d, i, c))
   ctx.check(not misses, f'{len(misses)} changes after the home restart not '
                         f'seen by a cache, e.g. {misses[:6]}')
+
+
+@test('partitioned_cache_not_stale', 'dirs', min_nodes=3, redeploy_after=True,
+      timeout=1800)
+def t_partitioned_cache(ctx):
+  """Every node caches a directory; then the last node is cut off (nobody
+  can send to it) while it stays alive to everyone. Changes made
+  meanwhile cannot be pushed to it, so its cached copies are stale. It
+  must never serve them as current: a lookup of a file created during the
+  partition must not answer a plain ENOENT, a chmod must not read back the
+  old mode -- an error (EIO / ETIMEDOUT) is acceptable, a stale answer is
+  not. After the partition heals the node sees everything."""
+  import time
+  n = len(ctx.hosts)
+  a = n - 1
+  d = ctx.p('part')
+  ctx.ok(0, 'mkdir', path=d)
+  ctx.ok(0, 'write_file', path=f'{d}/f0', size=100, seed=1)
+  ctx.ok(0, 'sh', cmd=f'chmod 644 {d}/f0')
+  for i in range(n):
+    ctx.ok(i, 'scandir_count', path=d)
+    ctx.ok(i, 'stat', path=f'{d}/f0')
+  for i in range(n - 1):
+    ctx.cl.partition(ctx.hosts[i], [a])
+  time.sleep(2)
+  t0 = time.time()
+  ctx.ok(0, 'write_file', path=f'{d}/f1', size=100, seed=2, timeout=300)
+  ctx.ok(0, 'sh', cmd=f'chmod 600 {d}/f0', timeout=300)
+  ctx.metrics['change_during_partition_s'] = round(time.time() - t0, 1)
+  stale = []
+  r = ctx.call(a, 'stat', path=f'{d}/f1', timeout=300)
+  if not r['ok'] and (r.get('err') or '').startswith('ENOENT'):
+    stale.append('f1 created during the partition: ENOENT')
+  r = ctx.call(a, 'stat', path=f'{d}/f0', timeout=300)
+  if r['ok'] and r['ret']['perm'] != 0o600:
+    stale.append(f'f0 mode {oct(r["ret"]["perm"])}, set to 0o600')
+  for i in range(n - 1):
+    ctx.cl.heal(ctx.hosts[i])
+  ctx.check(not stale, f'the partitioned node served stale copies as '
+                       f'current: {stale}')
+  ok = False
+  for _ in range(60):
+    st = ctx.call(a, 'stat', path=f'{d}/f1')
+    st0 = ctx.call(a, 'stat', path=f'{d}/f0')
+    if st['ok'] and st0['ok'] and st0['ret']['perm'] == 0o600:
+      ok = True
+      break
+    time.sleep(2)
+  ctx.check(ok, 'after the partition healed the node still does not see '
+                'the changes made during it')

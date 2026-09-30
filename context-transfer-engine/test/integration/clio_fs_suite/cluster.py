@@ -161,6 +161,8 @@ class Cluster:
         'CLIO_WITH_RUNTIME': '0',
         'CLIO_IPC_MODE': 'SHM',
         'CLIO_MEMFD_DIR': f'{self.local_root}/memfd',
+        # Test-only partition hook (see partition()): absent file = none.
+        'CLIO_TEST_PARTITION_FILE': f'{self.local_root}/test_partition',
         'CTP_LOG_LEVEL': os.environ.get('CLIO_SUITE_LOG_LEVEL', 'warning'),
         'PATH': f'{self.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin',
         # The login shell's LD_LIBRARY_PATH (e.g. another build's bin dir)
@@ -363,6 +365,16 @@ compose:
       self.kill_runtime(host)
       return False
     return True
+
+  def partition(self, host, node_ids):
+    """Make `host`'s daemon unable to send to `node_ids` (test hook:
+    CLIO_TEST_PARTITION_FILE; takes effect within ~0.5 s)."""
+    ids = ' '.join(str(i) for i in node_ids)
+    sh(host, f'echo "{ids}" > {self.local_root}/test_partition')
+
+  def heal(self, host):
+    """Undo partition() on `host`."""
+    sh(host, f'rm -f {self.local_root}/test_partition')
 
   def kill_runtime(self, host, sig='KILL'):
     sh(host, f'pkill -{sig} -u $USER -f "[c]lio_run (start|restart)"')

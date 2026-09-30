@@ -49,12 +49,34 @@ extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 #include <clio_ctp/thread/thread_model_manager.h>
 
 #include <atomic>
+#include <unordered_set>
+#include <mutex>
+#include <fstream>
 #include <cerrno>
 #include <chrono>
 #include <thread>
 #include <unordered_map>
 
 namespace clio::run {
+
+bool Run2RunTestPartitioned(u32 node_id) {
+  static const char *path = std::getenv("CLIO_TEST_PARTITION_FILE");
+  if (path == nullptr || *path == '\0') return false;
+  static std::mutex mu;
+  static std::unordered_set<u32> blocked;
+  static std::chrono::steady_clock::time_point read_at{};
+  std::lock_guard<std::mutex> g(mu);
+  const auto now = std::chrono::steady_clock::now();
+  if (now - read_at > std::chrono::milliseconds(500)) {
+    read_at = now;
+    blocked.clear();
+    std::ifstream in(path);
+    u32 id = 0;
+    while (in >> id) blocked.insert(id);
+  }
+  return blocked.count(node_id) != 0;
+}
+
 
 // TEMP NET TRACE (issue #892 diagnosis): per-stage nanosecond totals for the
 // cross-node task path, dumped every 32 ops when CLIO_NET_TRACE=1.
@@ -286,10 +308,11 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
     }
     task_copy->pool_query_.SetReturnNode(ipc_manager->GetNodeId());
 
-    if (!ipc_manager->IsAlive(target_node_id)) {
+    const bool partitioned = Run2RunTestPartitioned(target_node_id);
+    if (!ipc_manager->IsAlive(target_node_id) || partitioned) {
       float net_timeout = origin_task->pool_query_.GetNetTimeout();
       if ((net_timeout >= 0 && net_timeout < 0.001f) ||
-          Run2RunFailFastDead()) {
+          Run2RunFailFastDead() || partitioned) {
         // Rate-limited: with a node down every task routed to it lands here,
         // and one synchronous log line per task on the network worker was
         // itself enough to stall it.

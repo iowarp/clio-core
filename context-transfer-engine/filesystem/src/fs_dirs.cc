@@ -76,10 +76,11 @@ inline clio::run::u64 NowNs() { return clio::cte::core::GetWallTimeNs(); }
 constexpr double kCommitPollUs = 10.0;
 /** Wait between checks while another task loads the same block (us). */
 constexpr double kLoadPollUs = 20.0;
+/** Version jump when a home loads a block from its blob: more changes
+ *  than one incarnation of a home can make to one block. */
+constexpr clio::run::u64 kIncarnationStride = 1ull << 32;
 /** A block load, wait or commit slower than this is reported (seconds). */
 constexpr double kSlowBlockOpS = 10.0;
-/** How long a home keeps retrying a push to a live holder (s). */
-constexpr double kPushGiveUpS = 60.0;
 
 /** SetAttr flag bits shared with fs_namespace.cc (kShardDirAttr). */
 enum : clio::run::u32 {
@@ -231,13 +232,33 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
     const bool mine = home == container_id_;
     bool busy = false;
     bool busy_commit = false;
+    std::shared_ptr<BlockSlot> expired;  // a copy whose lease ran out
+    if (FindCachedBlock(key, home, &out, &expired)) CLIO_CO_RETURN;
+    if (expired != nullptr) {
+      // Ask the home before serving it again: a change it could not push
+      // here (a partition) must not be answered from the old copy.
+      CLIO_CO_AWAIT(RevalidateBlock(expired, dir, k, home, rc));
+      if (rc == 0) {
+        out = expired;
+        CLIO_CO_RETURN;
+      }
+      if (rc != kFsRedirect) CLIO_CO_RETURN;  // unreachable: never stale
+      rc = 0;
+      std::lock_guard<std::mutex> g(ns_mu_);
+      auto it = blocks_.find(key);
+      if (it != blocks_.end() && it->second == expired &&
+          !expired->committing_) {
+        blocks_.erase(it);  // the home moved: load it from the new one
+      }
+      continue;
+    }
     {
       std::lock_guard<std::mutex> g(ns_mu_);
       auto it = blocks_.find(key);
       if (it != blocks_.end()) {
         BlockSlot &s = *it->second;
         if (s.home_ == mine && (mine || s.home_id_ == home)) {
-          out = it->second;
+          out = it->second;  // revalidated by another task meanwhile
           CLIO_CO_RETURN;
         }
         // Its home moved (failover or return): this copy is not current.
@@ -267,39 +288,9 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
     auto slot = std::make_shared<BlockSlot>();
     int lrc = 0;
     if (mine) {
-      CLIO_CO_AWAIT(ReadBlockBlob(dir, k, &slot->blk_, lrc));
-      if (lrc == ENOENT && dir == FsPack(FsRootId()) && k == 0) {
-        // "/" exists by definition: its home materializes it on first use.
-        slot->blk_.dir_ = dir;
-        slot->blk_.version_ = 1;
-        const clio::run::u64 now = NowNs();
-        slot->blk_.hdr_.atime_ = slot->blk_.hdr_.mtime_ =
-            slot->blk_.hdr_.ctime_ = now;
-        slot->persist_dirty_ = true;
-        lrc = 0;
-      }
-      slot->home_ = true;
-      slot->durable_version_ = slot->persist_dirty_ ? 0 : slot->blk_.version_;
-      if (lrc == 0 && NumContainers() > 1) {
-        // Copies cached elsewhere registered with an earlier incarnation of
-        // this home and may be ahead of the blob (non-durable changes bump
-        // the version too): resync them before anyone reads through us.
-        slot->holders_unknown_ = true;
-        slot->durable_version_ = 0;
-      }
+      CLIO_CO_AWAIT(LoadHomeBlock(dir, k, slot, lrc));
     } else {
-      FsReq fr;
-      fr.dir_id_ = dir;
-      fr.block_ = k;
-      fr.a_ = container_id_;
-      FsResp resp;
-      CLIO_CO_AWAIT(CallShard(home, kShardBlockFetch, fr, resp));
-      lrc = static_cast<int>(resp.rc_);
-      if (lrc == 0 && !DecodeDirBlock(resp.str_.data(), resp.str_.size(),
-                                      &slot->blk_)) {
-        lrc = EIO;
-      }
-      slot->home_id_ = home;
+      CLIO_CO_AWAIT(FetchBlock(dir, k, home, slot, lrc));
     }
     {
       const double took = std::chrono::duration<double>(
@@ -310,24 +301,7 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
              static_cast<clio::run::u64>(took * 1000.0), lrc);
       }
     }
-    {
-      std::lock_guard<std::mutex> g(ns_mu_);
-      loading_.erase(key);
-      auto ev = early_.find(key);
-      if (lrc == 0) {
-        if (ev != early_.end()) {
-          for (const DirDelta &x : ev->second) {
-            if (x.kind_ == DirDeltaKind::kOps &&
-                x.new_version_ > slot->blk_.version_) {
-              ApplyDirOps(&slot->blk_, x);
-            }
-          }
-        }
-        blocks_[key] = slot;
-        out = slot;
-      }
-      if (ev != early_.end()) early_.erase(ev);
-    }
+    InstallLoadedBlock(key, slot, lrc, &out);
     if (lrc == kFsRedirect && attempt < 50) {
       // The home and this node disagree about membership for a moment.
       CLIO_CO_AWAIT(clio::run::yield(1000.0));
@@ -341,6 +315,165 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
     }
     CLIO_CO_RETURN;
   }
+  CLIO_TASK_BODY_END
+}
+
+bool Runtime::FindCachedBlock(const BlockKey &key, clio::run::u32 home,
+                              std::shared_ptr<BlockSlot> *out,
+                              std::shared_ptr<BlockSlot> *expired) {
+  const bool mine = home == container_id_;
+  std::lock_guard<std::mutex> g(ns_mu_);
+  auto it = blocks_.find(key);
+  if (it == blocks_.end()) return false;
+  BlockSlot &s = *it->second;
+  if (s.home_ != mine || (!mine && s.home_id_ != home)) return false;
+  if (mine || SteadyMs() < s.lease_until_ms_) {
+    *out = it->second;
+    return true;
+  }
+  *expired = it->second;
+  return false;
+}
+
+void Runtime::DropGoneHolders(
+    const std::vector<clio::run::u32> &gone,
+    const std::map<clio::run::u32, clio::run::u64> &pushed,
+    std::map<clio::run::u32, clio::run::u64> *holders,
+    std::map<clio::run::u32, clio::run::u64> *leases) {
+  const clio::run::u64 now = SteadyMs();
+  for (clio::run::u32 h : gone) {
+    // Only the registration this push went to: a holder that dropped its
+    // copy and fetched again meanwhile stays registered.
+    auto it = holders->find(h);
+    auto pt = pushed.find(h);
+    if (it == holders->end() || pt == pushed.end() ||
+        it->second != pt->second) {
+      continue;
+    }
+    holders->erase(it);
+    auto lt = leases->find(h);
+    if (lt != leases->end() && lt->second <= now) leases->erase(lt);
+  }
+}
+
+void Runtime::InstallLoadedBlock(const BlockKey &key,
+                                 std::shared_ptr<BlockSlot> slot, int lrc,
+                                 std::shared_ptr<BlockSlot> *out) {
+  std::lock_guard<std::mutex> g(ns_mu_);
+  loading_.erase(key);
+  auto ev = early_.find(key);
+  if (lrc == 0) {
+    if (ev != early_.end()) {
+      // Pushes that arrived while the copy was in flight.
+      for (const DirDelta &x : ev->second) {
+        if (x.kind_ == DirDeltaKind::kOps &&
+            x.new_version_ > slot->blk_.version_) {
+          ApplyDirOps(&slot->blk_, x);
+        }
+      }
+    }
+    blocks_[key] = slot;
+    *out = slot;
+  }
+  if (ev != early_.end()) early_.erase(ev);
+}
+
+clio::run::TaskResume Runtime::LoadHomeBlock(clio::run::u64 dir,
+                                             clio::run::u32 k,
+                                             std::shared_ptr<BlockSlot> slot,
+                                             int &lrc) {
+  CLIO_TASK_BODY_BEGIN
+  lrc = 0;
+  CLIO_CO_AWAIT(ReadBlockBlob(dir, k, &slot->blk_, lrc));
+  if (lrc == ENOENT && dir == FsPack(FsRootId()) && k == 0) {
+    // "/" exists by definition: its home materializes it on first use.
+    slot->blk_.dir_ = dir;
+    slot->blk_.version_ = 1;
+    const clio::run::u64 now = NowNs();
+    slot->blk_.hdr_.atime_ = slot->blk_.hdr_.mtime_ =
+        slot->blk_.hdr_.ctime_ = now;
+    slot->persist_dirty_ = true;
+    lrc = 0;
+  }
+  slot->home_ = true;
+  slot->durable_version_ = slot->persist_dirty_ ? 0 : slot->blk_.version_;
+  if (lrc == 0 && NumContainers() > 1) {
+    // Copies cached elsewhere registered with an earlier incarnation of
+    // this home and may be ahead of the blob (non-durable changes bump
+    // the version too): resync them before anyone reads through us.
+    slot->holders_unknown_ = true;
+    slot->durable_version_ = 0;
+    // Versions this incarnation hands out must exceed every version an
+    // earlier one did, or a cached copy that is ahead of the blob would
+    // look current to a revalidation. Persist the jump before serving,
+    // so the next incarnation starts past it too.
+    slot->blk_.version_ += kIncarnationStride;
+    int wrc = 0;
+    CLIO_CO_AWAIT(WriteBlockBlob(dir, k, EncodeDirBlock(slot->blk_, true),
+                                 wrc));
+    if (wrc != 0) slot->persist_dirty_ = true;  // the next commit retries
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::FetchBlock(clio::run::u64 dir,
+                                          clio::run::u32 k,
+                                          clio::run::u32 home,
+                                          std::shared_ptr<BlockSlot> slot,
+                                          int &lrc) {
+  CLIO_TASK_BODY_BEGIN
+  FsReq fr;
+  fr.dir_id_ = dir;
+  fr.block_ = k;
+  fr.a_ = container_id_;
+  FsResp resp;
+  const clio::run::u64 asked_ms = SteadyMs();
+  CLIO_CO_AWAIT(CallShard(home, kShardBlockFetch, fr, resp));
+  lrc = static_cast<int>(resp.rc_);
+  if (lrc == 0 && !DecodeDirBlock(resp.str_.data(), resp.str_.size(),
+                                  &slot->blk_)) {
+    lrc = EIO;
+  }
+  slot->home_id_ = home;
+  // The lease runs from when we asked: the home granted it later.
+  slot->lease_until_ms_ = asked_ms + kCacheLeaseMs;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RevalidateBlock(
+    std::shared_ptr<BlockSlot> slot, clio::run::u64 dir, clio::run::u32 k,
+    clio::run::u32 home, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  clio::run::u64 have = 0;
+  {
+    std::lock_guard<std::mutex> g(ns_mu_);
+    have = slot->blk_.version_;
+  }
+  FsReq fr;
+  fr.dir_id_ = dir;
+  fr.block_ = k;
+  fr.a_ = container_id_;
+  fr.b_ = have;  // "unchanged" if the home is still at this version
+  FsResp resp;
+  const clio::run::u64 asked_ms = SteadyMs();
+  CLIO_CO_AWAIT(CallShard(home, kShardBlockFetch, fr, resp));
+  rc = static_cast<int>(resp.rc_);
+  if (rc != 0) CLIO_CO_RETURN;
+  DirBlock nb;
+  const bool changed = resp.id_ != kFetchUnchanged;
+  if (changed && !DecodeDirBlock(resp.str_.data(), resp.str_.size(), &nb)) {
+    rc = EIO;
+    CLIO_CO_RETURN;
+  }
+  std::lock_guard<std::mutex> g(ns_mu_);
+  // A push may have landed a newer version while we asked: keep it.
+  if (changed && nb.version_ > slot->blk_.version_) {
+    slot->blk_ = std::move(nb);
+  }
+  slot->lease_until_ms_ = asked_ms + kCacheLeaseMs;
+  CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
@@ -360,11 +493,19 @@ clio::run::TaskResume Runtime::ServeBlockFetch(const FsReq &req,
   }
   std::lock_guard<std::mutex> g(ns_mu_);
   const clio::run::u32 holder = static_cast<clio::run::u32>(req.a_);
-  if (holder != container_id_) slot->holders_[holder] = reg_seq_++;
+  if (holder != container_id_) {
+    slot->holders_[holder] = reg_seq_++;
+    slot->holder_lease_ms_[holder] =
+        SteadyMs() + kCacheLeaseMs + kCacheLeaseSlackMs;
+  }
+  resp.rc_ = 0;
+  if (req.b_ != 0 && req.b_ == slot->blk_.version_) {
+    resp.id_ = kFetchUnchanged;  // a lease renewal: the copy is current
+    CLIO_CO_RETURN;
+  }
   // The in-memory state, uncommitted changes included: every later change
   // reaches the holder as a push with a higher version.
   resp.str_ = EncodeDirBlock(slot->blk_, false);
-  resp.rc_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -443,47 +584,84 @@ clio::run::u64 Runtime::RecordChangeLocked(BlockSlot &slot, DirDelta delta,
   return b.version_;
 }
 
-clio::run::TaskResume Runtime::PushDeltas(
-    const std::vector<clio::run::u32> &holders, const std::string &deltas,
+clio::run::TaskResume Runtime::PushToHolders(
+    clio::run::u32 op, const FsReq &req,
+    const std::vector<clio::run::u32> &holders,
+    const std::vector<clio::run::u64> &leases,
     std::vector<clio::run::u32> *gone) {
   CLIO_TASK_BODY_BEGIN
-  std::vector<clio::run::u32> todo = holders;
+  // (holder, lease end) still owed this push
+  std::vector<std::pair<clio::run::u32, clio::run::u64>> todo;
+  for (size_t i = 0; i < holders.size(); ++i) {
+    todo.emplace_back(holders[i], i < leases.size() ? leases[i] : 0);
+  }
   const auto start = std::chrono::steady_clock::now();
+  bool warned = false;
   while (!todo.empty()) {
-    std::vector<std::pair<clio::run::u32, clio::run::Future<ShardOpTask>>> fs;
-    for (clio::run::u32 h : todo) {
-      if (!clio::cte::core::ContainerNodeAlive(pool_id_, h)) {
-        gone->push_back(h);  // a dead node's cache died with it
-        continue;
+    const clio::run::u64 now = SteadyMs();
+    std::vector<std::pair<clio::run::u32, clio::run::u64>> wait;
+    std::vector<std::pair<size_t, clio::run::Future<ShardOpTask>>> fs;
+    for (size_t i = 0; i < todo.size(); ++i) {
+      if (now >= todo[i].second) {
+        // Its lease ran out: it asks the home before using its copy again,
+        // so the change reaches it whenever it comes back.
+        gone->push_back(todo[i].first);
+      } else if (!clio::cte::core::ContainerNodeAlive(pool_id_,
+                                                      todo[i].first)) {
+        wait.push_back(todo[i]);  // may only be cut off: wait out the lease
+      } else {
+        fs.emplace_back(i, SendShard(todo[i].first, op, req));
       }
-      FsReq r;
-      r.str_ = deltas;
-      fs.emplace_back(h, SendShard(h, kShardBlockPush, r));
     }
-    todo.clear();
-    for (auto &hf : fs) {
-      CLIO_CO_AWAIT(hf.second);
+    for (auto &xf : fs) {
+      CLIO_CO_AWAIT(xf.second);
       FsResp resp;
-      if (!ReadShardResp(hf.second, &resp)) {
-        todo.push_back(hf.first);  // unreachable but not declared dead yet
+      const auto &h = todo[xf.first];
+      if (!ReadShardResp(xf.second, &resp)) {
+        wait.push_back(h);  // unreachable: retry until it gets it or expires
       } else if (resp.rc_ == ENOENT) {
-        gone->push_back(hf.first);  // it no longer caches the block
+        gone->push_back(h.first);  // it no longer caches the block
       }
     }
+    todo.swap(wait);
     if (todo.empty()) break;
     const double waited = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
-    if (waited > kPushGiveUpS) {
-      HLOG(kError, "filesystem: {} holder(s) unreachable for {} s but not "
-           "declared dead; dropping them (their caches may be stale)",
-           todo.size(), waited);
-      gone->insert(gone->end(), todo.begin(), todo.end());
-      break;
+    if (!warned && waited > kSlowBlockOpS) {
+      warned = true;
+      HLOG(kWarning, "filesystem: {} cache holder(s) unreachable "
+           "for {} ms; waiting for their leases to run out", todo.size(),
+           static_cast<clio::run::u64>(waited * 1000.0));
     }
     CLIO_CO_AWAIT(clio::run::yield(100000.0));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+void Runtime::PushTargetsLocked(const BlockSlot &slot, bool resync,
+                                std::vector<clio::run::u32> *holders,
+                                std::vector<clio::run::u64> *leases) {
+  if (!resync) {
+    for (const auto &hv : slot.holders_) {
+      holders->push_back(hv.first);
+      auto lt = slot.holder_lease_ms_.find(hv.first);
+      leases->push_back(lt == slot.holder_lease_ms_.end() ? 0 : lt->second);
+    }
+    return;
+  }
+  // Whoever cached it from an earlier incarnation of this home holds a
+  // lease that ends by this horizon at the latest.
+  const clio::run::u64 horizon =
+      started_ms_ + kCacheLeaseMs + kCacheLeaseSlackMs;
+  for (clio::run::u32 c = 0; c < NumContainers(); ++c) {
+    if (c == container_id_) continue;
+    holders->push_back(c);
+    auto lt = slot.holder_lease_ms_.find(c);
+    leases->push_back(lt == slot.holder_lease_ms_.end()
+                          ? horizon
+                          : std::max(horizon, lt->second));
+  }
 }
 
 clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
@@ -494,6 +672,7 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
     std::vector<DirDelta> deltas;
     std::string image;
     std::vector<clio::run::u32> holders;
+    std::vector<clio::run::u64> leases;  // parallel to holders
     std::map<clio::run::u32, clio::run::u64> reg;  // registrations pushed to
     clio::run::u64 v = 0, dir = 0;
     clio::run::u32 k = 0;
@@ -516,12 +695,8 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
           resync = true;
           slot->holders_unknown_ = false;
           deltas.assign(1, SnapshotDelta(slot->blk_));
-          for (clio::run::u32 c = 0; c < NumContainers(); ++c) {
-            if (c != container_id_) holders.push_back(c);
-          }
-        } else {
-          for (const auto &hv : reg) holders.push_back(hv.first);
         }
+        PushTargetsLocked(*slot, resync, &holders, &leases);
       }
     }
     if (!go) {
@@ -533,8 +708,9 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
     if (!image.empty()) CLIO_CO_AWAIT(WriteBlockBlob(dir, k, image, wrc));
     std::vector<clio::run::u32> gone;
     if (!deltas.empty() && !holders.empty()) {
-      const std::string enc = EncodeDirDeltas(deltas);
-      CLIO_CO_AWAIT(PushDeltas(holders, enc, &gone));
+      FsReq pr;
+      pr.str_ = EncodeDirDeltas(deltas);
+      CLIO_CO_AWAIT(PushToHolders(kShardBlockPush, pr, holders, leases, &gone));
     }
     {
       const double took = std::chrono::duration<double>(
@@ -557,14 +733,7 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
           }
         }
       }
-      for (clio::run::u32 h : gone) {
-        // Only the registration this push went to: a holder that dropped its
-        // copy and fetched again meanwhile stays registered.
-        auto it = slot->holders_.find(h);
-        if (it != slot->holders_.end() && it->second == reg[h]) {
-          slot->holders_.erase(it);
-        }
-      }
+      DropGoneHolders(gone, reg, &slot->holders_, &slot->holder_lease_ms_);
       if (wrc != 0) slot->persist_dirty_ = true;  // the next commit retries
       slot->durable_version_ = v;
       slot->committing_ = false;
@@ -955,6 +1124,7 @@ clio::run::TaskResume Runtime::SealBlock(const FsReq &req, FsResp &resp) {
 clio::run::TaskResume Runtime::DropBlock(const FsReq &req, FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   std::vector<clio::run::u32> holders;
+  std::vector<clio::run::u64> leases;
   std::shared_ptr<BlockSlot> sealed;
   {
     std::lock_guard<std::mutex> g(ns_mu_);
@@ -964,7 +1134,7 @@ clio::run::TaskResume Runtime::DropBlock(const FsReq &req, FsResp &resp) {
         resp.rc_ = EBUSY;
         CLIO_CO_RETURN;
       }
-      for (const auto &hv : it->second->holders_) holders.push_back(hv.first);
+      PushTargetsLocked(*it->second, false, &holders, &leases);
       sealed = it->second;
     }
   }
@@ -986,9 +1156,10 @@ clio::run::TaskResume Runtime::DropBlock(const FsReq &req, FsResp &resp) {
     x.index_ = req.block_;
     std::vector<DirDelta> one;
     one.push_back(x);
-    const std::string enc = EncodeDirDeltas(one);
+    FsReq pr;
+    pr.str_ = EncodeDirDeltas(one);
     std::vector<clio::run::u32> gone;
-    CLIO_CO_AWAIT(PushDeltas(holders, enc, &gone));
+    CLIO_CO_AWAIT(PushToHolders(kShardBlockPush, pr, holders, leases, &gone));
   }
   resp.rc_ = 0;
   CLIO_CO_RETURN;

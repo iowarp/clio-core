@@ -93,6 +93,19 @@ inline bool Run2RunFailFastDead() {
   return v;
 }
 
+/**
+ * TEST ONLY -- simulate a network partition. When CLIO_TEST_PARTITION_FILE
+ * names a file, every node id listed in it (whitespace separated) is
+ * unreachable for this node's sends: they fail at once with the network
+ * timeout code, while every other view of the peer (liveness probes, what
+ * other nodes see) is unchanged -- the "partitioned but not declared dead"
+ * case. The file is re-read at most every 500 ms, so a test starts and heals
+ * the partition by rewriting it. Without the variable: always false.
+ * @param node_id the peer a task is about to be sent to
+ * @return true if this node must behave as if it cannot reach node_id
+ */
+bool Run2RunTestPartitioned(u32 node_id);
+
 inline float Run2RunRetryTimeoutSec() {
   static const float v = [] {
     const char *e = std::getenv("CLIO_NET_RETRY_TIMEOUT_S");

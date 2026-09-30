@@ -117,6 +117,9 @@ inline double BackoffUs(int attempt) {
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   FilesystemConfig cfg = task->GetParams();
+  // Caches granted by an earlier incarnation of this container run out by
+  // started_ms_ + lease; resync pushes wait at most that long for them.
+  started_ms_ = SteadyMs();
   next_pool_id_ = cfg.next_pool_id_;
   if (!next_pool_id_.IsNull()) {
     cte_ = clio::cte::core::Client(next_pool_id_);

@@ -337,7 +337,11 @@ clio::run::TaskResume Runtime::ExecInodeOp(clio::run::u32 op, const FsReq &req,
       // A stat from another container caches the result: register it, so
       // every later change reaches it before being acknowledged.
       const clio::run::u32 who = static_cast<clio::run::u32>(req.a_);
-      if (req.b_ != 0 && who != container_id_) fi->holders_[who] = reg_seq_++;
+      if (req.b_ != 0 && who != container_id_) {
+        fi->holders_[who] = reg_seq_++;
+        fi->holder_lease_ms_[who] =
+            SteadyMs() + kCacheLeaseMs + kCacheLeaseSlackMs;
+      }
       break;
     }
     case kShardInodeOpen:
