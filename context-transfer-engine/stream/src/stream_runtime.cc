@@ -92,8 +92,16 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   }
   OpenLog();
   if (is_restart_) {
-    CLIO_CO_AWAIT(FinishOpenPlans());
+    // Merge plans interrupted by the restart finish later, from the drain
+    // tick, once clio-fs has reconciled the restored streams: a stream whose
+    // file was truncated elsewhere meanwhile must drop its old plans, not
+    // replay them at their pre-crash offsets (see ReconcileRestored).
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      plans_pending_ = !open_plans_.empty();
+    }
     CLIO_CO_AWAIT(RecoverStaged());
+    if (plans_pending_) EnsureSequence();
   }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
@@ -270,6 +278,17 @@ clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {
 clio::run::TaskResume Runtime::Sequence(
     clio::run::shared_ptr<SequenceTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  {
+    bool finish = false;
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      if (plans_pending_ && (unverified_.empty() || !GatedAny())) {
+        plans_pending_ = false;
+        finish = true;
+      }
+    }
+    if (finish) CLIO_CO_AWAIT(FinishOpenPlans());
+  }
   const clio::run::u64 now = clio::cte::core::GetWallTimeNs();
   std::vector<PendingAppend> ready;
   {

@@ -68,6 +68,13 @@ bool WaitsForMerge(StreamSizeOp op) {
 // Sizes
 // ===========================================================================
 
+bool Runtime::GatedAny() {
+  if (unverified_.empty()) return false;
+  if (std::chrono::steady_clock::now() < gate_deadline_) return true;
+  unverified_.clear();  // gave up waiting (GatedLocked logs it)
+  return false;
+}
+
 bool Runtime::GatedLocked(const clio::cte::core::TagId &tag) {
   if (unverified_.empty() || unverified_.count(tag) == 0) return false;
   if (std::chrono::steady_clock::now() < gate_deadline_) return true;
@@ -86,10 +93,31 @@ std::vector<clio::cte::core::TagId> Runtime::UnverifiedStreams() {
 
 void Runtime::ReconcileRestored(const clio::cte::core::TagId &tag,
                                 StreamSizeOp op, clio::run::u64 value) {
-  std::lock_guard<std::mutex> g(mu_);
-  clio::run::u64 old_size = 0;
-  ApplySizeOpLocked(tag, op, value, &old_size);
-  unverified_.erase(tag);
+  std::vector<AppendEntry> dropped;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    clio::run::u64 old_size = 0;
+    ApplySizeOpLocked(tag, op, value, &old_size);
+    unverified_.erase(tag);
+    if (op == StreamSizeOp::kSet) {
+      // The file was served elsewhere while this node was down, so merge
+      // plans it had in flight belong to a size that no longer exists:
+      // replaying them would write their bytes at pre-crash offsets (past
+      // a truncate, or over newer appends). They hold only appends no fsync
+      // had waited for yet, which a crash may lose.
+      for (auto it = open_plans_.begin(); it != open_plans_.end();) {
+        if (it->second.tag_ == tag) {
+          dropped.insert(dropped.end(), it->second.entries_.begin(),
+                         it->second.entries_.end());
+          LogDoneLocked(it->first);
+          it = open_plans_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  }
+  if (!dropped.empty()) QueueStagedDelete(dropped);
 }
 
 void Runtime::ReleaseRestored() {

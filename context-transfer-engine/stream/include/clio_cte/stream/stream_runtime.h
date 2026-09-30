@@ -191,6 +191,11 @@ class Runtime : public clio::run::Container {
    */
   bool GatedLocked(const clio::cte::core::TagId &tag);
   /**
+   * Whether any restored stream still waits for reconciliation (mu_ held).
+   * @return true while any is held and the gate time has not passed
+   */
+  bool GatedAny();
+  /**
    * The container serving a stream homed on `home` right now: `home` while
    * its node is alive, else its failover successor.
    * @param home the stream's home container
@@ -321,6 +326,8 @@ class Runtime : public clio::run::Container {
   // home side, guarded by mu_
   std::mutex mu_;
   std::unordered_map<clio::cte::core::TagId, StreamState> streams_;
+  /** Merge plans interrupted by a restart wait to be finished (mu_). */
+  bool plans_pending_ = false;
   /** How long restored streams wait for reconciliation at most (s). */
   static constexpr int kRestoreGateS = 120;
   /** Restored streams not yet reconciled (see UnverifiedStreams; mu_). */
