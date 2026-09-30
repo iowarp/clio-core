@@ -282,9 +282,39 @@ std::string ExpandEnvVars(const std::string &v) {
   return out;
 }
 
+/** Size of a log file holding no records (its header). */
+constexpr std::uintmax_t kEmptyLogBytes = 4;
+
+/**
+ * Whether `path`, or any log beside it named `<path>.<suffix>` (the
+ * metadata WAL shards `.blob.N` / `.tag.N`, a module's `.stream`, ...), holds
+ * records.
+ * @param path a configured metadata_log_path
+ * @return the first non-empty one, or "" when there is none
+ */
+std::string NonEmptyLogAt(const std::string &path) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (fs::exists(path, ec) && fs::file_size(path, ec) > 0) return path;
+  // The snapshot is only rebuilt when the WAL needs compacting, so a node can
+  // hold all of its metadata in WAL shards with no snapshot file at all.
+  const fs::path p(path);
+  const std::string prefix = p.filename().string() + ".";
+  const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+  for (const auto &ent : fs::directory_iterator(dir, ec)) {
+    const std::string name = ent.path().filename().string();
+    if (name.compare(0, prefix.size(), prefix) != 0) continue;
+    if (ent.is_regular_file(ec) && ent.file_size(ec) > kEmptyLogBytes) {
+      return ent.path().string();
+    }
+  }
+  return "";
+}
+
 /**
  * Find persistent state a fresh start would discard: a non-empty
- * `metadata_log_path` of any pool in the server config.
+ * `metadata_log_path` of any pool in the server config, or a non-empty log
+ * beside it (see NonEmptyLogAt).
  *
  * A plain `start` over such state used to come up EMPTY -- every file of a
  * persistent clio-fs deployment vanished because only `restart` replays the
@@ -310,11 +340,9 @@ std::string FindRecoverableState() {
     v.erase(0, v.find_first_not_of(trim));
     v.erase(v.find_last_not_of(trim) + 1);
     v = ExpandEnvVars(v);
-    std::error_code ec;
-    if (!v.empty() && std::filesystem::exists(v, ec) &&
-        std::filesystem::file_size(v, ec) > 0) {
-      return v;
-    }
+    if (v.empty()) continue;
+    const std::string found = NonEmptyLogAt(v);
+    if (!found.empty()) return found;
   }
   return "";
 }
