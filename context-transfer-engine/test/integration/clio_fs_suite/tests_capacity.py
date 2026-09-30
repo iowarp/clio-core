@@ -72,3 +72,47 @@ def t_full_is_enospc(ctx):
                timeout=900)
     ctx.check(v['size_ok'] and not v['mismatch'],
               f'the file written after freeing space reads back wrong: {v}')
+
+
+@test('capacity_writeback_full_is_enospc', 'capacity', min_nodes=1,
+      redeploy_after=True, timeout=7200)
+def t_writeback_full_is_enospc(ctx):
+  """The same, the way ordinary programs write: no fsync, so the bytes go
+  through the batched write-behind path and a full store surfaces at write
+  or close. That failure, a mkdir and a create on the full filesystem all
+  fail ENOSPC -- never EIO -- and deleting files makes room again."""
+  written, err = [], None
+  for k in range(MAX_FILES):
+    path = ctx.p(f'wb{k}')
+    r = ctx.call(0, 'write_file', path=path, size=FILE_SIZE, seed=k,
+                 timeout=900)
+    if not r['ok']:
+      err = r.get('err', '')
+      break
+    written.append(path)
+  ctx.metrics['files_before_full'] = len(written)
+  ctx.check(err is not None, 'the cluster never filled; use a smaller '
+                             '--disk-gb')
+  ctx.metrics['full_error'] = (err or '')[:120]
+  ctx.check(err is not None and err.startswith('ENOSPC'),
+            f'a full cluster failed a buffered write with {err!r}, not ENOSPC')
+  # Metadata on a full filesystem: success (there was room) or ENOSPC.
+  for op, args in (('mkdir', {'path': ctx.p('full_dir')}),
+                   ('write_file', {'path': ctx.p('full_small'), 'size': 4096,
+                                   'seed': 1})):
+    r = ctx.call(0, op, **args)
+    e = r.get('err') or ''
+    ctx.check(r['ok'] or e.startswith('ENOSPC'),
+              f'{op} on a full filesystem failed with {e!r}, not ENOSPC')
+  for p in [ctx.p(f'wb{len(written)}'), ctx.p('full_small')]:
+    ctx.call(0, 'unlink', path=p)
+  for p in written:
+    ctx.ok(0, 'unlink', path=p, timeout=300)
+  ok = False
+  for _ in range(30):
+    if ctx.call(0, 'write_file', path=ctx.p('wb_again'), size=FILE_SIZE,
+                seed=999, timeout=900)['ok']:
+      ok = True
+      break
+    time.sleep(10)
+  ctx.check(ok, 'after deleting every file a 256 MiB write still fails')

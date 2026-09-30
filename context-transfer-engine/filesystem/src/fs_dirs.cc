@@ -161,7 +161,7 @@ clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
   if (g->GetReturnCode() != 0 ||
       !DecodeDirBlock(bytes.data(), bytes.size(), out) || out->dir_ != dir ||
       out->index_ != k) {
-    HLOG(kError, "filesystem: directory block {:x}/{} unreadable", dir, k);
+    HLOG(kError, "filesystem: directory block {}/{} unreadable", dir, k);
     rc = EIO;
   }
   CLIO_CO_RETURN;
@@ -202,9 +202,11 @@ clio::run::TaskResume Runtime::WriteBlockBlob(clio::run::u64 dir,
     }
   }
   if (p->GetReturnCode() != 0) {
-    HLOG(kError, "filesystem: writing directory block {:x}/{} failed (rc {})",
+    HLOG(kError, "filesystem: writing directory block {}/{} failed (rc {})",
          dir, k, p->GetReturnCode());
-    rc = EIO;
+    // A full store is ENOSPC, so a create or mkdir on a full filesystem says
+    // so (as on ext4); anything else is an I/O error.
+    rc = clio::cte::core::PutRcIsNoSpace(p->GetReturnCode()) ? ENOSPC : EIO;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -250,8 +252,9 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
       const double waited = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - wait_t0).count();
       if (waited > next_report_s) {
-        HLOG(kWarning, "filesystem: waiting {:.0f} s for directory block "
-             "{}/{} (home {}, mine {}): {}", waited, dir, k, home, mine,
+        HLOG(kWarning, "filesystem: waiting {} ms for directory block "
+             "{}/{} (home {}, mine {}): {}",
+             static_cast<clio::run::u64>(waited * 1000.0), dir, k, home, mine,
              busy_commit ? "a moved copy is still committing"
                          : "another task is loading it");
         next_report_s += kSlowBlockOpS;
@@ -302,8 +305,8 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
           std::chrono::steady_clock::now() - load_t0).count();
       if (took > kSlowBlockOpS) {
         HLOG(kWarning, "filesystem: loading directory block {}/{} from {} "
-             "took {:.1f} s (rc {})", dir, k, mine ? "its blob" : "its home",
-             took, lrc);
+             "took {} ms (rc {})", dir, k, mine ? "its blob" : "its home",
+             static_cast<clio::run::u64>(took * 1000.0), lrc);
       }
     }
     {
@@ -537,7 +540,8 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
           std::chrono::steady_clock::now() - commit_t0).count();
       if (took > kSlowBlockOpS) {
         HLOG(kWarning, "filesystem: committing directory block {}/{} took "
-             "{:.1f} s ({} holders{})", dir, k, took, holders.size(),
+             "{} ms ({} holders{})", dir, k,
+             static_cast<clio::run::u64>(took * 1000.0), holders.size(),
              resync ? ", resync" : "");
       }
     }
@@ -565,7 +569,7 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
       slot->committing_ = false;
     }
     if (wrc != 0) {
-      rc = EIO;
+      rc = wrc;  // ENOSPC or EIO (WriteBlockBlob)
       break;
     }
   }
@@ -834,7 +838,7 @@ clio::run::TaskResume Runtime::SplitBlock(std::shared_ptr<BlockSlot> slot) {
     int crc = 0;
     CLIO_CO_AWAIT(CommitBlock(slot, v, crc));
   } else {
-    HLOG(kWarning, "filesystem: splitting directory block {:x}/{} failed "
+    HLOG(kWarning, "filesystem: splitting directory block {}/{} failed "
          "(rc {}); it stays whole", child.dir_, child.index_ - (1u << d),
          irr.rc_);
   }

@@ -239,7 +239,7 @@ clio::run::TaskResume Runtime::FlushInodes() {
         }
       }
       if (p->GetReturnCode() != 0) {
-        HLOG(kWarning, "filesystem: storing inode {:x} failed (rc {}); will "
+        HLOG(kWarning, "filesystem: storing inode {} failed (rc {}); will "
              "retry", w.packed, p->GetReturnCode());
         if (fit != by_tag_.end()) inode_dirty_.insert(w.packed);
       }
@@ -351,7 +351,7 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed) {
   auto fi = std::make_shared<FileInfo>();
   clio::run::u64 size = 0;
   if (g->GetReturnCode() != 0 || !DecInodeRec(rec, fi.get(), &size)) {
-    HLOG(kError, "filesystem: inode record {:x} unreadable", packed);
+    HLOG(kError, "filesystem: inode record {} unreadable", packed);
     CLIO_CO_RETURN;
   }
   fi->tag_id_ = tag;

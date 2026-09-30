@@ -894,17 +894,24 @@ static constexpr clio::run::u32 kReplicaAbsentRc = 12;
 /** PutBlob could not place the bytes: every eligible tier is full (10 +
  *  ExtendBlob's out-of-space code). A filesystem reports it as ENOSPC. */
 static constexpr clio::run::u32 kPutNoSpaceRc = 13;
+/** The replication chimod reports a failed write-through (durable) copy as
+ *  this offset + the core's PutBlob code. */
+static constexpr clio::run::u32 kReplicaPutRcBase = 30;
 /**
  * Whether a PutBlob return code means the bytes did not fit: 11-13 are
  * 10 + ExtendBlob's capacity codes (no target with space, no target able to
- * hold the request, tier exhausted). A filesystem reports all three as
- * ENOSPC. (Replica-protocol UPDATE_ONLY writes reuse 12 as
- * kReplicaAbsentRc; this is for ordinary puts.)
+ * hold the request, tier exhausted), and 41-43 are the same codes from the
+ * replication chimod's durable copy (kReplicaPutRcBase + 11-13) -- which is
+ * what a full persistent tier returns when replication is on. A filesystem
+ * reports all of them as ENOSPC. (Replica-protocol UPDATE_ONLY writes reuse
+ * 12 as kReplicaAbsentRc; this is for ordinary puts.)
  * @param rc PutBlob return code
  * @return true for an out-of-space failure
  */
 inline constexpr bool PutRcIsNoSpace(clio::run::u32 rc) {
-  return rc >= 11 && rc <= kPutNoSpaceRc;
+  return (rc >= 11 && rc <= kPutNoSpaceRc) ||
+         (rc >= kReplicaPutRcBase + 11 &&
+          rc <= kReplicaPutRcBase + kPutNoSpaceRc);
 }
 /** PutBlob with Context::kPutIfAbsent found the blob already there. */
 static constexpr clio::run::u32 kPutExistsRc = 60;

@@ -1590,7 +1590,9 @@ class Client : public clio::run::ContainerClient {
     int err = 0;
     if (t == nullptr || t->GetReturnCode() != 0) {
       reg.errors_.fetch_add(1);
-      err = EIO;
+      // A full store is ENOSPC (as on ext4); only other failures are EIO.
+      err = (t != nullptr && PutRcIsNoSpace(t->GetReturnCode())) ? ENOSPC
+                                                                 : EIO;
     }
     clio::run::u64 bytes = 0;
     for (const auto &e : entry.ents_) bytes += e.size_;
@@ -1668,7 +1670,9 @@ class Client : public clio::run::ContainerClient {
       int err = 0;
       if (t == nullptr || t->GetReturnCode() != 0) {
         reg.errors_.fetch_add(1);
-        err = EIO;
+        // A full store is ENOSPC (as on ext4); only other failures are EIO.
+        err = (t != nullptr && PutRcIsNoSpace(t->GetReturnCode())) ? ENOSPC
+                                                                   : EIO;
       }
       clio::run::u64 bytes = 0;
       for (const auto &e : entry.ents_) bytes += e.size_;
