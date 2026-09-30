@@ -148,6 +148,7 @@ constexpr bool CteAllocIsCapacityFailure(clio::run::u32 rc) {
   return rc >= kCteAllocNoTargetSpace && rc <= kCteAllocExhausted;
 }
 
+
 // min_tier_score for the make-room eviction: 0.0 offers every tier as a
 // candidate. Scoping it to the tier that actually failed would need the
 // placement engine's target choice, which is not exposed here.
@@ -7822,27 +7823,35 @@ void Runtime::ReplayTransactionLogs() {
   // applies at read time: only when the primary itself reports empty, not
   // when it merely differs from a replica (a genuinely partial primary
   // still wins as the freshest copy).
-  tag_id_to_info_.for_each([&](const TagId &tag_id, std::shared_ptr<TagInfo> &tag_info_sp) { TagInfo &tag_info = *tag_info_sp; (void)tag_info;
-    clio::run::u64 total = 0;
-    std::string tag_prefix = std::to_string(tag_id.major_) + "." +
-                             std::to_string(tag_id.minor_) + ".";
-    tag_blob_name_to_info_.for_each(
-        [&tag_prefix, &total](const std::string &key,
-                              const std::shared_ptr<BlobInfo> &blob_info_sp) { const BlobInfo &blob_info = *blob_info_sp; (void)blob_info;
-          if (key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
-            clio::run::u64 blob_total = blob_info.GetTotalSize();
-            if (blob_total == 0) {
-              for (const auto &rep : blob_info.replicas_) {
-                if (rep.total_size_cache_ > blob_total) {
-                  blob_total = rep.total_size_cache_;
-                }
-              }
+  //
+  // ONE pass over the blobs. This used to scan every blob once per tag -- a
+  // prefix compare for each (tag, blob) pair -- which is quadratic: clio-fs
+  // makes every file and directory a tag, so a node holding tens of
+  // thousands of files spent minutes here, inside Create, on one worker that
+  // never yielded, and a whole-cluster restart could not come back.
+  std::unordered_map<TagId, clio::run::u64> tag_totals;
+  tag_blob_name_to_info_.for_each(
+      [&tag_totals](const std::string &key,
+                    const std::shared_ptr<BlobInfo> &blob_info_sp) {
+        TagId tag;
+        std::string name;
+        if (!SplitBlobKey(key, &tag, &name)) return;
+        const BlobInfo &blob_info = *blob_info_sp;
+        clio::run::u64 blob_total = blob_info.GetTotalSize();
+        if (blob_total == 0) {
+          for (const auto &rep : blob_info.replicas_) {
+            if (rep.total_size_cache_ > blob_total) {
+              blob_total = rep.total_size_cache_;
             }
-            total += blob_total;
           }
-        });
-    tag_info.total_size_ = total;
-  });
+        }
+        tag_totals[tag] += blob_total;
+      });
+  tag_id_to_info_.for_each(
+      [&tag_totals](const TagId &tag_id, std::shared_ptr<TagInfo> &tag_info_sp) {
+        auto it = tag_totals.find(tag_id);
+        tag_info_sp->total_size_ = it == tag_totals.end() ? 0 : it->second;
+      });
 
   // Phase 4: Update next_tag_id_minor_
   clio::run::u32 current_minor = next_tag_id_minor_.load();
@@ -7891,17 +7900,15 @@ void Runtime::ApplyWalDelTag(const std::vector<char> &payload,
   for (const auto &alias : txn.aliases_) {
     tag_name_to_id_.erase(alias);
   }
-  // Erase all blobs belonging to this tag
-  std::string tag_prefix = std::to_string(tag_id.major_) + "." +
-                           std::to_string(tag_id.minor_) + ".";
+  // Erase all blobs belonging to this tag, found through the per-tag index
+  // (replay maintains it): scanning every blob per deleted tag made a log
+  // with many deletes quadratic to replay.
+  const std::string tag_prefix = std::to_string(tag_id.major_) + "." +
+                                 std::to_string(tag_id.minor_) + ".";
   std::vector<std::string> keys_to_erase;
-  tag_blob_name_to_info_.for_each(
-      [&tag_prefix, &keys_to_erase](const std::string &key,
-                                    const std::shared_ptr<BlobInfo> &) {
-        if (key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
-          keys_to_erase.push_back(key);
-        }
-      });
+  for (const std::string &name : BlobIndexNames(tag_id)) {
+    keys_to_erase.push_back(tag_prefix + name);
+  }
   for (const auto &key : keys_to_erase) {
     tag_blob_name_to_info_.erase(key);
     BlobIndexErase(key);
