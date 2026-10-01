@@ -149,23 +149,6 @@ if(CLIO_CORE_ENABLE_CUDA)
     add_subdirectory(neuropress_lammps_lib)
   endif()
 
-  # The IN-SITU counterpart of that replay: libclio_nyx_insitu.so, which a
-  # patched Nyx dlopens from its own in-situ callback and hands
-  # fab.dataPtr(comp) -- AMReX device memory -- one component at a time. No
-  # AMReX dependency here; the simulation side of the patch owns every AMReX
-  # header, so this library takes a void* and integers.
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_nyx_insitu/CMakeLists.txt)
-    add_subdirectory(neuropress_nyx_insitu)
-  endif()
-
-  # The same shape for VPIC: libclio_vpic_insitu.so, which a vpic-kokkos deck
-  # calls from begin_diagnostics. VPIC's field view is already contiguous per
-  # variable on the device, so this adapter stages (pointer, count) and needs
-  # no extraction -- see its header.
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/neuropress_vpic_insitu/CMakeLists.txt)
-    add_subdirectory(neuropress_vpic_insitu)
-  endif()
-
   # Replay a simulation's field dumps through the compressor -- the shape
   # upstream NeuroPress uses for Nyx, and the only one available for codes
   # with no library interface to embed. No simulation dependency.

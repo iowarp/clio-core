@@ -46,6 +46,57 @@
 
 namespace ctp {
 
+namespace cuszp_detail {
+
+/**
+ * ONE STREAM AND ONE OUTPUT BUFFER PER THREAD, REUSED ACROSS CHUNKS.
+ *
+ * cuSZp's API is stateless, but this wrapper was not: every Compress created a
+ * stream, cudaMalloc'd a 2x-input output buffer, then cudaFree'd it and
+ * destroyed the stream. cudaFree synchronizes the whole device, so each chunk
+ * also stalled every other worker's codec. cuSZ (cusz.h Context) and nvCOMP
+ * (nvcomp.h slots) already keep their state per thread; cuSZp alone paid a
+ * build and teardown per chunk, which made figure 9 compare codecs under
+ * different wrapper overheads.
+ *
+ * The buffer only grows. It is NOT zeroed between chunks, which matches the old
+ * path: cudaMalloc never zeroed it either. NEVER RELEASED at thread exit, like
+ * cusz.h's managers: the CUDA context may be gone when a thread_local
+ * destructor runs at shutdown.
+ */
+struct Context {
+  cudaStream_t stream = nullptr;  /**< this thread's cuSZp stream */
+  unsigned char *d_cmp = nullptr; /**< device output buffer, grow-only */
+  size_t cap = 0;                 /**< bytes allocated at d_cmp */
+};
+
+/**
+ * The calling thread's context, its output buffer at least `need` bytes.
+ *
+ * @param need bytes cuSZp_compress may write for this chunk.
+ * @return the context, or nullptr when the stream or the buffer failed.
+ */
+inline Context *AcquireContext(size_t need) {
+  thread_local Context ctx;
+  if (ctx.stream == nullptr && cudaStreamCreate(&ctx.stream) != cudaSuccess) {
+    ctx.stream = nullptr;
+    return nullptr;
+  }
+  if (ctx.cap < need) {
+    if (ctx.d_cmp != nullptr) cudaFree(ctx.d_cmp);
+    ctx.d_cmp = nullptr;
+    ctx.cap = 0;
+    if (cudaMalloc(&ctx.d_cmp, need) != cudaSuccess) {
+      ctx.d_cmp = nullptr;
+      return nullptr;
+    }
+    ctx.cap = need;
+  }
+  return &ctx;
+}
+
+}  // namespace cuszp_detail
+
 /**
  * cuSZp GPU error-bounded LOSSY compressor for floating-point data -- the
  * ultra-fast single-kernel sibling of cuSZ from the same szcompressor family.
@@ -107,27 +158,25 @@ class Cuszp : public Compressor {
     }
     const size_t n = input_size / sizeof(float);
 
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
+    // cuSZp writes into a caller-provided device buffer and documents no
+    // worst-case size. Its fixed-length blocks can exceed the input once the
+    // per-block bit width nears 32 (sign and outlier bytes ride on top), so
+    // an input-sized buffer is not a bound. Twice the input plus slack is.
+    // The stream and that buffer are the thread's, kept across chunks.
+    cuszp_detail::Context *ctx =
+        cuszp_detail::AcquireContext(CompressCapacity(input_size));
+    if (ctx == nullptr) {
       return false;
     }
+    cudaStream_t stream = ctx->stream;
+    unsigned char *d_cmp = ctx->d_cmp;
     float *d_in = nullptr;
     bool free_in = false;
-    unsigned char *d_cmp = nullptr;  // temp worst-case device output buffer
     bool ok = false;
     do {
       d_in = static_cast<float *>(
           ToDeviceInput(input, input_size, stream, &free_in));
       if (d_in == nullptr) break;
-
-      // cuSZp writes into a caller-provided device buffer and documents no
-      // worst-case size. Its fixed-length blocks can exceed the input once the
-      // per-block bit width nears 32 (sign and outlier bytes ride on top), so
-      // an input-sized buffer is not a bound. Twice the input plus slack is;
-      // it costs only transient device memory.
-      if (cudaMalloc(&d_cmp, CompressCapacity(input_size)) != cudaSuccess) {
-        break;
-      }
 
       size_t cmp_size = 0;
       uint3 dims = {0, 0, 0};  // ignored for 1D
@@ -186,9 +235,10 @@ class Cuszp : public Compressor {
       ok = true;
     } while (false);
 
-    if (d_cmp != nullptr) cudaFree(d_cmp);
+    // A failed call can leave work queued on the kept stream; drain it so the
+    // next chunk does not inherit it.
+    if (!ok) cudaStreamSynchronize(stream);
     if (free_in) cudaFree(d_in);
-    cudaStreamDestroy(stream);
     return ok;
   }
 

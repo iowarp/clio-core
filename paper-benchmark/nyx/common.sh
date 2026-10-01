@@ -56,6 +56,10 @@ bench_compose() {
   local bdev_mb=$(( tier_mb * 2 ))
 
   mkdir -p "$store"
+  # BENCH_META_DIR: where the CTE metadata log lives, when not beside the run's
+  # results -- e.g. node-local, so a stalling results filesystem cannot stall
+  # the runtime's log appends inside a timed run.
+  [ -n "${BENCH_META_DIR:-}" ] && mkdir -p "$BENCH_META_DIR"
   cat > "$store/compose.yaml" <<YAML
 networking:
   port: $PORT
@@ -84,6 +88,8 @@ compose:
 ${STATIC_LIB:+    neuropress_static_lib: "$STATIC_LIB"}
 ${STATIC_LIB:+    neuropress_static_shuffle: ${STATIC_SHUF:-0}}
 ${STATIC_LIB:+    neuropress_static_quantize: ${STATIC_QUANT:-false}}
+${HC_SEED:+    hcompress_model_path: "$HC_SEED"}
+${XGB_SEED:+    xgb_model_path: "$XGB_SEED"}
   - mod_name: clio_cte_core
     pool_name: cte_core
     pool_query: local
@@ -95,7 +101,7 @@ ${STATIC_LIB:+    neuropress_static_quantize: ${STATIC_QUANT:-false}}
         score: 1.0
         persistence_level: "${BENCH_TIER1_PERSIST:-temporary}"$(bench_tier2_yaml "$tier_mb")
     performance:
-      metadata_log_path: "$store/cte_metadata_log"$(bench_flush_yaml)
+      metadata_log_path: "${BENCH_META_DIR:-$store}/cte_metadata_log"$(bench_flush_yaml)
       transaction_log_capacity: "32MB"
     dpe:
       dpe_type: "max_bw"

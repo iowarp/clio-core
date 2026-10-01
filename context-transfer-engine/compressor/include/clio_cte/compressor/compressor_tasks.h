@@ -62,6 +62,23 @@ struct CompressorConfig {
   // 3). Loaded once at Create() time and consulted by EstCompressionStats()'s
   // dynamic-selection path (compressor_runtime.cc) whenever set.
   std::string neuropress_model_path_;
+  // Directory holding a seeded HCompress Expected-Compression-Cost model
+  // (hcompress_ccp_seed.json, as HCompressCcpPredictor::Save() writes it).
+  // When set, HCompress -- not NeuroPress -- chooses each chunk's codec, over
+  // NeuroPress's own candidate set and cost model, so the two differ only in
+  // the predictor. It then takes precedence over neuropress_model_path_,
+  // which is not loaded: two selectors on one chunk would make the figure's
+  // HCompress bar partly NeuroPress's. Empty (the default) leaves HCompress
+  // off entirely.
+  std::string hcompress_model_path_;
+  // Directory holding the XGBoost baseline's exported trees (xgb_trees.txt,
+  // from paper-benchmark/model-accuracy/export_xgb_trees.py). When set,
+  // XGBoost chooses each chunk's codec the same way HCompress does: over
+  // NeuroPress's candidate set and cost model, with the NN's own per-chunk
+  // statistics as inputs, so only the predictor differs. Takes precedence
+  // over neuropress_model_path_ (not loaded); setting it together with
+  // hcompress_model_path_ fails the pool. Empty (the default) leaves it off.
+  std::string xgb_model_path_;
   // Master switch for ONLINE LEARNING (SGD Phase 1 + exploration Phase 2).
   // Off by default, mirroring NeuroPress's own
   // g_online_learning_enabled{false} (gpucompress_api.cpp), which gates its
@@ -202,6 +219,8 @@ struct CompressorConfig {
         distribution_model_path_(other.distribution_model_path_),
         dnn_model_weights_path_(other.dnn_model_weights_path_),
         neuropress_model_path_(other.neuropress_model_path_),
+        hcompress_model_path_(other.hcompress_model_path_),
+        xgb_model_path_(other.xgb_model_path_),
         neuropress_online_learning_enabled_(
             other.neuropress_online_learning_enabled_),
         neuropress_mape_threshold_(other.neuropress_mape_threshold_),
@@ -227,7 +246,8 @@ struct CompressorConfig {
     // created compressor pool straight to the default core, bypassing any
     // interposer chained beneath it.
     ar(qtable_model_path_, linreg_model_path_, distribution_model_path_,
-       dnn_model_weights_path_, neuropress_model_path_,
+       dnn_model_weights_path_, neuropress_model_path_, hcompress_model_path_,
+       xgb_model_path_,
        neuropress_online_learning_enabled_,
        neuropress_mape_threshold_, neuropress_learning_rate_,
        neuropress_exploration_enabled_,
@@ -293,6 +313,16 @@ struct CompressorConfig {
         if (node["neuropress_model_path"]) {
           neuropress_model_path_ =
               node["neuropress_model_path"].as<std::string>();
+        }
+        // HCompress's selector (see hcompress_model_path_). Takes precedence
+        // over neuropress_model_path when both are set.
+        if (node["hcompress_model_path"]) {
+          hcompress_model_path_ =
+              node["hcompress_model_path"].as<std::string>();
+        }
+        // XGBoost's selector (see xgb_model_path_).
+        if (node["xgb_model_path"]) {
+          xgb_model_path_ = node["xgb_model_path"].as<std::string>();
         }
         if (node["neuropress_online_learning_enabled"]) {
           neuropress_online_learning_enabled_ =

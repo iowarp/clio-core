@@ -686,6 +686,27 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - cuSZp GPU compression disabled")
     endif()
 
+    # GPULZ (ICS'23, https://github.com/hpdps-group/ICS23-GPULZ) - GPU LZSS
+    # LOSSLESS compressor for multi-byte data. Upstream is a program, not a
+    # library: paper-benchmark/external-baselines/install_codecs.sh builds
+    # libgpulz from its unmodified kernels plus our gpulz_api.h interface.
+    # Optional, requires CUDA; found by header and library name.
+    set(CLIO_CTP_ENABLE_GPULZ OFF)
+    if(CLIO_CORE_ENABLE_CUDA)
+        find_path(gpulz_INCLUDE_DIR gpulz_api.h)
+        find_library(gpulz_LIBRARY NAMES gpulz)
+        if(gpulz_INCLUDE_DIR AND gpulz_LIBRARY)
+            set(gpulz_LIBRARIES ${gpulz_LIBRARY})
+            set(gpulz_INCLUDE_DIRS ${gpulz_INCLUDE_DIR})
+            set(CLIO_CTP_ENABLE_GPULZ ON)
+            message(STATUS "found gpulz_api.h at ${gpulz_INCLUDE_DIRS}")
+        else()
+            message(STATUS "GPULZ not found - GPULZ GPU compression disabled")
+        endif()
+    else()
+        message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - GPULZ GPU compression disabled")
+    endif()
+
     set(COMPRESS_LIBS
         bz2
         ${lzo2_LIBRARIES}
@@ -755,6 +776,12 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         list(APPEND COMPRESS_INCLUDES ${cuszp_INCLUDE_DIRS})
     endif()
 
+    # Only add GPULZ if found
+    if(CLIO_CTP_ENABLE_GPULZ)
+        list(APPEND COMPRESS_LIBS ${gpulz_LIBRARIES})
+        list(APPEND COMPRESS_INCLUDES ${gpulz_INCLUDE_DIRS})
+    endif()
+
     # Make CTP_ENABLE_LIBPRESSIO available to subdirectories (CTP)
     set(CLIO_CTP_ENABLE_LIBPRESSIO ${CLIO_CTP_ENABLE_LIBPRESSIO} CACHE BOOL "Enable LibPressio wrapper (auto-detected)" FORCE)
     # Make CTP_ENABLE_NVCOMP available to subdirectories (CTP)
@@ -766,6 +793,7 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     set(CLIO_CTP_ENABLE_CUSZ ${CLIO_CTP_ENABLE_CUSZ} CACHE BOOL "Enable cuSZ GPU compression (auto-detected)" FORCE)
     set(CLIO_CTP_ENABLE_NDZIP ${CLIO_CTP_ENABLE_NDZIP} CACHE BOOL "Enable ndzip GPU compression (auto-detected)" FORCE)
     set(CLIO_CTP_ENABLE_CUSZP ${CLIO_CTP_ENABLE_CUSZP} CACHE BOOL "Enable cuSZp GPU compression (auto-detected)" FORCE)
+    set(CLIO_CTP_ENABLE_GPULZ ${CLIO_CTP_ENABLE_GPULZ} CACHE BOOL "Enable GPULZ GPU compression (auto-detected)" FORCE)
 endif()
 
 # Encryption libraries (conditional)

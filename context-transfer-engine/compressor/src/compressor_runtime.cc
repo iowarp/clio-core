@@ -499,7 +499,12 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 
   // Load NeuroPress NN model if configured (issue #693). Consulted
   // first in EstCompressionStats()'s dynamic-selection path -- see there.
-  if (!config_.neuropress_model_path_.empty()) {
+  // NOT when HCompress is requested: exactly one model chooses each chunk,
+  // and skipping the load (rather than loading then discarding) never
+  // allocates NeuroPress's prediction-reuse state for a run that cannot use it.
+  if (!config_.neuropress_model_path_.empty() &&
+      config_.hcompress_model_path_.empty() &&
+      config_.xgb_model_path_.empty()) {
     try {
       HLOG(kDebug, "Loading NeuroPress NN model from: {}",
            config_.neuropress_model_path_);
@@ -530,6 +535,87 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       task->SetReturnCode(1);
       CLIO_CO_RETURN;
     }
+  }
+
+  // HCompress as the selector (hcompress_model_path_; hcompress_selection.cc).
+  if (!config_.hcompress_model_path_.empty()) {
+    auto hc = std::make_unique<ctp::compress::model::HCompressCcpPredictor>();
+    // Requested and unloadable FAILS the pool, the same stance NeuroPress
+    // takes: a run labelled HCompress must not quietly be chosen by another
+    // model, or by none.
+    if (!hc->Load(config_.hcompress_model_path_) || !hc->IsReady()) {
+      HLOG(kError,
+           "HCompress was requested (model path '{}') but no usable seed was "
+           "found at '{}/hcompress_ccp_seed.json' -- failing CreateCompressor "
+           "rather than letting another model choose under its name",
+           config_.hcompress_model_path_, config_.hcompress_model_path_);
+      task->SetReturnCode(1);
+      CLIO_CO_RETURN;
+    }
+    hcompress_predictor_ = std::move(hc);
+    if (!config_.neuropress_model_path_.empty()) {
+      HLOG(kWarning,
+           "Both hcompress_model_path and neuropress_model_path are set; "
+           "HCompress chooses and NeuroPress was NOT loaded");
+    }
+    // HCompress learns through its own feedback (HCompressObserve), not
+    // NeuroPress's SGD, exploration or best mode -- all of which read a
+    // NeuroPress model this pool does not have.
+    config_.neuropress_online_learning_enabled_ = false;
+    config_.neuropress_exploration_enabled_ = false;
+    config_.neuropress_best_mode_ = false;
+    const auto &hc_cfg = hcompress_predictor_->Config();
+    HLOG(kWarning,
+         "HCompress selector ON for pool '{}': seed of {} rows, {} encoded "
+         "inputs, ratio target cap {}, forget factor {}, feedback every {} "
+         "observation(s). Ranks NeuroPress's candidate set under its cost "
+         "model; only the predictor differs.",
+         pool_name_, hcompress_predictor_->SeedRows(),
+         hcompress_predictor_->Dimension(), hc_cfg.ratio_target_cap,
+         hc_cfg.forget_factor, hc_cfg.feedback_interval);
+  }
+
+  // XGBoost as the selector (xgb_model_path_; xgb_selection.cc).
+  if (!config_.xgb_model_path_.empty()) {
+    // Two baselines on one pool would make either bar partly the other's.
+    if (hcompress_predictor_) {
+      HLOG(kError,
+           "Both xgb_model_path and hcompress_model_path are set; a pool has "
+           "exactly one selector -- failing CreateCompressor");
+      task->SetReturnCode(1);
+      CLIO_CO_RETURN;
+    }
+    auto xg = std::make_unique<ctp::compress::model::XgbTreePredictor>();
+    // Requested and unloadable FAILS the pool, as for HCompress. Load() also
+    // refuses a model whose trees do not reproduce XGBoost's own predictions.
+    if (!xg->Load(config_.xgb_model_path_)) {
+      HLOG(kError,
+           "XGBoost was requested (model path '{}') but '{}/xgb_trees.txt' is "
+           "not usable: {} -- failing CreateCompressor rather than letting "
+           "another model choose under its name",
+           config_.xgb_model_path_, config_.xgb_model_path_, xg->LastError());
+      task->SetReturnCode(1);
+      CLIO_CO_RETURN;
+    }
+    xgb_predictor_ = std::move(xg);
+    if (!config_.neuropress_model_path_.empty()) {
+      HLOG(kWarning,
+           "Both xgb_model_path and neuropress_model_path are set; XGBoost "
+           "chooses and NeuroPress was NOT loaded");
+    }
+    // A static model: no SGD, exploration or best mode, all of which read a
+    // NeuroPress model this pool does not have.
+    config_.neuropress_online_learning_enabled_ = false;
+    config_.neuropress_exploration_enabled_ = false;
+    config_.neuropress_best_mode_ = false;
+    HLOG(kWarning,
+         "XGBoost selector ON for pool '{}': {}/{}/{}/{} trees (comp time, "
+         "decomp time, ratio, PSNR), {} test vectors reproduced. Ranks "
+         "NeuroPress's candidate set under its cost model on the NN's own "
+         "statistics; only the predictor differs.",
+         pool_name_, xgb_predictor_->NumTrees(0), xgb_predictor_->NumTrees(1),
+         xgb_predictor_->NumTrees(2), xgb_predictor_->NumTrees(3),
+         xgb_predictor_->NumTestVectors());
   }
 
   // Static codec: the control condition.
@@ -748,11 +834,52 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     double* out_second_deriv, bool* out_neuropress_gpu_failed,
     const void** out_device_stats,
     const ctp::compress::preprocess::PredictionReuseContext* reuse,
-    ctp::compress::preprocess::PredictionReuseOutcome* out_outcome) {
+    ctp::compress::preprocess::PredictionReuseOutcome* out_outcome,
+    std::string* out_hc_distribution) {
   std::vector<CompressionStats> results;
   if (out_ranked_by_cost) *out_ranked_by_cost = false;
   if (out_neuropress_gpu_failed) *out_neuropress_gpu_failed = false;
   if (out_device_stats) *out_device_stats = nullptr;
+  if (out_hc_distribution) out_hc_distribution->clear();
+
+  // HCompress decides, when it is the configured selector. It RETURNS in
+  // every case: falling through would reach the legacy branch below, which
+  // computes features on the host straight from `chunk` -- a read of GPU
+  // memory from the CPU for the device-resident chunks this path serves. An
+  // empty return makes the caller store the chunk uncompressed.
+  if (HCompressActive(context)) {
+    std::vector<CompressionStats> hc_stats =
+        HCompressRankChunk(chunk, chunk_size, context, out_hc_distribution);
+    if (hc_stats.empty()) {
+      HLOG(kError,
+           "EstCompressionStats: HCompress produced no candidates for a chunk "
+           "of {} bytes; storing it uncompressed rather than letting another "
+           "selector choose under HCompress's name",
+           chunk_size);
+      return {};
+    }
+    // Best-first under NeuroPress's cost model: saying so stops the caller
+    // re-selecting on ratio alone, exactly as for a NeuroPress ranking.
+    if (out_ranked_by_cost) *out_ranked_by_cost = true;
+    return hc_stats;
+  }
+
+  // XGBoost decides, when it is the configured selector. Returns in every
+  // case, for the same reason as HCompress above.
+  if (XgbActive(context)) {
+    std::vector<CompressionStats> xg_stats =
+        XgbRankChunk(chunk, chunk_size, context);
+    if (xg_stats.empty()) {
+      HLOG(kError,
+           "EstCompressionStats: XGBoost produced no candidates for a chunk "
+           "of {} bytes; storing it uncompressed rather than letting another "
+           "selector choose under XGBoost's name",
+           chunk_size);
+      return {};
+    }
+    if (out_ranked_by_cost) *out_ranked_by_cost = true;
+    return xg_stats;
+  }
 
   double entropy = 0.0, mad = 0.0, second_derivative_mean = 0.0;
 
@@ -1223,6 +1350,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     bool neuropress_gpu_failed = false;
     // Statistics the selection ranked on; see out_device_stats.
     const void* sel_device_stats = nullptr;
+    // HCompress: the distribution class THIS chunk was ranked under. A local,
+    // because the chunk suspends on its compression below and by the time it
+    // resumes the predictor's stored inputs belong to another chunk -- the
+    // same hazard that once had NeuroPress's SGD training on another chunk's
+    // features (97.8% of steps on AI).
+    std::string hc_distribution;
     std::vector<CompressionStats> stats;
     if (!config_.neuropress_static_lib_.empty()) {
       // Control condition: one candidate, no inference.
@@ -1257,7 +1390,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                               &sel_entropy, &sel_mad, &sel_second_deriv,
                               &neuropress_gpu_failed, &sel_device_stats,
                               np_reuse_on ? &np_reuse_ctx : nullptr,
-                              np_reuse_on ? &np_reuse_outcome : nullptr);
+                              np_reuse_on ? &np_reuse_outcome : nullptr,
+                              &hc_distribution);
       phases_selected = phase_log && TakeSelectionPhases(&phases);
     }
 
@@ -1508,14 +1642,13 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           // Same ceiling the cost model and the kernel used; a hardcoded 100
           // here would report a MAPE against a differently-clamped ratio.
           const double kMapeCap = NeuroPressResolvedCostWeights().cap;
+          const double kFloor = NeuroPressResolvedCostWeights().min_time_ms;
           const double pred_r = std::min(kMapeCap, f.compression_ratio_);
-          const double pred_ct =
-              std::max(NeuroPressCost::kMinTimeMs, f.compress_time_ms_);
-          const double pred_dt =
-              std::max(NeuroPressCost::kMinTimeMs, f.decompress_time_ms_);
+          const double pred_ct = std::max(kFloor, f.compress_time_ms_);
+          const double pred_dt = std::max(kFloor, f.decompress_time_ms_);
           const double act_r = std::min(kMapeCap, context.actual_compression_ratio_);
-          const double act_ct = std::max(NeuroPressCost::kMinTimeMs,
-                                         context.actual_compress_time_ms_);
+          const double act_ct =
+              std::max(kFloor, context.actual_compress_time_ms_);
           // Decompression is not measured at write time; upstream substitutes the prediction, which ma...
           const double act_dt = pred_dt;
           diag.ratio_mape = static_cast<float>(
@@ -1557,6 +1690,16 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         diag.predicted_ranking_count = nrank;
         np_diag_slot = NeuroPressRecordChunkDiag(diag);
       }
+    }
+    // HCompress's feedback -- its paper's "every n operations the measured
+    // cost of the EXECUTED choice is fed back". best_lib/best_preset, NOT
+    // context.compress_lib_: that is reset to 0 when the output was stored
+    // raw, and a stored-raw chunk is exactly what HCompress most needs to
+    // learn from -- the codec ran, paid its time, and did not shrink it.
+    if (HCompressActive(context) && !hc_distribution.empty() &&
+        task->return_code_ == 0 && context.actual_compression_ratio_ > 0.0) {
+      HCompressObserve(hc_distribution, best_lib, best_preset, chunk_size,
+                       context);
     }
     if ((config_.neuropress_online_learning_enabled_ ||
          config_.neuropress_best_mode_) &&

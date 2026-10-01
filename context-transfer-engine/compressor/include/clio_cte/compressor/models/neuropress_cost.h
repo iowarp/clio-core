@@ -19,20 +19,24 @@
 
 namespace clio::cte::compressor {
 
-/** Resolved parameters. `cap` is upstream's RATIO_CAP (100). */
+/** Resolved parameters. `cap` is upstream's RATIO_CAP (100); `min_time_ms`
+ *  is the time floor, NeuroPressCost::kMinTimeMs unless overridden. */
 struct NeuroPressCostWeights {
-  double ct, dt, io, bw, cap;
+  double ct, dt, io, bw, cap, min_time_ms;
 };
 
-/** Weights after any CLIO_NEUROPRESS_COST_W_* override. Ranking and SGD gate
- *  must both read these, or training scores what it is not ranking on. */
+/** Weights after any CLIO_NEUROPRESS_COST_W_* / CLIO_NEUROPRESS_MIN_TIME_MS
+ *  override. Ranking and SGD gate must both read these, or training scores
+ *  what it is not ranking on. */
 NeuroPressCostWeights NeuroPressResolvedCostWeights();
 
-/** w_ct*ct + w_dt*dt + w_io*bytes/(min(ratio,cap)*bw). Times floored at
- *  kMinTimeMs and ratio capped first. Ratio <= 0 gives 1e30, a gate sentinel. */
+/** w_ct*ct + w_dt*dt + w_io*bytes/(min(ratio,cap)*bw). Times floored at the
+ *  resolved min_time_ms and ratio capped first. Ratio <= 0 gives 1e30, a gate
+ *  sentinel. */
 struct NeuroPressCost {
-  /** Time floor in ms, upstream's (nn_gpu.cu:229-236). Applied to predicted
-   *  and measured times alike. */
+  /** Default time floor in ms, upstream's (nn_gpu.cu:229-236). Applied to
+   *  predicted and measured times alike; CLIO_NEUROPRESS_MIN_TIME_MS
+   *  overrides it everywhere at once (NeuroPressResolvedCostWeights). */
   static constexpr double kMinTimeMs = 1.0;
 
   double w_ct;
@@ -44,7 +48,8 @@ struct NeuroPressCost {
 
   double operator()(double compress_ms, double decompress_ms,
                     double ratio) const {
-    return Eval(compress_ms, decompress_ms, ratio, kMinTimeMs);
+    return Eval(compress_ms, decompress_ms, ratio,
+                NeuroPressResolvedCostWeights().min_time_ms);
   }
 
   /** The same cost with no time floor (CLIO_NEUROPRESS_SGD_GATE=raw). */

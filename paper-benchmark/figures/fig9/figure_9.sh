@@ -38,9 +38,10 @@
 # derivable from this instrumentation; fig9.md beside this script records why, and the two
 # alternative splits that were tried and rejected.
 #
-# Environment: ONLY (same as --only), DUMP_ROOT, PFS_ROOT, NVME_ROOT, ALLOW_NETWORK_TIER2, EB_LOW, PANEL_B_TIER, NP_CFG, SMOKE_GB, MAXF, RAM_PCT/RAM_MB,
+# Environment: ONLY (same as --only), DUMP_ROOT, PFS_ROOT, NVME_ROOT, BB_ROOT, ALLOW_NETWORK_TIER2, EB_LOW, PANEL_B_TIER, NP_CFG, SMOKE_GB, MAXF, RAM_PCT/RAM_MB,
 # COST_BW, NP_LR, NP_MAPE, MEASURE_DT, MEASURE_QUALITY, ARM_TIMEOUT, BEST_FIXED, WORST_FIXED,
 # SELECTION_LOG (default 0), STAGE_INPUT (default 1), STAGE_ROOT, STAGE_STREAMS, EXCLUDE_READ (default 1),
+# PRELOAD (default 1), NVME_PCT (30), BB_PCT (30), ASYNC_INFLIGHT (8),
 # REPS (runs per arm, default 3), TBD_OTHERS (default 0).
 #===============================================================================
 set -uo pipefail
@@ -51,8 +52,15 @@ WL=nyx SIZE=smoke
 # The lossy bound for panel (a)'s lossy arm and for every panel (b) arm. ONE
 # bound: an earlier version swept a 1e-3 / 1e-2 / 1e-1 ladder across three
 # panel (a) arms, which is three more full-size runs for a comparison the
-# figure does not make. Set EB_LOW to move it.
-EB_LOW=${EB_LOW:-1e-3}
+# figure does not make.
+# LOSSLESS ONLY, HARD (2026-09-29): the paper runs no lossy arm, so the bound is
+# 0 and not an override; a caller asking for EB_LOW > 0 is refused. The
+# workload run_config scripts refuse any positive bound or -q on their own too.
+if awk -v e="${EB_LOW:-0}" 'BEGIN{exit !(e+0>0)}'; then
+  echo "figure_9.sh: LOSSLESS ONLY -- refusing EB_LOW=$EB_LOW" >&2
+  exit 3
+fi
+EB_LOW=0
 # PANEL (b) runs every codec TWICE at the same bound -- once writing through to
 # the PFS, once over the tier -- so the tier is the only variable. Before that,
 # the external codecs ran untiered while NeuroPress kept its tier, which
@@ -77,8 +85,11 @@ PANEL_B_TIER=${PANEL_B_TIER:-1}
 # A/B, or 1 to demand reuse.
 CUSZ_REUSE=${CUSZ_REUSE:-}
 # WHERE THE BYTES LAND -- one device class per arm class, set explicitly.
-#   PFS_ROOT   an UNTIERED arm (Baseline included) puts its tier-1 file here.
+#   PFS_ROOT   an UNTIERED arm (Baseline included) puts its tier-1 file here;
+#              a +Tier arm puts its last tier (tier 4, the remainder) here.
 #   NVME_ROOT  a +Tier arm keeps tier 1 in RAM and spills tier 2 here.
+#   BB_ROOT    a +Tier arm's tier 3, the burst buffer. Delta has no burst buffer
+#              as such; /work/nvme is its flash Lustre, the nearest equivalent.
 # Each arm gets its own subdirectory, removed as soon as it is measured; only
 # the CSVs and logs stay under --out.
 #
@@ -114,10 +125,29 @@ _WHO=${USER:-$(id -un)}
 PFS_ROOT=${PFS_ROOT:-/work/hdd/$CLIO_ACCT/$_WHO/fig9-pfs}
 # TIER2_ROOT is the old spelling, still honoured.
 NVME_ROOT=${NVME_ROOT:-${TIER2_ROOT:-/tmp/fig9-nvme-${SLURM_JOB_ID:-$_WHO}}}
+BB_ROOT=${BB_ROOT:-/work/nvme/$CLIO_ACCT/$_WHO/fig9-bb}
 PANEL=both DRY=0 OUT="" FIELDS="" ONLY=${ONLY:-}
 BEST_FIXED=${BEST_FIXED:-}     # default per workload, below
 WORST_FIXED=${WORST_FIXED:-}   # default per workload, below
 ASYNC_MS=${ASYNC_MS:-500}      # periodic flush for the +Async arms
+# +Async IS ASYNCHRONOUS CHUNK SUBMISSION (the paper: "adding asynchronous chunk
+# submission ... overlaps compression and transfer"). The driver keeps this many
+# chunks in flight across files (CLIO_REPLAY_INFLIGHT) instead of waiting for
+# each file's chunks before the next -- which on one-chunk files is ONE chunk in
+# flight, and was all +Async ever had: before 2026-09-30 it differed from +Tier
+# only by the periodic flush above. Both now apply to the +Async arms.
+ASYNC_INFLIGHT=${ASYNC_INFLIGHT:-8}
+# POST-RUN WORK, OFF BY DEFAULT. None of it is timed, but on a lossless
+# NeuroPress arm it is 180-290 s of a job's wall clock (the driver re-reads and
+# hashes every chunk, then reads every blob back through the decompressor), and
+# it is what made a 5-minute job limit unsafe.
+#   0  nothing after the run but recording the result and deleting its images
+#   1  + the checksum pass, bit-exact verification of LOSSLESS arms (rep 1),
+#        and the per-campaign quick-look plot -- the behaviour before this knob
+#   2  + lossy arms checked element-wise against their bound (--check-bound)
+# Recording the CSV and deleting the tier images and staged input are never
+# skipped: the first is the result, the second keeps NVMe and quota clear.
+POSTRUN=${POSTRUN:-0}
 # RAM tier 1, committed at runtime start: run_arm sets CLIO_PREFAULT=0 for a
 # tiered arm, which faults the whole mapping in during setup (untimed). Without
 # it the tier faulted in 64 MiB at a time INSIDE the timed loop, 40 ms each
@@ -126,6 +156,25 @@ ASYNC_MS=${ASYNC_MS:-500}      # periodic flush for the +Async arms
 # of being a fixed 512 MB that held 2-40% of one full-size arm's output and made
 # the +Tier arms spill immediately. Set RAM_MB to override with an absolute value.
 RAM_PCT=${RAM_PCT:-10}
+# INPUT PRELOAD (CLIO_REPLAY_PRELOAD): the driver reads every input file into
+# memory BEFORE its timer opens, so the timed window holds no reads at all.
+# Without it the reads sat inside the window and EXCLUDE_READ took them back
+# out -- exact only if nothing else ran during a read. On +Async the periodic
+# flush kept draining the RAM tier while the driver read the next file: those
+# writes were charged as I/O to a bar that excludes the reads, and the drain
+# got that time free (full Nyx, job 22575645: 2.6-3.6 s of a 19 s bar; VPIC's
+# I/O exceeded its whole bar, which zeroed its compute). With PRELOAD=1 the
+# driver reports read 0 and EXCLUDE_READ subtracts nothing. A driver that does
+# not print its `preload:` line (a build from before 2026-09-30) is refused
+# rather than silently timed the old way.
+PRELOAD=${PRELOAD:-1}
+# THE +Tier STORAGE HIERARCHY, as the paper configures it: "10% of the total
+# data volume fits in DRAM, 30% in local NVMe, 30% in a burst buffer, and the
+# remainder in the parallel file system". Percentages of the payload this run
+# replays, like RAM_PCT (tier 1). The PFS tier (4) is sized to the whole
+# payload, so it never refuses what the tiers above it cannot hold.
+NVME_PCT=${NVME_PCT:-30}
+BB_PCT=${BB_PCT:-30}
 # Storage bandwidth in the NeuroPress cost model, BYTES PER MILLISECOND. The
 # same 1.2e6 (1.2 GB/s) the per-chunk oracle scores under, so selection
 # optimizes the cost it is compared on; the shipped default is 5e6.
@@ -236,19 +285,24 @@ WORKLOADS_ALL=(VPIC Nyx LAMMPS WarpX AI)
 # Every workload is swept; the fallback below only covers a new one.
 if [ -z "$BEST_FIXED" ]; then
   case "$WL" in
-    nyx)  BEST_FIXED=static-bitcomp-q ;;
-    vpic|lammps|warpx) BEST_FIXED=static-ans-q-s4 ;;
+    # Lossless picks (no -q), the codecs the 2026-09-29 lossless Best runs used.
+    nyx|vpic)     BEST_FIXED=static-bitcomp ;;
+    lammps|warpx) BEST_FIXED=static-ans-s4 ;;
     ai)   BEST_FIXED=static-bitcomp-s4 ;;
-    *)    BEST_FIXED=static-bitcomp-q-s4 ;;
+    *)    BEST_FIXED=static-bitcomp-s4 ;;
   esac
 fi
 if [ -z "$WORST_FIXED" ]; then
   case "$WL" in
     nyx)  WORST_FIXED=static-deflate ;;
     vpic|lammps|ai) WORST_FIXED=static-deflate-s4 ;;
-    warpx)       WORST_FIXED=static-deflate-q-s4 ;;
+    warpx)       WORST_FIXED=static-deflate-s4 ;;
   esac
 fi
+# LOSSLESS ONLY: -q is linear quantization, i.e. lossy. Strip it from any
+# override so a fixed-codec arm can only be one of the 16 lossless actions.
+BEST_FIXED=${BEST_FIXED//-q/}
+WORST_FIXED=${WORST_FIXED//-q/}
 OUT=${OUT:-$BENCH/results/figure9/$WL-$SIZE}
 mkdir -p "$OUT"
 CSV="$OUT/fig9.csv"
@@ -261,6 +315,25 @@ CSV="$OUT/fig9.csv"
 # that trap. Derived from the account, like PFS_ROOT, so nothing is pinned to
 # one user's home.
 DUMP_ROOT=${DUMP_ROOT:-/work/hdd/$CLIO_ACCT/$_WHO/np-dumps}
+# Where the HCompress arm's seed lives (hcompress_ccp_seed.json), derived from
+# the account like DUMP_ROOT. EXPORTING IT IS SAFE: it only names a location.
+# What makes an arm HCompress is run_config.sh's `hcompress` config setting
+# HC_SEED from it, so no other arm can pick this up.
+#
+# THE DEFAULT IS THE RATIO-CAPPED SEED (--ratio-target-cap 100). Uncapped --
+# the paper's own setting -- the ratio head's least-squares fit chases the
+# multi-thousand-x quantized outliers until every LOSSLESS codec predicts the
+# 0.1 clamp floor, so the selector would pick a quantized codec on every chunk.
+# The cap is the one NeuroPress's own online SGD applies. The uncapped seed is
+# np-hcompress/out-09181432-fixseed/inputs; pass HC_MODEL to use it.
+HC_MODEL=${HC_MODEL:-/projects/$CLIO_ACCT/$_WHO/np-hcompress/seed-cap100}
+export HC_MODEL
+# Where the XGBoost arm's exported trees live (xgb_trees.txt): train_xgb.py on
+# the same 600k-corpus training split HCompress is seeded from, flattened by
+# export_xgb_trees.py. As with HC_MODEL, only run_config.sh's `xgb` config
+# reads it, so no other arm can pick it up.
+XGB_MODEL=${XGB_MODEL:-/projects/$CLIO_ACCT/$_WHO/np-hcompress/train/xgb-600k-split}
+export XGB_MODEL
 if [ -z "$FIELDS" ]; then
   # A per-workload override wins; then the consolidated root; then a dump this
   # checkout generated in-tree with <workload>/gen_fields.sh.
@@ -296,17 +369,17 @@ FILE_INDEX=$(mktemp "${TMPDIR:-/tmp}/fig9-files-XXXXXX") || exit 3
 # already, which then failed every later arm with "Disk quota exceeded".
 # Only THIS job's arm dirs are touched: $PFS_ROOT is shared between concurrent
 # per-arm jobs, so removing the whole root here would delete a sibling's tier.
-ARM_T2DIR=""; ARM_PFSDIR=""; ARM_STORE=""
+ARM_T2DIR=""; ARM_PFSDIR=""; ARM_BBDIR=""; ARM_STORE=""
 clean_arm_images() {
-  [ -n "$ARM_T2DIR$ARM_PFSDIR$ARM_STORE" ] || return 0
-  rm -rf $ARM_T2DIR $ARM_PFSDIR 2>/dev/null
+  [ -n "$ARM_T2DIR$ARM_PFSDIR$ARM_BBDIR$ARM_STORE" ] || return 0
+  rm -rf $ARM_T2DIR $ARM_PFSDIR $ARM_BBDIR 2>/dev/null
   # The bdev image under the run store goes too: it is raw payload bytes, the
   # same ones the two device roots hold. $store/<tag>/chi_bdev.dat, hence
   # depth 2 -- the same find the finished and timed-out paths run.
   [ -n "$ARM_STORE" ] && find "$ARM_STORE" -maxdepth 2 -type f \
        \( -name chi_bdev.dat -o -name 'cte_tier.dat*' \
           -o -name 'cte_tier2.dat*' \) -delete 2>/dev/null
-  ARM_T2DIR=""; ARM_PFSDIR=""; ARM_STORE=""
+  ARM_T2DIR=""; ARM_PFSDIR=""; ARM_BBDIR=""; ARM_STORE=""
   return 0
 }
 trap 'clean_arm_images; rm -f "$FILE_INDEX"' EXIT
@@ -385,6 +458,12 @@ if [ -z "${RAM_MB:-}" ]; then
 else
   echo "== payload ${PAYLOAD_MB:-?} MiB -> RAM tier ${RAM_MB} MiB (RAM_MB set)"
 fi
+NVME_MB=$(awk -v p="${PAYLOAD_MB:-0}" -v pc="$NVME_PCT" \
+  'BEGIN { v = p * pc / 100.0; if (v < 64) v = 64; printf "%.0f", v }')
+BB_MB=$(awk -v p="${PAYLOAD_MB:-0}" -v pc="$BB_PCT" \
+  'BEGIN { v = p * pc / 100.0; if (v < 64) v = 64; printf "%.0f", v }')
+PFS_MB=$(( ${PAYLOAD_MB:-0} + 512 ))
+echo "== +Tier hierarchy: RAM ${RAM_MB} MiB -> NVMe ${NVME_MB} MiB (${NVME_PCT}%) -> burst buffer ${BB_MB} MiB (${BB_PCT}%) -> PFS ${PFS_MB} MiB (remainder)"
 
 # arm  ::  label | panel | config | eb | tier(0/1) | async_ms
 #          async_ms 0 = periodic flush disabled entirely
@@ -398,7 +477,10 @@ fi
 # (b) runs at eb=0. The error-bounded codecs are not merely run at eb=0 there,
 # they are LEFT OUT: cuSZ and cuSZp3 have no lossless mode, so a lossless arm
 # of either is not the codec the name promises.
-LOSSLESS_ONLY_WORKLOADS=${LOSSLESS_ONLY_WORKLOADS:-AI}
+# LOSSLESS ONLY, HARD (2026-09-29): every workload is lossless-only now, so
+# no lossy rung and no cuSZ/cuSZp3 arm is ever built. The list is kept for
+# the TBD rows' labels; lossless_only() below no longer consults it.
+LOSSLESS_ONLY_WORKLOADS="VPIC Nyx LAMMPS WarpX AI"
 LOSSY_ONLY_CODECS=${LOSSY_ONLY_CODECS:-"cuSZ cuSZp3"}
 
 # lossless_only <workload display name> -- true when that workload runs no
@@ -407,7 +489,7 @@ LOSSY_ONLY_CODECS=${LOSSY_ONLY_CODECS:-"cuSZ cuSZp3"}
 #   @param 1 workload display name
 #   @return 0 when lossless-only, 1 otherwise
 lossless_only() {
-  case " $LOSSLESS_ONLY_WORKLOADS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+  return 0
 }
 
 # build_arms <workload display name> -- echo that workload's arm set, one spec
@@ -439,6 +521,10 @@ build_arms() {
   echo "NP+Tier+Async|a|$NP_CFG|0|1|$ASYNC_MS"
   # ...and the lossy end of that ladder, which a lossless-only workload skips.
   [ "$lossless" = 1 ] || echo "NP+Tier+Async+Lossy|a|$NP_CFG|$EB_LOW|1|$ASYNC_MS"
+  # HCompress (IPDPS 2020) sits in panel (b) as a SELECTOR, like NeuroPress:
+  # it ranks NeuroPress's own candidates under NeuroPress's cost model with
+  # its own predictions, so beside NeuroPress it isolates the predictor.
+  # Unlike NeuroPress it has no panel (a) ladder, so it keeps its +Tier row.
   # PANEL (b): the external codecs and NeuroPress at the SAME bound. With
   # PANEL_B_TIER=1 each runs twice so the tier is the only variable: the PFS row
   # writes each chunk through to Lustre inside the timed loop, the +Tier row puts
@@ -448,7 +534,9 @@ build_arms() {
   # same measurement drawn in both panels, not a second run of a different arm.
   for b in "Best fixed nvCOMP:$BEST_FIXED" \
            ${WORST_FIXED:+"Worst fixed nvCOMP:$WORST_FIXED"} "ndzip:static-ndzip" \
-           "cuSZp3:static-cuszp" "cuSZ:static-cusz" "NeuroPress:$NP_CFG"; do
+           "GPULZ:static-gpulz" \
+           "cuSZp3:static-cuszp" "cuSZ:static-cusz" "NeuroPress:$NP_CFG" \
+           "HCompress:hcompress" "XGB:xgb"; do
     bl=${b%%:*}; bc=${b#*:}
     if [ "$lossless" = 1 ]; then
       case " $LOSSY_ONLY_CODECS " in *" $bl "*) continue ;; esac
@@ -540,10 +628,12 @@ require_local_tier2() {
   esac
 }
 if [ "$DRY" != 1 ]; then
-  require_root PFS  PFS_ROOT  "$_want_pfs"  "$PFS_ROOT" \
-    "untiered arm (Baseline included) puts its tier-1 file"
+  require_root PFS  PFS_ROOT  "$([ "$_want_pfs$_want_nvme" = 00 ] && echo 0 || echo 1)" "$PFS_ROOT" \
+    "untiered arm (Baseline included) puts its tier-1 file, and every +Tier arm its tier 4,"
   require_root NVMe NVME_ROOT "$_want_nvme" "$NVME_ROOT" \
     "+Tier arm spills tier 2"
+  require_root BB   BB_ROOT   "$_want_nvme" "$BB_ROOT" \
+    "+Tier arm puts tier 3 (the burst buffer)"
   require_local_tier2 "$NVME_ROOT"
 fi
 
@@ -672,6 +762,38 @@ phase_union() {
     }' "$1"
 }
 
+# seed_tier_order <stats dir> <tier-2 path> <tier-3 path> <tier-4 path>
+#   Writes the STARTING device model of the three file tiers so placement starts
+#   fastest tier first -- RAM, NVMe, burst buffer, PFS, each spilling to the next
+#   when full: the paper's "tiering routes compressed output to faster storage
+#   tiers when capacity is available".
+#
+#   WHY IT IS NEEDED. max_bw ranks every tier with room by its LEARNED speed
+#   (bdev GetStats: 1 MiB / (coef x 2098 us)), and a tier that ranks lower gets
+#   no writes, so its estimate never moves again. Every tier starts from the
+#   same cold coefficient (1.0), so whichever tier the first write happened to
+#   make look slower was locked out for the whole run: full Nyx +Tier (job
+#   22575850) put 1 chunk in RAM and 3354 on NVMe in rep 1, none in RAM in reps
+#   2-3; job 22575645 rep 1 went the other way. A RAM bdev never loads a saved
+#   model (bdev_runtime.cc LoadPerfStats), so RAM starts at 1.0; the file tiers
+#   start 50x, 100x and 200x slower here, a margin no first-write jitter
+#   crosses. Every tier's own writes then retrain its coefficient, so these
+#   numbers set only the starting order, never a measured time.
+#   File name = the runtime's MakePerfStatsPath: pool name "<path>_node0" with
+#   every character outside [A-Za-z0-9.-] mapped to '_', plus ".perf".
+seed_tier_order() {
+  local dir=$1 coef=50 p name; shift
+  for p in "$@"; do
+    name=$(printf '%s' "${p}_node0" | sed 's/[^A-Za-z0-9.-]/_/g')
+    awk -v c="$coef" 'BEGIN {
+      printf "clio_bdev_perf_v1\n"
+      printf "read_bandwidth_mbps %.4f\nwrite_bandwidth_mbps %.4f\n", 476.61 / c, 476.61 / c
+      printf "read_latency_us %.2f\nwrite_latency_us %.2f\n", 2098.15 * c, 2098.15 * c
+      printf "iops 1000\nmodel_wall_read %d\nmodel_wall_write %d\n", c, c }' > "$dir/$name.perf"
+    coef=$(( coef * 2 ))
+  done
+}
+
 # run_arm <label> <config> <eb> <tier> <async_ms> <rep>
 #   One measured run of one arm. Rep 1 verifies every blob (and, on a lossy arm,
 #   checks the error bound element-wise); later reps skip that untimed read-back.
@@ -691,6 +813,7 @@ run_arm() {
                     "CLIO_NEUROPRESS_PHASE_LOG=$store/phases.csv"
                     "CLIO_IO_LOG=$store/io.csv"
                     "CLIO_CUSZ_PHASE_LOG=$store/cusz_setup.csv"
+                    "CLIO_REPLAY_PRELOAD=$PRELOAD"
                     )
   # Only pinned when the operator asked; otherwise the wrapper self-tests.
   [ -n "$CUSZ_REUSE" ] && env_kv+=( "CLIO_CUSZ_REUSE_MANAGER=$CUSZ_REUSE" )
@@ -702,15 +825,39 @@ run_arm() {
   # every workload builds the same arm tags, so without the $WL level two
   # concurrent jobs would both write .../fig9-pfs/baseline and corrupt each
   # other's tier.
-  local t2dir="$NVME_ROOT/$WL/$tag" pfsdir="$PFS_ROOT/$WL/$tag"
-  ARM_T2DIR="$t2dir"; ARM_PFSDIR="$pfsdir"; ARM_STORE="$store"
+  local t2dir="$NVME_ROOT/$WL/$tag" pfsdir="$PFS_ROOT/$WL/$tag" bbdir="$BB_ROOT/$WL/$tag"
+  ARM_T2DIR="$t2dir"; ARM_PFSDIR="$pfsdir"; ARM_BBDIR="$bbdir"; ARM_STORE="$store"
+  # A FRESH DEVICE-MODEL DIRECTORY PER REP (CLIO_BDEV_STATS_DIR). A file bdev
+  # saves its learned speed under its pool name and reloads it in the next
+  # process; the tier paths repeat across reps, so rep 2 used to start from rep
+  # 1's NVMe model (3.5 GB/s) against a cold RAM tier and never wrote to RAM
+  # (job 22575645, reps 2-3). Here every rep starts from the same model: cold
+  # for an untiered arm, seeded fastest-first for a tiered one. What each tier
+  # learned is left in the directory for inspection.
+  # THE CTE METADATA LOG GOES ON THIS NODE'S NVMe, under the arm's tier-2 dir
+  # (removed with it after every arm). Beside the results it sat on /work/hdd,
+  # and when that stalled the runtime's log appends stalled inside the timed
+  # run: a 5.2 s final flush with no slow data write (smoke job 22576276 rep 1).
+  # The log is copied back to the run's results before the dir goes.
+  env_kv+=( "BENCH_META_DIR=$t2dir/meta" )
+  local statsdir="$store/bdev_perf"
+  rm -rf "$statsdir"; mkdir -p "$statsdir"
+  env_kv+=( "CLIO_BDEV_STATS_DIR=$statsdir" )
   if [ "$tier" = 1 ]; then
-    mkdir -p "$t2dir" || { echo "cannot create the NVMe tier-2 dir $t2dir" >&2; return 0; }
+    mkdir -p "$t2dir" "$bbdir" "$pfsdir" || {
+      echo "cannot create the tier dirs $t2dir $bbdir $pfsdir" >&2; return 0; }
     env_kv+=( "BENCH_TIER1_TYPE=ram" "BENCH_TIER1_MB=$RAM_MB"
               "BENCH_TIER1_PERSIST=volatile"
-              "BENCH_TIER2_PATH=$t2dir/cte_tier2.dat"
+              "BENCH_TIER2_PATH=$t2dir/cte_tier2.dat" "BENCH_TIER2_MB=$NVME_MB"
+              "BENCH_TIER3_PATH=$bbdir/cte_tier3.dat" "BENCH_TIER3_MB=$BB_MB"
+              "BENCH_TIER4_PATH=$pfsdir/cte_tier4.dat" "BENCH_TIER4_MB=$PFS_MB"
               "CLIO_PREFAULT=0"
-              "CLIO_REPLAY_FSYNC=$t2dir/cte_tier2.dat" )
+              "CLIO_REPLAY_FSYNC=$t2dir/cte_tier2.dat,$bbdir/cte_tier3.dat,$pfsdir/cte_tier4.dat" )
+    seed_tier_order "$statsdir" "$t2dir/cte_tier2.dat" "$bbdir/cte_tier3.dat" \
+      "$pfsdir/cte_tier4.dat"
+    # +Async: asynchronous chunk submission (ASYNC_INFLIGHT) on top of the
+    # periodic drain of the DRAM tier.
+    [ "$flush" != 0 ] && env_kv+=( "CLIO_REPLAY_INFLIGHT=$ASYNC_INFLIGHT" )
   else
     mkdir -p "$pfsdir" || { echo "cannot create the PFS tier-1 dir $pfsdir" >&2; return 0; }
     env_kv+=( "BENCH_TIER1_PATH=$pfsdir/cte_tier.dat"
@@ -748,8 +895,15 @@ run_arm() {
   #
   # A LOSSLESS arm at rep 1 is still verified in full, bit-exact against the
   # input, because that check tests reconstruction rather than a bound.
-  if [ "$rep" -gt 1 ] || awk -v e="$eb" 'BEGIN{exit !(e + 0 > 0)}'; then
+  #
+  # POSTRUN (above) gates all of it: 0 verifies nothing, 1 is the rule just
+  # described, 2 also bound-checks the lossy arms in rep 1.
+  local lossy=0
+  awk -v e="$eb" 'BEGIN{exit !(e + 0 > 0)}' && lossy=1
+  if [ "$POSTRUN" = 0 ] || [ "$rep" -gt 1 ]; then
     cmd+=( --no-verify )
+  elif [ "$lossy" = 1 ]; then
+    if [ "$POSTRUN" = 2 ]; then cmd+=( --check-bound ); else cmd+=( --no-verify ); fi
   fi
 
   if [ "$DRY" = 1 ]; then
@@ -772,8 +926,8 @@ run_arm() {
     # quota, which then failed every later arm with "Disk quota exceeded".
     # rc=137 is SIGKILL -- both what `timeout -k` sends and what the OOM killer
     # sends -- so this is the likeliest arm of all to leak.
-    rm -rf "$t2dir" "$pfsdir" 2>/dev/null
-    ARM_T2DIR=""; ARM_PFSDIR=""; ARM_STORE=""
+    rm -rf "$t2dir" "$pfsdir" "$bbdir" 2>/dev/null
+    ARM_T2DIR=""; ARM_PFSDIR=""; ARM_BBDIR=""; ARM_STORE=""
     find "$store" -maxdepth 2 -type f \( -name chi_bdev.dat \
          -o -name 'cte_tier.dat*' -o -name 'cte_tier2.dat*' \) -delete 2>/dev/null
     echo "     after clean: $(node_state)" >&2
@@ -956,20 +1110,32 @@ print("%s %s: %d B, %d B allocated, %s"
          st.st_blocks * 512, nz))' \
       "$durable" "$([ "$tier" = 1 ] && echo tier2 || echo tier1)")
   fi
-  walrep=$(python3 "$BENCH/lib/decode_wal.py" --summary "$store/$tag/cte_metadata_log" 2>/dev/null)
+  # WHERE A TIERED ARM'S BYTES WENT: how many device writes the RAM tier took,
+  # and the allocated bytes of each durable tier file after the final flush.
+  local placement="" ramw allw d
+  if [ "$tier" = 1 ]; then
+    ramw=$(grep -c '^ram,' "$store/io.csv" 2>/dev/null); allw=$(grep -c '^[a-z]' "$store/io.csv" 2>/dev/null)
+    placement="placement: RAM took ${ramw:-?} of ${allw:-?} device writes |"
+    for d in "NVMe:$t2dir" "BB:$bbdir" "PFS:$pfsdir"; do
+      placement="$placement ${d%%:*} $(du -cB1 "${d#*:}"/cte_tier*.dat* 2>/dev/null | tail -1 | cut -f1) B"
+    done
+  fi
+  walrep=$(python3 "$BENCH/lib/decode_wal.py" --summary "$t2dir/meta/cte_metadata_log" 2>/dev/null)
+  cp -p "$t2dir"/meta/cte_metadata_log* "$store/$tag/" 2>/dev/null
   # The raw stored bytes are never kept: measured above, dropped here.
   find "$store" -maxdepth 2 -type f \( -name chi_bdev.dat -o -name 'cte_tier.dat*' \
        -o -name 'cte_tier2.dat*' \) -delete 2>/dev/null
   # Both device roots are shared allocations: an arm's images MUST go before
   # the next arm starts, or a full campaign fills the filesystem.
-  rm -rf "$t2dir" "$pfsdir" 2>/dev/null
-  ARM_T2DIR=""; ARM_PFSDIR=""; ARM_STORE=""
+  rm -rf "$t2dir" "$pfsdir" "$bbdir" 2>/dev/null
+  ARM_T2DIR=""; ARM_PFSDIR=""; ARM_BBDIR=""; ARM_STORE=""
   local failed
   failed=$(grep -hoE "failed: [0-9]+" "$store"/*/stdout.log 2>/dev/null | tail -1)
   echo "     rc=$rc loop=${stage_s:-?}s codec=${codec_s:-?}s cusz_mgr=${setup_s:-0}s io=${io_s:-?}s (fsync ${fsync_s:-0}s) compute=${sc_s:-?}s total=${total_s:-?}s (H2D staging ${h2d_s}s, input read ${read_s}s removed) ${failed:-} ${bound:-}" >&2
   echo "     tier=$tier async_ms=$flush -> $([ "$tier" = 1 ] \
          && echo "NVMe $t2dir" || echo "PFS $pfsdir") | stored ${stored_b:-?} B | final ${fl#flush: }" >&2
   [ -n "$durep" ] && echo "     $durep" >&2
+  [ -n "$placement" ] && echo "     $placement" >&2
   echo "     WAL: ${walrep:-(none)}" >&2
   # A failed run or a lost chunk is recorded as TBD. A run whose ONLY failure is
   # the error-bound check is still recorded -- its time is real -- but flagged,
@@ -988,6 +1154,15 @@ print("%s %s: %d B, %d B allocated, %s"
     && ! echo "$verdict" | grep -q FAILED && bound_only=1
   if [ -n "$fsync_bad" ]; then
     echo "     NOT RECORDED: $fsync_bad" >&2
+    return 0
+  fi
+  if [ "$PRELOAD" = 1 ] && ! grep -qE "^  preload: " "$store"/*/stdout.log 2>/dev/null; then
+    echo "     NOT RECORDED: PRELOAD=1 but the driver did not preload (a build from before 2026-09-30?)" >&2
+    return 0
+  fi
+  if [ "$tier" = 1 ] && [ "$flush" != 0 ] && [ "$ASYNC_INFLIGHT" -gt 0 ] \
+     && ! grep -qE "^  inflight: " "$store"/*/stdout.log 2>/dev/null; then
+    echo "     NOT RECORDED: +Async but the driver did not submit asynchronously (a build from before 2026-09-30?)" >&2
     return 0
   fi
   if { [ "$rc" -ne 0 ] && [ "$bound_only" = 0 ]; } || echo "$verdict" | grep -q FAILED \
@@ -1047,8 +1222,8 @@ cat > "$OUT/run.json" <<JSON
  "measure_dt":$MEASURE_DT,"measure_quality":$MEASURE_QUALITY,
  "arm_timeout_s":$ARM_TIMEOUT,"fields":"$FIELDS",
  "pfs_root":"$PFS_ROOT","nvme_root":"$NVME_ROOT",
- "selection_log":${SELECTION_LOG:-0},"exclude_read":${EXCLUDE_READ:-1},"staged_input":"$STAGED_DIR",
- "reps":${REPS:-3}}
+ "selection_log":${SELECTION_LOG:-0},"exclude_read":${EXCLUDE_READ:-1},"preload":$PRELOAD,"device_model":"fresh per rep; +Tier seeded fastest-first","nvme_pct":$NVME_PCT,"bb_pct":$BB_PCT,"bb_root":"$BB_ROOT","async_inflight":$ASYNC_INFLIGHT,"staged_input":"$STAGED_DIR",
+ "postrun":$POSTRUN,"reps":${REPS:-3}}
 JSON
 
 # Never truncate earlier results: rerunning a few arms into the same --out
@@ -1144,4 +1319,4 @@ done
 
 echo; echo "csv: $CSV"
 [ "$DRY" = 1 ] && exit 0
-python3 "$HERE/plot_fig9.py" --csv "$CSV" --out "$OUT/figures"
+[ "$POSTRUN" = 0 ] || python3 "$HERE/plot_fig9.py" --csv "$CSV" --out "$OUT/figures"

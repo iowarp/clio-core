@@ -71,6 +71,10 @@
 #include "cuszp.h"
 #endif
 
+#if CTP_ENABLE_GPULZ
+#include "gpulz.h"
+#endif
+
 namespace ctp {
 
 /**
@@ -105,6 +109,7 @@ class CompressionFactory {
    *                                "zfp-sycl" (lossy fixed-rate, if SYCL enabled)
    *                                "cusz" (GPU lossy float, if cuSZ enabled)
    *                                "ndzip" (GPU lossless float, if ndzip enabled)
+   *                                "gpulz" (GPU lossless LZSS, if GPULZ enabled)
    *                                "cuszp" (GPU lossy float, if cuSZp enabled)
    * @param preset Compression preset level (FAST/BALANCED/BEST/DEFAULT)
    * @return Unique pointer to configured compressor instance,
@@ -458,6 +463,15 @@ class CompressionFactory {
     return nullptr;
 #endif
   }
+  // GPULZ: GPU LZSS LOSSLESS compressor (ICS'23). Single-mode (no preset
+  // levels), like ndzip. Returns nullptr when GPULZ is not available.
+  static std::unique_ptr<Compressor> MakeGpulz(CompressionPreset) {
+#if CTP_ENABLE_GPULZ
+    return std::make_unique<Gpulz>();
+#else
+    return nullptr;
+#endif
+  }
   // cuSZp: GPU ultra-fast error-bounded LOSSY float compressor (single-kernel).
   // Multi-mode like cusz/the lossy CPU entries -- presets map to ABSOLUTE error
   // bounds (FAST=1e-2 loose, BALANCED=1e-3, BEST=1e-4 tight). Returns nullptr
@@ -515,6 +529,7 @@ class CompressionFactory {
         CompressorInfo{"cuszp",           20, 22, false, true, &MakeCuszp},
         CompressorInfo{"nvcomp-cascaded", 21, 23, true, true, &MakeNvCompCascaded},
         CompressorInfo{"nvcomp-bitcomp",  22, 24, true, true, &MakeNvCompBitcomp},
+        CompressorInfo{"gpulz",           23, 25, true, true, &MakeGpulz},
     };
     return kRegistry;
   }

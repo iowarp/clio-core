@@ -98,12 +98,14 @@ namespace CompLib {
   constexpr int NVCOMP_BITCOMP = 22;
   // Explicit-selection-only algorithms (not part of NeuroPress's NN action
   // space, but selectable through Clio's static compress_lib_ path like
-  // everything else). CUSZ/CUSZP are LOSSY (error-bounded); NDZIP is
-  // LOSSLESS. All three require float-aligned data (checked in their
-  // Compress() -- input_size % sizeof(float) must be 0).
+  // everything else). CUSZ/CUSZP are LOSSY (error-bounded); NDZIP and GPULZ
+  // are LOSSLESS. cuSZ/ndzip/cuSZp require float-aligned data (checked in
+  // their Compress() -- input_size % sizeof(float) must be 0); GPULZ takes
+  // any byte length.
   constexpr int CUSZ = 18;
   constexpr int NDZIP = 19;
   constexpr int CUSZP = 20;
+  constexpr int GPULZ = 23;
 }
 
 /**
@@ -979,7 +981,8 @@ TEST_CASE("NvComp GPU Round-trip", "[compressor][functional][nvcomp][gpu]") {
 }
 #endif  // CTP_ENABLE_NVCOMP
 
-#if CTP_ENABLE_NVCOMP || CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP
+#if CTP_ENABLE_NVCOMP || CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP || \
+    CTP_ENABLE_GPULZ
 /**
  * Static selection of every GPU compressor Clio can build against, run at
  * 1 GiB: NeuroPress's 8-algorithm nvcomp action space (lossless, byte data)
@@ -1055,7 +1058,7 @@ TEST_CASE("GPU Compressor Round-trip - 1GiB dataset",
   }
 #endif  // CTP_ENABLE_NVCOMP
 
-#if CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP
+#if CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP || CTP_ENABLE_GPULZ
   {
     // cuSZ/ndzip/cuSZp all require float-aligned input (Compress() rejects
     // input_size % sizeof(float) != 0), and cuSZ/cuSZp are LOSSY -- exact
@@ -1069,6 +1072,9 @@ TEST_CASE("GPU Compressor Round-trip - 1GiB dataset",
     std::vector<FloatAlgo> float_algos = {
 #if CTP_ENABLE_NDZIP
         {CompLib::NDZIP, "ndzip", true},
+#endif
+#if CTP_ENABLE_GPULZ
+        {CompLib::GPULZ, "gpulz", true},
 #endif
 #if CTP_ENABLE_CUSZ
         {CompLib::CUSZ, "cusz", false},
@@ -1144,9 +1150,9 @@ TEST_CASE("GPU Compressor Round-trip - 1GiB dataset",
       }
     }
   }
-#endif  // CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP
+#endif  // CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP || CTP_ENABLE_GPULZ
 }
-#endif  // CTP_ENABLE_NVCOMP || CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP
+#endif  // CTP_ENABLE_NVCOMP || ... || CTP_ENABLE_GPULZ
 
 #if CTP_ENABLE_NVCOMP
 /**

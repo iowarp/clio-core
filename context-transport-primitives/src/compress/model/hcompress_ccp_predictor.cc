@@ -8,6 +8,8 @@
 
 #include "clio_ctp/compress/model/hcompress_ccp_predictor.h"
 
+#include "clio_ctp/compress/model/ranking.h"  // KnownCompressors()
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -214,14 +216,44 @@ std::string HCompressCcpPredictor::LibraryKey(const std::string& library_name,
          (byte_shuffle ? "1" : "0");
 }
 
+/**
+ * @brief The bare algorithm name a seed row keys this candidate by.
+ *
+ * THE FEATURE PATH MUST KEY EXACTLY AS THE SEED DOES. The seed is written by
+ * paper-benchmark/model-accuracy/prepare_inputs.py::library_key, which keys on
+ * the ALGORITHM NAME with its "nvcomp-" prefix stripped -- "lz4|q0|s1". This
+ * used to key on the encoded id instead ("libcfg132|q0|s1"), which matches no
+ * seed row: every candidate then fell outside the library vocabulary, took no
+ * library term, predicted the same cost, and the ranking collapsed to tie
+ * order -- a selector that always picked its first candidate and looked
+ * normal doing it. The offline evaluator never noticed because it calls
+ * PredictFor() with the name straight from its CSV; only the runtime reaches
+ * this path.
+ *
+ * @param library_config_id base_id*10 + preset (CandidateConfig::LibraryConfigId)
+ * @return the seed's name for that algorithm, or "libcfg<id>" for an id the
+ *         registry does not know, which then correctly reads as unseen
+ */
+static std::string SeedAlgorithmName(double library_config_id) {
+  const int base_id = static_cast<int>(library_config_id) / 10;
+  static const std::string kNvcompPrefix = "nvcomp-";
+  for (const auto& entry : KnownCompressors()) {
+    if (entry.base_id != base_id) continue;
+    std::string name = entry.name;
+    if (name.compare(0, kNvcompPrefix.size(), kNvcompPrefix) == 0) {
+      name.erase(0, kNvcompPrefix.size());
+    }
+    return name;
+  }
+  std::ostringstream os;
+  os << "libcfg" << static_cast<long long>(library_config_id);
+  return os.str();
+}
+
 std::string HCompressCcpPredictor::LibraryKey(
     const CompressionFeatures& features) {
-  // No name in the features, so the encoded id stands in for it. The id is
-  // stable (base_id*10 + preset), which is all a category key needs.
-  std::ostringstream os;
-  os << "libcfg" << static_cast<long long>(features.library_config_id);
-  return LibraryKey(os.str(), features.quantize != 0.0,
-                    features.byte_shuffle != 0.0);
+  return LibraryKey(SeedAlgorithmName(features.library_config_id),
+                    features.quantize != 0.0, features.byte_shuffle != 0.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +549,30 @@ bool HCompressCcpPredictor::Load(const std::string& model_dir) {
   std::stringstream ss;
   ss << f.rdbuf();
   const std::string s = ss.str();
+
+  // THE FIT'S OWN SETTINGS COME BACK WITH IT. Save() writes these four, and
+  // Load() used to ignore them, so a reloaded model reverted to CcpConfig's
+  // defaults. That mattered most for ratio_target_cap: a seed fitted with the
+  // ratio target capped at 100 then took its FEEDBACK uncapped, updating under
+  // a different objective than it was fitted under -- and the uncapped
+  // objective is the one whose least-squares fit chases multi-thousand-x
+  // outliers until every lossless codec predicts the 0.1 clamp floor.
+  // Restored before the Reset() below, which reads regularization. A field
+  // absent from an older file leaves the configured value in place.
+  auto restore = [&s](const char* key, double* dst) {
+    const std::string v = Field(s, key);
+    if (v.empty()) return;
+    try {
+      *dst = std::stod(v);
+    } catch (...) {
+    }
+  };
+  restore("regularization", &config_.regularization);
+  restore("forget_factor", &config_.forget_factor);
+  restore("ratio_target_cap", &config_.ratio_target_cap);
+  double interval = static_cast<double>(config_.feedback_interval);
+  restore("feedback_interval", &interval);
+  if (interval >= 1.0) config_.feedback_interval = static_cast<size_t>(interval);
 
   types_ = SplitStrings(Field(s, "data_types"));
   formats_ = SplitStrings(Field(s, "data_formats"));

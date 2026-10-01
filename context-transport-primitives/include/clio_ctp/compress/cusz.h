@@ -55,6 +55,25 @@ namespace ctp {
 namespace cusz_detail {
 
 /**
+ * The entropy codec every cuSZ stream is written with: classic Huffman (HF).
+ *
+ * NOT cuSZ's DEFAULT_CODEC. On the master branch this tree builds against,
+ * DEFAULT_CODEC is HFR_V3 (one GPU-picked prebuilt book out of 25), and on
+ * real data it does not work: on VPIC fields ex/cbx/rhof it reported ~4.2 MB
+ * for a 8 MiB chunk (2 bytes per value, i.e. nothing entropy-coded) and a
+ * length the manager's own output buffer cannot hold, so copying the frame
+ * out failed and every such chunk was stored raw -- 52-100% of chunks in
+ * figure 9. On near-zero fields it "succeeded" and decoded to max|err| 526
+ * at eb 1e-3. psz_compress_float reports success either way (libcusz.cc
+ * discards the pipeline's status). HF on the same chunks: 3.3-5.7x, max|err|
+ * exactly eb (np-fix/cusz-reuse/codec_probe.cu, jobs 22350060/22350072).
+ *
+ * Decompression reads the codec from each stream's own header, so blobs
+ * written under HFR_V3 still decode as HFR_V3.
+ */
+inline constexpr psz_codec kCodec = HF;
+
+/**
  * Per-call breakdown of everything Compress() does around the codec kernel.
  *
  * `compress_ms` brackets `psz_compress_float` alone, so the stream creation,
@@ -323,7 +342,7 @@ inline bool ReuseProbeSplen(psz_resource *mgr, float *d_in, size_t *splen,
  */
 inline bool ReuseSelfTest() {
   constexpr size_t kN = 1u << 20;   // 1 Mi floats = 4 MiB, a real chunk size
-  psz_pipeline pipeline = {Lorenzo, HistGeneric, DEFAULT_CODEC, CodecNull};
+  psz_pipeline pipeline = {Lorenzo, HistGeneric, kCodec, CodecNull};
   const char *why = "did not run";
   double err_fresh = -1.0, diff = -1.0, tol = 0.0;
 
@@ -547,7 +566,8 @@ class Cusz : public Compressor {
       if (d_in == nullptr) break;
 
       psz_len len = {n, 1, 1};  // x, y, z (1D)
-      psz_pipeline pipeline = {Lorenzo, HistGeneric, DEFAULT_CODEC, CodecNull};
+      psz_pipeline pipeline = {Lorenzo, HistGeneric, cusz_detail::kCodec,
+                               CodecNull};
       t0 = std::chrono::steady_clock::now();
       if (log_setup) ns_mgr = cusz_detail::SetupLog::Now();
       // Reusing, this is free on every chunk but the first of a new length,

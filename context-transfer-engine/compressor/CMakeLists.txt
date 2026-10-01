@@ -15,6 +15,10 @@ set(COMPRESSOR_SOURCES
     src/neuropress_telemetry.cc
     src/neuropress_explore.cc
     src/neuropress_selection.cc
+    # HCompress's cost model as a runtime selector (hcompress_model_path).
+    src/hcompress_selection.cc
+    # The XGBoost baseline as a runtime selector (xgb_model_path).
+    src/xgb_selection.cc
     src/autogen/compressor_lib_exec.cc
 )
 

@@ -30,7 +30,7 @@ TWO THINGS THIS FIGURE CANNOT SHOW, both worth knowing before citing it:
 
 Usage:
   ./plot_choices.py --camp Nyx=/work/hdd/.../fig9-full-nyx-.../nyx \
-                    --camp VPIC=... --out live
+                    --camp VPIC=... --out live/choices
 """
 from __future__ import annotations
 
@@ -762,7 +762,7 @@ def main() -> int:
                          "only; pair with --top 8).")
     ap.add_argument("--bins", type=int, default=32,
                     help="timestep bins for --mode timeline/heat (default 32)")
-    ap.add_argument("--out", default="live", help="output directory")
+    ap.add_argument("--out", default="live/choices", help="output directory")
     ap.add_argument("--name", default=None,
                     help="output filename (default fig9_choices[_<mode>].png)")
     ap.add_argument("--title", default=DEFAULT_TITLE)

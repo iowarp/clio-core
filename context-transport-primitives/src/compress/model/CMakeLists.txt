@@ -14,6 +14,16 @@ set(CLIO_CTP_COMPRESS_MODEL_SRC
     linreg_table_predictor.cc
     xgboost_predictor.cc
     neuropress_nn_predictor.cc
+    # HCompress's Expected-Compression-Cost model (IPDPS 2020). Built here so
+    # the compressor runtime can DEPLOY it as a selector, not only score it
+    # offline: until now it was compiled on demand by
+    # paper-benchmark/model-accuracy/make_table.sh and linked into no target.
+    # Standard library only, so it adds no dependency to this target.
+    hcompress_ccp_predictor.cc
+    # The XGBoost baseline as a selector: walks trees exported by
+    # paper-benchmark/model-accuracy/export_xgb_trees.py. Standard library
+    # only -- no XGBoost dependency (CLIO_CTP_ENABLE_XGBOOST stays off).
+    xgb_tree_predictor.cc
     # Provides ByteShuffleDevice/ByteUnshuffleDevice on a CPU-only build;
     # compiles to nothing when CUDA is on (the .cu below defines them).
     ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/byte_shuffle_cpu_stub.cc

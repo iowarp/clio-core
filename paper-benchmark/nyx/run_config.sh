@@ -93,6 +93,15 @@ export FIELDS
 [ -d "$FIELDS" ] || { echo "no field dumps at $FIELDS -- run ./gen_fields.sh first" >&2; exit 1; }
 
 NP_LEARN=false NP_EXPLORE=false EXPLORE_K=0 THRESH=0.5 BEST=false
+# HC_SEED, not HC_MODEL, is what makes an arm HCompress: HC_MODEL only says
+# where the seed lives, and a caller may export it for a whole campaign. If
+# the compose keyed on HC_MODEL, every arm of that campaign -- NeuroPress's
+# and the fixed codecs' alike -- would silently be chosen by HCompress.
+# Reset here so an inherited value cannot leak into another config.
+HC_SEED=""
+# XGB_SEED, likewise, is set only by the `xgb` config below; XGB_MODEL only
+# says where the exported trees live.
+XGB_SEED=""
 STATIC_LIB="" STATIC_SHUF=0 STATIC_QUANT=false
 COST_ENV=()
 # Which of the two cost models this config asks for, recorded in meta.json so
@@ -100,7 +109,7 @@ COST_ENV=()
 # behaviour: `dynamic`/`learn` rank under the default balanced weights, the
 # rest under the ratio-only ones.
 case "$CONFIG" in
-  dynamic|learn|explore-balance) COSTMODEL=balance ;;
+  dynamic|learn|explore-balance|hcompress|xgb) COSTMODEL=balance ;;
   static-*|baseline)             COSTMODEL=none ;;
   *)                             COSTMODEL=ratio ;;
 esac
@@ -110,6 +119,20 @@ case "$CONFIG" in
   baseline)       NO_COMPRESS=1 ;;  # figure 9: stored raw, no codec
   dynamic-ratio)  COST_ENV=("${RATIO_ONLY[@]}") ;;
   learn)          NP_LEARN=true ;;
+  # HCompress's cost model (IPDPS 2020) chooses each chunk's codec instead of
+  # NeuroPress: same candidate set, same balanced cost model, a different
+  # predictor (compressor hcompress_model_path; hcompress_selection.cc).
+  # HC_MODEL is REQUIRED, not defaulted -- a seed directory holding
+  # hcompress_ccp_seed.json. Which seed decides the arm (a ratio-capped fit
+  # versus the paper's uncapped one), so it is named by the caller rather
+  # than silently picked here.
+  hcompress)      HC_SEED=${HC_MODEL:?hcompress needs HC_MODEL=<dir holding hcompress_ccp_seed.json>} ;;
+  # The XGBoost baseline chooses each chunk's codec the same way: NeuroPress's
+  # candidates and balanced cost model, the NN's own per-chunk statistics as
+  # inputs, XGBoost's predictions (compressor xgb_model_path; xgb_selection.cc).
+  # XGB_MODEL is REQUIRED -- a directory holding xgb_trees.txt, exported by
+  # paper-benchmark/model-accuracy/export_xgb_trees.py.
+  xgb)            XGB_SEED=${XGB_MODEL:?xgb needs XGB_MODEL=<dir holding xgb_trees.txt>} ;;
   learn-ratio)    NP_LEARN=true; COST_ENV=("${RATIO_ONLY[@]}") ;;
   explore)        NP_LEARN=true; NP_EXPLORE=true; EXPLORE_K=31; THRESH=0
                   COST_ENV=("${RATIO_ONLY[@]}") ;;
@@ -134,7 +157,7 @@ case "$CONFIG" in
   static-zstd-s4) STATIC_LIB=nvcomp-zstd; STATIC_SHUF=4 ;;
   static-zstd-s8) STATIC_LIB=nvcomp-zstd; STATIC_SHUF=8 ;;
   # Generic fixed-codec arm: static-<lib>[-sN], e.g. static-cusz, static-ndzip,
-  # static-cuszp, static-bitcomp-s4. Named codecs above keep their historical
+  # static-cuszp, static-gpulz, static-bitcomp-s4. Named codecs above keep their historical
   # spellings; this only adds names that had none. An nvcomp codec may be
   # written bare ("bitcomp" -> "nvcomp-bitcomp"); external ones (cusz, cuszp,
   # ndzip) are passed through as-is. An unknown name is NOT silently accepted:
@@ -152,7 +175,7 @@ case "$CONFIG" in
     case "$_spec" in *-s[0-9]*) STATIC_SHUF=${_spec##*-s}; _spec=${_spec%-s*} ;; esac
     case "$_spec" in *-q)       STATIC_QUANT=true;         _spec=${_spec%-q} ;; esac
     case "$_spec" in
-      cusz|cuszp|ndzip|zfp-sycl) STATIC_LIB=$_spec ;;
+      cusz|cuszp|ndzip|gpulz|zfp-sycl) STATIC_LIB=$_spec ;;
       nvcomp-*)                  STATIC_LIB=$_spec ;;
       *)                         STATIC_LIB=nvcomp-$_spec ;;
     esac ;;
@@ -165,6 +188,19 @@ export NP_LEARN NP_EXPLORE EXPLORE_K THRESH BEST STATIC_LIB STATIC_SHUF STATIC_Q
 # under lossy compression it would report FAILED on a run that is behaving
 # exactly as asked. Turn it off and say so; the quality number for a lossy run
 # is PSNR in selection.csv, not a digest.
+# LOSSLESS ONLY, HARD (paper decision 2026-09-29): no benchmark runs lossy.
+# Every harness reaches the driver through a workload's run_config script, so
+# the gate lives here. A positive error bound, a quantized fixed codec (-q),
+# or a positive CLIO_NEUROPRESS_ERROR_BOUND inherited from the caller is
+# REFUSED, not rewritten to 0: a lossy request fails loudly instead of coming
+# back as a result labelled with a bound it did not run at.
+if awk -v e="${EB:-0}" 'BEGIN{exit !(e+0>0)}' \
+   || awk -v e="${CLIO_NEUROPRESS_ERROR_BOUND:-0}" 'BEGIN{exit !(e+0>0)}' \
+   || [ "${STATIC_QUANT:-false}" = true ]; then
+  echo "LOSSLESS ONLY: refusing config=$CONFIG eb=${EB:-0}" \
+       "env_eb=${CLIO_NEUROPRESS_ERROR_BOUND:-unset} quantize=${STATIC_QUANT:-false}" >&2
+  exit 3
+fi
 MODE=lossless
 if [ -n "$EB" ] && awk -v e="$EB" 'BEGIN{exit !(e+0>0)}'; then
   MODE=lossy

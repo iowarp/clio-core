@@ -1061,6 +1061,26 @@ class NvComp : public Compressor {
     }
   }
 
+  /**
+   * @brief Bitcomp's `algorithm` option, from CLIO_NVCOMP_BITCOMP_ALGO.
+   *
+   * nvcomp offers two: 0, the default, usually gives the best ratio; 1,
+   * "sparse", works well on data with many zeroes and is usually faster.
+   * Read once per process, so every Bitcomp manager in a run agrees. Unset
+   * or any value other than 1 keeps 0, the setting NeuroPress's model was
+   * trained against. The stream is self-describing, so decompression needs
+   * no matching setting.
+   *
+   * @return 0 or 1.
+   */
+  static int BitcompAlgorithm() {
+    static const int algo = [] {
+      const char *e = std::getenv("CLIO_NVCOMP_BITCOMP_ALGO");
+      return (e != nullptr && std::atoi(e) == 1) ? 1 : 0;
+    }();
+    return algo;
+  }
+
   std::shared_ptr<nvcomp::nvcompManagerBase> MakeManager(cudaStream_t stream) {
     switch (algo_) {
       // NOTE: nvcomp >= 5.x split each algorithm's single "DefaultOpts" into
@@ -1118,12 +1138,12 @@ class NvComp : public Compressor {
         // data". Bitcomp models the buffer as an array of its declared
         // type, so the default NVCOMP_TYPE_UCHAR compresses 8-byte-wide
         // scientific data byte-wise and reaches a materially different
-        // ratio. algorithm 0 matches the default but is set explicitly,
-        // as upstream does.
+        // ratio. algorithm 0 matches the default and is set explicitly, as
+        // upstream does, unless CLIO_NVCOMP_BITCOMP_ALGO=1 asks for sparse.
         nvcompBatchedBitcompCompressOpts_t opts =
             nvcompBatchedBitcompCompressDefaultOpts;
         opts.data_type = NVCOMP_TYPE_LONGLONG;
-        opts.algorithm = 0;
+        opts.algorithm = BitcompAlgorithm();
         return std::make_shared<nvcomp::BitcompManager>(
             kChunkSize, opts, nvcompBatchedBitcompDecompressDefaultOpts,
             stream);

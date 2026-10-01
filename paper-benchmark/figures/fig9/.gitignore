@@ -1,0 +1,5 @@
+# Measured results, mirrored here by sync_data.sh so the directory is portable.
+# Never committed: results stay out of the repository and travel by download.
+data/
+# numbers written beside a figure stay local, like data/
+live/**/*.csv

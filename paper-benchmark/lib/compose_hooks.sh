@@ -6,15 +6,24 @@
 #                      CSVs and logs stay in the results dir. Inert for a `ram`
 #                      tier, whose path is only a shared-memory name.
 #   BENCH_TIER2_PATH / _MB / _SCORE    add a long_term file tier (score 0.3)
+#   BENCH_TIER3_PATH / _MB / _SCORE    a third long_term file tier (score 0.2); needs tier 2
+#   BENCH_TIER4_PATH / _MB / _SCORE    a fourth long_term file tier (score 0.1); needs tier 3
 #   BENCH_FLUSH_MS     flush_data_period_ms; 0 disables it (unset: core default 10 s)
 #   BENCH_NP_LR        neuropress_learning_rate
 #   BENCH_NP_MAPE      neuropress_mape_threshold
 
-# bench_tier2_yaml <tier_mb> -- the second storage entry, or nothing.
+# bench_tier2_yaml <tier_mb> -- the second storage entry (and a third and
+# fourth when BENCH_TIER3_PATH / BENCH_TIER4_PATH are set), or nothing.
 bench_tier2_yaml() {
   [ -n "${BENCH_TIER2_PATH:-}" ] || return 0
   printf '\n      - path: "%s"\n        bdev_type: "file"\n        capacity_limit: "%sMB"\n        score: %s\n        persistence_level: "long_term"' \
     "$BENCH_TIER2_PATH" "${BENCH_TIER2_MB:-$1}" "${BENCH_TIER2_SCORE:-0.3}"
+  [ -n "${BENCH_TIER3_PATH:-}" ] || return 0
+  printf '\n      - path: "%s"\n        bdev_type: "file"\n        capacity_limit: "%sMB"\n        score: %s\n        persistence_level: "long_term"' \
+    "$BENCH_TIER3_PATH" "${BENCH_TIER3_MB:-$1}" "${BENCH_TIER3_SCORE:-0.2}"
+  [ -n "${BENCH_TIER4_PATH:-}" ] || return 0
+  printf '\n      - path: "%s"\n        bdev_type: "file"\n        capacity_limit: "%sMB"\n        score: %s\n        persistence_level: "long_term"' \
+    "$BENCH_TIER4_PATH" "${BENCH_TIER4_MB:-$1}" "${BENCH_TIER4_SCORE:-0.1}"
 }
 
 # bench_flush_yaml -- the flush_data_period_ms line, or nothing.

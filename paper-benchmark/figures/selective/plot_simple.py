@@ -44,8 +44,8 @@ BLUE, GREEN, DARK_GREEN = "#1c5cab", "#31aa76", "#006435"   # figure 9's arm col
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.dirname(os.path.dirname(HERE))
 #: bar -> (measured arm, legend label, colour, hatch)
-BARS = [("uniform_zstd", "Uniform lossy", BLUE, ""),
-        ("np_lossless", "NeuroPress, lossless only", GREEN, ""),
+BARS = [("np_lossless", "NeuroPress, lossless only", GREEN, ""),
+        ("uniform_zstd", "Uniform lossy", BLUE, ""),
         ("np_ratiofloor40", "NeuroPress, lossy accepted", DARK_GREEN, "//")]
 #: The same three policies under the BALANCED cost model (compress + decompress
 #: + I/O time): uniform lossy is then the fastest fixed configuration.
@@ -110,14 +110,23 @@ def draw_dual(ax, t: pd.DataFrame, wls: list) -> None:
                 continue
             ratio, psnr = t.loc[(wl, arm), "ratio"], t.loc[(wl, arm), "psnr"]
             x = j + (i - (len(BARS) - 1) / 2) * w
+            secs = t.loc[(wl, arm), "time"]
+            if not np.isnan(secs):
+                # time spent (1 write + 5 reads) in a row under the bar
+                ax.annotate(f"{secs:.1f} s", (x, 0), xycoords=("data", "axes fraction"),
+                            xytext=(0, -9), textcoords="offset points", ha="center",
+                            va="top", fontsize=FS, color=INK)
             if not np.isnan(ratio):
                 ax.bar(x, ratio - 1.0, bottom=1.0, width=w * 0.92, color=color, hatch=hatch,
                        edgecolor="white", linewidth=0, zorder=3)
-                # label on the bar's left half, marker on its right half: they never meet
-                texts.append(ax.text(x - 0.2 * w, ratio * 1.1, f"{ratio:.1f}\u00d7", ha="center",
-                                     va="bottom", fontsize=FS, color=INK, rotation=90))
+                # label and marker both on the bar's centre line; upright when
+                # the bars are wide (one or two workloads), rotated otherwise.
+                # overlaps() fails the figure if the two ever meet.
+                texts.append(ax.text(x, ratio * 1.08, f"{ratio:.1f}\u00d7", ha="center",
+                                     va="bottom", fontsize=FS, color=INK,
+                                     rotation=0 if len(wls) <= 2 else 90))
             if not np.isnan(psnr):
-                marks += ax2.plot(x + 0.25 * w, min(psnr, PSNR_CAP), marker="D", ms=7, color=INK,
+                marks += ax2.plot(x, min(psnr, PSNR_CAP), marker="D", ms=7, color=INK,
                                   mec="white", mew=1.0, ls="none", zorder=5)
     ax.set_yscale("log")
     top = np.nanmax(t["ratio"].to_numpy())
@@ -138,7 +147,10 @@ def draw_dual(ax, t: pd.DataFrame, wls: list) -> None:
     for a_ in (ax, ax2):
         a_.tick_params(axis="y", labelsize=FS, colors=INK_MUTED, width=0.6)
         a_.spines["top"].set_visible(False)
-    ax.tick_params(axis="x", length=0)
+    ax.tick_params(axis="x", length=0, pad=23)   # under the row of times
+    ax.annotate("time", (0, 0), xycoords="axes fraction", xytext=(-4, -9),
+                textcoords="offset points", ha="right", va="top", fontsize=FS,
+                color=INK_MUTED)
     return texts, marks
 
 
@@ -184,7 +196,7 @@ def main():
         texts, marks = draw_dual(ax, t, wls)
         handles.append(plt.Line2D([], [], marker="D", ms=7, color=INK, mec="white", ls="none"))
         labels.append("Lowest block PSNR (right axis)")
-        ncol = 2
+        ncol = 2 if a.width >= 5 else 1     # one column at \columnwidth
     else:
         rows = 3 if a.model == "balanced" else 2
         fig, axes = plt.subplots(rows, 1, figsize=(a.width, a.height * rows / 2), sharex=True)
@@ -194,9 +206,13 @@ def main():
         panel(axes[-1], t, wls, "psnr", lambda v: "lossless" if v >= PSNR_CAP else f"{v:.0f}",
               "Lowest block\nPSNR (dB)")
         ncol = 3
+    fig.tight_layout(pad=0.3, h_pad=0.6, rect=(0, 0, 1, (0.84 if ncol == 2 else 1 - 1.0 / a.height)
+                                         if a.layout == "dual" else 0.93))
+    # Centred on the plot area, not on the figure: the two y-axis labels are
+    # different widths, so the figure's centre is not the axes' centre.
+    pos = fig.axes[0].get_position()
     fig.legend(handles, labels, loc="upper center", ncol=ncol, fontsize=FS, frameon=False,
-               bbox_to_anchor=(0.5, 1.0), handlelength=1.6, columnspacing=1.6)
-    fig.tight_layout(pad=0.3, h_pad=0.6, rect=(0, 0, 1, 0.84 if a.layout == "dual" else 0.93))
+               bbox_to_anchor=((pos.x0 + pos.x1) / 2, 1.0), handlelength=1.6, columnspacing=1.6)
     if a.layout == "dual" and overlaps(fig, texts, marks):
         raise SystemExit("figure check failed: " + "; ".join(overlaps(fig, texts, marks)))
     small = [t_.get_fontsize() for t_ in fig.findobj(mpl.text.Text)

@@ -212,6 +212,20 @@ compose:
   #   pool_query: local
   #   pool_id: "562.0"
   #   next_pool_id: "561.0"             # replication pool — see entry above
+  #   # Codec SELECTOR (all optional; with none, the legacy heuristics choose):
+  #   neuropress_model_path: ""         # dir holding NeuroPress model.nnwt
+  #   hcompress_model_path: ""          # dir holding hcompress_ccp_seed.json;
+  #                                     # HCompress (IPDPS 2020) ranks NeuroPress's
+  #                                     # candidates under its cost model. Takes
+  #                                     # precedence: when set, NeuroPress is NOT
+  #                                     # loaded, so one model chooses each chunk.
+  #   xgb_model_path: ""                # dir holding xgb_trees.txt (exported by
+  #                                     # model-accuracy/export_xgb_trees.py);
+  #                                     # XGBoost ranks NeuroPress's candidates
+  #                                     # under its cost model on the NN's own
+  #                                     # statistics. Takes precedence over
+  #                                     # neuropress_model_path; setting it with
+  #                                     # hcompress_model_path fails the pool.
 
   # === Indexer (SemanticSearch index, issue #905) ===
   # Search layer: owns the term index that serves Method::kSemanticSearch

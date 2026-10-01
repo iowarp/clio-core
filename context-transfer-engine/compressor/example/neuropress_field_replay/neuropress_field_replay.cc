@@ -445,6 +445,44 @@ std::string FieldOf(const std::string &stem) {
   return stem.substr(u + 1);
 }
 
+/**
+ * Read every input file into memory before the timed window opens
+ * (CLIO_REPLAY_PRELOAD=1).
+ *
+ * WITHOUT IT THE WINDOW HOLDS THE READS. The loop reads a file, submits its
+ * chunks, waits for them, and only then reads the next file; the harness takes
+ * the read time back out of the bar (EXCLUDE_READ). That subtraction is exact
+ * only when nothing else runs during a read -- and on a +Async arm something
+ * does: the periodic FlushData keeps draining the RAM tier to the file tier
+ * while the driver reads. Those drain writes landed in the I/O union of a bar
+ * that excludes the reads, and the drain got that time for free, which no
+ * other arm can do (measured on full Nyx: 2.6-3.6 s of a 19 s bar). With every
+ * file already in memory the window holds no reads, so nothing is subtracted.
+ *
+ * @param files the input files, in replay order.
+ * @param out receives one buffer per file, index-aligned with files; a
+ *            zero-length file gets an empty buffer.
+ * @param out_bytes receives the total bytes read.
+ * @return false on a short read (reported on stderr).
+ */
+bool PreloadFiles(const std::vector<fs::path> &files,
+                  std::vector<std::vector<char>> *out, size_t *out_bytes) {
+  out->assign(files.size(), std::vector<char>());
+  *out_bytes = 0;
+  for (size_t i = 0; i < files.size(); ++i) {
+    const size_t sz = fs::file_size(files[i]);
+    if (sz == 0) continue;
+    (*out)[i].resize(sz);
+    std::ifstream in(files[i], std::ios::binary);
+    if (!in.read((*out)[i].data(), static_cast<std::streamsize>(sz))) {
+      std::cerr << "short read on " << files[i] << "\n";
+      return false;
+    }
+    *out_bytes += sz;
+  }
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -882,66 +920,105 @@ int main(int argc, char **argv) {
               << " dB (a chunk below it is stored losslessly)" << std::endl;
 
   std::vector<BlobRecord> records;
-  std::vector<Pending> pending;
+  std::deque<Pending> pending;
   double read_s = 0.0, stage_s = 0.0;
   // --no-compress only: host->device staging, a replay artifact the
   // harness subtracts the same way it subtracts the compressor's h2d_ms.
   double baseline_h2d_s = 0.0;
 
-  auto drain = [&]() {
-    for (auto &p : pending) {
-      auto &r = records[p.record];
-      if (opt.no_compress) {
-        p.put.Wait();
-        r.ok = p.put->GetReturnCode() == 0;
-        r.lib = 0;  // stored raw, by construction
-        r.ratio = 1.0;
-        r.stored = r.bytes;
-        if (!p.dev_alloc.IsNull()) {
-          CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, p.dev_alloc);
-        }
-        CLIO_IPC->FreeBuffer(p.buf);
-        continue;
+  // Wait for one submitted chunk and record its outcome.
+  auto finish = [&](Pending &p) {
+    auto &r = records[p.record];
+    if (opt.no_compress) {
+      p.put.Wait();
+      r.ok = p.put->GetReturnCode() == 0;
+      r.lib = 0;  // stored raw, by construction
+      r.ratio = 1.0;
+      r.stored = r.bytes;
+      if (!p.dev_alloc.IsNull()) {
+        CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, p.dev_alloc);
       }
-      p.fut.Wait();
-      const auto &c = p.fut->context_;
-      r.ok = p.fut->GetReturnCode() == 0;
-      r.lib = c.compress_lib_;
-      r.ratio = c.actual_compression_ratio_;
-      r.ms = c.actual_compress_time_ms_;
-      r.preproc_ms = c.actual_preproc_time_ms_;
-      r.h2d_ms = c.actual_h2d_time_ms_;
-      r.dt_ms = c.actual_decompress_time_ms_;
-      // lib == 0 marks "stored raw": the codec did not shrink the chunk and
-      // the caller's bytes went to the tier untouched, so the stored size is
-      // the original -- actual_compressed_size_ still reports the codec's
-      // output, which is NOT what was stored.
-      r.stored = (r.ok && r.lib != 0) ? c.actual_compressed_size_ : r.bytes;
       CLIO_IPC->FreeBuffer(p.buf);
+      return;
     }
+    p.fut.Wait();
+    const auto &c = p.fut->context_;
+    r.ok = p.fut->GetReturnCode() == 0;
+    r.lib = c.compress_lib_;
+    r.ratio = c.actual_compression_ratio_;
+    r.ms = c.actual_compress_time_ms_;
+    r.preproc_ms = c.actual_preproc_time_ms_;
+    r.h2d_ms = c.actual_h2d_time_ms_;
+    r.dt_ms = c.actual_decompress_time_ms_;
+    // lib == 0 marks "stored raw": the codec did not shrink the chunk and
+    // the caller's bytes went to the tier untouched, so the stored size is
+    // the original -- actual_compressed_size_ still reports the codec's
+    // output, which is NOT what was stored.
+    r.stored = (r.ok && r.lib != 0) ? c.actual_compressed_size_ : r.bytes;
+    CLIO_IPC->FreeBuffer(p.buf);
+  };
+  auto drain = [&]() {
+    for (auto &p : pending) finish(p);
     pending.clear();
   };
+
+  // CLIO_REPLAY_PRELOAD=1: every input file is read into memory here, before
+  // the timer opens (PreloadFiles says why). Excluded like setup, but kept out
+  // of setup_s so that number still means runtime setup alone.
+  std::vector<std::vector<char>> preloaded;
+  const char *preload_env = std::getenv("CLIO_REPLAY_PRELOAD");
+  const bool preload = preload_env != nullptr && std::string(preload_env) == "1";
+  double preload_s = 0.0;
+  if (preload) {
+    size_t preload_bytes = 0;
+    const auto p0 = std::chrono::steady_clock::now();
+    if (!PreloadFiles(files, &preloaded, &preload_bytes)) return 1;
+    preload_s = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - p0).count();
+    std::cout << "  preload: " << files.size() << " file(s), " << preload_bytes
+              << " B in " << preload_s << " s  (before the timer, excluded)"
+              << std::endl;
+  }
+
+  // CLIO_REPLAY_INFLIGHT=N (N > 0): ASYNCHRONOUS CHUNK SUBMISSION. Up to N
+  // chunks stay in flight across file boundaries, so one chunk's compression
+  // overlaps the previous chunks' transfer. Unset or 0 keeps the synchronous
+  // loop: every chunk of a file is waited for before the next file starts,
+  // which for one-chunk files means one chunk in flight.
+  size_t inflight = 0;
+  if (const char *e = std::getenv("CLIO_REPLAY_INFLIGHT"); e && *e) {
+    inflight = std::strtoull(e, nullptr, 10);
+  }
+  if (inflight > 0) {
+    std::cout << "  inflight: " << inflight
+              << " chunk(s) submitted asynchronously" << std::endl;
+  }
 
   // The workload starts here: read, stage+compress, then the final flush.
   const auto t_work = std::chrono::steady_clock::now();
   const double setup_s =
-      std::chrono::duration<double>(t_work - t_proc).count();
+      std::chrono::duration<double>(t_work - t_proc).count() - preload_s;
 
   std::vector<char> filebuf;
-  for (const auto &f : files) {
+  for (size_t fi = 0; fi < files.size(); ++fi) {
+    const auto &f = files[fi];
     const auto t0 = std::chrono::steady_clock::now();
-    const size_t sz = fs::file_size(f);
+    // Preloaded, the bytes are already in memory and nothing is read here.
+    const std::vector<char> &data = preload ? preloaded[fi] : filebuf;
+    const size_t sz = preload ? data.size() : fs::file_size(f);
     if (sz == 0) continue;
     if (sz % elem != 0) {
       std::cerr << "warning: " << f.filename().string() << " is " << sz
                 << " bytes, not a whole number of "
                 << (opt.f64 ? "float64" : "float32") << " elements\n";
     }
-    filebuf.resize(sz);
-    std::ifstream in(f, std::ios::binary);
-    if (!in.read(filebuf.data(), static_cast<std::streamsize>(sz))) {
-      std::cerr << "short read on " << f << "\n";
-      return 1;
+    if (!preload) {
+      filebuf.resize(sz);
+      std::ifstream in(f, std::ios::binary);
+      if (!in.read(filebuf.data(), static_cast<std::streamsize>(sz))) {
+        std::cerr << "short read on " << f << "\n";
+        return 1;
+      }
     }
     const auto t1 = std::chrono::steady_clock::now();
     read_s += std::chrono::duration<double>(t1 - t0).count();
@@ -957,7 +1034,7 @@ int main(int argc, char **argv) {
     for (size_t ci = 0; ci < nchunks; ++ci) {
       const size_t off = ci * chunk;
       const size_t n = std::min(chunk, sz - off);
-      const char *src = filebuf.data() + off;
+      const char *src = data.data() + off;
 
       auto buf = CLIO_IPC->AllocateBuffer(n);
       if (buf.IsNull()) { std::cerr << "AllocateBuffer failed\n"; return 1; }
@@ -1015,11 +1092,18 @@ int main(int argc, char **argv) {
       p.buf = buf;
       p.record = records.size() - 1;
       pending.push_back(std::move(p));
+      // Asynchronous submission: retire the oldest chunks until at most
+      // `inflight` remain outstanding, then submit the next one at once.
+      while (inflight > 0 && pending.size() > inflight) {
+        finish(pending.front());
+        pending.pop_front();
+      }
     }
     // Drain per file: the staging buffers of a 4 MiB-chunked 8 MiB file are
     // cheap, but a whole run's worth is not, and the exploration modes make
     // each chunk expensive enough that unbounded queueing buys nothing.
-    drain();
+    // Asynchronous submission keeps its window open across files instead.
+    if (inflight == 0) drain();
     stage_s += std::chrono::duration<double>(
                    std::chrono::steady_clock::now() - t1).count();
   }
@@ -1119,10 +1203,16 @@ int main(int argc, char **argv) {
               << flush_rc << ")" << std::endl;
   }
 
-  // Outside every timer above: the digest is verification bookkeeping.
-  if (const size_t missing = FillDigestsFromSource(&records)) {
-    std::cerr << "digest: could not re-read the source of " << missing
-              << " blob(s)\n";
+  // Outside every timer above: the digest is verification bookkeeping, so it
+  // is taken only when this run verifies. Without --verify blobs.csv carries
+  // fnv1a64 = 0: the pass re-reads every chunk from disk and hashes it, 40-75 s
+  // of job wall clock per full-size arm, for a column only the round-trip
+  // check needs (evolution_from_blobs.py reads in-situ blobs.csv, not these).
+  if (opt.verify) {
+    if (const size_t missing = FillDigestsFromSource(&records)) {
+      std::cerr << "digest: could not re-read the source of " << missing
+                << " blob(s)\n";
+    }
   }
 
   if (!opt.report.empty()) {

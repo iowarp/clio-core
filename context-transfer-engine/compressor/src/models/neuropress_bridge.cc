@@ -47,7 +47,7 @@
 namespace clio::cte::compressor {
 
 namespace {
-struct CostWeightOverride { double ct, dt, io, bw, cap; bool any; };
+struct CostWeightOverride { double ct, dt, io, bw, cap, min_time; bool any; };
 
 /* Read once: this runs per chunk on runtime worker threads, where a getenv per
    call is both a syscall and a data race against anything setting the env. */
@@ -76,6 +76,14 @@ CostWeightOverride ResolveCostOverride() {
     bool cap_seen = false;
     o.cap = read("CLIO_NEUROPRESS_RATIO_CAP", 100.0, &cap_seen);
     if (!(o.cap > 0.0)) o.cap = 100.0;
+    /* The time floor, upstream's 1 ms. Also kept out of `seen`, for the same
+       reason as the cap. 0 removes it, so a compress-time-only cost ranks
+       sub-millisecond codecs by speed instead of tying them all at the floor
+       and letting candidate order decide. Negative or unparsable keeps 1. */
+    bool floor_seen = false;
+    o.min_time = read("CLIO_NEUROPRESS_MIN_TIME_MS", NeuroPressCost::kMinTimeMs,
+                      &floor_seen);
+    if (!(o.min_time >= 0.0)) o.min_time = NeuroPressCost::kMinTimeMs;
     o.any = seen;
     return o;
   }
@@ -83,7 +91,7 @@ CostWeightOverride ResolveCostOverride() {
 
 NeuroPressCostWeights NeuroPressResolvedCostWeights() {
   static const CostWeightOverride o = ResolveCostOverride();
-  return NeuroPressCostWeights{o.ct, o.dt, o.io, o.bw, o.cap};
+  return NeuroPressCostWeights{o.ct, o.dt, o.io, o.bw, o.cap, o.min_time};
 }
 
 
@@ -220,7 +228,7 @@ std::vector<CompressionStats> RankIntoStats(
      reaches the RANKING and the inference kernel's own clamp, so the model's
      predictions and the cost model score on one scale. */
   weights.ratio_cap = kOverride.cap;
-  weights.min_time_ms = NeuroPressCost::kMinTimeMs;
+  weights.min_time_ms = kOverride.min_time;
 
   // Best mode's ratio-only objective: zeroing ct/dt leaves a monotone function
   // of ratio. Applies to the RANKING too -- that decides which slots the sweep

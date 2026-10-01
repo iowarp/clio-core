@@ -29,6 +29,12 @@
 #
 # ndzip ships no install() rules, so its artifacts are copied by hand.
 #
+# GPULZ (ICS'23, hpdps-group/ICS23-GPULZ) is one CUDA program, not a library,
+# and carries a copyright notice but no license. Its source is therefore never
+# copied into this repository: gpulz/gpulz_api.cu compiles the UNMODIFIED
+# upstream gpulz.cu from the pinned clone and adds the library interface
+# (gpulz/gpulz_api.h) clio-core links against.
+#
 #   install_codecs.sh [--arch 80] [--jobs 16]
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -119,21 +125,36 @@ else
   echo "== ndzip already at $NPENV/ndzip"
 fi
 
+# ----------------------------------------------------------------- GPULZ
+GPULZ_REV=314d6cf   # upstream HEAD when integrated (2025-04-18)
+if [ ! -e "$NPENV/gpulz/lib/libgpulz.so" ]; then
+  echo "== GPULZ (library interface over upstream $GPULZ_REV)"
+  [ -d "$SRC/gpulz" ] || git clone https://github.com/hpdps-group/ICS23-GPULZ.git "$SRC/gpulz"
+  git -C "$SRC/gpulz" checkout -q "$GPULZ_REV"
+  mkdir -p "$NPENV/gpulz/include" "$NPENV/gpulz/lib"
+  nvcc -O3 -std=c++17 -arch=sm_"$CUDA_ARCH" -Xcompiler -fPIC -shared \
+      -I"$HERE/gpulz" -I"$SRC/gpulz" "$HERE/gpulz/gpulz_api.cu" \
+      -o "$NPENV/gpulz/lib/libgpulz.so"
+  cp "$HERE/gpulz/gpulz_api.h" "$NPENV/gpulz/include/"
+else
+  echo "== GPULZ already at $NPENV/gpulz"
+fi
+
 echo
 echo "== installed =="
 for f in "$NPENV/cusz/lib64/libcusz.so" "$NPENV/cuszp/lib64/libcuSZp.so" \
-         "$NPENV/ndzip/lib/libndzip-cuda.so"; do
+         "$NPENV/ndzip/lib/libndzip-cuda.so" "$NPENV/gpulz/lib/libgpulz.so"; do
   [ -e "$f" ] && echo "   $f" || echo "   MISSING: $f"
 done
 cat <<'MSG'
 
 Next: configure clio-core with these on CMAKE_PREFIX_PATH, e.g.
   cmake -S <repo> -B <build> -G Ninja \
-    -DCMAKE_PREFIX_PATH="$NPENV/np;$NPENV/cusz;$NPENV/ndzip;$NPENV/cuszp" \
+    -DCMAKE_PREFIX_PATH="$NPENV/np;$NPENV/cusz;$NPENV/ndzip;$NPENV/cuszp;$NPENV/gpulz" \
     -DCLIO_CTP_ENABLE_COMPRESS=ON -DCLIO_CTE_ENABLE_COMPRESS=ON \
     -DCMAKE_CUDA_ARCHITECTURES=80
-Confirm detection: CLIO_CTP_ENABLE_{CUSZ,CUSZP,NDZIP} must all be ON in
+Confirm detection: CLIO_CTP_ENABLE_{CUSZ,CUSZP,NDZIP,GPULZ} must all be ON in
 CMakeCache.txt, and ldd on libclio_cte_compressor_runtime.so must list
-libcuSZp.so and libndzip-cuda.so. If they are OFF the arms still "run" --
+libcuSZp.so, libndzip-cuda.so and libgpulz.so. If they are OFF the arms still "run" --
 WireIdForName falls back to zstd -- and produce plausible but wrong results.
 MSG

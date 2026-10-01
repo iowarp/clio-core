@@ -52,6 +52,8 @@
 #include <clio_cte/compressor/models/linreg_table_predictor.h>
 #include <clio_cte/compressor/models/distribution_classifier.h>
 #include <clio_ctp/compress/model/neuropress_nn_predictor.h>
+#include <clio_ctp/compress/model/hcompress_ccp_predictor.h>
+#include <clio_ctp/compress/model/xgb_tree_predictor.h>
 
 #include "clio_cte/compressor/models/neuropress_cost.h"
 #include <clio_cte/core/core_client.h>
@@ -280,6 +282,24 @@ private:
   std::unique_ptr<ctp::compress::model::NeuroPressNNPredictor>
       neuropress_predictor_;
 
+  // HCompress's Expected-Compression-Cost model, deployed as a SELECTOR
+  // (hcompress_selection.cc). Loaded only from hcompress_model_path_, and
+  // exclusive with NeuroPress: when it loads, neuropress_predictor_ is not
+  // kept, so exactly one model chooses each chunk.
+  std::unique_ptr<ctp::compress::model::HCompressCcpPredictor>
+      hcompress_predictor_;
+  // Serializes SetInputs() -> ranking. The predictor stores the per-buffer
+  // inputs (the chunk's distribution class) as MEMBER state, and Predict()
+  // copies them WITHOUT its own lock, so two workers selecting at once would
+  // each rank under the other's distribution. Held only across that
+  // synchronous section -- never across a CLIO_CO_AWAIT.
+  std::mutex hcompress_mutex_;
+
+  // The XGBoost baseline, deployed as a SELECTOR (xgb_selection.cc). Loaded
+  // only from xgb_model_path_ and exclusive with NeuroPress and HCompress.
+  // Predict() reads no mutable state, so no lock is needed.
+  std::unique_ptr<ctp::compress::model::XgbTreePredictor> xgb_predictor_;
+
   /* ---- prediction reuse across timesteps ------------------------------
      Off by default; CLIO_NEUROPRESS_REUSE_PREDICTIONS=1 opts in, and it is
      never used while exploration is enabled. The registry maps a lineage key
@@ -381,6 +401,22 @@ private:
   bool NeuroPressActive(const Context& context) const {
     return context.dynamic_compress_ != 1 && neuropress_predictor_ &&
            neuropress_predictor_->IsReady();
+  }
+
+  /** Is HCompress deciding for this chunk? Same shape as NeuroPressActive,
+   *  and checked FIRST in EstCompressionStats: the two are exclusive by
+   *  construction (Create() keeps at most one), but if both were ever loaded
+   *  the named selector must not be silently overridden. */
+  bool HCompressActive(const Context& context) const {
+    return context.dynamic_compress_ != 1 && hcompress_predictor_ &&
+           hcompress_predictor_->IsReady();
+  }
+
+  /** Is XGBoost deciding for this chunk? Same shape as HCompressActive, and
+   *  checked right after it; Create() never loads both. */
+  bool XgbActive(const Context& context) const {
+    return context.dynamic_compress_ != 1 && xgb_predictor_ &&
+           xgb_predictor_->IsReady();
   }
 
   /**
@@ -531,7 +567,65 @@ private:
       const ctp::compress::preprocess::PredictionReuseContext* reuse =
           nullptr,
       ctp::compress::preprocess::PredictionReuseOutcome* out_outcome =
-          nullptr);
+          nullptr,
+      /* HCompress only: the distribution class this chunk was ranked under.
+         The caller must carry it to HCompressObserve() in its OWN locals --
+         the chunk suspends on its compression, and the predictor's stored
+         inputs belong to whichever chunk ranked last by then. */
+      std::string* out_hc_distribution = nullptr);
+
+  /**
+   * @brief HCompress's half of EstCompressionStats (hcompress_selection.cc).
+   *
+   * Classifies the chunk's distribution the way HCompress deduces it -- a
+   * strided sub-sample of the whole buffer through Clio's own
+   * DistributionClassifier, the same classifier the offline accuracy table's
+   * classify_chunks.py ports -- then ranks NeuroPress's candidate set under
+   * NeuroPress's cost model with HCompress's predictions. Only the predictor
+   * differs from a NeuroPress selection.
+   *
+   * @param chunk            chunk bytes, host or device resident
+   * @param chunk_size       chunk size in bytes
+   * @param context          the chunk's compression context (type, bound)
+   * @param out_distribution the class ranked under, for HCompressObserve()
+   * @return best-first stats, or empty when the chunk cannot be classified
+   */
+  std::vector<CompressionStats> HCompressRankChunk(
+      const void* chunk, clio::run::u64 chunk_size, const Context& context,
+      std::string* out_distribution);
+
+  /**
+   * @brief Feed one executed outcome back to HCompress (its paper's feedback).
+   *
+   * @param distribution the class this chunk was ranked under
+   * @param wire_lib     wire id of the codec that RAN (not context's, which
+   *                     is reset to 0 when the output was stored raw)
+   * @param preset_field preset of that action, carrying its shuffle (bits
+   *                     8-15) and quantize (bit 24) flags
+   * @param chunk_size   bytes compressed
+   * @param context      holds the measured time and ratio
+   */
+  void HCompressObserve(const std::string& distribution, int wire_lib,
+                        int preset_field, clio::run::u64 chunk_size,
+                        const Context& context);
+
+  /**
+   * @brief XGBoost's half of EstCompressionStats (xgb_selection.cc).
+   *
+   * Computes the chunk's entropy, MAD and second derivative with the SAME
+   * statistics code NeuroPress's selection uses (the device kernel for a
+   * GPU-resident chunk), then ranks NeuroPress's candidate set under
+   * NeuroPress's cost model with XGBoost's predictions. Only the predictor
+   * differs from a NeuroPress selection.
+   *
+   * @param chunk      chunk bytes, host or device resident
+   * @param chunk_size chunk size in bytes
+   * @param context    the chunk's compression context (type, bound)
+   * @return best-first stats, or empty when no statistics could be computed
+   */
+  std::vector<CompressionStats> XgbRankChunk(const void* chunk,
+                                             clio::run::u64 chunk_size,
+                                             const Context& context);
 
   /** NeuroPress's half of EstCompressionStats (neuropress_selection.cc). Best
    *  first, or empty when it declined -- not an error, the caller's heuristics
