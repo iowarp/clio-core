@@ -1887,7 +1887,7 @@ endif()
 # Gray-Scott Example Application
 if(CLIO_CORE_ENABLE_GRAY_SCOTT)
     message(STATUS "Building Gray-Scott ADIOS2 example")
-    add_subdirectory(external/iowarp-gray-scott)
+    add_subdirectory(context-transfer-engine/benchmark/gray_scott)
 else()
     message(STATUS "Gray-Scott example disabled")
 endif()
