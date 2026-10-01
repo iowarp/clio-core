@@ -175,10 +175,12 @@ TEST_CASE("ComposeRestart_RestartSurvives - restart:true survives daemon "
   WaitForExit(s1);
   s1.Stop();
 
-  // Phase 3: fresh daemon. No re-compose — startup WAL replay must bring the
-  // bdev back, so `compose list` shows pool 720.0 again.
+  // Phase 3: `clio_run restart`. No re-compose — replaying this node's pool
+  // log must bring the bdev back, so `compose list` shows pool 720.0 again.
+  // (A fresh `start` clears the pool log by design.)
   clio::run::test::RuntimeServer s2;
-  REQUIRE(s2.Start(kPort));
+  REQUIRE(s2.Start(kPort, "127.0.0.1", /*ephemeral=*/false,
+                   /*detached=*/false, /*restart=*/true));
   REQUIRE(s2.WaitForReady());
   {
     std::string out = RunCliCapture({"compose", "list"}, 30);
@@ -191,8 +193,8 @@ TEST_CASE("ComposeRestart_RestartSurvives - restart:true survives daemon "
   fs::remove_all(work);
 }
 
-TEST_CASE("ComposeRestart_StopKeepsRestartable - stop drops from list but "
-          "keeps restartable",
+TEST_CASE("ComposeRestart_StopForgetsRestartable - stop drops the pool and "
+          "its pool-log entry",
           "[cli][compose][restart]") {
   const fs::path work = SetupWork("clio_compose_restart_2");
   const fs::path yaml = work / "bdev.yaml";
@@ -204,17 +206,22 @@ TEST_CASE("ComposeRestart_StopKeepsRestartable - stop drops from list but "
   REQUIRE(s.WaitForReady());
 
   REQUIRE(RunCliTimed({"compose", "start", yaml.string()}, 60) == 0);
+  // A `restart: true` pool is in this node's pool log while it lives...
+  {
+    std::string out = RunCliCapture({"compose", "list", "--restartable"}, 30);
+    REQUIRE(out.find("PoolId(major:720, minor:0)") != std::string::npos);
+  }
   REQUIRE(RunCliTimed({"compose", "stop", yaml.string()}, 60) == 0);
 
-  // Active list no longer has the bdev...
+  // ...and stop destroys it: gone from the active list AND the pool log
+  // (DestroyPool removes the entry).
   {
     std::string out = RunCliCapture({"compose", "list"}, 30);
     REQUIRE(out.find("720.0") == std::string::npos);
   }
-  // ...but it is still registered for restart.
   {
     std::string out = RunCliCapture({"compose", "list", "--restartable"}, 30);
-    REQUIRE(out.find("bdev.yaml") != std::string::npos);
+    REQUIRE(out.find("PoolId(major:720, minor:0)") == std::string::npos);
   }
 
   REQUIRE(RunCliTimed({"stop", "--grace-period", "2000"}, 90) == 0);
@@ -245,7 +252,7 @@ TEST_CASE("ComposeRestart_RmUnregisters - rm drops from list AND restartable",
   }
   {
     std::string out = RunCliCapture({"compose", "list", "--restartable"}, 30);
-    REQUIRE(out.find("bdev.yaml") == std::string::npos);
+    REQUIRE(out.find("PoolId(major:720, minor:0)") == std::string::npos);
   }
 
   REQUIRE(RunCliTimed({"stop", "--grace-period", "2000"}, 90) == 0);

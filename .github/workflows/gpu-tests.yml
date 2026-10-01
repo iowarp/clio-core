@@ -231,7 +231,12 @@ jobs:
                    distributed_md_paged distributed_md_bench \
                    distributed_workloads; do
             echo "== $d"
-            bash -n "$base/$d"/run_*.sh
+            # Not every harness has a run script: some are driven by compose
+            # alone (their run scripts were removed in 1034cdca), and an
+            # unmatched glob would hand bash -n a literal "run_*.sh".
+            for s in "$base/$d"/run_*.sh; do
+              if [ -e "$s" ]; then bash -n "$s"; fi
+            done
             # The harnesses require these to be set; the values are irrelevant
             # to a parse and a missing one is a hard error, not a warning.
             ( cd "$base/$d" && \

@@ -14,6 +14,8 @@
 #include <fcntl.h>
 #ifndef _WIN32
 #include <unistd.h>  // close (ReserveFileSpace)
+#else
+#include <io.h>  // _open, _commit, _close (SyncFileData)
 #endif
 
 namespace clio::run::bdev {
@@ -73,6 +75,41 @@ int ReserveFileSpace(const std::string &file_path, clio::run::u64 from,
   (void)from;
   (void)to;
   return 0;
+#endif
+}
+
+/**
+ * Flush a file's data to persistent media.
+ *
+ * Linux has fdatasync. macOS has none, and its fsync stops at the drive's
+ * volatile cache, so F_FULLFSYNC is what reaches media there (falling back
+ * to fsync on filesystems that reject it). Windows flushes via _commit,
+ * which needs a writable handle.
+ * @param file_path the file to flush
+ * @return 0, or the errno of the failing open or flush
+ */
+int SyncFileData(const std::string &file_path) {
+#if defined(_WIN32)
+  const int fd = _open(file_path.c_str(), _O_RDWR | _O_BINARY);
+  if (fd < 0) return errno;
+  const int rc = _commit(fd);
+  const int err = errno;
+  _close(fd);
+  return rc == 0 ? 0 : err;
+#else
+  const int fd = ::open(file_path.c_str(), O_RDONLY);
+  if (fd < 0) return errno;
+#if defined(__linux__)
+  const int rc = ::fdatasync(fd);
+#elif defined(__APPLE__)
+  int rc = ::fcntl(fd, F_FULLFSYNC);
+  if (rc != 0) rc = ::fsync(fd);
+#else
+  const int rc = ::fsync(fd);
+#endif
+  const int err = errno;
+  ::close(fd);
+  return rc == 0 ? 0 : err;
 #endif
 }
 
@@ -247,17 +284,9 @@ bool FsBdevTransport::Sync() {
   // Data first, then the allocator state that references it: a crash in
   // between leaves synced bytes in blocks the log may not show yet (the
   // CTE's own WAL still does), never a logged block whose bytes are lost.
-  const int fd = ::open(file_path_.c_str(), O_RDONLY);
-  if (fd < 0) {
-    HLOG(kError, "bdev Sync: cannot open {} ({})", file_path_,
-         strerror(errno));
-    return false;
-  }
-  const int rc = ::fdatasync(fd);
-  const int err = errno;
-  ::close(fd);
-  if (rc != 0) {
-    HLOG(kError, "bdev Sync: fdatasync {} failed ({})", file_path_,
+  const int err = SyncFileData(file_path_);
+  if (err != 0) {
+    HLOG(kError, "bdev Sync: flushing {} failed ({})", file_path_,
          strerror(err));
     return false;
   }

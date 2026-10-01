@@ -90,6 +90,25 @@ bool Client::EnsureInit() {
   return ready;
 }
 
+/**
+ * The namespace is strict POSIX: a create fails with ENOENT when the parent
+ * directory does not exist. An intercepted clio:: path mirrors a host path
+ * whose directories the application never creates through clio (nobody
+ * mkdirs /tmp), so the descriptor layer creates them on demand.
+ */
+bool Client::EnsureParentDirs(const std::string &path) {
+  size_t pos = 0;
+  while ((pos = path.find('/', pos + 1)) != std::string::npos) {
+    auto t = AsyncMkdir(path.substr(0, pos));
+    t.Wait();
+    const clio::run::u32 rc = t->GetReturnCode();
+    if (rc != 0 && rc != EEXIST) {
+      return false;
+    }
+  }
+  return true;
+}
+
 int Client::OpenFd(const std::string &raw_path, int flags, int mode) {
   if (!EnsureInit()) {
     errno = EIO;
@@ -99,6 +118,12 @@ int Client::OpenFd(const std::string &raw_path, int flags, int mode) {
   auto t = AsyncOpen(path, static_cast<clio::run::u32>(flags),
                           static_cast<clio::run::u32>(mode));
   t.Wait();
+  if ((flags & O_CREAT) && t->GetReturnCode() == ENOENT &&
+      EnsureParentDirs(path)) {
+    t = AsyncOpen(path, static_cast<clio::run::u32>(flags),
+                  static_cast<clio::run::u32>(mode));
+    t.Wait();
+  }
   if (t->GetReturnCode() != 0) {
     errno = EIO;
     return -1;

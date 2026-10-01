@@ -2341,6 +2341,11 @@ endif()
 if(TARGET clio_cte_filesystem_client)
   list(APPEND PIP_LIB_TARGETS clio_cte_filesystem_client clio_cte_filesystem_runtime)
 endif()
+# Stream chimod: NEEDED by the filesystem chimod (file sizes and deferred
+# appends) and so, transitively, by clio_cte_fuse.
+if(TARGET clio_cte_stream_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_stream_client clio_cte_stream_runtime)
+endif()
 if(CLIO_CORE_ENABLE_CAE AND TARGET clio_cae_core_client)
   list(APPEND PIP_LIB_TARGETS clio_cae_core_client clio_cae_core_runtime)
 endif()

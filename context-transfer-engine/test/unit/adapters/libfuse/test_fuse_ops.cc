@@ -127,6 +127,11 @@ class FuseOpsFixture {
     success = clio::cte::filesystem::CLIO_CFS_CLIENT_INIT();
     REQUIRE(success);
 
+    // The namespace is strict POSIX: a create under a directory that does
+    // not exist is ENOENT, so the directory the file tests share must exist.
+    const int mk = cte_fuse_mkdir("/ops", 0755);
+    REQUIRE((mk == 0 || mk == -EEXIST));
+
     g_initialized = true;
     INFO("Embedded runtime + CTE pool + RAM target + CFS chimod ready");
   }

@@ -994,6 +994,13 @@ class Client : public clio::cte::core::Client {
   /** Bind the filesystem pool on first tracked use. */
   static bool EnsureInit();
 
+  /**
+   * Create every missing ancestor directory of a path (mkdir -p).
+   * @param path normalized absolute path whose parents must exist
+   * @return true when every ancestor exists afterwards
+   */
+  bool EnsureParentDirs(const std::string &path);
+
   int OpenFd(const std::string &raw_path, int flags, int mode);
   FsSsize ReadFd(int fd, void *buf, size_t count);
   FsSsize WriteFd(int fd, const void *buf, size_t count);

@@ -115,11 +115,14 @@ class RuntimeServer {
    *   performed") and the daemon stayed alive but unreachable. A serviceable
    *   daemon after a detached spawn proves the transport initializes regardless
    *   of console.
+   * @param restart  Spawn `clio_run restart` instead of `start`, so the daemon
+   *   replays this node's pool log (a fresh `start` clears it).
    */
   bool Start(unsigned port = 10500,
              const std::string &bind_addr = "127.0.0.1",
              bool ephemeral = false,
-             bool detached = false) {
+             bool detached = false,
+             bool restart = false) {
     port_ = port;
     SetEnv("CLIO_PORT", std::to_string(port));
     SetEnv("CLIO_BIND_ADDR", bind_addr);
@@ -137,8 +140,8 @@ class RuntimeServer {
     // not flood the test output (and is inspectable on failure). When `detached`,
     // spawn console-less to reproduce issue #721.
     std::vector<std::string> args;
-    args.push_back("start");
-    if (ephemeral) args.push_back("--ephemeral");
+    args.push_back(restart ? "restart" : "start");
+    if (ephemeral && !restart) args.push_back("--ephemeral");  // start-only
     proc_ = ctp::SystemInfo::SpawnProcess(exe, args, log, detached);
     if (!proc_.valid) return false;
     started_ = true;

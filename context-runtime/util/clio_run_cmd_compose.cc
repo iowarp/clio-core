@@ -17,15 +17,14 @@ namespace fs = std::filesystem;
 void PrintComposeUsage() {
   HIPRINT("Usage: clio_run compose <start|stop|rm|list> [options]");
   HIPRINT("  start <config.yaml>    Create the pools in the compose file.");
-  HIPRINT("                         Pools with 'restart: true' register the");
-  HIPRINT("                         file in the restart log (~/.clio/restart_log.bin)");
-  HIPRINT("                         so it is re-composed on `clio_run start`.");
-  HIPRINT("  stop  <config.yaml>    Destroy the pools listed in the compose file.");
-  HIPRINT("                         Leaves the restart registration intact.");
-  HIPRINT("  rm    <config.yaml>    Stop the pools AND unregister the file from");
-  HIPRINT("                         restart. Does NOT delete the compose file.");
+  HIPRINT("                         Pools with 'restart: true' are recorded in");
+  HIPRINT("                         each node's pool log (<conf_dir>/wal) and");
+  HIPRINT("                         re-created by `clio_run restart`.");
+  HIPRINT("  stop  <config.yaml>    Destroy the pools listed in the compose file");
+  HIPRINT("                         (which also drops them from the pool log).");
+  HIPRINT("  rm    <config.yaml>    Same as stop. Does NOT delete the compose file.");
   HIPRINT("  list  [--restartable]  List active containers in the local daemon.");
-  HIPRINT("                         --restartable: list files registered for restart.");
+  HIPRINT("                         --restartable: list the pool-log entries.");
 }
 
 // Resolve a compose-file path to a stable absolute form so the same file
