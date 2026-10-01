@@ -958,7 +958,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   CLIO_TASK_BODY_END
 }
 
-TaskResume PoolManager::DestroyPool(PoolId pool_id) {
+TaskResume PoolManager::DestroyPool(PoolId pool_id, bool keep_in_pool_log) {
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {
     HLOG(kError, "PoolManager: Not initialized for pool destruction");
@@ -981,7 +981,9 @@ TaskResume PoolManager::DestroyPool(PoolId pool_id) {
 
   // Remove pool metadata
   ErasePoolMetadata(pool_id);
-  LogPool(false, PoolLogEntry{pool_id, "", "", "", false});
+  if (!keep_in_pool_log) {
+    LogPool(false, PoolLogEntry{pool_id, "", "", "", false});
+  }
   {
     std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
     destroyed_pools_.insert(pool_id);

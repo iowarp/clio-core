@@ -17,15 +17,15 @@ namespace fs = std::filesystem;
 void PrintComposeUsage() {
   HIPRINT("Usage: clio_run compose <start|stop|rm|list> [options]");
   HIPRINT("  start <config.yaml>    Create the pools in the compose file.");
-  HIPRINT("                         Pools with 'restart: true' register the");
-  HIPRINT("                         file in the restart log (~/.clio/restart_log.bin)");
-  HIPRINT("                         so it is re-composed on `clio_run start`.");
+  HIPRINT("                         Pools with 'restart: true' are recorded in");
+  HIPRINT("                         each node's pool log (<conf_dir>/wal) and");
+  HIPRINT("                         re-created by the next `clio_run start`.");
   HIPRINT("  stop  <config.yaml>    Destroy the pools listed in the compose file.");
-  HIPRINT("                         Leaves the restart registration intact.");
-  HIPRINT("  rm    <config.yaml>    Stop the pools AND unregister the file from");
-  HIPRINT("                         restart. Does NOT delete the compose file.");
+  HIPRINT("                         Keeps them in the pool log (still restartable).");
+  HIPRINT("  rm    <config.yaml>    Stop the pools AND drop them from the pool");
+  HIPRINT("                         log. Does NOT delete the compose file.");
   HIPRINT("  list  [--restartable]  List active containers in the local daemon.");
-  HIPRINT("                         --restartable: list files registered for restart.");
+  HIPRINT("                         --restartable: list the pool-log entries.");
 }
 
 // Resolve a compose-file path to a stable absolute form so the same file
@@ -121,8 +121,14 @@ int ComposeStart(const std::string& path) {
   return 0;
 }
 
-// Destroy every pool listed in a compose file. Used by both stop and rm.
-int DestroyComposePools(const std::string& path) {
+/**
+ * Destroy every pool listed in a compose file. Used by both stop and rm.
+ * @param path compose file
+ * @param keep_restartable true (stop) to keep the pools in the nodes' pool
+ *        logs so the next start re-creates them; false (rm) to forget them
+ * @return 0 on success, 1 if the file or admin client is unavailable
+ */
+int DestroyComposePools(const std::string& path, bool keep_restartable) {
   clio::run::ComposeConfig compose;
   if (!LoadComposeFile(path, &compose)) {
     return 1;
@@ -136,7 +142,10 @@ int DestroyComposePools(const std::string& path) {
     HLOG(kInfo, "Stopping pool {} (module: {})", pool_config.pool_name_,
          pool_config.mod_name_);
     auto task =
-        admin->AsyncDestroyPool(clio::run::PoolQuery::Dynamic(), pool_config.pool_id_);
+        admin->AsyncDestroyPool(
+            clio::run::PoolQuery::Dynamic(), pool_config.pool_id_,
+            keep_restartable ? clio::run::admin::kDestroyPoolKeepRestartable
+                             : 0u);
     task.Wait();
     if (task->GetReturnCode() != 0) {
       HLOG(kWarning, "Failed to stop pool {}, return code: {}",
@@ -153,7 +162,7 @@ int ComposeStop(const std::string& path) {
     return 1;
   }
   ClientFinalizeGuard guard;
-  return DestroyComposePools(path);
+  return DestroyComposePools(path, /*keep_restartable=*/true);
 }
 
 int ComposeRm(const std::string& path) {
@@ -161,7 +170,7 @@ int ComposeRm(const std::string& path) {
     return 1;
   }
   ClientFinalizeGuard guard;
-  int rc = DestroyComposePools(path);
+  int rc = DestroyComposePools(path, /*keep_restartable=*/false);
 
   // DestroyPool removes each pool from the nodes' pool logs; the compose
   // file itself is kept.

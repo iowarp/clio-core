@@ -271,11 +271,17 @@ TEST_CASE("FUSE ops - read/write bad handle", "[fuse][ops]") {
   REQUIRE(cte_fuse_write("/x", &c, 1, 0, &fi) == -EBADF);
 }
 
-TEST_CASE("FUSE ops - open missing file is ENOENT", "[fuse][ops]") {
+TEST_CASE("FUSE ops - open missing file is ESTALE", "[fuse][ops]") {
   Fx();
   auto fi = MakeFi();
+  // The kernel only opens a path it just looked up, so a missing file at
+  // open means it vanished in between: ESTALE makes the kernel look the path
+  // up again, and that lookup (getattr) is what reports ENOENT.
   int rc = cte_fuse_open("/definitely/not/here.dat", &fi);
-  REQUIRE(rc == -ENOENT);
+  REQUIRE(rc == -ESTALE);
+  cte_stat_t st;
+  REQUIRE(cte_fuse_getattr("/definitely/not/here.dat", &st, nullptr) ==
+          -ENOENT);
 }
 
 // ============================================================================

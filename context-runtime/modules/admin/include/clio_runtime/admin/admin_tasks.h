@@ -460,6 +460,13 @@ using ComposeTask =
     BaseCreateTask<CreateParamsT, Method::kGetOrCreatePool, false, true>;
 
 /**
+ * DestroyPoolTask::destruction_flags_ bit: keep the pool's entry in each
+ * node's pool log, so the next `clio_run start` re-creates it (`compose stop`
+ * sets it; `compose rm` and plain destroys do not).
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kDestroyPoolKeepRestartable = 0x1;
+
+/**
  * DestroyPoolTask - Destroy an existing ChiPool
  */
 struct DestroyPoolTask : public clio::run::Task {

@@ -36,7 +36,11 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <filesystem>
 
@@ -57,10 +61,115 @@ clio::run::u32 Fnv1a(const char *p, size_t n, clio::run::u32 h = 2166136261u) {
   return h;
 }
 
+// Thin POSIX/CRT file wrappers. On Windows the log must be opened binary
+// (text mode would rewrite the records' bytes) and not inherited.
+#ifdef _WIN32
+constexpr int kOsOpenFlags = _O_BINARY | _O_NOINHERIT;
+#else
+constexpr int kOsOpenFlags = O_CLOEXEC;
+#endif
+
+/**
+ * Open a file descriptor.
+ * @param path file to open
+ * @param flags POSIX open flags; the platform's binary/cloexec bits are added
+ * @return the descriptor, or -1
+ */
+int FileOpen(const std::string &path, int flags) {
+#ifdef _WIN32
+  return ::_open(path.c_str(), flags | kOsOpenFlags, _S_IREAD | _S_IWRITE);
+#else
+  return ::open(path.c_str(), flags | kOsOpenFlags, 0600);
+#endif
+}
+
+/** Close a descriptor. @param fd descriptor to close */
+void FileClose(int fd) {
+#ifdef _WIN32
+  ::_close(fd);
+#else
+  ::close(fd);
+#endif
+}
+
+/**
+ * Write once. @param fd descriptor @param p bytes @param n byte count
+ * @return bytes written, or -1
+ */
+long long FileWrite(int fd, const char *p, size_t n) {
+#ifdef _WIN32
+  return ::_write(fd, p, static_cast<unsigned>(n));
+#else
+  return ::write(fd, p, n);
+#endif
+}
+
+/**
+ * Read once. @param fd descriptor @param p buffer @param n buffer size
+ * @return bytes read, 0 at EOF, or -1
+ */
+long long FileRead(int fd, char *p, size_t n) {
+#ifdef _WIN32
+  return ::_read(fd, p, static_cast<unsigned>(n));
+#else
+  return ::read(fd, p, n);
+#endif
+}
+
+/** Seek to the start. @param fd descriptor @return true on success */
+bool FileRewind(int fd) {
+#ifdef _WIN32
+  return ::_lseeki64(fd, 0, SEEK_SET) >= 0;
+#else
+  return ::lseek(fd, 0, SEEK_SET) >= 0;
+#endif
+}
+
+/** Truncate. @param fd descriptor @param size new length @return 0 or -1 */
+int FileTruncate(int fd, size_t size) {
+#ifdef _WIN32
+  return ::_chsize_s(fd, static_cast<long long>(size)) == 0 ? 0 : -1;
+#else
+  return ::ftruncate(fd, static_cast<off_t>(size));
+#endif
+}
+
+/** Flush to media. @param fd descriptor @return 0 or -1 */
+int FileSync(int fd) {
+#ifdef _WIN32
+  return ::_commit(fd);
+#else
+  return ::fsync(fd);
+#endif
+}
+
+/**
+ * Make a create or rename in a file's directory durable. A no-op on Windows,
+ * where a directory cannot be opened through the CRT and NTFS journals the
+ * rename itself.
+ * @param path file whose parent directory is synced
+ */
+void SyncParentDir(const std::string &path) {
+#ifdef _WIN32
+  (void)path;
+#else
+  const size_t slash = path.find_last_of('/');
+  const std::string dir = slash == std::string::npos ? "." :
+                          slash == 0 ? "/" : path.substr(0, slash);
+  const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dfd < 0) return;
+  if (::fsync(dfd) != 0) {
+    HLOG(kError, "record log: fsync of directory {} failed: {}", dir,
+         std::strerror(errno));
+  }
+  ::close(dfd);
+#endif
+}
+
 /** write(2) the whole buffer, retrying short writes and EINTR. */
 bool WriteAll(int fd, const char *p, size_t n) {
   while (n > 0) {
-    ssize_t w = ::write(fd, p, n);
+    long long w = FileWrite(fd, p, n);
     if (w < 0) {
       if (errno == EINTR) continue;
       return false;
@@ -74,10 +183,10 @@ bool WriteAll(int fd, const char *p, size_t n) {
 /** Read a whole file into memory (empty on failure). */
 std::string Slurp(int fd) {
   std::string out;
-  if (::lseek(fd, 0, SEEK_SET) < 0) return out;
+  if (!FileRewind(fd)) return out;
   char buf[1 << 16];
   for (;;) {
-    ssize_t r = ::read(fd, buf, sizeof(buf));
+    long long r = FileRead(fd, buf, sizeof(buf));
     if (r < 0 && errno == EINTR) continue;
     if (r <= 0) break;
     out.append(buf, static_cast<size_t>(r));
@@ -87,7 +196,7 @@ std::string Slurp(int fd) {
 }  // namespace
 
 RecordLog::~RecordLog() {
-  if (fd_ >= 0) ::close(fd_);
+  if (fd_ >= 0) FileClose(fd_);
 }
 
 bool RecordLog::Open(const std::string &path) {
@@ -96,7 +205,7 @@ bool RecordLog::Open(const std::string &path) {
   std::error_code ec;
   std::filesystem::path parent = std::filesystem::path(path).parent_path();
   if (!parent.empty()) std::filesystem::create_directories(parent, ec);
-  fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+  fd_ = FileOpen(path, O_RDWR | O_CREAT | O_APPEND);
   since_compact_ = 0;
   return fd_ >= 0;
 }
@@ -141,7 +250,7 @@ size_t RecordLog::Replay(
   if (off < all.size()) {
     // A torn or corrupt tail: everything after the last intact record is
     // unacknowledged work from a crash. Cut it so appends stay parseable.
-    if (::ftruncate(fd_, static_cast<off_t>(off)) != 0) {
+    if (FileTruncate(fd_, off) != 0) {
       HLOG(kError, "record log: truncating torn tail of {} failed: {}",
            path_, std::strerror(errno));
     }
@@ -168,7 +277,7 @@ bool RecordLog::Sync() {
   std::lock_guard<std::mutex> g(mu_);
   if (fd_ < 0) return true;
   if (!unsynced_) return true;
-  if (::fsync(fd_) != 0) {
+  if (FileSync(fd_) != 0) {
     HLOG(kError, "record log: fsync of {} failed: {}", path_,
          std::strerror(errno));
     return false;
@@ -189,31 +298,36 @@ bool RecordLog::Rewrite(
   std::lock_guard<std::mutex> g(mu_);
   if (path_.empty()) return false;
   const std::string tmp = path_ + ".compact";
-  int tfd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  int tfd = FileOpen(tmp, O_WRONLY | O_CREAT | O_TRUNC);
   if (tfd < 0) return false;
-  bool ok = WriteAll(tfd, buf.data(), buf.size()) && ::fsync(tfd) == 0;
-  ::close(tfd);
-  if (!ok || ::rename(tmp.c_str(), path_.c_str()) != 0) {
-    ::unlink(tmp.c_str());
+  bool ok = WriteAll(tfd, buf.data(), buf.size()) && FileSync(tfd) == 0;
+  FileClose(tfd);
+#ifdef _WIN32
+  // Windows cannot replace a file that is open; drop ours first. On a failed
+  // replace the reopen below still reattaches to the untouched old log.
+  if (ok && fd_ >= 0) {
+    FileClose(fd_);
+    fd_ = -1;
+  }
+#endif
+  std::error_code ec;
+  // std::filesystem::rename replaces an existing target on every platform
+  // (::rename does not on Windows).
+  if (ok) std::filesystem::rename(tmp, path_, ec);
+  if (!ok || ec) {
+    std::filesystem::remove(tmp, ec);
+#ifdef _WIN32
+    if (fd_ < 0) fd_ = FileOpen(path_, O_RDWR | O_APPEND);
+#endif
     return false;
   }
   // The rename is durable only once the directory is: until then a power
   // loss brings back the old file, and records appended to the new one
   // (fsynced or not) are gone with it.
-  const size_t slash = path_.find_last_of('/');
-  const std::string dir = slash == std::string::npos ? "." :
-                          slash == 0 ? "/" : path_.substr(0, slash);
-  const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  if (dfd >= 0) {
-    if (::fsync(dfd) != 0) {
-      HLOG(kError, "record log: fsync of directory {} failed: {}", dir,
-           std::strerror(errno));
-    }
-    ::close(dfd);
-  }
-  int nfd = ::open(path_.c_str(), O_RDWR | O_APPEND | O_CLOEXEC, 0600);
+  SyncParentDir(path_);
+  int nfd = FileOpen(path_, O_RDWR | O_APPEND);
   if (nfd < 0) return false;
-  if (fd_ >= 0) ::close(fd_);
+  if (fd_ >= 0) FileClose(fd_);
   fd_ = nfd;
   since_compact_ = 0;
   unsynced_ = false;  // the new file was fsynced before the rename

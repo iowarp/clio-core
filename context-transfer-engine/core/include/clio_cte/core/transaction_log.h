@@ -37,7 +37,11 @@
 #include <clio_runtime/clio_runtime.h>
 
 #include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -417,10 +421,18 @@ class TransactionLog {
    * @return true on success
    */
   static bool FsyncPath(const std::string &path) {
+#ifdef _WIN32
+    // _commit (FlushFileBuffers) needs a writable handle.
+    const int fd = ::_open(path.c_str(), _O_RDWR | _O_BINARY);
+    if (fd < 0) return false;
+    const bool ok = ::_commit(fd) == 0;
+    ::_close(fd);
+#else
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
     const bool ok = ::fsync(fd) == 0;
     ::close(fd);
+#endif
     return ok;
   }
 
@@ -431,9 +443,16 @@ class TransactionLog {
    * @return true on success
    */
   static bool FsyncParentDir(const std::string &path) {
+#ifdef _WIN32
+    // A directory cannot be opened or flushed through the CRT; NTFS journals
+    // the rename itself.
+    (void)path;
+    return true;
+#else
     std::filesystem::path parent = std::filesystem::path(path).parent_path();
     if (parent.empty()) parent = ".";
     return FsyncPath(parent.string());
+#endif
   }
 
   /**

@@ -309,9 +309,11 @@ class PoolManager {
    * Destroy a complete pool including metadata and local containers
    * This is a coroutine for consistency with CreatePool
    * @param pool_id Pool identifier
+   * @param keep_in_pool_log true to leave the pool's pool-log entry, so the
+   *        next start re-creates it (`compose stop`)
    * @return TaskResume coroutine handle
    */
-  TaskResume DestroyPool(PoolId pool_id);
+  TaskResume DestroyPool(PoolId pool_id, bool keep_in_pool_log = false);
 
   /**
    * Destroy a local pool and its containers on this node (simple version)

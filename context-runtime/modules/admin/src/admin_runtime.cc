@@ -328,7 +328,9 @@ clio::run::TaskResume Runtime::DestroyPool(clio::run::shared_ptr<DestroyPoolTask
 
     // Use PoolManager to destroy the complete pool including metadata
     // DestroyPool is now a coroutine for consistency
-    CLIO_CO_AWAIT(pool_manager->DestroyPool(target_pool));
+    const bool keep_restartable =
+        (task->destruction_flags_ & kDestroyPoolKeepRestartable) != 0;
+    CLIO_CO_AWAIT(pool_manager->DestroyPool(target_pool, keep_restartable));
 
     // Set success results
     task->return_code_ = 0;
