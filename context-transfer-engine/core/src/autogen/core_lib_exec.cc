@@ -288,6 +288,12 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(SyncTag(typed_task));
       break;
     }
+    case Method::kListLocalBlobs: {
+      // Cast task FullPtr to specific type
+      auto& typed_task = task_ptr.template Cast<ListLocalBlobsTask>();
+      CLIO_CO_AWAIT(ListLocalBlobs(typed_task));
+      break;
+    }
     case Method::kSemanticSearch: {
       // Moved to the indexer chimod (issue #905): the core no longer owns
       // the search index. An explicit error beats the default's silent
@@ -538,6 +544,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kListLocalBlobs: {
+      auto& typed_task = task_ptr.template Cast<ListLocalBlobsTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kSemanticSearch: {
       auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
       archive << *typed_task;
@@ -775,6 +786,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kSyncTag: {
       auto& typed_task = task_ptr.template Cast<SyncTagTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kListLocalBlobs: {
+      auto& typed_task = task_ptr.template Cast<ListLocalBlobsTask>();
       archive >> *typed_task;
       break;
     }
@@ -1060,6 +1076,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       archive >> *typed_task;
       break;
     }
+    case Method::kListLocalBlobs: {
+      auto& typed_task = task_ptr.template Cast<ListLocalBlobsTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
     case Method::kSemanticSearch: {
       auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
       archive >> *typed_task;
@@ -1339,6 +1361,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kSyncTag: {
       auto& typed_task = task_ptr.template Cast<SyncTagTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kListLocalBlobs: {
+      auto& typed_task = task_ptr.template Cast<ListLocalBlobsTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -1822,6 +1850,17 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kListLocalBlobs: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<ListLocalBlobsTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<ListLocalBlobsTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ListLocalBlobsTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kSemanticSearch: {
       auto new_task_ptr = ipc_manager->NewTask<SemanticSearchTask>();
       if (!new_task_ptr.IsNull()) {
@@ -2036,6 +2075,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
     }
     case Method::kSyncTag: {
       auto new_task_ptr = ipc_manager->NewTask<SyncTagTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kListLocalBlobs: {
+      auto new_task_ptr = ipc_manager->NewTask<ListLocalBlobsTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
     case Method::kSemanticSearch: {
@@ -2273,6 +2316,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kSyncTag: {
       auto& typed_task = orig_task.template Cast<SyncTagTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kListLocalBlobs: {
+      auto& typed_task = orig_task.template Cast<ListLocalBlobsTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }

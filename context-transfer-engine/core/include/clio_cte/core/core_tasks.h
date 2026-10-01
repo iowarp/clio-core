@@ -39,6 +39,7 @@
 #include <cassert>
 #include <cstring>
 
+#include <clio_runtime/ipc/ipc_run2run.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/autogen/core_methods.h>
 #include <clio_cte/core/core_config.h>
@@ -894,6 +895,37 @@ static constexpr clio::run::u32 kReplicaAbsentRc = 12;
 /** PutBlob could not place the bytes: every eligible tier is full (10 +
  *  ExtendBlob's out-of-space code). A filesystem reports it as ENOSPC. */
 static constexpr clio::run::u32 kPutNoSpaceRc = 13;
+/**
+ * Whether a task's return code means the node it ran on was lost with the
+ * task in flight (kRun2RunNetworkTimeoutRC): the
+ * task may or may not have run there, so an idempotent op should be resent
+ * once failover names a live owner.
+ * @param rc task return code
+ * @return true for a lost-node failure
+ */
+inline constexpr bool IsNodeLostRc(clio::run::u32 rc) {
+  return rc == static_cast<clio::run::u32>(clio::run::kRun2RunNetworkTimeoutRC);
+}
+
+/** The replication chimod reports a failed write-through (durable) copy as
+ *  this offset + the core's PutBlob code. */
+static constexpr clio::run::u32 kReplicaPutRcBase = 30;
+/**
+ * Whether a PutBlob return code means the bytes did not fit: 11-13 are
+ * 10 + ExtendBlob's capacity codes (no target with space, no target able to
+ * hold the request, tier exhausted), and 41-43 are the same codes from the
+ * replication chimod's durable copy (kReplicaPutRcBase + 11-13) -- which is
+ * what a full persistent tier returns when replication is on. A filesystem
+ * reports all of them as ENOSPC. (Replica-protocol UPDATE_ONLY writes reuse
+ * 12 as kReplicaAbsentRc; this is for ordinary puts.)
+ * @param rc PutBlob return code
+ * @return true for an out-of-space failure
+ */
+inline constexpr bool PutRcIsNoSpace(clio::run::u32 rc) {
+  return (rc >= 11 && rc <= kPutNoSpaceRc) ||
+         (rc >= kReplicaPutRcBase + 11 &&
+          rc <= kReplicaPutRcBase + kPutNoSpaceRc);
+}
 /** PutBlob with Context::kPutIfAbsent found the blob already there. */
 static constexpr clio::run::u32 kPutExistsRc = 60;
 /** PutBlob with Context::kPutIfVersion found a different version. */
@@ -5370,6 +5402,65 @@ struct FlushDataTask : public clio::run::Task {
  * performance.fsync_mode "deferred" the container does nothing and reports
  * deferred_ = 1 so a caller can skip later syncs.
  */
+/**
+ * ListLocalBlobsTask - list the blobs a container holds (by tag id, not tag
+ * name) whose names match a pattern. For modules that keep state in blobs
+ * of nameless tags and must find it again after a restart.
+ */
+struct ListLocalBlobsTask : public clio::run::Task {
+  IN clio::run::priv::string blob_regex_;  ///< full-match on blob names
+  OUT std::vector<clio::run::u64> tag_ids_;  ///< packed (major << 32 | minor)
+  OUT std::vector<std::string> blob_names_;  ///< parallel to tag_ids_
+
+  /** SHM default constructor */
+  ListLocalBlobsTask() : clio::run::Task(), blob_regex_(CLIO_PRIV_ALLOC) {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit ListLocalBlobsTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const std::string &blob_regex)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kListLocalBlobs),
+        blob_regex_(CLIO_PRIV_ALLOC, blob_regex) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kListLocalBlobs;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /** Serialize IN and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(blob_regex_);
+  }
+
+  /** Serialize OUT and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(tag_ids_, blob_names_);
+  }
+
+  /** Copy from another ListLocalBlobsTask */
+  void Copy(const ctp::ipc::FullPtr<ListLocalBlobsTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    blob_regex_ = other->blob_regex_;
+    tag_ids_ = other->tag_ids_;
+    blob_names_ = other->blob_names_;
+  }
+
+  /** AggregateOut: concatenate the per-container lists. */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<ListLocalBlobsTask>();
+    tag_ids_.insert(tag_ids_.end(), other->tag_ids_.begin(),
+                    other->tag_ids_.end());
+    blob_names_.insert(blob_names_.end(), other->blob_names_.begin(),
+                       other->blob_names_.end());
+  }
+};
+
 /** SyncTag return code: a persistent tier had no room for the tag's bytes. */
 static constexpr clio::run::u32 kSyncNoSpaceRc = 28;  // ENOSPC
 /** SyncTag return code: a device sync or a read of the tag's bytes failed. */

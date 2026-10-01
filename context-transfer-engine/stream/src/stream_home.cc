@@ -68,6 +68,63 @@ bool WaitsForMerge(StreamSizeOp op) {
 // Sizes
 // ===========================================================================
 
+bool Runtime::GatedAny() {
+  if (unverified_.empty()) return false;
+  if (std::chrono::steady_clock::now() < gate_deadline_) return true;
+  unverified_.clear();  // gave up waiting (GatedLocked logs it)
+  return false;
+}
+
+bool Runtime::GatedLocked(const clio::cte::core::TagId &tag) {
+  if (unverified_.empty() || unverified_.count(tag) == 0) return false;
+  if (std::chrono::steady_clock::now() < gate_deadline_) return true;
+  HLOG(kWarning, "stream: {} restored stream(s) were never reconciled after "
+       "{} s; releasing them with their logged sizes", unverified_.size(),
+       kRestoreGateS);
+  unverified_.clear();
+  return false;
+}
+
+std::vector<clio::cte::core::TagId> Runtime::UnverifiedStreams() {
+  std::lock_guard<std::mutex> g(mu_);
+  return std::vector<clio::cte::core::TagId>(unverified_.begin(),
+                                             unverified_.end());
+}
+
+void Runtime::ReconcileRestored(const clio::cte::core::TagId &tag,
+                                StreamSizeOp op, clio::run::u64 value) {
+  std::vector<AppendEntry> dropped;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    clio::run::u64 old_size = 0;
+    ApplySizeOpLocked(tag, op, value, &old_size);
+    unverified_.erase(tag);
+    if (op == StreamSizeOp::kSet) {
+      // The file was served elsewhere while this node was down, so merge
+      // plans it had in flight belong to a size that no longer exists:
+      // replaying them would write their bytes at pre-crash offsets (past
+      // a truncate, or over newer appends). They hold only appends no fsync
+      // had waited for yet, which a crash may lose.
+      for (auto it = open_plans_.begin(); it != open_plans_.end();) {
+        if (it->second.tag_ == tag) {
+          dropped.insert(dropped.end(), it->second.entries_.begin(),
+                         it->second.entries_.end());
+          LogDoneLocked(it->first);
+          it = open_plans_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  }
+  if (!dropped.empty()) QueueStagedDelete(dropped);
+}
+
+void Runtime::ReleaseRestored() {
+  std::lock_guard<std::mutex> g(mu_);
+  unverified_.clear();
+}
+
 bool Runtime::LocalSize(const clio::cte::core::TagId &tag,
                         clio::run::u64 *size) {
   std::lock_guard<std::mutex> g(mu_);
@@ -108,16 +165,23 @@ clio::run::u64 Runtime::ApplySizeOpLocked(const clio::cte::core::TagId &tag,
 clio::run::TaskResume Runtime::SizeOp(clio::run::shared_ptr<SizeOpTask> &task) {
   CLIO_TASK_BODY_BEGIN
   const auto op = static_cast<StreamSizeOp>(task->op_);
-  if (op > StreamSizeOp::kDrop) {
+  if (op > StreamSizeOp::kSync) {
     task->return_code_ = EINVAL;
+    CLIO_CO_RETURN;
+  }
+  if (op == StreamSizeOp::kSync) {
+    // Sizes are logged with write(2) only; an fsync of a file makes every
+    // size this home recorded survive power loss.
+    task->return_code_ = log_.Sync() ? 0u : static_cast<clio::run::u32>(EIO);
     CLIO_CO_RETURN;
   }
   for (;;) {
     {
       std::lock_guard<std::mutex> g(mu_);
       auto it = streams_.find(task->tag_id_);
-      const bool busy = it != streams_.end() && it->second.busy_;
-      if (!busy || !WaitsForMerge(op)) {
+      const bool busy = (it != streams_.end() && it->second.busy_) ||
+                        GatedLocked(task->tag_id_);
+      if (!busy || (!WaitsForMerge(op) && !GatedLocked(task->tag_id_))) {
         task->new_size_ = ApplySizeOpLocked(task->tag_id_, op, task->value_,
                                             &task->old_size_);
         break;
@@ -168,7 +232,7 @@ clio::run::TaskResume Runtime::Plan(clio::run::shared_ptr<PlanTask> &task) {
         break;
       }
       StreamState &st = streams_[tag];
-      if (!st.busy_) {
+      if (!st.busy_ && !GatedLocked(tag)) {
         st.busy_ = true;
         for (auto &kv : open_plans_) {
           if (kv.second.tag_ == tag) retry.push_back(kv.second);

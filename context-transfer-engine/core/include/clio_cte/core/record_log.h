@@ -97,6 +97,9 @@ class RecordLog {
    */
   bool Sync();
 
+  /** @return true when records were appended since the last Sync/Rewrite. */
+  bool Unsynced();
+
   /**
    * Atomically replace the log with `records` (write temp, fsync, rename)
    * and keep appending to the new file.
@@ -123,6 +126,7 @@ class RecordLog {
   int fd_ = -1;
   std::mutex mu_;
   clio::run::u64 since_compact_ = 0;
+  bool unsynced_ = false;  ///< appended since the last fsync
 };
 
 }  // namespace clio::cte::core

@@ -4,20 +4,20 @@ services:
   coh-node1:
     command: >
       "
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
   coh-node2:
     command: >
       "
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
   coh-node3:
     command: >
       "
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
   coh-node4:
     command: >
       "
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "

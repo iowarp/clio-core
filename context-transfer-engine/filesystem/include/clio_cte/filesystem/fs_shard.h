@@ -32,28 +32,17 @@
  */
 
 /**
- * Hash sharding of the clio-fs namespace.
+ * Placement helpers of the clio-fs namespace.
  *
- * There is no metadata server. Every piece of namespace state has exactly one
- * owner container, chosen by hashing:
- *
- *   directory entry (dir, leaf)    -> container hash(dir path)
- *   directory listing + attributes -> container hash(dir path)
- *   file inode (size, mode, times,
- *     nlink, open handles)         -> the container that minted the file's
- *                                     id, encoded in the id itself; files are
- *                                     minted by hash(parent dir path) at
- *                                     creation, so this is hashed too
- *   file data pages                -> the CTE core's per-page blob hash
- *
- * All children of one directory live together, so create / O_EXCL / mkdir /
- * unlink / readdir are single-owner operations with no cross-node locking,
- * and a stat is one hop (two when a file was renamed or hard-linked into a
- * directory owned by another node).
+ * There is no metadata server. Directories are stored as directory blocks
+ * (CTE blobs, see fs_dir_block.h) whose home is the container owning the
+ * blob; inodes are homed on the container that minted their id (encoded in
+ * the id); file pages follow the CTE core's per-page hash. Path operations
+ * go to the local container, which resolves paths through its cache of
+ * directory blocks.
  *
  * This header is shared by clients (who route tasks with it) and the
- * runtime (which uses the same functions to decide what it owns), so the
- * two can never disagree.
+ * runtime, so the two can never disagree.
  */
 #ifndef CLIO_CTE_FILESYSTEM_FS_SHARD_H_
 #define CLIO_CTE_FILESYSTEM_FS_SHARD_H_
@@ -150,6 +139,33 @@ inline std::string FsLeaf(const std::string &path) {
  */
 inline std::string FsJoin(const std::string &dir, const std::string &leaf) {
   return dir == "/" ? "/" + leaf : dir + "/" + leaf;
+}
+
+/**
+ * Query for a path-based operation: the local container. It resolves the
+ * path through its own cache of directory blocks (fs_dir_block.h) and sends
+ * only mutations to the homes of the blocks involved.
+ * @return Local query
+ */
+/** Prefix of a Getattr "path" that names an inode instead (FsIdStatPath).
+ *  No real path can start with it: every client path starts with '/'. */
+inline constexpr const char kFsIdStatPrefix[] = "\x01id:";
+
+/**
+ * The Getattr argument that stats inode `packed` directly, whatever names
+ * it has -- including none: an open file whose last name was removed or
+ * renamed over (the handle still owns it). Used for fstat and for the
+ * size a read through an open descriptor clamps to, which must follow the
+ * descriptor's file, not whatever its old path names now.
+ * @param packed packed inode id (TagId)
+ * @return the query string for Client::AsyncGetattr
+ */
+inline std::string FsIdStatPath(clio::run::u64 packed) {
+  return std::string(kFsIdStatPrefix) + std::to_string(packed);
+}
+
+inline clio::run::PoolQuery FsPathQuery() {
+  return clio::run::PoolQuery::Local();
 }
 
 /**

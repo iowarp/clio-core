@@ -87,6 +87,20 @@ class FsBdevTransport : public BdevTransport {
   clio::run::u64 growth_unit_ = clio::run::u64(1) << 30;
   std::atomic<clio::run::u64> file_backed_bytes_{0};
   std::mutex grow_mu_;
+  /** Smallest end offset a grow could not reserve disk for (guarded by
+   *  grow_mu_; 0 = none), and when (steady ns): requests reaching it fail
+   *  fast for kGrowRetryNs instead of retrying the reservation. */
+  clio::run::u64 grow_fail_end_ = 0;
+  clio::run::u64 grow_fail_ns_ = 0;
+  /** How long a failed grow is trusted before disk space is probed again. */
+  static constexpr clio::run::u64 kGrowRetryNs = 2000000000ull;
+  /**
+   * Extend the backing file to `target` bytes and reserve its blocks.
+   * @param backed current backed size
+   * @param target new size
+   * @return true on success (on failure the file is left at `backed`)
+   */
+  bool GrowBackingFile(clio::run::u64 backed, clio::run::u64 target);
 
   bool InitializeWorkerIOContexts();
   void CleanupWorkerIOContexts();

@@ -148,10 +148,34 @@ constexpr bool CteAllocIsCapacityFailure(clio::run::u32 rc) {
   return rc >= kCteAllocNoTargetSpace && rc <= kCteAllocExhausted;
 }
 
+
 // min_tier_score for the make-room eviction: 0.0 offers every tier as a
 // candidate. Scoping it to the tier that actually failed would need the
 // placement engine's target choice, which is not exposed here.
 constexpr float kCteEvictAnyTier = 0.0f;
+
+// Resends of a forwarded put whose owner died mid-flight, and the wait
+// between them (us) while the cluster marks the node dead.
+constexpr int kForwardRetries = 10;
+constexpr double kForwardRetryUs = 1000000.0;
+
+// A metadata snapshot slower than this is reported (milliseconds).
+constexpr double kSlowSnapshotMs = 1000.0;
+
+// Unlogged metadata changes (blob scores) wait at most this long for a full
+// snapshot (milliseconds).
+constexpr clio::run::u64 kSnapshotMaxAgeMs = 60000;
+
+/**
+ * Milliseconds on the steady clock (for snapshot pacing).
+ * @return current steady-clock time in ms
+ */
+clio::run::u64 SteadyNowMs() {
+  return static_cast<clio::run::u64>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
 
 // #680 per-blob write-token re-check period (microseconds). Default 10us: a
 // loser is parked ONLY during active same-blob write contention, where a fast
@@ -946,6 +970,8 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     // nothing else can interleave on this worker in that window.
     ReserveRestoredBlockSpace();
   }
+
+  if (!is_restart_) DiscardPersistentMetadata();
 
   // Open WAL files if metadata_log_path is configured
   if (!config_.performance_.metadata_log_path_.empty()) {
@@ -2524,6 +2550,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     blob_info_ptr->last_modified_ = now;
     task->context_.version_ = now;
     blob_info_ptr->access_count_++;  // frequency input for the data organizer
+    if (blob_info_ptr->score_ != blob_score) snapshot_dirty_.store(true);
     blob_info_ptr->score_ = blob_score;
     // GENERATIONAL PUT: see the note on the replica path above.
     if (task->context_.op_flags_ & Context::kGenerational) {
@@ -3594,6 +3621,7 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
         }
         clio::run::u32 free_rc = 0;
         CLIO_CO_AWAIT(FreeAllBlobBlocks(blob_info, free_rc));
+        if (blob_info.score_ != new_score) snapshot_dirty_.store(true);
         blob_info.score_ = new_score;
         // The primary's bytes leave the tag (same bookkeeping as DelBlob):
         // GetTagSize stays equal to the sum of primary sizes.
@@ -3735,6 +3763,7 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
     old_layout.RecomputeTotalSize();
     blob_info.blocks_ = std::move(staging.blocks_);
     blob_info.total_size_cache_ = staging.total_size_cache_;
+    if (blob_info.score_ != placed_score) snapshot_dirty_.store(true);
     blob_info.score_ = placed_score;
     blob_info.BumpPlacementGen();
     {
@@ -5132,6 +5161,21 @@ clio::run::TaskResume Runtime::MultiPutBlob(
                                         task->context_, /*flags=*/0, owner);
         CLIO_CO_AWAIT(fut);
         rc = fut->GetReturnCode();
+        // The owner died with this put in flight: re-resolve the owner
+        // (failover now names its successor) and write again -- idempotent.
+        for (int attempt = 0; attempt < kForwardRetries && IsNodeLostRc(rc);
+             ++attempt) {
+          HLOG(kWarning, "MultiPutBlob: owner of {}.{}/{} was lost with the "
+               "put in flight; resending (attempt {})", d.tag_id_.major_,
+               d.tag_id_.minor_, d.blob_name_, attempt + 1);
+          CLIO_CO_AWAIT(clio::run::yield(kForwardRetryUs));
+          fut = client_.AsyncPutBlob(
+              d.tag_id_, d.blob_name_, d.offset_, d.size_, src,
+              /*score=*/-1.0f, task->context_, /*flags=*/0,
+              HashBlobToContainer(d.tag_id_, d.blob_name_));
+          CLIO_CO_AWAIT(fut);
+          rc = fut->GetReturnCode();
+        }
         if (rc != 0) break;
       }
     }
@@ -6686,6 +6730,43 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     CLIO_CO_RETURN;
   }
 
+  {
+    // The WAL is what makes each change durable: sync it every period. The
+    // full snapshot below is compaction -- it costs a pass over every blob,
+    // taking each one's write token -- so rebuild it only when the WAL must
+    // be truncated, or when a change the WAL does not record is pending and
+    // the last snapshot is old enough.
+    clio::run::u64 wal_bytes = 0;
+    for (auto &log : blob_txn_logs_) {
+      if (log) {
+        log->Sync();
+        wal_bytes += log->Size();
+      }
+    }
+    for (auto &log : tag_txn_logs_) {
+      if (log) {
+        log->Sync();
+        wal_bytes += log->Size();
+      }
+    }
+    const clio::run::u64 now_ms = SteadyNowMs();
+    const clio::run::u64 last_ms = last_snapshot_ms_.load();
+    const bool must_compact =
+        wal_bytes > config_.performance_.transaction_log_capacity_bytes_;
+    const bool unlogged_due =
+        snapshot_dirty_.load() &&
+        (last_ms == 0 || now_ms - last_ms >= kSnapshotMaxAgeMs);
+    // An explicit (one-shot) flush always writes the snapshot: callers ask
+    // for one. Only the periodic task may skip it.
+    const bool have_wal = !blob_txn_logs_.empty();
+    if (have_wal && task->IsPeriodic() && !must_compact && !unlogged_due) {
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+    snapshot_dirty_.store(false);  // changes after this point set it again
+    last_snapshot_ms_.store(now_ms);
+  }
+
   try {
     namespace fs = std::filesystem;
     fs::create_directories(fs::path(log_path).parent_path());
@@ -6701,6 +6782,7 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     // built (it yields on write tokens) might not be, and must survive the
     // WAL truncation that follows.
     const clio::run::u64 snapshot_seq = next_wal_seq_.load();
+    const auto snapshot_t0 = std::chrono::steady_clock::now();
 
     // Build the snapshot beside the live one and swap it in durably: writing
     // the live file in place left a truncated snapshot -- and the blobs only
@@ -6945,6 +7027,17 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     }
 
     task->return_code_ = 0;
+    const double snapshot_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - snapshot_t0).count();
+    // A full snapshot runs every flush_metadata_period_ms and takes every
+    // blob's write token in turn; when it costs on the order of the period it
+    // competes with foreground I/O the whole time. Say so.
+    if (snapshot_ms > kSlowSnapshotMs) {
+      HLOG(kWarning, "FlushMetadata: snapshot of {} entries took {} ms "
+           "(period {} ms)", task->entries_flushed_,
+           static_cast<clio::run::u64>(snapshot_ms),
+           config_.performance_.flush_metadata_period_ms_);
+    }
     HLOG(kDebug, "FlushMetadata: Flushed {} entries to {}",
          task->entries_flushed_, log_path);
   } catch (const std::exception &e) {
@@ -7332,6 +7425,35 @@ clio::run::TaskResume Runtime::SyncTag(
   }
   for (auto &log : tag_txn_logs_) {
     if (log) log->Sync();
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ListLocalBlobs(
+    clio::run::shared_ptr<ListLocalBlobsTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  task->tag_ids_.clear();
+  task->blob_names_.clear();
+  task->return_code_ = 0;
+  try {
+    const std::regex pattern(task->blob_regex_.str());
+    tag_blob_name_to_info_.for_each(
+        [&](const std::string &key, const std::shared_ptr<BlobInfo> &info) {
+          TagId tag;
+          std::string name;
+          if (!SplitBlobKey(key, &tag, &name)) return;
+          if (!std::regex_match(name, pattern)) return;
+          if (!ServesBlob(*info, tag, name)) return;
+          task->tag_ids_.push_back(
+              (static_cast<clio::run::u64>(tag.major_) << 32) | tag.minor_);
+          task->blob_names_.push_back(name);
+        },
+        ctp::priv::ForEachLock::kShared);
+  } catch (const std::exception &e) {
+    HLOG(kError, "ListLocalBlobs: bad pattern '{}': {}",
+         task->blob_regex_.str(), e.what());
+    task->return_code_ = 1;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -7793,27 +7915,35 @@ void Runtime::ReplayTransactionLogs() {
   // applies at read time: only when the primary itself reports empty, not
   // when it merely differs from a replica (a genuinely partial primary
   // still wins as the freshest copy).
-  tag_id_to_info_.for_each([&](const TagId &tag_id, std::shared_ptr<TagInfo> &tag_info_sp) { TagInfo &tag_info = *tag_info_sp; (void)tag_info;
-    clio::run::u64 total = 0;
-    std::string tag_prefix = std::to_string(tag_id.major_) + "." +
-                             std::to_string(tag_id.minor_) + ".";
-    tag_blob_name_to_info_.for_each(
-        [&tag_prefix, &total](const std::string &key,
-                              const std::shared_ptr<BlobInfo> &blob_info_sp) { const BlobInfo &blob_info = *blob_info_sp; (void)blob_info;
-          if (key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
-            clio::run::u64 blob_total = blob_info.GetTotalSize();
-            if (blob_total == 0) {
-              for (const auto &rep : blob_info.replicas_) {
-                if (rep.total_size_cache_ > blob_total) {
-                  blob_total = rep.total_size_cache_;
-                }
-              }
+  //
+  // ONE pass over the blobs. This used to scan every blob once per tag -- a
+  // prefix compare for each (tag, blob) pair -- which is quadratic: clio-fs
+  // makes every file and directory a tag, so a node holding tens of
+  // thousands of files spent minutes here, inside Create, on one worker that
+  // never yielded, and a whole-cluster restart could not come back.
+  std::unordered_map<TagId, clio::run::u64> tag_totals;
+  tag_blob_name_to_info_.for_each(
+      [&tag_totals](const std::string &key,
+                    const std::shared_ptr<BlobInfo> &blob_info_sp) {
+        TagId tag;
+        std::string name;
+        if (!SplitBlobKey(key, &tag, &name)) return;
+        const BlobInfo &blob_info = *blob_info_sp;
+        clio::run::u64 blob_total = blob_info.GetTotalSize();
+        if (blob_total == 0) {
+          for (const auto &rep : blob_info.replicas_) {
+            if (rep.total_size_cache_ > blob_total) {
+              blob_total = rep.total_size_cache_;
             }
-            total += blob_total;
           }
-        });
-    tag_info.total_size_ = total;
-  });
+        }
+        tag_totals[tag] += blob_total;
+      });
+  tag_id_to_info_.for_each(
+      [&tag_totals](const TagId &tag_id, std::shared_ptr<TagInfo> &tag_info_sp) {
+        auto it = tag_totals.find(tag_id);
+        tag_info_sp->total_size_ = it == tag_totals.end() ? 0 : it->second;
+      });
 
   // Phase 4: Update next_tag_id_minor_
   clio::run::u32 current_minor = next_tag_id_minor_.load();
@@ -7835,6 +7965,33 @@ void Runtime::ReplayTransactionLogs() {
 
   HLOG(kInfo, "ReplayTransactionLogs: Replayed {} tag ops and {} blob ops",
        tags_replayed, blobs_replayed);
+}
+
+void Runtime::DiscardPersistentMetadata() {
+  const std::string &path = config_.performance_.metadata_log_path_;
+  if (path.empty()) return;
+  // A fresh start (`clio_run start --fresh`) begins empty. The WAL shards are
+  // opened in append mode and the snapshot is only rewritten when needed, so
+  // left alone the previous run's metadata would survive and be replayed --
+  // interleaved with this run's records, whose seqs restart at 1 -- by the
+  // next (recovering) start.
+  namespace fs = std::filesystem;
+  const fs::path p(path);
+  const std::string base = p.filename().string();
+  const fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+  std::error_code ec;
+  size_t removed = 0;
+  for (const auto &ent : fs::directory_iterator(dir, ec)) {
+    const std::string name = ent.path().filename().string();
+    const bool snapshot = name == base || name == base + ".tmp";
+    const bool shard = name.rfind(base + ".blob.", 0) == 0 ||
+                       name.rfind(base + ".tag.", 0) == 0;
+    if ((snapshot || shard) && fs::remove(ent.path(), ec)) ++removed;
+  }
+  if (removed > 0) {
+    HLOG(kInfo, "cte_core: fresh start discarded {} metadata log file(s) at {}",
+         removed, path);
+  }
 }
 
 void Runtime::ApplyWalCreateTag(const std::vector<char> &payload,
@@ -7862,17 +8019,15 @@ void Runtime::ApplyWalDelTag(const std::vector<char> &payload,
   for (const auto &alias : txn.aliases_) {
     tag_name_to_id_.erase(alias);
   }
-  // Erase all blobs belonging to this tag
-  std::string tag_prefix = std::to_string(tag_id.major_) + "." +
-                           std::to_string(tag_id.minor_) + ".";
+  // Erase all blobs belonging to this tag, found through the per-tag index
+  // (replay maintains it): scanning every blob per deleted tag made a log
+  // with many deletes quadratic to replay.
+  const std::string tag_prefix = std::to_string(tag_id.major_) + "." +
+                                 std::to_string(tag_id.minor_) + ".";
   std::vector<std::string> keys_to_erase;
-  tag_blob_name_to_info_.for_each(
-      [&tag_prefix, &keys_to_erase](const std::string &key,
-                                    const std::shared_ptr<BlobInfo> &) {
-        if (key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
-          keys_to_erase.push_back(key);
-        }
-      });
+  for (const std::string &name : BlobIndexNames(tag_id)) {
+    keys_to_erase.push_back(tag_prefix + name);
+  }
   for (const auto &key : keys_to_erase) {
     tag_blob_name_to_info_.erase(key);
     BlobIndexErase(key);

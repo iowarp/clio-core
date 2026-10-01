@@ -1190,7 +1190,7 @@ def restart_runtime():
         cf.write(SUITE_CONF_YAML)
     env = dict(os.environ, HOME=CLIO_HOME, CLIO_SERVER_CONF=SUITE_CONF)
     with open(RUNTIME_LOG, "w") as log:
-        proc = subprocess.Popen([os.path.join(BIN, "clio_run"), "start"],
+        proc = subprocess.Popen([os.path.join(BIN, "clio_run"), "start", "--fresh"],
                                 stdout=log, stderr=log,
                                 cwd=os.path.dirname(BIN) or "/", env=env)
     for _ in range(60):

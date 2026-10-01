@@ -69,6 +69,7 @@ enum class StreamSizeOp : clio::run::u32 {
   kReserve = 2,  ///< old = size; size += value: synchronous append
   kSet = 3,      ///< size = value: truncate or extend
   kDrop = 4,     ///< forget the stream and discard its pending appends
+  kSync = 5,     ///< fsync the home's size log (fsync(2) of a file)
 };
 
 /**

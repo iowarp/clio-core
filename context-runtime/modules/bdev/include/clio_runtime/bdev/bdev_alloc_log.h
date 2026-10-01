@@ -46,6 +46,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 /**
  * Reusable persistent allocator-state log (write-ahead log) for the bdev
@@ -305,6 +309,17 @@ class AllocatorLog {
     } else {
       records_on_disk_ = written;
       live_cache_valid_ = false;
+#ifndef _WIN32
+      // The rename is durable only with its directory: otherwise a power
+      // loss brings back the old log and loses what is appended from here.
+      const std::string dir = fs::path(path_).parent_path().string();
+      const int dfd = ::open(dir.empty() ? "." : dir.c_str(),
+                             O_RDONLY | O_DIRECTORY);
+      if (dfd >= 0) {
+        (void)::fsync(dfd);
+        ::close(dfd);
+      }
+#endif
     }
     // Appends continue on whichever file now sits at path_.
     file_ = std::fopen(path_.c_str(), "ab");

@@ -39,7 +39,7 @@ services:
       "
         set -x &&
         echo 'Node 1 (writer): starting Clio runtime in background' &&
-        /workspace/build/bin/clio_run runtime start &
+        /workspace/build/bin/clio_run runtime start --fresh &
         RUNTIME_PID=$$! &&
         echo \"Node 1: runtime PID $$RUNTIME_PID; waiting for cluster to form\" &&
         sleep 6 &&
@@ -80,7 +80,7 @@ services:
       "
         set -x &&
         echo 'Node 2 (reader): starting Clio runtime in background' &&
-        /workspace/build/bin/clio_run runtime start &
+        /workspace/build/bin/clio_run runtime start --fresh &
         RUNTIME_PID=$$! &&
         echo \"Node 2: runtime PID $$RUNTIME_PID; waiting for cluster to form\" &&
         sleep 6 &&

@@ -118,7 +118,7 @@ class Runtime : public clio::cte::core::CoreInterposer {
       clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
 
   // ---- Container virtuals (defined in autogen/replication_lib_exec.cc) ----
-  /** Recovery start (`clio_run restart`): Create pulls the handoff. */
+  /** Recovering start (a plain `clio_run start`): Create pulls the handoff. */
   void Restart(const clio::run::PoolId &pool_id, const std::string &pool_name,
                clio::run::u32 container_id = 0) override;
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,

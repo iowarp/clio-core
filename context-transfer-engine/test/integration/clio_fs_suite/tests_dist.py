@@ -345,6 +345,35 @@ def t_xappend_burst(ctx):
   check_records(ctx, n - 1, p, acked, {}, reclen=128)
 
 
+@test('append_then_truncate', 'dist', min_nodes=2)
+def t_append_then_truncate(ctx):
+  """Appends whose write(2) returned come before a later truncate, as on
+  ext4: an O_APPEND file written and then truncated (by path, and through
+  the same descriptor) before it is closed keeps none of the truncated
+  appends -- merged after the truncate they would reappear past the cut."""
+  n = len(ctx.hosts)
+  for i in range(n):
+    p = ctx.p(f'at{i}')
+    ctx.ok(i, 'write_file', path=p, size=0, seed=0)
+    # By path from the same node, then ftruncate on the appending fd; then
+    # one more append, which lands at the new end.
+    code = (f"import os; fd=os.open({p!r}, os.O_WRONLY|os.O_APPEND); "
+            f"[os.write(fd, b'A'*1000) for _ in range(50)]; "
+            f"os.truncate({p!r}, 100); "
+            f"[os.write(fd, b'B'*1000) for _ in range(20)]; "
+            f"os.ftruncate(fd, 0); os.write(fd, b'C'*10); os.close(fd); "
+            f"d=open({p!r},'rb').read(); print(len(d), d[:10].decode())")
+    r = ctx.ok(i, 'sh', cmd=f'python3 -c "{code}"', timeout=120)
+    ctx.check(r['rc'] == 0, f'node{i}: {r["err"][-300:]}')
+    ctx.check(r['out'].strip() == '10 CCCCCCCCCC',
+              f'node{i}: after append/truncate/append the file reads '
+              f'{r["out"].strip()!r}, want 10 x "C"')
+    for j in range(n):
+      st = ctx.ok(j, 'stat', path=p)
+      ctx.check(st['size'] == 10, f'node{j} sees size {st["size"]} of at{i}, '
+                                  f'want 10')
+
+
 @test('xnode_metadata_attrs', 'dist', min_nodes=2)
 def t_xattrs(ctx):
   """chmod / utimens / xattr / truncate set on node A are seen on node B."""

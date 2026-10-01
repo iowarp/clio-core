@@ -3,7 +3,7 @@
 What a persistent, reliable deployment must guarantee (and what is checked):
   * Everything acknowledged by fsync()/close() before a graceful stop or a
     crash (SIGKILL of every daemon) is back, byte-exact, with its metadata
-    (names, sizes, modes, links, xattrs) after `clio_run restart`.
+    (names, sizes, modes, links, xattrs) after a stop and `clio_run start`.
   * Losing one node never hangs the survivors: every operation on a
     survivor returns (success or an error) inside a bounded time.
   * A node that comes back rejoins and its data is readable cluster-wide.
@@ -55,7 +55,8 @@ def victim_off_path(ctx, root):
 def build_dataset(ctx, tag, per_node=12):
   """Populate a mixed tree from every node; return the expected manifest.
 
-  The manifest maps relpath -> (kind, size, perm, seed/target) and is what
+  The manifest maps relpath -> (kind, size, perm, seed/target[, xattrs])
+  (xattrs: name -> hex value, checked by audit) and is what
   every node must see after the fault + recovery.
   """
   n = len(ctx.hosts)
@@ -83,8 +84,16 @@ def build_dataset(ctx, tag, per_node=12):
       local[rel] = ('f', size, mode, seed)
     ctx.ok(i, 'symlink', target='f0', path=f'{d}/link_to_f0')
     local[f'node{i}/link_to_f0'] = ('l', 'f0')
-    ctx.ok(i, 'setxattr', path=f'{d}/sub', name='user.tag',
-           value_hex=f'{tag}{i}'.encode().hex())
+    xv = f'{tag}{i}'.encode().hex()
+    ctx.ok(i, 'setxattr', path=f'{d}/sub', name='user.tag', value_hex=xv)
+    local[f'node{i}/sub'] = ('d', {'user.tag': xv})
+    # A file's xattr too (the manifest's optional last field: name -> hex).
+    frel = next((k for k in sorted(local) if local[k][0] == 'f'), None)
+    if frel is not None:
+      fv = f'file-{tag}{i}'.encode().hex()
+      ctx.ok(i, 'setxattr', path=f'{root}/{frel}', name='user.kind',
+             value_hex=fv)
+      local[frel] = local[frel] + ({'user.kind': fv},)
     return local
   for local in ctx.each(fill):
     exp.update(local)
@@ -140,6 +149,15 @@ def audit(ctx, i, root, exp, deadline=OP_DEADLINE, subset=None):
           bad.append((rel, 'HANG'))
         elif not r['ok'] or r['ret'] != e[1]:
           bad.append((rel, r.get('err') or r.get('ret')))
+      want_x = e[-1] if isinstance(e[-1], dict) else {}
+      for name, val in want_x.items():
+        r = ctx.a(i).call('getxattr', timeout=deadline, path=p, name=name)
+        if r.get('hang'):
+          hangs += 1
+          bad.append((rel, 'HANG'))
+        elif not r['ok'] or r['ret'] != val:
+          bad.append((rel, f'xattr {name}: {r.get("err") or r.get("ret")}, '
+                           f'want {val}'))
     except Exception as ex:  # pylint: disable=broad-except
       bad.append((rel, repr(ex)))
   return bad, hangs
@@ -158,7 +176,7 @@ def audit_all(ctx, root, exp, what):
 
 def restart_cluster(ctx, crash):
   """Stop (gracefully or SIGKILL) every daemon and bring it back with
-  `clio_run restart`, then remount."""
+  `clio_run start` (which recovers), then remount."""
   cl = ctx.cl
   cl.close_agents()
   if crash:
@@ -169,7 +187,7 @@ def restart_cluster(ctx, crash):
     parallel(cl.stop_runtime, cl.hosts)
   time.sleep(2)
   t0 = time.time()
-  parallel(lambda h: cl.start_runtime(h, 'restart'), cl.hosts)
+  parallel(lambda h: cl.start_runtime(h), cl.hosts)
   ups = parallel(cl.runtime_up, cl.hosts)
   ctx.check(all(u is True for u in ups), f'runtime restart failed: {ups}')
   time.sleep(3)
@@ -181,7 +199,7 @@ def restart_cluster(ctx, crash):
 @test('graceful_restart_all', 'fault', min_nodes=1, redeploy_after=True,
       timeout=3600)
 def t_graceful(ctx):
-  """Graceful stop of every daemon + `clio_run restart`: all data back."""
+  """Graceful stop of every daemon + `clio_run start`: all data back."""
   root, exp = build_dataset(ctx, 'g')
   audit_all(ctx, root, exp, 'before restart')
   restart_cluster(ctx, crash=False)
@@ -218,21 +236,59 @@ def t_double_crash(ctx):
 @test('plain_start_keeps_data', 'fault', min_nodes=1, redeploy_after=True,
       timeout=3600)
 def t_plain_start(ctx):
-  """Operator runs `clio_run start` (not `restart`) after a clean stop: does
-  a persistent deployment keep its data?"""
+  """Operator stops the deployment and runs `clio_run start` again: a
+  persistent deployment keeps all its data (start recovers by default;
+  only --fresh discards)."""
   root, exp = build_dataset(ctx, 's', per_node=4)
   cl = ctx.cl
   cl.close_agents()
   parallel(cl.unmount, cl.hosts)
   parallel(cl.stop_runtime, cl.hosts)
-  parallel(lambda h: cl.start_runtime(h, 'start'), cl.hosts)
+  parallel(lambda h: cl.start_runtime(h), cl.hosts)
   parallel(cl.runtime_up, cl.hosts)
   time.sleep(3)
   parallel(cl.mount, cl.hosts)
   bad, _ = audit(ctx, 0, root, exp)
   ctx.check(not bad, f'`clio_run start` on an existing persistent '
                      f'deployment lost {len(bad)}/{len(exp)} entries '
-                     f'(e.g. {bad[:3]}); only `restart` replays the WAL')
+                     f'(e.g. {bad[:3]})')
+
+
+@test('fresh_start_discards', 'fault', min_nodes=1, redeploy_after=True,
+      timeout=3600)
+def t_fresh_start(ctx):
+  """`clio_run start --fresh` is the one way to discard state: after it the
+  old dataset is gone -- and STAYS gone across a later (recovering) start,
+  i.e. nothing of the previous run's logs is replayed -- while the
+  filesystem works normally."""
+  root, exp = build_dataset(ctx, 'f', per_node=3)
+  cl = ctx.cl
+
+  def cycle(fresh):
+    cl.close_agents()
+    parallel(cl.unmount, cl.hosts)
+    parallel(cl.stop_runtime, cl.hosts)
+    parallel(lambda h: cl.start_runtime(h, fresh=fresh), cl.hosts)
+    ups = parallel(cl.runtime_up, cl.hosts)
+    ctx.check(all(u is True for u in ups), f'start (fresh={fresh}) failed')
+    time.sleep(3)
+    ms = parallel(cl.mount, cl.hosts)
+    ctx.check(all(m is True for m in ms), f'remount (fresh={fresh}) failed')
+
+  cycle(fresh=True)
+  ctx.check(ctx.ok(0, 'exists', path=root) is False,
+            'the dataset survived `start --fresh`')
+  # --fresh discarded this test's own directory too: make it again.
+  ctx.ok(0, 'makedirs', path=ctx.dir)
+  p = ctx.p('after_fresh')
+  ctx.ok(0, 'write_file', path=p, size=1 << 20, seed=9, fsync=True)
+  cycle(fresh=False)
+  for i in range(len(ctx.hosts)):
+    ctx.check(ctx.ok(i, 'exists', path=root) is False,
+              f'node{i}: the pre-fresh dataset came back after a later start')
+    v = ctx.ok(i, 'verify_file', path=p, size=1 << 20, seed=9)
+    ctx.check(v['size_ok'] and not v['mismatch'],
+              f'node{i}: the file written after --fresh was not recovered')
 
 
 @test('node_loss_survivors_bounded', 'fault', min_nodes=2,
@@ -284,7 +340,7 @@ def t_node_loss(ctx):
                              f'{OP_DEADLINE}s) on survivors after node '
                              f'{vh} died')
   # Bring the victim back.
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
@@ -346,7 +402,7 @@ def t_kill_during_io(ctx):
     acked[i] = o
   ctx.metrics['acked_writes'] = sum(len(v) for v in acked.values())
   ctx.check(not hangs, f'survivor writes hung after {vh} died: {hangs}')
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), 'victim restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), 'victim remount')
@@ -415,7 +471,7 @@ def t_chaos(ctx):
     if what == 'runtime':
       ctx.cl.kill_runtime(vh)
       time.sleep(1)
-      ctx.cl.start_runtime(vh, 'restart')
+      ctx.cl.start_runtime(vh)
       ctx.check(ctx.cl.runtime_up(vh), f'round {rnd} restart')
       time.sleep(3)
     ctx.check(ctx.cl.mount(vh), f'round {rnd} remount')
@@ -463,7 +519,7 @@ def t_node_loss_partial(ctx):
                       'reachable_fraction': round(oks / total, 2)})
   ctx.check(hangs == 0, f'{hangs} ops HUNG while one node was down')
   ctx.check(oks > 0, 'no part of the namespace stayed reachable')
-  ctx.cl.start_runtime(victim, 'restart')
+  ctx.cl.start_runtime(victim)
   ctx.check(ctx.cl.runtime_up(victim), 'victim restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(victim), 'victim remount')
@@ -507,7 +563,7 @@ def t_tag_names_restart(ctx):
     res = ctx.a(0).call('mkdir', timeout=OP_DEADLINE, path=p)
     if res.get('ok'):
       want.add(f'/during{k}')
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
@@ -559,7 +615,7 @@ def t_append_home_restart(ctx):
   ctx.cl.kill_fuse(vh)
   ctx.cl.kill_runtime(vh)
   time.sleep(5)
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
@@ -638,7 +694,7 @@ def t_data_failover(ctx):
   new = [f'{root}/n{k}' for k in range(3)]
   for k, p in enumerate(new):
     ctx.ok(w, 'write_file', path=p, size=3 * MiB, seed=950 + k, fsync=True)
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
@@ -696,13 +752,13 @@ def t_handoff_successor_restart(ctx):
   ctx.cl.kill_fuse(sh_)
   ctx.cl.kill_runtime(sh_)
   time.sleep(2)
-  ctx.cl.start_runtime(sh_, 'restart')
+  ctx.cl.start_runtime(sh_)
   ctx.check(ctx.cl.runtime_up(sh_), f'{sh_} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(sh_), f'{sh_} remount failed')
   ctx.cl.agents.pop(sh_, None)
   # Now the owner returns and must get the successor's changes.
-  ctx.cl.start_runtime(vh, 'restart')
+  ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
@@ -746,3 +802,133 @@ def blob_info_notes(ctx, path, verdict):
                   timeout=60)
       ctx.note(f'{h} page {page} of {tag}{flag or " (owner)"}: '
                f'{out.strip()}')
+
+
+@test('truncate_during_failover', 'fault', min_nodes=2, redeploy_after=True,
+      timeout=1800)
+def t_truncate_during_failover(ctx):
+  """A file's home (which owns its size) is SIGKILLed; while it is down a
+  survivor truncates the file (after failover takes the inode over) and
+  appends a tail. When the home comes back it must not resurrect the old,
+  larger size: every node sees the truncated size, the kept prefix and the
+  new tail, and nothing of the old bytes past the cut."""
+  n = len(ctx.hosts)
+  MiB = 1 << 20
+  p = ctx.p('shrink')
+  ctx.ok(0, 'write_file', path=p, size=8 * MiB, seed=5, fsync=True)
+  home = inode_home(ctx, 0, p)
+  victim = home if home is not None and home < n else n - 1
+  a = (victim + 1) % n
+  vh = ctx.hosts[victim]
+  ctx.note(f'home node{victim}; truncating from node{a}')
+  ctx.cl.kill_fuse(vh)
+  ctx.cl.kill_runtime(vh)
+  t0 = time.time()
+  done = False
+  while time.time() - t0 < 90:
+    if ctx.call(a, 'truncate', path=p, size=1 * MiB)['ok']:
+      done = True
+      break
+    time.sleep(2)
+  ctx.metrics['truncate_after_s'] = round(time.time() - t0, 1)
+  ctx.check(done, 'truncate never succeeded while the home was down '
+                  '(no failover within 90 s)')
+  # Two timed steps, so a hang names its half: the append, then the fsync.
+  r = ctx.ok(a, 'sh', cmd=f'timeout 60 python3 -c "import os; '
+                          f'fd=os.open({p!r}, os.O_WRONLY|os.O_APPEND); '
+                          f'os.write(fd, b\'T\'*4096); os.close(fd)"')
+  ctx.check(r['rc'] == 0, f'append after the truncate failed or took over '
+                          f'60 s (rc {r["rc"]}): {r["err"][-300:]}')
+  r = ctx.ok(a, 'sh', cmd=f'timeout 60 python3 -c "import os; '
+                          f'fd=os.open({p!r}, os.O_RDONLY); os.fsync(fd); '
+                          f'os.close(fd)"')
+  ctx.check(r['rc'] == 0, f'fsync while the home is down failed or took '
+                          f'over 60 s (rc {r["rc"]}): {r["err"][-300:]}')
+  want = 1 * MiB + 4096
+  for i in range(n):
+    if i != victim:
+      sz = ctx.ok(i, 'stat', path=p)['size']
+      ctx.check(sz == want, f'node{i} sees size {sz} during the outage, '
+                            f'want {want}')
+  ctx.cl.start_runtime(vh)
+  ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
+  time.sleep(3)
+  ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
+  ctx.cl.agents.pop(vh, None)
+  time.sleep(2)
+  for i in range(n):
+    sz = ctx.ok(i, 'stat', path=p)['size']
+    ctx.check(sz == want, f'node{i} sees size {sz} after the home returned, '
+                          f'want {want} (old size resurrected?)')
+    tail = ctx.ok(i, 'sh', cmd=f'python3 -c "f=open({p!r},\'rb\');'
+                               f' f.seek({1 * MiB}); '
+                               f'd=f.read(); print(len(d), set(d)==set(b\'T\'))"'
+                  )['out']
+    ctx.check(tail.strip().endswith(f'{4096} True'),
+              f'node{i}: bytes past the cut are {tail.strip()!r}, want 4096 '
+              f'x "T"')
+  v = ctx.ok(n - 1 if victim != n - 1 else 0, 'verify_file', path=p,
+             size=1 * MiB, seed=5)
+  ctx.check(not v['mismatch'], f'kept prefix damaged: {v["mismatch"]}')
+
+
+
+@test('open_handle_survives_home_loss', 'fault', min_nodes=2,
+      redeploy_after=True, timeout=1800)
+def t_open_handle_home_loss(ctx):
+  """A process keeps a file open on one node while the file's home (which
+  holds the open handle's state and the file's size) is SIGKILLed. Through
+  the SAME descriptor it keeps writing, fsyncs, stats and reads after
+  failover, and closes it; once the home is back every node reads exactly
+  what was written, before and after the loss."""
+  n = len(ctx.hosts)
+  MiB = 1 << 20
+  p = ctx.p('held')
+  ctx.ok(0, 'write_file', path=p, size=4 * MiB, seed=0, fsync=True)
+  home = inode_home(ctx, 0, p)
+  victim = home if home is not None and home < n else n - 1
+  a = (victim + 1) % n
+  ctx.note(f'home node{victim}; descriptor on node{a}')
+  h = ctx.ok(a, 'open', path=p, flags='rw')
+  ctx.ok(a, 'fpwrite', h=h, off=0, length=MiB, seed=1)
+  ctx.ok(a, 'fsync', h=h)
+  vh = ctx.hosts[victim]
+  ctx.cl.kill_fuse(vh)
+  ctx.cl.kill_runtime(vh)
+  # One write and ONE fsync, never retried: a write-back error is reported
+  # to one fsync only (as on Linux), so a retried fsync would succeed on
+  # bytes that were lost.
+  t0 = time.time()
+  r = ctx.call(a, 'fpwrite', timeout=300, h=h, off=MiB, length=MiB, seed=1)
+  ctx.check(r['ok'], f'write through the open descriptor after the home '
+                     f'died: {r.get("err")}')
+  r = ctx.call(a, 'fsync', timeout=300, h=h)
+  ctx.metrics['write_fsync_after_loss_s'] = round(time.time() - t0, 1)
+  ctx.check(r['ok'], f'fsync through the open descriptor after the home '
+                     f'died: {r.get("err")}')
+  r = ctx.call(a, 'fstat', timeout=60, h=h)
+  ctx.check(r['ok'] and r['ret']['size'] == 4 * MiB,
+            f'fstat after the home died: {r.get("err") or r.get("ret")}')
+  for off, seed in ((0, 1), (MiB, 1), (2 * MiB, 0)):
+    r = ctx.call(a, 'fpread_verify', timeout=60, h=h, off=off, length=MiB,
+                 seed=seed)
+    ctx.check(r['ok'] and r['ret'] is None,
+              f'read at {off} through the open descriptor: '
+              f'{r.get("err") or r.get("ret")}')
+  r = ctx.call(a, 'close', timeout=60, h=h)
+  ctx.check(r['ok'], f'close after the home died: {r.get("err")}')
+  ctx.cl.start_runtime(vh)
+  ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
+  time.sleep(3)
+  ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
+  ctx.cl.agents.pop(vh, None)
+  time.sleep(2)
+  for i in range(n):
+    g = ctx.ok(i, 'open', path=p, flags='r')
+    for off, seed in ((0, 1), (MiB, 1), (2 * MiB, 0), (3 * MiB, 0)):
+      mm = ctx.ok(i, 'fpread_verify', h=g, off=off, length=MiB, seed=seed)
+      ctx.check(mm is None, f'node{i} after the home returned, bytes at '
+                            f'{off}: {mm}')
+    st = ctx.ok(i, 'fstat', h=g)
+    ctx.check(st['size'] == 4 * MiB, f'node{i} size {st["size"]}')
+    ctx.ok(i, 'close', h=g)

@@ -301,6 +301,15 @@ public:
   clio::run::TaskResume SyncTag(clio::run::shared_ptr<SyncTagTask> &task);
 
   /**
+   * List this container's blobs whose names match a pattern, by tag id
+   * (Method::kListLocalBlobs). Shadow copies count only while they stand in
+   * for a dead owner (ServesBlob).
+   * @param task list task
+   */
+  clio::run::TaskResume ListLocalBlobs(
+      clio::run::shared_ptr<ListLocalBlobsTask> &task);
+
+  /**
    * Sync every non-volatile device holding a block of the named blobs
    * (primaries and durable replicas), all in parallel.
    * @param prefix "major.minor." key prefix of the tag
@@ -785,6 +794,25 @@ private:
    * (or racing behind) old ones still on disk before the next compaction.
    */
   std::atomic<clio::run::u64> next_wal_seq_{1};
+
+  /**
+   * Set when metadata the WAL does not record changes (a blob's score after
+   * its creation). FlushMetadata only rebuilds the full snapshot when it has
+   * to: to compact an oversized WAL, or -- at most every
+   * kSnapshotMaxAgeMs -- to persist such unlogged changes. Everything else
+   * is durable through the WAL, which every flush syncs.
+   */
+  std::atomic<bool> snapshot_dirty_{false};
+
+  /**
+   * On a fresh start, delete this container's metadata snapshot and WAL
+   * shards (metadata_log_path and its .blob.N / .tag.N / .tmp siblings), so
+   * nothing from the previous run can be replayed by a later start.
+   */
+  void DiscardPersistentMetadata();
+  /** Steady-clock time of the last full snapshot (ms since epoch of the
+   *  steady clock; 0 = none yet). */
+  std::atomic<clio::run::u64> last_snapshot_ms_{0};
 
   /**
    * Get access to configuration manager

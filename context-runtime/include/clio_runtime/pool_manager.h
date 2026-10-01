@@ -407,8 +407,8 @@ class PoolManager {
    *  @param path the log file  @return live entries */
   static std::vector<PoolLogEntry> ReadPoolLogFile(const std::string &path);
 
-  /** Forget every durable pool of this node: a fresh (non-restart) start
-   *  begins a new cluster lifetime. */
+  /** Forget every durable pool of this node and its address-table WAL: a
+   *  fresh (`start --fresh`) start begins a new cluster lifetime. */
   void ClearPoolLog();
 
   /** @return path of this node's pool log. */

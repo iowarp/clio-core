@@ -155,7 +155,7 @@ class RuntimeManager {
 
   /**
    * Check whether a graceful stop has been requested via RequestStop.
-   * Polled by the runtime main loop (clio_run start/restart).
+   * Polled by the runtime main loop (clio_run start).
    * @return true if a stop was requested
    */
   bool IsStopRequested() const;

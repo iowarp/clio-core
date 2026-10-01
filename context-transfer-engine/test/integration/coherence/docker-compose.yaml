@@ -54,7 +54,7 @@ x-coh-env: &coh-env
 x-coh-cmd: &coh-cmd >
   "
     echo \"Node $$NODE_ID: starting runtime\" &&
-    /workspace/build/bin/clio_run runtime start &
+    /workspace/build/bin/clio_run runtime start --fresh &
     RUNTIME_PID=$$! &&
     sleep 5 &&
     echo \"Node $$NODE_ID: running coherence suite\" &&

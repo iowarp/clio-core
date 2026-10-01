@@ -33,7 +33,7 @@ services:
     command: >
       "
         echo 'Node 1: Starting runtime...' &&
-        /workspace/build/bin/clio_run runtime start &
+        /workspace/build/bin/clio_run runtime start --fresh &
         RUNTIME_PID=\$! &&
         echo 'Node 1: Runtime started (PID \$RUNTIME_PID)' &&
         wait \$RUNTIME_PID
@@ -66,7 +66,7 @@ services:
     command: >
       "
         echo 'Node 2: Starting runtime...' &&
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
 
   # Node 3 - Inducted node (joins after cluster is up)
@@ -101,7 +101,7 @@ services:
         echo 'Node 3: Waiting 15s for initial cluster to start...' &&
         sleep 15 &&
         echo 'Node 3: Starting runtime with --induct...' &&
-        /workspace/build/bin/clio_run runtime start --induct
+        /workspace/build/bin/clio_run runtime start --fresh --induct
       "
 
 networks:

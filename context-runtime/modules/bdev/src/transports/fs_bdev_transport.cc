@@ -4,6 +4,7 @@
  */
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <clio_runtime/bdev/transports/fs_bdev_transport.h>
 #include <clio_ctp/introspect/system_info.h>
@@ -206,9 +207,10 @@ bool FsBdevTransport::Init(const CreateParams& params,
 }
 
 bool FsBdevTransport::OpenAllocLog(const CreateParams& params) {
-  // An explicit alloc_log always recovers. The default log recovers only on
-  // a runtime restart: a fresh start has no metadata referencing the old
-  // bytes, so their allocations are garbage and the log starts empty.
+  // An explicit alloc_log always recovers. The default log recovers on every
+  // recovering start (a plain `clio_run start`); after `start --fresh` no
+  // metadata references the old bytes, so their allocations are garbage and
+  // the log starts empty.
   const bool explicit_path = !params.alloc_log_path_.empty();
   const std::string path =
       explicit_path ? params.alloc_log_path_ : file_path_ + ".alloc_log";
@@ -347,6 +349,29 @@ bool FsBdevTransport::AllocateBlocks(size_t size, int worker_id, std::vector<Blo
   return true;
 }
 
+bool FsBdevTransport::GrowBackingFile(clio::run::u64 backed,
+                                      clio::run::u64 target) {
+  auto io = OpenBackingFile(io_depth_, file_path_);
+  if (!io) {
+    HLOG(kError, "EnsureFileBacked: failed to open {} to grow it", file_path_);
+    return false;
+  }
+  bool ok = io->Truncate(static_cast<size_t>(target));
+  if (ok) {
+    const int rrc = ReserveFileSpace(file_path_, backed, target);
+    if (rrc != 0) {
+      // Out of disk: undo the sparse growth so the file never claims space
+      // it does not have; the allocation fails as a full device.
+      HLOG(kWarning, "EnsureFileBacked: no disk space to grow {} to {} "
+           "bytes ({})", file_path_, target, std::strerror(rrc));
+      io->Truncate(static_cast<size_t>(backed));
+      ok = false;
+    }
+  }
+  io->Close();
+  return ok;
+}
+
 bool FsBdevTransport::EnsureFileBacked(clio::run::u64 end_offset) {
   // Fast path: recycled or low blocks are already inside the backed prefix.
   if (end_offset <= file_backed_bytes_.load(std::memory_order_acquire)) {
@@ -367,31 +392,33 @@ bool FsBdevTransport::EnsureFileBacked(clio::run::u64 end_offset) {
   if (capacity > 0 && target > capacity) {
     target = capacity;
   }
-  auto io = OpenBackingFile(io_depth_, file_path_);
-  if (!io) {
-    HLOG(kError, "EnsureFileBacked: failed to open {} to grow it", file_path_);
-    return false;
+  const clio::run::u64 now_ns = static_cast<clio::run::u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  if (grow_fail_end_ != 0 && end_offset >= grow_fail_end_ &&
+      now_ns - grow_fail_ns_ < kGrowRetryNs) {
+    return false;  // the disk was just found full: fail fast
   }
-  bool ok = io->Truncate(static_cast<size_t>(target));
-  if (ok) {
-    const int rrc = ReserveFileSpace(file_path_, backed, target);
-    if (rrc != 0) {
-      // Out of disk: undo the sparse growth so the file never claims space
-      // it does not have; the allocation fails as a full device.
-      HLOG(kWarning, "EnsureFileBacked: no disk space to grow {} to {} "
-           "bytes ({})", file_path_, target, std::strerror(rrc));
-      io->Truncate(static_cast<size_t>(backed));
-      ok = false;
-    }
+  // A whole growth unit first; if the disk cannot hold it, just what this
+  // allocation needs (the unit can be gigabytes more than what is left).
+  bool ok = GrowBackingFile(backed, target);
+  if (!ok && target > end_offset) {
+    target = end_offset;
+    ok = GrowBackingFile(backed, target);
   }
-  io->Close();
   if (!ok) {
+    if (grow_fail_end_ == 0 || end_offset < grow_fail_end_ ||
+        now_ns - grow_fail_ns_ >= kGrowRetryNs) {
+      grow_fail_end_ = end_offset;
+    }
+    grow_fail_ns_ = now_ns;
     HLOG(kError,
          "EnsureFileBacked: failed to grow {} from {} to {} bytes — treating "
          "as out of space",
-         file_path_, backed, target);
+         file_path_, backed, end_offset);
     return false;
   }
+  grow_fail_end_ = 0;
   HLOG(kDebug, "EnsureFileBacked: grew {} from {} to {} bytes", file_path_,
        backed, target);
   file_backed_bytes_.store(target, std::memory_order_release);

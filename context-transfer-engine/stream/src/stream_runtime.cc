@@ -38,6 +38,7 @@
  */
 
 #include <clio_cte/stream/stream_runtime.h>
+#include <clio_cte/core/blob_placement.h>
 
 #include <algorithm>
 #include <chrono>
@@ -91,8 +92,16 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   }
   OpenLog();
   if (is_restart_) {
-    CLIO_CO_AWAIT(FinishOpenPlans());
+    // Merge plans interrupted by the restart finish later, from the drain
+    // tick, once clio-fs has reconciled the restored streams: a stream whose
+    // file was truncated elsewhere meanwhile must drop its old plans, not
+    // replay them at their pre-crash offsets (see ReconcileRestored).
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      plans_pending_ = !open_plans_.empty();
+    }
     CLIO_CO_AWAIT(RecoverStaged());
+    if (plans_pending_) EnsureSequence();
   }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
@@ -177,6 +186,13 @@ void Runtime::Enqueue(PendingAppend p) {
   EnsureSequence();
 }
 
+clio::run::u32 Runtime::LiveHome(clio::run::u32 home) const {
+  // While the home's node is dead its successor serves the stream (the rule
+  // the CTE and the filesystem use for everything the home owns); sending to
+  // the dead node waits forever.
+  return clio::cte::core::FailoverContainer(pool_id_, home);
+}
+
 clio::run::TaskResume Runtime::Append(clio::run::shared_ptr<AppendTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->bytes_written_ = 0;
@@ -250,7 +266,8 @@ clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {
     }
     CLIO_CO_AWAIT(clio::run::yield(kFlushPollUs));
   }
-  auto s = self_.AsyncSizeOp(task->tag_id_, task->home_, StreamSizeOp::kGet);
+  auto s = self_.AsyncSizeOp(task->tag_id_, LiveHome(task->home_),
+                             StreamSizeOp::kGet);
   CLIO_CO_AWAIT(s);
   task->size_ = s->new_size_;
   task->return_code_ = s->GetReturnCode();
@@ -258,9 +275,30 @@ clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {
   CLIO_TASK_BODY_END
 }
 
+void Runtime::SyncLogPeriodically() {
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last_log_sync_ < std::chrono::milliseconds(kLogSyncPeriodMs)) {
+    return;
+  }
+  last_log_sync_ = now;
+  if (log_.Unsynced()) log_.Sync();
+}
+
 clio::run::TaskResume Runtime::Sequence(
     clio::run::shared_ptr<SequenceTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  {
+    bool finish = false;
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      if (plans_pending_ && (unverified_.empty() || !GatedAny())) {
+        plans_pending_ = false;
+        finish = true;
+      }
+    }
+    if (finish) CLIO_CO_AWAIT(FinishOpenPlans());
+  }
+  SyncLogPeriodically();
   const clio::run::u64 now = clio::cte::core::GetWallTimeNs();
   std::vector<PendingAppend> ready;
   {
@@ -334,8 +372,8 @@ clio::run::TaskResume Runtime::ShipChunk(
     }
     entries.push_back(std::move(e));
   }
-  auto f = self_.AsyncPlan(chunk->front().tag_, chunk->front().home_, entries,
-                           payload);
+  auto f = self_.AsyncPlan(chunk->front().tag_,
+                           LiveHome(chunk->front().home_), entries, payload);
   CLIO_CO_AWAIT(f);
   *ok = f->GetReturnCode() == 0;
   if (*ok) {

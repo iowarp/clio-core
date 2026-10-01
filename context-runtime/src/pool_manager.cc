@@ -46,11 +46,17 @@
 #include "clio_runtime/viz/viz_server.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <shared_mutex>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 // Global pointer variable definition for Pool manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::PoolManager, g_pool_manager);
@@ -1326,6 +1332,33 @@ bool GetStr(std::ifstream &i, std::string *v) {
   v->resize(n);
   return n == 0 || static_cast<bool>(i.read(&(*v)[0], n));
 }
+/**
+ * fsync a file and the directory holding it, so its contents and its name
+ * (a create or a rename onto it) survive power loss. Best effort: a failure
+ * is logged.
+ * @param path the file
+ */
+void SyncFileAndDir(const std::string &path) {
+#ifndef _WIN32
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    if (::fsync(fd) != 0) {
+      HLOG(kError, "PoolManager: fsync of {} failed: {}", path,
+           std::strerror(errno));
+    }
+    ::close(fd);
+  }
+  const std::string dir = std::filesystem::path(path).parent_path().string();
+  const int dfd = ::open(dir.empty() ? "." : dir.c_str(),
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dfd >= 0) {
+    (void)::fsync(dfd);
+    ::close(dfd);
+  }
+#else
+  (void)path;
+#endif
+}
 /** Write one record: [u8 op][u8 compose][PoolId][name][chimod][params]. */
 void PutRecord(std::ofstream &o, bool add, const PoolManager::PoolLogEntry &e) {
   const uint8_t op = add ? 1 : 0;
@@ -1360,6 +1393,10 @@ void PoolManager::LogPool(bool add, const PoolLogEntry &e) {
   }
   PutRecord(ofs, add, e);
   ofs.flush();
+  ofs.close();
+  // Pools change rarely; a pool created just before a power loss must not
+  // vanish with its data at the next start.
+  SyncFileAndDir(path);
 }
 
 std::vector<PoolManager::PoolLogEntry> PoolManager::ReadPoolLogFile(
@@ -1398,15 +1435,36 @@ std::vector<PoolManager::PoolLogEntry> PoolManager::LoadPoolLog() {
     std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
     for (const auto &e : live) PutRecord(ofs, true, e);
   }
+  // The compacted copy must be on disk before it replaces the log: renamed
+  // over it unsynced, a power loss could leave an empty log (every pool
+  // forgotten).
+  SyncFileAndDir(tmp);
   std::error_code ec;
   std::filesystem::rename(tmp, path, ec);
+  if (!ec) SyncFileAndDir(path);
   return live;
 }
 
 void PoolManager::ClearPoolLog() {
-  if (CLIO_CONFIG_MANAGER == nullptr) return;
+  auto *config_manager = CLIO_CONFIG_MANAGER;
+  if (config_manager == nullptr) return;
   std::error_code ec;
   std::filesystem::remove(PoolLogPath(), ec);
+  // This node's address-table WAL too (domain_table.<pool>.<node>.bin): a
+  // fresh start begins a new cluster lifetime, and a later recovering start
+  // must not remap containers from the previous one.
+  auto *ipc_manager = CLIO_IPC;
+  if (ipc_manager == nullptr) return;
+  const std::string suffix =
+      "." + std::to_string(ipc_manager->GetNodeId()) + ".bin";
+  const std::filesystem::path wal_dir = config_manager->GetConfDir() + "/wal";
+  for (const auto &ent : std::filesystem::directory_iterator(wal_dir, ec)) {
+    const std::string name = ent.path().filename().string();
+    if (name.rfind("domain_table.", 0) == 0 && name.size() > suffix.size() &&
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      std::filesystem::remove(ent.path(), ec);
+    }
+  }
 }
 
 }  // namespace clio::run
