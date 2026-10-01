@@ -932,10 +932,8 @@ endif()
 # COVERAGE AUDIT, so the next person can redo it in one command.
 #
 # Comparing every bench target declared under benchmark/ against everything
-# `ctest -N -V` shows a test invoking leaves 12 apparently uncovered:
+# `ctest -N -V` shows a test invoking leaves 6 apparently uncovered:
 #
-#   clio_*_bam_bench          (6)  excluded from the distributed gates by
-#                                  decision -- BaM is a storage baseline
 #   clio_*_paged_bench_sycl   (6)  FALSE POSITIVE. The SYCL gates build the
 #                                  binary name at RUNTIME (GVW_VARIANT=sycl
 #                                  appends _sycl), so ctest -N -V cannot see

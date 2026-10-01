@@ -27,7 +27,7 @@ config:
 
 vars:
   reg.workload: [lammps_md, gmx, lbann, grayscott, kmeans, weights]
-  reg.variant: [mpi, nccl, nvshmem, bam, kokkos, paged, sycl]
+  reg.variant: [mpi, nccl, nvshmem, kokkos, paged, sycl]
 
 loop:
   - [reg.workload]
@@ -45,7 +45,7 @@ post: |
   df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
   df = df[df.completed == 1]
   workloads = ['lammps_md', 'gmx', 'lbann', 'grayscott', 'kmeans', 'weights']
-  variants = ['mpi', 'nccl', 'nvshmem', 'bam', 'kokkos', 'paged', 'sycl']
+  variants = ['mpi', 'nccl', 'nvshmem', 'kokkos', 'paged', 'sycl']
   fig, axes = plt.subplots(1, 2, figsize=(15, 4.8))
   # Centre the group on the tick whatever the variant count is; a hardcoded
   # offset silently skews every bar when a variant is added.

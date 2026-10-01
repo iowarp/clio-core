@@ -3,18 +3,18 @@
 #
 # One SUBDIRECTORY per science workload, each holding every substrate
 # implementation of that workload (paged on the vector, plus mpi / nvshmem /
-# nccl / bam baselines where they exist -- a baseline links nothing from
+# nccl baselines where they exist -- a baseline links nothing from
 # clio, or it is not a baseline):
 #
-#   lammps_md/   LAMMPS melt        paged + mpi + nvshmem + nccl + bam
-#   gmx/         PME spread+gather  paged + mpi + nvshmem + nccl + bam
-#   lbann/       MLP training       paged + mpi + nvshmem + nccl + bam
-#   grayscott/   reaction-diffusion paged + mpi + nvshmem + nccl + bam
-#   kmeans/      k-means            paged + mpi + nvshmem + nccl + bam
-#   weights/     weight streaming   paged + mpi + nvshmem + nccl + bam
+#   lammps_md/   LAMMPS melt        paged + mpi + nvshmem + nccl
+#   gmx/         PME spread+gather  paged + mpi + nvshmem + nccl
+#   lbann/       MLP training       paged + mpi + nvshmem + nccl
+#   grayscott/   reaction-diffusion paged + mpi + nvshmem + nccl
+#   kmeans/      k-means            paged + mpi + nvshmem + nccl
+#   weights/     weight streaming   paged + mpi + nvshmem + nccl
 #
-# ALL SIX CARRY ALL FIVE SUBSTRATES. This list said "paged" only for five of
-# them long after the mpi/nvshmem/bam editions landed, and the nccl column
+# ALL SIX CARRY ALL FOUR SUBSTRATES. This list said "paged" only for five of
+# them long after the mpi/nvshmem editions landed, and the nccl column
 # was genuinely lammps_md-only until the five NCCL editions were written --
 # which is how a "compare paged against MPI/NVSHMEM/NCCL" campaign ran for
 # weeks with no NCCL number for five of its six workloads. Keep this table

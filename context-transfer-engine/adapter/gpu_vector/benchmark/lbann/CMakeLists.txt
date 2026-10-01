@@ -209,51 +209,6 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_NVSHMEM)
     endif()
 endif()
 
-#------------------------------------------------------------------------------
-# lbann, BaM edition: compiles BaM's sources itself with nvcc (clang rejects
-# --expt-relaxed-constexpr, see the lammps_md sibling).
-#------------------------------------------------------------------------------
-if(CLIO_CORE_ENABLE_CUDA AND EXISTS ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu)
-    find_program(MD_BAM_NVCC nvcc
-        HINTS ${CUDAToolkit_BIN_DIR} ENV CUDA_HOME
-        PATH_SUFFIXES bin)
-    if(MD_BAM_NVCC)
-        set(_arch_flags "")
-        foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
-            string(REGEX REPLACE "-(real|virtual)$" "" _arch "${_arch}")
-            list(APPEND _arch_flags "-gencode=arch=compute_${_arch},code=sm_${_arch}")
-        endforeach()
-        if(NOT _arch_flags)
-            list(APPEND _arch_flags "-arch=sm_80")
-        endif()
-        set(_out ${CMAKE_BINARY_DIR}/bin/clio_lbann_bam_bench)
-        set(_src ${CMAKE_CURRENT_SOURCE_DIR}/clio_lbann_bam_bench.cc)
-        add_custom_command(
-            OUTPUT ${_out}
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
-            COMMAND ${MD_BAM_NVCC}
-                -x cu -std=c++17 -O3 -rdc=true --expt-relaxed-constexpr
-                ${_arch_flags}
-                -I${CMAKE_SOURCE_DIR}/external/bam/include
-                ${_src}
-                ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
-                -o ${_out}
-            DEPENDS ${_src}
-                ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
-            COMMENT "Building clio_lbann_bam_bench (nvcc + BaM page cache)"
-            VERBATIM)
-        add_custom_target(clio_lbann_bam_bench ALL DEPENDS ${_out})
-        install(PROGRAMS ${_out} DESTINATION bin)
-        message(STATUS "lbann BaM baseline: ON")
-    endif()
-endif()
-
 
 #------------------------------------------------------------------------------
 # LBANN MLP training over a paged model -- SYCL.

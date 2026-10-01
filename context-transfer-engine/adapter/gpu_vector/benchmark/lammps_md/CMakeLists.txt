@@ -1,11 +1,10 @@
 #------------------------------------------------------------------------------
-# lammps_md: the from-scratch LAMMPS-melt reimplementation, on five substrates.
+# lammps_md: the from-scratch LAMMPS-melt reimplementation, on four substrates.
 #
 #   paged    all state device-canonical on paged vectors (design: adapter/gpu_vector/eternia.md)
 #   nvshmem  symmetric heap, one-sided in-kernel RMA        (links nothing from clio)
 #   mpi      two-sided, host-staged halo exchange           (links nothing from clio)
 #   nccl     halo + migrants via ncclSend/Recv on device ptrs
-#   bam      capacity sibling: Verlet list behind BaM's GPU page cache
 #
 # The baselines are built by NVCC through custom rules rather than
 # add_cuda_executable(), and the reason is not style: NVSHMEM's device library
@@ -248,55 +247,6 @@ if(CLIO_CORE_ENABLE_CUDA)
         endif()
     else()
         message(STATUS "MPI not found; skipping clio_lammps_md_mpi_bench")
-    endif()
-endif()
-
-#------------------------------------------------------------------------------
-# BaM edition: the capacity sibling. Compiles BaM's sources ITSELF with nvcc
-# because external/bam passes --expt-relaxed-constexpr, which clang rejects.
-#------------------------------------------------------------------------------
-if(CLIO_CORE_ENABLE_CUDA AND EXISTS ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu)
-    find_program(MD_BAM_NVCC nvcc
-        HINTS ${CUDAToolkit_BIN_DIR} ENV CUDA_HOME
-        PATH_SUFFIXES bin)
-    if(MD_BAM_NVCC)
-        set(_bam_arch_flags "")
-        foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
-            string(REGEX REPLACE "-(real|virtual)$" "" _arch "${_arch}")
-            list(APPEND _bam_arch_flags "-gencode=arch=compute_${_arch},code=sm_${_arch}")
-        endforeach()
-        if(NOT _bam_arch_flags)
-            list(APPEND _bam_arch_flags "-arch=sm_80")
-        endif()
-        set(_bam_out ${CMAKE_BINARY_DIR}/bin/clio_lammps_md_bam_bench)
-        set(_bam_src ${CMAKE_CURRENT_SOURCE_DIR}/clio_lammps_md_bam_bench.cc)
-        add_custom_command(
-            OUTPUT ${_bam_out}
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
-            COMMAND ${MD_BAM_NVCC}
-                -x cu -std=c++17 -O3 -rdc=true --expt-relaxed-constexpr
-                ${_bam_arch_flags}
-                -I${CMAKE_SOURCE_DIR}/external/bam/include
-                ${_bam_src}
-                ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
-                -o ${_bam_out}
-            DEPENDS ${_bam_src}
-                ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/include/bam/array.cuh
-                ${CMAKE_SOURCE_DIR}/external/bam/include/bam/page_cache.cuh
-                ${CMAKE_SOURCE_DIR}/external/bam/include/bam/types.h
-                ${CMAKE_SOURCE_DIR}/external/bam/include/bam/page_cache_host.h
-            COMMENT "Building clio_lammps_md_bam_bench (nvcc + BaM page cache)"
-            VERBATIM)
-        add_custom_target(clio_lammps_md_bam_bench ALL DEPENDS ${_bam_out})
-        install(PROGRAMS ${_bam_out} DESTINATION bin)
-        message(STATUS "lammps_md BaM baseline: ON")
     endif()
 endif()
 
