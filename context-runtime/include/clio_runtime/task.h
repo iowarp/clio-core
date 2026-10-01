@@ -952,6 +952,15 @@ class RunContext {
   char response_identity_[64];     /**< ZMQ echo-back identity (fallback path) */
   u32 response_identity_len_;
   int response_fd_;                /**< Socket fd for routing response (IPC) */
+  /** Client identity for TCP dial-back DEALER routing. Captured at RecvIn
+   *  (from the incoming ROUTER's identity frame) so SendOut can evict the
+   *  cached dial-back connection when a response is undeliverable (issue #722).
+   *  Empty for IPC responses (which use response_fd_). */
+  std::string client_identity_;
+  /** Client's response-listener port (SaveTaskArchive::client_port_). Used by
+   *  SendOut to evict the cached dial-back DEALER when the client is
+   *  unreachable (issue #722). Only meaningful for TCP responses. */
+  int client_response_port_;
   /** #722 bounded-drop of an undeliverable client response. When SendOut's
    *  network Send keeps failing (a client that submitted over TCP/IPC then
    *  disconnected), these bound the re-queue: after kMaxClientResponseRetries
@@ -1021,6 +1030,7 @@ class RunContext {
         response_transport_(nullptr),
         response_identity_len_(0),
         response_fd_(-1),
+        client_response_port_(0),
         send_fail_count_(0),
         gpu_task_device_ptr_(0),
         gpu_task_size_(0),

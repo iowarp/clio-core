@@ -152,6 +152,11 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       if (mode == IpcMode::kTcp) {
         const std::string &identity = recv_info.identity_;
         int client_port = archive.client_port_;
+        // Store for later eviction (issue #722): if SendOut exhausts retries
+        // to deliver the response, EvictClientByIdentity removes the cached
+        // dial-back connection so a retry gets a fresh connection.
+        future_shm->client_identity_ = identity;
+        future_shm->client_response_port_ = client_port;
         // Fast path: open (or reuse) a dedicated dial-back DEALER to the
         // client's ephemeral response listener at <identity-host>:<client_port>
         // and route the response there, off the inbound ROUTER's sock_mtx_. A
@@ -382,6 +387,13 @@ bool IpcCpu2CpuZmq::SendOut(
                "for pid {} after {} retries / {}s (last rc={}, priority={})",
                future_shm->client_pid_, future_shm->send_fail_count_,
                elapsed_sec, rc, static_cast<int>(priority));
+          // Evict the cached dial-back DEALER for this client (issue #722).
+          // The next SendOut attempt will create a fresh connection, giving
+          // the client another chance to respond.
+          if (mode == IpcMode::kTcp && !future_shm->client_identity_.empty()) {
+            ipc->EvictClientByIdentity(future_shm->client_identity_,
+                                       future_shm->client_response_port_);
+          }
           continue;
         }
         // Bounded retry: re-enqueue, but at kDebug (rate-limited) so a transient

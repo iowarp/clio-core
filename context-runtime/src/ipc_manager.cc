@@ -385,6 +385,15 @@ bool IpcManager::ClientInit() {
   auto *tls_counter = new TaskCounter();
   CTP_THREAD_MODEL->SetTls(chi_task_counter_key_, tls_counter);
 
+  // CLIO_WAIT_SERVER is read once, here. WaitForLocalServer used to re-read
+  // it on every call, which overrode the short per-attempt caps the
+  // reconnect paths set -- a client with CLIO_WAIT_SERVER=60 spent a full
+  // minute per reconnect attempt against a dead runtime.
+  // Semantics: 0 = fail immediately, -1 = wait forever, >0 = seconds.
+  if (const char *wait_env = clio::run::env::GetCompat("WAIT_SERVER")) {
+    wait_server_timeout_ = static_cast<float>(std::atof(wait_env));
+  }
+
   // Wait for local server using lightbeam transport
   if (!WaitForLocalServer()) {
     HLOG(kError, "CRITICAL ERROR: Cannot connect to local server.");
@@ -608,16 +617,20 @@ bool IpcManager::ServerInit() {
   // ManyToOne collective batch/aggregation manager (leader-side).
   batch_manager_ = std::make_unique<BatchManager>(this);
 
-  // Create lightbeam transports for client task reception
+  // Create lightbeam transports for client task reception.
+  // This is all-or-nothing: ServerInit fails if ANY bind fails. The port
+  // cluster is: base (main ROUTER), base+1 (local), base+3 (client ROUTER).
+  // A partial bind leaves the runtime half-initialized and unusable (issue
+  // #725).
   {
     u32 port = config->GetPort();
+    std::string router_bind = DefaultServerBindAddr();
 
     try {
       // TCP ROUTER server on port+3. Bind via DefaultServerBindAddr so it
       // honors CLIO_BIND_ADDR / loopback-under-test-mode and never defaults to
       // 0.0.0.0 (which trips the Windows Defender Firewall prompt on the ROUTER
       // port even when the main server is on loopback).
-      std::string router_bind = DefaultServerBindAddr();
       if (UseLocalZmqIpc()) {
         // macOS (issue #482): bind the local client ROUTER on an ipc:// unix
         // socket so replies route reliably; same-host clients connect their
@@ -636,9 +649,21 @@ bool IpcManager::ServerInit() {
         HLOG(kInfo, "IpcManager: TCP ROUTER transport bound on {}:{}",
              router_bind, port + 3);
       }
+      if (!client_tcp_transport_) {
+        HLOG(kError,
+             "IpcManager::ServerInit: failed to bind the client ROUTER on "
+             "port {} (base+3). The runtime needs ports {}, {} and {} "
+             "together; refusing to start half-bound.",
+             port + 3, port, port + 1, port + 3);
+        return false;
+      }
     } catch (const std::exception &e) {
-      HLOG(kError, "IpcManager::ServerInit: Failed to bind TCP server: {}",
-           e.what());
+      HLOG(kError,
+           "IpcManager::ServerInit: failed to bind the client ROUTER on port "
+           "{} (base+3): {}. The runtime needs ports {}, {} and {} together; "
+           "refusing to start half-bound.",
+           port + 3, e.what(), port, port + 1, port + 3);
+      return false;
     }
 
     try {
@@ -652,9 +677,19 @@ bool IpcManager::ServerInit() {
           ipc_path, ctp::lbm::TransportType::kSocket,
           ctp::lbm::TransportMode::kServer, "ipc", 0);
       HLOG(kInfo, "IpcManager: IPC lightbeam server bound on {}", ipc_path);
+      if (!client_ipc_transport_) {
+        HLOG(kError,
+             "IpcManager::ServerInit: failed to bind the IPC server at {}; "
+             "refusing to start half-bound.",
+             ipc_path);
+        return false;
+      }
     } catch (const std::exception &e) {
-      HLOG(kError, "IpcManager::ServerInit: Failed to bind IPC server: {}",
+      HLOG(kError,
+           "IpcManager::ServerInit: failed to bind the IPC server: {}; "
+           "refusing to start half-bound.",
            e.what());
+      return false;
     }
   }
 
@@ -1450,12 +1485,17 @@ bool IpcManager::ClientInitQueues() {
 
 bool IpcManager::StartLocalServer() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
+  std::string addr = "127.0.0.1";
+  u32 port = config->GetPort() + 1;
 
   try {
-    // Start local ZeroMQ server using CTP Lightbeam
-    std::string addr = "127.0.0.1";
+    // Bind the local server (base+1) for shared-memory client queue ingestion.
+    // This claim decides which process becomes the runtime: failing to bind
+    // is the normal outcome for every process after the first, so it is NOT
+    // an error here. ServerInit turns it into "this process is not the
+    // runtime". A foreign process squatting on base+1 looks the same, which
+    // is why the message names the port.
     std::string protocol = "tcp";
-    u32 port = config->GetPort() + 1;  // Use ZMQ port + 1 for local server
 
     local_transport_ = ctp::lbm::TransportFactory::Get(
         addr, ctp::lbm::TransportType::kZeroMq,
@@ -1466,22 +1506,25 @@ bool IpcManager::StartLocalServer() {
       return true;
     }
 
-    HLOG(kError, "Failed to start local server at {}:{}", addr, port);
+    HLOG(kInfo,
+         "IpcManager::StartLocalServer: could not bind local server port "
+         "{}:{} (base+1 of the runtime port cluster). Either another runtime "
+         "already owns this port, or a foreign process holds it -- in the "
+         "latter case pick a different networking.port / CLIO_PORT.",
+         addr, port);
     return false;
   } catch (const std::exception &e) {
-    HLOG(kError, "Exception starting local server: {}", e.what());
+    HLOG(kInfo,
+         "IpcManager::StartLocalServer: could not bind local server port "
+         "{}:{} (base+1 of the runtime port cluster): {}",
+         addr, port, e.what());
     return false;
   }
 }
 
 bool IpcManager::WaitForLocalServer() {
-  // Read environment variables for wait configuration
-  // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds
-  const char *wait_env = clio::run::env::GetCompat("WAIT_SERVER");
-  if (wait_env != nullptr) {
-    wait_server_timeout_ = static_cast<float>(std::atof(wait_env));
-  }
-
+  // wait_server_timeout_: CLIO_WAIT_SERVER (read in ClientInit), or a
+  // caller's temporary cap. 0 = fail immediately, -1 = forever, >0 = seconds.
   HLOG(kInfo, "Waiting for runtime via lightbeam (timeout={}s)",
        wait_server_timeout_);
 
@@ -2498,6 +2541,26 @@ void IpcManager::ClearClientPool() {
   client_pool_.clear();
 }
 
+void IpcManager::EvictClientByIdentity(const std::string &key_id, int port) {
+  /**
+   * Evict cached dial-back DEALER from client_conn_cache_ when a client
+   * response has been dropped as undeliverable (issue #722).
+   *
+   * The cache key is computed the same way as GetOrCreateClientByIdentity:
+   * hash of (identity + port). Removing it forces the next SendOut attempt
+   * to create a fresh dial-back connection.
+   */
+  size_t hkey = std::hash<std::string>{}(key_id + ":" + std::to_string(port));
+
+  std::lock_guard<std::mutex> lock(client_pool_mutex_);
+  if (ctp::lbm::Transport **found = client_conn_cache_.find(hkey)) {
+    client_conn_cache_.erase(hkey);
+    HLOG(kInfo,
+         "[ConnCache] Evicted dead client connection (id={}, port={}, key={})",
+         key_id, port, hkey);
+  }
+}
+
 // CLIO_NET_QPROF=1: how long a task sits on a net_queue_ priority lane between
 // EnqueueNetTask and the net worker popping it. This is queue+wakeup latency
 // only -- serialization and the wire are measured separately by CLIO_NET_TRACE.
@@ -3121,6 +3184,8 @@ size_t IpcManager::ClearUserIpcs() {
     }
   }
 
+  u32 our_port = CLIO_CONFIG_MANAGER ? CLIO_CONFIG_MANAGER->GetPort() : 9413;
+
   for (const auto &name : ctp::SystemInfo::ListDirectory(memfd_dir)) {
     std::string full_path = memfd_dir + "/" + name;
 
@@ -3155,6 +3220,11 @@ size_t IpcManager::ClearUserIpcs() {
     // its contents instead. Keep it while that runtime is alive: it is the
     // only handle `clio_run stop` has on a co-resident runtime whose segments
     // are not /proc symlinks (macOS/BSD).
+    //
+    // Issue #877: also check if files belong to OTHER PORTS. Only delete files
+    // from a different port if that port's pid record names a dead process.
+    // This prevents ClearUserIpcs from deleting segments owned by a different
+    // (still-running) runtime on a different port.
     if (name.rfind(kRuntimePidRecordPrefix, 0) == 0) {
       std::ifstream pid_file(full_path);
       CTP_MSAN_UNPOISON_OBJ(pid_file);  // stream state is libstdc++.so's
@@ -3167,6 +3237,38 @@ size_t IpcManager::ClearUserIpcs() {
           HLOG(kDebug, "ClearUserIpcs: keeping {} (runtime pid {} alive)", name,
                owner_pid);
           continue;
+        }
+      }
+    } else {
+      // Issue #877: a file named for ANOTHER port belongs to that port's
+      // runtime. Keep it while that runtime's pid record names a live
+      // process; only a dead (or record-less) owner's files are swept.
+      // Segment and socket names end in "_<port>" (optionally ".ipc"); the
+      // client ROUTER socket is keyed on base+3, so try both readings.
+      size_t last_underscore = name.rfind('_');
+      if (last_underscore != std::string::npos) {
+        const char *digits = name.c_str() + last_underscore + 1;
+        char *end = nullptr;
+        unsigned long file_port = std::strtoul(digits, &end, 10);
+        bool parsed = (end != digits) && (*end == '\0' || *end == '.');
+        if (parsed && file_port > 0 && file_port != our_port &&
+            file_port != our_port + 3) {
+          bool live_owner = false;
+          for (unsigned long base : {file_port, file_port - 3}) {
+            if (base == 0 || base > 65535) continue;
+            int owner_pid = ReadRuntimePidRecord(static_cast<u32>(base));
+            if (owner_pid > 0 && ctp::SystemInfo::IsProcessAlive(owner_pid)) {
+              live_owner = true;
+              break;
+            }
+          }
+          if (live_owner) {
+            HLOG(kDebug,
+                 "ClearUserIpcs: keeping {} (owned by a live runtime on "
+                 "another port)",
+                 name);
+            continue;
+          }
         }
       }
     }
@@ -3320,6 +3422,14 @@ bool IpcManager::ReconnectToOriginalHost() {
   HLOG(kInfo, "ReconnectToOriginalHost: Attempting to reconnect to restarted server");
 
   if (ipc_mode_ == IpcMode::kShm) {
+    // Confirm a server actually answers BEFORE touching shared memory, the
+    // same order ClientInit uses. A runtime that died without cleanup leaves
+    // its segment files behind (always on Windows, where they are plain
+    // files), so ClientInitShm would happily attach a dead runtime's
+    // segments and the RegisterMemory round trip below would wait forever --
+    // a client whose runtime died hung instead of failing (#722).
+    if (!WaitForLocalServer()) return false;
+
     // Detach old shared memory (don't destroy — server owns it)
     main_allocator_ = nullptr;
     worker_queues_ = ctp::ipc::FullPtr<TaskQueue>();
@@ -3346,8 +3456,20 @@ bool IpcManager::ReconnectToOriginalHost() {
       auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
           clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
           alloc_id);
-      IpcCpu2CpuZmq::SendIn(this,reg_task, IpcMode::kTcp).Wait();
+      // Bounded: the server can die again between the probe above and here.
+      if (!IpcCpu2CpuZmq::SendIn(this, reg_task, IpcMode::kTcp)
+               .Wait(wait_server_timeout_)) {
+        HLOG(kWarning,
+             "ReconnectToOriginalHost: RegisterMemory got no reply within "
+             "{}s",
+             wait_server_timeout_);
+        return false;
+      }
     }
+    server_alive_.store(true, std::memory_order_release);
+    HLOG(kInfo, "ReconnectToOriginalHost: Reconnected, new generation={}",
+         client_generation_);
+    return true;
   }
 
   // For TCP mode the original WaitForLocalServer DEALER may have died
@@ -3474,7 +3596,7 @@ bool IpcManager::ReconnectToNewHost(const std::string &new_addr) {
 }
 
 bool IpcManager::WaitForServerAndReconnect(
-    std::chrono::steady_clock::time_point start) {
+    std::chrono::steady_clock::time_point start, float max_sec) {
   // Guard against recursive re-entry (WaitForLocalServer → Recv → here)
   reconnecting_.store(true, std::memory_order_release);
 
@@ -3494,6 +3616,15 @@ bool IpcManager::WaitForServerAndReconnect(
         HLOG(kWarning, "WaitForServerAndReconnect: Original server timed out "
              "after {}s", elapsed);
         break;
+      }
+      // Issue #1096: thread max_sec through reconnect so timed waits return
+      // (false) when the deadline elapses.
+      if (max_sec > 0 && elapsed >= max_sec) {
+        HLOG(kWarning, "WaitForServerAndReconnect: max_sec timeout "
+             "after {}s", elapsed);
+        wait_server_timeout_ = saved_timeout;
+        reconnecting_.store(false, std::memory_order_release);
+        return false;
       }
       CTP_THREAD_MODEL->SleepForUs(1000000);
       if (ReconnectToOriginalHost()) {
@@ -3555,6 +3686,17 @@ bool IpcManager::WaitForServerAndReconnect(
        "WaitForServerAndReconnect: trying up to {} host(s), leader-first: {}",
        client_try_new_servers_, candidates.front());
   for (int i = 0; i < client_try_new_servers_; ++i) {
+    // Issue #1096: check max_sec timeout in Phase 2 as well
+    float elapsed =
+        std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
+            .count();
+    if (max_sec > 0 && elapsed >= max_sec) {
+      HLOG(kWarning, "WaitForServerAndReconnect: max_sec timeout "
+           "after {}s", elapsed);
+      reconnecting_.store(false, std::memory_order_release);
+      return false;
+    }
+
     const std::string &addr = candidates[i % candidates.size()];
     HLOG(kInfo, "WaitForServerAndReconnect: Trying {}/{}: {}",
          i + 1, client_try_new_servers_, addr);

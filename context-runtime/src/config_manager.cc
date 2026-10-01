@@ -184,6 +184,16 @@ void ConfigManager::ApplyEnvOverrides() {
     }
   }
 
+  // Check CLIO_IPC_NAMESPACE env var (overrides YAML config, issue #877).
+  // Appended to all shared memory segment names to allow multiple independent
+  // runtimes to coexist with the same ${USER}.
+  if (const char *env = clio::run::env::GetCompat("IPC_NAMESPACE")) {
+    std::string ns_env(env);
+    if (!ns_env.empty()) {
+      ipc_namespace_ = ns_env;
+    }
+  }
+
   // CLIO_NUM_THREADS overrides the configured worker-thread count (last word,
   // after any config file). Useful for forcing a single worker, e.g. to test
   // whether a failure depends on cross-thread task migration.
@@ -392,8 +402,14 @@ ConfigManager::GetSharedMemorySegmentName(MemorySegment segment,
   // segment (the fallback client attaching the main runtime's segments).
   u32 name_port = (port != 0) ? port : port_;
   // Use CTP's ExpandPath to resolve environment variables
-  return ctp::ConfigParse::ExpandPath(segment_name) + "_" +
-         std::to_string(name_port);
+  std::string result = ctp::ConfigParse::ExpandPath(segment_name) + "_" +
+                       std::to_string(name_port);
+  // Append optional IPC namespace suffix (issue #877) to allow multiple
+  // independent runtimes with the same ${USER}.
+  if (!ipc_namespace_.empty()) {
+    result += "_" + ipc_namespace_;
+  }
+  return result;
 }
 
 std::string ConfigManager::GetHostfilePath() const {
@@ -423,6 +439,7 @@ void ConfigManager::LoadDefault() {
   client_data_segment_name_ = "chi_client_data_segment_${USER}";
   metadata_segment_name_ = "chi_metadata_segment_${USER}";
   metadata_segment_size_ = 0;  // 0 means auto-calculate
+  ipc_namespace_.clear();      // no per-instance segment suffix
 
   // Set default hostfile path (empty means no networking/distributed mode)
   hostfile_path_ = "";
@@ -499,6 +516,12 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     // hosts can back. On Windows CI, CreateFileMapping cannot reserve it and
     // the runtime falls back to the no-cache path, silently disabling the
     // feature — with no way to ask for a smaller segment instead.
+    // Optional per-instance suffix for the shared-memory segment names
+    // (issue #877). Segment names already carry the user and the port; this
+    // separates two runtimes that must share both. CLIO_IPC_NAMESPACE wins.
+    if (runtime["ipc_namespace"]) {
+      ipc_namespace_ = runtime["ipc_namespace"].as<std::string>();
+    }
     if (runtime["metadata_segment_size"]) {
       size_t parsed = 0;
       if (ParseSegmentSizeNode(runtime["metadata_segment_size"],

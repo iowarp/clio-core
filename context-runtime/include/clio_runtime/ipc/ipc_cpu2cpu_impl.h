@@ -208,7 +208,8 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     // the client parked here forever, since a dead server can never set
     // FUTURE_COMPLETE. The 1s heartbeat flips server_alive_; hand the future
     // to the ZMQ RecvOut, whose kClientShm-origin head implements the
-    // reconnect/failover + resend path.
+    // reconnect/failover + resend path. Thread max_sec through so timed waits
+    // respect the deadline.
     if (!ipc->server_alive_.load(std::memory_order_acquire) &&
         !ipc->reconnecting_.load()) {
       HLOG(kWarning,
