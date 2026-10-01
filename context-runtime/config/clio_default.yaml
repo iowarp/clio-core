@@ -394,6 +394,15 @@ compose:
   #   pool_query: local
   #   pool_id: "562.0"
   #   next_pool_id: "561.0"             # replication pool — see entry above
+  #   # Steer each tag's compressed copy toward the node that last read it
+  #   # (consumer tracking). false = always place by hash of the tag id.
+  #   tracking_enabled: true            # default: true
+  #
+  # Codec choice is per put, via Context::dynamic_compress_:
+  #   0 kCompressSkip     store uncompressed
+  #   1 kCompressStatic   use exactly compress_lib_/compress_preset_ — the
+  #                       autoselection models are bypassed
+  #   2 kCompressDynamic  the models (Q-table / LinReg predictors) choose
 
   # === Indexer (SemanticSearch index, issue #905) ===
   # Search layer: owns the term index that serves Method::kSemanticSearch

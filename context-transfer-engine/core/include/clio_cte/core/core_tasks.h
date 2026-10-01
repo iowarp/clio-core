@@ -1679,6 +1679,15 @@ struct BlobReaderDrainGuard {
 };
 #endif  // CTP_IS_HOST
 
+/** Context::dynamic_compress_: store the blob uncompressed. */
+GLOBAL_CROSS_CONST int kCompressSkip = 0;
+/** Context::dynamic_compress_: compress with exactly compress_lib_ (and
+ *  compress_preset_); codec autoselection is bypassed. */
+GLOBAL_CROSS_CONST int kCompressStatic = 1;
+/** Context::dynamic_compress_: let the compressor's models choose the codec
+ *  (overwrites compress_lib_/compress_preset_). */
+GLOBAL_CROSS_CONST int kCompressDynamic = 2;
+
 /**
  * Context structure for workflow-aware compression
  * Provides metadata for compression decision-making
@@ -1845,7 +1854,7 @@ struct Context {
    */
   clio::run::u64 generation_;
 
-  int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
+  int dynamic_compress_;  // kCompressSkip / kCompressStatic / kCompressDynamic
   int compress_lib_;      // The compression library to apply (0-10)
   int compress_preset_;   // Compression preset: 1=FAST, 2=BALANCED, 3=BEST
                           // (default=2)
