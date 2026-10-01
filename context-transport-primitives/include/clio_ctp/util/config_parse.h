@@ -259,9 +259,13 @@ class ConfigParse {
   }
 
   /** Expands all environment variables in a path string.
-   *  Special case: ${HOME} on Windows falls back to USERPROFILE via
-   *  SystemInfo::GetHomeDir(), so YAML configs written against the POSIX
-   *  convention keep working without forcing every user to set HOME. */
+   *  Special cases:
+   *    - ${HOME}: on Windows falls back to USERPROFILE via
+   *      SystemInfo::GetHomeDir(), so YAML configs written against the POSIX
+   *      convention keep working without forcing every user to set HOME.
+   *    - ${USER}: falls back to USERNAME (Windows) or LOGNAME (POSIX) if USER
+   *      is unset, keeping cross-platform config compatibility (issue #877).
+   *    - ${CLIO_STORAGE_ROOT}: defaults to <home>/.clio when unset (#551). */
   static std::string ExpandPath(std::string path) {
     size_t pos = 0;
     while ((pos = path.find("${", pos)) != std::string::npos) {
@@ -275,6 +279,29 @@ class ConfigParse {
       // would otherwise contradict.
       if (env_name == "HOME") {
         env_val = ctp::SystemInfo::GetHomeDir();
+      } else if (env_name == "CLIO_STORAGE_ROOT") {
+        // Storage root for on-disk runtime state (issue #551): set by
+        // `clio_run start --disk <path>` or the environment, else the
+        // historical <home>/.clio.
+        env_val = ctp::SystemInfo::Getenv(
+            "CLIO_STORAGE_ROOT", ctp::Unit<size_t>::Megabytes(1));
+        if (env_val.empty()) {
+          env_val = ctp::SystemInfo::GetHomeDir() + "/.clio";
+        }
+      } else if (env_name == "USER") {
+        // Fall back to USERNAME (Windows) or LOGNAME (POSIX) if USER is unset
+        // (issue #877). This keeps configs portable across platforms where USER
+        // may not be defined but USERNAME or LOGNAME is.
+        env_val = ctp::SystemInfo::Getenv(
+            "USER", ctp::Unit<size_t>::Megabytes(1));
+        if (env_val.empty()) {
+          env_val = ctp::SystemInfo::Getenv(
+              "USERNAME", ctp::Unit<size_t>::Megabytes(1));
+        }
+        if (env_val.empty()) {
+          env_val = ctp::SystemInfo::Getenv(
+              "LOGNAME", ctp::Unit<size_t>::Megabytes(1));
+        }
       } else {
         env_val = ctp::SystemInfo::Getenv(
             env_name.c_str(), ctp::Unit<size_t>::Megabytes(1));

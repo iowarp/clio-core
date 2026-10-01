@@ -414,3 +414,48 @@ TEST_CASE("rm_char - Empty string") {
   ConfigParse::rm_char(str, 'x');
   REQUIRE(str == "");
 }
+
+//------------------------------------------------------------------------------
+// ExpandPath special variables
+//------------------------------------------------------------------------------
+
+TEST_CASE("ExpandPath - CLIO_STORAGE_ROOT override and default (#551)") {
+  std::string saved = ctp::SystemInfo::Getenv("CLIO_STORAGE_ROOT");
+
+  ctp::SystemInfo::Setenv("CLIO_STORAGE_ROOT", "/data/clio_root", 1);
+  REQUIRE(ConfigParse::ExpandPath("${CLIO_STORAGE_ROOT}/cte_metadata_log") ==
+          "/data/clio_root/cte_metadata_log");
+
+  // Unset: the historical <home>/.clio, never an empty prefix that would put
+  // runtime state at the filesystem root.
+  ctp::SystemInfo::Unsetenv("CLIO_STORAGE_ROOT");
+  REQUIRE(ConfigParse::ExpandPath("${CLIO_STORAGE_ROOT}/x") ==
+          ctp::SystemInfo::GetHomeDir() + "/.clio/x");
+
+  if (!saved.empty()) {
+    ctp::SystemInfo::Setenv("CLIO_STORAGE_ROOT", saved, 1);
+  }
+}
+
+TEST_CASE("ExpandPath - USER falls back to USERNAME (#877)") {
+  std::string saved_user = ctp::SystemInfo::Getenv("USER");
+  std::string saved_username = ctp::SystemInfo::Getenv("USERNAME");
+
+  ctp::SystemInfo::Unsetenv("USER");
+  ctp::SystemInfo::Setenv("USERNAME", "clio_test_user", 1);
+  REQUIRE(ConfigParse::ExpandPath("seg_${USER}") == "seg_clio_test_user");
+
+  ctp::SystemInfo::Setenv("USER", "posix_user", 1);
+  REQUIRE(ConfigParse::ExpandPath("seg_${USER}") == "seg_posix_user");
+
+  if (saved_user.empty()) {
+    ctp::SystemInfo::Unsetenv("USER");
+  } else {
+    ctp::SystemInfo::Setenv("USER", saved_user, 1);
+  }
+  if (saved_username.empty()) {
+    ctp::SystemInfo::Unsetenv("USERNAME");
+  } else {
+    ctp::SystemInfo::Setenv("USERNAME", saved_username, 1);
+  }
+}

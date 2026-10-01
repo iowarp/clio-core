@@ -45,13 +45,19 @@ std::string Runtime::MakePerfStatsPath(const std::string &pool_name) {
   if (ctp::SystemInfo::Getenv("CLIO_BDEV_PERSIST_STATS") == "0") {
     return std::string();
   }
+  // CLIO_BDEV_STATS_DIR wins if set (explicit override).
   std::string dir = ctp::SystemInfo::Getenv("CLIO_BDEV_STATS_DIR");
   if (dir.empty()) {
-    std::string home = ctp::SystemInfo::GetHomeDir();
-    if (home.empty()) {
-      return std::string();  // nowhere to persist
+    // Fall back to CLIO_STORAGE_ROOT (set by --disk or defaults to ~/.clio).
+    dir = ctp::SystemInfo::Getenv("CLIO_STORAGE_ROOT");
+    if (dir.empty()) {
+      std::string home = ctp::SystemInfo::GetHomeDir();
+      if (home.empty()) {
+        return std::string();  // nowhere to persist
+      }
+      dir = home + "/.clio";
     }
-    dir = home + "/.clio/bdev_perf";
+    dir += "/bdev_perf";
   }
   // Sanitize the pool name (it may be a filesystem path or "ram::name")
   // into a flat file name.
