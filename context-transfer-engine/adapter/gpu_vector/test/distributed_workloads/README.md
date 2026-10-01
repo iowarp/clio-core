@@ -30,7 +30,7 @@ The docker gates are opt-in:
 `-DCLIO_CORE_ENABLE_DOCKER_TESTS=ON`; the SYCL ones additionally need
 `-DCLIO_GV_SYCL_BUILD_DIR=build-syclreg` because DPC++ and nvcc cannot share a
 build tree, and the newcoro ones `-DCLIO_GV_COROC=ON` (or a path) with
-`tools/coroc/build.sh` having been run.
+`context-runtime/coroc/build.sh` having been run.
 
 ## The four editions, and why the newcoro ones are gated separately
 
@@ -38,8 +38,8 @@ build tree, and the newcoro ones `-DCLIO_GV_COROC=ON` (or a path) with
 |---|---|---|---|
 | *(unset)* | `clio_<wl>_paged_bench` | the compiler's `co_await` | nvcc / clang |
 | `sycl` | `clio_<wl>_paged_bench_sycl` | the compiler's `co_await` | DPC++ |
-| `newcoro` | `clio_<wl>_paged_newcoro` | `tools/coroc` | nvcc |
-| `newcoro_sycl` | `clio_<wl>_paged_newcoro_sycl` | `tools/coroc` | DPC++ |
+| `newcoro` | `clio_<wl>_paged_newcoro` | `context-runtime/coroc` | nvcc |
+| `newcoro_sycl` | `clio_<wl>_paged_newcoro_sycl` | `context-runtime/coroc` | DPC++ |
 
 Same science, same decks, same gates -- only the lowering and the compiler
 move, so a divergence between two editions is a real difference rather than a

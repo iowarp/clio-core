@@ -1013,7 +1013,7 @@ endif()
 # WHY THESE NEED THEIR OWN GATES. Every gate above compiles co_await with a
 # compiler that understands it. The ported benchmarks
 # (clio_<wl>_paged_newcoro.cc) run the same science through a state machine
-# produced by tools/coroc, so what they exercise is a DIFFERENT LOWERING of
+# produced by clio-coroc, so what they exercise is a DIFFERENT LOWERING of
 # the suspend points -- and a suspend point is exactly where a page fault,
 # an eviction and a cross-node fetch all happen. A lowering that drops a live
 # value across a resume, or replays a frame that already ran, produces a
@@ -1030,8 +1030,9 @@ endif()
 #
 # OPT-IN on the transpiler, because building it needs an LLVM with
 # development files that a plain clio build does not:
-#   -DCLIO_GV_COROC=ON       (or a path to a prebuilt clio-coroc)
-# with tools/coroc/build.sh having been run.
+#   -DCLIO_RUN_ENABLE_COROC=ON -DCLIO_GV_COROC=ON   (built in this tree)
+#   -DCLIO_GV_COROC=<path>                          (a prebuilt clio-coroc,
+#                                     e.g. from context-runtime/coroc/build.sh)
 #
 #   ctest -L gv_dist_newcoro        # CUDA, 2 nodes, resident
 #   ctest -L gv_dist_ooc_newcoro    # CUDA, 2 nodes, under eviction
@@ -1051,19 +1052,27 @@ endif()
 # frames only a 4-way split creates.
 # ---------------------------------------------------------------------------
 set(CLIO_GV_COROC "" CACHE STRING
-    "Path to the clio-coroc transpiler (or ON for <source>/build-coroc); \
+    "Path to the clio-coroc transpiler (or ON for the one this build makes); \
 enables the newcoro docker gates")
 
 if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_DOCKER_TESTS AND CLIO_GV_COROC)
-    if(CLIO_GV_COROC STREQUAL "ON")
+    # ON = the transpiler this build makes (CLIO_RUN_ENABLE_COROC). It does
+    # not exist yet at configure time, so it is not checked for here.
+    set(_gv_coroc_in_tree FALSE)
+    if(CLIO_GV_COROC STREQUAL "ON" AND TARGET clio-coroc)
+        set(_gv_coroc ${CMAKE_BINARY_DIR}/bin/clio-coroc)
+        set(_gv_coroc_in_tree TRUE)
+    elseif(CLIO_GV_COROC STREQUAL "ON")
         set(_gv_coroc ${CMAKE_SOURCE_DIR}/build-coroc/clio-coroc)
     else()
         set(_gv_coroc ${CLIO_GV_COROC})
     endif()
-    if(NOT EXISTS ${_gv_coroc})
+    if(NOT _gv_coroc_in_tree AND NOT EXISTS ${_gv_coroc})
         message(WARNING
             "CLIO_GV_COROC is set but ${_gv_coroc} does not exist -- run "
-            "tools/coroc/build.sh. The newcoro docker gates are NOT registered.")
+            "context-runtime/coroc/build.sh, or configure with "
+            "-DCLIO_RUN_ENABLE_COROC=ON. The newcoro docker gates are NOT "
+            "registered.")
     else()
         foreach(_wl kmeans weights gmx grayscott lbann lammps_md gnn)
             # Resident, CUDA.

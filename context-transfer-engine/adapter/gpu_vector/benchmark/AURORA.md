@@ -1,6 +1,6 @@
 # The clio-coroc paged benchmarks on Aurora (Intel Data Center GPU Max 1550)
 
-Six paged benchmarks, transpiled by `tools/coroc` and compiled with icpx
+Six paged benchmarks, transpiled by `context-runtime/coroc` and compiled with icpx
 (oneAPI 2025.3.2) for `spir64_gen -device pvc`. Each runs as ONE single-node
 job in the `debug` queue, capped at 90 s inside the queue's 5-minute minimum
 walltime, pinned to one tile. Results as of 2026-09-21:
@@ -92,7 +92,7 @@ cap hit; the tier runs use 1 MB pages.
 ## How to build and run
 
 ```
-tools/coroc/build.sh                                   # the transpiler, spack LLVM 22
+context-runtime/coroc/build.sh                                   # the transpiler, spack LLVM 22
 AOT=1 benchmark/build_newcoro_aurora_all.sh            # transpile + AOT for pvc, links against build-fresh
 SKIP=lammps_md benchmark/submit_newcoro_aurora.sh      # one job per benchmark, sequential
 benchmark/submit_one_aurora.sh weights mytag "" --repeat 1   # one benchmark, any tag

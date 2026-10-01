@@ -279,7 +279,7 @@ if (drv.HitRoundCap()) { /* livelock: fail loudly */ }
 CUDA (C++20 form): configure with `-DCLIO_CORE_ENABLE_CUDA=ON -DCLIO_GPU_CLANG=ON -DCLIO_CORE_ENABLE_TESTS=ON` (clang cannot parse CUDA 13 headers; use 12.x). Link:
 `clio_run_cxx clio_run_cxx_gpu clio_admin_client clio_bdev_client clio_cte_core_client clio_cte_core_runtime clio::cte::gpu_vector ctp::cuda_cxx Threads` (+ `clio_cte_checkpoint_*` for `Copy`). Include dirs: `context-runtime/include`, `context-runtime/test`, `context-runtime/modules/{admin,bdev}/include`, `context-transfer-engine/core/include`, `context-transfer-engine/adapter/gpu_vector/include`.
 
-coroc form: `tools/coroc/build.sh` builds the transpiler; `benchmark/build_newcoro.sh <dir> [name]` transpiles and builds with nvcc (`-std=c++20 -O2 -rdc=true -maxrregcount=64 -DCLIO_COROC`). SYCL: `build_newcoro_sycl.sh`; Aurora: `AOT=1 build_newcoro_aurora_all.sh` (`spir64_gen -device pvc`).
+coroc form: `context-runtime/coroc/build.sh` builds the transpiler; `benchmark/build_newcoro.sh <dir> [name]` transpiles and builds with nvcc (`-std=c++20 -O2 -rdc=true -maxrregcount=64 -DCLIO_COROC`). SYCL: `build_newcoro_sycl.sh`; Aurora: `AOT=1 build_newcoro_aurora_all.sh` (`spir64_gen -device pvc`).
 
 SYCL on Intel: exactly one `-fsycl` TU defines `CLIO_SYCL_KERNEL_TU 1` before every clio include and is built as a SHARED library; call `gy::SyclInitBlockIpcManagers(max_blocks, gpu_info)` once; kernels are `q.parallel_for(nd_range{...}, [=](sycl::nd_item<1>){ auto dev = v; dev.Init(vw.Block()); ... })`. Use `-fp-model=precise` (icpx defaults to fast-math) and `sycl::address_space_cast<global>` on pointers at each use.
 

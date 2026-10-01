@@ -16,6 +16,16 @@ target_include_directories(clio-coroc SYSTEM PRIVATE
                            ${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 target_compile_definitions(clio-coroc PRIVATE ${LLVM_DEFINITIONS})
 
+# A LibTooling binary is not clang: bake in where clang's builtin headers and
+# the host C++ library live (as build.sh does), so callers pass only -I/-D.
+set(_coroc_resource_dir
+    "${LLVM_LIBRARY_DIR}/clang/${LLVM_VERSION_MAJOR}")
+get_filename_component(_coroc_gcc_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+get_filename_component(_coroc_gcc_toolchain "${_coroc_gcc_bin}" DIRECTORY)
+target_compile_definitions(clio-coroc PRIVATE
+    CLIO_COROC_RESOURCE_DIR="${_coroc_resource_dir}"
+    CLIO_COROC_GCC_TOOLCHAIN="${_coroc_gcc_toolchain}")
+
 if(TARGET clang-cpp)
   target_link_libraries(clio-coroc PRIVATE clang-cpp LLVM)
 else()

@@ -10,7 +10,7 @@ Design: `$HOME/coroutines.md`.
 ## Run it
 
 ```bash
-./tools/coroc/build.sh                      # build the transpiler (needs an LLVM with dev files)
+./context-runtime/coroc/build.sh                      # build the transpiler (needs an LLVM with dev files)
 ./context-runtime/test/co/run_coroc.sh      # transpile + differential test + SYCL + AOT
 ```
 
@@ -20,7 +20,7 @@ Design: `$HOME/coroutines.md`.
 |---|---|
 | `include/clio_runtime/co/coro.h` | device runtime: `Item` (the five-operation backend seam), `Ctx`, `Frame`, `Scope`, and the `CO_AWAIT` marker |
 | `include/clio_runtime/co/driver.h` | host side: stack layout and the relaunch loop. Allocates nothing, so it has no per-backend conditional |
-| `tools/coroc/main.cc` | the transpiler, on clang LibTooling |
+| `context-runtime/coroc/main.cc` | the transpiler, on clang LibTooling |
 | `coro_workload.h` | **the input.** What a user writes, and all of it |
 | `coro_types.h` | data and awaiters. No `CO_AWAIT`, so never rewritten |
 | `coro_ref.cc` / `coro_gen.cc` | the differential test's two halves |

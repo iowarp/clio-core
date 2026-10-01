@@ -79,6 +79,18 @@ add_subdirectory(src)
 # Add modules subdirectory
 add_subdirectory(modules)
 
+# clio-coroc, the CO_AWAIT transpiler: lowers device coroutines written with
+# CO_AWAIT (clio_runtime/co/) into plain state machines, so nvcc / hipcc /
+# DPC++ can compile them without C++20 device coroutines. Only the *_newcoro
+# gpu_vector editions use it. Opt-in: it links clang's tooling libraries,
+# which a plain clio build does not need. Builds to <build>/bin/clio-coroc.
+option(CLIO_RUN_ENABLE_COROC
+       "Build clio-coroc, the CO_AWAIT transpiler (needs LLVM/Clang dev files)"
+       OFF)
+if(CLIO_RUN_ENABLE_COROC)
+  add_subdirectory(coroc)
+endif()
+
 # Add benchmark subdirectory if benchmarks are enabled
 # Benchmarks are controlled by CLIO_CORE_ENABLE_BENCHMARKS
 if(CLIO_CORE_ENABLE_BENCHMARKS)

@@ -20,7 +20,7 @@
 #                    compile_commands.json supplies the CTE -I/-D set, its
 #                    CMakeCache the GPU arch, its bin/ the libraries and the
 #                    output directory.        [<root>/build-gv, else build]
-#   COROC            the transpiler                  [<root>/build-coroc/clio-coroc]
+#   COROC            the transpiler     [<build>/bin/clio-coroc, else <root>/build-coroc/clio-coroc]
 #   CUDA_HOME        the toolkit nvcc comes from     [from `which nvcc`]
 #   COROC_CUDA_HOME  the toolkit the TRANSPILER's clang parses against. It
 #                    often has to be OLDER than CUDA_HOME: clang refuses a
@@ -60,8 +60,13 @@ test -n "$B" && test -f "${B}/compile_commands.json" || {
        "to a CUDA-enabled clio build" >&2; exit 1; }
 B="$(cd "$B" && pwd)"
 
-COROC="${COROC:-${W}/build-coroc/clio-coroc}"
-test -x "${COROC}" || { echo "no transpiler at ${COROC} -- run tools/coroc/build.sh" >&2; exit 1; }
+# The transpiler: the one the build tree made (-DCLIO_RUN_ENABLE_COROC=ON),
+# else a standalone context-runtime/coroc/build.sh build.
+if [[ -z "${COROC:-}" ]]; then
+  COROC="${W}/build-coroc/clio-coroc"
+  [[ -x "${B}/bin/clio-coroc" ]] && COROC="${B}/bin/clio-coroc"
+fi
+test -x "${COROC}" || { echo "no transpiler at ${COROC} -- configure with -DCLIO_RUN_ENABLE_COROC=ON or run context-runtime/coroc/build.sh" >&2; exit 1; }
 
 GVI=context-transfer-engine/adapter/gpu_vector/include
 BD=context-transfer-engine/adapter/gpu_vector/benchmark/$DIR
