@@ -40,8 +40,6 @@
 #ifndef CLIO_SAFE_BDEV_TEST_SAFE_BDEV_STRESS_UTIL_H_
 #define CLIO_SAFE_BDEV_TEST_SAFE_BDEV_STRESS_UTIL_H_
 
-#include <unistd.h>
-
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -55,6 +53,7 @@
 
 #include "simple_test.h"
 
+#include <clio_ctp/introspect/system_info.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/pool_query.h>
 #include <clio_runtime/singletons.h>
@@ -141,7 +140,7 @@ class Array {
    */
   bool NewDisk(Disk *d) {
     const clio::run::u32 n = next_disk_++;
-    d->path = (StressDir() / (tag_ + "_" + std::to_string(getpid()) + "_d" +
+    d->path = (StressDir() / (tag_ + "_" + std::to_string(ctp::SystemInfo::GetPid()) + "_d" +
                               std::to_string(n) + ".bin"))
                   .string();
     std::error_code ec;
@@ -168,7 +167,7 @@ class Array {
     safe_.SetPersistent(distributed);  // a real multi-node array is durable
     std::vector<sb::MemberBdevDesc> m;
     m.emplace_back(first.path, first.node, first.id);
-    log_ = (StressDir() / (tag_ + "_" + std::to_string(getpid()) + ".alog"))
+    log_ = (StressDir() / (tag_ + "_" + std::to_string(ctp::SystemInfo::GetPid()) + ".alog"))
                .string();
     std::error_code ec;
     std::filesystem::remove(log_, ec);

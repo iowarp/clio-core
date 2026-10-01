@@ -51,7 +51,7 @@ using namespace std::chrono_literals;
 TEST_CASE("safe_bdev_stress_grow_unplug_recover", "[safe_bdev][stress]") {
   EnsureInit();
   REQUIRE(g_initialized);
-  Array a("sbs_grow", 90000u + static_cast<clio::run::u32>(getpid() & 0xFFF) * 64);
+  Array a("sbs_grow", 90000u + static_cast<clio::run::u32>(ctp::SystemInfo::GetPid() & 0xFFF) * 64);
   clio::run::u32 seed = 1;
   Disk d0, d1, d2, d3, p0, p1;
 
@@ -134,7 +134,7 @@ TEST_CASE("safe_bdev_stress_second_parity_static", "[safe_bdev][stress]") {
   EnsureInit();
   REQUIRE(g_initialized);
   Array a("sbs_p2s",
-          92000u + static_cast<clio::run::u32>(getpid() & 0xFFF) * 64);
+          92000u + static_cast<clio::run::u32>(ctp::SystemInfo::GetPid() & 0xFFF) * 64);
   clio::run::u32 seed = 1;
   Disk d[4], p0, p1;
   REQUIRE(a.NewDisk(&d[0]));
@@ -156,7 +156,7 @@ TEST_CASE("safe_bdev_stress_second_parity_grown", "[safe_bdev][stress]") {
   EnsureInit();
   REQUIRE(g_initialized);
   Array a("sbs_p2g",
-          93000u + static_cast<clio::run::u32>(getpid() & 0xFFF) * 64);
+          93000u + static_cast<clio::run::u32>(ctp::SystemInfo::GetPid() & 0xFFF) * 64);
   clio::run::u32 seed = 1;
   Disk d[4], p0, p1;
   REQUIRE(a.NewDisk(&d[0]));
@@ -180,7 +180,7 @@ TEST_CASE("safe_bdev_stress_two_data_lost", "[safe_bdev][stress]") {
   EnsureInit();
   REQUIRE(g_initialized);
   Array a("sbs_2d",
-          94000u + static_cast<clio::run::u32>(getpid() & 0xFFF) * 64);
+          94000u + static_cast<clio::run::u32>(ctp::SystemInfo::GetPid() & 0xFFF) * 64);
   clio::run::u32 seed = 1;
   Disk d[4], p0, p1;
   REQUIRE(a.NewDisk(&d[0]));
@@ -204,7 +204,7 @@ TEST_CASE("safe_bdev_stress_restart_after_growth", "[safe_bdev][stress]") {
   EnsureInit();
   REQUIRE(g_initialized);
   Array a("sbs_rst",
-          96000u + static_cast<clio::run::u32>(getpid() & 0xFFF) * 64);
+          96000u + static_cast<clio::run::u32>(ctp::SystemInfo::GetPid() & 0xFFF) * 64);
   clio::run::u32 seed = 1;
   Disk d[4], p0, p1;
   REQUIRE(a.NewDisk(&d[0]));
@@ -242,7 +242,7 @@ TEST_CASE("safe_bdev_stress_overwrite_while_degraded", "[safe_bdev][stress]") {
   EnsureInit();
   REQUIRE(g_initialized);
   Array a("sbs_ovw",
-          97000u + static_cast<clio::run::u32>(getpid() & 0xFFF) * 64);
+          97000u + static_cast<clio::run::u32>(ctp::SystemInfo::GetPid() & 0xFFF) * 64);
   clio::run::u32 seed = 1;
   Disk d[4], p0;
   REQUIRE(a.NewDisk(&d[0]));
@@ -270,7 +270,7 @@ TEST_CASE("safe_bdev_stress_io_during_membership", "[safe_bdev][stress]") {
   EnsureInit();
   REQUIRE(g_initialized);
   Array a("sbs_live",
-          91000u + static_cast<clio::run::u32>(getpid() & 0xFFF) * 64);
+          91000u + static_cast<clio::run::u32>(ctp::SystemInfo::GetPid() & 0xFFF) * 64);
   Disk d0, p0;
   REQUIRE(a.NewDisk(&d0));
   REQUIRE(a.Create(d0, 1) == 0);
