@@ -71,12 +71,45 @@
 #endif
 
 /** Latency-report hook (defined by the runtime in ipc_gpu2cpu.cc, absent in
- *  a bare CTP binary). Weak so a header-only user needs no definition. */
+ *  a bare CTP binary). Weak so a header-only user needs no definition.
+ *  Not declared on Windows: MSVC has no weak attribute, and clang-cl lowers
+ *  it to per-object /alternatename defaults that conflict at link time
+ *  (LNK1227) with the runtime's strong definition. */
+#if !defined(_WIN32)
 extern "C" void clio_evlat_add(int which, unsigned long long cycles)
     __attribute__((weak));
+#endif
 
 extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
                                        void *stream);
+
+namespace ctp {
+
+/**
+ * Record one latency sample on a report channel, if the runtime that
+ * defines clio_evlat_add is linked in. A no-op otherwise, and on Windows.
+ * @param which report channel index
+ * @param cycles sample value, in rdtsc cycles
+ */
+inline void EvlatAdd(int which, unsigned long long cycles) {
+#if !defined(_WIN32)
+  if (clio_evlat_add != nullptr) clio_evlat_add(which, cycles);
+#else
+  (void)which;
+  (void)cycles;
+#endif
+}
+
+/** @return true when the latency-report hook is linked in. */
+inline bool EvlatEnabled() {
+#if !defined(_WIN32)
+  return clio_evlat_add != nullptr;
+#else
+  return false;
+#endif
+}
+
+}  // namespace ctp
 
 namespace ctp {
 
@@ -1248,7 +1281,7 @@ class GpuApi {
     // wait on the device before it started, and its transfer time. Only
     // when the queue was created with profiling (SyclThreadQueue); a
     // queue without it throws here, which is caught and ignored.
-    if (clio_evlat_add != nullptr) {
+    if (EvlatEnabled()) {
       try {
         const auto t_sub =
             ev.get_profiling_info<sycl::info::event_profiling::command_submit>();
@@ -1257,8 +1290,8 @@ class GpuApi {
         const auto t_end =
             ev.get_profiling_info<sycl::info::event_profiling::command_end>();
         // The report divides by 2995 cycles per us; these are ns.
-        if (t_start >= t_sub) clio_evlat_add(17, (t_start - t_sub) * 2995ull / 1000ull);
-        if (t_end >= t_start) clio_evlat_add(18, (t_end - t_start) * 2995ull / 1000ull);
+        if (t_start >= t_sub) EvlatAdd(17, (t_start - t_sub) * 2995ull / 1000ull);
+        if (t_end >= t_start) EvlatAdd(18, (t_end - t_start) * 2995ull / 1000ull);
       } catch (const sycl::exception &) {
       }
     }
@@ -1489,7 +1522,7 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   const bool src_dev = IsDeviceAccessible(src);
 #if defined(__x86_64__)
   const unsigned long long ev_c1 = __rdtsc();
-  if (clio_evlat_add != nullptr) clio_evlat_add(15, ev_c1 - ev_c0);
+  EvlatAdd(15, ev_c1 - ev_c0);
 #endif
   if (!dst_dev && !src_dev) {
     std::memcpy(dst, src, n);
@@ -1502,7 +1535,7 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   if (dst_dev == src_dev) {
     GpuApi::SyclCopySync(q, dst, src, n);
 #if defined(__x86_64__)
-    if (clio_evlat_add != nullptr) clio_evlat_add(16, __rdtsc() - ev_c1);
+    EvlatAdd(16, __rdtsc() - ev_c1);
 #endif
     return;
   }
@@ -1515,7 +1548,7 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   if (pin == nullptr) {
     GpuApi::SyclCopySync(q, dst, src, n);
 #if defined(__x86_64__)
-    if (clio_evlat_add != nullptr) clio_evlat_add(16, __rdtsc() - ev_c1);
+    EvlatAdd(16, __rdtsc() - ev_c1);
 #endif
     return;
   }
@@ -1531,7 +1564,7 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
     }
   }
 #if defined(__x86_64__)
-  if (clio_evlat_add != nullptr) clio_evlat_add(16, __rdtsc() - ev_c1);
+  EvlatAdd(16, __rdtsc() - ev_c1);
 #endif
 #else
   std::memcpy(dst, src, n);

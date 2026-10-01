@@ -100,6 +100,12 @@ using cte_statvfs_t = struct statvfs;
 #endif
 #endif
 
+// O_NOATIME is Linux-only. Elsewhere no open carries it, so a zero flag
+// makes every handle take the normal atime-update path.
+#ifndef O_NOATIME
+#define O_NOATIME 0
+#endif
+
 using namespace clio::cae::fuse;
 
 // ============================================================================
