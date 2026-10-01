@@ -98,11 +98,11 @@ class PosixAsyncIO : public AsyncIO {
     return ftruncate(fd, static_cast<off_t>(size)) == 0;
   }
 
-  IoToken Write(void *buffer, size_t size, off_t offset) override {
+  IoToken Write(void *buffer, size_t size, int64_t offset) override {
     return SubmitIO(buffer, size, offset, true);
   }
 
-  IoToken Read(void *buffer, size_t size, off_t offset) override {
+  IoToken Read(void *buffer, size_t size, int64_t offset) override {
     return SubmitIO(buffer, size, offset, false);
   }
 
@@ -153,10 +153,10 @@ class PosixAsyncIO : public AsyncIO {
   }
 
  private:
-  IoToken SubmitIO(void *buffer, size_t size, off_t offset, bool is_write) {
+  IoToken SubmitIO(void *buffer, size_t size, int64_t offset, bool is_write) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    int fd = SelectFd(buffer, size);
+    int fd = SelectFd(buffer, size, offset);
     IoToken token = next_token_.fetch_add(1);
 
     auto cb = std::make_unique<struct aiocb>();
@@ -182,10 +182,12 @@ class PosixAsyncIO : public AsyncIO {
     return token;
   }
 
-  int SelectFd(void *buffer, size_t size) const {
+  int SelectFd(void *buffer, size_t size, int64_t offset) const {
+    // O_DIRECT needs the buffer, the size AND the file offset aligned;
+    // an unaligned offset fails with EINVAL, so check all three.
     if (direct_fd_ >= 0 &&
         (reinterpret_cast<uintptr_t>(buffer) % 4096 == 0) &&
-        (size % 4096 == 0)) {
+        (size % 4096 == 0) && (offset % 4096 == 0)) {
       return direct_fd_;
     }
     return regular_fd_;

@@ -180,7 +180,7 @@ class NixlAsyncIO : public AsyncIO {
    * @param offset File offset for the write.
    * @return IoToken for tracking, or kInvalidIoToken on failure.
    */
-  IoToken Write(void *buffer, size_t size, off_t offset) override {
+  IoToken Write(void *buffer, size_t size, int64_t offset) override {
     std::lock_guard<std::mutex> lock(mutex_);
     // Build local (DRAM source) descriptor
     nixl_xfer_dlist_t local(DRAM_SEG);
@@ -207,7 +207,7 @@ class NixlAsyncIO : public AsyncIO {
    * @param offset File offset for the read.
    * @return IoToken for tracking, or kInvalidIoToken on failure.
    */
-  IoToken Read(void *buffer, size_t size, off_t offset) override {
+  IoToken Read(void *buffer, size_t size, int64_t offset) override {
     std::lock_guard<std::mutex> lock(mutex_);
     // Build local (DRAM destination) descriptor
     nixl_xfer_dlist_t local(DRAM_SEG);
