@@ -356,3 +356,121 @@ class FileSetWriter:
         logf.close()
     return {'durable': durable, 'started': started, 'errors': errors[:20],
             'nerrors': len(errors), 'rounds': gen}
+
+
+class SafeSaveStress:
+  """Concurrent write-temp / fsync / rename-over-target savers and readers.
+
+  Each saver thread repeatedly writes a whole new version of one of the
+  target files to a private temp name, fsyncs it and renames it over the
+  target -- the pattern editors and databases rely on to never expose a
+  half-written file. Reader threads open a target, read it whole and
+  classify it: every block must be an intact record of that target with
+  one single (writer, gen) throughout, and a target that existed must never
+  be missing, short or mixed.
+  """
+
+  def __init__(self, dirpath, targets, nblocks, writer_base, savers,
+               readers, secs, seed, blk=BLK):
+    self.dirpath = dirpath
+    self.targets = targets
+    self.nblocks = nblocks
+    self.writer_base = writer_base
+    self.nsavers = savers
+    self.nreaders = readers
+    self.secs = secs
+    self.seed = seed
+    self.blk = blk
+    self.saves = []    # [target, writer, gen, t_issue, t_renamed]
+    self.reads = 0
+    self.bad = []      # problems seen by readers
+    self.errors = []
+    self.lock = threading.Lock()
+
+  def _saver(self, k):
+    wid = self.writer_base + k
+    rng = random.Random(f'{self.seed}:s{wid}')
+    t_end = _now() + self.secs
+    gen = 0
+    while _now() < t_end:
+      tgt = rng.choice(self.targets)
+      gen += 1
+      tmp = os.path.join(self.dirpath, f'.{tgt}.tmp.{wid}')
+      t0 = _now()
+      try:
+        write_runs(tmp, file_id_of(tgt), [[0, self.nblocks]], wid, gen,
+                   fsync=True, blk=self.blk)
+        os.rename(tmp, os.path.join(self.dirpath, tgt))
+      except OSError as e:
+        with self.lock:
+          self.errors.append(f'saver {wid} {tgt} gen {gen}: {e}')
+        continue
+      with self.lock:
+        self.saves.append([tgt, wid, gen, t0, _now()])
+
+  def _reader(self, k):
+    rng = random.Random(f'{self.seed}:r{self.writer_base}:{k}')
+    t_end = _now() + self.secs
+    while _now() < t_end:
+      tgt = rng.choice(self.targets)
+      path = os.path.join(self.dirpath, tgt)
+      step = 'open'
+      try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+          step = 'fstat'
+          size = os.fstat(fd).st_size
+          step = 'read'
+          data = os.pread(fd, self.nblocks * self.blk, 0)
+          size2 = os.fstat(fd).st_size
+        finally:
+          os.close(fd)
+      except FileNotFoundError:
+        with self.lock:
+          self.bad.append(f'{tgt}: missing (ENOENT at {step}) after it was '
+                          f'created')
+        continue
+      except OSError as e:
+        with self.lock:
+          self.errors.append(f'{step} {tgt}: {e}')
+        continue
+      runs = []
+      for b in range(self.nblocks):
+        piece = data[b * self.blk:(b + 1) * self.blk]
+        w, g = classify(piece, file_id_of(tgt), b, self.blk) if piece \
+            else (ZERO, 0)
+        if runs and runs[-1][2:] == [w, g]:
+          runs[-1][1] += 1
+        else:
+          runs.append([b, 1, w, g])
+      with self.lock:
+        self.reads += 1
+        full = self.nblocks * self.blk
+        if size != full or len(data) != full:
+          self.bad.append(f'{tgt}: short: fstat {size} (after {size2}), '
+                          f'read {len(data)} of {full}')
+        elif len(runs) != 1 or runs[0][2] < 0:
+          first_bad = next((r for r in runs if r[2] < 0), None)
+          sample = ''
+          if first_bad is not None:
+            piece = data[first_bad[0] * self.blk:(first_bad[0] + 1) *
+                         self.blk]
+            nz = len(piece) - piece.count(0)
+            sample = (f' first bad block {first_bad[0]}: {nz} nonzero bytes, '
+                      f'head {piece[:24].hex()}')
+          self.bad.append(f'{tgt}: not one intact version: '
+                          f'{[r[:4] for r in runs[:4]]}{sample}')
+
+  def run(self):
+    """Run savers and readers; return their logs."""
+    ts = [threading.Thread(target=self._saver, args=(k,))
+          for k in range(self.nsavers)]
+    ts += [threading.Thread(target=self._reader, args=(k,))
+           for k in range(self.nreaders)]
+    for t in ts:
+      t.start()
+    for t in ts:
+      t.join()
+    return {'saves': self.saves, 'reads': self.reads, 'bad': self.bad[:50],
+            'nbad': len(self.bad), 'errors': self.errors[:20],
+            'nerrors': len(self.errors)}

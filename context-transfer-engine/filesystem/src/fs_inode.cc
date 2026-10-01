@@ -233,11 +233,19 @@ clio::run::TaskResume Runtime::FlushInodes() {
       auto fit = by_tag_.find(w.packed);
       if (fit != by_tag_.end()) {
         if (w.resync) {
-          // Everyone who took the push caches it: register them.
+          // Everyone who took the push caches it: register them, with the
+          // lease the resync assumed (see CommitBlock).
           for (const auto &hv : w.holders) {
-            if (std::find(gone.begin(), gone.end(), hv.first) == gone.end() &&
-                fit->second->holders_.count(hv.first) == 0) {
+            if (std::find(gone.begin(), gone.end(), hv.first) != gone.end()) {
+              continue;
+            }
+            if (fit->second->holders_.count(hv.first) == 0) {
               fit->second->holders_[hv.first] = reg_seq_++;
+            }
+            auto lt = w.leases.find(hv.first);
+            if (lt != w.leases.end()) {
+              clio::run::u64 &lease = fit->second->holder_lease_ms_[hv.first];
+              lease = std::max(lease, lt->second);
             }
           }
         }

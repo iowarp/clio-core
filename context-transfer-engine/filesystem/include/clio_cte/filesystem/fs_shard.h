@@ -147,6 +147,23 @@ inline std::string FsJoin(const std::string &dir, const std::string &leaf) {
  * only mutations to the homes of the blocks involved.
  * @return Local query
  */
+/** Prefix of a Getattr "path" that names an inode instead (FsIdStatPath).
+ *  No real path can start with it: every client path starts with '/'. */
+inline constexpr const char kFsIdStatPrefix[] = "\x01id:";
+
+/**
+ * The Getattr argument that stats inode `packed` directly, whatever names
+ * it has -- including none: an open file whose last name was removed or
+ * renamed over (the handle still owns it). Used for fstat and for the
+ * size a read through an open descriptor clamps to, which must follow the
+ * descriptor's file, not whatever its old path names now.
+ * @param packed packed inode id (TagId)
+ * @return the query string for Client::AsyncGetattr
+ */
+inline std::string FsIdStatPath(clio::run::u64 packed) {
+  return std::string(kFsIdStatPrefix) + std::to_string(packed);
+}
+
 inline clio::run::PoolQuery FsPathQuery() {
   return clio::run::PoolQuery::Local();
 }

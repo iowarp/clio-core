@@ -12,6 +12,7 @@
  * reaches any other piece of state through CallShard on that state's owner.
  */
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <algorithm>
@@ -440,7 +441,47 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
   r.dir_id_ = pe.id_;
   r.dir_ = FsParentDir(path);
   r.leaf_ = FsLeaf(path);
-  FsResp er;
+  clio::run::u64 last_id = 0;
+  for (int attempt = 0;; ++attempt) {
+    FsResp er;
+    bool done = false;
+    CLIO_CO_AWAIT(OpenName(task.get(), r, er, done));
+    if (done) CLIO_CO_RETURN;
+    // Second stage on the inode's home (where it was created; a rename or
+    // link can put its name in a block another node homes).
+    FsReq o;
+    o.id_ = er.id_;
+    o.dir_ = path;  // the name it is opened by (mirror key)
+    o.flags_ = er.created_ ? 0u : (task->flags_ & O_TRUNC);
+    FsResp orr;
+    CLIO_CO_AWAIT(CallShard(InodeOwner(o.id_), kShardInodeOpen, o, orr));
+    if (orr.rc_ == ENOENT) {
+      // The name led to an inode that is gone. A rename over the name (or
+      // an unlink + create) between the two stages did that: the name
+      // leads to another inode now -- look again. The same missing inode
+      // twice is an entry a crash left behind.
+      if (attempt < kNameRaceRetries && er.id_ != last_id) {
+        last_id = er.id_;
+        continue;
+      }
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+    task->handle_ = orr.handle_;
+    task->size_ = orr.attr_.size_;
+    task->created_ = er.created_;
+    task->tag_packed_ = er.id_;
+    task->return_code_ = orr.rc_;
+    CLIO_CO_RETURN;
+  }
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::OpenName(OpenTask *task, const FsReq &name,
+                                        FsResp &er, bool &done) {
+  CLIO_TASK_BODY_BEGIN
+  done = false;
+  FsReq r = name;
   if (task->flags_ & O_CREAT) {
     // Create-or-open in ONE mutation on the home of the name's block: of
     // several racing creators (any node) exactly one sees created_=1, which
@@ -452,9 +493,10 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
   } else {
     DirEntry e;
     int lrc = 0;
-    CLIO_CO_AWAIT(LookupEntry(pe.id_, r.leaf_, e, lrc));
-    if (lrc == ENOENT) {
+    CLIO_CO_AWAIT(LookupEntry(r.dir_id_, r.leaf_, e, lrc));
+    if (lrc == ENOENT) {  // handle_ = 0: ENOENT to the client
       task->return_code_ = 0;
+      done = true;
       CLIO_CO_RETURN;
     }
     er.rc_ = static_cast<clio::run::u32>(lrc);
@@ -463,29 +505,11 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
   }
   if (er.rc_ != 0) {
     task->return_code_ = er.rc_;
-    CLIO_CO_RETURN;
-  }
-  if (er.type_ == kFsTypeDir) {
+    done = true;
+  } else if (er.type_ == kFsTypeDir) {
     task->return_code_ = EISDIR;
-    CLIO_CO_RETURN;
+    done = true;
   }
-  // Second stage on the inode's home (where it was created; a rename or
-  // link can put its name in a block another node homes).
-  FsReq o;
-  o.id_ = er.id_;
-  o.dir_ = path;  // the name it is opened by (mirror key)
-  o.flags_ = er.created_ ? 0u : (task->flags_ & O_TRUNC);
-  FsResp orr;
-  CLIO_CO_AWAIT(CallShard(InodeOwner(o.id_), kShardInodeOpen, o, orr));
-  if (orr.rc_ == ENOENT) {  // entry without an inode: a crash leftover
-    task->return_code_ = 0;
-    CLIO_CO_RETURN;
-  }
-  task->handle_ = orr.handle_;
-  task->size_ = orr.attr_.size_;
-  task->created_ = er.created_;
-  task->tag_packed_ = er.id_;
-  task->return_code_ = orr.rc_;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -826,21 +850,43 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
 
 clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  const std::string path = FsNormPath(task->path_.str());
   task->exists_ = 0;
   task->is_dir_ = 0;
   task->size_ = 0;
-  CLIO_FS_RESOLVE(path, ent, par, erc);
-  if (erc == ENOENT || erc == ENOTDIR) {
-    task->return_code_ = 0;
+  const std::string raw = task->path_.str();
+  if (raw.rfind(kFsIdStatPrefix, 0) == 0) {
+    // By inode (FsIdStatPath): an open descriptor's file, named or not.
+    FsResp sr;
+    const clio::run::u64 packed = std::strtoull(
+        raw.c_str() + sizeof(kFsIdStatPrefix) - 1, nullptr, 10);
+    CLIO_CO_AWAIT(StatInode(packed, sr));
+    if (sr.rc_ == 0) FillGetattr(sr.attr_, task.get());
+    task->return_code_ = sr.rc_ == ENOENT ? 0 : sr.rc_;
     CLIO_CO_RETURN;
   }
-  if (erc != 0) {
-    task->return_code_ = erc;
-    CLIO_CO_RETURN;
-  }
+  const std::string path = FsNormPath(raw);
   FsResp sr;
-  CLIO_CO_AWAIT(StatEntry(par, FsLeaf(path), ent, sr));
+  clio::run::u64 last_id = 0;
+  for (int attempt = 0;; ++attempt) {
+    CLIO_FS_RESOLVE(path, ent, par, erc);
+    if (erc == ENOENT || erc == ENOTDIR) {
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+    if (erc != 0) {
+      task->return_code_ = erc;
+      CLIO_CO_RETURN;
+    }
+    sr = FsResp();
+    CLIO_CO_AWAIT(StatEntry(par, FsLeaf(path), ent, sr));
+    // The inode the name led to is gone: a rename over the name raced us
+    // (look again, see Open) unless it is the same missing inode twice.
+    if (sr.rc_ != ENOENT || ent.type_ == kFsTypeDir ||
+        attempt >= kNameRaceRetries || ent.id_ == last_id) {
+      break;
+    }
+    last_id = ent.id_;
+  }
   if (sr.rc_ == ENOENT) {  // entry without its state: a crash leftover
     task->return_code_ = 0;
     CLIO_CO_RETURN;
@@ -849,7 +895,13 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
     task->return_code_ = sr.rc_;
     CLIO_CO_RETURN;
   }
-  const FsAttr &a = sr.attr_;
+  FillGetattr(sr.attr_, task.get());
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::FillGetattr(const FsAttr &a, GetattrTask *task) {
   task->exists_ = 1;
   task->is_dir_ = a.type_ == kFsTypeDir ? 1u : 0u;
   task->is_symlink_ = a.type_ == kFsTypeSymlink ? 1u : 0u;
@@ -862,9 +914,6 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
   task->gid_ = a.gid_;
   task->mode_ = a.mode_;
   task->nlink_ = a.nlink_;
-  task->return_code_ = 0;
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::StatSize(clio::run::shared_ptr<StatSizeTask> &task) {
@@ -1248,10 +1297,13 @@ clio::run::TaskResume Runtime::Rename(clio::run::shared_ptr<RenameTask> &task) {
     }
   }
   if (rc == 0) {
+    // Demote the destination directory BEFORE erasing its entry's record:
+    // a "complete" directory makes a missing record an authoritative
+    // ENOENT, and in between the renamed-over name -- which exists all
+    // along -- was reported gone.
+    MirrorRefuse(FsParentDir(dst));
     MirrorErase(src);
     MirrorErase(dst);
-    MirrorRefuse(dst);
-    MirrorRefuse(FsParentDir(dst));
     if (is_dir) shm_fs_cache_.BumpNsGen();
   }
   task->return_code_ = rc;

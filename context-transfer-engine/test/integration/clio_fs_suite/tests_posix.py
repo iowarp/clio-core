@@ -539,3 +539,31 @@ def t_readdir_mut(ctx):
     ctx.check(len(keep) == 500 and len(set(keep)) == 500,
               f'round {rnd}: {len(keep)} keep entries')
     ctx.ok(0, 'unlink_many', dirpath=d, prefix=f'churn{rnd}_', count=100)
+
+
+@test('unlinked_open_file', 'posix', max_nodes=1)
+def t_unlinked_open_file(ctx):
+  """The temp-file pattern (SQLite, Python's TemporaryFile): create, write,
+  unlink, then keep using the descriptor -- fstat (nlink 0, the size),
+  read back, ftruncate, write, fstat again. Afterwards no hidden leftover
+  may remain in the directory."""
+  d = ctx.p('tmpf')
+  ctx.ok(0, 'mkdir', path=d)
+  code = (
+      "import os,json; p=%r; fd=os.open(p, os.O_RDWR|os.O_CREAT, 0o600); "
+      "os.write(fd, b'x'*100000); os.unlink(p); r={}; st=os.fstat(fd); "
+      "r['nlink']=st.st_nlink; r['size']=st.st_size; "
+      "r['read']=len(os.pread(fd, 200000, 0)); os.ftruncate(fd, 5000); "
+      "r['size_after_trunc']=os.fstat(fd).st_size; "
+      "os.pwrite(fd, b'y'*10, 7000); r['size_after_write']=os.fstat(fd).st_size; "
+      "r['tail']=os.pread(fd, 10, 7000).decode(); os.close(fd); "
+      "r['left']=sorted(os.listdir(%r)); print(json.dumps(r))"
+      % (f'{d}/t', d))
+  r = ctx.ok(0, 'sh', cmd=f'python3 -c "{code}"', timeout=120)
+  ctx.check(r['rc'] == 0, f'the unlinked open file failed: {r["err"][-400:]}')
+  import json
+  got = json.loads(r['out'].strip().splitlines()[-1])
+  want = {'nlink': 0, 'size': 100000, 'read': 100000, 'size_after_trunc': 5000,
+          'size_after_write': 7010, 'tail': 'y' * 10, 'left': []}
+  bad = {k: (got.get(k), v) for k, v in want.items() if got.get(k) != v}
+  ctx.check(not bad, f'unlinked open file: (got, want) {bad}')

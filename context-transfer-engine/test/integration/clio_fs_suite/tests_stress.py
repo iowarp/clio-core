@@ -860,3 +860,87 @@ def t_space_accounting(ctx):
   ctx.check(left - u0 <= max(64, written // 20),
             f'{left - u0} MiB still used a minute after deleting all '
             f'{written} MiB written (leaked capacity)')
+
+
+@test('stress_safe_save', 'stress', min_nodes=1, redeploy_after=True,
+      timeout=3600)
+def t_safe_save(ctx):
+  """Every node runs 2 savers (write a whole new version of one of 8 target
+  files to a temp name, fsync, rename over the target) and 2 readers (open
+  a target, read it whole) for 90 s. Every read must see exactly one
+  complete, intact version -- never a short, mixed or CORRUPT file;
+  afterwards every node reads the same final version of each target, and
+  it is the version of the last rename to it. ENOENT/ESTALE while a name
+  is replaced are reported (see the check) and fail only when strict."""
+  n = len(ctx.hosts)
+  d = ctx.p('save')
+  ctx.ok(0, 'mkdir', path=d)
+  targets = [f't{k}' for k in range(8)]
+  nb = 64  # 256 KiB files
+  for t in targets:  # every target exists before readers start
+    ctx.ok(0, 'rec_write', path=f'{d}/{t}', name=t, runs=[[0, nb]],
+           writer=0, gen=0, fsync=True)
+
+  def run(i):
+    return ctx.ok(i, 'rec_safe_save', timeout=900, dirpath=d,
+                  targets=targets, nblocks=nb, writer_base=10 * i + 1,
+                  savers=2, readers=2, secs=90, seed=i)
+  results = ctx.each(run)
+  saves = [s for r in results for s in r['saves']]
+  bad = [b for r in results for b in r['bad']]
+  errs = [e for r in results for e in r['errors']]
+  time.sleep(2)
+  finals, wrong = {}, []
+  for t in targets:
+    seen = set()
+    for i in range(n):
+      got = ctx.ok(i, 'rec_scan', path=f'{d}/{t}', name=t, nblocks=nb)
+      runs = got['runs']
+      seen.add(tuple(runs[0][2:]) if len(runs) == 1 else ('mixed',))
+    finals[t] = seen
+    mine = [s for s in saves if s[0] == t]
+    if len(seen) != 1:
+      wrong.append((t, 'nodes disagree', sorted(seen)))
+      continue
+    v = next(iter(seen))
+    if mine:
+      last = max(s[4] for s in mine)
+      ok = {(s[1], s[2]) for s in mine if s[4] >= last - SKEW_S}
+      if tuple(v) not in ok:
+        wrong.append((t, v, 'last renames', sorted(ok)[:3]))
+  ctx.metrics.update({'saves': len(saves),
+                      'reads': sum(r['reads'] for r in results),
+                      'bad_reads': sum(r['nbad'] for r in results),
+                      'errors': sum(r['nerrors'] for r in results)})
+  kinds, samples = {}, {}
+  for b in bad:
+    k = b.split(': ', 1)[1].split(',')[0][:40]
+    kinds[k] = kinds.get(k, 0) + 1
+    samples.setdefault(k, [])
+    if len(samples[k]) < 3:
+      samples[k].append(b)
+  ctx.metrics['bad_read_kinds'] = kinds
+  for k, v in samples.items():
+    ctx.note(f'bad reads [{k}]: {v}')
+  # Corruption (a short, mixed or corrupt read, a wrong final version) always
+  # fails. A name reported missing (ENOENT) or stale (ESTALE) while it is
+  # being replaced is the known window of libfuse's path-based API: a rename
+  # over a name open on the renaming node is two server renames (hide, then
+  # replace). It is reported, and fails only with CLIO_SUITE_STRICT_RENAME=1
+  # (closing it needs the inode-based low-level FUSE API).
+  import os
+  broken = [b for b in bad if 'missing (ENOENT' not in b]
+  unavailable = len(bad) - len(broken) + len(errs)
+  ctx.metrics['unavailable_reads'] = unavailable
+  if unavailable:
+    ctx.note(f'{unavailable} reads hit the rename-over-open window '
+             f'(ENOENT/ESTALE), e.g. {(errs + bad)[:3]}')
+  problems = []
+  if broken:
+    problems.append(f'{len(broken)} reads saw a broken file, e.g. '
+                    f'{broken[:6]}')
+  if wrong:
+    problems.append(f'final versions wrong: {wrong[:5]}')
+  if unavailable and os.environ.get('CLIO_SUITE_STRICT_RENAME') == '1':
+    problems.append(f'{unavailable} reads failed with ENOENT/ESTALE')
+  ctx.check(not problems, ' ;; '.join(problems))

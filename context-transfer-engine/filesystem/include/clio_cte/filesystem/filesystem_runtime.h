@@ -898,6 +898,25 @@ class Runtime : public clio::run::Container {
    *        inode does not exist
    */
   clio::run::TaskResume StatInode(clio::run::u64 packed, FsResp &resp);
+  /**
+   * Copy an inode's attributes into a Getattr reply.
+   * @param a the attributes (StatEntry / StatInode)
+   * @param task the reply to fill (exists_ = 1)
+   */
+  static void FillGetattr(const FsAttr &a, GetattrTask *task);
+  /** Re-resolves of a name whose inode vanished under a racing rename. */
+  static constexpr int kNameRaceRetries = 8;
+  /**
+   * Open's first stage: create-or-find the name's entry (O_CREAT) or look
+   * it up. Finishes the task itself (done = true) when the open ends here:
+   * a missing name (handle 0), an error, or a directory.
+   * @param task the Open task
+   * @param name dir_id_ / dir_ / leaf_ of the name
+   * @param er out: id_, type_, created_ of the entry
+   * @param done out: true when the task's reply is final
+   */
+  clio::run::TaskResume OpenName(OpenTask *task, const FsReq &name,
+                                 FsResp &er, bool &done);
   /** Holder side of an inode push (req.id_, attrs in req.str_; b_=1 drop). */
   int ApplyInodePush(const FsReq &req);
   /**

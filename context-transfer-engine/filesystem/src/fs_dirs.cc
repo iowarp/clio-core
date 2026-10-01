@@ -54,6 +54,7 @@
  */
 #include <cerrno>
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -725,12 +726,17 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
     {
       std::lock_guard<std::mutex> g(ns_mu_);
       if (resync) {
-        // Everyone who took the snapshot caches the block: register them.
-        for (clio::run::u32 h : holders) {
-          if (std::find(gone.begin(), gone.end(), h) == gone.end() &&
-              slot->holders_.count(h) == 0) {
-            slot->holders_[h] = reg_seq_++;
-          }
+        // Everyone who took the snapshot caches the block: register them,
+        // with the lease the resync assumed (a copy from before this home's
+        // restart may be trusted until that horizon). Without one they
+        // counted as expired: the next change skipped them while they still
+        // served their copy without asking.
+        for (size_t i = 0; i < holders.size(); ++i) {
+          const clio::run::u32 h = holders[i];
+          if (std::find(gone.begin(), gone.end(), h) != gone.end()) continue;
+          if (slot->holders_.count(h) == 0) slot->holders_[h] = reg_seq_++;
+          clio::run::u64 &lease = slot->holder_lease_ms_[h];
+          lease = std::max(lease, leases[i]);
         }
       }
       DropGoneHolders(gone, reg, &slot->holders_, &slot->holder_lease_ms_);
@@ -1465,6 +1471,15 @@ clio::run::TaskResume Runtime::ResolvePath(const std::string &path,
   ent.id_ = FsPack(FsRootId());
   ent.type_ = kFsTypeDir;
   if (path == "/") CLIO_CO_RETURN;
+  if (path.rfind(kFsIdStatPrefix, 0) == 0) {
+    // An open file named by its inode (FsIdStatPath): it may have no name
+    // left at all. Ops on it act on the inode; there is no parent entry.
+    ent.id_ = std::strtoull(path.c_str() + sizeof(kFsIdStatPrefix) - 1,
+                            nullptr, 10);
+    ent.type_ = kFsTypeFile;
+    ent.state_ = kDirEntLive;
+    CLIO_CO_RETURN;
+  }
   size_t pos = 1;
   while (pos <= path.size()) {
     size_t slash = path.find('/', pos);

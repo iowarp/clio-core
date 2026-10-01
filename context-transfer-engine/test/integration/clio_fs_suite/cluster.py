@@ -417,7 +417,8 @@ compose:
     sh(host, f'{self.seal_mnt_cmd()}; echo "=== {time.ctime()} mount" >> {log};'
              f' {self.env_prefix()} nohup {self._gdb("fuse")}'
              f'{self.bin_dir}/clio_cte_fuse '
-             f'{self.mnt} -f </dev/null >>{log} 2>&1 &')
+             f'{self.mnt} -f {os.environ.get("CLIO_SUITE_FUSE_ARGS", "")} '
+             f'</dev/null >>{log} 2>&1 &')
     t0 = time.time()
     while time.time() - t0 < timeout:
       rc, _ = sh(host, f'grep -q " {self.mnt} " /proc/self/mountinfo && '

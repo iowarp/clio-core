@@ -383,6 +383,12 @@ class Agent:
                                writer_base, writers, readers, secs, seed,
                                blk, sync=sync, truncater=truncater).run()
 
+  def op_rec_safe_save(self, dirpath, targets, nblocks, writer_base, savers,
+                       readers, secs, seed, blk=sr.BLK):
+    """Concurrent write-temp/fsync/rename-over savers + whole-file readers."""
+    return sr.SafeSaveStress(dirpath, targets, nblocks, writer_base, savers,
+                             readers, secs, seed, blk).run()
+
   def op_rec_fileset(self, dirpath, writer, nfiles, blocks, secs, seed,
                      log_path=None, blk=sr.BLK, retry=False):
     """Rewrite a cycling set of record files, logging each fsynced one."""
