@@ -106,6 +106,15 @@ using cte_statvfs_t = struct statvfs;
 #define O_NOATIME 0
 #endif
 
+// What an open of a file that vanished after the kernel's lookup returns:
+// ESTALE makes the kernel look the path up again. Windows (WinFsp) has no
+// ESTALE and no such retry, so the file is simply not there.
+#ifdef ESTALE
+static constexpr int kOpenVanishedErrno = ESTALE;
+#else
+static constexpr int kOpenVanishedErrno = ENOENT;
+#endif
+
 using namespace clio::cae::fuse;
 
 // ============================================================================
@@ -2341,7 +2350,7 @@ int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
     // names now (ENOENT from that lookup if nothing), where ENOENT failed
     // an open of a name that existed throughout (ext4 would open the old
     // file).
-    return -ESTALE;
+    return -kOpenVanishedErrno;
   }
 
   auto *handle = new CfsHandle();
@@ -2979,10 +2988,11 @@ int cte_fuse_truncate(const char *path_in, cte_off_t size,
 
 #ifdef __linux__
 // Write `len` zero bytes at `off` through an open handle, chunked so a large
-// range doesn't need one giant SHM buffer. Used by ZERO_RANGE. Returns 0 or a
+// range doesn't need one giant SHM buffer. Used by ZERO_RANGE. `path` is the
+// op's path (null only when the file has no name). Returns 0 or a
 // negative errno.
-static int cte_fuse_write_zeros(struct fuse_file_info *fi, cte_off_t off,
-                                cte_off_t len) {
+static int cte_fuse_write_zeros(const char *path, struct fuse_file_info *fi,
+                                cte_off_t off, cte_off_t len) {
   // Zeros MUST take the exact same path as write(2) — with the sieve-direct
   // adapter that is AsyncPutBlobDefer on the file's TAG, not the cfs handle
   // pipeline. The old cfs->AsyncWrite(handle->fh, ...) route (a) wrote via a
@@ -2995,7 +3005,11 @@ static int cte_fuse_write_zeros(struct fuse_file_info *fi, cte_off_t off,
     const size_t n = static_cast<size_t>(
         ((len - done) < static_cast<cte_off_t>(kChunk)) ? (len - done)
                                                         : kChunk);
-    int wrote = cte_fuse_write(nullptr, zbuf.get(), n, off + done, fi);
+    // Pass the op's path, not null: a null path tells cte_fuse_write the
+    // file lost its last name, re-keying the handle (and the hiwater this
+    // write raises) by inode, so a stat by path missed the growth
+    // (generic/075: "Size error: expected 0x146ee stat 0x13226").
+    int wrote = cte_fuse_write(path, zbuf.get(), n, off + done, fi);
     if (wrote < 0) return wrote;
     if (wrote == 0) return -EIO;
     done += wrote;
@@ -3043,7 +3057,7 @@ static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
     cte_stat_t st;
     int rc = cte_fuse_getattr_stat(path, &st, fi);
     if (rc != 0) return rc;
-    rc = cte_fuse_write_zeros(fi, offset, length);
+    rc = cte_fuse_write_zeros(path, fi, offset, length);
     if (rc != 0) return rc;
     if ((mode & FALLOC_FL_KEEP_SIZE) && (offset + length) > st.st_size) {
       // Restore EOF through the REAL truncate hook: it drains the deferred

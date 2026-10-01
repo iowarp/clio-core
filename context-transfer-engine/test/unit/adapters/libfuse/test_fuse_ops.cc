@@ -278,7 +278,7 @@ TEST_CASE("FUSE ops - open missing file is ESTALE", "[fuse][ops]") {
   // open means it vanished in between: ESTALE makes the kernel look the path
   // up again, and that lookup (getattr) is what reports ENOENT.
   int rc = cte_fuse_open("/definitely/not/here.dat", &fi);
-  REQUIRE(rc == -ESTALE);
+  REQUIRE(rc == -kOpenVanishedErrno);  // ESTALE (ENOENT on Windows)
   cte_stat_t st;
   REQUIRE(cte_fuse_getattr("/definitely/not/here.dat", &st, nullptr) ==
           -ENOENT);
@@ -499,6 +499,21 @@ TEST_CASE("FUSE ops - fallocate modes", "[fuse][ops]") {
               &fi) == 0);
   REQUIRE(cte_fuse_getattr(path, &st, &fi) == 0);
   REQUIRE(st.st_size == 4096);
+
+  // ZERO_RANGE past EOF without KEEP_SIZE grows the file to its end, also
+  // right after truncates down (generic/075 fsx: write, truncate, truncate,
+  // zero -> "Size error: expected 0x146ee stat 0x13226").
+  {
+    std::vector<char> buf(0x3e99b, 'a');
+    REQUIRE(cte_fuse_write(path, buf.data(), buf.size(), 0, &fi) ==
+            static_cast<int>(buf.size()));
+  }
+  REQUIRE(cte_fuse_truncate(path, 0x17cac, &fi) == 0);
+  REQUIRE(cte_fuse_truncate(path, 0x13226, &fi) == 0);
+  REQUIRE(cte_fuse_fallocate(path, FALLOC_FL_ZERO_RANGE, 0x8a25, 0xbcc9,
+                             &fi) == 0);
+  REQUIRE(cte_fuse_getattr(path, &st, &fi) == 0);
+  REQUIRE(st.st_size == 0x146ee);
 
   REQUIRE(cte_fuse_release(path, &fi) == 0);
   REQUIRE(cte_fuse_unlink(path) == 0);
