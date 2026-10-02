@@ -584,6 +584,30 @@ def _torn_unsynced(t, writer, inflight):
   return hw == writer and rw == writer and hg == inflight and rg < hg
 
 
+def _reread_note(ctx, nmx, path, block, nodes):
+  """Re-read one 4 KiB record block on each of `nodes` and note, per node,
+  where its trailing zeros start (4096 = none) and whether it now matches
+  the first node's re-read.
+
+  Args:
+    ctx: test context.
+    nmx: file name (for the note).
+    path: file path.
+    block: block index.
+    nodes: node indices to read on.
+  """
+  seen = {}
+  for j in nodes:
+    r = ctx.call(j, 'read_hex', path=path, off=block * 4096, length=4096)
+    if not r.get('ok'):
+      seen[f'node{j}'] = f'read failed: {r.get("err")}'
+      continue
+    raw = bytes.fromhex(r['ret'])
+    seen[f'node{j}'] = {'len': len(raw),
+                        'tail_zero_from': len(raw.rstrip(b'\0'))}
+  ctx.note(f'{nmx} block {block} re-read: {seen}')
+
+
 def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
                     skip_writer_of=None):
   """Verify FileSetWriter output after a fault.
@@ -628,6 +652,10 @@ def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
       for d in got.get('corrupt', [])[:2]:
         ctx.note(f'{nmx} corrupt block {when} (durable gen {dg}, '
                  f'started {started.get(nmx)}): {d}')
+        # Read the block again, here and from another node: a block that is
+        # whole on a re-read was a bad READ (stored data intact), one that is
+        # still torn is bad STORED data (#1124).
+        _reread_note(ctx, nmx, path, d['block'], [reader, (reader + 1) % n])
       foreign = got.get('foreign') or {}
       if foreign:
         ctx.note(f'{nmx} FOREIGN blocks {when} hold [file id, block, writer, '
