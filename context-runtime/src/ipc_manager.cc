@@ -4468,6 +4468,14 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
          "Worker {}: Task routing failed - no pool queries resolved. "
          "Pool ID: {}, Method: {}",
          worker ? worker->GetId() : 0, task_ptr->pool_id_, task_ptr->method_);
+    if (task_ptr->pool_id_.IsNull()) {
+      // A task for the null pool can never be routed. Returning Dne without
+      // completing it left its submitter waiting forever: a container used
+      // before its Create set its clients (a restart race) wedged a whole
+      // clio-fs directory this way, cluster-wide (#1125). Fail it instead.
+      task_ptr->SetReturnCode(kRouteNullPoolRc);
+      future.SetComplete();
+    }
     return RouteResult::Dne;
   }
 

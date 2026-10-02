@@ -56,6 +56,10 @@ namespace clio::run {
 /** Return code set on tasks that fail due to network timeout */
 static constexpr int kRun2RunNetworkTimeoutRC = -1000;
 
+/** Return code set on a task sent to the null pool, which can never be
+ *  routed: it is completed with this instead of being left pending. */
+static constexpr int kRouteNullPoolRc = -1001;
+
 /**
  * Sentinel for "no target node resolved".  Node id 0 is a valid node (the
  * first host in the hostfile is node 0), so 0 cannot double as an error
