@@ -293,7 +293,12 @@ class Cluster:
           f'        existing_pool_id: "{SAFE_POOL_ID}"\n'
           f'        existing_pool_module: "clio_safe_bdev"\n'
           f'        capacity_limit: "{self.disk_gb}GB"\n'
-          f'        score: 0.2\n')
+          f'        score: 0.2\n'
+          # Without a persistence level the CTE registers the array as a
+          # VOLATILE tier, and flushes/relocations (which need level >= 1)
+          # never place anything on it: writes fill the fast tier and then
+          # fail ENOSPC with the array empty (#1119).
+          f'        persistence_level: "long_term"\n')
     if self.profile in ('persistent', 'persistent_norepl', 'tiered', 'safe'):
       if self.profile != 'safe':
         storage.append(
