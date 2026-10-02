@@ -5,6 +5,7 @@
 #ifndef CLIO_CTE_REPLICATION_REPLICATION_TASKS_H_
 #define CLIO_CTE_REPLICATION_REPLICATION_TASKS_H_
 
+#include <algorithm>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/task.h>
 #include <clio_runtime/admin/admin_tasks.h>
@@ -34,11 +35,20 @@ struct ReplicationConfig {
   static constexpr const char* chimod_lib_name = "clio_cte_replication";
 
   clio::run::PoolId next_pool_id_;  ///< CTE core pool id (e.g. 512.0)
-  /// The FIXED SET of persistent replicas the interposed PutBlob maintains:
-  /// every default put through this pool writes through to replicas
-  /// 1..num_replicas_, each marked REPLICA_FIXED | REPLICA_PERSISTENT so
-  /// the organizer neither migrates nor volatilizes them.
-  int num_replicas_ = 1;
+  /// Total durable copies of every blob (YAML replication_factor). 1 (the
+  /// default): the blob's own copy only, made durable by fsync and the
+  /// periodic data flush -- the ext4 contract, and the single-copy disk
+  /// footprint. N > 1: plus N-1 copies on other nodes (remote_copies_),
+  /// written before a put returns, so a blob stays available while its
+  /// owner's node is down. Sets num_replicas_ = 0 and remote_copies_ =
+  /// N - 1 unless those are given explicitly.
+  int replication_factor_ = 1;
+  /// ADVANCED (YAML num_replicas): extra persistent copies on the owner's
+  /// own node, written through by every default put (REPLICA_FIXED |
+  /// REPLICA_PERSISTENT: the organizer neither migrates nor volatilizes
+  /// them). They protect against losing a device, not a node, and each
+  /// doubles the disk footprint, so the default is none.
+  int num_replicas_ = 0;
   /// Score for the primary (the DRAM cache copy) on a replica → primary
   /// re-cache. High by default so the DPE pins the fast copy to the fast
   /// tier.
@@ -69,6 +79,7 @@ struct ReplicationConfig {
   ReplicationConfig(const clio::run::PoolId &pool_id,
                     const ReplicationConfig &other)
       : next_pool_id_(other.next_pool_id_),
+        replication_factor_(other.replication_factor_),
         num_replicas_(other.num_replicas_),
         cache_score_(other.cache_score_),
         replica_score_(other.replica_score_),
@@ -80,12 +91,14 @@ struct ReplicationConfig {
 
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(next_pool_id_, num_replicas_, cache_score_, replica_score_,
-       replicate_period_ms_, remote_copies_, handoff_log_path_);
+    ar(next_pool_id_, replication_factor_, num_replicas_, cache_score_,
+       replica_score_, replicate_period_ms_, remote_copies_,
+       handoff_log_path_);
   }
 
   /** Load configuration from compose YAML (next_pool_id: "major.minor",
-   *  num_replicas: int, cache_score: float). */
+   *  replication_factor: int; advanced: num_replicas, remote_copies,
+   *  cache_score, replica_score, replicate_period_ms, handoff_log_path). */
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
     if (!pool_config.config_.empty()) {
       try {
@@ -99,6 +112,12 @@ struct ReplicationConfig {
             next_pool_id_ = clio::run::PoolId(major, minor);
           }
         }
+        if (node["replication_factor"]) {
+          replication_factor_ = std::max(1, node["replication_factor"].as<int>());
+        }
+        // The factor sets the copies; explicit counts override it.
+        remote_copies_ = replication_factor_ - 1;
+        num_replicas_ = 0;
         if (node["num_replicas"]) {
           num_replicas_ = node["num_replicas"].as<int>();
         }

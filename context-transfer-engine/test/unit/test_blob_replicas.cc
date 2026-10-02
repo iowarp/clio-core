@@ -404,6 +404,9 @@ TEST_CASE("BlobReplicas - replication module ReplicateBlob and FlushTag",
   {
     clio::cte::replication::ReplicationConfig params;
     params.next_pool_id_ = clio::cte::core::kCtePoolId;
+    // These tests exercise the persistent same-node replica, which the
+    // default (replication_factor 1: one copy) does not make.
+    params.num_replicas_ = 1;
     auto create = repl.AsyncCreateReplication(
         clio::run::PoolQuery::Local(),
         clio::cte::replication::kReplicationPoolName,
@@ -527,13 +530,16 @@ TEST_CASE("BlobReplicas - transparent interposition on the core Put/Get",
   REQUIRE(client != nullptr);
 
   // Bind the replication pool (GetOrCreatePool is idempotent; the module
-  // test earlier created it with default params: num_replicas=1,
-  // cache_score=1.0, replica_score=0.2).
+  // test earlier created it with num_replicas=1, cache_score=1.0,
+  // replica_score=0.2).
   clio::cte::replication::Client repl(
       clio::cte::replication::kReplicationPoolId, clio::cte::core::kCtePoolId);
   {
     clio::cte::replication::ReplicationConfig params;
     params.next_pool_id_ = clio::cte::core::kCtePoolId;
+    // These tests exercise the persistent same-node replica, which the
+    // default (replication_factor 1: one copy) does not make.
+    params.num_replicas_ = 1;
     auto create = repl.AsyncCreateReplication(
         clio::run::PoolQuery::Local(),
         clio::cte::replication::kReplicationPoolName,

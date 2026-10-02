@@ -362,28 +362,34 @@ compose:
   # invalidates it). Order in this file matters: each entry must come AFTER
   # the entry its next_pool_id names.
 
-  # === Replication (persistent copies, issue #886) ===
-  # Reliability layer: every default put writes through to a fixed set of
-  # persistent replicas on the disk tier above (REPLICA_FIXED |
-  # REPLICA_PERSISTENT: the organizer never migrates them and never places
-  # them on volatile storage — they only move if a device is evacuated).
-  # Reads serve the primary when present and transparently re-cache from a
-  # disk replica when the organizer (or a reboot) dropped it; every other
-  # core op is forwarded to next_pool_id untouched.
+  # === Replication (durable copies, issue #886) ===
+  # Reliability layer. replication_factor is the total number of durable
+  # copies of every blob:
+  #   1 (default): the blob's own copy only, made durable by fsync and the
+  #     periodic data flush -- the ext4 contract and a single-copy disk
+  #     footprint. A node's blobs are unavailable while it is down.
+  #   N > 1: plus N-1 copies on the next nodes by hash, written before a put
+  #     is acknowledged; with the core's failover_to_successor a blob stays
+  #     readable and writable while its owner is down, and changes made
+  #     meanwhile are handed back when it returns.
+  # Every other core op is forwarded to next_pool_id untouched.
   - mod_name: clio_cte_replication
     pool_name: clio_cte_replication
     pool_query: local
     pool_id: "561.0"
     next_pool_id: "512.0"               # CTE core pool — see entry above
-    num_replicas: 1                     # persistent copies per put
+    replication_factor: 1               # total durable copies (default 1)
     cache_score: 1.0                    # DRAM re-cache placement score
     replica_score: 0.2                  # disk copies' score = drop threshold
-    # Copies of every blob on the next containers by hash (other nodes),
-    # written before a put is acknowledged. With the core's
-    # failover_to_successor, a blob stays readable and writable while its
-    # owner's node is down; changes made meanwhile are handed back when it
-    # returns. Default: 0 (a node's blobs are unavailable while it is down).
+    # ADVANCED overrides of what replication_factor sets:
+    # remote_copies: copies on the next containers by hash (other nodes).
+    #   Default: replication_factor - 1.
     # remote_copies: 1
+    # num_replicas: extra persistent copies on the owner's OWN node, written
+    #   through by every put (REPLICA_FIXED | REPLICA_PERSISTENT: never
+    #   migrated, never volatile). They protect against losing a device, not
+    #   a node, and each doubles the disk footprint. Default: 0.
+    # num_replicas: 1
     # Base path of the handoff log (one file per container, suffixed
     # ".<container>"): the changes a container made while covering for a dead
     # owner, so they are still handed back if THIS node restarts before the
