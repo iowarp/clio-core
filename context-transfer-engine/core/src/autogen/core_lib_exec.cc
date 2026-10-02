@@ -203,6 +203,11 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(GetBlobScore(typed_task));
       break;
     }
+    case Method::kGetResidency: {
+      auto& typed_task = task_ptr.template Cast<GetResidencyTask>();
+      CLIO_CO_AWAIT(GetResidency(typed_task));
+      break;
+    }
     case Method::kGetBlobSize: {
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<GetBlobSizeTask>();
@@ -426,6 +431,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kGetResidency: {
+      auto& typed_task = task_ptr.template Cast<GetResidencyTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kGetBlobSize: {
       auto& typed_task = task_ptr.template Cast<GetBlobSizeTask>();
       archive << *typed_task;
@@ -628,6 +638,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kGetBlobScore: {
       auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kGetResidency: {
+      auto& typed_task = task_ptr.template Cast<GetResidencyTask>();
       archive >> *typed_task;
       break;
     }
@@ -862,6 +877,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
     }
     case Method::kGetBlobScore: {
       auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kGetResidency: {
+      auto& typed_task = task_ptr.template Cast<GetResidencyTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task;
       break;
@@ -1106,6 +1127,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kGetBlobScore: {
       auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kGetResidency: {
+      auto& typed_task = task_ptr.template Cast<GetResidencyTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -1480,6 +1507,17 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kGetResidency: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<GetResidencyTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<GetResidencyTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetResidencyTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kGetBlobSize: {
       // Allocate new task
       auto new_task_ptr = ipc_manager->NewTask<GetBlobSizeTask>();
@@ -1724,6 +1762,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<GetBlobScoreTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kGetResidency: {
+      auto new_task_ptr = ipc_manager->NewTask<GetResidencyTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kGetBlobSize: {
       auto new_task_ptr = ipc_manager->NewTask<GetBlobSizeTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
@@ -1916,6 +1958,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kGetBlobScore: {
       auto& typed_task = orig_task.template Cast<GetBlobScoreTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kGetResidency: {
+      auto& typed_task = orig_task.template Cast<GetResidencyTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }

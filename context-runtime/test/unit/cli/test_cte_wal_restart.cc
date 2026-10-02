@@ -149,17 +149,23 @@ TEST_CASE("CteWalRestart - WAL snapshot, replay on daemon restart",
   auto* ipc = CLIO_IPC;
   REQUIRE(ipc != nullptr);
 
-  auto put_blob = [&](const clio::cte::core::TagId& tag_id,
-                      const std::string& name, char fill) {
+  auto put_blob_flagged = [&](const clio::cte::core::TagId& tag_id,
+                              const std::string& name, char fill,
+                              clio::run::u32 flags) {
     constexpr size_t kSize = 4096;
     ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(kSize);
     REQUIRE(!buf.IsNull());
     memset(buf.ptr_, fill, kSize);
     ctp::ipc::ShmPtr<> shm_ref(buf.shm_);
-    auto put = cte->AsyncPutBlob(tag_id, name, 0, kSize, shm_ref, 1.0f);
+    auto put = cte->AsyncPutBlob(tag_id, name, 0, kSize, shm_ref, 1.0f,
+                                 clio::cte::core::Context(), flags);
     put.Wait();
     REQUIRE(put->GetReturnCode() == 0);
     ipc->FreeBuffer(buf);
+  };
+  auto put_blob = [&](const clio::cte::core::TagId& tag_id,
+                      const std::string& name, char fill) {
+    put_blob_flagged(tag_id, name, fill, 0);
   };
 
   // Tag with two blobs; delete one (kCreateTag/kCreateNewBlob/kDelBlob WAL).
@@ -168,6 +174,10 @@ TEST_CASE("CteWalRestart - WAL snapshot, replay on daemon restart",
   REQUIRE(tag_a->GetReturnCode() == 0);
   put_blob(tag_a->tag_id_, "blob_keep", 'k');
   put_blob(tag_a->tag_id_, "blob_drop", 'd');
+  // Droppable blob written BEFORE the snapshot: its droppability has to
+  // survive via the snapshot's blob record, not the WAL.
+  put_blob_flagged(tag_a->tag_id_, "blob_droppable_pre", 'x',
+                   clio::cte::core::kCtePutDroppable);
   auto del_blob = cte->AsyncDelBlob(tag_a->tag_id_, "blob_drop");
   del_blob.Wait();
   REQUIRE(del_blob->GetReturnCode() == 0);
@@ -190,6 +200,12 @@ TEST_CASE("CteWalRestart - WAL snapshot, replay on daemon restart",
   tag_c.Wait();
   REQUIRE(tag_c->GetReturnCode() == 0);
   put_blob(tag_c->tag_id_, "blob_post_snapshot", 'p');
+  // ...and one AFTER it, which can only return through the WAL record. Between
+  // them both persistence paths are written and re-read by the restart.
+  //
+  // This pins that the restore PARSES both formats: a malformed record fails
+  // the re-compose below. It does not pin that the bit came back set, which
+  // would need a client that reconnects to the restarted daemon.
 
   // --- Phase 2: clean stop.
   REQUIRE(RunCliTimed({"stop", "--grace-period", "2000"}, 90) == 0);

@@ -69,7 +69,6 @@ bool CLIO_CFS_CLIENT_INIT(const std::string &config_path,
   return true;
 }
 
-#if !defined(_WIN32)
 // Descriptor layer -- POSIX only, see filesystem_client.h.
 
 /**
@@ -127,24 +126,24 @@ int Client::OpenFd(const std::string &raw_path, int flags, int mode) {
   return fd;
 }
 
-ssize_t Client::ReadFd(int fd, void *buf, size_t count) {
+FsSsize Client::ReadFd(int fd, void *buf, size_t count) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
   }
-  ssize_t n = Read(of.handle, of.path, of.off, buf, count);
+  FsSsize n = Read(of.handle, of.path, of.off, buf, count);
   if (n > 0) {
     AdvanceFd(fd, static_cast<clio::run::u64>(n));
   }
   return n;
 }
 
-ssize_t Client::WriteFd(int fd, const void *buf, size_t count) {
+FsSsize Client::WriteFd(int fd, const void *buf, size_t count) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
   }
-  ssize_t n = Write(of.handle, of.path, of.off, buf, count,
+  FsSsize n = Write(of.handle, of.path, of.off, buf, count,
                                      IsSyncFd(of.flags));
   if (n > 0) {
     AdvanceFd(fd, static_cast<clio::run::u64>(n));
@@ -152,7 +151,7 @@ ssize_t Client::WriteFd(int fd, const void *buf, size_t count) {
   return n;
 }
 
-ssize_t Client::PreadFd(int fd, void *buf, size_t count, off_t offset) {
+FsSsize Client::PreadFd(int fd, void *buf, size_t count, FsOff offset) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
@@ -161,7 +160,7 @@ ssize_t Client::PreadFd(int fd, void *buf, size_t count, off_t offset) {
                                static_cast<clio::run::u64>(offset), buf, count);
 }
 
-ssize_t Client::PwriteFd(int fd, const void *buf, size_t count, off_t offset) {
+FsSsize Client::PwriteFd(int fd, const void *buf, size_t count, FsOff offset) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
@@ -171,7 +170,7 @@ ssize_t Client::PwriteFd(int fd, const void *buf, size_t count, off_t offset) {
                                 IsSyncFd(of.flags));
 }
 
-off_t Client::SeekFd(int fd, off_t offset, int whence) {
+FsOff Client::SeekFd(int fd, FsOff offset, int whence) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
@@ -199,7 +198,7 @@ off_t Client::SeekFd(int fd, off_t offset, int whence) {
       errno = EINVAL;
       return -1;
   }
-  off_t newoff = static_cast<off_t>(base) + offset;
+  FsOff newoff = static_cast<FsOff>(base) + offset;
   if (newoff < 0) {
     errno = EINVAL;
     return -1;
@@ -214,15 +213,15 @@ off_t Client::SeekFd(int fd, off_t offset, int whence) {
   return newoff;
 }
 
-off_t Client::TellFd(int fd) {
+FsOff Client::TellFd(int fd) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
   }
-  return static_cast<off_t>(of.off);
+  return static_cast<FsOff>(of.off);
 }
 
-off_t Client::SizeFd(int fd) {
+FsOff Client::SizeFd(int fd) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
@@ -231,7 +230,7 @@ off_t Client::SizeFd(int fd) {
   if (!GetSize(of.path, &size)) {
     return -1;
   }
-  return static_cast<off_t>(size);
+  return static_cast<FsOff>(size);
 }
 
 int Client::SyncFd(int fd) {
@@ -245,7 +244,7 @@ int Client::SyncFd(int fd) {
   return Flush(of.path);
 }
 
-int Client::FtruncateFd(int fd, off_t length) {
+int Client::FtruncateFd(int fd, FsOff length) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
@@ -253,7 +252,7 @@ int Client::FtruncateFd(int fd, off_t length) {
   return TruncatePath(std::string(kClioPrefix) + of.path, length);
 }
 
-int Client::TruncatePath(const std::string &raw_path, off_t length) {
+int Client::TruncatePath(const std::string &raw_path, FsOff length) {
   if (!EnsureInit()) {
     errno = EIO;
     return -1;
@@ -358,6 +357,5 @@ int Client::CloseFd(int fd) {
   return (t->GetReturnCode() == 0) ? 0 : -1;
 }
 
-#endif  // !_WIN32
 
 }  // namespace clio::cte::filesystem

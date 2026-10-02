@@ -7,6 +7,19 @@ and running `clio_run compose`. Supports both bare-metal and container modes.
 from jarvis_cd.core.pkg import Service
 from jarvis_cd.util import SizeType
 from jarvis_cd.shell.process import Rm, Mkdir
+
+
+# Cloud object-store device paths (s3://bucket/prefix, gcs://bucket/prefix).
+# These are URLs, not filesystem paths, so every host-side filesystem step
+# must skip them: os.path.dirname('s3://bucket/prefix') is 's3://bucket',
+# which Mkdir would happily create as a literal directory named 's3:'.
+CLOUD_PATH_PREFIXES = ('s3://', 'gcs://')
+
+
+def is_cloud_path(path):
+    """True if a CTE device path names a cloud object store rather than a
+    filesystem location."""
+    return path.startswith(CLOUD_PATH_PREFIXES)
 from jarvis_cd.shell import PsshExecInfo, Exec
 from jarvis_cd.util.container_utils import container_kwargs
 import yaml
@@ -162,7 +175,7 @@ class ClioCte(Service):
             yaml.dump(compose_config, f, default_flow_style=False, indent=2)
 
         for path, _, _ in devices:
-            if path.startswith('ram::'):
+            if path.startswith('ram::') or is_cloud_path(path):
                 continue
             parent_dir = os.path.dirname(path)
             if not parent_dir:
@@ -259,7 +272,10 @@ class ClioCte(Service):
             devices.extend(self._get_devices_from_resource_graph())
 
         for path, _, _ in devices:
-            if path.startswith('ram::'):
+            # Cloud tiers are skipped here deliberately: purging a bucket
+            # prefix is the pipeline's job (post_cmds), not clean()'s. Rm
+            # on 's3://...' would target a nonexistent local path anyway.
+            if path.startswith('ram::') or is_cloud_path(path):
                 continue
             try:
                 # Wrapped: file devices may live under /tmp, which the
@@ -346,7 +362,14 @@ class ClioCte(Service):
         storage_config = []
         for path, capacity, score in devices:
             is_ram = path.startswith('ram::')
-            bdev_type = 'ram' if is_ram else 'file'
+            if is_ram:
+                bdev_type = 'ram'
+            elif path.startswith('s3://'):
+                bdev_type = 's3'
+            elif path.startswith('gcs://'):
+                bdev_type = 'gcs'
+            else:
+                bdev_type = 'file'
             # CTE FlushData ranks targets by `persistence_level_` (string
             # in StorageDeviceConfig, mapped to enum kVolatile / kTemporary
             # / kLongTerm). The default is "volatile" for every device type

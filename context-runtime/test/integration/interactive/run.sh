@@ -23,7 +23,11 @@ elif [ -z "${IOWARP_CORE_ROOT:-}" ]; then
 fi
 
 DASHBOARD_PORT="${DASHBOARD_PORT:-5000}"
-NODE1_IP="172.28.0.10"
+# Must match node1's ipv4_address in docker-compose.yml (172.23.0.0/24). This
+# read 172.28.0.10 -- an address on no network this stack creates -- so socat
+# forwarded the dashboard to nothing. Not caught by CI: this script is a
+# developer convenience and no workflow runs it.
+NODE1_IP="172.23.0.10"
 NETWORK_NAME="interactive_interactive-cluster"
 
 cd "$SCRIPT_DIR"

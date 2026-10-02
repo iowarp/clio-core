@@ -36,6 +36,7 @@ jobs:
   check-version:
     name: Check tag matches version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
     - name: Checkout repository
@@ -106,7 +107,7 @@ jobs:
         python-version: '3.12'
 
     - name: Install cibuildwheel
-      run: pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build wheels
       env:
@@ -179,11 +180,20 @@ jobs:
     # builds against (#899; see adapter/libfuse/CMakeLists.txt). The choco
     # package installs to %ProgramFiles(x86)%\WinFsp, which is the CMake
     # default search path.
+    # Retry transient registry failures, then ASSERT the SDK is really there:
+    # choco has been observed to exit 0 on a community-feed 503 ("Unable to
+    # find package 'winfsp'"), after which the wheel silently built WITHOUT
+    # clio_cte_fuse.exe and the miss only surfaced ~40 minutes later in the
+    # test job, far from the cause (#1004).
     - name: Install WinFsp (FUSE adapter SDK)
-      run: choco install winfsp -y --no-progress
+      run: |
+        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
+        if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
+          throw "WinFsp SDK missing after the install succeeded -- failing HERE instead of shipping a wheel without the FUSE adapter (#1004)"
+        }
 
     - name: Install cibuildwheel
-      run: pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build Windows wheels
       env:
@@ -265,12 +275,12 @@ jobs:
         # cppzmq is the C++ header wrapper for zeromq; cereal and cppzmq
         # are header-only. msgpack-c is the C library (the recipe uses
         # the C API in serialize/msgpack_wrapper.h).
-        brew update
-        brew install cmake pkg-config \
+        bash CI/retry.sh brew update
+        bash CI/retry.sh brew install cmake pkg-config \
           yaml-cpp cereal msgpack-c libsodium zeromq cppzmq
 
     - name: Install cibuildwheel
-      run: pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build macOS wheels
       env:
@@ -368,13 +378,25 @@ jobs:
     - name: Checkout repository (for test script)
       uses: actions/checkout@v4
       with:
-        sparse-checkout: installers/pip
+        # CI/ as well as installers/pip: the image pull below goes through
+        # CI/retry.sh, which has to exist in the workspace.
+        sparse-checkout: |
+          installers/pip
+          CI
 
     - name: Download wheels
       uses: actions/download-artifact@v4
       with:
         name: wheels-${{ matrix.arch }}
         path: wheels/
+
+    # Pull with retry BEFORE the run. A registry hiccup makes `docker run`
+    # exit 125 -- "Error response from daemon: Get
+    # https://registry-1.docker.io/v2/..." -- which reads as a wheel failure
+    # but is Docker Hub being briefly unreachable. Pulling separately keeps the
+    # retry on the network step and off the test itself.
+    - name: Pull ${{ matrix.distro }}
+      run: bash CI/retry.sh docker pull ${{ matrix.distro }}
 
     - name: Test wheel in ${{ matrix.distro }}
       run: |
@@ -386,20 +408,41 @@ jobs:
 
             # Install Python
             if command -v apt-get &>/dev/null; then
-              apt-get update -qq
-              apt-get install -y -qq python3 python3-pip python3-venv >/dev/null 2>&1
+              for i in 1 2 3; do apt-get update -qq && break || sleep 5; done
+              for i in 1 2 3; do apt-get install -y -qq python3 python3-pip python3-venv >/dev/null 2>&1 && break || sleep 5; done
             elif command -v dnf &>/dev/null; then
               # RHEL8 family (rockylinux:8, #973): the stock python3 is 3.6,
               # older than the oldest wheel we build (cp310). Pull the 3.12
               # AppStream module and put it ahead of the stock interpreter so
               # the venv below matches a wheel we actually ship. Newer distros
               # fall through to their default python3.
-              if dnf install -y -q python3.12 python3.12-pip >/dev/null 2>&1; then
+              #
+              # The expat package is not a typo and not optional. The
+              # rockylinux:8 base image ships expat 2.2.5, but the current
+              # python3.12-3.12.14-1.el8_10
+              # (built 2026-08-24) links pyexpat against 2.4+ symbols, so
+              # importing pyexpat dies with:
+              #   undefined symbol: XML_SetBillionLaughsAttackProtection...
+              # pip imports it, so ensurepip fails and python3 -m venv
+              # aborts -- which is how this arrived, as every test-wheels leg
+              # going red overnight with no change on our side. Naming expat
+              # explicitly upgrades it to 2.5.0 alongside the interpreter.
+              #
+              # NOTE: this whole block is the body of a bash -c single-quoted
+              # string, so no apostrophe may appear anywhere in it, comments
+              # included -- one would close the string and truncate the script
+              # for every distro in the matrix, not just this branch.
+              if dnf install -y -q python3.12 python3.12-pip expat >/dev/null 2>&1; then
                 ln -sf /usr/bin/python3.12 /usr/local/bin/python3
               else
-                dnf install -y -q python3 python3-pip >/dev/null 2>&1
+                dnf install -y -q python3 python3-pip expat >/dev/null 2>&1
               fi
             fi
+
+            # Fail loudly here rather than 20 lines down. Both branches above
+            # swallow their output, so a broken interpreter used to surface as
+            # an opaque ensurepip traceback from the venv step.
+            python3 -c "import pyexpat, ssl, sys; print(\"interpreter OK:\", sys.version)"
 
             # Create clean venv
             python3 -m venv /tmp/test-venv
@@ -409,9 +452,9 @@ jobs:
             # A by-name install (iowarp-core) lets pip consider PyPI, where the
             # same version may already be published with older metadata, and
             # use that PyPI metadata instead of this wheel — so a changed
-            # dependency set (e.g. flask promoted to a core dep) would not be
+            # dependency set would not be
             # exercised. Selecting the wheel file for this Python tag forces
-            # the local artifact; runtime deps (flask, pyyaml, ...) still
+            # the local artifact; runtime deps (pyyaml, msgpack, ...) still
             # resolve from PyPI via --find-links + the default index.
             PYTAG=cp$(python -c "import sys; print(str(sys.version_info[0]) + str(sys.version_info[1]))")
             WHEEL=$(ls /wheels/iowarp_core-*-${PYTAG}-*.whl | head -1)
@@ -425,12 +468,6 @@ jobs:
 
             echo "=== CLI test ==="
             clio_run --help
-
-            echo "=== Context visualizer (standard feature) ==="
-            # flask is a core dependency, so the dashboard works out of the
-            # box. Verify the package imports and the console script runs.
-            python -c "import context_visualizer; print(\"visualizer import OK\")"
-            context-visualizer --help
 
             echo "=== Benchmark binaries: --help smoke test ==="
             # NOTE: This entire docker invocation is wrapped in bash -c
@@ -466,7 +503,7 @@ jobs:
             # fuse3 runtime like an end user would, then apply the same
             # signal-level heuristic as the benchmarks above.
             if command -v apt-get &>/dev/null; then
-              apt-get install -y -qq fuse3 libfuse3-3 >/dev/null 2>&1
+              for i in 1 2 3; do apt-get install -y -qq fuse3 libfuse3-3 >/dev/null 2>&1 && break || sleep 5; done
             elif command -v dnf &>/dev/null; then
               dnf install -y -q fuse3 fuse3-libs >/dev/null 2>&1
             fi
@@ -585,11 +622,6 @@ jobs:
         echo "=== CLI test ==="
         clio_run --help
 
-        echo "=== Context visualizer (standard feature) ==="
-        # flask is a core dependency, so the dashboard works out of the box.
-        python -c "import context_visualizer; print('visualizer import OK')"
-        context-visualizer --help
-
         echo "=== Benchmark binaries: --help smoke test ==="
         # Catch SIGSEGV / abort at load time. Bench --help exit codes
         # are allowed to be non-zero; only signal-level deaths fail us.
@@ -639,6 +671,17 @@ jobs:
     timeout-minutes: 30
 
     steps:
+    # FIRST step on purpose: actions/checkout cleans the workspace, so running
+    # it after download-artifact deletes the very artifact this job tests
+    # ("Cannot find path ...\\wheels because it does not exist"). Sparse
+    # because the job needs only the retry helper, not the tree -- without a
+    # checkout at all the helper is absent and the step dies with "The argument
+    # 'CI/Retry.ps1' is not recognized as the name of a script file".
+    - name: Check out CI helpers
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -654,7 +697,7 @@ jobs:
     # install this from winfsp.dev. The DLL lives under
     # %ProgramFiles(x86)%\WinFsp\bin, which is not on PATH by default.
     - name: Install WinFsp (FUSE adapter runtime)
-      run: choco install winfsp -y --no-progress
+      run: pwsh CI/Retry.ps1 choco install winfsp -y --no-progress
 
     - name: Test wheel in clean venv
       shell: pwsh
@@ -687,15 +730,6 @@ jobs:
         # crash; positive small codes are app-level "I printed usage".
         if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
           throw "clio_run --help died with exit code $LASTEXITCODE (likely missing DLL or binary)"
-        }
-
-        Write-Host "=== Context visualizer (standard feature) ==="
-        # flask is a core dependency, so the dashboard works out of the box.
-        python -c "import context_visualizer; print('visualizer import OK')"
-        if ($LASTEXITCODE -ne 0) { throw "context_visualizer import failed" }
-        context-visualizer --help
-        if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
-          throw "context-visualizer --help died with exit code $LASTEXITCODE"
         }
 
         Write-Host "=== Benchmark binaries: --help smoke test ==="
@@ -749,6 +783,7 @@ jobs:
       - test-wheels-macos
       - test-wheels-windows
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: startsWith(github.ref, 'refs/tags/v')
     environment:
       name: pypi
@@ -804,6 +839,7 @@ jobs:
       - test-wheels-macos
       - test-wheels-windows
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write

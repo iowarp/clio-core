@@ -80,10 +80,22 @@ enum class RuntimeMode {
  * @return true if initialization successful, false otherwise
  *
  * Environment variable:
- *   CLIO_WITH_RUNTIME=1 - Start runtime regardless of mode
+ *   CLIO_WITH_RUNTIME=1 - Make sure a runtime is available (see below)
  *   CLIO_WITH_RUNTIME=0 - Don't start runtime (client only)
  *   (CLIO_WITH_RUNTIME is honored as a legacy alias via env::GetCompat.)
  *   If not set, uses default_with_runtime parameter
+ *
+ * In kClient mode, "with runtime" means TRY-TO-BE-THE-RUNTIME-ELSE-ATTACH
+ * (issue #1015): this process attempts ServerInit, and if the port is already
+ * bound it falls back to ClientInit and attaches to whoever owns it. ZMQ's bind
+ * is the arbiter, so N processes launched at once (e.g. mpirun -np 4) elect
+ * exactly one runtime host between them with no extra coordination.
+ *
+ * A port held by some other program falls out of the same path: ServerInit
+ * cannot bind and ClientInit finds nobody answering, so initialization fails.
+ *
+ * kServer/kRuntime mode is unchanged: `clio_run runtime start` is an explicit
+ * "be the runtime" and still fails when one is already running.
  */
 bool ClioInitImpl(RuntimeMode mode, bool default_with_runtime,
                   bool is_restart);

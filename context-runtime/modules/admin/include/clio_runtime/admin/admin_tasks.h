@@ -87,17 +87,27 @@ struct CreateParams {
 };
 
 /**
- * BaseCreateTask - Templated base class for all ChiMod CreateTasks
- * @tparam CreateParamsT The parameter structure containing chimod-specific
- * configuration
- * @tparam MethodId The method ID for this task type
- * @tparam IS_ADMIN Whether this is an admin operation (sets volatile variable)
- * @tparam DO_COMPOSE Whether this task is called from compose (minimal error
- * checking)
+ * CreatePoolFields - the pool-operation state every ChiMod's create task
+ * carries, in a type that does NOT depend on which CreateParams it was built
+ * for.
+ *
+ * It exists so the runtime can reach those fields on a create task whose
+ * CreateParamsT it cannot know. PoolManager::CreatePool serves every ChiMod:
+ * admin::CreateTask, GetOrCreatePoolTask<XConfig> and ComposeTask<XConfig> all
+ * arrive there as a plain Task, and there is no one instantiation of
+ * BaseCreateTask that names them all. It used to reinterpret_cast to an
+ * arbitrary one; every instantiation lays these members out identically, so it
+ * worked, but reading an object through an unrelated type is undefined
+ * behaviour, and UBSan's vptr check said so on all 187 tests that create a
+ * pool. Downcasting to this shared base is the same access, spelled in a way
+ * the language defines.
+ *
+ * Layout is deliberately unchanged: single non-virtual inheritance that adds
+ * no virtual function of its own keeps the Task subobject at offset 0 and
+ * these members after it, exactly where they were. That matters here -- these
+ * tasks live in shared memory and are serialized field by field.
  */
-template <typename CreateParamsT, clio::run::u32 MethodId = Method::kCreate,
-          bool IS_ADMIN = false, bool DO_COMPOSE = false>
-struct BaseCreateTask : public clio::run::Task {
+struct CreatePoolFields : public clio::run::Task {
   // Pool operation parameters
   INOUT clio::run::priv::string chimod_name_;
   IN clio::run::priv::string pool_name_;
@@ -108,24 +118,155 @@ struct BaseCreateTask : public clio::run::Task {
   // Results for pool operations
   OUT clio::run::priv::string error_message_;
 
-  // Flags set by template parameters (must be serialized for remote execution)
+  // Flags set by the derived task's template parameters (must be serialized
+  // for remote execution)
   bool is_admin_;
   bool do_compose_;
 
   // Client pointer for PostWait callback (not serialized)
   clio::run::ContainerClient *client_;
 
-  /** SHM default constructor */
-  BaseCreateTask()
+  /** SHM default constructor. The flags come from the derived task's template
+   *  arguments, which this base cannot see. */
+  CTP_CROSS_FUN CreatePoolFields(bool is_admin, bool do_compose)
       : clio::run::Task(),
         chimod_name_(CLIO_PRIV_ALLOC),
         pool_name_(CLIO_PRIV_ALLOC),
         chimod_params_(CLIO_PRIV_ALLOC),
         new_pool_id_(clio::run::PoolId::GetNull()),
         error_message_(CLIO_PRIV_ALLOC),
-        is_admin_(IS_ADMIN),
-        do_compose_(DO_COMPOSE),
-        client_(nullptr) {
+        is_admin_(is_admin),
+        do_compose_(do_compose),
+        client_(nullptr) {}
+
+  /** Emplace constructor. The two name parameters are templated so one
+   *  definition serves every spelling the derived constructors use --
+   *  std::string, const char*, and the mix of the two -- since priv::string
+   *  accepts them all. chimod_params_ is left empty: what goes in it depends
+   *  on CreateParamsT, so only the derived constructor can fill it. */
+  template <typename ChimodNameT, typename PoolNameT>
+  CTP_CROSS_FUN CreatePoolFields(const clio::run::TaskId &task_node,
+                                 const clio::run::PoolId &task_pool_id,
+                                 const clio::run::PoolQuery &pool_query,
+                                 const ChimodNameT &chimod_name,
+                                 const PoolNameT &pool_name,
+                                 const clio::run::PoolId &target_pool_id,
+                                 clio::run::ContainerClient *client,
+                                 bool is_admin, bool do_compose)
+      : clio::run::Task(task_node, task_pool_id, pool_query, 0),
+        chimod_name_(CLIO_PRIV_ALLOC, chimod_name),
+        pool_name_(CLIO_PRIV_ALLOC, pool_name),
+        chimod_params_(CLIO_PRIV_ALLOC),
+        new_pool_id_(target_pool_id),
+        error_message_(CLIO_PRIV_ALLOC),
+        is_admin_(is_admin),
+        do_compose_(do_compose),
+        client_(client) {}
+
+#if CTP_IS_HOST
+  /**
+   * Deserialize chimod_params_ as @p CreateParamsT.
+   *
+   * The params type belongs to the READER, not to the object: what is in
+   * chimod_params_ is either a serialized CreateParams written by the same
+   * ChiMod that is now reading it, or -- in compose mode -- a PoolConfig whose
+   * YAML that ChiMod's config parses via LoadConfig. Which is why this is a
+   * member template on the shared base rather than a member of one
+   * instantiation: the runtime routinely hands a ChiMod a create task that was
+   * BUILT as some other instantiation (the compose path builds
+   * ComposeTask<PoolConfig> for every pool it brings up), and calling a member
+   * of the reader's instantiation on that object is undefined behaviour --
+   * UBSan's vptr check reports it on exactly the tests that take that path.
+   */
+  template <typename CreateParamsT>
+  CreateParamsT GetParamsAs() const {
+    if (do_compose_) {
+      // Compose mode: deserialize PoolConfig and load into CreateParams
+      clio::run::PoolConfig pool_config =
+          clio::run::Task::Deserialize<clio::run::PoolConfig>(chimod_params_);
+      CreateParamsT params;
+      params.LoadConfig(pool_config);
+      return params;
+    }
+    // Normal mode: deserialize CreateParams directly
+    return clio::run::Task::Deserialize<CreateParamsT>(chimod_params_);
+  }
+
+  /** Serialize @p CreateParamsT into chimod_params_. Does nothing in compose
+   *  mode, where chimod_params_ holds the PoolConfig instead. See
+   *  GetParamsAs for why the params type is a parameter of the call. */
+  template <typename CreateParamsT, typename... Args>
+  void SetParamsAs(Args &&...args) {
+    if (do_compose_) {
+      return;  // Skip SetParams in compose mode
+    }
+    CreateParamsT params(std::forward<Args>(args)...);
+    clio::run::Task::Serialize(CLIO_PRIV_ALLOC, chimod_params_, params);
+  }
+#endif
+
+  /**
+   * AggregateOut replica results into this task.
+   *
+   * Lives here, not on BaseCreateTask, for the same reason as GetParamsAs: the
+   * generated AggregateOut dispatch reaches a create task through whatever
+   * instantiation the ChiMod's method table names, which is not the one the
+   * object was built as. It touches only the fields above, so the shared base
+   * is where it belongs.
+   */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    // OUT fields ONLY (issue #856). Pool creation is BROADCAST, so this runs
+    // once per surviving node with a foreign replica. Delegating to Copy()
+    // ran Task::Copy — overwriting the ORIGIN's task_id_, pool_query_ and
+    // completer_ with the replica's while send_map_/completion bookkeeping
+    // still referenced the origin — and re-assigned IN priv::strings across
+    // shared-memory segments (free() through the wrong allocator). See the
+    // RecoverContainersTask note: that is the `free(): invalid pointer`
+    // abort behind the leader-election recovery crash.
+    auto other = other_base.template Cast<CreatePoolFields>();
+    // Every replica creates the same pool and reports the same id; take the
+    // first non-null so a later empty answer cannot erase it.
+    if (new_pool_id_.IsNull()) {
+      new_pool_id_ = other->new_pool_id_;
+    }
+    if (error_message_.size() == 0 && other->error_message_.size() > 0) {
+      error_message_ = other->error_message_;
+    }
+    // A replica that could not be delivered because its target node DIED must
+    // not fail the whole create (issue #856). Pool creation is a broadcast:
+    // Task::AggregateOut propagates any non-zero replica RC to the origin, so
+    // one unreachable node turned an otherwise-successful create into an
+    // error — which is exactly what the leader-election suite asserts on right
+    // after it kills a node (and, before dead-node tasks completed at all,
+    // what HUNG instead). The pool genuinely exists once any node created it
+    // and reported its id; the dead node's container is created when it
+    // rejoins or when recovery redistributes it. Only the network-timeout RC
+    // is forgiven — a real create failure still propagates.
+    if (!new_pool_id_.IsNull() &&
+        GetReturnCode() == clio::run::kRun2RunNetworkTimeoutRC) {
+      SetReturnCode(0);
+    }
+  }
+};
+
+/**
+ * BaseCreateTask - Templated base class for all ChiMod CreateTasks
+ * @tparam CreateParamsT The parameter structure containing chimod-specific
+ * configuration
+ * @tparam MethodId The method ID for this task type
+ * @tparam IS_ADMIN Whether this is an admin operation (sets volatile variable)
+ * @tparam DO_COMPOSE Whether this task is called from compose (minimal error
+ * checking)
+ *
+ * Everything that does not depend on CreateParamsT lives in CreatePoolFields
+ * above; see the note there for why that split exists.
+ */
+template <typename CreateParamsT, clio::run::u32 MethodId = Method::kCreate,
+          bool IS_ADMIN = false, bool DO_COMPOSE = false>
+struct BaseCreateTask : public CreatePoolFields {
+  /** SHM default constructor */
+  BaseCreateTask() : CreatePoolFields(IS_ADMIN, DO_COMPOSE) {
 #if CTP_IS_HOST
     HLOG(kDebug,
          "BaseCreateTask default constructor: IS_ADMIN={}, DO_COMPOSE={}, "
@@ -141,15 +282,9 @@ struct BaseCreateTask : public clio::run::Task {
       const clio::run::PoolQuery &pool_query, const std::string &chimod_name,
       const std::string &pool_name, const clio::run::PoolId &target_pool_id,
       clio::run::ContainerClient *client, CreateParamsArgs &&...create_params_args)
-      : clio::run::Task(task_node, task_pool_id, pool_query, 0),
-        chimod_name_(CLIO_PRIV_ALLOC, chimod_name),
-        pool_name_(CLIO_PRIV_ALLOC, pool_name),
-        chimod_params_(CLIO_PRIV_ALLOC),
-        new_pool_id_(target_pool_id),
-        error_message_(CLIO_PRIV_ALLOC),
-        is_admin_(IS_ADMIN),
-        do_compose_(DO_COMPOSE),
-        client_(client) {
+      : CreatePoolFields(task_node, task_pool_id, pool_query, chimod_name,
+                         pool_name, target_pool_id, client, IS_ADMIN,
+                         DO_COMPOSE) {
     // Initialize base task
     task_id_ = task_node;
     method_ = MethodId;
@@ -178,15 +313,9 @@ struct BaseCreateTask : public clio::run::Task {
       const clio::run::PoolQuery &pool_query, const char *chimod_name,
       const std::string &pool_name, const clio::run::PoolId &target_pool_id,
       clio::run::ContainerClient *client)
-      : clio::run::Task(task_node, task_pool_id, pool_query, 0),
-        chimod_name_(CLIO_PRIV_ALLOC, chimod_name),
-        pool_name_(CLIO_PRIV_ALLOC, pool_name),
-        chimod_params_(CLIO_PRIV_ALLOC),
-        new_pool_id_(target_pool_id),
-        error_message_(CLIO_PRIV_ALLOC),
-        is_admin_(IS_ADMIN),
-        do_compose_(DO_COMPOSE),
-        client_(client) {
+      : CreatePoolFields(task_node, task_pool_id, pool_query, chimod_name,
+                         pool_name, target_pool_id, client, IS_ADMIN,
+                         DO_COMPOSE) {
     // Initialize base task
     task_id_ = task_node;
     method_ = MethodId;
@@ -215,15 +344,10 @@ struct BaseCreateTask : public clio::run::Task {
       const clio::run::PoolQuery &pool_query, const char *chimod_name,
       const char *pool_name, const clio::run::PoolId &target_pool_id,
       clio::run::ContainerClient *client)
-      : clio::run::Task(task_node, task_pool_id, pool_query, 0),
-        chimod_name_(CLIO_PRIV_ALLOC, chimod_name),
-        pool_name_(CLIO_PRIV_ALLOC, pool_name),
-        chimod_params_(CLIO_PRIV_ALLOC),
-        new_pool_id_(target_pool_id),
-        error_message_(CLIO_PRIV_ALLOC),
-        is_admin_(IS_ADMIN),
-        do_compose_(false),
-        client_(client) {
+      // do_compose_ is hard-false here rather than DO_COMPOSE, as it was
+      // before this constructor delegated.
+      : CreatePoolFields(task_node, task_pool_id, pool_query, chimod_name,
+                         pool_name, target_pool_id, client, IS_ADMIN, false) {
     task_id_ = task_node;
     method_ = MethodId;
     task_flags_.Clear();
@@ -236,15 +360,9 @@ struct BaseCreateTask : public clio::run::Task {
                           const clio::run::PoolId &task_pool_id,
                           const clio::run::PoolQuery &pool_query,
                           const clio::run::PoolConfig &pool_config)
-      : clio::run::Task(task_node, task_pool_id, pool_query, 0),
-        chimod_name_(CLIO_PRIV_ALLOC, pool_config.mod_name_),
-        pool_name_(CLIO_PRIV_ALLOC, pool_config.pool_name_),
-        chimod_params_(CLIO_PRIV_ALLOC),
-        new_pool_id_(pool_config.pool_id_),
-        error_message_(CLIO_PRIV_ALLOC),
-        is_admin_(IS_ADMIN),
-        do_compose_(DO_COMPOSE),
-        client_(nullptr) {
+      : CreatePoolFields(task_node, task_pool_id, pool_query,
+                         pool_config.mod_name_, pool_config.pool_name_,
+                         pool_config.pool_id_, nullptr, IS_ADMIN, DO_COMPOSE) {
 #if CTP_IS_HOST
     HLOG(kDebug,
          "BaseCreateTask COMPOSE constructor: IS_ADMIN={}, DO_COMPOSE={}, "
@@ -268,11 +386,8 @@ struct BaseCreateTask : public clio::run::Task {
    */
   template <typename... Args>
   void SetParams(Args &&...args) {
-    if (do_compose_) {
-      return;  // Skip SetParams in compose mode
-    }
-    CreateParamsT params(std::forward<Args>(args)...);
-    clio::run::Task::Serialize(CLIO_PRIV_ALLOC, chimod_params_, params);
+    CreatePoolFields::template SetParamsAs<CreateParamsT>(
+        std::forward<Args>(args)...);
   }
 
   /**
@@ -281,17 +396,7 @@ struct BaseCreateTask : public clio::run::Task {
    * LoadConfig
    */
   CreateParamsT GetParams() const {
-    if (do_compose_) {
-      // Compose mode: deserialize PoolConfig and load into CreateParams
-      clio::run::PoolConfig pool_config =
-          clio::run::Task::Deserialize<clio::run::PoolConfig>(chimod_params_);
-      CreateParamsT params;
-      params.LoadConfig(pool_config);
-      return params;
-    } else {
-      // Normal mode: deserialize CreateParams directly
-      return clio::run::Task::Deserialize<CreateParamsT>(chimod_params_);
-    }
+    return CreatePoolFields::template GetParamsAs<CreateParamsT>();
   }
 #else
   CTP_GPU_FUN CreateParamsT GetParams() const {
@@ -360,42 +465,6 @@ struct BaseCreateTask : public clio::run::Task {
 #endif
   }
 
-  /** AggregateOut replica results into this task */
-  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
-    Task::AggregateOut(other_base);
-    // OUT fields ONLY (issue #856). Pool creation is BROADCAST, so this runs
-    // once per surviving node with a foreign replica. Delegating to Copy()
-    // ran Task::Copy — overwriting the ORIGIN's task_id_, pool_query_ and
-    // completer_ with the replica's while send_map_/completion bookkeeping
-    // still referenced the origin — and re-assigned IN priv::strings across
-    // shared-memory segments (free() through the wrong allocator). See the
-    // RecoverContainersTask note: that is the `free(): invalid pointer`
-    // abort behind the leader-election recovery crash.
-    auto other = other_base.template Cast<BaseCreateTask>();
-    // Every replica creates the same pool and reports the same id; take the
-    // first non-null so a later empty answer cannot erase it.
-    if (new_pool_id_.IsNull()) {
-      new_pool_id_ = other->new_pool_id_;
-    }
-    if (error_message_.size() == 0 && other->error_message_.size() > 0) {
-      error_message_ = other->error_message_;
-    }
-    // A replica that could not be delivered because its target node DIED must
-    // not fail the whole create (issue #856). Pool creation is a broadcast:
-    // Task::AggregateOut propagates any non-zero replica RC to the origin, so
-    // one unreachable node turned an otherwise-successful create into an
-    // error — which is exactly what the leader-election suite asserts on right
-    // after it kills a node (and, before dead-node tasks completed at all,
-    // what HUNG instead). The pool genuinely exists once any node created it
-    // and reported its id; the dead node's container is created when it
-    // rejoins or when recovery redistributes it. Only the network-timeout RC
-    // is forgiven — a real create failure still propagates.
-    if (!new_pool_id_.IsNull() &&
-        GetReturnCode() == clio::run::kRun2RunNetworkTimeoutRC) {
-      SetReturnCode(0);
-    }
-  }
-
   /**
    * Post-wait callback called after task completion
    * Sets client_->pool_id_ and client_->return_code_ from task results
@@ -429,6 +498,13 @@ struct BaseCreateTask : public clio::run::Task {
  * Uses MethodId=kCreate and IS_ADMIN=true
  */
 using CreateTask = BaseCreateTask<CreateParams, Method::kCreate, true>;
+
+// The CreatePoolFields split must stay free: these tasks are placed in shared
+// memory and serialized field by field, and PoolManager::CreatePool downcasts
+// to the base expecting the very same object. Adding a data member or a
+// virtual function to BaseCreateTask would break both, silently.
+static_assert(sizeof(CreateTask) == sizeof(CreatePoolFields),
+              "BaseCreateTask must add no storage to CreatePoolFields");
 
 /**
  * GetOrCreatePoolTask - Template typedef for pool creation by external ChiMods
@@ -524,7 +600,16 @@ struct DestroyPoolTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<DestroyPoolTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<DestroyPoolTask>();
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 
@@ -606,7 +691,16 @@ struct StopRuntimeTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<StopRuntimeTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<StopRuntimeTask>();
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 
@@ -668,7 +762,16 @@ struct FlushTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<FlushTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<FlushTask>();
+    // Flush is broadcast to every node and each reports the work IT did, so
+    // the collective figure is the SUM. This is the field the flush loop polls
+    // to decide whether the system is quiesced: clobbering it with the last
+    // replica's count (what the whole-task copy did) makes a busy system look
+    // idle as soon as one node happens to be.
+    total_work_done_ += replica->total_work_done_;
   }
 };
 
@@ -763,7 +866,16 @@ struct SendTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<SendTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<SendTask>();
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 
@@ -832,7 +944,16 @@ struct RecvTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<RecvTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<RecvTask>();
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 
@@ -989,7 +1110,46 @@ struct ClientConnectTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ClientConnectTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ClientConnectTask>();
+    // The handshake describes ONE runtime instance's shm layout — allocator
+    // ids, queue offsets, worker tids, GPU IPC handles. There is no meaningful
+    // N-to-1 merge of two different runtimes' layouts, so the first replica to
+    // answer wins and later ones are ignored (server_pid_ is 0 until a replica
+    // has filled the block). Aggregating instead of copying keeps the origin's
+    // identity intact either way.
+    if (server_pid_ != 0) {
+      return;
+    }
+    response_ = replica->response_;
+    server_generation_ = replica->server_generation_;
+    server_pid_ = replica->server_pid_;
+    worker_queues_off_ = replica->worker_queues_off_;
+    shm_in_shards_ = replica->shm_in_shards_;
+    main_alloc_id_ = replica->main_alloc_id_;
+    queue_alloc_id_ = replica->queue_alloc_id_;
+    metadata_dir_off_ = replica->metadata_dir_off_;
+    num_gpus_ = replica->num_gpus_;
+    gpu_queue_depth_ = replica->gpu_queue_depth_;
+    num_worker_tids_ = replica->num_worker_tids_;
+    for (clio::run::u32 i = 0; i < kMaxWorkerTids; ++i) {
+      worker_tids_[i] = replica->worker_tids_[i];
+    }
+    for (clio::run::u32 i = 0; i < kMaxGpuDevices; ++i) {
+      cpu2gpu_queue_off_[i] = replica->cpu2gpu_queue_off_[i];
+      gpu2cpu_queue_off_[i] = replica->gpu2cpu_queue_off_[i];
+      gpu2gpu_queue_off_[i] = replica->gpu2gpu_queue_off_[i];
+      cpu2gpu_backend_size_[i] = replica->cpu2gpu_backend_size_[i];
+      gpu2cpu_backend_size_[i] = replica->gpu2cpu_backend_size_[i];
+    }
+    for (clio::run::u32 i = 0; i < kMaxGpuDevices; ++i) {
+      const char *src = replica->gpu2gpu_ipc_handle_bytes_[i];
+      for (size_t b = 0; b < sizeof(gpu2gpu_ipc_handle_bytes_[i]); ++b) {
+        gpu2gpu_ipc_handle_bytes_[i][b] = src[b];
+      }
+    }
   }
 };
 
@@ -1040,7 +1200,13 @@ struct ClientRecvTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ClientRecvTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ClientRecvTask>();
+    // Each replica drains its own client queues, so the collective count is
+    // the SUM.
+    tasks_received_ += replica->tasks_received_;
   }
 };
 
@@ -1091,7 +1257,13 @@ struct ClientSendTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ClientSendTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ClientSendTask>();
+    // Each replica sends from its own client queues, so the collective count
+    // is the SUM.
+    tasks_sent_ += replica->tasks_sent_;
   }
 };
 
@@ -1158,7 +1330,12 @@ struct WreapDeadIpcsTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<WreapDeadIpcsTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<WreapDeadIpcsTask>();
+    // Each node reaps its own dead IPCs, so the collective count is the SUM.
+    reaped_count_ += replica->reaped_count_;
   }
 };
 
@@ -1396,7 +1573,19 @@ struct SubmitBatchTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<SubmitBatchTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<SubmitBatchTask>();
+    // Each replica completes its own slice of the batch, so the collective
+    // count is the SUM.
+    tasks_completed_ += replica->tasks_completed_;
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 
@@ -1523,7 +1712,21 @@ struct RegisterMemoryTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<RegisterMemoryTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<RegisterMemoryTask>();
+    // Registration must hold on EVERY node, so one failure fails the
+    // collective and is sticky: a failing replica also forces a non-zero
+    // return code, which stops any later success from setting the flag again.
+    if (!replica->success_) {
+      success_ = false;
+      if (GetReturnCode() == 0) {
+        SetReturnCode(1);
+      }
+    } else if (GetReturnCode() == 0) {
+      success_ = true;
+    }
   }
 };
 
@@ -1572,7 +1775,19 @@ struct RestartContainersTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<RestartContainersTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<RestartContainersTask>();
+    // Each node restarts the containers IT hosts, so the collective count is
+    // the SUM.
+    containers_restarted_ += replica->containers_restarted_;
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 
@@ -1685,7 +1900,20 @@ struct AddNodeTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<AddNodeTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<AddNodeTask>();
+    // Exactly one replica (the leader) allocates the id; the rest answer 0.
+    if (new_node_id_ == 0) {
+      new_node_id_ = replica->new_node_id_;
+    }
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 
@@ -1812,7 +2040,19 @@ struct MigrateContainersTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<MigrateContainersTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<MigrateContainersTask>();
+    // Migration is partitioned across nodes: each reports what IT moved, so
+    // the collective figure is the SUM.
+    num_migrated_ += replica->num_migrated_;
+    // error_message_ is diagnostic: keep the FIRST replica that reported one,
+    // so the failure that set the collective return code is the one the caller
+    // sees (last-replica-wins would hide it behind a later success).
+    if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
+      error_message_ = replica->error_message_;
+    }
   }
 };
 
@@ -2185,7 +2425,11 @@ struct SystemMonitorTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<SystemMonitorTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -2233,7 +2477,11 @@ struct AnnounceShutdownTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<AnnounceShutdownTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 

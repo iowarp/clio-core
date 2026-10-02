@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -68,6 +69,7 @@
 #include "clio_runtime/runtime_pid_record.h"
 #include "clio_runtime/scheduler/scheduler_factory.h"
 #include "clio_runtime/task_archives.h"
+#include "clio_ctp/util/msan.h"
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM
 #include <clio_ctp/util/gpu_api.h>
@@ -75,6 +77,27 @@
 
 // Global pointer variable definition for IPC manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::IpcManager, g_ipc_manager);
+
+/* Interruptible wait between liveness probes.
+ *
+ * The probe used to nap with a plain 1s sleep, which ClientFinalize's join()
+ * then had to sit through: EVERY client process paid up to a full second at
+ * exit, no matter how little work it did. That is invisible in a long-running
+ * application and lethal in a fan-out of short ones -- the netCDF-C tool tests
+ * spawn hundreds of one-file ncgen/ncdump processes, and a ~1s floor per
+ * process turned a 10s test into a ctest timeout (ncdump/tst_ncgen4 and
+ * friends). The condition variable lets the shutdown store wake the probe
+ * immediately while keeping the idle cost at one wakeup per second.
+ *
+ * Deliberately file-scope rather than IpcManager members: ipc_manager.h is
+ * included by every client of the runtime, and growing the class changes its
+ * layout -- any .so not rebuilt in the same pass then disagrees about where
+ * every following member lives, which shows up as a lock taken on the wrong
+ * address and a hang that looks nothing like its cause. There is one
+ * IpcManager per process (the g_ipc_manager global), so a process-wide pair is
+ * exactly as precise as members would be. */
+static std::mutex g_heartbeat_mtx;
+static std::condition_variable g_heartbeat_cv;
 
 namespace clio::run {
 
@@ -203,6 +226,12 @@ bool IpcManager::ClientInit() {
   if (is_initialized_) {
     return true;
   }
+  // A genuine (re)initialisation builds fresh transports, so clear the
+  // finalized flag (issue #970). Deliberately AFTER the early return above:
+  // when ClientInit is a no-op because the manager is already initialised, the
+  // transports torn down by a previous ClientFinalize are NOT rebuilt, and a
+  // wait on them must keep failing fast rather than parking forever.
+  client_finalized_.store(false, std::memory_order_release);
   // Optional Windows timer-resolution bump (CLIO_WIN_TIMER_MS, issue #768).
   ctp::SystemInfo::RequestTimerResolutionFromEnv();
 
@@ -356,6 +385,15 @@ bool IpcManager::ClientInit() {
   auto *tls_counter = new TaskCounter();
   CTP_THREAD_MODEL->SetTls(chi_task_counter_key_, tls_counter);
 
+  // CLIO_WAIT_SERVER is read once, here. WaitForLocalServer used to re-read
+  // it on every call, which overrode the short per-attempt caps the
+  // reconnect paths set -- a client with CLIO_WAIT_SERVER=60 spent a full
+  // minute per reconnect attempt against a dead runtime.
+  // Semantics: 0 = fail immediately, -1 = wait forever, >0 = seconds.
+  if (const char *wait_env = clio::run::env::GetCompat("WAIT_SERVER")) {
+    wait_server_timeout_ = static_cast<float>(std::atof(wait_env));
+  }
+
   // Wait for local server using lightbeam transport
   if (!WaitForLocalServer()) {
     HLOG(kError, "CRITICAL ERROR: Cannot connect to local server.");
@@ -478,6 +516,31 @@ bool IpcManager::ServerInit() {
     return false;
   }
 
+  // Claim the local server port before ANY state is created (issue #1015).
+  // Binding it is a kernel-level atomic claim, which makes it the natural
+  // mutual exclusion between processes racing to become this node's runtime:
+  // exactly one can win, and the losers fall back to attaching as clients.
+  //
+  // Placement is load-bearing at BOTH ends. It must come after the
+  // chi_cur_worker_key_ setup above -- binding takes a lock, and lock
+  // acquisition reads that TLS key, so claiming the port any earlier
+  // dereferences a garbage pointer and kills the daemon on startup. And it must
+  // come before ClearUserIpcs and everything after it: those steps are
+  // non-transactional with no rollback, and reaching the end of this function
+  // sets is_initialized_, which makes a later ClientInit a no-op that reports
+  // success -- a loser that got that far would report a healthy client attached
+  // to a runtime that does not exist.
+  //
+  // Nothing polls local_transport_; it exists to hold the port. So claiming it
+  // here costs nothing and does not expose a half-built runtime to clients.
+  if (!StartLocalServer()) {
+    HLOG(kInfo,
+         "IpcManager::ServerInit: local server port is already bound - "
+         "this process will not be the runtime");
+    return false;
+  }
+
+
   // Publish this runtime's pid as soon as its segments exist, and withdraw it
   // in UnlinkOwnArtifacts when they go: the record's lifetime brackets the
   // segments' exactly like the /proc/<pid>/fd symlink Linux memfds carry. It
@@ -554,16 +617,20 @@ bool IpcManager::ServerInit() {
   // ManyToOne collective batch/aggregation manager (leader-side).
   batch_manager_ = std::make_unique<BatchManager>(this);
 
-  // Create lightbeam transports for client task reception
+  // Create lightbeam transports for client task reception.
+  // This is all-or-nothing: ServerInit fails if ANY bind fails. The port
+  // cluster is: base (main ROUTER), base+1 (local), base+3 (client ROUTER).
+  // A partial bind leaves the runtime half-initialized and unusable (issue
+  // #725).
   {
     u32 port = config->GetPort();
+    std::string router_bind = DefaultServerBindAddr();
 
     try {
       // TCP ROUTER server on port+3. Bind via DefaultServerBindAddr so it
       // honors CLIO_BIND_ADDR / loopback-under-test-mode and never defaults to
       // 0.0.0.0 (which trips the Windows Defender Firewall prompt on the ROUTER
       // port even when the main server is on loopback).
-      std::string router_bind = DefaultServerBindAddr();
       if (UseLocalZmqIpc()) {
         // macOS (issue #482): bind the local client ROUTER on an ipc:// unix
         // socket so replies route reliably; same-host clients connect their
@@ -582,9 +649,21 @@ bool IpcManager::ServerInit() {
         HLOG(kInfo, "IpcManager: TCP ROUTER transport bound on {}:{}",
              router_bind, port + 3);
       }
+      if (!client_tcp_transport_) {
+        HLOG(kError,
+             "IpcManager::ServerInit: failed to bind the client ROUTER on "
+             "port {} (base+3). The runtime needs ports {}, {} and {} "
+             "together; refusing to start half-bound.",
+             port + 3, port, port + 1, port + 3);
+        return false;
+      }
     } catch (const std::exception &e) {
-      HLOG(kError, "IpcManager::ServerInit: Failed to bind TCP server: {}",
-           e.what());
+      HLOG(kError,
+           "IpcManager::ServerInit: failed to bind the client ROUTER on port "
+           "{} (base+3): {}. The runtime needs ports {}, {} and {} together; "
+           "refusing to start half-bound.",
+           port + 3, e.what(), port, port + 1, port + 3);
+      return false;
     }
 
     try {
@@ -598,9 +677,19 @@ bool IpcManager::ServerInit() {
           ipc_path, ctp::lbm::TransportType::kSocket,
           ctp::lbm::TransportMode::kServer, "ipc", 0);
       HLOG(kInfo, "IpcManager: IPC lightbeam server bound on {}", ipc_path);
+      if (!client_ipc_transport_) {
+        HLOG(kError,
+             "IpcManager::ServerInit: failed to bind the IPC server at {}; "
+             "refusing to start half-bound.",
+             ipc_path);
+        return false;
+      }
     } catch (const std::exception &e) {
-      HLOG(kError, "IpcManager::ServerInit: Failed to bind IPC server: {}",
+      HLOG(kError,
+           "IpcManager::ServerInit: failed to bind the IPC server: {}; "
+           "refusing to start half-bound.",
            e.what());
+      return false;
     }
   }
 
@@ -610,6 +699,12 @@ bool IpcManager::ServerInit() {
 }
 
 void IpcManager::ClientFinalize() {
+  // FIRST, before anything is torn down (issue #970): publish that this client
+  // is going away, so any wait — one already parked on another thread, or one
+  // submitted later from a still-to-run atexit handler — fails fast instead of
+  // blocking on a response that provably cannot arrive.
+  client_finalized_.store(true, std::memory_order_release);
+
   // Mark shutdown so ZeroMqTransport leaks shared-context sockets instead of
   // zmq_close-ing them on Windows (avoids libzmq's signaler WSASTARTUP abort).
   ctp::lbm::sock::SetSocketLibShutdown();
@@ -623,9 +718,16 @@ void IpcManager::ClientFinalize() {
                               static_cast<TaskCounter *>(nullptr));
   }
 
-  // Stop heartbeat thread
+  // Stop heartbeat thread. The store must be published under the same mutex
+  // the probe waits on, or the notify can slip into the gap between the
+  // predicate check and the wait and be missed -- which would put the full
+  // interval back into every process's exit path.
   if (heartbeat_running_.load()) {
-    heartbeat_running_.store(false);
+    {
+      std::lock_guard<std::mutex> lk(g_heartbeat_mtx);
+      heartbeat_running_.store(false);
+    }
+    g_heartbeat_cv.notify_all();
     if (heartbeat_thread_.joinable()) {
       heartbeat_thread_.join();
     }
@@ -1383,12 +1485,17 @@ bool IpcManager::ClientInitQueues() {
 
 bool IpcManager::StartLocalServer() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
+  std::string addr = "127.0.0.1";
+  u32 port = config->GetPort() + 1;
 
   try {
-    // Start local ZeroMQ server using CTP Lightbeam
-    std::string addr = "127.0.0.1";
+    // Bind the local server (base+1) for shared-memory client queue ingestion.
+    // This claim decides which process becomes the runtime: failing to bind
+    // is the normal outcome for every process after the first, so it is NOT
+    // an error here. ServerInit turns it into "this process is not the
+    // runtime". A foreign process squatting on base+1 looks the same, which
+    // is why the message names the port.
     std::string protocol = "tcp";
-    u32 port = config->GetPort() + 1;  // Use ZMQ port + 1 for local server
 
     local_transport_ = ctp::lbm::TransportFactory::Get(
         addr, ctp::lbm::TransportType::kZeroMq,
@@ -1399,22 +1506,25 @@ bool IpcManager::StartLocalServer() {
       return true;
     }
 
-    HLOG(kError, "Failed to start local server at {}:{}", addr, port);
+    HLOG(kInfo,
+         "IpcManager::StartLocalServer: could not bind local server port "
+         "{}:{} (base+1 of the runtime port cluster). Either another runtime "
+         "already owns this port, or a foreign process holds it -- in the "
+         "latter case pick a different networking.port / CLIO_PORT.",
+         addr, port);
     return false;
   } catch (const std::exception &e) {
-    HLOG(kError, "Exception starting local server: {}", e.what());
+    HLOG(kInfo,
+         "IpcManager::StartLocalServer: could not bind local server port "
+         "{}:{} (base+1 of the runtime port cluster): {}",
+         addr, port, e.what());
     return false;
   }
 }
 
 bool IpcManager::WaitForLocalServer() {
-  // Read environment variables for wait configuration
-  // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds
-  const char *wait_env = clio::run::env::GetCompat("WAIT_SERVER");
-  if (wait_env != nullptr) {
-    wait_server_timeout_ = static_cast<float>(std::atof(wait_env));
-  }
-
+  // wait_server_timeout_: CLIO_WAIT_SERVER (read in ClientInit), or a
+  // caller's temporary cap. 0 = fail immediately, -1 = forever, >0 = seconds.
   HLOG(kInfo, "Waiting for runtime via lightbeam (timeout={}s)",
        wait_server_timeout_);
 
@@ -2192,6 +2302,11 @@ size_t IpcManager::ReportRuntimeLeaks(const char *phase) const {
 }
 
 IpcManager::~IpcManager() {
+  // One-shot client-response send tally (#968). Emitted here because SendOut
+  // is driven from a periodic admin task and has no exit of its own to hook.
+  // No-ops in a process that never sent a client response, so clients and
+  // short-lived tools stay silent.
+  IpcCpu2CpuZmq::LogSendTally();
 #if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
   ReportRuntimeLeaks("~IpcManager");
 #endif
@@ -2431,6 +2546,96 @@ void IpcManager::ClearClientPool() {
   client_pool_.clear();
 }
 
+void IpcManager::EvictClientByIdentity(const std::string &key_id, int port) {
+  /**
+   * Evict cached dial-back DEALER from client_conn_cache_ when a client
+   * response has been dropped as undeliverable (issue #722).
+   *
+   * The cache key is computed the same way as GetOrCreateClientByIdentity:
+   * hash of (identity + port). Removing it forces the next SendOut attempt
+   * to create a fresh dial-back connection.
+   */
+  size_t hkey = std::hash<std::string>{}(key_id + ":" + std::to_string(port));
+
+  std::lock_guard<std::mutex> lock(client_pool_mutex_);
+  if (ctp::lbm::Transport **found = client_conn_cache_.find(hkey)) {
+    client_conn_cache_.erase(hkey);
+    HLOG(kInfo,
+         "[ConnCache] Evicted dead client connection (id={}, port={}, key={})",
+         key_id, port, hkey);
+  }
+}
+
+// CLIO_NET_QPROF=1: how long a task sits on a net_queue_ priority lane between
+// EnqueueNetTask and the net worker popping it. This is queue+wakeup latency
+// only -- serialization and the wire are measured separately by CLIO_NET_TRACE.
+// Exact when at most one task per priority is outstanding (the synchronous
+// request/response pattern the collective benchmark drives); under concurrency
+// it reads as "age of the most recent push", which still bounds the wait.
+namespace netqprof {
+static std::atomic<uint64_t> push_ns[kNetQueueNumPriorities];
+static std::atomic<uint64_t> wait_sum_ns[kNetQueueNumPriorities];
+static std::atomic<uint64_t> wait_max_ns[kNetQueueNumPriorities];
+static std::atomic<uint64_t> wait_n[kNetQueueNumPriorities];
+static std::atomic<uint64_t> dump_n{0};
+inline bool On() {
+  static bool on = [] {
+    const char *e = std::getenv("CLIO_NET_QPROF");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
+  return on;
+}
+inline uint64_t NowNs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+// Server-side residency: RecvIn (a peer's task lands here) -> the moment its
+// response is handed to the send queue. Everything the receiving node spends on
+// somebody else's task: lane push, worker wakeup, execute, EndTask. Keyed by
+// the originating node + its task id so concurrent inbound tasks don't collide.
+static std::mutex life_mu;
+static std::unordered_map<uint64_t, uint64_t> life_start;
+static std::atomic<uint64_t> life_sum_ns{0};
+static std::atomic<uint64_t> life_max_ns{0};
+static std::atomic<uint64_t> life_n{0};
+inline uint64_t LifeKey(u32 node_id, u32 unique, size_t net_key) {
+  return (static_cast<uint64_t>(node_id) << 56) ^
+         (static_cast<uint64_t>(unique) << 24) ^
+         static_cast<uint64_t>(net_key);
+}
+inline void Dump() {
+  uint64_t c = dump_n.fetch_add(1) + 1;
+  if (c % 256 != 0) return;
+  {
+    uint64_t ln = life_n.load();
+    if (ln > 0) {
+      HLOG(kInfo, "[NETQPROF] server_residency n={} mean={}us max={}us", ln,
+           life_sum_ns.load() / 1000 / ln, life_max_ns.load() / 1000);
+    }
+  }
+  static const char *names[kNetQueueNumPriorities] = {
+      "sendin_lat", "sendin_io", "sendout_lat",
+      "sendout_io", "cli_tcp",   "cli_ipc"};
+  for (u32 i = 0; i < kNetQueueNumPriorities; ++i) {
+    uint64_t n = wait_n[i].load();
+    if (n == 0) continue;
+    HLOG(kInfo, "[NETQPROF] {} n={} mean_wait={}us max_wait={}us", names[i], n,
+         wait_sum_ns[i].load() / 1000 / n, wait_max_ns[i].load() / 1000);
+  }
+}
+}  // namespace netqprof
+
+void IpcManager::NetProfMarkRecvIn(const clio::run::shared_ptr<Task> &task) {
+  if (!netqprof::On() || task.IsNull()) return;
+  uint64_t key = netqprof::LifeKey(task->task_id_.node_id_,
+                                   task->task_id_.unique_,
+                                   task->task_id_.net_key_);
+  std::lock_guard<std::mutex> lk(netqprof::life_mu);
+  netqprof::life_start[key] = netqprof::NowNs();
+}
+
 void IpcManager::EnqueueNetTask(Future<Task> future,
                                 NetQueuePriority priority) {
   if (net_queue_.IsNull()) {
@@ -2442,6 +2647,36 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
   u32 priority_idx = static_cast<u32>(priority);
   auto &lane = net_queue_->GetLane(0, priority_idx);
   bool was_empty = lane.Empty();
+  if (netqprof::On()) {
+    netqprof::push_ns[priority_idx].store(netqprof::NowNs(),
+                                          std::memory_order_relaxed);
+    if (priority == NetQueuePriority::kSendOutLatency ||
+        priority == NetQueuePriority::kSendOutIO) {
+      auto t = future.GetTaskPtr();
+      if (!t.IsNull()) {
+        uint64_t key = netqprof::LifeKey(t->task_id_.node_id_,
+                                         t->task_id_.unique_,
+                                         t->task_id_.net_key_);
+        uint64_t started = 0;
+        {
+          std::lock_guard<std::mutex> lk(netqprof::life_mu);
+          auto it = netqprof::life_start.find(key);
+          if (it != netqprof::life_start.end()) {
+            started = it->second;
+            netqprof::life_start.erase(it);
+          }
+        }
+        if (started != 0) {
+          uint64_t d = netqprof::NowNs() - started;
+          netqprof::life_sum_ns += d;
+          netqprof::life_n++;
+          uint64_t cur = netqprof::life_max_ns.load();
+          while (d > cur &&
+                 !netqprof::life_max_ns.compare_exchange_weak(cur, d)) {}
+        }
+      }
+    }
+  }
   lane.Push(future);
 
   // Pick the worker that drains this priority's queue. Cross-node Send
@@ -2497,6 +2732,19 @@ bool IpcManager::TryPopNetTask(NetQueuePriority priority,
   auto &lane = net_queue_->GetLane(0, priority_idx);
 
   if (lane.Pop(future)) {
+    if (netqprof::On()) {
+      uint64_t pushed =
+          netqprof::push_ns[priority_idx].load(std::memory_order_relaxed);
+      if (pushed != 0) {
+        uint64_t w = netqprof::NowNs() - pushed;
+        netqprof::wait_sum_ns[priority_idx] += w;
+        netqprof::wait_n[priority_idx]++;
+        uint64_t cur = netqprof::wait_max_ns[priority_idx].load();
+        while (w > cur &&
+               !netqprof::wait_max_ns[priority_idx].compare_exchange_weak(cur, w)) {}
+        netqprof::Dump();
+      }
+    }
     return true;
   }
 
@@ -2915,6 +3163,34 @@ size_t IpcManager::ClearUserIpcs() {
   std::string memfd_dir = ctp::SystemInfo::GetMemfdDir();
   int current_pid = ctp::SystemInfo::GetPid();
 
+  // Never garbage-collect while another runtime is alive on our port.
+  //
+  // The per-entry "keep it if a live pid owns it" test below reads the entry's
+  // /proc/<pid>/fd symlink -- which only Linux has. On macOS and BSD the
+  // segments are plain files naming no owner, so that test silently keeps
+  // nothing and this sweep deletes a LIVE runtime's main segment, queue
+  // segment and IPC socket out from under it (issue #1015: a second starter
+  // racing for the port did exactly that, and only the pid record survived
+  // because it is the one entry with a contents-based owner check).
+  //
+  // The pid record is enough to know better: if it names a living process that
+  // is not us, that runtime owns this port's artifacts and none of them are
+  // stale. Skip the sweep entirely and let the caller find out it lost the
+  // port.
+  if (ConfigManager *config = CLIO_CONFIG_MANAGER) {
+    const int owner = ReadRuntimePidRecord(config->GetPort());
+    if (owner > 0 && owner != current_pid &&
+        ctp::SystemInfo::IsProcessAlive(owner)) {
+      HLOG(kInfo,
+           "ClearUserIpcs: runtime pid {} is alive on port {} - skipping the "
+           "sweep so its segments survive",
+           owner, config->GetPort());
+      return 0;
+    }
+  }
+
+  u32 our_port = CLIO_CONFIG_MANAGER ? CLIO_CONFIG_MANAGER->GetPort() : 9413;
+
   for (const auto &name : ctp::SystemInfo::ListDirectory(memfd_dir)) {
     std::string full_path = memfd_dir + "/" + name;
 
@@ -2925,8 +3201,12 @@ size_t IpcManager::ClearUserIpcs() {
     // /proc/<pid>/fd/N; if that pid is alive and isn't us, keep the entry.
     std::error_code ec;
     auto target = std::filesystem::read_symlink(full_path, ec);
+    // See UnlinkOwnPidEntries: uninstrumented libstdc++.so filled this path,
+    // and its destructor is reported at the end of the iteration.
+    CTP_MSAN_UNPOISON_PATH(target);
     if (!ec) {
-      const std::string t = target.string();
+      std::string t = target.string();
+      CTP_MSAN_UNPOISON_STRING(t);
       constexpr const char *kProc = "/proc/";
       if (t.rfind(kProc, 0) == 0) {
         int owner_pid = std::atoi(t.c_str() + std::strlen(kProc));
@@ -2945,16 +3225,55 @@ size_t IpcManager::ClearUserIpcs() {
     // its contents instead. Keep it while that runtime is alive: it is the
     // only handle `clio_run stop` has on a co-resident runtime whose segments
     // are not /proc symlinks (macOS/BSD).
+    //
+    // Issue #877: also check if files belong to OTHER PORTS. Only delete files
+    // from a different port if that port's pid record names a dead process.
+    // This prevents ClearUserIpcs from deleting segments owned by a different
+    // (still-running) runtime on a different port.
     if (name.rfind(kRuntimePidRecordPrefix, 0) == 0) {
       std::ifstream pid_file(full_path);
+      CTP_MSAN_UNPOISON_OBJ(pid_file);  // stream state is libstdc++.so's
       std::string pid_line;
       if (pid_file.is_open() && std::getline(pid_file, pid_line)) {
+        CTP_MSAN_UNPOISON_STRING(pid_line);
         int owner_pid = std::atoi(pid_line.c_str());
         if (owner_pid > 0 && owner_pid != current_pid &&
             ctp::SystemInfo::IsProcessAlive(owner_pid)) {
           HLOG(kDebug, "ClearUserIpcs: keeping {} (runtime pid {} alive)", name,
                owner_pid);
           continue;
+        }
+      }
+    } else {
+      // Issue #877: a file named for ANOTHER port belongs to that port's
+      // runtime. Keep it while that runtime's pid record names a live
+      // process; only a dead (or record-less) owner's files are swept.
+      // Segment and socket names end in "_<port>" (optionally ".ipc"); the
+      // client ROUTER socket is keyed on base+3, so try both readings.
+      size_t last_underscore = name.rfind('_');
+      if (last_underscore != std::string::npos) {
+        const char *digits = name.c_str() + last_underscore + 1;
+        char *end = nullptr;
+        unsigned long file_port = std::strtoul(digits, &end, 10);
+        bool parsed = (end != digits) && (*end == '\0' || *end == '.');
+        if (parsed && file_port > 0 && file_port != our_port &&
+            file_port != our_port + 3) {
+          bool live_owner = false;
+          for (unsigned long base : {file_port, file_port - 3}) {
+            if (base == 0 || base > 65535) continue;
+            int owner_pid = ReadRuntimePidRecord(static_cast<u32>(base));
+            if (owner_pid > 0 && ctp::SystemInfo::IsProcessAlive(owner_pid)) {
+              live_owner = true;
+              break;
+            }
+          }
+          if (live_owner) {
+            HLOG(kDebug,
+                 "ClearUserIpcs: keeping {} (owned by a live runtime on "
+                 "another port)",
+                 name);
+            continue;
+          }
         }
       }
     }
@@ -2996,8 +3315,14 @@ size_t IpcManager::UnlinkOwnPidEntries() {
     bool owned = false;
     std::error_code ec;
     auto target = std::filesystem::read_symlink(full_path, ec);
+    // read_symlink is implemented in uninstrumented libstdc++.so, so the path
+    // it returns -- pathname and component list alike -- carries no shadow;
+    // even its destructor at the end of this iteration is reported.
+    CTP_MSAN_UNPOISON_PATH(target);
     if (!ec) {
-      owned = target.string().rfind(own_proc_prefix, 0) == 0;
+      std::string target_str = target.string();
+      CTP_MSAN_UNPOISON_STRING(target_str);
+      owned = target_str.rfind(own_proc_prefix, 0) == 0;
     } else {
       for (const auto &prefix : own_name_prefixes) {
         if (name.rfind(prefix, 0) == 0) {
@@ -3102,6 +3427,14 @@ bool IpcManager::ReconnectToOriginalHost() {
   HLOG(kInfo, "ReconnectToOriginalHost: Attempting to reconnect to restarted server");
 
   if (ipc_mode_ == IpcMode::kShm) {
+    // Confirm a server actually answers BEFORE touching shared memory, the
+    // same order ClientInit uses. A runtime that died without cleanup leaves
+    // its segment files behind (always on Windows, where they are plain
+    // files), so ClientInitShm would happily attach a dead runtime's
+    // segments and the RegisterMemory round trip below would wait forever --
+    // a client whose runtime died hung instead of failing (#722).
+    if (!WaitForLocalServer()) return false;
+
     // Detach old shared memory (don't destroy — server owns it)
     main_allocator_ = nullptr;
     worker_queues_ = ctp::ipc::FullPtr<TaskQueue>();
@@ -3128,8 +3461,20 @@ bool IpcManager::ReconnectToOriginalHost() {
       auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
           clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
           alloc_id);
-      IpcCpu2CpuZmq::SendIn(this,reg_task, IpcMode::kTcp).Wait();
+      // Bounded: the server can die again between the probe above and here.
+      if (!IpcCpu2CpuZmq::SendIn(this, reg_task, IpcMode::kTcp)
+               .Wait(wait_server_timeout_)) {
+        HLOG(kWarning,
+             "ReconnectToOriginalHost: RegisterMemory got no reply within "
+             "{}s",
+             wait_server_timeout_);
+        return false;
+      }
     }
+    server_alive_.store(true, std::memory_order_release);
+    HLOG(kInfo, "ReconnectToOriginalHost: Reconnected, new generation={}",
+         client_generation_);
+    return true;
   }
 
   // For TCP mode the original WaitForLocalServer DEALER may have died
@@ -3256,7 +3601,7 @@ bool IpcManager::ReconnectToNewHost(const std::string &new_addr) {
 }
 
 bool IpcManager::WaitForServerAndReconnect(
-    std::chrono::steady_clock::time_point start) {
+    std::chrono::steady_clock::time_point start, float max_sec) {
   // Guard against recursive re-entry (WaitForLocalServer → Recv → here)
   reconnecting_.store(true, std::memory_order_release);
 
@@ -3276,6 +3621,15 @@ bool IpcManager::WaitForServerAndReconnect(
         HLOG(kWarning, "WaitForServerAndReconnect: Original server timed out "
              "after {}s", elapsed);
         break;
+      }
+      // Issue #1096: thread max_sec through reconnect so timed waits return
+      // (false) when the deadline elapses.
+      if (max_sec > 0 && elapsed >= max_sec) {
+        HLOG(kWarning, "WaitForServerAndReconnect: max_sec timeout "
+             "after {}s", elapsed);
+        wait_server_timeout_ = saved_timeout;
+        reconnecting_.store(false, std::memory_order_release);
+        return false;
       }
       CTP_THREAD_MODEL->SleepForUs(1000000);
       if (ReconnectToOriginalHost()) {
@@ -3337,6 +3691,17 @@ bool IpcManager::WaitForServerAndReconnect(
        "WaitForServerAndReconnect: trying up to {} host(s), leader-first: {}",
        client_try_new_servers_, candidates.front());
   for (int i = 0; i < client_try_new_servers_; ++i) {
+    // Issue #1096: check max_sec timeout in Phase 2 as well
+    float elapsed =
+        std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
+            .count();
+    if (max_sec > 0 && elapsed >= max_sec) {
+      HLOG(kWarning, "WaitForServerAndReconnect: max_sec timeout "
+           "after {}s", elapsed);
+      reconnecting_.store(false, std::memory_order_release);
+      return false;
+    }
+
     const std::string &addr = candidates[i % candidates.size()];
     HLOG(kInfo, "WaitForServerAndReconnect: Trying {}/{}: {}",
          i + 1, client_try_new_servers_, addr);
@@ -3365,6 +3730,13 @@ bool IpcManager::WaitForServerAndReconnect(
 // TCP round-trip).
 static constexpr int kZmqPollTimeoutMs = 1;
 
+// Back-off after a failed (non-EAGAIN) client Recv. The first few retries stay
+// fast so a transient error costs no measurable latency; after that the link is
+// presumed down and the thread idles instead of burning a core.
+static constexpr int kRecvErrorRetryUs = 1000;
+static constexpr int kRecvErrorBackoffUs = 10000;
+static constexpr size_t kRecvErrorFastRetries = 32;
+
 void IpcManager::RecvZmqClientThread() {
   // Client-side thread: blocks for completed task responses. In TCP mode these
   // arrive on the dedicated response listener (an ephemeral ROUTER bound in
@@ -3386,10 +3758,28 @@ void IpcManager::RecvZmqClientThread() {
   // (FUTURE_COMPLETE set). Mismatch vs daemon-side send count = lost responses.
   size_t recv_count = 0;
   size_t miss_count = 0;
+  // #968: replies whose echoed client identity did not match the future found
+  // at their net_key. See the identity check in the drain loop below.
+  size_t identity_mismatch_count = 0;
+  // #968: when set, a mismatched reply is REJECTED rather than delivered. Read
+  // once here (not per message) because it must not change mid-run.
+  const bool strict_response_identity = []() {
+    const char *env = clio::run::env::GetCompat("STRICT_RESPONSE_IDENTITY");
+    return env != nullptr && env[0] == '1';
+  }();
+  // Consecutive drains that ended in a Recv error rather than EAGAIN. A client
+  // whose runtime has gone away sits here for the rest of its life: the
+  // socket transport's client-mode Recv() keeps returning -1 on the dead fd,
+  // and a dead fd is permanently POLLIN-readable, so neither this loop nor the
+  // PollRecv() below ever blocks. Used to back off (and to log once instead of
+  // per iteration) so that case costs a few wakeups a second rather than a
+  // pegged core and a megabyte of log per second.
+  size_t error_streak = 0;
 
   while (zmq_recv_running_.load()) {
     // Drain all available messages first
     bool drained_any = false;
+    bool recv_error = false;
     bool got_message = true;
     while (got_message) {
       got_message = false;
@@ -3403,8 +3793,15 @@ void IpcManager::RecvZmqClientThread() {
         // ETERM means the ZMQ context is being shut down (zmq_ctx_shutdown was
         // called).  Exit immediately so the context destructor is not blocked.
         if (rc == ETERM) return;
-        HLOG(kDebug, "RecvZmqClientThread: Recv returned: {}", rc);
-        continue;
+        // Nothing was drained, so there is nothing more to drain: end the
+        // drain loop the same way the runtime-side PeerRecvThread does and let
+        // the wait below decide how long to wait. (This used to `continue`,
+        // which retried the same failing Recv immediately, forever.)
+        recv_error = true;
+        if (error_streak == 0) {
+          HLOG(kDebug, "RecvZmqClientThread: Recv returned: {}", rc);
+        }
+        break;
       }
       got_message = true;
       drained_any = true;
@@ -3414,21 +3811,65 @@ void IpcManager::RecvZmqClientThread() {
         HLOG(kError, "RecvZmqClientThread: No task_infos in response");
         continue;
       }
-      size_t net_key = archive->task_infos_[0].task_id_.net_key_;
+      const TaskId &wire_id = archive->task_infos_[0].task_id_;
+      size_t net_key = wire_id.net_key_;
 
       std::lock_guard<std::mutex> lock(pending_futures_mutex_);
       auto it = pending_zmq_futures_.find(net_key);
       if (it == pending_zmq_futures_.end()) {
         ++miss_count;
+        // #968: report the echoed identity too. A miss whose unique_ matches a
+        // task this process has already completed is a LATE reply (the task finished and
+        // was reaped before its second response arrived); a miss with an
+        // unknown unique_ is a reply for something else entirely. The bare
+        // net_key could not tell those apart.
         HLOG(kError,
              "[CountClientRecv] miss#{}: No pending future for net_key {} "
-             "(received={}, misses={})",
-             miss_count, net_key, recv_count, miss_count);
+             "(echoed client_unique={} major={} pid={}, received={}, "
+             "misses={})",
+             miss_count, net_key, wire_id.unique_, wire_id.major_,
+             wire_id.pid_, recv_count, miss_count);
         recv_transport->ClearRecvHandles(*archive);
         continue;
       }
 
       Task *task = it->second.task;
+
+      // #968 IDENTITY CHECK. pending_zmq_futures_ is keyed by net_key, which is
+      // the waiting task's heap address and is recycled the moment that task is
+      // freed. The address matching therefore proves nothing on its own: a late
+      // reply to a previous task at this address matches just as well as the
+      // real one, and the client then deserializes THAT task's OUT fields over
+      // the one it is waiting for -- a silent wrong answer, which is the #968
+      // symptom. unique_ is monotonic per client process and never recycled, so
+      // comparing it turns the address match into a real identity match.
+      //
+      // Default is observe-only: log loudly, deliver anyway, so a run that has
+      // never seen a mismatch behaves exactly as before. Set
+      // CLIO_STRICT_RESPONSE_IDENTITY=1 to REJECT a mismatched response instead
+      // (treat it as a miss and keep waiting for the right one), which is the
+      // actual fix once the logs confirm this is what is happening.
+      if (wire_id.unique_ != 0 &&
+          (wire_id.unique_ != task->task_id_.unique_ ||
+           wire_id.major_ != task->task_id_.major_)) {
+        ++identity_mismatch_count;
+        HLOG(kError,
+             "[#968] RESPONSE IDENTITY MISMATCH on net_key {}: reply carries "
+             "unique={} major={} pid={} but the future waiting at this address "
+             "is unique={} major={} pid={}. This reply belongs to a DIFFERENT "
+             "task ({}). mismatches={}",
+             net_key, wire_id.unique_, wire_id.major_, wire_id.pid_,
+             task->task_id_.unique_, task->task_id_.major_,
+             task->task_id_.pid_,
+             strict_response_identity ? "REJECTED, still waiting"
+                                      : "delivered anyway -- observe-only mode",
+             identity_mismatch_count);
+        if (strict_response_identity) {
+          ++miss_count;
+          recv_transport->ClearRecvHandles(*archive);
+          continue;
+        }
+      }
 
       // Store the archive for Recv() to pick up
       pending_response_archives_[net_key] = std::move(archive);
@@ -3462,9 +3903,48 @@ void IpcManager::RecvZmqClientThread() {
     // Only block when the drain loop found nothing; if we just processed
     // messages, loop back immediately to drain more. zmq_poll wakes the instant
     // a response arrives, so this adds no latency to message delivery.
-    if (!drained_any) {
-      recv_transport->PollRecv(kZmqPollTimeoutMs);
+    if (drained_any) {
+      error_streak = 0;
+      continue;
     }
+    if (recv_error) {
+      // Sleep instead of polling: the fd that just failed is readable (that is
+      // what EOF looks like), so PollRecv returns instantly and would spin.
+      // 1 ms keeps a one-off error cheap to recover from; a link that stays
+      // broken (the runtime exited while this client was still up) settles at
+      // 100 wakeups/sec, which also bounds how long the shutdown join waits.
+      ++error_streak;
+      CTP_THREAD_MODEL->SleepForUs(error_streak < kRecvErrorFastRetries
+                                       ? kRecvErrorRetryUs
+                                       : kRecvErrorBackoffUs);
+      continue;
+    }
+    error_streak = 0;
+    recv_transport->PollRecv(kZmqPollTimeoutMs);
+  }
+
+  // One-shot teardown tally (#968). recv_count / miss_count were only ever
+  // observable through a 1-in-256 kDebug line that a default build compiles
+  // out, so a run could end having silently mis-routed responses with nothing
+  // in the log to say so. This is ONE line per client process, at kInfo, and
+  // it is the denominator every rate in this area needs.
+  //
+  // misses > 0 means at least one response arrived naming a net_key with no
+  // pending future -- i.e. a reply outlived the task it belonged to. That is
+  // the signature the #968 read failures turn on, so it is promoted to
+  // kWarning to survive a log level that hides kInfo.
+  if (miss_count > 0 || identity_mismatch_count > 0) {
+    HLOG(kWarning,
+         "[CountClientRecv] TOTAL responses={} misses={} identity_mismatches={}"
+         " -- a miss is a response naming a net_key with NO pending future; a "
+         "mismatch is one that matched an address but named a different task; "
+         "see #968 (strict_identity={})",
+         recv_count, miss_count, identity_mismatch_count,
+         strict_response_identity ? 1 : 0);
+  } else {
+    HLOG(kInfo,
+         "[CountClientRecv] TOTAL responses={} misses=0 identity_mismatches=0",
+         recv_count);
   }
 }
 
@@ -3833,12 +4313,24 @@ void IpcManager::HeartbeatThread() {
   while (heartbeat_running_.load()) {
     bool alive = IsServerAlive();
     server_alive_.store(alive, std::memory_order_release);
-    CTP_THREAD_MODEL->SleepForUs(1000000);
+    // ClientFinalize clears heartbeat_running_ and notifies, so the join that
+    // follows returns at once instead of waiting out the probe interval.
+    std::unique_lock<std::mutex> lk(g_heartbeat_mtx);
+    g_heartbeat_cv.wait_for(lk, std::chrono::seconds(1),
+                            [this]() { return !heartbeat_running_.load(); });
   }
 }
 
 void IpcManager::CleanupResponseArchive(size_t net_key) {
   std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+  // Drop the in-flight registration FIRST. pending_zmq_futures_ holds a RAW
+  // Task* that is only valid while the client's Future owns it, and the sole
+  // caller is ~Future — the moment after which it does not. A response that
+  // arrives later found the stale entry and wrote through the freed task
+  // (RecvZmqClientThread -> Task::SetNewData), which is the heap-use-after-free
+  // AddressSanitizer reported for cr_cli_client_crash_leak. Nothing can consume
+  // the response once the future is gone, so forgetting it is the whole fix.
+  pending_zmq_futures_.erase(net_key);
   auto it = pending_response_archives_.find(net_key);
   if (it != pending_response_archives_.end()) {
     // Frees ZMQ zero-copy recv handles (bulk.desc); a no-op for a SHM archive
@@ -4000,19 +4492,35 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     return RouteResult::Dne;
   }
 
-  // Check if task has already been routed - if so, return ExecHere
-  if (task_ptr->IsRouted()) {
-    return RouteResult::ExecHere;
-  }
-
   // Collective (ManyToOne / AllToOne) routing is handled before the normal
   // resolve path: forward to the neighborhood leader, or park into the batch
   // manager if we are the leader. Both modes share this routing; they differ
   // only in the BatchManager flush condition (time window vs. all-containers
   // barrier). (The aggregate task the leader later runs is a plain Local task
   // and does not re-enter this branch.)
+  //
+  // This MUST come before the IsRouted() early-return below. A member submitted
+  // on a non-leader node is forwarded here over the network, and RecvIn marks
+  // EVERY net-received task routed before handing it to a worker. With the
+  // early-return first, such a member never reached the BatchManager: it ran
+  // standalone on the leader and returned its own un-combined result, while the
+  // leader-local member sat in a group whose count could never reach the pool's
+  // container count. So a collective whose members did not all originate on the
+  // leader node silently did not happen -- an AllReduce returned each caller's
+  // own value with rc=0, and any leader-local member hung forever. Collectives
+  // only worked when every member was submitted on the leader, which is exactly
+  // the case the single-client alltoone test covers.
+  //
+  // Re-entry is bounded: on the leader this parks the task (it is never routed
+  // again), and the aggregate it later builds carries PoolQuery::Local(), so it
+  // does not match IsCollectiveMode().
   if (task_ptr->pool_query_.IsCollectiveMode()) {
     return RouteManyToOne(future);
+  }
+
+  // Check if task has already been routed - if so, return ExecHere
+  if (task_ptr->IsRouted()) {
+    return RouteResult::ExecHere;
   }
 
   // Only call ScheduleTask for Dynamic pool queries.

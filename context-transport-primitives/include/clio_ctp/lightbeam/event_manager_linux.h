@@ -39,6 +39,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "clio_ctp/util/msan.h"
+
 namespace ctp::lbm {
 
 class EventManager {
@@ -161,6 +163,16 @@ class EventManager {
       ts.tv_nsec = (timeout_us % 1000000) * 1000L;
       nfds = static_cast<int>(syscall(441, epoll_fd_, epoll_events_,
                                        kMaxEvents, &ts, nullptr, 0));
+      // The kernel filled epoll_events_, but MSan only intercepts the libc
+      // epoll_wait/epoll_pwait wrappers -- a raw syscall() goes straight past
+      // it, so the shadow for these entries keeps whatever poison the memory
+      // carried before (this buffer is recycled every call). Without this the
+      // fd read out below is reported as uninitialized on every wakeup that
+      // takes the epoll_pwait2 path.
+      if (nfds > 0) {
+        CTP_MSAN_UNPOISON(epoll_events_,
+                          static_cast<size_t>(nfds) * sizeof(epoll_events_[0]));
+      }
       if (nfds == -1 && errno == ENOSYS) {
         // Fallback to epoll_wait if kernel doesn't support epoll_pwait2
         int timeout_ms = static_cast<int>((timeout_us + 999) / 1000);

@@ -19,6 +19,15 @@ set(SUBMIT_BATCH_TEST_SOURCES
   test_submit_batch.cc
 )
 
+# CreatePoolFields test executable. Pure: aggregating a replica into an origin
+# is field arithmetic on two tasks, so this needs no daemon, no shared memory
+# and no cluster -- which is the point, since the branches it covers otherwise
+# only fire with a foreign replica in hand.
+set(CREATE_POOL_FIELDS_TEST_TARGET clio_run_create_pool_fields_tests)
+set(CREATE_POOL_FIELDS_TEST_SOURCES
+  test_create_pool_fields.cc
+)
+
 # Create compose test executable
 add_executable(${COMPOSE_TEST_TARGET} ${COMPOSE_TEST_SOURCES})
 
@@ -102,8 +111,42 @@ set_target_properties(${SUBMIT_BATCH_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Create CreatePoolFields test executable
+add_executable(${CREATE_POOL_FIELDS_TEST_TARGET} ${CREATE_POOL_FIELDS_TEST_SOURCES})
+
+target_include_directories(${CREATE_POOL_FIELDS_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/modules/admin/include  # For admin tasks
+)
+
+# Client-only: the create task's shared base is header-only, so nothing here
+# needs the runtime half of the chimod.
+target_link_libraries(${CREATE_POOL_FIELDS_TEST_TARGET}
+  clio_admin_client           # Admin module client for task types
+  ctp::cxx                       # ClioCtp library
+  ${CMAKE_THREAD_LIBS_INIT}       # Threading support
+)
+
+set_target_properties(${CREATE_POOL_FIELDS_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Enable CTest integration if testing is enabled
 if(CLIO_CORE_ENABLE_TESTS)
+  # CreatePoolFields aggregation rules (no daemon — runs in milliseconds)
+  add_test(
+    NAME cr_create_pool_fields_tests
+    COMMAND ${CREATE_POOL_FIELDS_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_create_pool_fields_tests PROPERTIES
+    TIMEOUT 60
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+  )
+
   # Task Archive Tests
   add_test(
     NAME cr_task_archive_basic_tests
@@ -316,6 +359,7 @@ add_custom_target(test_task_archive_performance
 
 # Install test executables
 install(TARGETS ${TASK_ARCHIVE_TEST_TARGET} ${COMPOSE_TEST_TARGET} ${SUBMIT_BATCH_TEST_TARGET}
+                ${CREATE_POOL_FIELDS_TEST_TARGET}
   RUNTIME DESTINATION bin
 )
 

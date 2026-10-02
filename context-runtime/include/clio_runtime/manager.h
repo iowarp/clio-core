@@ -170,7 +170,10 @@ class RuntimeManager {
   bool runtime_is_initializing_ = false;
 
   std::atomic<bool> stop_requested_{false};    /**< set once by RequestStop */
-  std::atomic<bool> finalize_complete_{false}; /**< ServerFinalize finished */
+  // "ServerFinalize finished" lives in manager.cc as a file-scope atomic, not
+  // here: the RequestStop watchdog that reads it is detached and can outlive
+  // this object (the atexit handler deletes the manager while the watchdog is
+  // parked between ticks). See g_finalize_complete.
   std::atomic<u32> stop_grace_period_ms_{5000}; /**< drain budget for stop */
 };
 

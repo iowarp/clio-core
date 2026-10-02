@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clio Config</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-brand">Clio</div>
+    <ul class="nav-links">
+      <li><a href="index.html">Cluster</a></li>
+      <li><a href="pools.html">Pools</a></li>
+      <li><a href="config.html">Config</a></li>
+    </ul>
+    <div class="nav-status" id="conn-status">connecting…</div>
+  </nav>
+
+  <main class="content">
+    <h1>Configuration</h1>
+    <p class="sub">What this daemon actually came up with, not what a file says.</p>
+    <div id="errors"></div>
+    <div class="grid" id="config"></div>
+
+    <h2>Routes</h2>
+    <p class="sub">Registered by each ChiMod's <code>RegisterViz()</code>.</p>
+    <div id="routes"></div>
+  </main>
+
+  <script src="js/api.js"></script>
+  <script src="js/config.js"></script>
+</body>
+</html>

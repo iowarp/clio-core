@@ -134,6 +134,8 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
   clio::run::TaskResume Open(clio::run::shared_ptr<OpenTask> &task);
   clio::run::TaskResume Close(clio::run::shared_ptr<CloseTask> &task);
+  clio::run::TaskResume MultiCreate(clio::run::shared_ptr<MultiCreateTask> &task);
+  clio::run::TaskResume AdvanceSize(clio::run::shared_ptr<AdvanceSizeTask> &task);
   clio::run::TaskResume Read(clio::run::shared_ptr<ReadTask> &task);
   clio::run::TaskResume Write(clio::run::shared_ptr<WriteTask> &task);
   clio::run::TaskResume Append(clio::run::shared_ptr<AppendTask> &task);
@@ -227,6 +229,9 @@ class Runtime : public clio::run::Container {
   std::mutex meta_mu_;
   std::unordered_map<clio::run::u64, std::shared_ptr<FileInfo>> handles_;
   std::unordered_map<std::string, std::shared_ptr<FileInfo>> by_path_;
+  // Tag-keyed index over the same FileInfo objects (see AdvanceSizeTask):
+  // maintained wherever by_path_ gains or loses a file entry.
+  std::unordered_map<clio::run::u64, std::shared_ptr<FileInfo>> by_tag_;
   std::atomic<clio::run::u64> next_handle_{1};
 
   // ---- issue #817: shared-memory attribute mirror ----
@@ -260,6 +265,8 @@ class Runtime : public clio::run::Container {
    * a way that invalidates cached pages (truncate, rename) but the path lives
    * on. Erasing would work too; this keeps the tag binding for the next op.
    */
+  void MirrorDir(const std::string &path,
+                 const clio::cte::core::TagId &tag_id, bool complete);
   void MirrorRefuse(const std::string &path);
 
   // ---- deferred-append pipeline state ----

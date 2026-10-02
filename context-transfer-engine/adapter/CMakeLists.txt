@@ -5,11 +5,11 @@
 # CTE adapter singleton implementation - moved to filesystem directory
 # to leverage existing working build configuration
 
-# The HDF5 VFD is a plugin the library dlopen's, not an interceptor: it
-# never touches real_api.h, so it does not need ELF support. Gate it on
-# UNIX -- H5FDclio.cc uses <sys/file.h>, <unistd.h> and flock, so Windows
-# needs porting work rather than a gate change.
-if(UNIX AND CLIO_CTE_ENABLE_VFD)
+# The HDF5 VFD is a plugin the library dlopen's, not an interceptor: it never
+# touches real_api.h, so it does not need ELF support and is not restricted to
+# the platforms the interceptors work on. Its file I/O goes through
+# adapter/vfd/H5FDclio_compat.h, which supplies the Win32 equivalents.
+if(CLIO_CTE_ENABLE_VFD)
     add_subdirectory(vfd)
 endif()
 

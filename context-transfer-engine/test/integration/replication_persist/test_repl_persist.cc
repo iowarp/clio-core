@@ -83,6 +83,11 @@ static int PutBlobs() {
   // Both copies of every blob must exist before the reboot. The primary is
   // synchronous; the replicas are written by the ASYNC sweep, so poll with
   // a bound — this is the async write-through path under test.
+  ctp::ipc::FullPtr<char> vbuf = CLIO_IPC->AllocateBuffer(kBlobSize);
+  if (vbuf.IsNull()) {
+    HLOG(kError, "Phase 1: SHM allocation failed for replica verification");
+    return 1;
+  }
   for (int i = 0; i < kNumBlobs; ++i) {
     auto psz = cte.AsyncGetBlobSize(tag_id, BlobName(i));
     psz.Wait();
@@ -105,7 +110,47 @@ static int PutBlobs() {
       HLOG(kError, "Phase 1: blob {} replica never appeared (async sweep)", i);
       return 1;
     }
+    // Verify the replica's CONTENT here, before the reboot. The size check
+    // above only proves an extent of the right length was recorded, not that
+    // the bytes in it are this blob's -- so a placement collision between two
+    // blobs' replica writes would pass Phase 1 and surface after the restart
+    // looking exactly like a persistence bug. Checking here separates "the
+    // async sweep wrote the wrong extent" from "the restart lost track of the
+    // right one".
+    {
+      memset(vbuf.ptr_, 0, kBlobSize);
+      clio::cte::core::Context vctx;
+      vctx.replica_ = 1;
+      auto vget = cte.AsyncGetBlob(tag_id, BlobName(i), 0, kBlobSize,
+                                   /*flags=*/0, ctp::ipc::ShmPtr<>(vbuf.shm_),
+                                   clio::run::PoolQuery::Dynamic(), vctx);
+      vget.Wait();
+      if (vget->GetReturnCode() != 0) {
+        HLOG(kError, "Phase 1: blob {} replica read failed rc={}", i,
+             vget->GetReturnCode());
+        return 1;
+      }
+      for (clio::run::u64 b = 0; b < kBlobSize; ++b) {
+        if (vbuf.ptr_[b] != PatternByte(i)) {
+          unsigned got = static_cast<unsigned char>(vbuf.ptr_[b]);
+          std::string note;
+          for (int cand = 0; cand < kNumBlobs; ++cand) {
+            if (static_cast<unsigned char>(PatternByte(cand)) == got) {
+              note = " (that is blob " + std::to_string(cand) + "'s pattern)";
+              break;
+            }
+          }
+          HLOG(kError,
+               "Phase 1: blob {} replica CORRUPT BEFORE REBOOT at byte {}: "
+               "got {}, want {}{}",
+               i, b, got, static_cast<unsigned>(
+                            static_cast<unsigned char>(PatternByte(i))), note);
+          return 1;
+        }
+      }
+    }
   }
+  CLIO_IPC->FreeBuffer(vbuf);
 
   // One-shot metadata flush: snapshot (including the type-3 replica entries)
   // + WAL sync, so the reboot has durable metadata regardless of timing.
@@ -184,11 +229,40 @@ static int VerifyBlobs() {
              get->GetReturnCode());
         return 1;
       }
+      // Report WHAT came back, not just that it differed: a zero-filled
+      // buffer (read succeeded but moved no bytes), another blob's pattern
+      // (block placement resolved to the wrong extent) and a partially
+      // correct buffer are three different bugs, and the old message could
+      // not tell them apart.
+      clio::run::u64 bad = 0, first_bad = 0;
+      unsigned first_got = 0;
       for (clio::run::u64 b = 0; b < kBlobSize; ++b) {
         if (buf.ptr_[b] != PatternByte(i)) {
-          HLOG(kError, "Phase 2: blob {} replica byte {} corrupt", i, b);
-          return 1;
+          if (bad == 0) {
+            first_bad = b;
+            first_got = static_cast<unsigned char>(buf.ptr_[b]);
+          }
+          ++bad;
         }
+      }
+      if (bad != 0) {
+        unsigned want = static_cast<unsigned char>(PatternByte(i));
+        std::string note;
+        if (first_got == 0) {
+          note = ", buffer left ZERO";
+        } else {
+          for (int cand = 0; cand < kNumBlobs; ++cand) {
+            if (static_cast<unsigned char>(PatternByte(cand)) == first_got) {
+              note = ", that is blob " + std::to_string(cand) + "'s pattern";
+              break;
+            }
+          }
+        }
+        HLOG(kError,
+             "Phase 2: blob {} replica CORRUPT: {}/{} bytes differ, first at "
+             "{} (got {}, want {}{})",
+             i, bad, kBlobSize, first_bad, first_got, want, note);
+        return 1;
       }
     }
     // And the cache path heals itself: a plain GetBlob through the

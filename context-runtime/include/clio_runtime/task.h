@@ -41,6 +41,7 @@ using pid_t = int;
 #endif
 
 #include <atomic>
+#include <exception>
 // ============================================================================
 // Coroutine backend selection.
 //   * Default: C++20 stackless coroutines (std::coroutine_handle).
@@ -743,6 +744,36 @@ class Task {
    * IMPORTANT: Derived classes that override AggregateOut MUST call
    * Task::AggregateOut(replica_task) first before aggregating their own fields.
    *
+   * THE CONTRACT (issue #915) — AggregateOut merges a REPLICA's OUT fields
+   * into THIS (origin) task, an N->1 gather. Two rules follow, and violating
+   * either corrupts a live runtime rather than merely returning bad data:
+   *
+   *   1. NEVER implement it by delegating to Copy(). Copy() is a WHOLE-TASK
+   *      assignment: it runs Task::Copy, overwriting this origin's task_id_,
+   *      pool_query_, method_, task_flags_, completer_ and task_group_ with
+   *      the REPLICA's — and the replica's task_id_ carries net_key/replica_id,
+   *      so the origin adopts a subtask's identity mid-flight while send_map_,
+   *      the replica accounting and the completion path still key off its own.
+   *      That is the `free(): invalid pointer` / SIGSEGV that killed
+   *      leader-election recovery in #856.
+   *   2. Touch OUT (and INOUT) fields ONLY, and never re-assign an shm-backed
+   *      member the CLIENT owns (a priv::string IN field, a ShmPtr payload
+   *      buffer). Doing so frees the origin's buffer through the replica's
+   *      allocator. Bulk-transferred payloads have already landed in the
+   *      origin's own buffer and must be left alone.
+   *
+   * Pick a reduction that suits each OUT field — SUM for partitioned counters,
+   * MAX for an owner-reported value that non-owners answer 0 for,
+   * first-non-empty for a diagnostic string, concatenation for a vector —
+   * and make sure a SINGLE-replica gather lands on the replica's value, since
+   * that is what almost every route actually does.
+   *
+   * Enforcement: `cr_aggregate_out_contract` lints every AggregateOut body in
+   * the tree for a Copy() call, the autogen sweep asserts the origin's identity
+   * survives a real container-dispatched aggregation for every method, and
+   * RecvOut (src/ipc/ipc_run2run.cc) checks and repairs it at run time for
+   * out-of-tree chimods.
+   *
    * @param replica_task The replica task to aggregate from
    */
   void AggregateOut(const ctp::ipc::FullPtr<Task>& replica_task) {
@@ -915,12 +946,33 @@ class RunContext {
    *  task's identity. The ZMQ recv thread keys pending_zmq_futures_ by this, so
    *  the response must carry it for the client to match (else it hangs). */
   uintptr_t client_net_key_;
+  /** #968: the client's OWN task identity, captured at RecvIn alongside
+   *  client_net_key_ and stamped back onto the response at SendOut.
+   *
+   *  net_key_ is the client task's heap address, so it is recycled as soon as
+   *  that task is freed. Demuxing a response by net_key alone therefore has no
+   *  way to tell "the reply to the task I am waiting for" from "a late reply to
+   *  a previous task that happened to live at this address". unique_ is
+   *  monotonic per client process and is never recycled, so echoing it lets the
+   *  client recv thread corroborate the address match against a real identity.
+   *  0 means the peer did not echo one (nothing to check). */
+  u32 client_task_unique_;
+  u32 client_task_major_;  /**< Companion to client_task_unique_ (per-thread) */
   ctp::lbm::ShmTransferInfo input_;   /**< SHM transfer info (client -> worker) */
   ctp::lbm::ShmTransferInfo output_;  /**< SHM transfer info (worker -> client) */
   ctp::lbm::Transport* response_transport_; /**< Transport for the response */
   char response_identity_[64];     /**< ZMQ echo-back identity (fallback path) */
   u32 response_identity_len_;
   int response_fd_;                /**< Socket fd for routing response (IPC) */
+  /** Client identity for TCP dial-back DEALER routing. Captured at RecvIn
+   *  (from the incoming ROUTER's identity frame) so SendOut can evict the
+   *  cached dial-back connection when a response is undeliverable (issue #722).
+   *  Empty for IPC responses (which use response_fd_). */
+  std::string client_identity_;
+  /** Client's response-listener port (SaveTaskArchive::client_port_). Used by
+   *  SendOut to evict the cached dial-back DEALER when the client is
+   *  unreachable (issue #722). Only meaningful for TCP responses. */
+  int client_response_port_;
   /** #722 bounded-drop of an undeliverable client response. When SendOut's
    *  network Send keeps failing (a client that submitted over TCP/IPC then
    *  disconnected), these bound the re-queue: after kMaxClientResponseRetries
@@ -928,6 +980,12 @@ class RunContext {
    *  (task freed via RAII) instead of re-queued forever. Non-serialized;
    *  meaningful only on the server's outbound response future. */
   u32 send_fail_count_;            /**< Consecutive response-Send failures */
+  /** #968: how many times SendOut has put a response for THIS future on the
+   *  wire. A successful send should happen exactly once; a second one means the
+   *  client is being handed two replies for one request, and the second lands
+   *  on whatever now owns that net_key. Counted so the anomaly is reported
+   *  where it happens rather than inferred from the client's miss tally. */
+  u32 responses_sent_;
   ctp::Timepoint first_send_fail_; /**< Time of the first failure (for timeout) */
   ctp::abitfield32_t gpu_flags_;   /**< GPU device-completion bit (gpu2gpu) */
   uintptr_t gpu_task_device_ptr_;  /**< Device addr of the task POD (kDeviceMem) */
@@ -987,10 +1045,14 @@ class RunContext {
         origin_(ClientOrigin::kClientShm),
         client_pid_(0),
         client_net_key_(0),
+        client_task_unique_(0),
+        client_task_major_(0),
         response_transport_(nullptr),
         response_identity_len_(0),
         response_fd_(-1),
+        client_response_port_(0),
         send_fail_count_(0),
+        responses_sent_(0),
         gpu_task_device_ptr_(0),
         gpu_task_size_(0),
         probe_rec_(0),

@@ -140,6 +140,7 @@ jobs:
   create-deploy-cpu-manifest:
     name: Create Multi-Arch Manifest (deploy-cpu)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [deploy-cpu-amd64, deploy-cpu-arm64]
     # No per-arch tags are pushed on a PR, so there is no manifest to stitch.
     if: ${{ github.event_name != 'pull_request' }}
@@ -242,6 +243,7 @@ jobs:
   create-benchmark-manifests:
     name: Create Multi-Arch Manifests (benchmarks)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [build-benchmarks-amd64, build-benchmarks-arm64]
     # No per-arch tags are pushed on a PR, so there is no manifest to stitch.
     if: ${{ github.event_name != 'pull_request' }}

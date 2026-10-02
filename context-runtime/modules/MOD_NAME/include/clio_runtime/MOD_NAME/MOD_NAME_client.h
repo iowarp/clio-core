@@ -135,6 +135,39 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Submit an AllReduce contribution (asynchronous) — the MPI_Allreduce(SUM)
+   * analogue. Pass a PoolQuery::AllToOne(container_hash, batch_key) so the
+   * request parks at the neighborhood leader until every container in the pool
+   * has contributed; the resulting future's sum_ is the collective total, the
+   * same value for every participant.
+   * @param pool_query Routing (use PoolQuery::AllToOne for the collective)
+   * @param value This participant's contribution
+   * @return Future for the AllReduceTask
+   */
+  clio::run::Future<AllReduceTask> AsyncAllReduce(
+      const clio::run::PoolQuery& pool_query, clio::run::u64 value) {
+    auto* ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<AllReduceTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, value);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Submit a Barrier contribution (asynchronous) — the MPI_Barrier analogue.
+   * Pass a PoolQuery::AllToOne(container_hash, batch_key); the future completes
+   * only once every container in the pool has reached the same barrier.
+   * @param pool_query Routing (use PoolQuery::AllToOne for the collective)
+   * @return Future for the BarrierTask
+   */
+  clio::run::Future<BarrierTask> AsyncBarrier(
+      const clio::run::PoolQuery& pool_query) {
+    auto* ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<BarrierTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Execute CoMutex test (asynchronous)
    * @param pool_query Pool routing information
    * @param test_id Test identifier

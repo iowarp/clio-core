@@ -14,11 +14,25 @@
 #   5. ~/.clio/clio_run.yaml         (legacy)
 #
 # Size values accept: B, KB, MB, GB, TB (case-insensitive)
+#
+# Storage root: on-disk runtime state (the CTE disk tier, metadata and
+# indexer logs, the restart log, bdev perf stats) lives under
+# ${CLIO_STORAGE_ROOT}, which defaults to ~/.clio. Override it per run with
+# `clio_run runtime start --disk <path>` (or `restart --disk <path>`) or by
+# exporting CLIO_STORAGE_ROOT. Paths written out explicitly in a custom
+# config are used as written.
 # =============================================================================
 
 # -- Networking ---------------------------------------------------------------
 networking:
-  port: 9413                           # RPC listener port
+  # RPC base port. The runtime binds a CLUSTER of three ports derived from
+  # it, all of which must be free: port (main RPC), port+1 (local server; the
+  # bind that decides which process is the runtime) and port+3 (client
+  # ROUTER). A runtime that cannot bind all three refuses to start rather
+  # than run half-bound. Keep the base below the OS ephemeral range (49152+
+  # on Windows) so port+3 cannot collide with an outbound connection.
+  # Override: CLIO_PORT.
+  port: 9413
   neighborhood_size: 32                # Max nodes queried when splitting range queries
   # hostfile: "/path/to/hostfile"      # One hostname per line for distributed mode
   wait_for_restart: 30                 # Seconds to wait for peer nodes on startup
@@ -36,6 +50,42 @@ runtime:
   local_sched: "default"               # Local task scheduler algorithm
   first_busy_wait: 10000               # Microseconds to busy-wait before sleeping (10ms)
   learning_rate: 0.2                   # SGD learning rate for task load prediction model
+  # ipc_namespace: ""                  # Extra suffix for shared-memory segment
+                                       # names, which already carry the user
+                                       # and port. Set it to run two runtimes
+                                       # that share both. Override:
+                                       # CLIO_IPC_NAMESPACE.
+
+# -- Web dashboard ------------------------------------------------------------
+# The runtime serves a dashboard itself: the admin ChiMod starts one HTTP server
+# per node, and every ChiMod that ships a `viz/` directory of HTML/CSS/JS gets
+# mounted at /viz/<mod_name> with the routes its Container registered. Nothing
+# here is collective, so each node serves the same UI independently.
+#
+# `clio_run runtime start` serves the dashboard by default; an embedded runtime
+# (a unit test, an adapter, a library user's CLIO_INIT) does not. Setting
+# `enabled` here decides it for both, and overrides the CLI default.
+#
+# Environment overrides (they win over this file):
+#   CLIO_VIZ_ENABLE      : 1/0
+#   CLIO_VIZ_PORT        : TCP port (0 = pick a free one)
+#   CLIO_VIZ_BIND        : bind address
+#   CLIO_VIZ_MAX_THREADS : HTTP thread-pool size
+#   CLIO_VIZ_PATH        : ':'-separated viz roots to serve assets from instead
+#                          of the ones next to the loaded ChiMod libraries
+#                          (edit pages without rebuilding)
+# Command line: clio_run runtime start [--viz|--no-viz] [--viz-port N]
+#                                      [--viz-bind ADDR]
+# viz:
+#   enabled: true                      # serve the dashboard on this node
+#   port: 8080                         # 0 = bind an ephemeral port
+#   bind: "127.0.0.1"                  # loopback by default: the dashboard
+#                                      # exposes runtime internals, so binding
+#                                      # 0.0.0.0 publishes them to the network
+#   max_threads: 16                    # HTTP request threads. Thread-per-
+#                                      # connection: a browser parks ~6
+#                                      # keep-alive sockets, so keep this
+#                                      # comfortably above that.
 
 # -- Compose ------------------------------------------------------------------
 # Modules started automatically with the runtime.
@@ -88,20 +138,35 @@ compose:
     pool_id: "400.0"
     next_pool_id: "512.0"               # CTE core pool — see entry below
 
-    # Transparent LLM labeling — optional. When enabled, PutBlob calls
-    # `model` on `label_endpoint` for every blob whose tag+name matches
-    # a rule, and stores the response as `{blob_name}_label` in the
-    # same tag. Leave commented out for a pure-passthrough CAE.
-    #
-    # label_endpoint: "http://127.0.0.1:11434"   # Ollama-compatible server
-    # label_prompts:
-    #   summarize: "Summarize the following text in one short sentence."
-    # label_matches:
-    #   - tag_re: ".*\\.txt$"                    # only label .txt blobs
-    #     blob_re: ".*"
-    #     model: "gemma3:1b"
-    #     prompt: "summarize"
-    #     context_length: 4096                  # tokens (Ollama num_ctx)
+  # === Summarizer (CAE) ===
+  # Transparent LLM summarization — optional, OFF by default (commented out).
+  # An interposer on the CTE core's task interface: it forwards every core
+  # verb to next_pool_id, and additionally calls `model` on `label_endpoint`
+  # for each PutBlob whose tag+blob name matches a rule, storing the response
+  # as `{blob_name}_label` in the same tag.
+  #
+  # To enable, uncomment this block AND point the CAE core's next_pool_id
+  # above at "401.0" so the data path runs through it. Compose it BEFORE any
+  # pool it forwards to exists — i.e. after the CTE core entry below.
+  #
+  # Inference is synchronous on the handling worker, so scope tag_re/blob_re
+  # tightly: a rule matching a hot write path serializes it behind the model.
+  #
+  # - mod_name: clio_cae_summarizer
+  #   pool_name: clio_cae_summarizer
+  #   pool_query: local
+  #   pool_id: "401.0"
+  #   next_pool_id: "512.0"             # CTE core pool — see entry below
+  #   label_endpoint: "http://127.0.0.1:11434"   # Ollama-compatible server
+  #   label_prompts:
+  #     summarize: "Summarize the following text in one short sentence."
+  #   label_matches:
+  #     - tag_re: ".*\\.txt$"            # only summarize .txt blobs
+  #       blob_re: ".*"
+  #       model: "gemma3:1b"
+  #       prompt: "summarize"
+  #       context_length: 4096          # tokens (Ollama num_ctx)
+  #       num_predict: 0                # cap on response tokens; 0 = no cap
 
   # === Context Transfer Engine (CTE) ===
   # High-performance data buffering and transfer engine. Sits at the
@@ -130,7 +195,7 @@ compose:
       # Persistent disk tier: where the replication chimod (below) keeps the
       # durable copies of DRAM-cached data. Grows lazily (1GB units), so the
       # capacity_limit is a cap, not an upfront allocation.
-      - path: "${HOME}/.clio/cte_disk_tier.dat"
+      - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
         bdev_type: "file"
         capacity_limit: "10GB"
         score: 0.2
@@ -141,7 +206,7 @@ compose:
     # for data to survive a runtime reboot: without it the disk tier's bytes
     # persist but nothing remembers which blob they belong to.
     performance:
-      metadata_log_path: "${HOME}/.clio/cte_metadata_log"
+      metadata_log_path: "${CLIO_STORAGE_ROOT}/cte_metadata_log"
       transaction_log_capacity: "32MB"
 
     # Data Placement Engine ------------------------------------------------
@@ -228,7 +293,7 @@ compose:
     pool_query: local
     pool_id: "564.0"
     next_pool_id: "561.0"               # replication (562.0 with compressor)
-    index_log_path: "${HOME}/.clio/cte_indexer_index"
+    index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
     # index_sweep_period_ms: 100        # async drain cadence (0 = lazy)
     # index_wal_compact_bytes: "8MB"    # WAL size that triggers compaction
     # tag_re: ".*"                      # index scope: only matching tags...

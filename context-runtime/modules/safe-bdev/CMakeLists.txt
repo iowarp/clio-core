@@ -19,6 +19,7 @@ add_clio_module_runtime(
   LIB_NAME clio_safe_bdev
   SOURCES
     src/safe_bdev_runtime.cc
+    src/safe_bdev_viz.cc
     src/autogen/safe_bdev_lib_exec.cc
   LINK_LIBRARIES
     clio_admin_runtime
@@ -26,6 +27,10 @@ add_clio_module_runtime(
     clio_bdev_client
 )
 add_library(chimaera_safe_bdev_runtime ALIAS clio_safe_bdev_runtime)
+
+# Web dashboard page for this module (issue #990): mounted at
+# /viz/clio_safe_bdev by the runtime as soon as a safe-bdev pool comes up.
+clio_add_viz_assets(MOD_NAME clio_safe_bdev)
 
 # Unit tests
 if(CLIO_CORE_ENABLE_TESTS)

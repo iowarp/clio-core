@@ -899,6 +899,17 @@ void DefaultScheduler::LoadBalance() {
     double window_sec = kNoProgressAlarmSec;
     const bool wedged_shape =
         IsWedgedShape(outstanding, live, live_stalled, &window_sec);
+    // Arm the window on the first tick. last_progress_us_ starts at 0.0, so a
+    // process whose FIRST LoadBalance tick already sees a wedged shape with
+    // nothing completed (processed == last_progress_count_ == 0, the normal
+    // state a second into bring-up) fell straight into the else branch and
+    // compared now_us against the epoch -- always greater than any window. The
+    // alarm then fired immediately and reported "no non-periodic task completed
+    // in 10s" about one second into the process's life. Same sentinel idiom as
+    // the HANGWATCH watchdog below.
+    if (last_progress_us_ == 0.0) {
+      last_progress_us_ = now_us;
+    }
     if (!wedged_shape || processed != last_progress_count_) {
       last_progress_count_ = processed;
       last_progress_us_ = now_us;

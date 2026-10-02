@@ -77,14 +77,35 @@ bool ClioInitImpl(RuntimeMode mode, bool default_with_runtime,
     init_runtime = with_runtime;
   }
 
-  // Initialize runtime first if needed
+  // "Clio as a cache" (issue #1015): asking for a runtime means asking for one
+  // to EXIST, not to be the process running it. Try to become the runtime; if
+  // something already owns the port, fall back to being its client.
+  //
+  // ZMQ is the arbiter here, not a lock of our own: binding the local server
+  // port is a kernel-level atomic claim, so of N processes racing to start
+  // (mpirun -np 4) exactly one can win it. The losers see ServerInit fail and
+  // continue to ClientInit, which attaches them to the winner.
+  //
+  // The foreign-program case falls out of the same path: if the port is held by
+  // something that is not a clio runtime, ServerInit fails to bind AND ClientInit
+  // finds nobody answering, so initialization fails — which is what we want, and
+  // is why this must not swallow a ClientInit failure.
   if (init_runtime) {
     if (!runtime_manager->ServerInit()) {
-      return false;
+      if (mode != RuntimeMode::kClient) {
+        // `clio_run runtime start` is an explicit "be the runtime" and must
+        // still fail loudly rather than silently become a client with no daemon.
+        return false;
+      }
+      HLOG(kInfo,
+           "CLIO_WITH_RUNTIME=1: could not start a runtime (port already "
+           "bound); attaching to the existing one as a client");
     }
   }
 
-  // Initialize client components
+  // Initialize client components. In the fall-back case above this is also the
+  // check that something real is listening: a foreign program on the port
+  // leaves nothing to attach to, and this fails.
   if (init_client) {
     if (!runtime_manager->ClientInit()) {
       return false;

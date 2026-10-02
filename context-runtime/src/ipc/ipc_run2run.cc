@@ -31,6 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <cstring>
+
 #include <clio_runtime/ipc/ipc_run2run.h>
 #include <clio_runtime/ipc_manager.h>
 #include <clio_runtime/pool_manager.h>
@@ -60,7 +62,15 @@ static std::atomic<uint64_t> sendout_ser_ns{0}, sendout_tx_ns{0},
 static std::atomic<uint64_t> recv_ns{0}, recvin_ns{0}, recvout_ns{0},
     recv_n{0};
 inline bool On() {
-  static bool on = std::getenv("CLIO_NET_TRACE") != nullptr;
+  // Non-EMPTY, not merely non-null: a harness that forwards the knob as
+  // "${CLIO_NET_TRACE:-}" (docker-compose environment:, and any `VAR=${VAR:-}`
+  // prefix) sets it to the empty string when unset, and a null check then
+  // leaves tracing permanently on -- silently adding clock reads and log
+  // volume to every measurement that was supposed to be clean.
+  static bool on = [] {
+    const char *e = std::getenv("CLIO_NET_TRACE");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
   return on;
 }
 inline uint64_t NowNs() {
@@ -252,7 +262,23 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
 
     task_copy->task_id_.net_key_ = send_map_key;
     task_copy->task_id_.replica_id_ = i;
-    task_copy->pool_query_ = query;
+    // A collective (ManyToOne / AllToOne) member keeps its OWN query across the
+    // wire. `query` here is the physical envelope RouteManyToOne wrapped it in
+    // (Physical(leader)), and the target node was already resolved from it
+    // above, so nothing on this side still needs it. The receiving leader,
+    // however, needs the collective query itself: it carries the routing mode
+    // that makes RouteTask park the task in the BatchManager, plus the
+    // container_hash and batch_key that decide WHICH group it joins.
+    // Overwriting it with the envelope erased all three, so a forwarded member
+    // arrived at the leader looking like an ordinary Physical task: it ran
+    // standalone and returned an un-combined result (an AllReduce gave each
+    // caller back its own value with rc=0), and the collective it should have
+    // joined waited for a member that never arrived.
+    if (origin_task->pool_query_.IsCollectiveMode()) {
+      task_copy->pool_query_ = origin_task->pool_query_;
+    } else {
+      task_copy->pool_query_ = query;
+    }
     task_copy->pool_query_.SetReturnNode(ipc_manager->GetNodeId());
 
     if (!ipc_manager->IsAlive(target_node_id)) {
@@ -527,6 +553,7 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   future.GetTaskPtr()->BeginRunContext();
+  ipc_manager->NetProfMarkRecvIn(task_ptr);
   task_ptr->SetRouted();
 
   if (ipc_manager->GetScheduler() != nullptr) {
@@ -661,25 +688,37 @@ int IpcManagerRun2Run::RecvOutAggregate(
     // Contract guard (issue #915). AggregateOut merges a REPLICA's OUT fields
     // into the origin; it must never touch the origin's IDENTITY. Tasks that
     // implement it by delegating to Copy() — a whole-task assignment — run
-    // Task::Copy and overwrite task_id_/pool_query_/completer_ with the
-    // replica's while send_map_ and the completion path still reference the
-    // origin, and re-assign IN shm strings across segments. That corrupted the
-    // runtime in production (#856) and ~26 such implementations still exist in
-    // tasks that are currently only routed single-replica. This catches any of
-    // them the instant someone routes that task multi-replica, naming the
-    // method, instead of letting it corrupt memory silently.
+    // Task::Copy and overwrite task_id_/pool_query_/method_/completer_ with
+    // the replica's while send_map_ and the completion path still reference
+    // the origin, and re-assign IN shm strings across segments. That corrupted
+    // the runtime in production (#856). Every in-tree AggregateOut now merges
+    // OUT fields only, and this guard keeps it that way: an out-of-tree chimod
+    // (or a new one that copy-pastes the old shape) is caught here, named by
+    // method, instead of corrupting memory silently.
+    //
+    // pool_query_ has no operator== and is deliberately trivially copyable and
+    // raw-byte compared elsewhere in the tree, so memcmp is the right test.
     const clio::run::TaskId id_before = origin_task->task_id_;
+    const clio::run::PoolQuery query_before = origin_task->pool_query_;
+    const clio::run::u32 method_before = origin_task->method_;
     container->AggregateOut(origin_task->method_, origin_task, replica);
-    if (!(origin_task->task_id_ == id_before)) {
+    const bool id_changed = !(origin_task->task_id_ == id_before);
+    const bool query_changed = memcmp(&origin_task->pool_query_, &query_before,
+                                      sizeof(clio::run::PoolQuery)) != 0;
+    const bool method_changed = origin_task->method_ != method_before;
+    if (id_changed || query_changed || method_changed) {
       HLOG(kError,
            "[AggregateOut CONTRACT VIOLATION] pool={} method={}: the origin's "
-           "task_id_ changed during aggregation ({} -> {}). This task's "
+           "identity changed during aggregation (task_id {} -> {}; "
+           "pool_query changed={}; method changed={}). This task's "
            "AggregateOut is copying the whole replica (almost certainly "
            "`Copy(other_base...)`) instead of merging OUT fields only. See "
            "issue #915. Restoring the origin's identity to avoid corruption.",
-           origin_task->pool_id_, origin_task->method_, id_before,
-           origin_task->task_id_);
+           origin_task->pool_id_, method_before, id_before,
+           origin_task->task_id_, query_changed, method_changed);
       origin_task->task_id_ = id_before;
+      origin_task->pool_query_ = query_before;
+      origin_task->method_ = method_before;
     }
 
     HLOG(kDebug, "[RecvOut] Task {}", origin_task->task_id_);

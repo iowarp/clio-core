@@ -74,7 +74,16 @@
 #include <fstream>
 #include <map>
 #include <string>
+
+// getpid() is the only POSIX call in this header. <process.h> is the MSVC CRT
+// spelling; windows.h is deliberately NOT pulled in here -- it defines macros
+// over ordinary identifiers (Yield() and friends) that break the driver body
+// and clio's headers, which is why the Win32 half lives in its own TU.
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 #include "adapter/clio_trace_schema.h"
 
@@ -94,12 +103,14 @@ inline const char *SizeBucket(uint64_t bytes) {
   return "ge_1m";
 }
 
+/** H5FD_MEM_DRAW, as a literal so this header does not need H5FDpublic.h.
+ *  H5FDclio.cc, which does include it, pins the two with a static_assert. */
+inline constexpr int kMemDraw = 3;
+
 /** HDF5's memory-type tag, collapsed to the distinction that drives R3. HDF5
  *  has several metadata classes; a recommendation only cares raw vs not. */
 inline const char *MemClass(int h5fd_mem_type) {
-  /* H5FD_MEM_DRAW == 1 in HDF5's enum; everything else is metadata of some
-     kind. Compared numerically so this header does not need H5FDpublic.h. */
-  return h5fd_mem_type == 1 ? "raw" : "meta";
+  return h5fd_mem_type == kMemDraw ? "raw" : "meta";
 }
 
 struct FileTrace {
@@ -133,7 +144,15 @@ inline bool Enabled() {
 #endif
 }
 
-inline long TracePid() { return static_cast<long>(::getpid()); }
+// MSVC spells it _getpid(); the value is only used to keep trace filenames and
+// records distinct per process, so either spelling serves equally.
+inline long TracePid() {
+#ifdef _WIN32
+  return static_cast<long>(::_getpid());
+#else
+  return static_cast<long>(::getpid());
+#endif
+}
 
 /** Filenames must not collide across processes (MPI ranks) or contain path
  *  separators from the traced file's own path. */

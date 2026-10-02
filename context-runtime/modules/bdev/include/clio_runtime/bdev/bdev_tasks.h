@@ -38,6 +38,7 @@
 #include <clio_runtime/config_manager.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <yaml-cpp/yaml.h>
+#include <clio_ctp/util/msan.h>
 
 #include <cctype>
 #include <string>
@@ -304,6 +305,11 @@ struct CreateParams {
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
     // Parse YAML config string
     YAML::Node config = YAML::Load(pool_config.config_);
+    // yaml-cpp is a prebuilt .so: the scalars its scanner just
+    // produced carry no MSan shadow, so every key lookup and
+    // .as<>() below reads memory it has no record of. One walk
+    // here covers the whole tree.
+    ctp::MsanUnpoisonYaml(config);
 
     // Load bdev type (optional, defaults to kFile)
     if (config["bdev_type"]) {
@@ -475,7 +481,17 @@ struct AllocateBlocksTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<AllocateBlocksTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<AllocateBlocksTask>();
+    // Allocation is partitioned across the replicas: each contributes the
+    // blocks IT reserved, so the origin accumulates the union. Element-wise
+    // push_back keeps every Block in the ORIGIN's allocator — assigning the
+    // replica's vector would adopt a foreign segment's buffer.
+    for (size_t i = 0; i < replica->blocks_.size(); ++i) {
+      blocks_.push_back(replica->blocks_[i]);
+    }
   }
 };
 
@@ -545,7 +561,11 @@ struct FreeBlocksTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<FreeBlocksTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -608,7 +628,16 @@ struct WriteTask : public clio::run::Task {
   /** AggregateOut */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<WriteTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<WriteTask>();
+    // Each replica writes its own slice, so bytes are SUMMED; the first
+    // non-zero io_error_ wins so a later success cannot mask a failure.
+    bytes_written_ += replica->bytes_written_;
+    if (io_error_ == 0) {
+      io_error_ = replica->io_error_;
+    }
   }
 
   /**
@@ -688,7 +717,21 @@ struct ReadTask : public clio::run::Task {
   /** AggregateOut */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ReadTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ReadTask>();
+    // data_ is a ShmPtr into the ORIGIN's buffer and the payload already
+    // landed there via the bulk transfer — never take the replica's pointer,
+    // which addresses a foreign segment.
+    // length_ is INOUT: it goes out as the requested length and comes back as
+    // the length actually read, so it is adopted rather than reduced (reading
+    // one range from several replicas is not a meaningful collective).
+    length_ = replica->length_;
+    bytes_read_ += replica->bytes_read_;
+    if (io_error_ == 0) {
+      io_error_ = replica->io_error_;
+    }
   }
 
   /**
@@ -762,7 +805,23 @@ struct GetStatsTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<GetStatsTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<GetStatsTask>();
+    // Stats are per-device and partitioned: a replica that does not host the
+    // bdev answers zeros. Capacity SUMS, the predicted lifetime keeps the
+    // WORST (smallest) figure — 999999 is the "healthy" sentinel the origin
+    // starts at — and the throughput model is taken from the first replica
+    // that actually measured one.
+    if (metrics_.read_bandwidth_mbps_ == 0.0 &&
+        metrics_.write_bandwidth_mbps_ == 0.0) {
+      metrics_ = replica->metrics_;
+    }
+    remaining_size_ += replica->remaining_size_;
+    if (replica->predicted_ttl_days_ < predicted_ttl_days_) {
+      predicted_ttl_days_ = replica->predicted_ttl_days_;
+    }
   }
 };
 
@@ -809,7 +868,11 @@ struct SetLifespanTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<SetLifespanTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -854,7 +917,11 @@ struct FlushAllocLogTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<FlushAllocLogTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -919,7 +986,11 @@ struct UpdateTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<UpdateTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 

@@ -60,7 +60,10 @@ services:
       <<: *common-env
       NODE_ID: "1"
       NODE_IP: 172.23.0.10
-      PYTHONPATH: /workspace/build/bin:/workspace/context-visualizer
+      # Built-in dashboard (issue #990): daemon-served, reachable off-container.
+      CLIO_VIZ_ENABLE: "1"
+      CLIO_VIZ_PORT: "5000"
+      CLIO_VIZ_BIND: 0.0.0.0
     entrypoint: ["/bin/bash", "-c"]
     command: >
       "
@@ -74,24 +77,17 @@ services:
         cp ~/.ssh/id_rsa.pub /shared-ssh/node1.pub &&
         sudo /usr/sbin/sshd;
 
-        echo 'Node 1: Installing dashboard dependencies...' &&
-        pip install flask pyyaml msgpack 2>&1 | tail -3 &&
-
-        echo 'Node 1: Starting runtime in background...' &&
+        echo 'Node 1: Starting runtime (dashboard built in, on :5000)...' &&
         /workspace/build/bin/clio_run runtime start &
         RUNTIME_PID=\$!;
         sleep 5;
-
-        echo 'Node 1: Starting dashboard on port 5000...' &&
-        python3 -m context_visualizer --host 0.0.0.0 --port 5000 &
-        DASH_PID=\$!;
 
         echo 'Node 1: Starting benchmark (200s, 16 threads)...' &&
         /workspace/build/bin/clio_run_thrpt_bench --test-case bdev_io --duration 200 --threads 16 --output-dir ram >/dev/null 2>&1 &
         BENCH_PID=\$!;
 
-        echo 'Node 1: Runtime PID='\$RUNTIME_PID' Dashboard PID='\$DASH_PID' Benchmark PID='\$BENCH_PID;
-        wait \$DASH_PID
+        echo 'Node 1: Runtime PID='\$RUNTIME_PID' Benchmark PID='\$BENCH_PID;
+        wait \$RUNTIME_PID
       "
 
   # Node 2

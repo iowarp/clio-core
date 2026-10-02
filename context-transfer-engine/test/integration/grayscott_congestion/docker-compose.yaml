@@ -15,14 +15,14 @@ services:
     hostname: iowarp-node1
     networks:
       gs-cluster:
-        ipv4_address: 172.30.0.10
+        ipv4_address: 172.31.3.10
     volumes:
       - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     tmpfs:
       - /mnt:mode=1777
     environment:
       - NODE_ID=1
-      - NODE_IP=172.30.0.10
+      - NODE_IP=172.31.3.10
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/grayscott_congestion/clio_config.yaml
       - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/grayscott_congestion/hostfile
       - CLIO_WITH_RUNTIME=0
@@ -48,6 +48,7 @@ services:
         /workspace/build/bin/test_grayscott_congestion
         EXIT=$$? &&
         echo \"gs-node1: producer exit $$EXIT\" &&
+        sleep $${GS_TEARDOWN_LINGER:-30} &&
         exit $$EXIT
       "
 
@@ -59,14 +60,14 @@ services:
     hostname: iowarp-node2
     networks:
       gs-cluster:
-        ipv4_address: 172.30.0.11
+        ipv4_address: 172.31.3.11
     volumes:
       - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     tmpfs:
       - /mnt:mode=1777
     environment:
       - NODE_ID=2
-      - NODE_IP=172.30.0.11
+      - NODE_IP=172.31.3.11
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/grayscott_congestion/clio_config.yaml
       - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/grayscott_congestion/hostfile
       - CLIO_WITH_RUNTIME=0
@@ -92,6 +93,7 @@ services:
         /workspace/build/bin/test_grayscott_congestion
         EXIT=$$? &&
         echo \"gs-node2: producer exit $$EXIT\" &&
+        sleep $${GS_TEARDOWN_LINGER:-30} &&
         exit $$EXIT
       "
 
@@ -100,4 +102,4 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.30.0.0/24
+        - subnet: 172.31.3.0/24

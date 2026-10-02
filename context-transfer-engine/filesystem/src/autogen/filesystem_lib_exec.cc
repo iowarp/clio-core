@@ -19,6 +19,8 @@ namespace clio::cte::filesystem {
   X(kMonitor, MonitorTask, Monitor)       \
   X(kOpen, OpenTask, Open)                \
   X(kClose, CloseTask, Close)             \
+  X(kMultiCreate, MultiCreateTask, MultiCreate) \
+  X(kAdvanceSize, AdvanceSizeTask, AdvanceSize) \
   X(kRead, ReadTask, Read)                \
   X(kWrite, WriteTask, Write)             \
   X(kGetattr, GetattrTask, Getattr)       \

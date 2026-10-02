@@ -26,6 +26,9 @@ on:
       - 'CMakePresets.json'
       - 'installers/conda/**'
       - '.github/workflows/gpu-tests.yml'
+  # Merge queue (issue #1013): same full-matrix-before-merge rationale as the
+  # other gates -- see ci-adapters.yml.
+  merge_group:
   workflow_dispatch:
 
 # One in-flight run per ref; a new push to a PR branch cancels the previous
@@ -56,10 +59,10 @@ jobs:
     - name: Install CUDA toolkit
       run: |
         if ! command -v nvcc &>/dev/null; then
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          bash CI/retry.sh wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cuda-toolkit-12-6 cuda-driver-dev-12-6
+          bash CI/retry.sh sudo apt-get update -qq
+          bash CI/retry.sh sudo apt-get install -y -qq cuda-toolkit-12-6 cuda-driver-dev-12-6
         fi
         echo "/usr/local/cuda/bin" >> $GITHUB_PATH
         echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV

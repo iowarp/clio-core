@@ -31,10 +31,6 @@
 
 namespace clio::run {
 
-namespace {
-class clio_sycl_init_queue_kernel;
-}
-
 #if CTP_IS_HOST
 
 bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
@@ -66,39 +62,38 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     dev.queue_backend_size = kQueueBackendBytes;
     std::memset(dev.queue_backend, 0, kQueueBackendBytes);
 
-    size_t *out_off = sycl::malloc_shared<size_t>(1, q);
-    if (!out_off) {
-      HLOG(kError, "ServerInitGpuQueues (SYCL): malloc_shared(out_off) failed");
-      FinalizeGpuQueues();
-      return false;
-    }
-    *out_off = static_cast<size_t>(-1);
-
-    char *queue_backend_ptr = dev.queue_backend;
-    size_t queue_backend_size = kQueueBackendBytes;
-    q.submit([&](sycl::handler &cgh) {
-      cgh.single_task<clio_sycl_init_queue_kernel>([=]() {
-        ctp::ipc::MemoryBackend proxy;
-        proxy.data_ = queue_backend_ptr;
-        proxy.data_capacity_ = queue_backend_size;
-        CLIO_QUEUE_ALLOC_T *alloc = proxy.MakeAlloc<CLIO_QUEUE_ALLOC_T>();
-        if (!alloc) {
-          *out_off = static_cast<size_t>(-1);
-          return;
-        }
+    // Host-side construction (mirrors gpu2cpu_init_hip.cc). queue_backend is
+    // pinned host memory mapped into the device address space at the same
+    // virtual address, so the BuddyAllocator's offset-based bookkeeping is
+    // safe to set up from the host.
+    //
+    // This MUST NOT run in a kernel on Intel GPUs. BuddyAllocator::Allocate
+    // takes ctp::Mutex, whose Lock() opens with lock_.fetch_add(1) -- and in
+    // the SYCL device pass CTP_IS_GPU==0, so ctp::ipc::atomic resolves to
+    // std_atomic (plain std::atomic). That is a device-side atomic RMW
+    // against host USM, which Ponte Vecchio does not support at any memory
+    // scope (aspect::usm_atomic_host_allocations == 0 on the Data Center GPU
+    // Max 1550). The GPU page-faults with AtomicAccessViolation and the
+    // Level Zero driver aborts the process, so every runtime start on Aurora
+    // died here. Constructing on the host needs no device atomic at all.
+    size_t queue_off = static_cast<size_t>(-1);
+    {
+      ctp::ipc::MemoryBackend proxy;
+      proxy.data_ = dev.queue_backend;
+      proxy.data_capacity_ = kQueueBackendBytes;
+      CLIO_QUEUE_ALLOC_T *alloc = proxy.MakeAlloc<CLIO_QUEUE_ALLOC_T>();
+      if (alloc) {
         ctp::ipc::FullPtr<clio::run::GpuTaskQueue> queue =
             alloc->NewObj<clio::run::GpuTaskQueue>(
                 alloc, /*num_lanes=*/1u, /*num_prio=*/2u, queue_depth);
-        *out_off = queue.IsNull() ? static_cast<size_t>(-1)
-                                  : queue.shm_.off_.load();
-      });
-    }).wait_and_throw();
-
-    size_t queue_off = *out_off;
-    sycl::free(out_off, q);
+        if (!queue.IsNull()) {
+          queue_off = queue.shm_.off_.load();
+        }
+      }
+    }
     if (queue_off == static_cast<size_t>(-1)) {
-      HLOG(kError, "ServerInitGpuQueues (SYCL): device queue construction "
-           "failed (gpu_id={})", gpu_id);
+      HLOG(kError, "ServerInitGpuQueues (SYCL): queue construction failed "
+           "(gpu_id={})", gpu_id);
       FinalizeGpuQueues();
       return false;
     }

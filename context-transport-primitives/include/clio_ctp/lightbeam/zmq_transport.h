@@ -48,6 +48,7 @@
 
 #include "clio_ctp/introspect/system_info.h"
 #include "clio_ctp/util/logging.h"
+#include "clio_ctp/util/msan.h"
 #include "lightbeam.h"
 #include "posix_socket.h"
 
@@ -171,6 +172,14 @@ class ZeroMqTransport : public Transport {
         port_(port),
         use_shared_ctx_(use_shared_ctx),
         zmq_fired_action_(nullptr) {
+    // Everything below is a call into libzmq, which is a prebuilt .so with no
+    // MSan instrumentation: creating the socket, setting options, resolving
+    // and connecting the endpoint, polling for writability. libzmq hands libc
+    // buffers it filled itself -- the pollfd array, the resolved address, the
+    // signaler pipe -- so MSan's interceptors report memory belonging to
+    // frames we never compile. Suppress just those checks for the duration of
+    // setup; instrumented code here is still checked normally.
+    ctp::MsanInterceptorCheckGuard msan_guard;
     type_ = TransportType::kZeroMq;
     sock::InitSocketLib();
 
@@ -267,7 +276,9 @@ class ZeroMqTransport : public Transport {
       // long enough that the net worker can't reach Recv() and the
       // bidirectional flow deadlocks. Bump both HWMs to 100 k so the
       // ZMQ I/O thread + TCP path (4 MiB SNDBUF/RCVBUF) is the
-      // bottleneck, not the application-side queue.
+      // bottleneck, not the application-side queue. A dial-back DEALER
+      // to a dead client is not left to fill this queue: SendOut evicts
+      // it when the response is dropped (#722).
       int sndhwm = 100000;
       zmq_setsockopt(socket_, ZMQ_SNDHWM, &sndhwm, sizeof(sndhwm));
       int rcvhwm = 100000;
@@ -524,22 +535,25 @@ class ZeroMqTransport : public Transport {
                               meta.client_info_.identity_.size(),
                               ZMQ_SNDMORE);
       if (rc == -1) {
-        HLOG(kError, "ZeroMqTransport::Send(ROUTER) - identity frame FAILED: {}",
-             zmq_strerror(zmq_errno()));
+        HLOG_EVERY_N(kError, 100,
+                     "ZeroMqTransport::Send(ROUTER) - identity frame FAILED: {}",
+                     zmq_strerror(zmq_errno()));
         return zmq_errno();
       }
       rc = zmq_send_eintr(socket_, "", 0, ZMQ_SNDMORE);
       if (rc == -1) {
-        HLOG(kError, "ZeroMqTransport::Send(ROUTER) - delimiter frame FAILED: {}",
-             zmq_strerror(zmq_errno()));
+        HLOG_EVERY_N(kError, 100,
+                     "ZeroMqTransport::Send(ROUTER) - delimiter frame FAILED: {}",
+                     zmq_strerror(zmq_errno()));
         return zmq_errno();
       }
     } else if (IsClient()) {
       // DEALER: empty delimiter frame, no identity.
       int rc = zmq_send_eintr(socket_, "", 0, ZMQ_SNDMORE);
       if (rc == -1) {
-        HLOG(kError, "ZeroMqTransport::Send(DEALER) - delimiter frame FAILED: {}",
-             zmq_strerror(zmq_errno()));
+        HLOG_EVERY_N(kError, 100,
+                     "ZeroMqTransport::Send(DEALER) - delimiter frame FAILED: {}",
+                     zmq_strerror(zmq_errno()));
         return zmq_errno();
       }
     }
@@ -547,8 +561,8 @@ class ZeroMqTransport : public Transport {
     int flags = (write_bulk_count > 0) ? ZMQ_SNDMORE : 0;
     int rc = zmq_send_eintr(socket_, meta_str.data(), meta_str.size(), flags);
     if (rc == -1) {
-      HLOG(kError, "ZeroMqTransport::Send - meta FAILED: {}",
-           zmq_strerror(zmq_errno()));
+      HLOG_EVERY_N(kError, 100, "ZeroMqTransport::Send - meta FAILED: {}",
+                   zmq_strerror(zmq_errno()));
       return zmq_errno();
     }
 
@@ -562,8 +576,8 @@ class ZeroMqTransport : public Transport {
       rc = zmq_send_eintr(socket_, meta.send[i].data.ptr_,
                            meta.send[i].size, bulk_flags);
       if (rc == -1) {
-        HLOG(kError, "ZeroMqTransport::Send - bulk {} FAILED: {}", i,
-             zmq_strerror(zmq_errno()));
+        HLOG_EVERY_N(kError, 100, "ZeroMqTransport::Send - bulk {} FAILED: {}",
+                     i, zmq_strerror(zmq_errno()));
         return zmq_errno();
       }
     }

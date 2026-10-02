@@ -1,12 +1,12 @@
 # Safe-BDev interactive integration test.
 #
 # Launches (in one container) the clio runtime + safe-bdev + CTE + clio-fs
-# (FUSE) + the context-visualizer dashboard, then -- in smoke mode -- scripts a
+# (FUSE) + the runtime's built-in dashboard, then -- in smoke mode -- scripts a
 # member remove+replace and asserts recovery progressed.
 #
 # Requires: Docker with SYS_ADMIN + /dev/fuse, a build with
 # -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON, and a container image carrying fuse3 +
-# flask (iowarp/cte-xfstests). Registered only under CLIO_CORE_ENABLE_DOCKER_CI.
+# (iowarp/cte-xfstests). Registered only under CLIO_CORE_ENABLE_DOCKER_CI.
 
 set(SAFE_BDEV_IT_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
