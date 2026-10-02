@@ -164,8 +164,10 @@ clio::run::TaskResume Runtime::StoreInodeRec(clio::run::u64 packed,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::FlushInodes() {
+clio::run::TaskResume Runtime::FlushInodes(int *err) {
   CLIO_TASK_BODY_BEGIN
+  if (err != nullptr) *err = 0;
+  std::unordered_set<clio::run::u64> failed;  // tried this call; stay dirty
   // Store what is dirty now, then push it to every container caching the
   // inode. An inode another task is storing stays dirty and is picked up
   // after it finishes: that store may predate this task's change, which must
@@ -177,6 +179,10 @@ clio::run::TaskResume Runtime::FlushInodes() {
       std::lock_guard<std::mutex> g(meta_mu_);
       for (auto it = inode_dirty_.begin(); it != inode_dirty_.end();) {
         const clio::run::u64 packed = *it;
+        if (failed.count(packed) != 0) {
+          ++it;  // a later flush retries it
+          continue;
+        }
         if (inode_storing_.count(packed) != 0) {
           ++busy;
           ++it;
@@ -256,6 +262,13 @@ clio::run::TaskResume Runtime::FlushInodes() {
         HLOG(kWarning, "filesystem: storing inode {} failed (rc {}); will "
              "retry", w.packed, src);
         if (fit != by_tag_.end()) inode_dirty_.insert(w.packed);
+        failed.insert(w.packed);
+        if (err != nullptr && *err == 0) {
+          *err = clio::cte::core::PutRcIsNoSpace(
+                     static_cast<clio::run::u32>(src))
+                     ? ENOSPC
+                     : EIO;
+        }
       }
     }
     if (busy == 0 && work.empty()) break;

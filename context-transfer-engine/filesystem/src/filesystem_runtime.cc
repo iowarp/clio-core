@@ -613,8 +613,9 @@ clio::run::TaskResume Runtime::AdvanceSize(
     LogInode(*fi);
     if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
   }
-  CLIO_CO_AWAIT(FlushInodes());  // the record carries the new size and mtime
-  task->return_code_ = 0;
+  int ferr = 0;
+  CLIO_CO_AWAIT(FlushInodes(&ferr));  // the record carries the new size/mtime
+  task->return_code_ = static_cast<clio::run::u32>(ferr);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -702,8 +703,9 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
       if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
     }
   }
-  CLIO_CO_AWAIT(FlushInodes());
-  task->return_code_ = 0;
+  int ferr = 0;
+  CLIO_CO_AWAIT(FlushInodes(&ferr));
+  task->return_code_ = static_cast<clio::run::u32>(ferr);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

@@ -308,6 +308,12 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
       CLIO_CO_AWAIT(clio::run::yield(1000.0));
       continue;
     }
+    if (!mine && lrc == EIO && attempt < 3 && BlockHome(dir, k) != home) {
+      // The home died while it was asked, and failover has since moved the
+      // block to its successor, which holds its replica: ask there instead
+      // of failing a lookup the cluster can still answer.
+      continue;
+    }
     rc = lrc == kFsRedirect ? EIO : lrc;
     if (rc == 0 && slot->home_ &&
         (slot->persist_dirty_ || slot->holders_unknown_)) {

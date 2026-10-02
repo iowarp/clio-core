@@ -882,8 +882,15 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume StoreInodeRec(clio::run::u64 packed,
                                       const std::string &rec, int &rc);
-  /** Store every dirty inode record and push it to its holders. */
-  clio::run::TaskResume FlushInodes();
+  /**
+   * Store every dirty inode record and push it to its holders. Each dirty
+   * inode is tried once per call: one that cannot be stored (a full store)
+   * stays dirty for a later flush instead of being retried in a loop that
+   * never returns.
+   * @param err out (optional): 0, or the errno of the first record that
+   *        could not be stored (ENOSPC for a full store, else EIO)
+   */
+  clio::run::TaskResume FlushInodes(int *err = nullptr);
   /**
    * Make sure an inode this container homes is in memory: after a restart
    * inodes load lazily from their records.

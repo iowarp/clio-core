@@ -315,7 +315,11 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
   // nodes storing inodes cached on each other.
   if (op != kShardBlockPush && op != kShardInodePush &&
       op != kShardBlockFetch) {
-    CLIO_CO_AWAIT(FlushInodes());
+    int ferr = 0;
+    CLIO_CO_AWAIT(FlushInodes(&ferr));
+    // The change could not be made durable (a full store): say so rather
+    // than acknowledge it.
+    if (rc == 0 && ferr != 0) rc = ferr;
   }
   resp.rc_ = static_cast<clio::run::u32>(rc);
   CLIO_CO_RETURN;
