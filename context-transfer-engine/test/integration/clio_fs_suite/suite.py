@@ -297,6 +297,12 @@ def main():
                   help='CTE performance.fsync_mode (default: CTE default)')
   ap.add_argument('--attr-cache', default=None,
                   help='CLIO_FUSE_ATTR_CACHE_S for the mounts')
+  ap.add_argument('--neighborhood', type=int, default=1,
+                  help='CTE targets.neighborhood: how many nodes\' devices '
+                       'each node may place blobs on')
+  ap.add_argument('--local-root', default=None,
+                  help='node-local state directory (default '
+                       '/mnt/nvme/$USER/clio_fs_suite)')
   ap.add_argument('--port', type=int, default=9519)
   ap.add_argument('--list', action='store_true')
   args = ap.parse_args()
@@ -336,8 +342,10 @@ def main():
                profile=args.profile, port=args.port,
                attr_cache_s=args.attr_cache, fsync_mode=args.fsync_mode,
                disk_gb=args.disk_gb, ram_mb=args.ram_mb,
-               fast_mb=args.fast_mb, organizer=args.organizer)
-  log(f'hosts={hosts} profile={args.profile} tests={len(sel)}')
+               fast_mb=args.fast_mb, organizer=args.organizer,
+               neighborhood=args.neighborhood, local_root=args.local_root)
+  log(f'hosts={hosts} profile={args.profile} '
+      f'neighborhood={args.neighborhood} tests={len(sel)}')
   ok, msg = cl.up(wipe=True)
   log(f'deploy: {msg}')
   resf = open(os.path.join(args.out, 'results.jsonl'), 'a')

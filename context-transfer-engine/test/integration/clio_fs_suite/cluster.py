@@ -128,7 +128,7 @@ class Cluster:
                ram_gb=8, disk_gb=20, local_root=None, net_suffix='-40g',
                extra_env=None, replicate_period_ms=0, fsync_mode=None,
                ram_mb=512, fast_mb=2048, organizer='frecency',
-               organizer_period_ms=2000):
+               organizer_period_ms=2000, neighborhood=1):
     self.hosts = list(hosts)
     self.bin_dir = bin_dir
     self.run_dir = run_dir            # shared (NFS): configs, logs, results
@@ -156,6 +156,10 @@ class Cluster:
     self.fast_mb = fast_mb
     self.organizer = organizer
     self.organizer_period_ms = organizer_period_ms
+    # CTE targets.neighborhood: each node's CTE registers the disk tiers of
+    # this many nodes (itself and the next ones), so a blob may be placed
+    # on a neighbor's device.
+    self.neighborhood = neighborhood
     self.agents = {}
     self.agent_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  'agent.py')
@@ -286,7 +290,7 @@ compose:
 {''.join(storage)}{perf}{organizer}    dpe:
       dpe_type: "max_bw"
     targets:
-      neighborhood: 1
+      neighborhood: {self.neighborhood}
       default_target_timeout_ms: 30000
       poll_period_ms: 5000
       failover_to_successor: true

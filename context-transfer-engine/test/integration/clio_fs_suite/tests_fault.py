@@ -856,17 +856,27 @@ def t_truncate_during_failover(ctx):
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
   ctx.cl.agents.pop(vh, None)
   time.sleep(2)
+  def tails():
+    out = {}
+    for i in range(n):
+      out[i] = ctx.ok(i, 'sh', cmd=f'python3 -c "f=open({p!r},\'rb\');'
+                                   f' f.seek({1 * MiB}); d=f.read(); '
+                                   f'print(len(d), set(d)==set(b\'T\'))"'
+                      )['out'].strip()
+    return {i: t for i, t in out.items() if not t.endswith(f'{4096} True')}
   for i in range(n):
     sz = ctx.ok(i, 'stat', path=p)['size']
     ctx.check(sz == want, f'node{i} sees size {sz} after the home returned, '
                           f'want {want} (old size resurrected?)')
-    tail = ctx.ok(i, 'sh', cmd=f'python3 -c "f=open({p!r},\'rb\');'
-                               f' f.seek({1 * MiB}); '
-                               f'd=f.read(); print(len(d), set(d)==set(b\'T\'))"'
-                  )['out']
-    ctx.check(tail.strip().endswith(f'{4096} True'),
-              f'node{i}: bytes past the cut are {tail.strip()!r}, want 4096 '
-              f'x "T"')
+  bad = tails()
+  if bad:
+    # Stale on every node, or only where a cached copy was made before the
+    # outage? And does it heal once the hand-back has had time to run?
+    time.sleep(20)
+    later = tails()
+    ctx.check(False, f'bytes past the cut are not the 4096 x "T" tail: '
+                     f'{bad} (writer node0, page-1 owner = home node{victim}'
+                     f'?); 20 s later: {later or "all healed"}')
   v = ctx.ok(n - 1 if victim != n - 1 else 0, 'verify_file', path=p,
              size=1 * MiB, seed=5)
   ctx.check(not v['mismatch'], f'kept prefix damaged: {v["mismatch"]}')

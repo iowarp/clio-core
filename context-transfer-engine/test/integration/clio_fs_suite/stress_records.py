@@ -142,6 +142,9 @@ def scan(path, file_id, nblocks, blk=BLK, chunk_blocks=256):
   """
   size = os.stat(path).st_size
   runs = []
+  corrupt = []
+  torn = {}
+  foreign = {}
   fd = os.open(path, os.O_RDONLY)
   try:
     b = 0
@@ -154,6 +157,18 @@ def scan(path, file_id, nblocks, blk=BLK, chunk_blocks=256):
           w, g = ZERO, 0  # past EOF: never written
         else:
           w, g = classify(piece, file_id, b + i, blk)
+          if w == FOREIGN and len(foreign) < 64:
+            # Whose record is it: [file id, its block, writer, gen].
+            _, ffid, fblk, fw, fg, _ = _HDR.unpack(piece[:_HDR.size])
+            foreign[b + i] = [hex(ffid), fblk, fw, fg]
+          if w == CORRUPT:
+            d = describe_corrupt(piece, blk)
+            if isinstance(d.get('head'), list) and d.get('rest_is'):
+              # A write torn mid-block: [head writer, head gen, rest writer,
+              # rest gen] -- the caller decides whether that tear is legal.
+              torn[b + i] = d['head'][2:4] + d['rest_is']
+            if len(corrupt) < 8:
+              corrupt.append(d | {'block': b + i})
         if runs and runs[-1][2] == w and runs[-1][3] == g and \
             runs[-1][0] + runs[-1][1] == b + i:
           runs[-1][1] += 1
@@ -162,7 +177,50 @@ def scan(path, file_id, nblocks, blk=BLK, chunk_blocks=256):
       b += n
   finally:
     os.close(fd)
-  return {'size': size, 'runs': runs}
+  return {'size': size, 'runs': runs, 'corrupt': corrupt,
+          'torn': {str(k): v for k, v in torn.items()},
+          'foreign': {str(k): v for k, v in foreign.items()}}
+
+
+def describe_corrupt(piece, blk=BLK):
+  """Describe a CORRUPT block for a failure report.
+
+  Args:
+    piece: the block's bytes.
+    blk: block size.
+  Returns:
+    {'len', 'nonzero', 'head' (header fields if the magic is there),
+     'tail_zero_from' (offset where an all-zero tail starts, or None),
+     'pattern_breaks_at' (first offset past the header where the record's
+     digest pattern no longer matches, or None)}.
+  """
+  out = {'len': len(piece), 'nonzero': len(piece) - piece.count(0)}
+  if piece[:8] == MAGIC and len(piece) >= _HDR.size:
+    _, fid, blkno, writer, gen, _ = _HDR.unpack(piece[:_HDR.size])
+    out['head'] = [hex(fid), blkno, writer, gen]
+    dig = hashlib.sha256(piece[:_HDR.size]).digest()
+    want = dig * ((blk - _HDR.size) // len(dig))
+    got = piece[_HDR.size:]
+    out['pattern_breaks_at'] = next(
+        (_HDR.size + k for k in range(min(len(got), len(want)))
+         if got[k] != want[k]), None)
+  else:
+    out['head'] = piece[:24].hex()
+  stripped = piece.rstrip(b'\0')
+  out['tail_zero_from'] = len(stripped) if len(stripped) < len(piece) else None
+  brk = out.get('pattern_breaks_at')
+  if brk is not None and 'head' in out and isinstance(out['head'], list):
+    # Which record does the rest of the block belong to? Try this file and
+    # block with other writers / gens (a torn write keeps an older version).
+    fid, blkno = int(out['head'][0], 16), out['head'][1]
+    for w in range(1, 17):
+      for g in range(0, 129):
+        ref = make_block(fid, blkno, w, g, blk)
+        if piece[brk:] == ref[brk:]:
+          out['rest_is'] = [w, g]
+          return out
+    out['rest_is'] = None
+  return out
 
 
 def _now():
@@ -421,7 +479,16 @@ class SafeSaveStress:
           step = 'fstat'
           size = os.fstat(fd).st_size
           step = 'read'
-          data = os.pread(fd, self.nblocks * self.blk, 0)
+          # CLIO_SUITE_READ_CHUNK_BLOCKS splits the whole-file read into
+          # several pread(2)s (diagnostic: separates page-cache mixing
+          # from a file whose bytes change between two reads).
+          ck = int(os.environ.get('CLIO_SUITE_READ_CHUNK_BLOCKS', '0'))
+          if ck <= 0:
+            data = os.pread(fd, self.nblocks * self.blk, 0)
+          else:
+            data = b''.join(
+                os.pread(fd, ck * self.blk, b * self.blk)
+                for b in range(0, self.nblocks, ck))
           size2 = os.fstat(fd).st_size
         finally:
           os.close(fd)
@@ -448,7 +515,8 @@ class SafeSaveStress:
         full = self.nblocks * self.blk
         if size != full or len(data) != full:
           self.bad.append(f'{tgt}: short: fstat {size} (after {size2}), '
-                          f'read {len(data)} of {full}')
+                          f'read {len(data)} of {full} '
+                          f'at {time.strftime("%H:%M:%S")}')
         elif len(runs) != 1 or runs[0][2] < 0:
           first_bad = next((r for r in runs if r[2] < 0), None)
           sample = ''
@@ -459,7 +527,8 @@ class SafeSaveStress:
             sample = (f' first bad block {first_bad[0]}: {nz} nonzero bytes, '
                       f'head {piece[:24].hex()}')
           self.bad.append(f'{tgt}: not one intact version: '
-                          f'{[r[:4] for r in runs[:4]]}{sample}')
+                          f'{[r[:4] for r in runs[:4]]}{sample} '
+                          f'at {time.strftime("%H:%M:%S")}')
 
   def run(self):
     """Run savers and readers; return their logs."""

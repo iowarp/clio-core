@@ -52,6 +52,23 @@ def t_full_is_enospc(ctx):
       bad.append((path, v.get('err') or v.get('ret')))
   ctx.check(not bad, f'{len(bad)} files acknowledged before the cluster '
                      f'filled are damaged, e.g. {bad[:3]}')
+  # Metadata on a full store: creating files and a directory must finish,
+  # each one succeeding or failing ENOSPC. (Inode records that could not be
+  # stored used to be retried forever, so every create and close hung.)
+  t0 = time.time()
+  ctx.call(0, 'mkdir', path=ctx.p('meta_when_full'), timeout=120)
+  r = ctx.call(0, 'create_many', dirpath=ctx.p('meta_when_full'), prefix='m',
+               count=200, timeout=120)
+  ctx.metrics['meta_when_full_s'] = round(time.time() - t0, 1)
+  ctx.check(not r.get('hang') and not r.get('agent_dead'),
+            'creating files on the full cluster hung')
+  if r['ok']:
+    errs = {e for _, e in r['ret']['fails']}
+    ctx.metrics['meta_when_full'] = {'created': r['ret']['created'],
+                                     'errors': sorted(errs)}
+    ctx.check(errs <= {'ENOSPC'},
+              f'creates on a full cluster failed with {sorted(errs)}, '
+              f'not ENOSPC')
   ctx.call(0, 'unlink', path=ctx.p(f'fill{len(written)}'))  # the partial one
   for path, _ in written:
     ctx.ok(0, 'unlink', path=path, timeout=300)

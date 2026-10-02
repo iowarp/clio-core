@@ -147,12 +147,16 @@ def t_tier_overflow(ctx):
 
   bad, anomalies = [], {'mismatch': 0, 'corrupt': 0}
 
+  foreign_src = []  # (file, block, source file id, its block, writer, gen)
+
   def verify(reader_of, names_of):
     def one(i):
       r = reader_of(i)
       for nm in names_of(i):
         got = ctx.ok(r, 'rec_scan', timeout=900, path=f'{base}/{nm}',
                      name=nm, nblocks=FILE_BLOCKS)
+        for b, src in list(got.get('foreign', {}).items())[:4]:
+          foreign_src.append((nm, int(b), *src))
         anomalies['corrupt'] += _corrupt_blocks(got['runs'])
         anomalies['mismatch'] += _compare(_to_runs(models[nm]), got,
                                           FILE_BLOCKS, nm, bad)
@@ -209,6 +213,16 @@ def t_tier_overflow(ctx):
   # verify from yet another node.
   time.sleep(5)
   verify(lambda i: (i + n - 1) % n, lambda i: owned[i])
+  if foreign_src:
+    # Name the files the foreign records came from: a deleted file means a
+    # freed extent was handed out unwritten; a live one, a shared extent.
+    names = {hex(sr.file_id_of(nm)): nm for nm in
+             list(models) + [g for gs in gones for g in gs]}
+    deleted = {g for gs in gones for g in gs}
+    ctx.note('foreign records came from: ' + str([
+        (nm, b, names.get(fid, fid),
+         'deleted' if names.get(fid) in deleted else 'live', fb, w, g)
+        for nm, b, fid, fb, w, g in foreign_src[:8]]))
   ctx.metrics['corrupt_or_foreign_blocks'] = anomalies['corrupt']
   ctx.metrics['bad_blocks_total'] = anomalies['mismatch']
   ctx.check(anomalies['mismatch'] == 0,
@@ -528,6 +542,24 @@ def _read_durable_log(path):
   return out
 
 
+def _torn_unsynced(t, writer, inflight):
+  """Whether a torn block is the unsynced in-flight write over an older
+  version of the same file.
+
+  Args:
+    t: [head writer, head gen, rest writer, rest gen] from scan, or None.
+    writer: the file's writer.
+    inflight: the gen being written when the crash hit.
+  Returns:
+    True when the head is the in-flight gen and the rest an older gen, both
+    by this file's writer.
+  """
+  if not t:
+    return False
+  hw, hg, rw, rg = t
+  return hw == writer and rw == writer and hg == inflight and rg < hg
+
+
 def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
                     skip_writer_of=None):
   """Verify FileSetWriter output after a fault.
@@ -547,6 +579,7 @@ def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
     skip_writer_of: node whose files are not checked (None: all).
   """
   lost, corrupt, missing_file, checked = [], [], [], 0
+  torn_unsynced = []
   for i in range(n):
     if i == skip_writer_of:
       continue
@@ -568,7 +601,20 @@ def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
                    nblocks=FILE_BLOCKS)
       checked += 1
       dg = durable.get(nmx, 0)
+      for d in got.get('corrupt', [])[:2]:
+        ctx.note(f'{nmx} corrupt block {when} (durable gen {dg}, '
+                 f'started {started.get(nmx)}): {d}')
+      torn = got.get('torn', {})
+      inflight = started.get(nmx)
       for start, count, w, g in got['runs']:
+        if w == CORRUPT and inflight is not None and all(
+            _torn_unsynced(torn.get(str(b)), i + 1, inflight)
+            for b in range(start, start + count)):
+          # The write in flight at the crash (never fsynced) landed only in
+          # part of the block; the rest is this file's older version. No
+          # guarantee covers unsynced bytes, so this is legal (reported).
+          torn_unsynced.append((nmx, start, count))
+          continue
         if w in (CORRUPT, FOREIGN):
           corrupt.append((nmx, start, count, KIND[w]))
         elif w == ZERO:
@@ -582,6 +628,10 @@ def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
             (g - dg) % nfiles != 0:
           corrupt.append((nmx, start, count, f'unexpected gen {g}'))
   ctx.metrics['files_checked'] = checked
+  if torn_unsynced:
+    ctx.metrics['torn_unsynced_blocks'] = sum(c for _, _, c in torn_unsynced)
+    ctx.note(f'blocks torn by the unsynced write in flight {when} (legal: '
+             f'the rest is the older version): {torn_unsynced[:6]}')
   ctx.check(not corrupt, f'{len(corrupt)} CORRUPT/FOREIGN/unexpected ranges '
                          f'{when}, e.g. {corrupt[:6]}')
   ctx.check(not missing_file, f'fsynced files missing {when}: '
@@ -887,8 +937,9 @@ def t_safe_save(ctx):
                   savers=2, readers=2, secs=90, seed=i)
   results = ctx.each(run)
   saves = [s for r in results for s in r['saves']]
-  bad = [b for r in results for b in r['bad']]
-  errs = [e for r in results for e in r['errors']]
+  # Prefix each problem with the node that saw it ('n3/t5: ...').
+  bad = [f'n{i}/{b}' for i, r in enumerate(results) for b in r['bad']]
+  errs = [f'n{i}/{e}' for i, r in enumerate(results) for e in r['errors']]
   time.sleep(2)
   finals, wrong = {}, []
   for t in targets:
