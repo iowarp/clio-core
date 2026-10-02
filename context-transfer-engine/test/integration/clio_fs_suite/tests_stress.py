@@ -688,6 +688,11 @@ def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
                       start=fb, count=1)
         r3 = ctx.call((reader + 1) % n, 'rec_scan_range', path=path,
                       name=nmx, start=fb, count=1)
+        st = (ctx.call(reader, 'stat', path=path).get('ret') or {})
+        ino = st.get('ino', 0) or 0
+        ctx.note(f'{nmx} tag={ino >> 32}.{ino & 0xffffffff} FOREIGN pages '
+                 f'{sorted({int(b) * 4096 >> 20 for b in foreign})} '
+                 f'(match [copy-read] lines; 4 KiB blocks, 1 MiB pages)')
         ctx.note(f'{nmx} FOREIGN block {fb} re-read: '
                  f'node{reader} {(r2.get("ret") or {}).get("runs")} '
                  f'node{(reader + 1) % n} {(r3.get("ret") or {}).get("runs")}')

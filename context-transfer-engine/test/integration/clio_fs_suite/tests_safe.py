@@ -255,3 +255,41 @@ def t_fsync_lost_node(ctx):
   v = ctx.ok(n - 1, 'verify_file', path=safe, size=8 << 20, seed=3,
              timeout=600)
   ctx.check(v['ok'], f'file fsynced before the crash: {v}')
+
+
+@test('safe_cache_coherent_after_crash', 'safe', min_nodes=3,
+      redeploy_after=True, timeout=1800)
+def t_cache_coherent_after_crash(ctx):
+  """#1136: node0 writes files WITHOUT fsync; node1 reads them (populating
+  its node-local cache copies); every daemon is SIGKILLed and the cluster
+  restarts. Whatever survived of unsynced data is up to the crash -- but
+  every node must then read the SAME bytes for each file (or all agree it
+  is gone): a node serving a cached copy the owner's recovery no longer
+  agrees with is two versions of one file."""
+  n = len(ctx.hosts)
+  base = ctx.p('cc')
+  ctx.ok(0, 'mkdir', path=base)
+  names = [f'f{k}' for k in range(8)]
+  for k, nm in enumerate(names):
+    ctx.ok(0, 'write_file', path=f'{base}/{nm}', size=(4 << 20) + 1000 * k,
+           seed=40 + k, fsync=False, timeout=600)
+  ctx.ok(0, 'sh', cmd=f'python3 -c "import os; os.fsync(os.open({base!r}, '
+                      f'os.O_RDONLY))"', timeout=120)  # the NAMES survive
+  time.sleep(3)  # let the write-behind ship the pages to their owners
+  for nm in names:
+    ctx.ok(1, 'sha256', path=f'{base}/{nm}', timeout=600)
+  restart_cluster(ctx, crash=True)
+  ctx.cl.agents.clear()
+  split = []
+  for nm in names:
+    seen = {}
+    for i in range(n):
+      r = ctx.call(i, 'sha256', path=f'{base}/{nm}', timeout=600)
+      seen[f'node{i}'] = ((r.get('ret') or {}).get('sha256', '')[:12],
+                          (r.get('ret') or {}).get('size')) if r.get('ok') \
+          else f'err {r.get("errno")}'
+    if len(set(map(str, seen.values()))) > 1:
+      split.append((nm, seen))
+  ctx.metrics['files_split'] = len(split)
+  ctx.check(not split, f'nodes disagree about unsynced files after a crash '
+                       f'restart: {split[:3]}')
