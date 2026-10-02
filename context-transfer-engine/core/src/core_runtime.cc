@@ -8979,6 +8979,23 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
   }
 
   clio::run::u64 additional_size = required_size - current_blob_size;
+  // A failed extension must leave the blob exactly as it found it: blocks
+  // placed but never written, or spare capacity counted into the size, would
+  // be READ as the blob's bytes -- whatever a recycled extent held (another
+  // blob's data, garbage, zeros) -- by any reader before the caller cleans
+  // up. A cache-copy population that failed on a nearly full tier served
+  // exactly that (#1107).
+  const size_t entry_nblocks = blob_info.blocks_.size();
+  const clio::run::u64 entry_last_size =
+      entry_nblocks != 0 ? blob_info.blocks_.back().size_ : 0;
+  const clio::run::u64 needed_size = additional_size;
+  const auto undo_fill = [&blob_info, entry_nblocks, entry_last_size,
+                          current_blob_size]() {
+    if (entry_nblocks != 0 && blob_info.blocks_.size() >= entry_nblocks) {
+      blob_info.blocks_[entry_nblocks - 1].size_ = entry_last_size;
+    }
+    blob_info.total_size_cache_ = current_blob_size;
+  };
 
   // Spare-capacity fast path: fill the unused physical slack of the LAST block
   // before allocating anything new. The bdev rounds each allocation up to a 4 KB
@@ -9073,8 +9090,9 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
          "ExtendBlob: no storage target registered on this container; the "
          "put of {} byte(s) is refused (clients see rc 11)",
          additional_size);
+    undo_fill();
     if (shortfall != nullptr) {
-      *shortfall = additional_size;
+      *shortfall = needed_size;
     }
     error_code = 1;
     CLIO_CO_RETURN;
@@ -9127,8 +9145,9 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
        ordered_targets.size());
 
   if (ordered_targets.empty()) {
+    undo_fill();
     if (shortfall != nullptr) {
-      *shortfall = additional_size;
+      *shortfall = needed_size;
     }
     error_code = 2;
     CLIO_CO_RETURN;
@@ -9244,14 +9263,26 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
   // Error condition: if we've exhausted all targets but still have remaining
   // space
   if (remaining_to_allocate > 0) {
-    // Partial allocation left blocks_ inconsistent; resync the size cache from
-    // the authoritative sum before bailing (cold error path). The blocks that
-    // DID land are kept, so a retry recomputes additional_size against the
-    // grown blob and asks only for what is still missing -- which is exactly
-    // remaining_to_allocate.
-    blob_info.RecomputeTotalSize();
+    // Roll the partial allocation back (see undo_fill): free the blocks this
+    // call placed and restore the size, so no reader ever sees bytes that
+    // were never written. A retry (after eviction) asks for the whole
+    // extension again.
+    {
+      BlobInfo placed;
+      for (size_t i = entry_nblocks; i < blob_info.blocks_.size(); ++i) {
+        placed.blocks_.push_back(blob_info.blocks_[i]);
+      }
+      while (blob_info.blocks_.size() > entry_nblocks) {
+        blob_info.blocks_.pop_back();
+      }
+      undo_fill();
+      if (!placed.blocks_.empty()) {
+        clio::run::u32 free_rc = 0;
+        CLIO_CO_AWAIT(FreeAllBlobBlocks(placed, free_rc));
+      }
+    }
     if (shortfall != nullptr) {
-      *shortfall = remaining_to_allocate;
+      *shortfall = needed_size;
     }
     // THE LINE THAT MATTERS, and it is a warning. Every candidate target was
     // walked and the blob still needs bytes, so the put is about to fail with
