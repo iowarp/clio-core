@@ -204,7 +204,9 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
   // consumed_ after Recv returns, so it is false on the first claim and true
   // on any re-Wait. (The ZMQ path does not erase on claim -- the SHM twin
   // does -- but the guard is kept in both for symmetry.)
-  if (!claimed && !future.consumed_) {
+  // net_key == 0 means the task was completed locally and never sent (see
+  // the twin in IpcCpu2Cpu::RecvOut), so there is no response to claim.
+  if (!claimed && !future.consumed_ && net_key != 0) {
     HLOG(kError,
          "IpcCpu2CpuZmq::RecvOut: task completed with NO response archive for "
          "net_key {} -- the completion came from another task's response "
