@@ -628,6 +628,10 @@ def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
       for d in got.get('corrupt', [])[:2]:
         ctx.note(f'{nmx} corrupt block {when} (durable gen {dg}, '
                  f'started {started.get(nmx)}): {d}')
+      foreign = got.get('foreign') or {}
+      if foreign:
+        ctx.note(f'{nmx} FOREIGN blocks {when} hold [file id, block, writer, '
+                 f'gen]: {dict(list(foreign.items())[:4])}')
       torn = got.get('torn', {})
       inflight = started.get(nmx)
       for start, count, w, g in got['runs']:
@@ -649,7 +653,10 @@ def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
         elif g < dg:
           lost.append((nmx, start, count, f'gen {g}', f'fsynced gen {dg}'))
         elif g > dg and ret and g not in started.values() and \
-            (g - dg) % nfiles != 0:
+            (g - (k + 1)) % nfiles != 0:
+          # File k is written at gens k+1, k+1+nfiles, ...: any of those
+          # newer than the fsynced one is an unsynced write that landed
+          # (legal); anything else is some other round's data.
           corrupt.append((nmx, start, count, f'unexpected gen {g}'))
   ctx.metrics['files_checked'] = checked
   if torn_unsynced:
