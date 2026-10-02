@@ -930,6 +930,13 @@ inline constexpr bool PutRcIsNoSpace(clio::run::u32 rc) {
 static constexpr clio::run::u32 kPutExistsRc = 60;
 /** PutBlob with Context::kPutIfVersion found a different version. */
 static constexpr clio::run::u32 kPutVersionMismatchRc = 61;
+/**
+ * GetBlob could not read bytes the blob has: a block's device (or the node
+ * holding it) did not return them. Distinct from 1 ("no such blob"), which
+ * readers such as the filesystem treat as a hole of zeros -- an unreachable
+ * block must surface as an I/O error, never as zeros.
+ */
+static constexpr clio::run::u32 kGetBlobIoErrorRc = 62;
 
 /**
  * One replica of a blob's data (issue #886): an independent block list,
@@ -3708,23 +3715,32 @@ struct PodMultiScoreTask : public clio::run::Task {
 /**
  * DelBlob task - Remove blob and decrement tag size
  */
+/** DelBlobTask::del_flags_: drop only this node's cache copy (REPLICA_CACHE)
+ *  of the blob -- a coherence invalidation that must leave any primary or
+ *  durable copy the node holds alone. */
+static constexpr clio::run::u32 kDelCacheCopyOnly = 1u;
+
 struct DelBlobTask : public clio::run::Task {
   IN TagId tag_id_;                 // Tag ID for blob lookup
   IN clio::run::priv::string blob_name_;  // Blob name (required)
+  IN clio::run::u32 del_flags_;     // kDelCacheCopyOnly, or 0: the whole blob
 
   // SHM constructor
   DelBlobTask()
-      : clio::run::Task(), tag_id_(TagId::GetNull()), blob_name_(CLIO_PRIV_ALLOC) {}
+      : clio::run::Task(), tag_id_(TagId::GetNull()), blob_name_(CLIO_PRIV_ALLOC),
+        del_flags_(0) {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit DelBlobTask(const clio::run::TaskId &task_id,
                                       const clio::run::PoolId &pool_id,
                                       const clio::run::PoolQuery &pool_query,
                                       const TagId &tag_id,
-                                      const std::string &blob_name)
+                                      const std::string &blob_name,
+                                      clio::run::u32 del_flags = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kDelBlob),
         tag_id_(tag_id),
-        blob_name_(CLIO_PRIV_ALLOC, blob_name) {
+        blob_name_(CLIO_PRIV_ALLOC, blob_name),
+        del_flags_(del_flags) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kDelBlob;
@@ -3738,7 +3754,7 @@ struct DelBlobTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_id_, blob_name_);
+    ar(tag_id_, blob_name_, del_flags_);
   }
 
   /**
@@ -3758,6 +3774,7 @@ struct DelBlobTask : public clio::run::Task {
     Task::Copy(other.template Cast<Task>());
     tag_id_ = other->tag_id_;
     blob_name_ = other->blob_name_;
+    del_flags_ = other->del_flags_;
   }
 
   /**

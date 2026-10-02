@@ -3420,15 +3420,25 @@ class Client : public clio::run::ContainerClient {
     return ipc_manager->Send(task);
   }
 
+  /**
+   * Asynchronously delete a blob.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob
+   * @param pool_query routing (Dynamic: the blob's owner)
+   * @param del_flags kDelCacheCopyOnly: drop only the target node's cache
+   *        copy (a coherence invalidation); 0: delete the blob
+   * @return the task future
+   */
   clio::run::Future<DelBlobTask> AsyncDelBlob(
       const TagId &tag_id,
       const std::string &blob_name,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      clio::run::u32 del_flags = 0) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<DelBlobTask>(clio::run::CreateTaskId(), pool_id_,
                                                   pool_query,
-                                                  tag_id, blob_name);
+                                                  tag_id, blob_name, del_flags);
 
     return ipc_manager->Send(task);
   }

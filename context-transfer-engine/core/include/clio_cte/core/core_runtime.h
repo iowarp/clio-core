@@ -501,6 +501,9 @@ public:
   /** Names that cannot resolve yet, keyed by the ancestor they wait for. */
   std::unordered_map<TagId, std::vector<std::pair<TagId, std::string>>>
       parked_names_;
+  /** Tags renamed under a parent not known yet, with the absolute path the
+   *  index still keys their subtree by: it moves when the name resolves. */
+  std::unordered_map<TagId, std::string> pending_rekey_;
   /**
    * Apply one decoded name operation unless a newer one for the same name
    * was already applied. Caller holds tag_names_mu_.
@@ -774,6 +777,12 @@ private:
   // Restart flag: set by Restart() before calling Init()/Create()
   bool is_restart_ = false;
 
+  // After a restart: blobs whose cached copies have been dropped on every
+  // node since (InvalidateCachedCopies). A restarted owner lost its copy
+  // registrations, but the copies on other nodes survived it.
+  std::mutex regs_reset_mu_;
+  std::unordered_set<std::string> regs_reset_;
+
   // Telemetry ring buffer for performance monitoring
   static inline constexpr size_t kTelemetryRingSize = 1024; // Ring buffer size
   std::unique_ptr<ctp::ipc::circular_mpsc_ring_buffer<CteTelemetry, ctp::ipc::MallocAllocator>> telemetry_log_;
@@ -1026,6 +1035,18 @@ private:
    * @param keep_node a node whose copy stays valid (the writer of a put that
    *        registered with it), or ~0 for none
    */
+  /**
+   * Drop the cached copy of a blob on every live node but `keep_node`
+   * (kDelCacheCopyOnly: primaries and durable copies stay). For when the
+   * registrations are unknown -- a restarted owner lost them.
+   * @param tag_id blob's tag
+   * @param blob_name blob name
+   * @param keep_node a node whose copy stays, or ~0 for none
+   */
+  clio::run::TaskResume InvalidateEveryCachedCopy(const TagId &tag_id,
+                                                  const std::string &blob_name,
+                                                  clio::run::u64 keep_node);
+
   clio::run::TaskResume InvalidateCachedCopies(const TagId &tag_id,
                                                const std::string &blob_name,
                                                BlobInfo &blob_info,

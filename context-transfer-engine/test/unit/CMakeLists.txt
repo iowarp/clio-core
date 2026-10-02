@@ -2218,3 +2218,25 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 endif()
+
+#------------------------------------------------------------------------------
+# Regression: renaming a published directory under a parent whose name has not
+# arrived yet must re-key the whole index subtree (pending_rekey_).
+#------------------------------------------------------------------------------
+add_executable(test_tag_name_rekey test_tag_name_rekey.cc)
+target_include_directories(test_tag_name_rekey PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test)
+target_link_libraries(test_tag_name_rekey
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT})
+add_test(NAME cte_tag_name_rekey COMMAND test_tag_name_rekey)
+set_tests_properties(cte_tag_name_rekey PROPERTIES
+    TIMEOUT 120
+    LABELS "unit;cte"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")

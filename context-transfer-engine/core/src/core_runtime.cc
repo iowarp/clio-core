@@ -863,7 +863,26 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
         bdev_type = clio::run::bdev::BdevType::kNoop;
       }
 
-      for (clio::run::u32 i = 0; i < actual_neighborhood; ++i) {
+      // Memory tiers stay node-local (issue #1110): a blob placed in another
+      // node's RAM/HBM/pinned buffer pays a network hop on every access
+      // (no locality) and dies with that node (no durability), so it is
+      // strictly worse than the local copy or a neighbor's disk. The
+      // neighborhood therefore spans only persistent tiers; memory tiers
+      // register for this node alone (i == 0). An attached existing pool is
+      // node-independent and keeps the full window.
+      const bool memory_tier = bdev_type == clio::run::bdev::BdevType::kRam ||
+                               bdev_type == clio::run::bdev::BdevType::kHbm ||
+                               bdev_type == clio::run::bdev::BdevType::kPinned;
+      const clio::run::u32 device_window =
+          (memory_tier && !device.HasExistingPool()) ? 1u : actual_neighborhood;
+      if (device_window < actual_neighborhood) {
+        HLOG(kDebug,
+             "Device {} ({}) is a memory tier: registered on this node only, "
+             "not across the neighborhood of {}",
+             device.path_, device.bdev_type_, actual_neighborhood);
+      }
+
+      for (clio::run::u32 i = 0; i < device_window; ++i) {
         // Sliding-window neighbor index. Modulo num_nodes wraps the
         // window for containers near the end of the cluster.
         clio::run::u32 target_node =
@@ -1348,11 +1367,24 @@ clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTarg
           pool_query, target_name, bdev_pool_id, bdev_type, total_size);
       CLIO_CO_AWAIT(create_task);
       if (create_task->return_code_ == 0 && target_node != this_node) {
+        // The pool exists only on target_node, so this node has no metadata
+        // for it: SendIn would find no static container to serialize with and
+        // drop every task to it (issue #1110 -- GetStats below never returned
+        // and the CTE create hung). Learn the pool's routing (metadata,
+        // ContainerId == NodeId address map, static container) without
+        // creating a container here.
         auto *pool_manager = CLIO_POOL_MANAGER;
-        if (pool_manager->GetPoolInfo(create_task->new_pool_id_) == nullptr) {
-          // Address map only (container i lives on node i), so DirectHash
-          // queries for this target resolve to the node that holds it.
-          pool_manager->InitAddressMap(create_task->new_pool_id_, num_hosts);
+        if (!pool_manager->RegisterRemotePool(
+                create_task->new_pool_id_, target_name,
+                create_task->chimod_name_.str(),
+                create_task->chimod_params_.str(), num_hosts)) {
+          HLOG(kError,
+               "RegisterTarget: cannot route to remote bdev ({},{}) '{}' on "
+               "node {}",
+               create_task->new_pool_id_.major_,
+               create_task->new_pool_id_.minor_, target_name, target_node);
+          task->return_code_ = 1;
+          CLIO_CO_RETURN;
         }
       }
       HLOG(kDebug,
@@ -4634,6 +4666,16 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
       CLIO_CO_RETURN;
     }
 
+    // A coherence invalidation: drop only this node's cache copy; a primary
+    // or durable copy held here (e.g. a remote replica) stays.
+    if (task->del_flags_ & kDelCacheCopyOnly) {
+      clio::run::u64 freed = 0;
+      clio::run::u32 rrc = 0;
+      CLIO_CO_AWAIT(ReclaimCacheReplica(tag_id, blob_name, freed, rrc));
+      task->return_code_ = rrc;
+      CLIO_CO_RETURN;
+    }
+
     // Step 1: Check if blob exists
     std::shared_ptr<BlobInfo> blob_info_ptr = CheckBlobExists(blob_name, tag_id);
 
@@ -6113,9 +6155,18 @@ void Runtime::UnparkNames(const TagId &parent) {
   parked_names_.erase(it);
   for (const auto &w : waiting) {
     TagId *bound = tag_name_to_id_.find(w.second);
-    if (bound != nullptr && *bound == w.first) {
-      IndexOrParkName(w.first, w.second);  // may park again, higher up
+    if (bound == nullptr || !(*bound == w.first)) continue;
+    auto pr = pending_rekey_.find(w.first);
+    std::string abs;
+    TagId blocker;
+    if (pr != pending_rekey_.end() &&
+        ResolveNameStrict(w.second, &abs, &blocker)) {
+      // A renamed directory: its whole subtree moves to the new path.
+      RekeyIndexSubtree(pr->second, abs);
+      pending_rekey_.erase(pr);
+      continue;
     }
+    IndexOrParkName(w.first, w.second);  // may park again, higher up
   }
 }
 
@@ -6243,6 +6294,14 @@ void Runtime::TnRename(const TagId &id, const std::string &from,
   const bool new_ok = ResolveNameStrict(to, &new_abs, &b2);
   if (canonical && old_ok && new_ok) {
     RekeyIndexSubtree(old_abs, new_abs);  // O(subtree) index keys, no messages
+  } else if (canonical && old_ok && !b2.IsNull()) {
+    // Renamed under a parent this node has not heard of yet (another node
+    // created it; its broadcast is still behind this one). Keep the subtree
+    // keyed by the old path and move all of it once the parent's name
+    // arrives -- re-indexing the directory alone left its descendants under
+    // the old path for good.
+    pending_rekey_[id] = old_abs;
+    parked_names_[b2].emplace_back(id, to);
   } else {
     if (old_ok) tag_search_.Delete(old_abs);
     IndexOrParkName(id, to);
@@ -6315,6 +6374,7 @@ bool Runtime::ApplyTagNameOp(const TagNameOpRec &r) {
         }
       }
       parked_names_.clear();
+      pending_rekey_.clear();
       name_seq_.clear();
       // Removal order can leave children's index keys behind their parents';
       // rebuild the index from the (now published-name-free) tag table.
@@ -9233,6 +9293,23 @@ clio::run::TaskResume Runtime::InvalidateCachedCopies(
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
+  if (is_restart_) {
+    // Registrations are not persisted, so a restarted container knows none,
+    // yet other nodes' copies outlived its restart (a stale copy kept being
+    // served after the blob was rewritten). The first change to each blob
+    // after a restart drops its copy everywhere.
+    bool first = false;
+    {
+      std::lock_guard<std::mutex> g(regs_reset_mu_);
+      first = regs_reset_
+                  .insert(std::to_string(tag_id.major_) + "." +
+                          std::to_string(tag_id.minor_) + "." + blob_name)
+                  .second;
+    }
+    if (first) {
+      CLIO_CO_AWAIT(InvalidateEveryCachedCopy(tag_id, blob_name, keep_node));
+    }
+  }
   if (blob_info.replica_nodes_.empty()) CLIO_CO_RETURN;
   // Snapshot and clear: a re-registration during the awaits below must not
   // dangle this iteration; caches re-register when they re-populate.
@@ -9248,9 +9325,11 @@ clio::run::TaskResume Runtime::InvalidateCachedCopies(
     // This container IS the owner (nothing cached here); a put's writer
     // holds these very bytes and is re-registered by the put.
     if (node == self_node || node == keep_node) continue;
+    // Cache copy only: a registered node may also hold a durable replica.
     auto inval = client_.AsyncDelBlob(
         tag_id, blob_name,
-        clio::run::PoolQuery::Physical(static_cast<clio::run::u32>(node)));
+        clio::run::PoolQuery::Physical(static_cast<clio::run::u32>(node)),
+        kDelCacheCopyOnly);
     CLIO_CO_AWAIT(inval);
     if (inval->GetReturnCode() != 0) {
       // Best-effort: "not found" means the copy was already gone, and a dead
@@ -9258,6 +9337,28 @@ clio::run::TaskResume Runtime::InvalidateCachedCopies(
       HLOG(kDebug, "cache invalidation of {} on node {} returned rc={}",
            blob_name, node, inval->GetReturnCode());
     }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::InvalidateEveryCachedCopy(
+    const TagId &tag_id, const std::string &blob_name,
+    clio::run::u64 keep_node) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  const clio::run::u32 n = PoolContainers(pool_id_);
+  const clio::run::u64 self_node = CLIO_IPC->GetNodeId();
+  for (clio::run::u32 c = 0; c < n; ++c) {
+    // Container ids are node ids. A dead node's cache died with it.
+    if (c == self_node || c == keep_node) continue;
+    if (!ContainerNodeAlive(pool_id_, c)) continue;
+    auto inval = client_.AsyncDelBlob(tag_id, blob_name,
+                                      clio::run::PoolQuery::Physical(c),
+                                      kDelCacheCopyOnly);
+    CLIO_CO_AWAIT(inval);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -9796,7 +9897,8 @@ clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock>
       for (size_t j = task_idx + 1; j < read_tasks.size(); ++j) {
         CLIO_CO_AWAIT(read_tasks[j]);
       }
-      error_code = 1;
+      // Not 1 ("no such blob"): a reader would serve that as zeros.
+      error_code = kGetBlobIoErrorRc;
       CLIO_CO_RETURN;
     }
   }
