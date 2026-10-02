@@ -52,6 +52,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -798,6 +799,46 @@ TEST_CASE("safe_bdev_write_throughput",
        "threads in {} ms = {} MiB/s ({} ms per write)",
        nwrites, kLen / 1024, kThreads, write_ms, mib / (write_ms / 1000.0),
        write_ms / nwrites);
+  rig.Cleanup();
+}
+
+TEST_CASE("safe_bdev_small_rewrites_delta_parity",
+          "[safe_bdev][disk_fail][sync]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      61000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("dlt", base);
+  rig.WriteNew(kSetLen, 101);
+  rig.WriteNew(kSetLen, 102);
+  // Small rewrites inside already-encoded stripes take the delta path
+  // (parity updated from old ^ new over the written range only, #1126).
+  // Mix single-chunk pieces, chunk-crossing spans and unaligned edges.
+  std::mt19937 rng(7);
+  for (int i = 0; i < 60; ++i) {
+    auto &set = rig.sets[static_cast<size_t>(i) % rig.sets.size()];
+    const clio::run::u64 total = set.second.size();
+    const clio::run::u64 len = 1 + rng() % (3 * 4096);
+    const clio::run::u64 off = rng() % (total - len);
+    // The byte range [off, off+len) of the set, as device blocks.
+    std::vector<Block> sub;
+    clio::run::u64 pos = 0;
+    for (const Block &b : set.first) {
+      const clio::run::u64 lo = std::max(pos, off);
+      const clio::run::u64 hi = std::min(pos + b.size_, off + len);
+      if (lo < hi) sub.push_back(Block(b.offset_ + (lo - pos), hi - lo, 0));
+      pos += b.size_;
+    }
+    std::vector<ctp::u8> bytes = Pattern(len, static_cast<ctp::u8>(200 + i));
+    REQUIRE(Write(rig.safe, sub, bytes) == 0);
+    std::copy(bytes.begin(), bytes.end(), set.second.begin() + off);
+  }
+  REQUIRE(QueryArray(rig.safe).dirty_slots == 0);
+  // No parity flush: two disks die right away. Every byte must reconstruct.
+  KillDisk(rig.paths[0]);
+  KillDisk(rig.paths[2]);
+  rig.VerifyAll();
   rig.Cleanup();
 }
 

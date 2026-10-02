@@ -1515,6 +1515,14 @@ clio::run::TaskResume Runtime::WriteStripes(
     if (!lok) CLIO_CO_RETURN;
   }
   for (auto &kv : degraded) OverlayPieces(kv.first, pieces, data, kv.second);
+  // Healthy stripes whose parity encodes exactly their current members get
+  // their parity updated from the change alone (DeltaEncodeStripe): keep the
+  // bytes this write replaces, read before it lands.
+  std::set<clio::run::u64> delta_slots;
+  std::vector<std::vector<uint8_t>> old_bytes;
+  if (degraded.empty()) {
+    CLIO_CO_AWAIT(ReadReplacedBytes(pieces, delta_slots, old_bytes));
+  }
 
   // One AsyncWrite per block to a live member, all dispatched, then awaited.
   // A down member's bytes live in the parity.
@@ -1564,7 +1572,10 @@ clio::run::TaskResume Runtime::WriteStripes(
     if (degraded.count(s) != 0 || retried.count(s) != 0) continue;
     NoteSlotWritten(s);
     bool eok = false;
-    CLIO_CO_AWAIT(EncodeStripe(s, eok));
+    if (delta_slots.count(s) != 0) {
+      CLIO_CO_AWAIT(DeltaEncodeStripe(s, pieces, data, old_bytes, eok));
+    }
+    if (!eok) CLIO_CO_AWAIT(EncodeStripe(s, eok));
     if (!eok && StripeHasDownMemberLocked(s)) {
       // A member went down between the data landing and this encode: redo
       // the stripe degraded, as for a member write that failed outright.
@@ -2792,6 +2803,115 @@ clio::run::TaskResume Runtime::EncodeStripe(clio::run::u64 s, bool &ok) {
     if (slot_gen_[s] == gen) dirty_slots_.erase(s);
   }
   ok = true;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+bool Runtime::DeltaEligible(clio::run::u64 s) {
+  if (parity_level_ == 0 || IsSlotDirty(s)) return false;
+  std::vector<int> stripe;
+  {
+    std::lock_guard<std::mutex> g(alloc_mu_);
+    if (StripeHasDownMember(s)) return false;
+    stripe = StripeMembers(s);
+  }
+  // The parity must encode exactly these members: a chunk the parity has
+  // not seen (a fresh slot) or one freed since (a narrowed stripe) changes
+  // the stripe, which only a full encode can express.
+  return !stripe.empty() && EncodedMembers(s) == stripe;
+}
+
+clio::run::TaskResume Runtime::ReadReplacedBytes(
+    const std::vector<WritePiece> &pieces, std::set<clio::run::u64> &slots,
+    std::vector<std::vector<uint8_t>> &old_bytes) {
+  CLIO_TASK_BODY_BEGIN
+  slots.clear();
+  old_bytes.assign(pieces.size(), std::vector<uint8_t>());
+  std::set<clio::run::u64> seen;
+  for (const WritePiece &p : pieces) {
+    if (seen.insert(p.slot).second && DeltaEligible(p.slot)) {
+      slots.insert(p.slot);
+    }
+  }
+  for (size_t i = 0; i < pieces.size(); ++i) {
+    const WritePiece &p = pieces[i];
+    if (slots.count(p.slot) == 0) continue;
+    old_bytes[i].assign(p.len, 0);
+    bool ok = false;
+    CLIO_CO_AWAIT(ReadDataSegment(p.member, SlotPhysOffset(p.slot) + p.within,
+                                  old_bytes[i].data(), p.len, ok));
+    if (!ok) slots.erase(p.slot);  // full encode for this stripe instead
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::DeltaEncodeStripe(
+    clio::run::u64 s, const std::vector<WritePiece> &pieces, const char *data,
+    const std::vector<std::vector<uint8_t>> &old_bytes, bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = false;
+  std::vector<int> stripe;
+  {
+    std::lock_guard<std::mutex> g(alloc_mu_);
+    stripe = StripeMembers(s);
+  }
+  if (stripe.empty() || EncodedMembers(s) != stripe) CLIO_CO_RETURN;
+  ec::ReedSolomon *codec = GetCodec(static_cast<int>(stripe.size()));
+  // Linear code: parity_j' = parity_j + c(j, pos) * (new - old), per byte,
+  // over GF(2^8) where + and - are XOR. Only the written range of each
+  // parity shard is read and rewritten.
+  for (size_t i = 0; i < pieces.size(); ++i) {
+    const WritePiece &p = pieces[i];
+    if (p.slot != s) continue;
+    const auto it = std::find(stripe.begin(), stripe.end(),
+                              static_cast<int>(p.member));
+    if (it == stripe.end() || old_bytes[i].size() != p.len) CLIO_CO_RETURN;
+    const int pos = static_cast<int>(it - stripe.begin());
+    std::vector<uint8_t> delta(old_bytes[i]);
+    const uint8_t *nw = reinterpret_cast<const uint8_t *>(data + p.buf_off);
+    for (clio::run::u64 b = 0; b < p.len; ++b) delta[b] ^= nw[b];
+    for (size_t j = 0; j < parity_level_; ++j) {
+      if (parity_members_[j].state_ != ec::EcState::kActive) continue;
+      bool pok = false;
+      CLIO_CO_AWAIT(ParityRangeAdd(j, SlotPhysOffset(s) + p.within,
+                                   delta.data(), p.len,
+                                   codec->CauchyCoeff(static_cast<int>(j), pos),
+                                   pok));
+      // A parity shard half updated is stale: the caller re-encodes fully.
+      if (!pok) CLIO_CO_RETURN;
+    }
+  }
+  ok = true;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ParityRangeAdd(size_t j, clio::run::u64 offset,
+                                              const uint8_t *delta,
+                                              clio::run::u64 len,
+                                              uint8_t coeff, bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = false;
+  auto *ipc = CLIO_IPC;
+  ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(len);
+  if (buf.IsNull()) CLIO_CO_RETURN;
+  auto rd = parity_clients_[j].AsyncRead(ParityQuery(j), MemberBlocks(offset, len),
+                                         buf.shm_.template Cast<void>(), len);
+  CLIO_CO_AWAIT(rd);
+  bool rok = rd->return_code_ == 0 && rd->bytes_read_ == len;
+  FaultOnIoError(/*is_parity=*/true, j, !rok, rd->io_error_);
+  if (rok) {
+    ec::GfMulAddRegion(reinterpret_cast<uint8_t *>(buf.ptr_), delta, coeff,
+                       len);
+    auto wr = parity_clients_[j].AsyncWrite(
+        ParityQuery(j), MemberBlocks(offset, len),
+        buf.shm_.template Cast<void>(), len);
+    CLIO_CO_AWAIT(wr);
+    ok = wr->return_code_ == 0 && wr->bytes_written_ == len;
+    FaultOnIoError(/*is_parity=*/true, j, !ok, wr->io_error_);
+  }
+  ipc->FreeBuffer(buf);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

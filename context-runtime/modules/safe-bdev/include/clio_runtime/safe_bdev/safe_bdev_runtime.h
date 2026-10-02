@@ -862,6 +862,8 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume EncodeStripe(clio::run::u64 s, bool &ok);
 
+
+
   /** @return the number of members (data + parity) not serving I/O. */
   clio::run::u32 CountDownMembers() const {
     clio::run::u32 n = 0;
@@ -1025,6 +1027,54 @@ class Runtime : public clio::run::Container {
    */
   bool DispatchMemberWrites(const WriteTask &task, const char *data,
                             MemberWrites &mw);
+  /**
+   * Whether stripe `s` can take a delta parity update: healthy, not dirty,
+   * and its parity encodes exactly its current members.
+   * @param s the stripe
+   */
+  bool DeltaEligible(clio::run::u64 s);
+
+  /**
+   * Before a write lands, read the bytes each of its pieces replaces, for
+   * the stripes that can take a delta update (#1126).
+   * @param pieces the write's pieces
+   * @param slots receives the delta-eligible stripes
+   * @param old_bytes receives, per piece, the bytes it replaces (empty for
+   *        pieces of other stripes)
+   */
+  clio::run::TaskResume ReadReplacedBytes(
+      const std::vector<WritePiece> &pieces, std::set<clio::run::u64> &slots,
+      std::vector<std::vector<uint8_t>> &old_bytes);
+
+  /**
+   * Bring stripe `s`'s parity up to date from the change alone: for each
+   * piece, parity_j[range] += c(j, pos) * (old ^ new). Reads and writes only
+   * the written ranges of each parity shard instead of the whole stripe. The
+   * caller holds the stripe; on failure it must fully re-encode.
+   * @param s the stripe
+   * @param pieces the write's pieces
+   * @param data the write's bytes
+   * @param old_bytes per piece, the bytes it replaced (ReadReplacedBytes)
+   * @param ok false if the delta could not be applied
+   */
+  clio::run::TaskResume DeltaEncodeStripe(
+      clio::run::u64 s, const std::vector<WritePiece> &pieces,
+      const char *data, const std::vector<std::vector<uint8_t>> &old_bytes,
+      bool &ok);
+
+  /**
+   * parity_j[offset, offset+len) += coeff * delta (GF(2^8)), in place.
+   * @param j parity row
+   * @param offset member offset
+   * @param delta the data change (old ^ new)
+   * @param len bytes
+   * @param coeff the code coefficient for the changed data column
+   * @param ok false on an I/O failure
+   */
+  clio::run::TaskResume ParityRangeAdd(size_t j, clio::run::u64 offset,
+                                       const uint8_t *delta,
+                                       clio::run::u64 len, uint8_t coeff,
+                                       bool &ok);
   /**
    * The body of a Write once its stripes are held and logged dirty: land the
    * data (degraded stripes reconstructed and re-encoded), then encode the
