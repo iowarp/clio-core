@@ -61,7 +61,7 @@ namespace clio::run::safe_bdev {
 // ---------------------------------------------------------------------------
 // Reused task types from the bdev module. They are brought into this namespace
 // with `using` so the autogen dispatcher can reference them unqualified, and so
-// their method_ ids match this module's method ids (10..14).
+// their method_ ids match this module's method ids (10..14, 18).
 // ---------------------------------------------------------------------------
 using clio::run::bdev::Block;
 using clio::run::bdev::PerfMetrics;
@@ -70,6 +70,8 @@ using clio::run::bdev::FreeBlocksTask;
 using clio::run::bdev::WriteTask;
 using clio::run::bdev::ReadTask;
 using clio::run::bdev::GetStatsTask;
+using clio::run::bdev::SetLifespanTask;  // Method ID 16 (optional in safe_bdev)
+using clio::run::bdev::SyncTask;         // Method ID 18 (same as bdev)
 
 using MonitorTask = clio::run::admin::MonitorTask;
 using DestroyTask = clio::run::admin::DestroyTask;
@@ -137,17 +139,30 @@ struct MemberBdevDesc {
   std::string pool_name_;  // Name/path of the member bdev pool
   clio::run::u32 node_id_;       // Node id hosting the member (0 = local)
   clio::run::PoolId pool_id_;    // Pool id of the member bdev (caller created it)
+  /** true: seat this member as a PARITY column at Create (compose
+   *  `parity: true`); false: a DATA column. At most max_failures_ members
+   *  may be parity. */
+  bool parity_ = false;
 
   MemberBdevDesc() : pool_name_(), node_id_(0), pool_id_() {}
   MemberBdevDesc(const std::string &pool_name, clio::run::u32 node_id)
       : pool_name_(pool_name), node_id_(node_id), pool_id_() {}
+  /**
+   * @param pool_name member bdev pool name/path
+   * @param node_id node hosting it
+   * @param pool_id its pool id
+   * @param parity true to seat it as a parity column
+   */
   MemberBdevDesc(const std::string &pool_name, clio::run::u32 node_id,
-                 const clio::run::PoolId &pool_id)
-      : pool_name_(pool_name), node_id_(node_id), pool_id_(pool_id) {}
+                 const clio::run::PoolId &pool_id, bool parity = false)
+      : pool_name_(pool_name),
+        node_id_(node_id),
+        pool_id_(pool_id),
+        parity_(parity) {}
 
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(pool_name_, node_id_, pool_id_);
+    ar(pool_name_, node_id_, pool_id_, parity_);
   }
 };
 
@@ -195,7 +210,8 @@ struct CreateParams {
   /**
    * Load configuration from PoolConfig (for compose mode).
    * Mirrors bdev's LoadConfig style; parses `max_failures` and a `members`
-   * YAML sequence of {pool_name, node_id}.
+   * YAML sequence of {pool_name, node_id, pool_id_major, pool_id_minor,
+   * parity}. A member with `parity: true` is seated as a parity column.
    */
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
     YAML::Node config = YAML::Load(pool_config.config_);
@@ -225,6 +241,9 @@ struct CreateParams {
           desc.pool_id_ = clio::run::PoolId(
               m["pool_id_major"].as<clio::run::u32>(),
               m["pool_id_minor"] ? m["pool_id_minor"].as<clio::run::u32>() : 0);
+        }
+        if (m["parity"]) {
+          desc.parity_ = m["parity"].as<bool>();
         }
         members_.push_back(desc);
       }

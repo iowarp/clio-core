@@ -36,6 +36,7 @@
 #include <clio_ctp/serialize/msgpack_wrapper.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -129,7 +130,7 @@ clio::run::TaskResume Runtime::WriteDataSegment(size_t d, clio::run::u64 offset,
       buf.shm_.template Cast<void>(), len);
   CLIO_CO_AWAIT(fut);
   ok = (fut->return_code_ == 0) && (fut->bytes_written_ == len);
-  MaybeFaultData(d, fut->io_error_);
+  FaultOnIoError(/*is_parity=*/false, d, !ok, fut->io_error_);
   ipc->FreeBuffer(buf);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -153,10 +154,35 @@ clio::run::TaskResume Runtime::ReadDataSegment(size_t d, clio::run::u64 offset,
     std::memcpy(dst, buf.ptr_, len);
     ok = true;
   }
-  MaybeFaultData(d, fut->io_error_);
+  FaultOnIoError(/*is_parity=*/false, d, !ok, fut->io_error_);
   ipc->FreeBuffer(buf);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+//===========================================================================
+// Runtime member fault detection
+//===========================================================================
+
+bool Runtime::FaultMember(bool is_parity, size_t idx, const char *why) {
+  std::vector<MemberSlot> &vec = is_parity ? parity_members_ : data_members_;
+  if (idx >= vec.size()) return false;
+  MemberSlot &m = vec[idx];
+  // A recovery target is already non-active; its rebuild reports its own
+  // failures.
+  if (m.recovering_) return false;
+  if (!m.state_.Transition(ec::EcState::kActive, ec::EcState::kFaulty)) {
+    return false;  // already down: someone else logged and persisted it
+  }
+  HLOG(kError,
+       "safe_bdev {}: {} member {} ('{}') FAILED at runtime ({}); marked "
+       "faulty -- reads reconstruct it, writes go degraded; {} of {} members "
+       "down, max_failures={}",
+       pool_name_, is_parity ? "parity" : "data", idx, m.pool_name_, why,
+       CountDownMembers(), data_members_.size() + parity_members_.size(),
+       max_failures_);
+  PersistMemberManifest();
+  return true;
 }
 
 //===========================================================================
@@ -197,12 +223,9 @@ clio::run::TaskResume Runtime::WriteSuperblock(bool is_parity, size_t idx,
                                MemberBlocks(0, kSuperblockSize),
                                buf.shm_.template Cast<void>(), kSuperblockSize);
   CLIO_CO_AWAIT(fut);
+  // No auto-fault here: every caller handles a failed stamp itself (refuses
+  // or unwinds the member), and a member it pops must not be persisted.
   ok = (fut->return_code_ == 0) && (fut->bytes_written_ == kSuperblockSize);
-  if (is_parity) {
-    MaybeFaultParity(idx, fut->io_error_);
-  } else {
-    MaybeFaultData(idx, fut->io_error_);
-  }
   ipc->FreeBuffer(buf);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -238,86 +261,99 @@ clio::run::TaskResume Runtime::ReadSuperblock(bool is_parity, size_t idx,
 // Stripe reconstruction (decode a stripe's k_s data chunks from survivors)
 //===========================================================================
 
-clio::run::TaskResume Runtime::ReconstructStripe(
-    clio::run::u64 s, const std::vector<int> &stripe, int exclude_member,
-    std::vector<std::vector<uint8_t>> &out, bool &ok) {
+clio::run::TaskResume Runtime::GatherSurvivors(
+    clio::run::u64 s, const std::vector<int> &code,
+    const std::vector<int> &exclude, std::vector<int> &idx,
+    std::vector<std::vector<uint8_t>> &bufs) {
   CLIO_TASK_BODY_BEGIN
-  ok = false;
-  const int k_s = static_cast<int>(stripe.size());
-  if (k_s <= 0) {
-    CLIO_CO_RETURN;
-  }
+  const int k = static_cast<int>(code.size());
   const clio::run::u64 off = SlotPhysOffset(s);
-
-  // Gather up to k_s active survivors among the stripe's k_s data + m parity
-  // members' chunks at this slot, excluding `exclude_member` and any non-active
-  // member. A data survivor's RS shard index is its POSITION in `stripe`; a
-  // parity survivor's is k_s + j.
-  std::vector<int> survivor_index;
-  std::vector<std::vector<uint8_t>> survivor_buf;
-
-  for (int pos = 0; pos < k_s; ++pos) {
-    const int d = stripe[static_cast<size_t>(pos)];
-    if (d == exclude_member) {
-      continue;
-    }
-    if (data_members_[static_cast<size_t>(d)].state_ != ec::EcState::kActive) {
+  // A data survivor's RS shard index is its POSITION in `code`; a parity
+  // survivor's is k + j.
+  for (int pos = 0; pos < k && static_cast<int>(idx.size()) < k; ++pos) {
+    const int d = code[static_cast<size_t>(pos)];
+    if (std::find(exclude.begin(), exclude.end(), d) != exclude.end() ||
+        static_cast<size_t>(d) >= data_members_.size() ||
+        !DataActive(static_cast<size_t>(d))) {
       continue;
     }
     std::vector<uint8_t> buf(kChunkLen, 0);
     bool rd_ok = false;
     CLIO_CO_AWAIT(ReadDataSegment(static_cast<size_t>(d), off, buf.data(),
                                   kChunkLen, rd_ok));
-    if (!rd_ok) {
-      continue;
-    }
-    survivor_index.push_back(pos);
-    survivor_buf.push_back(std::move(buf));
-    if (static_cast<int>(survivor_index.size()) == k_s) {
-      break;
-    }
+    if (!rd_ok) continue;  // faulted (or transient): try another shard
+    idx.push_back(pos);
+    bufs.push_back(std::move(buf));
   }
-
+  auto *ipc = CLIO_IPC;
   for (int j = 0; j < static_cast<int>(parity_level_) &&
-                  static_cast<int>(survivor_index.size()) < k_s;
+                  static_cast<int>(idx.size()) < k;
        ++j) {
     if (parity_members_[static_cast<size_t>(j)].state_ !=
         ec::EcState::kActive) {
       continue;
     }
-    std::vector<uint8_t> buf(kChunkLen, 0);
-    bool rd_ok = false;
-    auto *ipc = CLIO_IPC;
     ctp::ipc::FullPtr<char> rbuf = ipc->AllocateBuffer(kChunkLen);
-    if (rbuf.IsNull()) {
-      CLIO_CO_RETURN;
-    }
+    if (rbuf.IsNull()) CLIO_CO_RETURN;
     auto fut = parity_clients_[static_cast<size_t>(j)].AsyncRead(
         ParityQuery(static_cast<size_t>(j)), MemberBlocks(off, kChunkLen),
         rbuf.shm_.template Cast<void>(), kChunkLen);
     CLIO_CO_AWAIT(fut);
-    rd_ok = (fut->return_code_ == 0) && (fut->bytes_read_ == kChunkLen);
+    const bool rd_ok =
+        (fut->return_code_ == 0) && (fut->bytes_read_ == kChunkLen);
     if (rd_ok) {
-      std::memcpy(buf.data(), rbuf.ptr_, kChunkLen);
+      idx.push_back(k + j);
+      bufs.emplace_back(reinterpret_cast<uint8_t *>(rbuf.ptr_),
+                        reinterpret_cast<uint8_t *>(rbuf.ptr_) + kChunkLen);
     }
-    MaybeFaultParity(static_cast<size_t>(j), fut->io_error_);
+    FaultOnIoError(/*is_parity=*/true, static_cast<size_t>(j), !rd_ok,
+                   fut->io_error_);
     ipc->FreeBuffer(rbuf);
-    if (!rd_ok) {
-      continue;
-    }
-    survivor_index.push_back(k_s + j);
-    survivor_buf.push_back(std::move(buf));
   }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
 
-  if (static_cast<int>(survivor_index.size()) < k_s) {
+clio::run::TaskResume Runtime::ReconstructStripe(
+    clio::run::u64 s, const std::vector<int> &stripe,
+    const std::vector<int> &exclude, std::vector<std::vector<uint8_t>> &out,
+    bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = false;
+  if (stripe.empty()) CLIO_CO_RETURN;
+  std::vector<int> code = EncodedMembers(s);
+  if (code.empty()) code = stripe;
+  const int k = static_cast<int>(code.size());
+  std::vector<int> idx;
+  std::vector<std::vector<uint8_t>> bufs;
+  CLIO_CO_AWAIT(GatherSurvivors(s, code, exclude, idx, bufs));
+  if (static_cast<int>(idx.size()) < k) {
     CLIO_CO_RETURN;  // Too many failures to reconstruct.
   }
-  std::vector<const uint8_t *> ptrs(survivor_buf.size());
-  for (size_t i = 0; i < survivor_buf.size(); ++i) {
-    ptrs[i] = survivor_buf[i].data();
+  std::vector<const uint8_t *> ptrs(bufs.size());
+  for (size_t i = 0; i < bufs.size(); ++i) ptrs[i] = bufs[i].data();
+  std::vector<std::vector<uint8_t>> decoded;
+  if (!GetCodec(k)->DecodeData(idx, ptrs, kChunkLen, &decoded)) {
+    CLIO_CO_RETURN;
   }
-  ec::ReedSolomon *codec = GetCodec(k_s);
-  ok = codec->DecodeData(survivor_index, ptrs, kChunkLen, &out);
+  out.assign(stripe.size(), std::vector<uint8_t>());
+  for (size_t pos = 0; pos < stripe.size(); ++pos) {
+    const int d = stripe[pos];
+    auto it = std::find(code.begin(), code.end(), d);
+    if (it != code.end()) {
+      out[pos] = std::move(decoded[static_cast<size_t>(it - code.begin())]);
+      continue;
+    }
+    // Allocated since the parity was written: nothing to decode. Keep what
+    // the disk holds, so parity re-encoded over `out` matches it.
+    out[pos].assign(kChunkLen, 0);
+    if (DataActive(static_cast<size_t>(d))) {
+      bool rd_ok = false;
+      CLIO_CO_AWAIT(ReadDataSegment(static_cast<size_t>(d), SlotPhysOffset(s),
+                                    out[pos].data(), kChunkLen, rd_ok));
+    }
+  }
+  ok = true;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -349,7 +385,7 @@ void Runtime::WriteMemberRecord(std::FILE *f, const MemberSlot &m,
   put_u32(m.pool_id_.major_);
   put_u32(m.pool_id_.minor_);
   put_u32(m.node_id_);
-  put_u32(static_cast<clio::run::u32>(m.state_));
+  put_u32(static_cast<clio::run::u32>(m.state_.Load()));
   put_u32(m.recovering_ ? 1u : 0u);
   put_u32(static_cast<clio::run::u32>(m.pool_name_.size()));
   if (!m.pool_name_.empty()) {
@@ -518,6 +554,7 @@ std::vector<Runtime::DataSeatSpec> Runtime::BuildDataMemberPlan(
     const std::vector<MemberManifestEntry> &manifest) const {
   std::vector<DataSeatSpec> plan;
   for (const auto &d : params.members_) {
+    if (d.parity_) continue;  // seated by SeatParityMembers
     DataSeatSpec spec;
     spec.desc = d;
     plan.push_back(spec);
@@ -634,6 +671,135 @@ clio::run::TaskResume Runtime::SeatDataMember(DataSeatSpec spec, int col,
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::SeatConfigParity(MemberBdevDesc desc,
+                                                clio::run::u32 &rc,
+                                                bool &fresh) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  fresh = false;
+  MemberSlot slot;
+  slot.pool_id_ = desc.pool_id_;
+  slot.pool_name_ = desc.pool_name_;
+  slot.node_id_ = desc.node_id_;
+  slot.role_ = ec::EcRole::kParity;
+  slot.state_ = ec::EcState::kActive;
+  slot.index_ = static_cast<int>(parity_members_.size());
+  parity_clients_.emplace_back(desc.pool_id_);
+  parity_members_.push_back(slot);
+  const size_t pj = parity_members_.size() - 1;
+  MemberSuperblock sb;
+  bool present = false;
+  bool sb_ok = false;
+  CLIO_CO_AWAIT(ReadSuperblock(/*is_parity=*/true, pj, sb, present, sb_ok));
+  if (!sb_ok) {
+    HLOG(kError, "safe_bdev Create: superblock read failed for parity member "
+         "'{}'", desc.pool_name_);
+    rc = 1;
+    CLIO_CO_RETURN;
+  }
+  if (!present) {
+    bool wr_ok = false;
+    CLIO_CO_AWAIT(WriteSuperblock(/*is_parity=*/true, pj, wr_ok));
+    if (!wr_ok) {
+      HLOG(kError, "safe_bdev Create: superblock write failed for fresh "
+           "parity member '{}'", desc.pool_name_);
+      rc = 1;
+      CLIO_CO_RETURN;
+    }
+    fresh = true;
+    HLOG(kInfo, "safe_bdev Create: initialized fresh parity member '{}' "
+         "(row {})", desc.pool_name_, pj);
+  } else if (sb.array_major == static_cast<uint64_t>(pool_id_.major_) &&
+             sb.array_minor == static_cast<uint64_t>(pool_id_.minor_)) {
+    ++reattached_members_;
+    HLOG(kInfo, "safe_bdev Create: re-attached parity member '{}' (row {})",
+         desc.pool_name_, pj);
+  } else {
+    HLOG(kError, "safe_bdev Create: REFUSING parity member '{}' -- "
+         "initialized by a FOREIGN array ({},{})", desc.pool_name_,
+         sb.array_major, sb.array_minor);
+    rc = 2;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::SeatParityMembers(
+    const CreateParams &params,
+    const std::vector<MemberManifestEntry> &manifest_parity,
+    clio::run::u32 &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  for (const auto &pe : manifest_parity) {
+    MemberSlot slot;
+    slot.pool_id_ = clio::run::PoolId(pe.pool_major_, pe.pool_minor_);
+    slot.pool_name_ = pe.pool_name_;
+    slot.node_id_ = pe.node_id_;
+    slot.role_ = ec::EcRole::kParity;
+    slot.index_ = static_cast<int>(pe.index_);
+    parity_clients_.emplace_back(slot.pool_id_);
+    parity_members_.push_back(slot);
+    const size_t pj = parity_members_.size() - 1;
+    if (pe.recovering_ != 0) {
+      parity_members_[pj].state_ = ec::EcState::kFaulty;
+      parity_members_[pj].recovering_ = true;
+      continue;
+    }
+    if (pe.state_ != static_cast<clio::run::u32>(ec::EcState::kActive)) {
+      // Faulty/removed when the array stopped: its device may be gone, so do
+      // not touch it -- and keep its row, or every later row's RS shard
+      // index would shift.
+      parity_members_[pj].state_ = static_cast<ec::EcState>(pe.state_);
+      HLOG(kWarning, "safe_bdev Create: parity row {} ('{}') restored as down",
+           pj, pe.pool_name_);
+      continue;
+    }
+    MemberSuperblock sb;
+    bool present = false;
+    bool sb_ok = false;
+    CLIO_CO_AWAIT(ReadSuperblock(/*is_parity=*/true, pj, sb, present, sb_ok));
+    const bool ours = sb_ok && present &&
+                      sb.array_major == static_cast<uint64_t>(pool_id_.major_) &&
+                      sb.array_minor == static_cast<uint64_t>(pool_id_.minor_);
+    if (!ours) {
+      parity_members_.pop_back();
+      parity_clients_.pop_back();
+      HLOG(kInfo, "safe_bdev Create: skipping stale manifest parity member "
+           "(pool {}.{} not reachable/ours)", pe.pool_major_, pe.pool_minor_);
+    }
+  }
+  if (!manifest_parity.empty()) CLIO_CO_RETURN;
+
+  std::vector<MemberBdevDesc> cfg;
+  for (const auto &m : params.members_) {
+    if (m.parity_) cfg.push_back(m);
+  }
+  if (cfg.size() > max_failures_) {
+    HLOG(kError, "safe_bdev Create: {} members are marked parity but "
+         "max_failures is {}", cfg.size(), max_failures_);
+    rc = 3;
+    CLIO_CO_RETURN;
+  }
+  bool any_fresh = false;
+  for (size_t i = 0; i < cfg.size(); ++i) {
+    bool fresh = false;
+    CLIO_CO_AWAIT(SeatConfigParity(cfg[i], rc, fresh));
+    if (rc != 0) CLIO_CO_RETURN;
+    any_fresh = any_fresh || fresh;
+  }
+  if (any_fresh) {
+    // A parity disk stamped just now holds no parity for data the array
+    // already has (restart with parity newly configured): rebuild it.
+    std::lock_guard<std::mutex> g(slot_mu_);
+    for (clio::run::u64 s : written_slots_) {
+      dirty_slots_.insert(s);
+      ++slot_gen_[s];
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 void Runtime::FaultMembersOnDeadNodes() {
   if (!distributed_) return;
   auto *ipc = CLIO_IPC;
@@ -694,6 +860,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     std::lock_guard<std::mutex> g(slot_mu_);
     dirty_slots_.clear();
     written_slots_.clear();
+    encoded_.clear();
   }
 
   // DATA members come from the config member list and are re-attached by
@@ -737,6 +904,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
          "safe_bdev Create: failed to open alloc log at '{}', logging disabled",
          params.alloc_log_path_);
   }
+  if (alloc_log_.enabled()) StartIntentSync();
   const bool recovered =
       alloc_log_.enabled() && !alloc_log_.groups().empty();
 
@@ -764,6 +932,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       Unband(b.offset, d, s, within);
       if (d < data_alloc_.size()) {
         data_alloc_[d].live_.insert(s);
+        if (b.size < kChunkLen) data_alloc_[d].part_len_[s] = b.size;
       }
     }
     clio::run::u64 total_live = 0;
@@ -790,6 +959,16 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
           written_slots_.insert(s);
         }
       }
+      // The persisted parity was built over the stripes as they stand.
+      for (clio::run::u64 s : written_slots_) {
+        std::vector<int> mem;
+        for (size_t d = 0; d < data_alloc_.size(); ++d) {
+          if (data_alloc_[d].live_.count(s) != 0) {
+            mem.push_back(static_cast<int>(d));
+          }
+        }
+        encoded_[s] = mem;
+      }
     }
     HLOG(kInfo,
          "safe_bdev Create: RECOVERED slot allocators from alloc log '{}' "
@@ -805,41 +984,14 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
          task->pool_name_.str(), k0, max_failures_);
   }
 
-  // Restore PARITY members from the manifest (empty on fresh create). Each is
-  // probed by superblock: mid-recovery -> adopt+recovering; present+ours ->
-  // adopt; otherwise SKIP (stale entry, will be re-added).
-  for (const auto &pe : eff_parity) {
-    MemberSlot slot;
-    slot.pool_id_ = clio::run::PoolId(pe.pool_major_, pe.pool_minor_);
-    slot.pool_name_ = pe.pool_name_;
-    slot.node_id_ = pe.node_id_;
-    slot.role_ = ec::EcRole::kParity;
-    slot.index_ = static_cast<int>(pe.index_);
-    const bool par_recovering = (pe.recovering_ != 0);
-
-    parity_clients_.emplace_back(slot.pool_id_);
-    parity_members_.push_back(slot);
-    const size_t pj = parity_members_.size() - 1;
-    MemberSuperblock sb;
-    bool present = false;
-    bool sb_ok = false;
-    CLIO_CO_AWAIT(ReadSuperblock(/*is_parity=*/true, pj, sb, present, sb_ok));
-    const bool ours = sb_ok && present &&
-                      sb.array_major == static_cast<uint64_t>(pool_id_.major_) &&
-                      sb.array_minor == static_cast<uint64_t>(pool_id_.minor_);
-    if (par_recovering) {
-      parity_members_[pj].state_ = ec::EcState::kFaulty;
-      parity_members_[pj].recovering_ = true;
-    } else if (ours) {
-      parity_members_[pj].state_ = ec::EcState::kActive;
-      parity_members_[pj].recovering_ = false;
-    } else {
-      parity_members_.pop_back();
-      parity_clients_.pop_back();
-      HLOG(kInfo,
-           "safe_bdev Create: skipping stale manifest parity member "
-           "(pool {}.{} not reachable/ours)",
-           pe.pool_major_, pe.pool_minor_);
+  // Seat the PARITY columns: the manifest's (runtime-added, recovered,
+  // faulty), else the configured `parity: true` members.
+  {
+    clio::run::u32 par_rc = 0;
+    CLIO_CO_AWAIT(SeatParityMembers(params, eff_parity, par_rc));
+    if (par_rc != 0) {
+      task->return_code_ = par_rc;
+      CLIO_CO_RETURN;
     }
   }
   parity_level_ = static_cast<clio::run::u32>(parity_members_.size());
@@ -852,13 +1004,16 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   }
   ClampDataCaps();
 
-  // NOTE: dirty_slots_ stays EMPTY on restart. Parity is durably persisted on
-  // the parity members (they are real bdevs that survive the reboot), and the
-  // recovered stripe membership matches what that parity was built over, so the
-  // persisted parity is current -- re-dirtying it would only open a window where
-  // degraded reads see an (unnecessarily) unprotected stripe until the async
-  // builder catches up. A write whose parity had not yet been built before an
-  // unclean shutdown is the same bounded gap as the pre-existing design.
+  // Stripes whose parity was being (re)built when the array went down are
+  // still in the intent log (#1121): their data may have reached a member
+  // without the matching parity, so they are dirty -- degraded reads refuse
+  // them rather than decode from stale parity -- until the builder below
+  // re-encodes them. Every other stripe's persisted parity is current.
+  const size_t replayed = ReplayStripeIntents();
+  if (replayed != 0) {
+    HLOG(kWarning, "safe_bdev Create: {} stripe(s) were mid-write at the last "
+         "shutdown; re-encoding their parity", replayed);
+  }
 
   if (alloc_log_.enabled()) {
     client_.AsyncFlushAllocLog(SelfQuery(), kFlushAllocLogPeriodUs);
@@ -935,6 +1090,7 @@ clio::run::TaskResume Runtime::AllocateBlocks(
     const size_t d = static_cast<size_t>(chosen);
     const clio::run::u64 s = data_alloc_[d].Take();
     const clio::run::u64 seg = std::min<clio::run::u64>(kChunkLen, remaining);
+    if (seg < kChunkLen) data_alloc_[d].part_len_[s] = seg;
     const clio::run::u64 off = BandOffset(static_cast<clio::run::u32>(d), s);
 
     clio::run::bdev::Block block(off, seg, 0);
@@ -984,12 +1140,21 @@ clio::run::TaskResume Runtime::FreeBlocks(clio::run::shared_ptr<FreeBlocksTask> 
       continue;
     }
     data_alloc_[d].Release(s);
-    alloc_log_.LogFree(kAllocGroup, b.offset_, b.size_, 0);
+    // The stripe narrows but stays fully protected: its parity still encodes
+    // the wider member set it was built over (encoded_), and the freed
+    // chunk's bytes are untouched until a write reuses the slot -- which
+    // re-encodes the stripe under its lock. So a free does NOT dirty the
+    // stripe: dirtying it left every stripe the organizer freed from
+    // unrecoverable for a disk death until the background builder caught up.
+    // Restart, though, rebuilds encoded_ from the live (narrower) set, so
+    // the intent log must say the stripe needs re-encoding there; logged
+    // BEFORE the free record so any log prefix holding the free holds it.
     if (StripeMembers(s).empty()) {
-      ForgetSlotIfEmpty(s);
+      ForgetSlotIfEmpty(s);  // nothing left to protect: no intent needed
     } else {
-      MarkSlotDirty(s);
+      LogStripesStale({s});
     }
+    alloc_log_.LogFree(kAllocGroup, b.offset_, b.size_, 0);
   }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
@@ -1007,8 +1172,8 @@ clio::run::TaskResume Runtime::LoadDegradedStripe(clio::run::u64 s,
     CLIO_CO_RETURN;
   }
   out.members = StripeMembers(s);
-  CLIO_CO_AWAIT(ReconstructStripe(s, out.members, /*exclude_member=*/-1,
-                                  out.chunks, ok));
+  const std::vector<int> none;
+  CLIO_CO_AWAIT(ReconstructStripe(s, out.members, none, out.chunks, ok));
   if (!ok) {
     HLOG(kError, "safe_bdev Write: cannot reconstruct slot {} for a write to "
          "a down member", s);
@@ -1026,7 +1191,7 @@ clio::run::TaskResume Runtime::StoreDegradedParity(clio::run::u64 s,
   for (size_t i = 0; i < st.chunks.size(); ++i) ptrs[i] = st.chunks[i].data();
   ec::ReedSolomon *codec = GetCodec(static_cast<int>(st.members.size()));
   auto *ipc = CLIO_IPC;
-  int written = 0;
+  clio::run::u32 written = 0;
   for (int j = 0; j < static_cast<int>(parity_level_); ++j) {
     if (parity_members_[static_cast<size_t>(j)].state_ !=
         ec::EcState::kActive) {
@@ -1042,12 +1207,227 @@ clio::run::TaskResume Runtime::StoreDegradedParity(clio::run::u64 s,
     CLIO_CO_AWAIT(fut);
     const bool wok =
         fut->return_code_ == 0 && fut->bytes_written_ == kChunkLen;
-    MaybeFaultParity(static_cast<size_t>(j), fut->io_error_);
+    FaultOnIoError(/*is_parity=*/true, static_cast<size_t>(j), !wok,
+                   fut->io_error_);
     ipc->FreeBuffer(buf);
-    if (!wok) CLIO_CO_RETURN;
+    if (!wok) {
+      // A parity disk that just failed is out of the stripe; one that is
+      // still active holds a stale shard, which the stripe cannot carry.
+      if (parity_members_[static_cast<size_t>(j)].state_ ==
+          ec::EcState::kActive) {
+        CLIO_CO_RETURN;
+      }
+      continue;
+    }
     ++written;
   }
-  ok = written > 0;
+  // The stripe's down data chunks exist only in the parity: it needs at
+  // least one written shard per down member to give them back.
+  ok = written > 0 && written >= DownInStripe(st);
+  if (ok) SetEncoded(s, st.members);
+  if (!ok) {
+    HLOG(kError, "safe_bdev Write: slot {} has {} down data member(s) but "
+         "only {} parity shard(s) could be written; refusing the write",
+         s, DownInStripe(st), written);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+std::vector<Runtime::WritePiece> Runtime::SplitWrite(
+    const WriteTask &task) const {
+  std::vector<WritePiece> pieces;
+  clio::run::u64 buf_pos = 0;
+  for (size_t bi = 0; bi < task.blocks_.size(); ++bi) {
+    const clio::run::u64 off = task.blocks_[bi].offset_;
+    const clio::run::u64 len = task.blocks_[bi].size_;
+    for (clio::run::u64 cur = off; cur < off + len;) {
+      WritePiece p;
+      clio::run::u32 d = 0;
+      Unband(cur, d, p.slot, p.within);
+      p.member = d;
+      p.len = std::min<clio::run::u64>(off + len - cur, kChunkLen - p.within);
+      p.buf_off = buf_pos + (cur - off);
+      pieces.push_back(p);
+      cur += p.len;
+    }
+    buf_pos += len;
+  }
+  return pieces;
+}
+
+void Runtime::OverlayPieces(clio::run::u64 s,
+                            const std::vector<WritePiece> &pieces,
+                            const char *data, DegradedStripe &st) {
+  for (const WritePiece &p : pieces) {
+    if (p.slot != s) continue;
+    for (size_t pos = 0; pos < st.members.size(); ++pos) {
+      if (st.members[pos] == static_cast<int>(p.member)) {
+        std::memcpy(st.chunks[pos].data() + p.within, data + p.buf_off, p.len);
+      }
+    }
+  }
+}
+
+bool Runtime::DownBytesClobbered(clio::run::u64 s, const DegradedStripe &st,
+                                 const std::vector<clio::run::u64> &need_len,
+                                 const std::vector<WritePiece> &pieces) const {
+  std::vector<uint8_t> landed(kChunkLen, 0);
+  for (const WritePiece &p : pieces) {
+    if (p.slot == s && DataActive(p.member)) {
+      std::fill_n(landed.begin() + p.within, p.len, 1);
+    }
+  }
+  for (size_t pos = 0; pos < st.members.size(); ++pos) {
+    const int d = st.members[pos];
+    if (DataActive(static_cast<size_t>(d))) continue;
+    std::vector<uint8_t> need(kChunkLen, 0);
+    std::fill_n(need.begin(), need_len[pos], 1);
+    for (const WritePiece &p : pieces) {
+      if (p.slot == s && p.member == static_cast<clio::run::u32>(d)) {
+        std::fill_n(need.begin() + p.within, p.len, 0);
+      }
+    }
+    for (clio::run::u64 x = 0; x < kChunkLen; ++x) {
+      if (need[x] != 0 && landed[x] != 0) {
+        HLOG(kError, "safe_bdev Write: slot {}: data member {} failed after "
+             "this write changed bytes its parity decode needs", s, d);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+clio::run::TaskResume Runtime::RetryStripeDegraded(
+    clio::run::u64 s, const std::vector<WritePiece> &pieces, const char *data,
+    bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = false;
+  if (IsSlotDirty(s)) {
+    HLOG(kError, "safe_bdev Write: slot {} lost a member mid-write while its "
+         "parity was stale; refusing the write", s);
+    CLIO_CO_RETURN;
+  }
+  DegradedStripe st;
+  std::vector<clio::run::u64> need_len;  // per stripe position
+  {
+    std::lock_guard<std::mutex> g(alloc_mu_);
+    st.members = StripeMembers(s);
+    for (int d : st.members) {
+      need_len.push_back(data_alloc_[static_cast<size_t>(d)].LiveLen(s));
+    }
+  }
+  {
+    // A member the parity has not seen yet holds nothing worth keeping.
+    const std::vector<int> code = EncodedMembers(s);
+    for (size_t pos = 0; pos < st.members.size() && !code.empty(); ++pos) {
+      if (std::find(code.begin(), code.end(), st.members[pos]) == code.end()) {
+        need_len[pos] = 0;
+      }
+    }
+  }
+  // Members this write already changed hold NEW bytes, but the parity still
+  // encodes their OLD ones. Treat them as erasures too: when the parity
+  // covers them and the down members, the old stripe decodes exactly.
+  std::vector<int> landed;
+  for (const WritePiece &p : pieces) {
+    const int d = static_cast<int>(p.member);
+    if (p.slot == s && DataActive(p.member) &&
+        std::find(landed.begin(), landed.end(), d) == landed.end()) {
+      landed.push_back(d);
+    }
+  }
+  bool rok = false;
+  CLIO_CO_AWAIT(ReconstructStripe(s, st.members, landed, st.chunks, rok));
+  if (!rok) {
+    // Too many erasures for that. Decode from the survivors as they are now:
+    // exact wherever this write left the survivors untouched, which is all
+    // that matters unless a down member needs a byte the write overwrote.
+    const std::vector<int> none;
+    CLIO_CO_AWAIT(ReconstructStripe(s, st.members, none, st.chunks, rok));
+    if (!rok) {
+      HLOG(kError, "safe_bdev Write: slot {} lost a member mid-write and "
+           "cannot be reconstructed (too many members down)", s);
+      CLIO_CO_RETURN;
+    }
+    if (DownBytesClobbered(s, st, need_len, pieces)) CLIO_CO_RETURN;
+  }
+  OverlayPieces(s, pieces, data, st);
+  CLIO_CO_AWAIT(StoreDegradedParity(s, st, ok));
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+bool Runtime::BlocksInRange(const WriteTask &task) const {
+  for (size_t bi = 0; bi < task.blocks_.size(); ++bi) {
+    clio::run::u32 d = 0;
+    clio::run::u64 s0 = 0, within = 0;
+    Unband(task.blocks_[bi].offset_, d, s0, within);
+    if (task.blocks_[bi].size_ != 0 && d >= data_members_.size()) {
+      HLOG(kError, "safe_bdev Write: block offset {} decodes to member {} out "
+           "of range", task.blocks_[bi].offset_, d);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Runtime::DispatchMemberWrites(const WriteTask &task, const char *data,
+                                   MemberWrites &mw) {
+  auto *ipc = CLIO_IPC;
+  clio::run::u64 buf_pos = 0;
+  for (size_t bi = 0; bi < task.blocks_.size(); ++bi) {
+    const clio::run::u64 off = task.blocks_[bi].offset_;
+    const clio::run::u64 len = task.blocks_[bi].size_;
+    if (len == 0) continue;
+    clio::run::u32 d = 0;
+    clio::run::u64 s0 = 0, within = 0;
+    Unband(off, d, s0, within);
+    for (clio::run::u64 c = off / kChunkLen; c <= (off + len - 1) / kChunkLen;
+         ++c) {
+      mw.touched.insert(c % kSlotsPerMember);
+    }
+    if (DataActive(d)) {
+      ctp::ipc::FullPtr<char> seg = ipc->AllocateBuffer(len);
+      if (seg.IsNull()) return false;
+      std::memcpy(seg.ptr_, data + buf_pos, len);
+      mw.bufs.push_back(seg);
+      mw.members.push_back(d);
+      mw.futs.push_back(data_clients_[d].AsyncWrite(
+          DataQuery(d), MemberBlocks(SlotPhysOffset(s0) + within, len),
+          seg.shm_.template Cast<void>(), len));
+    }
+    buf_pos += len;
+    mw.bytes = buf_pos;
+  }
+  return true;
+}
+
+clio::run::TaskResume Runtime::AwaitMemberWrites(MemberWrites &mw,
+                                                 bool &any_failed, bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  // A member write is done only when all its bytes are. A member that fails
+  // is faulted (unless the error was transient); the caller redoes the
+  // stripes it shares with the write degraded.
+  for (size_t i = 0; i < mw.futs.size(); ++i) {
+    auto &f = mw.futs[i];
+    CLIO_CO_AWAIT(f);
+    if (f->return_code_ == 0 && f->bytes_written_ == f->length_) continue;
+    const size_t d = mw.members[i];
+    FaultOnIoError(/*is_parity=*/false, d, true, f->io_error_);
+    if (DataActive(d)) {
+      HLOG(kWarning, "safe_bdev Write: member {} write returned rc={} with "
+           "{} of {} bytes (transient)", d, f->return_code_,
+           f->bytes_written_, f->length_);
+      ok = false;
+    } else {
+      any_failed = true;
+    }
+  }
+  auto *ipc = CLIO_IPC;
+  for (auto &b : mw.bufs) ipc->FreeBuffer(b);
+  mw.bufs.clear();
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -1061,7 +1441,13 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     CLIO_CO_RETURN;
   }
   FaultMembersOnDeadNodes();
+  task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kOk);
   if (data_members_.empty() || task->blocks_.size() == 0) {
+    task->return_code_ = 1;
+    CLIO_CO_RETURN;
+  }
+  if (!BlocksInRange(*task)) {
+    task->bytes_written_ = 0;
     task->return_code_ = 1;
     CLIO_CO_RETURN;
   }
@@ -1069,145 +1455,188 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   auto *ipc = CLIO_IPC;
   ctp::ipc::FullPtr<char> data =
       ipc->ToFullPtr(task->data_).template Cast<char>();
+  const std::vector<WritePiece> pieces = SplitWrite(*task);
+  std::set<clio::run::u64> slots;
+  for (const WritePiece &p : pieces) slots.insert(p.slot);
 
-  // Each block decodes to (member d, slot s0, within); a block is contiguous on
-  // ONE member (banding keeps a member's consecutive slots contiguous), so it
-  // writes in a single AsyncWrite to member d at kSuperblockSize + s0*kChunkLen
-  // + within. All blocks' writes are dispatched in parallel, then awaited. Every
-  // slot the write touches is marked dirty (parity deferred to BuildParity).
-  clio::run::u64 buf_pos = 0;
-  clio::run::u64 bytes_written = 0;
-  std::vector<clio::run::Future<WriteTask>> futs;
-  std::vector<ctp::ipc::FullPtr<char>> bufs;
-  std::set<clio::run::u64> touched;
-  // (block index, its offset in the task buffer) for blocks on down members.
-  bool dispatch_ok = true;
-  // Stripes with a chunk of this write on a DOWN member, reconstructed
-  // before any member write lands (see DegradedStripe).
-  // A stripe counts as degraded when ANY of its data members is down, not
-  // only when this write lands on the down one: a plain write into it would
-  // dirty the slot, and a dirty stripe with a down member can never be
-  // rebuilt -- the down member's chunk there would become unreadable.
-  std::map<clio::run::u64, DegradedStripe> degraded;
-  for (size_t bi = 0; bi < task->blocks_.size(); ++bi) {
-    const clio::run::u64 off = task->blocks_[bi].offset_;
-    const clio::run::u64 len = task->blocks_[bi].size_;
-    if (len == 0) continue;
-    for (clio::run::u64 c = off / kChunkLen; c <= (off + len - 1) / kChunkLen;
-         ++c) {
-      const clio::run::u64 s = c % kSlotsPerMember;
-      if (degraded.count(s) != 0 || !StripeHasDownMember(s)) continue;
-      bool lok = false;
-      CLIO_CO_AWAIT(LoadDegradedStripe(s, degraded[s], lok));
-      if (!lok) {
-        task->bytes_written_ = 0;
-        task->return_code_ = 1;
-        CLIO_CO_RETURN;
-      }
-    }
-  }
-
-  for (size_t bi = 0; bi < task->blocks_.size() && dispatch_ok; ++bi) {
-    const clio::run::u64 off = task->blocks_[bi].offset_;
-    const clio::run::u64 len = task->blocks_[bi].size_;
-    if (len == 0) {
-      continue;
-    }
-    clio::run::u32 d = 0;
-    clio::run::u64 s0 = 0, within = 0;
-    Unband(off, d, s0, within);
-    if (d >= data_members_.size()) {
-      HLOG(kError, "safe_bdev Write: block offset {} decodes to member {} out "
-           "of range", off, d);
-      dispatch_ok = false;
-      break;
-    }
-    const clio::run::u64 phys = SlotPhysOffset(s0) + within;
-
-    // Overlay this block's bytes on any degraded stripe it lands in (the
-    // down member's chunk gets them only this way).
-    for (clio::run::u64 cur = off; cur < off + len;) {
-      clio::run::u32 dd = 0;
-      clio::run::u64 slot = 0, w = 0;
-      Unband(cur, dd, slot, w);
-      const clio::run::u64 n =
-          std::min<clio::run::u64>(off + len - cur, kChunkLen - w);
-      auto it = degraded.find(slot);
-      if (it != degraded.end()) {
-        const auto &mem = it->second.members;
-        for (size_t p = 0; p < mem.size(); ++p) {
-          if (mem[p] == static_cast<int>(dd)) {
-            std::memcpy(it->second.chunks[p].data() + w,
-                        data.ptr_ + buf_pos + (cur - off), n);
-          }
-        }
-      }
-      cur += n;
-    }
-    if (data_members_[d].state_ != ec::EcState::kActive) {
-      buf_pos += len;  // down member: its bytes live in the parity only
-      bytes_written += len;
-      continue;
-    }
-    {
-      ctp::ipc::FullPtr<char> seg = ipc->AllocateBuffer(len);
-      if (seg.IsNull()) {
-        dispatch_ok = false;
-        break;
-      }
-      std::memcpy(seg.ptr_, data.ptr_ + buf_pos, len);
-      bufs.push_back(seg);
-      futs.push_back(data_clients_[d].AsyncWrite(
-          DataQuery(d), MemberBlocks(phys, len),
-          seg.shm_.template Cast<void>(), len));
-    }
-    // Mark every slot this block spans dirty (contiguous slots on member d).
-    const clio::run::u64 chunk_first = off / kChunkLen;
-    const clio::run::u64 chunk_last = (off + len - 1) / kChunkLen;
-    for (clio::run::u64 c = chunk_first; c <= chunk_last; ++c) {
-      touched.insert(c % kSlotsPerMember);
-    }
-    buf_pos += len;
-    bytes_written += len;
-  }
-
-  bool ok = dispatch_ok;
-  for (size_t i = 0; i < futs.size(); ++i) {
-    auto &f = futs[i];
-    CLIO_CO_AWAIT(f);
-    // A member write is done only when all its bytes are: a short count
-    // (or a zero return code with nothing written) must fail the write, not
-    // mark the stripe dirty over bytes that never landed.
-    if (f->return_code_ != 0 || f->bytes_written_ != f->length_) {
-      HLOG(kWarning, "safe_bdev Write: member write {} of {} returned rc={} "
-           "with {} of {} bytes", i, futs.size(), f->return_code_,
-           f->bytes_written_, f->length_);
-      ok = false;
-    }
-  }
-  for (auto &b : bufs) {
-    ipc->FreeBuffer(b);
-  }
-  // Degraded stripes: the healthy chunks have landed; write the parity of
-  // the overlaid stripe. These slots come out with current parity and are
-  // not dirtied (a dirty slot with a down member is unreadable).
-  for (auto &kv : degraded) {
-    if (!ok) break;
-    bool pok = false;
-    CLIO_CO_AWAIT(StoreDegradedParity(kv.first, kv.second, pok));
-    ok = pok;
-  }
+  // Synchronous parity (#1121): hold every stripe this write touches from
+  // before its data lands until its parity does, and log them dirty (fsynced)
+  // first. The write is acked only once each stripe's parity is current, so
+  // a disk dying at any later moment can always rebuild it; a crash before
+  // that leaves the stripes in the intent log for Create to re-encode.
+  // The intent goes first and outside the stripe locks, so concurrent
+  // writers -- which share stripes, allocation being round-robin -- can
+  // share its fsync (AwaitIntentDurable); it is still durable before any
+  // data of this write reaches a member.
+  std::vector<IntentKey> intents;
+  const clio::run::u64 intent_seq = LogDirtyIntents(slots, intents);
+  CLIO_CO_AWAIT(AwaitIntentDurable(intent_seq));
+  CLIO_CO_AWAIT(LockStripes(slots));
+  const clio::run::u64 watermark = IntentWatermark();
+  bool ok = false;
+  std::set<clio::run::u64> clean;
+  CLIO_CO_AWAIT(WriteStripes(task, pieces, data.ptr_, ok, clean));
+  UnlockStripes(slots);
+  LogCleanIntents(intents, clean);
+  LogStripesEncoded(clean, watermark);  // older stale intents it settled
   if (!ok) {
     task->bytes_written_ = 0;
     task->return_code_ = 1;
+    task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kDeviceFault);
     CLIO_CO_RETURN;
   }
-
-  for (clio::run::u64 s : touched) {
-    if (degraded.count(s) == 0) MarkSlotDirty(s);
-  }
-  task->bytes_written_ = bytes_written;
   task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::WriteStripes(
+    clio::run::shared_ptr<WriteTask> &task,
+    const std::vector<WritePiece> &pieces, const char *data, bool &ok,
+    std::set<clio::run::u64> &clean) {
+  CLIO_TASK_BODY_BEGIN
+  ok = false;
+  clean.clear();
+  // Stripes with a DOWN data member, reconstructed before any member write
+  // lands (its parity is still consistent then) and overlaid with every byte
+  // this write puts in them (see DegradedStripe). A stripe counts when ANY of
+  // its data members is down, not only when this write lands on the down one.
+  std::map<clio::run::u64, DegradedStripe> degraded;
+  std::set<clio::run::u64> down_slots;
+  {
+    std::lock_guard<std::mutex> g(alloc_mu_);
+    for (const WritePiece &p : pieces) {
+      if (StripeHasDownMember(p.slot)) down_slots.insert(p.slot);
+    }
+  }
+  for (clio::run::u64 ds : down_slots) {
+    bool lok = false;
+    CLIO_CO_AWAIT(LoadDegradedStripe(ds, degraded[ds], lok));
+    if (!lok) CLIO_CO_RETURN;
+  }
+  for (auto &kv : degraded) OverlayPieces(kv.first, pieces, data, kv.second);
+
+  // One AsyncWrite per block to a live member, all dispatched, then awaited.
+  // A down member's bytes live in the parity.
+  MemberWrites mw;
+  bool wok = DispatchMemberWrites(*task, data, mw);
+  bool any_failed = false;
+  CLIO_CO_AWAIT(AwaitMemberWrites(mw, any_failed, wok));
+  const std::set<clio::run::u64> &touched = mw.touched;
+
+  // Stripes that gained a down member under this write are redone degraded.
+  std::set<clio::run::u64> retried;
+  if (any_failed || CountDownMembers() != 0) {
+    std::lock_guard<std::mutex> g(alloc_mu_);
+    for (clio::run::u64 s : touched) {
+      if (degraded.count(s) == 0 && StripeHasDownMember(s)) retried.insert(s);
+    }
+  }
+  for (clio::run::u64 s : retried) {
+    if (!wok) break;
+    CLIO_CO_AWAIT(RetryStripeDegraded(s, pieces, data, wok));
+    if (wok) clean.insert(s);
+  }
+  for (auto &kv : degraded) {
+    if (!wok) break;
+    CLIO_CO_AWAIT(StoreDegradedParity(kv.first, kv.second, wok));
+    if (wok) clean.insert(kv.first);
+  }
+  if (!wok) {
+    // Whatever landed made these stripes' parity stale: dirty them all, so a
+    // down member's chunk there is refused rather than decoded wrong.
+    for (clio::run::u64 s : touched) MarkSlotDirty(s);
+    for (auto &kv : degraded) MarkSlotDirty(kv.first);
+    clean.clear();
+    CLIO_CO_RETURN;
+  }
+  // Healthy stripes: encode their parity now, before the write is acked.
+  // (Degraded and retried stripes came out with current parity above.)
+  if (FaultSkipParity()) {
+    // Test fault: behave as if the process died right here -- data landed,
+    // parity did not, and the intent log still says so.
+    for (clio::run::u64 s : touched) MarkSlotDirty(s);
+    task->bytes_written_ = mw.bytes;
+    ok = true;
+    CLIO_CO_RETURN;
+  }
+  for (clio::run::u64 s : touched) {
+    if (degraded.count(s) != 0 || retried.count(s) != 0) continue;
+    NoteSlotWritten(s);
+    bool eok = false;
+    CLIO_CO_AWAIT(EncodeStripe(s, eok));
+    if (!eok && StripeHasDownMemberLocked(s)) {
+      // A member went down between the data landing and this encode: redo
+      // the stripe degraded, as for a member write that failed outright.
+      CLIO_CO_AWAIT(RetryStripeDegraded(s, pieces, data, eok));
+      if (!eok) {
+        MarkSlotDirty(s);  // its lost chunk is refused, never decoded wrong
+        CLIO_CO_RETURN;    // the write fails: not all of it is protected
+      }
+    } else if (!eok) {
+      // Members all up but the encode failed (e.g. no SHM buffer): the data
+      // is intact on every member; the background builder retries.
+      MarkSlotDirty(s);
+      continue;
+    }
+    clean.insert(s);
+  }
+  task->bytes_written_ = mw.bytes;
+  ok = true;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ReadBlockDegraded(clio::run::u64 off,
+                                                 clio::run::u64 len, char *dst,
+                                                 bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = false;
+  const clio::run::u64 hi = off + len;
+  clio::run::u64 cur = off;
+  while (cur < hi) {
+    clio::run::u32 dd = 0;
+    clio::run::u64 s = 0, within = 0;
+    Unband(cur, dd, s, within);
+    const clio::run::u64 chunk_base = (cur / kChunkLen) * kChunkLen;
+    const clio::run::u64 seg_end =
+        std::min<clio::run::u64>(hi, chunk_base + kChunkLen);
+    if (IsSlotDirty(s)) {
+      HLOG(kError,
+           "safe_bdev Read: slot {} is dirty (parity not built) and data "
+           "member {} is down — cannot reconstruct",
+           s, dd);
+      CLIO_CO_RETURN;
+    }
+    std::vector<int> stripe;
+    {
+      std::lock_guard<std::mutex> g(alloc_mu_);
+      stripe = StripeMembers(s);
+    }
+    int pos = -1;
+    for (size_t i = 0; i < stripe.size(); ++i) {
+      if (stripe[i] == static_cast<int>(dd)) {
+        pos = static_cast<int>(i);
+        break;
+      }
+    }
+    std::vector<std::vector<uint8_t>> chunks;
+    bool rec_ok = false;
+    if (pos >= 0) {
+      const std::vector<int> excl{static_cast<int>(dd)};
+      CLIO_CO_AWAIT(ReconstructStripe(s, stripe, excl, chunks, rec_ok));
+    }
+    if (!rec_ok || pos < 0) {
+      HLOG(kError, "safe_bdev Read: cannot reconstruct slot {} of down data "
+           "member {} (too many members down)", s, dd);
+      CLIO_CO_RETURN;
+    }
+    std::memcpy(dst + (cur - off),
+                chunks[static_cast<size_t>(pos)].data() + within,
+                seg_end - cur);
+    cur = seg_end;
+  }
+  ok = true;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -1221,6 +1650,7 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
     CLIO_CO_RETURN;
   }
   FaultMembersOnDeadNodes();
+  task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kOk);
   if (data_members_.empty() || task->blocks_.size() == 0) {
     task->return_code_ = 1;
     CLIO_CO_RETURN;
@@ -1231,8 +1661,6 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
       ipc->ToFullPtr(task->data_).template Cast<char>();
 
   clio::run::u64 buf_pos = 0;
-  clio::run::u64 bytes_read = 0;
-
   for (size_t bi = 0; bi < task->blocks_.size(); ++bi) {
     const clio::run::u64 off = task->blocks_[bi].offset_;
     const clio::run::u64 len = task->blocks_[bi].size_;
@@ -1242,83 +1670,38 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
     clio::run::u32 d = 0;
     clio::run::u64 s0 = 0, within0 = 0;
     Unband(off, d, s0, within0);
+    bool seg_ok = false;
     if (d >= data_members_.size()) {
       HLOG(kError, "safe_bdev Read: block offset {} decodes to member {} out of "
            "range", off, d);
-      task->bytes_read_ = bytes_read;
-      task->length_ = bytes_read;
+    } else {
+      if (DataActive(d)) {
+        // Healthy: one contiguous read from member d.
+        CLIO_CO_AWAIT(ReadDataSegment(
+            static_cast<size_t>(d), SlotPhysOffset(s0) + within0,
+            reinterpret_cast<uint8_t *>(data.ptr_) + buf_pos, len, seg_ok));
+      }
+      // Member d is down -- or just failed this read and was faulted:
+      // reconstruct the block from its stripes' survivors + parity.
+      if (!seg_ok && !DataActive(d)) {
+        CLIO_CO_AWAIT(ReadBlockDegraded(off, len, data.ptr_ + buf_pos, seg_ok));
+        if (!seg_ok) {
+          task->io_error_ =
+              static_cast<clio::run::u32>(ctp::IoError::kDeviceFault);
+        }
+      }
+    }
+    if (!seg_ok) {
+      task->bytes_read_ = buf_pos;
+      task->length_ = buf_pos;
       task->return_code_ = 1;
       CLIO_CO_RETURN;
     }
-
-    if (data_members_[d].state_ == ec::EcState::kActive) {
-      // Healthy: one contiguous read from member d.
-      const clio::run::u64 phys = SlotPhysOffset(s0) + within0;
-      bool seg_ok = false;
-      CLIO_CO_AWAIT(ReadDataSegment(
-          static_cast<size_t>(d), phys,
-          reinterpret_cast<uint8_t *>(data.ptr_) + buf_pos, len, seg_ok));
-      if (!seg_ok) {
-        task->bytes_read_ = bytes_read;
-        task->length_ = bytes_read;
-        task->return_code_ = 1;
-        CLIO_CO_RETURN;
-      }
-      buf_pos += len;
-    } else {
-      // Degraded: member d is down -> reconstruct each chunk of this block from
-      // its stripe's survivors + parity, chunk by chunk.
-      const clio::run::u64 hi = off + len;
-      clio::run::u64 cur = off;
-      while (cur < hi) {
-        clio::run::u32 dd = 0;
-        clio::run::u64 s = 0, within = 0;
-        Unband(cur, dd, s, within);
-        const clio::run::u64 chunk_base = (cur / kChunkLen) * kChunkLen;
-        const clio::run::u64 seg_end =
-            std::min<clio::run::u64>(hi, chunk_base + kChunkLen);
-        const clio::run::u64 seg_len = seg_end - cur;
-        if (IsSlotDirty(s)) {
-          HLOG(kError,
-               "safe_bdev Read: slot {} is dirty (parity not built) and data "
-               "member {} is down — cannot reconstruct",
-               s, dd);
-          task->bytes_read_ = bytes_read;
-          task->length_ = bytes_read;
-          task->return_code_ = 1;
-          CLIO_CO_RETURN;
-        }
-        const std::vector<int> stripe = StripeMembers(s);
-        int pos = -1;
-        for (size_t i = 0; i < stripe.size(); ++i) {
-          if (stripe[i] == static_cast<int>(dd)) {
-            pos = static_cast<int>(i);
-            break;
-          }
-        }
-        std::vector<std::vector<uint8_t>> chunks;
-        bool rec_ok = false;
-        if (pos >= 0) {
-          CLIO_CO_AWAIT(ReconstructStripe(s, stripe, static_cast<int>(dd),
-                                          chunks, rec_ok));
-        }
-        if (!rec_ok || pos < 0) {
-          task->bytes_read_ = bytes_read;
-          task->length_ = bytes_read;
-          task->return_code_ = 1;
-          CLIO_CO_RETURN;
-        }
-        std::memcpy(data.ptr_ + buf_pos,
-                    chunks[static_cast<size_t>(pos)].data() + within, seg_len);
-        buf_pos += seg_len;
-        cur = seg_end;
-      }
-    }
-    bytes_read += len;
+    buf_pos += len;
   }
 
-  task->bytes_read_ = bytes_read;
-  task->length_ = bytes_read;
+  task->bytes_read_ = buf_pos;
+  task->length_ = buf_pos;
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -1724,7 +2107,13 @@ clio::run::TaskResume Runtime::RebuildMember(bool is_data, int idx, bool &ok,
       recovery_active_.store(0, std::memory_order_release);
       CLIO_CO_RETURN;
     }
-    const std::vector<int> stripe = StripeMembers(s);
+    std::vector<int> stripe = StripeMembers(s);
+    if (!is_data && !IsSlotDirty(s)) {
+      // The other parity rows encode the slot's encoded set, which a later
+      // allocation may have widened past: rebuild this row over the same set.
+      std::vector<int> code = EncodedMembers(s);
+      if (!code.empty()) stripe = code;
+    }
     const int k_s = static_cast<int>(stripe.size());
     if (k_s <= 0) {
       ++done;
@@ -1750,7 +2139,8 @@ clio::run::TaskResume Runtime::RebuildMember(bool is_data, int idx, bool &ok,
       std::vector<std::vector<uint8_t>> chunks;
       bool rec_ok = false;
       if (pos >= 0) {
-        CLIO_CO_AWAIT(ReconstructStripe(s, stripe, idx, chunks, rec_ok));
+        const std::vector<int> excl{idx};
+        CLIO_CO_AWAIT(ReconstructStripe(s, stripe, excl, chunks, rec_ok));
       }
       if (!rec_ok || pos < 0) {
         ipc->FreeBuffer(buf);
@@ -1997,12 +2387,10 @@ clio::run::TaskResume Runtime::BuildParity(clio::run::shared_ptr<BuildParityTask
   // dirty set knows every stripe is protected. A slot that cannot be built (a
   // stripe member is down) is left dirty for a later pass.
   std::vector<clio::run::u64> batch;
-  std::unordered_map<clio::run::u64, clio::run::u64> batch_gen;
   {
     std::lock_guard<std::mutex> g(slot_mu_);
     for (clio::run::u64 s : dirty_slots_) {
       batch.push_back(s);
-      batch_gen[s] = slot_gen_[s];
       if (task->max_batch_ != 0 &&
           batch.size() >= static_cast<size_t>(task->max_batch_)) {
         break;
@@ -2010,80 +2398,21 @@ clio::run::TaskResume Runtime::BuildParity(clio::run::shared_ptr<BuildParityTask
     }
   }
 
-  auto *ipc = CLIO_IPC;
   clio::run::u32 built = 0;
+  if (FaultSkipParity()) batch.clear();  // test fault: the "crash" pending
   for (clio::run::u64 s : batch) {
-    const std::vector<int> stripe = StripeMembers(s);
-    const int k_s = static_cast<int>(stripe.size());
-    if (k_s <= 0) {
-      // Stale dirty mark for an empty stripe; drop it.
-      std::lock_guard<std::mutex> g(slot_mu_);
-      dirty_slots_.erase(s);
-      continue;
-    }
-
-    // Read the k_s data chunks of this stripe (all stripe members must be
-    // active to build parity over the full chunks).
-    std::vector<std::vector<uint8_t>> dchunks(
-        static_cast<size_t>(k_s), std::vector<uint8_t>(kChunkLen, 0));
-    bool rd_ok = true;
-    for (int pos = 0; pos < k_s; ++pos) {
-      const int d = stripe[static_cast<size_t>(pos)];
-      if (data_members_[static_cast<size_t>(d)].state_ !=
-          ec::EcState::kActive) {
-        rd_ok = false;
-        break;
-      }
-      bool one = false;
-      CLIO_CO_AWAIT(ReadDataSegment(static_cast<size_t>(d), SlotPhysOffset(s),
-                                    dchunks[static_cast<size_t>(pos)].data(),
-                                    kChunkLen, one));
-      rd_ok = one;
-      if (!rd_ok) break;
-    }
-    if (!rd_ok) {
-      continue;  // leave dirty; retry next pass
-    }
-
-    std::vector<const uint8_t *> ptrs(static_cast<size_t>(k_s));
-    for (int pos = 0; pos < k_s; ++pos) {
-      ptrs[static_cast<size_t>(pos)] = dchunks[static_cast<size_t>(pos)].data();
-    }
-    ec::ReedSolomon *codec = GetCodec(k_s);
-
-    bool wr_ok = true;
-    for (int j = 0; j < static_cast<int>(parity_level_); ++j) {
-      if (parity_members_[static_cast<size_t>(j)].state_ !=
-          ec::EcState::kActive) {
-        continue;
-      }
-      ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(kChunkLen);
-      if (buf.IsNull()) {
-        wr_ok = false;
-        break;
-      }
-      codec->EncodeParityShard(j, ptrs, kChunkLen,
-                               reinterpret_cast<uint8_t *>(buf.ptr_));
-      auto fut = parity_clients_[static_cast<size_t>(j)].AsyncWrite(
-          ParityQuery(static_cast<size_t>(j)), MemberBlocks(SlotPhysOffset(s), kChunkLen),
-          buf.shm_.template Cast<void>(), kChunkLen);
-      CLIO_CO_AWAIT(fut);
-      wr_ok = (fut->return_code_ == 0) && (fut->bytes_written_ == kChunkLen);
-      MaybeFaultParity(static_cast<size_t>(j), fut->io_error_);
-      ipc->FreeBuffer(buf);
-      if (!wr_ok) break;
-    }
-    if (!wr_ok) {
-      continue;  // leave dirty; retry next pass
-    }
-    {
-      // Clear only if no write re-dirtied the slot while this pass read it;
-      // otherwise the parity just written may predate that write.
-      std::lock_guard<std::mutex> g2(slot_mu_);
-      if (slot_gen_[s] == batch_gen[s]) {
-        dirty_slots_.erase(s);
-      }
-    }
+    // Wait out whoever holds the stripe (a Write encodes its own; another
+    // builder pass may be mid-encode) -- skipping it would let a drain
+    // return while the stripe is still unprotected. Then encode only if it
+    // is still dirty.
+    const std::set<clio::run::u64> one{s};
+    CLIO_CO_AWAIT(LockStripes(one));
+    const clio::run::u64 wm = IntentWatermark();
+    bool eok = !IsSlotDirty(s);
+    if (!eok) CLIO_CO_AWAIT(EncodeStripe(s, eok));
+    UnlockStripes(one);
+    if (!eok) continue;  // a member is down or I/O failed: stays dirty
+    LogStripesEncoded(one, wm);
     ++built;
   }
   if (built > 0) {
@@ -2144,13 +2473,13 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> pk(sbuf);
-    // 17 = the 16 scalar stats below plus the trailing "members" array. The
+    // 18 = the 17 scalar stats below plus the trailing "members" array. The
     // count was 14 while 15 pairs were packed, so a spec-conforming unpacker
     // (msgpack::unpack reads exactly the declared map) silently DROPPED the
     // members roster -- found by the dashboard's member-table test (#990).
     clio::run::u64 cap_total = 0, cap_remaining = 0;
     if (IsHome()) ArrayCapacity(&cap_total, &cap_remaining);
-    pk.pack_map(17);
+    pk.pack_map(18);
     pk.pack("pool_name");     pk.pack(pool_name_);
     pk.pack("max_failures");  pk.pack(max_failures_);
     pk.pack("data_count");
@@ -2170,6 +2499,8 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
     pk.pack("recovery_ops_completed"); pk.pack(rec_done);
     pk.pack("recovery_ops_in_flight"); pk.pack(rec_inflight);
     pk.pack("recovery_ops_remaining"); pk.pack(rec_remaining);
+    // Members out of service (faulty or removed), data + parity.
+    pk.pack("faulty_members");         pk.pack(CountDownMembers());
     const auto pack_members = [&](const std::vector<MemberSlot> &vec,
                                   bool is_parity) {
       for (const auto &m : vec) {
@@ -2205,6 +2536,7 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 
 clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  StopIntentSync();
   alloc_log_.Flush();
   task->return_code_ = 0;
   CLIO_CO_RETURN;
@@ -2212,6 +2544,308 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
 }
 
 clio::run::u64 Runtime::GetWorkRemaining() const { return 0; }
+
+//=============================================================================
+// Synchronous parity and the stripe intent log (#1121)
+//=============================================================================
+
+bool Runtime::TryLockStripes(const std::set<clio::run::u64> &slots) {
+  std::lock_guard<std::mutex> g(slot_mu_);
+  for (clio::run::u64 s : slots) {
+    if (busy_stripes_.count(s) != 0) return false;
+  }
+  busy_stripes_.insert(slots.begin(), slots.end());
+  return true;
+}
+
+clio::run::TaskResume Runtime::LockStripes(
+    const std::set<clio::run::u64> &slots) {
+  CLIO_TASK_BODY_BEGIN
+  // All-or-nothing, re-checked every time the worker runs us again: no lock
+  // order to get wrong and no wakeup to lose. A thread-blocking lock would
+  // deadlock the worker the moment a holder suspends at a member I/O.
+  while (!TryLockStripes(slots)) {
+    CLIO_CO_AWAIT(clio::run::yield(kStripeLockPollUs));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::UnlockStripes(const std::set<clio::run::u64> &slots) {
+  std::lock_guard<std::mutex> g(slot_mu_);
+  for (clio::run::u64 s : slots) busy_stripes_.erase(s);
+}
+
+clio::run::u64 Runtime::LogDirtyIntents(const std::set<clio::run::u64> &slots,
+                                        std::vector<IntentKey> &keys) {
+  keys.clear();
+  if (!alloc_log_.enabled() || slots.empty()) return 0;
+  std::lock_guard<std::mutex> g(intent_mu_);
+  for (clio::run::u64 s : slots) {
+    // A key of its own per (write, stripe): two writes' intents on one
+    // stripe coexist, so one write's clean record never erases another's
+    // dirty one. The stripe rides in the record's size field.
+    const clio::run::u64 key = ++intent_key_gen_;
+    alloc_log_.LogAlloc(kIntentGroup, key, s, 0);
+    keys.push_back(IntentKey{key, s});
+  }
+  // Into the kernel now (survives this process dying); AwaitIntentDurable
+  // fsyncs it before the data may be written.
+  alloc_log_.Append();
+  return intent_seq_.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+void Runtime::LogCleanIntents(const std::vector<IntentKey> &keys,
+                              const std::set<clio::run::u64> &clean) {
+  if (!alloc_log_.enabled() || keys.empty()) return;
+  std::lock_guard<std::mutex> g(intent_mu_);
+  for (const IntentKey &k : keys) {
+    if (clean.count(k.slot) != 0) {
+      alloc_log_.LogFree(kIntentGroup, k.key, k.slot, 0);
+    } else {
+      // Not encoded (its write failed, or a member went down): the stripe
+      // stays stale until some later encode settles it.
+      intent_stale_[k.slot].insert(k.key);
+    }
+  }
+  // Lazily flushed: a lost clean record costs one needless re-encode.
+}
+
+void Runtime::LogStripesStale(const std::set<clio::run::u64> &slots) {
+  if (!alloc_log_.enabled() || slots.empty()) return;
+  std::lock_guard<std::mutex> g(intent_mu_);
+  for (clio::run::u64 s : slots) {
+    const clio::run::u64 key = ++intent_key_gen_;
+    alloc_log_.LogAlloc(kIntentGroup, key, s, 0);
+    intent_stale_[s].insert(key);
+  }
+}
+
+clio::run::u64 Runtime::IntentWatermark() {
+  std::lock_guard<std::mutex> g(intent_mu_);
+  return intent_key_gen_;
+}
+
+void Runtime::LogStripesEncoded(const std::set<clio::run::u64> &slots,
+                                clio::run::u64 watermark) {
+  if (!alloc_log_.enabled() || slots.empty()) return;
+  std::lock_guard<std::mutex> g(intent_mu_);
+  for (clio::run::u64 s : slots) {
+    auto it = intent_stale_.find(s);
+    if (it == intent_stale_.end()) continue;
+    // Only stale intents logged before the encode began: a free that
+    // narrowed the stripe meanwhile is not covered by it. In-flight writes'
+    // intents are never here (their own write settles them).
+    auto &keys = it->second;
+    for (auto k = keys.begin(); k != keys.end() && *k <= watermark;) {
+      alloc_log_.LogFree(kIntentGroup, *k, s, 0);
+      k = keys.erase(k);
+    }
+    if (keys.empty()) intent_stale_.erase(it);
+  }
+}
+
+clio::run::TaskResume Runtime::AwaitIntentDurable(clio::run::u64 seq) {
+  CLIO_TASK_BODY_BEGIN
+  // Group commit on a dedicated thread (IntentSyncMain): one fsync covers
+  // every intent appended before it began, and it runs OFF the worker, so
+  // other writes keep going while it is in flight. A per-write fsync on the
+  // worker was ~7 of the 8 ms a 128 KiB write took.
+  if (seq != 0 && intent_durable_.load(std::memory_order_acquire) < seq) {
+    intent_cv_.notify_one();
+    while (intent_durable_.load(std::memory_order_acquire) < seq) {
+      CLIO_CO_AWAIT(clio::run::yield(kIntentSyncPollUs));
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::StartIntentSync() {
+  if (intent_thread_.joinable()) return;
+  intent_stop_.store(false);
+  intent_thread_ = std::thread(&Runtime::IntentSyncMain, this);
+}
+
+void Runtime::StopIntentSync() {
+  if (!intent_thread_.joinable()) return;
+  intent_stop_.store(true);
+  intent_cv_.notify_one();
+  intent_thread_.join();
+}
+
+void Runtime::IntentSyncMain() {
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lk(intent_cv_mu_);
+      intent_cv_.wait_for(lk, std::chrono::milliseconds(5), [this] {
+        return intent_stop_.load() ||
+               intent_seq_.load(std::memory_order_acquire) >
+                   intent_durable_.load(std::memory_order_acquire);
+      });
+    }
+    const clio::run::u64 target = intent_seq_.load(std::memory_order_acquire);
+    if (target > intent_durable_.load(std::memory_order_acquire)) {
+      if (!alloc_log_.SyncAppended()) {
+        HLOG(kError, "safe_bdev: fsync of the intent log failed; writes "
+             "wait until it succeeds");
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
+      }
+      intent_durable_.store(target, std::memory_order_release);
+    }
+    if (intent_stop_.load() &&
+        intent_seq_.load(std::memory_order_acquire) <=
+            intent_durable_.load(std::memory_order_acquire)) {
+      return;
+    }
+  }
+}
+
+size_t Runtime::ReplayStripeIntents() {
+  if (!alloc_log_.enabled()) return 0;
+  const std::vector<clio::run::bdev::LiveBlock> &live =
+      alloc_log_.live(kIntentGroup);
+  std::lock_guard<std::mutex> g(slot_mu_);
+  size_t n = 0;
+  {
+    std::lock_guard<std::mutex> ig(intent_mu_);
+    for (const auto &b : live) {
+      intent_key_gen_ = std::max(intent_key_gen_, b.offset);
+      intent_stale_[b.size].insert(b.offset);
+    }
+  }
+  for (const auto &b : live) {
+    const clio::run::u64 s = b.size;  // keys are unique; the stripe is here
+    if (written_slots_.count(s) == 0) continue;  // stripe since emptied
+    // The parity on disk encodes some earlier version of this stripe: never
+    // reconstruct from it until it has been re-encoded.
+    dirty_slots_.insert(s);
+    encoded_.erase(s);
+    ++slot_gen_[s];
+    ++n;
+  }
+  return n;
+}
+
+clio::run::TaskResume Runtime::EncodeStripe(clio::run::u64 s, bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = false;
+  clio::run::u64 gen = 0;
+  std::vector<int> stripe;
+  {
+    std::lock_guard<std::mutex> ag(alloc_mu_);
+    stripe = StripeMembers(s);
+  }
+  {
+    std::lock_guard<std::mutex> g(slot_mu_);
+    gen = slot_gen_[s];
+  }
+  const int k_s = static_cast<int>(stripe.size());
+  if (k_s <= 0) {
+    std::lock_guard<std::mutex> g(slot_mu_);
+    dirty_slots_.erase(s);  // nothing left to protect
+    ok = true;
+    CLIO_CO_RETURN;
+  }
+  std::vector<std::vector<uint8_t>> dchunks(
+      static_cast<size_t>(k_s), std::vector<uint8_t>(kChunkLen, 0));
+  for (int pos = 0; pos < k_s; ++pos) {
+    const size_t d = static_cast<size_t>(stripe[static_cast<size_t>(pos)]);
+    if (data_members_[d].state_ != ec::EcState::kActive) CLIO_CO_RETURN;
+    bool one = false;
+    CLIO_CO_AWAIT(ReadDataSegment(d, SlotPhysOffset(s),
+                                  dchunks[static_cast<size_t>(pos)].data(),
+                                  kChunkLen, one));
+    if (!one) CLIO_CO_RETURN;
+  }
+  std::vector<const uint8_t *> ptrs(static_cast<size_t>(k_s));
+  for (int pos = 0; pos < k_s; ++pos) {
+    ptrs[static_cast<size_t>(pos)] = dchunks[static_cast<size_t>(pos)].data();
+  }
+  ec::ReedSolomon *codec = GetCodec(k_s);
+  auto *ipc = CLIO_IPC;
+  for (size_t j = 0; j < parity_level_; ++j) {
+    if (parity_members_[j].state_ != ec::EcState::kActive) continue;
+    ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(kChunkLen);
+    if (buf.IsNull()) CLIO_CO_RETURN;
+    codec->EncodeParityShard(static_cast<int>(j), ptrs, kChunkLen,
+                             reinterpret_cast<uint8_t *>(buf.ptr_));
+    auto fut = parity_clients_[j].AsyncWrite(
+        ParityQuery(j), MemberBlocks(SlotPhysOffset(s), kChunkLen),
+        buf.shm_.template Cast<void>(), kChunkLen);
+    CLIO_CO_AWAIT(fut);
+    const bool wr_ok =
+        fut->return_code_ == 0 && fut->bytes_written_ == kChunkLen;
+    // A parity member that fails is faulted and drops out of the array; the
+    // shards the others hold are current, so the stripe stays protected by
+    // what remains (and RecoverBdev rebuilds the lost column).
+    FaultOnIoError(/*is_parity=*/true, j, !wr_ok, fut->io_error_);
+    ipc->FreeBuffer(buf);
+    if (!wr_ok && parity_members_[j].state_ == ec::EcState::kActive) {
+      CLIO_CO_RETURN;  // failed but not faulted: parity state unknown
+    }
+  }
+  {
+    std::lock_guard<std::mutex> g(slot_mu_);
+    encoded_[s] = stripe;
+    if (slot_gen_[s] == gen) dirty_slots_.erase(s);
+  }
+  ok = true;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::Sync(clio::run::shared_ptr<SyncTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  if (!IsHome()) {
+    HLOG(kError, "safe_bdev: {} sent to a passive container of a distributed "
+         "array; route it to the array's home node", "Sync");
+    task->return_code_ = kNotHomeRc;
+    CLIO_CO_RETURN;
+  }
+  FaultMembersOnDeadNodes();
+  task->return_code_ = 0;
+  // 1. Every stripe still dirty gets its parity now (writes encode their own
+  //    stripes before acking; frees and membership changes leave theirs to
+  //    the background builder, and fsync must not return ahead of it).
+  std::vector<clio::run::u64> dirty;
+  {
+    std::lock_guard<std::mutex> g(slot_mu_);
+    dirty.assign(dirty_slots_.begin(), dirty_slots_.end());
+  }
+  for (clio::run::u64 s : dirty) {
+    const std::set<clio::run::u64> one{s};
+    CLIO_CO_AWAIT(LockStripes(one));
+    const clio::run::u64 wm = IntentWatermark();
+    bool eok = !IsSlotDirty(s);
+    if (!eok) CLIO_CO_AWAIT(EncodeStripe(s, eok));
+    UnlockStripes(one);
+    if (eok) {
+      LogStripesEncoded(one, wm);
+    } else if (CountDownMembers() == 0) {
+      task->return_code_ = 1;  // all members up, yet parity cannot be built
+    }
+  }
+  // 2. Every active member's data (and its own allocator state) to media.
+  std::vector<clio::run::Future<clio::run::bdev::SyncTask>> futs;
+  for (size_t d = 0; d < data_clients_.size(); ++d) {
+    if (data_members_[d].state_ != ec::EcState::kActive) continue;
+    futs.push_back(data_clients_[d].AsyncSync(DataQuery(d)));
+  }
+  for (size_t j = 0; j < parity_clients_.size(); ++j) {
+    if (parity_members_[j].state_ != ec::EcState::kActive) continue;
+    futs.push_back(parity_clients_[j].AsyncSync(ParityQuery(j)));
+  }
+  for (auto &f : futs) {
+    CLIO_CO_AWAIT(f);
+    if (f->GetReturnCode() != 0) task->return_code_ = 1;
+  }
+  // 3. The allocation and intent log.
+  alloc_log_.Flush();
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
 
 }  // namespace clio::run::safe_bdev
 

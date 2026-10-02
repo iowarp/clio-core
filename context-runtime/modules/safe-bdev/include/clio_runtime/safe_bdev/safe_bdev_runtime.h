@@ -41,13 +41,18 @@
 #include <clio_runtime/bdev/bdev_alloc_log.h>  // bdev::AllocatorLog (reused WAL)
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>  // std::FILE
+#include <cstdlib>  // std::getenv
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <unordered_map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <clio_ctp/io/io_error.h>  // ctp::IoError, ctp::IsFatalDevice
@@ -114,7 +119,7 @@ class Runtime : public clio::run::Container {
         parity_level_(0),
         rr_cursor_(0),
         reattached_members_(0) {}
-  ~Runtime() override = default;
+  ~Runtime() override { StopIntentSync(); }
 
   /** EC chunk / slot length in bytes -- the fixed unit a member bdev is split
    *  into for erasure coding (the "1 MB" of the design; a configurable knob,
@@ -141,6 +146,8 @@ class Runtime : public clio::run::Container {
 
   /** Background parity-builder poll period (microseconds): 50 ms. */
   static constexpr double kBuildParityPeriodUs = 50000.0;
+  // Re-check period while waiting for a stripe another task holds (#1121).
+  static constexpr double kStripeLockPollUs = 10.0;
 
   /** Allocator-WAL flush/compact poll period (microseconds): 50 ms. */
   static constexpr double kFlushAllocLogPeriodUs = 50000.0;
@@ -191,6 +198,16 @@ class Runtime : public clio::run::Container {
 
   /** Flush/compact the persistent allocator log (Method::kFlushAllocLog). */
   clio::run::TaskResume FlushAllocLog(clio::run::shared_ptr<FlushAllocLogTask> &task);
+
+  /**
+   * Make everything written so far durable AND parity-protected
+   * (Method::kSync; bdev's SyncTask layout, so the CTE's plain bdev client
+   * can fsync an array). Encodes every dirty stripe, syncs every active
+   * member, then fsyncs the allocation/intent log.
+   * @param task rc 0 on success; 1 if a member sync failed or a dirty stripe
+   *        whose members are all active could not be encoded
+   */
+  clio::run::TaskResume Sync(clio::run::shared_ptr<SyncTask> &task);
 
   /** Monitor container state (Method::kMonitor). */
   clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
@@ -253,12 +270,49 @@ class Runtime : public clio::run::Container {
   // members live in parity_members_ (index_ == parity row j == position). A
   // member's chunk for SLOT s lives at absolute offset kSuperblockSize +
   // s*kChunkLen.
+  /**
+   * A member's ec::EcState, readable and writable from concurrent task
+   * fibers. A data-plane task that sees a member's I/O fail faults it
+   * (kActive -> kFaulty) while other workers' tasks are reading the state,
+   * so the field is atomic; the copy operations let MemberSlot stay a value
+   * type in the member vectors.
+   */
+  class AtomicEcState {
+   public:
+    AtomicEcState() : v_(ec::EcState::kActive) {}
+    AtomicEcState(ec::EcState s) : v_(s) {}  // NOLINT: implicit by design
+    AtomicEcState(const AtomicEcState &o) : v_(o.Load()) {}
+    AtomicEcState &operator=(const AtomicEcState &o) {
+      v_.store(o.Load(), std::memory_order_release);
+      return *this;
+    }
+    AtomicEcState &operator=(ec::EcState s) {
+      v_.store(s, std::memory_order_release);
+      return *this;
+    }
+    operator ec::EcState() const { return Load(); }  // NOLINT
+    /** @return the current state. */
+    ec::EcState Load() const { return v_.load(std::memory_order_acquire); }
+    /**
+     * Atomically move from `from` to `to`.
+     * @param from the state the caller expects
+     * @param to the new state
+     * @return true if this call made the transition
+     */
+    bool Transition(ec::EcState from, ec::EcState to) {
+      return v_.compare_exchange_strong(from, to, std::memory_order_acq_rel);
+    }
+
+   private:
+    std::atomic<ec::EcState> v_;
+  };
+
   struct MemberSlot {
     clio::run::PoolId pool_id_;
     std::string pool_name_;
     clio::run::u32 node_id_ = 0;
     ec::EcRole role_ = ec::EcRole::kData;
-    ec::EcState state_ = ec::EcState::kActive;
+    AtomicEcState state_ = ec::EcState::kActive;
     int index_ = -1;  // data column d (DATA) or parity row j (PARITY)
     // True while this member's chunks are being rebuilt onto pool_id_ (a
     // recovery target seated by RecoverBdev). Persisted in the member manifest
@@ -283,6 +337,16 @@ class Runtime : public clio::run::Container {
     clio::run::u64 cap_slots_ = 0;       // usable kChunkLen slots on this member
     std::vector<clio::run::u64> free_;   // freed slots, reusable (LIFO)
     std::set<clio::run::u64> live_;      // currently-live slots
+    /** Live slots whose block is shorter than kChunkLen: slot -> bytes in
+     *  use. The rest of such a chunk is never addressed, so a degraded
+     *  write retry need not preserve it (see RetryStripeDegraded). */
+    std::unordered_map<clio::run::u64, clio::run::u64> part_len_;
+
+    /** @return bytes of slot `s` that hold addressable data. */
+    clio::run::u64 LiveLen(clio::run::u64 s) const {
+      auto it = part_len_.find(s);
+      return it == part_len_.end() ? kChunkLen : it->second;
+    }
 
     // Slots not yet handed out (bump headroom + reusable frees).
     clio::run::u64 RemainingSlots() const {
@@ -309,6 +373,7 @@ class Runtime : public clio::run::Container {
       if (live_.erase(s) != 0) {
         free_.push_back(s);
       }
+      part_len_.erase(s);
     }
   };
 
@@ -338,6 +403,98 @@ class Runtime : public clio::run::Container {
   // Empty path => disabled (every API is a no-op).
   static constexpr clio::run::u32 kAllocGroup = 0;
   clio::run::bdev::AllocatorLog alloc_log_;
+
+  //==========================================================================
+  // Crash Consistency Intent Logging (issue #1121). Intent records track
+  // when a slot's data write begins (dirty) and when parity write completes
+  // (clean). On restart, slots marked dirty are rebuilt before degraded reads.
+  //==========================================================================
+
+  // Stripe intent log (#1121): stripes whose parity may be stale are logged
+  // as LIVE entries of this alloc-log group (LogAlloc = "dirty", LogFree =
+  // "clean", offset = slot). A write logs its stripes dirty and fsyncs the
+  // log BEFORE any member write, and logs them clean once their parity is
+  // written. After a crash, the group's live entries are exactly the stripes
+  // whose data may have landed without parity; Create rebuilds them.
+  static constexpr clio::run::u32 kIntentGroup = 1;
+
+  /** One logged intent: its unique log key and the stripe it names. */
+  struct IntentKey {
+    clio::run::u64 key;
+    clio::run::u64 slot;
+  };
+
+  /**
+   * Log a write's stripes dirty (before their data is written) and hand the
+   * records to the kernel; await AwaitIntentDurable(returned seq) before any
+   * member write.
+   * @param slots the stripes
+   * @param keys receives one key per stripe, for LogCleanIntents
+   * @return the intent's sequence number (0 when nothing was logged)
+   */
+  clio::run::u64 LogDirtyIntents(const std::set<clio::run::u64> &slots,
+                                 std::vector<IntentKey> &keys);
+
+  /**
+   * Settle a write's intents for the stripes whose parity it brought current.
+   * @param keys the write's intents (LogDirtyIntents)
+   * @param clean stripes now encoded
+   */
+  void LogCleanIntents(const std::vector<IntentKey> &keys,
+                       const std::set<clio::run::u64> &clean);
+
+  /** Log stripes whose parity is now stale for restart (a free narrowed
+   *  them; caller holds alloc_mu_, logged before the free record). */
+  void LogStripesStale(const std::set<clio::run::u64> &slots);
+
+  /** @return the newest intent key; stale intents up to it are covered by
+   *  an encode that starts now (pass it to LogStripesEncoded). */
+  clio::run::u64 IntentWatermark();
+
+  /**
+   * Settle the stale intents of `slots` that an encode covered.
+   * @param slots stripes just encoded under their lock
+   * @param watermark IntentWatermark() taken once the stripe was held
+   */
+  void LogStripesEncoded(const std::set<clio::run::u64> &slots,
+                         clio::run::u64 watermark);
+
+  // Stale intents per stripe (frees, failed writes), settled by a later
+  // encode; in-flight writes' intents are not here. Guarded by intent_mu_.
+  std::map<clio::run::u64, std::set<clio::run::u64>> intent_stale_;
+
+  /**
+   * Wait until intent `seq` is fsynced, sharing one fsync among concurrent
+   * writers (group commit).
+   * @param seq a LogStripeIntent sequence number (0 = nothing to wait for)
+   */
+  clio::run::TaskResume AwaitIntentDurable(clio::run::u64 seq);
+
+  /** Start the intent-log sync thread (alloc log enabled). */
+  void StartIntentSync();
+  /** Stop and join it, after a final sync of what was appended. */
+  void StopIntentSync();
+  /** Sync thread body: fsync the log whenever intents await durability. */
+  void IntentSyncMain();
+
+  // Group commit state for the intent log (#1121).
+  std::mutex intent_mu_;                         // orders appends with seq
+  clio::run::u64 intent_key_gen_ = 0;            // unique intent keys
+  std::atomic<clio::run::u64> intent_seq_{0};      // last appended
+  std::atomic<clio::run::u64> intent_durable_{0};  // last fsynced
+  std::thread intent_thread_;
+  std::mutex intent_cv_mu_;
+  std::condition_variable intent_cv_;
+  std::atomic<bool> intent_stop_{false};
+  // Re-check period while the sync thread's fsync covers our intent.
+  static constexpr double kIntentSyncPollUs = 20.0;
+
+  /**
+   * Restart: mark every stripe the intent log still holds dirty, so its
+   * parity is rebuilt before it can be trusted for reconstruction.
+   * @return the number of stripes recovered as dirty
+   */
+  size_t ReplayStripeIntents();
 
   // Durable member manifest path (== alloc_log_path + ".members"; empty when
   // the alloc log is disabled). Records the CURRENT full membership (data +
@@ -397,6 +554,15 @@ class Runtime : public clio::run::Container {
    *  insert was a no-op) must not be erased along with the stale parity. */
   std::unordered_map<clio::run::u64, clio::run::u64> slot_gen_;
   std::set<clio::run::u64> written_slots_;
+  /**
+   * Per slot, the data members (sorted) whose chunks its parity currently
+   * encodes -- the stripe as of the last parity write (slot_mu_). An
+   * allocation can WIDEN a stripe without dirtying it (see AllocateBlocks),
+   * so the live membership may hold members the parity has never seen; a
+   * decode must use the encoded set and code width, or it returns garbage.
+   * Absent: no parity written yet (the live membership is assumed).
+   */
+  std::unordered_map<clio::run::u64, std::vector<int>> encoded_;
   mutable std::mutex slot_mu_;
 
   // Slot-allocator lock. A container's methods are NOT serialized: client
@@ -419,6 +585,18 @@ class Runtime : public clio::run::Container {
   // reallocate under a concurrent data-plane task.
   mutable std::mutex alloc_mu_;
 
+  // Stripes held by an in-flight Write/encode (#1121), guarded by slot_mu_.
+  // A writer takes ALL of its stripes at once or none (TryLockStripes), so
+  // writers cannot deadlock; holders keep them across co_awaits from before
+  // their data writes until their parity is written.
+  std::set<clio::run::u64> busy_stripes_;
+
+  /** Note a slot holds data, without marking its parity stale (#1121: the
+   *  caller encodes it under the stripe lock right away). */
+  void NoteSlotWritten(clio::run::u64 s) {
+    std::lock_guard<std::mutex> g(slot_mu_);
+    written_slots_.insert(s);
+  }
   /** Mark a slot as holding data and needing (re)parity. */
   void MarkSlotDirty(clio::run::u64 s) {
     std::lock_guard<std::mutex> g(slot_mu_);
@@ -438,6 +616,25 @@ class Runtime : public clio::run::Container {
     std::lock_guard<std::mutex> g(slot_mu_);
     written_slots_.erase(s);
     dirty_slots_.erase(s);
+    encoded_.erase(s);
+  }
+  /**
+   * @param s slot
+   * @return data members slot `s`'s parity encodes (empty if unknown)
+   */
+  std::vector<int> EncodedMembers(clio::run::u64 s) const {
+    std::lock_guard<std::mutex> g(slot_mu_);
+    auto it = encoded_.find(s);
+    return it == encoded_.end() ? std::vector<int>() : it->second;
+  }
+  /**
+   * Record that slot `s`'s parity now encodes `members`.
+   * @param s slot
+   * @param members sorted data members
+   */
+  void SetEncoded(clio::run::u64 s, const std::vector<int> &members) {
+    std::lock_guard<std::mutex> g(slot_mu_);
+    encoded_[s] = members;
   }
   /** True if the slot's parity is not yet current (unprotected). */
   bool IsSlotDirty(clio::run::u64 s) const {
@@ -520,6 +717,11 @@ class Runtime : public clio::run::Container {
    */
   void ArrayCapacity(clio::run::u64 *total, clio::run::u64 *remaining);
 
+  /** StripeHasDownMember for callers that do not hold alloc_mu_. */
+  bool StripeHasDownMemberLocked(clio::run::u64 s) const {
+    std::lock_guard<std::mutex> g(alloc_mu_);
+    return StripeHasDownMember(s);
+  }
   /** @return true if any data member holding a chunk of stripe `s` is down. */
   bool StripeHasDownMember(clio::run::u64 s) const {
     for (int d : StripeMembers(s)) {
@@ -573,34 +775,103 @@ class Runtime : public clio::run::Container {
   bool IsHome() const { return !distributed_ || is_home_; }
 
   /**
-   * Automatic down-detection for a DATA member. Inspect a member-bdev future's
-   * io_error_ after a chunk I/O completes: a fatal device error (DeviceFault /
-   * Disconnected) ejects data member `d` (state_ = kFaulty) so the degraded-read
-   * / reconstruct path takes over. A TRANSIENT error never faults the member.
+   * Take a member out of service at runtime: kActive -> kFaulty, logged once
+   * at kError and persisted in the member manifest (exactly as
+   * RemoveBdev(was_faulty) records it), so a restart keeps the member down.
+   * Reads then reconstruct its chunks and writes keep its bytes in the
+   * parity. Safe from concurrent task fibers: only the call that makes the
+   * transition logs and persists. Must not be called holding alloc_mu_ or
+   * slot_mu_ (it takes member_log_mu_ and does file I/O).
+   * @param is_parity true for parity_members_, false for data_members_
+   * @param idx position in that vector
+   * @param why short reason for the log line
+   * @return true if this call faulted the member
    */
-  void MaybeFaultData(size_t d, clio::run::u32 io_error) {
+  bool FaultMember(bool is_parity, size_t idx, const char *why);
+
+  /**
+   * Automatic down-detection after a member I/O: a request the DEVICE failed
+   * (ctp::IsFatalDevice: a media error or a vanished device) faults the
+   * member, so a dying disk leaves the array instead of surfacing I/O errors
+   * to the caller. Any other failure -- one the device did not attribute to
+   * itself (kOk: a rejected range, a short count, no buffer), a full device
+   * (kNoSpace) or a transient error -- fails only that request: faulting on
+   * those took every member of a healthy array down under tier pressure.
+   * @param is_parity true for a parity member
+   * @param idx its position in the member vector
+   * @param failed whether the request failed
+   * @param io_error the request's ctp::IoError category
+   */
+  void FaultOnIoError(bool is_parity, size_t idx, bool failed,
+                      clio::run::u32 io_error) {
+    if (!failed) return;
     const auto e = static_cast<ctp::IoError>(io_error);
-    if (ctp::IsFatalDevice(e) && d < data_members_.size() &&
-        data_members_[d].state_ == ec::EcState::kActive) {
-      data_members_[d].state_ = ec::EcState::kFaulty;
-      HLOG(kWarning,
-           "safe_bdev: data member {} auto-faulted on fatal device error '{}' "
-           "(io_error={})",
-           d, ctp::IoErrorName(e), io_error);
+    if (ctp::IsFatalDevice(e)) {
+      FaultMember(is_parity, idx, ctp::IoErrorName(e));
+      return;
     }
+    HLOG(kWarning, "safe_bdev: a request to {} member {} failed ({}); not a "
+         "device fault, the member stays in the array",
+         is_parity ? "parity" : "data", idx, ctp::IoErrorName(e));
   }
 
-  /** Automatic down-detection for a PARITY member (parity row j). */
-  void MaybeFaultParity(size_t j, clio::run::u32 io_error) {
-    const auto e = static_cast<ctp::IoError>(io_error);
-    if (ctp::IsFatalDevice(e) && j < parity_members_.size() &&
-        parity_members_[j].state_ == ec::EcState::kActive) {
-      parity_members_[j].state_ = ec::EcState::kFaulty;
-      HLOG(kWarning,
-           "safe_bdev: parity member {} auto-faulted on fatal device error "
-           "'{}' (io_error={})",
-           j, ctp::IoErrorName(e), io_error);
+  /** @return true if data member `d` is serving I/O. */
+  bool DataActive(size_t d) const {
+    return data_members_[d].state_.Load() == ec::EcState::kActive;
+  }
+
+  //==========================================================================
+  // Synchronous Parity (issue #1121): per-stripe locking and intent logging
+  //==========================================================================
+
+  /**
+   * Take every stripe in `slots` if none is held by another task.
+   * @param slots the stripes
+   * @return true if all were taken (the caller must UnlockStripes them)
+   */
+  bool TryLockStripes(const std::set<clio::run::u64> &slots);
+
+  /**
+   * Test-only fault injection, like the file bdev's `.fail` marker: while
+   * $CLIO_SAFE_BDEV_FAULT_SKIP_PARITY is set, writes land their data but not
+   * their parity and the background builder stays idle -- the state a crash
+   * between the two leaves on disk.
+   * @return true while the fault is set
+   */
+  static bool FaultSkipParity() {
+    const char *e = std::getenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
+    return e != nullptr && e[0] == '1';
+  }
+
+  /**
+   * Take every stripe in `slots`, yielding the worker until none is held.
+   * @param slots the stripes
+   */
+  clio::run::TaskResume LockStripes(const std::set<clio::run::u64> &slots);
+
+  /** Release stripes taken by TryLockStripes/LockStripes. */
+  void UnlockStripes(const std::set<clio::run::u64> &slots);
+
+  /**
+   * Encode stripe `s`'s parity from its current data chunks and write every
+   * active parity shard; on success record the member set it was encoded
+   * over (encoded_) and clear the slot's dirty mark unless a write
+   * re-dirtied it meanwhile. The caller must hold the stripe.
+   * @param s the stripe (slot)
+   * @param ok false if a data member is down or any read/write failed
+   */
+  clio::run::TaskResume EncodeStripe(clio::run::u64 s, bool &ok);
+
+  /** @return the number of members (data + parity) not serving I/O. */
+  clio::run::u32 CountDownMembers() const {
+    clio::run::u32 n = 0;
+    for (const auto &m : data_members_) {
+      if (m.state_.Load() != ec::EcState::kActive) ++n;
     }
+    for (const auto &m : parity_members_) {
+      if (m.state_.Load() != ec::EcState::kActive) ++n;
+    }
+    return n;
   }
 
   //==========================================================================
@@ -628,18 +899,36 @@ class Runtime : public clio::run::Container {
                                   clio::run::u64 len, bool &ok);
 
   /**
-   * Reconstruct ALL k_s data chunks of stripe `s` from active survivors
-   * (DecodeData under the width-k_s code), optionally excluding data member
-   * `exclude_member`. `stripe` is StripeMembers(s) (the sorted data-member
-   * indices in this stripe); `out` receives k_s buffers of kChunkLen bytes
-   * indexed by stripe POSITION (shard index). Returns false on too few
+   * Reconstruct ALL k_s data chunks of stripe `s`: the members its parity
+   * encodes (encoded_) are decoded from active survivors under that set's
+   * code, not reading the data members in `exclude` (their on-disk chunks
+   * are not usable); a member the parity has not seen yet (allocated since)
+   * holds no data the parity could give back, so its chunk is read as it is
+   * on disk (zeros if it is down). `stripe` is StripeMembers(s) (the sorted
+   * data-member indices in this stripe); `out` receives k_s buffers of
+   * kChunkLen bytes indexed by stripe POSITION. Returns false on too few
    * survivors.
    */
   clio::run::TaskResume ReconstructStripe(clio::run::u64 s,
-                                    const std::vector<int> &stripe,
-                                    int exclude_member,
-                                    std::vector<std::vector<uint8_t>> &out,
-                                    bool &ok);
+                                          const std::vector<int> &stripe,
+                                          const std::vector<int> &exclude,
+                                          std::vector<std::vector<uint8_t>> &out,
+                                          bool &ok);
+  /**
+   * Read up to k = code.size() usable shards of slot `s`: data members of
+   * the encoded set `code` that are active and not in `exclude`, then
+   * active parity members.
+   * @param s slot
+   * @param code the data members the slot's parity encodes
+   * @param exclude data members not to read
+   * @param idx receives each shard's RS index (code position, or k + row)
+   * @param bufs receives the shards
+   */
+  clio::run::TaskResume GatherSurvivors(clio::run::u64 s,
+                                        const std::vector<int> &code,
+                                        const std::vector<int> &exclude,
+                                        std::vector<int> &idx,
+                                        std::vector<std::vector<uint8_t>> &bufs);
 
   /**
    * Serialize this array's identity for a member into a zero-padded
@@ -705,6 +994,106 @@ class Runtime : public clio::run::Container {
     std::vector<int> members;                  // StripeMembers(s)
     std::vector<std::vector<uint8_t>> chunks;  // by stripe position
   };
+  /** One piece of a Write that falls inside a single chunk. */
+  struct WritePiece {
+    clio::run::u64 slot;     // stripe (slot) it lands in
+    clio::run::u32 member;   // data member d
+    clio::run::u64 within;   // offset inside the chunk
+    clio::run::u64 len;      // bytes
+    clio::run::u64 buf_off;  // offset in the task's data buffer
+  };
+  /** The member writes one Write dispatched (index-aligned vectors). */
+  struct MemberWrites {
+    std::vector<clio::run::Future<WriteTask>> futs;
+    std::vector<size_t> members;                // data member of each future
+    std::vector<ctp::ipc::FullPtr<char>> bufs;  // staging buffers to free
+    std::set<clio::run::u64> touched;           // slots whose data changes
+    clio::run::u64 bytes = 0;                   // bytes the write covers
+  };
+  /**
+   * @param task a Write
+   * @return false (logged) if a block decodes to a member that does not exist
+   */
+  bool BlocksInRange(const WriteTask &task) const;
+  /**
+   * Stage and send one AsyncWrite per block to its member, skipping blocks
+   * on down members (their bytes live in the parity).
+   * @param task the write
+   * @param data its buffer
+   * @param mw receives the dispatched writes
+   * @return false if a staging buffer could not be allocated
+   */
+  bool DispatchMemberWrites(const WriteTask &task, const char *data,
+                            MemberWrites &mw);
+  /**
+   * The body of a Write once its stripes are held and logged dirty: land the
+   * data (degraded stripes reconstructed and re-encoded), then encode the
+   * parity of every healthy stripe it changed.
+   * @param task the write
+   * @param pieces the write split per stripe/member (SplitWrite)
+   * @param data the write's bytes
+   * @param ok false if the write must be failed
+   * @param clean stripes whose parity is current afterwards (log them clean)
+   */
+  clio::run::TaskResume WriteStripes(clio::run::shared_ptr<WriteTask> &task,
+                                     const std::vector<WritePiece> &pieces,
+                                     const char *data, bool &ok,
+                                     std::set<clio::run::u64> &clean);
+  /**
+   * Await a Write's member writes and free their staging buffers. A member
+   * whose write failed is faulted unless the error was transient.
+   * @param mw the dispatched writes
+   * @param any_failed set true if a member failed and was faulted
+   * @param ok set false if a member failed transiently (still active)
+   */
+  clio::run::TaskResume AwaitMemberWrites(MemberWrites &mw, bool &any_failed,
+                                          bool &ok);
+  /**
+   * Split a Write's blocks into per-chunk pieces.
+   * @param task the write
+   * @return one WritePiece per (block, chunk) intersection, in buffer order
+   */
+  std::vector<WritePiece> SplitWrite(const WriteTask &task) const;
+  /**
+   * Copy every byte the write puts in stripe `s` into its chunks.
+   * @param s slot
+   * @param pieces the write's pieces
+   * @param data the write's buffer
+   * @param st the stripe to overlay
+   */
+  static void OverlayPieces(clio::run::u64 s,
+                            const std::vector<WritePiece> &pieces,
+                            const char *data, DegradedStripe &st);
+  /**
+   * Whether a down member of stripe `s` needs a byte (inside its live
+   * length, not rewritten by this write) at a position this write already
+   * changed on a surviving member: the parity can then not produce it.
+   * @param s slot
+   * @param st the stripe (members)
+   * @param need_len live bytes of each stripe position's chunk
+   * @param pieces the write's pieces
+   * @return true if so (logged)
+   */
+  bool DownBytesClobbered(clio::run::u64 s, const DegradedStripe &st,
+                          const std::vector<clio::run::u64> &need_len,
+                          const std::vector<WritePiece> &pieces) const;
+  /**
+   * A member write of this request failed and the member was faulted after
+   * its siblings in the same stripe had already landed: redo stripe `s`
+   * degraded. The old stripe is decoded from the members this write left
+   * untouched and the parity (current: the slot was clean), overlaid with
+   * this write's bytes, and the parity re-encoded over it. With too many
+   * erasures for that, falls back to decoding from the survivors as they
+   * are, and fails (never guesses) when a byte a down member still needs
+   * was overwritten on a survivor by this same write.
+   * @param s slot
+   * @param pieces the write's pieces
+   * @param data the write's buffer
+   * @param ok receives success
+   */
+  clio::run::TaskResume RetryStripeDegraded(
+      clio::run::u64 s, const std::vector<WritePiece> &pieces,
+      const char *data, bool &ok);
   /**
    * Reconstruct stripe `s` for a degraded write. Refuses (ok=false) when its
    * parity is stale: the down member's bytes would then exist nowhere.
@@ -723,6 +1112,25 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume StoreDegradedParity(clio::run::u64 s,
                                             const DegradedStripe &st,
                                             bool &ok);
+  /** @return data members of stripe `st` that are down. */
+  clio::run::u32 DownInStripe(const DegradedStripe &st) const {
+    clio::run::u32 n = 0;
+    for (int d : st.members) {
+      if (!DataActive(static_cast<size_t>(d))) ++n;
+    }
+    return n;
+  }
+  /**
+   * Read one block of a Read request from down member `d`'s stripes by
+   * reconstruction, chunk by chunk.
+   * @param off logical offset of the block
+   * @param len its length
+   * @param dst destination
+   * @param ok receives success
+   */
+  clio::run::TaskResume ReadBlockDegraded(clio::run::u64 off,
+                                          clio::run::u64 len, char *dst,
+                                          bool &ok);
 
   /** One data column to seat at Create: where it is and what state the
    *  manifest left it in. */
@@ -755,6 +1163,29 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume SeatDataMember(DataSeatSpec spec, int col,
                                        clio::run::u32 &rc);
+  /**
+   * Seat the parity columns at Create: from the manifest when it records
+   * any (it is the truth: recoveries, faulty members), else from the
+   * configured members marked `parity: true`.
+   * @param params Create parameters
+   * @param manifest_parity manifest parity entries, sorted by row
+   * @param rc receives 0, or the Create return code (1 I/O, 2 foreign,
+   *           3 more parity members than max_failures)
+   */
+  clio::run::TaskResume SeatParityMembers(
+      const CreateParams &params,
+      const std::vector<MemberManifestEntry> &manifest_parity,
+      clio::run::u32 &rc);
+  /**
+   * Seat one configured (`parity: true`) parity column: stamp a fresh
+   * device, re-attach our own, refuse a foreign one.
+   * @param desc the member
+   * @param rc receives 0, 1 (I/O) or 2 (foreign)
+   * @param fresh receives true if its superblock was just written (its
+   *              parity is not built yet)
+   */
+  clio::run::TaskResume SeatConfigParity(MemberBdevDesc desc,
+                                         clio::run::u32 &rc, bool &fresh);
 
   /** Reconstruct + write EVERY slot this member participates in onto its
    *  (already-seated) client. Idempotent: safe to re-run after an interrupted

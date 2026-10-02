@@ -171,14 +171,23 @@ compose:
   #   # block is handed out twice. `clio_run start --fresh` discards the log.
   #   # Setting alloc_log moves the log and makes even --fresh recover it.
   #   # alloc_log: "/mnt/nvme/chi_bdev.alloc_log"
+  #   # TEST-ONLY fault injection (no config key): while a file named
+  #   # "<pool_name>.fail" exists, every read, write and sync of this device
+  #   # fails with an I/O error, as a dead disk would; delete the file and it
+  #   # works again. Checked at most every 100 ms; off unless the file exists.
 
   # === Safe Block Device (erasure-coded array over member bdevs) ===
   # One logical device over several member bdevs (disks): data members plus
   # up to max_failures dedicated Reed-Solomon parity members. Members are
   # bdev pools created before it (above); more can be added at runtime
-  # (AddBdev), failed ones rebuilt onto new disks (RecoverBdev). With
+  # (AddBdev), failed ones rebuilt onto new disks (RecoverBdev). A member
+  # whose I/O fails at runtime is marked faulty (logged once, shown in
+  # Monitor "stats"): reads reconstruct its chunks from the survivors +
+  # parity and writes go degraded; past max_failures faulty members, requests
+  # that need them fail with an I/O error, never wrong bytes. With
   # alloc_log set, the array's membership -- including members added or
-  # replaced at runtime -- is restored from "<alloc_log>.members" at restart.
+  # replaced at runtime, and faulty members -- is restored from
+  # "<alloc_log>.members" at restart.
   # - mod_name: clio_safe_bdev
   #   pool_name: safe_array
   #   pool_query: local
@@ -196,6 +205,24 @@ compose:
   #       node_id: 0
   #       pool_id_major: 301
   #       pool_id_minor: 0
+  #     - pool_name: "/mnt/nvme/disk1.bin"
+  #       node_id: 0
+  #       pool_id_major: 302
+  #       pool_id_minor: 0
+  #       parity: true              # default: false. Seat this member as a
+  #                                 # PARITY column (at most max_failures
+  #                                 # members may be); false: a DATA column.
+  #                                 # Parity can also be added at runtime
+  #                                 # with AddBdev(as_parity).
+  #
+  # Durability (no config key): a write is acknowledged only after every
+  # stripe it changed has current parity on the parity members, so a disk
+  # that dies at any later moment can always be rebuilt. With alloc_log
+  # set, each write first records its stripes as "dirty" in the log (one
+  # fsync of the log per write); if the process dies between the data and
+  # the parity, restart re-encodes exactly those stripes and refuses to
+  # reconstruct from them until it has. Sync (the CTE's fsync of the tier)
+  # encodes any stripe still dirty, syncs every active member and the log.
 
   # === Context Assimilation Engine (CAE) ===
   # Assimilation / discovery entrypoint at its own pool 400.0

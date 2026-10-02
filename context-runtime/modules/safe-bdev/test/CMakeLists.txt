@@ -199,3 +199,48 @@ set_target_properties(clio_safe_bdev_dist_stress PROPERTIES
   CXX_STANDARD_REQUIRED ON
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+
+# Member disks that fail at RUNTIME (issue #1117): the file bdev's test-only
+# "<file>.fail" marker kills a member mid-run; the array must fault it, serve
+# every byte degraded, keep it faulty across a restart, rebuild onto a fresh
+# disk, and past max_failures return errors -- never wrong bytes. The array is
+# composed from YAML with `parity: true` members (4 data + 2 parity).
+set(SAFE_BDEV_DISK_FAIL_TARGET clio_safe_bdev_disk_fail_tests)
+add_executable(${SAFE_BDEV_DISK_FAIL_TARGET} test_safe_bdev_disk_fail.cc)
+target_include_directories(${SAFE_BDEV_DISK_FAIL_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test
+  ${CLIO_RUN_ROOT}/modules/admin/include
+  ${CLIO_RUN_ROOT}/modules/bdev/include
+  ${CLIO_RUN_ROOT}/modules/safe-bdev/include
+)
+target_link_libraries(${SAFE_BDEV_DISK_FAIL_TARGET}
+  clio_admin_runtime
+  clio_admin_client
+  clio_bdev_runtime
+  clio_bdev_client
+  clio_safe_bdev_runtime
+  clio_safe_bdev_client
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+set_target_properties(${SAFE_BDEV_DISK_FAIL_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+install(TARGETS ${SAFE_BDEV_DISK_FAIL_TARGET}
+  RUNTIME DESTINATION bin
+)
+if(CLIO_CORE_ENABLE_TESTS)
+  add_test(
+    NAME cr_safe_bdev_disk_fail_tests
+    COMMAND ${SAFE_BDEV_DISK_FAIL_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_safe_bdev_disk_fail_tests PROPERTIES
+    TIMEOUT 300
+    LABELS "msan_skip"
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10503"
+  )
+endif()

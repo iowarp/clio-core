@@ -1,0 +1,804 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/**
+ * Member disks that FAIL AT RUNTIME (issue #1117).
+ *
+ * The file bdev's test-only fault injection makes a member's every I/O fail
+ * while "<backing file>.fail" exists. Over a 6-disk array (4 data + 2 parity,
+ * max_failures 2, composed from YAML with `parity: true` members) these tests
+ * check that a disk dying mid-run is marked faulty by the I/O that hits it,
+ * that the request is retried degraded (reads reconstruct, writes go to the
+ * survivors + parity), that a restart keeps the member faulty, that
+ * RecoverBdev restores full redundancy, and that past max_failures requests
+ * fail -- never return wrong bytes.
+ */
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "simple_test.h"
+
+using namespace std::chrono_literals;
+
+#include <clio_runtime/admin/admin_client.h>
+#include <clio_runtime/admin/admin_tasks.h>
+#include <clio_runtime/bdev/bdev_client.h>
+#include <clio_runtime/bdev/bdev_tasks.h>
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/pool_query.h>
+#include <clio_runtime/safe_bdev/safe_bdev_client.h>
+#include <clio_runtime/safe_bdev/safe_bdev_tasks.h>
+#include <clio_runtime/singletons.h>
+#include <clio_ctp/serialize/msgpack_wrapper.h>
+
+namespace {
+
+namespace fs = std::filesystem;
+using clio::run::bdev::Block;
+using clio::run::safe_bdev::MemberBdevDesc;
+
+bool g_initialized = false;
+
+constexpr clio::run::u64 kChunkLen = 65536;               // Runtime::kChunkLen
+constexpr clio::run::u64 kMemberSize = 4 * 1024 * 1024;   // per member disk
+constexpr int kDataMembers = 4;
+constexpr int kParityMembers = 2;
+constexpr int kMembers = kDataMembers + kParityMembers;
+/** Longer than the file bdev's 100 ms marker re-check period. */
+constexpr auto kMarkerSettle = 300ms;
+
+/** Start the embedded runtime once per process. */
+void EnsureInit() {
+  if (g_initialized) return;
+  g_initialized = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
+  if (g_initialized) {
+    SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
+    std::this_thread::sleep_for(500ms);
+  }
+}
+
+/**
+ * Per-user, per-process scratch directory for member files and logs.
+ * $CLIO_SAFE_STRESS_DIR overrides the system temp directory.
+ * @param tag names the test's own subdirectory
+ * @return the directory (created)
+ */
+fs::path ScratchDir(const std::string &tag) {
+  const char *e = std::getenv("CLIO_SAFE_STRESS_DIR");
+  const char *user = std::getenv("USER");
+  fs::path d = (e != nullptr ? fs::path(e) : fs::temp_directory_path()) /
+               ("safe_disk_fail_" + std::string(user ? user : "u") + "_" +
+                std::to_string(getpid()) + "_" + tag);
+  fs::create_directories(d);
+  return d;
+}
+
+/** Make member file `path` fail every I/O (dead disk). */
+void KillDisk(const std::string &path) {
+  std::ofstream(path + ".fail").put('x');
+  std::this_thread::sleep_for(kMarkerSettle);
+}
+
+/** Make member file `path` work again. */
+void ReviveDisk(const std::string &path) {
+  std::error_code ec;
+  fs::remove(path + ".fail", ec);
+  std::this_thread::sleep_for(kMarkerSettle);
+}
+
+/**
+ * Create a file-backed bdev pool (a "disk").
+ * @param path backing file (also the pool name)
+ * @param id pool id to use
+ * @return the created pool id (null on failure)
+ */
+clio::run::PoolId CreateDisk(const std::string &path,
+                             const clio::run::PoolId &id) {
+  clio::run::bdev::Client client(id);
+  // A 4 KiB growth unit keeps the backing file only as long as what was
+  // written, as a large member (capacity beyond the default 1 GiB unit) is
+  // in a real deployment: reads of never-written chunk tails then land past
+  // EOF and must still come back as zeros, not as a failing disk.
+  auto t = client.AsyncCreate(clio::run::PoolQuery::Dynamic(), path, id,
+                              clio::run::bdev::BdevType::kFile, kMemberSize,
+                              /*io_depth=*/32, /*alignment=*/4096,
+                              /*perf_metrics=*/nullptr, /*alloc_log_path=*/"",
+                              /*growth_unit=*/4096);
+  t.Wait();
+  if (t->GetReturnCode() != 0) return clio::run::PoolId();
+  return t->new_pool_id_;
+}
+
+/** Copy a block list into a runtime priv::vector. */
+clio::run::priv::vector<Block> ToPriv(const std::vector<Block> &blocks) {
+  clio::run::priv::vector<Block> v(CTP_MALLOC);
+  for (const auto &b : blocks) v.push_back(b);
+  return v;
+}
+
+/** @return total bytes covered by `blocks`. */
+clio::run::u64 BlocksLen(const std::vector<Block> &blocks) {
+  clio::run::u64 n = 0;
+  for (const auto &b : blocks) n += b.size_;
+  return n;
+}
+
+/** Deterministic pattern. */
+std::vector<ctp::u8> Pattern(size_t n, ctp::u8 seed) {
+  std::vector<ctp::u8> v(n);
+  for (size_t i = 0; i < n; ++i) {
+    v[i] = static_cast<ctp::u8>((seed * 31u + i * 7u + (i >> 10)) & 0xFF);
+  }
+  return v;
+}
+
+/** Allocate `len` bytes on the array. */
+std::vector<Block> Alloc(clio::run::safe_bdev::Client &safe,
+                         clio::run::u64 len) {
+  auto t = safe.AsyncAllocateBlocks(clio::run::PoolQuery::Dynamic(), len);
+  t.Wait();
+  REQUIRE(t->GetReturnCode() == 0);
+  std::vector<Block> v;
+  for (size_t i = 0; i < t->blocks_.size(); ++i) v.push_back(t->blocks_[i]);
+  return v;
+}
+
+/**
+ * Write `data` across `blocks`.
+ * @return the write's return code (0 = every byte stored)
+ */
+clio::run::u32 Write(clio::run::safe_bdev::Client &safe,
+                     const std::vector<Block> &blocks,
+                     const std::vector<ctp::u8> &data) {
+  auto buf = CLIO_IPC->AllocateBuffer(data.size());
+  REQUIRE_FALSE(buf.IsNull());
+  memcpy(buf.ptr_, data.data(), data.size());
+  auto t = safe.AsyncWrite(clio::run::PoolQuery::Dynamic(), ToPriv(blocks),
+                           buf.shm_.template Cast<void>(), data.size());
+  t.Wait();
+  clio::run::u32 rc = t->GetReturnCode();
+  if (rc == 0 && t->bytes_written_ != data.size()) rc = 999;
+  CLIO_IPC->FreeBuffer(buf);
+  return rc;
+}
+
+/**
+ * Read `blocks` into `out`.
+ * @return the read's return code (0 = every byte returned)
+ */
+clio::run::u32 Read(clio::run::safe_bdev::Client &safe,
+                    const std::vector<Block> &blocks,
+                    std::vector<ctp::u8> &out) {
+  const clio::run::u64 len = BlocksLen(blocks);
+  auto buf = CLIO_IPC->AllocateBuffer(len);
+  REQUIRE_FALSE(buf.IsNull());
+  memset(buf.ptr_, 0, len);
+  auto t = safe.AsyncRead(clio::run::PoolQuery::Dynamic(), ToPriv(blocks),
+                          buf.shm_.template Cast<void>(), len);
+  t.Wait();
+  clio::run::u32 rc = t->GetReturnCode();
+  if (rc == 0 && t->bytes_read_ != len) rc = 999;
+  out.assign(buf.ptr_, buf.ptr_ + len);
+  CLIO_IPC->FreeBuffer(buf);
+  return rc;
+}
+
+/** Drain the async parity builder (durability barrier). */
+void FlushParity(clio::run::safe_bdev::Client &safe) {
+  auto t = safe.AsyncBuildParity(clio::run::PoolQuery::Dynamic(), 0);
+  t.Wait();
+  REQUIRE(t->GetReturnCode() == 0);
+}
+
+/** One member as Monitor("stats") reports it. */
+struct MemberView {
+  std::string role;
+  clio::run::u32 index = 0;
+  std::string state;
+};
+
+/** Array state from Monitor("stats"). */
+struct ArrayView {
+  long data_count = -1;
+  long parity_level = -1;
+  long faulty_members = -1;
+  long dirty_slots = -1;
+  std::vector<MemberView> members;
+};
+
+/** Query Monitor("stats"). */
+ArrayView QueryArray(clio::run::safe_bdev::Client &safe) {
+  ArrayView v;
+  auto mon = safe.AsyncMonitor(clio::run::PoolQuery::Dynamic(), "stats");
+  mon.Wait();
+  REQUIRE(mon->GetReturnCode() == 0);
+  for (const auto &kv : mon->results_) {
+    if (kv.second.empty()) continue;
+    msgpack::object_handle oh = msgpack::unpack(kv.second.data(),
+                                                kv.second.size());
+    const msgpack::object &obj = oh.get();
+    if (obj.type != msgpack::type::MAP) continue;
+    for (uint32_t j = 0; j < obj.via.map.size; ++j) {
+      const auto &e = obj.via.map.ptr[j];
+      std::string key;
+      e.key.convert(key);
+      if (key == "data_count") e.val.convert(v.data_count);
+      if (key == "parity_level") e.val.convert(v.parity_level);
+      if (key == "faulty_members") e.val.convert(v.faulty_members);
+      if (key == "dirty_slots") e.val.convert(v.dirty_slots);
+      if (key != "members" || e.val.type != msgpack::type::ARRAY) continue;
+      for (uint32_t m = 0; m < e.val.via.array.size; ++m) {
+        const msgpack::object &mo = e.val.via.array.ptr[m];
+        MemberView mv;
+        for (uint32_t f = 0; f < mo.via.map.size; ++f) {
+          std::string fk;
+          mo.via.map.ptr[f].key.convert(fk);
+          if (fk == "role") mo.via.map.ptr[f].val.convert(mv.role);
+          if (fk == "index") mo.via.map.ptr[f].val.convert(mv.index);
+          if (fk == "state") mo.via.map.ptr[f].val.convert(mv.state);
+        }
+        v.members.push_back(mv);
+      }
+    }
+  }
+  return v;
+}
+
+/** @return Monitor's state string for one member ("" if absent). */
+std::string MemberState(const ArrayView &v, const std::string &role,
+                        clio::run::u32 index) {
+  for (const auto &m : v.members) {
+    if (m.role == role && m.index == index) return m.state;
+  }
+  return "";
+}
+
+/** The 6-disk array under test and the bytes it should hold. */
+struct Rig {
+  fs::path dir;
+  std::vector<std::string> paths;          // data 0..3, parity 0..1
+  std::vector<clio::run::PoolId> ids;      // index-aligned with paths
+  clio::run::PoolId safe_id;
+  std::string alloc_log;
+  clio::run::safe_bdev::CreateParams params;
+  clio::run::safe_bdev::Client safe;
+  /** Everything written so far: (blocks, bytes). */
+  std::vector<std::pair<std::vector<Block>, std::vector<ctp::u8>>> sets;
+
+  /**
+   * Create the disks and compose the array from YAML (4 data members and
+   * 2 `parity: true` members, max_failures 2).
+   * @param tag distinguishes rigs (file names, pool ids)
+   * @param id_base pool-id major of the first disk
+   */
+  void Build(const std::string &tag, clio::run::u32 id_base) {
+    dir = ScratchDir(tag);
+    alloc_log = (dir / (tag + ".alog")).string();
+    std::error_code ec;
+    fs::remove(alloc_log, ec);
+    fs::remove(alloc_log + ".members", ec);
+    std::string yaml = "max_failures: 2\nalloc_log: \"" + alloc_log +
+                       "\"\nmembers:\n";
+    for (int i = 0; i < kMembers; ++i) {
+      const std::string p = (dir / (tag + "_disk" + std::to_string(i) +
+                                    ".bin")).string();
+      fs::remove(p, ec);
+      fs::remove(p + ".fail", ec);
+      fs::remove(p + ".alloc_log", ec);
+      const clio::run::PoolId id = CreateDisk(
+          p, clio::run::PoolId(id_base + static_cast<clio::run::u32>(i), 0));
+      REQUIRE_FALSE(id.IsNull());
+      paths.push_back(p);
+      ids.push_back(id);
+      yaml += "  - pool_name: \"" + p + "\"\n    node_id: 0\n" +
+              "    pool_id_major: " + std::to_string(id.major_) + "\n" +
+              "    pool_id_minor: " + std::to_string(id.minor_) + "\n";
+      if (i >= kDataMembers) yaml += "    parity: true\n";
+    }
+    clio::run::PoolConfig pc;
+    pc.config_ = yaml;
+    params.LoadConfig(pc);
+    int n_parity = 0;
+    for (const auto &m : params.members_) n_parity += m.parity_ ? 1 : 0;
+    REQUIRE(params.members_.size() == static_cast<size_t>(kMembers));
+    REQUIRE(n_parity == kParityMembers);
+    REQUIRE(params.max_failures_ == 2u);
+    REQUIRE(params.alloc_log_path_ == alloc_log);
+    safe_id = clio::run::PoolId(id_base + 50, 0);
+    Create();
+  }
+
+  /** (Re)create the safe_bdev pool from `params`. */
+  void Create() {
+    safe = clio::run::safe_bdev::Client(safe_id);
+    auto t = safe.AsyncCreate(clio::run::PoolQuery::Dynamic(),
+                              "safe_disk_fail_" + safe_id.ToString(), safe_id,
+                              params.max_failures_, params.members_,
+                              params.alloc_log_path_);
+    t.Wait();
+    REQUIRE(t->GetReturnCode() == 0);
+    safe.pool_id_ = t->new_pool_id_;
+  }
+
+  /** Stop the array (its member disks stay), as a shutdown would. */
+  void Shutdown() {
+    auto fl = safe.AsyncFlushAllocLog(clio::run::PoolQuery::Dynamic(), 0);
+    fl.Wait();
+    REQUIRE(fl->GetReturnCode() == 0);
+    clio::run::admin::Client admin(clio::run::kAdminPoolId);
+    auto d = admin.AsyncDestroyPool(clio::run::PoolQuery::Dynamic(),
+                                    safe.pool_id_);
+    d.Wait();
+    REQUIRE(d->GetReturnCode() == 0);
+    std::this_thread::sleep_for(150ms);
+  }
+
+  /** Write a fresh allocation of `len` bytes and remember it. */
+  void WriteNew(clio::run::u64 len, ctp::u8 seed) {
+    std::vector<Block> b = Alloc(safe, len);
+    std::vector<ctp::u8> d = Pattern(len, seed);
+    REQUIRE(Write(safe, b, d) == 0);
+    sets.emplace_back(b, d);
+  }
+
+  /** Overwrite remembered set `i` with new bytes. */
+  void Rewrite(size_t i, ctp::u8 seed) {
+    std::vector<ctp::u8> d = Pattern(sets[i].second.size(), seed);
+    REQUIRE(Write(safe, sets[i].first, d) == 0);
+    sets[i].second = d;
+  }
+
+  /** Every remembered byte reads back exactly. */
+  void VerifyAll() {
+    for (const auto &s : sets) {
+      std::vector<ctp::u8> got;
+      REQUIRE(Read(safe, s.first, got) == 0);
+      REQUIRE(got == s.second);
+    }
+  }
+
+  /** Remove every fault marker and every file this rig made. */
+  void Cleanup() {
+    std::error_code ec;
+    for (const auto &p : paths) fs::remove(p + ".fail", ec);
+    fs::remove_all(dir, ec);
+  }
+};
+
+/** Bytes per write set: four full stripes plus a half chunk. */
+constexpr clio::run::u64 kSetLen = 16 * kChunkLen + kChunkLen / 2;
+
+}  // namespace
+
+TEST_CASE("safe_bdev_disk_fail_degraded_and_recover",
+          "[safe_bdev][disk_fail]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      21000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("deg", base);
+  ArrayView v = QueryArray(rig.safe);
+  REQUIRE(v.data_count == kDataMembers);
+  REQUIRE(v.parity_level == kParityMembers);
+  REQUIRE(v.faulty_members == 0);
+
+  rig.WriteNew(kSetLen, 1);
+  rig.WriteNew(kSetLen, 2);
+  FlushParity(rig.safe);
+  rig.VerifyAll();
+
+  // --- Disk 1 (data) dies. The read that hits it faults it and is served
+  //     from the survivors + parity. ---
+  KillDisk(rig.paths[1]);
+  rig.VerifyAll();
+  v = QueryArray(rig.safe);
+  REQUIRE(v.faulty_members == 1);
+  REQUIRE(MemberState(v, "data", 1) == "faulty");
+  // Writes go on, degraded: overwrite a set (stripes with the dead disk)
+  // and write new data.
+  rig.Rewrite(0, 11);
+  rig.WriteNew(kSetLen, 3);
+  FlushParity(rig.safe);
+  rig.VerifyAll();
+  HLOG(kInfo, "disk_fail: one data disk down, all bytes served");
+
+  // --- Disk 3 (data) dies; this time a WRITE hits it first. ---
+  KillDisk(rig.paths[3]);
+  rig.Rewrite(1, 12);
+  v = QueryArray(rig.safe);
+  REQUIRE(v.faulty_members == 2);
+  REQUIRE(MemberState(v, "data", 3) == "faulty");
+  rig.WriteNew(kSetLen, 4);
+  FlushParity(rig.safe);
+  rig.VerifyAll();
+  HLOG(kInfo, "disk_fail: two data disks down, all bytes served");
+
+  // --- The disks are replaced: rebuild both onto fresh disks. ---
+  ReviveDisk(rig.paths[1]);
+  ReviveDisk(rig.paths[3]);
+  for (int dead : {1, 3}) {
+    const std::string np = (rig.dir / ("deg_new" + std::to_string(dead) +
+                                       ".bin")).string();
+    const clio::run::PoolId nid = CreateDisk(
+        np, clio::run::PoolId(base + 10 + static_cast<clio::run::u32>(dead),
+                              0));
+    REQUIRE_FALSE(nid.IsNull());
+    auto rec = rig.safe.AsyncRecoverBdev(clio::run::PoolQuery::Dynamic(),
+                                         rig.ids[dead], np, 0, nid);
+    rec.Wait();
+    REQUIRE(rec->GetReturnCode() == 0);
+    rig.paths[dead] = np;
+    rig.ids[dead] = nid;
+  }
+  v = QueryArray(rig.safe);
+  REQUIRE(v.faulty_members == 0);
+  rig.VerifyAll();
+
+  // Full redundancy again: any two disks may die, here a data and a parity.
+  KillDisk(rig.paths[0]);
+  KillDisk(rig.paths[kDataMembers]);  // parity row 0
+  rig.VerifyAll();
+  v = QueryArray(rig.safe);
+  REQUIRE(v.faulty_members == 2);
+  REQUIRE(MemberState(v, "data", 0) == "faulty");
+  REQUIRE(MemberState(v, "parity", 0) == "faulty");
+  rig.WriteNew(kSetLen, 6);
+  FlushParity(rig.safe);
+  rig.VerifyAll();
+  HLOG(kInfo, "disk_fail: recovered array survives two more failures");
+
+  // --- A third disk dies: past max_failures. Requests that need it fail;
+  //     none returns wrong bytes. ---
+  KillDisk(rig.paths[2]);
+  int failed_reads = 0;
+  for (const auto &s : rig.sets) {
+    std::vector<ctp::u8> got;
+    if (Read(rig.safe, s.first, got) == 0) {
+      REQUIRE(got == s.second);
+    } else {
+      ++failed_reads;
+    }
+  }
+  REQUIRE(failed_reads > 0);
+  // Every chunk still on a live disk reads back exactly, one block at a time.
+  int good_chunks = 0;
+  for (const auto &s : rig.sets) {
+    clio::run::u64 pos = 0;
+    for (const Block &b : s.first) {
+      std::vector<ctp::u8> got;
+      if (Read(rig.safe, {b}, got) == 0) {
+        REQUIRE(std::equal(got.begin(), got.end(), s.second.begin() + pos));
+        ++good_chunks;
+      }
+      pos += b.size_;
+    }
+  }
+  REQUIRE(good_chunks > 0);
+  // A write into stripes that lost three members fails.
+  REQUIRE(Write(rig.safe, rig.sets[0].first,
+                Pattern(rig.sets[0].second.size(), 99)) != 0);
+  HLOG(kInfo, "disk_fail: 3 of 2 tolerated failures -> errors, never wrong "
+       "bytes ({} whole-set reads failed, {} chunks still served)",
+       failed_reads, good_chunks);
+  rig.Cleanup();
+}
+
+TEST_CASE("safe_bdev_disk_fail_restart_keeps_faulty",
+          "[safe_bdev][disk_fail][restart]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      26000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("rst", base);
+  rig.WriteNew(kSetLen, 21);
+  rig.WriteNew(kSetLen, 22);
+  FlushParity(rig.safe);
+
+  // Disk 2 dies at runtime and the first request to hit it is a WRITE to
+  // healthy stripes: its member write fails after the other members' writes
+  // landed. The write still succeeds -- its stripes are redone degraded --
+  // and every byte, old and new, reads back.
+  KillDisk(rig.paths[2]);
+  rig.WriteNew(kSetLen, 23);
+  REQUIRE(MemberState(QueryArray(rig.safe), "data", 2) == "faulty");
+  FlushParity(rig.safe);
+  rig.VerifyAll();
+
+  // Restart: the array comes back with the member still faulty, from the
+  // member manifest -- even though its disk now answers again.
+  rig.Shutdown();
+  ReviveDisk(rig.paths[2]);
+  rig.Create();
+  ArrayView v = QueryArray(rig.safe);
+  REQUIRE(v.data_count == kDataMembers);
+  REQUIRE(v.parity_level == kParityMembers);
+  REQUIRE(v.faulty_members == 1);
+  REQUIRE(MemberState(v, "data", 2) == "faulty");
+  rig.VerifyAll();
+  rig.WriteNew(kSetLen, 24);
+  FlushParity(rig.safe);
+  rig.VerifyAll();
+
+  // Replacing it restores the array.
+  const std::string np = (rig.dir / "rst_new2.bin").string();
+  const clio::run::PoolId nid =
+      CreateDisk(np, clio::run::PoolId(base + 20, 0));
+  REQUIRE_FALSE(nid.IsNull());
+  auto rec = rig.safe.AsyncRecoverBdev(clio::run::PoolQuery::Dynamic(),
+                                       rig.ids[2], np, 0, nid);
+  rec.Wait();
+  REQUIRE(rec->GetReturnCode() == 0);
+  REQUIRE(QueryArray(rig.safe).faulty_members == 0);
+  rig.VerifyAll();
+  rig.Cleanup();
+}
+
+TEST_CASE("safe_bdev_compose_parity_members_limit",
+          "[safe_bdev][disk_fail][compose]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  // More `parity: true` members than max_failures: Create refuses.
+  const clio::run::u32 base =
+      31000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  const fs::path dir = ScratchDir("lim");
+  std::vector<MemberBdevDesc> members;
+  for (int i = 0; i < 3; ++i) {
+    const std::string p =
+        (dir / ("lim_disk" + std::to_string(i) + ".bin")).string();
+    const clio::run::PoolId id =
+        CreateDisk(p, clio::run::PoolId(base + static_cast<clio::run::u32>(i),
+                                        0));
+    REQUIRE_FALSE(id.IsNull());
+    members.emplace_back(p, 0, id, /*parity=*/i > 0);
+  }
+  const clio::run::PoolId safe_id(base + 3, 0);
+  clio::run::safe_bdev::Client safe(safe_id);
+  auto t = safe.AsyncCreate(clio::run::PoolQuery::Dynamic(), "safe_lim",
+                            safe_id, /*max_failures=*/1, members);
+  t.Wait();
+  REQUIRE(t->GetReturnCode() != 0);
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+TEST_CASE("safe_bdev_sync_through_plain_bdev_client",
+          "[safe_bdev][disk_fail][sync]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      36000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("syn", base);
+  rig.WriteNew(kSetLen, 31);
+  rig.WriteNew(kSetLen, 32);
+  // The CTE fsyncs a tier through the PLAIN bdev client (#1120): method 18
+  // must be the array's Sync, not one of its management methods.
+  clio::run::bdev::Client plain(rig.safe.pool_id_);
+  auto t = plain.AsyncSync(clio::run::PoolQuery::Dynamic());
+  t.Wait();
+  REQUIRE(t->GetReturnCode() == 0);
+  ArrayView v = QueryArray(rig.safe);
+  REQUIRE(v.dirty_slots == 0);
+  REQUIRE(v.faulty_members == 0);
+  REQUIRE(v.data_count == kDataMembers);
+  rig.VerifyAll();
+  rig.Cleanup();
+}
+
+TEST_CASE("safe_bdev_parity_current_when_write_acks",
+          "[safe_bdev][disk_fail][sync]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      41000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("ack", base);
+  // No FlushParity anywhere: every acked write must already be protected.
+  for (int i = 0; i < 4; ++i) {
+    rig.WriteNew(kSetLen, static_cast<ctp::u8>(40 + i));
+    REQUIRE(QueryArray(rig.safe).dirty_slots == 0);
+  }
+  // Single-chunk writes from several threads at once. Consecutive chunks go
+  // to different members' same slot, so these share stripes and race on
+  // their parity (#1121).
+  std::vector<std::vector<Block>> blocks;
+  std::vector<std::vector<ctp::u8>> datas;
+  for (int i = 0; i < 16; ++i) {
+    blocks.push_back(Alloc(rig.safe, kChunkLen));
+    datas.push_back(Pattern(kChunkLen, static_cast<ctp::u8>(60 + i)));
+  }
+  std::vector<std::thread> th;
+  std::vector<clio::run::u32> rcs(blocks.size(), 1);
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    th.emplace_back([&, i] { rcs[i] = Write(rig.safe, blocks[i], datas[i]); });
+  }
+  for (auto &x : th) x.join();
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    REQUIRE(rcs[i] == 0);
+    rig.sets.emplace_back(blocks[i], datas[i]);
+  }
+  REQUIRE(QueryArray(rig.safe).dirty_slots == 0);
+  // Two disks die right away: everything acked must come back exactly.
+  KillDisk(rig.paths[0]);
+  KillDisk(rig.paths[kDataMembers + 1]);  // parity row 1
+  rig.VerifyAll();
+  // Reads touch parity only to rebuild the dead data disk, so the dead
+  // parity disk shows up at the next write; that write must succeed too.
+  rig.WriteNew(kSetLen, 90);
+  REQUIRE(QueryArray(rig.safe).faulty_members == 2);
+  rig.VerifyAll();
+  rig.Cleanup();
+}
+
+TEST_CASE("safe_bdev_crash_between_data_and_parity",
+          "[safe_bdev][disk_fail][restart][sync]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      46000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("crs", base);
+  rig.WriteNew(kSetLen, 71);
+  rig.WriteNew(kSetLen, 72);
+  // Overwrite set 0, "crashing" after its data lands but before its parity
+  // does: the stripes' on-disk parity still encodes the OLD bytes.
+  // (The fault also holds off the background builder until the "crash".)
+  setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
+  rig.Rewrite(0, 73);
+  REQUIRE(QueryArray(rig.safe).dirty_slots > 0);
+  rig.Shutdown();
+  unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
+  rig.Create();
+  // Restart re-encodes the stripes the intent log names. Had it trusted the
+  // stale parity, losing a disk would now decode set 0 to wrong bytes.
+  FlushParity(rig.safe);
+  REQUIRE(QueryArray(rig.safe).dirty_slots == 0);
+  KillDisk(rig.paths[1]);
+  KillDisk(rig.paths[2]);
+  rig.VerifyAll();
+  rig.Cleanup();
+}
+
+TEST_CASE("safe_bdev_free_keeps_stripes_protected",
+          "[safe_bdev][disk_fail][restart][sync]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      51000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("fre", base);
+  for (int i = 0; i < 6; ++i) rig.WriteNew(kSetLen, static_cast<ctp::u8>(80 + i));
+  // Free every other set: the stripes they shared with the kept sets narrow.
+  // Nothing may leave those stripes unprotected, not even for a moment.
+  std::vector<std::pair<std::vector<Block>, std::vector<ctp::u8>>> kept;
+  for (size_t i = 0; i < rig.sets.size(); ++i) {
+    if (i % 2 == 0) {
+      auto fr = rig.safe.AsyncFreeBlocks(clio::run::PoolQuery::Dynamic(),
+                                         ToPriv(rig.sets[i].first));
+      fr.Wait();
+      REQUIRE(fr->GetReturnCode() == 0);
+    } else {
+      kept.push_back(rig.sets[i]);
+    }
+  }
+  rig.sets = kept;
+  REQUIRE(QueryArray(rig.safe).dirty_slots == 0);
+  // Restart (the narrowed stripes come back from the intent log), then two
+  // disks die at once with no parity flush in between.
+  rig.Shutdown();
+  rig.Create();
+  FlushParity(rig.safe);
+  KillDisk(rig.paths[1]);
+  KillDisk(rig.paths[3]);
+  rig.VerifyAll();
+  // And without a restart: free more, kill nothing new, overwrite degraded.
+  rig.Rewrite(0, 95);
+  rig.VerifyAll();
+  rig.Cleanup();
+}
+
+TEST_CASE("safe_bdev_write_throughput",
+          "[safe_bdev][disk_fail][perf]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      56000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("thr", base);
+  // Concurrent 128 KiB writes from several threads into separate
+  // allocations, the shape the CTE puts on a tier (#1121 made parity
+  // synchronous; this reports what that costs). Rounds of allocate / write /
+  // verify a sample / free keep it inside the small test members.
+  constexpr int kThreads = 8;
+  constexpr int kPerThread = 6;
+  constexpr int kRounds = 10;
+  constexpr clio::run::u64 kLen = 2 * kChunkLen;
+  double write_ms = 0;
+  for (int r = 0; r < kRounds; ++r) {
+    std::vector<std::vector<std::vector<Block>>> blocks(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+      for (int i = 0; i < kPerThread; ++i) {
+        blocks[t].push_back(Alloc(rig.safe, kLen));
+      }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::thread> th;
+    std::vector<int> bad(kThreads, 0);
+    for (int t = 0; t < kThreads; ++t) {
+      th.emplace_back([&, t] {
+        for (int i = 0; i < kPerThread; ++i) {
+          if (Write(rig.safe, blocks[t][i],
+                    Pattern(kLen, static_cast<ctp::u8>(r + t * 31 + i))) != 0) {
+            ++bad[t];
+          }
+        }
+      });
+    }
+    for (auto &x : th) x.join();
+    write_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+    for (int t = 0; t < kThreads; ++t) {
+      REQUIRE(bad[t] == 0);
+      std::vector<ctp::u8> got;
+      REQUIRE(Read(rig.safe, blocks[t][0], got) == 0);
+      REQUIRE(got == Pattern(kLen, static_cast<ctp::u8>(r + t * 31)));
+      for (auto &b : blocks[t]) {
+        auto fr = rig.safe.AsyncFreeBlocks(clio::run::PoolQuery::Dynamic(),
+                                           ToPriv(b));
+        fr.Wait();
+        REQUIRE(fr->GetReturnCode() == 0);
+      }
+    }
+  }
+  const int nwrites = kThreads * kPerThread * kRounds;
+  const double mib = nwrites * kLen / 1048576.0;
+  HLOG(kInfo, "safe_bdev_write_throughput: {} x {} KiB writes from {} "
+       "threads in {} ms = {} MiB/s ({} ms per write)",
+       nwrites, kLen / 1024, kThreads, write_ms, mib / (write_ms / 1000.0),
+       write_ms / nwrites);
+  rig.Cleanup();
+}
+
+SIMPLE_TEST_MAIN()
