@@ -3308,6 +3308,20 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
     }
+    if (replica_sel == 0 && blob_info_ptr->GetTotalSize() < offset + size) {
+      // A read past the blob's current size is served short and the caller
+      // cannot tell (#1124: a page read short right after a restart reached
+      // the application as zeros inside an fsynced file). Rate-limited.
+      static std::atomic<clio::run::u64> short_reads{0};
+      const clio::run::u64 nshort = short_reads.fetch_add(1) + 1;
+      if (nshort <= 20 || (nshort & (nshort - 1)) == 0) {
+        HLOG(kWarning, "GetBlob: short read #{} of blob '{}' ({}.{}): asked "
+             "[{}, {}), blob size {}, {} block(s)",
+             nshort, blob_name, tag_id.major_, tag_id.minor_, offset,
+             offset + size, blob_info_ptr->GetTotalSize(),
+             blob_info_ptr->blocks_.size());
+      }
+    }
 
     // Snapshot the block layout BEFORE the read I/O. ReadData co_awaits a bdev
     // read per block; a concurrent PutBlob/Truncate (holding the per-blob write

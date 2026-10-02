@@ -1614,6 +1614,16 @@ clio::run::TaskResume Runtime::ReadBlockDegraded(clio::run::u64 off,
     const int pos = static_cast<int>(dd) < static_cast<int>(stripe.size())
                         ? static_cast<int>(dd)
                         : -1;
+    {
+      static std::atomic<clio::run::u64> degraded_reads{0};
+      const clio::run::u64 nd = degraded_reads.fetch_add(1) + 1;
+      if (nd <= 20 || (nd & (nd - 1)) == 0) {
+        // Degraded reads after a disk death / restart (#1124 diagnosis).
+        HLOG(kDebug, "safe_bdev ReadBlockDegraded #{}: slot {} member {} "
+             "within {} len {} dirty {}", nd, s, dd, within, seg_end - cur,
+             IsSlotDirty(s));
+      }
+    }
     std::vector<std::vector<uint8_t>> chunks;
     bool rec_ok = false;
     if (pos >= 0) {

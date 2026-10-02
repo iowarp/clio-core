@@ -701,6 +701,15 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
       // chunk and took it for a failing disk.
       std::memset(static_cast<char *>(block_data) + actual_bytes, 0,
                   block_read_size - actual_bytes);
+      static std::atomic<clio::run::u64> zero_fills{0};
+      const clio::run::u64 nz = zero_fills.fetch_add(1) + 1;
+      if (nz <= 20 || (nz & (nz - 1)) == 0) {
+        // Which reads land past the backed end of a file (#1124 diagnosis).
+        HLOG(kDebug, "bdev ReadBlocks: zero-fill #{} on {}: off {} len {} "
+             "got {} backed {}", nz, file_path_, block.offset_,
+             block_read_size, actual_bytes,
+             file_backed_bytes_.load());
+      }
       actual_bytes = block_read_size;
     }
     total_bytes_read += actual_bytes;
