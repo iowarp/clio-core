@@ -947,6 +947,11 @@ def t_space_accounting(ctx):
     after_rw.append(used_mib())
   time.sleep(10)
   after_rw.append(used_mib())
+  for i in range(len(ctx.hosts)):
+    r = ctx.call(i, 'sh', cmd=f'python3 {tool} {ctx.cl.local_root}/data')
+    ctx.note(f'node{i} live MiB per tier after the overwrites: ' +
+             ((r.get('ret') or {}).get('out') or '').strip().replace(
+                 chr(10), ' | '))
   for k in range(nfiles):
     ctx.ok(0, 'unlink', path=f'{base}/s{k}')
   left = None

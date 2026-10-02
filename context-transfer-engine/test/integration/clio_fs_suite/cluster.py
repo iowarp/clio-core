@@ -247,6 +247,10 @@ class Cluster:
             f'    pool_query: local\n'
             f'    pool_id: "{SAFE_POOL_ID}"\n'
             f'    max_failures: {SAFE_PARITY}\n'
+            # Intents reach the kernel before data, not the disk: the suite
+            # crashes processes (SIGKILL), never power, and the per-write
+            # fsync would make the safe profile 10x slower on small files.
+            f'    intent_sync: false\n'
             f'    alloc_log: "{lr}/data/safe_array.alog"\n'
             f'    members:\n' + members)
     return out

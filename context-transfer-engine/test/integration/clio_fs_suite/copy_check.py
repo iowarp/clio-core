@@ -40,6 +40,8 @@ def main():
   ap.add_argument('--size-mib', type=int, default=1024)
   ap.add_argument('--copies', type=int, default=10)
   ap.add_argument('--tool', default='cp', choices=['cp', 'python'])
+  ap.add_argument('--keep', action='store_true',
+                  help='keep every copy (fills the store with copies x size)')
   args = ap.parse_args()
   make_source(args.src, args.size_mib)
   want = hashlib.sha256()
@@ -80,11 +82,20 @@ def main():
             zero = got.count(0) == len(got)
             subs.append({'sub_off': o, 'zero': zero,
                          'holds_src_off': locate(src_index, got)})
-        pages.append({'page': p, 'page_off': p * MiB, 'subs': subs})
-        if len(pages) >= 8:
-          break
+        pages.append({'page': p, 'zero_subs': sum(1 for x in subs if x['zero']),
+                      'subs': subs[:2]})
     if pages or rc != 0 or size != len(src_pages) * MiB:
-      bad.append({'copy': i, 'rc': rc, 'size': size, 'pages': pages})
+      bad.append({'copy': i, 'rc': rc, 'size': size,
+                  'bad_pages': len(pages),
+                  'all_zero_pages': sum(1 for x in pages
+                                        if x['zero_subs'] == MiB // SUB),
+                  'first_bad': pages[0]['page'] if pages else None,
+                  'last_bad': pages[-1]['page'] if pages else None,
+                  'sample': pages[:2]})
+    # Free the copy before the next one: the test checks copies, not how
+    # many fit (the store is ~10 GB on the safe profile).
+    if not args.keep:
+      os.unlink(dst)
   print(json.dumps({'copies': args.copies, 'bad': bad}))
 
 

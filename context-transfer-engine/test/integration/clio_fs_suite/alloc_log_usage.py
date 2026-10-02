@@ -13,13 +13,20 @@ import sys
 REC = struct.Struct('<IIIIQQQ')
 
 
-def live_bytes(path):
-  """Replay one allocation log; return (live bytes, allocs, frees)."""
+def live_bytes(path, group=None):
+  """Replay one allocation log; return (live bytes, allocs, frees).
+
+  Args:
+    path: the log.
+    group: count only this allocator group (None = all).
+  """
   live, na, nf = {}, 0, 0
   with open(path, 'rb') as f:
     data = f.read()
   for off in range(0, len(data) - len(data) % REC.size, REC.size):
     typ, grp, _, _, boff, size, _ = REC.unpack_from(data, off)
+    if group is not None and grp != group:
+      continue
     if typ == 1:
       live[(grp, boff)] = size
       na += 1
@@ -32,3 +39,9 @@ def live_bytes(path):
 for p in sorted(glob.glob(os.path.join(sys.argv[1], '*.alloc_log'))):
   b, na, nf = live_bytes(p)
   print(f'{os.path.basename(p)[:-10]} {b / (1 << 20):.0f} {na} {nf}')
+# safe_bdev arrays: group 0 is the slot allocator (group 1 holds stripe
+# intents, not space).
+for p in sorted(glob.glob(os.path.join(sys.argv[1], '*.alog'))):
+  b, na, nf = live_bytes(p, group=0)
+  if na:
+    print(f'{os.path.basename(p)[:-5]} {b / (1 << 20):.0f} {na} {nf}')
