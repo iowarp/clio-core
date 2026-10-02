@@ -29,6 +29,11 @@ pass-through and stays correct.
 
 Files: `clio_vol.cc`, `clio_vol.h`. Connector name: **`clio`**.
 
+> **New here?** [`../HDF5_QUICKSTART.md`](../HDF5_QUICKSTART.md) gets you to
+> a working setup, and `scripts/clio-hdf5-doctor --smoke` checks an
+> environment and prints the fix for what it finds. This README is the
+> reference.
+
 ## Enabling and building
 
 The adapter is OFF by default (`CLIO_CTE_ENABLE_HDF5_VOL`, see the top-level

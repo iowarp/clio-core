@@ -346,6 +346,11 @@ Without them, a change to a connector compiles nothing and its tests silently
 do not exist in the tree. Check that the file was actually compiled before
 claiming a build is clean.
 
+For how the connectors fit into HDF5, which to use, and the ways a setup
+silently does nothing, see `context-transfer-engine/adapter/HDF5_QUICKSTART.md`.
+Set `CLIO_REQUIRE_RUNTIME=1` in any measurement, so a run that never reached
+the runtime fails instead of reporting a clean zero.
+
 #### CI green is weaker evidence than it looks
 
 `ci-linux.yml` runs ctest with `--repeat until-pass:3`, and its boost-backend

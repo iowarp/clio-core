@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""clio-hdf5-doctor -- check that the CLIO HDF5 connectors are actually in use.
+
+Most ways this setup breaks are silent: the application runs, the data is
+correct, and CLIO is never used. This checks for each one and prints the fix.
+It only reads and reports; it never starts, stops or reconfigures anything.
+
+    scripts/clio-hdf5-doctor                 # check the environment
+    scripts/clio-hdf5-doctor --bin build/bin # check a specific build tree
+    scripts/clio-hdf5-doctor --smoke         # also round-trip a file through the VOL
+
+Exit status is 1 if any check FAILs. Warnings do not fail it.
+"""
+
+import argparse
+import ctypes
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LIBS = {"libclio_hdf5_vol.so": "CLIO_CTE_ENABLE_HDF5_VOL", "libclio_vfd.so": "CLIO_CTE_ENABLE_VFD"}
+QUICKSTART_CONF = os.path.join(REPO, "context-transfer-engine/adapter/config/clio_hdf5_quickstart.yaml")
+# clio::cte::core::kCtePoolName. Any other pool name misses the clients' lookup.
+CTE_POOL_NAME = "clio_cte_core"
+
+failed = False
+
+
+def report(status, msg, fix=""):
+    global failed
+    failed |= status == "FAIL"
+    print(f"[{status:^4}] {msg}")
+    for line in fix.splitlines():
+        print(f"         {line}")
+
+
+def run(cmd, **kw):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60, **kw)
+        return p.returncode, p.stdout + p.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, str(e)
+
+
+def linked_hdf5(path):
+    """The libhdf5 a library resolves to, via ldd, or None."""
+    m = re.search(r"libhdf5\.so\S*\s+=>\s+(/\S+)", run(["ldd", path])[1])
+    return os.path.realpath(m.group(1)) if m else None
+
+
+def h5py_hdf5():
+    """The libhdf5 files h5py maps, or None if h5py is not importable."""
+    code = ("import h5py, json; print(json.dumps(sorted({l.split()[-1] for l in open('/proc/self/maps')"
+            " if 'libhdf5.so' in l and '_hl' not in l})))")
+    rc, out = run([sys.executable, "-c", code])
+    return {os.path.realpath(p) for p in json.loads(out.splitlines()[-1])} if rc == 0 else None
+
+
+def check_libs(bin_dir):
+    dirs = [bin_dir] if bin_dir else []
+    dirs += [d for d in os.environ.get("HDF5_PLUGIN_PATH", "").split(os.pathsep) if d]
+    dirs.append(os.path.join(REPO, "build", "bin"))
+    found = {}
+    for lib in LIBS:
+        hits = [os.path.join(d, lib) for d in dirs if os.path.isfile(os.path.join(d, lib))]
+        if hits:
+            found[lib] = hits[0]
+    if not found:
+        report("FAIL", "Neither connector library found in: " + ", ".join(dirs),
+               "cmake -S . -B build -DCLIO_CTE_ENABLE_HDF5_VOL=ON -DCLIO_CTE_ENABLE_VFD=ON\n"
+               "cmake --build build --target clio_hdf5_vol clio_vfd -j")
+        return found
+    py_hdf5 = h5py_hdf5()
+    for lib, flag in LIBS.items():
+        if lib not in found:
+            report("WARN", f"{lib} not found (fine if you do not need it).", f"build with -D{flag}=ON")
+            continue
+        try:
+            ctypes.CDLL(found[lib])
+        except OSError as e:
+            # HDF5 dlopens the connector the same way, but its own error never names the library.
+            report("FAIL", f"{found[lib]} cannot be loaded: {e}",
+                   "Usually the wrong libhdf5, or a .so copied out of a container with a newer glibc.\n"
+                   "Rebuild on this host with -DHDF5_ROOT=<the HDF5 your application uses>.")
+            continue
+        hdf5 = linked_hdf5(found[lib])
+        if py_hdf5 and hdf5 and hdf5 not in py_hdf5:
+            report("FAIL", f"{lib} links {hdf5}, but h5py uses {', '.join(sorted(py_hdf5))}.",
+                   "Two libhdf5 builds in one process do not share state. Rebuild with\n"
+                   "-DHDF5_ROOT=<prefix of the HDF5 h5py uses>.")
+        else:
+            report("OK", f"{found[lib]} loads" + (f" (libhdf5: {hdf5})" if hdf5 else ""))
+    return found
+
+
+def check_env(found):
+    lib_dirs = {os.path.dirname(p) for p in found.values()}
+    plugin_path = {os.path.abspath(d) for d in os.environ.get("HDF5_PLUGIN_PATH", "").split(os.pathsep) if d}
+    if lib_dirs and not lib_dirs & plugin_path:
+        report("WARN", "HDF5_PLUGIN_PATH does not include the connector directory, so HDF5 cannot find it.",
+               f"export HDF5_PLUGIN_PATH={sorted(lib_dirs)[0]}")
+    vol, vfd = os.environ.get("HDF5_VOL_CONNECTOR"), os.environ.get("HDF5_DRIVER")
+    if vol and vfd:
+        report("WARN", f"Both HDF5_VOL_CONNECTOR={vol} and HDF5_DRIVER={vfd} are set; stacking is untested.",
+               "unset one of them")
+    elif vol == "clio" or vfd == "clio_vfd":
+        report("OK", "Connector selected: " + ("HDF5_VOL_CONNECTOR=clio" if vol else "HDF5_DRIVER=clio_vfd"))
+    else:
+        report("WARN", "No CLIO connector selected; applications will use native HDF5.",
+               "export HDF5_VOL_CONNECTOR=clio   # or: export HDF5_DRIVER=clio_vfd")
+    for knob in ("CLIO_VOL_CACHE", "CLIO_VFD_CACHE"):
+        if os.environ.get(knob, "").lower() in ("0", "off", "false", "no"):
+            report("WARN", f"{knob} is off, so that connector will not use the CTE tier.", f"unset {knob}")
+
+
+def check_runtime(found):
+    siblings = [os.path.join(os.path.dirname(p), "clio_run") for p in found.values()]
+    clio_run = next((c for c in siblings if os.path.isfile(c)), shutil.which("clio_run"))
+    if not clio_run:
+        return report("FAIL", "clio_run not found next to the connectors or on PATH.")
+    rc, _ = run([clio_run, "status"])
+    if rc == 0:
+        report("OK", "CLIO runtime is running.")
+    else:
+        report("FAIL", "No CLIO runtime answered. The connectors fall back to the native file and say nothing.",
+               ("A dead runtime left segments behind; `clio_run status` lists them.\n" if rc == 2 else "")
+               + f"export CLIO_SERVER_CONF={QUICKSTART_CONF}\nclio_run start")
+
+
+def check_config():
+    explicit = os.environ.get("CLIO_SERVER_CONF")
+    path = explicit or os.path.expanduser("~/.clio/clio.yaml")
+    if explicit and not os.path.isfile(path):
+        return report("FAIL", f"CLIO_SERVER_CONF names a missing file: {path}. Every process that "
+                      "loads a connector will abort.", f"export CLIO_SERVER_CONF={QUICKSTART_CONF}")
+    if not os.path.isfile(path):
+        return report("FAIL", f"No runtime config ({path}), so clio_run composes no CTE pool.",
+                      f"export CLIO_SERVER_CONF={QUICKSTART_CONF}")
+    # Split into YAML list items; the CTE entry is the one naming the module. No PyYAML:
+    # this has to run before anything is set up.
+    items = re.split(r"\n\s*-\s", re.sub(r"#.*", "", open(path).read()))
+    cte = next((i for i in items if re.search(r"mod_name:\s*[\"']?clio_cte_core\b", i)), "")
+    m = re.search(r"pool_name:\s*[\"']?([^\s\"']+)", cte)
+    if not m:
+        report("FAIL", f"{path} composes no named clio_cte_core pool, so nothing can be cached.",
+               f"add one, or: export CLIO_SERVER_CONF={QUICKSTART_CONF}")
+    elif m.group(1) != CTE_POOL_NAME:
+        report("WARN", f"{path} names the CTE pool '{m.group(1)}', not '{CTE_POOL_NAME}'.",
+               "Clients look it up by that exact name; a miss falls back to broadcast routing,\n"
+               f"which is slower and has hung on attach. Rename it to {CTE_POOL_NAME}.")
+    else:
+        report("OK", f"{path} composes the CTE pool as '{CTE_POOL_NAME}'.")
+
+
+SMOKE = r"""
+import sys, numpy as np, h5py
+mode, path = sys.argv[1:]
+want = np.arange(65536, dtype="f8").reshape(256, 256)
+with h5py.File(path, mode) as f:
+    if mode == "w": f["x"] = want
+    elif not np.array_equal(f["x"][...], want): sys.exit("MISMATCH")
+"""
+
+
+def check_smoke(found):
+    if "libclio_hdf5_vol.so" not in found:
+        return report("SKIP", "Smoke test needs the VOL connector.")
+    tmp = tempfile.mkdtemp(prefix="clio-hdf5-doctor.")
+    env = dict(os.environ, HDF5_PLUGIN_PATH=os.path.dirname(found["libclio_hdf5_vol.so"]),
+               HDF5_VOL_CONNECTOR="clio", CLIO_VOL_TRACE=tmp, CLIO_REQUIRE_RUNTIME="1",
+               CLIO_VOL_ADMIT_COST="0")  # test the cache mechanics, not the admission policy
+    env.pop("HDF5_DRIVER", None)
+    h5 = os.path.join(tmp, "smoke.h5")
+    # Three sessions: a writing close cannot stamp the file (its mtime is too fresh to
+    # trust), so the first read is native; its close stamps, and the second can hit.
+    for mode in ("w", "r", "r"):
+        rc, out = run([sys.executable, "-c", SMOKE, mode, h5], env=env)
+        if rc != 0:
+            return report("FAIL", f"Round-trip through the VOL failed in a '{mode}' session "
+                          "(CLIO_REQUIRE_RUNTIME=1 turns a missing runtime or pool into this error):",
+                          out.strip()[-1500:])
+    totals = [json.load(open(os.path.join(tmp, f))).get("totals", {})
+              for f in os.listdir(tmp) if f.endswith(".access.json")]
+    cache = sum(t.get("read_bytes_from_cache", 0) for t in totals)
+    native = sum(t.get("read_bytes_from_native", 0) for t in totals)
+    shutil.rmtree(tmp, ignore_errors=True)
+    report("OK", f"Round-trip through the VOL is correct. Read bytes: {cache} from cache, {native} native.",
+           "0 from cache is not by itself a fault: the coherence and admission policies can\n"
+           "both decline. The *.access.json trace says which." if cache == 0 else "")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Check that the CLIO HDF5 connectors are actually in use.")
+    ap.add_argument("--bin", metavar="DIR", help="build output directory to check first (e.g. build/bin)")
+    ap.add_argument("--smoke", action="store_true", help="also write and read a file through the VOL")
+    args = ap.parse_args()
+    found = check_libs(args.bin)
+    check_env(found)
+    check_runtime(found)
+    check_config()
+    if args.smoke and not failed:
+        check_smoke(found)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
