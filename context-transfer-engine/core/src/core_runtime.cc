@@ -2329,35 +2329,6 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         (tail_write && old_num_blocks > 0) ? (old_blob_size - old_last_blk_size)
                                            : 0;
 
-    // WAL: log all current blocks (full replacement semantics).
-    // Skipped in emulation mode (issue #747): emulated puts are training
-    // traffic, not recoverable state — no data was written, so replaying
-    // their block layout after a crash would resurrect garbage.
-    if (!task->context_.emulate_ && !blob_txn_logs_.empty() &&
-        !blob_info_ptr->blocks_.empty()) {
-      clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
-      TxnExtendBlob txn;
-      txn.tag_major_ = tag_id.major_;
-      txn.tag_minor_ = tag_id.minor_;
-      txn.blob_name_ = blob_name;
-      for (const auto &blk : blob_info_ptr->blocks_) {
-        TxnExtendBlobBlock tb;
-        tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
-        tb.bdev_minor_ = blk.bdev_client_.pool_id_.minor_;
-        tb.target_query_ = blk.target_query_;
-        tb.target_offset_ = blk.target_offset_;
-        tb.size_ = blk.size_;
-        txn.new_blocks_.push_back(tb);
-      }
-      blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendBlob,
-                                                       txn);
-      if (TracePutEnv()) {
-        HLOG(kInfo, "[TRACE-PUT] wal blob='{}' off={} size={} nblocks={} size_now={} tok={}",
-             blob_name, offset, size, blob_info_ptr->blocks_.size(),
-             blob_info_ptr->GetTotalSize(), lock_tok);
-      }
-    }
-
     if (task->context_.emulate_) {
       // I/O emulation (issue #747): the placement above (DPE selection +
       // block allocation) is real so tier capacities stay honest, but the
@@ -2504,6 +2475,41 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         }
       }
     }
+    // WAL: log all current blocks (full replacement semantics) -- only now,
+    // AFTER the data writes above landed. A record logged first reaches the
+    // page cache at once (WriteRecord flushes), so a crash before the data
+    // write left the blob pointing at a recycled extent's OLD bytes:
+    // another file's data read back as this one's after a SIGKILL. Logged
+    // after, a crash in between just leaves the blob at its previous layout,
+    // which is all an unsynced write is promised.
+    // Skipped in emulation mode (issue #747): emulated puts are training
+    // traffic, not recoverable state — no data was written, so replaying
+    // their block layout after a crash would resurrect garbage.
+    if (!task->context_.emulate_ && !blob_txn_logs_.empty() &&
+        !blob_info_ptr->blocks_.empty()) {
+      clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+      TxnExtendBlob txn;
+      txn.tag_major_ = tag_id.major_;
+      txn.tag_minor_ = tag_id.minor_;
+      txn.blob_name_ = blob_name;
+      for (const auto &blk : blob_info_ptr->blocks_) {
+        TxnExtendBlobBlock tb;
+        tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
+        tb.bdev_minor_ = blk.bdev_client_.pool_id_.minor_;
+        tb.target_query_ = blk.target_query_;
+        tb.target_offset_ = blk.target_offset_;
+        tb.size_ = blk.size_;
+        txn.new_blocks_.push_back(tb);
+      }
+      blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendBlob,
+                                                       txn);
+      if (TracePutEnv()) {
+        HLOG(kInfo, "[TRACE-PUT] wal blob='{}' off={} size={} nblocks={} size_now={} tok={}",
+             blob_name, offset, size, blob_info_ptr->blocks_.size(),
+             blob_info_ptr->GetTotalSize(), lock_tok);
+      }
+    }
+
     if (put_prof) {
       const auto pi_t3 = std::chrono::steady_clock::now();
       auto us = [](auto a, auto b) {
@@ -3798,20 +3804,14 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
     if (blob_info.score_ != placed_score) snapshot_dirty_.store(true);
     blob_info.score_ = placed_score;
     blob_info.BumpPlacementGen();
-    {
-      clio::run::u32 free_rc = 0;
-      CLIO_CO_AWAIT(FreeAllBlobBlocks(old_layout, free_rc));
-      if (free_rc != 0) {
-        HLOG(kWarning, "ReorganizeBlob: freeing the old placement of blob={} "
-             "failed (rc {}); its space leaks", blob_name, free_rc);
-      }
-    }
-
     // WAL: log the new block layout (kExtendBlob replays with full-replacement
     // semantics, so this single record captures the whole move). Deliberately
     // logged only AFTER the publish: a crash mid-move replays the previous
     // kExtendBlob record, i.e. the blob at its old placement — the same bytes,
     // rather than the lost blob the old del-then-reput WAL sequence replayed.
+    // And logged BEFORE the old placement is freed: freed extents can be
+    // reused by another blob at once, and a crash between the free and this
+    // record would replay this blob onto them.
     if (!blob_txn_logs_.empty()) {
       clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
       TxnExtendBlob txn;
@@ -3829,6 +3829,15 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
       }
       blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendBlob,
                                                        txn);
+    }
+
+    {
+      clio::run::u32 free_rc = 0;
+      CLIO_CO_AWAIT(FreeAllBlobBlocks(old_layout, free_rc));
+      if (free_rc != 0) {
+        HLOG(kWarning, "ReorganizeBlob: freeing the old placement of blob={} "
+             "failed (rc {}); its space leaks", blob_name, free_rc);
+      }
     }
 
     // Refresh the caches that track placement: the SHM metadata mirror
@@ -4059,13 +4068,9 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
     rep->blocks_ = std::move(staging.blocks_);
     rep->total_size_cache_ = staging.total_size_cache_;
     rep->score_ = placed_score;
-    {
-      clio::run::u32 free_rc = 0;
-      CLIO_CO_AWAIT(FreeAllBlobBlocks(old_layout, free_rc));
-    }
-
     // WAL: one kExtendReplica record captures the whole move (logged after
-    // the publish; a crash mid-move replays the pre-move layout).
+    // the publish; a crash mid-move replays the pre-move layout) and before
+    // the old extents are freed, which another blob may reuse at once.
     if (!blob_txn_logs_.empty()) {
       clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
       TxnExtendReplica txn;
@@ -4089,6 +4094,11 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
       }
       blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendReplica,
                                                        txn);
+    }
+
+    {
+      clio::run::u32 free_rc = 0;
+      CLIO_CO_AWAIT(FreeAllBlobBlocks(old_layout, free_rc));
     }
 
     rc = 0;
@@ -7370,6 +7380,11 @@ clio::run::TaskResume Runtime::RelocateBlob(
   blob_info.blocks_ = std::move(staging.blocks_);
   blob_info.total_size_cache_ = staging.total_size_cache_;
   blob_info.BumpPlacementGen();  // #817: blocks moved under readers
+  // Log the new layout BEFORE the old one is freed: freed extents can be
+  // reallocated and overwritten by another blob at once, and a crash between
+  // the free and the record would replay this blob onto them (another
+  // file's bytes read back as this one's).
+  LogBlobLayout(tag_id, blob_name, blob_info);
   {
     clio::run::u32 free_rc = 0;
     CLIO_CO_AWAIT(FreeAllBlobBlocks(old_layout, free_rc));
@@ -7378,7 +7393,6 @@ clio::run::TaskResume Runtime::RelocateBlob(
            "returned {}", blob_name, free_rc);
     }
   }
-  LogBlobLayout(tag_id, blob_name, blob_info);
   MirrorBlobToShm(composite_key, blob_info);
   if (TracePutEnv()) {
     HLOG(kInfo, "[TRACE-PUT] flush-end blob='{}' size={} nblocks={}",
