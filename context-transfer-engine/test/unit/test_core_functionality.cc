@@ -3235,10 +3235,15 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
        write_us, write_us_last, cycle_shm_meta_us, cycle_rpc_meta_us,
        cycle_shm_data_us, cycle_rpc_data_us, kIters, kSize, sink);
 
-  // Structural sanity: a write+read cycle includes a write, so it cannot take
-  // less than half the write-alone floor. This catches a broken/near-zero
-  // measurement, and holds regardless of runner load.
-  REQUIRE(cycle_shm_meta_us >= std::min(write_us, write_us_last) * 0.5);
+  // Structural sanity: a write+read cycle includes a write, so it cannot be
+  // dramatically cheaper than the write-alone floor. This catches a
+  // broken/near-zero measurement. The bound is deliberately loose (10x): the
+  // loops are separate wall-clock samples, and on a loaded CI runner a
+  // write-alone loop has sampled 2.5x slower than the cycle loop (leak-check:
+  // write-alone 109/89 us vs SHM metadata cycle 43.7 us), which a 0.5x bound
+  // turned into a spurious failure.
+  REQUIRE(cycle_shm_meta_us > 0.0);
+  REQUIRE(cycle_shm_meta_us >= std::min(write_us, write_us_last) * 0.1);
 
   // SHM is EXPECTED to beat RPC — that is the point of the cache — but this is
   // a wall-clock comparison of two timing samples, so on a loaded CI runner
