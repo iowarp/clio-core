@@ -1877,6 +1877,7 @@ void IpcManager::SetDead(u64 node_id) {
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   if (it->second.state == NodeState::kDead) return;  // Already dead
+  NoteLivenessChange();
 
   SetNodeState(node_id, NodeState::kDead);
 
@@ -1933,6 +1934,7 @@ void IpcManager::SetAlive(u64 node_id) {
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   if (it->second.state == NodeState::kAlive) return;  // Already alive
+  NoteLivenessChange();
 
   SetNodeState(node_id, NodeState::kAlive);
 

@@ -842,6 +842,15 @@ class IpcManager {
   u32 DeadNodeCount() const {
     return dead_count_.load(std::memory_order_acquire);
   }
+  /** Wall-clock time (ns since the Unix epoch) of the latest peer liveness
+   *  transition this node saw (alive->dead or dead->alive), 0 if none.
+   *  fsync compares it with the start of a file's unsynced window (issue
+   *  #1133): a node that died -- or crashed and rejoined -- inside the
+   *  window may have taken unsynced bytes with it. Wall clock, not steady,
+   *  so values from different nodes compare. Readable from any thread. */
+  u64 LastLivenessChangeNs() const {
+    return last_liveness_change_ns_.load(std::memory_order_acquire);
+  }
 
   /**
    * Get the SWIM node state for a node
@@ -1838,6 +1847,18 @@ class IpcManager {
       new std::atomic<u64>[kHeardSlots]()};
   /** Confirmed membership changes; see GetMembershipEpoch (issue #856). */
   std::atomic<u64> membership_epoch_{0};
+  /** Time of the latest real peer liveness transition; see
+   *  LastLivenessChangeNs (#1133). */
+  std::atomic<u64> last_liveness_change_ns_{0};
+  /** Record a real peer liveness transition happening now. */
+  void NoteLivenessChange() {
+    last_liveness_change_ns_.store(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::system_clock::now()
+                                 .time_since_epoch())
+                             .count()),
+        std::memory_order_release);
+  }
   mutable std::vector<Host>
       hosts_cache_;  // Cached vector of hosts for GetAllHosts
   mutable bool hosts_cache_valid_ = false;  // Flag to track cache validity
