@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -204,10 +205,36 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * @param tag_id blob's tag
    * @param blob_name blob name
    * @param write_off lowest offset the pending write touches
+   * @param ok out: false when a replica holds bytes below write_off that
+   *        could not be copied back (no room in any tier): the write must
+   *        not go ahead, or reads of those bytes would return zeros
    */
   clio::run::TaskResume RefillPrimaryBeforeWrite(const TagId &tag_id,
                                                  const std::string &blob_name,
-                                                 clio::run::u64 write_off);
+                                                 clio::run::u64 write_off,
+                                                 bool &ok);
+
+  /**
+   * Take the replication write token of every blob in `keys` (BlobKey),
+   * waiting while any is held. Taken all at once, so two batches with
+   * overlapping blobs cannot deadlock. Serializes the refill of a dropped
+   * primary from its replica, the primary put and the replica puts (and a
+   * read's re-cache of the primary): a refill or re-cache copies the
+   * replica's bytes into the primary and must not land over a write
+   * acknowledged meanwhile.
+   * @param keys blob keys (deduplicated by the callee)
+   */
+  clio::run::TaskResume LockBlobs(std::vector<std::string> keys);
+  /**
+   * Release tokens taken by LockBlobs.
+   * @param keys the same keys
+   */
+  void UnlockBlobs(const std::vector<std::string> &keys);
+  /** @return the write-token key of a blob */
+  static std::string BlobKey(const TagId &tag, const std::string &name) {
+    return std::to_string(tag.major_) + "." + std::to_string(tag.minor_) +
+           "." + name;
+  }
 
   /**
    * Populate THIS node's local cache copy of a remote blob (issue #886
@@ -268,6 +295,15 @@ class Runtime : public clio::cte::core::CoreInterposer {
   void NoteHandoff(clio::run::u32 owner, const TagId &tag,
                    const std::string &name, bool deleted);
   /**
+   * Drop every node's cached copy of a blob this container just changed on
+   * behalf of its dead owner: the owner tracks who holds copies, and this
+   * stand-in does not know them, so it tells every live node.
+   * @param tag blob's tag
+   * @param name blob name
+   */
+  clio::run::TaskResume InvalidateCachedEverywhere(TagId tag,
+                                                   std::string name);
+  /**
    * Mirror one written range to this blob's remote copies (owner side).
    * @param tag blob's tag
    * @param name blob name
@@ -314,6 +350,9 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /** Log bytes after which the handoff log is rewritten as a snapshot. */
   static constexpr clio::run::u64 kHandoffCompactBytes = 4ull << 20;
   std::mutex handoff_mu_;
+  /** Blobs whose replication write token is held (LockBlobs). */
+  std::mutex blob_busy_mu_;
+  std::unordered_set<std::string> blob_busy_;
   std::unordered_map<clio::run::u32,
                      std::unordered_map<std::string, HandoffEntry>> handoff_;
   clio::cte::core::RecordLog handoff_log_;

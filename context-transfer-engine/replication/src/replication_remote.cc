@@ -82,6 +82,22 @@ clio::cte::core::Client *Runtime::Self() {
   return self_client_.get();
 }
 
+clio::run::TaskResume Runtime::InvalidateCachedEverywhere(TagId tag,
+                                                         std::string name) {
+  CLIO_TASK_BODY_BEGIN
+  const clio::run::u32 n = NumContainers();
+  for (clio::run::u32 c = 0; c < n; ++c) {
+    // Container ids are node ids; a dead node's cache died with it.
+    if (c == container_id_ || !ContainerAlive(c)) continue;
+    auto inval = GetCoreClient()->AsyncDelBlob(
+        tag, name, clio::run::PoolQuery::Physical(c),
+        clio::cte::core::kDelCacheCopyOnly);
+    CLIO_CO_AWAIT(inval);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 void Runtime::NoteHandoff(clio::run::u32 owner, const TagId &tag,
                           const std::string &name, bool deleted) {
   std::lock_guard<std::mutex> g(handoff_mu_);
@@ -147,6 +163,7 @@ clio::run::TaskResume Runtime::PutBlob(
     CLIO_CO_AWAIT(PutBlobLocal(task));
     if (failover && task->GetReturnCode() == 0) {
       NoteHandoff(owner, tag, name, false);
+      CLIO_CO_AWAIT(InvalidateCachedEverywhere(tag, name));
     }
     CLIO_CO_RETURN;
   }
@@ -258,12 +275,15 @@ clio::run::TaskResume Runtime::DelBlob(
   const std::string name = task->blob_name_.str();
   CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kDelBlob,
                               task.template Cast<clio::run::Task>()));
+  // A cache-copy invalidation touches only this node's cache copy.
+  if (task->del_flags_ & clio::cte::core::kDelCacheCopyOnly) CLIO_CO_RETURN;
   if (config_.remote_copies_ <= 0) CLIO_CO_RETURN;
   const clio::run::u32 owner = OwnerOf(tag, name);
   if (owner != container_id_) {
     // Standing in for a dead owner: it must learn of the delete.
     if (clio::cte::core::FailoverContainer(pool_id_, owner) == container_id_) {
       NoteHandoff(owner, tag, name, true);
+      CLIO_CO_AWAIT(InvalidateCachedEverywhere(tag, name));
     }
     CLIO_CO_RETURN;
   }
@@ -293,6 +313,7 @@ clio::run::TaskResume Runtime::TruncateBlob(
   if (owner != container_id_) {
     if (clio::cte::core::FailoverContainer(pool_id_, owner) == container_id_) {
       NoteHandoff(owner, tag, name, false);
+      CLIO_CO_AWAIT(InvalidateCachedEverywhere(tag, name));
     }
     CLIO_CO_RETURN;
   }
