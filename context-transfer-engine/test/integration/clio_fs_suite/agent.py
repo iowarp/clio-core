@@ -154,11 +154,11 @@ class Agent:
 
   def op_fpread_verify(self, h, off, length, seed):
     """pread [off,off+len) and compare with the pattern; return mismatch."""
-    got = os.pread(self.fds[h], length, off)
+    got = sr._pread_full(self.fds[h], length, off)
     return _compare(got, pattern(seed, off, length), off)
 
   def op_fpread_hex(self, h, off, length):
-    return os.pread(self.fds[h], length, off).hex()
+    return sr._pread_full(self.fds[h], length, off).hex()
 
   def op_fstat(self, h):
     return _st(os.fstat(self.fds[h]))
@@ -349,7 +349,7 @@ class Agent:
       off = 0
       while off < size:
         n = min(chunk, size - off)
-        got = os.pread(fd, n, off)
+        got = sr._pread_full(fd, n, off)
         mm = _compare(got, pattern(seed, off, n), off)
         if mm is not None:
           res['mismatch'] = mm

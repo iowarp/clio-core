@@ -136,12 +136,38 @@ def scan_range(path, file_id, start, count, blk=BLK):
   fd = os.open(path, os.O_RDONLY)
   try:
     for b in range(start, start + count):
-      piece = os.pread(fd, blk, b * blk)
+      piece = _pread_full(fd, blk, b * blk)
       w, g = classify(piece, file_id, b, blk)
       runs.append([b, 1, w, g])
   finally:
     os.close(fd)
   return {'runs': runs}
+
+
+def _pread_full(fd, length, offset):
+  """pread until `length` bytes or EOF.
+
+  A read that fails part-way returns the bytes before the failure (a short
+  count, as POSIX allows) and the error only on the NEXT call. Taking the
+  short count as the answer turned an honest EIO into missing bytes that
+  were then classified as CORRUPT. Continuing surfaces the error.
+
+  Args:
+    fd: open file descriptor.
+    length: bytes wanted.
+    offset: file offset.
+  Returns:
+    the bytes read (shorter than `length` only at EOF).
+  Raises:
+    OSError: the error the read hit.
+  """
+  out = b''
+  while len(out) < length:
+    chunk = os.pread(fd, length - len(out), offset + len(out))
+    if not chunk:
+      break  # EOF
+    out += chunk
+  return out
 
 
 def scan(path, file_id, nblocks, blk=BLK, chunk_blocks=256):
@@ -168,7 +194,7 @@ def scan(path, file_id, nblocks, blk=BLK, chunk_blocks=256):
     b = 0
     while b < nblocks:
       n = min(chunk_blocks, nblocks - b)
-      data = os.pread(fd, n * blk, b * blk)
+      data = _pread_full(fd, n * blk, b * blk)
       for i in range(n):
         piece = data[i * blk:(i + 1) * blk]
         if not piece and (b + i) * blk >= size:
@@ -349,7 +375,7 @@ class SharedFileStress:
       try:
         fd = os.open(self.path, os.O_RDONLY)
         try:
-          data = os.pread(fd, self.blk, b * self.blk)
+          data = _pread_full(fd, self.blk, b * self.blk)
         finally:
           os.close(fd)
       except OSError as e:
@@ -510,10 +536,10 @@ class SafeSaveStress:
           # from a file whose bytes change between two reads).
           ck = int(os.environ.get('CLIO_SUITE_READ_CHUNK_BLOCKS', '0'))
           if ck <= 0:
-            data = os.pread(fd, self.nblocks * self.blk, 0)
+            data = _pread_full(fd, self.nblocks * self.blk, 0)
           else:
             data = b''.join(
-                os.pread(fd, ck * self.blk, b * self.blk)
+                _pread_full(fd, ck * self.blk, b * self.blk)
                 for b in range(0, self.nblocks, ck))
           size2 = os.fstat(fd).st_size
         finally:

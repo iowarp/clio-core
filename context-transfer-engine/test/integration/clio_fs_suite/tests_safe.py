@@ -184,9 +184,21 @@ def t_beyond(ctx):
       failed += 1  # an I/O error is an honest answer
       continue
     ok += 1
+    bad = False
     for start, count, w, g in r['ret']['runs']:
       if w in (CORRUPT, FOREIGN, ZERO) or (w, g) != (1, 1):
         lies.append((nm, start, count, w, g))
+        bad = True
+    if bad:
+      # What the wrong bytes are (zeros, another record, garbage) and
+      # whether a second read agrees: a lie that re-reads right is a read
+      # path bug, one that persists is stored garbage.
+      ctx.note(f'{nm} wrong blocks: {r["ret"].get("corrupt", [])[:2]} '
+               f'foreign {dict(list((r["ret"].get("foreign") or {}).items())[:2])}')
+      r2 = ctx.call(0, 'rec_scan', timeout=900, path=f'{base}/{nm}', name=nm,
+                    nblocks=FILE_BLOCKS)
+      ctx.note(f'{nm} second read: ok={r2.get("ok")} '
+               f'runs={(r2.get("ret") or {}).get("runs", r2.get("err"))}')
   ctx.metrics.update({'files_readable': ok, 'files_failed': failed})
   ctx.check(not lies, f'reads beyond max_failures returned wrong bytes: '
                       f'{lies[:6]}')
