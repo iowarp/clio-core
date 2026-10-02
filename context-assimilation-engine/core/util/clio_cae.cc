@@ -95,16 +95,55 @@ int main(int argc, char* argv[]) {
     // Call ParseOmni with vector of contexts
     auto parse_task = client.AsyncParseOmni(contexts);
     parse_task.Wait();
-    clio::run::u32 result = parse_task->GetReturnCode();
+    // result_code_ is the ASSIMILATION result. GetReturnCode() is the task
+    // framework's own code and is left at 0 by the CAE runtime, so checking it
+    // alone reports success for a run in which every dataset failed to store.
+    // Check both, and prefer the assimilation code for reporting.
+    clio::run::u32 fw_result = parse_task->GetReturnCode();
+    int result = parse_task->result_code_;
+    std::string err_msg(parse_task->error_message_.c_str());
     clio::run::u32 num_tasks_scheduled = parse_task->num_tasks_scheduled_;
 
-    if (result != 0) {
-      HLOG(kError, "Error: ParseOmni failed with result code {}", result);
+    if (result != 0 || fw_result != 0) {
+      // fw_result is a u32 holding a negative code; print it signed so the
+      // reader sees -9 rather than 4294967287.
+      HLOG(kError,
+           "ParseOmni FAILED: assimilation result_code={} (framework code={}){}{}",
+           result, static_cast<int>(fw_result),
+           err_msg.empty() ? "" : " - ", err_msg);
+      if (result == -9) {
+        HLOG(kError,
+             "  Cause: include_patterns matched no dataset in the file. "
+             "Note '*' DOES cross '/' (fnmatch flags=0), so a trailing "
+             "wildcard is valid; check the path prefix instead.");
+      } else {
+        HLOG(kError,
+             "  Check the RUNTIME log for the underlying cause: assimilation "
+             "runs server-side in the clio_cae_core pool, so dataset-level "
+             "errors (e.g. 'PutBlob failed', which means the CTE tier is full) "
+             "are logged there, not here.");
+      }
+      HLOG(kInfo, "  Tasks scheduled before failure: {}", num_tasks_scheduled);
+      return 1;
+    }
+
+    if (num_tasks_scheduled == 0 && !contexts.empty()) {
+      // Nothing was scheduled although transfers were requested. This is the
+      // failure mode that used to be indistinguishable from success.
+      HLOG(kError,
+           "ParseOmni scheduled 0 assimilations from {} requested transfer(s).",
+           contexts.size());
+      HLOG(kError,
+           "  Likely causes: include_patterns matched no dataset, or the CTE "
+           "tier is full (look for 'PutBlob failed' in the runtime log).");
       return 1;
     }
 
     HLOG(kSuccess, "ParseOmni completed successfully!");
     HLOG(kInfo, "  Tasks scheduled: {}", num_tasks_scheduled);
+    HLOG(kInfo,
+         "  NOTE: assimilation is ASYNCHRONOUS -- tasks are scheduled, not "
+         "complete. Poll `cte_search '<dst>.*'` to confirm blobs have landed.");
 
     return 0;
 

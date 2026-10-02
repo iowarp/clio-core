@@ -70,6 +70,30 @@ public:
 
   static constexpr size_t kSmallFileSize = 1024;  // 1KB for quick tests
 
+  /** Backing store for the assimilators' PutBlobs. 256 MB of RAM is far
+   *  more than these fixtures need (the largest test file is 1 KB) and is
+   *  sized to match test_putblob_priv rather than to any host's DRAM, so it
+   *  registers on a 14 GB macOS runner as readily as on a CI Linux box. */
+  static bool RegisterRamTarget() {
+    static constexpr clio::run::u64 kRamTargetBytes = 256ULL * 1024 * 1024;
+    static constexpr const char *kTargetName = "cae_comprehensive_target";
+    auto *cte = CLIO_CTE_CLIENT;
+    clio::run::PoolId bdev_pool_id(918, 0);
+    clio::run::bdev::Client bdev_client(bdev_pool_id);
+    auto create = bdev_client.AsyncCreate(clio::run::PoolQuery::Dynamic(),
+                                          kTargetName, bdev_pool_id,
+                                          clio::run::bdev::BdevType::kRam,
+                                          kRamTargetBytes);
+    create.Wait();
+    auto reg = cte->AsyncRegisterTarget(kTargetName,
+                                        clio::run::bdev::BdevType::kRam,
+                                        kRamTargetBytes,
+                                        clio::run::PoolQuery::Local(),
+                                        bdev_pool_id);
+    reg.Wait();
+    return reg->GetReturnCode() == 0;
+  }
+
   CAEComprehensiveFixture() {
     if (!g_initialized) {
       INFO("=== Initializing CAE Test Environment ===");
@@ -102,6 +126,30 @@ public:
 
       if (cte_create->GetReturnCode() != 0) {
         throw std::runtime_error("CTE pool creation failed");
+      }
+
+      // Step 5: Register a RAM target BY HAND.
+      //
+      // Without this every PutBlob returns rc 11 ("available_targets empty")
+      // and each assimilator fails at its first write. The CreateParams above
+      // carry no storage of their own -- CreateParams::config_ is not
+      // serialized, and the server fills it from pool_config.config_ only for
+      // a pool declared in a compose section. These tests set no
+      // CLIO_SERVER_CONF, so whether clio_cte_core gets any storage depends
+      // entirely on ambient config: with a seeded ~/.clio/clio.yaml (which the
+      // container images write from context-runtime/config/clio_default.yaml)
+      // Create registers the default tiers, and without one it logs "Warning:
+      // No storage devices configured" and registers nothing. That is the
+      // whole macOS/Windows-vs-Linux split -- the runners have no such file.
+      // CLIO_TEST_MODE=1 reproduces the bare case on any host.
+      //
+      // It stayed invisible because the failure never reached an assertion:
+      // ParseOmni recorded it in result_code_ while GetReturnCode() stayed 0,
+      // so REQUIRE(task->GetReturnCode() == 0) passed on a run that stored
+      // nothing. Same fix, and same reason, as
+      // test_putblob_priv.cc::RegisterRamTarget.
+      if (!RegisterRamTarget()) {
+        throw std::runtime_error("CTE RAM target registration failed");
       }
 
       INFO("CTE infrastructure initialized");
