@@ -147,7 +147,10 @@ def t_tier_overflow(ctx):
 
   bad, anomalies = [], {'mismatch': 0, 'corrupt': 0}
 
+  count_lock = threading.Lock()
+  rereads = []  # (file, first reader, bad blocks, re-reader, bad blocks)
   foreign_src = []  # (file, block, source file id, its block, writer, gen)
+  corrupt_desc = []  # (file, describe_corrupt of a CORRUPT block)
 
   def verify(reader_of, names_of):
     def one(i):
@@ -157,9 +160,24 @@ def t_tier_overflow(ctx):
                      name=nm, nblocks=FILE_BLOCKS)
         for b, src in list(got.get('foreign', {}).items())[:4]:
           foreign_src.append((nm, int(b), *src))
-        anomalies['corrupt'] += _corrupt_blocks(got['runs'])
-        anomalies['mismatch'] += _compare(_to_runs(models[nm]), got,
-                                          FILE_BLOCKS, nm, bad)
+        for d in got.get('corrupt', [])[:2]:
+          corrupt_desc.append((nm, d))
+        ncorrupt = _corrupt_blocks(got['runs'])
+        nbad = _compare(_to_runs(models[nm]), got, FILE_BLOCKS, nm, bad)
+        if nbad:
+          # Stored wrong, or read wrong? Read the file again on this node
+          # and on another: a mismatch that changes or goes away is a
+          # read-side transient, one that stays is in the stored bytes.
+          other = (r + 1) % n
+          for again in (r, other):
+            g2 = ctx.ok(again, 'rec_scan', timeout=900, path=f'{base}/{nm}',
+                        name=nm, nblocks=FILE_BLOCKS)
+            n2 = _compare(_to_runs(models[nm]), g2, FILE_BLOCKS, nm, [])
+            with count_lock:
+              rereads.append((nm, f'node{r}', nbad, f'node{again}', n2))
+        with count_lock:  # the per-node threads share these counters
+          anomalies['corrupt'] += ncorrupt
+          anomalies['mismatch'] += nbad
     ctx.each(one)
 
   owned = {i: [fname(i, k) for k in range(nfiles)] for i in range(n)}
@@ -223,9 +241,15 @@ def t_tier_overflow(ctx):
         (nm, b, names.get(fid, fid),
          'deleted' if names.get(fid) in deleted else 'live', fb, w, g)
         for nm, b, fid, fb, w, g in foreign_src[:8]]))
+  if corrupt_desc:
+    ctx.note(f'corrupt blocks hold: {corrupt_desc[:6]}')
+  if rereads:
+    ctx.note(f're-reads of the bad files (file, reader, bad, re-reader, '
+             f'bad): {rereads[:8]}')
   ctx.metrics['corrupt_or_foreign_blocks'] = anomalies['corrupt']
   ctx.metrics['bad_blocks_total'] = anomalies['mismatch']
-  ctx.check(anomalies['mismatch'] == 0,
+  ctx.check(anomalies['mismatch'] == 0 and anomalies['corrupt'] == 0 and
+            not bad,
             f'{anomalies["mismatch"]} blocks differ from the model '
             f'({anomalies["corrupt"]} CORRUPT/FOREIGN), e.g. {bad[:8]}')
 
@@ -709,6 +733,7 @@ def t_hot_rewrite(ctx):
     for k in range(nfiles):
       models[f'n{i}_h{k}'] = [(ZERO, 0)] * fb
   bad, counts = [], {'bad': 0}
+  counts_lock = threading.Lock()
 
   def do_round(i, r):
     rng = random.Random(f'{i}:{r}')
@@ -738,15 +763,16 @@ def t_hot_rewrite(ctx):
         nm = f'n{i}_h{k}'
         got = ctx.ok(reader, 'rec_scan', timeout=900, path=f'{base}/{nm}',
                      name=nm, nblocks=fb)
-        counts['bad'] += _compare(_to_runs(models[nm]), got, fb,
-                                  f'r{r}:{nm}', bad)
+        nbad = _compare(_to_runs(models[nm]), got, fb, f'r{r}:{nm}', bad)
+        with counts_lock:  # check() runs on every node's thread at once
+          counts['bad'] += nbad
     # Read-your-writes on the writer's node.
     ctx.each(lambda i: check(i, i))
     if r % 2 == 1:  # fsynced round: every other node sees it too
       ctx.each(lambda i: check(i, (i + 1) % n))
   ctx.metrics['bad_blocks'] = counts['bad']
-  ctx.check(counts['bad'] == 0, f'{counts["bad"]} blocks differ from the '
-                                f'model, e.g. {bad[:8]}')
+  ctx.check(counts['bad'] == 0 and not bad,
+            f'{counts["bad"]} blocks differ from the model, e.g. {bad[:8]}')
 
 
 @test('stress_op_latency', 'stress', min_nodes=2, redeploy_after=True,
