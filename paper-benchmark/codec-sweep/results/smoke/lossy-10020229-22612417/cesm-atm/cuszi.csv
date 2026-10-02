@@ -1,0 +1,4 @@
+workload,file,codec,variant,eb_rel,eb_abs,n,bytes_in,bytes_out,ratio,comp_ms,comp_wall_ms,decomp_ms,decomp_wall_ms,max_err,err_over_eb,psnr_db,nrmse,bound_ok,ok,constant,note
+cesm-atm,1800x3600/AEROD_v_1_1800_3600.f32,cuszi,spline-pbk,0.01,9.99999962e+33,6480000,25920000,405160,63.974726,0.0772,0.0901,0.0391,0.0525,0,0.000000,999.0000,0,0,0,0,
+cesm-atm,1800x3600/AEROD_v_1_1800_3600.f32,cuszi,spline-pbk,0.02,1.99999992e+34,6480000,25920000,405160,63.974726,0.0684,0.0814,0.0298,0.0476,0,0.000000,999.0000,0,0,0,0,
+cesm-atm,1800x3600/AEROD_v_1_1800_3600.f32,cuszi,spline-pbk,0.03,2.99999989e+34,6480000,25920000,405160,63.974726,0.0695,0.0821,0.0303,0.0438,0,0.000000,999.0000,0,0,0,0,

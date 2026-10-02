@@ -1,0 +1,4 @@
+workload,file,codec,variant,eb_rel,eb_abs,n,bytes_in,bytes_out,ratio,comp_ms,comp_wall_ms,decomp_ms,decomp_wall_ms,max_err,err_over_eb,psnr_db,nrmse,bound_ok,ok,constant,note
+qmcpack,SDRBENCH-QMCPack/einspline_115_69_69_288.f32,cuszx,default,0.01,0.330100174,157684320,630737280,230263955,2.739192,198.4699,198.4869,227.8146,227.8314,0.330065906,0.999896,61.3479,0.000856261,1,1,0,host API: includes PCIe+CPU
+qmcpack,SDRBENCH-QMCPack/einspline_115_69_69_288.f32,cuszx,default,0.02,0.660200348,157684320,630737280,204599112,3.082796,212.3940,212.4131,211.3034,211.3196,0.66019696,0.999995,53.0518,0.0022254,1,1,0,host API: includes PCIe+CPU
+qmcpack,SDRBENCH-QMCPack/einspline_115_69_69_288.f32,cuszx,default,0.03,0.990300522,157684320,630737280,132439802,4.762445,177.2562,177.2739,173.6048,173.6218,0.990299702,0.999999,45.1018,0.00555792,1,1,0,host API: includes PCIe+CPU

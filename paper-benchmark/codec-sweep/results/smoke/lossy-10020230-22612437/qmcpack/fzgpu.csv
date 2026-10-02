@@ -1,0 +1,4 @@
+workload,file,codec,variant,eb_rel,eb_abs,n,bytes_in,bytes_out,ratio,comp_ms,comp_wall_ms,decomp_ms,decomp_wall_ms,max_err,err_over_eb,psnr_db,nrmse,bound_ok,ok,constant,note
+qmcpack,SDRBENCH-QMCPack/einspline_115_69_69_288.f32,fzgpu,default,0.01,0.330100174,157684320,630737280,83817180,7.525155,3.4174,3.4287,4.6107,4.6215,0.330100149,1.000000,46.7486,0.00459804,1,1,0,
+qmcpack,SDRBENCH-QMCPack/einspline_115_69_69_288.f32,fzgpu,default,0.02,0.660200348,157684320,630737280,68487820,9.209481,3.4185,3.4290,4.6058,4.6156,0.660200357,1.000000,41.8586,0.00807369,1,1,0,
+qmcpack,SDRBENCH-QMCPack/einspline_115_69_69_288.f32,fzgpu,default,0.03,0.990300522,157684320,630737280,51963148,12.138165,3.4091,3.4194,4.5981,4.6083,0.990300477,1.000000,39.6664,0.0103915,1,1,0,

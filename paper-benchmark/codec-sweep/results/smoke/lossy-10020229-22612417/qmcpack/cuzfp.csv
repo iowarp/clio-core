@@ -1,0 +1,4 @@
+workload,file,codec,variant,eb_rel,eb_abs,n,bytes_in,bytes_out,ratio,comp_ms,comp_wall_ms,decomp_ms,decomp_wall_ms,max_err,err_over_eb,psnr_db,nrmse,bound_ok,ok,constant,note
+qmcpack,SDRBENCH-QMCPack/einspline_115_69_69_288.f32,cuzfp,default,0.01,0.330100174,157684320,630737280,182089616,3.463884,5.2350,5.2458,3.2733,3.2829,0.323637486,0.980422,71.5859,0.000263454,1,1,0,rate=8.4844 bits/value
+qmcpack,SDRBENCH-QMCPack/einspline_115_69_69_288.f32,cuzfp,default,0.02,0.660200348,157684320,630737280,162639896,3.878122,5.0626,5.0734,3.1745,3.1844,0.630976319,0.955735,66.1042,0.000495208,1,1,0,rate=7.5781 bits/value
+qmcpack,SDRBENCH-QMCPack/einspline_115_69_69_288.f32,cuzfp,default,0.03,0.990300522,157684320,630737280,143190176,4.404892,4.8940,4.9042,3.0845,3.0942,0.980822444,0.990429,60.6555,0.000927306,1,1,0,rate=6.6719 bits/value
