@@ -138,6 +138,14 @@ clio::run::TaskResume Runtime::StoreInodeRec(clio::run::u64 packed,
                                              const std::string &rec,
                                              int &rc) {
   CLIO_TASK_BODY_BEGIN
+  {
+    bool ready = false;
+    CLIO_CO_AWAIT(AwaitCteReady(ready));
+    if (!ready) {
+      rc = EIO;
+      CLIO_CO_RETURN;
+    }
+  }
   // kMetaBlob: storing the record is not a change to the file (no ctime
   // bump); a non-volatile tier keeps it across a restart.
   clio::cte::core::Context meta_ctx;
@@ -349,18 +357,43 @@ clio::run::TaskResume Runtime::StatInode(clio::run::u64 packed,
   CLIO_TASK_BODY_END
 }
 
+void Runtime::RefreshCachedInode(clio::run::u64 packed, const FsAttr &attr) {
+  std::lock_guard<std::mutex> g(icache_mu_);
+  auto it = icache_.find(packed);
+  if (it != icache_.end() && attr.ctime_ >= it->second.attr_.ctime_) {
+    // Keep the type-independent fields the reply carries; the size is
+    // always asked of the stream (see StatInode).
+    it->second.attr_ = attr;
+  }
+  auto lit = iloading_.find(packed);
+  if (lit != iloading_.end() &&
+      (lit->second.home_ == ~0u || attr.ctime_ >= lit->second.attr_.ctime_)) {
+    lit->second.attr_ = attr;
+    lit->second.home_ = 0;  // "newer than the fetch": see StatInode
+  }
+}
+
 int Runtime::ApplyInodePush(const FsReq &req) {
   InodeCacheEnt ent;
   if (!DecInodePush(req.str_, &ent.attr_, &ent.symlink_)) return EINVAL;
   std::lock_guard<std::mutex> g(icache_mu_);
   auto lit = iloading_.find(req.id_);
   if (lit != iloading_.end()) {
+    if (lit->second.home_ != ~0u &&
+        ent.attr_.ctime_ < lit->second.attr_.ctime_) {
+      return 0;  // older than what already arrived
+    }
     ent.home_ = 0;  // any value but ~0u: "a push arrived"
     lit->second = ent;
     return 0;
   }
   auto it = icache_.find(req.id_);
   if (it == icache_.end()) return ENOENT;
+  // Pushes are not ordered with each other or with this node's own setattr
+  // replies (RefreshCachedInode): every change bumps ctime on the home, so
+  // an older push must not roll a newer copy back -- a chmod read back as
+  // the mode before it (#1127).
+  if (ent.attr_.ctime_ < it->second.attr_.ctime_) return 0;
   ent.home_ = it->second.home_;
   ent.lease_until_ms_ = it->second.lease_until_ms_;  // a push is no renewal
   it->second = ent;
@@ -372,6 +405,11 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed) {
   if (packed == 0 || InodeOwner(packed) != container_id_ ||
       FindInode(packed) != nullptr) {
     CLIO_CO_RETURN;
+  }
+  {
+    bool ready = false;
+    CLIO_CO_AWAIT(AwaitCteReady(ready));
+    if (!ready) CLIO_CO_RETURN;
   }
   const clio::cte::core::TagId tag = FsUnpack(packed);
   auto sz = cte_.AsyncGetBlobSize(tag, kInodeBlob);

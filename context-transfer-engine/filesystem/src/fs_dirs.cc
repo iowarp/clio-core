@@ -139,9 +139,23 @@ clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
                                              int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
+  bool ready = false;
+  CLIO_CO_AWAIT(AwaitCteReady(ready));
+  if (!ready) {
+    rc = EIO;
+    CLIO_CO_RETURN;
+  }
   const clio::cte::core::TagId tag = FsUnpack(dir);
   auto sz = cte_.AsyncGetBlobSize(tag, DirBlockName(k));
   CLIO_CO_AWAIT(sz);
+  // Only "no such blob" means the block does not exist. Any other failure
+  // (a lost node, a timeout, an unroutable request) must not read as an
+  // empty directory: a create would then write a fresh block over the real
+  // one.
+  if (sz->GetReturnCode() != 0 && sz->GetReturnCode() != kCteBlobNotFoundRc) {
+    rc = EIO;
+    CLIO_CO_RETURN;
+  }
   if (sz->GetReturnCode() != 0 || sz->size_ == 0) {
     rc = ENOENT;
     CLIO_CO_RETURN;
@@ -154,7 +168,8 @@ clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
     // Deleted between the two calls (an rmdir dropped it): it is gone.
     auto again = cte_.AsyncGetBlobSize(tag, DirBlockName(k));
     CLIO_CO_AWAIT(again);
-    if (again->GetReturnCode() != 0 || again->size_ == 0) {
+    if (again->GetReturnCode() == kCteBlobNotFoundRc ||
+        (again->GetReturnCode() == 0 && again->size_ == 0)) {
       rc = ENOENT;
       CLIO_CO_RETURN;
     }
@@ -177,6 +192,12 @@ clio::run::TaskResume Runtime::WriteBlockBlob(clio::run::u64 dir,
                                               int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
+  bool ready = false;
+  CLIO_CO_AWAIT(AwaitCteReady(ready));
+  if (!ready) {
+    rc = EIO;
+    CLIO_CO_RETURN;
+  }
   const clio::cte::core::TagId tag = FsUnpack(dir);
   // Pad to a power of two (>= 4 KiB). Every create grows the image a little;
   // a blob rewritten at a slightly larger size each time gains one more small
@@ -233,6 +254,7 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
     const bool mine = home == container_id_;
     bool busy = false;
     bool busy_commit = false;
+    const char *busy_stage = "";
     std::shared_ptr<BlockSlot> expired;  // a copy whose lease ran out
     if (FindCachedBlock(key, home, &out, &expired)) CLIO_CO_RETURN;
     if (expired != nullptr) {
@@ -266,20 +288,28 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
         if (s.committing_) busy = busy_commit = true;
         else blocks_.erase(it);
       }
+      const char *stage = "";
       if (!busy) {
-        busy = loading_.count(key) != 0;
-        if (!busy) loading_.insert(key);
+        auto lit = loading_.find(key);
+        busy = lit != loading_.end();
+        if (busy) {
+          stage = lit->second;
+        } else {
+          loading_.emplace(key, mine ? "home load" : "fetch from home");
+        }
       }
+      busy_stage = stage;
     }
     if (busy) {
       const double waited = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - wait_t0).count();
       if (waited > next_report_s) {
         HLOG(kWarning, "filesystem: waiting {} ms for directory block "
-             "{}/{} (home {}, mine {}): {}",
+             "{}/{} (home {}, mine {}): {}{}",
              static_cast<clio::run::u64>(waited * 1000.0), dir, k, home, mine,
              busy_commit ? "a moved copy is still committing"
-                         : "another task is loading it");
+                         : "another task is loading it, at: ",
+             busy_commit ? "" : busy_stage);
         next_report_s += kSlowBlockOpS;
       }
       CLIO_CO_AWAIT(clio::run::yield(kLoadPollUs));
@@ -391,6 +421,8 @@ clio::run::TaskResume Runtime::LoadHomeBlock(clio::run::u64 dir,
                                              int &lrc) {
   CLIO_TASK_BODY_BEGIN
   lrc = 0;
+  const BlockKey key{dir, k};
+  SetLoadStage(key, "home load: reading the block blob (GetBlobSize/GetBlob)");
   CLIO_CO_AWAIT(ReadBlockBlob(dir, k, &slot->blk_, lrc));
   if (lrc == ENOENT && dir == FsPack(FsRootId()) && k == 0) {
     // "/" exists by definition: its home materializes it on first use.
@@ -416,6 +448,7 @@ clio::run::TaskResume Runtime::LoadHomeBlock(clio::run::u64 dir,
     // so the next incarnation starts past it too.
     slot->blk_.version_ += kIncarnationStride;
     int wrc = 0;
+    SetLoadStage(key, "home load: persisting the incarnation jump (PutBlob)");
     CLIO_CO_AWAIT(WriteBlockBlob(dir, k, EncodeDirBlock(slot->blk_, true),
                                  wrc));
     if (wrc != 0) slot->persist_dirty_ = true;  // the next commit retries

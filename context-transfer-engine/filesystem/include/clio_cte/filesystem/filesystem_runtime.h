@@ -280,6 +280,23 @@ class Runtime : public clio::run::Container {
  private:
   // CTE core client this filesystem sits over (set at Create from next_pool_id_).
   clio::cte::core::Client cte_;
+  /** Set once Create has bound cte_. The container is reachable before its
+   *  Create runs (PoolManager registers it first); metadata I/O before then
+   *  went to the null pool and never completed (#1125). */
+  std::atomic<bool> cte_ready_{false};
+  /** core GetBlobSize's rc when the tag or blob does not exist (any other
+   *  non-zero rc is a failure to answer, not an answer). */
+  static constexpr clio::run::u32 kCteBlobNotFoundRc = 1;
+  /** How long metadata I/O waits for cte_ before failing with EIO. */
+  static constexpr clio::run::u64 kCteReadyWaitMs = 120000;
+  /** Re-check period while waiting for cte_. */
+  static constexpr double kCteReadyPollUs = 1000.0;
+
+  /**
+   * Wait (bounded) until Create has bound the CTE client.
+   * @param ok false if it is still unbound after kCteReadyWaitMs
+   */
+  clio::run::TaskResume AwaitCteReady(bool &ok);
   clio::run::PoolId next_pool_id_ = clio::run::PoolId::GetNull();
   // Client bound to THIS filesystem pool, for self-submitted tasks (the
   // append pipeline, and ShardOps to the owners of other namespace state).
@@ -382,8 +399,21 @@ class Runtime : public clio::run::Container {
   };
   std::mutex ns_mu_;  ///< guards blocks_, loading_, early_ and every slot
   std::unordered_map<BlockKey, std::shared_ptr<BlockSlot>, BlockKeyHash> blocks_;
-  /** Blocks being loaded here (a push that arrives meanwhile is kept). */
-  std::unordered_set<BlockKey, BlockKeyHash> loading_;
+  /** Blocks being loaded here (a push that arrives meanwhile is kept),
+   *  each with the step its loader is on -- named in a slow waiter's
+   *  warning, so a load that never returns says where it is stuck. */
+  std::unordered_map<BlockKey, const char *, BlockKeyHash> loading_;
+
+  /**
+   * Record which step the loader of `key` is on (static string).
+   * @param key the block being loaded
+   * @param stage what the loader is waiting on
+   */
+  void SetLoadStage(const BlockKey &key, const char *stage) {
+    std::lock_guard<std::mutex> g(ns_mu_);
+    auto it = loading_.find(key);
+    if (it != loading_.end()) it->second = stage;
+  }
   /** Pushes that arrived while their block was loading. */
   std::unordered_map<BlockKey, std::vector<DirDelta>, BlockKeyHash> early_;
 
@@ -778,6 +808,14 @@ class Runtime : public clio::run::Container {
   int InodeNlink(const FsReq &req, FsResp &resp);
   /** chmod / chown / utimens on an inode. */
   int InodeSetAttr(const FsReq &req, FsResp &resp);
+  /**
+   * After this node changed an inode homed elsewhere (chmod/chown/utimens),
+   * replace its cached attributes with the home's reply, so the next stat
+   * here sees the change instead of waiting for the home's async push.
+   * @param packed the inode
+   * @param attr the attributes the home returned
+   */
+  void RefreshCachedInode(clio::run::u64 packed, const FsAttr &attr);
   /** Set an inode's logical size and trim its pages. */
   clio::run::TaskResume InodeTruncate(const FsReq &req, FsResp &resp);
   /** getxattr/setxattr/listxattr/removexattr on an inode. */

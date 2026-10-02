@@ -115,6 +115,26 @@ inline double BackoffUs(int attempt) {
 // Lifecycle
 // ===========================================================================
 
+clio::run::TaskResume Runtime::AwaitCteReady(bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = cte_ready_.load(std::memory_order_acquire);
+  if (!ok) {
+    const clio::run::u64 t0 = SteadyMs();
+    while (!cte_ready_.load(std::memory_order_acquire) &&
+           SteadyMs() - t0 < kCteReadyWaitMs) {
+      CLIO_CO_AWAIT(clio::run::yield(kCteReadyPollUs));
+    }
+    ok = cte_ready_.load(std::memory_order_acquire);
+    if (!ok) {
+      HLOG(kError, "filesystem: metadata I/O before this container's Create "
+           "bound its CTE client, and it still is not after {} ms",
+           kCteReadyWaitMs);
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   FilesystemConfig cfg = task->GetParams();
@@ -124,6 +144,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   next_pool_id_ = cfg.next_pool_id_;
   if (!next_pool_id_.IsNull()) {
     cte_ = clio::cte::core::Client(next_pool_id_);
+    cte_ready_.store(true, std::memory_order_release);
   }
   // Bind a client to our own pool for self-submitted tasks. Use the
   // assigned pool id from the CreateTask (pool_id_ isn't reliable yet here).
@@ -1437,6 +1458,7 @@ clio::run::TaskResume Runtime::Readlink(clio::run::shared_ptr<ReadlinkTask> &tas
     } else {                                                                  \
       CLIO_CO_AWAIT(                                                          \
           CallShard(InodeOwner((req).id_), kShardInodeSetAttr, req, _ar));    \
+      if (_ar.rc_ == 0) RefreshCachedInode((req).id_, _ar.attr_);             \
     }                                                                         \
     rcv = static_cast<int>(_ar.rc_);                                          \
   } while (0)
