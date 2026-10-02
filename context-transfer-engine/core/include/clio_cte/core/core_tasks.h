@@ -922,7 +922,10 @@ static constexpr clio::run::u32 kReplicaPutRcBase = 30;
  * @return true for an out-of-space failure
  */
 inline constexpr bool PutRcIsNoSpace(clio::run::u32 rc) {
-  return (rc >= 11 && rc <= kPutNoSpaceRc) ||
+  // 28 (ENOSPC) is what the filesystem chimod's write task returns for a
+  // full store; the write-behind awaits those tasks too, and latched it as
+  // EIO -- a full store must stay ENOSPC (#1129).
+  return rc == 28 || (rc >= 11 && rc <= kPutNoSpaceRc) ||
          (rc >= kReplicaPutRcBase + 11 &&
           rc <= kReplicaPutRcBase + kPutNoSpaceRc);
 }
