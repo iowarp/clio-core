@@ -244,7 +244,13 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     archive->ResetBulkIndex();
     archive->msg_type_ = MsgType::kSerializeOut;
     *archive >> (*task_ptr);
-  } else if (!future.consumed_) {
+  } else if (!future.consumed_ && want_key != 0) {
+    // want_key == 0: the task never went on the wire. The client completes
+    // some tasks itself -- a GetBlob served from the SHM metadata cache or
+    // from a pending deferred put (core_client.h) -- and hands back a future
+    // with origin kClientShm whose net_key was never stamped (SendIn stamps
+    // it). No response exists to claim, so a missing archive is expected.
+    //
     // Twin of the check in IpcCpu2CpuZmq::RecvOut -- see the long comment
     // there for why a complete task with no parked archive is a protocol
     // violation rather than a benign miss, and why returning true here hid
