@@ -8,10 +8,13 @@
 
 #include <clio_runtime/bdev/transports/bdev_transport.h>
 #include <clio_runtime/bdev/transports/block_allocator.h>
+#include <clio_runtime/bdev/bdev_alloc_log.h>
 #include <clio_ctp/io/async_io_factory.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
+#include <thread>
 
 namespace clio::run::bdev {
 
@@ -44,7 +47,33 @@ class FsBdevTransport : public BdevTransport {
   clio::run::u64 GetCapacity() const override { return allocator_.GetCapacity(); }
   clio::run::u64 GetRemainingSize() const override { return allocator_.GetRemainingSize(); }
 
+  void FlushAllocLog() override;
+  bool Sync() override;
+
  private:
+  /**
+   * Persistent allocator state. Without it the bump allocator restarts at
+   * offset 0 and a restart hands out bytes that live data -- placed by ANY
+   * client, local or remote -- still occupies.
+   */
+  AllocatorLog alloc_log_;
+  bool has_alloc_log_ = false;
+
+  // The log's fsync runs on its own thread, owned by the transport, so it
+  // ends with the pool: a runtime periodic task outlives a destroyed pool
+  // and retries forever.
+  static constexpr int kAllocLogSyncPeriodMs = 50;
+  std::thread sync_thread_;
+  std::mutex sync_mu_;
+  std::condition_variable sync_cv_;
+  bool sync_stop_ = false;
+
+  /** Sync-thread body: FlushAllocLog every kAllocLogSyncPeriodMs until
+   *  StopAllocLogSync. */
+  void AllocLogSyncLoop();
+
+  /** Stop and join the sync thread (idempotent). */
+  void StopAllocLogSync();
   StandardBlockAllocator allocator_;
   std::vector<WorkerIOContext> io_contexts_;
   std::string file_path_;
@@ -58,6 +87,20 @@ class FsBdevTransport : public BdevTransport {
   clio::run::u64 growth_unit_ = clio::run::u64(1) << 30;
   std::atomic<clio::run::u64> file_backed_bytes_{0};
   std::mutex grow_mu_;
+  /** Smallest end offset a grow could not reserve disk for (guarded by
+   *  grow_mu_; 0 = none), and when (steady ns): requests reaching it fail
+   *  fast for kGrowRetryNs instead of retrying the reservation. */
+  clio::run::u64 grow_fail_end_ = 0;
+  clio::run::u64 grow_fail_ns_ = 0;
+  /** How long a failed grow is trusted before disk space is probed again. */
+  static constexpr clio::run::u64 kGrowRetryNs = 2000000000ull;
+  /**
+   * Extend the backing file to `target` bytes and reserve its blocks.
+   * @param backed current backed size
+   * @param target new size
+   * @return true on success (on failure the file is left at `backed`)
+   */
+  bool GrowBackingFile(clio::run::u64 backed, clio::run::u64 target);
 
   bool InitializeWorkerIOContexts();
   void CleanupWorkerIOContexts();
@@ -67,6 +110,22 @@ class FsBdevTransport : public BdevTransport {
    *  granularity, capped at capacity). Returns false if the extension fails
    *  (e.g. the disk is genuinely full). */
   bool EnsureFileBacked(clio::run::u64 end_offset);
+
+  /**
+   * Open the allocator-state log and, when recovering, rebuild the allocator
+   * from it. Called from Init after allocator_.Init.
+   * @param params Create parameters (alloc_log_path_ overrides the default
+   *               "<file>.alloc_log" and always recovers)
+   * @return false if the log cannot be opened
+   */
+  bool OpenAllocLog(const CreateParams& params);
+
+  /**
+   * Append one record per block to the allocator log and hand them to the OS.
+   * @param blocks Blocks just allocated or freed
+   * @param is_free true for frees, false for allocations
+   */
+  void LogBlocks(const std::vector<Block>& blocks, bool is_free);
 };
 
 } // namespace clio::run::bdev

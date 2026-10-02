@@ -1,0 +1,193 @@
+# lbann, PAGED, 2 NODES: PAGE CACHE RESIDENCY SWEEP AT A FIXED BLOCK COUNT.
+#
+#   1 workload x 5 residency rungs = 5 cells
+#
+# The general rationale is in gv_cache_kmeans_a100.yaml. lbann's specifics:
+#
+# ITS DECK IS SMALLER THAN THE OTHER FOUR, AND CANNOT SIMPLY BE GROWN.
+# Two independent ceilings pin it:
+#
+#   1. A PAGE MUST HOLD WHOLE ROWS OF BOTH W1 (I wide) AND W2 (H wide). At
+#      a 1024 KB page that is 262144 floats, which is EXACTLY one W2 row at
+#      H=262144 -- so H cannot exceed 262144 without a larger page.
+#   2. THE DENSE REFERENCE IS NOT SHARDED and there is no --no-dense for
+#      this bench (gmx has one; lbann does not). Every cell allocates a
+#      plain in-VRAM copy of the WHOLE network, so the model has to fit in
+#      40 GB alongside the paged cache no matter how many nodes run.
+#
+# H=262144, I=4096, O=2048 gives W1 = 4096 MB, W2 = 2048 MB, ~6144 MB
+# global and ~3072 pages per node. Absolute times here are therefore NOT
+# comparable to the 32 GB/node workloads; the residency curve within lbann
+# is, which is what this file is for.
+#
+# 128 BLOCKS, AND THE LIMIT IS DIVISIBILITY, NOT A CACHE WINDOW. lbann pins
+# ONE page per block (each coroutine fetches, holds, and unpins a single
+# page per iteration), so its pinned floor is just `blocks` -- 128 against a
+# 307-page tight rung, no contest. What actually caps blocks is that the
+# bench REFUSES a decomposition that does not split H and O into whole
+# pages, on both the block and the node axis:
+#
+#     H % blocks == 0        262144 % 128 = 0        OK
+#     O % blocks == 0          2048 % 128 = 0        OK
+#     (H/blocks) % rpp1 == 0     2048 % 64 = 0       OK   (rpp1 = 262144/I)
+#     hper = (H/2)/blocks = 1024,  1024 % 64 = 0     OK
+#     oper = (O/2)/blocks =    8,     8 %  1 = 0     OK   (rpp2 = 262144/H = 1)
+#
+# O IS RAISED FROM THE ANCHOR'S 64 TO 2048 FOR EXACTLY THIS REASON. At
+# O=64 on 2 nodes, oper = 32/blocks forces blocks <= 32 and the sweep would
+# run at a quarter of the block count for no reason but the output width.
+# O=2048 is still a legitimate classifier head and it buys 128 blocks.
+#
+#   rung   --cap (pages)   of ~3072 pages/node   floor is 128
+#    10%        307              3072                10.0%
+#    25%        768              3072                25.0%
+#    50%       1536              3072                50.0%
+#    80%       2458              3072                80.0%
+#   100%       3072              3072               100.0%  (resident)
+#
+# --lr 0.0001, NOT THE BINARY DEFAULT. At this H the default 0.01 diverges
+# to NaN losses and the loss gate then fails on nan != nan -- a
+# configuration failure that reads as a correctness failure.
+#
+# lbann FILLS ms_per_step AND LEAVES bench_ms EMPTY. A post block that
+# pivots on bench_ms alone renders this entire sweep blank and reports it as
+# a success. The block below coalesces a metric and names its source.
+#
+# FRESH RUN: rm -rf $HOME/gv_pipeline_results/cache_lbann first.
+#
+# Submit:  jarvis ppl submit gv_cache_lbann_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 60g
+  gpus_per_node: 1
+  time: "00:40:00"
+  job_name: gv_cache_lb
+  output: /u/llogan/gv_job_logs/gv_cache_lb-%j.out
+  error: /u/llogan/gv_job_logs/gv_cache_lb-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "scontrol show hostnames \"$SLURM_JOB_NODELIST\""
+    - "srun -N 2 --ntasks-per-node=1 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+config:
+  name: gv_cache_lbann_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: lbann
+      variant: paged
+      nodes: 2
+      node_launcher: "srun -N {n} --ntasks-per-node=1 --gpus-per-node=1"
+      hostfile: /u/llogan/.ppi-jarvis/shared/gv_cache_lbann_a100/hostfile.txt
+      cluster_port: 9441
+      # ---- FIXED: everything that is not the cache -------------------
+      blocks: 128          # divisibility-limited, not window-limited
+      threads: 256
+      page_kb: 1024        # 262144 floats == exactly one W2 row at this H
+      in_dim: 4096
+      hidden: 262144       # H ceiling at a 1 MB page
+      out_dim: 2048        # raised from 64 so 128 blocks divide O evenly
+      batch: 256
+      # ITERATIONS SIZED SO THE CACHE CAN ACTUALLY SHOW UP. Measured on
+      # job 21721196 at steps=2: faults fell 3.2x across the ladder
+      # (56896 -> 17842) while bench_ms did not move at all
+      # (16887/17470/13406/16573 ms). The reason is compulsory misses --
+      # at 2 iterations ONE of them is unavoidably cold however large the
+      # cache is, so at most half the accesses were ever cacheable, and
+      # that thin signal sat under a fixed ~40 s 32 GB ingest. At 8 the
+      # ratio is 1 cold to 7 warm and the dynamic range is ~8x. The cells
+      # ran 70-80 s against a 480 s cap, so this is spending headroom that
+      # was already there, not risking it.
+      steps: 8
+      lr: 0.0001           # 0.01 diverges to NaN and fails the loss gate
+      ram_mb: 8192         # ~3 GB/node band + slack
+      nvme_mb: 0
+      prefault: "0"
+      timeout_sec: 900
+      barrier_sec: 300
+      output_dir: /tmp/clio_gv/cache_lbann
+
+vars:
+  # THE ONLY AXIS: model cache in PAGES, as a fraction of this node's band.
+  wl.cap: [307, 768, 1536, 2458, 3072]
+
+loop:
+  - [wl.cap]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/cache_lbann"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  pd.set_option('display.width', 240)
+
+  PAGES_PER_NODE = 3072
+  if 'wl.cap' in df.columns:
+      df['residency_pct'] = (100.0 * df['wl.cap'] / PAGES_PER_NODE).round(1)
+
+  # ONE METRIC COLUMN, COALESCED. lbann fills ms_per_step and leaves
+  # bench_ms EMPTY -- pivoting on bench_ms alone blanks the whole sweep and
+  # still reports success, which is how a result goes missing silently.
+  df['metric_ms'] = pd.NA
+  df['metric_src'] = ''
+  for col in ('ms_per_step', 'bench_ms'):
+      if col in df.columns:
+          take = df['metric_ms'].isna() & df[col].notna()
+          df.loc[take, 'metric_ms'] = df.loc[take, col]
+          df.loc[take, 'metric_src'] = col
+
+  cols = [c for c in ['residency_pct', 'wl.cap', 'cache_setting',
+                      'blocks_resolved', 'nodes', 'nodes_finished',
+                      'completed', 'gates_pass', 'metric_ms', 'metric_src',
+                      'dense_ms_per_step', 'runtime', 'vram_peak_mb',
+                      'faults', 'evicts', 'get_errors', 'put_errors']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+
+  ok = df[(df.get('completed', 0) == 1) & df['metric_ms'].notna()]
+  if len(ok) and 'residency_pct' in ok.columns:
+      full = ok[ok['residency_pct'] >= 100.0]
+      if len(full):
+          base = float(full['metric_ms'].min())
+          curve = ok[['residency_pct', 'metric_ms', 'metric_src']].copy()
+          curve['x_resident'] = (curve['metric_ms'] / base).round(2)
+          logger.info('\nlbann paged, 128 blocks, H=262144 O=2048 (~6 GB '
+                      'global) -- cost of a smaller model cache:\n'
+                      + curve.sort_values('residency_pct').to_string(index=False))
+          # The dense in-VRAM reference is the other useful baseline: it is
+          # what the paged path costs against no paging at all.
+          if 'dense_ms_per_step' in ok.columns and ok['dense_ms_per_step'].notna().any():
+              d = float(ok['dense_ms_per_step'].dropna().min())
+              logger.info('dense in-VRAM reference: %.1f ms/step (the paged '
+                          '100%% rung is %.2fx it)' % (d, base / d))
+      else:
+          logger.warning('the 100%% rung produced no number -- no resident '
+                         'baseline to divide by')
+
+  # Like gmx, lbann's paging line is not parsed into results.csv: faults and
+  # evicts come back EMPTY, not zero.
+  if 'faults' not in df.columns or df['faults'].isna().all():
+      logger.info('faults/evicts are BLANK for lbann by construction. Read '
+                  '~/.ppi-jarvis/shared/gv_cache_lbann_a100*/wl/gvw_dist/'
+                  '*.node0.log for "paging: faults=... evicts=...". Blank is '
+                  'NOT evidence the cell was resident.')
+
+  bad = df[df.get('completed', 0) != 1]
+  for _, r in bad.iterrows():
+      logger.warning('OVER THE 480 s CAP or FAILED: residency %s%% (cap=%s '
+                     'pages, runtime=%s, nodes_finished=%s)'
+                     % (r.get('residency_pct'), r.get('wl.cap'),
+                        r.get('runtime'), r.get('nodes_finished')))
+
+  if len(df) < 5:
+      logger.warning('only %d of 5 rungs have rows -- RESUBMIT THIS FILE to '
+                     'continue' % len(df))
+  elif not len(bad):
+      logger.info('all 5 residency rungs completed')

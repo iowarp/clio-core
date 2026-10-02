@@ -56,6 +56,14 @@ function renderRecovery(s) {
         · ${esc(s.recovery_ops_remaining ?? 0)} remaining</div>
     </div>
     <div class="card">
+      <h3>Capacity</h3>
+      ${meter('used', s.total_capacity
+        ? ((s.total_capacity - s.remaining_capacity) / s.total_capacity) * 100
+        : 0)}
+      <div class="sub">${bytes(s.remaining_capacity ?? 0)} free of
+        ${bytes(s.total_capacity ?? 0)} usable (after parity)</div>
+    </div>
+    <div class="card">
       <h3>Array</h3>
       <div class="sub">data members ${esc(s.data_count ?? '?')} ·
         written slots ${esc(s.written_slots ?? 0)} / ${esc(s.total_slots ?? 0)} ·

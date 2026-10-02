@@ -1,0 +1,137 @@
+# Does the PAGED distributed path stand up on Delta bare metal? -- 2 nodes.
+#
+# Everything distributed about the paged benches had, until this file, run in
+# exactly one place: docker-compose on a single host
+# (test/distributed_workloads/). That harness proves the ALGORITHMS are right
+# at 2 and 4 nodes, but every node was a container on one machine, sharing
+# one GPU, one kernel and a 172.26.0.0/24 bridge. None of that is what a
+# Slingshot cluster looks like, so nothing here was known to work.
+#
+# WHAT IS NEW IN THE PACKAGE. The paged benches are NOT MPI programs -- each
+# hosts the clio runtime in-process and they meet through the CTE -- so
+# `mpirun -n 2` has nothing to bootstrap and mpi_launcher cannot place them.
+# clio_gv_workload gained `nodes`, which:
+#   - GENERATES the cluster config (port + the allocation hostfile + the
+#     hbm/ram/file tiers the bench would otherwise size for itself) and
+#     exports it as CLIO_SERVER_CONF. Every paged bench writes its own
+#     config only when nobody else supplied one, which is the guard that
+#     makes this possible at all;
+#   - places one process per node with srun and turns SLURM_PROCID into
+#     `--node i`, which srun hands to no non-MPI program by itself;
+#   - holds a done-file barrier so no node leaves while a peer is still
+#     paging against its runtime.
+#
+# THE DECKS ARE THE DOCKER HARNESS'S, VERBATIM. Tiny, and deliberately so:
+# these are the exact geometries whose 2-node answers are already gated
+# against a single-node reference, so a wrong number here is a Delta problem
+# and not a deck problem. Sizing comes later.
+#
+# THE SIZE KNOB IS GLOBAL, except for weights. kmeans/grayscott split
+# --data-mb, gmx splits K, lbann splits H and O, lammps_md splits the
+# lattice. weights is the exception: --pages is per block PER NODE. That is
+# why data_mb below is the docker deck's number for five of them and the
+# per-node number for weights.
+#
+# The mpi rows ride along as the control: `srun -n 2 --ntasks-per-node=1` on
+# the same allocation. If those fail too, the problem is the allocation, not
+# the paged distributed path.
+#
+# Submit:  jarvis ppl submit gv_dist2_smoke_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 60g
+  gpus_per_node: 1
+  time: "00:25:00"
+  job_name: gv_dist2_smoke
+  output: /u/llogan/gv_job_logs/gv_dist2_smoke-%j.out
+  error: /u/llogan/gv_job_logs/gv_dist2_smoke-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "scontrol show hostnames \"$SLURM_JOB_NODELIST\""
+    - "srun -N 2 --ntasks-per-node=1 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+# No CLIO_MEMFD_DIR override: the default is /tmp/clio_$USER, which is
+# already node-local. (The 2-node clio_cte_bench pipeline pins it only
+# because a shared-FS dir would let the nodes clobber each other's memfd
+# symlinks -- those point into /proc/<pid>/fd/<n> and resolve nowhere else.)
+
+config:
+  name: gv_dist2_smoke_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: paged
+      nodes: 2
+      # Not mpirun: OpenMPI is not in this picture at all for paged, and
+      # cray-mpich has no mpirun. srun places the processes; the package's
+      # wrapper turns SLURM_PROCID into --node.
+      node_launcher: "srun -N {n} --ntasks-per-node=1 --gpus-per-node=1"
+      # THE MPI BENCHES ARE LINKED AGAINST HPC-X OpenMPI, not cray-mpich
+      # (env.sh puts it on PATH: NVSHMEM's bootstrap plugin hard-requires
+      # libmpi.so.40). srun cannot bootstrap that -- every rank dies in
+      # MPI_Init with opal_init:startup:internal-failure -- so the mpi
+      # cells need OpenMPI's own launcher. --bind-to none because inside a
+      # Slurm cgroup cpuset mpirun's affinity call fails outright
+      # ("hwloc_set_cpubind returned Error for bitmap 0").
+      mpi_launcher: "mpirun -n {n} --oversubscribe --bind-to none"
+      nprocs: 2
+      # A PIPELINE TEST BUILDS A FRESH PIPELINE PER CELL, and the
+      # `scheduler:` block binds self.hostfile only on the pipeline it
+      # loaded -- so the per-cell pipelines see None and every paged cell
+      # fails with "needs an allocation hostfile". Name the scheduler's own
+      # file, which it writes at job start.
+      hostfile: /u/llogan/.ppi-jarvis/shared/gv_dist2_smoke_a100/hostfile.txt
+      cluster_port: 9425
+      prefault: "0"
+      # 240 s is generous for decks this size (the docker versions are
+      # seconds). A cell that needs longer is hung, not slow, and the cap
+      # is what stops one hang from eating the whole allocation.
+      timeout_sec: 240
+      barrier_sec: 120
+      output_dir: /tmp/clio_gv/dist2_smoke
+
+vars:
+  wl.workload: [kmeans, weights, grayscott, gmx,  lbann, lammps_md]
+  wl.blocks:   [8,      8,       8,         0,    4,     0]
+  wl.steps:    [3,      0,       4,         0,    0,     20]
+  # kmeans/grayscott: GLOBAL, split in two. weights: PER NODE
+  # (2 MB / 8 blocks / 64 KB pages = the docker deck's --pages 4).
+  wl.data_mb:  [64,     2,       64,        0,    0,     0]
+  wl.page_kb:  [0,      0,       0,         32,   0,     0]
+  wl.atoms:    [0,      0,       0,         20000, 0,    0]
+  wl.lattice:  [0,      0,       0,         0,    0,     28]
+  wl.repeat:   [1,      1,       1,         1,    0,     0]
+  # The substrate axis. paged is the thing under test; mpi is the control
+  # that says whether a 2-node allocation works at all.
+  wl.variant:  [paged, mpi]
+
+loop:
+  - [wl.workload, wl.blocks, wl.steps, wl.data_mb, wl.page_kb, wl.atoms,
+     wl.lattice, wl.repeat]
+  - [wl.variant]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/dist2_smoke"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  cols = [c for c in ['wl.workload', 'wl.variant', 'nodes', 'nodes_finished',
+                      'completed', 'gates_pass', 'bench_ms', 'runtime',
+                      'faults', 'evicts', 'get_errors', 'put_errors',
+                      'centroid_checksum', 'v_checksum', 'checksum']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+  bad = df[df.get('completed', 0) != 1]
+  for _, r in bad.iterrows():
+      logger.warning('DID NOT COMPLETE: %s %s' %
+                     (r['wl.workload'], r['wl.variant']))
+  if not len(bad):
+      logger.info('all 12 cells completed')

@@ -116,7 +116,9 @@ inline double GetCpuTimeNs() {
   return 0.0;
 }
 
-#if CTP_ENABLE_COMPRESS
+// Gate on the CODEC, not on compression as a whole: each codec is optional, so
+// lzo can be absent from a build that still has compression enabled.
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_LZO
 #include <lzo/lzo1x.h>
 #endif
 
@@ -1204,7 +1206,7 @@ TEST_CASE("Unified Compression Benchmark") {
   PrintCSVHeader(outfile);
 
   // Initialize LZO library
-#if CTP_ENABLE_COMPRESS
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_LZO
   lzo_init();
 #endif
 
@@ -1232,38 +1234,54 @@ TEST_CASE("Unified Compression Benchmark") {
     HLOG(kInfo, "Compression modes: FAST, BALANCED, BEST");
 
     // BZIP2 - compression levels 1, 6, 9
+#if CTP_ENABLE_BZIP2
     compressors.push_back({"BZIP2", "fast", std::make_unique<ctp::Bzip2WithModes>(ctp::LosslessMode::FAST)});
     compressors.push_back({"BZIP2", "balanced", std::make_unique<ctp::Bzip2WithModes>(ctp::LosslessMode::BALANCED)});
     compressors.push_back({"BZIP2", "best", std::make_unique<ctp::Bzip2WithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_BZIP2
 
     // ZSTD - compression levels 1, 3, 19
+#if CTP_ENABLE_ZSTD
     compressors.push_back({"ZSTD", "fast", std::make_unique<ctp::ZstdWithModes>(ctp::LosslessMode::FAST)});
     compressors.push_back({"ZSTD", "balanced", std::make_unique<ctp::ZstdWithModes>(ctp::LosslessMode::BALANCED)});
     compressors.push_back({"ZSTD", "best", std::make_unique<ctp::ZstdWithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_ZSTD
 
     // LZ4 - default vs HC mode
+#if CTP_ENABLE_LZ4
     compressors.push_back({"LZ4", "fast", std::make_unique<ctp::Lz4WithModes>(ctp::LosslessMode::FAST)});
     compressors.push_back({"LZ4", "balanced", std::make_unique<ctp::Lz4WithModes>(ctp::LosslessMode::BALANCED)});
     compressors.push_back({"LZ4", "best", std::make_unique<ctp::Lz4WithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_LZ4
 
     // ZLIB - compression levels 1, 6, 9
+#if CTP_ENABLE_ZLIB
     compressors.push_back({"ZLIB", "fast", std::make_unique<ctp::ZlibWithModes>(ctp::LosslessMode::FAST)});
     compressors.push_back({"ZLIB", "balanced", std::make_unique<ctp::ZlibWithModes>(ctp::LosslessMode::BALANCED)});
     compressors.push_back({"ZLIB", "best", std::make_unique<ctp::ZlibWithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_ZLIB
 
     // LZMA - compression levels 0, 6, 9
+#if CTP_ENABLE_LZMA
     compressors.push_back({"LZMA", "fast", std::make_unique<ctp::LzmaWithModes>(ctp::LosslessMode::FAST)});
     compressors.push_back({"LZMA", "balanced", std::make_unique<ctp::LzmaWithModes>(ctp::LosslessMode::BALANCED)});
     compressors.push_back({"LZMA", "best", std::make_unique<ctp::LzmaWithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_LZMA
 
     // BROTLI - quality levels 1, 6, 11
+#if CTP_ENABLE_BROTLI
     compressors.push_back({"BROTLI", "fast", std::make_unique<ctp::BrotliWithModes>(ctp::LosslessMode::FAST)});
     compressors.push_back({"BROTLI", "balanced", std::make_unique<ctp::BrotliWithModes>(ctp::LosslessMode::BALANCED)});
     compressors.push_back({"BROTLI", "best", std::make_unique<ctp::BrotliWithModes>(ctp::LosslessMode::BEST)});
+#endif  // CTP_ENABLE_BROTLI
 
     // SNAPPY and Blosc2 - no compression level support, use default only
+#if CTP_ENABLE_SNAPPY
     compressors.push_back({"SNAPPY", "default", std::make_unique<ctp::Snappy>()});
+#endif  // CTP_ENABLE_SNAPPY
+#if CTP_ENABLE_BLOSC2
     compressors.push_back({"Blosc2", "default", std::make_unique<ctp::Blosc>()});
+#endif  // CTP_ENABLE_BLOSC2
   }
   HLOG(kInfo, "Distribution variants: {} (varying compressibility)", distributions.size());
   HLOG(kInfo, "Data sizes: {} bins", data_sizes.size());

@@ -31,6 +31,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <type_traits>
 #include <catch2/catch_all.hpp>
 
 #include "clio_ctp/data_structures/ipc/ring_buffer.h"
@@ -220,7 +221,7 @@ TEST_CASE("GpuShmMmap", "[gpu][backend]") {
     // Step 4 & 5: Pass the ring_buffer to the kernel and push 10 elements
     // Allocate GPU-accessible host memory for the values array
     int *host_values;
-    cudaMallocHost(&host_values, kNumElements * sizeof(int));
+    host_values = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(host_values)>>(kNumElements * sizeof(int));
     for (size_t i = 0; i < kNumElements; ++i) {
       host_values[i] = static_cast<int>(i);
     }
@@ -229,7 +230,7 @@ TEST_CASE("GpuShmMmap", "[gpu][backend]") {
     // memory)
     PushElementsKernel<int, AllocT>
         <<<1, 1>>>(ring_ptr, host_values, kNumElements);
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
 
     // Step 6: Verify the runtime (CPU) can pop the 10 elements
     // Since GpuShmMmap provides unified memory, CPU can directly access the
@@ -257,7 +258,7 @@ TEST_CASE("GpuShmMmap", "[gpu][backend]") {
     }
 
     // Free pinned host memory
-    cudaFreeHost(host_values);
+    ctp::GpuApi::FreeHost(host_values);
 
     // Cleanup handled automatically by destructor
   }
@@ -286,12 +287,11 @@ TEST_CASE("GpuShmMmap", "[gpu][backend]") {
     // Step 5: Pass allocator and vector pointers to GPU kernel
     // They are already compatible with GPU memory (unified memory)
     SerializeStringStructKernel<AllocT><<<1, 1>>>(alloc_ptr, vec_ptr);
-    cudaError_t err = cudaDeviceSynchronize();
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Check for kernel launch errors
-    err = cudaGetLastError();
-    REQUIRE(err == cudaSuccess);
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Step 6: Check that the vector is not empty
     REQUIRE(!vec_ptr->empty());
@@ -343,7 +343,7 @@ TEST_CASE("GpuShmMmap", "[gpu][backend]") {
 
     // Launch kernel to push structs
     PushStructsKernel<AllocT><<<1, 1>>>(ring_ptr, kNumElements);
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
 
     // CPU pops and verifies
     for (size_t i = 0; i < kNumElements; ++i) {
@@ -393,6 +393,6 @@ TEST_CASE("GpuShmMmap", "[gpu][backend]") {
     }
 
     // Sync to ensure kernel finishes cleanly before backend teardown
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
   }
 }

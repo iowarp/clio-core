@@ -111,6 +111,9 @@ struct BaseCreateTask : public clio::run::Task {
   // Flags set by template parameters (must be serialized for remote execution)
   bool is_admin_;
   bool do_compose_;
+  /** API create whose pool is recorded in each node's pool log and
+   *  re-created after a restart (ContainerClient::SetPersistent). */
+  bool persist_;
 
   // Client pointer for PostWait callback (not serialized)
   clio::run::ContainerClient *client_;
@@ -125,6 +128,7 @@ struct BaseCreateTask : public clio::run::Task {
         error_message_(CLIO_PRIV_ALLOC),
         is_admin_(IS_ADMIN),
         do_compose_(DO_COMPOSE),
+        persist_(false),
         client_(nullptr) {
 #if CTP_IS_HOST
     HLOG(kDebug,
@@ -149,6 +153,7 @@ struct BaseCreateTask : public clio::run::Task {
         error_message_(CLIO_PRIV_ALLOC),
         is_admin_(IS_ADMIN),
         do_compose_(DO_COMPOSE),
+        persist_(client != nullptr && client->persist_create_),
         client_(client) {
     // Initialize base task
     task_id_ = task_node;
@@ -186,6 +191,7 @@ struct BaseCreateTask : public clio::run::Task {
         error_message_(CLIO_PRIV_ALLOC),
         is_admin_(IS_ADMIN),
         do_compose_(DO_COMPOSE),
+        persist_(client != nullptr && client->persist_create_),
         client_(client) {
     // Initialize base task
     task_id_ = task_node;
@@ -223,6 +229,7 @@ struct BaseCreateTask : public clio::run::Task {
         error_message_(CLIO_PRIV_ALLOC),
         is_admin_(IS_ADMIN),
         do_compose_(false),
+        persist_(client != nullptr && client->persist_create_),
         client_(client) {
     task_id_ = task_node;
     method_ = MethodId;
@@ -244,6 +251,7 @@ struct BaseCreateTask : public clio::run::Task {
         error_message_(CLIO_PRIV_ALLOC),
         is_admin_(IS_ADMIN),
         do_compose_(DO_COMPOSE),
+        persist_(false),
         client_(nullptr) {
 #if CTP_IS_HOST
     HLOG(kDebug,
@@ -313,7 +321,7 @@ struct BaseCreateTask : public clio::run::Task {
 #endif
     Task::SerializeIn(ar);
     ar(chimod_name_, pool_name_, chimod_params_, new_pool_id_, is_admin_,
-       do_compose_);
+       do_compose_, persist_);
 #if CTP_IS_HOST
     HLOG(kDebug,
          "BaseCreateTask::SerializeIn AFTER: do_compose_={}, is_admin_={}",
@@ -354,6 +362,7 @@ struct BaseCreateTask : public clio::run::Task {
     error_message_ = other->error_message_;
     is_admin_ = other->is_admin_;
     do_compose_ = other->do_compose_;
+    persist_ = other->persist_;
 #if CTP_IS_HOST
     HLOG(kDebug, "BaseCreateTask::Copy() AFTER: this->do_compose_={}",
          do_compose_);
@@ -449,6 +458,13 @@ using GetOrCreatePoolTask =
 template <typename CreateParamsT>
 using ComposeTask =
     BaseCreateTask<CreateParamsT, Method::kGetOrCreatePool, false, true>;
+
+/**
+ * DestroyPoolTask::destruction_flags_ bit: keep the pool's entry in each
+ * node's pool log, so the next `clio_run start` re-creates it (`compose stop`
+ * sets it; `compose rm` and plain destroys do not).
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kDestroyPoolKeepRestartable = 0x1;
 
 /**
  * DestroyPoolTask - Destroy an existing ChiPool
@@ -1656,7 +1672,7 @@ struct RegisterMemoryTask : public clio::run::Task {
 
 /**
  * RestartContainersTask - Restart containers from saved compose configs
- * Reads conf_dir/restart/ directory and re-creates pools from saved YAML files
+ * Re-creates this node's durable pools from its pool log (conf_dir/wal)
  */
 struct RestartContainersTask : public clio::run::Task {
   OUT clio::run::u32 containers_restarted_;

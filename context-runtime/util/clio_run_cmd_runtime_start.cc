@@ -2,7 +2,10 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <vector>
 #include <string>
 #include <thread>
 
@@ -14,6 +17,10 @@
 #include "clio_runtime/singletons.h"
 #include "clio_runtime/types.h"
 #include "clio_run_commands.h"
+
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 namespace {
 volatile sig_atomic_t g_keep_running = 1;
@@ -157,17 +164,13 @@ void PrintVizUsage() {
 }
 
 void PrintRuntimeStartUsage() {
-  HIPRINT("Usage: clio runtime start [--induct] [--ephemeral] [viz options]");
-  HIPRINT("  Starts the Clio runtime server");
+  HIPRINT("Usage: clio start [--fresh] [--induct] [--ephemeral] [viz options]");
+  HIPRINT("  Starts the Clio runtime server. It RECOVERS every piece of persistent");
+  HIPRINT("  state it finds (pools, metadata logs, allocators, data); it never");
+  HIPRINT("  discards state unless asked to.");
+  HIPRINT("  --fresh: Discard this node's persistent state and start empty");
   HIPRINT("  --induct: Register this node with all existing cluster nodes");
   HIPRINT("  --ephemeral: Skip the default compose; start bare (admin only)");
-  PrintVizUsage();
-}
-
-void PrintRuntimeRestartUsage() {
-  HIPRINT("Usage: clio runtime restart [--induct] [viz options]");
-  HIPRINT("  Restarts the Clio runtime, replaying WAL to recover address table");
-  HIPRINT("  --induct: Register this node with all existing cluster nodes");
   PrintVizUsage();
 }
 
@@ -251,8 +254,25 @@ void EnableVizForDaemon() {
 
 }  // namespace
 
+/**
+ * Let a debugger attach to this daemon when CLIO_ALLOW_PTRACE=1. Hosts with
+ * kernel.yama.ptrace_scope=1 only allow tracing of descendants, so a hung or
+ * stalled runtime could not be sampled with `gdb -p` without restarting it
+ * under gdb (which yields one snapshot and then kills it). Opt-in only.
+ */
+static void MaybeAllowPtrace() {
+#if defined(__linux__) && defined(PR_SET_PTRACER)
+  const char *e = std::getenv("CLIO_ALLOW_PTRACE");
+  if (e != nullptr && e[0] == '1') {
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+  }
+#endif
+}
+
 int RuntimeStart(int argc, char* argv[]) {
+  MaybeAllowPtrace();
   bool induct = false;
+  bool fresh = false;
   for (int i = 0; i < argc; ++i) {
     VizArg viz_arg = ParseVizArg(argc, argv, i);
     if (viz_arg == VizArg::kBadValue) {
@@ -260,6 +280,10 @@ int RuntimeStart(int argc, char* argv[]) {
       return 1;
     }
     if (viz_arg == VizArg::kConsumed) {
+      continue;
+    }
+    if (std::strcmp(argv[i], "--fresh") == 0) {
+      fresh = true;
       continue;
     }
     if (std::strcmp(argv[i], "--induct") == 0) {
@@ -283,9 +307,19 @@ int RuntimeStart(int argc, char* argv[]) {
   std::signal(SIGTERM, SignalHandler);
   std::signal(SIGINT, SignalHandler);
 
-  HLOG(kDebug, "Starting Clio runtime...");
+  // Recovery is the default and only `--fresh` discards state: an operator
+  // (re)starting a service must never lose its data because a flag was
+  // missing.
+  const bool recover = !fresh;
+  if (recover) {
+    HLOG(kInfo, "Starting Clio runtime (recovering persistent state)...");
+  } else {
+    HLOG(kWarning, "Starting Clio runtime with --fresh: this node's "
+         "persistent state is discarded");
+  }
 
-  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kRuntime, true)) {
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kRuntime, true,
+                           /*is_restart=*/recover)) {
     HLOG(kError, "Failed to initialize Clio runtime");
     return 1;
   }
@@ -319,66 +353,3 @@ int RuntimeStart(int argc, char* argv[]) {
   return 0;
 }
 
-int RuntimeRestart(int argc, char* argv[]) {
-  bool induct = false;
-  for (int i = 0; i < argc; ++i) {
-    VizArg viz_arg = ParseVizArg(argc, argv, i);
-    if (viz_arg == VizArg::kBadValue) {
-      PrintRuntimeRestartUsage();
-      return 1;
-    }
-    if (viz_arg == VizArg::kConsumed) {
-      continue;
-    }
-    if (std::strcmp(argv[i], "--induct") == 0) {
-      induct = true;
-    } else if (std::strcmp(argv[i], "--help") == 0 ||
-               std::strcmp(argv[i], "-h") == 0) {
-      PrintRuntimeRestartUsage();
-      return 0;
-    } else {
-      HLOG(kError, "Unknown argument: {}", argv[i]);
-      PrintRuntimeRestartUsage();
-      return 1;
-    }
-  }
-
-  std::signal(SIGTERM, SignalHandler);
-  std::signal(SIGINT, SignalHandler);
-
-  HLOG(kInfo, "Restarting Clio runtime (WAL replay enabled)...");
-
-  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kRuntime, true,
-                           /*is_restart=*/true)) {
-    HLOG(kError, "Failed to restart Clio runtime");
-    return 1;
-  }
-
-  HLOG(kInfo, "Clio runtime restarted successfully");
-
-  if (!InitializeAdminChiMod()) {
-    HLOG(kError, "FATAL ERROR: Failed to find or initialize admin ChiMod");
-    return 1;
-  }
-
-  HLOG(kDebug, "Admin ChiMod initialized successfully with pool ID {}", clio::run::kAdminPoolId);
-
-  EnableVizForDaemon();
-
-  if (induct) {
-    if (!InductNode()) {
-      HLOG(kError, "FATAL ERROR: Failed to induct node into cluster");
-      return 1;
-    }
-  }
-
-  RunUntilStopped();
-
-  HLOG(kDebug, "Shutting down Clio runtime...");
-  // The admin pool is NOT destroyed here — ServerFinalize()'s
-  // DestroyAllContainers() does it after StopWorkers(). See the
-  // "no ShutdownAdminChiMod()" note near the top of this file for why tearing
-  // it down while the workers still run wedges the shutdown.
-  HLOG(kDebug, "Clio runtime stopped (finalization will happen automatically)");
-  return 0;
-}

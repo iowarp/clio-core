@@ -55,7 +55,13 @@
 #endif
 #include "cte_env.h"
 
-using kvhdf5::byte_t;
+// NOTE: deliberately NOT named `kv_byte_t`. cuSZ's <cusz.h> (pulled in
+// transitively via clio_ctp/compress/compress_factory.h, which the
+// context-runtime headers include) declares `typedef uint8_t kv_byte_t;` at
+// GLOBAL scope. kvhdf5::byte_t is cuda::std::byte, so a global
+// `using kvhdf5::byte_t;` here is a conflicting redeclaration and this TU
+// fails to compile as soon as CUDA and compression are both enabled.
+using kv_byte_t = kvhdf5::byte_t;
 
 namespace {
 
@@ -86,8 +92,8 @@ __global__ void GsStepKernel(const float* u, const float* v, float* un, float* v
 // Copy the grid slice for chunk c into the handle's chunk-c buffer. Uniform chunk
 // size, 1-D float layout => chunk c is the contiguous byte range [c*n, c*n+n).
 __device__ inline void CopyChunk(kvhdf5::GpuDatasetHandle& h, uint32_t c,
-                                 const byte_t* src) {
-    byte_t* dst = h.Data(c);
+                                 const kv_byte_t* src) {
+    kv_byte_t* dst = h.Data(c);
     uint64_t n = h.Size(c);
     uint64_t off = static_cast<uint64_t>(c) * n;
     for (uint64_t i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[off + i];
@@ -98,7 +104,7 @@ __device__ inline void CopyChunk(kvhdf5::GpuDatasetHandle& h, uint32_t c,
 __global__ void GsSnapSyncKernel(kvhdf5::GpuDatasetHandle h, const float* src) {
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
-    const byte_t* s = reinterpret_cast<const byte_t*>(src);
+    const kv_byte_t* s = reinterpret_cast<const kv_byte_t*>(src);
     for (uint32_t c = 0; c < h.Count(); ++c) {
         CopyChunk(h, c, s);
         __threadfence_system();
@@ -114,7 +120,7 @@ __global__ void GsSnapSyncKernel(kvhdf5::GpuDatasetHandle h, const float* src) {
 __global__ void GsSnapAsyncKernel(kvhdf5::GpuDatasetHandle h, const float* src) {
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
-    const byte_t* s = reinterpret_cast<const byte_t*>(src);
+    const kv_byte_t* s = reinterpret_cast<const kv_byte_t*>(src);
     for (uint32_t c = 0; c < h.Count(); ++c) {
         CopyChunk(h, c, s);
         __threadfence_system();
@@ -131,7 +137,7 @@ __global__ void GsSnapAsyncKernel(kvhdf5::GpuDatasetHandle h, const float* src) 
 __global__ void GsSnapFireKernel(kvhdf5::GpuDatasetHandle h, const float* src) {
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
-    const byte_t* s = reinterpret_cast<const byte_t*>(src);
+    const kv_byte_t* s = reinterpret_cast<const kv_byte_t*>(src);
     for (uint32_t c = 0; c < h.Count(); ++c) {
         CopyChunk(h, c, s);
         __threadfence_system();
@@ -161,7 +167,7 @@ clio::cte::core::TagId MakeTag(const char* name) {
     return t->tag_id_;
 }
 
-std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& name,
+std::vector<kv_byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& name,
                                  uint64_t size) {
     ctp::ipc::FullPtr<char> buf = CLIO_CPU_IPC->AllocateBuffer(size);
     REQUIRE(!buf.IsNull());
@@ -170,7 +176,7 @@ std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& 
     auto t = CLIO_CTE_CLIENT->AsyncGetBlob(tag, name, clio::run::u64(0), size, clio::run::u32(0), shm);
     t.Wait();
     REQUIRE(t->GetReturnCode() == 0);
-    std::vector<byte_t> out(size);
+    std::vector<kv_byte_t> out(size);
     std::memcpy(out.data(), buf.ptr_, size);
     return out;
 }
@@ -268,7 +274,7 @@ TEST_CASE("GPU Gray-Scott async multi-chunk snapshots round-trip",
     for (unsigned s = 0; s < nsnap; ++s) {
         for (unsigned c = 0; c < C; ++c) {
             auto got = HostReadBlob(tags[s], std::to_string(c), chunk_bytes);
-            const byte_t* exp = reinterpret_cast<const byte_t*>(expected[s].data())
+            const kv_byte_t* exp = reinterpret_cast<const kv_byte_t*>(expected[s].data())
                                 + static_cast<uint64_t>(c) * chunk_bytes;
             REQUIRE(std::memcmp(got.data(), exp, chunk_bytes) == 0);
         }
@@ -350,11 +356,11 @@ TEST_CASE("GPU Gray-Scott async-overlapped snapshots beat sync in a real sim (nt
     // a single chunk CAN be all-zero, since Gray-Scott activity is a centre patch far
     // from the edge rows) and the field evolved between the first and last snapshot.
     const unsigned chunk_bytes = bytes / C;
-    const std::vector<byte_t> zero(chunk_bytes, byte_t{});
-    std::vector<byte_t> first_full, last_full;
+    const std::vector<kv_byte_t> zero(chunk_bytes, kv_byte_t{});
+    std::vector<kv_byte_t> first_full, last_full;
     bool any_nonzero = false;
     for (unsigned s = 0; s < nsnap; ++s) {
-        std::vector<byte_t> full;
+        std::vector<kv_byte_t> full;
         for (unsigned c = 0; c < C; ++c) {
             auto sv = HostReadBlob(sync_tags[s], std::to_string(c), chunk_bytes);
             auto av = HostReadBlob(async_tags[s], std::to_string(c), chunk_bytes);

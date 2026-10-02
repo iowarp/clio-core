@@ -42,7 +42,7 @@ sudo /usr/sbin/sshd
 echo '=== Node 1: starting local clio daemon ==='
 # Daemon output goes to a file: at info level it emits a periodic scheduler
 # report that would otherwise bury this script's progress in `docker logs`.
-CLIO_COLL_PROF=${CLIO_COLL_PROF:-} CLIO_NET_QPROF=${CLIO_NET_QPROF:-} CLIO_WORKER_RATE=${CLIO_WORKER_RATE:-} /workspace/build/bin/clio_run runtime start > /tmp/clio_daemon.log 2>&1 &
+CLIO_COLL_PROF=${CLIO_COLL_PROF:-} CLIO_NET_QPROF=${CLIO_NET_QPROF:-} CLIO_WORKER_RATE=${CLIO_WORKER_RATE:-} /workspace/build/bin/clio_run runtime start --fresh > /tmp/clio_daemon.log 2>&1 &
 echo "Node 1: daemon PID $!"
 
 echo "=== Node 1: waiting for worker SSH (nodes 2..${NUM_NODES}) ==="

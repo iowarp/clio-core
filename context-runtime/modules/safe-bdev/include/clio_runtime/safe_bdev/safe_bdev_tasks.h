@@ -166,6 +166,12 @@ struct CreateParams {
   // and the append-only group structure are persisted here and recovered on a
   // subsequent create over the same members + same path.
   std::string alloc_log_path_;
+  // Members live on the nodes their node_id_ names (a bdev pool has a
+  // container on every node; each member is one node's). Member I/O is
+  // routed to that node, the array runs on the FIRST member's node, and a
+  // member whose node dies is marked faulty. false (default): every member
+  // is this node's container of its pool (node_id_ ignored), as before.
+  bool distributed_ = false;
 
   // Required: chimod library name for module manager
   static constexpr const char *chimod_lib_name = "clio_safe_bdev";
@@ -174,15 +180,17 @@ struct CreateParams {
 
   CreateParams(clio::run::u32 max_failures,
                const std::vector<MemberBdevDesc> &members,
-               const std::string &alloc_log_path = "")
+               const std::string &alloc_log_path = "",
+               bool distributed = false)
       : max_failures_(max_failures),
         members_(members),
-        alloc_log_path_(alloc_log_path) {}
+        alloc_log_path_(alloc_log_path),
+        distributed_(distributed) {}
 
   // Serialization support for cereal
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(max_failures_, members_, alloc_log_path_);
+    ar(max_failures_, members_, alloc_log_path_, distributed_);
   }
 
   /**
@@ -204,6 +212,9 @@ struct CreateParams {
 
     if (config["alloc_log"]) {
       alloc_log_path_ = config["alloc_log"].as<std::string>();
+    }
+    if (config["distributed"]) {
+      distributed_ = config["distributed"].as<bool>();
     }
 
     if (config["members"] && config["members"].IsSequence()) {

@@ -28,11 +28,10 @@ enum ShmFileFlags : clio::run::u32 {
   /** Directory, not a regular file. Never payload-readable. */
   kShmFileIsDir = 1u << 1,
   /**
-   * The file has appends staged but not yet merged into its tail (see
-   * Runtime::Append). Until the AppendSequence pipeline drains them the bytes
-   * live under the staging tag, not under this file's page blobs, and the
-   * tracked size is explicitly best-effort -- so neither size nor pages may be
-   * trusted for a direct read.
+   * The file has appends staged but not yet merged into its tail: neither
+   * size nor pages may be trusted for a direct read. Reserved: deferred
+   * appends now go through the stream pool, whose writers flush before they
+   * read, so the runtime no longer sets it.
    */
   kShmFilePendingAppend = 1u << 2,
   /** Catch-all refusal for states the fast path does not model. */

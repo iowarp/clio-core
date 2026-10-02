@@ -751,6 +751,18 @@ class ContainerClient {
  public:
   PoolId pool_id_;  ///< The unique ID of the pool this client connects to
   u32 return_code_; ///< Return code from the last Create operation (0=success, non-zero=error)
+  /** Pools this client creates are recorded in each node's pool log and
+   *  re-created when the node restarts (see SetPersistent). */
+  bool persist_create_ = false;
+
+  /**
+   * Make the pools this client creates durable: each node records the
+   * create in its pool log and re-creates its container after a restart --
+   * the API counterpart of `restart: true` on a compose pool. Off by
+   * default, so test and benchmark pools are never resurrected.
+   * @param v true to persist later creates
+   */
+  CTP_CROSS_FUN void SetPersistent(bool v) { persist_create_ = v; }
 
   /**
    * Default constructor

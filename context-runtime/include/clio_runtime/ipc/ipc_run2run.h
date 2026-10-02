@@ -34,9 +34,11 @@
 #ifndef CLIO_RUNTIME_IPC_RUN2RUN_H_
 #define CLIO_RUNTIME_IPC_RUN2RUN_H_
 
+#include <cstdlib>
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <list>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -65,6 +67,57 @@ static constexpr clio::run::u64 kInvalidNodeId = ~clio::run::u64(0);
 /** How long (seconds) to keep a task in the retry queue before failing it */
 static constexpr float kRun2RunRetryTimeoutSec = 30.0f;
 
+/**
+ * How long a send to an unreachable node is retried before its task fails
+ * with kRun2RunNetworkTimeoutRC. Default kRun2RunRetryTimeoutSec (rides out a
+ * peer restart); CLIO_NET_RETRY_TIMEOUT_S overrides it -- a filesystem
+ * deployment that prefers a prompt EIO over a 30 s stall per operation while
+ * a node is down lowers it.
+ * @return the retry window in seconds
+ */
+/**
+ * CLIO_NET_DEAD_FAIL_FAST=1: a task addressed to a peer already DECLARED
+ * dead fails at once (network-timeout RC; a broadcast answers from the
+ * reachable peers) instead of waiting out the retry window. For clients
+ * such as a filesystem, where one user operation is a chain of RPCs (a path
+ * lookup is one per component), the retry window otherwise multiplies into
+ * minutes per syscall while a node is down. Off by default: the retry
+ * window is what lets tasks ride out a peer's restart.
+ * @return true when fail-fast is enabled
+ */
+inline bool Run2RunFailFastDead() {
+  static const bool v = [] {
+    const char *e = std::getenv("CLIO_NET_DEAD_FAIL_FAST");
+    return e != nullptr && *e == '1';
+  }();
+  return v;
+}
+
+/**
+ * TEST ONLY -- simulate a network partition. When CLIO_TEST_PARTITION_FILE
+ * names a file, every node id listed in it (whitespace separated) is
+ * unreachable for this node's sends: they fail at once with the network
+ * timeout code, while every other view of the peer (liveness probes, what
+ * other nodes see) is unchanged -- the "partitioned but not declared dead"
+ * case. The file is re-read at most every 500 ms, so a test starts and heals
+ * the partition by rewriting it. Without the variable: always false.
+ * @param node_id the peer a task is about to be sent to
+ * @return true if this node must behave as if it cannot reach node_id
+ */
+bool Run2RunTestPartitioned(u32 node_id);
+
+inline float Run2RunRetryTimeoutSec() {
+  static const float v = [] {
+    const char *e = std::getenv("CLIO_NET_RETRY_TIMEOUT_S");
+    if (e != nullptr && *e != '\0') {
+      const float f = std::strtof(e, nullptr);
+      if (f > 0.0f) return f;
+    }
+    return kRun2RunRetryTimeoutSec;
+  }();
+  return v;
+}
+
 /** Entry in a retry queue for tasks that could not be sent */
 struct RetryEntry {
   clio::run::shared_ptr<clio::run::Task> task;
@@ -81,12 +134,27 @@ struct ReplicaProgress {
   // post-recovery container mapping, or fails the replica after its bounded
   // timeout). This flag stops the dead-node scan from enqueuing duplicates.
   bool redispatched = false;
+  // Consecutive QueryTaskProgress answers of Gone. A single Gone is not
+  // proof: a probe queued behind a backlog answers after the replica has
+  // finished. The replica is declared lost only after kGoneStrikesToFail
+  // answers, an interval apart.
+  clio::run::u32 gone_strikes = 0;
 };
+
+/** Gone answers, one probe interval apart, before a replica is declared lost. */
+constexpr clio::run::u32 kGoneStrikesToFail = 2;
 
 /** Per-origin progress state, keyed by net_key in progress_map_ (issue #628). */
 struct OriginProgress {
   std::chrono::steady_clock::time_point enqueue_time;
   std::vector<ReplicaProgress> replicas;  // indexed by replica_id
+  // net_key is the origin task's heap address, which the allocator reuses as
+  // soon as the task is freed. A probe answered late (the target was
+  // backlogged) can therefore name a key that now belongs to a NEWER task;
+  // applying its Gone failed healthy puts at 16 and 64 nodes. Every
+  // registration gets a fresh generation, probes carry it, and an answer
+  // whose generation no longer matches is dropped.
+  clio::run::u64 gen = 0;
   // Admin-pool origins are tracked for the dead-node scan but must never be
   // PROBED: QueryTaskProgress is itself an admin cross-node task, so probing
   // admin origins would recurse (issue #896).
@@ -98,6 +166,7 @@ struct StuckReplica {
   clio::run::u64 net_key;
   clio::run::u32 replica_id;
   clio::run::u64 target_node_id;
+  clio::run::u64 gen;  // OriginProgress::gen at collection time
 };
 
 /**
@@ -151,6 +220,14 @@ class IpcManagerRun2Run {
    * per-task (or default) timeout.
    */
   void ProcessRetryQueues();
+
+  /**
+   * Replay inbound archives that were deferred because a task in them
+   * addressed a pool this node had not composed yet (see RecvIn), and drop
+   * the ones older than kDeferredRecvTimeoutSec. Called from the same net
+   * tick as ProcessRetryQueues.
+   */
+  void ReplayDeferredRecv();
 
   /**
    * Scan send_map_ for tasks waiting on nodes that have been marked dead and
@@ -224,8 +301,17 @@ class IpcManagerRun2Run {
    * accounted for, complete the origin with a network-timeout RC (partial
    * results from the replicas that did answer are preserved).
    */
+  /**
+   * Forget a received replica once its response has left this node (or was
+   * dropped), so QueryTaskProgress stops answering Running for it.
+   * @param task the replica task as received (its task_id_ carries net_key
+   *        and replica_id, which key recv_map_)
+   */
+  void EraseRecvEntry(const clio::run::shared_ptr<clio::run::Task> &task);
+
   void HandleTaskProgressResult(clio::run::u64 net_key,
-                                clio::run::u32 replica_id, bool gone);
+                                clio::run::u32 replica_id, bool gone,
+                                clio::run::u64 gen = 0);
 
  private:
   // ---------------------------------------------------------------------------
@@ -365,6 +451,7 @@ class IpcManagerRun2Run {
   // Per-origin cross-node progress state, keyed by net_key (issue #628).
   // Guarded by send_map_mutex_ (updated in lock-step with send_map_).
   std::unordered_map<size_t, OriginProgress> progress_map_;
+  clio::run::u64 progress_gen_ = 0;  // last OriginProgress::gen issued; under send_map_mutex_
   // Throttle: last time CollectStuckReplicas actually ran a scan pass.
   std::chrono::steady_clock::time_point last_progress_scan_{};
 
@@ -392,6 +479,28 @@ class IpcManagerRun2Run {
   mutable std::mutex retry_queues_mutex_;
   std::deque<RetryEntry> send_in_retry_;
   std::deque<RetryEntry> send_out_retry_;
+
+  /**
+   * An inbound archive that arrived before this node composed the pool one
+   * of its tasks addresses. Startup skew, not an error: at 64 nodes the
+   * first broadcast GetOrCreateTag reached four nodes whose CTE container
+   * did not exist yet; RecvInHandleOne dropped the replicas, the origin's
+   * progress probes answered Gone twice, and the origins failed with
+   * kRun2RunNetworkTimeoutRC before the run had seeded. The archive is
+   * pristine (no task consumed, bulk frames still attached), so it is held
+   * whole and replayed once every container it needs exists.
+   */
+  struct DeferredRecv {
+    clio::run::LoadTaskArchive archive;
+    ctp::lbm::Transport *transport;
+    std::chrono::steady_clock::time_point arrived;
+  };
+  static constexpr float kDeferredRecvTimeoutSec = 120.0f;
+  /** True when every task in the archive has its container on this node. */
+  static bool AllContainersPresent(clio::run::PoolManager *pool_manager,
+                                   const clio::run::LoadTaskArchive &archive);
+  std::mutex deferred_recv_mutex_;
+  std::list<DeferredRecv> deferred_recv_;  // list: erase never moves an archive
 };
 
 }  // namespace clio::run

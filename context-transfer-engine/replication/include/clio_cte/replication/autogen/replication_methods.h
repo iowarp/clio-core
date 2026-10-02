@@ -42,8 +42,14 @@ GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob =
 GLOBAL_CROSS_CONST clio::run::u32 kReplicateBlob = 100;
 GLOBAL_CROSS_CONST clio::run::u32 kFlushTag = 101;
 GLOBAL_CROSS_CONST clio::run::u32 kReplicateSweep = 102;
+GLOBAL_CROSS_CONST clio::run::u32 kHandoffPull = 103;
+GLOBAL_CROSS_CONST clio::run::u32 kHandoffSweep = 104;
+// Interposed core verbs mirrored to the remote copies.
+GLOBAL_CROSS_CONST clio::run::u32 kDelBlob = clio::cte::core::Method::kDelBlob;
+GLOBAL_CROSS_CONST clio::run::u32 kTruncateBlob =
+    clio::cte::core::Method::kTruncateBlob;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 103;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 105;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -58,6 +64,10 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[100] = "ReplicateBlob";
     v[101] = "FlushTag";
     v[102] = "ReplicateSweep";
+    v[kHandoffPull] = "HandoffPull";
+    v[kHandoffSweep] = "HandoffSweep";
+    v[kDelBlob] = "DelBlob";
+    v[kTruncateBlob] = "TruncateBlob";
     return v;
   }();
   return names;

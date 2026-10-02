@@ -156,7 +156,7 @@ class PosixAsyncIO : public AsyncIO {
   IoToken SubmitIO(void *buffer, size_t size, off_t offset, bool is_write) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    int fd = SelectFd(buffer, size);
+    int fd = SelectFd(buffer, size, offset);
     IoToken token = next_token_.fetch_add(1);
 
     auto cb = std::make_unique<struct aiocb>();
@@ -182,10 +182,21 @@ class PosixAsyncIO : public AsyncIO {
     return token;
   }
 
-  int SelectFd(void *buffer, size_t size) const {
+  /**
+   * Choose the O_DIRECT fd only when the buffer, the length AND the file
+   * offset are all 4 KiB-aligned; anything else uses the buffered fd. The
+   * offset check was missing: an aligned buffer written at an unaligned file
+   * offset (a truncate zeroing a page tail) went to O_DIRECT and failed with
+   * EINVAL.
+   * @param buffer I/O buffer
+   * @param size I/O length
+   * @param offset file offset
+   * @return fd to submit on
+   */
+  int SelectFd(void *buffer, size_t size, off_t offset) const {
     if (direct_fd_ >= 0 &&
         (reinterpret_cast<uintptr_t>(buffer) % 4096 == 0) &&
-        (size % 4096 == 0)) {
+        (size % 4096 == 0) && (offset % 4096 == 0)) {
       return direct_fd_;
     }
     return regular_fd_;

@@ -40,6 +40,7 @@
  */
 
 #ifndef _WIN32
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #else
@@ -55,6 +56,7 @@
 #include <clio_ctp/introspect/system_info.h>
 
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -510,6 +512,75 @@ TEST_CASE("bdev_lazy_file_growth", "[bdev][file][growth]") {
     REQUIRE(final_size <= static_cast<clio::run::i64>(kCapacity));
   }
 }
+
+/**
+ * A disk with less room than one growth unit: the backing file grows by just
+ * what an allocation needs, so the space that exists is used, and once the
+ * disk is full allocations fail at once. RLIMIT_FSIZE stands in for a full
+ * disk (growing past it fails with EFBIG, as past a full disk with ENOSPC).
+ * Before, a failed unit-sized grow refused every allocation past the backed
+ * prefix even with room left, and each refusal retried the whole
+ * reservation (gigabytes on a real deployment), stalling writers for
+ * minutes.
+ */
+#ifndef _WIN32
+TEST_CASE("bdev_file_growth_near_full_disk", "[bdev][file][growth][enospc]") {
+  BdevChimodFixture fixture;
+  if (fixture.getNumContainers() != 1) {
+    HLOG(kInfo, "bdev_file_growth_near_full_disk: skipping (the file size "
+                "limit must apply to the runtime: num_containers != 1)");
+    return;
+  }
+  REQUIRE(g_initialized);
+  constexpr clio::run::u64 kMiB = 1024 * 1024;
+  constexpr clio::run::u64 kCapacity = 64 * kMiB;
+  constexpr clio::run::u64 kGrowthUnit = 32 * kMiB;
+  constexpr rlim_t kDiskRoom = 40 * kMiB;  // less than two growth units
+
+  clio::run::PoolId custom_pool_id(142, 0);
+  clio::run::bdev::Client client(custom_pool_id);
+  auto create_task = client.AsyncCreate(
+      clio::run::PoolQuery::Dynamic(), fixture.getTestFile(), custom_pool_id,
+      clio::run::bdev::BdevType::kFile, kCapacity, 32, 4096,
+      /*perf_metrics=*/nullptr, /*alloc_log_path=*/"", kGrowthUnit);
+  create_task.Wait();
+  REQUIRE(create_task->GetReturnCode() == 0);
+  client.pool_id_ = create_task->new_pool_id_;
+
+  struct rlimit old_lim;
+  REQUIRE(getrlimit(RLIMIT_FSIZE, &old_lim) == 0);
+  auto old_sig = signal(SIGXFSZ, SIG_IGN);
+  struct rlimit lim = old_lim;
+  lim.rlim_cur = kDiskRoom;
+  REQUIRE(setrlimit(RLIMIT_FSIZE, &lim) == 0);
+
+  auto pool_query = clio::run::PoolQuery::DirectHash(0);
+  auto alloc = [&](clio::run::u64 bytes) {
+    auto a = client.AsyncAllocateBlocks(pool_query, bytes);
+    a.Wait();
+    return a->return_code_;
+  };
+  // Inside the first (backed) unit.
+  const auto rc1 = alloc(24 * kMiB);
+  // Past it: the next unit (to 64 MiB) does not fit, 36 MiB does.
+  const auto rc2 = alloc(12 * kMiB);
+  // Past the room left: refused, and quickly.
+  const auto t0 = std::chrono::steady_clock::now();
+  int refused = 0;
+  for (int i = 0; i < 20; ++i) refused += alloc(8 * kMiB) != 0 ? 1 : 0;
+  const double ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+
+  setrlimit(RLIMIT_FSIZE, &old_lim);
+  signal(SIGXFSZ, old_sig);
+  HLOG(kInfo, "bdev_file_growth_near_full_disk: rc {} {}, {} of 20 refused "
+       "in {} ms", rc1, rc2, refused, ms);
+  REQUIRE(rc1 == 0);
+  REQUIRE(rc2 == 0);
+  REQUIRE(refused == 20);
+  REQUIRE(ms < 2000.0);
+}
+#endif  // _WIN32
 
 /**
  * Regression for #798: alloc/free accounting must be alignment-symmetric.
@@ -1983,10 +2054,6 @@ TEST_CASE("bdev_parallel_io_operations", "[bdev][parallel][io]") {
 //==============================================================================
 // ALLOCATOR WAL (PERSISTENT ALLOCATOR STATE) TESTS
 //==============================================================================
-#if 0  // WIP (PR #663): the bdev alloc-log WAL is dormant on dev's rewritten
-       // bdev_runtime (FlushAllocLog handler + persistence not yet ported).
-       // Re-enable these tests once the bdev WAL is wired up.
-//
 // These tests exercise the persistent allocator-state log (WAL). They use a
 // FILE-backed bdev so written data survives a pool destroy, and a SECOND bdev
 // pool pointing at the SAME data file + SAME alloc-log file to simulate
@@ -2078,7 +2145,8 @@ TEST_CASE("bdev_alloc_log_recover_no_collision",
     // not call the bdev Destroy handler, so flush explicitly.)
     FlushLog(client);
     auto destroy_task =
-        CLIO_ADMIN->AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+        clio::run::admin::Client(clio::run::kAdminPoolId)
+            .AsyncDestroyPool(clio::run::PoolQuery::Dynamic(), pool_id);
     destroy_task.Wait();
     std::this_thread::sleep_for(200ms);
   }
@@ -2123,7 +2191,8 @@ TEST_CASE("bdev_alloc_log_recover_no_collision",
     }
 
     auto destroy_task =
-        CLIO_ADMIN->AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+        clio::run::admin::Client(clio::run::kAdminPoolId)
+            .AsyncDestroyPool(clio::run::PoolQuery::Dynamic(), pool_id);
     destroy_task.Wait();
   }
 
@@ -2162,7 +2231,8 @@ TEST_CASE("bdev_alloc_log_free_then_recover_reuse",
     // Persist the WAL (allocs of A/B/C + free of B) before destroying.
     FlushLog(client);
     auto destroy_task =
-        CLIO_ADMIN->AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+        clio::run::admin::Client(clio::run::kAdminPoolId)
+            .AsyncDestroyPool(clio::run::PoolQuery::Dynamic(), pool_id);
     destroy_task.Wait();
     std::this_thread::sleep_for(200ms);
   }
@@ -2189,7 +2259,8 @@ TEST_CASE("bdev_alloc_log_free_then_recover_reuse",
     REQUIRE_FALSE(RangesOverlap(more.offset_, more.size_, c.offset_, c.size_));
 
     auto destroy_task =
-        CLIO_ADMIN->AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+        clio::run::admin::Client(clio::run::kAdminPoolId)
+            .AsyncDestroyPool(clio::run::PoolQuery::Dynamic(), pool_id);
     destroy_task.Wait();
   }
 
@@ -2253,7 +2324,6 @@ TEST_CASE("bdev_alloc_log_compaction", "[bdev][alloc_log][compact]") {
 
   ctp::SystemInfo::RemoveFile(log_path);
 }
-#endif  // WIP #663: bdev alloc-log WAL tests (dormant feature)
 
 //==============================================================================
 // ManyToOne collective batch + aggregate (#587)

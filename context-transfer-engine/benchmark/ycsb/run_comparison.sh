@@ -73,7 +73,7 @@ setup_db() {
       local attempt ok=0
       for attempt in 1 2 3 4 5; do
         rm -rf /tmp/clio_$(whoami)/* 2>/dev/null
-        LD_LIBRARY_PATH="$BUILD_DIR/bin" "$BUILD_DIR/bin/clio_run" runtime start \
+        LD_LIBRARY_PATH="$BUILD_DIR/bin" "$BUILD_DIR/bin/clio_run" runtime start --fresh \
           >> "$OUT_DIR/clio_daemon_${wl}.log" 2>&1 &
         CLIO_PID=$!
         sleep 3

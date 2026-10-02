@@ -144,13 +144,22 @@ bool TaskStatModelSnapshot::Save(const std::string &path) const {
     // would happily load as the learned model.
     const std::string tmp_path = path + ".tmp";
     {
+      // The models directory does not exist on a fresh node; every runtime
+      // start then logged an ERROR per container and learned nothing across
+      // runs. Create it (best effort) before complaining.
+      std::error_code dir_ec;
+      std::filesystem::create_directories(
+          std::filesystem::path(path).parent_path(), dir_ec);
       std::ofstream ofs(tmp_path, std::ios::trunc);
       // Neither the stream's state (read by is_open/good below) nor the text
       // the yaml-cpp emitter accumulated is visible to MSan: libstdc++.so and
       // libyaml-cpp.so are both uninstrumented.
       CTP_MSAN_UNPOISON_OBJ(ofs);
       if (!ofs.is_open()) {
-        HLOG(kError, "TaskStatModel: failed to open {} for writing", tmp_path);
+        HLOG(kWarning,
+             "TaskStatModel: cannot write {} (directory create: {}); the "
+             "model will not persist across runs",
+             tmp_path, dir_ec ? dir_ec.message() : "ok");
         return false;
       }
       CTP_MSAN_UNPOISON(out.c_str(), out.size() + 1);

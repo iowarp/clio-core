@@ -23,3 +23,7 @@ kGetBlobSize: 23
 # Replication operations (above the core's method-id space)
 kReplicateBlob: 100
 kFlushTag: 101
+kDelBlob: 18
+kTruncateBlob: 37
+kHandoffPull: 103     # a restarted owner pulls what its successors changed
+kHandoffSweep: 104    # periodic: push changes back to owners that returned

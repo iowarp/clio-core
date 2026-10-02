@@ -19,7 +19,7 @@ services:
       "
         echo 'Runtime: Starting...' &&
         export PATH=/usr/local/bin:$PATH &&
-        clio_run runtime start &
+        clio_run runtime start --fresh &
         RUNTIME_PID=\$! &&
         echo \"Runtime: Started (PID \$RUNTIME_PID). Waiting...\" &&
         tail -f /dev/null

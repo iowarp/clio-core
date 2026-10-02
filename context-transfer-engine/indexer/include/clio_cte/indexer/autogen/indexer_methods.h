@@ -65,6 +65,8 @@ GLOBAL_CROSS_CONST clio::run::u32 kTruncateBlob =
     clio::cte::core::Method::kTruncateBlob;
 GLOBAL_CROSS_CONST clio::run::u32 kRenameTag =
     clio::cte::core::Method::kRenameTag;
+GLOBAL_CROSS_CONST clio::run::u32 kUpdateTagNames =
+    clio::cte::core::Method::kUpdateTagNames;
 GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob =
     clio::cte::core::Method::kMultiPutBlob;
 
@@ -87,6 +89,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[kSemanticSearch] = "SemanticSearch";
     v[kTruncateBlob] = "TruncateBlob";
     v[kRenameTag] = "RenameTag";
+    v[kUpdateTagNames] = "UpdateTagNames";
     v[kMultiPutBlob] = "MultiPutBlob";
     v[kIndexSweep] = "IndexSweep";
     v[kReindexScan] = "ReindexScan";

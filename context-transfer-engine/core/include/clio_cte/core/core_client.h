@@ -187,6 +187,16 @@ class Client : public clio::run::ContainerClient {
   bool HasShmCache() const { return shm_root_ != nullptr; }
 
   /**
+   * The stamp a zero-copy view hands out and CheckBlobGenShm re-checks:
+   * the placement generation (layout moved) and the content sequence
+   * (in-place overwrite started or finished) together, so a consumer
+   * that raced either one discards what it read.
+   */
+  static clio::run::u64 ShmReadStamp(const ShmBlobRecord &rec) {
+    return (rec.content_seq_ << 32) | (rec.placement_gen_ & 0xffffffffull);
+  }
+
+  /**
    * Zero-IPC metadata read.
    *
    * @return true if a consistent record was found in shared memory. false
@@ -230,6 +240,14 @@ class Client : public clio::run::ContainerClient {
     if (shm_root_ == nullptr || out == nullptr || size == 0) {
       return false;
     }
+    // DEVICE destinations take the RPC path: this fast path is a plain host
+    // std::memcpy, and a gpu_vector page fault hands us a cudaMalloc'd
+    // pointer a CPU store cannot touch (observed as a straight SIGSEGV when
+    // the compressor's get for a raw-stored device blob landed here). The
+    // RPC path dispatches on IsDevicePointer and copies device-side.
+    if (ctp::IsDevicePointer(out)) {
+      return false;
+    }
     ShmBlobRecord rec;
     if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
       return false;
@@ -243,14 +261,21 @@ class Client : public clio::run::ContainerClient {
     // Bound by the CACHED PREFIX, not by the blob's total size: a truncated
     // primary record describes only its first kMaxInlineBlocks blocks, and a
     // read past them has no block to resolve against.
-    const bool primary_ok =
-        rec.IsDirectReadable() && offset + size <= rec.CoveredBytes();
+    //
+    // AND by the DECLARED size: a block's capacity can exceed the bytes the
+    // blob holds (whole-block allocation, recycled extents), so a range past
+    // total_size_ but inside CoveredBytes() would copy stale bytes -- another
+    // file's data -- where a short read belongs. The RPC path clamps it.
+    const bool primary_ok = rec.IsDirectReadable() &&
+                            offset + size <= rec.CoveredBytes() &&
+                            offset + size <= rec.total_size_;
     // Serving-replica reads only for STACK-bound clients (AttachShmCacheOf):
     // they alias the whole interposer chain, whose task path returns
     // producer bytes. A direct core client keeps stored-bytes semantics.
     const bool replica_ok = shm_replica_serving_ && !primary_ok &&
                             rec.HasServableReplica() &&
-                            offset + size <= rec.RepCoveredBytes();
+                            offset + size <= rec.RepCoveredBytes() &&
+                            offset + size <= rec.rep_total_size_;
     if (!primary_ok && !replica_ok) {
       return false;  // transformed/file/remote/GPU-tier and no serving replica
     }
@@ -258,6 +283,12 @@ class Client : public clio::run::ContainerClient {
     const clio::run::u32 src_nblocks =
         primary_ok ? rec.num_blocks_ : rec.rep_num_blocks_;
     const clio::run::u64 gen_before = rec.placement_gen_;
+    // An in-place put is mid-flight (odd sequence): the bytes are torn by
+    // construction. Take the RPC path, which waits for the writer.
+    const clio::run::u64 seq_before = rec.content_seq_;
+    if (seq_before & 1) {
+      return false;
+    }
 
     size_t copied = 0;
     clio::run::u64 want_from = offset;
@@ -288,8 +319,8 @@ class Client : public clio::run::ContainerClient {
     if (!TryGetBlobRecordShm(tag_id, blob_name, &after)) {
       return false;
     }
-    if (after.placement_gen_ != gen_before) {
-      return false;
+    if (after.placement_gen_ != gen_before || after.content_seq_ != seq_before) {
+      return false;  // moved, or overwritten in place, while we copied
     }
     return true;
   }
@@ -346,7 +377,10 @@ class Client : public clio::run::ContainerClient {
     }
     *ptr = base + src.target_offset_;
     *size = primary_view ? rec.total_size_ : rec.rep_total_size_;
-    *gen = rec.placement_gen_;
+    if (rec.content_seq_ & 1) {
+      return false;  // in-place put mid-flight
+    }
+    *gen = ShmReadStamp(rec);
     return true;
   }
 
@@ -359,7 +393,7 @@ class Client : public clio::run::ContainerClient {
     if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
       return false;
     }
-    return rec.placement_gen_ == gen;
+    return ShmReadStamp(rec) == gen;
   }
 
   /** Zero-IPC tag-name lookup. */
@@ -414,7 +448,7 @@ class Client : public clio::run::ContainerClient {
 
   /**
    * GPU-callable AsyncCreate: takes const char* names for GPU kernel use.
-   * Routes to CPU admin worker via PoolQuery::ToLocalCpu().
+   * Routes via the caller's pool_query (PoolQuery::Dynamic()).
    * @param pool_query Pool query for task routing
    * @param pool_name Name of the pool (const char*, GPU-safe)
    * @param custom_pool_id Explicit pool ID
@@ -558,6 +592,27 @@ class Client : public clio::run::ContainerClient {
     // lookups from co-located chimods (clio-fs Open does three in a
     // row) each paid a queue+schedule+wake hop; inline they run on
     // the calling fiber. Falls back to Send everywhere else.
+    return CLIO_RUN_INLINE(task);
+  }
+
+  /**
+   * GetOrCreateTag WITH a fault handler (checkpointing / lazy copy): blobs
+   * this tag does not hold are resolved by `fault_pool_id` (e.g. the
+   * checkpoint chimod), which receives `fault_params` -- for checkpoint,
+   * the SOURCE tag name -- in Context::fault_params_ on every fault.
+   */
+  clio::run::Future<GetOrCreateTagTask<CreateParams>> AsyncGetOrCreateTag(
+      const std::string &tag_name, const clio::run::PoolId &fault_pool_id,
+      const std::string &fault_pool_name, const std::string &fault_params,
+      const TagId &tag_id = TagId::GetNull(),
+      const clio::run::PoolQuery &pool_query =
+          clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetOrCreateTagTask<CreateParams>>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_name, tag_id);
+    task->fault_pool_id_ = fault_pool_id;
+    task->fault_pool_name_ = fault_pool_name.c_str();
+    task->fault_params_ = fault_params.c_str();
     return CLIO_RUN_INLINE(task);
   }
 
@@ -1490,6 +1545,66 @@ class Client : public clio::run::ContainerClient {
     CLIO_IPC->FreeBuffer(buf);
   }
 
+  /**
+   * A write-behind batch is routed to its first blob's owner. When that node
+   * died with the batch in flight (before the cluster declared it dead, so
+   * failover could not yet route around it), the batch comes back with the
+   * runtime's lost-node code and its bytes were never stored. Resend it --
+   * a put is idempotent -- until failover names a live owner or the tries
+   * run out; the entry then carries the resent batch's outcome.
+   * @param entry a retiring deferred put whose future has completed
+   */
+  static void ResendIfNodeLost(DeferredPut *entry) {
+    constexpr int kTries = 10;
+    constexpr auto kWait = std::chrono::seconds(1);
+    for (int attempt = 0; attempt < kTries; ++attempt) {
+      auto *t = entry->fut_.get();
+      if (t == nullptr || !IsNodeLostRc(t->GetReturnCode())) return;
+      if (t->method_ == Method::kPutBlob) {
+        // A sieve page (one put per page).
+        auto old = entry->fut_.template Cast<PutBlobTask>();
+        PutBlobTask *ot = old.get();
+        if (!ot->segments_.empty()) return;  // vectored: not resent here
+        HLOG(kWarning, "write-behind put lost its owner node in flight; "
+             "resending (attempt {})", attempt + 1);
+        std::this_thread::sleep_for(kWait);
+        auto *ipc_manager = CLIO_CPU_IPC;
+        auto task = ipc_manager->NewTask<PutBlobTask>(
+            clio::run::CreateTaskId(), ot->pool_id_,
+            clio::run::PoolQuery::Dynamic(), ot->tag_id_,
+            ot->blob_name_.str(), ot->offset_, ot->size_, ot->blob_data_,
+            ot->score_, ot->context_, ot->flags_);
+        const bool owned = ot->IsDataOwner();
+        ot->ClearFlags(TASK_DATA_OWNER);
+        if (owned) task.get()->SetFlags(TASK_DATA_OWNER);
+        auto fut = CLIO_RUN_INLINE(task);
+        fut.Wait();
+        entry->fut_ = fut.template Cast<clio::run::Task>();
+        continue;
+      }
+      if (t->method_ != Method::kMultiPutBlob) return;
+      auto old = entry->fut_.template Cast<MultiPutBlobTask>();
+      MultiPutBlobTask *ot = old.get();
+      HLOG(kWarning, "write-behind batch lost its owner node in flight; "
+           "resending (attempt {})", attempt + 1);
+      std::this_thread::sleep_for(kWait);
+      auto *ipc_manager = CLIO_CPU_IPC;
+      auto task = ipc_manager->NewTask<MultiPutBlobTask>(
+          clio::run::CreateTaskId(), ot->pool_id_,
+          clio::run::PoolQuery::Local(), ot->route_tag_id_,
+          ot->route_blob_.str(), ot->data_, ot->data_len_, ot->descs_.str(),
+          ot->context_);
+      // The staging buffer now belongs to the resent batch: exactly one task
+      // may free it.
+      const bool owned = ot->IsDataOwner();
+      ot->ClearFlags(TASK_DATA_OWNER);
+      if (owned) task.get()->SetFlags(TASK_DATA_OWNER);
+      auto fut = CLIO_RUN_INLINE(task);
+      fut.Wait();
+      entry->fut_ = fut.template Cast<clio::run::Task>();
+    }
+  }
+
   static bool DeferAwaitOldest() {
     DeferRegistry &reg = DeferRegistry::Get();
     DeferredPut entry;
@@ -1531,11 +1646,19 @@ class Client : public clio::run::ContainerClient {
       fc->FlushDeferBatch();
     }
     entry.fut_.Wait();
+    ResendIfNodeLost(&entry);
     auto *t = entry.fut_.get();
     int err = 0;
     if (t == nullptr || t->GetReturnCode() != 0) {
       reg.errors_.fetch_add(1);
-      err = EIO;
+      // A full store is ENOSPC (as on ext4); only other failures are EIO.
+      err = (t != nullptr && PutRcIsNoSpace(t->GetReturnCode())) ? ENOSPC
+                                                                 : EIO;
+      HLOG(kError, "write-behind batch failed (rc {}); latching errno {}",
+           t != nullptr ? static_cast<long long>(
+                              static_cast<clio::run::i32>(t->GetReturnCode()))
+                        : -1LL,
+           err);
     }
     clio::run::u64 bytes = 0;
     for (const auto &e : entry.ents_) bytes += e.size_;
@@ -1609,11 +1732,19 @@ class Client : public clio::run::ContainerClient {
         reg.fifo_.pop_front();
       }
       entry.fut_.Wait();  // already complete — returns immediately
+      ResendIfNodeLost(&entry);
       auto *t = entry.fut_.get();
       int err = 0;
       if (t == nullptr || t->GetReturnCode() != 0) {
         reg.errors_.fetch_add(1);
-        err = EIO;
+        // A full store is ENOSPC (as on ext4); only other failures are EIO.
+        err = (t != nullptr && PutRcIsNoSpace(t->GetReturnCode())) ? ENOSPC
+                                                                   : EIO;
+        HLOG(kError, "write-behind batch failed (rc {}); latching errno {}",
+             t != nullptr ? static_cast<long long>(static_cast<clio::run::i32>(
+                                t->GetReturnCode()))
+                          : -1LL,
+             err);
       }
       clio::run::u64 bytes = 0;
       for (const auto &e : entry.ents_) bytes += e.size_;
@@ -2807,8 +2938,24 @@ class Client : public clio::run::ContainerClient {
     // Replica-targeted reads (issue #886, context.replica_ != 0) must also
     // reach the runtime: the SHM mirror publishes the PRIMARY's block layout
     // only, so serving them here would silently return primary bytes.
+    // A CODEC MUST REACH THE RUNTIME. This path serves the blob straight out
+    // of the SHM mirror, which holds the bytes AS STORED -- it applies no
+    // transform. A get that asked for decompression and took this route got
+    // compressed bytes back and a return code of 0, and only for blobs the
+    // codec had actually shrunk, so incompressible data still looked correct.
+    // Symptom: gv::Vector reads were bit-exact with codec=NONE and corrupt
+    // with zstd, identically at every page size. Device-destination gets never
+    // hit it because TryReadBlobShm refuses device pointers, which is why the
+    // in-kernel path looked fine and only host-side reads were wrong.
+    // A GENERATIONAL GET MUST REACH THE RUNTIME. Its whole contract is "do
+    // not serve until the blob has reached this generation", and the
+    // generation lives in the runtime's blob metadata -- serving the bytes
+    // from the SHM mirror here would answer the readiness question with
+    // whatever happens to be cached, which is precisely the stale read the
+    // flag exists to prevent.
     if (dst == nullptr || size == 0 || flags != 0 || context.emulate_ ||
-        context.replica_ != 0 || ForceNetEnv()) {
+        context.replica_ != 0 || context.compress_lib_ != 0 ||
+        (context.op_flags_ & Context::kGenerational) || ForceNetEnv()) {
       return false;
     }
     if (!HasShmCache() && !AttachShmCache()) {
@@ -3205,6 +3352,33 @@ class Client : public clio::run::ContainerClient {
                            blob_data, pool_query);
   }
 
+  // ===========================================================================
+  // Batched POD paging. One task carries up to kPodMultiMax page requests, so
+  // a full page-cache flush costs a handful of submissions instead of one per
+  // page. Build the task, Add() records until it returns false, then Send.
+  // ===========================================================================
+
+  /** Allocate an empty batch of `TaskT` (PodMulti{Put,Get}BlobTask /
+   *  PodMultiScoreTask) for the caller to fill with Add(). */
+  template <typename TaskT>
+  clio::run::shared_ptr<TaskT> NewPodBatch(
+      const TagId &tag_id, const Context &context = Context(),
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<TaskT>(clio::run::CreateTaskId(), pool_id_,
+                                            pool_query, tag_id);
+    task.get()->context_ = context;
+    task.get()->flags_ = flags;
+    return task;
+  }
+
+  /** Submit a batch built with NewPodBatch(). */
+  template <typename TaskT>
+  clio::run::Future<TaskT> AsyncPodBatch(clio::run::shared_ptr<TaskT> &task) {
+    return CLIO_CPU_IPC->Send(task);
+  }
+
   clio::run::Future<PodReorganizeBlobTask> AsyncPodReorganizeBlob(
       const TagId &tag_id, const std::string &blob_name, float new_score,
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
@@ -3246,15 +3420,25 @@ class Client : public clio::run::ContainerClient {
     return ipc_manager->Send(task);
   }
 
+  /**
+   * Asynchronously delete a blob.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob
+   * @param pool_query routing (Dynamic: the blob's owner)
+   * @param del_flags kDelCacheCopyOnly: drop only the target node's cache
+   *        copy (a coherence invalidation); 0: delete the blob
+   * @return the task future
+   */
   clio::run::Future<DelBlobTask> AsyncDelBlob(
       const TagId &tag_id,
       const std::string &blob_name,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      clio::run::u32 del_flags = 0) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<DelBlobTask>(clio::run::CreateTaskId(), pool_id_,
                                                   pool_query,
-                                                  tag_id, blob_name);
+                                                  tag_id, blob_name, del_flags);
 
     return ipc_manager->Send(task);
   }
@@ -3280,6 +3464,34 @@ class Client : public clio::run::ContainerClient {
                                                 min_tier_score, bytes,
                                                 droppable_only);
     return ipc_manager->Send(task);
+  }
+
+  /**
+   * Asynchronously set the data organizer's phase hint (Method::kReorganizeHint).
+   * The value is opaque to the core: it is stored on every container and read
+   * by the configured DataOrganizer on its next Reorganize round, which decides
+   * what a given value means for its policy.
+   * @param hint Opaque phase indicator (e.g. algorithm phase or iteration)
+   * @param pool_query Routing; Broadcast by default so all containers agree
+   */
+  clio::run::Future<ReorganizeHintTask> AsyncReorganizeHint(
+      clio::run::i32 hint,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<ReorganizeHintTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, hint);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Set the data organizer's phase hint and wait until every container has it.
+   * @param hint Opaque phase indicator; see AsyncReorganizeHint
+   * @return the task's return code (0 on success)
+   */
+  clio::run::u32 ReorganizeHint(clio::run::i32 hint) {
+    auto task = AsyncReorganizeHint(hint);
+    task.Wait();
+    return task->GetReturnCode();
   }
 
   /**
@@ -3473,6 +3685,23 @@ class Client : public clio::run::ContainerClient {
     auto *ipc_manager = CLIO_CPU_IPC;
     auto task = ipc_manager->NewTask<GetNumAliasesTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, std::string(), tag_id);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Publish a batch of tag-name operations (see EncodeTagNameOp). Sent as a
+   * Broadcast so every container can resolve and search the names; dead
+   * nodes are skipped (they catch up from the publisher after restart).
+   * @param ops encoded batch
+   * @param pool_query default Broadcast(0.0f)
+   */
+  clio::run::Future<UpdateTagNamesTask> AsyncUpdateTagNames(
+      const std::string &ops,
+      const clio::run::PoolQuery &pool_query =
+          clio::run::PoolQuery::Broadcast(0.0f)) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<UpdateTagNamesTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, ops);
     return ipc_manager->Send(task);
   }
 
@@ -3710,6 +3939,44 @@ class Client : public clio::run::ContainerClient {
       task->SetFlags(TASK_PERIODIC);
     }
 
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * List the blobs (tag id + name) whose names fully match `blob_regex` on
+   * the containers `pool_query` reaches - asynchronous. Local() lists this
+   * node's blobs; Broadcast() the whole cluster's.
+   * @param blob_regex std::regex over blob names
+   * @param pool_query routing (default: Local)
+   * @return future for the ListLocalBlobsTask
+   */
+  clio::run::Future<ListLocalBlobsTask> AsyncListLocalBlobs(
+      const std::string &blob_regex,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<ListLocalBlobsTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, blob_regex);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * fsync(2) for one tag - asynchronous. Broadcast by default so every
+   * container makes the blobs it holds durable (see SyncTagTask).
+   * @param tag_id tag whose blobs must become durable
+   * @param pool_query routing (default: Broadcast)
+   * @param min_persistence minimum tier level; < 0 uses the configured
+   *        flush_data_min_persistence
+   * @return future for the SyncTagTask (rc kSyncNoSpaceRc / kSyncIoRc on
+   *         failure; deferred_ = 1 when fsync_mode is "deferred")
+   */
+  clio::run::Future<SyncTagTask> AsyncSyncTag(
+      const TagId &tag_id,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast(),
+      int min_persistence = -1) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<SyncTagTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
+        min_persistence);
     return ipc_manager->Send(task);
   }
 

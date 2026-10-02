@@ -41,7 +41,7 @@ services:
       "
         set -x &&
         echo 'gs-node1: starting Clio runtime' &&
-        /workspace/build/bin/clio_run runtime start &
+        /workspace/build/bin/clio_run runtime start --fresh &
         RUNTIME_PID=$$! &&
         sleep 6 &&
         echo 'gs-node1: running congestion producer' &&
@@ -86,7 +86,7 @@ services:
       "
         set -x &&
         echo 'gs-node2: starting Clio runtime' &&
-        /workspace/build/bin/clio_run runtime start &
+        /workspace/build/bin/clio_run runtime start --fresh &
         RUNTIME_PID=$$! &&
         sleep 6 &&
         echo 'gs-node2: running congestion producer' &&

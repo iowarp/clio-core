@@ -54,6 +54,13 @@
 #include <unistd.h>    // getuid/getgid/read used by fuse_cte.cc on Linux
 #endif
 
+// O_NOATIME is a Linux-only open flag. macFUSE and WinFsp never hand it to
+// the open callbacks, so elsewhere it is 0 and "opened with O_NOATIME" is
+// simply never true.
+#if !defined(__linux__) && !defined(O_NOATIME)
+#define O_NOATIME 0
+#endif
+
 #include "clio_cte/core/core_client.h"
 #include "clio_cte/core/core_tasks.h"
 
@@ -519,6 +526,8 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
 int cte_fuse_release(const char *path, struct fuse_file_info *fi);
 int cte_fuse_flush(const char *path, struct fuse_file_info *fi);
 int cte_fuse_fsync(const char *path, int datasync, struct fuse_file_info *fi);
+int cte_fuse_fsyncdir(const char *path, int datasync,
+                      struct fuse_file_info *fi);
 int cte_fuse_mkdir(const char *path, cte_mode_t mode);
 int cte_fuse_rmdir(const char *path);
 int cte_fuse_unlink(const char *path);

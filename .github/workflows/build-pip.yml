@@ -531,10 +531,10 @@ jobs:
             LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
             export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-            echo "=== Cache + replication chimods present ==="
-            # Both chimods ship by default (#886/#899); a missing lib means
-            # the pip_package component lost them.
-            for mod in cache replication; do
+            echo "=== Cache, replication, stream, filesystem chimods present ==="
+            # They ship by default (#886/#899; filesystem needs stream); a
+            # missing lib means the pip_package component lost them.
+            for mod in cache replication stream filesystem; do
               if ! ls "$LIB_DIR"/libclio_cte_${mod}_* >/dev/null 2>&1; then
                 echo "FAIL: libclio_cte_${mod}_* missing from wheel lib dir"
                 exit 1

@@ -49,7 +49,7 @@ export CLIO_RESTART_LOG="$CONF_DIR/restart_log.bin"
 echo ""
 echo "=== Phase 1: store documents, verify inline index ==="
 
-$BIN_DIR/clio_run runtime start &
+$BIN_DIR/clio_run runtime start --fresh &
 RUNTIME_PID=$!
 sleep 3
 

@@ -1,0 +1,62 @@
+# kmeans MPI baseline: what moves VRAM and runtime.
+#
+# Axes: dataset size (the VRAM axis -- each rank holds its whole point
+# shard on-device) x Lloyd iterations (the runtime axis -- each iteration
+# is one full pass over the shard). kmeans has no checkpoint phase, so
+# there is no I/O axis; the workload is compute + one Allreduce/iter.
+#
+# Run:   ./run.sh kmeans_mpi_sweep.yaml      (or:
+#        PATH=<build>/bin:$PATH jarvis ppl run yaml kmeans_mpi_sweep.yaml)
+# Post:  jarvis ppl post yaml kmeans_mpi_sweep.yaml
+config:
+  name: gv_kmeans_mpi_sweep
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: mpi
+      nprocs: 1
+      steps: 4          # iterations
+      data_mb: 512
+      prefault: "0"
+      timeout_sec: 600
+      output_dir: /tmp/clio_gv/kmeans_mpi_sweep
+
+vars:
+  wl.data_mb: [256, 512, 1024, 2048]
+  wl.steps: [2, 4, 8, 16]
+
+loop:
+  - [wl.data_mb]
+  - [wl.steps]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/kmeans_mpi_sweep"
+
+post: |
+  import matplotlib
+  matplotlib.use('Agg')
+  import matplotlib.pyplot as plt
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  bad = df[df.get('gates_pass', 0) != 1]
+  if len(bad):
+      logger.warning(f'{len(bad)} cells failed gates -- excluded from figures')
+  df = df[df.gates_pass == 1]
+  fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+  for steps, g in df.groupby('wl.steps'):
+      g = g.sort_values('wl.data_mb')
+      axes[0].plot(g['wl.data_mb'], g['bench_ms'], 'o-', label=f'{steps} iters')
+  axes[0].set_xlabel('dataset (MB)'); axes[0].set_ylabel('kernel time (ms)')
+  axes[0].set_title('kmeans MPI: runtime vs dataset x iterations')
+  axes[0].legend(); axes[0].set_xscale('log', base=2)
+  one = df[df['wl.steps'] == sorted(df['wl.steps'].unique())[0]]
+  one = one.sort_values('wl.data_mb')
+  axes[1].plot(one['wl.data_mb'], one['vram_delta_mb'], 's-', color='tab:red')
+  axes[1].plot(one['wl.data_mb'], one['wl.data_mb'], '--', color='gray',
+               label='dataset size (y=x)')
+  axes[1].set_xlabel('dataset (MB)'); axes[1].set_ylabel('VRAM delta (MB)')
+  axes[1].set_title('kmeans MPI: peak VRAM vs dataset (nvidia-smi)')
+  axes[1].legend()
+  fig.tight_layout(); fig.savefig('kmeans_mpi_sweep.png', dpi=130)
+  logger.info('wrote kmeans_mpi_sweep.png')

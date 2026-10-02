@@ -23,6 +23,7 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/compressor/compressor_client.h>
+#include <clio_ctp/compress/compress_factory.h>
 
 #include <chrono>
 #include <cstring>
@@ -110,6 +111,31 @@ static std::string CompressiblePayload(clio::run::u64 size) {
   return v;
 }
 
+namespace {
+/**
+ * A codec wire id this build actually has.
+ *
+ * Codecs are individually optional, so a hardcoded id is a test that passes or
+ * fails depending on which dev packages the host happens to have. This test
+ * used wire id 1 (bzip2) and silently stopped compressing anywhere bzip2 was
+ * absent -- the put still succeeded, the bytes were just stored raw, so the
+ * failure surfaced as "compressed size is not smaller" rather than as anything
+ * about a missing codec.
+ *
+ * Preference order is by availability, not quality: any working codec proves
+ * the interposition, which is what is under test here.
+ */
+int AvailableCompressLib() {
+  for (const char *name : {"lz4", "zstd", "zlib", "lzma", "bzip2", "brotli",
+                           "snappy", "blosc2"}) {
+    if (ctp::CompressionFactory::GetPreset(name) != nullptr) {
+      return ctp::CompressionFactory::GetWireId(name);
+    }
+  }
+  return 0;  // no codec in this build; callers REQUIRE non-zero
+}
+}  // namespace
+
 TEST_CASE("CompressorInterpose - transparent compress/decompress + parity",
           "[cte][compressor][interpose][886]") {
   CompressorInterposeFixture fixture;
@@ -158,7 +184,8 @@ TEST_CASE("CompressorInterpose - transparent compress/decompress + parity",
   //    interposed view stays logical.
   {
     clio::cte::core::Context ctx;
-    ctx.compress_lib_ = 1;  // wire id -> factory registry (zstd family)
+    ctx.compress_lib_ = AvailableCompressLib();
+    REQUIRE(ctx.compress_lib_ != 0);
     auto put = comp_io.AsyncPutBlob(tag_id, "comp_blob", 0, kValSize,
                                     val.data(), /*score=*/-1.0f, ctx);
     put.Wait();
@@ -223,7 +250,7 @@ TEST_CASE("CompressorInterpose - transparent compress/decompress + parity",
     segs.emplace_back(0, 4096, ctp::ipc::ShmPtr<>(s1.shm_));
     segs.emplace_back(8192, 4096, ctp::ipc::ShmPtr<>(s2.shm_));
     clio::cte::core::Context ctx;
-    ctx.compress_lib_ = 1;  // requested, but undefined for a vectored put
+    ctx.compress_lib_ = AvailableCompressLib();  // undefined for a vectored put
     auto vput = comp_io.AsyncPutBlobVectored(tag_id, "vec_blob", segs,
                                              /*score=*/-1.0f, ctx);
     vput.Wait();

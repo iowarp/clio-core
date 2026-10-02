@@ -35,6 +35,21 @@
  * IPC manager implementation
  */
 
+// Guarded for the same reason gpu_api.h guards it: execinfo.h is glibc/BSD and
+// MSVC has none, so an unguarded include fails the Windows build of
+// clio_run_cxx outright ("C1083: Cannot open include file: 'execinfo.h'").
+// The one call site -- an opt-in CLIO_SHM_TRACE diagnostic -- carries the same
+// guard and degrades to a line saying the backtrace is unavailable there.
+#if defined(__has_include)
+#if __has_include(<execinfo.h>)
+#define CLIO_RUN_HAS_EXECINFO 1
+#include <execinfo.h>
+#endif
+#endif
+#ifndef CLIO_RUN_HAS_EXECINFO
+#define CLIO_RUN_HAS_EXECINFO 0
+#endif
+
 #include "clio_runtime/ipc_manager.h"
 
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
@@ -557,7 +572,17 @@ bool IpcManager::ServerInit() {
   // (Device-aware memcpy is now ctp::DeviceAwareMemcpy in gpu_api.h.)
   {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
-    u32 queue_depth = config->GetQueueDepth();
+    // ONE lane serves every block on the GPU, so it must be sized for the
+    // whole device, not for a single producer. The generic runtime depth is
+    // sized for CPU lanes (one per worker); reusing it here let a burst of
+    // faults overrun the ring, and an overrun is unrecoverable because a
+    // dropped task leaves its kernel waiting on a completion that will never
+    // come. Entries are ~32 bytes against a 16 MB backend, so a deep ring
+    // costs ~2 MB and removes the cliff.
+    constexpr u32 kGpuQueueDepth = 64 * 1024;
+    u32 queue_depth =
+        (config->GetQueueDepth() > kGpuQueueDepth) ? config->GetQueueDepth()
+                                                  : kGpuQueueDepth;
     constexpr size_t kHipClientBackendBytes = 64 * 1024 * 1024;  // 64 MB
     if (!ChiServerBootstrapHipGpu(this, queue_depth,
                                    kHipClientBackendBytes)) {
@@ -572,7 +597,17 @@ bool IpcManager::ServerInit() {
   // on both.
   {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
-    u32 queue_depth = config->GetQueueDepth();
+    // ONE lane serves every block on the GPU, so it must be sized for the
+    // whole device, not for a single producer. The generic runtime depth is
+    // sized for CPU lanes (one per worker); reusing it here let a burst of
+    // faults overrun the ring, and an overrun is unrecoverable because a
+    // dropped task leaves its kernel waiting on a completion that will never
+    // come. Entries are ~32 bytes against a 16 MB backend, so a deep ring
+    // costs ~2 MB and removes the cliff.
+    constexpr u32 kGpuQueueDepth = 64 * 1024;
+    u32 queue_depth =
+        (config->GetQueueDepth() > kGpuQueueDepth) ? config->GetQueueDepth()
+                                                  : kGpuQueueDepth;
     constexpr size_t kSyclClientBackendBytes = 64 * 1024 * 1024;  // 64 MB
     if (!ChiServerBootstrapSyclGpu(this, queue_depth,
                                     kSyclClientBackendBytes)) {
@@ -1000,7 +1035,7 @@ bool IpcManager::ServerInitShm() {
     {
       const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
       if (budget > 0 && main_segment_size > budget / 2) {
-        HLOG(kWarning,
+        HLOG(kInfo,
              "Main segment: requested {} bytes exceeds half the memory "
              "budget ({} bytes); clamping to {} bytes",
              main_segment_size, budget, budget / 2);
@@ -1099,7 +1134,7 @@ bool IpcManager::ServerInitShm() {
       size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
       if (budget > 0 && metadata_segment_size > budget / 2) {
         size_t clamped = budget / 2;
-        HLOG(kWarning,
+        HLOG(kInfo,
              "Metadata segment: requested {} bytes exceeds half the memory "
              "budget ({} bytes); clamping to {} bytes",
              metadata_segment_size, budget, clamped);
@@ -1674,6 +1709,33 @@ u64 IpcManager::GetNodeId() const {
   return this_host_.node_id;
 }
 
+/**
+ * Split a hostfile entry of the form "host:port" into its parts.
+ *
+ * Only a trailing ":<digits>" on an entry with exactly one ':' is a port; a
+ * bare IPv6 address has several colons and no port, and is left whole.
+ *
+ * @param entry the hostfile entry as read
+ * @param host receives the host part (the whole entry when there is no port)
+ * @param port receives the port, or 0 when the entry names none
+ */
+static void SplitHostPort(const std::string &entry, std::string &host,
+                          u32 &port) {
+  host = entry;
+  port = 0;
+  const size_t colon = entry.rfind(':');
+  if (colon == std::string::npos || colon == 0 || colon + 1 >= entry.size() ||
+      entry.find(':') != colon) {
+    return;
+  }
+  const std::string digits = entry.substr(colon + 1);
+  if (digits.find_first_not_of("0123456789") != std::string::npos) {
+    return;
+  }
+  host = entry.substr(0, colon);
+  port = static_cast<u32>(std::stoul(digits));
+}
+
 bool IpcManager::LoadHostfile() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
   std::string hostfile_path = config->GetHostfilePath();
@@ -1737,10 +1799,13 @@ bool IpcManager::LoadHostfile() {
     HLOG(kDebug, "=== Container to Node ID Mapping (Linear Offset) ===");
     for (size_t offset = 0; offset < host_ips.size(); ++offset) {
       u64 node_id = static_cast<u64>(offset);
-      Host host(host_ips[offset], node_id);
+      std::string name;
+      u32 entry_port = 0;
+      SplitHostPort(host_ips[offset], name, entry_port);
+      Host host(name, node_id, entry_port);
       hostfile_map_[node_id] = host;
-      HLOG(kDebug, "  Hostfile[{}]: {} -> Node ID: {}", offset,
-           host_ips[offset], node_id);
+      HLOG(kDebug, "  Hostfile[{}]: {} port {} -> Node ID: {}", offset, name,
+           entry_port, node_id);
     }
     HLOG(kDebug, "=== Total hosts loaded: {} ===", hostfile_map_.size());
     if (hostfile_map_.empty()) {
@@ -1821,18 +1886,43 @@ void IpcManager::SetDead(u64 node_id) {
   entry.node_id = node_id;
   entry.detected_at = std::chrono::steady_clock::now();
   dead_nodes_.push_back(entry);
+  dead_count_.fetch_add(1, std::memory_order_acq_rel);
 
   // Remove cached client connections to the dead node
   {
     std::lock_guard<std::mutex> lock(client_pool_mutex_);
     auto *config_manager = CLIO_CONFIG_MANAGER;
-    int port = static_cast<int>(config_manager->GetPort());
+    int port = static_cast<int>(it->second.PortOr(config_manager->GetPort()));
     std::string key = it->second.ip_address + ":" + std::to_string(port);
     client_pool_.erase(key);
+    client_pool_.erase(key + "#resp");
   }
 
   HLOG(kWarning, "IpcManager: Node {} ({}) marked as DEAD", node_id,
        it->second.ip_address);
+}
+
+void IpcManager::NoteHeardFrom(u64 node_id) {
+  if (node_id >= kHeardSlots) return;
+  const u64 now = static_cast<u64>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  last_heard_ns_[node_id].store(now, std::memory_order_relaxed);
+}
+
+std::vector<u64> IpcManager::GetNodeIds() const {
+  std::vector<u64> ids;
+  ids.reserve(hostfile_map_.size());
+  for (const auto &kv : hostfile_map_) ids.push_back(kv.first);
+  return ids;
+}
+
+u64 IpcManager::NsSinceHeardFrom(u64 node_id) const {
+  if (node_id >= kHeardSlots) return ~0ull;
+  const u64 last = last_heard_ns_[node_id].load(std::memory_order_relaxed);
+  if (last == 0) return ~0ull;
+  const u64 now = static_cast<u64>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  return now > last ? now - last : 0;
 }
 
 void IpcManager::SetAlive(u64 node_id) {
@@ -2060,6 +2150,13 @@ bool IpcManager::IdentifyThisHost() {
                  suffix_match ||
                  HostMatchesLocalIp(host.ip_address, local_ips);
     if (!is_me) continue;
+    // An entry that names a port is this process only if the port is ours:
+    // that is how several runtimes on one host tell themselves apart.
+    if (host.port != 0 && host.port != port) {
+      HLOG(kDebug, "Hostfile entry {}:{} is local but not our port {}",
+           host.ip_address, host.port, port);
+      continue;
+    }
 
     // Bind to whatever address the hostfile entry advertises so an
     // override like CLIO_BIND_ADDR=127.0.0.1 actually pins the listener
@@ -2318,6 +2415,27 @@ FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
 
   // 3. All existing allocators are full - create new shared memory segment
   // Calculate segment size: (requested_size + 32MB metadata) * 1.2 multiplier
+  //
+  // These segments are never released, so a workload that keeps landing here
+  // grows shared memory without bound (measured: 509 segments / 57 GiB in one
+  // papers100M epoch). CLIO_SHM_TRACE=1 prints who asked, which is the only
+  // way to tell a genuine capacity need from an allocation the existing
+  // arenas should have been able to serve.
+  if (std::getenv("CLIO_SHM_TRACE") != nullptr) {
+#if CLIO_RUN_HAS_EXECINFO
+    void *frames[24];
+    int n = backtrace(frames, 24);
+    char **syms = backtrace_symbols(frames, n);
+    HLOG(kError, "[SHM-TRACE] growing for a {} byte request; callers:", size);
+    for (int i = 0; i < n && syms != nullptr; ++i) {
+      HLOG(kError, "[SHM-TRACE]   {}", syms[i]);
+    }
+    free(syms);
+#else
+    HLOG(kError, "[SHM-TRACE] growing for a {} byte request; no backtrace on "
+         "this platform (execinfo.h absent)", size);
+#endif
+  }
   size_t new_size = static_cast<size_t>((size + kShmMetadataOverhead) *
                                         kShmAllocationMultiplier);
   if (!IncreaseClientShm(new_size)) {
@@ -2609,7 +2727,19 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
       }
     }
   }
-  lane.Push(future);
+  {
+    // Never block: the net worker is this ring's only consumer AND one of
+    // its producers (see net_overflow_). Spill instead of waiting for space.
+    std::lock_guard<std::mutex> push_lk(net_push_mu_);
+    auto &spill = net_overflow_[priority_idx];
+    if (!spill.empty() || lane.Size() + 1 >= lane.GetDepth()) {
+      spill.push_back(future);
+      net_overflow_size_[priority_idx].fetch_add(1, std::memory_order_relaxed);
+      was_empty = was_empty || spill.size() == 1;
+    } else {
+      lane.Push(future);
+    }
+  }
 
   // Pick the worker that drains this priority's queue. Cross-node Send
   // priorities (kSendIn{Latency,IO} / kSendOut{Latency,IO}) are owned
@@ -2663,7 +2793,21 @@ bool IpcManager::TryPopNetTask(NetQueuePriority priority,
   u32 priority_idx = static_cast<u32>(priority);
   auto &lane = net_queue_->GetLane(0, priority_idx);
 
-  if (lane.Pop(future)) {
+  bool popped = lane.Pop(future);
+  if (!popped &&
+      net_overflow_size_[priority_idx].load(std::memory_order_relaxed) != 0) {
+    // The ring is empty, so every spilled task is now the oldest: serve the
+    // spill in order until producers can use the ring again.
+    std::lock_guard<std::mutex> push_lk(net_push_mu_);
+    auto &spill = net_overflow_[priority_idx];
+    if (!spill.empty()) {
+      future = spill.front();
+      spill.pop_front();
+      net_overflow_size_[priority_idx].fetch_sub(1, std::memory_order_relaxed);
+      popped = true;
+    }
+  }
+  if (popped) {
     if (netqprof::On()) {
       uint64_t pushed =
           netqprof::push_ns[priority_idx].load(std::memory_order_relaxed);
@@ -4347,6 +4491,18 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     // If container is plugged or gone, add to retry queue
     if (result == RouteResult::Retry || result == RouteResult::Dne) {
       Worker *worker = CLIO_CUR_WORKER;
+      auto *pool_manager = CLIO_POOL_MANAGER;
+      if (task_ptr->IsPeriodic() && pool_manager != nullptr &&
+          pool_manager->WasDestroyed(task_ptr->pool_id_)) {
+        // A periodic task of a pool destroyed on this node: nothing will
+        // ever serve it again. Retrying re-queued it -- and logged an error
+        // -- every period, forever. Retire it.
+        HLOG(kDebug, "RouteTask: retiring periodic task of destroyed pool {} "
+             "(method {})", task_ptr->pool_id_, task_ptr->method_);
+        task_ptr->SetReturnCode(1);
+        future.SetComplete();
+        return result;
+      }
       HLOG(kError, "RouteTask: RouteLocal returned {} for pool={} method={}, worker={}",
            (int)result, task_ptr->pool_id_, task_ptr->method_,
            worker ? (int)worker->GetId() : -1);
@@ -4548,9 +4704,6 @@ bool IpcManager::IsTaskLocal(const clio::run::shared_ptr<Task> & /*task_ptr*/,
       // the neighborhood leader, else Physical) by now. If we still see them
       // here, they are not local.
       return false;
-
-    case RoutingMode::ToLocalCpu:
-      return true;  // GPU producer-only path: always local
 
     case RoutingMode::Null:
       return true;  // Null mode is a no-op, treat as local
@@ -4754,9 +4907,8 @@ std::vector<PoolQuery> IpcManager::ResolvePoolQuery(
     case RoutingMode::Physical:
       result = ResolvePhysicalQuery(query, pool_id, task_ptr);
       break;
-    case RoutingMode::ToLocalCpu:
     case RoutingMode::Null:
-      // GPU producer-only ToLocalCpu and Null modes pass through.
+      // Null mode passes through.
       result = {query};
       break;
     case RoutingMode::ManyToOne:
@@ -4854,11 +5006,6 @@ std::vector<PoolQuery> IpcManager::ResolveRangeQuery(
     return {query};  // Fallback to original query
   }
 
-  auto *config_manager = CLIO_CONFIG_MANAGER;
-  if (config_manager == nullptr) {
-    return {query};  // Fallback to original query
-  }
-
   u32 range_offset = query.GetRangeOffset();
   u32 range_count = query.GetRangeCount();
 
@@ -4883,36 +5030,21 @@ std::vector<PoolQuery> IpcManager::ResolveRangeQuery(
     return {PoolQuery::DirectId(container_id)};
   }
 
+  // ONE QUERY PER CONTAINER. This used to split a range wider than
+  // networking.neighborhood_size into at most neighborhood_size
+  // multi-container sub-ranges, each sent to the node owning its first
+  // container. Nothing fans a received range out to its remaining
+  // containers (RecvInHandleOne marks every received task routed, so the
+  // receiver runs it locally once), and the origin counted one replica per
+  // sub-range, so a 64-node Broadcast with the default neighborhood of 32
+  // created a pool on nodes 0 and 32 only and reported success. The fan-out
+  // is O(containers) from the origin, as it always was for ranges no wider
+  // than the neighborhood.
   std::vector<PoolQuery> result_queries;
-
-  // Get neighborhood size from configuration (maximum number of queries)
-  u32 neighborhood_size = config_manager->GetNeighborhoodSize();
-
-  // Calculate queries needed, capped at neighborhood_size
-  u32 ideal_queries = (range_count + neighborhood_size - 1) / neighborhood_size;
-  u32 queries_to_create = std::min(ideal_queries, neighborhood_size);
-
-  // Create one query per container
-  if (queries_to_create <= 1) {
-    queries_to_create = range_count;
+  result_queries.reserve(range_count);
+  for (u32 i = 0; i < range_count; ++i) {
+    result_queries.push_back(PoolQuery::Range(range_offset + i, 1));
   }
-
-  u32 containers_per_query = range_count / queries_to_create;
-  u32 remaining_containers = range_count % queries_to_create;
-
-  u32 current_offset = range_offset;
-  for (u32 i = 0; i < queries_to_create; ++i) {
-    u32 current_count = containers_per_query;
-    if (i < remaining_containers) {
-      current_count++;  // Distribute remainder across first queries
-    }
-
-    if (current_count > 0) {
-      result_queries.push_back(PoolQuery::Range(current_offset, current_count));
-      current_offset += current_count;
-    }
-  }
-
   return result_queries;
 }
 

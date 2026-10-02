@@ -14,8 +14,8 @@ void PrintUsage() {
   std::cerr << "Usage: " << g_progname << " <command> [options]\n"
             << "\n"
             << "Commands:\n"
-            << "  start           Start the Clio runtime server\n"
-            << "  restart         Restart the Clio runtime (WAL replay)\n"
+            << "  start           Start the Clio runtime server; it recovers\n"
+            << "                  all persistent state (--fresh: start empty)\n"
             << "  stop            Stop the Clio runtime server\n"
             << "                  (--force: immediate ungraceful stop;\n"
             << "                   --grace-period <ms>: drain budget)\n"
@@ -29,11 +29,22 @@ void PrintUsage() {
             << "  refresh         Autogenerate ChiMod method files\n"
             << "\n"
             << "Legacy nested forms (still supported):\n"
-            << "  runtime <start|restart|stop>\n"
+            << "  runtime <start|stop>\n"
             << "  repo refresh\n"
             << "\n"
             << "Run '" << g_progname
             << " <command> --help' for more information on a command.\n";
+}
+/**
+ * `restart` was removed: `start` always recovers persistent state now.
+ * @return 1, after saying what to run instead
+ */
+int RestartRemoved() {
+  std::cerr << "`" << g_progname << " restart` was removed: `" << g_progname
+            << " start` always recovers persistent state. Use `" << g_progname
+            << " start` (recover) or `" << g_progname
+            << " start --fresh` (discard this node's state).\n";
+  return 1;
 }
 }  // namespace
 
@@ -58,7 +69,7 @@ int main(int argc, char* argv[]) {
   }
 
   // Flat dispatch (canonical form):
-  //   <progname> start | restart | stop | refresh | migrate | monitor | compose
+  //   <progname> start | stop | refresh | migrate | monitor | compose
   // Strip "<progname> <cmd>" from argv. Each handler sees only its own args.
   {
     int new_argc = argc - 2;
@@ -67,7 +78,7 @@ int main(int argc, char* argv[]) {
     if (cmd == "start") {
       return RuntimeStart(new_argc, new_argv);
     } else if (cmd == "restart") {
-      return RuntimeRestart(new_argc, new_argv);
+      return RestartRemoved();
     } else if (cmd == "stop") {
       return RuntimeStop(new_argc, new_argv);
     } else if (cmd == "status") {
@@ -86,14 +97,14 @@ int main(int argc, char* argv[]) {
   }
 
   // Legacy nested forms (kept working for backward compat):
-  //   <progname> runtime <start|restart|stop>
+  //   <progname> runtime <start|stop>
   //   <progname> repo refresh
   if (cmd == "runtime") {
     if (argc < 3) {
       std::cerr << "Usage: " << g_progname
-                << " runtime <start|restart|stop> [options]\n"
+                << " runtime <start|stop> [options]\n"
                 << "Hint: the canonical flat form is `" << g_progname
-                << " <start|restart|stop>`.\n";
+                << " <start|stop>`.\n";
       return 1;
     }
 
@@ -105,7 +116,7 @@ int main(int argc, char* argv[]) {
     if (subcmd == "start") {
       return RuntimeStart(new_argc, new_argv);
     } else if (subcmd == "restart") {
-      return RuntimeRestart(new_argc, new_argv);
+      return RestartRemoved();
     } else if (subcmd == "stop") {
       return RuntimeStop(new_argc, new_argv);
     } else if (subcmd == "status") {
@@ -113,7 +124,7 @@ int main(int argc, char* argv[]) {
     } else {
       std::cerr << "Unknown runtime subcommand: " << subcmd << "\n";
       std::cerr << "Usage: " << g_progname
-                << " runtime <start|restart|stop> [options]\n";
+                << " runtime <start|stop> [options]\n";
       return 1;
     }
   }

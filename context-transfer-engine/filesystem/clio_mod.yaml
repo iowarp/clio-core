@@ -19,10 +19,24 @@ kRead: 12
 kWrite: 13
 kGetattr: 14
 kTruncate: 15
-kAppend: 16
 kReaddir: 17
 kMkdir: 18
 kRmdir: 19
 kUnlink: 20
 kRename: 21
 kStatSize: 22
+kLink: 23
+kUtimens: 28
+kSymlink: 29
+kReadlink: 30
+kSetxattr: 31
+kGetxattr: 32
+kListxattr: 33
+kRemovexattr: 34
+kChown: 35
+kMultiCreate: 36
+kAdvanceSize: 37
+# Internal: one operation on hash-owned namespace state (directory entries
+# by hash of the directory path, inodes at their home container).
+kShardOp: 38
+kSyncMeta: 39        # fsync the namespace log (broadcast; fsync/fsyncdir)

@@ -22,6 +22,28 @@ install(TARGETS clio_cte_bench
 
 # Create clio_cte_semantic_bench executable — ingests N keyword blobs under a
 # single tag, then runs one broadcast SemanticSearch over them.
+# Vector-shaped stress: the CTE driven the way the gpu_vector adapter's host
+# side drives it (page-sized generational puts/gets hash-distributed across
+# nodes, halo reads, batched writebacks, tag copies), with no GPU at all, so
+# a failure at scale is clio-core's own. Reuses the gpu_vector benchmark's
+# CTE barrier/reduction helpers (bench_dist.h, host-only).
+add_executable(clio_cte_vector_stress
+  clio_cte_vector_stress.cc
+)
+target_include_directories(clio_cte_vector_stress PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../adapter/gpu_vector/benchmark
+)
+target_link_libraries(clio_cte_vector_stress
+  clio::cte::checkpoint_client
+  clio::cte::core_client
+  clio::run::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+target_compile_features(clio_cte_vector_stress PRIVATE cxx_std_20)
+install(TARGETS clio_cte_vector_stress
+  RUNTIME DESTINATION bin
+)
+
 add_executable(clio_cte_semantic_bench
   clio_cte_semantic_bench.cc
 )

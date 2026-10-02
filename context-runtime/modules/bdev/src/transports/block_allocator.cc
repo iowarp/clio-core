@@ -7,6 +7,13 @@
 
 #include <clio_runtime/bdev/transports/block_allocator.h>
 
+#include <algorithm>
+#include <cstdlib>
+#include <iterator>
+#ifdef __linux__
+#include <execinfo.h>
+#endif
+
 namespace clio::run::bdev {
 
 // The implementation of WorkerBlockMap, GlobalBlockMap, Heap 
@@ -148,6 +155,33 @@ bool GlobalBlockMap::FreeBlock(int worker, Block &block) {
   return true;
 }
 
+void GlobalBlockMap::SeedFreeRange(clio::run::u64 offset, clio::run::u64 size) {
+  if (size == 0 || worker_maps_.empty()) {
+    return;
+  }
+  const size_t kMaxIdx =
+      static_cast<size_t>(BlockSizeCategory::kMaxCategories) - 1;
+  clio::run::ScopedCoMutex lock(worker_locks_[0]);
+  clio::run::u64 cur = offset;
+  clio::run::u64 left = size;
+  while (left > 0) {
+    // Largest class that fits what is left; a tail below the smallest class
+    // is filed there anyway (AllocateBlock checks the real size).
+    size_t idx = 0;
+    for (size_t i = kMaxIdx + 1; i-- > 0;) {
+      if (kBlockSizes[i] <= left) {
+        idx = i;
+        break;
+      }
+    }
+    clio::run::u64 chunk = std::min<clio::run::u64>(left, kBlockSizes[idx]);
+    worker_maps_[0].FreeBlock(
+        Block(cur, chunk, static_cast<clio::run::u32>(idx)));
+    cur += chunk;
+    left -= chunk;
+  }
+}
+
 Heap::Heap() : heap_(0), total_size_(0), alignment_(4096) {}
 
 void Heap::Init(clio::run::u64 total_size, clio::run::u32 alignment) {
@@ -181,7 +215,75 @@ clio::run::u64 Heap::GetRemainingSize() const {
   return 0;
 }
 
+namespace {
+/** Log the calling stack to stderr (checker diagnostics). */
+void DumpStack() {
+#ifdef __linux__
+  void *frames[32];
+  int n = backtrace(frames, 32);
+  backtrace_symbols_fd(frames, n, 2);
+#endif
+}
+}  // namespace
+
+bool StandardBlockAllocator::CheckEnabled() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_BDEV_CHECK_ALLOC");
+    return e != nullptr && *e == '1';
+  }();
+  return on;
+}
+
+void StandardBlockAllocator::CheckAllocated(const std::vector<Block> &blocks) {
+  std::lock_guard<std::mutex> g(check_mu_);
+  for (const auto &b : blocks) {
+    const clio::run::u64 lo = b.offset_;
+    const clio::run::u64 hi = b.offset_ + AlignSize(b.size_);
+    auto it = live_.upper_bound(lo);
+    bool overlap = false;
+    if (it != live_.begin() && std::prev(it)->second > lo) overlap = true;
+    if (it != live_.end() && it->first < hi) overlap = true;
+    if (overlap) {
+      HLOG(kError, "BDEV-CHECK: allocated [{}, {}) overlaps a live extent: "
+           "two owners of the same bytes", lo, hi);
+      DumpStack();
+    }
+    live_[lo] = std::max(live_[lo], hi);
+  }
+}
+
+void StandardBlockAllocator::CheckFreed(const std::vector<Block> &blocks) {
+  std::lock_guard<std::mutex> g(check_mu_);
+  for (const auto &b : blocks) {
+    const clio::run::u64 lo = b.offset_;
+    const clio::run::u64 hi = b.offset_ + AlignSize(b.size_);
+    auto it = live_.upper_bound(lo);
+    if (it == live_.begin() || std::prev(it)->second < hi) {
+      HLOG(kError, "BDEV-CHECK: freed [{}, {}) is not live: double free",
+           lo, hi);
+      DumpStack();
+      continue;
+    }
+    --it;  // the live extent [s, e) containing [lo, hi)
+    const clio::run::u64 s = it->first;
+    const clio::run::u64 e = it->second;
+    live_.erase(it);
+    if (s < lo) live_[s] = lo;  // a partial free (a shrink) keeps the rest
+    if (hi < e) live_[hi] = e;
+  }
+}
+
 bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) {
+  const size_t first_new = blocks.size();
+  const bool ok = AllocateBlocksImpl(size, worker_id, blocks);
+  if (ok && CheckEnabled() && blocks.size() > first_new) {
+    CheckAllocated(std::vector<Block>(blocks.begin() + first_new, blocks.end()));
+  }
+  return ok;
+}
+
+bool StandardBlockAllocator::AllocateBlocksImpl(size_t size, int worker_id,
+                                                std::vector<Block>& blocks) {
   clio::run::u64 total_size = size;
   if (total_size == 0) {
     blocks.clear();
@@ -255,7 +357,40 @@ bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vec
   return false;
 }
 
+void StandardBlockAllocator::InitFromLive(
+    const std::vector<std::pair<clio::run::u64, clio::run::u64>>& live) {
+  // Aligned footprints, sorted by offset; overlapping records (a stale alloc
+  // record whose free was lost) merge rather than double count.
+  std::vector<std::pair<clio::run::u64, clio::run::u64>> ext;
+  ext.reserve(live.size());
+  for (const auto& e : live) {
+    if (e.second == 0) continue;
+    ext.emplace_back(e.first, e.first + AlignSize(e.second));
+  }
+  std::sort(ext.begin(), ext.end());
+  clio::run::u64 cursor = 0;
+  clio::run::u64 used = 0;
+  for (const auto& e : ext) {
+    if (e.first > cursor) {
+      global_block_map_.SeedFreeRange(cursor, e.first - cursor);
+    }
+    clio::run::u64 start = std::max(e.first, cursor);
+    if (e.second > start) {
+      used += e.second - start;
+      cursor = e.second;
+    }
+  }
+  heap_.SetCursor(cursor);
+  allocated_bytes_.store(used, std::memory_order_relaxed);
+  if (CheckEnabled()) {
+    std::lock_guard<std::mutex> g(check_mu_);
+    live_.clear();
+    for (const auto &e : ext) live_[e.first] = std::max(live_[e.first], e.second);
+  }
+}
+
 void StandardBlockAllocator::FreeBlocks(int worker_id, const std::vector<Block>& blocks) {
+  if (CheckEnabled()) CheckFreed(blocks);
   clio::run::u64 freed_bytes = 0;
   for (const auto& block : blocks) {
     Block block_copy = block;

@@ -1,0 +1,92 @@
+# Adds nodes 3 and 4 to distributed_md/'s cluster, for 4-rank
+# cross-container baseline runs.
+#
+# A SEPARATE OVERRIDE, not an edit to distributed_md/docker-compose.yml: that
+# file is the 2-node cluster three harnesses depend on, and quietly growing it
+# to four would change what they stand up. Compose merges overrides in order:
+#
+#   docker compose -f ../distributed_md/docker-compose.yml \
+#                  -f docker-compose.kokkos.yml \
+#                  -f docker-compose.four.yml up -d md-node1 ... md-node4
+#
+# The x-node anchor is re-declared because YAML anchors do not carry across
+# files -- an override referencing *node from the base would fail to parse.
+#
+# THE MOUNTS LIVE IN THE ANCHOR, not per service. Compose REPLACES sequences
+# rather than merging them, so a service-level `volumes:` here would drop
+# /workspace and /shared-ssh -- and a node with no /shared-ssh waits forever
+# for a key file in a directory that does not exist, logging nothing at all.
+x-node: &node
+  image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+  init: true
+  runtime: nvidia
+  ipc: host
+  user: "0:0"
+  stop_grace_period: 5s
+  security_opt:
+    - seccomp:unconfined
+  volumes:
+    - ${HOST_WORKSPACE:?set HOST_WORKSPACE to the repo root}:/workspace:ro
+    - ${KOKKOS_HOME:-/opt/kokkos}:/opt/kokkos:ro
+    - ${CUDA_HOME:-/usr/local/cuda}:/usr/local/cuda:ro
+    - ${NVSHMEM_HOME:?set NVSHMEM_HOME to the nvshmem prefix}:/opt/nvshmem:ro
+    - ${MD_SSH_DIR:?set MD_SSH_DIR to a writable host directory}:/shared-ssh:rw
+  working_dir: /tmp
+  mem_limit: 8g
+  environment: &node-env
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    - LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/nvshmem/lib:/usr/local/lib
+    # NVSHMEM probes for InfiniBand and prints a scary "Device enumeration
+    # failed" when there is none. There is none here and this test uses the
+    # P2P/IPC path, so the remote transports are disabled rather than left to
+    # fail noisily in every log.
+    - NVSHMEM_REMOTE_TRANSPORT=none
+  command:
+    - bash
+    - -c
+    - |
+      set -e
+      mkdir -p /root/.ssh && chmod 700 /root/.ssh
+      if [ "$$MD_NODE" = "1" ]; then
+        [ -f /shared-ssh/id_rsa ] || ssh-keygen -t rsa -N '' -f /shared-ssh/id_rsa -q
+      else
+        while [ ! -f /shared-ssh/id_rsa.pub ]; do sleep 1; done
+      fi
+      cp /shared-ssh/id_rsa /root/.ssh/id_rsa
+      chmod 600 /root/.ssh/id_rsa
+      cat /shared-ssh/id_rsa.pub >> /root/.ssh/authorized_keys
+      chmod 600 /root/.ssh/authorized_keys
+      mkdir -p /run/sshd
+      ssh-keygen -A >/dev/null 2>&1 || true
+      /usr/sbin/sshd -D -p 2222 -o PermitRootLogin=prohibit-password &
+      touch /tmp/ready
+      wait
+
+services:
+  md-node3:
+    <<: *node
+    container_name: md-node3
+    hostname: md-node3
+    environment:
+      - MD_NODE=3
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/nvshmem/lib:/usr/local/lib
+      - NVSHMEM_REMOTE_TRANSPORT=none
+    networks:
+      md-cluster: { ipv4_address: 172.23.0.12 }
+
+  md-node4:
+    <<: *node
+    container_name: md-node4
+    hostname: md-node4
+    environment:
+      - MD_NODE=4
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/nvshmem/lib:/usr/local/lib
+      - NVSHMEM_REMOTE_TRANSPORT=none
+    networks:
+      md-cluster: { ipv4_address: 172.23.0.13 }
+

@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""Deploy / tear down / fault-inject a clio-fs cluster over ssh.
+
+One clio_run daemon per node, the filesystem + CTE chain composed from the
+server config on every node (so `clio_run start` and `clio_run start --fresh`
+bring the whole stack back with no separate compose step), and one
+clio_cte_fuse mount per node at the same node-local path.
+
+All state a node writes (storage tiers, metadata WAL, indexer log, memfd
+links, logs of the daemons) lives under a node-local directory, never on
+the shared NFS home: a shared WAL / memfd dir lets daemons on different
+nodes clobber each other.
+"""
+
+import json
+import os
+import shlex
+import subprocess
+import threading
+import time
+
+SSH = ['env', '-u', 'LD_LIBRARY_PATH', 'ssh', '-o', 'BatchMode=yes',
+       '-o', 'StrictHostKeyChecking=no', '-o', 'LogLevel=ERROR',
+       '-o', 'ConnectTimeout=10']
+
+
+def sh(host, cmd, timeout=120, check=False):
+  """Run cmd on host via ssh (locally when host is None)."""
+  argv = SSH + [host, cmd] if host else ['bash', '-c', cmd]
+  try:
+    p = subprocess.run(argv, capture_output=True, timeout=timeout,
+                       stdin=subprocess.DEVNULL)
+    out = p.stdout.decode(errors='replace') + p.stderr.decode(errors='replace')
+    rc = p.returncode
+  except subprocess.TimeoutExpired:
+    out, rc = f'ssh timeout after {timeout}s: {cmd}', 124
+  if check and rc != 0:
+    raise RuntimeError(f'[{host}] rc={rc}: {cmd}\n{out[-3000:]}')
+  return rc, out
+
+
+def parallel(fn, items):
+  """Run fn(item) for every item concurrently; return results in order."""
+  res = [None] * len(items)
+
+  def run(i, it):
+    try:
+      res[i] = fn(it)
+    except Exception as e:  # pylint: disable=broad-except
+      res[i] = e
+  ths = [threading.Thread(target=run, args=(i, it))
+         for i, it in enumerate(items)]
+  for t in ths:
+    t.start()
+  for t in ths:
+    t.join()
+  return res
+
+
+class AgentConn:
+  """A JSON-lines connection to agent.py running on one node."""
+
+  def __init__(self, host, agent_py, env_prefix=''):
+    self.host = host
+    cmd = f'{env_prefix} exec /usr/bin/python3 -u {agent_py}'
+    self.p = subprocess.Popen(SSH + [host, cmd], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL)
+    self.next_id = 1
+    self.lock = threading.Lock()
+    hello = self._readline(60)
+    if hello is None:
+      raise RuntimeError(f'agent on {host} did not start')
+    self.pid = hello['ret']['pid']
+    self.dead = False
+
+  def _readline(self, timeout):
+    box = {}
+
+    def rd():
+      box['l'] = self.p.stdout.readline()
+    t = threading.Thread(target=rd, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive() or not box.get('l'):
+      return None
+    return json.loads(box['l'])
+
+  def call(self, op, timeout=120, **args):
+    """Invoke op on the node; returns the reply dict (never raises)."""
+    with self.lock:
+      if self.dead:
+        return {'ok': False, 'err': 'agent dead', 'agent_dead': True}
+      rid = self.next_id
+      self.next_id += 1
+      try:
+        self.p.stdin.write((json.dumps({'id': rid, 'op': op, 'args': args,
+                                        'timeout': timeout}) + '\n').encode())
+        self.p.stdin.flush()
+      except (BrokenPipeError, OSError):
+        self.dead = True
+        return {'ok': False, 'err': 'agent pipe broken', 'agent_dead': True}
+      # The agent itself enforces `timeout`; allow slack for the reply.
+      r = self._readline(timeout + 30)
+      if r is None:
+        self.dead = True
+        return {'ok': False, 'err': 'agent unresponsive', 'agent_dead': True,
+                'hang': True}
+      return r
+
+  def close(self):
+    try:
+      self.p.stdin.write(b'{"id":-1,"op":"exit"}\n')
+      self.p.stdin.flush()
+    except OSError:
+      pass
+    try:
+      self.p.wait(5)
+    except subprocess.TimeoutExpired:
+      self.p.kill()
+
+
+# Profile 'safe': each node's slow tier is a safe_bdev array of SAFE_MEMBERS
+# file bdevs, the last SAFE_PARITY of them parity (max_failures).
+SAFE_MEMBERS = 6
+SAFE_PARITY = 2
+SAFE_POOL_ID = '7100.0'
+SAFE_MEMBER_POOL_MAJOR = 7101  # members are 7101.0 .. 7106.0
+
+
+class Cluster:
+  """Owns the daemons, mounts and agents of an N-node clio-fs deployment."""
+
+  def __init__(self, hosts, bin_dir, run_dir, profile='persistent',
+               port=9519, attr_cache_s=None, num_threads=8,
+               ram_gb=8, disk_gb=20, local_root=None, net_suffix='-40g',
+               extra_env=None, replicate_period_ms=0, fsync_mode=None,
+               ram_mb=512, fast_mb=2048, organizer='frecency',
+               organizer_period_ms=2000, neighborhood=1):
+    self.hosts = list(hosts)
+    self.bin_dir = bin_dir
+    self.run_dir = run_dir            # shared (NFS): configs, logs, results
+    self.profile = profile
+    self.port = port
+    self.attr_cache_s = attr_cache_s
+    self.num_threads = num_threads
+    self.ram_gb = ram_gb
+    self.disk_gb = disk_gb
+    self.net_suffix = net_suffix
+    user = os.environ.get('USER', 'user')
+    self.local_root = local_root or f'/mnt/nvme/{user}/clio_fs_suite'
+    self.mnt = f'{self.local_root}/mnt'
+    self.extra_env = extra_env or {}
+    # 0 = synchronous write-through to the persistent replica (a put acks
+    # only once its durable copy exists); >0 = async sweep every N ms.
+    self.replicate_period_ms = replicate_period_ms
+    # CTE performance.fsync_mode ('durable' / 'deferred'); None = default.
+    self.fsync_mode = fsync_mode
+    # Profile 'tiered': three small tiers per node so ordinary workloads
+    # overflow the upper ones -- RAM (ram_mb), a fast file tier (fast_mb)
+    # and a slow file tier (disk_gb) -- with `organizer` migrating blobs
+    # between them every organizer_period_ms while tests read and write.
+    self.ram_mb = ram_mb
+    self.fast_mb = fast_mb
+    self.organizer = organizer
+    self.organizer_period_ms = organizer_period_ms
+    # CTE targets.neighborhood: each node's CTE registers the disk tiers of
+    # this many nodes (itself and the next ones), so a blob may be placed
+    # on a neighbor's device.
+    self.neighborhood = neighborhood
+    self.agents = {}
+    self.agent_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'agent.py')
+    os.makedirs(run_dir, exist_ok=True)
+    self.conf = os.path.join(run_dir, 'clio_server.yaml')
+    self.hostfile = os.path.join(run_dir, 'hostfile')
+
+  # -- configuration -------------------------------------------------------
+  def env(self):
+    """Environment every daemon/mount/agent on a node runs with."""
+    e = {
+        'CLIO_SERVER_CONF': self.conf,
+        'CLIO_WITH_RUNTIME': '0',
+        'CLIO_IPC_MODE': 'SHM',
+        'CLIO_MEMFD_DIR': f'{self.local_root}/memfd',
+        # Test-only partition hook (see partition()): absent file = none.
+        'CLIO_TEST_PARTITION_FILE': f'{self.local_root}/test_partition',
+        'CTP_LOG_LEVEL': os.environ.get('CLIO_SUITE_LOG_LEVEL', 'warning'),
+        'PATH': f'{self.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin',
+        # The login shell's LD_LIBRARY_PATH (e.g. another build's bin dir)
+        # would override the binaries' RUNPATH and load mismatched libs.
+        'LD_LIBRARY_PATH': self.bin_dir,
+    }
+    # Failure detection: the runtime defaults (30 s silence + 30 s retry per
+    # send) ride out restarts but stall every op on a dead node for 30 s;
+    # a filesystem deployment wants a prompt EIO. Overridable per run.
+    e['CLIO_PROBE_SILENCE_S'] = os.environ.get('CLIO_SUITE_PROBE_SILENCE_S',
+                                               '10')
+    e['CLIO_NET_RETRY_TIMEOUT_S'] = os.environ.get(
+        'CLIO_SUITE_NET_RETRY_TIMEOUT_S', '10')
+    e['CLIO_NET_DEAD_FAIL_FAST'] = os.environ.get(
+        'CLIO_SUITE_NET_DEAD_FAIL_FAST', '1')
+    if self.attr_cache_s is not None:
+      e['CLIO_FUSE_ATTR_CACHE_S'] = str(self.attr_cache_s)
+    # CLIO_SUITE_PASS_<NAME>=v exports <NAME>=v to every daemon, mount and
+    # agent (e.g. CLIO_SUITE_PASS_CLIO_ALLOW_PTRACE=1 to gdb -p a daemon).
+    for k, v in os.environ.items():
+      if k.startswith('CLIO_SUITE_PASS_'):
+        e[k[len('CLIO_SUITE_PASS_'):]] = v
+    e.update(self.extra_env)
+    return e
+
+  def env_prefix(self):
+    return ' '.join(f'{k}={shlex.quote(v)}' for k, v in self.env().items())
+
+  def safe_member_path(self, k):
+    """Backing file of safe_bdev member k (0-based) on every node.
+    Disk death is injected by creating `<path>.fail` (see kill_disk)."""
+    return f'{self.local_root}/data/safe_m{k}.dat'
+
+  def safe_compose(self):
+    """Compose entries for profile 'safe' (empty otherwise): SAFE_MEMBERS
+    file bdevs and the safe_bdev array over them, node-local on every node,
+    each with an allocation log so a restart recovers its state."""
+    if self.profile != 'safe':
+      return ''
+    lr = self.local_root
+    per_member_gb = max(1, -(-self.disk_gb // (SAFE_MEMBERS - SAFE_PARITY)))
+    out = ''
+    members = ''
+    for k in range(SAFE_MEMBERS):
+      pid = SAFE_MEMBER_POOL_MAJOR + k
+      out += (f'  - mod_name: clio_bdev\n'
+              f'    pool_name: "{self.safe_member_path(k)}"\n'
+              f'    pool_query: local\n'
+              f'    pool_id: "{pid}.0"\n'
+              f'    bdev_type: file\n'
+              f'    capacity: "{per_member_gb}GB"\n'
+              f'    alloc_log: "{lr}/data/safe_m{k}.alog"\n')
+      parity = 'true' if k >= SAFE_MEMBERS - SAFE_PARITY else 'false'
+      members += (f'      - pool_name: "{self.safe_member_path(k)}"\n'
+                  f'        pool_id_major: {pid}\n'
+                  f'        node_id: 0\n'
+                  f'        parity: {parity}\n')
+    out += (f'  - mod_name: clio_safe_bdev\n'
+            f'    pool_name: "{lr}/data/safe_array"\n'
+            f'    pool_query: local\n'
+            f'    pool_id: "{SAFE_POOL_ID}"\n'
+            f'    max_failures: {SAFE_PARITY}\n'
+            f'    alloc_log: "{lr}/data/safe_array.alog"\n'
+            f'    members:\n' + members)
+    return out
+
+  def kill_disk(self, host, k):
+    """Make safe_bdev member k on `host` fail every I/O from now on (the file
+    bdev's test fault injection), as a disk dying under load would."""
+    return sh(host, f'touch {self.safe_member_path(k)}.fail', timeout=30)
+
+  def revive_disk(self, host, k):
+    """Undo kill_disk: the member's device answers again."""
+    return sh(host, f'rm -f {self.safe_member_path(k)}.fail', timeout=30)
+
+  def write_config(self):
+    """Generate the hostfile and the server config (with compose)."""
+    with open(self.hostfile, 'w') as f:
+      for h in self.hosts:
+        f.write(f'{h}{self.net_suffix}\n')
+    lr = self.local_root
+    # 'safe' is the tiered profile whose slow tier is a safe_bdev array of
+    # SAFE_MEMBERS file bdevs (SAFE_PARITY of them parity) on each node.
+    tiered = self.profile in ('tiered', 'safe')
+    ram_cap = f'{self.ram_mb}MB' if tiered else f'{self.ram_gb}GB'
+    storage = [
+        f'      - path: "ram::clio_fs_ram"\n'
+        f'        bdev_type: "ram"\n'
+        f'        capacity_limit: "{ram_cap}"\n'
+        f'        score: 1.0\n']
+    perf = ''
+    chain = ''
+    fs_next = '512.0'
+    fs_extra = ''
+    stream_extra = ''
+    if tiered:
+      storage.append(
+          f'      - path: "{lr}/data/cte_fast_tier.dat"\n'
+          f'        bdev_type: "file"\n'
+          f'        capacity_limit: "{self.fast_mb}MB"\n'
+          f'        score: 0.6\n'
+          f'        persistence_level: "temporary"\n')
+    if self.profile == 'safe':
+      storage.append(
+          f'      - path: "{lr}/data/safe_array"\n'
+          f'        existing_pool_id: "{SAFE_POOL_ID}"\n'
+          f'        existing_pool_module: "clio_safe_bdev"\n'
+          f'        capacity_limit: "{self.disk_gb}GB"\n'
+          f'        score: 0.2\n')
+    if self.profile in ('persistent', 'persistent_norepl', 'tiered', 'safe'):
+      if self.profile != 'safe':
+        storage.append(
+            f'      - path: "{lr}/data/cte_disk_tier.dat"\n'
+            f'        bdev_type: "file"\n'
+            f'        capacity_limit: "{self.disk_gb}GB"\n'
+            f'        score: 0.2\n'
+            f'        persistence_level: "temporary"\n')
+      perf = (f'    performance:\n'
+              f'      metadata_log_path: "{lr}/data/cte_metadata_log"\n'
+              f'      transaction_log_capacity: "256MB"\n')
+      if self.fsync_mode:
+        perf += f'      fsync_mode: "{self.fsync_mode}"\n'
+      # Each node persists its own hash-owned slice of the namespace, and
+      # the file sizes / pending appends of the streams it homes.
+      fs_extra = f'    metadata_log_path: "{lr}/data/cfs_namespace_log"\n'
+      stream_extra = f'    log_path: "{lr}/data/cte_stream_log"\n'
+    if self.profile == 'persistent_norepl':
+      # Nothing but fsync may move bytes off the RAM tier: no replica on the
+      # disk tier, and the periodic volatile->disk flush pushed out an hour.
+      perf += '      flush_data_period_ms: 3600000\n'
+    organizer = ''
+    if tiered:
+      perf += '      flush_data_period_ms: 2000\n'
+      organizer = (f'    organizer: "{self.organizer}"\n'
+                   f'    organizer_period_ms: {self.organizer_period_ms}\n')
+    if self.profile in ('persistent', 'tiered', 'safe'):
+      chain = ('  - mod_name: clio_cte_replication\n'
+               '    pool_name: clio_cte_replication\n'
+               '    pool_query: local\n'
+               '    pool_id: "561.0"\n'
+               '    next_pool_id: "512.0"\n'
+               '    num_replicas: 1\n'
+               f'    replicate_period_ms: {self.replicate_period_ms}\n'
+               '    cache_score: 1.0\n'
+               '    replica_score: 0.2\n'
+               '    remote_copies: 1\n'
+               f'    handoff_log_path: "{lr}/data/cte_handoff_log"\n')
+      fs_next = '561.0'
+    cfg = f"""# Generated by clio_fs_suite/cluster.py -- profile {self.profile}
+memory:
+  main_segment_size: auto
+  client_data_segment_size: 4GB
+networking:
+  port: {self.port}
+  hostfile: {self.hostfile}
+  wait_for_restart: 60
+  wait_for_restart_poll_period: 1
+runtime:
+  num_threads: {self.num_threads}
+  queue_depth: 1024
+  conf_dir: {lr}/conf
+compose:
+{self.safe_compose()}  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+{''.join(storage)}{perf}{organizer}    dpe:
+      dpe_type: "max_bw"
+    targets:
+      neighborhood: {self.neighborhood}
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+      failover_to_successor: true
+{chain}  - mod_name: clio_cte_cache
+    pool_name: clio_cte_cache
+    pool_query: local
+    pool_id: "563.0"
+    next_pool_id: "{fs_next}"
+    min_score: 0.5
+  - mod_name: clio_cte_stream
+    pool_name: clio_cte_stream
+    pool_query: local
+    pool_id: "565.0"
+    next_pool_id: "563.0"
+    staging_pool_id: "{fs_next}"
+{stream_extra}  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: "560.0"
+    next_pool_id: "563.0"
+{fs_extra}"""
+    with open(self.conf, 'w') as f:
+      f.write(cfg)
+
+  # -- per-node lifecycle --------------------------------------------------
+  def log_path(self, host, what):
+    d = os.path.join(self.run_dir, 'logs')
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f'{host}.{what}.log')
+
+  def wipe(self, host):
+    """Remove all node-local state (storage, WAL, memfd links)."""
+    self.force_unmount(host)
+    sh(host, f'pkill -9 -u $USER -f "[c]lio_cte_fuse" ; '
+             f'pkill -9 -u $USER -f "[c]lio_run" ; sleep 0.5; '
+             f'rm -rf {self.local_root}/data {self.local_root}/memfd '
+             f'{self.local_root}/conf; '
+             f'mkdir -p {self.local_root}/data; {self.seal_mnt_cmd()}',
+       timeout=60)
+
+  def seal_mnt_cmd(self):
+    """Shell snippet leaving an EMPTY raw mountpoint (only when nothing is
+    mounted there; fusermount needs it writable, so it cannot be sealed). A test op that runs after its FUSE mount died
+    must fail loudly -- otherwise it silently writes into the node-local
+    directory underneath and later runs read that junk back as if it were
+    clio-fs state."""
+    m = self.mnt
+    return (f'if ! grep -q " {m} " /proc/self/mountinfo; then '
+            f'chmod -R u+w {m} 2>/dev/null; rm -rf {m}; mkdir -p {m}; fi')
+
+  def start_runtime(self, host, fresh=False):
+    """Launch `clio_run start` detached on host. It recovers the node's
+    persistent state; fresh=True passes --fresh (discard it, start empty)."""
+    log = self.log_path(host, 'runtime')
+    args = 'start --fresh' if fresh else 'start'
+    # CLIO_SUITE_GDB=1 runs the daemon under gdb and dumps every thread's
+    # stack into the runtime log if it crashes (silent SIGSEGV otherwise).
+    cmd = (f'{self.env_prefix()} nohup {self._gdb("runtime")}'
+           f'{self.bin_dir}/clio_run {args} '
+           f'--no-viz </dev/null >>{log} 2>&1 &')
+    sh(host, f'echo "=== {time.ctime()} clio_run {args}" >> {log}; {cmd}')
+
+  def gdb_prefix(self):
+    """Command prefix running a daemon under gdb when CLIO_SUITE_GDB=1: a
+    crash (or a SIGUSR2 sent to a hung daemon) then dumps every thread's
+    stack into the daemon's log instead of dying silently."""
+    return self._gdb('1')
+
+  def _gdb(self, which):
+    want = os.environ.get('CLIO_SUITE_GDB', '')
+    if want not in ('1', which):
+      return ''
+    return ('gdb -q -batch -nx -ex "set startup-with-shell off" '
+            '-ex "handle SIGUSR1 nostop noprint pass" '
+            '-ex "handle SIGPIPE nostop noprint pass" '
+            '-ex run -ex "thread apply all bt 25" --args ')
+
+  def runtime_up(self, host, timeout=180):
+    """Wait until the daemon on host listens on its port."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+      rc, _ = sh(host, f'ss -ltn | grep -q ":{self.port} "', timeout=20)
+      if rc == 0:
+        return True
+      time.sleep(1)
+    return False
+
+  def runtime_pid(self, host):
+    rc, out = sh(host, 'pgrep -u $USER -f "^[^ ]*[c]lio_run (start|restart)"')
+    return [int(x) for x in out.split()] if rc == 0 else []
+
+  def stop_runtime(self, host, timeout=60):
+    """Graceful `clio_run stop`; falls back to SIGKILL after timeout."""
+    sh(host, f'{self.env_prefix()} timeout {timeout} '
+             f'{self.bin_dir}/clio_run stop', timeout=timeout + 15)
+    t0 = time.time()
+    while time.time() - t0 < timeout and self.runtime_pid(host):
+      time.sleep(1)
+    if self.runtime_pid(host):
+      self.kill_runtime(host)
+      return False
+    return True
+
+  def partition(self, host, node_ids):
+    """Make `host`'s daemon unable to send to `node_ids` (test hook:
+    CLIO_TEST_PARTITION_FILE; takes effect within ~0.5 s)."""
+    ids = ' '.join(str(i) for i in node_ids)
+    sh(host, f'echo "{ids}" > {self.local_root}/test_partition')
+
+  def heal(self, host):
+    """Undo partition() on `host`."""
+    sh(host, f'rm -f {self.local_root}/test_partition')
+
+  def kill_runtime(self, host, sig='KILL'):
+    sh(host, f'pkill -{sig} -u $USER -f "[c]lio_run (start|restart)"')
+
+  def mount(self, host, timeout=90):
+    """Start clio_cte_fuse on host and wait for a usable mount."""
+    log = self.log_path(host, 'fuse')
+    # Any mount still at the mountpoint is a stale one (dead daemon): the
+    # setuid fusermount3 then fails with EACCES on it. Clear it first.
+    for _ in range(10):
+      rc, _ = sh(host, f'grep -q " {self.mnt} " /proc/self/mountinfo')
+      if rc != 0:
+        break
+      self.force_unmount(host)
+      time.sleep(0.5)
+    sh(host, f'{self.seal_mnt_cmd()}; echo "=== {time.ctime()} mount" >> {log};'
+             f' {self.env_prefix()} nohup {self._gdb("fuse")}'
+             f'{self.bin_dir}/clio_cte_fuse '
+             f'{self.mnt} -f {os.environ.get("CLIO_SUITE_FUSE_ARGS", "")} '
+             f'</dev/null >>{log} 2>&1 &')
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+      rc, _ = sh(host, f'grep -q " {self.mnt} " /proc/self/mountinfo && '
+                       f'timeout 20 stat -f {self.mnt} >/dev/null',
+                 timeout=40)
+      if rc == 0:
+        return True
+      time.sleep(1)
+    return False
+
+  def fuse_pid(self, host):
+    rc, out = sh(host, 'pgrep -u $USER -f "[c]lio_cte_fuse"')
+    return [int(x) for x in out.split()] if rc == 0 else []
+
+  def force_unmount(self, host):
+    """Abort the FUSE connection (unsticks D-state callers), lazy-unmount."""
+    script = (
+        f'for m in $(awk \'$5=="{self.mnt}" {{split($3,a,":"); print a[2]}}\' '
+        f'/proc/self/mountinfo); do echo 1 > /sys/fs/fuse/connections/$m/abort'
+        f' 2>/dev/null; done; fusermount3 -u -z {self.mnt} 2>/dev/null; true')
+    sh(host, script, timeout=30)
+
+  def unmount(self, host):
+    """Clean unmount, then make sure the fuse process is gone."""
+    sh(host, f'timeout 30 fusermount3 -u {self.mnt}', timeout=45)
+    t0 = time.time()
+    while time.time() - t0 < 20 and self.fuse_pid(host):
+      time.sleep(0.5)
+    if self.fuse_pid(host):
+      self.force_unmount(host)
+      sh(host, 'pkill -9 -u $USER -f "[c]lio_cte_fuse"')
+
+  def kill_fuse(self, host):
+    sh(host, 'pkill -9 -u $USER -f "[c]lio_cte_fuse"')
+    self.force_unmount(host)
+
+  # -- agents --------------------------------------------------------------
+  def agent(self, host):
+    a = self.agents.get(host)
+    if a is None or a.dead:
+      if a is not None:
+        a.close()
+      a = AgentConn(host, self.agent_py, self.env_prefix())
+      self.agents[host] = a
+    return a
+
+  def close_agents(self):
+    for a in self.agents.values():
+      a.close()
+    self.agents = {}
+
+  # -- whole-cluster -------------------------------------------------------
+  def up(self, wipe=True):
+    """Bring every node up; return (ok, message). wipe=True is a new
+    deployment: its data is removed and every daemon starts --fresh."""
+    self.write_config()
+    if wipe:
+      parallel(self.wipe, self.hosts)
+    parallel(lambda h: self.start_runtime(h, fresh=wipe), self.hosts)
+    ups = parallel(self.runtime_up, self.hosts)
+    bad = [h for h, ok in zip(self.hosts, ups) if ok is not True]
+    if bad:
+      return False, f'runtime did not come up on {bad}'
+    # Compose happens inside start; give the pools a moment on every node.
+    time.sleep(3)
+    mounts = parallel(self.mount, self.hosts)
+    bad = [h for h, ok in zip(self.hosts, mounts) if ok is not True]
+    if bad:
+      return False, f'mount failed on {bad}'
+    return True, 'ok'
+
+  def down(self, graceful=True):
+    self.close_agents()
+    parallel(self.unmount, self.hosts)
+    if graceful:
+      parallel(self.stop_runtime, self.hosts)
+    else:
+      parallel(self.kill_runtime, self.hosts)
+    parallel(lambda h: sh(h, 'pkill -9 -u $USER -f "[c]lio_run"'), self.hosts)
+
+  def health(self):
+    """Return {host: problem} for nodes whose mount or daemon is not OK."""
+    def chk(h):
+      if not self.runtime_pid(h):
+        return 'runtime not running'
+      if not self.fuse_pid(h):
+        return 'fuse not running'
+      rc, out = sh(h, f'grep -q " {self.mnt} " /proc/self/mountinfo && '
+                      f'timeout 15 stat -f {self.mnt} >/dev/null && '
+                      f'timeout 15 ls {self.mnt} >/dev/null', timeout=40)
+      return None if rc == 0 else f'mount unusable rc={rc} {out[-200:]}'
+    res = parallel(chk, self.hosts)
+    return {h: r for h, r in zip(self.hosts, res) if r}
