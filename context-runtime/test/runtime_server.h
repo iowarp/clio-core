@@ -374,7 +374,11 @@ class RuntimeServer {
     std::error_code ec;
     std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
     if (ec) dir = ".";
-    return (dir / "clio_run_test_server.log").string();
+    // Per user: on a shared machine another user's leftover log at a fixed
+    // name cannot be opened, and every daemon spawn then failed.
+    const char *user = std::getenv("USER");
+    const std::string who = (user && *user) ? std::string(user) : "user";
+    return (dir / ("clio_run_test_server_" + who + ".log")).string();
   }
 
   static void SetEnv(const char *key, const std::string &val) {
