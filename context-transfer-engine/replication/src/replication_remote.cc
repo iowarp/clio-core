@@ -147,10 +147,14 @@ constexpr double kForwardRetryUs = 1000000.0;
 clio::run::TaskResume Runtime::PutBlob(
     clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  if (task->context_.replica_ != 0 || config_.remote_copies_ <= 0) {
+  if (task->context_.replica_ != 0) {
     CLIO_CO_AWAIT(PutBlobLocal(task));
     CLIO_CO_RETURN;
   }
+  // A failover write is recorded for hand-back whatever remote_copies_ is
+  // (#1130): with no remote copy (replication_factor 1, the default) the
+  // stand-in holds the ONLY copy of what was written while the owner was
+  // down, and the owner returns without it unless it is handed back.
   const TagId tag = task->tag_id_;
   const std::string name = task->blob_name_.str();
   const clio::run::u32 owner = OwnerOf(tag, name);
@@ -249,17 +253,17 @@ clio::run::TaskResume Runtime::MultiPutBlob(
     task->context_.op_flags_ |= Context::kShadowCopy;  // standing in
   }
   CLIO_CO_AWAIT(MultiPutBlobLocal(task));
-  if (task->GetReturnCode() != 0 || config_.remote_copies_ <= 0) {
-    CLIO_CO_RETURN;
-  }
+  if (task->GetReturnCode() != 0) CLIO_CO_RETURN;
   for (size_t d = 0; d < batch.size(); ++d) {
     if (!batch.RecordValid(d)) continue;
     const auto &desc = batch.descs_[d];
     if (!owner_here) {
+      // Standing in for a dead owner: always hand back (#1130).
       NoteHandoff(OwnerOf(desc.tag_id_, desc.blob_name_), desc.tag_id_,
                   desc.blob_name_, false);
       continue;
     }
+    if (config_.remote_copies_ <= 0) continue;
     CLIO_CO_AWAIT(MirrorRange(desc.tag_id_, desc.blob_name_, desc.offset_,
                               desc.size_, batch.RecordSlice(d),
                               config_.replica_score_));
@@ -277,16 +281,17 @@ clio::run::TaskResume Runtime::DelBlob(
                               task.template Cast<clio::run::Task>()));
   // A cache-copy invalidation touches only this node's cache copy.
   if (task->del_flags_ & clio::cte::core::kDelCacheCopyOnly) CLIO_CO_RETURN;
-  if (config_.remote_copies_ <= 0) CLIO_CO_RETURN;
   const clio::run::u32 owner = OwnerOf(tag, name);
   if (owner != container_id_) {
-    // Standing in for a dead owner: it must learn of the delete.
+    // Standing in for a dead owner: it must learn of the delete (#1130:
+    // whatever remote_copies_ is).
     if (clio::cte::core::FailoverContainer(pool_id_, owner) == container_id_) {
       NoteHandoff(owner, tag, name, true);
       CLIO_CO_AWAIT(InvalidateCachedEverywhere(tag, name));
     }
     CLIO_CO_RETURN;
   }
+  if (config_.remote_copies_ <= 0) CLIO_CO_RETURN;
   const clio::run::u32 n = NumContainers();
   for (int i = 1; i <= config_.remote_copies_ && i < static_cast<int>(n); ++i) {
     const clio::run::u32 c = (container_id_ + i) % n;
@@ -306,17 +311,16 @@ clio::run::TaskResume Runtime::TruncateBlob(
   const clio::run::u64 new_size = task->new_size_;
   CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kTruncateBlob,
                               task.template Cast<clio::run::Task>()));
-  if (config_.remote_copies_ <= 0 || task->GetReturnCode() != 0) {
-    CLIO_CO_RETURN;
-  }
+  if (task->GetReturnCode() != 0) CLIO_CO_RETURN;
   const clio::run::u32 owner = OwnerOf(tag, name);
   if (owner != container_id_) {
     if (clio::cte::core::FailoverContainer(pool_id_, owner) == container_id_) {
-      NoteHandoff(owner, tag, name, false);
+      NoteHandoff(owner, tag, name, false);  // #1130: always
       CLIO_CO_AWAIT(InvalidateCachedEverywhere(tag, name));
     }
     CLIO_CO_RETURN;
   }
+  if (config_.remote_copies_ <= 0) CLIO_CO_RETURN;
   const clio::run::u32 n = NumContainers();
   for (int i = 1; i <= config_.remote_copies_ && i < static_cast<int>(n); ++i) {
     const clio::run::u32 c = (container_id_ + i) % n;

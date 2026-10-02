@@ -39,7 +39,10 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     HLOG(kInfo, "replication: async write-through sweep every {} ms",
          config_.replicate_period_ms_);
   }
-  if (config_.remote_copies_ > 0) {
+  // Failover hand-back runs whenever there is another container to stand
+  // in (#1130), not only with remote copies: with replication_factor 1 the
+  // stand-in holds the only copy of what was written during an outage.
+  if (NumContainers() > 1) {
     OpenHandoffLog();
     auto *ipc = CLIO_CPU_IPC;
     auto sweep = ipc->NewTask<HandoffSweepTask>(
@@ -50,10 +53,12 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     if (is_restart_) {
       // Pull what the successors changed while this node was down before
       // serving: otherwise it would answer with its stale copies.
+      // Ask every other container: whichever stood in (the first live
+      // successor at the time, which the remote-copy count does not bound).
       const clio::run::u32 n = NumContainers();
-      for (int i = 1; i <= config_.remote_copies_ && i < static_cast<int>(n);
-           ++i) {
+      for (clio::run::u32 i = 1; i < n; ++i) {
         const clio::run::u32 c = (container_id_ + i) % n;
+        if (!ContainerAlive(c)) continue;  // a dead one cannot answer
         auto pull = ipc->NewTask<HandoffPullTask>(
             clio::run::CreateTaskId(), task->new_pool_id_,
             clio::run::PoolQuery::DirectId(c), container_id_);
