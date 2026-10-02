@@ -2327,6 +2327,12 @@ if(TARGET clio_cte_replication_client)
 endif()
 # Filesystem chimod: NEEDED by the clio_cte_fuse adapter binary that ships
 # in the wheel when CLIO_CTE_ENABLE_FUSE_ADAPTER is ON (#899).
+# The filesystem chimod depends on the stream chimod (file sizes, deferred
+# appends): without it the wheel's libclio_cte_filesystem_runtime.so has
+# unresolved libclio_cte_stream_* dependencies.
+if(TARGET clio_cte_stream_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_stream_client clio_cte_stream_runtime)
+endif()
 if(TARGET clio_cte_filesystem_client)
   list(APPEND PIP_LIB_TARGETS clio_cte_filesystem_client clio_cte_filesystem_runtime)
 endif()
