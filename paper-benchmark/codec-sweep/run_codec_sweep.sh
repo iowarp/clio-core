@@ -6,17 +6,19 @@
 #SBATCH --time=00:10:00
 #SBATCH --output=codec-sweep-%j.out
 #===============================================================================
-# run_codec_sweep.sh -- compress Nyx field files in fixed-size chunks with every
-# nvcomp codec, ndzip, GPULZ, SPspeed and SPratio (no preprocessing, no clio)
-# and write one CSV row per (chunk, codec): compressed bytes, ratio,
+# run_codec_sweep.sh -- compress a workload's field files in fixed-size chunks
+# with every nvcomp codec, ndzip, GPULZ, SPspeed and SPratio (no preprocessing,
+# no clio) and write one CSV row per (chunk, codec): compressed bytes, ratio,
 # compress/decompress ms, and whether the round trip was bit-exact.
 #
 #   sbatch run_codec_sweep.sh                         # every Nyx file
+#   WL=vpic sbatch run_codec_sweep.sh                 # every VPIC file
 #   MAX_GB=1 sbatch --time=00:05:00 run_codec_sweep.sh  # first 1 GiB only
 #
 # Environment:
-#   FIELDS        dump directory          (/work/hdd/bekn/$USER/np-dumps/nyx/fields)
-#   OUT           results directory       (/projects/bekn/$USER/np-codec-sweep/<stamp>)
+#   WL            workload name, names the dump dir and the CSV   (nyx)
+#   FIELDS        dump directory          (/work/hdd/bekn/$USER/np-dumps/$WL/fields)
+#   OUT           results directory       (np-codec-sweep/{smoke,full}/$WL-<stamp>; smoke when MAX_GB > 0)
 #   CHUNK         bytes per chunk         (4194304)
 #   MAX_GB        stop after this many GiB of input, 0 = all   (0)
 #   CODECS        comma list, default all twelve
@@ -26,6 +28,9 @@
 #   STAGE_STREAMS parallel copies         (16)
 #===============================================================================
 set -euo pipefail
+# No core dumps: a crashing codec on a 40 GB GPU writes ~37 GB of core into the
+# results folder (four did on 2026-10-02).
+ulimit -c 0
 
 # Under sbatch, $0 is a spool copy; find the real script through scontrol.
 if [ -n "${SLURM_JOB_ID:-}" ]; then
@@ -35,10 +40,13 @@ else
 fi
 HERE=$(cd "$(dirname "$SELF")" && pwd)
 
-FIELDS=${FIELDS:-/work/hdd/bekn/$USER/np-dumps/nyx/fields}
-OUT=${OUT:-/projects/bekn/$USER/np-codec-sweep/nyx-$(date +%m%d%H%M)-${SLURM_JOB_ID:-local}}
-CHUNK=${CHUNK:-4194304}
+WL=${WL:-nyx}
+FIELDS=${FIELDS:-/work/hdd/bekn/$USER/np-dumps/$WL/fields}
 MAX_GB=${MAX_GB:-0}
+# Smoke runs (MAX_GB > 0) and full runs land in separate trees.
+KIND=$(awk -v g="$MAX_GB" 'BEGIN{print (g > 0) ? "smoke" : "full"}')
+OUT=${OUT:-/projects/bekn/$USER/np-codec-sweep/$KIND/$WL-$(date +%m%d%H%M)-${SLURM_JOB_ID:-local}}
+CHUNK=${CHUNK:-4194304}
 CODECS=${CODECS:-}
 NPENV=${NPENV:-$HOME/np-env}
 BUILD_DIR=${BUILD_DIR:-$HOME/np-build/codec-sweep}
@@ -46,7 +54,7 @@ STAGE=${STAGE:-1}
 STAGE_STREAMS=${STAGE_STREAMS:-16}
 BIN=$BUILD_DIR/codec_sweep
 SRC=$HERE/codec_sweep.cu
-CSV=$OUT/nyx_chunk$((CHUNK >> 20))m.csv
+CSV=$OUT/${WL}_chunk$((CHUNK >> 20))m.csv
 
 # build -- compile the benchmark out of tree when the binary is missing or older
 # than its source. Libraries are found through RPATH, not LD_LIBRARY_PATH. It
@@ -54,7 +62,7 @@ CSV=$OUT/nyx_chunk$((CHUNK >> 20))m.csv
 # binary.
 build() {
   mkdir -p "$BUILD_DIR"
-  [ -x "$BIN" ] && [ "$BIN" -nt "$SRC" ] && return 0
+  [ -x "$BIN" ] && [ "$BIN" -nt "$SRC" ] && [ "$BIN" -nt "$HERE/gpu_codecs.cuh" ] && return 0
   echo "building $BIN"
   local tmp=$BIN.tmp.$$
   nvcc -O2 -std=c++17 -arch=sm_80 --expt-relaxed-constexpr \
@@ -76,12 +84,24 @@ make_list() {
 }
 
 # stage -- copy the listed files to node-local /tmp with parallel streams and
-# point DIR there, so the sweep never waits on the shared filesystem.
+# point DIR there, so the sweep never waits on the shared filesystem. Refuses a
+# network filesystem or one without room for the inputs (exit 4).
 stage() {
   STAGED=/tmp/codec-sweep-${SLURM_JOB_ID:-$$}
   trap 'rm -rf "$STAGED"' EXIT
   mkdir -p "$STAGED"
-  local t0 t1 want got
+  local t0 t1 want got fs need avail
+  fs=$(df -T "$STAGED" | awk 'NR==2{print $2}')
+  case "$fs" in lustre|nfs|nfs4|gpfs|beegfs|cifs|ceph|fuse.*)
+    echo "stage dir $STAGED is on $fs, not node-local" >&2; exit 4 ;; esac
+  need=$(cd "$FIELDS" && xargs -a "$OUT/files.txt" stat -c %s | awk '{s+=$1} END{printf "%.0f", s}')
+  avail=$(df -B1 --output=avail "$STAGED" | tail -1)
+  if awk -v a="$avail" -v n="$need" 'BEGIN{exit !(a < n * 1.05)}'; then
+    echo "stage dir $STAGED: $avail B free, $need B needed" >&2; exit 4
+  fi
+  # Create every directory first: parallel `cp --parents` race on a shared
+  # parent ("cannot make directory ... File exists") and drop files.
+  (cd "$STAGED" && awk -F/ 'NF > 1 { NF--; print }' OFS=/ "$OUT/files.txt" | sort -u | xargs -r mkdir -p)
   t0=$(date +%s.%N)
   (cd "$FIELDS" && xargs -a "$OUT/files.txt" -P "$STAGE_STREAMS" -n 16 \
      cp --parents -t "$STAGED")
