@@ -195,4 +195,21 @@ if(BUILD_TESTING)
         ENVIRONMENT "CLIO_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
         DEPENDS clio_cte_core_ext
     )
+
+    # GIL release + typed futures (#1096, #793): spawns its own daemon,
+    # suspends it, and checks blocking calls keep the main thread running,
+    # Async*Query results arrive, and Future.wait(max_sec) honours max_sec
+    # against a suspended and a killed daemon. GIL checks need psutil.
+    add_test(
+        NAME python_gil_release_test
+        COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cte_gil_release.py
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:clio_cte_core_ext>
+    )
+    set_tests_properties(
+        python_gil_release_test
+        PROPERTIES
+        LABELS "python;bindings;async"
+        TIMEOUT 180
+        DEPENDS clio_cte_core_ext
+    )
 endif()

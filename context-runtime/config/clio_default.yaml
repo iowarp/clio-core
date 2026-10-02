@@ -14,11 +14,25 @@
 #   5. ~/.clio/clio_run.yaml         (legacy)
 #
 # Size values accept: B, KB, MB, GB, TB (case-insensitive)
+#
+# Storage root: on-disk runtime state (the CTE disk tier, metadata and
+# indexer logs, the restart log, bdev perf stats) lives under
+# ${CLIO_STORAGE_ROOT}, which defaults to ~/.clio. Override it per run with
+# `clio_run runtime start --disk <path>` (or `restart --disk <path>`) or by
+# exporting CLIO_STORAGE_ROOT. Paths written out explicitly in a custom
+# config are used as written.
 # =============================================================================
 
 # -- Networking ---------------------------------------------------------------
 networking:
-  port: 9413                           # RPC listener port
+  # RPC base port. The runtime binds a CLUSTER of three ports derived from
+  # it, all of which must be free: port (main RPC), port+1 (local server; the
+  # bind that decides which process is the runtime) and port+3 (client
+  # ROUTER). A runtime that cannot bind all three refuses to start rather
+  # than run half-bound. Keep the base below the OS ephemeral range (49152+
+  # on Windows) so port+3 cannot collide with an outbound connection.
+  # Override: CLIO_PORT.
+  port: 9413
   neighborhood_size: 32                # Max nodes queried when splitting range queries
   # hostfile: "/path/to/hostfile"      # One hostname per line for distributed mode
   wait_for_restart: 30                 # Seconds to wait for peer nodes on startup
@@ -36,6 +50,11 @@ runtime:
   local_sched: "default"               # Local task scheduler algorithm
   first_busy_wait: 10000               # Microseconds to busy-wait before sleeping (10ms)
   learning_rate: 0.2                   # SGD learning rate for task load prediction model
+  # ipc_namespace: ""                  # Extra suffix for shared-memory segment
+                                       # names, which already carry the user
+                                       # and port. Set it to run two runtimes
+                                       # that share both. Override:
+                                       # CLIO_IPC_NAMESPACE.
 
 # -- Web dashboard ------------------------------------------------------------
 # The runtime serves a dashboard itself: the admin ChiMod starts one HTTP server
@@ -176,7 +195,7 @@ compose:
       # Persistent disk tier: where the replication chimod (below) keeps the
       # durable copies of DRAM-cached data. Grows lazily (1GB units), so the
       # capacity_limit is a cap, not an upfront allocation.
-      - path: "${HOME}/.clio/cte_disk_tier.dat"
+      - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
         bdev_type: "file"
         capacity_limit: "10GB"
         score: 0.2
@@ -187,7 +206,7 @@ compose:
     # for data to survive a runtime reboot: without it the disk tier's bytes
     # persist but nothing remembers which blob they belong to.
     performance:
-      metadata_log_path: "${HOME}/.clio/cte_metadata_log"
+      metadata_log_path: "${CLIO_STORAGE_ROOT}/cte_metadata_log"
       transaction_log_capacity: "32MB"
 
     # Data Placement Engine ------------------------------------------------
@@ -274,7 +293,7 @@ compose:
     pool_query: local
     pool_id: "564.0"
     next_pool_id: "561.0"               # replication (562.0 with compressor)
-    index_log_path: "${HOME}/.clio/cte_indexer_index"
+    index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
     # index_sweep_period_ms: 100        # async drain cadence (0 = lazy)
     # index_wal_compact_bytes: "8MB"    # WAL size that triggers compaction
     # tag_re: ".*"                      # index scope: only matching tags...

@@ -143,6 +143,49 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 110
     LABELS "msan_skip"
   )
+  # CTE failure recovery (#725, #1059): corrupt snapshot/WAL on restart must
+  # not kill the daemon; a PutBlob whose data write fails (RLIMIT_FSIZE on the
+  # daemon, Linux) must leave the blob at its committed size. Each case runs
+  # in its own process (one client init per process) on its own port.
+  add_executable(clio_run_cte_failure_recovery_test test_cte_failure_recovery.cc)
+  target_include_directories(clio_run_cte_failure_recovery_test PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+  )
+  target_link_libraries(clio_run_cte_failure_recovery_test
+    clio_cte_core_client
+    clio_admin_client
+    clio_run_cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  target_compile_definitions(clio_run_cte_failure_recovery_test PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+  add_dependencies(clio_run_cte_failure_recovery_test clio_run)
+  set_target_properties(clio_run_cte_failure_recovery_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set(_recovery_cases CorruptRestore)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # RLIMIT_FSIZE via prlimit(2) is Linux-only; the case is compiled out
+    # elsewhere, so it is only registered here.
+    list(APPEND _recovery_cases PutBlobRollback)
+  endif()
+  foreach(_case ${_recovery_cases})
+    add_test(
+      NAME cr_cli_cte_${_case}
+      COMMAND clio_run_cte_failure_recovery_test "${_case}"
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cr_cli_cte_${_case} PROPERTIES
+      ENVIRONMENT "${_cli_live_env}"
+      RESOURCE_LOCK "clio_runtime"
+      TIMEOUT 120
+      LABELS "msan_skip"
+    )
+  endforeach()
   # Client-crash PutBlob test (issues #722 + "client dies mid-op"): spawns its
   # own daemon, forks a client that fires a PutBlob burst then _exit()s without
   # waiting, and asserts the daemon (a) drops the undeliverable responses and

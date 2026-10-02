@@ -127,7 +127,8 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
     }
     HLOG(kWarning, "Recv(SHM): Server dead, attempting reconnect...");
     auto start = std::chrono::steady_clock::now();
-    if (!ipc->WaitForServerAndReconnect(start)) return false;
+    // Thread max_sec through WaitForServerAndReconnect (issue #1096)
+    if (!ipc->WaitForServerAndReconnect(start, max_sec)) return false;
     ResendTask(ipc, future);
     future_shm = future.GetFutureShm();
   }
@@ -156,7 +157,8 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
         return false;
       }
       HLOG(kWarning, "Recv: Server unreachable, reconnecting...");
-      if (!ipc->WaitForServerAndReconnect(start)) return false;
+      // Thread max_sec through WaitForServerAndReconnect (issue #1096)
+      if (!ipc->WaitForServerAndReconnect(start, max_sec)) return false;
       ResendTask(ipc, future);
       future_shm = future.GetFutureShm();
       start = std::chrono::steady_clock::now();

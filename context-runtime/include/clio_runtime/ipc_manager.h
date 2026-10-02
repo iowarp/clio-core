@@ -702,12 +702,16 @@ class IpcManager {
   bool ReconnectToOriginalHost();
 
   /**
-   * Wait for server to come back and reconnect
-   * Polls with 1-second intervals up to client_retry_timeout_
+   * Wait for server to come back and reconnect.
+   * Polls with 1-second intervals up to the lesser of client_retry_timeout_
+   * and max_sec. Returns false if either timeout elapses (issue #1096).
+   *
    * @param start Time point when the wait started (for overall timeout)
+   * @param max_sec Maximum seconds to wait (from start), or <= 0 for no limit
    * @return true if reconnection succeeded within timeout
    */
-  bool WaitForServerAndReconnect(std::chrono::steady_clock::time_point start);
+  bool WaitForServerAndReconnect(std::chrono::steady_clock::time_point start,
+                                  float max_sec = 0.0f);
 
   /**
    * Reconnect the ZMQ transport to a different host.
@@ -1203,6 +1207,20 @@ class IpcManager {
    * Should be called during shutdown
    */
   void ClearClientPool();
+
+  /**
+   * Evict a cached dial-back DEALER connection for an undeliverable client.
+   * Called when a client response is dropped after exhausting retries (issue #722).
+   * This removes the cached connection from client_conn_cache_ so a subsequent
+   * SendOut attempt will create a fresh dial-back connection, giving the client
+   * another chance to respond (or detecting that it's permanently gone).
+   *
+   * Thread-safe: acquires client_pool_mutex_ before modifying the cache.
+   *
+   * @param key_id The client's identity string (used to compute cache key).
+   * @param port The client's response port (used to compute cache key).
+   */
+  void EvictClientByIdentity(const std::string &key_id, int port);
 
   /**
    * Set the net worker's lane pointers for signaling on EnqueueNetTask.
