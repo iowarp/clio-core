@@ -288,11 +288,8 @@ private:
   // kept, so exactly one model chooses each chunk.
   std::unique_ptr<ctp::compress::model::HCompressCcpPredictor>
       hcompress_predictor_;
-  // Serializes SetInputs() -> ranking. The predictor stores the per-buffer
-  // inputs (the chunk's distribution class) as MEMBER state, and Predict()
-  // copies them WITHOUT its own lock, so two workers selecting at once would
-  // each rank under the other's distribution. Held only across that
-  // synchronous section -- never across a CLIO_CO_AWAIT.
+  // Serializes HCompress ranking and feedback. Held only across those
+  // synchronous sections -- never across a CLIO_CO_AWAIT.
   std::mutex hcompress_mutex_;
 
   // The XGBoost baseline, deployed as a SELECTOR (xgb_selection.cc). Loaded
@@ -568,36 +565,27 @@ private:
           nullptr,
       ctp::compress::preprocess::PredictionReuseOutcome* out_outcome =
           nullptr,
-      /* HCompress only: the distribution class this chunk was ranked under.
-         The caller must carry it to HCompressObserve() in its OWN locals --
-         the chunk suspends on its compression, and the predictor's stored
-         inputs belong to whichever chunk ranked last by then. */
-      std::string* out_hc_distribution = nullptr);
+      /* HCompress only: set when HCompress ranked this chunk, so the caller
+         feeds the executed outcome back to HCompressObserve(). */
+      bool* out_hc_ranked = nullptr);
 
   /**
    * @brief HCompress's half of EstCompressionStats (hcompress_selection.cc).
    *
-   * Classifies the chunk's distribution the way HCompress deduces it -- a
-   * strided sub-sample of the whole buffer through Clio's own
-   * DistributionClassifier, the same classifier the offline accuracy table's
-   * classify_chunks.py ports -- then ranks NeuroPress's candidate set under
-   * NeuroPress's cost model with HCompress's predictions. Only the predictor
-   * differs from a NeuroPress selection.
+   * Ranks NeuroPress's candidate set under NeuroPress's cost model with
+   * HCompress's predictions, which take only the library and the chunk size.
+   * Only the predictor differs from a NeuroPress selection.
    *
-   * @param chunk            chunk bytes, host or device resident
-   * @param chunk_size       chunk size in bytes
-   * @param context          the chunk's compression context (type, bound)
-   * @param out_distribution the class ranked under, for HCompressObserve()
-   * @return best-first stats, or empty when the chunk cannot be classified
+   * @param chunk_size chunk size in bytes
+   * @param context    the chunk's compression context (error bound)
+   * @return best-first stats
    */
-  std::vector<CompressionStats> HCompressRankChunk(
-      const void* chunk, clio::run::u64 chunk_size, const Context& context,
-      std::string* out_distribution);
+  std::vector<CompressionStats> HCompressRankChunk(clio::run::u64 chunk_size,
+                                                   const Context& context);
 
   /**
    * @brief Feed one executed outcome back to HCompress (its paper's feedback).
    *
-   * @param distribution the class this chunk was ranked under
    * @param wire_lib     wire id of the codec that RAN (not context's, which
    *                     is reset to 0 when the output was stored raw)
    * @param preset_field preset of that action, carrying its shuffle (bits
@@ -605,9 +593,8 @@ private:
    * @param chunk_size   bytes compressed
    * @param context      holds the measured time and ratio
    */
-  void HCompressObserve(const std::string& distribution, int wire_lib,
-                        int preset_field, clio::run::u64 chunk_size,
-                        const Context& context);
+  void HCompressObserve(int wire_lib, int preset_field,
+                        clio::run::u64 chunk_size, const Context& context);
 
   /**
    * @brief XGBoost's half of EstCompressionStats (xgb_selection.cc).

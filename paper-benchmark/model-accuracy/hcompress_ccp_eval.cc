@@ -81,7 +81,6 @@
 #include "clio_ctp/compress/model/hcompress_ccp_predictor.h"
 
 using ctp::compress::model::CcpConfig;
-using ctp::compress::model::CcpInputs;
 using ctp::compress::model::CcpObservation;
 using ctp::compress::model::HCompressCcpPredictor;
 
@@ -152,23 +151,9 @@ struct Table {
   }
 };
 
-CcpInputs InputsOf(const Table& t, const std::vector<std::string>& r,
-                   const std::string& constant_as) {
-  CcpInputs in;
-  in.data_type = t.Get(r, "data_type");
-  in.data_format = t.Get(r, "data_format");
-  in.library = t.Get(r, "library");
-  in.distribution = t.Get(r, "distribution");
-  if (!constant_as.empty() && in.distribution == "constant") {
-    in.distribution = constant_as;
-  }
-  return in;
-}
-
-CcpObservation ObsOf(const Table& t, const std::vector<std::string>& r,
-                     const std::string& constant_as) {
+CcpObservation ObsOf(const Table& t, const std::vector<std::string>& r) {
   CcpObservation o;
-  o.inputs = InputsOf(t, r, constant_as);
+  o.library = t.Get(r, "library");
   o.bytes = Num(t.Get(r, "bytes"));
   o.compress_time_ms = Num(t.Get(r, "ct_ms"));
   o.decompress_time_ms = Num(t.Get(r, "dt_ms"));
@@ -180,10 +165,10 @@ CcpObservation ObsOf(const Table& t, const std::vector<std::string>& r,
   std::cerr <<
       "hcompress_ccp_eval --seed seed.csv --eval eval.csv --out pred.csv\n"
       "                   [--feedback-interval N] [--forget L]\n"
-      "                   [--feedback-scope self|executed|all] [--feedback-topk N] [--constant-as NAME]\n"
+      "                   [--feedback-scope self|executed|all] [--feedback-topk N]\n"
       "                   [--regularization C] [--ratio-target-cap X]\n"
       "                   [--seed-json DIR]\n\n"
-      "seed.csv: data_type,data_format,library,distribution,bytes,ct_ms,dt_ms,ratio\n"
+      "seed.csv: library,bytes,ct_ms,dt_ms,ratio\n"
       "eval.csv: the same, plus chunk,seq,executed\n";
   std::exit(code);
 }
@@ -193,7 +178,6 @@ CcpObservation ObsOf(const Table& t, const std::vector<std::string>& r,
 int main(int argc, char** argv) {
   std::string seed_path, eval_path, out_path, seed_json, scope = "self";
   size_t topk = 1;
-  std::string constant_as;
   CcpConfig cfg;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -211,7 +195,6 @@ int main(int argc, char** argv) {
     else if (a == "--feedback-scope") scope = next("--feedback-scope");
     else if (a == "--feedback-topk")
       topk = static_cast<size_t>(std::stoul(next("--feedback-topk")));
-    else if (a == "--constant-as") constant_as = next("--constant-as");
     else if (a == "--feedback-interval")
       cfg.feedback_interval = static_cast<size_t>(std::stoul(next("--feedback-interval")));
     else if (a == "--forget") cfg.forget_factor = std::stod(next("--forget"));
@@ -242,17 +225,14 @@ int main(int argc, char** argv) {
   // ---- Seed both instances identically ------------------------------------
   std::vector<CcpObservation> rows;
   rows.reserve(seed.rows.size());
-  for (const auto& r : seed.rows) rows.push_back(ObsOf(seed, r, constant_as));
+  for (const auto& r : seed.rows) rows.push_back(ObsOf(seed, r));
 
   HCompressCcpPredictor seed_only(cfg), with_fb(cfg);
   seed_only.Seed(rows);
   with_fb.Seed(rows);
   std::cerr << "seeded on " << rows.size() << " row(s); encoded dimension "
-            << seed_only.Dimension() << " (1 intercept + "
-            << seed_only.Vocabulary("data_type").size() << " type + "
-            << seed_only.Vocabulary("data_format").size() << " format + "
-            << seed_only.Vocabulary("library").size() << " library + "
-            << seed_only.Vocabulary("distribution").size() << " distribution)\n";
+            << seed_only.Dimension() << " (1 intercept + 1 log2(bytes) + "
+            << seed_only.Libraries().size() << " library)\n";
   if (!seed_json.empty() && !seed_only.Save(seed_json)) {
     std::cerr << "warning: could not write the seed JSON to " << seed_json << "\n";
   }
@@ -264,7 +244,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   out << "chunk,library,pred_ct_ms_seed,pred_dt_ms_seed,pred_ratio_seed,"
-         "pred_ct_ms_fb,pred_dt_ms_fb,pred_ratio_fb,unseen_distribution\n";
+         "pred_ct_ms_fb,pred_dt_ms_fb,pred_ratio_fb\n";
   out.precision(9);
 
   // Stable chunk order: the file's own order, which prepare_inputs.py writes
@@ -278,25 +258,9 @@ int main(int argc, char** argv) {
     by_chunk[c].push_back(&r);
   }
 
-  // The SEED's vocabulary, frozen here. Testing against the live one instead
-  // would flag only the FIRST chunk of an unprofiled class, because feedback
-  // widens the model as soon as it sees one -- turning a fixed property of the
-  // seed into a "first occurrence" marker.
-  const std::vector<std::string> seed_dists = seed_only.Vocabulary("distribution");
-
-  size_t fed = 0, unseen = 0, predicted = 0, self_matched_run = 0;
+  size_t fed = 0, predicted = 0, self_matched_run = 0;
   for (const auto& chunk : order) {
     const auto& group = by_chunk[chunk];
-    // The distribution class is deduced ONCE per buffer, as the paper has it.
-    const CcpInputs chunk_inputs = InputsOf(eval, *group.front(), constant_as);
-    seed_only.SetInputs(chunk_inputs);
-    with_fb.SetInputs(chunk_inputs);
-    const bool dist_unseen =
-        !chunk_inputs.distribution.empty() &&
-        std::find(seed_dists.begin(), seed_dists.end(),
-                  chunk_inputs.distribution) == seed_dists.end();
-    if (dist_unseen) ++unseen;
-
     // The candidate THIS model would have selected, by its own predicted cost.
     // Captured during prediction, so it is decided before any of this chunk's
     // measurements are shown to it.
@@ -315,7 +279,7 @@ int main(int argc, char** argv) {
       out << chunk << ',' << lib << ',' << a.compression_time_ms << ','
           << a.decompression_time_ms << ',' << a.compression_ratio << ','
           << b.compression_time_ms << ',' << b.decompression_time_ms << ','
-          << b.compression_ratio << ',' << (dist_unseen ? 1 : 0) << '\n';
+          << b.compression_ratio << '\n';
       ++predicted;
     }
     // Feedback AFTER every prediction for this chunk.
@@ -325,7 +289,7 @@ int main(int argc, char** argv) {
                         self_rank.end(),
                         [](const auto& a, const auto& b) { return a.first < b.first; });
       for (size_t i = 0; i < k; ++i) {
-        with_fb.Observe(ObsOf(eval, *self_rank[i].second, constant_as));
+        with_fb.Observe(ObsOf(eval, *self_rank[i].second));
         ++fed;
       }
       // Coincidence with the campaign is reported for the model's own ARGMIN.
@@ -336,7 +300,7 @@ int main(int argc, char** argv) {
         const auto& r = *rp;
         const bool executed = Num(eval.Get(r, "executed")) != 0.0;
         if (scope == "executed" && !executed) continue;
-        with_fb.Observe(ObsOf(eval, r, constant_as));
+        with_fb.Observe(ObsOf(eval, r));
         ++fed;
       }
     }
@@ -357,10 +321,6 @@ int main(int argc, char** argv) {
               << (100.0 * static_cast<double>(self_matched_run) /
                   static_cast<double>(order.size()))
               << "% of chunk(s)\n";
-  }
-  if (unseen > 0) {
-    std::cerr << unseen << " chunk(s) had a distribution class the seed never "
-              << "profiled (reported per row as unseen_distribution=1)\n";
   }
   return 0;
 }

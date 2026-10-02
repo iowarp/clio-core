@@ -156,37 +156,24 @@ size_t HCompressCcpPredictor::Index(std::vector<std::string>* vocab,
 }
 
 size_t HCompressCcpPredictor::Dimension() const {
-  return 1 + types_.size() + formats_.size() + libraries_.size() +
-         distributions_.size();
+  return 2 + libraries_.size();
 }
 
-std::vector<double> HCompressCcpPredictor::Encode(
-    const CcpInputs& inputs) const {
+std::vector<double> HCompressCcpPredictor::Encode(const std::string& library,
+                                                  double bytes) const {
   std::vector<double> x(Dimension(), 0.0);
-  x[0] = 1.0;  // intercept
-  size_t off = 1;
-  auto put = [&x, &off](const std::vector<std::string>& vocab,
-                        const std::string& value) {
-    if (!value.empty()) {
-      for (size_t i = 0; i < vocab.size(); ++i) {
-        if (vocab[i] == value) {
-          x[off + i] = 1.0;
-          break;
-        }
-      }
+  x[0] = 1.0;                                    // intercept
+  x[1] = (bytes > 0.0) ? std::log2(bytes) : 0.0;  // data size
+  // A library the seed never saw leaves its block at zero: the prediction
+  // falls back to the intercept plus the size term. That is the honest
+  // behaviour for a model whose cells come from a profiler -- there is no
+  // entry to interpolate from.
+  for (size_t i = 0; i < libraries_.size(); ++i) {
+    if (libraries_[i] == library) {
+      x[2 + i] = 1.0;
+      break;
     }
-    // A value the seed never saw, or an input that is unavailable here, leaves
-    // this whole block at zero: the prediction falls back to the intercept plus
-    // whichever blocks ARE known. That is the honest behaviour for a model
-    // whose cells come from a profiler -- there is no entry to interpolate
-    // from -- and the harness reports how often it happened rather than
-    // letting it pass as a normal prediction.
-    off += vocab.size();
-  };
-  put(types_, inputs.data_type);
-  put(formats_, inputs.data_format);
-  put(libraries_, inputs.library);
-  put(distributions_, inputs.distribution);
+  }
   return x;
 }
 
@@ -262,13 +249,8 @@ std::string HCompressCcpPredictor::LibraryKey(
 void HCompressCcpPredictor::Seed(const std::vector<CcpObservation>& rows) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  // Pass 1: the vocabularies, so the encoded width is final before any fit.
-  for (const auto& r : rows) {
-    Index(&types_, r.inputs.data_type, true);
-    Index(&formats_, r.inputs.data_format, true);
-    Index(&libraries_, r.inputs.library, true);
-    Index(&distributions_, r.inputs.distribution, true);
-  }
+  // Pass 1: the vocabulary, so the encoded width is final before any fit.
+  for (const auto& r : rows) Index(&libraries_, r.library, true);
   const size_t dim = Dimension();
   comp_speed_.Reset(dim, config_.regularization);
   decomp_speed_.Reset(dim, config_.regularization);
@@ -297,11 +279,12 @@ void HCompressCcpPredictor::Seed(const std::vector<CcpObservation>& rows) {
   acc_ratio.Init(dim);
 
   for (const auto& r : rows) {
-    const std::vector<double> x = Encode(r.inputs);
-    if (r.bytes > 0.0 && r.compress_time_ms > 0.0) {
+    if (r.bytes <= 0.0) continue;  // the size is an input: no size, no row
+    const std::vector<double> x = Encode(r.library, r.bytes);
+    if (r.compress_time_ms > 0.0) {
       acc_ct.Add(x, r.bytes / (r.compress_time_ms * 1000.0));
     }
-    if (r.bytes > 0.0 && r.decompress_time_ms > 0.0) {
+    if (r.decompress_time_ms > 0.0) {
       acc_dt.Add(x, r.bytes / (r.decompress_time_ms * 1000.0));
     }
     if (r.compression_ratio > 0.0) {
@@ -313,11 +296,6 @@ void HCompressCcpPredictor::Seed(const std::vector<CcpObservation>& rows) {
   ratio_.InitFromRidge(acc_ratio.a, acc_ratio.b, acc_ratio.n,
                        config_.regularization);
   seed_rows_ += rows.size();
-}
-
-void HCompressCcpPredictor::SetInputs(const CcpInputs& inputs) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  inputs_ = inputs;
 }
 
 bool HCompressCcpPredictor::Observe(const CcpObservation& row) {
@@ -335,31 +313,20 @@ size_t HCompressCcpPredictor::ApplyFeedback() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (pending_.empty()) return 0;
 
-  // A feedback row may carry a category the profiler never covered (a
-  // distribution class absent from the seed, say). Widen first, then fit, so
-  // the new cell can actually be learned instead of being folded into the
-  // intercept forever.
-  bool widened = false;
-  for (const auto& r : pending_) {
-    if (Index(&types_, r.inputs.data_type, true) != std::string::npos) {}
-    if (Index(&formats_, r.inputs.data_format, true) != std::string::npos) {}
-    if (Index(&libraries_, r.inputs.library, true) != std::string::npos) {}
-    if (Index(&distributions_, r.inputs.distribution, true) !=
-        std::string::npos) {}
-  }
-  if (Dimension() != comp_speed_.Weights().size()) {
-    Rebuild(Dimension());
-    widened = true;
-  }
-  (void)widened;
+  // A feedback row may carry a library the profiler never covered. Widen
+  // first, then fit, so the new cell can actually be learned instead of being
+  // folded into the intercept forever.
+  for (const auto& r : pending_) Index(&libraries_, r.library, true);
+  if (Dimension() != comp_speed_.Weights().size()) Rebuild(Dimension());
 
   const double forget = config_.forget_factor;
   for (const auto& r : pending_) {
-    const std::vector<double> x = Encode(r.inputs);
-    if (r.bytes > 0.0 && r.compress_time_ms > 0.0) {
+    if (r.bytes <= 0.0) continue;  // the size is an input: no size, no row
+    const std::vector<double> x = Encode(r.library, r.bytes);
+    if (r.compress_time_ms > 0.0) {
       comp_speed_.Update(x, r.bytes / (r.compress_time_ms * 1000.0), forget);
     }
-    if (r.bytes > 0.0 && r.decompress_time_ms > 0.0) {
+    if (r.decompress_time_ms > 0.0) {
       decomp_speed_.Update(x, r.bytes / (r.decompress_time_ms * 1000.0),
                            forget);
     }
@@ -377,24 +344,18 @@ size_t HCompressCcpPredictor::ApplyFeedback() {
 // ---------------------------------------------------------------------------
 // Prediction
 // ---------------------------------------------------------------------------
-CompressionPrediction HCompressCcpPredictor::PredictWith(
-    const CcpInputs& inputs, double bytes) const {
+CompressionPrediction HCompressCcpPredictor::PredictLocked(
+    const std::string& library, double bytes) const {
   const auto t0 = std::chrono::high_resolution_clock::now();
   CompressionPrediction out;
-  std::vector<double> x;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    x = Encode(inputs);
-    const double cs = std::max(config_.min_speed_mbps, comp_speed_.Predict(x));
-    const double ds =
-        std::max(config_.min_speed_mbps, decomp_speed_.Predict(x));
-    // bytes / (MB/s * 1000) = ms. The regression sees no size; the size enters
-    // only here, which is the whole reason the paper can regress a speed.
-    out.compression_time_ms = (bytes > 0.0) ? bytes / (cs * 1000.0) : 0.0;
-    out.decompression_time_ms = (bytes > 0.0) ? bytes / (ds * 1000.0) : 0.0;
-    out.compression_ratio = std::max(
-        config_.min_ratio, std::min(config_.max_ratio, ratio_.Predict(x)));
-  }
+  const std::vector<double> x = Encode(library, bytes);
+  const double cs = std::max(config_.min_speed_mbps, comp_speed_.Predict(x));
+  const double ds = std::max(config_.min_speed_mbps, decomp_speed_.Predict(x));
+  // bytes / (MB/s * 1000) = ms.
+  out.compression_time_ms = (bytes > 0.0) ? bytes / (cs * 1000.0) : 0.0;
+  out.decompression_time_ms = (bytes > 0.0) ? bytes / (ds * 1000.0) : 0.0;
+  out.compression_ratio = std::max(
+      config_.min_ratio, std::min(config_.max_ratio, ratio_.Predict(x)));
   // NOT PREDICTED, and not 0: this codebase reads psnr_db == 0 as "measured and
   // lossless", i.e. maximal quality. The HCompress model has no quality output
   // at all, so it must report absence.
@@ -408,16 +369,13 @@ CompressionPrediction HCompressCcpPredictor::PredictWith(
 
 CompressionPrediction HCompressCcpPredictor::PredictFor(
     const std::string& library, double bytes) const {
-  CcpInputs in = inputs_;
-  in.library = library;
-  return PredictWith(in, bytes);
+  std::lock_guard<std::mutex> lock(mutex_);
+  return PredictLocked(library, bytes);
 }
 
 CompressionPrediction HCompressCcpPredictor::Predict(
     const CompressionFeatures& features) {
-  CcpInputs in = inputs_;
-  in.library = LibraryKey(features);
-  return PredictWith(in, features.chunk_size_bytes);
+  return PredictFor(LibraryKey(features), features.chunk_size_bytes);
 }
 
 std::vector<CompressionPrediction> HCompressCcpPredictor::PredictBatch(
@@ -433,14 +391,9 @@ bool HCompressCcpPredictor::IsReady() const {
   return comp_speed_.Ready() || ratio_.Ready();
 }
 
-std::vector<std::string> HCompressCcpPredictor::Vocabulary(
-    const std::string& field) const {
+std::vector<std::string> HCompressCcpPredictor::Libraries() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (field == "data_type") return types_;
-  if (field == "data_format") return formats_;
-  if (field == "library") return libraries_;
-  if (field == "distribution") return distributions_;
-  return {};
+  return libraries_;
 }
 
 // ---------------------------------------------------------------------------
@@ -517,10 +470,10 @@ bool HCompressCcpPredictor::Save(const std::string& model_dir) {
   if (!f.is_open()) return false;
   f << "{\n";
   f << "  \"model_type\": \"hcompress_ccp\",\n";
-  f << "  \"version\": \"1.0\",\n";
-  f << "  \"note\": \"Expected Compression Cost, HCompress (IPDPS 2020) Sec."
-       " IV-D: linear regression on data type, data format, compression"
-       " library and data distribution; outputs compression speed (MB/s),"
+  f << "  \"version\": \"2.0\",\n";
+  f << "  \"note\": \"Expected Compression Cost, HCompress (IPDPS 2020):"
+       " linear regression on the compression library (one-hot) and the"
+       " data size (log2 bytes); outputs compression speed (MB/s),"
        " decompression speed (MB/s) and compression ratio; no quality"
        " output.\",\n";
   f << "  \"seed_rows\": " << seed_rows_ << ",\n";
@@ -529,10 +482,7 @@ bool HCompressCcpPredictor::Save(const std::string& model_dir) {
   f << "  \"feedback_interval\": " << config_.feedback_interval << ",\n";
   f << "  \"feedback_updates\": " << feedback_updates_ << ",\n";
   f << "  \"ratio_target_cap\": " << config_.ratio_target_cap << ",\n";
-  WriteStrings(f, "data_types", types_);
-  WriteStrings(f, "data_formats", formats_);
   WriteStrings(f, "libraries", libraries_);
-  WriteStrings(f, "distributions", distributions_);
   f << "  \"samples\": [" << comp_speed_.Samples() << ", "
     << decomp_speed_.Samples() << ", " << ratio_.Samples() << "],\n";
   WriteDoubles(f, "w_compress_speed_mbps", comp_speed_.Weights(), false);
@@ -574,10 +524,7 @@ bool HCompressCcpPredictor::Load(const std::string& model_dir) {
   restore("feedback_interval", &interval);
   if (interval >= 1.0) config_.feedback_interval = static_cast<size_t>(interval);
 
-  types_ = SplitStrings(Field(s, "data_types"));
-  formats_ = SplitStrings(Field(s, "data_formats"));
   libraries_ = SplitStrings(Field(s, "libraries"));
-  distributions_ = SplitStrings(Field(s, "distributions"));
   const std::vector<double> samples = SplitDoubles(Field(s, "samples"));
   const std::vector<double> wc = SplitDoubles(Field(s, "w_compress_speed_mbps"));
   const std::vector<double> wd =

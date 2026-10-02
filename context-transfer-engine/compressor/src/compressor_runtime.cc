@@ -835,12 +835,12 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     const void** out_device_stats,
     const ctp::compress::preprocess::PredictionReuseContext* reuse,
     ctp::compress::preprocess::PredictionReuseOutcome* out_outcome,
-    std::string* out_hc_distribution) {
+    bool* out_hc_ranked) {
   std::vector<CompressionStats> results;
   if (out_ranked_by_cost) *out_ranked_by_cost = false;
   if (out_neuropress_gpu_failed) *out_neuropress_gpu_failed = false;
   if (out_device_stats) *out_device_stats = nullptr;
-  if (out_hc_distribution) out_hc_distribution->clear();
+  if (out_hc_ranked) *out_hc_ranked = false;
 
   // HCompress decides, when it is the configured selector. It RETURNS in
   // every case: falling through would reach the legacy branch below, which
@@ -849,7 +849,8 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   // empty return makes the caller store the chunk uncompressed.
   if (HCompressActive(context)) {
     std::vector<CompressionStats> hc_stats =
-        HCompressRankChunk(chunk, chunk_size, context, out_hc_distribution);
+        HCompressRankChunk(chunk_size, context);
+    if (out_hc_ranked) *out_hc_ranked = !hc_stats.empty();
     if (hc_stats.empty()) {
       HLOG(kError,
            "EstCompressionStats: HCompress produced no candidates for a chunk "
@@ -1350,12 +1351,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     bool neuropress_gpu_failed = false;
     // Statistics the selection ranked on; see out_device_stats.
     const void* sel_device_stats = nullptr;
-    // HCompress: the distribution class THIS chunk was ranked under. A local,
-    // because the chunk suspends on its compression below and by the time it
-    // resumes the predictor's stored inputs belong to another chunk -- the
-    // same hazard that once had NeuroPress's SGD training on another chunk's
-    // features (97.8% of steps on AI).
-    std::string hc_distribution;
+    // HCompress ranked THIS chunk, so its executed outcome is fed back.
+    bool hc_ranked = false;
     std::vector<CompressionStats> stats;
     if (!config_.neuropress_static_lib_.empty()) {
       // Control condition: one candidate, no inference.
@@ -1391,7 +1388,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                               &neuropress_gpu_failed, &sel_device_stats,
                               np_reuse_on ? &np_reuse_ctx : nullptr,
                               np_reuse_on ? &np_reuse_outcome : nullptr,
-                              &hc_distribution);
+                              &hc_ranked);
       phases_selected = phase_log && TakeSelectionPhases(&phases);
     }
 
@@ -1696,10 +1693,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     // context.compress_lib_: that is reset to 0 when the output was stored
     // raw, and a stored-raw chunk is exactly what HCompress most needs to
     // learn from -- the codec ran, paid its time, and did not shrink it.
-    if (HCompressActive(context) && !hc_distribution.empty() &&
+    if (HCompressActive(context) && hc_ranked &&
         task->return_code_ == 0 && context.actual_compression_ratio_ > 0.0) {
-      HCompressObserve(hc_distribution, best_lib, best_preset, chunk_size,
-                       context);
+      HCompressObserve(best_lib, best_preset, chunk_size, context);
     }
     if ((config_.neuropress_online_learning_enabled_ ||
          config_.neuropress_best_mode_) &&
