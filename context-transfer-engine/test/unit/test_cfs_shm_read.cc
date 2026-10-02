@@ -131,7 +131,11 @@ bool InitRuntime() {
   }
   tried = true;
 
-  const std::string work = "/tmp/clio_cfs_shm_read_test";
+  // Per user: another user's leftover directory at a fixed name cannot
+  // be removed or reused on a shared machine.
+  const char *user_env = std::getenv("USER");
+  const std::string work =
+      std::string("/tmp/clio_cfs_shm_read_test_") + (user_env != nullptr ? user_env : "user");
   std::filesystem::remove_all(work);
   std::filesystem::create_directories(work);
   const std::string yaml = work + "/compose.yaml";

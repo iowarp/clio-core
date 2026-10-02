@@ -1421,7 +1421,11 @@ int main() {
   // Telemetry is checked here rather than trusted because nothing else reads it
   // yet: until `hdf5 diagnose` exists, a wrong field would sit wrong for months.
   {
-    const char *kTraceDir = "/tmp/clio_cte_vfd_trace_t";
+    // Per user (shared machines: another user's directory is not ours).
+    const char *vfd_user = std::getenv("USER");
+    const std::string trace_dir_s = std::string("/tmp/clio_cte_vfd_trace_t_") +
+                                    (vfd_user != nullptr ? vfd_user : "user");
+    const char *kTraceDir = trace_dir_s.c_str();
     // std::filesystem rather than `rm -rf` / `mkdir -p`: cmd.exe has neither.
     std::error_code dec;
     std::filesystem::remove_all(kTraceDir, dec);
