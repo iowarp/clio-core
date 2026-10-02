@@ -371,6 +371,10 @@ class Agent:
     return sr.write_runs(path, sr.file_id_of(name), runs, writer, gen,
                          fsync, blk)
 
+  def op_rec_scan_range(self, path, name, start, count, blk=sr.BLK):
+    """Classify blocks [start, start+count) of a record file."""
+    return sr.scan_range(path, sr.file_id_of(name), start, count, blk)
+
   def op_rec_scan(self, path, name, nblocks, blk=sr.BLK):
     """Classify every block of a record file (see stress_records.scan)."""
     return sr.scan(path, sr.file_id_of(name), nblocks, blk)

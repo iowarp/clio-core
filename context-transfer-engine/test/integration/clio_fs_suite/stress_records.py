@@ -126,6 +126,24 @@ def write_runs(path, file_id, runs, writer, gen, fsync, blk=BLK,
   return total
 
 
+def scan_range(path, file_id, start, count, blk=BLK):
+  """Classify blocks [start, start+count) of a file (see scan).
+
+  Returns:
+    {'runs': [[block, 1, writer, gen], ...]}
+  """
+  runs = []
+  fd = os.open(path, os.O_RDONLY)
+  try:
+    for b in range(start, start + count):
+      piece = os.pread(fd, blk, b * blk)
+      w, g = classify(piece, file_id, b, blk)
+      runs.append([b, 1, w, g])
+  finally:
+    os.close(fd)
+  return {'runs': runs}
+
+
 def scan(path, file_id, nblocks, blk=BLK, chunk_blocks=256):
   """Classify every block of a file.
 

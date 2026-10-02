@@ -566,22 +566,34 @@ def _read_durable_log(path):
   return out
 
 
-def _torn_unsynced(t, writer, inflight):
-  """Whether a torn block is the unsynced in-flight write over an older
-  version of the same file.
+def _torn_unsynced(t, writer, inflight, durable=0, k=None, nfiles=None):
+  """Whether a torn block is an unsynced write over an older version of the
+  same file.
 
   Args:
     t: [head writer, head gen, rest writer, rest gen] from scan, or None.
     writer: the file's writer.
-    inflight: the gen being written when the crash hit.
+    inflight: the newest gen attempted when the fault hit.
+    durable: the file's newest fsynced gen.
+    k: the file's index in its writer's set (gens k+1, k+1+nfiles, ...).
+    nfiles: files per writer.
   Returns:
-    True when the head is the in-flight gen and the rest an older gen, both
-    by this file's writer.
+    True when the head is one of this file's unsynced gens (newer than the
+    durable one, at most the newest attempted) and the rest an older gen by
+    the same writer. A writer that retries after a crash burns gens on
+    attempts that never reach the store, so the torn write is often not the
+    newest attempted one.
   """
   if not t:
     return False
   hw, hg, rw, rg = t
-  return hw == writer and rw == writer and hg == inflight and rg < hg
+  if hw != writer or rw != writer or rg >= hg:
+    return False
+  if hg == inflight:
+    return True
+  if k is None or nfiles is None:
+    return False
+  return durable < hg <= inflight and (hg - (k + 1)) % nfiles == 0
 
 
 def _reread_note(ctx, nmx, path, block, nodes):
@@ -660,11 +672,19 @@ def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
       if foreign:
         ctx.note(f'{nmx} FOREIGN blocks {when} hold [file id, block, writer, '
                  f'gen]: {dict(list(foreign.items())[:4])}')
+        fb = int(next(iter(foreign)))
+        r2 = ctx.call(reader, 'rec_scan_range', path=path, name=nmx,
+                      start=fb, count=1)
+        r3 = ctx.call((reader + 1) % n, 'rec_scan_range', path=path,
+                      name=nmx, start=fb, count=1)
+        ctx.note(f'{nmx} FOREIGN block {fb} re-read: '
+                 f'node{reader} {(r2.get("ret") or {}).get("runs")} '
+                 f'node{(reader + 1) % n} {(r3.get("ret") or {}).get("runs")}')
       torn = got.get('torn', {})
       inflight = started.get(nmx)
       for start, count, w, g in got['runs']:
         if w == CORRUPT and inflight is not None and all(
-            _torn_unsynced(torn.get(str(b)), i + 1, inflight)
+            _torn_unsynced(torn.get(str(b)), i + 1, inflight, dg, k, nfiles)
             for b in range(start, start + count)):
           # The write in flight at the crash (never fsynced) landed only in
           # part of the block; the rest is this file's older version. No
