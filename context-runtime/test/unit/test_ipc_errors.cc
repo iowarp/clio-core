@@ -45,7 +45,12 @@
 #include <unistd.h>
 #endif
 
+#include "clio_runtime/admin/admin_tasks.h"
 #include "clio_runtime/clio_runtime.h"
+#include "clio_runtime/ipc/ipc_cpu2cpu.h"
+#include "clio_runtime/ipc/ipc_cpu2cpu_impl.h"
+#include "clio_runtime/ipc/ipc_cpu2cpu_zmq.h"
+#include "clio_runtime/ipc/ipc_cpu2cpu_zmq_impl.h"
 #include "clio_runtime/ipc_manager.h"
 
 using namespace clio::run;
@@ -385,6 +390,100 @@ TEST_CASE("IpcErrors - Concurrent Init/Finalize", "[ipc][errors][multiproc]") {
 // ============================================================================
 // Global Cleanup - Finalize once at the end
 // ============================================================================
+
+// ============================================================================
+// Never-Sent Future Tests
+// ============================================================================
+
+/**
+ * Build the shape the client-side read fast paths hand back: a REAL task,
+ * filled in locally, SetComplete()'d, and NEVER Sent. That is the documented
+ * "synthesized-task contract" of CoreClient::TryShmGet and its deferred-put /
+ * vectored twins, which serve a read straight out of the shared metadata cache
+ * and hand the caller an already-complete future so every call site gets the
+ * optimization with no special-casing.
+ *
+ * The defining property is that task_id_.net_key_ is still the TaskId
+ * constructor's zero: both SendIn paths stamp it with the task's own heap
+ * address, so only a task that never went over IPC can carry a zero.
+ */
+static clio::run::shared_ptr<clio::run::admin::FlushTask> MakeNeverSentTask(
+    IpcManager *ipc, Future<clio::run::admin::FlushTask> *fut,
+    ClientOrigin origin) {
+  auto task = ipc->NewTask<clio::run::admin::FlushTask>(
+      CreateTaskId(), kAdminPoolId, PoolQuery::Local());
+  if (task.IsNull()) return task;
+  *fut = Future<clio::run::admin::FlushTask>(task->pool_id_, task->method_,
+                                             task);
+  fut->GetFutureShm()->origin_ = origin;
+  task->SetReturnCode(0);
+  task->SetComplete();
+  return task;
+}
+
+/**
+ * Regression for the #968 guard vs. the client-side read fast paths.
+ *
+ * Both RecvOut twins fail a complete task that has no parked response archive,
+ * on the reasoning that the only client-path writer of IsComplete() is the
+ * recv demux, which always parks the archive first. A synthesized never-Sent
+ * future breaks that assumption: it is complete and has no archive, which is
+ * exactly the aliasing signature the guard looks for. Before the fix every
+ * cache-hit read came back rc = -1 with the bytes already correctly copied.
+ *
+ * Driving RecvOut directly (rather than through a real cache hit) is
+ * deliberate: whether TryShmGet actually hits depends on the machine -- it
+ * needs the SHM main segment to map and the metadata cache to attach, which a
+ * CI runner or a login node with a small ulimit -v will not do, and there the
+ * fast path silently never runs. This exercises the contract everywhere.
+ */
+TEST_CASE("IpcErrors - never-Sent future needs no response archive",
+          "[ipc][errors][968]") {
+  REQUIRE(InitializeRuntime());
+
+  auto *ipc = CLIO_IPC;
+  REQUIRE(ipc != nullptr);
+
+  SECTION("SHM RecvOut returns the locally-produced result") {
+    Future<clio::run::admin::FlushTask> fut;
+    auto task = MakeNeverSentTask(ipc, &fut, ClientOrigin::kClientShm);
+    REQUIRE(!task.IsNull());
+    // The contract the RecvOut check keys off.
+    REQUIRE(task->task_id_.net_key_ == 0);
+
+    // max_sec is a deadline, not a delay: a correct RecvOut returns at once.
+    // Before the fix this returned false after logging the #968 error.
+    REQUIRE(IpcCpu2Cpu::RecvOut(ipc, fut, 5.0f));
+    REQUIRE(task->GetReturnCode() == 0);
+  }
+
+  SECTION("ZMQ RecvOut returns the locally-produced result") {
+    Future<clio::run::admin::FlushTask> fut;
+    auto task = MakeNeverSentTask(ipc, &fut, ClientOrigin::kClientTcp);
+    REQUIRE(!task.IsNull());
+    REQUIRE(task->task_id_.net_key_ == 0);
+
+    REQUIRE(IpcCpu2CpuZmq::RecvOut(ipc, fut, 5.0f));
+    REQUIRE(task->GetReturnCode() == 0);
+  }
+
+  SECTION("ZMQ RecvOut does not resend a kClientShm future when the server is "
+          "gone") {
+    // The synthesized futures carry origin_ == kClientShm, so IpcManager::Recv
+    // routes them to the ZMQ twin the moment server_alive_ goes false. That
+    // twin's kClientShm head would otherwise push one through
+    // WaitForServerAndReconnect + ResendTask -- resending a request the client
+    // already satisfied out of its own cache -- so the never-Sent check has to
+    // sit AHEAD of that head, not merely ahead of the archive claim.
+    Future<clio::run::admin::FlushTask> fut;
+    auto task = MakeNeverSentTask(ipc, &fut, ClientOrigin::kClientShm);
+    REQUIRE(!task.IsNull());
+    REQUIRE(task->task_id_.net_key_ == 0);
+
+    REQUIRE(IpcCpu2CpuZmq::RecvOut(ipc, fut, 5.0f));
+    REQUIRE(task->GetReturnCode() == 0);
+  }
+}
 
 TEST_CASE("IpcErrors - ZZZ Final Cleanup", "[ipc][errors][cleanup]") {
   // This test runs last (ZZZ prefix ensures it's last alphabetically).
