@@ -35,6 +35,11 @@
 # upstream gpulz.cu from the pinned clone and adds the library interface
 # (gpulz/gpulz_api.h) clio-core links against.
 #
+# SPspeed / SPratio (ASPLOS'25, burtscher/FPcompress, BSD-3) ship as four CUDA
+# programs. fpcompress/*.cu compile the UNMODIFIED upstream single-precision
+# programs from the pinned clone the same way and add fpcompress/fpc_api.h.
+# They are used by paper-benchmark/codec-sweep, not by clio-core.
+#
 #   install_codecs.sh [--arch 80] [--jobs 16]
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -140,10 +145,28 @@ else
   echo "== GPULZ already at $NPENV/gpulz"
 fi
 
+# --------------------------------------------------------- SPspeed / SPratio
+FPC_REV=97f0372   # upstream HEAD when integrated (2026-10-01)
+if [ ! -e "$NPENV/fpcompress/lib/libfpcompress.so" ]; then
+  echo "== SPspeed/SPratio (library interface over FPcompress $FPC_REV)"
+  [ -d "$SRC/FPcompress" ] || git clone https://github.com/burtscher/FPcompress.git "$SRC/FPcompress"
+  git -C "$SRC/FPcompress" checkout -q "$FPC_REV"
+  mkdir -p "$NPENV/fpcompress/include" "$NPENV/fpcompress/lib"
+  # -fmad=false as upstream's compile.py builds them.
+  nvcc -O3 -std=c++17 -arch=sm_"$CUDA_ARCH" -fmad=false -Xcompiler -fPIC -shared \
+      -I"$HERE/fpcompress" -I"$SRC/FPcompress/single_src" \
+      "$HERE"/fpcompress/{spspeed,spratio}_{compress,decompress}.cu \
+      -o "$NPENV/fpcompress/lib/libfpcompress.so"
+  cp "$HERE/fpcompress/fpc_api.h" "$NPENV/fpcompress/include/"
+else
+  echo "== SPspeed/SPratio already at $NPENV/fpcompress"
+fi
+
 echo
 echo "== installed =="
 for f in "$NPENV/cusz/lib64/libcusz.so" "$NPENV/cuszp/lib64/libcuSZp.so" \
-         "$NPENV/ndzip/lib/libndzip-cuda.so" "$NPENV/gpulz/lib/libgpulz.so"; do
+         "$NPENV/ndzip/lib/libndzip-cuda.so" "$NPENV/gpulz/lib/libgpulz.so" \
+         "$NPENV/fpcompress/lib/libfpcompress.so"; do
   [ -e "$f" ] && echo "   $f" || echo "   MISSING: $f"
 done
 cat <<'MSG'
