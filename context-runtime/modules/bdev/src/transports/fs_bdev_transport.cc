@@ -6,8 +6,11 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <system_error>
 #include <clio_runtime/bdev/transports/fs_bdev_transport.h>
 #include <clio_ctp/introspect/system_info.h>
+#include <clio_ctp/io/io_error.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/manager.h>
 #include <clio_runtime/worker.h>
@@ -146,6 +149,9 @@ bool FsBdevTransport::Init(const CreateParams& params,
   // The pool name doubles as the backing file path.
   file_path_ = pool_name;
   io_depth_ = params.io_depth_;
+  fail_marker_path_ = file_path_ + ".fail";
+  fail_marker_checked_ns_.store(0, std::memory_order_relaxed);
+  fail_marker_present_.store(false, std::memory_order_relaxed);
 
   auto setup_io = OpenBackingFile(io_depth_, file_path_);
   if (!setup_io) {
@@ -282,7 +288,36 @@ bool FsBdevTransport::OpenAllocLog(const CreateParams& params) {
   return true;
 }
 
+bool FsBdevTransport::FaultInjected() {
+  const clio::run::u64 now_ns = static_cast<clio::run::u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  clio::run::u64 last = fail_marker_checked_ns_.load(std::memory_order_relaxed);
+  if (last != 0 && now_ns - last < kFailMarkerPollNs) {
+    return fail_marker_present_.load(std::memory_order_relaxed);
+  }
+  // One caller per period re-checks; the others keep the cached answer.
+  if (!fail_marker_checked_ns_.compare_exchange_strong(
+          last, now_ns, std::memory_order_relaxed)) {
+    return fail_marker_present_.load(std::memory_order_relaxed);
+  }
+  std::error_code ec;
+  const bool present = std::filesystem::exists(fail_marker_path_, ec);
+  const bool was = fail_marker_present_.exchange(present,
+                                                 std::memory_order_relaxed);
+  if (present != was) {
+    HLOG(kWarning, "bdev {}: fault-injection marker {} {}; I/O now {}",
+         file_path_, fail_marker_path_, present ? "present" : "removed",
+         present ? "FAILS" : "works");
+  }
+  return present;
+}
+
 bool FsBdevTransport::Sync() {
+  if (FaultInjected()) {
+    HLOG(kError, "bdev Sync: {} failed (injected device fault)", file_path_);
+    return false;
+  }
   // Data first, then the allocator state that references it: a crash in
   // between leaves synced bytes in blocks the log may not show yet (the
   // CTE's own WAL still does), never a logged block whose bytes are lost.
@@ -528,6 +563,15 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
 
   clio::run::u64 total_bytes_written = 0;
   clio::run::u64 data_offset = 0;
+  task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kOk);
+
+  if (FaultInjected()) {
+    // TEST-ONLY: the device is "dead" (see fail_marker_path_).
+    task->return_code_ = 4;
+    task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kDeviceFault);
+    task->bytes_written_ = 0;
+    CLIO_CO_RETURN;
+  }
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
@@ -562,6 +606,8 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
 
     if (result.error_code != 0) {
       task->return_code_ = 4;
+      task->io_error_ =
+          static_cast<clio::run::u32>(ctp::ClassifyErrno(result.error_code));
       task->bytes_written_ = total_bytes_written;
       CLIO_CO_RETURN;
     }
@@ -595,6 +641,15 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
 
   clio::run::u64 total_bytes_read = 0;
   clio::run::u64 data_offset = 0;
+  task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kOk);
+
+  if (FaultInjected()) {
+    // TEST-ONLY: the device is "dead" (see fail_marker_path_).
+    task->return_code_ = 4;
+    task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kDeviceFault);
+    task->bytes_read_ = 0;
+    CLIO_CO_RETURN;
+  }
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
@@ -628,12 +683,26 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
 
     if (result.error_code != 0) {
       task->return_code_ = 4;
+      task->io_error_ =
+          static_cast<clio::run::u32>(ctp::ClassifyErrno(result.error_code));
       task->bytes_read_ = total_bytes_read;
       CLIO_CO_RETURN;
     }
 
     clio::run::u64 actual_bytes = std::min(
         static_cast<clio::run::u64>(result.bytes_transferred), block_read_size);
+    if (actual_bytes < block_read_size &&
+        block.offset_ + block_read_size <= allocator_.GetCapacity()) {
+      // Inside the device but past the backed end of the (lazily grown) file:
+      // never written, so it reads as zeros -- the same answer the file would
+      // give had it been truncated to full capacity up front. A caller that
+      // writes at fixed offsets without going through this allocator (a
+      // safe_bdev member) otherwise saw a short read of a partly written
+      // chunk and took it for a failing disk.
+      std::memset(static_cast<char *>(block_data) + actual_bytes, 0,
+                  block_read_size - actual_bytes);
+      actual_bytes = block_read_size;
+    }
     total_bytes_read += actual_bytes;
     data_offset += actual_bytes;
   }

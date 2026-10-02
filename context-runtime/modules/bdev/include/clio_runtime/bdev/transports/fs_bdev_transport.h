@@ -102,6 +102,30 @@ class FsBdevTransport : public BdevTransport {
    */
   bool GrowBackingFile(clio::run::u64 backed, clio::run::u64 target);
 
+  /**
+   * TEST-ONLY fault injection. While a file named `<backing file>.fail`
+   * exists, every read, write and sync of this device fails with an I/O
+   * error (io_error_ = DeviceFault), as a dead disk would; deleting the file
+   * makes the device work again (a disk that comes back, or is replaced in
+   * place). Off unless the marker exists. The marker is stat'ed at most once
+   * per kFailMarkerPollNs per transport and the answer cached, so the I/O
+   * path pays one clock read, not a syscall.
+   */
+  std::string fail_marker_path_;
+  /** Cached "marker present" answer from the last stat. */
+  std::atomic<bool> fail_marker_present_{false};
+  /** Steady-clock ns of the last marker stat (0 = never). */
+  std::atomic<clio::run::u64> fail_marker_checked_ns_{0};
+  /** Marker re-check period: 100 ms. */
+  static constexpr clio::run::u64 kFailMarkerPollNs = 100000000ull;
+
+  /**
+   * Whether the TEST-ONLY fault-injection marker is present (see
+   * fail_marker_path_). Logs once on every transition.
+   * @return true if every I/O of this device must fail
+   */
+  bool FaultInjected();
+
   bool InitializeWorkerIOContexts();
   void CleanupWorkerIOContexts();
   WorkerIOContext* GetWorkerIOContext(size_t worker_id);

@@ -242,6 +242,36 @@ class AllocatorLog {
   }
 
   /**
+   * Flush() without holding the log lock across the fsync: append under the
+   * lock, then fsync a duplicate of the descriptor, so other threads keep
+   * appending (and a concurrent Compact may swap the file: the duplicate
+   * still names the old one, whose records Compact already carried over).
+   * For a dedicated sync thread; everything appended before the call is
+   * durable when it returns.
+   * @return false if the fsync failed
+   */
+  bool SyncAppended() {
+#ifndef _WIN32
+    int fd = -1;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      AppendLocked();
+      if (!enabled_ || file_ == nullptr) return true;
+      const int cur = ::fileno(file_);
+      if (cur >= 0) fd = ::dup(cur);
+      unsynced_ = false;
+    }
+    if (fd < 0) return false;
+    const bool ok = ::fdatasync(fd) == 0;
+    ::close(fd);
+    return ok;
+#else
+    Flush();
+    return true;
+#endif
+  }
+
+  /**
    * Recompute the current state by replaying the WHOLE log (file + buffer)
    * in memory, then rewrite the file as the minimal record set that
    * reproduces it: one kGroupOpen per live group, then one kAlloc per live
