@@ -53,3 +53,63 @@ def t_cp_1g(ctx):
   ctx.metrics['reported_failed_copies'] = len(reported)
   ctx.check(not silent, f'cp returned 0 but wrote wrong bytes: '
                         f'{brief(silent)[:4]} sample {silent[0]["sample"][:1] if silent else None}')
+
+
+FILL_SCRIPT = r'''
+import errno, json, os, sys
+d, mib = sys.argv[1], int(sys.argv[2])
+buf = os.urandom(1 << 20)
+res = {"files": 0, "fail": None}
+for i in range(10000):
+    p = os.path.join(d, "f%d" % i)
+    step, done = "open", 0
+    try:
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            step = "write"
+            for _ in range(mib):
+                os.write(fd, buf)
+                done += 1
+            step = "fsync"
+            os.fsync(fd)
+            step = "close"
+        finally:
+            os.close(fd)
+        res["files"] += 1
+    except OSError as e:
+        st = os.stat(p) if os.path.exists(p) else None
+        res["fail"] = {"file": p, "errno": errno.errorcode.get(e.errno, e.errno),
+                       "step": step, "mib_written_before": done,
+                       "size_after": st.st_size if st else None}
+        break
+print(json.dumps(res))
+'''
+
+
+@test('enospc_reported_honestly', 'copy', min_nodes=1, timeout=3600)
+def t_enospc(ctx):
+  """#1129: fill the store with 256 MiB files until a write fails. The
+  failure must be ENOSPC (not EIO), and afterwards opening the failed file
+  and an earlier good one must work (a failed write's error belongs to
+  write/fsync/close, not to every later open), with the good file intact."""
+  base = ctx.p('fill')
+  ctx.ok(0, 'mkdir', path=base)
+  script = f'{ctx.cl.local_root}/fill.py'
+  rc, _ = sh(ctx.hosts[0], f"cat > {script} <<'PYEOF'\n{FILL_SCRIPT}\nPYEOF")
+  rc, out = sh(ctx.hosts[0], f'python3 {script} {base} 256', timeout=3400)
+  line = next((ln for ln in reversed(out.splitlines()) if ln.startswith('{')),
+              '')
+  res = json.loads(line) if line else {}
+  ctx.metrics.update({'files_written': res.get('files'),
+                      'failure': res.get('fail')})
+  fail = res.get('fail')
+  ctx.check(fail is not None, f'the store never filled: {out[-500:]}')
+  ctx.check(fail['errno'] == 'ENOSPC',
+            f'a full store failed with {fail["errno"]}, not ENOSPC')
+  for p in (fail['file'], f'{base}/f0'):
+    r = ctx.call(0, 'open', path=p, flags='r')
+    ctx.check(r.get('ok'), f'open({p}) after the store filled: {r.get("err")}')
+    ctx.ok(0, 'close', h=r['ret'])
+  r = ctx.call(0, 'sha256', path=f'{base}/f0', timeout=600)
+  ctx.check(r.get('ok') and r['ret']['size'] == 256 << 20,
+            f'the first (fsynced) file after the fill: {r}')
