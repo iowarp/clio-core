@@ -714,6 +714,15 @@ class Cusz : public Compressor {
         }
       }
 
+      // cuSZ's decoder does not overwrite every element of d_out: decoding
+      // into a buffer that still held earlier values gave errors thousands
+      // of times the bound (lookahead_gpu jobs 22590988, 22591012), and a
+      // zeroed buffer decodes within it. Start from zeros.
+      if (cudaMemsetAsync(d_out, 0, n * sizeof(float), stream) !=
+          cudaSuccess) {
+        if (free_stream) cudaFree(d_stream);
+        break;
+      }
       mgr = psz_create_resource_manager_from_header(&prefix.header, stream);
       bool decoded = mgr != nullptr &&
                      psz_decompress_float(mgr, d_stream, comp_bytes, d_out) == 0;

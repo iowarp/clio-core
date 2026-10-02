@@ -299,6 +299,14 @@ class Cuszp : public Compressor {
         }
       }
 
+      // cuSZp writes a block back only when it has a non-zero rate or uses
+      // the outlier encoding; a block whose values all quantized to zero is
+      // skipped, so whatever d_out already held would show through there.
+      // Those blocks decode to zero, so start from zeros.
+      if (cudaMemsetAsync(d_out, 0, n * sizeof(float), stream) !=
+          cudaSuccess) {
+        break;
+      }
       uint3 dims = {0, 0, 0};
       cuSZp_decompress(d_out, d_stream, n, cmp_arg, prefix.eb, CUSZP_DIM_1D,
                        dims, CUSZP_TYPE_FLOAT,
