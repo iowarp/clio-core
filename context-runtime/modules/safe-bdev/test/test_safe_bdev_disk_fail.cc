@@ -48,8 +48,10 @@
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -874,3 +876,229 @@ TEST_CASE("safe_bdev_sync_with_dying_disks",
 }
 
 SIMPLE_TEST_MAIN()
+
+namespace {
+
+/**
+ * Bytes that name their writer: every 8-byte word is (tag << 32 | word
+ * index), so a mismatch says whose bytes came back and from which offset.
+ * @param n length (bytes)
+ * @param tag the writer's (thread, op) id
+ * @return the pattern
+ */
+std::vector<ctp::u8> TaggedPattern(size_t n, clio::run::u32 tag) {
+  std::vector<ctp::u8> v(n);
+  for (size_t i = 0; i < n; i += 8) {
+    const clio::run::u64 w =
+        (static_cast<clio::run::u64>(tag) << 32) | static_cast<clio::run::u64>(i / 8);
+    std::memcpy(v.data() + i, &w, std::min<size_t>(8, n - i));
+  }
+  return v;
+}
+
+/** One churn thread's live allocations and the bytes each must hold. */
+struct ChurnSet {
+  std::vector<Block> blocks;
+  std::vector<ctp::u8> bytes;
+};
+
+/**
+ * Sub-range [off, off+len) of an allocation, as device blocks.
+ * @param blocks the allocation
+ * @param off byte offset into it
+ * @param len bytes
+ * @return the device blocks covering exactly that range
+ */
+std::vector<Block> SubBlocks(const std::vector<Block> &blocks,
+                             clio::run::u64 off, clio::run::u64 len) {
+  std::vector<Block> sub;
+  clio::run::u64 pos = 0;
+  for (const Block &b : blocks) {
+    const clio::run::u64 lo = std::max(pos, off);
+    const clio::run::u64 hi = std::min(pos + b.size_, off + len);
+    if (lo < hi) sub.push_back(Block(b.offset_ + (lo - pos), hi - lo, 0));
+    pos += b.size_;
+  }
+  return sub;
+}
+
+/**
+ * Describe the first mismatch between what a set must hold and what was
+ * read: the offset, and whose (tag, word) the read bytes carry.
+ * @param want expected bytes
+ * @param got bytes read
+ * @return a one-line description ("" when equal)
+ */
+std::string DescribeMismatch(const std::vector<ctp::u8> &want,
+                             const std::vector<ctp::u8> &got) {
+  if (want == got) return "";
+  size_t i = 0;
+  while (i < want.size() && i < got.size() && want[i] == got[i]) ++i;
+  const size_t w0 = (i / 8) * 8;
+  clio::run::u64 gw = 0, ww = 0;
+  std::memcpy(&gw, got.data() + w0, std::min<size_t>(8, got.size() - w0));
+  std::memcpy(&ww, want.data() + w0, std::min<size_t>(8, want.size() - w0));
+  size_t bad = 0;
+  for (size_t k = 0; k < want.size() && k < got.size(); ++k) {
+    bad += want[k] != got[k] ? 1 : 0;
+  }
+  return "first diff at byte " + std::to_string(i) + " of " +
+         std::to_string(want.size()) + " (" + std::to_string(bad) +
+         " bytes differ): want tag " + std::to_string(ww >> 32) + " word " +
+         std::to_string(ww & 0xffffffffULL) + ", got tag " +
+         std::to_string(gw >> 32) + " word " +
+         std::to_string(gw & 0xffffffffULL);
+}
+
+/**
+ * One churn step on a thread's sets: write a fresh allocation, rewrite a
+ * sub-range of a live one, or free one (keeping at most `max_sets`).
+ * @param safe the array
+ * @param sets this thread's live sets
+ * @param rng this thread's generator
+ * @param tag unique id for the bytes this step writes
+ * @param max_sets cap on live sets
+ * @return a failure description ("" on success)
+ */
+std::string ChurnStep(clio::run::safe_bdev::Client &safe,
+                      std::vector<ChurnSet> &sets, std::mt19937 &rng,
+                      clio::run::u32 tag, size_t max_sets) {
+  const int op = static_cast<int>(rng() % 3);
+  if ((op == 0 && !sets.empty()) || sets.size() >= max_sets) {
+    // Free a random set: its stripes narrow, its chunks become reusable.
+    const size_t i = rng() % sets.size();
+    auto fr = safe.AsyncFreeBlocks(clio::run::PoolQuery::Dynamic(),
+                                   ToPriv(sets[i].blocks));
+    fr.Wait();
+    if (fr->GetReturnCode() != 0) return "free failed";
+    sets.erase(sets.begin() + static_cast<long>(i));
+    return "";
+  }
+  if (op == 1 && !sets.empty()) {
+    // Rewrite an unaligned sub-range in place.
+    ChurnSet &s = sets[rng() % sets.size()];
+    const clio::run::u64 total = s.bytes.size();
+    const clio::run::u64 len = 1 + rng() % std::min<clio::run::u64>(total, 3 * kChunkLen / 2);
+    const clio::run::u64 off = rng() % (total - len + 1);
+    std::vector<ctp::u8> d = TaggedPattern(len, tag);
+    if (Write(safe, SubBlocks(s.blocks, off, len), d) != 0) {
+      return "rewrite failed";
+    }
+    std::copy(d.begin(), d.end(), s.bytes.begin() + static_cast<long>(off));
+    return "";
+  }
+  // A fresh allocation of 1..3 chunks plus an unaligned tail.
+  const clio::run::u64 len = (1 + rng() % 3) * kChunkLen + rng() % kChunkLen;
+  auto t = safe.AsyncAllocateBlocks(clio::run::PoolQuery::Dynamic(), len);
+  t.Wait();
+  if (t->GetReturnCode() != 0) return "";  // full: not this test's concern
+  ChurnSet s;
+  for (size_t i = 0; i < t->blocks_.size(); ++i) s.blocks.push_back(t->blocks_[i]);
+  s.bytes = TaggedPattern(len, tag);
+  if (Write(safe, s.blocks, s.bytes) != 0) return "fresh write failed";
+  sets.push_back(std::move(s));
+  return "";
+}
+
+/**
+ * Run `steps` churn steps on every thread concurrently.
+ * @param safe the array
+ * @param sets per-thread live sets
+ * @param rngs per-thread generators
+ * @param next_tag per-thread op counters (tags are thread << 20 | op)
+ * @param steps steps per thread
+ * @return failures seen ("" if none)
+ */
+std::string ChurnPhase(clio::run::safe_bdev::Client &safe,
+                       std::vector<std::vector<ChurnSet>> &sets,
+                       std::vector<std::mt19937> &rngs,
+                       std::vector<clio::run::u32> &next_tag, int steps) {
+  std::vector<std::string> err(sets.size());
+  std::vector<std::thread> th;
+  for (size_t t = 0; t < sets.size(); ++t) {
+    th.emplace_back([&, t] {
+      for (int i = 0; i < steps && err[t].empty(); ++i) {
+        const clio::run::u32 tag =
+            (static_cast<clio::run::u32>(t + 1) << 20) | next_tag[t]++;
+        err[t] = ChurnStep(safe, sets[t], rngs[t], tag, /*max_sets=*/6);
+      }
+    });
+  }
+  for (auto &x : th) x.join();
+  std::string all;
+  for (size_t t = 0; t < err.size(); ++t) {
+    if (!err[t].empty()) all += "thread " + std::to_string(t) + ": " + err[t] + "; ";
+  }
+  return all;
+}
+
+/**
+ * Read every live set back.
+ * @param safe the array
+ * @param sets per-thread live sets
+ * @return mismatches and read failures, described ("" if all exact)
+ */
+std::string VerifyChurn(clio::run::safe_bdev::Client &safe,
+                        const std::vector<std::vector<ChurnSet>> &sets) {
+  std::string out;
+  int n = 0;
+  for (size_t t = 0; t < sets.size(); ++t) {
+    for (size_t i = 0; i < sets[t].size(); ++i) {
+      std::vector<ctp::u8> got;
+      const clio::run::u32 rc = Read(safe, sets[t][i].blocks, got);
+      std::string d = rc != 0 ? "read rc " + std::to_string(rc)
+                              : DescribeMismatch(sets[t][i].bytes, got);
+      if (!d.empty() && n++ < 6) {
+        out += "[thread " + std::to_string(t) + " set " + std::to_string(i) +
+               ": " + d + "] ";
+      }
+    }
+  }
+  if (n > 6) out += "(+" + std::to_string(n - 6) + " more)";
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("safe_bdev_degraded_churn_verify",
+          "[safe_bdev][disk_fail][restart]") {
+  // #1131: after a data disk died under concurrent writes, came back, and
+  // the array restarted, a 64 KiB read silently returned another
+  // allocation's OLD bytes. Churn allocations (fresh writes, unaligned
+  // rewrites, frees that let chunks be reused) from several threads across
+  // that whole sequence and check every live byte -- each word names its
+  // writer, so a wrong read says whose bytes it got.
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      71000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("chn", base);
+  constexpr size_t kThreads = 4;
+  std::vector<std::vector<ChurnSet>> sets(kThreads);
+  std::vector<std::mt19937> rngs;
+  for (size_t t = 0; t < kThreads; ++t) rngs.emplace_back(1131 + t);
+  std::vector<clio::run::u32> next_tag(kThreads, 0);
+  auto phase = [&](int steps, const char *when) {
+    const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, steps);
+    INFO(std::string("churn ") + when + ": " + e);
+    REQUIRE(e.empty());
+    const std::string v = VerifyChurn(rig.safe, sets);
+    INFO(std::string("verify ") + when + ": " + v);
+    REQUIRE(v.empty());
+  };
+  phase(40, "healthy");
+  KillDisk(rig.paths[0]);
+  phase(60, "data disk 0 dead");
+  ReviveDisk(rig.paths[0]);  // it answers again; the array must not trust it
+  phase(40, "disk 0 answering again");
+  rig.Shutdown();
+  rig.Create();
+  {
+    const std::string v = VerifyChurn(rig.safe, sets);
+    INFO("verify after restart: " + v);
+    REQUIRE(v.empty());
+  }
+  phase(40, "after restart");
+  rig.Cleanup();
+}
