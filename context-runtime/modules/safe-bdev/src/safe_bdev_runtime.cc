@@ -2543,7 +2543,14 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
   CLIO_TASK_BODY_END
 }
 
-clio::run::u64 Runtime::GetWorkRemaining() const { return 0; }
+clio::run::u64 Runtime::GetWorkRemaining() const {
+  // Stripes an in-flight Write or parity encode holds (#1137): from before its
+  // data writes until its parity is written. The runtime's stop drain waits
+  // on this -- tearing a write off between its data and its parity leaves the
+  // stripe dirty, and with a member down a dirty stripe cannot be rebuilt.
+  std::lock_guard<std::mutex> g(slot_mu_);
+  return static_cast<clio::run::u64>(busy_stripes_.size());
+}
 
 //=============================================================================
 // Synchronous parity and the stripe intent log (#1121)

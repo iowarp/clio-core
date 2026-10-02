@@ -1104,7 +1104,11 @@ void Runtime::RegisterStopFlush() {
   if (manager == nullptr) return;
   const clio::run::PoolId pool_id = client_.pool_id_;
   const int level = config_.performance_.flush_data_min_persistence_;
-  stop_hook_id_ = manager->AddStopHook([pool_id, level]() {
+  stop_hook_id_ = manager->AddStopHook([this, pool_id, level]() {
+    // No new tier moves from here on (#1137): the drain that follows waits
+    // for the ones in flight (GetWorkRemaining). The hook is removed in
+    // Destroy/~Runtime, so `this` outlives every call.
+    stopping_.store(true, std::memory_order_release);
     auto *mgr = CLIO_RUNTIME_MANAGER;
     const float max_s =
         static_cast<float>(mgr->GetStopGracePeriodMs()) / 1000.0f;
@@ -3565,8 +3569,13 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
+  MoveInFlight move_in_flight(&moves_in_flight_);  // stop drain waits (#1137)
   try {
     rc = 0;
+    if (stopping_.load(std::memory_order_acquire)) {
+      rc = 7;  // stopping: no new moves; the blob stays where it is
+      CLIO_CO_RETURN;
+    }
 
     // Validate inputs
     if (blob_name.empty()) {
@@ -3936,8 +3945,13 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
+  MoveInFlight move_in_flight(&moves_in_flight_);  // stop drain waits (#1137)
   try {
     rc = 0;
+    if (stopping_.load(std::memory_order_acquire)) {
+      rc = 7;  // stopping: no new moves; the replica stays where it is
+      CLIO_CO_RETURN;
+    }
     if (blob_name.empty() || replica_idx <= 0 || new_score < 0.0f ||
         new_score > 1.0f) {
       rc = 1;
@@ -4644,7 +4658,8 @@ clio::run::TaskResume Runtime::PodMultiScore(
 clio::run::TaskResume Runtime::DynamicReorganize(
     clio::run::shared_ptr<DynamicReorganizeTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  if (organizer_) {
+  // A stopping runtime starts no new moves (#1137).
+  if (organizer_ && !stopping_.load(std::memory_order_acquire)) {
     CLIO_CO_AWAIT(organizer_->Reorganize(this, task->replica_id_));
   }
   task->return_code_ = 0;
@@ -8586,9 +8601,12 @@ void Runtime::ReserveRestoredBlockSpace() {
 
 // GetWorkRemaining implementation (required pure virtual method)
 clio::run::u64 Runtime::GetWorkRemaining() const {
-  // Return approximate work remaining (simple implementation)
-  // In a real implementation, this would sum tasks across all queues
-  return 0;  // For now, always return 0 work remaining
+  // Tier moves in flight (#1137). The stop drain waits on this: a move torn
+  // off between writing its new copy and publishing it wastes the copy, and
+  // on a safe_bdev tier its interrupted stripe writes cannot be rebuilt
+  // while a member is down. (Client puts stop with the mount; the stop hook
+  // awaits its own flush.)
+  return moves_in_flight_.load(std::memory_order_acquire);
 }
 
 clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {

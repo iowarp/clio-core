@@ -1259,6 +1259,23 @@ private:
 
   /** RuntimeManager stop-hook id (0 = none registered). */
   clio::run::u64 stop_hook_id_ = 0;
+  /** Set first thing by the stop hook (#1137): the organizer starts no new
+   *  tier moves once the runtime is stopping, so the stop drain can finish
+   *  the ones already in flight instead of tearing them off mid-write. */
+  std::atomic<bool> stopping_{false};
+  /** Tier moves in flight (ReorganizeBlob / ReorganizeReplica), reported by
+   *  GetWorkRemaining so the stop drain waits for them (#1137). */
+  std::atomic<clio::run::u64> moves_in_flight_{0};
+  /** Counts one tier move in moves_in_flight_ for its whole lifetime. */
+  struct MoveInFlight {
+    std::atomic<clio::run::u64> *n;
+    explicit MoveInFlight(std::atomic<clio::run::u64> *c) : n(c) {
+      n->fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~MoveInFlight() { n->fetch_sub(1, std::memory_order_acq_rel); }
+    MoveInFlight(const MoveInFlight &) = delete;
+    MoveInFlight &operator=(const MoveInFlight &) = delete;
+  };
 
   /**
    * Forget every restored REPLICA_CACHE layout -- called once during Create()
