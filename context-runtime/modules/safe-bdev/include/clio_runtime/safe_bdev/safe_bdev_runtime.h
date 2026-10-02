@@ -88,20 +88,21 @@
  * s; the returned offset bands (d,s). Decode is pure div/mod -- nothing extra is
  * persisted for addressing (only each member's slot allocator, via the WAL).
  *
- * STRIPES & PARITY (offset-aligned, variable width). A STRIPE s = the live data
- * chunks at physical slot s across the data members deep enough to have one;
- * parity for stripe s lives at the SAME slot s on each parity member:
- *   parity[s] = RS(k_s, m) over { data_d[s] : member d has a LIVE chunk at s }
- * k_s (stripe width) varies by slot (StripeMembers(s) -> the sorted data-member
- * indices with slot s live; a member's RS data-shard index is its POSITION in
- * that sorted list). Codecs are cached by width in rs_cache_. Membership is
- * DERIVED from the per-member live sets, not stored. A single data chunk
- * (k_s==1) with m==1 is a MIRROR -- narrow writes are protected immediately and
- * widen to RS(k,m) as drives join. Parity is built off the write path (deferred
- * to a periodic BuildParity over a dirty-SLOT set); degraded reads reconstruct a
- * down member's chunk on demand from the stripe survivors + parity. Adding a
- * data drive moves NO data: new writes round-robin onto it, dirtying the slots
- * they widen so BuildParity re-derives that stripe's parity.
+ * STRIPES & PARITY (offset-aligned, fixed width -- #1126). A STRIPE s is the
+ * chunk at physical slot s on EVERY data member, allocated or not; parity for
+ * stripe s lives at the SAME slot s on each parity member:
+ *   parity_j[s] = sum_d c(j, d) * data_d[s]      (GF(2^8), Cauchy RS)
+ * over all N data members, where c(j, d) does not depend on N (Cauchy rows
+ * x_j = 255 - j). An unallocated or freed chunk is a column holding whatever
+ * bytes it holds (zeros if never written), so:
+ *  - every write updates parity from the change alone (old ^ new, over the
+ *    written range) -- fresh chunks included; frees never touch parity;
+ *  - a down member's chunk decodes from any N of the N + m columns;
+ *  - adding a data member is a new (zero) column: existing parity stays valid.
+ * Parity is written before a write is acked (synchronous, #1121), under a
+ * per-stripe lock, with a durable stripe intent logged first so a crash
+ * between data and parity is re-encoded at restart. Requires
+ * N + max_failures <= 256.
  */
 
 namespace clio::run::safe_bdev {
@@ -417,6 +418,17 @@ class Runtime : public clio::run::Container {
   // written. After a crash, the group's live entries are exactly the stripes
   // whose data may have landed without parity; Create rebuilds them.
   static constexpr clio::run::u32 kIntentGroup = 1;
+  // Array high water (#1126): one group-open record, rewritten whenever an
+  // allocation first reaches a new slot (first_row = slots ever used). The
+  // live set alone forgets freed slots above the highest live one, whose
+  // bytes still count in their stripes' parity.
+  static constexpr clio::run::u32 kHighWaterGroup = 2;
+  // Parity format (#1126): k = kParityFormat once the array's parity is
+  // fixed-width. An array without it re-encodes every slot at Create.
+  static constexpr clio::run::u32 kFormatGroup = 3;
+  static constexpr clio::run::u32 kParityFormat = 2;
+  /** Slots ever allocated on any member (guarded by alloc_mu_). */
+  clio::run::u64 array_high_water_ = 0;
 
   /** One logged intent: its unique log key and the stripe it names. */
   struct IntentKey {
@@ -443,9 +455,6 @@ class Runtime : public clio::run::Container {
   void LogCleanIntents(const std::vector<IntentKey> &keys,
                        const std::set<clio::run::u64> &clean);
 
-  /** Log stripes whose parity is now stale for restart (a free narrowed
-   *  them; caller holds alloc_mu_, logged before the free record). */
-  void LogStripesStale(const std::set<clio::run::u64> &slots);
 
   /** @return the newest intent key; stale intents up to it are covered by
    *  an encode that starts now (pass it to LogStripesEncoded). */
@@ -486,6 +495,8 @@ class Runtime : public clio::run::Container {
   std::mutex intent_cv_mu_;
   std::condition_variable intent_cv_;
   std::atomic<bool> intent_stop_{false};
+  /** CreateParams::intent_sync_: fsync intents before data (power loss). */
+  bool intent_sync_ = true;
   // Re-check period while the sync thread's fsync covers our intent.
   static constexpr double kIntentSyncPollUs = 20.0;
 
@@ -553,16 +564,10 @@ class Runtime : public clio::run::Container {
    *  write that re-dirtied it mid-build (the slot already in the set, so the
    *  insert was a no-op) must not be erased along with the stale parity. */
   std::unordered_map<clio::run::u64, clio::run::u64> slot_gen_;
+  // Every slot below any member's high water: parity covers the physical
+  // bytes of every data column there, allocated or not (#1126), so a freed
+  // chunk stays part of its stripe and recovery must rebuild it too.
   std::set<clio::run::u64> written_slots_;
-  /**
-   * Per slot, the data members (sorted) whose chunks its parity currently
-   * encodes -- the stripe as of the last parity write (slot_mu_). An
-   * allocation can WIDEN a stripe without dirtying it (see AllocateBlocks),
-   * so the live membership may hold members the parity has never seen; a
-   * decode must use the encoded set and code width, or it returns garbage.
-   * Absent: no parity written yet (the live membership is assumed).
-   */
-  std::unordered_map<clio::run::u64, std::vector<int>> encoded_;
   mutable std::mutex slot_mu_;
 
   // Slot-allocator lock. A container's methods are NOT serialized: client
@@ -604,37 +609,26 @@ class Runtime : public clio::run::Container {
     dirty_slots_.insert(s);
     ++slot_gen_[s];
   }
-  /** Note a slot no longer holds data (last live chunk freed): drop it from the
-   *  written set once no data member has it live. Caller ensures liveness check
-   *  already reflects the free. */
-  void ForgetSlotIfEmpty(clio::run::u64 s) {
-    for (const auto &a : data_alloc_) {
-      if (a.live_.count(s) != 0) {
-        return;  // still live somewhere -> keep tracking
-      }
-    }
-    std::lock_guard<std::mutex> g(slot_mu_);
-    written_slots_.erase(s);
-    dirty_slots_.erase(s);
-    encoded_.erase(s);
-  }
   /**
-   * @param s slot
-   * @return data members slot `s`'s parity encodes (empty if unknown)
+   * The RS data columns of every stripe: all data members, in member order
+   * (fixed-width parity, #1126). Column d's coefficients do not depend on
+   * how many columns exist, so an unallocated or freed chunk is just a
+   * column holding whatever bytes it holds.
+   * @return 0 .. data_members_.size()-1
    */
-  std::vector<int> EncodedMembers(clio::run::u64 s) const {
-    std::lock_guard<std::mutex> g(slot_mu_);
-    auto it = encoded_.find(s);
-    return it == encoded_.end() ? std::vector<int>() : it->second;
-  }
   /**
-   * Record that slot `s`'s parity now encodes `members`.
-   * @param s slot
-   * @param members sorted data members
+   * Restart: parity covers every slot below the array high water (from the
+   * alloc log; at least every member's live high water). An array whose
+   * parity predates the fixed-width format gets every slot marked dirty, so
+   * BuildParity re-encodes it and nothing is reconstructed from old parity.
+   * Caller has exclusive access (Create).
    */
-  void SetEncoded(clio::run::u64 s, const std::vector<int> &members) {
-    std::lock_guard<std::mutex> g(slot_mu_);
-    encoded_[s] = members;
+  void RestoreParityCoverage();
+
+  std::vector<int> CodeColumns() const {
+    std::vector<int> cols(data_members_.size());
+    for (size_t d = 0; d < cols.size(); ++d) cols[d] = static_cast<int>(d);
+    return cols;
   }
   /** True if the slot's parity is not yet current (unprotected). */
   bool IsSlotDirty(clio::run::u64 s) const {
@@ -722,9 +716,11 @@ class Runtime : public clio::run::Container {
     std::lock_guard<std::mutex> g(alloc_mu_);
     return StripeHasDownMember(s);
   }
-  /** @return true if any data member holding a chunk of stripe `s` is down. */
+  /** @return true if any data column of stripe `s` is down: every stripe
+   *  spans all data members (fixed-width parity). */
   bool StripeHasDownMember(clio::run::u64 s) const {
-    for (int d : StripeMembers(s)) {
+    (void)s;
+    for (int d : CodeColumns()) {
       if (data_members_[static_cast<size_t>(d)].state_ !=
           ec::EcState::kActive) {
         return true;

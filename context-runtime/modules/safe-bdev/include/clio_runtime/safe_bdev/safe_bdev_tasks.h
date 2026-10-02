@@ -186,6 +186,12 @@ struct CreateParams {
   // member whose node dies is marked faulty. false (default): every member
   // is this node's container of its pool (node_id_ ignored), as before.
   bool distributed_ = false;
+  // Stripe intents (#1121) are fsynced before a write's data reaches a
+  // member (true, default): parity stays consistent across a POWER LOSS.
+  // false: intents only reach the kernel first -- consistent across any
+  // process crash, not a power loss -- and small writes skip an fsync each
+  // (#1126: ~10x the small-file create rate).
+  bool intent_sync_ = true;
 
   // Required: chimod library name for module manager
   static constexpr const char *chimod_lib_name = "clio_safe_bdev";
@@ -204,7 +210,7 @@ struct CreateParams {
   // Serialization support for cereal
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(max_failures_, members_, alloc_log_path_, distributed_);
+    ar(max_failures_, members_, alloc_log_path_, distributed_, intent_sync_);
   }
 
   /**
@@ -225,6 +231,9 @@ struct CreateParams {
     }
     if (config["distributed"]) {
       distributed_ = config["distributed"].as<bool>();
+    }
+    if (config["intent_sync"]) {
+      intent_sync_ = config["intent_sync"].as<bool>();
     }
 
     if (config["members"] && config["members"].IsSequence()) {

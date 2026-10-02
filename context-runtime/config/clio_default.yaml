@@ -223,6 +223,12 @@ compose:
   # the parity, restart re-encodes exactly those stripes and refuses to
   # reconstruct from them until it has. Sync (the CTE's fsync of the tier)
   # encodes any stripe still dirty, syncs every active member and the log.
+  #   intent_sync: true     # default. Stripe intents are fsynced before the
+  #                         # write's data reaches a member: parity stays
+  #                         # consistent across a power loss. false: intents
+  #                         # only reach the kernel first (still consistent
+  #                         # across any process crash) and small writes skip
+  #                         # an fsync each -- ~10x the small-file create rate.
 
   # === Context Assimilation Engine (CAE) ===
   # Assimilation / discovery entrypoint at its own pool 400.0
