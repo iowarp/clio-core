@@ -3771,10 +3771,15 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
     BlobInfo staging;
     bool placed = false;
     const float placed_score = new_score;
+    // A move must never make the blob less durable than it is (#1124,
+    // #1130): placed with no floor, a hot fsynced blob was moved onto the
+    // volatile RAM tier -- whole or just its tail -- and its persistent
+    // placement freed; a crash then replayed it as a hole or a short page.
+    const int durability_floor = DurabilityFloor(blob_info.blocks_);
     for (int attempt = 0; attempt < 2 && !placed; ++attempt) {
       clio::run::u32 place_rc = 0;
       CLIO_CO_AWAIT(ExtendBlob(staging, 0, blob_size, placed_score, place_rc,
-                               /*min_persistence_level=*/0,
+                               /*min_persistence_level=*/durability_floor,
                                /*preallocate=*/0));
       if (place_rc == 0) {
         clio::run::u32 write_rc = 0;
@@ -7416,6 +7421,18 @@ clio::run::TaskResume Runtime::RelocateBlob(
   CLIO_TASK_BODY_END
 }
 
+int Runtime::DurabilityFloor(const clio::run::priv::vector<BlobBlock> &blocks) {
+  if (blocks.empty()) return 0;
+  int floor = std::numeric_limits<int>::max();
+  clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+  for (const auto &b : blocks) {
+    TargetInfo *t = registered_targets_.find(b.bdev_client_.pool_id_);
+    const int lvl = t == nullptr ? 0 : static_cast<int>(t->persistence_level_);
+    floor = std::min(floor, lvl);
+  }
+  return floor;
+}
+
 void Runtime::LogBlobLayout(const TagId &tag_id, const std::string &blob_name,
                             const BlobInfo &blob_info) {
   if (blob_txn_logs_.empty()) return;
@@ -8260,6 +8277,7 @@ void Runtime::ApplyWalExtendBlob(const std::vector<char> &payload,
   if (blob_info_ptr) {
     // Replace blocks with replayed blocks (full replacement semantics)
     blob_info_ptr->blocks_.clear();
+    size_t volatile_dropped = 0;
     for (const auto &tb : txn.new_blocks_) {
       clio::run::PoolId bdev_pool_id(tb.bdev_major_, tb.bdev_minor_);
       // Filter volatile targets (matching RestoreMetadataFromLog)
@@ -8273,6 +8291,7 @@ void Runtime::ApplyWalExtendBlob(const std::vector<char> &payload,
         }
       }
       if (is_volatile) {
+        ++volatile_dropped;
         continue;
       }
       clio::run::bdev::Client bdev_client(bdev_pool_id);
@@ -8281,6 +8300,14 @@ void Runtime::ApplyWalExtendBlob(const std::vector<char> &payload,
       blob_info_ptr->blocks_.push_back(block);
     }
     blob_info_ptr->RecomputeTotalSize();  // blocks_ rebuilt: resync cache
+    if (volatile_dropped != 0 && !blob_info_ptr->blocks_.empty()) {
+      // Part of the blob lived on a volatile tier: it comes back SHORT. Not
+      // silent: this is how fsynced data that was moved onto RAM showed up
+      // as a page missing its tail (#1124).
+      HLOG(kWarning, "WAL replay: blob {} lost {} volatile block(s); it is "
+           "now {} byte(s)", composite_key, volatile_dropped,
+           blob_info_ptr->GetTotalSize());
+    }
   }
   blobs_replayed++;
 }

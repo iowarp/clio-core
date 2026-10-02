@@ -273,6 +273,14 @@ public:
    * @param blob_name the blob's name
    * @param blob_info the blob (its blocks_ are recorded)
    */
+  /**
+   * The least durable persistence level among a blob's blocks: a move or
+   * re-placement must not put the blob below it.
+   * @param blocks the blob's current layout
+   * @return the minimum PersistenceLevel (as int); 0 for an empty layout
+   */
+  int DurabilityFloor(const clio::run::priv::vector<BlobBlock> &blocks);
+
   void LogBlobLayout(const TagId &tag_id, const std::string &blob_name,
                      const BlobInfo &blob_info);
 
