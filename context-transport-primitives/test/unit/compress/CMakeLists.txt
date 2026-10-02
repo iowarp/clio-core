@@ -43,6 +43,18 @@ if(CLIO_CORE_ENABLE_CUDA)
     add_test(NAME ctp_quantize_device COMMAND
             ${CMAKE_BINARY_DIR}/bin/test_quantize_device_exec)
     set_tests_properties(ctp_quantize_device PROPERTIES LABELS "gpu")
+
+    # Look-ahead (temporal) codec: needs a GPU, cuSZp for anchors and nvcomp
+    # for the residual packer.
+    add_executable(test_lookahead_gpu_exec
+            ${TEST_MAIN}/main.cc
+            test_init.cc
+            test_lookahead_gpu.cc)
+    target_link_libraries(test_lookahead_gpu_exec
+            clio_ctp_host ctp::compress CUDA::cudart Catch2::Catch2)
+    add_test(NAME ctp_lookahead_gpu COMMAND
+            ${CMAKE_BINARY_DIR}/bin/test_lookahead_gpu_exec)
+    set_tests_properties(ctp_lookahead_gpu PROPERTIES LABELS "gpu")
 endif()
 
 #------------------------------------------------------------------------------

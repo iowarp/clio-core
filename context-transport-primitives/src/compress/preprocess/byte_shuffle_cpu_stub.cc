@@ -19,6 +19,7 @@
 #include "clio_ctp/compress/preprocess/data_stats_gpu.h"
 #include "clio_ctp/compress/preprocess/quality_metrics_gpu.h"
 #include "clio_ctp/compress/preprocess/quantization.h"
+#include "clio_ctp/compress/preprocess/temporal.h"
 
 #if !defined(CTP_ENABLE_CUDA) || !CTP_ENABLE_CUDA
 
@@ -45,6 +46,29 @@ bool DequantizeDevice(const void *, size_t, const DeviceQuantizeParams &,
  *  RMSE/PSNR/SSIM would be indistinguishable in the logs from a real one. */
 bool ComputeQualityDevice(const void *, const void *, std::size_t, void *,
                           QualityMetrics *) {
+  return false;
+}
+
+/** Temporal (look-ahead) primitives: device only, like the quantizer. */
+bool TemporalPredictDevice(const float *, const float *, float, float *,
+                           size_t, void *) {
+  return false;
+}
+bool AddDevice(const float *, const float *, float, float *, size_t, void *) {
+  return false;
+}
+bool BoundCheckDevice(const float *, const float *, const float *, double,
+                      float *, uint32_t *, float *, uint64_t *, size_t,
+                      void *) {
+  return false;
+}
+bool ScatterDevice(const uint32_t *, const float *, uint64_t, float *,
+                   void *) {
+  return false;
+}
+bool TemporalProbeDevice(const float *, const float *, const float *, size_t,
+                         size_t, size_t, double, TemporalProbeResult *,
+                         void *) {
   return false;
 }
 

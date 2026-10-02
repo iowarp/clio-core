@@ -70,6 +70,10 @@ if(CLIO_CORE_ENABLE_CUDA)
     # the inference kernels without a host round trip.
     list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC
         ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/prediction_reuse_gpu.cu)
+    # Temporal (look-ahead) prediction primitives for ctp::LookaheadCodec:
+    # prediction, residuals and the closed-loop bound check on device frames.
+    list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/temporal_gpu_kernels.cu)
 endif()
 
 add_library(clio_ctp_compress_model STATIC ${CLIO_CTP_COMPRESS_MODEL_SRC})
@@ -91,6 +95,9 @@ if(CLIO_CORE_ENABLE_CUDA)
         PROPERTIES LANGUAGE CUDA)
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/prediction_reuse_gpu.cu
+        PROPERTIES LANGUAGE CUDA)
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/temporal_gpu_kernels.cu
         PROPERTIES LANGUAGE CUDA)
     # CUDA_RESOLVE_DEVICE_SYMBOLS: device-link this library's .cu objects ONCE,
     # here, instead of once per consumer.

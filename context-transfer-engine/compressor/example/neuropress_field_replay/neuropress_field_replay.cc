@@ -35,6 +35,7 @@
  */
 
 #include <algorithm>
+#include <memory>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -66,6 +67,8 @@
 #include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
+
+#include "lookahead_stage.h"
 
 namespace fs = std::filesystem;
 
@@ -103,6 +106,10 @@ struct Options {
   // With --verify: read back only the blobs whose name matches (ECMAScript
   // regex), as a consumer that reads some of the fields a producer wrote.
   std::string read_match;
+  // --lookahead N: hold each chunk until N timesteps of it arrived and write
+  // the group as one look-ahead blob when a trial encode says it is smaller
+  // (lookahead_stage.h). 0 = off.
+  int lookahead = 0;
 };
 
 void Usage(const char *argv0) {
@@ -129,6 +136,9 @@ void Usage(const char *argv0) {
       << "  --read-repeat N  with --verify: N timed read-backs; --check-bound\n"
       << "                   then runs one more, untimed, to check the bound\n"
       << "  --read-match RE  with --verify: read back only blobs matching RE\n"
+      << "  --lookahead N    hold N timesteps of each chunk; store the group as\n"
+      << "                   one look-ahead blob when a trial encode says it is\n"
+      << "                   smaller (needs a positive CLIO_NEUROPRESS_ERROR_BOUND)\n"
       << "  --dump-decompressed DIR  with --readback, write each decompressed\n"
       << "                   blob to DIR so an EXTERNAL tool can compare it\n"
       << "                   against the simulation's own output files\n";
@@ -156,6 +166,7 @@ bool ParseArgs(int argc, char **argv, Options *o) {
     else if (a == "--f64") o->f64 = true;
     else if (a == "--verify") o->verify = true;
     else if (a == "--no-compress") o->no_compress = true;
+    else if (a == "--lookahead") o->lookahead = std::atoi(need("N"));
     else if (a == "--read-to-gpu") o->read_to_gpu = true;
     else if (a == "--read-match") o->read_match = need("REGEX");
     else if (a == "--read-repeat") {
@@ -919,6 +930,24 @@ int main(int argc, char **argv) {
     std::cout << "  quality floor=" << ctx.target_psnr_
               << " dB (a chunk below it is stored losslessly)" << std::endl;
 
+  std::unique_ptr<neuropress_replay::LookaheadStage> stage;
+  std::vector<neuropress_replay::LookaheadRecord> la_records;
+  if (opt.lookahead > 0) {
+    if (opt.f64 || opt.no_compress || ctx.error_bound_ <= 0.0) {
+      std::cerr << "--lookahead needs float32 data, compression on and a "
+                   "positive CLIO_NEUROPRESS_ERROR_BOUND\n";
+      return 1;
+    }
+    stage = std::make_unique<neuropress_replay::LookaheadStage>(
+        opt.lookahead, ctx.error_bound_);
+    if (!stage->Ready()) {
+      std::cerr << "--lookahead: needs N >= 3 and a codec that takes the bound\n";
+      return 1;
+    }
+    std::cout << "  look-ahead: groups of " << opt.lookahead
+              << " timesteps per chunk, decided by a trial encode" << std::endl;
+  }
+
   std::vector<BlobRecord> records;
   std::deque<Pending> pending;
   double read_s = 0.0, stage_s = 0.0;
@@ -994,6 +1023,110 @@ int main(int argc, char **argv) {
               << " chunk(s) submitted asynchronously" << std::endl;
   }
 
+  // Submit one chunk through NeuroPress (or raw with --no-compress) and
+  // record it; keeps at most `inflight` submissions outstanding.
+  auto submit_chunk = [&](const std::string &name, const char *src, size_t n,
+                          const fs::path *file, size_t off) -> bool {
+    auto buf = CLIO_IPC->AllocateBuffer(n);
+    if (buf.IsNull()) { std::cerr << "AllocateBuffer failed\n"; return false; }
+    std::memcpy(buf.ptr_, src, n);
+
+    BlobRecord rec;
+    rec.name = name;
+    rec.bytes = n;
+    rec.src_file = file;  // digest is taken after the timer stops
+    rec.src_off = off;
+    records.push_back(rec);
+
+    Pending p;
+    if (opt.no_compress) {
+      // BASELINE STARTS ON THE GPU, like every arm it is compared against.
+      //
+      // fs_bdev_transport.cc:328-334 starts the I/O timer BEFORE the
+      // device-to-host copy a device-resident blob implies -- its own
+      // comment calls that "the single D2H that terminates the device
+      // path". A compressed arm hands the bdev a DEVICE pointer and so pays
+      // that copy inside io_s; a Baseline that handed over a HOST buffer
+      // skipped it entirely and was credited a free payload-sized D2H.
+      // On a 40 GiB arm that is not a rounding error.
+      //
+      // So stage the chunk up and put the device pointer. The H2D itself is
+      // a REPLAY artifact -- an in-situ producer already has the data on the
+      // device -- so it is timed separately and reported for subtraction,
+      // exactly as the compressor's own h2d_ms is.
+      char *dev = nullptr;
+      p.dev_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
+          /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem, n,
+          &dev);
+      if (p.dev_alloc.IsNull() || dev == nullptr) {
+        std::cerr << "baseline: device staging failed for " << rec.name
+                  << " (" << n << " B)\n";
+        return false;
+      }
+      const auto h2d_t0 = std::chrono::steady_clock::now();
+      ctp::DeviceAwareMemcpy(dev, buf.ptr_, n);
+      baseline_h2d_s += std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - h2d_t0).count();
+      // AllocateAndRegisterGpuBackend's convention: off_ carries the raw
+      // device address, which IpcManager::ToFullPtr resolves for the process
+      // that minted the id (ipc_manager.h, "Case 4").
+      ctp::ipc::ShmPtr<void> dev_shm(p.dev_alloc,
+                                     reinterpret_cast<size_t>(dev));
+      p.put = cte_client->AsyncPutBlob(
+          tag_id, rec.name, 0, n, dev_shm, -1.0f,
+          clio::cte::core::Context(), 0, clio::run::PoolQuery::Local());
+    } else {
+      p.fut = compressor.AsyncDynamicSchedule(
+          clio::run::PoolQuery::Local(), tag_id, rec.name, 0, n,
+          buf.shm_.template Cast<void>(), -1.0f, ctx, 0, cte_client->pool_id_);
+    }
+    p.buf = buf;
+    p.record = records.size() - 1;
+    pending.push_back(std::move(p));
+    // Asynchronous submission: retire the oldest chunks until at most
+    // `inflight` remain outstanding, then submit the next one at once.
+    while (inflight > 0 && pending.size() > inflight) {
+      finish(pending.front());
+      pending.pop_front();
+    }
+    return true;
+  };
+
+  // --lookahead: write a complete group as one look-ahead blob when the
+  // trial says so, else send its chunks through submit_chunk as usual.
+  auto process_group = [&](const std::string &key,
+                           std::vector<neuropress_replay::StagedChunk> &g) -> bool {
+    std::vector<uint8_t> blob;
+    if (!stage->EncodeIfPays(g, &blob)) {
+      for (auto &c : g) {
+        if (!submit_chunk(c.frame + "/" + key, c.data.data(), c.data.size(),
+                          c.src, c.off)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    neuropress_replay::LookaheadRecord lr;
+    lr.name = "lookahead/" + key + "/" + g.front().frame + "-" + g.back().frame;
+    lr.chunk_bytes = g.front().data.size();
+    for (const auto &c : g) {
+      lr.src.push_back(c.src);
+      lr.off.push_back(c.off);
+    }
+    auto buf = CLIO_IPC->AllocateBuffer(blob.size());
+    if (buf.IsNull()) { std::cerr << "AllocateBuffer failed\n"; return false; }
+    std::memcpy(buf.ptr_, blob.data(), blob.size());
+    auto put = cte_client->AsyncPutBlob(
+        tag_id, lr.name, 0, blob.size(), buf.shm_.template Cast<void>(), -1.0f,
+        clio::cte::core::Context(), 0, clio::run::PoolQuery::Local());
+    put.Wait();
+    lr.ok = put->GetReturnCode() == 0;
+    lr.stored = blob.size();
+    CLIO_IPC->FreeBuffer(buf);
+    la_records.push_back(std::move(lr));
+    return true;
+  };
+
   // The workload starts here: read, stage+compress, then the final flush.
   const auto t_work = std::chrono::steady_clock::now();
   const double setup_s =
@@ -1036,68 +1169,18 @@ int main(int argc, char **argv) {
       const size_t n = std::min(chunk, sz - off);
       const char *src = data.data() + off;
 
-      auto buf = CLIO_IPC->AllocateBuffer(n);
-      if (buf.IsNull()) { std::cerr << "AllocateBuffer failed\n"; return 1; }
-      std::memcpy(buf.ptr_, src, n);
-
-      BlobRecord rec;
-      rec.name = frame + "/" + stem + "/chunk_" + std::to_string(ci);
-      rec.bytes = n;
-      rec.src_file = &f;  // digest is taken after the timer stops
-      rec.src_off = off;
-      records.push_back(rec);
-
-      Pending p;
-      if (opt.no_compress) {
-        // BASELINE STARTS ON THE GPU, like every arm it is compared against.
-        //
-        // fs_bdev_transport.cc:328-334 starts the I/O timer BEFORE the
-        // device-to-host copy a device-resident blob implies -- its own
-        // comment calls that "the single D2H that terminates the device
-        // path". A compressed arm hands the bdev a DEVICE pointer and so pays
-        // that copy inside io_s; a Baseline that handed over a HOST buffer
-        // skipped it entirely and was credited a free payload-sized D2H.
-        // On a 40 GiB arm that is not a rounding error.
-        //
-        // So stage the chunk up and put the device pointer. The H2D itself is
-        // a REPLAY artifact -- an in-situ producer already has the data on the
-        // device -- so it is timed separately and reported for subtraction,
-        // exactly as the compressor's own h2d_ms is.
-        char *dev = nullptr;
-        p.dev_alloc = CLIO_IPC->AllocateAndRegisterGpuBackend(
-            /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem, n,
-            &dev);
-        if (p.dev_alloc.IsNull() || dev == nullptr) {
-          std::cerr << "baseline: device staging failed for " << rec.name
-                    << " (" << n << " B)\n";
+      const std::string key = stem + "/chunk_" + std::to_string(ci);
+      if (stage) {
+        std::vector<neuropress_replay::StagedChunk> group;
+        neuropress_replay::StagedChunk c{frame, std::vector<char>(src, src + n),
+                                         &f, off};
+        if (stage->Add(key, std::move(c), &group) &&
+            !process_group(key, group)) {
           return 1;
         }
-        const auto h2d_t0 = std::chrono::steady_clock::now();
-        ctp::DeviceAwareMemcpy(dev, buf.ptr_, n);
-        baseline_h2d_s += std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - h2d_t0).count();
-        // AllocateAndRegisterGpuBackend's convention: off_ carries the raw
-        // device address, which IpcManager::ToFullPtr resolves for the process
-        // that minted the id (ipc_manager.h, "Case 4").
-        ctp::ipc::ShmPtr<void> dev_shm(p.dev_alloc,
-                                       reinterpret_cast<size_t>(dev));
-        p.put = cte_client->AsyncPutBlob(
-            tag_id, rec.name, 0, n, dev_shm, -1.0f,
-            clio::cte::core::Context(), 0, clio::run::PoolQuery::Local());
-      } else {
-        p.fut = compressor.AsyncDynamicSchedule(
-            clio::run::PoolQuery::Local(), tag_id, rec.name, 0, n,
-            buf.shm_.template Cast<void>(), -1.0f, ctx, 0, cte_client->pool_id_);
+        continue;
       }
-      p.buf = buf;
-      p.record = records.size() - 1;
-      pending.push_back(std::move(p));
-      // Asynchronous submission: retire the oldest chunks until at most
-      // `inflight` remain outstanding, then submit the next one at once.
-      while (inflight > 0 && pending.size() > inflight) {
-        finish(pending.front());
-        pending.pop_front();
-      }
+      if (!submit_chunk(frame + "/" + key, src, n, &f, off)) return 1;
     }
     // Drain per file: the staging buffers of a 4 MiB-chunked 8 MiB file are
     // cheap, but a whole run's worth is not, and the exploration modes make
@@ -1107,7 +1190,17 @@ int main(int argc, char **argv) {
     stage_s += std::chrono::duration<double>(
                    std::chrono::steady_clock::now() - t1).count();
   }
+  // Groups shorter than N at the end of the run, and the last submissions,
+  // are stage+compress work too.
+  const auto t_tail = std::chrono::steady_clock::now();
+  if (stage) {
+    for (auto &kv : stage->TakeRemaining()) {
+      if (!process_group(kv.first, kv.second)) return 1;
+    }
+  }
   drain();
+  stage_s += std::chrono::duration<double>(
+                 std::chrono::steady_clock::now() - t_tail).count();
 
   // CLIO_REPLAY_FINAL_FLUSH=1: move volatile blobs to a durable tier, inside
   // `total`. The fdatasync below then makes the bytes durable, also inside
@@ -1169,6 +1262,27 @@ int main(int argc, char **argv) {
                            : ctp::CompressionFactory::NameForWireId(lib))
               << " : " << n
               << " chunk(s)\n";
+  size_t la_in = 0, la_out = 0, la_failed = 0;
+  if (stage) {
+    for (const auto &r : la_records) {
+      if (!r.ok) { ++la_failed; continue; }
+      la_in += r.chunk_bytes * r.src.size();
+      la_out += r.stored;
+    }
+    std::cout << "  look-ahead: " << la_records.size() - la_failed
+              << " group(s), " << la_in << " B -> " << la_out << " B  ("
+              << (la_out ? double(la_in) / double(la_out) : 0.0)
+              << "x), failed " << la_failed << "; trial bytes spatial "
+              << stage->trial_spatial_bytes_ << " vs look-ahead "
+              << stage->trial_lookahead_bytes_ << "\n  all data: "
+              << in_total + la_in << " B -> " << stored_total + la_out
+              << " B  (stored ratio "
+              << (stored_total + la_out
+                      ? double(in_total + la_in) / double(stored_total + la_out)
+                      : 0.0)
+              << ")\n";
+    if (la_failed) failed += la_failed;
+  }
   // THE MEASURED WINDOW, in the same steady-clock nanoseconds the bdev's I/O
   // log stamps its writes with (io_log.h's Now()). Without it the harness can
   // only union whatever intervals the log holds, including any that ran before
@@ -1298,7 +1412,34 @@ int main(int argc, char **argv) {
   // is what populates the counters, and independently of it: under --check-bound
   // verify_records only fails on a decompress error, so without this a run
   // whose data came back outside the bound would exit 0.
-  if (opt.verify && !report_bound()) rc = 1;
+  // Under --lookahead every chunk may have gone into a group blob, leaving
+  // nothing for the per-chunk report: zero checked is not a failure then.
+  if (opt.verify && !(stage && records.empty()) && !report_bound()) rc = 1;
+  if (stage && opt.verify) {
+    // Every look-ahead group read back from the tier, decoded, and checked
+    // element-wise against its source files (untimed).
+    double worst = 0.0;
+    size_t bad = 0;
+    for (const auto &r : la_records) {
+      auto buf = CLIO_IPC->AllocateBuffer(r.stored);
+      auto get = cte_client->AsyncGetBlob(tag_id, r.name, 0, r.stored, 0,
+                                          buf.shm_.template Cast<void>(),
+                                          clio::run::PoolQuery::Local());
+      get.Wait();
+      double w = -1.0;
+      if (get->GetReturnCode() == 0) {
+        std::vector<uint8_t> blob(buf.ptr_, buf.ptr_ + r.stored);
+        w = stage->Check(blob, r);
+      }
+      CLIO_IPC->FreeBuffer(buf);
+      if (w < 0.0 || w > 1.0) ++bad;
+      worst = std::max(worst, w);
+    }
+    std::cout << (bad ? "LOOKAHEAD BOUND FAILED: " : "LOOKAHEAD BOUND OK: ")
+              << la_records.size() << " group(s), worst |err|/eb " << worst
+              << ", " << bad << " bad" << std::endl;
+    if (bad) rc = 1;
+  }
 
   clio::run::CLIO_RUNTIME_FINALIZE();
   return rc;

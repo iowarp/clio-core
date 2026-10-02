@@ -18,6 +18,7 @@ endif()
 
 message(STATUS "NeuroPress field replay example: enabled")
 
+find_package(CUDAToolkit REQUIRED)
 add_executable(neuropress_field_replay neuropress_field_replay.cc)
 
 target_link_libraries(neuropress_field_replay
@@ -29,6 +30,10 @@ target_link_libraries(neuropress_field_replay
   clio::run::bdev_runtime
   clio::run::bdev_client
   ctp::cxx
+  # --lookahead (lookahead_stage.h): ctp::LookaheadCodec with cuSZp anchors
+  # and the nvcomp packer, plus the temporal kernels in compress_model.
+  ctp::compress
+  CUDA::cudart
   ${CMAKE_THREAD_LIBS_INIT}
 )
 
