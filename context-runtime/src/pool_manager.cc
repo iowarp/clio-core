@@ -706,6 +706,35 @@ void PoolManager::InitAddressMap(PoolId pool_id, u32 num_containers) {
   HLOG(kDebug, "=== Address Map Complete ===");
 }
 
+bool PoolManager::RegisterRemotePool(PoolId pool_id,
+                                     const std::string& pool_name,
+                                     const std::string& chimod_name,
+                                     const std::string& chimod_params,
+                                     u32 num_containers) {
+  if (!is_initialized_ || pool_id.IsNull()) {
+    return false;
+  }
+  {
+    // Insert-if-absent under the write lock: a pool this node created (or
+    // already learned) keeps its metadata and containers untouched.
+    // The address map is the same ContainerId == NodeId mapping that
+    // InitAddressMap builds for every pool (issue #856).
+    PoolMetaWriteLock lock(pool_metadata_mutex_);
+    if (pool_metadata_.find(pool_id) == pool_metadata_.end()) {
+      PoolInfo info(pool_id, pool_name, chimod_name, chimod_params,
+                    num_containers);
+      for (u32 c = 0; c < num_containers; ++c) {
+        info.address_map_[c] = c;
+      }
+      pool_metadata_[pool_id] = std::move(info);
+      HLOG(kDebug,
+           "PoolManager: registered remote pool '{}' {} ({}) for routing",
+           pool_name, pool_id, chimod_name);
+    }
+  }
+  return EnsureStaticContainer(pool_id).IsValid();
+}
+
 TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {

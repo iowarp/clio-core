@@ -284,7 +284,13 @@ compose:
 
     # Target management ----------------------------------------------------
     targets:
-      neighborhood: 1                   # Storage nodes CTE can buffer to
+      # Storage nodes CTE can buffer to: each node registers the devices of
+      # itself and the next (neighborhood - 1) nodes (wrapping). Only
+      # persistent tiers ("file", object stores, attached existing pools) span
+      # the neighborhood; memory tiers ("ram", "hbm", "pinned") are always
+      # node-local, since a neighbor's RAM gives neither locality nor
+      # durability. Range: 1-1024, capped at the node count. Default: 1.
+      neighborhood: 1
       default_target_timeout_ms: 30000   # Timeout for target operations (ms)
       poll_period_ms: 5000               # Target statistics re-scan interval (ms)
       # While a blob's owner node is dead, route it to the first live

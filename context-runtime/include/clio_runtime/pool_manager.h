@@ -296,6 +296,33 @@ class PoolManager {
   void InitAddressMap(PoolId pool_id, u32 num_containers);
 
   /**
+   * Make a pool that lives on OTHER nodes routable from this one, without
+   * creating a container here.
+   *
+   * A pool composed on a single node (e.g. a per-node bdev created with
+   * PoolQuery::Physical) has metadata only on that node. Any other node that
+   * submits a task to it needs the pool's static container (to serialize the
+   * task) and its address map (to resolve DirectHash/Physical routing); without
+   * them SendIn drops the task and its waiter hangs. This installs exactly
+   * those two things: metadata, a ContainerId == NodeId address map, and the
+   * static container. No module Create runs and no task executes here.
+   *
+   * Does nothing if this node already knows the pool (a real local pool is
+   * never overwritten).
+   *
+   * @param pool_id Pool identifier of the remote pool
+   * @param pool_name Pool name (as created on the owning node)
+   * @param chimod_name ChiMod library name the pool was created with
+   * @param chimod_params Serialized ChiMod create parameters
+   * @param num_containers Number of containers in the pool's address map
+   * @return true if the pool is routable from this node afterwards
+   */
+  bool RegisterRemotePool(PoolId pool_id, const std::string& pool_name,
+                          const std::string& chimod_name,
+                          const std::string& chimod_params,
+                          u32 num_containers);
+
+  /**
    * Create or get a complete pool with get-or-create semantics
    * Extracts all parameters from the task (chimod_name, pool_name, chimod_params)
    * This is a coroutine that can co_await nested Create methods
