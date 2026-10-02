@@ -88,6 +88,32 @@ compose:
     return path
 
 
+READY_MARK = "CTE Core container created and initialized"
+
+
+def wait_for_daemon(log_path: str, daemon, timeout: float = 90.0) -> None:
+    """Block until the daemon has composed its CTE pool.
+
+    Connecting straight after spawning races startup: on macOS clio_init
+    does not retry a not-yet-bound Unix socket, and a client that attaches
+    before the compose finishes finds no storage targets (PutBlob rc=11).
+    The daemon logs READY_MARK once the CTE container is up.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if daemon.poll() is not None:
+            raise RuntimeError(f"daemon exited early (rc={daemon.returncode})")
+        try:
+            with open(log_path, errors="replace") as f:
+                if READY_MARK in f.read():
+                    time.sleep(0.5)  # let the compose task reply
+                    return
+        except OSError:
+            pass
+        time.sleep(0.2)
+    raise RuntimeError("daemon did not come up; see " + log_path)
+
+
 def find_clio_run(bin_dir: str) -> str:
     """Locate the clio_run executable next to the module."""
     for name in ("clio_run.exe", "clio_run"):
@@ -147,11 +173,13 @@ def main() -> int:
     # Import only after the environment is final: a module linked against a
     # different C runtime snapshots the environment when it loads.
     import clio_cte_core_ext as cte
+    daemon_log = cfg + ".daemon.log"
+    log_f = open(daemon_log, "w")
     daemon = subprocess.Popen([find_clio_run(bin_dir), "start"], env=env,
-                              stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL)
+                              stdout=log_f, stderr=subprocess.STDOUT)
     failures = []
     try:
+        wait_for_daemon(daemon_log, daemon)
         assert cte.clio_init(cte.RuntimeMode.kClient, False), "clio_init"
         assert cte.initialize_cte(cfg, cte.PoolQuery.Dynamic()), "init cte"
         client = cte.get_cte_client()
@@ -224,6 +252,8 @@ def main() -> int:
         check(fut.wait(10.0) == 0, "wait() completes once resumed", failures)
 
         # 3b. wait(max_sec) against a dead daemon.
+        # Freeze it first so the request cannot complete before the kill.
+        proc.suspend()
         fut = client.AsyncGetContainedBlobs(tid)
         proc.kill()
         daemon.wait(10)
@@ -250,10 +280,12 @@ def main() -> int:
     finally:
         if daemon.poll() is None:
             daemon.kill()
-        try:
-            os.remove(cfg)
-        except OSError:
-            pass
+        log_f.close()
+        for path in (cfg, daemon_log):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     print("RESULT:", "FAIL" if failures else "OK", flush=True)
     sys.stdout.flush()
     # The client still holds a connection to a daemon this test killed;
