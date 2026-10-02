@@ -388,14 +388,28 @@ set(CTEST_DROP_SITE_CDASH TRUE)
 set(CTEST_COVERAGE_COMMAND "gcov")
 ${CDASH_SCOPE_BLOCK}
 ctest_start("Experimental")
-ctest_test(RETURN_VALUE test_result ${CTEST_TEST_SELECT})
+ctest_test(RETURN_VALUE test_result ${CTEST_TEST_SELECT} REPEAT UNTIL_PASS:3)
+file(WRITE "${BUILD_DIR}/ctest_result.txt" "\${test_result}")
 ctest_coverage()
 ctest_submit()
 if(NOT test_result EQUAL 0)
   message("Some tests failed (exit code: \${test_result})")
 endif()
 EOFCMAKE
+        # ctest -S exits 0 even when tests fail, so the dashboard script
+        # records ctest_test's result in ctest_result.txt. Coverage and the
+        # CDash submission still run; the failure is reported when this script
+        # exits. A missing result file means the dashboard run itself broke,
+        # which counts as a failure too.
+        rm -f "${BUILD_DIR}/ctest_result.txt"
         ctest -S "${BUILD_DIR}/cdash_coverage.cmake" -VV || true
+        CTEST_EXIT_CODE=$(cat "${BUILD_DIR}/ctest_result.txt" 2>/dev/null || echo 1)
+        if [ "${CTEST_EXIT_CODE}" = "0" ]; then
+            print_success "All CTest tests passed"
+        else
+            print_error "Some CTest tests failed (ctest_test result: ${CTEST_EXIT_CODE})"
+            print_warning "Continuing with coverage generation; the job fails at the end"
+        fi
         print_success "CDash submission complete"
     else
         CTEST_EXIT_CODE=0
@@ -415,7 +429,7 @@ EOFCMAKE
             print_success "All CTest tests passed"
         else
             print_error "Some CTest tests failed (exit code: $CTEST_EXIT_CODE)"
-            print_warning "Continuing with coverage generation..."
+            print_warning "Continuing with coverage generation; the job fails at the end"
         fi
     fi
 
@@ -762,5 +776,14 @@ echo "  google-chrome ${BUILD_DIR}/coverage_report/index.html"
 echo ""
 
 print_success "All coverage analysis complete!"
+
+# Test failures used to end here with exit 0: the CDash path ran ctest through
+# `ctest -S ... || true` and the plain path only printed a warning, so every
+# Linux build-test leg reported success no matter what its tests did. Report
+# them now that coverage is generated.
+if [ "${CTEST_EXIT_CODE:-0}" != "0" ]; then
+    print_error "CTest reported failures (result: ${CTEST_EXIT_CODE}); see the test log above"
+    exit 1
+fi
 
 exit 0
