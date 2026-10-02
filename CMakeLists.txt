@@ -893,18 +893,47 @@ if(CLIO_ENABLE_GOOGLE_CLOUD)
   message(STATUS "Google Cloud Storage bdev support: ENABLED (Poco found)")
 endif()
 
+# The S3 adapter (kS3 bdev transport) signs requests itself and talks to S3
+# over HTTPS via Poco -- it does NOT link the AWS SDK, which corrupts runtime
+# init when loaded into a CLIO_INIT-ing process. Same auto-disable treatment as
+# the GCS adapter above. (CAE_ENABLE_S3 below is a different feature that
+# happens to share the word "S3": it gates the CAE assimilator, which DOES use
+# the SDK, out-of-process via cae_s3_tool.)
+if(CLIO_ENABLE_AMAZON_DRIVE AND NOT Poco_FOUND)
+  message(WARNING "CLIO_ENABLE_AMAZON_DRIVE is ON but the Poco library "
+                  "(Net, NetSSL, Crypto components) was not found. "
+                  "S3 bdev support will be disabled. "
+                  "Install Poco (libpoco-dev) to enable it.")
+  set(CLIO_ENABLE_AMAZON_DRIVE OFF)
+endif()
+if(CLIO_ENABLE_AMAZON_DRIVE)
+  message(STATUS "Amazon S3 bdev support: ENABLED (Poco found)")
+endif()
+
 # AWS SDK for C++ (optional - for the CAE S3 assimilator, s3://). Reuses the
 # same dependency the bdev S3 transport links (aws-cpp-sdk-s3/-core). If the
 # option is requested but the SDK isn't found, warn and disable rather than
 # fail the configure (mirrors the CAE Globus dependency check).
 if(CAE_ENABLE_S3)
+  # CAE S3 now needs BOTH: Poco for the in-process assimilator read path
+  # (s3_rest.h, Poco + SigV4 -- the AWS SDK must never load into the runtime),
+  # and the AWS SDK for the out-of-process cae_s3_tool helper (still used by the
+  # write-bench raw-PUT floor, the read-bench raw-GET floor, and test seeding).
   find_package(AWSSDK COMPONENTS s3 QUIET)
-  if(AWSSDK_FOUND)
-    message(STATUS "found AWS SDK for C++ (CAE S3 support: ENABLED)")
+  if(AWSSDK_FOUND AND Poco_FOUND)
+    message(STATUS "found AWS SDK + Poco (CAE S3 support: ENABLED)")
   else()
-    message(WARNING "CAE_ENABLE_S3 is ON but the AWS SDK for C++ (component s3) "
-                    "was not found. S3 import will be disabled. "
-                    "Install aws-sdk-cpp to enable it.")
+    if(NOT AWSSDK_FOUND)
+      message(WARNING "CAE_ENABLE_S3 is ON but the AWS SDK for C++ (component "
+                      "s3) was not found (needed for cae_s3_tool). Install "
+                      "aws-sdk-cpp to enable it.")
+    endif()
+    if(NOT Poco_FOUND)
+      message(WARNING "CAE_ENABLE_S3 is ON but Poco (Net, NetSSL, Crypto) was "
+                      "not found (needed for the in-process s3:// read path). "
+                      "Install Poco (libpoco-dev) to enable it.")
+    endif()
+    message(WARNING "S3 import will be disabled.")
     set(CAE_ENABLE_S3 OFF)
   endif()
 endif()
@@ -922,6 +951,21 @@ if(CAE_ENABLE_GCS)
                     "Install google-cloud-cpp to enable it.")
     set(CAE_ENABLE_GCS OFF)
   endif()
+endif()
+
+# The header-only S3 REST client (Poco::Net + SigV4, s3_rest.h) is shared by two
+# unrelated consumers: the kS3 bdev tier (CLIO_ENABLE_AMAZON_DRIVE) and the CAE
+# s3:// assimilator's in-process read path (CAE_ENABLE_S3). Both need Poco. The
+# header's own #ifdef therefore keys off this derived capability flag rather than
+# either feature flag, so it compiles whenever *either* consumer is on. Defined
+# globally (before any add_subdirectory) so it reaches every module and test TU
+# that includes s3_rest.h -- the bdev module, the CAE runtime, and their tests.
+# NOTE: the AWS SDK stays out of the runtime regardless; s3_rest.h links only
+# Poco. CAE_ENABLE_S3 still separately builds the out-of-process cae_s3_tool,
+# which is the only target that links the SDK.
+if((CLIO_ENABLE_AMAZON_DRIVE OR CAE_ENABLE_S3) AND Poco_FOUND)
+  add_compile_definitions(CLIO_ENABLE_S3_REST)
+  message(STATUS "S3 REST client (Poco+SigV4): ENABLED")
 endif()
 
 if (CLIO_CTE_ENABLE_ADIOS2_ADAPTER OR CLIO_CORE_ENABLE_GRAY_SCOTT)

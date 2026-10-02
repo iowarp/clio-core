@@ -72,6 +72,13 @@ class ClioRuntime(Service):
                 'default': 9413
             },
             {
+                'name': 'forward_env',
+                'msg': 'Env var names to copy from the submitting shell into '
+                       'the runtime daemon environment',
+                'type': list,
+                'default': [],
+            },
+            {
                 'name': 'ipc_mode',
                 'msg': 'IPC transport mode for client-server communication',
                 'type': str,
@@ -84,6 +91,14 @@ class ClioRuntime(Service):
                 'type': str,
                 'choices': ['debug', 'info', 'warning', 'error'],
                 'default': 'info'
+            },
+            {
+                'name': 'strict_response_identity',
+                'msg': ('Reject a client response whose echoed task identity '
+                        'does not match the future waiting at its net_key, '
+                        'instead of only logging it (#968).'),
+                'type': bool,
+                'default': False
             },
             {
                 'name': 'queue_depth',
@@ -232,11 +247,83 @@ class ClioRuntime(Service):
         self.setenv('CLIO_SERVER_CONF', self.config_file)
         self.setenv('CTP_LOG_LEVEL', self.config['log_level'])
         self.setenv('CLIO_IPC_MODE', self.config['ipc_mode'].upper())
+        # #968: the identity check is read from the environment by the CLIENT's
+        # recv thread, not from the daemon's config file, so it has to be set
+        # here rather than only emitted into clio_config.yaml.
+        self.setenv('CLIO_STRICT_RESPONSE_IDENTITY',
+                    '1' if self.config['strict_response_identity'] else '0')
+        self._forward_env()
 
         self._generate_config()
 
         self.log(f"IOWarp runtime configured")
         self.log(f"  Config file: {self.config_file}")
+
+    def _forward_env(self):
+        """
+        Copy selected variables from the submitting shell into the runtime's
+        environment.
+
+        WHY THIS EXISTS. Jarvis does not hand the job script's environment to
+        the daemon: start() launches it as
+        `PsshExecInfo(env=self.env, ...)`, and self.env is the curated dict
+        jarvis builds (`Auto-built environment with N variables` in the job
+        log). That dict is a copy of whichever names in
+        `EnvironmentManager.COMMON_ENV_VARS` exist in the submitting shell --
+        a fixed toolchain list (PATH, LD_LIBRARY_PATH, HOME, CC, ...) with no
+        AWS_* entry and no way to add one. Exporting a variable in the
+        pipeline's pre_cmds therefore reaches jarvis itself and every
+        benchmark process, but NOT clio_run.
+
+        That distinction is invisible until something inside the daemon needs
+        an env var. The S3 bdev does: its SigV4 signer reads
+        AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from the environment only
+        (it has no profile support), and the signing happens in a runtime
+        worker. Without forwarding, bdev Init fails, CTE registers no target,
+        and every subsequent PutBlob returns rc=11 from a different process
+        than the one that logged the cause.
+
+        Names only are logged -- never values, which are credentials here.
+        A name that is unset in the submitting shell is skipped silently, so a
+        pipeline may list optional variables (AWS_SESSION_TOKEN) unconditionally.
+
+        Raises:
+            ValueError: if a value contains a character the transport would
+                mangle. SshExec._build_remote_command emits each variable as
+                an inline `KEY="value"` prefix and escapes ONLY the double
+                quote, so $, backtick and backslash are still interpreted by
+                the remote shell. AWS keys are base64 (A-Za-z0-9+/=) and never
+                contain those, so hitting this means something is wrong --
+                and the alternative is a silently corrupted credential that
+                comes back as an indistinguishable HTTP 403.
+        """
+        names = self.config.get('forward_env') or []
+        if isinstance(names, str):
+            names = [names]
+        forwarded, missing = [], []
+        for name in names:
+            name = str(name).strip()
+            if not name:
+                continue
+            value = os.environ.get(name)
+            if value is None or value == '':
+                missing.append(name)
+                continue
+            bad = [ch for ch in ('$', '`', '\\', '\n', '\r') if ch in value]
+            if bad:
+                raise ValueError(
+                    f'{name} cannot be forwarded to the runtime: its value '
+                    f'contains {bad!r}, which the ssh transport quotes but '
+                    f'does not escape, so the daemon would receive a '
+                    f'different value than the one set here. Regenerate the '
+                    f'credential or pass it another way.')
+            self.setenv(name, value)
+            forwarded.append(name)
+        if forwarded:
+            self.log(f"  Forwarded env to runtime: {', '.join(forwarded)}")
+        if missing:
+            self.log(f"  Not set in the submitting shell, skipped: "
+                     f"{', '.join(missing)}")
 
     def _generate_config(self):
         if self.config['main_segment_size'] == 'auto':
@@ -382,8 +469,32 @@ class ClioRuntime(Service):
                 pass
             time.sleep(1)
         else:
-            self.log(f'WARNING: Runtime did not respond on {host}:{port} after 30s',
-                     color=Color.RED)
+            # Hard failure, not a warning. Continuing here used to log
+            # "IOWarp runtime started" for a runtime that does not exist; the
+            # sweep then ran on to the next package, which died ~150 log lines
+            # later with `IpcManager::ClientInit: Failed to create IPC
+            # transport: ... failed to connect to /tmp/clio_<user>/clio_<port>
+            # .ipc` and got blamed on the benchmark (observed: job 23911 run2).
+            # Raising attributes the failure to the runtime, where it belongs.
+            #
+            # The cause to check first is a STALE hostfile: the per-run copy at
+            # <pipeline_shared_dir>/hostfile is preferred over self.hostfile
+            # whenever it exists (see _generate_config) and nothing invalidates
+            # it across jobs, so a run directory left over from an earlier
+            # allocation still names that allocation's node. pssh to it then
+            # fails with `Access denied by pam_slurm_adopt: you have no active
+            # jobs on this node`, no daemon is ever launched on the node the
+            # benchmark actually runs on, and the hostfile's node is not in
+            # $SLURM_JOB_NODELIST. Fix by removing the stale run directories.
+            nodelist = os.environ.get('SLURM_JOB_NODELIST', '')
+            hint = ''
+            if nodelist and host not in nodelist:
+                hint = (f" -- host is NOT in SLURM_JOB_NODELIST ({nodelist}): "
+                        f"the hostfile is stale, left over from an earlier "
+                        f"allocation. Remove the pipeline's per-run shared "
+                        f"directories and resubmit.")
+            raise ValueError(
+                f'Runtime did not respond on {host}:{port} after 30s{hint}')
 
         self.log("IOWarp runtime started")
 
