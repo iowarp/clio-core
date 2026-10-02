@@ -677,6 +677,37 @@ void Runtime::MirrorBlobToShm(const std::string &composite_key,
   shm_cache_.PutBlob(composite_key, rec);
 }
 
+/**
+ * Whether reads served from a non-primary copy are traced
+ * (CLIO_TRACE_COPY_READS=1; diagnosis of #1131).
+ * @return true when tracing is on
+ */
+static bool TraceCopyReadsEnv() {
+  static const bool v = [] {
+    const char *e = std::getenv("CLIO_TRACE_COPY_READS");
+    return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
+
+void Runtime::TraceCopyRead(const TagId &tag_id, const std::string &blob_name,
+                            int replica_sel,
+                            const clio::run::priv::vector<BlobBlock> &blocks,
+                            clio::run::u64 offset, clio::run::u64 size,
+                            size_t declared_size) {
+  // Which copy served a read, and from where: a FOREIGN block found by a
+  // test is matched to the copy (and extents) that produced it (#1131).
+  std::string layout;
+  for (size_t i = 0; i < blocks.size() && i < 32; ++i) {
+    layout += std::to_string(blocks[i].bdev_client_.pool_id_.major_) + ":" +
+              std::to_string(blocks[i].target_offset_) + "+" +
+              std::to_string(blocks[i].size_) + " ";
+  }
+  HLOG(kWarning, "[copy-read] tag={}.{} blob={} replica={} off={} len={} "
+       "declared={} blocks=[{}]", tag_id.major_, tag_id.minor_, blob_name,
+       replica_sel, offset, size, declared_size, layout);
+}
+
 void Runtime::WithdrawBlobMirror(const TagId &tag_id,
                                  const std::string &blob_name) {
   shm_cache_.EraseBlob(std::to_string(tag_id.major_) + "." +
@@ -3361,6 +3392,10 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         replica_sel > 0
             ? blob_info_ptr->GetReplica(replica_sel, false)->total_size_cache_
             : blob_info_ptr->GetTotalSize();
+    if (replica_sel > 0 && TraceCopyReadsEnv()) {
+      TraceCopyRead(tag_id, blob_name, replica_sel, blocks_snapshot, offset,
+                    size, declared_size);
+    }
 
     // Step 2: Read data from blob blocks (no lock held during I/O).
     // In emulation mode (issue #747) the read is skipped entirely — the

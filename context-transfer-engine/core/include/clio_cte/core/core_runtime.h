@@ -742,6 +742,23 @@ private:
    */
   void WithdrawBlobMirror(const TagId &tag_id, const std::string &blob_name);
 
+  /**
+   * Log a read served from a non-primary copy (CLIO_TRACE_COPY_READS=1):
+   * the copy index and the extents it read (#1131 diagnosis).
+   * @param tag_id the blob's tag
+   * @param blob_name the blob's name
+   * @param replica_sel the copy served (> 0: a replica slot)
+   * @param blocks that copy's block list
+   * @param offset read offset
+   * @param size read length
+   * @param declared_size the copy's declared size
+   */
+  void TraceCopyRead(const TagId &tag_id, const std::string &blob_name,
+                     int replica_sel,
+                     const clio::run::priv::vector<BlobBlock> &blocks,
+                     clio::run::u64 offset, clio::run::u64 size,
+                     size_t declared_size);
+
   // Atomic counters for thread-safe ID generation
   std::atomic<clio::run::u32>
       next_tag_id_minor_; // Minor counter for TagId UniqueId generation
