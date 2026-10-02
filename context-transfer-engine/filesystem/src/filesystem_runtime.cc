@@ -184,7 +184,16 @@ inline std::vector<std::pair<std::string, std::string>> DeserializeXattrs(
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  FilesystemConfig cfg = task->GetParams();
+  // The task is NOT a CreateTask, whatever the parameter says. The generated
+  // dispatch reinterprets whatever create task the runtime is holding into
+  // this ChiMod's instantiation, and what it is actually holding depends on
+  // who asked for the pool -- compose builds ComposeTask<PoolConfig>, a direct
+  // caller builds its own. All of them ARE a CreatePoolFields, so reads go
+  // through that; the config type is named at the call instead of being baked
+  // into the object's type. Touching the task through `task` itself would be
+  // undefined behaviour, which is what UBSan reports here.
+  auto &fields = task.template Cast<clio::run::admin::CreatePoolFields>();
+  FilesystemConfig cfg = fields->GetParamsAs<FilesystemConfig>();
   next_pool_id_ = cfg.next_pool_id_;
   if (!next_pool_id_.IsNull()) {
     cte_ = clio::cte::core::Client(next_pool_id_);
@@ -192,7 +201,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // Bind a client to our own pool for self-submitted pipeline tasks. Use the
   // assigned pool id from the CreateTask (pool_id_ isn't reliable yet here),
   // matching how the CTE core initializes its self-client.
-  self_.Init(task->new_pool_id_);
+  self_.Init(fields->new_pool_id_);
 
   // Resolve the global append-staging tag (shared by all files). Append data
   // blobs live here, so they don't inflate any file's GetTagSize. Flat tag
@@ -240,7 +249,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
         capacity = static_cast<size_t>(v);
       }
     }
-    if (shm_fs_cache_.Create(capacity, task->new_pool_id_)) {
+    if (shm_fs_cache_.Create(capacity, fields->new_pool_id_)) {
       HLOG(kInfo,
            "filesystem: shared-memory attribute cache enabled (files={}, "
            "root_off={})",
@@ -257,7 +266,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // The root of a fresh mount is COMPLETE: nothing exists yet, and every
   // later top-level name goes through handlers that keep the mirror honest.
   MirrorDir("/", clio::cte::core::TagId::GetNull(), /*complete=*/true);
-  task->return_code_ = 0;
+  fields->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
