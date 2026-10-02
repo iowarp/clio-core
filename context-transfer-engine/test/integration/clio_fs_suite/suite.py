@@ -163,6 +163,7 @@ def load_tests():
   import tests_dirs  # noqa: F401
   import tests_capacity  # noqa: F401
   import tests_stress  # noqa: F401
+  import tests_safe  # noqa: F401
 
 
 def slurm_hosts():
@@ -279,7 +280,7 @@ def main():
   ap.add_argument('--skip', default='')
   ap.add_argument('--profile', default='persistent',
                   choices=['persistent', 'persistent_norepl', 'ram',
-                           'tiered'],
+                           'tiered', 'safe'],
                   help='persistent_norepl: disk tier + WALs but no '
                        'replication chimod and no periodic data flush, so '
                        'only fsync itself moves data off the RAM tier')

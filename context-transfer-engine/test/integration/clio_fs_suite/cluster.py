@@ -120,6 +120,14 @@ class AgentConn:
       self.p.kill()
 
 
+# Profile 'safe': each node's slow tier is a safe_bdev array of SAFE_MEMBERS
+# file bdevs, the last SAFE_PARITY of them parity (max_failures).
+SAFE_MEMBERS = 6
+SAFE_PARITY = 2
+SAFE_POOL_ID = '7100.0'
+SAFE_MEMBER_POOL_MAJOR = 7101  # members are 7101.0 .. 7106.0
+
+
 class Cluster:
   """Owns the daemons, mounts and agents of an N-node clio-fs deployment."""
 
@@ -205,13 +213,62 @@ class Cluster:
   def env_prefix(self):
     return ' '.join(f'{k}={shlex.quote(v)}' for k, v in self.env().items())
 
+  def safe_member_path(self, k):
+    """Backing file of safe_bdev member k (0-based) on every node.
+    Disk death is injected by creating `<path>.fail` (see kill_disk)."""
+    return f'{self.local_root}/data/safe_m{k}.dat'
+
+  def safe_compose(self):
+    """Compose entries for profile 'safe' (empty otherwise): SAFE_MEMBERS
+    file bdevs and the safe_bdev array over them, node-local on every node,
+    each with an allocation log so a restart recovers its state."""
+    if self.profile != 'safe':
+      return ''
+    lr = self.local_root
+    per_member_gb = max(1, -(-self.disk_gb // (SAFE_MEMBERS - SAFE_PARITY)))
+    out = ''
+    members = ''
+    for k in range(SAFE_MEMBERS):
+      pid = SAFE_MEMBER_POOL_MAJOR + k
+      out += (f'  - mod_name: clio_bdev\n'
+              f'    pool_name: "{self.safe_member_path(k)}"\n'
+              f'    pool_query: local\n'
+              f'    pool_id: "{pid}.0"\n'
+              f'    bdev_type: file\n'
+              f'    capacity: "{per_member_gb}GB"\n'
+              f'    alloc_log: "{lr}/data/safe_m{k}.alog"\n')
+      parity = 'true' if k >= SAFE_MEMBERS - SAFE_PARITY else 'false'
+      members += (f'      - pool_name: "{self.safe_member_path(k)}"\n'
+                  f'        pool_id_major: {pid}\n'
+                  f'        node_id: 0\n'
+                  f'        parity: {parity}\n')
+    out += (f'  - mod_name: clio_safe_bdev\n'
+            f'    pool_name: "{lr}/data/safe_array"\n'
+            f'    pool_query: local\n'
+            f'    pool_id: "{SAFE_POOL_ID}"\n'
+            f'    max_failures: {SAFE_PARITY}\n'
+            f'    alloc_log: "{lr}/data/safe_array.alog"\n'
+            f'    members:\n' + members)
+    return out
+
+  def kill_disk(self, host, k):
+    """Make safe_bdev member k on `host` fail every I/O from now on (the file
+    bdev's test fault injection), as a disk dying under load would."""
+    return sh(host, f'touch {self.safe_member_path(k)}.fail', timeout=30)
+
+  def revive_disk(self, host, k):
+    """Undo kill_disk: the member's device answers again."""
+    return sh(host, f'rm -f {self.safe_member_path(k)}.fail', timeout=30)
+
   def write_config(self):
     """Generate the hostfile and the server config (with compose)."""
     with open(self.hostfile, 'w') as f:
       for h in self.hosts:
         f.write(f'{h}{self.net_suffix}\n')
     lr = self.local_root
-    tiered = self.profile == 'tiered'
+    # 'safe' is the tiered profile whose slow tier is a safe_bdev array of
+    # SAFE_MEMBERS file bdevs (SAFE_PARITY of them parity) on each node.
+    tiered = self.profile in ('tiered', 'safe')
     ram_cap = f'{self.ram_mb}MB' if tiered else f'{self.ram_gb}GB'
     storage = [
         f'      - path: "ram::clio_fs_ram"\n'
@@ -230,13 +287,21 @@ class Cluster:
           f'        capacity_limit: "{self.fast_mb}MB"\n'
           f'        score: 0.6\n'
           f'        persistence_level: "temporary"\n')
-    if self.profile in ('persistent', 'persistent_norepl', 'tiered'):
+    if self.profile == 'safe':
       storage.append(
-          f'      - path: "{lr}/data/cte_disk_tier.dat"\n'
-          f'        bdev_type: "file"\n'
+          f'      - path: "{lr}/data/safe_array"\n'
+          f'        existing_pool_id: "{SAFE_POOL_ID}"\n'
+          f'        existing_pool_module: "clio_safe_bdev"\n'
           f'        capacity_limit: "{self.disk_gb}GB"\n'
-          f'        score: 0.2\n'
-          f'        persistence_level: "temporary"\n')
+          f'        score: 0.2\n')
+    if self.profile in ('persistent', 'persistent_norepl', 'tiered', 'safe'):
+      if self.profile != 'safe':
+        storage.append(
+            f'      - path: "{lr}/data/cte_disk_tier.dat"\n'
+            f'        bdev_type: "file"\n'
+            f'        capacity_limit: "{self.disk_gb}GB"\n'
+            f'        score: 0.2\n'
+            f'        persistence_level: "temporary"\n')
       perf = (f'    performance:\n'
               f'      metadata_log_path: "{lr}/data/cte_metadata_log"\n'
               f'      transaction_log_capacity: "256MB"\n')
@@ -255,7 +320,7 @@ class Cluster:
       perf += '      flush_data_period_ms: 2000\n'
       organizer = (f'    organizer: "{self.organizer}"\n'
                    f'    organizer_period_ms: {self.organizer_period_ms}\n')
-    if self.profile in ('persistent', 'tiered'):
+    if self.profile in ('persistent', 'tiered', 'safe'):
       chain = ('  - mod_name: clio_cte_replication\n'
                '    pool_name: clio_cte_replication\n'
                '    pool_query: local\n'
@@ -282,7 +347,7 @@ runtime:
   queue_depth: 1024
   conf_dir: {lr}/conf
 compose:
-  - mod_name: clio_cte_core
+{self.safe_compose()}  - mod_name: clio_cte_core
     pool_name: cte_main
     pool_query: local
     pool_id: "512.0"

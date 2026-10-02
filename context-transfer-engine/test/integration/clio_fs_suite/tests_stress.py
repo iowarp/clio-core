@@ -36,7 +36,7 @@ KIND = {ZERO: 'ZERO', CORRUPT: 'CORRUPT', FOREIGN: 'FOREIGN'}
 def _tier_mb(ctx):
   """RAM + fast tier per node (MB) under the tiered profile, else RAM."""
   cl = ctx.cl
-  if cl.profile == 'tiered':
+  if cl.profile in ('tiered', 'safe'):
     return cl.ram_mb + cl.fast_mb
   return cl.ram_gb * 1024
 
@@ -678,7 +678,7 @@ def t_crash_under_pressure(ctx):
   cl = ctx.cl
   base = ctx.p('crash')
   ctx.ok(0, 'mkdir', path=base)
-  ram_mb = cl.ram_mb if cl.profile == 'tiered' else cl.ram_gb * 1024
+  ram_mb = cl.ram_mb if cl.profile in ('tiered', 'safe') else cl.ram_gb * 1024
   nfiles = max(4, (2 * ram_mb) // 64)
   secs = 600
   logs = [f'{cl.run_dir}/crash_writer_{i}.log' for i in range(n)]
@@ -724,7 +724,7 @@ def t_hot_rewrite(ctx):
   cl = ctx.cl
   base = ctx.p('hot')
   ctx.ok(0, 'mkdir', path=base)
-  ram_mb = cl.ram_mb if cl.profile == 'tiered' else cl.ram_gb * 1024
+  ram_mb = cl.ram_mb if cl.profile in ('tiered', 'safe') else cl.ram_gb * 1024
   fb = 4096  # 16 MiB files
   nfiles = max(4, (2 * ram_mb) // 16)
   rounds = 8
@@ -817,7 +817,7 @@ def t_node_loss_during_writes(ctx):
   cl = ctx.cl
   base = ctx.p('nl')
   ctx.ok(0, 'mkdir', path=base)
-  ram_mb = cl.ram_mb if cl.profile == 'tiered' else cl.ram_gb * 1024
+  ram_mb = cl.ram_mb if cl.profile in ('tiered', 'safe') else cl.ram_gb * 1024
   nfiles = max(4, (2 * ram_mb) // 64)
   secs = 120
   logs = [f'{cl.run_dir}/nodeloss_writer_{i}.log' for i in range(n)]
