@@ -5501,6 +5501,10 @@ struct SyncTagTask : public clio::run::Task {
   /** Core containers that handled the sync (summed). 0 means a module in
    *  front of the core dropped it -- nothing was made durable. */
   OUT clio::run::u32 containers_;
+  /** Wall-clock ns of the latest peer liveness transition the answering
+   *  runtimes saw (the max over containers). One inside a file's unsynced
+   *  window means a node may have lost its unsynced bytes (issue #1133). */
+  OUT clio::run::u64 liveness_change_ns_;
 
   /** SHM default constructor */
   SyncTagTask()
@@ -5510,7 +5514,8 @@ struct SyncTagTask : public clio::run::Task {
         deferred_(0),
         blobs_moved_(0),
         bdevs_synced_(0),
-        containers_(0) {}
+        containers_(0),
+        liveness_change_ns_(0) {}
 
   /** Emplace constructor */
   CTP_CROSS_FUN explicit SyncTagTask(const clio::run::TaskId &task_id,
@@ -5524,7 +5529,8 @@ struct SyncTagTask : public clio::run::Task {
         deferred_(0),
         blobs_moved_(0),
         bdevs_synced_(0),
-        containers_(0) {
+        containers_(0),
+        liveness_change_ns_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kSyncTag;
@@ -5543,7 +5549,7 @@ struct SyncTagTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(deferred_, blobs_moved_, bdevs_synced_, containers_);
+    ar(deferred_, blobs_moved_, bdevs_synced_, containers_, liveness_change_ns_);
   }
 
   /** Copy from another SyncTagTask */
@@ -5555,9 +5561,11 @@ struct SyncTagTask : public clio::run::Task {
     blobs_moved_ = other->blobs_moved_;
     bdevs_synced_ = other->bdevs_synced_;
     containers_ = other->containers_;
+    liveness_change_ns_ = other->liveness_change_ns_;
   }
 
-  /** AggregateOut: sums the counts; deferred if any container defers. */
+  /** AggregateOut: sums the counts; deferred if any container defers;
+   *  the latest liveness change. */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     auto replica = other_base.template Cast<SyncTagTask>();
@@ -5565,6 +5573,9 @@ struct SyncTagTask : public clio::run::Task {
     blobs_moved_ += replica->blobs_moved_;
     bdevs_synced_ += replica->bdevs_synced_;
     containers_ += replica->containers_;
+    if (replica->liveness_change_ns_ > liveness_change_ns_) {
+      liveness_change_ns_ = replica->liveness_change_ns_;
+    }
   }
 };
 

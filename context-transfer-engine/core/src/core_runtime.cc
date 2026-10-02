@@ -7483,6 +7483,8 @@ clio::run::TaskResume Runtime::SyncTag(
   task->bdevs_synced_ = 0;
   task->containers_ = 1;
   task->return_code_ = 0;
+  auto *liveness_ipc = CLIO_IPC;
+  task->liveness_change_ns_ = liveness_ipc->LastLivenessChangeNs();
   if (config_.performance_.fsync_deferred_) {
     task->deferred_ = 1;  // durability is the periodic flushes' job
     CLIO_CO_RETURN;

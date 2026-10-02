@@ -492,6 +492,52 @@ static int FlushReplicationBarrier(const clio::cte::core::TagId &tag) {
   return fut->GetReturnCode() == 0 ? 0 : -EIO;
 }
 
+// Unsynced-write windows (issue #1133). With replication_factor 1 the bytes
+// a node holds between two fsyncs (RAM tier, write-behind) die with it, and
+// failover makes the next SyncTag succeed on the survivors. So each file
+// written since its last fsync remembers when (wall clock) that window
+// opened; fsync fails with EIO when a peer died, or crashed and rejoined,
+// inside the window (SyncTagTask::liveness_change_ns_) -- it may have taken
+// some of those bytes. Conservative: the node may have held none of them.
+// Reported once, like Linux's errseq.
+static std::mutex g_unsynced_mtx;
+static std::unordered_map<clio::run::u64, clio::run::u64> g_unsynced;
+
+/**
+ * Note that `tag` was written and is not yet fsynced; the first write after
+ * an fsync opens the window at the current wall-clock time.
+ * @param tag the file's tag (null: nothing to track)
+ */
+static void UnsyncedNote(const clio::cte::core::TagId &tag) {
+  if (tag.IsNull()) return;
+  const clio::run::u64 k = PackTag(tag);
+  std::lock_guard<std::mutex> lk(g_unsynced_mtx);
+  if (g_unsynced.count(k) != 0) return;
+  g_unsynced.emplace(
+      k, static_cast<clio::run::u64>(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::system_clock::now().time_since_epoch())
+                 .count()));
+}
+
+/**
+ * Close `tag`'s unsynced window (taken BEFORE the sync, so a write racing
+ * it opens a new one).
+ * @param tag the file's tag
+ * @param opened_ns receives the wall-clock ns the window opened at
+ * @return true if the tag had a window
+ */
+static bool UnsyncedTake(const clio::cte::core::TagId &tag,
+                         clio::run::u64 *opened_ns) {
+  const clio::run::u64 k = PackTag(tag);
+  std::lock_guard<std::mutex> lk(g_unsynced_mtx);
+  auto it = g_unsynced.find(k);
+  if (it == g_unsynced.end()) return false;
+  *opened_ns = it->second;
+  g_unsynced.erase(it);
+  return true;
+}
+
 /**
  * CTE performance.fsync_mode as learned from the first SyncTag reply:
  * -1 not yet known, 0 "durable", 1 "deferred" (fsync skips the device sync).
@@ -509,6 +555,8 @@ static int SyncOneTag(const clio::cte::core::TagId &tag) {
   if (g_fsync_deferred.load(std::memory_order_relaxed) == 1) return 0;
   auto *cte_c = CLIO_CTE_CLIENT;
   if (cte_c == nullptr || tag.IsNull()) return 0;
+  clio::run::u64 opened_ns = 0;
+  const bool unsynced = UnsyncedTake(tag, &opened_ns);
   auto fut = cte_c->AsyncSyncTag(tag);
   fut.Wait();
   const bool deferred = fut->deferred_ != 0;
@@ -527,22 +575,28 @@ static int SyncOneTag(const clio::cte::core::TagId &tag) {
   }
   const clio::run::u32 rc = fut->GetReturnCode();
   if (rc == clio::cte::core::kSyncNoSpaceRc) return -ENOSPC;
-  if (clio::cte::core::IsNodeLostRc(rc)) {
-    // The sync is broadcast to every core container; one whose node died
-    // answers with the lost-node code. It cannot hold bytes written through
-    // this mount since it died -- those puts failed and were resent to the
-    // live successor (ResendIfNodeLost) -- and what it held before is
-    // durable already or lives on in its replicas. The live containers
-    // synced (containers_ > 0), so the fsync holds.
-    HLOG(kWarning, "clio_cte_fuse: fsync of tag {}.{}: a container's node "
-         "is down; the live containers synced", tag.major_, tag.minor_);
-    return 0;
-  }
-  if (rc != 0) {
+  if (rc != 0 && !clio::cte::core::IsNodeLostRc(rc)) {
     HLOG(kError, "clio_cte_fuse: fsync of tag {}.{} failed (rc {}); "
          "reporting EIO", tag.major_, tag.minor_,
          static_cast<long long>(static_cast<clio::run::i32>(rc)));
     return -EIO;
+  }
+  // The live containers synced. A container whose node is down answers with
+  // the lost-node code; once the cluster declares the node dead the sync
+  // routes around it and succeeds. Either way, bytes written since the last
+  // fsync that the node held are gone (#1133): fail if the window saw one.
+  const bool lost_node = rc != 0;
+  const bool moved = fut->liveness_change_ns_ >= opened_ns;
+  if (unsynced && (lost_node || moved)) {
+    HLOG(kError, "clio_cte_fuse: fsync of tag {}.{}: a node {} while the "
+         "file had unsynced writes; they may be lost, reporting EIO",
+         tag.major_, tag.minor_,
+         lost_node ? "is down" : "died or rejoined");
+    return -EIO;
+  }
+  if (lost_node) {
+    HLOG(kWarning, "clio_cte_fuse: fsync of tag {}.{}: a container's node "
+         "is down; the file had no unsynced writes", tag.major_, tag.minor_);
   }
   return 0;
 }
@@ -2957,6 +3011,7 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
   if (handle->append && !handle->tag.IsNull() &&
       AppendModeOf() == AppendMode::kDeferred &&
       clio::cte::filesystem::FsIdHasHome(PackTag(handle->tag))) {
+    UnsyncedNote(handle->tag);
     return DeferredAppend(handle, buf, size);
   }
   if (handle->append && !handle->tag.IsNull() &&
@@ -2989,6 +3044,7 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
       }
       done += n;
     }
+    UnsyncedNote(handle->tag);
     DirtyRaise(handle->tag, static_cast<clio::run::u64>(offset) + size);
     HiwaterRaise(hp, static_cast<clio::run::u64>(offset) + size);
     return static_cast<int>(size);
@@ -2996,6 +3052,7 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
   // Deferred write-behind through the cfs client (staging pool, RYW
   // registration, fsync drain) — one submit, no wait.
   auto *cfs = CLIO_CFS_CLIENT;
+  UnsyncedNote(handle->tag);
   ssize_t wrote = CfsWriteCompat(cfs, handle->fh, hp,
                                  static_cast<clio::run::u64>(offset), buf,
                                  size);

@@ -61,6 +61,9 @@
 
 #ifndef _WIN32
 #include <unistd.h>  // getuid, getgid, read
+#if defined(__linux__)
+#include <sys/prctl.h>  // PR_SET_PTRACER
+#endif
 #ifndef __APPLE__
 #include <fuse3/fuse_lowlevel.h>  // fuse_session_custom_io, struct fuse_custom_io
 #include <dlfcn.h>                // dlsym (resolve fuse_session_custom_io at runtime)
@@ -187,7 +190,23 @@ static void AtimeFromMountOptions(int argc, char *argv[]) {
 #endif
 }
 
+/**
+ * Let a debugger attach to this mount daemon when CLIO_ALLOW_PTRACE=1, as
+ * clio_run does: hosts with kernel.yama.ptrace_scope=1 only allow tracing
+ * descendants, and a hung FUSE request (one the runtime is not working on)
+ * can only be located from this process's thread stacks. Opt-in only.
+ */
+static void MaybeAllowPtrace() {
+#if defined(__linux__) && defined(PR_SET_PTRACER)
+  const char *e = std::getenv("CLIO_ALLOW_PTRACE");
+  if (e != nullptr && e[0] == '1') {
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+  }
+#endif
+}
+
 int main(int argc, char *argv[]) {
+  MaybeAllowPtrace();
   DefaultMountServerWait();
   AtimeFromMountOptions(argc, argv);
 #if defined(_WIN32) || defined(__APPLE__)
