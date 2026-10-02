@@ -43,6 +43,7 @@
 #include <set>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -150,26 +151,42 @@ struct CfsHandle {
   std::atomic<bool> appended{false};
   // Opened with O_NOATIME, or atime already touched by a read through it.
   std::atomic<bool> atime_done{false};
-  // Path the open was registered under in g_open_files (empty: not).
-  std::string open_key;
+  // The open-file record of the libfuse node it was opened on (null: not
+  // registered; see RegisterOpenFile).
+  std::shared_ptr<struct OpenNode> open_node;
 };
 
-// Files open on this mount per path: path -> packed inode -> open count.
-// libfuse gives the kernel one inode per PATH, so when another node renames
-// a new file over a name, this node's kernel keeps one inode -- and one
-// page cache -- for both files. A reader of the old file then read pages a
-// reader of the new one had cached: one read(2) returned blocks of two
-// different files (stress_safe_save across nodes).
+/** The files open on one libfuse node -- one kernel inode, one page cache. */
+struct OpenNode {
+  std::string path;  ///< the node's current path (follows renames)
+  std::unordered_map<clio::run::u64, clio::run::u32> files;  ///< id -> opens
+  /// Opens with no server handle (a minted create): the server keeps no open
+  /// count for them, so it would destroy the file at its unlink.
+  clio::run::u32 unanchored = 0;
+};
+
+// Files open on this mount, per libfuse node (keyed by its current path).
+// libfuse gives the kernel one inode per node, and a node is reached by a
+// path, so files that are different on the server can share one kernel
+// inode -- and one page cache -- here: after another node renames a new file
+// over a name, and when a rename over a name open on this mount "hides" the
+// node (libfuse renames it on the server to .fuse_hiddenXXX, which moves
+// whatever file the name names NOW). A reader of one file then read pages a
+// reader of the other had cached: one read(2) returned blocks of two
+// different files (stress_safe_save across nodes). The records follow the
+// nodes through renames (OpenFilesRenamed), so every open of a node sees the
+// files already open on it.
 std::mutex g_open_files_mu;
-std::unordered_map<std::string,
-                   std::unordered_map<clio::run::u64, clio::run::u32>>
-    g_open_files;
+std::unordered_map<std::string, std::shared_ptr<OpenNode>> g_open_files;
+// Hidden names that DO exist on the server: hides that fell back to a
+// server rename (HideOpenFile). Guarded by g_open_files_mu.
+std::unordered_set<std::string> g_server_hidden;
 
 /**
- * Register a new open of `h` under its path and keep the page cache from
- * mixing files: if another file is open under the same path on this mount,
- * this descriptor bypasses the page cache (direct_io), so each descriptor
- * reads only its own file's bytes.
+ * Register a new open of `h` on its node and keep the page cache from mixing
+ * files: if another file is open on the same node, this descriptor bypasses
+ * the page cache (direct_io), so each descriptor reads only its own file's
+ * bytes.
  * @param h the new handle (tag and path set)
  * @param fi its fuse_file_info (direct_io may be set)
  */
@@ -178,15 +195,20 @@ static void RegisterOpenFile(CfsHandle *h, struct fuse_file_info *fi) {
   const clio::run::u64 id =
       (static_cast<clio::run::u64>(h->tag.major_) << 32) | h->tag.minor_;
   std::lock_guard<std::mutex> g(g_open_files_mu);
-  auto &files = g_open_files[h->path];
-  for (const auto &kv : files) {
+  auto &node = g_open_files[h->path];
+  if (node == nullptr) {
+    node = std::make_shared<OpenNode>();
+    node->path = h->path;
+  }
+  for (const auto &kv : node->files) {
     if (kv.first != id && kv.second > 0) {
       fi->direct_io = 1;
       break;
     }
   }
-  ++files[id];
-  h->open_key = h->path;
+  ++node->files[id];
+  if (h->fh == 0) ++node->unanchored;
+  h->open_node = node;
 }
 
 /**
@@ -194,15 +216,93 @@ static void RegisterOpenFile(CfsHandle *h, struct fuse_file_info *fi) {
  * @param h the handle being released
  */
 static void UnregisterOpenFile(CfsHandle *h) {
-  if (h->open_key.empty()) return;
+  if (h->open_node == nullptr) return;
   const clio::run::u64 id =
       (static_cast<clio::run::u64>(h->tag.major_) << 32) | h->tag.minor_;
   std::lock_guard<std::mutex> g(g_open_files_mu);
-  auto it = g_open_files.find(h->open_key);
-  if (it == g_open_files.end()) return;
-  auto ft = it->second.find(id);
-  if (ft != it->second.end() && --ft->second == 0) it->second.erase(ft);
-  if (it->second.empty()) g_open_files.erase(it);
+  auto &node = h->open_node;
+  auto ft = node->files.find(id);
+  if (ft != node->files.end() && --ft->second == 0) node->files.erase(ft);
+  if (h->fh == 0 && node->unanchored > 0) --node->unanchored;
+  if (node->files.empty()) {
+    auto it = g_open_files.find(node->path);
+    if (it != g_open_files.end() && it->second == node) g_open_files.erase(it);
+  }
+  node.reset();
+}
+
+/**
+ * Move the open-file records along with libfuse's nodes after a successful
+ * rename: the node at `from` (and, for a directory, every node below it) is
+ * now reached by the new path. A node libfuse unhashed at `to` had no open
+ * files (libfuse hides an open one first, which is itself a rename).
+ * @param from the old path
+ * @param to the new path
+ */
+static void OpenFilesRenamed(const std::string &from, const std::string &to) {
+  std::lock_guard<std::mutex> g(g_open_files_mu);
+  std::vector<std::pair<std::string, std::shared_ptr<OpenNode>>> moved;
+  const std::string dir_prefix = from + "/";
+  for (auto it = g_open_files.begin(); it != g_open_files.end();) {
+    const std::string &k = it->first;
+    if (k == from || k.compare(0, dir_prefix.size(), dir_prefix) == 0) {
+      moved.emplace_back(to + k.substr(from.size()), it->second);
+      it = g_open_files.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto &kv : moved) {
+    kv.second->path = kv.first;
+    g_open_files[kv.first] = kv.second;
+  }
+}
+
+/**
+ * Whether `path` is a name libfuse made up to hide an open file
+ * (.fuse_hiddenXXXX). Such names exist only on this mount (HideOpenFile).
+ * @param path a libfuse path (may be null)
+ * @return true for a hidden name
+ */
+static bool IsHiddenName(const char *path) {
+  if (path == nullptr) return false;
+  const char *slash = strrchr(path, '/');
+  const char *leaf = slash != nullptr ? slash + 1 : path;
+  return strncmp(leaf, ".fuse_hidden", 12) == 0;
+}
+
+/**
+ * The server path for a hidden name: the inode id form (FsIdStatPath) of a
+ * file open on the hidden node.
+ * @param path a hidden name (IsHiddenName)
+ * @param out the id-form path
+ * @return 0, or -ENOENT when no file is open on that node any more
+ */
+static int HiddenIdPath(const char *path, std::string *out) {
+  std::lock_guard<std::mutex> g(g_open_files_mu);
+  auto it = g_open_files.find(path);
+  if (it == g_open_files.end()) return -ENOENT;
+  for (const auto &kv : it->second->files) {
+    if (kv.second > 0) {
+      *out = clio::cte::filesystem::FsIdStatPath(kv.first);
+      return 0;
+    }
+  }
+  return -ENOENT;
+}
+
+/**
+ * Map a libfuse path to the one to send the server: hidden names become the
+ * id form of their open file, every other path is kept.
+ * @param path in/out: the path to use (repointed into `out` when hidden)
+ * @param out holds the hidden name's id-form path
+ * @return 0, or -ENOENT for a hidden name with no open file
+ */
+static int MapHiddenPath(const char **path, std::string *out) {
+  if (!IsHiddenName(*path)) return 0;
+  const int rc = HiddenIdPath(*path, out);
+  if (rc == 0) *path = out->c_str();
+  return rc;
 }
 
 /**
@@ -220,11 +320,12 @@ static void UnregisterOpenFile(CfsHandle *h) {
  */
 static std::string HandlePath(CfsHandle *h, const char *path) {
   std::lock_guard<std::mutex> lk(h->path_mu);
-  if (path != nullptr && *path != '\0') {
+  if (path != nullptr && *path != '\0' && !IsHiddenName(path)) {
     if (h->path != path) h->path = path;
   } else if (!h->tag.IsNull()) {
-    // hard_remove: libfuse passes no path once the open file lost its last
-    // name (unlinked, or renamed over). Key it by its inode from now on:
+    // The open file lost its last name (unlinked, or renamed over): libfuse
+    // passes no path (hard_remove) or the local hidden name HideOpenFile
+    // keeps for it. Key it by its inode from now on:
     // its old name may already belong to another file, whose path-keyed
     // state (sizes of queued writes, timestamps) this one must not touch.
     h->path = clio::cte::filesystem::FsIdStatPath(
@@ -241,6 +342,11 @@ static std::string HandlePath(CfsHandle *h, const char *path) {
  * @return the path, or "" when there is neither
  */
 static std::string OpPath(const char *path, struct fuse_file_info *fi) {
+  if (IsHiddenName(path)) {
+    std::string id_path;
+    if (HiddenIdPath(path, &id_path) == 0) return id_path;
+    path = nullptr;  // nothing open on the node: fall back to the handle
+  }
   if (path != nullptr) return std::string(path);
   CfsHandle *h = fi != nullptr ? reinterpret_cast<CfsHandle *>(fi->fh)
                                : nullptr;
@@ -1754,9 +1860,11 @@ static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
   // Delegate to the filesystem chimod: it owns exists/is-dir/logical-size.
   auto t = cfs->AsyncGetattr(p);
   t.Wait();
-  if (t->GetReturnCode() != 0 || t->exists_ == 0) {
-    return -ENOENT;
-  }
+  // A lookup that FAILED (its directory block's home unreachable, a timeout)
+  // is EIO, never ENOENT: "no such file" for an existing file invites the
+  // application to create it again over the real one.
+  if (t->GetReturnCode() != 0) return FsErrno(t->GetReturnCode());
+  if (t->exists_ == 0) return -ENOENT;
   FillStatFromGetattr(t.get(), p, stbuf);
   return 0;
 }
@@ -1835,6 +1943,11 @@ int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
                           struct fuse_file_info *fi) {
   // fstat through a handle with deferred appends sees them.
   CfsHandle *handle = fi != nullptr ? GetHandle(fi) : nullptr;
+  std::string hidden;
+  if (handle == nullptr) {
+    const int hrc = MapHiddenPath(&path, &hidden);
+    if (hrc != 0) return hrc;
+  }
   std::string key = path != nullptr ? std::string(path) : std::string();
   if (handle != nullptr) {
     key = HandlePath(handle, path);
@@ -2051,7 +2164,8 @@ int cte_fuse_chmod(const char *path, cte_mode_t mode,
   // missing target would otherwise be silently created. chmod(2) must ENOENT.
   auto g = cfs->AsyncGetattr(p);
   g.Wait();
-  if (g->GetReturnCode() != 0 || g->exists_ == 0) return -ENOENT;
+  if (g->GetReturnCode() != 0) return FsErrno(g->GetReturnCode());
+  if (g->exists_ == 0) return -ENOENT;
   auto t = cfs->AsyncChmod(p, static_cast<clio::run::u32>(mode) & 07777u);
   t.Wait();
   return t->GetReturnCode() == 0 ? 0 : -EIO;
@@ -2316,6 +2430,9 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
 }
 
 int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
+  // A hidden name is reached only through a dentry the kernel had not yet
+  // moved off it: ESTALE makes the kernel look the real name up again.
+  if (IsHiddenName(path)) return -kOpenVanishedErrno;
   std::string p(path);
   auto *cfs = CLIO_CFS_CLIENT;
   // A minted create that has not flushed yet is invisible to the chimod; a
@@ -2776,6 +2893,9 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
       // names another file (or, mid-rename, none) and read 0 bytes.
       const int src = OpenHandleSize(handle, hp, &fsize);
       if (src == -EIO) return -EIO;
+      // The descriptor's own file is gone on the server: a silent EOF would
+      // read as a truncated file. ESTALE, as NFS reports a vanished file.
+      if (src == -ENOENT) return -kOpenVanishedErrno;
     }
     clio::run::u64 hw = HiwaterFor(hp);
     if (hw > fsize) fsize = hw;
@@ -2888,6 +3008,13 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
 // ============================================================================
 
 int cte_fuse_unlink(const char *path) {
+  // libfuse removes a hidden name when the file's last descriptor closes.
+  // Unless the hide fell back to a server rename, the name never existed on
+  // the server (HideOpenFile), which purges the file at its last close.
+  if (IsHiddenName(path)) {
+    std::lock_guard<std::mutex> g(g_open_files_mu);
+    if (g_server_hidden.erase(path) == 0) return 0;
+  }
   auto *cfs = CLIO_CFS_CLIENT;
   // Deferred writes racing the unlink would land on a deleted file and latch
   // spurious errors; drain first (no-op unless this file has writes in
@@ -3103,6 +3230,7 @@ static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
 
 int cte_fuse_link(const char *from, const char *to) {
   if (NameTooLong(to)) return -ENAMETOOLONG;
+  if (IsHiddenName(from) || IsHiddenName(to)) return -ENOENT;
   EnsureCreated(std::string(from));
   EnsureCreated(std::string(to));
   // Hard link `to` -> existing file `from`. The chimod binds both names to the
@@ -3152,6 +3280,8 @@ int cte_fuse_readlink(const char *path, char *buf, size_t size) {
 static int cte_fuse_setxattr_ensure(const std::string &p) { EnsureCreated(p); return 0; }
 static int cte_fuse_setxattr(const char *path, const char *name,
                              const char *value, size_t size, int flags) {
+  std::string hidden;
+  if (const int hrc = MapHiddenPath(&path, &hidden)) return hrc;
   cte_fuse_setxattr_ensure(std::string(path));
   // Set xattr `name` on `path`. `value` is raw bytes (may contain NULs), so
   // preserve its length rather than treating it as a C string. `flags` carries
@@ -3167,6 +3297,8 @@ static int cte_fuse_setxattr(const char *path, const char *name,
 
 static int cte_fuse_getxattr(const char *path, const char *name, char *value,
                              size_t size) {
+  std::string hidden;
+  if (const int hrc = MapHiddenPath(&path, &hidden)) return hrc;
   // Read xattr `name` of `path`. Return the value length (POSIX getxattr);
   // size==0 is a length query. Missing attribute -> -ENODATA.
   //
@@ -3242,6 +3374,8 @@ static int cte_fuse_getxattr_darwin(const char *path, const char *name,
 #endif  // __APPLE__
 
 static int cte_fuse_listxattr(const char *path, char *list, size_t size) {
+  std::string hidden;
+  if (const int hrc = MapHiddenPath(&path, &hidden)) return hrc;
   // Return the NUL-separated, NUL-terminated list of xattr names. size==0 is a
   // length query.
   auto *cfs = CLIO_CFS_CLIENT;
@@ -3264,6 +3398,8 @@ static int cte_fuse_listxattr(const char *path, char *list, size_t size) {
 }
 
 static int cte_fuse_removexattr(const char *path, const char *name) {
+  std::string hidden;
+  if (const int hrc = MapHiddenPath(&path, &hidden)) return hrc;
   EnsureCreated(std::string(path));
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncRemovexattr(std::string(path), std::string(name));
@@ -3279,9 +3415,46 @@ static int cte_fuse_removexattr(const char *path, const char *name) {
 #define RENAME_EXCHANGE (1 << 1)  // ditto; referenced by the unsupported-flag test
 #endif
 
+/**
+ * libfuse's "hide": `from` is open on this mount and is being unlinked or
+ * renamed over, so libfuse keeps the open file reachable as `to`
+ * (.fuse_hiddenXXXX). Done as a server rename, that name was shared by
+ * every node (each picks .fuse_hidden<node id><counter> from the same
+ * counters), and the rename moved whatever file `from` named on the server
+ * by then -- after another node's rename over `from`, a different file than
+ * the one open here, which this node's kernel inode then read pages of.
+ * The server already keeps an unlinked file alive while any node has it
+ * open, so the hidden name needs no server state: `from` is unlinked there,
+ * and `to` stays local, mapped to this node's open files (HiddenIdPath).
+ * Not for a node with an open the server holds no count for (a minted
+ * create): unlinked, that file would be destroyed under its descriptor.
+ * @param from the name being hidden
+ * @param to libfuse's hidden name
+ * @param rc out: 0, or a negative errno from the unlink
+ * @return false when the hide must be a server rename instead
+ */
+static bool HideOpenFile(const char *from, const char *to, int *rc) {
+  {
+    std::lock_guard<std::mutex> g(g_open_files_mu);
+    auto it = g_open_files.find(from);
+    if (it == g_open_files.end() || it->second->unanchored > 0) return false;
+  }
+  *rc = cte_fuse_unlink(from);
+  // Another node removed or replaced the name first: it is gone either way.
+  if (*rc == -ENOENT) *rc = 0;
+  if (*rc != 0) return true;
+  OpenFilesRenamed(std::string(from), std::string(to));
+  // Its handles now key their path-keyed state (queued sizes, write times)
+  // by the inode (HandlePath): move what the rename handler put under `to`.
+  std::string id_path;
+  if (HiddenIdPath(to, &id_path) == 0) HiwaterRename(std::string(to), id_path);
+  return true;
+}
+
 int cte_fuse_rename(const char *from, const char *to,
                            unsigned int flags) {
   if (NameTooLong(to)) return -ENAMETOOLONG;
+  if (IsHiddenName(from)) return -ENOENT;  // only libfuse knows these names
   auto *cfs = CLIO_CFS_CLIENT;
   // Deferred writes are keyed by PATH; a rename racing them would let the
   // writes land under the old name. Drain `from` first (git's
@@ -3305,6 +3478,12 @@ int cte_fuse_rename(const char *from, const char *to,
     }
   }
   HiwaterRename(std::string(from), std::string(to));
+  bool server_hide = false;
+  if (IsHiddenName(to)) {
+    int hrc = 0;
+    if (HideOpenFile(from, to, &hrc)) return hrc;
+    server_hide = true;  // falls through to the server rename below
+  }
   // RENAME_NOREPLACE: the rename must fail with EEXIST if `to` already exists.
   // Probe for the destination then fall through to a plain rename. This is the
   // standard high-level-FUSE approach (a tiny TOCTOU window vs a truly atomic
@@ -3329,7 +3508,14 @@ int cte_fuse_rename(const char *from, const char *to,
   }
   auto t = cfs->AsyncRename(std::string(from), std::string(to));
   t.Wait();
-  if (t->GetReturnCode() == 0) LinkGroupRename(std::string(from), std::string(to));
+  if (t->GetReturnCode() == 0) {
+    LinkGroupRename(std::string(from), std::string(to));
+    OpenFilesRenamed(std::string(from), std::string(to));
+    if (server_hide) {
+      std::lock_guard<std::mutex> g(g_open_files_mu);
+      g_server_hidden.insert(to);
+    }
+  }
   int rc = static_cast<int>(t->GetReturnCode());
   return FsErrno(rc);  // chimod returns errno-style codes (ENOENT/EIO)
 }
