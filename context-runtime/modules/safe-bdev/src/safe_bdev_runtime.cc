@@ -2910,19 +2910,30 @@ clio::run::TaskResume Runtime::Sync(clio::run::shared_ptr<SyncTask> &task) {
     }
   }
   // 2. Every active member's data (and its own allocator state) to media.
+  // A member that cannot sync cannot persist anything: it is faulted like a
+  // member whose I/O failed, and the array stays durable through the rest.
+  // Sync fails only if that leaves the array past max_failures. (Failing it
+  // outright turned one dying disk into an fsync EIO for every writer.)
   std::vector<clio::run::Future<clio::run::bdev::SyncTask>> futs;
+  std::vector<std::pair<bool, size_t>> who;  // (is_parity, index)
   for (size_t d = 0; d < data_clients_.size(); ++d) {
     if (data_members_[d].state_ != ec::EcState::kActive) continue;
     futs.push_back(data_clients_[d].AsyncSync(DataQuery(d)));
+    who.emplace_back(false, d);
   }
   for (size_t j = 0; j < parity_clients_.size(); ++j) {
     if (parity_members_[j].state_ != ec::EcState::kActive) continue;
     futs.push_back(parity_clients_[j].AsyncSync(ParityQuery(j)));
+    who.emplace_back(true, j);
   }
-  for (auto &f : futs) {
-    CLIO_CO_AWAIT(f);
-    if (f->GetReturnCode() != 0) task->return_code_ = 1;
+  for (size_t i = 0; i < futs.size(); ++i) {
+    CLIO_CO_AWAIT(futs[i]);
+    if (futs[i]->GetReturnCode() != 0) {
+      FaultOnIoError(who[i].first, who[i].second, true,
+                     static_cast<clio::run::u32>(ctp::IoError::kDeviceFault));
+    }
   }
+  if (CountDownMembers() > max_failures_) task->return_code_ = 1;
   // 3. The allocation and intent log.
   alloc_log_.Flush();
   CLIO_CO_RETURN;

@@ -842,4 +842,35 @@ TEST_CASE("safe_bdev_small_rewrites_delta_parity",
   rig.Cleanup();
 }
 
+TEST_CASE("safe_bdev_sync_with_dying_disks",
+          "[safe_bdev][disk_fail][sync]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      66000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("snc", base);
+  rig.WriteNew(kSetLen, 111);
+  clio::run::bdev::Client plain(rig.safe.pool_id_);
+  auto sync = [&]() {
+    auto t = plain.AsyncSync(clio::run::PoolQuery::Dynamic());
+    t.Wait();
+    return t->GetReturnCode();
+  };
+  // A disk that dies is found by the fsync itself: it must be faulted and
+  // the fsync must still succeed while the array is within max_failures.
+  KillDisk(rig.paths[1]);
+  REQUIRE(sync() == 0);
+  REQUIRE(QueryArray(rig.safe).faulty_members == 1);
+  KillDisk(rig.paths[kDataMembers]);  // a parity disk
+  rig.WriteNew(kSetLen, 112);
+  REQUIRE(sync() == 0);
+  REQUIRE(QueryArray(rig.safe).faulty_members == 2);
+  rig.VerifyAll();
+  // A third disk is past max_failures: now fsync reports it.
+  KillDisk(rig.paths[2]);
+  REQUIRE(sync() != 0);
+  rig.Cleanup();
+}
+
 SIMPLE_TEST_MAIN()
