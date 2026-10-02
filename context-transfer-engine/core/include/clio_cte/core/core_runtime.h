@@ -731,6 +731,16 @@ private:
 
   /** Mirror one blob into the SHM cache. No-op when caching is off. */
   void MirrorBlobToShm(const std::string &composite_key, const BlobInfo &info);
+  /**
+   * Withdraw a blob's zero-IPC mirror record. Called before extents the
+   * record names are freed (#1131): a client copying from the mirror pins
+   * nothing and validates only against the mirror's generation, so a record
+   * left in place across the free lets it return another blob's reused bytes
+   * with rc 0. A miss sends it to the RPC path instead.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob's name
+   */
+  void WithdrawBlobMirror(const TagId &tag_id, const std::string &blob_name);
 
   // Atomic counters for thread-safe ID generation
   std::atomic<clio::run::u32>

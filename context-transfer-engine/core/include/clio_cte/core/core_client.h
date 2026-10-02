@@ -315,6 +315,10 @@ class Client : public clio::run::ContainerClient {
 
     // Re-validate placement. If the blob moved while we were copying, the
     // bytes may be a mix of two blobs -- discard and let the caller use RPC.
+    // The fence keeps the payload loads above ordered before the re-check:
+    // bytes another blob wrote into freed extents happen after the runtime
+    // withdrew this record, so a copy that saw them must also see that.
+    std::atomic_thread_fence(std::memory_order_acquire);
     ShmBlobRecord after;
     if (!TryGetBlobRecordShm(tag_id, blob_name, &after)) {
       return false;
@@ -389,6 +393,9 @@ class Client : public clio::run::ContainerClient {
    *  stable). */
   bool CheckBlobGenShm(const TagId &tag_id, const std::string &blob_name,
                        clio::run::u64 gen) {
+    // Order the caller's consumption of the view before this re-check (see
+    // TryReadBlobShm).
+    std::atomic_thread_fence(std::memory_order_acquire);
     ShmBlobRecord rec;
     if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
       return false;

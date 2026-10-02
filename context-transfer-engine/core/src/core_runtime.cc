@@ -669,9 +669,18 @@ void Runtime::MirrorBlobToShm(const std::string &composite_key,
   }
   ShmBlobRecord rec;
   if (!BuildShmBlobRecord(info, &rec)) {
+    // The previous record may name extents this layout no longer holds: a
+    // zero-IPC reader must miss, not copy them (#1131).
+    shm_cache_.EraseBlob(composite_key);
     return;
   }
   shm_cache_.PutBlob(composite_key, rec);
+}
+
+void Runtime::WithdrawBlobMirror(const TagId &tag_id,
+                                 const std::string &blob_name) {
+  shm_cache_.EraseBlob(std::to_string(tag_id.major_) + "." +
+                       std::to_string(tag_id.minor_) + "." + blob_name);
 }
 
 namespace {
@@ -3671,8 +3680,12 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
         while (blob_info.HasReadPins()) {
           CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
         }
+        // Zero-IPC readers pin nothing: withdraw the mirror before the
+        // extents can be reused (#1131); re-published below.
+        WithdrawBlobMirror(tag_id, blob_name);
         clio::run::u32 free_rc = 0;
         CLIO_CO_AWAIT(FreeAllBlobBlocks(blob_info, free_rc));
+        blob_info.BumpPlacementGen();
         if (blob_info.score_ != new_score) snapshot_dirty_.store(true);
         blob_info.score_ = new_score;
         // The primary's bytes leave the tag (same bookkeeping as DelBlob):
@@ -3851,6 +3864,14 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
     }
 
     {
+      // The drain above covers readers that pin through this runtime; a
+      // zero-IPC client copies straight out of the RAM tier, pins nothing,
+      // and validates against the MIRROR's placement generation -- which
+      // still names the old extents. Withdraw it before they are freed: a
+      // reader that copied reused bytes then fails its post-copy check
+      // instead of returning another blob's data with rc 0 (#1131).
+      // Re-published with the new layout below.
+      WithdrawBlobMirror(tag_id, blob_name);
       clio::run::u32 free_rc = 0;
       CLIO_CO_AWAIT(FreeAllBlobBlocks(old_layout, free_rc));
       if (free_rc != 0) {
@@ -4077,9 +4098,11 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
       CLIO_CO_RETURN;
     }
 
-    // Publish (readers were drained above), then free the old placement. No
-    // SHM mirror / placement-gen churn: the mirror publishes the PRIMARY's
-    // layout, which this move never touched.
+    // Publish (readers were drained above), then free the old placement.
+    // The mirror also publishes a node-local RAM replica as the serving copy
+    // (BuildShmBlobRecord), so it is withdrawn before the old extents are
+    // freed and re-published with the new layout and a new generation after
+    // (#1131) -- left alone, it named freed extents indefinitely.
     rep = blob_info.GetReplica(replica_idx, /*create=*/false);
     BlobInfo old_layout;
     old_layout.blocks_ = std::move(rep->blocks_);
@@ -4116,8 +4139,13 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
     }
 
     {
+      WithdrawBlobMirror(tag_id, blob_name);
       clio::run::u32 free_rc = 0;
       CLIO_CO_AWAIT(FreeAllBlobBlocks(old_layout, free_rc));
+      blob_info.BumpPlacementGen();
+      MirrorBlobToShm(std::to_string(tag_id.major_) + "." +
+                          std::to_string(tag_id.minor_) + "." + blob_name,
+                      blob_info);
     }
 
     rc = 0;
@@ -4761,7 +4789,11 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
       rep.total_size_cache_ = 0;
     }
 
-    // Step 2.5: Free all blocks back to their targets before removing blob
+    // Step 2.5: Free all blocks back to their targets before removing blob.
+    // Withdraw the zero-IPC mirror FIRST: a client copying from it validates
+    // only against the mirror, so the record must be gone before another
+    // blob can reuse these extents (#1131).
+    WithdrawBlobMirror(tag_id, blob_name);
     clio::run::u32 free_result = 0;
     CLIO_CO_AWAIT(FreeAllBlobBlocks(*blob_info_ptr, free_result));
     if (free_result != 0) {
@@ -5314,6 +5346,9 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
     // path drains in-flight readers itself before freeing dropped extents
     // (issue #753, reader half) — see ResizeBlob.
     clio::run::u32 resize_result = 0;
+    // A shrink frees the dropped extents: withdraw the zero-IPC mirror first
+    // so no client copies them once reused (#1131); re-published below.
+    if (new_size < old_size) WithdrawBlobMirror(tag_id, blob_name);
     CLIO_CO_AWAIT(ResizeBlob(*blob_info_ptr, new_size, blob_score,
                         resize_result, 0));
     if (resize_result != 0) {
@@ -7405,6 +7440,9 @@ clio::run::TaskResume Runtime::RelocateBlob(
   // file's bytes read back as this one's).
   LogBlobLayout(tag_id, blob_name, blob_info);
   {
+    // Zero-IPC readers validate against the mirror, which still names the
+    // old extents: withdraw it before they are freed (#1131).
+    shm_cache_.EraseBlob(composite_key);
     clio::run::u32 free_rc = 0;
     CLIO_CO_AWAIT(FreeAllBlobBlocks(old_layout, free_rc));
     if (free_rc != 0) {
