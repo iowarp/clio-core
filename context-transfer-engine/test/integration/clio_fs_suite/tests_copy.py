@@ -24,8 +24,12 @@ def t_cp_1g(ctx):
   base = ctx.p('cp')
   ctx.ok(0, 'mkdir', path=base)
   src = f'{cl.local_root}/cp_src_1g.bin'
+  # CLIO_SUITE_CP_COPIES: more copies = more prior traffic for the later
+  # ones (#1116 failed more often on a store that had seen traffic).
+  copies = int(os.environ.get('CLIO_SUITE_CP_COPIES', '10'))
   rc, out = sh(host, f'python3 {HERE}/copy_check.py --src {src} '
-                     f'--dst-dir {base} --size-mib 1024 --copies 10 --keep',
+                     f'--dst-dir {base} --size-mib 1024 --copies {copies} '
+                     f'--keep',
                timeout=7000)
   # The JSON summary is copy_check's last stdout line; cp's own errors
   # (stderr) are appended after it by sh().

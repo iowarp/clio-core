@@ -580,13 +580,24 @@ def _torn_unsynced(t, writer, inflight, durable=0, k=None, nfiles=None):
   Returns:
     True when the head is one of this file's unsynced gens (newer than the
     durable one, at most the newest attempted) and the rest an older gen by
-    the same writer. A writer that retries after a crash burns gens on
+    the same writer -- or, for a file never fsynced, zeros (rest writer and
+    gen 0: the unsynced write landed only in part). A writer that retries after a crash burns gens on
     attempts that never reach the store, so the torn write is often not the
     newest attempted one.
   """
   if not t:
     return False
   hw, hg, rw, rg = t
+  if hw == writer and rw == 0 and rg == 0:
+    # Head intact, rest zeros: only legal for a file with NO fsynced
+    # version -- over a durable one the zeros would be lost fsynced bytes.
+    if durable != 0:
+      return False
+    if hg == inflight:
+      return True
+    if k is None or nfiles is None:
+      return False
+    return hg <= inflight and (hg - (k + 1)) % nfiles == 0
   if hw != writer or rw != writer or rg >= hg:
     return False
   if hg == inflight:

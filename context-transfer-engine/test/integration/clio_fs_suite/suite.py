@@ -287,6 +287,9 @@ def main():
                        'only fsync itself moves data off the RAM tier')
   ap.add_argument('--disk-gb', type=int, default=20,
                   help='size of each node\'s disk tier (GB)')
+  ap.add_argument('--ram-gb', type=int, default=8,
+                  help='persistent profiles: RAM tier per node (GB); 0 '
+                       'drops the RAM tier (disk tier only)')
   ap.add_argument('--ram-mb', type=int, default=512,
                   help='tiered profile: RAM tier per node (MB)')
   ap.add_argument('--fast-mb', type=int, default=2048,
@@ -343,7 +346,7 @@ def main():
   cl = Cluster(hosts, bin_dir, os.path.abspath(args.out),
                profile=args.profile, port=args.port,
                attr_cache_s=args.attr_cache, fsync_mode=args.fsync_mode,
-               disk_gb=args.disk_gb, ram_mb=args.ram_mb,
+               disk_gb=args.disk_gb, ram_gb=args.ram_gb, ram_mb=args.ram_mb,
                fast_mb=args.fast_mb, organizer=args.organizer,
                neighborhood=args.neighborhood, local_root=args.local_root)
   log(f'hosts={hosts} profile={args.profile} '

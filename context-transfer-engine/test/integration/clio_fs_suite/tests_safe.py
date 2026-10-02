@@ -215,3 +215,31 @@ def t_disk_back(ctx):
   ctx.cl.agents.clear()
   _check_filesets(ctx, base, n, nfiles, logs, replies,
                   'after a disk came back and the cluster restarted')
+
+
+@test('safe_fsync_reports_lost_node', 'safe', min_nodes=3,
+      redeploy_after=True, timeout=1800)
+def t_fsync_lost_node(ctx):
+  """Issue #1133: node0 writes 32 MiB (pages hash over every node) and does
+  NOT fsync; the last node is SIGKILLed and restarted. Its share of those
+  unsynced bytes may be gone, so node0's fsync must fail with EIO rather
+  than report success. Bytes written after the node rejoined must fsync
+  cleanly, and a file fsynced before the crash must read back intact."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  size = 32 << 20
+  safe = ctx.p('synced_before')
+  ctx.ok(0, 'write_file', path=safe, size=8 << 20, seed=3, fsync=True)
+  h = ctx.ok(0, 'open', path=ctx.p('dirty'), flags='wc')
+  ctx.ok(0, 'fpwrite', h=h, off=0, length=size, seed=5, timeout=600)
+  time.sleep(3)  # let the write-behind ship the full pages to their owners
+  _bounce(ctx, cl.hosts[n - 1], crash=True, down_s=30)
+  time.sleep(10)  # every node has seen the rejoin
+  ctx.err(0, 'fsync', ['EIO'], h=h, timeout=600)
+  # Reported once; a write window opened after the rejoin syncs cleanly.
+  ctx.ok(0, 'fpwrite', h=h, off=0, length=1 << 20, seed=6, timeout=600)
+  ctx.ok(0, 'fsync', h=h, timeout=600)
+  ctx.ok(0, 'close', h=h)
+  v = ctx.ok(n - 1, 'verify_file', path=safe, size=8 << 20, seed=3,
+             timeout=600)
+  ctx.check(v['ok'], f'file fsynced before the crash: {v}')

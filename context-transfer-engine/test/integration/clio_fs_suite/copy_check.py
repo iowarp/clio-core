@@ -33,6 +33,39 @@ def locate(src_index, piece):
   return src_index.get(hashlib.sha1(piece).digest())
 
 
+def check_copy(dst, src, src_pages, src_index):
+  """Compare one copy with the source page by page.
+
+  Args:
+    dst: the copy.
+    src: the source file.
+    src_pages: sha1 of each source page.
+    src_index: sha1 of each 128 KiB source sub-block -> its offset.
+  Returns:
+    One entry per differing page: its index, how many of its sub-blocks
+    are all zero, and the first two differing sub-blocks.
+  """
+  pages = []
+  with open(dst, 'rb') as f, open(src, 'rb') as s:
+    for p in range(len(src_pages)):
+      page = f.read(MiB)
+      if hashlib.sha1(page).digest() == src_pages[p]:
+        continue
+      s.seek(p * MiB)
+      ref = s.read(MiB)
+      subs = []
+      for o in range(0, MiB, SUB):
+        got, exp = page[o:o + SUB], ref[o:o + SUB]
+        if got != exp:
+          zero = got.count(0) == len(got)
+          subs.append({'sub_off': o, 'zero': zero,
+                       'holds_src_off': locate(src_index, got)})
+      pages.append({'page': p,
+                    'zero_subs': sum(1 for x in subs if x['zero']),
+                    'subs': subs[:2]})
+  return pages
+
+
 def main():
   ap = argparse.ArgumentParser()
   ap.add_argument('--src', required=True)
@@ -67,23 +100,18 @@ def main():
       shutil.copyfile(args.src, dst)
       rc = 0
     pages = []
-    size = os.path.getsize(dst)
-    with open(dst, 'rb') as f, open(args.src, 'rb') as s:
-      for p in range(len(src_pages)):
-        page = f.read(MiB)
-        if hashlib.sha1(page).digest() == src_pages[p]:
-          continue
-        s.seek(p * MiB)
-        ref = s.read(MiB)
-        subs = []
-        for o in range(0, MiB, SUB):
-          got, exp = page[o:o + SUB], ref[o:o + SUB]
-          if got != exp:
-            zero = got.count(0) == len(got)
-            subs.append({'sub_off': o, 'zero': zero,
-                         'holds_src_off': locate(src_index, got)})
-        pages.append({'page': p, 'zero_subs': sum(1 for x in subs if x['zero']),
-                      'subs': subs[:2]})
+    try:
+      size = os.path.getsize(dst)
+      pages = check_copy(dst, args.src, src_pages, src_index)
+    except OSError as e:
+      # The copy cannot even be read back (e.g. a write error latched on a
+      # full store): report it, keep checking the other copies.
+      bad.append({'copy': i, 'rc': rc, 'size': -1, 'read_errno': e.errno,
+                  'bad_pages': -1, 'all_zero_pages': 0, 'first_bad': None,
+                  'last_bad': None, 'sample': []})
+      if not args.keep:
+        os.unlink(dst)
+      continue
     if pages or rc != 0 or size != len(src_pages) * MiB:
       bad.append({'copy': i, 'rc': rc, 'size': size,
                   'bad_pages': len(pages),

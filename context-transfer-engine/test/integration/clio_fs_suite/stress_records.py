@@ -185,6 +185,14 @@ def scan(path, file_id, nblocks, blk=BLK, chunk_blocks=256):
               # A write torn mid-block: [head writer, head gen, rest writer,
               # rest gen] -- the caller decides whether that tear is legal.
               torn[b + i] = d['head'][2:4] + d['rest_is']
+            elif isinstance(d.get('head'), list) and \
+                d.get('tail_zero_from') is not None and \
+                (d.get('pattern_breaks_at') or 0) >= d['tail_zero_from']:
+              # The record is intact up to an all-zero tail (a write that
+              # landed only in part, over nothing): rest writer/gen 0. (The
+              # pattern may itself end in zero bytes, so the zeros can start
+              # before the first mismatch.)
+              torn[b + i] = d['head'][2:4] + [0, 0]
             if len(corrupt) < 8:
               corrupt.append(d | {'block': b + i})
         if runs and runs[-1][2] == w and runs[-1][3] == g and \

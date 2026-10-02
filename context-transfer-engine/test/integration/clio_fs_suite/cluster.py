@@ -274,11 +274,13 @@ class Cluster:
     # SAFE_MEMBERS file bdevs (SAFE_PARITY of them parity) on each node.
     tiered = self.profile in ('tiered', 'safe')
     ram_cap = f'{self.ram_mb}MB' if tiered else f'{self.ram_gb}GB'
-    storage = [
-        f'      - path: "ram::clio_fs_ram"\n'
-        f'        bdev_type: "ram"\n'
-        f'        capacity_limit: "{ram_cap}"\n'
-        f'        score: 1.0\n']
+    storage = []
+    if tiered or self.ram_gb > 0:  # ram_gb 0: disk tier only (#1116)
+      storage.append(
+          f'      - path: "ram::clio_fs_ram"\n'
+          f'        bdev_type: "ram"\n'
+          f'        capacity_limit: "{ram_cap}"\n'
+          f'        score: 1.0\n')
     perf = ''
     chain = ''
     fs_next = '512.0'
