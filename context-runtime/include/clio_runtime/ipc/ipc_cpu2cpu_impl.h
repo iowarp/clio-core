@@ -140,6 +140,29 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
   TaskT *task_ptr = future.get();
   const size_t want_key = task_ptr->task_id_.net_key_;
 
+  // Never-sent task: nothing to wait for, nothing to claim.
+  //
+  // Both SendIn paths stamp net_key_ with the task's OWN heap address, which
+  // cannot be null, and ResendTask re-stamps the same way -- so a zero
+  // net_key_ is only ever TaskId's constructor default, i.e. a task that
+  // never went over IPC at all. The client-side read fast paths synthesize
+  // exactly that: a real GetBlobTask filled in from the shared metadata cache
+  // and SetComplete()'d locally, never Sent (CoreClient::TryShmGet and its
+  // deferred-put / vectored twins -- see the "synthesized-task contract"
+  // there). Returning true hands the caller the locally-produced result and
+  // lets WaitCpu2Cpu run Destroy(true) -> PostWait, which the fast paths rely
+  // on to finish the destination copy.
+  //
+  // Without this the #968 guard at the bottom treats every such future as a
+  // protocol violation: the task IS complete (locally) and there IS no parked
+  // archive, which is precisely the aliasing signature that guard looks for.
+  // That turned every cache-hit read into rc=-1 (cr_cli_cfs,
+  // cte_{get,put}blob_priv_separate, python_gil_release_test), with the bytes
+  // already correctly copied.
+  if (want_key == 0) {
+    return true;
+  }
+
   // Finalized-client escape (issue #970). A task submitted AFTER
   // ClientFinalize can never complete — the response listener is gone and the
   // recv threads are joined — so waiting for it is an unbounded park with no
