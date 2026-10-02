@@ -1139,7 +1139,26 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume RetryStripeDegraded(
       clio::run::u64 s, const std::vector<WritePiece> &pieces,
-      const char *data, bool &ok);
+      const char *data, bool &ok,
+      const std::vector<std::vector<uint8_t>> *old_bytes = nullptr);
+  /**
+   * Decode stripe `s` as it was BEFORE this write (#1139): the survivors'
+   * chunks with every landed piece swapped back to the bytes it replaced,
+   * which is what the (not yet updated) parity encodes. Works whenever the
+   * down members alone fit in the parity, however many members the write
+   * already changed.
+   * @param s slot
+   * @param stripe stripe columns (CodeColumns())
+   * @param pieces this write's pieces
+   * @param old_bytes the bytes each piece replaced (ReadReplacedBytes)
+   * @param out decoded chunks, one per stripe position
+   * @param ok true on success
+   */
+  clio::run::TaskResume ReconstructStripeAsBefore(
+      clio::run::u64 s, const std::vector<int> &stripe,
+      const std::vector<WritePiece> &pieces,
+      const std::vector<std::vector<uint8_t>> &old_bytes,
+      std::vector<std::vector<uint8_t>> &out, bool &ok);
   /**
    * Reconstruct stripe `s` for a degraded write. Refuses (ok=false) when its
    * parity is stale: the down member's bytes would then exist nowhere.

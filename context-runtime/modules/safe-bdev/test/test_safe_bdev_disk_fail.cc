@@ -1102,3 +1102,53 @@ TEST_CASE("safe_bdev_degraded_churn_verify",
   phase(40, "after restart");
   rig.Cleanup();
 }
+
+TEST_CASE("safe_bdev_two_down_churn_across_restart",
+          "[safe_bdev][disk_fail][restart]") {
+  // #1131 (traced): after a crash restart with a data AND a parity member
+  // of an array dead (max_failures), a node-local cache copy written to the
+  // array afterwards read back with one 64 KiB chunk holding an older
+  // allocation's bytes. Churn with both members down, restart the array
+  // (the crash-like way: no alloc-log flush first), keep churning with them
+  // still dead, and check every live byte throughout.
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      76000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("tdn", base);
+  constexpr size_t kThreads = 4;
+  std::vector<std::vector<ChurnSet>> sets(kThreads);
+  std::vector<std::mt19937> rngs;
+  for (size_t t = 0; t < kThreads; ++t) rngs.emplace_back(2131 + t);
+  std::vector<clio::run::u32> next_tag(kThreads, 0);
+  auto phase = [&](int steps, const char *when) {
+    const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, steps);
+    INFO(std::string("churn ") + when + ": " + e);
+    REQUIRE(e.empty());
+    const std::string v = VerifyChurn(rig.safe, sets);
+    INFO(std::string("verify ") + when + ": " + v);
+    REQUIRE(v.empty());
+  };
+  phase(40, "healthy");
+  KillDisk(rig.paths[0]);                // a data member
+  KillDisk(rig.paths[kMembers - 1]);     // a parity member
+  phase(60, "data 0 + parity 1 dead");
+  // Crash-like restart: destroy the pool without flushing its alloc log.
+  {
+    clio::run::admin::Client admin(clio::run::kAdminPoolId);
+    auto d = admin.AsyncDestroyPool(clio::run::PoolQuery::Dynamic(),
+                                    rig.safe.pool_id_);
+    d.Wait();
+    REQUIRE(d->GetReturnCode() == 0);
+    std::this_thread::sleep_for(150ms);
+  }
+  rig.Create();
+  {
+    const std::string v = VerifyChurn(rig.safe, sets);
+    INFO("verify after restart: " + v);
+    REQUIRE(v.empty());
+  }
+  phase(80, "after restart, both still dead");
+  rig.Cleanup();
+}

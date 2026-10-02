@@ -1297,9 +1297,54 @@ bool Runtime::DownBytesClobbered(clio::run::u64 s, const DegradedStripe &st,
   return false;
 }
 
+clio::run::TaskResume Runtime::ReconstructStripeAsBefore(
+    clio::run::u64 s, const std::vector<int> &stripe,
+    const std::vector<WritePiece> &pieces,
+    const std::vector<std::vector<uint8_t>> &old_bytes,
+    std::vector<std::vector<uint8_t>> &out, bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = false;
+  if (old_bytes.size() != pieces.size() || stripe.empty()) CLIO_CO_RETURN;
+  for (size_t i = 0; i < pieces.size(); ++i) {
+    if (pieces[i].slot == s && old_bytes[i].size() != pieces[i].len) {
+      CLIO_CO_RETURN;  // a replaced range was not captured: cannot rewind
+    }
+  }
+  const std::vector<int> code = CodeColumns();
+  const int k = static_cast<int>(code.size());
+  std::vector<int> idx;
+  std::vector<std::vector<uint8_t>> bufs;
+  const std::vector<int> none;
+  CLIO_CO_AWAIT(GatherSurvivors(s, code, none, idx, bufs));
+  if (static_cast<int>(idx.size()) < k) CLIO_CO_RETURN;
+  // Rewind each data survivor to the bytes the parity still encodes.
+  for (size_t si = 0; si < idx.size(); ++si) {
+    if (idx[si] >= k) continue;  // a parity shard: untouched by the write
+    const int d = code[static_cast<size_t>(idx[si])];
+    for (size_t i = 0; i < pieces.size(); ++i) {
+      const WritePiece &p = pieces[i];
+      if (p.slot != s || static_cast<int>(p.member) != d) continue;
+      std::memcpy(bufs[si].data() + p.within, old_bytes[i].data(), p.len);
+    }
+  }
+  std::vector<const uint8_t *> ptrs(bufs.size());
+  for (size_t i = 0; i < bufs.size(); ++i) ptrs[i] = bufs[i].data();
+  std::vector<std::vector<uint8_t>> decoded;
+  if (!GetCodec(k)->DecodeData(idx, ptrs, kChunkLen, &decoded)) {
+    CLIO_CO_RETURN;
+  }
+  out.assign(stripe.size(), std::vector<uint8_t>());
+  for (size_t pos = 0; pos < stripe.size(); ++pos) {
+    out[pos] = std::move(decoded[static_cast<size_t>(stripe[pos])]);
+  }
+  ok = true;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::RetryStripeDegraded(
     clio::run::u64 s, const std::vector<WritePiece> &pieces, const char *data,
-    bool &ok) {
+    bool &ok, const std::vector<std::vector<uint8_t>> *old_bytes) {
   CLIO_TASK_BODY_BEGIN
   ok = false;
   if (IsSlotDirty(s)) {
@@ -1331,6 +1376,13 @@ clio::run::TaskResume Runtime::RetryStripeDegraded(
   }
   bool rok = false;
   CLIO_CO_AWAIT(ReconstructStripe(s, st.members, landed, st.chunks, rok));
+  if (!rok && old_bytes != nullptr) {
+    // Too many erasures to ignore what landed -- but the bytes it replaced
+    // were read before the write: rewind the survivors to them and decode
+    // the stripe exactly as the parity still encodes it (#1139).
+    CLIO_CO_AWAIT(ReconstructStripeAsBefore(s, st.members, pieces, *old_bytes,
+                                            st.chunks, rok));
+  }
   if (!rok) {
     // Too many erasures for that. Decode from the survivors as they are now:
     // exact wherever this write left the survivors untouched, which is all
@@ -1533,7 +1585,8 @@ clio::run::TaskResume Runtime::WriteStripes(
   }
   for (clio::run::u64 s : retried) {
     if (!wok) break;
-    CLIO_CO_AWAIT(RetryStripeDegraded(s, pieces, data, wok));
+    CLIO_CO_AWAIT(RetryStripeDegraded(s, pieces, data, wok,
+                                      old_bytes.empty() ? nullptr : &old_bytes));
     if (wok) clean.insert(s);
   }
   for (auto &kv : degraded) {
@@ -1570,7 +1623,8 @@ clio::run::TaskResume Runtime::WriteStripes(
     if (!eok && StripeHasDownMemberLocked(s)) {
       // A member went down between the data landing and this encode: redo
       // the stripe degraded, as for a member write that failed outright.
-      CLIO_CO_AWAIT(RetryStripeDegraded(s, pieces, data, eok));
+      CLIO_CO_AWAIT(RetryStripeDegraded(
+          s, pieces, data, eok, old_bytes.empty() ? nullptr : &old_bytes));
       if (!eok) {
         MarkSlotDirty(s);  // its lost chunk is refused, never decoded wrong
         CLIO_CO_RETURN;    // the write fails: not all of it is protected
@@ -2615,7 +2669,12 @@ void Runtime::LogCleanIntents(const std::vector<IntentKey> &keys,
       intent_stale_[k.slot].insert(k.key);
     }
   }
-  // Lazily flushed: a lost clean record costs one needless re-encode.
+  // Into the kernel now (no fsync), like the dirty intent: survives this
+  // process dying. Lazily buffered, a crash lost it and the restart saw the
+  // stripe as mid-write -- harmless while every member is up (one needless
+  // re-encode), but with a member down such a stripe cannot be re-encoded,
+  // so every later write to it was refused (#1137, #1139).
+  alloc_log_.Append();
 }
 
 clio::run::u64 Runtime::IntentWatermark() {
@@ -2640,6 +2699,7 @@ void Runtime::LogStripesEncoded(const std::set<clio::run::u64> &slots,
     }
     if (keys.empty()) intent_stale_.erase(it);
   }
+  alloc_log_.Append();  // survives a crash, as in LogCleanIntents
 }
 
 clio::run::TaskResume Runtime::AwaitIntentDurable(clio::run::u64 seq) {
