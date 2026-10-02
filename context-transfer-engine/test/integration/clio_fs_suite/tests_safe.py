@@ -293,3 +293,54 @@ def t_cache_coherent_after_crash(ctx):
   ctx.metrics['files_split'] = len(split)
   ctx.check(not split, f'nodes disagree about unsynced files after a crash '
                        f'restart: {split[:3]}')
+
+
+@test('safe_cache_coherent_after_partial_crash', 'safe', min_nodes=3,
+      redeploy_after=True, timeout=1800)
+def t_cache_coherent_partial_crash(ctx):
+  """#1136 (restart-invalidation gap): node1 caches unsynced files written on
+  node0; then every node EXCEPT node1 is SIGKILLed and restarted. The
+  restarted owners' recovery may shorten pages (unsynced volatile tails are
+  dropped) while node1 -- never restarted, so its cached copies were never
+  dropped -- still holds the pre-crash bytes. Every node must still read the
+  same bytes for each file."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('pc')
+  ctx.ok(0, 'mkdir', path=base)
+  names = [f'g{k}' for k in range(8)]
+  for k, nm in enumerate(names):
+    ctx.ok(0, 'write_file', path=f'{base}/{nm}', size=(4 << 20) + 777 * k,
+           seed=60 + k, fsync=False, timeout=600)
+  ctx.ok(0, 'sh', cmd=f'python3 -c "import os; os.fsync(os.open({base!r}, '
+                      f'os.O_RDONLY))"', timeout=120)
+  time.sleep(3)
+  for nm in names:
+    ctx.ok(1, 'sha256', path=f'{base}/{nm}', timeout=600)
+  others = [h for i, h in enumerate(cl.hosts) if i != 1]
+  from cluster import parallel
+  parallel(cl.kill_fuse, others)
+  parallel(cl.kill_runtime, others)
+  time.sleep(5)
+  for h in others:
+    cl.start_runtime(h)
+  for h in others:
+    ctx.check(cl.runtime_up(h), f'{h} runtime did not restart')
+  time.sleep(5)
+  for h in others:
+    ctx.check(cl.mount(h), f'{h} remount failed')
+    cl.agents.pop(h, None)
+  time.sleep(10)  # recovery (restart pulls, peers see the rejoin)
+  split = []
+  for nm in names:
+    seen = {}
+    for i in range(n):
+      r = ctx.call(i, 'sha256', path=f'{base}/{nm}', timeout=600)
+      seen[f'node{i}'] = ((r.get('ret') or {}).get('sha256', '')[:12],
+                          (r.get('ret') or {}).get('size')) if r.get('ok') \
+          else f'err {r.get("errno")}'
+    if len(set(map(str, seen.values()))) > 1:
+      split.append((nm, seen))
+  ctx.metrics['files_split'] = len(split)
+  ctx.check(not split, f'nodes disagree after a crash of every node but the '
+                       f'one holding cached copies: {split[:3]}')
