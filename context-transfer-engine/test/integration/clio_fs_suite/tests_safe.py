@@ -17,7 +17,7 @@ return wrong bytes.
 import threading
 import time
 
-from cluster import SAFE_MEMBERS, SAFE_PARITY
+from cluster import SAFE_MEMBERS, SAFE_PARITY, parallel
 from suite import test
 from tests_fault import restart_cluster
 from tests_stress import (CORRUPT, FILE_BLOCKS, FOREIGN, ZERO,
@@ -344,3 +344,82 @@ def t_cache_coherent_partial_crash(ctx):
   ctx.metrics['files_split'] = len(split)
   ctx.check(not split, f'nodes disagree after a crash of every node but the '
                        f'one holding cached copies: {split[:3]}')
+
+
+@test('safe_disk_replaced_and_rebuilt', 'safe', min_nodes=1,
+      redeploy_after=True, timeout=5400)
+def t_disk_replaced(ctx):
+  """The operator's repair path under load: a data disk dies in every
+  node's array while writers run, is swapped for a fresh disk and rebuilt
+  onto it (RecoverBdev) with the writers still going. Redundancy must be
+  back afterwards: two MORE members per array then die (max_failures again,
+  three originals dead in all) and every fsynced version must still read
+  back intact -- before and after a crash restart, which must bring the
+  replacement disk back as a member rather than the dead original."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('dr')
+  ctx.ok(0, 'mkdir', path=base)
+  th, replies, logs, nfiles = _writers(ctx, base, 150, 'diskrepl')
+  time.sleep(20)
+  for h in cl.hosts:
+    cl.kill_disk(h, 0)
+  time.sleep(20)
+  t0 = time.time()
+  res = parallel(lambda h: cl.replace_disk(h, 0), cl.hosts)
+  ctx.metrics['rebuild_s'] = round(time.time() - t0, 1)
+  bad = {h: r for h, r in zip(cl.hosts, res)
+         if isinstance(r, Exception) or r[0] != 0}
+  ctx.check(not bad, f'rebuild onto the replacement disk failed: '
+                     f'{ {h: str(r)[-400:] for h, r in bad.items()} }')
+  th.join(timeout=150 + 1000)
+  errs = _writer_errors(replies, n)
+  ctx.metrics['writer_errors'] = errs
+  ctx.check(not any(errs.values()),
+            f'writes failed across a disk death and its rebuild: {errs}')
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after a dead disk was replaced and rebuilt')
+  for h in cl.hosts:  # max_failures more: only parity can cover them now
+    cl.kill_disk(h, 1)
+    cl.kill_disk(h, SAFE_MEMBERS - 1)
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  f'after {SAFE_PARITY} more disks died behind the rebuild')
+  restart_cluster(ctx, crash=True)
+  ctx.cl.agents.clear()
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after a crash restart with the replacement disk seated')
+
+
+@test('safe_rolling_restart_degraded', 'safe', min_nodes=2,
+      redeploy_after=True, timeout=7200)
+def t_rolling_restart_degraded(ctx):
+  """A rolling restart of the whole cluster while every array runs
+  degraded: a data disk is dead on every node from the start, and every
+  node in turn is taken down (alternately SIGKILLed and stopped) and
+  brought back while all nodes keep writing fsynced record files. Halfway
+  through, a parity disk also dies on node0 (max_failures there). Crashes
+  land in the middle of degraded writes, the case the degraded-write
+  journal exists for (#1137): every fsynced version must survive, and the
+  writers on nodes that stayed up must see no errors once their peer is
+  back."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('rr')
+  ctx.ok(0, 'mkdir', path=base)
+  for h in cl.hosts:
+    cl.kill_disk(h, 0)
+  secs = 60 + 75 * n
+  th, replies, logs, nfiles = _writers(ctx, base, secs, 'rolling')
+  time.sleep(30)
+  for i, h in enumerate(cl.hosts):
+    _bounce(ctx, h, crash=(i % 2 == 0), down_s=20)
+    if i == n // 2:
+      cl.kill_disk(cl.hosts[0], SAFE_MEMBERS - 1)
+    time.sleep(30)  # degraded writes resume on the rejoined node
+  th.join(timeout=secs + 1800)
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after a rolling restart with every array degraded')
+  restart_cluster(ctx, crash=True)
+  ctx.cl.agents.clear()
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after the rolling restart and a full crash restart')

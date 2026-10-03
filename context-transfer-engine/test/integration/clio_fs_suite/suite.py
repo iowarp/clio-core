@@ -187,7 +187,7 @@ def snapshot_bins(src, dst):
   os.makedirs(dst, exist_ok=True)
   for name in os.listdir(src):
     if name in ('clio_run', 'clio_cte_fuse', 'cte_search',
-                'clio_safe_bdev_dist_stress') or (
+                'clio_safe_bdev_dist_stress', 'clio_safe_bdev_recover') or (
         name.startswith('lib') and '.so' in name):
       sp = os.path.join(src, name)
       dp = os.path.join(dst, name)

@@ -225,7 +225,7 @@ class Cluster:
     if self.profile != 'safe':
       return ''
     lr = self.local_root
-    per_member_gb = max(1, -(-self.disk_gb // (SAFE_MEMBERS - SAFE_PARITY)))
+    per_member_gb = self.safe_member_gb()
     out = ''
     members = ''
     for k in range(SAFE_MEMBERS):
@@ -259,6 +259,32 @@ class Cluster:
     """Make safe_bdev member k on `host` fail every I/O from now on (the file
     bdev's test fault injection), as a disk dying under load would."""
     return sh(host, f'touch {self.safe_member_path(k)}.fail', timeout=30)
+
+  def safe_member_gb(self):
+    """Capacity (GiB) of each safe_bdev member: disk_gb over the data
+    members, rounded up."""
+    return max(1, -(-self.disk_gb // (SAFE_MEMBERS - SAFE_PARITY)))
+
+  def replace_disk(self, host, k, gen=1):
+    """Swap failed member k on `host` for a fresh disk and rebuild onto it
+    (clio_safe_bdev_recover -> RecoverBdev on the running array).
+
+    Args:
+      host: node whose array is repaired.
+      k: the failed member (0-based).
+      gen: replacement generation; picks a fresh file and pool id.
+    Returns:
+      (rc, output) of the tool; rc 0 when the rebuild completed.
+    """
+    lr = self.local_root
+    new_id = f'{SAFE_MEMBER_POOL_MAJOR + 100 * gen + k}.0'
+    cap = self.safe_member_gb() << 30
+    cmd = (f'{self.env_prefix()} timeout 1800 '
+           f'{self.bin_dir}/clio_safe_bdev_recover --array {SAFE_POOL_ID} '
+           f'--failed {SAFE_MEMBER_POOL_MAJOR + k}.0 '
+           f'--member {lr}/data/safe_m{k}_r{gen}.dat --capacity {cap} '
+           f'--new-id {new_id}')
+    return sh(host, cmd, timeout=1830)
 
   def revive_disk(self, host, k):
     """Undo kill_disk: the member's device answers again."""
