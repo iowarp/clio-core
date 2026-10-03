@@ -252,6 +252,8 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
                                            FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   int rc = 0;
+  // Records dirtied from here on are this op's: only their failure fails it.
+  const clio::run::u64 since = DirtySeq();
   switch (op) {
     case kShardInsert:
     case kShardRemove:
@@ -316,7 +318,7 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
   if (op != kShardBlockPush && op != kShardInodePush &&
       op != kShardBlockFetch) {
     int ferr = 0;
-    CLIO_CO_AWAIT(FlushInodes(&ferr));
+    CLIO_CO_AWAIT(FlushInodes(&ferr, since));
     // The change could not be made durable (a full store): say so rather
     // than acknowledge it.
     if (rc == 0 && ferr != 0) rc = ferr;
@@ -456,6 +458,9 @@ void Runtime::DropInodeLocked(const std::shared_ptr<FileInfo> &fi) {
     orphans_dirty_ = true;  // it leaves the orphan record
   }
   by_tag_.erase(packed);
+  // Its record still reads nlink 1 until the purge deletes it: an open
+  // racing the rename that dropped it must not load it back (#1150).
+  dying_.insert(packed);
   PurgeItem item;
   item.id_ = fi->tag_id_;
   item.data_ = true;  // pages and the inode record (symlinks have one too)
@@ -660,6 +665,11 @@ clio::run::TaskResume Runtime::PurgeDrain() {
         FsResp ignored;  // an unreachable node keeps its pages (a leak)
         CLIO_CO_AWAIT(CallShard(c, kShardPurgeLocal, batch, ignored));
       }
+    }
+    {
+      // The records are gone: EnsureInode finds nothing to load now.
+      std::lock_guard<std::mutex> g(meta_mu_);
+      for (size_t j = i; j < end; ++j) dying_.erase(FsPack(work[j].id_));
     }
     for (size_t j = i; j < end; ++j) {
       if (!work[j].xattr_ || xattr_tag_id_.IsNull()) continue;

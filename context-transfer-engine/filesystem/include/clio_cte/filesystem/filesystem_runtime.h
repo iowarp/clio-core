@@ -925,10 +925,50 @@ class Runtime : public clio::run::Container {
    * inode is tried once per call: one that cannot be stored (a full store)
    * stays dirty for a later flush instead of being retried in a loop that
    * never returns.
-   * @param err out (optional): 0, or the errno of the first record that
-   *        could not be stored (ENOSPC for a full store, else EIO)
+   * @param err out (optional): 0, or the errno of the first record dirtied
+   *        after @p since that could not be stored (ENOSPC for a full
+   *        store, else EIO)
+   * @param since DirtySeq() when the caller started its change: a record
+   *        dirtied earlier and still failing is another operation's change,
+   *        already reported to it, and does not fail this one (one record
+   *        stuck on a full store failed every unlink on its container, so
+   *        no space could ever be freed)
    */
-  clio::run::TaskResume FlushInodes(int *err = nullptr);
+  clio::run::TaskResume FlushInodes(int *err = nullptr,
+                                    clio::run::u64 since = 0);
+  /**
+   * The current inode-dirty sequence number: every MarkInodeDirtyLocked
+   * after this call stamps its inode with a larger one.
+   * @return the sequence number
+   */
+  clio::run::u64 DirtySeq();
+  /**
+   * Whether an inode was dropped (nlink 0, no open) and its purge has not
+   * yet deleted its record. EnsureInode must not load such a record: it
+   * still says nlink 1, and an open that resolved the name just before a
+   * rename replaced it brought the file back with no stream size, so a
+   * read through it returned 0 bytes (#1150).
+   * @param packed inode id
+   * @return true while the inode is between drop and purge
+   */
+  bool IsDying(clio::run::u64 packed);
+  /** Inodes dropped and queued for purge, until the purge ran (meta_mu_). */
+  std::unordered_set<clio::run::u64> dying_;
+  /**
+   * Whether FlushInodes should skip a dirty record this round (meta_mu_
+   * held): its last store failed under kInodeStoreRetryMs ago and the
+   * caller did not change it. Every namespace op flushes, so without this
+   * a record stuck on a full store was retried by each one.
+   * @param packed inode id
+   * @param since the caller's DirtySeq() at the start of its change
+   * @return true to leave it for a later flush
+   */
+  bool StoreBackingOff(clio::run::u64 packed, clio::run::u64 since);
+  /** How long a record whose store failed waits before another caller's
+   *  flush retries it. */
+  static constexpr clio::run::u64 kInodeStoreRetryMs = 1000;
+  /** SteadyMs() of each dirty record's last failed store (meta_mu_). */
+  std::unordered_map<clio::run::u64, clio::run::u64> inode_store_failed_ms_;
   /**
    * Make sure an inode this container homes is in memory: after a restart
    * inodes load lazily from their records.
@@ -995,6 +1035,9 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume ReconcileRestoredStreams();
   std::unordered_set<clio::run::u64> inode_dirty_;    ///< meta_mu_
+  /** Sequence number of each dirty inode's latest change (meta_mu_). */
+  std::unordered_map<clio::run::u64, clio::run::u64> inode_dirty_seq_;
+  clio::run::u64 dirty_seq_ = 0;  ///< meta_mu_; last number handed out
   std::unordered_set<clio::run::u64> inode_storing_;  ///< meta_mu_
 
   // ---- public-handler building blocks (filesystem_runtime.cc) ----

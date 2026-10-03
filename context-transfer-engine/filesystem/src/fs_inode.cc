@@ -92,7 +92,27 @@ bool Runtime::DecInodeRec(const std::string &rec, FileInfo *fi,
 }
 
 void Runtime::MarkInodeDirtyLocked(const FileInfo &fi) {
-  inode_dirty_.insert(FsPack(fi.tag_id_));
+  const clio::run::u64 packed = FsPack(fi.tag_id_);
+  inode_dirty_.insert(packed);
+  inode_dirty_seq_[packed] = ++dirty_seq_;
+}
+
+bool Runtime::StoreBackingOff(clio::run::u64 packed, clio::run::u64 since) {
+  auto fit = inode_store_failed_ms_.find(packed);
+  if (fit == inode_store_failed_ms_.end()) return false;
+  auto sit = inode_dirty_seq_.find(packed);
+  if (sit != inode_dirty_seq_.end() && sit->second > since) return false;
+  return SteadyMs() < fit->second + kInodeStoreRetryMs;
+}
+
+bool Runtime::IsDying(clio::run::u64 packed) {
+  std::lock_guard<std::mutex> g(meta_mu_);
+  return dying_.count(packed) != 0;
+}
+
+clio::run::u64 Runtime::DirtySeq() {
+  std::lock_guard<std::mutex> g(meta_mu_);
+  return dirty_seq_;
 }
 
 namespace {
@@ -131,6 +151,7 @@ struct InodeWork {
   std::map<clio::run::u32, clio::run::u64> holders;  ///< caching it (+ reg)
   std::map<clio::run::u32, clio::run::u64> leases;   ///< their lease ends
   bool resync = false;  ///< holders unknown: pushed to every container
+  clio::run::u64 seq = 0;  ///< dirty sequence number of the stored change
 };
 }  // namespace
 
@@ -172,7 +193,7 @@ clio::run::TaskResume Runtime::StoreInodeRec(clio::run::u64 packed,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::FlushInodes(int *err) {
+clio::run::TaskResume Runtime::FlushInodes(int *err, clio::run::u64 since) {
   CLIO_TASK_BODY_BEGIN
   if (err != nullptr) *err = 0;
   std::unordered_set<clio::run::u64> failed;  // tried this call; stay dirty
@@ -196,12 +217,18 @@ clio::run::TaskResume Runtime::FlushInodes(int *err) {
           ++it;
           continue;
         }
+        if (StoreBackingOff(packed, since)) {
+          ++it;  // failed moments ago and not this caller's change
+          continue;
+        }
         auto fit = by_tag_.find(packed);
         if (fit != by_tag_.end()) {
           const FileInfo &fi = *fit->second;
           inode_storing_.insert(packed);
           InodeWork w;
           w.packed = packed;
+          auto sit = inode_dirty_seq_.find(packed);
+          w.seq = sit == inode_dirty_seq_.end() ? 0 : sit->second;
           w.rec = EncInodeRec(fi, FileSize(fi), container_id_);
           FsAttr a;
           InodeAttrLocked(fi, &a);
@@ -221,6 +248,10 @@ clio::run::TaskResume Runtime::FlushInodes(int *err) {
             }
           }
           work.push_back(std::move(w));
+        }
+        if (fit == by_tag_.end()) {
+          inode_dirty_seq_.erase(packed);
+          inode_store_failed_ms_.erase(packed);
         }
         it = inode_dirty_.erase(it);  // dropped inodes need no record
       }
@@ -266,12 +297,20 @@ clio::run::TaskResume Runtime::FlushInodes(int *err) {
         DropGoneHolders(gone, w.holders, &fit->second->holders_,
                         &fit->second->holder_lease_ms_);
       }
-      if (src != 0) {
+      if (src == 0) {
+        inode_store_failed_ms_.erase(w.packed);
+        auto sit = inode_dirty_seq_.find(w.packed);
+        if (inode_dirty_.count(w.packed) == 0 &&
+            sit != inode_dirty_seq_.end() && sit->second == w.seq) {
+          inode_dirty_seq_.erase(sit);
+        }
+      } else {
         HLOG(kWarning, "filesystem: storing inode {} failed (rc {}); will "
              "retry", w.packed, src);
         if (fit != by_tag_.end()) inode_dirty_.insert(w.packed);
+        inode_store_failed_ms_[w.packed] = SteadyMs();
         failed.insert(w.packed);
-        if (err != nullptr && *err == 0) {
+        if (err != nullptr && *err == 0 && w.seq > since) {
           *err = clio::cte::core::PutRcIsNoSpace(
                      static_cast<clio::run::u32>(src))
                      ? ENOSPC
@@ -403,7 +442,7 @@ int Runtime::ApplyInodePush(const FsReq &req) {
 clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed) {
   CLIO_TASK_BODY_BEGIN
   if (packed == 0 || InodeOwner(packed) != container_id_ ||
-      FindInode(packed) != nullptr) {
+      FindInode(packed) != nullptr || IsDying(packed)) {
     CLIO_CO_RETURN;
   }
   {
@@ -455,6 +494,8 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed) {
     }
   }
   std::lock_guard<std::mutex> lk(meta_mu_);
+  // Dropped while the record was being read: it stays gone (#1150).
+  if (dying_.count(packed) != 0) CLIO_CO_RETURN;
   by_tag_.emplace(packed, fi);  // a racing loader may have won: keep it
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

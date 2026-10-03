@@ -616,6 +616,8 @@ clio::run::TaskResume Runtime::AdvanceSize(
     CLIO_CO_AWAIT(clio::run::yield(kAdvanceRetryUs));
   }
   CLIO_CO_AWAIT(EnsureInode(task->tag_packed_));
+  // Only a record this update dirties can fail it (see FlushInodes).
+  const clio::run::u64 since = DirtySeq();
   std::shared_ptr<FileInfo> fi = FindInode(task->tag_packed_);
   if (fi == nullptr) {
     task->return_code_ = ENOENT;
@@ -644,7 +646,8 @@ clio::run::TaskResume Runtime::AdvanceSize(
     if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
   }
   int ferr = 0;
-  CLIO_CO_AWAIT(FlushInodes(&ferr));  // the record carries the new size/mtime
+  // The record carries the new size/mtime.
+  CLIO_CO_AWAIT(FlushInodes(&ferr, since));
   task->return_code_ = static_cast<clio::run::u32>(ferr);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -701,6 +704,8 @@ clio::run::TaskResume Runtime::MultiCreate(
 clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
   CLIO_TASK_BODY_BEGIN
   EnsurePurgeDrain();
+  // Only a record this close dirties can fail it (see FlushInodes).
+  const clio::run::u64 since = DirtySeq();
   std::shared_ptr<FileInfo> fi;
   {
     std::lock_guard<std::mutex> g(meta_mu_);
@@ -734,7 +739,7 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
     }
   }
   int ferr = 0;
-  CLIO_CO_AWAIT(FlushInodes(&ferr));
+  CLIO_CO_AWAIT(FlushInodes(&ferr, since));
   task->return_code_ = static_cast<clio::run::u32>(ferr);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
