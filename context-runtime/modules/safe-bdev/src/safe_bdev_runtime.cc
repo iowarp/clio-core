@@ -1119,6 +1119,13 @@ clio::run::TaskResume Runtime::AllocateBlocks(
     // new member's WRITE dirties the stripes it joins.
     remaining -= seg;
   }
+  // Into the kernel before the caller learns the slots (one write, no
+  // fsync): the CTE logs a blob layout that names them right after, and a
+  // process crash that kept that record but lost this one restarted with
+  // the slots "free" -- reallocated to other data, they read back as another
+  // file's bytes or as holes in fsynced data. A power loss is still covered
+  // only by Sync, which fsyncs the log.
+  alloc_log_.Append();
 
   task->return_code_ = 0;
   CLIO_CO_RETURN;
@@ -1155,6 +1162,7 @@ clio::run::TaskResume Runtime::FreeBlocks(clio::run::shared_ptr<FreeBlocksTask> 
     data_alloc_[d].Release(s);
     alloc_log_.LogFree(kAllocGroup, b.offset_, b.size_, 0);
   }
+  alloc_log_.Append();  // survives a process crash, as AllocateBlocks
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
