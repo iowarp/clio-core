@@ -524,6 +524,43 @@ TEST_CASE("bdev_lazy_file_growth", "[bdev][file][growth]") {
  * minutes.
  */
 #ifndef _WIN32
+TEST_CASE("bdev_file_remaining_capped_by_host_disk",
+          "[bdev][file][capacity]") {
+  // #1108: a file bdev configured larger than its disk's free space
+  // reported the configured free space, so placement kept choosing it after
+  // the disk filled. Its remaining size must not exceed what the backing
+  // filesystem can hold (plus its already-reserved prefix).
+  BdevChimodFixture fixture;
+  REQUIRE(g_initialized);
+  constexpr clio::run::u64 kMiB = 1024 * 1024;
+  constexpr clio::run::u64 kGrowthUnit = 32 * kMiB;
+  std::error_code ec;
+  const auto si = std::filesystem::space(
+      std::filesystem::path(fixture.getTestFile()).parent_path(), ec);
+  REQUIRE_FALSE(ec);
+  // Far beyond the disk: 64x its total size.
+  const clio::run::u64 capacity =
+      static_cast<clio::run::u64>(si.capacity) * 64;
+  clio::run::PoolId custom_pool_id(143, 0);
+  clio::run::bdev::Client client(custom_pool_id);
+  auto create_task = client.AsyncCreate(
+      clio::run::PoolQuery::Dynamic(), fixture.getTestFile(), custom_pool_id,
+      clio::run::bdev::BdevType::kFile, capacity, 32, 4096,
+      /*perf_metrics=*/nullptr, /*alloc_log_path=*/"", kGrowthUnit);
+  create_task.Wait();
+  REQUIRE(create_task->GetReturnCode() == 0);
+  client.pool_id_ = create_task->new_pool_id_;
+  auto stats = client.AsyncGetStats();
+  stats.Wait();
+  const clio::run::u64 remaining = stats->remaining_size_;
+  const clio::run::u64 bound =
+      static_cast<clio::run::u64>(si.available) + kGrowthUnit + 64 * kMiB;
+  HLOG(kInfo, "bdev_file_remaining_capped_by_host_disk: capacity {} "
+       "remaining {} host free {}", capacity, remaining, si.available);
+  REQUIRE(remaining > 0);
+  REQUIRE(remaining <= bound);
+}
+
 TEST_CASE("bdev_file_growth_near_full_disk", "[bdev][file][growth][enospc]") {
   BdevChimodFixture fixture;
   if (fixture.getNumContainers() != 1) {

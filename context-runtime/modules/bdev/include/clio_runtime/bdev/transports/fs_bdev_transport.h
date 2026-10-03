@@ -45,7 +45,15 @@ class FsBdevTransport : public BdevTransport {
   clio::run::TaskResume ReadBlocks(ctp::ipc::FullPtr<ReadTask> task) override;
 
   clio::run::u64 GetCapacity() const override { return allocator_.GetCapacity(); }
-  clio::run::u64 GetRemainingSize() const override { return allocator_.GetRemainingSize(); }
+  /**
+   * Bytes the device can still hand out AND back with disk (#1108): the
+   * allocator's free space, capped by the free part of the backed prefix
+   * plus what the host filesystem can still give the file. A capacity set
+   * above the disk's free space otherwise reported gigabytes free while
+   * every growth failed, and placement kept choosing a full target.
+   * @return remaining bytes
+   */
+  clio::run::u64 GetRemainingSize() const override;
 
   void FlushAllocLog() override;
   bool Sync() override;
@@ -92,6 +100,13 @@ class FsBdevTransport : public BdevTransport {
    *  fast for kGrowRetryNs instead of retrying the reservation. */
   clio::run::u64 grow_fail_end_ = 0;
   clio::run::u64 grow_fail_ns_ = 0;
+  /** Host filesystem free bytes (cached for kHostFreeTtlNs) and when it
+   *  was sampled (steady ns); 0 ns = never. */
+  mutable std::atomic<clio::run::u64> host_free_{0};
+  mutable std::atomic<clio::run::u64> host_free_ns_{0};
+  static constexpr clio::run::u64 kHostFreeTtlNs = 1000000000ull;
+  /** @return free bytes on the backing file's filesystem (cached). */
+  clio::run::u64 HostFreeBytes() const;
   /** How long a failed grow is trusted before disk space is probed again. */
   static constexpr clio::run::u64 kGrowRetryNs = 2000000000ull;
   /**

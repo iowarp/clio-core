@@ -3,6 +3,7 @@
  * All rights reserved.
  */
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -487,6 +488,42 @@ bool FsBdevTransport::EnsureFileBacked(clio::run::u64 end_offset) {
        backed, target);
   file_backed_bytes_.store(target, std::memory_order_release);
   return true;
+}
+
+clio::run::u64 FsBdevTransport::HostFreeBytes() const {
+  const clio::run::u64 now_ns = static_cast<clio::run::u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  const clio::run::u64 at = host_free_ns_.load(std::memory_order_acquire);
+  if (at != 0 && now_ns - at < kHostFreeTtlNs) {
+    return host_free_.load(std::memory_order_relaxed);
+  }
+  std::error_code ec;
+  const std::filesystem::space_info si =
+      std::filesystem::space(std::filesystem::path(file_path_).parent_path(),
+                             ec);
+  // Unknown (e.g. no permission to stat): do not cap by it.
+  const clio::run::u64 free_b =
+      ec ? ~clio::run::u64(0) : static_cast<clio::run::u64>(si.available);
+  host_free_.store(free_b, std::memory_order_relaxed);
+  host_free_ns_.store(now_ns, std::memory_order_release);
+  return free_b;
+}
+
+clio::run::u64 FsBdevTransport::GetRemainingSize() const {
+  const clio::run::u64 alloc_free = allocator_.GetRemainingSize();
+  const clio::run::u64 cap = allocator_.GetCapacity();
+  const clio::run::u64 used = cap > alloc_free ? cap - alloc_free : 0;
+  const clio::run::u64 backed =
+      file_backed_bytes_.load(std::memory_order_relaxed);
+  // Free room inside the already-reserved prefix, then whatever the disk
+  // can still add to the file.
+  const clio::run::u64 in_backed = backed > used ? backed - used : 0;
+  const clio::run::u64 host = HostFreeBytes();
+  const clio::run::u64 can_back =
+      host > ~clio::run::u64(0) - in_backed ? ~clio::run::u64(0)
+                                            : in_backed + host;
+  return std::min(alloc_free, can_back);
 }
 
 void FsBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& blocks) {
