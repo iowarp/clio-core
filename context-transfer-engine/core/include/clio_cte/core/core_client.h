@@ -1184,6 +1184,12 @@ class Client : public clio::run::ContainerClient {
       }
     }
     void KeyRelease(clio::run::u64 key, clio::run::u64 seq, int err = 0) {
+      if (err == ENOSPC ||
+          (err > 0 && PutRcIsNoSpace(static_cast<clio::run::u32>(err)))) {
+        // A put the store had no room for: writers check this epoch so the
+        // file's next write(2) reports ENOSPC (#1129).
+        nospace_epoch_.fetch_add(1, std::memory_order_release);
+      }
       Shard &sh = ShardFor(key);
       std::lock_guard<std::mutex> lk(sh.mtx_);
       if (err != 0) {
@@ -1260,6 +1266,9 @@ class Client : public clio::run::ContainerClient {
       auto it = sh.per_key_.find(key);
       return it == sh.per_key_.end() ? 0 : it->second.max_end_;
     }
+
+    /** Count of puts refused for lack of space (#1129). */
+    std::atomic<clio::run::u64> nospace_epoch_{0};
 
     /** Consume the sticky failure recorded for `key`, if any. Consuming is
      *  the point: fsync(2) reports a write-behind failure ONCE, and a second
@@ -1480,6 +1489,16 @@ class Client : public clio::run::ContainerClient {
       return 0;
     }
     return reg.MaxPendingEnd(key);
+  }
+
+  /**
+   * How many write-behind puts the store has refused for lack of space so
+   * far (#1129). A writer that sees it move drains its own file's pages to
+   * learn whether one of them was refused.
+   * @return the count
+   */
+  static clio::run::u64 DeferNoSpaceEpoch() {
+    return DeferRegistry::Get().nospace_epoch_.load(std::memory_order_acquire);
   }
 
   /** Consume `key`'s sticky write-behind failure (0 if none) — fsync/close. */

@@ -154,6 +154,9 @@ struct CfsHandle {
   // The open-file record of the libfuse node it was opened on (null: not
   // registered; see RegisterOpenFile).
   std::shared_ptr<struct OpenNode> open_node;
+  // Client no-space epoch this handle last checked (#1129, see
+  // CheckWriteBehindNoSpace).
+  std::atomic<clio::run::u64> nospace_seen{0};
 };
 
 /** The files open on one libfuse node -- one kernel inode, one page cache. */
@@ -838,27 +841,50 @@ clio::run::u64 DirtyTake(const clio::cte::core::TagId &tag) {
  * @param hiwater extent of the writes to drain
  * @return 0, or the first errno-style error latched by a page write
  */
-int DrainSievePages(const clio::cte::core::TagId &tag,
-                    clio::run::u64 hiwater) {
+/**
+ * DrainSievePages with options: land every deferred page write of a file
+ * and report whether any failed.
+ * @param tag the file's tag
+ * @param hiwater extent of the writes to drain
+ * @param take consume the latched errors (fsync/close) or only peek
+ *        (write(2), which must leave them owed to fsync/close)
+ * @param first_bad when non-null, receives the offset of the first page the
+ *        store refused for lack of space (~0 if none)
+ * @return 0, or the first errno-style error latched by a page write
+ */
+int DrainSievePagesEx(const clio::cte::core::TagId &tag,
+                      clio::run::u64 hiwater, bool take,
+                      clio::run::u64 *first_bad) {
+  if (first_bad != nullptr) *first_bad = ~0ull;
   if (tag.IsNull()) return 0;
-  hiwater = std::max(hiwater, DirtyTake(tag));
+  if (take) hiwater = std::max(hiwater, DirtyTake(tag));
   if (hiwater == 0) return 0;
   int first_err = 0;
   for (clio::run::u64 off = 0; off < hiwater;
        off += clio::cte::filesystem::kFsPageSize) {
     const std::string page = clio::cte::filesystem::PageName(off);
     clio::cte::core::Client::AwaitPendingPuts(tag, page);
-    int e = clio::cte::core::Client::DeferTakeKeyError(
-        clio::cte::core::Client::DeferKeyHash(tag, page));
+    const clio::run::u64 key = clio::cte::core::Client::DeferKeyHash(tag, page);
+    int e = take ? clio::cte::core::Client::DeferTakeKeyError(key)
+                 : clio::cte::core::Client::DeferPeekKeyError(key);
     // Page latches hold store return codes: a full store is ENOSPC, as on
     // ext4, not the EIO every other failure becomes.
     if (e > 0 && clio::cte::core::PutRcIsNoSpace(static_cast<clio::run::u32>(e))) {
       e = ENOSPC;
     }
+    if (e == ENOSPC && first_bad != nullptr && off < *first_bad) {
+      *first_bad = off;
+    }
     if (e != 0 && first_err == 0) first_err = e;
   }
   return first_err;
 }
+
+int DrainSievePages(const clio::cte::core::TagId &tag,
+                    clio::run::u64 hiwater) {
+  return DrainSievePagesEx(tag, hiwater, /*take=*/true, nullptr);
+}
+
 
 CfsHandle *GetHandle(struct fuse_file_info *fi) {
   return reinterpret_cast<CfsHandle *>(fi->fh);
@@ -2393,6 +2419,21 @@ int cte_fuse_rmdir(const char *path) {
 int cte_fuse_truncate(const char *path, cte_off_t size,
                       struct fuse_file_info *fi);
 
+/**
+ * A page put the store had no room for (#1129): the bytes from that page on
+ * were never stored, so the file must not claim them -- cut it back to the
+ * first refused page instead of letting it read back as zeros.
+ * @param hp the file's path
+ * @param first_bad offset of the first refused page (~0: none)
+ */
+static void ShrinkAfterNoSpace(const std::string &hp,
+                               clio::run::u64 first_bad) {
+  if (first_bad == ~0ull) return;
+  HLOG(kWarning, "clio_cte_fuse: {}: the store had no room for the write at "
+       "offset {}; the file ends there (ENOSPC)", hp, first_bad);
+  cte_fuse_truncate(hp.c_str(), static_cast<cte_off_t>(first_bad), nullptr);
+}
+
 static inline void MaybeTruncateOnOpen(clio::cte::filesystem::Client *cfs,
                                        const std::string &p, int flags) {
   if (flags & O_TRUNC) {
@@ -2681,11 +2722,17 @@ static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
   clio::cte::core::Client::DeferAwaitKey(
       clio::cte::core::Client::DeferKeyHashName(hp));
   const clio::run::u64 hiwater = HiwaterFor(hp);
-  const int werr = DrainSievePages(handle->tag, hiwater);
+  clio::run::u64 first_bad = ~0ull;
+  const int werr =
+      DrainSievePagesEx(handle->tag, hiwater, /*take=*/true, &first_bad);
   if (werr != 0) {
     // A lost write must fail fsync/close. Latched codes are a mix of errno
-    // values and store return codes, so only ENOSPC is passed through.
-    if (werr == ENOSPC) return -ENOSPC;
+    // values and store return codes, so only ENOSPC is passed through --
+    // with the file cut back to what was stored (#1129).
+    if (werr == ENOSPC) {
+      ShrinkAfterNoSpace(hp, first_bad);
+      return -ENOSPC;
+    }
     HLOG(kError, "clio_cte_fuse: write-back of {} failed (latched code {}); "
          "reporting EIO", hp, werr);
     return -EIO;
@@ -2988,6 +3035,28 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
   return static_cast<int>(got);
 }
 
+/**
+ * write(2)'s view of earlier write-behind puts (#1129): when the client has
+ * seen a put refused for lack of space since this handle last looked, find
+ * out whether it was one of this file's pages; if so the write fails with
+ * ENOSPC and the file is cut back to the refused page.
+ * @param handle the open file
+ * @param hp its path
+ * @return 0, or -ENOSPC
+ */
+static int CheckWriteBehindNoSpace(CfsHandle *handle, const std::string &hp) {
+  const clio::run::u64 ep = clio::cte::core::Client::DeferNoSpaceEpoch();
+  if (ep == handle->nospace_seen.load(std::memory_order_relaxed)) return 0;
+  handle->nospace_seen.store(ep, std::memory_order_relaxed);
+  clio::run::u64 first_bad = ~0ull;
+  // Peek, not take: any other latched error is still owed to fsync/close.
+  const int e = DrainSievePagesEx(handle->tag, HiwaterFor(hp), /*take=*/false,
+                                  &first_bad);
+  if (e != ENOSPC) return 0;
+  ShrinkAfterNoSpace(hp, first_bad);
+  return -ENOSPC;
+}
+
 int cte_fuse_write(const char *path, const char *buf, size_t size,
                           cte_off_t offset, struct fuse_file_info *fi) {
   auto *handle = GetHandle(fi);
@@ -2997,6 +3066,11 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
   if (size > static_cast<size_t>(INT_MAX))
     size = static_cast<size_t>(INT_MAX);
   if (size == 0) return 0;
+  {
+    // A page of this file the store refused earlier fails this write.
+    const int nospc = CheckWriteBehindNoSpace(handle, hp);
+    if (nospc != 0) return nospc;
+  }
 
   // SIEVE-DIRECT (user directive): the write is a memcpy into the CTE
   // sieve's page buffer — no task at all until a 64 KiB page fills and
