@@ -945,6 +945,7 @@ TEST_CASE("safe_bdev_sync_with_dying_disks",
   rig.Cleanup();
 }
 
+
 SIMPLE_TEST_MAIN()
 
 namespace {
@@ -1220,5 +1221,130 @@ TEST_CASE("safe_bdev_two_down_churn_across_restart",
     REQUIRE(v.empty());
   }
   phase(80, "after restart, both still dead");
+  rig.Cleanup();
+}
+
+TEST_CASE("safe_bdev_concurrent_degraded_crash",
+          "[safe_bdev][disk_fail][restart]") {
+  // #1137 under concurrency (seen on the 6-node rolling restart: 20 stripes
+  // stranded after a crash): four threads churn (allocate, rewrite parts,
+  // free) with a data disk dead, "crash" with every write's parity skipped,
+  // and restart with the disk still dead. Every stripe must come back
+  // encodable and every live byte intact.
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      80000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("cdc", base);
+  constexpr size_t kThreads = 4;
+  std::vector<std::vector<ChurnSet>> sets(kThreads);
+  std::vector<std::mt19937> rngs;
+  for (size_t t = 0; t < kThreads; ++t) rngs.emplace_back(1137 + t);
+  std::vector<clio::run::u32> next_tag(kThreads, 0);
+  auto phase = [&](int steps, const char *when) {
+    const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, steps);
+    INFO(std::string("churn ") + when + ": " + e);
+    REQUIRE(e.empty());
+  };
+  phase(30, "healthy");
+  KillDisk(rig.paths[0]);
+  {
+    const std::string v = VerifyChurn(rig.safe, sets);  // faults member 0
+    INFO("verify after the disk died: " + v);
+    REQUIRE(v.empty());
+  }
+  phase(30, "degraded");
+  setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
+  phase(30, "degraded, parity skipped");
+  const long dirty_before = QueryArray(rig.safe).dirty_slots;
+  {
+    clio::run::admin::Client admin(clio::run::kAdminPoolId);
+    auto d = admin.AsyncDestroyPool(clio::run::PoolQuery::Dynamic(),
+                                    rig.safe.pool_id_);
+    d.Wait();
+    REQUIRE(d->GetReturnCode() == 0);
+    std::this_thread::sleep_for(150ms);
+  }
+  unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
+  rig.Create();
+  FlushParity(rig.safe);
+  const long dirty_after = QueryArray(rig.safe).dirty_slots;
+  INFO("dirty stripes before the crash " + std::to_string(dirty_before) +
+       ", after restart + flush " + std::to_string(dirty_after));
+  REQUIRE(dirty_before > 0);
+  REQUIRE(dirty_after == 0);
+  {
+    const std::string v = VerifyChurn(rig.safe, sets);
+    INFO("verify after restart: " + v);
+    REQUIRE(v.empty());
+  }
+  phase(30, "after restart, disk still dead");
+  {
+    const std::string v = VerifyChurn(rig.safe, sets);
+    INFO("verify at the end: " + v);
+    REQUIRE(v.empty());
+  }
+  rig.Cleanup();
+}
+
+TEST_CASE("safe_bdev_degraded_crash_cycles",
+          "[safe_bdev][disk_fail][restart]") {
+  // #1145: repeated crashes while a data disk is dead, with allocation
+  // churn (frees and reuse) between them -- the shape of the 6-node rolling
+  // restart that served another file's bytes. Each cycle churns with every
+  // write's parity skipped, "crashes", restarts with the disk still dead,
+  // and checks every live byte.
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      81000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("dcc", base);
+  constexpr size_t kThreads = 4;
+  std::vector<std::vector<ChurnSet>> sets(kThreads);
+  std::vector<std::mt19937> rngs;
+  for (size_t t = 0; t < kThreads; ++t) rngs.emplace_back(1145 + t);
+  std::vector<clio::run::u32> next_tag(kThreads, 0);
+  auto phase = [&](int steps, const std::string &when) {
+    const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, steps);
+    INFO("churn " + when + ": " + e);
+    REQUIRE(e.empty());
+    const std::string v = VerifyChurn(rig.safe, sets);
+    INFO("verify " + when + ": " + v);
+    REQUIRE(v.empty());
+  };
+  phase(30, "healthy");
+  KillDisk(rig.paths[0]);
+  phase(20, "degraded");
+  for (int cycle = 0; cycle < 6; ++cycle) {
+    const std::string c = "cycle " + std::to_string(cycle);
+    phase(15, c + " before the crash");
+    setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
+    {
+      const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, 10);
+      INFO("churn " + c + " parity skipped: " + e);
+      REQUIRE(e.empty());
+    }
+    clio::run::admin::Client admin(clio::run::kAdminPoolId);
+    auto d = admin.AsyncDestroyPool(clio::run::PoolQuery::Dynamic(),
+                                    rig.safe.pool_id_);
+    d.Wait();
+    REQUIRE(d->GetReturnCode() == 0);
+    std::this_thread::sleep_for(150ms);
+    unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
+    rig.Create();
+    {
+      const std::string v = VerifyChurn(rig.safe, sets);
+      INFO("verify " + c + " after restart: " + v);
+      REQUIRE(v.empty());
+    }
+    FlushParity(rig.safe);
+    INFO(c + " dirty after flush: " +
+         std::to_string(QueryArray(rig.safe).dirty_slots));
+    REQUIRE(QueryArray(rig.safe).dirty_slots == 0);
+  }
+  KillDisk(rig.paths[kMembers - 1]);  // a parity disk too: max_failures
+  phase(20, "two down");
   rig.Cleanup();
 }

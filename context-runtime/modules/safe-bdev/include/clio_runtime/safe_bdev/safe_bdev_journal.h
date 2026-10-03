@@ -121,6 +121,20 @@ class StripeJournal {
   /** @return the number of stripes with records. */
   size_t NumSlots();
 
+  /** @return true when a record of stripe `slot` is held. */
+  bool HasSlot(uint64_t slot);
+
+  /** What the last Open's scan found (for the restart log). */
+  struct ScanStats {
+    uint64_t records = 0;    // intact records scanned
+    uint64_t live = 0;       // of them, written under a still-live intent
+    uint64_t stopped_at = 0; // file offset where the scan ended
+    uint64_t file_size = 0;  // file size at Open
+    const char *why = "";    // why the scan ended
+  };
+  /** @return the last Open's scan statistics. */
+  ScanStats LastScan() const { return scan_; }
+
  private:
   /** On-disk record header; chunk_len payload bytes follow. */
   struct RecordHeader {
@@ -158,6 +172,7 @@ class StripeJournal {
                const uint8_t *data);
 
   std::mutex mu_;
+  ScanStats scan_;
   int fd_ = -1;
   std::string path_;
   uint64_t chunk_len_ = 0;

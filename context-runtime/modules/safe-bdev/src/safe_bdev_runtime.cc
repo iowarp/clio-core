@@ -911,9 +911,13 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       HLOG(kWarning, "safe_bdev Create: cannot open the degraded-write "
            "journal '{}'; a crash during degraded writes can lose a down "
            "member's chunks", jpath);
-    } else if (journal_.NumSlots() != 0) {
+    } else {
+      const StripeJournal::ScanStats js = journal_.LastScan();
       HLOG(kInfo, "safe_bdev Create: degraded-write journal holds {} "
-           "stripe(s) to finish", journal_.NumSlots());
+           "stripe(s) to finish ({} live intent(s); scanned {} record(s), "
+           "{} under a live intent; stopped at {} of {} bytes: {})",
+           journal_.NumSlots(), live_keys.size(), js.records, js.live,
+           js.stopped_at, js.file_size, js.why);
     }
   }
   const bool recovered =
@@ -1008,6 +1012,26 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   if (replayed != 0) {
     HLOG(kWarning, "safe_bdev Create: {} stripe(s) were mid-write at the last "
          "shutdown; re-encoding their parity", replayed);
+    if (CountDownMembers() != 0) {
+      // With a data member down, a dirty stripe without a journaled chunk
+      // cannot be re-encoded (#1137): name them.
+      std::vector<clio::run::u64> bare;
+      {
+        std::lock_guard<std::mutex> g(slot_mu_);
+        for (clio::run::u64 s : dirty_slots_) {
+          if (!journal_.HasSlot(s)) bare.push_back(s);
+        }
+      }
+      if (!bare.empty()) {
+        std::string list;
+        for (size_t i = 0; i < bare.size() && i < 16; ++i) {
+          list += std::to_string(bare[i]) + " ";
+        }
+        HLOG(kError, "safe_bdev Create: {} dirty stripe(s) have a member down "
+             "and no journaled chunk; they cannot be re-encoded: {}",
+             bare.size(), list);
+      }
+    }
   }
 
   if (alloc_log_.enabled()) {

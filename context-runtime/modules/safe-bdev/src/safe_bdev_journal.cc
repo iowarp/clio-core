@@ -131,19 +131,35 @@ void StripeJournal::Load(const std::set<uint64_t> &live_keys) {
   const uint64_t rec_len = sizeof(RecordHeader) + chunk_len_;
   std::vector<uint8_t> payload(chunk_len_);
   uint64_t off = 0;
+  scan_ = ScanStats();
+  const off_t fsize = ::lseek(fd_, 0, SEEK_END);
+  scan_.file_size = fsize > 0 ? static_cast<uint64_t>(fsize) : 0;
+  scan_.why = "end of file";
   while (true) {
     RecordHeader h{};
     if (!PreadAll(fd_, &h, sizeof(h), off)) break;
-    if (h.magic != kMagic) break;
-    if (!PreadAll(fd_, payload.data(), chunk_len_, off + sizeof(h))) break;
-    if (Checksum(h, payload.data(), chunk_len_) != h.sum) break;  // torn tail
+    if (h.magic != kMagic) {
+      scan_.why = "bad magic";
+      break;
+    }
+    if (!PreadAll(fd_, payload.data(), chunk_len_, off + sizeof(h))) {
+      scan_.why = "short payload";
+      break;
+    }
+    if (Checksum(h, payload.data(), chunk_len_) != h.sum) {  // torn tail
+      scan_.why = "bad checksum";
+      break;
+    }
+    ++scan_.records;
     if (live_keys.count(h.key) != 0) {
+      ++scan_.live;
       Loc &cur = recs_[h.slot][h.col];  // keys start at 1: {0,0} is unset
       if (h.key >= cur.key) cur = Loc{h.key, off};
     }
     off += rec_len;
   }
   end_ = off;
+  scan_.stopped_at = off;
 }
 
 bool StripeJournal::WriteAt(uint64_t off, uint64_t key, uint64_t slot,
@@ -251,6 +267,11 @@ void StripeJournal::DropKey(uint64_t slot, uint64_t key) {
     }
   }
   if (s->second.empty()) recs_.erase(s);
+}
+
+bool StripeJournal::HasSlot(uint64_t slot) {
+  std::lock_guard<std::mutex> g(mu_);
+  return recs_.count(slot) != 0;
 }
 
 size_t StripeJournal::NumSlots() {
