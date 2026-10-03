@@ -1407,6 +1407,21 @@ TEST_CASE("safe_bdev_rebuild_under_load_then_lose_two",
   rig.ids[0] = nid;
   verify("after the rebuild");
   {
+    // Restart as a crash does: the array comes back BEFORE any pool added
+    // at runtime -- here, the replacement disk's pool is gone entirely.
+    // Create must re-attach it from its backing file.
+    clio::run::admin::Client admin(clio::run::kAdminPoolId);
+    for (const clio::run::PoolId &p : {rig.safe.pool_id_, nid}) {
+      auto d = admin.AsyncDestroyPool(clio::run::PoolQuery::Dynamic(), p);
+      d.Wait();
+      REQUIRE(d->GetReturnCode() == 0);
+    }
+    std::this_thread::sleep_for(150ms);
+    rig.Create();
+    REQUIRE(QueryArray(rig.safe).faulty_members == 0);
+    verify("after a restart without the replacement disk's pool");
+  }
+  {
     const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, 20);
     INFO("churn after the rebuild: " + e);
     REQUIRE(e.empty());

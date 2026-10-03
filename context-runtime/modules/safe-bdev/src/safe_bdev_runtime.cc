@@ -181,8 +181,47 @@ bool Runtime::FaultMember(bool is_parity, size_t idx, const char *why) {
        pool_name_, is_parity ? "parity" : "data", idx, m.pool_name_, why,
        CountDownMembers(), data_members_.size() + parity_members_.size(),
        max_failures_);
+  if (!is_parity) LogMemberFault(idx);
   PersistMemberManifest();
   return true;
+}
+
+void Runtime::LogMemberFault(size_t d) {
+  if (!alloc_log_.enabled()) return;
+  std::lock_guard<std::mutex> g(intent_mu_);
+  const clio::run::u32 col = static_cast<clio::run::u32>(d);
+  if (fault_key_.count(col) != 0) return;
+  // Read after the member turned faulty: any intent logged from here on
+  // belongs to a write that sees it down.
+  fault_key_[col] = intent_key_gen_;
+  alloc_log_.LogAlloc(kFaultGroup, col, intent_key_gen_, 0);
+  alloc_log_.Append();
+}
+
+void Runtime::LogMemberRecovered(size_t d) {
+  if (!alloc_log_.enabled()) return;
+  std::lock_guard<std::mutex> g(intent_mu_);
+  const clio::run::u32 col = static_cast<clio::run::u32>(d);
+  auto it = fault_key_.find(col);
+  if (it == fault_key_.end()) return;
+  alloc_log_.LogFree(kFaultGroup, col, it->second, 0);
+  fault_key_.erase(it);
+  alloc_log_.Append();
+}
+
+bool Runtime::IntentNeverLanded(clio::run::u64 key) {
+  if (!journal_.enabled() || journal_.HasKey(key)) return false;
+  bool any_down = false;
+  std::lock_guard<std::mutex> g(intent_mu_);
+  for (size_t d = 0; d < data_members_.size(); ++d) {
+    if (DataActive(d)) continue;
+    any_down = true;
+    auto it = fault_key_.find(static_cast<clio::run::u32>(d));
+    // Unknown fault time, or the write may predate it: it could have
+    // landed without journaling.
+    if (it == fault_key_.end() || it->second >= key) return false;
+  }
+  return any_down;
 }
 
 //===========================================================================
@@ -571,6 +610,34 @@ std::vector<Runtime::DataSeatSpec> Runtime::BuildDataMemberPlan(
   return plan;
 }
 
+clio::run::TaskResume Runtime::EnsureMemberPool(clio::run::PoolId pool_id,
+                                                std::string pool_name) {
+  CLIO_TASK_BODY_BEGIN
+  auto *pm = CLIO_POOL_MANAGER;
+  std::error_code ec;
+  // Remote members (distributed arrays) live on their own node; a missing
+  // backing file is a dead disk, which the member's first I/O reports.
+  if (!distributed_ && !pool_id.IsNull() && !pm->HasPool(pool_id) &&
+      std::filesystem::exists(pool_name, ec)) {
+    clio::run::bdev::Client disk(pool_id);
+    auto t = disk.AsyncCreate(clio::run::PoolQuery::Local(), pool_name,
+                              pool_id, clio::run::bdev::BdevType::kFile,
+                              /*capacity: the file's size=*/0);
+    CLIO_CO_AWAIT(t);
+    if (t->GetReturnCode() == 0) {
+      HLOG(kInfo, "safe_bdev Create: re-attached member disk '{}' as pool "
+           "{}.{} (it was added at runtime, not composed)", pool_name,
+           pool_id.major_, pool_id.minor_);
+    } else {
+      HLOG(kError, "safe_bdev Create: cannot re-attach member disk '{}' "
+           "(rc {}); it will be treated as failed", pool_name,
+           t->GetReturnCode());
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::SeatDataMember(DataSeatSpec spec, int col,
                                               clio::run::u32 &rc) {
   CLIO_TASK_BODY_BEGIN
@@ -597,6 +664,7 @@ clio::run::TaskResume Runtime::SeatDataMember(DataSeatSpec spec, int col,
          col, desc.pool_name_);
     CLIO_CO_RETURN;
   }
+  CLIO_CO_AWAIT(EnsureMemberPool(desc.pool_id_, desc.pool_name_));
   clio::run::u64 cap_slots = 0;
   bool qok = false;
   CLIO_CO_AWAIT(QueryMemberSlots(data_clients_.back(), MemberQuery(slot),
@@ -730,6 +798,8 @@ clio::run::TaskResume Runtime::SeatParityMembers(
     if (pe.recovering_ != 0) {
       parity_members_[pj].state_ = ec::EcState::kFaulty;
       parity_members_[pj].recovering_ = true;
+      // ResumeRecoveries writes to it.
+      CLIO_CO_AWAIT(EnsureMemberPool(slot.pool_id_, slot.pool_name_));
       continue;
     }
     if (pe.state_ != static_cast<clio::run::u32>(ec::EcState::kActive)) {
@@ -741,6 +811,7 @@ clio::run::TaskResume Runtime::SeatParityMembers(
            pj, pe.pool_name_);
       continue;
     }
+    CLIO_CO_AWAIT(EnsureMemberPool(slot.pool_id_, slot.pool_name_));
     MemberSuperblock sb;
     bool present = false;
     bool sb_ok = false;
@@ -799,7 +870,9 @@ void Runtime::FaultMembersOnDeadNodes() {
          "marked faulty", kind, i, m.pool_name_, m.node_id_);
   };
   for (size_t i = 0; i < data_members_.size(); ++i) {
+    const bool was = DataActive(i);
     check(data_members_[i], "data", i);
+    if (was && !DataActive(i)) LogMemberFault(i);
   }
   for (size_t i = 0; i < parity_members_.size(); ++i) {
     check(parity_members_[i], "parity", i);
@@ -1009,6 +1082,11 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // them rather than decode from stale parity -- until the builder below
   // re-encodes them. Every other stripe's persisted parity is current.
   const size_t replayed = ReplayStripeIntents();
+  // Down members with no fault record (found dead at this start): writes
+  // from now on see them down.
+  for (size_t d = 0; d < data_members_.size(); ++d) {
+    if (!DataActive(d)) LogMemberFault(d);
+  }
   if (replayed != 0) {
     HLOG(kWarning, "safe_bdev Create: {} stripe(s) were mid-write at the last "
          "shutdown; re-encoding their parity", replayed);
@@ -2491,6 +2569,7 @@ clio::run::TaskResume Runtime::RecoverBdev(clio::run::shared_ptr<RecoverBdevTask
   m.state_ = ec::EcState::kActive;
   m.recovering_ = false;
   OpenWriteGate();  // RebuildMember left it closed for this flip
+  if (is_data) LogMemberRecovered(static_cast<size_t>(idx));
   {
     bool wr_ok = false;
     CLIO_CO_AWAIT(WriteSuperblock(!is_data, static_cast<size_t>(idx), wr_ok));
@@ -2522,6 +2601,7 @@ clio::run::TaskResume Runtime::ResumeRecoveries() {
       data_members_[i].state_ = ec::EcState::kActive;
       data_members_[i].recovering_ = false;
       OpenWriteGate();
+      LogMemberRecovered(i);
       bool wr = false;
       CLIO_CO_AWAIT(WriteSuperblock(false, i, wr));
       PersistMemberManifest();
@@ -2903,18 +2983,53 @@ void Runtime::IntentSyncMain() {
 
 size_t Runtime::ReplayStripeIntents() {
   if (!alloc_log_.enabled()) return 0;
-  const std::vector<clio::run::bdev::LiveBlock> &live =
+  {
+    // When each down data member went down (previous run's records). Intent
+    // keys must keep growing across restarts -- past every fault record and
+    // every journal record, live or not -- or a new write's key could be
+    // older than a fault, or match an old record.
+    std::lock_guard<std::mutex> ig(intent_mu_);
+    for (const auto &b : alloc_log_.live(kFaultGroup)) {
+      fault_key_[static_cast<clio::run::u32>(b.offset)] = b.size;
+      intent_key_gen_ = std::max(intent_key_gen_, b.size);
+    }
+    intent_key_gen_ = std::max(intent_key_gen_, journal_.LastScan().max_key);
+  }
+  const std::vector<clio::run::bdev::LiveBlock> live =
       alloc_log_.live(kIntentGroup);
-  std::lock_guard<std::mutex> g(slot_mu_);
-  size_t n = 0;
   {
     std::lock_guard<std::mutex> ig(intent_mu_);
     for (const auto &b : live) {
       intent_key_gen_ = std::max(intent_key_gen_, b.offset);
-      intent_stale_[b.size].insert(b.offset);
     }
   }
+  // A write that saw a data member down journals its down columns before
+  // landing anything (#1137); one whose intent has no record never landed
+  // -- it was still waiting for its stripe when the array went down -- and
+  // left the stripe's parity as it was (#1145). Settle those.
+  std::vector<clio::run::bdev::LiveBlock> pending;
+  size_t settled = 0;
   for (const auto &b : live) {
+    if (IntentNeverLanded(b.offset)) {
+      alloc_log_.LogFree(kIntentGroup, b.offset, b.size, 0);
+      ++settled;
+    } else {
+      pending.push_back(b);
+    }
+  }
+  if (settled != 0) {
+    alloc_log_.Append();
+    HLOG(kInfo, "safe_bdev Create: {} write intent(s) never landed (no "
+         "journal record, issued with a member already down); their stripes "
+         "keep their parity", settled);
+  }
+  {
+    std::lock_guard<std::mutex> ig(intent_mu_);
+    for (const auto &b : pending) intent_stale_[b.size].insert(b.offset);
+  }
+  std::lock_guard<std::mutex> g(slot_mu_);
+  size_t n = 0;
+  for (const auto &b : pending) {
     const clio::run::u64 s = b.size;  // keys are unique; the stripe is here
     if (written_slots_.count(s) == 0) continue;  // stripe since emptied
     // The parity on disk encodes some earlier version of this stripe: never

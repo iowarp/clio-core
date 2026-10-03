@@ -124,12 +124,16 @@ class StripeJournal {
   /** @return true when a record of stripe `slot` is held. */
   bool HasSlot(uint64_t slot);
 
+  /** @return true when Open found a record written under intent `key`. */
+  bool HasKey(uint64_t key);
+
   /** What the last Open's scan found (for the restart log). */
   struct ScanStats {
     uint64_t records = 0;    // intact records scanned
     uint64_t live = 0;       // of them, written under a still-live intent
     uint64_t stopped_at = 0; // file offset where the scan ended
     uint64_t file_size = 0;  // file size at Open
+    uint64_t max_key = 0;    // newest intent key of any intact record
     const char *why = "";    // why the scan ended
   };
   /** @return the last Open's scan statistics. */
@@ -179,6 +183,8 @@ class StripeJournal {
   uint64_t end_ = 0;  // append offset
   // slot -> column -> newest record
   std::map<uint64_t, std::map<uint32_t, Loc>> recs_;
+  // Intent keys of the live records Open found.
+  std::set<uint64_t> loaded_keys_;
 };
 
 }  // namespace clio::run::safe_bdev

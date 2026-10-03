@@ -124,6 +124,7 @@ void StripeJournal::Close() {
   if (fd_ >= 0) ::close(fd_);
   fd_ = -1;
   recs_.clear();
+  loaded_keys_.clear();
   end_ = 0;
 }
 
@@ -151,8 +152,10 @@ void StripeJournal::Load(const std::set<uint64_t> &live_keys) {
       break;
     }
     ++scan_.records;
+    if (h.key > scan_.max_key) scan_.max_key = h.key;
     if (live_keys.count(h.key) != 0) {
       ++scan_.live;
+      loaded_keys_.insert(h.key);
       Loc &cur = recs_[h.slot][h.col];  // keys start at 1: {0,0} is unset
       if (h.key >= cur.key) cur = Loc{h.key, off};
     }
@@ -267,6 +270,11 @@ void StripeJournal::DropKey(uint64_t slot, uint64_t key) {
     }
   }
   if (s->second.empty()) recs_.erase(s);
+}
+
+bool StripeJournal::HasKey(uint64_t key) {
+  std::lock_guard<std::mutex> g(mu_);
+  return loaded_keys_.count(key) != 0;
 }
 
 bool StripeJournal::HasSlot(uint64_t slot) {

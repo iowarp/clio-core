@@ -428,6 +428,22 @@ class Runtime : public clio::run::Container {
   // fixed-width. An array without it re-encodes every slot at Create.
   static constexpr clio::run::u32 kFormatGroup = 3;
   static constexpr clio::run::u32 kParityFormat = 2;
+  // Member faults (#1145): one live record per DATA member that is down,
+  // key = data column, size = the newest intent key when it went down.
+  // A write whose intent is newer saw the member down, so it journals
+  // before landing anything; at restart such an intent with no journal
+  // record of its own never landed, and its stripe's parity is intact.
+  static constexpr clio::run::u32 kFaultGroup = 4;
+  /** Intent key at each down data member's fault (guarded by intent_mu_). */
+  std::map<clio::run::u32, clio::run::u64> fault_key_;
+  /** Record that data member `d` went down (no-op if already recorded). */
+  void LogMemberFault(size_t d);
+  /** Drop data member `d`'s fault record (it is active again). */
+  void LogMemberRecovered(size_t d);
+  /** Whether live intent `key` with no journal record of its own is a
+   *  write that never landed: every down data member went down before it
+   *  (so it would have journaled first). Needs intent_mu_ NOT held. */
+  bool IntentNeverLanded(clio::run::u64 key);
   /** Slots ever allocated on any member (guarded by alloc_mu_). */
   clio::run::u64 array_high_water_ = 0;
 
@@ -1366,6 +1382,19 @@ class Runtime : public clio::run::Container {
   static constexpr double kWriteGatePollUs = 200.0;
   /** Redo passes before the final, gated one. */
   static constexpr int kRebuildRedoPasses = 4;
+
+  /**
+   * Make sure a node-local member's bdev pool exists before it is seated.
+   * A member added or replaced at runtime (AddBdev / RecoverBdev) is not in
+   * the server config's compose, which re-creates the array at a restart
+   * BEFORE durable runtime pools come back -- the array then found no pool
+   * for its replacement disk and every start failed (#1146). Its backing
+   * file is re-attached here as a file bdev (its existing size) instead.
+   * @param pool_id member pool id
+   * @param pool_name member pool name (its backing file)
+   */
+  clio::run::TaskResume EnsureMemberPool(clio::run::PoolId pool_id,
+                                         std::string pool_name);
 
   /** After membership is restored, resume any member left in the recovering
    *  state (crash mid-RecoverBdev). Persists the manifest as members come back
