@@ -2165,14 +2165,19 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // env CLIO_WRITE_TOKEN_POLL_US).
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
     clio::run::u64 _tok_spin = 0;  // [HANGWATCH-TOK] stuck-holder probe (#822)
-    while (!blob_info_ptr->TryLockWrite(lock_tok)) {
+    while (!blob_info_ptr->TryLockWrite(lock_tok, "PutBlob",
+                                        GetCurrentTimeNs())) {
       if ((++_tok_spin % 20000) == 0) {
         ctp::ipc::atomic_ref<clio::run::u64> _own(blob_info_ptr->write_owner_);
+        const char *site = blob_info_ptr->write_site_;
         HLOG(kError,
              "[HANGWATCH-TOK] PutBlob spinning on write token blob='{}' "
-             "owner_tok={} my_tok={} spins={}",
+             "owner_tok={} held by {} for {} ms; my_tok={} spins={}",
              task->GetBlobName(),
-             _own.load(std::memory_order_relaxed), lock_tok, _tok_spin);
+             _own.load(std::memory_order_relaxed),
+             site != nullptr ? site : "?",
+             (GetCurrentTimeNs() - blob_info_ptr->write_since_ns_) / 1e6,
+             lock_tok, _tok_spin);
       }
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
@@ -3686,7 +3691,8 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
       unsigned long long t0;
       ~EvMoveScope() { clio_evlat_add(9, clio::run::CycleNow() - t0); }
     } ev_move_scope{ev_m0};
-    while (!blob_info.TryLockWrite(lock_tok)) {
+    while (!blob_info.TryLockWrite(lock_tok, "ReorganizeBlob",
+                                   GetCurrentTimeNs())) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard blob_write_guard(&blob_info, lock_tok);
@@ -4041,7 +4047,8 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
     if (lock_tok == 0) {
       lock_tok = reinterpret_cast<clio::run::u64>(&rc);
     }
-    while (!blob_info.TryLockWrite(lock_tok)) {
+    while (!blob_info.TryLockWrite(lock_tok, "ReorganizeReplica",
+                                   GetCurrentTimeNs())) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     {
@@ -4821,7 +4828,8 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
     // #680 write-token re-check period; see BlobWriteLockPollUs() (default 10us,
     // env CLIO_WRITE_TOKEN_POLL_US).
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
-    while (!blob_info_ptr->TryLockWrite(lock_tok)) {
+    while (!blob_info_ptr->TryLockWrite(lock_tok, "DelBlob",
+                                        GetCurrentTimeNs())) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
@@ -4951,7 +4959,8 @@ clio::run::TaskResume Runtime::ReclaimCacheReplica(const TagId &tag_id,
     // Same write-token + reader-drain discipline as every extent-freeing
     // mutator (#753): a pinned reader's snapshot may reference the blocks.
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(&freed_bytes);
-    while (!blob_info_ptr->TryLockWrite(lock_tok)) {
+    while (!blob_info_ptr->TryLockWrite(lock_tok, "ReclaimCacheReplica",
+                                        GetCurrentTimeNs())) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard guard(blob_info_ptr.get(), lock_tok);
@@ -5404,7 +5413,8 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
     // #680 write-token re-check period; see BlobWriteLockPollUs() (default 10us,
     // env CLIO_WRITE_TOKEN_POLL_US).
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
-    while (!blob_info_ptr->TryLockWrite(lock_tok)) {
+    while (!blob_info_ptr->TryLockWrite(lock_tok, "TruncateBlob",
+                                        GetCurrentTimeNs())) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
@@ -7048,17 +7058,20 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       // Same acquire pattern PutBlobImpl uses; reentrant and lost-wakeup-proof.
       clio::run::u64 flush_tok = reinterpret_cast<clio::run::u64>(&kv);
       clio::run::u64 spins = 0;
-      while (!blob_info.TryLockWrite(flush_tok)) {
+      while (!blob_info.TryLockWrite(flush_tok, "FlushMetadata",
+                                     GetCurrentTimeNs())) {
         if (++spins > kFlushTokenMaxSpins) { break; }
         CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
       }
       const bool have_tok = (spins <= kFlushTokenMaxSpins);
       BlobWriteLockGuard flush_guard(&blob_info, have_tok ? flush_tok : 0);
       if (!have_tok) {
+        const char *site = blob_info.write_site_;
         HLOG(kError,
              "FlushMetadata: could not take the write token for blob '{}' "
-             "after {} spins; its layout may be captured mid-staging", key,
-             spins);
+             "after {} spins (held by {} for {} ms); its layout may be "
+             "captured mid-staging", key, spins, site != nullptr ? site : "?",
+             (GetCurrentTimeNs() - blob_info.write_since_ns_) / 1e6);
       }
       // Entry type 2 == blob record carrying transform_flags_ (issue #818);
       // type 3 additionally carries droppable_. A NEW type each time rather
@@ -7415,7 +7428,8 @@ clio::run::TaskResume Runtime::MoveBlobToPersistent(
   // blob still being written, and moving that many bytes truncated it
   // (RELIABILITY.md defect 14). The token is held until the swap.
   clio::run::u64 tok = reinterpret_cast<clio::run::u64>(&size);
-  while (!blob_info_ptr->TryLockWrite(tok)) {
+  while (!blob_info_ptr->TryLockWrite(tok, "MoveBlobToPersistent",
+                                      GetCurrentTimeNs())) {
     CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
   }
   blob_info_ptr->BeginDrainReaders();
@@ -7614,8 +7628,11 @@ clio::run::TaskResume Runtime::SyncTag(
   // 1. Bytes still below the persistence level move up first. With no tier
   //    at that level there is nothing durable to move to (a RAM-only
   //    deployment): fsync then means what it means on tmpfs.
+  // Every blob is visited: one already persistent costs no budget, and one
+  // that cannot fit fails the sync with ENOSPC. Stopping once the budget
+  // reached 0 reported success with the remaining blobs still on RAM (#1147).
   clio::run::u64 budget = PersistentBudget(level);
-  for (size_t i = 0; i < names.size() && budget > 0; ++i) {
+  for (size_t i = 0; i < names.size(); ++i) {
     std::shared_ptr<BlobInfo> info = tag_blob_name_to_info_.get(prefix + names[i]);
     if (!info) continue;
     clio::run::u64 size = 0;
@@ -7648,6 +7665,11 @@ clio::run::TaskResume Runtime::SyncTag(
   for (auto &log : tag_txn_logs_) {
     if (log) log->Sync();
   }
+  // Which syncs moved what, per container (#1147: fsynced pages a crash
+  // later replayed from RAM-only layouts).
+  HLOG(kInfo, "SyncTag {}.{}: {} blob(s) indexed, {} moved to level >= {}, "
+       "{} device(s) synced", tag.major_, tag.minor_, names.size(),
+       task->blobs_moved_, level, task->bdevs_synced_);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -7864,6 +7886,7 @@ void Runtime::RestoreMetadataFromLog() {
 
       if (!ifs.good()) break;
 
+      size_t snap_volatile_dropped = 0;
       BlobInfo blob_info;
       blob_info.blob_name_ = blob_name;
       blob_info.score_ = score;
@@ -7911,6 +7934,7 @@ void Runtime::RestoreMetadataFromLog() {
           }
         }
         if (is_volatile) {
+          ++snap_volatile_dropped;
           continue;  // Volatile data is lost on restart
         }
 
@@ -7924,6 +7948,12 @@ void Runtime::RestoreMetadataFromLog() {
       // post-restart reads/rebuilds see empty blobs. The WAL-replay path
       // below already did this; the snapshot path forgot.
       blob_info.RecomputeTotalSize();
+      if (snap_volatile_dropped != 0) {
+        // As in WAL replay: say what a restart lost (#1147).
+        HLOG(kWarning, "Metadata restore: blob {} lost {} volatile block(s); "
+             "it is now {} byte(s)", composite_key, snap_volatile_dropped,
+             blob_info.GetTotalSize());
+      }
 
       tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
       BlobIndexAdd(composite_key);
@@ -8417,10 +8447,11 @@ void Runtime::ApplyWalExtendBlob(const std::vector<char> &payload,
       blob_info_ptr->blocks_.push_back(block);
     }
     blob_info_ptr->RecomputeTotalSize();  // blocks_ rebuilt: resync cache
-    if (volatile_dropped != 0 && !blob_info_ptr->blocks_.empty()) {
-      // Part of the blob lived on a volatile tier: it comes back SHORT. Not
-      // silent: this is how fsynced data that was moved onto RAM showed up
-      // as a page missing its tail (#1124).
+    if (volatile_dropped != 0) {
+      // Part (or all) of the blob lived on a volatile tier: it comes back
+      // SHORT or EMPTY. Not silent: this is how fsynced data that was moved
+      // onto RAM showed up as a page missing its tail (#1124) -- or, every
+      // block volatile, as a whole page of zeros (#1147).
       HLOG(kWarning, "WAL replay: blob {} lost {} volatile block(s); it is "
            "now {} byte(s)", composite_key, volatile_dropped,
            blob_info_ptr->GetTotalSize());

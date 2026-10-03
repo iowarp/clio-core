@@ -1145,6 +1145,9 @@ struct BlobInfo {
   // here — it would deadlock the single worker the instant the holder suspends
   // at a co_await. 0 == unlocked; otherwise a non-zero per-task owner token.
   clio::run::u64 write_owner_;
+  // Who holds write_owner_ and since when (diagnostics only; #1147).
+  const char *write_site_ = nullptr;
+  clio::run::u64 write_since_ns_ = 0;
   // Reader-pin word (issue #753, reader half). GetBlob deliberately reads with
   // no lock held: it snapshots blocks_ and then co_awaits bdev reads, so a
   // concurrent ReorganizeBlob/DelBlob/Truncate that takes the write token
@@ -1477,6 +1480,26 @@ struct BlobInfo {
     ctp::ipc::atomic_ref<clio::run::u64> ref(write_owner_);
     clio::run::u64 expected = 0;
     if (ref.compare_exchange_strong(expected, tok)) return true;
+    return ref.load() == tok;  // reentrant: already ours
+  }
+
+  /**
+   * TryLockWrite that records who took the lock and when, so a waiter stuck
+   * behind it can name the holder ([HANGWATCH-TOK], #1147).
+   * @param tok Non-zero per-task owner token.
+   * @param site Static name of the acquiring code path.
+   * @param now_ns Current steady time (ns).
+   * @return true if the caller now holds the lock.
+   */
+  bool TryLockWrite(clio::run::u64 tok, const char *site,
+                    clio::run::u64 now_ns) {
+    ctp::ipc::atomic_ref<clio::run::u64> ref(write_owner_);
+    clio::run::u64 expected = 0;
+    if (ref.compare_exchange_strong(expected, tok)) {
+      write_site_ = site;
+      write_since_ns_ = now_ns;
+      return true;
+    }
     return ref.load() == tok;  // reentrant: already ours
   }
 
