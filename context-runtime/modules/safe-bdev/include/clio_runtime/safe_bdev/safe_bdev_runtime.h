@@ -1035,15 +1035,38 @@ class Runtime : public clio::run::Container {
   bool DeltaEligible(clio::run::u64 s);
 
   /**
+   * Stripes a write rewrites whole (#1126): every data column's full chunk,
+   * all of them up. Their parity follows from the write's own bytes, with
+   * no reads.
+   * @param pieces the write's pieces
+   * @return the full stripes
+   */
+  std::set<clio::run::u64> FullStripes(const std::vector<WritePiece> &pieces);
+
+  /**
+   * Encode a stripe the write covers whole from the write's bytes and write
+   * every live parity shard concurrently.
+   * @param s the stripe (in FullStripes)
+   * @param pieces the write's pieces
+   * @param data the write's bytes
+   * @param ok receives true when every live shard was written
+   */
+  clio::run::TaskResume EncodeFullStripe(clio::run::u64 s,
+                                         const std::vector<WritePiece> &pieces,
+                                         const char *data, bool &ok);
+
+  /**
    * Before a write lands, read the bytes each of its pieces replaces, for
    * the stripes that can take a delta update (#1126).
    * @param pieces the write's pieces
+   * @param skip stripes not to read (rewritten whole: FullStripes)
    * @param slots receives the delta-eligible stripes
    * @param old_bytes receives, per piece, the bytes it replaces (empty for
    *        pieces of other stripes)
    */
   clio::run::TaskResume ReadReplacedBytes(
-      const std::vector<WritePiece> &pieces, std::set<clio::run::u64> &slots,
+      const std::vector<WritePiece> &pieces,
+      const std::set<clio::run::u64> &skip, std::set<clio::run::u64> &slots,
       std::vector<std::vector<uint8_t>> &old_bytes);
 
   /**

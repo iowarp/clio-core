@@ -743,6 +743,30 @@ TEST_CASE("safe_bdev_crash_during_degraded_write",
   rig.Cleanup();
 }
 
+TEST_CASE("safe_bdev_full_stripe_writes_protected",
+          "[safe_bdev][disk_fail]") {
+  // #1126: a write that covers whole stripes encodes their parity from its
+  // own bytes, never reading the members. Fresh full-stripe writes,
+  // full-stripe rewrites and a mixed write (whole stripes plus a partial
+  // one) must all leave parity that decodes every byte once max_failures
+  // data disks die -- with no flush in between.
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      79000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("fsw", base);
+  for (ctp::u8 k = 0; k < 4; ++k) rig.WriteNew(16 * kChunkLen, 90 + k);
+  rig.WriteNew(kSetLen, 95);  // whole stripes plus half a chunk
+  for (size_t i = 0; i < 4; ++i) rig.Rewrite(i, static_cast<ctp::u8>(100 + i));
+  rig.Rewrite(4, 105);
+  REQUIRE(QueryArray(rig.safe).dirty_slots == 0);
+  KillDisk(rig.paths[0]);
+  KillDisk(rig.paths[2]);
+  rig.VerifyAll();
+  rig.Cleanup();
+}
+
 TEST_CASE("safe_bdev_free_keeps_stripes_protected",
           "[safe_bdev][disk_fail][restart][sync]") {
   EnsureInit();
@@ -794,9 +818,16 @@ TEST_CASE("safe_bdev_write_throughput",
   // synchronous; this reports what that costs). Rounds of allocate / write /
   // verify a sample / free keep it inside the small test members.
   constexpr int kThreads = 8;
-  constexpr int kPerThread = 6;
   constexpr int kRounds = 10;
-  constexpr clio::run::u64 kLen = 2 * kChunkLen;
+  // CLIO_SAFE_THR_CHUNKS: chunks per write (default 2 = 128 KiB; 16 = the
+  // CTE's 1 MiB page, whole stripes). Fewer writes per thread for larger
+  // ones, to stay inside the small test members.
+  const char *ce = std::getenv("CLIO_SAFE_THR_CHUNKS");
+  const clio::run::u64 chunks =
+      ce != nullptr ? std::max<clio::run::u64>(1, std::strtoull(ce, nullptr, 10))
+                    : 2;
+  const clio::run::u64 kLen = chunks * kChunkLen;
+  const int kPerThread = static_cast<int>(std::max<clio::run::u64>(1, 12 / chunks));
   double write_ms = 0;
   for (int r = 0; r < kRounds; ++r) {
     std::vector<std::vector<std::vector<Block>>> blocks(kThreads);
