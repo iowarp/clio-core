@@ -60,6 +60,14 @@ constexpr clio::run::u64 kShipRetryNs = 100ULL * 1000 * 1000;
 constexpr clio::run::u32 kRcIo = EIO;
 /** Return code for a flush that timed out (matches ETIMEDOUT). */
 constexpr clio::run::u32 kRcTimeout = ETIMEDOUT;
+/** Tries (one per kStagingTagRetryUs) to register the staging tag with its
+ *  owner at startup; past them the well-known id is used (#1141). */
+constexpr int kStagingTagTries = 5;
+/** The staging tag's well-known id: major 0x3FFFFFFF is outside every range
+ *  a node, container or client mints (the root directory is minor 1). */
+const clio::cte::core::TagId kStagingTagId(0x3FFFFFFFu, 2u);
+/** Pause between staging-tag tries (us). */
+constexpr double kStagingTagRetryUs = 1e6;
 }  // namespace
 
 // ===========================================================================
@@ -79,16 +87,31 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   auto *ipc = CLIO_IPC;
   node_ = ipc->GetNodeId();
   {
-    auto st = staging_.AsyncGetOrCreateTag(kStagingTagName,
-                                       clio::cte::core::TagId::GetNull(),
-                                       clio::run::PoolQuery::Dynamic());
-    CLIO_CO_AWAIT(st);
-    if (st->GetReturnCode() != 0) {
-      HLOG(kError, "stream: cannot create staging tag {}", kStagingTagName);
-      task->return_code_ = kRcIo;
-      CLIO_CO_RETURN;
+    // The staging tag has a WELL-KNOWN id, so a node never needs the tag's
+    // owner to learn it: its blobs route by blob hash and fail over like any
+    // other, while the name->id lookup goes only to the owner and does NOT
+    // fail over. A node restarting while that owner was down used to abort
+    // its whole runtime here (#1141). Registering the name with its owner is
+    // best effort: an owner that already holds an id for it (a deployment
+    // older than the well-known id) is adopted; an unreachable one is not
+    // waited for.
+    staging_tag_ = kStagingTagId;
+    for (int attempt = 0; attempt < kStagingTagTries; ++attempt) {
+      auto st = staging_.AsyncGetOrCreateTag(kStagingTagName, kStagingTagId,
+                                         clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(st);
+      if (st->GetReturnCode() == 0) {
+        staging_tag_ = st->tag_id_;
+        break;
+      }
+      if (attempt + 1 == kStagingTagTries) {
+        HLOG(kWarning, "stream: the owner of staging tag {} is unreachable "
+             "(rc {}); using its well-known id {}.{}", kStagingTagName,
+             st->GetReturnCode(), kStagingTagId.major_, kStagingTagId.minor_);
+        break;
+      }
+      CLIO_CO_AWAIT(clio::run::yield(kStagingTagRetryUs));
     }
-    staging_tag_ = st->tag_id_;
   }
   OpenLog();
   if (is_restart_) {
