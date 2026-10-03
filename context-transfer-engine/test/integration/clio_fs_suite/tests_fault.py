@@ -966,3 +966,36 @@ def t_open_handle_home_loss(ctx):
     st = ctx.ok(i, 'fstat', h=g)
     ctx.check(st['size'] == 4 * MiB, f'node{i} size {st["size"]}')
     ctx.ok(i, 'close', h=g)
+
+
+@test('xattrs_survive_crash', 'fault', min_nodes=2, redeploy_after=True,
+      timeout=1800)
+def t_xattrs_survive_crash(ctx):
+  """#1144: xattrs are metadata like modes and names and must survive a
+  crash once set. Every node sets xattrs on 40 files (their records hash
+  over every node), then every runtime is SIGKILLed and restarted; each
+  xattr must read back from every node."""
+  n = len(ctx.hosts)
+  base = ctx.p('xa')
+  ctx.ok(0, 'mkdir', path=base)
+  want = {}
+  for i in range(n):
+    for k in range(40):
+      p = f'{base}/n{i}_f{k}'
+      ctx.ok(i, 'write_file', path=p, size=4096, seed=i * 100 + k,
+             fsync=True)
+      v = f'xa-{i}-{k}'.encode().hex()
+      ctx.ok(i, 'setxattr', path=p, name='user.kind', value_hex=v)
+      want[p] = v
+  restart_cluster(ctx, crash=True)
+  ctx.cl.agents.clear()
+  lost = []
+  for i in range(n):
+    for p, v in sorted(want.items()):
+      r = ctx.call(i, 'getxattr', path=p, name='user.kind', timeout=120)
+      got = (r.get('ret') if r.get('ok') else f'err {r.get("errno")}')
+      if got != v:
+        lost.append((f'node{i}', p.rsplit('/', 1)[1], got))
+  ctx.metrics['xattrs_lost'] = len(lost)
+  ctx.check(not lost, f'{len(lost)} xattr reads wrong after a crash '
+                      f'restart: {lost[:6]}')

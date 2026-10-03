@@ -1620,12 +1620,26 @@ clio::run::TaskResume Runtime::InodeXattr(const FsReq &req, FsResp &resp) {
         resp.rc_ = EIO;
       } else {
         std::memcpy(buf.ptr_, payload.data(), payload.size());
+        // A metadata record like the inode's (#1144): on a non-volatile
+        // tier before the change is acknowledged. Placed by default it sat
+        // in RAM, and a crash of its node lost every xattr of the file.
+        clio::cte::core::Context xctx;
+        xctx.op_flags_ |= clio::cte::core::Context::kMetaBlob;
+        xctx.min_persistence_level_ = inode_volatile_only_ ? 0 : 1;
         auto p = cte_.AsyncPutBlob(xattr_tag_id_, key, 0, payload.size(),
                                    buf.shm_.template Cast<void>(), -1.0f,
-                                   clio::cte::core::Context(),
-                                   clio::cte::core::kCtePutReplace,
+                                   xctx, clio::cte::core::kCtePutReplace,
                                    clio::run::PoolQuery::Dynamic());
         CLIO_CO_AWAIT(p);
+        if (p->GetReturnCode() != 0 && !inode_volatile_only_) {
+          // No non-volatile tier takes it: keep it in RAM rather than fail.
+          xctx.min_persistence_level_ = 0;
+          p = cte_.AsyncPutBlob(xattr_tag_id_, key, 0, payload.size(),
+                                buf.shm_.template Cast<void>(), -1.0f, xctx,
+                                clio::cte::core::kCtePutReplace,
+                                clio::run::PoolQuery::Dynamic());
+          CLIO_CO_AWAIT(p);
+        }
         if (p->GetReturnCode() != 0) resp.rc_ = EIO;
         ipc->FreeBuffer(buf);
       }
