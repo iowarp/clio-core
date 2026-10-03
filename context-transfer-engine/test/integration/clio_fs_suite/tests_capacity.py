@@ -63,7 +63,8 @@ def t_full_is_enospc(ctx):
   ctx.check(not r.get('hang') and not r.get('agent_dead'),
             'creating files on the full cluster hung')
   if r['ok']:
-    errs = {e for _, e in r['ret']['fails']}
+    # The agent reports 'ENOSPC: <message>'; compare the errno name only.
+    errs = {e.split(':', 1)[0] for _, e in r['ret']['fails']}
     ctx.metrics['meta_when_full'] = {'created': r['ret']['created'],
                                      'errors': sorted(errs)}
     ctx.check(errs <= {'ENOSPC'},
