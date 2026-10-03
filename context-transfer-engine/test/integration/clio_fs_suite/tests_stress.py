@@ -601,10 +601,11 @@ def _torn_unsynced(t, writer, inflight, durable=0, k=None, nfiles=None):
     k: the file's index in its writer's set (gens k+1, k+1+nfiles, ...).
     nfiles: files per writer.
   Returns:
-    True when the head is one of this file's unsynced gens (newer than the
-    durable one, at most the newest attempted) and the rest an older gen by
-    the same writer -- or, for a file never fsynced, zeros (rest writer and
-    gen 0: the unsynced write landed only in part). A writer that retries after a crash burns gens on
+    True when one half is one of this file's unsynced gens (newer than the
+    durable one, at most the newest attempted) and the other an older gen by
+    the same writer that is not older than the durable one -- or, for a file
+    never fsynced, zeros (rest writer and gen 0: the unsynced write landed
+    only in part). A writer that retries after a crash burns gens on
     attempts that never reach the store, so the torn write is often not the
     newest attempted one.
   """
@@ -621,13 +622,21 @@ def _torn_unsynced(t, writer, inflight, durable=0, k=None, nfiles=None):
     if k is None or nfiles is None:
       return False
     return hg <= inflight and (hg - (k + 1)) % nfiles == 0
-  if hw != writer or rw != writer or rg >= hg:
+  if hw != writer or rw != writer or rg == hg:
     return False
-  if hg == inflight:
+  # Either half may be the newer one: which part of an unsynced write
+  # lands depends on how its bytes were split (a tail that landed over the
+  # fsynced head is as legal as the reverse). The newer gen must be one this
+  # file attempted after its last fsync; the older must not predate that
+  # fsync -- older than the durable gen would be lost fsynced bytes.
+  newer, older = max(hg, rg), min(hg, rg)
+  if older < durable:
+    return False
+  if newer == inflight:
     return True
   if k is None or nfiles is None:
     return False
-  return durable < hg <= inflight and (hg - (k + 1)) % nfiles == 0
+  return durable < newer <= inflight and (newer - (k + 1)) % nfiles == 0
 
 
 def _reread_note(ctx, nmx, path, block, nodes):
