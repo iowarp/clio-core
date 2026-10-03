@@ -1283,6 +1283,13 @@ private:
   /** Set first thing by the stop hook (#1137): the organizer starts no new
    *  tier moves once the runtime is stopping, so the stop drain can finish
    *  the ones already in flight instead of tearing them off mid-write. */
+  /** Physical bytes held by node-local cache copies (REPLICA_CACHE), as of
+   *  the last StatTargets sweep. They are evicted before a put fails, so
+   *  GetCapacity reports them as free, as Linux does the page cache (#1140). */
+  std::atomic<clio::run::u64> cache_copy_bytes_{0};
+  /** Recount cache_copy_bytes_ (one pass over the blob map; called from the
+   *  periodic StatTargets sweep, not per statfs). */
+  void RefreshCacheCopyBytes();
   std::atomic<bool> stopping_{false};
   /** Tier moves in flight (ReorganizeBlob / ReorganizeReplica), reported by
    *  GetWorkRemaining so the stop drain waits for them (#1137). */

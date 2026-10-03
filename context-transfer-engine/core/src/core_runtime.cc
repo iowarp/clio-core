@@ -1655,8 +1655,22 @@ clio::run::TaskResume Runtime::ListTargets(clio::run::shared_ptr<ListTargetsTask
   CLIO_TASK_BODY_END
 }
 
+void Runtime::RefreshCacheCopyBytes() {
+  clio::run::u64 bytes = 0;
+  tag_blob_name_to_info_.for_each(
+      [&bytes](const std::string &, const std::shared_ptr<BlobInfo> &info) {
+        for (const auto &rep : info->replicas_) {
+          if (!(rep.flags_ & REPLICA_CACHE)) continue;
+          for (const auto &b : rep.blocks_) bytes += b.capacity_;
+        }
+      },
+      ctp::priv::ForEachLock::kShared);
+  cache_copy_bytes_.store(bytes, std::memory_order_relaxed);
+}
+
 clio::run::TaskResume Runtime::StatTargets(clio::run::shared_ptr<StatTargetsTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  RefreshCacheCopyBytes();
   try {
     // Collect all target IDs under read lock (can't co_await inside lambda)
     std::vector<clio::run::PoolId> target_ids;
@@ -6195,6 +6209,11 @@ clio::run::TaskResume Runtime::GetCapacity(
           remaining += t.remaining_space_;
         });
   }
+  // Evictable cache copies are reclaimed before a put fails: count their
+  // bytes as free, or df reports a store full that still takes writes (#1140).
+  remaining = std::min(total,
+                       remaining + cache_copy_bytes_.load(
+                                       std::memory_order_relaxed));
   task->total_capacity_ = total;
   task->remaining_capacity_ = remaining;
   task->return_code_ = 0;
