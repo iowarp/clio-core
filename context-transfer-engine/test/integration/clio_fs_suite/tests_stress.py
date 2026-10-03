@@ -18,11 +18,14 @@ into a fast and then a slow file tier while the organizer migrates blobs:
   suite.py --profile tiered --groups stress [--ram-mb 512 --fast-mb 2048]
 """
 
+import os
 import random
 import threading
 import time
 
-from suite import test
+from suite import TestFailure, test
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 from tests_fault import restart_cluster
 import stress_records as sr
 
@@ -53,6 +56,16 @@ def _tier_usage(ctx):
         f'{ln.split()[1].rsplit("/", 1)[-1]}={ln.split()[0]}M'
         for ln in (r.get('ret') or {}).get('out', '').splitlines()
         if len(ln.split()) == 2)
+    # Live (allocated, not physical) MiB per tier from the allocation
+    # logs -- including the safe_bdev array -- so a premature ENOSPC can be
+    # told from a genuinely full tier.
+    r = ctx.call(i, 'sh', cmd=f'python3 {HERE}/alloc_log_usage.py '
+                              f'{lr}/data 2>/dev/null')
+    live = ' '.join(f'{ln.split()[0]}:live={ln.split()[1]}M'
+                    for ln in (r.get('ret') or {}).get('out', '').splitlines()
+                    if len(ln.split()) == 4)
+    if live:
+      out[f'node{i}'] += ' | ' + live
   return out
 
 
@@ -136,7 +149,12 @@ def t_tier_overflow(ctx):
       ctx.ok(i, 'rec_write', timeout=900, path=f'{base}/{nm}', name=nm,
              runs=[[0, FILE_BLOCKS]], writer=i, gen=1, fsync=True)
   t0 = time.time()
-  ctx.each(write_all)
+  try:
+    ctx.each(write_all)
+  except TestFailure:
+    # Record where the space went before the cluster is wiped.
+    ctx.note(f'tier usage when a write failed: {_tier_usage(ctx)}')
+    raise
   ctx.metrics['write_MiB_per_s'] = round(
       n * nfiles * 64 / max(0.001, time.time() - t0))
   ctx.metrics['bytes_per_node_mib'] = nfiles * 64
