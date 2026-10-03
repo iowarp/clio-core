@@ -842,12 +842,14 @@ class IpcManager {
   u32 DeadNodeCount() const {
     return dead_count_.load(std::memory_order_acquire);
   }
-  /** Wall-clock time (ns since the Unix epoch) of the latest peer liveness
-   *  transition this node saw (alive->dead or dead->alive), 0 if none.
-   *  fsync compares it with the start of a file's unsynced window (issue
-   *  #1133): a node that died -- or crashed and rejoined -- inside the
-   *  window may have taken unsynced bytes with it. Wall clock, not steady,
-   *  so values from different nodes compare. Readable from any thread. */
+  /** Wall-clock time (ns since the Unix epoch) of the LAST MOMENT a peer
+   *  this node has since declared dead was heard from, the latest over all
+   *  such deaths; 0 if none. A node accepts nothing after it goes silent,
+   *  so fsync (issue #1133) fails a file only if its unsynced window opened
+   *  before that moment -- not merely before the (seconds later) death
+   *  declaration, which failed fsyncs of writes made after the node had
+   *  already died. Wall clock, so values from different nodes compare.
+   *  Readable from any thread. */
   u64 LastLivenessChangeNs() const {
     return last_liveness_change_ns_.load(std::memory_order_acquire);
   }
@@ -1850,14 +1852,22 @@ class IpcManager {
   /** Time of the latest real peer liveness transition; see
    *  LastLivenessChangeNs (#1133). */
   std::atomic<u64> last_liveness_change_ns_{0};
-  /** Record a real peer liveness transition happening now. */
-  void NoteLivenessChange() {
-    last_liveness_change_ns_.store(
-        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::system_clock::now()
-                                 .time_since_epoch())
-                             .count()),
-        std::memory_order_release);
+  /**
+   * Record that a peer was just declared dead: raise the liveness-change
+   * time to the wall-clock moment it was last heard from (now, if never).
+   * @param node_id the peer
+   */
+  void NoteLivenessChange(u64 node_id) {
+    const u64 now = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    const u64 since = NsSinceHeardFrom(node_id);
+    const u64 at = (since == ~0ull || since > now) ? now : now - since;
+    u64 cur = last_liveness_change_ns_.load(std::memory_order_acquire);
+    while (at > cur && !last_liveness_change_ns_.compare_exchange_weak(
+                           cur, at, std::memory_order_acq_rel)) {
+    }
   }
   mutable std::vector<Host>
       hosts_cache_;  // Cached vector of hosts for GetAllHosts

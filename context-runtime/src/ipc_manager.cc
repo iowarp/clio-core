@@ -1877,7 +1877,7 @@ void IpcManager::SetDead(u64 node_id) {
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   if (it->second.state == NodeState::kDead) return;  // Already dead
-  NoteLivenessChange();
+  NoteLivenessChange(node_id);
 
   SetNodeState(node_id, NodeState::kDead);
 
@@ -1934,7 +1934,9 @@ void IpcManager::SetAlive(u64 node_id) {
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   if (it->second.state == NodeState::kAlive) return;  // Already alive
-  NoteLivenessChange();
+  // A dead node's rejoin adds no risk to unsynced data: whatever it held
+  // was lost when it died (recorded then, in SetDead), and writes made while
+  // it was down went to live successors.
 
   SetNodeState(node_id, NodeState::kAlive);
 

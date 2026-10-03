@@ -5504,9 +5504,10 @@ struct SyncTagTask : public clio::run::Task {
   /** Core containers that handled the sync (summed). 0 means a module in
    *  front of the core dropped it -- nothing was made durable. */
   OUT clio::run::u32 containers_;
-  /** Wall-clock ns of the latest peer liveness transition the answering
-   *  runtimes saw (the max over containers). One inside a file's unsynced
-   *  window means a node may have lost its unsynced bytes (issue #1133). */
+  /** Wall-clock ns at which the latest peer the answering runtimes have
+   *  declared dead was last heard from (the max over containers). Later
+   *  than the start of a file's unsynced window means that node may have
+   *  accepted, and lost, some of its unsynced bytes (issue #1133). */
   OUT clio::run::u64 liveness_change_ns_;
 
   /** SHM default constructor */

@@ -496,10 +496,11 @@ static int FlushReplicationBarrier(const clio::cte::core::TagId &tag) {
 // a node holds between two fsyncs (RAM tier, write-behind) die with it, and
 // failover makes the next SyncTag succeed on the survivors. So each file
 // written since its last fsync remembers when (wall clock) that window
-// opened; fsync fails with EIO when a peer died, or crashed and rejoined,
-// inside the window (SyncTagTask::liveness_change_ns_) -- it may have taken
-// some of those bytes. Conservative: the node may have held none of them.
-// Reported once, like Linux's errseq.
+// opened; fsync fails with EIO when a peer that has since died was last
+// heard from after the window opened (SyncTagTask::liveness_change_ns_) --
+// it may have accepted, and lost, some of those bytes. Writes made after
+// it went silent went to live successors and fsync cleanly. Conservative:
+// the node may have held none of them. Reported once, like Linux's errseq.
 static std::mutex g_unsynced_mtx;
 static std::unordered_map<clio::run::u64, clio::run::u64> g_unsynced;
 
@@ -591,7 +592,7 @@ static int SyncOneTag(const clio::cte::core::TagId &tag) {
     HLOG(kError, "clio_cte_fuse: fsync of tag {}.{}: a node {} while the "
          "file had unsynced writes; they may be lost, reporting EIO",
          tag.major_, tag.minor_,
-         lost_node ? "is down" : "died or rejoined");
+         lost_node ? "is down" : "died");
     return -EIO;
   }
   if (lost_node) {
