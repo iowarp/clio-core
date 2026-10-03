@@ -19,6 +19,7 @@ add_clio_module_runtime(
   LIB_NAME clio_safe_bdev
   SOURCES
     src/safe_bdev_runtime.cc
+    src/safe_bdev_journal.cc
     src/safe_bdev_viz.cc
     src/autogen/safe_bdev_lib_exec.cc
   LINK_LIBRARIES

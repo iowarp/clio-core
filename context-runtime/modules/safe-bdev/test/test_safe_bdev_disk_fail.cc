@@ -320,6 +320,7 @@ struct Rig {
     std::error_code ec;
     fs::remove(alloc_log, ec);
     fs::remove(alloc_log + ".members", ec);
+    fs::remove(alloc_log + ".journal", ec);
     std::string yaml = "max_failures: 2\nalloc_log: \"" + alloc_log +
                        "\"\nmembers:\n";
     for (int i = 0; i < kMembers; ++i) {
@@ -700,6 +701,44 @@ TEST_CASE("safe_bdev_crash_between_data_and_parity",
   REQUIRE(QueryArray(rig.safe).dirty_slots == 0);
   KillDisk(rig.paths[1]);
   KillDisk(rig.paths[2]);
+  rig.VerifyAll();
+  rig.Cleanup();
+}
+
+TEST_CASE("safe_bdev_crash_during_degraded_write",
+          "[safe_bdev][disk_fail][restart]") {
+  // #1137 (the degraded write hole): with a data member dead, its chunks
+  // exist only through their stripes' parity. "Crash" a rewrite after its
+  // data landed on the live members but before that parity did, and restart
+  // with the member still dead. The stripes must come back encodable (the
+  // down column's chunk was journaled before the write), every set must
+  // read back, further writes to those stripes must succeed, and losing a
+  // second disk afterwards must still decode everything.
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      78000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("cdw", base);
+  rig.WriteNew(kSetLen, 81);
+  rig.WriteNew(kSetLen, 82);
+  KillDisk(rig.paths[0]);  // a data member
+  rig.VerifyAll();         // its first failed read marks it down
+  setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
+  rig.Rewrite(0, 83);
+  REQUIRE(QueryArray(rig.safe).dirty_slots > 0);
+  rig.Shutdown();
+  unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
+  rig.Create();
+  FlushParity(rig.safe);
+  INFO("dirty stripes after restart: " +
+       std::to_string(QueryArray(rig.safe).dirty_slots));
+  REQUIRE(QueryArray(rig.safe).dirty_slots == 0);
+  rig.VerifyAll();
+  rig.Rewrite(0, 84);  // refused before the fix: "stale parity"
+  rig.Rewrite(1, 85);
+  rig.VerifyAll();
+  KillDisk(rig.paths[1]);  // max_failures now
   rig.VerifyAll();
   rig.Cleanup();
 }

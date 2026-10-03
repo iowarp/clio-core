@@ -899,7 +899,23 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
          params.alloc_log_path_);
   }
   intent_sync_ = params.intent_sync_;
-  if (alloc_log_.enabled()) StartIntentSync();
+  if (alloc_log_.enabled()) {
+    StartIntentSync();
+    // Records stay valid only while their write's intent is live (#1137).
+    std::set<clio::run::u64> live_keys;
+    for (const auto &b : alloc_log_.live(kIntentGroup)) {
+      live_keys.insert(b.offset);
+    }
+    const std::string jpath = params.alloc_log_path_ + ".journal";
+    if (!journal_.Open(jpath, kChunkLen, live_keys)) {
+      HLOG(kWarning, "safe_bdev Create: cannot open the degraded-write "
+           "journal '{}'; a crash during degraded writes can lose a down "
+           "member's chunks", jpath);
+    } else if (journal_.NumSlots() != 0) {
+      HLOG(kInfo, "safe_bdev Create: degraded-write journal holds {} "
+           "stripe(s) to finish", journal_.NumSlots());
+    }
+  }
   const bool recovered =
       alloc_log_.enabled() && !alloc_log_.groups().empty();
 
@@ -1174,9 +1190,19 @@ clio::run::TaskResume Runtime::LoadDegradedStripe(clio::run::u64 s,
   CLIO_TASK_BODY_BEGIN
   ok = false;
   if (IsSlotDirty(s)) {
-    HLOG(kError, "safe_bdev Write: slot {} has a down member and stale "
-         "parity; refusing the write (it could not be recovered)", s);
-    CLIO_CO_RETURN;
+    // A crash or failure mid-write left it stale; the journal may hold its
+    // down columns' chunks (#1137), which make it encodable again.
+    const clio::run::u64 wm = IntentWatermark();  // the caller holds s
+    bool eok = false;
+    CLIO_CO_AWAIT(EncodeStripe(s, eok));
+    // Settle the stale intents now: their journal records describe the
+    // down column as it was, and this write may change it.
+    if (eok) LogStripesEncoded({s}, wm);
+    if (!eok || IsSlotDirty(s)) {
+      HLOG(kError, "safe_bdev Write: slot {} has a down member and stale "
+           "parity; refusing the write (it could not be recovered)", s);
+      CLIO_CO_RETURN;
+    }
   }
   out.members = CodeColumns();
   const std::vector<int> none;
@@ -1526,7 +1552,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   const clio::run::u64 watermark = IntentWatermark();
   bool ok = false;
   std::set<clio::run::u64> clean;
-  CLIO_CO_AWAIT(WriteStripes(task, pieces, data.ptr_, ok, clean));
+  CLIO_CO_AWAIT(WriteStripes(task, pieces, data.ptr_, ok, clean, intents));
   UnlockStripes(slots);
   LogCleanIntents(intents, clean);
   LogStripesEncoded(clean, watermark);  // older stale intents it settled
@@ -1544,7 +1570,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
 clio::run::TaskResume Runtime::WriteStripes(
     clio::run::shared_ptr<WriteTask> &task,
     const std::vector<WritePiece> &pieces, const char *data, bool &ok,
-    std::set<clio::run::u64> &clean) {
+    std::set<clio::run::u64> &clean, const std::vector<IntentKey> &intents) {
   CLIO_TASK_BODY_BEGIN
   ok = false;
   clean.clear();
@@ -1566,6 +1592,11 @@ clio::run::TaskResume Runtime::WriteStripes(
     if (!lok) CLIO_CO_RETURN;
   }
   for (auto &kv : degraded) OverlayPieces(kv.first, pieces, data, kv.second);
+  // Their down columns exist only through the parity this write is about to
+  // change: save them -- as this write leaves them -- before anything lands
+  // (#1137). A crash then finishes the stripe from the live members and
+  // these; the write was not acked, so any mix of its bytes is legal.
+  if (!JournalDownColumns(degraded, intents)) CLIO_CO_RETURN;
   // Healthy stripes whose parity encodes exactly their current members get
   // their parity updated from the change alone (DeltaEncodeStripe): keep the
   // bytes this write replaces, read before it lands.
@@ -1599,6 +1630,12 @@ clio::run::TaskResume Runtime::WriteStripes(
   }
   for (auto &kv : degraded) {
     if (!wok) break;
+    if (FaultSkipParity()) {
+      // Test fault: the process "dies" after the data landed, before the
+      // degraded stripe's parity did (the write hole, #1137).
+      MarkSlotDirty(kv.first);
+      continue;
+    }
     CLIO_CO_AWAIT(StoreDegradedParity(kv.first, kv.second, wok));
     if (wok) clean.insert(kv.first);
   }
@@ -2164,6 +2201,17 @@ clio::run::TaskResume Runtime::RebuildMember(bool is_data, int idx, bool &ok,
       CLIO_CO_RETURN;
     }
     if (is_data && IsSlotDirty(s)) {
+      // A degraded write cut short may have journaled the missing chunk
+      // (#1137): re-encode from it first.
+      const std::set<clio::run::u64> one{s};
+      CLIO_CO_AWAIT(LockStripes(one));
+      const clio::run::u64 wm = IntentWatermark();
+      bool eok = !IsSlotDirty(s);
+      if (!eok) CLIO_CO_AWAIT(EncodeStripe(s, eok));
+      UnlockStripes(one);
+      if (eok) LogStripesEncoded(one, wm);
+    }
+    if (is_data && IsSlotDirty(s)) {
       // Reconstructing a DATA chunk needs current parity; a parity rebuild
       // recomputes from the (active) data members directly, so it does not.
       HLOG(kError,
@@ -2671,6 +2719,7 @@ void Runtime::LogCleanIntents(const std::vector<IntentKey> &keys,
   for (const IntentKey &k : keys) {
     if (clean.count(k.slot) != 0) {
       alloc_log_.LogFree(kIntentGroup, k.key, k.slot, 0);
+      journal_.DropKey(k.slot, k.key);  // the parity covers it again
     } else {
       // Not encoded (its write failed, or a member went down): the stripe
       // stays stale until some later encode settles it.
@@ -2820,7 +2869,14 @@ clio::run::TaskResume Runtime::EncodeStripe(clio::run::u64 s, bool &ok) {
       static_cast<size_t>(k_s), std::vector<uint8_t>(kChunkLen, 0));
   for (int pos = 0; pos < k_s; ++pos) {
     const size_t d = static_cast<size_t>(stripe[static_cast<size_t>(pos)]);
-    if (data_members_[d].state_ != ec::EcState::kActive) CLIO_CO_RETURN;
+    if (data_members_[d].state_ != ec::EcState::kActive) {
+      // A down column: only its journaled chunk (#1137) says what it holds.
+      if (!journal_.Read(s, static_cast<uint32_t>(d),
+                         dchunks[static_cast<size_t>(pos)])) {
+        CLIO_CO_RETURN;
+      }
+      continue;
+    }
     bool one = false;
     CLIO_CO_AWAIT(ReadDataSegment(d, SlotPhysOffset(s),
                                   dchunks[static_cast<size_t>(pos)].data(),
@@ -2858,9 +2914,39 @@ clio::run::TaskResume Runtime::EncodeStripe(clio::run::u64 s, bool &ok) {
     std::lock_guard<std::mutex> g(slot_mu_);
     if (slot_gen_[s] == gen) dirty_slots_.erase(s);
   }
+  journal_.DropSlot(s);  // the parity is current; the stripe is held
   ok = true;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+bool Runtime::JournalDownColumns(
+    const std::map<clio::run::u64, DegradedStripe> &degraded,
+    const std::vector<IntentKey> &intents) {
+  if (degraded.empty() || !journal_.enabled()) return true;
+  std::map<clio::run::u64, clio::run::u64> key_of;
+  for (const IntentKey &k : intents) key_of[k.slot] = k.key;
+  for (const auto &kv : degraded) {
+    auto key = key_of.find(kv.first);
+    if (key == key_of.end()) continue;  // no intent: nothing to key it by
+    const DegradedStripe &st = kv.second;
+    for (size_t pos = 0; pos < st.members.size(); ++pos) {
+      const int d = st.members[pos];
+      if (DataActive(static_cast<size_t>(d))) continue;
+      if (!journal_.Append(key->second, kv.first, static_cast<uint32_t>(d),
+                           st.chunks[pos].data())) {
+        HLOG(kError, "safe_bdev Write: cannot journal down member {} of "
+             "slot {}; refusing the degraded write", d, kv.first);
+        return false;
+      }
+    }
+  }
+  if (intent_sync_ && !journal_.Sync()) {
+    HLOG(kError, "safe_bdev Write: fsync of the degraded-write journal "
+         "failed; refusing the degraded write");
+    return false;
+  }
+  return true;
 }
 
 bool Runtime::DeltaEligible(clio::run::u64 s) {

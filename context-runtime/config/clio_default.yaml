@@ -223,6 +223,11 @@ compose:
   # the parity, restart re-encodes exactly those stripes and refuses to
   # reconstruct from them until it has. Sync (the CTE's fsync of the tier)
   # encodes any stripe still dirty, syncs every active member and the log.
+  # While a DATA member is down, its chunks exist only through the parity, so
+  # a write to one of its stripes first saves the down member's chunk to
+  # "<alloc_log>.journal" (with the same durability as the intent); a crash
+  # mid-write then finishes the stripe from the journal instead of leaving
+  # the down member's data undecodable (the degraded write hole).
   #   intent_sync: true     # default. Stripe intents are fsynced before the
   #                         # write's data reaches a member: parity stays
   #                         # consistent across a power loss. false: intents

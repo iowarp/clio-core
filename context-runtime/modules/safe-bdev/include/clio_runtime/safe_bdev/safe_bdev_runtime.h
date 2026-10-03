@@ -59,6 +59,7 @@
 
 #include "ec/ec_array.h"  // ec::EcRole, ec::EcState, ec::ReedSolomon
 #include "safe_bdev_client.h"
+#include "safe_bdev_journal.h"  // StripeJournal (#1137)
 #include "safe_bdev_superblock.h"  // MemberSuperblock, kMemberSuperblockMagic
 #include "safe_bdev_tasks.h"
 
@@ -497,6 +498,9 @@ class Runtime : public clio::run::Container {
   std::atomic<bool> intent_stop_{false};
   /** CreateParams::intent_sync_: fsync intents before data (power loss). */
   bool intent_sync_ = true;
+  /** Down columns' chunks saved before degraded writes (#1137); lives next
+   *  to the alloc log (`<alloc_log>.journal`), disabled without one. */
+  StripeJournal journal_;
   // Re-check period while the sync thread's fsync covers our intent.
   static constexpr double kIntentSyncPollUs = 20.0;
 
@@ -1080,11 +1084,23 @@ class Runtime : public clio::run::Container {
    * @param data the write's bytes
    * @param ok false if the write must be failed
    * @param clean stripes whose parity is current afterwards (log them clean)
+   * @param intents the write's stripe intents (journal keys for degraded
+   *        stripes; empty when the intent log is disabled)
    */
   clio::run::TaskResume WriteStripes(clio::run::shared_ptr<WriteTask> &task,
                                      const std::vector<WritePiece> &pieces,
                                      const char *data, bool &ok,
-                                     std::set<clio::run::u64> &clean);
+                                     std::set<clio::run::u64> &clean,
+                                     const std::vector<IntentKey> &intents);
+  /**
+   * Journal the down data columns of each degraded stripe (#1137) before any
+   * byte of the write lands, so a crash mid-write cannot strand them.
+   * @param degraded the write's degraded stripes, reconstructed
+   * @param intents the write's stripe intents (keys the records)
+   * @return false if a record could not be written (the write must fail)
+   */
+  bool JournalDownColumns(const std::map<clio::run::u64, DegradedStripe> &degraded,
+                          const std::vector<IntentKey> &intents);
   /**
    * Await a Write's member writes and free their staging buffers. A member
    * whose write failed is faulted unless the error was transient.
