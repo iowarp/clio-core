@@ -422,6 +422,12 @@ compose:
     #   through by every put (REPLICA_FIXED | REPLICA_PERSISTENT: never
     #   migrated, never volatile). They protect against losing a device, not
     #   a node, and each doubles the disk footprint. Default: 0.
+    #   Leave it 0 over a clio_safe_bdev tier: the array already survives
+    #   max_failures dead disks, so a second copy on the same array protects
+    #   nothing, and fsync moves the primary onto persistent storage too --
+    #   each fsynced byte then lands twice on the array (#1140).
+    #   Space per fsynced byte is about 1 + num_replicas + remote_copies,
+    #   plus the writer node's evictable cache copy.
     # num_replicas: 1
     # Base path of the handoff log (one file per container, suffixed
     # ".<container>"): the changes a container made while covering for a dead

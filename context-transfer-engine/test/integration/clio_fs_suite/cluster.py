@@ -332,12 +332,18 @@ class Cluster:
       organizer = (f'    organizer: "{self.organizer}"\n'
                    f'    organizer_period_ms: {self.organizer_period_ms}\n')
     if self.profile in ('persistent', 'tiered', 'safe'):
+      # A local persistent replica (num_replicas) guards against losing a
+      # device. On the safe profile the slow tier is a safe_bdev array that
+      # already survives max_failures dead disks, so a second copy on that
+      # same array protects nothing and doubles every fsynced byte (#1140);
+      # the remote copy (node loss) is kept.
+      local_replicas = 0 if self.profile == 'safe' else 1
       chain = ('  - mod_name: clio_cte_replication\n'
                '    pool_name: clio_cte_replication\n'
                '    pool_query: local\n'
                '    pool_id: "561.0"\n'
                '    next_pool_id: "512.0"\n'
-               '    num_replicas: 1\n'
+               f'    num_replicas: {local_replicas}\n'
                f'    replicate_period_ms: {self.replicate_period_ms}\n'
                '    cache_score: 1.0\n'
                '    replica_score: 0.2\n'

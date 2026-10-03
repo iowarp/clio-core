@@ -135,6 +135,11 @@ def t_tier_overflow(ctx):
   block not holding its latest fsynced version fails the test."""
   n = len(ctx.hosts)
   per_node_mb = int(_tier_mb(ctx) * 1.5)
+  if ctx.cl.profile == 'safe' and n > 1:
+    # Every fsynced byte is stored twice on the safe arrays there (the
+    # primary and the remote copy), so 1.5x RAM + fast would need ~94% of a
+    # disk_gb array: keep it to ~70%, which still overflows both upper tiers.
+    per_node_mb = min(per_node_mb, int(ctx.cl.disk_gb * 1024 * 0.7 / 2))
   nfiles = max(2, per_node_mb // 64)
   base = ctx.p('ovf')
   ctx.ok(0, 'mkdir', path=base)
