@@ -6,8 +6,10 @@
 #define CLIO_CTE_REPLICATION_REPLICATION_RUNTIME_H_
 
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <string>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -304,6 +306,18 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::run::TaskResume InvalidateCachedEverywhere(TagId tag,
                                                    std::string name);
   /**
+   * Serve a read from this blob's remote copies (#1114): the owner is alive
+   * but neither its primary nor its local replicas could be read (their
+   * device is down -- with neighborhood > 1 they can share a dead
+   * neighbor's disk). Reads the first live successor's shadow straight into
+   * the task's buffers (every segment of a vectored read).
+   * @param task the read (its pool query is left untouched)
+   * @param served set true when a remote copy served every byte
+   */
+  clio::run::TaskResume ReadRemoteCopy(
+      clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task,
+      bool &served);
+  /**
    * Mirror one written range to this blob's remote copies (owner side).
    * @param tag blob's tag
    * @param name blob name
@@ -352,7 +366,10 @@ class Runtime : public clio::cte::core::CoreInterposer {
   std::mutex handoff_mu_;
   /** Blobs whose replication write token is held (LockBlobs). */
   std::mutex blob_busy_mu_;
-  std::unordered_set<std::string> blob_busy_;
+  // Held blob keys -> when their holder took them (steady ns), so a waiter
+  // stuck behind one can say how long it has been held (#1147).
+  std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+      blob_busy_;
   std::unordered_map<clio::run::u32,
                      std::unordered_map<std::string, HandoffEntry>> handoff_;
   clio::cte::core::RecordLog handoff_log_;

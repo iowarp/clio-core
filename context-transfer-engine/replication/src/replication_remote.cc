@@ -136,6 +136,47 @@ clio::run::TaskResume Runtime::MirrorRange(TagId tag, std::string name,
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::ReadRemoteCopy(
+    clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task, bool &served) {
+  CLIO_TASK_BODY_BEGIN
+  served = false;
+  const clio::run::u32 n = NumContainers();
+  const TagId tag = task->tag_id_;
+  const std::string name = task->blob_name_.str();
+  for (int i = 1; i <= config_.remote_copies_ && i < static_cast<int>(n) &&
+                  !served; ++i) {
+    const clio::run::u32 c = (container_id_ + i) % n;
+    if (!ContainerAlive(c)) continue;
+    const clio::run::PoolQuery at = clio::run::PoolQuery::DirectId(c);
+    // One scalar read per region: the task's own range, or each segment of
+    // a vectored read into that segment's buffer.
+    std::vector<clio::cte::core::BlobSegment> regions;
+    if (task->segments_.empty()) {
+      regions.emplace_back(task->offset_, task->size_, task->blob_data_);
+    } else {
+      for (size_t k = 0; k < task->segments_.size(); ++k) {
+        regions.push_back(task->segments_[k]);
+      }
+    }
+    bool all = true;
+    for (size_t k = 0; k < regions.size() && all; ++k) {
+      auto g = GetCoreClient()->AsyncGetBlob(tag, name, regions[k].blob_off_,
+                                             regions[k].size_, task->flags_,
+                                             regions[k].data_, at);
+      CLIO_CO_AWAIT(g);
+      all = g->GetReturnCode() == 0;
+    }
+    if (all) {
+      HLOG(kWarning, "replication: {}.{}/{} unreadable at its owner "
+           "(device down); served from the remote copy on container {}",
+           tag.major_, tag.minor_, name, c);
+      served = true;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 namespace {
 /** Resends of a forwarded put whose owner died mid-flight. */
 constexpr int kForwardRetries = 10;

@@ -91,6 +91,26 @@ inline bool ContainerNodeAlive(clio::run::PoolId pool_id,
 }
 
 /**
+ * Whether the node holding a storage target is up (#1114). A target reached
+ * through a DirectHash/DirectId query lives on that container's node;
+ * any other query (Local) is this node's own, which is up.
+ * @param t the target
+ * @return false only when the target's node is known to be down
+ */
+inline bool TargetNodeAlive(const TargetInfo &t) {
+  const clio::run::PoolQuery &q = t.target_query_;
+  const clio::run::PoolId bdev = t.bdev_client_.pool_id_;
+  if (q.IsDirectIdMode()) {
+    return ContainerNodeAlive(bdev, q.GetContainerId());
+  }
+  if (q.IsDirectHashMode()) {
+    const clio::run::u32 n = PoolContainers(bdev);
+    return n == 0 || ContainerNodeAlive(bdev, q.GetHash() % n);
+  }
+  return true;
+}
+
+/**
  * The container serving the owner's blobs now: the owner while its node is
  * alive, else the first container after it whose node is.
  * @param pool_id pool

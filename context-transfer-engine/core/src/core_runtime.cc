@@ -9386,6 +9386,14 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
   std::vector<TargetInfo> ordered_targets =
       dpe_->SelectTargets(available_targets, blob_score, additional_size);
 
+  // A neighbor's target whose node is down cannot take the blocks: placing
+  // there only fails the put (or, with neighborhood > 1, strands the blob on
+  // a dead disk) (#1114).
+  ordered_targets.erase(
+      std::remove_if(ordered_targets.begin(), ordered_targets.end(),
+                     [](const TargetInfo &t) { return !TargetNodeAlive(t); }),
+      ordered_targets.end());
+
   // Capped placement (#1140): a node-local CACHE copy is derivable and
   // evictable, so it must not take durable capacity -- spilled onto a
   // long_term tier once the fast tiers filled, cache copies used up the

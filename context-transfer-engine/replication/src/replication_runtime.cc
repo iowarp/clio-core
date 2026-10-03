@@ -474,22 +474,39 @@ clio::run::TaskResume Runtime::LockBlobs(std::vector<std::string> keys) {
   CLIO_TASK_BODY_BEGIN
   std::sort(keys.begin(), keys.end());
   keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-  for (;;) {
-    {
-      std::lock_guard<std::mutex> g(blob_busy_mu_);
-      bool free = true;
-      for (const auto &k : keys) {
-        if (blob_busy_.count(k) != 0) {
-          free = false;
-          break;
+  {
+    const auto t0 = std::chrono::steady_clock::now();
+    double next_report_s = 10.0;
+    for (;;) {
+      std::string busy_key;
+      double held_s = 0;
+      {
+        std::lock_guard<std::mutex> g(blob_busy_mu_);
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto &k : keys) {
+          auto it = blob_busy_.find(k);
+          if (it != blob_busy_.end()) {
+            busy_key = k;
+            held_s = std::chrono::duration<double>(now - it->second).count();
+            break;
+          }
+        }
+        if (busy_key.empty()) {
+          for (const auto &k : keys) blob_busy_[k] = now;
+          CLIO_CO_RETURN;
         }
       }
-      if (free) {
-        for (const auto &k : keys) blob_busy_.insert(k);
-        CLIO_CO_RETURN;
+      const double waited = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (waited >= next_report_s) {
+        // Held this long is a stuck holder (e.g. a put awaiting a remote
+        // copy that never answers), not contention.
+        HLOG(kError, "replication [HANGWATCH-BLOB] waited {} ms for blob {} "
+             "(held for {} ms)", waited * 1000.0, busy_key, held_s * 1000.0);
+        next_report_s *= 2;
       }
+      CLIO_CO_AWAIT(clio::run::yield(20.0));
     }
-    CLIO_CO_AWAIT(clio::run::yield(20.0));
   }
   CLIO_TASK_BODY_END
 }
@@ -588,7 +605,7 @@ clio::run::TaskResume Runtime::GetBlob(
       CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
                              task.template Cast<clio::run::Task>()));
       if (task->GetReturnCode() != clio::cte::core::kGetBlobIoErrorRc ||
-          config_.num_replicas_ <= 0) {
+          (config_.num_replicas_ <= 0 && config_.remote_copies_ <= 0)) {
         CLIO_CO_RETURN;
       }
       // The primary's blocks did not come back (their device or node is
@@ -686,6 +703,16 @@ clio::run::TaskResume Runtime::GetBlob(
       }
       served = true;
       served_total = rep_size;
+    }
+    if (!served && primary_unreadable && config_.remote_copies_ > 0) {
+      // Every local copy sits on a dead device: another node holds one
+      // (#1114). No re-cache -- the primary's blocks are unreachable.
+      bool remote = false;
+      CLIO_CO_AWAIT(ReadRemoteCopy(task, remote));
+      if (remote) {
+        task->SetReturnCode(0);
+        CLIO_CO_RETURN;
+      }
     }
     if (!served) {
       // Nothing covers the range: forward to the core so the caller gets
