@@ -1348,3 +1348,71 @@ TEST_CASE("safe_bdev_degraded_crash_cycles",
   phase(20, "two down");
   rig.Cleanup();
 }
+
+TEST_CASE("safe_bdev_rebuild_under_load_then_lose_two",
+          "[safe_bdev][disk_fail][recover]") {
+  // #1146: a data disk dies, is replaced and rebuilt WHILE writers churn
+  // (allocate, rewrite parts, free -- so freed chunks hold old bytes the
+  // fixed-width parity still encodes); then a data and a parity disk die
+  // (max_failures again, behind the rebuild). Every live byte must decode.
+  EnsureInit();
+  REQUIRE(g_initialized);
+  const clio::run::u32 base =
+      82000 + static_cast<clio::run::u32>(getpid() & 0x3FF) * 4;
+  Rig rig;
+  rig.Build("rul", base);
+  constexpr size_t kThreads = 4;
+  std::vector<std::vector<ChurnSet>> sets(kThreads);
+  std::vector<std::mt19937> rngs;
+  for (size_t t = 0; t < kThreads; ++t) rngs.emplace_back(1146 + t);
+  std::vector<clio::run::u32> next_tag(kThreads, 0);
+  auto verify = [&](const std::string &when) {
+    const std::string v = VerifyChurn(rig.safe, sets);
+    INFO("verify " + when + ": " + v);
+    REQUIRE(v.empty());
+  };
+  {
+    const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, 40);
+    INFO("churn healthy: " + e);
+    REQUIRE(e.empty());
+  }
+  KillDisk(rig.paths[0]);
+  verify("after the disk died");
+  {
+    const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, 20);
+    INFO("churn degraded: " + e);
+    REQUIRE(e.empty());
+  }
+  const std::string np = (rig.dir / "rul_new0.bin").string();
+  const clio::run::PoolId nid = CreateDisk(np, clio::run::PoolId(base + 30, 0));
+  REQUIRE_FALSE(nid.IsNull());
+  // Churn during the rebuild.
+  std::string churn_err;
+  std::atomic<bool> rebuilding{true};
+  std::thread churner([&] {
+    while (rebuilding.load() && churn_err.empty()) {
+      churn_err = ChurnPhase(rig.safe, sets, rngs, next_tag, 2);
+    }
+  });
+  auto rec = rig.safe.AsyncRecoverBdev(clio::run::PoolQuery::Dynamic(),
+                                       rig.ids[0], np, 0, nid);
+  rec.Wait();
+  rebuilding.store(false);
+  churner.join();
+  INFO("churn during the rebuild: " + churn_err);
+  REQUIRE(churn_err.empty());
+  REQUIRE(rec->GetReturnCode() == 0);
+  REQUIRE(QueryArray(rig.safe).faulty_members == 0);
+  rig.paths[0] = np;
+  rig.ids[0] = nid;
+  verify("after the rebuild");
+  {
+    const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, 20);
+    INFO("churn after the rebuild: " + e);
+    REQUIRE(e.empty());
+  }
+  KillDisk(rig.paths[1]);
+  KillDisk(rig.paths[kMembers - 1]);
+  verify("after two more disks died behind the rebuild");
+  rig.Cleanup();
+}

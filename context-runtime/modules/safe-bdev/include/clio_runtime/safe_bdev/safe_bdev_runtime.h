@@ -1291,13 +1291,81 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume SeatConfigParity(MemberBdevDesc desc,
                                          clio::run::u32 &rc, bool &fresh);
 
-  /** Reconstruct + write EVERY slot this member participates in onto its
-   *  (already-seated) client. Idempotent: safe to re-run after an interrupted
-   *  recovery. On return `ok` reports I/O success and `completed` is false only
-   *  when the CLIO_SAFE_BDEV_RECOVER_MAX_ROWS test hook stopped the rebuild
-   *  early (recovery left in-progress). */
+  /** Reconstruct + write EVERY slot below the array high water onto the
+   *  member's (already-seated) client -- fixed-width parity covers every
+   *  column's physical bytes, allocated or not (#1146). Slots that writes
+   *  touch meanwhile are rebuilt again, and the last pass runs with writes
+   *  gated: on success with `completed`, the write gate is left CLOSED so
+   *  the caller can mark the member active before any write sees it
+   *  non-active; the caller then calls OpenWriteGate(). Idempotent: safe to
+   *  re-run after an interrupted recovery. On return `ok` reports I/O
+   *  success and `completed` is false only when the
+   *  CLIO_SAFE_BDEV_RECOVER_MAX_ROWS test hook stopped the rebuild early
+   *  (recovery left in-progress; the gate is open). */
   clio::run::TaskResume RebuildMember(bool is_data, int idx, bool &ok,
                                       bool &completed);
+
+  /**
+   * Rebuild one slot of a recovering member under its stripe lock.
+   * @param is_data data (true) or parity (false) member
+   * @param idx the member's column / row
+   * @param s the slot
+   * @param ok receives false on an I/O or reconstruction failure
+   */
+  clio::run::TaskResume RebuildSlot(bool is_data, int idx, clio::run::u64 s,
+                                    bool &ok);
+
+  /** Rebuild every slot recorded in rebuild_redo_ (and clear them).
+   * @param is_data data (true) or parity (false) member
+   * @param idx the member's column / row
+   * @param ok receives false on a failure */
+  clio::run::TaskResume RebuildRedo(bool is_data, int idx, bool &ok);
+
+  /**
+   * Record stripes a write or encode is about to change while a member is
+   * being rebuilt: the rebuild redoes them, since the recovering member does
+   * not take writes (#1146).
+   * @param slots the stripes
+   */
+  void NoteRebuildWrites(const std::set<clio::run::u64> &slots) {
+    std::lock_guard<std::mutex> g(rebuild_mu_);
+    if (rebuild_tracking_) rebuild_redo_.insert(slots.begin(), slots.end());
+  }
+
+  /** Let writes proceed again (after a rebuilt member was marked active). */
+  void OpenWriteGate() {
+    write_gate_.store(false, std::memory_order_seq_cst);
+  }
+
+  /** Stop tracking writes for a rebuild and open the gate (failure paths). */
+  void EndRebuildTracking() {
+    {
+      std::lock_guard<std::mutex> g(rebuild_mu_);
+      rebuild_tracking_ = false;
+      rebuild_redo_.clear();
+    }
+    OpenWriteGate();
+  }
+
+  /** Writes wait here while a rebuild's final pass runs; then count
+   *  themselves in flight (seq_cst pairs with the gate). */
+  clio::run::TaskResume EnterWrite();
+
+  /** A write's member and parity I/O is done. */
+  void LeaveWrite() {
+    writes_in_flight_.fetch_sub(1, std::memory_order_seq_cst);
+  }
+
+  // Rebuild-under-load state (#1146).
+  std::mutex rebuild_mu_;
+  bool rebuild_tracking_ = false;              // guarded by rebuild_mu_
+  std::set<clio::run::u64> rebuild_redo_;      // guarded by rebuild_mu_
+  std::atomic<bool> write_gate_{false};
+  std::atomic<clio::run::u64> writes_in_flight_{0};
+  /** Re-check period while waiting on the write gate / in-flight writes. */
+  static constexpr double kWriteGatePollUs = 200.0;
+  /** Redo passes before the final, gated one. */
+  static constexpr int kRebuildRedoPasses = 4;
 
   /** After membership is restored, resume any member left in the recovering
    *  state (crash mid-RecoverBdev). Persists the manifest as members come back

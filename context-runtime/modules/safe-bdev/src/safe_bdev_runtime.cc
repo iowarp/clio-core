@@ -1569,6 +1569,10 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   // writers -- which share stripes, allocation being round-robin -- can
   // share its fsync (AwaitIntentDurable); it is still durable before any
   // data of this write reaches a member.
+  // A member being rebuilt does not take this write: record its stripes
+  // so the rebuild redoes them, and wait out a rebuild's final pass (#1146).
+  CLIO_CO_AWAIT(EnterWrite());
+  NoteRebuildWrites(slots);
   std::vector<IntentKey> intents;
   const clio::run::u64 intent_seq = LogDirtyIntents(slots, intents);
   CLIO_CO_AWAIT(AwaitIntentDurable(intent_seq));
@@ -1578,6 +1582,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   std::set<clio::run::u64> clean;
   CLIO_CO_AWAIT(WriteStripes(task, pieces, data.ptr_, ok, clean, intents));
   UnlockStripes(slots);
+  LeaveWrite();
   LogCleanIntents(intents, clean);
   LogStripesEncoded(clean, watermark);  // older stale intents it settled
   if (!ok) {
@@ -2190,10 +2195,6 @@ clio::run::TaskResume Runtime::RebuildMember(bool is_data, int idx, bool &ok,
   CLIO_TASK_BODY_BEGIN
   ok = true;
   completed = true;
-  auto &client = is_data ? data_clients_[static_cast<size_t>(idx)]
-                         : parity_clients_[static_cast<size_t>(idx)];
-  auto *ipc = CLIO_IPC;
-
   // Test hook: stop after this many slots to simulate a recovery interrupted by
   // a crash (0 / unset => rebuild everything). The manifest keeps the member
   // recovering, so the next Create() resumes it.
@@ -2201,129 +2202,178 @@ clio::run::TaskResume Runtime::RebuildMember(bool is_data, int idx, bool &ok,
   if (const char *env = std::getenv("CLIO_SAFE_BDEV_RECOVER_MAX_ROWS")) {
     max_rows = std::strtoull(env, nullptr, 10);
   }
-
-  // The set of slots to rebuild: a DATA member rebuilds its own live slots; a
-  // PARITY member rebuilds every written slot (all stripes).
-  std::vector<clio::run::u64> slots;
-  if (is_data) {
-    for (clio::run::u64 s : data_alloc_[static_cast<size_t>(idx)].live_) {
-      slots.push_back(s);
-    }
-  } else {
-    std::lock_guard<std::mutex> g(slot_mu_);
-    for (clio::run::u64 s : written_slots_) {
-      slots.push_back(s);
-    }
+  {
+    std::lock_guard<std::mutex> g(rebuild_mu_);
+    rebuild_tracking_ = true;  // writes from here on are redone below
+    rebuild_redo_.clear();
   }
-  std::sort(slots.begin(), slots.end());
-
-  recovery_ops_total_.store(slots.size(), std::memory_order_relaxed);
   recovery_ops_completed_.store(0, std::memory_order_relaxed);
   recovery_ops_in_flight_.store(0, std::memory_order_relaxed);
   recovering_is_parity_.store(is_data ? 0u : 1u, std::memory_order_relaxed);
   recovering_index_.store(idx, std::memory_order_relaxed);
   recovery_active_.store(1, std::memory_order_release);
 
-  clio::run::u64 done = 0;
-  for (clio::run::u64 s : slots) {
-    if (max_rows != 0 && done >= max_rows) {
-      completed = false;  // interrupted: leave the member recovering
-      recovery_active_.store(0, std::memory_order_release);
-      CLIO_CO_RETURN;
+  // Pass 1: every slot below the array high water (#1146): fixed-width
+  // parity encodes every column's physical bytes there, allocated or not,
+  // so a member holding zeros in a freed chunk would corrupt the decode of
+  // its neighbors. The high water is re-read each step: slots first used
+  // meanwhile are covered too.
+  {
+    clio::run::u64 s = 0;
+    for (;;) {
+      clio::run::u64 hw = 0;
+      {
+        std::lock_guard<std::mutex> g(alloc_mu_);
+        hw = array_high_water_;
+      }
+      recovery_ops_total_.store(hw, std::memory_order_relaxed);
+      if (s >= hw) break;
+      if (max_rows != 0 && s >= max_rows) {
+        completed = false;  // interrupted: leave the member recovering
+        break;
+      }
+      CLIO_CO_AWAIT(RebuildSlot(is_data, idx, s, ok));
+      if (!ok) break;
+      recovery_ops_completed_.fetch_add(1, std::memory_order_relaxed);
+      ++s;
     }
-    if (is_data && IsSlotDirty(s)) {
-      // A degraded write cut short may have journaled the missing chunk
-      // (#1137): re-encode from it first.
-      const std::set<clio::run::u64> one{s};
-      CLIO_CO_AWAIT(LockStripes(one));
-      const clio::run::u64 wm = IntentWatermark();
-      bool eok = !IsSlotDirty(s);
-      if (!eok) CLIO_CO_AWAIT(EncodeStripe(s, eok));
-      UnlockStripes(one);
-      if (eok) LogStripesEncoded(one, wm);
+  }
+  // Redo passes: stripes that writes changed while the member did not take
+  // them. The last one runs with writes gated and drained, so nothing
+  // changes between it and the member turning active (the caller opens the
+  // gate once it has).
+  for (int pass = 0; ok && completed && pass < kRebuildRedoPasses; ++pass) {
+    CLIO_CO_AWAIT(RebuildRedo(is_data, idx, ok));
+  }
+  if (ok && completed) {
+    write_gate_.store(true, std::memory_order_seq_cst);
+    while (writes_in_flight_.load(std::memory_order_seq_cst) != 0) {
+      CLIO_CO_AWAIT(clio::run::yield(kWriteGatePollUs));
     }
-    if (is_data && IsSlotDirty(s)) {
-      // Reconstructing a DATA chunk needs current parity; a parity rebuild
-      // recomputes from the (active) data members directly, so it does not.
-      HLOG(kError,
-           "safe_bdev RebuildMember: slot {} dirty (parity not built); cannot "
-           "reconstruct data member",
-           s);
-      ok = false;
-      recovery_active_.store(0, std::memory_order_release);
-      CLIO_CO_RETURN;
+    CLIO_CO_AWAIT(RebuildRedo(is_data, idx, ok));
+  }
+  {
+    std::lock_guard<std::mutex> g(rebuild_mu_);
+    rebuild_tracking_ = false;
+    rebuild_redo_.clear();
+  }
+  if (!ok || !completed) OpenWriteGate();
+  recovery_active_.store(0, std::memory_order_release);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RebuildRedo(bool is_data, int idx, bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  std::set<clio::run::u64> redo;
+  {
+    std::lock_guard<std::mutex> g(rebuild_mu_);
+    redo.swap(rebuild_redo_);
+  }
+  for (clio::run::u64 s : redo) {
+    CLIO_CO_AWAIT(RebuildSlot(is_data, idx, s, ok));
+    if (!ok) break;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::EnterWrite() {
+  CLIO_TASK_BODY_BEGIN
+  for (;;) {
+    writes_in_flight_.fetch_add(1, std::memory_order_seq_cst);
+    if (!write_gate_.load(std::memory_order_seq_cst)) break;
+    // A rebuild's final pass is running: step back out and wait.
+    writes_in_flight_.fetch_sub(1, std::memory_order_seq_cst);
+    while (write_gate_.load(std::memory_order_seq_cst)) {
+      CLIO_CO_AWAIT(clio::run::yield(kWriteGatePollUs));
     }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RebuildSlot(bool is_data, int idx,
+                                           clio::run::u64 s, bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = false;
+  auto &client = is_data ? data_clients_[static_cast<size_t>(idx)]
+                         : parity_clients_[static_cast<size_t>(idx)];
+  auto *ipc = CLIO_IPC;
+  // Held across reconstruct + write: a write landing in between would be
+  // overwritten with the bytes from before it (#1146).
+  const std::set<clio::run::u64> one{s};
+  CLIO_CO_AWAIT(LockStripes(one));
+  if (is_data && IsSlotDirty(s)) {
+    // A degraded write cut short may have journaled the missing chunk
+    // (#1137): re-encode from it first.
+    const clio::run::u64 wm = IntentWatermark();
+    bool eok = false;
+    CLIO_CO_AWAIT(EncodeStripe(s, eok));
+    if (eok) LogStripesEncoded(one, wm);
+  }
+  if (is_data && IsSlotDirty(s)) {
+    // Reconstructing a DATA chunk needs current parity; a parity rebuild
+    // recomputes from the (active) data members directly, so it does not.
+    HLOG(kError, "safe_bdev RebuildMember: slot {} dirty (parity not built); "
+         "cannot reconstruct data member", s);
+    UnlockStripes(one);
+    CLIO_CO_RETURN;
+  }
+  {
     // Every column, allocated or not (fixed-width parity, #1126).
     const std::vector<int> stripe = CodeColumns();
     const int k_s = static_cast<int>(stripe.size());
     if (k_s <= 0) {
-      ++done;
-      continue;
-    }
-
-    ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(kChunkLen);
-    if (buf.IsNull()) {
-      ok = false;
-      recovery_active_.store(0, std::memory_order_release);
+      UnlockStripes(one);
+      ok = true;
       CLIO_CO_RETURN;
     }
-
+    std::vector<uint8_t> chunk(kChunkLen, 0);
+    bool built = false;
     if (is_data) {
       // Reconstruct this member's chunk from the stripe's survivors.
-      int pos = -1;
-      for (size_t i = 0; i < stripe.size(); ++i) {
-        if (stripe[i] == idx) {
-          pos = static_cast<int>(i);
-          break;
-        }
-      }
+      const auto it = std::find(stripe.begin(), stripe.end(), idx);
       std::vector<std::vector<uint8_t>> chunks;
-      bool rec_ok = false;
-      if (pos >= 0) {
+      if (it != stripe.end()) {
         const std::vector<int> excl{idx};
-        CLIO_CO_AWAIT(ReconstructStripe(s, stripe, excl, chunks, rec_ok));
+        CLIO_CO_AWAIT(ReconstructStripe(s, stripe, excl, chunks, built));
       }
-      if (!rec_ok || pos < 0) {
-        ipc->FreeBuffer(buf);
-        ok = false;
-        recovery_active_.store(0, std::memory_order_release);
-        CLIO_CO_RETURN;
+      if (built) {
+        chunk = std::move(chunks[static_cast<size_t>(it - stripe.begin())]);
       }
-      std::memcpy(buf.ptr_, chunks[static_cast<size_t>(pos)].data(), kChunkLen);
     } else {
       // Recompute this parity member's shard from the stripe's data chunks
       // (all data members must be active).
       std::vector<std::vector<uint8_t>> dchunks(
           static_cast<size_t>(k_s), std::vector<uint8_t>(kChunkLen, 0));
-      bool rd_ok = true;
-      for (int pos = 0; pos < k_s; ++pos) {
+      built = true;
+      for (int pos = 0; pos < k_s && built; ++pos) {
         const int d = stripe[static_cast<size_t>(pos)];
-        if (data_members_[static_cast<size_t>(d)].state_ !=
-            ec::EcState::kActive) {
-          rd_ok = false;
+        if (!DataActive(static_cast<size_t>(d))) {
+          built = false;
           break;
         }
-        bool one = false;
         CLIO_CO_AWAIT(ReadDataSegment(static_cast<size_t>(d), SlotPhysOffset(s),
                                       dchunks[static_cast<size_t>(pos)].data(),
-                                      kChunkLen, one));
-        rd_ok = one;
-        if (!rd_ok) break;
+                                      kChunkLen, built));
       }
-      if (!rd_ok) {
-        ipc->FreeBuffer(buf);
-        ok = false;
-        recovery_active_.store(0, std::memory_order_release);
-        CLIO_CO_RETURN;
+      if (built) {
+        std::vector<const uint8_t *> ptrs(static_cast<size_t>(k_s));
+        for (int pos = 0; pos < k_s; ++pos) {
+          ptrs[static_cast<size_t>(pos)] =
+              dchunks[static_cast<size_t>(pos)].data();
+        }
+        GetCodec(k_s)->EncodeParityShard(idx, ptrs, kChunkLen, chunk.data());
       }
-      std::vector<const uint8_t *> ptrs(static_cast<size_t>(k_s));
-      for (int pos = 0; pos < k_s; ++pos) {
-        ptrs[static_cast<size_t>(pos)] = dchunks[static_cast<size_t>(pos)].data();
-      }
-      GetCodec(k_s)->EncodeParityShard(idx, ptrs, kChunkLen,
-                                       reinterpret_cast<uint8_t *>(buf.ptr_));
     }
-
+    ctp::ipc::FullPtr<char> buf =
+        built ? ipc->AllocateBuffer(kChunkLen) : ctp::ipc::FullPtr<char>();
+    if (!built || buf.IsNull()) {
+      UnlockStripes(one);
+      CLIO_CO_RETURN;
+    }
+    std::memcpy(buf.ptr_, chunk.data(), kChunkLen);
     recovery_ops_in_flight_.store(1, std::memory_order_relaxed);
     const clio::run::PoolQuery q =
         is_data ? DataQuery(static_cast<size_t>(idx))
@@ -2331,19 +2381,11 @@ clio::run::TaskResume Runtime::RebuildMember(bool is_data, int idx, bool &ok,
     auto fut = client.AsyncWrite(q, MemberBlocks(SlotPhysOffset(s), kChunkLen),
                                  buf.shm_.template Cast<void>(), kChunkLen);
     CLIO_CO_AWAIT(fut);
-    const bool wok =
-        (fut->return_code_ == 0) && (fut->bytes_written_ == kChunkLen);
+    ok = fut->return_code_ == 0 && fut->bytes_written_ == kChunkLen;
     ipc->FreeBuffer(buf);
     recovery_ops_in_flight_.store(0, std::memory_order_relaxed);
-    if (!wok) {
-      ok = false;
-      recovery_active_.store(0, std::memory_order_release);
-      CLIO_CO_RETURN;
-    }
-    recovery_ops_completed_.fetch_add(1, std::memory_order_relaxed);
-    ++done;
   }
-  recovery_active_.store(0, std::memory_order_release);
+  UnlockStripes(one);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -2448,6 +2490,7 @@ clio::run::TaskResume Runtime::RecoverBdev(clio::run::shared_ptr<RecoverBdevTask
 
   m.state_ = ec::EcState::kActive;
   m.recovering_ = false;
+  OpenWriteGate();  // RebuildMember left it closed for this flip
   {
     bool wr_ok = false;
     CLIO_CO_AWAIT(WriteSuperblock(!is_data, static_cast<size_t>(idx), wr_ok));
@@ -2478,6 +2521,7 @@ clio::run::TaskResume Runtime::ResumeRecoveries() {
     if (ok && completed) {
       data_members_[i].state_ = ec::EcState::kActive;
       data_members_[i].recovering_ = false;
+      OpenWriteGate();
       bool wr = false;
       CLIO_CO_AWAIT(WriteSuperblock(false, i, wr));
       PersistMemberManifest();
@@ -2498,6 +2542,7 @@ clio::run::TaskResume Runtime::ResumeRecoveries() {
     if (ok && completed) {
       parity_members_[j].state_ = ec::EcState::kActive;
       parity_members_[j].recovering_ = false;
+      OpenWriteGate();
       bool wr = false;
       CLIO_CO_AWAIT(WriteSuperblock(true, j, wr));
       PersistMemberManifest();
@@ -2547,11 +2592,13 @@ clio::run::TaskResume Runtime::BuildParity(clio::run::shared_ptr<BuildParityTask
     // return while the stripe is still unprotected. Then encode only if it
     // is still dirty.
     const std::set<clio::run::u64> one{s};
+    CLIO_CO_AWAIT(EnterWrite());  // parity writes: gated like a Write (#1146)
     CLIO_CO_AWAIT(LockStripes(one));
     const clio::run::u64 wm = IntentWatermark();
     bool eok = !IsSlotDirty(s);
     if (!eok) CLIO_CO_AWAIT(EncodeStripe(s, eok));
     UnlockStripes(one);
+    LeaveWrite();
     if (!eok) continue;  // a member is down or I/O failed: stays dirty
     LogStripesEncoded(one, wm);
     ++built;
@@ -2882,6 +2929,7 @@ size_t Runtime::ReplayStripeIntents() {
 clio::run::TaskResume Runtime::EncodeStripe(clio::run::u64 s, bool &ok) {
   CLIO_TASK_BODY_BEGIN
   ok = false;
+  NoteRebuildWrites({s});  // a recovering parity row is not written here
   clio::run::u64 gen = 0;
   // Every data column's physical bytes, allocated or not (#1126).
   const std::vector<int> stripe = CodeColumns();
@@ -3189,11 +3237,13 @@ clio::run::TaskResume Runtime::Sync(clio::run::shared_ptr<SyncTask> &task) {
   }
   for (clio::run::u64 s : dirty) {
     const std::set<clio::run::u64> one{s};
+    CLIO_CO_AWAIT(EnterWrite());  // parity writes: gated like a Write (#1146)
     CLIO_CO_AWAIT(LockStripes(one));
     const clio::run::u64 wm = IntentWatermark();
     bool eok = !IsSlotDirty(s);
     if (!eok) CLIO_CO_AWAIT(EncodeStripe(s, eok));
     UnlockStripes(one);
+    LeaveWrite();
     if (eok) {
       LogStripesEncoded(one, wm);
     } else if (CountDownMembers() == 0) {
