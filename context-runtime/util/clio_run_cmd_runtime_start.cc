@@ -171,6 +171,8 @@ void PrintRuntimeStartUsage() {
   HIPRINT("  --fresh: Discard this node's persistent state and start empty");
   HIPRINT("  --induct: Register this node with all existing cluster nodes");
   HIPRINT("  --ephemeral: Skip the default compose; start bare (admin only)");
+  HIPRINT("  --disk <path>: Override storage root directory for this run");
+  HIPRINT("      (default: ~/.clio). Also CLIO_STORAGE_ROOT env var.");
   PrintVizUsage();
 }
 
@@ -195,6 +197,52 @@ enum class VizArg {
   // NOTE: not kError -- logging.h #defines kError as a log level, so it cannot
   // be used as an identifier anywhere in this tree.
 };
+
+/** Outcome of looking at one argument through the disk flag's eyes. */
+enum class DiskArg {
+  kNotMine,   ///< not a disk flag; the caller should handle it
+  kConsumed,  ///< consumed (i advanced past any value)
+  kBadValue,  ///< a disk flag, but malformed
+};
+
+/**
+ * Parse one argument as a disk flag.
+ *
+ * The value is pushed into the environment rather than into ConfigManager
+ * because ConfigManager does not exist yet (this runs before CLIO_INIT) and
+ * because environment overrides are re-applied after every config load.
+ * The directory is created if it does not exist.
+ */
+DiskArg ParseDiskArg(int argc, char* argv[], int& i) {
+  const std::string arg = argv[i];
+  if (arg == "--disk") {
+    if (i + 1 >= argc) {
+      HLOG(kError, "--disk requires a path value");
+      return DiskArg::kBadValue;
+    }
+    const std::string disk_path = argv[i + 1];
+    if (disk_path.empty()) {
+      HLOG(kError, "--disk path cannot be empty");
+      return DiskArg::kBadValue;
+    }
+
+    // Create the directory if it does not exist.
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(disk_path, ec);
+    if (ec) {
+      HLOG(kError, "Failed to create disk directory {}: {}", disk_path,
+           ec.message());
+      return DiskArg::kBadValue;
+    }
+
+    // Set the environment variable so ConfigManager picks it up during CLIO_INIT.
+    SetEnv("CLIO_STORAGE_ROOT", disk_path);
+    ++i;
+    return DiskArg::kConsumed;
+  }
+  return DiskArg::kNotMine;
+}
 
 /**
  * Parse one argument as a viz flag.
@@ -274,6 +322,15 @@ int RuntimeStart(int argc, char* argv[]) {
   bool induct = false;
   bool fresh = false;
   for (int i = 0; i < argc; ++i) {
+    DiskArg disk_arg = ParseDiskArg(argc, argv, i);
+    if (disk_arg == DiskArg::kBadValue) {
+      PrintRuntimeStartUsage();
+      return 1;
+    }
+    if (disk_arg == DiskArg::kConsumed) {
+      continue;
+    }
+
     VizArg viz_arg = ParseVizArg(argc, argv, i);
     if (viz_arg == VizArg::kBadValue) {
       PrintRuntimeStartUsage();

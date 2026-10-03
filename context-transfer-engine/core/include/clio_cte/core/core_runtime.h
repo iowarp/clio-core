@@ -1047,6 +1047,26 @@ private:
                                  clio::run::u32 &error_code);
 
   /**
+   * Undo the size growth of a PutBlob whose data write failed (issue #1059).
+   *
+   * PutBlob sizes the blob (and logs the new layout) before writing the
+   * bytes. If the write then fails, the blob would otherwise keep pointing at
+   * blocks that were never written, so every later GetBlob of the full size
+   * fails or returns garbage. This shrinks the blob back to its committed
+   * size, frees the unwritten blocks, re-logs the layout, and re-mirrors the
+   * SHM cache entry. A no-op when the put did not grow the blob.
+   * @param blob_info Blob whose put failed (caller holds its write token)
+   * @param old_size Committed size before the put
+   * @param blob_score Score passed through to ResizeBlob
+   * @param tag_id Tag owning the blob (for the WAL record and SHM key)
+   * @param blob_name Blob name (for the WAL record and SHM key)
+   */
+  clio::run::TaskResume RollbackFailedPut(BlobInfo &blob_info,
+                                    clio::run::u64 old_size,
+                                    float blob_score, const TagId &tag_id,
+                                    const std::string &blob_name);
+
+  /**
    * Resize a blob to exactly new_size: grow (allocate appended blocks via
    * ExtendBlob) or shrink (free trailing blocks, trim the boundary block).
    * new_size == 0 frees all blocks. Shared by PutBlob's replace path

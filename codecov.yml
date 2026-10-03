@@ -55,3 +55,9 @@ ignore:
   # a real kernel mount); the operation callbacks it dispatches to live in
   # fuse_cte.cc and are covered by test_fuse_ops.
   - "**/fuse_cte_main.cc"
+  # CAE OMNI ingest process entry: arg parsing, CLIO_INIT, the IPC handle
+  # check and the ParseOmni round-trip. Not unit-testable -- it defines
+  # main(), so no test can link the translation unit, and every statement in
+  # it needs a live runtime. The OMNI parsing it used to carry now lives in
+  # core/src/omni_loader.cc and is covered by test_cae_omni_loader.
+  - "**/util/clio_cae.cc"

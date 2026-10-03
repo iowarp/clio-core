@@ -260,6 +260,15 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetNeighborhoodSize() const;
 
   /**
+   * Get the optional IPC namespace suffix for shared memory segment names.
+   * When set (via YAML `runtime: ipc_namespace` or CLIO_IPC_NAMESPACE env var),
+   * this suffix is appended to all segment names to allow multiple independent
+   * runtimes to coexist with the same ${USER} (issue #877).
+   * @return IPC namespace suffix, or empty string if not configured
+   */
+  std::string GetIpcNamespace() const { return ipc_namespace_; }
+
+  /**
    * Get shared memory segment names. The name is suffixed with the runtime port
    * so that multiple runtimes sharing one node + ${USER} (the fallback-runtime
    * topology) each own a distinct segment instead of colliding. Pass an explicit
@@ -516,6 +525,12 @@ class ConfigManager : public ctp::BaseConfig {
   std::string client_data_segment_name_ = "chi_client_data_segment_${USER}";
   std::string queue_segment_name_ = "chi_queue_segment_${USER}";
   std::string metadata_segment_name_ = "chi_metadata_segment_${USER}";
+
+  // Optional IPC namespace suffix appended to all shared memory segment names
+  // (issue #877). Allows multiple independent runtimes to coexist using the
+  // same ${USER}, configured via `runtime: ipc_namespace` in YAML or
+  // CLIO_IPC_NAMESPACE environment variable. Empty string means no suffix.
+  std::string ipc_namespace_ = "";
 
   // Networking configuration
   std::string hostfile_path_ = "";

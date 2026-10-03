@@ -68,17 +68,9 @@
 #endif
 
 #include "clio_ctp/constants/macros.h"
-// MSan: inform sanitizer that mmap-backed memory is initialized by the kernel
-#if defined(__has_feature)
-#if __has_feature(memory_sanitizer)
-#include <sanitizer/msan_interface.h>
-#define CTP_MSAN_UNPOISON(ptr, size) __msan_unpoison((ptr), (size))
-#else
-#define CTP_MSAN_UNPOISON(ptr, size) ((void)0)
-#endif
-#else
-#define CTP_MSAN_UNPOISON(ptr, size) ((void)0)
-#endif
+// MSan: mark memory that uninstrumented code (the kernel, libstdc++, Poco)
+// filled in as initialized -- see the header.
+#include "clio_ctp/util/msan.h"
 #if CTP_ENABLE_PROCFS_SYSINFO
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -385,9 +377,14 @@ size_t SystemInfo::GetRamAvailable() {
 #if CTP_ENABLE_PROCFS_SYSINFO
 #ifdef __linux__
   std::ifstream meminfo("/proc/meminfo");
+  // libstdc++.so is not MSan-instrumented, so neither the stream's own state
+  // nor the bytes getline() copies into `line` are recorded as initialized;
+  // the rfind() below would be reported on every call.
+  CTP_MSAN_UNPOISON_OBJ(meminfo);
   if (!meminfo.is_open()) return 0;
   std::string line;
   while (std::getline(meminfo, line)) {
+    CTP_MSAN_UNPOISON_STRING(line);
     if (line.rfind("MemAvailable:", 0) == 0) {
       size_t kb = 0;
       std::sscanf(line.c_str(), "MemAvailable: %zu", &kb);
@@ -1702,6 +1699,10 @@ namespace {
 // Minimal JSON string escaping so an error message embedded in the fallback
 // payload can never produce invalid JSON (quotes/backslashes/control chars).
 std::string JsonEscape(const std::string &s) {
+  // The only caller escapes a Poco exception's displayText(). Poco is not
+  // MSan-instrumented, so the message characters it composed carry no shadow
+  // and every byte examined below would be reported.
+  CTP_MSAN_UNPOISON_STRING(s);
   std::string out;
   out.reserve(s.size() + 8);
   for (char c : s) {
@@ -1766,6 +1767,8 @@ std::string SystemInfo::PredictDriveFailure(const std::string &drive_type,
     std::istream &rs = session.receiveResponse(res);
     std::string body;
     Poco::StreamCopier::copyToString(rs, body);
+    // Response bytes came off the wire through uninstrumented Poco.
+    CTP_MSAN_UNPOISON_STRING(body);
     return body.empty() ? "{}" : body;
   } catch (const Poco::Exception &e) {
     return std::string("{\"error\": \"Prediction server unreachable: ") +

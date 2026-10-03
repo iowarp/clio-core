@@ -86,6 +86,7 @@ extern "C" void clio_cte_locate_register(
 #include "clio_runtime/worker.h"
 #include "clio_ctp/util/gpu_api.h"
 #include "clio_ctp/util/logging.h"
+#include "clio_ctp/util/msan.h"
 #include "clio_ctp/util/timer.h"
 
 namespace clio::cte::core {
@@ -901,6 +902,10 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
         bdev_type = clio::run::bdev::BdevType::kPinned;
       } else if (device.bdev_type_ == "noop") {
         bdev_type = clio::run::bdev::BdevType::kNoop;
+      } else if (device.bdev_type_ == "s3") {
+        bdev_type = clio::run::bdev::BdevType::kS3;
+      } else if (device.bdev_type_ == "gcs") {
+        bdev_type = clio::run::bdev::BdevType::kGcs;
       }
 
       // Memory tiers stay node-local (issue #1110): a blob placed in another
@@ -1010,8 +1015,19 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 
   // If this is a restart, restore metadata from the persistent log
   if (is_restart_) {
-    RestoreMetadataFromLog();
-    ReplayTransactionLogs();
+    // A corrupt record that slips past the bounds checks must not take the
+    // daemon down silently before it binds its port (#725): report it and
+    // start with whatever was restored.
+    try {
+      RestoreMetadataFromLog();
+      ReplayTransactionLogs();
+    } catch (const std::exception &e) {
+      HLOG(kError,
+           "CTE restart: metadata restore under {} failed ({}); continuing "
+           "with the state restored so far. Move the metadata log aside to "
+           "start clean.",
+           config_.performance_.metadata_log_path_, e.what());
+    }
     // Both paths populate the tag table directly (bypassing GetOrAssignTagId's
     // per-insert indexing), so rebuild the regex search index once from the
     // final tag set (#598).
@@ -2373,6 +2389,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     const auto pi_ext1 = std::chrono::steady_clock::now();
     if (alloc_result != 0) {
       task->return_code_ = 10 + alloc_result;
+      CLIO_CO_AWAIT(RollbackFailedPut(*blob_info_ptr, old_blob_size,
+                                        blob_score, tag_id, blob_name));
       CLIO_CO_RETURN;
     }
 
@@ -2428,6 +2446,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           ctp::ipc::FullPtr<char> zbuf = ipc_mgr->AllocateBuffer(zlen);
           if (zbuf.IsNull()) {
             task->return_code_ = 6;
+            CLIO_CO_AWAIT(RollbackFailedPut(*blob_info_ptr, old_blob_size,
+                                              blob_score, tag_id, blob_name));
             CLIO_CO_RETURN;
           }
           std::memset(zbuf.ptr_, 0, zlen);
@@ -2439,6 +2459,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           ipc_mgr->FreeBuffer(zbuf);
           if (zero_result != 0) {
             task->return_code_ = 20 + zero_result;
+            CLIO_CO_AWAIT(RollbackFailedPut(*blob_info_ptr, old_blob_size,
+                                              blob_score, tag_id, blob_name));
             CLIO_CO_RETURN;
           }
           zcur += zlen;
@@ -2475,6 +2497,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
               ctp::ipc::FullPtr<char> gzbuf = zipc_mgr->AllocateBuffer(zlen);
               if (gzbuf.IsNull()) {
                 task->return_code_ = 6;
+                CLIO_CO_AWAIT(RollbackFailedPut(*blob_info_ptr, old_blob_size,
+                                                  blob_score, tag_id, blob_name));
                 CLIO_CO_RETURN;
               }
               std::memset(gzbuf.ptr_, 0, zlen);
@@ -2485,6 +2509,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
               zipc_mgr->FreeBuffer(gzbuf);
               if (gz_result != 0) {
                 task->return_code_ = 20 + gz_result;
+                CLIO_CO_AWAIT(RollbackFailedPut(*blob_info_ptr, old_blob_size,
+                                                  blob_score, tag_id, blob_name));
                 CLIO_CO_RETURN;
               }
               zcursor += zlen;
@@ -2518,6 +2544,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                                       hint_idx, hint_off));
           if (write_result != 0) {
             task->return_code_ = 20 + write_result;
+            CLIO_CO_AWAIT(RollbackFailedPut(*blob_info_ptr, old_blob_size,
+                                              blob_score, tag_id, blob_name));
             CLIO_CO_RETURN;
           }
         }
@@ -2526,6 +2554,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                                     offset, write_result, hint_idx, hint_off));
         if (write_result != 0) {
           task->return_code_ = 20 + write_result;
+          CLIO_CO_AWAIT(RollbackFailedPut(*blob_info_ptr, old_blob_size,
+                                            blob_score, tag_id, blob_name));
           CLIO_CO_RETURN;
         }
        }
@@ -2534,6 +2564,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                                     offset, write_result, hint_idx, hint_off));
         if (write_result != 0) {
           task->return_code_ = 20 + write_result;
+          CLIO_CO_AWAIT(RollbackFailedPut(*blob_info_ptr, old_blob_size,
+                                            blob_score, tag_id, blob_name));
           CLIO_CO_RETURN;
         }
       }
@@ -7765,6 +7797,9 @@ void Runtime::RestoreMetadataFromLog() {
   }
 
   std::ifstream ifs(log_path, std::ios::binary);
+  // Stream state belongs to uninstrumented libstdc++.so: is_open(), peek() and
+  // good() below all read bytes MSan never saw written.
+  CTP_MSAN_UNPOISON_OBJ(ifs);
   if (!ifs.is_open()) {
     HLOG(kError, "RestoreMetadataFromLog: Failed to open log file: {}",
          log_path);
@@ -7775,17 +7810,57 @@ void Runtime::RestoreMetadataFromLog() {
   clio::run::u32 tags_restored = 0;
   clio::run::u32 blobs_restored = 0;
 
-  while (ifs.peek() != EOF) {
+  // Every length and count below comes off disk. A torn or corrupt log must
+  // stop the restore with a message, never size a std::string or loop off a
+  // garbage u32 -- that used to kill the daemon before it bound its port,
+  // with nothing in the log (#725).
+  std::error_code size_ec;
+  const clio::run::u64 file_size =
+      static_cast<clio::run::u64>(fs::file_size(log_path, size_ec));
+  if (size_ec) {
+    HLOG(kError, "RestoreMetadataFromLog: cannot stat {}: {}", log_path,
+         size_ec.message());
+    return;
+  }
+  auto remaining = [&ifs, file_size]() -> clio::run::u64 {
+    std::streamoff pos = ifs.tellg();
+    if (pos < 0 || static_cast<clio::run::u64>(pos) > file_size) return 0;
+    return file_size - static_cast<clio::run::u64>(pos);
+  };
+  auto corrupt = [&log_path, &ifs](const char *what, clio::run::u64 value) {
+    HLOG(kError,
+         "RestoreMetadataFromLog: {} is corrupt near offset {} ({} = {}); "
+         "keeping what was restored before it and ignoring the rest",
+         log_path, static_cast<long long>(ifs.tellg()), what, value);
+  };
+  // Length-prefixed string, bounded by the bytes left in the file.
+  auto read_str = [&](std::string &out, const char *what) -> bool {
+    uint32_t len = 0;
+    ifs.read(reinterpret_cast<char *>(&len), sizeof(len));
+    if (!ifs.good()) return false;
+    if (len > remaining()) {
+      corrupt(what, len);
+      return false;
+    }
+    out.assign(len, '\0');
+    ifs.read(out.data(), len);
+    return ifs.good();
+  };
+  // Serialized size of one block record: bdev ids, target query, offset, size.
+  constexpr clio::run::u64 kBlockBytes =
+      2 * sizeof(clio::run::u32) + sizeof(clio::run::PoolQuery) +
+      2 * sizeof(clio::run::u64);
+  bool stop = false;
+
+  while (!stop && ifs.peek() != EOF) {
     uint8_t entry_type;
     ifs.read(reinterpret_cast<char *>(&entry_type), sizeof(entry_type));
     if (!ifs.good()) break;
 
     if (entry_type == 0) {
       // TagInfo entry (legacy layout, no aliases -- see type 5).
-      uint32_t name_len;
-      ifs.read(reinterpret_cast<char *>(&name_len), sizeof(name_len));
-      std::string tag_name(name_len, '\0');
-      ifs.read(tag_name.data(), name_len);
+      std::string tag_name;
+      if (!read_str(tag_name, "tag name length")) break;
       TagId tag_id;
       ifs.read(reinterpret_cast<char *>(&tag_id), sizeof(tag_id));
       clio::run::u64 total_size;
@@ -7808,10 +7883,8 @@ void Runtime::RestoreMetadataFromLog() {
       // TagInfo entry WITH aliases (issue: renames/hard links lost on
       // crash). FlushMetadata writes this type exclusively now; type 0 is
       // only read for a snapshot file left by an older binary.
-      uint32_t name_len;
-      ifs.read(reinterpret_cast<char *>(&name_len), sizeof(name_len));
-      std::string tag_name(name_len, '\0');
-      ifs.read(tag_name.data(), name_len);
+      std::string tag_name;
+      if (!read_str(tag_name, "tag name length")) break;
       TagId tag_id;
       ifs.read(reinterpret_cast<char *>(&tag_id), sizeof(tag_id));
       clio::run::u64 total_size;
@@ -7819,17 +7892,24 @@ void Runtime::RestoreMetadataFromLog() {
       uint32_t num_aliases;
       ifs.read(reinterpret_cast<char *>(&num_aliases), sizeof(num_aliases));
       if (!ifs.good()) break;
+      // Each alias costs at least its 4-byte length prefix.
+      if (static_cast<clio::run::u64>(num_aliases) * sizeof(uint32_t) >
+          remaining()) {
+        corrupt("tag alias count", num_aliases);
+        break;
+      }
       std::vector<std::string> aliases;
       aliases.reserve(num_aliases);
+      bool aliases_ok = true;
       for (uint32_t i = 0; i < num_aliases; ++i) {
-        uint32_t alias_len;
-        ifs.read(reinterpret_cast<char *>(&alias_len), sizeof(alias_len));
-        std::string alias(alias_len, '\0');
-        ifs.read(alias.data(), alias_len);
-        if (!ifs.good()) break;
+        std::string alias;
+        if (!read_str(alias, "tag alias length")) {
+          aliases_ok = false;
+          break;
+        }
         aliases.push_back(alias);
       }
-      if (!ifs.good()) break;
+      if (!aliases_ok) break;
 
       tag_name_to_id_.insert_or_assign(tag_name, tag_id);
       TagInfo tag_info(tag_name, tag_id);
@@ -7853,15 +7933,10 @@ void Runtime::RestoreMetadataFromLog() {
       // older layouts restore as non-droppable.
       const bool has_transform_flags = (entry_type >= 2);
       const bool has_droppable = (entry_type >= 3);
-      uint32_t key_len;
-      ifs.read(reinterpret_cast<char *>(&key_len), sizeof(key_len));
-      std::string composite_key(key_len, '\0');
-      ifs.read(composite_key.data(), key_len);
-
-      uint32_t blob_name_len;
-      ifs.read(reinterpret_cast<char *>(&blob_name_len), sizeof(blob_name_len));
-      std::string blob_name(blob_name_len, '\0');
-      ifs.read(blob_name.data(), blob_name_len);
+      std::string composite_key;
+      if (!read_str(composite_key, "blob key length")) break;
+      std::string blob_name;
+      if (!read_str(blob_name, "blob name length")) break;
 
       float score;
       ifs.read(reinterpret_cast<char *>(&score), sizeof(score));
@@ -7885,6 +7960,10 @@ void Runtime::RestoreMetadataFromLog() {
       ifs.read(reinterpret_cast<char *>(&num_blocks), sizeof(num_blocks));
 
       if (!ifs.good()) break;
+      if (num_blocks * kBlockBytes > remaining()) {
+        corrupt("blob block count", num_blocks);
+        break;
+      }
 
       size_t snap_volatile_dropped = 0;
       BlobInfo blob_info;
@@ -7968,17 +8047,12 @@ void Runtime::RestoreMetadataFromLog() {
       // Tag 4, not 3: the blob branch above accepts 1|2|3, so while replicas
       // were written as 3 this branch was unreachable and every replica record
       // was misparsed as a blob (see the writer for the full consequence).
-      uint32_t key_len;
-      ifs.read(reinterpret_cast<char *>(&key_len), sizeof(key_len));
-      std::string composite_key(key_len, '\0');
-      ifs.read(composite_key.data(), key_len);
-
+      std::string composite_key;
+      if (!read_str(composite_key, "replica key length")) break;
       uint32_t rep_idx;
       ifs.read(reinterpret_cast<char *>(&rep_idx), sizeof(rep_idx));
-      uint32_t rep_name_len;
-      ifs.read(reinterpret_cast<char *>(&rep_name_len), sizeof(rep_name_len));
-      std::string rep_name(rep_name_len, '\0');
-      ifs.read(rep_name.data(), rep_name_len);
+      std::string rep_name;
+      if (!read_str(rep_name, "replica name length")) break;
       float rep_score;
       ifs.read(reinterpret_cast<char *>(&rep_score), sizeof(rep_score));
       uint32_t rep_flags;
@@ -7993,6 +8067,10 @@ void Runtime::RestoreMetadataFromLog() {
       ifs.read(reinterpret_cast<char *>(&num_blocks), sizeof(num_blocks));
 
       if (!ifs.good()) break;
+      if (num_blocks * kBlockBytes > remaining()) {
+        corrupt("replica block count", num_blocks);
+        break;
+      }
 
       std::shared_ptr<BlobInfo> blob_info_ptr =
           tag_blob_name_to_info_.get(composite_key);
@@ -8045,9 +8123,8 @@ void Runtime::RestoreMetadataFromLog() {
       }
 
     } else {
-      HLOG(kWarning, "RestoreMetadataFromLog: Unknown entry type {}",
-           entry_type);
-      break;
+      corrupt("entry type", entry_type);
+      stop = true;
     }
   }
 
@@ -9590,6 +9667,66 @@ clio::run::TaskResume Runtime::InvalidateCachedCopies(
            blob_name, node, inval->GetReturnCode());
     }
   }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RollbackFailedPut(BlobInfo &blob_info,
+                                           clio::run::u64 old_size,
+                                           float blob_score,
+                                           const TagId &tag_id,
+                                           const std::string &blob_name) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  // Only a put that GREW the blob can be undone: the bytes past old_size were
+  // never acknowledged, so dropping them restores exactly the last committed
+  // state. A failed overwrite of [0, old_size) cannot be rolled back -- those
+  // bytes are gone either way -- and the blob keeps its size so the rest of
+  // it stays readable.
+  clio::run::u64 cur_size = blob_info.GetTotalSize();
+  if (cur_size <= old_size) {
+    CLIO_CO_RETURN;
+  }
+  clio::run::u32 shrink_rc = 0;
+  CLIO_CO_AWAIT(ResizeBlob(blob_info, old_size, blob_score, shrink_rc));
+  if (shrink_rc != 0) {
+    HLOG(kError,
+         "PutBlob rollback: could not shrink blob '{}' from {} to {} bytes "
+         "(rc={}); its tail may read back unwritten",
+         blob_name, cur_size, old_size, shrink_rc);
+    CLIO_CO_RETURN;
+  }
+  HLOG(kWarning,
+       "PutBlob failed; rolled blob '{}' back from {} to its committed {} "
+       "bytes",
+       blob_name, cur_size, old_size);
+  // The grow was already logged as a kExtendBlob layout. Log the rolled-back
+  // layout after it, on the same shard, so replay lands on the committed
+  // state instead of resurrecting the unwritten blocks.
+  if (!blob_txn_logs_.empty()) {
+    clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+    TxnExtendBlob txn;
+    txn.tag_major_ = tag_id.major_;
+    txn.tag_minor_ = tag_id.minor_;
+    txn.blob_name_ = blob_name;
+    for (const auto &blk : blob_info.blocks_) {
+      TxnExtendBlobBlock tb;
+      tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
+      tb.bdev_minor_ = blk.bdev_client_.pool_id_.minor_;
+      tb.target_query_ = blk.target_query_;
+      tb.target_offset_ = blk.target_offset_;
+      tb.size_ = blk.size_;
+      txn.new_blocks_.push_back(tb);
+    }
+    blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendBlob,
+                                                     txn);
+  }
+  // Republish the restored size so client-side SHM reads agree with it.
+  std::string shm_key = std::to_string(tag_id.major_) + "." +
+                        std::to_string(tag_id.minor_) + "." + blob_name;
+  MirrorBlobToShm(shm_key, blob_info);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

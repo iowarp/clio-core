@@ -45,6 +45,8 @@
 #include <exception>
 #include <sstream>
 
+#include "clio_ctp/util/msan.h"
+
 #ifdef CTP_ALLOC_TRACK_SIZE
 #include <chrono>
 #include <thread>
@@ -109,6 +111,10 @@ struct TestStats {
     int failed_tests = 0;
     
     void print_summary() const {
+        // Formatting these counts runs libstdc++'s num_put on stack the tests
+        // just poisoned, and libstdc++.so is not instrumented -- same reason
+        // run_all_tests guards its opening line. Nothing under test runs here.
+        ctp::MsanInterceptorCheckGuard msan_guard;
         std::cout << "\n=== Test Summary ===" << std::endl;
         std::cout << "Total tests: " << total_tests << std::endl;
         std::cout << "Passed: " << passed_tests << std::endl;
@@ -130,7 +136,15 @@ static FinalizeFunc g_test_finalize = nullptr;
 // Test failure exception
 class TestFailure : public std::exception {
 public:
-    explicit TestFailure(const std::string& message) : message_(message) {}
+    explicit TestFailure(const std::string& message) : message_(message) {
+        // Every failure message is composed in a std::ostringstream, and
+        // basic_stringbuf::str() runs inside the uninstrumented libstdc++.so:
+        // the characters it hands back carry no MSan shadow, so PRINTING the
+        // explanation of a failure is itself reported -- twice, burying the
+        // one line that says what actually broke. Cleared once here rather
+        // than at each of the macros that build a message.
+        CTP_MSAN_UNPOISON_STRING(message_);
+    }
     const char* what() const noexcept override { return message_.c_str(); }
 private:
     std::string message_;
@@ -256,10 +270,27 @@ inline int run_all_tests(const std::string& filter = "") {
         }
     }
 
-    if (!filter.empty()) {
-        std::cout << "Running " << matching_tests << " test(s) matching filter '" << filter << "'..." << std::endl;
-    } else {
-        std::cout << "Running " << tests.size() << " test(s)..." << std::endl;
+    {
+        // First locale-dependent ostream write in the process, which is where
+        // libstdc++ lazily builds std::ctype's widen cache -- on a 256-byte
+        // stack buffer it then memcmps. That buffer lands on stack our
+        // instrumented frames already poisoned, and libstdc++.so is not
+        // instrumented, so MSan reports the memcmp. Nothing on our side owns
+        // that memory, so the interceptor check is the only thing we can turn
+        // off; the cache is built once, so this one scope covers the whole run.
+        // print_summary() below needs the same treatment for the same reason.
+        ctp::MsanInterceptorCheckGuard msan_guard;
+        // The stream buffer behind std::cout is libstdc++.so's, but our own
+        // instrumented copy of basic_streambuf::sputn reads its put-area
+        // pointers on every <<. Clearing the base sub-object once here covers
+        // the whole run, tests' own output included.
+        CTP_MSAN_UNPOISON(std::cout.rdbuf(), sizeof(std::streambuf));
+        CTP_MSAN_UNPOISON(std::cerr.rdbuf(), sizeof(std::streambuf));
+        if (!filter.empty()) {
+            std::cout << "Running " << matching_tests << " test(s) matching filter '" << filter << "'..." << std::endl;
+        } else {
+            std::cout << "Running " << tests.size() << " test(s)..." << std::endl;
+        }
     }
 
 #ifdef CTP_ALLOC_TRACK_SIZE

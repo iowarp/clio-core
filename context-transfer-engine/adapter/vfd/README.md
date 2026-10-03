@@ -14,6 +14,10 @@ in `translation/VFD_2.1_READ_CACHE_SCOPING.md` and is not implemented.
 
 Files: `H5FDclio.cc`, `H5FDclio.h`. Driver name: **`clio_vfd`**. Driver value: `3200`.
 
+> **New here?** [`../HDF5_QUICKSTART.md`](../HDF5_QUICKSTART.md) gets you to
+> a working setup, and `scripts/clio-hdf5-doctor` checks an environment and
+> prints the fix for what it finds. This README is the reference.
+
 ## Requirements
 
 HDF5 **>= 1.14** — the driver uses the multi-version `H5FD_class_t` API

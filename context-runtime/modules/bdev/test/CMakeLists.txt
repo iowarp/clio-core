@@ -10,6 +10,92 @@ set(BDEV_TEST_SOURCES
 # GPU bdev tests (test_bdev_gpucache, test_bdev_gpu_kernels) removed
 # along with the GPU runtime concept.
 
+# AWS SigV4 signer known-answer tests. Built whenever Poco is available rather
+# than under CLIO_ENABLE_AMAZON_DRIVE: sigv4.h is pure Poco Foundation string
+# manipulation with no I/O, so this test is meaningful -- and cheap -- even in
+# a build with no S3 bdev, no network and no credentials.
+if(Poco_FOUND)
+  add_executable(clio_run_sigv4_test test_sigv4.cc)
+  target_include_directories(clio_run_sigv4_test PRIVATE
+    ${CLIO_RUN_ROOT}/test              # simple_test.h
+    ${CLIO_RUN_ROOT}/modules/bdev/include
+  )
+  target_link_libraries(clio_run_sigv4_test
+    Poco::Foundation
+    ctp::cxx                            # simple_test.h pulls in clio_ctp
+  )
+  set_target_properties(clio_run_sigv4_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  if(CLIO_CORE_ENABLE_TESTS)
+    add_test(
+      NAME cr_bdev_sigv4
+      COMMAND clio_run_sigv4_test
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cr_bdev_sigv4 PROPERTIES TIMEOUT 60)
+  endif()
+  install(TARGETS clio_run_sigv4_test RUNTIME DESTINATION bin)
+endif()
+
+# S3 REST client round-trip tests. Driven by s3_stub_server.py, which stands up
+# an in-memory S3 stand-in on an ephemeral port and verifies SigV4 itself, so
+# the test needs no AWS account, no network and no credentials. Gated on the
+# feature flag because it includes s3_rest.h, which is #ifdef'd on it.
+if(CLIO_ENABLE_AMAZON_DRIVE)
+  add_executable(clio_run_s3_rest_test test_s3_rest.cc)
+  target_include_directories(clio_run_s3_rest_test PRIVATE
+    ${CLIO_RUN_ROOT}/test              # simple_test.h
+    ${CLIO_RUN_ROOT}/modules/bdev/include
+  )
+  target_link_libraries(clio_run_s3_rest_test
+    Poco::Net Poco::NetSSL Poco::Crypto Poco::Foundation
+    ctp::cxx                            # simple_test.h pulls in clio_ctp
+  )
+  set_target_properties(clio_run_s3_rest_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  # s3_rest.h is #ifdef'd on CLIO_ENABLE_S3_REST (the capability flag shared with
+  # the CAE consumer); the root CMake also defines it globally, but set it here
+  # too so the test builds even when configured stand-alone with only the bdev
+  # feature flag.
+  target_compile_definitions(clio_run_s3_rest_test PRIVATE
+    CLIO_ENABLE_AMAZON_DRIVE CLIO_ENABLE_S3_REST)
+  if(CLIO_CORE_ENABLE_TESTS)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+      add_test(
+        NAME cr_bdev_s3_rest
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/s3_stub_server.py
+                -- $<TARGET_FILE:clio_run_s3_rest_test>
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+      )
+      set_tests_properties(cr_bdev_s3_rest PROPERTIES TIMEOUT 120)
+      # Same binary, but the stub truncates the first GET of every key so every
+      # streamed read must resume with a ranged GET. Exercises the keep-alive
+      # drop / mid-object recovery path the CAE assimilator depends on.
+      add_test(
+        NAME cr_bdev_s3_rest_resume
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/s3_stub_server.py
+                -- $<TARGET_FILE:clio_run_s3_rest_test>
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+      )
+      set_tests_properties(cr_bdev_s3_rest_resume PROPERTIES
+        TIMEOUT 120
+        ENVIRONMENT "S3_STUB_SHORT_ONCE=1")
+    else()
+      message(STATUS "Python3 not found; skipping the cr_bdev_s3_rest test")
+    endif()
+  endif()
+  install(TARGETS clio_run_s3_rest_test RUNTIME DESTINATION bin)
+endif()
+
 # Create bdev test executable
 add_executable(${BDEV_TEST_TARGET} ${BDEV_TEST_SOURCES})
 
@@ -53,9 +139,25 @@ if(CLIO_CORE_ENABLE_TESTS)
     COMMAND ${BDEV_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
+  # The `bdev` label is what lets the prediction phase run this suite. That
+  # phase scopes its coverage to context-runtime/modules/bdev but used to run
+  # only the two prediction_e2e tests, so it reported ~21% on a subtree the
+  # unit phase already covers at ~83%. A phase should run the tests for the
+  # code it measures. This stays in the unit phase too: that selection
+  # excludes by name (cr_bdev_) and by the slow/integration labels, neither
+  # of which this matches.
+  # Both labels must be set HERE, in the one and only set_tests_properties call
+  # naming this test. LABELS is replaced, not appended, by each call, so listing
+  # this test in a second call (as the shared block below used to do) silently
+  # erases what the first call set. That is what happened: `bdev` was wiped by a
+  # later LABELS "msan_skip", the prediction phase's `-L prediction_e2e|bdev`
+  # stopped matching, and that phase measured the bdev subtree while never
+  # running the suite that covers it -- 30.7% instead of ~83%. Keep this test
+  # out of the shared block below.
   set_tests_properties(cr_all_bdev_tests PROPERTIES
-    TIMEOUT 180
+    TIMEOUT 300
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    LABELS "bdev;msan_skip"
   )
 
   # Dedicated explicit backend tests — each sets CLIO_IPC_MODE so the
@@ -92,7 +194,6 @@ if(CLIO_CORE_ENABLE_TESTS)
 
   # Set test properties
   set_tests_properties(
-    cr_all_bdev_tests
     cr_bdev_explicit_backend_shm
     cr_bdev_explicit_backend_tcp
     cr_bdev_explicit_backend_ipc

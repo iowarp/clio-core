@@ -57,6 +57,7 @@
 
 #include "clio_ctp/introspect/system_info.h"
 #include "clio_ctp/util/config_parse.h"
+#include "clio_ctp/util/msan.h"
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/runtime_pid_record.h"
 #include "clio_runtime/types.h"
@@ -111,8 +112,12 @@ inline int DiscoverRuntimePid(u32 port) {
 #else
   std::error_code ec;
   auto target = std::filesystem::read_symlink(MainSegmentPath(port), ec);
+  // Uninstrumented libstdc++.so filled this path; see IpcManager::
+  // UnlinkOwnPidEntries.
+  CTP_MSAN_UNPOISON_PATH(target);
   if (!ec) {
-    const std::string t = target.string();
+    std::string t = target.string();
+    CTP_MSAN_UNPOISON_STRING(t);
     constexpr const char *kProc = "/proc/";
     if (t.rfind(kProc, 0) == 0) {
       int pid = std::atoi(t.c_str() + std::string(kProc).size());

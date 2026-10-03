@@ -53,6 +53,7 @@
 
 #include "../simple_test.h"
 #include "../runtime_server.h"
+#include "clio_ctp/util/msan.h"
 
 #ifndef _WIN32
 
@@ -151,8 +152,12 @@ ArtifactScan ScanArtifacts(unsigned port, int pid) {
     }
     std::error_code ec;
     auto target = std::filesystem::read_symlink(full_path, ec);
+    // Uninstrumented libstdc++.so filled this path; see IpcManager::
+    // UnlinkOwnPidEntries, which scans the same directory the same way.
+    CTP_MSAN_UNPOISON_PATH(target);
     if (!ec) {
-      const std::string t = target.string();
+      std::string t = target.string();
+      CTP_MSAN_UNPOISON_STRING(t);
       if (!pid_proc.empty() && t.rfind(pid_proc, 0) == 0) {
         scan.pid_owned.push_back(full_path);
       }

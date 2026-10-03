@@ -46,6 +46,7 @@
 #endif
 
 #include "clio_ctp/util/config_parse.h"
+#include "clio_ctp/util/msan.h"
 #include "clio_runtime/admin/admin_client.h"
 #include "clio_runtime/clio_runtime.h"
 #include "clio_runtime/config_manager.h"
@@ -125,8 +126,12 @@ size_t SweepDeadRuntimeArtifacts(int pid, clio::run::u32 port) {
     if (!matches) {
       std::error_code ec;
       auto target = std::filesystem::read_symlink(full_path, ec);
+      // Uninstrumented libstdc++.so filled this path; see IpcManager::
+      // UnlinkOwnPidEntries, which scans the same directory the same way.
+      CTP_MSAN_UNPOISON_PATH(target);
       if (!ec) {
-        const std::string t = target.string();
+        std::string t = target.string();
+        CTP_MSAN_UNPOISON_STRING(t);
         if (!proc_prefix.empty() && t.rfind(proc_prefix, 0) == 0) {
           matches = true;  // owned by the dead runtime
         } else if (t.rfind("/proc/", 0) == 0) {

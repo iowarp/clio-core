@@ -218,7 +218,8 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     // the client parked here forever, since a dead server can never set
     // FUTURE_COMPLETE. The 1s heartbeat flips server_alive_; hand the future
     // to the ZMQ RecvOut, whose kClientShm-origin head implements the
-    // reconnect/failover + resend path.
+    // reconnect/failover + resend path. Thread max_sec through so timed waits
+    // respect the deadline.
     if (!ipc->server_alive_.load(std::memory_order_acquire) &&
         !ipc->reconnecting_.load()) {
       HLOG(kWarning,
@@ -253,6 +254,28 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     archive->ResetBulkIndex();
     archive->msg_type_ = MsgType::kSerializeOut;
     *archive >> (*task_ptr);
+  } else if (!future.consumed_ && want_key != 0) {
+    // want_key == 0: the task never went on the wire. The client completes
+    // some tasks itself -- a GetBlob served from the SHM metadata cache or
+    // from a pending deferred put (core_client.h) -- and hands back a future
+    // with origin kClientShm whose net_key was never stamped (SendIn stamps
+    // it). No response exists to claim, so a missing archive is expected.
+    //
+    // Twin of the check in IpcCpu2CpuZmq::RecvOut -- see the long comment
+    // there for why a complete task with no parked archive is a protocol
+    // violation rather than a benign miss, and why returning true here hid
+    // the #968 read failures behind untouched constructor defaults.
+    //
+    // consumed_ matters MORE on this path than on the ZMQ twin: the claim
+    // above ERASES the entry, so a second Wait() on the same future finds
+    // nothing legitimately. Destroy(true) sets consumed_ after Recv returns,
+    // so it is false only on the first claim.
+    HLOG(kError,
+         "IpcCpu2Cpu::RecvOut: task completed with NO response archive for "
+         "net_key {} -- the completion came from another task's response "
+         "(recycled address). Failing instead of returning defaults. See #968.",
+         want_key);
+    return false;
   }
   return true;
 #endif  // CTP_IS_HOST

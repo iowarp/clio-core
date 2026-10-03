@@ -109,11 +109,11 @@ class IoUringAsyncIO : public AsyncIO {
     return ftruncate(fd, static_cast<off_t>(size)) == 0;
   }
 
-  IoToken Write(void *buffer, size_t size, off_t offset) override {
+  IoToken Write(void *buffer, size_t size, int64_t offset) override {
     return SubmitIO(buffer, size, offset, true);
   }
 
-  IoToken Read(void *buffer, size_t size, off_t offset) override {
+  IoToken Read(void *buffer, size_t size, int64_t offset) override {
     return SubmitIO(buffer, size, offset, false);
   }
 
@@ -196,7 +196,7 @@ class IoUringAsyncIO : public AsyncIO {
   }
 
  private:
-  IoToken SubmitIO(void *buffer, size_t size, off_t offset, bool is_write) {
+  IoToken SubmitIO(void *buffer, size_t size, int64_t offset, bool is_write) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
@@ -231,7 +231,7 @@ class IoUringAsyncIO : public AsyncIO {
    * @param offset file offset
    * @return fd to submit on
    */
-  int SelectFd(void *buffer, size_t size, off_t offset) const {
+  int SelectFd(void *buffer, size_t size, int64_t offset) const {
     if (direct_fd_ >= 0 &&
         (reinterpret_cast<uintptr_t>(buffer) % 4096 == 0) &&
         (size % 4096 == 0) && (offset % 4096 == 0)) {

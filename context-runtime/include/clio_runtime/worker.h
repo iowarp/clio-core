@@ -352,21 +352,49 @@ class Worker {
            elapsed;
   }
 
+  /**
+   * Microseconds as a reservation amount.
+   *
+   * The caller's value is a float off the task (sched_reserved_us_), so it is
+   * only as trustworthy as whatever last wrote that field; a float reaches
+   * 3.4e38 while long long stops at 9.2e18, and converting one that does not
+   * fit is itself undefined. Saturating keeps the conversion total. NaN
+   * answers false to every comparison and lands on 0.
+   */
+  static long long ReservationUs(double us) {
+    constexpr double kMax = 9.0e18;  // comfortably inside long long
+    if (!(us > 0.0)) {
+      return 0;
+    }
+    return (us >= kMax) ? static_cast<long long>(kMax)
+                        : static_cast<long long>(us);
+  }
+
   /** #781: reserve predicted cost on this worker when a task is mapped to it.
    *  Integer atomic (µs) — atomic<double> fetch_add is not portable (icx/MSVC). */
   void ReserveLoad(double us) {
-    if (us > 0.0) {
-      queued_load_us_.fetch_add(static_cast<long long>(us),
-                                std::memory_order_relaxed);
+    long long amt = ReservationUs(us);
+    if (amt > 0) {
+      queued_load_us_.fetch_add(amt, std::memory_order_relaxed);
     }
   }
   /** #781: release the reservation when the task starts executing (or is
    *  cancelled) — the executing cost is then tracked by load_ instead. */
   void ReleaseReservation(double us) {
-    if (us > 0.0) {
-      long long amt = static_cast<long long>(us);
-      long long prev = queued_load_us_.fetch_sub(amt, std::memory_order_relaxed);
-      if (prev - amt < 0) queued_load_us_.store(0, std::memory_order_relaxed);
+    long long amt = ReservationUs(us);
+    if (amt <= 0) {
+      return;
+    }
+    long long prev = queued_load_us_.fetch_sub(amt, std::memory_order_relaxed);
+    // `prev - amt` is the value just stored, but COMPUTING it is the signed
+    // overflow UBSan reported: a release with no matching reserve drives this
+    // counter negative, and once it is far enough below zero the subtraction
+    // wraps to a positive result -- so the clamp below stopped firing and the
+    // counter could never climb back, which is how it reached -9.18e18. The
+    // comparison asks the same question without the arithmetic, so the clamp
+    // fires on the very first negative result and the counter recovers.
+    if (prev < amt) {
+      queued_load_us_.store(0, std::memory_order_relaxed);
     }
   }
 

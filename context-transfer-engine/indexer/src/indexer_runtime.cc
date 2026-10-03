@@ -43,6 +43,8 @@
 #include <utility>
 #include <vector>
 
+#include <clio_ctp/util/msan.h>
+
 #include <clio_cte/core/blob_batch.h>
 #include <clio_cte/indexer/indexer_runtime.h>
 
@@ -258,17 +260,31 @@ void WStr(std::ofstream &os, const std::string &s) {
   WPod(os, len);
   os.write(s.data(), len);
 }
+// The two readers below are the snapshot's only entry points, and every byte
+// they produce arrives through std::ifstream::read -- i.e. it is written by
+// the uninstrumented libstdc++.so, so MSan has no record of it and the caller
+// is reported the moment it compares, counts or stores the value. Clearing the
+// bytes here, where their extent is exactly known, covers the whole restore
+// path; the caller sees ordinary initialized memory.
 template <typename T>
 bool RPod(std::ifstream &is, T *v) {
   is.read(reinterpret_cast<char *>(v), sizeof(T));
-  return is.good();
+  CTP_MSAN_UNPOISON_OBJ(is);
+  if (!is.good()) return false;
+  CTP_MSAN_UNPOISON(v, sizeof(T));
+  return true;
 }
 bool RStr(std::ifstream &is, std::string *s) {
   clio::run::u32 len = 0;
   if (!RPod(is, &len)) return false;
   s->resize(len);
   is.read(s->data(), len);
-  return is.good() || (len == 0 && !is.bad());
+  CTP_MSAN_UNPOISON_OBJ(is);
+  const bool ok = is.good() || (len == 0 && !is.bad());
+  if (ok) {
+    CTP_MSAN_UNPOISON(s->data(), s->size());
+  }
+  return ok;
 }
 
 /** Anchor a literal tag name as a full-match regex. */
@@ -349,6 +365,9 @@ void Runtime::SnapshotIndex() {
   {
     std::ofstream snap(config_.index_log_path_,
                        std::ios::binary | std::ios::trunc);
+    // Stream state is libstdc++.so's, which MSan does not instrument, so
+    // is_open()/good() read bytes it has no record of.
+    CTP_MSAN_UNPOISON_OBJ(snap);
     if (!snap.is_open()) {
       HLOG(kError, "Indexer: cannot write snapshot at {}",
            config_.index_log_path_);
@@ -417,9 +436,18 @@ bool Runtime::RestoreIndex() {
   // ---- Snapshot ----
   {
     std::ifstream snap(config_.index_log_path_, std::ios::binary);
+    CTP_MSAN_UNPOISON_OBJ(snap);  // see the snapshot writer above
     char magic[8];
-    if (snap.is_open() && snap.read(magic, 8) &&
-        std::memcmp(magic, kIdxMagic, 8) == 0) {
+    // Same boundary as RPod/RStr, but this read is open-coded: libstdc++ put
+    // these 8 bytes here, so the memcmp that follows is reading memory MSan
+    // never saw written.
+    const bool got_magic =
+        snap.is_open() && static_cast<bool>(snap.read(magic, 8));
+    CTP_MSAN_UNPOISON_OBJ(snap);
+    if (got_magic) {
+      CTP_MSAN_UNPOISON(magic, sizeof(magic));
+    }
+    if (got_magic && std::memcmp(magic, kIdxMagic, 8) == 0) {
       clio::run::u32 version = 0;
       RPod(snap, &version);
       clio::run::u32 n_tags = 0;
@@ -490,6 +518,7 @@ bool Runtime::RestoreIndex() {
   // ---- WAL replay (last-wins on top of the snapshot) ----
   {
     std::ifstream wal(config_.index_log_path_ + ".wal", std::ios::binary);
+    CTP_MSAN_UNPOISON_OBJ(wal);  // see the snapshot writer above
     while (wal.is_open() && wal.good()) {
       unsigned char type = 0;
       if (!RPod(wal, &type)) break;

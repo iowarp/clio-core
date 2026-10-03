@@ -48,6 +48,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -496,6 +497,10 @@ class TransactionLog {
 
     std::ifstream ifs(file_path_, std::ios::binary);
     if (!ifs.is_open()) return entries;
+    std::error_code size_ec;
+    const clio::run::u64 file_size =
+        static_cast<clio::run::u64>(fs::file_size(file_path_, size_ec));
+    if (size_ec) return entries;
 
     uint32_t magic = 0;
     ifs.read(reinterpret_cast<char *>(&magic), sizeof(magic));
@@ -522,10 +527,21 @@ class TransactionLog {
       ifs.read(reinterpret_cast<char *>(&payload_size), sizeof(payload_size));
       if (!ifs.good()) break;
 
+      // A torn tail (crash mid-append) or a corrupt length must end the
+      // load, not drive a multi-GB allocation off a garbage u32 (#725).
+      const std::streamoff pos = ifs.tellg();
+      if (pos < 0 || static_cast<clio::run::u64>(pos) + payload_size >
+                         file_size) {
+        HLOG(kError,
+             "TransactionLog::Load: {} has a record at offset {} claiming {} "
+             "bytes but only {} remain; ignoring it and everything after",
+             file_path_, static_cast<long long>(pos), payload_size,
+             file_size - static_cast<clio::run::u64>(pos < 0 ? 0 : pos));
+        break;
+      }
       std::vector<char> payload(payload_size);
       ifs.read(payload.data(), payload_size);
-      if (!ifs.good() && static_cast<uint32_t>(ifs.gcount()) != payload_size)
-        break;
+      if (static_cast<uint32_t>(ifs.gcount()) != payload_size) break;
 
       entries.push_back(
           WalRecord{static_cast<TxnType>(type_byte), seq, std::move(payload)});
@@ -611,7 +627,7 @@ class TransactionLog {
     txn.tag_major_ = ReadU32(data, off);
     txn.tag_minor_ = ReadU32(data, off);
     txn.blob_name_ = ReadString(data, off);
-    clio::run::u32 num_blocks = ReadU32(data, off);
+    clio::run::u32 num_blocks = ReadCount(data, off, kBlockRecordBytes);
     txn.new_blocks_.resize(num_blocks);
     for (clio::run::u32 i = 0; i < num_blocks; ++i) {
       txn.new_blocks_[i].bdev_major_ = ReadU32(data, off);
@@ -637,7 +653,7 @@ class TransactionLog {
     txn.flags_ = ReadU32(data, off);
     txn.transform_flags_ = ReadU32(data, off);
     txn.min_score_ = ReadFloat(data, off);
-    clio::run::u32 num_blocks = ReadU32(data, off);
+    clio::run::u32 num_blocks = ReadCount(data, off, kBlockRecordBytes);
     txn.new_blocks_.resize(num_blocks);
     for (clio::run::u32 i = 0; i < num_blocks; ++i) {
       txn.new_blocks_[i].bdev_major_ = ReadU32(data, off);
@@ -812,19 +828,59 @@ class TransactionLog {
   }
 
   // ---- Deserialization primitives ----
+  // Every read is bounds-checked: a corrupt or truncated record throws
+  // std::out_of_range instead of reading past the payload (#725). Replay
+  // catches it per record and reports the record as corrupt.
+
+  /** Serialized size of one TxnExtendBlobBlock (bdev ids, query, offset,
+   *  size); used to bound block counts read from disk. */
+  static constexpr size_t kBlockRecordBytes =
+      2 * sizeof(clio::run::u32) + sizeof(clio::run::PoolQuery) +
+      2 * sizeof(clio::run::u64);
+
+  /**
+   * Throw unless `len` bytes are available at `off`.
+   * @param data record payload
+   * @param off current read offset
+   * @param len bytes about to be read
+   */
+  static void Need(const std::vector<char> &data, size_t off, size_t len) {
+    if (off > data.size() || len > data.size() - off) {
+      throw std::out_of_range("transaction log record truncated or corrupt");
+    }
+  }
+
+  /**
+   * Read an element count and check the payload can hold that many
+   * elements, so a garbage count cannot drive a huge resize.
+   * @param data record payload
+   * @param off read offset, advanced past the count
+   * @param elem_bytes minimum serialized size of one element
+   * @return the validated count
+   */
+  static clio::run::u32 ReadCount(const std::vector<char> &data, size_t &off,
+                                  size_t elem_bytes) {
+    clio::run::u32 n = ReadU32(data, off);
+    Need(data, off, static_cast<size_t>(n) * elem_bytes);
+    return n;
+  }
+
   static clio::run::u32 ReadU32(const std::vector<char> &data, size_t &off) {
+    Need(data, off, sizeof(clio::run::u32));
     clio::run::u32 val;
     std::memcpy(&val, data.data() + off, sizeof(val));
     off += sizeof(val);
     return val;
   }
   static clio::run::u64 ReadU64(const std::vector<char> &data, size_t &off) {
+    Need(data, off, sizeof(clio::run::u64));
     clio::run::u64 val;
     std::memcpy(&val, data.data() + off, sizeof(val));
     off += sizeof(val);
     return val;
   }
   static float ReadFloat(const std::vector<char> &data, size_t &off) {
+    Need(data, off, sizeof(float));
     float val;
     std::memcpy(&val, data.data() + off, sizeof(val));
     off += sizeof(val);
@@ -832,6 +888,7 @@ class TransactionLog {
   }
   static std::string ReadString(const std::vector<char> &data, size_t &off) {
     clio::run::u32 len = ReadU32(data, off);
+    Need(data, off, len);
     std::string s(data.data() + off, len);
     off += len;
     return s;
@@ -848,6 +905,7 @@ class TransactionLog {
   }
   static void ReadRaw(const std::vector<char> &data, size_t &off, void *ptr,
                       size_t len) {
+    Need(data, off, len);
     std::memcpy(ptr, data.data() + off, len);
     off += len;
   }

@@ -330,7 +330,11 @@ clio::run::TaskResume Runtime::ParseOmni(clio::run::shared_ptr<ParseOmniTask> &t
 
   // Process each assimilation context
   clio::run::u32 tasks_scheduled = 0;
+#ifdef CLIO_ENABLE_S3_REST
+  AssimilatorFactory factory(cte_client_, &s3_conn_pool_);
+#else
   AssimilatorFactory factory(cte_client_);
+#endif
 
   for (size_t i = 0; i < assimilation_contexts.size(); ++i) {
     const auto& assimilation_ctx = assimilation_contexts[i];
@@ -350,6 +354,9 @@ clio::run::TaskResume Runtime::ParseOmni(clio::run::shared_ptr<ParseOmniTask> &t
       task->error_message_ =
           "No assimilator found for source: " + assimilation_ctx.src;
       task->num_tasks_scheduled_ = tasks_scheduled;
+      // Mirror onto the task-framework code: clients that check GetReturnCode()
+      // would otherwise see 0 and report success.
+      task->SetReturnCode(static_cast<clio::run::u32>(-2));
       CLIO_CO_RETURN;
     }
 
@@ -364,6 +371,7 @@ clio::run::TaskResume Runtime::ParseOmni(clio::run::shared_ptr<ParseOmniTask> &t
       task->result_code_ = result;
       task->error_message_ = std::string("Assimilator failed");
       task->num_tasks_scheduled_ = tasks_scheduled;
+      task->SetReturnCode(static_cast<clio::run::u32>(result));
       CLIO_CO_RETURN;
     }
 

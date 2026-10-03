@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "simple_test.h"
+#include "clio_ctp/util/msan.h"
 
 namespace fs = std::filesystem;
 
@@ -83,7 +84,10 @@ class BlobReplicasFixture {
     for (const auto &entry :
          fs::directory_iterator(fs::path(metadata_log_path_).parent_path(),
                                 ec)) {
-      const std::string name = entry.path().filename().string();
+      // libstdc++.so assembled this path; its destructor reads it too.
+      CTP_MSAN_UNPOISON_OBJ(entry);
+      std::string name = entry.path().filename().string();
+      CTP_MSAN_UNPOISON_STRING(name);
       if (name.rfind("blob_replicas_meta.log", 0) == 0) {
         fs::remove(entry.path(), ec);
       }

@@ -54,6 +54,7 @@
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/pool_manager.h"
 #include "clio_runtime/viz/viz_json.h"
+#include "clio_ctp/util/msan.h"
 
 #if CLIO_RUN_HAS_POCO
 #include <Poco/Net/Net.h>
@@ -138,12 +139,19 @@ bool ReadWholeFile(const std::string &path, std::string *out) {
     return false;
   }
   std::ifstream in(path, std::ios::binary);
+  CTP_MSAN_UNPOISON_OBJ(in);
   if (!in) {
     return false;
   }
   std::ostringstream buf;
+  CTP_MSAN_UNPOISON_OBJ(buf);
   buf << in.rdbuf();
-  *out = buf.str();
+  // Stream objects and the bytes they moved are all libstdc++.so's; the asset
+  // this returns is then served, hashed and compared. Clear str()'s result
+  // before the assignment, which reads its length.
+  std::string contents = buf.str();
+  CTP_MSAN_UNPOISON_STRING(contents);
+  *out = contents;
   return true;
 }
 
@@ -385,8 +393,16 @@ std::vector<std::string> VizServer::AssetSearchDirs(
   if (auto *module_manager = CLIO_MODULE_MANAGER) {
     std::string lib_path = module_manager->GetChiModLibPath(mod_name);
     if (!lib_path.empty()) {
-      lib_dirs.push_back(
-          std::filesystem::path(lib_path).parent_path().string());
+      // Every std::filesystem::path operation below runs inside
+      // uninstrumented libstdc++.so, so each path and each string it yields
+      // has to be cleared where it is produced -- doing it once at the end
+      // misses the temporaries' own destructors.
+      std::filesystem::path parent =
+          std::filesystem::path(lib_path).parent_path();
+      CTP_MSAN_UNPOISON_PATH(parent);
+      std::string parent_str = parent.string();
+      CTP_MSAN_UNPOISON_STRING(parent_str);
+      lib_dirs.push_back(parent_str);
     }
     std::string self_dir = module_manager->GetModuleDirectory();
     if (!self_dir.empty()) {
@@ -395,11 +411,23 @@ std::vector<std::string> VizServer::AssetSearchDirs(
   }
   for (const std::string &lib_dir : lib_dirs) {
     std::filesystem::path dir(lib_dir);
+    CTP_MSAN_UNPOISON_PATH(dir);
     // Built, not installed: libs in <build>/bin, assets in <build>/bin/viz.
-    dirs.push_back((dir / "viz" / mod_name).string());
+    std::filesystem::path built = dir / "viz" / mod_name;
+    CTP_MSAN_UNPOISON_PATH(built);
     // Installed: libs in <prefix>/lib, assets in <prefix>/share/clio/viz.
-    dirs.push_back(
-        (dir.parent_path() / "share" / "clio" / "viz" / mod_name).string());
+    // parent_path() gets its own name: as a temporary its destructor runs
+    // while still poisoned, which is reported even though nothing reads it.
+    std::filesystem::path parent = dir.parent_path();
+    CTP_MSAN_UNPOISON_PATH(parent);
+    std::filesystem::path installed =
+        parent / "share" / "clio" / "viz" / mod_name;
+    CTP_MSAN_UNPOISON_PATH(installed);
+    dirs.push_back(built.string());
+    dirs.push_back(installed.string());
+  }
+  for (std::string &dir : dirs) {
+    CTP_MSAN_UNPOISON_STRING(dir);
   }
   return dirs;
 }
@@ -589,7 +617,10 @@ bool VizServer::ResolveAsset(const Request &req, std::string *file_path,
       continue;
     }
     *file_path = candidate.string();
-    *mime = MimeTypeOf(candidate.string());
+    // As in AssetSearchDirs: the path text is built inside uninstrumented
+    // libstdc++, and MimeTypeOf scans it for an extension.
+    CTP_MSAN_UNPOISON_STRING(*file_path);
+    *mime = MimeTypeOf(*file_path);
     return true;
   }
   return false;
@@ -706,10 +737,25 @@ class PocoVizHandler : public Poco::Net::HTTPRequestHandler {
     Request req;
     Response resp;
     try {
+      // Poco parsed all of this off the socket and is not MSan-instrumented,
+      // so nothing below -- routing, JSON quoting, the string compares in
+      // Dispatch -- may touch it until it is unpoisoned. This is the one place
+      // the request enters our code, so it is the one place that has to do it,
+      // and each value has to be cleared before it is read, not after.
       req.method = preq.getMethod();
+      CTP_MSAN_UNPOISON_STRING(req.method);
       Poco::URI uri(preq.getURI());
+      CTP_MSAN_UNPOISON_OBJ(uri);
       req.path = uri.getPath();
-      for (const auto &kv : uri.getQueryParameters()) {
+      CTP_MSAN_UNPOISON_STRING(req.path);
+      // The vector itself is Poco's too: iterating it reads a poisoned
+      // begin/end pair before any element is touched.
+      Poco::URI::QueryParameters query = uri.getQueryParameters();
+      CTP_MSAN_UNPOISON_OBJ(query);
+      CTP_MSAN_UNPOISON(query.data(), query.size() * sizeof(query[0]));
+      for (auto &kv : query) {
+        CTP_MSAN_UNPOISON_STRING(kv.first);
+        CTP_MSAN_UNPOISON_STRING(kv.second);
         req.params[kv.first] = kv.second;
       }
       // Read the body ONLY when the request declares one (Content-Length or
@@ -726,11 +772,13 @@ class PocoVizHandler : public Poco::Net::HTTPRequestHandler {
       if (req.method != "GET" && req.method != "HEAD" && has_body) {
         Poco::StreamCopier::copyToString(preq.stream(), req.body,
                                          kMaxBodyBytes);
+        CTP_MSAN_UNPOISON_STRING(req.body);
         // A form submission's fields become params, exactly as if they had been
         // query parameters — with the query string winning on a key collision
         // (ParseFormBody never overwrites). Handlers then read one map either
         // way, and pages can use plain <form> posts or fetch+URLSearchParams.
         const std::string &ctype = preq.getContentType();
+        CTP_MSAN_UNPOISON_STRING(ctype);
         if (ctype.compare(0, 33, "application/x-www-form-urlencoded") == 0) {
           VizServer::ParseFormBody(req.body, &req.params);
         }
@@ -739,7 +787,9 @@ class PocoVizHandler : public Poco::Net::HTTPRequestHandler {
         resp.Error(404, "no route or asset for " + req.path);
       }
     } catch (const Poco::Exception &e) {
-      resp.Error(400, std::string("bad request: ") + e.displayText());
+      const std::string detail = e.displayText();
+      CTP_MSAN_UNPOISON_STRING(detail);
+      resp.Error(400, std::string("bad request: ") + detail);
     } catch (const std::exception &e) {
       resp.Error(500, std::string("internal error: ") + e.what());
     }

@@ -440,6 +440,11 @@ TEST_CASE("CliDispatch - command help and argument errors", "[cli][dispatch]") {
   REQUIRE(RunCli("restart") == 1);
   REQUIRE(RunCli("restart --help") == 1);
 
+  SECTION("--disk needs a path (#551)");
+  REQUIRE(RunCli("start --disk") == 1);
+  REQUIRE(RunCli("restart --disk") == 1);
+  REQUIRE(RunCli("start --disk \"\"") == 1);
+
   SECTION("refresh dispatch: no args / bad repo exit 1");
   REQUIRE(RunCli("refresh") == 1);
   REQUIRE(RunCli("refresh /nonexistent/clio_cli_test_repo") == 1);

@@ -1,0 +1,60 @@
+# Minimal CLIO runtime configuration for the HDF5 connectors.
+#
+#   export CLIO_SERVER_CONF=$PWD/context-transfer-engine/adapter/config/clio_hdf5_quickstart.yaml
+#   clio_run start
+#
+# Without a config, clio_run composes no CTE pool, and the connectors silently
+# fall back to the native file. This one is deliberately small -- DRAM-only, a
+# few hundred MB, no persistence -- so it starts anywhere, including a container
+# with a small /dev/shm. For real workloads start from
+# context-runtime/config/clio_default.yaml and add storage tiers, but keep the
+# CTE pool_name below. See ../HDF5_QUICKSTART.md.
+
+networking:
+  port: 9413
+  neighborhood_size: 32
+
+memory:
+  main_segment_size: 256MB
+  client_data_segment_size: 256MB
+  runtime_data_segment_size: 256MB
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+  local_sched: "default"
+
+compose:
+  # Block device. Required: it provides the shared-memory allocator the other
+  # modules use. Nothing composes without it.
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "256MB"
+
+  # CTE core: the pool the HDF5 connectors read and write blobs through.
+  #
+  # pool_name MUST be "clio_cte_core" -- that is clio::cte::core::kCtePoolName
+  # (context-transfer-engine/core/include/clio_cte/core/core_tasks.h), the name
+  # clients look the pool up by. Any other name misses, so each client falls
+  # back to broadcast routing, which is slower and has caused attach hangs.
+  #
+  # The shipped clio_default.yaml still names this pool "cte_main". If you
+  # start from that file, rename it.
+  - mod_name: clio_cte_core
+    pool_name: clio_cte_core
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "256MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+    targets:
+      neighborhood: 1
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000

@@ -105,16 +105,22 @@ if(GLOBUS_ENABLED)
   list(APPEND RUNTIME_LINK_LIBRARIES Poco::Net Poco::NetSSL Poco::Crypto Poco::JSON nlohmann_json::nlohmann_json)
 endif()
 
-# Conditionally add S3 assimilator if enabled (AWS SDK found by root CMakeLists).
-# NOTE: the AWS SDK is intentionally NOT linked into the CAE runtime library.
-# Loading libaws-cpp-sdk-core.so into the CLIO runtime process corrupts runtime
-# startup (its load-time global ctors / static-baked s2n collide with CLIO init).
-# The assimilator instead shells out to the standalone `cae_s3_tool` helper
-# (defined below), which is the only target that links the AWS SDK.
+# Conditionally add S3 assimilator if enabled.
+# NOTE: the AWS SDK is STILL intentionally NOT linked into the CAE runtime
+# library. Loading libaws-cpp-sdk-core.so into the CLIO runtime process corrupts
+# runtime startup (its load-time global ctors / static-baked s2n collide with
+# CLIO init). The assimilator now reads s3:// objects IN-PROCESS over Poco::Net +
+# SigV4 (the shared s3_rest.h from the bdev module, guarded by CLIO_ENABLE_S3_REST
+# which the root CMake defines whenever CAE_ENABLE_S3 or CLIO_ENABLE_AMAZON_DRIVE
+# is on). Poco is linked here for that; the AWS SDK is confined to the standalone
+# `cae_s3_tool` helper (defined below), the only target that links it.
 if(CAE_ENABLE_S3)
   message(STATUS "CAE S3 support: ENABLED")
   add_compile_definitions(CAE_ENABLE_S3)
   list(APPEND RUNTIME_SOURCES src/factory/s3_file_assimilator.cc)
+  # Poco for the in-process signer/transport (NOT the AWS SDK).
+  list(APPEND RUNTIME_LINK_LIBRARIES
+    Poco::Net Poco::NetSSL Poco::Crypto Poco::Foundation)
 else()
   message(STATUS "CAE S3 support: DISABLED")
 endif()
@@ -141,6 +147,14 @@ if(HDF5_ENABLED)
   target_include_directories(clio_cae_core_runtime PRIVATE ${HDF5_INCLUDE_DIRS})
 endif()
 
+# The in-process S3 read path includes the bdev module's header-only S3 REST
+# client (s3_rest.h) and SigV4 signer (sigv4.h). Add that module's include dir;
+# CMAKE_SOURCE_DIR-relative so no absolute path is baked in.
+if(CAE_ENABLE_S3)
+  target_include_directories(clio_cae_core_runtime PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include)
+endif()
+
 # ExportData reads the kvhdf5 __meta blob to reconstruct an N-D dataset, so it
 # needs kvhdf5's include path. We deliberately add the PATH ONLY and do NOT link
 # the clio::cte::kvhdf5 INTERFACE target: that target pulls in clio_run_cxx_gpu,
@@ -165,17 +179,34 @@ if(CAE_ENABLE_S3)
   install(TARGETS cae_s3_tool DESTINATION bin)
 endif()
 
+# OMNI parsing, split out of the clio_cae binary so the unit tests can link it
+# (a main()-only translation unit is not linkable from a test). Static: it has
+# exactly two consumers, the binary below and test_cae_omni_loader.
+add_library(cae_omni_loader STATIC src/omni_loader.cc)
+target_include_directories(cae_omni_loader
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(cae_omni_loader
+  PUBLIC
+    clio_cae_core_client
+  PRIVATE
+    ctp::configure
+    ${YAML_CPP_LIBS}
+)
+
 # clio_cae utility (CAE OMNI ingest driver). Installed as `clio_cae`;
 # the legacy `clio_cae_omni` name is preserved as an install-time symlink
 # so out-of-tree scripts and pipelines keep working.
-add_executable(clio_cae util/clio_cae.cc)
+add_executable(clio_cae util/clio_cae.cc) # process entry (coverage-excluded)
 target_link_libraries(clio_cae
   PRIVATE
+    cae_omni_loader
     clio_cae_core_client
     clio::run::cxx
     ctp::configure
 )
-install(TARGETS clio_cae DESTINATION bin)
 
 # Install `clio_cae_omni` as a symlink to `clio_cae` (Windows: copy fallback).
 install(CODE "

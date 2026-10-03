@@ -103,12 +103,14 @@ inline const char *SizeBucket(uint64_t bytes) {
   return "ge_1m";
 }
 
+/** H5FD_MEM_DRAW, as a literal so this header does not need H5FDpublic.h.
+ *  H5FDclio.cc, which does include it, pins the two with a static_assert. */
+inline constexpr int kMemDraw = 3;
+
 /** HDF5's memory-type tag, collapsed to the distinction that drives R3. HDF5
  *  has several metadata classes; a recommendation only cares raw vs not. */
 inline const char *MemClass(int h5fd_mem_type) {
-  /* H5FD_MEM_DRAW == 1 in HDF5's enum; everything else is metadata of some
-     kind. Compared numerically so this header does not need H5FDpublic.h. */
-  return h5fd_mem_type == 1 ? "raw" : "meta";
+  return h5fd_mem_type == kMemDraw ? "raw" : "meta";
 }
 
 struct FileTrace {

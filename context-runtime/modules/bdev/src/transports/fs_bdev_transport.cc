@@ -166,7 +166,9 @@ bool FsBdevTransport::Init(const CreateParams& params,
     return false;
   }
 
-  off_t current_size = setup_io->GetFileSize();
+  // int64_t, not off_t: MSVC off_t is a 32-bit long, which wraps any
+  // backing file of 2 GiB or more (#1059).
+  int64_t current_size = setup_io->GetFileSize();
   if (current_size < 0) {
     HLOG(kError, "Failed to get file size for: {}", file_path_);
     setup_io->Close();
@@ -629,7 +631,7 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
 
     ctp::IoToken token = io_ctx->async_io_->Write(
         block_data, static_cast<size_t>(block_write_size),
-        static_cast<off_t>(block.offset_));
+        static_cast<int64_t>(block.offset_));
     if (token == ctp::kInvalidIoToken) {
       task->return_code_ = 2;
       task->bytes_written_ = total_bytes_written;
@@ -706,7 +708,7 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
 
     ctp::IoToken token = io_ctx->async_io_->Read(
         block_data, static_cast<size_t>(block_read_size),
-        static_cast<off_t>(block.offset_));
+        static_cast<int64_t>(block.offset_));
     if (token == ctp::kInvalidIoToken) {
       task->return_code_ = 2;
       task->bytes_read_ = total_bytes_read;

@@ -61,6 +61,7 @@
 
 #include "clio_ctp/introspect/system_info.h"
 #include "clio_ctp/util/config_parse.h"
+#include "clio_ctp/util/msan.h"
 #include "clio_runtime/types.h"
 
 namespace clio::run {
@@ -86,8 +87,20 @@ inline std::string RuntimePidRecordPath(u32 port) {
  */
 inline int ReadRuntimePidRecord(u32 port) {
   std::ifstream in(RuntimePidRecordPath(port));
+  // libstdc++.so is not instrumented: it constructs this stream AND fills the
+  // line out of it, so the stream state every check below reads (is_open,
+  // eof) and the characters of the line itself arrive with no MSan shadow
+  // behind them. getline is split out of the condition so its results can be
+  // cleared before anything looks at them.
+  CTP_MSAN_UNPOISON_OBJ(in);
+  if (!in.is_open()) {
+    return -1;
+  }
   std::string line;
-  if (!in.is_open() || !std::getline(in, line) || in.eof() || line.empty()) {
+  const bool got_line = static_cast<bool>(std::getline(in, line));
+  CTP_MSAN_UNPOISON_OBJ(in);
+  CTP_MSAN_UNPOISON_STRING(line);
+  if (!got_line || in.eof() || line.empty()) {
     return -1;
   }
   for (char c : line) {
