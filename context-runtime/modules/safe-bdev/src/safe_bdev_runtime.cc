@@ -303,10 +303,11 @@ clio::run::TaskResume Runtime::ReadSuperblock(bool is_parity, size_t idx,
 clio::run::TaskResume Runtime::GatherSurvivors(
     clio::run::u64 s, const std::vector<int> &code,
     const std::vector<int> &exclude, std::vector<int> &idx,
-    std::vector<std::vector<uint8_t>> &bufs) {
+    std::vector<std::vector<uint8_t>> &bufs, clio::run::u64 lo,
+    clio::run::u64 len) {
   CLIO_TASK_BODY_BEGIN
   const int k = static_cast<int>(code.size());
-  const clio::run::u64 off = SlotPhysOffset(s);
+  const clio::run::u64 off = SlotPhysOffset(s) + lo;
   // A data survivor's RS shard index is its POSITION in `code`; a parity
   // survivor's is k + j.
   for (int pos = 0; pos < k && static_cast<int>(idx.size()) < k; ++pos) {
@@ -316,10 +317,10 @@ clio::run::TaskResume Runtime::GatherSurvivors(
         !DataActive(static_cast<size_t>(d))) {
       continue;
     }
-    std::vector<uint8_t> buf(kChunkLen, 0);
+    std::vector<uint8_t> buf(len, 0);
     bool rd_ok = false;
     CLIO_CO_AWAIT(ReadDataSegment(static_cast<size_t>(d), off, buf.data(),
-                                  kChunkLen, rd_ok));
+                                  len, rd_ok));
     if (!rd_ok) continue;  // faulted (or transient): try another shard
     idx.push_back(pos);
     bufs.push_back(std::move(buf));
@@ -332,18 +333,17 @@ clio::run::TaskResume Runtime::GatherSurvivors(
         ec::EcState::kActive) {
       continue;
     }
-    ctp::ipc::FullPtr<char> rbuf = ipc->AllocateBuffer(kChunkLen);
+    ctp::ipc::FullPtr<char> rbuf = ipc->AllocateBuffer(len);
     if (rbuf.IsNull()) CLIO_CO_RETURN;
     auto fut = parity_clients_[static_cast<size_t>(j)].AsyncRead(
-        ParityQuery(static_cast<size_t>(j)), MemberBlocks(off, kChunkLen),
-        rbuf.shm_.template Cast<void>(), kChunkLen);
+        ParityQuery(static_cast<size_t>(j)), MemberBlocks(off, len),
+        rbuf.shm_.template Cast<void>(), len);
     CLIO_CO_AWAIT(fut);
-    const bool rd_ok =
-        (fut->return_code_ == 0) && (fut->bytes_read_ == kChunkLen);
+    const bool rd_ok = (fut->return_code_ == 0) && (fut->bytes_read_ == len);
     if (rd_ok) {
       idx.push_back(k + j);
       bufs.emplace_back(reinterpret_cast<uint8_t *>(rbuf.ptr_),
-                        reinterpret_cast<uint8_t *>(rbuf.ptr_) + kChunkLen);
+                        reinterpret_cast<uint8_t *>(rbuf.ptr_) + len);
     }
     FaultOnIoError(/*is_parity=*/true, static_cast<size_t>(j), !rd_ok,
                    fut->io_error_);
@@ -356,23 +356,23 @@ clio::run::TaskResume Runtime::GatherSurvivors(
 clio::run::TaskResume Runtime::ReconstructStripe(
     clio::run::u64 s, const std::vector<int> &stripe,
     const std::vector<int> &exclude, std::vector<std::vector<uint8_t>> &out,
-    bool &ok) {
+    bool &ok, clio::run::u64 lo, clio::run::u64 len) {
   CLIO_TASK_BODY_BEGIN
   ok = false;
-  if (stripe.empty()) CLIO_CO_RETURN;
+  if (stripe.empty() || len == 0 || lo + len > kChunkLen) CLIO_CO_RETURN;
   // Fixed-width parity (#1126): the code spans every data column.
   const std::vector<int> code = CodeColumns();
   const int k = static_cast<int>(code.size());
   std::vector<int> idx;
   std::vector<std::vector<uint8_t>> bufs;
-  CLIO_CO_AWAIT(GatherSurvivors(s, code, exclude, idx, bufs));
+  CLIO_CO_AWAIT(GatherSurvivors(s, code, exclude, idx, bufs, lo, len));
   if (static_cast<int>(idx.size()) < k) {
     CLIO_CO_RETURN;  // Too many failures to reconstruct.
   }
   std::vector<const uint8_t *> ptrs(bufs.size());
   for (size_t i = 0; i < bufs.size(); ++i) ptrs[i] = bufs[i].data();
   std::vector<std::vector<uint8_t>> decoded;
-  if (!GetCodec(k)->DecodeData(idx, ptrs, kChunkLen, &decoded)) {
+  if (!GetCodec(k)->DecodeData(idx, ptrs, len, &decoded)) {
     CLIO_CO_RETURN;
   }
   out.assign(stripe.size(), std::vector<uint8_t>());
@@ -1840,16 +1840,17 @@ clio::run::TaskResume Runtime::ReadBlockDegraded(clio::run::u64 off,
     std::vector<std::vector<uint8_t>> chunks;
     bool rec_ok = false;
     if (pos >= 0) {
+      // Only the bytes asked for (#1147).
       const std::vector<int> excl{static_cast<int>(dd)};
-      CLIO_CO_AWAIT(ReconstructStripe(s, stripe, excl, chunks, rec_ok));
+      CLIO_CO_AWAIT(ReconstructStripe(s, stripe, excl, chunks, rec_ok, within,
+                                      seg_end - cur));
     }
     if (!rec_ok || pos < 0) {
       HLOG(kError, "safe_bdev Read: cannot reconstruct slot {} of down data "
            "member {} (too many members down)", s, dd);
       CLIO_CO_RETURN;
     }
-    std::memcpy(dst + (cur - off),
-                chunks[static_cast<size_t>(pos)].data() + within,
+    std::memcpy(dst + (cur - off), chunks[static_cast<size_t>(pos)].data(),
                 seg_end - cur);
     cur = seg_end;
   }
@@ -2839,8 +2840,21 @@ clio::run::TaskResume Runtime::LockStripes(
   // All-or-nothing, re-checked every time the worker runs us again: no lock
   // order to get wrong and no wakeup to lose. A thread-blocking lock would
   // deadlock the worker the moment a holder suspends at a member I/O.
-  while (!TryLockStripes(slots)) {
-    CLIO_CO_AWAIT(clio::run::yield(kStripeLockPollUs));
+  {
+    const auto t0 = std::chrono::steady_clock::now();
+    double next_report_s = 10.0;
+    while (!TryLockStripes(slots)) {
+      CLIO_CO_AWAIT(clio::run::yield(kStripeLockPollUs));
+      const double waited = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (waited >= next_report_s) {
+        // A stripe held this long is a stuck holder, not contention.
+        HLOG(kError, "safe_bdev [HANGWATCH-STRIPE] waited {} ms for {} "
+             "stripe(s) starting at slot {}", waited * 1000.0, slots.size(),
+             slots.empty() ? 0 : *slots.begin());
+        next_report_s *= 2;
+      }
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

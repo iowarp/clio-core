@@ -925,13 +925,17 @@ class Runtime : public clio::run::Container {
    * on disk (zeros if it is down). `stripe` is StripeMembers(s) (the sorted
    * data-member indices in this stripe); `out` receives k_s buffers of
    * kChunkLen bytes indexed by stripe POSITION. Returns false on too few
-   * survivors.
+   * survivors. With `lo`/`len`, only that byte range of every chunk is
+   * read and decoded (the code is bytewise), and `out` holds `len` bytes per
+   * position: a 4 KiB degraded read then costs 4 KiB per survivor, not the
+   * whole 64 KiB stripe (#1147: two-down arrays starved their workers).
    */
   clio::run::TaskResume ReconstructStripe(clio::run::u64 s,
                                           const std::vector<int> &stripe,
                                           const std::vector<int> &exclude,
                                           std::vector<std::vector<uint8_t>> &out,
-                                          bool &ok);
+                                          bool &ok, clio::run::u64 lo = 0,
+                                          clio::run::u64 len = kChunkLen);
   /**
    * Read up to k = code.size() usable shards of slot `s`: data members of
    * the encoded set `code` that are active and not in `exclude`, then
@@ -941,12 +945,16 @@ class Runtime : public clio::run::Container {
    * @param exclude data members not to read
    * @param idx receives each shard's RS index (code position, or k + row)
    * @param bufs receives the shards
+   * @param lo first byte of each chunk to read
+   * @param len bytes of each chunk to read
    */
   clio::run::TaskResume GatherSurvivors(clio::run::u64 s,
                                         const std::vector<int> &code,
                                         const std::vector<int> &exclude,
                                         std::vector<int> &idx,
-                                        std::vector<std::vector<uint8_t>> &bufs);
+                                        std::vector<std::vector<uint8_t>> &bufs,
+                                        clio::run::u64 lo = 0,
+                                        clio::run::u64 len = kChunkLen);
 
   /**
    * Serialize this array's identity for a member into a zero-padded
