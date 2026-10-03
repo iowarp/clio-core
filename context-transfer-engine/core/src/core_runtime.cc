@@ -2795,6 +2795,7 @@ clio::run::TaskResume Runtime::WriteReplicaData(
   BlobInfo staging;
   float rep_score = requested_score;
   int rep_min_pers = task->context_.min_persistence_level_;
+  bool cache_copy = false;
   {
     Replica *rep = blob_info.GetReplica(replica_idx, /*create=*/true);
     if (rep == nullptr) {
@@ -2808,6 +2809,7 @@ clio::run::TaskResume Runtime::WriteReplicaData(
     // and must never persist on the slot.
     rep->flags_ |= task->context_.replica_flags_ &
                    ~(REPLICA_UPDATE_ONLY | REPLICA_VERIFY_COMPLETE);
+    cache_copy = (rep->flags_ & REPLICA_CACHE) != 0;
     // THIS copy's transform state is whatever the writer declares (issue
     // #886 cache/replication split): assignment, not OR — a replica write
     // replaces the copy's content. The cache chimod writes raw bytes
@@ -2842,9 +2844,15 @@ clio::run::TaskResume Runtime::WriteReplicaData(
   {
     clio::run::u64 old_size = staging.GetTotalSize();
     clio::run::u32 step_result = 0;
+    // A cache copy never goes below the temporary tiers (#1140): if those
+    // are full it is not stored at all (the caller deletes the copy).
+    const int rep_max_pers =
+        cache_copy ? static_cast<int>(clio::run::bdev::PersistenceLevel::
+                                          kTemporaryNonVolatile)
+                   : -1;
     CLIO_CO_AWAIT(ExtendBlob(staging, offset, size, rep_score, step_result,
                         rep_min_pers,
-                        task->context_.preallocate_));
+                        task->context_.preallocate_, nullptr, rep_max_pers));
     if (step_result != 0) {
       error_code = 10 + step_result;
     } else if (!task->context_.emulate_) {
@@ -9105,7 +9113,8 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
                                     clio::run::u32 &error_code,
                                     int min_persistence_level,
                                     clio::run::u64 preallocate,
-                                    clio::run::u64 *shortfall) {
+                                    clio::run::u64 *shortfall,
+                                    int max_persistence_level) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
@@ -9249,6 +9258,20 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
   // Use cached Data Placement Engine (built once in Create() from config)
   std::vector<TargetInfo> ordered_targets =
       dpe_->SelectTargets(available_targets, blob_score, additional_size);
+
+  // Capped placement (#1140): a node-local CACHE copy is derivable and
+  // evictable, so it must not take durable capacity -- spilled onto a
+  // long_term tier once the fast tiers filled, cache copies used up the
+  // safe arrays fsynced data needed, and the cluster hit ENOSPC early.
+  if (max_persistence_level >= 0) {
+    ordered_targets.erase(
+        std::remove_if(ordered_targets.begin(), ordered_targets.end(),
+                       [max_persistence_level](const TargetInfo &t) {
+                         return static_cast<int>(t.persistence_level_) >
+                                max_persistence_level;
+                       }),
+        ordered_targets.end());
+  }
 
   // Filter AFTER DPE by persistence level
   if (min_persistence_level > 0) {

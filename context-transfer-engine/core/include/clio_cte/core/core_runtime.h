@@ -1003,12 +1003,16 @@ private:
    * @param min_persistence_level Minimum persistence level for target filtering
    * @param shortfall Optional output: on a placement failure (error_code 1-3),
    *                  the bytes that could not be placed; 0 on success.
+   * @param max_persistence_level Highest persistence level a target may have
+   *                  (-1: no cap). Cache copies pass the temporary level so
+   *                  they never take durable capacity (#1140).
    */
   clio::run::TaskResume ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset, clio::run::u64 size,
                              float blob_score, clio::run::u32 &error_code,
                              int min_persistence_level = 0,
                              clio::run::u64 preallocate = 0,
-                             clio::run::u64 *shortfall = nullptr);
+                             clio::run::u64 *shortfall = nullptr,
+                             int max_persistence_level = -1);
 
   /**
    * One placement attempt for a put: grow-to-cover (ExtendBlob) or
