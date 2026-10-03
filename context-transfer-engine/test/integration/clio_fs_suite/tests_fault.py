@@ -15,7 +15,7 @@ import random
 import time
 
 from cluster import parallel, sh
-from suite import test
+from suite import TestUnsupported, test
 from tests_dist import _tags_match, check_records, runs_to_set
 
 MiB = 1 << 20
@@ -659,16 +659,26 @@ def t_data_failover(ctx):
   replication chimod's remote copies + core failover), and every change
   made meanwhile is on the returning node afterwards (handoff)."""
   n = len(ctx.hosts)
-  root = ctx.p('fo')
-  ctx.ok(0, 'mkdir', path=root)
-  rel = root[len(ctx.cl.mnt):]
-  owners = {fs_dir_owner(d, n) for d in ['/'] + [
-      '/' + '/'.join(rel.strip('/').split('/')[:k])
-      for k in range(1, len(rel.strip('/').split('/')) + 1)]}
-  victim = next((i for i in range(n - 1, 0, -1) if i not in owners), None)
+
+  def victim_for(root):
+    rel = root[len(ctx.cl.mnt):]
+    owners = {fs_dir_owner(d, n) for d in ['/'] + [
+        '/' + '/'.join(rel.strip('/').split('/')[:k])
+        for k in range(1, len(rel.strip('/').split('/')) + 1)]}
+    return next((i for i in range(n - 1, 0, -1) if i not in owners), None)
+
+  # Try directory names until one leaves a node clear of the path (a fixed
+  # name could leave none, and the test then passed having tested nothing).
+  root, victim = None, None
+  for k in range(64):
+    cand = ctx.p(f'fo{k}')
+    victim = victim_for(cand)
+    if victim is not None:
+      root = cand
+      break
   if victim is None:
-    ctx.note('every node owns part of the path; nothing to test')
-    return
+    raise TestUnsupported('every node owns part of every candidate path')
+  ctx.ok(0, 'mkdir', path=root)
   size = 8 * MiB
   files = [f'{root}/f{k}' for k in range(8)]
   for k, p in enumerate(files):
@@ -720,21 +730,35 @@ def t_handoff_successor_restart(ctx):
   the changes it made meanwhile must still be handed back (the replication
   chimod's handoff log), not forgotten with its memory."""
   n = len(ctx.hosts)
-  root = ctx.p('hs')
-  ctx.ok(0, 'mkdir', path=root)
-  rel = root[len(ctx.cl.mnt):]
-  owners = {fs_dir_owner(d, n) for d in ['/'] + [
-      '/' + '/'.join(rel.strip('/').split('/')[:k])
-      for k in range(1, len(rel.strip('/').split('/')) + 1)]}
-  # The owner that goes down must hold none of the path's directories (it
-  # stays down while the files are used); its successor, which covers for
-  # it, is only down while nothing touches the path. Node 0 writes, so it
-  # is neither.
-  pick = next(((v, (v + 1) % n) for v in range(n - 1, 0, -1)
-               if v not in owners and (v + 1) % n != 0), None)
+
+  def pick_for(root):
+    rel = root[len(ctx.cl.mnt):]
+    owners = {fs_dir_owner(d, n) for d in ['/'] + [
+        '/' + '/'.join(rel.strip('/').split('/')[:k])
+        for k in range(1, len(rel.strip('/').split('/')) + 1)]}
+    # The owner that goes down must hold none of the path's directories (it
+    # stays down while the files are used); its successor, which covers for
+    # it, is only down while nothing touches the path. Node 0 writes, so it
+    # is neither.
+    return next(((v, (v + 1) % n) for v in range(n - 1, 0, -1)
+                 if v not in owners and (v + 1) % n != 0), None)
+
+  # The directory's owner depends on its name: try names until one leaves an
+  # owner/successor pair clear of the path. A fixed name could leave none
+  # (5 nodes) and the test then passed having tested nothing.
+  root, pick = None, None
+  for k in range(64):
+    cand = ctx.p(f'hs{k}')
+    pick = pick_for(cand)
+    if pick is not None:
+      root = cand
+      break
   if pick is None:
-    ctx.note('no owner/successor pair clear of the path; nothing to test')
-    return
+    raise TestUnsupported('no directory name under the test dir leaves an '
+                          'owner/successor pair clear of the path')
+  ctx.ok(0, 'mkdir', path=root)
+  ctx.note(f'directory {root.rsplit("/", 1)[-1]}: node{pick[0]} goes down, '
+           f'node{pick[1]} covers and restarts')
   victim, succ = pick
   size = 8 * MiB
   files = [f'{root}/f{k}' for k in range(8)]
