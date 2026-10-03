@@ -16,6 +16,8 @@ namespace clio::cte::replication {
  * PutBlob, and the CTE serializes each op under the blob's write token.
  */
 static constexpr clio::run::u64 kReplicateChunkBytes = 4ULL * 1024 * 1024;
+/** Poll period while a SyncTag barrier waits for a running sweep. */
+static constexpr double kSweepWaitUs = 200.0;
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -128,6 +130,7 @@ clio::run::TaskResume Runtime::ReplicateSweep(
 #endif
   CLIO_TASK_BODY_BEGIN
   task->blobs_swept_ = 0;
+  const clio::run::u64 sweep_id = sweeps_started_.fetch_add(1) + 1;
   {
     // Swap the dirty set out under the lock; replicate outside it. A put
     // racing the sweep re-inserts its key and is caught next period —
@@ -138,29 +141,10 @@ clio::run::TaskResume Runtime::ReplicateSweep(
       batch.swap(pending_);
     }
     for (auto it = batch.begin(); it != batch.end(); ++it) {
-      const TagId &tag_id = it->second.first;
-      const std::string &blob_name = it->second.second;
-      Context rep_ctx;
-      rep_ctx.replica_flags_ = clio::cte::core::REPLICA_FIXED |
-                               clio::cte::core::REPLICA_PERSISTENT;
-      rep_ctx.min_persistence_level_ = 1;
-      bool failed = false;
-      for (int r = 1; r <= config_.num_replicas_; ++r) {
-        clio::run::u64 bytes = 0;
-        clio::run::u32 rc = 0;
-        CLIO_CO_AWAIT(ReplicateOne(tag_id, blob_name, r, rep_ctx, bytes, rc,
-                              config_.replica_score_));
-        if (rc == 11) {
-          // Blob deleted between the put and this sweep — nothing to keep
-          // durable; drop the entry.
-          rc = 0;
-        }
-        if (rc != 0) {
-          failed = true;
-          break;
-        }
-      }
-      if (failed) {
+      bool ok = false;
+      CLIO_CO_AWAIT(ReplicateAllCopies(it->second.first, it->second.second,
+                                       ok));
+      if (!ok) {
         // Leave it dirty for the next period; sweeping is best-effort and
         // periodic, so there is no retry loop to spin here.
         std::lock_guard<std::mutex> lk(pending_mtx_);
@@ -170,7 +154,90 @@ clio::run::TaskResume Runtime::ReplicateSweep(
       }
     }
   }
+  sweeps_done_.store(sweep_id);
   task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ReplicateAllCopies(const TagId &tag_id,
+                                                  const std::string &blob_name,
+                                                  bool &ok) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  ok = true;
+  Context rep_ctx;
+  rep_ctx.replica_flags_ = clio::cte::core::REPLICA_FIXED |
+                           clio::cte::core::REPLICA_PERSISTENT;
+  rep_ctx.min_persistence_level_ = 1;
+  for (int r = 1; r <= config_.num_replicas_; ++r) {
+    clio::run::u64 bytes = 0;
+    clio::run::u32 rc = 0;
+    CLIO_CO_AWAIT(ReplicateOne(tag_id, blob_name, r, rep_ctx, bytes, rc,
+                               config_.replica_score_));
+    // 11: the blob was deleted after the put; nothing to keep durable.
+    if (rc != 0 && rc != 11) {
+      ok = false;
+      break;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::FlushTagReplicas(const TagId &tag_id,
+                                                bool &current) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  current = true;
+  {
+    // A running sweep swapped its batch out of pending_ and may still be
+    // copying this tag's blobs: wait for it, not for later sweeps.
+    const clio::run::u64 running = sweeps_started_.load();
+    while (sweeps_done_.load() < running) {
+      CLIO_CO_AWAIT(clio::run::yield(kSweepWaitUs));
+    }
+  }
+  std::vector<std::pair<std::string, std::pair<TagId, std::string>>> mine;
+  {
+    std::lock_guard<std::mutex> lk(pending_mtx_);
+    for (auto it = pending_.begin(); it != pending_.end();) {
+      if (it->second.first == tag_id) {
+        mine.emplace_back(it->first, it->second);
+        it = pending_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (size_t i = 0; i < mine.size(); ++i) {
+    bool ok = false;
+    CLIO_CO_AWAIT(ReplicateAllCopies(mine[i].second.first,
+                                     mine[i].second.second, ok));
+    if (!ok) {
+      current = false;
+      std::lock_guard<std::mutex> lk(pending_mtx_);
+      pending_[mine[i].first] = mine[i].second;  // the sweep retries it
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::SyncTag(
+    clio::run::shared_ptr<clio::cte::core::SyncTagTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  if (config_.num_replicas_ > 0) {
+    bool current = false;
+    CLIO_CO_AWAIT(FlushTagReplicas(task->tag_id_, current));
+    if (current) task->sync_flags_ |= clio::cte::core::kSyncReplicasCurrent;
+  }
+  CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kSyncTag,
+                              task.template Cast<clio::run::Task>()));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

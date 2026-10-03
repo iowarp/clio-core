@@ -5518,9 +5518,16 @@ static constexpr clio::run::u32 kSyncNoSpaceRc = 28;  // ENOSPC
 /** SyncTag return code: a device sync or a read of the tag's bytes failed. */
 static constexpr clio::run::u32 kSyncIoRc = 5;  // EIO
 
+/** SyncTagTask::sync_flags_: every durable replica of the tag's blobs was
+ *  brought up to date by the module in front of the core (replication's
+ *  barrier), so a blob with one at the persistence level needs no second
+ *  durable copy of its primary (#1143). */
+GLOBAL_CROSS_CONST clio::run::u32 kSyncReplicasCurrent = 0x1;
+
 struct SyncTagTask : public clio::run::Task {
   IN TagId tag_id_;              ///< Tag whose blobs must become durable
   IN int min_persistence_;       ///< Minimum tier level; < 0 = config default
+  IN clio::run::u32 sync_flags_; ///< kSyncReplicasCurrent
   OUT clio::run::u32 deferred_;  ///< 1 when fsync_mode is "deferred"
   OUT clio::run::u64 blobs_moved_;  ///< Blobs moved to a persistent tier
   OUT clio::run::u64 bdevs_synced_; ///< Devices synced (summed over nodes)
@@ -5538,6 +5545,7 @@ struct SyncTagTask : public clio::run::Task {
       : clio::run::Task(),
         tag_id_(TagId::GetNull()),
         min_persistence_(-1),
+        sync_flags_(0),
         deferred_(0),
         blobs_moved_(0),
         bdevs_synced_(0),
@@ -5553,6 +5561,7 @@ struct SyncTagTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kSyncTag),
         tag_id_(tag_id),
         min_persistence_(min_persistence),
+        sync_flags_(0),
         deferred_(0),
         blobs_moved_(0),
         bdevs_synced_(0),
@@ -5569,7 +5578,7 @@ struct SyncTagTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_id_, min_persistence_);
+    ar(tag_id_, min_persistence_, sync_flags_);
   }
 
   /** Serialize OUT and INOUT parameters */
@@ -5584,6 +5593,7 @@ struct SyncTagTask : public clio::run::Task {
     Task::Copy(other.template Cast<Task>());
     tag_id_ = other->tag_id_;
     min_persistence_ = other->min_persistence_;
+    sync_flags_ = other->sync_flags_;
     deferred_ = other->deferred_;
     blobs_moved_ = other->blobs_moved_;
     bdevs_synced_ = other->bdevs_synced_;

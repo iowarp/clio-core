@@ -48,6 +48,8 @@ GLOBAL_CROSS_CONST clio::run::u32 kHandoffSweep = 104;
 GLOBAL_CROSS_CONST clio::run::u32 kDelBlob = clio::cte::core::Method::kDelBlob;
 GLOBAL_CROSS_CONST clio::run::u32 kTruncateBlob =
     clio::cte::core::Method::kTruncateBlob;
+// fsync's SyncTag: the replica barrier runs before the core's sync (#1143).
+GLOBAL_CROSS_CONST clio::run::u32 kSyncTag = clio::cte::core::Method::kSyncTag;
 
 GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 105;
 
@@ -68,6 +70,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[kHandoffSweep] = "HandoffSweep";
     v[kDelBlob] = "DelBlob";
     v[kTruncateBlob] = "TruncateBlob";
+    v[kSyncTag] = "SyncTag";
     return v;
   }();
   return names;

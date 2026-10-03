@@ -119,6 +119,12 @@ class Runtime : public clio::cte::core::CoreInterposer {
    *  silently strip durability from every async caller. */
   clio::run::TaskResume MultiPutBlob(
       clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
+  /** Interposed fsync (Method::kSyncTag, broadcast): bring this container's
+   *  pending replicas of the tag up to date, then run the core's sync. When
+   *  every one is current the core is told so (kSyncReplicasCurrent) and
+   *  does not also move primaries that have a durable replica (#1143). */
+  clio::run::TaskResume SyncTag(
+      clio::run::shared_ptr<clio::cte::core::SyncTagTask> &task);
 
   // ---- Container virtuals (defined in autogen/replication_lib_exec.cc) ----
   /** Recovering start (a plain `clio_run start`): Create pulls the handoff. */
@@ -273,6 +279,30 @@ class Runtime : public clio::cte::core::CoreInterposer {
    *  simply re-inserts and is caught next period. */
   std::mutex pending_mtx_;
   std::unordered_map<std::string, std::pair<TagId, std::string>> pending_;
+  /** Sweeps started / finished (ReplicateSweep numbers each run): a barrier
+   *  waits for the sweep that may hold entries it swapped out. */
+  std::atomic<clio::run::u64> sweeps_started_{0};
+  std::atomic<clio::run::u64> sweeps_done_{0};
+
+  /**
+   * Write one blob's current primary to each of its num_replicas durable
+   * replicas.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob
+   * @param ok OUT false if a replica could not be written (a deleted blob
+   *        counts as done)
+   */
+  clio::run::TaskResume ReplicateAllCopies(const TagId &tag_id,
+                                           const std::string &blob_name,
+                                           bool &ok);
+  /**
+   * The SyncTag barrier: replicate every pending blob of one tag on this
+   * container, after any sweep that took entries out of the pending set has
+   * finished with them.
+   * @param tag_id the tag being synced
+   * @param current OUT true when every pending replica of the tag was written
+   */
+  clio::run::TaskResume FlushTagReplicas(const TagId &tag_id, bool &current);
 
   // ---- remote copies and failover (replication_remote.cc) ----
   /** A blob changed here while its owner was down. */

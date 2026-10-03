@@ -7445,7 +7445,8 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
 clio::run::TaskResume Runtime::MoveBlobToPersistent(
     const std::string &composite_key, const TagId &tag_id,
     const std::string &blob_name, float score, int target_level,
-    clio::run::u64 &budget, clio::run::u64 &size, clio::run::u32 &rc) {
+    clio::run::u64 &budget, clio::run::u64 &size, clio::run::u32 &rc,
+    bool replicas_current) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
@@ -7473,6 +7474,12 @@ clio::run::TaskResume Runtime::MoveBlobToPersistent(
   {
     clio::run::ScopedCoRwReadLock read_lock(target_lock_);
     below = HasBlocksBelowLevelLocked(blob_info_ptr->blocks_, target_level);
+  }
+  // A current durable replica already makes the bytes survive a crash; a
+  // second durable copy of the primary only costs space (#1143).
+  if (below && replicas_current &&
+      HasDurableReplica(*blob_info_ptr, total_size, target_level)) {
+    below = false;
   }
   ctp::ipc::FullPtr<char> buffer;
   auto *ipc_manager = CLIO_IPC;
@@ -7582,6 +7589,19 @@ clio::run::TaskResume Runtime::RelocateBlob(
   CLIO_TASK_BODY_END
 }
 
+bool Runtime::HasDurableReplica(const BlobInfo &blob_info, clio::run::u64 size,
+                                int level) {
+  for (const auto &rep : blob_info.replicas_) {
+    if ((rep.flags_ & REPLICA_CACHE) || !(rep.flags_ & REPLICA_PERSISTENT)) {
+      continue;
+    }
+    clio::run::u64 rep_size = 0;
+    for (const auto &blk : rep.blocks_) rep_size += blk.size_;
+    if (rep_size == size && DurabilityFloor(rep.blocks_) >= level) return true;
+  }
+  return false;
+}
+
 int Runtime::DurabilityFloor(const clio::run::priv::vector<BlobBlock> &blocks) {
   if (blocks.empty()) return 0;
   int floor = std::numeric_limits<int>::max();
@@ -7669,9 +7689,9 @@ clio::run::TaskResume Runtime::SyncTag(
     if (!info) continue;
     clio::run::u64 size = 0;
     clio::run::u32 move_rc = kMoveDone;
-    CLIO_CO_AWAIT(MoveBlobToPersistent(prefix + names[i], tag, names[i],
-                                       info->score_, level, budget, size,
-                                       move_rc));
+    CLIO_CO_AWAIT(MoveBlobToPersistent(
+        prefix + names[i], tag, names[i], info->score_, level, budget, size,
+        move_rc, (task->sync_flags_ & kSyncReplicasCurrent) != 0));
     if (move_rc == kMoveNoRoom || move_rc == kMovePlaceFailed) {
       task->return_code_ = kSyncNoSpaceRc;
       CLIO_CO_RETURN;

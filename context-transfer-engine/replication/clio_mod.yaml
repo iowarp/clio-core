@@ -25,5 +25,6 @@ kReplicateBlob: 100
 kFlushTag: 101
 kDelBlob: 18
 kTruncateBlob: 37
+kSyncTag: 56          # fsync: flush the tag's pending replicas, then the core's sync (#1143)
 kHandoffPull: 103     # a restarted owner pulls what its successors changed
 kHandoffSweep: 104    # periodic: push changes back to owners that returned

@@ -34,6 +34,7 @@ namespace clio::cte::replication {
   X(kMultiPutBlob, clio::cte::core::MultiPutBlobTask, MultiPutBlob) \
   X(kDelBlob, clio::cte::core::DelBlobTask, DelBlob) \
   X(kTruncateBlob, clio::cte::core::TruncateBlobTask, TruncateBlob) \
+  X(kSyncTag, clio::cte::core::SyncTagTask, SyncTag) \
   X(kHandoffPull, HandoffPullTask, HandoffPull) \
   X(kHandoffSweep, HandoffSweepTask, HandoffSweep)
 

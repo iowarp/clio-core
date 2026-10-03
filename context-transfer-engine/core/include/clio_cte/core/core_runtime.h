@@ -236,6 +236,9 @@ public:
    * @param budget free bytes on qualifying tiers; debited by the move
    * @param size OUT bytes moved (kMoveDone) or needed (kMoveNoRoom)
    * @param rc OUT one of the kMove* outcomes
+   * @param replicas_current the caller vouches that the blob's durable
+   *        replicas are up to date (kSyncReplicasCurrent): one of the
+   *        blob's full size at target_level makes the move unnecessary
    */
   clio::run::TaskResume MoveBlobToPersistent(const std::string &composite_key,
                                              const TagId &tag_id,
@@ -243,7 +246,20 @@ public:
                                              float score, int target_level,
                                              clio::run::u64 &budget,
                                              clio::run::u64 &size,
-                                             clio::run::u32 &rc);
+                                             clio::run::u32 &rc,
+                                             bool replicas_current = false);
+
+  /**
+   * Whether a blob has a durable (non-cache) replica holding all of its
+   * bytes on tiers at or above a persistence level. The caller holds the
+   * blob's write token.
+   * @param blob_info the blob
+   * @param size the blob's current size
+   * @param level the persistence level the replica must reach
+   * @return true when such a replica exists
+   */
+  bool HasDurableReplica(const BlobInfo &blob_info, clio::run::u64 size,
+                         int level);
 
   /**
    * Place `total_size` bytes of `data` on tiers at or above `target_level`
