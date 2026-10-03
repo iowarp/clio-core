@@ -46,6 +46,9 @@
 
 #ifndef _WIN32
 #include <sys/resource.h>  // RaiseFdLimit
+#if defined(__linux__)
+#include <sys/prctl.h>  // MaybeAllowPtrace
+#endif
 #endif
 
 #include "clio_runtime/admin/admin_client.h"
@@ -295,6 +298,19 @@ void RaiseFdLimit() {
   }
 #endif
 }
+/**
+ * CLIO_ALLOW_PTRACE=1: let any process of this user attach a debugger to the
+ * runtime (kernel.yama.ptrace_scope=1 otherwise allows only its parent), so
+ * a wedged daemon's state can be inspected in place (#1147).
+ */
+void MaybeAllowPtrace() {
+#if defined(__linux__) && defined(PR_SET_PTRACER)
+  const char *e = std::getenv("CLIO_ALLOW_PTRACE");
+  if (e != nullptr && e[0] == '1') {
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+  }
+#endif
+}
 }  // namespace
 
 bool RuntimeManager::ServerInit() {
@@ -303,6 +319,7 @@ bool RuntimeManager::ServerInit() {
     return true;
   }
   RaiseFdLimit();
+  MaybeAllowPtrace();
 
   // Set mode flags at the start
   is_runtime_mode_ = true;

@@ -102,6 +102,16 @@ public:
   int client_port_ = 0;
 
   /**
+   * Sending runtime's node id and incarnation (its server generation, set
+   * at startup), stamped on every runtime-to-runtime message (#1148). A
+   * receiver that sees a node's incarnation change knows that node
+   * restarted: whatever it had sent the old process will never be answered.
+   * 0 incarnation = unset (client messages).
+   */
+  u64 sender_node_ = 0;
+  u64 sender_inc_ = 0;
+
+  /**
    * Default constructor
    */
   NetTaskArchive() : msg_type_(MsgType::kSerializeIn) {}
@@ -124,7 +134,9 @@ public:
       : ctp::lbm::LbmMeta<>(std::move(other)),
         task_infos_(std::move(other.task_infos_)),
         msg_type_(other.msg_type_),
-        client_port_(other.client_port_) {}
+        client_port_(other.client_port_),
+        sender_node_(other.sender_node_),
+        sender_inc_(other.sender_inc_) {}
 
   /**
    * Move assignment operator
@@ -135,6 +147,8 @@ public:
       task_infos_ = std::move(other.task_infos_);
       msg_type_ = other.msg_type_;
       client_port_ = other.client_port_;
+      sender_node_ = other.sender_node_;
+      sender_inc_ = other.sender_inc_;
     }
     return *this;
   }
@@ -274,7 +288,7 @@ public:
   template <typename Ar>
   void serialize(Ar &ar) {
     ar(send, recv, send_bulks, recv_bulks);
-    ar(task_infos_, msg_type_, client_port_);
+    ar(task_infos_, msg_type_, client_port_, sender_node_, sender_inc_);
     serializer_.Finalize();
     ar(buffer_);
   }
@@ -434,7 +448,7 @@ public:
   template <typename Ar>
   void serialize(Ar &ar) {
     ar(send, recv, send_bulks, recv_bulks);
-    ar(task_infos_, msg_type_, client_port_);
+    ar(task_infos_, msg_type_, client_port_, sender_node_, sender_inc_);
     ar(data_);
     // Reinitialize deserializer with new data
     new (&deserializer_)

@@ -194,6 +194,7 @@ void IpcManagerRun2Run::SendInTransmitReplica(
   }
 
   clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeIn, lbm_transport);
+  StampSender(archive);
   // Advertise this node's server port as the response port. The receiver pairs
   // it with our return-node address to open a dedicated dial-back connection
   // for SendOut (see RecvInHandleOne), keyed in the connection cache by
@@ -422,6 +423,7 @@ int IpcManagerRun2Run::SendOutTransmit(
   }
 
   clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeOut, lbm_transport);
+  StampSender(archive);
   const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
   container->SaveTask(origin_task->method_, archive, origin_task);
   const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
@@ -575,6 +577,7 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   {
     std::lock_guard<std::mutex> lk(recv_map_mutex_);
     recv_map_[recv_key] = task_ptr;
+    recv_since_[recv_key] = std::chrono::steady_clock::now();
   }
 
   HLOG(kDebug, "[RecvIn] Task {} method={} pool_id={} dispatching to workers",
@@ -976,6 +979,29 @@ std::vector<StuckReplica> IpcManagerRun2Run::CollectStuckReplicas(
 
   for (auto &kv : progress_map_) {
     OriginProgress &prog = kv.second;
+    {
+      // [HANGWATCH-REPLICA] (#1147): an origin outstanding a minute or more
+      // is stuck, not slow -- say where each replica stands.
+      const double age_s =
+          std::chrono::duration<double>(now - prog.enqueue_time).count();
+      if (age_s >= 60.0 && age_s < 60.0 + interval_ms / 1000.0) {
+        auto sit = send_map_.find(kv.first);
+        const bool live = sit != nullptr && !(*sit).IsNull();
+        const clio::run::TaskId tid =
+            live ? (*sit)->task_id_ : clio::run::TaskId();
+        for (clio::run::u32 rid = 0; rid < prog.replicas.size(); ++rid) {
+          const ReplicaProgress &rp = prog.replicas[rid];
+          HLOG(kError, "[HANGWATCH-REPLICA] task {} (origin live={}) replica "
+               "{} -> node {} outstanding {} s: accounted={} alive={} "
+               "gone_strikes={} redispatched={} probe_eligible={}", tid, live,
+               rid,
+               rp.target_node_id, age_s, rp.accounted,
+               rp.target_node_id != kInvalidNodeId &&
+                   ipc_manager->IsAlive(rp.target_node_id),
+               rp.gone_strikes, rp.redispatched, prog.probe_eligible);
+        }
+      }
+    }
     if (!prog.probe_eligible) {
       continue;  // admin origin: probing it would recurse (issue #896)
     }
@@ -1006,6 +1032,68 @@ void IpcManagerRun2Run::EraseRecvEntry(
       (static_cast<size_t>(task->task_id_.replica_id_) * 0x9e3779b97f4a7c15ULL);
   std::lock_guard<std::mutex> lk(recv_map_mutex_);
   recv_map_.erase(recv_key);
+  recv_since_.erase(recv_key);
+}
+
+void IpcManagerRun2Run::ReportOldRecvTasks() {
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lk(recv_map_mutex_);
+  for (auto it = recv_since_.begin(); it != recv_since_.end(); ++it) {
+    const double age_s =
+        std::chrono::duration<double>(now - it->second).count();
+    if (age_s < 60.0) continue;
+    auto *t = recv_map_.find(it->first);
+    if (t != nullptr && !(*t).IsNull()) {
+      HLOG(kError, "[HANGWATCH-RECV] holding received task {} (pool {}, "
+           "method {}) for {} s without a response", (*t)->task_id_,
+           (*t)->pool_id_, (*t)->method_, age_s);
+    }
+    // Once per task: push its stamp far into the future.
+    it->second = now + std::chrono::hours(24 * 365);
+  }
+}
+
+void IpcManagerRun2Run::StampSender(clio::run::NetTaskArchive &archive) {
+  auto *ipc = CLIO_IPC;
+  archive.sender_node_ = ipc->GetNodeId();
+  archive.sender_inc_ = ipc->GetServerGeneration();
+}
+
+void IpcManagerRun2Run::CheckPeerIncarnation(
+    const clio::run::NetTaskArchive &archive) {
+  if (archive.sender_inc_ == 0) return;  // a client, or an older peer
+  auto *ipc = CLIO_IPC;
+  if (ipc->NotePeerIncarnation(archive.sender_node_, archive.sender_inc_)) {
+    FailInFlightToNode(archive.sender_node_);
+  }
+}
+
+void IpcManagerRun2Run::FailInFlightToNode(clio::run::u64 node_id) {
+  // Everything dispatched to node_id before we saw its new incarnation went
+  // to the old process (or was lost in transit when it died): no answer will
+  // come, and its probes may be lost the same way while the node keeps
+  // talking to us -- the waiters hung forever (#1148). Fail them like the
+  // dead-node path does; callers retry (puts are idempotent).
+  std::vector<std::pair<size_t, clio::run::u32>> to_fail;
+  {
+    std::lock_guard<std::mutex> lk(send_map_mutex_);
+    for (auto &kv : progress_map_) {
+      OriginProgress &prog = kv.second;
+      for (clio::run::u32 rid = 0; rid < prog.replicas.size(); ++rid) {
+        const ReplicaProgress &rp = prog.replicas[rid];
+        if (!rp.accounted && rp.target_node_id == node_id) {
+          to_fail.emplace_back(kv.first, rid);
+        }
+      }
+    }
+  }
+  HLOG(kWarning, "[RecvIn] node {} restarted (new incarnation); failing {} "
+       "task replica(s) sent to its previous process", node_id,
+       to_fail.size());
+  for (const auto &f : to_fail) {
+    HandleTaskProgressResult(static_cast<clio::run::u64>(f.first), f.second,
+                             /*gone=*/true, /*gen=*/0);
+  }
 }
 
 void IpcManagerRun2Run::HandleTaskProgressResult(clio::run::u64 net_key,
@@ -1120,6 +1208,7 @@ bool IpcManagerRun2Run::RetrySendToNode(RetryEntry &entry, clio::run::u64 node_i
   }
 
   clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeIn, lbm_transport);
+  StampSender(archive);
   container->SaveTask(entry.task->method_, archive, entry.task);
   ctp::lbm::LbmContext ctx(0);
   int rc = lbm_transport->Send(archive, ctx);
@@ -1458,6 +1547,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
         const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
         if (nettrace::On()) nettrace::recv_ns += nt1 - nt0;
         drained_any = true;
+        CheckPeerIncarnation(archive);
         clio::run::MsgType msg_type = archive.GetMsgType();
         switch (msg_type) {
           case clio::run::MsgType::kSerializeIn:

@@ -1663,6 +1663,7 @@ void Runtime::ScanTaskProgress() {
       CLIO_CONFIG_MANAGER->GetTaskProgressIntervalMs();
   FireStuckProbes(interval_ms);
   if (interval_ms != 0) FireIdleProbes();
+  CLIO_IPC->GetRun2Run()->ReportOldRecvTasks();
 }
 
 void Runtime::ReapProgressProbes(std::chrono::steady_clock::time_point now,

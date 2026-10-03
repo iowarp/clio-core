@@ -277,6 +277,32 @@ class IpcManagerRun2Run {
    * not yet been responded to in SendOut (issue #628). Backs the
    * QueryTaskProgress admin method's kRunning/kGone answer.
    */
+  /**
+   * [HANGWATCH-RECV] (#1147): log every received task this node has held
+   * for a minute or more without responding -- the target side of a sender's
+   * [HANGWATCH-REPLICA]. Each entry is reported once.
+   */
+  void ReportOldRecvTasks();
+
+  /**
+   * Stamp this runtime's node id and incarnation on an outgoing archive.
+   * @param archive the message
+   */
+  void StampSender(clio::run::NetTaskArchive &archive);
+
+  /**
+   * Note the incarnation a received message carries; when its sender
+   * restarted since we last heard from it, fail what we had sent it.
+   * @param archive the received message
+   */
+  void CheckPeerIncarnation(const clio::run::NetTaskArchive &archive);
+
+  /**
+   * Fail every replica in flight to node_id (#1148: it restarted).
+   * @param node_id the restarted node
+   */
+  void FailInFlightToNode(clio::run::u64 node_id);
+
   bool HasRecvTask(clio::run::u64 net_key, clio::run::u32 replica_id) const {
     size_t recv_key = static_cast<size_t>(net_key) ^
                       (static_cast<size_t>(replica_id) * 0x9e3779b97f4a7c15ULL);
@@ -451,6 +477,10 @@ class IpcManagerRun2Run {
   mutable std::mutex recv_map_mutex_;
   ctp::priv::unordered_map_ll<size_t, clio::run::shared_ptr<clio::run::Task>> send_map_;
   ctp::priv::unordered_map_ll<size_t, clio::run::shared_ptr<clio::run::Task>> recv_map_;
+  // When each recv_map_ entry arrived (guarded by recv_map_mutex_), for
+  // ReportOldRecvTasks (#1147).
+  std::unordered_map<size_t, std::chrono::steady_clock::time_point>
+      recv_since_;
 
   // Per-origin cross-node progress state, keyed by net_key (issue #628).
   // Guarded by send_map_mutex_ (updated in lock-step with send_map_).

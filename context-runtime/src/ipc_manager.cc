@@ -1902,6 +1902,19 @@ void IpcManager::SetDead(u64 node_id) {
        it->second.ip_address);
 }
 
+bool IpcManager::NotePeerIncarnation(u64 node_id, u64 incarnation) {
+  if (incarnation == 0 || node_id == GetNodeId()) return false;
+  std::lock_guard<std::mutex> g(peer_inc_mu_);
+  auto it = peer_inc_.find(node_id);
+  if (it == peer_inc_.end()) {
+    peer_inc_[node_id] = incarnation;
+    return false;
+  }
+  if (it->second == incarnation) return false;
+  it->second = incarnation;
+  return true;
+}
+
 void IpcManager::NoteHeardFrom(u64 node_id) {
   if (node_id >= kHeardSlots) return;
   const u64 now = static_cast<u64>(

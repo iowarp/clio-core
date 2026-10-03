@@ -833,6 +833,15 @@ class IpcManager {
    * Cheap (one relaxed atomic store), called from the receive threads.
    */
   void NoteHeardFrom(u64 node_id);
+  /**
+   * Record the incarnation a message from node_id carried (#1148).
+   * @param node_id the sending node
+   * @param incarnation its runtime's server generation (0 = unknown)
+   * @return true when node_id was known under a DIFFERENT incarnation: it
+   *         restarted since, and nothing sent to its old process will be
+   *         answered
+   */
+  bool NotePeerIncarnation(u64 node_id, u64 incarnation);
   /** Nanoseconds since the last message from node_id; ~0ull if never. */
   u64 NsSinceHeardFrom(u64 node_id) const;
   /** Every node id in the hostfile (fixed after init; safe from any thread). */
@@ -1628,6 +1637,9 @@ class IpcManager {
 
   // Monotonic counter, set from epoch nanos at init
   std::atomic<u64> server_generation_{0};
+  /** Last incarnation seen per peer node (NotePeerIncarnation). */
+  std::mutex peer_inc_mu_;
+  std::unordered_map<u64, u64> peer_inc_;
 
   // The worker task queues (multi-lane queue)
   ctp::ipc::FullPtr<TaskQueue> worker_queues_;
