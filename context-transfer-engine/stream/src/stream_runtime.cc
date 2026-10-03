@@ -115,18 +115,44 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   }
   OpenLog();
   if (is_restart_) {
+    std::lock_guard<std::mutex> g(mu_);
+    plans_pending_ = !open_plans_.empty();
+  }
+  // Clients bound and sizes restored: tasks may run now. RecoverStaged below
+  // ships through this very container, so it must not wait on Create.
+  ready_.store(true, std::memory_order_release);
+  if (is_restart_) {
     // Merge plans interrupted by the restart finish later, from the drain
     // tick, once clio-fs has reconciled the restored streams: a stream whose
     // file was truncated elsewhere meanwhile must drop its old plans, not
     // replay them at their pre-crash offsets (see ReconcileRestored).
-    {
-      std::lock_guard<std::mutex> g(mu_);
-      plans_pending_ = !open_plans_.empty();
-    }
     CLIO_CO_AWAIT(RecoverStaged());
     if (plans_pending_) EnsureSequence();
   }
   task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::AwaitReady(bool &ok) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  ok = ready_.load(std::memory_order_acquire);
+  if (!ok) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!ready_.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() - t0 <
+               std::chrono::milliseconds(kReadyWaitMs)) {
+      CLIO_CO_AWAIT(clio::run::yield(kReadyPollUs));
+    }
+    ok = ready_.load(std::memory_order_acquire);
+    if (!ok) {
+      HLOG(kError, "stream: a task arrived before this container's Create "
+           "opened its log, and it still has not after {} ms", kReadyWaitMs);
+    }
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -219,6 +245,14 @@ clio::run::u32 Runtime::LiveHome(clio::run::u32 home) const {
 clio::run::TaskResume Runtime::Append(clio::run::shared_ptr<AppendTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->bytes_written_ = 0;
+  {
+    bool ready = false;
+    CLIO_CO_AWAIT(AwaitReady(ready));
+    if (!ready) {
+      task->return_code_ = EIO;
+      CLIO_CO_RETURN;
+    }
+  }
   if (task->size_ == 0) {
     task->return_code_ = 0;
     CLIO_CO_RETURN;
@@ -262,6 +296,14 @@ clio::run::TaskResume Runtime::Append(clio::run::shared_ptr<AppendTask> &task) {
 
 clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  {
+    bool ready = false;
+    CLIO_CO_AWAIT(AwaitReady(ready));
+    if (!ready) {
+      task->return_code_ = EIO;
+      CLIO_CO_RETURN;
+    }
+  }
   // Wait only for the appends accepted BEFORE this flush: later writers must
   // not be able to starve it.
   clio::run::u64 target = 0;

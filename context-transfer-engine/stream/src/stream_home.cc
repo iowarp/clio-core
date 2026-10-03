@@ -164,6 +164,14 @@ clio::run::u64 Runtime::ApplySizeOpLocked(const clio::cte::core::TagId &tag,
 
 clio::run::TaskResume Runtime::SizeOp(clio::run::shared_ptr<SizeOpTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  {
+    bool ready = false;
+    CLIO_CO_AWAIT(AwaitReady(ready));
+    if (!ready) {
+      task->return_code_ = EIO;
+      CLIO_CO_RETURN;
+    }
+  }
   const auto op = static_cast<StreamSizeOp>(task->op_);
   if (op > StreamSizeOp::kSync) {
     task->return_code_ = EINVAL;
@@ -219,6 +227,14 @@ void Runtime::DedupeLocked(std::vector<AppendEntry> *entries) {
 
 clio::run::TaskResume Runtime::Plan(clio::run::shared_ptr<PlanTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  {
+    bool ready = false;
+    CLIO_CO_AWAIT(AwaitReady(ready));
+    if (!ready) {
+      task->return_code_ = EIO;
+      CLIO_CO_RETURN;
+    }
+  }
   const clio::cte::core::TagId tag = task->tag_id_;
   std::vector<AppendEntry> entries(task->entries_.begin(),
                                    task->entries_.end());

@@ -312,6 +312,21 @@ class Runtime : public clio::run::Container {
   void EnsureSequence();
   /** Restart: re-queue the staged appends this node originated. */
   clio::run::TaskResume RecoverStaged();
+  /**
+   * Hold a task until Create has bound the CTE clients and reopened the
+   * stream log. The container takes tasks as soon as it is registered,
+   * before Create runs: after a restart a Plan merged appends from offset
+   * 0 over the file's first records, and its copies went to pool 0.0.
+   * @param ok OUT false if Create still had not got that far after
+   *        kReadyWaitMs
+   */
+  clio::run::TaskResume AwaitReady(bool &ok);
+  /** Set once Create has bound its clients and opened the log. */
+  std::atomic<bool> ready_{false};
+  /** Longest a task waits for Create (ms). */
+  static constexpr clio::run::u64 kReadyWaitMs = 120000;
+  /** Poll period while waiting for Create (us). */
+  static constexpr double kReadyPollUs = 1000.0;
   /** Restart: finish plans that were in flight at the crash. */
   clio::run::TaskResume FinishOpenPlans();
   /** fsync the size log if kLogSyncPeriodMs passed and it has new records
