@@ -744,6 +744,14 @@ def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
         elif w == ZERO:
           if dg:
             lost.append((nmx, start, count, 'hole', f'fsynced gen {dg}'))
+            if len(lost) <= 4:
+              # Name the tag and pages, to match against runtime logs.
+              st = (ctx.call(reader, 'stat', path=path).get('ret') or {})
+              ino = st.get('ino', 0) or 0
+              ctx.note(f'{nmx} tag={ino >> 32}.{ino & 0xffffffff} hole '
+                       f'pages {start * 4096 >> 20}..'
+                       f'{((start + count) * 4096 - 1) >> 20} (fsynced gen '
+                       f'{dg}; file size {st.get("size")})')
         elif w != i + 1:
           corrupt.append((nmx, start, count, f'writer {w}'))
         elif g < dg:
