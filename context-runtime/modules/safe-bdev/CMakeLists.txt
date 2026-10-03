@@ -37,3 +37,19 @@ clio_add_viz_assets(MOD_NAME clio_safe_bdev)
 if(CLIO_CORE_ENABLE_TESTS)
   add_subdirectory(test)
 endif()
+
+# Operator tool: rebuild a failed member onto a replacement disk of a running
+# array (RecoverBdev); used by clio_fs_suite's disk-replacement test.
+add_executable(clio_safe_bdev_recover util/safe_bdev_recover.cc)
+target_link_libraries(clio_safe_bdev_recover
+  clio_safe_bdev_client
+  clio_bdev_client
+  clio_admin_client
+  ctp::cxx
+)
+set_target_properties(clio_safe_bdev_recover PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+install(TARGETS clio_safe_bdev_recover RUNTIME DESTINATION bin)
