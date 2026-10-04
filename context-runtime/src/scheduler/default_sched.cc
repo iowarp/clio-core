@@ -682,10 +682,11 @@ void DefaultScheduler::LoadBalance() {
     if (!w->IsStalled(now_us, kStallThresholdSec)) return false;
     stalls_detected_.fetch_add(1, std::memory_order_relaxed);
     HLOG(kWarning,
-         "[#781] worker {} STALLED on one task (load_us={} realtime_load_us={} "
-         "threshold_s={})",
-         w->GetId(), (double)w->Load(), w->RealtimeLoad(now_us),
-         kStallThresholdSec);
+         "[#781] worker {} STALLED on one task (pool {} method {} running "
+         "{} ms; load_us={} realtime_load_us={} threshold_s={})",
+         w->GetId(), w->CurrentPoolMajor(), w->CurrentMethod(),
+         w->CurrentTaskAgeMs(now_us), (double)w->Load(),
+         w->RealtimeLoad(now_us), kStallThresholdSec);
 
     // issue #785: LANE RESCUE. The stalled worker is inside ExecTask and is
     // provably not popping its lane, so its queued backlog is stranded behind a

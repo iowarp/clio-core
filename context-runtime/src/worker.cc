@@ -1256,6 +1256,11 @@ bool Worker::IsRunning() const { return is_running_; }
 
 void Worker::SetCurrentTask(const clio::run::shared_ptr<Task> &task) {
   current_task_ = task;
+  const Task *t = task.get();
+  cur_pool_major_.store(t != nullptr ? static_cast<u32>(t->pool_id_.major_) : 0,
+                        std::memory_order_relaxed);
+  cur_method_.store(t != nullptr ? static_cast<u32>(t->method_) : 0,
+                    std::memory_order_relaxed);
 }
 
 clio::run::shared_ptr<Task> &Worker::GetCurrentTask() { return current_task_; }

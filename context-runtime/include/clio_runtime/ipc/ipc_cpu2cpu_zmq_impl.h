@@ -153,12 +153,25 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
   // named auto-reset event latches a signal that races the Wait.
   ctp::lbm::EventManager *em = &ipc->GetTls()->event_manager_;
   auto start = std::chrono::steady_clock::now();
+  // [HANGWATCH-CLIENT] (#1147): the SHM twin of this loop names a task whose
+  // response is a minute late; this loop said nothing, so a FUSE daemon on
+  // TCP waiting on a lost or stalled response looked like a silent hang from
+  // outside (#1149's v81 run: every node's fsync parked here for 15 minutes).
+  float next_report_s = 60.0f;
   while (!task_ptr->IsComplete()) {
     em->Wait(100);  // 100us bounded re-check; woken immediately by Signal
     float elapsed =
         std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
             .count();
     if (max_sec > 0 && elapsed >= max_sec) return false;
+    if (elapsed >= next_report_s) {
+      HLOG(kError,
+           "[HANGWATCH-CLIENT] waited {} ms for task {} (pool {}, method {}) "
+           "over ZMQ",
+           elapsed * 1000.0f, task_ptr->task_id_, task_ptr->pool_id_,
+           task_ptr->method_);
+      next_report_s *= 2.0f;
+    }
     if (ipc->client_finalized_.load(std::memory_order_acquire)) {
       HLOG(kWarning,
            "Recv: client finalized mid-wait; failing task (issue #970)");

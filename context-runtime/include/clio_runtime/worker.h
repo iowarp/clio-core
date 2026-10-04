@@ -423,6 +423,34 @@ class Worker {
   clio::run::shared_ptr<Task> &GetCurrentTask();
 
   /**
+   * Pool (major id) of the task this worker is executing, readable from
+   * another thread; 0 when idle. For the stall report.
+   * @return the pool major id, or 0
+   */
+  u32 CurrentPoolMajor() const {
+    return cur_pool_major_.load(std::memory_order_relaxed);
+  }
+
+  /**
+   * Method of the task this worker is executing, readable from another
+   * thread; 0 when idle. For the stall report.
+   * @return the method id, or 0
+   */
+  u32 CurrentMethod() const {
+    return cur_method_.load(std::memory_order_relaxed);
+  }
+
+  /**
+   * How long the current task has been executing without yielding.
+   * @param now_us the current steady-clock time in microseconds
+   * @return elapsed milliseconds, or 0 when idle
+   */
+  double CurrentTaskAgeMs(double now_us) const {
+    long long start = last_exec_start_us_.load(std::memory_order_relaxed);
+    return start == 0 ? 0.0 : (now_us - static_cast<double>(start)) / 1000.0;
+  }
+
+  /**
    * Get current lane from the current RunContext
    * @return Pointer to current lane or nullptr if no RunContext
    */
@@ -722,6 +750,10 @@ class Worker {
   // Task currently executing on this worker thread (null when idle). The
   // RunContext lives inside this Task; it is never held as a bare pointer.
   clio::run::shared_ptr<Task> current_task_;
+  // Plain mirrors of current_task_'s pool and method for the monitor thread's
+  // stall report: a shared_ptr cannot be read from another thread, these can.
+  std::atomic<u32> cur_pool_major_{0};
+  std::atomic<u32> cur_method_{0};
 
   // Single lane assigned to this worker (one lane per worker).
   // issue #785: atomic because the monitor thread reassigns it during a stall

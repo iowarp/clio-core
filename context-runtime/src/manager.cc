@@ -167,6 +167,10 @@ RuntimeManager::~RuntimeManager() {
   }
 }
 
+namespace {
+void MaybeAllowPtrace();  // defined with ServerInit below
+}  // namespace
+
 bool RuntimeManager::ClientInit() {
   HLOG(kInfo, "RuntimeManager::ClientInit");
   if (is_client_initialized_ || client_is_initializing_ ||
@@ -177,6 +181,9 @@ bool RuntimeManager::ClientInit() {
   // Set mode flags at the start
   is_client_mode_ = true;
   client_is_initializing_ = true;
+  // A wedged client (the FUSE daemon above all) needs inspecting as much as a
+  // wedged runtime; the allowance is opt-in by the same variable.
+  MaybeAllowPtrace();
 
   HLOG(kDebug, "IpcManager::ClientInit");
   // Initialize configuration manager
