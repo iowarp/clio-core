@@ -7098,7 +7098,17 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
         },
         ctp::priv::ForEachLock::kShared);
 
+    size_t snap_since_yield = 0;
     for (auto &kv : blob_snap) {
+      // Give the worker back every kSnapshotYieldEvery blobs: a snapshot of
+      // ~12k blobs ran 1-3 s straight on one worker every period, and the
+      // requests queued behind it (a filesystem home's Closes) waited for
+      // minutes (#1149). Yielding between blobs is safe: the loop already
+      // does whenever a blob's token is busy.
+      if (++snap_since_yield >= kSnapshotYieldEvery) {
+        snap_since_yield = 0;
+        CLIO_CO_AWAIT(clio::run::yield(0));
+      }
       const std::string &key = kv.first;
       BlobInfo &blob_info = *kv.second;
       // Same acquire pattern PutBlobImpl uses; reentrant and lost-wakeup-proof.
