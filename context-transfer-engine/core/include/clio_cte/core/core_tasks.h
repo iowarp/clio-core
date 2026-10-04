@@ -1170,6 +1170,14 @@ struct BlobInfo {
   // RecomputeTotalSize()). Without it, a file built by millions of tiny
   // O_APPEND writes pays an O(blocks) sum on every put -> O(N^2) (generic/069).
   clio::run::u64 total_size_cache_;
+  // Bytes a restart LOST (#1163): blocks that lived on a volatile tier are
+  // gone when the node comes back, and so is everything the blob held after
+  // the first of them (a later block cannot keep its logical offset once an
+  // earlier one is missing). Restore truncates blocks_ at that point and
+  // records the lost range here as [GetTotalSize(), GetTotalSize() +
+  // lost_bytes_). A read into it is an error, not zeros; a put that rewrites
+  // it from the front shrinks it (NoteWritten). Runtime-only, not persisted.
+  clio::run::u64 lost_bytes_ = 0;
   // Monotonic counter bumped by EVERY mutation of blocks_ (issue #817). It is
   // copied into ShmBlobRecord::placement_gen_, which a client reads before and
   // after copying a payload out of shared memory: if it moved, the bytes may
@@ -1385,6 +1393,7 @@ struct BlobInfo {
         write_owner_(0),  // a fresh copy is unlocked; never inherit lock state
         read_state_(0),  // ...and has no readers pinned
         total_size_cache_(other.total_size_cache_),
+        lost_bytes_(other.lost_bytes_),
         placement_gen_(other.placement_gen_),
         content_seq_(other.content_seq_) {
     prealloc_lock_.Init();
@@ -1408,6 +1417,7 @@ struct BlobInfo {
       trace_key_ = other.trace_key_;
       preallocated_size_ = other.preallocated_size_;
       total_size_cache_ = other.total_size_cache_;
+      lost_bytes_ = other.lost_bytes_;
       placement_gen_ = other.placement_gen_;
       content_seq_ = other.content_seq_;
     }
@@ -1452,6 +1462,43 @@ struct BlobInfo {
   // restore) -- these are cold paths where the O(blocks) recompute is fine.
   CTP_CROSS_FUN void RecomputeTotalSize() {
     total_size_cache_ = ComputeTotalSizeSlow();
+  }
+
+  /**
+   * Whether a read of [offset, offset+size) touches bytes a restart lost.
+   * @param offset first byte of the read
+   * @param size bytes read
+   * @return true when the range overlaps the lost range
+   */
+  CTP_CROSS_FUN bool ReadTouchesLost(clio::run::u64 offset,
+                                     clio::run::u64 size) const {
+    if (lost_bytes_ == 0 || size == 0) return false;
+    const clio::run::u64 lost_from = total_size_cache_;
+    return offset < lost_from + lost_bytes_ && offset + size > lost_from;
+  }
+
+  /**
+   * A put landed on [offset, offset+size): whatever it rewrote of the lost
+   * range (from its front) is no longer lost. Call after the blocks are in
+   * place and the size cache is current.
+   * @param offset first byte written
+   * @param size bytes written
+   */
+  CTP_CROSS_FUN void NoteWritten(clio::run::u64 offset, clio::run::u64 size) {
+    if (lost_bytes_ == 0) return;
+    // The write extended the blob through (part of) the lost range: the new
+    // size is where the loss now starts; what the write covered is gone.
+    const clio::run::u64 end = offset + size;
+    const clio::run::u64 old_lost_end = total_size_cache_ + lost_bytes_;
+    if (end >= old_lost_end) {
+      lost_bytes_ = 0;
+    } else if (end > total_size_cache_) {
+      lost_bytes_ = old_lost_end - end;
+    } else if (total_size_cache_ >= old_lost_end) {
+      lost_bytes_ = 0;  // the blob grew past the whole lost range
+    } else {
+      lost_bytes_ = old_lost_end - total_size_cache_;
+    }
   }
 
   // O(1) total size. Returns the maintained cache; a debug/sanitizer build

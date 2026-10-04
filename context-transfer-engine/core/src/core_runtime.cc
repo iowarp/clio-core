@@ -2605,6 +2605,10 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
     }
 
+    // Under the write token, with the blocks placed and the size current:
+    // what this put rewrote of a range a restart lost is no longer lost.
+    blob_info_ptr->NoteWritten(offset, size);
+
     {
       const auto pi_t3 = std::chrono::steady_clock::now();
       auto us = [](auto a, auto b) {
@@ -3423,9 +3427,37 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       // create_on_get_: a blob with no bytes yet is not an error. The caller
       // asked to treat "nothing stored" as readable -- it owns whatever is in
       // its buffer and will overwrite it. Report success, copy nothing.
-      task->return_code_ = task->context_.create_on_get_ ? 0 : 1;
+      // A primary emptied by a restart (#1163) is not "nothing stored": its
+      // bytes existed and are gone, so an ordinary read gets the I/O error
+      // that sends the replication layer to a copy.
+      if (task->context_.create_on_get_) {
+        task->return_code_ = 0;
+      } else if (replica_sel == 0 && blob_info_ptr->lost_bytes_ != 0) {
+        task->return_code_ = kGetBlobIoErrorRc;
+      } else {
+        task->return_code_ = 1;
+      }
       clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
+    }
+    if (replica_sel == 0 && !task->context_.create_on_get_ &&
+        blob_info_ptr->ReadTouchesLost(offset, size)) {
+      // The range includes bytes a restart lost (#1163): fail the read as an
+      // I/O error -- the same code an unreadable device yields -- so the
+      // replication layer serves it from a copy and a bare client gets EIO,
+      // not zeros inside its fsynced file.
+      static std::atomic<clio::run::u64> lost_reads{0};
+      const clio::run::u64 nlost = lost_reads.fetch_add(1) + 1;
+      if (nlost <= 20 || (nlost & (nlost - 1)) == 0) {
+        HLOG(kWarning, "GetBlob: read #{} into bytes lost at a restart: blob "
+             "'{}' ({}.{}) asked [{}, {}), {} byte(s) kept, {} lost",
+             nlost, blob_name, tag_id.major_, tag_id.minor_, offset,
+             offset + size, blob_info_ptr->GetTotalSize(),
+             blob_info_ptr->lost_bytes_);
+      }
+      task->return_code_ = kGetBlobIoErrorRc;
+      clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
+      CLIO_CO_RETURN;
     }
     if (replica_sel == 0 && blob_info_ptr->GetTotalSize() < offset + size) {
       // A read past the blob's current size is served short and the caller
@@ -7883,6 +7915,8 @@ clio::run::TaskResume Runtime::SyncTagDevices(
 }
 
 void Runtime::RestoreMetadataFromLog() {
+  restore_lost_blobs_ = 0;
+  restore_lost_bytes_ = 0;
   const std::string &log_path = config_.performance_.metadata_log_path_;
   if (log_path.empty()) {
     HLOG(kInfo, "RestoreMetadataFromLog: No metadata log path configured");
@@ -8065,6 +8099,7 @@ void Runtime::RestoreMetadataFromLog() {
       }
 
       size_t snap_volatile_dropped = 0;
+      clio::run::u64 snap_lost_bytes = 0;
       BlobInfo blob_info;
       blob_info.blob_name_ = blob_name;
       blob_info.score_ = score;
@@ -8111,9 +8146,12 @@ void Runtime::RestoreMetadataFromLog() {
             is_volatile = true;
           }
         }
-        if (is_volatile) {
-          ++snap_volatile_dropped;
-          continue;  // Volatile data is lost on restart
+        if (is_volatile) ++snap_volatile_dropped;
+        if (is_volatile || snap_lost_bytes != 0) {
+          // Lost on restart, and so is every block after it (#1163). The
+          // record is still consumed so the stream stays aligned.
+          snap_lost_bytes += size;
+          continue;
         }
 
         // Reconstruct block
@@ -8126,11 +8164,13 @@ void Runtime::RestoreMetadataFromLog() {
       // post-restart reads/rebuilds see empty blobs. The WAL-replay path
       // below already did this; the snapshot path forgot.
       blob_info.RecomputeTotalSize();
-      if (snap_volatile_dropped != 0) {
-        // As in WAL replay: say what a restart lost (#1147).
-        HLOG(kWarning, "Metadata restore: blob {} lost {} volatile block(s); "
-             "it is now {} byte(s)", composite_key, snap_volatile_dropped,
-             blob_info.GetTotalSize());
+      blob_info.lost_bytes_ = snap_lost_bytes;
+      if (snap_lost_bytes != 0) {
+        // As in WAL replay: what a restart lost (#1147, #1163), summarized.
+        NoteRestoreLoss(snap_lost_bytes);
+        HLOG(kDebug, "Metadata restore: blob {} lost {} volatile block(s), {} "
+             "byte(s) after offset {}", composite_key, snap_volatile_dropped,
+             snap_lost_bytes, blob_info.GetTotalSize());
       }
 
       tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
@@ -8237,9 +8277,25 @@ void Runtime::RestoreMetadataFromLog() {
 
   HLOG(kInfo, "RestoreMetadataFromLog: Restored {} tags and {} blobs from {}",
        tags_restored, blobs_restored, log_path);
+  LogRestoreLoss("Metadata restore");
+}
+
+void Runtime::LogRestoreLoss(const char *what) {
+  if (restore_lost_blobs_ == 0) return;
+  // Reads into these bytes fail (kGetBlobIoErrorRc) until a put or a
+  // replica heal rewrites them; the replication layer serves them from a
+  // copy meanwhile (#1161).
+  HLOG(kWarning, "{}: {} blob(s) lost {} byte(s) that lived on a volatile "
+       "tier when this node went down; reads into them fail until they are "
+       "rewritten or healed from a copy",
+       what, restore_lost_blobs_, restore_lost_bytes_);
+  restore_lost_blobs_ = 0;
+  restore_lost_bytes_ = 0;
 }
 
 void Runtime::ReplayTransactionLogs() {
+  restore_lost_blobs_ = 0;
+  restore_lost_bytes_ = 0;
   const std::string &log_path = config_.performance_.metadata_log_path_;
   if (log_path.empty()) return;
 
@@ -8393,6 +8449,7 @@ void Runtime::ReplayTransactionLogs() {
 
   HLOG(kInfo, "ReplayTransactionLogs: Replayed {} tag ops and {} blob ops",
        tags_replayed, blobs_replayed);
+  LogRestoreLoss("WAL replay");
 }
 
 void Runtime::DiscardPersistentMetadata() {
@@ -8601,9 +8658,13 @@ void Runtime::ApplyWalExtendBlob(const std::vector<char> &payload,
     // Replace blocks with replayed blocks (full replacement semantics)
     blob_info_ptr->blocks_.clear();
     size_t volatile_dropped = 0;
+    clio::run::u64 lost_bytes = 0;
     for (const auto &tb : txn.new_blocks_) {
       clio::run::PoolId bdev_pool_id(tb.bdev_major_, tb.bdev_minor_);
-      // Filter volatile targets (matching RestoreMetadataFromLog)
+      // A block on a volatile target did not survive the restart -- and
+      // neither did the blob's layout past it: a later block cannot keep
+      // its logical offset with an earlier one missing (#1163). Keep the
+      // prefix, count the rest as lost.
       bool is_volatile = false;
       {
         clio::run::ScopedCoRwReadLock read_lock(target_lock_);
@@ -8613,8 +8674,9 @@ void Runtime::ApplyWalExtendBlob(const std::vector<char> &payload,
           is_volatile = true;
         }
       }
-      if (is_volatile) {
-        ++volatile_dropped;
+      if (is_volatile) ++volatile_dropped;
+      if (is_volatile || lost_bytes != 0) {
+        lost_bytes += tb.size_;
         continue;
       }
       clio::run::bdev::Client bdev_client(bdev_pool_id);
@@ -8623,13 +8685,15 @@ void Runtime::ApplyWalExtendBlob(const std::vector<char> &payload,
       blob_info_ptr->blocks_.push_back(block);
     }
     blob_info_ptr->RecomputeTotalSize();  // blocks_ rebuilt: resync cache
-    if (volatile_dropped != 0) {
+    blob_info_ptr->lost_bytes_ = lost_bytes;
+    if (lost_bytes != 0) {
       // Part (or all) of the blob lived on a volatile tier: it comes back
-      // SHORT or EMPTY. Not silent: this is how fsynced data that was moved
-      // onto RAM showed up as a page missing its tail (#1124) -- or, every
-      // block volatile, as a whole page of zeros (#1147).
-      HLOG(kWarning, "WAL replay: blob {} lost {} volatile block(s); it is "
-           "now {} byte(s)", composite_key, volatile_dropped,
+      // SHORT or EMPTY, and reads into the lost range fail rather than
+      // zero-fill (#1124, #1147, #1163). One line per replay says how much;
+      // the per-blob detail is debug.
+      NoteRestoreLoss(lost_bytes);
+      HLOG(kDebug, "WAL replay: blob {} lost {} volatile block(s), {} byte(s) "
+           "after offset {}", composite_key, volatile_dropped, lost_bytes,
            blob_info_ptr->GetTotalSize());
     }
   }

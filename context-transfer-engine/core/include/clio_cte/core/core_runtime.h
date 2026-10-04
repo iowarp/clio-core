@@ -267,6 +267,25 @@ public:
   /** A PutBlob slower than this (ms) logs its per-phase times. */
   static constexpr double kSlowPutMs = 2000.0;
 
+  /**
+   * Count a blob whose bytes a restore could not bring back (#1163); the
+   * total is logged once per restore by LogRestoreLoss.
+   * @param bytes the blob's lost bytes
+   */
+  void NoteRestoreLoss(clio::run::u64 bytes) {
+    ++restore_lost_blobs_;
+    restore_lost_bytes_ += bytes;
+  }
+
+  /**
+   * Log the loss counted since the restore began, once, and reset it.
+   * @param what the restore path, for the message
+   */
+  void LogRestoreLoss(const char *what);
+
+  clio::run::u64 restore_lost_blobs_ = 0; /**< blobs short after a restore */
+  clio::run::u64 restore_lost_bytes_ = 0; /**< their lost bytes */
+
   /** Score bands a reorganize no-room backoff is tracked per. */
   static constexpr size_t kReorgBands = 10;
   /** How long moves into a band that just found no room fail fast (ms). */
