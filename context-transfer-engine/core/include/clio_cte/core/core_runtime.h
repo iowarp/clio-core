@@ -264,6 +264,9 @@ public:
   /** Blobs FlushMetadata serializes between yields to its worker. */
   static constexpr size_t kSnapshotYieldEvery = 256;
 
+  /** A PutBlob slower than this (ms) logs its per-phase times. */
+  static constexpr double kSlowPutMs = 2000.0;
+
   /** Score bands a reorganize no-room backoff is tracked per. */
   static constexpr size_t kReorgBands = 10;
   /** How long moves into a band that just found no room fail fast (ms). */

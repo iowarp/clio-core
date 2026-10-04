@@ -2605,15 +2605,31 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
     }
 
-    if (put_prof) {
+    {
       const auto pi_t3 = std::chrono::steady_clock::now();
       auto us = [](auto a, auto b) {
         return (long long) std::chrono::duration_cast<
             std::chrono::microseconds>(b - a).count();
       };
-      fprintf(stderr, "[pimp] tok_us=%lld pre_us=%lld ext_us=%lld mod_us=%lld\n",
-              us(pi_t0, pi_t1), us(pi_t1, pi_t2), us(pi_ext0, pi_ext1),
-              us(pi_t2, pi_t3));
+      if (put_prof) {
+        fprintf(stderr, "[pimp] tok_us=%lld pre_us=%lld ext_us=%lld mod_us=%lld\n",
+                us(pi_t0, pi_t1), us(pi_t1, pi_t2), us(pi_ext0, pi_ext1),
+                us(pi_t2, pi_t3));
+      }
+      // Where a slow put spent its time: waiting for the blob's write token
+      // (another put or a MoveBlobToPersistent holds it), the pre-placement
+      // checks, placing the bytes (ExtendBlob, with its make-room eviction),
+      // or the write + WAL. Under tier overflow the inode-record stores of
+      // #1149 took 6-7 s each; this tells which phase.
+      const double put_ms = us(pi_t0, pi_t3) / 1000.0;
+      if (put_ms > kSlowPutMs) {
+        HLOG(kWarning,
+             "[SLOW-PUT] blob='{}' off={} size={} took {} ms: token {} ms, "
+             "pre {} ms, extend {} ms, modify {} ms",
+             blob_name, offset, size, put_ms, us(pi_t0, pi_t1) / 1000.0,
+             us(pi_t1, pi_t2) / 1000.0, us(pi_ext0, pi_ext1) / 1000.0,
+             us(pi_t2, pi_t3) / 1000.0);
+      }
     }
 
     // Write-through (issue #886): Context::replica_ == kAllReplicas repeats
