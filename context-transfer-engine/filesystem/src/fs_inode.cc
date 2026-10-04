@@ -105,6 +105,11 @@ bool Runtime::StoreBackingOff(clio::run::u64 packed, clio::run::u64 since) {
   return SteadyMs() < fit->second + kInodeStoreRetryMs;
 }
 
+bool Runtime::DirtiedAfterLocked(clio::run::u64 packed, clio::run::u64 since) {
+  auto sit = inode_dirty_seq_.find(packed);
+  return sit != inode_dirty_seq_.end() && sit->second > since;
+}
+
 bool Runtime::IsDying(clio::run::u64 packed) {
   std::lock_guard<std::mutex> g(meta_mu_);
   return dying_.count(packed) != 0;
@@ -210,6 +215,13 @@ clio::run::TaskResume Runtime::FlushInodes(int *err, clio::run::u64 since) {
         const clio::run::u64 packed = *it;
         if (failed.count(packed) != 0) {
           ++it;  // a later flush retries it
+          continue;
+        }
+        if (since != 0 && !DirtiedAfterLocked(packed, since)) {
+          // Another operation's change: that operation stores it (or the
+          // periodic drain does). Storing or waiting on it here made every
+          // Close on this container queue behind one slow store (#1149).
+          ++it;
           continue;
         }
         if (inode_storing_.count(packed) != 0) {

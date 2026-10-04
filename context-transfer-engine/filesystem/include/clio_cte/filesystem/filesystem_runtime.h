@@ -928,11 +928,12 @@ class Runtime : public clio::run::Container {
    * @param err out (optional): 0, or the errno of the first record dirtied
    *        after @p since that could not be stored (ENOSPC for a full
    *        store, else EIO)
-   * @param since DirtySeq() when the caller started its change: a record
-   *        dirtied earlier and still failing is another operation's change,
-   *        already reported to it, and does not fail this one (one record
-   *        stuck on a full store failed every unlink on its container, so
-   *        no space could ever be freed)
+   * @param since DirtySeq() when the caller started its change; 0 flushes
+   *        every dirty record (the periodic drain). Otherwise only records
+   *        dirtied after it are stored, waited on and reported: an earlier
+   *        record is another operation's change (one record stuck on a full
+   *        store failed every unlink on its container, #1151, and one slow
+   *        store made every Close queue behind it, #1149)
    */
   clio::run::TaskResume FlushInodes(int *err = nullptr,
                                     clio::run::u64 since = 0);
@@ -952,6 +953,14 @@ class Runtime : public clio::run::Container {
    * @return true while the inode is between drop and purge
    */
   bool IsDying(clio::run::u64 packed);
+  /**
+   * Whether an inode's latest change came after a caller's DirtySeq()
+   * (meta_mu_ held).
+   * @param packed inode id
+   * @param since the caller's DirtySeq() when it started
+   * @return true when the inode was dirtied after `since`
+   */
+  bool DirtiedAfterLocked(clio::run::u64 packed, clio::run::u64 since);
   /** Inodes dropped and queued for purge, until the purge ran (meta_mu_). */
   std::unordered_set<clio::run::u64> dying_;
   /**
