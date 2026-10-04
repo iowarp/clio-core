@@ -1,0 +1,137 @@
+{
+  "name": "NeuroPress v2 (model B)",
+  "format": {
+    "file": "model_v2.nnwt",
+    "magic": "0x4E4E5754",
+    "version": 3,
+    "layout": "u32 magic, u32 version, u32 n_layers, u32 dims[n_layers+1], u32 feature_set, u32 outputs_per_setting, u32 n_settings, u32 table_bytes, settings table ('\\n'-separated specs), f32 x_mean[in], x_std[in], y_mean[out], y_std[out], per layer f32 W[out][in] row-major then f32 b[out]; little-endian",
+    "feature_set": 1
+  },
+  "architecture": {
+    "dims": [
+      4,
+      64,
+      64,
+      64,
+      64,
+      135
+    ],
+    "hidden_activation": "ReLU",
+    "output": "linear",
+    "params": 21575
+  },
+  "inputs": {
+    "features": [
+      "log2(chunk bytes)",
+      "Shannon entropy of the chunk's bytes, bits/byte (0-8)",
+      "log10(mean |x - mean(x)| / (max(x) - min(x)) + 1e-12), x as float32 values in float64; range 0 -> 1",
+      "log10(mean |x[i+2] - 2 x[i+1] + x[i]| / (max(x) - min(x)) + 1e-12); range 0 -> 1"
+    ],
+    "normalise": "x_norm = (x - x_mean) / x_std, then the network"
+  },
+  "outputs": {
+    "denormalise": "y = y_norm * y_std + y_mean",
+    "order": "setting s -> outputs 3s, 3s+1, 3s+2",
+    "per_setting": [
+      "ln(compress ms)",
+      "ln(decompress ms)",
+      "ln(compression ratio)"
+    ],
+    "inverse": "exp(y)",
+    "times": "GPU kernel time (CUDA events), median of 3 reps, byte/bit shuffle and un-shuffle included",
+    "settings": [
+      "ans",
+      "ans shuffle=bit",
+      "ans shuffle=byte",
+      "ans type=float16",
+      "bitcomp algo=1 shuffle=bit type=char",
+      "bitcomp algo=1 shuffle=byte type=char",
+      "bitcomp algo=1 type=char",
+      "bitcomp shuffle=bit type=int",
+      "bitcomp shuffle=byte type=int",
+      "bitcomp type=int",
+      "cascaded bp=1 delta=0 rle=0 shuffle=bit type=int",
+      "cascaded bp=1 delta=0 rle=0 shuffle=byte type=int",
+      "cascaded bp=1 delta=0 rle=0 type=int",
+      "cascaded bp=1 delta=0 rle=1 shuffle=bit type=int",
+      "cascaded bp=1 delta=0 rle=1 shuffle=byte type=int",
+      "cascaded bp=1 delta=0 rle=1 type=int",
+      "deflate level=1",
+      "deflate level=1 shuffle=bit",
+      "deflate level=1 shuffle=byte",
+      "gdeflate level=1",
+      "gdeflate level=1 shuffle=bit",
+      "gdeflate level=1 shuffle=byte",
+      "gpulz",
+      "gpulz shuffle=bit",
+      "gpulz shuffle=byte",
+      "lz4",
+      "lz4 bitshuffle=msb type=int",
+      "lz4 shuffle=bit",
+      "lz4 shuffle=byte",
+      "ndzip",
+      "ndzip shuffle=bit",
+      "ndzip shuffle=byte",
+      "snappy",
+      "snappy shuffle=bit",
+      "snappy shuffle=byte",
+      "spratio",
+      "spratio shuffle=bit",
+      "spratio shuffle=byte",
+      "spspeed",
+      "spspeed shuffle=bit",
+      "spspeed shuffle=byte",
+      "store",
+      "zstd",
+      "zstd shuffle=bit",
+      "zstd shuffle=byte"
+    ]
+  },
+  "training": {
+    "data": "/mnt/nvme0/corpus-sweep/corpus_v2.csv",
+    "files": 9800,
+    "rows": 441000,
+    "dtype": "float32, synthetic NeuroPress corpus (9800 files, 16 KiB-4 MiB)",
+    "optimizer": "Adam lr 1e-3, MSE on standardised log targets",
+    "batch": 256,
+    "epochs": 1540,
+    "seed": 0,
+    "train_ms": 150802.01412999304,
+    "gpu": "NVIDIA A100-PCIE-40GB"
+  },
+  "accuracy": {
+    "cv_5fold_mape": {
+      "comp_time": {
+        "mean": 0.079900363813287,
+        "std": 0.004126663071206629,
+        "median_ape": 0.03578258743618258
+      },
+      "decomp_time": {
+        "mean": 0.08132948339638983,
+        "std": 0.0033324599036910012,
+        "median_ape": 0.0403867507972819
+      },
+      "ratio": {
+        "mean": 0.10094546129319903,
+        "std": 0.002806388423573178,
+        "median_ape": 0.04756808989382928
+      }
+    },
+    "cv_best_epochs": [
+      1376,
+      2043,
+      799,
+      1539,
+      1826
+    ],
+    "in_sample_mape": {
+      "comp_time": 0.07434529283837706,
+      "decomp_time": 0.07648709419892542,
+      "ratio": 0.09004452487930736
+    },
+    "note": "CV values are the expected accuracy on unseen data; in-sample values are on the training data itself"
+  },
+  "verify": {
+    "numpy_vs_torch_max_abs_diff_log": 1.2633288241081786e-05
+  }
+}

@@ -5,6 +5,9 @@
                         [--files FILES.txt] [--settings SETTINGS.txt]
                         [--ref benchmark_results_600k.csv]
 
+Values are written unrounded, exactly as measured or computed: no floor,
+cap, clamp or rounding is applied to any time, size, ratio or statistic.
+
 Columns: the 600k CSV's, in its order, with `settings` after `algorithm`, no
 `lib_throughput_mbps` (always 0 there), and four added at the end:
 `comp_wall_ms`, `decomp_wall_ms`, `reps` and `note`.
@@ -25,8 +28,11 @@ How each value is defined:
   mad, second_derivative            mean |x - mean| and mean |x[i+2] - 2x[i+1]
                                     + x[i]|, divided by (max - min), as the
                                     600k CSV stores them
-  shuffle / quantization / error_bound   0 / none / 0: no preprocessing,
-                                    lossless only
+  shuffle / shuffle_elem            the setting's shuffle (none / byte / bit)
+                                    and its element bytes (0 none, 2/4/8 byte,
+                                    4 bit: 32-bit words); part of comp/decomp
+                                    time
+  quantization / error_bound        none / 0: lossless only
 
 Checks (exit 1 on any failure): every (file, setting) appears exactly once,
 every listed file x every listed setting is present, original_size equals the
@@ -118,6 +124,20 @@ def check_coverage(raw, files, settings):
     return probs
 
 
+def shuffle_of(settings):
+    """Shuffle of a setting string, as gpu_codecs.cuh MakeCodec reads it.
+
+    @param settings  the setting's key=value tokens, e.g. "shuffle=byte elem=8"
+    @return (shuffle, element bytes): ("none", 0), ("byte", 2|4|8 [4]) or
+            ("bit", 4)
+    """
+    kv = dict(t.split('=', 1) for t in settings.split() if '=' in t)
+    mode = kv.get('shuffle', 'none')
+    if mode == 'byte':
+        return mode, int(kv.get('elem', 4))
+    return mode, 4 if mode == 'bit' else 0
+
+
 def fmt_num(x):
     """@return x the way the 600k CSV writes grid values (0.325, 1, 16)."""
     return f"{x:g}"
@@ -137,6 +157,7 @@ def build(raw, st):
         r'^(compress failed|decompress failed|exception|setup|unknown|size not)')
     ratio = np.where(d['comp_bytes'] > 0, d['bytes'] / d['comp_bytes'].where(
         d['comp_bytes'] > 0), np.nan)
+    sh = d['settings'].fillna('').map(shuffle_of)
     sec_c = d['comp_ms'] / 1e3
     sec_d = d['decomp_ms'] / 1e3
     out = pd.DataFrame({
@@ -148,24 +169,25 @@ def build(raw, st):
         'fill_mode': meta['fill'],
         'algorithm': d['algorithm'],
         'settings': d['settings'].fillna(''),
-        'shuffle': 0,
+        'shuffle': sh.str[0],
+        'shuffle_elem': sh.str[1],
         'quantization': 'none',
         'error_bound': 0,
         'original_size': d['bytes'],
         'compressed_size': d['comp_bytes'],
-        'compression_ratio': np.round(ratio, 6),
+        'compression_ratio': ratio,
         'compression_time_ms': d['comp_ms'],
         'decompression_time_ms': d['decomp_ms'],
         'compression_throughput_mbps':
-            np.round(np.where(sec_c > 0, d['bytes'] / MIB / sec_c.where(sec_c > 0), np.nan), 4),
+            np.where(sec_c > 0, d['bytes'] / MIB / sec_c.where(sec_c > 0), np.nan),
         'decompression_throughput_mbps':
-            np.round(np.where(sec_d > 0, d['bytes'] / MIB / sec_d.where(sec_d > 0), np.nan), 4),
+            np.where(sec_d > 0, d['bytes'] / MIB / sec_d.where(sec_d > 0), np.nan),
         'psnr_db': np.where(ok, math.inf, np.nan),
         'max_error': np.where(ok, 0.0, np.nan),
         'rmse': np.where(ok, 0.0, np.nan),
-        'entropy': np.round(d['entropy'], 6),
-        'mad': np.round(d['mad'], 6),
-        'second_derivative': np.round(d['second_derivative'], 6),
+        'entropy': d['entropy'],
+        'mad': d['mad'],
+        'second_derivative': d['second_derivative'],
         'exact_match': ok,
         'success': ~fail_codec & (ok | d['note'].eq('output differs')),
         'comp_wall_ms': d['comp_wall_ms'],
@@ -219,7 +241,7 @@ def main():
     if out['palette'].isna().any():
         probs.append("file names that do not parse")
 
-    out.to_csv(a.out, index=False)
+    out.to_csv(a.out, index=False, float_format='%.17g')  # exact float64 round trip
     n_ok = int(out['exact_match'].sum())
     print(f"wrote {a.out}: {len(out)} rows, {out['file'].nunique()} files, "
           f"{(out['algorithm'] + ' ' + out['settings']).nunique()} settings, "
