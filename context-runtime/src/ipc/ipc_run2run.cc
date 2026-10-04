@@ -371,6 +371,16 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
   // (ScanSendMapTimeouts) needs it for all routing modes. Admin-pool origins
   // are registered but NOT probe-eligible: QueryTaskProgress is itself an
   // admin cross-node task, so probing them would recurse (issue #896).
+  if (origin_task->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
+    // No response is coming (the executor's EndTask skips SendOut for these),
+    // so nothing may wait for one: no progress probes, and the origin is
+    // finished now, exactly as a locally executed fire-and-forget task is.
+    // Tracked like a normal task, every detached remote close left a
+    // send_map_ entry here and a recv_map_ entry at the executor forever,
+    // which the hang watches then reported as stuck (#1149).
+    RecvOutCompleteOriginTask(send_map_key, origin_task);
+    return;
+  }
   RegisterOriginProgress(send_map_key, replica_targets,
                          /*probe_eligible=*/
                          !(origin_task->pool_id_ == clio::run::kAdminPoolId));
@@ -486,6 +496,7 @@ void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_ta
     return;
   }
 
+  NoteResponseAge(origin_task, "send");
   int rc = SendOutTransmit(ipc_manager, origin_task,
                            target_node_id, target_host);
   // The replica stays visible to QueryTaskProgress until its response has
@@ -571,10 +582,14 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   // serialized TASK_PERIODIC flag needs resetting on receive.
   task_ptr->ClearFlags(TASK_PERIODIC);
 
-  size_t recv_key =
-      task_ptr->task_id_.net_key_ ^
-      (static_cast<size_t>(task_ptr->task_id_.replica_id_) * 0x9e3779b97f4a7c15ULL);
-  {
+  // A fire-and-forget task is never answered (EndTask skips SendOut), so it
+  // must not be recorded as awaiting a response: the record would never be
+  // erased, and the hang watch reported every such task at 60 s (#1149).
+  if (!task_ptr->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
+    size_t recv_key =
+        task_ptr->task_id_.net_key_ ^
+        (static_cast<size_t>(task_ptr->task_id_.replica_id_) *
+         0x9e3779b97f4a7c15ULL);
     std::lock_guard<std::mutex> lk(recv_map_mutex_);
     recv_map_[recv_key] = task_ptr;
     recv_since_[recv_key] = std::chrono::steady_clock::now();
@@ -1030,9 +1045,47 @@ void IpcManagerRun2Run::EraseRecvEntry(
   const size_t recv_key =
       task->task_id_.net_key_ ^
       (static_cast<size_t>(task->task_id_.replica_id_) * 0x9e3779b97f4a7c15ULL);
-  std::lock_guard<std::mutex> lk(recv_map_mutex_);
-  recv_map_.erase(recv_key);
-  recv_since_.erase(recv_key);
+  bool missed = false;
+  {
+    std::lock_guard<std::mutex> lk(recv_map_mutex_);
+    missed = recv_map_.find(recv_key) == nullptr;
+    recv_map_.erase(recv_key);
+    recv_since_.erase(recv_key);
+  }
+  if (missed) {
+    // A response whose receive record is gone (or was never keyed this way)
+    // leaves the record behind: the hang watch then reports a task that
+    // was in fact answered (#1149). Say so, once per 64.
+    const clio::run::u64 n = recv_erase_misses_.fetch_add(1) + 1;
+    if (n % 64 == 1) {
+      HLOG(kWarning, "[RecvMap] response for task {} (pool {}, method {}, "
+           "flags {}) had no receive record ({} such so far)",
+           task->task_id_, task->pool_id_, task->method_,
+           static_cast<clio::run::u32>(task->task_flags_.bits_), n);
+    }
+  }
+}
+
+void IpcManagerRun2Run::NoteResponseAge(
+    const clio::run::shared_ptr<clio::run::Task> &task, const char *step) {
+  if (task.IsNull()) return;
+  const size_t recv_key =
+      task->task_id_.net_key_ ^
+      (static_cast<size_t>(task->task_id_.replica_id_) * 0x9e3779b97f4a7c15ULL);
+  double age_ms = 0;
+  {
+    std::lock_guard<std::mutex> lk(recv_map_mutex_);
+    auto it = recv_since_.find(recv_key);
+    if (it == recv_since_.end()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (it->second > now) return;  // already reported by the hang watch
+    age_ms = std::chrono::duration<double, std::milli>(now - it->second).count();
+  }
+  if (age_ms >= kSlowResponseMs) {
+    HLOG(kWarning, "[SLOW-RESPONSE] task {} (pool {}, method {}) at {}: {} ms "
+         "since it was received", task->task_id_, task->pool_id_,
+         task->method_, step, age_ms);
+  }
 }
 
 void IpcManagerRun2Run::ReportOldRecvTasks() {
@@ -1044,9 +1097,20 @@ void IpcManagerRun2Run::ReportOldRecvTasks() {
     if (age_s < 60.0) continue;
     auto *t = recv_map_.find(it->first);
     if (t != nullptr && !(*t).IsNull()) {
+      // Where it is held: never started (queued for a worker), running
+      // (suspended in its handler), or finished with its response not yet
+      // sent (the send path is the bottleneck) -- #1149.
+      const auto &rc = (*t)->run_ctx_;
+      const char *where = rc.get() == nullptr   ? "no run context"
+                          : !rc->IsStarted()     ? "not started"
+                          : (*t)->IsCoroCompleted() ? "finished, response unsent"
+                                                    : "running";
       HLOG(kError, "[HANGWATCH-RECV] holding received task {} (pool {}, "
-           "method {}) for {} s without a response", (*t)->task_id_,
-           (*t)->pool_id_, (*t)->method_, age_s);
+           "method {}, flags {}, return node {}) for {} s without a "
+           "response ({})", (*t)->task_id_, (*t)->pool_id_, (*t)->method_,
+           static_cast<clio::run::u32>((*t)->task_flags_.bits_),
+           (*t)->pool_query_.GetReturnNode(), age_s,
+           where);
     }
     // Once per task: push its stamp far into the future.
     it->second = now + std::chrono::hours(24 * 365);

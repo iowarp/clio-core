@@ -283,6 +283,16 @@ class IpcManagerRun2Run {
    * [HANGWATCH-REPLICA]. Each entry is reported once.
    */
   void ReportOldRecvTasks();
+  /**
+   * Log a remote task whose response is late at a given step (#1149): how
+   * long since this node received it, when that exceeds kSlowResponseMs.
+   * @param task the received task
+   * @param step where the caller is ("end-task" or "send")
+   */
+  void NoteResponseAge(const clio::run::shared_ptr<clio::run::Task> &task,
+                       const char *step);
+  /** Response age that NoteResponseAge reports (ms). */
+  static constexpr double kSlowResponseMs = 10000.0;
 
   /**
    * Stamp this runtime's node id and incarnation on an outgoing archive.
@@ -475,6 +485,8 @@ class IpcManagerRun2Run {
   static constexpr size_t kNumMapBuckets = 1024;
   mutable std::mutex send_map_mutex_;
   mutable std::mutex recv_map_mutex_;
+  /** Responses sent whose receive record was already gone (#1149). */
+  std::atomic<clio::run::u64> recv_erase_misses_{0};
   ctp::priv::unordered_map_ll<size_t, clio::run::shared_ptr<clio::run::Task>> send_map_;
   ctp::priv::unordered_map_ll<size_t, clio::run::shared_ptr<clio::run::Task>> recv_map_;
   // When each recv_map_ entry arrived (guarded by recv_map_mutex_), for
