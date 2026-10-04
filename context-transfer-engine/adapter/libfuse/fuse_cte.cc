@@ -115,6 +115,10 @@ static constexpr int kOpenVanishedErrno = ESTALE;
 #else
 static constexpr int kOpenVanishedErrno = ENOENT;
 #endif
+/** Re-sends of a page read that completed with the node-lost code. */
+static constexpr int kReadNodeLostRetries = 20;
+/** Pause between them (ms): node death is declared within ~10 s. */
+static constexpr int kReadNodeLostRetryMs = 500;
 
 using namespace clio::cae::fuse;
 
@@ -3011,16 +3015,28 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
       clio::run::u64 page_off = cur % clio::cte::filesystem::kFsPageSize;
       clio::run::u64 n = std::min<clio::run::u64>(
           clio::cte::filesystem::kFsPageSize - page_off, want - done);
-      auto g = cte->AsyncGetBlobDefer(
-          handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
-          buf + done);
-      g.Wait();
+      // A page sent to its owner just before the owner was declared dead
+      // completes with the node-lost code; sent again it routes to the
+      // stand-in, which serves it. Only after the retries is it EIO.
+      int grc = 0;
+      for (int attempt = 0;; ++attempt) {
+        auto g = cte->AsyncGetBlobDefer(
+            handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
+            buf + done);
+        g.Wait();
+        grc = static_cast<int>(g->GetReturnCode());
+        if (!clio::cte::core::IsNodeLostRc(static_cast<clio::run::u32>(grc)) ||
+            attempt >= kReadNodeLostRetries) {
+          break;
+        }
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kReadNodeLostRetryMs));
+      }
       // 0 = read, 1 = the page does not exist (a hole: the pre-zeroed
       // buffer is the right answer). Anything else -- above all the
       // network-timeout code a page on a DEAD node completes with -- is an
       // I/O error. Treating it as a hole returned zeros with success: a
       // reader got silently corrupted data while a node was down.
-      const int grc = static_cast<int>(g->GetReturnCode());
       if (grc != 0 && grc != 1) {
         return -EIO;
       }
