@@ -7686,6 +7686,14 @@ bool Runtime::HasBlocksBelowLevelLocked(
   return false;
 }
 
+bool Runtime::HasTierAtLevel(int level) {
+  clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+  for (const auto &t : target_list_) {
+    if (static_cast<int>(t.persistence_level_) >= level) return true;
+  }
+  return false;
+}
+
 clio::run::u64 Runtime::PersistentBudget(int level) {
   clio::run::u64 budget = 0;
   clio::run::ScopedCoRwReadLock read_lock(target_lock_);
@@ -7725,7 +7733,11 @@ clio::run::TaskResume Runtime::SyncTag(
   // that cannot fit fails the sync with ENOSPC. Stopping once the budget
   // reached 0 reported success with the remaining blobs still on RAM (#1147).
   clio::run::u64 budget = PersistentBudget(level);
-  for (size_t i = 0; i < names.size(); ++i) {
+  // No tier at that level at all (a RAM-only deployment): nothing to move
+  // to, and fsync means what it means on tmpfs. A full persistent tier is
+  // different: that fails the sync with ENOSPC below.
+  const size_t move_count = HasTierAtLevel(level) ? names.size() : 0;
+  for (size_t i = 0; i < move_count; ++i) {
     std::shared_ptr<BlobInfo> info = tag_blob_name_to_info_.get(prefix + names[i]);
     if (!info) continue;
     clio::run::u64 size = 0;

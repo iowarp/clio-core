@@ -346,6 +346,13 @@ public:
                                  int level);
 
   /**
+   * Whether any registered target is at or above a persistence level.
+   * @param level persistence level
+   * @return true if such a tier exists (full or not)
+   */
+  bool HasTierAtLevel(int level);
+
+  /**
    * Free bytes on every target at or above persistence `level`.
    * @param level persistence level
    * @return summed remaining space
