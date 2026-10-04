@@ -1032,6 +1032,8 @@ class Runtime : public clio::run::Container {
   /** How long a record whose store failed waits before another caller's
    *  flush retries it. */
   static constexpr clio::run::u64 kInodeStoreRetryMs = 1000;
+  /** A Close slower than this logs how long each of its phases took. */
+  static constexpr clio::run::u64 kSlowCloseMs = 5000;
   /** SteadyMs() of each dirty record's last failed store (meta_mu_). */
   std::unordered_map<clio::run::u64, clio::run::u64> inode_store_failed_ms_;
   /**

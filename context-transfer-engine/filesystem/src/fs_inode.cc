@@ -320,7 +320,9 @@ clio::run::TaskResume Runtime::FlushInodes(int *err, clio::run::u64 since) {
     }
     for (const InodeWork &w : work) {
       int src = 0;
+      const clio::run::u64 t_store = SteadyMs();
       CLIO_CO_AWAIT(StoreInodeRec(w.packed, w.rec, src));
+      const clio::run::u64 t_push = SteadyMs();
       std::vector<clio::run::u32> gone;
       if (!w.holders.empty()) {
         FsReq r;
@@ -334,6 +336,14 @@ clio::run::TaskResume Runtime::FlushInodes(int *err, clio::run::u64 since) {
           ls.push_back(lt == w.leases.end() ? 0 : lt->second);
         }
         CLIO_CO_AWAIT(PushToHolders(kShardInodePush, r, hs, ls, &gone));
+      }
+      {
+        const clio::run::u64 t_done = SteadyMs();
+        if (t_done - t_store >= kSlowCloseMs) {
+          HLOG(kWarning, "filesystem: inode {} record took {} ms to store "
+               "(rc {}) and {} ms to push to {} holder(s)", w.packed,
+               t_push - t_store, src, t_done - t_push, w.holders.size());
+        }
       }
       std::lock_guard<std::mutex> g(meta_mu_);
       inode_storing_.erase(w.packed);

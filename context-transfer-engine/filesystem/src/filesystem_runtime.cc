@@ -756,6 +756,10 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
   EnsurePurgeDrain();
   // Only a record this close dirties can fail it (see FlushInodes).
   const clio::run::u64 since = DirtySeq();
+  // Phase timing for slow closes (#1149: Closes held for minutes on one
+  // node while its workers sat idle).
+  const clio::run::u64 t_start = SteadyMs();
+  clio::run::u64 t_size = 0;
   std::shared_ptr<FileInfo> fi;
   {
     std::lock_guard<std::mutex> g(meta_mu_);
@@ -776,6 +780,7 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
     CLIO_CO_AWAIT(FileSizeOp(fi->tag_id_, clio::cte::stream::StreamSizeOp::kMax,
                              task->advance_size_, nullptr, nullptr, &rc));
   }
+  t_size = SteadyMs();
   {
     std::lock_guard<std::mutex> g(meta_mu_);
     if (fi->open_count_ > 0) fi->open_count_--;
@@ -790,6 +795,14 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
   }
   int ferr = 0;
   CLIO_CO_AWAIT(FlushInodes(&ferr, since));
+  {
+    const clio::run::u64 t_end = SteadyMs();
+    if (t_end - t_start >= kSlowCloseMs) {
+      HLOG(kWarning, "filesystem: Close of inode {} took {} ms (size update "
+           "{} ms, inode flush {} ms, rc {})", FsPack(fi->tag_id_),
+           t_end - t_start, t_size - t_start, t_end - t_size, ferr);
+    }
+  }
   task->return_code_ = static_cast<clio::run::u32>(ferr);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
