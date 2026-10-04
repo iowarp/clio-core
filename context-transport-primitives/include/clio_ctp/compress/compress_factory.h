@@ -75,6 +75,8 @@
 #include "gpulz.h"
 #endif
 
+#include "gpu_setting_codec.h"
+
 namespace ctp {
 
 /**
@@ -111,7 +113,9 @@ class CompressionFactory {
    *                                "ndzip" (GPU lossless float, if ndzip enabled)
    *                                "gpulz" (GPU lossless LZSS, if GPULZ enabled)
    *                                "cuszp" (GPU lossy float, if cuSZp enabled)
+   *                                "np-setting" (45 frozen GPU codec settings)
    * @param preset Compression preset level (FAST/BALANCED/BEST/DEFAULT)
+   *               For "np-setting", cast setting index (0-44) as preset
    * @return Unique pointer to configured compressor instance,
    *         or nullptr if library not found
    *
@@ -120,6 +124,10 @@ class CompressionFactory {
    *   if (compressor) {
    *     // Use compressor for compression
    *   }
+   *
+   *   // For GPU settings codec:
+   *   auto gpu_codec = CompressionFactory::GetPreset(
+   *       "np-setting", static_cast<CompressionPreset>(3));
    */
   static std::unique_ptr<Compressor> GetPreset(
       const std::string& library_name,
@@ -132,6 +140,23 @@ class CompressionFactory {
       return nullptr;
     }
     return info->make(preset);
+  }
+
+  /**
+   * Direct helper to get a GPU settings codec for a specific setting index.
+   *
+   * This is a convenience wrapper equivalent to:
+   *   GetPreset("np-setting", static_cast<CompressionPreset>(index))
+   *
+   * @param index Setting index (0-44)
+   * @return Unique pointer to GpuSettingCodec, or nullptr if index is invalid
+   *         or unavailable in this build
+   */
+  static std::unique_ptr<Compressor> GetGpuSetting(int index) {
+    if (index < 0 || index >= kGpuSettingCount) {
+      return nullptr;
+    }
+    return GetPreset("np-setting", static_cast<CompressionPreset>(index));
   }
 
   /**
@@ -472,6 +497,24 @@ class CompressionFactory {
     return nullptr;
 #endif
   }
+  // GPU Settings Codec: one of 45 frozen lossless GPU codec settings,
+  // selected by the NeuroPress v2 model. The preset value carries the
+  // setting index (0-44); returns nullptr when the index is invalid or
+  // unavailable in this build. Single-mode (no preset levels).
+  // Built into clio_ctp_compress_model only with CUDA, which also defines
+  // CTP_ENABLE_NEUROPRESS_GPU=1 for every consumer that links it.
+  static std::unique_ptr<Compressor> MakeGpuSetting(CompressionPreset preset) {
+#if CTP_ENABLE_NEUROPRESS_GPU
+    const int index = static_cast<int>(preset);
+    if (!GpuSettingAvailable(index)) {
+      return nullptr;
+    }
+    return std::make_unique<GpuSettingCodec>(index);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
   // cuSZp: GPU ultra-fast error-bounded LOSSY float compressor (single-kernel).
   // Multi-mode like cusz/the lossy CPU entries -- presets map to ABSOLUTE error
   // bounds (FAST=1e-2 loose, BALANCED=1e-3, BEST=1e-4 tight). Returns nullptr
@@ -530,6 +573,12 @@ class CompressionFactory {
         CompressorInfo{"nvcomp-cascaded", 21, 23, true, true, &MakeNvCompCascaded},
         CompressorInfo{"nvcomp-bitcomp",  22, 24, true, true, &MakeNvCompBitcomp},
         CompressorInfo{"gpulz",           23, 25, true, true, &MakeGpulz},
+        // GPU Settings Codec: frozen 45-setting index (0-44). For this codec,
+        // the preset value IS the setting index (not a standard preset level).
+        // Pass the desired setting index as CompressionPreset (cast from int).
+        // Example: GetPreset("np-setting", static_cast<CompressionPreset>(3))
+        // will create GpuSettingCodec(3).
+        CompressorInfo{"np-setting",      24, 26, true, true, &MakeGpuSetting},
     };
     return kRegistry;
   }

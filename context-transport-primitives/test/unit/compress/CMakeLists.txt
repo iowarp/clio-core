@@ -55,6 +55,20 @@ if(CLIO_CORE_ENABLE_CUDA)
     add_test(NAME ctp_lookahead_gpu COMMAND
             ${CMAKE_BINARY_DIR}/bin/test_lookahead_gpu_exec)
     set_tests_properties(ctp_lookahead_gpu PROPERTIES LABELS "gpu")
+
+    # NeuroPress v2 predictor: loading, host network vs the Python model,
+    # GPU features/ranking vs the host, online learning.
+    add_executable(test_neuropress_v2_exec
+            ${TEST_MAIN}/main.cc
+            test_init.cc
+            test_neuropress_v2.cc)
+    target_link_libraries(test_neuropress_v2_exec
+            clio_ctp_host ctp::compress CUDA::cudart Catch2::Catch2)
+    target_compile_definitions(test_neuropress_v2_exec PRIVATE
+            CLIO_CTP_NEUROPRESS_V2_WEIGHTS="${CLIO_CTP_ROOT}/src/compress/model/weights/v2")
+    add_test(NAME ctp_neuropress_v2 COMMAND
+            ${CMAKE_BINARY_DIR}/bin/test_neuropress_v2_exec)
+    set_tests_properties(ctp_neuropress_v2 PROPERTIES LABELS "gpu")
 endif()
 
 #------------------------------------------------------------------------------

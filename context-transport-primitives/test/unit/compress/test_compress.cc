@@ -231,10 +231,12 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::NameForWireId(20) == "cuszp");
     REQUIRE(CompressionFactory::NameForWireId(21) == "nvcomp-cascaded");
     REQUIRE(CompressionFactory::NameForWireId(22) == "nvcomp-bitcomp");
+    REQUIRE(CompressionFactory::NameForWireId(23) == "gpulz");
+    REQUIRE(CompressionFactory::NameForWireId(24) == "np-setting");
     // Out-of-range falls back to the historical default. (Registry rows are
     // build-independent, so the GPU names above resolve even without nvcomp.)
     REQUIRE(CompressionFactory::NameForWireId(-1) == "zstd");
-    REQUIRE(CompressionFactory::NameForWireId(23) == "zstd");
+    REQUIRE(CompressionFactory::NameForWireId(25) == "zstd");
     REQUIRE(CompressionFactory::NameForWireId(9999) == "zstd");
   }
 
@@ -709,3 +711,155 @@ TEST_CASE("TestCuszpGpu") {
   }
 }
 #endif  // CTP_ENABLE_CUSZP
+
+#if CTP_ENABLE_CUDA && CTP_ENABLE_NEUROPRESS_GPU
+#include <cuda_runtime.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "clio_ctp/compress/gpu_setting_codec.h"
+
+namespace {
+
+/** The frozen v2 setting table, as model_v2.nnwt stores it. */
+const char *const kExpectedSettings[] = {
+    "ans", "ans shuffle=bit", "ans shuffle=byte", "ans type=float16",
+    "bitcomp algo=1 shuffle=bit type=char",
+    "bitcomp algo=1 shuffle=byte type=char", "bitcomp algo=1 type=char",
+    "bitcomp shuffle=bit type=int", "bitcomp shuffle=byte type=int",
+    "bitcomp type=int",
+    "cascaded bp=1 delta=0 rle=0 shuffle=bit type=int",
+    "cascaded bp=1 delta=0 rle=0 shuffle=byte type=int",
+    "cascaded bp=1 delta=0 rle=0 type=int",
+    "cascaded bp=1 delta=0 rle=1 shuffle=bit type=int",
+    "cascaded bp=1 delta=0 rle=1 shuffle=byte type=int",
+    "cascaded bp=1 delta=0 rle=1 type=int", "deflate level=1",
+    "deflate level=1 shuffle=bit", "deflate level=1 shuffle=byte",
+    "gdeflate level=1", "gdeflate level=1 shuffle=bit",
+    "gdeflate level=1 shuffle=byte", "gpulz", "gpulz shuffle=bit",
+    "gpulz shuffle=byte", "lz4", "lz4 bitshuffle=msb type=int",
+    "lz4 shuffle=bit", "lz4 shuffle=byte", "ndzip", "ndzip shuffle=bit",
+    "ndzip shuffle=byte", "snappy", "snappy shuffle=bit",
+    "snappy shuffle=byte", "spratio", "spratio shuffle=bit",
+    "spratio shuffle=byte", "spspeed", "spspeed shuffle=bit",
+    "spspeed shuffle=byte", "store", "zstd", "zstd shuffle=bit",
+    "zstd shuffle=byte"};
+
+/**
+ * A float32 test field every setting can compress: a smooth sine with a
+ * little deterministic noise, then a run of zeros.
+ * @param n floats
+ */
+std::vector<float> SettingTestField(size_t n) {
+  std::vector<float> v(n);
+  for (size_t i = 0; i < n; ++i) {
+    const float sine = std::sin(static_cast<float>(i) * 0.001f) * 50.0f;
+    const float noise = static_cast<float>((i * 7919) % 101) * 0.01f;
+    v[i] = (i + 4096 > n) ? 0.0f : sine + noise;
+  }
+  return v;
+}
+
+/**
+ * Compress then decompress host data with one setting through device or host
+ * buffers, and require a bit-exact result.
+ * @return the compressed bytes
+ */
+std::vector<uint8_t> RoundTrip(int index, const std::vector<float> &orig,
+                               bool device) {
+  const size_t raw = orig.size() * sizeof(float);
+  auto codec = ctp::CompressionFactory::GetGpuSetting(index);
+  REQUIRE(codec != nullptr);
+  size_t cap = codec->MaxCompressedSize(raw);
+  REQUIRE(cap > 0);
+  std::vector<uint8_t> comp(cap);
+  std::vector<float> back(orig.size(), -1.0f);
+  size_t comp_size = cap;
+  size_t back_size = raw;
+  if (device) {
+    void *d_in = nullptr, *d_comp = nullptr, *d_out = nullptr;
+    REQUIRE(cudaMalloc(&d_in, raw) == cudaSuccess);
+    REQUIRE(cudaMalloc(&d_comp, cap) == cudaSuccess);
+    REQUIRE(cudaMalloc(&d_out, raw) == cudaSuccess);
+    REQUIRE(cudaMemcpy(d_in, orig.data(), raw, cudaMemcpyHostToDevice) ==
+            cudaSuccess);
+    REQUIRE(codec->Compress(d_comp, comp_size, d_in, raw));
+    REQUIRE(ctp::LastCodecKernelMs() >= 0.0);
+    REQUIRE(codec->Decompress(d_out, back_size, d_comp, comp_size));
+    REQUIRE(ctp::LastCodecKernelMs() >= 0.0);
+    REQUIRE(cudaMemcpy(comp.data(), d_comp, comp_size,
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy(back.data(), d_out, raw, cudaMemcpyDeviceToHost) ==
+            cudaSuccess);
+    cudaFree(d_in);
+    cudaFree(d_comp);
+    cudaFree(d_out);
+  } else {
+    std::vector<float> in = orig;
+    REQUIRE(codec->Compress(comp.data(), comp_size, in.data(), raw));
+    REQUIRE(codec->Decompress(back.data(), back_size, comp.data(), comp_size));
+  }
+  REQUIRE(comp_size > 0);
+  REQUIRE(back_size == raw);
+  REQUIRE(std::memcmp(back.data(), orig.data(), raw) == 0);
+  comp.resize(comp_size);
+  return comp;
+}
+
+}  // namespace
+
+// The 45 lossless GPU settings NeuroPress v2 chooses between
+// (gpu_setting_codec.h): the frozen table, and a bit-exact round trip of
+// every setting through device and host buffers with deterministic output.
+TEST_CASE("TestGpuSettingCodec", "[gpu_setting]") {
+  PAGE_DIVIDE("frozen table, lookup and availability") {
+    REQUIRE(ctp::kGpuSettingCount == 45);
+    for (int i = 0; i < ctp::kGpuSettingCount; ++i) {
+      REQUIRE(std::string(ctp::GpuSettingSpec(i)) == kExpectedSettings[i]);
+      REQUIRE(ctp::GpuSettingIndex(kExpectedSettings[i]) == i);
+      // Every codec library is part of this build.
+      REQUIRE(ctp::GpuSettingAvailable(i));
+    }
+    REQUIRE(ctp::GpuSettingIndex("cascaded type=int shuffle=bit rle=1 "
+                                 "delta=0 bp=1") == 13);
+    REQUIRE(ctp::GpuSettingIndex("lz4 type=int bitshuffle=msb") == 26);
+    REQUIRE(ctp::GpuSettingIndex("zstd shuffle=byte elem=8") == -1);
+    REQUIRE(ctp::GpuSettingIndex("") == -1);
+    REQUIRE(ctp::GpuSettingSpec(-1) == nullptr);
+    REQUIRE(ctp::GpuSettingSpec(45) == nullptr);
+    REQUIRE_FALSE(ctp::GpuSettingAvailable(45));
+    REQUIRE(ctp::CompressionFactory::NameForWireId(24) == "np-setting");
+    REQUIRE(ctp::CompressionFactory::WireIdForName("np-setting") == 24);
+    REQUIRE(ctp::CompressionFactory::GetGpuSetting(45) == nullptr);
+  }
+
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("No CUDA device available; skipping the settings round trips");
+    return;
+  }
+  const std::vector<float> field = SettingTestField(1u << 18);  // 1 MiB
+
+  PAGE_DIVIDE("every setting round-trips bit-exactly, device and host") {
+    for (int i = 0; i < ctp::kGpuSettingCount; ++i) {
+      INFO("setting " << i << ": " << ctp::GpuSettingSpec(i));
+      const auto dev = RoundTrip(i, field, true);
+      const auto host = RoundTrip(i, field, false);
+      // The same size whichever side the buffers live on, and run to run
+      // (the sweep's determinism rule: some nvcomp streams carry padding
+      // bytes that are not initialised, so the bytes themselves may differ;
+      // each stream still decodes bit-exactly, checked in RoundTrip).
+      REQUIRE(dev.size() == host.size());
+      REQUIRE(RoundTrip(i, field, true).size() == dev.size());
+      std::printf("  [gpu_setting] %2d %-50s %8zu B  ratio %7.3f\n", i,
+                  ctp::GpuSettingSpec(i), dev.size(),
+                  static_cast<double>(field.size() * 4) / dev.size());
+    }
+  }
+}
+#endif  // CTP_ENABLE_CUDA && CTP_ENABLE_NEUROPRESS_GPU

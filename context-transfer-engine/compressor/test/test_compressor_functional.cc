@@ -632,6 +632,87 @@ TEST_CASE("Exploration - adopted winners still round-trip",
 }
 
 /**
+ * NeuroPress v2 end to end: the pool loads the v2 model (an NNWT version-3
+ * file), ranks each chunk over the 45 GPU settings, stores the pick through
+ * the "np-setting" codec (wire 24, the setting index in the preset), learns
+ * online from every measured result, and explores the next-ranked settings
+ * on every chunk (threshold 0) -- adopting a winner re-stores the blob. The
+ * check is that every stored blob reads back byte-for-byte, whichever
+ * setting finally wrote it, and that v2 actually chose np-setting blobs.
+ */
+TEST_CASE("NeuroPress v2 - selection, learning and exploration round-trip",
+          "[compressor][functional][dynamic][neuropress][v2]") {
+#ifndef CLIO_CTP_NEUROPRESS_V2_WEIGHTS_DIR
+#error "CLIO_CTP_NEUROPRESS_V2_WEIGHTS_DIR must be set by CMake"
+#endif
+  CTETestFixture fixture;
+  CompressorConfig config;
+  config.neuropress_model_path_ = CLIO_CTP_NEUROPRESS_V2_WEIGHTS_DIR;
+  config.neuropress_online_learning_enabled_ = true;
+  config.neuropress_mape_threshold_ = 0.0f;         // learn on every chunk
+  config.neuropress_exploration_enabled_ = true;
+  config.neuropress_exploration_threshold_ = 0.0f;  // explore every chunk
+  config.neuropress_exploration_k_ = 3;
+  clio::run::PoolId pool_id = CreateCompressorPoolWithConfig(
+      clio::run::PoolId(2, 45), "test_compressor_pool_neuropress_v2", config);
+  Client client;
+  client.Init(pool_id);
+
+  // A smooth float32 field (what v2 was trained on) plus the byte patterns.
+  auto float_field = [](size_t bytes, float scale) {
+    std::vector<char> out(bytes);
+    for (size_t i = 0; i < bytes / sizeof(float); ++i) {
+      const float v = std::sin(static_cast<float>(i) * 0.003f) * scale +
+                      static_cast<float>(i % 17) * 0.01f;
+      std::memcpy(out.data() + i * sizeof(float), &v, sizeof(float));
+    }
+    return out;
+  };
+  std::vector<std::pair<std::string, std::vector<char>>> trials = {
+      {"field_1m", float_field(1 << 20, 100.0f)},
+      {"field_4m", float_field(4 << 20, 1.0e5f)},
+      {"repeating", GenerateTestData(256 * 1024, "repeating")},
+      {"text", GenerateTestData(256 * 1024, "text")},
+      {"random", GenerateTestData(64 * 1024, "random")},
+  };
+
+  int np_setting_blobs = 0;
+  for (const auto &trial : trials) {
+    const auto &original = trial.second;
+    auto put_buffer = fixture.AllocateAndCopyData(original);
+    REQUIRE(!put_buffer.IsNull());
+    const std::string blob_name = "v2_blob_" + trial.first;
+    Context context;
+    context.dynamic_compress_ = 0;
+    context.data_type_ = 1;  // float32
+    auto task = client.AsyncDynamicSchedule(
+        clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+        original.size(), put_buffer.shm_.template Cast<void>(), 0.5f, context,
+        0, fixture.core_pool_id_);
+    task.Wait();
+    REQUIRE(task->return_code_ == 0);
+    if (task->context_.compress_lib_ == 24) ++np_setting_blobs;
+    INFO(trial.first << ": lib " << task->context_.compress_lib_
+         << " preset " << task->context_.compress_preset_);
+    CLIO_IPC->FreeBuffer(put_buffer);
+
+    auto get_buffer = CLIO_IPC->AllocateBuffer(original.size());
+    REQUIRE(!get_buffer.IsNull());
+    auto get_task = client.AsyncDecompressExplicit(
+        clio::run::PoolQuery::Local(), fixture.tag_id_, blob_name, 0,
+        original.size(), 0, get_buffer.shm_.template Cast<void>(),
+        fixture.core_pool_id_);
+    get_task.Wait();
+    REQUIRE(get_task->return_code_ == 0);
+    REQUIRE(get_task->output_size_ == original.size());
+    REQUIRE(std::memcmp(original.data(), get_buffer.ptr_, original.size()) ==
+            0);
+    CLIO_IPC->FreeBuffer(get_buffer);
+  }
+  REQUIRE(np_setting_blobs > 0);
+}
+
+/**
  * Selection must not depend on WHERE the chunk lives.
  *
  * Recorded as coverage gap G2. Profiling during the NeuroPress parity

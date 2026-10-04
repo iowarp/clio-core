@@ -16,56 +16,43 @@
 #include <clio_runtime/types.h>
 
 #include <algorithm>
+#include <cmath>
 
 namespace clio::cte::compressor {
 
-/** Resolved parameters. `cap` is upstream's RATIO_CAP (100); `min_time_ms`
- *  is the time floor, NeuroPressCost::kMinTimeMs unless overridden. */
+/** Resolved parameters for cost model weights. */
 struct NeuroPressCostWeights {
-  double ct, dt, io, bw, cap, min_time_ms;
+  double ct, dt, io, bw;
 };
 
-/** Weights after any CLIO_NEUROPRESS_COST_W_* / CLIO_NEUROPRESS_MIN_TIME_MS
- *  override. Ranking and SGD gate must both read these, or training scores
+/** Weights after any CLIO_NEUROPRESS_COST_W_* override.
+ *  Ranking and SGD gate must both read these, or training scores
  *  what it is not ranking on. */
 NeuroPressCostWeights NeuroPressResolvedCostWeights();
 
-/** w_ct*ct + w_dt*dt + w_io*bytes/(min(ratio,cap)*bw). Times floored at the
- *  resolved min_time_ms and ratio capped first. Ratio <= 0 gives 1e30, a gate
- *  sentinel. */
+/** w_ct*ct + w_dt*dt + w_io*bytes/(ratio*bw). No time floor or ratio cap.
+ *  Ratio <= 0 or non-finite gives 1e30 (sentinel). */
 struct NeuroPressCost {
-  /** Default time floor in ms, upstream's (nn_gpu.cu:229-236). Applied to
-   *  predicted and measured times alike; CLIO_NEUROPRESS_MIN_TIME_MS
-   *  overrides it everywhere at once (NeuroPressResolvedCostWeights). */
-  static constexpr double kMinTimeMs = 1.0;
-
   double w_ct;
   double w_dt;
   double w_io;
   double bandwidth_bytes_per_ms;
-  double ratio_cap;
   clio::run::u64 chunk_size;
 
   double operator()(double compress_ms, double decompress_ms,
                     double ratio) const {
-    return Eval(compress_ms, decompress_ms, ratio,
-                NeuroPressResolvedCostWeights().min_time_ms);
-  }
-
-  /** The same cost with no time floor (CLIO_NEUROPRESS_SGD_GATE=raw). */
-  double Raw(double compress_ms, double decompress_ms, double ratio) const {
-    return Eval(compress_ms, decompress_ms, ratio, 0.0);
+    return Eval(compress_ms, decompress_ms, ratio);
   }
 
   /** Public so the struct stays an aggregate. */
-  double Eval(double compress_ms, double decompress_ms, double ratio,
-              double floor_ms) const {
-    const double ct = std::max(floor_ms, compress_ms);
-    const double dt = std::max(floor_ms, decompress_ms);
-    const double rc = std::min(ratio_cap, ratio);
+  double Eval(double compress_ms, double decompress_ms, double ratio) const {
+    const double ct = std::max(0.0, compress_ms);
+    const double dt = std::max(0.0, decompress_ms);
+    // Guard non-finite or <= 0 ratio with sentinel.
+    bool is_ratio_valid = std::isfinite(ratio) && ratio > 0.0;
     return w_ct * ct + w_dt * dt +
-           ((rc > 0.0) ? w_io * static_cast<double>(chunk_size) /
-                             (rc * bandwidth_bytes_per_ms)
+           (is_ratio_valid ? w_io * static_cast<double>(chunk_size) /
+                                 (ratio * bandwidth_bytes_per_ms)
                        : 1e30);
   }
 };

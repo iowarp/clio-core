@@ -334,7 +334,7 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     # CUDA::cudart to provide it to every consumer of ctp::compress (test + CTE
     # compressor module) whenever any CUDA-backed compressor is enabled.
     if((CLIO_CTP_ENABLE_NVCOMP OR CLIO_CTP_ENABLE_CUSZ OR CLIO_CTP_ENABLE_NDZIP
-        OR CLIO_CTP_ENABLE_CUSZP OR CLIO_CTP_ENABLE_GPULZ)
+        OR CLIO_CTP_ENABLE_CUSZP OR CLIO_CTP_ENABLE_GPULZ OR CLIO_CTP_ENABLE_FPCOMPRESS)
        AND TARGET CUDA::cudart)
         target_link_libraries(compress INTERFACE CUDA::cudart)
     endif()
@@ -348,6 +348,7 @@ target_compile_definitions(compress INTERFACE
     CTP_ENABLE_NDZIP=$<BOOL:${CLIO_CTP_ENABLE_NDZIP}>
     CTP_ENABLE_CUSZP=$<BOOL:${CLIO_CTP_ENABLE_CUSZP}>
     CTP_ENABLE_GPULZ=$<BOOL:${CLIO_CTP_ENABLE_GPULZ}>
+    CTP_ENABLE_FPCOMPRESS=$<BOOL:${CLIO_CTP_ENABLE_FPCOMPRESS}>
 )
 add_library(ctp::compress ALIAS compress)
 

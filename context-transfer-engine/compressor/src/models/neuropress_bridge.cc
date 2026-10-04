@@ -67,23 +67,6 @@ CostWeightOverride ResolveCostOverride() {
     o.dt = read("CLIO_NEUROPRESS_COST_W_DT", 1.0, &seen);
     o.io = read("CLIO_NEUROPRESS_COST_W_IO", 1.0, &seen);
     o.bw = read("CLIO_NEUROPRESS_COST_BW", 5e6, &seen);
-    /* Ratio ceiling, upstream's RATIO_CAP of 100. An experiment knob that must
-       reach SEVEN places at once; miss one and it silently re-imposes 100.
-       Raising it makes MAPE rise -- the cap was hiding real prediction error. */
-    /* Deliberately NOT folded into `seen`: the cap is not one of the four
-       cost WEIGHTS, and letting it set that flag would make a cap-only
-       experiment re-apply all four weights from their fallbacks. */
-    bool cap_seen = false;
-    o.cap = read("CLIO_NEUROPRESS_RATIO_CAP", 100.0, &cap_seen);
-    if (!(o.cap > 0.0)) o.cap = 100.0;
-    /* The time floor, upstream's 1 ms. Also kept out of `seen`, for the same
-       reason as the cap. 0 removes it, so a compress-time-only cost ranks
-       sub-millisecond codecs by speed instead of tying them all at the floor
-       and letting candidate order decide. Negative or unparsable keeps 1. */
-    bool floor_seen = false;
-    o.min_time = read("CLIO_NEUROPRESS_MIN_TIME_MS", NeuroPressCost::kMinTimeMs,
-                      &floor_seen);
-    if (!(o.min_time >= 0.0)) o.min_time = NeuroPressCost::kMinTimeMs;
     o.any = seen;
     return o;
   }
@@ -91,7 +74,7 @@ CostWeightOverride ResolveCostOverride() {
 
 NeuroPressCostWeights NeuroPressResolvedCostWeights() {
   static const CostWeightOverride o = ResolveCostOverride();
-  return NeuroPressCostWeights{o.ct, o.dt, o.io, o.bw, o.cap, o.min_time};
+  return NeuroPressCostWeights{o.ct, o.dt, o.io, o.bw};
 }
 
 
@@ -224,12 +207,6 @@ std::vector<CompressionStats> RankIntoStats(
     weights.w_cost_io = kOverride.io;
     weights.bandwidth_bytes_per_ms = kOverride.bw;
   }
-  /* Independent of the weight override (see ResolveCostOverride): the cap
-     reaches the RANKING and the inference kernel's own clamp, so the model's
-     predictions and the cost model score on one scale. */
-  weights.ratio_cap = kOverride.cap;
-  weights.min_time_ms = kOverride.min_time;
-
   // Best mode's ratio-only objective: zeroing ct/dt leaves a monotone function
   // of ratio. Applies to the RANKING too -- that decides which slots the sweep
   // visits.

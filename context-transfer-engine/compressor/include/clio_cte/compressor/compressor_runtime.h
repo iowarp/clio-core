@@ -52,6 +52,7 @@
 #include <clio_cte/compressor/models/linreg_table_predictor.h>
 #include <clio_cte/compressor/models/distribution_classifier.h>
 #include <clio_ctp/compress/model/neuropress_nn_predictor.h>
+#include <clio_ctp/compress/model/neuropress_v2_predictor.h>
 #include <clio_ctp/compress/model/hcompress_ccp_predictor.h>
 #include <clio_ctp/compress/model/xgb_tree_predictor.h>
 
@@ -282,6 +283,23 @@ private:
   std::unique_ptr<ctp::compress::model::NeuroPressNNPredictor>
       neuropress_predictor_;
 
+  /**
+   * NeuroPress v2 (neuropress_v2_selection.cc): one network pass ranks the 45
+   * lossless GPU settings of ctp::GpuSettingCodec. Loaded instead of v1 when
+   * neuropress_model_path_ names an NNWT version-3 model; never both.
+   */
+  std::unique_ptr<ctp::compress::model::NeuroPressV2Predictor> neuropress_v2_;
+
+  /** @brief What a v2 write predicted from, kept for the read that follows. */
+  struct V2DecompRecord {
+    ctp::compress::model::NeuroPressV2Features features;
+    int setting = -1;    ///< the setting the stored blob was compressed with
+    clio::run::u64 seq;  ///< insertion order, for FIFO eviction
+  };
+  std::mutex v2_decomp_mutex_;
+  std::unordered_map<std::string, V2DecompRecord> v2_decomp_;
+  clio::run::u64 v2_decomp_seq_ = 0;
+
   // HCompress's Expected-Compression-Cost model, deployed as a SELECTOR
   // (hcompress_selection.cc). Loaded only from hcompress_model_path_, and
   // exclusive with NeuroPress: when it loads, neuropress_predictor_ is not
@@ -400,6 +418,12 @@ private:
            neuropress_predictor_->IsReady();
   }
 
+  /** Is NeuroPress v2 deciding for this chunk? Same gate as v1's. */
+  bool NeuroPressV2Active(const Context& context) const {
+    return context.dynamic_compress_ != 1 && neuropress_v2_ &&
+           neuropress_v2_->IsReady();
+  }
+
   /** Is HCompress deciding for this chunk? Same shape as NeuroPressActive,
    *  and checked FIRST in EstCompressionStats: the two are exclusive by
    *  construction (Create() keeps at most one), but if both were ever loaded
@@ -460,6 +484,116 @@ private:
    * blob has no recorded features, or the predictor isn't ready.
    */
   void LearnDecompTime(const std::string& blob_key, double measured_ms);
+
+  /**
+   * @brief Remember which v2 setting and inputs produced a stored blob, so a
+   * later read can train that setting's decompress-time row.
+   * @param blob_key  blob name
+   * @param features  the chunk's v2 inputs
+   * @param setting   the setting the stored blob used
+   */
+  void RecordV2Decomp(const std::string& blob_key,
+                      const ctp::compress::model::NeuroPressV2Features& features,
+                      int setting);
+
+  /**
+   * @brief v2 half of LearnDecompTime: train the stored setting's decompress
+   * row from a measured read. No-op without a record or with learning off.
+   * @param blob_key    blob name
+   * @param measured_ms the read's codec decompress time
+   */
+  void LearnV2DecompTime(const std::string& blob_key, double measured_ms);
+
+  /**
+   * @brief Append v2's predictions for every setting of one chunk, made
+   * before any learning from it, to CLIO_NEUROPRESS_V2_PRED_LOG (no-op when
+   * unset). Columns: blob, bytes, x0..x3, updates, then ct/dt/ratio per
+   * setting index (empty when the setting was not ranked).
+   * @param blob       blob name
+   * @param chunk_size its size
+   * @param f          the v2 inputs
+   * @param stats      the v2 ranking
+   */
+  void LogV2Predictions(const std::string& blob, clio::run::u64 chunk_size,
+                        const ctp::compress::model::NeuroPressV2Features& f,
+                        const std::vector<CompressionStats>& stats);
+
+  /** @return the v2 cost weights: the resolved NeuroPress weights, with the
+   *  time terms zeroed in best mode (ratio-only, as v1's best mode). */
+  ctp::compress::model::NeuroPressV2CostWeights V2CostWeights() const;
+
+  /**
+   * @brief v2's ranking of one chunk (neuropress_v2_selection.cc).
+   *
+   * Statistics on the GPU for a device chunk (as v1), on the host otherwise;
+   * then one network pass and a ranking of all 45 settings by cost. Each
+   * returned entry is the "np-setting" codec (wire 24) with compress_preset_
+   * = the setting index, or wire 0 (stored raw) for the "store" setting.
+   * @param chunk          chunk bytes, host or device
+   * @param chunk_size     its size
+   * @param context        compression context (data type)
+   * @param out_entropy    receives the chunk's byte entropy (for logs)
+   * @param out_mad        receives its MAD (absolute, for logs)
+   * @param out_second_deriv receives its mean |second difference|
+   * @param out_gpu_failed set when the device path could not rank
+   * @param out_features   receives the v2 inputs, for learning
+   * @return best-first stats, empty when the chunk could not be ranked
+   */
+  std::vector<CompressionStats> NeuroPressV2RankChunk(
+      const void* chunk, clio::run::u64 chunk_size, const Context& context,
+      double* out_entropy, double* out_mad, double* out_second_deriv,
+      bool* out_gpu_failed,
+      ctp::compress::model::NeuroPressV2Features* out_features);
+
+  /**
+   * @brief v2 online learning from the primary's measured result.
+   *
+   * Cost error = |actual - predicted| / actual under V2CostWeights(), with the
+   * predicted decompress time standing in when the write did not measure it.
+   * Above neuropress_mape_threshold_ (and with online learning on, not best
+   * mode) the setting's output rows take one TrainSetting step.
+   * @param features   the chunk's v2 inputs
+   * @param predicted  the ranking entry that was run
+   * @param context    holds the measured ratio and times
+   * @param chunk_size bytes compressed
+   * @param trained    receives whether a step was applied
+   * @return the cost error, for the exploration gate
+   */
+  double NeuroPressV2LearnPrimary(
+      const ctp::compress::model::NeuroPressV2Features& features,
+      const CompressionStats& predicted, const Context& context,
+      clio::run::u64 chunk_size, bool* trained);
+
+  /** @brief A v2 exploration result: the best alternative, if any won. */
+  struct V2ExploreWinner {
+    bool have = false;
+    int setting = -1;           ///< winning setting index
+    std::vector<char> payload;  ///< its compressed bytes (no header)
+    double ratio = 0.0;         ///< measured ratio
+    double comp_ms = 0.0;       ///< measured compress ms
+    double decomp_ms = -1.0;    ///< measured decompress ms, < 0 if not
+    double cost = 0.0;          ///< measured cost
+    int measured = 0;           ///< alternatives actually compressed
+    int trained = 0;            ///< TrainSetting steps applied
+  };
+
+  /**
+   * @brief v2 exploration: compress the next K ranked settings for real,
+   * learn from each (when online learning is on), and return the cheapest
+   * one if it beats the primary's measured cost.
+   * @param chunk        chunk bytes, host or device
+   * @param chunk_size   its size
+   * @param stats        the v2 ranking
+   * @param primary_setting the setting the primary ran
+   * @param primary_cost the primary's measured cost
+   * @param measure_dt   measure each alternative's decompress time too
+   * @param features     the chunk's v2 inputs
+   */
+  V2ExploreWinner NeuroPressV2Explore(
+      const void* chunk, clio::run::u64 chunk_size,
+      const std::vector<CompressionStats>& stats, int primary_setting,
+      double primary_cost, bool measure_dt,
+      const ctp::compress::model::NeuroPressV2Features& features);
 
   // Compression telemetry ring buffer for performance monitoring
   using CompressionTelemetryLog = ctp::ipc::ring_buffer<CompressionTelemetry, CLIO_TASK_ALLOC_T>;
@@ -567,7 +701,9 @@ private:
           nullptr,
       /* HCompress only: set when HCompress ranked this chunk, so the caller
          feeds the executed outcome back to HCompressObserve(). */
-      bool* out_hc_ranked = nullptr);
+      bool* out_hc_ranked = nullptr,
+      /* NeuroPress v2 only: receives the chunk's v2 inputs, for learning. */
+      ctp::compress::model::NeuroPressV2Features* out_v2_features = nullptr);
 
   /**
    * @brief HCompress's half of EstCompressionStats (hcompress_selection.cc).

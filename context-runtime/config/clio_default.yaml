@@ -213,7 +213,16 @@ compose:
   #   pool_id: "562.0"
   #   next_pool_id: "561.0"             # replication pool — see entry above
   #   # Codec SELECTOR (all optional; with none, the legacy heuristics choose):
-  #   neuropress_model_path: ""         # dir holding NeuroPress model.nnwt
+  #   neuropress_model_path: ""         # NeuroPress model: a dir holding
+  #                                     # model.nnwt (v1, 32 nvcomp actions), or
+  #                                     # a v2 model -- an NNWT version-3 file, or
+  #                                     # a dir holding model_v2.nnwt (e.g.
+  #                                     # .../model/weights/v2). v2 ranks the 45
+  #                                     # lossless GPU settings of the np-setting
+  #                                     # codec (wire 24) in one pass; the file
+  #                                     # version picks v1 or v2. Online learning,
+  #                                     # exploration and best mode use the same
+  #                                     # neuropress_* keys for both.
   #   hcompress_model_path: ""          # dir holding hcompress_ccp_seed.json;
   #                                     # HCompress (IPDPS 2020) ranks NeuroPress's
   #                                     # candidates under its cost model. Takes

@@ -74,6 +74,16 @@ if(CLIO_CORE_ENABLE_CUDA)
     # prediction, residuals and the closed-loop bound check on device frames.
     list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC
         ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/temporal_gpu_kernels.cu)
+    # GPU settings codec: unified interface to 45 frozen lossless GPU codecs,
+    # selected by the NeuroPress v2 model. Lives in compress/ but is compiled
+    # into this target for the same reasons as the kernels above.
+    list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../gpu_setting_codec.cu)
+    # NeuroPress v2: one pass predicts every setting of the codec above, so
+    # it is built exactly when that codec is.
+    list(APPEND CLIO_CTP_COMPRESS_MODEL_SRC
+        neuropress_v2_predictor.cc
+        neuropress_v2_kernels.cu)
 endif()
 
 add_library(clio_ctp_compress_model STATIC ${CLIO_CTP_COMPRESS_MODEL_SRC})
@@ -84,6 +94,7 @@ if(CLIO_CORE_ENABLE_CUDA)
             CACHE STRING "CUDA architectures to compile for" FORCE)
     endif()
     set_source_files_properties(neuropress_nn_gpu_kernels.cu PROPERTIES LANGUAGE CUDA)
+    set_source_files_properties(neuropress_v2_kernels.cu PROPERTIES LANGUAGE CUDA)
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/data_stats_gpu_kernels.cu
         PROPERTIES LANGUAGE CUDA)
@@ -99,6 +110,16 @@ if(CLIO_CORE_ENABLE_CUDA)
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/temporal_gpu_kernels.cu
         PROPERTIES LANGUAGE CUDA)
+    # The settings codec calls nvcomp / ndzip / GPULZ / FPcompress directly.
+    # Their CTP_ENABLE_* flags and include dirs normally reach a source through
+    # ctp::compress, but ctp::compress links THIS library, so it cannot be
+    # linked back here: give the one source the same flags and dirs instead.
+    # Without them every #if CTP_ENABLE_<codec> block compiles out silently.
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/../gpu_setting_codec.cu
+        PROPERTIES LANGUAGE CUDA
+        COMPILE_DEFINITIONS "CTP_ENABLE_NVCOMP=$<BOOL:${CLIO_CTP_ENABLE_NVCOMP}>;CTP_ENABLE_NDZIP=$<BOOL:${CLIO_CTP_ENABLE_NDZIP}>;CTP_ENABLE_GPULZ=$<BOOL:${CLIO_CTP_ENABLE_GPULZ}>;CTP_ENABLE_FPCOMPRESS=$<BOOL:${CLIO_CTP_ENABLE_FPCOMPRESS}>"
+        INCLUDE_DIRECTORIES "${COMPRESS_INCLUDES}")
     # CUDA_RESOLVE_DEVICE_SYMBOLS: device-link this library's .cu objects ONCE,
     # here, instead of once per consumer.
     #
@@ -130,6 +151,19 @@ if(CLIO_CORE_ENABLE_CUDA)
     # own GPU utility headers, so it doesn't need that heavier target.
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(clio_ctp_compress_model PRIVATE CUDA::cudart)
+    # Libraries the settings codec calls (see gpu_setting_codec.cu above).
+    if(CLIO_CTP_ENABLE_NVCOMP)
+        target_link_libraries(clio_ctp_compress_model PRIVATE nvcomp::nvcomp)
+    endif()
+    if(CLIO_CTP_ENABLE_NDZIP)
+        target_link_libraries(clio_ctp_compress_model PRIVATE ${ndzip_LIBRARIES})
+    endif()
+    if(CLIO_CTP_ENABLE_GPULZ)
+        target_link_libraries(clio_ctp_compress_model PRIVATE ${gpulz_LIBRARIES})
+    endif()
+    if(CLIO_CTP_ENABLE_FPCOMPRESS)
+        target_link_libraries(clio_ctp_compress_model PRIVATE ${fpcompress_LIBRARIES})
+    endif()
     target_compile_definitions(clio_ctp_compress_model PUBLIC CTP_ENABLE_NEUROPRESS_GPU=1)
     message(STATUS "clio_ctp_compress_model: NeuroPress GPU backend enabled (CUDA)")
 else()

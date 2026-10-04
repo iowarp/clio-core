@@ -201,6 +201,39 @@ constexpr uint32_t kQuantFloat64Bit = 1u << 4;
  *  without those decoders refuses it instead of misreading it. */
 constexpr uint32_t kFormatVersionQuantExt = 2;
 
+/** Wire id of the NeuroPress v2 settings codec ("np-setting" in
+ *  compress_factory.h, ctp::GpuSettingCodec). */
+constexpr uint32_t kNpSettingWireId = 24;
+/** Format of an np-setting blob: preset bits 0-7 hold the setting index
+ *  (gpu_setting_codec.h), and no runtime shuffle or quantization applies --
+ *  the setting carries its own shuffle. A build without the settings codec
+ *  refuses the blob instead of misreading it. */
+constexpr uint32_t kFormatVersionSetting = 3;
+
+/**
+ * @param index setting index, 0..ctp::kGpuSettingCount-1
+ * @return the stored preset word of an np-setting blob
+ */
+inline uint32_t PackSetting(uint32_t index) {
+  return (index & kPresetMask) | (kFormatVersionSetting << kVersionShift);
+}
+
+/**
+ * The factory preset a stored (wire id, preset id) pair means.
+ * @param lib       wire id
+ * @param preset_id preset bits 0-7
+ * @return the setting index itself for np-setting; FAST / BALANCED / BEST
+ *         from the codes 1 / other / 3 for every other codec
+ */
+inline ctp::CompressionPreset PresetFor(uint32_t lib, uint32_t preset_id) {
+  if (lib == kNpSettingWireId) {
+    return static_cast<ctp::CompressionPreset>(preset_id);
+  }
+  if (preset_id == 1) return ctp::CompressionPreset::FAST;
+  if (preset_id == 3) return ctp::CompressionPreset::BEST;
+  return ctp::CompressionPreset::BALANCED;
+}
+
 inline uint32_t PackQuant(
     bool enabled, const ctp::compress::preprocess::DeviceQuantizeParams &p) {
   if (!enabled) return 0;
@@ -285,8 +318,11 @@ struct CompressionHeader {
 
   /** Magic matches AND the format is one this build understands. */
   bool IsValid() const {
+    const uint32_t version = UnpackVersion(compress_preset_);
     return magic_ == kMagic &&
-           UnpackVersion(compress_preset_) <= kFormatVersionQuantExt;
+           (version <= kFormatVersionQuantExt ||
+            (version == kFormatVersionSetting &&
+             compress_lib_ == kNpSettingWireId));
   }
 
   /** Payload length to feed the decompressor, or 0 if unusable. */
@@ -502,7 +538,37 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // NOT when HCompress is requested: exactly one model chooses each chunk,
   // and skipping the load (rather than loading then discarding) never
   // allocates NeuroPress's prediction-reuse state for a run that cannot use it.
-  if (!config_.neuropress_model_path_.empty() &&
+  // NeuroPress v2 when the path names an NNWT version-3 model (a v2 file, or
+  // a directory holding model_v2.nnwt); v1 otherwise. Never both.
+  const bool np_v2 =
+      !config_.neuropress_model_path_.empty() &&
+      config_.hcompress_model_path_.empty() &&
+      config_.xgb_model_path_.empty() &&
+      ctp::compress::model::NeuroPressV2Predictor::IsV2File(
+          config_.neuropress_model_path_);
+  if (np_v2) {
+#if CTP_ENABLE_NEUROPRESS_GPU
+    neuropress_v2_ =
+        std::make_unique<ctp::compress::model::NeuroPressV2Predictor>();
+    if (!neuropress_v2_->Load(config_.neuropress_model_path_)) {
+      HLOG(kError,
+           "NeuroPress v2 was requested (model path '{}') but could not be "
+           "loaded: {} -- failing CreateCompressor",
+           config_.neuropress_model_path_, neuropress_v2_->LastError());
+      neuropress_v2_.reset();
+      task->SetReturnCode(1);
+      CLIO_CO_RETURN;
+    }
+    HLOG(kInfo, "NeuroPress v2 loaded from {} ({} settings)",
+         config_.neuropress_model_path_, neuropress_v2_->NumSettings());
+#else
+    HLOG(kError, "NeuroPress v2 needs the CUDA build -- failing "
+         "CreateCompressor");
+    task->SetReturnCode(1);
+    CLIO_CO_RETURN;
+#endif
+  }
+  if (!np_v2 && !config_.neuropress_model_path_.empty() &&
       config_.hcompress_model_path_.empty() &&
       config_.xgb_model_path_.empty()) {
     try {
@@ -835,12 +901,21 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     const void** out_device_stats,
     const ctp::compress::preprocess::PredictionReuseContext* reuse,
     ctp::compress::preprocess::PredictionReuseOutcome* out_outcome,
-    bool* out_hc_ranked) {
+    bool* out_hc_ranked,
+    ctp::compress::model::NeuroPressV2Features* out_v2_features) {
   std::vector<CompressionStats> results;
   if (out_ranked_by_cost) *out_ranked_by_cost = false;
   if (out_neuropress_gpu_failed) *out_neuropress_gpu_failed = false;
   if (out_device_stats) *out_device_stats = nullptr;
   if (out_hc_ranked) *out_hc_ranked = false;
+  // NeuroPress v2 (neuropress_v2_selection.cc): ranks the 45 GPU settings.
+  if (NeuroPressV2Active(context)) {
+    auto v2_stats = NeuroPressV2RankChunk(
+        chunk, chunk_size, context, out_entropy, out_mad, out_second_deriv,
+        out_neuropress_gpu_failed, out_v2_features);
+    if (!v2_stats.empty() && out_ranked_by_cost) *out_ranked_by_cost = true;
+    return v2_stats;
+  }
 
   // HCompress decides, when it is the configured selector. It RETURNS in
   // every case: falling through would reach the legacy branch below, which
@@ -1184,6 +1259,7 @@ void Runtime::RecordDecompFeatures(
 
 void Runtime::LearnDecompTime(const std::string& blob_key,
                               double measured_ms) {
+  LearnV2DecompTime(blob_key, measured_ms);
   if (!config_.neuropress_online_learning_enabled_ || measured_ms <= 0.0) {
     return;
   }
@@ -1196,14 +1272,10 @@ void Runtime::LearnDecompTime(const std::string& blob_key,
     auto it = decomp_features_.find(blob_key);
     if (it == decomp_features_.end()) return;  // never compressed here
 
-    // Upstream's label floor is 0.01 ms (nn_gpu.cu:775), not the 1 ms
-    // prediction clamp. CLIO_NEUROPRESS_DT_LABEL_FLOOR_MS overrides.
-    static const double kLabelFloorMs = [] {
-      const char* e = std::getenv("CLIO_NEUROPRESS_DT_LABEL_FLOOR_MS");
-      const double v = (e != nullptr && *e != '\0') ? std::atof(e) : 0.01;
-      return (v > 0.0) ? v : 0.01;
-    }();
-    it->second.measured_ms = std::max(kLabelFloorMs, measured_ms);
+    // Use measured time as-is; skip if not finite or <= 0.
+    if (std::isfinite(measured_ms) && measured_ms > 0.0) {
+      it->second.measured_ms = measured_ms;
+    }
 
     // Train over EVERY record that has a measurement, not just this one and not only once per re...
     batch_features.reserve(decomp_features_.size());
@@ -1353,6 +1425,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     const void* sel_device_stats = nullptr;
     // HCompress ranked THIS chunk, so its executed outcome is fed back.
     bool hc_ranked = false;
+    // NeuroPress v2's inputs for this chunk, for its online learning.
+    ctp::compress::model::NeuroPressV2Features sel_v2_features;
     std::vector<CompressionStats> stats;
     if (!config_.neuropress_static_lib_.empty()) {
       // Control condition: one candidate, no inference.
@@ -1388,7 +1462,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                               &neuropress_gpu_failed, &sel_device_stats,
                               np_reuse_on ? &np_reuse_ctx : nullptr,
                               np_reuse_on ? &np_reuse_outcome : nullptr,
-                              &hc_ranked);
+                              &hc_ranked, &sel_v2_features);
       phases_selected = phase_log && TakeSelectionPhases(&phases);
     }
 
@@ -1591,6 +1665,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
           checksum *= 1099511628211ull;
         }
       }
+      if (NeuroPressV2Active(context)) {
+        LogV2Predictions(task->blob_name_.str(), chunk_size, sel_v2_features,
+                         stats);
+      }
       LogNeuroPressSelection(task->blob_name_.str(), chunk_size, sel_entropy,
                              sel_mad, sel_second_deriv, best_lib, best_preset,
                              logged_pred, context.actual_compression_ratio_,
@@ -1636,16 +1714,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         // One MAPE per predicted metric, plus the cost error, exactly as upstream derives them...
         {
           const auto &f = stats.front();
-          // Same ceiling the cost model and the kernel used; a hardcoded 100
-          // here would report a MAPE against a differently-clamped ratio.
-          const double kMapeCap = NeuroPressResolvedCostWeights().cap;
-          const double kFloor = NeuroPressResolvedCostWeights().min_time_ms;
-          const double pred_r = std::min(kMapeCap, f.compression_ratio_);
-          const double pred_ct = std::max(kFloor, f.compress_time_ms_);
-          const double pred_dt = std::max(kFloor, f.decompress_time_ms_);
-          const double act_r = std::min(kMapeCap, context.actual_compression_ratio_);
-          const double act_ct =
-              std::max(kFloor, context.actual_compress_time_ms_);
+          // No clamping/flooring: use values as-is.
+          const double pred_r = f.compression_ratio_;
+          const double pred_ct = std::max(0.0, f.compress_time_ms_);
+          const double pred_dt = std::max(0.0, f.decompress_time_ms_);
+          const double act_r = context.actual_compression_ratio_;
+          const double act_ct = std::max(0.0, context.actual_compress_time_ms_);
           // Decompression is not measured at write time; upstream substitutes the prediction, which ma...
           const double act_dt = pred_dt;
           diag.ratio_mape = static_cast<float>(
@@ -1697,6 +1771,105 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         task->return_code_ == 0 && context.actual_compression_ratio_ > 0.0) {
       HCompressObserve(best_lib, best_preset, chunk_size, context);
     }
+    // ---- NeuroPress v2: learn from the primary, then explore. (v1's blocks
+    // below need neuropress_feat_valid, which only v1 sets.)
+    if (NeuroPressV2Active(context) && !stats.empty() &&
+        task->return_code_ == 0 &&
+        static_cast<uint32_t>(best_lib) == kNpSettingWireId &&
+        context.actual_compression_ratio_ > 0.0) {
+      RecordV2Decomp(task->blob_name_.str(), sel_v2_features, best_preset);
+      bool v2_trained = false;
+      const double v2_err = NeuroPressV2LearnPrimary(
+          sel_v2_features, stats.front(), context, chunk_size, &v2_trained);
+      if (v2_trained) {
+        ++phases.sgd_updates;
+        np_sgd_epoch_.fetch_add(1, std::memory_order_relaxed);
+      }
+      CLIO_PATH_TRACE("5 gate     v2 cost error=%.4f vs exploration threshold "
+                      "%.4f", v2_err,
+                      static_cast<double>(
+                          config_.neuropress_exploration_threshold_));
+      if (config_.neuropress_exploration_enabled_ && defer_store &&
+          (config_.neuropress_best_mode_ ||
+           v2_err > static_cast<double>(
+                        config_.neuropress_exploration_threshold_))) {
+        explore_t0 = std::chrono::steady_clock::now();
+        explore_ran = true;
+        const auto w = V2CostWeights();
+        const bool dt_measured = context.actual_decompress_time_ms_ > 0.0;
+        const double primary_cost =
+            w.w_ct * context.actual_compress_time_ms_ +
+            w.w_dt * (dt_measured ? context.actual_decompress_time_ms_
+                                  : stats.front().decompress_time_ms_) +
+            w.w_io * static_cast<double>(chunk_size) /
+                (context.actual_compression_ratio_ * w.bw_bytes_per_ms);
+        V2ExploreWinner win = NeuroPressV2Explore(
+            chunk_data, chunk_size, stats, best_preset, primary_cost,
+            dt_measured, sel_v2_features);
+        phases.sgd_updates += win.trained;
+        if (win.trained > 0) {
+          np_sgd_epoch_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (win.have) {
+          // Adopt: one put of the winner, as v1's exploration does.
+          const size_t total = sizeof(CompressionHeader) + win.payload.size();
+          CompressionHeader hdr(kNpSettingWireId,
+                                PackSetting(static_cast<uint32_t>(win.setting)),
+                                chunk_size, win.payload.size());
+          auto shm = CLIO_IPC->AllocateBuffer(total);
+          if (!shm.IsNull()) {
+            std::memcpy(shm.ptr_, &hdr, sizeof(hdr));
+            std::memcpy(shm.ptr_ + sizeof(hdr), win.payload.data(),
+                        win.payload.size());
+            Context win_ctx = context;
+            win_ctx.compress_lib_ = static_cast<int>(kNpSettingWireId);
+            win_ctx.compress_preset_ = win.setting;
+            win_ctx.transform_flags_ |= clio::cte::core::kBlobTransformed |
+                                        clio::cte::core::kBlobTransformCompressed;
+            const auto put_t0 = std::chrono::steady_clock::now();
+            auto win_put = core_client_->AsyncPutBlob(
+                task->tag_id_, task->blob_name_.str(), task->offset_, total,
+                shm.shm_.template Cast<void>(), task->score_, win_ctx,
+                task->flags_, clio::run::PoolQuery::Local());
+            CLIO_CO_AWAIT(win_put);
+            written_time = std::chrono::high_resolution_clock::now();
+            explore_inner_ms += ms_since(put_t0);
+            const int rc = win_put->return_code_;
+            CLIO_IPC->FreeBuffer(shm);
+            if (rc == 0) {
+              stored_by_exploration = true;
+              task->context_ = win_ctx;
+              task->context_.actual_original_size_ = chunk_size;
+              task->context_.actual_compressed_size_ = total;
+              task->context_.actual_compression_ratio_ = win.ratio;
+              task->context_.actual_compress_time_ms_ = win.comp_ms;
+              if (win.decomp_ms >= 0.0) {
+                task->context_.actual_decompress_time_ms_ = win.decomp_ms;
+              }
+              RecordV2Decomp(task->blob_name_.str(), sel_v2_features,
+                             win.setting);
+              // The selection log's row for this blob is the primary's; a
+              // second row names what was actually stored (as v1 does).
+              if (SelectionLogEnabled()) {
+                LogNeuroPressSelection(
+                    task->blob_name_.str(), chunk_size, sel_entropy, sel_mad,
+                    sel_second_deriv, static_cast<int>(kNpSettingWireId),
+                    win.setting, /*predicted=*/nullptr, win.ratio, win.comp_ms,
+                    /*actual_psnr=*/-1.0, /*checksum=*/0ull, "adopted");
+              }
+            } else {
+              HLOG(kWarning, "NeuroPress v2 explore: winner put failed "
+                   "(rc={}); keeping the primary", rc);
+            }
+          }
+          CLIO_PATH_TRACE("7 adopt    v2 %s (measured %d alternatives)",
+                          stored_by_exploration
+                              ? ctp::GpuSettingSpec(win.setting)
+                              : "none -- primary kept",
+                          win.measured);
+        }
+      }
+    }
     if ((config_.neuropress_online_learning_enabled_ ||
          config_.neuropress_best_mode_) &&
         neuropress_feat_valid &&
@@ -1715,7 +1888,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         // Best mode scores I/O alone: it ranks on what a configuration SAVES, not what it costs to g...
         const NeuroPressCost cost{config_.neuropress_best_mode_ ? 0.0 : kCw.ct,
                                   config_.neuropress_best_mode_ ? 0.0 : kCw.dt,
-                                  kCw.io, kCw.bw, kCw.cap, chunk_size};
+                                  kCw.io, kCw.bw, chunk_size};
         // Decompress time is not measured at write time (only a later read decompresses it) -- use t...
         double predicted_cost = cost(predicted->compress_time_ms_,
                                      predicted->decompress_time_ms_,
@@ -1727,24 +1900,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             ? std::fabs(actual_cost - predicted_cost) / actual_cost
             : 0.0;
 
-        // CLIO_NEUROPRESS_SGD_GATE=raw scores the SGD gate without the time
-        // floor; by default it scores the ranked cost, as upstream.
-        static const bool kRawSgdGate = [] {
-          const char *e = std::getenv("CLIO_NEUROPRESS_SGD_GATE");
-          return (e != nullptr && std::strcmp(e, "raw") == 0);
-        }();
+        // SGD gate uses the same cost model as ranking (no time floor/ratio cap).
         double sgd_error_pct = error_pct;
-        if (kRawSgdGate) {
-          const double raw_pred = cost.Raw(predicted->compress_time_ms_,
-                                           predicted->decompress_time_ms_,
-                                           predicted->compression_ratio_);
-          const double raw_act = cost.Raw(context.actual_compress_time_ms_,
-                                          predicted->decompress_time_ms_,
-                                          context.actual_compression_ratio_);
-          sgd_error_pct = (raw_act > 0.0)
-              ? std::fabs(raw_act - raw_pred) / raw_act
-              : 0.0;
-        }
 
         // ---- Phase 1: "learn from PRIMARY result immediately" -- online SGD on the real, just-meas...
         std::string lib_name =
@@ -1806,13 +1963,11 @@ clio::run::TaskResume Runtime::DynamicSchedule(
               static_cast<double>(config_.neuropress_mape_threshold_);
           const bool np_cost_gate = sgd_error_pct > np_cost_thresh;
 
-          // Same clamps the reported ratio_mape uses, so the gate and the
-          // column agree.
+          // No clamping/flooring: use values as-is.
           double np_ratio_mape = 0.0;
           {
-            const double cap = NeuroPressResolvedCostWeights().cap;
-            const double pr = std::min(cap, predicted->compression_ratio_);
-            const double ar = std::min(cap, context.actual_compression_ratio_);
+            const double pr = predicted->compression_ratio_;
+            const double ar = context.actual_compression_ratio_;
             if (ar > 0.0) np_ratio_mape = std::fabs(ar - pr) / ar;
           }
           const bool np_ratio_gate =
@@ -2742,12 +2897,8 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     // The selector's quantize bit.
     const bool quantize_requested = UnpackQuantEnabled(packed_preset);
 
-    ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-    if (preset_id == 1) {
-      preset = ctp::CompressionPreset::FAST;
-    } else if (preset_id == 3) {
-      preset = ctp::CompressionPreset::BEST;
-    }
+    const ctp::CompressionPreset preset = PresetFor(
+        static_cast<uint32_t>(context.compress_lib_), preset_id);
 
     // Create compressor with specified preset
     const auto factory_t0 = std::chrono::steady_clock::now();
@@ -3102,8 +3253,27 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
           (compress_kernel_ms >= 0.0) ? compress_kernel_ms : compress_time;
 
       // Decompress what we just produced, back, and time the codec call alone.
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_NEUROPRESS_GPU
+      // A v2 setting decodes with its own codec (shuffle included), the way
+      // its decompress-time labels were measured.
+      const bool np_setting_blob =
+          static_cast<uint32_t>(context.compress_lib_) == kNpSettingWireId;
+      if (np_setting_blob && MeasureExploreDecompTime()) {
+        auto dcodec =
+            ctp::CompressionFactory::GetGpuSetting(static_cast<int>(preset_id));
+        std::vector<char> decoded(compress_input_size);
+        size_t decoded_size = compress_input_size;
+        if (dcodec && dcodec->Decompress(decoded.data(), decoded_size,
+                                         compress_dst, compressed_size) &&
+            ctp::LastCodecKernelMs() >= 0.0) {
+          context.actual_decompress_time_ms_ = ctp::LastCodecKernelMs();
+        }
+      }
+#else
+      const bool np_setting_blob = false;
+#endif
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
-      if (MeasureExploreDecompTime()) {
+      if (!np_setting_blob && MeasureExploreDecompTime()) {
         double dt_ms = -1.0;
         if (ctp::NvComp::DecompressMeasureAnyPtr(compress_dst, compressed_size,
                                                  compress_input_size, &dt_ms)) {
@@ -3139,8 +3309,10 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // Record the shuffle that was ACTUALLY applied, not the one requested: if ByteShuffle declin...
       CompressionHeader header(
           context.compress_lib_,
-          PackStored(preset_id, applied_shuffle, applied_quant,
-                     quant_params),
+          static_cast<uint32_t>(context.compress_lib_) == kNpSettingWireId
+              ? PackSetting(preset_id)
+              : PackStored(preset_id, applied_shuffle, applied_quant,
+                           quant_params),
           input_size, compressed_size);
       QuantHeaderExtension quant_ext{};
       if (applied_quant) {
@@ -3480,12 +3652,9 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
           ctp::CompressionFactory::NameForWireId(compress_lib);
 
       // Map preset integer to enum
-      ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-      if (compress_preset == 1) {
-        preset = ctp::CompressionPreset::FAST;
-      } else if (compress_preset == 3) {
-        preset = ctp::CompressionPreset::BEST;
-      }
+      const ctp::CompressionPreset preset =
+          PresetFor(static_cast<uint32_t>(compress_lib),
+                    static_cast<uint32_t>(compress_preset));
 
       // Create decompressor
       const auto factory_t0 = std::chrono::steady_clock::now();
@@ -4034,12 +4203,8 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
       UnpackShuffle(static_cast<uint32_t>(ctx.compress_preset_));
   const bool requested_quant =
       UnpackQuantEnabled(static_cast<uint32_t>(ctx.compress_preset_));
-  ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-  if (requested_preset == 1) {
-    preset = ctp::CompressionPreset::FAST;
-  } else if (requested_preset == 3) {
-    preset = ctp::CompressionPreset::BEST;
-  }
+  const ctp::CompressionPreset preset = PresetFor(
+      static_cast<uint32_t>(ctx.compress_lib_), requested_preset);
   auto compressor = ctp::CompressionFactory::GetPreset(library_name, preset);
   if (!compressor) {
     return false;
@@ -4185,8 +4350,10 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
   // Record the shuffle that was ACTUALLY applied, not the one requested -- a declined shuffle ...
   CompressionHeader header(
       ctx.compress_lib_,
-      PackStored(requested_preset, applied_shuffle, applied_quant,
-                 quant_params),
+      static_cast<uint32_t>(ctx.compress_lib_) == kNpSettingWireId
+          ? PackSetting(requested_preset)
+          : PackStored(requested_preset, applied_shuffle, applied_quant,
+                       quant_params),
       size, compressed_size);
   QuantHeaderExtension quant_ext{};
   if (applied_quant) {
@@ -4275,12 +4442,8 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
     std::memcpy(&stored_ext, stored + sizeof(CompressionHeader),
                 sizeof(stored_ext));
   }
-  ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-  if (stored_preset == 1) {
-    preset = ctp::CompressionPreset::FAST;
-  } else if (stored_preset == 3) {
-    preset = ctp::CompressionPreset::BEST;
-  }
+  const ctp::CompressionPreset preset =
+      PresetFor(header->compress_lib_, stored_preset);
   auto decompressor = ctp::CompressionFactory::GetPreset(library_name, preset);
   if (!decompressor) {
     return 3;

@@ -426,23 +426,13 @@ std::vector<CompressionPrediction> NeuroPressNNPredictor::PredictBatch(
                           end_time - start_time)
                           .count() /
                       static_cast<double>(batch.size());
-    const double kPredTimeFloor =
-        static_cast<double>(gpu::NeuroPressPredTimeFloorMs());
     for (size_t i = 0; i < batch.size(); ++i) {
-      // Already clamped inside the kernel (nn_gpu.cu order: sanity
-      // ceiling first, then the policy floors/caps). Repeat the policy half
-      // here so the CPU and GPU paths read identically.
-      //
-      // Upstream's literal 100, not the configurable cap: this entry point
-      // takes no RankingWeights and therefore has no cost model, so there is
-      // no cap to honour. Callers that raise the ceiling go through
-      // PredictBatchDeviceStats, which carries the weights.
-      results.emplace_back(
-          std::max(0.1, std::min(100.0, static_cast<double>(ratio[i]))),
-          std::max(0.0, std::min(120.0, static_cast<double>(psnr[i]))),
-          std::max(kPredTimeFloor, static_cast<double>(comp_time[i])),
-          std::max(kPredTimeFloor, static_cast<double>(decomp_time[i])),
-          infer_ms);
+      // No flooring/capping policy: values used as-is. Guard non-negative time only.
+      double ct = std::max(0.0, static_cast<double>(comp_time[i]));
+      double dt = std::max(0.0, static_cast<double>(decomp_time[i]));
+      double ratio_val = static_cast<double>(ratio[i]);
+      double psnr_val = std::max(0.0, std::min(120.0, static_cast<double>(psnr[i])));
+      results.emplace_back(ratio_val, psnr_val, ct, dt, infer_ms);
     }
     return results;
   }
@@ -532,8 +522,6 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
     rank.w_decompress_time = weights->w_cost_decompress_time;
     rank.w_io = weights->w_cost_io;
     rank.bandwidth_bytes_per_ms = weights->bandwidth_bytes_per_ms;
-    rank.ratio_cap = weights->ratio_cap;
-    rank.min_time_ms = weights->min_time_ms;
     // The two mask inputs.
     //
     // The bound is the CHUNK's, i.e. upstream's cfg.error_bound -- NOT
@@ -601,21 +589,16 @@ NeuroPressNNPredictor::PredictBatchDeviceStats(
       std::chrono::duration<double, std::milli>(end_time - start_time).count() /
       static_cast<double>(batch.size());
 
-  const double kRatioCap = (weights != nullptr) ? weights->ratio_cap : 100.0;
-  const double kPredTimeFloor =
-      static_cast<double>(gpu::NeuroPressPredTimeFloorMs());
   std::vector<CompressionPrediction> results;
   results.reserve(batch.size());
   for (size_t i = 0; i < batch.size(); ++i) {
-    // Identical post-clamps to PredictBatch's GPU branch, so a chunk routed
-    // through either path lands on the same numbers -- and with the SAME cap
-    // the kernel used, or this re-clamp silently undoes a raised ceiling.
+    // No time floor and no ratio clamp: the kernel's values as they are
+    // (times already kept non-negative there). PSNR keeps its [0, 120] clamp.
     results.emplace_back(
-        std::max(0.1, std::min(kRatioCap, static_cast<double>(ratio[i]))),
+        static_cast<double>(ratio[i]),
         std::max(0.0, std::min(120.0, static_cast<double>(psnr[i]))),
-        std::max(kPredTimeFloor, static_cast<double>(comp_time[i])),
-        std::max(kPredTimeFloor, static_cast<double>(decomp_time[i])),
-        infer_ms);
+        static_cast<double>(comp_time[i]),
+        static_cast<double>(decomp_time[i]), infer_ms);
   }
   return results;
 #else

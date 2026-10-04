@@ -29,10 +29,6 @@ namespace ctp::compress::model::gpu {
 /** @brief Opaque device-resident weight handle (defined in the .cu TU). */
 struct NeuroPressGpuWeights;
 
-/** Floor on predicted compress/decompress times, in ms. Default 1 (upstream);
- *  CLIO_NEUROPRESS_PRED_TIME_FLOOR_MS overrides. */
-float NeuroPressPredTimeFloorMs();
-
 /**
  * @brief Allocate device weight storage and upload from host-parsed .nnwt
  * data (same flattened layout NeuroPressNNPredictor::Load() already parses:
@@ -205,17 +201,6 @@ struct GpuRankParams {
   double w_decompress_time = 1.0;
   double w_io = 1.0;
   double bandwidth_bytes_per_ms = 5e6;
-
-  /**
-   * Compression-ratio ceiling, upstream's RATIO_CAP. Default 100 matches
-   * nn_gpu.cu exactly. It is applied to the PREDICTION in the forward pass and
-   * again in the ranking, so raising it moves both halves together -- see the
-   * note at the InferKernelDeviceStats launch.
-   */
-  double ratio_cap = 100.0;
-
-  /** Time floor in ms (RankingWeights::min_time_ms). */
-  double min_time_ms = 1.0;
 
   /**
    * The two mask inputs, applied in-kernel exactly as nn_gpu.cu does:

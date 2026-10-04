@@ -85,7 +85,8 @@ elseif(CLIO_CORE_ENABLE_ROCM)
 endif()
 
 target_compile_definitions(test_compressor_functional PRIVATE
-  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/")
+  CLIO_CTP_NEUROPRESS_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/"
+  CLIO_CTP_NEUROPRESS_V2_WEIGHTS_DIR="${CMAKE_SOURCE_DIR}/context-transport-primitives/src/compress/model/weights/v2")
 
 # Register functional tests - use test names (simple_test.h filters by name).
 #
@@ -127,6 +128,14 @@ add_test(NAME compressor_dynamic_neuropress
 # Sweeps in the residency case, whose host arm needs staging (STAGE_H2D copies
 # the chunk UP to the device -- not a host fallback).
 set_tests_properties(compressor_dynamic_neuropress PROPERTIES
+    ENVIRONMENT "CLIO_NEUROPRESS_STAGE_H2D=1")
+
+# NeuroPress v2: selection over the 45 GPU settings, online learning,
+# exploration and adoption, each stored blob read back byte-for-byte.
+add_test(NAME compressor_neuropress_v2
+    COMMAND test_compressor_functional "[v2]")
+# Host SHM input staged to the device, as for v1 (CLIO_NEUROPRESS_REQUIRE_DEVICE).
+set_tests_properties(compressor_neuropress_v2 PROPERTIES
     ENVIRONMENT "CLIO_NEUROPRESS_STAGE_H2D=1")
 
 # Exploration gets its own entry as well as being swept up by the tag filter

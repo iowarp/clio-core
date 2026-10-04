@@ -22,8 +22,10 @@
 #define CLIO_CTP_COMPRESS_MODEL_PREDICTOR_H_
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -195,10 +197,6 @@ struct RankingWeights {
   double w_cost_decompress_time = 1.0;
   double w_cost_io = 1.0;
   double bandwidth_bytes_per_ms = 5e6;
-  /** Compression-ratio ceiling (upstream RATIO_CAP). 100 = upstream. */
-  double ratio_cap = 100.0;
-  /** Time floor in ms; the CTE bridge sets NeuroPressCost::kMinTimeMs. */
-  double min_time_ms = 1.0;
 
   double Score(const CompressionPrediction &p) const {
     return w_ratio * p.compression_ratio -
@@ -209,27 +207,34 @@ struct RankingWeights {
    * Cost-model score for one candidate. `data_size_bytes` is the chunk being
    * compressed (DataFeatures::chunk_size_bytes). Falls back to Score(p) when
    * the cost model is off.
+   *
+   * Time and ratio are used as-is (no flooring/capping policy). A non-finite
+   * or non-positive ratio returns -infinity (masked, worst score).
    */
   double Score(const CompressionPrediction &p, double data_size_bytes) const {
     if (!use_cost_model) {
       return Score(p);
     }
-    // Same policy clamps NeuroPress applies before ranking (nn_gpu.cu):
-    // times floor at min_time_ms (NeuroPressCost::kMinTimeMs), ratio caps at 100x.
-    double ct = std::max(min_time_ms, p.compression_time_ms);
+    // No flooring/capping: use times and ratio as-is. Guard non-physical only.
+    double ct = std::max(0.0, p.compression_time_ms);
     // A model that doesn't predict decompression time reports 0; use the
     // compression-time estimate rather than scoring it as free.
     double dt = (p.decompression_time_ms > 0.0)
-                    ? std::max(min_time_ms, p.decompression_time_ms)
+                    ? p.decompression_time_ms
                     : ct;
-    // Floor at 0.1 as well as capping at 100: nn_gpu.cu clamps ratio to
-    // [0.1, 1e5] before the policy cap, so io_cost can never be divided by a
-    // vanishing or negative ratio. Callers whose predictor already floors
-    // (NeuroPressNNPredictor does) are unaffected; this protects the ones
-    // that do not.
-    double ratio = std::max(0.1, std::min(ratio_cap, p.compression_ratio));
+    // Guard against non-finite or <= 0 ratio: score as -infinity (masked).
+    double ratio = p.compression_ratio;
+    bool is_ratio_valid = std::isfinite(ratio) && ratio > 0.0;
+
     double bw = (bandwidth_bytes_per_ms > 0.0) ? bandwidth_bytes_per_ms : 1.0;
-    double io_cost = (ratio > 0.0) ? (data_size_bytes / (ratio * bw)) : 1e30;
+    double io_cost = is_ratio_valid ? (data_size_bytes / (ratio * bw)) : 1e30;
+
+    // Guard time finiteness as well.
+    bool is_time_valid = std::isfinite(ct) && std::isfinite(dt);
+    if (!is_time_valid || !is_ratio_valid) {
+      return -std::numeric_limits<double>::infinity();  // Masked: worst possible score.
+    }
+
     double cost = w_cost_compress_time * ct + w_cost_decompress_time * dt +
                   w_cost_io * io_cost;
     return -cost;  // lower cost is better
