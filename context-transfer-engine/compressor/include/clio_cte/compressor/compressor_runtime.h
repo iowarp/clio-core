@@ -516,11 +516,43 @@ private:
    */
   void LogV2Predictions(const std::string& blob, clio::run::u64 chunk_size,
                         const ctp::compress::model::NeuroPressV2Features& f,
-                        const std::vector<CompressionStats>& stats);
+                        const std::vector<CompressionStats>& stats,
+                        double bw, double select_ms, double convert_ms);
+
+  /**
+   * @brief Append one measured (chunk, setting) outcome to
+   * CLIO_NEUROPRESS_V2_EXPLORE_LOG (no-op when unset): the primary and every
+   * explored alternative, with the tier bandwidth the chunk was costed at.
+   * @param blob     blob name
+   * @param bw       the chunk's tier bandwidth, bytes per ms
+   * @param setting  setting index
+   * @param role     "primary" or "alt"
+   * @param comp_ms  measured compress ms (shuffle included)
+   * @param decomp_ms measured decompress ms, < 0 when not measured
+   * @param ratio    measured ratio
+   * @param cost     cost under the chunk's tier
+   * @param adopted  whether this outcome was the one stored
+   */
+  void LogV2Measured(const std::string& blob, double bw, int setting,
+                     const char* role, double comp_ms, double decomp_ms,
+                     double ratio, double cost, bool adopted);
+
+  /**
+   * @brief The next chunk's tier bandwidth under CLIO_NEUROPRESS_TIERS
+   * ("bw_bytes_per_ms:count,..." dealt round-robin in arrival order, e.g.
+   * "12e6:1,1e6:3,0.5e6:3,0.25e6:3"); 0 when unset (the single resolved
+   * CLIO_NEUROPRESS_COST_BW applies).
+   */
+  double NextV2TierBw();
+
+  /** @brief Selection wall ms (conversion excluded) and conversion ms of this
+   *  thread's last v2 ranking. */
+  static void TakeV2SelectTiming(double* select_ms, double* convert_ms);
 
   /** @return the v2 cost weights: the resolved NeuroPress weights, with the
    *  time terms zeroed in best mode (ratio-only, as v1's best mode). */
-  ctp::compress::model::NeuroPressV2CostWeights V2CostWeights() const;
+  ctp::compress::model::NeuroPressV2CostWeights V2CostWeights(
+      double bw = 0.0) const;
 
   /**
    * @brief v2's ranking of one chunk (neuropress_v2_selection.cc).
@@ -543,7 +575,7 @@ private:
       const void* chunk, clio::run::u64 chunk_size, const Context& context,
       double* out_entropy, double* out_mad, double* out_second_deriv,
       bool* out_gpu_failed,
-      ctp::compress::model::NeuroPressV2Features* out_features);
+      ctp::compress::model::NeuroPressV2Features* out_features, double bw);
 
   /**
    * @brief v2 online learning from the primary's measured result.
@@ -562,7 +594,7 @@ private:
   double NeuroPressV2LearnPrimary(
       const ctp::compress::model::NeuroPressV2Features& features,
       const CompressionStats& predicted, const Context& context,
-      clio::run::u64 chunk_size, bool* trained);
+      clio::run::u64 chunk_size, double bw, bool* trained);
 
   /** @brief A v2 exploration result: the best alternative, if any won. */
   struct V2ExploreWinner {
@@ -590,6 +622,7 @@ private:
    * @param features     the chunk's v2 inputs
    */
   V2ExploreWinner NeuroPressV2Explore(
+      const std::string& blob, double bw,
       const void* chunk, clio::run::u64 chunk_size,
       const std::vector<CompressionStats>& stats, int primary_setting,
       double primary_cost, bool measure_dt,
@@ -703,7 +736,9 @@ private:
          feeds the executed outcome back to HCompressObserve(). */
       bool* out_hc_ranked = nullptr,
       /* NeuroPress v2 only: receives the chunk's v2 inputs, for learning. */
-      ctp::compress::model::NeuroPressV2Features* out_v2_features = nullptr);
+      ctp::compress::model::NeuroPressV2Features* out_v2_features = nullptr,
+      /* NeuroPress v2 only: this chunk's tier bandwidth (0 = default). */
+      double v2_bw = 0.0);
 
   /**
    * @brief HCompress's half of EstCompressionStats (hcompress_selection.cc).

@@ -76,6 +76,14 @@ struct RankOut {
   int order[kMaxSettings];   ///< settings, cheapest first
 };
 
+/** @brief One online update: the chunk's raw inputs and measured labels. */
+struct TrainArgs {
+  float x[4] = {0.0f, 0.0f, 0.0f, 0.0f};  ///< raw inputs (before scaling)
+  int setting = -1;                       ///< setting that was measured
+  double label[3] = {-1.0, -1.0, -1.0};   ///< ct ms, dt ms, ratio; <= 0 = none
+  double lr = 0.0;                        ///< fraction of error removed
+};
+
 /**
  * Allocate device memory and copy host bytes into it.
  * @param host  source
@@ -91,6 +99,45 @@ bool Upload(const void *host, size_t bytes, void **dev);
  */
 bool CopyToDevice(void *dev, size_t offset_bytes, const void *host,
                   size_t bytes);
+
+/**
+ * Convert n device elements of a NeuroPressV2Dtype to float32 on `stream`
+ * into this thread's scratch buffer (grown as needed). The conversion is
+ * bracketed by CUDA events and synchronised so its GPU time can be reported
+ * and excluded from every measurement.
+ * @param convert_ms receives the conversion's GPU time in ms
+ * @return the scratch, nullptr on a CUDA error
+ */
+float *ConvertToFloat32(const void *in, size_t n, int dtype, void *stream,
+                        double *convert_ms);
+
+/**
+ * One normalised-LMS step on the output rows of one setting, entirely on the
+ * GPU: the kernel recomputes the last hidden layer from the raw inputs and
+ * updates the labelled rows of d_params in place, on `stream`, without
+ * synchronising. An event is recorded after it so inference can wait on it.
+ * @param d_params flat parameters on the device (updated)
+ * @param desc     their layout
+ * @param args     inputs, setting, labels, learning rate
+ * @param stream   cudaStream_t for the update
+ * @param done     cudaEvent_t recorded after the update
+ * @param d_abs_err device double receiving mean |log error| before the step
+ * @return false on a launch error
+ */
+bool TrainOnDevice(float *d_params, const NetDesc &desc, const TrainArgs &args,
+                   void *stream, void *done, double *d_abs_err);
+
+/** @return a new non-blocking stream and an event (nullptr on failure). */
+bool CreateStreamAndEvent(void **stream, void **event);
+
+/** Destroy what CreateStreamAndEvent made (nullptr is fine). */
+void DestroyStreamAndEvent(void *stream, void *event);
+
+/** Make `stream` wait for `event` (no host synchronisation). */
+bool StreamWaitEvent(void *stream, void *event);
+
+/** Copy device bytes to the host after `stream` drains. */
+bool CopyToHost(void *host, const void *dev, size_t bytes, void *stream);
 
 /** Free a device buffer from Upload (nullptr is fine). */
 void FreeDevice(void *dev);

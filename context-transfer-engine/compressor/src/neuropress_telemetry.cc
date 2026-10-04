@@ -569,7 +569,7 @@ PhaseLog *PhaseLogInstance() {
                      "nn_batch_chunks,choice_ms,factory_ms,compress_ms,"
                      "decompress_ms,io_ms,io_start_ns,preproc_ms,h2d_ms,h2d_start_ns,wall_ms,other_ms,"
                      "lib,reused,explore_ms,sgd_ms,explored,sgd_updates,"
-                     "stored_bytes\n");
+                     "stored_bytes,convert_ms\n");
       }
     }
     return l;
@@ -604,6 +604,7 @@ void MergePhases(ChunkPhases *a, const ChunkPhases &b) {
   keep_min(&a->h2d_start_ns, b.h2d_start_ns);
   keep_min(&a->io_start_ns, b.io_start_ns);
   if (b.reused >= 0) a->reused = b.reused;
+  if (b.convert_ms > 0.0) a->convert_ms += b.convert_ms;
   a->explore_ms += b.explore_ms;
   a->sgd_ms += b.sgd_ms;
   a->explored += b.explored;
@@ -620,8 +621,9 @@ bool PhaseLogEnabled() {
 }
 
 void RecordSelectionPhases(double stats_ms, double nn_ms, double choice_ms,
-                           bool reused) {
+                           bool reused, double convert_ms) {
   ChunkPhases p;
+  p.convert_ms = convert_ms;
   p.stats_ms = stats_ms;
   p.nn_ms = nn_ms;
   p.choice_ms = choice_ms;
@@ -695,7 +697,7 @@ void LogChunkPhases(const std::string &blob_name, const char *path,
   std::fprintf(
       log->fp,
       "%ld,%s,%s,%zu,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%.6f,%.6f,%d,%s,%.6f,%.6f,"
-      "%d,%d,%zu\n",
+      "%d,%d,%zu,%.6f\n",
       log->seq++, blob_name.c_str(), path, chunk_bytes,
       cell(p.stats_ms, write).c_str(), cell(p.nn_ms, write).c_str(),
       write ? "1" : "",
@@ -705,9 +707,9 @@ void LogChunkPhases(const std::string &blob_name, const char *path,
       cell(p.io_start_ns, true).c_str(),
       cell(p.preproc_ms, write).c_str(), cell(p.h2d_ms, true).c_str(),
       cell(p.h2d_start_ns, true).c_str(),
-      wall_ms, wall_ms - covered, lib,
+      wall_ms - p.convert_ms, wall_ms - p.convert_ms - covered, lib,
       (write && p.reused >= 0) ? (p.reused ? "1" : "0") : "", p.explore_ms,
-      p.sgd_ms, p.explored, p.sgd_updates, stored_bytes);
+      p.sgd_ms, p.explored, p.sgd_updates, stored_bytes, p.convert_ms);
   std::fflush(log->fp);
 }
 

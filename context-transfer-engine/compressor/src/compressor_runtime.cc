@@ -902,7 +902,8 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     const ctp::compress::preprocess::PredictionReuseContext* reuse,
     ctp::compress::preprocess::PredictionReuseOutcome* out_outcome,
     bool* out_hc_ranked,
-    ctp::compress::model::NeuroPressV2Features* out_v2_features) {
+    ctp::compress::model::NeuroPressV2Features* out_v2_features,
+    double v2_bw) {
   std::vector<CompressionStats> results;
   if (out_ranked_by_cost) *out_ranked_by_cost = false;
   if (out_neuropress_gpu_failed) *out_neuropress_gpu_failed = false;
@@ -912,7 +913,7 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   if (NeuroPressV2Active(context)) {
     auto v2_stats = NeuroPressV2RankChunk(
         chunk, chunk_size, context, out_entropy, out_mad, out_second_deriv,
-        out_neuropress_gpu_failed, out_v2_features);
+        out_neuropress_gpu_failed, out_v2_features, v2_bw);
     if (!v2_stats.empty() && out_ranked_by_cost) *out_ranked_by_cost = true;
     return v2_stats;
   }
@@ -1425,8 +1426,12 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     const void* sel_device_stats = nullptr;
     // HCompress ranked THIS chunk, so its executed outcome is fed back.
     bool hc_ranked = false;
-    // NeuroPress v2's inputs for this chunk, for its online learning.
+    // NeuroPress v2's inputs for this chunk, for its online learning; the
+    // chunk's storage tier (CLIO_NEUROPRESS_TIERS, round-robin on arrival);
+    // and its selection timing with the float32 conversion kept out.
     ctp::compress::model::NeuroPressV2Features sel_v2_features;
+    const double v2_bw = NeuroPressV2Active(context) ? NextV2TierBw() : 0.0;
+    double v2_select_ms = 0.0, v2_convert_ms = 0.0;
     std::vector<CompressionStats> stats;
     if (!config_.neuropress_static_lib_.empty()) {
       // Control condition: one candidate, no inference.
@@ -1462,7 +1467,8 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                               &neuropress_gpu_failed, &sel_device_stats,
                               np_reuse_on ? &np_reuse_ctx : nullptr,
                               np_reuse_on ? &np_reuse_outcome : nullptr,
-                              &hc_ranked, &sel_v2_features);
+                              &hc_ranked, &sel_v2_features, v2_bw);
+      TakeV2SelectTiming(&v2_select_ms, &v2_convert_ms);
       phases_selected = phase_log && TakeSelectionPhases(&phases);
     }
 
@@ -1667,7 +1673,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       }
       if (NeuroPressV2Active(context)) {
         LogV2Predictions(task->blob_name_.str(), chunk_size, sel_v2_features,
-                         stats);
+                         stats, v2_bw, v2_select_ms, v2_convert_ms);
       }
       LogNeuroPressSelection(task->blob_name_.str(), chunk_size, sel_entropy,
                              sel_mad, sel_second_deriv, best_lib, best_preset,
@@ -1780,7 +1786,22 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       RecordV2Decomp(task->blob_name_.str(), sel_v2_features, best_preset);
       bool v2_trained = false;
       const double v2_err = NeuroPressV2LearnPrimary(
-          sel_v2_features, stats.front(), context, chunk_size, &v2_trained);
+          sel_v2_features, stats.front(), context, chunk_size, v2_bw,
+          &v2_trained);
+      // The primary's measured outcome, for the exhaustive / explore log.
+      const auto v2w = V2CostWeights(v2_bw);
+      const bool v2_dt_measured = context.actual_decompress_time_ms_ > 0.0;
+      const double v2_primary_cost =
+          v2w.w_ct * context.actual_compress_time_ms_ +
+          v2w.w_dt * (v2_dt_measured ? context.actual_decompress_time_ms_
+                                     : stats.front().decompress_time_ms_) +
+          v2w.w_io * static_cast<double>(chunk_size) /
+              (context.actual_compression_ratio_ * v2w.bw_bytes_per_ms);
+      const int v2_primary_setting = best_preset;
+      const double v2_primary_ct = context.actual_compress_time_ms_;
+      const double v2_primary_dt =
+          v2_dt_measured ? context.actual_decompress_time_ms_ : -1.0;
+      const double v2_primary_ratio = context.actual_compression_ratio_;
       if (v2_trained) {
         ++phases.sgd_updates;
         np_sgd_epoch_.fetch_add(1, std::memory_order_relaxed);
@@ -1795,17 +1816,10 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                         config_.neuropress_exploration_threshold_))) {
         explore_t0 = std::chrono::steady_clock::now();
         explore_ran = true;
-        const auto w = V2CostWeights();
-        const bool dt_measured = context.actual_decompress_time_ms_ > 0.0;
-        const double primary_cost =
-            w.w_ct * context.actual_compress_time_ms_ +
-            w.w_dt * (dt_measured ? context.actual_decompress_time_ms_
-                                  : stats.front().decompress_time_ms_) +
-            w.w_io * static_cast<double>(chunk_size) /
-                (context.actual_compression_ratio_ * w.bw_bytes_per_ms);
         V2ExploreWinner win = NeuroPressV2Explore(
-            chunk_data, chunk_size, stats, best_preset, primary_cost,
-            dt_measured, sel_v2_features);
+            task->blob_name_.str(), v2_bw, chunk_data, chunk_size, stats,
+            best_preset, v2_primary_cost, v2_dt_measured, sel_v2_features);
+        phases.explored += win.measured;
         phases.sgd_updates += win.trained;
         if (win.trained > 0) {
           np_sgd_epoch_.fetch_add(1, std::memory_order_relaxed);
@@ -1869,6 +1883,9 @@ clio::run::TaskResume Runtime::DynamicSchedule(
                           win.measured);
         }
       }
+      LogV2Measured(task->blob_name_.str(), v2_bw, v2_primary_setting,
+                    "primary", v2_primary_ct, v2_primary_dt, v2_primary_ratio,
+                    v2_primary_cost, !stored_by_exploration);
     }
     if ((config_.neuropress_online_learning_enabled_ ||
          config_.neuropress_best_mode_) &&

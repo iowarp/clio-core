@@ -34,9 +34,9 @@
 /**
  * @file neuropress_v2_selection.cc
  * @brief NeuroPress v2 in the compressor: ranking a chunk over the 45 GPU
- * settings, online learning from measured results (write and read), and
- * exploration of the next-ranked settings. v1 is untouched; exactly one of
- * the two is loaded (see Create).
+ * settings, online learning from measured results (write and read),
+ * exploration of the next-ranked settings, per-chunk storage tiers and the
+ * v2 logs. v1 is untouched; exactly one of the two is loaded (see Create).
  */
 
 #include <clio_ctp/compress/compress_factory.h>
@@ -44,16 +44,20 @@
 #include <clio_ctp/compress/preprocess/data_stats.h>
 #include <clio_ctp/compress/preprocess/data_stats_gpu.h>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <vector>
 
 #include "clio_cte/compressor/compressor_runtime.h"
 #include "clio_cte/compressor/neuropress_path_trace.h"
+#include "clio_cte/compressor/neuropress_telemetry.h"
 
 namespace clio::cte::compressor {
 
@@ -78,37 +82,82 @@ double V2Cost(const ctp::compress::model::NeuroPressV2CostWeights &w,
          w.w_io * bytes / (ratio * w.bw_bytes_per_ms);
 }
 
+/** @brief This thread's last v2 selection timing. */
+struct SelectTiming {
+  double select_ms = 0.0;   ///< wall ms, conversion excluded
+  double convert_ms = 0.0;  ///< float32 conversion ms (excluded everywhere)
+};
+thread_local SelectTiming g_select_timing;
+
+/** @return CLIO_NEUROPRESS_TIERS as one bandwidth per round-robin slot. */
+const std::vector<double> &TierPattern() {
+  static const std::vector<double> pattern = [] {
+    std::vector<double> p;
+    const char *e = std::getenv("CLIO_NEUROPRESS_TIERS");
+    if (e == nullptr) return p;
+    std::stringstream ss(e);
+    for (std::string item; std::getline(ss, item, ',');) {
+      const size_t colon = item.find(':');
+      const double bw = std::strtod(item.c_str(), nullptr);
+      const long n = colon == std::string::npos
+                         ? 1 : std::strtol(item.c_str() + colon + 1, nullptr, 10);
+      for (long k = 0; bw > 0.0 && k < n; ++k) p.push_back(bw);
+    }
+    return p;
+  }();
+  return pattern;
+}
+
+/** @return a CSV log opened for appending, or nullptr when env is unset. */
+std::ofstream *OpenLog(const char *env) {
+  const char *path = std::getenv(env);
+  if (path == nullptr || *path == '\0') return nullptr;
+  auto *out = new std::ofstream(path, std::ios::app);
+  *out << std::setprecision(9);
+  return out;
+}
+
 }  // namespace
 
-ctp::compress::model::NeuroPressV2CostWeights Runtime::V2CostWeights() const {
+ctp::compress::model::NeuroPressV2CostWeights Runtime::V2CostWeights(
+    double bw) const {
   const auto cw = NeuroPressResolvedCostWeights();
   ctp::compress::model::NeuroPressV2CostWeights w;
   w.w_ct = config_.neuropress_best_mode_ ? 0.0 : cw.ct;
   w.w_dt = config_.neuropress_best_mode_ ? 0.0 : cw.dt;
   w.w_io = cw.io;
-  w.bw_bytes_per_ms = cw.bw;
+  w.bw_bytes_per_ms = bw > 0.0 ? bw : cw.bw;
   return w;
+}
+
+double Runtime::NextV2TierBw() {
+  static std::atomic<unsigned long long> seq{0};
+  const auto &p = TierPattern();
+  if (p.empty()) return 0.0;
+  return p[seq.fetch_add(1, std::memory_order_relaxed) % p.size()];
+}
+
+void Runtime::TakeV2SelectTiming(double *select_ms, double *convert_ms) {
+  *select_ms = g_select_timing.select_ms;
+  *convert_ms = g_select_timing.convert_ms;
+  g_select_timing = SelectTiming{};
 }
 
 void Runtime::LogV2Predictions(
     const std::string &blob, clio::run::u64 chunk_size,
     const ctp::compress::model::NeuroPressV2Features &f,
-    const std::vector<CompressionStats> &stats) {
-  static const char *path = std::getenv("CLIO_NEUROPRESS_V2_PRED_LOG");
-  if (path == nullptr || *path == '\0' || !neuropress_v2_) return;
+    const std::vector<CompressionStats> &stats, double bw, double select_ms,
+    double convert_ms) {
+  static std::ofstream *out = OpenLog("CLIO_NEUROPRESS_V2_PRED_LOG");
+  if (out == nullptr || !neuropress_v2_) return;
   static std::mutex mu;
   std::lock_guard<std::mutex> lock(mu);
-  static std::ofstream out = [] {
-    std::ofstream o(path, std::ios::app);
-    o << std::setprecision(9);
-    return o;
-  }();
   static bool header = false;
   const int n = ctp::kGpuSettingCount;
   if (!header) {
-    out << "blob,bytes,x0,x1,x2,x3,updates";
-    for (int s = 0; s < n; ++s) out << ",ct" << s << ",dt" << s << ",r" << s;
-    out << "\n";
+    *out << "blob,bytes,tier_bw,select_ms,convert_ms,x0,x1,x2,x3,updates";
+    for (int s = 0; s < n; ++s) *out << ",ct" << s << ",dt" << s << ",r" << s;
+    *out << "\n";
     header = true;
   }
   std::vector<const CompressionStats *> by(n, nullptr);
@@ -117,19 +166,40 @@ void Runtime::LogV2Predictions(
       by[st.compress_preset_] = &st;
     }
   }
-  out << blob << "," << chunk_size;
-  for (float x : f.x) out << "," << x;
-  out << "," << neuropress_v2_->UpdateCount();
+  *out << blob << "," << chunk_size << "," << V2CostWeights(bw).bw_bytes_per_ms
+       << "," << select_ms << "," << convert_ms;
+  for (float x : f.x) *out << "," << x;
+  *out << "," << neuropress_v2_->UpdateCount();
   for (int s = 0; s < n; ++s) {
     if (by[s] == nullptr) {
-      out << ",,,";
+      *out << ",,,";
     } else {
-      out << "," << by[s]->compress_time_ms_ << ","
-          << by[s]->decompress_time_ms_ << "," << by[s]->compression_ratio_;
+      *out << "," << by[s]->compress_time_ms_ << ","
+           << by[s]->decompress_time_ms_ << "," << by[s]->compression_ratio_;
     }
   }
-  out << "\n";
-  out.flush();
+  *out << "\n";
+  out->flush();
+}
+
+void Runtime::LogV2Measured(const std::string &blob, double bw, int setting,
+                            const char *role, double comp_ms, double decomp_ms,
+                            double ratio, double cost, bool adopted) {
+  static std::ofstream *out = OpenLog("CLIO_NEUROPRESS_V2_EXPLORE_LOG");
+  if (out == nullptr) return;
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lock(mu);
+  static bool header = false;
+  if (!header) {
+    *out << "blob,tier_bw,setting,spec,role,comp_ms,decomp_ms,ratio,cost,"
+            "adopted\n";
+    header = true;
+  }
+  *out << blob << "," << V2CostWeights(bw).bw_bytes_per_ms << "," << setting
+       << "," << ctp::GpuSettingSpec(setting) << "," << role << "," << comp_ms
+       << "," << decomp_ms << "," << ratio << "," << cost << ","
+       << (adopted ? 1 : 0) << "\n";
+  out->flush();
 }
 
 #if CTP_ENABLE_NEUROPRESS_GPU
@@ -138,22 +208,20 @@ std::vector<CompressionStats> Runtime::NeuroPressV2RankChunk(
     const void *chunk, clio::run::u64 chunk_size, const Context &context,
     double *out_entropy, double *out_mad, double *out_second_deriv,
     bool *out_gpu_failed,
-    ctp::compress::model::NeuroPressV2Features *out_features) {
+    ctp::compress::model::NeuroPressV2Features *out_features, double bw) {
   using ctp::compress::model::NeuroPressV2Predictor;
-  const auto w = V2CostWeights();
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto w = V2CostWeights(bw);
   ctp::compress::model::NeuroPressV2Features f;
   std::vector<ctp::compress::model::NeuroPressV2Prediction> ranked;
-  double entropy = 0.0, mad = 0.0, d2 = 0.0;
+  double entropy = 0.0, mad = 0.0, d2 = 0.0, convert_ms = 0.0;
   if (ctp::IsDevicePointer(chunk)) {
-    // As v1: statistics stay on the GPU and the ranking chains on the stream.
+    // Converted to float32 by value on the GPU (timed, then excluded), then
+    // the statistics and the ranking chain on the same stream.
     void *stream = ctp::DeviceStatsStream();
-    const void *st =
-        (context.data_type_ == 2)
-            ? ctp::ComputeDeviceStatsResidentF32From64(
-                  chunk, chunk_size / sizeof(double), stream)
-            : ctp::ComputeDeviceStatsResident(
-                  chunk, chunk_size / sizeof(float), ctp::DataType::FLOAT32,
-                  stream);
+    const void *st = NeuroPressV2Predictor::DeviceStatsAsFloat32(
+        chunk, chunk_size, context.data_type_, stream);
+    convert_ms = NeuroPressV2Predictor::LastConvertMs();
     if (st != nullptr) {
       ranked = neuropress_v2_->RankDevice(st, chunk_size, w, stream, &f);
       ctp::ReadDeviceFeatureStats(st, &entropy, &mad, &d2, stream);
@@ -165,23 +233,23 @@ std::vector<CompressionStats> Runtime::NeuroPressV2RankChunk(
       return {};
     }
   } else {
-    // Host chunk: the same statistics in double precision on the host. float64
-    // is converted to float32 first, as the device path does.
-    std::vector<float> narrowed;
-    const float *values = static_cast<const float *>(chunk);
-    size_t n = chunk_size / sizeof(float);
-    if (context.data_type_ == 2) {
-      const double *d = static_cast<const double *>(chunk);
-      narrowed.assign(d, d + chunk_size / sizeof(double));
-      values = narrowed.data();
-      n = narrowed.size();
-    }
-    if (n == 0) return {};
-    const auto s = NeuroPressV2Predictor::ComputeStats(values, n);
+    const auto c0 = std::chrono::steady_clock::now();
+    const std::vector<float> values = NeuroPressV2Predictor::ToFloat32Host(
+        chunk, chunk_size, context.data_type_);
+    convert_ms = std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - c0).count();
+    if (values.empty()) return {};
+    const auto s = NeuroPressV2Predictor::ComputeStats(values.data(),
+                                                       values.size());
     f = NeuroPressV2Predictor::MakeFeatures(chunk_size, s);
     ranked = neuropress_v2_->RankHost(f, chunk_size, w);
     entropy = s.entropy, mad = s.mad, d2 = s.d2;
   }
+  const double wall = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+  g_select_timing = SelectTiming{std::max(0.0, wall - convert_ms), convert_ms};
+  RecordSelectionPhases(-1.0, std::max(0.0, wall - convert_ms), -1.0,
+                        /*reused=*/false, convert_ms);
   if (out_entropy) *out_entropy = entropy;
   if (out_mad) *out_mad = mad;
   if (out_second_deriv) *out_second_deriv = d2;
@@ -194,7 +262,8 @@ std::vector<CompressionStats> Runtime::NeuroPressV2RankChunk(
                      p.setting, p.ratio, p.comp_ms, p.decomp_ms, 0.0);
   }
   CLIO_PATH_TRACE("2 infer    v2 ONE forward pass (4->64x4->135), %zu settings "
-                  "ranked; primary=%s", out.size(),
+                  "ranked at %.3g B/ms; primary=%s", out.size(),
+                  w.bw_bytes_per_ms,
                   out.empty() ? "-" : ctp::GpuSettingSpec(
                                           out.front().compress_preset_));
   return out;
@@ -203,9 +272,9 @@ std::vector<CompressionStats> Runtime::NeuroPressV2RankChunk(
 double Runtime::NeuroPressV2LearnPrimary(
     const ctp::compress::model::NeuroPressV2Features &features,
     const CompressionStats &predicted, const Context &context,
-    clio::run::u64 chunk_size, bool *trained) {
+    clio::run::u64 chunk_size, double bw, bool *trained) {
   if (trained) *trained = false;
-  const auto w = V2CostWeights();
+  const auto w = V2CostWeights(bw);
   const double bytes = static_cast<double>(chunk_size);
   const bool dt_measured = context.actual_decompress_time_ms_ > 0.0;
   const double act_dt = dt_measured ? context.actual_decompress_time_ms_
@@ -234,17 +303,19 @@ double Runtime::NeuroPressV2LearnPrimary(
 }
 
 Runtime::V2ExploreWinner Runtime::NeuroPressV2Explore(
-    const void *chunk, clio::run::u64 chunk_size,
-    const std::vector<CompressionStats> &stats, int primary_setting,
-    double primary_cost, bool measure_dt,
+    const std::string &blob, double bw, const void *chunk,
+    clio::run::u64 chunk_size, const std::vector<CompressionStats> &stats,
+    int primary_setting, double primary_cost, bool measure_dt,
     const ctp::compress::model::NeuroPressV2Features &features) {
   V2ExploreWinner win;
-  const auto w = V2CostWeights();
+  const auto w = V2CostWeights(bw);
   const double bytes = static_cast<double>(chunk_size);
   const bool learn = config_.neuropress_online_learning_enabled_ &&
                      !config_.neuropress_best_mode_;
   double best = primary_cost;
   int examined = 0;
+  struct Measured { int setting; double ct, dt, ratio, cost; };
+  std::vector<Measured> rows;
   for (const auto &alt : stats) {
     if (alt.compress_lib_ != kNpSettingWire ||
         alt.compress_preset_ == primary_setting) {
@@ -278,6 +349,7 @@ Runtime::V2ExploreWinner Runtime::NeuroPressV2Explore(
     }
     const double cost =
         V2Cost(w, ct, dt >= 0.0 ? dt : alt.decompress_time_ms_, ratio, bytes);
+    rows.push_back({alt.compress_preset_, ct, dt, ratio, cost});
     CLIO_PATH_TRACE("6 explore  v2 %s ratio=%.3f ct=%.3f ms cost=%.4f vs %.4f",
                     ctp::GpuSettingSpec(alt.compress_preset_), ratio, ct, cost,
                     best);
@@ -292,6 +364,10 @@ Runtime::V2ExploreWinner Runtime::NeuroPressV2Explore(
       win.decomp_ms = dt;
       win.cost = cost;
     }
+  }
+  for (const auto &r : rows) {
+    LogV2Measured(blob, bw, r.setting, "alt", r.ct, r.dt, r.ratio, r.cost,
+                  win.have && r.setting == win.setting);
   }
   return win;
 }
@@ -337,21 +413,23 @@ void Runtime::LearnV2DecompTime(const std::string &blob_key,
 std::vector<CompressionStats> Runtime::NeuroPressV2RankChunk(
     const void *, clio::run::u64, const Context &, double *, double *,
     double *, bool *out_gpu_failed,
-    ctp::compress::model::NeuroPressV2Features *) {
+    ctp::compress::model::NeuroPressV2Features *, double) {
   if (out_gpu_failed) *out_gpu_failed = true;
   return {};
 }
 
 double Runtime::NeuroPressV2LearnPrimary(
     const ctp::compress::model::NeuroPressV2Features &,
-    const CompressionStats &, const Context &, clio::run::u64, bool *trained) {
+    const CompressionStats &, const Context &, clio::run::u64, double,
+    bool *trained) {
   if (trained) *trained = false;
   return 0.0;
 }
 
 Runtime::V2ExploreWinner Runtime::NeuroPressV2Explore(
-    const void *, clio::run::u64, const std::vector<CompressionStats> &, int,
-    double, bool, const ctp::compress::model::NeuroPressV2Features &) {
+    const std::string &, double, const void *, clio::run::u64,
+    const std::vector<CompressionStats> &, int, double, bool,
+    const ctp::compress::model::NeuroPressV2Features &) {
   return V2ExploreWinner{};
 }
 

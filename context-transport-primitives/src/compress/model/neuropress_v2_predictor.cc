@@ -50,6 +50,8 @@
 #include <sys/stat.h>
 
 #include "clio_ctp/compress/gpu_setting_codec.h"
+#include "clio_ctp/compress/preprocess/data_stats.h"
+#include "clio_ctp/compress/preprocess/data_stats_gpu.h"
 #include "neuropress_v2_kernels.h"
 
 namespace ctp::compress::model {
@@ -115,6 +117,8 @@ NeuroPressV2Predictor::NeuroPressV2Predictor() = default;
 NeuroPressV2Predictor::~NeuroPressV2Predictor() {
   v2::FreeDevice(d_params_);
   v2::FreeDevice(d_available_);
+  v2::FreeDevice(d_abs_err_);
+  v2::DestroyStreamAndEvent(train_stream_, train_event_);
 }
 
 std::string NeuroPressV2Predictor::ResolvePath(const std::string &path_or_dir) {
@@ -210,6 +214,19 @@ bool NeuroPressV2Predictor::Load(const std::string &path_or_dir) {
   }
   d_params_ = static_cast<float *>(p);
   d_available_ = static_cast<unsigned char *>(a);
+  if (train_stream_ == nullptr &&
+      !v2::CreateStreamAndEvent(&train_stream_, &train_event_)) {
+    return (error_ = "cannot create the GPU update stream"), false;
+  }
+  if (d_abs_err_ == nullptr) {
+    const double zero = 0.0;
+    void *e = nullptr;
+    if (!v2::Upload(&zero, sizeof(zero), &e)) {
+      return (error_ = "cannot allocate the update's error slot"), false;
+    }
+    d_abs_err_ = static_cast<double *>(e);
+  }
+  host_dirty_ = false;
   ready_ = true;
   return true;
 }
@@ -247,6 +264,106 @@ NeuroPressV2Stats NeuroPressV2Predictor::ComputeStats(const float *data,
   return s;
 }
 
+namespace {
+/** This thread's last conversion time, ms. */
+double &LastConvertMsSlot() {
+  static thread_local double ms = 0.0;
+  return ms;
+}
+}  // namespace
+
+double NeuroPressV2Predictor::LastConvertMs() { return LastConvertMsSlot(); }
+
+size_t NeuroPressV2Predictor::DtypeBytes(int dtype) {
+  switch (dtype) {
+    case 2: case 11: case 12: return 8;
+    case 3: case 4: case 7: case 8: return 2;
+    case 5: case 6: return 1;
+    default: return 4;
+  }
+}
+
+namespace {
+
+/** IEEE half to float (normals, subnormals, inf and NaN). */
+float HalfToFloat(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu;
+  uint32_t mant = h & 0x3FFu;
+  uint32_t bits;
+  if (exp == 0x1Fu) {
+    bits = sign | 0x7F800000u | (mant << 13);
+  } else if (exp != 0) {
+    bits = sign | ((exp + 112u) << 23) | (mant << 13);
+  } else if (mant == 0) {
+    bits = sign;
+  } else {
+    exp = 113;  // normalise the subnormal
+    while ((mant & 0x400u) == 0) {
+      mant <<= 1;
+      --exp;
+    }
+    bits = sign | (exp << 23) | ((mant & 0x3FFu) << 13);
+  }
+  float f;
+  std::memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+
+/** One host element of a dtype code as float. */
+float HostElement(const unsigned char *p, size_t i, int dtype) {
+  switch (dtype) {
+    case 2: { double v; std::memcpy(&v, p + 8 * i, 8); return static_cast<float>(v); }
+    case 3: { uint16_t v; std::memcpy(&v, p + 2 * i, 2); return HalfToFloat(v); }
+    case 4: {
+      uint16_t v;
+      std::memcpy(&v, p + 2 * i, 2);
+      const uint32_t bits = static_cast<uint32_t>(v) << 16;
+      float f;
+      std::memcpy(&f, &bits, 4);
+      return f;
+    }
+    case 5: return static_cast<float>(static_cast<int8_t>(p[i]));
+    case 6: return static_cast<float>(p[i]);
+    case 7: { int16_t v; std::memcpy(&v, p + 2 * i, 2); return static_cast<float>(v); }
+    case 8: { uint16_t v; std::memcpy(&v, p + 2 * i, 2); return static_cast<float>(v); }
+    case 9: { int32_t v; std::memcpy(&v, p + 4 * i, 4); return static_cast<float>(v); }
+    case 10: { uint32_t v; std::memcpy(&v, p + 4 * i, 4); return static_cast<float>(v); }
+    case 11: { int64_t v; std::memcpy(&v, p + 8 * i, 8); return static_cast<float>(v); }
+    case 12: { uint64_t v; std::memcpy(&v, p + 8 * i, 8); return static_cast<float>(v); }
+    default: { float v; std::memcpy(&v, p + 4 * i, 4); return v; }
+  }
+}
+
+}  // namespace
+
+std::vector<float> NeuroPressV2Predictor::ToFloat32Host(const void *data,
+                                                        size_t bytes,
+                                                        int dtype) {
+  const size_t n = bytes / DtypeBytes(dtype);
+  std::vector<float> out(n);
+  const auto *p = static_cast<const unsigned char *>(data);
+  for (size_t i = 0; i < n; ++i) out[i] = HostElement(p, i, dtype);
+  return out;
+}
+
+const void *NeuroPressV2Predictor::DeviceStatsAsFloat32(const void *chunk,
+                                                        size_t bytes,
+                                                        int dtype,
+                                                        void *stream) {
+  const size_t n = bytes / DtypeBytes(dtype);
+  if (n == 0) return nullptr;
+  // float32 (1) and unknown codes are read as float32 bytes as they are.
+  const float *values = static_cast<const float *>(chunk);
+  LastConvertMsSlot() = 0.0;
+  if (dtype >= 2 && dtype <= 12) {
+    values = v2::ConvertToFloat32(chunk, n, dtype, stream, &LastConvertMsSlot());
+    if (values == nullptr) return nullptr;
+  }
+  return ctp::ComputeDeviceStatsResident(values, n, ctp::DataType::FLOAT32,
+                                         stream);
+}
+
 NeuroPressV2Features NeuroPressV2Predictor::MakeFeatures(
     size_t chunk_bytes, const NeuroPressV2Stats &s) {
   double range = s.vmax - s.vmin;
@@ -259,15 +376,35 @@ NeuroPressV2Features NeuroPressV2Predictor::MakeFeatures(
   return f;
 }
 
+void NeuroPressV2Predictor::SyncHost() const {
+  std::lock_guard<std::mutex> lock(host_mutex_);
+  if (!host_dirty_) return;
+  if (v2::CopyToHost(params_.data(), d_params_, params_.size() * sizeof(float),
+                     train_stream_)) {
+    host_dirty_ = false;
+  }
+}
+
+void NeuroPressV2Predictor::FillDesc(v2::NetDesc *d) const {
+  d->n_layers = n_layers_;
+  for (int l = 0; l <= n_layers_; ++l) d->dims[l] = dims_[l];
+  for (int l = 0; l < n_layers_; ++l) {
+    d->w_off[l] = w_off_[l];
+    d->b_off[l] = b_off_[l];
+  }
+  d->xm_off = xm_off_, d->xs_off = xs_off_, d->ym_off = ym_off_;
+  d->ys_off = ys_off_;
+  d->n_settings = n_settings_;
+}
+
 void NeuroPressV2Predictor::ForwardHostFull(const NeuroPressV2Features &f,
-                                            std::vector<float> *last,
                                             std::vector<float> *out) const {
+  SyncHost();
   std::vector<float> h(dims_[0]);
   for (int i = 0; i < dims_[0]; ++i) {
     h[i] = (f.x[i] - params_[xm_off_ + i]) / params_[xs_off_ + i];
   }
   for (int l = 0; l < n_layers_; ++l) {
-    if (l + 1 == n_layers_ && last != nullptr) *last = h;
     const int n_in = dims_[l], n_out = dims_[l + 1];
     const float *w = params_.data() + w_off_[l];
     const float *b = params_.data() + b_off_[l];
@@ -287,7 +424,7 @@ void NeuroPressV2Predictor::ForwardHostFull(const NeuroPressV2Features &f,
 
 void NeuroPressV2Predictor::ForwardHost(const NeuroPressV2Features &f,
                                         std::vector<float> *out) const {
-  ForwardHostFull(f, nullptr, out);
+  ForwardHostFull(f, out);
 }
 
 double NeuroPressV2Predictor::Cost(int s, double ct, double dt, double ratio,
@@ -329,14 +466,9 @@ std::vector<NeuroPressV2Prediction> NeuroPressV2Predictor::RankDevice(
     NeuroPressV2Features *features_out) {
   if (!ready_ || device_stats == nullptr) return {};
   v2::NetDesc d;
-  d.n_layers = n_layers_;
-  for (int l = 0; l <= n_layers_; ++l) d.dims[l] = dims_[l];
-  for (int l = 0; l < n_layers_; ++l) {
-    d.w_off[l] = w_off_[l];
-    d.b_off[l] = b_off_[l];
-  }
-  d.xm_off = xm_off_, d.xs_off = xs_off_, d.ym_off = ym_off_, d.ys_off = ys_off_;
-  d.n_settings = n_settings_;
+  FillDesc(&d);
+  // The ranking stream waits for the last GPU update (no host sync).
+  if (!v2::StreamWaitEvent(stream, train_event_)) return {};
   v2::RankArgs a;
   a.w_ct = w.w_ct, a.w_dt = w.w_dt, a.w_io = w.w_io;
   a.bw_bytes_per_ms = w.bw_bytes_per_ms;
@@ -355,11 +487,6 @@ std::vector<NeuroPressV2Prediction> NeuroPressV2Predictor::RankDevice(
   return out;
 }
 
-bool NeuroPressV2Predictor::SyncDevice(size_t offset, size_t count) {
-  return v2::CopyToDevice(d_params_, offset * sizeof(float),
-                          params_.data() + offset, count * sizeof(float));
-}
-
 bool NeuroPressV2Predictor::TrainSetting(const NeuroPressV2Features &f,
                                          int setting, double comp_ms,
                                          double decomp_ms, double ratio,
@@ -367,41 +494,32 @@ bool NeuroPressV2Predictor::TrainSetting(const NeuroPressV2Features &f,
   if (!ready_ || setting < 0 || setting >= n_settings_ || !(lr > 0.0)) {
     return false;
   }
-  const double labels[3] = {comp_ms, decomp_ms, ratio};
+  v2::TrainArgs a;
+  std::copy(f.x, f.x + 4, a.x);
+  a.setting = setting;
+  a.label[0] = comp_ms;
+  a.label[1] = decomp_ms;
+  a.label[2] = ratio;
+  a.lr = lr;
+  int labelled = 0;
+  for (double v : a.label) labelled += (v > 0.0 && std::isfinite(v)) ? 1 : 0;
+  if (labelled == 0) return false;
+  v2::NetDesc d;
+  FillDesc(&d);
   std::lock_guard<std::mutex> lock(train_mutex_);
-  std::vector<float> h, y;
-  ForwardHostFull(f, &h, &y);
-  const int last = n_layers_ - 1;
-  const int n_in = dims_[last];
-  // Normalised LMS: the step is scaled by 1 / (1 + |h|^2), so one update
-  // removes at most a fraction lr of the error whatever the scale of the
-  // hidden activations. A plain gradient step diverges on inputs far outside
-  // the training range, where |h| is large.
-  double h2 = 1.0;
-  for (int i = 0; i < n_in; ++i) h2 += static_cast<double>(h[i]) * h[i];
-  double err_sum = 0.0;
-  int n_lab = 0;
-  for (int k = 0; k < kOutputsPerSetting; ++k) {
-    if (!(labels[k] > 0.0) || !std::isfinite(labels[k])) continue;
-    const size_t o = static_cast<size_t>(kOutputsPerSetting) * setting + k;
-    const float sd = params_[ys_off_ + o];
-    const double target = (std::log(labels[k]) - params_[ym_off_ + o]) / sd;
-    const double pred = (static_cast<double>(y[o]) - params_[ym_off_ + o]) / sd;
-    const double err = pred - target;  // d(0.5 err^2) / d(pred)
-    err_sum += std::fabs(err * sd);
-    ++n_lab;
-    const double step = lr * err / h2;
-    float *w = params_.data() + w_off_[last] + o * n_in;
-    for (int i = 0; i < n_in; ++i) w[i] -= static_cast<float>(step * h[i]);
-    params_[b_off_[last] + o] -= static_cast<float>(step);
-    if (!SyncDevice(w_off_[last] + o * n_in, n_in) ||
-        !SyncDevice(b_off_[last] + o, 1)) {
-      return false;
-    }
+  if (!v2::TrainOnDevice(d_params_, d, a, train_stream_, train_event_,
+                         d_abs_err_)) {
+    return false;
   }
-  if (n_lab == 0) return false;
-  if (abs_err != nullptr) *abs_err = err_sum / n_lab;
+  {
+    std::lock_guard<std::mutex> host_lock(host_mutex_);
+    host_dirty_ = true;
+  }
   ++updates_;
+  if (abs_err != nullptr &&
+      !v2::CopyToHost(abs_err, d_abs_err_, sizeof(double), train_stream_)) {
+    return false;
+  }
   return true;
 }
 

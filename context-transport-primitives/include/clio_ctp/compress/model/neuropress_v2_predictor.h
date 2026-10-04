@@ -68,6 +68,22 @@
 
 namespace ctp::compress::model {
 
+namespace v2 {
+struct NetDesc;  // neuropress_v2_kernels.h
+}  // namespace v2
+
+/**
+ * @brief Element type of a chunk, as carried in Context::data_type_. 1 and 2
+ * keep their v1 meaning (float32, float64); any other value is read as
+ * float32 bytes. v2 converts a chunk to float32 by value before computing its
+ * features (the network was trained on float32); the codec still compresses
+ * the original bytes.
+ */
+enum class NeuroPressV2Dtype : int {
+  kF32 = 1, kF64 = 2, kF16 = 3, kBF16 = 4, kI8 = 5, kU8 = 6,
+  kI16 = 7, kU16 = 8, kI32 = 9, kU32 = 10, kI64 = 11, kU64 = 12
+};
+
 /** @brief The four v2 inputs of one chunk, before standardisation. */
 struct NeuroPressV2Features {
   float x[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -110,8 +126,10 @@ struct NeuroPressV2Stats {
  * chunk by cost and learns online from measured results.
  *
  * Thread safety: ranking may run concurrently from many threads. Training
- * steps are serialised by an internal mutex; each one rewrites the touched
- * output rows on the host and then on the device.
+ * steps are serialised by an internal mutex and run on the GPU, on the
+ * predictor's own stream, without synchronising the host; RankDevice waits on
+ * the last update's event, so a ranking always sees the latest weights. The
+ * host copy (RankHost, ForwardHost) is refreshed from the device on demand.
  */
 class NeuroPressV2Predictor {
  public:
@@ -160,6 +178,41 @@ class NeuroPressV2Predictor {
   static NeuroPressV2Stats ComputeStats(const float *data, size_t n);
 
   /**
+   * @param dtype a NeuroPressV2Dtype code
+   * @return its element size in bytes; 4 for an unknown code (read as float32)
+   */
+  static size_t DtypeBytes(int dtype);
+
+  /**
+   * Convert a host chunk to float32 by value.
+   * @param data  the chunk
+   * @param bytes its size
+   * @param dtype a NeuroPressV2Dtype code (unknown = float32 bytes)
+   * @return one float per element
+   */
+  static std::vector<float> ToFloat32Host(const void *data, size_t bytes,
+                                          int dtype);
+
+  /**
+   * Device statistics of a device chunk after converting it to float32 by
+   * value on the GPU (into a per-thread scratch), on `stream`.
+   * @param chunk  device pointer
+   * @param bytes  its size
+   * @param dtype  a NeuroPressV2Dtype code (unknown = float32 bytes)
+   * @param stream cudaStream_t
+   * @return a ctp::DeviceFeatureStats device pointer, nullptr on failure
+   */
+  static const void *DeviceStatsAsFloat32(const void *chunk, size_t bytes,
+                                          int dtype, void *stream);
+
+  /**
+   * @return GPU ms of this thread's last DeviceStatsAsFloat32 conversion (0
+   *         when no conversion was needed), so callers can keep the
+   *         conversion out of every reported time
+   */
+  static double LastConvertMs();
+
+  /**
    * The four network inputs from raw statistics.
    * @param chunk_bytes size of the chunk in bytes
    * @param s           its statistics
@@ -203,7 +256,8 @@ class NeuroPressV2Predictor {
 
   /**
    * One online step on the output rows of one setting, from a measured
-   * result: a normalised LMS update of each labelled row (gradient of the
+   * result, run on the GPU (asynchronous; nothing but the labels crosses from
+   * the host): a normalised LMS update of each labelled row (gradient of the
    * squared standardised log error, divided by 1 + |h|^2 of the last hidden
    * layer), so a step removes at most a fraction lr (0 < lr <= 1) of that
    * row's error on this input and stays bounded on out-of-range inputs. Only
@@ -216,6 +270,8 @@ class NeuroPressV2Predictor {
    * @param ratio      measured compression ratio (<= 0: no label)
    * @param lr         fraction of the error removed per step (0, 1]
    * @param abs_err    optional: mean |log error| of the labels before the step
+   *                   (reading it synchronises the update; pass nullptr to
+   *                   keep the step fully asynchronous)
    * @return false when not loaded, the setting is invalid or no label is valid
    */
   bool TrainSetting(const NeuroPressV2Features &f, int setting, double comp_ms,
@@ -225,11 +281,13 @@ class NeuroPressV2Predictor {
  private:
   /** Parse and validate a version-3 file into the host parameters. */
   bool ParseFile(const std::string &path);
-  /** Hidden activations of the last hidden layer and the outputs. */
-  void ForwardHostFull(const NeuroPressV2Features &f, std::vector<float> *last,
+  /** The network on the host (after SyncHost). */
+  void ForwardHostFull(const NeuroPressV2Features &f,
                        std::vector<float> *out) const;
-  /** Upload the whole parameter vector (Load) or a range of it (training). */
-  bool SyncDevice(size_t offset, size_t count);
+  /** Describe the parameter layout for the kernels. */
+  void FillDesc(v2::NetDesc *d) const;
+  /** Refresh the host parameters from the device after GPU updates. */
+  void SyncHost() const;
   /** Cost of a setting's prediction under w (inf when unusable). */
   double Cost(int s, double ct, double dt, double ratio, size_t chunk_bytes,
               const NeuroPressV2CostWeights &w) const;
@@ -239,13 +297,18 @@ class NeuroPressV2Predictor {
   int n_layers_ = 0;
   std::vector<int> dims_;            ///< input, hidden..., output
   int n_settings_ = 0;
-  std::vector<float> params_;        ///< x_mean, x_std, y_mean, y_std, W/b...
+  mutable std::vector<float> params_;  ///< host copy: x/y scaling, W/b...
   std::vector<size_t> w_off_, b_off_;
   size_t xm_off_ = 0, xs_off_ = 0, ym_off_ = 0, ys_off_ = 0;
   std::vector<unsigned char> available_;  ///< per setting, from the codec
   float *d_params_ = nullptr;        ///< device copy of params_
   unsigned char *d_available_ = nullptr;
   std::mutex train_mutex_;
+  mutable std::mutex host_mutex_;
+  mutable bool host_dirty_ = false;  ///< device weights newer than params_
+  void *train_stream_ = nullptr;     ///< cudaStream_t of the updates
+  void *train_event_ = nullptr;      ///< cudaEvent_t after the last update
+  double *d_abs_err_ = nullptr;      ///< device slot for an update's error
   uint64_t updates_ = 0;
 };
 

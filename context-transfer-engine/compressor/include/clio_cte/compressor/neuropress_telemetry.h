@@ -207,13 +207,16 @@ struct ChunkPhases {
   double sgd_ms = 0.0;
   int explored = 0;     // alternatives measured by the exploration sweep
   int sgd_updates = 0;  // TrainDeviceStats calls that updated the model
+  /** NeuroPress v2: GPU (or host) ms spent converting the chunk to float32
+   *  for its features. Kept OUT of every time: wall_ms is logged minus it. */
+  double convert_ms = 0.0;
 };
 
 bool PhaseLogEnabled();
 
 /** Thread-local hand-off from the selection to DynamicSchedule. */
 void RecordSelectionPhases(double stats_ms, double nn_ms, double choice_ms,
-                           bool reused);
+                           bool reused, double convert_ms = 0.0);
 bool TakeSelectionPhases(ChunkPhases *out);
 
 /** Hand-off from Runtime::Compress, keyed by blob name; only chunks

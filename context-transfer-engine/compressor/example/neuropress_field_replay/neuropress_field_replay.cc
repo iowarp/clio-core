@@ -35,6 +35,7 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <memory>
 #include <chrono>
 #include <cmath>
@@ -82,6 +83,7 @@ struct Options {
   std::string report;              // per-chunk CSV
   size_t max_files = 0;            // 0 = all
   bool f64 = false;                // dumps are float64 rather than float32
+  bool dtype_from_name = false;    // element type from "__dt-<type>" in a name
   bool verify = false;
   bool readback = false;           // read a previous report back, no files
   std::string dump_dir;            // write decompressed bytes here (readback)
@@ -112,6 +114,25 @@ struct Options {
   int lookahead = 0;
 };
 
+/**
+ * @param name a blob or file name holding "__dt-<type>"
+ * @return the Context::data_type_ code of that type (the NeuroPress v2
+ *         codes: 1 f32, 2 f64, 3 f16, 4 bf16, 5 i8, 6 u8, 7 i16, 8 u16,
+ *         9 i32, 10 u32, 11 i64, 12 u64); 1 (float32) when absent
+ */
+int DtypeFromName(const std::string &name) {
+  static const std::map<std::string, int> codes = {
+      {"f32", 1}, {"f64", 2}, {"f16", 3}, {"bf16", 4}, {"i8", 5},
+      {"u8", 6}, {"i16", 7}, {"u16", 8}, {"i32", 9}, {"u32", 10},
+      {"i64", 11}, {"u64", 12}};
+  const size_t at = name.find("__dt-");
+  if (at == std::string::npos) return 1;
+  size_t end = at + 5;
+  while (end < name.size() && std::isalnum(static_cast<unsigned char>(name[end]))) ++end;
+  auto it = codes.find(name.substr(at + 5, end - at - 5));
+  return it == codes.end() ? 1 : it->second;
+}
+
 void Usage(const char *argv0) {
   std::cerr
       << "usage: " << argv0 << " --dir DIR [options]\n"
@@ -125,6 +146,9 @@ void Usage(const char *argv0) {
          "[4194304]\n"
       << "  --max-files N    replay only the first N files (lexical order)\n"
       << "  --f64            files hold float64 (default float32)\n"
+      << "  --dtype-from-name  each file's element type from \"__dt-<type>\"\n"
+      << "                   in its name (f32 f64 f16 bf16 i8 u8 i16 u16 i32\n"
+      << "                   u32 i64 u64), passed to the compressor per chunk\n"
       << "  --tag NAME       CTE tag [field_replay]\n"
       << "  --report CSV     per-chunk outcome\n"
       << "  --verify         read every blob back and compare\n"
@@ -164,6 +188,7 @@ bool ParseArgs(int argc, char **argv, Options *o) {
     else if (a == "--dump-decompressed") o->dump_dir = need("DIR");
     else if (a == "--check-bound") o->check_bound = true;
     else if (a == "--f64") o->f64 = true;
+    else if (a == "--dtype-from-name") o->dtype_from_name = true;
     else if (a == "--verify") o->verify = true;
     else if (a == "--no-compress") o->no_compress = true;
     else if (a == "--lookahead") o->lookahead = std::atoi(need("N"));
@@ -1076,9 +1101,12 @@ int main(int argc, char **argv) {
           tag_id, rec.name, 0, n, dev_shm, -1.0f,
           clio::cte::core::Context(), 0, clio::run::PoolQuery::Local());
     } else {
+      clio::cte::core::Context chunk_ctx = ctx;
+      if (opt.dtype_from_name) chunk_ctx.data_type_ = DtypeFromName(rec.name);
       p.fut = compressor.AsyncDynamicSchedule(
           clio::run::PoolQuery::Local(), tag_id, rec.name, 0, n,
-          buf.shm_.template Cast<void>(), -1.0f, ctx, 0, cte_client->pool_id_);
+          buf.shm_.template Cast<void>(), -1.0f, chunk_ctx, 0,
+          cte_client->pool_id_);
     }
     p.buf = buf;
     p.record = records.size() - 1;

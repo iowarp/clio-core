@@ -241,10 +241,22 @@ class Codec {
   virtual bool DecompressOk() { return true; }
   /** @return the stream every call of this codec runs on. */
   cudaStream_t stream() const { return stream_; }
+  /**
+   * @param n          input bytes
+   * @param decompress which direction
+   * @return true the first time this codec object sees n bytes in that
+   *         direction (and records it), so the caller can run an untimed
+   *         warm-up first, as the sweep did: first launches pay for lazy
+   *         kernel loading and per-size allocation
+   */
+  bool FirstUse(size_t n, bool decompress) {
+    return (decompress ? warm_d_ : warm_c_).insert(n).second;
+  }
 
  protected:
   cudaStream_t stream_ = nullptr;
   bool owns_stream_ = true;  ///< false for a wrapper borrowing a stream
+  std::set<size_t> warm_c_, warm_d_;  ///< sizes already warmed up
 };
 
 /** @brief Reads a spec's settings and rejects any it never asked for. */
@@ -859,6 +871,13 @@ size_t RunCompress(int index, void *output, size_t cap, const void *input,
   uint8_t *d_out = direct ? static_cast<uint8_t *>(output) : out_tmp.Alloc(bound);
   c->PrepareCompress(n);
   GSC_CHECK(cudaStreamSynchronize(s));
+  if (c->FirstUse(n, false)) {
+    // Untimed warm-up on this thread's first call at this size.
+    c->Compress(c->Preprocess(d_in, n), n, d_out, bound);
+    GSC_CHECK(cudaStreamSynchronize(s));
+    c->PrepareCompress(n);
+    GSC_CHECK(cudaStreamSynchronize(s));
+  }
   {
     // Preprocess + Compress, exactly the region the v2 labels timed.
     CodecKernelTimer timer(s);
@@ -887,6 +906,13 @@ void RunDecompress(int index, void *output, size_t n, const void *input,
   c->PrepareDecode(n);
   GSC_CHECK(cudaStreamSynchronize(s));
   uint8_t *dst = c->DecodeTarget(d_out);
+  if (c->FirstUse(n, true)) {
+    // Untimed warm-up on this thread's first call at this size.
+    c->PrepareDecompress(d_in, comp);
+    c->Decompress(d_in, comp, dst, n);
+    c->Postprocess(d_out, n);
+    GSC_CHECK(cudaStreamSynchronize(s));
+  }
   c->PrepareDecompress(d_in, comp);
   {
     // Decompress + Postprocess, exactly the region the v2 labels timed.
