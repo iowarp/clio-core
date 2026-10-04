@@ -161,17 +161,28 @@ Sample RunOne(Codec *c, const uint8_t *in, size_t n, Workspace *ws) {
   cudaStream_t s = c->stream();
   try {
     c->PrepareCompress(n);
-    TimeOnStream(s, ws, [&] { c->Compress(in, n, ws->d_comp, ws->cap); },
+    // A pre-shuffle and its inverse are part of (de)compressing: timed.
+    TimeOnStream(s, ws,
+                 [&] {
+                   const uint8_t *src = c->Preprocess(in, n);
+                   c->Compress(src, n, ws->d_comp, ws->cap);
+                 },
                  &r.comp_ms, &r.comp_wall_ms);
     r.comp_bytes = c->CompressedBytes(ws->d_comp);
     if (r.comp_bytes == 0 || r.comp_bytes > ws->cap) return r;
     // A codec that writes nothing must not pass on the previous one's output.
+    uint8_t *dst = c->DecodeTarget(ws->d_dec);
     CUDA_CHECK(cudaMemsetAsync(ws->d_dec, 0xA5, n, s));
+    if (dst != ws->d_dec) CUDA_CHECK(cudaMemsetAsync(dst, 0xA5, n, s));
     c->PrepareDecompress(ws->d_comp, r.comp_bytes);
     TimeOnStream(s, ws,
-                 [&] { c->Decompress(ws->d_comp, r.comp_bytes, ws->d_dec, n); },
+                 [&] {
+                   c->Decompress(ws->d_comp, r.comp_bytes, dst, n);
+                   c->Postprocess(ws->d_dec, n);
+                 },
                  &r.decomp_ms, &r.decomp_wall_ms);
-    r.ok = c->DecompressOk() && SameOnGpu(in, ws->d_dec, n, ws, s);
+    if (!c->DecompressOk()) return r;
+    r.ok = SameOnGpu(in, ws->d_dec, n, ws, s);
   } catch (const std::exception &e) {
     std::fprintf(stderr, "%s: %s\n", c->name().c_str(), e.what());
     cudaGetLastError();  // clear a non-sticky error so the next codec runs

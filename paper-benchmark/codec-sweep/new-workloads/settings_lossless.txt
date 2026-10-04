@@ -1,0 +1,42 @@
+# Lossless grid for the new-workloads study: every codec family, its data-type
+# options, and byte (2/4/8-byte element) or bit shuffle where it matters.
+store
+lz4
+lz4 shuffle=byte
+lz4 type=int bitshuffle=msb
+lz4 type=short bitshuffle=msb
+snappy
+snappy shuffle=byte
+zstd
+zstd shuffle=byte
+zstd shuffle=byte elem=2
+zstd shuffle=byte elem=8
+zstd shuffle=bit
+gdeflate level=1
+gdeflate level=5
+gdeflate level=1 shuffle=byte
+deflate level=1
+deflate level=5
+ans
+ans shuffle=byte
+ans shuffle=byte elem=8
+ans type=float16
+cascaded type=int rle=2 delta=1 bp=1
+cascaded type=int rle=1 delta=0 bp=1
+cascaded type=int rle=0 delta=1 bp=1
+cascaded type=int rle=0 delta=0 bp=1
+cascaded type=longlong rle=1 delta=1 bp=1
+cascaded type=longlong rle=0 delta=1 bp=1
+cascaded type=short rle=1 delta=1 bp=1
+cascaded type=char rle=1 delta=0 bp=1
+bitcomp type=int
+bitcomp type=char
+bitcomp type=short
+bitcomp type=longlong
+bitcomp algo=1 type=int
+bitcomp algo=1 type=char
+bitcomp algo=1 type=longlong
+ndzip
+gpulz
+spspeed
+spratio

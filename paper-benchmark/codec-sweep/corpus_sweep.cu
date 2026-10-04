@@ -47,12 +47,21 @@
  *    untimed round trip at that size, so per-size scratch allocation and
  *    first-launch costs never land in a timed call.
  *  - comp_ms / decomp_ms: CUDA events on the codec's stream around the
- *    compress / decompress call only -- the codec's GPU time.
+ *    compress / decompress call only -- the codec's GPU time. A shuffle
+ *    (pre-compression) and its inverse run before / after these, untimed.
  *  - comp_wall_ms: host clock from the launch until the compressed size is
  *    known on the host. decomp_wall_ms: host clock from header parsing (nvcomp
  *    configure_decompression, the SPspeed/SPratio size check) to the end of
  *    decompression. Both include launch overhead and syncs.
  *  - Each value is the median of --reps timed round trips.
+ *  - With --batch B > 1 the times instead come from one call on B copies of
+ *    the input laid end to end (one round trip, verified bit-exact like any
+ *    other), divided by B: the GPU time per input when the codec gets enough
+ *    work to fill the device, as in a pipeline that hands it many chunks at
+ *    once. comp_bytes and ok still come from the input alone. Every GPU codec
+ *    here works in windows smaller than one input, so copies cannot match
+ *    each other; a batch whose stream is not within 1% of B x comp_bytes is
+ *    noted in the row ("batch size drift").
  *  - comp_bytes is the whole stream the decoder needs (nvcomp's container
  *    header and chunk table included). It must be equal in every rep, or the
  *    row fails as nondeterministic.
@@ -62,7 +71,7 @@
  *
  * Usage:
  *   corpus_sweep --dir DIR --list FILES --configs SPECS --out CSV [--reps N]
- *                [--chunk BYTES]
+ *                [--chunk BYTES] [--batch B]
  * FILES lists one path per line, relative to DIR. SPECS lists one codec spec
  * per line ("gdeflate chunk=65536 level=5", see gpu_codecs.cuh); blank lines
  * and lines starting with '#' are skipped.
@@ -97,6 +106,7 @@ struct Options {
   std::string dir, list, configs, out;
   int reps = 3;      ///< timed round trips per (file, setting)
   size_t chunk = 0;  ///< bytes per input chunk; 0 = whole files
+  int batch = 1;     ///< copies of an input per timed call
 };
 
 /** @return the options; exits with usage on a missing or unknown flag. */
@@ -105,7 +115,7 @@ Options ParseArgs(int argc, char **argv) {
   auto usage = [] {
     std::fprintf(stderr,
                  "usage: corpus_sweep --dir DIR --list FILES --configs SPECS "
-                 "--out CSV [--reps N] [--chunk BYTES]\n");
+                 "--out CSV [--reps N] [--chunk BYTES] [--batch B]\n");
     std::exit(1);
   };
   for (int i = 1; i < argc; ++i) {
@@ -118,10 +128,11 @@ Options ParseArgs(int argc, char **argv) {
     else if (a == "--out") o.out = v;
     else if (a == "--reps") o.reps = std::atoi(v);
     else if (a == "--chunk") o.chunk = std::strtoull(v, nullptr, 10);
+    else if (a == "--batch") o.batch = std::atoi(v);
     else usage();
   }
   if (o.dir.empty() || o.list.empty() || o.configs.empty() || o.out.empty() ||
-      o.reps < 1) {
+      o.reps < 1 || o.batch < 1) {
     usage();
   }
   return o;
@@ -243,7 +254,9 @@ Corpus LoadCorpus(const std::string &dir, const std::vector<Input> &inputs) {
 struct Workspace {
   uint8_t *d_comp = nullptr;  ///< compressed stream, cap bytes
   size_t cap = 0;
-  uint8_t *d_dec = nullptr;   ///< decompressed output, the largest input
+  uint8_t *d_dec = nullptr;   ///< decompressed output, the largest batch
+  uint8_t *d_rep = nullptr;   ///< batch copies of one input (batch > 1)
+  int batch = 1;
   unsigned int *d_bad = nullptr;
   cudaEvent_t e0 = nullptr, e1 = nullptr;
 };
@@ -286,7 +299,9 @@ Round RunRound(Codec *c, const uint8_t *in, size_t n, Workspace *ws) {
     CUDA_CHECK(cudaStreamSynchronize(s));
     Clock::time_point w0 = Clock::now();
     CUDA_CHECK(cudaEventRecord(ws->e0, s));
-    c->Compress(in, n, ws->d_comp, ws->cap);
+    // A pre-shuffle is part of compressing, so it is inside the timed region.
+    const uint8_t *src = c->Preprocess(in, n);
+    c->Compress(src, n, ws->d_comp, ws->cap);
     CUDA_CHECK(cudaEventRecord(ws->e1, s));
     CUDA_CHECK(cudaEventSynchronize(ws->e1));
     r.comp_bytes = c->CompressedBytes(ws->d_comp);
@@ -297,12 +312,15 @@ Round RunRound(Codec *c, const uint8_t *in, size_t n, Workspace *ws) {
       return r;
     }
     // A codec that writes nothing must not pass on stale output.
+    uint8_t *dst = c->DecodeTarget(ws->d_dec);
     CUDA_CHECK(cudaMemsetAsync(ws->d_dec, 0xA5, n, s));
+    if (dst != ws->d_dec) CUDA_CHECK(cudaMemsetAsync(dst, 0xA5, n, s));
     CUDA_CHECK(cudaStreamSynchronize(s));
     w0 = Clock::now();
     c->PrepareDecompress(ws->d_comp, r.comp_bytes);
     CUDA_CHECK(cudaEventRecord(ws->e0, s));
-    c->Decompress(ws->d_comp, r.comp_bytes, ws->d_dec, n);
+    c->Decompress(ws->d_comp, r.comp_bytes, dst, n);
+    c->Postprocess(ws->d_dec, n);  // the un-shuffle is part of decompressing
     CUDA_CHECK(cudaEventRecord(ws->e1, s));
     CUDA_CHECK(cudaEventSynchronize(ws->e1));
     r.decomp_wall_ms = MsSince(w0);
@@ -358,13 +376,56 @@ Round Measure(Codec *c, const uint8_t *in, size_t n, int reps,
 }
 
 /**
+ * Replace single's times with those of one call on ws->batch copies of the
+ * input, divided by the batch; its size and ok stay the input's own.
+ * @param c      codec, already built and warmed at n
+ * @param in     device input, n bytes
+ * @param single the input's own measurement (ok)
+ * @param warmed batch sizes already warmed up, updated
+ * @return single with per-input batch times; not ok if the batch fails
+ */
+Round MeasureBatched(Codec *c, const uint8_t *in, size_t n, int reps,
+                     Workspace *ws, const Round &single,
+                     std::map<size_t, bool> *warmed) {
+  const size_t b = static_cast<size_t>(ws->batch), nb = n * b;
+  for (size_t k = 0; k < b; ++k) {
+    CUDA_CHECK(cudaMemcpy(ws->d_rep + k * n, in, n, cudaMemcpyDeviceToDevice));
+  }
+  if (!(*warmed)[nb]) {
+    RunRound(c, ws->d_rep, nb, ws);  // untimed; result ignored
+    (*warmed)[nb] = true;
+  }
+  const Round r = Measure(c, ws->d_rep, nb, reps, ws);
+  Round out = single;
+  if (!r.ok) {
+    out.ok = false;
+    out.note = "batch: " + r.note;
+    return out;
+  }
+  out.comp_ms = r.comp_ms / b;
+  out.comp_wall_ms = r.comp_wall_ms / b;
+  out.decomp_ms = r.decomp_ms / b;
+  out.decomp_wall_ms = r.decomp_wall_ms / b;
+  const double drift =
+      double(r.comp_bytes) / (double(b) * single.comp_bytes) - 1.0;
+  if (drift > 0.01 || drift < -0.01) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "batch size drift %+.2f%%", 100 * drift);
+    out.note = buf;
+  }
+  return out;
+}
+
+/**
  * Grow the compressed-stream buffer to the codec's bound at every input size.
  * @param c      codec about to run
  * @param sizes  the distinct input sizes
  */
 void FitWorkspace(Codec *c, const std::vector<size_t> &sizes, Workspace *ws) {
   size_t need = 0;
-  for (size_t n : sizes) need = std::max(need, c->Bound(n));
+  for (size_t n : sizes) {
+    need = std::max(need, c->Bound(n * static_cast<size_t>(ws->batch)));
+  }
   if (need <= ws->cap) return;
   if (ws->d_comp) CUDA_CHECK(cudaFree(ws->d_comp));
   CUDA_CHECK(cudaMalloc(&ws->d_comp, need));
@@ -419,12 +480,15 @@ Totals RunSetting(const CodecSpec &spec, const Corpus &corpus,
         warmed[n] = true;
       }
       r = Measure(c.get(), in, n, reps, ws);
+      if (r.ok && ws->batch > 1) {
+        r = MeasureBatched(c.get(), in, n, reps, ws, r, &warmed);
+      }
     }
-    std::fprintf(csv, "%s,%zu,%s,%s,%zu,%.6f,%.6f,%.6f,%.6f,%d,%d,%s\n",
+    std::fprintf(csv, "%s,%zu,%s,%s,%zu,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%s\n",
                  corpus.names[i].c_str(), n, spec.base.c_str(),
                  spec.Settings().c_str(), r.comp_bytes, r.comp_ms,
                  r.comp_wall_ms, r.decomp_ms, r.decomp_wall_ms, reps,
-                 r.ok ? 1 : 0, CsvSafe(r.note).c_str());
+                 ws->batch, r.ok ? 1 : 0, CsvSafe(r.note).c_str());
     if (!r.ok) {
       ++t.failed;
       continue;
@@ -452,11 +516,15 @@ int main(int argc, char **argv) {
   std::vector<size_t> sizes = corpus.bytes;
   std::sort(sizes.begin(), sizes.end());
   sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
-  std::fprintf(stderr, "%zu files, %zu settings, %d reps; loaded in %.0f ms\n",
-               corpus.names.size(), specs.size(), o.reps, MsSince(t0));
+  std::fprintf(stderr,
+               "%zu files, %zu settings, %d reps, batch %d; loaded in %.0f ms\n",
+               corpus.names.size(), specs.size(), o.reps, o.batch, MsSince(t0));
 
   Workspace ws;
-  CUDA_CHECK(cudaMalloc(&ws.d_dec, corpus.max_bytes));
+  ws.batch = o.batch;
+  const size_t batch_bytes = corpus.max_bytes * static_cast<size_t>(o.batch);
+  CUDA_CHECK(cudaMalloc(&ws.d_dec, batch_bytes));
+  if (o.batch > 1) CUDA_CHECK(cudaMalloc(&ws.d_rep, batch_bytes));
   CUDA_CHECK(cudaMalloc(&ws.d_bad, sizeof(unsigned int)));
   CUDA_CHECK(cudaEventCreate(&ws.e0));
   CUDA_CHECK(cudaEventCreate(&ws.e1));
@@ -466,7 +534,8 @@ int main(int argc, char **argv) {
     return 1;
   }
   std::fprintf(csv, "file,bytes,algorithm,settings,comp_bytes,comp_ms,"
-                    "comp_wall_ms,decomp_ms,decomp_wall_ms,reps,ok,note\n");
+                    "comp_wall_ms,decomp_ms,decomp_wall_ms,reps,batch,ok,"
+                    "note\n");
   size_t failed = 0;
   for (size_t k = 0; k < specs.size(); ++k) {
     const Totals t = RunSetting(specs[k], corpus, sizes, o.reps, &ws, csv);

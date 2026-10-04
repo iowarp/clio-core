@@ -43,7 +43,8 @@
  *   lz4       type=char|short|int [char], bitshuffle=none|msb|lsb [none]
  *   snappy, zstd       (chunk only)
  *   gdeflate, deflate  level=0..5 [1]  (0 entropy-only ... 5 best ratio)
- *   ans       type=char|float16 [char], subchunks=0|4..64 [0 = auto]
+ *   ans       type=char|float16|float8 [char] (float8 = nvcomp 5 FP8 E4M3),
+ *             subchunks=0|4..64 [0 = auto]
  *   cascaded  type=char|short|int|longlong [int], rle=N [2], delta=N [1],
  *             bp=0|1 [1]
  *   bitcomp   algo=0|1 [0] (1 = sparse), type=char|short|int|longlong [char]
@@ -53,9 +54,11 @@
  *             compressor; a partial row/plane at the end goes 1-D.
  *   gpulz, spspeed, spratio   (no settings)
  * Every base also takes shuffle=none|byte|bit [none]: a GPU transform of the
- * input as 4-byte words before compressing (undone after decompressing),
- * counted in the codec's time. byte groups byte k of every word together
- * (4 planes); bit groups bit k of every word together (32 planes). A partial
+ * input before compressing (undone after decompressing). It runs in
+ * Preprocess / Postprocess, INSIDE the timed region, so comp/decomp time
+ * includes the shuffle and the un-shuffle. byte groups byte k of every element together, HDF5
+ * style, with elem=2|4|8 bytes per element [4] (8 for double data); bit
+ * groups bit k of every 32-bit word together (32 planes). A partial
  * word or a last group of fewer than 32 words is passed through unchanged.
  * An unknown base or setting is an error, so a typo never measures a default.
  */
@@ -111,6 +114,32 @@ class Codec {
   virtual bool Accepts(size_t n) const { (void)n; return true; }
   /** Untimed setup before Compress (configuration, per-size objects). */
   virtual void PrepareCompress(size_t n) { (void)n; }
+  /**
+   * Transform of the input before Compress (e.g. a shuffle), enqueued on
+   * stream() inside the caller's compress timing.
+   * @param in device input, n bytes
+   * @param n  input bytes
+   * @return the buffer to hand to Compress: in itself, or codec scratch
+   */
+  virtual const uint8_t *Preprocess(const uint8_t *in, size_t n) {
+    (void)n;
+    return in;
+  }
+  /**
+   * @param out the caller's n-byte decompressed-output buffer
+   * @return where Decompress must write: out itself, or codec scratch
+   */
+  virtual uint8_t *DecodeTarget(uint8_t *out) { return out; }
+  /**
+   * Transform after Decompress, from DecodeTarget(out) into out, enqueued
+   * on stream() inside the caller's decompress timing.
+   * @param out the caller's decompressed-output buffer
+   * @param n   decompressed bytes
+   */
+  virtual void Postprocess(uint8_t *out, size_t n) {
+    (void)out;
+    (void)n;
+  }
   /**
    * Enqueue compression on stream().
    * @param in  device input, n bytes
@@ -227,7 +256,8 @@ inline nvcompType_t ParseType(const std::string &t) {
       {"short", NVCOMP_TYPE_SHORT},       {"ushort", NVCOMP_TYPE_USHORT},
       {"int", NVCOMP_TYPE_INT},           {"uint", NVCOMP_TYPE_UINT},
       {"longlong", NVCOMP_TYPE_LONGLONG}, {"ulonglong", NVCOMP_TYPE_ULONGLONG},
-      {"float16", NVCOMP_TYPE_FLOAT16}};
+      {"float16", NVCOMP_TYPE_FLOAT16},
+      {"float8", NVCOMP_TYPE_FLOAT8_E4M3}};
   auto it = m.find(t);
   if (it == m.end()) throw std::invalid_argument("unknown type " + t);
   return it->second;
@@ -520,6 +550,41 @@ class NdzipCodec : public Codec {
   uint64_t h_shaped_dec_ = 0;  ///< same, read back from the stream header
 };
 
+/**
+ * @brief Store uncompressed: the bytes pass through unchanged (ratio 1).
+ *
+ * Compress and Decompress are one device-to-device copy each, so the timed
+ * cost is what staging the raw chunk into and out of an output buffer takes.
+ */
+class StoreCodec : public Codec {
+ public:
+  /** @param name label for the CSV */
+  explicit StoreCodec(const std::string &name) : Codec(name) {}
+  size_t Bound(size_t n) override { return n; }
+  void Compress(const uint8_t *in, size_t n, uint8_t *out,
+                size_t cap) override {
+    bytes_ = n <= cap ? n : 0;
+    if (bytes_) {
+      CUDA_CHECK(cudaMemcpyAsync(out, in, n, cudaMemcpyDeviceToDevice,
+                                 stream_));
+    }
+  }
+  size_t CompressedBytes(const uint8_t *) override { return bytes_; }
+  void Decompress(const uint8_t *in, size_t comp_bytes, uint8_t *out,
+                  size_t n) override {
+    ok_ = comp_bytes == n;
+    if (ok_) {
+      CUDA_CHECK(cudaMemcpyAsync(out, in, n, cudaMemcpyDeviceToDevice,
+                                 stream_));
+    }
+  }
+  bool DecompressOk() override { return ok_; }
+
+ private:
+  size_t bytes_ = 0;
+  bool ok_ = false;
+};
+
 /** @brief GPULZ (ICS'23) through the gpulz_api.h shim. */
 class GpulzCodec : public Codec {
  public:
@@ -584,20 +649,16 @@ class FpcCodec : public Codec {
 };
 
 /**
- * Byte shuffle of m 4-byte words: out[k*m + i] = byte k of word i
- * (inverse: the reverse map).
+ * HDF5-style byte shuffle of m elements of e bytes each: out[k*m + i] = byte
+ * k of element i (inverse: the reverse map).
  */
 __global__ void ByteShuffleKernel(const uint8_t *in, uint8_t *out, size_t m,
-                                  bool inverse) {
+                                  unsigned e, bool inverse) {
   size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
   for (; i < m; i += static_cast<size_t>(gridDim.x) * blockDim.x) {
-    if (!inverse) {
-      const uint32_t w = reinterpret_cast<const uint32_t *>(in)[i];
-      for (int k = 0; k < 4; ++k) out[k * m + i] = (w >> (8 * k)) & 0xffu;
-    } else {
-      uint32_t w = 0;
-      for (int k = 0; k < 4; ++k) w |= uint32_t(in[k * m + i]) << (8 * k);
-      reinterpret_cast<uint32_t *>(out)[i] = w;
+    for (unsigned k = 0; k < e; ++k) {
+      if (!inverse) out[k * m + i] = in[i * e + k];
+      else out[i * e + k] = in[k * m + i];
     }
   }
 }
@@ -643,9 +704,12 @@ inline Shuffle ParseShuffle(const std::string &s) {
 }
 
 /**
- * @brief Any codec with a byte or bit shuffle in front of it. The transform
- * runs on the inner codec's stream inside Compress / Decompress, so it is in
- * the timed region; the scratch buffer is sized in PrepareCompress, untimed.
+ * @brief Any codec with a byte or bit shuffle in front of it. The forward
+ * transform runs in Preprocess and the inverse in Postprocess, on the inner
+ * codec's stream. The sweeps time Preprocess + Compress and Decompress +
+ * Postprocess together, so the measured times include the shuffle and the
+ * un-shuffle. Scratch buffers (shuffled input, shuffled decode) are sized in
+ * PrepareCompress, untimed.
  */
 class ShuffleCodec : public Codec {
  public:
@@ -653,15 +717,20 @@ class ShuffleCodec : public Codec {
    * @param name  label for the CSV
    * @param inner the codec that compresses the shuffled words
    * @param mode  kByte or kBit
+   * @param elem  element size in bytes for kByte (4 float, 8 double); the bit
+   *              shuffle always works on 32-bit words
    */
-  ShuffleCodec(std::string name, std::unique_ptr<Codec> inner, Shuffle mode)
-      : Codec(std::move(name)), inner_(std::move(inner)), mode_(mode) {
+  ShuffleCodec(std::string name, std::unique_ptr<Codec> inner, Shuffle mode,
+               unsigned elem = 4)
+      : Codec(std::move(name)), inner_(std::move(inner)), mode_(mode),
+        elem_(elem) {
     cudaStreamDestroy(stream_);  // run on the inner codec's stream instead
     stream_ = inner_->stream();
     owns_stream_ = false;
   }
   ~ShuffleCodec() override {
-    if (scratch_) cudaFree(scratch_);
+    if (shuffled_) cudaFree(shuffled_);
+    if (decoded_) cudaFree(decoded_);
   }
 
   size_t Bound(size_t n) override { return inner_->Bound(n); }
@@ -670,10 +739,14 @@ class ShuffleCodec : public Codec {
     Fit(n);
     inner_->PrepareCompress(n);
   }
+  const uint8_t *Preprocess(const uint8_t *in, size_t n) override {
+    Fit(n);
+    Transform(in, shuffled_, n, false);
+    return shuffled_;
+  }
   void Compress(const uint8_t *in, size_t n, uint8_t *out,
                 size_t cap) override {
-    Transform(in, scratch_, n, false);
-    inner_->Compress(scratch_, n, out, cap);
+    inner_->Compress(in, n, out, cap);  // in: the Preprocess output
   }
   size_t CompressedBytes(const uint8_t *out) override {
     return inner_->CompressedBytes(out);
@@ -681,19 +754,27 @@ class ShuffleCodec : public Codec {
   void PrepareDecompress(const uint8_t *in, size_t comp_bytes) override {
     inner_->PrepareDecompress(in, comp_bytes);
   }
+  uint8_t *DecodeTarget(uint8_t *out) override {
+    (void)out;
+    return decoded_;
+  }
   void Decompress(const uint8_t *in, size_t comp_bytes, uint8_t *out,
                   size_t n) override {
-    inner_->Decompress(in, comp_bytes, scratch_, n);
-    Transform(scratch_, out, n, true);
+    inner_->Decompress(in, comp_bytes, out, n);  // out: DecodeTarget()
+  }
+  void Postprocess(uint8_t *out, size_t n) override {
+    Transform(decoded_, out, n, true);
   }
   bool DecompressOk() override { return inner_->DecompressOk(); }
 
  private:
-  /** Grow the scratch buffer to n bytes (untimed). */
+  /** Grow both scratch buffers to n bytes (untimed). */
   void Fit(size_t n) {
     if (n <= cap_) return;
-    if (scratch_) CUDA_CHECK(cudaFree(scratch_));
-    CUDA_CHECK(cudaMalloc(&scratch_, n));
+    if (shuffled_) CUDA_CHECK(cudaFree(shuffled_));
+    if (decoded_) CUDA_CHECK(cudaFree(decoded_));
+    CUDA_CHECK(cudaMalloc(&shuffled_, n));
+    CUDA_CHECK(cudaMalloc(&decoded_, n));
     cap_ = n;
   }
   /**
@@ -704,9 +785,11 @@ class ShuffleCodec : public Codec {
   void Transform(const uint8_t *src, uint8_t *dst, size_t n, bool inverse) {
     const size_t words = n / 4;
     size_t covered = 0;
-    if (mode_ == Shuffle::kByte && words) {
-      ByteShuffleKernel<<<1024, 256, 0, stream_>>>(src, dst, words, inverse);
-      covered = words * 4;
+    if (mode_ == Shuffle::kByte && n / elem_ > 1) {
+      const size_t m = n / elem_;
+      ByteShuffleKernel<<<1024, 256, 0, stream_>>>(src, dst, m, elem_,
+                                                   inverse);
+      covered = m * elem_;
     } else if (mode_ == Shuffle::kBit && words >= 32) {
       const size_t g = words / 32;
       BitShuffleKernel<<<1024, 256, 0, stream_>>>(
@@ -723,7 +806,9 @@ class ShuffleCodec : public Codec {
 
   std::unique_ptr<Codec> inner_;
   Shuffle mode_;
-  uint8_t *scratch_ = nullptr;
+  unsigned elem_;
+  uint8_t *shuffled_ = nullptr;  ///< shuffled input, handed to Compress
+  uint8_t *decoded_ = nullptr;   ///< Decompress output, still shuffled
   size_t cap_ = 0;
 };
 
@@ -761,9 +846,18 @@ inline std::unique_ptr<Codec> MakeCodec(const CodecSpec &spec,
     const Shuffle mode = ParseShuffle(sh->second);
     CodecSpec rest = spec;
     rest.params.erase("shuffle");
+    unsigned elem = 4;
+    auto el = rest.params.find("elem");
+    if (el != rest.params.end()) {
+      elem = static_cast<unsigned>(std::stoul(el->second));
+      if (mode != Shuffle::kByte || (elem != 2 && elem != 4 && elem != 8)) {
+        throw std::invalid_argument("elem=2|4|8 needs shuffle=byte");
+      }
+      rest.params.erase(el);
+    }
     auto inner = MakeCodec(rest, name);
     if (!inner || mode == Shuffle::kNone) return inner;
-    return std::make_unique<ShuffleCodec>(name, std::move(inner), mode);
+    return std::make_unique<ShuffleCodec>(name, std::move(inner), mode, elem);
   }
   const std::string &b = spec.base;
   if (b == "ndzip") {
@@ -774,9 +868,11 @@ inline std::unique_ptr<Codec> MakeCodec(const CodecSpec &spec,
         name, shape.empty() ? std::vector<ndzip::index_type>{}
                             : ParseShape(shape));
   }
-  const bool plain = b == "gpulz" || b == "spspeed" || b == "spratio";
+  const bool plain =
+      b == "store" || b == "gpulz" || b == "spspeed" || b == "spratio";
   if (plain) {
     SettingReader(spec).CheckAllUsed();  // these take no settings
+    if (b == "store") return std::make_unique<StoreCodec>(name);
     if (b == "gpulz") return std::make_unique<GpulzCodec>(name);
     if (b == "spspeed") {
       return std::make_unique<FpcCodec>(

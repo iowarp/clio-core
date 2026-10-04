@@ -1,0 +1,101 @@
+# Shuffled variant of every unshuffled codec configuration in settings_lossless.txt
+# (byte shuffle at 2/4/8-byte elements, and 32-bit bit shuffle) not already there.
+lz4 shuffle=byte elem=2
+lz4 shuffle=byte elem=8
+lz4 shuffle=bit
+snappy shuffle=byte elem=2
+snappy shuffle=byte elem=8
+snappy shuffle=bit
+gdeflate level=1 shuffle=byte elem=2
+gdeflate level=1 shuffle=byte elem=8
+gdeflate level=1 shuffle=bit
+gdeflate level=5 shuffle=byte elem=2
+gdeflate level=5 shuffle=byte
+gdeflate level=5 shuffle=byte elem=8
+gdeflate level=5 shuffle=bit
+deflate level=1 shuffle=byte elem=2
+deflate level=1 shuffle=byte
+deflate level=1 shuffle=byte elem=8
+deflate level=1 shuffle=bit
+deflate level=5 shuffle=byte elem=2
+deflate level=5 shuffle=byte
+deflate level=5 shuffle=byte elem=8
+deflate level=5 shuffle=bit
+ans shuffle=byte elem=2
+ans shuffle=bit
+cascaded type=int rle=2 delta=1 bp=1 shuffle=byte elem=2
+cascaded type=int rle=2 delta=1 bp=1 shuffle=byte
+cascaded type=int rle=2 delta=1 bp=1 shuffle=byte elem=8
+cascaded type=int rle=2 delta=1 bp=1 shuffle=bit
+cascaded type=int rle=1 delta=0 bp=1 shuffle=byte elem=2
+cascaded type=int rle=1 delta=0 bp=1 shuffle=byte
+cascaded type=int rle=1 delta=0 bp=1 shuffle=byte elem=8
+cascaded type=int rle=1 delta=0 bp=1 shuffle=bit
+cascaded type=int rle=0 delta=1 bp=1 shuffle=byte elem=2
+cascaded type=int rle=0 delta=1 bp=1 shuffle=byte
+cascaded type=int rle=0 delta=1 bp=1 shuffle=byte elem=8
+cascaded type=int rle=0 delta=1 bp=1 shuffle=bit
+cascaded type=int rle=0 delta=0 bp=1 shuffle=byte elem=2
+cascaded type=int rle=0 delta=0 bp=1 shuffle=byte
+cascaded type=int rle=0 delta=0 bp=1 shuffle=byte elem=8
+cascaded type=int rle=0 delta=0 bp=1 shuffle=bit
+cascaded type=longlong rle=1 delta=1 bp=1 shuffle=byte elem=2
+cascaded type=longlong rle=1 delta=1 bp=1 shuffle=byte
+cascaded type=longlong rle=1 delta=1 bp=1 shuffle=byte elem=8
+cascaded type=longlong rle=1 delta=1 bp=1 shuffle=bit
+cascaded type=longlong rle=0 delta=1 bp=1 shuffle=byte elem=2
+cascaded type=longlong rle=0 delta=1 bp=1 shuffle=byte
+cascaded type=longlong rle=0 delta=1 bp=1 shuffle=byte elem=8
+cascaded type=longlong rle=0 delta=1 bp=1 shuffle=bit
+cascaded type=short rle=1 delta=1 bp=1 shuffle=byte elem=2
+cascaded type=short rle=1 delta=1 bp=1 shuffle=byte
+cascaded type=short rle=1 delta=1 bp=1 shuffle=byte elem=8
+cascaded type=short rle=1 delta=1 bp=1 shuffle=bit
+cascaded type=char rle=1 delta=0 bp=1 shuffle=byte elem=2
+cascaded type=char rle=1 delta=0 bp=1 shuffle=byte
+cascaded type=char rle=1 delta=0 bp=1 shuffle=byte elem=8
+cascaded type=char rle=1 delta=0 bp=1 shuffle=bit
+bitcomp type=int shuffle=byte elem=2
+bitcomp type=int shuffle=byte
+bitcomp type=int shuffle=byte elem=8
+bitcomp type=int shuffle=bit
+bitcomp type=char shuffle=byte elem=2
+bitcomp type=char shuffle=byte
+bitcomp type=char shuffle=byte elem=8
+bitcomp type=char shuffle=bit
+bitcomp type=short shuffle=byte elem=2
+bitcomp type=short shuffle=byte
+bitcomp type=short shuffle=byte elem=8
+bitcomp type=short shuffle=bit
+bitcomp type=longlong shuffle=byte elem=2
+bitcomp type=longlong shuffle=byte
+bitcomp type=longlong shuffle=byte elem=8
+bitcomp type=longlong shuffle=bit
+bitcomp algo=1 type=int shuffle=byte elem=2
+bitcomp algo=1 type=int shuffle=byte
+bitcomp algo=1 type=int shuffle=byte elem=8
+bitcomp algo=1 type=int shuffle=bit
+bitcomp algo=1 type=char shuffle=byte elem=2
+bitcomp algo=1 type=char shuffle=byte
+bitcomp algo=1 type=char shuffle=byte elem=8
+bitcomp algo=1 type=char shuffle=bit
+bitcomp algo=1 type=longlong shuffle=byte elem=2
+bitcomp algo=1 type=longlong shuffle=byte
+bitcomp algo=1 type=longlong shuffle=byte elem=8
+bitcomp algo=1 type=longlong shuffle=bit
+ndzip shuffle=byte elem=2
+ndzip shuffle=byte
+ndzip shuffle=byte elem=8
+ndzip shuffle=bit
+gpulz shuffle=byte elem=2
+gpulz shuffle=byte
+gpulz shuffle=byte elem=8
+gpulz shuffle=bit
+spspeed shuffle=byte elem=2
+spspeed shuffle=byte
+spspeed shuffle=byte elem=8
+spspeed shuffle=bit
+spratio shuffle=byte elem=2
+spratio shuffle=byte
+spratio shuffle=byte elem=8
+spratio shuffle=bit
