@@ -261,6 +261,41 @@ public:
   bool HasDurableReplica(const BlobInfo &blob_info, clio::run::u64 size,
                          int level);
 
+  /** Score bands a reorganize no-room backoff is tracked per. */
+  static constexpr size_t kReorgBands = 10;
+  /** How long moves into a band that just found no room fail fast (ms). */
+  static constexpr clio::run::u64 kReorgBackoffMs = 1000;
+  /** NoteReorgNoRoom: this failure is not the one to log. */
+  static constexpr clio::run::u64 kReorgNoLog = ~0ull;
+  /** Per-band reorganize no-room state. */
+  struct ReorgBandState {
+    std::atomic<clio::run::u64> until_ns_{0};   ///< fail fast until then
+    std::atomic<clio::run::u64> logged_ns_{0};  ///< last warning
+    std::atomic<clio::run::u64> skipped_{0};    ///< fast-failed since then
+  };
+  ReorgBandState reorg_bands_[kReorgBands];
+  /**
+   * The backoff band of a target score.
+   * @param score reorganize target score (clamped to [0, 1])
+   * @return band index in [0, kReorgBands)
+   */
+  static size_t ReorgBand(float score);
+  /**
+   * Whether a move to this score should fail without trying: one into the
+   * same band found no room under kReorgBackoffMs ago. Counts the skip.
+   * @param score the move's target score
+   * @return true to leave the blob in place now
+   */
+  bool ReorgBandBackingOff(float score);
+  /**
+   * Record that a move to this score found no room: moves into its band fail
+   * fast for kReorgBackoffMs.
+   * @param score the move's target score
+   * @return moves skipped since the last warning when this failure should be
+   *         logged, else kReorgNoLog
+   */
+  clio::run::u64 NoteReorgNoRoom(float score);
+
   /**
    * Place `total_size` bytes of `data` on tiers at or above `target_level`
    * and swap them in as the blob's layout (caller holds the write token and

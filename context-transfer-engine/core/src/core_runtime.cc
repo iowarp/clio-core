@@ -3829,6 +3829,15 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
       }
     }
 
+    // A move into this score band found no room moments ago: the tiers it
+    // maps to are still full. Fail before reading the whole blob, the cost
+    // that, retried by the organizer, kept workers busy with nothing but
+    // doomed moves on a full cluster.
+    if (ReorgBandBackingOff(new_score)) {
+      rc = 7;  // left in place
+      CLIO_CO_RETURN;
+    }
+
     // Step 5: Allocate buffer for blob data
     auto *ipc_manager = CLIO_IPC;
     ctp::ipc::FullPtr<char> blob_data_buffer =
@@ -3919,8 +3928,13 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
     }
     ipc_manager->FreeBuffer(blob_data_buffer);
     if (!placed) {
-      HLOG(kWarning, "ReorganizeBlob: no room to move blob={} to score {}; "
-           "left in place at score {}", blob_name, new_score, current_score);
+      const clio::run::u64 skipped = NoteReorgNoRoom(new_score);
+      if (skipped != kReorgNoLog) {
+        HLOG(kWarning, "ReorganizeBlob: no room to move blob={} to score {}; "
+             "left in place at score {} ({} move(s) to that score band "
+             "skipped in the last {} ms)", blob_name, new_score,
+             current_score, skipped, kReorgBackoffMs);
+      }
       rc = 7;  // Move failed; blob intact at its original placement
       CLIO_CO_RETURN;
     }
@@ -7587,6 +7601,33 @@ clio::run::TaskResume Runtime::RelocateBlob(
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+size_t Runtime::ReorgBand(float score) {
+  const float s = std::min(std::max(score, 0.0f), 1.0f);
+  return std::min(static_cast<size_t>(s * kReorgBands), kReorgBands - 1);
+}
+
+bool Runtime::ReorgBandBackingOff(float score) {
+  ReorgBandState &b = reorg_bands_[ReorgBand(score)];
+  const clio::run::u64 until = b.until_ns_.load(std::memory_order_relaxed);
+  if (until == 0 || GetCurrentTimeNs() >= until) return false;
+  b.skipped_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+clio::run::u64 Runtime::NoteReorgNoRoom(float score) {
+  ReorgBandState &b = reorg_bands_[ReorgBand(score)];
+  const clio::run::u64 now = GetCurrentTimeNs();
+  b.until_ns_.store(now + kReorgBackoffMs * 1000000ull,
+                    std::memory_order_relaxed);
+  // One warning per band per backoff window, carrying what it skipped.
+  clio::run::u64 last = b.logged_ns_.load(std::memory_order_relaxed);
+  if (now < last + kReorgBackoffMs * 1000000ull ||
+      !b.logged_ns_.compare_exchange_strong(last, now)) {
+    return kReorgNoLog;
+  }
+  return b.skipped_.exchange(0, std::memory_order_relaxed);
 }
 
 bool Runtime::HasDurableReplica(const BlobInfo &blob_info, clio::run::u64 size,
