@@ -105,6 +105,20 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
   TaskT *task_ptr = future.get();
   ClientOrigin origin = future_shm->origin_;
 
+  // Never-sent task: nothing to wait for, nothing to claim. Twin of the check
+  // in IpcCpu2Cpu::RecvOut -- see the long comment there for why a zero
+  // net_key_ unambiguously means "synthesized client-side and completed
+  // locally, never Sent" (the CoreClient read fast paths).
+  //
+  // This must come BEFORE the kClientShm reconnect head below, not just before
+  // the claim at the bottom: those synthesized futures carry origin_ ==
+  // kClientShm, so a dead/unreachable server would send one through
+  // WaitForServerAndReconnect + ResendTask -- resending a task the client
+  // already satisfied out of its own cache.
+  if (task_ptr->task_id_.net_key_ == 0) {
+    return true;
+  }
+
   // Finalized-client escape (issue #970), before the reconnect head below.
   // Reaching here during teardown means the SHM path handed off after seeing
   // the server flagged dead; reconnecting would rebuild transports the caller
