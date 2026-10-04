@@ -529,8 +529,16 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   // drop. Observed live: node 2 held node 1 "dead" indefinitely while
   // ingesting node 1's healthy probe traffic the whole time, wedging the
   // entire remote half of the workload.
-  {
-    clio::run::u64 sender = task_info.task_id_.node_id_;
+  //
+  // The sender is the RUNTIME that put this message on the wire
+  // (archive.sender_node_, #1148), not the task id's node: a client task
+  // forwarded by a peer carries the CLIENT's node id there, which is 0 for
+  // every FUSE daemon -- so all forwarded client traffic in the cluster
+  // counted as node 0 being heard from, and node 0 could never be declared
+  // dead while any client was active (#1162). A message without a stamp (a
+  // client's own, or an older peer) identifies no runtime: no proof of life.
+  if (archive.sender_inc_ != 0) {
+    clio::run::u64 sender = archive.sender_node_;
     auto *im = CLIO_IPC;
     if (im != nullptr) im->NoteHeardFrom(sender);
     if (im != nullptr && sender != im->GetNodeId() && !im->IsAlive(sender)) {
@@ -772,8 +780,16 @@ int IpcManagerRun2Run::RecvOutDeserialize(
     }
 
     container->LoadTask(origin_task->method_, archive, replica);
-    // The completer id is the node that answered: proof of life.
-    if (auto *im = CLIO_IPC) im->NoteHeardFrom(replica->completer_.load());
+    // Proof of life for the node that answered: the one this replica was
+    // dispatched to. Not completer_: its "unset" value is 0, which is also
+    // node 0's id, so every response that never set it kept node 0 alive
+    // (#1162).
+    {
+      const clio::run::u64 answered_by = ReplicaTargetNode(net_key, replica_id);
+      if (answered_by != kInvalidNodeId) {
+        if (auto *im = CLIO_IPC) im->NoteHeardFrom(answered_by);
+      }
+    }
   }
 
   return 0;
@@ -955,6 +971,17 @@ void IpcManagerRun2Run::RegisterOriginProgress(
   std::lock_guard<std::mutex> lk(send_map_mutex_);
   prog.gen = ++progress_gen_;
   progress_map_[net_key] = std::move(prog);
+}
+
+clio::run::u64 IpcManagerRun2Run::ReplicaTargetNode(
+    size_t net_key, clio::run::u32 replica_id) const {
+  std::lock_guard<std::mutex> lk(send_map_mutex_);
+  auto it = progress_map_.find(net_key);
+  if (it == progress_map_.end() ||
+      replica_id >= it->second.replicas.size()) {
+    return kInvalidNodeId;
+  }
+  return it->second.replicas[replica_id].target_node_id;
 }
 
 bool IpcManagerRun2Run::MarkReplicaAccounted(size_t net_key,

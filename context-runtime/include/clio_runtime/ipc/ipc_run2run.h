@@ -511,6 +511,14 @@ class IpcManagerRun2Run {
                               const std::vector<clio::run::u64> &replica_targets,
                               bool probe_eligible = true);
   /**
+   * The node a tracked origin's replica was dispatched to.
+   * @param net_key the origin's send-map key
+   * @param replica_id the replica index
+   * @return its target node, or kInvalidNodeId when untracked
+   */
+  clio::run::u64 ReplicaTargetNode(size_t net_key,
+                                   clio::run::u32 replica_id) const;
+  /**
    * Mark a replica as accounted for (a response arrived, or it was declared
    * lost). Returns whether the caller should count it toward completion:
    * true if this call transitioned the replica to accounted, or the origin is
