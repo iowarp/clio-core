@@ -34,14 +34,130 @@
 #include "clio_runtime/safe_bdev/safe_bdev_journal.h"
 
 #include <fcntl.h>
+#if defined(_WIN32)
+#include <io.h>
+#include <sys/stat.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 
 namespace clio::run::safe_bdev {
 
 namespace {
+
+// ---- Platform layer: every journal file call goes through these. All of
+// them run under StripeJournal::mu_, so the Windows seek-then-transfer
+// forms of pread/pwrite cannot interleave.
+
+/**
+ * Open (creating if needed) a journal file for reading and writing.
+ * @param path file path
+ * @param truncate empty it first
+ * @return descriptor, or -1
+ */
+int OpenRw(const std::string &path, bool truncate) {
+#if defined(_WIN32)
+  return _open(path.c_str(),
+               _O_RDWR | _O_CREAT | _O_BINARY | (truncate ? _O_TRUNC : 0),
+               _S_IREAD | _S_IWRITE);
+#else
+  return ::open(path.c_str(), O_RDWR | O_CREAT | (truncate ? O_TRUNC : 0),
+                0644);
+#endif
+}
+
+/** Close a descriptor. @param fd descriptor */
+void CloseFd(int fd) {
+#if defined(_WIN32)
+  _close(fd);
+#else
+  ::close(fd);
+#endif
+}
+
+/**
+ * Size of an open file.
+ * @param fd descriptor
+ * @return bytes, or 0 if it cannot be determined
+ */
+uint64_t FileSize(int fd) {
+#if defined(_WIN32)
+  const int64_t n = _lseeki64(fd, 0, SEEK_END);
+#else
+  const off_t n = ::lseek(fd, 0, SEEK_END);
+#endif
+  return n > 0 ? static_cast<uint64_t>(n) : 0;
+}
+
+/**
+ * Cut a file to a length.
+ * @param fd descriptor
+ * @param len new length
+ * @return true on success
+ */
+bool TruncateFd(int fd, uint64_t len) {
+#if defined(_WIN32)
+  return _chsize_s(fd, static_cast<int64_t>(len)) == 0;
+#else
+  return ::ftruncate(fd, static_cast<off_t>(len)) == 0;
+#endif
+}
+
+/**
+ * Make a file's data durable: fdatasync on Linux, F_FULLFSYNC (else fsync)
+ * on macOS, whose plain fsync stops at the drive cache, _commit on Windows.
+ * @param fd descriptor
+ * @return true on success
+ */
+bool SyncFd(int fd) {
+#if defined(_WIN32)
+  return _commit(fd) == 0;
+#elif defined(__linux__)
+  return ::fdatasync(fd) == 0;
+#elif defined(__APPLE__)
+  return ::fcntl(fd, F_FULLFSYNC) == 0 || ::fsync(fd) == 0;
+#else
+  return ::fsync(fd) == 0;
+#endif
+}
+
+/**
+ * Write up to len bytes at a file offset.
+ * @param fd descriptor
+ * @param p bytes
+ * @param len byte count
+ * @param off file offset
+ * @return bytes written, or <= 0 on error
+ */
+int64_t WriteAtOs(int fd, const char *p, size_t len, uint64_t off) {
+#if defined(_WIN32)
+  if (_lseeki64(fd, static_cast<int64_t>(off), SEEK_SET) < 0) return -1;
+  return _write(fd, p, static_cast<unsigned>(len));
+#else
+  return ::pwrite(fd, p, len, static_cast<off_t>(off));
+#endif
+}
+
+/**
+ * Read up to len bytes at a file offset.
+ * @param fd descriptor
+ * @param p destination
+ * @param len byte count
+ * @param off file offset
+ * @return bytes read, or <= 0 at EOF or on error
+ */
+int64_t ReadAtOs(int fd, char *p, size_t len, uint64_t off) {
+#if defined(_WIN32)
+  if (_lseeki64(fd, static_cast<int64_t>(off), SEEK_SET) < 0) return -1;
+  return _read(fd, p, static_cast<unsigned>(len));
+#else
+  return ::pread(fd, p, len, static_cast<off_t>(off));
+#endif
+}
 
 /**
  * pwrite all of buf.
@@ -54,7 +170,7 @@ namespace {
 bool PwriteAll(int fd, const void *buf, size_t len, uint64_t off) {
   const char *p = static_cast<const char *>(buf);
   while (len > 0) {
-    const ssize_t n = ::pwrite(fd, p, len, static_cast<off_t>(off));
+    const int64_t n = WriteAtOs(fd, p, len, off);
     if (n <= 0) return false;
     p += n;
     len -= static_cast<size_t>(n);
@@ -74,7 +190,7 @@ bool PwriteAll(int fd, const void *buf, size_t len, uint64_t off) {
 bool PreadAll(int fd, void *buf, size_t len, uint64_t off) {
   char *p = static_cast<char *>(buf);
   while (len > 0) {
-    const ssize_t n = ::pread(fd, p, len, static_cast<off_t>(off));
+    const int64_t n = ReadAtOs(fd, p, len, off);
     if (n <= 0) return false;
     p += n;
     len -= static_cast<size_t>(n);
@@ -107,21 +223,21 @@ bool StripeJournal::Open(const std::string &path, uint64_t chunk_len,
   Close();
   if (path.empty()) return true;
   std::lock_guard<std::mutex> g(mu_);
-  fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+  fd_ = OpenRw(path, /*truncate=*/false);
   if (fd_ < 0) return false;
   path_ = path;
   chunk_len_ = chunk_len;
   Load(live_keys);
   // Nothing worth keeping: start the file over.
   if (recs_.empty() && end_ != 0) {
-    if (::ftruncate(fd_, 0) == 0) end_ = 0;
+    if (TruncateFd(fd_, 0)) end_ = 0;
   }
   return true;
 }
 
 void StripeJournal::Close() {
   std::lock_guard<std::mutex> g(mu_);
-  if (fd_ >= 0) ::close(fd_);
+  if (fd_ >= 0) CloseFd(fd_);
   fd_ = -1;
   recs_.clear();
   loaded_keys_.clear();
@@ -133,8 +249,7 @@ void StripeJournal::Load(const std::set<uint64_t> &live_keys) {
   std::vector<uint8_t> payload(chunk_len_);
   uint64_t off = 0;
   scan_ = ScanStats();
-  const off_t fsize = ::lseek(fd_, 0, SEEK_END);
-  scan_.file_size = fsize > 0 ? static_cast<uint64_t>(fsize) : 0;
+  scan_.file_size = FileSize(fd_);
   scan_.why = "end of file";
   while (true) {
     RecordHeader h{};
@@ -196,7 +311,7 @@ bool StripeJournal::CompactLocked() {
   for (const auto &s : recs_) live += s.second.size();
   if (live * rec_len * 2 > end_) return true;  // mostly live: keep growing
   const std::string tmp = path_ + ".tmp";
-  const int nfd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+  int nfd = OpenRw(tmp, /*truncate=*/true);
   if (nfd < 0) return false;
   std::vector<uint8_t> payload(chunk_len_);
   uint64_t noff = 0;
@@ -217,13 +332,31 @@ bool StripeJournal::CompactLocked() {
     if (!ok) break;
   }
   // The new file must be on disk before it replaces the old one.
-  if (!ok || ::fdatasync(nfd) != 0 ||
-      std::rename(tmp.c_str(), path_.c_str()) != 0) {
-    ::close(nfd);
-    ::unlink(tmp.c_str());
+  if (!ok || !SyncFd(nfd)) {
+    CloseFd(nfd);
+    std::remove(tmp.c_str());
     return false;
   }
-  ::close(fd_);
+#if defined(_WIN32)
+  // Windows cannot replace or rename a file that is open.
+  CloseFd(nfd);
+  CloseFd(fd_);
+  fd_ = -1;
+  std::error_code ec;
+  std::filesystem::rename(tmp, path_, ec);
+  nfd = OpenRw(ec ? tmp : path_, /*truncate=*/false);
+  if (ec || nfd < 0) {
+    fd_ = OpenRw(path_, /*truncate=*/false);
+    return false;
+  }
+#else
+  if (std::rename(tmp.c_str(), path_.c_str()) != 0) {
+    CloseFd(nfd);
+    std::remove(tmp.c_str());
+    return false;
+  }
+  CloseFd(fd_);
+#endif
   fd_ = nfd;
   end_ = noff;
   recs_ = std::move(moved);
@@ -232,7 +365,7 @@ bool StripeJournal::CompactLocked() {
 
 bool StripeJournal::Sync() {
   std::lock_guard<std::mutex> g(mu_);
-  return fd_ < 0 || ::fdatasync(fd_) == 0;
+  return fd_ < 0 || SyncFd(fd_);
 }
 
 bool StripeJournal::Read(uint64_t slot, uint32_t col,

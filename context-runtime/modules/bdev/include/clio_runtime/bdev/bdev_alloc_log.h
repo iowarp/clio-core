@@ -262,7 +262,14 @@ class AllocatorLog {
       unsynced_ = false;
     }
     if (fd < 0) return false;
+#if defined(__linux__)
     const bool ok = ::fdatasync(fd) == 0;
+#elif defined(__APPLE__)
+    // macOS has no fdatasync, and its fsync stops at the drive cache.
+    const bool ok = ::fcntl(fd, F_FULLFSYNC) == 0 || ::fsync(fd) == 0;
+#else
+    const bool ok = ::fsync(fd) == 0;
+#endif
     ::close(fd);
     return ok;
 #else
