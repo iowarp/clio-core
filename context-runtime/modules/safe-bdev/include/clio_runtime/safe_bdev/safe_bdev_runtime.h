@@ -1122,6 +1122,12 @@ class Runtime : public clio::run::Container {
                                        const uint8_t *delta,
                                        clio::run::u64 len, uint8_t coeff,
                                        bool &ok);
+  /** Where a Write spent its time inside WriteStripes, in ms. */
+  struct WritePhases {
+    double read_old_ms = 0;  /**< ReadReplacedBytes (delta-parity reads) */
+    double members_ms = 0;   /**< member data writes, dispatch to last ack */
+    double encode_ms = 0;    /**< parity encode + parity writes, all stripes */
+  };
   /**
    * The body of a Write once its stripes are held and logged dirty: land the
    * data (degraded stripes reconstructed and re-encoded), then encode the
@@ -1133,12 +1139,14 @@ class Runtime : public clio::run::Container {
    * @param clean stripes whose parity is current afterwards (log them clean)
    * @param intents the write's stripe intents (journal keys for degraded
    *        stripes; empty when the intent log is disabled)
+   * @param phases where the time went, for the slow-write log (may be null)
    */
   clio::run::TaskResume WriteStripes(clio::run::shared_ptr<WriteTask> &task,
                                      const std::vector<WritePiece> &pieces,
                                      const char *data, bool &ok,
                                      std::set<clio::run::u64> &clean,
-                                     const std::vector<IntentKey> &intents);
+                                     const std::vector<IntentKey> &intents,
+                                     WritePhases *phases);
   /**
    * Journal the down data columns of each degraded stripe (#1137) before any
    * byte of the write lands, so a crash mid-write cannot strand them.
@@ -1388,6 +1396,8 @@ class Runtime : public clio::run::Container {
   std::atomic<clio::run::u64> writes_in_flight_{0};
   /** Re-check period while waiting on the write gate / in-flight writes. */
   static constexpr double kWriteGatePollUs = 200.0;
+  /** A Write slower than this (ms) logs where its time went. */
+  static constexpr double kSlowStripeWriteMs = 1000.0;
   /** Redo passes before the final, gated one. */
   static constexpr int kRebuildRedoPasses = 4;
 

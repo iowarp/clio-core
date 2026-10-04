@@ -1649,20 +1649,46 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   // data of this write reaches a member.
   // A member being rebuilt does not take this write: record its stripes
   // so the rebuild redoes them, and wait out a rebuild's final pass (#1146).
+  const auto w_t0 = std::chrono::steady_clock::now();
   CLIO_CO_AWAIT(EnterWrite());
   NoteRebuildWrites(slots);
   std::vector<IntentKey> intents;
   const clio::run::u64 intent_seq = LogDirtyIntents(slots, intents);
   CLIO_CO_AWAIT(AwaitIntentDurable(intent_seq));
+  const auto w_t1 = std::chrono::steady_clock::now();
   CLIO_CO_AWAIT(LockStripes(slots));
+  const auto w_t2 = std::chrono::steady_clock::now();
   const clio::run::u64 watermark = IntentWatermark();
   bool ok = false;
   std::set<clio::run::u64> clean;
-  CLIO_CO_AWAIT(WriteStripes(task, pieces, data.ptr_, ok, clean, intents));
+  WritePhases phases;
+  CLIO_CO_AWAIT(WriteStripes(task, pieces, data.ptr_, ok, clean, intents,
+                             &phases));
+  const auto w_t3 = std::chrono::steady_clock::now();
   UnlockStripes(slots);
   LeaveWrite();
   LogCleanIntents(intents, clean);
   LogStripesEncoded(clean, watermark);  // older stale intents it settled
+  {
+    // Where a slow write went: the gate + intent log, the stripe locks
+    // (another write on the same round-robin stripes), or the I/O itself,
+    // split into the delta-parity reads, the member writes and the serial
+    // per-stripe parity encode. The core's [SLOW-PUT] modify phase is this
+    // whole call; this says which part of it (#1149).
+    auto ms = [](auto a, auto b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    const double total_ms = ms(w_t0, w_t3);
+    if (total_ms > kSlowStripeWriteMs) {
+      HLOG(kWarning,
+           "safe_bdev [SLOW-STRIPE] write of {} byte(s) over {} stripe(s) "
+           "took {} ms: gate+intent {} ms, stripe locks {} ms, read-old {} "
+           "ms, member writes {} ms, parity encode {} ms",
+           task->length_, slots.size(), total_ms, ms(w_t0, w_t1),
+           ms(w_t1, w_t2), phases.read_old_ms, phases.members_ms,
+           phases.encode_ms);
+    }
+  }
   if (!ok) {
     task->bytes_written_ = 0;
     task->return_code_ = 1;
@@ -1674,10 +1700,24 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   CLIO_TASK_BODY_END
 }
 
+namespace {
+/**
+ * Milliseconds elapsed since a steady_clock time point.
+ * @param t0 the start of the interval
+ * @return elapsed time in ms
+ */
+double MsSince(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
+}
+}  // namespace
+
 clio::run::TaskResume Runtime::WriteStripes(
     clio::run::shared_ptr<WriteTask> &task,
     const std::vector<WritePiece> &pieces, const char *data, bool &ok,
-    std::set<clio::run::u64> &clean, const std::vector<IntentKey> &intents) {
+    std::set<clio::run::u64> &clean, const std::vector<IntentKey> &intents,
+    WritePhases *phases) {
   CLIO_TASK_BODY_BEGIN
   ok = false;
   clean.clear();
@@ -1714,16 +1754,20 @@ clio::run::TaskResume Runtime::WriteStripes(
   const std::set<clio::run::u64> full_slots =
       degraded.empty() ? FullStripes(pieces) : std::set<clio::run::u64>();
   if (degraded.empty()) {
+    const auto read_t0 = std::chrono::steady_clock::now();
     CLIO_CO_AWAIT(ReadReplacedBytes(pieces, full_slots, delta_slots,
                                     old_bytes));
+    if (phases != nullptr) phases->read_old_ms = MsSince(read_t0);
   }
 
   // One AsyncWrite per block to a live member, all dispatched, then awaited.
   // A down member's bytes live in the parity.
   MemberWrites mw;
+  const auto members_t0 = std::chrono::steady_clock::now();
   bool wok = DispatchMemberWrites(*task, data, mw);
   bool any_failed = false;
   CLIO_CO_AWAIT(AwaitMemberWrites(mw, any_failed, wok));
+  if (phases != nullptr) phases->members_ms = MsSince(members_t0);
   const std::set<clio::run::u64> &touched = mw.touched;
 
   // Stripes that gained a down member under this write are redone degraded.
@@ -1769,6 +1813,7 @@ clio::run::TaskResume Runtime::WriteStripes(
     ok = true;
     CLIO_CO_RETURN;
   }
+  const auto encode_t0 = std::chrono::steady_clock::now();
   for (clio::run::u64 s : touched) {
     if (degraded.count(s) != 0 || retried.count(s) != 0) continue;
     NoteSlotWritten(s);
@@ -1796,6 +1841,7 @@ clio::run::TaskResume Runtime::WriteStripes(
     }
     clean.insert(s);
   }
+  if (phases != nullptr) phases->encode_ms = MsSince(encode_t0);
   task->bytes_written_ = mw.bytes;
   ok = true;
   CLIO_CO_RETURN;
