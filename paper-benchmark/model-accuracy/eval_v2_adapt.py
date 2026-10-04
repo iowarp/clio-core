@@ -14,6 +14,7 @@ Per chunk, in stream order:
   regret_pick    true cost of v2's own pick / best true cost - 1
   regret_stored  the same for the setting finally stored (exploration can
                  replace the pick)
+  best / pick / stored  the truly cheapest setting, v2's pick, what was stored
 Cost = compress ms + decompress ms + bytes / (ratio * 1 GB/s), as in the runs.
 Writes PREFIX_chunks.csv and PREFIX_summary.csv; prints the summary (first
 and second half of the stream, and the whole stream).
@@ -79,6 +80,7 @@ def score_run(run, settings, truth_keys, nbytes_t, truth):
         "ape_ct": np.nanmean(ape[..., 0], axis=1),
         "ape_dt": np.nanmean(ape[..., 1], axis=1),
         "ape_ratio": np.nanmean(ape[..., 2], axis=1),
+        "best": [settings[k] for k in tc.argmin(axis=1)],
         "pick": [settings[k] for k in pick],
         "regret_pick": tc[r, pick] / best - 1,
         "stored": [settings[k] if k >= 0 else "" for k in stored],
