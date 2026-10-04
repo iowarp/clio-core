@@ -54,7 +54,7 @@ constexpr double kStoreBusyPollUs = 20.0;
 }  // namespace
 
 std::string Runtime::EncInodeRec(const FileInfo &fi, clio::run::u64 size,
-                                 clio::run::u32 writer) {
+                                 clio::run::u32 writer, bool fresh) {
   std::string p;
   FsEnc e(&p);
   e.U32(kInodeRecMagic);
@@ -67,7 +67,8 @@ std::string Runtime::EncInodeRec(const FileInfo &fi, clio::run::u64 size,
   e.U64(fi.atime_);
   e.U64(fi.mtime_);
   e.U64(fi.ctime_);
-  e.U32((fi.orphan_ ? 1u : 0u) | (fi.has_xattr_ ? 2u : 0u));
+  e.U32((fi.orphan_ ? 1u : 0u) | (fi.has_xattr_ ? 2u : 0u) |
+        (fresh ? kInodeRecFresh : 0u));
   e.Str(fi.symlink_);
   // Appended last so older decoders (and older records) still line up.
   e.U32(writer);
@@ -75,7 +76,8 @@ std::string Runtime::EncInodeRec(const FileInfo &fi, clio::run::u64 size,
 }
 
 bool Runtime::DecInodeRec(const std::string &rec, FileInfo *fi,
-                          clio::run::u64 *size, clio::run::u32 *writer) {
+                          clio::run::u64 *size, clio::run::u32 *writer,
+                          bool *fresh) {
   FsDec d(rec.data(), rec.size());
   clio::run::u32 magic = 0, flags = 0;
   if (!d.U32(&magic) || magic != kInodeRecMagic || !d.U32(&fi->type_) ||
@@ -87,8 +89,56 @@ bool Runtime::DecInodeRec(const std::string &rec, FileInfo *fi,
   }
   fi->orphan_ = (flags & 1u) != 0;
   fi->has_xattr_ = (flags & 2u) != 0;
+  if (fresh != nullptr) *fresh = (flags & kInodeRecFresh) != 0;
   if (!d.U32(writer)) *writer = kNoRecWriter;
   return true;
+}
+
+clio::run::TaskResume Runtime::CreateInodeRecord(
+    const clio::cte::core::TagId &id, clio::run::u32 type, clio::run::u32 mode,
+    const std::string &symlink, const std::string &path, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  auto fi = std::make_shared<FileInfo>();
+  fi->tag_id_ = id;
+  fi->path_ = path;
+  fi->type_ = type;
+  fi->mode_ = mode == 0xFFFFFFFFu ? mode : (mode & 07777u);
+  fi->symlink_ = symlink;
+  const clio::run::u64 now = clio::cte::core::GetWallTimeNs();
+  fi->atime_ = fi->mtime_ = fi->ctime_ = now;
+  const std::string rec = EncInodeRec(*fi, 0, container_id_, /*fresh=*/true);
+  const clio::run::u64 packed = FsPack(id);
+  CLIO_CO_AWAIT(StoreInodeRec(packed, rec, rc));
+  if (rc != 0) {
+    rc = clio::cte::core::PutRcIsNoSpace(static_cast<clio::run::u32>(rc))
+             ? ENOSPC
+             : EIO;
+    CLIO_CO_RETURN;
+  }
+  if (InodeOwner(packed) == container_id_) {
+    // Homed here: resident at once. The record is stored, nothing is dirty.
+    std::lock_guard<std::mutex> g(meta_mu_);
+    if (by_tag_.count(packed) == 0) by_tag_[packed] = fi;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::DiscardInodeRecord(
+    const clio::cte::core::TagId &id) {
+  CLIO_TASK_BODY_BEGIN
+  const clio::run::u64 packed = FsPack(id);
+  {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    by_tag_.erase(packed);
+    inode_dirty_.erase(packed);
+    inode_dirty_seq_.erase(packed);
+  }
+  auto d = cte_.AsyncDelBlob(id, kInodeBlob, clio::run::PoolQuery::Dynamic());
+  CLIO_CO_AWAIT(d);  // best effort: a leftover record names nothing
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 void Runtime::MarkInodeDirtyLocked(const FileInfo &fi) {
@@ -472,18 +522,20 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed) {
   auto fi = std::make_shared<FileInfo>();
   clio::run::u64 size = 0;
   clio::run::u32 writer = kNoRecWriter;
+  bool fresh = false;
   if (g->GetReturnCode() != 0 ||
-      !DecInodeRec(rec, fi.get(), &size, &writer)) {
+      !DecInodeRec(rec, fi.get(), &size, &writer, &fresh)) {
     HLOG(kError, "filesystem: inode record {} unreadable", packed);
     CLIO_CO_RETURN;
   }
   fi->tag_id_ = tag;
   // Containers caching its attrs registered with an earlier incarnation of
-  // this home: the next change goes to every container.
-  fi->holders_unknown_ = NumContainers() > 1;
+  // this home: the next change goes to every container. A record written at
+  // create (fresh) was never cached anywhere and has no stream to reconcile.
+  fi->holders_unknown_ = NumContainers() > 1 && !fresh;
   const bool served_elsewhere =
       writer != kNoRecWriter && writer != container_id_;
-  if (fi->type_ != kFsTypeSymlink) {
+  if (fi->type_ != kFsTypeSymlink && !fresh) {
     // Another container stored the latest record: it served the inode while
     // this one was away (a failover), so this container's stream state is
     // older than the record -- a truncate there must not be undone by the

@@ -789,6 +789,62 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume EnsureIdReserve(clio::run::u32 margin);
   /** Mint a new, never-reused inode id homed here (0 when none reserved). */
   clio::cte::core::TagId MintId();
+  /**
+   * Mint a new, never-reused inode id homed on `home` (null when none is
+   * reserved). The major names this container as the minter, so ids minted
+   * for one home by different containers never collide (#1158).
+   * @param home the container that will serve the inode
+   * @return the id, or null
+   */
+  clio::cte::core::TagId MintIdFor(clio::run::u32 home);
+  /**
+   * Mint an id homed on `home`, extending the durable id reservation first
+   * when it has run out.
+   * @param home the container that will serve the inode
+   * @param id OUT the id
+   */
+  clio::run::TaskResume MintIdReady(clio::run::u32 home,
+                                    clio::cte::core::TagId &id);
+  /**
+   * Store the record of a NEW inode before its name is published (#1158).
+   * The inode's home (FsInodeHomeFor) is usually not the container that
+   * inserts the name; it loads the inode from this record on first use
+   * (EnsureInode). Stored first, a published name never leads to a missing
+   * inode. When the home is this container the inode is made resident too.
+   * @param id the inode's id (its home encoded)
+   * @param type kFsTypeFile or kFsTypeSymlink
+   * @param mode permission bits
+   * @param symlink target (symlinks)
+   * @param path the file's path
+   * @param rc OUT 0, or ENOSPC / EIO when the record could not be stored
+   */
+  clio::run::TaskResume CreateInodeRecord(const clio::cte::core::TagId &id,
+                                          clio::run::u32 type,
+                                          clio::run::u32 mode,
+                                          const std::string &symlink,
+                                          const std::string &path, int &rc);
+  /**
+   * Undo CreateInodeRecord for an id whose name was never published (the
+   * name was taken meanwhile, or the insert failed).
+   * @param id the inode's id
+   */
+  clio::run::TaskResume DiscardInodeRecord(const clio::cte::core::TagId &id);
+  /**
+   * Create a file or symlink: mint an id homed by the file's path (or adopt
+   * the client-minted r.id_), store its inode record, then publish the name
+   * on its block's home. A name taken meanwhile yields the existing entry
+   * (EEXIST with kInsExcl) and the record is discarded.
+   * @param r dir_id_, dir_ and leaf_ set; id_ a client-minted id or 0
+   * @param type kFsTypeFile or kFsTypeSymlink
+   * @param mode permission bits
+   * @param symlink target (symlinks)
+   * @param flags kInsExcl or 0
+   * @param er OUT the insert result; created_ != 0 when the name is new
+   */
+  clio::run::TaskResume CreateEntry(FsReq r, clio::run::u32 type,
+                                    clio::run::u32 mode,
+                                    const std::string &symlink,
+                                    clio::run::u32 flags, FsResp &er);
   /** Create the inode for a new file/symlink (meta_mu_ NOT held). */
   std::shared_ptr<FileInfo> NewInode(const clio::cte::core::TagId &id,
                                      clio::run::u32 type, clio::run::u32 mode,
@@ -1018,10 +1074,12 @@ class Runtime : public clio::run::Container {
    * @param fi inode
    * @param size logical size to record
    * @param writer the container storing the record
+   * @param fresh written at create by the minter: no container caches the
+   *        inode yet and no stream exists (kInodeRecFresh)
    * @return record bytes
    */
   static std::string EncInodeRec(const FileInfo &fi, clio::run::u64 size,
-                                 clio::run::u32 writer);
+                                 clio::run::u32 writer, bool fresh = false);
   /**
    * Decode an inode record.
    * @param rec record bytes
@@ -1029,12 +1087,16 @@ class Runtime : public clio::run::Container {
    * @param size receives the recorded size
    * @param writer receives the container that stored it (kNoRecWriter for a
    *        record from before the field existed)
+   * @param fresh receives the kInodeRecFresh flag (may be null)
    * @return false if malformed
    */
   static bool DecInodeRec(const std::string &rec, FileInfo *fi,
-                          clio::run::u64 *size, clio::run::u32 *writer);
+                          clio::run::u64 *size, clio::run::u32 *writer,
+                          bool *fresh = nullptr);
   /** DecInodeRec's writer for records that do not carry one. */
   static constexpr clio::run::u32 kNoRecWriter = 0xFFFFFFFFu;
+  /** Record flag: written at create, before any access (see EncInodeRec). */
+  static constexpr clio::run::u32 kInodeRecFresh = 4u;
   /**
    * After a restart, reconcile every stream this node's stream container
    * restored from its log with its file's inode record, before the

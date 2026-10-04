@@ -382,14 +382,31 @@ clio::run::TaskResume Runtime::ExecInodeOp(clio::run::u32 op, const FsReq &req,
 // Inodes
 // ===========================================================================
 
-clio::cte::core::TagId Runtime::MintId() {
+clio::cte::core::TagId Runtime::MintId() { return MintIdFor(container_id_); }
+
+clio::cte::core::TagId Runtime::MintIdFor(clio::run::u32 home) {
   std::lock_guard<std::mutex> g(meta_mu_);
   // Only ids covered by the durable reservation are handed out, so a
   // restart can never mint one that is still in use (EnsureIdReserve keeps
   // the reservation ahead; null asks the caller to wait for it).
   if (next_minor_ >= minted_hi_) return clio::cte::core::TagId::GetNull();
-  return clio::cte::core::TagId(kFsIdFlag | (container_id_ & kFsHomeMask),
-                                next_minor_++);
+  const clio::run::u32 major =
+      kFsIdFlag | kFsIdMinterFlag |
+      ((container_id_ & kFsIdMinterMask) << kFsIdMinterShift) |
+      (home & kFsHomeMask);
+  return clio::cte::core::TagId(major, next_minor_++);
+}
+
+clio::run::TaskResume Runtime::MintIdReady(clio::run::u32 home,
+                                           clio::cte::core::TagId &id) {
+  CLIO_TASK_BODY_BEGIN
+  for (;;) {
+    id = MintIdFor(home);
+    if (!id.IsNull()) break;
+    CLIO_CO_AWAIT(EnsureIdReserve(1024));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 std::shared_ptr<Runtime::FileInfo> Runtime::NewInode(

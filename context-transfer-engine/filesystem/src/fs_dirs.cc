@@ -866,15 +866,12 @@ int Runtime::InsertEntryLocked(BlockSlot &slot, const FsReq &req,
   e.type_ = req.type_;
   e.state_ = (f & kInsPending) ? kDirEntPending : kDirEntLive;
   if ((f & kInsNewInode) != 0) {
-    const clio::run::u64 want = req.id_;
-    if (want != 0 &&
-        (InodeOwner(want) != container_id_ || FindInode(want) != nullptr)) {
-      return EEXIST;  // a client-minted id that is not ours or is taken
-    }
-    const clio::cte::core::TagId id = want != 0 ? FsUnpack(want) : MintId();
-    if (id.IsNull()) return kFsRetry;  // reservation in flight
-    e.id_ = FsPack(id);
-    NewInode(id, req.type_, req.mode_, req.str_, FsJoin(req.dir_, req.leaf_));
+    // The caller minted the id and stored the inode's record first
+    // (CreateEntry); the inode's home loads it on first use. Nothing is
+    // created here, so the name's block and the inode need not share a
+    // container (#1158).
+    if (req.id_ == 0) return EINVAL;
+    e.id_ = req.id_;
   } else {
     const clio::cte::core::TagId id = req.id_ != 0 ? FsUnpack(req.id_) : MintId();
     if (id.IsNull()) return kFsRetry;

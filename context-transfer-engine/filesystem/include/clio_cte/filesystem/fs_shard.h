@@ -66,6 +66,13 @@ GLOBAL_CROSS_CONST clio::run::u32 kFsIdFlag = 0x40000000u;
 GLOBAL_CROSS_CONST clio::run::u32 kFsClientIdFlag = 0x80000000u;
 /** Low bits of an fs/client-minted major that hold the home container. */
 GLOBAL_CROSS_CONST clio::run::u32 kFsHomeMask = 0xFFFFu;
+/** Set on a container-minted id whose major also names its MINTER (bits
+ *  16..28): home and minter are then independent, so (minter, minor) keeps
+ *  ids unique while the home may be any container (#1158). Ids from before
+ *  this bit have minter == home. */
+GLOBAL_CROSS_CONST clio::run::u32 kFsIdMinterFlag = 0x20000000u;
+GLOBAL_CROSS_CONST clio::run::u32 kFsIdMinterShift = 16;
+GLOBAL_CROSS_CONST clio::run::u32 kFsIdMinterMask = 0x1FFFu;
 
 /**
  * splitmix64 finalizer: spreads sequential or low-entropy keys uniformly.
@@ -196,6 +203,20 @@ inline clio::run::PoolQuery FsEntryQuery(const std::string &path) {
  */
 inline clio::run::u32 FsDirContainer(const std::string &dir, clio::run::u32 n) {
   return n == 0 ? 0 : FsPathHash(dir) % n;
+}
+
+/**
+ * Home container of a new file's inode: a hash of the file's OWN path, so
+ * the files of one directory spread over every container instead of all
+ * living where the directory's entries do (#1158). Both the client (sieve
+ * create) and the filesystem containers mint ids with this home.
+ * @param path normalized absolute path of the file
+ * @param n number of containers
+ * @return container id
+ */
+inline clio::run::u32 FsInodeHomeFor(const std::string &path,
+                                     clio::run::u32 n) {
+  return n == 0 ? 0 : FsPathHash(path) % n;
 }
 
 /** Pack a TagId as (major << 32) | minor. */

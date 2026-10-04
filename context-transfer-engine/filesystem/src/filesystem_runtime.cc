@@ -507,19 +507,71 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::CreateEntry(FsReq r, clio::run::u32 type,
+                                           clio::run::u32 mode,
+                                           const std::string &symlink,
+                                           clio::run::u32 flags, FsResp &er) {
+  CLIO_TASK_BODY_BEGIN
+  er = FsResp();
+  const std::string path = FsJoin(r.dir_, r.leaf_);
+  clio::cte::core::TagId id;
+  if (r.id_ != 0) {
+    // Client-minted (sieve create): its home must name a container.
+    if (FsIdHome(r.id_) >= NumContainers()) {
+      er.rc_ = EINVAL;
+      CLIO_CO_RETURN;
+    }
+    id = FsUnpack(r.id_);
+  } else {
+    CLIO_CO_AWAIT(MintIdReady(FsInodeHomeFor(path, NumContainers()), id));
+  }
+  int crc = 0;
+  CLIO_CO_AWAIT(CreateInodeRecord(id, type, mode, symlink, path, crc));
+  if (crc != 0) {
+    er.rc_ = static_cast<clio::run::u32>(crc);
+    CLIO_CO_RETURN;
+  }
+  r.id_ = FsPack(id);
+  r.type_ = type;
+  r.mode_ = mode;
+  r.str_ = symlink;
+  r.flags_ = kInsNewInode | flags;
+  CLIO_CO_AWAIT(EntryOp(kShardInsert, r, er));
+  if (er.rc_ != 0 || er.created_ == 0 || er.id_ != r.id_) {
+    // The name went to another inode (or nowhere): ours was never published.
+    CLIO_CO_AWAIT(DiscardInodeRecord(id));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::OpenName(OpenTask *task, const FsReq &name,
                                         FsResp &er, bool &done) {
   CLIO_TASK_BODY_BEGIN
   done = false;
   FsReq r = name;
   if (task->flags_ & O_CREAT) {
-    // Create-or-open in ONE mutation on the home of the name's block: of
-    // several racing creators (any node) exactly one sees created_=1, which
-    // is what O_EXCL keys off.
-    r.type_ = kFsTypeFile;
-    r.mode_ = task->mode_ & 07777u;
-    r.flags_ = kInsNewInode | ((task->flags_ & O_EXCL) ? kInsExcl : 0u);
-    CLIO_CO_AWAIT(EntryOp(kShardInsert, r, er));
+    // Without O_EXCL the common case is an existing file: look first, and
+    // create only when the name is free. Of several racing creators (any
+    // node) exactly one publishes the name (created_=1), which is what
+    // O_EXCL keys off; the others get the winner's entry (CreateEntry).
+    bool exists = false;
+    if ((task->flags_ & O_EXCL) == 0) {
+      DirEntry e;
+      int lrc = 0;
+      CLIO_CO_AWAIT(LookupEntry(r.dir_id_, r.leaf_, e, lrc));
+      if (lrc == 0) {
+        exists = true;
+        er.id_ = e.id_;
+        er.type_ = e.type_;
+      } else if (lrc != ENOENT) {
+        er.rc_ = static_cast<clio::run::u32>(lrc);
+      }
+    }
+    if (!exists && er.rc_ == 0) {
+      CLIO_CO_AWAIT(CreateEntry(r, kFsTypeFile, task->mode_ & 07777u, "",
+                                (task->flags_ & O_EXCL) ? kInsExcl : 0u, er));
+    }
   } else {
     DirEntry e;
     int lrc = 0;
@@ -679,10 +731,8 @@ clio::run::TaskResume Runtime::MultiCreate(
       r.dir_ = FsParentDir(path);
       r.leaf_ = FsLeaf(path);
       r.id_ = e.tag_packed_;
-      r.type_ = kFsTypeFile;
-      r.mode_ = e.mode_ & 07777u;
-      r.flags_ = kInsNewInode | kInsExcl;
-      CLIO_CO_AWAIT(EntryOp(kShardInsert, r, er));
+      CLIO_CO_AWAIT(CreateEntry(r, kFsTypeFile, e.mode_ & 07777u, "",
+                                kInsExcl, er));
     } else {
       er.rc_ = static_cast<clio::run::u32>(perc);
     }
@@ -1411,13 +1461,10 @@ clio::run::TaskResume Runtime::Symlink(clio::run::shared_ptr<SymlinkTask> &task)
   r.dir_id_ = pe.id_;
   r.dir_ = FsParentDir(path);
   r.leaf_ = FsLeaf(path);
-  r.type_ = kFsTypeSymlink;
-  r.mode_ = 0777u;
-  r.str_ = task->target_.str();
-  r.flags_ = kInsExcl | kInsNewInode;
   MirrorRefuse(r.dir_);  // before the name can exist (libfuse's post-op stat)
   FsResp rr;
-  CLIO_CO_AWAIT(EntryOp(kShardInsert, r, rr));
+  CLIO_CO_AWAIT(CreateEntry(r, kFsTypeSymlink, 0777u, task->target_.str(),
+                            kInsExcl, rr));
   task->return_code_ = rr.rc_;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

@@ -924,10 +924,10 @@ std::vector<clio::cte::filesystem::MultiCreateEnt> g_create_queue;
 
 /**
  * Mint a file id client-side for sieve create. The id names its inode's home
- * -- the container owning the file's directory (hash of the parent path),
- * which is where the MultiCreate entry lands -- plus this node, and its minor
+ * -- a hash of the file's own path (FsInodeHomeFor, #1158), so the files of
+ * one directory spread over every container -- plus this node, and its minor
  * starts at a per-process epoch so a restarted FUSE daemon does not reissue
- * the ids of its previous life. The home rejects any id it already holds.
+ * the ids of its previous life.
  * @param path the file being created
  * @return the minted id
  */
@@ -941,8 +941,8 @@ clio::cte::core::TagId MintTagId(const std::string &path) {
   const clio::run::u32 node = ipc != nullptr ? ipc->GetNodeId() : 0;
   const clio::run::u32 hosts =
       ipc != nullptr ? static_cast<clio::run::u32>(ipc->GetNumHosts()) : 1;
-  const clio::run::u32 home = clio::cte::filesystem::FsDirContainer(
-      clio::cte::filesystem::FsParentDir(path), hosts);
+  const clio::run::u32 home =
+      clio::cte::filesystem::FsInodeHomeFor(path, hosts);
   const clio::run::u32 major = clio::cte::filesystem::kFsClientIdFlag |
                                ((node & 0x3FFFu) << 16) |
                                (home & clio::cte::filesystem::kFsHomeMask);
