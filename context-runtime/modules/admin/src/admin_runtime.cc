@@ -480,6 +480,14 @@ clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
     }
   }
 
+  // Per-phase timing of slow ticks (#1149: small responses sat unsent for
+  // 60+ s on one node while its handlers had long finished).
+  const auto tick_t0 = std::chrono::steady_clock::now();
+  auto tick_t_maint = tick_t0;
+  auto tick_t_lat = tick_t0;
+  size_t tick_lat_sent = 0;
+  size_t tick_io_sent = 0;
+
   // Maintenance: retries, dead-node fanout, cross-node task-progress (#628).
   //
   // These are LIVENESS scans on millisecond-to-second timescales (retry
@@ -506,6 +514,7 @@ clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
       ScanTaskProgress();  // #628: cross-node task-progress validity check
     }
   }
+  tick_t_maint = std::chrono::steady_clock::now();
 
   // Snapshot the depth of each priority at function entry so a hot
   // producer can't monopolise this tick.
@@ -539,8 +548,10 @@ clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
     if (!origin_task.IsNull()) {
       ipc_manager->GetRun2Run()->SendOut(origin_task);
       did_send = true;
+      ++tick_lat_sent;
     }
   }
+  tick_t_lat = std::chrono::steady_clock::now();
 
   // --- Phase 2: drain bulk I/O up to byte budget AND entry depth ------
   size_t io_budget = clio::run::kNetQueueIoByteBudget;
@@ -574,9 +585,23 @@ clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
         io_budget = (sz >= io_budget) ? 0 : (io_budget - sz);
         --io_out_remaining;
         did_any = true;
+        ++tick_io_sent;
       }
     }
     if (!did_any) break;
+  }
+  {
+    const auto tick_t_end = std::chrono::steady_clock::now();
+    auto ms = [](auto a, auto b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    if (ms(tick_t0, tick_t_end) >= kSlowSendTickMs) {
+      HLOG(kWarning, "[SLOW-SEND-TICK] {} ms: maintenance {} ms, latency "
+           "lane {} ms ({} sent of {} queued), bulk {} ms ({} sent of {} "
+           "queued)", ms(tick_t0, tick_t_end), ms(tick_t0, tick_t_maint),
+           ms(tick_t_maint, tick_t_lat), tick_lat_sent, n_out_lat,
+           ms(tick_t_lat, tick_t_end), tick_io_sent, n_in_io + n_out_io);
+    }
   }
 
   cur_task->SetDidWork(did_send);

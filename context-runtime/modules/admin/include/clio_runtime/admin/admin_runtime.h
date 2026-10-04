@@ -72,6 +72,8 @@ enum AdminQueueIndex {
  */
 class Runtime : public clio::run::Container {
 public:
+  /** A Send tick slower than this logs its per-phase timing (ms). */
+  static constexpr double kSlowSendTickMs = 500.0;
   // CreateParams type used by CLIO_TASK_CC macro for lib_name access
   using CreateParams = clio::run::admin::CreateParams;
 
