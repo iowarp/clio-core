@@ -72,6 +72,7 @@ using namespace std::chrono_literals;
 #include <clio_runtime/safe_bdev/safe_bdev_client.h>
 #include <clio_runtime/safe_bdev/safe_bdev_tasks.h>
 #include <clio_runtime/singletons.h>
+#include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/serialize/msgpack_wrapper.h>
 
 namespace {
@@ -689,11 +690,11 @@ TEST_CASE("safe_bdev_crash_between_data_and_parity",
   // Overwrite set 0, "crashing" after its data lands but before its parity
   // does: the stripes' on-disk parity still encodes the OLD bytes.
   // (The fault also holds off the background builder until the "crash".)
-  setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
+  ctp::SystemInfo::Setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
   rig.Rewrite(0, 73);
   REQUIRE(QueryArray(rig.safe).dirty_slots > 0);
   rig.Shutdown();
-  unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
+  ctp::SystemInfo::Unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
   rig.Create();
   // Restart re-encodes the stripes the intent log names. Had it trusted the
   // stale parity, losing a disk would now decode set 0 to wrong bytes.
@@ -724,11 +725,11 @@ TEST_CASE("safe_bdev_crash_during_degraded_write",
   rig.WriteNew(kSetLen, 82);
   KillDisk(rig.paths[0]);  // a data member
   rig.VerifyAll();         // its first failed read marks it down
-  setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
+  ctp::SystemInfo::Setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
   rig.Rewrite(0, 83);
   REQUIRE(QueryArray(rig.safe).dirty_slots > 0);
   rig.Shutdown();
-  unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
+  ctp::SystemInfo::Unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
   rig.Create();
   FlushParity(rig.safe);
   INFO("dirty stripes after restart: " +
@@ -1255,7 +1256,7 @@ TEST_CASE("safe_bdev_concurrent_degraded_crash",
     REQUIRE(v.empty());
   }
   phase(30, "degraded");
-  setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
+  ctp::SystemInfo::Setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
   phase(30, "degraded, parity skipped");
   const int64_t dirty_before = QueryArray(rig.safe).dirty_slots;
   {
@@ -1266,7 +1267,7 @@ TEST_CASE("safe_bdev_concurrent_degraded_crash",
     REQUIRE(d->GetReturnCode() == 0);
     std::this_thread::sleep_for(150ms);
   }
-  unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
+  ctp::SystemInfo::Unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
   rig.Create();
   FlushParity(rig.safe);
   const int64_t dirty_after = QueryArray(rig.safe).dirty_slots;
@@ -1320,7 +1321,7 @@ TEST_CASE("safe_bdev_degraded_crash_cycles",
   for (int cycle = 0; cycle < 6; ++cycle) {
     const std::string c = "cycle " + std::to_string(cycle);
     phase(15, c + " before the crash");
-    setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
+    ctp::SystemInfo::Setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
     {
       const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, 10);
       INFO("churn " + c + " parity skipped: " + e);
@@ -1332,7 +1333,7 @@ TEST_CASE("safe_bdev_degraded_crash_cycles",
     d.Wait();
     REQUIRE(d->GetReturnCode() == 0);
     std::this_thread::sleep_for(150ms);
-    unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
+    ctp::SystemInfo::Unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
     rig.Create();
     {
       const std::string v = VerifyChurn(rig.safe, sets);
