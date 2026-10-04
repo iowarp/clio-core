@@ -165,6 +165,17 @@ void AppendBytes(const fs::path &path, const std::vector<uint8_t> &bytes) {
 }
 
 /**
+ * Little-endian bytes of a 64-bit value.
+ * @param v the value
+ * @return its 8 bytes, least significant first
+ */
+std::vector<uint8_t> U64(uint64_t v) {
+  std::vector<uint8_t> out(8);
+  for (int i = 0; i < 8; ++i) out[i] = static_cast<uint8_t>(v >> (8 * i));
+  return out;
+}
+
+/**
  * Little-endian bytes of a u32.
  * @param v value
  * @return its four bytes
@@ -258,11 +269,14 @@ TEST_CASE("CorruptRestore - corrupt snapshot and WAL do not kill the daemon",
   // Snapshot: a tag entry (type 0) whose name length claims ~4 GiB.
   AppendBytes(meta_log, {0});
   AppendBytes(meta_log, U32(0xFFFFFF00u));
-  // WAL: a well-framed kCreateTag record whose 4-byte payload is a string
-  // length of 2 GiB -- the old reader copied 2 GiB out of a 4-byte buffer.
+  // WAL: a well-framed kCreateTag record (type, sequence number, payload
+  // size, payload) whose 4-byte payload is a string length of 2 GiB -- the
+  // old reader copied 2 GiB out of a 4-byte buffer. The sequence number is
+  // past every real record's, so replay reaches it last.
   const fs::path tag_wal = meta_log.string() + ".tag.0";
   std::vector<uint8_t> rec = {
       static_cast<uint8_t>(clio::cte::core::TxnType::kCreateTag)};
+  for (uint8_t b : U64(1ull << 40)) rec.push_back(b);
   for (uint8_t b : U32(4)) rec.push_back(b);
   for (uint8_t b : U32(0x7FFFFFFFu)) rec.push_back(b);
   AppendBytes(tag_wal, rec);
