@@ -139,7 +139,8 @@ clio::run::TaskResume Runtime::MirrorRange(TagId tag, std::string name,
 }
 
 clio::run::TaskResume Runtime::ReadRemoteCopy(
-    clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task, bool &served) {
+    clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task, bool &served,
+    clio::run::u32 *served_by) {
   CLIO_TASK_BODY_BEGIN
   served = false;
   const clio::run::u32 n = NumContainers();
@@ -169,10 +170,12 @@ clio::run::TaskResume Runtime::ReadRemoteCopy(
       all = g->GetReturnCode() == 0;
     }
     if (all) {
-      HLOG(kWarning, "replication: {}.{}/{} unreadable at its owner "
-           "(device down); served from the remote copy on container {}",
+      HLOG(kWarning, "replication: {}.{}/{} not readable from its owner's "
+           "copies (device down, or the primary lost its bytes in a "
+           "restart); served from the remote copy on container {}",
            tag.major_, tag.minor_, name, c);
       served = true;
+      if (served_by != nullptr) *served_by = c;
     }
   }
   CLIO_CO_RETURN;

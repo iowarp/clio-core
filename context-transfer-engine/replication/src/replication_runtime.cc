@@ -584,11 +584,10 @@ void Runtime::UnlockBlobs(const std::vector<std::string> &keys) {
   for (const auto &k : keys) blob_busy_.erase(k);
 }
 
-clio::run::TaskResume Runtime::RecachePrimary(const TagId &tag_id,
-                                              const std::string &blob_name,
-                                              int replica_idx,
-                                              clio::run::u64 rep_size,
-                                              clio::run::u64 &recached) {
+clio::run::TaskResume Runtime::RecachePrimary(
+    const TagId &tag_id, const std::string &blob_name, int replica_idx,
+    clio::run::u64 rep_size, clio::run::u64 &recached,
+    const clio::run::PoolQuery &from) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
@@ -605,9 +604,7 @@ clio::run::TaskResume Runtime::RecachePrimary(const TagId &tag_id,
     Context get_ctx;
     get_ctx.replica_ = replica_idx;
     auto get_task = cte->AsyncGetBlob(tag_id, blob_name, off, len,
-                                      /*flags=*/0, buf_ptr,
-                                      clio::run::PoolQuery::Local(),
-                                      get_ctx);
+                                      /*flags=*/0, buf_ptr, from, get_ctx);
     CLIO_CO_AWAIT(get_task);
     if (get_task->GetReturnCode() != 0) {
       CLIO_IPC->FreeBuffer(buf);
@@ -629,6 +626,45 @@ clio::run::TaskResume Runtime::RecachePrimary(const TagId &tag_id,
     }
     recached += len;
   }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::HealPrimaryFromRemote(
+    const TagId &tag_id, const std::string &blob_name,
+    clio::run::u32 remote_c, clio::run::u64 end) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  auto *cte = GetCoreClient();
+  const clio::run::PoolQuery at = clio::run::PoolQuery::DirectId(remote_c);
+  clio::run::u64 remote_size = 0;
+  {
+    auto st = cte->AsyncGetBlobSize(tag_id, blob_name, at, 0);
+    CLIO_CO_AWAIT(st);
+    if (st->GetReturnCode() != 0 || st->size_ < end) CLIO_CO_RETURN;
+    remote_size = st->size_;
+  }
+  // Under the blob's write token: the re-cache re-reads the remote copy and
+  // must not land over a write that refills the primary meanwhile.
+  std::vector<std::string> keys{BlobKey(tag_id, blob_name)};
+  CLIO_CO_AWAIT(LockBlobs(keys));
+  {
+    auto ps = cte->AsyncGetBlobSize(tag_id, blob_name,
+                                    clio::run::PoolQuery::Local(), 0);
+    CLIO_CO_AWAIT(ps);
+    if (!(ps->GetReturnCode() == 0 && ps->size_ >= end)) {
+      clio::run::u64 recached = 0;
+      CLIO_CO_AWAIT(RecachePrimary(tag_id, blob_name, 0, remote_size,
+                                   recached, at));
+      HLOG(kWarning, "replication: {}.{}/{} primary re-cached from the remote "
+           "copy on container {}: {} of {} byte(s)",
+           tag_id.major_, tag_id.minor_, blob_name, remote_c, recached,
+           remote_size);
+    }
+  }
+  UnlockBlobs(keys);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -772,12 +808,26 @@ clio::run::TaskResume Runtime::GetBlob(
       served = true;
       served_total = rep_size;
     }
-    if (!served && primary_unreadable && config_.remote_copies_ > 0) {
-      // Every local copy sits on a dead device: another node holds one
-      // (#1114). No re-cache -- the primary's blocks are unreachable.
+    if (!served && config_.remote_copies_ > 0 &&
+        (primary_unreadable || primary_size < end)) {
+      // Another node holds a copy, in two cases. Every local copy sits on a
+      // dead device (#1114): serve from the remote, no re-cache -- the
+      // primary's blocks are unreachable. Or the primary is SHORT of the
+      // range on a healthy device (#1161): after a restart the WAL replay
+      // drops the blocks that lived in the RAM tier and keeps the blob at
+      // what is left, so a fsynced range whose primary died with the node
+      // read back as a HOLE through the native short-range semantics below,
+      // while the remote copy -- written through before the fsync was acked
+      // -- still held it. A legitimately short blob is short on the remote
+      // too, and the read then falls through to those semantics as before.
       bool remote = false;
-      CLIO_CO_AWAIT(ReadRemoteCopy(task, remote));
+      clio::run::u32 remote_c = 0;
+      CLIO_CO_AWAIT(ReadRemoteCopy(task, remote, &remote_c));
       if (remote) {
+        if (!primary_unreadable) {
+          CLIO_CO_AWAIT(HealPrimaryFromRemote(task->tag_id_, blob_name,
+                                              remote_c, end));
+        }
         task->SetReturnCode(0);
         CLIO_CO_RETURN;
       }

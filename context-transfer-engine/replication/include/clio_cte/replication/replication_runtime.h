@@ -197,11 +197,38 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::run::TaskResume MultiPutBlobLocal(
       clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
 
-  clio::run::TaskResume RecachePrimary(const TagId &tag_id,
-                                       const std::string &blob_name,
-                                       int replica_idx,
-                                       clio::run::u64 rep_size,
-                                       clio::run::u64 &recached);
+  /**
+   * Copy a replica back into the primary, sequentially from offset 0, so
+   * the DRAM fast path is restored after the primary was dropped or lost.
+   * Best-effort: stops at the first failed chunk, leaving a valid prefix.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob's name
+   * @param replica_idx replica index to read (0 = that container's primary)
+   * @param rep_size stored size of the copy being read
+   * @param recached bytes copied so far (output)
+   * @param from where the copy lives: this container (Local, a local
+   *        replica) or a successor's primary (DirectId, the remote copy)
+   */
+  clio::run::TaskResume RecachePrimary(
+      const TagId &tag_id, const std::string &blob_name, int replica_idx,
+      clio::run::u64 rep_size, clio::run::u64 &recached,
+      const clio::run::PoolQuery &from = clio::run::PoolQuery::Local());
+
+  /**
+   * Restore a primary that lost its bytes (a restart dropped its RAM-tier
+   * blocks, #1161) from the remote copy that just served a read of it, so
+   * later reads are local again. Under the blob's write token, and only if
+   * the primary still does not cover the range: a writer that refilled it
+   * meanwhile keeps its newer bytes. Best-effort.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob's name
+   * @param remote_c the container whose copy served the read
+   * @param end the end of the range the read needed covered
+   */
+  clio::run::TaskResume HealPrimaryFromRemote(const TagId &tag_id,
+                                              const std::string &blob_name,
+                                              clio::run::u32 remote_c,
+                                              clio::run::u64 end);
 
   /**
    * Before a primary write that starts at `write_off`: if the primary holds
@@ -364,12 +391,16 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * device is down -- with neighborhood > 1 they can share a dead
    * neighbor's disk). Reads the first live successor's shadow straight into
    * the task's buffers (every segment of a vectored read).
+   * Also the path for a primary that came back SHORT after a restart (its
+   * RAM-tier blocks died with the node, #1161): the device is fine but the
+   * bytes are gone, and only a remote copy still holds them.
    * @param task the read (its pool query is left untouched)
    * @param served set true when a remote copy served every byte
+   * @param served_by when non-null, receives the container that served
    */
   clio::run::TaskResume ReadRemoteCopy(
       clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task,
-      bool &served);
+      bool &served, clio::run::u32 *served_by = nullptr);
   /**
    * Mirror one written range to this blob's remote copies (owner side).
    * @param tag blob's tag
