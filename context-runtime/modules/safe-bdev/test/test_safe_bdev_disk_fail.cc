@@ -242,10 +242,10 @@ struct MemberView {
 
 /** Array state from Monitor("stats"). */
 struct ArrayView {
-  long data_count = -1;
-  long parity_level = -1;
-  long faulty_members = -1;
-  long dirty_slots = -1;
+  int64_t data_count = -1;
+  int64_t parity_level = -1;
+  int64_t faulty_members = -1;
+  int64_t dirty_slots = -1;
   std::vector<MemberView> members;
 };
 
@@ -1257,7 +1257,7 @@ TEST_CASE("safe_bdev_concurrent_degraded_crash",
   phase(30, "degraded");
   setenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY", "1", 1);
   phase(30, "degraded, parity skipped");
-  const long dirty_before = QueryArray(rig.safe).dirty_slots;
+  const int64_t dirty_before = QueryArray(rig.safe).dirty_slots;
   {
     clio::run::admin::Client admin(clio::run::kAdminPoolId);
     auto d = admin.AsyncDestroyPool(clio::run::PoolQuery::Dynamic(),
@@ -1269,7 +1269,7 @@ TEST_CASE("safe_bdev_concurrent_degraded_crash",
   unsetenv("CLIO_SAFE_BDEV_FAULT_SKIP_PARITY");
   rig.Create();
   FlushParity(rig.safe);
-  const long dirty_after = QueryArray(rig.safe).dirty_slots;
+  const int64_t dirty_after = QueryArray(rig.safe).dirty_slots;
   INFO("dirty stripes before the crash " + std::to_string(dirty_before) +
        ", after restart + flush " + std::to_string(dirty_after));
   REQUIRE(dirty_before > 0);
