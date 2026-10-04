@@ -9362,26 +9362,28 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
   // tiny appends from a million blocks (O(N^2) read/write scans + slab-per-write
   // ENOSPC) to ~one block per slab. No bdev call and no remaining_space_ debit:
   // the slab was already charged when the block was created.
+  // The fill and every block placed below are applied to the blob only once
+  // the WHOLE extension is placed, in one co_await-free step with the size.
+  // Published per target, the size was readable mid-extension (an unaligned
+  // partial size, e.g. 1046240 of a 1 MiB page) by GetBlobSize, which a
+  // hand-back or replica copy then took as the blob's size and truncated a
+  // fsynced page to (#1154, #1157).
+  clio::run::u64 spare_fill = 0;
   if (!blob_info.blocks_.empty()) {
-    BlobBlock &last = blob_info.blocks_.back();
+    const BlobBlock &last = blob_info.blocks_.back();
     if (last.capacity_ > last.size_) {
-      clio::run::u64 fill =
-          std::min(last.capacity_ - last.size_, additional_size);
-      last.size_ += fill;
-      additional_size -= fill;
-      // Keep the O(1) size cache == sum(blocks_) in the SAME co_await-free step
-      // as the blocks_ mutation. Otherwise a concurrent reader (GetBlob/
-      // GetBlobInfo do not hold the per-blob write token) could run during a
-      // later co_await and observe grown blocks_ with a stale cache.
-      blob_info.total_size_cache_ += fill;
+      spare_fill = std::min(last.capacity_ - last.size_, additional_size);
+      additional_size -= spare_fill;
     }
   }
   if (additional_size == 0) {
     // Entirely satisfied from spare capacity; no allocation needed.
+    blob_info.blocks_.back().size_ += spare_fill;
     blob_info.total_size_cache_ = required_size;
     error_code = 0;
     CLIO_CO_RETURN;
   }
+  std::vector<BlobBlock> staged;  // placed, not yet part of the blob
 
   // Snapshot available targets for the DPE. target_list_ is the contiguous
   // mirror of registered_targets_ — copying it under the read lock is O(N_live)
@@ -9614,12 +9616,10 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
       BlobBlock new_block(target_info_copy.bdev_client_,
                           target_info_copy.target_query_, b.offset_, logical,
                           physical);
-      blob_info.blocks_.push_back(new_block);
-      blob_info.total_size_cache_ += logical;
+      staged.push_back(new_block);
       physical_sum += physical;
       need -= logical;
     }
-    blob_info.BumpPlacementGen();  // #817: block layout changed
     remaining_to_allocate -= (logical_need - need);  // logical actually placed
     (void)kAppendSlab;
 
@@ -9648,12 +9648,7 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
     // extension again.
     {
       BlobInfo placed;
-      for (size_t i = entry_nblocks; i < blob_info.blocks_.size(); ++i) {
-        placed.blocks_.push_back(blob_info.blocks_[i]);
-      }
-      while (blob_info.blocks_.size() > entry_nblocks) {
-        blob_info.blocks_.pop_back();
-      }
+      for (const auto &b : staged) placed.blocks_.push_back(b);
       undo_fill();
       if (!placed.blocks_.empty()) {
         clio::run::u32 free_rc = 0;
@@ -9688,8 +9683,11 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
   }
 
   // Success: we allocated exactly `additional_size`, so the blob now spans
-  // required_size (== offset + size). Update the O(1) size cache incrementally
-  // instead of re-summing every block -- this is what keeps append O(1).
+  // required_size (== offset + size). Publish the fill, the new blocks and
+  // the size together (no co_await between them).
+  if (spare_fill != 0) blob_info.blocks_.back().size_ += spare_fill;
+  for (const auto &b : staged) blob_info.blocks_.push_back(b);
+  blob_info.BumpPlacementGen();  // #817: block layout changed
   blob_info.total_size_cache_ = required_size;
   error_code = 0;  // Success
   CLIO_CO_RETURN;
