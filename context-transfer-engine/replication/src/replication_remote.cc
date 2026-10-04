@@ -51,6 +51,8 @@ namespace clio::cte::replication {
 namespace {
 /** Chunk size for copying a shadow back to its owner. */
 constexpr clio::run::u64 kHandoffChunk = 4ULL << 20;
+/** Poll period while a hand-back pass or the hand-back gate waits (us). */
+constexpr double kHandoffWaitUs = 500.0;
 /** Conditional-put bits never apply to a mirrored copy. */
 constexpr clio::run::u32 kConditionalBits =
     clio::cte::core::Context::kPutIfAbsent |
@@ -103,7 +105,7 @@ void Runtime::NoteHandoff(clio::run::u32 owner, const TagId &tag,
   std::lock_guard<std::mutex> g(handoff_mu_);
   const std::string key = std::to_string(tag.major_) + "." +
                           std::to_string(tag.minor_) + "." + name;
-  handoff_[owner][key] = HandoffEntry{tag, name, deleted};
+  handoff_[owner][key] = HandoffEntry{tag, name, deleted, ++handoff_seq_};
   LogHandoff(kHandoffNote, owner, handoff_[owner][key]);
 }
 
@@ -212,8 +214,17 @@ clio::run::TaskResume Runtime::PutBlob(
     }
     CLIO_CO_RETURN;
   }
+  // This container owns the blob: after a restart, the stand-in's copy of
+  // it lands first.
+  CLIO_CO_AWAIT(AwaitHandback(task->context_));
   CLIO_CO_AWAIT(PutBlobLocal(task));
   if (task->GetReturnCode() != 0) CLIO_CO_RETURN;
+  // A hand-back push comes FROM the stand-in, which holds the newer copy:
+  // mirroring it back would overwrite that copy with what the push read
+  // before a still-running failover put finished (#1154).
+  if ((task->context_.op_flags_ & Context::kHandoffPush) != 0) {
+    CLIO_CO_RETURN;
+  }
   std::vector<clio::cte::core::BlobRegion> regions;
   clio::cte::core::ForEachBlobRegion(*task,
       [&regions](const clio::cte::core::BlobRegion &r) {
@@ -231,6 +242,7 @@ clio::run::TaskResume Runtime::PutBlob(
 clio::run::TaskResume Runtime::MultiPutBlob(
     clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  CLIO_CO_AWAIT(AwaitHandback(task->context_));
   if (task->context_.replica_ != 0) {
     CLIO_CO_AWAIT(MultiPutBlobLocal(task));
     CLIO_CO_RETURN;
@@ -383,6 +395,13 @@ clio::run::TaskResume Runtime::PushOne(HandoffEntry e, clio::run::u32 owner,
   CLIO_TASK_BODY_BEGIN
   *ok = false;
   const auto to_owner = clio::run::PoolQuery::DirectId(owner);
+  // No blob lock here: the owner's mirror of this push writes back to this
+  // container, and the read below may heal the primary under the same lock
+  // -- holding it deadlocked the hand-back. A failover put landing while
+  // this copy is taken re-notes the blob with a newer seq_, so PushHandoff
+  // keeps it and the next pass sends the finished state (#1154).
+  Context push_ctx;
+  push_ctx.op_flags_ |= Context::kHandoffPush;
   if (e.deleted_) {
     auto d = Self()->AsyncDelBlob(e.tag_, e.name_, to_owner);
     CLIO_CO_AWAIT(d);
@@ -411,7 +430,7 @@ clio::run::TaskResume Runtime::PushOne(HandoffEntry e, clio::run::u32 owner,
     bool good = g->GetReturnCode() == 0;
     if (good) {
       auto p = Self()->AsyncPutBlob(e.tag_, e.name_, off, len, ptr,
-                                    config_.cache_score_, Context(), 0u,
+                                    config_.cache_score_, push_ctx, 0u,
                                     to_owner);
       CLIO_CO_AWAIT(p);
       good = p->GetReturnCode() == 0;
@@ -419,8 +438,20 @@ clio::run::TaskResume Runtime::PushOne(HandoffEntry e, clio::run::u32 owner,
     CLIO_IPC->FreeBuffer(buf);
     if (!good) CLIO_CO_RETURN;
   }
-  // The owner's stale copy may be longer.
-  auto t = Self()->AsyncTruncateBlob(e.tag_, e.name_, size, to_owner);
+  {
+    // A failover put still extending the blob when its size was taken: the
+    // copy is a prefix, and truncating the owner to it would cut the page.
+    // Leave the entry for the next pass, which sends the finished state.
+    auto sz2 = Self()->AsyncGetBlobSize(e.tag_, e.name_,
+                                        clio::run::PoolQuery::Local(), 0);
+    CLIO_CO_AWAIT(sz2);
+    if (sz2->GetReturnCode() != 0 || sz2->size_ != size) CLIO_CO_RETURN;
+  }
+  // The owner's stale copy may be longer. Straight to the owner's CORE: the
+  // owner's replication layer would mirror the truncate to its remote copy
+  // -- this very stand-in -- cutting the stand-in's newer copy short too
+  // (#1154).
+  auto t = GetCoreClient()->AsyncTruncateBlob(e.tag_, e.name_, size, to_owner);
   CLIO_CO_AWAIT(t);
   *ok = t->GetReturnCode() == 0;
   CLIO_CO_RETURN;
@@ -431,12 +462,22 @@ clio::run::TaskResume Runtime::PushHandoff(clio::run::u32 owner,
                                            clio::run::u32 *pushed) {
   CLIO_TASK_BODY_BEGIN
   *pushed = 0;
+  // One pass per owner at a time: the periodic sweep and the owner's pull
+  // pushed the same blobs concurrently, each truncating the other's copy.
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> g(handoff_mu_);
+      if (pushing_.insert(owner).second) break;
+    }
+    CLIO_CO_AWAIT(clio::run::yield(kHandoffWaitUs));
+  }
   std::vector<std::pair<std::string, HandoffEntry>> work;
   {
     std::lock_guard<std::mutex> g(handoff_mu_);
     auto it = handoff_.find(owner);
-    if (it == handoff_.end()) CLIO_CO_RETURN;
-    for (auto &kv : it->second) work.push_back(kv);
+    if (it != handoff_.end()) {
+      for (auto &kv : it->second) work.push_back(kv);
+    }
   }
   for (const auto &w : work) {
     bool ok = false;
@@ -448,7 +489,7 @@ clio::run::TaskResume Runtime::PushHandoff(clio::run::u32 owner,
     if (it == handoff_.end()) continue;
     auto e = it->second.find(w.first);
     // A newer failover change to the same blob stays for the next round.
-    if (e != it->second.end() && e->second.deleted_ == w.second.deleted_) {
+    if (e != it->second.end() && e->second.seq_ == w.second.seq_) {
       LogHandoff(kHandoffDone, owner, w.second);
       it->second.erase(e);
     }
@@ -456,8 +497,31 @@ clio::run::TaskResume Runtime::PushHandoff(clio::run::u32 owner,
   }
   {
     std::lock_guard<std::mutex> g(handoff_mu_);
+    pushing_.erase(owner);
     if (handoff_log_.BytesSinceCompact() > kHandoffCompactBytes) {
       CompactHandoffLogLocked();
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::AwaitHandback(const Context &ctx) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  if (!handed_back_.load(std::memory_order_acquire) &&
+      (ctx.op_flags_ & Context::kHandoffPush) == 0) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!handed_back_.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() - t0 <
+               std::chrono::milliseconds(kHandbackWaitMs)) {
+      CLIO_CO_AWAIT(clio::run::yield(kHandoffWaitUs));
+    }
+    if (!handed_back_.load(std::memory_order_acquire)) {
+      HLOG(kError, "replication: hand-back still running after {} ms; "
+           "serving a client request without it", kHandbackWaitMs);
     }
   }
   CLIO_CO_RETURN;

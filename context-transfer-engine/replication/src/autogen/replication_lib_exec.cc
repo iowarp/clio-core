@@ -49,6 +49,7 @@ void Runtime::Restart(const clio::run::PoolId &pool_id,
                       const std::string &pool_name,
                       clio::run::u32 container_id) {
   is_restart_ = true;  // Create pulls what successors changed while down
+  handed_back_.store(false);  // owned-blob writes wait for that pull
   Init(pool_id, pool_name, container_id);
 }
 

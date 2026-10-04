@@ -80,6 +80,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       }
     }
   }
+  handed_back_.store(true, std::memory_order_release);
   fields->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

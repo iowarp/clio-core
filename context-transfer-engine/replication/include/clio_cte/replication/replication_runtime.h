@@ -310,7 +310,30 @@ class Runtime : public clio::cte::core::CoreInterposer {
     TagId tag_;
     std::string name_;
     bool deleted_ = false;
+    /** Which change this is (handoff_seq_ at NoteHandoff): a push clears
+     *  the entry only if no newer change replaced it meanwhile. */
+    clio::run::u64 seq_ = 0;
   };
+  /** Last HandoffEntry::seq_ handed out (handoff_mu_). */
+  clio::run::u64 handoff_seq_ = 0;
+  /** Owners a PushHandoff is running for (handoff_mu_): the sweep and an
+   *  owner's pull must not push the same blobs at once. */
+  std::unordered_set<clio::run::u32> pushing_;
+  /** False on a restarted container until its hand-back pull finished:
+   *  until then client writes of the blobs it owns wait (#1154). */
+  std::atomic<bool> handed_back_{true};
+  /** Longest a client task waits for the hand-back (ms). */
+  static constexpr clio::run::u64 kHandbackWaitMs = 120000;
+  /**
+   * Hold a client write of a blob this container owns until it has pulled
+   * back what its
+   * stand-ins changed while it was down. A write accepted before that was
+   * overwritten by the older stand-in copy, and a truncate in the hand-back
+   * cut a newer full page short (#1154). Hand-back pushes (kHandoffPush)
+   * pass straight through.
+   * @param ctx the task's context
+   */
+  clio::run::TaskResume AwaitHandback(const Context &ctx);
   /** @return containers in this pool. */
   clio::run::u32 NumContainers() const;
   /** @return the container that owns a blob by hash. */
