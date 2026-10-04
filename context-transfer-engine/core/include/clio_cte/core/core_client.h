@@ -2909,6 +2909,13 @@ class Client : public clio::run::ContainerClient {
    * every caller gets the optimization with no special-casing, exactly like
    * the PutBlob path shapes.
    *
+   * NEVER Send this task: leaving task_id_.net_key_ at its constructor zero
+   * is what tells IpcCpu2Cpu::RecvOut (and the ZMQ twin) that there is no
+   * response to wait for and no archive to claim. Both skip their #968
+   * "completed with no response archive" guard on a zero net_key_ for exactly
+   * this contract; stamping a key here would make every cache hit look like
+   * the aliasing bug that guard catches.
+   *
    * TryReadBlobShm carries its own guards (cache attached and ready, blob
    * RAM-resident and direct-readable, placement generation unchanged across
    * the copy); any miss returns false and the caller Sends the RPC task, so
