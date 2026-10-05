@@ -1511,14 +1511,24 @@ clio::run::TaskResume Runtime::RetryStripeDegraded(
     }
   }
   bool rok = false;
+  const char *how = "erasing what landed";
   CLIO_CO_AWAIT(ReconstructStripe(s, st.members, landed, st.chunks, rok));
   if (!rok && old_bytes != nullptr) {
     // Too many erasures to ignore what landed -- but the bytes it replaced
     // were read before the write: rewind the survivors to them and decode
     // the stripe exactly as the parity still encodes it (#1139).
+    how = "rewinding the landed bytes";
     CLIO_CO_AWAIT(ReconstructStripeAsBefore(s, st.members, pieces, *old_bytes,
                                             st.chunks, rok));
   }
+  if (!rok) {
+    how = "from the survivors as they are now";
+  }
+  // A member died under this write: which way the stripe was rebuilt decides
+  // whether its down column is exact (#1165 diagnosis).
+  HLOG(kWarning, "safe_bdev Write: slot {} lost a member mid-write; stripe "
+       "rebuilt {} ({} landed piece(s), old bytes {})",
+       s, how, landed.size(), old_bytes != nullptr ? "captured" : "none");
   if (!rok) {
     // Too many erasures for that. Decode from the survivors as they are now:
     // exact wherever this write left the survivors untouched, which is all
@@ -1877,8 +1887,9 @@ clio::run::TaskResume Runtime::ReadBlockDegraded(clio::run::u64 off,
       static std::atomic<clio::run::u64> degraded_reads{0};
       const clio::run::u64 nd = degraded_reads.fetch_add(1) + 1;
       if (nd <= 20 || (nd & (nd - 1)) == 0) {
-        // Degraded reads after a disk death / restart (#1124 diagnosis).
-        HLOG(kDebug, "safe_bdev ReadBlockDegraded #{}: slot {} member {} "
+        // Degraded reads after a disk death / restart (#1124, #1165
+        // diagnosis): rate-limited, so info is affordable.
+        HLOG(kInfo, "safe_bdev ReadBlockDegraded #{}: slot {} member {} "
              "within {} len {} dirty {}", nd, s, dd, within, seg_end - cur,
              IsSlotDirty(s));
       }
