@@ -70,11 +70,23 @@ enum class AsyncIoBackend {
 
 class AsyncIoFactory {
  public:
+  /**
+   * Create an AsyncIO for @p backend.
+   *
+   * @param io_depth queue depth for the backend
+   * @param backend the backend; kDefault picks the best one that works here
+   * @return the AsyncIO, or nullptr if @p backend is not compiled in or cannot
+   *         run on this system (e.g. io_uring under a seccomp profile that
+   *         blocks io_uring_setup, as Docker's default does)
+   */
   static std::unique_ptr<AsyncIO> Get(
       uint32_t io_depth,
       AsyncIoBackend backend = AsyncIoBackend::kDefault) {
     if (backend == AsyncIoBackend::kDefault) {
       backend = GetDefaultBackend();
+    }
+    if (!IsBackendUsable(backend)) {
+      return nullptr;
     }
 
     switch (backend) {
@@ -108,18 +120,64 @@ class AsyncIoFactory {
     }
   }
 
+  /**
+   * Whether @p backend can actually run on this system. Compiled-in support
+   * is not enough for io_uring: kernels can disable it and container seccomp
+   * profiles block io_uring_setup (issue #1177), so it is probed once.
+   *
+   * @param backend a concrete backend (not kDefault)
+   * @return false for io_uring when the kernel refuses a ring, else true
+   */
+  static bool IsBackendUsable(AsyncIoBackend backend) {
+#if CTP_ENABLE_IO_URING
+    if (backend == AsyncIoBackend::kIoUring) {
+      return IoUringUsable();
+    }
+#endif
+    (void)backend;
+    return true;
+  }
+
  private:
+#if CTP_ENABLE_IO_URING
+  /**
+   * Probe io_uring once by creating and tearing down a minimal ring.
+   * @return true if io_uring_queue_init succeeds in this process
+   */
+  static bool IoUringUsable() {
+    static const bool usable = [] {
+      struct io_uring ring;
+      if (io_uring_queue_init(2, &ring, 0) < 0) {
+        return false;
+      }
+      io_uring_queue_exit(&ring);
+      return true;
+    }();
+    return usable;
+  }
+#endif
+
+  /**
+   * Pick the best backend that works here: NIXL, then io_uring if the kernel
+   * allows it, then libaio, then the platform's portable backend.
+   * @return a concrete backend
+   */
   static AsyncIoBackend GetDefaultBackend() {
 #if CTP_ENABLE_NIXL
     return AsyncIoBackend::kNixl;
-#elif CTP_ENABLE_IO_URING
-    return AsyncIoBackend::kIoUring;
-#elif CTP_ENABLE_LIBAIO
+#else
+#if CTP_ENABLE_IO_URING
+    if (IoUringUsable()) {
+      return AsyncIoBackend::kIoUring;
+    }
+#endif
+#if CTP_ENABLE_LIBAIO
     return AsyncIoBackend::kLinuxAio;
 #elif defined(_WIN32)
     return AsyncIoBackend::kIocp;
 #else
     return AsyncIoBackend::kPosixAio;
+#endif
 #endif
   }
 };

@@ -17,10 +17,12 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <vector>
 
 #include <clio_ctp/introspect/system_info.h>
+#include <clio_runtime/admin/admin_client.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/config_manager.h>
 #include <clio_runtime/ipc_manager.h>
@@ -388,6 +390,37 @@ TEST_CASE("IpcInternals - main segment size is configurable (issue #727)",
   }
   (void)config->LoadYaml(cfg.string());
   fs::remove(cfg);
+}
+
+TEST_CASE("IpcInternals - MigrateContainers refuses a container hosted "
+          "elsewhere (issue #1179)",
+          "[admin][migrate][1179]") {
+  EnsureInitialized();
+  clio::run::admin::Client admin(clio::run::kAdminPoolId);
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  REQUIRE(pool_manager != nullptr);
+
+  // This node hosts its own admin container (id = node id) but not 4242.
+  // GetContainer would fall back to the local container, which used to be
+  // migrated in its place with a success report.
+  const auto local_id =
+      static_cast<clio::run::ContainerId>(CLIO_IPC->GetNodeId());
+  const clio::run::ContainerId missing_id = 4242;
+  REQUIRE(pool_manager->HasContainer(clio::run::kAdminPoolId, local_id));
+  REQUIRE_FALSE(pool_manager->HasContainer(clio::run::kAdminPoolId, missing_id));
+
+  std::vector<clio::run::MigrateInfo> migrations;
+  migrations.emplace_back(clio::run::kAdminPoolId, missing_id,
+                          static_cast<clio::run::u32>(CLIO_IPC->GetNodeId()));
+  auto task = admin.AsyncMigrateContainers(clio::run::PoolQuery::Local(),
+                                            migrations);
+  task.Wait();
+
+  REQUIRE(task->GetReturnCode() != 0);
+  REQUIRE(task->num_migrated_ == 0);
+  REQUIRE(task->error_message_.str().find("not hosted") != std::string::npos);
+  // The local container was left alone.
+  REQUIRE(pool_manager->HasContainer(clio::run::kAdminPoolId, local_id));
 }
 
 SIMPLE_TEST_MAIN()

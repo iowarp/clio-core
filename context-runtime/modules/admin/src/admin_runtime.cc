@@ -1559,10 +1559,28 @@ clio::run::TaskResume Runtime::MigrateContainers(
     ar(migrations);
   }
 
+  bool any_failed = false;
   for (const auto &info : migrations) {
     // Look up source node
     clio::run::u32 src_node =
         pool_manager->GetContainerNodeId(info.pool_id_, info.container_id_);
+
+    // Only the node that hosts a container can migrate it. GetContainer below
+    // falls back to this node's own container of the pool, so without this
+    // check a request for a container hosted elsewhere migrated the wrong
+    // container and reported success (issue #1179).
+    if (!pool_manager->HasContainer(info.pool_id_, info.container_id_)) {
+      std::string err = "container " + std::to_string(info.container_id_) +
+                        " of pool " + info.pool_id_.ToString() +
+                        " is not hosted on node " +
+                        std::to_string(CLIO_IPC->GetNodeId()) +
+                        " (address table: node " + std::to_string(src_node) +
+                        "); run the migration on the node that hosts it";
+      HLOG(kError, "Admin: MigrateContainers: {}", err);
+      task->error_message_ = clio::run::priv::string(CTP_MALLOC, err);
+      any_failed = true;
+      continue;
+    }
 
     // Plug the container to stop new tasks and wait for work to complete
     pool_manager->PlugContainer(info.pool_id_, info.container_id_);
@@ -1600,7 +1618,7 @@ clio::run::TaskResume Runtime::MigrateContainers(
          info.pool_id_, info.container_id_, src_node, info.dest_);
   }
 
-  task->SetReturnCode(0);
+  task->SetReturnCode(any_failed ? 1 : 0);
   HLOG(kInfo, "Admin: MigrateContainers completed, {} migrated",
        task->num_migrated_);
   CLIO_CO_RETURN;
@@ -1810,6 +1828,58 @@ void Runtime::FireIdleProbes() {
   }
 }
 
+void Runtime::StartIndirectProbes(clio::run::u64 target_node_id,
+                                  clio::run::u64 self_node_id,
+                                  const std::string &reason) {
+  auto *ipc_manager = CLIO_IPC;
+  // A node already known DEAD must STAY dead on probe failure (issue #856).
+  // We probe dead nodes so a rejoin can be observed, but a failed probe must
+  // not move it to kProbeFailed: that silently takes it out of kDead, so the
+  // dead-node completion sweep stops firing and tasks addressed to it hang
+  // forever again. Only a SUCCESSFUL probe may revive a dead node.
+  if (ipc_manager->GetNodeState(target_node_id) !=
+      clio::run::NodeState::kDead) {
+    ipc_manager->SetNodeState(target_node_id,
+                              clio::run::NodeState::kProbeFailed);
+  }
+  HLOG(kWarning, "SWIM: Direct probe to node {} {}, starting indirect probes",
+       target_node_id, reason);
+
+  // Select k random alive helpers (excluding self and target)
+  const auto &hosts = ipc_manager->GetAllHosts();
+  std::vector<clio::run::u64> candidates;
+  for (const auto &h : hosts) {
+    if (h.node_id != self_node_id && h.node_id != target_node_id &&
+        h.IsAlive()) {
+      candidates.push_back(h.node_id);
+    }
+  }
+  std::shuffle(candidates.begin(), candidates.end(), probe_rng_);
+  size_t num_helpers = std::min(kIndirectProbeHelpers, candidates.size());
+  if (num_helpers == 0) {
+    // No live peer can probe on our behalf, so "every indirect probe failed"
+    // holds vacuously: suspect it now. Waiting for indirect results that were
+    // never sent left the node in kProbeFailed forever -- never re-probed,
+    // never suspected, never declared dead or recovered (issue #1178).
+    if (ipc_manager->GetNodeState(target_node_id) !=
+        clio::run::NodeState::kDead) {
+      ipc_manager->SetNodeState(target_node_id,
+                                clio::run::NodeState::kSuspected);
+    }
+    HLOG(kWarning,
+         "SWIM: no live helper to probe node {} indirectly, marking suspected",
+         target_node_id);
+    return;
+  }
+  for (size_t i = 0; i < num_helpers; ++i) {
+    auto future = client_.AsyncProbeRequest(
+        clio::run::PoolQuery::Physical(candidates[i]), target_node_id);
+    pending_indirect_probes_.push_back({std::move(future), target_node_id,
+                                        candidates[i],
+                                        std::chrono::steady_clock::now()});
+  }
+}
+
 clio::run::TaskResume Runtime::HeartbeatProbe(clio::run::shared_ptr<HeartbeatProbeTask> &task) {
   CLIO_TASK_BODY_BEGIN
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
@@ -1846,7 +1916,20 @@ clio::run::TaskResume Runtime::HeartbeatProbe(clio::run::shared_ptr<HeartbeatPro
   for (auto it = pending_direct_probes_.begin();
        it != pending_direct_probes_.end();) {
     if (it->future.IsComplete()) {
-      // Direct probe succeeded - node is alive.
+      it->future.Wait();  // Finalize (already complete — IsComplete() above)
+      clio::run::u32 rc = it->future->GetReturnCode();
+      if (rc != 0) {
+        // Completed, but with an error -- e.g. the send to an unreachable
+        // node timed out (kRun2RunNetworkTimeoutRC). That is a failed probe,
+        // not an answer: treating any completion as alive marked unreachable
+        // nodes REJOINED (issue #1171).
+        StartIndirectProbes(it->target_node_id, self_node_id,
+                            "failed (rc=" + std::to_string(rc) + ")");
+        it = pending_direct_probes_.erase(it);
+        did_work = true;
+        continue;
+      }
+      // Direct probe answered - node is alive.
       // Use SetAlive, not SetNodeState (issue #856): SetNodeState only flips
       // the enum, leaving the node in dead_nodes_, which is what the
       // dead-node timeout scan consults — so a REVIVED node would keep having
@@ -1868,42 +1951,7 @@ clio::run::TaskResume Runtime::HeartbeatProbe(clio::run::shared_ptr<HeartbeatPro
     } else {
       float elapsed = std::chrono::duration<float>(now - it->sent_at).count();
       if (elapsed > kDirectProbeTimeoutSec_cfg) {
-        // Direct probe timed out - escalate to indirect probing.
-        // A node already known DEAD must STAY dead on probe failure (issue
-        // #856). We now probe dead nodes so a rejoin can be observed, but a
-        // failed probe must not move it to kProbeFailed: that silently takes
-        // it out of kDead, so the dead-node completion sweep stops firing and
-        // tasks addressed to it hang forever again. Only a SUCCESSFUL probe
-        // may revive a dead node.
-        if (ipc_manager->GetNodeState(it->target_node_id) !=
-            clio::run::NodeState::kDead) {
-          ipc_manager->SetNodeState(it->target_node_id,
-                                    clio::run::NodeState::kProbeFailed);
-        }
-        HLOG(
-            kWarning,
-            "SWIM: Direct probe to node {} timed out, starting indirect probes",
-            it->target_node_id);
-
-        // Select k random alive helpers (excluding self and target)
-        const auto &hosts = ipc_manager->GetAllHosts();
-        std::vector<clio::run::u64> candidates;
-        for (const auto &h : hosts) {
-          if (h.node_id != self_node_id && h.node_id != it->target_node_id &&
-              h.IsAlive()) {
-            candidates.push_back(h.node_id);
-          }
-        }
-        std::shuffle(candidates.begin(), candidates.end(), probe_rng_);
-        size_t num_helpers = std::min(kIndirectProbeHelpers, candidates.size());
-        for (size_t i = 0; i < num_helpers; ++i) {
-          auto future = client_.AsyncProbeRequest(
-              clio::run::PoolQuery::Physical(candidates[i]), it->target_node_id);
-          pending_indirect_probes_.push_back(
-              {std::move(future), it->target_node_id, candidates[i],
-               std::chrono::steady_clock::now()});
-        }
-
+        StartIndirectProbes(it->target_node_id, self_node_id, "timed out");
         it = pending_direct_probes_.erase(it);
         did_work = true;
       } else {
@@ -2154,11 +2202,16 @@ clio::run::TaskResume Runtime::ProbeRequest(clio::run::shared_ptr<ProbeRequestTa
     CLIO_CO_AWAIT(clio::run::yield(1000.0));
   }
 
+  // Alive only if the heartbeat completed SUCCESSFULLY. A heartbeat to an
+  // unreachable node also completes, with a network error rc, once its send
+  // times out; counting that as an answer reported dead nodes as alive and
+  // made the requester mark them REJOINED (issue #1171).
+  task->probe_result_ = -1;  // unreachable
   if (future.IsComplete()) {
-    future.Wait();            // Finalize (already complete)
-    task->probe_result_ = 0;  // alive
-  } else {
-    task->probe_result_ = -1;  // unreachable
+    future.Wait();  // Finalize (already complete)
+    if (future->GetReturnCode() == 0) {
+      task->probe_result_ = 0;  // alive
+    }
   }
 
   task->SetReturnCode(0);
@@ -2389,7 +2442,13 @@ clio::run::TaskResume Runtime::RecoverContainers(
     // drops the first mid-use (the free(): invalid pointer aborts that kill
     // the new leader during leader-election). Skip assignments that are
     // already satisfied locally.
-    if (pool_manager->GetContainer(ra.pool_id_, ra.container_id_)) {
+    //
+    // HasContainer (an exact lookup), not GetContainer: GetContainer falls
+    // back to the pool's local container when this container id is not
+    // registered, and every survivor has a local container of every pool, so
+    // the guard skipped every assignment and recovery never re-created
+    // anything (issue #1170).
+    if (pool_manager->HasContainer(ra.pool_id_, ra.container_id_)) {
       HLOG(kInfo,
            "Recovery: container {} for pool {} already present locally; "
            "skipping duplicate recovery",

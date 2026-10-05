@@ -428,6 +428,19 @@ private:
   std::vector<PendingProbe> pending_direct_probes_;
   std::vector<PendingIndirectProbe> pending_indirect_probes_;
 
+  /**
+   * A direct probe of @p target_node_id failed (timed out, or completed with
+   * an error): mark it probe-failed unless it is already dead, and ask up to
+   * kIndirectProbeHelpers live peers to probe it on our behalf.
+   *
+   * @param target_node_id the node whose direct probe failed
+   * @param self_node_id this node's id (never chosen as a helper)
+   * @param reason short description for the log ("timed out", "rc=...")
+   */
+  void StartIndirectProbes(clio::run::u64 target_node_id,
+                           clio::run::u64 self_node_id,
+                           const std::string &reason);
+
   // #628: in-flight QueryTaskProgress probes for the cross-node task-progress
   // validity check. Fired (fire-and-poll) by ScanTaskProgress and reaped on a
   // later tick via Future::IsComplete() -- never awaited, so the net-processing

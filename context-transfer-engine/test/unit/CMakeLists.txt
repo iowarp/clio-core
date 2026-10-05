@@ -1585,8 +1585,7 @@ endif()
 # lose their own labels (e.g. "regression;cte", "query;core;cte"). Fixing it is
 # NOT a drive-by: the coverage gate excludes -LE "query|stress|functional", so
 # restoring labels changes which tests the gate runs. Tracked separately.
-set_tests_properties(
-    cte_core_pool_creation
+set_property(TEST cte_core_pool_creation
     cte_core_target_registration
     cte_core_blob_put
     cte_core_blob_get
@@ -1632,8 +1631,7 @@ set_tests_properties(
     cte_reorganize_all
     cte_data_organizer_all
     cte_io_emulation_all
-    PROPERTIES LABELS "msan_skip"
-)
+  APPEND PROPERTY LABELS "msan_skip")
 
 # Tests that start a full CLIO Runtime runtime share /tmp/clio_iowarp SHM
 # segments and TCP/IPC ports, so they must NOT run in parallel. They also

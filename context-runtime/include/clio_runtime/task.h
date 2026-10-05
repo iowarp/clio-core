@@ -961,6 +961,12 @@ class RunContext {
   ctp::lbm::ShmTransferInfo input_;   /**< SHM transfer info (client -> worker) */
   ctp::lbm::ShmTransferInfo output_;  /**< SHM transfer info (worker -> client) */
   ctp::lbm::Transport* response_transport_; /**< Transport for the response */
+  /** Keeps a client dial-back transport alive while this task may still send
+   *  its response on it (issue #1065): the dial-back table is LRU-bounded and
+   *  may evict the entry while the task runs. Null when response_transport_ is
+   *  owned elsewhere (the inbound IPC socket). Runtime-local, never
+   *  serialized. */
+  std::shared_ptr<ctp::lbm::Transport> response_transport_owner_;
   char response_identity_[64];     /**< ZMQ echo-back identity (fallback path) */
   u32 response_identity_len_;
   int response_fd_;                /**< Socket fd for routing response (IPC) */

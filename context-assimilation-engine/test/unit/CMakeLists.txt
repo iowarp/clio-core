@@ -1199,7 +1199,7 @@ if(HDF5_ENABLED)
   )
 
   add_test(NAME cae_hdf5_export COMMAND cae_hdf5_export_test)
-  set_tests_properties(cae_hdf5_export PROPERTIES TIMEOUT 60)
+  set_tests_properties(cae_hdf5_export PROPERTIES TIMEOUT 60 LABELS "cae;hdf5")
 
   install(TARGETS cae_hdf5_export_test DESTINATION bin)
 endif()
@@ -1221,6 +1221,7 @@ if(HDF5_ENABLED)
       ${HDF5_INCLUDE_DIRS}
       ${CMAKE_CURRENT_SOURCE_DIR}/../../../context-transfer-engine/adapter/kvhdf5/include
   )
+  set_tests_properties(cae_export_data PROPERTIES LABELS "cae;hdf5")
 endif()
 
 #------------------------------------------------------------------------------
@@ -1251,7 +1252,7 @@ if(HDF5_ENABLED)
   )
 
   add_test(NAME cae_hdf5_import COMMAND cae_hdf5_import_test)
-  set_tests_properties(cae_hdf5_import PROPERTIES TIMEOUT 60)
+  set_tests_properties(cae_hdf5_import PROPERTIES TIMEOUT 60 LABELS "cae;hdf5")
 
   install(TARGETS cae_hdf5_import_test DESTINATION bin)
 endif()
@@ -1272,4 +1273,5 @@ if(HDF5_ENABLED)
       ${HDF5_INCLUDE_DIRS}
       ${CMAKE_CURRENT_SOURCE_DIR}/../../../context-transfer-engine/adapter/kvhdf5/include
   )
+  set_tests_properties(cae_import_data PROPERTIES LABELS "cae;hdf5")
 endif()

@@ -1,1 +1,11 @@
 *.pkl filter=lfs diff=lfs merge=lfs -text
+
+# Files that run on Linux (including the devcontainer, which mounts a Windows
+# checkout) must keep LF: with core.autocrlf=true a CRLF checkout breaks every
+# script with "$'\r': command not found" and a "python3\r" shebang (#1176).
+*.sh text eol=lf
+*.bash text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+scripts/clio-hdf5-doctor text eol=lf

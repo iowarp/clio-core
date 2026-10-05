@@ -1057,6 +1057,8 @@ endif()
 # Poco and nlohmann_json (optional - for CAE Globus support and the Google
 # Cloud Storage bdev adapter, which uses Poco::Net for HTTPS + Poco::JSON).
 find_package(Poco COMPONENTS Net NetSSL Crypto JSON QUIET)
+include(ClioCheckPocoAbi)
+clio_check_poco_abi()
 find_package(nlohmann_json QUIET)
 if(NOT nlohmann_json_FOUND)
   include(FetchContent)
@@ -1317,6 +1319,13 @@ if(CLIO_CORE_ENABLE_RPATH)
     elseif(UNIX)
         set(CMAKE_INSTALL_RPATH "$ORIGIN;$ORIGIN/../lib")
         set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
+        # Emit DT_RPATH, not DT_RUNPATH. Most current toolchains default to
+        # RUNPATH, which LD_LIBRARY_PATH outranks: an older iowarp-core in an
+        # LD_LIBRARY_PATH entry (a conda env's lib, an HPC module) then
+        # replaces the libraries this build just produced, and a freshly linked
+        # test dies in Catch's post-link discovery with "undefined symbol"
+        # (issue #836). DT_RPATH is searched before LD_LIBRARY_PATH.
+        add_link_options("LINKER:--disable-new-dtags")
     endif()
 
     message(STATUS "RPATH: Using relative paths ($ORIGIN/../lib)")

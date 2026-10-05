@@ -253,8 +253,7 @@ jobs:
               #    failure count varies run to run (95 vs 93 /96), consistent
               #    with a transient container-resource limit rather than a code
               #    bug. Tracked for a deeper in-container bdev-allocation fix.
-              #  * ctp_async_io -- unrelated deps-cpu incompatibility.
-              ctest --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama|force_net|flaky" -E "ctp_async_io|cte_tiered_storage_all|cte_tiered_dram_default_all"
+              ctest --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama|force_net|flaky" -E "cte_tiered_storage_all|cte_tiered_dram_default_all"
             '
 
   boost-native:

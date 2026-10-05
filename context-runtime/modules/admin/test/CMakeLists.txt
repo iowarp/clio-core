@@ -289,8 +289,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
 
   # Mark all admin tests as msan_skip (they use ZMQ which is uninstrumented)
-  set_tests_properties(
-    cr_task_archive_basic_tests
+  set_property(TEST cr_task_archive_basic_tests
     cr_task_archive_bulk_transfer_tests
     cr_task_archive_non_task_tests
     cr_task_archive_task_base_tests
@@ -303,8 +302,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     cr_all_task_archive_tests
     cr_compose_tests
     cr_submit_batch_tests
-    PROPERTIES LABELS "msan_skip"
-  )
+  APPEND PROPERTY LABELS "msan_skip")
 
   # CLIO_FORCE_NET stress variants: route every task through the loopback
   # run-to-run network path so the serialize/send/recv/aggregate path is
