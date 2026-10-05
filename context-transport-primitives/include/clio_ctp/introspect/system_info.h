@@ -356,6 +356,35 @@ class SystemInfo {
    *  Windows: TerminateProcess. Idempotent; marks `proc` invalid. */
   CTP_DLL static void TerminateChild(SpawnedProcess &proc, int grace_ms = 5000);
 
+  /** Wait for a child spawned by SpawnProcess to exit and collect its exit
+   *  code. A child still running at the deadline is killed and reported as a
+   *  failure, so a hung child cannot hang its caller. Marks `proc` invalid.
+   *  @param proc the child
+   *  @param timeout_ms how long to wait before killing it
+   *  @param exit_code out: the exit code (unchanged if the child did not
+   *         exit normally)
+   *  @return true if the child exited on its own (not killed, not signalled) */
+  CTP_DLL static bool WaitForChild(SpawnedProcess &proc, int timeout_ms,
+                                   int *exit_code);
+
+  /** Absolute path of the running executable ("" if unknown). Lets a test
+   *  re-launch itself to run a phase in a fresh process. */
+  CTP_DLL static std::string GetExecutablePath();
+
+  /** Ignore the file-size-limit signal (POSIX SIGXFSZ), so a write past the
+   *  limit fails with EFBIG instead of killing the process. The disposition
+   *  is inherited by children spawned afterwards. No-op on Windows. */
+  CTP_DLL static void IgnoreFileSizeSignal();
+
+  /** Set another process's soft file-size limit (RLIMIT_FSIZE), keeping its
+   *  hard limit. Linux only (prlimit); returns false elsewhere.
+   *  @param pid the process
+   *  @param soft_bytes the new soft limit in bytes
+   *  @param prev_soft out (optional): the soft limit it replaced
+   *  @return true on success */
+  CTP_DLL static bool SetProcessFileSizeLimit(int pid, uint64_t soft_bytes,
+                                              uint64_t *prev_soft = nullptr);
+
   /** Sleep for `us` microseconds at the platform's best available precision.
    *  Windows uses a one-shot high-resolution waitable timer
    *  (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION) for sub-millisecond accuracy

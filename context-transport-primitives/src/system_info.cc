@@ -85,6 +85,7 @@
 #include <fcntl.h>
 #include <spawn.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -100,6 +101,7 @@
 #include <linux/memfd.h>
 #endif
 #if __APPLE__
+#include <mach-o/dyld.h>
 #include <pthread.h>
 #endif
 // WINDOWS
@@ -1216,6 +1218,85 @@ void SystemInfo::TerminateChild(SpawnedProcess &proc, int grace_ms) {
   proc.win_thread = 0;
 #endif
   proc.valid = false;
+}
+
+bool SystemInfo::WaitForChild(SpawnedProcess &proc, int timeout_ms,
+                              int *exit_code) {
+  if (!proc.valid) return false;
+  bool exited = false;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  int status = 0;
+  pid_t r = 0;
+  for (int waited = 0; proc.pid > 0; waited += 10) {
+    r = waitpid(proc.pid, &status, WNOHANG);
+    if (r != 0 || waited >= timeout_ms) break;
+    struct timespec ts = {0, 10 * 1000 * 1000};  // 10 ms
+    nanosleep(&ts, nullptr);
+  }
+  if (r == proc.pid) {
+    exited = WIFEXITED(status);
+    if (exited && exit_code != nullptr) *exit_code = WEXITSTATUS(status);
+    proc.pid = -1;
+  }
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  HANDLE hp = reinterpret_cast<HANDLE>(proc.win_process);
+  if (hp != NULL &&
+      WaitForSingleObject(hp, static_cast<DWORD>(timeout_ms)) ==
+          WAIT_OBJECT_0) {
+    DWORD code = 0;
+    exited = GetExitCodeProcess(hp, &code) != 0;
+    if (exited && exit_code != nullptr) *exit_code = static_cast<int>(code);
+  }
+#endif
+  TerminateChild(proc, 0);  // kills a timed-out child; releases handles
+  return exited;
+}
+
+void SystemInfo::IgnoreFileSizeSignal() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  signal(SIGXFSZ, SIG_IGN);
+#endif
+}
+
+bool SystemInfo::SetProcessFileSizeLimit(int pid, uint64_t soft_bytes,
+                                         uint64_t *prev_soft) {
+#if CTP_ENABLE_PROCFS_SYSINFO && defined(__linux__)
+  struct rlimit cur;
+  if (prlimit(static_cast<pid_t>(pid), RLIMIT_FSIZE, nullptr, &cur) != 0) {
+    return false;
+  }
+  if (prev_soft != nullptr) *prev_soft = static_cast<uint64_t>(cur.rlim_cur);
+  struct rlimit lim = {static_cast<rlim_t>(soft_bytes), cur.rlim_max};
+  return prlimit(static_cast<pid_t>(pid), RLIMIT_FSIZE, &lim, nullptr) == 0;
+#else
+  (void)pid;
+  (void)soft_bytes;
+  (void)prev_soft;
+  return false;
+#endif
+}
+
+std::string SystemInfo::GetExecutablePath() {
+#if CTP_ENABLE_PROCFS_SYSINFO && defined(__APPLE__)
+  uint32_t size = PATH_MAX;
+  std::string buf(size, '\0');
+  if (_NSGetExecutablePath(buf.data(), &size) != 0) return "";
+  char resolved[PATH_MAX];
+  if (realpath(buf.c_str(), resolved) == nullptr) return "";
+  return resolved;
+#elif CTP_ENABLE_PROCFS_SYSINFO
+  char path[PATH_MAX];
+  ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+  if (n <= 0) return "";
+  return std::string(path, static_cast<size_t>(n));
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  char path[MAX_PATH];
+  DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return "";
+  return std::string(path, n);
+#else
+  return "";
+#endif
 }
 
 #if CTP_ENABLE_WINDOWS_SYSINFO
