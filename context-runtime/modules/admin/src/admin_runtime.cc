@@ -1559,10 +1559,28 @@ clio::run::TaskResume Runtime::MigrateContainers(
     ar(migrations);
   }
 
+  bool any_failed = false;
   for (const auto &info : migrations) {
     // Look up source node
     clio::run::u32 src_node =
         pool_manager->GetContainerNodeId(info.pool_id_, info.container_id_);
+
+    // Only the node that hosts a container can migrate it. GetContainer below
+    // falls back to this node's own container of the pool, so without this
+    // check a request for a container hosted elsewhere migrated the wrong
+    // container and reported success (issue #1179).
+    if (!pool_manager->HasContainer(info.pool_id_, info.container_id_)) {
+      std::string err = "container " + std::to_string(info.container_id_) +
+                        " of pool " + info.pool_id_.ToString() +
+                        " is not hosted on node " +
+                        std::to_string(CLIO_IPC->GetNodeId()) +
+                        " (address table: node " + std::to_string(src_node) +
+                        "); run the migration on the node that hosts it";
+      HLOG(kError, "Admin: MigrateContainers: {}", err);
+      task->error_message_ = clio::run::priv::string(CTP_MALLOC, err);
+      any_failed = true;
+      continue;
+    }
 
     // Plug the container to stop new tasks and wait for work to complete
     pool_manager->PlugContainer(info.pool_id_, info.container_id_);
@@ -1600,7 +1618,7 @@ clio::run::TaskResume Runtime::MigrateContainers(
          info.pool_id_, info.container_id_, src_node, info.dest_);
   }
 
-  task->SetReturnCode(0);
+  task->SetReturnCode(any_failed ? 1 : 0);
   HLOG(kInfo, "Admin: MigrateContainers completed, {} migrated",
        task->num_migrated_);
   CLIO_CO_RETURN;
