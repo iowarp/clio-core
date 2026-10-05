@@ -10181,6 +10181,36 @@ clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 ne
   CLIO_TASK_BODY_END
 }
 
+namespace {
+/**
+ * Whether two pool queries name the same place: the same routing mode, and
+ * for DirectId / DirectHash the same container id / hash.
+ * @param a a query
+ * @param b another
+ * @return true if a write to either lands on the same container
+ */
+bool SameRoute(const clio::run::PoolQuery &a, const clio::run::PoolQuery &b) {
+  if (a.GetRoutingMode() != b.GetRoutingMode()) return false;
+  if (a.IsDirectIdMode()) return a.GetContainerId() == b.GetContainerId();
+  if (a.IsDirectHashMode()) return a.GetHash() == b.GetHash();
+  return true;
+}
+}  // namespace
+
+void Runtime::FlushWriteRun(
+    WriteRun &run, ctp::ipc::ShmPtr<> data,
+    std::vector<clio::run::Future<clio::run::bdev::WriteTask>> &write_tasks,
+    std::vector<size_t> &expected_write_sizes,
+    std::vector<std::pair<clio::run::u64, clio::run::u64>> &write_targets) {
+  if (!run.open) return;
+  clio::run::bdev::Client client = run.client;
+  write_tasks.push_back(client.AsyncWrite(run.query, run.blocks,
+                                          data + run.data_off, run.size));
+  expected_write_sizes.push_back(run.size);
+  write_targets.emplace_back(run.pool.ToU64(), run.first_off);
+  run.open = false;
+}
+
 clio::run::TaskResume Runtime::ModifyExistingData(
     const clio::run::priv::vector<BlobBlock> &blocks, ctp::ipc::ShmPtr<> data, size_t data_size,
     size_t data_offset_in_blob, clio::run::u32 &error_code,
@@ -10205,6 +10235,7 @@ clio::run::TaskResume Runtime::ModifyExistingData(
   std::vector<clio::run::Future<clio::run::bdev::WriteTask>> write_tasks;
   std::vector<size_t> expected_write_sizes;
   std::vector<std::pair<clio::run::u64, clio::run::u64>> write_targets;
+  WriteRun run;
 
   // Step 2: Store the offset of the block in the blob. Normally the first block
   // is at offset 0; a tail-write hint lets the caller start mid-list (the block
@@ -10289,23 +10320,31 @@ clio::run::TaskResume Runtime::ModifyExistingData(
         }
       }
 
-      // Wrap single block in clio::run::priv::vector for AsyncWrite
+      // One write per run of consecutive blocks on the same target (#1160):
+      // a 1 MiB page used to reach safe_bdev as 16 single-chunk writes that
+      // each paid an intent-log, stripe-lock and parity cycle and contended
+      // on the stripes they shared. As one write it is a whole stripe,
+      // encoded from its own bytes. The transports write a block list from
+      // one contiguous buffer, which consecutive blocks of a put are.
       timer.Resume();
-      clio::run::priv::vector<clio::run::bdev::Block> blocks(CTP_MALLOC);
-      blocks.push_back(bdev_block);
-      timer.Pause();
-      t_vec_alloc_ms += timer.GetMsec();
-      timer.Reset();
-
-      // Create and send the async write task
-      timer.Resume();
-      clio::run::bdev::Client cte_clientcopy = block.bdev_client_;
-      auto write_task = cte_clientcopy.AsyncWrite(block.target_query_, blocks,
-                                                  data_ptr, write_size);
-      write_tasks.push_back(std::move(write_task));
-      expected_write_sizes.push_back(write_size);
-      write_targets.emplace_back(block.bdev_client_.pool_id_.ToU64(),
-                                 bdev_block.offset_);
+      if (run.open && run.pool == block.bdev_client_.pool_id_ &&
+          SameRoute(run.query, block.target_query_) &&
+          run.data_off + run.size == data_buffer_offset) {
+        run.blocks.push_back(bdev_block);
+        run.size += write_size;
+      } else {
+        FlushWriteRun(run, data, write_tasks, expected_write_sizes,
+                      write_targets);
+        run.open = true;
+        run.pool = block.bdev_client_.pool_id_;
+        run.query = block.target_query_;
+        run.client = block.bdev_client_;
+        run.blocks.clear();
+        run.blocks.push_back(bdev_block);
+        run.data_off = data_buffer_offset;
+        run.size = write_size;
+        run.first_off = bdev_block.offset_;
+      }
       timer.Pause();
       t_async_send_ms += timer.GetMsec();
       timer.Reset();
@@ -10316,6 +10355,7 @@ clio::run::TaskResume Runtime::ModifyExistingData(
     // Update block offset for next iteration
     block_offset_in_blob += block.size_;
   }
+  FlushWriteRun(run, data, write_tasks, expected_write_sizes, write_targets);
 
   // Step 7: Wait for all Async write operations to complete
   timer.Resume();

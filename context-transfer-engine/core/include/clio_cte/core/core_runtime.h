@@ -1238,6 +1238,32 @@ private:
   // the default (0,0) reproduces the exact full-scan behavior. This turns an
   // O(blocks) rescan per append into O(1), fixing the O(N^2) blowup on files
   // built by millions of tiny O_APPEND writes (generic/069).
+  /** A run of consecutive blocks of one put on the same bdev target, sent
+   *  as one write (#1160). */
+  struct WriteRun {
+    bool open = false;
+    clio::run::PoolId pool;
+    clio::run::PoolQuery query;
+    clio::run::bdev::Client client;
+    clio::run::priv::vector<clio::run::bdev::Block> blocks{CTP_MALLOC};
+    size_t data_off = 0;   /**< the run's first byte in the put's buffer */
+    size_t size = 0;       /**< bytes in the run */
+    clio::run::u64 first_off = 0;  /**< its first block's target offset */
+  };
+  /**
+   * Send an open run as one bdev write and record it with the put's other
+   * writes (the completion loop checks each against its expected size).
+   * @param run the run; closed on return
+   * @param data the put's buffer
+   * @param write_tasks receives the write's future
+   * @param expected_write_sizes receives the run's size
+   * @param write_targets receives (pool, first block offset) for diagnostics
+   */
+  void FlushWriteRun(
+      WriteRun &run, ctp::ipc::ShmPtr<> data,
+      std::vector<clio::run::Future<clio::run::bdev::WriteTask>> &write_tasks,
+      std::vector<size_t> &expected_write_sizes,
+      std::vector<std::pair<clio::run::u64, clio::run::u64>> &write_targets);
   clio::run::TaskResume ModifyExistingData(const clio::run::priv::vector<BlobBlock> &blocks,
                                      ctp::ipc::ShmPtr<> data, size_t data_size,
                                      size_t data_offset_in_blob, clio::run::u32 &error_code,
