@@ -332,7 +332,12 @@ struct DeviceStatsScratch {
 DeviceStatsScratch &Scratch() {
   static thread_local DeviceStatsScratch *s = [] {
     auto *p = new DeviceStatsScratch();
-    p->ok = cudaStreamCreate(&p->stream) == cudaSuccess &&
+    // Non-blocking: the statistics and the ranking that chains on this stream
+    // must not wait for (or hold up) work on the legacy default stream, e.g. a
+    // synchronous copy of another chunk in flight. Inputs reach the device by
+    // copies that complete before the call (DeviceAwareMemcpy synchronizes).
+    p->ok = cudaStreamCreateWithFlags(&p->stream, cudaStreamNonBlocking) ==
+                cudaSuccess &&
             cudaMalloc(&p->d_hist, kHistBins * sizeof(unsigned int)) ==
                 cudaSuccess &&
             cudaMalloc(&p->d_scalars, 3 * sizeof(double)) == cudaSuccess &&

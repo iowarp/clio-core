@@ -308,13 +308,38 @@ std::vector<CompressionStats> Runtime::NeuroPressV2RankChunk(
     return {CompressionStats(fixed == StoreSetting() ? 0 : kNpSettingWire,
                              fixed, 0.0, 0.0, 0.0, 0.0)};
   }
-  const auto t0 = std::chrono::steady_clock::now();
+  auto t0 = std::chrono::steady_clock::now();
   const auto w = V2CostWeights(bw);
   ctp::compress::model::NeuroPressV2Features f;
   std::vector<ctp::compress::model::NeuroPressV2Prediction> ranked;
   double entropy = 0.0, mad = 0.0, d2 = 0.0, convert_ms = 0.0;
   double nn_gpu_ms = -1.0;
-  if (ctp::IsDevicePointer(chunk)) {
+  // A ranking NeuroPressV2LaunchRank started for this blob: take its result
+  // (normally already on the host); its selection time runs from its start.
+  V2PendingRank pending;
+  bool have_pending = false;
+  {
+    std::lock_guard<std::mutex> lock(v2_pending_mutex_);
+    auto it = v2_pending_.find(g_selection_blob);
+    if (it != v2_pending_.end()) {
+      pending = it->second;
+      v2_pending_.erase(it);
+      have_pending = true;
+    }
+  }
+  if (have_pending) {
+    t0 = pending.t0;
+    double gpu_ms = -1.0;
+    ranked = neuropress_v2_->RankDeviceFinish(&pending.gpu, &f, &gpu_ms);
+    convert_ms = pending.gpu.convert_ms;
+    if (gpu_ms >= 0.0) nn_gpu_ms = std::max(0.0, gpu_ms - convert_ms);
+    if (ranked.empty()) {
+      HLOG(kError, "NeuroPress v2: device ranking failed for a {}-byte chunk",
+           chunk_size);
+      if (out_gpu_failed) *out_gpu_failed = true;
+      return {};
+    }
+  } else if (ctp::IsDevicePointer(chunk)) {
     // Converted to float32 by value on the GPU (timed, then excluded), then
     // the statistics and the ranking chain on the same stream.
     void *stream = ctp::DeviceStatsStream();
@@ -326,7 +351,12 @@ std::vector<CompressionStats> Runtime::NeuroPressV2RankChunk(
     convert_ms = NeuroPressV2Predictor::LastConvertMs();
     if (st != nullptr) {
       ranked = neuropress_v2_->RankDevice(st, chunk_size, w, stream, &f);
-      ctp::ReadDeviceFeatureStats(st, &entropy, &mad, &d2, stream);
+      // The raw statistics only feed the selection log; the ranking already
+      // returned the network's inputs, so without the log there is no second
+      // device-to-host copy and wait per chunk.
+      if (SelectionLogEnabled()) {
+        ctp::ReadDeviceFeatureStats(st, &entropy, &mad, &d2, stream);
+      }
     }
     const double gpu_ms = NeuroPressV2Predictor::GpuTimerStopMs(stream);
     if (gpu_ms >= 0.0) nn_gpu_ms = std::max(0.0, gpu_ms - convert_ms);
@@ -371,6 +401,32 @@ std::vector<CompressionStats> Runtime::NeuroPressV2RankChunk(
                   out.empty() ? "-" : ctp::GpuSettingSpec(
                                           out.front().compress_preset_));
   return out;
+}
+
+bool Runtime::NeuroPressV2LaunchRank(const std::string &blob, const void *chunk,
+                                     clio::run::u64 chunk_size,
+                                     const Context &context, double bw) {
+  if (!neuropress_v2_ || !ctp::IsDevicePointer(chunk) ||
+      FixedV2Setting() >= 0 || !OracleV2Map().empty() || SelectionLogEnabled()) {
+    return false;
+  }
+  V2PendingRank p;
+  p.t0 = std::chrono::steady_clock::now();
+  if (!neuropress_v2_->RankDeviceAsync(chunk, chunk_size, context.data_type_,
+                                       V2CostWeights(bw),
+                                       ctp::DeviceStatsStream(), &p.gpu)) {
+    return false;  // NeuroPressV2RankChunk ranks it the synchronous way
+  }
+  std::lock_guard<std::mutex> lock(v2_pending_mutex_);
+  v2_pending_[blob] = p;
+  return true;
+}
+
+bool Runtime::NeuroPressV2RankDone(const std::string &blob) {
+  std::lock_guard<std::mutex> lock(v2_pending_mutex_);
+  auto it = v2_pending_.find(blob);
+  return it == v2_pending_.end() ||
+         ctp::compress::model::NeuroPressV2Predictor::RankReady(it->second.gpu);
 }
 
 double Runtime::NeuroPressV2LearnPrimary(
@@ -541,6 +597,13 @@ Runtime::V2ExploreWinner Runtime::NeuroPressV2Explore(
 #else  // NeuroPress v2 needs the CUDA build; Create refuses a v2 model here.
 
 void SetV2SelectionBlob(const std::string &) {}
+
+bool Runtime::NeuroPressV2LaunchRank(const std::string &, const void *,
+                                     clio::run::u64, const Context &, double) {
+  return false;
+}
+
+bool Runtime::NeuroPressV2RankDone(const std::string &) { return true; }
 
 std::vector<CompressionStats> Runtime::NeuroPressV2RankChunk(
     const void *, clio::run::u64, const Context &, double *, double *,

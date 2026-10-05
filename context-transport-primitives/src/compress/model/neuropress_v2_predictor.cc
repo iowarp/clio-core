@@ -486,12 +486,88 @@ std::vector<NeuroPressV2Prediction> NeuroPressV2Predictor::RankDevice(
                         &r)) {
     return {};
   }
+  return RankFromOut(r, features_out);
+}
+
+std::vector<NeuroPressV2Prediction> NeuroPressV2Predictor::RankFromOut(
+    const v2::RankOut &r, NeuroPressV2Features *features_out) const {
   if (features_out != nullptr) std::copy(r.x, r.x + 4, features_out->x);
   std::vector<NeuroPressV2Prediction> out(n_settings_);
   for (int k = 0; k < n_settings_; ++k) {
     const int s = r.order[k];
     out[k] = {s, r.ct[s], r.dt[s], r.ratio[s], r.cost[s]};
   }
+  return out;
+}
+
+bool NeuroPressV2Predictor::TakePendingResources(NeuroPressV2PendingRank *p) {
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (!pending_free_.empty()) {
+      *p = pending_free_.back();
+      pending_free_.pop_back();
+      p->convert_ms = 0.0;
+      return true;
+    }
+  }
+  p->host = v2::AllocPinned(sizeof(v2::RankOut));
+  p->start = v2::CreateTimingEvent();
+  p->done = v2::CreateTimingEvent();
+  p->convert_ms = 0.0;
+  return p->host != nullptr && p->start != nullptr && p->done != nullptr;
+}
+
+void NeuroPressV2Predictor::GivePendingResources(NeuroPressV2PendingRank *p) {
+  if (p->host != nullptr && p->start != nullptr && p->done != nullptr) {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    pending_free_.push_back(*p);
+  }
+  *p = NeuroPressV2PendingRank{};
+}
+
+bool NeuroPressV2Predictor::RankDeviceAsync(const void *chunk, size_t bytes,
+                                            int dtype,
+                                            const NeuroPressV2CostWeights &w,
+                                            void *stream,
+                                            NeuroPressV2PendingRank *p) {
+  if (!ready_ || chunk == nullptr || p == nullptr) return false;
+  if (!TakePendingResources(p)) {
+    GivePendingResources(p);
+    return false;
+  }
+  v2::RecordEvent(p->start, stream);
+  const void *st = DeviceStatsAsFloat32(chunk, bytes, dtype, stream);
+  p->convert_ms = LastConvertMs();
+  v2::NetDesc d;
+  FillDesc(&d);
+  v2::RankArgs a;
+  a.w_ct = w.w_ct, a.w_dt = w.w_dt, a.w_io = w.w_io;
+  a.bw_bytes_per_ms = w.bw_bytes_per_ms;
+  a.chunk_bytes = static_cast<double>(bytes);
+  // The ranking stream waits for the last GPU update (no host sync).
+  if (st == nullptr || !v2::StreamWaitEvent(stream, train_event_) ||
+      !v2::RankLaunch(d_params_, d, d_available_, st, a, stream,
+                      static_cast<v2::RankOut *>(p->host), p->done)) {
+    GivePendingResources(p);
+    return false;
+  }
+  return true;
+}
+
+bool NeuroPressV2Predictor::RankReady(const NeuroPressV2PendingRank &p) {
+  return p.done != nullptr && v2::EventDone(p.done);
+}
+
+std::vector<NeuroPressV2Prediction> NeuroPressV2Predictor::RankDeviceFinish(
+    NeuroPressV2PendingRank *p, NeuroPressV2Features *features_out,
+    double *gpu_ms) {
+  if (p == nullptr || p->done == nullptr) return {};
+  std::vector<NeuroPressV2Prediction> out;
+  if (v2::EventSync(p->done)) {
+    out = RankFromOut(*static_cast<const v2::RankOut *>(p->host), features_out);
+    if (gpu_ms != nullptr) *gpu_ms = v2::EventElapsedMs(p->start, p->done);
+  }
+  GivePendingResources(p);
   return out;
 }
 

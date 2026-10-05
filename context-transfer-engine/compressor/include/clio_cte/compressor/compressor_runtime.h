@@ -41,6 +41,7 @@
 #include <clio_ctp/data_structures/ipc/ring_buffer.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <memory>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -307,6 +308,14 @@ private:
    */
   std::unique_ptr<ctp::compress::model::NeuroPressV2Predictor> neuropress_v2_;
 
+  /** @brief A v2 ranking started by NeuroPressV2LaunchRank for one blob. */
+  struct V2PendingRank {
+    ctp::compress::model::NeuroPressV2PendingRank gpu;
+    std::chrono::steady_clock::time_point t0;  ///< when it was started
+  };
+  std::mutex v2_pending_mutex_;
+  std::unordered_map<std::string, V2PendingRank> v2_pending_;
+
   // HCompress's Expected-Compression-Cost model, deployed as a SELECTOR
   // (hcompress_selection.cc). Loaded only from hcompress_model_path_, and
   // exclusive with NeuroPress: when it loads, neuropress_predictor_ is not
@@ -541,6 +550,29 @@ private:
    *  time terms zeroed in best mode (ratio-only, as v1's best mode). */
   ctp::compress::model::NeuroPressV2CostWeights V2CostWeights(
       double bw = 0.0) const;
+
+  /**
+   * @brief Start a device chunk's v2 ranking on the GPU without a host wait,
+   * so the Compress task can yield its worker while the GPU ranks; the
+   * ranking is taken by NeuroPressV2RankChunk for the same blob. Only for the
+   * normal v2 path: not with a fixed setting, an oracle map or the selection
+   * log (whose raw statistics need the synchronous path).
+   * @param blob       the blob the ranking is for
+   * @param chunk      chunk bytes
+   * @param chunk_size its size
+   * @param context    compression context (data type)
+   * @param bw         the chunk's bandwidth (as for NeuroPressV2RankChunk)
+   * @return true when a ranking was started
+   */
+  bool NeuroPressV2LaunchRank(const std::string& blob, const void* chunk,
+                              clio::run::u64 chunk_size, const Context& context,
+                              double bw);
+
+  /**
+   * @param blob a blob passed to NeuroPressV2LaunchRank
+   * @return true once its ranking finished on the GPU, or when none is pending
+   */
+  bool NeuroPressV2RankDone(const std::string& blob);
 
   /**
    * @brief v2's ranking of one chunk (neuropress_v2_selection.cc).

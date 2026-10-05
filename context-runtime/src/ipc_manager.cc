@@ -3855,6 +3855,31 @@ void IpcManager::CleanupResponseArchive(size_t net_key) {
 // gpu::IpcManager::RegisterClientBackend directly.
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+/**
+ * @brief The block size actually allocated for a GPU backend of `bytes`.
+ *
+ * Device data blocks of 1 MiB or more come in size classes, eight per power
+ * of two (a block is at most 12.5 % larger than asked): blocks of nearby
+ * sizes -- e.g. the output bounds of different codec settings for one chunk
+ * size -- then share one pooled class, instead of each size paying its own
+ * synchronizing cudaMalloc the first time and holding its own pool entries.
+ * Smaller blocks and host memory keep their exact size.
+ *
+ * @param kind  memory kind
+ * @param bytes the size the caller asked for
+ * @return the size to allocate and pool by (>= bytes)
+ */
+static size_t GpuBlockSizeClass(gpu::IpcManager::MemKind kind, size_t bytes) {
+  constexpr size_t kClassFrom = size_t{1} << 20;
+  if (kind != gpu::IpcManager::MemKind::kDeviceMem || bytes < kClassFrom) {
+    return bytes;
+  }
+  size_t pow2 = kClassFrom;
+  while (pow2 <= bytes / 2) pow2 <<= 1;
+  const size_t step = pow2 / 8;
+  return (bytes + step - 1) / step * step;
+}
+
 ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
     u32 gpu_id, gpu::IpcManager::MemKind kind, size_t bytes,
     char **out_base) {
@@ -3867,18 +3892,21 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
   // -- 132 us on average in the compressor's steady state, seventeen times a
   // chunk. Everything after this point is unchanged: the id is still fresh and
   // still registered, so only the memory is recycled, never the identity.
-  char *base = GpuBlockPoolTake(gpu_id, kind, bytes);
+  // The block is of its size class (GpuBlockSizeClass); the backend is still
+  // registered with the size the caller asked for.
+  const size_t block_bytes = GpuBlockSizeClass(kind, bytes);
+  char *base = GpuBlockPoolTake(gpu_id, kind, block_bytes);
   if (base == nullptr) {
     switch (kind) {
       case gpu::IpcManager::MemKind::kPinnedHost:
-        base = ctp::GpuApi::MallocHost<char>(bytes);
+        base = ctp::GpuApi::MallocHost<char>(block_bytes);
         break;
       case gpu::IpcManager::MemKind::kManagedUvm:
-        base = ctp::GpuApi::MallocManaged<char>(bytes);
+        base = ctp::GpuApi::MallocManaged<char>(block_bytes);
         break;
       case gpu::IpcManager::MemKind::kDeviceMem:
         ctp::GpuApi::SetDevice(static_cast<int>(gpu_id));
-        base = ctp::GpuApi::Malloc<char>(bytes);
+        base = ctp::GpuApi::Malloc<char>(block_bytes);
         break;
     }
   }
@@ -3982,7 +4010,7 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
               static_cast<u64>(alloc_id.minor_);
     std::lock_guard<std::mutex> lk(owned_gpu_backends_mutex_);
     owned_gpu_backends_[key] =
-        OwnedGpuBackend{base, kind, registered_in_process, bytes, gpu_id};
+        OwnedGpuBackend{base, kind, registered_in_process, block_bytes, gpu_id};
   }
 
   result = alloc_id;

@@ -385,6 +385,43 @@ void FreeDevice(void *dev) {
   if (dev != nullptr) cudaFree(dev);
 }
 
+bool RankLaunch(const float *d_params, const NetDesc &desc,
+                const unsigned char *d_available, const void *device_stats,
+                const RankArgs &args, void *stream, RankOut *host_out,
+                void *done) {
+  if (desc.n_settings > kMaxSettings || desc.n_layers > kMaxLayers) {
+    return false;
+  }
+  for (int l = 0; l <= desc.n_layers; ++l) {
+    if (desc.dims[l] > kMaxWidth) return false;
+  }
+  // The thread's device result buffer is reused by the next ranking on this
+  // thread, which is enqueued on the same stream after this copy.
+  RankOut *d_out = ThreadOut();
+  if (d_out == nullptr || device_stats == nullptr || host_out == nullptr) {
+    return false;
+  }
+  auto s = static_cast<cudaStream_t>(stream);
+  RankKernel<<<1, kThreads, 0, s>>>(
+      d_params, desc, d_available,
+      static_cast<const ctp::DeviceFeatureStats *>(device_stats), args, d_out);
+  if (cudaGetLastError() != cudaSuccess) return false;
+  if (cudaMemcpyAsync(host_out, d_out, sizeof(RankOut), cudaMemcpyDeviceToHost,
+                      s) != cudaSuccess) {
+    return false;
+  }
+  return RecordEvent(done, stream);
+}
+
+void *AllocPinned(size_t bytes) {
+  void *p = nullptr;
+  if (cudaMallocHost(&p, bytes) != cudaSuccess) {
+    cudaGetLastError();
+    return nullptr;
+  }
+  return p;
+}
+
 bool RankOnDevice(const float *d_params, const NetDesc &desc,
                   const unsigned char *d_available, const void *device_stats,
                   const RankArgs &args, void *stream, RankOut *out) {

@@ -49,6 +49,10 @@
 #                     more than in flight can run), so no chunk pays a codec's
 #                     first-use setup inside the timed work; CUDA kernels are
 #                     loaded at start too (CUDA_MODULE_LOADING=EAGER)
+#   PIN=1             run the driver on the CPUs of the GPU's NUMA node, its memory preferred there
+#                     node (numactl; default 1; NUMA_NODE overrides the node
+#                     read from the GPU's PCI device). The CPU governor is set
+#                     by the run chains (run_kmeans_parallel.sh).
 # Each chunk's element type rides in its name (--dtype-from-name); v2 turns
 # it into float32 for its features only, timed and kept out of every time.
 # Output: /mnt/nvme0/v2-work/runs/DATASET_MODE/{v2_pred,v2_measured,phases,
@@ -152,6 +156,13 @@ READ_OPTS=(--read-repeat "${READS:-1}")
 INF=$(( ${CLIO_REPLAY_INFLIGHT:-1} > ${READ_INFLIGHT:-1} ? ${CLIO_REPLAY_INFLIGHT:-1} : ${READ_INFLIGHT:-1} ))
 MEASURE_ENV=(CLIO_REPLAY_PRELOAD="${PRELOAD:-1}" CUDA_MODULE_LOADING=EAGER
              CLIO_NEUROPRESS_PREWARM="${PREWARM:-$(( INF + 1 ))}")
+PIN_CMD=()
+if [ "${PIN:-1}" = 1 ] && command -v numactl > /dev/null; then
+  BUS=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null | head -1 |
+        tr 'A-F' 'a-f' | sed 's/^0000//')
+  NODE=${NUMA_NODE:-$(cat "/sys/bus/pci/devices/$BUS/numa_node" 2>/dev/null || echo -1)}
+  [ "$NODE" -ge 0 ] 2>/dev/null && PIN_CMD=(numactl --cpunodebind="$NODE" --preferred="$NODE")
+fi
 START=$(date +%s.%N)
 set +e  # the replay process segfaults in CUDA teardown at exit (v1 too), after all output is written
 env CLIO_SERVER_CONF="$STORE/compose.yaml" CLIO_WITH_RUNTIME=1 \
@@ -167,7 +178,7 @@ env CLIO_SERVER_CONF="$STORE/compose.yaml" CLIO_WITH_RUNTIME=1 \
     CLIO_NEUROPRESS_PHASE_LOG="$STORE/phases.csv" \
     CLIO_NEUROPRESS_SELECTION_LOG="$SELECTION_LOG" \
     CTP_LOG_LEVEL=warning \
-    "$BIN" --dir "$FIELDS" --ext .chunk --chunk 0 --dtype-from-name \
+    "${PIN_CMD[@]}" "$BIN" --dir "$FIELDS" --ext .chunk --chunk 0 --dtype-from-name \
     --tag "v2_${DS}_${MODE}" --report "$STORE/blobs.csv" --verify "${READ_OPTS[@]}" "${EXTRA[@]}" \
     > "$STORE/stdout.log" 2> "$STORE/runtime.log"
 RC=$?; set -e

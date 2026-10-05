@@ -70,6 +70,7 @@ namespace ctp::compress::model {
 
 namespace v2 {
 struct NetDesc;  // neuropress_v2_kernels.h
+struct RankOut;  // neuropress_v2_kernels.h
 }  // namespace v2
 
 /**
@@ -106,6 +107,17 @@ struct NeuroPressV2CostWeights {
   double w_dt = 1.0;               ///< weight of decompress ms
   double w_io = 1.0;               ///< weight of the I/O term
   double bw_bytes_per_ms = 5.0e6;  ///< storage bandwidth (5e6 B/ms = 5 GB/s)
+};
+
+/**
+ * @brief One chunk's ranking in flight on the GPU (RankDeviceAsync), until
+ * RankDeviceFinish takes its result and returns the resources for reuse.
+ */
+struct NeuroPressV2PendingRank {
+  void *host = nullptr;     ///< pinned host copy of the result (v2::RankOut)
+  void *start = nullptr;    ///< timing event before the statistics
+  void *done = nullptr;     ///< timing event after the result's copy
+  double convert_ms = 0.0;  ///< GPU ms of a float32 conversion (0: none)
 };
 
 /**
@@ -255,6 +267,42 @@ class NeuroPressV2Predictor {
       NeuroPressV2Features *features_out = nullptr);
 
   /**
+   * @brief Start one chunk's ranking on the GPU without any host wait (except
+   * a non-float32 chunk's conversion): statistics, network and an
+   * asynchronous copy of the result, on `stream`. The same kernels as
+   * RankDevice, so the same ranking; the caller can do other work until
+   * RankReady and then take it with RankDeviceFinish.
+   * @param chunk  device pointer to the chunk
+   * @param bytes  its size
+   * @param dtype  its element type code (Context::data_type_)
+   * @param w      cost weights
+   * @param stream cudaStream_t to run on (ctp::DeviceStatsStream())
+   * @param p      receives the pending ranking (with its resources)
+   * @return false when not loaded or on a CUDA error (nothing pending)
+   */
+  bool RankDeviceAsync(const void *chunk, size_t bytes, int dtype,
+                       const NeuroPressV2CostWeights &w, void *stream,
+                       NeuroPressV2PendingRank *p);
+
+  /**
+   * @param p a ranking started by RankDeviceAsync
+   * @return true once its result is on the host (no wait)
+   */
+  static bool RankReady(const NeuroPressV2PendingRank &p);
+
+  /**
+   * @brief Take a started ranking's result (waiting for it if it is not
+   * ready yet) and return its resources for reuse.
+   * @param p             the pending ranking (empty afterwards)
+   * @param features_out  optional: receives the inputs the kernel computed
+   * @param gpu_ms        optional: GPU ms from the statistics to the copy
+   * @return all settings, cheapest first; empty on error
+   */
+  std::vector<NeuroPressV2Prediction> RankDeviceFinish(
+      NeuroPressV2PendingRank *p, NeuroPressV2Features *features_out = nullptr,
+      double *gpu_ms = nullptr);
+
+  /**
    * One online step on the output rows of one setting, from a measured
    * result, run on the GPU (asynchronous; nothing but the labels crosses from
    * the host): a normalised LMS update of each labelled row (gradient of the
@@ -314,6 +362,13 @@ class NeuroPressV2Predictor {
   void FillDesc(v2::NetDesc *d) const;
   /** Refresh the host parameters from the device after GPU updates. */
   void SyncHost() const;
+  /** A pending ranking's pinned buffer and events, from the reuse list. */
+  bool TakePendingResources(NeuroPressV2PendingRank *p);
+  /** Return a pending ranking's pinned buffer and events to the list. */
+  void GivePendingResources(NeuroPressV2PendingRank *p);
+  /** Build the ranking from a kernel result (as RankDevice does). */
+  std::vector<NeuroPressV2Prediction> RankFromOut(
+      const v2::RankOut &r, NeuroPressV2Features *features_out) const;
   /** Cost of a setting's prediction under w (inf when unusable). */
   double Cost(int s, double ct, double dt, double ratio, size_t chunk_bytes,
               const NeuroPressV2CostWeights &w) const;
@@ -343,6 +398,10 @@ class NeuroPressV2Predictor {
   bool t_pending_[kTimerSlots] = {};
   int t_next_ = 0;
   double train_gpu_ms_ = 0.0;  ///< finished updates' GPU ms, not yet taken
+  /** Pinned buffers and events of finished async rankings, for reuse; never
+      freed (process lifetime, as the device parameters). */
+  std::mutex pending_mutex_;
+  std::vector<NeuroPressV2PendingRank> pending_free_;
 };
 
 }  // namespace ctp::compress::model

@@ -443,6 +443,11 @@ void Runtime::InitPredictionReuse() {
            (1024 * 1024));
 }
 
+/** Microseconds a Compress task waits between checks of its NeuroPress v2
+ *  ranking on the GPU while it yields its worker (the ranking takes a few
+ *  hundred microseconds). */
+static constexpr double kV2RankPollUs = 20.0;
+
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Load configuration from compose YAML (or direct CreateParams)
@@ -1475,6 +1480,17 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       np_reuse_ctx.error_bound = context.error_bound_;
       const bool np_reuse_on =
           np_reuse_ctx.slot != ctp::compress::preprocess::kNoLineageSlot;
+      // NeuroPress v2 on a device chunk: start the ranking on the GPU and
+      // yield this worker to other tasks (other chunks in flight) until it
+      // has finished, instead of holding the worker in a host wait;
+      // EstCompressionStats below then takes the finished ranking.
+      if (NeuroPressV2Active(context) &&
+          NeuroPressV2LaunchRank(task->blob_name_.str(), chunk_data, chunk_size,
+                                 context, v2_bw)) {
+        while (!NeuroPressV2RankDone(task->blob_name_.str())) {
+          CLIO_CO_AWAIT(clio::run::yield(kV2RankPollUs));
+        }
+      }
       SetV2SelectionBlob(task->blob_name_.str());
       stats =
           EstCompressionStats(chunk_data, chunk_size, context, &ranked_by_cost,

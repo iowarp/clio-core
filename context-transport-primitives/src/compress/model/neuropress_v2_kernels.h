@@ -179,6 +179,34 @@ bool RankOnDevice(const float *d_params, const NetDesc &desc,
                   const unsigned char *d_available, const void *device_stats,
                   const RankArgs &args, void *stream, RankOut *out);
 
+/**
+ * @brief Enqueue one chunk's ranking without waiting on the host: the
+ * network, an asynchronous copy of its result to `host_out`, then `done`
+ * recorded on the stream. Read host_out only once EventDone(done) (or
+ * EventSync(done)) says the copy finished.
+ * @param d_params     device weights
+ * @param desc         their layout
+ * @param d_available  per-setting availability on the device
+ * @param device_stats device pointer to a ctp::DeviceFeatureStats
+ * @param args         cost weights and chunk size
+ * @param stream       cudaStream_t of the statistics that produced device_stats
+ * @param host_out     pinned host memory (AllocPinned) for the result
+ * @param done         event from CreateTimingEvent, recorded after the copy
+ * @return false on a launch error or an unsupported shape
+ */
+bool RankLaunch(const float *d_params, const NetDesc &desc,
+                const unsigned char *d_available, const void *device_stats,
+                const RankArgs &args, void *stream, RankOut *host_out,
+                void *done);
+
+/**
+ * @brief Pinned (page-locked) host memory, for asynchronous device-to-host
+ * copies.
+ * @param bytes size
+ * @return the memory, or nullptr on error
+ */
+void *AllocPinned(size_t bytes);
+
 }  // namespace ctp::compress::model::v2
 
 #endif  // CLIO_CTP_SRC_COMPRESS_MODEL_NEUROPRESS_V2_KERNELS_H_

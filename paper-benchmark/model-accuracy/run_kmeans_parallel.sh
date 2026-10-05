@@ -57,6 +57,16 @@ if pgrep -f bin/neuropress_field_replay > /dev/null; then
 fi
 say "start $DS, weights ${WS[*]}, $PROCS processes x $INFLIGHT in flight"
 
+# GOVERNOR (default performance): the CPU frequency governor while the runs
+# go, restored on exit (needs sudo); GOVERNOR= (empty) leaves it alone.
+GOV_FILES=(/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor)
+OLD_GOV=$(cat "${GOV_FILES[0]}" 2>/dev/null || true)
+if [ -n "${GOVERNOR-performance}" ] && [ -n "$OLD_GOV" ] && [ "$OLD_GOV" != "${GOVERNOR-performance}" ]; then
+  echo "${GOVERNOR-performance}" | sudo tee "${GOV_FILES[@]}" > /dev/null &&
+    trap 'echo "$OLD_GOV" | sudo tee "${GOV_FILES[@]}" > /dev/null' EXIT
+  say "CPU governor ${GOVERNOR-performance} (was $OLD_GOV; restored on exit)"
+fi
+
 # the exhaustive search, once per input (as run_kmeans_benchmark.sh)
 if "$PY" "$HERE/baseline_store.py" has "$DS" exhaustive > /dev/null 2>&1; then
   say "exhaustive search: stored baseline, not run"
