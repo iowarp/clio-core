@@ -702,6 +702,12 @@ clio::run::TaskResume Runtime::GetBlob(
     clio::run::u64 primary_size = 0;
     clio::run::u64 primary_lost = 0;  // bytes a restart took (#1163)
     {
+      // After a restart the primary may be behind its remote copy (#1164).
+      bool healed = false;
+      CLIO_CO_AWAIT(ReconcilePrimaryWithRemote(task->tag_id_, blob_name,
+                                               healed));
+    }
+    {
       auto size_task = cte->AsyncGetBlobSize(task->tag_id_, blob_name,
                                              clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(size_task);
@@ -981,6 +987,53 @@ clio::run::TaskResume Runtime::MultiPutBlobLocal(
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::ReconcilePrimaryWithRemote(
+    const TagId &tag_id, const std::string &blob_name, bool &healed) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  healed = false;
+  if (!is_restart_ || config_.remote_copies_ <= 0 ||
+      OwnerOf(tag_id, blob_name) != container_id_) {
+    CLIO_CO_RETURN;
+  }
+  {
+    std::lock_guard<std::mutex> lk(reconcile_mu_);
+    if (!reconciled_.insert(BlobKey(tag_id, blob_name)).second) {
+      CLIO_CO_RETURN;  // already compared since the restart
+    }
+  }
+  auto *cte = GetCoreClient();
+  clio::run::u64 have = 0;
+  {
+    auto ps = cte->AsyncGetBlobSize(tag_id, blob_name,
+                                    clio::run::PoolQuery::Local(), 0);
+    CLIO_CO_AWAIT(ps);
+    if (ps->GetReturnCode() == 0) have = ps->size_ - ps->lost_bytes_;
+  }
+  const clio::run::u32 n = NumContainers();
+  for (int i = 1; i <= config_.remote_copies_ && i < static_cast<int>(n) &&
+                  !healed; ++i) {
+    const clio::run::u32 c = (container_id_ + i) % n;
+    if (!ContainerAlive(c)) continue;
+    auto rs = cte->AsyncGetBlobSize(tag_id, blob_name,
+                                    clio::run::PoolQuery::DirectId(c), 0);
+    CLIO_CO_AWAIT(rs);
+    if (rs->GetReturnCode() != 0) continue;
+    const clio::run::u64 theirs = rs->size_ - rs->lost_bytes_;
+    if (theirs <= have) continue;
+    HLOG(kWarning, "replication: {}.{}/{} holds {} byte(s) after the restart "
+         "but its remote copy on container {} holds {}; healing the primary "
+         "from the copy", tag_id.major_, tag_id.minor_, blob_name, have, c,
+         theirs);
+    CLIO_CO_AWAIT(HealPrimaryFromRemote(tag_id, blob_name, c, theirs));
+    healed = true;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::GetBlobSize(
     clio::run::shared_ptr<clio::cte::core::GetBlobSizeTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -989,6 +1042,13 @@ clio::run::TaskResume Runtime::GetBlobSize(
     CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlobSize,
                            task.template Cast<clio::run::Task>()));
     CLIO_CO_RETURN;
+  }
+  {
+    // A size is what a copy of the blob is built from (#1164): after a
+    // restart make sure the primary is not behind its remote copy first.
+    bool healed = false;
+    CLIO_CO_AWAIT(ReconcilePrimaryWithRemote(task->tag_id_,
+                                             task->blob_name_.str(), healed));
   }
   CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlobSize,
                          task.template Cast<clio::run::Task>()));

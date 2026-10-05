@@ -231,6 +231,22 @@ class Runtime : public clio::cte::core::CoreInterposer {
                                               clio::run::u64 end);
 
   /**
+   * After a recovering start, the first time a blob this container owns is
+   * sized or read: compare the primary's stored bytes with the remote copy's
+   * and heal the primary if the copy holds more (#1164). The owner's
+   * persisted layout can lag its remote copy after a SIGKILL -- the copy is
+   * written through before a put is acked, the WAL may not have reached the
+   * disk -- so until reconciled the primary looks complete at an old size
+   * and anyone sizing a copy from it builds a short one. Once per blob.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob's name
+   * @param healed set true when the primary was re-cached from a copy
+   */
+  clio::run::TaskResume ReconcilePrimaryWithRemote(const TagId &tag_id,
+                                                   const std::string &blob_name,
+                                                   bool &healed);
+
+  /**
    * Before a primary write that starts at `write_off`: if the primary holds
    * fewer than `write_off` bytes but a replica holds more (the primary's
    * volatile blocks were dropped by a restart), copy that replica back into
@@ -458,6 +474,10 @@ class Runtime : public clio::cte::core::CoreInterposer {
                      std::unordered_map<std::string, HandoffEntry>> handoff_;
   clio::cte::core::RecordLog handoff_log_;
   bool is_restart_ = false;
+  /** Blobs already reconciled with their remote copy since this restart
+   *  (ReconcilePrimaryWithRemote); keys from BlobKey. */
+  std::mutex reconcile_mu_;
+  std::unordered_set<std::string> reconciled_;
 };
 
 }  // namespace clio::cte::replication
