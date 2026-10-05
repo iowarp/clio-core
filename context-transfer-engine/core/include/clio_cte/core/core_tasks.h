@@ -125,6 +125,36 @@ inline Timestamp GetWallTimeNs() {
 }
 
 /**
+ * Convert a steady-clock blob timestamp (GetCurrentTimeNs) to wall-clock ns,
+ * for persisting it: the steady clock restarts at boot, so only a wall-clock
+ * value means anything to the next runtime (issue #796).
+ * @param steady steady-clock ns; 0 (never set) stays 0
+ * @return the equivalent wall-clock ns
+ */
+inline Timestamp SteadyToWallNs(Timestamp steady) {
+  if (steady == 0) return 0;
+  const Timestamp now_steady = GetCurrentTimeNs();
+  const Timestamp now_wall = GetWallTimeNs();
+  const Timestamp age = now_steady > steady ? now_steady - steady : 0;
+  return now_wall > age ? now_wall - age : 1;
+}
+
+/**
+ * Convert a persisted wall-clock timestamp back to this boot's steady clock.
+ * Anything older than this boot clamps to 1: still non-zero ("was written"),
+ * still older than every timestamp taken since.
+ * @param wall wall-clock ns; 0 (never set) stays 0
+ * @return the equivalent steady-clock ns
+ */
+inline Timestamp WallToSteadyNs(Timestamp wall) {
+  if (wall == 0) return 0;
+  const Timestamp now_steady = GetCurrentTimeNs();
+  const Timestamp now_wall = GetWallTimeNs();
+  const Timestamp age = now_wall > wall ? now_wall - wall : 0;
+  return now_steady > age ? now_steady - age : 1;
+}
+
+/**
  * CreateParams for CTE Core chimod
  * Contains configuration parameters for CTE container creation
  */
@@ -1113,9 +1143,9 @@ struct BlobInfo {
   Timestamp last_read_;
   // Number of data ops (PutBlob/GetBlob) served by this blob since creation.
   // Consumed by the frecency data organizer (issue #738) as the "frequency"
-  // half of the frecency score. Transient runtime stat — not persisted to
-  // the WAL/metadata log, so it resets on restart (organizers must treat a
-  // zero count as "cold or freshly restored", which decays gracefully).
+  // half of the frecency score. Persisted by the metadata snapshot (#796) but
+  // not by the WAL, so it can lag after a crash (organizers must treat a zero
+  // count as "cold or freshly restored", which decays gracefully).
   clio::run::u64 access_count_;
   // Authoritative record of whether the stored bytes have been rewritten by
   // some transform (compression, encryption, ...). See BlobTransformFlags.
