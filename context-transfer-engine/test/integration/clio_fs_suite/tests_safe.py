@@ -17,7 +17,7 @@ return wrong bytes.
 import threading
 import time
 
-from cluster import SAFE_MEMBERS, SAFE_PARITY, parallel
+from cluster import SAFE_MEMBERS, SAFE_PARITY, AgentConn, parallel
 from suite import test
 from tests_fault import restart_cluster
 from tests_stress import (CORRUPT, FILE_BLOCKS, FOREIGN, ZERO,
@@ -500,11 +500,27 @@ def t_two_nodes_down(ctx):
   parallel(cl.kill_runtime, down)
   time.sleep(5)
   lies, failed, ok = [], 0, 0
-  # A scan of a file with pages on the pair takes ~30 s of I/O errors: probe
-  # three, so the pair is back while the writers still have minutes to run.
+  # Probe through a connection of its own: a node's agent serializes its
+  # calls, so a probe on node0's shared agent waited behind node0's 300 s
+  # writer call and that wait read as a 274 s stat (#1169). Each step is
+  # timed -- the stat, the first 4 KiB read, then the record scan -- so a
+  # slow one is named.
+  probe = AgentConn(cl.hosts[0], cl.agent_py, cl.env_prefix())
+  step_s = []
   for nm in names[:3]:
-    r = ctx.call(0, 'rec_scan', timeout=900, path=f'{base}/{nm}', name=nm,
-                 nblocks=FILE_BLOCKS)
+    path = f'{base}/{nm}'
+    t = time.time()
+    st = probe.call('stat', timeout=900, path=path)
+    t_stat = round(time.time() - t, 1)
+    t = time.time()
+    rd = probe.call('read_hex', timeout=900, path=path, off=0, length=4096)
+    t_read = round(time.time() - t, 1)
+    t = time.time()
+    r = probe.call('rec_scan', timeout=900, path=path, name=nm,
+                   nblocks=FILE_BLOCKS)
+    t_scan = round(time.time() - t, 1)
+    step_s.append([nm, t_stat, st.get('ok'), t_read, rd.get('ok'), t_scan,
+                   r.get('ok')])
     if not r['ok']:
       failed += 1  # an I/O error is an honest answer
       continue
@@ -512,8 +528,12 @@ def t_two_nodes_down(ctx):
     for start, count, w, g in r['ret']['runs']:
       if w in (CORRUPT, FOREIGN, ZERO) or (w, g) != (1, 1):
         lies.append((nm, start, count, w, g))
+  probe.close()
   ctx.metrics.update({'files_readable_during_outage': ok,
-                      'files_failed_during_outage': failed})
+                      'files_failed_during_outage': failed,
+                      'probe_steps': step_s})
+  ctx.note(f'outage probes [file, stat s, ok, 4K read s, ok, scan s, ok]: '
+           f'{step_s}')
   ctx.check(not lies, f'reads with two adjacent nodes down returned wrong '
                       f'bytes: {lies[:6]}')
   ctx.metrics['probe_s'] = round(time.time() - t_kill, 1)
