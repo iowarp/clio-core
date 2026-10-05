@@ -2024,8 +2024,31 @@ static int OpenHandleSize(CfsHandle *h, const std::string &hp,
   return rc;
 }
 
+static int GetattrStatImpl(const char *path, cte_stat_t *stbuf,
+                           struct fuse_file_info *fi);
+
 int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
                           struct fuse_file_info *fi) {
+  // A getattr that took seconds, with its answer (#1169: a stat took 274 s
+  // with two nodes down and no read-path diagnostic fired). Rate-limited.
+  const auto t0 = std::chrono::steady_clock::now();
+  const int rc = GetattrStatImpl(path, stbuf, fi);
+  const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+  if (ms > 2000.0) {
+    static std::atomic<clio::run::u64> logged{0};
+    const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
+    if (k < 16 || k % 256 == 0) {
+      HLOG(kWarning, "clio_cte_fuse: slow getattr of '{}': {} ms, rc {} ({} "
+           "such)", path != nullptr ? path : "", ms, rc, k + 1);
+    }
+  }
+  return rc;
+}
+
+static int GetattrStatImpl(const char *path, cte_stat_t *stbuf,
+                           struct fuse_file_info *fi) {
   // fstat through a handle with deferred appends sees them.
   CfsHandle *handle = fi != nullptr ? GetHandle(fi) : nullptr;
   std::string hidden;

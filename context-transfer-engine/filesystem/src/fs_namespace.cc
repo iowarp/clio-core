@@ -47,6 +47,8 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <algorithm>
+#include <chrono>
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -192,6 +194,7 @@ clio::run::TaskResume Runtime::CallShard(clio::run::u32 target,
   }
   std::string enc;
   EncReq(req, &enc);
+  const auto shard_t0 = std::chrono::steady_clock::now();
   auto t = self_.AsyncShardOp(
       op, enc,
       clio::run::PoolQuery::DirectId(
@@ -203,6 +206,25 @@ clio::run::TaskResume Runtime::CallShard(clio::run::u32 target,
     // owns is unavailable, which POSIX can only express as an I/O error.
     resp = FsResp();
     resp.rc_ = EIO;
+  }
+  {
+    // A shard call that took seconds, and where it went (#1169: a stat
+    // took 274 s with two nodes down). Rate-limited.
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - shard_t0)
+                          .count();
+    if (ms > 2000.0) {
+      static std::atomic<clio::run::u64> logged{0};
+      const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
+      if (k < 16 || k % 256 == 0) {
+        auto *pm = CLIO_POOL_MANAGER;
+        HLOG(kWarning, "filesystem: shard op {} to container {} (node {}, "
+             "alive {}) took {} ms; task rc {}, resp rc {} ({} such calls)",
+             op, target, pm->GetContainerNodeId(pool_id_, target),
+             clio::cte::core::ContainerNodeAlive(pool_id_, target), ms,
+             t->GetReturnCode(), resp.rc_, k + 1);
+      }
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
