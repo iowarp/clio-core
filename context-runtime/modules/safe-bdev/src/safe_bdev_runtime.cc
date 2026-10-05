@@ -1897,10 +1897,21 @@ clio::run::TaskResume Runtime::ReadBlockDegraded(clio::run::u64 off,
     std::vector<std::vector<uint8_t>> chunks;
     bool rec_ok = false;
     if (pos >= 0) {
+      // Under the stripe lock (#1165). A reconstruct reads k shards of the
+      // stripe and needs them to agree; a degraded Write to the same slot
+      // lands its data on a survivor and stores the new parity in two
+      // steps, both under this lock. Read between them, the decode of the
+      // down column is garbage with no error -- and a tier move that read
+      // it then wrote that garbage into fresh extents on healthy members,
+      // where every later reader saw it (a 64 KiB record chunk of random
+      // bytes, identical on every node).
+      const std::set<clio::run::u64> one{s};
+      CLIO_CO_AWAIT(LockStripes(one));
       // Only the bytes asked for (#1147).
       const std::vector<int> excl{static_cast<int>(dd)};
       CLIO_CO_AWAIT(ReconstructStripe(s, stripe, excl, chunks, rec_ok, within,
                                       seg_end - cur));
+      UnlockStripes(one);
     }
     if (!rec_ok || pos < 0) {
       HLOG(kError, "safe_bdev Read: cannot reconstruct slot {} of down data "
