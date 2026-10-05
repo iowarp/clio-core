@@ -3019,7 +3019,9 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
       // completes with the node-lost code; sent again it routes to the
       // stand-in, which serves it. Only after the retries is it EIO.
       int grc = 0;
-      for (int attempt = 0;; ++attempt) {
+      const auto read_t0 = std::chrono::steady_clock::now();
+      int attempt = 0;
+      for (;; ++attempt) {
         auto g = cte->AsyncGetBlobDefer(
             handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
             buf + done);
@@ -3031,6 +3033,22 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
         }
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kReadNodeLostRetryMs));
+      }
+      if (attempt > 0) {
+        // Where a slow failing read spent its time (#1169): how many
+        // node-lost answers it retried and what it ended with. Rate-limited:
+        // with a node down every page read of that node lands here.
+        static std::atomic<clio::run::u64> logged{0};
+        const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
+        if (k < 8 || k % 256 == 0) {
+          const double ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - read_t0)
+                                .count();
+          HLOG(kWarning, "clio_cte_fuse: read of tag {}.{} page {} got the "
+               "node-lost code {} time(s) over {} ms; final rc {} ({} such "
+               "reads so far)", handle->tag.major_, handle->tag.minor_,
+               clio::cte::filesystem::PageName(cur), attempt, ms, grc, k + 1);
+        }
       }
       // 0 = read, 1 = the page does not exist (a hole: the pre-zeroed
       // buffer is the right answer). Anything else -- above all the
