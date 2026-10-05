@@ -711,6 +711,14 @@ def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
         # whole on a re-read was a bad READ (stored data intact), one that is
         # still torn is bad STORED data (#1124).
         _reread_note(ctx, nmx, path, d['block'], [reader, (reader + 1) % n])
+        # The tag and page, so the runtimes' [copy-read] / [COH] lines for
+        # exactly this blob can be found afterwards (#1164): which copy --
+        # local cache, owner primary, remote copy -- served the torn bytes.
+        st = (ctx.call(reader, 'stat', path=path).get('ret') or {})
+        ino = st.get('ino', 0) or 0
+        ctx.note(f'{nmx} tag={ino >> 32}.{ino & 0xffffffff} corrupt block '
+                 f'{d["block"]} is in page {int(d["block"]) * 4096 >> 20} '
+                 f'(reader node{reader}; match [copy-read]/[COH] lines)')
       foreign = got.get('foreign') or {}
       if foreign:
         ctx.note(f'{nmx} FOREIGN blocks {when} hold [file id, block, writer, '
