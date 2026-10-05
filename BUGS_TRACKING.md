@@ -79,7 +79,7 @@ Process per bug, oldest created-date first:
 | 1100 | 2026-10-01 | Windows bdevs allocate up front (no lazy allocation) | pending | jaime-issues lead (local, uncommitted) |
 | 1156 | 2026-10-04 | safe_bdev disk-fault tests fail on macOS (rc=2, 0 bytes) | pending | |
 | 1159 | 2026-10-04 | clio-fs small-file create rate falls 11x (1→6 nodes) | pending | |
-| 1160 | 2026-10-04 | safe_bdev: 68-byte inode write waits behind 1 MiB stripes | pending | |
+| 1160 | 2026-10-04 | safe_bdev: 68-byte inode write waits behind 1 MiB stripes | **fixed upstream** | Commit 5806605ca ("safe_bdev: a write's parity update is batched... (#1160)"), already on this branch's base (origin/dev tip, merged hours before this session) — batches GatherSurvivors/ReadReplacedBytes/DeltaEncodeStripe/StoreDegradedParity into single round trips instead of per-row serial ones. No further code change needed here; issue just needs closing on GitHub once labeling access exists. |
 | 1167 | 2026-10-05 | CTE core put refills lost range, stays marked lost | pending | newest bug, filed the day before this session |
 
 **Note on "leads":** branch names and the jaime-issues commit log are starting
