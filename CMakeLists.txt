@@ -1057,6 +1057,8 @@ endif()
 # Poco and nlohmann_json (optional - for CAE Globus support and the Google
 # Cloud Storage bdev adapter, which uses Poco::Net for HTTPS + Poco::JSON).
 find_package(Poco COMPONENTS Net NetSSL Crypto JSON QUIET)
+include(ClioCheckPocoAbi)
+clio_check_poco_abi()
 find_package(nlohmann_json QUIET)
 if(NOT nlohmann_json_FOUND)
   include(FetchContent)
