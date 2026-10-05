@@ -1185,7 +1185,11 @@ struct BlobInfo {
   // records the lost range here as [GetTotalSize(), GetTotalSize() +
   // lost_bytes_). A read into it is an error, not zeros; a put that rewrites
   // it from the front shrinks it (NoteWritten). Runtime-only, not persisted.
+  // The range's start is kept explicitly (#1167): the size cache grows as
+  // puts land, so deriving the start from it after a put moved the loss to
+  // the new end instead of retiring what the put rewrote.
   clio::run::u64 lost_bytes_ = 0;
+  clio::run::u64 lost_from_ = 0;
   // Monotonic counter bumped by EVERY mutation of blocks_ (issue #817). It is
   // copied into ShmBlobRecord::placement_gen_, which a client reads before and
   // after copying a payload out of shared memory: if it moved, the bytes may
@@ -1402,6 +1406,7 @@ struct BlobInfo {
         read_state_(0),  // ...and has no readers pinned
         total_size_cache_(other.total_size_cache_),
         lost_bytes_(other.lost_bytes_),
+        lost_from_(other.lost_from_),
         placement_gen_(other.placement_gen_),
         content_seq_(other.content_seq_) {
     prealloc_lock_.Init();
@@ -1426,6 +1431,7 @@ struct BlobInfo {
       preallocated_size_ = other.preallocated_size_;
       total_size_cache_ = other.total_size_cache_;
       lost_bytes_ = other.lost_bytes_;
+      lost_from_ = other.lost_from_;
       placement_gen_ = other.placement_gen_;
       content_seq_ = other.content_seq_;
     }
@@ -1481,31 +1487,63 @@ struct BlobInfo {
   CTP_CROSS_FUN bool ReadTouchesLost(clio::run::u64 offset,
                                      clio::run::u64 size) const {
     if (lost_bytes_ == 0 || size == 0) return false;
-    const clio::run::u64 lost_from = total_size_cache_;
-    return offset < lost_from + lost_bytes_ && offset + size > lost_from;
+    return offset < lost_from_ + lost_bytes_ && offset + size > lost_from_;
+  }
+
+  /**
+   * The blob's logical size: what is stored, or the end of the lost range
+   * when a restart took bytes past what is stored (#1163, #1167).
+   * @return bytes the blob holds or lost
+   */
+  CTP_CROSS_FUN clio::run::u64 LogicalSize() const {
+    const clio::run::u64 lost_end = lost_from_ + lost_bytes_;
+    return lost_end > total_size_cache_ ? lost_end : total_size_cache_;
+  }
+
+  /**
+   * Record what a restart lost: the blocks_ prefix that survived is in
+   * place and the size cache current; `lost` bytes after it are gone.
+   * @param lost bytes lost after the stored prefix
+   */
+  CTP_CROSS_FUN void SetRestoreLoss(clio::run::u64 lost) {
+    lost_bytes_ = lost;
+    lost_from_ = total_size_cache_;
   }
 
   /**
    * A put landed on [offset, offset+size): whatever it rewrote of the lost
-   * range (from its front) is no longer lost. Call after the blocks are in
-   * place and the size cache is current.
+   * range from its front is no longer lost. A write that lands inside the
+   * range without covering its front leaves it (a read there still fails:
+   * conservative). Call after the blocks are in place.
    * @param offset first byte written
    * @param size bytes written
    */
   CTP_CROSS_FUN void NoteWritten(clio::run::u64 offset, clio::run::u64 size) {
-    if (lost_bytes_ == 0) return;
-    // The write extended the blob through (part of) the lost range: the new
-    // size is where the loss now starts; what the write covered is gone.
+    if (lost_bytes_ == 0 || size == 0) return;
     const clio::run::u64 end = offset + size;
-    const clio::run::u64 old_lost_end = total_size_cache_ + lost_bytes_;
-    if (end >= old_lost_end) {
+    const clio::run::u64 lost_end = lost_from_ + lost_bytes_;
+    if (offset > lost_from_ || end <= lost_from_) return;
+    if (end >= lost_end) {
       lost_bytes_ = 0;
-    } else if (end > total_size_cache_) {
-      lost_bytes_ = old_lost_end - end;
-    } else if (total_size_cache_ >= old_lost_end) {
-      lost_bytes_ = 0;  // the blob grew past the whole lost range
+      lost_from_ = 0;
     } else {
-      lost_bytes_ = old_lost_end - total_size_cache_;
+      lost_from_ = end;
+      lost_bytes_ = lost_end - end;
+    }
+  }
+
+  /**
+   * The blob was cut to `new_size`: lost bytes at or past it are discarded
+   * with the rest, not lost any more.
+   * @param new_size the size after the truncate
+   */
+  CTP_CROSS_FUN void NoteTruncated(clio::run::u64 new_size) {
+    if (lost_bytes_ == 0) return;
+    if (new_size <= lost_from_) {
+      lost_bytes_ = 0;
+      lost_from_ = 0;
+    } else if (new_size < lost_from_ + lost_bytes_) {
+      lost_bytes_ = new_size - lost_from_;
     }
   }
 

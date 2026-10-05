@@ -8217,7 +8217,7 @@ void Runtime::RestoreMetadataFromLog() {
       // post-restart reads/rebuilds see empty blobs. The WAL-replay path
       // below already did this; the snapshot path forgot.
       blob_info.RecomputeTotalSize();
-      blob_info.lost_bytes_ = snap_lost_bytes;
+      blob_info.SetRestoreLoss(snap_lost_bytes);
       if (snap_lost_bytes != 0) {
         // As in WAL replay: what a restart lost (#1147, #1163), summarized.
         NoteRestoreLoss(snap_lost_bytes);
@@ -8738,7 +8738,7 @@ void Runtime::ApplyWalExtendBlob(const std::vector<char> &payload,
       blob_info_ptr->blocks_.push_back(block);
     }
     blob_info_ptr->RecomputeTotalSize();  // blocks_ rebuilt: resync cache
-    blob_info_ptr->lost_bytes_ = lost_bytes;
+    blob_info_ptr->SetRestoreLoss(lost_bytes);
     if (lost_bytes != 0) {
       // Part (or all) of the blob lived on a volatile tier: it comes back
       // SHORT or EMPTY, and reads into the lost range fail rather than
@@ -10127,6 +10127,7 @@ clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 ne
   // The kept blocks span exactly [0, new_size) (the boundary block was trimmed),
   // so the O(1) size cache is precisely new_size.
   blob_info.total_size_cache_ = new_size;
+  blob_info.NoteTruncated(new_size);  // lost bytes past the cut are discarded
 
   // Free the dropped blocks, grouped by pool, and credit remaining_space_
   // (mirrors FreeAllBlobBlocks).
@@ -11050,8 +11051,9 @@ clio::run::TaskResume Runtime::GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask
       // through the lost range -- which fails and is served from a replica
       // -- rather than build a shorter copy that it then believes complete
       // (#1164). The split is reported so a heal can see what is stored.
-      task->size_ = blob_info_ptr->GetTotalSize() + blob_info_ptr->lost_bytes_;
-      task->lost_bytes_ = blob_info_ptr->lost_bytes_;
+      task->size_ = blob_info_ptr->LogicalSize();
+      task->lost_bytes_ =
+          blob_info_ptr->LogicalSize() - blob_info_ptr->GetTotalSize();
     }
 
     // Step 3: Update timestamps and log telemetry

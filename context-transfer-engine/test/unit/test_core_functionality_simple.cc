@@ -374,6 +374,63 @@ TEST_CASE("Blob Information Structure", "[cte][core][blob][info]") {
 }
 
 /**
+ * Test Case: BlobInfo lost-range bookkeeping (#1163, #1167)
+ *
+ * A restart marks the bytes that lived on a volatile tier as lost. A put
+ * that rewrites the range from its front retires what it covered -- also
+ * when the size cache was already advanced by the put (#1167: the loss used
+ * to move to the new end, and a 1 MiB page reported a 2 MiB logical size).
+ */
+TEST_CASE("BlobInfo lost range bookkeeping", "[cte][core][blob][info][lost]") {
+  auto *fixture = ctp::Singleton<CTECoreTestFixture>::GetInstance();
+  (void)fixture;
+  clio::cte::core::BlobInfo b;
+
+  SECTION("a full rewrite after the size cache grew retires the whole loss") {
+    b.total_size_cache_ = 0;
+    b.SetRestoreLoss(1046032);  // the restart kept nothing of 1046032 bytes
+    REQUIRE(b.LogicalSize() == 1046032);
+    REQUIRE(b.ReadTouchesLost(0, 4096));
+    b.total_size_cache_ = 1048576;  // the put placed its blocks first
+    b.NoteWritten(0, 1048576);
+    REQUIRE(b.lost_bytes_ == 0);
+    REQUIRE(b.LogicalSize() == 1048576);
+    REQUIRE_FALSE(b.ReadTouchesLost(1044480, 4096));
+  }
+
+  SECTION("a refill from the front shrinks the range; one inside leaves it") {
+    b.total_size_cache_ = 4096;
+    b.SetRestoreLoss(8192);  // lost [4096, 12288)
+    REQUIRE(b.LogicalSize() == 12288);
+    b.total_size_cache_ = 8192;
+    b.NoteWritten(4096, 4096);
+    REQUIRE(b.lost_from_ == 8192);
+    REQUIRE(b.lost_bytes_ == 4096);
+    REQUIRE(b.LogicalSize() == 12288);
+    REQUIRE_FALSE(b.ReadTouchesLost(4096, 4096));
+    REQUIRE(b.ReadTouchesLost(8192, 100));
+    b.NoteWritten(10000, 100);  // not from the front: conservative
+    REQUIRE(b.lost_bytes_ == 4096);
+    b.NoteWritten(0, 20000);  // past the end: all gone
+    REQUIRE(b.lost_bytes_ == 0);
+  }
+
+  SECTION("a truncate drops the lost bytes it cuts away") {
+    b.total_size_cache_ = 4096;
+    b.SetRestoreLoss(8192);  // lost [4096, 12288)
+    b.total_size_cache_ = 4096;
+    b.NoteTruncated(10000);
+    REQUIRE(b.lost_from_ == 4096);
+    REQUIRE(b.lost_bytes_ == 5904);
+    REQUIRE(b.LogicalSize() == 10000);
+    b.total_size_cache_ = 2048;
+    b.NoteTruncated(2048);
+    REQUIRE(b.lost_bytes_ == 0);
+    REQUIRE(b.LogicalSize() == 2048);
+  }
+}
+
+/**
  * Test Case: Task Structure Validation
  * 
  * This test verifies:
