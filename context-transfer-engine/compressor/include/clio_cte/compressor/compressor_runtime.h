@@ -53,6 +53,7 @@
 #include <clio_cte/compressor/models/distribution_classifier.h>
 #include <clio_ctp/compress/model/neuropress_nn_predictor.h>
 #include <clio_ctp/compress/model/neuropress_v2_predictor.h>
+#include <clio_ctp/compress/gpu_setting_codec.h>
 #include <clio_ctp/compress/model/hcompress_ccp_predictor.h>
 #include <clio_ctp/compress/model/xgb_tree_predictor.h>
 
@@ -69,6 +70,22 @@
 #include <mutex>
 
 namespace clio::cte::compressor {
+
+/** ctp::GpuSettingScratch slots (per thread) used by NeuroPress v2:
+ *  exploration keeps its two candidate payloads in A and B (swapped when a
+ *  cheaper one wins) and decodes into kExploreDecodeSlot; the primary's
+ *  decompress-time label decodes into kLabelScratchSlot. */
+constexpr int kExploreCompSlotA = 0;
+constexpr int kExploreCompSlotB = 1;
+constexpr int kExploreDecodeSlot = 2;
+constexpr int kLabelScratchSlot = 3;
+
+/**
+ * @brief Tell NeuroPress v2's selection which blob it is choosing for (the
+ * oracle baseline looks each chunk's setting up by blob name).
+ * @param blob the blob name of the chunk about to be selected
+ */
+void SetV2SelectionBlob(const std::string &blob);
 
 /**
  * Compression statistics predicted by AI models
@@ -607,6 +624,9 @@ private:
     double cost = 0.0;          ///< measured cost
     int measured = 0;           ///< alternatives actually compressed
     int trained = 0;            ///< TrainSetting steps applied
+    double train_ms = 0.0;      ///< host wall ms inside TrainSetting
+    double gpu_ms = 0.0;        ///< GPU ms (CUDA events): alternatives'
+                                ///< compress + decompress
   };
 
   /**
@@ -617,7 +637,10 @@ private:
    * @param chunk_size   its size
    * @param stats        the v2 ranking
    * @param primary_setting the setting the primary ran
-   * @param primary_cost the primary's measured cost
+   * @param primary_raw  the primary did not shrink the chunk and was stored
+   *                     raw; its setting is then measured here as well (not
+   *                     counted in K)
+   * @param primary_cost the primary's measured cost (of what was stored)
    * @param measure_dt   measure each alternative's decompress time too
    * @param features     the chunk's v2 inputs
    */
@@ -625,7 +648,7 @@ private:
       const std::string& blob, double bw,
       const void* chunk, clio::run::u64 chunk_size,
       const std::vector<CompressionStats>& stats, int primary_setting,
-      double primary_cost, bool measure_dt,
+      bool primary_raw, double primary_cost, bool measure_dt,
       const ctp::compress::model::NeuroPressV2Features& features);
 
   // Compression telemetry ring buffer for performance monitoring

@@ -766,21 +766,26 @@ std::vector<float> SettingTestField(size_t n) {
 }
 
 /**
- * Compress then decompress host data with one setting through device or host
+ * Compress then decompress bytes with one setting through device or host
  * buffers, and require a bit-exact result.
+ * @param index  setting index
+ * @param orig   the bytes (any length, not only whole words)
+ * @param device true for device buffers, false for host buffers
  * @return the compressed bytes
  */
-std::vector<uint8_t> RoundTrip(int index, const std::vector<float> &orig,
-                               bool device) {
-  const size_t raw = orig.size() * sizeof(float);
+std::vector<uint8_t> RoundTripBytes(int index, const std::vector<uint8_t> &orig,
+                                    bool device) {
+  const size_t raw = orig.size();
   auto codec = ctp::CompressionFactory::GetGpuSetting(index);
   REQUIRE(codec != nullptr);
   size_t cap = codec->MaxCompressedSize(raw);
   REQUIRE(cap > 0);
   std::vector<uint8_t> comp(cap);
-  std::vector<float> back(orig.size(), -1.0f);
+  std::vector<uint8_t> back(raw, 0xA5);
   size_t comp_size = cap;
   size_t back_size = raw;
+  // Under one whole word there is no codec call to time (all tail).
+  const bool timed = raw >= 8;
   if (device) {
     void *d_in = nullptr, *d_comp = nullptr, *d_out = nullptr;
     REQUIRE(cudaMalloc(&d_in, raw) == cudaSuccess);
@@ -789,9 +794,9 @@ std::vector<uint8_t> RoundTrip(int index, const std::vector<float> &orig,
     REQUIRE(cudaMemcpy(d_in, orig.data(), raw, cudaMemcpyHostToDevice) ==
             cudaSuccess);
     REQUIRE(codec->Compress(d_comp, comp_size, d_in, raw));
-    REQUIRE(ctp::LastCodecKernelMs() >= 0.0);
+    if (timed) REQUIRE(ctp::LastCodecKernelMs() >= 0.0);
     REQUIRE(codec->Decompress(d_out, back_size, d_comp, comp_size));
-    REQUIRE(ctp::LastCodecKernelMs() >= 0.0);
+    if (timed) REQUIRE(ctp::LastCodecKernelMs() >= 0.0);
     REQUIRE(cudaMemcpy(comp.data(), d_comp, comp_size,
                        cudaMemcpyDeviceToHost) == cudaSuccess);
     REQUIRE(cudaMemcpy(back.data(), d_out, raw, cudaMemcpyDeviceToHost) ==
@@ -800,7 +805,7 @@ std::vector<uint8_t> RoundTrip(int index, const std::vector<float> &orig,
     cudaFree(d_comp);
     cudaFree(d_out);
   } else {
-    std::vector<float> in = orig;
+    std::vector<uint8_t> in = orig;
     REQUIRE(codec->Compress(comp.data(), comp_size, in.data(), raw));
     REQUIRE(codec->Decompress(back.data(), back_size, comp.data(), comp_size));
   }
@@ -809,6 +814,17 @@ std::vector<uint8_t> RoundTrip(int index, const std::vector<float> &orig,
   REQUIRE(std::memcmp(back.data(), orig.data(), raw) == 0);
   comp.resize(comp_size);
   return comp;
+}
+
+/**
+ * RoundTripBytes on a float field's bytes.
+ * @return the compressed bytes
+ */
+std::vector<uint8_t> RoundTrip(int index, const std::vector<float> &orig,
+                               bool device) {
+  const auto *b = reinterpret_cast<const uint8_t *>(orig.data());
+  return RoundTripBytes(
+      index, std::vector<uint8_t>(b, b + orig.size() * sizeof(float)), device);
 }
 
 }  // namespace
@@ -859,6 +875,37 @@ TEST_CASE("TestGpuSettingCodec", "[gpu_setting]") {
       std::printf("  [gpu_setting] %2d %-50s %8zu B  ratio %7.3f\n", i,
                   ctp::GpuSettingSpec(i), dev.size(),
                   static_cast<double>(field.size() * 4) / dev.size());
+    }
+  }
+
+  // A chunk need not be whole words: the last chunk of an array has any
+  // length (genomics u8 qualities ended at 3,186,145 B). The partial last
+  // word must survive every setting, typed ones (int, float16, float words)
+  // included.
+  PAGE_DIVIDE("sizes that are not whole words round-trip bit-exactly") {
+    const auto *fb = reinterpret_cast<const uint8_t *>(field.data());
+    for (size_t extra : {1u, 3u, 5u, 7u}) {
+      for (size_t n : {size_t{1} << 20, size_t{1} << 16}) {
+        std::vector<uint8_t> bytes(fb, fb + n - 8);
+        for (size_t k = 0; k < 8 + extra; ++k) {
+          bytes.push_back(static_cast<uint8_t>(0x3C + 17 * k));
+        }
+        for (int i = 0; i < ctp::kGpuSettingCount; ++i) {
+          INFO("setting " << i << ": " << ctp::GpuSettingSpec(i) << ", "
+                          << bytes.size() << " B");
+          RoundTripBytes(i, bytes, true);
+          RoundTripBytes(i, bytes, false);
+        }
+      }
+    }
+    for (size_t n : {1u, 5u, 7u}) {  // under one word: all tail
+      const std::vector<uint8_t> tiny(fb, fb + n);
+      for (int i = 0; i < ctp::kGpuSettingCount; ++i) {
+        INFO("setting " << i << ": " << ctp::GpuSettingSpec(i) << ", " << n
+                        << " B");
+        RoundTripBytes(i, tiny, true);
+        RoundTripBytes(i, tiny, false);
+      }
     }
   }
 }

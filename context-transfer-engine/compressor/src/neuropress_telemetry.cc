@@ -569,7 +569,8 @@ PhaseLog *PhaseLogInstance() {
                      "nn_batch_chunks,choice_ms,factory_ms,compress_ms,"
                      "decompress_ms,io_ms,io_start_ns,preproc_ms,h2d_ms,h2d_start_ns,wall_ms,other_ms,"
                      "lib,reused,explore_ms,sgd_ms,explored,sgd_updates,"
-                     "stored_bytes,convert_ms\n");
+                     "stored_bytes,convert_ms,label_ms,nn_gpu_ms,sgd_gpu_ms,"
+                     "label_gpu_ms,explore_gpu_ms\n");
       }
     }
     return l;
@@ -607,6 +608,11 @@ void MergePhases(ChunkPhases *a, const ChunkPhases &b) {
   if (b.convert_ms > 0.0) a->convert_ms += b.convert_ms;
   a->explore_ms += b.explore_ms;
   a->sgd_ms += b.sgd_ms;
+  a->label_ms += b.label_ms;
+  add(&a->nn_gpu_ms, b.nn_gpu_ms);
+  a->sgd_gpu_ms += b.sgd_gpu_ms;
+  a->label_gpu_ms += b.label_gpu_ms;
+  a->explore_gpu_ms += b.explore_gpu_ms;
   a->explored += b.explored;
   a->sgd_updates += b.sgd_updates;
 }
@@ -621,9 +627,10 @@ bool PhaseLogEnabled() {
 }
 
 void RecordSelectionPhases(double stats_ms, double nn_ms, double choice_ms,
-                           bool reused, double convert_ms) {
+                           bool reused, double convert_ms, double nn_gpu_ms) {
   ChunkPhases p;
   p.convert_ms = convert_ms;
+  p.nn_gpu_ms = nn_gpu_ms;
   p.stats_ms = stats_ms;
   p.nn_ms = nn_ms;
   p.choice_ms = choice_ms;
@@ -690,14 +697,14 @@ void LogChunkPhases(const std::string &blob_name, const char *path,
   double covered = 0.0;
   for (double v : {p.stats_ms, p.nn_ms, p.choice_ms, p.factory_ms,
                    p.compress_ms, p.decompress_ms, p.io_ms, p.preproc_ms,
-                   p.h2d_ms, p.explore_ms, p.sgd_ms}) {
+                   p.h2d_ms, p.explore_ms, p.sgd_ms, p.label_ms}) {
     if (v > 0.0) covered += v;
   }
   std::lock_guard<std::mutex> lock(log->mutex);
   std::fprintf(
       log->fp,
       "%ld,%s,%s,%zu,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%.6f,%.6f,%d,%s,%.6f,%.6f,"
-      "%d,%d,%zu,%.6f\n",
+      "%d,%d,%zu,%.6f,%.6f,%s,%.6f,%.6f,%.6f\n",
       log->seq++, blob_name.c_str(), path, chunk_bytes,
       cell(p.stats_ms, write).c_str(), cell(p.nn_ms, write).c_str(),
       write ? "1" : "",
@@ -709,7 +716,9 @@ void LogChunkPhases(const std::string &blob_name, const char *path,
       cell(p.h2d_start_ns, true).c_str(),
       wall_ms - p.convert_ms, wall_ms - p.convert_ms - covered, lib,
       (write && p.reused >= 0) ? (p.reused ? "1" : "0") : "", p.explore_ms,
-      p.sgd_ms, p.explored, p.sgd_updates, stored_bytes, p.convert_ms);
+      p.sgd_ms, p.explored, p.sgd_updates, stored_bytes, p.convert_ms,
+      p.label_ms, cell(p.nn_gpu_ms, write).c_str(), p.sgd_gpu_ms,
+      p.label_gpu_ms, p.explore_gpu_ms);
   std::fflush(log->fp);
 }
 

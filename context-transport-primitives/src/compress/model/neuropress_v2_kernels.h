@@ -122,16 +122,37 @@ float *ConvertToFloat32(const void *in, size_t n, int dtype, void *stream,
  * @param stream   cudaStream_t for the update
  * @param done     cudaEvent_t recorded after the update
  * @param d_abs_err device double receiving mean |log error| before the step
+ * @param t_start  optional timing cudaEvent_t recorded just before the kernel
+ * @param t_stop   optional timing cudaEvent_t recorded just after it
  * @return false on a launch error
  */
 bool TrainOnDevice(float *d_params, const NetDesc &desc, const TrainArgs &args,
-                   void *stream, void *done, double *d_abs_err);
+                   void *stream, void *done, double *d_abs_err,
+                   void *t_start = nullptr, void *t_stop = nullptr);
 
 /** @return a new non-blocking stream and an event (nullptr on failure). */
 bool CreateStreamAndEvent(void **stream, void **event);
 
 /** Destroy what CreateStreamAndEvent made (nullptr is fine). */
 void DestroyStreamAndEvent(void *stream, void *event);
+
+/** @return a new timing-enabled cudaEvent_t, or nullptr on failure. */
+void *CreateTimingEvent();
+
+/** Destroy an event from CreateTimingEvent (nullptr is fine). */
+void DestroyEvent(void *event);
+
+/** Record `event` on `stream`; false on error. */
+bool RecordEvent(void *event, void *stream);
+
+/** @return true once `event` has completed (never waits). */
+bool EventDone(void *event);
+
+/** Wait on the host until `event` completes; false on error. */
+bool EventSync(void *event);
+
+/** @return GPU ms between two completed timing events, or -1 on error. */
+double EventElapsedMs(void *start, void *stop);
 
 /** Make `stream` wait for `event` (no host synchronisation). */
 bool StreamWaitEvent(void *stream, void *event);

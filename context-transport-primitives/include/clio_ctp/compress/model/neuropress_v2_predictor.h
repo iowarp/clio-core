@@ -278,7 +278,33 @@ class NeuroPressV2Predictor {
                     double decomp_ms, double ratio, double lr,
                     double *abs_err = nullptr);
 
+  /**
+   * @brief GPU time of the updates that completed since the last call.
+   *
+   * Each update kernel is bracketed by CUDA events on the update stream; this
+   * collects the finished ones without waiting, so an update still running
+   * is counted by a later call.
+   *
+   * @return GPU milliseconds (CUDA events)
+   */
+  double TakeTrainGpuMs();
+
+  /**
+   * @brief Start a GPU timer (CUDA events, per thread) on `stream`.
+   * @param stream cudaStream_t the timed work is enqueued on
+   */
+  static void GpuTimerStart(void *stream);
+
+  /**
+   * @brief Stop the per-thread GPU timer on `stream` and wait for it.
+   * @param stream the same cudaStream_t as GpuTimerStart
+   * @return GPU milliseconds since GpuTimerStart, or -1 on error
+   */
+  static double GpuTimerStopMs(void *stream);
+
  private:
+  /** Collect slot's update time into train_gpu_ms_ if it finished (or wait). */
+  void HarvestTimer(int slot, bool wait);
   /** Parse and validate a version-3 file into the host parameters. */
   bool ParseFile(const std::string &path);
   /** The network on the host (after SyncHost). */
@@ -310,6 +336,13 @@ class NeuroPressV2Predictor {
   void *train_event_ = nullptr;      ///< cudaEvent_t after the last update
   double *d_abs_err_ = nullptr;      ///< device slot for an update's error
   uint64_t updates_ = 0;
+  /** Ring of CUDA event pairs timing the update kernels (train_mutex_). */
+  static constexpr int kTimerSlots = 8;
+  void *t_start_[kTimerSlots] = {};
+  void *t_stop_[kTimerSlots] = {};
+  bool t_pending_[kTimerSlots] = {};
+  int t_next_ = 0;
+  double train_gpu_ms_ = 0.0;  ///< finished updates' GPU ms, not yet taken
 };
 
 }  // namespace ctp::compress::model

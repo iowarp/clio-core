@@ -84,6 +84,33 @@ int GpuSettingIndex(const std::string& spec);
  */
 bool GpuSettingAvailable(int index);
 
+/** Number of per-thread scratch buffers GpuSettingScratch() keeps. */
+constexpr int kGpuScratchSlots = 4;
+
+/**
+ * @brief A device buffer of at least `bytes`, owned by the calling thread and
+ * reused across calls.
+ *
+ * For measuring codecs without host copies: compress into one slot,
+ * decompress into another, and copy to the host only what must be kept. A
+ * slot only grows (its contents are lost when it does) and lives for the
+ * thread's lifetime. Slots are independent; the caller owns their meaning.
+ *
+ * @param slot  buffer index, 0 to kGpuScratchSlots - 1
+ * @param bytes minimum size in bytes
+ * @return device pointer, or nullptr on error or in a build without CUDA
+ */
+void* GpuSettingScratch(int slot, size_t bytes);
+
+/**
+ * @brief Copy bytes from device (or host) memory to host memory.
+ * @param dst   host destination
+ * @param src   device or host source
+ * @param bytes byte count
+ * @return true on success
+ */
+bool GpuSettingCopyToHost(void* dst, const void* src, size_t bytes);
+
 /**
  * @brief One GPU codec selected by a frozen setting index.
  *

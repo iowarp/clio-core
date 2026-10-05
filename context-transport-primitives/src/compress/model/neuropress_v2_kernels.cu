@@ -294,16 +294,58 @@ float *ConvertToFloat32(const void *in, size_t n, int dtype, void *stream,
 }
 
 bool TrainOnDevice(float *d_params, const NetDesc &desc, const TrainArgs &args,
-                   void *stream, void *done, double *d_abs_err) {
+                   void *stream, void *done, double *d_abs_err, void *t_start,
+                   void *t_stop) {
   if (desc.n_layers > kMaxLayers || args.setting < 0 ||
       args.setting >= desc.n_settings) {
     return false;
   }
   auto s = static_cast<cudaStream_t>(stream);
+  if (t_start != nullptr) cudaEventRecord(static_cast<cudaEvent_t>(t_start), s);
   TrainKernel<<<1, kThreads, 0, s>>>(d_params, desc, args, d_abs_err);
   if (cudaGetLastError() != cudaSuccess) return false;
+  if (t_stop != nullptr) cudaEventRecord(static_cast<cudaEvent_t>(t_stop), s);
   return done == nullptr ||
          cudaEventRecord(static_cast<cudaEvent_t>(done), s) == cudaSuccess;
+}
+
+void *CreateTimingEvent() {
+  cudaEvent_t e = nullptr;
+  if (cudaEventCreate(&e) != cudaSuccess) return nullptr;
+  return e;
+}
+
+void DestroyEvent(void *event) {
+  if (event != nullptr) cudaEventDestroy(static_cast<cudaEvent_t>(event));
+}
+
+bool RecordEvent(void *event, void *stream) {
+  return event != nullptr &&
+         cudaEventRecord(static_cast<cudaEvent_t>(event),
+                         static_cast<cudaStream_t>(stream)) == cudaSuccess;
+}
+
+bool EventDone(void *event) {
+  if (event == nullptr) return false;
+  const cudaError_t rc = cudaEventQuery(static_cast<cudaEvent_t>(event));
+  if (rc == cudaErrorNotReady) return false;
+  return rc == cudaSuccess;
+}
+
+bool EventSync(void *event) {
+  return event != nullptr &&
+         cudaEventSynchronize(static_cast<cudaEvent_t>(event)) == cudaSuccess;
+}
+
+double EventElapsedMs(void *start, void *stop) {
+  float ms = 0.0f;
+  if (start == nullptr || stop == nullptr ||
+      cudaEventElapsedTime(&ms, static_cast<cudaEvent_t>(start),
+                           static_cast<cudaEvent_t>(stop)) != cudaSuccess) {
+    cudaGetLastError();
+    return -1.0;
+  }
+  return static_cast<double>(ms);
 }
 
 bool CreateStreamAndEvent(void **stream, void **event) {

@@ -855,11 +855,19 @@ const uint8_t *DeviceInput(const void *in, size_t n, cudaStream_t s,
 }
 
 /**
- * Compress n bytes with one setting.
+ * Bytes past the last multiple of this are kept raw after the payload. The
+ * typed codecs (int, float16 and float words, ndzip, FPcompress) only cover
+ * whole words, so a chunk whose size is not a multiple of the word would
+ * lose or corrupt its partial last word; 8 covers every word size here.
+ */
+constexpr size_t kTailAlign = 8;
+
+/**
+ * Compress n bytes (a multiple of kTailAlign) with one setting.
  * @return compressed bytes written to output (0 never: failures throw)
  */
-size_t RunCompress(int index, void *output, size_t cap, const void *input,
-                   size_t n) {
+size_t CompressBody(int index, void *output, size_t cap, const void *input,
+                    size_t n) {
   Codec *c = CachedCodec(index);
   if (!c->Accepts(n)) throw CodecError("input size not accepted");
   const cudaStream_t s = c->stream();
@@ -893,9 +901,12 @@ size_t RunCompress(int index, void *output, size_t cap, const void *input,
   return comp;
 }
 
-/** Decompress comp bytes into exactly n bytes with one setting. */
-void RunDecompress(int index, void *output, size_t n, const void *input,
-                   size_t comp) {
+/**
+ * Decompress comp bytes into exactly n bytes (a multiple of kTailAlign) with
+ * one setting.
+ */
+void DecompressBody(int index, void *output, size_t n, const void *input,
+                    size_t comp) {
   Codec *c = CachedCodec(index);
   const cudaStream_t s = c->stream();
   DeviceBuffer in_tmp, out_tmp;
@@ -923,6 +934,55 @@ void RunDecompress(int index, void *output, size_t n, const void *input,
   GSC_CHECK(cudaStreamSynchronize(s));
   if (!c->DecompressOk()) throw CodecError("decompression failed");
   if (!direct) GSC_CHECK(cudaMemcpy(output, d_out, n, cudaMemcpyDefault));
+}
+
+/**
+ * Compress n bytes with one setting: the whole-word body through the
+ * setting, then the n % kTailAlign tail bytes copied raw after it.
+ * @param index  setting index
+ * @param output destination (host or device), cap bytes
+ * @param cap    capacity of output
+ * @param input  source (host or device), n bytes
+ * @param n      bytes to compress
+ * @return payload bytes written (body payload + tail)
+ */
+size_t RunCompress(int index, void *output, size_t cap, const void *input,
+                   size_t n) {
+  const size_t tail = n % kTailAlign;
+  const size_t body = n - tail;
+  if (cap < tail) throw CodecError("output too small for the tail");
+  const size_t comp =
+      body > 0 ? CompressBody(index, output, cap - tail, input, body) : 0;
+  if (tail > 0) {
+    GSC_CHECK(cudaMemcpy(static_cast<uint8_t *>(output) + comp,
+                         static_cast<const uint8_t *>(input) + body, tail,
+                         cudaMemcpyDefault));
+  }
+  return comp + tail;
+}
+
+/**
+ * Decompress a RunCompress payload of comp bytes into exactly n bytes: the
+ * body through the setting, then the raw tail (its length is n % kTailAlign).
+ * @param index  setting index
+ * @param output destination (host or device), n bytes
+ * @param n      original size
+ * @param input  payload (host or device)
+ * @param comp   payload bytes
+ */
+void RunDecompress(int index, void *output, size_t n, const void *input,
+                   size_t comp) {
+  const size_t tail = n % kTailAlign;
+  const size_t body = n - tail;
+  if (comp < tail || (body > 0 && comp == tail)) {
+    throw CodecError("payload shorter than its tail");
+  }
+  if (body > 0) DecompressBody(index, output, body, input, comp - tail);
+  if (tail > 0) {
+    GSC_CHECK(cudaMemcpy(static_cast<uint8_t *>(output) + body,
+                         static_cast<const uint8_t *>(input) + (comp - tail),
+                         tail, cudaMemcpyDefault));
+  }
 }
 
 #undef GSC_CHECK
@@ -953,6 +1013,49 @@ bool GpuSettingAvailable(int index) {
   if (b == "spspeed" || b == "spratio") return CTP_ENABLE_FPCOMPRESS != 0;
   return CTP_ENABLE_NVCOMP != 0;
 #else
+  return false;
+#endif
+}
+
+void *GpuSettingScratch(int slot, size_t bytes) {
+#if CTP_ENABLE_CUDA
+  if (slot < 0 || slot >= kGpuScratchSlots) return nullptr;
+  // Per thread, grow-only, never freed: freeing in a thread-exit destructor
+  // races CUDA's own teardown, and the buffers are a few chunk sizes.
+  thread_local void *ptr[kGpuScratchSlots] = {};
+  thread_local size_t cap[kGpuScratchSlots] = {};
+  const size_t want = bytes > 0 ? bytes : 1;
+  if (cap[slot] >= want) return ptr[slot];
+  if (ptr[slot] != nullptr) cudaFree(ptr[slot]);
+  ptr[slot] = nullptr;
+  cap[slot] = 0;
+  if (cudaMalloc(&ptr[slot], want) != cudaSuccess) {
+    cudaGetLastError();
+    ptr[slot] = nullptr;
+    return nullptr;
+  }
+  cap[slot] = want;
+  return ptr[slot];
+#else
+  (void)slot;
+  (void)bytes;
+  return nullptr;
+#endif
+}
+
+bool GpuSettingCopyToHost(void *dst, const void *src, size_t bytes) {
+#if CTP_ENABLE_CUDA
+  if (bytes == 0) return true;
+  if (dst == nullptr || src == nullptr) return false;
+  if (cudaMemcpy(dst, src, bytes, cudaMemcpyDefault) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  return true;
+#else
+  (void)dst;
+  (void)src;
+  (void)bytes;
   return false;
 #endif
 }
@@ -1011,7 +1114,10 @@ size_t GpuSettingCodec::MaxCompressedSize(size_t input_size) {
 #if CTP_ENABLE_CUDA
   if (!GpuSettingAvailable(index_)) return 0;
   try {
-    return CachedCodec(index_)->Bound(input_size);
+    // The body's bound plus the raw tail (RunCompress).
+    const size_t tail = input_size % kTailAlign;
+    const size_t body = input_size - tail;
+    return (body > 0 ? CachedCodec(index_)->Bound(body) : 0) + tail;
   } catch (const std::exception &) {
     return 0;
   }

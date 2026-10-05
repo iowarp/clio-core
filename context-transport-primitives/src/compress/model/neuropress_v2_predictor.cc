@@ -119,6 +119,10 @@ NeuroPressV2Predictor::~NeuroPressV2Predictor() {
   v2::FreeDevice(d_available_);
   v2::FreeDevice(d_abs_err_);
   v2::DestroyStreamAndEvent(train_stream_, train_event_);
+  for (int i = 0; i < kTimerSlots; ++i) {
+    v2::DestroyEvent(t_start_[i]);
+    v2::DestroyEvent(t_stop_[i]);
+  }
 }
 
 std::string NeuroPressV2Predictor::ResolvePath(const std::string &path_or_dir) {
@@ -217,6 +221,10 @@ bool NeuroPressV2Predictor::Load(const std::string &path_or_dir) {
   if (train_stream_ == nullptr &&
       !v2::CreateStreamAndEvent(&train_stream_, &train_event_)) {
     return (error_ = "cannot create the GPU update stream"), false;
+  }
+  for (int k = 0; k < kTimerSlots; ++k) {
+    if (t_start_[k] == nullptr) t_start_[k] = v2::CreateTimingEvent();
+    if (t_stop_[k] == nullptr) t_stop_[k] = v2::CreateTimingEvent();
   }
   if (d_abs_err_ == nullptr) {
     const double zero = 0.0;
@@ -507,10 +515,15 @@ bool NeuroPressV2Predictor::TrainSetting(const NeuroPressV2Features &f,
   v2::NetDesc d;
   FillDesc(&d);
   std::lock_guard<std::mutex> lock(train_mutex_);
+  // A slot comes back after kTimerSlots updates; its update is long done.
+  const int slot = t_next_;
+  t_next_ = (t_next_ + 1) % kTimerSlots;
+  HarvestTimer(slot, /*wait=*/true);
   if (!v2::TrainOnDevice(d_params_, d, a, train_stream_, train_event_,
-                         d_abs_err_)) {
+                         d_abs_err_, t_start_[slot], t_stop_[slot])) {
     return false;
   }
+  t_pending_[slot] = t_start_[slot] != nullptr && t_stop_[slot] != nullptr;
   {
     std::lock_guard<std::mutex> host_lock(host_mutex_);
     host_dirty_ = true;
@@ -521,6 +534,52 @@ bool NeuroPressV2Predictor::TrainSetting(const NeuroPressV2Features &f,
     return false;
   }
   return true;
+}
+
+void NeuroPressV2Predictor::HarvestTimer(int slot, bool wait) {
+  if (!t_pending_[slot]) return;
+  if (!(wait ? v2::EventSync(t_stop_[slot]) : v2::EventDone(t_stop_[slot]))) {
+    return;
+  }
+  const double ms = v2::EventElapsedMs(t_start_[slot], t_stop_[slot]);
+  if (ms >= 0.0) train_gpu_ms_ += ms;
+  t_pending_[slot] = false;
+}
+
+double NeuroPressV2Predictor::TakeTrainGpuMs() {
+  std::lock_guard<std::mutex> lock(train_mutex_);
+  for (int k = 0; k < kTimerSlots; ++k) HarvestTimer(k, /*wait=*/false);
+  const double ms = train_gpu_ms_;
+  train_gpu_ms_ = 0.0;
+  return ms;
+}
+
+namespace {
+/** The per-thread event pair behind GpuTimerStart/GpuTimerStopMs. */
+struct ThreadGpuTimer {
+  void *start = nullptr;
+  void *stop = nullptr;
+  bool on = false;
+};
+ThreadGpuTimer &TimerOfThisThread() {
+  static thread_local ThreadGpuTimer t;
+  return t;
+}
+}  // namespace
+
+void NeuroPressV2Predictor::GpuTimerStart(void *stream) {
+  ThreadGpuTimer &t = TimerOfThisThread();
+  if (t.start == nullptr) t.start = v2::CreateTimingEvent();
+  if (t.stop == nullptr) t.stop = v2::CreateTimingEvent();
+  t.on = v2::RecordEvent(t.start, stream);
+}
+
+double NeuroPressV2Predictor::GpuTimerStopMs(void *stream) {
+  ThreadGpuTimer &t = TimerOfThisThread();
+  if (!t.on) return -1.0;
+  t.on = false;
+  if (!v2::RecordEvent(t.stop, stream) || !v2::EventSync(t.stop)) return -1.0;
+  return v2::EventElapsedMs(t.start, t.stop);
 }
 
 }  // namespace ctp::compress::model

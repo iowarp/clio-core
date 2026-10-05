@@ -210,13 +210,28 @@ struct ChunkPhases {
   /** NeuroPress v2: GPU (or host) ms spent converting the chunk to float32
    *  for its features. Kept OUT of every time: wall_ms is logged minus it. */
   double convert_ms = 0.0;
+  /** NeuroPress v2: host wall ms of decompressing the primary right after
+   *  compressing it, to measure its decompress time as a learning label
+   *  (CLIO_NEUROPRESS_EXPLORE_MEASURE_DT). Part of wall_ms. */
+  double label_ms = 0.0;
+  /** GPU time (CUDA events) of the same work, beside the host-wall fields:
+   *  nn_gpu_ms   v2 features + network + ranking (conversion excluded),
+   *  sgd_gpu_ms  v2 update kernels (collected once finished, so an update
+   *              still running is counted on a later chunk),
+   *  label_gpu_ms the decode in label_ms,
+   *  explore_gpu_ms compress + decompress of the explored alternatives. */
+  double nn_gpu_ms = -1.0;
+  double sgd_gpu_ms = 0.0;
+  double label_gpu_ms = 0.0;
+  double explore_gpu_ms = 0.0;
 };
 
 bool PhaseLogEnabled();
 
 /** Thread-local hand-off from the selection to DynamicSchedule. */
 void RecordSelectionPhases(double stats_ms, double nn_ms, double choice_ms,
-                           bool reused, double convert_ms = 0.0);
+                           bool reused, double convert_ms = 0.0,
+                           double nn_gpu_ms = -1.0);
 bool TakeSelectionPhases(ChunkPhases *out);
 
 /** Hand-off from Runtime::Compress, keyed by blob name; only chunks

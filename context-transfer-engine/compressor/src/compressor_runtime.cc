@@ -1461,6 +1461,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       np_reuse_ctx.error_bound = context.error_bound_;
       const bool np_reuse_on =
           np_reuse_ctx.slot != ctp::compress::preprocess::kNoLineageSlot;
+      SetV2SelectionBlob(task->blob_name_.str());
       stats =
           EstCompressionStats(chunk_data, chunk_size, context, &ranked_by_cost,
                               &sel_entropy, &sel_mad, &sel_second_deriv,
@@ -1785,18 +1786,28 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         context.actual_compression_ratio_ > 0.0) {
       RecordV2Decomp(task->blob_name_.str(), sel_v2_features, best_preset);
       bool v2_trained = false;
+      const auto v2_learn_t0 = std::chrono::steady_clock::now();
       const double v2_err = NeuroPressV2LearnPrimary(
           sel_v2_features, stats.front(), context, chunk_size, v2_bw,
           &v2_trained);
+      phases.sgd_ms += ms_since(v2_learn_t0);
       // The primary's measured outcome, for the exhaustive / explore log.
       const auto v2w = V2CostWeights(v2_bw);
       const bool v2_dt_measured = context.actual_decompress_time_ms_ > 0.0;
+      // The primary's codec did not shrink the chunk, so it was stored raw:
+      // what is stored costs only its I/O, and the setting itself has no
+      // measurement yet (exploration measures it).
+      const bool v2_primary_raw = context.compress_lib_ == 0;
       const double v2_primary_cost =
-          v2w.w_ct * context.actual_compress_time_ms_ +
-          v2w.w_dt * (v2_dt_measured ? context.actual_decompress_time_ms_
-                                     : stats.front().decompress_time_ms_) +
-          v2w.w_io * static_cast<double>(chunk_size) /
-              (context.actual_compression_ratio_ * v2w.bw_bytes_per_ms);
+          v2_primary_raw
+              ? v2w.w_io * static_cast<double>(chunk_size) / v2w.bw_bytes_per_ms
+              : v2w.w_ct * context.actual_compress_time_ms_ +
+                    v2w.w_dt * (v2_dt_measured
+                                    ? context.actual_decompress_time_ms_
+                                    : stats.front().decompress_time_ms_) +
+                    v2w.w_io * static_cast<double>(chunk_size) /
+                        (context.actual_compression_ratio_ *
+                         v2w.bw_bytes_per_ms);
       const int v2_primary_setting = best_preset;
       const double v2_primary_ct = context.actual_compress_time_ms_;
       const double v2_primary_dt =
@@ -1818,9 +1829,14 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         explore_ran = true;
         V2ExploreWinner win = NeuroPressV2Explore(
             task->blob_name_.str(), v2_bw, chunk_data, chunk_size, stats,
-            best_preset, v2_primary_cost, v2_dt_measured, sel_v2_features);
+            best_preset, v2_primary_raw, v2_primary_cost,
+            MeasureExploreDecompTime(), sel_v2_features);
         phases.explored += win.measured;
         phases.sgd_updates += win.trained;
+        // Its training is learning time, not exploration time.
+        phases.sgd_ms += win.train_ms;
+        phases.explore_gpu_ms += win.gpu_ms;
+        explore_inner_ms += win.train_ms;
         if (win.trained > 0) {
           np_sgd_epoch_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1886,6 +1902,29 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       LogV2Measured(task->blob_name_.str(), v2_bw, v2_primary_setting,
                     "primary", v2_primary_ct, v2_primary_dt, v2_primary_ratio,
                     v2_primary_cost, !stored_by_exploration);
+      // GPU time of the update kernels that have finished (CUDA events).
+      phases.sgd_gpu_ms += neuropress_v2_->TakeTrainGpuMs();
+    }
+    // ---- NeuroPress v2 picked storing raw: no codec ran, so there is nothing
+    // to learn from, but an exhaustive pass (best mode, or an exploration
+    // threshold of 0, i.e. explore every chunk) still measures every setting
+    // on the chunk for the per-chunk truth. The raw blob is already stored, so
+    // this is measurement only: against a primary cost of 0 no alternative
+    // wins, so none is adopted or logged as adopted.
+    if (NeuroPressV2Active(context) && !stats.empty() &&
+        task->return_code_ == 0 && best_lib == 0 &&
+        config_.neuropress_exploration_enabled_ &&
+        (config_.neuropress_best_mode_ ||
+         config_.neuropress_exploration_threshold_ <= 0)) {
+      explore_t0 = std::chrono::steady_clock::now();
+      explore_ran = true;
+      V2ExploreWinner win = NeuroPressV2Explore(
+          task->blob_name_.str(), v2_bw, chunk_data, chunk_size, stats,
+          /*primary_setting=*/-1, /*primary_raw=*/false, /*primary_cost=*/0.0,
+          MeasureExploreDecompTime(), sel_v2_features);
+      phases.explored += win.measured;
+      phases.sgd_updates += win.trained;
+      phases.explore_gpu_ms += win.gpu_ms;
     }
     if ((config_.neuropress_online_learning_enabled_ ||
          config_.neuropress_best_mode_) &&
@@ -3276,15 +3315,24 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       const bool np_setting_blob =
           static_cast<uint32_t>(context.compress_lib_) == kNpSettingWireId;
       if (np_setting_blob && MeasureExploreDecompTime()) {
+        const auto label_t0 = std::chrono::steady_clock::now();
         auto dcodec =
             ctp::CompressionFactory::GetGpuSetting(static_cast<int>(preset_id));
-        std::vector<char> decoded(compress_input_size);
+        // Only the decode TIME is needed, so decode into a reusable device
+        // buffer: no host buffer, no copy of the result back to the host.
+        void *decoded =
+            ctp::GpuSettingScratch(kLabelScratchSlot, compress_input_size);
         size_t decoded_size = compress_input_size;
-        if (dcodec && dcodec->Decompress(decoded.data(), decoded_size,
-                                         compress_dst, compressed_size) &&
+        if (dcodec && decoded != nullptr &&
+            dcodec->Decompress(decoded, decoded_size, compress_dst,
+                               compressed_size) &&
             ctp::LastCodecKernelMs() >= 0.0) {
           context.actual_decompress_time_ms_ = ctp::LastCodecKernelMs();
+          compress_phases.label_gpu_ms += ctp::LastCodecKernelMs();
         }
+        compress_phases.label_ms += std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - label_t0)
+                                        .count();
       }
 #else
       const bool np_setting_blob = false;
