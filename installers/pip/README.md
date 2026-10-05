@@ -111,7 +111,7 @@ iowarp_core/
 Pass extra CMake args via `scikit-build-core`:
 
 ```bash
-pip install -v . --config-settings=cmake.args="-DWRP_CORE_ENABLE_CAE=OFF"
+pip install -v . --config-settings=cmake.args="-DCLIO_CORE_ENABLE_CAE=OFF"
 ```
 
 ### Static vs Shared Dependencies
