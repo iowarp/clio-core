@@ -495,11 +495,14 @@ def t_two_nodes_down(ctx):
   th, replies, logs, nfiles = _writers(ctx, base, 300, 'twodown')
   time.sleep(20)
   down = [cl.hosts[n - 2], cl.hosts[n - 1]]
+  t_kill = time.time()
   parallel(cl.kill_fuse, down)
   parallel(cl.kill_runtime, down)
   time.sleep(5)
   lies, failed, ok = [], 0, 0
-  for nm in names:
+  # A scan of a file with pages on the pair takes ~30 s of I/O errors: probe
+  # three, so the pair is back while the writers still have minutes to run.
+  for nm in names[:3]:
     r = ctx.call(0, 'rec_scan', timeout=900, path=f'{base}/{nm}', name=nm,
                  nblocks=FILE_BLOCKS)
     if not r['ok']:
@@ -513,6 +516,7 @@ def t_two_nodes_down(ctx):
                       'files_failed_during_outage': failed})
   ctx.check(not lies, f'reads with two adjacent nodes down returned wrong '
                       f'bytes: {lies[:6]}')
+  ctx.metrics['probe_s'] = round(time.time() - t_kill, 1)
   time.sleep(5)
   parallel(lambda h: cl.start_runtime(h), down)
   ups = parallel(cl.runtime_up, down)
@@ -523,24 +527,43 @@ def t_two_nodes_down(ctx):
   for h in down:
     cl.agents.pop(h, None)
   back_at = time.time()
-  # The filesystem must take writes again once the pair is back.
+  ctx.metrics['outage_s'] = round(back_at - t_kill, 1)
+  # The filesystem must take writes again once the pair is back: one file
+  # checked from another node, and a second round of record writers whose
+  # every fsynced version is verified like the first round's.
   p = ctx.p('after_return')
   ctx.ok(0, 'write_file', path=p, size=8 << 20, seed=17, fsync=True)
   v = ctx.ok(n - 1, 'verify_file', path=p, size=8 << 20, seed=17)
   ctx.check(v['ok'], f'write after the pair returned: {v}')
+  base2 = ctx.p('tn_after')
+  ctx.ok(0, 'mkdir', path=base2)
+  th2, replies2, logs2, nfiles2 = _writers(ctx, base2, 60, 'twodown_after')
   th.join(timeout=300 + 1200)
+  th2.join(timeout=60 + 600)
   ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  ctx.metrics['writer_errors_after_return'] = _writer_errors(replies2, n)
   ctx.metrics['writer_secs_after_return'] = round(time.time() - back_at, 1)
   for i in range(n):  # what the failed rounds saw (first few per node)
     errs = ((replies.get(i) or {}).get('ret') or {}).get('errors') or []
     if errs:
       ctx.note(f'node{i} first writer errors: {errs[:2]}')
+    errs2 = ((replies2.get(i) or {}).get('ret') or {}).get('errors') or []
+    if errs2:
+      ctx.note(f'node{i} writer errors after the return: {errs2[:2]}')
+  ctx.check(not any(ctx.metrics['writer_errors_after_return'].values()),
+            'writes failed after both nodes were back: '
+            f'{ctx.metrics["writer_errors_after_return"]}')
   _check_filesets(ctx, base, n, nfiles, logs, replies,
                   'after two adjacent nodes crashed and returned')
+  _check_filesets(ctx, base2, n, nfiles2, logs2, replies2,
+                  'for the writers started after the pair returned')
   restart_cluster(ctx, crash=True)
   ctx.cl.agents.clear()
   _check_filesets(ctx, base, n, nfiles, logs, replies,
                   'after a crash restart following the double node loss')
+  _check_filesets(ctx, base2, n, nfiles2, logs2, replies2,
+                  'after a crash restart, for the writers started after the '
+                  'return')
 
 
 @test('safe_rolling_restart_degraded', 'safe', min_nodes=2,
