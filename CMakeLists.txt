@@ -1319,6 +1319,13 @@ if(CLIO_CORE_ENABLE_RPATH)
     elseif(UNIX)
         set(CMAKE_INSTALL_RPATH "$ORIGIN;$ORIGIN/../lib")
         set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
+        # Emit DT_RPATH, not DT_RUNPATH. Most current toolchains default to
+        # RUNPATH, which LD_LIBRARY_PATH outranks: an older iowarp-core in an
+        # LD_LIBRARY_PATH entry (a conda env's lib, an HPC module) then
+        # replaces the libraries this build just produced, and a freshly linked
+        # test dies in Catch's post-link discovery with "undefined symbol"
+        # (issue #836). DT_RPATH is searched before LD_LIBRARY_PATH.
+        add_link_options("LINKER:--disable-new-dtags")
     endif()
 
     message(STATUS "RPATH: Using relative paths ($ORIGIN/../lib)")
