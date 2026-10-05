@@ -58,6 +58,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <set>
 
 #include "simple_test.h"
 
@@ -461,6 +462,96 @@ TEST_CASE("safe_bdev_raid0_striping", "[safe_bdev][ec][striping]") {
        num_chunks, k);
 }
 
+/**
+ * #1160: the allocator keeps consecutive single-chunk allocations (what
+ * concurrent small writers issue) off one stripe, so they do not serialize
+ * on its lock, and places a request with a chunk for every member as one
+ * whole stripe, whose parity then follows from its own bytes.
+ */
+TEST_CASE("safe_bdev_alloc_spreads_small_puts", "[safe_bdev][alloc][spread]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  std::this_thread::sleep_for(100ms);
+
+  const int pidsalt = static_cast<int>(getpid() & 0xFFF);
+  auto member_name = [&](int idx) {
+    return "al_member_" + std::to_string(getpid()) + "_" + std::to_string(idx);
+  };
+  const int k = 4;
+  std::vector<clio::run::PoolId> data_ids;
+  for (int c = 0; c < k; ++c) {
+    clio::run::PoolId id(static_cast<clio::run::u32>(9500 + pidsalt + c), 0);
+    clio::run::bdev::Client client(id);
+    REQUIRE(CreateRamMember(client, member_name(c), id));
+    data_ids.push_back(client.pool_id_);
+  }
+  clio::run::PoolId safe_id(static_cast<clio::run::u32>(9560 + pidsalt), 0);
+  clio::run::safe_bdev::Client safe(safe_id);
+  std::vector<clio::run::safe_bdev::MemberBdevDesc> members;
+  for (int c = 0; c < k; ++c) {
+    members.emplace_back(member_name(c), /*node_id=*/0, data_ids[c]);
+  }
+  auto create_task = safe.AsyncCreate(clio::run::PoolQuery::Dynamic(),
+                                      "safe_bdev_al_pool", safe_id,
+                                      /*max_failures=*/1, members);
+  create_task.Wait();
+  safe.pool_id_ = create_task->new_pool_id_;
+  REQUIRE(create_task->GetReturnCode() == 0);
+
+  // Banded addressing (mirrors Runtime::Unband): chunk -> (member, slot).
+  constexpr clio::run::u64 kSlotsPerMember = (1ull << 32);
+  auto decode = [&](const clio::run::bdev::Block &b, clio::run::u64 &d,
+                    clio::run::u64 &slot) {
+    const clio::run::u64 chunk = b.offset_ / kChunkLen;
+    d = chunk / kSlotsPerMember;
+    slot = chunk % kSlotsPerMember;
+  };
+
+  // Eight single-chunk allocations in a row: eight distinct stripes.
+  std::set<clio::run::u64> small_slots;
+  for (int i = 0; i < 8; ++i) {
+    std::vector<clio::run::bdev::Block> blocks = AllocBlocks(safe, kChunkLen);
+    REQUIRE(blocks.size() == 1);
+    clio::run::u64 d = 0, slot = 0;
+    decode(blocks[0], d, slot);
+    small_slots.insert(slot);
+  }
+  REQUIRE(small_slots.size() == 8);
+
+  // A chunk per member: one stripe, every member once.
+  {
+    std::vector<clio::run::bdev::Block> blocks =
+        AllocBlocks(safe, static_cast<clio::run::u64>(k) * kChunkLen);
+    REQUIRE(blocks.size() == static_cast<size_t>(k));
+    std::set<clio::run::u64> slots, mems;
+    for (const auto &b : blocks) {
+      clio::run::u64 d = 0, slot = 0;
+      decode(b, d, slot);
+      slots.insert(slot);
+      mems.insert(d);
+    }
+    REQUIRE(slots.size() == 1);
+    REQUIRE(mems.size() == static_cast<size_t>(k));
+    REQUIRE(small_slots.count(*slots.begin()) == 0);  // not a shared stripe
+  }
+
+  // Six chunks: a whole stripe first, the remainder a chunk at a time.
+  {
+    std::vector<clio::run::bdev::Block> blocks =
+        AllocBlocks(safe, static_cast<clio::run::u64>(k + 2) * kChunkLen);
+    REQUIRE(blocks.size() == static_cast<size_t>(k + 2));
+    std::set<clio::run::u64> first_stripe;
+    for (int i = 0; i < k; ++i) {
+      clio::run::u64 d = 0, slot = 0;
+      decode(blocks[static_cast<size_t>(i)], d, slot);
+      first_stripe.insert(slot);
+    }
+    REQUIRE(first_stripe.size() == 1);
+  }
+  HLOG(kInfo, "safe_bdev alloc: 8 small puts on 8 stripes; a {}-chunk put on "
+       "one stripe", k);
+}
+
 TEST_CASE("safe_bdev_reclaim", "[safe_bdev][ec][reclaim]") {
   EnsureInit();
   REQUIRE(g_initialized);
@@ -495,7 +586,10 @@ TEST_CASE("safe_bdev_reclaim", "[safe_bdev][ec][reclaim]") {
   const clio::run::u64 sz = static_cast<clio::run::u64>(k) * kChunkLen;
 
   // Allocate, capture the offset, free, allocate again: the SAME region should
-  // be reused (the allocator is a free-list, not a bump pointer).
+  // be reused (the allocator is a free-list, not a bump pointer). The request
+  // is a whole stripe, so the whole allocation is freed: a stripe is reused
+  // by a stripe-sized request only when every member's chunk of it is free
+  // (#1160); a single freed chunk goes to the next single-chunk request.
   auto a1 = safe.AsyncAllocateBlocks(clio::run::PoolQuery::Dynamic(), sz);
   a1.Wait();
   REQUIRE(a1->GetReturnCode() == 0);
@@ -503,7 +597,7 @@ TEST_CASE("safe_bdev_reclaim", "[safe_bdev][ec][reclaim]") {
   const clio::run::u64 off1 = a1->blocks_[0].offset_;
 
   clio::run::priv::vector<clio::run::bdev::Block> fblocks(CTP_MALLOC);
-  fblocks.push_back(a1->blocks_[0]);
+  for (size_t i = 0; i < a1->blocks_.size(); ++i) fblocks.push_back(a1->blocks_[i]);
   auto fr = safe.AsyncFreeBlocks(clio::run::PoolQuery::Dynamic(), fblocks);
   fr.Wait();
   REQUIRE(fr->GetReturnCode() == 0);
