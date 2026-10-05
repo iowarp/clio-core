@@ -683,12 +683,37 @@ void Runtime::MirrorBlobToShm(const std::string &composite_key,
  * (CLIO_TRACE_COPY_READS=1; diagnosis of #1131).
  * @return true when tracing is on
  */
-static bool TraceCopyReadsEnv() {
-  static const bool v = [] {
+/**
+ * Read-trace level from CLIO_TRACE_COPY_READS: 0 off, 1 reads served from
+ * a replica slot (#1131), 2 every read including the primary's -- so a
+ * garbage chunk found by a test can be matched to the extents, and thus the
+ * array member and slot, it was read from (#1165).
+ * @return the level
+ */
+static int TraceCopyReadsEnv() {
+  static const int v = [] {
     const char *e = std::getenv("CLIO_TRACE_COPY_READS");
-    return e != nullptr && e[0] == '1';
+    if (e == nullptr || e[0] == '\0' || e[0] == '0') return 0;
+    if (e[0] == '3') return 3;  // + every put's and free's extents (#1165)
+    return e[0] == '2' ? 2 : 1;
   }();
   return v;
+}
+
+/**
+ * A blob layout as "pool:offset+size ..." (first 32 blocks), the form the
+ * extent traces use so one extent can be grepped across reads, puts, frees.
+ * @param blocks the blob's blocks
+ * @return the layout string
+ */
+static std::string BlockLayout(const clio::run::priv::vector<BlobBlock> &blocks) {
+  std::string layout;
+  for (size_t i = 0; i < blocks.size() && i < 32; ++i) {
+    layout += std::to_string(blocks[i].bdev_client_.pool_id_.major_) + ":" +
+              std::to_string(blocks[i].target_offset_) + "+" +
+              std::to_string(blocks[i].size_) + " ";
+  }
+  return layout;
 }
 
 void Runtime::TraceCopyRead(const TagId &tag_id, const std::string &blob_name,
@@ -2603,6 +2628,13 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
              blob_name, offset, size, blob_info_ptr->blocks_.size(),
              blob_info_ptr->GetTotalSize(), lock_tok);
       }
+      if (TraceCopyReadsEnv() >= 3) {
+        // Every writer of an extent, matched later against the reads and
+        // frees of the same extent (#1165: a chunk read back as garbage).
+        HLOG(kWarning, "[extent-put] tag={}.{} blob={} off={} len={} blocks=[{}]",
+             tag_id.major_, tag_id.minor_, blob_name, offset, size,
+             BlockLayout(blob_info_ptr->blocks_));
+      }
     }
 
     // Under the write token, with the blocks placed and the size current:
@@ -3499,7 +3531,7 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         replica_sel > 0
             ? blob_info_ptr->GetReplica(replica_sel, false)->total_size_cache_
             : blob_info_ptr->GetTotalSize();
-    if (replica_sel > 0 && TraceCopyReadsEnv()) {
+    if (TraceCopyReadsEnv() >= (replica_sel > 0 ? 1 : 2)) {
       TraceCopyRead(tag_id, blob_name, replica_sel, blocks_snapshot, offset,
                     size, declared_size);
     }
@@ -4002,6 +4034,14 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
     if (blob_info.score_ != placed_score) snapshot_dirty_.store(true);
     blob_info.score_ = placed_score;
     blob_info.BumpPlacementGen();
+    if (TraceCopyReadsEnv() >= 3) {
+      // A tier move copies stored bytes into fresh extents: trace the
+      // source and destination so a garbage chunk can be followed back to
+      // where its bytes were read (#1165).
+      HLOG(kWarning, "[extent-move] reorganize blob={} from=[{}] to=[{}]",
+           blob_info.blob_name_.str(), BlockLayout(old_layout.blocks_),
+           BlockLayout(blob_info.blocks_));
+    }
     // WAL: log the new block layout (kExtendBlob replays with full-replacement
     // semantics, so this single record captures the whole move). Deliberately
     // logged only AFTER the publish: a crash mid-move replays the previous
@@ -7636,6 +7676,13 @@ clio::run::TaskResume Runtime::RelocateBlob(
   blob_info.blocks_ = std::move(staging.blocks_);
   blob_info.total_size_cache_ = staging.total_size_cache_;
   blob_info.BumpPlacementGen();  // #817: blocks moved under readers
+  if (TraceCopyReadsEnv() >= 3) {
+    // As in ReorganizeBlobInternal: where a moved blob's bytes came from
+    // and where they now live (#1165).
+    HLOG(kWarning, "[extent-move] relocate tag={}.{} blob={} from=[{}] to=[{}]",
+         tag_id.major_, tag_id.minor_, blob_name,
+         BlockLayout(old_layout.blocks_), BlockLayout(blob_info.blocks_));
+  }
   // Log the new layout BEFORE the old one is freed: freed extents can be
   // reallocated and overwritten by another blob at once, and a crash between
   // the free and the record would replay this blob onto them (another
@@ -10101,6 +10148,16 @@ clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 ne
       bytes_freed += block.size_;
     }
     clio::run::bdev::Client bdev_client(pool_id);
+    if (TraceCopyReadsEnv() >= 3) {
+      std::string layout;
+      for (const auto &b : blocks) {
+        layout += std::to_string(pool_id.major_) + ":" +
+                  std::to_string(b.offset_) + "+" + std::to_string(b.size_) +
+                  " ";
+      }
+      HLOG(kWarning, "[extent-free] resize blob={} to={} blocks=[{}]",
+           blob_info.blob_name_.str(), new_size, layout);
+    }
     auto free_task = bdev_client.AsyncFreeBlocks(target_query, blocks);
     CLIO_CO_AWAIT(free_task);
     if (free_task->GetReturnCode() == 0) {
@@ -10662,6 +10719,16 @@ clio::run::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
 
     // Get bdev client for this pool from first blob block
     clio::run::bdev::Client bdev_client(pool_id);
+    if (TraceCopyReadsEnv() >= 3) {
+      std::string layout;
+      for (const auto &b : blocks) {
+        layout += std::to_string(pool_id.major_) + ":" +
+                  std::to_string(b.offset_) + "+" + std::to_string(b.size_) +
+                  " ";
+      }
+      HLOG(kWarning, "[extent-free] all blob={} blocks=[{}]",
+           blob_info.blob_name_.str(), layout);
+    }
     auto free_task = bdev_client.AsyncFreeBlocks(target_query, blocks);
     CLIO_CO_AWAIT(free_task);
     clio::run::u32 free_result = free_task->GetReturnCode();
