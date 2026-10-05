@@ -32,25 +32,25 @@
  */
 
 /**
- * Reproducer for issue #1065: the runtime's client pool never releases a
+ * Regression tests for issue #1065: the runtime never released a client's
  * dial-back connection.
  *
- * IpcManager::GetOrCreateClient() inserts one owning TransportPtr per
- * "addr:port" key into client_pool_ and nothing on the dial-back path ever
- * erases it: SetDead() only erases hostfile nodes, and EvictClientByIdentity()
- * only drops the identity -> Transport* lookaside (client_conn_cache_), not the
- * owning client_pool_ entry, so the DEALER socket lives on. The shared ZeroMQ
- * context never sets ZMQ_MAX_SOCKETS, so libzmq's default ceiling of 1023
- * applies: once the pool reaches it, zmq_socket() returns NULL, the dial-back
- * fails with "not a socket", and that client's response is dropped.
+ * Every TCP client left a DEALER in IpcManager::client_pool_ for the life of
+ * the daemon, and EvictClientByIdentity only dropped a raw-pointer lookaside,
+ * so the 1024th distinct client hit ZeroMQ's default ZMQ_MAX_SOCKETS (1023):
+ * zmq_socket() returned NULL, dial-back failed with "not a socket", and that
+ * client's response was dropped. Dial-backs now live in an LRU-bounded table
+ * whose entries are shared with the in-flight responses that use them.
  *
- * Kept in its own executable so its expected failure does not mask the other
- * IpcManager internals tests; ctest marks it WILL_FAIL until #1065 is fixed.
+ * These run with ZeroMQ's default socket limit, so they fail if the table is
+ * unbounded again, and they check that eviction never frees a connection an
+ * in-flight response still holds.
  */
 
 #include "simple_test.h"
 
 #include <iostream>
+#include <memory>
 #include <string>
 
 #include <clio_runtime/clio_runtime.h>
@@ -59,12 +59,10 @@
 
 namespace {
 
-/** Number of distinct fake clients to dial back; above libzmq's 1023. */
+/** Distinct fake clients to dial back; above libzmq's 1023-socket default. */
 constexpr int kAttempts = 1100;
 /** First fake client port; client i uses kBasePort + i. */
 constexpr int kBasePort = 24000;
-/** How many early identities to evict before retrying a fresh dial-back. */
-constexpr int kEvictCount = 50;
 
 bool g_initialized = false;
 
@@ -81,56 +79,116 @@ void EnsureInitialized() {
 }
 
 /**
- * Build the fake dial-back identity for client index i.
+ * Build a fake dial-back identity unique to this test.
+ * @param tag distinguishes the test case
  * @param i client index
- * @return identity string unique to this test
+ * @return identity string
  */
-std::string FakeIdentity(int i) { return "repro1065:" + std::to_string(i); }
+std::string FakeIdentity(const char *tag, int i) {
+  return std::string("repro1065-") + tag + ":" + std::to_string(i);
+}
 
 }  // namespace
 
-TEST_CASE("ClientPool - dial-back sockets are released (issue #1065)",
+TEST_CASE("ClientPool - more distinct clients than ZMQ_MAX_SOCKETS (#1065)",
           "[ipc][clientpool][1065]") {
   EnsureInitialized();
   auto *ipc = CLIO_IPC;
   REQUIRE(ipc != nullptr);
 
-  // No listener is needed: zmq_connect() on a TCP DEALER is asynchronous, so
-  // a failure here comes from exhausting the context's socket slots, not from
-  // a refused connection.
+  // Each client is served and its response sent, so nothing outside the
+  // table holds the connection -- the pattern of a long-lived daemon serving
+  // many short-lived clients. No listener is needed: a TCP DEALER connects
+  // asynchronously, so failure here can only be socket exhaustion.
+  int failures = 0;
   int first_failure = -1;
-  int failure_count = 0;
   for (int i = 0; i < kAttempts; ++i) {
-    ctp::lbm::Transport *t = ipc->GetOrCreateClientByIdentity(
-        FakeIdentity(i), "127.0.0.1", kBasePort + i);
-    if (t == nullptr) {
-      ++failure_count;
-      if (first_failure == -1) first_failure = i;
+    auto t = ipc->GetOrCreateClientByIdentity(FakeIdentity("many", i),
+                                              "127.0.0.1", kBasePort + i);
+    if (!t) {
+      ++failures;
+      if (first_failure < 0) first_failure = i;
     }
   }
-  std::cout << "[#1065 repro] first dial-back failure at attempt "
-            << first_failure << " (" << failure_count << "/" << kAttempts
-            << " failed)" << std::endl;
+  std::cout << "[#1065] " << kAttempts << " distinct clients: " << failures
+            << " failed (first at " << first_failure << "), "
+            << ipc->GetClientDialBackCount() << " dial-backs cached (max "
+            << ipc->GetMaxClientDialBacks() << ")" << std::endl;
+  REQUIRE(failures == 0);
+  REQUIRE(ipc->GetClientDialBackCount() <= ipc->GetMaxClientDialBacks());
+}
 
-  // If eviction released the pooled socket, evicting earlier identities would
-  // make room for a new one.
-  bool recovered_after_evict = (first_failure == -1);
-  if (first_failure != -1) {
-    for (int i = 0; i < kEvictCount && i < first_failure; ++i) {
-      ipc->EvictClientByIdentity(FakeIdentity(i), kBasePort + i);
-    }
-    ctp::lbm::Transport *retry = ipc->GetOrCreateClientByIdentity(
-        "repro1065:retry", "127.0.0.1", kBasePort + kAttempts + 1);
-    recovered_after_evict = (retry != nullptr);
-    std::cout << "[#1065 repro] after evicting " << kEvictCount
-              << " earlier identities, a fresh dial-back "
-              << (recovered_after_evict ? "SUCCEEDED" : "STILL FAILED")
-              << std::endl;
+TEST_CASE("ClientPool - eviction keeps an in-flight response's transport",
+          "[ipc][clientpool][1065]") {
+  EnsureInitialized();
+  auto *ipc = CLIO_IPC;
+  REQUIRE(ipc != nullptr);
+
+  const std::string held_id = FakeIdentity("held", 0);
+  const int held_port = kBasePort + kAttempts + 10;
+  std::shared_ptr<ctp::lbm::Transport> held =
+      ipc->GetOrCreateClientByIdentity(held_id, "127.0.0.1", held_port);
+  REQUIRE(held != nullptr);
+  REQUIRE(held.use_count() >= 2);  // the table and this in-flight holder
+
+  // Push it out of the table with enough newer clients to fill the cap.
+  const size_t cap = ipc->GetMaxClientDialBacks();
+  for (size_t i = 0; i <= cap; ++i) {
+    int port = kBasePort + 2 * kAttempts + static_cast<int>(i);
+    REQUIRE(ipc->GetOrCreateClientByIdentity(
+                FakeIdentity("churn", static_cast<int>(i)), "127.0.0.1",
+                port) != nullptr);
   }
 
-  // Both encode the fixed behavior and fail on a tree that still has #1065.
-  REQUIRE(first_failure == -1);
-  REQUIRE(recovered_after_evict);
+  // Evicted from the table, but alive: only the in-flight holder owns it.
+  REQUIRE(held.use_count() == 1);
+  // The same client asking again gets a freshly dialed connection.
+  auto again = ipc->GetOrCreateClientByIdentity(held_id, "127.0.0.1",
+                                                held_port);
+  REQUIRE(again != nullptr);
+  REQUIRE(again.get() != held.get());
+  held.reset();  // the response is sent; the old socket closes now
+}
+
+TEST_CASE("ClientPool - EvictClientByIdentity releases the connection",
+          "[ipc][clientpool][1065]") {
+  EnsureInitialized();
+  auto *ipc = CLIO_IPC;
+  REQUIRE(ipc != nullptr);
+
+  const std::string id = FakeIdentity("evict", 0);
+  const int port = kBasePort + 4 * kAttempts;
+  std::weak_ptr<ctp::lbm::Transport> watch =
+      ipc->GetOrCreateClientByIdentity(id, "127.0.0.1", port);
+  REQUIRE(!watch.expired());  // the table still holds it
+  size_t before = ipc->GetClientDialBackCount();
+
+  ipc->EvictClientByIdentity(id, port);
+  REQUIRE(ipc->GetClientDialBackCount() == before - 1);
+  REQUIRE(watch.expired());  // nothing else held it: the socket is closed
+
+  // Evicting an unknown client is a no-op.
+  ipc->EvictClientByIdentity(id, port);
+  REQUIRE(ipc->GetClientDialBackCount() == before - 1);
+}
+
+TEST_CASE("ClientPool - lowering the cap trims the table",
+          "[ipc][clientpool][1065]") {
+  EnsureInitialized();
+  auto *ipc = CLIO_IPC;
+  REQUIRE(ipc != nullptr);
+
+  const size_t original = ipc->GetMaxClientDialBacks();
+  for (int i = 0; i < 8; ++i) {
+    REQUIRE(ipc->GetOrCreateClientByIdentity(FakeIdentity("trim", i),
+                                             "127.0.0.1",
+                                             kBasePort + 5 * kAttempts + i) !=
+            nullptr);
+  }
+  ipc->SetMaxClientDialBacks(4);
+  REQUIRE(ipc->GetClientDialBackCount() <= 4);
+  ipc->SetMaxClientDialBacks(original);
+  REQUIRE(ipc->GetMaxClientDialBacks() == original);
 }
 
 SIMPLE_TEST_MAIN()

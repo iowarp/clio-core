@@ -39,10 +39,9 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
 endif()
 
-# Issue #1065 reproducer: the client pool never releases dial-back sockets, so
-# client ~1024 cannot be reached. Its own executable so the expected failure
-# does not hide the tests above; WILL_FAIL until #1065 is fixed, at which point
-# this test turns red and WILL_FAIL should be removed.
+# Issue #1065: client dial-back connections are LRU-bounded, so a daemon can
+# serve more distinct clients than ZeroMQ's 1023-socket default, and eviction
+# never frees a connection an in-flight response still holds.
 add_executable(clio_run_client_pool_1065_tests test_client_pool_1065.cc)
 target_include_directories(clio_run_client_pool_1065_tests PRIVATE
   ${CLIO_RUN_ROOT}/include
@@ -72,7 +71,6 @@ if(CLIO_CORE_ENABLE_TESTS)
   set_tests_properties(cr_client_pool_1065 PROPERTIES
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10596"
     TIMEOUT 120
-    WILL_FAIL TRUE
     LABELS "msan_skip"
   )
 endif()

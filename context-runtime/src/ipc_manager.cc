@@ -2646,59 +2646,103 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
   return raw_ptr;
 }
 
-ctp::lbm::Transport *IpcManager::GetOrCreateClientByIdentity(
+std::shared_ptr<ctp::lbm::Transport> IpcManager::GetOrCreateClientByIdentity(
     const std::string &key_id, const std::string &dial_addr, int port) {
-  // Cache key: routing identity + advertised response port. Two clients that
-  // happen to pick the same ephemeral port still differ by identity, and the
-  // same client reusing a port across reconnects re-resolves to a fresh dial.
-  size_t hkey = std::hash<std::string>{}(key_id + ":" + std::to_string(port));
+  // Key: routing identity + advertised response port. Two clients that happen
+  // to pick the same ephemeral port still differ by identity, and the same
+  // client reusing a port across reconnects re-resolves to a fresh dial.
+  std::string key = key_id + ":" + std::to_string(port);
 
-  // Fast path: already have a dial-back connection for this client.
-  if (ctp::lbm::Transport **found = client_conn_cache_.find(hkey)) {
-    return *found;
+  std::lock_guard<std::mutex> lock(client_pool_mutex_);
+  auto it = client_dial_backs_.find(key);
+  if (it != client_dial_backs_.end()) {
+    client_dial_back_lru_.splice(client_dial_back_lru_.begin(),
+                                 client_dial_back_lru_, it->second.lru_pos_);
+    return it->second.transport_;
   }
 
-  // Miss: open (and own, via client_pool_) a DEALER to the client's listener.
-  ctp::lbm::Transport *transport = GetOrCreateClient(dial_addr, port);
-  if (transport == nullptr) {
-    HLOG(kError, "[ConnCache] Failed to dial back to {}:{} (id={})", dial_addr,
+  // Miss: make room first, so the table never holds more than the cap. An
+  // evicted entry's socket closes once its last in-flight response is sent.
+  TrimClientDialBacksLocked(max_client_dial_backs_ - 1);
+
+  // TransportFactory::Get throws when the address is unroutable; a malformed
+  // client identity must never terminate the runtime, so report and return
+  // nullptr (RecvIn then logs the response as undeliverable).
+  ctp::lbm::TransportPtr transport;
+  try {
+    transport = ctp::lbm::TransportFactory::Get(
+        dial_addr, ctp::lbm::TransportType::kZeroMq,
+        ctp::lbm::TransportMode::kClient, "tcp", port);
+  } catch (const std::exception &e) {
+    HLOG(kError, "[DialBack] Failed to dial back to {}:{} (id={}): {}",
+         dial_addr, port, key_id, e.what());
+    return nullptr;
+  }
+  if (!transport) {
+    HLOG(kError, "[DialBack] Failed to dial back to {}:{} (id={})", dial_addr,
          port, key_id);
     return nullptr;
   }
-  // insert_or_assign is idempotent under a race: whichever thread lands second
-  // just overwrites with the same client_pool_-owned pointer.
-  client_conn_cache_.insert_or_assign(hkey, transport);
-  HLOG(kDebug, "[ConnCache] dial-back to {}:{} cached (id={}, key={})",
-       dial_addr, port, key_id, hkey);
-  return transport;
+
+  client_dial_back_lru_.push_front(key);
+  ClientDialBack &entry = client_dial_backs_[key];
+  entry.transport_ = std::shared_ptr<ctp::lbm::Transport>(std::move(transport));
+  entry.lru_pos_ = client_dial_back_lru_.begin();
+  HLOG(kDebug, "[DialBack] dial-back to {}:{} cached (id={}, {} cached)",
+       dial_addr, port, key_id, client_dial_backs_.size());
+  return entry.transport_;
+}
+
+void IpcManager::TrimClientDialBacksLocked(size_t limit) {
+  while (client_dial_backs_.size() > limit && !client_dial_back_lru_.empty()) {
+    const std::string &victim = client_dial_back_lru_.back();
+    HLOG(kDebug, "[DialBack] evicting least recently used dial-back {}",
+         victim);
+    client_dial_backs_.erase(victim);
+    client_dial_back_lru_.pop_back();
+  }
+}
+
+size_t IpcManager::GetClientDialBackCount() const {
+  std::lock_guard<std::mutex> lock(client_pool_mutex_);
+  return client_dial_backs_.size();
+}
+
+size_t IpcManager::GetMaxClientDialBacks() const {
+  std::lock_guard<std::mutex> lock(client_pool_mutex_);
+  return max_client_dial_backs_;
+}
+
+void IpcManager::SetMaxClientDialBacks(size_t max_dial_backs) {
+  std::lock_guard<std::mutex> lock(client_pool_mutex_);
+  max_client_dial_backs_ = max_dial_backs < 1 ? 1 : max_dial_backs;
+  TrimClientDialBacksLocked(max_client_dial_backs_);
 }
 
 void IpcManager::ClearClientPool() {
   std::lock_guard<std::mutex> lock(client_pool_mutex_);
-  HLOG(kInfo, "[ClientPool] Clearing {} persistent connections",
-       client_pool_.size());
-  client_conn_cache_.clear();
+  HLOG(kInfo,
+       "[ClientPool] Clearing {} persistent connections and {} dial-backs",
+       client_pool_.size(), client_dial_backs_.size());
+  client_dial_backs_.clear();
+  client_dial_back_lru_.clear();
   client_pool_.clear();
 }
 
 void IpcManager::EvictClientByIdentity(const std::string &key_id, int port) {
-  /**
-   * Evict cached dial-back DEALER from client_conn_cache_ when a client
-   * response has been dropped as undeliverable (issue #722).
-   *
-   * The cache key is computed the same way as GetOrCreateClientByIdentity:
-   * hash of (identity + port). Removing it forces the next SendOut attempt
-   * to create a fresh dial-back connection.
-   */
-  size_t hkey = std::hash<std::string>{}(key_id + ":" + std::to_string(port));
-
+  // Called when a client response was dropped as undeliverable (issue #722).
+  // Removing the entry closes the socket once no in-flight response holds it
+  // (issue #1065), and the client's next request dials afresh.
+  std::string key = key_id + ":" + std::to_string(port);
   std::lock_guard<std::mutex> lock(client_pool_mutex_);
-  if (ctp::lbm::Transport **found = client_conn_cache_.find(hkey)) {
-    client_conn_cache_.erase(hkey);
-    HLOG(kInfo,
-         "[ConnCache] Evicted dead client connection (id={}, port={}, key={})",
-         key_id, port, hkey);
+  auto it = client_dial_backs_.find(key);
+  if (it == client_dial_backs_.end()) {
+    return;
   }
+  client_dial_back_lru_.erase(it->second.lru_pos_);
+  client_dial_backs_.erase(it);
+  HLOG(kInfo, "[DialBack] Evicted dead client connection (id={}, port={})",
+       key_id, port);
 }
 
 // CLIO_NET_QPROF=1: how long a task sits on a net_queue_ priority lane between

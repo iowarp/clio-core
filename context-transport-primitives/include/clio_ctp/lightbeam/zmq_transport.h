@@ -155,6 +155,24 @@ class ZeroMqTransport : public Transport {
     return owner.ctx;
   }
 
+  /**
+   * Throw for a zmq_socket() that returned NULL (issue #1065). Without this
+   * the NULL socket reached zmq_connect, whose "not a socket" hid the real
+   * cause -- usually EMFILE, the context's ZMQ_MAX_SOCKETS (default 1023).
+   *
+   * @param kind "DEALER" or "ROUTER", for the message
+   */
+  [[noreturn]] static void ThrowSocketCreateError(const char *kind) {
+    int err = zmq_errno();
+    std::string msg = std::string("ZeroMqTransport(") + kind +
+                      ") could not create a socket: " + zmq_strerror(err);
+    if (err == EMFILE) {
+      msg += " (the ZeroMQ context's socket limit, ZMQ_MAX_SOCKETS, is "
+             "exhausted)";
+    }
+    throw std::runtime_error(msg);
+  }
+
  public:
   // Wire topology is fixed: ROUTER on the server, DEALER on each client,
   // with identity + empty-delimiter frames around every multipart
@@ -234,6 +252,9 @@ class ZeroMqTransport : public Transport {
       ctx_ = GetSharedContext();
       owns_ctx_ = false;
       socket_ = zmq_socket(ctx_, ZMQ_DEALER);
+      if (socket_ == nullptr) {
+        ThrowSocketCreateError("DEALER");
+      }
 
       // ZMQ_IDENTITY: the server's ROUTER uses this as the response routing
       // prefix. It MUST be unique per DEALER socket: when several DEALERs in one
@@ -342,6 +363,9 @@ class ZeroMqTransport : public Transport {
         zmq_ctx_set(ctx_, ZMQ_IO_THREADS, iot);
       }
       socket_ = zmq_socket(ctx_, ZMQ_ROUTER);
+      if (socket_ == nullptr) {
+        ThrowSocketCreateError("ROUTER");
+      }
 
       // Mandatory routing makes zmq_send fail loudly if the destination
       // identity isn't connected (instead of silently dropping); handover

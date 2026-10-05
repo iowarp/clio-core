@@ -40,6 +40,7 @@
 #include <condition_variable>
 #include <deque>
 #include <iostream>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -1234,19 +1235,39 @@ class IpcManager {
 
   /**
    * Get or create a dial-back connection for returning a response to a client.
-   * The (key_id, port) pair forms the cache key (hash(key_id + ":" + port)); a
-   * cache miss opens a new ZeroMQ DEALER to dial_addr:port via GetOrCreateClient
-   * (which owns it) and records the raw pointer in client_conn_cache_. Used at
-   * RecvIn to populate RunContext::response_transport_.
-   * @param key_id Routing identity of the requesting client (e.g. ZMQ identity
-   *               or peer address) used together with port as the cache key.
+   *
+   * Dial-back connections live in their own LRU-bounded table, separate from
+   * the runtime-peer client_pool_ (issue #1065): every short-lived client used
+   * to leave a DEALER in client_pool_ for the life of the daemon, so the
+   * 1024th distinct client exhausted ZeroMQ's socket limit and its response
+   * was dropped. The table holds at most GetMaxClientDialBacks() entries; a
+   * miss at capacity evicts the least recently used one.
+   *
+   * The caller receives shared ownership and must keep it for as long as it
+   * may send on the transport (RecvIn stores it in
+   * RunContext::response_transport_owner_). Eviction only drops the table's
+   * reference, so an in-flight response is never sent on a freed socket.
+   *
+   * @param key_id Routing identity of the requesting client ("hostname:pid").
    * @param dial_addr Host/IP to connect the dial-back DEALER to.
    * @param port Client's ephemeral response port (SaveTaskArchive::client_port_).
-   * @return Non-owning transport pointer, or nullptr on failure.
+   * @return Shared transport, or nullptr if the dial failed.
    */
-  ctp::lbm::Transport *GetOrCreateClientByIdentity(const std::string &key_id,
-                                                   const std::string &dial_addr,
-                                                   int port);
+  std::shared_ptr<ctp::lbm::Transport> GetOrCreateClientByIdentity(
+      const std::string &key_id, const std::string &dial_addr, int port);
+
+  /** @return the number of client dial-back connections currently cached. */
+  size_t GetClientDialBackCount() const;
+
+  /** @return the most client dial-back connections kept cached at once. */
+  size_t GetMaxClientDialBacks() const;
+
+  /**
+   * Set the most client dial-back connections kept cached at once. Lowering
+   * it evicts least recently used entries immediately.
+   * @param max_dial_backs new capacity (at least 1)
+   */
+  void SetMaxClientDialBacks(size_t max_dial_backs);
 
   /** Port of this process's client-side response listener (0 if none). */
   int GetClientResponsePort() const { return client_response_port_; }
@@ -1258,16 +1279,16 @@ class IpcManager {
   void ClearClientPool();
 
   /**
-   * Evict a cached dial-back DEALER connection for an undeliverable client.
-   * Called when a client response is dropped after exhausting retries (issue #722).
-   * This removes the cached connection from client_conn_cache_ so a subsequent
-   * SendOut attempt will create a fresh dial-back connection, giving the client
-   * another chance to respond (or detecting that it's permanently gone).
+   * Evict the cached dial-back DEALER for an undeliverable client.
+   * Called when a client response is dropped after exhausting retries (issue
+   * #722). The connection leaves the table, so its socket is closed as soon as
+   * no in-flight response still holds it, and a later request from the same
+   * client dials afresh.
    *
-   * Thread-safe: acquires client_pool_mutex_ before modifying the cache.
+   * Thread-safe: acquires client_pool_mutex_.
    *
-   * @param key_id The client's identity string (used to compute cache key).
-   * @param port The client's response port (used to compute cache key).
+   * @param key_id The client's identity string.
+   * @param port The client's response port.
    */
   void EvictClientByIdentity(const std::string &key_id, int port);
 
@@ -1924,23 +1945,31 @@ class IpcManager {
   std::unordered_map<std::string, ctp::lbm::TransportPtr> client_pool_;
   mutable std::mutex client_pool_mutex_;  // Mutex for thread-safe pool access
 
-  // Dial-back connection cache for returning responses to clients.
-  // Keyed by hash(response-identity + client_port); value is a NON-owning raw
-  // Transport* (ownership stays in client_pool_, keyed by "addr:port"). Built
-  // at RecvIn from the requesting peer's transport identity and the archive's
-  // client_port_, then stashed in RunContext::response_transport_ so SendOut
-  // routes the response over a dedicated connection instead of the inbound
-  // socket. Self-locking (per-bucket RwLocks), so no external mutex needed.
-  // Host-only: the single-bucket-count unordered_map_ll constructor lives under
-  // CTP_IS_HOST (it pulls the global CTP_MALLOC), so nvcc's device pass has no
-  // matching constructor for this in-class initializer. The dial-back cache is
-  // host networking state used only from the host .cc, so guard the whole
-  // member out of the device pass.
-#if CTP_IS_HOST
-  static constexpr size_t kConnCacheBuckets = 1024;
-  ctp::priv::unordered_map_ll<size_t, ctp::lbm::Transport *> client_conn_cache_{
-      kConnCacheBuckets};
-#endif
+  // Dial-back connections for returning responses to TCP clients (issue
+  // #1065), keyed by "<client identity>:<response port>" and guarded by
+  // client_pool_mutex_. Kept apart from client_pool_ (runtime peers, bounded
+  // by the hostfile) because clients are unbounded over a daemon's life: the
+  // table is LRU-capped at max_client_dial_backs_. Entries share ownership
+  // with every in-flight response that will send on them
+  // (RunContext::response_transport_owner_), so eviction never frees a socket
+  // a response is about to use.
+  struct ClientDialBack {
+    std::shared_ptr<ctp::lbm::Transport> transport_;
+    std::list<std::string>::iterator lru_pos_;  // position in the LRU list
+  };
+  /** Default cap: well under ZeroMQ's 1023-socket default, leaving room for
+   *  the runtime's peer, listener and response sockets. */
+  static constexpr size_t kDefaultMaxClientDialBacks = 512;
+  std::unordered_map<std::string, ClientDialBack> client_dial_backs_;
+  std::list<std::string> client_dial_back_lru_;  // front = most recently used
+  size_t max_client_dial_backs_ = kDefaultMaxClientDialBacks;
+
+  /**
+   * Evict least recently used dial-backs until at most @p limit remain.
+   * Caller must hold client_pool_mutex_.
+   * @param limit the number of entries to keep
+   */
+  void TrimClientDialBacksLocked(size_t limit);
 
   // Client-side ephemeral ROUTER on which this process receives task responses.
   // Bound to an OS-assigned port at client init; that port is advertised to the

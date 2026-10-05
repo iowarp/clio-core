@@ -170,7 +170,7 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
         // DEALER has a single peer so it auto-routes with no identity frame.
         // This requires the client to advertise a response port (client_port_)
         // AND present a parseable "hostname:pid" routing identity.
-        ctp::lbm::Transport *dial_back = nullptr;
+        std::shared_ptr<ctp::lbm::Transport> dial_back;
         size_t colon = identity.find(':');
         const bool parseable_identity =
             colon != std::string::npos &&
@@ -199,7 +199,10 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
         // resolves. If it ever doesn't, the response is undeliverable — log and
         // drop rather than echo over the ROUTER.
         if (dial_back) {
-          future_shm->response_transport_ = dial_back;
+          // Hold the dial-back until this task is freed: the table is
+          // LRU-bounded and may evict it before SendOut runs (issue #1065).
+          future_shm->response_transport_ = dial_back.get();
+          future_shm->response_transport_owner_ = std::move(dial_back);
           future_shm->response_identity_len_ = 0;  // DEALER: no identity frame
         } else {
           HLOG(kError,
