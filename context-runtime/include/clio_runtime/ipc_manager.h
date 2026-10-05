@@ -1294,7 +1294,7 @@ class IpcManager {
 
   /**
    * Set the net worker's lane pointers for signaling on EnqueueNetTask.
-   * Called by scheduler after DivideWorkers assigns the net workers.
+   * Called by WorkOrchestrator once worker lanes are mapped (#768).
    *
    * With the recv/send split, the cross-node Send priorities
    * (kSendIn{Latency,IO} / kSendOut{Latency,IO}) are drained by the

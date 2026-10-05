@@ -162,15 +162,11 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
          class_workers_[kHeavyClass].size(), kSpawnLoadUs, kIdleRetireSec);
   }
 
-  // Register both net workers' lanes with the IPC manager so
-  // EnqueueNetTask wakes the correct one based on the priority enqueued.
+  // The net workers' lanes are not assigned yet; WorkOrchestrator publishes
+  // them to the IPC manager after lane mapping (issue #768).
   IpcManager *ipc = CLIO_IPC;
   if (ipc) {
     ipc->SetNumSchedQueues(1);
-    if (net_send_worker_ && net_recv_worker_) {
-      ipc->SetNetLane(net_send_worker_->GetLane(),
-                      net_recv_worker_->GetLane());
-    }
   }
 
   int send_id = net_send_worker_ ? (int)net_send_worker_->GetId() : -1;

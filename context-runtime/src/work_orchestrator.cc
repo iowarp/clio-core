@@ -298,6 +298,19 @@ bool WorkOrchestrator::SpawnWorkerThreads() {
     }
   }
 
+  // issue #768: publish the net workers' lanes now that they exist. The
+  // schedulers pick the net workers in DivideWorkers, which runs before this
+  // lane mapping, so registering there stored null lanes: EnqueueNetTask then
+  // never woke the net worker and every response waited for its next timer
+  // tick (~15.6 ms on Windows).
+  if (scheduler_) {
+    Worker *send_worker = scheduler_->GetNetSendWorker();
+    Worker *recv_worker = scheduler_->GetNetRecvWorker();
+    if (send_worker && recv_worker) {
+      ipc->SetNetLane(send_worker->GetLane(), recv_worker->GetLane());
+    }
+  }
+
   // Assign GPU lanes only to the designated GPU worker
   size_t num_gpus = ipc->GetGpuQueueCount();
   if (num_gpus > 0 && scheduler_) {
