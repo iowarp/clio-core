@@ -11,7 +11,10 @@
 #
 # Usage: CLIO_RUN=<path/to/clio_run[.exe]> [LIVE=3] [SETTLE=45] ./run_repro.sh
 # Each node's log is <workdir>/node<i>.log; exit codes are printed at the end.
-# Exits 1 if any runtime died before the end of the run, else 0.
+# Exits 1 if any runtime died before the end of the run (#624), if any node
+# logged a dead peer as REJOINED (#1171: the DEAD_PEERS never answer), if a dead
+# peer was never declared dead (#1178), or if the survivors were not fenced yet
+# recovery created no containers (#1170). Else 0.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIO_RUN=${CLIO_RUN:?set CLIO_RUN to the clio_run binary}
@@ -75,6 +78,24 @@ for ((i = 0; i < LIVE; i++)); do
   grep -E "confirmed dead|Self-fencing|Recovery:|marked as DEAD" \
     "$WORK/node$i.log" | sed "s/^/  node$i| /" | head -20
 done
+
+# Behavioural checks on the logs (see the header).
+logs=("$WORK"/node*.log)
+if grep -q "REJOINED" "${logs[@]}"; then
+  echo "FAIL: an unreachable peer was logged as REJOINED (#1171)"
+  died=1
+fi
+for p in $DEAD_PEERS; do
+  if ! grep -q "($p) marked as DEAD" "${logs[@]}"; then
+    echo "FAIL: dead peer $p was never declared dead (#1178)"
+    died=1
+  fi
+done
+if ! grep -q "Self-fencing" "${logs[@]}" &&
+   ! grep -q "Recovery: Creating container" "${logs[@]}"; then
+  echo "FAIL: not self-fenced, yet recovery created no containers (#1170)"
+  died=1
+fi
 
 for ((i = 0; i < LIVE; i++)); do
   kill "${pids[$i]}" 2>/dev/null
