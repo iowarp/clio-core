@@ -15,7 +15,9 @@
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/memory/backend/posix_shm_mmap.h>
 
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -198,6 +200,42 @@ TEST_CASE("SystemInfoSharedMemoryCreateFailure") {
   // must stay one now that the Windows branch actually deletes a file.
   SystemInfo::DestroySharedMemory(too_long);
   SystemInfo::DestroySharedMemory("ctp_no_such_segment_xyz");
+}
+
+TEST_CASE("SystemInfoSharedMemoryAttachFailure") {
+  // Regression for #1173: the attach path reported "shm_open failed:
+  // strerror(errno)", which on Windows is unrelated to the failing call.
+  // Attaching a segment that does not exist must fail cleanly, and the error
+  // the platform reports must be "not found", not a stale code.
+  const std::string missing_name = "ctp_no_such_segment_attach_1173";
+  SystemInfo::DestroySharedMemory(missing_name);
+  PosixShmMmap backend;
+  REQUIRE_FALSE(backend.shm_attach(missing_name));
+
+  ctp::File missing;
+  REQUIRE_FALSE(SystemInfo::OpenSharedMemory(missing, missing_name));
+  std::string open_err = SystemInfo::GetLastSharedMemoryError();
+#if defined(_WIN32)
+  REQUIRE(open_err.find("(Win32 error 2)") != std::string::npos);
+#else
+  REQUIRE(open_err == strerror(ENOENT));
+#endif
+
+  // MapSharedMemory prints its own diagnostic on failure; that must not
+  // overwrite the error the caller then reads.
+  ctp::File invalid;
+#if defined(_WIN32)
+  invalid.windows_fd_ = nullptr;
+#else
+  invalid.posix_fd_ = -1;
+#endif
+  REQUIRE(SystemInfo::MapSharedMemory(invalid, 4096, 0) == nullptr);
+  std::string map_err = SystemInfo::GetLastSharedMemoryError();
+#if defined(_WIN32)
+  REQUIRE(map_err.find("(Win32 error 6)") != std::string::npos);
+#else
+  REQUIRE(map_err == strerror(EBADF));
+#endif
 }
 
 TEST_CASE("SystemInfoShmRecreateAfterDestroy") {

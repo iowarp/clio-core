@@ -117,7 +117,9 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     header_ = reinterpret_cast<MemoryBackendHeader *>(
         SystemInfo::MapSharedMemory(fd_, hdr_size, 0));
     if (!header_) {
-      HLOG(kError, "Failed to map backend header");
+      std::string shm_err = SystemInfo::GetLastSharedMemoryError();
+      HLOG(kError, "could not map the header of shared memory segment {}: {}",
+           url, shm_err);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
@@ -127,7 +129,10 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     region_ = reinterpret_cast<char *>(
         SystemInfo::MapSharedMemory(fd_, data_size, hdr_size));
     if (!region_) {
-      HLOG(kError, "Failed to map data region");
+      std::string shm_err = SystemInfo::GetLastSharedMemoryError();
+      HLOG(kError,
+           "could not map {} bytes of shared memory segment {}: {}",
+           data_size, url, shm_err);
       SystemInfo::UnmapMemory(header_, hdr_size);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
@@ -155,8 +160,12 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
    */
   bool shm_attach(const std::string &url) {
     if (!SystemInfo::OpenSharedMemory(fd_, url)) {
-      const char *err_buf = strerror(errno);
-      HLOG(kError, "shm_open failed: {}", err_buf);
+      // Same as shm_init: none of the platform calls is shm_open() and the
+      // Win32 one does not set errno, so ask the platform -- into a local,
+      // before HLOG, whose first use can clobber the thread's last error.
+      std::string shm_err = SystemInfo::GetLastSharedMemoryError();
+      HLOG(kError, "could not attach shared memory segment {}: {}", url,
+           shm_err);
       return false;
     }
     url_ = url;
@@ -167,7 +176,9 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     header_ = reinterpret_cast<MemoryBackendHeader *>(
         SystemInfo::MapSharedMemory(fd_, hdr_size, 0));
     if (!header_) {
-      HLOG(kError, "Failed to map backend header");
+      std::string shm_err = SystemInfo::GetLastSharedMemoryError();
+      HLOG(kError, "could not map the header of shared memory segment {}: {}",
+           url, shm_err);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
@@ -176,8 +187,9 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     size_t backend_size = header_->backend_size_;
     if (backend_size < hdr_size) {
       HLOG(kError,
-           "Invalid backend_size in header: {} bytes (must be >= {} bytes)",
-           backend_size, hdr_size);
+           "Invalid backend_size in the header of shared memory segment {}: "
+           "{} bytes (must be >= {} bytes)",
+           url, backend_size, hdr_size);
       SystemInfo::UnmapMemory(header_, hdr_size);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
@@ -188,7 +200,11 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     region_ = reinterpret_cast<char *>(
         SystemInfo::MapSharedMemory(fd_, data_size, hdr_size));
     if (!region_) {
-      HLOG(kError, "Failed to map data region during attach");
+      std::string shm_err = SystemInfo::GetLastSharedMemoryError();
+      HLOG(kError,
+           "could not map {} bytes of shared memory segment {} during attach: "
+           "{}",
+           data_size, url, shm_err);
       SystemInfo::UnmapMemory(header_, hdr_size);
       SystemInfo::CloseSharedMemory(fd_);
       return false;

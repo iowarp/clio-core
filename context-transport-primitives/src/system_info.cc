@@ -828,7 +828,10 @@ void *SystemInfo::MapSharedMemory(const File &fd, size_t size, i64 off) {
                      fd.posix_fd_, off);
 #endif
   if (ptr == MAP_FAILED) {
+    // Keep errno for the caller's GetLastSharedMemoryError() (#1173).
+    int saved_errno = errno;
     perror("mmap");
+    errno = saved_errno;
     return nullptr;
   }
 #if defined(__linux__) && defined(MADV_DONTDUMP)
@@ -867,6 +870,9 @@ void *SystemInfo::MapSharedMemory(const File &fd, size_t size, i64 off) {
                    (LPSTR)&msg_buf, 0, NULL);
     printf("MapViewOfFile failed with error: %s\n", (char *)msg_buf);
     LocalFree(msg_buf);
+    // FormatMessage/printf/LocalFree may overwrite the thread's last error;
+    // put back the MapViewOfFile code for GetLastSharedMemoryError() (#1173).
+    SetLastError(error);
   }
   return ret;
 #endif
