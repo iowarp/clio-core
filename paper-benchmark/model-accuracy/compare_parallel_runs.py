@@ -33,6 +33,7 @@ Output: runs/DATASET_<tag>_compare.csv and <fig-dir>/v2_DATASET_<tag>.png.
 import argparse
 import os
 import re
+import textwrap
 
 import matplotlib
 matplotlib.use("Agg")
@@ -143,6 +144,11 @@ def serial_row(ds, mode, tag, bw):
             "read_s": r["read_s"] + r["kmeans_s"], "app_s": r["e2e_s"], "ratio": r["ratio"]}
 
 
+def TitleWrap(text, width=150):
+    """@return text with each line wrapped to `width` characters."""
+    return "\n".join(textwrap.fill(line, width) for line in text.split("\n"))
+
+
 def plot(t, ds, procs, inflight, w, best, png, reads=4, bw=520000.0):
     """Application time and ratio of the three options, serial and parallel."""
     fig, ax = plt.subplots(1, 2, figsize=(15, 5.6))
@@ -175,13 +181,13 @@ def plot(t, ds, procs, inflight, w, best, png, reads=4, bw=520000.0):
     ax[0].legend(fontsize=7.5, loc="upper center", ncol=2, bbox_to_anchor=(0.5, -0.17))
     ax[1].set_title("Compression ratio (higher is better)", fontsize=10.5)
     ax[1].legend(fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.17))
-    fig.suptitle(f"{ds}: producer writes once, k-means consumer reads {reads} times; all options "
+    fig.suptitle(TitleWrap(f"{ds}: producer writes once, k-means consumer reads {reads} times; all options "
                  f"select by the cost weights {w} (compress / decompress / transfer) at "
                  f"{bw / 1e6:g} GB/s (one tier; the cost model's bandwidth, not this machine's)."
                  f"\nWith {procs} processes, each process writes and reads one chunk in {procs} "
                  f"with its own Clio runtime and its own NeuroPress learning.\nApplication "
                  f"time = measured time when at least one process writes or does a timed read "
-                 f"(steady-clock timestamps of every process).", fontsize=10)
+                 f"(steady-clock timestamps of every process)."), fontsize=10)
     fig.tight_layout()
     fig.savefig(png, dpi=130)
     print("wrote", png)
