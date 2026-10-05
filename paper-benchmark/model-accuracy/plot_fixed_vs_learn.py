@@ -146,8 +146,8 @@ def main():
     fig.legend([plt.Rectangle((0, 0), 1, 1, color=c) for c in colours],
                [lab for _, _, lab in arms], loc="upper left", ncol=3, frameon=False,
                fontsize=9.5, bbox_to_anchor=(0.01, 0.86), labelcolor=INK)
-    fig.suptitle(f"{a.dataset}: best single codec vs NeuroPress learning, the "
-                 "whole workload through Clio", x=0.01, ha="left", fontsize=13,
+    fig.suptitle(f"{ev.workload_label(a.dataset, ' ')}: best single codec vs NeuroPress "
+                 "learning, the whole workload through Clio", x=0.01, ha="left", fontsize=13,
                  color=INK, y=0.99)
     fig.text(0.01, 0.94, "Best single codec = cheapest of all 45 settings by the "
              "balanced 4-tier cost model (exhaustive run).\nSame chunks and order, "

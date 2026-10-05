@@ -24,6 +24,8 @@ import os
 import numpy as np
 import pandas as pd
 
+import eval_v2_workloads as ev
+
 RUNS = "/mnt/nvme0/v2-work/runs"
 TIERS = {"12 GB/s": 12e6, "1 GB/s": 1e6, "0.5 GB/s": 0.5e6, "0.25 GB/s": 0.25e6}
 
@@ -58,6 +60,9 @@ def analyse(run):
           else base.replace("_exhaustive", "").replace("_nolog", ""))
     piv, nbytes, run_bw, specs = measurements(run)
     names = specs + ["raw (store)"]
+    all_names, _ = ev.settings_list()
+    dropped = {all_names[k] for k in ev.DROPPED_SETTINGS}
+    drop = [i for i, n in enumerate(names) if n in dropped]
     gain, winners = [], []
     tiers = dict(TIERS)
     tiers["4-tier mix (as run)"] = None
@@ -65,15 +70,17 @@ def analyse(run):
         c = costs(piv, nbytes, run_bw if bw is None else bw)
         ok = ~np.isnan(c).any(axis=1)
         c = c[ok]
-        oracle = c.min(axis=1).sum()
+        sel = c.copy()   # the best single and the oracle select from the candidates
+        sel[:, drop] = np.inf
+        oracle = sel.min(axis=1).sum()
         totals = c.sum(axis=0)
-        k = int(np.argmin(totals))
+        k = int(np.argmin(sel.sum(axis=0)))
         gain.append({"workload": ds, "tier": tier, "chunks": int(ok.sum()),
                      "oracle_ms": oracle, "best_fixed": names[k],
                      "best_fixed_ms": totals[k],
                      "oracle_gain_pct": 100 * (totals[k] - oracle) / totals[k],
-                     "n_winning_settings": len(np.unique(c.argmin(axis=1)))})
-        share = pd.Series([names[j] for j in c.argmin(axis=1)]).value_counts(normalize=True)
+                     "n_winning_settings": len(np.unique(sel.argmin(axis=1)))})
+        share = pd.Series([names[j] for j in sel.argmin(axis=1)]).value_counts(normalize=True)
         winners += [{"workload": ds, "tier": tier, "setting": s, "share_pct": 100 * p}
                     for s, p in share.items()]
     return gain, winners

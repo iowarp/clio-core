@@ -38,9 +38,43 @@ import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS = "/mnt/nvme0/v2-work/runs"
+# Every workload run in full (no sampling): figures/new-workloads/nn-v2 shows
+# only these. Of the new (non-simulation) workloads only gnn-igbh and
+# graph-orkut-full are kept (user, 2026-10-05: the others, their runs,
+# searches, data and figures were removed; list in
+# /mnt/nvme0/v2-work/removed_new_workloads_2026-10-05.log).
+FULL_WORKLOADS = [
+    "nyx-full", "nyx-multiphase-50g", "gnn-igbh", "graph-orkut-full",
+    "ref-lammps-b70-2000", "ref-vpic-126-2000", "vpic-slabs", "ref-warpx-64x64x512-2000"]
 WEIGHTS_JSON = os.path.join(HERE, "..", "..", "context-transport-primitives", "src",
                             "compress", "model", "weights", "v2", "model_v2.json")
 MODES = ("static", "learn", "learnexp", "exhaustive")
+
+
+def workload_size(ds):
+    """(chunks, GiB) of a staged workload (/mnt/nvme0/v2-work/<ds>/fields)."""
+    d = os.path.join(os.path.dirname(RUNS), ds, "fields")
+    names = os.listdir(d)
+    return len(names), sum(os.path.getsize(os.path.join(d, n)) for n in names) / 2**30
+
+
+def workload_label(ds, sep="  "):
+    """'<ds>  (N chunks, X.X GiB)' for plot labels."""
+    n, gib = workload_size(ds)
+    return f"{ds}{sep}({n} chunks, {gib:.1f} GiB)"
+
+
+def total_label(dss):
+    """'N workloads, C chunks, X.X GiB in total' over the given workloads."""
+    sizes = [workload_size(d) for d in dss]
+    return (f"{len(dss)} workloads, {sum(n for n, _ in sizes):,} chunks, "
+            f"{sum(g for _, g in sizes):.1f} GiB in total")
+
+
+def run_finished(run):
+    """True when a run's stdout.log holds its final timing line."""
+    p = os.path.join(run, "stdout.log")
+    return os.path.exists(p) and "stage+compress" in open(p).read()
 
 
 def settings_list():
@@ -51,6 +85,37 @@ def settings_list():
     return names, store[0]
 
 
+# The settings that the best single codec and the oracle select from: all 45
+# again (user, 2026-10-05, "return add 45 configs of codecs"; it was 33
+# earlier the same day: one cascaded / gdeflate variant, at most 3 per codec).
+# NeuroPress selects among all 45 as well. Put indices here to leave settings
+# out of the best single codec and the oracle.
+DROPPED_SETTINGS = ()
+
+
+def candidate_settings(n_settings=45):
+    """The setting indices that the best single codec and the oracle select from.
+
+    @param n_settings number of settings in the model
+    @return list of indices, without DROPPED_SETTINGS
+    """
+    return [s for s in range(n_settings) if s not in DROPPED_SETTINGS]
+
+
+def for_selection(cost):
+    """A copy of a cost matrix with the dropped settings at +inf.
+
+    Use it only for the argmin of the best single codec or the oracle, never to
+    score a pick: a pick of a dropped setting keeps its measured cost.
+
+    @param cost cost[chunk, setting] (or one chunk's cost[setting])
+    @return the copy, dropped settings' columns set to +inf
+    """
+    c = np.array(cost, dtype=float)
+    c[..., list(DROPPED_SETTINGS)] = np.inf
+    return c
+
+
 def raw_primary(m):
     """Rows logging a primary that did not shrink its chunk and was stored
     raw (no measurement of its setting: ct 0 when exploration deferred the
@@ -58,16 +123,20 @@ def raw_primary(m):
     return (m.role == "primary") & ((m.comp_ms <= 0) | (m.ratio <= 1))
 
 
-def load_truth(run, n_settings, store):
+def load_truth(run, n_settings, store, w=(1.0, 1.0, 1.0), bw=None):
     """Chunk x setting truth cost from an exhaustive run.
 
     A setting that does not shrink the chunk (ratio <= 1) is stored raw by
     Clio, so its cost is its compress time plus raw I/O; storing raw outright
-    costs the I/O alone.
+    costs the I/O alone. Each term carries its weight:
+    w_ct * ct + w_dt * dt + w_io * bytes / (ratio * bw).
 
     @param run         exhaustive run directory
     @param n_settings  number of settings (45)
     @param store       index of the store setting
+    @param w           (w_ct, w_dt, w_io); (1, 1, 1) is the balanced model
+    @param bw          one bandwidth in bytes per ms for every chunk, or None
+                       for the tier each chunk was written to
     @return (blobs, cost[chunk, setting]) with NaN where unmeasured
     """
     pred = pd.read_csv(os.path.join(run, "v2_pred.csv"))
@@ -84,13 +153,15 @@ def load_truth(run, n_settings, store):
               f"with a failed decompress: "
               f"{m[failed][['setting', 'spec', 'ratio']].to_dict('records')[:3]}")
     m = m[~failed]
-    raw_io = (pred.set_index("blob").bytes.reindex(m.blob).to_numpy(float)
-              / m.tier_bw.to_numpy(float))
+    w_ct, w_dt, w_io = w
+    m_bw = m.tier_bw.to_numpy(float) if bw is None else np.full(len(m), float(bw))
+    raw_io = pred.set_index("blob").bytes.reindex(m.blob).to_numpy(float) / m_bw
     kept = m.ratio.to_numpy() > 1
-    c = np.where(kept, m.comp_ms + m.decomp_ms + raw_io / m.ratio,
-                 m.comp_ms + raw_io)
+    c = np.where(kept, w_ct * m.comp_ms + w_dt * m.decomp_ms + w_io * raw_io / m.ratio,
+                 w_ct * m.comp_ms + w_io * raw_io)
     cost[m.blob.map(idx).to_numpy(), m.setting.to_numpy()] = c
-    cost[:, store] = pred.bytes.to_numpy(float) / pred.tier_bw.to_numpy(float)
+    p_bw = pred.tier_bw.to_numpy(float) if bw is None else float(bw)
+    cost[:, store] = w_io * pred.bytes.to_numpy(float) / p_bw
     return blobs, cost
 
 
@@ -153,14 +224,14 @@ def score_mode(ds, mode, run, names, store, blobs, truth):
     d = d[rows.notna()].reset_index(drop=True)
     t = truth[rows.dropna().astype(int).to_numpy()]
     r = np.arange(len(d))
-    best = np.nanargmin(t, axis=1)
+    best = np.nanargmin(for_selection(t), axis=1)   # oracle: candidates only
     bc = t[r, best]
     d["best"] = best
     d["regret_pick"] = 100 * (t[r, d.pick] / bc - 1)
     d["regret_stored"] = 100 * (t[r, d.stored] / bc - 1)
     # Best single setting over the chunks where every setting was measured.
     complete = ~np.isnan(t).any(axis=1)
-    single = t[complete].sum(axis=0)
+    single = for_selection(t[complete]).sum(axis=0)
     s_best = int(np.argmin(single))
     d["cost_stored"], d["cost_best"] = t[r, d.stored], bc
     d["cost_single"] = t[r, s_best]

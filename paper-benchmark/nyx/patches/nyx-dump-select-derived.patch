@@ -1,0 +1,85 @@
+--- a/Source/IO/Nyx_output.cpp
++++ b/Source/IO/Nyx_output.cpp
+@@ -1,6 +1,7 @@
+ #include <unistd.h>
+ #include <vector>
+ #include <cstring>
++#include <sstream>
+ #include <iomanip>
+ #include <Nyx.H>
+ #ifdef AMREX_USE_SUNDIALS
+@@ -220,10 +221,71 @@
+        AMReX HDF5, and driven off the hydro state rather than the assembled
+        plot MultiFab so it does not depend on derive(). */
+     {
+-        const amrex::MultiFab& S = get_new_data(State_Type);
++        const amrex::MultiFab& S_all = get_new_data(State_Type);
++        /* NYX_DUMP_STATE="density rho_E ..." writes only those state
++           components (as amr.plot_vars chooses a plotfile's); unset or empty
++           writes every one. */
++        const char* sv = getenv("NYX_DUMP_STATE");
++        amrex::Vector<int> keep;
++        if (sv != nullptr && *sv != '\0') {
++            std::string list(sv);
++            for (char& ch : list) if (ch == ',') ch = ' ';
++            std::istringstream is(list);
++            std::string w;
++            while (is >> w) {
++                for (int c = 0; c < S_all.nComp(); ++c) {
++                    if (desc_lst[State_Type].name(c) == w) keep.push_back(c);
++                }
++            }
++        } else {
++            for (int c = 0; c < S_all.nComp(); ++c) keep.push_back(c);
++        }
++        amrex::MultiFab S(S_all.boxArray(), S_all.DistributionMap(),
++                          static_cast<int>(keep.size()), 0);
+         amrex::Vector<std::string> nm;
+-        for (int c = 0; c < S.nComp(); ++c) nm.push_back(desc_lst[State_Type].name(c));
+-        nyx_dump_raw_fields(parent, S, nm);
++        for (int q = 0; q < static_cast<int>(keep.size()); ++q) {
++            amrex::MultiFab::Copy(S, S_all, keep[q], q, 1, 0);
++            nm.push_back(desc_lst[State_Type].name(keep[q]));
++        }
++        /* NYX_DUMP_DERIVED="divu magvort ..." also writes those derived
++           quantities (any name derive() knows; others are skipped), as more
++           components of the same step, so each field is a separate file in
++           the same plt directory. */
++        const char* dv = getenv("NYX_DUMP_DERIVED");
++        amrex::Vector<std::string> want;
++        if (dv != nullptr) {
++            std::string list(dv);
++            for (char& ch : list) if (ch == ',') ch = ' ';
++            std::istringstream is(list);
++            std::string w;
++            while (is >> w) {
++                int st = 0, sc = 0;
++                if (derive_lst.canDerive(w) || isStateVariable(w, st, sc)) {
++                    want.push_back(w);
++                }
++            }
++        }
++        if (want.empty()) {
++            nyx_dump_raw_fields(parent, S, nm);
++        } else {
++            const amrex::Real t = state[State_Type].curTime();
++            amrex::Vector<std::unique_ptr<amrex::MultiFab>> ders;
++            int extra = 0;
++            for (const auto& w : want) {
++                ders.push_back(derive(w, t, 0));
++                extra += ders.back()->nComp();
++            }
++            amrex::MultiFab all(S.boxArray(), S.DistributionMap(), S.nComp() + extra, 0);
++            amrex::MultiFab::Copy(all, S, 0, 0, S.nComp(), 0);
++            int c = S.nComp();
++            for (int q = 0; q < static_cast<int>(ders.size()); ++q) {
++                for (int cc = 0; cc < ders[q]->nComp(); ++cc, ++c) {
++                    amrex::MultiFab::Copy(all, *ders[q], cc, c, 1, 0);
++                    nm.push_back(ders[q]->nComp() > 1 ? want[q] + std::to_string(cc) : want[q]);
++                }
++            }
++            nyx_dump_raw_fields(parent, all, nm);
++        }
+     }
+ 
+ #ifdef AMREX_USE_HDF5

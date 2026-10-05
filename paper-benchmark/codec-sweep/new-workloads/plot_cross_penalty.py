@@ -37,9 +37,7 @@ RES = os.path.join(HERE, "..", "results", "cross-penalty")
 PIPE = os.path.expanduser("~/np-pipeline")
 
 # (dataset, best-of array, used-on array, short title) -- from products.csv
-INSIDE = [("consumer-vpic-full", "kmeans.i32", "pdf2d.f64", "VPIC analysis:\nk-means labels' best -> 2-D PDF"),
-          ("graph-orkut-full", "cc_label.i32", "edges_src.i32", "Orkut graph:\ncomponent labels' best -> edge list"),
-          ("sparse-fem", "Flan_1565_row_ptr.i64", "Flan_1565_col_idx.i32", "FEM:\nrow pointers' best -> column indices"),
+INSIDE = [("graph-orkut-full", "cc_label.i32", "edges_src.i32", "Orkut graph:\ncomponent labels' best -> edge list"),
           ("ref-vpic-126-2000", "ex.f32", "div_e_err.f32", "VPIC sim:\nE-field's best -> div(E) error")]
 
 
@@ -126,7 +124,7 @@ def inside(ax):
 
 def measured(ax):
     rows = []
-    for w, name in (("vpic", "VPIC"), ("lammps", "LAMMPS"), ("nanoaod", "NanoAOD"), ("fem", "FEM")):
+    for w, name in (("vpic", "VPIC"), ("lammps", "LAMMPS")):   # nanoaod, fem removed
         f = os.path.join(PIPE, w, "runs.csv")
         if not os.path.exists(f):
             continue

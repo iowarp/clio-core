@@ -1,0 +1,170 @@
+diff --git a/Exec/HydroTests/Prob.cpp b/Exec/HydroTests/Prob.cpp
+index 8cc1fa54..7ff6d614 100644
+--- a/Exec/HydroTests/Prob.cpp
++++ b/Exec/HydroTests/Prob.cpp
+@@ -1,5 +1,6 @@
+ #include "Nyx.H"
+ #include "Prob.H"
++#include <cmath>
+ 
+ enum Prob_Type_Index_Sod {
+   p_l_comp = 6, // Note this must be one greater than the final index in Prob_param.H
+@@ -22,9 +23,36 @@ enum Prob_Type_Index_Sedov {
+   dens_ambient_comp,
+   exp_energy_comp,
+   r_init_comp,
+-  nsub_comp
++  nsub_comp,
++  noise_dens_comp,   // relative amplitude of per-cell ambient density noise
++  noise_vel_comp,    // amplitude of per-cell ambient velocity noise
++  nblast_comp,       // number of explosions (1 = the centred Sedov blast)
++  nphase_comp,       // ambient phases (0 = uniform ambient medium)
++  phase_rho_comp,    // density contrast between the densest and lightest phase
++  phase_p_comp,      // pressure contrast between phases
++  phase_block_comp,  // cells per side of one phase clump (1 = cell by cell)
++  nlayer_comp,       // > 0: alternate clumpy / smooth layers along z
++  smooth_amp_comp,   // relative amplitude of the smooth layers' density wave
++  smooth_k_comp,     // wavenumber (periods per box) of that wave
++  phase_pow2_comp,   // 1: phase densities are exact powers of two
++  smooth_exp_comp    // 1: smooth layers are rho0 * exp(amp * wave), else rho0 * (1 + amp * wave)
+ };
+ 
++/**
++ * Deterministic per-cell noise in [-1, 1): a hash of the cell index and a
++ * channel, so every run (and every GPU block order) sees the same field.
++ */
++AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
++amrex::Real cell_noise(int i, int j, int k, int c)
++{
++  unsigned int h = static_cast<unsigned int>(i) * 73856093u ^
++                   static_cast<unsigned int>(j) * 19349663u ^
++                   static_cast<unsigned int>(k) * 83492791u ^
++                   static_cast<unsigned int>(c) * 2654435761u;
++  h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
++  return static_cast<amrex::Real>(h & 0xffffffu) / amrex::Real(8388608.0) - amrex::Real(1.0);
++}
++
+ void prob_param_special_fill(amrex::GpuArray<amrex::Real,max_prob_param>& prob_param)
+ {
+     if(amrex::Math::round(prob_param[prob_type_comp]) == 0)
+@@ -65,7 +93,31 @@ void prob_param_special_fill(amrex::GpuArray<amrex::Real,max_prob_param>& prob_p
+     prob_param[dens_ambient_comp] = 1.0;
+     prob_param[exp_energy_comp] = 1.0;
+     prob_param[nsub_comp] = 10;
++    prob_param[noise_dens_comp] = 0.0;
++    prob_param[noise_vel_comp] = 0.0;
++    prob_param[nblast_comp] = 1;
+     amrex::ParmParse pp("prob");
++    pp.query("noise_dens", prob_param[noise_dens_comp]);
++    pp.query("noise_vel", prob_param[noise_vel_comp]);
++    pp.query("nblast", prob_param[nblast_comp]);
++    prob_param[nphase_comp] = 0;
++    prob_param[phase_rho_comp] = 100.0;
++    prob_param[phase_p_comp] = 10.0;
++    prob_param[phase_block_comp] = 1;
++    pp.query("nphase", prob_param[nphase_comp]);
++    pp.query("phase_rho", prob_param[phase_rho_comp]);
++    pp.query("phase_p", prob_param[phase_p_comp]);
++    pp.query("phase_block", prob_param[phase_block_comp]);
++    prob_param[nlayer_comp] = 0;
++    prob_param[smooth_amp_comp] = 0.5;
++    prob_param[smooth_k_comp] = 2;
++    prob_param[phase_pow2_comp] = 0;
++    pp.query("nlayer", prob_param[nlayer_comp]);
++    pp.query("smooth_amp", prob_param[smooth_amp_comp]);
++    pp.query("smooth_k", prob_param[smooth_k_comp]);
++    pp.query("phase_pow2", prob_param[phase_pow2_comp]);
++    prob_param[smooth_exp_comp] = 0;
++    pp.query("smooth_exp", prob_param[smooth_exp_comp]);
+     pp.query("p_ambient", prob_param[p_ambient_comp]);
+     pp.query("dens_ambient", prob_param[dens_ambient_comp]);
+     pp.query("exp_energy", prob_param[exp_energy_comp]);
+@@ -204,6 +256,15 @@ void prob_initdata_state(const int i,
+       for (int ii = 0; ii < prob_param[nsub_comp]; ii++) {
+         const amrex::Real x = xmin + (ii + 0.5) * dx_sub - ctr_x;
+         amrex::Real dist = AMREX_D_TERM(x * x, +y * y, +z * z);
++        // Further blasts at fixed pseudo-random centres in the inner 80% of
++        // the box (offsets from the box centre).
++        for (int b = 1; b < static_cast<int>(prob_param[nblast_comp]); ++b) {
++          AMREX_D_TERM(
++            const amrex::Real bx = x - 0.4 * (prob_hi[0] - prob_lo[0]) * cell_noise(b, 1, 7, 11);
++            , const amrex::Real by = y - 0.4 * (prob_hi[1] - prob_lo[1]) * cell_noise(b, 2, 7, 13);
++            , const amrex::Real bz = z - 0.4 * (prob_hi[2] - prob_lo[2]) * cell_noise(b, 3, 7, 17);)
++          dist = amrex::min(dist, AMREX_D_TERM(bx * bx, +by * by, +bz * bz));
++        }
+ 
+         if (dist <= prob_param[r_init_comp] * prob_param[r_init_comp]) {
+           npert += 1;
+@@ -218,17 +279,54 @@ void prob_initdata_state(const int i,
+   }
+ #endif
+ 
++  amrex::Real rho_amb = prob_param[dens_ambient_comp];
++  amrex::Real p_amb = prob_param[p_ambient_comp];
++  const int nphase = static_cast<int>(prob_param[nphase_comp]);
++  // Layers along z (the slowest index, so a 4 MiB chunk of a field lies in
++  // one layer): even layers clumpy (the phases below), odd layers a smooth
++  // density wave at the same pressure.
++  const int nlayer = static_cast<int>(prob_param[nlayer_comp]);
++  bool clumpy = nphase > 1;
++  if (nlayer > 0) {
++    const amrex::Real zf = (prob_lo[2] + (k + 0.5) * dx[2] - prob_lo[2]) / (prob_hi[2] - prob_lo[2]);
++    const int layer = amrex::min(nlayer - 1, static_cast<int>(zf * nlayer));
++    if (layer % 2 == 1) {
++      clumpy = false;
++      const amrex::Real kk2 = 2.0 * M_PI * prob_param[smooth_k_comp];
++      const amrex::Real xs = (i + 0.5) * dx[0], ys = (j + 0.5) * dx[1], zs = (k + 0.5) * dx[2];
++      const amrex::Real wave = std::sin(kk2 * xs) * std::sin(kk2 * ys + 0.7) * std::sin(kk2 * zs + 1.3);
++      rho_amb *= (prob_param[smooth_exp_comp] > 0.5) ? std::exp(prob_param[smooth_amp_comp] * wave)
++                                                      : 1.0 + prob_param[smooth_amp_comp] * wave;
++    }
++  }
++  if (clumpy && nphase > 1) {
++    const int blk = amrex::max(1, static_cast<int>(prob_param[phase_block_comp]));
++    const amrex::Real u = 0.5 * (cell_noise(i / blk, j / blk, k / blk, 5) + 1.0);
++    const int q = amrex::min(nphase - 1, static_cast<int>(u * nphase));
++    const amrex::Real f = static_cast<amrex::Real>(q) / static_cast<amrex::Real>(nphase - 1) - 0.5;
++    if (prob_param[phase_pow2_comp] > 0.5) {
++      rho_amb = std::ldexp(prob_param[dens_ambient_comp], q - nphase / 2);
++    } else {
++      rho_amb *= std::pow(prob_param[phase_rho_comp], f);
++    }
++    p_amb *= std::pow(prob_param[phase_p_comp], -f);
++  }
++
+   amrex::Real p_zone =
+     (static_cast<amrex::Real>(npert) * p_exp +
+-     static_cast<amrex::Real>(n_amb) * prob_param[p_ambient_comp]) /
++     static_cast<amrex::Real>(n_amb) * p_amb) /
+     static_cast<amrex::Real>(prob_param[nsub_comp] * prob_param[nsub_comp] * prob_param[nsub_comp]);
+ 
+   amrex::Real eint = p_zone / (prob_param[gamma_comp] - 1.0);
+ 
+-  state(i, j, k, Density_comp) = prob_param[dens_ambient_comp];
+-  state(i, j, k, Xmom_comp) = 0.0;
+-  state(i, j, k, Ymom_comp) = 0.0;
+-  state(i, j, k, Zmom_comp) = 0.0;
++  state(i, j, k, Density_comp) = rho_amb *
++      (1.0 + prob_param[noise_dens_comp] * cell_noise(i, j, k, 0));
++  state(i, j, k, Xmom_comp) = state(i, j, k, Density_comp) *
++      prob_param[noise_vel_comp] * cell_noise(i, j, k, 1);
++  state(i, j, k, Ymom_comp) = state(i, j, k, Density_comp) *
++      prob_param[noise_vel_comp] * cell_noise(i, j, k, 2);
++  state(i, j, k, Zmom_comp) = state(i, j, k, Density_comp) *
++      prob_param[noise_vel_comp] * cell_noise(i, j, k, 3);
+ 
+   state(i, j, k, Eden_comp) = eint + 0.5 *
+                                    (state(i, j, k, Xmom_comp) * state(i, j, k, Xmom_comp) +
+diff --git a/Source/Driver/Nyx.H b/Source/Driver/Nyx.H
+index 7d5c7c85..e7d67ea8 100644
+--- a/Source/Driver/Nyx.H
++++ b/Source/Driver/Nyx.H
+@@ -66,7 +66,7 @@ enum StateType {
+ #endif
+     NUM_STATE_TYPE
+ };
+-static constexpr int max_prob_param = 20;
++static constexpr int max_prob_param = 32;
+ #endif
+ 
+ //

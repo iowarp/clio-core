@@ -48,7 +48,11 @@
 #include "clio_ctp/compress/gpu_setting_codec.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -803,18 +807,79 @@ std::unique_ptr<Codec> MakeCodec(int index) {
 }
 
 /**
- * @return this thread's codec for a setting, built on first use. The cache is
- * deliberately never destroyed: its nvcomp managers, streams and device
- * buffers would otherwise be freed at thread or process exit, after the CUDA
- * runtime has already been torn down, which crashes the process on exit.
+ * @brief The codec objects of every setting, shared by all threads.
+ *
+ * A call leases one codec object for its whole duration and returns it (each
+ * object has its own stream and buffers, and every call ends with its stream
+ * idle), so a codec built and warmed by one thread serves every thread. A
+ * per-thread cache made each worker build and warm every setting it met
+ * again, inside the caller's timed work, which costs a selector that uses
+ * many settings far more than a single codec. The pool is deliberately never
+ * destroyed: its nvcomp managers, streams and device buffers would otherwise
+ * be freed at process exit, after the CUDA runtime has been torn down, which
+ * crashes the process on exit.
  */
-Codec *CachedCodec(int index) {
-  static thread_local auto *cache = new std::map<int, std::unique_ptr<Codec>>();
-  auto &c = (*cache)[index];
-  if (!c) c = MakeCodec(index);
-  if (!c) throw CodecError(std::string("setting unavailable: ") + kSpecs[index]);
-  return c.get();
+struct CodecPool {
+  std::mutex mu;
+  std::vector<std::vector<std::unique_ptr<Codec>>> idle;
+  std::atomic<unsigned long long> builds{0};  ///< built on demand
+  CodecPool() : idle(kGpuSettingCount) {}
+};
+
+/** @return the process's codec pool (leaked on purpose, see CodecPool). */
+CodecPool &Pool() {
+  static auto *pool = new CodecPool();
+  return *pool;
 }
+
+/** @return the steady-clock time in nanoseconds (the drivers' clock). */
+long long SteadyNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+/**
+ * @brief One codec object of a setting, taken from the pool for one call: an
+ * idle (warm) object, or one built now when none is idle. A build on demand
+ * is reported on stderr with its steady-clock time, so a harness can tell
+ * whether one happened inside its timed work.
+ */
+class CodecLease {
+ public:
+  /** @param index setting index */
+  explicit CodecLease(int index) : index_(index) {
+    CodecPool &pool = Pool();
+    {
+      std::lock_guard<std::mutex> lock(pool.mu);
+      auto &idle = pool.idle[index];
+      if (!idle.empty()) {
+        c_ = std::move(idle.back());
+        idle.pop_back();
+      }
+    }
+    if (!c_) {
+      c_ = MakeCodec(index);
+      if (!c_) throw CodecError(std::string("setting unavailable: ") + kSpecs[index]);
+      const unsigned long long n = pool.builds.fetch_add(1) + 1;
+      std::fprintf(stderr, "[gpu-setting-codec] build on demand: setting %d (%s), "
+                   "build %llu, steady_ns %lld\n", index, kSpecs[index], n, SteadyNs());
+    }
+  }
+  ~CodecLease() {
+    if (!c_) return;
+    std::lock_guard<std::mutex> lock(Pool().mu);
+    Pool().idle[index_].push_back(std::move(c_));
+  }
+  CodecLease(const CodecLease &) = delete;
+  CodecLease &operator=(const CodecLease &) = delete;
+  /** @return the leased codec */
+  Codec *get() const { return c_.get(); }
+
+ private:
+  int index_;
+  std::unique_ptr<Codec> c_;
+};
 
 /** @return true for device or managed memory. */
 bool OnDevice(const void *p) {
@@ -866,9 +931,8 @@ constexpr size_t kTailAlign = 8;
  * Compress n bytes (a multiple of kTailAlign) with one setting.
  * @return compressed bytes written to output (0 never: failures throw)
  */
-size_t CompressBody(int index, void *output, size_t cap, const void *input,
+size_t CompressBody(Codec *c, void *output, size_t cap, const void *input,
                     size_t n) {
-  Codec *c = CachedCodec(index);
   if (!c->Accepts(n)) throw CodecError("input size not accepted");
   const cudaStream_t s = c->stream();
   DeviceBuffer in_tmp, out_tmp;
@@ -905,9 +969,8 @@ size_t CompressBody(int index, void *output, size_t cap, const void *input,
  * Decompress comp bytes into exactly n bytes (a multiple of kTailAlign) with
  * one setting.
  */
-void DecompressBody(int index, void *output, size_t n, const void *input,
+void DecompressBody(Codec *c, void *output, size_t n, const void *input,
                     size_t comp) {
-  Codec *c = CachedCodec(index);
   const cudaStream_t s = c->stream();
   DeviceBuffer in_tmp, out_tmp;
   const uint8_t *d_in = DeviceInput(input, comp, s, &in_tmp);
@@ -952,7 +1015,7 @@ size_t RunCompress(int index, void *output, size_t cap, const void *input,
   const size_t body = n - tail;
   if (cap < tail) throw CodecError("output too small for the tail");
   const size_t comp =
-      body > 0 ? CompressBody(index, output, cap - tail, input, body) : 0;
+      body > 0 ? CompressBody(CodecLease(index).get(), output, cap - tail, input, body) : 0;
   if (tail > 0) {
     GSC_CHECK(cudaMemcpy(static_cast<uint8_t *>(output) + comp,
                          static_cast<const uint8_t *>(input) + body, tail,
@@ -977,7 +1040,7 @@ void RunDecompress(int index, void *output, size_t n, const void *input,
   if (comp < tail || (body > 0 && comp == tail)) {
     throw CodecError("payload shorter than its tail");
   }
-  if (body > 0) DecompressBody(index, output, body, input, comp - tail);
+  if (body > 0) DecompressBody(CodecLease(index).get(), output, body, input, comp - tail);
   if (tail > 0) {
     GSC_CHECK(cudaMemcpy(static_cast<uint8_t *>(output) + body,
                          static_cast<const uint8_t *>(input) + (comp - tail),
@@ -985,10 +1048,90 @@ void RunDecompress(int index, void *output, size_t n, const void *input,
   }
 }
 
+/**
+ * Build `copies` codec objects of one setting and warm each at n bytes (an
+ * untimed compress and decompress of synthetic data), then put them in the
+ * pool.
+ * @return objects warmed (0 when the setting fails on this input)
+ */
+int WarmSetting(int index, int copies, const uint8_t *d_in, size_t n) {
+  std::vector<std::unique_ptr<Codec>> made;
+  for (int k = 0; k < copies; ++k) {
+    auto c = MakeCodec(index);
+    if (!c) return 0;
+    DeviceBuffer out, back;
+    const size_t bound = c->Bound(n);
+    const size_t comp = CompressBody(c.get(), out.Alloc(bound), bound, d_in, n);
+    DecompressBody(c.get(), back.Alloc(n), n, out.ptr, comp);
+    made.push_back(std::move(c));
+  }
+  std::lock_guard<std::mutex> lock(Pool().mu);
+  for (auto &c : made) Pool().idle[index].push_back(std::move(c));
+  return copies;
+}
+
 #undef GSC_CHECK
 #endif  // CTP_ENABLE_CUDA
 
 }  // namespace
+
+int GpuSettingPrewarm(int copies, size_t bytes) {
+#if CTP_ENABLE_CUDA
+  const size_t n = bytes - bytes % kTailAlign;
+  if (copies <= 0 || n == 0) return 0;
+  // Synthetic float32 data (a smooth wave with a small step pattern): no
+  // benchmark data, and every codec takes its normal path on it.
+  std::vector<float> host(n / sizeof(float));
+  for (size_t i = 0; i < host.size(); ++i) {
+    host[i] = 100.0f * std::sin(static_cast<float>(i) * 1e-3f) +
+              0.01f * static_cast<float>(i % 13);
+  }
+  uint8_t *d_in = nullptr;
+  if (cudaMalloc(&d_in, n) != cudaSuccess) {
+    cudaGetLastError();
+    return 0;
+  }
+  cudaMemcpy(d_in, host.data(), n, cudaMemcpyHostToDevice);
+  const long long t0 = SteadyNs();
+  // One more copy of every setting per round, so all settings always hold the
+  // same number; a round starts only while it leaves a quarter of the GPU's
+  // memory free (codec objects hold tens of MB each, and several processes
+  // may share the GPU).
+  std::vector<char> usable(kGpuSettingCount);
+  for (int i = 0; i < kGpuSettingCount; ++i) usable[i] = GpuSettingAvailable(i);
+  size_t free_b = 0, total_b = 0, round_b = 0;
+  int warmed = 0, rounds = 0;
+  for (; rounds < copies; ++rounds) {
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) break;
+    if (rounds > 0 && free_b < total_b / 4 + round_b) break;
+    const size_t before = free_b;
+    for (int index = 0; index < kGpuSettingCount; ++index) {
+      if (!usable[index]) continue;
+      try {
+        warmed += WarmSetting(index, 1, d_in, n);
+      } catch (const std::exception &e) {
+        cudaGetLastError();
+        usable[index] = 0;
+        std::fprintf(stderr, "[gpu-setting-codec] prewarm: setting %d (%s) failed: %s\n",
+                     index, kSpecs[index], e.what());
+      }
+    }
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && before > free_b) {
+      round_b = before - free_b;
+    }
+  }
+  cudaFree(d_in);
+  std::fprintf(stderr, "[gpu-setting-codec] prewarm: %d codec objects, %d per setting (asked "
+               "%d; %.2f GB per copy of all settings, %.1f of %.1f GB free) at %zu bytes in "
+               "%.1f ms, steady_ns %lld\n", warmed, rounds, copies, round_b / 1e9,
+               free_b / 1e9, total_b / 1e9, n, (SteadyNs() - t0) / 1e6, SteadyNs());
+  return warmed;
+#else
+  (void)copies;
+  (void)bytes;
+  return 0;
+#endif
+}
 
 const char *GpuSettingSpec(int index) {
   return (index >= 0 && index < kGpuSettingCount) ? kSpecs[index] : nullptr;
@@ -1117,7 +1260,7 @@ size_t GpuSettingCodec::MaxCompressedSize(size_t input_size) {
     // The body's bound plus the raw tail (RunCompress).
     const size_t tail = input_size % kTailAlign;
     const size_t body = input_size - tail;
-    return (body > 0 ? CachedCodec(index_)->Bound(body) : 0) + tail;
+    return (body > 0 ? CodecLease(index_).get()->Bound(body) : 0) + tail;
   } catch (const std::exception &) {
     return 0;
   }

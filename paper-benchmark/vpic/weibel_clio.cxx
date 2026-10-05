@@ -2,6 +2,8 @@
 #include <sys/stat.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
+#include <string>
 
 // Magnetic reconnection in a Harris equilibrium thin current sheet
 //
@@ -59,6 +61,7 @@
 begin_globals {
   int    clio_dump_interval;   // steps between raw field dumps (0 = off)
   char   clio_dump_dir[512];
+  char   clio_dump_vars[256];  // VPIC_DUMP_VARS: field names to dump ("" = all 16)
   double energies_interval;
   double fields_interval;
   double ehydro_interval;
@@ -130,6 +133,12 @@ begin_initialization {
   double Lx        = 10;
   double Ly        = 10;
   double Lz        = 10;
+  // VPIC_L: box length (same on every axis). With the frozen vacuum fields of
+  // LAYERED SLABS, use L = cells * 2^-5 so the cell size is an exact power of
+  // two: the start-up divergence clean then sees an exactly zero error in the
+  // vacuum slabs and leaves their fields bit-exact (with L = 10 it adds
+  // rounding-level noise to every cell).
+  if( getenv("VPIC_L") ) Lx = Ly = Lz = atof( getenv("VPIC_L") );
   // 3D and configurable. Defaults give 128^3 voxels -> 16 field vars x
   // 2,097,152 cells x 4 B = 134 MB per dump, which is the same order as the
   // Nyx benchmark's per-frame payload and lets the two be compared.
@@ -138,6 +147,13 @@ begin_initialization {
   double ny        = getenv("VPIC_NY")   ? atof(getenv("VPIC_NY"))   : 128;
   double nz        = getenv("VPIC_NZ")   ? atof(getenv("VPIC_NZ"))   : 128;
   double nppc      = getenv("VPIC_NPPC") ? atof(getenv("VPIC_NPPC")) : 8;
+  // VPIC_CELL: cell size on every axis (box length = cells * VPIC_CELL), for
+  // a non-cubic box with cubic cells; overrides VPIC_L. With LAYERED SLABS use
+  // a power of two (2^-5) for the same reason as VPIC_L.
+  if( getenv("VPIC_CELL") ) {
+    const double cell = atof( getenv("VPIC_CELL") );
+    Lx = nx * cell; Ly = ny * cell; Lz = nz * cell;
+  }
   double cfl_req   = 0.99f; //0.99;  // How close to Courant should we try to run
   double wpedt_max = 0.36;  // How big a timestep is allowed if Courant is not too restrictive
   double damp      = 0.0; // Level of radiation damping
@@ -153,9 +169,41 @@ begin_initialization {
   double hy = Ly/ny;
   double hz = Lz/nz;
 
-  double Npe = n0*Ly*Lz*Lx;    // Number physical electrons.
+  // LAYERED SLABS (VPIC_SLABS, off by default). The box is cut along z into
+  // slabs of VPIC_SLAB_CELLS cells (16 by default), one character per slab.
+  // Slab s holds cells k = s*SLAB .. s*SLAB+SLAB-1 of the 1-based cell index
+  // (slab 0 starts at k = 1): the dumped array includes one ghost plane, so
+  // array plane k is cell k and, at 254^3 with 16 z-planes per 4 MiB chunk,
+  // every chunk of a field lies in exactly one slab.
+  //   P  plasma: the bi-Maxwellian electrons and ions, at density n0
+  //   C  vacuum holding a frozen "clumpy" electrostatic field E = -grad(phi),
+  //      phi an integer level 0..VPIC_PHI_LEVELS-1 drawn per node, times
+  //      VPIC_E_UNIT (a power of two): E takes a handful of exact values
+  //   S  vacuum holding a frozen smooth field E = -grad(phi) + E0 z^, phi a
+  //      product of sines (peak field VPIC_E_SMOOTH) rounded to a 2^-22 grid
+  //      so every difference is exact, and E0 = VPIC_E0 a uniform offset in
+  //      ez only (normal to the slabs, so it adds no curl)
+  // A curl-free E in vacuum with B = 0 and no current does not change (the
+  // clumpy one exactly: its differences are exact), until plasma streaming
+  // out of the P slabs reaches it. Slabs past the pattern's end are plasma.
+  const std::string slabs = getenv("VPIC_SLABS") ? getenv("VPIC_SLABS") : "";
+  const int slab_cells = getenv("VPIC_SLAB_CELLS") ? atoi(getenv("VPIC_SLAB_CELLS")) : 16;
+  std::vector<int> pslab;
+  // Cells [lo, hi] (1-based) of slab s.
+  auto slab_lo = [&](int s0) { return std::max(1, s0 * slab_cells); };
+  auto slab_hi = [&](int s0) { return std::min((int)nz, s0 * slab_cells + slab_cells - 1); };
+  for (int s0 = 0; s0 * slab_cells <= (int)nz; ++s0)
+    if (s0 >= (int)slabs.size() || slabs[s0] == 'P') pslab.push_back(s0);
+  double plasma_frac = 1.0;
+  if (!slabs.empty()) {
+    double pc = 0;
+    for (int s0 : pslab) pc += std::max(0, slab_hi(s0) - slab_lo(s0) + 1);
+    plasma_frac = pc / nz;
+  }
+
+  double Npe = n0*Ly*Lz*Lx*plasma_frac;    // Number physical electrons.
   double Npi = Npe;            // Number of physical ions in box
-  double Ne  = nppc*nx*ny*nz;  // total macro electrons in box
+  double Ne  = nppc*nx*ny*nz*plasma_frac;  // total macro electrons in box
 
   Ne = trunc_granular(Ne,nproc());
   double Ni   = Ne;                                   // Total macro ions in box
@@ -172,6 +220,12 @@ begin_initialization {
   // printf("in harris.cxx: dt=%.7f\n",  dt);
   // exit(1);
   if( wpe*dt>wpedt_max ) dt=wpedt_max/wpe;            // Override time step if plasma frequency limited
+  // VPIC_DT_DX: dt = VPIC_DT_DX * cell size / c (must stay under the Courant
+  // limit, 1/sqrt(3) for cubic cells). With LAYERED SLABS use 0.5 and a
+  // power-of-two cell size (VPIC_L): the B update's coefficients are then
+  // powers of two, so curl(E) of the frozen clumpy field is computed exactly
+  // as zero even with fused multiply-adds, and B stays exactly zero there.
+  if( getenv("VPIC_DT_DX") ) dt = atof( getenv("VPIC_DT_DX") ) * hx / c;
  
   ////////////////////////////////////////
   // Setup high level simulation parmeters
@@ -218,6 +272,9 @@ begin_initialization {
  
              d ? d : ".");
  
+    const char* dv = getenv("VPIC_DUMP_VARS");
+    snprintf(global->clio_dump_vars, sizeof(global->clio_dump_vars), "%s",
+             dv ? dv : "");
   }
 
 
@@ -329,6 +386,59 @@ begin_initialization {
   // Note: everywhere is a region that encompasses the entire simulation
   // In general, regions are specied as logical equations (i.e. x>0 && x+y<2)
 
+  if( !slabs.empty() ) {
+    // Frozen vacuum fields of the C and S slabs (see LAYERED SLABS above).
+    const int levels = getenv("VPIC_PHI_LEVELS") ? atoi(getenv("VPIC_PHI_LEVELS")) : 8;
+    const double e_unit = getenv("VPIC_E_UNIT") ? atof(getenv("VPIC_E_UNIT")) : 0.0078125;
+    const double e_smooth = getenv("VPIC_E_SMOOTH") ? atof(getenv("VPIC_E_SMOOTH")) : 0.3;
+    const double e0_s = getenv("VPIC_E0") ? atof(getenv("VPIC_E0")) : 1.0;
+    // Grid of the smooth potential: 2^-VPIC_Q_BITS (22 by default). Every E
+    // value of the S slab is then a multiple of it, exact in float32 while
+    // |E| < 2^(24 - bits) (4 for 22 bits), so the curl stays exactly zero.
+    const double q23 = std::ldexp( 1.0, -( getenv("VPIC_Q_BITS") ? atoi(getenv("VPIC_Q_BITS")) : 22 ) );
+    const int ni = (int)nx, nj = (int)ny, nk = (int)nz;
+    const double kw = 2.0 * M_PI / Lx;
+    // Node potential; indices wrap periodically over 1..n.
+    auto phi = [&]( int i, int j, int k ) -> double {
+      i = (i - 1 + ni) % ni + 1; j = (j - 1 + nj) % nj + 1; k = (k - 1 + nk) % nk + 1;
+      const int s0 = k / slab_cells;
+      const char t = s0 < (int)slabs.size() ? slabs[s0] : 'P';
+      if( t == 'C' ) {
+        unsigned int h = (unsigned)i * 73856093u ^ (unsigned)j * 19349663u ^
+                         (unsigned)k * 83492791u;
+        h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+        return (double)( h % (unsigned)levels ) * e_unit;
+      }
+      if( t == 'S' ) {
+        const double x = (i - 1) * hx, y = (j - 1) * hy, z = (k - 1) * hz;
+        // sin^2 taper, exactly zero on the slab's first plane and small near
+        // its last: E across each boundary (a difference of a clumpy level and
+        // this) stays exact in float32, so the boundary adds no curl, and the
+        // last plane of a neighbouring C chunk (whose ez reaches into this
+        // slab's first plane) keeps the clumpy range.
+        const double tz = sin( M_PI * ( k - s0 * slab_cells ) / slab_cells );
+        return std::nearbyint( e_smooth / ( kw * hx ) * tz * tz *
+                               sin( kw * x ) * sin( kw * y + 0.7 ) * sin( kw * z + 1.3 ) / q23 ) * q23;
+      }
+      return 0.0;
+    };
+    // Every voxel, ghosts included (0 .. n+1), from the same periodic phi:
+    // VPIC averages the two copies of each periodic boundary face at start-up,
+    // and a ghost left at zero would break E = -grad(phi) on those faces.
+    for( int k = 0; k <= nk + 1; ++k )
+      for( int j = 0; j <= nj + 1; ++j )
+        for( int i = 0; i <= ni + 1; ++i ) {
+          const double p0 = phi( i, j, k );
+          field( i, j, k ).ex = (float)( -( phi( i + 1, j, k ) - p0 ) );
+          field( i, j, k ).ey = (float)( -( phi( i, j + 1, k ) - p0 ) );
+          const int sk = ( ( k - 1 + nk ) % nk + 1 ) / slab_cells;
+          const bool s_slab = sk < (int)slabs.size() && slabs[sk] == 'S';
+          field( i, j, k ).ez = (float)( ( s_slab ? e0_s : 0.0 ) - ( phi( i, j, k + 1 ) - p0 ) );
+        }
+    sim_log( "Slabs " << slabs << " x " << slab_cells << " cells; plasma fraction "
+             << plasma_frac );
+  }
+
   sim_log( "Loading particles" );
  
   // Do a fast load of the particles
@@ -348,7 +458,16 @@ begin_initialization {
 
    double x = uniform( rng(0), xmin, xmax );
    double y = uniform( rng(0), ymin, ymax );
-   double z = uniform( rng(0), zmin, zmax );
+   double z;
+   if( slabs.empty() ) {
+     z = uniform( rng(0), zmin, zmax );
+   } else {
+     int q = (int)uniform( rng(0), 0, (double)pslab.size() );
+     if( q >= (int)pslab.size() ) q = (int)pslab.size() - 1;
+     const double zlo = zmin + ( slab_lo( pslab[q] ) - 1 ) * hz;
+     const double zhi = zmin + slab_hi( pslab[q] ) * hz;
+     z = uniform( rng(0), zlo, zhi );
+   }
    n1 = normal(rng(0),0,vthex);
    n2 = normal(rng(0),0,vthe );
    n3 = normal(rng(0),0,vthe );
@@ -494,7 +613,11 @@ begin_diagnostics {
     mkdir( dir, 0755 );
 
     std::vector<float> col( nv );
+    const std::string want = std::string(",") + global->clio_dump_vars + ",";
     for( int m = 0; m < FIELD_VAR_COUNT && m < 16; ++m ) {
+      if( want.size() > 2 &&
+          want.find( std::string(",") + kFieldNames[m] + "," ) == std::string::npos )
+        continue;   // VPIC_DUMP_VARS lists the fields to write
       for( size_t v = 0; v < nv; ++v ) col[v] = field_array->k_f_h(v, m);
       char path[800];
       snprintf( path, sizeof(path), "%s/fab0000_comp%02d_%s.f32",

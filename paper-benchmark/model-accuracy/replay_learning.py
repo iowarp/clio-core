@@ -43,7 +43,7 @@ STORE = "/mnt/nvme0/v2-work/baselines"
 RUNS = "/mnt/nvme0/v2-work/runs"
 MODEL = os.path.join(HERE, "..", "..", "context-transport-primitives", "src", "compress",
                      "model", "weights", "v2", "model_v2.nnwt")
-FULL = ["nyx-full", "omics-pbmc", "gnn-igbh", "analytics-tpch", "climate-era5"]
+FULL = ev.FULL_WORKLOADS
 
 
 class Net:
@@ -120,8 +120,13 @@ def step_backprop(net, a, s, target_log, lr):
 def load(ds):
     """Arrival order, inputs and every setting's measured outcome for one workload."""
     names, store = ev.settings_list()
-    order = pd.read_csv(os.path.join(RUNS, f"{ds}_learn_nolog", "v2_pred.csv"),
-                        usecols=["blob", "bytes", "tier_bw", "x0", "x1", "x2", "x3"])
+    # Arrival order and inputs from the learning run, or, for a workload with
+    # only an exhaustive search (a tuning probe), from that run: same chunks,
+    # same order, same inputs and tiers.
+    src = os.path.join(RUNS, f"{ds}_learn_nolog", "v2_pred.csv")
+    if not os.path.exists(src):
+        src = os.path.join(STORE, ds, "exhaustive", "v2_pred.csv")
+    order = pd.read_csv(src, usecols=["blob", "bytes", "tier_bw", "x0", "x1", "x2", "x3"])
     m = pd.read_csv(os.path.join(STORE, ds, "exhaustive", "v2_measured.csv"))
     m = m[~ev.raw_primary(m) & (m.decomp_ms > 0)].drop_duplicates(["blob", "setting"])
     idx = {b: i for i, b in enumerate(order.blob)}
@@ -137,13 +142,32 @@ def load(ds):
     return names, store, order, meas, cost
 
 
-def replay(ds, rule, lr, shared=0.0, thr=0.15, labels=None, data=None):
-    """Replay one workload under one rule; per-chunk record and predictions."""
+# Clio's learning gate (neuropress_mape_threshold, user 2026-10-05: 0.30) and
+# what Clio learns from: the write only. NeuroPress does no work on reads, so
+# it never gets a measured decompress time (no_dt=True by default).
+MAPE_THRESHOLD = 0.30
+
+
+def replay(ds, rule, lr, shared=0.0, thr=MAPE_THRESHOLD, labels=None, data=None, no_dt=True,
+           w=(1.0, 1.0, 1.0), bw=None):
+    """Replay one workload under one rule; per-chunk record and predictions.
+
+    @param w   cost weights (w_ct, w_dt, w_io) of the selection and of the
+               learning trigger, as CLIO_NEUROPRESS_COST_W_CT/_W_DT/_W_IO;
+               the default is the balanced cost
+    @param bw  one bandwidth (bytes per ms) for every chunk, as
+               CLIO_NEUROPRESS_COST_BW with no tiers; None (default) uses
+               each chunk's tier_bw
+    The record's cost_pick / cost_best come from data's cost matrix, so pass
+    data with the truth cost of the same weights and bandwidth.
+    """
     names, store, order, meas, cost = data or load(ds)
     net = Net()
     n, ns = len(order), len(names)
     X = order[["x0", "x1", "x2", "x3"]].to_numpy(np.float64)
-    nbytes, bw = order.bytes.to_numpy(float), order.tier_bw.to_numpy(float)
+    nbytes = order.bytes.to_numpy(float)
+    bw = order.tier_bw.to_numpy(float) if bw is None else np.full(n, float(bw))
+    w_ct, w_dt, w_io = (float(v) for v in w)
     preds = np.empty((n, ns, 3))
     rec = []
     updates = 0
@@ -152,15 +176,18 @@ def replay(ds, rule, lr, shared=0.0, thr=0.15, labels=None, data=None):
         lp = net.log_pred(a[-1])
         preds[i] = lp
         ct, dt, r = np.exp(lp[:, 0]), np.exp(lp[:, 1]), np.exp(lp[:, 2])
-        pc = ct + dt + nbytes[i] / (r * bw[i])
+        pc = w_ct * ct + w_dt * dt + w_io * nbytes[i] / (r * bw[i])
         s = int(np.argmin(pc))
         lab = labels[i] if labels is not None else meas[i, s]
         trained = False
         if s != store and np.isfinite(lab[0]) and lab[2] > 0:
             # As NeuroPressV2LearnPrimary: an unmeasured decompress time
             # counts as predicted in the cost and is not a label.
-            dt_ok = np.isfinite(lab[1]) and lab[1] > 0
-            act = lab[0] + (lab[1] if dt_ok else dt[s]) + nbytes[i] / (lab[2] * bw[i])
+            # no_dt: no decompress on the write path, so no measured
+            # decompress time while writing (Clio learns it only at read).
+            dt_ok = (not no_dt) and np.isfinite(lab[1]) and lab[1] > 0
+            act = (w_ct * lab[0] + w_dt * (lab[1] if dt_ok else dt[s])
+                   + w_io * nbytes[i] / (lab[2] * bw[i]))
             err = abs(act - pc[s]) / act
             if err > thr:
                 tl = np.log(np.where([True, dt_ok, True], lab, np.nan))
@@ -170,7 +197,8 @@ def replay(ds, rule, lr, shared=0.0, thr=0.15, labels=None, data=None):
                     step_nlms(net, a, s, tl, lr, shared)
                 updates += 1
                 trained = True
-        best = int(np.nanargmin(cost[i])) if np.isfinite(cost[i]).any() else -1
+        sel = ev.for_selection(cost[i])   # the oracle selects from the candidates
+        best = int(np.nanargmin(sel)) if np.isfinite(sel).any() else -1
         rec.append({"blob": order.blob[i], "pick": s, "best": best,
                     "cost_pick": cost[i, s], "cost_best": cost[i, best] if best >= 0 else np.nan,
                     "trained": trained, "updates": updates})
@@ -241,20 +269,46 @@ def tile(data, passes):
             np.concatenate([meas] * passes), np.concatenate([cost] * passes))
 
 
-def compare(dss, passes):
-    """Every rule on every workload, `passes` passes each."""
+def cache_path(ds, passes, label):
+    """Per-workload, per-rule replay result kept between calls."""
+    slug = "".join(c if c.isalnum() else "_" for c in label)
+    return os.path.join(RUNS, "replay_cache", f"{ds}_{passes}pass_{slug}.csv")
+
+
+def cache_fresh(path, ds):
+    """True when a cached result is newer than the workload's inputs (the
+    exhaustive baseline and the learning run)."""
+    if not os.path.exists(path):
+        return False
+    inputs = [os.path.join(STORE, ds, "exhaustive", "meta.json"),
+              os.path.join(RUNS, f"{ds}_learn_nolog", "v2_pred.csv")]
+    return all(os.path.getmtime(path) > os.path.getmtime(i) for i in inputs
+               if os.path.exists(i))
+
+
+def compare(dss, passes, only=()):
+    """Every rule (or those named in `only`) on every workload, `passes` each.
+    A workload/rule already replayed with the same inputs is read from
+    runs/replay_cache instead of replayed again."""
     rows = []
+    rules = [r for r in RULES if not only or r[0] in only]
+    os.makedirs(os.path.join(RUNS, "replay_cache"), exist_ok=True)
     for ds in dss:
-        data = load(ds)
-        names, store, order, meas, cost = data
-        n1 = len(order)
-        tot = np.nansum(cost, axis=0)
-        fixed = np.nanmin(tot)
-        big = tile(data, passes)
-        for label, rule, lr, sh in RULES:
-            rec, preds, _ = replay(ds, rule or "nlms", lr if rule else 0.0, sh,
-                                   thr=0.15 if rule else np.inf, data=big)
-            out = summarize(ds, label, rec, preds, big[3], n1, fixed)
+        todo = [r for r in rules if not cache_fresh(cache_path(ds, passes, r[0]), ds)]
+        if todo:
+            data = load(ds)
+            names, store, order, meas, cost = data
+            n1 = len(order)
+            fixed = np.nanmin(np.nansum(ev.for_selection(cost), axis=0))
+            big = tile(data, passes)
+        for label, rule, lr, sh in rules:
+            cp = cache_path(ds, passes, label)
+            if (label, rule, lr, sh) in todo:
+                rec, preds, _ = replay(ds, rule or "nlms", lr if rule else 0.0, sh,
+                                       thr=MAPE_THRESHOLD if rule else np.inf, data=big)
+                pd.DataFrame(summarize(ds, label, rec, preds, big[3], n1, fixed)).to_csv(
+                    cp, index=False)
+            out = pd.read_csv(cp).to_dict("records")
             rows += out
             f, l = out[0], out[-1]
             print(f"{ds:15s} {label:24s} pass 1 -> {len(out)}: ratio err {f['ratio_err']:6.1f}% -> "
@@ -270,16 +324,19 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("action", choices=["check", "compare"])
     ap.add_argument("datasets", nargs="*")
+    ap.add_argument("--rules", default="",
+                    help="comma-separated rule labels to run (default: all), "
+                         "e.g. 'frozen,nlms lr 0.5 (Clio)'")
     ap.add_argument("--passes", type=int, default=1,
                     help="replay each workload this many times in a row")
     a = ap.parse_args()
-    dss = a.datasets or [d for d in FULL if os.path.exists(
-        os.path.join(RUNS, f"{d}_learn_nolog", "v2_pred.csv"))]
+    dss = a.datasets or [d for d in FULL if ev.run_finished(
+        os.path.join(RUNS, f"{d}_learn_nolog"))]
     if a.action == "check":
         for ds in dss:
             check(ds)
     else:
-        compare(dss, a.passes)
+        compare(dss, a.passes, [r for r in a.rules.split(",") if r])
 
 
 if __name__ == "__main__":

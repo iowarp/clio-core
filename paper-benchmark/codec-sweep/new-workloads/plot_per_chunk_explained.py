@@ -166,7 +166,7 @@ def draw(fig, gs, key, name):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--datasets", default="consumer-vpic-full,genomics-reads,sparse-fem")
+    ap.add_argument("--datasets", default="graph-orkut-full,ref-vpic-126-2000,ref-nyx-256-2000")
     ap.add_argument("--out", default=os.path.join(HERE, "..", "..", "figures", "new-workloads",
                                                   "per_chunk_explained.png"))
     a = ap.parse_args()

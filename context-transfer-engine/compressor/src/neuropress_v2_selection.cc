@@ -39,11 +39,14 @@
  * v2 logs. v1 is untouched; exactly one of the two is loaded (see Create).
  */
 
+#include "clio_cte/compressor/async_log.h"
+
 #include <clio_ctp/compress/compress_factory.h>
 #include <clio_ctp/compress/gpu_setting_codec.h>
 #include <clio_ctp/compress/preprocess/data_stats.h>
 #include <clio_ctp/compress/preprocess/data_stats_gpu.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -151,36 +154,43 @@ void Runtime::LogV2Predictions(
     double convert_ms) {
   static std::ofstream *out = OpenLog("CLIO_NEUROPRESS_V2_PRED_LOG");
   if (out == nullptr || !neuropress_v2_) return;
-  static std::mutex mu;
-  std::lock_guard<std::mutex> lock(mu);
-  static bool header = false;
-  const int n = ctp::kGpuSettingCount;
-  if (!header) {
-    *out << "blob,bytes,tier_bw,select_ms,convert_ms,x0,x1,x2,x3,updates";
-    for (int s = 0; s < n; ++s) *out << ",ct" << s << ",dt" << s << ",r" << s;
-    *out << "\n";
-    header = true;
-  }
-  std::vector<const CompressionStats *> by(n, nullptr);
+  // Copies for the log thread (async_log.h): the row is formatted and written
+  // there, off the compress path.
+  constexpr int n = ctp::kGpuSettingCount;
+  std::vector<std::array<double, 3>> vals(n);
+  std::vector<char> have(n, 0);
   for (const auto &st : stats) {
     if (st.compress_preset_ >= 0 && st.compress_preset_ < n) {
-      by[st.compress_preset_] = &st;
+      vals[st.compress_preset_] = {st.compress_time_ms_, st.decompress_time_ms_,
+                                   static_cast<double>(st.compression_ratio_)};
+      have[st.compress_preset_] = 1;
     }
   }
-  *out << blob << "," << chunk_size << "," << V2CostWeights(bw).bw_bytes_per_ms
-       << "," << select_ms << "," << convert_ms;
-  for (float x : f.x) *out << "," << x;
-  *out << "," << neuropress_v2_->UpdateCount();
-  for (int s = 0; s < n; ++s) {
-    if (by[s] == nullptr) {
-      *out << ",,,";
-    } else {
-      *out << "," << by[s]->compress_time_ms_ << ","
-           << by[s]->decompress_time_ms_ << "," << by[s]->compression_ratio_;
+  const std::array<float, 4> x = {f.x[0], f.x[1], f.x[2], f.x[3]};
+  PostLogWork([blob, chunk_size, bw_v = V2CostWeights(bw).bw_bytes_per_ms,
+               select_ms, convert_ms, x, updates = neuropress_v2_->UpdateCount(),
+               vals = std::move(vals), have = std::move(have)]() {
+    static bool header = false;  // touched by the log thread only
+    if (!header) {
+      *out << "blob,bytes,tier_bw,select_ms,convert_ms,x0,x1,x2,x3,updates";
+      for (int s = 0; s < n; ++s) *out << ",ct" << s << ",dt" << s << ",r" << s;
+      *out << "\n";
+      header = true;
     }
-  }
-  *out << "\n";
-  out->flush();
+    *out << blob << "," << chunk_size << "," << bw_v << "," << select_ms << ","
+         << convert_ms;
+    for (float v : x) *out << "," << v;
+    *out << "," << updates;
+    for (int s = 0; s < n; ++s) {
+      if (!have[s]) {
+        *out << ",,,";
+      } else {
+        *out << "," << vals[s][0] << "," << vals[s][1] << "," << vals[s][2];
+      }
+    }
+    *out << "\n";
+    out->flush();
+  });
 }
 
 void Runtime::LogV2Measured(const std::string &blob, double bw, int setting,
@@ -188,19 +198,22 @@ void Runtime::LogV2Measured(const std::string &blob, double bw, int setting,
                             double ratio, double cost, bool adopted) {
   static std::ofstream *out = OpenLog("CLIO_NEUROPRESS_V2_EXPLORE_LOG");
   if (out == nullptr) return;
-  static std::mutex mu;
-  std::lock_guard<std::mutex> lock(mu);
-  static bool header = false;
-  if (!header) {
-    *out << "blob,tier_bw,setting,spec,role,comp_ms,decomp_ms,ratio,cost,"
-            "adopted\n";
-    header = true;
-  }
-  *out << blob << "," << V2CostWeights(bw).bw_bytes_per_ms << "," << setting
-       << "," << ctp::GpuSettingSpec(setting) << "," << role << "," << comp_ms
-       << "," << decomp_ms << "," << ratio << "," << cost << ","
-       << (adopted ? 1 : 0) << "\n";
-  out->flush();
+  // Formatted and written on the log thread (async_log.h).
+  PostLogWork([blob, bw_v = V2CostWeights(bw).bw_bytes_per_ms, setting,
+               role = std::string(role), comp_ms, decomp_ms, ratio, cost,
+               adopted]() {
+    static bool header = false;  // touched by the log thread only
+    if (!header) {
+      *out << "blob,tier_bw,setting,spec,role,comp_ms,decomp_ms,ratio,cost,"
+              "adopted\n";
+      header = true;
+    }
+    *out << blob << "," << bw_v << "," << setting << ","
+         << ctp::GpuSettingSpec(setting) << "," << role << "," << comp_ms << ","
+         << decomp_ms << "," << ratio << "," << cost << "," << (adopted ? 1 : 0)
+         << "\n";
+    out->flush();
+  });
 }
 
 #if CTP_ENABLE_NEUROPRESS_GPU
@@ -525,42 +538,6 @@ Runtime::V2ExploreWinner Runtime::NeuroPressV2Explore(
   return win;
 }
 
-void Runtime::RecordV2Decomp(
-    const std::string &blob_key,
-    const ctp::compress::model::NeuroPressV2Features &features, int setting) {
-  std::lock_guard<std::mutex> lock(v2_decomp_mutex_);
-  if (v2_decomp_.size() >= kMaxDecompFeatureRecords &&
-      v2_decomp_.find(blob_key) == v2_decomp_.end()) {
-    auto oldest = v2_decomp_.begin();
-    for (auto it = v2_decomp_.begin(); it != v2_decomp_.end(); ++it) {
-      if (it->second.seq < oldest->second.seq) oldest = it;
-    }
-    v2_decomp_.erase(oldest);
-  }
-  v2_decomp_[blob_key] = V2DecompRecord{features, setting, v2_decomp_seq_++};
-}
-
-void Runtime::LearnV2DecompTime(const std::string &blob_key,
-                                double measured_ms) {
-  if (!config_.neuropress_online_learning_enabled_ || !neuropress_v2_ ||
-      !neuropress_v2_->IsReady() || !(measured_ms > 0.0) ||
-      !std::isfinite(measured_ms)) {
-    return;
-  }
-  V2DecompRecord rec;
-  {
-    std::lock_guard<std::mutex> lock(v2_decomp_mutex_);
-    auto it = v2_decomp_.find(blob_key);
-    if (it == v2_decomp_.end()) return;  // not written by v2 here
-    rec = it->second;
-  }
-  const bool ok = neuropress_v2_->TrainSetting(
-      rec.features, rec.setting, -1.0, measured_ms, -1.0,
-      config_.neuropress_learning_rate_);
-  HLOG(kDebug, "NeuroPress v2 decompress-time SGD: setting={} dt={} ms "
-       "trained={}", ctp::GpuSettingSpec(rec.setting), measured_ms, ok);
-}
-
 #else  // NeuroPress v2 needs the CUDA build; Create refuses a v2 model here.
 
 void SetV2SelectionBlob(const std::string &) {}
@@ -587,12 +564,6 @@ Runtime::V2ExploreWinner Runtime::NeuroPressV2Explore(
     const ctp::compress::model::NeuroPressV2Features &) {
   return V2ExploreWinner{};
 }
-
-void Runtime::RecordV2Decomp(const std::string &,
-                             const ctp::compress::model::NeuroPressV2Features &,
-                             int) {}
-
-void Runtime::LearnV2DecompTime(const std::string &, double) {}
 
 #endif  // CTP_ENABLE_NEUROPRESS_GPU
 

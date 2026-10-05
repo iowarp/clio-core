@@ -18,6 +18,8 @@
 
 #include "clio_cte/compressor/neuropress_telemetry.h"
 
+#include "clio_cte/compressor/async_log.h"
+
 #include <clio_ctp/compress/compress_factory.h>
 #include <clio_ctp/compress/model/predictor.h>
 #include <clio_ctp/compress/model/ranking.h>
@@ -687,39 +689,43 @@ void LogChunkPhases(const std::string &blob_name, const char *path,
                     double wall_ms, size_t stored_bytes) {
   PhaseLog *log = PhaseLogInstance();
   if (!log->fp) return;
-  const bool write = std::strcmp(path, "write") == 0;
-  // Unmeasured or not-applicable fields are written empty, never 0.
-  auto cell = [](double v, bool applies) {
-    char b[32] = "";
-    if (applies && v >= 0.0) std::snprintf(b, sizeof(b), "%.6f", v);
-    return std::string(b);
-  };
-  double covered = 0.0;
-  for (double v : {p.stats_ms, p.nn_ms, p.choice_ms, p.factory_ms,
-                   p.compress_ms, p.decompress_ms, p.io_ms, p.preproc_ms,
-                   p.h2d_ms, p.explore_ms, p.sgd_ms, p.label_ms}) {
-    if (v > 0.0) covered += v;
-  }
-  std::lock_guard<std::mutex> lock(log->mutex);
-  std::fprintf(
-      log->fp,
-      "%ld,%s,%s,%zu,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%.6f,%.6f,%d,%s,%.6f,%.6f,"
-      "%d,%d,%zu,%.6f,%.6f,%s,%.6f,%.6f,%.6f\n",
-      log->seq++, blob_name.c_str(), path, chunk_bytes,
-      cell(p.stats_ms, write).c_str(), cell(p.nn_ms, write).c_str(),
-      write ? "1" : "",
-      cell(p.choice_ms, write).c_str(), cell(p.factory_ms, true).c_str(),
-      cell(p.compress_ms, write).c_str(),
-      cell(p.decompress_ms, !write).c_str(), cell(p.io_ms, true).c_str(),
-      cell(p.io_start_ns, true).c_str(),
-      cell(p.preproc_ms, write).c_str(), cell(p.h2d_ms, true).c_str(),
-      cell(p.h2d_start_ns, true).c_str(),
-      wall_ms - p.convert_ms, wall_ms - p.convert_ms - covered, lib,
-      (write && p.reused >= 0) ? (p.reused ? "1" : "0") : "", p.explore_ms,
-      p.sgd_ms, p.explored, p.sgd_updates, stored_bytes, p.convert_ms,
-      p.label_ms, cell(p.nn_gpu_ms, write).c_str(), p.sgd_gpu_ms,
-      p.label_gpu_ms, p.explore_gpu_ms);
-  std::fflush(log->fp);
+  // Formatted and written on the log thread (async_log.h), from copies; the
+  // log thread is the only writer of log->fp and log->seq after the header.
+  PostLogWork([log, blob_name, write = std::strcmp(path, "write") == 0,
+               path = std::string(path), chunk_bytes, lib, p, wall_ms,
+               stored_bytes]() {
+    // Unmeasured or not-applicable fields are written empty, never 0.
+    auto cell = [](double v, bool applies) {
+      char b[32] = "";
+      if (applies && v >= 0.0) std::snprintf(b, sizeof(b), "%.6f", v);
+      return std::string(b);
+    };
+    double covered = 0.0;
+    for (double v : {p.stats_ms, p.nn_ms, p.choice_ms, p.factory_ms,
+                     p.compress_ms, p.decompress_ms, p.io_ms, p.preproc_ms,
+                     p.h2d_ms, p.explore_ms, p.sgd_ms, p.label_ms}) {
+      if (v > 0.0) covered += v;
+    }
+    std::fprintf(
+        log->fp,
+        "%ld,%s,%s,%zu,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%.6f,%.6f,%d,%s,%.6f,%.6f,"
+        "%d,%d,%zu,%.6f,%.6f,%s,%.6f,%.6f,%.6f\n",
+        log->seq++, blob_name.c_str(), path.c_str(), chunk_bytes,
+        cell(p.stats_ms, write).c_str(), cell(p.nn_ms, write).c_str(),
+        write ? "1" : "",
+        cell(p.choice_ms, write).c_str(), cell(p.factory_ms, true).c_str(),
+        cell(p.compress_ms, write).c_str(),
+        cell(p.decompress_ms, !write).c_str(), cell(p.io_ms, true).c_str(),
+        cell(p.io_start_ns, true).c_str(),
+        cell(p.preproc_ms, write).c_str(), cell(p.h2d_ms, true).c_str(),
+        cell(p.h2d_start_ns, true).c_str(),
+        wall_ms - p.convert_ms, wall_ms - p.convert_ms - covered, lib,
+        (write && p.reused >= 0) ? (p.reused ? "1" : "0") : "", p.explore_ms,
+        p.sgd_ms, p.explored, p.sgd_updates, stored_bytes, p.convert_ms,
+        p.label_ms, cell(p.nn_gpu_ms, write).c_str(), p.sgd_gpu_ms,
+        p.label_gpu_ms, p.explore_gpu_ms);
+    std::fflush(log->fp);
+  });
 }
 
 }  // namespace clio::cte::compressor

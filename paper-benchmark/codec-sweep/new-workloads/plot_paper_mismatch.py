@@ -45,23 +45,9 @@ GROUPS = [
     ("Simulation", [("ref-nyx-256-2000", "Nyx (cosmology)"),
                            ("ref-vpic-126-2000", "VPIC (plasma)"),
                            ("ref-warpx-64x64x512-2000", "WarpX (plasma)"),
-                           ("ref-lammps-b70-2000", "LAMMPS (molecular)"),
-                           ("astro-camels", "CAMELS (galaxies)")]),
-    ("Analysis outputs", [("consumer-nyx", "Nyx analysis"),
-                         ("consumer-vpic-full", "VPIC analysis"),
-                         ("consumer-lammps-full", "LAMMPS analysis")]),
-    ("Experiment", [("hep-nanoaod", "CMS NanoAOD"),
-                             ("genomics-reads", "Genome reads"),
-                             ("detector-frames", "X-ray detector"),
-                             ("sparse-fem", "FEM matrices")]),
-    ("Graphs", [("graph-livejournal-full", "LiveJournal"),
-               ("graph-orkut-full", "Orkut")]),
-    ("Deep learning", [("dl-resnet18-train", "ResNet-18 training"),
-                       ("dl-pythia-ckpt", "Pythia checkpoints"),
-                       ("dl-qwen-bf16", "Qwen bf16 weights"),
-                       ("dl-opt-relu-act", "OPT activations"),
-                       ("dl-gpt2-kv", "GPT-2 KV cache")]),
-]
+                           ("ref-lammps-b70-2000", "LAMMPS (molecular)")]),
+    ("Graphs", [("graph-orkut-full", "Orkut")]),
+]   # analysis outputs, experiments, LiveJournal and deep learning removed (2026-10-05)
 # Readable codec names: setting string -> label
 NAMES = {"spratio": "SPratio", "ans shuffle=byte": "ANS\n+4-byte shuffle",
          "bitcomp algo=1 type=int": "Bitcomp\nsparse int32", "ans type=float16": "ANS\nfloat16",
@@ -156,10 +142,7 @@ def heatmap(out):
 
 
 INSIDE = [  # dataset, borrowed-from array, used-on array, workflow, borrowed-from label, used-on label
-    ("consumer-vpic-full", "kmeans.i32", "pdf2d.f64", "VPIC analysis", "k-means labels", "2-D PDF"),
     ("graph-orkut-full", "cc_label.i32", "edges_src.i32", "Orkut graph", "component labels", "edge list"),
-    ("sparse-fem", "Flan_1565_row_ptr.i64", "Flan_1565_col_idx.i32", "FEM matrix", "row pointers",
-     "column indices"),
     ("ref-vpic-126-2000", "ex.f32", "div_e_err.f32", "VPIC simulation", "electric field",
      "div(E) error"),
 ]
@@ -209,7 +192,7 @@ def within(out):
 
 def pipeline(out):
     """Measured runs: extra compression and end-to-end time."""
-    names = {"vpic": "VPIC", "lammps": "LAMMPS", "nanoaod": "NanoAOD", "fem": "FEM"}
+    names = {"vpic": "VPIC", "lammps": "LAMMPS"}   # nanoaod, fem removed
     rows = []
     for w, n in names.items():
         f = os.path.join(PIPE, w, "runs.csv")

@@ -33,7 +33,7 @@ RUNS = "/mnt/nvme0/v2-work/runs"
 STORE = "/mnt/nvme0/v2-work/baselines"
 FIGS = os.path.join(HERE, "..", "figures", "new-workloads", "nn-v2")
 # Workloads run in full (not sampled); nn-v2/ shows only these by default.
-FULL = ["nyx-full", "omics-pbmc", "gnn-igbh", "analytics-tpch", "climate-era5"]
+FULL = ev.FULL_WORKLOADS
 INK, INK2, GOOD, BAD, OPP = "#1f2328", "#57606a", "#1a7f37", "#cf222e", "#2e86ab"
 
 
@@ -43,6 +43,12 @@ def wall(run):
     w = float(re.search(r"stage\+compress ([0-9.]+) s", t).group(1))
     r = float(re.search(r"READ 1/1.*?get\+decompress: ([0-9.]+) ms", t, re.S).group(1))
     return w + r / 1e3
+
+
+def finished(run):
+    """True when a run's stdout.log holds its final timing line."""
+    p = os.path.join(run, "stdout.log")
+    return os.path.exists(p) and "stage+compress" in open(p).read()
 
 
 def ratio(run):
@@ -66,9 +72,9 @@ def row(ds):
     keep = ok[rows]
     np_cost = truth[rows[keep], d.stored.to_numpy()[keep]].sum()
     fixed_cost = truth[rows[keep], best].sum()
-    oracle = np.nanmin(truth[rows[keep]], axis=1).sum()
+    oracle = np.nanmin(ev.for_selection(truth[rows[keep]]), axis=1).sum()
     orc = os.path.join(RUNS, f"{ds}_oracle_nolog")
-    has_orc = os.path.exists(os.path.join(orc, "stdout.log"))
+    has_orc = finished(orc)
     return {"workload": ds, "chunks": gain["chunks"], "best_fixed": gain["best_fixed"],
             "e2e_oracle_s": wall(orc) if has_orc else np.nan,
             "ratio_oracle": ratio(orc) if has_orc else np.nan,
@@ -113,7 +119,6 @@ def pair(ax, t, cols, title, fmt, good_low):
     ax.tick_params(labelsize=8, colors=INK2)
     for sd in ("top", "right"):
         ax.spines[sd].set_visible(False)
-    ax.legend(frameon=False, fontsize=8, labelcolor=INK, loc="lower right")
     vals = np.concatenate([t[c].to_numpy() for c, _, _ in cols])
     vals = vals[np.isfinite(vals)]
     lo, hi = min(0, vals.min()), max(0, vals.max())
@@ -130,7 +135,8 @@ def main():
     a = ap.parse_args()
     dss = sorted(os.path.basename(os.path.dirname(p))
                  for p in glob.glob(os.path.join(STORE, "*", "exhaustive")))
-    dss = [d for d in dss if os.path.exists(os.path.join(RUNS, f"{d}_learn_nolog", "stdout.log"))]
+    dss = [d for d in dss if all(finished(os.path.join(RUNS, f"{d}_{m}_nolog"))
+                                 for m in ("learn", "fixed"))]
     if not a.all:
         dss = [d for d in dss if d in FULL]
     a.out = a.out or (os.path.join(FIGS, "archive-sampled", "v2_spectrum.png") if a.all
@@ -142,7 +148,8 @@ def main():
     t["ratio_oracle_vs_fixed_pct"] = 100 * (t.ratio_oracle / t.ratio_fixed - 1)
     t.to_csv(os.path.join(RUNS, "spectrum.csv"), index=False)
     plt.rcParams["font.family"] = "DejaVu Sans"
-    fig, axes = plt.subplots(1, 4, figsize=(20, 10), sharey=True)
+    H = max(6.0, 2.0 + 0.42 * len(t))
+    fig, axes = plt.subplots(1, 4, figsize=(20, H), sharey=True)
     fig.patch.set_facecolor("white")
     panel(axes[0], t, "opportunity_pct",
           "Opportunity: per-chunk best vs\nbest single codec (cost, %)",
@@ -155,17 +162,21 @@ def main():
             ("e2e_vs_fixed_pct", "#d1495b", "NeuroPress learning")]
     pair(axes[2], t, cols, "Measured write + read time vs best\nsingle codec (%; < 0 = faster)",
          lambda x: f"{x:+.0f}%", True)
-    cols = [("ratio_oracle_vs_fixed_pct", OPP, "oracle"),
+    cols = [("ratio_oracle_vs_fixed_pct", OPP, "oracle (each chunk's best setting)"),
             ("ratio_vs_fixed_pct", "#d1495b", "NeuroPress learning")]
     pair(axes[3], t, cols, "Compression ratio vs best single\ncodec (%; > 0 = smaller)",
          lambda x: f"{x:+.0f}%", False)
+    h, l = axes[2].get_legend_handles_labels()
+    fig.legend(h, l, frameon=False, fontsize=9, labelcolor=INK, loc="upper right", ncol=2,
+               bbox_to_anchor=(0.99, 1 - 0.03 / H))
     axes[0].set_yticks(np.arange(len(t))[::-1])
-    axes[0].set_yticklabels([f"{d}  ({n} chunks)" for d, n in zip(t.workload, t.chunks)],
+    axes[0].set_yticklabels([ev.workload_label(d) for d in t.workload],
                             fontsize=8.5, color=INK)
-    fig.suptitle(f"Where does choosing a codec per chunk pay? {len(t)} "
-                 f"{'' if a.all else 'full '}workloads through Clio",
-                 x=0.01, ha="left", fontsize=14, color=INK, y=0.995)
-    fig.text(0.01, 0.955, "Opportunity = how much cheaper the best setting per chunk "
+    fig.suptitle(f"Where does choosing a codec per chunk pay? "
+                 f"{ev.total_label(list(t.workload))}{'' if a.all else ', full size'}, "
+                 "through Clio",
+                 x=0.01, ha="left", fontsize=14, color=INK, y=1 - 0.03 / H)
+    fig.text(0.01, 1 - 0.3 / H, "Opportunity = how much cheaper the best setting per chunk "
              "would be than the best single codec for the whole workload (balanced "
              "4-tier cost model, from the exhaustive search: the most any per-chunk "
              "selector could gain).\nThe other panels compare NeuroPress v2 learning "
@@ -174,7 +185,7 @@ def main():
              "codec: by cost, by measured end-to-end time and by compression ratio.",
              fontsize=9, color=INK2, va="top",
              linespacing=1.45)
-    fig.subplots_adjust(left=0.15, right=0.99, top=0.88, bottom=0.04, wspace=0.12)
+    fig.subplots_adjust(left=0.15, right=0.99, top=1 - 1.25 / H, bottom=0.3 / H, wspace=0.12)
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     fig.savefig(a.out, dpi=150)
     if a.pdf:

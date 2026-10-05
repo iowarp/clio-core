@@ -34,7 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STORE = "/mnt/nvme0/v2-work/baselines"
 RUNS = "/mnt/nvme0/v2-work/runs"
 FIGS = os.path.join(HERE, "..", "figures", "new-workloads", "nn-v2")
-FULL = ["nyx-full", "omics-pbmc", "gnn-igbh", "analytics-tpch", "climate-era5"]
+FULL = ev.FULL_WORKLOADS
 # The model on the synthetic float32 corpus it was trained on (nn_v2_cv.py,
 # model B, 5-fold cross-validation, results/nn-v2/cv_*.csv): median absolute
 # % error, and the share of files whose predicted cheapest setting is the
@@ -133,8 +133,8 @@ def main():
     ap.add_argument("--out", default=os.path.join(FIGS, "v2_prediction_error.png"))
     ap.add_argument("--pdf", action="store_true", help="also write a PDF")
     a = ap.parse_args()
-    dss = a.datasets or [d for d in FULL if os.path.exists(
-        os.path.join(RUNS, f"{d}_learn_nolog", "v2_pred.csv"))]
+    dss = a.datasets or [d for d in FULL if ev.run_finished(
+        os.path.join(RUNS, f"{d}_learn_nolog"))]
     names, store = ev.settings_list()
     rows, types, worst = [], [], []
     for ds in dss:
@@ -165,7 +165,7 @@ def plot(t, out, pdf):
     wide.columns = [f"{c}_{m}" for c, m in wide.columns]
     wide = wide.reindex([d for d in FULL if d in wide.index])
     plt.rcParams["font.family"] = "DejaVu Sans"
-    fig, axes = plt.subplots(1, 4, figsize=(19, 5.2), sharey=True)
+    fig, axes = plt.subplots(1, 4, figsize=(19, 2.6 + 0.65 * len(wide)), sharey=True)
     fig.patch.set_facecolor("white")
     for ax, q, lab in zip(axes[:3], ("ct", "dt", "ratio"),
                           ("compress time", "decompress time", "compression ratio")):
@@ -179,11 +179,12 @@ def plot(t, out, pdf):
     axes[3].set_xlim(0, 115)
     axes[3].legend(frameon=False, fontsize=8, loc="lower right")
     axes[0].set_yticks(np.arange(len(wide))[::-1])
-    axes[0].set_yticklabels([f"{d}\n({int(n)} chunks)" for d, n in
+    axes[0].set_yticklabels([ev.workload_label(d, "\n") for d, n in
                              zip(wide.index, wide.chunks_frozen)], fontsize=9, color=INK)
-    fig.suptitle("How accurate are NeuroPress v2's predictions on real workloads?",
+    fig.suptitle("How accurate are NeuroPress v2's predictions on real workloads? "
+                 f"({ev.total_label(list(wide.index))})",
                  x=0.01, ha="left", fontsize=14, color=INK, y=0.99)
-    fig.text(0.01, 0.905, "Each chunk's prediction for all 44 compressing settings vs "
+    fig.text(0.01, 1 - 0.45 / (2.6 + 0.65 * len(wide)), "Each chunk's prediction for all 44 compressing settings vs "
              "the exhaustive search's measurement of the same chunk and setting. Dashed "
              "line: the same measure on the synthetic float32 data the model was trained "
              "on (5-fold cross-validation).\nRight: the cheapest by the balanced 4-tier cost "
@@ -191,7 +192,8 @@ def plot(t, out, pdf):
              "measured values. Online learning: prediction made when the chunk was "
              "chosen, after updates from all earlier chunks.",
              fontsize=9, color=INK2, va="top", linespacing=1.45)
-    fig.subplots_adjust(left=0.09, right=0.99, top=0.76, bottom=0.07, wspace=0.12)
+    h = 2.6 + 0.65 * len(wide)
+    fig.subplots_adjust(left=0.12, right=0.99, top=1 - 1.25 / h, bottom=0.35 / h, wspace=0.12)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     fig.savefig(out, dpi=150)
     if pdf:

@@ -1,0 +1,64 @@
+# LJ crystal that melts from the middle outward -- a workload whose chunks
+# change kind over time, for testing a per-chunk codec selector.
+#
+# The fcc lattice is built at reduced density 0.5, where the lattice constant
+# is exactly 2: every lattice coordinate is a small integer, exact in float32.
+# Atoms start frozen (zero velocity; zero force while frozen), so they stay
+# bit-exactly on their sites. A slab around the box centre starts hot. The
+# released region grows outward at RATE sigma per step: an atom whose z lies
+# within HALF0 + RATE*step of the centre feels its force and moves; every
+# other atom keeps zero force and zero velocity. So the frozen, exactly
+# ordered crystal is replaced, layer by layer, by a melting, disordered one.
+#
+# Run it through the driver with --f32 --order id --fields position: atom IDs
+# follow create_atoms' order (z layer, y row, x, basis), so a chunk of the
+# position array is a few z layers of the crystal, and velocity / force are
+# exactly zero wherever atoms are frozen.
+#
+# The release front is driven by the global `step`, so it is immune to the
+# driver advancing the run in GAP-step segments (see in.melt_ramp).
+
+variable        BOX      index 64        # lattice cells/side -> 4*BOX^3 atoms
+variable        GAP      index 10        # driver's frame gap
+variable        DENSITY  index 0.5       # lattice constant (4/DENSITY)^(1/3) = 2
+variable        THOT     index 3.0       # temperature of the initial hot slab
+variable        HALF0    index 4.0       # half-width of the initial hot slab, sigma
+variable        RATE     index 0.05      # release front speed, sigma per step
+variable        CUTOFF   index 2.5       # lj/cut pair cutoff, sigma
+variable        SKIN     index 0.3       # neighbor-list skin
+variable        EVERY    index 20        # neigh_modify every
+variable        SEED     index 87287     # velocity RNG seed
+variable        DT       index 0.005     # timestep
+
+units           lj
+atom_style      atomic
+lattice         fcc ${DENSITY}
+region          box block 0 ${BOX} 0 ${BOX} 0 ${BOX}
+create_box      1 box
+create_atoms    1 box
+mass            1 1.0
+
+variable        zc equal 0.5*(zlo+zhi)
+region          hot block INF INF INF INF $(v_zc-v_HALF0) $(v_zc+v_HALF0) units box
+group           hot region hot
+velocity        all set 0.0 0.0 0.0
+velocity        hot create ${THOT} ${SEED} loop geom
+
+pair_style      lj/cut ${CUTOFF}
+pair_coeff      1 1 1.0 1.0 ${CUTOFF}
+neighbor        ${SKIN} bin
+neigh_modify    every ${EVERY} delay 0 check yes
+
+# Released = within the front's half-width of the centre. A frozen atom has
+# zero velocity and gets zero force, so fix nve leaves it exactly in place.
+variable        half equal ${HALF0}+${RATE}*step
+variable        rel atom abs(z-v_zc)<v_half
+variable        hfx atom v_rel*fx
+variable        hfy atom v_rel*fy
+variable        hfz atom v_rel*fz
+fix             hold all setforce v_hfx v_hfy v_hfz
+fix             1 all nve
+
+timestep        ${DT}
+thermo          ${GAP}
+run             0

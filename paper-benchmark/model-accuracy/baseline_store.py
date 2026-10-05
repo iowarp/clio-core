@@ -118,8 +118,9 @@ def save(ds, kind, run):
         import compare_fixed_vs_learn as c
         cand = c.candidates(run)
         cand.to_csv(os.path.join(dst, "candidates.csv"))
-        meta["best_codec"] = cand.index[0]
-        meta["best_cost_ms"] = float(cand.cost_ms.iloc[0])
+        best = cand[cand.candidate]   # eval_v2_workloads.DROPPED_SETTINGS left out
+        meta["best_codec"] = best.index[0]
+        meta["best_cost_ms"] = float(best.cost_ms.iloc[0])
     json.dump(meta, open(os.path.join(dst, "meta.json"), "w"), indent=2)
     print(f"saved {ds} {kind}{' ' + codec if codec else ''} -> {dst}")
 

@@ -34,22 +34,10 @@ import cost_model_per_chunk as cpc  # noqa: E402
 import cost_model_hierarchy as ch  # noqa: E402
 import volume_weights as vw  # noqa: E402
 
+# Of the new (non-simulation) workloads only graph-orkut-full (and gnn-igbh,
+# not in this sweep) are kept (user, 2026-10-05); the others were removed.
 DATASETS = {  # sweep dir -> panel name, in panel order (all 2-4+ GB)
-    "graph-livejournal-full": "LiveJournal graph",
     "graph-orkut-full": "Orkut graph",
-    "sparse-fem": "FEM matrices",
-    "hep-nanoaod": "NanoAOD",
-    "genomics-reads": "Genome reads",
-    "astro-camels": "CAMELS TNG z=0",
-    "detector-frames": "Detector frames",
-    "consumer-nyx": "Nyx analysis",
-    "consumer-vpic-full": "VPIC analysis",
-    "consumer-lammps-full": "LAMMPS analysis",
-    "dl-resnet18-train": "ResNet-18",
-    "dl-pythia-ckpt": "Pythia ckpts",
-    "dl-qwen-bf16": "Qwen bf16 ckpt",
-    "dl-opt-relu-act": "OPT ReLU acts",
-    "dl-gpt2-kv": "GPT-2 KV cache",
     "ref-nyx-256-2000": "Nyx sim",
     "ref-vpic-126-2000": "VPIC sim",
     "ref-warpx-64x64x512-2000": "WarpX sim",

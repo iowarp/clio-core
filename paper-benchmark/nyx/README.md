@@ -35,8 +35,10 @@ comparison is exact.
 
 ## The patches
 
-Two, and both are needed — see "Building Nyx" for why the second one's absence
-is easy to miss.
+Four. The first two are needed for every run — see "Building Nyx" for why the
+second one's absence is easy to miss. The last two add the options the
+multiphase workload uses (see [Multiphase workload](#multiphase-workload-nyx-multiphase));
+with their options left at the defaults Nyx behaves exactly as without them.
 
 ### `nyx-raw-field-dump.patch`
 
@@ -73,6 +75,43 @@ The fix floors `eps` at a few ULP of the interval's own magnitude and makes the
 endpoint comparisons inclusive. No physics change: the default run's field
 dumps are bit-identical to the unpatched binary.
 
+### `nyx-sedov-multiphase.patch`
+
+New `prob.*` options for the Sedov problem (`Exec/HydroTests/Prob.cpp`) that
+change the gas the blast goes off in. Upstream fills the box with one uniform,
+motionless gas. With the defaults below the initial state is that same uniform
+gas.
+
+| Option | Default | Effect |
+|---|---|---|
+| `prob.nphase` | 0 | > 1: each clump of cells is one of `nphase` gas phases, drawn at random per clump (deterministic hash of the cell index) |
+| `prob.phase_rho` | 100 | density contrast between the densest and the lightest phase (geometric ladder) |
+| `prob.phase_pow2` | 0 | 1: phase densities are exact powers of two, `dens_ambient * 2^(q - nphase/2)`, instead of the ladder |
+| `prob.phase_p` | 10 | pressure contrast between phases; **1 = pressure equilibrium**, so the gas stays exactly at rest until the blast reaches it |
+| `prob.phase_block` | 1 | cells per side of one clump (1 = every cell independently) |
+| `prob.nlayer` | 0 | > 0: the box is cut into `nlayer` slabs along z, alternately clumpy (the phases above) and smooth |
+| `prob.smooth_amp`, `prob.smooth_k`, `prob.smooth_exp` | 0.5, 2, 0 | smooth slabs' density: `dens_ambient * (1 + amp * w)`, or `dens_ambient * exp(amp * w)` when `smooth_exp=1`, with `w = sin(2πkx) sin(2πky+0.7) sin(2πkz+1.3)` |
+| `prob.nblast` | 1 | number of explosions; the first is the centred Sedov blast, the others sit at fixed pseudo-random positions |
+| `prob.noise_dens`, `prob.noise_vel` | 0, 0 | per-cell random perturbation of the ambient density (relative) and velocity |
+
+It also raises `max_prob_param` in `Source/Driver/Nyx.H` from 20 to 32:
+these options are stored in that fixed-size array, and the original size
+overflows (a segfault at initialisation) once the layer options are used.
+
+### `nyx-dump-select-derived.patch`
+
+Two environment variables for the raw field dump (`Source/IO/Nyx_output.cpp`),
+both off by default:
+
+- `NYX_DUMP_STATE="density rho_E"` writes only the listed hydro-state
+  components, the way `amr.plot_vars` selects a plotfile's. Unset or empty
+  writes all six, as before.
+- `NYX_DUMP_DERIVED="logden pressure …"` also writes those derived quantities
+  (any name Nyx's `derive()` knows, e.g. `pressure`, `soundspeed`,
+  `MachNumber`, `divu`, `logden`, `x_velocity`, `magvort`, `Temp`; unknown
+  names are skipped), as further components of the same step, so each is one
+  more `fab0000_compNN_<name>.f32` file in the same `pltNNNNN/` directory.
+
 ## Building Nyx
 
 ```bash
@@ -80,6 +119,9 @@ git clone --depth 1 --recursive https://github.com/AMReX-Astro/Nyx.git ~/src/Nyx
 cd ~/src/Nyx
 git apply <clio>/paper-benchmark/nyx/patches/nyx-raw-field-dump.patch
 git apply <clio>/paper-benchmark/nyx/patches/nyx-comoving-a-single-precision-eps.patch
+# only for the multiphase workload (harmless otherwise: defaults are upstream's)
+git apply <clio>/paper-benchmark/nyx/patches/nyx-sedov-multiphase.patch
+git apply <clio>/paper-benchmark/nyx/patches/nyx-dump-select-derived.patch
 cmake -S . -B build-clio -DCMAKE_BUILD_TYPE=Release \
       -DNyx_MPI=NO -DNyx_OMP=NO -DNyx_HYDRO=YES -DNyx_HEATCOOL=NO \
       -DNyx_GPU_BACKEND=CUDA -DAMReX_CUDA_ARCH=Ampere \
@@ -356,6 +398,153 @@ But its compression ratio sits at **1.0005 .. 1.0022 for the entire history**:
 cosmological float32 fields are incompressible losslessly at every redshift, so
 there is no signal to measure. Sedov with a raised blast energy is the
 configuration that produces one.
+
+## Multiphase workload (`nyx-multiphase`)
+
+### Purpose
+
+This variant exists to answer one question: does choosing a codec per chunk
+pay on a simulation? On the default Sedov run it barely can.
+- **Default Sedov:** every chunk is smooth float32, so `spratio` is the
+  cheapest setting almost everywhere. Choosing per chunk could save at most
+  0.4% (`nyx-full`), and NeuroPress v2 loses to that single codec.
+- **This variant:** the same Sedov blast goes off in a deliberately
+  heterogeneous gas, so that different chunks need different codecs and the
+  data changes as the blast sweeps through it.
+
+The settings were found by searching for exactly that, not chosen for the
+physics; see [What is contrived](#what-is-contrived).
+
+### Setup
+
+- **The box:** cut along z into 4 slabs that alternate:
+  - **Clumpy slabs** (z in [0, ¼) and [½, ¾)): every cell is independently one
+    of 8 gas phases, with densities exactly 1/16, 1/8, …, 8, all at the same
+    pressure.
+  - **Smooth slabs** (z in [¼, ½) and [¾, 1)): density `exp(sin·sin·sin)`,
+    from 0.37 to 2.7, one gentle wave per box, at the same pressure.
+- **Why it stays put:** because the pressure is uniform, the gas does not
+  move until the blast reaches it.
+- **The blast:** a weak centred blast (`exp_energy` 0.05 instead of 1.0)
+  slowly sweeps outward through both kinds of slab.
+- **Output:** only `density` and `rho_E` from the hydro state, plus the
+  derived `logden`.
+
+```bash
+cd <work dir>
+NYX_DUMP_FIELDS=1 NYX_DUMP_DIR=<out> NYX_DUMP_STATE="density rho_E" NYX_DUMP_DERIVED="logden" \
+  ~/src/Nyx/build-clio/Exec/HydroTests/nyx_HydroTests \
+  ~/src/Nyx/Exec/HydroTests/inputs.3d.sph.sedov \
+  amr.n_cell="256 256 256" amr.max_grid_size=256 \
+  max_step=2660 amr.plot_int=10 amr.check_int=0 stop_time=1.0 nyx.cfl=0.8 nyx.v=0 amr.v=0 \
+  prob.nphase=8 prob.phase_pow2=1 prob.phase_p=1 prob.nlayer=4 \
+  prob.smooth_exp=1 prob.smooth_amp=1.0 prob.smooth_k=1 \
+  prob.nblast=1 prob.exp_energy=0.05 prob.p_ambient=7.62939453125e-06
+```
+
+`../sim-tuning/nyx_probe.sh` wraps this command, stages the output and runs
+the exhaustive search. The two saved runs differ only in the step count and
+output interval:
+
+| Workload | Steps, output every | Output steps | Chunks | Size |
+|---|---|---|---|---|
+| `nyx-multiphase-25g` | 2,600, every 20 | 131 | 6,288 | 24.6 GiB (26.4 GB) |
+| `nyx-multiphase-50g` | 2,660, every 10 | 267 | 12,816 | 50.1 GiB (53.8 GB) |
+
+`p_ambient` = 2⁻¹⁷ keeps the pressure, and so `rho_E`, an exact power of two
+as well.
+
+### Why it works
+
+- **Each chunk is one kind of data.** The slabs run along z, the slowest
+  index of a dumped field. At 256³ a field is 64 MiB, which is 16 chunks of
+  16 z-planes each, and every slab is exactly 4 of those chunks.
+- **Clumpy chunks favour `ans` with byte shuffle.** Values jump at random
+  between 8 levels, so there is little information per byte but no
+  smoothness. On early clumpy `density` chunks, `ans` and `zstd` with byte
+  shuffle reach 5.7× and 6.9×; `spratio`, which predicts each value from its
+  neighbour, gets 1.2×. Power-of-two levels matter: with arbitrary levels
+  every byte of the value varies and byte-shuffled `ans` only reaches about
+  2.5×.
+- **Smooth chunks favour `spratio`,** provided the wave is gentle. Faster or
+  steeper waves make `lz4` the cheapest setting, and the model mispredicts
+  that.
+- **The model reads both kinds correctly.** The candidate patterns were
+  checked offline against the trained model's predictions
+  (`../sim-tuning/pattern_lab.py`). The model is never retrained on these
+  data.
+- **The data changes over time.** As the blast sweeps outward, both kinds of
+  slab turn into shocked flow, and the share of each kind of chunk shifts
+  from step to step.
+
+### Fields left out, and why
+
+The fields written were chosen by measurement:
+
+- **`xmom`, `ymom`, `zmom` hurt NeuroPress.** Outside the blast the gas is at
+  rest, so momentum is exactly zero, and on mostly-zero chunks the trained
+  model over-predicts the ratio of bit-shuffle settings by up to 1,000×.
+- **`rho_e` is nearly constant** outside the blast, so it compresses
+  extremely well and adds little.
+- **`Temp`, `soundspeed`, `MachNumber`, `divu`, `magvort`, `x_velocity` don't
+  help.** Their chunks are noisy, so no setting gains much, or the model
+  mispredicts them.
+
+Offline replay of the 128³ probe:
+
+| Fields written | NeuroPress learning vs best single codec, one pass |
+|---|---|
+| `density`, `logden`, `rho_E` | −7.0% |
+| `density`, `logden`, `rho_E`, `rho_e` | −0.8% |
+| + `soundspeed` | +6.3% |
+| + `soundspeed`, `Temp` | +11.9% |
+| all 6 state fields + `logden`, `soundspeed`, `Temp` | +17.5% |
+
+### Results
+
+Measured through Clio, balanced 4-tier cost, every chunk read back
+bit-exact. Learning is on and exploration off; the best single codec is the
+cheapest of all 45 settings over the whole workload.
+
+| | `nyx-full` (default Sedov) | `nyx-multiphase-25g` | `nyx-multiphase-50g` |
+|---|---|---|---|
+| Size | 19.1 GiB, 4,896 chunks | 24.6 GiB, 6,288 chunks | 50.1 GiB, 12,816 chunks |
+| Best single codec | `spratio` | `ans` with byte shuffle | `ans` with byte shuffle |
+| Most per-chunk choice could save | 0.4% | 22.4% | 22.0% |
+| NeuroPress learning, cost vs best single | +14.4% | **−15.0%** (67% of the possible saving) | **−16.8%** (76%) |
+| Compression ratio, best single → NeuroPress (oracle) | 6.23 → 5.50 | 1.91 → **2.13** (2.29) | 1.89 → **2.15** (2.27) |
+| Measured write + read time, best single → NeuroPress (oracle) | 39.2 → 40.5 s | 86.7 → 87.1 s (78.2 s) | 160.0 → **147.6 s, −7.7%** (147.1 s) |
+
+At 50 GiB NeuroPress also wins in measured wall-clock time:
+- **Write** 89.9 → 80.5 s, **read** 70.0 → 67.1 s, which is within 0.3% of
+  the per-chunk oracle.
+- Its own overhead (prediction 3.3 s, the write-path decompress that labels
+  learning 2.2 s) is outweighed by faster codecs (compress + decompress
+  5.2 → 3.9 s) and 12% fewer bytes written.
+- What it stores: `spratio` on 40% of chunks (smooth slabs and `rho_E`),
+  `ans` with byte shuffle on 26% (clumpy slabs), and 41 other settings on the
+  rest.
+
+The cost model assumes slow storage tiers this machine doesn't have: every
+run writes to one NVMe. So the cost gains are larger than the measured time
+gains, and at 25 GiB the time gain does not appear at all.
+
+### What is contrived
+
+Say so wherever these numbers are used:
+
+- **Not resolved physics.** A medium whose phase changes from one cell to the
+  next has structure at the grid scale.
+- **Picked for compression, not for science.** The power-of-two densities,
+  the slabs aligned with chunk boundaries and the gentle wave all serve the
+  codecs.
+- **Output chosen for the model.** The fields written were chosen because the
+  trained model handles them; with the momenta and temperature included,
+  NeuroPress loses.
+
+The full search, every probe in order with its result, is in
+[`../sim-tuning/README.md`](../sim-tuning/README.md), and the probe log is
+`/mnt/nvme0/v2-work/runs/nyx_tuning.log`.
 
 ## Notes
 

@@ -19,7 +19,10 @@ endif()
 message(STATUS "NeuroPress field replay example: enabled")
 
 find_package(CUDAToolkit REQUIRED)
-add_executable(neuropress_field_replay neuropress_field_replay.cc)
+# kmeans_consumer.cu: the --kmeans consumer's kernel (one Lloyd iteration
+# per timed read-back).
+add_executable(neuropress_field_replay neuropress_field_replay.cc
+  kmeans_consumer.cu)
 
 target_link_libraries(neuropress_field_replay
   clio_cte_core_client

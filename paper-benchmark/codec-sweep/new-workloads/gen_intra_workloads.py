@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Workloads with heterogeneity INSIDE one application, as native arrays.
 
-    gen_intra_workloads.py {omics,mag,igbh,tpch,era5} [--out DIR]
+    gen_intra_workloads.py {omics,mag,igbh,igbh-medium,tpch,era5} [--out DIR]
 
 Each writes one directory of raw array files named NNN_<array>.<type> (type
 in u8/i32/i64/f32/...), NNN giving the order the application produces them;
@@ -24,6 +24,12 @@ stage_intra_workloads.py cuts them into one 4 MiB chunk stream.
          conferences, then the 19- and 2,983-class paper labels (f32, as
          stored). Author features (7.9 GB) are left out to keep the workload
          at ~5.4 GB; like gnn-mag, the main features are the papers'.
+  igbh-medium  gnn-igbh-medium: a 15 GiB part of IGBH-medium (10 M papers;
+         download igb_heterogeneous_medium.tar.gz, 91.3 GB, from the same
+         bucket into RAW/igbh): the same arrays in the same order as igbh,
+         every relation's full edge_index and every small node type's
+         features, but the paper features and labels of the first papers
+         only (as many as fill 15 GiB). Author features left out, as in igbh.
   tpch   analytics-tpch: TPC-H SF 1 from DuckDB, every column of every table
          as DuckDB stores it: integers, DECIMAL(15,2) as int64 cents, DATE as
          int32 days, strings as offsets (i64) + bytes
@@ -156,6 +162,38 @@ def igbh(out):
         w.put(f"paper_label_{k}", np.load(os.path.join(base, "paper", f"node_label_{k}.npy")))
 
 
+def igbh_medium(out, target=15 << 30):
+    """gnn-igbh-medium: a `target`-byte part of IGBH-medium (see the header).
+
+    @param out    workload directory
+    @param target total bytes; the paper features fill what the edges, the
+                  other node types' features and the labels leave
+    """
+    w = Writer(out)
+    base = os.path.join(RAW, "igbh", "medium", "processed")
+    rels = sorted(d for d in os.listdir(base) if "__" in d)
+    small = ("fos", "institute", "journal", "conference")
+    load = lambda *p: np.load(os.path.join(base, *p), mmap_mode="r")
+    feat = load("paper", "node_feat.npy")
+    labels = [load("paper", f"node_label_{k}.npy") for k in ("19", "2K")]
+    fixed = (sum(load(r, "edge_index.npy").nbytes for r in rels)
+             + sum(load(n, "node_feat.npy").nbytes for n in small
+                   if os.path.exists(os.path.join(base, n, "node_feat.npy"))))
+    per_paper = feat.shape[1] * feat.itemsize + sum(l.itemsize for l in labels)
+    papers = min(feat.shape[0], max(0, (target - fixed) // per_paper))
+    print(f"  {len(rels)} relations, {fixed / 2**30:.2f} GiB of edges and small "
+          f"node features; paper features and labels of {papers:,} of "
+          f"{feat.shape[0]:,} papers")
+    for r in rels:
+        w.put(f"edge_index_{r.replace('__', '-')}", load(r, "edge_index.npy"))
+    w.put("paper_features", feat[:papers])
+    for n in small:
+        if os.path.exists(os.path.join(base, n, "node_feat.npy")):
+            w.put(f"{n}_features", load(n, "node_feat.npy"))
+    for k, l in zip(("19", "2K"), labels):
+        w.put(f"paper_label_{k}", l[:papers])
+
+
 def tpch(out):
     """analytics-tpch: TPC-H SF 1 columns as DuckDB stores them."""
     import duckdb
@@ -204,13 +242,14 @@ def era5(out):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("workload", choices=["omics", "mag", "igbh", "tpch", "era5"])
+    ap.add_argument("workload", choices=["omics", "mag", "igbh", "igbh-medium", "tpch", "era5"])
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
-    dirs = {"omics": "omics-pbmc", "mag": "gnn-mag", "igbh": "gnn-igbh", "tpch": "analytics-tpch",
-            "era5": "climate-era5"}
+    dirs = {"omics": "omics-pbmc", "mag": "gnn-mag", "igbh": "gnn-igbh",
+            "igbh-medium": "gnn-igbh-medium", "tpch": "analytics-tpch", "era5": "climate-era5"}
     out = a.out or os.path.join(OUT, dirs[a.workload])
-    {"omics": omics, "mag": mag, "igbh": igbh, "tpch": tpch, "era5": era5}[a.workload](out)
+    {"omics": omics, "mag": mag, "igbh": igbh, "igbh-medium": igbh_medium, "tpch": tpch,
+     "era5": era5}[a.workload](out)
     print("wrote", out)
 
 

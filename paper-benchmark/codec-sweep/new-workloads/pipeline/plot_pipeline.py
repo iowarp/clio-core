@@ -41,7 +41,7 @@ TITLES = {"vpic": "VPIC  sim -> k-means / structures / PDF",
           "lammps": "LAMMPS  sim -> coordination / RDF / k-means",
           "nanoaod": "CMS NanoAOD -> Z->ee selection / mass / PDFs",
           "fem": "FEM matrices -> 100 CG iterations"}
-ORDER = ["vpic", "lammps", "nanoaod", "fem"]
+ORDER = ["vpic", "lammps"]   # nanoaod, fem removed (user, 2026-10-05)
 
 
 def panel(ax, d, meta):

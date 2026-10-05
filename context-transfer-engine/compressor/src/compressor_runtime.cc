@@ -561,6 +561,19 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     }
     HLOG(kInfo, "NeuroPress v2 loaded from {} ({} settings)",
          config_.neuropress_model_path_, neuropress_v2_->NumSettings());
+    // CLIO_NEUROPRESS_PREWARM=K: build and warm K codec objects of every
+    // setting now, before any timed work, so no chunk pays a codec's
+    // first-use setup inside it; whatever selects the settings (NeuroPress,
+    // a fixed setting, a map) then starts from the same warm pool
+    // (ctp::GpuSettingPrewarm). CLIO_NEUROPRESS_PREWARM_BYTES: the chunk size
+    // to warm at (default 4 MiB).
+    if (const char *e = std::getenv("CLIO_NEUROPRESS_PREWARM"); e && *e) {
+      size_t bytes = size_t{4} << 20;
+      if (const char *b = std::getenv("CLIO_NEUROPRESS_PREWARM_BYTES"); b && *b) {
+        bytes = std::strtoull(b, nullptr, 10);
+      }
+      ctp::GpuSettingPrewarm(std::atoi(e), bytes);
+    }
 #else
     HLOG(kError, "NeuroPress v2 needs the CUDA build -- failing "
          "CreateCompressor");
@@ -1260,7 +1273,8 @@ void Runtime::RecordDecompFeatures(
 
 void Runtime::LearnDecompTime(const std::string& blob_key,
                               double measured_ms) {
-  LearnV2DecompTime(blob_key, measured_ms);
+  // v1 only. NeuroPress v2 does no work on reads (user, 2026-10-05): it
+  // learns on the write alone, so a read never trains or waits for it.
   if (!config_.neuropress_online_learning_enabled_ || measured_ms <= 0.0) {
     return;
   }
@@ -1784,7 +1798,6 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         task->return_code_ == 0 &&
         static_cast<uint32_t>(best_lib) == kNpSettingWireId &&
         context.actual_compression_ratio_ > 0.0) {
-      RecordV2Decomp(task->blob_name_.str(), sel_v2_features, best_preset);
       bool v2_trained = false;
       const auto v2_learn_t0 = std::chrono::steady_clock::now();
       const double v2_err = NeuroPressV2LearnPrimary(
@@ -1876,8 +1889,6 @@ clio::run::TaskResume Runtime::DynamicSchedule(
               if (win.decomp_ms >= 0.0) {
                 task->context_.actual_decompress_time_ms_ = win.decomp_ms;
               }
-              RecordV2Decomp(task->blob_name_.str(), sel_v2_features,
-                             win.setting);
               // The selection log's row for this blob is the primary's; a
               // second row names what was actually stored (as v1 does).
               if (SelectionLogEnabled()) {

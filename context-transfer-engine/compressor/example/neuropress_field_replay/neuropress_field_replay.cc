@@ -52,6 +52,7 @@
 #include <limits>
 #include <map>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,6 +70,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/gpu/gpu_ipc_manager.h>
 
+#include "kmeans_consumer.h"
 #include "lookahead_stage.h"
 
 namespace fs = std::filesystem;
@@ -105,6 +107,13 @@ struct Options {
   // With --verify: read everything back this many times, each timed. Needed
   // for a memory-backed tier, whose contents do not outlive this process.
   size_t read_repeat = 1;
+  // With --verify: a k-means consumer (kmeans_consumer.h) with this many
+  // clusters; each timed read-back is one Lloyd iteration over every float32
+  // chunk. Needs --read-to-gpu. 0 = off.
+  int kmeans = 0;
+  // Values per k-means point: 1 for a grid field, 3 for a per-atom vector
+  // stored x0 y0 z0 x1 ... (LAMMPS).
+  int kmeans_dim = 1;
   // With --verify: read back only the blobs whose name matches (ECMAScript
   // regex), as a consumer that reads some of the fields a producer wrote.
   std::string read_match;
@@ -160,6 +169,10 @@ void Usage(const char *argv0) {
       << "  --read-repeat N  with --verify: N timed read-backs; --check-bound\n"
       << "                   then runs one more, untimed, to check the bound\n"
       << "  --read-match RE  with --verify: read back only blobs matching RE\n"
+      << "  --kmeans K       with --verify --read-to-gpu: k-means consumer, K\n"
+      << "                   clusters per field; each timed read-back is one\n"
+      << "                   iteration (float32 and float64 chunks)\n"
+      << "  --kmeans-dim D   values per k-means point [1]; 3 for x y z per atom\n"
       << "  --lookahead N    hold N timesteps of each chunk; store the group as\n"
       << "                   one look-ahead blob when a trial encode says it is\n"
       << "                   smaller (needs a positive CLIO_NEUROPRESS_ERROR_BOUND)\n"
@@ -193,6 +206,8 @@ bool ParseArgs(int argc, char **argv, Options *o) {
     else if (a == "--no-compress") o->no_compress = true;
     else if (a == "--lookahead") o->lookahead = std::atoi(need("N"));
     else if (a == "--read-to-gpu") o->read_to_gpu = true;
+    else if (a == "--kmeans") o->kmeans = std::atoi(need("K"));
+    else if (a == "--kmeans-dim") o->kmeans_dim = std::atoi(need("D"));
     else if (a == "--read-match") o->read_match = need("REGEX");
     else if (a == "--read-repeat") {
       o->read_repeat = std::strtoull(need("N"), nullptr, 10);
@@ -206,6 +221,15 @@ bool ParseArgs(int argc, char **argv, Options *o) {
     else { std::cerr << "unknown option " << a << "\n"; Usage(argv[0]); return false; }
   }
   if (o->dir.empty() && !o->readback) { Usage(argv[0]); return false; }
+  if (o->kmeans != 0 &&
+      (o->kmeans < 1 || o->kmeans > kmeans_consumer::kMaxClusters ||
+       o->kmeans_dim < 1 || o->kmeans_dim > kmeans_consumer::kMaxDim ||
+       !o->verify || !o->read_to_gpu || o->readback)) {
+    std::cerr << "--kmeans K needs 1 <= K <= " << kmeans_consumer::kMaxClusters
+              << ", 1 <= --kmeans-dim <= " << kmeans_consumer::kMaxDim
+              << ", --verify and --read-to-gpu, and no --readback\n";
+    return false;
+  }
   return true;
 }
 
@@ -482,6 +506,125 @@ std::string FieldOf(const std::string &stem) {
 }
 
 /**
+ * @param name a staged chunk's blob name, "...<source>__c<index>__dt-<type>..."
+ * @return the source part (everything before "__c<index>"); the whole name
+ *         when it has no chunk index
+ */
+std::string ChunkSource(const std::string &name) {
+  const size_t dt = name.rfind("__dt-");
+  if (dt == std::string::npos || dt == 0) return name;
+  const size_t c = name.rfind("__c", dt - 1);
+  if (c == std::string::npos || c + 3 >= dt) return name;
+  for (size_t i = c + 3; i < dt; ++i) {
+    if (!std::isdigit(static_cast<unsigned char>(name[i]))) return name;
+  }
+  return name.substr(0, c);
+}
+
+/**
+ * @param name a staged chunk's blob name
+ * @return its physical field, for the k-means consumer: the last component
+ *         of the source path, after the "_compNN_" of a plotfile dump
+ *         ("ez.f32", "density.f32", "B_x.f32") and before the "_step_" of a
+ *         LAMMPS dump ("position")
+ */
+std::string KmeansField(const std::string &name) {
+  const std::string src = ChunkSource(name);
+  const size_t cut = std::max(src.rfind("__") == std::string::npos ? 0 : src.rfind("__") + 2,
+                              src.rfind('/') == std::string::npos ? 0 : src.rfind('/') + 1);
+  std::string field = FieldOf(src.substr(cut));
+  const size_t step = field.find("_step_");
+  return step == std::string::npos ? field : field.substr(0, step);
+}
+
+/** Where one chunk's points lie, for the k-means consumer. */
+struct KmeansChunk {
+  std::string field;  // physical field (one KMeans each)
+  bool f64 = false;   // element type: float64, else float32
+  size_t skip = 0;    // elements before the chunk's first whole point
+};
+
+/**
+ * Plans the k-means consumer's view of every float32 and float64 chunk.
+ *
+ * @param records blobs in write order (the chunks of one source in order)
+ * @param dtype   functor: a record's Context::data_type_ code (1 f32, 2 f64)
+ * @param dim     values per point
+ * @return blob name -> KmeansChunk; chunks of other types are left out
+ */
+template <typename Dtype>
+std::map<std::string, KmeansChunk> PlanKmeans(
+    const std::vector<BlobRecord> &records, Dtype dtype, int dim) {
+  std::map<std::string, KmeansChunk> plan;
+  std::map<std::string, size_t> offset;  // elements of each source so far
+  const size_t d = static_cast<size_t>(dim);
+  for (const auto &r : records) {
+    const int t = dtype(r);
+    if (t != 1 && t != 2) continue;
+    size_t &off = offset[ChunkSource(r.name)];
+    plan[r.name] = KmeansChunk{KmeansField(r.name), t == 2, (d - off % d) % d};
+    off += r.bytes / (t == 2 ? sizeof(double) : sizeof(float));
+  }
+  return plan;
+}
+
+/**
+ * Samples of the source data, one per field, to seed the k-means centroids.
+ *
+ * Reads up to `max_chunks` chunks of each field, evenly spaced over its
+ * records, from the source files (untimed, and the same for every codec
+ * policy) and keeps every `stride`-th whole point of each.
+ *
+ * @param records    blobs written this run, with `src_file` and `src_off` set
+ * @param plan       the consumer's chunk plan (PlanKmeans)
+ * @param dim        values per point
+ * @param max_chunks chunks to sample per field
+ * @param stride     keep one point in this many
+ * @return field -> sampled point values, dim per point
+ */
+std::map<std::string, std::vector<double>> SampleSource(
+    const std::vector<BlobRecord> &records,
+    const std::map<std::string, KmeansChunk> &plan, int dim,
+    size_t max_chunks, size_t stride) {
+  std::map<std::string, std::vector<const BlobRecord *>> by_field;
+  for (const auto &r : records) {
+    auto it = plan.find(r.name);
+    if (r.src_file != nullptr && it != plan.end()) by_field[it->second.field].push_back(&r);
+  }
+  std::map<std::string, std::vector<double>> samples;
+  std::vector<char> buf;
+  const size_t d = static_cast<size_t>(dim);
+  for (const auto &[field, recs] : by_field) {
+    auto &out = samples[field];
+    const size_t step = std::max<size_t>(1, recs.size() / std::max<size_t>(1, max_chunks));
+    for (size_t i = 0; i < recs.size(); i += step) {
+      const BlobRecord &r = *recs[i];
+      const KmeansChunk &c = plan.at(r.name);
+      std::ifstream in(*r.src_file, std::ios::binary);
+      buf.resize(r.bytes);
+      in.seekg(static_cast<std::streamoff>(r.src_off));
+      in.read(buf.data(), static_cast<std::streamsize>(r.bytes));
+      if (!in) continue;
+      const size_t n = r.bytes / (c.f64 ? sizeof(double) : sizeof(float));
+      for (size_t p = c.skip; p + d <= n; p += stride * d) {
+        for (size_t e = p; e < p + d; ++e) {
+          if (c.f64) {
+            double v;
+            std::memcpy(&v, buf.data() + e * sizeof(double), sizeof(v));
+            out.push_back(v);
+          } else {
+            float v;
+            std::memcpy(&v, buf.data() + e * sizeof(float), sizeof(v));
+            out.push_back(v);
+          }
+        }
+      }
+    }
+  }
+  return samples;
+}
+
+/**
  * Read every input file into memory before the timed window opens
  * (CLIO_REPLAY_PRELOAD=1).
  *
@@ -697,6 +840,46 @@ int main(int argc, char **argv) {
     if (opt.read_to_gpu) CLIO_IPC->FreeGpuBackend(/*gpu_id=*/0, b.dev_alloc);
     else CLIO_IPC->FreeBuffer(b.host);
   };
+  // Timed reads take their buffers from a pool filled once before the first
+  // timed pass, outside every timer: a consumer keeps its buffers, and
+  // allocating, registering, clearing and freeing a GPU buffer for every
+  // chunk of every read would put driver work into the read time.
+  std::vector<ReadBuf> read_pool;
+  auto fill_read_pool = [&](size_t count, size_t bytes) -> bool {
+    while (read_pool.size() < count) {
+      ReadBuf b;
+      if (!alloc_read_buf(bytes, &b, /*clear=*/false)) return false;
+      read_pool.push_back(b);
+    }
+    return true;
+  };
+  auto drop_read_pool = [&]() {
+    for (auto &b : read_pool) free_read_buf(b);
+    read_pool.clear();
+  };
+  // --kmeans: one consumer per physical field, active only inside a timed
+  // read-back pass, and each chunk's field, element type and first whole
+  // point (filled before the first pass).
+  std::map<std::string, kmeans_consumer::KMeans> kmeans;
+  std::map<std::string, KmeansChunk> kmeans_plan;
+  bool kmeans_active = false;
+  size_t kmeans_skipped = 0, kmeans_failed = 0;
+  auto dtype_of = [&](const BlobRecord &r) {
+    return opt.dtype_from_name ? DtypeFromName(r.name) : (opt.f64 ? 2 : 1);
+  };
+  // One chunk of the current k-means iteration, on the decoded data in GPU
+  // memory. Chunks that are not float32 / float64, or whose read failed, are
+  // skipped.
+  auto consume = [&](const BlobRecord &r, const ReadBuf &b, int rc) {
+    if (!kmeans_active) return;
+    auto c = kmeans_plan.find(r.name);
+    auto km = c == kmeans_plan.end() ? kmeans.end() : kmeans.find(c->second.field);
+    if (rc != 0 || km == kmeans.end()) { ++kmeans_skipped; return; }
+    const size_t elem = c->second.f64 ? sizeof(double) : sizeof(float);
+    if (!km->second.AddChunk(b.dev, r.bytes / elem, c->second.f64, c->second.skip)) {
+      ++kmeans_failed;
+    }
+  };
   // Issue one read into `b`: a raw GetBlob for the baseline, else the
   // compressor's decompress.
   auto issue_get = [&](const BlobRecord &r, const ReadBuf &b) {
@@ -727,17 +910,22 @@ int main(int argc, char **argv) {
   // Read-back with up to --read-inflight requests outstanding: a consumer
   // that prefetches, so the runtime's workers decode chunks concurrently.
   //
-  // A TIMING mode. Its time is the wall clock of the whole loop -- issuing,
-  // waiting, and allocating and releasing each buffer, as a prefetching
-  // consumer would -- with nothing subtracted: the reads still in flight keep
-  // progressing during any driver work, so subtracting that work would remove
-  // read time with it. For the same reason nothing heavy runs inside the loop:
-  // buffers are not cleared and only each read's return code is checked. The
-  // data are verified by a sequential read (the harness's first), and a
-  // windowed read that must dump or check them says its time includes that.
+  // A TIMING mode, the only one the timed passes use (with 1 or more reads in
+  // flight). Its time is the wall clock of the whole loop -- issuing, waiting
+  // and consuming, as a prefetching consumer would -- with nothing
+  // subtracted: the reads still in flight keep progressing during any driver
+  // work, so subtracting that work would remove read time with it. For the
+  // same reason nothing heavy runs inside the loop: buffers come from a pool
+  // filled before the pass, are not cleared, and only each read's return code
+  // is checked. The data are verified by the untimed sequential check read
+  // after the timed passes, and a windowed read that must dump or check them
+  // allocates its own buffers and says its time includes that.
   auto read_windowed = [&](const std::vector<BlobRecord> &recs, size_t *bad,
                            double *get_ms, size_t *got_bytes) -> bool {
     const bool inspect = !opt.dump_dir.empty() || opt.check_bound;
+    // Pooled buffers hold no cleared data, so a pass that inspects the data
+    // allocates its own; the pool covers the window (fill_read_pool).
+    const bool pooled = !inspect && read_pool.size() >= std::max<size_t>(opt.read_inflight, 1);
     if (inspect) {
       std::cerr << "note: windowed read with --dump-decompressed/--check-bound;"
                    " its time includes that work\n";
@@ -754,6 +942,7 @@ int main(int argc, char **argv) {
         slot.fut.Wait();
         const int rc = slot.fut->GetReturnCode();
         const BlobRecord &r = recs[slot.idx];
+        consume(r, slot.buf, rc);
         if (inspect) {
           finish_record(r, slot.buf, rc, bad, got_bytes);
           return;
@@ -763,16 +952,20 @@ int main(int argc, char **argv) {
           ++*bad;
           std::cerr << "  MISMATCH " << r.name << " rc=" << rc << "\n";
         }
-        free_read_buf(slot.buf);
+        if (pooled) read_pool.push_back(slot.buf);
+        else free_read_buf(slot.buf);
       };
       const auto t_start = std::chrono::steady_clock::now();
       for (size_t i = 0; i < recs.size(); ++i) {
-        if (window.size() >= opt.read_inflight) {
+        if (window.size() >= std::max<size_t>(opt.read_inflight, 1)) {
           finish(window.front());
           window.pop_front();
         }
         ReadBuf buf;
-        if (!alloc_read_buf(recs[i].bytes, &buf, inspect)) {
+        if (pooled && !read_pool.empty()) {
+          buf = read_pool.back();
+          read_pool.pop_back();
+        } else if (!alloc_read_buf(recs[i].bytes, &buf, inspect)) {
           std::cerr << "read buffer allocation failed\n";
           return false;
         }
@@ -815,19 +1008,23 @@ int main(int argc, char **argv) {
       }
       *get_ms += std::chrono::duration<double, std::milli>(
                      std::chrono::steady_clock::now() - t_get).count();
+      consume(r, buf, rc_get);
       finish_record(r, buf, rc_get, bad, got_bytes);
     }
     return true;
   };
 
-  auto verify_records = [&](const std::vector<BlobRecord> &recs) -> bool {
+  // windowed: the timing read (read_windowed, --read-inflight requests in
+  // flight, 1 or more, pooled buffers, return codes only); otherwise the
+  // checking read (read_sequential: every chunk digest-checked).
+  auto verify_records = [&](const std::vector<BlobRecord> &recs,
+                            bool windowed) -> bool {
     size_t bad = 0;
     double get_ms = 0.0;
     size_t got_bytes = 0;
     const bool read_ok =
-        opt.read_inflight > 1
-            ? read_windowed(recs, &bad, &get_ms, &got_bytes)
-            : read_sequential(recs, &bad, &get_ms, &got_bytes);
+        windowed ? read_windowed(recs, &bad, &get_ms, &got_bytes)
+                 : read_sequential(recs, &bad, &get_ms, &got_bytes);
     if (!read_ok) return false;
     // Say which check ran. In bound mode the bytes are NOT expected to match
     // bit for bit, so claiming they did would be false on every lossy run --
@@ -850,6 +1047,21 @@ int main(int argc, char **argv) {
               << std::endl;
     std::cout << "  get+decompress: " << get_ms << " ms for " << got_bytes
               << " B in " << recs.size() << " blob(s)" << std::endl;
+    if (kmeans_active) {
+      double wall = 0.0, gpu = 0.0;
+      size_t chunks = 0;
+      for (const auto &f : kmeans) {
+        wall += f.second.wall_ms();
+        gpu += f.second.gpu_ms();
+        chunks += f.second.chunks();
+      }
+      // A sequential read times the consumer apart from get+decompress; a
+      // windowed read's wall clock already holds it.
+      const double pass_ms = windowed ? get_ms : get_ms + wall;
+      std::cout << "  consumer (k-means): " << wall << " ms (GPU " << gpu
+                << " ms) for " << chunks << " chunk(s)\n  pass: " << pass_ms
+                << " ms (get+decompress + consumer)" << std::endl;
+    }
     return bad == 0;
   };
 
@@ -900,7 +1112,7 @@ int main(int argc, char **argv) {
     }
     std::cout << "cold read-back of " << recs.size() << " blob(s) listed in "
               << opt.report << std::endl;
-    const bool ok = verify_records(recs) && report_bound();
+    const bool ok = verify_records(recs, opt.read_inflight > 1) && report_bound();
     clio::run::CLIO_RUNTIME_FINALIZE();
     return ok ? 0 : 1;
   }
@@ -1403,22 +1615,91 @@ int main(int argc, char **argv) {
   // sequential, that checks the data -- element-wise against the bound with
   // --check-bound, bit-exact against the digest for a lossless run -- so the
   // timed reads (return codes only) carry none of it.
+  // --kmeans: plan the chunks, then seed one consumer per field from a
+  // sample of the source files. @return false when a field cannot be seeded.
+  auto seed_kmeans = [&](const std::vector<BlobRecord> &recs) -> bool {
+    kmeans_plan = PlanKmeans(recs, dtype_of, opt.kmeans_dim);
+    auto samples = SampleSource(recs, kmeans_plan, opt.kmeans_dim, 64, 64);
+    kmeans.clear();
+    for (auto &f : samples) {
+      auto km = kmeans.emplace(f.first, kmeans_consumer::KMeans(opt.kmeans, opt.kmeans_dim));
+      if (!km.first->second.Seed(std::move(f.second))) {
+        std::cout << "KMEANS FAILED: no finite source values of " << f.first
+                  << " to seed from" << std::endl;
+        return false;
+      }
+    }
+    std::cout << "KMEANS: " << kmeans.size() << " field(s), K = " << opt.kmeans
+              << ", " << opt.kmeans_dim << " value(s) per point" << std::endl;
+    if (kmeans.empty()) std::cout << "KMEANS FAILED: no float32 or float64 chunk" << std::endl;
+    return !kmeans.empty();
+  };
+  // --kmeans: end iteration i of every field and print its centroids, at full
+  // precision in a stream of its own (std::cout's format is sticky, and a
+  // lossless run must give the same centroids under every policy).
+  // @return false when a chunk could not be clustered.
+  auto report_kmeans = [&](size_t i) -> bool {
+    std::ostringstream line;
+    line << std::setprecision(17);
+    for (auto &f : kmeans) {
+      const double shift = f.second.EndPass();
+      line << "KMEANS iteration " << i << "/" << opt.read_repeat << " field "
+           << f.first << ": " << f.second.points() << " points in "
+           << f.second.chunks() << " chunk(s); max centroid move " << shift
+           << "\n  centroids:";
+      for (double c : f.second.centroids()) line << " " << c;
+      line << "\n";
+    }
+    line << "KMEANS iteration " << i << "/" << opt.read_repeat << " done: "
+         << kmeans_skipped << " chunk(s) skipped, " << kmeans_failed << " failed";
+    std::cout << line.str() << std::endl;
+    const bool ok = kmeans_failed == 0;
+    kmeans_skipped = kmeans_failed = 0;
+    return ok;
+  };
   auto verify_repeated = [&](const std::vector<BlobRecord> &recs) -> bool {
     const bool check = opt.check_bound || verify_eb <= 0.0;
     const size_t window = opt.read_inflight;
     opt.check_bound = false;
     bool ok = true;
+    if (opt.kmeans > 0 && !seed_kmeans(recs)) ok = false;
+    // Every timed pass, with 1 or more reads in flight, runs the same timing
+    // read on pooled buffers (allocated here, outside the timers); the data
+    // are digest-checked once, by the untimed check below.
+    size_t max_bytes = 1;
+    for (const auto &r : recs) max_bytes = std::max<size_t>(max_bytes, r.bytes);
+    if (!fill_read_pool(std::max<size_t>(window, 1), max_bytes)) {
+      std::cerr << "read buffer pool allocation failed\n";
+      ok = false;
+    }
     for (size_t i = 1; i <= opt.read_repeat; ++i) {
       std::cout << "READ " << i << "/" << opt.read_repeat << std::endl;
-      ok = verify_records(recs) && ok;
+      for (auto &f : kmeans) f.second.BeginPass();
+      kmeans_active = opt.kmeans > 0;
+      const auto t_pass = std::chrono::steady_clock::now();
+      ok = verify_records(recs, /*windowed=*/true) && ok;
+      // The pass's steady-clock window, in the same nanoseconds as the write
+      // window: with several processes, the harness joins every process's
+      // timed intervals into the application's time.
+      std::cout << "  pass window: start_ns "
+                << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       t_pass.time_since_epoch()).count()
+                << "   end_ns "
+                << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count()
+                << std::endl;
+      if (!kmeans_active) continue;
+      kmeans_active = false;
+      ok = report_kmeans(i) && ok;
     }
+    drop_read_pool();
     if (check) {
       opt.check_bound = verify_eb > 0.0;
       opt.read_inflight = 1;
       std::cout << "READ check (untimed; sequential, "
                 << (verify_eb > 0.0 ? "element-wise bound" : "bit-exact digest")
                 << ")" << std::endl;
-      ok = verify_records(recs) && ok;
+      ok = verify_records(recs, /*windowed=*/false) && ok;
       opt.read_inflight = window;
     }
     return ok;

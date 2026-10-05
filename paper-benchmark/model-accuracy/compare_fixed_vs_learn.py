@@ -55,6 +55,10 @@ def candidates(ex):
                           "stored_bytes": [pred.bytes.sum()], "ratio": [1.0]},
                          index=["store (raw)"])
     g = pd.concat([g[g.chunks == n], store]).sort_values("cost_ms")
+    import eval_v2_workloads as ev
+    names, _ = ev.settings_list()
+    dropped = {names[k] for k in ev.DROPPED_SETTINGS}
+    g["candidate"] = ~g.index.isin(dropped)   # may be the best single codec
     return g.drop(columns="chunks")
 
 

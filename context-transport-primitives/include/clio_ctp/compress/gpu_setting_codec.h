@@ -84,6 +84,25 @@ int GpuSettingIndex(const std::string& spec);
  */
 bool GpuSettingAvailable(int index);
 
+/**
+ * @brief Build and warm codec objects of every available setting before any
+ * timed work, so no compress or decompress has to build one.
+ *
+ * Codec objects are shared by all threads through a pool (a call leases one
+ * for its duration). Each warmed object has run one untimed compress and
+ * decompress of synthetic float32 data at `bytes`, so it also skips the
+ * first-use warm-up at that size. A later call that finds no idle object of
+ * its setting builds one and reports it on stderr ("build on demand").
+ *
+ * @param copies objects per setting (at least the number of calls that can
+ *               use one setting at the same time); built one copy of every
+ *               setting per round, and no further round once it would leave
+ *               less than a quarter of the GPU's memory free
+ * @param bytes  input size to warm at (rounded down to a multiple of 8)
+ * @return codec objects warmed (0 in a build without CUDA)
+ */
+int GpuSettingPrewarm(int copies, size_t bytes);
+
 /** Number of per-thread scratch buffers GpuSettingScratch() keeps. */
 constexpr int kGpuScratchSlots = 4;
 

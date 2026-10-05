@@ -307,16 +307,6 @@ private:
    */
   std::unique_ptr<ctp::compress::model::NeuroPressV2Predictor> neuropress_v2_;
 
-  /** @brief What a v2 write predicted from, kept for the read that follows. */
-  struct V2DecompRecord {
-    ctp::compress::model::NeuroPressV2Features features;
-    int setting = -1;    ///< the setting the stored blob was compressed with
-    clio::run::u64 seq;  ///< insertion order, for FIFO eviction
-  };
-  std::mutex v2_decomp_mutex_;
-  std::unordered_map<std::string, V2DecompRecord> v2_decomp_;
-  clio::run::u64 v2_decomp_seq_ = 0;
-
   // HCompress's Expected-Compression-Cost model, deployed as a SELECTOR
   // (hcompress_selection.cc). Loaded only from hcompress_model_path_, and
   // exclusive with NeuroPress: when it loads, neuropress_predictor_ is not
@@ -501,25 +491,6 @@ private:
    * blob has no recorded features, or the predictor isn't ready.
    */
   void LearnDecompTime(const std::string& blob_key, double measured_ms);
-
-  /**
-   * @brief Remember which v2 setting and inputs produced a stored blob, so a
-   * later read can train that setting's decompress-time row.
-   * @param blob_key  blob name
-   * @param features  the chunk's v2 inputs
-   * @param setting   the setting the stored blob used
-   */
-  void RecordV2Decomp(const std::string& blob_key,
-                      const ctp::compress::model::NeuroPressV2Features& features,
-                      int setting);
-
-  /**
-   * @brief v2 half of LearnDecompTime: train the stored setting's decompress
-   * row from a measured read. No-op without a record or with learning off.
-   * @param blob_key    blob name
-   * @param measured_ms the read's codec decompress time
-   */
-  void LearnV2DecompTime(const std::string& blob_key, double measured_ms);
 
   /**
    * @brief Append v2's predictions for every setting of one chunk, made

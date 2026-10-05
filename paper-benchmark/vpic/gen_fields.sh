@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Phase 1 of 2: run VPIC and dump its field array as flat float32 files.
 #
-#   ./gen_fields.sh [--ncell N] [--nppc N] [--steps N] [--dump-int N]
+#   ./gen_fields.sh [--ncell N] [--nz N] [--nppc N] [--steps N] [--dump-int N]
 #                   [--clean-div N] [--out DIR]
 #
 # VPIC has no library interface either, and upstream NeuroPress's own VPIC
@@ -35,6 +35,7 @@ BIN=${BIN:-$HERE/weibel_clio.Linux}
 while [ $# -gt 0 ]; do
   case "$1" in
     --ncell) NCELL=$2; shift 2;;
+    --nz) NZ=$2; shift 2;;
     --nppc) NPPC=$2; shift 2;;
     --steps) STEPS=$2; shift 2;;
     --dump-int) DUMP_INT=$2; shift 2;;
@@ -53,7 +54,7 @@ done
 [ -x "$BIN" ] || { echo "missing deck binary: $BIN -- run ./build_deck.sh first" >&2; exit 1; }
 
 rm -rf "$OUT"; mkdir -p "$OUT"
-VOX=$(( (NCELL+2) * (NCELL+2) * (NCELL+2) ))
+VOX=$(( (NCELL+2) * (NCELL+2) * (${NZ:-$NCELL}+2) ))
 FRAMES=$(( STEPS / DUMP_INT ))
 echo "== VPIC Weibel: ${NCELL}^3 cells (${VOX} voxels with ghosts), nppc=$NPPC, $STEPS steps"
 echo "   dumping 16 field vars every $DUMP_INT steps -> ~$FRAMES frames"
@@ -62,7 +63,7 @@ echo "   out=$OUT"
 # VPIC writes rundata/ and its own diagnostics into the working directory.
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
-VPIC_NX=$NCELL VPIC_NY=$NCELL VPIC_NZ=$NCELL VPIC_NPPC=$NPPC \
+VPIC_NX=$NCELL VPIC_NY=$NCELL VPIC_NZ=${NZ:-$NCELL} VPIC_NPPC=$NPPC \
 VPIC_STEPS=$STEPS VPIC_DUMP_INT=$DUMP_INT VPIC_CLEAN_DIV_INT=$CLEAN_DIV \
 VPIC_DUMP_FIELDS=1 VPIC_DUMP_DIR="$OUT" \
     "$BIN" > "$OUT/vpic.log" 2>&1
