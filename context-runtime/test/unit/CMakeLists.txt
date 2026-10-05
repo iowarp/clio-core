@@ -920,8 +920,12 @@ if(CLIO_CORE_ENABLE_SYCL)
 endif()
 
 # GPU task-trace, POD-transfer, and runtime tests were removed along
-# with the GPU runtime. Coverage of the kernel→CPU path now lives in
-# the SYCL kernel-side tests (test_sycl_chimod_to_cpu, test_sycl_cte_*).
+# with the GPU runtime. On SYCL the kernel→CPU path currently has NO running
+# test: cr_gpu_kernel_stress_sycl above is disabled, and the
+# test_sycl_chimod_to_cpu / test_sycl_cte_* tests this note used to cite do
+# not exist. On Intel GPUs the in-kernel Future::Wait() cannot observe the
+# host's completion write at all (issue #1086), so that path needs a design
+# change, not just a test.
 
 # GPU coroutine test removed along with the GPU runtime concept.
 
