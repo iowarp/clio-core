@@ -87,11 +87,26 @@ fi
 # would then die with "Address already in use". Best-effort clear any leftover
 # and wait for the port to free -- bounded so we never hang.
 RUNTIME_PORT="${CLIO_PORT:-9413}"
+# The runtime binds a cluster of ports: base, base+1 (client-facing) and
+# base+3 (see clio_default.yaml), so any of them can be the one still held.
+RUNTIME_PORTS="${RUNTIME_PORT} $((RUNTIME_PORT + 1)) $((RUNTIME_PORT + 3))"
+# Issue #808: count every TCP state, not only LISTEN. A runtime leaked by the
+# preceding ctest suite is often mid-shutdown here -- its socket has left
+# LISTEN but the port is not yet free -- and a LISTEN-only probe reported the
+# port free a few ms before the new runtime's bind failed.
 port_busy() {
+  local p
   if command -v ss >/dev/null 2>&1; then
-    ss -ltn 2>/dev/null | grep -q ":${RUNTIME_PORT}[[:space:]]"
+    local filter=""
+    for p in ${RUNTIME_PORTS}; do
+      filter="${filter:+${filter} or }sport = :${p}"
+    done
+    [ -n "$(ss -Htan "( ${filter} )" 2>/dev/null)" ]
   elif command -v lsof >/dev/null 2>&1; then
-    lsof -iTCP:"${RUNTIME_PORT}" -sTCP:LISTEN >/dev/null 2>&1
+    for p in ${RUNTIME_PORTS}; do
+      lsof -iTCP:"${p}" >/dev/null 2>&1 && return 0
+    done
+    return 1
   else
     return 1  # no probe available -> assume free
   fi
@@ -103,20 +118,37 @@ if port_busy; then
   if port_busy; then
     # Graceful stop did not free it: force-kill whatever still holds the port.
     if command -v lsof >/dev/null 2>&1; then
-      lsof -ti tcp:"${RUNTIME_PORT}" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+      for p in ${RUNTIME_PORTS}; do
+        lsof -ti tcp:"${p}" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+      done
     fi
-    command -v fuser >/dev/null 2>&1 && fuser -k "${RUNTIME_PORT}/tcp" >/dev/null 2>&1 || true
+    if command -v fuser >/dev/null 2>&1; then
+      for p in ${RUNTIME_PORTS}; do
+        fuser -k "${p}/tcp" >/dev/null 2>&1 || true
+      done
+    fi
     pkill -9 -f clio_run >/dev/null 2>&1 || true
     for _ in $(seq 1 10); do port_busy || break; sleep 1; done
   fi
 fi
 
 # --- Start runtime ----------------------------------------------------------
+# The bind can still race a close that completes between the probe above and
+# the runtime's own bind (#808), so retry a runtime that dies on startup after
+# waiting for its ports to clear.
 info "starting Clio runtime"
-clio_run runtime start --fresh &
-RUNTIME_PID=$!
-sleep 3
-kill -0 "$RUNTIME_PID" 2>/dev/null || { echo "[smoke] ERROR: runtime died on startup"; exit 1; }
+for attempt in 1 2 3; do
+  clio_run runtime start --fresh &
+  RUNTIME_PID=$!
+  sleep 3
+  kill -0 "$RUNTIME_PID" 2>/dev/null && break
+  if [ "$attempt" = 3 ]; then
+    echo "[smoke] ERROR: runtime died on startup (3 attempts)"
+    exit 1
+  fi
+  info "runtime died on startup (attempt ${attempt}/3); waiting for its ports"
+  for _ in $(seq 1 10); do port_busy || break; sleep 1; done
+done
 
 # --- Compose the CTE pool ---------------------------------------------------
 info "composing CTE pool"
