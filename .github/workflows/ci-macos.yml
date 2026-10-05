@@ -135,8 +135,11 @@ jobs:
           cd build
           # -T Test writes the dashboard XML once for the CDash step. Retry
           # intermittently-flaky in-process-runtime tests up to 3x (#482/#485).
+          # "query" is not excluded: the cte_query_* tests pass here, and they
+          # only ever ran because a set_tests_properties wiped their labels
+          # (#1174). Excluding them now would silently drop that coverage.
           ctest -T Test --output-on-failure --timeout 120 --repeat until-pass:3 \
-            -LE "integration|restart|functional|query|stress|docker|flaky" \
+            -LE "integration|restart|functional|stress|docker|flaky" \
             -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress|cte_tag_large|cte_tiered_storage_all|cte_tiered_dram_default_all|cte_reorganize_all"
 
       - name: Submit results to CDash

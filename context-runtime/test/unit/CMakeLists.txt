@@ -1485,7 +1485,7 @@ if(CLIO_CORE_ENABLE_TESTS)
       cr_ipc_transport_default
     )
   endif()
-  set_tests_properties(${_msan_skip_tests} PROPERTIES LABELS "msan_skip")
+  set_property(TEST ${_msan_skip_tests} APPEND PROPERTY LABELS "msan_skip")
 endif()
 
 # macOS (issue #482, fixed): the cross-process client/transport tests reach the

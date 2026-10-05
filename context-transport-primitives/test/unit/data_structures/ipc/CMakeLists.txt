@@ -133,8 +133,7 @@ set_tests_properties(ctp_ipc_lease PROPERTIES TIMEOUT 120)
 # swaps the sigaction reports for reports from Catch2's own reporter against an
 # uninstrumented libstdc++ (tried, still non-zero). An MSan-instrumented libc++
 # would fix this properly; until then these run under asan/ubsan only.
-set_tests_properties(ctp_ipc_string ctp_ipc_unordered_map ctp_ipc_lease
-        PROPERTIES LABELS "msan_skip")
+set_property(TEST ctp_ipc_string ctp_ipc_unordered_map ctp_ipc_lease APPEND PROPERTY LABELS "msan_skip")
 
 add_test(NAME ctp_ring_buffer COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_exec)
@@ -167,19 +166,16 @@ set_tests_properties(
 
 # Skip under MSan: slist/rb_tree tests use precompiled Catch2 which
 # has FatalConditionHandler false positives (sigaction filled by kernel).
-set_tests_properties(
-  ctp_slist_pre
+set_property(TEST ctp_slist_pre
   ctp_slist_pre_atomic
   ctp_rb_tree_pre
   ctp_rb_tree_pre_atomic
   ctp_rb_tree_pre_ext
-  PROPERTIES LABELS "msan_skip"
-)
+  APPEND PROPERTY LABELS "msan_skip")
 
 # Skip under MSan: vector and ring buffer tests use raw shared-memory and
 # atomic operations that MSan cannot instrument (uninstrumented backing alloc).
-set_tests_properties(
-  ctp_vector
+set_property(TEST ctp_vector
   ctp_vector_pod
   ctp_vector_non_pod
   ctp_vector_edge
@@ -190,8 +186,7 @@ set_tests_properties(
   ctp_ring_buffer_mpsc
   ctp_ring_buffer_mpmc
   ctp_multi_ring_buffer
-  PROPERTIES LABELS "msan_skip"
-)
+  APPEND PROPERTY LABELS "msan_skip")
 
 #------------------------------------------------------------------------------
 # Install Targets
