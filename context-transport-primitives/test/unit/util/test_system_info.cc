@@ -231,3 +231,49 @@ TEST_CASE("SystemInfoShmRecreateAfterDestroy") {
 
   SystemInfo::DestroySharedMemory(name);
 }
+
+TEST_CASE("SystemInfoShmLargerThan4GiB") {
+  // Regression for #1061 / #1069. A segment past 4 GiB exercises the
+  // high-order DWORD of the Windows section size and of the view length: a
+  // spelling that truncated size to 32 bits created a 4 KiB section and the
+  // write to the last page below faulted. The backing is sparse on every
+  // platform (memfd / regular file / sparse file), so only the two touched
+  // pages are ever committed.
+  const std::string name = "ctp_shm_large_test_" +
+                           std::to_string(SystemInfo::GetPid());
+  const size_t kSize = (4ull << 30) + 4096;
+  const size_t kPage = 4096;
+
+  ctp::File fd;
+  SystemInfo::DestroySharedMemory(name);
+  REQUIRE(SystemInfo::CreateNewSharedMemory(fd, name, kSize));
+  char *mapped = static_cast<char *>(SystemInfo::MapSharedMemory(fd, kSize, 0));
+  REQUIRE(mapped != nullptr);
+
+  mapped[0] = 'F';
+  char *last = mapped + kSize - kPage;
+  memset(last, 0xA5, kPage);
+  REQUIRE(mapped[0] == 'F');
+  REQUIRE(static_cast<unsigned char>(last[0]) == 0xA5);
+  REQUIRE(static_cast<unsigned char>(last[kPage - 1]) == 0xA5);
+
+  // A second view of the same section sees the bytes written past 4 GiB.
+  ctp::File fd2;
+  REQUIRE(SystemInfo::OpenSharedMemory(fd2, name));
+  char *view2 = static_cast<char *>(SystemInfo::MapSharedMemory(fd2, kSize, 0));
+  REQUIRE(view2 != nullptr);
+  REQUIRE(static_cast<unsigned char>(view2[kSize - 1]) == 0xA5);
+  SystemInfo::UnmapMemory(view2, kSize);
+  SystemInfo::CloseSharedMemory(fd2);
+
+  SystemInfo::UnmapMemory(mapped, kSize);
+  SystemInfo::CloseSharedMemory(fd);
+  SystemInfo::DestroySharedMemory(name);
+
+  // Destroyed: the name no longer opens, and it can be created again.
+  ctp::File fd3;
+  REQUIRE_FALSE(SystemInfo::OpenSharedMemory(fd3, name));
+  REQUIRE(SystemInfo::CreateNewSharedMemory(fd3, name, kPage));
+  SystemInfo::CloseSharedMemory(fd3);
+  SystemInfo::DestroySharedMemory(name);
+}
