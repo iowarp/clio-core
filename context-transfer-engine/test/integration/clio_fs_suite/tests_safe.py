@@ -490,7 +490,9 @@ def t_two_nodes_down(ctx):
   for nm in names:
     ctx.ok(0, 'rec_write', timeout=900, path=f'{base}/{nm}', name=nm,
            runs=[[0, FILE_BLOCKS]], writer=1, gen=1, fsync=True)
-  th, replies, logs, nfiles = _writers(ctx, base, 180, 'twodown')
+  # Long enough to outlive the outage: the probes below take ~20 s per
+  # unreadable file, so the pair is back only ~3 min in.
+  th, replies, logs, nfiles = _writers(ctx, base, 300, 'twodown')
   time.sleep(20)
   down = [cl.hosts[n - 2], cl.hosts[n - 1]]
   parallel(cl.kill_fuse, down)
@@ -520,8 +522,19 @@ def t_two_nodes_down(ctx):
   ctx.check(all(m is True for m in ms), f'remount failed: {ms}')
   for h in down:
     cl.agents.pop(h, None)
-  th.join(timeout=180 + 1200)
+  back_at = time.time()
+  # The filesystem must take writes again once the pair is back.
+  p = ctx.p('after_return')
+  ctx.ok(0, 'write_file', path=p, size=8 << 20, seed=17, fsync=True)
+  v = ctx.ok(n - 1, 'verify_file', path=p, size=8 << 20, seed=17)
+  ctx.check(v['ok'], f'write after the pair returned: {v}')
+  th.join(timeout=300 + 1200)
   ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  ctx.metrics['writer_secs_after_return'] = round(time.time() - back_at, 1)
+  for i in range(n):  # what the failed rounds saw (first few per node)
+    errs = ((replies.get(i) or {}).get('ret') or {}).get('errors') or []
+    if errs:
+      ctx.note(f'node{i} first writer errors: {errs[:2]}')
   _check_filesets(ctx, base, n, nfiles, logs, replies,
                   'after two adjacent nodes crashed and returned')
   restart_cluster(ctx, crash=True)

@@ -206,7 +206,7 @@ def scan(path, file_id, nblocks, blk=BLK, chunk_blocks=256):
             _, ffid, fblk, fw, fg, _ = _HDR.unpack(piece[:_HDR.size])
             foreign[b + i] = [hex(ffid), fblk, fw, fg]
           if w == CORRUPT:
-            d = describe_corrupt(piece, blk)
+            d = describe_corrupt(piece, blk, file_id, b + i)
             if isinstance(d.get('head'), list) and d.get('rest_is'):
               # A write torn mid-block: [head writer, head gen, rest writer,
               # rest gen] -- the caller decides whether that tear is legal.
@@ -234,19 +234,43 @@ def scan(path, file_id, nblocks, blk=BLK, chunk_blocks=256):
           'foreign': {str(k): v for k, v in foreign.items()}}
 
 
-def describe_corrupt(piece, blk=BLK):
+# Gens a torn block's other half is matched against: a writer that retries
+# after a fault burns a gen per failed round, so they run into the hundreds.
+_TORN_MAX_GEN = 1024
+
+
+def describe_corrupt(piece, blk=BLK, file_id=None, block=None):
   """Describe a CORRUPT block for a failure report.
 
   Args:
     piece: the block's bytes.
     blk: block size.
+    file_id: the file's record id, if known (lets a block whose head is
+      zeros be matched against this file's own records).
+    block: the block's index, if known.
   Returns:
     {'len', 'nonzero', 'head' (header fields if the magic is there),
      'tail_zero_from' (offset where an all-zero tail starts, or None),
      'pattern_breaks_at' (first offset past the header where the record's
-     digest pattern no longer matches, or None)}.
+     digest pattern no longer matches, or None)}. A block whose head is
+     zeros and whose rest is the tail of one of this file's records gets
+     'head' [file id, block, 0, 0] and 'rest_is' [writer, gen]: a write
+     torn the other way round (its tail landed, its head did not).
   """
   out = {'len': len(piece), 'nonzero': len(piece) - piece.count(0)}
+  if piece[:8] != MAGIC and file_id is not None and block is not None and \
+     len(piece) == blk:
+    z = len(piece) - len(piece.lstrip(b'\0'))  # first nonzero offset
+    if 0 < z < blk:
+      for w in range(1, 17):
+        for g in range(0, _TORN_MAX_GEN + 1):
+          ref = make_block(file_id, block, w, g, blk)
+          if piece[z:] == ref[z:]:
+            out['head'] = [hex(file_id), block, 0, 0]
+            out['rest_is'] = [w, g]
+            out['zero_head_to'] = z
+            out['tail_zero_from'] = None
+            return out
   if piece[:8] == MAGIC and len(piece) >= _HDR.size:
     _, fid, blkno, writer, gen, _ = _HDR.unpack(piece[:_HDR.size])
     out['head'] = [hex(fid), blkno, writer, gen]
@@ -266,7 +290,7 @@ def describe_corrupt(piece, blk=BLK):
     # block with other writers / gens (a torn write keeps an older version).
     fid, blkno = int(out['head'][0], 16), out['head'][1]
     for w in range(1, 17):
-      for g in range(0, 129):
+      for g in range(0, _TORN_MAX_GEN + 1):
         ref = make_block(fid, blkno, w, g, blk)
         if piece[brk:] == ref[brk:]:
           out['rest_is'] = [w, g]
