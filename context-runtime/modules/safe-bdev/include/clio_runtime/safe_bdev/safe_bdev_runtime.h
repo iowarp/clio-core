@@ -937,6 +937,20 @@ class Runtime : public clio::run::Container {
                                           bool &ok, clio::run::u64 lo = 0,
                                           clio::run::u64 len = kChunkLen);
   /**
+   * The parity half of GatherSurvivors: read active parity rows until the
+   * decode has k shards, as many at once as it still needs.
+   * @param s slot
+   * @param k the code width
+   * @param idx shard RS indices gathered so far; parity rows append k + row
+   * @param bufs the shards gathered so far
+   * @param lo first byte of each chunk to read
+   * @param len bytes of each chunk to read
+   */
+  clio::run::TaskResume GatherParitySurvivors(
+      clio::run::u64 s, int k, std::vector<int> &idx,
+      std::vector<std::vector<uint8_t>> &bufs, clio::run::u64 lo,
+      clio::run::u64 len);
+  /**
    * Read up to k = code.size() usable shards of slot `s`: data members of
    * the encoded set `code` that are active and not in `exclude`, then
    * active parity members.
@@ -1110,24 +1124,80 @@ class Runtime : public clio::run::Container {
       bool &ok);
 
   /**
-   * parity_j[offset, offset+len) += coeff * delta (GF(2^8)), in place.
-   * @param j parity row
-   * @param offset member offset
-   * @param delta the data change (old ^ new)
-   * @param len bytes
-   * @param coeff the code coefficient for the changed data column
-   * @param ok false on an I/O failure
+   * One parity shard's share of a delta update: the stripe's pieces folded
+   * into a single change over the bounding range they cover (#1160), so the
+   * shard is read and rewritten once, not once per piece.
+   * @param s the stripe
+   * @param pieces the write's pieces
+   * @param data the write's bytes
+   * @param old_bytes per piece, the bytes it replaced
+   * @param lo receives the first changed byte of the chunk
+   * @param deltas receives, per parity row, coeff-weighted (old ^ new) over
+   *        [lo, lo + deltas[j].size()); empty for an inactive row
+   * @return false if a piece of `s` has no replaced bytes
    */
-  clio::run::TaskResume ParityRangeAdd(size_t j, clio::run::u64 offset,
-                                       const uint8_t *delta,
-                                       clio::run::u64 len, uint8_t coeff,
-                                       bool &ok);
+  bool FoldParityDeltas(clio::run::u64 s, const std::vector<WritePiece> &pieces,
+                        const char *data,
+                        const std::vector<std::vector<uint8_t>> &old_bytes,
+                        clio::run::u64 &lo,
+                        std::vector<std::vector<uint8_t>> &deltas);
   /** Where a Write spent its time inside WriteStripes, in ms. */
   struct WritePhases {
     double read_old_ms = 0;  /**< ReadReplacedBytes (delta-parity reads) */
     double members_ms = 0;   /**< member data writes, dispatch to last ack */
     double encode_ms = 0;    /**< parity encode + parity writes, all stripes */
+    double load_ms = 0;      /**< degraded stripes reconstructed before the write */
+    double journal_ms = 0;   /**< down columns journaled (JournalDownColumns) */
+    double store_ms = 0;     /**< degraded stripes' parity written */
   };
+  /** One read of a data member, batched by DispatchDataReads. */
+  struct SegRead {
+    size_t d = 0;             /**< data member */
+    clio::run::u64 offset = 0; /**< absolute member-pool offset */
+    uint8_t *dst = nullptr;   /**< where the bytes go */
+    clio::run::u64 len = 0;   /**< bytes */
+    bool ok = false;          /**< set by AwaitDataReads */
+  };
+  /** The in-flight reads of one DispatchDataReads (index-aligned). */
+  struct SegReadBatch {
+    std::vector<clio::run::Future<clio::run::bdev::ReadTask>> futs;
+    std::vector<ctp::ipc::FullPtr<char>> bufs;
+  };
+  /**
+   * Send every read of `reads` to its member at once (#1160: survivor and
+   * replaced-bytes reads used to go one round trip at a time).
+   * @param reads the reads
+   * @param batch receives the futures and staging buffers
+   * @return false if a staging buffer could not be allocated (nothing sent)
+   */
+  bool DispatchDataReads(const std::vector<SegRead> &reads,
+                         SegReadBatch &batch);
+  /**
+   * Wait for a DispatchDataReads batch: copy each read's bytes to its `dst`,
+   * set its `ok`, fault members whose I/O failed fatally, free the staging.
+   * @param reads the reads (ok is set per entry)
+   * @param batch the batch
+   */
+  clio::run::TaskResume AwaitDataReads(std::vector<SegRead> &reads,
+                                       SegReadBatch &batch);
+  /**
+   * The first half of a degraded write: reconstruct every stripe of the write
+   * with a down data member, keep the bytes the write replaces there, overlay
+   * the write, and journal the down columns (#1137) before any data lands.
+   * @param pieces the write's pieces
+   * @param data the write's bytes
+   * @param intents the write's intent-log keys (journal records key by them)
+   * @param degraded receives the overlaid stripes, by slot
+   * @param deg_old receives, per piece, the replaced bytes (CaptureDegradedOld)
+   * @param phases receives the load and journal times, if not null
+   * @param ok false if a stripe could not be reconstructed or journaled
+   */
+  clio::run::TaskResume PrepareDegradedStripes(
+      const std::vector<WritePiece> &pieces, const char *data,
+      const std::vector<IntentKey> &intents,
+      std::map<clio::run::u64, DegradedStripe> &degraded,
+      std::vector<std::vector<uint8_t>> &deg_old, WritePhases *phases,
+      bool &ok);
   /**
    * The body of a Write once its stripes are held and logged dirty: land the
    * data (degraded stripes reconstructed and re-encoded), then encode the
@@ -1248,6 +1318,44 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume StoreDegradedParity(clio::run::u64 s,
                                             const DegradedStripe &st,
                                             bool &ok);
+  /**
+   * Keep the bytes a write replaces in its degraded stripes, from the stripes
+   * as reconstructed before the write (a down column's "old" bytes are what
+   * its parity decodes to). Lets StoreDegradedStripe update parity by delta.
+   * @param degraded the reconstructed stripes, before OverlayPieces
+   * @param pieces the write's pieces
+   * @param old_bytes receives, per piece, the replaced bytes (empty for
+   *        pieces of healthy stripes)
+   */
+  void CaptureDegradedOld(
+      const std::map<clio::run::u64, DegradedStripe> &degraded,
+      const std::vector<WritePiece> &pieces,
+      std::vector<std::vector<uint8_t>> &old_bytes) const;
+  /**
+   * Write a degraded stripe's parity after its data landed: by delta from the
+   * change alone when the write covers little of the stripe (#1160) -- the
+   * parity still encodes the down column either way -- else a full
+   * re-encode from the reconstructed, overlaid stripe. A delta that fails
+   * part-way falls back to the full re-encode, which rewrites every shard.
+   * @param s slot
+   * @param st the overlaid stripe
+   * @param pieces the write's pieces
+   * @param data the write's bytes
+   * @param old_bytes per piece, the replaced bytes (CaptureDegradedOld)
+   * @param ok receives success
+   */
+  clio::run::TaskResume StoreDegradedStripe(
+      clio::run::u64 s, const DegradedStripe &st,
+      const std::vector<WritePiece> &pieces, const char *data,
+      const std::vector<std::vector<uint8_t>> &old_bytes, bool &ok);
+  /** @return active parity rows. */
+  clio::run::u32 ActiveParityCount() const {
+    clio::run::u32 n = 0;
+    for (const auto &p : parity_members_) {
+      if (p.state_.Load() == ec::EcState::kActive) ++n;
+    }
+    return n;
+  }
   /** @return data members of stripe `st` that are down. */
   clio::run::u32 DownInStripe(const DegradedStripe &st) const {
     clio::run::u32 n = 0;
