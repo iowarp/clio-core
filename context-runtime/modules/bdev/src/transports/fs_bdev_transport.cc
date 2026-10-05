@@ -3,14 +3,25 @@
  * All rights reserved.
  */
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <system_error>
 #include <clio_runtime/bdev/transports/fs_bdev_transport.h>
 #include <clio_ctp/introspect/system_info.h>
+#include <clio_ctp/io/io_error.h>
 #include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/manager.h>
 #include <clio_runtime/worker.h>
 #include <clio_runtime/work_orchestrator.h>
 #include <fcntl.h>
+#ifndef _WIN32
+#include <unistd.h>  // close (ReserveFileSpace)
+#else
+#include <io.h>  // _open, _commit, _close (SyncFileData)
+#endif
 
 namespace clio::run::bdev {
 
@@ -42,6 +53,71 @@ std::unique_ptr<ctp::AsyncIO> OpenBackingFile(clio::run::u32 io_depth,
   return nullptr;
 }
 
+/**
+ * Reserve real disk blocks for [from, to) of the backing file. ftruncate
+ * alone makes a SPARSE extent: it never fails for lack of space, so a full
+ * disk showed up later as failed writes (EIO to the application) instead
+ * of as a full device at allocation time.
+ * @param file_path backing file
+ * @param from start of the new extent
+ * @param to end of the new extent
+ * @return 0, or the errno (ENOSPC when the disk cannot hold it). A
+ *         filesystem without fallocate support keeps the sparse extent (0).
+ */
+int ReserveFileSpace(const std::string &file_path, clio::run::u64 from,
+                     clio::run::u64 to) {
+#ifdef __linux__
+  if (to <= from) return 0;
+  const int fd = open(file_path.c_str(), O_RDWR);
+  if (fd < 0) return errno;
+  const int rc = posix_fallocate(fd, static_cast<off_t>(from),
+                                 static_cast<off_t>(to - from));
+  close(fd);
+  if (rc == EOPNOTSUPP || rc == EINVAL) return 0;
+  return rc;
+#else
+  (void)file_path;
+  (void)from;
+  (void)to;
+  return 0;
+#endif
+}
+
+/**
+ * Flush a file's data to persistent media.
+ *
+ * Linux has fdatasync. macOS has none, and its fsync stops at the drive's
+ * volatile cache, so F_FULLFSYNC is what reaches media there (falling back
+ * to fsync on filesystems that reject it). Windows flushes via _commit,
+ * which needs a writable handle.
+ * @param file_path the file to flush
+ * @return 0, or the errno of the failing open or flush
+ */
+int SyncFileData(const std::string &file_path) {
+#if defined(_WIN32)
+  const int fd = _open(file_path.c_str(), _O_RDWR | _O_BINARY);
+  if (fd < 0) return errno;
+  const int rc = _commit(fd);
+  const int err = errno;
+  _close(fd);
+  return rc == 0 ? 0 : err;
+#else
+  const int fd = ::open(file_path.c_str(), O_RDONLY);
+  if (fd < 0) return errno;
+#if defined(__linux__)
+  const int rc = ::fdatasync(fd);
+#elif defined(__APPLE__)
+  int rc = ::fcntl(fd, F_FULLFSYNC);
+  if (rc != 0) rc = ::fsync(fd);
+#else
+  const int rc = ::fsync(fd);
+#endif
+  const int err = errno;
+  ::close(fd);
+  return rc == 0 ? 0 : err;
+#endif
+}
+
 }  // namespace
 
 bool WorkerIOContext::Init(const std::string &file_path, clio::run::u32 io_depth,
@@ -50,7 +126,8 @@ bool WorkerIOContext::Init(const std::string &file_path, clio::run::u32 io_depth
 
   async_io_ = OpenBackingFile(io_depth, file_path);
   if (!async_io_) {
-    HLOG(kError, "Worker {} failed to open file {}", worker_id, file_path);
+    HLOG(kError, "Worker {} failed to open file {} ({})", worker_id,
+         file_path, std::strerror(errno));
     return false;
   }
 
@@ -73,6 +150,9 @@ bool FsBdevTransport::Init(const CreateParams& params,
   // The pool name doubles as the backing file path.
   file_path_ = pool_name;
   io_depth_ = params.io_depth_;
+  fail_marker_path_ = file_path_ + ".fail";
+  fail_marker_checked_ns_.store(0, std::memory_order_relaxed);
+  fail_marker_present_.store(false, std::memory_order_relaxed);
 
   auto setup_io = OpenBackingFile(io_depth_, file_path_);
   if (!setup_io) {
@@ -137,6 +217,14 @@ bool FsBdevTransport::Init(const CreateParams& params,
       setup_io->Close();
       return false;
     }
+    const int rrc = ReserveFileSpace(file_path_, 0, initial);
+    if (rrc != 0) {
+      HLOG(kError, "Cannot reserve {} bytes for bdev file {} ({})", initial,
+           file_path_, std::strerror(rrc));
+      setup_io->Truncate(0);
+      setup_io->Close();
+      return false;
+    }
     file_backed_bytes_.store(initial, std::memory_order_relaxed);
   } else {
     // Existing file: its current extent is the already-backed prefix (capped
@@ -149,18 +237,156 @@ bool FsBdevTransport::Init(const CreateParams& params,
   setup_io->Close();
 
   if (!InitializeWorkerIOContexts()) {
-    HLOG(kWarning, "Failed to initialize per-worker I/O contexts");
+    // A worker that cannot open the file fails every I/O it is handed: refuse
+    // the device rather than create one that errors intermittently.
+    HLOG(kError, "Failed to open {} on every worker; refusing the device",
+         file_path_);
+    CleanupWorkerIOContexts();  // release the descriptors that did open
+    return false;
   }
 
   clio::run::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
   size_t num_workers = work_orchestrator ? work_orchestrator->GetWorkerCount() : 16;
   allocator_.Init(num_workers, file_size, params.alignment_);
 
+  return OpenAllocLog(params);
+}
+
+bool FsBdevTransport::OpenAllocLog(const CreateParams& params) {
+  // An explicit alloc_log always recovers. The default log recovers on every
+  // recovering start (a plain `clio_run start`); after `start --fresh` no
+  // metadata references the old bytes, so their allocations are garbage and
+  // the log starts empty.
+  const bool explicit_path = !params.alloc_log_path_.empty();
+  const std::string path =
+      explicit_path ? params.alloc_log_path_ : file_path_ + ".alloc_log";
+  auto *manager = CLIO_RUNTIME_MANAGER;
+  const bool recover =
+      explicit_path || (manager != nullptr && manager->is_restart_);
+  if (!recover) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+  }
+  if (!alloc_log_.Open(path, recover)) {
+    HLOG(kError, "Cannot open allocator log {} for bdev {} ({})", path,
+         file_path_, strerror(errno));
+    return false;
+  }
+  has_alloc_log_ = true;
+  const std::vector<LiveBlock> &live = alloc_log_.live(/*group_id=*/0);
+  if (!live.empty()) {
+    std::vector<std::pair<clio::run::u64, clio::run::u64>> ext;
+    ext.reserve(live.size());
+    for (const auto &b : live) {
+      ext.emplace_back(b.offset, b.size);
+    }
+    allocator_.InitFromLive(ext);
+    HLOG(kInfo, "bdev {}: recovered {} live blocks from {}; {} bytes free",
+         file_path_, live.size(), path, allocator_.GetRemainingSize());
+  }
+  // Start from a compact log so it tracks the live set, not history.
+  alloc_log_.Compact();
+  sync_stop_ = false;
+  sync_thread_ = std::thread(&FsBdevTransport::AllocLogSyncLoop, this);
   return true;
+}
+
+bool FsBdevTransport::FaultInjected() {
+  const clio::run::u64 now_ns = static_cast<clio::run::u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  clio::run::u64 last = fail_marker_checked_ns_.load(std::memory_order_relaxed);
+  if (last != 0 && now_ns - last < kFailMarkerPollNs) {
+    return fail_marker_present_.load(std::memory_order_relaxed);
+  }
+  // One caller per period re-checks; the others keep the cached answer.
+  if (!fail_marker_checked_ns_.compare_exchange_strong(
+          last, now_ns, std::memory_order_relaxed)) {
+    return fail_marker_present_.load(std::memory_order_relaxed);
+  }
+  std::error_code ec;
+  const bool present = std::filesystem::exists(fail_marker_path_, ec);
+  const bool was = fail_marker_present_.exchange(present,
+                                                 std::memory_order_relaxed);
+  if (present != was) {
+    HLOG(kWarning, "bdev {}: fault-injection marker {} {}; I/O now {}",
+         file_path_, fail_marker_path_, present ? "present" : "removed",
+         present ? "FAILS" : "works");
+  }
+  return present;
+}
+
+bool FsBdevTransport::Sync() {
+  if (FaultInjected()) {
+    HLOG(kError, "bdev Sync: {} failed (injected device fault)", file_path_);
+    return false;
+  }
+  // Data first, then the allocator state that references it: a crash in
+  // between leaves synced bytes in blocks the log may not show yet (the
+  // CTE's own WAL still does), never a logged block whose bytes are lost.
+  const int err = SyncFileData(file_path_);
+  if (err != 0) {
+    HLOG(kError, "bdev Sync: flushing {} failed ({})", file_path_,
+         strerror(err));
+    return false;
+  }
+  FlushAllocLog();
+  return true;
+}
+
+void FsBdevTransport::AllocLogSyncLoop() {
+  std::unique_lock<std::mutex> lock(sync_mu_);
+  while (!sync_stop_) {
+    sync_cv_.wait_for(lock, std::chrono::milliseconds(kAllocLogSyncPeriodMs),
+                      [this] { return sync_stop_; });
+    lock.unlock();
+    FlushAllocLog();
+    lock.lock();
+  }
+}
+
+void FsBdevTransport::StopAllocLogSync() {
+  {
+    std::lock_guard<std::mutex> lock(sync_mu_);
+    sync_stop_ = true;
+  }
+  sync_cv_.notify_all();
+  if (sync_thread_.joinable()) {
+    sync_thread_.join();
+  }
+}
+
+void FsBdevTransport::LogBlocks(const std::vector<Block>& blocks,
+                                bool is_free) {
+  if (!has_alloc_log_) return;
+  for (const Block &b : blocks) {
+    if (is_free) {
+      alloc_log_.LogFree(/*group_id=*/0, b.offset_, b.size_, b.block_type_);
+    } else {
+      alloc_log_.LogAlloc(/*group_id=*/0, b.offset_, b.size_, b.block_type_);
+    }
+  }
+  alloc_log_.Append();
+}
+
+void FsBdevTransport::FlushAllocLog() {
+  if (!has_alloc_log_) return;
+  alloc_log_.Flush();
+  // Compact once history dominates: the log is then bounded by ~2x the
+  // live-block count instead of growing with every allocate/free.
+  constexpr clio::run::u64 kMinCompactRecords = 4096;
+  const clio::run::u64 live = alloc_log_.live_block_count();
+  if (alloc_log_.records_on_disk() > std::max(kMinCompactRecords, 2 * live)) {
+    alloc_log_.Compact();
+  }
 }
 
 void FsBdevTransport::Destroy() {
   CleanupWorkerIOContexts();
+  StopAllocLogSync();
+  if (has_alloc_log_) {
+    alloc_log_.Close();
+  }
 }
 
 bool FsBdevTransport::AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) {
@@ -185,7 +411,32 @@ bool FsBdevTransport::AllocateBlocks(size_t size, int worker_id, std::vector<Blo
     blocks.clear();
     return false;
   }
+  // Logged BEFORE the caller can write into or reference the blocks.
+  LogBlocks(blocks, /*is_free=*/false);
   return true;
+}
+
+bool FsBdevTransport::GrowBackingFile(clio::run::u64 backed,
+                                      clio::run::u64 target) {
+  auto io = OpenBackingFile(io_depth_, file_path_);
+  if (!io) {
+    HLOG(kError, "EnsureFileBacked: failed to open {} to grow it", file_path_);
+    return false;
+  }
+  bool ok = io->Truncate(static_cast<size_t>(target));
+  if (ok) {
+    const int rrc = ReserveFileSpace(file_path_, backed, target);
+    if (rrc != 0) {
+      // Out of disk: undo the sparse growth so the file never claims space
+      // it does not have; the allocation fails as a full device.
+      HLOG(kWarning, "EnsureFileBacked: no disk space to grow {} to {} "
+           "bytes ({})", file_path_, target, std::strerror(rrc));
+      io->Truncate(static_cast<size_t>(backed));
+      ok = false;
+    }
+  }
+  io->Close();
+  return ok;
 }
 
 bool FsBdevTransport::EnsureFileBacked(clio::run::u64 end_offset) {
@@ -208,27 +459,79 @@ bool FsBdevTransport::EnsureFileBacked(clio::run::u64 end_offset) {
   if (capacity > 0 && target > capacity) {
     target = capacity;
   }
-  auto io = OpenBackingFile(io_depth_, file_path_);
-  if (!io) {
-    HLOG(kError, "EnsureFileBacked: failed to open {} to grow it", file_path_);
-    return false;
+  const clio::run::u64 now_ns = static_cast<clio::run::u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  if (grow_fail_end_ != 0 && end_offset >= grow_fail_end_ &&
+      now_ns - grow_fail_ns_ < kGrowRetryNs) {
+    return false;  // the disk was just found full: fail fast
   }
-  bool ok = io->Truncate(static_cast<size_t>(target));
-  io->Close();
+  // A whole growth unit first; if the disk cannot hold it, just what this
+  // allocation needs (the unit can be gigabytes more than what is left).
+  bool ok = GrowBackingFile(backed, target);
+  if (!ok && target > end_offset) {
+    target = end_offset;
+    ok = GrowBackingFile(backed, target);
+  }
   if (!ok) {
+    if (grow_fail_end_ == 0 || end_offset < grow_fail_end_ ||
+        now_ns - grow_fail_ns_ >= kGrowRetryNs) {
+      grow_fail_end_ = end_offset;
+    }
+    grow_fail_ns_ = now_ns;
     HLOG(kError,
          "EnsureFileBacked: failed to grow {} from {} to {} bytes — treating "
          "as out of space",
-         file_path_, backed, target);
+         file_path_, backed, end_offset);
     return false;
   }
+  grow_fail_end_ = 0;
   HLOG(kDebug, "EnsureFileBacked: grew {} from {} to {} bytes", file_path_,
        backed, target);
   file_backed_bytes_.store(target, std::memory_order_release);
   return true;
 }
 
+clio::run::u64 FsBdevTransport::HostFreeBytes() const {
+  const clio::run::u64 now_ns = static_cast<clio::run::u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  const clio::run::u64 at = host_free_ns_.load(std::memory_order_acquire);
+  if (at != 0 && now_ns - at < kHostFreeTtlNs) {
+    return host_free_.load(std::memory_order_relaxed);
+  }
+  std::error_code ec;
+  const std::filesystem::space_info si =
+      std::filesystem::space(std::filesystem::path(file_path_).parent_path(),
+                             ec);
+  // Unknown (e.g. no permission to stat): do not cap by it.
+  const clio::run::u64 free_b =
+      ec ? ~clio::run::u64(0) : static_cast<clio::run::u64>(si.available);
+  host_free_.store(free_b, std::memory_order_relaxed);
+  host_free_ns_.store(now_ns, std::memory_order_release);
+  return free_b;
+}
+
+clio::run::u64 FsBdevTransport::GetRemainingSize() const {
+  const clio::run::u64 alloc_free = allocator_.GetRemainingSize();
+  const clio::run::u64 cap = allocator_.GetCapacity();
+  const clio::run::u64 used = cap > alloc_free ? cap - alloc_free : 0;
+  const clio::run::u64 backed =
+      file_backed_bytes_.load(std::memory_order_relaxed);
+  // Free room inside the already-reserved prefix, then whatever the disk
+  // can still add to the file.
+  const clio::run::u64 in_backed = backed > used ? backed - used : 0;
+  const clio::run::u64 host = HostFreeBytes();
+  const clio::run::u64 can_back =
+      host > ~clio::run::u64(0) - in_backed ? ~clio::run::u64(0)
+                                            : in_backed + host;
+  return std::min(alloc_free, can_back);
+}
+
 void FsBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& blocks) {
+  // Logged BEFORE reuse is possible: a crash between the two leaves the
+  // blocks allocated in the log (a leak), never free while still in use.
+  LogBlocks(blocks, /*is_free=*/true);
   allocator_.FreeBlocks(worker_id, blocks);
 }
 
@@ -299,6 +602,15 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
 
   clio::run::u64 total_bytes_written = 0;
   clio::run::u64 data_offset = 0;
+  task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kOk);
+
+  if (FaultInjected()) {
+    // TEST-ONLY: the device is "dead" (see fail_marker_path_).
+    task->return_code_ = 4;
+    task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kDeviceFault);
+    task->bytes_written_ = 0;
+    CLIO_CO_RETURN;
+  }
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
@@ -333,6 +645,8 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
 
     if (result.error_code != 0) {
       task->return_code_ = 4;
+      task->io_error_ =
+          static_cast<clio::run::u32>(ctp::ClassifyErrno(result.error_code));
       task->bytes_written_ = total_bytes_written;
       CLIO_CO_RETURN;
     }
@@ -366,6 +680,15 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
 
   clio::run::u64 total_bytes_read = 0;
   clio::run::u64 data_offset = 0;
+  task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kOk);
+
+  if (FaultInjected()) {
+    // TEST-ONLY: the device is "dead" (see fail_marker_path_).
+    task->return_code_ = 4;
+    task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kDeviceFault);
+    task->bytes_read_ = 0;
+    CLIO_CO_RETURN;
+  }
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
@@ -399,12 +722,35 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
 
     if (result.error_code != 0) {
       task->return_code_ = 4;
+      task->io_error_ =
+          static_cast<clio::run::u32>(ctp::ClassifyErrno(result.error_code));
       task->bytes_read_ = total_bytes_read;
       CLIO_CO_RETURN;
     }
 
     clio::run::u64 actual_bytes = std::min(
         static_cast<clio::run::u64>(result.bytes_transferred), block_read_size);
+    if (actual_bytes < block_read_size &&
+        block.offset_ + block_read_size <= allocator_.GetCapacity()) {
+      // Inside the device but past the backed end of the (lazily grown) file:
+      // never written, so it reads as zeros -- the same answer the file would
+      // give had it been truncated to full capacity up front. A caller that
+      // writes at fixed offsets without going through this allocator (a
+      // safe_bdev member) otherwise saw a short read of a partly written
+      // chunk and took it for a failing disk.
+      std::memset(static_cast<char *>(block_data) + actual_bytes, 0,
+                  block_read_size - actual_bytes);
+      static std::atomic<clio::run::u64> zero_fills{0};
+      const clio::run::u64 nz = zero_fills.fetch_add(1) + 1;
+      if (nz <= 20 || (nz & (nz - 1)) == 0) {
+        // Which reads land past the backed end of a file (#1124 diagnosis).
+        HLOG(kDebug, "bdev ReadBlocks: zero-fill #{} on {}: off {} len {} "
+             "got {} backed {}", nz, file_path_, block.offset_,
+             block_read_size, actual_bytes,
+             file_backed_bytes_.load());
+      }
+      actual_bytes = block_read_size;
+    }
     total_bytes_read += actual_bytes;
     data_offset += actual_bytes;
   }

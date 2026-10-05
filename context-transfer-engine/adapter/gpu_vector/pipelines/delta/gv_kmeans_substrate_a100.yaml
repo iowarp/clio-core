@@ -1,0 +1,215 @@
+# k-means across substrates on ONE A100, at MATCHED launch geometry.
+#
+# This replaces the earlier substrate comparison, which was not controlled:
+# the paged side was pinned to 32 blocks by a sweep ladder while the MPI
+# side silently used its own 64x256 default, so "paged is 18.9x slower"
+# was mostly a 16x thread deficit on one side. Everything below exists to
+# make that class of error impossible rather than unlikely.
+#
+# WHAT IS HELD IDENTICAL ACROSS SUBSTRATES
+#   problem   data_mb, dims, clusters, iters
+#   geometry  blocks (via blocks_per_sm x sm_count), threads
+# clio_gv_kmeans REQUIRES both blocks and threads and passes them to every
+# variant -- it has no "0 = binary default" path -- and it reads the
+# geometry back out of each run's output (geometry_ok) so a flag that is
+# ignored or clamped fails the cell instead of producing a number.
+#
+# WHAT IS ALLOWED TO DIFFER
+# Only the paged cache/tier stack, because a resident substrate has no
+# counterpart to it. That asymmetry IS the measurement.
+#
+# THE BLOCKS SWEEP: POWERS OF TWO, SWEPT DIRECTLY.
+# blocks is now given as an absolute count rather than blocks_per_sm.
+# Deriving it as a fraction of 108 SMs produced 27/54 -- values that carry
+# no meaning of their own and divide the dataset and the per-block cache
+# raggedly. Powers of two divide both cleanly and are what anyone reading
+# a GPU sweep expects.
+#
+#   blocks   32    64   128   256   512
+#   /SM     0.30  0.59  1.19  2.37  4.74
+#
+# 512 sits just past the 4-blocks-per-SM occupancy target; 32 and 64 sit
+# below one block per SM, which is where the best paged number so far
+# lives (4949 ms/iter at 32 blocks, against 7862 at 108).
+#
+# 4 BLOCKS/SM IS NOT REACHABLE BY THE PAGED KERNELS, AND THAT IS THE POINT.
+# Occupancy here is capped by REGISTERS, not by how many blocks we ask
+# for. From cuobjdump --dump-resource-usage on the built binaries:
+#
+#   clio_kmeans_paged_bench     REG=192  -> 1 block/SM, 12.5% occupancy
+#   clio_kmeans_mpi_bench       REG= 32  -> 8 block/SM,  100% occupancy
+#   clio_kmeans_nvshmem_bench   REG= 32  -> 8 block/SM,  100% occupancy
+#
+# On an A100 (65536 regs/SM) resident threads per SM = 65536/regs, so the
+# paged coroutine kernels are hard-limited to 341 threads/SM whatever the
+# block size: at 256 threads/block that is ONE block per SM, i.e. 108
+# blocks resident and everything above that merely QUEUED. That is what
+# the flat, non-monotonic paged curve (7862 / 8655 / 7343 at 108/216/432)
+# was showing, and it means the lever for paged occupancy is register
+# pressure or threads/block -- not more blocks.
+#
+# The package records regs_per_thread, max_blocks_per_sm, occupancy_pct,
+# blocks_resident and blocks_queued on every row, so this is visible in
+# results.csv rather than something a reader has to reconstruct.
+#
+# sm_count IS STILL SET (108) even though blocks is now absolute: the
+# package uses it to report blocks_per_sm_req, blocks_resident and
+# blocks_queued. It is stated rather than detected because detection needs
+# a GPU and this file must load on the login node.
+#
+# CACHE HELD CONSTANT WHILE BLOCKS VARY. cache_mb is a TOTAL, resolved to
+# per-block slots as cache_mb/blocks/page_kb, so sweeping blocks does not
+# quietly change the VRAM budget -- otherwise a blocks sweep is confounded
+# by a cache sweep. Powers of two divide it exactly:
+#     32 x 1024,  64 x 512,  128 x 256,  256 x 128,  512 x 64 slots of 1 MB
+#   = 32768 MB at EVERY rung -- exactly constant, not merely close,
+# and covering the 32 GB problem at every rung, i.e. residency throughout.
+# What DOES change is per-block cache fragmentation, and it shows: paged
+# faults ran 147 -> 4625 -> 5890 at 108 -> 216 -> 432 blocks, with
+# faults == evicts exactly (capacity churn at the margin, not cold misses).
+#
+# NO REPEATS -- MORE ITERATIONS INSTEAD. The paged bench defaults to
+# `int repeat = 3` and reports the BEST of the three, while the resident
+# substrates get exactly one shot, so simply not passing --repeat would
+# have left a silent best-of-3 bias in paged's favour. The package now
+# passes --repeat 1 unconditionally and exposes no knob for it. Stability
+# comes from ITERATIONS, which cost every substrate equally.
+#
+# ITERS=20. MEASURED cost per cell: ~140 s of timed work plus ~40 s of
+# 32 GB dataset build (and RAM-tier prefault on the paged cells) = ~3 min,
+# so a 10-minute request holds THREE cells. 15 cells therefore need FIVE
+# submissions of this same file: jarvis resumes a pipeline test by row
+# count, so each resubmission continues where the last job stopped.
+#
+# THE OUTPUT DIRECTORY IS NEW (kmeans_substrate_blocks). Resume counts
+# ROWS, not parameters, so pointing a reshaped sweep at the old 9-row
+# directory would silently map those rows onto the wrong cells. The
+# 3-rung results stay intact under kmeans_substrate/.
+#
+# Do NOT size this from an assumed scaling law. Per-iteration cost does
+# NOT fall as blocks rise here -- measured 7862 / 8655 / 7343 ms/iter at
+# 108 / 216 / 432 blocks paged -- and two earlier wall-clock estimates
+# were wrong precisely because they assumed it would.
+#
+# ONE RANK. The paged edition is single-process on one GPU, so mpi and
+# nvshmem run at -n 1 on the same GPU. This measures the SUBSTRATE on
+# identical hardware. It does NOT exercise inter-GPU communication -- that
+# is a different question, answered separately by
+# gv_variant_matrix_a100.yaml at 2 ranks.
+#
+# 15 cells = 3 substrates x 5 block rungs. timeout_sec 300 bounds any one
+# cell well inside the 10-minute request.
+# Submit:  jarvis ppl submit gv_kmeans_substrate_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 1
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 60g
+  gpus_per_node: 1
+  time: "00:10:00"
+  job_name: gv_kmeans_substrate
+  output: /u/llogan/gv_job_logs/gv_kmeans_substrate-%j.out
+  error: /u/llogan/gv_job_logs/gv_kmeans_substrate-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+config:
+  name: gv_kmeans_substrate_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_kmeans
+      pkg_name: km
+      variant: paged
+      # ---- the problem, identical for every cell ----
+      data_mb: 32000
+      dims: 32
+      clusters: 16
+      iters: 20
+      # ---- the geometry, identical for every cell at a given rung ----
+      blocks: 128
+      sm_count: 108
+      threads: 256
+      # ---- paged-only ----
+      cache_mb: 32768
+      page_kb: 1024
+      hbm_mb: 256
+      # -1 = size the file tier from data_mb. It was 8192 against a 32000 MB
+      # deck, and the file tier is the ONLY non-volatile tier here, so the
+      # end-of-run flush pushed all 32 GB at an 8 GB target: it filled, then
+      # failed on every remaining blob with rc 12 (10 +
+      # kCteAllocNoHealthyTarget) -- and the flush frees a blob's volatile
+      # blocks BEFORE re-putting them, so those blobs were destroyed, not
+      # merely skipped. Megabytes of `PutBlob failed ... (error 12)` in the
+      # job logs are that. /tmp on these nodes is 1.3 TB, so an honest ~33 GB
+      # tier costs nothing worth saving.
+      nvme_mb: -1
+      nvme_path: /tmp/gv_kmeans_tier.dat
+      # ---- harness ----
+      nprocs: 1
+      mpi_launcher: "mpirun -n {n} --oversubscribe --bind-to none"
+      prefault: "0"
+      timeout_sec: 300
+      output_dir: /tmp/clio_gv/kmeans_substrate
+
+vars:
+  km.variant: [paged, mpi, nvshmem]
+  km.blocks: [32, 64, 128, 256, 512]
+
+loop:
+  - [km.variant]
+  - [km.blocks]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/kmeans_substrate_blocks"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+
+  # 1. REFUSE TO REPORT AN UNCONTROLLED COMPARISON. geometry_ok is 0 when a
+  #    binary did not use the geometry it was given, and -1 when the
+  #    edition does not echo it (mpi/nvshmem) so no check was possible.
+  bad = df[df.get('geometry_ok', -1) == 0]
+  for _, r in bad.iterrows():
+      logger.warning('GEOMETRY MISMATCH %s bps=%s: asked b=%s t=%s, '
+                     'used b=%s t=%s'
+                     % (r['km.variant'], r['km.blocks'],
+                        r.get('blocks_req'), r.get('threads_req'),
+                        r.get('blocks_used'), r.get('threads_used')))
+  if len(bad):
+      logger.warning('%d cells ran at the wrong geometry -- excluded'
+                     % len(bad))
+  df = df[df.get('geometry_ok', -1) != 0]
+
+  ok = df[df.gates_pass == 1]
+  cols = ['km.variant', 'km.blocks', 'threads_total', 'regs_per_thread',
+          'occupancy_pct', 'blocks_resident', 'blocks_queued', 'iters',
+          'ms_per_iter', 'gbps', 'vram_peak_mb', 'faults', 'evicts',
+          'centroid_checksum']
+  logger.info('\n' + ok[[c for c in cols if c in ok.columns]]
+              .to_string(index=False))
+
+  # 2. THE COMPARISON, per rung, normalised per iteration.
+  if 'ms_per_iter' in ok.columns:
+      piv = ok.pivot_table(index='km.blocks', columns='km.variant',
+                           values='ms_per_iter', aggfunc='min')
+      logger.info('\nms_per_iter by (blocks_per_sm x substrate):\n'
+                  + piv.to_string())
+      if 'paged' in piv.columns and 'mpi' in piv.columns:
+          logger.info('\npaged/mpi at matched geometry:\n'
+                      + (piv['paged'] / piv['mpi']).to_string())
+
+  # 3. SAME INPUTS IS NOT SAME ANSWER. The substrates must agree
+  #    numerically or the timings compare two different computations.
+  if 'centroid_checksum' in ok.columns:
+      for bps, g in ok.groupby('km.blocks'):
+          cs = g['centroid_checksum'].dropna().unique()
+          if len(cs) > 1:
+              spread = (max(cs) - min(cs)) / max(abs(max(cs)), 1e-30)
+              logger.warning('bps=%s: substrates DISAGREE on the answer, '
+                             'checksums %s (rel spread %.3e)'
+                             % (bps, list(cs), spread))

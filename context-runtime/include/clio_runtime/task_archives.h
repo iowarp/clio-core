@@ -102,6 +102,16 @@ public:
   int client_port_ = 0;
 
   /**
+   * Sending runtime's node id and incarnation (its server generation, set
+   * at startup), stamped on every runtime-to-runtime message (#1148). A
+   * receiver that sees a node's incarnation change knows that node
+   * restarted: whatever it had sent the old process will never be answered.
+   * 0 incarnation = unset (client messages).
+   */
+  u64 sender_node_ = 0;
+  u64 sender_inc_ = 0;
+
+  /**
    * Default constructor
    */
   NetTaskArchive() : msg_type_(MsgType::kSerializeIn) {}
@@ -124,7 +134,9 @@ public:
       : ctp::lbm::LbmMeta<>(std::move(other)),
         task_infos_(std::move(other.task_infos_)),
         msg_type_(other.msg_type_),
-        client_port_(other.client_port_) {}
+        client_port_(other.client_port_),
+        sender_node_(other.sender_node_),
+        sender_inc_(other.sender_inc_) {}
 
   /**
    * Move assignment operator
@@ -135,6 +147,8 @@ public:
       task_infos_ = std::move(other.task_infos_);
       msg_type_ = other.msg_type_;
       client_port_ = other.client_port_;
+      sender_node_ = other.sender_node_;
+      sender_inc_ = other.sender_inc_;
     }
     return *this;
   }
@@ -185,26 +199,30 @@ private:
   ctp::ipc::GlobalSerialize<std::vector<char>> serializer_;
   ctp::lbm::Transport *lbm_transport_;
   bool is_pod_ = false;
+  /** Host copies of bulk buffers that live in DEVICE memory (see bulk()).
+   *  Owned here so they outlive the send: the transport copies bulk bytes
+   *  with a host memcpy inside Send, and a GPU address there is a segfault. */
+  std::vector<std::unique_ptr<char[]>> staged_;
 
 public:
   void PushPod(bool val) { is_pod_ = val; }
   void PopPod() { is_pod_ = false; }
 
+  /** Constructor and destructor are defined OUT OF LINE, in task_archive.cc.
+   *  Inline, every executable carried its own copy, and an executable linked
+   *  before a member was added kept constructing the OLD layout while the
+   *  library's bulk() used the new one: the crash in a two-node kmeans was
+   *  bulk() pushing onto a staged_ that a stale kmeans binary never
+   *  initialised. With the special members in one library the layout has
+   *  one owner, and a stale binary fails to link instead of failing to run.
+   *  @param msg_type Serialization mode of the message being built
+   *  @param lbm_transport Transport used to Expose bulk buffers (may be null) */
   explicit SaveTaskArchive(MsgType msg_type,
-                           ctp::lbm::Transport *lbm_transport = nullptr)
-      : NetTaskArchive(msg_type),
-        serializer_(buffer_),
-        lbm_transport_(lbm_transport) {
-    buffer_.reserve(256);
-  }
-
-  SaveTaskArchive(SaveTaskArchive &&other) noexcept
-      : NetTaskArchive(std::move(other)),
-        buffer_(std::move(other.buffer_)),
-        serializer_(buffer_, true),
-        lbm_transport_(other.lbm_transport_) {
-    other.lbm_transport_ = nullptr;
-  }
+                           ctp::lbm::Transport *lbm_transport = nullptr);
+  /** Move constructor: takes the buffer, the staged copies and the transport.
+   *  @param other Archive to move from; its transport is cleared */
+  SaveTaskArchive(SaveTaskArchive &&other) noexcept;
+  ~SaveTaskArchive();
 
   SaveTaskArchive &operator=(SaveTaskArchive &&other) noexcept = delete;
   SaveTaskArchive(const SaveTaskArchive &) = delete;
@@ -270,7 +288,7 @@ public:
   template <typename Ar>
   void serialize(Ar &ar) {
     ar(send, recv, send_bulks, recv_bulks);
-    ar(task_infos_, msg_type_, client_port_);
+    ar(task_infos_, msg_type_, client_port_, sender_node_, sender_inc_);
     serializer_.Finalize();
     ar(buffer_);
   }
@@ -430,7 +448,7 @@ public:
   template <typename Ar>
   void serialize(Ar &ar) {
     ar(send, recv, send_bulks, recv_bulks);
-    ar(task_infos_, msg_type_, client_port_);
+    ar(task_infos_, msg_type_, client_port_, sender_node_, sender_inc_);
     ar(data_);
     // Reinitialize deserializer with new data
     new (&deserializer_)

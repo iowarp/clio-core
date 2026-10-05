@@ -996,6 +996,12 @@ class RunContext {
    *  0 for every task the probe did not open — which is every CPU-origin task,
    *  and all tasks when the probe is off. */
   uintptr_t probe_rec_;
+  /** Cycle stamp for the latency report (CLIO_EVLAT): set when this task's
+   *  completion event is pushed onto its parent's event queue, read when the
+   *  parent's worker pops it (channel evq_wait); and on an origin task, set
+   *  at SendIn and read when the remote reply completes it (channel
+   *  rtt_remote). 0 when unset. */
+  unsigned long long notify_ns_ = 0;
 
  private:
   std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event
@@ -1877,8 +1883,13 @@ public:
  * back to the worker with an optional delay before resumption.
  *
  * Usage:
- *   co_await clio::run::yield();       // Yield immediately
+ *   co_await clio::run::yield(1.0);    // Yield, resume on the next pass
  *   co_await clio::run::yield(25.0);   // Yield with 25 microsecond delay
+ *
+ * A delay of 0 does NOT mean "yield immediately": the worker treats it as
+ * "waiting for a Future" and never re-queues the task itself, so a bare
+ * yield() suspends until some event resumes it -- possibly forever. Always
+ * pass a positive delay to yield cooperatively.
  */
 class YieldAwaiter {
  private:
@@ -1938,11 +1949,12 @@ class YieldAwaiter {
  * This function provides a clean syntax for yielding control within
  * ChiMod runtime coroutines.
  *
- * @param us Microseconds to delay before resumption (default: 0)
+ * @param us Microseconds to delay before resumption; must be > 0 for a
+ *           cooperative yield (0 waits for an event, see YieldAwaiter)
  * @return YieldAwaiter object that can be co_awaited
  *
  * Usage:
- *   co_await clio::run::yield();       // Yield immediately
+ *   co_await clio::run::yield(1.0);    // Yield, resume on the next pass
  *   co_await clio::run::yield(25.0);   // Yield with 25 microsecond delay
  */
 inline YieldAwaiter yield(double us = 0.0) { return YieldAwaiter(us); }

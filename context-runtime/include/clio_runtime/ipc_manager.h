@@ -830,6 +830,44 @@ class IpcManager {
   void SetAlive(u64 node_id);
 
   /**
+   * Record that a message (a task or a response) just arrived from node_id.
+   * Proof of life that does not depend on how busy that node's workers are:
+   * a liveness probe is a task, so a node saturated by startup pool creates
+   * can be silent to probes for tens of seconds while it is visibly sending.
+   * Cheap (one relaxed atomic store), called from the receive threads.
+   */
+  void NoteHeardFrom(u64 node_id);
+  /**
+   * Record the incarnation a message from node_id carried (#1148).
+   * @param node_id the sending node
+   * @param incarnation its runtime's server generation (0 = unknown)
+   * @return true when node_id was known under a DIFFERENT incarnation: it
+   *         restarted since, and nothing sent to its old process will be
+   *         answered
+   */
+  bool NotePeerIncarnation(u64 node_id, u64 incarnation);
+  /** Nanoseconds since the last message from node_id; ~0ull if never. */
+  u64 NsSinceHeardFrom(u64 node_id) const;
+  /** Every node id in the hostfile (fixed after init; safe from any thread). */
+  std::vector<u64> GetNodeIds() const;
+  /** Number of nodes marked dead so far; a collective can never complete
+   *  once this is non-zero. Readable from any thread. */
+  u32 DeadNodeCount() const {
+    return dead_count_.load(std::memory_order_acquire);
+  }
+  /** Wall-clock time (ns since the Unix epoch) of the LAST MOMENT a peer
+   *  this node has since declared dead was heard from, the latest over all
+   *  such deaths; 0 if none. A node accepts nothing after it goes silent,
+   *  so fsync (issue #1133) fails a file only if its unsynced window opened
+   *  before that moment -- not merely before the (seconds later) death
+   *  declaration, which failed fsyncs of writes made after the node had
+   *  already died. Wall clock, so values from different nodes compare.
+   *  Readable from any thread. */
+  u64 LastLivenessChangeNs() const {
+    return last_liveness_change_ns_.load(std::memory_order_acquire);
+  }
+
+  /**
    * Get the SWIM node state for a node
    * @param node_id Node to query
    * @return NodeState (kDead for unknown nodes)
@@ -1051,9 +1089,15 @@ class IpcManager {
   template <typename T>
   ctp::ipc::FullPtr<T> ToFullPtr(const ctp::ipc::ShmPtr<T> &shm_ptr) {
     // Full allocator lookup implementation
-    // Case 1: AllocatorId is null - offset IS the raw memory address
-    // This is used for private memory allocations (new/delete)
-    if (shm_ptr.alloc_id_ == ctp::ipc::AllocatorId::GetNull()) {
+    // Case 1: the offset IS the raw address, with no allocator to resolve it
+    // against. Two tags land here:
+    //   GetNull()       - a private HOST address (new/delete).
+    //   GetGpuPointer() - a GPU DEVICE address, which is only dereferenceable
+    //                     in the owning context and must be moved with a
+    //                     device-aware copy. Resolution is the same (pass the
+    //                     address through); the difference is that a holder
+    //                     can now tell the two apart and act on it.
+    if (shm_ptr.alloc_id_.IsRawAddress()) {
       // The offset field contains the raw pointer address
       T *raw_ptr = reinterpret_cast<T *>(shm_ptr.off_.load());
       return ctp::ipc::FullPtr<T>(raw_ptr);
@@ -1150,8 +1194,13 @@ class IpcManager {
     // Acquire reader lock for thread-safe access
     allocator_map_lock_.ReadLock();
 
+    // (alloc_map_ is the live registry; a stale `alloc_vector_` member was
+    // referenced here for a long time without anyone noticing, because no
+    // caller instantiates this overload -- clang's definition-time lookup is
+    // what finally flagged it.)
     ctp::ipc::FullPtr<T> result;
-    for (auto *alloc : alloc_vector_) {
+    for (auto &kv : alloc_map_) {
+      auto *alloc = kv.second;
       if (alloc && alloc->ContainsPtr(ptr)) {
         result = ctp::ipc::FullPtr<T>(alloc, ptr);
         allocator_map_lock_.ReadUnlock();
@@ -1280,7 +1329,9 @@ class IpcManager {
     if (net_queue_.IsNull()) {
       return 0;
     }
-    return net_queue_->GetLane(0, static_cast<u32>(priority)).Size();
+    const u32 p = static_cast<u32>(priority);
+    return net_queue_->GetLane(0, p).Size() +
+           net_overflow_size_[p].load(std::memory_order_relaxed);
   }
 
   /**
@@ -1604,6 +1655,9 @@ class IpcManager {
 
   // Monotonic counter, set from epoch nanos at init
   std::atomic<u64> server_generation_{0};
+  /** Last incarnation seen per peer node (NotePeerIncarnation). */
+  std::mutex peer_inc_mu_;
+  std::unordered_map<u64, u64> peer_inc_;
 
   // The worker task queues (multi-lane queue)
   ctp::ipc::FullPtr<TaskQueue> worker_queues_;
@@ -1690,6 +1744,22 @@ class IpcManager {
 
   // Network queue for send operations (one lane, two priorities)
   ctp::ipc::FullPtr<NetQueue> net_queue_;
+
+  /**
+   * Spill-over for net_queue_ when a priority's ring is full.
+   *
+   * The ring waits for space when full, and its only consumer is the net
+   * worker -- which itself enqueues net tasks (liveness probes from
+   * ScanTaskProgress, retries, responses). Under a burst of cross-node
+   * metadata traffic the ring filled, the net worker blocked pushing into
+   * its own queue, and the node wedged for good (R-state spin in
+   * EnqueueNetTask, peers declaring it dead). Enqueues are serialized by
+   * net_push_mu_ so the space check and the push are atomic; once a
+   * priority has spilled, later tasks queue behind the spill to keep FIFO.
+   */
+  std::mutex net_push_mu_;
+  std::deque<Future<Task>> net_overflow_[kNetQueueNumPriorities];
+  std::atomic<size_t> net_overflow_size_[kNetQueueNumPriorities] = {};
 
   // Net workers' lane pointers for signaling on EnqueueNetTask. With the
   // recv/send split, send-side priorities wake net_send_lane_ and
@@ -1796,14 +1866,39 @@ class IpcManager {
 
   // Dead node tracking for failure detection
   std::vector<DeadNodeEntry> dead_nodes_;
+  std::atomic<u32> dead_count_{0};  ///< dead_nodes_.size(), for other threads
 
   // Self-fencing flag for partition detection (SWIM protocol)
   bool self_fenced_ = false;
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host
+  /** Last-heard-from steady-clock ns per node id (see NoteHeardFrom). */
+  static constexpr u64 kHeardSlots = 65536;
+  std::unique_ptr<std::atomic<u64>[]> last_heard_ns_{
+      new std::atomic<u64>[kHeardSlots]()};
   /** Confirmed membership changes; see GetMembershipEpoch (issue #856). */
   std::atomic<u64> membership_epoch_{0};
+  /** Time of the latest real peer liveness transition; see
+   *  LastLivenessChangeNs (#1133). */
+  std::atomic<u64> last_liveness_change_ns_{0};
+  /**
+   * Record that a peer was just declared dead: raise the liveness-change
+   * time to the wall-clock moment it was last heard from (now, if never).
+   * @param node_id the peer
+   */
+  void NoteLivenessChange(u64 node_id) {
+    const u64 now = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    const u64 since = NsSinceHeardFrom(node_id);
+    const u64 at = (since == ~0ull || since > now) ? now : now - since;
+    u64 cur = last_liveness_change_ns_.load(std::memory_order_acquire);
+    while (at > cur && !last_liveness_change_ns_.compare_exchange_weak(
+                           cur, at, std::memory_order_acq_rel)) {
+    }
+  }
   mutable std::vector<Host>
       hosts_cache_;  // Cached vector of hosts for GetAllHosts
   mutable bool hosts_cache_valid_ = false;  // Flag to track cache validity
@@ -2171,6 +2266,16 @@ CTP_HOST_FUN Future<TaskT, AllocT>::~Future() {
 }
 
 // GetFutureShm() - converts internal ShmPtr to FullPtr
+//
+// CTP_IS_HOST for the same reason as Future::await_suspend_impl in task.h:
+// this body reads Task::RunCtxPtr(), which is itself #if CTP_IS_HOST, and a
+// device pass member-checks the whole translation unit.
+//
+// CTP_HOST_FUN alone is not enough. Under clang-CUDA it nearly is -- wrong-
+// side calls are diagnosed lazily, so an unused host function with a
+// device-invalid body survives -- but SYCL has no deferred diagnostics and
+// rejects it outright. The GPU path uses gpu::Future and never this.
+#if CTP_IS_HOST
 template <typename TaskT, typename AllocT>
 CTP_HOST_FUN ctp::ipc::FullPtr<typename Future<TaskT, AllocT>::FutureT>
 Future<TaskT, AllocT>::GetFutureShm() const {
@@ -2182,6 +2287,7 @@ Future<TaskT, AllocT>::GetFutureShm() const {
   }
   return ctp::ipc::FullPtr<FutureT>(t->RunCtxPtr());
 }
+#endif  // CTP_IS_HOST
 
 // ----------------------------------------------------------------
 // IsComplete variants

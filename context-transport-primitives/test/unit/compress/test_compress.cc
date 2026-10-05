@@ -31,6 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "clio_ctp/util/gpu_api.h"
+#include <type_traits>
 #include "basic_test.h"
 #include "clio_ctp/compress/compress_factory.h"
 #include <utility>
@@ -59,6 +61,7 @@ TEST_CASE("TestCompress") {
   std::vector<char> compressed(1024);
   std::vector<char> decompressed(1024);
 
+#if CTP_ENABLE_BZIP2
   PAGE_DIVIDE("BZIP2") {
     ctp::Bzip2 bzip;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -68,7 +71,9 @@ TEST_CASE("TestCompress") {
                     compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_BZIP2
 
+#if CTP_ENABLE_LZO
   PAGE_DIVIDE("LZO") {
     ctp::Lzo lzo;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -78,7 +83,9 @@ TEST_CASE("TestCompress") {
                    compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_LZO
 
+#if CTP_ENABLE_ZSTD
   PAGE_DIVIDE("Zstd") {
     ctp::Zstd zstd;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -88,7 +95,9 @@ TEST_CASE("TestCompress") {
                     compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_ZSTD
 
+#if CTP_ENABLE_LZ4
   PAGE_DIVIDE("LZ4") {
     ctp::Lz4 lz4;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -98,7 +107,9 @@ TEST_CASE("TestCompress") {
                    compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_LZ4
 
+#if CTP_ENABLE_ZLIB
   PAGE_DIVIDE("Zlib") {
     ctp::Zlib zlib;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -108,7 +119,9 @@ TEST_CASE("TestCompress") {
                     compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_ZLIB
 
+#if CTP_ENABLE_LZMA
   PAGE_DIVIDE("Lzma") {
     ctp::Lzma lzma;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -118,7 +131,9 @@ TEST_CASE("TestCompress") {
                     compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_LZMA
 
+#if CTP_ENABLE_BROTLI
   PAGE_DIVIDE("Brotli") {
     ctp::Brotli brotli;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -128,7 +143,9 @@ TEST_CASE("TestCompress") {
                       compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_BROTLI
 
+#if CTP_ENABLE_SNAPPY
   PAGE_DIVIDE("Snappy") {
     ctp::Snappy snappy;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -138,7 +155,9 @@ TEST_CASE("TestCompress") {
                       compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_SNAPPY
 
+#if CTP_ENABLE_BLOSC2
   PAGE_DIVIDE("Blosc2") {
     ctp::Blosc blosc;
     size_t cmpr_size = 1024, raw_size = 1024;
@@ -148,6 +167,7 @@ TEST_CASE("TestCompress") {
                      compressed.data(), cmpr_size);
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
+#endif  // CTP_ENABLE_BLOSC2
 }
 
 #if CTP_ENABLE_ZFP_SYCL
@@ -327,16 +347,55 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::GetLibraryInfo(212).first == "ndzip");
   }
 
-  PAGE_DIVIDE("GetPreset constructs known CPU compressors (incl. alias)") {
+  PAGE_DIVIDE("GetPreset constructs the CPU compressors this build HAS") {
+    // Each codec is optional (its dev library may not be installed), so the
+    // expectation is conditional on the same switch that compiles it in.
+    // A codec that is compiled out must return nullptr rather than crash --
+    // that is the contract callers rely on, so assert it in both directions.
+#if CTP_ENABLE_BZIP2
     REQUIRE(CompressionFactory::GetPreset("bzip2") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("bzip2") == nullptr);
+#endif
+#if CTP_ENABLE_ZSTD
     REQUIRE(CompressionFactory::GetPreset("zstd") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("zstd") == nullptr);
+#endif
+#if CTP_ENABLE_LZ4
     REQUIRE(CompressionFactory::GetPreset("lz4") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("lz4") == nullptr);
+#endif
+#if CTP_ENABLE_ZLIB
     REQUIRE(CompressionFactory::GetPreset("zlib") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("zlib") == nullptr);
+#endif
+#if CTP_ENABLE_LZMA
     REQUIRE(CompressionFactory::GetPreset("lzma") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("lzma") == nullptr);
+#endif
+#if CTP_ENABLE_BROTLI
     REQUIRE(CompressionFactory::GetPreset("brotli") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("brotli") == nullptr);
+#endif
+#if CTP_ENABLE_SNAPPY
     REQUIRE(CompressionFactory::GetPreset("snappy") != nullptr);
+#else
+    REQUIRE(CompressionFactory::GetPreset("snappy") == nullptr);
+#endif
+#if CTP_ENABLE_BLOSC2
     REQUIRE(CompressionFactory::GetPreset("blosc2") != nullptr);
     REQUIRE(CompressionFactory::GetPreset("blosc") != nullptr);  // alias
+#else
+    REQUIRE(CompressionFactory::GetPreset("blosc2") == nullptr);
+    REQUIRE(CompressionFactory::GetPreset("blosc") == nullptr);  // alias
+#endif
+    // Names stay resolvable regardless: wire ids are frozen protocol values.
+    REQUIRE(CompressionFactory::NameForWireId(4) == "lz4");
     REQUIRE(CompressionFactory::GetPreset("does-not-exist") == nullptr);
   }
 
@@ -350,8 +409,33 @@ TEST_CASE("CompressorRegistryMappings") {
     for (int i = 0; i < 256; ++i) {
       payload += "registry round-trip payload 0123456789 ";
     }
-    const char *cpu_libs[] = {"bzip2", "zstd",   "lz4",    "zlib",
-                              "lzma",  "brotli", "snappy", "blosc2"};
+    // Only the codecs this build compiled in: an absent one legitimately
+    // yields nullptr from the factory (see the optional-codec note above).
+    std::vector<const char *> cpu_libs;
+#if CTP_ENABLE_BZIP2
+    cpu_libs.push_back("bzip2");
+#endif
+#if CTP_ENABLE_ZSTD
+    cpu_libs.push_back("zstd");
+#endif
+#if CTP_ENABLE_LZ4
+    cpu_libs.push_back("lz4");
+#endif
+#if CTP_ENABLE_ZLIB
+    cpu_libs.push_back("zlib");
+#endif
+#if CTP_ENABLE_LZMA
+    cpu_libs.push_back("lzma");
+#endif
+#if CTP_ENABLE_BROTLI
+    cpu_libs.push_back("brotli");
+#endif
+#if CTP_ENABLE_SNAPPY
+    cpu_libs.push_back("snappy");
+#endif
+#if CTP_ENABLE_BLOSC2
+    cpu_libs.push_back("blosc2");
+#endif
     for (const char *lib : cpu_libs) {
       auto comp = CompressionFactory::GetPreset(lib);
       REQUIRE(comp != nullptr);
@@ -392,7 +476,7 @@ TEST_CASE("TestNvCompGpu") {
   // nvcomp needs a real GPU. Skip gracefully where none is present (CI, laptops,
   // Docker without --gpus) so the suite stays green everywhere.
   int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+  if ((device_count = ctp::GpuApi::GetDeviceCount()) == 0) {
     WARN("No CUDA device available; skipping nvcomp GPU compression test");
     return;
   }
@@ -450,13 +534,15 @@ TEST_CASE("TestNvCompGpu") {
     }
 
     void *d_raw = nullptr;
-    REQUIRE(cudaMalloc(&d_raw, raw.size()) == cudaSuccess);
-    REQUIRE(cudaMemcpy(d_raw, raw.data(), raw.size(),
-                       cudaMemcpyHostToDevice) == cudaSuccess);
+    d_raw = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_raw)>>(raw.size());
+    REQUIRE(d_raw != nullptr);
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(d_raw), reinterpret_cast<const char *>(raw.data()), raw.size());
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     size_t cap = raw.size() + raw.size() / 20 + 4096;
     void *d_comp = nullptr;
-    REQUIRE(cudaMalloc(&d_comp, cap) == cudaSuccess);
+    d_comp = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_comp)>>(cap);
+    REQUIRE(d_comp != nullptr);
 
     ctp::NvComp nvcomp(ctp::NvCompAlgo::LZ4);
     size_t comp_size = cap;
@@ -464,19 +550,20 @@ TEST_CASE("TestNvCompGpu") {
     REQUIRE(comp_size < raw.size());
 
     void *d_decomp = nullptr;
-    REQUIRE(cudaMalloc(&d_decomp, raw.size()) == cudaSuccess);
+    d_decomp = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_decomp)>>(raw.size());
+    REQUIRE(d_decomp != nullptr);
     size_t decomp_size = raw.size();
     REQUIRE(nvcomp.Decompress(d_decomp, decomp_size, d_comp, comp_size));
     REQUIRE(decomp_size == raw.size());
 
     std::vector<char> host_out(raw.size());
-    REQUIRE(cudaMemcpy(host_out.data(), d_decomp, raw.size(),
-                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(host_out.data()), reinterpret_cast<const char *>(d_decomp), raw.size());
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
     REQUIRE(raw == std::string(host_out.data(), raw.size()));
 
-    cudaFree(d_raw);
-    cudaFree(d_comp);
-    cudaFree(d_decomp);
+    ctp::GpuApi::Free(d_raw);
+    ctp::GpuApi::Free(d_comp);
+    ctp::GpuApi::Free(d_decomp);
   }
 
   // Every general-purpose nvcomp format must round-trip through the factory on
@@ -526,7 +613,7 @@ TEST_CASE("TestNvCompGpu") {
 // gracefully where none is present so the suite stays green everywhere.
 TEST_CASE("TestCuszGpu") {
   int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+  if ((device_count = ctp::GpuApi::GetDeviceCount()) == 0) {
     WARN("No CUDA device available; skipping cuSZ GPU compression test");
     return;
   }
@@ -542,11 +629,14 @@ TEST_CASE("TestCuszGpu") {
   // Device-pointer (zero-copy) round-trip with a fixed error bound.
   PAGE_DIVIDE("cusz (device pointers, BALANCED) round-trips within eb") {
     void *d_in = nullptr, *d_comp = nullptr, *d_out = nullptr;
-    REQUIRE(cudaMalloc(&d_in, raw_bytes) == cudaSuccess);
-    REQUIRE(cudaMalloc(&d_comp, raw_bytes + 4096) == cudaSuccess);
-    REQUIRE(cudaMalloc(&d_out, raw_bytes) == cudaSuccess);
-    REQUIRE(cudaMemcpy(d_in, orig.data(), raw_bytes,
-                       cudaMemcpyHostToDevice) == cudaSuccess);
+    d_in = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_in)>>(raw_bytes);
+    REQUIRE(d_in != nullptr);
+    d_comp = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_comp)>>(raw_bytes + 4096);
+    REQUIRE(d_comp != nullptr);
+    d_out = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_out)>>(raw_bytes);
+    REQUIRE(d_out != nullptr);
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(d_in), reinterpret_cast<const char *>(orig.data()), raw_bytes);
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     auto comp = ctp::CompressionFactory::GetPreset(
         "cusz", ctp::CompressionPreset::BALANCED);
@@ -561,8 +651,8 @@ TEST_CASE("TestCuszGpu") {
     REQUIRE(dcmp->Decompress(d_out, deco_size, d_comp, cmpr_size));
     REQUIRE(deco_size == raw_bytes);
 
-    REQUIRE(cudaMemcpy(deco.data(), d_out, raw_bytes,
-                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(deco.data()), reinterpret_cast<const char *>(d_out), raw_bytes);
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
     // Lossy within the BALANCED relative error bound (1e-3) on a [-100,100]
     // signal -> generous absolute slack.
     double max_err = 0.0;
@@ -572,9 +662,9 @@ TEST_CASE("TestCuszGpu") {
     }
     REQUIRE(max_err < 1.0);
 
-    cudaFree(d_in);
-    cudaFree(d_comp);
-    cudaFree(d_out);
+    ctp::GpuApi::Free(d_in);
+    ctp::GpuApi::Free(d_comp);
+    ctp::GpuApi::Free(d_out);
   }
 }
 #endif  // CTP_ENABLE_CUSZ
@@ -584,7 +674,7 @@ TEST_CASE("TestCuszGpu") {
 // skip gracefully where none is present.
 TEST_CASE("TestNdzipGpu") {
   int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+  if ((device_count = ctp::GpuApi::GetDeviceCount()) == 0) {
     WARN("No CUDA device available; skipping ndzip GPU compression test");
     return;
   }
@@ -599,11 +689,14 @@ TEST_CASE("TestNdzipGpu") {
   // Lossless: device round-trip must reconstruct the input bit-exactly.
   PAGE_DIVIDE("ndzip (device pointers) round-trips bit-exactly") {
     void *d_in = nullptr, *d_comp = nullptr, *d_out = nullptr;
-    REQUIRE(cudaMalloc(&d_in, raw_bytes) == cudaSuccess);
-    REQUIRE(cudaMalloc(&d_comp, raw_bytes * 2 + 4096) == cudaSuccess);
-    REQUIRE(cudaMalloc(&d_out, raw_bytes) == cudaSuccess);
-    REQUIRE(cudaMemcpy(d_in, orig.data(), raw_bytes,
-                       cudaMemcpyHostToDevice) == cudaSuccess);
+    d_in = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_in)>>(raw_bytes);
+    REQUIRE(d_in != nullptr);
+    d_comp = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_comp)>>(raw_bytes * 2 + 4096);
+    REQUIRE(d_comp != nullptr);
+    d_out = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_out)>>(raw_bytes);
+    REQUIRE(d_out != nullptr);
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(d_in), reinterpret_cast<const char *>(orig.data()), raw_bytes);
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     auto comp = ctp::CompressionFactory::GetPreset("ndzip");
     REQUIRE(comp != nullptr);
@@ -617,12 +710,12 @@ TEST_CASE("TestNdzipGpu") {
     REQUIRE(dcmp->Decompress(d_out, deco_size, d_comp, cmpr_size));
     REQUIRE(deco_size == raw_bytes);
 
-    REQUIRE(cudaMemcpy(deco.data(), d_out, raw_bytes,
-                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(deco.data()), reinterpret_cast<const char *>(d_out), raw_bytes);
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
     REQUIRE(orig == deco);  // lossless: exact
-    cudaFree(d_in);
-    cudaFree(d_comp);
-    cudaFree(d_out);
+    ctp::GpuApi::Free(d_in);
+    ctp::GpuApi::Free(d_comp);
+    ctp::GpuApi::Free(d_out);
   }
 }
 #endif  // CTP_ENABLE_NDZIP
@@ -632,7 +725,7 @@ TEST_CASE("TestNdzipGpu") {
 // GPU; skip gracefully where none is present.
 TEST_CASE("TestCuszpGpu") {
   int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+  if ((device_count = ctp::GpuApi::GetDeviceCount()) == 0) {
     WARN("No CUDA device available; skipping cuSZp GPU compression test");
     return;
   }
@@ -651,11 +744,14 @@ TEST_CASE("TestCuszpGpu") {
   // Device-pointer (zero-copy) round-trip within the absolute error bound.
   PAGE_DIVIDE("cuszp (device pointers, BALANCED) round-trips within eb") {
     void *d_in = nullptr, *d_comp = nullptr, *d_out = nullptr;
-    REQUIRE(cudaMalloc(&d_in, raw_bytes) == cudaSuccess);
-    REQUIRE(cudaMalloc(&d_comp, raw_bytes + 4096) == cudaSuccess);
-    REQUIRE(cudaMalloc(&d_out, raw_bytes) == cudaSuccess);
-    REQUIRE(cudaMemcpy(d_in, orig.data(), raw_bytes,
-                       cudaMemcpyHostToDevice) == cudaSuccess);
+    d_in = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_in)>>(raw_bytes);
+    REQUIRE(d_in != nullptr);
+    d_comp = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_comp)>>(raw_bytes + 4096);
+    REQUIRE(d_comp != nullptr);
+    d_out = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(d_out)>>(raw_bytes);
+    REQUIRE(d_out != nullptr);
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(d_in), reinterpret_cast<const char *>(orig.data()), raw_bytes);
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     auto comp = ctp::CompressionFactory::GetPreset(
         "cuszp", ctp::CompressionPreset::BALANCED);
@@ -671,8 +767,8 @@ TEST_CASE("TestCuszpGpu") {
     REQUIRE(dcmp->Decompress(d_out, deco_size, d_comp, cmpr_size));
     REQUIRE(deco_size == raw_bytes);
 
-    REQUIRE(cudaMemcpy(deco.data(), d_out, raw_bytes,
-                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(deco.data()), reinterpret_cast<const char *>(d_out), raw_bytes);
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
     // Lossy within the BALANCED absolute error bound (1e-3) -> generous slack.
     double max_err = 0.0;
     for (size_t i = 0; i < n; ++i) {
@@ -681,9 +777,9 @@ TEST_CASE("TestCuszpGpu") {
     }
     REQUIRE(max_err < 1.0);
 
-    cudaFree(d_in);
-    cudaFree(d_comp);
-    cudaFree(d_out);
+    ctp::GpuApi::Free(d_in);
+    ctp::GpuApi::Free(d_comp);
+    ctp::GpuApi::Free(d_out);
   }
 }
 #endif  // CTP_ENABLE_CUSZP

@@ -152,7 +152,7 @@ run_test_docker_direct() {
     # Restart node 1's runtime (the leader) in detached mode
     log_info "Restarting node 1's runtime..."
     docker exec -d iowarp-leader-elect-node1 \
-        /workspace/build/bin/clio_run runtime restart
+        /workspace/build/bin/clio_run runtime start
 
     # Wait for the restarted runtime to initialize and rejoin the cluster
     log_info "Waiting 10s for restarted runtime to initialize..."

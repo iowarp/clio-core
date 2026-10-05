@@ -1,0 +1,105 @@
+# 2-node distributed eternia-MD test: the MPI and NVSHMEM benches, each run
+# as a real multi-rank job across two containers.
+#
+#   HOST_WORKSPACE=$(pwd) NVSHMEM_HOME=... docker compose up -d
+#
+# Both containers share the host GPU through the nvidia runtime, so the two
+# ranks time-slice one device. That makes the WALL TIME meaningless and the
+# CORRECTNESS meaningful, which is the right trade for CI: what is gated is
+# that the slab decomposition, the halo exchange and the atom migration all
+# still work when the ranks are in separate containers talking over a real
+# network -- not that they are fast.
+#
+# Three settings are load-bearing and each cost a debugging round:
+#
+#   * ipc: host  -- NVSHMEM's peer transport uses CUDA IPC handles, which do
+#                   not cross the default per-container IPC namespace.
+#   * root       -- mpirun launches remote ranks over ssh, and a NON-ROOT
+#                   sshd cannot do privilege separation ("setgroups() failed:
+#                   Operation not permitted"), so every public-key auth is
+#                   rejected no matter how correct the keys are. Running the
+#                   nodes as root is what makes ssh work at all here.
+#   * :ro on the workspace -- the consequence of the above. Root containers
+#                   must not be able to litter the repo with root-owned
+#                   files, so the source is mounted read-only and each node
+#                   compiles into its OWN container-local /tmp. Nothing is
+#                   shared and nothing is written back.
+x-node: &node
+  image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+  init: true
+  runtime: nvidia
+  ipc: host
+  user: "0:0"
+  stop_grace_period: 5s
+  security_opt:
+    - seccomp:unconfined
+  volumes:
+    - ${HOST_WORKSPACE:?set HOST_WORKSPACE to the repo root}:/workspace:ro
+    - ${CUDA_HOME:-/usr/local/cuda}:/usr/local/cuda:ro
+    - ${NVSHMEM_HOME:?set NVSHMEM_HOME to the nvshmem prefix}:/opt/nvshmem:ro
+    - ${MD_SSH_DIR:?set MD_SSH_DIR to a writable host directory}:/shared-ssh:rw
+  working_dir: /tmp
+  mem_limit: 8g
+  environment: &node-env
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    - LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/nvshmem/lib:/usr/local/lib
+    # NVSHMEM probes for InfiniBand and prints a scary "Device enumeration
+    # failed" when there is none. There is none here and this test uses the
+    # P2P/IPC path, so the remote transports are disabled rather than left to
+    # fail noisily in every log.
+    - NVSHMEM_REMOTE_TRANSPORT=none
+  command:
+    - bash
+    - -c
+    - |
+      set -e
+      mkdir -p /root/.ssh && chmod 700 /root/.ssh
+      if [ "$$MD_NODE" = "1" ]; then
+        [ -f /shared-ssh/id_rsa ] || ssh-keygen -t rsa -N '' -f /shared-ssh/id_rsa -q
+      else
+        while [ ! -f /shared-ssh/id_rsa.pub ]; do sleep 1; done
+      fi
+      cp /shared-ssh/id_rsa /root/.ssh/id_rsa
+      chmod 600 /root/.ssh/id_rsa
+      cat /shared-ssh/id_rsa.pub >> /root/.ssh/authorized_keys
+      chmod 600 /root/.ssh/authorized_keys
+      mkdir -p /run/sshd
+      ssh-keygen -A >/dev/null 2>&1 || true
+      /usr/sbin/sshd -D -p 2222 -o PermitRootLogin=prohibit-password &
+      touch /tmp/ready
+      wait
+
+services:
+  md-node1:
+    <<: *node
+    container_name: md-node1
+    hostname: md-node1
+    environment:
+      - MD_NODE=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/nvshmem/lib:/usr/local/lib
+      - NVSHMEM_REMOTE_TRANSPORT=none
+    networks:
+      md-cluster: { ipv4_address: 172.23.0.10 }
+
+  md-node2:
+    <<: *node
+    container_name: md-node2
+    hostname: md-node2
+    environment:
+      - MD_NODE=2
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/nvshmem/lib:/usr/local/lib
+      - NVSHMEM_REMOTE_TRANSPORT=none
+    networks:
+      md-cluster: { ipv4_address: 172.23.0.11 }
+
+networks:
+  md-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.23.0.0/24

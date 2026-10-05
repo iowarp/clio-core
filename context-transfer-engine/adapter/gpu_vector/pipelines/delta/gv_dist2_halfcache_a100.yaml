@@ -1,0 +1,213 @@
+# ONE PAGED CELL PER WORKLOAD, 2 NODES, CACHE = HALF THE DATA. HANG GATE.
+#
+# This is not a science sweep. It asks one question of all six paged
+# workloads at once: with the page cache at HALF the data each node holds,
+# so every one of them is genuinely faulting, does the 2-node paged path
+# still finish -- or does something wedge?
+#
+#   6 workloads x 1 cell = 6 cells, all `paged`, all --nodes 2
+#
+# TEN MINUTES FOR THE WHOLE JOB. The wall is 00:10:00 because gpuA100x4 is
+# ~1900 jobs deep and a 10-minute request backfills into gaps almost
+# immediately while an hour-long one sits (the same reason
+# gv_sweep_paged_blocks_a100.yaml chains short jobs). Six cells inside that
+# wall is ~80 s of budget each, which is why the DECKS BELOW ARE SMALL --
+# roughly 2 GB per node rather than the 32 GB anchors. Absolute times here
+# are worthless for comparison; what the cells report is whether the
+# faulting distributed path COMPLETES.
+#
+# timeout_sec is 120: a cell that has not finished by then is the finding.
+# It lands with completed=0 and the post block names it, which is exactly
+# the "did it hang" signal this pipeline exists to produce. A cap shorter
+# than the wall matters -- the wall killing a running cell records nothing.
+#
+# HALF THE CACHE MEANS SIX DIFFERENT ARITHMETICS. Each bench spells its
+# cache differently and each deck was sized so that half is EXACT, not
+# approximate. The per-node data figure is the denominator every time,
+# because the cache is per node:
+#
+#   kmeans     --data-mb 4096 GLOBAL -> 2048/node; 64 blocks x 1 MB pages
+#              = 32 pages/block. cache_mb 1024 -> --slots 16.      32 -> 16
+#   grayscott  --data-mb 4096 GLOBAL -> nz=1024 planes, 512/node; 4 regions
+#              x 8 planes/block = 32 pages/block. cache_mb 1024 -> 16.
+#   weights    --pages is PER BLOCK PER NODE, so --data-mb 2048 is already
+#              the per-node figure -> 32 pages/block. cache_mb 1024 -> 16.
+#   gmx        K comes from --page-kb, NOT from --k (the bench has no --k
+#              and silently ignores one): page 4608 KB = 768^2 x 8 B, so
+#              K=768, mesh 3456 MB, 384 planes/node. --cap is TOTAL pages
+#              -> 192.                                            384 -> 192
+#              --cap must also be >= 4*blocks+2 (the gather holds 4 planes
+#              per block); at 32 blocks that floor is 130, so 192 clears it.
+#   lbann      W1 = H x I x 4 B = 4096 MB at H=262144, I=4096; the vector is
+#              ~4162 pages of 1 MB and a node owns half, ~2081. cache_mb
+#              1024 -> --cap 1024 pages.                         2081 -> 1024
+#              A 1 MB page must hold whole rows of BOTH W1 (I=4096) and W2
+#              (H=262144) -- 262144 elems/page is exactly one W2 row, which
+#              is what caps H here. 32 blocks: hper=4096 is a multiple of
+#              rpp1=64, oper=1 of rpp2=1.
+#   lammps_md  cache is --slots, and --slots IS PER BLOCK ("one table per
+#              block", as the bench's own banner says) -- so the denominator
+#              is the span ONE BLOCK touches, not the vector. Getting this
+#              wrong is silent: the first run of this pipeline used lattice
+#              54 with slots 32 against the vector's 64 global pages and got
+#              `x faults=84 evicts=0` -- a block touched ~25 pages against a
+#              32-slot table, i.e. fully resident, and the cell passed its
+#              gates while testing nothing about paging.
+#              lattice 108 -> nb=64 -> a node owns 32 z-planes of 8 pages.
+#              16 blocks -> 2 planes each, and the force pass reads z-1..z+1,
+#              so a block's span is 4 planes = 32 pages. slots 16.  32 -> 16
+#              nb MUST BE A MULTIPLE OF 32 at this page size: a z-plane is
+#              nb^2 x 512 B and the slab seam must land on a page boundary,
+#              or a halo refresh overwrites this node's own live elements
+#              and the run is quietly wrong. nb=64 gives a 2 MB plane =
+#              exactly 8 pages.
+#
+# gmx AND lbann REPORT NO faults/evicts IN results.csv. The pkg does not
+# parse their paging line, so those two columns come back EMPTY for them --
+# empty, not zero, and the post block's witness below would call that "no
+# faults" if it treated blank as 0. Both do page hard; read the per-node log
+# under ~/.ppi-jarvis/shared/<pipeline>_runN/wl/gvw_dist/*.node0.log, which
+# carries `paging: faults=... evicts=...` directly. Measured on job 21718688:
+# gmx 1402/1210, lbann 11837/10382.
+#
+# NO FILE TIER (nvme_mb 0 everywhere). The end-of-run FlushData is a clean
+# no-op without one; with one it pushes each node's whole share to disk,
+# which is real wall clock spent on something this gate is not asking about.
+#
+# RESUME. jarvis resumes a pipeline test by ROW COUNT. For a FRESH run,
+# `rm -rf $HOME/gv_pipeline_results/dist2_halfcache` first -- otherwise a
+# stale results.csv silently eats the first N cells and still reports
+# success.
+#
+# Submit:  jarvis ppl submit gv_dist2_halfcache_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 60g
+  gpus_per_node: 1
+  time: "00:10:00"
+  job_name: gv_dist2_half
+  output: /u/llogan/gv_job_logs/gv_dist2_half-%j.out
+  error: /u/llogan/gv_job_logs/gv_dist2_half-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "scontrol show hostnames \"$SLURM_JOB_NODELIST\""
+    - "srun -N 2 --ntasks-per-node=1 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+config:
+  name: gv_dist2_halfcache_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: paged
+      nodes: 2
+      node_launcher: "srun -N {n} --ntasks-per-node=1 --gpus-per-node=1"
+      # A pipeline TEST builds a fresh pipeline per cell and the `scheduler:`
+      # block binds self.hostfile only on the one it loaded, so the per-cell
+      # pipelines see None. Name the scheduler's own file.
+      hostfile: /u/llogan/.ppi-jarvis/shared/gv_dist2_halfcache_a100/hostfile.txt
+      cluster_port: 9431
+      threads: 256
+      prefault: "0"
+      # 120 s, and the wall is 600 s. Job 21718688 ran all six in 160 s
+      # total (five of them ~18 s each), so the cap is pure headroom for
+      # the one heavy cell; a cell still running at 120 s is what this
+      # pipeline is looking for.
+      timeout_sec: 120
+      barrier_sec: 60
+      output_dir: /tmp/clio_gv/dist2_halfcache
+
+vars:
+  wl.workload: [kmeans, weights, grayscott, gmx,    lbann,  lammps_md]
+  # kmeans/grayscott: GLOBAL, split across the 2 nodes. weights: PER NODE.
+  wl.data_mb:  [4096,   2048,    4096,      0,      0,      0]
+  wl.page_kb:  [1024,   1024,    1024,      4608,   1024,   256]
+  # Blocks differ per workload because the cache floors do: gmx needs
+  # cap >= 4*blocks+2, lbann needs oper >= 1 with O=64 at 2 nodes (so
+  # blocks <= 32), lammps_md has 16 z-planes per node to hand out.
+  wl.blocks:   [64,     64,      64,        32,     32,     16]
+  # Host RAM tier per node, ~1.5x that node's share. CLIO_PREFAULT=0
+  # touches all of it at compose, so oversizing costs startup seconds.
+  wl.ram_mb:   [3072,   3072,    3072,      3072,   4096,   8192]
+  wl.steps:    [3,      0,       4,         0,      2,      8]
+  wl.repeat:   [1,      2,       1,         1,      0,      0]
+  wl.dims:     [32,     0,       0,         0,      0,      0]
+  wl.clusters: [16,     0,       0,         0,      0,      0]
+  # gmx derives K from --page-kb and has no --k at all; left at 0 so the
+  # row does not carry a flag the binary ignores. K=768 here.
+  wl.mesh_k:   [0,      0,       0,         0,      0,      0]
+  wl.atoms:    [0,      0,       0,         200000, 0,      0]
+  wl.lattice:  [0,      0,       0,         0,      0,      108]
+  wl.in_dim:   [0,      0,       0,         0,      4096,   0]
+  wl.hidden:   [0,      0,       0,         0,      262144, 0]
+  wl.out_dim:  [0,      0,       0,         0,      64,     0]
+  wl.batch:    [0,      0,       0,         0,      256,    0]
+  # 0.01 (the binary default) diverges to NaN at this H and the loss gate
+  # then fails on nan != nan.
+  wl.lr:       [0,      0,       0,         0,      0.0001, 0]
+  # gmx: no room for a second dense mesh copy alongside the paged one; the
+  # conservation gate still runs.
+  wl.no_dense: [false,  false,   false,     true,   false,  false]
+  # RAM-only stack everywhere: the end-of-run flush is a clean no-op.
+  wl.nvme_mb:  [0,      0,       0,         0,      0,      0]
+  # ---- THE HALF-CACHE SETTING, one spelling per bench ------------------
+  # cache_mb -> --slots for kmeans/grayscott/weights, -> --cap for lbann.
+  wl.cache_mb: [1024,   1024,    1024,      0,      1024,   0]
+  # gmx takes --cap in PAGES directly (1024 MB / 4608 KB is not 192).
+  wl.cap:      [0,      0,       0,         192,    0,      0]
+  # lammps_md's cache knob is --slots on the shared x/v table.
+  wl.slots:    [0,      0,       0,         0,      0,      16]
+
+loop:
+  - [wl.workload, wl.data_mb, wl.page_kb, wl.blocks, wl.ram_mb, wl.steps,
+     wl.repeat, wl.dims, wl.clusters, wl.mesh_k, wl.atoms, wl.lattice,
+     wl.in_dim, wl.hidden, wl.out_dim, wl.batch, wl.lr, wl.no_dense,
+     wl.nvme_mb, wl.cache_mb, wl.cap, wl.slots]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/dist2_halfcache"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  pd.set_option('display.width', 240)
+  cols = [c for c in ['wl.workload', 'cache_setting', 'wl.blocks', 'nodes',
+                      'nodes_finished', 'completed', 'gates_pass', 'bench_ms',
+                      'ms_per_step', 'runtime', 'vram_peak_mb', 'faults',
+                      'evicts', 'puts', 'get_errors', 'put_errors']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+
+  # THE HANG GATE. A cell the 80 s cap killed is the whole point of this
+  # pipeline, so name it loudly rather than letting it sit as a blank row.
+  hung = df[df.get('completed', 0) != 1]
+  for _, r in hung.iterrows():
+      logger.warning('DID NOT COMPLETE (hung or over the 80 s cap): %s '
+                     '(runtime=%s, nodes_finished=%s)'
+                     % (r['wl.workload'], r.get('runtime'),
+                        r.get('nodes_finished')))
+
+  # THE PRESSURE WITNESS. Half-cache that reports zero faults is not a
+  # half-cache run -- the deck went resident and the cell proves nothing
+  # about the faulting path it was built to exercise.
+  if 'faults' in df.columns:
+      for _, r in df.iterrows():
+          f = r.get('faults')
+          if r.get('completed', 0) == 1 and (pd.isna(f) or float(f or 0) == 0):
+              logger.warning('NO FAULTS: %s completed without paging -- the '
+                             'cache is not actually half the data here'
+                             % r['wl.workload'])
+
+  if not len(hung):
+      logger.info('all %d workloads completed at 2 nodes with a half-size '
+                  'cache; none hung' % len(df))
+  else:
+      logger.warning('%d/%d workloads did not complete: %s'
+                     % (len(hung), len(df),
+                        ', '.join(sorted(set(hung['wl.workload'])))))

@@ -65,39 +65,30 @@ target_link_libraries(test_compressor_functional
   ${CMAKE_THREAD_LIBS_INIT}     # Threading support
 )
 
-# Register functional tests - use test names (simple_test.h filters by name)
-add_test(NAME compressor_compress_lz4
-    COMMAND test_compressor_functional "CompressTask - LZ4 Compression")
+# Stage the functional tests' compose config next to the binary.
+add_custom_command(TARGET test_compressor_functional POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_compressor_functional_config.yaml
+    ${CMAKE_BINARY_DIR}/bin/test_compressor_functional_config.yaml
+)
 
-add_test(NAME compressor_decompress_lz4
-    COMMAND test_compressor_functional "DecompressTask - LZ4 Decompression")
+# ONE entry running every case in order, in a single process.
+#
+# Two things forced this. simple_test.h filters by name, and six of the seven
+# filters here named tests that do not exist -- those entries ran nothing and
+# passed vacuously. And "Decompress and Retrieve" reads the blob that "Basic
+# Compress and Store" wrote, so splitting them across ctest entries puts them
+# in separate PROCESSES with separate runtimes and the blob is gone. Running
+# the binary unfiltered executes the cases in order against one runtime, which
+# is what they were written for.
+add_test(NAME compressor_functional
+    COMMAND test_compressor_functional
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-add_test(NAME compressor_roundtrip_integrity
-    COMMAND test_compressor_functional "Round-trip - Data Integrity")
-
-add_test(NAME compressor_compression_ratios
-    COMMAND test_compressor_functional "Compression Ratio - Data Patterns")
-
-add_test(NAME compressor_dynamic_schedule
-    COMMAND test_compressor_functional "DynamicSchedule - Compression Selection")
-
-add_test(NAME compressor_multiple_libraries
-    COMMAND test_compressor_functional "Multiple Libraries - Compression")
-
-add_test(NAME compressor_error_handling
-    COMMAND test_compressor_functional "Error Handling - Invalid Parameters")
-
-# Set test properties
 set_tests_properties(
-    compressor_compress_lz4
-    compressor_decompress_lz4
-    compressor_roundtrip_integrity
-    compressor_compression_ratios
-    compressor_dynamic_schedule
-    compressor_multiple_libraries
-    compressor_error_handling
+    compressor_functional
     PROPERTIES
-        TIMEOUT 300  # 5 minute timeout
+        TIMEOUT 300
         LABELS "compressor;functional;chimod"
 )
 
@@ -137,15 +128,19 @@ add_custom_command(TARGET test_transparent_compress POST_BUILD
     ${CMAKE_CURRENT_BINARY_DIR}/test_transparent_compress_config.yaml
 )
 
-add_test(NAME compressor_transparent_putblob
-    COMMAND test_transparent_compress "Transparent PutBlob")
-
-add_test(NAME compressor_transparent_getblob
-    COMMAND test_transparent_compress "Transparent GetBlob")
+# ONE test, running both cases in a single process.
+#
+# They were two ctest entries invoking this same binary with different name
+# filters, i.e. two separate PROCESSES. The GetBlob case reads the blob "we
+# created in the previous test", but that blob lives in the runtime the
+# PutBlob process started and took with it, so GetBlob could only ever fail
+# with a non-zero return code. Running the binary unfiltered executes both
+# cases in order against one runtime, which is what the test was written for.
+add_test(NAME compressor_transparent
+    COMMAND test_transparent_compress)
 
 set_tests_properties(
-    compressor_transparent_putblob
-    compressor_transparent_getblob
+    compressor_transparent
     PROPERTIES
         TIMEOUT 120
         LABELS "compressor;transparent;integration;msan_skip"

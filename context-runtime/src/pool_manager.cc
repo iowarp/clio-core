@@ -46,11 +46,17 @@
 #include "clio_runtime/viz/viz_server.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <shared_mutex>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 // Global pointer variable definition for Pool manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::PoolManager, g_pool_manager);
@@ -502,6 +508,11 @@ void PoolManager::PlugContainer(PoolId pool_id, ContainerId container_id) {
   }
 }
 
+bool PoolManager::WasDestroyed(PoolId pool_id) const {
+  std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
+  return destroyed_pools_.count(pool_id) != 0;
+}
+
 bool PoolManager::HasPool(PoolId pool_id) const {
   if (!is_initialized_) {
     return false;
@@ -695,6 +706,35 @@ void PoolManager::InitAddressMap(PoolId pool_id, u32 num_containers) {
   HLOG(kDebug, "=== Address Map Complete ===");
 }
 
+bool PoolManager::RegisterRemotePool(PoolId pool_id,
+                                     const std::string& pool_name,
+                                     const std::string& chimod_name,
+                                     const std::string& chimod_params,
+                                     u32 num_containers) {
+  if (!is_initialized_ || pool_id.IsNull()) {
+    return false;
+  }
+  {
+    // Insert-if-absent under the write lock: a pool this node created (or
+    // already learned) keeps its metadata and containers untouched.
+    // The address map is the same ContainerId == NodeId mapping that
+    // InitAddressMap builds for every pool (issue #856).
+    PoolMetaWriteLock lock(pool_metadata_mutex_);
+    if (pool_metadata_.find(pool_id) == pool_metadata_.end()) {
+      PoolInfo info(pool_id, pool_name, chimod_name, chimod_params,
+                    num_containers);
+      for (u32 c = 0; c < num_containers; ++c) {
+        info.address_map_[c] = c;
+      }
+      pool_metadata_[pool_id] = std::move(info);
+      HLOG(kDebug,
+           "PoolManager: registered remote pool '{}' {} ({}) for routing",
+           pool_name, pool_id, chimod_name);
+    }
+  }
+  return EnsureStaticContainer(pool_id).IsValid();
+}
+
 TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {
@@ -743,8 +783,16 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   // Make was_created a local variable
   bool was_created;
 
-  // Validate pool parameters
+  // Validate pool parameters.
+  //
+  // EVERY failure below must set a return code. Without one the task completes
+  // with 0, and 0 means success to the compose driver -- which then logs
+  // "Successfully created pool" for a pool that does not exist. A ChiMod whose
+  // .so fails to dlopen took exactly that path: the pool was silently absent,
+  // every blob bypassed the module, and the only symptom was a stored size of
+  // zero much later.
   if (!ValidatePoolParams(chimod_name, pool_name)) {
+    task->SetReturnCode(EINVAL);
     CLIO_CO_RETURN;
   }
 
@@ -769,6 +817,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
     HLOG(kError,
          "PoolManager: Cannot create pool with null PoolId. Users must provide "
          "explicit pool ID.");
+    task->SetReturnCode(EINVAL);
     CLIO_CO_RETURN;
   }
 
@@ -789,6 +838,11 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
 
   // Store pool metadata first so InitAddressMap can find it
   UpdatePoolMetadata(target_pool_id, pool_info);
+  {
+    // Re-created under a destroyed id: its periodic tasks are live again.
+    std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
+    destroyed_pools_.erase(target_pool_id);
+  }
 
   // Initialize address map for the pool (ContainerId -> NodeId)
   InitAddressMap(target_pool_id, num_containers);
@@ -806,6 +860,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   if (!module_manager) {
     HLOG(kError, "PoolManager: Module manager not available");
     ErasePoolMetadata(target_pool_id);
+    task->SetReturnCode(ENODEV);
     CLIO_CO_RETURN;
   }
 
@@ -820,6 +875,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
       HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
            chimod_name);
       ErasePoolMetadata(target_pool_id);
+      task->SetReturnCode(ENOENT);
       CLIO_CO_RETURN;
     }
 
@@ -837,6 +893,8 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
       pool_config =
           clio::run::Task::Deserialize<clio::run::PoolConfig>(create_task->chimod_params_);
       is_restart = pool_config.restart_;
+    } else if (replaying_pools_) {
+      is_restart = true;  // re-created from the pool log after a restart
     }
 
     // Initialize container with pool ID, name, and container ID
@@ -863,6 +921,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
       HLOG(kError, "PoolManager: Failed to register container");
       container.get().Destroy(chimod_name);
       ErasePoolMetadata(target_pool_id);
+      task->SetReturnCode(EIO);
       CLIO_CO_RETURN;
     }
 
@@ -895,6 +954,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
 
   } catch (const std::exception& e) {
     HLOG(kError, "PoolManager: Exception during pool creation: {}", e.what());
+    task->SetReturnCode(EIO);
     if (container) {
       // Unregister if it was registered before the exception
       UnregisterContainer(target_pool_id, node_id);
@@ -907,6 +967,24 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   // Set success results
   was_created = true;
   (void)was_created;  // Suppress unused variable warning
+  // Durable pools (compose `restart: true`, or an API create from a client
+  // with SetPersistent) go to this node's pool log -- the one restart
+  // registry. Re-creations from the log itself are already there.
+  if (!create_task->is_admin_ && !replaying_pools_) {
+    // From the params captured at entry: chimod_params_ is INOUT, and a
+    // module's Create may have rewritten it by now (reading it here as a
+    // PoolConfig overran it and threw bad_alloc mid-compose).
+    bool durable = create_task->persist_;
+    if (create_task->do_compose_) {
+      durable = clio::run::Task::Deserialize<clio::run::PoolConfig>(
+                    clio::run::priv::string(CLIO_PRIV_ALLOC, chimod_params))
+                    .restart_;
+    }
+    if (durable) {
+      LogPool(true, PoolLogEntry{target_pool_id, pool_name, chimod_name,
+                                 chimod_params, create_task->do_compose_});
+    }
+  }
   // Note: create_task->new_pool_id_ already contains target_pool_id
 
   HLOG(kInfo,
@@ -916,7 +994,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   CLIO_TASK_BODY_END
 }
 
-TaskResume PoolManager::DestroyPool(PoolId pool_id) {
+TaskResume PoolManager::DestroyPool(PoolId pool_id, bool keep_in_pool_log) {
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {
     HLOG(kError, "PoolManager: Not initialized for pool destruction");
@@ -939,6 +1017,13 @@ TaskResume PoolManager::DestroyPool(PoolId pool_id) {
 
   // Remove pool metadata
   ErasePoolMetadata(pool_id);
+  if (!keep_in_pool_log) {
+    LogPool(false, PoolLogEntry{pool_id, "", "", "", false});
+  }
+  {
+    std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
+    destroyed_pools_.insert(pool_id);
+  }
 
   HLOG(kInfo, "PoolManager: Destroyed complete pool {}", pool_id);
   CLIO_CO_RETURN;
@@ -1234,7 +1319,13 @@ void PoolManager::ReplayAddressTableWAL() {
 
   size_t entries_replayed = 0;
   for (const auto &dir_entry : fs::directory_iterator(wal_dir)) {
-    if (dir_entry.path().extension() != ".bin") continue;
+    // Only this WAL's own files: the directory also holds other logs (the
+    // pool log, pools.<node>.bin), whose records parsed as mappings here
+    // produced garbage pool ids -- and could remap a real pool's containers.
+    if (dir_entry.path().extension() != ".bin" ||
+        dir_entry.path().filename().string().rfind("domain_table.", 0) != 0) {
+      continue;
+    }
 
     std::ifstream ifs(dir_entry.path(), std::ios::binary);
     if (!ifs.is_open()) continue;
@@ -1258,6 +1349,160 @@ void PoolManager::ReplayAddressTableWAL() {
   }
 
   HLOG(kInfo, "ReplayAddressTableWAL: Replayed {} entries", entries_replayed);
+}
+
+// ===========================================================================
+// Pool log: the one restart registry for durable pools (compose and API)
+// ===========================================================================
+
+namespace {
+/** Append a length-prefixed string. */
+void PutStr(std::ofstream &o, const std::string &v) {
+  const u32 n = static_cast<u32>(v.size());
+  o.write(reinterpret_cast<const char *>(&n), sizeof(n));
+  o.write(v.data(), n);
+}
+/** Read a length-prefixed string; false at a torn tail. */
+bool GetStr(std::ifstream &i, std::string *v) {
+  u32 n = 0;
+  if (!i.read(reinterpret_cast<char *>(&n), sizeof(n))) return false;
+  if (n > (64u << 20)) return false;  // garbage length: torn record
+  v->resize(n);
+  return n == 0 || static_cast<bool>(i.read(&(*v)[0], n));
+}
+/**
+ * fsync a file and the directory holding it, so its contents and its name
+ * (a create or a rename onto it) survive power loss. Best effort: a failure
+ * is logged.
+ * @param path the file
+ */
+void SyncFileAndDir(const std::string &path) {
+#ifndef _WIN32
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    if (::fsync(fd) != 0) {
+      HLOG(kError, "PoolManager: fsync of {} failed: {}", path,
+           std::strerror(errno));
+    }
+    ::close(fd);
+  }
+  const std::string dir = std::filesystem::path(path).parent_path().string();
+  const int dfd = ::open(dir.empty() ? "." : dir.c_str(),
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dfd >= 0) {
+    (void)::fsync(dfd);
+    ::close(dfd);
+  }
+#else
+  (void)path;
+#endif
+}
+/** Write one record: [u8 op][u8 compose][PoolId][name][chimod][params]. */
+void PutRecord(std::ofstream &o, bool add, const PoolManager::PoolLogEntry &e) {
+  const uint8_t op = add ? 1 : 0;
+  const uint8_t compose = e.compose ? 1 : 0;
+  o.write(reinterpret_cast<const char *>(&op), sizeof(op));
+  o.write(reinterpret_cast<const char *>(&compose), sizeof(compose));
+  o.write(reinterpret_cast<const char *>(&e.pool_id), sizeof(e.pool_id));
+  PutStr(o, e.pool_name);
+  PutStr(o, e.chimod_name);
+  PutStr(o, e.chimod_params);
+}
+}  // namespace
+
+std::string PoolManager::PoolLogPath() const {
+  auto *config_manager = CLIO_CONFIG_MANAGER;
+  auto *ipc_manager = CLIO_IPC;
+  return config_manager->GetConfDir() + "/wal/pools." +
+         std::to_string(ipc_manager->GetNodeId()) + ".bin";
+}
+
+void PoolManager::LogPool(bool add, const PoolLogEntry &e) {
+  if (CLIO_CONFIG_MANAGER == nullptr) return;
+  const std::string path = PoolLogPath();
+  std::error_code ec;
+  std::filesystem::create_directories(
+      std::filesystem::path(path).parent_path(), ec);
+  std::ofstream ofs(path, std::ios::binary | std::ios::app);
+  if (!ofs.is_open()) {
+    HLOG(kError, "PoolManager: cannot open pool log {}; pool {} will not be "
+         "re-created after a restart", path, e.pool_id);
+    return;
+  }
+  PutRecord(ofs, add, e);
+  ofs.flush();
+  ofs.close();
+  // Pools change rarely; a pool created just before a power loss must not
+  // vanish with its data at the next start.
+  SyncFileAndDir(path);
+}
+
+std::vector<PoolManager::PoolLogEntry> PoolManager::ReadPoolLogFile(
+    const std::string &path) {
+  std::vector<PoolLogEntry> live;
+  std::ifstream ifs(path, std::ios::binary);
+  if (!ifs.is_open()) return live;
+  while (true) {
+    uint8_t op = 0, compose = 0;
+    PoolLogEntry e;
+    if (!ifs.read(reinterpret_cast<char *>(&op), sizeof(op))) break;
+    if (!ifs.read(reinterpret_cast<char *>(&compose), sizeof(compose)) ||
+        !ifs.read(reinterpret_cast<char *>(&e.pool_id), sizeof(e.pool_id)) ||
+        !GetStr(ifs, &e.pool_name) || !GetStr(ifs, &e.chimod_name) ||
+        !GetStr(ifs, &e.chimod_params)) {
+      break;  // torn tail from a crash mid-append
+    }
+    e.compose = compose != 0;
+    auto it = std::find_if(live.begin(), live.end(),
+                           [&](const PoolLogEntry &x) {
+                             return x.pool_id == e.pool_id;
+                           });
+    if (it != live.end()) live.erase(it);
+    if (op == 1) live.push_back(std::move(e));
+  }
+  return live;
+}
+
+std::vector<PoolManager::PoolLogEntry> PoolManager::LoadPoolLog() {
+  if (CLIO_CONFIG_MANAGER == nullptr) return {};
+  const std::string path = PoolLogPath();
+  std::vector<PoolLogEntry> live = ReadPoolLogFile(path);
+  if (!std::filesystem::exists(path)) return live;
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
+    for (const auto &e : live) PutRecord(ofs, true, e);
+  }
+  // The compacted copy must be on disk before it replaces the log: renamed
+  // over it unsynced, a power loss could leave an empty log (every pool
+  // forgotten).
+  SyncFileAndDir(tmp);
+  std::error_code ec;
+  std::filesystem::rename(tmp, path, ec);
+  if (!ec) SyncFileAndDir(path);
+  return live;
+}
+
+void PoolManager::ClearPoolLog() {
+  auto *config_manager = CLIO_CONFIG_MANAGER;
+  if (config_manager == nullptr) return;
+  std::error_code ec;
+  std::filesystem::remove(PoolLogPath(), ec);
+  // This node's address-table WAL too (domain_table.<pool>.<node>.bin): a
+  // fresh start begins a new cluster lifetime, and a later recovering start
+  // must not remap containers from the previous one.
+  auto *ipc_manager = CLIO_IPC;
+  if (ipc_manager == nullptr) return;
+  const std::string suffix =
+      "." + std::to_string(ipc_manager->GetNodeId()) + ".bin";
+  const std::filesystem::path wal_dir = config_manager->GetConfDir() + "/wal";
+  for (const auto &ent : std::filesystem::directory_iterator(wal_dir, ec)) {
+    const std::string name = ent.path().filename().string();
+    if (name.rfind("domain_table.", 0) == 0 && name.size() > suffix.size() &&
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      std::filesystem::remove(ent.path(), ec);
+    }
+  }
 }
 
 }  // namespace clio::run

@@ -65,6 +65,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -87,10 +88,49 @@ int FromEnv(const char *name, int dflt) {
   return dflt;
 }
 
+/**
+ * SAME_BLOB_FLUSH=1: run against a self-contained two-tier config (RAM +
+ * temporary file tier) with the periodic FlushData every 500 ms, so the
+ * flush's move-to-persistent-tier races the writers. This is the
+ * configuration under which the blob lost 0.4-240 MB before FlushData held
+ * the write token across its place-and-swap and sized the move under it
+ * (RELIABILITY.md defect 14). Written before CLIO_INIT so the runtime
+ * composes from it instead of whatever ~/.clio/clio.yaml holds.
+ */
+static void MaybeWriteFlushConfig() {
+  const char *on = std::getenv("SAME_BLOB_FLUSH");
+  if (on == nullptr || *on == '\0' || *on == '0') return;
+  const char *d = clio::run::env::GetCompat("TEST_DATA_DIR");
+  std::string dir = (d && *d) ? d : ".";
+  std::string path = dir + "/same_blob_flush.yaml";
+  std::string tier = dir + "/same_blob_flush_tier.dat";
+  std::remove(tier.c_str());
+  std::string yaml =
+      "runtime:\n  num_threads: 4\n  queue_depth: 1024\ncompose:\n"
+      "  - mod_name: clio_cte_core\n    pool_name: clio_cte\n"
+      "    pool_query: local\n    pool_id: 512.0\n"
+      "    targets:\n      neighborhood: 1\n"
+      "    storage:\n"
+      "      - path: \"ram::same_blob_flush_dram\"\n        bdev_type: \"ram\"\n"
+      "        capacity_limit: \"4GB\"\n        score: 1.0\n"
+      "      - path: \"" + tier + "\"\n        bdev_type: \"file\"\n"
+      "        capacity_limit: \"4GB\"\n        score: 0.2\n"
+      "        persistence_level: \"temporary\"\n"
+      "    performance:\n      flush_data_period_ms: 500\n"
+      "      flush_data_min_persistence: 1\n"
+      "    dpe:\n      dpe_type: \"max_bw\"\n";
+  FILE *f = std::fopen(path.c_str(), "w");
+  REQUIRE(f != nullptr);
+  std::fputs(yaml.c_str(), f);
+  std::fclose(f);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", path.c_str(), 1);
+}
+
 class Fixture {
  public:
   bool initialized_ = false;
   Fixture() {
+    MaybeWriteFlushConfig();
     bool ok = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
     REQUIRE(ok);
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -197,6 +237,47 @@ TEST_CASE("ConcurrentSameBlob - many threads write disjoint regions of ONE "
                "[same_blob] FIRST mismatch at pos={} expected=0x{:02x} "
                "got=0x{:02x} (total_bytes={})",
                base + b, static_cast<int>(expect), static_cast<int>(v), total);
+          // DIAGNOSIS: is the runtime's copy intact (RPC re-read; a non-zero
+          // flag word disables the client's shared-memory fast path and the
+          // runtime ignores it), and what did the shm record say?
+          {
+            ctp::ipc::FullPtr<char> rb2 = ipc->AllocateBuffer(win);
+            std::memset(rb2.ptr_, 0xAA, win);
+            auto again = CLIO_CTE_CLIENT->AsyncGetBlob(
+                tag_id, blob, base, win, 1u, rb2.shm_.template Cast<void>(),
+                clio::run::PoolQuery::Local());
+            again.Wait();
+            clio::run::u64 rpc_bad = 0, both_bad = 0;
+            for (clio::run::u64 k = 0; k < win; ++k) {
+              const unsigned char e2 = static_cast<unsigned char>((base + k) & 0xff);
+              if (static_cast<unsigned char>(rb2.ptr_[k]) != e2) ++rpc_bad;
+              if (static_cast<unsigned char>(rb2.ptr_[k]) != e2 &&
+                  static_cast<unsigned char>(rb.ptr_[k]) != e2) ++both_bad;
+            }
+            HLOG(kError,
+                 "[same_blob] DIAG window [{}, +{}): RPC re-read rc={} bad={} "
+                 "(bad in both={}); fast-path bytes at first mismatch: {:02x} {:02x} {:02x} {:02x}",
+                 base, win, again->GetReturnCode(), rpc_bad, both_bad,
+                 (unsigned)(unsigned char)rb.ptr_[b], (unsigned)(unsigned char)rb.ptr_[std::min(b + 1, win - 1)],
+                 (unsigned)(unsigned char)rb.ptr_[std::min(b + 2, win - 1)], (unsigned)(unsigned char)rb.ptr_[std::min(b + 3, win - 1)]);
+            clio::cte::core::ShmBlobRecord rec;
+            if (CLIO_CTE_CLIENT->TryGetBlobRecordShm(tag_id, blob, &rec)) {
+              HLOG(kError,
+                   "[same_blob] DIAG shm record: total_size={} num_blocks={} flags={:#x} "
+                   "direct={} covered={} placement_gen={} content_seq={} rep_direct={} rep_blocks={}",
+                   rec.total_size_, rec.num_blocks_, rec.flags_, rec.IsDirectReadable(),
+                   rec.CoveredBytes(), rec.placement_gen_, rec.content_seq_, rec.rep_direct_,
+                   rec.rep_num_blocks_);
+              for (clio::run::u32 i = 0; i < rec.num_blocks_ && i < 16; ++i) {
+                HLOG(kError, "[same_blob]   block {}: pool={} target_off={} size={} bdev_type={} node={}",
+                     i, rec.blocks_[i].target_pool_, rec.blocks_[i].target_offset_,
+                     rec.blocks_[i].size_, rec.blocks_[i].bdev_type_, rec.blocks_[i].node_id_);
+              }
+            } else {
+              HLOG(kError, "[same_blob] DIAG: no shm record for the blob");
+            }
+            ipc->FreeBuffer(rb2);
+          }
         }
         ++total_mismatches;
       }

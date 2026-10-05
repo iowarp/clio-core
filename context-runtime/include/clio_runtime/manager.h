@@ -37,7 +37,10 @@
 #include "clio_runtime/api.h"
 #include "clio_runtime/types.h"
 #include <atomic>
+#include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace clio::run {
@@ -152,13 +155,52 @@ class RuntimeManager {
 
   /**
    * Check whether a graceful stop has been requested via RequestStop.
-   * Polled by the runtime main loop (clio_run start/restart).
+   * Polled by the runtime main loop (clio_run start).
    * @return true if a stop was requested
    */
   bool IsStopRequested() const;
 
+  /**
+   * Register a function to run at the start of a graceful teardown
+   * (ServerFinalize), while the workers still run: a module flushes volatile
+   * state to durable storage there, as unmount does. The hook runs on the
+   * finalizing thread, may submit tasks and wait on them, and must bound its
+   * own waits.
+   * @param hook function to run once at teardown
+   * @return id for RemoveStopHook
+   */
+  u64 AddStopHook(std::function<void()> hook);
+
+  /**
+   * Unregister a stop hook (a container being destroyed before teardown).
+   * @param id value AddStopHook returned; unknown ids are ignored
+   */
+  void RemoveStopHook(u64 id);
+
+  /**
+   * Budget of the current graceful stop (clio_run stop --grace-period); a
+   * stop hook bounds its waits by it.
+   * @return grace period in milliseconds
+   */
+  u32 GetStopGracePeriodMs() const { return stop_grace_period_ms_.load(); }
+
+ private:
+  /** Run (and clear) every registered stop hook. */
+  void RunStopHooks();
+
+  std::mutex stop_hooks_mu_;
+  std::map<u64, std::function<void()>> stop_hooks_;
+  u64 next_stop_hook_ = 1;
+
  public:
   bool is_restart_ = false;  /**< If true, force restart on compose pools and replay WAL */
+  /**
+   * Set once ServerInit has finished composing the server config's pools
+   * (and replaying the restart log), successfully or not. The port accepts
+   * clients before that, so a client's create-or-bind of a configured pool
+   * waits on this instead of creating it with its own default parameters.
+   */
+  std::atomic<bool> compose_done_{false};
 
  private:
   bool is_initialized_ = false;

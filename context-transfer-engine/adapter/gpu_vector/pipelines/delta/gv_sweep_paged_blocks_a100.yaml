@@ -1,0 +1,253 @@
+# BLOCKS ONLY, PAGED, ALL SIX WORKLOADS, 2 nodes, CACHE FIXED IN THE
+# FAULTING REGIME.
+#
+# The reduced form of gv_sweep_paged_a100.yaml: that file crosses cache x
+# blocks for 96 cells, this one pins cache and sweeps blocks alone.
+#
+#   6 workloads x 4 block rungs = 24 cells
+#
+# WHY PIN CACHE RATHER THAN SWEEP IT. The question is what block count does
+# when the vector is actually paging. A cache rung large enough to hold the
+# per-block working set takes storage out of the loop entirely and the block
+# curve then measures launch geometry -- kmeans at 32 GB/node with cache =
+# the whole deck ran ZERO faults at 32 and 64 blocks, and its numbers there
+# say nothing about paging. Pinning cache in the faulting regime makes every
+# cell a storage-bound cell, which is the regime the answer lives in.
+#
+# CACHE RUNG 2, NOT RUNG 1. Rung 2 is 8192 MB against a 32000 MB per-node
+# deck -- roughly 4x oversubscribed, so every block count faults, guaranteed.
+# Rung 1 (~1/8 of the deck) faults harder but the parent file records that
+# its cells were still running when a 600 s cap killed them; at 900 s many
+# would still cap and a capped cell collects NOTHING. A rung that guarantees
+# faults and finishes beats a rung that guarantees faults and times out.
+# Change wl.cache_level to [1] for the deeper-thrash version.
+#
+# THE BLOCK LADDER IS UNCHANGED from both sweep files, so this CSV still
+# joins gv_sweep_substrates_a100.yaml on (workload, blocks).
+#
+# TWO OPPOSING EFFECTS ARE EXPECTED HERE, and separating them is the point.
+# More blocks means more concurrent page faults in flight, which is what
+# saturates the link -- gmx at a fixed 6144 MB cache went 3698 -> 1754 ->
+# 1122 -> 616 ms across 1/16/32/67 blocks, monotone. But more blocks also
+# means less ABSOLUTE page slack per block, and kmeans at 32 GB/node fell
+# off a cliff between 12 spare pages (0 faults) and 6 (4439 faults). Whether
+# a workload is on the saturating limb or past the cliff is what these 24
+# cells report.
+#
+# EVERY WORKLOAD MUST COLLECT, and one of them nearly did not. lbann's paged
+# bench fills ms_per_step and leaves bench_ms EMPTY, so a post block that
+# pivots on bench_ms alone renders lbann's whole row blank and reports it as
+# a successful sweep. The post block below coalesces a metric per workload
+# and names any workload that collected nothing rather than quietly omitting
+# it.
+#
+# TEN MINUTE JOBS, CHAINED. The wall is 00:10:00 on purpose. gpuA100x4 runs
+# ~1900 jobs deep, where a 6 h request sat at "start in two days" and a
+# 10 min request backfills into gaps almost immediately -- so the sweep is
+# ground out by a CHAIN of short jobs rather than one long one. jarvis
+# resumes a pipeline test by ROW COUNT, so every job in the chain picks up
+# at the first cell the previous one did not finish. Submit the chain with
+# sbatch --dependency=afterany:<prev> on the generated submit.slurm.
+#
+# timeout_sec is 300, not 900: a per-cell cap longer than the wall is
+# incoherent -- the wall would kill a running cell and that cell's slot is
+# lost work rather than a recorded cap. At 300 s a cell either lands or is
+# recorded as capped (completed=0), which the post block names.
+#
+# RESUME. jarvis resumes a pipeline test by ROW COUNT, so resubmitting this
+# file continues an interrupted run. For a FRESH sweep,
+# `rm -rf $HOME/gv_pipeline_results/sweep_paged_blocks` first -- otherwise a
+# stale results.csv silently eats the first N cells and still reports
+# success.
+#
+# Submit:  jarvis ppl submit gv_sweep_paged_blocks_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 80g
+  gpus_per_node: 1
+  time: "00:10:00"
+  job_name: gv_sweep_pgblk
+  output: /u/llogan/gv_job_logs/gv_sweep_pgblk-%j.out
+  error: /u/llogan/gv_job_logs/gv_sweep_pgblk-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "scontrol show hostnames \"$SLURM_JOB_NODELIST\""
+    - "srun -N 2 --ntasks-per-node=1 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+config:
+  name: gv_sweep_paged_blocks_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: paged
+      nodes: 2
+      node_launcher: "srun -N {n} --ntasks-per-node=1 --gpus-per-node=1"
+      # A pipeline TEST builds a fresh pipeline per cell and the `scheduler:`
+      # block binds self.hostfile only on the one it loaded, so the per-cell
+      # pipelines see None. Name the scheduler's own file.
+      hostfile: /u/llogan/.ppi-jarvis/shared/gv_sweep_paged_blocks_a100/hostfile.txt
+      cluster_port: 9429
+      # Threads pinned on every cell. Left unset each binary uses its own
+      # default (the paged benches disagree: kmeans 256, weights 32), and a
+      # comparison across cells then measures launch geometry instead of
+      # the axis under test. The substrates file pins the SAME 256.
+      threads: 256
+      prefault: "0"
+      timeout_sec: 300
+      barrier_sec: 300
+      output_dir: /tmp/clio_gv/sweep_pgblk
+
+vars:
+  # ---- zipped per workload -------------------------------------------
+  wl.workload: [kmeans, weights, grayscott, gmx,    lbann,  lammps_md]
+  wl.data_mb:  [64000,  32000,   64000,     0,      0,      0]
+  wl.page_kb:  [1024,   1024,    1024,      32768,  672,    256]
+  # Host RAM tier. 0 derives it from data_mb (per-node share + slack),
+  # which is right for the three that declare one; the other three declare
+  # it because they do not use --data-mb at all.
+  wl.ram_mb:   [33280,  33280,   33280,     35840,  20480,  16384]
+  # ITERATIONS CUT ~5x, DECK LEFT AT 32 GB/node. The first run of this
+  # sweep used the gv_anchor32_* step counts, but those were calibrated for
+  # FULL-CACHE runs (~125-250 s). A cache sweep exists to run at an EIGHTH
+  # of the deck, which is several times more work per step, so at 20 steps
+  # only cache_level 4 -- the rung that defeats the purpose -- ever
+  # finished: 14 of 16 kmeans cells hit the cap, at 600 s and again at
+  # 900 s. Cutting steps rather than the deck keeps the 32 GB memory
+  # pressure, which is the thing a cache sweep is actually measuring.
+  # Measured anchor to size against: kmeans cache_level 4 ran 224 s at 20
+  # iters, so 4 iters lands near 45 s of compute plus the one-shot ~40 s
+  # 32 GB ingest, leaving real headroom under the 900 s cap for the tight
+  # rungs.
+  wl.steps:    [4,      0,       4,         0,      2,      4]
+  wl.repeat:   [1,      4,       1,         1,      0,      0]
+  wl.dims:     [32,     0,       0,         0,      0,      0]
+  wl.clusters: [16,     0,       0,         0,      0,      0]
+  wl.mesh_k:   [0,      0,       0,         2048,   0,      0]
+  wl.atoms:    [0,      0,       0,         200000, 0,      0]
+  wl.lattice:  [0,      0,       0,         0,      0,      126]
+  wl.ckpt:     [0,      0,       0,         0,      0,      5]
+  wl.in_dim:   [0,      0,       0,         0,      4096,   0]
+  wl.hidden:   [0,      0,       0,         0,      921600, 0]
+  wl.out_dim:  [0,      0,       0,         0,      64,     0]
+  wl.batch:    [0,      0,       0,         0,      256,    0]
+  wl.lr:       [0,      0,       0,         0,      0.0001, 0]
+  # gmx: skip the dense in-VRAM reference. There is no room for a second
+  # 34 GB copy; the conservation gate still runs.
+  wl.no_dense: [false,  false,   false,     true,   false,  false]
+  # File tier. It is the ONLY non-volatile tier in this stack, so the
+  # end-of-run flush pushes this node's whole share into it -- undersized,
+  # the flush fills it and then fails per blob with rc 12 AFTER freeing
+  # each blob's volatile blocks. -1 sizes it from the per-node deck; 0 is
+  # a RAM-only stack where the flush is a clean no-op. See _nvme_tier_mb.
+  wl.nvme_mb:  [-1,     -1,      -1,        0,      0,      0]
+  # ---- the two swept axes, per-workload rungs ------------------------
+  # Each ladder spans ~1/8 of that workload's per-node deck up to roughly
+  # all of it, so cache_level means the same FRACTION everywhere.
+  wl.cache_ladder:
+    - "4096,8192,16384,32768"     # kmeans     32 GB/node
+    - "4096,8192,16384,32768"     # weights    32 GB/node
+    - "4096,8192,16384,32768"     # grayscott  32 GB/node
+    - "4096,8192,16384,32768"     # gmx        34 GB/node
+    - "1024,2048,4096,8192"       # lbann      ~8.9 GB/node (H=921600 -> 17763 MB global)
+    - "s128,s256,s512,s896"       # lammps_md  slots, not MB
+  wl.blocks_ladder:
+    - "32,64,128,256"
+    - "32,64,128,256"
+    - "32,64,128,256"
+    - "32,64,128,256"
+    - "16,32,64,128"              # lbann capped lower; 256 blew its cap before
+    - "32,64,128,256"
+  # PINNED. Rung 2 = 8192 MB vs a 32000 MB deck: every block count faults.
+  wl.cache_level:  [2]
+  wl.blocks_level: [1, 2, 3, 4]
+
+loop:
+  - [wl.workload, wl.data_mb, wl.page_kb, wl.ram_mb, wl.steps, wl.repeat,
+     wl.dims, wl.clusters, wl.mesh_k, wl.atoms, wl.lattice, wl.ckpt,
+     wl.in_dim, wl.hidden, wl.out_dim, wl.batch, wl.lr, wl.no_dense,
+     wl.nvme_mb, wl.cache_ladder, wl.blocks_ladder]
+  - [wl.blocks_level]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/sweep_paged_blocks"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  pd.set_option('display.width', 240)
+
+  # ONE METRIC COLUMN, COALESCED. The six paged benches do not agree on
+  # which timing they print: kmeans/weights/grayscott/gmx/lammps_md fill
+  # bench_ms, lbann fills ONLY ms_per_step. Pivoting on bench_ms alone
+  # renders lbann's entire block sweep blank and calls the run a success,
+  # which is how a workload goes missing without anything saying so.
+  df['metric_ms'] = pd.NA
+  df['metric_src'] = ''
+  for col in ('bench_ms', 'ms_per_step', 'gather_ms'):
+      if col in df.columns:
+          take = df['metric_ms'].isna() & df[col].notna()
+          df.loc[take, 'metric_ms'] = df.loc[take, col]
+          df.loc[take, 'metric_src'] = col
+
+  cols = [c for c in ['wl.workload', 'wl.blocks_level', 'blocks_resolved',
+                      'cache_setting', 'nodes', 'nodes_finished', 'completed',
+                      'gates_pass', 'metric_ms', 'metric_src', 'runtime',
+                      'vram_peak_mb', 'faults', 'evicts', 'get_errors',
+                      'put_errors']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+
+  # The block curve, one row per workload.
+  piv = df.pivot_table(index='wl.workload', columns='blocks_resolved',
+                       values='metric_ms', aggfunc='min')
+  logger.info('\nmetric_ms by (workload x blocks), cache pinned at rung 2:\n'
+              + piv.to_string())
+
+  if 'faults' in df.columns:
+      fp = df.pivot_table(index='wl.workload', columns='blocks_resolved',
+                          values='faults', aggfunc='min')
+      logger.info('\nfaults by (workload x blocks) -- a ZERO here means the '
+                  'cell was NOT storage-bound and its timing does not answer '
+                  'the question:\n' + fp.to_string())
+
+  # COLLECTION AUDIT. Every workload must produce a number at every block
+  # rung; anything short of that is reported as a gap, not omitted.
+  WL = ['kmeans', 'weights', 'grayscott', 'gmx', 'lbann', 'lammps_md']
+  expected = 4
+  gaps = []
+  for wl in WL:
+      g = df[df['wl.workload'] == wl]
+      got = int(g['metric_ms'].notna().sum())
+      if len(g) == 0:
+          gaps.append('%s: NO ROWS AT ALL' % wl)
+      elif got < expected:
+          gaps.append('%s: %d/%d block rungs collected a metric (%d rows ran)'
+                      % (wl, got, expected, len(g)))
+      resident = g[g.get('faults', pd.Series(dtype=float)).fillna(-1) == 0]
+      if len(resident):
+          logger.warning('%s: %d cell(s) reported ZERO faults -- cache rung 2 '
+                         'did not oversubscribe this workload, so its block '
+                         'curve is not storage-bound. Drop it to rung 1.'
+                         % (wl, len(resident)))
+  if gaps:
+      logger.warning('COLLECTION GAPS -- these are not results:\n  '
+                     + '\n  '.join(gaps))
+  else:
+      logger.info('collection complete: all %d workloads x %d block rungs '
+                  'produced a metric' % (len(WL), expected))
+
+  bad = df[df.get('completed', 0) != 1]
+  for _, r in bad.iterrows():
+      logger.warning('OVER THE 15 MIN CAP or FAILED: %s blocks=%s '
+                     '(runtime=%s, nodes_finished=%s)'
+                     % (r['wl.workload'], r.get('blocks_resolved'),
+                        r.get('runtime'), r.get('nodes_finished')))
+  if not len(bad):
+      logger.info('all %d cells completed inside the 15 min cap' % len(df))

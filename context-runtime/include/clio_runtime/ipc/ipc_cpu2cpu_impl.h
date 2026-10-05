@@ -216,13 +216,23 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     } while (start.GetUsecFromStart(spin_now) < spin_us);
   }
 
+  double next_report_us = 60e6;  // [HANGWATCH-CLIENT], #1147
   while (!task_ptr->IsComplete()) {
     em->Wait(100);
-    if (max_sec > 0) {
+    {
       ctp::Timepoint now;
       now.Now();
-      if (start.GetUsecFromStart(now) >= static_cast<double>(max_sec) * 1e6) {
+      const double waited_us = start.GetUsecFromStart(now);
+      if (max_sec > 0 && waited_us >= static_cast<double>(max_sec) * 1e6) {
         return false;
+      }
+      if (waited_us >= next_report_us) {
+        // A response this late is lost, not slow: name the task so the
+        // runtimes' logs and tables can be searched for it.
+        HLOG(kError, "[HANGWATCH-CLIENT] waited {} ms for task {} (pool {}, "
+             "method {}) over SHM", waited_us / 1000.0, task_ptr->task_id_,
+             task_ptr->pool_id_, task_ptr->method_);
+        next_report_us *= 2;
       }
     }
     // Server-death escape (issue #851): unlike the ZMQ twin of this loop, the

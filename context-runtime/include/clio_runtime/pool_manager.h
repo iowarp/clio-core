@@ -35,6 +35,7 @@
 #define CLIO_RUNTIME_INCLUDE_MANAGERS_POOL_MANAGER_H_
 
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -228,6 +229,15 @@ class PoolManager {
   bool HasPool(PoolId pool_id) const;
 
   /**
+   * Whether this node destroyed `pool_id` and has not re-created it since.
+   * Routing retires a periodic task of such a pool instead of retrying it
+   * forever.
+   * @param pool_id Pool identifier
+   * @return true if the pool was destroyed here and not re-created
+   */
+  bool WasDestroyed(PoolId pool_id) const;
+
+  /**
    * Check if a specific container exists on this node for a given pool
    * @param pool_id Pool identifier
    * @param container_id Container identifier
@@ -286,6 +296,33 @@ class PoolManager {
   void InitAddressMap(PoolId pool_id, u32 num_containers);
 
   /**
+   * Make a pool that lives on OTHER nodes routable from this one, without
+   * creating a container here.
+   *
+   * A pool composed on a single node (e.g. a per-node bdev created with
+   * PoolQuery::Physical) has metadata only on that node. Any other node that
+   * submits a task to it needs the pool's static container (to serialize the
+   * task) and its address map (to resolve DirectHash/Physical routing); without
+   * them SendIn drops the task and its waiter hangs. This installs exactly
+   * those two things: metadata, a ContainerId == NodeId address map, and the
+   * static container. No module Create runs and no task executes here.
+   *
+   * Does nothing if this node already knows the pool (a real local pool is
+   * never overwritten).
+   *
+   * @param pool_id Pool identifier of the remote pool
+   * @param pool_name Pool name (as created on the owning node)
+   * @param chimod_name ChiMod library name the pool was created with
+   * @param chimod_params Serialized ChiMod create parameters
+   * @param num_containers Number of containers in the pool's address map
+   * @return true if the pool is routable from this node afterwards
+   */
+  bool RegisterRemotePool(PoolId pool_id, const std::string& pool_name,
+                          const std::string& chimod_name,
+                          const std::string& chimod_params,
+                          u32 num_containers);
+
+  /**
    * Create or get a complete pool with get-or-create semantics
    * Extracts all parameters from the task (chimod_name, pool_name, chimod_params)
    * This is a coroutine that can co_await nested Create methods
@@ -299,9 +336,11 @@ class PoolManager {
    * Destroy a complete pool including metadata and local containers
    * This is a coroutine for consistency with CreatePool
    * @param pool_id Pool identifier
+   * @param keep_in_pool_log true to leave the pool's pool-log entry, so the
+   *        next start re-creates it (`compose stop`)
    * @return TaskResume coroutine handle
    */
-  TaskResume DestroyPool(PoolId pool_id);
+  TaskResume DestroyPool(PoolId pool_id, bool keep_in_pool_log = false);
 
   /**
    * Destroy a local pool and its containers on this node (simple version)
@@ -363,7 +402,53 @@ class PoolManager {
    */
   void ReplayAddressTableWAL();
 
+  /** One durable pool as this node's pool log keeps it: what re-creating
+   *  its container here after a restart takes. */
+  struct PoolLogEntry {
+    PoolId pool_id;
+    std::string pool_name;
+    std::string chimod_name;
+    /** Compose: the serialized PoolConfig. API: the ChiMod's serialized
+     *  CreateParams. */
+    std::string chimod_params;
+    bool compose = false;
+  };
+
+  /**
+   * Record (add) or forget (!add) a durable pool in this node's pool log,
+   * <conf_dir>/wal/pools.<node>.bin -- the ONE restart registry for every
+   * pool, however it was created: compose pools with `restart: true` and
+   * API pools created by a client with SetPersistent(true).
+   * @param add true on create, false on destroy
+   * @param e the pool
+   */
+  void LogPool(bool add, const PoolLogEntry &e);
+
+  /**
+   * The live entries of this node's pool log, in creation order (a pool may
+   * need one created before it, e.g. an array's member disks), compacting
+   * the log to that set.
+   * @return live entries
+   */
+  std::vector<PoolLogEntry> LoadPoolLog();
+
+  /** Read the live entries of a pool log file without compacting it.
+   *  @param path the log file  @return live entries */
+  static std::vector<PoolLogEntry> ReadPoolLogFile(const std::string &path);
+
+  /** Forget every durable pool of this node and its address-table WAL: a
+   *  fresh (`start --fresh`) start begins a new cluster lifetime. */
+  void ClearPoolLog();
+
+  /** @return path of this node's pool log. */
+  std::string PoolLogPath() const;
+
+  /** While true, pools being created are re-creations from the pool log:
+   *  their containers take the Restart() path and are not logged again. */
+  void SetReplayingPools(bool v) { replaying_pools_ = v; }
+
  private:
+  bool replaying_pools_ = false;
   /**
    * Internal: Get a DynamicContainer by PoolId and ContainerId (no fallback to
    * local container; no plug check)
@@ -431,6 +516,9 @@ class PoolManager {
   // always scoped to a single map operation so the lock is never held across
   // CreatePool's co_await.
   mutable std::shared_mutex pool_metadata_mutex_;
+  /** Pools destroyed on this node and not re-created (see WasDestroyed). */
+  std::unordered_set<PoolId> destroyed_pools_;
+  mutable std::mutex destroyed_pools_mu_;
 
   // Pool ID counter for generating unique IDs (used as minor number)
   std::atomic<u32> next_pool_minor_{5}; // Start at 5 for safety, 1 reserved for admin

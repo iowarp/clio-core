@@ -58,7 +58,7 @@ echo ""
 echo "=== Phase 1: Start runtime and store blobs ==="
 
 export CLIO_SERVER_CONF="$COMPOSE_CONFIG"
-$BIN_DIR/clio_run runtime start &
+$BIN_DIR/clio_run runtime start --fresh &
 RUNTIME_PID=$!
 sleep 3
 

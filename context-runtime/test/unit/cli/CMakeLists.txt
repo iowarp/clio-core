@@ -277,6 +277,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
     target_link_libraries(clio_run_cfs_test
       clio_cte_filesystem_client
+      clio_cte_stream_client
       clio_cte_core_client
       clio_admin_client
       clio_run_cxx

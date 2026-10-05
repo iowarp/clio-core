@@ -51,7 +51,6 @@ enum class RoutingMode {
   Broadcast,      /**< Broadcast to all containers */
   Physical,       /**< Route to specific physical node by ID */
   Dynamic,        /**< Dynamic routing with cache optimization (routes to Monitor) */
-  ToLocalCpu,     /**< GPU → CPU direction (the only GPU-related mode) */
   Null,           /**< Do nothing */
   ManyToOne,      /**< Batch+aggregate matching tasks at the neighborhood leader */
   AllToOne        /**< Like ManyToOne, but the aggregate runs only once tasks
@@ -156,8 +155,22 @@ class PoolQuery {
    * Routes to Monitor with kGlobalSchedule for automatic cache checking
    * @param net_timeout Per-task network timeout in seconds (-1 = default)
    * @return PoolQuery configured for dynamic routing with cache optimization
+   *
+   * DEVICE-CALLABLE, and it has to be: a GPU kernel submitting a task picks
+   * its own routing, and the mode it used to pick (ToLocalCpu) is gone. The
+   * body sets plain fields, so there was never anything host-specific in it.
    */
-  static PoolQuery Dynamic(float net_timeout = -1);
+  static CTP_CROSS_FUN PoolQuery Dynamic(float net_timeout = -1) {
+    PoolQuery query;
+    query.routing_mode_ = RoutingMode::Dynamic;
+    query.hash_value_ = 0;
+    query.container_id_ = 0;
+    query.range_offset_ = 0;
+    query.range_count_ = 0;
+    query.node_id_ = 0;
+    query.net_timeout_ = net_timeout;
+    return query;
+  }
 
   /**
    * Create a many-to-one collective routing pool query.
@@ -199,17 +212,6 @@ class PoolQuery {
    * @return PoolQuery configured for all-to-one barrier aggregation
    */
   static PoolQuery AllToOne(u32 container_hash, u64 batch_key = 0);
-
-  /**
-   * Create a pool query for GPU → CPU direction
-   * @return PoolQuery configured for routing from GPU back to CPU
-   */
-  static CTP_CROSS_FUN PoolQuery ToLocalCpu(u32 parallelism = 32) {
-    PoolQuery query;
-    query.routing_mode_ = RoutingMode::ToLocalCpu;
-    query.parallelism_ = parallelism;
-    return query;
-  }
 
   /**
    * Create a null pool query (do nothing)
@@ -334,14 +336,6 @@ class PoolQuery {
    */
   CTP_CROSS_FUN bool IsDynamicMode() const {
     return routing_mode_ == RoutingMode::Dynamic;
-  }
-
-  /**
-   * Check if pool query is in ToLocalCpu routing mode
-   * @return true if routing mode is ToLocalCpu
-   */
-  CTP_CROSS_FUN bool IsToLocalCpuMode() const {
-    return routing_mode_ == RoutingMode::ToLocalCpu;
   }
 
   /**

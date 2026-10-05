@@ -74,6 +74,29 @@ class Client : public clio::cte::core::Client {
   }
 
   /**
+   * Point this client at a compressor pool.
+   *
+   * MUST be overridden here. The inherited cte::core::Client::Init sets only
+   * the CORE client's pool and leaves compressor_pool_id_ null, so a client
+   * built as `Client c; c.Init(pool);` silently addressed every Compress /
+   * Decompress / DynamicSchedule task to PoolId(0,0). Routing then failed
+   * ("no pool queries resolved") and the task never completed, so callers
+   * hung in Wait() rather than getting an error.
+   */
+  void Init(const clio::run::PoolId &compressor_pool_id) {
+    compressor_pool_id_ = compressor_pool_id;
+    clio::cte::core::Client::Init(compressor_pool_id);
+  }
+
+  /** Two-pool form: this client's tasks go to the compressor pool, while the
+   *  inherited core client talks to `core_pool_id`. */
+  void Init(const clio::run::PoolId &compressor_pool_id,
+            const clio::run::PoolId &core_pool_id) {
+    compressor_pool_id_ = compressor_pool_id;
+    clio::cte::core::Client::Init(core_pool_id);
+  }
+
+  /**
    * Create the compressor container.
    */
   clio::run::Future<CreateTask> AsyncCreateCompressor(

@@ -337,7 +337,7 @@ class ConfigManager : public ctp::BaseConfig {
    * each interval. This is the anti-hang mechanism that works even when a
    * task's ttl is infinite. 0 disables the periodic check.
    * Overridable via env CLIO_TASK_PROGRESS_INTERVAL_MS.
-   * @return Interval in ms (default: 0 = disabled)
+   * @return Interval in ms (default: 5000)
    */
   u32 GetTaskProgressIntervalMs() const { return task_progress_interval_ms_; }
 
@@ -563,13 +563,28 @@ class ConfigManager : public ctp::BaseConfig {
   u32 gpu_queue_depth_ = 16;                 // Default: 16 tasks per queue
 
   // SWIM membership-detection configuration.
-  // Defaults match the prior hard-coded constants in admin_runtime.cc so
-  // existing deployments behave identically when these fields are absent
-  // from the YAML.
-  bool swim_enabled_ = true;
-  float swim_direct_probe_timeout_sec_ = 30.0f;
-  float swim_indirect_probe_timeout_sec_ = 15.0f;
-  float swim_suspicion_timeout_sec_ = 60.0f;
+  //
+  // DISABLED BY DEFAULT. SWIM decides a peer is dead from probe replies, and
+  // a wide collective -- a 256-node compose, a full-machine page flush --
+  // starves those replies for longer than the suspicion timeout while every
+  // node is healthy and busy. The detector then declares live nodes dead and
+  // recovery redistributes their containers, after which routing cannot find
+  // the containers and the job fails. Measured at 256 nodes: eight nodes,
+  // ids 0, 32, 64 ... 224, marked dead inside one run.
+  //
+  // Timeouts long enough to survive that are also long enough to be useless
+  // as a detector, so the honest default is off. A deployment that genuinely
+  // needs failure detection turns it on with `swim: enabled: true` and sizes
+  // the timeouts for its own collective width.
+  //
+  // The defaults below are sized for volatility, not detection speed: a node
+  // has to be unreachable for about an hour (5 min direct probe, 2.5 min
+  // indirect probe, 1 h suspicion) before recovery redistributes its
+  // containers. The old 30 s / 15 s / 60 s defaults fired inside healthy runs.
+  bool swim_enabled_ = false;
+  float swim_direct_probe_timeout_sec_ = 300.0f;
+  float swim_indirect_probe_timeout_sec_ = 150.0f;
+  float swim_suspicion_timeout_sec_ = 3600.0f;
 
   // Web dashboard (issue #990). viz_enabled_explicit_ records whether the YAML
   // or the environment stated a preference, so the daemon CLI can supply a

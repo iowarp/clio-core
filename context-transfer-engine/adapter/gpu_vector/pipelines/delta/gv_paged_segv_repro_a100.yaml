@@ -1,0 +1,110 @@
+# REPRODUCER: the 2-node paged segfault, at the smallest deck that shows it.
+#
+# WHAT THIS IS CHASING. In the 32 GB/node cache sweep, every paged cell that
+# had to FAULT died on the PEER node with SIGSEGV (exit 139) -- 9 of 12 cells
+# at cache_level 1-3, plus both high-block cells at full cache. The only two
+# that passed were cache_level 4 at 32 and 64 blocks, i.e. the two where the
+# cache covers the deck and the vector never faults at all. The head node
+# then sits at the barrier until timeout_sec, so the CSV reports these as
+# slow cells rather than as crashes; only the job log says "Segmentation
+# fault (core dumped)".
+#
+# FAULTING ALONE IS NOT THE TRIGGER. gv_dist2_smoke_a100 ran kmeans paged at
+# 2 nodes with a 64 MB deck and 1347 faults and passed its gates. So the
+# crash needs SCALE as well as faulting -- which is why this file sweeps the
+# deck size at a fixed, deliberately tight cache instead of sweeping cache.
+#
+# THE AXIS IS THE DECK. cache_mb is pinned at 512 MB total across 64 blocks
+# (8 slots of 1 MB per block), which is far under every deck below, so every
+# cell faults hard. data_mb then climbs 1 GB -> 16 GB per node. The cell
+# where it starts dying is the scale the bug needs, and the cells below it
+# are the working control.
+#
+# SHORT ON PURPOSE. iters=2 and a 20-minute wall: this is a bisect, not a
+# measurement, and a small job backfills in minutes on a partition that is
+# currently 1900 jobs deep. Nothing here is a number to quote.
+#
+# Submit:  jarvis ppl submit gv_paged_segv_repro_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 60g
+  gpus_per_node: 1
+  time: "00:30:00"
+  job_name: gv_segv_repro
+  output: /u/llogan/gv_job_logs/gv_segv_repro-%j.out
+  error: /u/llogan/gv_job_logs/gv_segv_repro-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "ulimit -c unlimited"
+    - "scontrol show hostnames \"$SLURM_JOB_NODELIST\""
+
+config:
+  name: gv_paged_segv_repro_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: kmeans
+      variant: paged
+      nodes: 2
+      node_launcher: "srun -N {n} --ntasks-per-node=1 --gpus-per-node=1"
+      hostfile: /u/llogan/.ppi-jarvis/shared/gv_paged_segv_repro_a100/hostfile.txt
+      cluster_port: 9431
+      threads: 256
+      blocks: 64
+      dims: 32
+      clusters: 16
+      iters: 2
+      page_kb: 1024
+      # 512 MB over 64 blocks = 8 pages per block. Every deck below dwarfs
+      # this, so every cell faults from the first iteration.
+      cache_mb: 512
+      # No file tier: keep the stack to hbm+ram so a crash cannot be blamed
+      # on the flush path, which had its own bug.
+      nvme_mb: 0
+      prefault: "0"
+      # Short. A cell that has not crashed or finished in 5 minutes at these
+      # sizes is a pass for this purpose.
+      timeout_sec: 300
+      barrier_sec: 120
+      output_dir: /tmp/clio_gv/segv_repro
+
+vars:
+  # GLOBAL deck; kmeans splits it, so per-node is half. 2 -> 32 GB global
+  # is 1 -> 16 GB per node, bracketing the 32 GB/node sweep from below.
+  wl.data_mb: [2000, 4000, 8000, 16000, 32000]
+  # ram tier must clear the per-node share with slack.
+  wl.ram_mb:  [2048, 3072, 5120, 9216,  17408]
+
+loop:
+  - [wl.data_mb, wl.ram_mb]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/segv_repro"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  cols = [c for c in ['wl.data_mb', 'nodes_finished', 'completed', 'gates_pass',
+                      'runtime', 'faults', 'evicts', 'vram_peak_mb']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+  ok = df[df.get('completed', 0) == 1]
+  bad = df[df.get('completed', 0) != 1]
+  if len(ok):
+      logger.info('largest deck that COMPLETED: %d MB global'
+                  % int(ok['wl.data_mb'].max()))
+  else:
+      logger.warning('no cell completed -- the crash reaches below 2000 MB, '
+                     'so bisect downward from here')
+  if len(bad):
+      logger.warning('first FAILING deck: %d MB global. grep the job log for '
+                     '"Segmentation fault" to confirm it is the crash and not '
+                     'the 300 s cap -- the CSV cannot tell them apart, which '
+                     'is the whole reason this file exists.'
+                     % int(bad['wl.data_mb'].min()))

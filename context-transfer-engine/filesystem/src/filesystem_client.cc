@@ -90,6 +90,17 @@ bool Client::EnsureInit() {
   return ready;
 }
 
+void Client::MakeParents(const std::string &path) {
+  // Every ancestor, outermost first; EEXIST (or a race with another creator)
+  // is fine -- the create that follows reports any real failure.
+  size_t pos = 1;
+  while ((pos = path.find('/', pos)) != std::string::npos) {
+    auto m = AsyncMkdir(path.substr(0, pos));
+    m.Wait();
+    ++pos;
+  }
+}
+
 int Client::OpenFd(const std::string &raw_path, int flags, int mode) {
   if (!EnsureInit()) {
     errno = EIO;
@@ -99,8 +110,18 @@ int Client::OpenFd(const std::string &raw_path, int flags, int mode) {
   auto t = AsyncOpen(path, static_cast<clio::run::u32>(flags),
                           static_cast<clio::run::u32>(mode));
   t.Wait();
-  if (t->GetReturnCode() != 0) {
-    errno = EIO;
+  if ((flags & O_CREAT) != 0 && t->GetReturnCode() == ENOENT) {
+    // A `clio::` path mirrors a host path whose directories exist on the host
+    // but not (yet) in clio-fs: create the missing parents, then retry once.
+    // (FUSE stays strictly POSIX: a create under a missing parent is ENOENT.)
+    MakeParents(path);
+    t = AsyncOpen(path, static_cast<clio::run::u32>(flags),
+                  static_cast<clio::run::u32>(mode));
+    t.Wait();
+  }
+  const clio::run::u32 rc = t->GetReturnCode();
+  if (rc != 0) {
+    errno = rc < 4096 ? static_cast<int>(rc) : EIO;
     return -1;
   }
   if (t->handle_ == 0) {

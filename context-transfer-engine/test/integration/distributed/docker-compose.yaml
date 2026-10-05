@@ -51,7 +51,7 @@ services:
         echo '========================================' &&
         echo 'Node 1: Starting Clio runtime in background' &&
         echo '========================================' &&
-        gdb -batch -ex 'set confirm off' -ex run -ex 'thread apply all bt' -ex quit --args /workspace/build/bin/clio_run runtime start &
+        gdb -batch -ex 'set confirm off' -ex run -ex 'thread apply all bt' -ex quit --args /workspace/build/bin/clio_run runtime start --fresh &
         RUNTIME_PID=$$! &&
         echo \"Node 1: Runtime started (PID $$RUNTIME_PID)\" &&
         sleep 3 &&
@@ -103,7 +103,7 @@ services:
     command: >
       "
         echo 'Node 2: Starting Clio runtime in foreground' &&
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
 
   # Node 3 - Secondary node
@@ -135,7 +135,7 @@ services:
     command: >
       "
         echo 'Node 3: Starting Clio runtime in foreground' &&
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
 
   # Node 4 - Secondary node
@@ -167,7 +167,7 @@ services:
     command: >
       "
         echo 'Node 4: Starting Clio runtime in foreground' &&
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
 
 networks:

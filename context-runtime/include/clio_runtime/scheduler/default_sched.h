@@ -41,6 +41,7 @@
 #include "clio_runtime/scheduler/scheduler.h"
 
 #include <array>
+#include <string>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -87,7 +88,29 @@ class DefaultScheduler : public Scheduler {
   static bool IsWedgedShape(u64 outstanding, u32 live, u32 live_stalled,
                             double *window_sec);         // issue #781 — safety net, every 500ms
   bool StealWork(Worker *thief) override;  // issue #781 — work-conserving steal
-  void RecordCompletion(u32 method, double cpu_us, double wall_us) override;
+  void RecordCompletion(u32 pool_major, u32 method, double cpu_us,
+                        double wall_us) override;
+
+  /**
+   * Per-(pool, method) wall-time totals behind the PDF dump. The histogram
+   * says HOW MANY tasks were slow; this says WHICH. Open addressing over a
+   * fixed array so a completion costs a few atomics and no lock.
+   */
+  struct MethodTime {
+    std::atomic<u64> key{0};      ///< (pool_major << 16 | method) + 1; 0 = free
+    std::atomic<u64> count{0};    ///< completions
+    std::atomic<u64> wall_ns{0};  ///< summed wall time
+    std::atomic<u64> max_ns{0};   ///< slowest single completion
+  };
+  static constexpr size_t kMethodTimeSlots = 1024;
+
+  /**
+   * Render the per-method table as one log line: the top_n entries by summed
+   * wall time as " pool.method n=.. sum_ms=.. avg_ms=.. max_ms=.. |".
+   * @param top_n How many entries to include
+   * @return The rendered entries (empty when nothing has completed)
+   */
+  std::string MethodTimeReport(size_t top_n) const;
   void AdjustPolling(const clio::run::shared_ptr<Task> &task) override;
   Worker *GetGpuWorker() const override { return gpu_worker_; }
   // Legacy alias — admin_runtime.cc:Create registers transport FDs with the
@@ -121,6 +144,7 @@ class DefaultScheduler : public Scheduler {
     return kGe1s;
   }
   std::array<std::atomic<u64>, kNumPerfBins> perf_pdf_{};  ///< #781 telemetry
+  std::array<MethodTime, kMethodTimeSlots> method_times_{};  ///< see MethodTime
   std::atomic<u64> load_balance_ticks_{0};  ///< #781 monitor ticks observed
   std::atomic<u64> stalls_detected_{0};     ///< #781 cumulative stall events
   std::atomic<u64> rescues_performed_{0};   ///< #785 lane transfers off stalled workers

@@ -36,6 +36,7 @@
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cae/core/core_tasks.h>
+#include <clio_cae/core/factory/pagify.h>
 #include <clio_cae/core/core_client.h>
 #include <memory>
 #include <string>
@@ -250,6 +251,9 @@ class Runtime : public clio::run::Container {
 
   Client client_;
   std::shared_ptr<clio::cte::core::Client> cte_client_;
+  /** pagify: per-tag page map, loaded once from the tag's "pagemap" blob.
+   *  Keyed by tag so a pool serving several datasets keeps them apart. */
+  std::map<clio::cte::core::TagId, clio::cae::core::Pagify> page_maps_;
 #ifdef CLIO_ENABLE_S3_REST
   /// Keep-alive S3 connections leased by the s3:// assimilator, one lease per
   /// object for its whole lifetime (safe across worker migration). Long-lived

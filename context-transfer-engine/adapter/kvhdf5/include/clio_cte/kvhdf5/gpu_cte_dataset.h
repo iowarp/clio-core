@@ -642,7 +642,7 @@ private:
         std::memset(put_proto, 0, sizeof(put_proto));
         auto* put = new (put_proto) cte::PodPutBlobTask(
             clio::run::CreateTaskId(), cte::kCtePoolId,
-            clio::run::PoolQuery::ToLocalCpu(), tag, name,
+            clio::run::PoolQuery::Dynamic(), tag, name,
             /*offset=*/clio::run::u64(0), bytes, blob_shm,
             /*score=*/-1.0f, cte::Context(), /*flags=*/clio::run::u32(0));
         put->fut_.task_size_ = sizeof(cte::PodPutBlobTask);
@@ -652,7 +652,7 @@ private:
         std::memset(get_proto, 0, sizeof(get_proto));
         auto* get = new (get_proto) cte::PodGetBlobTask(
             clio::run::CreateTaskId(), cte::kCtePoolId,
-            clio::run::PoolQuery::ToLocalCpu(), tag, name,
+            clio::run::PoolQuery::Dynamic(), tag, name,
             /*offset=*/clio::run::u64(0), bytes, /*flags=*/clio::run::u32(0),
             blob_shm);
         get->fut_.task_size_ = sizeof(cte::PodGetBlobTask);

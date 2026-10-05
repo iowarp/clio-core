@@ -1,0 +1,198 @@
+# gmx, PAGED, 2 NODES: PAGE CACHE RESIDENCY SWEEP AT A FIXED BLOCK COUNT.
+#
+#   1 workload x 5 residency rungs = 5 cells
+#
+# The general rationale is in gv_cache_kmeans_a100.yaml. gmx is the outlier
+# of this collection and the reason deserves stating, because a reader who
+# sees "16 blocks" next to kmeans' "432" will otherwise assume a mistake.
+#
+# 16 BLOCKS, AND IT IS THE DATA STRUCTURE, NOT THE KERNEL. A page here is
+# ONE XY PLANE of the K^3 mesh -- K^2 * 8 B -- so the mesh has exactly K
+# pages. THE PAGE COUNT IS THE CUBE ROOT OF THE DATA. At K=2048 that is
+# 2048 planes of 32 MB, 1024 per node, and no growth in the deck changes
+# that ratio: page size grows as K^2 while page count grows as K.
+#
+# The gather then holds FOUR planes at once per block (an atom's order-4
+# spline spans z..z+3), and the bench refuses cap < 4*blocks+2 -- a cache
+# that could evict a plane mid-read. Against a 10% cache that is:
+#
+#     4*blocks + 2 <= 0.10 * 1024 pages = 102   ->   blocks <= 25
+#
+# So gmx's ceiling at the tight end of a residency ladder is TWENTY-FIVE
+# blocks -- 6% of one A100 wave -- and it is set by the mesh having only a
+# thousand pages to divide, not by occupancy. 16 leaves the floor at 66
+# against 102, which is margin rather than a knife edge.
+#
+# IS THAT A DESIGN FLAW? It is a deliberate trade. The spread scatters each
+# atom's 4x4 xy footprint at an arbitrary (x,y) WITHIN a plane, so a plane
+# is the smallest unit with a single writer; tiling it in xy would put
+# several blocks on one page and break the write-site-publish contract that
+# makes the fixed-point gates bit-exact rather than tolerance-based. The
+# cost is that gmx is structurally a few-huge-pages, low-block workload and
+# will never be a block-scaling story. Changing that means per-block xy tile
+# accumulators plus a reduction, and giving up the exact gate.
+#
+#   rung   --cap (pages)   of 1024 planes/node   floor is 66
+#    10%        102               1024                10.0%
+#    25%        256               1024                25.0%
+#    50%        512               1024                50.0%
+#    80%        819               1024                80.0%
+#   100%       1024               1024               100.0%  (resident)
+#
+# --cap IS SET DIRECTLY, NOT VIA cache_mb. The pkg converts cache_mb to
+# pages through page_kb, and at a 32768 KB page every rung would have to be
+# a clean multiple of 32 GB/1024 -- the arithmetic rounds badly and the
+# rungs stop being the fractions they claim to be. cap is the bench's own
+# unit here, so it is what the ladder is written in.
+#
+# K COMES FROM --page-kb, AND THE BENCH HAS NO --k AT ALL. page 32768 KB =
+# 2048^2 * 8 B, so K=2048 and the mesh is 2048^3 * 8 = 64 GB global,
+# 32 GB/node -- the same anchor deck as kmeans/weights/grayscott, reached
+# through the page size. Passing --k would be silently ignored, so mesh_k is
+# left at 0 rather than carrying a flag the binary drops.
+#
+# --no-dense IS REQUIRED. There is no room for a second 32 GB in-VRAM mesh
+# alongside the paged one. The CONSERVATION gate still runs (sum over mesh
+# == sum of input charges, exactly, in fixed point); only the mesh-vs-dense
+# comparison is skipped.
+#
+# A LONGER WALL THAN THE OTHERS. 30 min and a 900 s cap: a 32 MB page is
+# ~7x kmeans' transfer unit, so each fault is correspondingly expensive and
+# the tight rungs are the slowest cells in this collection.
+#
+# FRESH RUN: rm -rf $HOME/gv_pipeline_results/cache_gmx first.
+#
+# Submit:  jarvis ppl submit gv_cache_gmx_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 90g
+  gpus_per_node: 1
+  time: "00:40:00"
+  job_name: gv_cache_gmx
+  output: /u/llogan/gv_job_logs/gv_cache_gmx-%j.out
+  error: /u/llogan/gv_job_logs/gv_cache_gmx-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "scontrol show hostnames \"$SLURM_JOB_NODELIST\""
+    - "srun -N 2 --ntasks-per-node=1 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+
+config:
+  name: gv_cache_gmx_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: gmx
+      variant: paged
+      nodes: 2
+      node_launcher: "srun -N {n} --ntasks-per-node=1 --gpus-per-node=1"
+      hostfile: /u/llogan/.ppi-jarvis/shared/gv_cache_gmx_a100/hostfile.txt
+      cluster_port: 9439
+      # ---- FIXED: everything that is not the cache -------------------
+      blocks: 16           # cap>=4*blocks+2 vs a 102-page 10% rung; see header
+      threads: 256
+      page_kb: 32768       # 2048^2 * 8 B -> K=2048, mesh 64 GB global
+      mesh_k: 0            # the bench has no --k; K is derived from page_kb
+      atoms: 200000
+      # ITERATIONS SIZED SO THE CACHE CAN ACTUALLY SHOW UP. Measured on
+      # job 21721196 at steps=2: faults fell 3.2x across the ladder
+      # (56896 -> 17842) while bench_ms did not move at all
+      # (16887/17470/13406/16573 ms). The reason is compulsory misses --
+      # at 2 iterations ONE of them is unavoidably cold however large the
+      # cache is, so at most half the accesses were ever cacheable, and
+      # that thin signal sat under a fixed ~40 s 32 GB ingest. At 8 the
+      # ratio is 1 cold to 7 warm and the dynamic range is ~8x. The cells
+      # ran 70-80 s against a 480 s cap, so this is spending headroom that
+      # was already there, not risking it.
+      repeat: 3            # each repeat is a full spread+gather over 32 GB/node
+      no_dense: true       # no room for a second 32 GB mesh; conservation still gated
+      ram_mb: 35840        # 32 GB/node mesh + slack
+      nvme_mb: 0
+      prefault: "0"
+      timeout_sec: 900
+      barrier_sec: 300
+      output_dir: /tmp/clio_gv/cache_gmx
+
+vars:
+  # THE ONLY AXIS: mesh cache in PAGES, as a fraction of this node's 1024
+  # planes. Do NOT lower the first rung without lowering `blocks`: below
+  # 4*16+2 = 66 the bench refuses the cell rather than running it.
+  wl.cap: [102, 256, 512, 819, 1024]
+
+loop:
+  - [wl.cap]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/cache_gmx"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  pd.set_option('display.width', 240)
+
+  PLANES_PER_NODE = 1024
+  if 'wl.cap' in df.columns:
+      df['residency_pct'] = (100.0 * df['wl.cap'] / PLANES_PER_NODE).round(1)
+
+  # gmx REPORTS spread_ms / gather_ms, and bench_ms may be empty. Pivoting
+  # on bench_ms alone renders this whole sweep blank and calls it a success,
+  # so coalesce a metric and say which column it came from.
+  df['metric_ms'] = pd.NA
+  df['metric_src'] = ''
+  for col in ('bench_ms', 'gather_ms', 'spread_ms'):
+      if col in df.columns:
+          take = df['metric_ms'].isna() & df[col].notna()
+          df.loc[take, 'metric_ms'] = df.loc[take, col]
+          df.loc[take, 'metric_src'] = col
+
+  cols = [c for c in ['residency_pct', 'wl.cap', 'cache_setting',
+                      'blocks_resolved', 'nodes', 'nodes_finished',
+                      'completed', 'gates_pass', 'metric_ms', 'metric_src',
+                      'spread_ms', 'gather_ms', 'runtime', 'vram_peak_mb',
+                      'faults', 'evicts', 'get_errors', 'put_errors']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+
+  ok = df[(df.get('completed', 0) == 1) & df['metric_ms'].notna()]
+  if len(ok) and 'residency_pct' in ok.columns:
+      full = ok[ok['residency_pct'] >= 100.0]
+      if len(full):
+          base = float(full['metric_ms'].min())
+          curve = ok[['residency_pct', 'metric_ms', 'metric_src']].copy()
+          curve['x_resident'] = (curve['metric_ms'] / base).round(2)
+          logger.info('\ngmx paged, 16 blocks, K=2048 (64 GB global) -- cost '
+                      'of a smaller mesh cache:\n'
+                      + curve.sort_values('residency_pct').to_string(index=False))
+      else:
+          logger.warning('the 100%% rung produced no number -- no resident '
+                         'baseline to divide by')
+
+  # gmx does NOT fill faults/evicts in results.csv -- the pkg does not parse
+  # its paging line, so those columns come back EMPTY, not zero. Say so
+  # rather than letting a blank read as "no paging happened".
+  if 'faults' not in df.columns or df['faults'].isna().all():
+      logger.info('faults/evicts are BLANK for gmx by construction (the pkg '
+                  'does not parse its paging line). For the real numbers read '
+                  '~/.ppi-jarvis/shared/gv_cache_gmx_a100*/wl/gvw_dist/'
+                  '*.node0.log, which carries "paging: faults=... evicts=..." '
+                  'directly. Blank here is NOT evidence the cell was resident.')
+
+  bad = df[df.get('completed', 0) != 1]
+  for _, r in bad.iterrows():
+      logger.warning('OVER THE 900 s CAP or FAILED: residency %s%% (cap=%s '
+                     'pages, runtime=%s). A near-zero runtime means the bench '
+                     'REFUSED the cell -- check cap against the 4*blocks+2 '
+                     'floor of 66.'
+                     % (r.get('residency_pct'), r.get('wl.cap'),
+                        r.get('runtime')))
+
+  if len(df) < 5:
+      logger.warning('only %d of 5 rungs have rows -- RESUBMIT THIS FILE to '
+                     'continue' % len(df))
+  elif not len(bad):
+      logger.info('all 5 residency rungs completed')

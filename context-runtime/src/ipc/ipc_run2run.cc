@@ -34,7 +34,11 @@
 #include <cstring>
 
 #include <clio_runtime/ipc/ipc_run2run.h>
+#include <clio_runtime/cycle_counter.h>
 #include <clio_runtime/ipc_manager.h>
+
+/** Latency-report channel hook (defined in ipc_gpu2cpu.cc). */
+extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 #include <clio_runtime/pool_manager.h>
 #include <clio_runtime/config_manager.h>
 #include <clio_runtime/worker.h>
@@ -45,12 +49,34 @@
 #include <clio_ctp/thread/thread_model_manager.h>
 
 #include <atomic>
+#include <unordered_set>
+#include <mutex>
+#include <fstream>
 #include <cerrno>
 #include <chrono>
 #include <thread>
 #include <unordered_map>
 
 namespace clio::run {
+
+bool Run2RunTestPartitioned(u32 node_id) {
+  static const char *path = std::getenv("CLIO_TEST_PARTITION_FILE");
+  if (path == nullptr || *path == '\0') return false;
+  static std::mutex mu;
+  static std::unordered_set<u32> blocked;
+  static std::chrono::steady_clock::time_point read_at{};
+  std::lock_guard<std::mutex> g(mu);
+  const auto now = std::chrono::steady_clock::now();
+  if (now - read_at > std::chrono::milliseconds(500)) {
+    read_at = now;
+    blocked.clear();
+    std::ifstream in(path);
+    u32 id = 0;
+    while (in >> id) blocked.insert(id);
+  }
+  return blocked.count(node_id) != 0;
+}
+
 
 // TEMP NET TRACE (issue #892 diagnosis): per-stage nanosecond totals for the
 // cross-node task path, dumped every 32 ops when CLIO_NET_TRACE=1.
@@ -152,7 +178,8 @@ void IpcManagerRun2Run::SendInTransmitReplica(
   auto *config_manager = CLIO_CONFIG_MANAGER;
   const clio::run::Host *target_host = ipc_manager->GetHost(target_node_id);
 
-  int port = static_cast<int>(config_manager->GetPort());
+  int port =
+      static_cast<int>(target_host->PortOr(config_manager->GetPort()));
   ctp::lbm::Transport *lbm_transport =
       ipc_manager->GetOrCreateClient(target_host->ip_address, port);
 
@@ -167,6 +194,7 @@ void IpcManagerRun2Run::SendInTransmitReplica(
   }
 
   clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeIn, lbm_transport);
+  StampSender(archive);
   // Advertise this node's server port as the response port. The receiver pairs
   // it with our return-node address to open a dedicated dial-back connection
   // for SendOut (see RecvInHandleOne), keyed in the connection cache by
@@ -281,12 +309,28 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
     }
     task_copy->pool_query_.SetReturnNode(ipc_manager->GetNodeId());
 
-    if (!ipc_manager->IsAlive(target_node_id)) {
+    const bool partitioned = Run2RunTestPartitioned(target_node_id);
+    if (!ipc_manager->IsAlive(target_node_id) || partitioned) {
       float net_timeout = origin_task->pool_query_.GetNetTimeout();
-      if (net_timeout >= 0 && net_timeout < 0.001f) {
-        HLOG(kWarning,
-             "[SendIn] Task {} target node {} is dead, net_timeout=0 -> skip",
-             origin_task->task_id_, target_node_id);
+      if ((net_timeout >= 0 && net_timeout < 0.001f) ||
+          Run2RunFailFastDead() || partitioned) {
+        // Rate-limited: with a node down every task routed to it lands here,
+        // and one synchronous log line per task on the network worker was
+        // itself enough to stall it.
+        static std::atomic<clio::run::u64> skip_logged{0};
+        if (skip_logged.fetch_add(1, std::memory_order_relaxed) % 1000 == 0) {
+          HLOG(kWarning,
+               "[SendIn] Task {} target node {} is dead -> skip (fail fast); "
+               "{} such skips so far",
+               origin_task->task_id_, target_node_id, skip_logged.load());
+        }
+        // A broadcast may legitimately answer from the reachable subset, but
+        // a single-target task that skips its ONLY target produced no result
+        // at all: completing it with rc 0 handed the caller an empty success
+        // (a read of a dead node's blob came back as zeros).
+        if (!origin_task->pool_query_.IsBroadcastMode()) {
+          origin_task->SetReturnCode(kRun2RunNetworkTimeoutRC);
+        }
         // Issue #856: if this skip is the LAST replica to be accounted (every
         // other replica already responded), nobody else will ever observe
         // completed == size — the origin would never complete and its awaiting
@@ -313,6 +357,11 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
     }
 
     replica_targets[i] = target_node_id;
+    // Latency report (CLIO_EVLAT): the remote round trip starts here and
+    // ends in RecvOutCompleteOriginTask.
+    if (RunContext *rc = origin_task->RunCtxPtr()) {
+      if (rc->notify_ns_ == 0) rc->notify_ns_ = clio::run::CycleNow();
+    }
     SendInTransmitReplica(ipc_manager, task_copy,
                           target_node_id, origin_task);
   }
@@ -322,6 +371,16 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
   // (ScanSendMapTimeouts) needs it for all routing modes. Admin-pool origins
   // are registered but NOT probe-eligible: QueryTaskProgress is itself an
   // admin cross-node task, so probing them would recurse (issue #896).
+  if (origin_task->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
+    // No response is coming (the executor's EndTask skips SendOut for these),
+    // so nothing may wait for one: no progress probes, and the origin is
+    // finished now, exactly as a locally executed fire-and-forget task is.
+    // Tracked like a normal task, every detached remote close left a
+    // send_map_ entry here and a recv_map_ entry at the executor forever,
+    // which the hang watches then reported as stuck (#1149).
+    RecvOutCompleteOriginTask(send_map_key, origin_task);
+    return;
+  }
   RegisterOriginProgress(send_map_key, replica_targets,
                          /*probe_eligible=*/
                          !(origin_task->pool_id_ == clio::run::kAdminPoolId));
@@ -339,7 +398,8 @@ int IpcManagerRun2Run::SendOutTransmit(
   clio::run::ContainerHold container =
       CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_).get();
   auto *config_manager = CLIO_CONFIG_MANAGER;
-  int port = static_cast<int>(config_manager->GetPort());
+  int port =
+      static_cast<int>(target_host->PortOr(config_manager->GetPort()));
 
   // Prefer the dedicated dial-back connection resolved at RecvIn (stored on the
   // task's FutureShm). Fall back to resolving the peer connection by address if
@@ -373,6 +433,7 @@ int IpcManagerRun2Run::SendOutTransmit(
   }
 
   clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeOut, lbm_transport);
+  StampSender(archive);
   const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
   container->SaveTask(origin_task->method_, archive, origin_task);
   const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
@@ -416,14 +477,6 @@ void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_ta
   // RecvInHandleOne and stored in this task's RunContext). It is freed
   // automatically when the RunContext (and its Future copy) is destroyed by
   // DelTask below — no manual capture/FreeBuffer needed.
-  size_t recv_key = origin_task->task_id_.net_key_ ^
-                    (static_cast<size_t>(origin_task->task_id_.replica_id_) *
-                     0x9e3779b97f4a7c15ULL);
-  {
-    std::lock_guard<std::mutex> lk(recv_map_mutex_);
-    recv_map_.erase(recv_key);
-  }
-
   clio::run::u64 target_node_id = origin_task->pool_query_.GetReturnNode();
 
   if (!ipc_manager->IsAlive(target_node_id)) {
@@ -443,9 +496,15 @@ void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_ta
     return;
   }
 
+  NoteResponseAge(origin_task, "send");
   int rc = SendOutTransmit(ipc_manager, origin_task,
                            target_node_id, target_host);
-  (void)rc;
+  // The replica stays visible to QueryTaskProgress until its response has
+  // actually left. Erasing before the send made a response parked in
+  // send_out_retry_ look Gone to the origin, which then failed the task.
+  if (rc == 0) {
+    EraseRecvEntry(origin_task);
+  }
   // Task frees via RAII when its shared_ptr owners drop (the by-value
   // origin_task handle here, plus the RunContext/send_map_ entry) — no
   // explicit DelTask.
@@ -470,9 +529,18 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   // drop. Observed live: node 2 held node 1 "dead" indefinitely while
   // ingesting node 1's healthy probe traffic the whole time, wedging the
   // entire remote half of the workload.
-  {
-    clio::run::u64 sender = task_info.task_id_.node_id_;
+  //
+  // The sender is the RUNTIME that put this message on the wire
+  // (archive.sender_node_, #1148), not the task id's node: a client task
+  // forwarded by a peer carries the CLIENT's node id there, which is 0 for
+  // every FUSE daemon -- so all forwarded client traffic in the cluster
+  // counted as node 0 being heard from, and node 0 could never be declared
+  // dead while any client was active (#1162). A message without a stamp (a
+  // client's own, or an older peer) identifies no runtime: no proof of life.
+  if (archive.sender_inc_ != 0) {
+    clio::run::u64 sender = archive.sender_node_;
     auto *im = CLIO_IPC;
+    if (im != nullptr) im->NoteHeardFrom(sender);
     if (im != nullptr && sender != im->GetNodeId() && !im->IsAlive(sender)) {
       HLOG(kWarning,
            "[RecvIn] node {} was marked dead but just sent us a task — "
@@ -522,12 +590,17 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   // serialized TASK_PERIODIC flag needs resetting on receive.
   task_ptr->ClearFlags(TASK_PERIODIC);
 
-  size_t recv_key =
-      task_ptr->task_id_.net_key_ ^
-      (static_cast<size_t>(task_ptr->task_id_.replica_id_) * 0x9e3779b97f4a7c15ULL);
-  {
+  // A fire-and-forget task is never answered (EndTask skips SendOut), so it
+  // must not be recorded as awaiting a response: the record would never be
+  // erased, and the hang watch reported every such task at 60 s (#1149).
+  if (!task_ptr->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
+    size_t recv_key =
+        task_ptr->task_id_.net_key_ ^
+        (static_cast<size_t>(task_ptr->task_id_.replica_id_) *
+         0x9e3779b97f4a7c15ULL);
     std::lock_guard<std::mutex> lk(recv_map_mutex_);
     recv_map_[recv_key] = task_ptr;
+    recv_since_[recv_key] = std::chrono::steady_clock::now();
   }
 
   HLOG(kDebug, "[RecvIn] Task {} method={} pool_id={} dispatching to workers",
@@ -588,11 +661,79 @@ int IpcManagerRun2Run::RecvIn(clio::run::LoadTaskArchive &archive,
     return 0;
   }
 
+  // A task for a pool this node has not composed yet is held, not dropped:
+  // the sender is simply ahead of us in startup. Whole-archive, so no task
+  // is consumed twice; ReplayDeferredRecv retries it from the net tick.
+  if (!AllContainersPresent(pool_manager, archive)) {
+    std::lock_guard<std::mutex> lk(deferred_recv_mutex_);
+    deferred_recv_.push_back(DeferredRecv{std::move(archive), lbm_transport,
+                                          std::chrono::steady_clock::now()});
+    return 0;
+  }
+
   for (const auto &task_info : task_infos) {
     RecvInHandleOne(ipc_manager, pool_manager, task_info, archive, lbm_transport);
   }
 
   return 0;
+}
+
+bool IpcManagerRun2Run::AllContainersPresent(
+    clio::run::PoolManager *pool_manager,
+    const clio::run::LoadTaskArchive &archive) {
+  // The REAL local container, not the static one. A task that reaches this
+  // node over the network was routed here because the address map says this
+  // node hosts its container, so that is what it must run on. The static
+  // container exists from the moment the pool's metadata does -- before the
+  // real one is registered and long before its Create runs -- and a task
+  // admitted on that evidence executed on the static instance: two puts
+  // waited 120 s for targets that instance would never register while the
+  // real container was ready 180 ms later (late-peer reproducer, trial 3).
+  for (const auto &task_info : archive.GetTaskInfos()) {
+    if (!pool_manager->GetContainer(task_info.pool_id_, kInvalidContainerId)
+             .get()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void IpcManagerRun2Run::ReplayDeferredRecv() {
+  auto *ipc_manager = CLIO_IPC;
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  std::list<DeferredRecv> ready;
+  {
+    std::lock_guard<std::mutex> lk(deferred_recv_mutex_);
+    if (deferred_recv_.empty()) return;
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = deferred_recv_.begin(); it != deferred_recv_.end();) {
+      if (AllContainersPresent(pool_manager, it->archive)) {
+        ready.splice(ready.end(), deferred_recv_, it++);
+        continue;
+      }
+      const float waited =
+          std::chrono::duration<float>(now - it->arrived).count();
+      if (waited >= kDeferredRecvTimeoutSec) {
+        const auto &infos = it->archive.GetTaskInfos();
+        HLOG(kError,
+             "[RecvIn] dropping {} deferred task(s) (first: pool {} method {} "
+             "from node {}): its pool was never composed here in {} s",
+             infos.size(), infos.front().pool_id_, infos.front().method_id_,
+             infos.front().task_id_.node_id_,
+             static_cast<clio::run::u32>(waited));
+        it = deferred_recv_.erase(it);
+        continue;
+      }
+      ++it;
+    }
+  }
+  for (auto &d : ready) {
+    HLOG(kInfo, "[RecvIn] replaying {} deferred task(s) now that their pool exists",
+         d.archive.GetTaskInfos().size());
+    for (const auto &task_info : d.archive.GetTaskInfos()) {
+      RecvInHandleOne(ipc_manager, pool_manager, task_info, d.archive, d.transport);
+    }
+  }
 }
 
 // =============================================================================
@@ -639,6 +780,16 @@ int IpcManagerRun2Run::RecvOutDeserialize(
     }
 
     container->LoadTask(origin_task->method_, archive, replica);
+    // Proof of life for the node that answered: the one this replica was
+    // dispatched to. Not completer_: its "unset" value is 0, which is also
+    // node 0's id, so every response that never set it kept node 0 alive
+    // (#1162).
+    {
+      const clio::run::u64 answered_by = ReplicaTargetNode(net_key, replica_id);
+      if (answered_by != kInvalidNodeId) {
+        if (auto *im = CLIO_IPC) im->NoteHeardFrom(answered_by);
+      }
+    }
   }
 
   return 0;
@@ -763,6 +914,12 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
   if (!ClaimOrigin(net_key)) {
     return;
   }
+  if (RunContext *rc = origin_task->RunCtxPtr()) {
+    if (rc->notify_ns_ != 0) {
+      clio_evlat_add(10, clio::run::CycleNow() - rc->notify_ns_);
+      rc->notify_ns_ = 0;
+    }
+  }
 
   // The origin task is about to be completed through EndTask, which calls the
   // module's UpdateWork on its ExecContainer — so this must resolve to the real
@@ -812,7 +969,19 @@ void IpcManagerRun2Run::RegisterOriginProgress(
     prog.replicas[i].accounted = (replica_targets[i] == kInvalidNodeId);
   }
   std::lock_guard<std::mutex> lk(send_map_mutex_);
+  prog.gen = ++progress_gen_;
   progress_map_[net_key] = std::move(prog);
+}
+
+clio::run::u64 IpcManagerRun2Run::ReplicaTargetNode(
+    size_t net_key, clio::run::u32 replica_id) const {
+  std::lock_guard<std::mutex> lk(send_map_mutex_);
+  auto it = progress_map_.find(net_key);
+  if (it == progress_map_.end() ||
+      replica_id >= it->second.replicas.size()) {
+    return kInvalidNodeId;
+  }
+  return it->second.replicas[replica_id].target_node_id;
 }
 
 bool IpcManagerRun2Run::MarkReplicaAccounted(size_t net_key,
@@ -852,6 +1021,29 @@ std::vector<StuckReplica> IpcManagerRun2Run::CollectStuckReplicas(
 
   for (auto &kv : progress_map_) {
     OriginProgress &prog = kv.second;
+    {
+      // [HANGWATCH-REPLICA] (#1147): an origin outstanding a minute or more
+      // is stuck, not slow -- say where each replica stands.
+      const double age_s =
+          std::chrono::duration<double>(now - prog.enqueue_time).count();
+      if (age_s >= 60.0 && age_s < 60.0 + interval_ms / 1000.0) {
+        auto sit = send_map_.find(kv.first);
+        const bool live = sit != nullptr && !(*sit).IsNull();
+        const clio::run::TaskId tid =
+            live ? (*sit)->task_id_ : clio::run::TaskId();
+        for (clio::run::u32 rid = 0; rid < prog.replicas.size(); ++rid) {
+          const ReplicaProgress &rp = prog.replicas[rid];
+          HLOG(kError, "[HANGWATCH-REPLICA] task {} (origin live={}) replica "
+               "{} -> node {} outstanding {} s: accounted={} alive={} "
+               "gone_strikes={} redispatched={} probe_eligible={}", tid, live,
+               rid,
+               rp.target_node_id, age_s, rp.accounted,
+               rp.target_node_id != kInvalidNodeId &&
+                   ipc_manager->IsAlive(rp.target_node_id),
+               rp.gone_strikes, rp.redispatched, prog.probe_eligible);
+        }
+      }
+    }
     if (!prog.probe_eligible) {
       continue;  // admin origin: probing it would recurse (issue #896)
     }
@@ -869,17 +1061,164 @@ std::vector<StuckReplica> IpcManagerRun2Run::CollectStuckReplicas(
         continue;
       }
       stuck.push_back({static_cast<clio::run::u64>(kv.first), rid,
-                       rp.target_node_id});
+                       rp.target_node_id, prog.gen});
     }
   }
   return stuck;
 }
 
+void IpcManagerRun2Run::EraseRecvEntry(
+    const clio::run::shared_ptr<clio::run::Task> &task) {
+  const size_t recv_key =
+      task->task_id_.net_key_ ^
+      (static_cast<size_t>(task->task_id_.replica_id_) * 0x9e3779b97f4a7c15ULL);
+  bool missed = false;
+  {
+    std::lock_guard<std::mutex> lk(recv_map_mutex_);
+    missed = recv_map_.find(recv_key) == nullptr;
+    recv_map_.erase(recv_key);
+    recv_since_.erase(recv_key);
+  }
+  if (missed) {
+    // A response whose receive record is gone (or was never keyed this way)
+    // leaves the record behind: the hang watch then reports a task that
+    // was in fact answered (#1149). Say so, once per 64.
+    const clio::run::u64 n = recv_erase_misses_.fetch_add(1) + 1;
+    if (n % 64 == 1) {
+      HLOG(kWarning, "[RecvMap] response for task {} (pool {}, method {}, "
+           "flags {}) had no receive record ({} such so far)",
+           task->task_id_, task->pool_id_, task->method_,
+           static_cast<clio::run::u32>(task->task_flags_.bits_), n);
+    }
+  }
+}
+
+void IpcManagerRun2Run::NoteResponseAge(
+    const clio::run::shared_ptr<clio::run::Task> &task, const char *step) {
+  if (task.IsNull()) return;
+  const size_t recv_key =
+      task->task_id_.net_key_ ^
+      (static_cast<size_t>(task->task_id_.replica_id_) * 0x9e3779b97f4a7c15ULL);
+  double age_ms = 0;
+  {
+    std::lock_guard<std::mutex> lk(recv_map_mutex_);
+    auto it = recv_since_.find(recv_key);
+    if (it == recv_since_.end()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (it->second > now) return;  // already reported by the hang watch
+    age_ms = std::chrono::duration<double, std::milli>(now - it->second).count();
+  }
+  if (age_ms >= kSlowResponseMs) {
+    HLOG(kWarning, "[SLOW-RESPONSE] task {} (pool {}, method {}) at {}: {} ms "
+         "since it was received", task->task_id_, task->pool_id_,
+         task->method_, step, age_ms);
+  }
+}
+
+void IpcManagerRun2Run::ReportOldRecvTasks() {
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lk(recv_map_mutex_);
+  for (auto it = recv_since_.begin(); it != recv_since_.end(); ++it) {
+    const double age_s =
+        std::chrono::duration<double>(now - it->second).count();
+    if (age_s < 60.0) continue;
+    auto *t = recv_map_.find(it->first);
+    if (t != nullptr && !(*t).IsNull()) {
+      // Where it is held: never started (queued for a worker), running
+      // (suspended in its handler), or finished with its response not yet
+      // sent (the send path is the bottleneck) -- #1149.
+      const auto &rc = (*t)->run_ctx_;
+      const char *where = rc.get() == nullptr   ? "no run context"
+                          : !rc->IsStarted()     ? "not started"
+                          : (*t)->IsCoroCompleted() ? "finished, response unsent"
+                                                    : "running";
+      HLOG(kError, "[HANGWATCH-RECV] holding received task {} (pool {}, "
+           "method {}, flags {}, return node {}) for {} s without a "
+           "response ({})", (*t)->task_id_, (*t)->pool_id_, (*t)->method_,
+           static_cast<clio::run::u32>((*t)->task_flags_.bits_),
+           (*t)->pool_query_.GetReturnNode(), age_s,
+           where);
+    }
+    // Once per task: push its stamp far into the future.
+    it->second = now + std::chrono::hours(24 * 365);
+  }
+}
+
+void IpcManagerRun2Run::StampSender(clio::run::NetTaskArchive &archive) {
+  auto *ipc = CLIO_IPC;
+  archive.sender_node_ = ipc->GetNodeId();
+  archive.sender_inc_ = ipc->GetServerGeneration();
+}
+
+void IpcManagerRun2Run::CheckPeerIncarnation(
+    const clio::run::NetTaskArchive &archive) {
+  if (archive.sender_inc_ == 0) return;  // a client, or an older peer
+  auto *ipc = CLIO_IPC;
+  if (ipc->NotePeerIncarnation(archive.sender_node_, archive.sender_inc_)) {
+    FailInFlightToNode(archive.sender_node_);
+  }
+}
+
+void IpcManagerRun2Run::FailInFlightToNode(clio::run::u64 node_id) {
+  // Everything dispatched to node_id before we saw its new incarnation went
+  // to the old process (or was lost in transit when it died): no answer will
+  // come, and its probes may be lost the same way while the node keeps
+  // talking to us -- the waiters hung forever (#1148). Fail them like the
+  // dead-node path does; callers retry (puts are idempotent).
+  std::vector<std::pair<size_t, clio::run::u32>> to_fail;
+  {
+    std::lock_guard<std::mutex> lk(send_map_mutex_);
+    for (auto &kv : progress_map_) {
+      OriginProgress &prog = kv.second;
+      for (clio::run::u32 rid = 0; rid < prog.replicas.size(); ++rid) {
+        const ReplicaProgress &rp = prog.replicas[rid];
+        if (!rp.accounted && rp.target_node_id == node_id) {
+          to_fail.emplace_back(kv.first, rid);
+        }
+      }
+    }
+  }
+  HLOG(kWarning, "[RecvIn] node {} restarted (new incarnation); failing {} "
+       "task replica(s) sent to its previous process", node_id,
+       to_fail.size());
+  for (const auto &f : to_fail) {
+    HandleTaskProgressResult(static_cast<clio::run::u64>(f.first), f.second,
+                             /*gone=*/true, /*gen=*/0);
+  }
+}
+
 void IpcManagerRun2Run::HandleTaskProgressResult(clio::run::u64 net_key,
                                                  clio::run::u32 replica_id,
-                                                 bool gone) {
+                                                 bool gone,
+                                                 clio::run::u64 gen) {
   if (!gone) {
     return;  // still running on its node -> keep waiting
+  }
+  // A probe's answer applies only to the origin it was fired for. gen == 0
+  // is the dead-node and send-failure paths, which act on live state.
+  if (gen != 0) {
+    std::lock_guard<std::mutex> lk(send_map_mutex_);
+    auto pit = progress_map_.find(static_cast<size_t>(net_key));
+    if (pit == progress_map_.end() || pit->second.gen != gen) {
+      HLOG(kDebug,
+           "[TaskProgress] stale Gone for net_key {} gen {} ignored: the key "
+           "now names a newer origin",
+           net_key, gen);
+      return;
+    }
+    if (replica_id < pit->second.replicas.size()) {
+      ReplicaProgress &rp = pit->second.replicas[replica_id];
+      if (rp.accounted) {
+        return;
+      }
+      if (++rp.gone_strikes < kGoneStrikesToFail) {
+        HLOG(kWarning,
+             "[TaskProgress] replica {} of net_key {} answered Gone ({}/{}); "
+             "re-probing before declaring it lost",
+             replica_id, net_key, rp.gone_strikes, kGoneStrikesToFail);
+        return;
+      }
+    }
   }
   // Claim the accounting transition; bail if a real response already took it.
   if (!MarkReplicaAccounted(static_cast<size_t>(net_key), replica_id)) {
@@ -945,7 +1284,8 @@ bool IpcManagerRun2Run::RetrySendToNode(RetryEntry &entry, clio::run::u64 node_i
     return false;
   }
 
-  int port = static_cast<int>(config_manager->GetPort());
+  int port =
+      static_cast<int>(target_host->PortOr(config_manager->GetPort()));
   ctp::lbm::Transport *lbm_transport =
       ipc_manager->GetOrCreateClient(target_host->ip_address, port);
   if (!lbm_transport) {
@@ -959,6 +1299,7 @@ bool IpcManagerRun2Run::RetrySendToNode(RetryEntry &entry, clio::run::u64 node_i
   }
 
   clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeIn, lbm_transport);
+  StampSender(archive);
   container->SaveTask(entry.task->method_, archive, entry.task);
   ctp::lbm::LbmContext ctx(0);
   int rc = lbm_transport->Send(archive, ctx);
@@ -993,6 +1334,7 @@ clio::run::u64 IpcManagerRun2Run::RerouteRetryEntry(RetryEntry &entry) {
 // =============================================================================
 
 void IpcManagerRun2Run::ProcessRetryQueues() {
+  ReplayDeferredRecv();
   auto *ipc_manager = CLIO_IPC;
   auto now = std::chrono::steady_clock::now();
 
@@ -1005,7 +1347,7 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
 
   for (auto it = send_in_retry_.begin(); it != send_in_retry_.end();) {
     float elapsed = std::chrono::duration<float>(now - it->enqueued_at).count();
-    float task_timeout = kRun2RunRetryTimeoutSec;
+    float task_timeout = Run2RunRetryTimeoutSec();
     float task_net_timeout = it->task->pool_query_.GetNetTimeout();
     if (task_net_timeout >= 0) {
       task_timeout = task_net_timeout;
@@ -1066,7 +1408,7 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
 
   for (auto it = send_out_retry_.begin(); it != send_out_retry_.end();) {
     float elapsed = std::chrono::duration<float>(now - it->enqueued_at).count();
-    float out_task_timeout = kRun2RunRetryTimeoutSec;
+    float out_task_timeout = Run2RunRetryTimeoutSec();
     float out_task_net_timeout = it->task->pool_query_.GetNetTimeout();
     if (out_task_net_timeout >= 0) {
       out_task_timeout = out_task_net_timeout;
@@ -1075,6 +1417,7 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
     if (elapsed >= out_task_timeout) {
       HLOG(kError, "[RetryQueue] SendOut task timed out after {}s for node {}",
            elapsed, it->target_node_id);
+      EraseRecvEntry(it->task);  // the response is dropped; now it is Gone
       it = send_out_retry_.erase(it);
     } else if (ipc_manager->IsAlive(it->target_node_id)) {
       clio::run::shared_ptr<clio::run::Task> retry_task = it->task;
@@ -1133,7 +1476,7 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
       }
       clio::run::shared_ptr<clio::run::Task> &origin_task = *sit;
 
-      float task_timeout = kRun2RunRetryTimeoutSec;
+      float task_timeout = Run2RunRetryTimeoutSec();
       float task_net_timeout = origin_task->pool_query_.GetNetTimeout();
       if (task_net_timeout >= 0) {
         task_timeout = task_net_timeout;
@@ -1158,11 +1501,13 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
     }
   }
 
-  for (const auto &dr : to_fail) {
+  if (!to_fail.empty()) {
     HLOG(kError,
-         "[ScanSendMapTimeouts] replica {} of net_key {} timed out waiting "
-         "for dead node {}; completing with network-timeout RC",
-         dr.replica_id, dr.net_key, dr.node_id);
+         "[ScanSendMapTimeouts] {} replicas timed out waiting for dead nodes "
+         "(e.g. node {}); completing them with network-timeout RC",
+         to_fail.size(), to_fail.front().node_id);
+  }
+  for (const auto &dr : to_fail) {
     // Exactly-once (issue #856): HandleTaskProgressResult claims the
     // accounting transition (MarkReplicaAccounted) before counting, and the
     // final count funnels through RecvOutCompleteOriginTask, whose
@@ -1225,6 +1570,7 @@ void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
     HLOG(kInfo,
          "[FlushStale] Discarding SendOut retry for restarted node {}",
          node_id);
+    EraseRecvEntry(it->task);
     it = send_out_retry_.erase(it);
   }
   }  // release retry_queues_mutex_ before completing origins
@@ -1292,6 +1638,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
         const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
         if (nettrace::On()) nettrace::recv_ns += nt1 - nt0;
         drained_any = true;
+        CheckPeerIncarnation(archive);
         clio::run::MsgType msg_type = archive.GetMsgType();
         switch (msg_type) {
           case clio::run::MsgType::kSerializeIn:

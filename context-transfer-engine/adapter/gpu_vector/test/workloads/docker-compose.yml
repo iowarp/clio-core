@@ -1,0 +1,159 @@
+# 4-node cluster test for the eternia workloads (LAMMPS, GROMACS, LBANN).
+#
+# Nodes 1-3 run eternia_cluster_node and hold storage; node 4 runs the
+# workload. Because pages are CTE blobs and blobs hash across the cluster,
+# most of the workload's page faults are then served from another node's
+# memory -- which is the property the single-node harnesses cannot test.
+#
+#   ETERNIA_BIN_DIR=<build root> ./run_workload_cluster.sh {lammps|gromacs|lbann|all}
+#
+# WHY THE WORKLOAD IS NODE 4 AND NOT NODE 1
+# -----------------------------------------
+# The ordering is circular if the workload bootstraps: peers cannot join until
+# a runtime is listening, but the workload's runtime does not start with its
+# container -- it starts when the workload first reaches the eternia code path,
+# which is seconds in for LAMMPS and much later for GROMACS and LBANN. Running
+# the workload first therefore either raced (short workloads finished before
+# the peers had joined, so every blob was created locally and the "cluster" run
+# never left the node) or hung.
+#
+# Putting a peer first inverts it: node 1 listens immediately, nodes 2 and 3
+# join it, each writes a readiness marker, and the workload waits for all three
+# before it starts. The workload's blobs are then created with the full cluster
+# present, which is the only arrangement that actually distributes them.
+#
+# The workload binaries are NOT in the repo -- they are large third-party
+# builds from the forks under external/ -- so ETERNIA_BIN_DIR points at
+# wherever they were built and is mounted read-only at /sp.
+x-node: &node
+  image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+  init: true
+  runtime: nvidia
+  stop_grace_period: 5s
+  security_opt:
+    - seccomp:unconfined
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  volumes:
+    - ${HOST_WORKSPACE:?set HOST_WORKSPACE to the repo root}:/workspace:rw
+    - ${ETERNIA_BIN_DIR:?set ETERNIA_BIN_DIR to the workload build root}:/sp:ro
+    - ${CUDA_HOME:-/usr/local/cuda-13.3}:/usr/local/cuda:ro
+    - /usr/lib/x86_64-linux-gnu/nvcomp:/usr/lib/x86_64-linux-gnu/nvcomp:ro
+    # Host-path libraries the fork builds link against and the image lacks.
+    - ${ETERNIA_CUDNN_DIR:-/usr/lib/x86_64-linux-gnu}:/cudnn:ro
+    - ${ETERNIA_CUSZP_DIR:-/usr/lib/x86_64-linux-gnu}:/cuszp:ro
+    - ${ETERNIA_CONDA_LIB:-/usr/lib/x86_64-linux-gnu}:/condalib:ro
+  working_dir: /workspace
+  environment: &node-env
+    NVIDIA_VISIBLE_DEVICES: all
+    NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    CLIO_NUM_CONTAINERS: 4
+    CLIO_SERVER_CONF: /workspace/context-transfer-engine/adapter/gpu_vector/test/workloads/cluster_conf.yaml
+    ETERNIA_DONE_FILE: /workspace/.eternia_cluster_done
+    ETERNIA_NODE_TIMEOUT: ${ETERNIA_NODE_TIMEOUT:-1800}
+    # clio-inst FIRST: the workloads are linked against the GPU-enabled
+    # install, and the repo's build/ is a CPU-only build of the same
+    # libraries. With build/ first the workload resolves against it and dies
+    # on an undefined GPU symbol. All four nodes therefore use one build.
+    LD_LIBRARY_PATH: /sp/clio-inst/lib:/sp/lbann-deps/lib:/cuszp:/cudnn:/condalib:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu/nvcomp/13:/usr/local/lib
+
+services:
+  # Bootstrap peer: starts immediately so there is something to join.
+  wl-node1:
+    <<: *node
+    container_name: wl-node1
+    hostname: wl-node1
+    mem_limit: 8g
+    networks:
+      wl-cluster: { ipv4_address: 172.23.0.10 }
+    environment:
+      <<: *node-env
+      NODE_ID: 1
+      NODE_IP: 172.23.0.10
+    command: ["sh", "-c", "exec /sp/eternia_cluster_node"]
+    entrypoint: []
+
+  wl-node2:
+    <<: *node
+    container_name: wl-node2
+    hostname: wl-node2
+    mem_limit: 8g
+    networks:
+      wl-cluster: { ipv4_address: 172.23.0.11 }
+    environment:
+      <<: *node-env
+      NODE_ID: 2
+      NODE_IP: 172.23.0.11
+    command:
+      - bash
+      - -c
+      - >-
+        for i in $$(seq 1 $${ETERNIA_PEER_WAIT:-900}); do
+        (echo > /dev/tcp/172.23.0.10/9423) 2>/dev/null && break;
+        sleep 1; done;
+        sleep 3;
+        exec /sp/eternia_cluster_node
+
+  wl-node3:
+    <<: *node
+    container_name: wl-node3
+    hostname: wl-node3
+    mem_limit: 8g
+    networks:
+      wl-cluster: { ipv4_address: 172.23.0.12 }
+    environment:
+      <<: *node-env
+      NODE_ID: 3
+      NODE_IP: 172.23.0.12
+    command:
+      - bash
+      - -c
+      - >-
+        for i in $$(seq 1 $${ETERNIA_PEER_WAIT:-900}); do
+        (echo > /dev/tcp/172.23.0.10/9423) 2>/dev/null && break;
+        sleep 1; done;
+        sleep 6;
+        exec /sp/eternia_cluster_node
+
+  # The workload. Waits for all three peers to report ready, runs, then drops
+  # the done file so the peers exit instead of idling to their timeout. The
+  # done file is written even on failure -- otherwise a failing workload costs
+  # a full timeout on three containers.
+  wl-node4:
+    <<: *node
+    container_name: wl-node4
+    hostname: wl-node4
+    mem_limit: ${ETERNIA_WORKLOAD_MEM:-24g}
+    networks:
+      wl-cluster: { ipv4_address: 172.23.0.13 }
+    environment:
+      <<: *node-env
+      NODE_ID: 4
+      NODE_IP: 172.23.0.13
+    command:
+      - bash
+      - -c
+      - |
+        rm -f "$${ETERNIA_DONE_FILE}"
+        for i in $$(seq 1 $${ETERNIA_PEER_WAIT:-900}); do
+          n=$$(ls /workspace/.eternia_peer_ready.* 2>/dev/null | wc -l)
+          [ "$$n" -ge 3 ] && break
+          sleep 1
+        done
+        n=$$(ls /workspace/.eternia_peer_ready.* 2>/dev/null | wc -l)
+        echo "[node4] peers ready: $$n"
+        if [ "$$n" -lt 3 ]; then
+          echo "[node4] refusing to run: only $$n peer(s) ready, this would not be a cluster run"
+          touch "$${ETERNIA_DONE_FILE}"
+          exit 3
+        fi
+        ${ETERNIA_WORKLOAD_CMD:?set ETERNIA_WORKLOAD_CMD}
+        rc=$$?
+        touch "$${ETERNIA_DONE_FILE}"
+        exit $$rc
+
+networks:
+  wl-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.23.0.0/24

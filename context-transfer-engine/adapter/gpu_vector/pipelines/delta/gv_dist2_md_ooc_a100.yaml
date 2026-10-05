@@ -1,0 +1,139 @@
+# lammps_md ALONE, 2 NODES, OUT OF CORE -- ABOVE THE PIN FLOOR.
+#
+# Split out of gv_dist2_halfcache_a100.yaml because lammps_md is the one
+# workload of the six that a half-size cache does not simply slow down: at
+# job 21718877 it ABORTED, on both nodes, with
+#
+#   [gpu_vector] DEVICE FATAL 5 (AllocatePage: set full)
+#   [gpu_vector] FATAL set=1 full for page 17: 0 of 129 frames pinned, 1 in
+#                flight. Freeing space in another set cannot help -- this
+#                page's home is fixed by the hash.
+#   [gpu_vector] all sets: 20 resident (14 pinned, 14 fetching, 6 flushing),
+#                2044 empty tags; 0 of 20 regions on free lists
+#   CUDA Error 719: unspecified launch failure  ->  terminate called
+#
+# WHY THAT DECK COULD NOT HAVE WORKED. These kernels PIN 28 FRAMES AT ONCE,
+# and the bench says so and silently raises anything lower:
+#
+#   note: --slots 16 is below the 28 frames these kernels pin at once;
+#         raising to 28
+#
+# The deck there was lattice 108 / 16 blocks, which gives a block a span of
+# 4 z-planes = 32 pages. So the cache could not be halved at all -- the
+# floor of 28 against a span of 32 is 0.875x, essentially resident, and the
+# run still died because the cache is SET-ASSOCIATIVE: a page's home set is
+# fixed by its hash, so a set can fill while 2044 tags sit empty. Asking for
+# half of 32 was asking for 16, and 16 was never going to be honoured.
+#
+# WHAT THIS FILE CHANGES: FOUR BLOCKS, NOT SIXTEEN. A node owns 32 z-planes
+# of 8 pages; at 4 blocks each block sweeps 8 planes and the force pass
+# reads z-1..z+1 around them, so the span is 10 planes = 80 pages. Half is
+# 40 -- comfortably ABOVE the 28-frame pin floor, so `--slots 40` is the
+# value the bench actually runs with rather than one it overrides.
+#
+#   span 80 pages  ->  cache 40 slots  ->  a real 0.5x, honoured as written
+#
+# ANSWERED, AND THEN FIXED. The 4-block cell passed (12848 faults / 12784
+# evicts, all gates), which placed the fault in the bench rather than in the
+# paged vector -- and the bug was one line. kMinSlotsX (28) was enforced on
+# a LOCAL copy of the slot count while the REGION capacity was clamped by
+# the raw `a.slots`, so `--slots 16` printed "raising to 28" and then built
+# a 20-frame pool. See the note at clio_lammps_md_paged_bench.cc:864.
+#
+# THIS FILE IS NOW THE REGRESSION PAIR for that fix:
+#
+#   cell 1  16 blocks, --slots 16   THE EXACT DECK THAT ABORTED (job
+#                                   21718877). Pre-fix it built 20 regions
+#                                   and died in AllocatePage; post-fix
+#                                   a.slots carries the floor, so the pool
+#                                   is ceil(28/20)*20 = 40 and the run must
+#                                   reach NVE GATE: PASS.
+#   cell 2  4 blocks,  --slots 40   The control that already passed. It
+#                                   never went near the floor, so the fix
+#                                   must leave it exactly where it was --
+#                                   40 regions, gates green.
+#
+# Cell 1 is the one that proves the fix; cell 2 is what catches the fix
+# breaking the path that already worked.
+#
+# FOUR BLOCKS IS SLOW, and that is the cost of the geometry: 4 blocks on 108
+# SMs, at 5.04M atoms. --steps 4 keeps it inside the cap; the question here
+# is completion, not throughput, so the step count is the smallest one that
+# still runs the integration loop and its halo exchange several times.
+#
+# RESUME: rm -rf $HOME/gv_pipeline_results/dist2_md_ooc before a fresh run.
+#
+# Submit:  jarvis ppl submit gv_dist2_md_ooc_a100.yaml
+
+scheduler:
+  name: slurm
+  account: bekn-delta-gpu
+  partition: gpuA100x4
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 16
+  mem: 60g
+  gpus_per_node: 1
+  time: "00:10:00"
+  job_name: gv_dist2_mdooc
+  output: /u/llogan/gv_job_logs/gv_dist2_mdooc-%j.out
+  error: /u/llogan/gv_job_logs/gv_dist2_mdooc-%j.err
+  pre_cmds:
+    - "source /u/llogan/clio-core/context-transfer-engine/adapter/gpu_vector/pipelines/delta/env.sh"
+    - "scontrol show hostnames \"$SLURM_JOB_NODELIST\""
+
+config:
+  name: gv_dist2_md_ooc_a100
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_gv_workload
+      pkg_name: wl
+      workload: lammps_md
+      variant: paged
+      nodes: 2
+      node_launcher: "srun -N {n} --ntasks-per-node=1 --gpus-per-node=1"
+      hostfile: /u/llogan/.ppi-jarvis/shared/gv_dist2_md_ooc_a100/hostfile.txt
+      cluster_port: 9433
+      threads: 256
+      prefault: "0"
+      # One cell in a 600 s wall, so the cap is generous. A run still going
+      # at 300 s is hung.
+      timeout_sec: 300
+      barrier_sec: 120
+      output_dir: /tmp/clio_gv/dist2_md_ooc
+      # nb MUST BE A MULTIPLE OF 32 at a 256 KB page: a z-plane is
+      # nb^2 x 512 B and the slab seam has to land on a page boundary or a
+      # halo refresh overwrites this node's own live elements, silently.
+      # lattice 108 -> nb=64 -> a 2 MB plane = exactly 8 pages.
+      lattice: 108
+      page_kb: 256
+      steps: 4
+      ram_mb: 8192
+
+vars:
+  # Zipped: cell 1 is the abort repro, cell 2 the already-passing control.
+  wl.blocks: [16, 4]
+  wl.slots:  [16, 40]
+
+loop:
+  - [wl.blocks, wl.slots]
+
+repeat: 1
+output: "${HOME}/gv_pipeline_results/dist2_md_ooc"
+
+post: |
+  import pandas as pd, os
+  df = pd.read_csv(os.path.join(output_dir, 'results.csv'))
+  cols = [c for c in ['wl.blocks', 'wl.slots', 'nodes', 'nodes_finished', 'completed',
+                      'gates_pass', 'crashed', 'ms_per_step', 'runtime',
+                      'faults', 'evicts', 'get_errors', 'put_errors']
+          if c in df.columns]
+  logger.info('\n' + df[cols].to_string(index=False))
+  for _, r in df.iterrows():
+      tag = 'blocks=%s slots=%s' % (r.get('wl.blocks'), r.get('wl.slots'))
+      if r.get('crashed') == 1:
+          logger.warning('%s CRASHED -- the slot-floor fix did not take; '
+                         'check the banner for the region count' % tag)
+      elif r.get('completed') != 1:
+          logger.warning('%s DID NOT COMPLETE inside the 300 s cap' % tag)
+      else:
+          logger.info('%s OK out-of-core at 2 nodes' % tag)

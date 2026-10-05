@@ -36,6 +36,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+
+#if defined(__x86_64__) && defined(__GNUC__)
+#include <immintrin.h>
+#define SAFE_BDEV_GF_HAVE_X86 1
+#endif
 
 /**
  * Arithmetic over the Galois field GF(2^8).
@@ -116,18 +122,100 @@ inline uint8_t GfDiv(uint8_t a, uint8_t b) {
  * This is the inner loop of both encoding (parity = sum of scaled data) and
  * decoding (data = sum of scaled survivors).
  */
+/**
+ * Split-nibble tables for one coefficient: coeff * x = lo[x & 15] ^
+ * hi[x >> 4] (multiplication distributes over XOR).
+ */
+struct GfNibbleTables {
+  alignas(16) uint8_t lo[16];
+  alignas(16) uint8_t hi[16];
+};
+
+/**
+ * Build the split-nibble tables for `coeff`.
+ * @param coeff the multiplier
+ * @param t receives the tables
+ */
+inline void GfBuildNibbleTables(uint8_t coeff, GfNibbleTables *t) {
+  for (int x = 0; x < 16; ++x) {
+    t->lo[x] = GfMul(coeff, static_cast<uint8_t>(x));
+    t->hi[x] = GfMul(coeff, static_cast<uint8_t>(x << 4));
+  }
+}
+
+#ifdef SAFE_BDEV_GF_HAVE_X86
+/**
+ * dst ^= coeff * src for the first (len & ~15) bytes, 16 at a time with
+ * PSHUFB table lookups (SSSE3).
+ * @param dst accumulator
+ * @param src source
+ * @param t the coefficient's nibble tables
+ * @param len bytes (only whole 16-byte blocks are processed)
+ * @return bytes processed
+ */
+__attribute__((target("ssse3"))) inline size_t GfMulAddRegionSsse3(
+    uint8_t *dst, const uint8_t *src, const GfNibbleTables &t, size_t len) {
+  const __m128i lo = _mm_load_si128(reinterpret_cast<const __m128i *>(t.lo));
+  const __m128i hi = _mm_load_si128(reinterpret_cast<const __m128i *>(t.hi));
+  const __m128i mask = _mm_set1_epi8(0x0f);
+  size_t i = 0;
+  for (; i + 16 <= len; i += 16) {
+    const __m128i v =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(src + i));
+    const __m128i l = _mm_shuffle_epi8(lo, _mm_and_si128(v, mask));
+    const __m128i h =
+        _mm_shuffle_epi8(hi, _mm_and_si128(_mm_srli_epi64(v, 4), mask));
+    __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i *>(dst + i));
+    d = _mm_xor_si128(d, _mm_xor_si128(l, h));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(dst + i), d);
+  }
+  return i;
+}
+
+/** @return true when the CPU has SSSE3 (checked once). */
+inline bool GfHaveSsse3() {
+  static const bool have = __builtin_cpu_supports("ssse3");
+  return have;
+}
+#endif
+
+/**
+ * Region multiply-accumulate: dst[i] ^= coeff * src[i] for i in [0, len).
+ * This is the inner loop of both encoding (parity = sum of scaled data) and
+ * decoding (data = sum of scaled survivors). Split-nibble lookups, 16 bytes
+ * per instruction with SSSE3: the scalar log/exp loop made every degraded
+ * read and write of a two-disks-down array CPU-bound enough to stall the
+ * runtime's workers for minutes (#1147).
+ * @param dst accumulator
+ * @param src source
+ * @param coeff multiplier
+ * @param len bytes
+ */
 inline void GfMulAddRegion(uint8_t *dst, const uint8_t *src, uint8_t coeff,
                            size_t len) {
   if (coeff == 0) {
     return;
   }
-  const GfTables &t = GfTablesInstance();
-  const int log_c = static_cast<int>(t.log[coeff]);
-  for (size_t i = 0; i < len; ++i) {
-    uint8_t s = src[i];
-    if (s != 0) {
-      dst[i] ^= t.exp[log_c + static_cast<int>(t.log[s])];
+  size_t i = 0;
+  if (coeff == 1) {
+    for (; i + 8 <= len; i += 8) {
+      uint64_t a, b;
+      std::memcpy(&a, dst + i, 8);
+      std::memcpy(&b, src + i, 8);
+      a ^= b;
+      std::memcpy(dst + i, &a, 8);
     }
+    for (; i < len; ++i) dst[i] ^= src[i];
+    return;
+  }
+  GfNibbleTables t;
+  GfBuildNibbleTables(coeff, &t);
+#ifdef SAFE_BDEV_GF_HAVE_X86
+  if (GfHaveSsse3()) i = GfMulAddRegionSsse3(dst, src, t, len);
+#endif
+  for (; i < len; ++i) {
+    const uint8_t v = src[i];
+    dst[i] ^= static_cast<uint8_t>(t.lo[v & 15] ^ t.hi[v >> 4]);
   }
 }
 
