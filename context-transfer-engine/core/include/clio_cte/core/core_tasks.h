@@ -4808,7 +4808,12 @@ struct GetBlobSizeTask : public clio::run::Task {
   IN clio::run::priv::string blob_name_;  // Blob name (required)
   IN int replica_;                  // 0 = primary; N > 0 = replica N's size
                                     // (issue #886; absent replica = error)
-  OUT clio::run::u64 size_;               // Blob size in bytes
+  OUT clio::run::u64 size_;               // LOGICAL blob size in bytes: the
+                                          // bytes stored plus lost_bytes_
+  // Bytes of the primary a restart lost (BlobInfo::lost_bytes_, #1163):
+  // reads into [size_ - lost_bytes_, size_) fail; a copy of the blob must be
+  // built from a replica (#1164). 0 for replicas and healthy primaries.
+  OUT clio::run::u64 lost_bytes_;
 
   // SHM constructor
   GetBlobSizeTask()
@@ -4816,7 +4821,8 @@ struct GetBlobSizeTask : public clio::run::Task {
         tag_id_(TagId::GetNull()),
         blob_name_(CLIO_PRIV_ALLOC),
         replica_(0),
-        size_(0) {}
+        size_(0),
+        lost_bytes_(0) {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit GetBlobSizeTask(const clio::run::TaskId &task_id,
@@ -4829,7 +4835,8 @@ struct GetBlobSizeTask : public clio::run::Task {
         tag_id_(tag_id),
         blob_name_(CLIO_PRIV_ALLOC, blob_name),
         replica_(replica),
-        size_(0) {
+        size_(0),
+        lost_bytes_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kGetBlobSize;
@@ -4852,7 +4859,7 @@ struct GetBlobSizeTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(size_);
+    ar(size_, lost_bytes_);
   }
 
   /**
@@ -4865,6 +4872,7 @@ struct GetBlobSizeTask : public clio::run::Task {
     blob_name_ = other->blob_name_;
     replica_ = other->replica_;
     size_ = other->size_;
+    lost_bytes_ = other->lost_bytes_;
   }
 
   /**
@@ -4887,6 +4895,7 @@ struct GetBlobSizeTask : public clio::run::Task {
     // owner's size for one replica and for many.
     if (replica->size_ > size_) {
       size_ = replica->size_;
+      lost_bytes_ = replica->lost_bytes_;  // travels with the owner's answer
     }
   }
 };

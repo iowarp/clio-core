@@ -11037,7 +11037,13 @@ clio::run::TaskResume Runtime::GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask
       task->return_code_ = 1;
       CLIO_CO_RETURN;
     } else {
-      task->size_ = blob_info_ptr->GetTotalSize();
+      // The LOGICAL size: what is stored plus what a restart lost (#1163).
+      // A caller that copies the blob must size its copy from this and read
+      // through the lost range -- which fails and is served from a replica
+      // -- rather than build a shorter copy that it then believes complete
+      // (#1164). The split is reported so a heal can see what is stored.
+      task->size_ = blob_info_ptr->GetTotalSize() + blob_info_ptr->lost_bytes_;
+      task->lost_bytes_ = blob_info_ptr->lost_bytes_;
     }
 
     // Step 3: Update timestamps and log telemetry

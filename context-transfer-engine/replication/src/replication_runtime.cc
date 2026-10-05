@@ -643,8 +643,12 @@ clio::run::TaskResume Runtime::HealPrimaryFromRemote(
   {
     auto st = cte->AsyncGetBlobSize(tag_id, blob_name, at, 0);
     CLIO_CO_AWAIT(st);
-    if (st->GetReturnCode() != 0 || st->size_ < end) CLIO_CO_RETURN;
-    remote_size = st->size_;
+    // The copy's STORED bytes: a remote copy that itself lost a tail in a
+    // restart cannot heal anyone past what it holds.
+    if (st->GetReturnCode() != 0 || st->size_ - st->lost_bytes_ < end) {
+      CLIO_CO_RETURN;
+    }
+    remote_size = st->size_ - st->lost_bytes_;
   }
   // Under the blob's write token: the re-cache re-reads the remote copy and
   // must not land over a write that refills the primary meanwhile.
@@ -654,7 +658,7 @@ clio::run::TaskResume Runtime::HealPrimaryFromRemote(
     auto ps = cte->AsyncGetBlobSize(tag_id, blob_name,
                                     clio::run::PoolQuery::Local(), 0);
     CLIO_CO_AWAIT(ps);
-    if (!(ps->GetReturnCode() == 0 && ps->size_ >= end)) {
+    if (!(ps->GetReturnCode() == 0 && ps->size_ - ps->lost_bytes_ >= end)) {
       clio::run::u64 recached = 0;
       CLIO_CO_AWAIT(RecachePrimary(tag_id, blob_name, 0, remote_size,
                                    recached, at));
@@ -696,12 +700,14 @@ clio::run::TaskResume Runtime::GetBlob(
     //    still hits for ranges inside it. Forwarding the ORIGINAL task
     //    keeps vectored segments, flags and OUT-context reporting intact.
     clio::run::u64 primary_size = 0;
+    clio::run::u64 primary_lost = 0;  // bytes a restart took (#1163)
     {
       auto size_task = cte->AsyncGetBlobSize(task->tag_id_, blob_name,
                                              clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(size_task);
       if (size_task->GetReturnCode() == 0) {
-        primary_size = size_task->size_;
+        primary_size = size_task->size_;  // logical: stored + lost
+        primary_lost = size_task->lost_bytes_;
       }
     }
     bool primary_unreadable = false;
@@ -799,7 +805,7 @@ clio::run::TaskResume Runtime::GetBlob(
                                         clio::run::PoolQuery::Local(), 0);
         CLIO_CO_AWAIT(ps);
         // A writer refilled (or rewrote) the primary meanwhile: keep it.
-        if (!(ps->GetReturnCode() == 0 && ps->size_ >= end)) {
+        if (!(ps->GetReturnCode() == 0 && ps->size_ - ps->lost_bytes_ >= end)) {
           CLIO_CO_AWAIT(RecachePrimary(task->tag_id_, blob_name, r, rep_size,
                                        recached));
         }
@@ -824,7 +830,10 @@ clio::run::TaskResume Runtime::GetBlob(
       clio::run::u32 remote_c = 0;
       CLIO_CO_AWAIT(ReadRemoteCopy(task, remote, &remote_c));
       if (remote) {
-        if (!primary_unreadable) {
+        // Heal unless the primary's DEVICE is gone: a primary that merely
+        // lost bytes in a restart (reported as unreadable for the lost
+        // range) sits on a healthy device and takes the copy back.
+        if (!primary_unreadable || primary_lost != 0) {
           CLIO_CO_AWAIT(HealPrimaryFromRemote(task->tag_id_, blob_name,
                                               remote_c, end));
         }
