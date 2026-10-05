@@ -14,6 +14,8 @@ than max_failures members. Beyond that, reads may FAIL (EIO) but must never
 return wrong bytes.
 """
 
+import os
+import random
 import threading
 import time
 
@@ -584,6 +586,66 @@ def t_two_nodes_down(ctx):
   _check_filesets(ctx, base2, n, nfiles2, logs2, replies2,
                   'after a crash restart, for the writers started after the '
                   'return')
+
+
+@test('safe_chaos_disks_and_nodes', 'safe', min_nodes=3,
+      redeploy_after=True, timeout=5400)
+def t_chaos_disks_and_nodes(ctx):
+  """Random faults in a loop under fsynced record writers: a disk dies in
+  some node's array (never past max_failures per array), a dead disk comes
+  back or is replaced and rebuilt, a node is SIGKILLed or stopped and
+  brought back -- six rounds, in an order drawn from CLIO_SUITE_CHAOS_SEED
+  (default 7), so a failing run can be repeated. No array ever loses more
+  than it can cover, so every fsynced version must read back intact at the
+  end and after a crash restart of the whole cluster."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('ch')
+  ctx.ok(0, 'mkdir', path=base)
+  rng = random.Random(int(os.environ.get('CLIO_SUITE_CHAOS_SEED', '7')))
+  down = {h: set() for h in cl.hosts}      # members the array cannot use
+  replaced = {h: set() for h in cl.hosts}  # members rebuilt onto new disks
+  th, replies, logs, nfiles = _writers(ctx, base, 600, 'chaos')
+  time.sleep(20)
+  events = []
+  for rnd in range(6):
+    h = rng.choice(cl.hosts)
+    roll = rng.random()
+    if roll < 0.45 and len(down[h]) < SAFE_PARITY:
+      k = rng.choice([k for k in range(SAFE_MEMBERS)
+                      if k not in down[h] and k not in replaced[h]])
+      cl.kill_disk(h, k)
+      down[h].add(k)
+      events.append([rnd, h, 'kill_disk', k])
+    elif roll < 0.65 and down[h]:
+      k = rng.choice(sorted(down[h]))
+      if rng.random() < 0.5:
+        # The device answers again; the array keeps it faulty (its contents
+        # are stale), so it still counts against the budget.
+        cl.revive_disk(h, k)
+        events.append([rnd, h, 'revive_disk', k])
+      else:
+        rc, out = cl.replace_disk(h, k, gen=1 + len(replaced[h]))
+        ctx.check(rc == 0, f'round {rnd}: rebuild of member {k} on {h} '
+                           f'failed: {str(out)[-300:]}')
+        down[h].discard(k)
+        replaced[h].add(k)
+        events.append([rnd, h, 'replace_disk', k])
+    else:
+      crash = rng.random() < 0.5
+      _bounce(ctx, h, crash=crash, down_s=15)
+      events.append([rnd, h, 'crash' if crash else 'stop'])
+    ctx.note(f'round {rnd}: {events[-1]}')
+    time.sleep(45)
+  ctx.metrics['events'] = events
+  th.join(timeout=600 + 1200)
+  ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after six rounds of random disk and node faults')
+  restart_cluster(ctx, crash=True)
+  ctx.cl.agents.clear()
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after a crash restart following the chaos rounds')
 
 
 @test('safe_rolling_restart_degraded', 'safe', min_nodes=2,
