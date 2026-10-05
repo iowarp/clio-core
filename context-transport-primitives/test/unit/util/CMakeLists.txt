@@ -21,6 +21,15 @@ target_link_libraries(test_numbers_exec
         clio_ctp_host
         Catch2::Catch2)
 
+add_executable(test_formatter_exec
+        ${TEST_MAIN}/main.cc
+        test_init.cc
+        test_formatter.cc)
+add_dependencies(test_formatter_exec clio_ctp_host)
+target_link_libraries(test_formatter_exec
+        clio_ctp_host
+        Catch2::Catch2)
+
 #------------------------------------------------------------------------------
 # Test Cases
 #------------------------------------------------------------------------------
@@ -30,14 +39,18 @@ add_test(NAME ctp_config_parse COMMAND
 add_test(NAME ctp_numbers COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_numbers_exec)
 
+add_test(NAME ctp_formatter COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_formatter_exec)
+
 # Skip under MSan: uses precompiled Catch2 (FatalConditionHandler/sigaction
 # false positives) and yaml-cpp (uninstrumented) for config parsing.
-# ctp_numbers uses the same Catch2 harness, producing identical sigaction
-# false positives even though the tested code is pure arithmetic.
-set_tests_properties(
+# ctp_numbers and ctp_formatter use the same Catch2 harness, producing
+# identical sigaction false positives even though the tested code is pure.
+set_property(TEST
   ctp_config_parse
   ctp_numbers
-  PROPERTIES LABELS "msan_skip"
+  ctp_formatter
+  APPEND PROPERTY LABELS "msan_skip"
 )
 
 #------------------------------------------------------------------------------
@@ -46,6 +59,7 @@ set_tests_properties(
 install(TARGETS
         test_config_parse_exec
         test_numbers_exec
+        test_formatter_exec
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
