@@ -1521,6 +1521,18 @@ private:
                                      const std::string &blob_name);
 
   /**
+   * The code for a blob this container does not have (#1166): 1 ("no such
+   * blob") when that is authoritative -- the blob's owner is this container,
+   * or alive to be asked -- and kBlobOwnerDownRc when the owner's node is
+   * down and this container only stands in for it: it holds no copy (the
+   * successor that holds the copies is down too), so the blob may well
+   * exist, and a reader must not treat the miss as an absence.
+   * @param tag_id the blob's tag
+   * @param blob_name its name
+   * @return 1 or kBlobOwnerDownRc
+   */
+  clio::run::u32 NotFoundRc(const TagId &tag_id, const std::string &blob_name);
+  /**
    * Whether this container lists / counts a blob: always its own; a shadow
    * copy only while it stands in for the copy's dead owner.
    * @param blob_info the blob

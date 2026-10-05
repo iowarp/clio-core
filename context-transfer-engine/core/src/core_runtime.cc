@@ -3311,17 +3311,23 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // blob succeed with the caller's buffer untouched, so a pager does not
     // have to tell "missing" apart from "read failed" itself.
     if (blob_info_ptr == nullptr) {
-      if (task->context_.create_on_get_) {
+      const clio::run::u32 miss_rc = NotFoundRc(tag_id, blob_name);
+      if (task->context_.create_on_get_ && miss_rc == 1) {
         // Bind the name so a later put has something to extend; the read
-        // itself returns success with the caller's buffer untouched.
+        // itself returns success with the caller's buffer untouched. Not
+        // while standing in for the blob's dead owner without its copies:
+        // the blob may exist there, and a fresh one here would read as
+        // zeros for it (#1166).
         CreateNewBlob(blob_name, tag_id, 0.5f);
         task->return_code_ = 0;
         clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
         CLIO_CO_RETURN;
       }
-      task->return_code_ = 1;
+      // Not found -- or unknowable, while this container stands in for the
+      // blob's dead owner without its copies (#1166).
+      task->return_code_ = miss_rc;
       clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
-  CLIO_CO_RETURN;
+      CLIO_CO_RETURN;
     }
 
     // Replica-targeted read (issue #886): Context::replica_ == N > 0 serves
@@ -11010,7 +11016,9 @@ clio::run::TaskResume Runtime::GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask
     // Step 1: Check if blob exists
     std::shared_ptr<BlobInfo> blob_info_ptr = CheckBlobExists(blob_name, tag_id);
     if (blob_info_ptr == nullptr) {
-      task->return_code_ = 1;  // Blob not found
+      // Not found -- or unknowable, while this container stands in for the
+      // blob's dead owner without its copies (#1166).
+      task->return_code_ = NotFoundRc(tag_id, blob_name);
       CLIO_CO_RETURN;
     }
 
@@ -11401,6 +11409,20 @@ clio::run::TaskResume Runtime::TemporalSearch(
 // ==============================================================================
 // Helper Functions for Dynamic Scheduling
 // ==============================================================================
+
+clio::run::u32 Runtime::NotFoundRc(const TagId &tag_id,
+                                   const std::string &blob_name) {
+  auto *pm = CLIO_POOL_MANAGER;
+  const clio::run::PoolInfo *info = pm->GetPoolInfo(pool_id_);
+  const clio::run::u32 n = info != nullptr ? info->num_containers_ : 0;
+  if (n <= 1) return 1;
+  const clio::run::u32 owner = BlobHash(tag_id, blob_name) % n;
+  if (owner == container_id_ || ContainerNodeAlive(pool_id_, owner)) return 1;
+  // Standing in for the dead owner without its copies: unknowable here.
+  return FailoverContainer(pool_id_, owner) == container_id_
+             ? kBlobOwnerDownRc
+             : 1;
+}
 
 bool Runtime::ServesBlob(const BlobInfo &blob_info, const TagId &tag_id,
                          const std::string &blob_name) {

@@ -940,6 +940,14 @@ static constexpr clio::run::u32 kPutVersionMismatchRc = 61;
  * block must surface as an I/O error, never as zeros.
  */
 static constexpr clio::run::u32 kGetBlobIoErrorRc = 62;
+/**
+ * The blob's owner node is down and this container, standing in for it,
+ * holds no copy of the blob (#1166: the owner's successor, which holds the
+ * copies, is down too). Whether the blob exists cannot be known here.
+ * Distinct from 1 ("no such blob"), which is an authoritative absence that
+ * a reader may act on (a directory block that is not there, a hole).
+ */
+static constexpr clio::run::u32 kBlobOwnerDownRc = 63;
 
 /**
  * One replica of a blob's data (issue #886): an independent block list,

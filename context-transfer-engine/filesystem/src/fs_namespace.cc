@@ -332,7 +332,14 @@ clio::run::TaskResume Runtime::ExecInodeOp(clio::run::u32 op, const FsReq &req,
                                            FsResp &resp, int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
-  CLIO_CO_AWAIT(EnsureInode(req.id_));  // lazily loaded after a restart
+  int load_err = 0;
+  CLIO_CO_AWAIT(EnsureInode(req.id_, &load_err));  // lazily loaded after a restart
+  if (load_err != 0 && FindInode(req.id_) == nullptr) {
+    // The record is unreadable (its owner down with no copy here, #1166):
+    // nothing below may answer "no such inode" for it.
+    rc = load_err;
+    CLIO_CO_RETURN;
+  }
   switch (op) {
     case kShardInodeStat: {
       auto fi = FindInode(req.id_);

@@ -1040,8 +1040,13 @@ class Runtime : public clio::run::Container {
    * Make sure an inode this container homes is in memory: after a restart
    * inodes load lazily from their records.
    * @param packed inode id
+   * @param err if not null, receives EIO when the record could not be read
+   *        (its owner's node is down with no copy reachable, #1166; a lost
+   *        block; a malformed record) -- as opposed to no record existing,
+   *        which leaves it 0. A caller that finds no inode afterwards must
+   *        answer EIO, not ENOENT, when it is set.
    */
-  clio::run::TaskResume EnsureInode(clio::run::u64 packed);
+  clio::run::TaskResume EnsureInode(clio::run::u64 packed, int *err = nullptr);
   /**
    * Stat an inode: the home's own copy, else this container's cached copy,
    * else a fetch from the home (which registers this container for pushes).
