@@ -34,12 +34,12 @@ the reason.
 | 803 | fixed here | Baseline from dev CI: asan and ubsan 330/330, 0 tests with defects (3 runs); msan 13 with defects. asan/ubsan now gate on defects, failed tests or an incomplete run; msan stays a report. Gate logic checked against real dev logs + synthetic cases. |
 | 808 | fixed here | 4eeefd330: port guard probes every TCP state on base, base+1, base+3; start retry. Verified free/LISTEN/TIME-WAIT cases in the container. |
 | 809 | open | Root cause unknown; mitigation holds; macOS only. |
-| 848 | partly fixed on dev | RwLock (cebb678bb), DLL-copy race, detached_spawn fixed; Windows startup wedge remains. |
+| 848 | no longer occurring | Causes fixed on dev: RwLock reader/writer overlap (cebb678bb, #927), DLL-copy race, detached_spawn. The remaining startup-wedge signature ('inline retry exhausted' / 'RouteLocal returned 4') appears in 0 of the last 35 Windows CI runs; the only test failure in that window was cr_safe_bdev_disk_fail_tests on gpu-vector-rewrite, i.e. the #1156 YAML bug fixed here. |
 | 853 | fixed on dev | Cluster Tests run 37173255855 passes both steps. |
 | 856 | partly fixed on dev | PR #918; remaining SIGSEGV tracked in #929; needs the leader_elect docker harness. |
 | 863 | partly fixed on dev | Data-loss path fixed (756097c94); capacity drift never confirmed. |
 | 877 | in progress elsewhere | Asks 1 and 3 on dev; fail-closed ServerInit is uncommitted in the jaime-issues checkout (another agent). |
-| 882 | partly fixed on dev | Same startup-wedge class as #848. |
+| 882 | no longer occurring | Same window as #848: the icx (windows-2025) leg's only failure in 35 runs was cr_safe_bdev_disk_fail_tests (#1156 YAML, fixed here); no wedge, no flake. |
 | 893 | fixed on dev | 2d769d309. |
 | 896 | fixed on dev | fe21df453 (regression test not added; multi-node). |
 | 907 | open | Windows + WinFsp hang, no root cause. |
