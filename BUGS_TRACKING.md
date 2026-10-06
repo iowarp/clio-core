@@ -30,7 +30,7 @@ the reason.
 | 793 | fixed on dev | 4bafb3c68: GIL released around every RPC, `wait(max_sec)`. |
 | 794 | fixed here (tests) | 6ff6cb70c: tiered tests assert actual placement from SHM records. Locally 64/64 in DRAM, 64/96 on file then 96/96 back in RAM. CI `-E` exclusions left until a CI run confirms them. |
 | 796 | fixed here | 726a13ea9: WAL create/extend records carry a wall-clock stamp, snapshot entry type 6 carries times, restore converts to the new boot's steady clock. `cr_cli_cte_BlobTimes`: 0 hits without the fix, 2 in order with it. |
-| 800 | open (CI infra) | Mitigated 23% -> 7% by build retry; the lock holder is unidentified; needs a Windows CI diagnostic run. |
+| 800 | no longer occurring | Scanned the last 48 Windows CI runs (~264 builds): the BUILD-RETRY fired 6 times in 3 runs, and every one was a genuine compile error on gpu-vector-rewrite (setenv / unistd.h on MSVC), not a link lock; 0 link-lock failures vs ~9 expected at the issue's 3.6%/job rate. Holder never identified; Defender exclusions + retry remain in place. |
 | 803 | open (CI) | Findings summary landed (bcd773823), UBSan cast class fixed (#1094). Jobs still cannot fail (`|| true`, `exit 0`); gating needs a fresh sanitizer baseline. |
 | 808 | fixed here | 4eeefd330: port guard probes every TCP state on base, base+1, base+3; start retry. Verified free/LISTEN/TIME-WAIT cases in the container. |
 | 809 | open | Root cause unknown; mitigation holds; macOS only. |
