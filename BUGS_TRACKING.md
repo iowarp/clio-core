@@ -53,7 +53,7 @@ the reason.
 | 1000 | fixed on dev | 3c2f493de. |
 | 1028 | open | FUSE O_DIRECT/page-cache coherence; design-sized (#1060 §3.3). |
 | 1029 | open | Hypothesis: rmdir lacks the closer barrier; issue requires a CI-verified fix. |
-| 1030 | fixed on dev (likely) | bfae06809, 1ae09daef, 79b0b2ea5, 13ee44409; 20x acceptance loop pending. |
+| 1030 | fixed on dev | bfae06809, 1ae09daef, 79b0b2ea5, 13ee44409. Acceptance loop run here: `cte_replication_persist_integration` 20/20 passed. |
 | 1039 | not recurring | No coherence timeout on dev since 09-26. |
 | 1049 | fixed on dev | d1dbb516f + 297bf813a. |
 | 1050 | open | Windows + pytest crash, no repro on current dev. |
