@@ -19,7 +19,7 @@ import random
 import threading
 import time
 
-from cluster import SAFE_MEMBERS, SAFE_PARITY, AgentConn, parallel
+from cluster import SAFE_MEMBERS, SAFE_PARITY, AgentConn, parallel, sh
 from suite import TestFailure, test
 from tests_fault import restart_cluster
 from tests_stress import (CORRUPT, FILE_BLOCKS, FOREIGN, ZERO, _apply,
@@ -808,3 +808,119 @@ def t_tier_overflow_degraded(ctx):
   ctx.check(tally['mismatch'] == 0 and tally['corrupt'] == 0 and not bad,
             f'{tally["mismatch"]} blocks differ from the model '
             f'({tally["corrupt"]} CORRUPT/FOREIGN), e.g. {bad[:8]}')
+
+
+# ---------------------------------------------------------------------------
+# A dead disk swapped for a blank one while its node is down
+# ---------------------------------------------------------------------------
+def _log_tail_has(cl, host, needle, offset, wait_s=30):
+  """True if `host`'s runtime log contains needle AFTER byte `offset` (the
+  part written since the node was restarted); re-read for up to wait_s
+  seconds because the driver's NFS view lags the daemon's appends."""
+  deadline = time.time() + wait_s
+  while True:
+    try:
+      with open(cl.log_path(host, 'runtime'), errors='replace') as f:
+        f.seek(offset)
+        if needle in f.read():
+          return True
+    except OSError:
+      pass
+    if time.time() >= deadline:
+      return False
+    time.sleep(2)
+
+
+def _swap_member_blank(cl, host, k):
+  """Simulate the operator swapping failed member k of `host`'s array for a
+  blank drive while the node is down: the member's backing file, its
+  allocation log and the fault marker go away, so the file bdev recreates
+  an empty member with no superblock at the next start."""
+  m = cl.safe_member_path(k)
+  alog = m[:-len('.dat')] + '.alog'
+  rc, out = sh(host, f'rm -f {m} {m}.fail {alog} && ls {os.path.dirname(m)}',
+               timeout=60)
+  return rc, out
+
+
+@test('safe_disk_swapped_while_down', 'safe', min_nodes=2,
+      redeploy_after=True, timeout=5400)
+def t_disk_swapped_while_down(ctx):
+  """The operator's offline repair path. A data disk dies in node1's array
+  while every node writes fsynced record files; node1 is stopped
+  gracefully, the dead disk is swapped for a BLANK one while the node is
+  down (backing file, allocation log and fault marker gone, so the member
+  comes back empty and without a superblock), and node1 restarts. The
+  array must not seat the blank member as if it still held its column:
+  every fsynced version must read back intact (reconstructed from parity,
+  or after a rebuild onto the blank member), never zeros or corrupt bytes,
+  and the filesystem must take new writes. How the member was seated is
+  read from node1's log and recorded. A crash restart of the whole cluster
+  must then keep the data intact too."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  vi = 1 % n
+  victim = cl.hosts[vi]
+  base = ctx.p('sw')
+  ctx.ok(0, 'mkdir', path=base)
+  th, replies, logs, nfiles = _writers(ctx, base, 150, 'swap')
+  time.sleep(20)
+  cl.kill_disk(victim, 2)
+  time.sleep(20)
+  cl.unmount(victim)
+  cl.stop_runtime(victim)
+  log_off = os.path.getsize(cl.log_path(victim, 'runtime'))
+  rc, out = _swap_member_blank(cl, victim, 2)
+  ctx.check(rc == 0, f'blank swap of member 2 on {victim} failed: {out[-300:]}')
+  cl.start_runtime(victim)
+  ctx.check(cl.runtime_up(victim),
+            f'{victim} did not come back with the blank member seated')
+  time.sleep(3)
+  ctx.check(cl.mount(victim), f'{victim} remount failed after the swap')
+  cl.agents.pop(victim, None)
+  # How the array seated column 2 at this start (the member manifest is
+  # expected to keep it down until an explicit rebuild).
+  mp = cl.safe_member_path(2)
+  seated = 'unknown'
+  for needle, label in ((f"data column 2 ('{mp}') restored as down",
+                         'restored-down'),
+                        (f"initialized fresh member '{mp}'", 'fresh-active'),
+                        (f"re-attached member '{mp}'", 'reattached'),
+                        (f"REFUSING member '{mp}'", 'refused')):
+    if _log_tail_has(cl, victim, needle, log_off, wait_s=20):
+      seated = label
+      break
+  ctx.check(seated != 'fresh-active',
+            'the blank member was seated as an active data column: the '
+            'array would serve zeros for everything that lived on it')
+  ctx.metrics['blank_member_seated_as'] = seated
+  ctx.note(f'{victim} seated the blank member as: {seated}')
+  # The operator's next step: rebuild onto the blank disk IN PLACE (same
+  # path, same member pool). Record whether the tool supports that; the
+  # integrity checks below hold either way.
+  t0 = time.time()
+  rc, out = cl.rebuild_disk_inplace(victim, 2)
+  ctx.metrics['inplace_rebuild_rc'] = rc
+  ctx.metrics['inplace_rebuild_s'] = round(time.time() - t0, 1)
+  if rc != 0:
+    ctx.note(f'in-place rebuild onto the blank member refused: {out[-400:]}')
+  th.join(timeout=150 + 1200)
+  ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after a dead disk was swapped for a blank one offline')
+  if rc == 0:
+    # Redundancy is claimed back: max_failures OTHER members may now die
+    # and the rebuilt column must carry its share.
+    cl.kill_disk(victim, 0)
+    cl.kill_disk(victim, SAFE_MEMBERS - 1)
+    _check_filesets(ctx, base, n, nfiles, logs, replies,
+                    f'with {SAFE_PARITY} more members dead behind the '
+                    'in-place rebuild')
+  p = ctx.p('after_swap')
+  ctx.ok(vi, 'write_file', path=p, size=8 << 20, seed=17, fsync=True)
+  v = ctx.ok((vi + 1) % n, 'verify_file', path=p, size=8 << 20, seed=17)
+  ctx.check(v['ok'], f'write on the repaired node after the swap: {v}')
+  restart_cluster(ctx, crash=True)
+  cl.agents.clear()
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after the blank swap and a full crash restart')
