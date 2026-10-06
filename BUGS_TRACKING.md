@@ -22,7 +22,7 @@ the reason.
 | 597 | mostly fixed on dev | B1 d33aff8fb, B2 60f89b980/3e5126dbb, fsx 38a8174a4/ccc6328bf, mmap/timestamps/inode numbers landed. Left: exportfs (feature). |
 | 641 | obsolete | The fallback-runtime feature was removed; its tests only exist with `CLIO_CORE_ENABLE_RUNTIME_FALLBACK=ON`. Nothing to fix. |
 | 646 | fixed here | BuddyAllocator never merged adjacent free pages, so a mostly-free heap failed 1 MB requests (894 MB churn -> null). Now coalesces free pages before failing. All three hidden `[fuse_repro]` cases pass (also the ProducerConsumerAllocator one: 2910 nulls -> 0) and are un-hidden (~1 s). |
-| 706 | open (needs repro) | Partly explained (64 MB /dev/shm, over-subscribed tier per #794, reorganize rewrite 756097c94/879b47bb6); needs a fresh run in the constrained deps-cpu container. |
+| 706 | fixed on dev; CI exclusion dropped here | No longer reproduces in its own deterministic environment: deps-cpu, --cpus=2, 64 MB /dev/shm, all three affected tests 20x each = 60/60 pass (reorganize place-then-swap 756097c94 + #794 placement asserts). Linux exclusion removed; macOS exclusions kept (not verifiable here). |
 | 722 | fixed on dev | Bounded retry + drop + evict (d1dbb516f, 297bf813a). Log size cap is extra protection pending in the jaime-issues working tree. |
 | 725 | fixed on dev | 3d7554a15 (restore hardening), 297bf813a (fail-loud port cluster), 5f597ac99 (docs). |
 | 768 | fixed here (Linux-neutral) | Net worker lanes were registered before they existed (null), so EnqueueNetTask never woke the net worker. Fixed in f6cb94637. Linux PutGet/TCP unchanged (~2 ms/op both); the Windows tick-bound latency is not measured with the fix. |
