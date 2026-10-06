@@ -63,6 +63,14 @@ std::unique_ptr<ctp::AsyncIO> OpenBackingFile(clio::run::u32 io_depth,
  * @param to end of the new extent
  * @return 0, or the errno (ENOSPC when the disk cannot hold it). A
  *         filesystem without fallocate support keeps the sparse extent (0).
+ *
+ * Uses the fallocate(2) system call, not posix_fallocate(3): where the
+ * filesystem cannot preallocate (9p/drvfs, NFSv3, many FUSE filesystems)
+ * glibc's posix_fallocate does not report EOPNOTSUPP, it EMULATES the
+ * reservation by writing every block. That turned this call into writing the
+ * whole extent -- 1 GiB for a default bdev, ~155 s on a Docker Desktop bind
+ * mount -- synchronously on the runtime worker running the pool's Create or a
+ * PutBlob growth step (issue #1180). fallocate(2) fails fast there instead.
  */
 int ReserveFileSpace(const std::string &file_path, clio::run::u64 from,
                      clio::run::u64 to) {
@@ -70,10 +78,15 @@ int ReserveFileSpace(const std::string &file_path, clio::run::u64 from,
   if (to <= from) return 0;
   const int fd = open(file_path.c_str(), O_RDWR);
   if (fd < 0) return errno;
-  const int rc = posix_fallocate(fd, static_cast<off_t>(from),
-                                 static_cast<off_t>(to - from));
+  int rc = 0;
+  while (fallocate(fd, 0, static_cast<off_t>(from),
+                   static_cast<off_t>(to - from)) != 0) {
+    if (errno == EINTR) continue;
+    rc = errno;
+    break;
+  }
   close(fd);
-  if (rc == EOPNOTSUPP || rc == EINVAL) return 0;
+  if (rc == EOPNOTSUPP || rc == ENOSYS || rc == EINVAL) return 0;
   return rc;
 #else
   (void)file_path;
