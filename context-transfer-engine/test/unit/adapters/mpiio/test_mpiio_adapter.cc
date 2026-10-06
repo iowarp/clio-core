@@ -33,6 +33,10 @@ const std::string kClio = "clio::" + kBackend;
 bool initializeRuntime() {
   static bool initialized = false;
   if (initialized) return true;
+  // kBackend is the storage target's backing file: remove a stale one now,
+  // never once the target is up -- deleting a live device file loses every
+  // write made after it (the test cases used to do exactly that).
+  stdfs::remove(kBackend);
 
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
     INFO("Clio init failed");
@@ -67,7 +71,6 @@ bool initializeRuntime() {
 TEST_CASE("MPI-IO Adapter: independent write + read round-trip",
           "[mpiio][adapter]") {
   REQUIRE(initializeRuntime());
-  stdfs::remove(kBackend);
 
   MPI_File fh;
   int rc = MPI_File_open(MPI_COMM_SELF, kClio.c_str(),
@@ -90,13 +93,11 @@ TEST_CASE("MPI-IO Adapter: independent write + read round-trip",
   REQUIRE(r == w);
 
   REQUIRE(MPI_File_close(&fh) == MPI_SUCCESS);
-  stdfs::remove(kBackend);
 }
 
 TEST_CASE("MPI-IO Adapter: explicit-offset (read_at/write_at) ops",
           "[mpiio][adapter][offset]") {
   REQUIRE(initializeRuntime());
-  stdfs::remove(kBackend);
 
   MPI_File fh;
   REQUIRE(MPI_File_open(MPI_COMM_SELF, kClio.c_str(),
@@ -117,7 +118,6 @@ TEST_CASE("MPI-IO Adapter: explicit-offset (read_at/write_at) ops",
   REQUIRE(r == b);
 
   REQUIRE(MPI_File_close(&fh) == MPI_SUCCESS);
-  stdfs::remove(kBackend);
 }
 
 TEST_CASE("MPI-IO Adapter: bare path is not intercepted",
@@ -185,7 +185,6 @@ TEST_CASE("MPI-IO Adapter: status reports bytes actually transferred",
 TEST_CASE("MPI-IO Adapter: a failed write is reported at sync",
           "[mpiio][adapter][errors]") {
   REQUIRE(initializeRuntime());
-  stdfs::remove(kBackend);
 
   MPI_File fh;
   REQUIRE(MPI_File_open(MPI_COMM_SELF, kClio.c_str(),
@@ -215,7 +214,6 @@ TEST_CASE("MPI-IO Adapter: a failed write is reported at sync",
           MPI_SUCCESS);
   REQUIRE(MPI_File_sync(fh) == MPI_SUCCESS);
   REQUIRE(MPI_File_close(&fh) == MPI_SUCCESS);
-  stdfs::remove(kBackend);
 }
 
 /*
