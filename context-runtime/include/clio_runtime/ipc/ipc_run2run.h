@@ -163,6 +163,12 @@ struct OriginProgress {
   // PROBED: QueryTaskProgress is itself an admin cross-node task, so probing
   // admin origins would recurse (issue #896).
   bool probe_eligible = true;
+  // #1197: true from registration until SendIn has transmitted the last
+  // replica. A Gone verdict (dead node, probe) that lands meanwhile must not
+  // complete and release the origin under the sender's feet; it is parked in
+  // deferred_gone and applied by FinishOriginSend.
+  bool sending = false;
+  std::vector<clio::run::u32> deferred_gone;
 };
 
 /** A replica the origin is still waiting on, to be probed via QueryTaskProgress. */
@@ -555,6 +561,15 @@ class IpcManagerRun2Run {
    * excludes it from QueryTaskProgress probing (admin-pool origins: the probe
    * is itself an admin cross-node task and would recurse).
    */
+  /**
+   * Mark the origin's send as finished (#1197): clears OriginProgress::sending
+   * and applies every Gone verdict parked while the replicas were being
+   * transmitted. Called by SendIn after its last transmit, on the sending
+   * worker. A no-op when the origin already completed.
+   * @param net_key the origin's send_map_ key
+   */
+  void FinishOriginSend(size_t net_key);
+
   void RegisterOriginProgress(size_t net_key,
                               const std::vector<clio::run::u64> &replica_targets,
                               bool probe_eligible = true);

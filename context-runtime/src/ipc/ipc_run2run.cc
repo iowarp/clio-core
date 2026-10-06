@@ -48,6 +48,7 @@ extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/thread/thread_model_manager.h>
 
+#include <algorithm>
 #include <atomic>
 #include <unordered_set>
 #include <mutex>
@@ -296,7 +297,11 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
 
   if (fire_and_forget) {
     RecvOutCompleteOriginTask(send_map_key, origin_task);
+    return;
   }
+  // #1197: the origin may now be completed by probes and dead-node sweeps;
+  // apply any verdict that was parked while we were transmitting.
+  FinishOriginSend(send_map_key);
 }
 
 IpcManagerRun2Run::SendInPlan IpcManagerRun2Run::SendInPlanReplica(
@@ -980,6 +985,7 @@ void IpcManagerRun2Run::RegisterOriginProgress(
     // so the scan skips it and it never blocks completion.
     prog.replicas[i].accounted = (replica_targets[i] == kInvalidNodeId);
   }
+  prog.sending = true;  // #1197: cleared by FinishOriginSend
   std::lock_guard<std::mutex> lk(send_map_mutex_);
   if (send_map_.find(net_key) == nullptr) {
     // #1185: the origin already completed (ClaimOrigin erased it). Inserting
@@ -988,6 +994,23 @@ void IpcManagerRun2Run::RegisterOriginProgress(
   }
   prog.gen = ++progress_gen_;
   progress_map_[net_key] = std::move(prog);
+}
+
+void IpcManagerRun2Run::FinishOriginSend(size_t net_key) {
+  std::vector<clio::run::u32> deferred;
+  {
+    std::lock_guard<std::mutex> lk(send_map_mutex_);
+    auto it = progress_map_.find(net_key);
+    if (it == progress_map_.end()) {
+      return;  // already completed (fail-fast or a reply) and erased
+    }
+    it->second.sending = false;
+    deferred.swap(it->second.deferred_gone);
+  }
+  for (clio::run::u32 rid : deferred) {
+    HandleTaskProgressResult(static_cast<clio::run::u64>(net_key), rid,
+                             /*gone=*/true, /*gen=*/0);
+  }
 }
 
 clio::run::u64 IpcManagerRun2Run::ReplicaTargetNode(
@@ -1235,6 +1258,20 @@ void IpcManagerRun2Run::HandleTaskProgressResult(clio::run::u64 net_key,
              replica_id, net_key, rp.gone_strikes, kGoneStrikesToFail);
         return;
       }
+    }
+  }
+  // #1197: never complete an origin whose SendIn is still transmitting it --
+  // RecvOutCompleteOriginTask would clear its subtasks and EndTask it under
+  // the sender's feet. Park the verdict; FinishOriginSend applies it.
+  {
+    std::lock_guard<std::mutex> lk(send_map_mutex_);
+    auto pit = progress_map_.find(static_cast<size_t>(net_key));
+    if (pit != progress_map_.end() && pit->second.sending) {
+      auto &dg = pit->second.deferred_gone;
+      if (std::find(dg.begin(), dg.end(), replica_id) == dg.end()) {
+        dg.push_back(replica_id);
+      }
+      return;
     }
   }
   // Claim the accounting transition; bail if a real response already took it.
