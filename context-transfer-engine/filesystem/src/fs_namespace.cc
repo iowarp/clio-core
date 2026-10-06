@@ -764,10 +764,25 @@ clio::run::TaskResume Runtime::FlushNames() {
   }
   if (!batch.empty()) {
     // One broadcast per drain tick carries every change since the last one.
-    // A node that is down misses it and resyncs when it restarts.
+    // A node that is down misses it and resyncs when it restarts. A
+    // broadcast that fails outright is retried on the next ticks (#1182:
+    // a node's index missed a directory rename and nothing said why); the
+    // records carry their own stamps, so re-sending them is harmless.
     auto u = cte_.AsyncUpdateTagNames(batch,
                                       clio::run::PoolQuery::Broadcast(0.0f));
     CLIO_CO_AWAIT(u);
+    if (u->GetReturnCode() != 0) {
+      ++tn_flush_failures_;
+      HLOG(kWarning, "filesystem: tag-name broadcast of {} byte(s) failed "
+           "(rc {}); {} failure(s) so far, re-queued", batch.size(),
+           u->GetReturnCode(), tn_flush_failures_);
+      if (tn_flush_failures_ <= kNameFlushRetries) {
+        std::lock_guard<std::mutex> g(tn_mu_);
+        tn_batch_.insert(0, batch);  // ahead of what was published since
+      }
+    } else {
+      tn_flush_failures_ = 0;
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

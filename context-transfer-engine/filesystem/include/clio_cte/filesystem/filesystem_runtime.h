@@ -906,6 +906,10 @@ class Runtime : public clio::run::Container {
   // and broadcast in batches by the periodic drain.
   std::mutex tn_mu_;             ///< guards tn_batch_ (taken after ns_mu_)
   std::string tn_batch_;         ///< EncodeTagNameOp records not yet sent
+  /** Consecutive failed tag-name broadcasts; the batch is re-queued for up
+   *  to kNameFlushRetries of them (#1182). */
+  clio::run::u32 tn_flush_failures_ = 0;
+  static constexpr clio::run::u32 kNameFlushRetries = 30;
   bool catchup_pending_ = false; ///< restart: rebuild names on this node
   int catchup_attempts_ = 0;
   std::unordered_set<clio::run::u32> catchup_missing_;  ///< peers not yet heard
