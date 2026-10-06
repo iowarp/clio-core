@@ -26,7 +26,7 @@ the reason.
 | 722 | fixed on dev | Bounded retry + drop + evict (d1dbb516f, 297bf813a). Log size cap is extra protection pending in the jaime-issues working tree. |
 | 725 | fixed on dev | 3d7554a15 (restore hardening), 297bf813a (fail-loud port cluster), 5f597ac99 (docs). |
 | 768 | fixed here (Linux-neutral) | Net worker lanes were registered before they existed (null), so EnqueueNetTask never woke the net worker. Fixed in f6cb94637. Linux PutGet/TCP unchanged (~2 ms/op both); the Windows tick-bound latency is not measured with the fix. |
-| 791 | open (no repro) | Stale-cache measurement and alignment mismatch fixed on dev (7eac0527e, 7a76b4b1e); the exact 64 KiB residue is unexplained; Windows only. |
+| 791 | fixed on dev | 7eac0527e (fresh StatTargets before reading) + 7a76b4b1e (alloc/free alignment, #798). Native Windows Debug: cte_bdev_leak_stress_force_net 10/10. Windows CI on dev: last 5 runs x 7 jobs = 35 passes, 0 failed attempts (no retry masking). |
 | 793 | fixed on dev | 4bafb3c68: GIL released around every RPC, `wait(max_sec)`. |
 | 794 | fixed here (tests) | 6ff6cb70c: tiered tests assert actual placement from SHM records. Locally 64/64 in DRAM, 64/96 on file then 96/96 back in RAM. CI `-E` exclusions left until a CI run confirms them. |
 | 796 | fixed here | 726a13ea9: WAL create/extend records carry a wall-clock stamp, snapshot entry type 6 carries times, restore converts to the new boot's steady clock. `cr_cli_cte_BlobTimes`: 0 hits without the fix, 2 in order with it. |
