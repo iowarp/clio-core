@@ -64,6 +64,17 @@ the reason.
 | 1156 | fixed here | 4e93ca9d1: POSIX AIO EAGAIN (macOS request cap) completes synchronously; safe_bdev test YAML single-quoted for Windows. Test fails without the fix. ctest stays Linux-only until CI confirms macOS/Windows. |
 | 1160 | fixed here | Parity batching (5806605ca) was on dev; the stripe-aware allocation (7e554a96) and one-write-per-consecutive-blocks put (7f4a095d5) existed only on gpu-vector-rewrite and are cherry-picked here (cluster-measured by their author: 47 -> 50 MiB/s, slow-stripe phases roughly halved). Locally: safe_bdev / cte_core / tiered / sieve / leak-stress suites 30/30; safe-bdev docker smoke (write 32 MB via clio-fs, replace a member, recover, verify) PASSED. |
 | 1180 | diagnostics fixed here | 6c739c79e: the stall warning names every pool create in flight (name, module, age). Root cause still unknown (rare, 1/21). |
+| 1186 | fixed on branch bugfix/new-issues-1186 | 9fbe9d620: checkpoint pool id 566.0; static_assert test keeps CTE well-known ids distinct. |
+| 1187 | fixed on branch bugfix/new-issues-1186 | 700ed833d + db946b6f2: MPI-IO errors mapped to MPI classes, real MPI_File_sync, close reports latched errors, MPI_Status filled. Tests pass 6/6 (the earlier zero reads were the test deleting the live bdev file). |
+| 1188 | fixed on branch bugfix/new-issues-1186 | d60119322: SyncFd runs SyncTag/size/parent-dir sync (shared with FUSE). cfs_fsync_durable, cfs_shm_read, fuse_cte_*, fuse_ops pass. |
+| 1189 | fixed on branch bugfix/new-issues-1186 | 14a4319fc: one preset encoding, GetLibraryId model ids, real decompress time, model paths from YAML, dynamic mode in interposer PutBlob, kDecompress gated on transform flag. Test run standalone (libzfp SYCL init crashes in the devcontainer). |
+| 1190 | fixed on branch bugfix/new-issues-1186 | 14d2e34d1: CTE backing compiled, async UAF fixed with CUDA events, errors propagated, blobs deleted on destroy. GPU test passes (RTX 5080). |
+| 1191 | fixed on branch bugfix/new-issues-1186 | c45f55f93: cuFile offsets honored, descriptor copied, caller fd not closed, CMake target fixed. GPU test fails before / passes after. |
+| 1192 | needs maintainer decision | Reaper disabled deliberately in 7c37a1bed; re-enabling risks unmapping a dead client's segment mid-PutBlob and pid checks across pid namespaces. |
+| 1193 | fixed on branch bugfix/new-issues-1186 | b764fb4f0: append fsynced; replay sorted by time (per-file append order kept). Test cr_address_table_wal. |
+| 1194 | fixed on branch bugfix/new-issues-1186 | b28836d7c: Spack variants map to real CLIO_* options; adapters conflict with ~elf; CI asserts libclio_cte_posix.so. |
+| 1195 | fixed on branch bugfix/new-issues-1186 | 01775c5fb: conda variants use the release preset + IOWARP_CMAKE_ARGS; RPM license BSD-3-Clause; WRP_ flags renamed. |
+| 1197 | fixed on gpu-vector-rewrite | 32ed13bcb (PR #1198): Gone verdicts park until SendIn finishes transmitting. |
 
 ## Not bugs (features, designs, CI process)
 
