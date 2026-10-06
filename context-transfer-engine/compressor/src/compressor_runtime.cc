@@ -612,9 +612,13 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // allocates NeuroPress's prediction-reuse state for a run that cannot use it.
   // NeuroPress v2 when the path names an NNWT version-3 model (a v2 file, or
   // a directory holding model_v2.nnwt); v1 otherwise. Never both.
+  // With CLIO_HCOMPRESS_V2_SETTINGS=1 the v2 model is loaded beside
+  // HCompress for its setting table, prewarm and logs only: HCompress ranks
+  // the 45 settings (HCompressRankV2Settings) and the network never chooses.
   const bool np_v2 =
       !config_.neuropress_model_path_.empty() &&
-      config_.hcompress_model_path_.empty() &&
+      (config_.hcompress_model_path_.empty() ||
+       HCompressV2SettingsRequested()) &&
       config_.xgb_model_path_.empty() &&
       ctp::compress::model::NeuroPressV2Predictor::IsV2File(
           config_.neuropress_model_path_);
@@ -704,7 +708,13 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       CLIO_CO_RETURN;
     }
     hcompress_predictor_ = std::move(hc);
-    if (!config_.neuropress_model_path_.empty()) {
+    if (HCompressRanksV2()) {
+      HLOG(kWarning,
+           "HCompress ranks NeuroPress v2's {} settings "
+           "(CLIO_HCOMPRESS_V2_SETTINGS=1): the v2 model is loaded for its "
+           "setting table only and never chooses",
+           ctp::kGpuSettingCount);
+    } else if (!config_.neuropress_model_path_.empty()) {
       HLOG(kWarning,
            "Both hcompress_model_path and neuropress_model_path are set; "
            "HCompress chooses and NeuroPress was NOT loaded");
@@ -1000,6 +1010,8 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
         chunk, chunk_size, context, out_entropy, out_mad, out_second_deriv,
         out_neuropress_gpu_failed, out_v2_features, v2_bw);
     if (!v2_stats.empty() && out_ranked_by_cost) *out_ranked_by_cost = true;
+    // HCompress ranked the v2 settings: its executed outcome is fed back
+    if (out_hc_ranked && HCompressRanksV2()) *out_hc_ranked = !v2_stats.empty();
     return v2_stats;
   }
 

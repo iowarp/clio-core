@@ -59,7 +59,9 @@
 #include <clio_ctp/compress/model/hcompress_ccp_predictor.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -141,6 +143,9 @@ void Runtime::HCompressObserve(int wire_lib, int preset_field,
   ctp::compress::model::CcpObservation row;
   row.library = ctp::compress::model::HCompressCcpPredictor::LibraryKey(
       name, quantize, byte_shuffle);
+  // Ranking the v2 settings, the preset field IS the setting index (also
+  // for the store setting, wire 0): key it the way the seed keys it.
+  if (HCompressRanksV2()) row.library = HCompressV2Key(preset_field);
   row.bytes = static_cast<double>(chunk_size);
   // A non-positive measurement means NOT MEASURED and trains nothing, so an
   // unmeasured decompression time teaches the decompression head nothing
@@ -152,6 +157,27 @@ void Runtime::HCompressObserve(int wire_lib, int preset_field,
   row.compression_ratio = context.actual_compression_ratio_;
   std::lock_guard<std::mutex> lock(hcompress_mutex_);
   hcompress_predictor_->Observe(row);
+}
+
+bool Runtime::HCompressV2SettingsRequested() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_HCOMPRESS_V2_SETTINGS");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
+  return on;
+}
+
+std::string Runtime::HCompressV2Key(int setting) {
+  const char *spec = ctp::GpuSettingSpec(setting);
+  std::istringstream words(spec != nullptr ? spec : "");
+  std::string algorithm, word;
+  words >> algorithm;
+  bool shuffle = false;
+  while (words >> word) {
+    shuffle = shuffle || word == "shuffle=byte" || word == "shuffle=bit";
+  }
+  return ctp::compress::model::HCompressCcpPredictor::LibraryKey(
+      algorithm, /*quantize=*/false, shuffle);
 }
 
 }  // namespace clio::cte::compressor

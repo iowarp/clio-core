@@ -46,6 +46,7 @@
 #include <clio_ctp/compress/preprocess/data_stats.h>
 #include <clio_ctp/compress/preprocess/data_stats_gpu.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -308,6 +309,9 @@ std::vector<CompressionStats> Runtime::NeuroPressV2RankChunk(
     return {CompressionStats(fixed == StoreSetting() ? 0 : kNpSettingWire,
                              fixed, 0.0, 0.0, 0.0, 0.0)};
   }
+  // HCompress ranks the settings (CLIO_HCOMPRESS_V2_SETTINGS=1); the network
+  // is not run and the chunk's bytes are not read.
+  if (HCompressRanksV2()) return HCompressRankV2Settings(chunk_size, bw);
   auto t0 = std::chrono::steady_clock::now();
   const auto w = V2CostWeights(bw);
   ctp::compress::model::NeuroPressV2Features f;
@@ -403,11 +407,54 @@ std::vector<CompressionStats> Runtime::NeuroPressV2RankChunk(
   return out;
 }
 
+std::vector<CompressionStats> Runtime::HCompressRankV2Settings(
+    clio::run::u64 chunk_size, double bw) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto w = V2CostWeights(bw);
+  const double bytes = static_cast<double>(chunk_size);
+  struct Ranked {
+    int setting;
+    double cost;
+    ctp::compress::model::CompressionPrediction p;
+  };
+  std::vector<Ranked> ranked;
+  ranked.reserve(ctp::kGpuSettingCount);
+  {
+    std::lock_guard<std::mutex> lock(hcompress_mutex_);
+    for (int s = 0; s < ctp::kGpuSettingCount; ++s) {
+      if (!ctp::GpuSettingAvailable(s)) continue;  // not in this build
+      const auto p = hcompress_predictor_->PredictFor(HCompressV2Key(s), bytes);
+      const double c = V2Cost(w, p.compression_time_ms, p.decompression_time_ms,
+                              p.compression_ratio, bytes);
+      if (std::isfinite(c)) ranked.push_back({s, c, p});
+    }
+  }
+  std::stable_sort(ranked.begin(), ranked.end(),
+                   [](const Ranked &a, const Ranked &b) { return a.cost < b.cost; });
+  const double wall = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+  // HCompress reads nothing from the chunk: no statistics, no conversion.
+  g_select_timing = SelectTiming{wall, 0.0};
+  RecordSelectionPhases(0.0, wall, 0.0, /*reused=*/false, 0.0, -1.0);
+  std::vector<CompressionStats> out;
+  out.reserve(ranked.size());
+  for (const auto &r : ranked) {
+    out.emplace_back(r.setting == StoreSetting() ? 0 : kNpSettingWire, r.setting,
+                     r.p.compression_ratio, r.p.compression_time_ms,
+                     r.p.decompression_time_ms, 0.0);
+  }
+  CLIO_PATH_TRACE("2 infer    HCompress ranked %zu v2 settings at %.3g B/ms; "
+                  "primary=%s", out.size(), w.bw_bytes_per_ms,
+                  out.empty() ? "-" : ctp::GpuSettingSpec(out.front().compress_preset_));
+  return out;
+}
+
 bool Runtime::NeuroPressV2LaunchRank(const std::string &blob, const void *chunk,
                                      clio::run::u64 chunk_size,
                                      const Context &context, double bw) {
   if (!neuropress_v2_ || !ctp::IsDevicePointer(chunk) ||
-      FixedV2Setting() >= 0 || !OracleV2Map().empty() || SelectionLogEnabled()) {
+      FixedV2Setting() >= 0 || !OracleV2Map().empty() || SelectionLogEnabled() ||
+      HCompressRanksV2()) {
     return false;
   }
   V2PendingRank p;

@@ -781,6 +781,47 @@ private:
                                                    const Context& context);
 
   /**
+   * @brief Whether HCompress should rank NeuroPress v2's 45 settings.
+   *
+   * CLIO_HCOMPRESS_V2_SETTINGS=1 (with hcompress_model_path and a v2
+   * neuropress_model_path): the v2 setting table, codec prewarm and logs are
+   * loaded, and HCompress -- not the network -- ranks the 45 settings, so the
+   * two selectors choose from the same candidates. Off by default.
+   * @return true when the environment variable asks for it
+   */
+  static bool HCompressV2SettingsRequested();
+
+  /** Is HCompress ranking NeuroPress v2's setting table for this pool? */
+  bool HCompressRanksV2() const {
+    return hcompress_predictor_ && hcompress_predictor_->IsReady() &&
+           neuropress_v2_ && HCompressV2SettingsRequested();
+  }
+
+  /**
+   * @brief HCompress's ranking of the 45 v2 settings for one chunk.
+   *
+   * Each setting is predicted from its library key (algorithm, quantize bit,
+   * shuffle bit) and the chunk size only, and ranked by the same cost as
+   * NeuroPress v2 (V2CostWeights at the chunk's bandwidth).
+   * @param chunk_size bytes of the chunk
+   * @param bw         the chunk's bandwidth, bytes per ms
+   * @return best-first stats, in the v2 setting encoding
+   */
+  std::vector<CompressionStats> HCompressRankV2Settings(clio::run::u64 chunk_size,
+                                                        double bw);
+
+  /**
+   * @brief HCompress's library key for one v2 setting, as its seed keys it.
+   *
+   * The algorithm is the setting spec's first word; the shuffle bit is set by
+   * a "shuffle=byte" or "shuffle=bit" parameter only (lz4's bitshuffle=msb is
+   * a codec parameter, not the shuffle preprocessor); quantize is 0.
+   * @param setting v2 setting index
+   * @return e.g. "ans|q0|s1"
+   */
+  static std::string HCompressV2Key(int setting);
+
+  /**
    * @brief Feed one executed outcome back to HCompress (its paper's feedback).
    *
    * @param wire_lib     wire id of the codec that RAN (not context's, which

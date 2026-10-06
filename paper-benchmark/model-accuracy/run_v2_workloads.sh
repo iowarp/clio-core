@@ -63,6 +63,7 @@ DS=$1; MODE=$2
 ROOT=/mnt/nvme0/v2-work
 FIELDS=$ROOT/$DS/fields
 WEIGHTS=/home/cc/clio-core/context-transport-primitives/src/compress/model/weights/v2
+HC_WEIGHTS=${HC_WEIGHTS:-/home/cc/clio-core/context-transport-primitives/src/compress/model/weights/hcompress_v2}
 BIN=/home/cc/clio-core/build/bin/neuropress_field_replay
 # RUN_TAG (optional) keeps a run apart from the untagged one: <ds>_<mode>_<tag>.
 STORE=$ROOT/runs/${DS}_${MODE}${RUN_TAG:+_$RUN_TAG}
@@ -80,7 +81,11 @@ case $MODE in
               [ -f "${ORACLE_MAP:-}" ] || { echo "oracle needs ORACLE_MAP" >&2; exit 1; } ;;
   fixed)      LEARN=false; EXPLORE=false; K=0;  THRESH=$MAPE
               [ -n "${FIXED_SETTING:-}" ] || { echo "fixed needs FIXED_SETTING" >&2; exit 1; } ;;
-  *) echo "MODE must be static|learn|exhaustive|fixed|oracle|raw" >&2; exit 1 ;;
+  # HCompress (library + size, its own online feedback) ranks the same 45 v2
+  # settings under the same cost model; the v2 model is loaded for its setting
+  # table only (CLIO_HCOMPRESS_V2_SETTINGS=1).
+  hcompress)  LEARN=false; EXPLORE=false; K=0;  THRESH=$MAPE ;;
+  *) echo "MODE must be static|learn|exhaustive|fixed|oracle|raw|hcompress" >&2; exit 1 ;;
 esac
 PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("",0));print(s.getsockname()[1])')
 MB=$(( $(du -smL "$FIELDS" | cut -f1) + 512 ))
@@ -110,6 +115,7 @@ compose:
     neuropress_exploration_threshold: $THRESH
     neuropress_mape_threshold: $MAPE
     neuropress_learning_rate: 0.5
+$([ "$MODE" = hcompress ] && echo "    hcompress_model_path: \"$HC_WEIGHTS\"")
   - mod_name: clio_cte_core
     pool_name: cte_core
     pool_query: local
@@ -173,6 +179,7 @@ env CLIO_SERVER_CONF="$STORE/compose.yaml" CLIO_WITH_RUNTIME=1 \
     CLIO_NEUROPRESS_EXPLORE_MEASURE_DT="$MEASURE_DT" \
     CLIO_NEUROPRESS_FIXED_SETTING="$FIXED" \
     CLIO_NEUROPRESS_SETTING_MAP="$SETTING_MAP" \
+    CLIO_HCOMPRESS_V2_SETTINGS="$([ "$MODE" = hcompress ] && echo 1 || echo 0)" \
     CLIO_NEUROPRESS_V2_PRED_LOG="$STORE/v2_pred.csv" \
     CLIO_NEUROPRESS_V2_EXPLORE_LOG="$STORE/v2_measured.csv" \
     CLIO_NEUROPRESS_PHASE_LOG="$STORE/phases.csv" \

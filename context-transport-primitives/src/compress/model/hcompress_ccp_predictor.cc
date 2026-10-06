@@ -487,7 +487,12 @@ bool HCompressCcpPredictor::Save(const std::string& model_dir) {
     << decomp_speed_.Samples() << ", " << ratio_.Samples() << "],\n";
   WriteDoubles(f, "w_compress_speed_mbps", comp_speed_.Weights(), false);
   WriteDoubles(f, "w_decompress_speed_mbps", decomp_speed_.Weights(), false);
-  WriteDoubles(f, "w_compression_ratio", ratio_.Weights(), true);
+  WriteDoubles(f, "w_compression_ratio", ratio_.Weights(), false);
+  // P of each head, so a loaded seed keeps its weight in the feedback (RLS
+  // continues from the seed's (A + C I)^-1, not from the prior (1/C) I).
+  WriteDoubles(f, "p_compress_speed_mbps", comp_speed_.Covariance(), false);
+  WriteDoubles(f, "p_decompress_speed_mbps", decomp_speed_.Covariance(), false);
+  WriteDoubles(f, "p_compression_ratio", ratio_.Covariance(), true);
   f << "}\n";
   return static_cast<bool>(f);
 }
@@ -546,6 +551,11 @@ bool HCompressCcpPredictor::Load(const std::string& model_dir) {
   comp_speed_.SetWeights(wc, samples.size() > 0 ? size_t(samples[0]) : 1);
   decomp_speed_.SetWeights(wd, samples.size() > 1 ? size_t(samples[1]) : 1);
   ratio_.SetWeights(wr, samples.size() > 2 ? size_t(samples[2]) : 1);
+  // P of each head when the seed carries it (absent in older seeds: those keep
+  // the prior (1/C) I set by Reset above, as before).
+  comp_speed_.SetCovariance(SplitDoubles(Field(s, "p_compress_speed_mbps")));
+  decomp_speed_.SetCovariance(SplitDoubles(Field(s, "p_decompress_speed_mbps")));
+  ratio_.SetCovariance(SplitDoubles(Field(s, "p_compression_ratio")));
   return true;
 }
 

@@ -9,10 +9,9 @@ exists, and draws per configuration the best single codec, NeuroPress
 learning and the oracle:
   top     application time (s); NeuroPress and oracle as % against the best
           single of the same configuration
-  middle  compression ratio, with the same %
-  bottom  model cost: the cost every option selects by (the run's cost model),
-          of the settings each run actually stored, from the stored exhaustive
-          search -- the quantity the oracle minimizes
+  bottom  compression ratio, with the same %
+The configs CSV also holds each option's model cost (the cost every option
+selects by, of the settings each run stored, from the exhaustive search).
 Under each configuration: the codec copies per setting built before the timed
 work and the codec builds inside the timed work (best single / NeuroPress /
 oracle). A bar whose bit-exact check failed is marked in red.
@@ -35,7 +34,13 @@ import replay_learning as rl
 
 RUNS = "/mnt/nvme0/v2-work/runs"
 OPTIONS = (("fixed", "best single codec"), ("learn", "NeuroPress learning"),
-           ("oracle", "oracle (each chunk's best)"))
+           ("oracle", "oracle (each chunk's best)"), ("hcompress", "HCompress"))
+
+
+def present(t):
+    """@return the options of OPTIONS that have rows in t, in OPTIONS order."""
+    have = set(t["mode"])
+    return [(m, n) for m, n in OPTIONS if m in have]
 
 
 def load(ds, w, prefix):
@@ -100,31 +105,12 @@ def model_costs(t, ds, prefix, w, bw):
     return t.assign(model_cost_vs_best_single_pct=100.0 * (t.model_cost / ref - 1.0))
 
 
-def panel_model_cost(a, t, keys):
-    """Bottom panel: the model cost of each option, % against the best single."""
-    x = np.arange(len(keys))
-    width = 0.26
-    for k, (mode, name) in enumerate(OPTIONS):
-        s = t[t["mode"] == mode].set_index("config").reindex(keys)
-        pos = x + (k - 1) * width
-        color = style.OPTION_COLORS[mode]
-        a.bar(pos, s.model_cost, width, color=color, label=name, edgecolor="white", linewidth=0.8)
-        for p, v, d in zip(pos, s.model_cost, s.model_cost_vs_best_single_pct):
-            if np.isfinite(v):
-                a.annotate(f"{v:.1f}" if k == 0 else style.pct(d), (p, v), xytext=(0, 2),
-                           textcoords="offset points", ha="center", va="bottom", fontsize=8,
-                           color="#333333" if k == 0 else color,
-                           fontweight="normal" if k == 0 else "bold")
-    a.set_ylim(0, a.get_ylim()[1] * 1.12)
-    a.set_xlim(-0.6, len(keys) - 0.4)
-
-
 def xlabels(t, configs):
     """@return the tick text per configuration: P x I, copies, timed builds."""
     out = []
     for p, i in configs:
         s = t[(t.procs == p) & (t.inflight == i)].set_index("mode")
-        builds = " / ".join(str(int(s.codec_builds_in_timed.get(m, 0))) for m, _ in OPTIONS)
+        builds = " / ".join(str(int(s.codec_builds_in_timed.get(m, 0))) for m, _ in present(t))
         copies = int(s.prewarm_per_setting.iat[0])
         out.append(f"{p} process{'es' if p > 1 else ''} \u00d7 {i} in flight\n"
                    f"{copies} codec cop{'y' if copies == 1 else 'ies'} per setting\n"
@@ -137,8 +123,8 @@ def plot(t, ds, w, out, prefix="km10b1g", reads=10, bw=1e6):
     style.apply()
     configs = list(dict.fromkeys(zip(t.procs, t.inflight)))
     keys = [t[(t.procs == p) & (t.inflight == i)].config.iat[0] for p, i in configs]
-    fig, ax = plt.subplots(3, 1, figsize=(max(12, 2.6 * len(configs)), 13.5), sharex=True,
-                           gridspec_kw={"height_ratios": [1, 0.8, 0.8]})
+    fig, ax = plt.subplots(2, 1, figsize=(max(12, 2.6 * len(configs)), 10), sharex=True,
+                           gridspec_kw={"height_ratios": [1, 0.8]})
     names = dict(OPTIONS)
     cpr.bar_options(ax[:2], t, keys, names, reads)
     ax[0].set_ylabel("application time (s)")
@@ -147,16 +133,12 @@ def plot(t, ds, w, out, prefix="km10b1g", reads=10, bw=1e6):
     ax[1].set_ylabel("compression ratio")
     ax[1].set_title("Compression ratio (higher is better)")
     wt = w.replace("-", "/")
-    panel_model_cost(ax[2], t, keys)
-    ax[2].set_ylabel("model cost (weighted s)")
-    ax[2].set_title(f"Model cost {wt} at {bw / 1e6:g} GB/s: what all options select by, "
-                    "from the exhaustive search (lower is better)")
-    ax[2].set_xticks(np.arange(len(configs)), xlabels(t, configs), fontsize=9)
+    ax[1].set_xticks(np.arange(len(configs)), xlabels(t, configs), fontsize=9)
     style.titles(fig, f"{ds}: processes \u00d7 chunks in flight",
                  f"Cost model {wt} at {bw / 1e6:g} GB/s; 1 write + {reads} reads, each read followed by "
                  f"one k-means iteration. % = change against the best single codec of the same "
                  f"configuration.\nTimed builds = codec objects built inside the timed work "
-                 f"(best single / NeuroPress / oracle).")
+                 f"({' / '.join(n.split(' (')[0] for _, n in present(t))}).")
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     print("wrote", os.path.abspath(out))

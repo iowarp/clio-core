@@ -42,6 +42,9 @@ ROOT=/mnt/nvme0/v2-work
 RUNS=$ROOT/runs
 PY=${PYTHON:-$HOME/np-venv/bin/python}
 PROCS=${PROCS:-2}; INFLIGHT=${INFLIGHT:-8}
+# OPTIONS: which options to run (any of fixed learn oracle hcompress); runs of
+# the others already present with the same tag stay in the comparison.
+OPTIONS=${OPTIONS:-fixed learn oracle}
 LOG=$RUNS/${DS}_kmeans_parallel.log
 export COST_BW=${COST_BW:-520000} READS=${READS:-4} KMEANS=${KMEANS:-8} NO_SELECTION_LOG=1
 export TIERS=${TIERS:-${COST_BW}:1}
@@ -108,7 +111,7 @@ run_option() {   # MODE TAG [VAR=VALUE ...]
 
 for W in "${WS[@]}"; do
   WL=w${W//,/-}; TAG=${TAG_PREFIX}p${PROCS}i${INFLIGHT}$WL
-  rm -f "$RUNS/${DS}_${TAG}_walls.csv"
+  case " $OPTIONS " in *" fixed "*) rm -f "$RUNS/${DS}_${TAG}_walls.csv" ;; esac
   MAP=$RUNS/${DS}_oracle_map_$WL${BWSUF:+_$BWSUF}.csv
   "$PY" "$HERE/oracle_map.py" "$DS" --w "$W" --bw "$COST_BW" --out "$MAP" >> "$LOG" 2>&1
   read -r BEST NAME < <(cd "$HERE" && "$PY" - "$DS" "$W" "$COST_BW" <<'EOF'
@@ -125,12 +128,15 @@ print(b, names[b])
 EOF
 )
   say "$WL: best single (exhaustive CSV) = setting $BEST ($NAME)"
-  run_option fixed "$TAG" FIXED_SETTING="$BEST"
-  say "$WL: best single done"
-  run_option learn "$TAG" COST_W="$W"
-  say "$WL: NeuroPress learning done"
-  run_option oracle "$TAG" ORACLE_MAP="$MAP"
-  say "$WL: oracle done"
+  for opt in $OPTIONS; do
+    case $opt in
+      fixed)     run_option fixed "$TAG" FIXED_SETTING="$BEST"; say "$WL: best single done" ;;
+      learn)     run_option learn "$TAG" COST_W="$W"; say "$WL: NeuroPress learning done" ;;
+      oracle)    run_option oracle "$TAG" ORACLE_MAP="$MAP"; say "$WL: oracle done" ;;
+      hcompress) run_option hcompress "$TAG" COST_W="$W"; say "$WL: HCompress done" ;;
+      *) say "unknown option $opt (fixed|learn|oracle|hcompress)"; exit 1 ;;
+    esac
+  done
   REF=(--serial-tag "km4$WL")
   # REF_TAG: one or more tag prefixes (comma-separated), each a configuration
   # of this script already run with the same weights

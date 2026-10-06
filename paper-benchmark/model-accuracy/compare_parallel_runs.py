@@ -46,7 +46,13 @@ import compare_kmeans_runs as ck
 import plot_style as style
 
 MODES = (("fixed", "best single codec"), ("learn", "NeuroPress learning"),
-         ("oracle", "oracle"))
+         ("oracle", "oracle"), ("hcompress", "HCompress"))
+
+
+def has_runs(ds, procs, mode, tag):
+    """@return True when every process of one option has a finished run log."""
+    return all(os.path.exists(os.path.join(ck.RUNS, f"{ds}-p{i}_{mode}_{tag}", "stdout.log"))
+               for i in range(procs))
 
 
 def parse_proc(run):
@@ -166,10 +172,11 @@ def bar_options(ax, t, configs, names, reads):
     @param reads   the timed reads per process, for the legend
     """
     x = np.arange(len(configs))
-    width = 0.26   # three bars leave a gap between configurations
-    for k, (mode, _) in enumerate(MODES):
+    modes = [m for m, _ in MODES if m in set(t["mode"])]
+    width = 0.78 / len(modes)   # the bars of one configuration leave a gap to the next
+    for k, mode in enumerate(modes):
         s = t[t["mode"] == mode].set_index("config").reindex(configs)
-        pos = x + (k - 1) * width
+        pos = x + (k - (len(modes) - 1) / 2) * width
         color = style.OPTION_COLORS[mode]
         ok = s["digest_ok"] if "digest_ok" in s else pd.Series(True, index=s.index)
         bad = ~ok.fillna(True).astype(bool).to_numpy()
@@ -208,7 +215,7 @@ def plot(t, ds, procs, inflight, w, best, png, reads=4, bw=520000.0):
     configs = list(dict.fromkeys(t.config))   # reference(s) first
     fig, ax = plt.subplots(2, 1, figsize=(max(11, 2.6 * len(configs)), 9.5), sharex=True)
     names = {"fixed": f"best single codec ({best})", "learn": "NeuroPress learning",
-             "oracle": "oracle (each chunk's best)"}
+             "oracle": "oracle (each chunk's best)", "hcompress": "HCompress"}
     bar_options(ax, t, configs, names, reads)
     ax[1].set_xticks(np.arange(len(configs)), [c.replace(", ", "\n") for c in configs])
     ax[0].set_ylabel("application time (s)")
@@ -242,13 +249,15 @@ def main():
     ap.add_argument("--bw", type=float, default=520000.0, help="bytes per ms")
     ap.add_argument("--fig-dir", default=None)
     a = ap.parse_args()
-    rows = [parallel_row(a.dataset, a.procs, m, a.tag) for m, _ in MODES]
+    rows = [parallel_row(a.dataset, a.procs, m, a.tag) for m, _ in MODES
+            if has_runs(a.dataset, a.procs, m, a.tag)]
     if a.ref_tag:   # one or more tags, comma-separated; processes from p<P> in each
         refs = []
         for rt in a.ref_tag.split(","):
             rp = int(re.search(r"p(\d+)i\d+", rt).group(1)) if re.search(r"p(\d+)i\d+", rt) \
                 else a.ref_procs
-            refs += [parallel_row(a.dataset, rp, m, rt) for m, _ in MODES]
+            refs += [parallel_row(a.dataset, rp, m, rt) for m, _ in MODES
+                     if has_runs(a.dataset, rp, m, rt)]
         rows = refs + rows
     elif a.serial_tag:
         rows = [r for r in (serial_row(a.dataset, m, a.serial_tag, a.bw) for m, _ in MODES)
