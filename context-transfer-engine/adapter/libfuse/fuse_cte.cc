@@ -1177,6 +1177,7 @@ std::thread g_closer;
 bool g_closer_started = false;
 bool g_closer_stop = false;
 bool g_closer_busy = false;  // CloserMain is executing a popped entry
+std::string g_closer_busy_path;  // the path of that entry (g_closer_busy)
 
 bool CreateQueueNonEmpty() {
   std::lock_guard<std::mutex> lk(g_pc_mtx);
@@ -1209,6 +1210,7 @@ void CloserMain() {
     PendingClose pc = std::move(g_closer_q.front());
     g_closer_q.pop_front();
     g_closer_busy = true;
+    g_closer_busy_path = pc.path;
     lk.unlock();
 
     // Order the metadata op AFTER the file's in-flight writes land. A
@@ -1257,6 +1259,7 @@ void CloserMain() {
     }
     lk.lock();
     g_closer_busy = false;
+    g_closer_busy_path.clear();
     g_closer_cv.notify_all();
   }
 }
@@ -1326,6 +1329,21 @@ void CloserBarrier() {
                                             pc.flags);
     }
   }
+}
+
+/**
+ * Whether the asynchronous closer still holds an entry for `path` (queued,
+ * or being executed). Local only: no task is sent.
+ * @param path the path to look for
+ * @return true if a close or utimens for `path` has not finished yet
+ */
+bool CloserPendingFor(const std::string &path) {
+  std::lock_guard<std::mutex> lk(g_closer_mtx);
+  if (g_closer_busy && g_closer_busy_path == path) return true;
+  for (const auto &pc : g_closer_q) {
+    if (pc.path == path) return true;
+  }
+  return false;
 }
 
 void EnqueueDrainOrdered(PendingClose pc) {
@@ -2414,8 +2432,29 @@ static void ShrinkAfterNoSpace(const std::string &hp,
   cte_fuse_truncate(hp.c_str(), static_cast<cte_off_t>(first_bad), nullptr);
 }
 
+/**
+ * Apply an open's O_TRUNC to a file that already existed.
+ *
+ * A file the Open just created (`created`) is empty by construction, so its
+ * O_TRUNC is skipped: the truncate is not free on a cluster -- it drains the
+ * asynchronous closer (putting the PREVIOUS file's close on this open's
+ * path) and sends a truncate to the inode's home, two dependent round trips
+ * on every `open(O_CREAT|O_TRUNC)` of a new file (#1159).
+ * @param cfs filesystem client (unused; the full truncate hook is used)
+ * @param p the opened path
+ * @param flags the open(2) flags
+ * @param created nonzero when this Open created the file
+ */
 static inline void MaybeTruncateOnOpen(clio::cte::filesystem::Client *cfs,
-                                       const std::string &p, int flags) {
+                                       const std::string &p, int flags,
+                                       clio::run::u32 created) {
+  if (created != 0) {
+    // A close of an earlier file by this name (removed on another node)
+    // must still land before this file is used, as the truncate's closer
+    // drain guaranteed. Rare, and checked locally.
+    if ((flags & O_TRUNC) && CloserPendingFor(p)) CloserBarrier();
+    return;
+  }
   if (flags & O_TRUNC) {
     // The FULL truncate hook, not a raw AsyncTruncate: O_TRUNC on reopen
     // must drain the file's deferred pipelines (closer AND sieve pages)
@@ -2500,7 +2539,7 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
   fi->fh = reinterpret_cast<uint64_t>(handle);
   RegisterOpenFile(handle, fi);
   MaybeDirectIo(fi);
-  MaybeTruncateOnOpen(cfs, p, fi->flags);
+  MaybeTruncateOnOpen(cfs, p, fi->flags, t->created_);
   if (fi->flags & O_TRUNC) HiwaterClamp(p, 0);
   return 0;
 }
@@ -2558,7 +2597,7 @@ int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   fi->fh = reinterpret_cast<uint64_t>(handle);
   RegisterOpenFile(handle, fi);
   MaybeDirectIo(fi);
-  MaybeTruncateOnOpen(cfs, p, fi->flags);
+  MaybeTruncateOnOpen(cfs, p, fi->flags, t->created_);
   if (fi->flags & O_TRUNC) HiwaterClamp(p, 0);
   return 0;
 }
