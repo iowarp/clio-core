@@ -6475,6 +6475,19 @@ void Runtime::RekeyIndexSubtree(const std::string &old_abs,
   for (const auto &k : movers) {
     tag_search_.Rename(k, new_abs + k.substr(old_abs.size()));
   }
+  // A rename parked under a parent this node has not heard of yet remembers
+  // the subtree's OLD absolute path, to move it when the parent arrives
+  // (UnparkNames). An ancestor rename applied meanwhile has just moved
+  // those keys: follow them, or the parked move finds nothing and the
+  // subtree stays under the ancestor's new name for good (#1182).
+  for (auto &pr : pending_rekey_) {
+    std::string &p = pr.second;
+    if (p == old_abs ||
+        (p.size() > old_abs.size() && p.compare(0, old_abs.size(), old_abs) == 0 &&
+         p[old_abs.size()] == '/')) {
+      p = new_abs + p.substr(old_abs.size());
+    }
+  }
 }
 
 void Runtime::TnAddName(const TagId &id, const std::string &name) {
