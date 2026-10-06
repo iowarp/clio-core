@@ -33,7 +33,7 @@ if(CLIO_CORE_ENABLE_ELF)
     endif()
 else()
     message(STATUS "CTE Adapters: DISABLED (ELF support not enabled)")
-    message(STATUS "  To enable adapters, configure with -DWRP_CORE_ENABLE_ELF=ON")
+    message(STATUS "  To enable adapters, configure with -DCLIO_CORE_ENABLE_ELF=ON")
 endif()
 
 # ADIOS2 adapter does not require ELF support (it's a plugin engine)

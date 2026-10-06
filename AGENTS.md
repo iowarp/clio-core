@@ -366,7 +366,7 @@ The unified IOWarp Core build system provides options to enable/disable componen
 
 Example:
 ```bash
-cmake --preset=debug -DWRP_CORE_ENABLE_CTE=ON -DWRP_CORE_ENABLE_CAE=OFF
+cmake --preset=debug -DCLIO_CORE_ENABLE_CTE=ON -DCLIO_CORE_ENABLE_CAE=OFF
 ```
 
 ### Compilation Standards
@@ -382,7 +382,7 @@ The build system uses **relative RPATHs** (`$ORIGIN`) for portable, relocatable 
 - **Linux**: Uses `$ORIGIN` and `$ORIGIN/../lib` so libraries and binaries find siblings at runtime
 - **macOS**: Uses `@loader_path` and `@loader_path/../lib` (equivalent to `$ORIGIN`)
 - Works for all deployment targets: system installs, pip wheels, conda packages, and relocatable builds
-- **Disable RPATH**: Set `-DWRP_CORE_ENABLE_RPATH=OFF` if you prefer using `LD_LIBRARY_PATH`
+- **Disable RPATH**: Set `-DCLIO_CORE_ENABLE_RPATH=OFF` if you prefer using `LD_LIBRARY_PATH`
 
 ### CTP Usage
 

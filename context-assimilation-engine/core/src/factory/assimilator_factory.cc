@@ -104,7 +104,7 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
     HLOG(kError,
          "AssimilatorFactory: HDF5 protocol requested but HDF5 support not "
          "compiled in. "
-         "Rebuild with -DWRP_CORE_ENABLE_HDF5=ON to enable HDF5 support.");
+         "Rebuild with -DCLIO_CORE_ENABLE_HDF5=ON to enable HDF5 support.");
     return nullptr;
 #endif
   } else if (protocol == "globus") {

@@ -22,6 +22,8 @@ build:
   string: {{ preset.replace('-', '_') }}_h{{ PKG_HASH }}
   script_env:
     - IOWARP_PRESET
+    # Extra -D options for a variant (mpi.yaml, full.yaml); see build.sh.
+    - IOWARP_CMAKE_ARGS
   # Drop the `python` spec that the host python weak-run-exports, and keep
   # everything else it exports (notably `python_abi 3.12.* *_cp312`, which the
   # release preset does need -- it builds the nanobind extension modules with

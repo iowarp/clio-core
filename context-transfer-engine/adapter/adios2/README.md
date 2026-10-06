@@ -21,7 +21,7 @@ The adapter code has been fully implemented and updated to work with the current
 
 ### Building
 ```bash
-cmake --preset=debug -DWRP_CTE_ENABLE_ADIOS2_ADAPTER=ON
+cmake --preset=debug -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=ON
 make iowarp_engine
 ```
 

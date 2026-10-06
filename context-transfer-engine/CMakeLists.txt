@@ -49,7 +49,7 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     message(STATUS "CTE: Compression enabled - building compressor chimod")
     add_subdirectory(compressor)
 else()
-    message(STATUS "CTE: Compression disabled - skipping compressor chimod (use -DWRP_CTE_ENABLE_COMPRESS=ON to enable)")
+    message(STATUS "CTE: Compression disabled - skipping compressor chimod (use -DCLIO_CTE_ENABLE_COMPRESS=ON to enable)")
 endif()
 
 # Stream chimod -- byte-stream layer with deferred append pipeline
