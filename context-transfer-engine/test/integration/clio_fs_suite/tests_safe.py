@@ -20,10 +20,11 @@ import threading
 import time
 
 from cluster import SAFE_MEMBERS, SAFE_PARITY, AgentConn, parallel
-from suite import test
+from suite import TestFailure, test
 from tests_fault import restart_cluster
-from tests_stress import (CORRUPT, FILE_BLOCKS, FOREIGN, ZERO,
-                          _check_filesets)
+from tests_stress import (CORRUPT, FILE_BLOCKS, FOREIGN, ZERO, _apply,
+                          _check_filesets, _compare, _corrupt_blocks,
+                          _tier_mb, _tier_usage, _to_runs)
 
 
 def _writers(ctx, base, secs, tag):
@@ -681,3 +682,129 @@ def t_rolling_restart_degraded(ctx):
   ctx.cl.agents.clear()
   _check_filesets(ctx, base, n, nfiles, logs, replies,
                   'after the rolling restart and a full crash restart')
+
+
+# ---------------------------------------------------------------------------
+# Tiering under faults: overflow onto degraded arrays, crash, rebuild
+# ---------------------------------------------------------------------------
+def _ovf_nfiles(ctx):
+  """Number of 64 MiB record files per node that push the data through the
+  RAM and fast tiers onto the safe arrays. Same sizing as
+  stress_tier_overflow: every fsynced byte lands twice on the arrays (the
+  primary and its remote copy), so stay near 70% of one disk_gb array."""
+  per_node_mb = int(_tier_mb(ctx) * 1.5)
+  if len(ctx.hosts) > 1:
+    per_node_mb = min(per_node_mb, int(ctx.cl.disk_gb * 1024 * 0.7 / 2))
+  return max(2, per_node_mb // 64)
+
+
+def _ovf_verify(ctx, base, models, owned, reader_of, tag, tally, bad):
+  """Scan every node's files from reader_of(owner) and compare each with
+  its model. Differing and CORRUPT/FOREIGN block counts accumulate in
+  `tally`, the first differing blocks in `bad`; metrics get the verify
+  time and running count under `tag`. A file that cannot be read at all
+  fails the test: no array ever loses more than max_failures members here."""
+  lock = threading.Lock()
+
+  def one(i):
+    r = reader_of(i)
+    for nm in owned[i]:
+      got = ctx.ok(r, 'rec_scan', timeout=900, path=f'{base}/{nm}',
+                   name=nm, nblocks=FILE_BLOCKS)
+      ncorrupt = _corrupt_blocks(got['runs'])
+      nbad = _compare(_to_runs(models[nm]), got, FILE_BLOCKS, nm, bad)
+      with lock:
+        tally['corrupt'] += ncorrupt
+        tally['mismatch'] += nbad
+  t0 = time.time()
+  ctx.each(one)
+  ctx.metrics[f'verify_{tag}_s'] = round(time.time() - t0, 1)
+  ctx.metrics[f'bad_after_{tag}'] = tally['mismatch']
+
+
+def _ovf_overwrite(ctx, base, owned, models):
+  """From a third node, overwrite six random ranges of every file (gen 2)
+  with fsync and record them in the models."""
+  n = len(ctx.hosts)
+  rng = random.Random(4321)
+  plan = {}
+  for i in range(n):
+    for nm in owned[i]:
+      plan[nm] = []
+      for _ in range(6):
+        s = rng.randrange(FILE_BLOCKS)
+        plan[nm].append([s, min(rng.randrange(1, 512), FILE_BLOCKS - s)])
+
+  def overwrite(i):
+    ow = (i + 2) % n
+    for nm in owned[i]:
+      ctx.ok(ow, 'rec_write', timeout=900, path=f'{base}/{nm}', name=nm,
+             runs=plan[nm], writer=100 + ow, gen=2, fsync=True)
+  ctx.each(overwrite)
+  for i in range(n):
+    for nm in owned[i]:
+      _apply(models[nm], plan[nm], 100 + (i + 2) % n, 2)
+
+
+@test('safe_tier_overflow_degraded', 'safe', min_nodes=2,
+      redeploy_after=True, timeout=5400)
+def t_tier_overflow_degraded(ctx):
+  """Tiering with the arrays already hurt. A data disk dies in every node's
+  array first; then every node writes 1.5x its RAM + fast tiers in fsynced
+  64 MiB record files, so the organizer pushes the data down onto the
+  degraded arrays (every stripe is written with a member missing). Every
+  block must read back from another node; then after a crash restart of
+  the whole cluster with the disks still dead; then, once the dead disks
+  are replaced and rebuilt, with max_failures OTHER members killed (the
+  rebuilt member is now the only holder of its column); and finally after
+  random ranges are overwritten in that state."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('tod')
+  ctx.ok(0, 'mkdir', path=base)
+  nfiles = _ovf_nfiles(ctx)
+  ctx.metrics['bytes_per_node_mib'] = nfiles * 64
+  for h in cl.hosts:
+    cl.kill_disk(h, 1)  # a data member of every array
+  owned = {i: [f'n{i}_f{k}' for k in range(nfiles)] for i in range(n)}
+  models = {nm: [(i, 1)] * FILE_BLOCKS for i in range(n) for nm in owned[i]}
+
+  def write_all(i):
+    for nm in owned[i]:
+      ctx.ok(i, 'rec_write', timeout=900, path=f'{base}/{nm}', name=nm,
+             runs=[[0, FILE_BLOCKS]], writer=i, gen=1, fsync=True)
+  t0 = time.time()
+  try:
+    ctx.each(write_all)
+  except TestFailure:
+    ctx.note(f'tier usage when a write failed: {_tier_usage(ctx)}')
+    raise
+  ctx.metrics['write_MiB_per_s'] = round(
+      n * nfiles * 64 / max(0.001, time.time() - t0))
+  ctx.note(f'tiers after the writes onto degraded arrays: {_tier_usage(ctx)}')
+  tally = {'mismatch': 0, 'corrupt': 0}
+  bad = []
+  _ovf_verify(ctx, base, models, owned, lambda i: (i + 1) % n, 'degraded',
+              tally, bad)
+  restart_cluster(ctx, crash=True)
+  cl.agents.clear()
+  _ovf_verify(ctx, base, models, owned, lambda i: (i + 2) % n, 'crash',
+              tally, bad)
+  t0 = time.time()
+  res = parallel(lambda h: cl.replace_disk(h, 1), cl.hosts)
+  ctx.metrics['rebuild_s'] = round(time.time() - t0, 1)
+  failed = {h: str(r)[-400:] for h, r in zip(cl.hosts, res)
+            if isinstance(r, Exception) or r[0] != 0}
+  ctx.check(not failed, f'rebuild onto the replacement disks failed: {failed}')
+  for h in cl.hosts:  # max_failures others: the rebuilt member must serve
+    cl.kill_disk(h, 0)
+    cl.kill_disk(h, SAFE_MEMBERS - 1)
+  _ovf_verify(ctx, base, models, owned, lambda i: (i + 3) % n, 'rebuilt',
+              tally, bad)
+  _ovf_overwrite(ctx, base, owned, models)
+  _ovf_verify(ctx, base, models, owned, lambda i: i, 'overwrite', tally, bad)
+  ctx.metrics['corrupt_or_foreign_blocks'] = tally['corrupt']
+  ctx.metrics['bad_blocks_total'] = tally['mismatch']
+  ctx.check(tally['mismatch'] == 0 and tally['corrupt'] == 0 and not bad,
+            f'{tally["mismatch"]} blocks differ from the model '
+            f'({tally["corrupt"]} CORRUPT/FOREIGN), e.g. {bad[:8]}')
