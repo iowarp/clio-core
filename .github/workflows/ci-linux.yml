@@ -239,21 +239,13 @@ jobs:
               # not belong in this containerized build. Excluded by label so
               # new force_net tests are handled automatically.
               #
-              # -E excludes tests incompatible with THIS docker variant
-              # specifically -- they pass on the native amd64 + arm64 boost
-              # jobs (verified), which provide the real coverage:
-              #  * cte_tiered_storage_all and cte_tiered_dram_default_all --
-              #    the reorganize-down leg intermittently fails a few blob
-              #    PutBlobs with rc=7 (3/96) ONLY in the constrained deps-cpu
-              #    container. Enlarging the slow file tier to hold the whole
-              #    working set was tried and did NOT help, so the binding
-              #    constraint is the deps-cpu container memory/CPU limits
-              #    during the rapid Get/Del/Put reorganize burst, not the tier
-              #    size. The
-              #    failure count varies run to run (95 vs 93 /96), consistent
-              #    with a transient container-resource limit rather than a code
-              #    bug. Tracked for a deeper in-container bdev-allocation fix.
-              ctest --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama|force_net|flaky" -E "cte_tiered_storage_all|cte_tiered_dram_default_all"
+              # cte_tiered_storage_all / cte_tiered_dram_default_all used to be
+              # excluded here: their reorganize-down leg failed a few blobs
+              # with rc=7 in this constrained container (#706). Reorganize now
+              # places the new copy before freeing the old one (756097c94) and
+              # the tests assert real placement (#794); both ran 20x clean in
+              # deps-cpu with 2 CPUs and the default 64 MB /dev/shm.
+              ctest --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama|force_net|flaky"
             '
 
   boost-native:

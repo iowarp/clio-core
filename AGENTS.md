@@ -353,9 +353,9 @@ the runtime fails instead of reporting a clean zero.
 
 #### CI green is weaker evidence than it looks
 
-`ci-linux.yml` runs ctest with `--repeat until-pass:3`, and its boost-backend
-job excludes `cte_tiered_storage_all` and `cte_tiered_dram_default_all`. A test
-can be flaky, or skipped outright, and still show green.
+`ci-linux.yml` runs ctest with `--repeat until-pass:3`, and the macOS jobs
+still exclude some tests by name (`-E`). A test can be flaky, or skipped
+outright, and still show green.
 
 ### Component Build Options
 The unified IOWarp Core build system provides options to enable/disable components:
