@@ -1362,6 +1362,50 @@ bool PoolManager::UpdateContainerNodeMapping(PoolId pool_id,
   return true;
 }
 
+namespace {
+void SyncFileAndDir(const std::string &path);  // defined with the pool log
+
+/** One address-table WAL record, as replay orders them. */
+struct AddressTableRecord {
+  u64 order_ns;      ///< timestamp, raised to keep each file's append order
+  size_t file_rank;  ///< tie-break: the file's position in name order
+  size_t seq;        ///< tie-break: the record's position in its file
+  PoolId pool_id;
+  ContainerId container_id;
+  u32 new_node;
+};
+
+/**
+ * Read one domain_table.* file. A record stamped earlier than the one before
+ * it (the wall clock stepped back) is ordered right after it: append order
+ * is the truth within a file.
+ * @param path the file
+ * @param file_rank its position among the WAL files, sorted by name
+ * @param out records are appended here
+ */
+void ReadAddressTableFile(const std::filesystem::path &path, size_t file_rank,
+                          std::vector<AddressTableRecord> *out) {
+  std::ifstream ifs(path, std::ios::binary);
+  if (!ifs.is_open()) return;
+  u64 floor_ns = 0;
+  size_t seq = 0;
+  while (ifs.good()) {
+    u64 timestamp;
+    PoolId pool_id;
+    u32 container_id, old_node, new_node;
+    ifs.read(reinterpret_cast<char *>(&timestamp), sizeof(timestamp));
+    ifs.read(reinterpret_cast<char *>(&pool_id), sizeof(pool_id));
+    ifs.read(reinterpret_cast<char *>(&container_id), sizeof(container_id));
+    ifs.read(reinterpret_cast<char *>(&old_node), sizeof(old_node));
+    ifs.read(reinterpret_cast<char *>(&new_node), sizeof(new_node));
+    if (ifs.fail()) break;  // torn tail
+    floor_ns = std::max(floor_ns, timestamp);
+    out->push_back({floor_ns, file_rank, seq++, pool_id,
+                    static_cast<ContainerId>(container_id), new_node});
+  }
+}
+}  // namespace
+
 void PoolManager::WriteAddressTableWAL(PoolId pool_id,
                                         ContainerId container_id,
                                         u32 old_node, u32 new_node) {
@@ -1403,6 +1447,12 @@ void PoolManager::WriteAddressTableWAL(PoolId pool_id,
             sizeof(container_id));
   ofs.write(reinterpret_cast<const char *>(&old_node), sizeof(old_node));
   ofs.write(reinterpret_cast<const char *>(&new_node), sizeof(new_node));
+  ofs.flush();
+  ofs.close();
+  // A remap that a power loss erased would route the container back to the
+  // node it moved off (#1193). Remaps are rare: sync each one, as the pool
+  // log does.
+  SyncFileAndDir(wal_path);
 
   HLOG(kDebug, "PoolManager: WAL entry written to {}", wal_path);
 }
@@ -1422,35 +1472,36 @@ void PoolManager::ReplayAddressTableWAL() {
     return;
   }
 
-  size_t entries_replayed = 0;
+  // Only this WAL's own files: the directory also holds other logs (the
+  // pool log, pools.<node>.bin), whose records parsed as mappings here
+  // produced garbage pool ids -- and could remap a real pool's containers.
+  std::vector<fs::path> files;
   for (const auto &dir_entry : fs::directory_iterator(wal_dir)) {
-    // Only this WAL's own files: the directory also holds other logs (the
-    // pool log, pools.<node>.bin), whose records parsed as mappings here
-    // produced garbage pool ids -- and could remap a real pool's containers.
-    if (dir_entry.path().extension() != ".bin" ||
-        dir_entry.path().filename().string().rfind("domain_table.", 0) != 0) {
-      continue;
+    if (dir_entry.path().extension() == ".bin" &&
+        dir_entry.path().filename().string().rfind("domain_table.", 0) == 0) {
+      files.push_back(dir_entry.path());
     }
+  }
+  std::sort(files.begin(), files.end());
 
-    std::ifstream ifs(dir_entry.path(), std::ios::binary);
-    if (!ifs.is_open()) continue;
-
-    while (ifs.good()) {
-      u64 timestamp;
-      PoolId pool_id;
-      u32 container_id, old_node, new_node;
-
-      ifs.read(reinterpret_cast<char*>(&timestamp), sizeof(timestamp));
-      ifs.read(reinterpret_cast<char*>(&pool_id), sizeof(pool_id));
-      ifs.read(reinterpret_cast<char*>(&container_id), sizeof(container_id));
-      ifs.read(reinterpret_cast<char*>(&old_node), sizeof(old_node));
-      ifs.read(reinterpret_cast<char*>(&new_node), sizeof(new_node));
-      if (ifs.fail()) break;
-
-      // Apply the last-writer-wins mapping
-      UpdateContainerNodeMapping(pool_id, container_id, new_node);
-      entries_replayed++;
-    }
+  // Apply in time order, not directory-iteration order: with several files
+  // remapping the same container, the result after a restart depended on
+  // the order the filesystem listed them (#1193).
+  std::vector<AddressTableRecord> records;
+  for (size_t i = 0; i < files.size(); ++i) {
+    ReadAddressTableFile(files[i], i, &records);
+  }
+  std::sort(records.begin(), records.end(),
+            [](const AddressTableRecord &x, const AddressTableRecord &y) {
+              if (x.order_ns != y.order_ns) return x.order_ns < y.order_ns;
+              if (x.file_rank != y.file_rank) return x.file_rank < y.file_rank;
+              return x.seq < y.seq;
+            });
+  size_t entries_replayed = 0;
+  for (const auto &r : records) {
+    // Last writer (in time) wins.
+    UpdateContainerNodeMapping(r.pool_id, r.container_id, r.new_node);
+    entries_replayed++;
   }
 
   HLOG(kInfo, "ReplayAddressTableWAL: Replayed {} entries", entries_replayed);

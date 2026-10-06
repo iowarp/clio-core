@@ -522,6 +522,23 @@ set_target_properties(${RUNTIME_CLEANUP_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Address-table WAL replay order (#1193)
+add_executable(test_address_table_wal test_address_table_wal.cc)
+target_include_directories(test_address_table_wal PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+)
+target_link_libraries(test_address_table_wal
+  clio_run_cxx
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+set_target_properties(test_address_table_wal PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Create IPC Errors test executable
 add_executable(${IPC_ERRORS_TEST_TARGET} ${IPC_ERRORS_TEST_SOURCES})
 
@@ -1246,6 +1263,17 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_runtime_cleanup_tests PROPERTIES
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    TIMEOUT 120
+  )
+
+  add_test(
+    NAME cr_address_table_wal
+    COMMAND test_address_table_wal
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_address_table_wal PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 120
   )
 
