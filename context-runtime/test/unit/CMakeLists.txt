@@ -1325,6 +1325,21 @@ if(CLIO_CORE_ENABLE_TESTS)
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 300
   )
+  # issue #1039: a request that reaches the runtime before its pool exists
+  # (client started mid-compose) must be held until the pool is created, not
+  # consumed and dropped. One case per client ingress path.
+  foreach(_late_mode SHM TCP)
+    string(TOLOWER "${_late_mode}" _late_lc)
+    add_test(
+      NAME cr_ipc_transport_${_late_lc}_late_pool
+      COMMAND ${IPC_TRANSPORT_MODES_TEST_TARGET} "IpcTransportMode - ${_late_mode} Task Before Pool Exists"
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cr_ipc_transport_${_late_lc}_late_pool PROPERTIES
+      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+      TIMEOUT 300
+    )
+  endforeach()
   endif()  # NOT WIN32 (ipc_transport_modes tests)
 
   # Shutdown Battletest (issue #710) — POSIX-only. Each scenario runs in its

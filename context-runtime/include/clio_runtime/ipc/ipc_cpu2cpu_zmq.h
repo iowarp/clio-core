@@ -40,6 +40,23 @@ struct IpcCpu2CpuZmq {
   static bool RecvIn(IpcManager *ipc, u32 &tasks_received);
 
   /**
+   * Admit one received TCP/IPC client request: deserialize it, stamp the
+   * client's response route on a new Future, and push it onto the ingress
+   * lane. Used by RecvIn and by the deferred-request replay (issue #1039).
+   * @param ipc IpcManager
+   * @param mode Client transport (kTcp or kIpc)
+   * @param transport Transport the request arrived on
+   * @param archive The received request; its task is consumed and its
+   *        transport-owned receive handles are released
+   * @param recv_info The transport's receive info (fd / routing identity)
+   * @return true if the request was enqueued for a worker
+   */
+  static bool AdmitZmq(IpcManager *ipc, IpcMode mode,
+                       ctp::lbm::Transport *transport,
+                       LoadTaskArchive &archive,
+                       const ctp::lbm::ClientInfo &recv_info);
+
+  /**
    * Worker-inline SendOut: enqueue completed task to net_queue_.
    * The actual ZMQ send happens in the net-worker SendOut phase.
    */

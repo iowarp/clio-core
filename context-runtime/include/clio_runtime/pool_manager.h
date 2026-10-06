@@ -347,6 +347,33 @@ class PoolManager {
   void EndCreate(u64 handle);
 
   /**
+   * Attach the pool id to a create in progress once CreatePool knows it, so
+   * IsPoolCreating can answer by id (issue #1039).
+   * @param handle the value BeginCreate returned
+   * @param pool_id the id of the pool being created
+   */
+  void SetCreatingPoolId(u64 handle, PoolId pool_id);
+
+  /**
+   * Whether this node is still creating `pool_id` (its Create has not
+   * finished). Safe from any thread.
+   * @param pool_id Pool identifier
+   * @return true while a CreatePool for this id is in progress here
+   */
+  bool IsPoolCreating(PoolId pool_id) const;
+
+  /**
+   * Whether a CLIENT request for `pool_id` may be admitted now (issue #1039):
+   * the pool is known here (its static container exists, so the request can
+   * be deserialized) and its local Create has finished. A client that
+   * connects while the runtime is still composing must have its request held
+   * until this holds, not dropped, and not run against a half-created pool.
+   * @param pool_id Pool identifier
+   * @return true if the request can be deserialized and executed
+   */
+  bool IsClientAdmissible(PoolId pool_id) const;
+
+  /**
    * Describe every pool create still in progress, oldest first, for a stall
    * report: a stalled GetOrCreatePool otherwise names only its method, not
    * which pool it is creating (issue #1180). Safe from any thread.
@@ -476,10 +503,14 @@ class PoolManager {
     std::string pool_name_;  /**< pool being created */
     std::string chimod_;     /**< its module */
     std::chrono::steady_clock::time_point start_;  /**< when it began */
+    PoolId pool_id_;  /**< set once known (SetCreatingPoolId); null before */
   };
   mutable std::mutex creates_mu_;  /**< guards creates_ and next_create_ */
   std::unordered_map<u64, CreateInProgress> creates_;  /**< by handle */
   u64 next_create_ = 1;  /**< next BeginCreate handle */
+  /** Creates in creates_ whose pool id is known; lets IsPoolCreating skip
+      creates_mu_ on the per-request ingress path when nothing is creating. */
+  std::atomic<u32> creating_ids_{0};
 
   bool replaying_pools_ = false;
   /**

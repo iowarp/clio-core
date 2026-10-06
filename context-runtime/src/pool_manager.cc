@@ -739,13 +739,50 @@ u64 PoolManager::BeginCreate(const std::string &pool_name,
                              const std::string &chimod_name) {
   std::lock_guard<std::mutex> lock(creates_mu_);
   const u64 handle = next_create_++;
-  creates_[handle] = {pool_name, chimod_name, std::chrono::steady_clock::now()};
+  creates_[handle] = {pool_name, chimod_name, std::chrono::steady_clock::now(),
+                      PoolId()};
   return handle;
 }
 
 void PoolManager::EndCreate(u64 handle) {
   std::lock_guard<std::mutex> lock(creates_mu_);
-  creates_.erase(handle);
+  auto it = creates_.find(handle);
+  if (it == creates_.end()) {
+    return;
+  }
+  if (!it->second.pool_id_.IsNull()) {
+    creating_ids_.fetch_sub(1, std::memory_order_release);
+  }
+  creates_.erase(it);
+}
+
+void PoolManager::SetCreatingPoolId(u64 handle, PoolId pool_id) {
+  std::lock_guard<std::mutex> lock(creates_mu_);
+  auto it = creates_.find(handle);
+  if (it != creates_.end() && it->second.pool_id_.IsNull() &&
+      !pool_id.IsNull()) {
+    it->second.pool_id_ = pool_id;
+    creating_ids_.fetch_add(1, std::memory_order_release);
+  }
+}
+
+bool PoolManager::IsPoolCreating(PoolId pool_id) const {
+  // Every client request asks this at ingress; with no create in flight (the
+  // steady state) answer without taking the lock.
+  if (creating_ids_.load(std::memory_order_acquire) == 0) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(creates_mu_);
+  for (const auto &kv : creates_) {
+    if (kv.second.pool_id_ == pool_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool PoolManager::IsClientAdmissible(PoolId pool_id) const {
+  return GetStaticContainer(pool_id).IsValid() && !IsPoolCreating(pool_id);
 }
 
 std::string PoolManager::DescribeCreatesInProgress() const {
@@ -783,6 +820,11 @@ class CreateInProgressGuard {
                         const std::string &chimod_name)
       : pm_(pm), handle_(pm->BeginCreate(pool_name, chimod_name)) {}
   ~CreateInProgressGuard() { pm_->EndCreate(handle_); }
+  /**
+   * Record the id of the pool being created (issue #1039).
+   * @param pool_id the pool's id, once CreatePool has resolved it
+   */
+  void SetPoolId(PoolId pool_id) { pm_->SetCreatingPoolId(handle_, pool_id); }
   CreateInProgressGuard(const CreateInProgressGuard &) = delete;
   CreateInProgressGuard &operator=(const CreateInProgressGuard &) = delete;
 
@@ -890,6 +932,10 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
          target_pool_id);
     CLIO_CO_RETURN;
   }
+
+  // From here until this coroutine ends, client requests for this pool are
+  // held at ingress rather than run against a half-created pool (#1039).
+  in_progress.SetPoolId(target_pool_id);
 
   // Create pool metadata
   PoolInfo pool_info(target_pool_id, pool_name, chimod_name, chimod_params,
