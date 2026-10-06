@@ -233,14 +233,28 @@ TEST_CASE("TestAsyncIO") {
 #endif
 
 #if CTP_ENABLE_IO_URING
+  // io_uring can be compiled in yet refused by the kernel or a seccomp
+  // profile (Docker's default blocks io_uring_setup): the factory then returns
+  // nullptr for it and the default backend falls back (#1177).
+  const bool uring = ctp::AsyncIoFactory::IsBackendUsable(
+      ctp::AsyncIoBackend::kIoUring);
   PAGE_DIVIDE("IoUring") {
-    bool ok = RunAlignedWriteReadTest(ctp::AsyncIoBackend::kIoUring);
-    REQUIRE(ok);
+    if (!uring) {
+      WARN("io_uring is not usable here; skipping its explicit sections");
+      REQUIRE(ctp::AsyncIoFactory::Get(kIoDepth,
+                                       ctp::AsyncIoBackend::kIoUring) ==
+              nullptr);
+    } else {
+      bool ok = RunAlignedWriteReadTest(ctp::AsyncIoBackend::kIoUring);
+      REQUIRE(ok);
+    }
   }
 
   PAGE_DIVIDE("IoUringUnaligned") {
-    bool ok = RunUnalignedWriteReadTest(ctp::AsyncIoBackend::kIoUring);
-    REQUIRE(ok);
+    if (uring) {
+      bool ok = RunUnalignedWriteReadTest(ctp::AsyncIoBackend::kIoUring);
+      REQUIRE(ok);
+    }
   }
 #endif
 

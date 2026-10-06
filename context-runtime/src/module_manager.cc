@@ -137,7 +137,29 @@ bool ModuleManager::LoadChiMod(const std::string &lib_path) {
   HLOG(kInfo, "Loaded ChiMod: {} from {}", chimod_info->name, lib_path);
 
   // Store in map
-  chimods_[chimod_info->name] = std::move(chimod_info);
+  const std::string name = chimod_info->name;
+  alloc_chimod_t alloc_func = chimod_info->alloc_func;
+  destroy_chimod_t destroy_func = chimod_info->destroy_func;
+  chimods_[name] = std::move(chimod_info);
+
+  // Give the module its dashboard presence (viz/ assets + routes) NOW, at load
+  // time, not at first pool creation: the Add Pool form a ChiMod registers at
+  // /api/mod/<mod>/create must exist BEFORE any pool of that module does --
+  // that form is how the first one gets made. RegisterViz runs on a throwaway
+  // default-constructed prototype and is documented to depend on no container
+  // state; constructing-then-destroying an un-Created container is a lifecycle
+  // the failed-create paths in PoolManager::CreatePool already exercise.
+  // PoolManager::RegisterContainer calls the same hook per real container,
+  // which is a no-op here thanks to first-wins route registration.
+  if (alloc_func && destroy_func) {
+    if (auto *viz = CLIO_VIZ) {
+      Container *prototype = alloc_func();
+      if (prototype) {
+        viz->OnContainerRegistered(name, *prototype);
+        destroy_func(prototype);
+      }
+    }
+  }
   return true;
 }
 
@@ -194,6 +216,11 @@ std::vector<std::string> ModuleManager::GetLoadedChiMods() const {
 }
 
 bool ModuleManager::IsInitialized() const { return is_initialized_; }
+
+std::string ModuleManager::GetChiModLibPath(const std::string &chimod_name) {
+  ChiModInfo *chimod = GetChiMod(chimod_name);
+  return chimod ? chimod->lib_path : std::string();
+}
 
 void ModuleManager::ScanForChiMods() {
   std::vector<std::string> scan_dirs = GetScanDirectories();

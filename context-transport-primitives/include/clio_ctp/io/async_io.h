@@ -100,10 +100,10 @@ class AsyncIO {
   /** Submit async write. Automatically selects O_DIRECT fd if buffer and
    *  size are aligned, otherwise uses regular fd.
    *  @return IoToken for tracking, or kInvalidIoToken on failure */
-  virtual IoToken Write(void *buffer, size_t size, off_t offset) = 0;
+  virtual IoToken Write(void *buffer, size_t size, int64_t offset) = 0;
 
   /** Submit async read. Same alignment-adaptive logic as Write. */
-  virtual IoToken Read(void *buffer, size_t size, off_t offset) = 0;
+  virtual IoToken Read(void *buffer, size_t size, int64_t offset) = 0;
 
   /** Non-blocking check: is this I/O operation complete?
    *  @param token Token from Write/Read

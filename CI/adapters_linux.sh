@@ -139,6 +139,16 @@ ctest --test-dir "$BUILD_DIR" --output-on-failure \
   -R "posix|stdio|vfd|hdf5_vol|fuse" \
   -E "copy_workspace|compat_suite" -LE "docker|ollama"
 
+# --repeat until-pass:2 above keeps a one-off flake from blocking a merge, and
+# in doing so makes the flake INVISIBLE: the check goes green and the only trace
+# is in LastTest.log. That is how cte_hdf5_vol_io_dataset failed its first
+# attempt in 5 of 146 runs (a read-back DATA MISMATCH, not a timeout) without
+# anyone noticing until the logs were mined by hand for #1022. Every other CI
+# job already runs this reporter; the adapters job was the one that did not.
+# Reports only -- never gates, never changes the exit status.
+bash CI/report_flaky_tests.sh \
+  "$BUILD_DIR/Testing/Temporary/LastTest.log" "adapters (linux, all 5)" || true
+
 # The compat suites self-skip (exit 125 -> CTest "Skipped") when the toolchain is
 # missing, which is right locally and WRONG here: a skipped differential suite is
 # no evidence at all, and ctest above counts a skip as success. Assert both

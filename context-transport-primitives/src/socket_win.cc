@@ -79,7 +79,14 @@ namespace {
 struct WinsockStartup {
   WinsockStartup() {
     WSADATA wsa_data;
-    (void)::WSAStartup(MAKEWORD(2, 2), &wsa_data);
+    int wsa_err = ::WSAStartup(MAKEWORD(2, 2), &wsa_data);
+    if (wsa_err != 0) {
+      std::fprintf(stderr,
+                   "FATAL: WSAStartup failed with error code %d. "
+                   "Winsock initialization is required for network operations.\n",
+                   wsa_err);
+      std::abort();
+    }
   }
 };
 WinsockStartup g_winsock_startup;

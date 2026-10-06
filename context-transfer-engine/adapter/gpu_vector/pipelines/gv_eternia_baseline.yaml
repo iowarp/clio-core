@@ -1,0 +1,85 @@
+# PAGED gpu_vector VS THE APPLICATION'S OWN KERNEL, same binary, one variable.
+#
+# Every cell runs twice: once on the paged path, once with ETERNIA_BASELINE=1,
+# which switches each application to its stock kernel and changes nothing else.
+# No second build and no second input -- that was the point of adding the
+# variable rather than a separate binary.
+#
+# WHAT THE NUMBERS MEAN, AND WHAT THEY DO NOT
+# -------------------------------------------
+# These sizes FIT. The baseline holds its data resident and pays nothing for
+# capacity, while the paged path pays for out-of-core machinery it does not
+# need here. So the baseline should win, and it does -- by roughly one to two
+# orders of magnitude. Measured at the sizes configured below:
+#
+#   LAMMPS   pair kernel   2.38 s paged   vs 0.31 s stock    7.6x
+#   GROMACS  paged kernel  241 ms         vs --              (see below)
+#   LBANN    fwd+bwd GEMM  20.67 s paged  vs 0.088 s stock   234x
+#
+# Correctness is identical on both paths in all three: E_pair -4.7638693 vs
+# -4.7638692, per-atom LJ -4.914217 vs -4.914120, objective 2.87839 both.
+#
+# THREE CAVEATS, none of them small:
+#
+#   LAMMPS's baseline is its CPU kernel. This build has no GPU package, so
+#   7.6x is paged-GPU against stock-CPU, not a like-for-like GPU comparison.
+#
+#   GROMACS's paged kernel runs ALONGSIDE nbnxm rather than instead of it, so
+#   the run's wall clock covers both plus the Clio runtime start. Compare its
+#   kernel_ms against nbnxm's own kernel time, not against wall_s.
+#
+#   LBANN's 234x is measured where the weights fit. The paged path exists for
+#   the case where they do not: at a 1 GiB weight matrix the paged path peaks
+#   at 366 MiB of VRAM against 4298 MiB resident, an 11.7x reduction, and the
+#   stock path stops working entirely somewhat above that. A ratio taken where
+#   the baseline still runs is a measure of overhead, not of value.
+#
+# The useful question this pipeline cannot answer on its own is where the two
+# curves cross -- the size at which the baseline stops running at all. Sweep
+# `width`, `lattice_cells` and `cells` upward to find it.
+config:
+  name: gv_eternia_baseline
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_eternia_lammps
+      pkg_name: lmp
+      lattice_cells: 25
+      steps: 20
+      page_kb: 256
+      blocks: 32
+      slots: 8
+      baseline: false
+      timeout_sec: 1800
+      output_dir: "/tmp/gv_base_lammps"
+    - pkg_type: jarvis_clio_core.clio_eternia_gromacs
+      pkg_name: gmx
+      cells: 60
+      steps: 20
+      page_kb: 64
+      blocks: 32
+      slots: 8
+      baseline: false
+      timeout_sec: 1800
+      output_dir: "/tmp/gv_base_gromacs"
+    - pkg_type: jarvis_clio_core.clio_eternia_lbann
+      pkg_name: lb
+      width: 8192
+      epochs: 2
+      page_kb: 256
+      blocks: 32
+      slots: 8
+      baseline: false
+      host_weights: true
+      own_weights: false
+      timeout_sec: 1800
+      output_dir: "/tmp/gv_base_lbann"
+vars:
+  # Zipped, so a cell is "all three paged" or "all three stock" rather than a
+  # cross product of mixed modes.
+  lmp.baseline: [false, true]
+  gmx.baseline: [false, true]
+  lb.baseline:  [false, true]
+loop:
+  - [lmp.baseline, gmx.baseline, lb.baseline]
+repeat: 1
+run_timeout: 7200
+output: "/home/llogan/Documents/Projects/iowarp/core/results/gv_eternia_baseline"

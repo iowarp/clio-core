@@ -26,8 +26,9 @@ GLOBAL_CROSS_CONST clio::run::u32 kGetStats = 14;
 GLOBAL_CROSS_CONST clio::run::u32 kUpdate = 15;
 GLOBAL_CROSS_CONST clio::run::u32 kSetLifespan = 16;
 GLOBAL_CROSS_CONST clio::run::u32 kFlushAllocLog = 17;
+GLOBAL_CROSS_CONST clio::run::u32 kSync = 18;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 18;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 19;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -43,6 +44,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[15] = "Update";
     v[16] = "SetLifespan";
     v[17] = "FlushAllocLog";
+    v[18] = "Sync";
     return v;
   }();
   return names;

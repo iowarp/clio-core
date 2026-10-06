@@ -14,13 +14,32 @@
 #   5. ~/.clio/clio_run.yaml         (legacy)
 #
 # Size values accept: B, KB, MB, GB, TB (case-insensitive)
+#
+# Storage root: on-disk runtime state (the CTE disk tier, metadata and
+# indexer logs, the restart log, bdev perf stats) lives under
+# ${CLIO_STORAGE_ROOT}, which defaults to ~/.clio. Override it per run with
+# `clio_run runtime start --disk <path>` (or `restart --disk <path>`) or by
+# exporting CLIO_STORAGE_ROOT. Paths written out explicitly in a custom
+# config are used as written.
 # =============================================================================
 
 # -- Networking ---------------------------------------------------------------
 networking:
-  port: 9413                           # RPC listener port
-  neighborhood_size: 32                # Max nodes queried when splitting range queries
-  # hostfile: "/path/to/hostfile"      # One hostname per line for distributed mode
+  # RPC base port. The runtime binds a CLUSTER of three ports derived from
+  # it, all of which must be free: port (main RPC), port+1 (local server; the
+  # bind that decides which process is the runtime) and port+3 (client
+  # ROUTER). A runtime that cannot bind all three refuses to start rather
+  # than run half-bound. Keep the base below the OS ephemeral range (49152+
+  # on Windows) so port+3 cannot collide with an outbound connection.
+  # Override: CLIO_PORT.
+  port: 9413
+  neighborhood_size: 32                # Collective (ManyToOne) neighborhood width. Broadcasts and
+                                       # ranges reach every container regardless of this value.
+  # hostfile: "/path/to/hostfile"      # One hostname per line for distributed mode.
+  #                                    # An entry may name its runtime's port,
+  #                                    # "host:port", so several runtimes can share
+  #                                    # one host; a process takes the entry whose
+  #                                    # port equals its own networking.port.
   wait_for_restart: 30                 # Seconds to wait for peer nodes on startup
   wait_for_restart_poll_period: 1      # Seconds between connection retries
 
@@ -35,7 +54,65 @@ runtime:
   queue_depth: 1024                    # Task queue depth per worker
   local_sched: "default"               # Local task scheduler algorithm
   first_busy_wait: 10000               # Microseconds to busy-wait before sleeping (10ms)
+  task_progress_interval_ms: 5000      # default: 5000 -- how long a cross-node task may sit
+                                       # quietly before the origin probes its node (issue #628);
+                                       # 0 disables. Env CLIO_TASK_PROGRESS_INTERVAL_MS overrides.
+  # Failure-detection knobs (environment only):
+  #   CLIO_PROBE_SILENCE_S     default 30 -- a peer silent this long is declared
+  #                            dead and the tasks waiting on it fail.
+  #   CLIO_NET_RETRY_TIMEOUT_S default 30 -- how long a send to an unreachable
+  #                            peer is retried before its task fails (network-
+  #                            timeout RC). Lower both (e.g. 5) for a filesystem
+  #                            deployment that prefers a prompt EIO over a 30 s
+  #                            stall per operation while a node is down; keep
+  #                            the defaults to ride out peer restarts.
+  #   CLIO_NET_DEAD_FAIL_FAST  default 0 -- 1 = a task addressed to a peer
+  #                            already declared dead fails immediately instead
+  #                            of waiting out the retry window (recommended for
+  #                            filesystem deployments: an operation on a name
+  #                            owned by the dead node then fails with EIO at
+  #                            once instead of stalling).
   learning_rate: 0.2                   # SGD learning rate for task load prediction model
+  # conf_dir: /tmp/clio_$USER          # default: the per-user runtime directory (same
+                                       # as the memfd links). Learned task-stat models are
+                                       # saved under <conf_dir>/models; a directory shared
+                                       # between users cannot be written by the second one.
+  # ipc_namespace: ""                  # Extra suffix for shared-memory segment
+                                       # names, which already carry the user
+                                       # and port. Set it to run two runtimes
+                                       # that share both. Override:
+                                       # CLIO_IPC_NAMESPACE.
+
+# -- Web dashboard ------------------------------------------------------------
+# The runtime serves a dashboard itself: the admin ChiMod starts one HTTP server
+# per node, and every ChiMod that ships a `viz/` directory of HTML/CSS/JS gets
+# mounted at /viz/<mod_name> with the routes its Container registered. Nothing
+# here is collective, so each node serves the same UI independently.
+#
+# `clio_run runtime start` serves the dashboard by default; an embedded runtime
+# (a unit test, an adapter, a library user's CLIO_INIT) does not. Setting
+# `enabled` here decides it for both, and overrides the CLI default.
+#
+# Environment overrides (they win over this file):
+#   CLIO_VIZ_ENABLE      : 1/0
+#   CLIO_VIZ_PORT        : TCP port (0 = pick a free one)
+#   CLIO_VIZ_BIND        : bind address
+#   CLIO_VIZ_MAX_THREADS : HTTP thread-pool size
+#   CLIO_VIZ_PATH        : ':'-separated viz roots to serve assets from instead
+#                          of the ones next to the loaded ChiMod libraries
+#                          (edit pages without rebuilding)
+# Command line: clio_run runtime start [--viz|--no-viz] [--viz-port N]
+#                                      [--viz-bind ADDR]
+# viz:
+#   enabled: true                      # serve the dashboard on this node
+#   port: 8080                         # 0 = bind an ephemeral port
+#   bind: "127.0.0.1"                  # loopback by default: the dashboard
+#                                      # exposes runtime internals, so binding
+#                                      # 0.0.0.0 publishes them to the network
+#   max_threads: 16                    # HTTP request threads. Thread-per-
+#                                      # connection: a browser parks ~6
+#                                      # keep-alive sockets, so keep this
+#                                      # comfortably above that.
 
 # -- Compose ------------------------------------------------------------------
 # Modules started automatically with the runtime.
@@ -56,6 +133,37 @@ runtime:
 # interception therefore lives only in the dedicated interceptor test
 # configs, never in this default.
 #
+# =========================================================================
+# SWIM failure detection
+# =========================================================================
+# SWIM gossips liveness probes between nodes and declares a peer dead when
+# its probes go unanswered for long enough. Recovery then redistributes the
+# dead peer's containers.
+#
+# DISABLED BY DEFAULT, and the default is the recommendation. A wide
+# collective -- composing a pool across 256 nodes, flushing a full-machine
+# page working set -- starves probe replies for longer than the suspicion
+# timeout while every node is healthy and merely busy. SWIM then declares
+# live nodes dead, recovery moves their containers, and routing can no
+# longer find them: tasks come back with RouteResult::Dne and the job dies.
+# Measured at 256 nodes, eight nodes (ids 0, 32, 64 ... 224) were marked
+# dead inside a single run in which nothing had actually failed.
+#
+# Timeouts long enough to survive a wide collective are also long enough
+# that the detector no longer detects anything useful, so leaving this off
+# is the honest setting for a job-scheduled run, where the batch system
+# already kills the whole allocation if a node dies. Turn it on for a
+# long-lived service deployment and size the timeouts for the widest
+# collective that deployment issues.
+# The timeouts are sized for volatility, not detection speed: a node has to
+# be unreachable for about an hour before recovery redistributes its
+# containers. The old 30 / 15 / 60 s defaults fired inside healthy runs.
+swim:
+  enabled: false                        # default: false
+  direct_probe_timeout_sec: 300.0       # default: 300.0 -- direct probe reply deadline
+  indirect_probe_timeout_sec: 150.0     # default: 150.0 -- indirect (relayed) probe deadline
+  suspicion_timeout_sec: 3600.0         # default: 3600.0 -- suspect -> dead, triggers recovery
+
 # Only clio_bdev is strictly required. Drop the CAE or CTE entry if you
 # don't need it.
 compose:
@@ -77,6 +185,74 @@ compose:
   #   pool_id: "302.0"
   #   bdev_type: file                    # Options: file, ram, hbm, pinned, noop
   #   capacity: "100GB"
+  #   # A file bdev logs its allocations to "<pool_name>.alloc_log" and, on
+  #   # every `clio_run start`, rebuilds its allocator from that log so no live
+  #   # block is handed out twice. `clio_run start --fresh` discards the log.
+  #   # Setting alloc_log moves the log and makes even --fresh recover it.
+  #   # alloc_log: "/mnt/nvme/chi_bdev.alloc_log"
+  #   # TEST-ONLY fault injection (no config key): while a file named
+  #   # "<pool_name>.fail" exists, every read, write and sync of this device
+  #   # fails with an I/O error, as a dead disk would; delete the file and it
+  #   # works again. Checked at most every 100 ms; off unless the file exists.
+
+  # === Safe Block Device (erasure-coded array over member bdevs) ===
+  # One logical device over several member bdevs (disks): data members plus
+  # up to max_failures dedicated Reed-Solomon parity members. Members are
+  # bdev pools created before it (above); more can be added at runtime
+  # (AddBdev), failed ones rebuilt onto new disks (RecoverBdev). A member
+  # whose I/O fails at runtime is marked faulty (logged once, shown in
+  # Monitor "stats"): reads reconstruct its chunks from the survivors +
+  # parity and writes go degraded; past max_failures faulty members, requests
+  # that need them fail with an I/O error, never wrong bytes. With
+  # alloc_log set, the array's membership -- including members added or
+  # replaced at runtime, and faulty members -- is restored from
+  # "<alloc_log>.members" at restart.
+  # - mod_name: clio_safe_bdev
+  #   pool_name: safe_array
+  #   pool_query: local
+  #   pool_id: "350.0"
+  #   max_failures: 1               # parity members the array may take
+  #   alloc_log: "/var/lib/clio/safe_array.alog"
+  #   # distributed: false          # true: each member is the container of
+  #   #                             # its pool on node `node_id` (disks on
+  #   #                             # different nodes); the array runs on the
+  #   #                             # first member's node, and a member whose
+  #   #                             # node dies is marked faulty. false: every
+  #   #                             # member is this node's container.
+  #   members:
+  #     - pool_name: "/mnt/nvme/disk0.bin"
+  #       node_id: 0
+  #       pool_id_major: 301
+  #       pool_id_minor: 0
+  #     - pool_name: "/mnt/nvme/disk1.bin"
+  #       node_id: 0
+  #       pool_id_major: 302
+  #       pool_id_minor: 0
+  #       parity: true              # default: false. Seat this member as a
+  #                                 # PARITY column (at most max_failures
+  #                                 # members may be); false: a DATA column.
+  #                                 # Parity can also be added at runtime
+  #                                 # with AddBdev(as_parity).
+  #
+  # Durability (no config key): a write is acknowledged only after every
+  # stripe it changed has current parity on the parity members, so a disk
+  # that dies at any later moment can always be rebuilt. With alloc_log
+  # set, each write first records its stripes as "dirty" in the log (one
+  # fsync of the log per write); if the process dies between the data and
+  # the parity, restart re-encodes exactly those stripes and refuses to
+  # reconstruct from them until it has. Sync (the CTE's fsync of the tier)
+  # encodes any stripe still dirty, syncs every active member and the log.
+  # While a DATA member is down, its chunks exist only through the parity, so
+  # a write to one of its stripes first saves the down member's chunk to
+  # "<alloc_log>.journal" (with the same durability as the intent); a crash
+  # mid-write then finishes the stripe from the journal instead of leaving
+  # the down member's data undecodable (the degraded write hole).
+  #   intent_sync: true     # default. Stripe intents are fsynced before the
+  #                         # write's data reaches a member: parity stays
+  #                         # consistent across a power loss. false: intents
+  #                         # only reach the kernel first (still consistent
+  #                         # across any process crash) and small writes skip
+  #                         # an fsync each -- ~10x the small-file create rate.
 
   # === Context Assimilation Engine (CAE) ===
   # Assimilation / discovery entrypoint at its own pool 400.0
@@ -88,20 +264,35 @@ compose:
     pool_id: "400.0"
     next_pool_id: "512.0"               # CTE core pool — see entry below
 
-    # Transparent LLM labeling — optional. When enabled, PutBlob calls
-    # `model` on `label_endpoint` for every blob whose tag+name matches
-    # a rule, and stores the response as `{blob_name}_label` in the
-    # same tag. Leave commented out for a pure-passthrough CAE.
-    #
-    # label_endpoint: "http://127.0.0.1:11434"   # Ollama-compatible server
-    # label_prompts:
-    #   summarize: "Summarize the following text in one short sentence."
-    # label_matches:
-    #   - tag_re: ".*\\.txt$"                    # only label .txt blobs
-    #     blob_re: ".*"
-    #     model: "gemma3:1b"
-    #     prompt: "summarize"
-    #     context_length: 4096                  # tokens (Ollama num_ctx)
+  # === Summarizer (CAE) ===
+  # Transparent LLM summarization — optional, OFF by default (commented out).
+  # An interposer on the CTE core's task interface: it forwards every core
+  # verb to next_pool_id, and additionally calls `model` on `label_endpoint`
+  # for each PutBlob whose tag+blob name matches a rule, storing the response
+  # as `{blob_name}_label` in the same tag.
+  #
+  # To enable, uncomment this block AND point the CAE core's next_pool_id
+  # above at "401.0" so the data path runs through it. Compose it BEFORE any
+  # pool it forwards to exists — i.e. after the CTE core entry below.
+  #
+  # Inference is synchronous on the handling worker, so scope tag_re/blob_re
+  # tightly: a rule matching a hot write path serializes it behind the model.
+  #
+  # - mod_name: clio_cae_summarizer
+  #   pool_name: clio_cae_summarizer
+  #   pool_query: local
+  #   pool_id: "401.0"
+  #   next_pool_id: "512.0"             # CTE core pool — see entry below
+  #   label_endpoint: "http://127.0.0.1:11434"   # Ollama-compatible server
+  #   label_prompts:
+  #     summarize: "Summarize the following text in one short sentence."
+  #   label_matches:
+  #     - tag_re: ".*\\.txt$"            # only summarize .txt blobs
+  #       blob_re: ".*"
+  #       model: "gemma3:1b"
+  #       prompt: "summarize"
+  #       context_length: 4096          # tokens (Ollama num_ctx)
+  #       num_predict: 0                # cap on response tokens; 0 = no cap
 
   # === Context Transfer Engine (CTE) ===
   # High-performance data buffering and transfer engine. Sits at the
@@ -130,7 +321,7 @@ compose:
       # Persistent disk tier: where the replication chimod (below) keeps the
       # durable copies of DRAM-cached data. Grows lazily (1GB units), so the
       # capacity_limit is a cap, not an upfront allocation.
-      - path: "${HOME}/.clio/cte_disk_tier.dat"
+      - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
         bdev_type: "file"
         capacity_limit: "10GB"
         score: 0.2
@@ -141,7 +332,7 @@ compose:
     # for data to survive a runtime reboot: without it the disk tier's bytes
     # persist but nothing remembers which blob they belong to.
     performance:
-      metadata_log_path: "${HOME}/.clio/cte_metadata_log"
+      metadata_log_path: "${CLIO_STORAGE_ROOT}/cte_metadata_log"
       transaction_log_capacity: "32MB"
 
     # Data Placement Engine ------------------------------------------------
@@ -150,20 +341,63 @@ compose:
 
     # Target management ----------------------------------------------------
     targets:
-      neighborhood: 1                   # Storage nodes CTE can buffer to
+      # Storage nodes CTE can buffer to: each node registers the devices of
+      # itself and the next (neighborhood - 1) nodes (wrapping). Only
+      # persistent tiers ("file", object stores, attached existing pools) span
+      # the neighborhood; memory tiers ("ram", "hbm", "pinned") are always
+      # node-local, since a neighbor's RAM gives neither locality nor
+      # durability. Range: 1-1024, capped at the node count. Default: 1.
+      neighborhood: 1
       default_target_timeout_ms: 30000   # Timeout for target operations (ms)
       poll_period_ms: 5000               # Target statistics re-scan interval (ms)
+      # While a blob's owner node is dead, route it to the first live
+      # successor container, which holds the replication chimod's remote
+      # copy (see remote_copies below) and serves it until the owner returns.
+      # Default: false (operations on the dead owner's blobs fail).
+      # failover_to_successor: true
 
     # Performance tuning ---------------------------------------------------
     # Uncomment to override defaults:
     # performance:
-    #   stat_targets_period_ms: 50       # Periodic StatTargets interval (ms)
+    #   stat_targets_period_ms: 1000     # How often each target's capacity and
+    #                                    # free space are re-read from its bdev
+    #                                    # (df and the dashboard follow within
+    #                                    # one period). Default 1000.
     #   max_concurrent_operations: 64    # Max concurrent I/O operations
     #   score_threshold: 0.7             # Score above which blobs are reorganized
     #   score_difference_threshold: 0.05 # Min score delta to trigger reorganization
-    #   flush_metadata_period_ms: 5000   # Metadata flush interval (ms)
+    #
+    # Internal data organizer (periodic tier re-placement). Commented out =
+    # "none" (disabled). Each replica runs DynamicReorganize every period and
+    # rescores blobs through ReorganizeBlobInternal; higher score = faster tier.
+    #   organizer: "none"                # "none" | "frecency" (recency+frequency)
+    #                                    # | "grayscott" (reference policy: write-once
+    #                                    #   checkpoint tags sink to the slowest tier;
+    #                                    #   with a ReorganizeHint(step) the pair about
+    #                                    #   to be overwritten is demoted. Measured not
+    #                                    #   to pay on Gray-Scott -- see its header)
+    #   organizer_tasks: 1               # Periodic replicas (blob space is hash-partitioned)
+    #   organizer_period_ms: 5000        # Period between organizer rounds (ms)
+    #   flush_metadata_period_ms: 5000   # Metadata flush interval (ms): syncs
+    #                                    # the metadata WAL each period. The full
+    #                                    # snapshot (a pass over every blob) is
+    #                                    # rebuilt only when the WAL exceeds
+    #                                    # transaction_log_capacity, or at most
+    #                                    # once a minute to persist blob score
+    #                                    # changes the WAL does not record.
     #   flush_data_period_ms: 10000      # Data flush interval (ms)
     #   flush_data_min_persistence: 1    # Min persistence level (1=temp-nonvolatile)
+    #   fsync_mode: "durable"            # fsync(2) on clio-fs. "durable": returns
+    #                                    # once the file's bytes are on a tier at
+    #                                    # flush_data_min_persistence or above and
+    #                                    # synced to the device, along with the WAL
+    #                                    # and namespace log. "deferred": returns
+    #                                    # at once; the periodic flushes make the
+    #                                    # data durable (a crash can lose up to
+    #                                    # flush_data_period_ms of fsync'd data).
+    #                                    # A graceful `clio_run stop` also moves
+    #                                    # RAM-tier data to disk before exiting
+    #                                    # (bounded by --grace-period).
     #   transaction_log_capacity: "32MB" # Write-ahead log capacity
 
   # === The interposition chain (issue #886) ==============================
@@ -185,22 +419,45 @@ compose:
   # invalidates it). Order in this file matters: each entry must come AFTER
   # the entry its next_pool_id names.
 
-  # === Replication (persistent copies, issue #886) ===
-  # Reliability layer: every default put writes through to a fixed set of
-  # persistent replicas on the disk tier above (REPLICA_FIXED |
-  # REPLICA_PERSISTENT: the organizer never migrates them and never places
-  # them on volatile storage — they only move if a device is evacuated).
-  # Reads serve the primary when present and transparently re-cache from a
-  # disk replica when the organizer (or a reboot) dropped it; every other
-  # core op is forwarded to next_pool_id untouched.
+  # === Replication (durable copies, issue #886) ===
+  # Reliability layer. replication_factor is the total number of durable
+  # copies of every blob:
+  #   1 (default): the blob's own copy only, made durable by fsync and the
+  #     periodic data flush -- the ext4 contract and a single-copy disk
+  #     footprint. A node's blobs are unavailable while it is down.
+  #   N > 1: plus N-1 copies on the next nodes by hash, written before a put
+  #     is acknowledged; with the core's failover_to_successor a blob stays
+  #     readable and writable while its owner is down, and changes made
+  #     meanwhile are handed back when it returns.
+  # Every other core op is forwarded to next_pool_id untouched.
   - mod_name: clio_cte_replication
     pool_name: clio_cte_replication
     pool_query: local
     pool_id: "561.0"
     next_pool_id: "512.0"               # CTE core pool — see entry above
-    num_replicas: 1                     # persistent copies per put
+    replication_factor: 1               # total durable copies (default 1)
     cache_score: 1.0                    # DRAM re-cache placement score
     replica_score: 0.2                  # disk copies' score = drop threshold
+    # ADVANCED overrides of what replication_factor sets:
+    # remote_copies: copies on the next containers by hash (other nodes).
+    #   Default: replication_factor - 1.
+    # remote_copies: 1
+    # num_replicas: extra persistent copies on the owner's OWN node, written
+    #   through by every put (REPLICA_FIXED | REPLICA_PERSISTENT: never
+    #   migrated, never volatile). They protect against losing a device, not
+    #   a node, and each doubles the disk footprint. Default: 0.
+    #   Leave it 0 over a clio_safe_bdev tier: the array already survives
+    #   max_failures dead disks, so a second copy on the same array protects
+    #   nothing, and fsync moves the primary onto persistent storage too --
+    #   each fsynced byte then lands twice on the array (#1140).
+    #   Space per fsynced byte is about 1 + num_replicas + remote_copies,
+    #   plus the writer node's evictable cache copy.
+    # num_replicas: 1
+    # Base path of the handoff log (one file per container, suffixed
+    # ".<container>"): the changes a container made while covering for a dead
+    # owner, so they are still handed back if THIS node restarts before the
+    # owner returns. Default: "" (kept in memory only).
+    # handoff_log_path: "/var/lib/clio/cte_handoff_log"
 
   # === Compression (optional, issue #886) ===
   # Encoding layer: transparently compresses on the way down and
@@ -212,6 +469,15 @@ compose:
   #   pool_query: local
   #   pool_id: "562.0"
   #   next_pool_id: "561.0"             # replication pool — see entry above
+  #   # Steer each tag's compressed copy toward the node that last read it
+  #   # (consumer tracking). false = always place by hash of the tag id.
+  #   tracking_enabled: true            # default: true
+  #
+  # Codec choice is per put, via Context::dynamic_compress_:
+  #   0 kCompressSkip     store uncompressed
+  #   1 kCompressStatic   use exactly compress_lib_/compress_preset_ — the
+  #                       autoselection models are bypassed
+  #   2 kCompressDynamic  the models (Q-table / LinReg predictors) choose
 
   # === Indexer (SemanticSearch index, issue #905) ===
   # Search layer: owns the term index that serves Method::kSemanticSearch
@@ -228,7 +494,7 @@ compose:
     pool_query: local
     pool_id: "564.0"
     next_pool_id: "561.0"               # replication (562.0 with compressor)
-    index_log_path: "${HOME}/.clio/cte_indexer_index"
+    index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
     # index_sweep_period_ms: 100        # async drain cadence (0 = lazy)
     # index_wal_compact_bytes: "8MB"    # WAL size that triggers compaction
     # tag_re: ".*"                      # index scope: only matching tags...
@@ -250,6 +516,30 @@ compose:
     next_pool_id: "564.0"               # indexer — see entry above
     min_score: 0.5                      # cache copies' score floor
 
+  # === Stream (byte-stream layer over CTE tags) ===
+  # Owns what makes a tag a byte stream: its page layout (1 MiB page blobs
+  # named by page index), its authoritative logical size, and deferred
+  # appends. Each stream has a HOME container chosen by the caller (clio-fs
+  # uses the file's inode home) that owns its size and merges its appends:
+  # an append is staged as a blob on the writer's node and returns at once;
+  # every node ships its batch to the home each 1 ms, where the combined
+  # batch is ordered, its range reserved from the size, and copied into the
+  # pages. The filesystem creates this pool with defaults if it is not
+  # composed; compose it BEFORE the filesystem to configure it.
+  - mod_name: clio_cte_stream
+    pool_name: clio_cte_stream
+    pool_query: local
+    pool_id: "565.0"
+    next_pool_id: "563.0"               # data path: the chain top (cache)
+    # Where staged (not yet merged) appends are written. They are written
+    # once and read at most once, after a restart, so skip the cache.
+    # Default: next_pool_id.
+    staging_pool_id: "561.0"            # replication (durable, uncached)
+    # Node-local log of the sizes, merge plans and merged-append names of
+    # the streams this node homes (the container id is appended). Without it
+    # file sizes do not survive a stop and `clio_run start`. Default: unset.
+    # log_path: "/mnt/nvme/$USER/clio/cte_stream_log"
+
   # === Context Filesystem (CFS) ===
   # POSIX-style filesystem chimod that the libfuse / POSIX adapters drive. It
   # sits at the canonical filesystem pool 560.0 (clio::cte::filesystem::
@@ -265,3 +555,14 @@ compose:
     pool_query: local
     pool_id: "560.0"
     next_pool_id: "563.0"               # chain top (cache) — see entries above
+    # The namespace is stored in the CTE -- no metadata server, no log:
+    # directories are split into directory blocks (one CTE blob each), inodes
+    # are one CTE blob each, and every node caches what it reads while each
+    # block's home pushes every change before acknowledging it.
+    # metadata_log_path only names this node's stream log (<path>.stream).
+    # metadata_log_path: "/mnt/nvme/$USER/clio/cfs_namespace_log"
+    # Entries a directory block holds before it splits (default 1024).
+    # dir_split_entries: 1024
+    # Stream pool holding every file's logical size and merging deferred
+    # O_APPEND writes (see the clio_cte_stream entry). Default: "565.0".
+    # stream_pool_id: "565.0"

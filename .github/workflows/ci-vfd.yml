@@ -18,6 +18,13 @@ on:
     branches: [main, dev, 'feat/vfd-**']
   pull_request:
     branches: [main, dev]
+  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
+  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
+  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
+  # single bad commit turns every later push red. A merge_group run is that
+  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
+  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -56,8 +63,8 @@ jobs:
               export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
               git config --global --add safe.directory /workspace
               # ELF interception headers for the CTE adapters (HDF5 already in image).
-              apt-get update -qq
-              apt-get install -y -qq libelf-dev pkg-config
+              for i in 1 2 3; do apt-get update -qq && break || sleep 5; done
+              for i in 1 2 3; do apt-get install -y -qq libelf-dev pkg-config && break || sleep 5; done
               # Locate the native HDF5 CLI tools (h5dump/h5ls/h5repack/h5diff)
               # used by the in-test native-compat matrix. Their location varies
               # across deps-cpu image revisions, so discover rather than assume:
@@ -125,5 +132,5 @@ jobs:
               # Run the VFD suite (+ its shell cleanup fixtures). Allow one retry
               # for flaky runtime bring-up, like the ci-adapters job.
               ctest --test-dir build-vfd --output-on-failure \
-                --timeout 300 --repeat until-pass:2 -R vfd -LE "docker|ollama"
+                --timeout 300 --repeat until-pass:2 -R vfd -LE "docker|ollama|flaky"
             '

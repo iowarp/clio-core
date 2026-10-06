@@ -34,6 +34,12 @@ add_dependencies(test_ctp_malloc_exec clio_ctp_host)
 target_link_libraries(test_ctp_malloc_exec
         clio_ctp_host)
 
+add_executable(test_slab_cache_allocator_exec
+        test_slab_cache_allocator.cc)
+add_dependencies(test_slab_cache_allocator_exec clio_ctp_host)
+target_link_libraries(test_slab_cache_allocator_exec
+        clio_ctp_host Catch2::Catch2WithMain)
+
 add_executable(test_thread_allocator_exec
         test_thread_allocator.cc)
 add_dependencies(test_thread_allocator_exec clio_ctp_host)
@@ -92,17 +98,18 @@ add_test(NAME ctp_thread_allocator_multithread COMMAND
 add_test(NAME ctp_ctp_malloc COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_ctp_malloc_exec)
 
+add_test(NAME ctp_slab_cache_allocator COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_slab_cache_allocator_exec)
+
 # Skip under MSan: buddy allocator, thread/partitioned allocator, and hshm
 # malloc all use raw mmap/brk memory that MSan cannot instrument (no
 # instrumented allocator backing).
-set_tests_properties(
-  ctp_buddy_allocator
+set_property(TEST ctp_buddy_allocator
   ctp_buddy_compaction
   ctp_ctp_malloc
   ctp_thread_allocator
   ctp_thread_allocator_multithread
-  PROPERTIES LABELS "msan_skip"
-)
+  APPEND PROPERTY LABELS "msan_skip")
 
 if(NOT WIN32)
 add_test(NAME ctp_mp_allocator COMMAND
@@ -137,16 +144,14 @@ set_tests_properties(
 
 # Skip under MSan: Catch2 is precompiled without MSan instrumentation,
 # and multiprocess tests don't propagate MSan shadow across fork boundaries.
-set_tests_properties(
-  ctp_sub_alloc
+set_property(TEST ctp_sub_alloc
   ctp_sub_alloc_nested
   ctp_mp_allocator
   ctp_mp_allocator_multithread
   ctp_mp_allocator_multiprocess
   ctp_mp_reuse
   ctp_buddy_allocator_multiprocess
-  PROPERTIES LABELS "msan_skip"
-)
+  APPEND PROPERTY LABELS "msan_skip")
 
 # macOS (issue #483, fixed): ctp_mp_allocator_multiprocess used to livelock
 # under cross-process contention on the shared-memory ProducerConsumerAllocator.

@@ -234,6 +234,21 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Make this bdev's written data and allocator state durable -
+   * asynchronous. Completes once an fdatasync of the backing file (file
+   * bdevs) has returned; rc != 0 means the device could not guarantee it.
+   * @param pool_query Routing to the container that owns the device (a
+   *                   block's target_query_)
+   * @return future for the SyncTask
+   */
+  clio::run::Future<SyncTask> AsyncSync(const clio::run::PoolQuery &pool_query) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<SyncTask>(clio::run::CreateTaskId(),
+                                               pool_id_, pool_query);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Get performance statistics - asynchronous
    */
   clio::run::Future<clio::run::bdev::GetStatsTask> AsyncGetStats(

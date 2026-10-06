@@ -1,0 +1,37 @@
+# Compose for the pagify interceptor test. The CAE pool sits IN FRONT of
+# the CTE pool: a GetBlob named "page:<id>" is served by the CAE (which
+# resolves it through the tag's pagemap), and everything else forwards to
+# CTE at 512.0 unchanged.
+
+networking:
+  port: 9421
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "64MB"
+
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+    next_pool_id: "512.0"
+
+  - mod_name: clio_cte_core
+    pool_name: cte_core
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "32MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"

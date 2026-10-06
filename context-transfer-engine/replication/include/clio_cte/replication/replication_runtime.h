@@ -6,15 +6,19 @@
 #define CLIO_CTE_REPLICATION_REPLICATION_RUNTIME_H_
 
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <string>
+#include <chrono>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_interposer.h>
+#include <clio_cte/core/record_log.h>
 #include <clio_cte/replication/replication_client.h>
 #include <clio_cte/replication/replication_tasks.h>
 
@@ -115,8 +119,17 @@ class Runtime : public clio::cte::core::CoreInterposer {
    *  silently strip durability from every async caller. */
   clio::run::TaskResume MultiPutBlob(
       clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
+  /** Interposed fsync (Method::kSyncTag, broadcast): bring this container's
+   *  pending replicas of the tag up to date, then run the core's sync. When
+   *  every one is current the core is told so (kSyncReplicasCurrent) and
+   *  does not also move primaries that have a durable replica (#1143). */
+  clio::run::TaskResume SyncTag(
+      clio::run::shared_ptr<clio::cte::core::SyncTagTask> &task);
 
   // ---- Container virtuals (defined in autogen/replication_lib_exec.cc) ----
+  /** Recovering start (a plain `clio_run start`): Create pulls the handoff. */
+  void Restart(const clio::run::PoolId &pool_id, const std::string &pool_name,
+               clio::run::u32 container_id = 0) override;
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
             clio::run::u32 container_id = 0) override;
   clio::run::TaskResume Run(clio::run::u32 method,
@@ -165,11 +178,114 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * Best-effort: a failed chunk stops the copy without failing the read that
    * triggered it. recached reports bytes restored.
    */
-  clio::run::TaskResume RecachePrimary(const TagId &tag_id,
-                                       const std::string &blob_name,
-                                       int replica_idx,
-                                       clio::run::u64 rep_size,
-                                       clio::run::u64 &recached);
+  // ---- remote copies and failover (replication_remote.cc) ----
+  /** Delete a blob; at its owner, also its remote copies. */
+  clio::run::TaskResume DelBlob(
+      clio::run::shared_ptr<clio::cte::core::DelBlobTask> &task);
+  /** Truncate a blob; at its owner, also its remote copies. */
+  clio::run::TaskResume TruncateBlob(
+      clio::run::shared_ptr<clio::cte::core::TruncateBlobTask> &task);
+  /** Hand back to `owner_` every blob this container changed for it. */
+  clio::run::TaskResume HandoffPull(clio::run::shared_ptr<HandoffPullTask> &task);
+  /** Periodic: hand changes back to owners that are alive again. */
+  clio::run::TaskResume HandoffSweep(
+      clio::run::shared_ptr<HandoffSweepTask> &task);
+  /** The original PutBlob: primary plus this node's replicas. */
+  clio::run::TaskResume PutBlobLocal(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task);
+  /** The original MultiPutBlob: primary batch plus this node's replicas. */
+  clio::run::TaskResume MultiPutBlobLocal(
+      clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
+
+  /**
+   * Copy a replica back into the primary, sequentially from offset 0, so
+   * the DRAM fast path is restored after the primary was dropped or lost.
+   * Best-effort: stops at the first failed chunk, leaving a valid prefix.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob's name
+   * @param replica_idx replica index to read (0 = that container's primary)
+   * @param rep_size stored size of the copy being read
+   * @param recached bytes copied so far (output)
+   * @param from where the copy lives: this container (Local, a local
+   *        replica) or a successor's primary (DirectId, the remote copy)
+   */
+  clio::run::TaskResume RecachePrimary(
+      const TagId &tag_id, const std::string &blob_name, int replica_idx,
+      clio::run::u64 rep_size, clio::run::u64 &recached,
+      const clio::run::PoolQuery &from = clio::run::PoolQuery::Local());
+
+  /**
+   * Restore a primary that lost its bytes (a restart dropped its RAM-tier
+   * blocks, #1161) from the remote copy that just served a read of it, so
+   * later reads are local again. Under the blob's write token, and only if
+   * the primary still does not cover the range: a writer that refilled it
+   * meanwhile keeps its newer bytes. Best-effort.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob's name
+   * @param remote_c the container whose copy served the read
+   * @param end the end of the range the read needed covered
+   */
+  clio::run::TaskResume HealPrimaryFromRemote(const TagId &tag_id,
+                                              const std::string &blob_name,
+                                              clio::run::u32 remote_c,
+                                              clio::run::u64 end);
+
+  /**
+   * After a recovering start, the first time a blob this container owns is
+   * sized or read: compare the primary's stored bytes with the remote copy's
+   * and heal the primary if the copy holds more (#1164). The owner's
+   * persisted layout can lag its remote copy after a SIGKILL -- the copy is
+   * written through before a put is acked, the WAL may not have reached the
+   * disk -- so until reconciled the primary looks complete at an old size
+   * and anyone sizing a copy from it builds a short one. Once per blob.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob's name
+   * @param healed set true when the primary was re-cached from a copy
+   */
+  clio::run::TaskResume ReconcilePrimaryWithRemote(const TagId &tag_id,
+                                                   const std::string &blob_name,
+                                                   bool &healed);
+
+  /**
+   * Before a primary write that starts at `write_off`: if the primary holds
+   * fewer than `write_off` bytes but a replica holds more (the primary's
+   * volatile blocks were dropped by a restart), copy that replica back into
+   * the primary first. Otherwise the write would re-grow the primary over
+   * [0, write_off) with unfilled blocks, which then shadow the intact
+   * replica: every read of that range returns zeros.
+   * @param tag_id blob's tag
+   * @param blob_name blob name
+   * @param write_off lowest offset the pending write touches
+   * @param ok out: false when a replica holds bytes below write_off that
+   *        could not be copied back (no room in any tier): the write must
+   *        not go ahead, or reads of those bytes would return zeros
+   */
+  clio::run::TaskResume RefillPrimaryBeforeWrite(const TagId &tag_id,
+                                                 const std::string &blob_name,
+                                                 clio::run::u64 write_off,
+                                                 bool &ok);
+
+  /**
+   * Take the replication write token of every blob in `keys` (BlobKey),
+   * waiting while any is held. Taken all at once, so two batches with
+   * overlapping blobs cannot deadlock. Serializes the refill of a dropped
+   * primary from its replica, the primary put and the replica puts (and a
+   * read's re-cache of the primary): a refill or re-cache copies the
+   * replica's bytes into the primary and must not land over a write
+   * acknowledged meanwhile.
+   * @param keys blob keys (deduplicated by the callee)
+   */
+  clio::run::TaskResume LockBlobs(std::vector<std::string> keys);
+  /**
+   * Release tokens taken by LockBlobs.
+   * @param keys the same keys
+   */
+  void UnlockBlobs(const std::vector<std::string> &keys);
+  /** @return the write-token key of a blob */
+  static std::string BlobKey(const TagId &tag, const std::string &name) {
+    return std::to_string(tag.major_) + "." + std::to_string(tag.minor_) +
+           "." + name;
+  }
 
   /**
    * Populate THIS node's local cache copy of a remote blob (issue #886
@@ -206,6 +322,162 @@ class Runtime : public clio::cte::core::CoreInterposer {
    *  simply re-inserts and is caught next period. */
   std::mutex pending_mtx_;
   std::unordered_map<std::string, std::pair<TagId, std::string>> pending_;
+  /** Sweeps started / finished (ReplicateSweep numbers each run): a barrier
+   *  waits for the sweep that may hold entries it swapped out. */
+  std::atomic<clio::run::u64> sweeps_started_{0};
+  std::atomic<clio::run::u64> sweeps_done_{0};
+
+  /**
+   * Write one blob's current primary to each of its num_replicas durable
+   * replicas.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob
+   * @param ok OUT false if a replica could not be written (a deleted blob
+   *        counts as done)
+   */
+  clio::run::TaskResume ReplicateAllCopies(const TagId &tag_id,
+                                           const std::string &blob_name,
+                                           bool &ok);
+  /**
+   * The SyncTag barrier: replicate every pending blob of one tag on this
+   * container, after any sweep that took entries out of the pending set has
+   * finished with them.
+   * @param tag_id the tag being synced
+   * @param current OUT true when every pending replica of the tag was written
+   */
+  clio::run::TaskResume FlushTagReplicas(const TagId &tag_id, bool &current);
+
+  // ---- remote copies and failover (replication_remote.cc) ----
+  /** A blob changed here while its owner was down. */
+  struct HandoffEntry {
+    TagId tag_;
+    std::string name_;
+    bool deleted_ = false;
+    /** Which change this is (handoff_seq_ at NoteHandoff): a push clears
+     *  the entry only if no newer change replaced it meanwhile. */
+    clio::run::u64 seq_ = 0;
+  };
+  /** Last HandoffEntry::seq_ handed out (handoff_mu_). */
+  clio::run::u64 handoff_seq_ = 0;
+  /** Owners a PushHandoff is running for (handoff_mu_): the sweep and an
+   *  owner's pull must not push the same blobs at once. */
+  std::unordered_set<clio::run::u32> pushing_;
+  /** False on a restarted container until its hand-back pull finished:
+   *  until then client writes of the blobs it owns wait (#1154). */
+  std::atomic<bool> handed_back_{true};
+  /** Longest a client task waits for the hand-back (ms). */
+  static constexpr clio::run::u64 kHandbackWaitMs = 120000;
+  /**
+   * Hold a client write of a blob this container owns until it has pulled
+   * back what its
+   * stand-ins changed while it was down. A write accepted before that was
+   * overwritten by the older stand-in copy, and a truncate in the hand-back
+   * cut a newer full page short (#1154). Hand-back pushes (kHandoffPush)
+   * pass straight through.
+   * @param ctx the task's context
+   */
+  clio::run::TaskResume AwaitHandback(const Context &ctx);
+  /** @return containers in this pool. */
+  clio::run::u32 NumContainers() const;
+  /** @return the container that owns a blob by hash. */
+  clio::run::u32 OwnerOf(const TagId &tag, const std::string &name) const;
+  /** @return true if `container`'s node is alive. */
+  bool ContainerAlive(clio::run::u32 container) const;
+  /**
+   * Record a change made here on behalf of a dead owner.
+   * @param owner the owner container
+   * @param tag blob's tag
+   * @param name blob name
+   * @param deleted true for a delete, false for a write/truncate
+   */
+  void NoteHandoff(clio::run::u32 owner, const TagId &tag,
+                   const std::string &name, bool deleted);
+  /**
+   * Drop every node's cached copy of a blob this container just changed on
+   * behalf of its dead owner: the owner tracks who holds copies, and this
+   * stand-in does not know them, so it tells every live node.
+   * @param tag blob's tag
+   * @param name blob name
+   */
+  clio::run::TaskResume InvalidateCachedEverywhere(TagId tag,
+                                                   std::string name);
+  /**
+   * Serve a read from this blob's remote copies (#1114): the owner is alive
+   * but neither its primary nor its local replicas could be read (their
+   * device is down -- with neighborhood > 1 they can share a dead
+   * neighbor's disk). Reads the first live successor's shadow straight into
+   * the task's buffers (every segment of a vectored read).
+   * Also the path for a primary that came back SHORT after a restart (its
+   * RAM-tier blocks died with the node, #1161): the device is fine but the
+   * bytes are gone, and only a remote copy still holds them.
+   * @param task the read (its pool query is left untouched)
+   * @param served set true when a remote copy served every byte
+   * @param served_by when non-null, receives the container that served
+   */
+  clio::run::TaskResume ReadRemoteCopy(
+      clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task,
+      bool &served, clio::run::u32 *served_by = nullptr);
+  /**
+   * Mirror one written range to this blob's remote copies (owner side).
+   * @param tag blob's tag
+   * @param name blob name
+   * @param off offset of the range
+   * @param size size of the range
+   * @param data the bytes
+   * @param score blob score
+   */
+  clio::run::TaskResume MirrorRange(TagId tag, std::string name,
+                                    clio::run::u64 off, clio::run::u64 size,
+                                    ctp::ipc::ShmPtr<> data, float score);
+  /**
+   * Hand back every change recorded for `owner` to it.
+   * @param owner the returned owner
+   * @param pushed receives the number of blobs handed back
+   */
+  clio::run::TaskResume PushHandoff(clio::run::u32 owner, clio::run::u32 *pushed);
+  /**
+   * Copy this container's shadow of one blob to its owner.
+   * @param e the blob
+   * @param owner owner container
+   * @param ok receives true on success
+   */
+  clio::run::TaskResume PushOne(HandoffEntry e, clio::run::u32 owner, bool *ok);
+  /** Client bound to THIS (replication) pool: mirrored ops run through the
+   *  target node's replication container, so its local replicas apply. */
+  clio::cte::core::Client *Self();
+  std::unique_ptr<clio::cte::core::Client> self_client_;
+  /** Open the handoff log; on a restart, replay it into handoff_. */
+  void OpenHandoffLog();
+  /**
+   * Log one handoff change (a note or its completion).
+   * @param type kHandoffNote or kHandoffDone
+   * @param owner owner container
+   * @param e the entry
+   */
+  void LogHandoff(clio::run::u32 type, clio::run::u32 owner,
+                  const HandoffEntry &e);
+  /** Rewrite the log as a snapshot of handoff_ once it has grown. Caller
+   *  holds handoff_mu_. */
+  void CompactHandoffLogLocked();
+  static constexpr clio::run::u32 kHandoffNote = 1;
+  static constexpr clio::run::u32 kHandoffDone = 2;
+  /** Log bytes after which the handoff log is rewritten as a snapshot. */
+  static constexpr clio::run::u64 kHandoffCompactBytes = 4ull << 20;
+  std::mutex handoff_mu_;
+  /** Blobs whose replication write token is held (LockBlobs). */
+  std::mutex blob_busy_mu_;
+  // Held blob keys -> when their holder took them (steady ns), so a waiter
+  // stuck behind one can say how long it has been held (#1147).
+  std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+      blob_busy_;
+  std::unordered_map<clio::run::u32,
+                     std::unordered_map<std::string, HandoffEntry>> handoff_;
+  clio::cte::core::RecordLog handoff_log_;
+  bool is_restart_ = false;
+  /** Blobs already reconciled with their remote copy since this restart
+   *  (ReconcilePrimaryWithRemote); keys from BlobKey. */
+  std::mutex reconcile_mu_;
+  std::unordered_set<std::string> reconciled_;
 };
 
 }  // namespace clio::cte::replication

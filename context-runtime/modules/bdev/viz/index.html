@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clio Block Device</title>
+  <!-- The admin shell's stylesheet and helpers: every mounted page is served
+       from the same origin, so a module's UI can build on the dashboard shell
+       instead of restating it. -->
+  <link rel="stylesheet" href="/viz/clio_admin/css/style.css">
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-brand">Clio</div>
+    <ul class="nav-links">
+      <li><a href="/viz/clio_admin/index.html">Cluster</a></li>
+      <li><a href="/viz/clio_admin/pools.html">Pools</a></li>
+      <li><a href="/viz/clio_admin/config.html">Config</a></li>
+    </ul>
+    <div class="nav-status" id="conn-status">connecting…</div>
+  </nav>
+
+  <main class="content">
+    <h1 id="title">Block device</h1>
+    <p class="sub"><a href="/viz/clio_admin/pools.html">&larr; back to pools</a></p>
+    <div id="errors"></div>
+
+    <div class="row">
+      <label for="pool-select">Pool:</label>
+      <select id="pool-select"></select>
+    </div>
+
+    <h2>Statistics</h2>
+    <div class="grid" id="device"></div>
+
+    <h2>Task predictions</h2>
+    <p class="sub">
+      The learned per-method cost model for this pool: predicted time =
+      coefficient &times; task size; the error columns are the average miss.
+    </p>
+    <div id="predictions"></div>
+  </main>
+
+  <script src="/viz/clio_admin/js/api.js"></script>
+  <script src="js/bdev.js"></script>
+</body>
+</html>

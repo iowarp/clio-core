@@ -46,6 +46,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 /**
  * Reusable persistent allocator-state log (write-ahead log) for the bdev
@@ -145,12 +149,12 @@ class AllocatorLog {
       ReplayFileLocked();
     }
     // Ensure the file exists so a later Flush()/append always has a target.
-    std::FILE *f = std::fopen(path_.c_str(), "ab");
-    if (f == nullptr) {
+    CloseFileLocked();
+    file_ = std::fopen(path_.c_str(), "ab");
+    if (file_ == nullptr) {
       enabled_ = false;
       return false;
     }
-    std::fclose(f);
     return true;
   }
 
@@ -209,30 +213,69 @@ class AllocatorLog {
   }
 
   /**
-   * Append the buffered records to the file (write + fsync). Idempotent
-   * when the buffer is empty. Records flushed here are also folded into the
-   * in-memory recovered model so a later Compact() sees a consistent state.
+   * Hand the buffered records to the OS (write, no fsync) and fold them into
+   * the in-memory model. Survives a process crash -- the bytes sit in the
+   * page cache -- at the cost of one write syscall per call, so callers
+   * batch every record of one allocate/free into a single Append().
+   * Idempotent when the buffer is empty.
+   */
+  void Append() {
+    std::lock_guard<std::mutex> lock(mu_);
+    AppendLocked();
+  }
+
+  /**
+   * Append the buffered records, then fsync the log so they also survive
+   * power loss. Idempotent when nothing was written since the last sync.
    */
   void Flush() {
     std::lock_guard<std::mutex> lock(mu_);
-    if (!enabled_ || buffer_.empty()) return;
-    std::FILE *f = std::fopen(path_.c_str(), "ab");
-    if (f == nullptr) return;
-    std::fwrite(buffer_.data(), sizeof(AllocLogRecord), buffer_.size(), f);
-    std::fflush(f);
+    AppendLocked();
+    if (!enabled_ || file_ == nullptr || !unsynced_) return;
 #ifndef _WIN32
-    int fd = ::fileno(f);
+    int fd = ::fileno(file_);
     if (fd >= 0) {
       ::fsync(fd);
     }
 #endif
-    std::fclose(f);
-    // Fold the just-persisted records into the recovered model.
-    for (const auto &rec : buffer_) {
-      ApplyRecordLocked(rec);
+    unsynced_ = false;
+  }
+
+  /**
+   * Flush() without holding the log lock across the fsync: append under the
+   * lock, then fsync a duplicate of the descriptor, so other threads keep
+   * appending (and a concurrent Compact may swap the file: the duplicate
+   * still names the old one, whose records Compact already carried over).
+   * For a dedicated sync thread; everything appended before the call is
+   * durable when it returns.
+   * @return false if the fsync failed
+   */
+  bool SyncAppended() {
+#ifndef _WIN32
+    int fd = -1;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      AppendLocked();
+      if (!enabled_ || file_ == nullptr) return true;
+      const int cur = ::fileno(file_);
+      if (cur >= 0) fd = ::dup(cur);
+      unsynced_ = false;
     }
-    records_on_disk_ += buffer_.size();
-    buffer_.clear();
+    if (fd < 0) return false;
+#if defined(__linux__)
+    const bool ok = ::fdatasync(fd) == 0;
+#elif defined(__APPLE__)
+    // macOS has no fdatasync, and its fsync stops at the drive cache.
+    const bool ok = ::fcntl(fd, F_FULLFSYNC) == 0 || ::fsync(fd) == 0;
+#else
+    const bool ok = ::fsync(fd) == 0;
+#endif
+    ::close(fd);
+    return ok;
+#else
+    Flush();
+    return true;
+#endif
   }
 
   /**
@@ -296,18 +339,37 @@ class AllocatorLog {
     std::fclose(f);
 
     std::error_code ec;
+    CloseFileLocked();
     fs::rename(tmp, path_, ec);
     if (ec) {
       fs::remove(tmp, ec);
-      return;
+    } else {
+      records_on_disk_ = written;
+      live_cache_valid_ = false;
+#ifndef _WIN32
+      // The rename is durable only with its directory: otherwise a power
+      // loss brings back the old log and loses what is appended from here.
+      const std::string dir = fs::path(path_).parent_path().string();
+      const int dfd = ::open(dir.empty() ? "." : dir.c_str(),
+                             O_RDONLY | O_DIRECTORY);
+      if (dfd >= 0) {
+        (void)::fsync(dfd);
+        ::close(dfd);
+      }
+#endif
     }
-    records_on_disk_ = written;
-    live_cache_valid_ = false;
+    // Appends continue on whichever file now sits at path_.
+    file_ = std::fopen(path_.c_str(), "ab");
+    if (file_ == nullptr) {
+      enabled_ = false;
+    }
   }
 
   /** Sync then close the file handle (flushes any buffered records). */
   void Close() {
     Flush();
+    std::lock_guard<std::mutex> lock(mu_);
+    CloseFileLocked();
   }
 
   /** Recovered group table (after replay). */
@@ -366,6 +428,8 @@ class AllocatorLog {
   std::string path_;
   std::vector<AllocLogRecord> buffer_;
   bool enabled_ = false;
+  std::FILE *file_ = nullptr;  /**< Append handle, open while enabled */
+  bool unsynced_ = false;      /**< Appended since the last fsync */
   clio::run::u64 records_on_disk_ = 0;
   std::mutex mu_;
 
@@ -379,6 +443,27 @@ class AllocatorLog {
   std::map<clio::run::u32, std::vector<LiveBlock>> live_cache_;
   std::vector<GroupRec> group_cache_;
   std::vector<LiveBlock> empty_live_;
+
+  /** Write the buffer to the append handle (no fsync) and apply it. */
+  void AppendLocked() {
+    if (!enabled_ || buffer_.empty() || file_ == nullptr) return;
+    std::fwrite(buffer_.data(), sizeof(AllocLogRecord), buffer_.size(), file_);
+    std::fflush(file_);
+    for (const auto &rec : buffer_) {
+      ApplyRecordLocked(rec);
+    }
+    records_on_disk_ += buffer_.size();
+    buffer_.clear();
+    unsynced_ = true;
+  }
+
+  /** Close the append handle if open. */
+  void CloseFileLocked() {
+    if (file_ != nullptr) {
+      std::fclose(file_);
+      file_ = nullptr;
+    }
+  }
 
   /** Apply a single record to the in-memory recovered model. */
   void ApplyRecordLocked(const AllocLogRecord &rec) {

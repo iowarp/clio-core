@@ -330,11 +330,15 @@ struct nonatomic {
 };
 
 /** A wrapper for CUDA atomic operations.
- * Guarded by CTP_IS_GPU_COMPILER because CUDA device builtins (atomicAdd,
- * atomicExch, atomicCAS, etc.) are only available when compiling with nvcc/hipcc.
- * Regular g++/clang++ compilations with CTP_ENABLE_CUDA set should not parse
- * this class since it's only used as ctp::ipc::atomic<T> inside device code. */
-#if CTP_IS_GPU_COMPILER
+ * Guarded because the device builtins it uses (atomicAdd, atomicExch,
+ * atomicCAS, ...) only exist when a GPU compiler is driving. Regular
+ * g++/clang++ compilations with CTP_ENABLE_CUDA set should not parse this
+ * class since it's only used as ctp::ipc::atomic<T> inside device code.
+ *
+ * SYCL qualifies: sycl_cuda_compat.h supplies those same names over
+ * sycl::atomic_ref, and the SYCL device pass needs a real atomic<T> for the
+ * same reason the CUDA one does -- see the alias further down. */
+#if CTP_IS_GPU_COMPILER || CTP_IS_SYCL_COMPILER
 template <typename T>
 struct rocm_atomic {
   T x;
@@ -372,7 +376,7 @@ struct rocm_atomic {
   template <typename U>
   CTP_INLINE_CROSS_FUN T
   fetch_add(U count, std::memory_order order = std::memory_order_seq_cst) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     if constexpr (sizeof(T) == 8) {
       return (T)atomicAdd(reinterpret_cast<unsigned long long*>(&x),
                           static_cast<unsigned long long>(
@@ -393,7 +397,7 @@ struct rocm_atomic {
   template <typename U>
   CTP_INLINE_CROSS_FUN T
   fetch_add_system(U count) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     if constexpr (sizeof(T) == 8) {
       return (T)atomicAdd_system(
           reinterpret_cast<unsigned long long*>(&x),
@@ -412,7 +416,7 @@ struct rocm_atomic {
   template <typename U>
   CTP_INLINE_CROSS_FUN T
   fetch_sub(U count, std::memory_order order = std::memory_order_seq_cst) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     if constexpr (sizeof(T) == 8) {
       return (T)atomicAdd(reinterpret_cast<unsigned long long*>(&x),
                           static_cast<unsigned long long>(
@@ -446,7 +450,7 @@ struct rocm_atomic {
    */
   CTP_INLINE_CROSS_FUN T
   load_device() const {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     // Device-scope atomic read: atomicAdd(&x, 0) bypasses L1 and reads
     // from L2 (which is coherent across SMs). This is a read-modify-write
     // but with 0 addend, so it doesn't change the value.
@@ -481,7 +485,7 @@ struct rocm_atomic {
   template <typename U>
   CTP_INLINE_CROSS_FUN T
   exchange(U count, std::memory_order order = std::memory_order_seq_cst) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     if constexpr (sizeof(T) == 8) {
       return (T)atomicExch(reinterpret_cast<unsigned long long*>(&x),
                            static_cast<unsigned long long>(
@@ -504,7 +508,7 @@ struct rocm_atomic {
   /** System-scope atomic fetch_sub (visible to CPU from GPU immediately) */
   template <typename U>
   CTP_INLINE_CROSS_FUN T fetch_sub_system(U count) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     if constexpr (sizeof(T) == 8) {
       return atomicAdd_system(
           reinterpret_cast<unsigned long long *>(&x),
@@ -524,7 +528,7 @@ struct rocm_atomic {
    *  can hang on pinned host memory in persistent kernels. */
   template <typename U>
   CTP_INLINE_CROSS_FUN void store_system(U count) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     __threadfence_system();
     *reinterpret_cast<volatile T*>(&x) = static_cast<T>(count);
     __threadfence_system();
@@ -549,7 +553,7 @@ struct rocm_atomic {
   CTP_INLINE_CROSS_FUN bool compare_exchange_weak(
       T &expected, U desired,
       std::memory_order order = std::memory_order_seq_cst) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     if constexpr (sizeof(T) == 8) {
       auto old = atomicCAS(reinterpret_cast<unsigned long long*>(
                                const_cast<T*>(&x)),
@@ -582,7 +586,7 @@ struct rocm_atomic {
   CTP_INLINE_CROSS_FUN bool compare_exchange_strong(
       T &expected, U desired,
       std::memory_order order = std::memory_order_seq_cst) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     if constexpr (sizeof(T) == 8) {
       auto old = atomicCAS(reinterpret_cast<unsigned long long*>(
                                const_cast<T*>(&x)),
@@ -710,7 +714,7 @@ struct rocm_atomic {
   /** Bitwise and assign (device-scope on GPU, plain on host) */
   template <typename U>
   CTP_INLINE_CROSS_FUN rocm_atomic &operator&=(U other) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     atomicAnd(reinterpret_cast<unsigned int*>(&x),
               static_cast<unsigned int>(other));
 #else
@@ -722,7 +726,7 @@ struct rocm_atomic {
   /** Bitwise or assign (device-scope on GPU, plain on host) */
   template <typename U>
   CTP_INLINE_CROSS_FUN rocm_atomic &operator|=(U other) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     atomicOr(reinterpret_cast<unsigned int*>(&x),
              static_cast<unsigned int>(other));
 #else
@@ -736,7 +740,7 @@ struct rocm_atomic {
    *  atomicOr_system can hang on pinned host memory in persistent kernels. */
   template <typename U>
   CTP_INLINE_CROSS_FUN rocm_atomic &or_system(U other) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     __threadfence_system();
     volatile T *vptr = reinterpret_cast<volatile T*>(&x);
     *vptr = *vptr | static_cast<T>(other);
@@ -755,7 +759,7 @@ struct rocm_atomic {
   CTP_INLINE_CROSS_FUN bool compare_exchange_strong_system(
       T &expected, U desired,
       std::memory_order order = std::memory_order_seq_cst) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     if constexpr (sizeof(T) == 8) {
       auto old = atomicCAS_system(
           reinterpret_cast<unsigned long long*>(const_cast<T*>(&x)),
@@ -785,7 +789,7 @@ struct rocm_atomic {
   /** Bitwise xor assign (device-scope on GPU, plain on host) */
   template <typename U>
   CTP_INLINE_CROSS_FUN rocm_atomic &operator^=(U other) {
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
     atomicXor(reinterpret_cast<unsigned int*>(&x),
               static_cast<unsigned int>(other));
 #else
@@ -874,10 +878,18 @@ struct std_atomic {
     return x.fetch_sub(count, order);
   }
 
-  /** Atomic load wrapper */
-  CTP_INLINE T
+  /** Atomic load wrapper. Device-callable: nvcc always accepted the device
+   * call here (the cross-call diagnostic is suppressed project-wide) and
+   * emitted a plain load; clang makes it a hard error, so spell out what the
+   * device side actually is -- a volatile poll of a host-written flag. */
+  CTP_INLINE_CROSS_FUN T
   load(std::memory_order order = std::memory_order_seq_cst) const {
+#if CTP_IS_HOST
     return x.load(order);
+#else
+    (void)order;
+    return *reinterpret_cast<const volatile T *>(&x);
+#endif
   }
 
   /** Atomic store wrapper */
@@ -1172,6 +1184,22 @@ template <typename T>
 using atomic = rocm_atomic<T>;
 #endif
 
+/**
+ * SYCL device pass: the same real-atomic type the CUDA device pass gets.
+ *
+ * NOT nonatomic<T>. That is the tempting fix -- it compiles, and the
+ * `CTP_IS_GPU && !CUDA_OR_ROCM` fallback below does exactly that -- but here
+ * it would be a silent correctness downgrade rather than a stub: this type
+ * backs the completion flags a kernel polls and the free-list counters the
+ * page cache bumps, both of which really are contended. rocm_atomic's method
+ * bodies select their intrinsic on CTP_IS_DEVICE_PASS, so they resolve to
+ * sycl::atomic_ref here through sycl_cuda_compat.h.
+ */
+#if CTP_IS_SYCL_DEVICE
+template <typename T>
+using atomic = rocm_atomic<T>;
+#endif
+
 #if CTP_IS_GPU && !CTP_ENABLE_CUDA_OR_ROCM
 // Fallback for nvcc's device-compilation pass when CTP_ENABLE_CUDA=0.
 // CTP_IS_GPU=1 (via __CUDA_ARCH__) but no GPU atomic backend is configured.
@@ -1186,7 +1214,7 @@ using opt_atomic =
     typename std::conditional<is_atomic, atomic<T>, nonatomic<T>>::type;
 
 /** Device-scope memory fence */
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
 CTP_GPU_FUN static void threadfence() { __threadfence(); }
 #else
 CTP_INLINE static void threadfence() {
@@ -1195,7 +1223,7 @@ CTP_INLINE static void threadfence() {
 #endif
 
 /** System-scope memory fence (ensures GPU writes are visible to CPU) */
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
 CTP_GPU_FUN static void threadfence_system() { __threadfence_system(); }
 #else
 CTP_INLINE static void threadfence_system() {
@@ -1204,20 +1232,42 @@ CTP_INLINE static void threadfence_system() {
 #endif
 
 /**
+ * Lane mask for warp/wavefront collectives.
+ *
+ * A CUDA warp is 32 lanes and takes a 32-bit mask; an AMD wavefront is 64 and
+ * HIP requires a 64-bit one. ROCm 7.x static_asserts on this rather than
+ * silently promoting -- "The mask must be a 64-bit integer. Implicitly
+ * promoting a smaller integer is almost always an error" -- which is how the
+ * hardcoded `unsigned` below was found. It broke EVERY ROCm compile of any TU
+ * that reached this header, which is most of them.
+ */
+#if CTP_ENABLE_ROCM
+using warp_mask_t = unsigned long long;
+static constexpr warp_mask_t kWarpFullMask = ~0ull;
+#else
+using warp_mask_t = unsigned;
+static constexpr warp_mask_t kWarpFullMask = 0xffffffffu;
+#endif
+
+/**
  * Safe 64-bit warp shuffle broadcast.
  * Splits into two 32-bit shuffles to avoid potential issues with
  * __shfl_sync for 64-bit types on some GPU architectures.
+ *
+ * NOTE: currently has no callers. Kept and made portable rather than deleted,
+ * because a deliberately-written helper is worth more correct than absent --
+ * but do not assume it is exercised anywhere.
  */
-#if CTP_IS_GPU
+#if CTP_IS_DEVICE_PASS
 CTP_GPU_FUN static unsigned long long shfl_sync_u64(
-    unsigned mask, unsigned long long val, int src_lane) {
+    warp_mask_t mask, unsigned long long val, int src_lane) {
   unsigned int lo = __shfl_sync(mask, static_cast<unsigned int>(val), src_lane);
   unsigned int hi = __shfl_sync(mask, static_cast<unsigned int>(val >> 32), src_lane);
   return (static_cast<unsigned long long>(hi) << 32) | lo;
 }
 #else
 CTP_INLINE static unsigned long long shfl_sync_u64(
-    unsigned mask, unsigned long long val, int src_lane) {
+    warp_mask_t mask, unsigned long long val, int src_lane) {
   (void)mask; (void)src_lane;
   return val;
 }

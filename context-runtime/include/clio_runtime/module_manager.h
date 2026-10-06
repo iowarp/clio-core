@@ -164,6 +164,29 @@ class ModuleManager {
    */
   bool IsInitialized() const;
 
+  /**
+   * Get the filesystem path of the library a ChiMod was loaded from.
+   *
+   * This is the anchor the web dashboard uses to locate a ChiMod's `viz/`
+   * assets: the answer follows whichever copy of the module the runtime
+   * actually dlopen'd, so a built-but-not-installed tree and an installed tree
+   * resolve to their own assets with no configuration.
+   *
+   * @param chimod_name Name of ChiMod
+   * @return Absolute path to the loaded shared library, or "" if not loaded
+   */
+  std::string GetChiModLibPath(const std::string& chimod_name);
+
+  /**
+   * Get the directory path where the runtime shared object is located
+   *
+   * Uses dladdr() to discover the runtime location of the shared object,
+   * allowing dynamic loading of sibling modules in the same directory.
+   *
+   * @return Absolute directory path, or empty string on failure
+   */
+  std::string GetModuleDirectory() const;
+
  private:
   /**
    * Scan directories for ChiMod libraries
@@ -175,16 +198,6 @@ class ModuleManager {
    * @return Vector of directory paths
    */
   std::vector<std::string> GetScanDirectories() const;
-
-  /**
-   * Get the directory path where the runtime shared object is located
-   *
-   * Uses dladdr() to discover the runtime location of the shared object,
-   * allowing dynamic loading of sibling modules in the same directory.
-   *
-   * @return Absolute directory path, or empty string on failure
-   */
-  std::string GetModuleDirectory() const;
 
   /**
    * Check if file is a potential ChiMod library

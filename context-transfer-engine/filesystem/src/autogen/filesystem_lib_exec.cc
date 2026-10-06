@@ -19,11 +19,14 @@ namespace clio::cte::filesystem {
   X(kMonitor, MonitorTask, Monitor)       \
   X(kOpen, OpenTask, Open)                \
   X(kClose, CloseTask, Close)             \
+  X(kMultiCreate, MultiCreateTask, MultiCreate) \
+  X(kAdvanceSize, AdvanceSizeTask, AdvanceSize) \
+  X(kShardOp, ShardOpTask, ShardOp)       \
+  X(kSyncMeta, SyncMetaTask, SyncMeta)    \
   X(kRead, ReadTask, Read)                \
   X(kWrite, WriteTask, Write)             \
   X(kGetattr, GetattrTask, Getattr)       \
   X(kTruncate, TruncateTask, Truncate)    \
-  X(kAppend, AppendTask, Append)          \
   X(kReaddir, ReaddirTask, Readdir)       \
   X(kMkdir, MkdirTask, Mkdir)             \
   X(kRmdir, RmdirTask, Rmdir)             \
@@ -31,10 +34,6 @@ namespace clio::cte::filesystem {
   X(kRename, RenameTask, Rename)          \
   X(kLink, LinkTask, Link)                \
   X(kStatSize, StatSizeTask, StatSize)    \
-  X(kAppendSequence, AppendSequenceTask, AppendSequence)    \
-  X(kAppendCollect, AppendCollectTask, AppendCollect)       \
-  X(kAppendExecution, AppendExecutionTask, AppendExecution) \
-  X(kAppendPlan, AppendPlanTask, AppendPlan)                \
   X(kUtimens, UtimensTask, Utimens)   \
   X(kSymlink, SymlinkTask, Symlink)   \
   X(kReadlink, ReadlinkTask, Readlink)   \
@@ -49,6 +48,13 @@ void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_nam
   clio::run::Container::Init(pool_id, pool_name, container_id);
   DefineModel(Method::kMaxMethodId);
   SetMethodNames(Method::GetMethodNames());
+}
+
+void Runtime::Restart(const clio::run::PoolId &pool_id,
+                      const std::string &pool_name,
+                      clio::run::u32 container_id) {
+  is_restart_ = true;
+  Init(pool_id, pool_name, container_id);
 }
 
 clio::run::u64 Runtime::GetWorkRemaining() const { return 0; }
@@ -194,13 +200,48 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
   }
 }
 
+/**
+ * Merge a single remote replica's result into the originating task.
+ *
+ * Every filesystem task goes to exactly ONE container (the hash-chosen owner
+ * of the state it touches), so "aggregating" its reply is taking the
+ * replica's fields wholesale. The
+ * task types define no AggregateOut of their own, and the base one moves
+ * only a nonzero return code: a task answered by another node came back
+ * with every OUT field at its default (mkdir reported ENOENT for a
+ * directory it had just created, readdir came back empty). The copy also
+ * overwrites the base fields, so the originating task's identity (the ids
+ * and query its completion and reply routing key off) is restored after.
+ * @param orig    the task the local runtime is completing
+ * @param replica the reply deserialized from the remote container
+ */
+template <typename TaskT>
+static void TakeReplicaResult(clio::run::shared_ptr<clio::run::Task> &orig,
+                              const clio::run::shared_ptr<clio::run::Task> &replica) {
+  auto dst = orig.template Cast<TaskT>();
+  const clio::run::PoolId pool_id = dst->pool_id_;
+  const clio::run::TaskId task_id = dst->task_id_;
+  const clio::run::PoolQuery pool_query = dst->pool_query_;
+  const clio::run::u32 method = dst->method_;
+  const auto task_flags = dst->task_flags_;
+  const double period_ns = dst->period_ns_;
+  const auto task_group = dst->task_group_;
+  dst->Copy(ctp::ipc::FullPtr<TaskT>(replica.template Cast<TaskT>().get()));
+  dst->pool_id_ = pool_id;
+  dst->task_id_ = task_id;
+  dst->pool_query_ = pool_query;
+  dst->method_ = method;
+  dst->task_flags_ = task_flags;
+  dst->period_ns_ = period_ns;
+  dst->task_group_ = task_group;
+}
+
 void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task,
                            const clio::run::shared_ptr<clio::run::Task> &replica_task) {
   switch (method) {
 #define X(MID, TASK, HANDLER)                                            \
     case Method::MID:                                                    \
-      orig_task.template Cast<TASK>()->AggregateOut(                     \
-          ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));       \
+      TakeReplicaResult<TASK>(orig_task, replica_task);                  \
       break;
     CLIO_FS_FOR_EACH_METHOD(X)
 #undef X
@@ -213,12 +254,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
 
 void Runtime::AggregateIn(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &agg_task,
                           const clio::run::shared_ptr<clio::run::Task> &member_task) {
-  // Only AppendCollect combines member inputs (ManyToOne). All other methods
-  // keep the default no-op (the aggregate is a copy of the first member).
-  if (method == Method::kAppendCollect) {
-    agg_task.template Cast<AppendCollectTask>()->AggregateIn(
-        ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
-  }
+  // No filesystem method is a ManyToOne collective: the aggregate is a
+  // copy of the first member.
+  (void)method;
+  (void)agg_task;
+  (void)member_task;
 }
 
 #undef CLIO_FS_FOR_EACH_METHOD

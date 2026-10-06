@@ -10,7 +10,7 @@
 #   * cte_main: a CTE bound to safe0 as its backing store.
 #   * clio_fs: a POSIX filesystem (clio-fs) over the CTE, mounted via FUSE.
 #
-# The operator removes a bdev and replaces it from the context-visualizer
+# The operator removes a bdev and replaces it from the dashboard
 # safe-bdev dashboard; recovery progress (ops in flight vs remaining) is shown
 # live.
 

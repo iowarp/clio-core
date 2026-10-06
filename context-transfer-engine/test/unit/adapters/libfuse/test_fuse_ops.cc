@@ -127,6 +127,11 @@ class FuseOpsFixture {
     success = clio::cte::filesystem::CLIO_CFS_CLIENT_INIT();
     REQUIRE(success);
 
+    // The namespace is strict POSIX: a create under a directory that does
+    // not exist is ENOENT, so the directory the file tests share must exist.
+    const int mk = cte_fuse_mkdir("/ops", 0755);
+    REQUIRE((mk == 0 || mk == -EEXIST));
+
     g_initialized = true;
     INFO("Embedded runtime + CTE pool + RAM target + CFS chimod ready");
   }
@@ -182,7 +187,10 @@ TEST_CASE("FUSE ops - init is idempotent", "[fuse][ops]") {
   void *ret = cte_fuse_init(&conn, &cfg);
   (void)ret;
   REQUIRE(cfg.use_ino == 1);
-  REQUIRE(cfg.attr_timeout == 0);
+  // Kernel attr/entry caching defaults to 1 s (checkout-shaped workloads
+  // were lookup-storm bound at TTL 0); CLIO_FUSE_ATTR_CACHE_S=0 restores
+  // strict coherence.
+  REQUIRE(cfg.attr_timeout == 1.0);
 }
 
 // ============================================================================
@@ -263,11 +271,17 @@ TEST_CASE("FUSE ops - read/write bad handle", "[fuse][ops]") {
   REQUIRE(cte_fuse_write("/x", &c, 1, 0, &fi) == -EBADF);
 }
 
-TEST_CASE("FUSE ops - open missing file is ENOENT", "[fuse][ops]") {
+TEST_CASE("FUSE ops - open missing file is ESTALE", "[fuse][ops]") {
   Fx();
   auto fi = MakeFi();
+  // The kernel only opens a path it just looked up, so a missing file at
+  // open means it vanished in between: ESTALE makes the kernel look the path
+  // up again, and that lookup (getattr) is what reports ENOENT.
   int rc = cte_fuse_open("/definitely/not/here.dat", &fi);
-  REQUIRE(rc == -ENOENT);
+  REQUIRE(rc == -kOpenVanishedErrno);  // ESTALE (ENOENT on Windows)
+  cte_stat_t st;
+  REQUIRE(cte_fuse_getattr("/definitely/not/here.dat", &st, nullptr) ==
+          -ENOENT);
 }
 
 // ============================================================================
@@ -312,6 +326,10 @@ TEST_CASE("FUSE ops - mkdir readdir rmdir", "[fuse][ops]") {
 // ============================================================================
 
 TEST_CASE("FUSE ops - chmod chown utimens", "[fuse][ops]") {
+  // Detached (fire-and-forget) utimens is the default; this case asserts
+  // exact read-back after each utimens, so pin the awaited mode. The env is
+  // read once on first use, and no earlier case calls utimens.
+  ctp::SystemInfo::Setenv("CLIO_FUSE_ASYNC_UTIMENS", "0", 1);
   Fx();
   const char *path = "/ops/perm.bin";
   auto fi = MakeFi();
@@ -481,6 +499,21 @@ TEST_CASE("FUSE ops - fallocate modes", "[fuse][ops]") {
               &fi) == 0);
   REQUIRE(cte_fuse_getattr(path, &st, &fi) == 0);
   REQUIRE(st.st_size == 4096);
+
+  // ZERO_RANGE past EOF without KEEP_SIZE grows the file to its end, also
+  // right after truncates down (generic/075 fsx: write, truncate, truncate,
+  // zero -> "Size error: expected 0x146ee stat 0x13226").
+  {
+    std::vector<char> buf(0x3e99b, 'a');
+    REQUIRE(cte_fuse_write(path, buf.data(), buf.size(), 0, &fi) ==
+            static_cast<int>(buf.size()));
+  }
+  REQUIRE(cte_fuse_truncate(path, 0x17cac, &fi) == 0);
+  REQUIRE(cte_fuse_truncate(path, 0x13226, &fi) == 0);
+  REQUIRE(cte_fuse_fallocate(path, FALLOC_FL_ZERO_RANGE, 0x8a25, 0xbcc9,
+                             &fi) == 0);
+  REQUIRE(cte_fuse_getattr(path, &st, &fi) == 0);
+  REQUIRE(st.st_size == 0x146ee);
 
   REQUIRE(cte_fuse_release(path, &fi) == 0);
   REQUIRE(cte_fuse_unlink(path) == 0);

@@ -25,6 +25,30 @@ Future<TaskT> IpcCpu2CpuZmq::SendIn(IpcManager *ipc,
 #else
   if (task_ptr.IsNull()) return Future<TaskT>();
 
+  // Finalized-client guard (issue #970). ClientFinalize resets the transports
+  // this function is about to use, so a submit after it dereferences a dangling
+  // one. Complete the task with an error instead.
+  //
+  // Placed HERE rather than in IpcManager::Send, which is where it started: Send
+  // is not the only way in. ClientConnect (reconnect) and RegisterMemory call
+  // this directly from ipc_manager.cc -- five sites that bypass Send entirely --
+  // and each of them would hit the same dangling transport. Guarding the
+  // transport entry points covers those too, and needs no CTP_IS_HOST block of
+  // its own because this body is already the host half of one.
+  //
+  // The runtime self-send path (IpcCpu2Self::SendIn) is deliberately untouched:
+  // it uses none of these transports, so excluding it is structural here rather
+  // than an is_runtime test.
+  if (ipc->client_finalized_.load(std::memory_order_acquire)) {
+    HLOG(kWarning,
+         "Send(ZMQ): client is finalized; failing task instead of submitting on a "
+         "torn-down transport (issue #970)");
+    Future<TaskT> future(task_ptr->pool_id_, task_ptr->method_, task_ptr);
+    task_ptr->SetReturnCode(static_cast<u32>(-1));
+    task_ptr->SetComplete();
+    return future;
+  }
+
   // Set net_key for response routing
   size_t net_key = reinterpret_cast<size_t>(task_ptr.get());
   task_ptr->task_id_.net_key_ = net_key;
@@ -81,6 +105,33 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
   TaskT *task_ptr = future.get();
   ClientOrigin origin = future_shm->origin_;
 
+  // Never-sent task: nothing to wait for, nothing to claim. Twin of the check
+  // in IpcCpu2Cpu::RecvOut -- see the long comment there for why a zero
+  // net_key_ unambiguously means "synthesized client-side and completed
+  // locally, never Sent" (the CoreClient read fast paths).
+  //
+  // This must come BEFORE the kClientShm reconnect head below, not just before
+  // the claim at the bottom: those synthesized futures carry origin_ ==
+  // kClientShm, so a dead/unreachable server would send one through
+  // WaitForServerAndReconnect + ResendTask -- resending a task the client
+  // already satisfied out of its own cache.
+  if (task_ptr->task_id_.net_key_ == 0) {
+    return true;
+  }
+
+  // Finalized-client escape (issue #970), before the reconnect head below.
+  // Reaching here during teardown means the SHM path handed off after seeing
+  // the server flagged dead; reconnecting would rebuild transports the caller
+  // is concurrently destroying, and the resent task still has no listener to
+  // answer it.
+  if (ipc->client_finalized_.load(std::memory_order_acquire) &&
+      !task_ptr->IsComplete()) {
+    HLOG(kWarning,
+         "Recv: client is finalized; failing task instead of reconnecting "
+         "(issue #970)");
+    return false;
+  }
+
   // If origin was SHM but server is dead, reconnect and resend via ZMQ
   if (origin == ClientOrigin::kClientShm) {
     if (ipc->client_retry_timeout_ == 0 && ipc->client_try_new_servers_ <= 0) {
@@ -90,7 +141,8 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
     }
     HLOG(kWarning, "Recv(SHM): Server dead, attempting reconnect...");
     auto start = std::chrono::steady_clock::now();
-    if (!ipc->WaitForServerAndReconnect(start)) return false;
+    // Thread max_sec through WaitForServerAndReconnect (issue #1096)
+    if (!ipc->WaitForServerAndReconnect(start, max_sec)) return false;
     ResendTask(ipc, future);
     future_shm = future.GetFutureShm();
   }
@@ -101,12 +153,30 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
   // named auto-reset event latches a signal that races the Wait.
   ctp::lbm::EventManager *em = &ipc->GetTls()->event_manager_;
   auto start = std::chrono::steady_clock::now();
+  // [HANGWATCH-CLIENT] (#1147): the SHM twin of this loop names a task whose
+  // response is a minute late; this loop said nothing, so a FUSE daemon on
+  // TCP waiting on a lost or stalled response looked like a silent hang from
+  // outside (#1149's v81 run: every node's fsync parked here for 15 minutes).
+  float next_report_s = 60.0f;
   while (!task_ptr->IsComplete()) {
     em->Wait(100);  // 100us bounded re-check; woken immediately by Signal
     float elapsed =
         std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
             .count();
     if (max_sec > 0 && elapsed >= max_sec) return false;
+    if (elapsed >= next_report_s) {
+      HLOG(kError,
+           "[HANGWATCH-CLIENT] waited {} ms for task {} (pool {}, method {}) "
+           "over ZMQ",
+           elapsed * 1000.0f, task_ptr->task_id_, task_ptr->pool_id_,
+           task_ptr->method_);
+      next_report_s *= 2.0f;
+    }
+    if (ipc->client_finalized_.load(std::memory_order_acquire)) {
+      HLOG(kWarning,
+           "Recv: client finalized mid-wait; failing task (issue #970)");
+      return false;
+    }
     if (!ipc->server_alive_.load() && !ipc->reconnecting_.load()) {
       if (ipc->client_retry_timeout_ == 0 &&
           ipc->client_try_new_servers_ <= 0) {
@@ -114,7 +184,8 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
         return false;
       }
       HLOG(kWarning, "Recv: Server unreachable, reconnecting...");
-      if (!ipc->WaitForServerAndReconnect(start)) return false;
+      // Thread max_sec through WaitForServerAndReconnect (issue #1096)
+      if (!ipc->WaitForServerAndReconnect(start, max_sec)) return false;
       ResendTask(ipc, future);
       future_shm = future.GetFutureShm();
       start = std::chrono::steady_clock::now();
@@ -125,6 +196,7 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
   // Memory fence + deserialize from pending_response_archives_
   std::atomic_thread_fence(std::memory_order_acquire);
   size_t net_key = task_ptr->task_id_.net_key_;
+  bool claimed = false;
   {
     std::lock_guard<std::mutex> lock(ipc->pending_futures_mutex_);
     auto it = ipc->pending_response_archives_.find(net_key);
@@ -133,7 +205,41 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
       archive->ResetBulkIndex();
       archive->msg_type_ = MsgType::kSerializeOut;
       *archive >> (*task_ptr);
+      claimed = true;
     }
+  }
+  // Reaching here with NO archive is a protocol violation, and this used to
+  // fall through to `return true` in silence -- which is precisely how the
+  // #968 read failures presented: the task looked like it succeeded while
+  // every OUT field still held its client-side constructor default (rc=0,
+  // result_code=0, scheduled=0, msg=''), because the OUT deserialize never
+  // ran. Nothing distinguished that from a genuine zero-valued success.
+  //
+  // It cannot happen on a well-formed round trip. The ONLY client-path writer
+  // of IsComplete() is the demux in IpcManager::RecvZmqClientThread, which
+  // parks the archive under this same net_key BEFORE calling SetComplete().
+  // So a complete task with no archive means the completion that woke us was
+  // raised by some OTHER task's response -- the aliasing case, since net_key
+  // is the task's recycled heap address (TaskId::net_key_, types.h).
+  //
+  // Failing here (rather than logging and continuing) is what makes the bug
+  // observable: WaitCpu2Cpu stamps return_code_ = -1 on a false return, so
+  // the caller sees a real error instead of plausible defaults.
+  //
+  // consumed_ guards the one legitimate miss: a SECOND Wait() on a future
+  // whose archive the first Wait already claimed. Destroy(true) sets
+  // consumed_ after Recv returns, so it is false on the first claim and true
+  // on any re-Wait. (The ZMQ path does not erase on claim -- the SHM twin
+  // does -- but the guard is kept in both for symmetry.)
+  // net_key == 0 means the task was completed locally and never sent (see
+  // the twin in IpcCpu2Cpu::RecvOut), so there is no response to claim.
+  if (!claimed && !future.consumed_ && net_key != 0) {
+    HLOG(kError,
+         "IpcCpu2CpuZmq::RecvOut: task completed with NO response archive for "
+         "net_key {} -- the completion came from another task's response "
+         "(recycled address). Failing instead of returning defaults. See #968.",
+         net_key);
+    return false;
   }
   return true;
 #endif  // CTP_IS_HOST

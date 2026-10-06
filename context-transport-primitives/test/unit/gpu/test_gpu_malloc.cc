@@ -31,6 +31,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <type_traits>
 #include <catch2/catch_all.hpp>
 
 #include "clio_ctp/data_structures/ipc/ring_buffer.h"
@@ -150,35 +151,32 @@ TEST_CASE("GpuMalloc", "[gpu][backend]") {
     // Step 2: Create an allocator on that backend (using GPU kernel)
     using AllocT = ctp::ipc::BuddyAllocator;
     AllocT **alloc_result_dev;
-    cudaMalloc(&alloc_result_dev, sizeof(AllocT *));
+    alloc_result_dev = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(alloc_result_dev)>>(sizeof(AllocT *));
 
     MemoryBackend *backend_dev;
-    cudaMalloc(&backend_dev, sizeof(GpuMalloc));
-    cudaMemcpy(backend_dev, &backend, sizeof(GpuMalloc),
-               cudaMemcpyHostToDevice);
+    backend_dev = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(backend_dev)>>(sizeof(GpuMalloc));
+    ctp::GpuApi::Memcpy(backend_dev, &backend, sizeof(GpuMalloc));
 
     MakeAllocKernel<AllocT><<<1, 1>>>(backend_dev, alloc_result_dev);
-    cudaDeviceSynchronize();
-    CUDA_ERROR_CHECK(cudaGetLastError());
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     AllocT *alloc_ptr;
-    cudaMemcpy(&alloc_ptr, alloc_result_dev, sizeof(AllocT *),
-               cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(&alloc_ptr, alloc_result_dev, sizeof(AllocT *));
     REQUIRE(alloc_ptr != nullptr);
 
     // Step 3: Allocate a ring_buffer on that backend (using GPU kernel)
     using RingBuffer = mpsc_ring_buffer<int, AllocT>;
     RingBuffer **ring_result_dev;
-    cudaMalloc(&ring_result_dev, sizeof(RingBuffer *));
+    ring_result_dev = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(ring_result_dev)>>(sizeof(RingBuffer *));
 
     AllocateRingBufferKernel<AllocT, int>
         <<<1, 1>>>(alloc_ptr, kNumElements, ring_result_dev);
-    cudaDeviceSynchronize();
-    CUDA_ERROR_CHECK(cudaGetLastError());
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     RingBuffer *ring_ptr;
-    cudaMemcpy(&ring_ptr, ring_result_dev, sizeof(RingBuffer *),
-               cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(&ring_ptr, ring_result_dev, sizeof(RingBuffer *));
     REQUIRE(ring_ptr != nullptr);
 
     // Step 4 & 5: Pass the ring_buffer to the kernel and push 10 elements
@@ -190,34 +188,32 @@ TEST_CASE("GpuMalloc", "[gpu][backend]") {
 
     // Copy values to GPU
     int *dev_values;
-    cudaMalloc(&dev_values, kNumElements * sizeof(int));
-    cudaMemcpy(dev_values, host_values, kNumElements * sizeof(int),
-               cudaMemcpyHostToDevice);
+    dev_values = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(dev_values)>>(kNumElements * sizeof(int));
+    ctp::GpuApi::Memcpy(dev_values, host_values, kNumElements * sizeof(int));
 
     // Launch kernel to push elements
     PushElementsKernel<int, AllocT>
         <<<1, 1>>>(ring_ptr, dev_values, kNumElements);
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
 
     // Step 6: Verify the runtime can pop the 10 elements
     // Allocate device memory for output values and success flag
     int *dev_output;
-    cudaMalloc(&dev_output, kNumElements * sizeof(int));
+    dev_output = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(dev_output)>>(kNumElements * sizeof(int));
 
     int *dev_success;
-    cudaMalloc(&dev_success, sizeof(int));
+    dev_success = ctp::GpuApi::Malloc<std::remove_pointer_t<decltype(dev_success)>>(sizeof(int));
 
     // Launch kernel to pop elements from ring buffer
     PopElementsKernel<int, AllocT>
         <<<1, 1>>>(ring_ptr, dev_output, kNumElements, dev_success);
-    cudaDeviceSynchronize();
+    ctp::GpuApi::Synchronize();
 
     // Copy results back to host
     int host_output[kNumElements];
     int success_flag;
-    cudaMemcpy(host_output, dev_output, kNumElements * sizeof(int),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(&success_flag, dev_success, sizeof(int), cudaMemcpyDeviceToHost);
+    ctp::GpuApi::Memcpy(host_output, dev_output, kNumElements * sizeof(int));
+    ctp::GpuApi::Memcpy(&success_flag, dev_success, sizeof(int));
 
     // Verify all pops succeeded
     REQUIRE(success_flag == 1);
@@ -228,12 +224,12 @@ TEST_CASE("GpuMalloc", "[gpu][backend]") {
     }
 
     // Cleanup GPU temporary allocations
-    cudaFree(dev_success);
-    cudaFree(dev_output);
-    cudaFree(dev_values);
-    cudaFree(ring_result_dev);
-    cudaFree(alloc_result_dev);
-    cudaFree(backend_dev);
+    ctp::GpuApi::Free(dev_success);
+    ctp::GpuApi::Free(dev_output);
+    ctp::GpuApi::Free(dev_values);
+    ctp::GpuApi::Free(ring_result_dev);
+    ctp::GpuApi::Free(alloc_result_dev);
+    ctp::GpuApi::Free(backend_dev);
 
     // Backend cleanup handled automatically by destructor
   }

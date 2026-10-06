@@ -107,18 +107,6 @@ PoolQuery PoolQuery::Physical(u32 node_id, float net_timeout) {
   return query;
 }
 
-PoolQuery PoolQuery::Dynamic(float net_timeout) {
-  PoolQuery query;
-  query.routing_mode_ = RoutingMode::Dynamic;
-  query.hash_value_ = 0;
-  query.container_id_ = 0;
-  query.range_offset_ = 0;
-  query.range_count_ = 0;
-  query.node_id_ = 0;
-  query.net_timeout_ = net_timeout;
-  return query;
-}
-
 PoolQuery PoolQuery::ManyToOne(u32 container_hash, u64 batch_key,
                                u64 batch_for_ns) {
   PoolQuery query;

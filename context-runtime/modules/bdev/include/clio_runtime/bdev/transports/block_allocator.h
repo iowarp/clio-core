@@ -14,6 +14,8 @@
 #include <clio_runtime/bdev/bdev_tasks.h>
 #include <clio_runtime/comutex.h>
 #include <atomic>
+#include <map>
+#include <mutex>
 #include <vector>
 #include <list>
 
@@ -73,6 +75,14 @@ class GlobalBlockMap {
   bool AllocateAnyUpTo(int worker, size_t max_bytes, Block& block);
   bool FreeBlock(int worker, Block& block);
 
+  /**
+   * File the free range [offset, offset + size) into worker 0's free list,
+   * carved largest-size-class first so AllocateBlock can reuse it.
+   * @param offset Start of the free range (bytes)
+   * @param size Length of the free range (bytes, alignment multiple)
+   */
+  void SeedFreeRange(clio::run::u64 offset, clio::run::u64 size);
+
   /** Map an I/O size to its block-size category, or -1 if larger than all. */
   static int FindBlockType(size_t io_size);
 
@@ -91,6 +101,13 @@ class Heap {
   void Init(clio::run::u64 total_size, clio::run::u32 alignment = 4096);
   bool Allocate(size_t block_size, int block_type, Block& block);
   clio::run::u64 GetRemainingSize() const;
+
+  /**
+   * Move the bump cursor to `cursor` (used on recovery: past every live
+   * block, so the heap can never hand out a live offset).
+   * @param cursor New bump offset in bytes
+   */
+  void SetCursor(clio::run::u64 cursor) { heap_.store(cursor); }
 
  private:
   std::atomic<clio::run::u64> heap_;
@@ -113,12 +130,45 @@ class StandardBlockAllocator {
   }
 
   bool AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks);
+
+  /**
+   * Rebuild the allocator from a recovered set of live extents (after Init).
+   * The heap cursor moves past the highest live byte, every gap below it is
+   * returned to the free list, and the live bytes are charged as allocated,
+   * so no live extent is ever handed out again and freed space is reused.
+   * @param live Live extents as (offset, size) pairs; sizes may be unaligned
+   */
+  void InitFromLive(
+      const std::vector<std::pair<clio::run::u64, clio::run::u64>>& live);
   void FreeBlocks(int worker_id, const std::vector<Block>& blocks);
 
   clio::run::u64 GetRemainingSize() const;
   clio::run::u64 GetCapacity() const { return capacity_; }
 
+  /** @return whether CLIO_BDEV_CHECK_ALLOC=1 enables the live-extent checker */
+  static bool CheckEnabled();
+
  private:
+  /**
+   * Checker (CLIO_BDEV_CHECK_ALLOC=1): record newly allocated extents,
+   * logging an error with a backtrace if one overlaps an extent already
+   * live -- two owners of the same bytes.
+   * @param blocks the blocks just handed out
+   */
+  void CheckAllocated(const std::vector<Block> &blocks);
+  /**
+   * Checker: drop freed extents, logging an error with a backtrace for a
+   * range that is not (entirely) live -- a double free.
+   * @param blocks the blocks being freed
+   */
+  void CheckFreed(const std::vector<Block> &blocks);
+  /** AllocateBlocks without the checker. */
+  bool AllocateBlocksImpl(size_t size, int worker_id,
+                          std::vector<Block> &blocks);
+  std::mutex check_mu_;
+  /** Live extents (offset -> aligned end), only with the checker on. */
+  std::map<clio::run::u64, clio::run::u64> live_;
+
   GlobalBlockMap global_block_map_;
   Heap heap_;
   clio::run::u32 alignment_;

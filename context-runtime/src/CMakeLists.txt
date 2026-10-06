@@ -229,6 +229,23 @@ target_link_libraries(${CLIO_LIB_NAME}
     # chimods_admin_client  # Admin client library for global task routing - TODO: Enable when admin chimod is built
 )
 
+# Poco::Net powers the web dashboard's HTTP server (src/viz, issue #990).
+#
+# PRIVATE for the same reason clio_ctp_host links it privately: Poco::Foundation
+# exports INTERFACE compile definitions (_FILE_OFFSET_BITS=64 /
+# _LARGEFILE64_SOURCE) that make glibc alias open() -> open64() in every
+# consumer, colliding with the POSIX interception adapters that define open64 /
+# creat64 themselves. All Poco use is confined to viz_server.cc; the installed
+# headers never mention a Poco type. CLIO_RUN_HAS_POCO is PUBLIC so ChiMods and
+# tests can #if on whether a dashboard exists in this build.
+if(Poco_FOUND)
+  target_link_libraries(${CLIO_LIB_NAME} PRIVATE Poco::Net Poco::Foundation)
+  target_compile_definitions(${CLIO_LIB_NAME} PUBLIC CLIO_RUN_HAS_POCO=1)
+else()
+  target_compile_definitions(${CLIO_LIB_NAME} PUBLIC CLIO_RUN_HAS_POCO=0)
+  message(STATUS "Web dashboard (viz): DISABLED (Poco::Net not found)")
+endif()
+
 # Set target properties
 set_target_properties(${CLIO_LIB_NAME} PROPERTIES
   VERSION ${PROJECT_VERSION}

@@ -22,6 +22,28 @@ install(TARGETS clio_cte_bench
 
 # Create clio_cte_semantic_bench executable — ingests N keyword blobs under a
 # single tag, then runs one broadcast SemanticSearch over them.
+# Vector-shaped stress: the CTE driven the way the gpu_vector adapter's host
+# side drives it (page-sized generational puts/gets hash-distributed across
+# nodes, halo reads, batched writebacks, tag copies), with no GPU at all, so
+# a failure at scale is clio-core's own. Reuses the gpu_vector benchmark's
+# CTE barrier/reduction helpers (bench_dist.h, host-only).
+add_executable(clio_cte_vector_stress
+  clio_cte_vector_stress.cc
+)
+target_include_directories(clio_cte_vector_stress PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../adapter/gpu_vector/benchmark
+)
+target_link_libraries(clio_cte_vector_stress
+  clio::cte::checkpoint_client
+  clio::cte::core_client
+  clio::run::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+target_compile_features(clio_cte_vector_stress PRIVATE cxx_std_20)
+install(TARGETS clio_cte_vector_stress
+  RUNTIME DESTINATION bin
+)
+
 add_executable(clio_cte_semantic_bench
   clio_cte_semantic_bench.cc
 )
@@ -185,5 +207,23 @@ if(CLIO_JNI_INCLUDE_DIR AND NOT WIN32)
   target_compile_features(clio_ycsb_jni PRIVATE cxx_std_17)
   install(TARGETS clio_ycsb_jni
     LIBRARY DESTINATION bin
+  )
+endif()
+
+# S3 write benchmark — times CTE -> S3 bdev writes for the #968 comparison
+# against Zarr-on-S3. Gated on CLIO_ENABLE_AMAZON_DRIVE because without the
+# S3 bdev there is no tier for it to write to; the binary itself links
+# neither the AWS SDK nor Poco (all S3 work is in the runtime daemon).
+if(CLIO_ENABLE_AMAZON_DRIVE)
+  add_executable(clio_s3_write_bench
+    clio_s3_write_bench.cc
+  )
+  target_link_libraries(clio_s3_write_bench
+    clio::cte::core_client
+    clio::run::cxx
+  )
+  target_compile_features(clio_s3_write_bench PRIVATE cxx_std_17)
+  install(TARGETS clio_s3_write_bench
+    RUNTIME DESTINATION bin
   )
 endif()

@@ -39,12 +39,57 @@
  */
 
 #include "clio_runtime/worker.h"
+#include "clio_runtime/cycle_counter.h"
+
+/** Latency-report channel hook (defined in ipc_gpu2cpu.cc). */
+extern "C" void clio_evlat_add(int which, unsigned long long cycles);
+
+namespace {
+/**
+ * Event-queue wait per popping worker (CLIO_EVLAT). The global evq_wait
+ * channel showed completion events sitting 5-50 ms in their parent's queue
+ * on the two-node kmeans after every task's executing time had dropped
+ * below a millisecond; this says which workers' queues are the slow ones.
+ * Printed at exit as "clio-evqw worker=N n=.. avg=..us slow(>5ms)=..".
+ */
+struct EvqWaitByWorker {
+  static constexpr int kMax = 64;
+  static std::atomic<unsigned long long> n[kMax], sum[kMax], slow[kMax];
+  static void Add(unsigned worker, unsigned long long cycles) {
+    if (worker >= static_cast<unsigned>(kMax)) return;
+    n[worker].fetch_add(1, std::memory_order_relaxed);
+    sum[worker].fetch_add(cycles, std::memory_order_relaxed);
+    if (cycles > 5000ull * 2995ull) {
+      slow[worker].fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  static void Report() {
+    for (int w = 0; w < kMax; ++w) {
+      const unsigned long long c = n[w].load();
+      if (c == 0) continue;
+      std::fprintf(stderr, "clio-evqw worker=%d n=%llu avg=%.0fus slow(>5ms)=%llu\n",
+                   w, c, static_cast<double>(sum[w].load()) / 2995.0 /
+                             static_cast<double>(c),
+                   slow[w].load());
+    }
+  }
+  EvqWaitByWorker() {
+    if (std::getenv("CLIO_EVLAT") != nullptr) std::atexit(Report);
+  }
+};
+std::atomic<unsigned long long> EvqWaitByWorker::n[EvqWaitByWorker::kMax];
+std::atomic<unsigned long long> EvqWaitByWorker::sum[EvqWaitByWorker::kMax];
+std::atomic<unsigned long long> EvqWaitByWorker::slow[EvqWaitByWorker::kMax];
+EvqWaitByWorker g_evqw_init;
+}  // namespace
 
 // <coroutine> only for the C++20 stackless backend, not the Boost stackful one.
 // (CLIO_ENABLE_BOOST_COROUTINES is defined by task.h, included below, in terms of
 // CLIO_ENABLE_BOOST_COROUTINES.)
 #if !defined(CLIO_ENABLE_BOOST_COROUTINES)
+#include <atomic>
 #include <coroutine>
+#include <cstdio>
 #endif
 #include <cerrno>
 #include <cstdlib>
@@ -236,7 +281,34 @@ void Worker::Finalize() {
   // Clear assigned lane reference (don't delete - it's in shared memory)
   assigned_lane_.store(nullptr, std::memory_order_release);
 
+  // Release the event queues this worker owns: its own (Init /
+  // ReplaceEventQueue) plus every queue it inherited from a rescued worker.
+  // Nothing else ever freed them, so each worker walked off with a 147 KB ring
+  // on every runtime shutdown. Ownership is unambiguous — a queue moves to
+  // exactly one owner via ReplaceEventQueue / TransferAdoptedEventQueuesTo, and
+  // ~Worker runs only from WorkOrchestrator::Finalize during ServerFinalize,
+  // after StopWorkers() and DestroyAllContainers(), so no thread can still be
+  // draining or pushing. Freed last, after the queues above are emptied.
+  // (LeakSanitizer never got to report this: the RequestStop watchdog's
+  // use-after-free ended the daemon's ASan run before the exit-time leak check.)
+  DeleteEventQueue(event_queue_.exchange(nullptr, std::memory_order_acq_rel));
+  {
+    std::lock_guard<std::mutex> lk(park_mtx_);
+    for (EventQueue *q : adopted_event_queues_) {
+      DeleteEventQueue(q);
+    }
+    adopted_event_queues_.clear();
+  }
+
   is_initialized_ = false;
+}
+
+void Worker::DeleteEventQueue(EventQueue *queue) {
+  if (queue == nullptr) {
+    return;
+  }
+  ctp::ipc::FullPtr<EventQueue> ptr(CTP_MALLOC, queue);
+  CTP_MALLOC->DelObj(ptr);
 }
 
 void Worker::Run() {
@@ -295,6 +367,9 @@ void Worker::Run() {
     // issue #785: re-read every iteration. The monitor thread may have moved
     // this lane to a replacement worker while we were wedged in a task, so a
     // cached pointer would keep us consuming a lane we no longer own.
+    // Parked parents first (see ProcessNewTasks): their continuations are
+    // the work most likely to unblock something else.
+    ProcessEventQueue();
     if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
       u32 count = ProcessNewTasks(lane);
       if (count > 0) did_work_ = true;
@@ -319,6 +394,34 @@ void Worker::Run() {
 
     // Increment iteration counter
     iteration_count_++;
+
+    // CLIO_WORKER_RATE=1: wall time per worker-loop iteration. Anything driven
+    // by the loop -- every periodic, including the cross-node send drain --
+    // inherits this as its latency quantum, so it is the ceiling on any "poll
+    // faster" fix. NOTE it measures WALL time, so an idle worker's number is
+    // dominated by its epoll park, not by loop cost: read it as "how often this
+    // worker comes around", and compare workers rather than reading it as CPU.
+    // (Measured on the collective benchmark: scheduler worker ~1.3us, but the
+    // net send/recv workers ~82us/~157us -- they are parked most of the time,
+    // which is why their wakeup, not their poll rate, sets send latency.)
+    {
+      static bool rate_on = [] {
+        const char *e = std::getenv("CLIO_WORKER_RATE");
+        return e != nullptr && *e != '\0' && *e != '0';
+      }();
+      if (rate_on && iteration_count_ % 4096 == 0) {
+        static thread_local int64_t prev_ns = 0;
+        int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+        if (prev_ns != 0) {
+          double us_per_iter = (now_ns - prev_ns) / 1000.0 / 4096.0;
+          HLOG(kInfo, "[WORKERRATE] worker={} {}us/iteration", worker_id_,
+               us_per_iter);
+        }
+        prev_ns = now_ns;
+      }
+    }
 
     if (!did_work_) {
       // No work was done - suspend worker with adaptive sleep
@@ -441,6 +544,16 @@ const std::vector<GpuTaskLane *> &Worker::GetGpuLanes() const {
 }
 
 u32 Worker::ProcessNewTasksGpu() {
+  // ONE task per poll, deliberately -- do NOT batch this like the CPU path.
+  //
+  // Draining up to 16 per iteration (as ProcessNewTasks does) was tried as a
+  // latency fix and HANGS the runtime: with 64 blocks faulting through an
+  // oversubscribed page cache, every compute worker ends up stalled on a
+  // parked device task at once ("ALL compute workers stalled — runtime cannot
+  // place work"), and the kernel waits forever on completions that can no
+  // longer be produced. The CPU lanes are per-worker, so a batch there spreads
+  // out; the gpu2cpu lane is a SINGLE lane for the whole GPU, so a batch piles
+  // its whole depth onto one worker.
   u32 total = 0;
   for (auto *gpu_lane : gpu_lanes_) {
     if (ProcessNewTaskGpu(gpu_lane)) {
@@ -502,6 +615,15 @@ u32 Worker::ProcessNewTasks(TaskLane *lane) {
   while (tasks_processed < MAX_TASKS_PER_ITERATION) {
     if (ProcessNewTask(lane)) {
       tasks_processed++;
+      // COMPLETION EVENTS BETWEEN NEW TASKS, not after the whole batch. A
+      // parked parent's continuation is usually the cheapest and most
+      // urgent work a worker has -- on the paged vector it is what
+      // unblocks a GPU block -- yet it waited behind up to 16 fresh lane
+      // tasks of milliseconds each. Measured on the two-node kmeans: a
+      // completion event sat 20 ms on average (max 140 ms) in the parent's
+      // event queue (clio-evchan evq_wait), and every remote round trip
+      // paid that twice. An empty queue costs a lock and a check.
+      ProcessEventQueue();
     } else {
       break;
     }
@@ -1134,6 +1256,11 @@ bool Worker::IsRunning() const { return is_running_; }
 
 void Worker::SetCurrentTask(const clio::run::shared_ptr<Task> &task) {
   current_task_ = task;
+  const Task *t = task.get();
+  cur_pool_major_.store(t != nullptr ? static_cast<u32>(t->pool_id_.major_) : 0,
+                        std::memory_order_relaxed);
+  cur_method_.store(t != nullptr ? static_cast<u32>(t->method_) : 0,
+                    std::memory_order_relaxed);
 }
 
 clio::run::shared_ptr<Task> &Worker::GetCurrentTask() { return current_task_; }
@@ -1212,6 +1339,14 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
   // Call appropriate coroutine function based on task state. Driving the
   // coroutine is the Task's own responsibility (it owns its RunContext/frame).
   if (is_started) {
+    // A resumed task is on this worker's CPU again: re-add the predicted cost
+    // its park released (see the yield branch below). Symmetric with the
+    // first-execution add for new tasks, and EndTask subtracts it once more
+    // when the task finishes, so load_ always equals the predicted cost of
+    // the tasks that can actually occupy this worker right now.
+    load_.store(load_.load(std::memory_order_relaxed) +
+                    task_ptr->PredictedLoad(),
+                std::memory_order_relaxed);
     task_ptr->ResumeCoroutine(task_ptr);
   } else {
     task_ptr->StartCoroutine(task_ptr);
@@ -1273,6 +1408,19 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
 
   // If coroutine yielded (not done and is_yielded_ set), don't clean up
   if (task_ptr->IsYielded() && !coro_done) {
+    // A PARKED TASK IS NOT LOAD. load_ counted every started-but-unfinished
+    // task until EndTask, parked coroutines included. On a two-node paged
+    // vector dozens of fault tasks sit parked on a remote await at any
+    // moment, so every worker read as backlogged: RuntimeMapTask stopped
+    // running sub-gets inline (RealtimeLoad > kInlineCallerLoadUs), routed
+    // them by predicted WALL time to the one heavy-class worker, found it
+    // "saturated" and spawned elastic workers at the 500 ms tick, while the
+    // tasks waited ~40 ms per hop in lanes (clio-evlat: C-P p50 85 ms on two
+    // nodes against 7 ms on one; multi_await 40 ms against a 1.5 ms get).
+    // Release the cost while parked; the resume above re-adds it.
+    load_.store(load_.load(std::memory_order_relaxed) -
+                    task_ptr->PredictedLoad(),
+                std::memory_order_relaxed);
     // yield_time_us_ > 0 means cooperative yield (polling) — add to periodic
     // queue so the worker re-checks after the requested delay.
     // yield_time_us_ == 0 means waiting for a Future event — the event queue
@@ -1345,8 +1493,8 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   // issue #781: fold the measured cost into the scheduler's perf-bin PDF so the
   // monitor thread can report the live workload distribution (telemetry).
   if (scheduler_ != nullptr) {
-    scheduler_->RecordCompletion(task_ptr->method_, actual_cpu_us,
-                                 actual_wall_us);
+    scheduler_->RecordCompletion(task_ptr->pool_id_.major_, task_ptr->method_,
+                                 actual_cpu_us, actual_wall_us);
   }
 
   // Break the RunContext self-cycle for a task that is about to be released.
@@ -1423,6 +1571,7 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   // small ACK / heartbeat reply doesn't queue behind a 1 MiB GetBlob
   // response on the wire.
   if (is_remote) {
+    CLIO_IPC->GetRun2Run()->NoteResponseAge(task_ptr, "end-task");
     size_t io_size = task_ptr->PredictedStat().io_size_;
     NetQueuePriority prio = (io_size >= kNetQueueIoThreshold)
                                 ? NetQueuePriority::kSendOutIO
@@ -1461,7 +1610,21 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
       !task_ptr->task_flags_.Any(TASK_EXTERNAL_CLIENT) &&
       (task_ptr->GetParentTask().IsNull() ||
        task_ptr->GetParentTask()->EventQueue() == nullptr);
-  if (signals_inprocess_client) {
+  // GPU-submitted tasks have the SAME hazard as the in-process client case
+  // above, with the kernel in the client's role: IpcGpu2Cpu::SendOut's last
+  // act flips the task's device-side completion flag, and the INSTANT it
+  // flips, the kernel may resubmit the slot -- whereupon another worker's
+  // RecvIn stages the new submission into the same per-slot scratch buffer
+  // and calls BeginRunContext on it. break_self_cycle after SendOut then
+  // mutates that scratch underneath the new submission, observed as
+  // "SetRunWorkerId: null RunContext" under repeated mid-decode batched
+  // fetches (56 clio_warm_range launches; see clio-core issue #961). RecvIn
+  // wraps the scratch NON-OWNING, so breaking the cycle first frees nothing;
+  // it only finishes every host-side mutation before the release signal.
+  const bool signal_is_release =
+      signals_inprocess_client ||
+      future_shm->origin_ == ClientOrigin::kClientGpu2Cpu;
+  if (signal_is_release) {
     break_self_cycle();
     IpcCpu2Self::SendOut(task_ptr, shm_send_transport_.get());
   } else {
@@ -1519,6 +1682,22 @@ void Worker::ProcessBlockedQueue(std::queue<clio::run::shared_ptr<Task>> &queue,
       continue;
     }
 
+    // A GPU-submitted task can lose its RunContext between the completion
+    // check above and here: its completion is published by another thread,
+    // the device re-fires the slot, and IpcGpu2Cpu::RecvIn resets the context
+    // for the new submission -- all while this loop still holds the OLD
+    // submission's yield-queue entry. On CUDA the asynchronous SendOut made
+    // that sequence take longer than this loop body; on Level Zero it is
+    // synchronous and the reset lands inside the window. A task with no
+    // context has nothing to resume: it is an orphan entry, so skip it as the
+    // completed case above is skipped. Seen on Aurora as
+    //   Task::SetYielded: null RunContext (pool=513 method=51)
+    // thrown from the SetYielded below. This NARROWS the window rather than
+    // closing it; closing it needs the re-fire reset to be owned by the task's
+    // worker, which is a larger change than a diagnostic bring-up should carry.
+    if (task->RunCtxPtr() == nullptr) {
+      continue;
+    }
     task->SetYieldCount(0);
 
     // CRITICAL: Clear the is_yielded_ flag before resuming the task
@@ -1582,6 +1761,12 @@ void Worker::ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue
       // Time threshold reached (within tolerance) - execute the task
       bool is_started = task->IsStarted();
 
+      // Same orphan guard as the yield-queue resume above: a context reset by
+      // a GPU slot re-fire leaves nothing to resume.
+      if (task->RunCtxPtr() == nullptr) {
+        continue;
+      }
+
       // CRITICAL: Clear the is_yielded_ flag before resuming the task
       // This allows the task to call Wait() again if needed
       task->SetYielded(false);
@@ -1593,11 +1778,20 @@ void Worker::ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue
       // This ensures all tasks in this batch get the same block_start time
       task->BlockStart() = batch_timestamp;
 
-      // Route task again - this will handle both local and distributed routing
-      // RouteTask handles Retry/Dne internally via AddToRetryQueue
-      if (CLIO_IPC->RouteTask(task->RunFuture()) == RouteResult::ExecHere) {
+      // A YIELDED COROUTINE RESUMES HERE, on the worker that parked it. It
+      // used to be re-routed through RuntimeMapTask on every yield, so a
+      // poll loop such as "yield 10 us until the copy lands" hopped to
+      // another worker's lane on most iterations and waited there behind
+      // new tasks: a 64 KB device-to-host bounce measured 17-22 ms of wall
+      // time on the two-node kmeans (clio-evchan pput_bounce) for a copy
+      // that takes well under a millisecond. Periodic pollers keep the
+      // re-route, which is how they rebalance; RouteTask handles Retry/Dne
+      // internally via AddToRetryQueue.
+      if (is_started && !task->IsPeriodic()) {
+        ExecTask(task, true);
+      } else if (CLIO_IPC->RouteTask(task->RunFuture()) ==
+                 RouteResult::ExecHere) {
         ExecTask(task, is_started);
-
         // If task re-yielded with a polling interval, ExecTask already
         // re-added it to the periodic queue via AddToBlockedQueue.
       }
@@ -1633,6 +1827,20 @@ void Worker::ProcessEventQueue() {
   while (eq->Pop(future)) {
     HLOG(kDebug, "Worker {}: ProcessEventQueue popped subtask future",
          worker_id_);
+    // Latency report (CLIO_EVLAT): how long the completion event sat here,
+    // and per popping worker, so a slow queue can be traced to its owner.
+    {
+      const clio::run::shared_ptr<Task> &sub = future.GetTaskPtr();
+      if (!sub.IsNull()) {
+        RunContext *rc = sub->RunCtxPtr();
+        if (rc != nullptr && rc->notify_ns_ != 0) {
+          const unsigned long long d = clio::run::CycleNow() - rc->notify_ns_;
+          clio_evlat_add(11, d);
+          EvqWaitByWorker::Add(worker_id_, d);
+          rc->notify_ns_ = 0;
+        }
+      }
+    }
     // Mark the subtask's future as complete
     future.Complete();
 
@@ -1648,7 +1856,24 @@ void Worker::ProcessEventQueue() {
     // Skip if the parent's coroutine already completed. Uses the completion
     // query (the flag, not coro_handle_.done()) to avoid dereferencing a
     // coroutine frame a cross-thread completion may already have freed (#485).
-    if (parent->IsCoroCompleted()) {
+    //
+    // AND SKIP IF THE PARENT HAS NO RUNCONTEXT AT ALL. The comment above the
+    // parent lookup argues its context cannot have been freed yet, and for a
+    // parent that awaits this child that is true. A GPU-submitted parent is
+    // different: under producer-only reuse the device re-fires the same task
+    // slot the moment the runtime frees it, and IpcGpu2Cpu::RecvIn resets the
+    // slot's RunContext for the new submission -- with no regard for a child
+    // the old submission left in flight. On CUDA the asynchronous SendOut
+    // copies gave such a child time to finish first; on Level Zero SendOut is
+    // synchronous, the free-then-refire lands within microseconds, and the
+    // child's completion arrives here to find its parent's context gone.
+    // Measured on Aurora: every gpu2cpu event paired correctly (S/C/P/F, no
+    // duplicate delivery), the last event a free, then
+    //   Task::IsCoroCompleted: null RunContext (pool=513 method=51)
+    // thrown from this very line for a bdev child of the freed parent.
+    // A context-less parent is an orphan by definition, and orphans are
+    // already skipped here rather than crashed on; this makes that hold.
+    if (parent->RunCtxPtr() == nullptr || parent->IsCoroCompleted()) {
       continue;
     }
 
@@ -1674,6 +1899,12 @@ void Worker::ProcessEventQueue() {
     // leader-election). Both await paths record the awaited future before
     // suspending, and a future with a null FutureShm matches null == null,
     // so exact equality cannot strand a legitimate waiter.
+    // Re-checked at the point of use: the orphan check above is fifty lines
+    // upstream, and a GPU slot re-fire can reset the parent's context in the
+    // meantime (see the yield-queue resume for the full account).
+    if (parent->RunCtxPtr() == nullptr) {
+      continue;
+    }
     const void* awaited = parent->AwaitedFshm();
     if (awaited != future.GetFutureShm().ptr_) {
       continue;

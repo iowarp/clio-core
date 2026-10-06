@@ -37,6 +37,8 @@
 #include "clio_runtime/scheduler/default_sched.h"
 
 #include <chrono>
+#include <cstdio>
+#include <string>
 #include <cstdlib>
 
 #include "clio_runtime/config_manager.h"
@@ -627,7 +629,7 @@ void DefaultScheduler::LoadBalance() {
   // workload distribution (how many quick vs 1-second tasks it actually ran).
   // It adapts continuously as RecordCompletion folds in each finished task.
   if (tick % 10 == 0) {
-    HLOG(kWarning,
+    HLOG(kDebug,
          "[#781 PDF] observed exec-time bins (cumulative): "
          "<10us={} <50us={} <500us={} <10ms={} <50ms={} <500ms={} <1s={} "
          ">=1s={} | stalls_detected={}",
@@ -636,7 +638,11 @@ void DefaultScheduler::LoadBalance() {
          perf_pdf_[kLt50ms].load(), perf_pdf_[kLt500ms].load(),
          perf_pdf_[kLt1s].load(), perf_pdf_[kGe1s].load(),
          stalls_detected_.load());
-    HLOG(kWarning, "[#785] lane rescues performed: {}",
+    // WHICH tasks own the slow bins: pool.method, count, summed and worst
+    // wall time in ms, the eight largest by summed time.
+    HLOG(kDebug, "[#781 METHODS] wall time by pool.method (top 8):{}",
+         MethodTimeReport(8));
+    HLOG(kDebug, "[#785] lane rescues performed: {}",
          rescues_performed_.load());
     size_t nq, nm, nh;
     {
@@ -645,7 +651,7 @@ void DefaultScheduler::LoadBalance() {
       nm = class_workers_[kMediumClass].size();
       nh = class_workers_[kHeavyClass].size();
     }
-    HLOG(kWarning,
+    HLOG(kDebug,
          "[sched] cost classes: quick {} workers ({} routed, +{}/-{}) | "
          "medium {} workers ({} routed, +{}/-{}) | heavy {} workers "
          "({} routed, +{}/-{})",
@@ -676,10 +682,11 @@ void DefaultScheduler::LoadBalance() {
     if (!w->IsStalled(now_us, kStallThresholdSec)) return false;
     stalls_detected_.fetch_add(1, std::memory_order_relaxed);
     HLOG(kWarning,
-         "[#781] worker {} STALLED on one task (load_us={} realtime_load_us={} "
-         "threshold_s={})",
-         w->GetId(), (double)w->Load(), w->RealtimeLoad(now_us),
-         kStallThresholdSec);
+         "[#781] worker {} STALLED on one task (pool {} method {} running "
+         "{} ms; load_us={} realtime_load_us={} threshold_s={})",
+         w->GetId(), w->CurrentPoolMajor(), w->CurrentMethod(),
+         w->CurrentTaskAgeMs(now_us), (double)w->Load(),
+         w->RealtimeLoad(now_us), kStallThresholdSec);
 
     // issue #785: LANE RESCUE. The stalled worker is inside ExecTask and is
     // provably not popping its lane, so its queued backlog is stranded behind a
@@ -899,6 +906,17 @@ void DefaultScheduler::LoadBalance() {
     double window_sec = kNoProgressAlarmSec;
     const bool wedged_shape =
         IsWedgedShape(outstanding, live, live_stalled, &window_sec);
+    // Arm the window on the first tick. last_progress_us_ starts at 0.0, so a
+    // process whose FIRST LoadBalance tick already sees a wedged shape with
+    // nothing completed (processed == last_progress_count_ == 0, the normal
+    // state a second into bring-up) fell straight into the else branch and
+    // compared now_us against the epoch -- always greater than any window. The
+    // alarm then fired immediately and reported "no non-periodic task completed
+    // in 10s" about one second into the process's life. Same sentinel idiom as
+    // the HANGWATCH watchdog below.
+    if (last_progress_us_ == 0.0) {
+      last_progress_us_ = now_us;
+    }
     if (!wedged_shape || processed != last_progress_count_) {
       last_progress_count_ = processed;
       last_progress_us_ = now_us;
@@ -946,7 +964,7 @@ void DefaultScheduler::LoadBalance() {
       // did or did not fire.
       static u64 hb_tick = 0;
       if (outstanding > 0 && (++hb_tick % 4 == 0)) {
-        HLOG(kError,
+        HLOG(kDebug,
              "[HANGWATCH-HB] processed={} outstanding={} (queued={} blocked={} "
              "retry={} periodic={}) live={} live_stalled={}",
              processed, outstanding, ob_queued, ob_blocked, ob_retry,
@@ -1013,13 +1031,73 @@ void DefaultScheduler::LoadBalance() {
   }
 }
 
-void DefaultScheduler::RecordCompletion(u32 method, double cpu_us,
-                                        double wall_us) {
+void DefaultScheduler::RecordCompletion(u32 pool_major, u32 method,
+                                        double cpu_us, double wall_us) {
   // Telemetry only (issue #781): bin the measured wall time. This is the
   // runtime OBSERVING what it actually ran — it is not used for routing.
-  (void)method;
   (void)cpu_us;
   perf_pdf_[BinFor(wall_us)].fetch_add(1, std::memory_order_relaxed);
+  // Fold the wall time into the per-(pool, method) table: hash the key,
+  // claim or match a slot within a short probe run, and give up silently if
+  // the run is full (telemetry, never a reason to stall a worker).
+  const u64 key =
+      ((static_cast<u64>(pool_major) << 16) | (method & 0xffffu)) + 1;
+  const size_t start =
+      static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 54);  // 10 bits
+  const u64 ns = wall_us > 0.0 ? static_cast<u64>(wall_us * 1000.0) : 0;
+  for (size_t probe = 0; probe < 8; ++probe) {
+    MethodTime &mt = method_times_[(start + probe) & (kMethodTimeSlots - 1)];
+    u64 have = mt.key.load(std::memory_order_acquire);
+    if (have == 0) {
+      u64 expected = 0;
+      if (mt.key.compare_exchange_strong(expected, key,
+                                         std::memory_order_acq_rel)) {
+        have = key;
+      } else {
+        have = expected;
+      }
+    }
+    if (have != key) continue;
+    mt.count.fetch_add(1, std::memory_order_relaxed);
+    mt.wall_ns.fetch_add(ns, std::memory_order_relaxed);
+    u64 cur = mt.max_ns.load(std::memory_order_relaxed);
+    while (ns > cur && !mt.max_ns.compare_exchange_weak(
+                           cur, ns, std::memory_order_relaxed)) {
+    }
+    return;
+  }
+}
+
+std::string DefaultScheduler::MethodTimeReport(size_t top_n) const {
+  struct Row {
+    u64 key, count, wall_ns, max_ns;
+  };
+  std::vector<Row> rows;
+  for (const MethodTime &mt : method_times_) {
+    const u64 key = mt.key.load(std::memory_order_acquire);
+    if (key == 0) continue;
+    rows.push_back({key - 1, mt.count.load(std::memory_order_relaxed),
+                    mt.wall_ns.load(std::memory_order_relaxed),
+                    mt.max_ns.load(std::memory_order_relaxed)});
+  }
+  std::sort(rows.begin(), rows.end(),
+            [](const Row &a, const Row &b) { return a.wall_ns > b.wall_ns; });
+  if (rows.size() > top_n) rows.resize(top_n);
+  std::string out;
+  char buf[160];
+  for (const Row &r : rows) {
+    const double sum_ms = static_cast<double>(r.wall_ns) / 1e6;
+    const double avg_ms =
+        r.count ? sum_ms / static_cast<double>(r.count) : 0.0;
+    std::snprintf(buf, sizeof(buf),
+                  " %llu.%llu n=%llu sum_ms=%.1f avg_ms=%.3f max_ms=%.1f |",
+                  static_cast<unsigned long long>(r.key >> 16),
+                  static_cast<unsigned long long>(r.key & 0xffffu),
+                  static_cast<unsigned long long>(r.count), sum_ms, avg_ms,
+                  static_cast<double>(r.max_ns) / 1e6);
+    out += buf;
+  }
+  return out;
 }
 
 // issue #781 — SCAFFOLD ONLY (not yet wired). Move up to kStealBatch tasks from

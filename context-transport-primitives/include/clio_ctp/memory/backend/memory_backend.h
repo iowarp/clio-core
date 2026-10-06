@@ -105,6 +105,33 @@ class MemoryBackendId {
     return MemoryBackendId(UINT32_MAX, UINT32_MAX);
   }
 
+  /**
+   * THE OFFSET IS A RAW GPU DEVICE ADDRESS.
+   *
+   * Distinct from GetNull(), which also means "the offset is the address" but
+   * refers to HOST memory the receiving process can simply dereference. A
+   * device address can only be dereferenced in the owning GPU context, and it
+   * has to be moved with a device-aware copy -- so the two cases cannot share
+   * a tag. They did: the GPU vector built its page pointers with GetNull(),
+   * which made a device address indistinguishable from a host one and left
+   * "run this task where the pointer is valid" as an unwritten rule enforced
+   * by pinning the task to the local node. Labelling the pointer is what lets
+   * a holder ASK, and bounce it when it has to cross a node.
+   */
+  CTP_CROSS_FUN
+  static MemoryBackendId GetGpuPointer() {
+    return MemoryBackendId(UINT32_MAX, UINT32_MAX - 1);
+  }
+
+  /** Is this the GPU-device-address tag? See GetGpuPointer. */
+  CTP_CROSS_FUN
+  bool IsGpuPointer() const { return *this == GetGpuPointer(); }
+
+  /** Does `off_` hold a raw address rather than an allocator offset? True for
+   *  both the host (null) and device (GPU pointer) forms. */
+  CTP_CROSS_FUN
+  bool IsRawAddress() const { return IsNull() || IsGpuPointer(); }
+
   /** Set this backend ID to null */
   CTP_CROSS_FUN
   void SetNull() { *this = GetNull(); }

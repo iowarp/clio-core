@@ -43,12 +43,20 @@
 #include "clio_runtime/module_manager.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/task_stat_model.h"
+#include "clio_runtime/viz/viz_server.h"
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <shared_mutex>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 // Global pointer variable definition for Pool manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::PoolManager, g_pool_manager);
@@ -156,7 +164,7 @@ void PoolManager::DestroyAllContainers() {
   // coroutine continuation state and crashes. Running the Destroy method on
   // shutdown (route it through the workers before StopWorkers) is tracked as a
   // follow-up in #563.
-  // Persist what the schedulers learned before the model owners are deleted.
+  // Persist what each container learned before the containers are deleted.
   // This is the only unconditional save; the periodic flush is best-effort.
   FlushModels(/*force=*/true);
 
@@ -171,7 +179,7 @@ void PoolManager::DestroyAllContainers() {
       }
     }
     // The static container is NOT in containers_ (issue #956), so it needs its
-    // own Destroy or it leaks the model tables until process exit.
+    // own Destroy or it leaks until process exit.
     if (ContainerHold sc = info.static_container_.get()) {
       sc.Destroy(info.chimod_name_);
       ++destroyed;
@@ -213,31 +221,53 @@ bool PoolManager::RegisterContainer(PoolId pool_id, ContainerId container_id,
     return false;
   }
 
-  // Make sure the pool's model owner exists BEFORE the container is published:
-  // once it is in containers_ a worker can route a task to it, and that task's
-  // BeginTask/EndTask must already reinforce the shared model rather than a
-  // private copy that would be silently discarded. Done outside the write lock
-  // because it constructs a container and may read the persisted model file.
-  DynamicContainer static_container = EnsureStaticContainer(pool_id);
+  // Make sure the pool's static (stateless) container exists so routing can
+  // find it. Done outside the write lock because it constructs a container.
+  EnsureStaticContainer(pool_id);
 
-  PoolMetaWriteLock lock(pool_metadata_mutex_);
-  auto it = pool_metadata_.find(pool_id);
-  if (it == pool_metadata_.end()) {
-    return false;
+  // Restore what a previous run of THIS container learned on this node (issue
+  // #994: the model is per container, so each one reads its own file). Done
+  // BEFORE the container is published: once it is in containers_ a worker can
+  // route a task to it, and a restore landing after that task's EndTask would
+  // overwrite fresh learning. Outside the lock: this reads a file.
+  std::string chimod_name;
+  std::string pool_name;
+  {
+    PoolMetaReadLock lock(pool_metadata_mutex_);
+    auto it = pool_metadata_.find(pool_id);
+    if (it == pool_metadata_.end()) {
+      return false;
+    }
+    chimod_name = it->second.chimod_name_;
+    pool_name = it->second.pool_name_;
+  }
+  RestoreModel(chimod_name, pool_name, container);
+
+  {
+    PoolMetaWriteLock lock(pool_metadata_mutex_);
+    auto it = pool_metadata_.find(pool_id);
+    if (it == pool_metadata_.end()) {
+      return false;
+    }
+
+    PoolInfo &info = it->second;
+    // Publish the (already-built) DynamicContainer handle. Copies are by value, so
+    // any handle already cached in a RunContext keeps pointing at the same
+    // ModuleManager-owned container. Store is serialized by pool_metadata_mutex_.
+    info.containers_[container_id] = container;
+
+    if (!info.local_container_.IsValid()) {
+      info.local_container_ = info.containers_[container_id];
+    }
   }
 
-  PoolInfo &info = it->second;
-  // Publish the (already-built) DynamicContainer handle. Copies are by value, so
-  // any handle already cached in a RunContext keeps pointing at the same
-  // ModuleManager-owned container. Store is serialized by pool_metadata_mutex_.
-  info.containers_[container_id] = container;
-
-  // Cache the model owner in the container so the per-task inference and
-  // reinforcement paths never re-query the PoolManager (issue #956).
-  container.get()->SetStaticContainer(info.static_container_);
-
-  if (!info.local_container_.IsValid()) {
-    info.local_container_ = info.containers_[container_id];
+  // Let the ChiMod publish its web-dashboard assets and routes (issue #990).
+  // Outside the metadata lock: a RegisterViz() override is module code that may
+  // read pool metadata itself, and holding a write lock across it would
+  // deadlock. Registration is idempotent, so being called once per container is
+  // fine.
+  if (auto *viz = CLIO_VIZ) {
+    viz->OnContainerRegistered(chimod_name, *container.get());
   }
 
   return true;
@@ -264,33 +294,22 @@ DynamicContainer PoolManager::EnsureStaticContainer(PoolId pool_id) {
   }
 
   // Build outside the lock: constructing a container calls into the
-  // ModuleManager's dlopen'd factory and restoring the model reads a file.
-  // Neither belongs under the pool metadata write lock, which the task-routing
-  // hot path takes for reading.
+  // ModuleManager's dlopen'd factory, which does not belong under the pool
+  // metadata write lock that the task-routing hot path takes for reading.
   DynamicContainer static_container(chimod_name, pool_id, pool_name);
   if (!static_container) {
     HLOG(kError,
          "PoolManager: failed to create static container for ChiMod '{}' "
-         "(pool '{}'); the pool will fall back to per-container models",
+         "(pool '{}')",
          chimod_name, pool_name);
     return DynamicContainer();
   }
   // Init() only wires up the container's identity, client handle and model
   // table (it is the autogenerated ChiMod Init). The module's Create method is
   // deliberately NOT run here: the static container must hold no module state.
+  // Its model table is never restored or reinforced either — the learned model
+  // is per real container (issue #994).
   static_container.get()->Init(pool_id, pool_name, kStaticContainerId);
-
-  // Restore what a previous run learned about this pool on this node.
-  auto *ipc_manager = CLIO_IPC;
-  u32 node_id = ipc_manager ? ipc_manager->GetNodeId() : 0;
-  TaskStatModelSnapshot snapshot;
-  const std::string model_path =
-      TaskStatModelPath(chimod_name, pool_name, node_id);
-  if (snapshot.Load(model_path)) {
-    size_t restored = static_container.get()->ImportModel(snapshot);
-    HLOG(kInfo, "PoolManager: restored {} method weight(s) for pool '{}' from {}",
-         restored, pool_name, model_path);
-  }
 
   // Install, unless another thread won the race.
   DynamicContainer duplicate;
@@ -316,6 +335,29 @@ DynamicContainer PoolManager::EnsureStaticContainer(PoolId pool_id) {
 bool PoolManager::UnregisterContainer(PoolId pool_id, ContainerId container_id) {
   if (!is_initialized_) {
     return false;
+  }
+
+  // The model lives on the container being removed (issue #994), so persist it
+  // first or its learning goes with it. Outside the write lock: file I/O.
+  {
+    DynamicContainer leaving;
+    std::string chimod_name;
+    std::string pool_name;
+    {
+      PoolMetaReadLock lock(pool_metadata_mutex_);
+      auto it = pool_metadata_.find(pool_id);
+      if (it != pool_metadata_.end()) {
+        auto cit = it->second.containers_.find(container_id);
+        if (cit != it->second.containers_.end()) {
+          leaving = cit->second;
+          chimod_name = it->second.chimod_name_;
+          pool_name = it->second.pool_name_;
+        }
+      }
+    }
+    if (leaving.IsValid()) {
+      SaveModel(chimod_name, pool_name, leaving, /*force=*/true);
+    }
   }
 
   PoolMetaWriteLock lock(pool_metadata_mutex_);
@@ -347,23 +389,28 @@ void PoolManager::UnregisterAllContainers(PoolId pool_id) {
     return;
   }
 
-  // Persist the model before the pool's owner handle is dropped, so a pool that
-  // is destroyed and later re-created starts from what it had learned. Done
-  // outside the write lock (it writes a file), and on a copy of the handle.
+  // Persist every container's model before the handles are dropped, so a pool
+  // that is destroyed and later re-created starts from what each container had
+  // learned. Done outside the write lock (it writes files), on handle copies.
   {
-    DynamicContainer static_container;
+    std::vector<DynamicContainer> containers;
     std::string chimod_name;
     std::string pool_name;
     {
       PoolMetaReadLock lock(pool_metadata_mutex_);
       auto it = pool_metadata_.find(pool_id);
       if (it != pool_metadata_.end()) {
-        static_container = it->second.static_container_;
         chimod_name = it->second.chimod_name_;
         pool_name = it->second.pool_name_;
+        containers.reserve(it->second.containers_.size());
+        for (const auto &cpair : it->second.containers_) {
+          containers.push_back(cpair.second);
+        }
       }
     }
-    SaveModel(chimod_name, pool_name, static_container, /*force=*/true);
+    for (const auto &c : containers) {
+      SaveModel(chimod_name, pool_name, c, /*force=*/true);
+    }
   }
 
   PoolMetaWriteLock lock(pool_metadata_mutex_);
@@ -461,6 +508,11 @@ void PoolManager::PlugContainer(PoolId pool_id, ContainerId container_id) {
   }
 }
 
+bool PoolManager::WasDestroyed(PoolId pool_id) const {
+  std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
+  return destroyed_pools_.count(pool_id) != 0;
+}
+
 bool PoolManager::HasPool(PoolId pool_id) const {
   if (!is_initialized_) {
     return false;
@@ -521,6 +573,37 @@ std::vector<PoolId> PoolManager::GetAllPoolIds() const {
     pool_ids.push_back(pair.first);
   }
   return pool_ids;
+}
+
+std::vector<DynamicContainer> PoolManager::GetLocalContainers(
+    PoolId pool_id) const {
+  std::vector<DynamicContainer> containers;
+  if (!is_initialized_) {
+    return containers;
+  }
+
+  std::vector<std::pair<ContainerId, DynamicContainer>> entries;
+  {
+    PoolMetaReadLock lock(pool_metadata_mutex_);
+    auto it = pool_metadata_.find(pool_id);
+    if (it == pool_metadata_.end()) {
+      return containers;
+    }
+    entries.reserve(it->second.containers_.size());
+    for (const auto &cpair : it->second.containers_) {
+      if (cpair.second.IsValid()) {
+        entries.emplace_back(cpair.first, cpair.second);
+      }
+    }
+  }
+  // Deterministic order for reporting (unordered_map iteration is not).
+  std::sort(entries.begin(), entries.end(),
+            [](const auto &a, const auto &b) { return a.first < b.first; });
+  containers.reserve(entries.size());
+  for (auto &e : entries) {
+    containers.push_back(e.second);
+  }
+  return containers;
 }
 
 bool PoolManager::IsInitialized() const { return is_initialized_; }
@@ -623,6 +706,35 @@ void PoolManager::InitAddressMap(PoolId pool_id, u32 num_containers) {
   HLOG(kDebug, "=== Address Map Complete ===");
 }
 
+bool PoolManager::RegisterRemotePool(PoolId pool_id,
+                                     const std::string& pool_name,
+                                     const std::string& chimod_name,
+                                     const std::string& chimod_params,
+                                     u32 num_containers) {
+  if (!is_initialized_ || pool_id.IsNull()) {
+    return false;
+  }
+  {
+    // Insert-if-absent under the write lock: a pool this node created (or
+    // already learned) keeps its metadata and containers untouched.
+    // The address map is the same ContainerId == NodeId mapping that
+    // InitAddressMap builds for every pool (issue #856).
+    PoolMetaWriteLock lock(pool_metadata_mutex_);
+    if (pool_metadata_.find(pool_id) == pool_metadata_.end()) {
+      PoolInfo info(pool_id, pool_name, chimod_name, chimod_params,
+                    num_containers);
+      for (u32 c = 0; c < num_containers; ++c) {
+        info.address_map_[c] = c;
+      }
+      pool_metadata_[pool_id] = std::move(info);
+      HLOG(kDebug,
+           "PoolManager: registered remote pool '{}' {} ({}) for routing",
+           pool_name, pool_id, chimod_name);
+    }
+  }
+  return EnsureStaticContainer(pool_id).IsValid();
+}
+
 TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {
@@ -630,10 +742,17 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
     CLIO_CO_RETURN;
   }
 
-  // Cast generic Task to BaseCreateTask to access pool operation parameters
-  auto* create_task = reinterpret_cast<
-      clio::run::admin::BaseCreateTask<clio::run::admin::CreateParams>*>(
-      task.get());
+  // Cast generic Task to the create task's pool-operation fields. Every create
+  // task reaching here is SOME BaseCreateTask instantiation -- admin's own,
+  // GetOrCreatePoolTask<XConfig>, ComposeTask<XConfig> -- and which one depends
+  // on the calling ChiMod, so there is no instantiation to name. They all share
+  // CreatePoolFields, which carries exactly the fields this function reads, so
+  // the downcast is to that: an ordinary derived-class cast rather than the
+  // reinterpret_cast to one arbitrary instantiation this used to do, which was
+  // undefined behaviour and which UBSan reported on every test that creates a
+  // pool.
+  auto* create_task =
+      static_cast<clio::run::admin::CreatePoolFields*>(task.get());
 
   // Debug: Log do_compose_ value after cast
   HLOG(kDebug, "PoolManager::CreatePool: After cast, do_compose_={}, is_admin_={}",
@@ -664,8 +783,16 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   // Make was_created a local variable
   bool was_created;
 
-  // Validate pool parameters
+  // Validate pool parameters.
+  //
+  // EVERY failure below must set a return code. Without one the task completes
+  // with 0, and 0 means success to the compose driver -- which then logs
+  // "Successfully created pool" for a pool that does not exist. A ChiMod whose
+  // .so fails to dlopen took exactly that path: the pool was silently absent,
+  // every blob bypassed the module, and the only symptom was a stored size of
+  // zero much later.
   if (!ValidatePoolParams(chimod_name, pool_name)) {
+    task->SetReturnCode(EINVAL);
     CLIO_CO_RETURN;
   }
 
@@ -690,6 +817,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
     HLOG(kError,
          "PoolManager: Cannot create pool with null PoolId. Users must provide "
          "explicit pool ID.");
+    task->SetReturnCode(EINVAL);
     CLIO_CO_RETURN;
   }
 
@@ -710,15 +838,20 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
 
   // Store pool metadata first so InitAddressMap can find it
   UpdatePoolMetadata(target_pool_id, pool_info);
+  {
+    // Re-created under a destroyed id: its periodic tasks are live again.
+    std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
+    destroyed_pools_.erase(target_pool_id);
+  }
 
   // Initialize address map for the pool (ContainerId -> NodeId)
   InitAddressMap(target_pool_id, num_containers);
 
   // Build the pool's static container up front (issue #956). It is created
-  // once per pool, at pool-creation time, owns the task-stat model for every
-  // container of the pool, and restores the weights the previous run of this
-  // pool learned on this node. It never runs Create, so it carries no module
-  // state; RegisterContainer wires each real container to it.
+  // once per pool, at pool-creation time, for the stateless routing APIs. It
+  // never runs Create, so it carries no module state, and it owns no learned
+  // state either: each real container keeps its own task-stat model, restored
+  // by RegisterContainer (issue #994).
   EnsureStaticContainer(target_pool_id);
 
   // Create local pool with containers (merged from CreateLocalPool)
@@ -727,6 +860,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   if (!module_manager) {
     HLOG(kError, "PoolManager: Module manager not available");
     ErasePoolMetadata(target_pool_id);
+    task->SetReturnCode(ENODEV);
     CLIO_CO_RETURN;
   }
 
@@ -741,6 +875,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
       HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
            chimod_name);
       ErasePoolMetadata(target_pool_id);
+      task->SetReturnCode(ENOENT);
       CLIO_CO_RETURN;
     }
 
@@ -758,6 +893,8 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
       pool_config =
           clio::run::Task::Deserialize<clio::run::PoolConfig>(create_task->chimod_params_);
       is_restart = pool_config.restart_;
+    } else if (replaying_pools_) {
+      is_restart = true;  // re-created from the pool log after a restart
     }
 
     // Initialize container with pool ID, name, and container ID
@@ -784,6 +921,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
       HLOG(kError, "PoolManager: Failed to register container");
       container.get().Destroy(chimod_name);
       ErasePoolMetadata(target_pool_id);
+      task->SetReturnCode(EIO);
       CLIO_CO_RETURN;
     }
 
@@ -816,6 +954,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
 
   } catch (const std::exception& e) {
     HLOG(kError, "PoolManager: Exception during pool creation: {}", e.what());
+    task->SetReturnCode(EIO);
     if (container) {
       // Unregister if it was registered before the exception
       UnregisterContainer(target_pool_id, node_id);
@@ -828,6 +967,24 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   // Set success results
   was_created = true;
   (void)was_created;  // Suppress unused variable warning
+  // Durable pools (compose `restart: true`, or an API create from a client
+  // with SetPersistent) go to this node's pool log -- the one restart
+  // registry. Re-creations from the log itself are already there.
+  if (!create_task->is_admin_ && !replaying_pools_) {
+    // From the params captured at entry: chimod_params_ is INOUT, and a
+    // module's Create may have rewritten it by now (reading it here as a
+    // PoolConfig overran it and threw bad_alloc mid-compose).
+    bool durable = create_task->persist_;
+    if (create_task->do_compose_) {
+      durable = clio::run::Task::Deserialize<clio::run::PoolConfig>(
+                    clio::run::priv::string(CLIO_PRIV_ALLOC, chimod_params))
+                    .restart_;
+    }
+    if (durable) {
+      LogPool(true, PoolLogEntry{target_pool_id, pool_name, chimod_name,
+                                 chimod_params, create_task->do_compose_});
+    }
+  }
   // Note: create_task->new_pool_id_ already contains target_pool_id
 
   HLOG(kInfo,
@@ -837,7 +994,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   CLIO_TASK_BODY_END
 }
 
-TaskResume PoolManager::DestroyPool(PoolId pool_id) {
+TaskResume PoolManager::DestroyPool(PoolId pool_id, bool keep_in_pool_log) {
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {
     HLOG(kError, "PoolManager: Not initialized for pool destruction");
@@ -860,6 +1017,13 @@ TaskResume PoolManager::DestroyPool(PoolId pool_id) {
 
   // Remove pool metadata
   ErasePoolMetadata(pool_id);
+  if (!keep_in_pool_log) {
+    LogPool(false, PoolLogEntry{pool_id, "", "", "", false});
+  }
+  {
+    std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
+    destroyed_pools_.insert(pool_id);
+  }
 
   HLOG(kInfo, "PoolManager: Destroyed complete pool {}", pool_id);
   CLIO_CO_RETURN;
@@ -906,7 +1070,7 @@ void PoolManager::ErasePoolMetadata(PoolId pool_id) {
 }
 
 //=============================================================================
-// Task-stat model persistence (issue #956)
+// Task-stat model persistence (issues #956, #994)
 //=============================================================================
 
 /** How often FlushModels() is allowed to write, in seconds. The admin
@@ -916,32 +1080,68 @@ void PoolManager::ErasePoolMetadata(PoolId pool_id) {
  *  much learning. */
 static constexpr double kModelFlushIntervalSec = 30.0;
 
-void PoolManager::SaveModel(const std::string &chimod_name,
-                            const std::string &pool_name,
-                            const DynamicContainer &static_container,
-                            bool force) {
-  ContainerHold owner = static_container.get();
-  if (owner == nullptr) {
-    return;
-  }
-  if (!force && !owner->IsModelDirty()) {
+void PoolManager::RestoreModel(const std::string &chimod_name,
+                               const std::string &pool_name,
+                               const DynamicContainer &container) {
+  ContainerHold c = container.get();
+  if (c == nullptr) {
     return;
   }
   auto *ipc_manager = CLIO_IPC;
   u32 node_id = ipc_manager ? ipc_manager->GetNodeId() : 0;
-  const std::string path = TaskStatModelPath(chimod_name, pool_name, node_id);
+  const std::string path =
+      TaskStatModelPath(chimod_name, pool_name, node_id, c->container_id_);
+  TaskStatModelSnapshot snapshot;
+  if (!snapshot.Load(path)) {
+    return;  // first run for this container on this node
+  }
+  size_t restored = c->ImportModel(snapshot);
+  HLOG(kInfo,
+       "PoolManager: restored {} method weight(s) for pool '{}' container {} "
+       "from {}",
+       restored, pool_name, c->container_id_, path);
+}
+
+void PoolManager::SaveModel(const std::string &chimod_name,
+                            const std::string &pool_name,
+                            const DynamicContainer &container, bool force) {
+  ContainerHold c = container.get();
+  if (c == nullptr) {
+    return;
+  }
+  if (!force && !c->IsModelDirty()) {
+    return;
+  }
+  auto *ipc_manager = CLIO_IPC;
+  u32 node_id = ipc_manager ? ipc_manager->GetNodeId() : 0;
+  const std::string path =
+      TaskStatModelPath(chimod_name, pool_name, node_id, c->container_id_);
   if (path.empty()) {
     return;
   }
-  TaskStatModelSnapshot snapshot = owner->ExportModel();
+  // One writer at a time, across every path that reaches here: the 1 Hz
+  // SystemMonitor flush (on a worker), the force=true flush
+  // DestroyAllContainers issues during shutdown, and the direct force=true
+  // saves on the container-leave / pool-destroy paths below. They can target
+  // the SAME container, and Save() writes "<path>.tmp" and renames it over the
+  // real file -- two of them interleaved means one rename lands on a temp file
+  // the other is still writing. FlushModels used to take model_flush_mutex_
+  // only for its throttle bookkeeping and release it before saving, and the two
+  // direct call sites never took it at all, so its "one writer at a time"
+  // comment described an exclusion nothing enforced. Held here rather than
+  // around the FlushModels loop so it covers those call sites too, and so it is
+  // never held while pool_metadata_mutex_ is (no lock-order inversion).
+  std::lock_guard<std::mutex> guard(model_flush_mutex_);
+  TaskStatModelSnapshot snapshot = c->ExportModel();
   if (snapshot.Empty()) {
     return;  // module never registered method names — nothing to analyze
   }
   snapshot.chimod_name_ = chimod_name;
   if (snapshot.Save(path)) {
-    owner->ClearModelDirty();
-    HLOG(kDebug, "PoolManager: saved task-stat model for pool '{}' to {}",
-         pool_name, path);
+    c->ClearModelDirty();
+    HLOG(kDebug,
+         "PoolManager: saved task-stat model for pool '{}' container {} to {}",
+         pool_name, c->container_id_, path);
   }
 }
 
@@ -950,7 +1150,8 @@ void PoolManager::FlushModels(bool force) {
     return;
   }
 
-  // One writer at a time, and no more often than the flush interval.
+  // No more often than the flush interval. Mutual exclusion between writers is
+  // SaveModel's job, not this throttle's -- see the lock there.
   {
     std::lock_guard<std::mutex> guard(model_flush_mutex_);
     auto now = std::chrono::steady_clock::now();
@@ -966,27 +1167,31 @@ void PoolManager::FlushModels(bool force) {
 
   // Copy the handles out from under the lock: saving does filesystem I/O, and
   // pool_metadata_mutex_ is taken for reading by the task-routing hot path.
-  struct PoolModel {
+  // Every REAL container is saved (issue #994: one model, one file, per
+  // container); the static container carries no learned state and is skipped.
+  struct ContainerModel {
     std::string chimod_name_;
     std::string pool_name_;
-    DynamicContainer static_container_;
+    DynamicContainer container_;
   };
-  std::vector<PoolModel> models;
+  std::vector<ContainerModel> models;
   {
     PoolMetaReadLock lock(pool_metadata_mutex_);
     models.reserve(pool_metadata_.size());
     for (const auto &pair : pool_metadata_) {
       const PoolInfo &info = pair.second;
-      if (!info.static_container_.IsValid()) {
-        continue;
+      for (const auto &cpair : info.containers_) {
+        if (!cpair.second.IsValid()) {
+          continue;
+        }
+        models.push_back(ContainerModel{info.chimod_name_, info.pool_name_,
+                                        cpair.second});
       }
-      models.push_back(
-          PoolModel{info.chimod_name_, info.pool_name_, info.static_container_});
     }
   }
 
   for (const auto &m : models) {
-    SaveModel(m.chimod_name_, m.pool_name_, m.static_container_, force);
+    SaveModel(m.chimod_name_, m.pool_name_, m.container_, force);
   }
 }
 
@@ -1114,7 +1319,13 @@ void PoolManager::ReplayAddressTableWAL() {
 
   size_t entries_replayed = 0;
   for (const auto &dir_entry : fs::directory_iterator(wal_dir)) {
-    if (dir_entry.path().extension() != ".bin") continue;
+    // Only this WAL's own files: the directory also holds other logs (the
+    // pool log, pools.<node>.bin), whose records parsed as mappings here
+    // produced garbage pool ids -- and could remap a real pool's containers.
+    if (dir_entry.path().extension() != ".bin" ||
+        dir_entry.path().filename().string().rfind("domain_table.", 0) != 0) {
+      continue;
+    }
 
     std::ifstream ifs(dir_entry.path(), std::ios::binary);
     if (!ifs.is_open()) continue;
@@ -1138,6 +1349,160 @@ void PoolManager::ReplayAddressTableWAL() {
   }
 
   HLOG(kInfo, "ReplayAddressTableWAL: Replayed {} entries", entries_replayed);
+}
+
+// ===========================================================================
+// Pool log: the one restart registry for durable pools (compose and API)
+// ===========================================================================
+
+namespace {
+/** Append a length-prefixed string. */
+void PutStr(std::ofstream &o, const std::string &v) {
+  const u32 n = static_cast<u32>(v.size());
+  o.write(reinterpret_cast<const char *>(&n), sizeof(n));
+  o.write(v.data(), n);
+}
+/** Read a length-prefixed string; false at a torn tail. */
+bool GetStr(std::ifstream &i, std::string *v) {
+  u32 n = 0;
+  if (!i.read(reinterpret_cast<char *>(&n), sizeof(n))) return false;
+  if (n > (64u << 20)) return false;  // garbage length: torn record
+  v->resize(n);
+  return n == 0 || static_cast<bool>(i.read(&(*v)[0], n));
+}
+/**
+ * fsync a file and the directory holding it, so its contents and its name
+ * (a create or a rename onto it) survive power loss. Best effort: a failure
+ * is logged.
+ * @param path the file
+ */
+void SyncFileAndDir(const std::string &path) {
+#ifndef _WIN32
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    if (::fsync(fd) != 0) {
+      HLOG(kError, "PoolManager: fsync of {} failed: {}", path,
+           std::strerror(errno));
+    }
+    ::close(fd);
+  }
+  const std::string dir = std::filesystem::path(path).parent_path().string();
+  const int dfd = ::open(dir.empty() ? "." : dir.c_str(),
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dfd >= 0) {
+    (void)::fsync(dfd);
+    ::close(dfd);
+  }
+#else
+  (void)path;
+#endif
+}
+/** Write one record: [u8 op][u8 compose][PoolId][name][chimod][params]. */
+void PutRecord(std::ofstream &o, bool add, const PoolManager::PoolLogEntry &e) {
+  const uint8_t op = add ? 1 : 0;
+  const uint8_t compose = e.compose ? 1 : 0;
+  o.write(reinterpret_cast<const char *>(&op), sizeof(op));
+  o.write(reinterpret_cast<const char *>(&compose), sizeof(compose));
+  o.write(reinterpret_cast<const char *>(&e.pool_id), sizeof(e.pool_id));
+  PutStr(o, e.pool_name);
+  PutStr(o, e.chimod_name);
+  PutStr(o, e.chimod_params);
+}
+}  // namespace
+
+std::string PoolManager::PoolLogPath() const {
+  auto *config_manager = CLIO_CONFIG_MANAGER;
+  auto *ipc_manager = CLIO_IPC;
+  return config_manager->GetConfDir() + "/wal/pools." +
+         std::to_string(ipc_manager->GetNodeId()) + ".bin";
+}
+
+void PoolManager::LogPool(bool add, const PoolLogEntry &e) {
+  if (CLIO_CONFIG_MANAGER == nullptr) return;
+  const std::string path = PoolLogPath();
+  std::error_code ec;
+  std::filesystem::create_directories(
+      std::filesystem::path(path).parent_path(), ec);
+  std::ofstream ofs(path, std::ios::binary | std::ios::app);
+  if (!ofs.is_open()) {
+    HLOG(kError, "PoolManager: cannot open pool log {}; pool {} will not be "
+         "re-created after a restart", path, e.pool_id);
+    return;
+  }
+  PutRecord(ofs, add, e);
+  ofs.flush();
+  ofs.close();
+  // Pools change rarely; a pool created just before a power loss must not
+  // vanish with its data at the next start.
+  SyncFileAndDir(path);
+}
+
+std::vector<PoolManager::PoolLogEntry> PoolManager::ReadPoolLogFile(
+    const std::string &path) {
+  std::vector<PoolLogEntry> live;
+  std::ifstream ifs(path, std::ios::binary);
+  if (!ifs.is_open()) return live;
+  while (true) {
+    uint8_t op = 0, compose = 0;
+    PoolLogEntry e;
+    if (!ifs.read(reinterpret_cast<char *>(&op), sizeof(op))) break;
+    if (!ifs.read(reinterpret_cast<char *>(&compose), sizeof(compose)) ||
+        !ifs.read(reinterpret_cast<char *>(&e.pool_id), sizeof(e.pool_id)) ||
+        !GetStr(ifs, &e.pool_name) || !GetStr(ifs, &e.chimod_name) ||
+        !GetStr(ifs, &e.chimod_params)) {
+      break;  // torn tail from a crash mid-append
+    }
+    e.compose = compose != 0;
+    auto it = std::find_if(live.begin(), live.end(),
+                           [&](const PoolLogEntry &x) {
+                             return x.pool_id == e.pool_id;
+                           });
+    if (it != live.end()) live.erase(it);
+    if (op == 1) live.push_back(std::move(e));
+  }
+  return live;
+}
+
+std::vector<PoolManager::PoolLogEntry> PoolManager::LoadPoolLog() {
+  if (CLIO_CONFIG_MANAGER == nullptr) return {};
+  const std::string path = PoolLogPath();
+  std::vector<PoolLogEntry> live = ReadPoolLogFile(path);
+  if (!std::filesystem::exists(path)) return live;
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
+    for (const auto &e : live) PutRecord(ofs, true, e);
+  }
+  // The compacted copy must be on disk before it replaces the log: renamed
+  // over it unsynced, a power loss could leave an empty log (every pool
+  // forgotten).
+  SyncFileAndDir(tmp);
+  std::error_code ec;
+  std::filesystem::rename(tmp, path, ec);
+  if (!ec) SyncFileAndDir(path);
+  return live;
+}
+
+void PoolManager::ClearPoolLog() {
+  auto *config_manager = CLIO_CONFIG_MANAGER;
+  if (config_manager == nullptr) return;
+  std::error_code ec;
+  std::filesystem::remove(PoolLogPath(), ec);
+  // This node's address-table WAL too (domain_table.<pool>.<node>.bin): a
+  // fresh start begins a new cluster lifetime, and a later recovering start
+  // must not remap containers from the previous one.
+  auto *ipc_manager = CLIO_IPC;
+  if (ipc_manager == nullptr) return;
+  const std::string suffix =
+      "." + std::to_string(ipc_manager->GetNodeId()) + ".bin";
+  const std::filesystem::path wal_dir = config_manager->GetConfDir() + "/wal";
+  for (const auto &ent : std::filesystem::directory_iterator(wal_dir, ec)) {
+    const std::string name = ent.path().filename().string();
+    if (name.rfind("domain_table.", 0) == 0 && name.size() > suffix.size() &&
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      std::filesystem::remove(ent.path(), ec);
+    }
+  }
 }
 
 }  // namespace clio::run

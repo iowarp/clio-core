@@ -122,6 +122,7 @@ struct ShmBlobRecord {
    * read itself.
    */
   clio::run::u64 placement_gen_;
+  clio::run::u64 content_seq_;  /**< in-place write seqlock; odd = writing */
   float score_;
   clio::run::u32 flags_;
   clio::run::u32 num_blocks_;
@@ -162,6 +163,7 @@ struct ShmBlobRecord {
         last_modified_(0),
         last_read_(0),
         placement_gen_(0),
+        content_seq_(0),
         score_(0.0f),
         flags_(0),
         num_blocks_(0),
@@ -268,7 +270,8 @@ struct ShmMetadataCacheRoot {
   // v2 (issue #817): kMaxInlineBlocks 8 -> 16, and a truncated record is now
   // readable up to CoveredBytes(). Both change the record layout/semantics, so
   // a v1 client must refuse rather than misread it.
-  static constexpr clio::run::u32 kLayoutVersion = 3;
+  // v4: content_seq_ on the blob record (in-place write seqlock).
+  static constexpr clio::run::u32 kLayoutVersion = 4;
 
   clio::run::u32 version_;
   clio::run::u32 ready_;  /**< 0 until fully constructed; clients must check */

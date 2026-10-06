@@ -3,13 +3,36 @@
  * All rights reserved.
  */
 
+#include "clio_runtime/cycle_counter.h"
+extern "C" void clio_evlat_add(int which, unsigned long long cycles);
+// Direct-read registry (core runtime lib): fault-chain level collapse. The mem
+// transport's reads are synchronously servable, so the CTE read path can skip
+// the dispatched ReadTask (and its ~240 µs/level await-resume cost) entirely.
+extern "C" void clio_direct_read_register(
+    unsigned long long pool_id,
+    int (*fn)(void *, unsigned long long, unsigned long long, char *),
+    void *ctx);
+extern "C" void clio_direct_read_unregister(unsigned long long pool_id);
+extern "C" void clio_direct_write_register(
+    unsigned long long pool_id,
+    int (*fn)(void *, unsigned long long, unsigned long long, const char *,
+              void **),
+    void *ctx);
+extern "C" void clio_direct_write_unregister(unsigned long long pool_id);
+extern "C" void clio_direct_dev_base_register(unsigned long long pool_id,
+                                              char *base);
+extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id);
 #include <clio_runtime/bdev/bdev_runtime.h>
+#include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_runtime/comutex.h>
 #include <clio_ctp/util/gpu_api.h>
+#include <clio_ctp/util/msan.h>
 #include <clio_runtime/work_orchestrator.h>
 #include <clio_runtime/worker.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/serialize/msgpack_wrapper.h>
+#include <clio_runtime/pool_manager.h>
+#include <clio_runtime/viz/viz_json.h>
 
 #include <algorithm>
 #include <cctype>
@@ -42,13 +65,19 @@ std::string Runtime::MakePerfStatsPath(const std::string &pool_name) {
   if (ctp::SystemInfo::Getenv("CLIO_BDEV_PERSIST_STATS") == "0") {
     return std::string();
   }
+  // CLIO_BDEV_STATS_DIR wins if set (explicit override).
   std::string dir = ctp::SystemInfo::Getenv("CLIO_BDEV_STATS_DIR");
   if (dir.empty()) {
-    std::string home = ctp::SystemInfo::GetHomeDir();
-    if (home.empty()) {
-      return std::string();  // nowhere to persist
+    // Fall back to CLIO_STORAGE_ROOT (set by --disk or defaults to ~/.clio).
+    dir = ctp::SystemInfo::Getenv("CLIO_STORAGE_ROOT");
+    if (dir.empty()) {
+      std::string home = ctp::SystemInfo::GetHomeDir();
+      if (home.empty()) {
+        return std::string();  // nowhere to persist
+      }
+      dir = home + "/.clio";
     }
-    dir = home + "/.clio/bdev_perf";
+    dir += "/bdev_perf";
   }
   // Sanitize the pool name (it may be a filesystem path or "ram::name")
   // into a flat file name.
@@ -68,12 +97,19 @@ bool Runtime::SavePerfStatsFile(const std::string &path,
   if (path.empty()) return false;
   try {
     namespace fs = std::filesystem;
-    fs::create_directories(fs::path(path).parent_path());
+    // Named, not a temporary: libstdc++.so builds it, so its destructor reads
+    // memory MSan has no record of. See VizServer::AssetSearchDirs.
+    fs::path parent = fs::path(path).parent_path();
+    CTP_MSAN_UNPOISON_PATH(parent);
+    fs::create_directories(parent);
     // Write to a tmp file then rename so a crash mid-write never leaves a
     // truncated stats file for the next session to trip over.
     const std::string tmp = path + ".tmp";
     {
       std::ofstream ofs(tmp, std::ios::trunc);
+      // Stream state lives in uninstrumented libstdc++.so, so is_open()/good()
+      // read bytes MSan has no record of.
+      CTP_MSAN_UNPOISON_OBJ(ofs);
       if (!ofs.is_open()) return false;
       ofs << kPerfStatsHeader << "\n"
           << "read_bandwidth_mbps " << metrics.read_bandwidth_mbps_ << "\n"
@@ -83,6 +119,7 @@ bool Runtime::SavePerfStatsFile(const std::string &path,
           << "iops " << metrics.iops_ << "\n"
           << "model_wall_read " << model_wall_read << "\n"
           << "model_wall_write " << model_wall_write << "\n";
+      CTP_MSAN_UNPOISON_OBJ(ofs);
       if (!ofs.good()) return false;
     }
     std::error_code ec;
@@ -99,6 +136,7 @@ bool Runtime::LoadPerfStatsFile(const std::string &path, PerfMetrics &metrics,
                                 float &model_wall_write) {
   if (path.empty()) return false;
   std::ifstream ifs(path);
+  CTP_MSAN_UNPOISON_OBJ(ifs);  // see SavePerfStatsFile
   if (!ifs.is_open()) return false;
   std::string header;
   if (!std::getline(ifs, header) || header != kPerfStatsHeader) {
@@ -146,11 +184,11 @@ void Runtime::LoadPerfStats() {
   }
   perf_metrics_ = m;
   // Seed the learned wall-clock model so InferWallClockTime (which GetStats
-  // derives its bandwidth from) starts warm instead of at the 1.0 seed.
-  // SetMethodWallCoef writes through to the pool's model owner (the static
-  // container) — writing method_model_wall_ directly would land on this
-  // container's own now-unused table and the seed would be invisible to both
-  // inference and the monitor (issue #956).
+  // derives its bandwidth from) starts warm instead of at the 1.0 seed. The
+  // model is per container (issue #994), so this seeds exactly the table this
+  // bdev's own tasks are scheduled and reinforced against — a second bdev
+  // container on the node (recovered from a peer, backing another device)
+  // keeps its own profile.
   if (wall_read > 0.0f) {
     SetMethodWallCoef(Method::kRead, wall_read);
   }
@@ -243,6 +281,38 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     CLIO_CO_RETURN;
   }
 
+  // Synthetic bandwidth cap, armed only from the environment. Matching on the
+  // pool name is what makes it useful: a tiering experiment needs the SPILL
+  // tier slowed down while the tier above it stays at full speed, and
+  // throttling everything would just scale the whole system down.
+  {
+    const char *mbps = clio::run::env::GetCompat("BDEV_THROTTLE_MBPS");
+    if (mbps != nullptr && *mbps != '\0') {
+      const char *match = clio::run::env::GetCompat("BDEV_THROTTLE_MATCH");
+      const std::string name = task->pool_name_.str();
+      if (match == nullptr || *match == '\0' ||
+          name.find(match) != std::string::npos) {
+        throttle_mbps_ = std::atof(mbps);
+        if (throttle_mbps_ > 0.0) {
+          HLOG(kInfo, "bdev '{}' throttled to {} MB/s", name, throttle_mbps_);
+        }
+      }
+    }
+  }
+
+  {
+    const char *tr = clio::run::env::GetCompat("BDEV_IO_TRACE");
+    io_trace_ = (tr != nullptr && *tr != '\0' && *tr != '0');
+    // The value doubles as the reporting period: 1 logs every operation,
+    // which is what makes an exact op count possible when the totals do not
+    // reconcile with the expected number of pages.
+    if (io_trace_) {
+      const int p = std::atoi(tr);
+      io_trace_period_ = (p > 0) ? static_cast<clio::run::u64>(p) : 64;
+    }
+    trace_name_ = task->pool_name_.str();
+  }
+
   // pool_name doubles as the file path (kFile) / S3 bucket (kS3); it lives on
   // the create task, not in CreateParams.
   if (!transport_->Init(params, task->pool_name_.str(), this)) {
@@ -271,6 +341,38 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // on every startup. Overrides the configured defaults when a stats file
   // exists.
   LoadPerfStats();
+
+  // Level collapse: a mem transport's reads are synchronously servable, so
+  // publish a direct entry keyed by pool id. Deliberately NOT registered when
+  // the throttle or IO-trace experiment knobs are armed — direct reads bypass
+  // the handler where those are enforced/counted, and a throttling experiment
+  // silently reading at full speed is worse than a slower fault path.
+  if (throttle_mbps_ <= 0.0 && !io_trace_) {
+    auto *mem = dynamic_cast<MemBdevTransport *>(transport_.get());
+    if (mem != nullptr) {
+      // Device-backed tier: publish the device base for zero-copy mapping.
+      char *db = mem->DeviceBase();
+      if (db != nullptr) {
+        clio_direct_dev_base_register(pool_id_.ToU64(), db);
+      }
+      clio_direct_read_register(
+          pool_id_.ToU64(),
+          [](void *ctx, unsigned long long off, unsigned long long size,
+             char *dst) -> int {
+            return static_cast<MemBdevTransport *>(ctx)->DirectRead(off, size,
+                                                                    dst);
+          },
+          mem);
+      clio_direct_write_register(
+          pool_id_.ToU64(),
+          [](void *ctx, unsigned long long off, unsigned long long size,
+             const char *src, void **pending_stream) -> int {
+            return static_cast<MemBdevTransport *>(ctx)->DirectWrite(
+                off, size, src, pending_stream);
+          },
+          mem);
+    }
+  }
 
   task->return_code_ = 0;
   CLIO_CO_RETURN;
@@ -350,6 +452,92 @@ clio::run::TaskResume Runtime::FreeBlocks(clio::run::shared_ptr<FreeBlocksTask> 
   CLIO_TASK_BODY_END
 }
 
+namespace {
+/** Steady-clock microseconds, for the synthetic bandwidth cap. */
+double ThrottleNowUs() {
+  return std::chrono::duration<double, std::micro>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
+/**
+ * Reserve this transfer's slice of the device's timeline, then wait for it.
+ *
+ * YIELDS rather than sleeps: this runs on a worker fiber, and blocking the
+ * thread would stall every other task on that worker -- turning a per-device
+ * cap into a global one and measuring the wrong thing entirely.
+ */
+/**
+ * Running per-device I/O totals, so a tier's traffic can be compared against
+ * the logical dataset. Periodic rather than per-op: the point is the ratio,
+ * and one line per operation would itself perturb what is being measured.
+ */
+void Runtime::TraceIo(clio::run::u64 bytes, bool is_write) {
+  // Decided ONCE per process, not per container, and read here rather than in
+  // Create: a container that never ran Create kept io_trace_ = false and its
+  // traffic vanished from the totals. That is exactly how a read path can look
+  // like it is skipping work when it is only skipping the instrument -- 8192
+  // reads were issued and 4484 were counted.
+  static const bool s_trace = [] {
+    const char *tr = clio::run::env::GetCompat("BDEV_IO_TRACE");
+    return tr != nullptr && *tr != '\0' && *tr != '0';
+  }();
+  static const clio::run::u64 s_period = [] {
+    const char *tr = clio::run::env::GetCompat("BDEV_IO_TRACE");
+    const int p = (tr != nullptr) ? std::atoi(tr) : 0;
+    return (p > 0) ? static_cast<clio::run::u64>(p) : 64;
+  }();
+  if (!s_trace) {
+    return;
+  }
+  io_trace_period_ = s_period;
+  clio::run::u64 n;
+  if (is_write) {
+    trace_w_bytes_.fetch_add(bytes);
+    n = trace_w_ops_.fetch_add(1) + 1;
+  } else {
+    trace_r_bytes_.fetch_add(bytes);
+    n = trace_r_ops_.fetch_add(1) + 1;
+  }
+  if ((n % io_trace_period_) != 0) {
+    return;
+  }
+  // Container id included on purpose: a pool can have MORE THAN ONE
+  // container, each with its own counters, and totals that ignore that
+  // undercount by however many containers were not looked at.
+  HLOG(kWarning, "[IO] {}#{} reads={} rMB={} writes={} wMB={}", trace_name_,
+       container_id_,
+       trace_r_ops_.load(), trace_r_bytes_.load() / (1024 * 1024),
+       trace_w_ops_.load(), trace_w_bytes_.load() / (1024 * 1024));
+}
+
+clio::run::TaskResume Runtime::ThrottleFor(clio::run::u64 bytes) {
+  CLIO_TASK_BODY_BEGIN
+  const double want_us =
+      (static_cast<double>(bytes) / (throttle_mbps_ * 1024.0 * 1024.0)) * 1e6;
+  const double now = ThrottleNowUs();
+  // Claim [start, start + want_us) on the shared timeline. A device that is
+  // idle starts now; a busy one queues behind whatever is already booked.
+  double prev = throttle_next_free_us_.load(std::memory_order_relaxed);
+  double start;
+  do {
+    start = (prev > now) ? prev : now;
+  } while (!throttle_next_free_us_.compare_exchange_weak(
+      prev, start + want_us, std::memory_order_relaxed));
+  const double deadline = start + want_us;
+  // Wait to the reserved deadline. Yields rather than sleeps: this runs on a
+  // worker fiber, and blocking the thread would stall every other task on it,
+  // turning a per-device cap into a global one.
+  for (;;) {
+    const double left = deadline - ThrottleNowUs();
+    if (left <= 0.0) break;
+    CLIO_CO_AWAIT(clio::run::yield(left));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   CLIO_TASK_BODY_BEGIN
 
@@ -363,6 +551,10 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     CLIO_CO_AWAIT(transport_->WriteBlocks(ctp::ipc::FullPtr<WriteTask>(task.get())));
     total_writes_.fetch_add(1);
     total_bytes_written_.fetch_add(task->bytes_written_);
+    TraceIo(task->bytes_written_, true);
+    if (throttle_mbps_ > 0.0) {
+      CLIO_CO_AWAIT(ThrottleFor(task->bytes_written_));
+    }
   } else {
     task->return_code_ = 1;
     task->bytes_written_ = 0;
@@ -374,22 +566,33 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
 
 clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  const unsigned long long ev_b0 = clio::run::CycleNow();
+
+  // Counted at ENTRY, before the kNoop early-out: that path reports success
+  // and claims bytes_read_ = length without touching storage, so counting
+  // after it hides exactly the reads that did no I/O.
+  TraceIo(task->length_, false);
 
   if (bdev_type_ == BdevType::kNoop) {
     task->return_code_ = 0;
     task->bytes_read_ = task->length_;
-    CLIO_CO_RETURN;
+    clio_evlat_add(6, clio::run::CycleNow() - ev_b0);
+  CLIO_CO_RETURN;
   }
 
   if (transport_) {
     CLIO_CO_AWAIT(transport_->ReadBlocks(ctp::ipc::FullPtr<ReadTask>(task.get())));
     total_reads_.fetch_add(1);
     total_bytes_read_.fetch_add(task->bytes_read_);
+    if (throttle_mbps_ > 0.0) {
+      CLIO_CO_AWAIT(ThrottleFor(task->bytes_read_));
+    }
   } else {
     task->return_code_ = 1;
     task->bytes_read_ = 0;
   }
 
+  clio_evlat_add(6, clio::run::CycleNow() - ev_b0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -425,8 +628,10 @@ clio::run::TaskResume Runtime::GetStats(clio::run::shared_ptr<GetStatsTask> &tas
 
   if (transport_) {
     task->remaining_size_ = transport_->GetRemainingSize();
+    task->total_size_ = transport_->GetCapacity();
   } else {
     task->remaining_size_ = 0;
+    task->total_size_ = 0;
   }
 
   // Expose the latest ML-predicted TTL so the CTE can make
@@ -467,6 +672,24 @@ clio::run::TaskResume Runtime::SetLifespan(
   CLIO_TASK_BODY_BEGIN
   predicted_ttl_days_.store(task->lifespan_days_, std::memory_order_relaxed);
   task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::FlushAllocLog(
+    clio::run::shared_ptr<FlushAllocLogTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  if (transport_) {
+    transport_->FlushAllocLog();
+  }
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::Sync(clio::run::shared_ptr<SyncTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  task->return_code_ = (transport_ && !transport_->Sync()) ? 1 : 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -539,12 +762,224 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 
 void Runtime::PostGpuContainerCreate() {}
 
+namespace {
+
+/** The bdev types the dashboard offers, in form order. S3/GCS are omitted: they
+ *  need credentials and endpoint state a one-line form cannot express. */
+const std::pair<const char *, BdevType> kVizBdevTypes[] = {
+    {"ram", BdevType::kRam},       {"file", BdevType::kFile},
+    {"hbm", BdevType::kHbm},       {"pinned", BdevType::kPinned},
+    {"noop", BdevType::kNoop},
+};
+
+/** @return true and set @p out if @p name is an offered bdev type. */
+bool ParseVizBdevType(const std::string &name, BdevType *out) {
+  for (const auto &kv : kVizBdevTypes) {
+    if (name == kv.first) {
+      *out = kv.second;
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Validate the create form's fields, writing per-field messages into @p errors.
+ * Shared by action=validate and the create itself, so the two can never
+ * disagree about what is acceptable.
+ * @return number of errors found (0 = valid; outputs are then set)
+ */
+size_t ValidateBdevCreate(const clio::run::viz::Request &req,
+                          clio::run::viz::JsonWriter &errors,
+                          std::string *pool_name, clio::run::PoolId *pool_id,
+                          BdevType *bdev_type, clio::run::u64 *capacity) {
+  size_t count = 0;
+  auto fail = [&errors, &count](const std::string &field,
+                                const std::string &message) {
+    errors.Field(field, message);
+    ++count;
+  };
+
+  *pool_name = req.Param("pool_name");
+  if (pool_name->empty()) {
+    fail("pool_name", "required (\"ram::name\" or a filesystem path)");
+  }
+
+  const std::string id_str = req.Param("pool_id");
+  if (id_str.empty()) {
+    fail("pool_id", "required");
+  } else {
+    try {
+      *pool_id = clio::run::PoolId::FromString(id_str);
+      if (pool_id->IsNull()) {
+        fail("pool_id", "must not be null");
+      }
+    } catch (const std::exception &e) {
+      fail("pool_id", std::string("unparseable: ") + e.what());
+    }
+  }
+
+  const std::string type_str = req.Param("bdev_type", "ram");
+  if (!ParseVizBdevType(type_str, bdev_type)) {
+    fail("bdev_type", "unknown type '" + type_str + "'");
+  }
+
+  const std::string cap_str = req.Param("capacity", "0");
+  if (!clio::run::viz::ParseSizeField(cap_str, capacity)) {
+    fail("capacity", "unparseable size '" + cap_str + "' (e.g. \"16MB\")");
+  } else if (count == 0 && *capacity == 0 && *bdev_type != BdevType::kNoop) {
+    fail("capacity", "must be > 0");
+  }
+  return count;
+}
+
+}  // namespace
+
+void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
+                          const std::string &mod_name) {
+  // Node-local read only: the pool table is already in this process, so the
+  // page's index costs no task. Runs on an HTTP thread, so it takes the pool
+  // manager's own read lock and touches nothing else.
+  viz.AddRoute(
+      {"GET", "/api/mod/" + mod_name + "/pools", mod_name,
+       "Block-device pools on this node",
+       [mod_name](const clio::run::viz::Request &,
+                  clio::run::viz::Response &resp) {
+         auto *pool_manager = CLIO_POOL_MANAGER;
+         if (!pool_manager) {
+           resp.Error(503, "pool manager unavailable");
+           return;
+         }
+         clio::run::viz::JsonWriter w;
+         w.BeginObject();
+         w.Key("pools").BeginArray();
+         for (const auto &pid : pool_manager->GetAllPoolIds()) {
+           const auto *info = pool_manager->GetPoolInfo(pid);
+           if (!info || info->chimod_name_ != mod_name) {
+             continue;
+           }
+           w.BeginObject();
+           w.Field("pool_id", pid.ToString());
+           w.Field("pool_name", info->pool_name_);
+           w.EndObject();
+         }
+         w.EndArray();
+         w.EndObject();
+         resp.Json(w.Str());
+       }});
+
+  // ---- Create form (the dashboard's "Add Pool" convention) ----------------
+  // GET answers a form spec the admin's Pools page renders; POST validates the
+  // submitted fields (action=validate) or creates the pool. The module owns
+  // both, so what the form accepts and what Create accepts is one code path.
+  viz.AddRoute(
+      {"GET", "/api/mod/" + mod_name + "/create", mod_name,
+       "Form spec for creating a block-device pool",
+       [mod_name](const clio::run::viz::Request &,
+                  clio::run::viz::Response &resp) {
+         clio::run::viz::JsonWriter w;
+         w.BeginObject();
+         w.Field("mod_name", mod_name);
+         w.Field("title", "Block device");
+         w.Key("fields").BeginArray();
+         w.BeginObject();
+         w.Field("name", "pool_name").Field("label", "Pool name");
+         w.Field("type", "text").Field("required", true);
+         w.Field("placeholder", "ram::my_bdev");
+         w.Field("help",
+                 "\"ram::<name>\" for DRAM, or a filesystem path for a "
+                 "file-backed device");
+         w.EndObject();
+         w.BeginObject();
+         w.Field("name", "pool_id").Field("label", "Pool ID");
+         w.Field("type", "text").Field("required", true);
+         w.Field("default",
+                 std::to_string(clio::run::viz::SuggestFreePoolMajor(800)) +
+                     ".0");
+         w.Field("help", "major.minor; prefilled with a free id");
+         w.EndObject();
+         w.BeginObject();
+         w.Field("name", "bdev_type").Field("label", "Type");
+         w.Field("type", "select").Field("default", "ram");
+         w.Key("options").BeginArray();
+         for (const auto &kv : kVizBdevTypes) {
+           w.Value(kv.first);
+         }
+         w.EndArray();
+         w.EndObject();
+         w.BeginObject();
+         w.Field("name", "capacity").Field("label", "Capacity");
+         w.Field("type", "text").Field("default", "1GB");
+         w.Field("help", "size with units: 64MB, 1GB, ...");
+         w.EndObject();
+         w.EndArray();
+         w.EndObject();
+         resp.Json(w.Str());
+       }});
+
+  viz.AddRoute(
+      {"POST", "/api/mod/" + mod_name + "/create", mod_name,
+       "Validate (action=validate) or create a block-device pool",
+       [](const clio::run::viz::Request &req, clio::run::viz::Response &resp) {
+         std::string pool_name;
+         clio::run::PoolId pool_id;
+         BdevType bdev_type = BdevType::kRam;
+         clio::run::u64 capacity = 0;
+         clio::run::viz::JsonWriter errors;
+         errors.BeginObject();
+         const size_t error_count = ValidateBdevCreate(
+             req, errors, &pool_name, &pool_id, &bdev_type, &capacity);
+         errors.EndObject();
+         if (error_count > 0) {
+           clio::run::viz::JsonWriter w;
+           w.BeginObject();
+           w.Field("ok", false);
+           w.RawField("errors", errors.Str());
+           w.EndObject();
+           resp.status = 400;
+           resp.Json(w.Str());
+           return;
+         }
+         if (req.Param("action") == "validate") {
+           resp.Json("{\"ok\":true}");
+           return;
+         }
+         // Get-or-create semantics, like every CreateTask: an existing
+         // pool_name returns the existing pool rather than failing.
+         Client client(pool_id);
+         auto future = client.AsyncCreate(clio::run::PoolQuery::Dynamic(),
+                                          pool_name, pool_id, bdev_type,
+                                          capacity);
+         if (!future.Wait(30.0f)) {
+           resp.Error(503, "bdev create timed out");
+           return;
+         }
+         if (future->return_code_ != 0) {
+           resp.Error(500, "bdev create failed with rc=" +
+                               std::to_string(future->return_code_));
+           return;
+         }
+         clio::run::viz::JsonWriter w;
+         w.BeginObject();
+         w.Field("ok", true);
+         w.Field("pool_name", pool_name);
+         w.Field("pool_id", future->new_pool_id_.ToString());
+         w.EndObject();
+         resp.Json(w.Str());
+       }});
+}
+
 void Runtime::StopHealthPolling() {
   health_poll_stop_.store(true, std::memory_order_relaxed);
   if (health_poll_thread_.joinable()) {
     health_poll_thread_.join();
   }
   if (transport_) {
+    // Retract the direct entries BEFORE tearing down the transport they
+    // point at (no-ops if this pool never registered them).
+    clio_direct_read_unregister(pool_id_.ToU64());
+    clio_direct_write_unregister(pool_id_.ToU64());
+    clio_direct_dev_base_unregister(pool_id_.ToU64());
     transport_->Destroy();
     transport_.reset();
   }

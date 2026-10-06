@@ -1,0 +1,52 @@
+---
+# "Clio as a cache" 2-node test config (issue #1015).
+#
+# Note what is NOT here: no daemon starts with this config. Every rank loads it
+# via CLIO_SERVER_CONF and asks for a runtime with CLIO_WITH_RUNTIME=1, so
+# whichever rank wins the race on each node composes the pools below in-process
+# and the other three attach to it.
+
+memory:
+  main_segment_size: auto
+  client_data_segment_size: 1GB
+  runtime_data_segment_size: 1GB
+
+networking:
+  port: 8090
+  neighborhood_size: 2
+  hostfile: /workspace/context-runtime/test/integration/with_runtime/hostfile
+
+logging:
+  level: info
+  file: /tmp/clio_with_runtime.log
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+  local_sched: "default"
+  heartbeat_interval: 1000
+
+compose:
+  # One CTE core container per node, so the blobs the eight ranks write are
+  # distributed across the two independently-started runtimes.
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: /mnt/hdd1
+        bdev_type: file
+        capacity_limit: 2GB
+        score: 0.5
+    dpe:
+      dpe_type: max_bw
+    targets:
+      neighborhood: 2
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+    performance:
+      target_stat_interval_ms: 5000
+      blob_cache_size_mb: 1024
+      max_concurrent_operations: 64
+      score_threshold: 0.7
+      score_difference_threshold: 0.05

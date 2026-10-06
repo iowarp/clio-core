@@ -38,13 +38,19 @@ constexpr clio::run::u32 kPatternSeed = 0x5Au;
 
 }  // namespace
 
-using kvhdf5::byte_t;  // raw blob-payload bytes (codebase convention)
+// NOTE: deliberately NOT named `kv_byte_t`. cuSZ's <cusz.h> (pulled in
+// transitively via clio_ctp/compress/compress_factory.h, which the
+// context-runtime headers include) declares `typedef uint8_t kv_byte_t;` at
+// GLOBAL scope. kvhdf5::byte_t is cuda::std::byte, so a global
+// `using kv_byte_t = kvhdf5::byte_t;
+// fails to compile as soon as CUDA and compression are both enabled.
+using kv_byte_t = kvhdf5::byte_t;
 
 /** Fill the device blob buffer with the byte pattern (separate kernel). */
-__global__ void DsFillKernel(byte_t *buf, clio::run::u32 size, clio::run::u32 seed) {
+__global__ void DsFillKernel(kv_byte_t *buf, clio::run::u32 size, clio::run::u32 seed) {
   clio::run::u32 i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= size) return;
-  buf[i] = static_cast<byte_t>((seed ^ i) & 0xFFu);
+  buf[i] = static_cast<kv_byte_t>((seed ^ i) & 0xFFu);
 }
 
 /** Submit the pre-built PutBlob task from the kernel via the handle. */
@@ -69,7 +75,7 @@ __global__ void DsFillAndWriteKernel(kvhdf5::GpuDatasetHandle h, clio::run::u32 
   CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
   (void)g_ipc_manager;
   for (uint64_t i = threadIdx.x; i < h.Size(); i += blockDim.x)
-    h.Data()[i] = static_cast<byte_t>((seed ^ i) & 0xFFu);
+    h.Data()[i] = static_cast<kv_byte_t>((seed ^ i) & 0xFFu);
   __threadfence_system();  // flush each thread's fills to system scope
   __syncthreads();         // all fills done before the producer Sends
   h.Write();               // thread-0 only (internal guard)
@@ -78,12 +84,12 @@ __global__ void DsFillAndWriteKernel(kvhdf5::GpuDatasetHandle h, clio::run::u32 
 #if !CTP_IS_DEVICE_PASS
 
 /** Verify the device buffer holds the pattern (host reads it back via D2H). */
-static clio::run::u32 DsVerifyDevicePattern(const byte_t *device_buf, clio::run::u32 size,
+static clio::run::u32 DsVerifyDevicePattern(const kv_byte_t *device_buf, clio::run::u32 size,
                                       clio::run::u32 seed) {
-  std::vector<byte_t> host(size);
+  std::vector<kv_byte_t> host(size);
   ctp::GpuApi::Memcpy(host.data(), device_buf, size);
   for (clio::run::u32 i = 0; i < size; ++i) {
-    byte_t want = static_cast<byte_t>((seed ^ i) & 0xFFu);
+    kv_byte_t want = static_cast<kv_byte_t>((seed ^ i) & 0xFFu);
     if (host[i] != want) return i;
   }
   return size;  // all match
@@ -110,7 +116,7 @@ TEST_CASE("GPU Dataset handle PutBlob+GetBlob round trip",
   kvhdf5::GpuCteDataset ds(ipc, gpu_info, /*gpu_id=*/0, env.tag_id, name,
                            kBlobBytes);
   kvhdf5::GpuDatasetHandle h = ds.Handle();
-  byte_t *data = ds.DeviceData();
+  kv_byte_t *data = ds.DeviceData();
 
   // ---- Fill the buffer (separate kernel) then sync so PutBlob sees it. ----
   clio::run::u32 threads = 256;
@@ -124,7 +130,7 @@ TEST_CASE("GPU Dataset handle PutBlob+GetBlob round trip",
   ctp::GpuApi::Synchronize();
 
   // ---- Zero the buffer so the GetBlob readback is verifiable. ----
-  std::vector<byte_t> zeros(kBlobBytes);
+  std::vector<kv_byte_t> zeros(kBlobBytes);
   ctp::GpuApi::Memcpy(data, zeros.data(), kBlobBytes);
 
   // ---- Submit GetBlob from a kernel via the handle. ----
@@ -163,7 +169,7 @@ TEST_CASE("GPU Dataset handle fused fill+write round trip",
   kvhdf5::GpuCteDataset ds(ipc, gpu_info, /*gpu_id=*/0, env.tag_id, name,
                            kBlobBytes);
   kvhdf5::GpuDatasetHandle h = ds.Handle();
-  byte_t *data = ds.DeviceData();
+  kv_byte_t *data = ds.DeviceData();
 
   // ---- Fill + submit PutBlob in a single launch (no host sync between). ----
   std::fprintf(stderr, "[put] launching DsFillAndWriteKernel (fused)\n");
@@ -171,7 +177,7 @@ TEST_CASE("GPU Dataset handle fused fill+write round trip",
   ctp::GpuApi::Synchronize();
 
   // ---- Zero, read back via the handle, verify. ----
-  std::vector<byte_t> zeros(kBlobBytes);
+  std::vector<kv_byte_t> zeros(kBlobBytes);
   ctp::GpuApi::Memcpy(data, zeros.data(), kBlobBytes);
   DsReadKernel<<<1, 32>>>(h);
   ctp::GpuApi::Synchronize();

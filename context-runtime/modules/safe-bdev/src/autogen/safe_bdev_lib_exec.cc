@@ -75,6 +75,11 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method,
       CLIO_CO_AWAIT(GetStats(typed_task));
       break;
     }
+    case Method::kSync: {
+      auto& typed_task = task_ptr.template Cast<SyncTask>();
+      CLIO_CO_AWAIT(Sync(typed_task));
+      break;
+    }
     case Method::kAddBdev: {
       auto& typed_task = task_ptr.template Cast<AddBdevTask>();
       CLIO_CO_AWAIT(AddBdev(typed_task));
@@ -152,6 +157,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archiv
       archive << *typed_task;
       break;
     }
+    case Method::kSync: {
+      auto& typed_task = task_ptr.template Cast<SyncTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kAddBdev: {
       auto& typed_task = task_ptr.template Cast<AddBdevTask>();
       archive << *typed_task;
@@ -223,6 +233,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archiv
     }
     case Method::kGetStats: {
       auto& typed_task = task_ptr.template Cast<GetStatsTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kSync: {
+      auto& typed_task = task_ptr.template Cast<SyncTask>();
       archive >> *typed_task;
       break;
     }
@@ -309,6 +324,11 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       archive >> *typed_task;
       break;
     }
+    case Method::kSync: {
+      auto& typed_task = task_ptr.template Cast<SyncTask>();
+      archive >> *typed_task;
+      break;
+    }
     case Method::kAddBdev: {
       auto& typed_task = task_ptr.template Cast<AddBdevTask>();
       archive >> *typed_task;
@@ -389,6 +409,11 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kGetStats: {
       auto& typed_task = task_ptr.template Cast<GetStatsTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kSync: {
+      auto& typed_task = task_ptr.template Cast<SyncTask>();
       archive << *typed_task;
       break;
     }
@@ -503,6 +528,15 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(
       }
       break;
     }
+    case Method::kSync: {
+      auto new_task_ptr = ipc_manager->NewTask<SyncTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<SyncTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<SyncTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kAddBdev: {
       auto new_task_ptr = ipc_manager->NewTask<AddBdevTask>();
       if (!new_task_ptr.IsNull()) {
@@ -601,6 +635,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<GetStatsTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kSync: {
+      auto new_task_ptr = ipc_manager->NewTask<SyncTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kAddBdev: {
       auto new_task_ptr = ipc_manager->NewTask<AddBdevTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
@@ -667,6 +705,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kGetStats: {
       auto& typed_task = orig_task.template Cast<GetStatsTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kSync: {
+      auto& typed_task = orig_task.template Cast<SyncTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }

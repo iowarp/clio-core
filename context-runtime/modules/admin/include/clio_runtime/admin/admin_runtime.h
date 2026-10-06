@@ -72,6 +72,8 @@ enum AdminQueueIndex {
  */
 class Runtime : public clio::run::Container {
 public:
+  /** A Send tick slower than this logs its per-phase timing (ms). */
+  static constexpr double kSlowSendTickMs = 500.0;
   // CreateParams type used by CLIO_TASK_CC macro for lib_name access
   using CreateParams = clio::run::admin::CreateParams;
 
@@ -130,6 +132,13 @@ public:
    * Returns TaskResume for consistency with other methods called from Run
    */
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
+
+  /**
+   * True when the server config's compose section defines pool `pool_id`.
+   * @param pool_id requested pool id
+   * @return whether compose will create it
+   */
+  static bool IsComposedPool(const clio::run::PoolId &pool_id);
 
   /**
    * Handle GetOrCreatePool task - Pool get-or-create operation (IS_ADMIN=false)
@@ -233,6 +242,16 @@ public:
   void MonitorGetHostInfo(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
+   * Register the web dashboard's endpoints and claim its home page
+   * (issue #990). Called on a prototype instance at module-load time (see
+   * Container::RegisterViz), so every handler is stateless -- Monitor
+   * forwarding constructs a local admin Client per request. Defined in
+   * admin_viz.cc.
+   */
+  void RegisterViz(clio::run::viz::VizServer &viz,
+                   const std::string &mod_name) override;
+
+  /**
    * Handle AnnounceShutdown - Mark a departing node as dead immediately
    * and trigger recovery if this node is the new leader.
    */
@@ -246,10 +265,9 @@ public:
   clio::run::TaskResume RegisterMemory(clio::run::shared_ptr<RegisterMemoryTask> &task);
 
   /**
-   * Handle RestartContainers - Re-create pools from the restart registry.
-   * Reads the RestartLog write-ahead log (~/.clio/restart_log.bin), the same
-   * persistent registry replayed at startup, and re-composes each registered
-   * compose file.
+   * Handle RestartContainers - Re-create pools from the restart registry:
+   * this node's pool log (PoolManager::LoadPoolLog), the same registry the
+   * runtime replays on a restart -- durable compose and API pools alike.
    */
   clio::run::TaskResume RestartContainers(clio::run::shared_ptr<RestartContainersTask> &task);
 
@@ -410,6 +428,19 @@ private:
   std::vector<PendingProbe> pending_direct_probes_;
   std::vector<PendingIndirectProbe> pending_indirect_probes_;
 
+  /**
+   * A direct probe of @p target_node_id failed (timed out, or completed with
+   * an error): mark it probe-failed unless it is already dead, and ask up to
+   * kIndirectProbeHelpers live peers to probe it on our behalf.
+   *
+   * @param target_node_id the node whose direct probe failed
+   * @param self_node_id this node's id (never chosen as a helper)
+   * @param reason short description for the log ("timed out", "rc=...")
+   */
+  void StartIndirectProbes(clio::run::u64 target_node_id,
+                           clio::run::u64 self_node_id,
+                           const std::string &reason);
+
   // #628: in-flight QueryTaskProgress probes for the cross-node task-progress
   // validity check. Fired (fire-and-poll) by ScanTaskProgress and reaped on a
   // later tick via Future::IsComplete() -- never awaited, so the net-processing
@@ -418,15 +449,81 @@ private:
     clio::run::Future<QueryTaskProgressTask> future;
     size_t net_key;
     clio::run::u32 replica_id;
+    clio::run::u64 gen;  // the origin's OriginProgress::gen when fired
+    clio::run::u64 target_node_id;  // the node probed
+    std::chrono::steady_clock::time_point fired_at;
+    bool silence_reported = false;  // the silence bound was already acted on
   };
+  /**
+   * How long a probe may go unanswered before its target is declared dead.
+   * A probe to a node that is gone never completes at all: no origin-side
+   * timer fails a sent task whose target never answers, so counting failed
+   * completions is not enough. Three probe intervals of silence it is.
+   */
+  static constexpr double kProbeSilenceSec = 30.0;
+
+  /**
+   * Silence (no liveness-probe answer, no inbound bytes) after which a peer
+   * is declared dead so the tasks waiting on it fail. Default
+   * kProbeSilenceSec; CLIO_PROBE_SILENCE_S overrides it.
+   * @return the silence window in seconds
+   */
+  static double ProbeSilenceSec() {
+    static const double v = [] {
+      const char *e = std::getenv("CLIO_PROBE_SILENCE_S");
+      if (e != nullptr && *e != '\0') {
+        const double d = std::strtod(e, nullptr);
+        if (d > 0.0) return d;
+      }
+      return kProbeSilenceSec;
+    }();
+    return v;
+  }
+  /**
+   * Idle liveness. A peer this node has heard from before, then nothing for
+   * kIdleProbeSec, gets a probe even with no task in flight to it, so a
+   * node waiting on data that peer will never publish (a barrier or reduce
+   * blob it happens to own itself) learns of the death through the silence
+   * bound above instead of its own collective timeout. Peers never heard
+   * from are left alone: a late starter is not a dead one.
+   */
+  static constexpr double kIdleProbeSec = 10.0;
+  /** net_key of an idle probe: no replica behind it, liveness only. */
+  static constexpr size_t kIdleProbeKey = ~size_t(0);
   std::vector<PendingProgressQuery> pending_progress_queries_;
+  /**
+   * Consecutive liveness probes to a node that came back with an error (no
+   * answer within the probe's own bound). With SWIM off nothing else ever
+   * marks a node dead, so a rank whose peer died sat in GetOrCreateTag
+   * forever. After kProbeFailuresToDeclareDead in a row the node is marked
+   * dead and the dead-node scan fails its outstanding tasks.
+   */
+  std::unordered_map<clio::run::u64, clio::run::u32> probe_failures_;
+  static constexpr clio::run::u32 kProbeFailuresToDeclareDead = 3;
 
   /**
    * Periodic cross-node task-progress validity check (issue #628). Reaps
    * completed probes (Gone -> complete the origin) and fires new probes for
    * replicas the origin has waited on beyond task_progress_interval_ms.
    */
+  void NoteProbeFailure(clio::run::u64 node_id);
   void ScanTaskProgress();
+  /**
+   * Step 1 of ScanTaskProgress: reap answered probes and act on silent ones,
+   * in ONE compaction pass (the per-item vector::erase this replaced was
+   * O(n^2): thousands of probes under load held the network worker for 25 s).
+   * @param now scan time
+   * @param judge false when this node's own scan was delayed, so a probe's
+   *        silence says nothing about its target (re-arm instead of kill)
+   */
+  void ReapProgressProbes(std::chrono::steady_clock::time_point now,
+                          bool judge);
+  /** Step 2: probe replicas outstanding beyond the interval (bounded). */
+  void FireStuckProbes(clio::run::u32 interval_ms);
+  /** Step 3: probe silent idle peers, one probe per peer at a time. */
+  void FireIdleProbes();
+  /** When ScanTaskProgress last ran (detects this node's own stalls). */
+  std::chrono::steady_clock::time_point last_progress_scan_{};
   std::mt19937 probe_rng_{std::random_device{}()};
 
   // SWIM probe / suspicion timeouts. The prior 5 s direct + 3 s

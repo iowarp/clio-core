@@ -231,7 +231,8 @@ clio::run::TaskResume Runtime::PutBlob(
         // (the blob pre-existed beyond this put, so our copy is a prefix):
         // the local copy must not survive.
         auto del = local->AsyncDelBlob(task->tag_id_, blob_name,
-                                       clio::run::PoolQuery::Local());
+                                       clio::run::PoolQuery::Local(),
+                                       clio::cte::core::kDelCacheCopyOnly);
         CLIO_CO_AWAIT(del);
       }
       out_ctx.replica_ = orig_ctx.replica_;
@@ -392,7 +393,17 @@ clio::run::TaskResume Runtime::GetBlob(
                                        put_ctx, /*flags=*/0,
                                        clio::run::PoolQuery::Local());
         CLIO_CO_AWAIT(put);
-        if (put->GetReturnCode() == 0) {
+        if (put->GetReturnCode() != 0) {
+          // A put that failed part-way (a device error, a full tier) leaves
+          // a copy with chunks that were never written -- whatever their
+          // reused extents held before. The present => COMPLETE invariant
+          // the opportunistic read above relies on forbids keeping it: such
+          // a copy was served as another file's old bytes with rc 0 (#1131).
+          auto del = local->AsyncDelBlob(task->tag_id_, blob_name,
+                                         clio::run::PoolQuery::Local(),
+                                         clio::cte::core::kDelCacheCopyOnly);
+          CLIO_CO_AWAIT(del);
+        } else {
           // VERSION-CHECKED registration (issue #894): if the owner's
           // content moved on since our fetch, the registration is REJECTED
           // and the just-written copy is stale — delete it, the next read
@@ -409,7 +420,8 @@ clio::run::TaskResume Runtime::GetBlob(
                reg->GetReturnCode());
           if (reg->GetReturnCode() != 0) {
             auto del = local->AsyncDelBlob(task->tag_id_, blob_name,
-                                           clio::run::PoolQuery::Local());
+                                           clio::run::PoolQuery::Local(),
+                                           clio::cte::core::kDelCacheCopyOnly);
             CLIO_CO_AWAIT(del);
           }
         }
@@ -483,7 +495,8 @@ clio::run::TaskResume Runtime::PopulateLocal(const TagId &tag_id,
       // local size answer both rely on it) forbids keeping a prefix: a
       // partial population is deleted whole.
       auto del = local->AsyncDelBlob(tag_id, blob_name,
-                                     clio::run::PoolQuery::Local());
+                                     clio::run::PoolQuery::Local(),
+                                     clio::cte::core::kDelCacheCopyOnly);
       CLIO_CO_AWAIT(del);
       CLIO_CO_RETURN;
     }
@@ -506,7 +519,8 @@ clio::run::TaskResume Runtime::PopulateLocal(const TagId &tag_id,
          reg->GetReturnCode());
     if (reg->GetReturnCode() != 0) {
       auto del = local->AsyncDelBlob(tag_id, blob_name,
-                                     clio::run::PoolQuery::Local());
+                                     clio::run::PoolQuery::Local(),
+                                     clio::cte::core::kDelCacheCopyOnly);
       CLIO_CO_AWAIT(del);
     }
   }

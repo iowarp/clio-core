@@ -116,6 +116,21 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(PodGetBlob(typed_task));
       break;
     }
+    case Method::kPodMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<PodMultiPutBlobTask>();
+      CLIO_CO_AWAIT(PodMultiPutBlob(typed_task));
+      break;
+    }
+    case Method::kPodMultiGetBlob: {
+      auto& typed_task = task_ptr.template Cast<PodMultiGetBlobTask>();
+      CLIO_CO_AWAIT(PodMultiGetBlob(typed_task));
+      break;
+    }
+    case Method::kPodMultiScore: {
+      auto& typed_task = task_ptr.template Cast<PodMultiScoreTask>();
+      CLIO_CO_AWAIT(PodMultiScore(typed_task));
+      break;
+    }
     case Method::kPodReorganizeBlob: {
       auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
       CLIO_CO_AWAIT(PodReorganizeBlob(typed_task));
@@ -130,6 +145,11 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<DelBlobTask>();
       CLIO_CO_AWAIT(DelBlob(typed_task));
+      break;
+    }
+    case Method::kReorganizeHint: {
+      auto& typed_task = task_ptr.template Cast<ReorganizeHintTask>();
+      CLIO_CO_AWAIT(ReorganizeHint(typed_task));
       break;
     }
     case Method::kEvict: {
@@ -191,6 +211,12 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(GetNumAliases(typed_task));
       break;
     }
+    case Method::kUpdateTagNames: {
+      // Cast task FullPtr to specific type
+      auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
+      CLIO_CO_AWAIT(UpdateTagNames(typed_task));
+      break;
+    }
     case Method::kPollTelemetryLog: {
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
@@ -201,6 +227,11 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
       CLIO_CO_AWAIT(GetBlobScore(typed_task));
+      break;
+    }
+    case Method::kGetResidency: {
+      auto& typed_task = task_ptr.template Cast<GetResidencyTask>();
+      CLIO_CO_AWAIT(GetResidency(typed_task));
       break;
     }
     case Method::kGetBlobSize: {
@@ -249,6 +280,18 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<FlushDataTask>();
       CLIO_CO_AWAIT(FlushData(typed_task));
+      break;
+    }
+    case Method::kSyncTag: {
+      // Cast task FullPtr to specific type
+      auto& typed_task = task_ptr.template Cast<SyncTagTask>();
+      CLIO_CO_AWAIT(SyncTag(typed_task));
+      break;
+    }
+    case Method::kListLocalBlobs: {
+      // Cast task FullPtr to specific type
+      auto& typed_task = task_ptr.template Cast<ListLocalBlobsTask>();
+      CLIO_CO_AWAIT(ListLocalBlobs(typed_task));
       break;
     }
     case Method::kSemanticSearch: {
@@ -346,6 +389,21 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kPodMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<PodMultiPutBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kPodMultiGetBlob: {
+      auto& typed_task = task_ptr.template Cast<PodMultiGetBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kPodMultiScore: {
+      auto& typed_task = task_ptr.template Cast<PodMultiScoreTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kPodReorganizeBlob: {
       auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
       archive << *typed_task;
@@ -358,6 +416,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
     }
     case Method::kDelBlob: {
       auto& typed_task = task_ptr.template Cast<DelBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kReorganizeHint: {
+      auto& typed_task = task_ptr.template Cast<ReorganizeHintTask>();
       archive << *typed_task;
       break;
     }
@@ -416,6 +479,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kUpdateTagNames: {
+      auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kPollTelemetryLog: {
       auto& typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
       archive << *typed_task;
@@ -423,6 +491,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
     }
     case Method::kGetBlobScore: {
       auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kGetResidency: {
+      auto& typed_task = task_ptr.template Cast<GetResidencyTask>();
       archive << *typed_task;
       break;
     }
@@ -463,6 +536,16 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
     }
     case Method::kFlushData: {
       auto& typed_task = task_ptr.template Cast<FlushDataTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kSyncTag: {
+      auto& typed_task = task_ptr.template Cast<SyncTagTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kListLocalBlobs: {
+      auto& typed_task = task_ptr.template Cast<ListLocalBlobsTask>();
       archive << *typed_task;
       break;
     }
@@ -551,6 +634,21 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
       archive >> *typed_task;
       break;
     }
+    case Method::kPodMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<PodMultiPutBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kPodMultiGetBlob: {
+      auto& typed_task = task_ptr.template Cast<PodMultiGetBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kPodMultiScore: {
+      auto& typed_task = task_ptr.template Cast<PodMultiScoreTask>();
+      archive >> *typed_task;
+      break;
+    }
     case Method::kPodReorganizeBlob: {
       auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
       archive >> *typed_task;
@@ -563,6 +661,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kDelBlob: {
       auto& typed_task = task_ptr.template Cast<DelBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kReorganizeHint: {
+      auto& typed_task = task_ptr.template Cast<ReorganizeHintTask>();
       archive >> *typed_task;
       break;
     }
@@ -621,6 +724,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
       archive >> *typed_task;
       break;
     }
+    case Method::kUpdateTagNames: {
+      auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
+      archive >> *typed_task;
+      break;
+    }
     case Method::kPollTelemetryLog: {
       auto& typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
       archive >> *typed_task;
@@ -628,6 +736,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kGetBlobScore: {
       auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kGetResidency: {
+      auto& typed_task = task_ptr.template Cast<GetResidencyTask>();
       archive >> *typed_task;
       break;
     }
@@ -668,6 +781,16 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kFlushData: {
       auto& typed_task = task_ptr.template Cast<FlushDataTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kSyncTag: {
+      auto& typed_task = task_ptr.template Cast<SyncTagTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kListLocalBlobs: {
+      auto& typed_task = task_ptr.template Cast<ListLocalBlobsTask>();
       archive >> *typed_task;
       break;
     }
@@ -775,6 +898,21 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       archive >> *typed_task;
       break;
     }
+    case Method::kPodMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<PodMultiPutBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kPodMultiGetBlob: {
+      auto& typed_task = task_ptr.template Cast<PodMultiGetBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kPodMultiScore: {
+      auto& typed_task = task_ptr.template Cast<PodMultiScoreTask>();
+      archive >> *typed_task;
+      break;
+    }
     case Method::kPodReorganizeBlob: {
       auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
       archive >> *typed_task;
@@ -787,6 +925,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
     }
     case Method::kDelBlob: {
       auto& typed_task = task_ptr.template Cast<DelBlobTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kReorganizeHint: {
+      auto& typed_task = task_ptr.template Cast<ReorganizeHintTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task;
       break;
@@ -854,6 +998,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       archive >> *typed_task;
       break;
     }
+    case Method::kUpdateTagNames: {
+      auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
     case Method::kPollTelemetryLog: {
       auto& typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
       // Use archive operator which respects msg_type
@@ -862,6 +1012,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
     }
     case Method::kGetBlobScore: {
       auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kGetResidency: {
+      auto& typed_task = task_ptr.template Cast<GetResidencyTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task;
       break;
@@ -910,6 +1066,18 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
     }
     case Method::kFlushData: {
       auto& typed_task = task_ptr.template Cast<FlushDataTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kSyncTag: {
+      auto& typed_task = task_ptr.template Cast<SyncTagTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kListLocalBlobs: {
+      auto& typed_task = task_ptr.template Cast<ListLocalBlobsTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task;
       break;
@@ -1019,6 +1187,21 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
       archive << *typed_task;
       break;
     }
+    case Method::kPodMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<PodMultiPutBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kPodMultiGetBlob: {
+      auto& typed_task = task_ptr.template Cast<PodMultiGetBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kPodMultiScore: {
+      auto& typed_task = task_ptr.template Cast<PodMultiScoreTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kPodReorganizeBlob: {
       auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
       archive << *typed_task;
@@ -1031,6 +1214,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kDelBlob: {
       auto& typed_task = task_ptr.template Cast<DelBlobTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kReorganizeHint: {
+      auto& typed_task = task_ptr.template Cast<ReorganizeHintTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -1098,6 +1287,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
       archive << *typed_task;
       break;
     }
+    case Method::kUpdateTagNames: {
+      auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
     case Method::kPollTelemetryLog: {
       auto& typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
       // Use archive operator which respects msg_type
@@ -1106,6 +1301,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kGetBlobScore: {
       auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kGetResidency: {
+      auto& typed_task = task_ptr.template Cast<GetResidencyTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -1154,6 +1355,18 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kFlushData: {
       auto& typed_task = task_ptr.template Cast<FlushDataTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kSyncTag: {
+      auto& typed_task = task_ptr.template Cast<SyncTagTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kListLocalBlobs: {
+      auto& typed_task = task_ptr.template Cast<ListLocalBlobsTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -1322,6 +1535,33 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kPodMultiPutBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<PodMultiPutBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<PodMultiPutBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<PodMultiPutBlobTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kPodMultiGetBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<PodMultiGetBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<PodMultiGetBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<PodMultiGetBlobTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kPodMultiScore: {
+      auto new_task_ptr = ipc_manager->NewTask<PodMultiScoreTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<PodMultiScoreTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<PodMultiScoreTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kPodReorganizeBlob: {
       auto new_task_ptr = ipc_manager->NewTask<PodReorganizeBlobTask>();
       if (!new_task_ptr.IsNull()) {
@@ -1347,6 +1587,15 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
         // Copy task fields (includes base Task fields)
         auto& task_typed = orig_task_ptr.template Cast<DelBlobTask>();
         new_task_ptr->Copy(ctp::ipc::FullPtr<DelBlobTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kReorganizeHint: {
+      auto new_task_ptr = ipc_manager->NewTask<ReorganizeHintTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<ReorganizeHintTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ReorganizeHintTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1458,6 +1707,17 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kUpdateTagNames: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<UpdateTagNamesTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<UpdateTagNamesTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<UpdateTagNamesTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kPollTelemetryLog: {
       // Allocate new task
       auto new_task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
@@ -1476,6 +1736,17 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
         // Copy task fields (includes base Task fields)
         auto& task_typed = orig_task_ptr.template Cast<GetBlobScoreTask>();
         new_task_ptr->Copy(ctp::ipc::FullPtr<GetBlobScoreTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kGetResidency: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<GetResidencyTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<GetResidencyTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetResidencyTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1564,6 +1835,28 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
         // Copy task fields (includes base Task fields)
         auto& task_typed = orig_task_ptr.template Cast<FlushDataTask>();
         new_task_ptr->Copy(ctp::ipc::FullPtr<FlushDataTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kSyncTag: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<SyncTagTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<SyncTagTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<SyncTagTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kListLocalBlobs: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<ListLocalBlobsTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<ListLocalBlobsTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ListLocalBlobsTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1660,6 +1953,18 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<PodGetBlobTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kPodMultiPutBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<PodMultiPutBlobTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kPodMultiGetBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<PodMultiGetBlobTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kPodMultiScore: {
+      auto new_task_ptr = ipc_manager->NewTask<PodMultiScoreTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kPodReorganizeBlob: {
       auto new_task_ptr = ipc_manager->NewTask<PodReorganizeBlobTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
@@ -1670,6 +1975,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
     }
     case Method::kDelBlob: {
       auto new_task_ptr = ipc_manager->NewTask<DelBlobTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kReorganizeHint: {
+      auto new_task_ptr = ipc_manager->NewTask<ReorganizeHintTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
     case Method::kEvict: {
@@ -1716,12 +2025,20 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<GetNumAliasesTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kUpdateTagNames: {
+      auto new_task_ptr = ipc_manager->NewTask<UpdateTagNamesTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kPollTelemetryLog: {
       auto new_task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
     case Method::kGetBlobScore: {
       auto new_task_ptr = ipc_manager->NewTask<GetBlobScoreTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kGetResidency: {
+      auto new_task_ptr = ipc_manager->NewTask<GetResidencyTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
     case Method::kGetBlobSize: {
@@ -1754,6 +2071,14 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
     }
     case Method::kFlushData: {
       auto new_task_ptr = ipc_manager->NewTask<FlushDataTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kSyncTag: {
+      auto new_task_ptr = ipc_manager->NewTask<SyncTagTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kListLocalBlobs: {
+      auto new_task_ptr = ipc_manager->NewTask<ListLocalBlobsTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
     case Method::kSemanticSearch: {
@@ -1839,6 +2164,21 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
+    case Method::kPodMultiPutBlob: {
+      auto& typed_task = orig_task.template Cast<PodMultiPutBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kPodMultiGetBlob: {
+      auto& typed_task = orig_task.template Cast<PodMultiGetBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kPodMultiScore: {
+      auto& typed_task = orig_task.template Cast<PodMultiScoreTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
     case Method::kPodReorganizeBlob: {
       auto& typed_task = orig_task.template Cast<PodReorganizeBlobTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
@@ -1851,6 +2191,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kDelBlob: {
       auto& typed_task = orig_task.template Cast<DelBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kReorganizeHint: {
+      auto& typed_task = orig_task.template Cast<ReorganizeHintTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
@@ -1909,6 +2254,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
+    case Method::kUpdateTagNames: {
+      auto& typed_task = orig_task.template Cast<UpdateTagNamesTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
     case Method::kPollTelemetryLog: {
       auto& typed_task = orig_task.template Cast<PollTelemetryLogTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
@@ -1916,6 +2266,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kGetBlobScore: {
       auto& typed_task = orig_task.template Cast<GetBlobScoreTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kGetResidency: {
+      auto& typed_task = orig_task.template Cast<GetResidencyTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
@@ -1956,6 +2311,16 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kFlushData: {
       auto& typed_task = orig_task.template Cast<FlushDataTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kSyncTag: {
+      auto& typed_task = orig_task.template Cast<SyncTagTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kListLocalBlobs: {
+      auto& typed_task = orig_task.template Cast<ListLocalBlobsTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }

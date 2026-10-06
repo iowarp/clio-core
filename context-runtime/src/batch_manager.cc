@@ -13,7 +13,9 @@
 
 #include "clio_runtime/batch_manager.h"
 
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <utility>
 
 #include "clio_runtime/container.h"
@@ -24,6 +26,47 @@
 #include "clio_runtime/worker.h"
 
 namespace clio::run {
+
+// CLIO_COLL_PROF=1: stage profiling for the collective path. A collective that
+// takes ~1ms end to end is not attributable without knowing WHICH stage ate it,
+// and the stages have very different fixes: waiting for the last member is the
+// network and the callers' skew, waiting for the flusher to notice is a wakeup
+// problem, and the rest is aggregate build + execute + broadcast. Accumulates
+// per stage and dumps every 64 collectives.
+namespace collprof {
+static std::atomic<uint64_t> skew_ns{0};      // first member -> last member
+static std::atomic<uint64_t> notice_ns{0};    // last member -> flusher noticed
+static std::atomic<uint64_t> build_ns{0};     // noticed -> aggregate submitted
+static std::atomic<uint64_t> exec_ns{0};      // submitted -> aggregate done
+static std::atomic<uint64_t> bcast_ns{0};     // aggregate done -> members done
+static std::atomic<uint64_t> n{0};
+static std::atomic<uint64_t> notice_max_ns{0};
+inline bool On() {
+  // Must test for a non-EMPTY value, not just a non-null pointer: the harness
+  // passes CLIO_COLL_PROF through docker-compose as "${CLIO_COLL_PROF:-}",
+  // which sets it to the empty string when unset. getenv then returns a valid
+  // pointer to "" and a null check would leave profiling permanently on.
+  static bool on = [] {
+    const char *e = std::getenv("CLIO_COLL_PROF");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
+  return on;
+}
+inline void Bump(std::atomic<uint64_t> &m, uint64_t v) {
+  uint64_t cur = m.load(std::memory_order_relaxed);
+  while (v > cur && !m.compare_exchange_weak(cur, v)) {}
+}
+inline void Dump() {
+  uint64_t c = n.load();
+  if (c == 0 || c % 64 != 0) return;
+  HLOG(kInfo,
+       "[COLLPROF] n={} mean us: skew={} notice={} build={} exec={} bcast={} "
+       "| notice_max={}us",
+       c, skew_ns.load() / 1000 / c, notice_ns.load() / 1000 / c,
+       build_ns.load() / 1000 / c, exec_ns.load() / 1000 / c,
+       bcast_ns.load() / 1000 / c, notice_max_ns.load() / 1000);
+}
+}  // namespace collprof
 
 u64 BatchManager::NowNs() {
   return static_cast<u64>(
@@ -50,6 +93,11 @@ void BatchManager::Add(const clio::run::shared_ptr<Task> &task) {
     }
   }
   group.members.push_back(task);
+  if (collprof::On()) {
+    u64 now = NowNs();
+    if (group.members.size() == 1) group.first_add_ns = now;
+    group.last_add_ns = now;
+  }
 }
 
 bool BatchManager::FlushDue(Worker *worker) {
@@ -92,6 +140,7 @@ bool BatchManager::FlushDue(Worker *worker) {
           continue;
         }
         in_flight_.insert(it->first);  // claim: this group's aggregate is ours
+        if (collprof::On()) it->second.deadline_ns = NowNs();  // reuse: ready_ns
         due.emplace_back(it->first, std::move(it->second));
         it = groups_.erase(it);
       } else {
@@ -164,6 +213,15 @@ void BatchManager::BuildAndSubmit(Worker * /*worker*/, const GroupKey &key,
     std::lock_guard<std::mutex> lk(mu_);
     agg_group_[agg->task_id_.unique_] = key;
   }
+  if (collprof::On()) {
+    AggTiming t;
+    t.first_add_ns = group.first_add_ns;
+    t.last_add_ns = group.last_add_ns;
+    t.ready_ns = group.deadline_ns;  // FlushDue stamped the notice time here
+    t.submitted_ns = NowNs();
+    std::lock_guard<std::mutex> lk(prof_mu_);
+    prof_[agg->task_id_.unique_] = t;
+  }
 
   ipc_->Send(agg);
 }
@@ -210,6 +268,19 @@ void BatchManager::OnAggregateComplete(Worker *worker,
     return;
   }
 
+  AggTiming timing;
+  bool have_timing = false;
+  if (collprof::On()) {
+    std::lock_guard<std::mutex> lk(prof_mu_);
+    auto pit = prof_.find(agg->task_id_.unique_);
+    if (pit != prof_.end()) {
+      timing = pit->second;
+      have_timing = true;
+      prof_.erase(pit);
+    }
+  }
+  const u64 agg_done_ns = collprof::On() ? NowNs() : 0;
+
   u32 rc = agg->GetReturnCode();
   ContainerId completer = agg->GetCompleter();
   u32 method = agg->method_;
@@ -231,7 +302,32 @@ void BatchManager::OnAggregateComplete(Worker *worker,
     member->SetCompleter(completer);
     // Complete the original: local future signal or remote SendOut.
     member->ExecContainer() = container;  // DynamicContainer copy (handle)
+    // A member forwarded from another node completes by SendOut, which EndTask
+    // performs ASYNCHRONOUSLY: it copies the member's RunFuture onto the net
+    // queue and relies on that copy being OWNING to keep the task alive until
+    // the net worker actually transmits. RouteManyToOne deliberately left the
+    // RunFuture's task pointer NON-owning (to break the task->RunContext->
+    // future->task cycle), and the last owning reference is the `members`
+    // element being iterated here, which drops as soon as this loop finishes.
+    // Restore ownership for the duration of the handoff; EndTask re-breaks the
+    // cycle itself right after EnqueueNetTask has taken its copy.
+    if (member->IsRemote()) {
+      member->RunFuture().GetTaskPtr() = member;
+    }
     worker->EndTask(member, false);
+  }
+
+  if (have_timing) {
+    const u64 bcast_done_ns = NowNs();
+    collprof::skew_ns += timing.last_add_ns - timing.first_add_ns;
+    const u64 notice = timing.ready_ns - timing.last_add_ns;
+    collprof::notice_ns += notice;
+    collprof::Bump(collprof::notice_max_ns, notice);
+    collprof::build_ns += timing.submitted_ns - timing.ready_ns;
+    collprof::exec_ns += agg_done_ns - timing.submitted_ns;
+    collprof::bcast_ns += bcast_done_ns - agg_done_ns;
+    ++collprof::n;
+    collprof::Dump();
   }
 }
 

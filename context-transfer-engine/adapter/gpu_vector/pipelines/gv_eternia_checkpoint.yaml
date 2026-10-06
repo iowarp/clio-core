@@ -1,0 +1,87 @@
+# CHECKPOINT-DOMINATED COMPARISON: paged gpu_vector vs the stock kernel, with
+# both paths doing the I/O a real run does.
+#
+# WHY THIS EXISTS. The first baseline comparison (gv_eternia_baseline) ran both
+# paths with no output at all, so the stock path held its data resident, wrote
+# nothing, and won by 7x-234x. That measured paging overhead against a workload
+# that was not doing the job -- a real run checkpoints, and at these rates the
+# checkpoint dominates everything else.
+#
+# MEASURED CHECKPOINT RATES on this machine (disk itself does 2.9 GB/s):
+#
+#   LBANN   dump_weights   ~71 MB/s   TEXT, 3.2x inflation (827 MB per
+#                                     256 MiB weight matrix). Format-bound,
+#                                     not disk-bound -- 2.5% of disk speed.
+#   LAMMPS  restart        ~71 MB/s   binary. Also far below disk.
+#   GROMACS trajectory     ~8 GB/s    binary and buffered; costs almost
+#                                     nothing until it exceeds page cache.
+#
+# So "I/O dominates" is true for LBANN and LAMMPS and false for GROMACS, and
+# that is a property of the three writers rather than of the workloads.
+#
+# WHERE PAGING ACTUALLY HELPS, AND WHERE IT CANNOT
+# ------------------------------------------------
+# Only LBANN under own_weights: there the CTE copy IS the live weight matrix,
+# so with a file-backed tier it is already durable and the dump is redundant.
+# That is `ckpt_free=1` in the results.
+#
+# LAMMPS and GROMACS own their arrays -- the paged vectors are a copy refreshed
+# each step -- so a restart or a trajectory frame still has to be serialised,
+# and paging adds its cost on top of an unchanged I/O bill. `ckpt_free=0`.
+# Making those free would mean the application checkpointing FROM the CTE,
+# which is not implemented.
+config:
+  name: gv_eternia_checkpoint
+  env:
+    CLIO_PREFAULT: "2GB"
+  pkgs:
+    # 64 epochs x 827 MB = ~53 GB of text checkpoints on the stock path.
+    - pkg_type: jarvis_clio_core.clio_eternia_lbann
+      pkg_name: lb
+      width: 8192
+      epochs: 64
+      checkpoint_epochs: 1
+      ckpt_via_cte: true
+      own_weights: true
+      host_weights: true
+      baseline: false
+      page_kb: 256
+      blocks: 32
+      slots: 8
+      timeout_sec: 5400
+      output_dir: "/tmp/gv_ck_lbann"
+    # 10000 restarts x 5.3 MB = ~53 GB. Both paths pay it.
+    - pkg_type: jarvis_clio_core.clio_eternia_lammps
+      pkg_name: lmp
+      lattice_cells: 25
+      steps: 10000
+      restart_steps: 1
+      baseline: false
+      page_kb: 256
+      blocks: 32
+      slots: 8
+      timeout_sec: 5400
+      output_dir: "/tmp/gv_ck_lammps"
+    # 4000 frames x 2.6 MB = ~10 GB, NOT the 50 GB the other two reach: at
+    # 241 ms per step on the paged path, 21000 steps would take over an hour
+    # for this workload alone. The shortfall is recorded rather than hidden.
+    - pkg_type: jarvis_clio_core.clio_eternia_gromacs
+      pkg_name: gmx
+      cells: 60
+      steps: 4000
+      nstxout: 1
+      baseline: false
+      page_kb: 64
+      blocks: 32
+      slots: 8
+      timeout_sec: 5400
+      output_dir: "/tmp/gv_ck_gromacs"
+vars:
+  lb.baseline:  [false, true]
+  lmp.baseline: [false, true]
+  gmx.baseline: [false, true]
+loop:
+  - [lb.baseline, lmp.baseline, gmx.baseline]
+repeat: 1
+run_timeout: 14400
+output: "/home/llogan/Documents/Projects/iowarp/core/results/gv_eternia_checkpoint"

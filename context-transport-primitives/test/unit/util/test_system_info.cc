@@ -13,12 +13,16 @@
 #include "basic_test.h"
 
 #include <clio_ctp/introspect/system_info.h>
+#include <clio_ctp/memory/backend/posix_shm_mmap.h>
 
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
 using ctp::SystemInfo;
+using ctp::ipc::PosixShmMmap;
 
 TEST_CASE("SystemInfoCpu") {
   int cpus = SystemInfo::GetCpuCount();
@@ -154,4 +158,160 @@ TEST_CASE("SystemInfoProcessAndModule") {
 #else
   REQUIRE(mod_dir.front() == '/');
 #endif
+}
+
+TEST_CASE("SystemInfoSharedMemoryError") {
+  // GetLastSharedMemoryError() renders whatever the platform's shared-memory
+  // calls last reported: strerror(errno) on POSIX, FormatMessage over
+  // GetLastError() plus the numeric code on Windows. It must always produce
+  // something a human can read -- the point of it is that the previous
+  // "shm_open failed: {strerror(errno)}" reported a Win32 commit-limit failure
+  // as EAGAIN, because the Win32 calls do not set errno at all.
+  std::string msg = SystemInfo::GetLastSharedMemoryError();
+  REQUIRE(!msg.empty());
+
+  // After a call that genuinely failed it must still be non-empty, and must
+  // not fall through to the "unknown error" placeholder.
+  ctp::File missing;
+  REQUIRE_FALSE(
+      SystemInfo::OpenSharedMemory(missing, "ctp_no_such_segment_xyz"));
+  std::string after = SystemInfo::GetLastSharedMemoryError();
+  REQUIRE(!after.empty());
+  REQUIRE(after != "unknown error");
+}
+
+TEST_CASE("SystemInfoSharedMemoryCreateFailure") {
+  // A name far past any platform's limit: memfd_create(2) caps the name at
+  // 249 bytes, and the macOS/Windows branches open a file whose path this
+  // makes far too long. Every platform therefore fails the create, which is
+  // the one path that reports through GetLastSharedMemoryError().
+  const std::string too_long(4096, 'x');
+
+  ctp::File fd;
+  REQUIRE_FALSE(SystemInfo::CreateNewSharedMemory(fd, too_long, 1024 * 1024));
+
+  // The same failure one layer up: shm_init() must report it and return false
+  // rather than going on to map a backend it never created.
+  PosixShmMmap backend;
+  REQUIRE_FALSE(backend.shm_init(ctp::ipc::MemoryBackendId::GetRoot(),
+                                 1024 * 1024, too_long));
+
+  // Destroying a segment that was never created is a no-op everywhere, and
+  // must stay one now that the Windows branch actually deletes a file.
+  SystemInfo::DestroySharedMemory(too_long);
+  SystemInfo::DestroySharedMemory("ctp_no_such_segment_xyz");
+}
+
+TEST_CASE("SystemInfoSharedMemoryAttachFailure") {
+  // Regression for #1173: the attach path reported "shm_open failed:
+  // strerror(errno)", which on Windows is unrelated to the failing call.
+  // Attaching a segment that does not exist must fail cleanly, and the error
+  // the platform reports must be "not found", not a stale code.
+  const std::string missing_name = "ctp_no_such_segment_attach_1173";
+  SystemInfo::DestroySharedMemory(missing_name);
+  PosixShmMmap backend;
+  REQUIRE_FALSE(backend.shm_attach(missing_name));
+
+  ctp::File missing;
+  REQUIRE_FALSE(SystemInfo::OpenSharedMemory(missing, missing_name));
+  std::string open_err = SystemInfo::GetLastSharedMemoryError();
+#if defined(_WIN32)
+  REQUIRE(open_err.find("(Win32 error 2)") != std::string::npos);
+#else
+  REQUIRE(open_err == strerror(ENOENT));
+#endif
+
+  // MapSharedMemory prints its own diagnostic on failure; that must not
+  // overwrite the error the caller then reads.
+  ctp::File invalid;
+#if defined(_WIN32)
+  invalid.windows_fd_ = nullptr;
+#else
+  invalid.posix_fd_ = -1;
+#endif
+  REQUIRE(SystemInfo::MapSharedMemory(invalid, 4096, 0) == nullptr);
+  std::string map_err = SystemInfo::GetLastSharedMemoryError();
+#if defined(_WIN32)
+  REQUIRE(map_err.find("(Win32 error 6)") != std::string::npos);
+#else
+  REQUIRE(map_err == strerror(EBADF));
+#endif
+}
+
+TEST_CASE("SystemInfoShmRecreateAfterDestroy") {
+  // Regression for #1069. shm_destroy() must actually release the mapping, so
+  // the same segment name can be created again -- the pattern every test
+  // fixture and every restarting client uses.
+  //
+  // On Windows this failed: UnmapMemory() called VirtualFree(ptr, size,
+  // MEM_RELEASE), which cannot free a MapViewOfFile region at all (and, for a
+  // VirtualAlloc region, MEM_RELEASE requires dwSize == 0). Nothing was ever
+  // unmapped. Once segments gained a sparse backing file (#1063), the leaked
+  // view kept a live section on that file and the second create could not
+  // truncate it: ERROR_USER_MAPPED_FILE. The whole cycle has to run at least
+  // three times, because the first create is the one that passed even when
+  // this was broken.
+  const std::string name = "ctp_shm_recreate_test_" +
+                           std::to_string(SystemInfo::GetPid());
+  const size_t kSize = 4 * 1024 * 1024;
+
+  for (int i = 0; i < 3; ++i) {
+    PosixShmMmap backend;
+    REQUIRE(backend.shm_init(ctp::ipc::MemoryBackendId::GetRoot(), kSize,
+                             name));
+    // Touch the region: a create that "succeeded" against a stale section
+    // from a previous iteration must not be mistaken for a good one.
+    REQUIRE(backend.data_ != nullptr);
+    backend.data_[0] = static_cast<char>('a' + i);
+    REQUIRE(backend.data_[0] == static_cast<char>('a' + i));
+    backend.shm_destroy();
+  }
+
+  SystemInfo::DestroySharedMemory(name);
+}
+
+TEST_CASE("SystemInfoShmLargerThan4GiB") {
+  // Regression for #1061 / #1069. A segment past 4 GiB exercises the
+  // high-order DWORD of the Windows section size and of the view length: a
+  // spelling that truncated size to 32 bits created a 4 KiB section and the
+  // write to the last page below faulted. The backing is sparse on every
+  // platform (memfd / regular file / sparse file), so only the two touched
+  // pages are ever committed.
+  const std::string name = "ctp_shm_large_test_" +
+                           std::to_string(SystemInfo::GetPid());
+  const size_t kSize = (4ull << 30) + 4096;
+  const size_t kPage = 4096;
+
+  ctp::File fd;
+  SystemInfo::DestroySharedMemory(name);
+  REQUIRE(SystemInfo::CreateNewSharedMemory(fd, name, kSize));
+  char *mapped = static_cast<char *>(SystemInfo::MapSharedMemory(fd, kSize, 0));
+  REQUIRE(mapped != nullptr);
+
+  mapped[0] = 'F';
+  char *last = mapped + kSize - kPage;
+  memset(last, 0xA5, kPage);
+  REQUIRE(mapped[0] == 'F');
+  REQUIRE(static_cast<unsigned char>(last[0]) == 0xA5);
+  REQUIRE(static_cast<unsigned char>(last[kPage - 1]) == 0xA5);
+
+  // A second view of the same section sees the bytes written past 4 GiB.
+  ctp::File fd2;
+  REQUIRE(SystemInfo::OpenSharedMemory(fd2, name));
+  char *view2 = static_cast<char *>(SystemInfo::MapSharedMemory(fd2, kSize, 0));
+  REQUIRE(view2 != nullptr);
+  REQUIRE(static_cast<unsigned char>(view2[kSize - 1]) == 0xA5);
+  SystemInfo::UnmapMemory(view2, kSize);
+  SystemInfo::CloseSharedMemory(fd2);
+
+  SystemInfo::UnmapMemory(mapped, kSize);
+  SystemInfo::CloseSharedMemory(fd);
+  SystemInfo::DestroySharedMemory(name);
+
+  // Destroyed: the name no longer opens, and it can be created again.
+  ctp::File fd3;
+  REQUIRE_FALSE(SystemInfo::OpenSharedMemory(fd3, name));
+  REQUIRE(SystemInfo::CreateNewSharedMemory(fd3, name, kPage));
+  SystemInfo::CloseSharedMemory(fd3);
+  SystemInfo::DestroySharedMemory(name);
 }

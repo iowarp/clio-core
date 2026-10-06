@@ -1,0 +1,7 @@
+# OpenMPI hostfile: one slot per node so `mpirun -np 4` places exactly one
+# rank on each physical node, matching the one-container-per-node pool the
+# AllToOne barrier counts.
+iowarp-node1 slots=1
+iowarp-node2 slots=1
+iowarp-node3 slots=1
+iowarp-node4 slots=1

@@ -32,6 +32,9 @@ name: Cluster Tests
 on:
   push:
     branches: [main, dev]
+  # Merge queue (issue #1013): same full-matrix-before-merge rationale as the
+  # other gates -- see ci-adapters.yml.
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -80,7 +83,7 @@ jobs:
           docker build -t "$FUSE_IMAGE" - <<'DOCKERFILE'
           FROM iowarp/deps-cpu:latest
           USER root
-          RUN apt-get update \
+          RUN for i in 1 2 3; do apt-get update && break || sleep 5; done \
             && apt-get install -y --no-install-recommends fuse3 libfuse3-dev \
             && rm -rf /var/lib/apt/lists/*
           DOCKERFILE
@@ -90,6 +93,8 @@ jobs:
       # set is the SUPERSET of all three suites' needs:
       #   * CLIO_CTE_ENABLE_FILESYSTEM=ON   — builds clio_run_cfs_test (ManyToOne)
       #   * CLIO_CTE_ENABLE_FUSE_ADAPTER=ON — builds clio_cte_fuse (needs libfuse3)
+      #   * CLIO_CORE_ENABLE_MPI=ON         — builds test_with_runtime_cache, the
+      #     MPI driver for the CLIO_WITH_RUNTIME=1 attach-or-start suite (#1015)
       #   * CLIO_CORE_ENABLE_DOCKER_CI=ON   — builds the integration test binaries
       #     (clio_run_{leader_elect,reconnect,recovery}_tests) the suites
       #     docker-exec; without it every gated suite fails "command not found".
@@ -105,10 +110,11 @@ jobs:
               git config --global --add safe.directory /workspace
               # deps-cpu ships no FUSE3, so CLIO_CTE_ENABLE_FUSE_ADAPTER=ON would
               # FATAL_ERROR without the headers.
-              apt-get update -qq && apt-get install -y -qq libfuse3-dev
+              for i in 1 2 3; do apt-get update -qq && apt-get install -y -qq libfuse3-dev && break || sleep 5; done
               cmake --preset release -DCLIO_CORE_ENABLE_PYTHON=OFF \
                 -DCLIO_CTE_ENABLE_FILESYSTEM=ON \
                 -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
+                -DCLIO_CORE_ENABLE_MPI=ON \
                 -DCLIO_CORE_ENABLE_DOCKER_CI=ON
               cmake --build build -j"$(nproc)"
               # Hand ownership back to the runner so post-job cleanup and the
@@ -276,6 +282,18 @@ jobs:
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-transfer-engine/test/integration/grayscott_congestion/run_tests.sh tiny
 
+      # CLIO_WITH_RUNTIME=1 as a cache (#1015): two nodes with NO daemon on
+      # either, and `mpirun -np 8` (4 ranks per node). Exactly one rank per node
+      # must win the race and host the runtime; the other three must attach to
+      # it rather than fail or clobber its shared memory, and all eight must
+      # then PutBlob/GetBlob through it. Hard gate.
+      - name: Runtime CLIO_WITH_RUNTIME=1 attach-or-start test (2-node, 8 MPI ranks, #1015)
+        timeout-minutes: 20
+        if: ${{ !cancelled() }}
+        run: |
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+          ./context-runtime/test/integration/with_runtime/run_tests.sh
+
       - name: CTE FUSE test (mount + POSIX I/O)
         timeout-minutes: 20
         if: ${{ !cancelled() }}
@@ -287,21 +305,24 @@ jobs:
 
       # The run_tests.sh scripts tear their clusters down on success and failure;
       # this only fires if a step was killed before its own cleanup.
+      #
+      # A step killed by `timeout-minutes` never reaches its own teardown, so its
+      # network survives into the NEXT step. That is how the coherence step timing
+      # out at 20 minutes took the grayscott step down with it:
+      #   failed to create network grayscott_congestion_gs-cluster:
+      #     invalid pool request: Pool overlaps with other one on this address space
+      # Both stacks had been sharing 172.30.0.0/24. The subnets are unique per
+      # stack now, so a leak can no longer block a DIFFERENT stack -- but the leak
+      # still has to be swept, and grayscott_congestion was missing from this list
+      # entirely. Every compose file that declares a network belongs here, not
+      # just the ones that had already caused trouble.
       - name: Cleanup clusters
         if: always()
         run: |
-          for f in \
-            context-runtime/test/integration/alltoone/docker-compose.yml \
-            context-runtime/test/integration/distributed/docker-compose.yml \
-            context-runtime/test/integration/expand/docker-compose.yml \
-            context-runtime/test/integration/migrate/docker-compose.yml \
-            context-runtime/test/integration/reconnect/docker-compose.yml \
-            context-runtime/test/integration/leader_elect/docker-compose.yml \
-            context-runtime/test/integration/recovery/docker-compose.yml \
-            context-transfer-engine/test/integration/distributed/docker-compose.yaml \
-            context-transfer-engine/test/integration/cfs_distributed/docker-compose.yaml \
-            context-transfer-engine/test/integration/coherence/docker-compose.yaml \
-            context-transfer-engine/test/integration/client_crash/docker-compose.yaml \
-            context-transfer-engine/test/integration/fuse/docker-compose.yaml ; do
-            docker compose -f "$f" down -v 2>/dev/null || true
+          for f in             context-runtime/test/integration/alltoone/docker-compose.yml             context-runtime/test/integration/distributed/docker-compose.yml             context-runtime/test/integration/expand/docker-compose.yml             context-runtime/test/integration/migrate/docker-compose.yml             context-runtime/test/integration/reconnect/docker-compose.yml             context-runtime/test/integration/leader_elect/docker-compose.yml             context-runtime/test/integration/recovery/docker-compose.yml             context-runtime/test/integration/collective_restart/docker-compose.yml             context-runtime/test/integration/dashboard/docker-compose.yml             context-runtime/test/integration/interactive/docker-compose.yml             context-runtime/test/integration/with_runtime/docker-compose.yaml             context-transfer-engine/test/integration/distributed/docker-compose.yaml             context-transfer-engine/test/integration/cfs_distributed/docker-compose.yaml             context-transfer-engine/test/integration/coherence/docker-compose.yaml             context-transfer-engine/test/integration/client_crash/docker-compose.yaml             context-transfer-engine/test/integration/grayscott_congestion/docker-compose.yaml             context-transfer-engine/test/integration/mpi_producer_consumer/docker-compose.yaml             context-transfer-engine/test/integration/fuse/docker-compose.yaml ; do
+            docker compose -f "$f" down -v --remove-orphans 2>/dev/null || true
           done
+          # Sweep anything the loop could not name -- a stack whose compose file
+          # moved, or a network orphaned by a killed `docker compose up`. Safe on
+          # a CI runner: prune only removes networks with no attached container.
+          docker network prune -f 2>/dev/null || true

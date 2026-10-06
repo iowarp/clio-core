@@ -6,7 +6,8 @@
 #include <vector>
 
 /**
- * Auto-generated method definitions for safe_bdev
+ * Auto-generated method definitions for safe_bdev.
+ * Updated in issue #1120 to avoid method ID collisions with bdev module.
  */
 
 namespace clio::run::safe_bdev {
@@ -23,15 +24,16 @@ GLOBAL_CROSS_CONST clio::run::u32 kFreeBlocks = 11;
 GLOBAL_CROSS_CONST clio::run::u32 kWrite = 12;
 GLOBAL_CROSS_CONST clio::run::u32 kRead = 13;
 GLOBAL_CROSS_CONST clio::run::u32 kGetStats = 14;
+GLOBAL_CROSS_CONST clio::run::u32 kSync = 18;  // Same as bdev
 
-// safe_bdev-specific methods (erasure-coding management)
-GLOBAL_CROSS_CONST clio::run::u32 kAddBdev = 16;
-GLOBAL_CROSS_CONST clio::run::u32 kRemoveBdev = 17;
-GLOBAL_CROSS_CONST clio::run::u32 kRecoverBdev = 18;
-GLOBAL_CROSS_CONST clio::run::u32 kBuildParity = 19;
-GLOBAL_CROSS_CONST clio::run::u32 kFlushAllocLog = 20;
+// safe_bdev-specific methods (erasure-coding management, renumbered to start at 21)
+GLOBAL_CROSS_CONST clio::run::u32 kAddBdev = 21;
+GLOBAL_CROSS_CONST clio::run::u32 kRemoveBdev = 22;
+GLOBAL_CROSS_CONST clio::run::u32 kRecoverBdev = 23;
+GLOBAL_CROSS_CONST clio::run::u32 kBuildParity = 24;
+GLOBAL_CROSS_CONST clio::run::u32 kFlushAllocLog = 25;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 21;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 26;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -44,11 +46,12 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[12] = "Write";
     v[13] = "Read";
     v[14] = "GetStats";
-    v[16] = "AddBdev";
-    v[17] = "RemoveBdev";
-    v[18] = "RecoverBdev";
-    v[19] = "BuildParity";
-    v[20] = "FlushAllocLog";
+    v[18] = "Sync";
+    v[21] = "AddBdev";
+    v[22] = "RemoveBdev";
+    v[23] = "RecoverBdev";
+    v[24] = "BuildParity";
+    v[25] = "FlushAllocLog";
     return v;
   }();
   return names;

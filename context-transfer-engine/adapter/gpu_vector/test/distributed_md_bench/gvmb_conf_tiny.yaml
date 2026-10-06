@@ -1,0 +1,57 @@
+# NON-DEFAULT VARIANT: a tier far too small for the working set.
+#
+#   BUILD_DIR=build GVMB_CONF1=gvmb_conf_tiny.yaml ./run_md_bench_distributed.sh
+#
+# Kept because it reproduces something worth fixing: with the cluster tier
+# undersized, a node does not get a clean out-of-space error -- it reports
+# WRONG PHYSICS. Observed both as "an atom has more than --maxneigh 96
+# neighbours within cutoff+skin" and as a resort gate failing
+# -216747 -> -54864 (rel=7.5e-01). Whichever node's config loses the
+# pool-creation race is the one that suffers, so the starvation is
+# cluster-wide rather than per-node however this file is pointed.
+#
+# NOT DIAGNOSED. It may be the known target remaining_space_ mirror (a stale
+# copy read on a decision path gives spurious ENOSPC) or an unchecked put on
+# the paging path. It is not the shared cache: the same deck passes on both
+# nodes with the default config.
+#
+# Cluster config for the 2-node distributed md BENCHMARK harness.
+#
+# Same shape as distributed_md_paged/gvmd_conf.yaml, with its own port and
+# subnet so all the harnesses can be up at once without fighting.
+#
+# This is the config md_bench would otherwise write for itself. It only
+# reaches the bench because the bench now leaves an already-set
+# CLIO_SERVER_CONF alone -- that is the whole reason a distributed md_bench
+# run is possible.
+networking:
+  port: 9415
+  hostfile: "/workspace/context-transfer-engine/adapter/gpu_vector/test/distributed_md_bench/hostfile"
+
+runtime:
+  num_threads: 8
+  queue_depth: 8192
+  first_busy_wait: 2000000000
+
+gpu:
+  queue_depth: 8192
+
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::gvmb_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "64MB"
+
+  - mod_name: clio_cte_core
+    pool_name: cte_core
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::gvmb_ram"
+        bdev_type: "ram"
+        capacity_limit: "8MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"

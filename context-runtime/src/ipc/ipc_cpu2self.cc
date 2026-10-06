@@ -32,6 +32,7 @@
  */
 
 #include "clio_runtime/ipc/ipc_cpu2self.h"
+#include "clio_runtime/cycle_counter.h"
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/worker.h"
 #include "clio_runtime/singletons.h"
@@ -132,6 +133,10 @@ void IpcCpu2Self::SendOut(const clio::run::shared_ptr<Task> &task_ptr,
     // completion, so no cycle survives.
     Future<Task, CLIO_QUEUE_ALLOC_T> event_future = task_ptr->RunFuture();
     event_future.GetTaskPtr() = task_ptr;
+    // Latency report: when the event went in (see Worker::ProcessEventQueue).
+    if (RunContext *rc = task_ptr->RunCtxPtr()) {
+      rc->notify_ns_ = clio::run::CycleNow();
+    }
     parent_event_queue->Emplace(std::move(event_future));
     if (parent_task->Lane()) {
       // Always signal — see ipc_cpu2cpu_impl.h for the race.

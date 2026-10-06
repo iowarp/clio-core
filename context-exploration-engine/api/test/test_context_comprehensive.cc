@@ -213,7 +213,7 @@ compose:
       // creates the pool with DEFAULT params (next = the core), and a
       // second create by id just returns the existing pool — so whoever
       // creates first decides the chain. CAE's internal CTE writes
-      // (ParseOmni assimilation, labeling) must flow through the indexer
+      // (ParseOmni assimilation) must flow through the indexer
       // to be searchable. The compose config is what actually guarantees
       // that (it runs at server boot, before any client gets here).
       clio::cae::core::Client cae_client;

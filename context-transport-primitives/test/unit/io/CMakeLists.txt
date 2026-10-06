@@ -8,6 +8,7 @@ add_executable(test_async_io_exec
         ${TEST_MAIN}/main.cc
         test_init.cc
         test_async_io.cc
+        test_async_io_large.cc
         test_io_error.cc)
 
 #------------------------------------------------------------------------------

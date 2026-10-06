@@ -90,8 +90,25 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
 
     SystemInfo::DestroySharedMemory(url);
     if (!SystemInfo::CreateNewSharedMemory(fd_, url, backend_size)) {
-      char *err_buf = strerror(errno);
-      HLOG(kError, "shm_open failed: {}", err_buf);
+      // NOT strerror(errno): none of the three platform implementations is
+      // shm_open(), and the Win32 one does not set errno at all, so this used
+      // to report a commit-limit failure as "Resource temporarily
+      // unavailable". Ask the platform what actually went wrong.
+      //
+      // Read it into a local BEFORE logging, and not as an argument to HLOG.
+      // GetLastError() is thread-global, and HLOG's first use in a process
+      // constructs the Logger singleton, which looks up CTP_LOG_LEVEL and
+      // CTP_LOG_OUT -- leaving ERROR_ENVVAR_NOT_FOUND behind when they are
+      // unset, as they normally are. The order of the two is unspecified, and
+      // in practice the singleton wins, so the FIRST shm failure in a process
+      // was reported as "could not find the environment option that was
+      // entered (Win32 error 203)" -- a code nothing in the create path can
+      // produce -- while later ones reported the truth. That is exactly what
+      // the two failures in CDash build 4029381 look like: 203 from the first,
+      // the real ERROR_USER_MAPPED_FILE from the second.
+      std::string shm_err = SystemInfo::GetLastSharedMemoryError();
+      HLOG(kError, "could not create shared memory segment {} of {} bytes: {}",
+           url, backend_size, shm_err);
       return false;
     }
     url_ = url;
@@ -100,7 +117,9 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     header_ = reinterpret_cast<MemoryBackendHeader *>(
         SystemInfo::MapSharedMemory(fd_, hdr_size, 0));
     if (!header_) {
-      HLOG(kError, "Failed to map backend header");
+      std::string shm_err = SystemInfo::GetLastSharedMemoryError();
+      HLOG(kError, "could not map the header of shared memory segment {}: {}",
+           url, shm_err);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
@@ -110,7 +129,10 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     region_ = reinterpret_cast<char *>(
         SystemInfo::MapSharedMemory(fd_, data_size, hdr_size));
     if (!region_) {
-      HLOG(kError, "Failed to map data region");
+      std::string shm_err = SystemInfo::GetLastSharedMemoryError();
+      HLOG(kError,
+           "could not map {} bytes of shared memory segment {}: {}",
+           data_size, url, shm_err);
       SystemInfo::UnmapMemory(header_, hdr_size);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
@@ -138,8 +160,12 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
    */
   bool shm_attach(const std::string &url) {
     if (!SystemInfo::OpenSharedMemory(fd_, url)) {
-      const char *err_buf = strerror(errno);
-      HLOG(kError, "shm_open failed: {}", err_buf);
+      // Same as shm_init: none of the platform calls is shm_open() and the
+      // Win32 one does not set errno, so ask the platform -- into a local,
+      // before HLOG, whose first use can clobber the thread's last error.
+      std::string shm_err = SystemInfo::GetLastSharedMemoryError();
+      HLOG(kError, "could not attach shared memory segment {}: {}", url,
+           shm_err);
       return false;
     }
     url_ = url;
@@ -150,7 +176,9 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     header_ = reinterpret_cast<MemoryBackendHeader *>(
         SystemInfo::MapSharedMemory(fd_, hdr_size, 0));
     if (!header_) {
-      HLOG(kError, "Failed to map backend header");
+      std::string shm_err = SystemInfo::GetLastSharedMemoryError();
+      HLOG(kError, "could not map the header of shared memory segment {}: {}",
+           url, shm_err);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
@@ -159,8 +187,9 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     size_t backend_size = header_->backend_size_;
     if (backend_size < hdr_size) {
       HLOG(kError,
-           "Invalid backend_size in header: {} bytes (must be >= {} bytes)",
-           backend_size, hdr_size);
+           "Invalid backend_size in the header of shared memory segment {}: "
+           "{} bytes (must be >= {} bytes)",
+           url, backend_size, hdr_size);
       SystemInfo::UnmapMemory(header_, hdr_size);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
@@ -171,7 +200,11 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     region_ = reinterpret_cast<char *>(
         SystemInfo::MapSharedMemory(fd_, data_size, hdr_size));
     if (!region_) {
-      HLOG(kError, "Failed to map data region during attach");
+      std::string shm_err = SystemInfo::GetLastSharedMemoryError();
+      HLOG(kError,
+           "could not map {} bytes of shared memory segment {} during attach: "
+           "{}",
+           data_size, url, shm_err);
       SystemInfo::UnmapMemory(header_, hdr_size);
       SystemInfo::CloseSharedMemory(fd_);
       return false;

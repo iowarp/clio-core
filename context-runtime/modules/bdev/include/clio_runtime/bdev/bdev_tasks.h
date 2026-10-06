@@ -38,6 +38,7 @@
 #include <clio_runtime/config_manager.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <yaml-cpp/yaml.h>
+#include <clio_ctp/util/msan.h>
 
 #include <cctype>
 #include <string>
@@ -126,8 +127,11 @@ struct Block {
   clio::run::u32 block_type_;  // Block size category (BlockSizeCategory:
                                // 512B..1MB; see block_allocator.h)
 
-  CTP_GPU_FUN Block() : offset_(0), size_(0), block_type_(0) {}
-  CTP_GPU_FUN Block(clio::run::u64 offset, clio::run::u64 size, clio::run::u32 block_type)
+  // CROSS, not GPU: host code constructs Blocks too -- the deserializer
+  // placement-news them in priv::vector::resize, and a __device__-only ctor
+  // fails that host instantiation under clang-CUDA's strict checking.
+  CTP_CROSS_FUN Block() : offset_(0), size_(0), block_type_(0) {}
+  CTP_CROSS_FUN Block(clio::run::u64 offset, clio::run::u64 size, clio::run::u32 block_type)
       : offset_(offset), size_(size), block_type_(block_type) {}
 
   // Cereal serialization
@@ -239,12 +243,17 @@ struct CreateParams {
         total_size_(total_size),
         io_depth_(io_depth),
         alignment_(alignment) {
-    // Set conservative default performance characteristics
+    // Set conservative default performance characteristics, then let the
+    // device type refine them. This ctor is what RegisterTarget uses for every
+    // CTE storage target, so without the refinement a kHbm target and a kRam
+    // target report identical bandwidth to the DPE and the GPU tier is never
+    // selected.
     perf_metrics_.read_bandwidth_mbps_ = 100.0;
     perf_metrics_.write_bandwidth_mbps_ = 80.0;
     perf_metrics_.read_latency_us_ = 1000.0;
     perf_metrics_.write_latency_us_ = 1200.0;
     perf_metrics_.iops_ = 1000.0;
+    ApplyDefaultPerfForType();
 
     // Debug: Log what parameters were received
     HLOG(kDebug,
@@ -275,12 +284,13 @@ struct CreateParams {
            alignment_, perf_metrics_.read_bandwidth_mbps_,
            perf_metrics_.write_bandwidth_mbps_);
     } else {
-      // Use default performance characteristics
+      // Use default performance characteristics, refined by device type.
       perf_metrics_.read_bandwidth_mbps_ = 100.0;
       perf_metrics_.write_bandwidth_mbps_ = 80.0;
       perf_metrics_.read_latency_us_ = 1000.0;
       perf_metrics_.write_latency_us_ = 1200.0;
       perf_metrics_.iops_ = 1000.0;
+      ApplyDefaultPerfForType();
       HLOG(kDebug,
            "DEBUG: CreateParams constructor called with default performance: "
            "bdev_type={}, total_size={}, io_depth={}, alignment={}",
@@ -298,12 +308,52 @@ struct CreateParams {
   }
 
   /**
+   * Set perf_metrics_ to values representative of bdev_type_.
+   *
+   * These only need to be ORDERED correctly -- the DPE ranks targets by them,
+   * it does not model absolute throughput. Device HBM must outrank host RAM,
+   * host RAM must outrank pinned staging and disk.
+   */
+  void ApplyDefaultPerfForType() {
+    switch (bdev_type_) {
+      case BdevType::kHbm:  // on-device HBM: ~1-3 TB/s on current parts
+        perf_metrics_.read_bandwidth_mbps_ = 1500000.0;
+        perf_metrics_.write_bandwidth_mbps_ = 1500000.0;
+        perf_metrics_.read_latency_us_ = 1.0;
+        perf_metrics_.write_latency_us_ = 1.0;
+        perf_metrics_.iops_ = 10000000.0;
+        break;
+      case BdevType::kRam:  // host DRAM
+        perf_metrics_.read_bandwidth_mbps_ = 20000.0;
+        perf_metrics_.write_bandwidth_mbps_ = 20000.0;
+        perf_metrics_.read_latency_us_ = 5.0;
+        perf_metrics_.write_latency_us_ = 5.0;
+        perf_metrics_.iops_ = 1000000.0;
+        break;
+      case BdevType::kPinned:  // host DRAM reachable by DMA, but staged
+        perf_metrics_.read_bandwidth_mbps_ = 12000.0;
+        perf_metrics_.write_bandwidth_mbps_ = 12000.0;
+        perf_metrics_.read_latency_us_ = 10.0;
+        perf_metrics_.write_latency_us_ = 10.0;
+        perf_metrics_.iops_ = 500000.0;
+        break;
+      default:  // kFile / kS3 / kGcs / kNoop keep the conservative estimates
+        break;
+    }
+  }
+
+  /**
    * Load configuration from PoolConfig (for compose mode)
    * @param pool_config Pool configuration from compose section
    */
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
     // Parse YAML config string
     YAML::Node config = YAML::Load(pool_config.config_);
+    // yaml-cpp is a prebuilt .so: the scalars its scanner just
+    // produced carry no MSan shadow, so every key lookup and
+    // .as<>() below reads memory it has no record of. One walk
+    // here covers the whole tree.
+    ctp::MsanUnpoisonYaml(config);
 
     // Load bdev type (optional, defaults to kFile)
     if (config["bdev_type"]) {
@@ -323,6 +373,14 @@ struct CreateParams {
       } else if (type_str == "gcs") {
         bdev_type_ = BdevType::kGcs;
       }
+      // The type now implies its speed. Before this, EVERY bdev type kept the
+      // conservative file defaults (100/80 MB/s), so a kHbm tier and a kRam
+      // tier were indistinguishable to MaxBwDpe: they tied on write bandwidth
+      // and the tie fell to input order, which put RAM first. The effect was
+      // that a configured GPU tier never received a single blob -- the "GPU
+      // tier" measurements were host-tier measurements. An explicit
+      // perf_metrics block below still overrides these.
+      ApplyDefaultPerfForType();
     }
 
     // Load capacity/total_size (parse size strings like "2GB", "512MB")
@@ -475,7 +533,17 @@ struct AllocateBlocksTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<AllocateBlocksTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<AllocateBlocksTask>();
+    // Allocation is partitioned across the replicas: each contributes the
+    // blocks IT reserved, so the origin accumulates the union. Element-wise
+    // push_back keeps every Block in the ORIGIN's allocator — assigning the
+    // replica's vector would adopt a foreign segment's buffer.
+    for (size_t i = 0; i < replica->blocks_.size(); ++i) {
+      blocks_.push_back(replica->blocks_[i]);
+    }
   }
 };
 
@@ -545,7 +613,11 @@ struct FreeBlocksTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<FreeBlocksTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -608,7 +680,16 @@ struct WriteTask : public clio::run::Task {
   /** AggregateOut */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<WriteTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<WriteTask>();
+    // Each replica writes its own slice, so bytes are SUMMED; the first
+    // non-zero io_error_ wins so a later success cannot mask a failure.
+    bytes_written_ += replica->bytes_written_;
+    if (io_error_ == 0) {
+      io_error_ = replica->io_error_;
+    }
   }
 
   /**
@@ -688,7 +769,21 @@ struct ReadTask : public clio::run::Task {
   /** AggregateOut */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ReadTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ReadTask>();
+    // data_ is a ShmPtr into the ORIGIN's buffer and the payload already
+    // landed there via the bulk transfer — never take the replica's pointer,
+    // which addresses a foreign segment.
+    // length_ is INOUT: it goes out as the requested length and comes back as
+    // the length actually read, so it is adopted rather than reduced (reading
+    // one range from several replicas is not a meaningful collective).
+    length_ = replica->length_;
+    bytes_read_ += replica->bytes_read_;
+    if (io_error_ == 0) {
+      io_error_ = replica->io_error_;
+    }
   }
 
   /**
@@ -714,16 +809,22 @@ struct GetStatsTask : public clio::run::Task {
   // Task-specific data (no inputs)
   OUT PerfMetrics metrics_;            // Performance metrics
   OUT clio::run::u64 remaining_size_;  // Remaining allocatable space
+  /** The device's allocatable capacity (its configured size -- not the
+   *  physical disk under a file bdev). 0 = unknown. */
+  OUT clio::run::u64 total_size_;
   OUT clio::run::u32 predicted_ttl_days_; // Predicted device TTL in days (999999 = healthy)
 
   /** SHM default constructor */
-  GetStatsTask() : clio::run::Task(), remaining_size_(0), predicted_ttl_days_(999999) {}
+  GetStatsTask()
+      : clio::run::Task(), remaining_size_(0), total_size_(0),
+        predicted_ttl_days_(999999) {}
 
   /** Emplace constructor */
   explicit GetStatsTask(const clio::run::TaskId &task_node,
                         const clio::run::PoolId &pool_id,
                         const clio::run::PoolQuery &pool_query)
-      : clio::run::Task(task_node, pool_id, pool_query, 10), remaining_size_(0), predicted_ttl_days_(999999) {
+      : clio::run::Task(task_node, pool_id, pool_query, 10), remaining_size_(0),
+        total_size_(0), predicted_ttl_days_(999999) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -743,7 +844,7 @@ struct GetStatsTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(metrics_, remaining_size_, predicted_ttl_days_);
+    ar(metrics_, remaining_size_, total_size_, predicted_ttl_days_);
   }
 
   /**
@@ -756,13 +857,31 @@ struct GetStatsTask : public clio::run::Task {
     // Copy GetStatsTask-specific fields
     metrics_ = other->metrics_;
     remaining_size_ = other->remaining_size_;
+    total_size_ = other->total_size_;
     predicted_ttl_days_ = other->predicted_ttl_days_;
   }
 
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<GetStatsTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<GetStatsTask>();
+    // Stats are per-device and partitioned: a replica that does not host the
+    // bdev answers zeros. Capacity SUMS, the predicted lifetime keeps the
+    // WORST (smallest) figure — 999999 is the "healthy" sentinel the origin
+    // starts at — and the throughput model is taken from the first replica
+    // that actually measured one.
+    if (metrics_.read_bandwidth_mbps_ == 0.0 &&
+        metrics_.write_bandwidth_mbps_ == 0.0) {
+      metrics_ = replica->metrics_;
+    }
+    remaining_size_ += replica->remaining_size_;
+    total_size_ += replica->total_size_;
+    if (replica->predicted_ttl_days_ < predicted_ttl_days_) {
+      predicted_ttl_days_ = replica->predicted_ttl_days_;
+    }
   }
 };
 
@@ -809,7 +928,11 @@ struct SetLifespanTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<SetLifespanTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -854,7 +977,55 @@ struct FlushAllocLogTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<FlushAllocLogTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
+  }
+};
+
+/**
+ * SyncTask - Make every byte written to this bdev, and its allocator state,
+ * durable (fdatasync on a file bdev; a no-op for memory tiers). The fsync
+ * path of the CTE sends one per bdev that holds a synced file's blocks.
+ */
+struct SyncTask : public clio::run::Task {
+  /** SHM default constructor */
+  CTP_CROSS_FUN SyncTask() : clio::run::Task() {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit SyncTask(const clio::run::TaskId &task_node,
+                                  const clio::run::PoolId &pool_id,
+                                  const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kSync) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kSync;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /** Serialize IN and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+  }
+
+  /** Serialize OUT and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  /** Copy from another SyncTask */
+  void Copy(const ctp::ipc::FullPtr<SyncTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+  }
+
+  /** AggregateOut replica results into this task (no OUT fields). */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
   }
 };
 
@@ -919,7 +1090,11 @@ struct UpdateTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<UpdateTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 

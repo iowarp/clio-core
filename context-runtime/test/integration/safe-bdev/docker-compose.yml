@@ -1,12 +1,12 @@
 # Safe-BDev interactive integration test.
 # Single-node container running: clio runtime + safe-bdev + CTE + clio-fs (FUSE)
-# + context-visualizer dashboard (:5000).
+# + the runtime's built-in dashboard (:5000).
 #
 # Usage:  ./run_tests.sh            # interactive (dashboard stays up)
 #         MODE=smoke ./run_tests.sh # automated CI smoke check
 #
 # Requirements: Docker with --cap-add SYS_ADMIN + /dev/fuse; a build with
-# -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON; a container image carrying fuse3 + flask.
+# -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON; a container image carrying fuse3.
 
 services:
   safe-bdev-test:
@@ -21,7 +21,7 @@ services:
     container_name: safe-bdev-test
     hostname: iowarp-safebdev
     ports:
-      - "5000:5000"              # context-visualizer dashboard
+      - "5000:5000"              # built-in web dashboard
     volumes:
       - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     tmpfs:

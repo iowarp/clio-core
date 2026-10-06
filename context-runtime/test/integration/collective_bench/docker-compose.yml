@@ -1,0 +1,116 @@
+# 4-node cluster for the collective latency benchmark (Clio AllToOne vs MPI).
+#
+# Every node runs its own clio daemon; node 1 additionally sets up passwordless
+# SSH and launches `mpirun -np 4` across all four containers, so there is one
+# rank per physical node and each rank drives its own local daemon. Nodes 2-4
+# serve sshd so mpirun can start ranks there.
+#
+# Hostnames MUST be iowarp-node1..4 to match hostfile + mpi_hostfile.
+# The repo is mounted at /workspace and binaries come from the host build tree
+# at /workspace/build/bin, as in the other integration tests.
+# Usage: ./run_tests.sh  (keys the result on node 1, the mpirun launcher).
+
+x-worker-common: &worker-common
+  image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+  security_opt:
+    - seccomp:unconfined
+  # So a hung rank can be inspected with gdb from `docker exec`.
+  cap_add:
+    - SYS_PTRACE
+  volumes:
+    - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+  tmpfs:
+    - /mnt:mode=1777
+  mem_limit: 8g
+  working_dir: /workspace
+  entrypoint:
+    - /bin/bash
+    - /workspace/context-runtime/test/integration/collective_bench/worker_entrypoint.sh
+
+x-node-env: &node-env
+  CLIO_SERVER_CONF: /workspace/context-runtime/test/integration/collective_bench/clio_conf.yaml
+  CONTAINER_HOSTFILE: /workspace/context-runtime/test/integration/collective_bench/hostfile
+  CLIO_WITH_RUNTIME: "0"
+  PATH: /workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+  LD_LIBRARY_PATH: /workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+  OMPI_ALLOW_RUN_AS_ROOT: "1"
+  OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: "1"
+  # Set to 1 to make each daemon emit [COLLPROF] collective stage timings.
+  CLIO_COLL_PROF: "${CLIO_COLL_PROF:-}"
+  # Set to 1 for [NETQPROF] net-queue enqueue->pop wait timings.
+  CLIO_NET_QPROF: "${CLIO_NET_QPROF:-}"
+  # Set to 1 for [NETTRACE] serialize/transmit timings.
+  CLIO_NET_TRACE: "${CLIO_NET_TRACE:-}"
+  # Set to 1 for [WORKERRATE] worker-loop iteration cost.
+  CLIO_WORKER_RATE: "${CLIO_WORKER_RATE:-}"
+
+services:
+  # Node 1 — mpirun launcher; hosts rank 0
+  cb-node1:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - SYS_PTRACE
+    container_name: cb-node1
+    hostname: iowarp-node1
+    networks:
+      cb-cluster:
+        ipv4_address: 172.31.7.10
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    tmpfs:
+      - /mnt:mode=1777
+    mem_limit: 8g
+    working_dir: /workspace
+    environment:
+      <<: *node-env
+      NODE_ID: "1"
+      NUM_NODES: "${NUM_NODES:-4}"
+      COLL_BENCH_ITERS: "${COLL_BENCH_ITERS:-1000}"
+      COLL_BENCH_WARMUP: "${COLL_BENCH_WARMUP:-100}"
+      COLL_BENCH_VERIFY_ROUNDS: "${COLL_BENCH_VERIFY_ROUNDS:-4}"
+      COLL_BENCH_STAGGER_MS: "${COLL_BENCH_STAGGER_MS:-20}"
+    entrypoint:
+      - /bin/bash
+      - /workspace/context-runtime/test/integration/collective_bench/node1_entrypoint.sh
+
+  cb-node2:
+    <<: *worker-common
+    container_name: cb-node2
+    hostname: iowarp-node2
+    networks:
+      cb-cluster:
+        ipv4_address: 172.31.7.11
+    environment:
+      <<: *node-env
+      NODE_ID: "2"
+
+  cb-node3:
+    <<: *worker-common
+    container_name: cb-node3
+    hostname: iowarp-node3
+    networks:
+      cb-cluster:
+        ipv4_address: 172.31.7.12
+    environment:
+      <<: *node-env
+      NODE_ID: "3"
+
+  cb-node4:
+    <<: *worker-common
+    container_name: cb-node4
+    hostname: iowarp-node4
+    networks:
+      cb-cluster:
+        ipv4_address: 172.31.7.13
+    environment:
+      <<: *node-env
+      NODE_ID: "4"
+
+networks:
+  cb-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.7.0/24

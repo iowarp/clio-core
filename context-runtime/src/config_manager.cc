@@ -152,6 +152,12 @@ bool ConfigManager::ClientInit() {
             "Warning: Failed to load configuration from {}, using defaults",
             config_file_path_);
     }
+  } else {
+    // No config file: still per-user (see LoadDefault). The member default
+    // /tmp/clio is shared by every user of the host, so whoever created it
+    // first owned it and every other user's runtime could not write its pool
+    // log there -- durable pools silently failed to come back on a start.
+    conf_dir_ = ctp::SystemInfo::GetMemfdDir();
   }
   ApplyEnvOverrides();
 
@@ -181,6 +187,16 @@ void ConfigManager::ApplyEnvOverrides() {
     std::string addr_env(env);
     if (!addr_env.empty()) {
       server_addr_ = addr_env;
+    }
+  }
+
+  // Check CLIO_IPC_NAMESPACE env var (overrides YAML config, issue #877).
+  // Appended to all shared memory segment names to allow multiple independent
+  // runtimes to coexist with the same ${USER}.
+  if (const char *env = clio::run::env::GetCompat("IPC_NAMESPACE")) {
+    std::string ns_env(env);
+    if (!ns_env.empty()) {
+      ipc_namespace_ = ns_env;
     }
   }
 
@@ -231,6 +247,35 @@ void ConfigManager::ApplyEnvOverrides() {
     size_t parsed = 0;
     if (ParseSegmentSizeText(env, "CLIO_MAIN_SEGMENT_SIZE", parsed)) {
       main_segment_size_ = parsed;
+    }
+  }
+
+  // issue #990: web dashboard. CLIO_VIZ_ENABLE=1/0 counts as an explicit
+  // choice, so `clio_run runtime start` will not override it. CLIO_VIZ_PORT=0
+  // asks for an ephemeral port (VizServer::GetPort() reports what was bound),
+  // which is how tests avoid colliding with a real daemon.
+  if (const char *env = clio::run::env::GetCompat("VIZ_ENABLE")) {
+    viz_enabled_ = (env[0] == '1' || env[0] == 't' || env[0] == 'T' ||
+                    env[0] == 'y' || env[0] == 'Y');
+    viz_enabled_explicit_ = true;
+  }
+  if (const char *env = clio::run::env::GetCompat("VIZ_PORT")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env && n <= 65535) {
+      viz_port_ = static_cast<u32>(n);
+    }
+  }
+  if (const char *env = clio::run::env::GetCompat("VIZ_BIND")) {
+    if (env[0] != '\0') {
+      viz_bind_addr_ = env;
+    }
+  }
+  if (const char *env = clio::run::env::GetCompat("VIZ_MAX_THREADS")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env && n >= 1) {
+      viz_max_threads_ = static_cast<u32>(n);
     }
   }
 }
@@ -363,8 +408,14 @@ ConfigManager::GetSharedMemorySegmentName(MemorySegment segment,
   // segment (the fallback client attaching the main runtime's segments).
   u32 name_port = (port != 0) ? port : port_;
   // Use CTP's ExpandPath to resolve environment variables
-  return ctp::ConfigParse::ExpandPath(segment_name) + "_" +
-         std::to_string(name_port);
+  std::string result = ctp::ConfigParse::ExpandPath(segment_name) + "_" +
+                       std::to_string(name_port);
+  // Append optional IPC namespace suffix (issue #877) to allow multiple
+  // independent runtimes with the same ${USER}.
+  if (!ipc_namespace_.empty()) {
+    result += "_" + ipc_namespace_;
+  }
+  return result;
 }
 
 std::string ConfigManager::GetHostfilePath() const {
@@ -382,6 +433,12 @@ void ConfigManager::LoadDefault() {
   // Set default configuration values
   num_threads_ = 4;
   queue_depth_ = 1024;
+  // Per-user by default (/tmp/clio_$USER, the same directory as the memfd
+  // links): the learned task-stat models live under <conf_dir>/models, and a
+  // shared /tmp/clio on a multi-user node meant one user's runtimes could not
+  // write the models (an ERROR per container at every start) and would
+  // RESTORE another user's. runtime.conf_dir in the yaml overrides.
+  conf_dir_ = ctp::SystemInfo::GetMemfdDir();
 
   main_segment_size_ = 0;                         // 0 means auto-calculate
   client_data_segment_size_ = 512 * 1024 * 1024;  // 512MB
@@ -394,6 +451,7 @@ void ConfigManager::LoadDefault() {
   client_data_segment_name_ = "chi_client_data_segment_${USER}";
   metadata_segment_name_ = "chi_metadata_segment_${USER}";
   metadata_segment_size_ = 0;  // 0 means auto-calculate
+  ipc_namespace_.clear();      // no per-instance segment suffix
 
   // Set default hostfile path (empty means no networking/distributed mode)
   hostfile_path_ = "";
@@ -408,6 +466,16 @@ void ConfigManager::LoadDefault() {
 
   // Set default task load prediction model learning rate
   learning_rate_ = 0.2f;
+
+  // Web dashboard defaults (issue #990): off unless something asks for it, so
+  // an embedded runtime never opens a listening socket by surprise. Cleared on
+  // every (re)load; the YAML section, ApplyEnvOverrides and the daemon CLI all
+  // run afterwards and restate whatever was configured.
+  viz_enabled_ = false;
+  viz_enabled_explicit_ = false;
+  viz_port_ = 8080;
+  viz_bind_addr_ = "127.0.0.1";
+  viz_max_threads_ = 16;
 }
 
 void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
@@ -442,7 +510,8 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
           runtime["task_progress_interval_ms"].as<u32>();
     }
 
-    // Configuration directory for persistent runtime config
+    // Configuration directory for persistent runtime config; the default is
+    // the per-user directory set in LoadDefault (see there).
     if (runtime["conf_dir"]) {
       conf_dir_ = runtime["conf_dir"].as<std::string>();
     }
@@ -460,6 +529,12 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     // hosts can back. On Windows CI, CreateFileMapping cannot reserve it and
     // the runtime falls back to the no-cache path, silently disabling the
     // feature — with no way to ask for a smaller segment instead.
+    // Optional per-instance suffix for the shared-memory segment names
+    // (issue #877). Segment names already carry the user and the port; this
+    // separates two runtimes that must share both. CLIO_IPC_NAMESPACE wins.
+    if (runtime["ipc_namespace"]) {
+      ipc_namespace_ = runtime["ipc_namespace"].as<std::string>();
+    }
     if (runtime["metadata_segment_size"]) {
       size_t parsed = 0;
       if (ParseSegmentSizeNode(runtime["metadata_segment_size"],
@@ -555,6 +630,26 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     if (swim["suspicion_timeout_sec"]) {
       swim_suspicion_timeout_sec_ =
           swim["suspicion_timeout_sec"].as<float>();
+    }
+  }
+
+  // Parse the web-dashboard section (issue #990). All fields optional. Naming
+  // an `enabled` value here counts as an explicit choice, so the daemon CLI's
+  // default (SetVizEnabledDefault) will not override it.
+  if (yaml_conf["viz"]) {
+    auto viz = yaml_conf["viz"];
+    if (viz["enabled"]) {
+      viz_enabled_ = viz["enabled"].as<bool>();
+      viz_enabled_explicit_ = true;
+    }
+    if (viz["port"]) {
+      viz_port_ = viz["port"].as<u32>();
+    }
+    if (viz["bind"]) {
+      viz_bind_addr_ = viz["bind"].as<std::string>();
+    }
+    if (viz["max_threads"]) {
+      viz_max_threads_ = viz["max_threads"].as<u32>();
     }
   }
 

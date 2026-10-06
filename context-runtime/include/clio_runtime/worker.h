@@ -239,6 +239,14 @@ class Worker {
   EventQueue *ReplaceEventQueue();
 
   /**
+   * Destruct and free an event queue allocated from CTP_MALLOC.
+   * Only Finalize() calls it: a queue is owned by exactly one worker, and the
+   * owner at teardown is the one that frees it.
+   * @param queue the queue to release (nullptr is a no-op)
+   */
+  static void DeleteEventQueue(EventQueue *queue);
+
+  /**
    * issue #785: hand every queue this worker has ADOPTED to \a dst.
    *
    * Rescues cascade — a replacement adopts a donor's queue, then wedges and is
@@ -344,21 +352,49 @@ class Worker {
            elapsed;
   }
 
+  /**
+   * Microseconds as a reservation amount.
+   *
+   * The caller's value is a float off the task (sched_reserved_us_), so it is
+   * only as trustworthy as whatever last wrote that field; a float reaches
+   * 3.4e38 while long long stops at 9.2e18, and converting one that does not
+   * fit is itself undefined. Saturating keeps the conversion total. NaN
+   * answers false to every comparison and lands on 0.
+   */
+  static long long ReservationUs(double us) {
+    constexpr double kMax = 9.0e18;  // comfortably inside long long
+    if (!(us > 0.0)) {
+      return 0;
+    }
+    return (us >= kMax) ? static_cast<long long>(kMax)
+                        : static_cast<long long>(us);
+  }
+
   /** #781: reserve predicted cost on this worker when a task is mapped to it.
    *  Integer atomic (µs) — atomic<double> fetch_add is not portable (icx/MSVC). */
   void ReserveLoad(double us) {
-    if (us > 0.0) {
-      queued_load_us_.fetch_add(static_cast<long long>(us),
-                                std::memory_order_relaxed);
+    long long amt = ReservationUs(us);
+    if (amt > 0) {
+      queued_load_us_.fetch_add(amt, std::memory_order_relaxed);
     }
   }
   /** #781: release the reservation when the task starts executing (or is
    *  cancelled) — the executing cost is then tracked by load_ instead. */
   void ReleaseReservation(double us) {
-    if (us > 0.0) {
-      long long amt = static_cast<long long>(us);
-      long long prev = queued_load_us_.fetch_sub(amt, std::memory_order_relaxed);
-      if (prev - amt < 0) queued_load_us_.store(0, std::memory_order_relaxed);
+    long long amt = ReservationUs(us);
+    if (amt <= 0) {
+      return;
+    }
+    long long prev = queued_load_us_.fetch_sub(amt, std::memory_order_relaxed);
+    // `prev - amt` is the value just stored, but COMPUTING it is the signed
+    // overflow UBSan reported: a release with no matching reserve drives this
+    // counter negative, and once it is far enough below zero the subtraction
+    // wraps to a positive result -- so the clamp below stopped firing and the
+    // counter could never climb back, which is how it reached -9.18e18. The
+    // comparison asks the same question without the arithmetic, so the clamp
+    // fires on the very first negative result and the counter recovers.
+    if (prev < amt) {
+      queued_load_us_.store(0, std::memory_order_relaxed);
     }
   }
 
@@ -385,6 +421,34 @@ class Worker {
    * @return Reference to the current task handle (null if idle)
    */
   clio::run::shared_ptr<Task> &GetCurrentTask();
+
+  /**
+   * Pool (major id) of the task this worker is executing, readable from
+   * another thread; 0 when idle. For the stall report.
+   * @return the pool major id, or 0
+   */
+  u32 CurrentPoolMajor() const {
+    return cur_pool_major_.load(std::memory_order_relaxed);
+  }
+
+  /**
+   * Method of the task this worker is executing, readable from another
+   * thread; 0 when idle. For the stall report.
+   * @return the method id, or 0
+   */
+  u32 CurrentMethod() const {
+    return cur_method_.load(std::memory_order_relaxed);
+  }
+
+  /**
+   * How long the current task has been executing without yielding.
+   * @param now_us the current steady-clock time in microseconds
+   * @return elapsed milliseconds, or 0 when idle
+   */
+  double CurrentTaskAgeMs(double now_us) const {
+    long long start = last_exec_start_us_.load(std::memory_order_relaxed);
+    return start == 0 ? 0.0 : (now_us - static_cast<double>(start)) / 1000.0;
+  }
 
   /**
    * Get current lane from the current RunContext
@@ -686,6 +750,10 @@ class Worker {
   // Task currently executing on this worker thread (null when idle). The
   // RunContext lives inside this Task; it is never held as a bare pointer.
   clio::run::shared_ptr<Task> current_task_;
+  // Plain mirrors of current_task_'s pool and method for the monitor thread's
+  // stall report: a shared_ptr cannot be read from another thread, these can.
+  std::atomic<u32> cur_pool_major_{0};
+  std::atomic<u32> cur_method_{0};
 
   // Single lane assigned to this worker (one lane per worker).
   // issue #785: atomic because the monitor thread reassigns it during a stall

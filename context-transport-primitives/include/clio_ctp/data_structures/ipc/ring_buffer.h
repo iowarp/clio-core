@@ -48,7 +48,12 @@ using pid_t = int;
 #include "clio_ctp/types/atomic.h"
 #include "clio_ctp/types/bitfield.h"
 
-#if CTP_IS_HOST
+// !CTP_IS_DEVICE_PASS, not CTP_IS_HOST: CTP_IS_HOST is 1 during DPC++'s SYCL
+// device pass (it is only 0 for CUDA/ROCm device passes), so a CTP_IS_HOST
+// guard does NOT keep host code out of a SYCL kernel. std::this_thread::yield
+// compiled into a kernel emits sched_yield, which SPIR-V cannot resolve --
+// the JIT then fails the whole program with "Unresolved Symbol <sched_yield>".
+#if !CTP_IS_DEVICE_PASS
 #include <thread>  // std::this_thread::yield in the WAIT_FOR_SPACE back-pressure spin
 #endif
 
@@ -628,7 +633,7 @@ class ring_buffer : public ShmContainer<AllocT> {
     // queue.size()
     if constexpr (WaitForSpace) {
       size_t size = tail - head + 1;
-#if CTP_IS_HOST
+#if !CTP_IS_DEVICE_PASS
       unsigned spin_ct = 0;
 #endif
       while (size >= queue.size()) {
@@ -647,7 +652,9 @@ class ring_buffer : public ShmContainer<AllocT> {
           head = head_.load_device();
         }
         size = tail - head + 1;
-#if CTP_IS_HOST
+// !CTP_IS_DEVICE_PASS covers the SYCL device pass too; see the <thread>
+// include guard at the top of this file.
+#if !CTP_IS_DEVICE_PASS
         // The ring is FULL. On a CPU this loop must not hard-spin: this producer
         // may be a worker thread and the consumer that has to drain the ring may
         // be the only OTHER runnable thread on a 2-CPU box. A tight spin here

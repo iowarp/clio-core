@@ -67,6 +67,7 @@
 
 #include "clio_ctp/introspect/system_info.h"
 #include "clio_ctp/util/config_parse.h"
+#include "clio_ctp/util/msan.h"
 
 // Downstream POSIX tests that include this header (test_clio_run_cli,
 // test_cte_fallback, ...) call kill()/waitpid()/open() directly and have long
@@ -115,11 +116,18 @@ class RuntimeServer {
    *   performed") and the daemon stayed alive but unreachable. A serviceable
    *   daemon after a detached spawn proves the transport initializes regardless
    *   of console.
+   * @param recover  Recover the node's persistent state (a plain
+   *   `clio_run start`). Off by default: every test gets an empty node
+   *   (`start --fresh`), because all tests on a host share the conf dir
+   *   (/tmp/clio_$USER) and a recovering start would bring back the pools and
+   *   logs an earlier test left there. Only a test's own recovery phase (after
+   *   stopping a daemon it started) passes true.
    */
   bool Start(unsigned port = 10500,
              const std::string &bind_addr = "127.0.0.1",
              bool ephemeral = false,
-             bool detached = false) {
+             bool detached = false,
+             bool recover = false) {
     port_ = port;
     SetEnv("CLIO_PORT", std::to_string(port));
     SetEnv("CLIO_BIND_ADDR", bind_addr);
@@ -138,6 +146,7 @@ class RuntimeServer {
     // spawn console-less to reproduce issue #721.
     std::vector<std::string> args;
     args.push_back("start");
+    if (!recover) args.push_back("--fresh");
     if (ephemeral) args.push_back("--ephemeral");
     proc_ = ctp::SystemInfo::SpawnProcess(exe, args, log, detached);
     if (!proc_.valid) return false;
@@ -225,11 +234,56 @@ class RuntimeServer {
    */
   static bool ServerLogHasAdminPool(const std::string &log_path) {
     std::ifstream f(log_path, std::ios::binary);
+    CTP_MSAN_UNPOISON_OBJ(f);
     if (!f) return false;
     std::ostringstream ss;
+    CTP_MSAN_UNPOISON_OBJ(ss);
     ss << f.rdbuf();
-    return ss.str().find("Admin chimod pool created successfully") !=
+    // Every byte here was moved by uninstrumented libstdc++.so -- the stream
+    // objects' own state and the log text they copied -- so under MSan the
+    // find() below searches memory it considers uninitialized. This readiness
+    // check runs in a poll loop, which is why it dominated the report counts.
+    std::string contents = ss.str();
+    CTP_MSAN_UNPOISON_STRING(contents);
+    return contents.find("Admin chimod pool created successfully") !=
            std::string::npos;
+  }
+
+  /**
+   * Tail of the daemon's captured stdout/stderr, for failure messages.
+   *
+   * A daemon that dies of an abort — uncaught exception ("libc++abi:
+   * terminating with ..."), a libzmq assertion, malloc corruption — says WHY on
+   * stderr and nowhere else. That stderr is this log file, which lives in the
+   * runner's temp dir and dies with the runner: CI keeps only the ctest output,
+   * so a test that reports "exit code 134" and nothing else is unfixable from a
+   * CI log. Folding the tail into the failing assertion is what makes such a
+   * death diagnosable after the fact.
+   *
+   * The log is truncated on every Start(), so this is the current cycle's
+   * daemon only. Reads at most the last 64 KiB (the first line of that window
+   * may be partial).
+   * @param max_lines how many trailing lines to return
+   */
+  static std::string LogTail(size_t max_lines = 40) {
+    const std::string path = ServerLogPath();
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) return "(daemon log " + path + " not readable)";
+    const std::streamoff size = f.tellg();
+    constexpr std::streamoff kMaxBytes = 64 * 1024;
+    f.seekg(size > kMaxBytes ? size - kMaxBytes : 0);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(f, line)) lines.push_back(line);
+    if (lines.empty()) return "(daemon log " + path + " is empty)";
+    const size_t start =
+        lines.size() > max_lines ? lines.size() - max_lines : 0;
+    std::string out = "---- last " + std::to_string(lines.size() - start) +
+                      " line(s) of " + path + " ----\n";
+    for (size_t i = start; i < lines.size(); ++i) {
+      out += "    | " + lines[i] + "\n";
+    }
+    return out;
   }
 
   /** Stop the daemon (SIGTERM then SIGKILL on POSIX — so ServerFinalize's leak
@@ -329,7 +383,11 @@ class RuntimeServer {
     std::error_code ec;
     std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
     if (ec) dir = ".";
-    return (dir / "clio_run_test_server.log").string();
+    // Per user: on a shared machine another user's leftover log at a fixed
+    // name cannot be opened, and every daemon spawn then failed.
+    const char *user = std::getenv("USER");
+    const std::string who = (user && *user) ? std::string(user) : "user";
+    return (dir / ("clio_run_test_server_" + who + ".log")).string();
   }
 
   static void SetEnv(const char *key, const std::string &val) {

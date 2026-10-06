@@ -59,6 +59,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 #include <filesystem>
 #include <memory>
 #include <thread>
@@ -2593,9 +2595,29 @@ TEST_CASE("CTE SHM cache write-then-read",
     REQUIRE(fixture->WaitForTaskCompletion(size_task, 10000));
     REQUIRE(rec.total_size_ == size_task->size_);
 
-    // Payload reads must still be refused until the RAM bdev is SHM-backed
-    // (phase 6): this blob lives on a FILE target, so direct read is invalid.
-    REQUIRE_FALSE(rec.IsDirectReadable());
+    // ASSERT THE INVARIANT, NOT THE DEPLOYMENT. This used to require
+    // REQUIRE_FALSE(rec.IsDirectReadable()) on the grounds that "this blob
+    // lives on a FILE target" -- but which target it lands on is decided by
+    // whatever targets the ambient clio.yaml declares. On a config whose
+    // only CTE target is a SHM-backed RAM tier the blob is legitimately
+    // direct-readable, and the test failed for describing the operator's
+    // config rather than the code.
+    //
+    // What must hold in EVERY config is that the cache does not lie: if it
+    // advertises a direct read, that read has to succeed and return exactly
+    // the bytes the authoritative path would. If it does not advertise one,
+    // the direct read must refuse rather than invent data.
+    {
+      std::vector<char> direct(blob_size, 0);
+      const bool served = fixture->core_client_->TryReadBlobShm(
+          tag_id, blob_name, direct.data(), blob_size, 0);
+      if (rec.IsDirectReadable() && blob_size <= rec.CoveredBytes()) {
+        REQUIRE(served);
+        REQUIRE(std::memcmp(direct.data(), test_data.data(), blob_size) == 0);
+      } else {
+        REQUIRE_FALSE(served);
+      }
+    }
 
     CLIO_IPC->FreeBuffer(blob_data_fullptr);
   }
@@ -3235,10 +3257,15 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
        write_us, write_us_last, cycle_shm_meta_us, cycle_rpc_meta_us,
        cycle_shm_data_us, cycle_rpc_data_us, kIters, kSize, sink);
 
-  // Structural sanity: a write+read cycle includes a write, so it cannot take
-  // less than half the write-alone floor. This catches a broken/near-zero
-  // measurement, and holds regardless of runner load.
-  REQUIRE(cycle_shm_meta_us >= std::min(write_us, write_us_last) * 0.5);
+  // Structural sanity: a write+read cycle includes a write, so it cannot be
+  // dramatically cheaper than the write-alone floor. This catches a
+  // broken/near-zero measurement. The bound is deliberately loose (10x): the
+  // loops are separate wall-clock samples, and on a loaded CI runner a
+  // write-alone loop has sampled 2.5x slower than the cycle loop (leak-check:
+  // write-alone 109/89 us vs SHM metadata cycle 43.7 us), which a 0.5x bound
+  // turned into a spurious failure.
+  REQUIRE(cycle_shm_meta_us > 0.0);
+  REQUIRE(cycle_shm_meta_us >= std::min(write_us, write_us_last) * 0.1);
 
   // SHM is EXPECTED to beat RPC — that is the point of the cache — but this is
   // a wall-clock comparison of two timing samples, so on a loaded CI runner

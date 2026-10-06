@@ -418,9 +418,9 @@ TEST_CASE("CliDispatch - legacy nested forms", "[cli][dispatch]") {
   SECTION("runtime with unknown subcommand exits 1");
   REQUIRE(RunCli("runtime bogus") == 1);
 
-  SECTION("runtime start/restart --help exit 0");
+  SECTION("runtime start --help exits 0; the removed restart exits 1");
   REQUIRE(RunCli("runtime start --help") == 0);
-  REQUIRE(RunCli("runtime restart --help") == 0);
+  REQUIRE(RunCli("runtime restart --help") == 1);
 
   SECTION("repo with no subcommand exits 1");
   REQUIRE(RunCli("repo") == 1);
@@ -433,12 +433,17 @@ TEST_CASE("CliDispatch - legacy nested forms", "[cli][dispatch]") {
 }
 
 TEST_CASE("CliDispatch - command help and argument errors", "[cli][dispatch]") {
-  SECTION("start/restart help exits 0; unknown arg exits 1");
+  SECTION("start help exits 0; unknown arg exits 1; restart is removed");
   REQUIRE(RunCli("start --help") == 0);
   REQUIRE(RunCli("start -h") == 0);
   REQUIRE(RunCli("start --bogus") == 1);
-  REQUIRE(RunCli("restart --help") == 0);
-  REQUIRE(RunCli("restart --bogus") == 1);
+  REQUIRE(RunCli("restart") == 1);
+  REQUIRE(RunCli("restart --help") == 1);
+
+  SECTION("--disk needs a path (#551)");
+  REQUIRE(RunCli("start --disk") == 1);
+  REQUIRE(RunCli("restart --disk") == 1);
+  REQUIRE(RunCli("start --disk \"\"") == 1);
 
   SECTION("refresh dispatch: no args / bad repo exit 1");
   REQUIRE(RunCli("refresh") == 1);

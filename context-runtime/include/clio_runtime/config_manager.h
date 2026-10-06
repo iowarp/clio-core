@@ -260,6 +260,15 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetNeighborhoodSize() const;
 
   /**
+   * Get the optional IPC namespace suffix for shared memory segment names.
+   * When set (via YAML `runtime: ipc_namespace` or CLIO_IPC_NAMESPACE env var),
+   * this suffix is appended to all segment names to allow multiple independent
+   * runtimes to coexist with the same ${USER} (issue #877).
+   * @return IPC namespace suffix, or empty string if not configured
+   */
+  std::string GetIpcNamespace() const { return ipc_namespace_; }
+
+  /**
    * Get shared memory segment names. The name is suffixed with the runtime port
    * so that multiple runtimes sharing one node + ${USER} (the fallback-runtime
    * topology) each own a distinct segment instead of colliding. Pass an explicit
@@ -328,7 +337,7 @@ class ConfigManager : public ctp::BaseConfig {
    * each interval. This is the anti-hang mechanism that works even when a
    * task's ttl is infinite. 0 disables the periodic check.
    * Overridable via env CLIO_TASK_PROGRESS_INTERVAL_MS.
-   * @return Interval in ms (default: 0 = disabled)
+   * @return Interval in ms (default: 5000)
    */
   u32 GetTaskProgressIntervalMs() const { return task_progress_interval_ms_; }
 
@@ -389,6 +398,58 @@ class ConfigManager : public ctp::BaseConfig {
   float GetSwimSuspicionTimeoutSec() const {
     return swim_suspicion_timeout_sec_;
   }
+
+  // -- Web dashboard ("viz", issue #990) -------------------------------------
+  // The admin container starts one HTTP server per node when this is enabled.
+  // Default OFF so an embedded / in-process runtime (unit tests, adapters, a
+  // library user's CLIO_INIT) never opens a listening socket it did not ask
+  // for; `clio_run runtime start` turns it on for real daemons via
+  // SetVizEnabledDefault().
+
+  /** @return true if the node-local web dashboard should be served. */
+  bool GetVizEnabled() const { return viz_enabled_; }
+
+  /** @return TCP port for the dashboard (0 = bind an ephemeral port). */
+  u32 GetVizPort() const { return viz_port_; }
+
+  /** @return address the dashboard binds to (default 127.0.0.1: the dashboard
+   *  exposes runtime internals, so it is loopback-only unless asked
+   *  otherwise). */
+  std::string GetVizBindAddr() const { return viz_bind_addr_; }
+
+  /** @return size of the dashboard's HTTP thread pool. */
+  u32 GetVizMaxThreads() const { return viz_max_threads_; }
+
+  /** @return true if the YAML `viz: enabled:` key or CLIO_VIZ_ENABLE stated a
+   *  preference, so a caller supplying a default should stand down. */
+  bool IsVizEnabledExplicit() const { return viz_enabled_explicit_; }
+
+  /**
+   * Force the dashboard on or off, overriding YAML and environment. Used by
+   * `clio_run runtime start --viz / --no-viz`.
+   */
+  void SetVizEnabled(bool enabled) {
+    viz_enabled_ = enabled;
+    viz_enabled_explicit_ = true;
+  }
+
+  /**
+   * Raise the dashboard default without overriding an explicit choice: a no-op
+   * when the YAML `viz: enabled:` key or CLIO_VIZ_ENABLE already spoke. This is
+   * how the daemon CLI turns the dashboard on by default while still honouring
+   * a deployment that switched it off.
+   */
+  void SetVizEnabledDefault(bool enabled) {
+    if (!viz_enabled_explicit_) {
+      viz_enabled_ = enabled;
+    }
+  }
+
+  /** Override the dashboard port (CLI `--viz-port`). */
+  void SetVizPort(u32 port) { viz_port_ = port; }
+
+  /** Override the dashboard bind address (CLI `--viz-bind`). */
+  void SetVizBindAddr(const std::string &addr) { viz_bind_addr_ = addr; }
 
  private:
   /**
@@ -465,6 +526,12 @@ class ConfigManager : public ctp::BaseConfig {
   std::string queue_segment_name_ = "chi_queue_segment_${USER}";
   std::string metadata_segment_name_ = "chi_metadata_segment_${USER}";
 
+  // Optional IPC namespace suffix appended to all shared memory segment names
+  // (issue #877). Allows multiple independent runtimes to coexist using the
+  // same ${USER}, configured via `runtime: ipc_namespace` in YAML or
+  // CLIO_IPC_NAMESPACE environment variable. Empty string means no suffix.
+  std::string ipc_namespace_ = "";
+
   // Networking configuration
   std::string hostfile_path_ = "";
 
@@ -496,13 +563,37 @@ class ConfigManager : public ctp::BaseConfig {
   u32 gpu_queue_depth_ = 16;                 // Default: 16 tasks per queue
 
   // SWIM membership-detection configuration.
-  // Defaults match the prior hard-coded constants in admin_runtime.cc so
-  // existing deployments behave identically when these fields are absent
-  // from the YAML.
-  bool swim_enabled_ = true;
-  float swim_direct_probe_timeout_sec_ = 30.0f;
-  float swim_indirect_probe_timeout_sec_ = 15.0f;
-  float swim_suspicion_timeout_sec_ = 60.0f;
+  //
+  // DISABLED BY DEFAULT. SWIM decides a peer is dead from probe replies, and
+  // a wide collective -- a 256-node compose, a full-machine page flush --
+  // starves those replies for longer than the suspicion timeout while every
+  // node is healthy and busy. The detector then declares live nodes dead and
+  // recovery redistributes their containers, after which routing cannot find
+  // the containers and the job fails. Measured at 256 nodes: eight nodes,
+  // ids 0, 32, 64 ... 224, marked dead inside one run.
+  //
+  // Timeouts long enough to survive that are also long enough to be useless
+  // as a detector, so the honest default is off. A deployment that genuinely
+  // needs failure detection turns it on with `swim: enabled: true` and sizes
+  // the timeouts for its own collective width.
+  //
+  // The defaults below are sized for volatility, not detection speed: a node
+  // has to be unreachable for about an hour (5 min direct probe, 2.5 min
+  // indirect probe, 1 h suspicion) before recovery redistributes its
+  // containers. The old 30 s / 15 s / 60 s defaults fired inside healthy runs.
+  bool swim_enabled_ = false;
+  float swim_direct_probe_timeout_sec_ = 300.0f;
+  float swim_indirect_probe_timeout_sec_ = 150.0f;
+  float swim_suspicion_timeout_sec_ = 3600.0f;
+
+  // Web dashboard (issue #990). viz_enabled_explicit_ records whether the YAML
+  // or the environment stated a preference, so the daemon CLI can supply a
+  // default without silently overriding one.
+  bool viz_enabled_ = false;
+  bool viz_enabled_explicit_ = false;
+  u32 viz_port_ = 8080;
+  std::string viz_bind_addr_ = "127.0.0.1";
+  u32 viz_max_threads_ = 16;
 
   // Compose configuration
   ComposeConfig compose_config_;

@@ -35,6 +35,7 @@
  * CLIO Runtime manager implementation
  */
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +43,13 @@
 #include <iomanip>
 #include <iostream>
 #include <thread>
+
+#ifndef _WIN32
+#include <sys/resource.h>  // RaiseFdLimit
+#if defined(__linux__)
+#include <sys/prctl.h>  // MaybeAllowPtrace
+#endif
+#endif
 
 #include "clio_runtime/admin/admin_client.h"
 #include "clio_runtime/restart_log.h"
@@ -55,6 +63,21 @@ extern "C" void __gcov_dump(void);
 
 // Global pointer variable definition for CLIO Runtime manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::RuntimeManager, g_runtime_manager);
+
+/**
+ * Set by RuntimeManager::ServerFinalize, polled by the RequestStop watchdog.
+ *
+ * Deliberately NOT a RuntimeManager member. The watchdog thread is detached —
+ * it has to survive a teardown that wedges, which is the whole point of it —
+ * so it is typically parked between two 100 ms ticks when the normal exit path
+ * finishes, and the atexit handler below then deletes the manager out from
+ * under it. The next tick read a freed object: AddressSanitizer caught exactly
+ * that (heap-use-after-free in the watchdog lambda, freed by
+ * RuntimeManagerCleanupAtExit), and it failed every shutdown-battletest plus
+ * cfs_shm_read in the asan build. Static storage outlives every thread, so the
+ * flag is readable for as long as a detached watchdog can possibly look at it.
+ */
+static std::atomic<bool> g_finalize_complete{false};
 
 static void RuntimeManagerCleanupAtExit() {
   // exchange, not load-then-store: this runs from atexit while other threads
@@ -144,6 +167,10 @@ RuntimeManager::~RuntimeManager() {
   }
 }
 
+namespace {
+void MaybeAllowPtrace();  // defined with ServerInit below
+}  // namespace
+
 bool RuntimeManager::ClientInit() {
   HLOG(kInfo, "RuntimeManager::ClientInit");
   if (is_client_initialized_ || client_is_initializing_ ||
@@ -154,6 +181,9 @@ bool RuntimeManager::ClientInit() {
   // Set mode flags at the start
   is_client_mode_ = true;
   client_is_initializing_ = true;
+  // A wedged client (the FUSE daemon above all) needs inspecting as much as a
+  // wedged runtime; the allowance is opt-in by the same variable.
+  MaybeAllowPtrace();
 
   HLOG(kDebug, "IpcManager::ClientInit");
   // Initialize configuration manager
@@ -216,11 +246,87 @@ bool RuntimeManager::ClientInit() {
   return true;
 }
 
+namespace {
+/**
+ * Restart replay of this node's pool log -- the one restart registry: every
+ * durable pool (compose `restart: true`, or API-created by a client with
+ * SetPersistent) is re-created here, in creation order, taking the
+ * Restart() path. A fresh start forgets them instead: it begins a new
+ * cluster lifetime, and test pools must never come back.
+ * @param is_restart true for a recovering `clio_run start`, false for
+ *        `clio_run start --fresh`
+ */
+void ReplayPoolLog(bool is_restart) {
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  auto *admin = CLIO_ADMIN;
+  if (!is_restart) {
+    pool_manager->ClearPoolLog();
+    return;
+  }
+  const auto pools = pool_manager->LoadPoolLog();
+  if (pools.empty() || admin == nullptr) return;
+  pool_manager->SetReplayingPools(true);
+  size_t made = 0;
+  for (const auto &e : pools) {
+    if (!pool_manager->FindPoolByName(e.pool_name).IsNull()) {
+      ++made;  // already back (e.g. from the server config's compose)
+      continue;
+    }
+    auto fut = admin->AsyncRecreatePool(e);
+    fut.Wait();
+    if (fut->GetReturnCode() == 0) {
+      ++made;
+    } else {
+      HLOG(kError, "Restart: could not re-create pool '{}' ({}): rc={}",
+           e.pool_name, e.chimod_name, fut->GetReturnCode());
+    }
+  }
+  pool_manager->SetReplayingPools(false);
+  HLOG(kInfo, "Restart: {} of {} durable pool(s) back from {}", made,
+       pools.size(), pool_manager->PoolLogPath());
+}
+
+/**
+ * Raise this process's open-file soft limit to its hard limit. Every file
+ * bdev opens its backing file once per worker, so an array of several disks
+ * on 16 workers runs past the usual 1024 soft limit, and the next member's
+ * workers then fail to open it. Storage daemons raise the limit themselves.
+ */
+void RaiseFdLimit() {
+#ifndef _WIN32
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur >= rl.rlim_max) {
+    return;
+  }
+  const rlim_t old = rl.rlim_cur;
+  rl.rlim_cur = rl.rlim_max;
+  if (setrlimit(RLIMIT_NOFILE, &rl) == 0) {
+    HLOG(kDebug, "Raised open-file limit from {} to {}", old, rl.rlim_cur);
+  }
+#endif
+}
+/**
+ * CLIO_ALLOW_PTRACE=1: let any process of this user attach a debugger to the
+ * runtime (kernel.yama.ptrace_scope=1 otherwise allows only its parent), so
+ * a wedged daemon's state can be inspected in place (#1147).
+ */
+void MaybeAllowPtrace() {
+#if defined(__linux__) && defined(PR_SET_PTRACER)
+  const char *e = std::getenv("CLIO_ALLOW_PTRACE");
+  if (e != nullptr && e[0] == '1') {
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+  }
+#endif
+}
+}  // namespace
+
 bool RuntimeManager::ServerInit() {
   if (is_runtime_initialized_ || runtime_is_initializing_ ||
       client_is_initializing_) {
     return true;
   }
+  RaiseFdLimit();
+  MaybeAllowPtrace();
 
   // Set mode flags at the start
   is_runtime_mode_ = true;
@@ -275,6 +381,13 @@ bool RuntimeManager::ServerInit() {
     runtime_is_initializing_ = false;
     return false;
   }
+
+  // Whatever happens below (success, a failed compose, an ephemeral
+  // runtime), mark composition finished when ServerInit returns.
+  struct ComposeDoneGuard {
+    std::atomic<bool> &flag_;
+    ~ComposeDoneGuard() { flag_.store(true, std::memory_order_release); }
+  } compose_done_guard{compose_done_};
 
   // Process compose section if present — unless this runtime is ephemeral
   // (--ephemeral / CLIO_EPHEMERAL), in which case it starts bare and is
@@ -338,13 +451,17 @@ bool RuntimeManager::ServerInit() {
     }
   }
 
-  // Replay the restart write-ahead log: re-compose every "container" (compose
-  // file) that was registered for restart via `clio_run compose start`. This
-  // is the persistent-restart registry (~/.clio/restart_log.bin) and runs on
-  // every startup (both `start` and `restart`), independently of whether the
-  // server config had a compose section. On a recovery (`restart`) the pools
-  // take the Restart() path; on a fresh `start` they Init().
-  {
+  if (!config_manager->IsEphemeral()) {
+    ReplayPoolLog(is_restart_);
+  }
+
+  // LEGACY migration: compose files registered in the old restart log
+  // (~/.clio/restart_log.bin) by `clio_run compose start` before the pool
+  // log became the one restart registry. Nothing registers there any more
+  // (only entries whose file is gone are pruned):
+  // on a restart their pools are re-composed with restart semantics, which
+  // records them in this node's pool log like any durable compose pool.
+  if (is_restart_) {
     clio::run::RestartLog restart_log;
     std::vector<std::string> containers = restart_log.LiveSet();
     if (!containers.empty()) {
@@ -410,15 +527,10 @@ bool RuntimeManager::ServerInit() {
   // set up the gpu2cpu_queue + gpu2cpu_copy_backend at server-init
   // time.
 
-  // Start local server last - after all other initialization is complete
-  // This ensures clients can connect only when runtime is fully ready
-  if (!ipc_manager->StartLocalServer()) {
-    HLOG(kError,
-         "Failed to start local server - runtime initialization failed");
-    is_runtime_mode_ = false;
-    runtime_is_initializing_ = false;
-    return false;
-  }
+  // NOTE: the local server port is no longer claimed here. It is bound at the
+  // very top of IpcManager::ServerInit (issue #1015), because that bind is the
+  // atomic claim deciding which of several racing processes becomes this node's
+  // runtime -- a decision that cannot wait until initialization is complete.
 
   is_runtime_initialized_ = true;
   is_initialized_ = true;
@@ -431,6 +543,17 @@ bool RuntimeManager::ServerInit() {
 void RuntimeManager::ClientFinalize() {
   if (!is_initialized_ || !is_client_mode_) {
     return;
+  }
+
+  // An embedded process (client and runtime in one) shares the pool manager
+  // and the peer connection pool with its own server. Tearing them down under
+  // the running workers empties the admin pool while the network worker still
+  // routes to it: every send then fails RouteLocal (Dne), is re-queued, and
+  // fails again until the workers stop -- thousands of ERROR lines per clean
+  // exit -- and the peers lose their DEALER connections early. Stop the server
+  // first, in the order CLIO_RUNTIME_FINALIZE and ~RuntimeManager already use.
+  if (is_runtime_mode_) {
+    ServerFinalize();
   }
 
   // Leak shared-context ZMQ sockets on Windows during teardown (see
@@ -504,11 +627,23 @@ void RuntimeManager::ServerFinalize() {
   // StopWorkers / ClearClientPool below.
   ctp::lbm::sock::SetSocketLibShutdown();
 
+  // Stop the web dashboard first (issue #990). Its request handlers submit
+  // tasks and wait on Futures, so they must be drained before the workers stop:
+  // a handler that started after StopWorkers() would wait out its whole timeout
+  // for a task nothing will ever run. Stop() waits for in-flight requests.
+  if (auto *viz = CLIO_VIZ) {
+    viz->Stop();
+  }
+
   // Flush in-flight (non-periodic) tasks and the net queues while the workers
   // are still running, so client/runtime work completes on its normal path and
   // its task + Future allocations are reclaimed instead of being abandoned by
   // the abrupt StopWorkers() below. The budget is the stop grace period
   // (default 5000 ms; overridden by clio_run stop --grace-period).
+  // Modules flush volatile state to durable storage first (e.g. the CTE
+  // moves RAM-tier data to disk), while the workers can still run it.
+  RunStopHooks();
+
   DrainPendingTasks(stop_grace_period_ms_.load());
 
   // Stop workers and finalize server components
@@ -558,7 +693,7 @@ void RuntimeManager::ServerFinalize() {
 
   // Signal the RequestStop watchdog (if any) that teardown completed so it
   // stands down instead of force-exiting. Must be the last statement here.
-  finalize_complete_.store(true);
+  g_finalize_complete.store(true, std::memory_order_release);
 }
 
 namespace {
@@ -588,6 +723,34 @@ constexpr u64 kForceAckFlushMs = 500;
   std::_Exit(exit_code);
 }
 }  // namespace
+
+u64 RuntimeManager::AddStopHook(std::function<void()> hook) {
+  std::lock_guard<std::mutex> lk(stop_hooks_mu_);
+  const u64 id = next_stop_hook_++;
+  stop_hooks_[id] = std::move(hook);
+  return id;
+}
+
+void RuntimeManager::RemoveStopHook(u64 id) {
+  std::lock_guard<std::mutex> lk(stop_hooks_mu_);
+  stop_hooks_.erase(id);
+}
+
+void RuntimeManager::RunStopHooks() {
+  std::map<u64, std::function<void()>> hooks;
+  {
+    std::lock_guard<std::mutex> lk(stop_hooks_mu_);
+    hooks.swap(stop_hooks_);
+  }
+  for (auto &kv : hooks) {
+    try {
+      kv.second();
+    } catch (const std::exception &e) {
+      HLOG(kError, "ServerFinalize: stop hook {} threw: {}", kv.first,
+           e.what());
+    }
+  }
+}
 
 void RuntimeManager::RequestStop(StopMode mode, u32 grace_period_ms) {
   if (!is_runtime_mode_) {
@@ -622,11 +785,14 @@ void RuntimeManager::RequestStop(StopMode mode, u32 grace_period_ms) {
   // at escalation time — the logging system may be part of what wedged.
   const u64 deadline_ms =
       static_cast<u64>(grace_period_ms) + kShutdownTeardownMarginMs;
-  std::thread([this, deadline_ms]() {
+  // Captures nothing but the deadline: `this` must not outlive the exit path
+  // into a detached thread (see g_finalize_complete).
+  g_finalize_complete.store(false, std::memory_order_release);
+  std::thread([deadline_ms]() {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(deadline_ms);
     while (std::chrono::steady_clock::now() < deadline) {
-      if (finalize_complete_.load()) {
+      if (g_finalize_complete.load(std::memory_order_acquire)) {
         return;  // teardown finished; normal process exit proceeds
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(100));

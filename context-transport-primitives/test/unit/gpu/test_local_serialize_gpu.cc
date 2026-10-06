@@ -45,6 +45,7 @@
  * and LocalDeserialize on CPU for deserialization.
  */
 
+#include <type_traits>
 #include <catch2/catch_all.hpp>
 
 #include "clio_ctp/data_structures/priv/vector.h"
@@ -168,8 +169,8 @@ TEST_CASE("LocalSerialize GPU", "[gpu][serialize]") {
 
     int *host_ints;
     float *host_floats;
-    cudaMallocHost(&host_ints, kNumInts * sizeof(int));
-    cudaMallocHost(&host_floats, kNumFloats * sizeof(float));
+    host_ints = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(host_ints)>>(kNumInts * sizeof(int));
+    host_floats = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(host_floats)>>(kNumFloats * sizeof(float));
 
     // Initialize test values
     int expected_ints[kNumInts] = {10, 20, 30, 40, 50};
@@ -185,12 +186,11 @@ TEST_CASE("LocalSerialize GPU", "[gpu][serialize]") {
     // Step 5: Launch kernel to serialize data on GPU
     SerializeKernel<AllocT><<<1, 1>>>(alloc_ptr, vec_ptr, host_ints,
                                       host_floats, kNumInts, kNumFloats);
-    cudaError_t err = cudaDeviceSynchronize();
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Check for kernel launch errors
-    err = cudaGetLastError();
-    REQUIRE(err == cudaSuccess);
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Step 6: Verify the vector is not empty
     REQUIRE(!vec_ptr->empty());
@@ -223,8 +223,8 @@ TEST_CASE("LocalSerialize GPU", "[gpu][serialize]") {
     }
 
     // Cleanup
-    cudaFreeHost(host_ints);
-    cudaFreeHost(host_floats);
+    ctp::GpuApi::FreeHost(host_ints);
+    ctp::GpuApi::FreeHost(host_floats);
   }
 
   SECTION("LargeDataSerialization") {
@@ -251,8 +251,8 @@ TEST_CASE("LocalSerialize GPU", "[gpu][serialize]") {
 
     int *host_ints;
     float *host_floats;
-    cudaMallocHost(&host_ints, kNumInts * sizeof(int));
-    cudaMallocHost(&host_floats, kNumFloats * sizeof(float));
+    host_ints = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(host_ints)>>(kNumInts * sizeof(int));
+    host_floats = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(host_floats)>>(kNumFloats * sizeof(float));
 
     // Initialize with pattern
     for (size_t i = 0; i < kNumInts; ++i) {
@@ -265,11 +265,10 @@ TEST_CASE("LocalSerialize GPU", "[gpu][serialize]") {
     // Launch kernel
     SerializeKernel<AllocT><<<1, 1>>>(alloc_ptr, vec_ptr, host_ints,
                                       host_floats, kNumInts, kNumFloats);
-    cudaError_t err = cudaDeviceSynchronize();
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
-    err = cudaGetLastError();
-    REQUIRE(err == cudaSuccess);
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Verify serialized data
     REQUIRE(!vec_ptr->empty());
@@ -297,8 +296,8 @@ TEST_CASE("LocalSerialize GPU", "[gpu][serialize]") {
       REQUIRE(val == static_cast<float>(i) * 0.5f);
     }
 
-    cudaFreeHost(host_ints);
-    cudaFreeHost(host_floats);
+    ctp::GpuApi::FreeHost(host_ints);
+    ctp::GpuApi::FreeHost(host_floats);
   }
 
   SECTION("MixedTypeSerialization") {
@@ -328,8 +327,8 @@ TEST_CASE("LocalSerialize GPU", "[gpu][serialize]") {
 
     int *host_ints;
     float *host_floats;
-    cudaMallocHost(&host_ints, kNumInts * sizeof(int));
-    cudaMallocHost(&host_floats, kNumFloats * sizeof(float));
+    host_ints = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(host_ints)>>(kNumInts * sizeof(int));
+    host_floats = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(host_floats)>>(kNumFloats * sizeof(float));
 
     host_ints[0] = 12345;
     host_ints[1] = -9876;
@@ -338,8 +337,8 @@ TEST_CASE("LocalSerialize GPU", "[gpu][serialize]") {
 
     SerializeKernel<AllocT><<<1, 1>>>(alloc_ptr, vec_ptr, host_ints,
                                       host_floats, kNumInts, kNumFloats);
-    cudaError_t err = cudaDeviceSynchronize();
-    REQUIRE(err == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Deserialize
     ctp::ipc::LocalDeserialize<CharVector> deserializer(*vec_ptr);
@@ -362,7 +361,7 @@ TEST_CASE("LocalSerialize GPU", "[gpu][serialize]") {
     REQUIRE(fval1 == Catch::Approx(3.14159f));
     REQUIRE(fval2 == Catch::Approx(2.71828f));
 
-    cudaFreeHost(host_ints);
-    cudaFreeHost(host_floats);
+    ctp::GpuApi::FreeHost(host_ints);
+    ctp::GpuApi::FreeHost(host_floats);
   }
 }

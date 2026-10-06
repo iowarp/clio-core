@@ -33,8 +33,8 @@ class IocpAsyncIO : public AsyncIO {
   CTP_DLL bool Open(const std::string &path, int flags, mode_t mode) override;
   CTP_DLL ssize_t GetFileSize() const override;
   CTP_DLL bool Truncate(size_t size) override;
-  CTP_DLL IoToken Write(void *buffer, size_t size, off_t offset) override;
-  CTP_DLL IoToken Read(void *buffer, size_t size, off_t offset) override;
+  CTP_DLL IoToken Write(void *buffer, size_t size, int64_t offset) override;
+  CTP_DLL IoToken Read(void *buffer, size_t size, int64_t offset) override;
   CTP_DLL bool IsComplete(IoToken token, IoResult &result) override;
   CTP_DLL void Close() override;
   CTP_DLL int GetEventFd() const override;

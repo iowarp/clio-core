@@ -250,7 +250,7 @@ __global__ void StackBuddyAllocFreeKernel(
 
 TEST_CASE("PrivateBuddyAllocator shifted on GPU",
           "[gpu][allocator][shifted]") {
-  cudaDeviceSetLimit(cudaLimitStackSize, 16384);
+  ctp::GpuApi::SetDeviceStackLimit(16384);
 
   SECTION("Single block, __shared__ allocator, GpuMalloc backend") {
     constexpr size_t kBackendSize = 4 * 1024 * 1024;  // 4 MB
@@ -266,7 +266,7 @@ TEST_CASE("PrivateBuddyAllocator shifted on GPU",
     StackBuddyAllocSharedKernel<<<1, kBlockSize>>>(
         static_cast<MemoryBackend &>(backend), d_results, d_count);
 
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE((ctp::GpuApi::Synchronize(), true));
 
     int h_count = 0;
     ctp::GpuApi::Memcpy(&h_count, d_count, sizeof(int));
@@ -300,7 +300,7 @@ TEST_CASE("PrivateBuddyAllocator shifted on GPU",
     StackBuddyAllocSharedKernel<<<1, kBlockSize>>>(
         static_cast<MemoryBackend &>(backend), d_results, d_count);
 
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE((ctp::GpuApi::Synchronize(), true));
 
     int h_count = 0;
     ctp::GpuApi::Memcpy(&h_count, d_count, sizeof(int));
@@ -334,14 +334,14 @@ TEST_CASE("PrivateBuddyAllocator shifted on GPU",
     int total_threads = kNumBlocks * kBlockSize;
     int *d_results = ctp::GpuApi::Malloc<int>(total_threads * sizeof(int));
     int *d_counts = ctp::GpuApi::Malloc<int>(kNumBlocks * sizeof(int));
-    cudaMemset(d_results, 0, total_threads * sizeof(int));
-    cudaMemset(d_counts, 0, kNumBlocks * sizeof(int));
+    ctp::GpuApi::Memset(d_results, 0, total_threads * sizeof(int));
+    ctp::GpuApi::Memset(d_counts, 0, kNumBlocks * sizeof(int));
 
     StackBuddyAllocMultiBlockKernel<<<kNumBlocks, kBlockSize>>>(
         static_cast<MemoryBackend &>(backend), kPerBlockSize,
         d_results, d_counts);
 
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE((ctp::GpuApi::Synchronize(), true));
 
     std::vector<int> h_counts(kNumBlocks);
     ctp::GpuApi::Memcpy(h_counts.data(), d_counts,
@@ -377,7 +377,7 @@ TEST_CASE("PrivateBuddyAllocator shifted on GPU",
     StackBuddyAllocFreeKernel<<<1, kBlockSize>>>(
         static_cast<MemoryBackend &>(backend), d_results);
 
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE((ctp::GpuApi::Synchronize(), true));
 
     std::vector<int> h_results(kBlockSize, -99);
     ctp::GpuApi::Memcpy(h_results.data(), d_results,

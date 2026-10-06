@@ -34,6 +34,7 @@
 #ifndef CTP_SHM_INCLUDE_HSHM_SHM_UTIL_LOGGING_H_
 #define CTP_SHM_INCLUDE_HSHM_SHM_UTIL_LOGGING_H_
 
+#include <atomic>
 #include <climits>
 #include <fstream>
 #include <iomanip>
@@ -115,6 +116,37 @@ namespace ctp {
   } while (false)
 #else
 #define HLOG(LOG_CODE, ...) ((void)0)
+#endif
+
+/**
+ * Rate-limited logging macro using per-location atomic counter.
+ * Logs the message at most once per N invocations.
+ * Usage: HLOG_EVERY_N(kError, 100, "format string {}", arg)
+ *
+ * This is useful for avoiding log spam in hot paths where errors occur
+ * repeatedly (e.g., transient network issues). The counter is per-location
+ * (identified by __FILE__, __func__, __LINE__), and is never reset.
+ *
+ * @param LOG_CODE The log level (kDebug, kInfo, kWarning, kError, kFatal)
+ * @param N Log every Nth invocation
+ * @param ... Format string and arguments
+ */
+#if !CTP_IS_DEVICE_PASS
+#define HLOG_EVERY_N(LOG_CODE, N, ...)                                    \
+  do {                                                                    \
+    if constexpr (LOG_CODE >= CTP_LOG_LEVEL) {                           \
+      static std::atomic<size_t> ctp_rate_limit_counter{0};              \
+      size_t ctp_count =                                                  \
+          ctp_rate_limit_counter.fetch_add(1, std::memory_order_relaxed); \
+      size_t ctp_suppressed = ctp_count - (ctp_count / (N)) * (N);       \
+      if (ctp_suppressed == 0) {                                          \
+        CTP_LOG->Log<LOG_CODE>(__FILE__, __func__, __LINE__,             \
+                               __VA_ARGS__);                              \
+      }                                                                   \
+    }                                                                     \
+  } while (false)
+#else
+#define HLOG_EVERY_N(LOG_CODE, N, ...) ((void)0)
 #endif
 
 /**

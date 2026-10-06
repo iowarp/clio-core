@@ -101,8 +101,9 @@ class Scheduler {
    * @param cpu_us   measured CPU time (us)
    * @param wall_us  measured wall-clock time (us)
    */
-  virtual void RecordCompletion(u32 method, double cpu_us, double wall_us) {
-    (void)method; (void)cpu_us; (void)wall_us;
+  virtual void RecordCompletion(u32 pool_major, u32 method, double cpu_us,
+                                double wall_us) {
+    (void)pool_major; (void)method; (void)cpu_us; (void)wall_us;
   }
 
   /**

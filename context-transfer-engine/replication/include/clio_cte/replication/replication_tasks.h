@@ -5,7 +5,9 @@
 #ifndef CLIO_CTE_REPLICATION_REPLICATION_TASKS_H_
 #define CLIO_CTE_REPLICATION_REPLICATION_TASKS_H_
 
+#include <algorithm>
 #include <clio_runtime/clio_runtime.h>
+#include <clio_ctp/util/msan.h>
 #include <clio_runtime/task.h>
 #include <clio_runtime/admin/admin_tasks.h>
 #include <clio_cte/core/core_tasks.h>
@@ -34,11 +36,20 @@ struct ReplicationConfig {
   static constexpr const char* chimod_lib_name = "clio_cte_replication";
 
   clio::run::PoolId next_pool_id_;  ///< CTE core pool id (e.g. 512.0)
-  /// The FIXED SET of persistent replicas the interposed PutBlob maintains:
-  /// every default put through this pool writes through to replicas
-  /// 1..num_replicas_, each marked REPLICA_FIXED | REPLICA_PERSISTENT so
-  /// the organizer neither migrates nor volatilizes them.
-  int num_replicas_ = 1;
+  /// Total durable copies of every blob (YAML replication_factor). 1 (the
+  /// default): the blob's own copy only, made durable by fsync and the
+  /// periodic data flush -- the ext4 contract, and the single-copy disk
+  /// footprint. N > 1: plus N-1 copies on other nodes (remote_copies_),
+  /// written before a put returns, so a blob stays available while its
+  /// owner's node is down. Sets num_replicas_ = 0 and remote_copies_ =
+  /// N - 1 unless those are given explicitly.
+  int replication_factor_ = 1;
+  /// ADVANCED (YAML num_replicas): extra persistent copies on the owner's
+  /// own node, written through by every default put (REPLICA_FIXED |
+  /// REPLICA_PERSISTENT: the organizer neither migrates nor volatilizes
+  /// them). They protect against losing a device, not a node, and each
+  /// doubles the disk footprint, so the default is none.
+  int num_replicas_ = 0;
   /// Score for the primary (the DRAM cache copy) on a replica → primary
   /// re-cache. High by default so the DPE pins the fast copy to the fast
   /// tier.
@@ -55,30 +66,49 @@ struct ReplicationConfig {
   /// coalesce into one replica write). 0 = synchronous write-through (the
   /// put blocks until every replica is written).
   int replicate_period_ms_ = 50;
+  /** Copies of every blob kept on the next containers by hash (on other
+   *  nodes). With the core's failover_to_successor, a blob stays readable
+   *  and writable while its owner's node is down; the changes are handed
+   *  back when the owner returns. 0 = none. */
+  int remote_copies_ = 0;
+  /** Base path of the handoff log (one file per container, suffixed
+   *  ".<container>"): the changes this container made for a dead owner,
+   *  so a restart here still hands them back. Empty = in memory only. */
+  std::string handoff_log_path_;
 
   ReplicationConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
   ReplicationConfig(const clio::run::PoolId &pool_id,
                     const ReplicationConfig &other)
       : next_pool_id_(other.next_pool_id_),
+        replication_factor_(other.replication_factor_),
         num_replicas_(other.num_replicas_),
         cache_score_(other.cache_score_),
         replica_score_(other.replica_score_),
-        replicate_period_ms_(other.replicate_period_ms_) {
+        replicate_period_ms_(other.replicate_period_ms_),
+        remote_copies_(other.remote_copies_),
+        handoff_log_path_(other.handoff_log_path_) {
     (void)pool_id;
   }
 
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(next_pool_id_, num_replicas_, cache_score_, replica_score_,
-       replicate_period_ms_);
+    ar(next_pool_id_, replication_factor_, num_replicas_, cache_score_,
+       replica_score_, replicate_period_ms_, remote_copies_,
+       handoff_log_path_);
   }
 
   /** Load configuration from compose YAML (next_pool_id: "major.minor",
-   *  num_replicas: int, cache_score: float). */
+   *  replication_factor: int; advanced: num_replicas, remote_copies,
+   *  cache_score, replica_score, replicate_period_ms, handoff_log_path). */
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
     if (!pool_config.config_.empty()) {
       try {
         YAML::Node node = YAML::Load(pool_config.config_);
+        // yaml-cpp is a prebuilt .so: the scalars its scanner just
+        // produced carry no MSan shadow, so every key lookup and
+        // .as<>() below reads memory it has no record of. One walk
+        // here covers the whole tree.
+        ctp::MsanUnpoisonYaml(node);
         if (node["next_pool_id"]) {
           std::string next_str = node["next_pool_id"].as<std::string>();
           auto dot = next_str.find('.');
@@ -88,6 +118,12 @@ struct ReplicationConfig {
             next_pool_id_ = clio::run::PoolId(major, minor);
           }
         }
+        if (node["replication_factor"]) {
+          replication_factor_ = std::max(1, node["replication_factor"].as<int>());
+        }
+        // The factor sets the copies; explicit counts override it.
+        remote_copies_ = replication_factor_ - 1;
+        num_replicas_ = 0;
         if (node["num_replicas"]) {
           num_replicas_ = node["num_replicas"].as<int>();
         }
@@ -99,6 +135,12 @@ struct ReplicationConfig {
         }
         if (node["replicate_period_ms"]) {
           replicate_period_ms_ = node["replicate_period_ms"].as<int>();
+        }
+        if (node["remote_copies"]) {
+          remote_copies_ = node["remote_copies"].as<int>();
+        }
+        if (node["handoff_log_path"]) {
+          handoff_log_path_ = node["handoff_log_path"].as<std::string>();
         }
       } catch (...) {
         // Config parsing is best-effort
@@ -121,7 +163,11 @@ struct DestroyTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<DestroyTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 
   void Copy(const ctp::ipc::FullPtr<DestroyTask>& other) {
@@ -167,7 +213,12 @@ struct ReplicateSweepTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ReplicateSweepTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ReplicateSweepTask>();
+    // Each replica sweeps its own shard, so the collective count is the SUM.
+    blobs_swept_ += replica->blobs_swept_;
   }
 
   void Copy(const ctp::ipc::FullPtr<ReplicateSweepTask> &other) {
@@ -177,6 +228,53 @@ struct ReplicateSweepTask : public clio::run::Task {
 };
 
 using MonitorTask = clio::run::admin::MonitorTask;
+
+/** A restarted owner asks a successor to hand back what it changed. */
+struct HandoffPullTask : public clio::run::Task {
+  IN clio::run::u32 owner_;   ///< the returning owner container
+  OUT clio::run::u32 pushed_; ///< blobs handed back
+
+  HandoffPullTask() : clio::run::Task(), owner_(0), pushed_(0) {}
+  explicit HandoffPullTask(const clio::run::TaskId &task_id,
+                           const clio::run::PoolId &pool_id,
+                           const clio::run::PoolQuery &pool_query,
+                           clio::run::u32 owner)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kHandoffPull),
+        owner_(owner), pushed_(0) {}
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(owner_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(pushed_);
+  }
+  /** OUT fields only. */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &o) {
+    Task::AggregateOut(o);
+    pushed_ = o.template Cast<HandoffPullTask>()->pushed_;
+  }
+  void Copy(const ctp::ipc::FullPtr<HandoffPullTask> &o) {
+    Task::Copy(o.template Cast<clio::run::Task>());
+    owner_ = o->owner_; pushed_ = o->pushed_;
+  }
+};
+
+/** Periodic: hand changes back to owners that are alive again. */
+struct HandoffSweepTask : public clio::run::Task {
+  HandoffSweepTask() : clio::run::Task() {}
+  explicit HandoffSweepTask(const clio::run::TaskId &task_id,
+                            const clio::run::PoolId &pool_id,
+                            const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kHandoffSweep) {}
+  template <typename Ar> void SerializeIn(Ar &ar) { Task::SerializeIn(ar); }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+  /** No OUT fields beyond the base. */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &o) {
+    Task::AggregateOut(o);
+  }
+  void Copy(const ctp::ipc::FullPtr<HandoffSweepTask> &o) {
+    Task::Copy(o.template Cast<clio::run::Task>());
+  }
+};
 
 /**
  * ReplicateBlobTask — bring replica `replica_` of one blob up to date with
@@ -207,7 +305,13 @@ struct ReplicateBlobTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ReplicateBlobTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<ReplicateBlobTask>();
+    // Each replica copies its own share of the bytes, so the collective figure
+    // is the SUM.
+    bytes_copied_ += replica->bytes_copied_;
   }
 
   void Copy(const ctp::ipc::FullPtr<ReplicateBlobTask>& other) {
@@ -261,7 +365,13 @@ struct FlushTagTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<FlushTagTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<FlushTagTask>();
+    // Each replica flushes its own share of the tag, so both totals are SUMS.
+    blobs_replicated_ += replica->blobs_replicated_;
+    bytes_copied_ += replica->bytes_copied_;
   }
 
   void Copy(const ctp::ipc::FullPtr<FlushTagTask>& other) {

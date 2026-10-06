@@ -44,7 +44,6 @@
 #include <clio_runtime/manager.h>
 #include <clio_runtime/module_manager.h>
 #include <clio_runtime/pool_manager.h>
-#include <clio_runtime/restart_log.h>
 #include <clio_runtime/task_archives.h>
 #include <clio_runtime/worker.h>
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
@@ -72,6 +71,12 @@ namespace clio::run::admin {
 // Method implementations
 //===========================================================================
 
+// NOTE: no dashboard teardown here. Every viz handler is stateless (no
+// container capture -- see Container::RegisterViz), so an admin container can
+// be destroyed and re-created under a running server; requests in the gap get
+// error responses from a dead pool, not use-after-free. This destructor must
+// also stay trivial because ModuleManager destroys a throwaway prototype
+// instance right after load-time route registration.
 Runtime::~Runtime() {}
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
@@ -113,7 +118,22 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // Spawn periodic Send task — outbound side still runs on the worker
   // because the per-task send path is bounded by transport capacity, and
   // EnqueueNetTask is invoked from many worker threads anyway.
-  client_.AsyncSendPoll(clio::run::PoolQuery::Local(), 0, 500);
+  //
+  // The period is NOT just a delay: Worker::AddToBlockedQueue buckets periodic
+  // tasks BY period, and ContinueBlockedTasks services the buckets at very
+  // different rates -- <=50us every 4 loop iterations, <=200us every 8, <=50ms
+  // every 64. This poll drives every cross-node send, so the bucket it lands in
+  // is the cadence of the entire outbound network path. At the previous 500us
+  // it fell in the <=50ms bucket and was serviced every 64 iterations: tasks
+  // sat ~300us on the send queue, which made a plain cross-node round trip
+  // ~650us and a 4-node collective ~1ms. Keeping it in the <=50us bucket cuts
+  // that to ~45us and the round trip to ~310us. Any future value MUST stay
+  // <= 50us or the outbound path silently drops back to the slow bucket.
+  constexpr double kSendPollPeriodUs = 25.0;
+  static_assert(kSendPollPeriodUs <= 50.0,
+                "SendPoll must stay in the fastest periodic bucket (<=50us); "
+                "above it the cross-node send drain is serviced 16x less often");
+  client_.AsyncSendPoll(clio::run::PoolQuery::Local(), 0, kSendPollPeriodUs);
 
   // Spawn periodic ClientSend task for client response sending via lightbeam
   client_.AsyncClientSend(clio::run::PoolQuery::Local(), 100);
@@ -148,6 +168,17 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   prev_cpu_times_ = ctp::SystemInfo::GetCpuTimes();
   client_.AsyncSystemMonitor(clio::run::PoolQuery::Local(), 1000000);  // 1s
 
+  // Spawn the web dashboard (issue #990). One server per node -- the routes it
+  // serves are all node-local reads or explicitly-addressed Monitor queries, so
+  // there is no collective here and every node can serve the same UI. Our
+  // routes were already registered by PoolManager::RegisterContainer (which
+  // runs before this Create), and any ChiMod composed later adds its own as it
+  // comes up. Start() is a no-op unless the dashboard is enabled, and never
+  // fatal: a taken port disables the dashboard, it does not fail the runtime.
+  if (auto *viz = CLIO_VIZ) {
+    viz->Start();
+  }
+
   HLOG(kDebug,
        "Admin: Container created and initialized for pool: {} (ID: {}, count: "
        "{})",
@@ -170,11 +201,31 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       if (!existing_pool_id.IsNull()) {
         return clio::run::PoolQuery::Local();
       }
+      // A create that names a FIXED pool id is satisfied by that id existing
+      // here whatever the pool was called when it was composed: the CTE
+      // client asks for "clio_cte_core" at 512.0 while compose named the
+      // same pool "cte_core", so the name check missed and every client
+      // init broadcast a no-op create to every node -- N per node, N^2
+      // cluster-wide, on top of the real work (16 per rank at 16 nodes).
+      if (!typed->new_pool_id_.IsNull() &&
+          pool_manager->GetPoolInfo(typed->new_pool_id_) != nullptr) {
+        return clio::run::PoolQuery::Local();
+      }
       return clio::run::PoolQuery::Broadcast();
     }
     default:
       return task->pool_query_;
   }
+}
+
+bool Runtime::IsComposedPool(const clio::run::PoolId &pool_id) {
+  if (pool_id.IsNull()) return false;
+  auto *config = CLIO_CONFIG_MANAGER;
+  if (config == nullptr) return false;
+  for (const auto &pc : config->GetComposeConfig().pools_) {
+    if (pc.pool_id_ == pool_id) return true;
+  }
+  return false;
 }
 
 clio::run::TaskResume Runtime::GetOrCreatePool(
@@ -198,6 +249,22 @@ clio::run::TaskResume Runtime::GetOrCreatePool(
   // Initialize output values
   task->return_code_ = 0;
   task->error_message_ = "";
+
+  // A client's create-or-bind can arrive before the server's own compose has
+  // created the pools its config defines (the port accepts clients first).
+  // Creating it here with the client's default parameters would silently
+  // replace the configured ones -- e.g. a filesystem pool without its
+  // metadata log, or over the bare core instead of the replication chain.
+  // Wait (cooperatively) for compose to create such a pool, then bind to it.
+  if (!task->do_compose_ && IsComposedPool(task->new_pool_id_)) {
+    auto *rm = CLIO_RUNTIME_MANAGER;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (rm != nullptr && !rm->compose_done_.load(std::memory_order_acquire) &&
+           !pool_manager->HasPool(task->new_pool_id_) &&
+           std::chrono::steady_clock::now() - t0 < std::chrono::seconds(300)) {
+      CLIO_CO_AWAIT(clio::run::yield(2000));
+    }
+  }
 
   try {
     // Use the simplified PoolManager API that extracts all parameters from the
@@ -261,7 +328,9 @@ clio::run::TaskResume Runtime::DestroyPool(clio::run::shared_ptr<DestroyPoolTask
 
     // Use PoolManager to destroy the complete pool including metadata
     // DestroyPool is now a coroutine for consistency
-    CLIO_CO_AWAIT(pool_manager->DestroyPool(target_pool));
+    const bool keep_restartable =
+        (task->destruction_flags_ & kDestroyPoolKeepRestartable) != 0;
+    CLIO_CO_AWAIT(pool_manager->DestroyPool(target_pool, keep_restartable));
 
     // Set success results
     task->return_code_ = 0;
@@ -411,10 +480,41 @@ clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
     }
   }
 
-  // Per-tick maintenance: retries and dead-node fanout.
-  CLIO_IPC->GetRun2Run()->ProcessRetryQueues();
-  CLIO_IPC->GetRun2Run()->ScanSendMapTimeouts();
-  ScanTaskProgress();  // #628: cross-node task-progress validity check
+  // Per-phase timing of slow ticks (#1149: small responses sat unsent for
+  // 60+ s on one node while its handlers had long finished).
+  const auto tick_t0 = std::chrono::steady_clock::now();
+  auto tick_t_maint = tick_t0;
+  auto tick_t_lat = tick_t0;
+  size_t tick_lat_sent = 0;
+  size_t tick_io_sent = 0;
+
+  // Maintenance: retries, dead-node fanout, cross-node task-progress (#628).
+  //
+  // These are LIVENESS scans on millisecond-to-second timescales (retry
+  // backoffs, send-map timeouts, task TTLs) -- nothing about them needs to run
+  // at the drain's cadence. They used to run on EVERY tick, which was cheap
+  // when this periodic ticked every 500us and invisible because the drain was
+  // slow anyway. Once the period drops to make the drain responsive, their
+  // fixed per-tick cost becomes the tick rate's ceiling: the tick cannot repeat
+  // faster than the scans take, and a task's wait on the send queue is exactly
+  // one tick. Giving them their own millisecond cadence lets the drain below
+  // tick as fast as the worker loop allows, which is the whole point of the
+  // short period.
+  {
+    constexpr clio::run::u64 kMaintIntervalNs = 1000000;  // 1ms
+    static thread_local clio::run::u64 last_maint_ns = 0;
+    clio::run::u64 now_ns = static_cast<clio::run::u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    if (now_ns - last_maint_ns >= kMaintIntervalNs) {
+      last_maint_ns = now_ns;
+      CLIO_IPC->GetRun2Run()->ProcessRetryQueues();
+      CLIO_IPC->GetRun2Run()->ScanSendMapTimeouts();
+      ScanTaskProgress();  // #628: cross-node task-progress validity check
+    }
+  }
+  tick_t_maint = std::chrono::steady_clock::now();
 
   // Snapshot the depth of each priority at function entry so a hot
   // producer can't monopolise this tick.
@@ -448,8 +548,10 @@ clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
     if (!origin_task.IsNull()) {
       ipc_manager->GetRun2Run()->SendOut(origin_task);
       did_send = true;
+      ++tick_lat_sent;
     }
   }
+  tick_t_lat = std::chrono::steady_clock::now();
 
   // --- Phase 2: drain bulk I/O up to byte budget AND entry depth ------
   size_t io_budget = clio::run::kNetQueueIoByteBudget;
@@ -483,9 +585,23 @@ clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
         io_budget = (sz >= io_budget) ? 0 : (io_budget - sz);
         --io_out_remaining;
         did_any = true;
+        ++tick_io_sent;
       }
     }
     if (!did_any) break;
+  }
+  {
+    const auto tick_t_end = std::chrono::steady_clock::now();
+    auto ms = [](auto a, auto b) {
+      return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    if (ms(tick_t0, tick_t_end) >= kSlowSendTickMs) {
+      HLOG(kWarning, "[SLOW-SEND-TICK] {} ms: maintenance {} ms, latency "
+           "lane {} ms ({} sent of {} queued), bulk {} ms ({} sent of {} "
+           "queued)", ms(tick_t0, tick_t_end), ms(tick_t0, tick_t_maint),
+           ms(tick_t_maint, tick_t_lat), tick_lat_sent, n_out_lat,
+           ms(tick_t_lat, tick_t_end), tick_io_sent, n_in_io + n_out_io);
+    }
   }
 
   cur_task->SetDidWork(did_send);
@@ -754,69 +870,74 @@ void Runtime::MonitorContainerStats(clio::run::shared_ptr<MonitorTask> &task) {
   msgpack::sbuffer sbuf;
   msgpack::packer<msgpack::sbuffer> pk(sbuf);
 
-  auto pool_ids = pool_manager->GetAllPoolIds();
-  pk.pack_array(pool_ids.size());
-
-  for (const auto &pid : pool_ids) {
+  // One entry per REAL container hosted on this node (issue #994): the model
+  // is per container, so each entry reports exactly the weights that container
+  // schedules with. The static container owns no learned state and a pool with
+  // no container on this node contributes nothing.
+  struct Entry {
+    PoolId pool_id_;
+    std::string pool_name_;
+    std::string chimod_name_;
+    ContainerHold container_;
+  };
+  std::vector<Entry> entries;
+  for (const auto &pid : pool_manager->GetAllPoolIds()) {
     const auto *info = pool_manager->GetPoolInfo(pid);
     if (!info) continue;
+    std::string pool_name = info->pool_name_;
+    std::string chimod_name = info->chimod_name_;
+    for (const auto &dc : pool_manager->GetLocalContainers(pid)) {
+      ContainerHold container = dc.get();
+      if (!container) continue;
+      entries.push_back(Entry{pid, pool_name, chimod_name, container});
+    }
+  }
 
-    // The model lives on the static container, which owns it for the whole
-    // pool (issue #956) — so this reports exactly the weights every container
-    // of the pool schedules with.
-    auto container = pool_manager->GetStaticContainer(pid).get();
-    // …but report the id of a container that actually serves tasks; the static
-    // container's id is a reserved sentinel and would be meaningless here.
-    auto serving = pool_manager->GetRealOrStaticContainer(pid).get();
+  pk.pack_array(entries.size());
+  for (const auto &entry : entries) {
+    ContainerHold container = entry.container_;
 
     pk.pack_map(6);
 
     pk.pack("pool_id");
-    pk.pack(pid.ToString());
+    pk.pack(entry.pool_id_.ToString());
 
     pk.pack("pool_name");
-    pk.pack(info->pool_name_);
+    pk.pack(entry.pool_name_);
 
     pk.pack("chimod_name");
-    pk.pack(info->chimod_name_);
+    pk.pack(entry.chimod_name_);
 
     pk.pack("container_id");
-    pk.pack(serving ? serving->container_id_ : 0u);
+    pk.pack(container->container_id_);
 
     // Model data: array of per-method entries
-    if (container) {
-      const auto &model = container->GetMethodModel();
-      const auto &mape = container->GetMethodMapeVec();
-      const auto &model_wall = container->GetMethodModelWall();
-      const auto &mape_wall = container->GetMethodMapeWallVec();
-      const auto &names = container->GetMethodNames();
+    const auto &model = container->GetMethodModel();
+    const auto &mape = container->GetMethodMapeVec();
+    const auto &model_wall = container->GetMethodModelWall();
+    const auto &mape_wall = container->GetMethodMapeWallVec();
+    const auto &names = container->GetMethodNames();
 
-      pk.pack("methods");
-      pk.pack_array(model.size());
-      for (size_t i = 0; i < model.size(); ++i) {
-        pk.pack_map(6);
-        pk.pack("id");
-        pk.pack(static_cast<uint32_t>(i));
-        pk.pack("name");
-        pk.pack(i < names.size() ? names[i] : std::string());
-        pk.pack("coefficient");
-        pk.pack(model[i]);
-        pk.pack("mape");
-        pk.pack(i < mape.size() ? mape[i] : 0.0f);
-        pk.pack("wall_coefficient");
-        pk.pack(i < model_wall.size() ? model_wall[i] : 0.0f);
-        pk.pack("wall_mape");
-        pk.pack(i < mape_wall.size() ? mape_wall[i] : 0.0f);
-      }
-
-      pk.pack("learning_rate");
-      pk.pack(container->GetLearningRate());
-    } else {
-      pk.pack("methods");
-      pk.pack_array(0);
-      pk.pack("learning_rate");
-      pk.pack(0.0f);
+    pk.pack("methods");
+    pk.pack_array(model.size());
+    for (size_t i = 0; i < model.size(); ++i) {
+      pk.pack_map(6);
+      pk.pack("id");
+      pk.pack(static_cast<uint32_t>(i));
+      pk.pack("name");
+      pk.pack(i < names.size() ? names[i] : std::string());
+      pk.pack("coefficient");
+      pk.pack(model[i]);
+      pk.pack("mape");
+      pk.pack(i < mape.size() ? mape[i] : 0.0f);
+      pk.pack("wall_coefficient");
+      pk.pack(i < model_wall.size() ? model_wall[i] : 0.0f);
+      pk.pack("wall_mape");
+      pk.pack(i < mape_wall.size() ? mape_wall[i] : 0.0f);
     }
+
+    pk.pack("learning_rate");
+    pk.pack(container->GetLearningRate());
   }
 
   task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
@@ -1269,58 +1390,31 @@ clio::run::TaskResume Runtime::RestartContainers(
   task->error_message_ = "";
 
   try {
-    // The restart registry is the RestartLog write-ahead log
-    // (~/.clio/restart_log.bin), the same persistent registry that
-    // manager.cc replays at startup. Each live entry is the absolute path of
-    // a compose file registered via `clio_run compose start`. Re-compose each
-    // pool found there; pools already live (e.g. recovered at server-init
-    // time) come back as the existing pool with rc=0 and are still counted.
-    namespace fs = std::filesystem;
-    clio::run::RestartLog restart_log;
-    std::vector<std::string> containers = restart_log.LiveSet();
-    if (containers.empty()) {
-      HLOG(kDebug, "Admin: No restartable containers registered in {}",
-           restart_log.path());
-      task->SetReturnCode(0);
-      CLIO_CO_RETURN;
-    }
-
-    for (const auto &container_path : containers) {
-      std::error_code ec;
-      if (!fs::exists(container_path, ec) || ec) {
-        HLOG(kWarning, "Admin: registered container '{}' no longer exists, "
-             "skipping", container_path);
-        continue;
-      }
-
-      // Load pool config from the registered compose file
-      clio::run::ConfigManager file_config;
-      if (!file_config.LoadYaml(container_path)) {
-        HLOG(kError, "Admin: Failed to load restart config: {}",
-             container_path);
-        continue;
-      }
-
-      for (auto pool_config : file_config.GetComposeConfig().pools_) {
-        pool_config.restart_ = true;
-        HLOG(kInfo, "Admin: Restarting pool {} (module: {})",
-             pool_config.pool_name_, pool_config.mod_name_);
-
-        auto future = client_.AsyncCompose(pool_config);
-        CLIO_CO_AWAIT(future);
-
-        clio::run::u32 rc = future->GetReturnCode();
-        if (rc != 0) {
-          HLOG(kError, "Admin: Failed to restart pool {}: rc={}",
-               pool_config.pool_name_, rc);
-          continue;
-        }
-
+    // The restart registry is this node's pool log (PoolManager): every
+    // durable pool, compose `restart: true` or API-created with
+    // SetPersistent. Re-create the ones missing here; pools already live
+    // (e.g. recovered at server init) still count.
+    auto *pool_manager = CLIO_POOL_MANAGER;
+    const auto pools = pool_manager->LoadPoolLog();
+    pool_manager->SetReplayingPools(true);
+    for (const auto &e : pools) {
+      if (!pool_manager->FindPoolByName(e.pool_name).IsNull()) {
         task->containers_restarted_++;
-        HLOG(kInfo, "Admin: Successfully restarted pool {}",
-             pool_config.pool_name_);
+        continue;
       }
+      HLOG(kInfo, "Admin: Restarting pool {} (module: {})", e.pool_name,
+           e.chimod_name);
+      auto future = client_.AsyncRecreatePool(e);
+      CLIO_CO_AWAIT(future);
+      const clio::run::u32 rc = future->GetReturnCode();
+      if (rc != 0) {
+        HLOG(kError, "Admin: Failed to restart pool {}: rc={}", e.pool_name,
+             rc);
+        continue;
+      }
+      task->containers_restarted_++;
     }
+    pool_manager->SetReplayingPools(false);
 
     task->SetReturnCode(0);
     HLOG(kInfo, "Admin: RestartContainers completed, {} containers restarted",
@@ -1465,10 +1559,28 @@ clio::run::TaskResume Runtime::MigrateContainers(
     ar(migrations);
   }
 
+  bool any_failed = false;
   for (const auto &info : migrations) {
     // Look up source node
     clio::run::u32 src_node =
         pool_manager->GetContainerNodeId(info.pool_id_, info.container_id_);
+
+    // Only the node that hosts a container can migrate it. GetContainer below
+    // falls back to this node's own container of the pool, so without this
+    // check a request for a container hosted elsewhere migrated the wrong
+    // container and reported success (issue #1179).
+    if (!pool_manager->HasContainer(info.pool_id_, info.container_id_)) {
+      std::string err = "container " + std::to_string(info.container_id_) +
+                        " of pool " + info.pool_id_.ToString() +
+                        " is not hosted on node " +
+                        std::to_string(CLIO_IPC->GetNodeId()) +
+                        " (address table: node " + std::to_string(src_node) +
+                        "); run the migration on the node that hosts it";
+      HLOG(kError, "Admin: MigrateContainers: {}", err);
+      task->error_message_ = clio::run::priv::string(CTP_MALLOC, err);
+      any_failed = true;
+      continue;
+    }
 
     // Plug the container to stop new tasks and wait for work to complete
     pool_manager->PlugContainer(info.pool_id_, info.container_id_);
@@ -1506,7 +1618,7 @@ clio::run::TaskResume Runtime::MigrateContainers(
          info.pool_id_, info.container_id_, src_node, info.dest_);
   }
 
-  task->SetReturnCode(0);
+  task->SetReturnCode(any_failed ? 1 : 0);
   HLOG(kInfo, "Admin: MigrateContainers completed, {} migrated",
        task->num_migrated_);
   CLIO_CO_RETURN;
@@ -1539,62 +1651,232 @@ clio::run::TaskResume Runtime::QueryTaskProgress(
   CLIO_TASK_BODY_END
 }
 
+/**
+ * Record a liveness probe to node_id that returned an error, and mark the
+ * node dead after kProbeFailuresToDeclareDead consecutive ones.
+ *
+ * A probe fails when the target does not answer within the probe's own net
+ * timeout. One failure is inconclusive (the target may be busy); three in a
+ * row, an interval apart, means the node is not there. Marking it dead lets
+ * ScanSendMapTimeouts fail the tasks waiting on it instead of hanging.
+ * @param node_id the probed node
+ */
+void Runtime::NoteProbeFailure(clio::run::u64 node_id) {
+  auto *ipc_manager = CLIO_IPC;
+  const clio::run::u32 failures = ++probe_failures_[node_id];
+  if (failures < kProbeFailuresToDeclareDead) {
+    HLOG(kWarning,
+         "[TaskProgress] node {} did not answer a liveness probe ({}/{})",
+         node_id, failures, kProbeFailuresToDeclareDead);
+    return;
+  }
+  HLOG(kError,
+       "[TaskProgress] node {} failed {} consecutive liveness probes; marking "
+       "it dead so the tasks waiting on it can fail",
+       node_id, failures);
+  probe_failures_.erase(node_id);
+  ipc_manager->SetDead(node_id);
+}
+
 // Origin-side periodic task-progress validity check (issue #628). Fire-and-poll:
 // reap completed probes, then fire new ones for replicas outstanding beyond the
 // configured interval. Never awaits, so the net-processing tick that drives the
 // probes' own transmission is never blocked waiting on itself.
 void Runtime::ScanTaskProgress() {
+  const auto now = std::chrono::steady_clock::now();
+  // A probe's silence only means something if THIS node was listening. When
+  // our own scan ran late (this worker was stuck, or the whole node was
+  // starved), every pending probe looks silent at once and the old code
+  // declared every live peer dead in one sweep -- after which fail-fast turned
+  // each remote operation into EIO. Re-arm instead of judging.
+  const bool first = last_progress_scan_.time_since_epoch().count() == 0;
+  const double gap_s =
+      first ? 0.0
+            : std::chrono::duration<double>(now - last_progress_scan_).count();
+  last_progress_scan_ = now;
+  const bool judge = gap_s < ProbeSilenceSec() / 2.0;
+  if (!judge) {
+    HLOG(kWarning,
+         "[TaskProgress] this node's progress scan was delayed {} s; "
+         "re-arming {} probes instead of judging their targets",
+         static_cast<clio::run::u32>(gap_s), pending_progress_queries_.size());
+  }
+  ReapProgressProbes(now, judge);
+  const clio::run::u32 interval_ms =
+      CLIO_CONFIG_MANAGER->GetTaskProgressIntervalMs();
+  FireStuckProbes(interval_ms);
+  if (interval_ms != 0) FireIdleProbes();
+  CLIO_IPC->GetRun2Run()->ReportOldRecvTasks();
+}
+
+void Runtime::ReapProgressProbes(std::chrono::steady_clock::time_point now,
+                                 bool judge) {
   auto *ipc_manager = CLIO_IPC;
   auto *run2run = ipc_manager->GetRun2Run();
-
-  // 1. Reap completed probes.
-  for (auto it = pending_progress_queries_.begin();
-       it != pending_progress_queries_.end();) {
-    if (!it->future.IsComplete()) {
-      ++it;
-      continue;
-    }
-    // A failed probe (target died after we picked it) is inconclusive -- the
-    // dead-node timeout path handles that. Only a successful answer decides.
-    HLOG(kDebug, "[TaskProgress] reap probe net_key={} replica={} rc={} status={}",
-         it->net_key, it->replica_id, it->future->GetReturnCode(),
-         it->future->status_);
-    if (it->future->GetReturnCode() == 0) {
-      bool gone = (it->future->status_ == 0);
-      run2run->HandleTaskProgressResult(
-          static_cast<clio::run::u64>(it->net_key), it->replica_id, gone);
-    }
-    it = pending_progress_queries_.erase(it);
-  }
-
-  // 2. Fire new probes for replicas outstanding beyond the interval.
-  clio::run::u32 interval_ms = CLIO_CONFIG_MANAGER->GetTaskProgressIntervalMs();
-  auto stuck = run2run->CollectStuckReplicas(interval_ms);
-  for (const auto &sr : stuck) {
-    bool already = false;
-    for (const auto &pq : pending_progress_queries_) {
-      if (pq.net_key == static_cast<size_t>(sr.net_key) &&
-          pq.replica_id == sr.replica_id) {
-        already = true;
-        break;
+  size_t keep = 0;
+  for (size_t i = 0; i < pending_progress_queries_.size(); ++i) {
+    PendingProgressQuery &pq = pending_progress_queries_[i];
+    if (!pq.future.IsComplete()) {
+      const double silent_s =
+          std::chrono::duration<double>(now - pq.fired_at).count();
+      if (!judge) {
+        pq.fired_at = now;
+      } else if (!pq.silence_reported && silent_s >= ProbeSilenceSec()) {
+        // A node whose workers are saturated answers no probe for tens of
+        // seconds while plainly alive; anything received from it inside the
+        // window is proof of life, only total silence kills.
+        const clio::run::u64 heard_ns =
+            ipc_manager->NsSinceHeardFrom(pq.target_node_id);
+        if (heard_ns / 1e9 < ProbeSilenceSec()) {
+          pq.fired_at = now;
+        } else {
+          pq.silence_reported = true;
+          HLOG(kError,
+               "[TaskProgress] node {} has not answered a liveness probe for "
+               "{} s; marking it dead so the tasks waiting on it can fail",
+               pq.target_node_id, static_cast<clio::run::u32>(silent_s));
+          ipc_manager->SetDead(pq.target_node_id);
+        }
       }
-    }
-    if (already) {
+      if (keep != i) pending_progress_queries_[keep] = std::move(pq);
+      ++keep;
       continue;
     }
-    // Probe the replica's node. Bounded net_timeout so a target that dies
-    // mid-probe fails fast instead of leaking an in-flight entry.
-    clio::run::PoolQuery q =
-        clio::run::PoolQuery::Physical(static_cast<clio::run::u32>(sr.target_node_id));
+    // A failed probe is inconclusive -- only a successful answer decides.
+    if (pq.future->GetReturnCode() == 0) {
+      if (pq.net_key != kIdleProbeKey) {
+        bool gone = (pq.future->status_ == 0);
+        run2run->HandleTaskProgressResult(
+            static_cast<clio::run::u64>(pq.net_key), pq.replica_id, gone,
+            pq.gen);
+      }
+      probe_failures_.erase(pq.target_node_id);
+    } else {
+      NoteProbeFailure(pq.target_node_id);
+    }
+  }
+  pending_progress_queries_.resize(keep);
+}
+
+void Runtime::FireStuckProbes(clio::run::u32 interval_ms) {
+  auto *ipc_manager = CLIO_IPC;
+  auto *run2run = ipc_manager->GetRun2Run();
+  auto stuck = run2run->CollectStuckReplicas(interval_ms);
+  if (stuck.empty()) return;
+  // (net_key, replica) pairs already probed: a hash set, not a scan of every
+  // pending probe per candidate (O(stuck x pending) under load).
+  std::unordered_set<clio::run::u64> probed;
+  probed.reserve(pending_progress_queries_.size() * 2);
+  auto key_of = [](size_t net_key, clio::run::u32 rid) {
+    return static_cast<clio::run::u64>(net_key) * 1000003ULL + rid;
+  };
+  for (const auto &pq : pending_progress_queries_) {
+    probed.insert(key_of(pq.net_key, pq.replica_id));
+  }
+  // Bound the probes fired per scan: a burst of thousands of slow replicas
+  // must not turn liveness checking into the load that starves the node.
+  constexpr size_t kMaxNewProbesPerScan = 256;
+  size_t fired = 0;
+  for (const auto &sr : stuck) {
+    if (fired >= kMaxNewProbesPerScan) break;
+    if (!probed.insert(key_of(static_cast<size_t>(sr.net_key), sr.replica_id))
+             .second) {
+      continue;
+    }
+    // Bounded net_timeout so a target that dies mid-probe fails fast.
+    clio::run::PoolQuery q = clio::run::PoolQuery::Physical(
+        static_cast<clio::run::u32>(sr.target_node_id));
     q.SetNetTimeout(5.0f);
     auto task = ipc_manager->NewTask<QueryTaskProgressTask>(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, q, sr.net_key,
         sr.replica_id);
     auto fut = ipc_manager->Send(task);
-    HLOG(kDebug, "[TaskProgress] fire probe net_key={} replica={} -> node {}",
-         sr.net_key, sr.replica_id, sr.target_node_id);
     pending_progress_queries_.push_back(
-        {std::move(fut), static_cast<size_t>(sr.net_key), sr.replica_id});
+        {std::move(fut), static_cast<size_t>(sr.net_key), sr.replica_id,
+         sr.gen, sr.target_node_id, std::chrono::steady_clock::now(), false});
+    ++fired;
+  }
+}
+
+void Runtime::FireIdleProbes() {
+  // Idle liveness probes (see kIdleProbeSec): peers heard from before and
+  // silent since, with nothing in flight to them. One probe per peer at a
+  // time; an answer refreshes the heard-from stamp.
+  auto *ipc_manager = CLIO_IPC;
+  std::unordered_set<clio::run::u64> busy;
+  for (const auto &pq : pending_progress_queries_) {
+    busy.insert(pq.target_node_id);
+  }
+  const clio::run::u64 self = ipc_manager->GetNodeId();
+  for (clio::run::u64 node : ipc_manager->GetNodeIds()) {
+    if (node == self || busy.count(node) != 0) continue;
+    if (ipc_manager->GetNodeState(node) == clio::run::NodeState::kDead) continue;
+    const clio::run::u64 heard_ns = ipc_manager->NsSinceHeardFrom(node);
+    if (heard_ns == ~clio::run::u64(0) || heard_ns / 1e9 < kIdleProbeSec) {
+      continue;
+    }
+    clio::run::PoolQuery q =
+        clio::run::PoolQuery::Physical(static_cast<clio::run::u32>(node));
+    q.SetNetTimeout(5.0f);
+    auto task = ipc_manager->NewTask<QueryTaskProgressTask>(
+        clio::run::CreateTaskId(), clio::run::kAdminPoolId, q, kIdleProbeKey,
+        0u);
+    auto fut = ipc_manager->Send(task);
+    pending_progress_queries_.push_back(
+        {std::move(fut), kIdleProbeKey, 0u, 0ull, node,
+         std::chrono::steady_clock::now(), false});
+  }
+}
+
+void Runtime::StartIndirectProbes(clio::run::u64 target_node_id,
+                                  clio::run::u64 self_node_id,
+                                  const std::string &reason) {
+  auto *ipc_manager = CLIO_IPC;
+  // A node already known DEAD must STAY dead on probe failure (issue #856).
+  // We probe dead nodes so a rejoin can be observed, but a failed probe must
+  // not move it to kProbeFailed: that silently takes it out of kDead, so the
+  // dead-node completion sweep stops firing and tasks addressed to it hang
+  // forever again. Only a SUCCESSFUL probe may revive a dead node.
+  if (ipc_manager->GetNodeState(target_node_id) !=
+      clio::run::NodeState::kDead) {
+    ipc_manager->SetNodeState(target_node_id,
+                              clio::run::NodeState::kProbeFailed);
+  }
+  HLOG(kWarning, "SWIM: Direct probe to node {} {}, starting indirect probes",
+       target_node_id, reason);
+
+  // Select k random alive helpers (excluding self and target)
+  const auto &hosts = ipc_manager->GetAllHosts();
+  std::vector<clio::run::u64> candidates;
+  for (const auto &h : hosts) {
+    if (h.node_id != self_node_id && h.node_id != target_node_id &&
+        h.IsAlive()) {
+      candidates.push_back(h.node_id);
+    }
+  }
+  std::shuffle(candidates.begin(), candidates.end(), probe_rng_);
+  size_t num_helpers = std::min(kIndirectProbeHelpers, candidates.size());
+  if (num_helpers == 0) {
+    // No live peer can probe on our behalf, so "every indirect probe failed"
+    // holds vacuously: suspect it now. Waiting for indirect results that were
+    // never sent left the node in kProbeFailed forever -- never re-probed,
+    // never suspected, never declared dead or recovered (issue #1178).
+    if (ipc_manager->GetNodeState(target_node_id) !=
+        clio::run::NodeState::kDead) {
+      ipc_manager->SetNodeState(target_node_id,
+                                clio::run::NodeState::kSuspected);
+    }
+    HLOG(kWarning,
+         "SWIM: no live helper to probe node {} indirectly, marking suspected",
+         target_node_id);
+    return;
+  }
+  for (size_t i = 0; i < num_helpers; ++i) {
+    auto future = client_.AsyncProbeRequest(
+        clio::run::PoolQuery::Physical(candidates[i]), target_node_id);
+    pending_indirect_probes_.push_back({std::move(future), target_node_id,
+                                        candidates[i],
+                                        std::chrono::steady_clock::now()});
   }
 }
 
@@ -1634,7 +1916,20 @@ clio::run::TaskResume Runtime::HeartbeatProbe(clio::run::shared_ptr<HeartbeatPro
   for (auto it = pending_direct_probes_.begin();
        it != pending_direct_probes_.end();) {
     if (it->future.IsComplete()) {
-      // Direct probe succeeded - node is alive.
+      it->future.Wait();  // Finalize (already complete — IsComplete() above)
+      clio::run::u32 rc = it->future->GetReturnCode();
+      if (rc != 0) {
+        // Completed, but with an error -- e.g. the send to an unreachable
+        // node timed out (kRun2RunNetworkTimeoutRC). That is a failed probe,
+        // not an answer: treating any completion as alive marked unreachable
+        // nodes REJOINED (issue #1171).
+        StartIndirectProbes(it->target_node_id, self_node_id,
+                            "failed (rc=" + std::to_string(rc) + ")");
+        it = pending_direct_probes_.erase(it);
+        did_work = true;
+        continue;
+      }
+      // Direct probe answered - node is alive.
       // Use SetAlive, not SetNodeState (issue #856): SetNodeState only flips
       // the enum, leaving the node in dead_nodes_, which is what the
       // dead-node timeout scan consults — so a REVIVED node would keep having
@@ -1656,42 +1951,7 @@ clio::run::TaskResume Runtime::HeartbeatProbe(clio::run::shared_ptr<HeartbeatPro
     } else {
       float elapsed = std::chrono::duration<float>(now - it->sent_at).count();
       if (elapsed > kDirectProbeTimeoutSec_cfg) {
-        // Direct probe timed out - escalate to indirect probing.
-        // A node already known DEAD must STAY dead on probe failure (issue
-        // #856). We now probe dead nodes so a rejoin can be observed, but a
-        // failed probe must not move it to kProbeFailed: that silently takes
-        // it out of kDead, so the dead-node completion sweep stops firing and
-        // tasks addressed to it hang forever again. Only a SUCCESSFUL probe
-        // may revive a dead node.
-        if (ipc_manager->GetNodeState(it->target_node_id) !=
-            clio::run::NodeState::kDead) {
-          ipc_manager->SetNodeState(it->target_node_id,
-                                    clio::run::NodeState::kProbeFailed);
-        }
-        HLOG(
-            kWarning,
-            "SWIM: Direct probe to node {} timed out, starting indirect probes",
-            it->target_node_id);
-
-        // Select k random alive helpers (excluding self and target)
-        const auto &hosts = ipc_manager->GetAllHosts();
-        std::vector<clio::run::u64> candidates;
-        for (const auto &h : hosts) {
-          if (h.node_id != self_node_id && h.node_id != it->target_node_id &&
-              h.IsAlive()) {
-            candidates.push_back(h.node_id);
-          }
-        }
-        std::shuffle(candidates.begin(), candidates.end(), probe_rng_);
-        size_t num_helpers = std::min(kIndirectProbeHelpers, candidates.size());
-        for (size_t i = 0; i < num_helpers; ++i) {
-          auto future = client_.AsyncProbeRequest(
-              clio::run::PoolQuery::Physical(candidates[i]), it->target_node_id);
-          pending_indirect_probes_.push_back(
-              {std::move(future), it->target_node_id, candidates[i],
-               std::chrono::steady_clock::now()});
-        }
-
+        StartIndirectProbes(it->target_node_id, self_node_id, "timed out");
         it = pending_direct_probes_.erase(it);
         did_work = true;
       } else {
@@ -1942,11 +2202,16 @@ clio::run::TaskResume Runtime::ProbeRequest(clio::run::shared_ptr<ProbeRequestTa
     CLIO_CO_AWAIT(clio::run::yield(1000.0));
   }
 
+  // Alive only if the heartbeat completed SUCCESSFULLY. A heartbeat to an
+  // unreachable node also completes, with a network error rc, once its send
+  // times out; counting that as an answer reported dead nodes as alive and
+  // made the requester mark them REJOINED (issue #1171).
+  task->probe_result_ = -1;  // unreachable
   if (future.IsComplete()) {
-    future.Wait();            // Finalize (already complete)
-    task->probe_result_ = 0;  // alive
-  } else {
-    task->probe_result_ = -1;  // unreachable
+    future.Wait();  // Finalize (already complete)
+    if (future->GetReturnCode() == 0) {
+      task->probe_result_ = 0;  // alive
+    }
   }
 
   task->SetReturnCode(0);
@@ -2177,7 +2442,13 @@ clio::run::TaskResume Runtime::RecoverContainers(
     // drops the first mid-use (the free(): invalid pointer aborts that kill
     // the new leader during leader-election). Skip assignments that are
     // already satisfied locally.
-    if (pool_manager->GetContainer(ra.pool_id_, ra.container_id_)) {
+    //
+    // HasContainer (an exact lookup), not GetContainer: GetContainer falls
+    // back to the pool's local container when this container id is not
+    // registered, and every survivor has a local container of every pool, so
+    // the guard skipped every assignment and recovery never re-created
+    // anything (issue #1170).
+    if (pool_manager->HasContainer(ra.pool_id_, ra.container_id_)) {
       HLOG(kInfo,
            "Recovery: container {} for pool {} already present locally; "
            "skipping duplicate recovery",

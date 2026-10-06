@@ -42,6 +42,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <cstdio>
 #include <cstring>
 #include <atomic>
 #include <mutex>
@@ -108,11 +109,11 @@ class IoUringAsyncIO : public AsyncIO {
     return ftruncate(fd, static_cast<off_t>(size)) == 0;
   }
 
-  IoToken Write(void *buffer, size_t size, off_t offset) override {
+  IoToken Write(void *buffer, size_t size, int64_t offset) override {
     return SubmitIO(buffer, size, offset, true);
   }
 
-  IoToken Read(void *buffer, size_t size, off_t offset) override {
+  IoToken Read(void *buffer, size_t size, int64_t offset) override {
     return SubmitIO(buffer, size, offset, false);
   }
 
@@ -137,6 +138,34 @@ class IoUringAsyncIO : public AsyncIO {
       return true;
     }
 
+    // Diagnostic for a completion that never arrives (ctp_async_io, issue:
+    // "REQUIRE(attempts < 1000000)" at test_async_io.cc:135 -- the READ poll).
+    //
+    // That assertion fires only when a SUBMITTED read never reports back, and
+    // when it hit CI it failed all three `ctest --repeat until-pass:3`
+    // attempts, so it is not a one-in-a-run race -- it is a condition that
+    // arises on a runner and then persists. The bare timeout carried no
+    // evidence, so print the state that separates the candidates ONCE per
+    // 200k misses: a dropped CQE (cq overflow), an SQE that was prepared but
+    // never submitted (sq_ready > 0), or a completion delivered under a token
+    // nobody is waiting on (in_flight/completed sizes).
+    if ((++miss_polls_ % 200000) == 0) {
+      unsigned cq_ready = io_uring_cq_ready(&ring_);
+      unsigned sq_ready = io_uring_sq_ready(&ring_);
+      int overflow = -1;  // -1 = this liburing/kernel cannot report it
+#ifdef IORING_SQ_CQ_OVERFLOW
+      overflow = (*ring_.sq.kflags & IORING_SQ_CQ_OVERFLOW) ? 1 : 0;
+#endif
+      std::fprintf(stderr,
+                   "[AIO-STUCK] token=%llu misses=%llu in_flight=%zu "
+                   "completed=%zu cq_ready=%u sq_ready=%u cq_overflow=%d "
+                   "direct_fd=%d regular_fd=%d%c",
+                   (unsigned long long)token,
+                   (unsigned long long)miss_polls_, in_flight_.size(),
+                   completed_.size(), cq_ready, sq_ready, overflow,
+                   direct_fd_, regular_fd_, 10);
+      std::fflush(stderr);
+    }
     return false;
   }
 
@@ -167,13 +196,13 @@ class IoUringAsyncIO : public AsyncIO {
   }
 
  private:
-  IoToken SubmitIO(void *buffer, size_t size, off_t offset, bool is_write) {
+  IoToken SubmitIO(void *buffer, size_t size, int64_t offset, bool is_write) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
     if (!sqe) return kInvalidIoToken;
 
-    int fd = SelectFd(buffer, size);
+    int fd = SelectFd(buffer, size, offset);
     IoToken token = next_token_.fetch_add(1);
 
     if (is_write) {
@@ -191,10 +220,21 @@ class IoUringAsyncIO : public AsyncIO {
     return token;
   }
 
-  int SelectFd(void *buffer, size_t size) const {
+  /**
+   * Choose the O_DIRECT fd only when the buffer, the length AND the file
+   * offset are all 4 KiB-aligned; anything else uses the buffered fd. The
+   * offset check was missing: an aligned buffer written at an unaligned file
+   * offset (a truncate zeroing a page tail) went to O_DIRECT and failed with
+   * EINVAL.
+   * @param buffer I/O buffer
+   * @param size I/O length
+   * @param offset file offset
+   * @return fd to submit on
+   */
+  int SelectFd(void *buffer, size_t size, int64_t offset) const {
     if (direct_fd_ >= 0 &&
         (reinterpret_cast<uintptr_t>(buffer) % 4096 == 0) &&
-        (size % 4096 == 0)) {
+        (size % 4096 == 0) && (offset % 4096 == 0)) {
       return direct_fd_;
     }
     return regular_fd_;
@@ -236,6 +276,8 @@ class IoUringAsyncIO : public AsyncIO {
   std::mutex mutex_;
   std::unordered_set<IoToken> in_flight_;
   std::unordered_map<IoToken, IoResult> completed_;
+  // Misses seen by IsComplete; drives the [AIO-STUCK] diagnostic above.
+  unsigned long long miss_polls_ = 0;
 };
 
 }  // namespace ctp

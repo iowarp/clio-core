@@ -34,6 +34,7 @@
 #include <clio_cte/core/core_config.h>
 #include <clio_runtime/bdev/bdev_tasks.h>
 #include <yaml-cpp/yaml.h>
+#include <clio_ctp/util/msan.h>
 #include <fstream>
 #include <iostream>
 #include <cstdlib>
@@ -61,6 +62,8 @@ bool Config::LoadFromFile(const std::string &config_file_path) {
     
     // Load and parse YAML
     YAML::Node root = YAML::LoadFile(config_file_path);
+    // yaml-cpp is a prebuilt .so; its scalars carry no MSan shadow.
+    ctp::MsanUnpoisonYaml(root);
     
     // Parse configuration using base class method
     if (!ParseYamlNode(root)) {
@@ -95,6 +98,7 @@ bool Config::LoadFromString(const std::string &yaml_string) {
 
     // Load and parse YAML from string
     YAML::Node root = YAML::Load(yaml_string);
+    ctp::MsanUnpoisonYaml(root);  // see LoadFromFile
 
     // Parse configuration using base class method
     if (!ParseYamlNode(root)) {
@@ -291,7 +295,10 @@ bool Config::ParseYamlNode(const YAML::Node &node) {
   // Parse data organizer configuration (top-level keys, issue #738)
   if (node["organizer"]) {
     std::string organizer = node["organizer"].as<std::string>();
-    if (organizer != "none" && organizer != "frecency") {
+    if (organizer != "none" && organizer != "frecency" &&
+        organizer != "grayscott" &&
+        organizer != "cyclic" &&
+        organizer != "scatter" && organizer != "hotset") {
       HLOG(kError,
            "Config error: Invalid organizer '{}' (must be 'none' or "
            "'frecency')",
@@ -309,24 +316,6 @@ bool Config::ParseYamlNode(const YAML::Node &node) {
   }
   if (node["organizer_period_ms"]) {
     organizer_.period_ms_ = node["organizer_period_ms"].as<clio::run::u32>();
-  }
-
-  // Parse GPU metadata cache configuration (optional)
-  if (node["gpu_metadata_cache"]) {
-    const YAML::Node &gmc = node["gpu_metadata_cache"];
-    if (gmc["enabled"]) {
-      gpu_metadata_cache_.enabled_ = gmc["enabled"].as<bool>();
-    }
-    if (gmc["capacity"]) {
-      std::string cap_str = gmc["capacity"].as<std::string>();
-      ParseSizeString(cap_str, gpu_metadata_cache_.capacity_bytes_);
-    }
-    if (gmc["max_blobs"]) {
-      gpu_metadata_cache_.max_blobs_ = gmc["max_blobs"].as<clio::run::u32>();
-    }
-    if (gmc["max_tags"]) {
-      gpu_metadata_cache_.max_tags_ = gmc["max_tags"].as<clio::run::u32>();
-    }
   }
 
   // Parse environment variable configuration
@@ -357,6 +346,8 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
           << YAML::Value << FormatSizeBytes(performance_.transaction_log_capacity_bytes_);
   emitter << YAML::Key << "flush_data_period_ms" << YAML::Value << performance_.flush_data_period_ms_;
   emitter << YAML::Key << "flush_data_min_persistence" << YAML::Value << performance_.flush_data_min_persistence_;
+  emitter << YAML::Key << "fsync_mode" << YAML::Value
+          << (performance_.fsync_deferred_ ? "deferred" : "durable");
   emitter << YAML::EndMap;
 
   // Emit target configuration
@@ -364,6 +355,8 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
   emitter << YAML::Key << "neighborhood" << YAML::Value << targets_.neighborhood_;
   emitter << YAML::Key << "default_target_timeout_ms" << YAML::Value << targets_.default_target_timeout_ms_;
   emitter << YAML::Key << "poll_period_ms" << YAML::Value << targets_.poll_period_ms_;
+  emitter << YAML::Key << "failover_to_successor" << YAML::Value
+          << targets_.failover_to_successor_;
   emitter << YAML::EndMap;
   
   // Emit storage configuration
@@ -450,6 +443,16 @@ bool Config::ParsePerformanceConfig(const YAML::Node &node) {
     ParseSizeString(cap_str, performance_.transaction_log_capacity_bytes_);
   }
 
+  if (node["fsync_mode"]) {
+    const std::string mode = node["fsync_mode"].as<std::string>();
+    if (mode != "durable" && mode != "deferred") {
+      HLOG(kError, "Config error: fsync_mode must be \"durable\" or "
+           "\"deferred\", got \"{}\"", mode);
+      return false;
+    }
+    performance_.fsync_deferred_ = (mode == "deferred");
+  }
+
   return true;
 }
 
@@ -464,6 +467,9 @@ bool Config::ParseTargetConfig(const YAML::Node &node) {
 
   if (node["poll_period_ms"]) {
     targets_.poll_period_ms_ = node["poll_period_ms"].as<clio::run::u32>();
+  }
+  if (node["failover_to_successor"]) {
+    targets_.failover_to_successor_ = node["failover_to_successor"].as<bool>();
   }
 
   return true;
@@ -526,14 +532,22 @@ bool Config::ParseStorageConfig(const YAML::Node &node) {
       device_config.bdev_type_ = device_node["bdev_type"].as<std::string>();
 
       // Validate bdev_type
+      // 's3' and 'gcs' name cloud object-store tiers. Their device paths are
+      // URLs (s3://bucket/prefix), not filesystem paths, so they deliberately
+      // skip the directory creation below -- see the 'ram' branch's sibling
+      // check. A bare bucket with no prefix is a configuration error: CTE
+      // registers targets as <path>_node<N>, which would corrupt the bucket
+      // name itself rather than the key prefix.
       if (device_config.bdev_type_ != "file" &&
           device_config.bdev_type_ != "ram" &&
           device_config.bdev_type_ != "hbm" &&
           device_config.bdev_type_ != "pinned" &&
-          device_config.bdev_type_ != "noop") {
+          device_config.bdev_type_ != "noop" &&
+          device_config.bdev_type_ != "s3" &&
+          device_config.bdev_type_ != "gcs") {
         HLOG(kError,
              "Config error: Invalid bdev_type '{}' (must be 'file', 'ram', "
-             "'hbm', 'pinned', or 'noop')",
+             "'hbm', 'pinned', 'noop', 's3', or 'gcs')",
              device_config.bdev_type_);
         return false;
       }

@@ -18,6 +18,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <winioctl.h>
 #ifdef Yield
 #undef Yield
 #endif
@@ -106,19 +107,34 @@ struct IocpAsyncIO::Impl {
     }
   }
 
-  HANDLE SelectHandle(void *buffer, size_t size) const {
+  /**
+   * Pick the handle for one I/O. FILE_FLAG_NO_BUFFERING requires the buffer
+   * address, the transfer size AND the file offset to be sector-aligned;
+   * any one of them unaligned makes ReadFile/WriteFile fail with
+   * ERROR_INVALID_PARAMETER (87), so all three are checked.
+   * @param buffer user buffer
+   * @param size transfer size in bytes
+   * @param offset file offset in bytes
+   * @return the unbuffered handle when legal, else the buffered one
+   */
+  HANDLE SelectHandle(void *buffer, size_t size, int64_t offset) const {
     if (direct_fd != INVALID_HANDLE_VALUE &&
         (reinterpret_cast<uintptr_t>(buffer) % 4096 == 0) &&
-        (size % 4096 == 0)) {
+        (size % 4096 == 0) && (offset % 4096 == 0)) {
       return direct_fd;
     }
     return regular_fd;
   }
 
-  IoToken SubmitIO(void *buffer, size_t size, off_t offset, bool is_write) {
+  IoToken SubmitIO(void *buffer, size_t size, int64_t offset, bool is_write) {
     std::lock_guard<std::mutex> lock(mutex);
 
-    HANDLE h = SelectHandle(buffer, size);
+    // A negative offset or a transfer wider than a DWORD cannot be expressed
+    // in one OVERLAPPED ReadFile/WriteFile call (#1059).
+    if (offset < 0 || size > static_cast<size_t>(MAXDWORD)) {
+      return kInvalidIoToken;
+    }
+    HANDLE h = SelectHandle(buffer, size, offset);
     if (h == INVALID_HANDLE_VALUE) return kInvalidIoToken;
 
     IoToken token = next_token.fetch_add(1, std::memory_order_relaxed);
@@ -157,6 +173,33 @@ struct IocpAsyncIO::Impl {
   }
 };
 
+namespace {
+
+/**
+ * Mark a file sparse (FSCTL_SET_SPARSE), best effort.
+ *
+ * The handle is FILE_FLAG_OVERLAPPED, so DeviceIoControl needs a real
+ * OVERLAPPED; the call must happen before the handle is bound to the
+ * completion port so its completion is not delivered there.
+ * @param h overlapped file handle not yet associated with an IOCP
+ * @return true if the filesystem accepted the sparse attribute
+ */
+bool MarkSparse(HANDLE h) {
+  OVERLAPPED ov{};
+  ov.hEvent = ::CreateEventA(nullptr, TRUE, FALSE, nullptr);
+  if (!ov.hEvent) return false;
+  DWORD bytes = 0;
+  BOOL ok = ::DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0,
+                              &bytes, &ov);
+  if (!ok && ::GetLastError() == ERROR_IO_PENDING) {
+    ok = ::GetOverlappedResult(h, &ov, &bytes, TRUE);
+  }
+  ::CloseHandle(ov.hEvent);
+  return ok != FALSE;
+}
+
+}  // namespace
+
 IocpAsyncIO::IocpAsyncIO(uint32_t io_depth) : impl_(std::make_unique<Impl>()) {
   impl_->io_depth = io_depth;
 }
@@ -183,6 +226,14 @@ bool IocpAsyncIO::Open(const std::string &path, int flags, mode_t mode) {
   impl_->regular_fd = ::CreateFileA(path.c_str(), access, share, nullptr,
                                      creation, FILE_FLAG_OVERLAPPED, nullptr);
   if (impl_->regular_fd == INVALID_HANDLE_VALUE) return false;
+
+  // Mark the file sparse so extending it (Truncate -> SetEndOfFile) only
+  // reserves logical size; clusters are allocated as blocks are actually
+  // written, matching ftruncate on Linux (#1100). Without this, NTFS
+  // allocates -- and charges quota for -- the whole extent up front.
+  // Best effort: FAT/exFAT have no sparse support, and then we simply get
+  // the old eager behaviour.
+  MarkSparse(impl_->regular_fd);
 
   impl_->direct_fd = ::CreateFileA(
       path.c_str(), access, share, nullptr, OPEN_EXISTING,
@@ -232,11 +283,11 @@ bool IocpAsyncIO::Truncate(size_t size) {
   return true;
 }
 
-IoToken IocpAsyncIO::Write(void *buffer, size_t size, off_t offset) {
+IoToken IocpAsyncIO::Write(void *buffer, size_t size, int64_t offset) {
   return impl_->SubmitIO(buffer, size, offset, /*is_write=*/true);
 }
 
-IoToken IocpAsyncIO::Read(void *buffer, size_t size, off_t offset) {
+IoToken IocpAsyncIO::Read(void *buffer, size_t size, int64_t offset) {
   return impl_->SubmitIO(buffer, size, offset, /*is_write=*/false);
 }
 

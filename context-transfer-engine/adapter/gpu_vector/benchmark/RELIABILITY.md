@@ -1,0 +1,270 @@
+# Reliability work, post-submission (started 2026-09-26)
+
+Goal: make multi-node clio-core runs stable, and make failures cheap and
+legible. Rules for this work: reproduce every defect at the smallest scale
+that shows it, confirm the mechanism from code and logs before changing
+anything, fix in clio-core proper (not in job scripts), then keep the
+reproducer as a test. Nothing is submitted at scale that has not passed the
+same configuration at small scale.
+
+## Defects seen during the evaluation (16-64 nodes), with status
+
+| # | Symptom | Mechanism | Status |
+|---|---|---|---|
+| 1 | Writeback "REFUSED (rc=4294966296)" on a healthy peer; the one rank without a FATAL is the backlogged target | The probe is keyed by the origin task's heap address (net_key). A probe delayed behind a backlogged target answers after that task completed and its address was reused by a newer task, whose replica is then failed with kRun2RunNetworkTimeoutRC (-1000). Secondary: recv_map_ entry erased before the response is transmitted; cross-origin key collisions. | Fixed in code and built: per-origin generation carried by the probe, stale answers dropped, two Gone answers required, recv_map_ erased only after the response is transmitted. Verified non-regressing: 2 co-located ranks, out of core (1.5k faults/evicts per rank), probe at 1 s, zero Gone (run 31). A backlogged-target reproducer is still to be written. |
+| 2 | "GetBlob: generation N never reached" then FATAL 7 on a healthy neighbour | Fixed 10 s generational-get bound; out-of-core steps take ~40 s and ranks drift | Fixed in code: CLIO_GEN_WAIT_MS, default 120 s (7d67cafd). To do: yaml setting, not env. |
+| 3 | At 64 nodes pool creation reached nodes 0 and 32 only | ResolveRangeQuery (ipc_manager.cc) split a range wider than neighborhood_size into at most neighborhood_size multi-container sub-ranges; SendIn sent each only to the node owning its first container; RecvInHandleOne marks received tasks routed so the receiver never fans out; the origin counted one replica per sub-range and reported success. 64 nodes / 32 = exactly nodes 0 and 32. No test ever had N > neighborhood_size. | Fixed and verified on the dev node: 4 co-located ranks with neighborhood_size=2 all register targets and agree on the checksum (run 24). Fix: one single-container Range per container. |
+| 4 | Ranks hang in GetOrCreateTag after the final checkpoint until the cap | Each rank embeds its node's runtime; a rank that exits takes the node's containers; peers whose tag lives there wait forever (SWIM off, so nothing marks the node dead) | Reproduced on the dev node (run 36: peer SIGKILLed at 10 s; the survivor finished 173 iterations, then "[stuck-wait] no completion after 60s" until the cap). First fix (count probes that complete with an error) did nothing: a probe to a dead node never completes, because no origin-side timer fails a sent task whose target never answers (run 38 hung exactly like 36). Fix now in code: a pending probe unanswered for kProbeSilenceSec (15 s = three intervals) marks its target dead; ScanSendMapTimeouts then fails the waiting tasks (30 s). Requires the probe on; the generator default is back to 5000 ms. VERIFIED: suite case peer_death (peer SIGKILLed at 10 s; the survivor logs "has not answered a liveness probe ... marking it dead" and fails before its cap). |
+| 5 | Writeback "REFUSED (rc=11)" during seeding on a subset of nodes | PutBlob rc = 10 + 1: the CTE container is registered before its Create runs (pool_manager.cc:866 then :882); Create awaits one broadcast bdev create per target (slower with N); a peer that finished earlier sends puts into that window and finds target_list_ empty (core_runtime.cc:7680). kmeans gated only on a 500 ms sleep. | FIXED AND VERIFIED (runs 33/34): with CLIO_CTE_REGISTER_DELAY_MS=6000 on one rank, the peer's seeding puts hit the empty target list; wait 0 reproduces the 64-node signature exactly (REFUSED rc=11, FATAL 8, exit 134); the default 120 s wait completes the run with matching checksums. Skew alone (2 and 4 ranks, 16 tiers) never opened the window: every node's Create waits on the slowest peer. |
+| 6 | One rank dies (GPU NotPresent fault, OUT_OF_RESOURCES); the other 63 livelock at ROUND CAP for the full cap | No failure propagation between ranks; 2,000,000-round cap is minutes long | Fixed: bench_watch_ranks / run_colocated fail-fast (first non-zero rank stops the rest; a 300 s cap became 7 s), CLIO_GV_WALL_CAP_MS in the yieldable driver, and dead-peer detection (defect 4) so a survivor fails instead of parking. The GPU host-address fault itself is still open. |
+| 8 | Silent data corruption: a page read back is a MIX of two generations (header says gen 4, the tail still holds gen 3; first bad word 102608 of 131072 in one run, 121336 in another) with rc=0 | Found by the CPU-only `clio_cte_vector_stress` (context-transfer-engine/benchmark), not by the vector. PutBlob overwrites a blob's extents IN PLACE under the write token but never drained pinned readers (core_runtime.cc said so: "PutBlob never drains ... read/write concurrency on a blob is unchanged"); a GetBlob mid-ReadData on the same extents returned old and new bytes together. Both the scalar and the PodMultiPutBlob paths (rungs a and d of the stress ladder, 2 and 4 co-located ranks). For the vector this is a halo/stream page read during a neighbour's publish: wrong numbers, no error. | Fixed in code and built: PutBlobImpl drains readers after taking the write token (BeginDrainReaders + wait HasReadPins, the #753 discipline every extent-freeing mutator already used). VERIFIED: rungs a/d 6/6 clean after the fix (2/2 failing before). Checked: the zero-IPC TryReadBlobShm fast path (non-generational host reads of local pages) validates only placement_gen_, which an in-place put does not bump. |
+| 9 | Barrier miss: after the checkpoint at step 4, node 0 polled for a peer's barrier blob (`stressbar_1004_2`) for 300 s and never got it, while nodes 1 and 3 read the same blob and passed | Unknown yet. No "generation never reached" warning on any node, so the gets did not sit in the owner's 120 s generational wait; they failed some other way, repeatedly. Node 0 issued its get ~300 ms before the writer's put (it finished its checkpoint first). The same ReduceSum/GetPeers exchange gates every kmeans iteration and every benchmark's exit, so this is a candidate for the "exit=124 with the timed region complete" hangs at 16-64 nodes. | GetPeers now reports attempts and the last rc on timeout; the stress benchmark has `--barriers N` (barrier-only rounds). Reproducers queued (4 ranks x 300 rounds, and the failing rung). |
+| 10 | Every clean exit of an embedded-runtime process ends with 900-5000 `RouteTask: RouteLocal returned 4 for pool=(1,0) method=14/21` ERROR lines | `RuntimeManager::ClientFinalize()` (which the CTE benchmarks and `CLIO_RUNTIME_FINALIZE`'s documented contract call) finalized the pool manager and closed the peer connection pool while the process's OWN server workers were still running: the admin pool vanished under the network worker, every kSend/kClientSend was re-queued and failed again until StopWorkers. Peers lose their DEALER connections early as well. | Fixed and verified (0 lines on a 2-rank run): ClientFinalize runs ServerFinalize first when the process is also the runtime, the order `~RuntimeManager` and `CLIO_RUNTIME_FINALIZE` already use. |
+| 11 | Same torn pages through the zero-IPC fast path: one rank, non-generational host reads of LOCAL pages, 3 torn pages in 11 s (rung fast1) | `TryReadBlobShm` copies a blob's extents straight out of the RAM tier and re-checks only `placement_gen_`, which an in-place put never changes (the header said so: "concurrent same-blob overwrite vs view is torn-content-visible"). The runtime-side drain (defect 8) cannot see these readers: they pin nothing. This is the default read path for every host client of a local blob (adapters, CAE), not only the benchmarks. | Fix in code: a content seqlock. `BlobInfo::content_seq_` goes odd before a put's first in-place byte and even after its last, mirrored to `ShmBlobRecord::content_seq_` both times (cache layout v4); `TryReadBlobShm` refuses an odd value and discards a copy across which it changed; the zero-copy view stamp (`TryGetBlobViewShm`/`CheckBlobGenShm`) now carries both counters. VERIFIED: fast1-3 3/3 clean (was 3 torn pages in 11 s), plus the whole ladder, 8-runtime and 30-step soaks clean afterwards. |
+| 12 | 16-node stress run never left startup: all 16 nodes declared node 5 dead (748 times; node 15 too), every seeding put to it failed, fail-fast stopped the run at 249 s | The defect-4 probe-silence rule (a liveness probe unanswered for 15 s = dead) fired on a node that was merely saturated: node 5's log shows it still creating the 16 per-node tier pools x 16 containers (the N^2 startup) with `worker 0 STALLED ... 1.45 s`. A probe is a task, so a busy node answers none, while it is plainly alive and sending. The rule had only ever been exercised at 2-8 co-located runtimes, where startup is instant. | Fixed in code: IpcManager records the last message received from each node (RecvInHandleOne, response completer); ScanTaskProgress treats a probe-silent node that was heard from inside the window as busy and re-arms; silence window 15 -> 30 s. Building; 16-node resubmission follows automatically. The N^2 startup itself (every node creates every other node's tier pool) is still open and will dominate at 64 nodes. |
+| 13 | 64-node stress run (O(N) startup) failed at 25 s: seeding puts and GetOrCreateTag returned -1000 on 7 ranks, 113 dead-marks (send-map timeouts), no probe-silence marks | Startup skew: 21 broadcast tasks for the CTE pool (512.0) reached nodes 11/25/44/5 before those nodes had composed the pool's container; `RecvIn` logged `Container not found` and DROPPED them. The origins' progress probes then answered Gone twice and the tasks failed with kRun2RunNetworkTimeoutRC. The faster O(N) startup widened the window the N^2 creates used to paper over. | Fix in code: an inbound archive with a task for a pool whose REAL local container is not registered yet is held whole (`deferred_recv_`) and replayed from the net tick once it is; dropped with an error after 120 s. The first version admitted a task as soon as the pool's STATIC container existed: `Task::BeginRunContext` binds a task to the static instance when no real one exists, so two puts executed on a Runtime that never ran Create, waited 120 s for targets it would never register (rc 11) while the real container was ready 180 ms later -- the same hazard exists for any task that reaches a node in that window. Reproducer: `BENCH_RANK_DELAY_1=<3..9>` on 2 co-located ranks (late-peer trials, dev node 4). Verifying. |
+| 14 | `test_concurrent_same_blob` (8 threads write disjoint regions of one blob) lost 0.4-240 MB of the blob -- zeros where written bytes should be, on the RPC read path too -- under the user's `~/.clio/clio.yaml`; bisected to the `performance:` section, which brings the periodic `FlushData` (every 10 s by default) into play once a tier at persistence level >= 1 exists (the `temporary` file tier) | Traced with `CLIO_CTE_TRACE_PUT=1` (kept as a diagnostic). Two defects in `FlushData`'s move of a blob to a persistent tier: (1) it read the blob under its write token, FREED the volatile blocks and recomputed the (smaller) size, released the token and re-put the snapshot through an `AsyncPutBlob` subtask -- concurrent puts saw a shrunken blob, zero-filled "holes" over live data, and the re-put overwrote everything written since; (2) it sized the move from the candidate scan's `entry.total_size`, taken before any token -- a blob still being written had grown by hundreds of MB by its turn (flush-begin size=435812589, blob 810844809), so the swap truncated it. A WAL sharding race (logs by `worker_id % num_logs`, aliased by elastic workers) was found on the way and closed with a mutex, but was not the cause. Tests that do not set `CLIO_SERVER_CONF` silently run under `~/.clio/clio.yaml`. | FIXED: `FlushData` takes the token and reader drain first, sizes the move under the token, places the snapshot on the persistent tier and writes it into a staging layout, swaps, frees the old blocks and publishes -- all under the token (the inline place-and-swap `ReorganizeBlobInternal` uses); a placement failure leaves the blob untouched. Verified: the failing configuration 3/3 clean with flushes occurring, the full user yaml clean, torn-read test clean. |
+| 7 | Same config passes at 4 nodes, fails at 64 | Configs edited by hand per script; three scripts generate three yamls; binaries with ad-hoc suffixes and no provenance | Done: bench_config.sh is the one generator (E1/E4/E5 use it), MANIFEST.tsv per build, bench_check_binary refuses binaries older than the headers, bench_ladder.sh is the mandatory pre-scale gate, bench_colocated_tests.sh keeps the reproducers green, the clio-bench skill is the runbook. |
+
+## Plan (priority order)
+
+1. Fail fast in the launcher and a wall-clock round cap (defect 6).
+2. Smallest-scale reproducers, then fixes, for defects 1, 3, 4, 5.
+3. Generation wait as a yaml setting (defect 2).
+4. One config generator used by every PBS script (defect 7).
+5. Build manifest per benchmark binary (defect 7).
+6. Scale ladder script: 1 -> 4 -> 16 nodes with the resident and out-of-core
+   gates, prints the 64-node submit line only when every rung passes.
+7. Each reproducer becomes a distributed test under gpu_vector/test.
+8. A `clio-bench` runbook skill: procedure + failure-signature table.
+9. DONE: a CPU-only CTE stress benchmark that mimics the vector
+   (`context-transfer-engine/benchmark/clio_cte_vector_stress`, ladder
+   `stress_ladder.sh`, scale launcher `pbs_stress_aurora.sh`). Found
+   defects 8-11 in the core with no GPU involved.
+10. Open: the barrier miss (defect 9) has not recurred in 2,400+ gate
+    rounds since the reader drain; keep the diagnostics armed and watch the
+    16-node stress runs. DONE: `test_torn_read` (ctest `cte_torn_read`,
+    context-transfer-engine/test/unit) overwrites 8 blobs from 4 threads
+    while 8 threads read and verify, generational (runtime path) and plain
+    (zero-IPC path): 0 torn in ~17k puts / ~40k gets per case. The
+    startup-skew drop (defect 13) is `late_peer` in bench_colocated_tests.sh;
+    the flush race (defect 14) is ctest `cte_concurrent_same_blob_flush`
+    (`SAME_BLOB_FLUSH=1`: self-contained two-tier config, FlushData every
+    500 ms racing 8 writers; 5-6 flushes per run, 0 lost bytes).
+
+## Enabler: several runtimes on one node
+
+The debug queue allows 2 nodes and one running job per user, and the repo's
+own distributed tests need docker (one container = one hostname). To iterate
+in minutes, the runtime gets an optional per-entry port in the hostfile
+(`host:port`); a process picks the entry whose port equals its own
+`networking.port` / `CLIO_PORT`. Identity, shared-memory segment names
+(already suffixed with the port), the client cache key (`addr:port`) and the
+per-user IPC sweep (pid-aware) all already tolerate this; only the hostfile
+parse, the identity check and the three peer dial sites change. Entries
+without a port behave exactly as before. This is a test enabler, not the
+production layout: one runtime per node remains the design.
+
+## Other findings
+
+- Shared model directory. The learned task-stat models were saved under
+  `<conf_dir>/models` with `conf_dir` defaulting to `/tmp/clio`, shared by
+  every user of a node. On the login node that directory belonged to another
+  user: every runtime start logged an ERROR per container (the model could
+  not be written) and `RestoreModel` happily loaded the other user's models.
+  Fixed: `conf_dir` defaults to the per-user runtime directory
+  (`/tmp/clio_$USER`, the memfd directory); `runtime.conf_dir` still
+  overrides. The models directory is created on first save.
+
+- N^2 startup pool creation. The yaml has ONE tier line, but the CTE
+  registers each node's tier as its own pool (`ram::<tier>_node<k>`) and every
+  pool is created by broadcast with a container on EVERY node: node 5's log
+  at 16 nodes shows it creating `_node0`, `_node7`, `_node6`, `_node14`, ...
+  So each node runs N pool creates, N^2 cluster-wide (4096 at 64 nodes), and
+  this is what saturated node 5 long enough to trip the 15 s probe rule
+  (defect 12). Seeding still started after 4.4 s at 64 nodes, so it is not
+  yet the bottleneck, but a per-node DRAM tier only needs one container, on
+  its own node: creating it with a single-container query instead of a
+  broadcast would make startup O(N) and remove the stall. FIXED (6baa919e): RegisterTarget creates the tier pool on its own node (Local / Physical(node) + address map for remote targets); at 16 nodes tier pool creates per rank went 16 -> 1, run clean. A second N-fold, every CTE client init broadcasting GetOrCreatePool('clio_cte_core') because the admin scheduler checked existence by name only and compose had named 512.0 'cte_core', is fixed in admin ScheduleTask (fixed-id check); verification pending.
+
+- `runtime.task_progress_interval_ms` defaults to 5000 (on); the header said
+  "default 0 = disabled". Comment and default yaml corrected.
+- The generational-get wait passed a millisecond nap to `yield()`, which takes
+  microseconds: the wait was a hot spin. Fixed (x1000).
+- Every node creates a bdev pool container for every other node's tier
+  (RegisterTarget's bdev create is broadcast): N^2 pool creates at startup,
+  and each node maps N x TIER_MB of (sparse) shared memory. Not yet changed.
+- `neighborhood_size` defaults to 32, which is exactly why 64-node pool
+  creation reached nodes 0 and 32.
+- build-fresh, which every evaluation binary linked against, is a Debug build.
+
+## Log
+
+- 2026-09-26: SWIM defaults changed (fdab7a1f): off everywhere, 300/150/3600 s.
+- 2026-09-26: rc=11 identified as "no storage targets registered" (AGENTS.md
+  and PITFALLS.md already said so; the 64-node diagnosis had guessed EAGAIN).
+- 2026-09-26: host:port hostfile entries added (types.h, ipc_manager.cc,
+  ipc_run2run.cc); bench_config.sh (one yaml generator), run_colocated.sh,
+  pbs_devnode_aurora.sh written. Defect-5 fix and nap-unit fix built into
+  libclio_cte_core_runtime.so. Probe fix written, building.
+- 2026-09-26 06:48-07:00 UTC, dev node x4404c0s2b0n0 (job 8871567): host:port
+  identity WORKS (node 0 on 9460, node 1 on 9468, same host; 4 ranks too).
+  Fail-fast works (7 s instead of a 300 s cap). Launcher lessons, all fixed
+  in run_colocated.sh: killing a rank's subshell left the benchmark and its
+  embedded runtime alive (GNU timeout moves its child to a new process
+  group) -> setsid per rank + timeout --foreground + kill by group; dev-node
+  scripts must not poll files under /tmp (node-local). Every co-located run
+  still segfaults ~7 s in, in the benchmark's main() (null deref at +0x38
+  right after a 0x1000000000 constant), even with the peer not yet started;
+  suspect the CLIO_MAIN_SEGMENT_SIZE override; cores in
+  devnode/work/smoke2_core, gdb-oneapi works on the login node; a -g kmeans
+  build (_x_dbg) is in progress.
+- Range-split fix built into libclio_run_cxx.so (with the probe fix).
+- 2026-09-26 07:05 UTC: the co-located segfault was an ABI mismatch, not a
+  runtime bug. Adding Host::port (types.h) changed a struct that every
+  benchmark binary compiles into itself through the runtime headers; the old
+  binaries crashed inside main() (inlined accessor at a stale offset) while a
+  freshly built kmeans passed: 1 rank small, and 2 co-located runtimes at the
+  E5 sizes with matching checksums and remote page traffic. Consequence: all
+  benchmark binaries are rebuilt under their existing names; launchers now
+  refuse a binary older than the runtime libraries (bench_check_binary), and
+  the build script writes a manifest line per binary.
+- Noise to fix: kmeans's end-of-run TIER SPLIT check queries bdev pool (513,1),
+  which does not exist in a one-tier config; it costs 5 s and an ERROR line.
+- 2026-09-26 07:08 UTC: all five benchmark binaries rebuilt against the new
+  headers (kmeans _x_ckpt2, grayscott _x_fc2_ct8, gmx, lbann, lammps_md).
+  MANIFEST.tsv now records each build. Defect 3 verified fixed (run 24).
+- 2026-09-26 07:13 UTC: defect-5 reproduction attempts at 2 and 4 co-located
+  ranks (start delays, 16 tiers per node) never opened the window: every
+  node's Create waits on the slowest peer's bdev create, so they finish
+  together. A test hook (CLIO_CTE_REGISTER_DELAY_MS, per rank via
+  BENCH_RANK_ENV_<r>) stretches one node's registration to make the window
+  deterministic; runs 33/34 use it. kmeans's end-of-run tier check is now
+  opt-in (KM_TIER_CHECK=1). bench_ladder.sh written (kmeans, grayscott).
+- 2026-09-26 07:20 UTC: committed 3a76539a (runtime/CTE) and 9690b048
+  (harness). Defect 4 reproduced (run 36) and fixed in code (dead after 3
+  unanswered probes); SetDead now evicts the peer's real port from the client
+  pool. The stale-binary check caught the benchmarks being older than the
+  relinked library (run 37); all five rebuilt again.
+- 2026-09-26 07:27 UTC: bench_colocated_tests.sh (6 cases) first run: smoke,
+  range_split, targets_race pass; targets_race_control reproduced the defect
+  (rank 0 abort 134, owner refusals) but the check read the wrong log line
+  (fixed); peer_death / probe_ooc were refused by the staleness check after a
+  library relink with no header change -> the check now compares against
+  headers (runtime, ctp, module client, CTE core, gpu_vector), not .so files.
+  Ladder: kmeans's atomically summed checksum differs by ~1e-8 across rank
+  counts, so the cross-rung gate is a relative tolerance (1e-6) now.
+- 2026-09-26 07:31 UTC: bench_colocated_tests.sh ALL SIX CASES PASS (run 44):
+  smoke, range_split, targets_race, targets_race_control (reproduces rc 11
+  without the wait), peer_death (dead peer detected, no hang), probe_ooc
+  (out of core, probe on, zero Gone). Ladder out-of-core rungs now sized
+  above the 8-frames-per-block floor.
+- 2026-09-26 07:32 UTC: bench_ladder.sh kmeans LADDER PASS (run 45): 1 resident,
+  2 resident, 2 out of core (1514 evicts), 4 out of core (1511 evicts).
+- 2026-09-26 14:30-15:10 UTC (dev node x4415c7s0b0n0, job 8872208): the
+  CPU-only CTE stress ladder (context-transfer-engine/benchmark/
+  clio_cte_vector_stress) found defects 8 (torn reads, RPC path), 9 (barrier
+  miss, once), 10 (ClientFinalize under live workers) and 11 (torn reads,
+  zero-IPC path). Rungs: a FAIL torn, b FAIL barrier, c PASS (4 ranks, 64
+  threads, 4 GB/rank), d FAIL torn (scalar), e PASS (non-generational), f PASS
+  (32768 x 64 KB pages, 1.5 M gets). After the PutBlob reader drain: a/d
+  4/4 PASS, b 5/5 PASS, 400 barrier-only rounds PASS (0.5 ms per round at 4
+  ranks). fast1 (1 rank, non-generational, 64 threads) then showed defect 11;
+  content seqlock written, verification pending. A header edited 2 s after the
+  stress binary linked made bench_check_binary refuse the next dev run and the
+  first 16-node job (8872228): batch header edits before building.
+- 2026-09-26 15:05-15:20 UTC (same dev node): with the reader drain and the
+  content seqlock: fast1-3 PASS, a3/d3 PASS, soak (12 steps, checkpoint
+  every step, 2000 gate rounds) PASS, 8 co-located runtimes PASS (500 rounds,
+  ~1 ms each), 30-step soak at 4 ranks PASS (172k gets/rank, 0 errors),
+  8 ranks scalar PASS. The barrier miss has not recurred (2,900+ rounds).
+- 2026-09-26 15:40 UTC, 16 nodes (job 8872285, debug-scaling), first
+  multi-node stress run with the liveness guard: 8 GB of 1 MB pages per node,
+  32 threads, batches of 16, halo 1 + 2 random reads per page, 6 steps, two
+  checkpoints, 200 gate rounds. 196,608 verified gets per node (3.1 M total,
+  ~25% served the next generation), 0 get/put/checkpoint errors, 0
+  mismatches, 0 nodes declared dead, 200/200 barrier rounds (1.1 ms each,
+  slowest 9.8 ms), every rank exit 0. Timed region 109 s; seed 4.5 s;
+  checkpoint of 8192 pages 10.5 s. The previous attempt (8872256, 15 s
+  probe-silence rule) never left startup.
+- 2026-09-26 15:55 UTC, 64 nodes (job 8872293): same configuration as the
+  16-node run. All 64 ranks: 196,602-196,608 verified gets each (12.6 M),
+  0 errors of any kind, 0 mismatches, 0 nodes declared dead, 200/200 gate
+  rounds (3.9 ms each, slowest 22.8 ms). Timed region 115 s vs 109 s at 16
+  nodes (steps 15-16 s vs 13 s; a checkpoint of 8192 pages 10.4-11.0 s at
+  both scales). Weak scaling holds 16 -> 64 for this CPU-only pattern.
+- 2026-09-26 16:10 UTC (dev node 2, job 8872255), everything on the fixed
+  libraries: kmeans GPU ladder PASS; colocated reproducer suite 0 failures;
+  CTE stress ladder 9/9 PASS; grayscott GPU ladder PASS with the corrected
+  gate (its checksum is extensive and non-linear in the deck; paging is
+  bit-exact against a resident run of the same deck at 2 and 4 ranks, ~4,500
+  evictions each).
+- 2026-09-26 19:40 UTC (dev node 3, job 8872501), O(N)-startup libraries
+  (6baa919e tier pool on its own node, 06142bf9 fixed-id create stays Local):
+  pool creates per rank 36 -> 6 at 16 nodes (tier 16 -> 1, clio_cte_core
+  16 -> 1); 16-node stress 8872502 clean (123 s wall); stress ladder 9/9,
+  kmeans ladder, grayscott ladder and the reproducer suite all PASS.
+- 2026-09-26 20:45 UTC, 64 nodes (job 8872587), O(N) startup + inbound
+  deferral (cf86f33d): all 64 ranks clean, 0 errors/mismatches, 0 nodes
+  declared dead, 200/200 gate rounds, 132 s wall (172 s before the startup
+  work); 6 pool creates per rank. Stress ladder 9/9 and kmeans GPU ladder
+  PASS on the same libraries (dev node 4).
+- 2026-09-26 22:30 UTC (dev node 6, job 8872832), final libraries of the day
+  (97250a23 FlushData atomic move + WAL mutex, 689f47e3 flush-race test):
+  stress ladder 9/9, kmeans GPU ladder PASS, colocated suite 21/21 (7 cases
+  including late_peer); torn-read test and both same-blob variants pass.
+- 2026-09-27 03:40 UTC: `clio_cte_vector_stress --bw` added (write, read
+  back, read the next node's pages, barrier-fenced, BW line per node) with
+  ladder rungs bw_2r / bw_4r_scalar (pass, 0 errors); `pbs_bw_aurora.sh`
+  runs 100 GiB through IOR on DAOS (DFS ppn 8/32, POSIX+pil4dfs) and through
+  clio (t32b16, t64b32) on the same 64 nodes; job 8873592. GPU binaries
+  rebuilt on the final libraries; E5 64-node GPU rerun queued behind it.
+- 2026-09-27 04:37 UTC, jobs 8873592 / 8873651 (64 nodes, 100 GiB per
+  phase, 1 MiB transfers, GB/s by the slowest node): DAOS DFS, default
+  container (rd_fac 3): 249 write / 468 read at 8 ranks per node, 352 / 550
+  at 32; rd_fac 0 SX container at 32 ranks: 952 / 1034; POSIX via dfuse +
+  pil4dfs at 8 ranks: 230 / 421. clio (1 embedded runtime per node, 32
+  client threads, batches of 16): cold write 84-92, warm rewrite 160-191,
+  read 133-165, shifted read 163-187; CLIO_PREFAULT=4GB lifts the cold
+  write to 122-131; 16 or 32 runtime workers do not beat 8. Zero errors in
+  all six clio runs. Cold memory (sparse RAM tier populated in the write
+  path, sparse main segment) is a 2.3x factor on first-touch writes.
+  Harness: the dfuse launcher's dbcast hung 20 min once (killed by hand);
+  IOR DFS refuses an object class the container's rd_fac cannot honour.
+- 2026-09-27 05:10 UTC, GPU host-address fault ROOT CAUSE (defect 6's open
+  half). E5 at 64 nodes on the 04:00 libraries failed 4 of 4 cell attempts
+  on four distinct nodes (8873625, 8873678): kmeans rank 62 OUT_OF_RESOURCES,
+  rank 40 and rank 5 "Segmentation fault from GPU at 0x14.. NotPresent
+  Read", grayscott ranks 57 and 60 OUT_OF_RESOURCES; 16 nodes passed twice.
+  Cause: GpuApi::Memcpy on SYCL was a raw queue memcpy, and gpu_vector
+  uploads pages from std::vector staging (PrefetchShared, Copy, table and
+  task uploads), so Level Zero mapped PAGEABLE heap as a userptr; the
+  compute nodes run THP 'always' with khugepaged active (33k collapses on
+  one node), which moves those pages under the mapping mid-copy. The SYCL
+  build also took the device-task slot scratch from new[] (GPU writes it via
+  the ring stream). Fix: GpuApi::Memcpy and MemcpyAsync(stream=nullptr)
+  route through DeviceAwareMemcpy's per-thread pinned USM bounce
+  (gpu_api.h); the slot scratch comes from a USM-host slab pool on SYCL as
+  it does from cudaHostAlloc on CUDA (ipc_gpu2cpu.cc). Harness: pbs_e5
+  e5_sweep() kills stragglers and waits for the runtime ports between
+  cells (a dying cell's port made the next cell's 63 ranks attach as
+  clients and segfault). Validation on the fixed libraries (dev node
+  8873806): stress ladder 6/6, kmeans ladder PASS, grayscott ladder PASS;
+  E5 64 nodes resubmitted (8873847).
+- 2026-09-27 05:48 UTC, job 8873847: E5 at 64 nodes on the pinned-bounce
+  libraries PASSES: kmeans 64/64 (161 s, checksum 30720.000051, matching
+  the ladder), grayscott 64/64 (345 s, v_checksum 3185441526.3441 identical
+  on every rank). The old binaries were 0/4 on the same cells an hour
+  earlier. Defect 6's GPU host-address fault is closed.
+- Open, defect 15: a survivor that waits on a blob it owns itself never
+  sends the dead peer anything, so no liveness probe fires and it fails only
+  through its own collective timeout (120 s). peer_death reproduces it 2 of
+  4 runs (the kill lands around iteration 175, whose reduce blob hashes to
+  the survivor). Fix in progress: idle liveness probes in ScanTaskProgress
+  (peers heard from before, silent 10 s, heard-from guard), an atomic
+  dead-node count, and GetPeers giving up as soon as a node is dead.
+- 2026-09-27 06:41 UTC, job 8873942: 64-node CTE stress on the idle-probe
+  libraries (probes on, 5 s interval): 64/64, 12.6 M gets, 3.7 M puts,
+  0 errors, 0 mismatches, 0 network timeouts, 0 dead marks, 0 busy re-arms,
+  0 probe-failure warnings, 125 s. Defect 15 closed (commits 7373c069,
+  e7a57d40, a6fc7bad pushed to gpu-coro-port).

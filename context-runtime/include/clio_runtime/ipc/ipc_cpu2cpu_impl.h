@@ -35,6 +35,30 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
 #else
   if (task_ptr.IsNull()) return Future<TaskT>();
 
+  // Finalized-client guard (issue #970). ClientFinalize resets the transports
+  // this function is about to use, so a submit after it dereferences a dangling
+  // one. Complete the task with an error instead.
+  //
+  // Placed HERE rather than in IpcManager::Send, which is where it started: Send
+  // is not the only way in. ClientConnect (reconnect) and RegisterMemory call
+  // this directly from ipc_manager.cc -- five sites that bypass Send entirely --
+  // and each of them would hit the same dangling transport. Guarding the
+  // transport entry points covers those too, and needs no CTP_IS_HOST block of
+  // its own because this body is already the host half of one.
+  //
+  // The runtime self-send path (IpcCpu2Self::SendIn) is deliberately untouched:
+  // it uses none of these transports, so excluding it is structural here rather
+  // than an is_runtime test.
+  if (ipc->client_finalized_.load(std::memory_order_acquire)) {
+    HLOG(kWarning,
+         "Send(SHM): client is finalized; failing task instead of submitting on a "
+         "torn-down transport (issue #970)");
+    Future<TaskT> future(task_ptr->pool_id_, task_ptr->method_, task_ptr);
+    task_ptr->SetReturnCode(static_cast<u32>(-1));
+    task_ptr->SetComplete();
+    return future;
+  }
+
   // #642: the task's virtual address is the response key the worker echoes back
   // so this client thread can match the result to the right Future.
   size_t net_key = reinterpret_cast<size_t>(task_ptr.get());
@@ -116,6 +140,48 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
   TaskT *task_ptr = future.get();
   const size_t want_key = task_ptr->task_id_.net_key_;
 
+  // Never-sent task: nothing to wait for, nothing to claim.
+  //
+  // Both SendIn paths stamp net_key_ with the task's OWN heap address, which
+  // cannot be null, and ResendTask re-stamps the same way -- so a zero
+  // net_key_ is only ever TaskId's constructor default, i.e. a task that
+  // never went over IPC at all. The client-side read fast paths synthesize
+  // exactly that: a real GetBlobTask filled in from the shared metadata cache
+  // and SetComplete()'d locally, never Sent (CoreClient::TryShmGet and its
+  // deferred-put / vectored twins -- see the "synthesized-task contract"
+  // there). Returning true hands the caller the locally-produced result and
+  // lets WaitCpu2Cpu run Destroy(true) -> PostWait, which the fast paths rely
+  // on to finish the destination copy.
+  //
+  // Without this the #968 guard at the bottom treats every such future as a
+  // protocol violation: the task IS complete (locally) and there IS no parked
+  // archive, which is precisely the aliasing signature that guard looks for.
+  // That turned every cache-hit read into rc=-1 (cr_cli_cfs,
+  // cte_{get,put}blob_priv_separate, python_gil_release_test), with the bytes
+  // already correctly copied.
+  if (want_key == 0) {
+    return true;
+  }
+
+  // Finalized-client escape (issue #970). A task submitted AFTER
+  // ClientFinalize can never complete — the response listener is gone and the
+  // recv threads are joined — so waiting for it is an unbounded park with no
+  // possible wakeup. The reported case is an HDF5 VOL application: clio's
+  // atexit handler runs before H5_term_library (atexit is LIFO and the
+  // connector cannot register earlier than HDF5), so clio_file_close submits
+  // a DelBlob on a torn-down client and exit() never returns.
+  //
+  // Checked before the spin/park below rather than only inside the loop, so
+  // this costs nothing on the healthy path and returns immediately on the
+  // dead one.
+  if (ipc->client_finalized_.load(std::memory_order_acquire) &&
+      !task_ptr->IsComplete()) {
+    HLOG(kWarning,
+         "Recv(SHM): client is finalized; failing task instead of waiting "
+         "for a response that cannot arrive (issue #970)");
+    return false;
+  }
+
   // Block on this thread's EventManager until RecvShmClientThread marks this
   // task complete and signals us (SHM analogue of IpcCpu2CpuZmq::RecvOut). The
   // dedicated recv thread — not this thread — drains the single response ring,
@@ -150,13 +216,23 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     } while (start.GetUsecFromStart(spin_now) < spin_us);
   }
 
+  double next_report_us = 60e6;  // [HANGWATCH-CLIENT], #1147
   while (!task_ptr->IsComplete()) {
     em->Wait(100);
-    if (max_sec > 0) {
+    {
       ctp::Timepoint now;
       now.Now();
-      if (start.GetUsecFromStart(now) >= static_cast<double>(max_sec) * 1e6) {
+      const double waited_us = start.GetUsecFromStart(now);
+      if (max_sec > 0 && waited_us >= static_cast<double>(max_sec) * 1e6) {
         return false;
+      }
+      if (waited_us >= next_report_us) {
+        // A response this late is lost, not slow: name the task so the
+        // runtimes' logs and tables can be searched for it.
+        HLOG(kError, "[HANGWATCH-CLIENT] waited {} ms for task {} (pool {}, "
+             "method {}) over SHM", waited_us / 1000.0, task_ptr->task_id_,
+             task_ptr->pool_id_, task_ptr->method_);
+        next_report_us *= 2;
       }
     }
     // Server-death escape (issue #851): unlike the ZMQ twin of this loop, the
@@ -165,12 +241,20 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     // the client parked here forever, since a dead server can never set
     // FUTURE_COMPLETE. The 1s heartbeat flips server_alive_; hand the future
     // to the ZMQ RecvOut, whose kClientShm-origin head implements the
-    // reconnect/failover + resend path.
+    // reconnect/failover + resend path. Thread max_sec through so timed waits
+    // respect the deadline.
     if (!ipc->server_alive_.load(std::memory_order_acquire) &&
         !ipc->reconnecting_.load()) {
       HLOG(kWarning,
            "Recv(SHM): server died mid-wait; handing off to reconnect path");
       return IpcCpu2CpuZmq::RecvOut(ipc, future, max_sec);
+    }
+    // The twin of the entry check above, for a wait that was already parked
+    // when another thread began teardown (issue #970).
+    if (ipc->client_finalized_.load(std::memory_order_acquire)) {
+      HLOG(kWarning,
+           "Recv(SHM): client finalized mid-wait; failing task (issue #970)");
+      return false;
     }
   }
 
@@ -193,6 +277,28 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     archive->ResetBulkIndex();
     archive->msg_type_ = MsgType::kSerializeOut;
     *archive >> (*task_ptr);
+  } else if (!future.consumed_ && want_key != 0) {
+    // want_key == 0: the task never went on the wire. The client completes
+    // some tasks itself -- a GetBlob served from the SHM metadata cache or
+    // from a pending deferred put (core_client.h) -- and hands back a future
+    // with origin kClientShm whose net_key was never stamped (SendIn stamps
+    // it). No response exists to claim, so a missing archive is expected.
+    //
+    // Twin of the check in IpcCpu2CpuZmq::RecvOut -- see the long comment
+    // there for why a complete task with no parked archive is a protocol
+    // violation rather than a benign miss, and why returning true here hid
+    // the #968 read failures behind untouched constructor defaults.
+    //
+    // consumed_ matters MORE on this path than on the ZMQ twin: the claim
+    // above ERASES the entry, so a second Wait() on the same future finds
+    // nothing legitimately. Destroy(true) sets consumed_ after Recv returns,
+    // so it is false only on the first claim.
+    HLOG(kError,
+         "IpcCpu2Cpu::RecvOut: task completed with NO response archive for "
+         "net_key {} -- the completion came from another task's response "
+         "(recycled address). Failing instead of returning defaults. See #968.",
+         want_key);
+    return false;
   }
   return true;
 #endif  // CTP_IS_HOST

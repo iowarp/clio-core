@@ -39,6 +39,7 @@
  * allocates/frees small objects and verifies no corruption.
  */
 
+#include <type_traits>
 #include <catch2/catch_all.hpp>
 
 #include "clio_ctp/memory/allocator/thread_allocator.h"
@@ -260,7 +261,7 @@ TEST_CASE("ThreadAllocatorGpu", "[gpu][allocator]") {
     constexpr int kNumBlocks = 16;
     constexpr size_t kBackendSize = 64u * 1024u * 1024u;  // 64 MB
 
-    cudaDeviceSetLimit(cudaLimitStackSize, 16384);
+    ctp::GpuApi::SetDeviceStackLimit(16384);
 
     GpuShmMmap backend;
     MemoryBackendId backend_id(99, 0);
@@ -273,12 +274,12 @@ TEST_CASE("ThreadAllocatorGpu", "[gpu][allocator]") {
         backend.data_capacity_,
         backend_id,
         kNumBlocks);
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
-    REQUIRE(cudaGetLastError() == cudaSuccess);
+    REQUIRE((ctp::GpuApi::Synchronize(), true));
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Per-block result array
     int *d_results = nullptr;
-    cudaMallocHost(&d_results, kNumBlocks * sizeof(int));
+    d_results = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(d_results)>>(kNumBlocks * sizeof(int));
     REQUIRE(d_results != nullptr);
     memset(d_results, 0, kNumBlocks * sizeof(int));
 
@@ -286,8 +287,8 @@ TEST_CASE("ThreadAllocatorGpu", "[gpu][allocator]") {
     ThreadAllocWorkKernel<<<kNumBlocks, 1>>>(
         backend.data_,
         d_results);
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
-    REQUIRE(cudaGetLastError() == cudaSuccess);
+    REQUIRE((ctp::GpuApi::Synchronize(), true));
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     for (int i = 0; i < kNumBlocks; ++i) {
       INFO("Block " << i << " result: " << d_results[i]);
@@ -296,14 +297,14 @@ TEST_CASE("ThreadAllocatorGpu", "[gpu][allocator]") {
       REQUIRE(d_results[i] >= 10);
     }
 
-    cudaFreeHost(d_results);
+    ctp::GpuApi::FreeHost(d_results);
   }
 
   SECTION("CrossBlockFree") {
     constexpr int kNumBlocks = 4;
     constexpr size_t kBackendSize = 64u * 1024u * 1024u;
 
-    cudaDeviceSetLimit(cudaLimitStackSize, 16384);
+    ctp::GpuApi::SetDeviceStackLimit(16384);
 
     GpuShmMmap backend;
     MemoryBackendId backend_id(100, 0);
@@ -313,32 +314,32 @@ TEST_CASE("ThreadAllocatorGpu", "[gpu][allocator]") {
     // Init kernel: set up allocator (uses backend.data_capacity_)
     ThreadAllocInitKernel<<<1, 1>>>(
         backend.data_, backend.data_capacity_, backend_id, kNumBlocks);
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
-    REQUIRE(cudaGetLastError() == cudaSuccess);
+    REQUIRE((ctp::GpuApi::Synchronize(), true));
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
 
     // Allocate result + offset arrays (pinned host for GPU access)
     int *d_results = nullptr;
-    cudaMallocHost(&d_results, 4 * sizeof(int));
+    d_results = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(d_results)>>(4 * sizeof(int));
     REQUIRE(d_results != nullptr);
     memset(d_results, 0, 4 * sizeof(int));
 
     unsigned long long *d_offsets = nullptr;
-    cudaMallocHost(&d_offsets, kCrossBlockObjs * sizeof(unsigned long long));
+    d_offsets = ctp::GpuApi::MallocHost<std::remove_pointer_t<decltype(d_offsets)>>(kCrossBlockObjs * sizeof(unsigned long long));
     REQUIRE(d_offsets != nullptr);
     memset(d_offsets, 0, kCrossBlockObjs * sizeof(unsigned long long));
 
     // Phase 1: block 0 allocates objects
     CrossBlockAllocKernel<<<1, 1>>>(backend.data_, d_offsets, d_results);
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
-    REQUIRE(cudaGetLastError() == cudaSuccess);
+    REQUIRE((ctp::GpuApi::Synchronize(), true));
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
     INFO("Phase 1 alloc count: " << d_results[0]);
     REQUIRE(d_results[0] == kCrossBlockObjs);
 
     // Phase 2: block 1 frees block 0's allocations
     CrossBlockFreeKernel<<<2, 1>>>(
         backend.data_, d_offsets, d_results[0], d_results);
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
-    REQUIRE(cudaGetLastError() == cudaSuccess);
+    REQUIRE((ctp::GpuApi::Synchronize(), true));
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
     INFO("Phase 2 free count: " << d_results[1]);
     INFO("Data integrity: " << d_results[3]);
     REQUIRE(d_results[3] == 0);  // no corruption
@@ -346,14 +347,14 @@ TEST_CASE("ThreadAllocatorGpu", "[gpu][allocator]") {
 
     // Phase 3: block 0 re-allocates — memory should be reclaimed
     CrossBlockReallocKernel<<<1, 1>>>(backend.data_, d_results);
-    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
-    REQUIRE(cudaGetLastError() == cudaSuccess);
+    REQUIRE((ctp::GpuApi::Synchronize(), true));
+    REQUIRE(ctp::GpuApi::LastError() == nullptr);
     INFO("Phase 3 realloc count: " << d_results[2]);
     INFO("Data integrity: " << d_results[3]);
     REQUIRE(d_results[3] == 0);  // no corruption
     REQUIRE(d_results[2] == kCrossBlockObjs);
 
-    cudaFreeHost(d_offsets);
-    cudaFreeHost(d_results);
+    ctp::GpuApi::FreeHost(d_offsets);
+    ctp::GpuApi::FreeHost(d_results);
   }
 }
