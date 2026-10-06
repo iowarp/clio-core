@@ -23,7 +23,13 @@ bool WeightManager::Init() {
   vmm_cfg.use_cte        = cfg_.use_cte;
   vmm_cfg.cte_tag_name   = cfg_.cte_tag_name;
 
-  vmm_.init(vmm_cfg);
+  // A failed init (e.g. use_cte with no reachable CTE) must fail Init, not
+  // leave a manager that pages into nothing.
+  if (vmm_.init(vmm_cfg) != CUDA_SUCCESS) {
+    fprintf(stderr, "WeightManager: GpuVmm init failed
+");
+    return false;
+  }
   ready_ = true;
   return true;
 }

@@ -35,6 +35,11 @@ target_link_libraries(clio_cte_uvm
     PUBLIC
         CUDA::cuda_driver   # cuda.h + libcuda.so (driver API)
         CUDA::cudart        # cuda_runtime.h + libcudart.so (runtime API)
+    PRIVATE
+        # GpuVmmConfig::use_cte stores evicted pages as CTE blobs. Always
+        # compiled in: the class layout must never depend on a macro (#1190).
+        # gpu_vmm.h only forward-declares the client types.
+        clio_cte_core_client
 )
 # -Wl,-soname is a GNU-ld option; the MSVC linker rejects it.
 if(NOT WIN32)
@@ -92,4 +97,25 @@ if(CLIO_CORE_ENABLE_TESTS AND NOT WIN32)
     target_link_libraries(test_gpu_vmm PRIVATE clio_cte_uvm cuda)
     add_test(NAME test_gpu_vmm COMMAND test_gpu_vmm)
     message(STATUS "CTE UVM: Test target 'test_gpu_vmm' added")
+endif()
+
+# use_cte round trip (#1190): host-only (cuMemcpy, no kernel), so it is plain
+# CXX with no device-architecture restriction. Needs a GPU and starts an
+# in-process runtime.
+if(CLIO_CORE_ENABLE_TESTS)
+    add_executable(test_gpu_vmm_cte test/test_gpu_vmm_cte.cc)
+    target_link_libraries(test_gpu_vmm_cte PRIVATE
+        clio_cte_uvm
+        clio_cte_core_client
+        clio::run::bdev_client
+        CUDA::cuda_driver)
+    add_dependencies(test_gpu_vmm_cte
+        clio_cte_core_runtime clio_bdev_runtime clio_admin_runtime)
+    add_test(NAME test_gpu_vmm_cte COMMAND test_gpu_vmm_cte
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    set_tests_properties(test_gpu_vmm_cte PROPERTIES
+        ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+        RESOURCE_LOCK "clio_runtime"
+        TIMEOUT 120
+        LABELS "gpu;cte")
 endif()
