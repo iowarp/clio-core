@@ -42,7 +42,7 @@ the reason.
 | 882 | no longer occurring | Same window as #848: the icx (windows-2025) leg's only failure in 35 runs was cr_safe_bdev_disk_fail_tests (#1156 YAML, fixed here); no wedge, no flake. |
 | 893 | fixed on dev | 2d769d309. |
 | 896 | fixed on dev | fe21df453 (regression test not added; multi-node). |
-| 907 | open | Windows + WinFsp hang, no root cause. |
+| 907 | blocked (needs WinFsp developer files) | This host has the WinFsp runtime only (no inc/ or lib/), so CMake skips the FUSE adapter. Installing the WinFsp developer component is a machine-wide admin MSI change; not done without the owner's go-ahead. |
 | 915 | fixed on dev | fb735bdb6 (PR #1027). |
 | 919 | fixed on dev | PRs #920, #932. |
 | 924 | fixed on dev | 499b7c2fb (PR #932). |
