@@ -115,8 +115,10 @@ both off by default:
 ## Building Nyx
 
 ```bash
-git clone --depth 1 --recursive https://github.com/AMReX-Astro/Nyx.git ~/src/Nyx
+git clone https://github.com/AMReX-Astro/Nyx.git ~/src/Nyx
 cd ~/src/Nyx
+git checkout 4ecfea2a      # the commit the benchmark data were made with
+git submodule update --init --recursive   # AMReX 6e875b7cc
 git apply <clio>/paper-benchmark/nyx/patches/nyx-raw-field-dump.patch
 git apply <clio>/paper-benchmark/nyx/patches/nyx-comoving-a-single-precision-eps.patch
 # only for the multiphase workload (harmless otherwise: defaults are upstream's)

@@ -52,9 +52,12 @@ def time_key(rel):
     return (-1, product(rel), rel)
 
 
-def stage(ds, out):
-    """Cut every array file of one dataset into chunk files; (chunks, bytes)."""
-    src = sv.source_dir(ds)
+def stage(ds, out, src=None):
+    """Cut every array file of one dataset into chunk files; (chunks, bytes).
+
+    @param src the source directory (default: stage_v2_workloads.source_dir)
+    """
+    src = src or sv.source_dir(ds)
     rels = []
     for root, _, files in os.walk(src):
         for f in files:
@@ -84,12 +87,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("datasets", nargs="*", default=DATASETS)
     ap.add_argument("--out", default="/mnt/nvme0/v2-work")
+    ap.add_argument("--src", default=None,
+                    help="source directory of the one dataset given (default: ~/np-data/...)")
     a = ap.parse_args()
+    if a.src and len(a.datasets) != 1:
+        raise SystemExit("--src needs exactly one dataset")
     for ds in a.datasets:
         dst = os.path.join(a.out, ds, "fields")
         if os.path.exists(dst) and os.listdir(dst):
             raise SystemExit(f"{dst} is not empty; move the sampled staging away first")
-        n, total = stage(ds, dst)
+        n, total = stage(ds, dst, a.src)
         print(f"{ds:28s} {n:5d} chunks  {total / 2**30:6.2f} GiB", flush=True)
 
 

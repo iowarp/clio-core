@@ -69,7 +69,9 @@ only this deck needs the guard.
 VPIC first:
 
 ```bash
-git clone --depth 1 --recursive https://github.com/lanl/vpic-kokkos.git ~/src/vpic-kokkos
+git clone https://github.com/lanl/vpic-kokkos.git ~/src/vpic-kokkos
+git -C ~/src/vpic-kokkos checkout f01d2959   # the commit the benchmark data were made with
+git -C ~/src/vpic-kokkos submodule update --init --recursive
 cd ~/src/vpic-kokkos
 cmake -S . -B build-clio -DCMAKE_BUILD_TYPE=Release \
       -DENABLE_KOKKOS_CUDA=ON -DENABLE_KOKKOS_OPENMP=OFF \
