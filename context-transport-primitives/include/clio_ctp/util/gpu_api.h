@@ -154,7 +154,7 @@ __global__ void CtpCopyKernel(char *dst, const char *src, size_t n) {
 #endif
 
 // Defined after the class; GpuApi::Memcpy's SYCL branch routes through it.
-inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n);
+inline CTP_SO_LOCAL void DeviceAwareMemcpy(void *dst, const void *src, size_t n);
 
 class GpuApi {
  public:
@@ -796,7 +796,7 @@ class GpuApi {
   }
 
   template <typename T>
-  static bool IsDevicePointer(T *ptr) {
+  static CTP_SO_LOCAL bool IsDevicePointer(T *ptr) {
     if (ptr == nullptr) return false;
 #if CTP_ENABLE_ROCM
     // A failed attribute query means there is no usable GPU (no driver / no
@@ -855,7 +855,7 @@ class GpuApi {
    * pages read as host memory and every GPU path silently declines.
    */
   template <typename T>
-  static bool IsDeviceAccessiblePointer(T *ptr) {
+  static CTP_SO_LOCAL bool IsDeviceAccessiblePointer(T *ptr) {
     if (ptr == nullptr) return false;
 #if CTP_ENABLE_ROCM
     hipPointerAttribute_t a{};
@@ -1346,9 +1346,10 @@ class GpuApi {
  */
 /** Declared here because DeviceAwareMemcpy's SYCL branch needs it and the
  *  definition sits below. */
-inline bool IsDeviceAccessible(const void *ptr);
+inline CTP_SO_LOCAL bool IsDeviceAccessible(const void *ptr);
 
-inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
+inline CTP_SO_LOCAL void DeviceAwareMemcpy(void *dst, const void *src,
+                                           size_t n) {
   if (n == 0) return;
 #if CTP_ENABLE_CUDA
   // Fast path: when both pointers are plain host memory, use std::memcpy. The
@@ -1576,11 +1577,11 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
  *  hook. */
 /** True if a GPU may touch `ptr`: device OR managed memory. Prefer this over
  *  IsDevicePointer when deciding whether to take a GPU path. */
-inline bool IsDeviceAccessible(const void *ptr) {
+inline CTP_SO_LOCAL bool IsDeviceAccessible(const void *ptr) {
   return GpuApi::IsDeviceAccessiblePointer(const_cast<void *>(ptr));
 }
 
-inline bool IsDevicePointer(const void *ptr) {
+inline CTP_SO_LOCAL bool IsDevicePointer(const void *ptr) {
   return GpuApi::IsDevicePointer(const_cast<void *>(ptr));
 }
 
