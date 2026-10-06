@@ -36,7 +36,7 @@ the reason.
 | 809 | fixed here | Root cause found on Linux with strace: the VOL connector closes synchronously, but the runtime's bdev health poll ran popen("df ..."), forking a shell that inherited the .h5 descriptor (HDF5 opens without O_CLOEXEC) and so its flock, which outlived H5Fclose. Device lookup now stat/statfs-based (89f8617fd): no execve during a VOL test (was sh/df/tail/awk), same device as df. Locking mitigation removed in a separate commit; macOS confirmation is CI-only. |
 | 848 | no longer occurring | Causes fixed on dev: RwLock reader/writer overlap (cebb678bb, #927), DLL-copy race, detached_spawn. The remaining startup-wedge signature ('inline retry exhausted' / 'RouteLocal returned 4') appears in 0 of the last 35 Windows CI runs; the only test failure in that window was cr_safe_bdev_disk_fail_tests on gpu-vector-rewrite, i.e. the #1156 YAML bug fixed here. |
 | 853 | fixed on dev | Cluster Tests run 37173255855 passes both steps. |
-| 856 | partly fixed on dev | PR #918; remaining SIGSEGV tracked in #929; needs the leader_elect docker harness. |
+| 856 | fixed on dev | leader_elect 4-node docker harness: 6/6 pass, all four node runtimes alive after the restart phase in every run (the crash used to hit node2 10/10). CI step re-enabled here. |
 | 863 | fixed on dev | Data loss fixed by 756097c94 (place the new copy before freeing the old). Hazard 2 (drift) re-tested with the issue's own repro (kRounds=4, churn burst 8): 2 runs x 4 rounds, every fill-to-brim + reorganize round succeeded; the churn trigger (blob layout seen empty mid-move) never fires any more because place-then-swap removed that window. |
 | 877 | in progress elsewhere | Asks 1 and 3 on dev; fail-closed ServerInit is uncommitted in the jaime-issues checkout (another agent). |
 | 882 | no longer occurring | Same window as #848: the icx (windows-2025) leg's only failure in 35 runs was cr_safe_bdev_disk_fail_tests (#1156 YAML, fixed here); no wedge, no flake. |
@@ -47,7 +47,7 @@ the reason.
 | 919 | fixed on dev | PRs #920, #932. |
 | 924 | fixed on dev | 499b7c2fb (PR #932). |
 | 927 | fixed on dev | cebb678bb (PR #1032). |
-| 929 | partly fixed on dev | A, D fixed; B (leader recovery SIGSEGV) open, needs the 4-node harness. |
+| 929 | fixed on dev (class B) | A/D fixed earlier; class B (leader-election node SIGSEGV) no longer reproduces: 6/6 runs, no node crash. Cluster-tests leader_elect step re-enabled here. Local runs used 4 threads / 256 MB segments to fit the docker VM. |
 | 991 | needs repro | No 1800 s hang in recent macOS runs; `cr_shutdown_bt_churn` fails fast instead. |
 | 995 | open (needs FUSE repro) | Candidate 002b51b4d is a no-op: since #1007 an open sieve page counts in `pending_count_`, so the early return never skipped one. Added a contract test (422596b40) that AwaitPendingPuts drains an open page. |
 | 1000 | fixed on dev | 3c2f493de. |
