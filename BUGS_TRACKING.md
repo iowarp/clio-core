@@ -54,9 +54,9 @@ the reason.
 | 1028 | open | FUSE O_DIRECT/page-cache coherence; design-sized (#1060 §3.3). |
 | 1029 | open | Hypothesis: rmdir lacks the closer barrier; issue requires a CI-verified fix. |
 | 1030 | fixed on dev | bfae06809, 1ae09daef, 79b0b2ea5, 13ee44409. Acceptance loop run here: `cte_replication_persist_integration` 20/20 passed. |
-| 1039 | not recurring | No coherence timeout on dev since 09-26. |
+| 1039 | reproduced; fix in progress | 4-node coherence harness (memory-reduced): 9/10 pass in ~26 s, 1/10 hangs: a node stalls at startup, its barrier reads fail, and rank 0's client task (pool 563 method 14) never completes even after the runtime marks the node dead and completes the timed-out replica -- the failure does not propagate to the client. Root-cause agent working on it. |
 | 1049 | fixed on dev | d1dbb516f + 297bf813a. |
-| 1050 | open | Windows + pytest crash, no repro on current dev. |
+| 1050 | does not reproduce | Native Windows Debug build + Python 3.13 extension: a daemon + CTE client put/get flow (4 tags x 200 round trips, then stop) hosted by pytest with default fd capture 5/5 clean, with -s 3/3, bare script 3/3; daemon exit 0x0 every time, never 0xC0000409. The reported daemon-side crash loop fits the restart-on-corrupt-restore crash fixed by 3d7554a15 (#725) and the Windows bdev offset bug (#1059); confirming against clio-agent's own suite is still worthwhile. |
 | 1059 | fixed on dev | 7118e904d + 3d7554a15. |
 | 1096 | fixed on dev + here | 4bafb3c68; leftover `clio_init`/`clio_finalize` GIL release in fcd79070d (checked: a Python thread keeps running while clio_init blocks). |
 | 1100 | fixed on dev | 7118e904d. |
