@@ -6,7 +6,7 @@
 # k-means iteration after every timed read; the k-means check after each
 # configuration; then the compare CSVs and the configuration figure.
 #
-#   [CONFIGS="1x1 2x8 4x8 8x8"] run_workload_bench.sh DATASET W COST_BW READS FIG_DIR
+#   [CONFIGS="1x1 2x8 4x8 8x8"] [REFS=km10b1gp1i1,...] run_workload_bench.sh DATASET W COST_BW READS FIG_DIR
 #
 # W        cost weights w_ct,w_dt,w_io (e.g. 1,4,5)
 # COST_BW  cost-model bandwidth in bytes per ms (1000000 = 1 GB/s)
@@ -29,11 +29,11 @@ WL=w${W//,/-}
 mkdir -p "$FIG"
 say() { echo "$(date +%T) $*" | tee -a "$LOG"; }
 say "start $DS: W=$W bw=$BWL GB/s reads=$READS configs=$CONFIGS"
-refs=""
+refs=${REFS:-}   # earlier configurations to compare with (tag prefixes, comma list)
 for c in $CONFIGS; do
   p=${c%x*}; i=${c#*x}
   say "config ${p}x${i}"
-  ( cd "$HERE" && COST_BW=$COST_BW READS=$READS FIG_DIR=$FIG PROCS=$p INFLIGHT=$i \
+  ( cd "$HERE" && env COST_BW=$COST_BW READS=$READS FIG_DIR=$FIG PROCS=$p INFLIGHT=$i \
       ${refs:+REF_TAG=$refs} ./run_kmeans_parallel.sh "$DS" "$W" ) \
       > "$RUNS/${DS}_${p}x${i}_bench.out" 2>&1 || say "config ${p}x${i}: run FAILED"
   "$HERE/check_kmeans.sh" "$DS" "${PREFIX}p${p}i${i}$WL" "$p" "$READS" >> "$LOG" 2>&1 \
