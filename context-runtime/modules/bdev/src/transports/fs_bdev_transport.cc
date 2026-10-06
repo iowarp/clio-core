@@ -3,6 +3,7 @@
  * All rights reserved.
  */
 
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cstdio>
@@ -15,6 +16,10 @@
 #include <clio_runtime/worker.h>
 #include <clio_runtime/work_orchestrator.h>
 #include <fcntl.h>
+#include <unistd.h>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace clio::run::bdev {
 
@@ -73,6 +78,85 @@ std::unique_ptr<ctp::AsyncIO> OpenBackingFile(clio::run::u32 io_depth,
     return io;
   }
   return nullptr;
+}
+
+/** True when CLIO_BDEV_IO_DIAG=1: check every completed read (a diagnostic,
+ *  DEFAULT OFF; it reads every block a second time). */
+bool BdevIoDiag() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_BDEV_IO_DIAG");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
+  return on;
+}
+
+/** @return the number of bytes that differ between a and b. */
+size_t CountDiff(const char *a, const char *b, size_t n, size_t *first) {
+  size_t diff = 0;
+  *first = n;
+  if (std::memcmp(a, b, n) == 0) return 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (a[i] != b[i]) {
+      if (*first == n) *first = i;
+      ++diff;
+    }
+  }
+  return diff;
+}
+
+/**
+ * @brief Diagnostic: compare the bytes of a read the async I/O reported
+ * complete with a second, synchronous read of the same range.
+ *
+ * A difference that is gone 2 ms later means the data landed in the buffer
+ * after the completion was reported. Mismatches and short transfers are
+ * printed on stderr ("[bdev-io-diag]") with the file offset, the length,
+ * whether the read took the O_DIRECT path (4 KiB-aligned buffer and size),
+ * and the differing byte counts; every 2000 reads a running total.
+ *
+ * @param path   the backing file
+ * @param buf    the buffer the async read filled
+ * @param asked  bytes requested
+ * @param got    bytes the completion reported
+ * @param off    file offset of the read
+ */
+void DiagCheckRead(const std::string &path, const char *buf, size_t asked,
+                   size_t got, off_t off) {
+  static std::atomic<unsigned long long> reads{0};
+  static std::atomic<unsigned long long> mismatched{0};
+  const bool direct =
+      reinterpret_cast<uintptr_t>(buf) % 4096 == 0 && asked % 4096 == 0;
+  if (got != asked) {
+    std::fprintf(stderr,
+                 "[bdev-io-diag] SHORT READ off=%lld asked=%zu got=%zu "
+                 "direct=%d\n",
+                 static_cast<long long>(off), asked, got, direct ? 1 : 0);
+  }
+  std::vector<char> ref(got);
+  const int fd = open(path.c_str(), O_RDONLY);
+  const ssize_t n = fd >= 0 ? pread(fd, ref.data(), got, off) : -1;
+  if (fd >= 0) close(fd);
+  const unsigned long long r = reads.fetch_add(1) + 1;
+  if (n == static_cast<ssize_t>(got)) {
+    size_t first = 0;
+    const size_t diff = CountDiff(buf, ref.data(), got, &first);
+    if (diff != 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      size_t first2 = 0;
+      const size_t diff2 = CountDiff(buf, ref.data(), got, &first2);
+      const unsigned long long m = mismatched.fetch_add(1) + 1;
+      std::fprintf(stderr,
+                   "[bdev-io-diag] READ MISMATCH off=%lld len=%zu direct=%d "
+                   "buf=%p diff=%zu first=%zu diff_after_2ms=%zu "
+                   "(mismatch %llu of %llu reads)\n",
+                   static_cast<long long>(off), got, direct ? 1 : 0,
+                   static_cast<const void *>(buf), diff, first, diff2, m, r);
+    }
+  }
+  if (r % 2000 == 0) {
+    std::fprintf(stderr, "[bdev-io-diag] %llu reads checked, %llu mismatched\n",
+                 r, mismatched.load());
+  }
 }
 
 }  // namespace
@@ -453,6 +537,11 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
 
     clio::run::u64 actual_bytes = std::min(
         static_cast<clio::run::u64>(result.bytes_transferred), block_read_size);
+    if (BdevIoDiag()) {
+      DiagCheckRead(file_path_, static_cast<const char *>(block_data),
+                    block_read_size, actual_bytes,
+                    static_cast<off_t>(block.offset_));
+    }
     total_bytes_read += actual_bytes;
     data_offset += actual_bytes;
   }

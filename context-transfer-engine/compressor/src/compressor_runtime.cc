@@ -133,6 +133,73 @@ inline bool NeuroPressReuseStagedH2D() {
   return on;
 }
 
+/** True when CLIO_NEUROPRESS_CHECK_STAGED=1: compare every staged device
+ *  copy with its host source after the chunk is stored. A diagnostic,
+ *  DEFAULT OFF (it adds a device-to-host copy and a compare per chunk). */
+inline bool NeuroPressCheckStaged() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_NEUROPRESS_CHECK_STAGED");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
+  return on;
+}
+
+/**
+ * @brief Diagnostic: compare the staged device copy of a chunk with the host
+ * bytes it was copied from, after the chunk was stored.
+ *
+ * A difference means something wrote into the staged device block between
+ * the host-to-device copy and this check -- for a chunk stored raw, the
+ * stored bytes come from that block. Each mismatch is printed on stderr
+ * ("[staged-check] MISMATCH") with the blob, whether it was stored raw, the
+ * first differing offset, the number of differing bytes, the device address
+ * and the time since the staging copy; every 200 checks a running total is
+ * printed.
+ *
+ * @param blob         blob name, for the report
+ * @param staged       the device copy DynamicSchedule made
+ * @param host         the host bytes the copy was made from
+ * @param bytes        chunk size in bytes
+ * @param stored_raw   true when the chunk was stored uncompressed
+ * @param h2d_start_ns steady-clock time of the staging copy, in ns
+ */
+static void CheckStagedAgainstHost(const std::string &blob, const void *staged,
+                            const void *host, size_t bytes, bool stored_raw,
+                            double h2d_start_ns) {
+  static std::atomic<unsigned long long> checked{0};
+  static std::atomic<unsigned long long> mismatched{0};
+  thread_local std::vector<char> copy;
+  copy.resize(bytes);
+  ctp::DeviceAwareMemcpy(copy.data(), staged, bytes);
+  const char *h = static_cast<const char *>(host);
+  size_t first = bytes;
+  size_t diff = 0;
+  if (std::memcmp(copy.data(), h, bytes) != 0) {
+    for (size_t i = 0; i < bytes; ++i) {
+      if (copy[i] != h[i]) {
+        if (first == bytes) first = i;
+        ++diff;
+      }
+    }
+  }
+  const unsigned long long n = checked.fetch_add(1) + 1;
+  if (diff != 0) {
+    const double now_ns = static_cast<double>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const unsigned long long m = mismatched.fetch_add(1) + 1;
+    std::fprintf(stderr,
+                 "[staged-check] MISMATCH blob=%s raw=%d first_diff=%zu "
+                 "diff_bytes=%zu of %zu dev=%p since_h2d_ms=%.3f "
+                 "(mismatch %llu, %llu checked)\n",
+                 blob.c_str(), stored_raw ? 1 : 0, first, diff, bytes, staged,
+                 (now_ns - h2d_start_ns) / 1e6, m, n);
+  }
+  if (n % 200 == 0) {
+    std::fprintf(stderr, "[staged-check] %llu checked, %llu mismatched\n", n,
+                 mismatched.load());
+  }
+}
+
 inline bool NeuroPressRequireDevice() {
   static const bool on = [] {
     const char *e = std::getenv("CLIO_NEUROPRESS_REQUIRE_DEVICE");
@@ -1631,6 +1698,15 @@ clio::run::TaskResume Runtime::DynamicSchedule(
     task->context_ = compress_task->context_;
     task->tier_score_ = compress_task->tier_score_;
     task->return_code_ = compress_task->return_code_;
+    // CLIO_NEUROPRESS_CHECK_STAGED: the chunk is stored (no deferral without
+    // exploration), so the staged copy must still equal its host source.
+    if (NeuroPressCheckStaged() && !defer_store && !h2d_alloc.IsNull() &&
+        host_chunk_src != nullptr) {
+      CheckStagedAgainstHost(task->blob_name_.str(), chunk_data,
+                             host_chunk_src, chunk_size,
+                             task->context_.compress_lib_ == 0,
+                             ds_h2d_start_ns);
+    }
 
     CLIO_PATH_TRACE(
         "4 primary  %s ran lib=%d (%s) -- MEASURED ratio=%.2f ct=%.3f ms "
