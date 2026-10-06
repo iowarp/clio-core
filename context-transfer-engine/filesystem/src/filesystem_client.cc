@@ -339,7 +339,10 @@ int Client::ReaddirPath(const std::string &raw_path, std::vector<std::string> *o
   auto t = AsyncReaddir(path);
   t.Wait();
   if (t->GetReturnCode() != 0) {
-    errno = ENOENT;
+    // Pass the server's errno through: a listing that failed (EAGAIN, EIO)
+    // is not a missing directory (#1029).
+    const clio::run::u32 rc = t->GetReturnCode();
+    errno = rc < 4096 ? static_cast<int>(rc) : EIO;  // runtime codes -> EIO
     return -1;
   }
   out->clear();

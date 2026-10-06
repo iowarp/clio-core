@@ -2338,7 +2338,11 @@ int cte_fuse_readdir(const char *path, void *buf,
   auto t = cfs->AsyncReaddir(p);
   t.Wait();
   if (t->GetReturnCode() != 0) {
-    return 0;
+    // Never report a listing that failed as an empty directory: rm -r
+    // would unlink nothing and its rmdir would then fail ENOTEMPTY (#1029).
+    HLOG(kError, "clio_cte_fuse: readdir of {} failed (rc {})", p,
+         t->GetReturnCode());
+    return FsErrno(t->GetReturnCode());
   }
   size_t prefix_len = p.size();
   if (!p.empty() && p.back() != '/') prefix_len++;
@@ -2423,6 +2427,25 @@ int cte_fuse_rmdir(const char *path) {
   auto t = cfs->AsyncRmdir(std::string(path));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());  // 0/ENOTEMPTY/ENOENT/EIO
+  if (rc == ENOTEMPTY) {
+    // #1029: say what the directory still holds that a listing hides
+    // (.fuse_hidden names, pending/leaving entries) -- the server logs the
+    // block contents for the same rmdir.
+    auto l = cfs->AsyncReaddir(std::string(path));
+    l.Wait();
+    size_t shown = 0;
+    if (l->GetReturnCode() == 0) {
+      for (size_t i = 0; i < l->entries_.size(); ++i) {
+        const std::string e = l->entries_[i].str();
+        if (e.find("/.fuse_hidden") == std::string::npos) ++shown;
+      }
+    }
+    if (shown == 0) {
+      HLOG(kError, "clio_cte_fuse: rmdir {}: ENOTEMPTY but its listing "
+           "(rc {}, {} raw entries) shows no child", path,
+           l->GetReturnCode(), l->entries_.size());
+    }
+  }
   return FsErrno(rc);
 }
 
