@@ -735,6 +735,63 @@ bool PoolManager::RegisterRemotePool(PoolId pool_id,
   return EnsureStaticContainer(pool_id).IsValid();
 }
 
+u64 PoolManager::BeginCreate(const std::string &pool_name,
+                             const std::string &chimod_name) {
+  std::lock_guard<std::mutex> lock(creates_mu_);
+  const u64 handle = next_create_++;
+  creates_[handle] = {pool_name, chimod_name, std::chrono::steady_clock::now()};
+  return handle;
+}
+
+void PoolManager::EndCreate(u64 handle) {
+  std::lock_guard<std::mutex> lock(creates_mu_);
+  creates_.erase(handle);
+}
+
+std::string PoolManager::DescribeCreatesInProgress() const {
+  std::vector<std::pair<u64, std::string>> parts;
+  const auto now = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(creates_mu_);
+    for (const auto &kv : creates_) {
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now - kv.second.start_)
+                          .count();
+      parts.emplace_back(kv.first, "creating '" + kv.second.pool_name_ +
+                                       "' (" + kv.second.chimod_ + ") for " +
+                                       std::to_string(ms) + " ms");
+    }
+  }
+  std::sort(parts.begin(), parts.end());
+  std::string out;
+  for (const auto &p : parts) {
+    out += (out.empty() ? "" : "; ") + p.second;
+  }
+  return out;
+}
+
+namespace {
+/** Keeps a pool create listed in PoolManager while CreatePool runs (#1180). */
+class CreateInProgressGuard {
+ public:
+  /**
+   * @param pm the pool manager
+   * @param pool_name the pool being created
+   * @param chimod_name its module
+   */
+  CreateInProgressGuard(PoolManager *pm, const std::string &pool_name,
+                        const std::string &chimod_name)
+      : pm_(pm), handle_(pm->BeginCreate(pool_name, chimod_name)) {}
+  ~CreateInProgressGuard() { pm_->EndCreate(handle_); }
+  CreateInProgressGuard(const CreateInProgressGuard &) = delete;
+  CreateInProgressGuard &operator=(const CreateInProgressGuard &) = delete;
+
+ private:
+  PoolManager *pm_;
+  u64 handle_;
+};
+}  // namespace
+
 TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {
@@ -762,6 +819,8 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   const std::string chimod_name = create_task->chimod_name_.str();
   const std::string pool_name = create_task->pool_name_.str();
   const std::string chimod_params = create_task->chimod_params_.str();
+  // Listed until this coroutine ends, so a stall report can name the pool.
+  CreateInProgressGuard in_progress(this, pool_name, chimod_name);
 
   // Set num_containers equal to number of nodes in the cluster
   auto* ipc_manager = CLIO_IPC;

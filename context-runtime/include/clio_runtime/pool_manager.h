@@ -331,6 +331,29 @@ class PoolManager {
    */
   TaskResume CreatePool(clio::run::shared_ptr<Task> &task);
 
+  /**
+   * Record that a pool create has started (issue #1180). Paired with
+   * EndCreate; CreatePool does both through a scope guard.
+   * @param pool_name the pool being created
+   * @param chimod_name its module
+   * @return a handle for EndCreate
+   */
+  u64 BeginCreate(const std::string &pool_name, const std::string &chimod_name);
+
+  /**
+   * Record that a pool create has finished, however it ended.
+   * @param handle the value BeginCreate returned
+   */
+  void EndCreate(u64 handle);
+
+  /**
+   * Describe every pool create still in progress, oldest first, for a stall
+   * report: a stalled GetOrCreatePool otherwise names only its method, not
+   * which pool it is creating (issue #1180). Safe from any thread.
+   * @return e.g. "creating 'cte_main' (clio_cte_core) for 297321 ms", or ""
+   */
+  std::string DescribeCreatesInProgress() const;
+
 
   /**
    * Destroy a complete pool including metadata and local containers
@@ -448,6 +471,16 @@ class PoolManager {
   void SetReplayingPools(bool v) { replaying_pools_ = v; }
 
  private:
+  /** One pool create in progress (issue #1180). */
+  struct CreateInProgress {
+    std::string pool_name_;  /**< pool being created */
+    std::string chimod_;     /**< its module */
+    std::chrono::steady_clock::time_point start_;  /**< when it began */
+  };
+  mutable std::mutex creates_mu_;  /**< guards creates_ and next_create_ */
+  std::unordered_map<u64, CreateInProgress> creates_;  /**< by handle */
+  u64 next_create_ = 1;  /**< next BeginCreate handle */
+
   bool replaying_pools_ = false;
   /**
    * Internal: Get a DynamicContainer by PoolId and ContainerId (no fallback to
