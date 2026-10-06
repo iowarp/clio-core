@@ -1,0 +1,2 @@
+file,bytes,algorithm,settings,comp_bytes,comp_ms,comp_wall_ms,decomp_ms,decomp_wall_ms,reps,batch,ok,note
+float32_gamma_w10_p950_linear_1mb.bin,1048576,spspeed,shuffle=byte,966798,0.051520000000000003,0.067607,0.062911999999999996,0.093519000000000005,3,1,1,"remeasured: compress failed once in the full run, not reproducible"

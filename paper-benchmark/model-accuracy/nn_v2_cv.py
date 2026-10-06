@@ -314,7 +314,7 @@ def accuracy_rows(model, fold, pred, true, data, test):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--csv", default="/mnt/nvme0/corpus-sweep/corpus_v2.csv")
+    ap.add_argument("--csv", default=os.path.join(HERE, "nn-v2-training", "corpus_v2.csv.xz"))
     ap.add_argument("--out", default=os.path.join(HERE, "..", "codec-sweep", "results", "nn-v2"))
     ap.add_argument("--pred-out", default="/mnt/nvme0/corpus-sweep/nn-v2/cv_predictions.npz")
     ap.add_argument("--folds", type=int, default=5)

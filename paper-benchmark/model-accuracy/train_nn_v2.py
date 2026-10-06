@@ -169,7 +169,7 @@ def numpy_forward(path, x_raw):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--csv", default="/mnt/nvme0/corpus-sweep/corpus_v2.csv")
+    ap.add_argument("--csv", default=os.path.join(HERE, "nn-v2-training", "corpus_v2.csv.xz"))
     ap.add_argument("--out-dir", default=os.path.join(
         REPO, "context-transport-primitives", "src", "compress", "model", "weights", "v2"))
     ap.add_argument("--cv-dir", default=os.path.join(HERE, "..", "codec-sweep", "results", "nn-v2"))

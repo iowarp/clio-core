@@ -1,0 +1,50 @@
+# Lossless settings for the float32 synthetic corpus (NN v2 training): every codec, at most two
+# parameter variants per codec, each with no shuffle, 4-byte byte shuffle and 32-bit
+# bit shuffle (LZ4 bitshuffle and ANS float16 unshuffled, as in the 139 grid). Where a codec
+# has more than two variants, the pair closest to its best variant over all 19 datasets.
+# GDeflate and Deflate: level 1 only (level 5 compresses 30-60x slower; user choice).
+store
+lz4
+lz4 shuffle=byte
+lz4 type=int bitshuffle=msb
+snappy
+snappy shuffle=byte
+zstd
+zstd shuffle=byte
+zstd shuffle=bit
+gdeflate level=1
+gdeflate level=1 shuffle=byte
+deflate level=1
+ans
+ans type=float16
+ans shuffle=byte
+cascaded type=int rle=1 delta=0 bp=1
+cascaded type=int rle=0 delta=0 bp=1
+bitcomp type=int
+bitcomp algo=1 type=char
+ndzip
+gpulz
+spspeed
+spratio
+lz4 shuffle=bit
+snappy shuffle=bit
+gdeflate level=1 shuffle=bit
+deflate level=1 shuffle=byte
+deflate level=1 shuffle=bit
+ans shuffle=bit
+cascaded type=int rle=1 delta=0 bp=1 shuffle=byte
+cascaded type=int rle=1 delta=0 bp=1 shuffle=bit
+cascaded type=int rle=0 delta=0 bp=1 shuffle=byte
+cascaded type=int rle=0 delta=0 bp=1 shuffle=bit
+bitcomp type=int shuffle=byte
+bitcomp type=int shuffle=bit
+bitcomp algo=1 type=char shuffle=byte
+bitcomp algo=1 type=char shuffle=bit
+ndzip shuffle=byte
+ndzip shuffle=bit
+gpulz shuffle=byte
+gpulz shuffle=bit
+spspeed shuffle=byte
+spspeed shuffle=bit
+spratio shuffle=byte
+spratio shuffle=bit

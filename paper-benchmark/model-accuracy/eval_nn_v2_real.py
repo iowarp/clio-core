@@ -128,7 +128,7 @@ def main():
     ap.add_argument("--chunk", type=int, default=4 << 20)
     ap.add_argument("--limit", type=int, default=0, help="first N chunks only")
     ap.add_argument("--model", default=WEIGHTS)
-    ap.add_argument("--stats", default="/mnt/nvme0/synthetic-9800-stats.csv")
+    ap.add_argument("--stats", default=os.path.join(HERE, "nn-v2-training", "synthetic-9800-stats.csv.xz"))
     ap.add_argument("--out", default=os.path.join(HERE, "..", "codec-sweep", "results", "nn-v2"))
     a = ap.parse_args()
     meta = json.load(open(os.path.splitext(a.model)[0] + ".json"))
