@@ -18,7 +18,7 @@ the reason.
 |---|---|---|
 | 363 | fixed here | Stale `WRP_` flag names in installers (189f41bd0) + `installers/check_flag_names.mjs` regression check. |
 | 503 | open (test debt) | `TEMP-DISABLED (#503)` assertion; needs a routing or test-design decision and the 4-node docker suite. |
-| 579 | in verification | Root cause (exit-time `zmq_ctx_term` hang) fixed on dev by d7598a6e4/#627; the CI `-E` exclusion is stale. Looping both tests 20x before dropping it. |
+| 579 | fixed on dev; CI exclusion dropped here | Root cause (exit-time `zmq_ctx_term` hang) fixed by d7598a6e4/#627. Both tests ran 20x each locally (Debug) with no hang; 12916cfd9 re-enables them in the leak-check job (not run locally under that preset). |
 | 597 | mostly fixed on dev | B1 d33aff8fb, B2 60f89b980/3e5126dbb, fsx 38a8174a4/ccc6328bf, mmap/timestamps/inode numbers landed. Left: exportfs (feature). |
 | 641 | obsolete | The fallback-runtime feature was removed; its tests only exist with `CLIO_CORE_ENABLE_RUNTIME_FALLBACK=ON`. Nothing to fix. |
 | 646 | fixed here | BuddyAllocator never merged adjacent free pages, so a mostly-free heap failed 1 MB requests (894 MB churn -> null). Now coalesces free pages before failing. All three hidden `[fuse_repro]` cases pass (also the ProducerConsumerAllocator one: 2910 nulls -> 0) and are un-hidden (~1 s). |
