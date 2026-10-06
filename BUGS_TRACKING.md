@@ -49,10 +49,10 @@ the reason.
 | 927 | fixed on dev | cebb678bb (PR #1032). |
 | 929 | fixed on dev (class B) | A/D fixed earlier; class B (leader-election node SIGSEGV) no longer reproduces: 6/6 runs, no node crash. Cluster-tests leader_elect step re-enabled here. Local runs used 4 threads / 256 MB segments to fit the docker VM. |
 | 991 | needs repro | No 1800 s hang in recent macOS runs; `cr_shutdown_bt_churn` fails fast instead. |
-| 995 | open (needs FUSE repro) | Candidate 002b51b4d is a no-op: since #1007 an open sieve page counts in `pending_count_`, so the early return never skipped one. Added a contract test (422596b40) that AwaitPendingPuts drains an open page. |
+| 995 | likely fixed on dev | FUSE in a privileged container: concurrent growing-file writers (4 KiB-1 MiB chunks, 1 and 4 workers) 0 bad chunks; kernel shallow clone through the mount + git fsck clean; 64 MiB restart test clean in all 4 modes. Matches 7834cd773 (parallel puts creating the same blob lost leading blocks). Original report was aarch64 (not testable here). |
 | 1000 | fixed on dev | 3c2f493de. |
-| 1028 | open | FUSE O_DIRECT/page-cache coherence; design-sized (#1060 §3.3). |
-| 1029 | open | Hypothesis: rmdir lacks the closer barrier; issue requires a CI-verified fix. |
+| 1028 | does not reproduce here | 900+ runs of the generic/729 case (pinned CPU, hogs, random handler delays) and ~8 harness rounds of 209/451/647/729: all pass. Host kernel is WSL 6.6; FUSE direct-I/O semantics changed in 6.8+ (what CI runs) -- needs a 6.8+ host to reproduce. |
+| 1029 | not reproduced; real adjacent defect found | 60 runs with the CI seed + 18 heavier randomized-delay runs: clean. CloserBarrier hypothesis refuted (nothing on the closer queue adds dir entries by default). Found: cte_fuse_readdir returns success with an EMPTY listing when the server Readdir fails (fuse_cte.cc ~2316), which makes rm -rf skip entries and rmdir fail ENOTEMPTY -- exactly the symptom. Fail-loud patch prepared. |
 | 1030 | fixed on dev | bfae06809, 1ae09daef, 79b0b2ea5, 13ee44409. Acceptance loop run here: `cte_replication_persist_integration` 20/20 passed. |
 | 1039 | reproduced; fix in progress | 4-node coherence harness (memory-reduced): 9/10 pass in ~26 s, 1/10 hangs: a node stalls at startup, its barrier reads fail, and rank 0's client task (pool 563 method 14) never completes even after the runtime marks the node dead and completes the timed-out replica -- the failure does not propagate to the client. Root-cause agent working on it. |
 | 1049 | fixed on dev | d1dbb516f + 297bf813a. |
