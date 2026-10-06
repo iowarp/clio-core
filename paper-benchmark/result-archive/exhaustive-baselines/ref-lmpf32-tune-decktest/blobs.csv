@@ -1,5 +1,0 @@
-blob,bytes,fnv1a64,lib,codec,ratio,stored,compress_ms,preproc_ms,h2d_ms,decompress_ms,rc,stored_ratio
-fields/00000__position_step_0_chunk_0.bin__c0000__dt-f32/chunk_0,196608,cc11a711f7e3eea5,0,raw(not-beneficial),1,196608,0,0,0,-1,0,1
-fields/00001__position_step_10_chunk_0.bin__c0000__dt-f32/chunk_0,196608,87629ddc52c4f7bd,0,raw(not-beneficial),1,196608,0,0,0,-1,0,1
-fields/00002__position_step_20_chunk_0.bin__c0000__dt-f32/chunk_0,196608,a26498e04eb8412,0,raw(not-beneficial),1,196608,0,0,0,-1,0,1
-fields/00003__position_step_30_chunk_0.bin__c0000__dt-f32/chunk_0,196608,91584110233713a0,0,raw(not-beneficial),1,196608,0,0,0,-1,0,1

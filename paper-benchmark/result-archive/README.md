@@ -5,8 +5,8 @@ not lost. Only CSV tables; files over 512 KiB are xz-compressed (`.csv.xz`;
 `xz -d` restores them, pandas reads them directly). No simulation data and no
 stored chunks.
 
-- `exhaustive-baselines/<workload>/`: the exhaustive search of every workload
-  and tuning probe (all 45 settings on every chunk): `v2_measured.csv`
+- `exhaustive-baselines/<workload>/`: the exhaustive search of the Nyx, VPIC,
+  WarpX and incflo workloads and their tuning probes (all 45 settings on every chunk): `v2_measured.csv`
   (compress / decompress time and ratio per chunk and setting), `v2_pred.csv`
   (model inputs and predictions per chunk), `blobs.csv`, `candidates.csv`,
   `phases.csv`. The best single codec, the oracle map and every "possible
