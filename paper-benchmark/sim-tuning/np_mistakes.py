@@ -18,6 +18,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model-accuracy"))
 import replay_learning as rl  # noqa: E402
+import probe_eval as pe  # noqa: E402
 
 
 def main():
@@ -31,8 +32,7 @@ def main():
     rec, preds, _ = rl.replay(a.dataset, "nlms", a.lr, thr=rl.MAPE_THRESHOLD if a.lr else np.inf, data=data)
     n = np.arange(len(rec))
     r = rec.assign(pick_name=[names[k] for k in rec.pick],
-                   field=[re.search(r"comp\d+_([A-Za-z_0-9]+)\.", b).group(1) if "comp" in b else "?"
-                          for b in rec.blob],
+                   field=[pe.field(b) for b in rec.blob],
                    extra=rec.cost_pick - cost[n, bf])
     tot = np.nansum(cost[:, bf])
     print(f"{a.dataset}: best single {names[bf]} {tot:.0f} ms; NeuroPress extra {r.extra.sum():+.0f} ms "
@@ -47,6 +47,11 @@ def main():
               f"pred/meas ratio {rp:6.2f}  measured ratio {np.median(meas[i, k, 2]):5.2f} "
               f"vs {names[bf]} {np.median(meas[i, bf, 2]):5.2f}")
     print(r.groupby("field").extra.sum().sort_values(ascending=False).round(1).to_string())
+    top = g.head(4).index
+    t = r[r.pick_name.isin(top)].pivot_table(index="field", columns="pick_name", values="extra",
+                                             aggfunc="sum", fill_value=0.0)
+    print("extra ms by field and pick (the 4 costliest picks):")
+    print(t.round(1).to_string())
 
 
 if __name__ == "__main__":

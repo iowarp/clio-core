@@ -1,0 +1,62 @@
+diff --git a/src/prob/prob_init_fluid.cpp b/src/prob/prob_init_fluid.cpp
+index 73f631a..b898140 100644
+--- a/src/prob/prob_init_fluid.cpp
++++ b/src/prob/prob_init_fluid.cpp
+@@ -664,6 +664,28 @@ void incflo::init_rayleigh_taylor (Box const& vbx, Box const& /*gbx*/,
+ #elif (AMREX_SPACEDIM == 3)
+ 
+     const Real splity = Real(0.5)*(problo[1] + probhi[1]);
++
++    // Layered tracer (NeuroPress benchmark): prob.tracer_layers > 0 replaces
++    // the tanh tracer by z-layers that alternate between "clumpy" (each
++    // block of prob.tracer_block cells holds one of prob.tracer_nphase
++    // power-of-two values, picked by a fixed hash) and "smooth"
++    // (exp(prob.smooth_amp * wave), wave number prob.smooth_k). The density
++    // and the flow are unchanged; the flow carries and mixes the tracer.
++    // Each tracer component (incflo.ntrac) gets its own hash; odd components
++    // swap the clumpy and smooth layers.
++    int tracer_layers = 0, tracer_nphase = 8, tracer_block = 4, smooth_k = 1;
++    Real smooth_amp = Real(1.0);
++    {
++        ParmParse ppp("prob");
++        ppp.query("tracer_layers", tracer_layers);
++        ppp.query("tracer_nphase", tracer_nphase);
++        ppp.query("tracer_block", tracer_block);
++        ppp.query("smooth_amp", smooth_amp);
++        ppp.query("smooth_k", smooth_k);
++    }
++    const Real L_y = probhi[1] - problo[1];
++    const Real L_z = probhi[2] - problo[2];
++
+     ParallelFor(vbx, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+     {
+         vel(i,j,k,0) = Real(0.0);
+@@ -679,6 +701,28 @@ void incflo::init_rayleigh_taylor (Box const& vbx, Box const& /*gbx*/,
+ 
+         density(i,j,k) = rho_1 + (Real(0.5)*(rho_2-rho_1))*(Real(1.0)+std::tanh((z-pertheight)/width));
+         tracer(i,j,k)  = tra_1 + (Real(0.5)*(tra_2-tra_1))*(Real(1.0)+std::tanh((z-pertheight)/width));
++        if (tracer_layers > 0) {
++            const int layer = amrex::min(int((z - problo[2]) / L_z * Real(tracer_layers)),
++                                         tracer_layers - 1);
++            // component n: its own clump hash and the opposite layer order for odd n
++            for (int n = 0; n < tracer.nComp(); ++n) {
++                if ((layer + n) % 2 == 0) {
++                    // clumpy: power-of-two level from a hash of the block index
++                    unsigned int h = unsigned(i / tracer_block) * 73856093u
++                                   ^ unsigned(j / tracer_block) * 19349663u
++                                   ^ unsigned(k / tracer_block) * 83492791u
++                                   ^ unsigned(n) * 2654435761u;
++                    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
++                    tracer(i,j,k,n) = std::ldexp(Real(1.0), int(h % unsigned(tracer_nphase)) - 3);
++                } else {
++                    const Real ph = Real(0.25) * Real(n);
++                    const Real w = std::sin(Real(2.0)*pi*(Real(smooth_k)*(x - problo[0])/L_x + ph))
++                                 * std::sin(Real(2.0)*pi*Real(smooth_k)*(y - problo[1])/L_y)
++                                 + Real(0.5)*std::sin(Real(2.0)*pi*Real(smooth_k)*(z - problo[2])/L_z);
++                    tracer(i,j,k,n) = std::exp(smooth_amp * w);
++                }
++            }
++        }
+     });
+ #endif
+ }

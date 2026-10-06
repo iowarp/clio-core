@@ -1,0 +1,42 @@
+# incflo 3D Rayleigh-Taylor for the NeuroPress benchmark: heavy fluid
+# (density 2) over light fluid (0.5), single level, one GPU. Based on
+# incflo test_no_eb_3d/benchmark.rayleigh_taylor (probtype 5), without AMR.
+# The probe scripts override n_cell, stop_time, plot_per_approx on the command line.
+stop_time               = 20.0
+max_step                = 1000000
+incflo.cfl              = 0.5
+incflo.init_shrink      = 1.0
+amr.plot_per_approx     = 1.0
+amr.check_int           = -1
+amr.plot_file           = plt
+
+incflo.mu               = 0.0001
+incflo.mu_s             = 0.0001
+
+amr.max_level           = 0
+amr.n_cell              = 128 128 256
+amr.max_grid_size       = 512
+amr.blocking_factor     = 16
+
+geometry.prob_lo        = 0.  0.  0.
+geometry.prob_hi        = 0.5 0.5 1.0
+geometry.is_periodic    = 1   1   0
+zlo.type                = "sw"
+zhi.type                = "sw"
+
+incflo.probtype         = 5
+incflo.gravity          = 0. 0. -0.1
+amr.plotVariables       = velx vely velz gpx gpy gpz density tracer
+
+incflo.advection_type   = "Godunov"
+incflo.constant_density = false
+incflo.ro_0             = 0
+incflo.do_initial_pressure_proj = 1
+incflo.advect_tracer    = true
+incflo.diffusion_type   = 1
+
+incflo.verbose          = 1
+mac_proj.verbose        = 0
+nodal_proj.verbose      = 0
+scalar_diffusion.verbose = 0
+tensor_diffusion.verbose = 0

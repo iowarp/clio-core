@@ -99,6 +99,41 @@ VPIC_CELL=0.03125 VPIC_DT_DX=0.5 VPIC_VTHE=0.03 VPIC_VTHEX=0.006 VPIC_DUMP_VARS=
 The run log prints "254^3"; the grid is 254 x 254 x 1022 (`gen_fields.sh`
 passes `--nz` to the deck as `VPIC_NZ`).
 
+## incflo: Rayleigh-Taylor with frozen layered tracers
+
+incflo (AMReX-Fluids) `6f82b5f`, AMReX `8cb3256`, AMReX-Hydro `a153304`;
+built by `../incflo/build_incflo.sh` (CUDA sm_80, no MPI, EB on, double
+precision) with `../incflo/patches/incflo-rt-layered-tracer.patch`. The patch
+adds `prob.tracer_layers` (z-layers alternating clumpy / smooth, per tracer
+component, odd components swapped), `prob.tracer_block` (clump size in cells;
+1 = per-cell), `prob.tracer_nphase` (8 power-of-two levels), `prob.smooth_amp`,
+`prob.smooth_k`. Plotfiles become `fields/plt<step>/<field>.f32` with
+`../incflo/plt_to_raw.py` (float32, z slowest); `incflo_probe.sh` runs it all.
+
+Workload `ref-incflo-tune-final25g` (79 frames x 5 fields, 395 files, 25 GiB,
+6320 chunks):
+
+```
+INPUTS=../incflo/inputs.rt NCELL="256 256 256" STOP=12 PER=0.15 PLOT="velz density tracer" \
+  ./incflo_probe.sh final25g "..." prob.tracer_layers=4 prob.tracer_block=1 incflo.ntrac=3 \
+  "incflo.mu_s=0 0 0" incflo.advect_tracer=false "geometry.prob_hi=1. 1. 1."
+# sha256 plt00000/tracer0.f32 1537ae0515cdeac16587cd5807bb62993df30292f8d4fa21fae1ce4fc4904b45
+#        plt01328/velz.f32    b6550e40611b130c509c19484edf9242aff9b9af40f3467bdac95189ad0f15af
+```
+
+256^3 in a 1x1x1 box keeps probe D's cell size (1/256); 256x256x512 needs
+about 45 GB of GPU memory (AMReX's arena is 30 GB on a 40 GB A100). The
+tracers are frozen (`advect_tracer=false`), like VPIC's `C`/`S` slabs: moving
+clumps lose their exact values within a few time units. Benchmark cost model
+1/40/2.8 at 0.5 GB/s, 10 reads (chosen with `np_cost_sweep.py --wide`).
+
+| Probe (128x128x256, t <= 10) | Possible gain (1/1/1) | NP learning pass 1 |
+|---|---|---|
+| A: stock RT, 8 fields | 2.6% | +28.7% |
+| B: moving layered tracer, blocks of 16, g = -0.02 | 3.2% | +32.5% |
+| C: frozen per-cell tracer, 8 fields | 9.7% | +18.7% |
+| D: 3 frozen tracers + velz + density | 28.7% | -8.6% |
+
 ## Reproduce the benchmark workloads (another machine, e.g. Delta)
 
 The two workloads of the benchmark, with the exact settings:
@@ -172,11 +207,14 @@ On another machine (e.g. a Delta GPU node):
 
 - `gen_nyx_multiphase_50g.sh`, `gen_vpic_slabs.sh`: make the two benchmark
   workloads with the exact settings (see above).
-- `nyx_probe.sh`, `vpic_probe.sh`, `warpx_probe.sh`, `gs_probe.sh`: one probe
+- `nyx_probe.sh`, `vpic_probe.sh`, `warpx_probe.sh`, `gs_probe.sh`, `incflo_probe.sh`: one probe
   run (generate, stage, exhaustive search, score); `data_probe.sh NAME DIR`:
   the same for data already on disk. Each deletes its stored (compressed)
   data after the search.
 - `opp_grid.py`: possible gain over a grid of cost models (and field subsets).
+- `subset_search.py`: field subsets with the largest possible gain at a minimum size.
+- `plot_probes.py`: possible gain of several probes (per model and per field).
+- `learn_variants.py`: offline test of NeuroPress learning variants.
 - `pick_cost_model.py`: ranks `np_cost_sweep.py`'s models by NeuroPress's
   runtime and ratio gain together.
 - `probe_eval.py`: opportunity per field, plus NeuroPress's result from the

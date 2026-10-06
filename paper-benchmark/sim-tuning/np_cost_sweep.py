@@ -97,11 +97,18 @@ def main():
     ap.add_argument("--predict-s", type=float, default=3.3,
                     help="NeuroPress prediction time added to its runtime (s)")
     ap.add_argument("--limit", type=int, default=0, help="score only the first N (timing test)")
+    ap.add_argument("--wide", action="store_true",
+                    help="a much wider grid (~21600 models); output ..._wide.csv")
     a = ap.parse_args()
     bws = (0.1, 0.25, 0.52, 1, 2, 3, 5, 8)
     reads = (1, 2, 4, 10)
     mults = ((1, 1, 1), (1, 1, 1.25), (1, 1, 1.5), (1, 1, 2), (1, 1, 3), (1, 1, 5),
              (0.5, 1, 1), (0, 1, 1), (1, 0.5, 1), (1, 2, 1), (1, 1, 0.75), (0.5, 0.5, 1))
+    if a.wide:
+        bws = (0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 3, 5, 8, 12, 20)
+        reads = (1, 2, 3, 4, 6, 8, 10, 15, 20)
+        mults = tuple(itertools.product((0, 0.25, 0.5, 1, 2), (0.25, 0.5, 1, 2, 4),
+                                        (0.25, 0.5, 0.75, 1, 1.5, 2, 3, 5)))
     jobs = [(b, r, m, a.predict_s) for b, r, m in itertools.product(bws, reads, mults)]
     if a.limit:
         jobs = jobs[:a.limit]
@@ -109,7 +116,7 @@ def main():
     with Pool(min(a.workers, len(jobs)), initializer=init, initargs=(a.dataset,)) as pool:
         rows = pool.map(score, jobs, chunksize=1)
     out = pd.DataFrame(rows)
-    path = os.path.join(rl.RUNS, f"np_cost_sweep_{a.dataset}{'_test' if a.limit else ''}.csv")
+    path = os.path.join(rl.RUNS, f"np_cost_sweep_{a.dataset}{'_wide' if a.wide else ''}{'_test' if a.limit else ''}.csv")
     out.to_csv(path, index=False)
     print(f"{len(rows)} combinations in {time.time() - t:.0f} s -> {path}")
 

@@ -1,0 +1,805 @@
+blob,tier_bw,setting,spec,role,comp_ms,decomp_ms,ratio,cost,adopted
+fields/00000__plt00000__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.186368003,-1,31.751938,0.230400003,1
+fields/00000__plt00000__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0552960001,-1,31.751938,0.0993280001,1
+fields/00001__plt00000__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.592895985,-1,31.751938,0.636927985,1
+fields/00002__plt00020__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.040959999,-1,31.751938,0.084991999,1
+fields/00003__plt00020__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0675840005,-1,31.751938,0.111616001,1
+fields/00001__plt00000__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.044032,-1,31.751938,0.088064,1
+fields/00002__plt00020__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0419839993,-1,31.751938,0.0860159993,1
+fields/00003__plt00020__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0645119995,-1,31.751938,0.108543999,1
+fields/00004__plt00040__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0378880017,-1,31.751938,0.0819200017,1
+fields/00004__plt00040__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0921600014,-1,31.751938,0.136192001,1
+fields/00005__plt00040__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00005__plt00040__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00006__plt00060__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00006__plt00060__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00007__plt00060__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0686080009,-1,31.751938,0.112640001,1
+fields/00007__plt00060__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0430079997,-1,31.751938,0.0870399997,1
+fields/00008__plt00080__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0419839993,-1,31.751938,0.0860159993,1
+fields/00008__plt00080__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00009__plt00080__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00009__plt00080__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00010__plt00100__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00010__plt00100__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00011__plt00100__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0419839993,-1,31.751938,0.0860159993,1
+fields/00011__plt00100__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00012__plt00120__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00013__plt00120__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00012__plt00120__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0675840005,-1,31.751938,0.111616001,1
+fields/00013__plt00120__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.044032,-1,31.751938,0.088064,1
+fields/00014__plt00140__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0655359998,-1,31.751938,0.109568,1
+fields/00014__plt00140__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0706560016,-1,31.751938,0.114688002,1
+fields/00015__plt00140__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00015__plt00140__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0552960001,-1,31.751938,0.0993280001,1
+fields/00016__plt00160__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0655359998,-1,31.751938,0.109568,1
+fields/00016__plt00160__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00017__plt00160__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00017__plt00160__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.040959999,-1,31.751938,0.084991999,1
+fields/00018__plt00180__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0460800007,-1,31.751938,0.0901120007,1
+fields/00018__plt00180__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0870399997,-1,31.751938,0.131072,1
+fields/00019__plt00180__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.040959999,-1,31.751938,0.084991999,1
+fields/00019__plt00180__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.035840001,-1,31.751938,0.079872001,1
+fields/00020__plt00200__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0542719997,-1,31.751938,0.0983039997,1
+fields/00020__plt00200__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0368640013,-1,31.751938,0.0808960013,1
+fields/00021__plt00200__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0419839993,-1,31.751938,0.0860159993,1
+fields/00021__plt00200__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.088064,-1,31.0818117,0.133045333,1
+fields/00022__plt00220__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0798719972,-1,31.751938,0.123903997,1
+fields/00022__plt00220__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.0983040035,-1,13.7138672,0.200252003,1
+fields/00023__plt00220__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0430079997,-1,31.751938,0.0870399997,1
+fields/00023__plt00220__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.429663986,-1,9.53964214,0.576220986,1
+fields/00024__plt00240__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00024__plt00240__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.0819199979,-1,7.18370031,0.276541331,1
+fields/00025__plt00240__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00025__plt00240__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.403968006,-1,4.0997354,0.74499034,1
+fields/00026__plt00260__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00026__plt00260__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.117760003,-1,5.18030195,0.387648003,1
+fields/00027__plt00260__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.040959999,-1,31.751938,0.084991999,1
+fields/00027__plt00260__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.42377603,-1,2.76684095,1.92908203,1
+fields/00028__plt00280__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00028__plt00280__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.0819199979,-1,4.9289317,0.365571998,1
+fields/00029__plt00280__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0522239991,-1,31.751938,0.0962559991,1
+fields/00029__plt00280__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.391072005,-1,2.56551027,0.936032338,1
+fields/00030__plt00300__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00030__plt00300__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.084991999,-1,4.77985541,0.377490666,1
+fields/00031__plt00300__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0378880017,-1,31.751938,0.0819200017,1
+fields/00031__plt00300__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.313088,-1,2.61417423,0.847903666,1
+fields/00032__plt00320__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0665600002,-1,31.751938,0.110592,1
+fields/00032__plt00320__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,36,spratio shuffle=bit,primary,0.104000002,-1,5.92270261,0.340058002,1
+fields/00033__plt00320__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00033__plt00320__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.37888002,-1,2.59772279,1.91708269,1
+fields/00034__plt00340__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0675840005,-1,31.751938,0.111616001,1
+fields/00034__plt00340__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.084991999,-1,4.49396134,0.396098666,1
+fields/00035__plt00340__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0634879991,-1,31.751938,0.107519999,1
+fields/00035__plt00340__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.727551997,-1,2.5877124,1.26783666,1
+fields/00039__plt00380__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00036__plt00360__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0378880017,-1,31.751938,0.0819200017,1
+fields/00036__plt00360__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.084991999,-1,4.62794218,0.387091999,1
+fields/00037__plt00360__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0768000036,-1,31.751938,0.120832004,1
+fields/00037__plt00360__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.300543994,-1,2.23902681,0.92496766,1
+fields/00038__plt00380__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00038__plt00380__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,9,bitcomp type=int,primary,2.71964788,-1,9.21784537,2.87132122,1
+fields/00039__plt00380__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.28064001,-1,2.23451668,1.90632401,1
+fields/00040__plt00400__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0378880017,-1,31.751938,0.0819200017,1
+fields/00040__plt00400__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,36,spratio shuffle=bit,primary,0.792288005,-1,5.86491263,1.03067201,1
+fields/00041__plt00400__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00041__plt00400__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.930848002,-1,2.22011413,1.560591,1
+fields/00042__plt00420__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00042__plt00420__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.39001608,-1,7.80934223,2.56904541,1
+fields/00043__plt00420__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0665600002,-1,31.751938,0.110592,1
+fields/00043__plt00420__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.711903989,-1,2.51820312,1.26710199,1
+fields/00045__plt00440__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00044__plt00440__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0624639988,-1,31.751938,0.106495999,1
+fields/00045__plt00440__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.28473604,-1,2.45663942,1.85384737,1
+fields/00044__plt00440__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,9,bitcomp type=int,primary,1.99171197,-1,8.02105134,2.16601597,1
+fields/00046__plt00460__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0389119983,-1,31.751938,0.0829439983,1
+fields/00046__plt00460__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,9,bitcomp type=int,primary,3.50031996,-1,7.64557996,3.68318396,1
+fields/00047__plt00460__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0757760033,-1,31.751938,0.119808003,1
+fields/00047__plt00460__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.796512008,-1,2.34161156,1.39358001,1
+fields/00048__plt00480__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00048__plt00480__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,9,bitcomp type=int,primary,1.13356805,-1,7.36732056,1.32333872,1
+fields/00051__plt00500__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.040959999,-1,31.751938,0.084991999,1
+fields/00049__plt00480__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.040959999,-1,31.751938,0.084991999,1
+fields/00049__plt00480__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.38118398,-1,2.16230774,2.02776232,1
+fields/00050__plt00500__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0399359986,-1,31.751938,0.0839679986,1
+fields/00050__plt00500__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.39772797,-1,7.70235865,2.57924397,1
+fields/00051__plt00500__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.919839978,-1,1.9892869,1.62265531,1
+fields/00052__plt00520__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0450560004,-1,27.911414,0.095146667,1
+fields/00052__plt00520__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.44099212,-1,7.68491564,3.62292012,1
+fields/00053__plt00520__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0481280014,-1,15.0266692,0.141169335,1
+fields/00053__plt00520__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.243744001,-1,1.88109085,0.986983667,1
+fields/00054__plt00540__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.270783991,-1,14.8189771,0.365129324,1
+fields/00054__plt00540__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.33257604,-1,7.66278866,2.51502937,1
+fields/00055__plt00540__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0773440003,-1,5.45544458,0.333620334,1
+fields/00055__plt00540__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.2192,-1,1.76575657,1.010986,1
+fields/00057__plt00560__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.867712021,-1,2.66101427,1.39311369,1
+fields/00057__plt00560__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.17881596,-1,1.63909213,2.03178896,1
+fields/00056__plt00560__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,3.22307205,-1,12.0696617,3.33890805,1
+fields/00056__plt00560__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.69401598,-1,6.33006942,2.91488265,1
+fields/00058__plt00580__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.78857601,-1,11.815074,1.90690801,1
+fields/00058__plt00580__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.40201592,-1,6.3089697,2.62362126,1
+fields/00059__plt00580__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.34112,-1,1.9769169,2.048333,1
+fields/00059__plt00580__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.845344007,-1,1.5402019,1.75308301,1
+fields/00060__plt00600__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.43721604,-1,13.0875686,3.54404271,1
+fields/00062__plt00620__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,3.95871997,-1,12.2808522,4.07256397,1
+fields/00060__plt00600__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,3.40854406,-1,6.28767082,3.63090006,1
+fields/00061__plt00600__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.798399985,-1,1.7338462,1.60475832,1
+fields/00061__plt00600__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.883584023,-1,1.46597807,1.83728269,1
+fields/00062__plt00620__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,3.4249599,-1,6.26146359,3.64824656,1
+fields/00063__plt00620__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.850080013,-1,1.65984047,1.69239068,1
+fields/00063__plt00620__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.782047987,-1,1.41983907,1.76673799,1
+fields/00064__plt00640__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.74396801,-1,13.268747,2.84933601,1
+fields/00064__plt00640__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.47059202,-1,7.61186305,2.65426602,1
+fields/00065__plt00640__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.11881602,-1,1.65710064,1.96251935,1
+fields/00065__plt00640__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.17555201,-1,1.38771567,2.18303601,1
+fields/00066__plt00660__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.96755195,-1,12.2772574,2.08142928,1
+fields/00066__plt00660__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.76665604,-1,6.07813768,1.99667737,1
+fields/00067__plt00660__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.13727999,-1,1.64710909,1.98610132,1
+fields/00068__plt00680__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.452544004,-1,7.58721591,0.63681467,1
+fields/00067__plt00660__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.417472,-1,1.36488459,2.44180867,1
+fields/00068__plt00680__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,9,bitcomp type=int,primary,1.39414406,-1,15.3224421,1.48538939,1
+fields/00069__plt00680__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.425247997,-1,1.6127646,1.29214533,1
+fields/00070__plt00700__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,9,bitcomp type=int,primary,1.66688001,-1,14.5498141,1.76297068,1
+fields/00069__plt00680__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.182879999,-1,1.34480018,1.222515,1
+fields/00070__plt00700__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.01747203,-1,7.56941557,3.20217603,1
+fields/00071__plt00700__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.69148803,-1,1.55801032,2.58885136,1
+fields/00071__plt00700__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.37430406,-1,1.32946336,2.42593239,1
+fields/00072__plt00720__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.80809605,-1,12.1138632,1.92350938,1
+fields/00072__plt00720__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.68636799,-1,7.56810439,1.87110399,1
+fields/00073__plt00720__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.347615987,-1,1.48781932,1.28731432,1
+fields/00073__plt00720__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.673376024,-1,1.31785412,1.73426836,1
+fields/00074__plt00740__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.87347198,-1,11.7269393,2.99269331,1
+fields/00074__plt00740__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.947391987,-1,7.54963245,1.13257999,1
+fields/00075__plt00740__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.441792011,-1,1.42101328,1.42566834,1
+fields/00075__plt00740__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.301568002,-1,1.30953569,1.36919933,1
+fields/00076__plt00760__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.00387192,-1,9.63871015,2.14892258,1
+fields/00076__plt00760__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.40454412,-1,7.5351471,2.59008812,1
+fields/00077__plt00760__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.387744009,-1,1.36872574,1.40920601,1
+fields/00077__plt00760__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.09180796,-1,1.30142256,2.16609496,1
+fields/00078__plt00780__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.32438397,-1,8.05815902,2.49788531,1
+fields/00078__plt00780__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.34080005,-1,7.52282152,1.52664805,1
+fields/00079__plt00780__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.849183977,-1,1.33842284,1.89377264,1
+fields/00079__plt00780__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.802784026,-1,1.29627023,1.88134103,1
+fields/00080__plt00800__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.19500804,-1,6.85733718,2.39889204,1
+fields/00080__plt00800__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.97449601,-1,5.56110005,2.22590334,1
+fields/00084__plt00840__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.825984,-1,7.70354697,4.007472,1
+fields/00081__plt00800__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.65200001,-1,1.3511624,1.68673968,1
+fields/00081__plt00800__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.27171195,-1,1.29183857,2.35396895,1
+fields/00082__plt00820__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.32355189,-1,6.41688034,2.54143056,1
+fields/00082__plt00820__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.45587206,-1,5.54598177,2.70796473,1
+fields/00083__plt00820__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.890559971,-1,1.41021603,1.8819693,1
+fields/00083__plt00820__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.45788801,-1,1.28973362,2.54191134,1
+fields/00084__plt00840__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.51936007,-1,5.54287421,2.77159407,1
+fields/00085__plt00840__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0831039995,-1,1.52587284,0.999367333,1
+fields/00085__plt00840__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.534016013,-1,1.28762761,1.61981235,1
+fields/00086__plt00860__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.59702396,-1,7.59793635,3.78103463,1
+fields/00086__plt00860__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.24172795,-1,7.47378662,1.42879528,1
+fields/00087__plt00860__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.06691206,-1,1.69648129,1.89103039,1
+fields/00087__plt00860__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.926783979,-1,1.28746872,2.01271431,1
+fields/00088__plt00880__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.81161594,-1,7.56155532,3.99651194,1
+fields/00088__plt00880__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.09132791,-1,7.46508714,3.27861324,1
+fields/00089__plt00880__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.449247986,-1,1.70315446,1.27013732,1
+fields/00089__plt00880__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.613983989,-1,1.28789449,1.69955532,1
+fields/00094__plt00940__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,4.25574398,-1,7.64675082,4.43857998,1
+fields/00090__plt00900__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.0983040035,-1,3.79511828,0.46669867,1
+fields/00090__plt00900__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.0870399997,-1,3.14524049,0.531553333,1
+fields/00091__plt00900__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.944832027,-1,1.74140116,1.74769203,1
+fields/00091__plt00900__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.25984001,-1,1.28794431,2.34536934,1
+fields/00092__plt00920__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,3.11142397,-1,6.48449955,3.32703064,1
+fields/00092__plt00920__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.74854398,-1,5.48923695,3.00324264,1
+fields/00093__plt00920__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.20163202,-1,1.6551944,2.04630702,1
+fields/00093__plt00920__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.49276799,-1,1.28862848,1.57772099,1
+fields/00094__plt00940__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.97695994,-1,5.48596302,3.23181061,1
+fields/00095__plt00940__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.843616009,-1,1.28929157,1.92801101,1
+fields/00096__plt00960__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.114688002,-1,3.14387311,0.559394668,1
+fields/00096__plt00960__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,9,bitcomp type=int,primary,1.97276795,-1,6.36526764,2.19241328,1
+fields/00097__plt00960__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.347424001,-1,1.41048207,1.33864633,1
+fields/00095__plt00940__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.45695996,-1,1.58873226,2.33697063,1
+fields/00097__plt00960__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.405728012,-1,1.28924639,1.49016101,1
+fields/00098__plt00980__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.960608006,-1,5.46265632,1.21654601,1
+fields/00099__plt00980__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.309215993,-1,1.29396597,1.38969366,1
+fields/00102__plt01020__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.88870406,-1,7.55981082,3.07364273,1
+fields/00098__plt00980__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.15571189,-1,6.33864084,2.37627989,1
+fields/00100__plt01000__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.16233611,-1,7.56144627,2.34723478,1
+fields/00101__plt01000__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.917504013,-1,1.23246104,2.05190201,1
+fields/00099__plt00980__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.09372795,-1,1.29017279,2.17738228,1
+fields/00100__plt01000__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.50060797,-1,7.43955841,3.68853597,1
+fields/00101__plt01000__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.51305604,-1,1.29091693,2.59608571,1
+fields/00102__plt01020__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.74627197,-1,7.43465283,1.93432397,1
+fields/00103__plt01020__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.848096013,-1,1.2906488,1.93135068,1
+fields/00104__plt01040__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.57065594,-1,5.44863404,1.82725261,1
+fields/00103__plt01020__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.235264003,-1,1.20221692,1.3982,1
+fields/00104__plt01040__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.08988798,-1,6.27401424,1.31272798,1
+fields/00105__plt01040__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.845408022,-1,1.19016485,2.02012036,1
+fields/00106__plt01060__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.559584022,-1,7.55164417,0.744722688,1
+fields/00107__plt01060__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.233055994,-1,1.18307107,1.41481199,1
+fields/00105__plt01040__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.291839987,-1,1.28974432,1.37585432,1
+fields/00106__plt01060__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.492352009,-1,7.4358127,0.680374675,1
+fields/00107__plt01060__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.453887999,-1,1.28963011,1.53799833,1
+fields/00108__plt01080__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.68348789,-1,6.23139779,2.90785189,1
+fields/00108__plt01080__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.7036159,-1,7.4375532,3.89159457,1
+fields/00109__plt01080__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.731519997,-1,1.18315617,1.913191,1
+fields/00111__plt01100__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.541119993,-1,1.28691647,1.62751633,1
+fields/00110__plt01100__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.94729602,-1,6.23627124,2.17148469,1
+fields/00110__plt01100__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.29116797,-1,5.44374041,1.54799531,1
+fields/00111__plt01100__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.388063997,-1,1.18140689,1.57148466,1
+fields/00109__plt01080__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.47257602,-1,1.28817295,2.55791269,1
+fields/00113__plt01120__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.483328015,-1,1.18059284,1.66756468,1
+fields/00112__plt01120__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.13302398,-1,6.19260957,2.35879331,1
+fields/00112__plt01120__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.76729596,-1,5.44813862,2.02391596,1
+fields/00113__plt01120__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.413856,-1,1.2865458,1.50056533,1
+fields/00115__plt01140__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.248063996,-1,1.28574639,1.335449,1
+fields/00115__plt01140__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.824735999,-1,1.17954435,2.01002533,1
+fields/00114__plt01140__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.706496,-1,7.56051943,1.89141733,1
+fields/00114__plt01140__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.841856,-1,7.44336073,2.029688,1
+fields/00116__plt01160__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,3.10761595,-1,6.25116102,3.33127061,1
+fields/00117__plt01160__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.868416011,-1,1.28460833,1.95676434,1
+fields/00117__plt01160__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.744095981,-1,1.17946375,1.92946631,1
+fields/00116__plt01160__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.97776008,-1,5.44444704,3.23455408,1
+fields/00118__plt01180__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,3.37308788,-1,6.24922375,3.59681188,1
+fields/00120__plt01200__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,3.55657601,-1,5.44451771,3.81336668,1
+fields/00118__plt01180__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,8.41779232,-1,5.44155103,8.67472299,1
+fields/00120__plt01200__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.58652806,-1,7.59815658,2.7705334,1
+fields/00119__plt01180__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.342079997,-1,1.18012912,1.526782,1
+fields/00119__plt01180__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.610368013,-1,1.28350842,1.69964901,1
+fields/00121__plt01200__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.31939197,-1,1.28315659,2.40897163,1
+fields/00121__plt01200__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.049312,-1,1.17750219,2.236657,1
+fields/00122__plt01220__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.05481601,-1,7.44669095,2.24256401,1
+fields/00122__plt01220__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.939008,-1,7.62002209,3.12248533,1
+fields/00123__plt01220__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.248768002,-1,1.17724109,1.43637634,1
+fields/00123__plt01220__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.251744002,-1,1.28316523,1.34131634,1
+fields/00125__plt01240__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.277631998,-1,1.17569674,1.46680033,1
+fields/00125__plt01240__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.108896002,-1,1.28205838,1.199409,1
+fields/00126__plt01260__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.37209594,-1,7.63795025,1.55514261,1
+fields/00124__plt01240__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.34585595,-1,7.6291144,1.52911462,1
+fields/00124__plt01240__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.893216014,-1,7.44703472,1.08095535,1
+fields/00126__plt01260__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.25433612,-1,7.4443912,3.44214212,1
+fields/00127__plt01260__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.72982395,-1,1.28127392,2.82100461,1
+fields/00127__plt01260__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.504639983,-1,1.17400755,1.69551932,1
+fields/00128__plt01280__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,4.75072002,-1,6.30087581,4.97261002,1
+fields/00130__plt01300__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.325984,-1,7.4443912,1.51379,1
+fields/00128__plt01280__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.29644799,-1,7.44518406,2.48423399,1
+fields/00129__plt01280__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.349727988,-1,1.28058151,1.44149865,1
+fields/00130__plt01300__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.31561589,-1,6.31138103,2.53713656,1
+fields/00129__plt01280__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.356287986,-1,1.17539659,1.54575999,1
+fields/00131__plt01300__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.465600014,-1,1.17762716,1.65281901,1
+fields/00132__plt01320__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.72767997,-1,6.32296968,2.94879463,1
+fields/00131__plt01300__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.863712013,-1,1.27944828,1.95644968,1
+fields/00132__plt01320__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.72150397,-1,5.43888377,2.97856064,1
+fields/00134__plt01340__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.37625599,-1,5.4374031,2.63338266,1
+fields/00134__plt01340__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.98880005,-1,6.32838848,2.20972538,1
+fields/00133__plt01320__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.26553601,-1,1.18018093,1.45018601,1
+fields/00133__plt01320__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.418911994,-1,1.27865454,1.51232799,1
+fields/00135__plt01340__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.39766395,-1,1.18166584,2.58082528,1
+fields/00137__plt01360__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.281984001,-1,1.18371948,1.46309267,1
+fields/00135__plt01340__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.253472,-1,1.27795055,1.34749033,1
+fields/00136__plt01360__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.1721921,-1,7.66687871,2.3545481,1
+fields/00136__plt01360__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,1,ans shuffle=bit,primary,1.56876802,-1,4.82294608,1.85865336,1
+fields/00138__plt01380__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.86185598,-1,5.43531741,2.11908132,1
+fields/00139__plt01380__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.227392003,-1,1.18306773,1.40915134,1
+fields/00139__plt01380__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.356992006,-1,1.27616271,1.45254301,1
+fields/00138__plt01380__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.82415998,-1,7.68243827,2.00614665,1
+fields/00140__plt01400__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.18156791,-1,7.4428324,2.36941324,1
+fields/00137__plt01360__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.599135995,-1,1.27712755,1.69385933,1
+fields/00140__plt01400__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.12860799,-1,7.68756369,3.31047332,1
+fields/00143__plt01420__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.231168002,-1,1.18324696,1.41274834,1
+fields/00141__plt01400__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.971584022,-1,1.18298932,2.15342169,1
+fields/00141__plt01400__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.81318402,-1,1.27567443,2.90915436,1
+fields/00142__plt01420__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.60982394,-1,6.35410108,1.82985528,1
+fields/00144__plt01440__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.94211197,-1,5.43416252,2.19939197,1
+fields/00144__plt01440__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.76803195,-1,7.69326036,1.94976262,1
+fields/00143__plt01420__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.301535994,-1,1.27478462,1.39827133,1
+fields/00142__plt01420__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.62857604,-1,7.44692894,1.81631804,1
+fields/00145__plt01440__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.782591999,-1,1.18317987,1.96423933,1
+fields/00148__plt01480__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.25782394,-1,5.4286905,2.51536328,1
+fields/00145__plt01440__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.14742398,-1,1.27388637,2.24493265,1
+fields/00146__plt01460__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.74841595,-1,7.69060838,2.93020928,1
+fields/00146__plt01460__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.62451196,-1,7.45063292,2.81216062,1
+fields/00147__plt01460__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.207967997,-1,1.27367052,1.30566266,1
+fields/00147__plt01460__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.285696,-1,1.18367371,1.46685033,1
+fields/00149__plt01480__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.40959999,-1,1.18349536,1.59093232,1
+fields/00148__plt01480__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.47552001,-1,7.695067,1.65720801,1
+fields/00149__plt01480__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.766143978,-1,1.27313931,1.86429664,1
+fields/00150__plt01500__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.29503989,-1,7.45365174,2.48261256,1
+fields/00154__plt01540__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.731648028,-1,6.36807025,0.951196695,1
+fields/00150__plt01500__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.5072639,-1,6.36298872,2.7269879,1
+fields/00151__plt01500__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.43215999,-1,1.18163555,1.61535166,1
+fields/00152__plt01520__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.33043194,-1,7.70264155,2.51194127,1
+fields/00153__plt01520__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.358175993,-1,1.27191121,1.45738899,1
+fields/00153__plt01520__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.243136004,-1,1.18160692,1.42635634,1
+fields/00151__plt01500__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.462944001,-1,1.27240471,1.56173067,1
+fields/00152__plt01520__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.24124801,-1,7.44899213,1.42893801,1
+fields/00154__plt01540__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.13193595,-1,5.43871451,1.38900062,1
+fields/00155__plt01540__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.229599997,-1,1.18276014,1.41166666,1
+fields/00155__plt01540__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.406048,-1,1.27128552,1.505802,1
+fields/00157__plt01560__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.511327982,-1,1.18282651,1.69332832,1
+fields/00156__plt01560__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.73228788,-1,7.45696466,3.91977722,1
+fields/00157__plt01560__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.44777596,-1,1.27035256,2.54833763,1
+fields/00158__plt01580__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.63110399,-1,7.4542611,3.81866133,1
+fields/00156__plt01560__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,9.79779243,-1,6.37304371,10.0171698,1
+fields/00158__plt01580__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.52979207,-1,7.71289656,3.71106007,1
+fields/00162__plt01620__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,4.1024642,-1,6.37130115,4.32190153,1
+fields/00159__plt01580__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.186976001,-1,1.27030293,1.28758067,1
+fields/00160__plt01600__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.17971206,-1,7.70858727,1.36108139,1
+fields/00161__plt01600__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.396512002,-1,1.18333676,1.57800267,1
+fields/00159__plt01580__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.360480011,-1,1.18406701,1.54124201,1
+fields/00160__plt01600__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,3.43939209,-1,5.43490892,3.69663676,1
+fields/00161__plt01600__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.85580802,-1,1.269396,1.95719902,1
+fields/00163__plt01620__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.36278403,-1,1.18500705,2.54260936,1
+fields/00162__plt01620__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.34246397,-1,7.45153301,3.53008997,1
+fields/00164__plt01640__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.74982405,-1,5.44033703,3.00681205,1
+fields/00164__plt01640__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.71411204,-1,6.3746322,2.93343471,1
+fields/00166__plt01660__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.32364798,-1,7.45595722,2.51116264,1
+fields/00165__plt01640__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.565312028,-1,1.1870871,1.74307003,1
+fields/00166__plt01660__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,3.26767993,-1,6.37405095,3.4870226,1
+fields/00163__plt01620__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.661055982,-1,1.26917053,1.76264265,1
+fields/00165__plt01640__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.10659206,-1,1.26885684,2.20845106,1
+fields/00167__plt01660__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.49596798,-1,1.18754723,2.67326965,1
+fields/00167__plt01660__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.00617599,-1,1.26852912,2.10831966,1
+fields/00168__plt01680__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.53126395,-1,7.71346393,1.71251861,1
+fields/00168__plt01680__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.44828796,-1,5.43565552,2.7054973,1
+fields/00170__plt01700__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.55200005,-1,6.36362588,1.77170205,1
+fields/00170__plt01700__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.61180794,-1,7.45924566,1.79923994,1
+fields/00169__plt01680__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.361375988,-1,1.18797373,1.53825499,1
+fields/00169__plt01680__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.252223998,-1,1.26791787,1.354899,1
+fields/00172__plt01720__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.37295997,-1,6.36175337,1.59272664,1
+fields/00171__plt01700__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.321215987,-1,1.18815882,1.49791165,1
+fields/00171__plt01700__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.706911981,-1,1.26661221,1.81072365,1
+fields/00172__plt01720__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.64479995,-1,5.434923,2.90204395,1
+fields/00173__plt01720__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.264319986,-1,1.1888637,1.44031799,1
+fields/00175__plt01740__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.09123194,-1,1.26646917,2.19516828,1
+fields/00175__plt01740__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.963775992,-1,1.18808814,2.14054166,1
+fields/00174__plt01740__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.9780159,-1,7.70898397,3.1593759,1
+fields/00173__plt01720__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.664928019,-1,1.26663325,1.76872135,1
+fields/00174__plt01740__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.91798401,-1,5.43755818,3.17510334,1
+fields/00177__plt01760__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.326272011,-1,1.26539322,1.43114701,1
+fields/00177__plt01760__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.740191996,-1,1.18678212,1.91825266,1
+fields/00176__plt01760__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.20025611,-1,7.46237768,2.38760944,1
+fields/00176__plt01760__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.63507199,-1,6.36507445,1.85472399,1
+fields/00179__plt01780__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0853440017,-1,1.26492307,1.19062967,1
+fields/00180__plt01800__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.401087999,-1,7.71108153,0.582398666,1
+fields/00178__plt01780__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.400864005,-1,7.46081134,0.588256672,1
+fields/00178__plt01780__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.458656013,-1,6.36310456,0.678376013,1
+fields/00180__plt01800__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,3.2324481,-1,5.44309048,3.4893061,1
+fields/00179__plt01780__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0915199965,-1,1.18517614,1.271177,1
+fields/00182__plt01820__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.40780795,-1,5.44081692,1.66477328,1
+fields/00181__plt01800__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.01056004,-1,1.18727864,2.18812804,1
+fields/00181__plt01800__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.676352024,-1,1.2649513,1.78161302,1
+fields/00182__plt01820__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.68825603,-1,7.7094374,3.86960536,1
+fields/00183__plt01820__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.139679998,-1,1.18910604,1.31543833,1
+fields/00185__plt01840__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.255264014,-1,1.19159613,1.42856535,1
+fields/00186__plt01860__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.65919995,-1,6.34746604,2.87946129,1
+fields/00183__plt01820__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.387136012,-1,1.26529702,1.49209501,1
+fields/00184__plt01840__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.26144004,-1,6.35092607,2.48158137,1
+fields/00184__plt01840__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.33235192,-1,7.47123054,3.51948326,1
+fields/00187__plt01860__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.678431988,-1,1.26485364,1.78377832,1
+fields/00188__plt01880__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.51254404,-1,7.47019264,1.69970137,1
+fields/00186__plt01860__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.76758409,-1,5.4437828,3.02440942,1
+fields/00187__plt01860__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.32720006,-1,1.19220682,2.49990039,1
+fields/00185__plt01840__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.581951976,-1,1.26514245,1.68704598,1
+fields/00188__plt01880__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.512128,-1,6.34318467,1.732538,1
+fields/00189__plt01880__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.232544005,-1,1.26502378,1.33774167,1
+fields/00191__plt01900__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.404000014,-1,1.1981285,1.57090435,1
+fields/00190__plt01900__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.12127995,-1,7.68860651,3.30312062,1
+fields/00189__plt01880__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.311616004,-1,1.19502003,1.48155567,1
+fields/00192__plt01920__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.40384007,-1,6.33372092,2.6245794,1
+fields/00190__plt01900__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.34067202,-1,5.44931362,1.59723668,1
+fields/00194__plt01940__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.42780805,-1,7.68044065,2.60984205,1
+fields/00194__plt01940__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.40700793,-1,7.46918162,2.5941906,1
+fields/00192__plt01920__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.68979192,-1,7.47168306,3.87691192,1
+fields/00191__plt01900__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.252160013,-1,1.26504286,1.35734101,1
+fields/00193__plt01920__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.427552015,-1,1.26490094,1.53285701,1
+fields/00193__plt01920__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.15535998,-1,1.20269299,2.31783565,1
+fields/00195__plt01940__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.44195199,-1,1.20664117,1.60062399,1
+fields/00196__plt01960__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.04956794,-1,7.47365345,2.2366386,1
+fields/00196__plt01960__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.07955194,-1,7.67681382,3.26167194,1
+fields/00195__plt01940__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.259039998,-1,1.26463473,1.36457766,1
+fields/00197__plt01960__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.588671982,-1,1.2102566,1.74388265,1
+fields/00198__plt01980__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.86716795,-1,7.47535841,2.05419595,1
+fields/00200__plt02000__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,3.32934403,-1,5.45023416,3.58586537,1
+fields/00197__plt01960__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.350463986,-1,1.26414,1.45643432,1
+fields/00198__plt01980__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.95196795,-1,7.67675762,3.13408929,1
+fields/00199__plt01980__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.42492801,-1,1.2140814,1.57649934,1
+fields/00199__plt01980__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.230015993,-1,1.26390686,1.33619033,1
+fields/00200__plt02000__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.45007992,-1,6.31312897,2.67153925,1
+fields/00201__plt02000__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0839679986,-1,1.13594493,1.31475067,1
+fields/00201__plt02000__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.735264003,-1,1.21464816,1.886298,1
+fields/00204__plt02040__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.22483206,-1,6.30034579,2.44674072,1
+fields/00202__plt02020__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.49391997,-1,7.65903862,1.67646264,1
+fields/00204__plt02040__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,3.43375993,-1,5.45162263,3.69021593,1
+fields/00203__plt02020__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.726112008,-1,1.21604483,1.87582401,1
+fields/00202__plt02020__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.73388803,-1,5.45043247,1.99040003,1
+fields/00203__plt02020__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.736703992,-1,1.26467439,1.84220699,1
+fields/00205__plt02040__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.556703985,-1,1.21755816,1.70498698,1
+fields/00206__plt02060__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.51830399,-1,7.64435372,0.701197324,1
+fields/00207__plt02060__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.927807987,-1,1.26435149,2.03359332,1
+fields/00205__plt02040__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.689728022,-1,1.2643473,1.79551702,1
+fields/00206__plt02060__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.234272,-1,7.47722411,1.42125334,1
+fields/00208__plt02080__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,3.17424011,-1,6.28254735,3.39677745,1
+fields/00208__plt02080__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.088064,-1,3.17824462,0.527961333,1
+fields/00209__plt02080__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.964191973,-1,1.21885455,2.11125364,1
+fields/00207__plt02060__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.52086401,-1,1.21876636,1.66800868,1
+fields/00210__plt02100__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.53225589,-1,6.27675584,2.75499855,1
+fields/00209__plt02080__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.36915195,-1,1.26451311,2.47479595,1
+fields/00211__plt02100__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.47814399,-1,1.22072083,1.62345199,1
+fields/00210__plt02100__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.0860159993,-1,3.18697704,0.524707999,1
+fields/00211__plt02100__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.190495998,-1,1.26511421,1.29561466,1
+fields/00212__plt02120__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.32495999,-1,5.45443007,1.58128399,1
+fields/00212__plt02120__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,4.77663994,-1,7.62523089,4.95999194,1
+fields/00213__plt02120__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.561951995,-1,1.26554098,1.66669799,1
+fields/00213__plt02120__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.845408022,-1,1.22213151,1.98939402,1
+fields/00214__plt02140__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.40268803,-1,7.47554494,3.58971136,1
+fields/00214__plt02140__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.25600004,-1,6.26730182,2.47907871,1
+fields/00215__plt02140__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.566815972,-1,1.22420576,1.70886364,1
+fields/00216__plt02160__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.88681602,-1,7.47597132,2.07382869,1
+fields/00216__plt02160__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,3.04604793,-1,6.26645909,3.26915659,1
+fields/00215__plt02140__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.712095976,-1,1.26557382,1.81681331,1
+fields/00217__plt02160__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.40675199,-1,1.22553784,1.54755832,1
+fields/00217__plt02160__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.546656013,-1,1.2665709,1.65050368,1
+fields/00218__plt02180__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.99718404,-1,7.47503867,2.18422004,1
+fields/00218__plt02180__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.67795205,-1,7.62470414,1.86131672,1
+fields/00219__plt02180__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.132799998,-1,1.22765854,1.27163566,1
+fields/00219__plt02180__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.994239986,-1,1.26713491,2.09759632,1
+fields/00220__plt02200__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.08483195,-1,7.62431606,3.26820595,1
+fields/00220__plt02200__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.32643199,-1,7.47514525,3.51346532,1
+fields/00221__plt02200__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.554271996,-1,1.26767529,1.657158,1
+fields/00221__plt02200__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.15743995,-1,1.23068689,2.29347328,1
+fields/00223__plt02220__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.4224,-1,1.23096392,2.55817766,1
+fields/00223__plt02220__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.043136,-1,1.2684474,2.14535067,1
+fields/00222__plt02220__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,3.10080004,-1,5.46358137,3.3566947,1
+fields/00222__plt02220__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.50342393,-1,7.62104666,2.6868766,1
+fields/00224__plt02240__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.65273595,-1,7.6084663,1.83649195,1
+fields/00224__plt02240__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.57014394,-1,7.4794375,2.75706994,1
+fields/00226__plt02260__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.518176019,-1,7.61354874,0.701809353,1
+fields/00225__plt02240__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.986976027,-1,1.23280735,2.12105536,1
+fields/00227__plt02260__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.05715203,-1,1.26979106,2.15820037,1
+fields/00228__plt02280__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.78320003,-1,7.47853065,2.97014869,1
+fields/00225__plt02240__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.263711989,-1,1.26923467,1.36524299,1
+fields/00226__plt02260__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.31328011,-1,7.4783173,2.50023411,1
+fields/00227__plt02260__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.852191985,-1,1.23388483,1.98528098,1
+fields/00229__plt02280__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.187744007,-1,1.23436707,1.32039034,1
+fields/00228__plt02280__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,3.11052799,-1,6.23262007,3.33484799,1
+fields/00229__plt02280__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.168191999,-1,1.27112871,1.26808167,1
+fields/00230__plt02300__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.437920004,-1,7.60810747,0.621684671,1
+fields/00231__plt02300__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.288672,-1,1.27162585,1.38813167,1
+fields/00230__plt02300__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.447104007,-1,7.48202589,0.63396534,1
+fields/00231__plt02300__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.167199999,-1,1.23540944,1.29889067,1
+fields/00232__plt02320__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.92931199,-1,7.4853908,3.11608932,1
+fields/00233__plt02320__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,2.01302409,-1,1.27233408,3.11187176,1
+fields/00234__plt02340__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.54415989,-1,7.60129615,2.72808922,1
+fields/00232__plt02320__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.62784004,-1,7.60330794,2.81172071,1
+fields/00233__plt02320__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.944671988,-1,1.23791877,2.07406866,1
+fields/00234__plt02340__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.96550393,-1,7.48298698,3.15234126,1
+fields/00235__plt02340__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0788479969,-1,1.14396058,1.30100666,1
+fields/00235__plt02340__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0778239965,-1,1.13798399,1.30640133,1
+fields/00237__plt02360__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.249599993,-1,1.27490745,1.34622966,1
+fields/00236__plt02360__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.45248008,-1,7.59292971,2.63661208,1
+fields/00237__plt02360__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.308735996,-1,1.2424799,1.43398666,1
+fields/00236__plt02360__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.04431999,-1,7.48937386,1.23099799,1
+fields/00239__plt02380__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.123328,-1,1.27544285,1.21949733,1
+fields/00238__plt02380__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.726624012,-1,7.59551473,0.910693345,1
+fields/00238__plt02380__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.466048,-1,5.47957003,1.721196,1
+fields/00239__plt02380__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.250752002,-1,1.24503321,1.373695,1
+fields/00240__plt02400__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.700800002,-1,7.58875339,0.885033335,1
+fields/00240__plt02400__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.084991999,-1,3.18436389,0.524043999,1
+fields/00241__plt02400__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.621663988,-1,1.24533264,1.74433699,1
+fields/00241__plt02400__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,1.07273602,-1,1.27658647,2.16792336,1
+fields/00242__plt02420__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.81916809,-1,7.58754532,3.00343076,1
+fields/00245__plt02440__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.34063995,-1,1.24986933,2.45923795,1
+fields/00244__plt02440__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.31891203,-1,7.4908987,3.50555203,1
+fields/00243__plt02420__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.806432009,-1,1.24772323,1.92695401,1
+fields/00242__plt02420__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.20463991,-1,7.49287924,2.39123058,1
+fields/00244__plt02440__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.70380795,-1,6.20576677,1.92909862,1
+fields/00243__plt02420__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.864992023,-1,1.27721583,1.95963969,1
+fields/00245__plt02440__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.750047982,-1,1.27774188,1.84424498,1
+fields/00246__plt02460__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.00755203,-1,6.20172938,1.23298936,1
+fields/00246__plt02460__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.992416024,-1,7.49362891,1.17898802,1
+fields/00248__plt02480__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,4.33961582,-1,7.49261154,4.52621316,1
+fields/00248__plt02480__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,9.24579239,-1,6.2125504,9.47083706,1
+fields/00247__plt02460__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0788479969,-1,1.15502927,1.28929466,1
+fields/00250__plt02500__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.93519998,-1,7.48619242,2.12195731,1
+fields/00247__plt02460__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.283167988,-1,1.27999375,1.37543999,1
+fields/00251__plt02500__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,1.190624,-1,1.24922197,2.30980167,1
+fields/00250__plt02500__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.42895997,-1,6.21466757,1.65392797,1
+fields/00249__plt02480__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.153088003,-1,1.28071837,1.244742,1
+fields/00249__plt02480__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.63539201,-1,1.25014277,1.75374534,1
+fields/00252__plt02520__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,2.84284806,-1,6.22071404,3.0675974,1
+fields/00252__plt02520__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.15254402,-1,5.4997312,2.40675669,1
+fields/00254__plt02540__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.01398396,-1,6.22067714,1.23873463,1
+fields/00253__plt02520__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.60403198,-1,1.28326809,1.69351698,1
+fields/00251__plt02500__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.35808,-1,1.28245901,1.44825233,1
+fields/00253__plt02520__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.970016003,-1,1.25037197,2.08816434,1
+fields/00255__plt02540__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.907840014,-1,1.24973042,2.02656235,1
+fields/00256__plt02560__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.138239995,-1,3.18065477,0.577803995,1
+fields/00254__plt02540__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.731776,-1,7.49014958,1.91843467,1
+fields/00256__plt02560__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.139264002,-1,3.13788955,0.584818669,1
+fields/00255__plt02540__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.364863992,-1,1.28396459,1.45375799,1
+fields/00257__plt02560__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.243487999,-1,1.25106754,1.36101467,1
+fields/00258__plt02580__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.66236806,-1,6.21155675,1.88744873,1
+fields/00259__plt02580__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.182367995,-1,1.25175827,1.299278,1
+fields/00257__plt02560__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0798719972,-1,1.14211026,1.30401066,1
+fields/00259__plt02580__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.194112003,-1,1.28621085,1.28110434,1
+fields/00258__plt02580__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.42879999,-1,7.49678988,1.61529332,1
+fields/00262__plt02620__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.71759999,-1,7.57674466,1.90212532,1
+fields/00260__plt02600__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.23808002,-1,7.58170256,2.42248469,1
+fields/00261__plt02600__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.114688002,-1,1.1428397,1.33804533,1
+fields/00260__plt02600__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.71052802,-1,7.49673628,1.89702268,1
+fields/00261__plt02600__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.610880017,-1,1.25013345,1.72924168,1
+fields/00263__plt02620__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.119199999,-1,1.28838227,1.20436033,1
+fields/00262__plt02620__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.64921594,-1,7.49762074,2.8356886,1
+fields/00263__plt02620__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.485343993,-1,1.24948508,1.60428599,1
+fields/00264__plt02640__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.94374394,-1,6.20290335,2.16913861,1
+fields/00264__plt02640__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,2.01164794,-1,5.5116559,2.26531061,1
+fields/00267__plt02660__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.526144028,-1,1.25235703,1.64252003,1
+fields/00265__plt02640__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.488575995,-1,1.29014422,1.57225433,1
+fields/00266__plt02660__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.96710396,-1,6.19140293,2.19291729,1
+fields/00265__plt02640__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.396032006,-1,1.24902518,1.51538601,1
+fields/00267__plt02660__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.561056018,-1,1.29156926,1.64353868,1
+fields/00268__plt02680__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.20415998,-1,7.5721213,2.38879798,1
+fields/00266__plt02660__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.105471998,-1,3.18631851,0.544254665,1
+fields/00268__plt02680__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.03392005,-1,7.49925621,3.22035205,1
+fields/00269__plt02680__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.971231997,-1,1.25200227,2.08792433,1
+fields/00269__plt02680__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.410272002,-1,1.29242691,1.49203634,1
+fields/00272__plt02720__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,2.21222401,-1,7.4959324,2.39873867,1
+fields/00271__plt02700__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.237312004,-1,1.25282126,1.35327434,1
+fields/00270__plt02700__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.48156798,-1,5.51615007,1.73502398,1
+fields/00270__plt02700__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.40694404,-1,7.58057893,1.59137604,1
+fields/00271__plt02700__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.373952001,-1,1.29360999,1.454727,1
+fields/00272__plt02720__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.83024001,-1,7.57975697,2.01469201,1
+fields/00273__plt02720__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.767135978,-1,1.29450471,1.84716398,1
+fields/00273__plt02720__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.45926401,-1,1.25202805,1.57593334,1
+fields/00274__plt02740__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.47033596,-1,7.49590561,1.65685129,1
+fields/00276__plt02760__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.313120008,-1,6.21796586,0.537968674,1
+fields/00274__plt02740__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.36729601,-1,6.20446322,0.59263401,1
+fields/00275__plt02740__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.4824,-1,1.25240041,1.59873733,1
+fields/00276__plt02760__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.167935997,-1,3.1777534,0.607901331,1
+fields/00275__plt02740__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.640352011,-1,1.29568359,1.71939734,1
+fields/00277__plt02760__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.31081599,-1,1.25198844,1.42752066,1
+fields/00278__plt02780__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.687039971,-1,6.21496224,0.911997305,1
+fields/00277__plt02760__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.665503979,-1,1.29642489,1.74393231,1
+fields/00278__plt02780__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.108543999,-1,3.18152332,0.547987999,1
+fields/00279__plt02780__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.481471986,-1,1.2522329,1.59795865,1
+fields/00280__plt02800__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.49839997,-1,6.21957021,1.72319064,1
+fields/00279__plt02780__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0970880017,-1,1.29696287,1.175069,1
+fields/00281__plt02800__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.10272,-1,1.29828888,1.1796,1
+fields/00280__plt02800__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,1,ans shuffle=bit,primary,0.540639997,-1,4.77811295,0.83324533,1
+fields/00281__plt02800__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.363712013,-1,1.2538733,1.47873801,1
+fields/00283__plt02820__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0839679986,-1,1.14596216,1.303992,1
+fields/00283__plt02820__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.195488006,-1,1.25506793,1.30945267,1
+fields/00282__plt02820__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,3.17721605,-1,7.57918171,3.36168205,1
+fields/00285__plt02840__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.242431998,-1,1.30104147,1.31703366,1
+fields/00282__plt02820__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.94934404,-1,5.52728653,2.20228937,1
+fields/00286__plt02860__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.483168006,-1,7.58375884,0.667522673,1
+fields/00284__plt02840__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.383296013,-1,7.58041453,0.567732013,1
+fields/00284__plt02840__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.722751975,-1,7.49309342,0.909337308,1
+fields/00286__plt02860__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.16182399,-1,7.49274539,1.34841799,1
+fields/00285__plt02840__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.236095995,-1,1.25473791,1.35035366,1
+fields/00287__plt02860__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.359744012,-1,1.25418862,1.47448968,1
+fields/00287__plt02860__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0827839971,-1,1.30166852,1.156868,1
+fields/00288__plt02880__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.53129601,-1,5.53542733,1.78386935,1
+fields/00288__plt02880__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.47718406,-1,7.58030493,1.66162272,1
+fields/00289__plt02880__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.584288001,-1,1.25498306,1.698328,1
+fields/00290__plt02900__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.22537601,-1,7.5789352,1.40984801,1
+fields/00289__plt02880__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.409824014,-1,1.30284714,1.48293635,1
+fields/00291__plt02900__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.401567996,-1,1.3043296,1.47346066,1
+fields/00290__plt02900__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.593439996,-1,7.49180855,0.78005733,1
+fields/00291__plt02900__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.271456003,-1,1.25381183,1.38653667,1
+fields/00292__plt02920__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.590879977,-1,7.49437873,0.77743331,1
+fields/00293__plt02920__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.101471998,-1,1.25376836,1.21659133,1
+fields/00293__plt02920__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.292672008,-1,1.30523394,1.36382201,1
+fields/00292__plt02920__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.21078396,-1,7.57329712,1.39539329,1
+fields/00294__plt02940__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.31593597,-1,5.54078004,1.5682653,1
+fields/00294__plt02940__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.42396796,-1,6.21724694,1.64884262,1
+fields/00296__plt02960__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.38860798,-1,7.58749041,1.57287198,1
+fields/00295__plt02940__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.541152,-1,1.25453712,1.655588,1
+fields/00296__plt02960__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.09187198,-1,5.54397318,1.34405598,1
+fields/00297__plt02960__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.236128002,-1,1.25513591,1.35003234,1
+fields/00295__plt02940__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.330624014,-1,1.3062156,1.40096901,1
+fields/00297__plt02960__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.302464008,-1,1.30727981,1.37193767,1
+fields/00298__plt02980__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.31142402,-1,5.54215645,1.56369068,1
+fields/00298__plt02980__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.353408009,-1,6.23538122,0.577628675,1
+fields/00299__plt02980__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.200767994,-1,1.30824415,1.26945333,1
+fields/00299__plt02980__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.766367972,-1,1.25303984,1.88213564,1
+fields/00300__plt03000__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.490303993,-1,7.49853222,0.676753993,1
+fields/00300__plt03000__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.445600003,-1,6.22573712,0.670168003,1
+fields/00302__plt03020__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.943264008,-1,7.50057046,1.12966334,1
+fields/00302__plt03020__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.265471995,-1,7.58392339,0.449822662,1
+fields/00301__plt03000__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.174367994,-1,1.25204525,1.29102199,1
+fields/00301__plt03000__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0799999982,-1,1.30929532,1.14782733,1
+fields/00303__plt03020__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.292512,-1,1.25158309,1.40957833,1
+fields/00303__plt03020__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.595264018,-1,1.31067576,1.66196668,1
+fields/00305__plt03040__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.39596799,-1,1.31089042,1.46249599,1
+fields/00304__plt03040__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,1.16252804,-1,6.22913969,1.38697337,1
+fields/00305__plt03040__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.259968013,-1,1.25233534,1.37636335,1
+fields/00306__plt03060__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.188416004,-1,7.50489196,0.374708004,1
+fields/00306__plt03060__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.207680002,-1,6.23933262,0.431758669,1
+fields/00307__plt03060__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0801279992,-1,1.31093262,1.14662167,1
+fields/00304__plt03040__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,1.25667202,-1,5.5464218,1.50874469,1
+fields/00308__plt03080__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.204224005,-1,7.50397893,0.390538672,1
+fields/00309__plt03080__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0858879983,-1,1.31294791,1.15074467,1
+fields/00307__plt03060__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.441152006,-1,1.25235105,1.55753334,1
+fields/00308__plt03080__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.415104002,-1,6.22688322,0.639630668,1
+fields/00309__plt03080__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.341535985,-1,1.25403376,1.45641932,1
+fields/00310__plt03100__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.325632006,-1,6.23173109,0.549984006,1
+fields/00310__plt03100__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.184159994,-1,7.50185834,0.370527327,1
+fields/00311__plt03100__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.214655995,-1,1.25486817,1.328798,1
+fields/00311__plt03100__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.388671994,-1,1.31420881,1.45250699,1
+fields/00312__plt03120__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.765056014,-1,7.49989987,0.951472014,1
+fields/00312__plt03120__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.06156802,-1,7.58776494,1.24582536,1
+fields/00313__plt03120__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0627840012,-1,1.25512615,1.176697,1
+fields/00316__plt03160__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.51235199,-1,7.59639514,0.69639999,1
+fields/00313__plt03120__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.244831994,-1,1.31428706,1.30860366,1
+fields/00314__plt03140__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.12796795,-1,7.59380952,1.31207862,1
+fields/00314__plt03140__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,1.00713599,-1,7.49984622,1.19355332,1
+fields/00315__plt03140__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.436320007,-1,1.31454574,1.49988234,1
+fields/00315__plt03140__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.408991992,-1,1.25461443,1.52335933,1
+fields/00317__plt03160__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0827199966,-1,1.31524568,1.14571633,1
+fields/00316__plt03160__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.895839989,-1,7.50113385,1.08222532,1
+fields/00318__plt03180__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.318239987,-1,6.22899167,0.542690654,1
+fields/00317__plt03160__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0773120001,-1,1.25442794,1.191845,1
+fields/00319__plt03180__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.390976012,-1,1.31608552,1.45329401,1
+fields/00318__plt03180__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.371872008,-1,5.56616273,0.623050675,1
+fields/00320__plt03200__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.902144015,-1,6.2340096,1.12641401,1
+fields/00321__plt03200__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.225920007,-1,1.25301887,1.34170634,1
+fields/00322__plt03220__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.680224001,-1,7.600938,0.864162001,1
+fields/00322__plt03220__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.211232007,-1,7.50564404,0.39750534,1
+fields/00319__plt03180__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0938879997,-1,1.25404913,1.20875767,1
+fields/00323__plt03220__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.224191993,-1,1.2532862,1.33974033,1
+fields/00320__plt03200__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.900128007,-1,5.58513721,1.15045334,1
+fields/00323__plt03220__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.233375996,-1,1.31931575,1.293093,1
+fields/00324__plt03240__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.284287989,-1,6.24836726,0.508042656,1
+fields/00321__plt03200__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.074752003,-1,1.15136529,1.28905067,1
+fields/00325__plt03240__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0848959982,-1,1.32084718,1.14338433,1
+fields/00324__plt03240__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.541823983,-1,7.51158534,0.727949983,1
+fields/00325__plt03240__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.237856001,-1,1.25279955,1.35383767,1
+fields/00327__plt03260__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0732799992,-1,1.25237348,1.18964133,1
+fields/00327__plt03260__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.127327994,-1,1.32066377,1.18596333,1
+fields/00326__plt03260__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.670368016,-1,7.59031897,0.854563349,1
+fields/00326__plt03260__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.208352,-1,7.5113432,0.394484,1
+fields/00328__plt03280__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.184384003,-1,7.59628508,0.36843467,1
+fields/00328__plt03280__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.342368007,-1,5.61877612,0.591194673,1
+fields/00329__plt03280__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.117087997,-1,1.25194808,1.23382866,1
+fields/00329__plt03280__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0723199993,-1,1.32004571,1.131451,1
+fields/00330__plt03300__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.175648004,-1,5.59207726,0.42566267,1
+fields/00330__plt03300__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.207967997,-1,7.58617297,0.392263997,1
+fields/00331__plt03300__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0830719993,-1,1.32202663,1.140616,1
+fields/00331__plt03300__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0629760027,-1,1.25308962,1.17869934,1
+fields/00332__plt03320__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.184959993,-1,7.59744089,0.368982659,1
+fields/00333__plt03320__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0806400031,-1,1.25392766,1.19561767,1
+fields/00332__plt03320__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.191744,-1,5.66136835,0.438698666,1
+fields/00336__plt03360__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.201023996,-1,7.51508462,0.387063329,1
+fields/00333__plt03320__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0804480016,-1,1.31874041,1.14062733,1
+fields/00334__plt03340__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.180160001,-1,6.26232367,0.403416001,1
+fields/00335__plt03340__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0797759965,-1,1.31884491,1.13987133,1
+fields/00337__plt03360__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0769279972,-1,1.25482838,1.19110533,1
+fields/00334__plt03340__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.479647994,-1,7.51349608,0.665726661,1
+fields/00338__plt03380__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.387744009,-1,6.2669647,0.610834676,1
+fields/00338__plt03380__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.179455996,-1,5.79414991,0.420751329,1
+fields/00337__plt03360__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0695680007,-1,1.32290436,1.12641033,1
+fields/00335__plt03340__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0703999996,-1,1.25397489,1.18533567,1
+fields/00336__plt03360__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.183776006,-1,7.60245349,0.367677339,1
+fields/00339__plt03380__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0684799999,-1,1.2566209,1.181068,1
+fields/00339__plt03380__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0860479996,-1,1.32083304,1.14454767,1
+fields/00340__plt03400__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.396863997,-1,7.59380952,0.580974664,1
+fields/00341__plt03400__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.108159997,-1,1.25795092,1.21957166,1
+fields/00342__plt03420__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.542496026,-1,6.27221285,0.765400026,1
+fields/00341__plt03400__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0853120014,-1,1.32245847,1.14251067,1
+fields/00343__plt03420__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0707840025,-1,1.32352427,1.12713134,1
+fields/00340__plt03400__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.710016012,-1,5.79023049,0.951474679,1
+fields/00342__plt03420__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.247776002,-1,5.82498535,0.487794002,1
+fields/00344__plt03440__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.35097599,-1,6.27003755,0.573957324,1
+fields/00343__plt03420__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0712319985,-1,1.26118271,1.17979567,1
+fields/00345__plt03440__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.158784002,-1,1.32504372,1.21392,1
+fields/00345__plt03440__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0786880031,-1,1.26190821,1.18661434,1
+fields/00344__plt03440__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.215775996,-1,7.51381912,0.401846663,1
+fields/00347__plt03460__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0698560029,-1,1.32727905,1.123215,1
+fields/00347__plt03460__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0799359977,-1,1.26285313,1.18703333,1
+fields/00346__plt03460__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.920768023,-1,7.60670008,1.10456669,1
+fields/00348__plt03480__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.190400004,-1,7.51120869,0.376535338,1
+fields/00349__plt03480__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0706880018,-1,1.25956172,1.18067834,1
+fields/00346__plt03460__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.205119997,-1,5.90788647,0.441769997,1
+fields/00348__plt03480__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.271840006,-1,7.6101781,0.455554673,1
+fields/00349__plt03480__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0793600008,-1,1.32662541,1.133238,1
+fields/00350__plt03500__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.185087994,-1,7.61504161,0.368685327,1
+fields/00350__plt03500__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.180352002,-1,7.51441143,0.366408002,1
+fields/00351__plt03500__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0808959976,-1,1.16860454,1.27728133,1
+fields/00352__plt03520__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.468479991,-1,6.02173064,0.700655991,1
+fields/00351__plt03500__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0795840025,-1,1.32134901,1.13767034,1
+fields/00353__plt03520__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0858559981,-1,1.31631103,1.147992,1
+fields/00354__plt03540__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.185599998,-1,7.51314616,0.371687331,1
+fields/00354__plt03540__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,30,ndzip shuffle=bit,primary,0.0860159993,-1,3.14389197,0.530719999,1
+fields/00352__plt03520__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.172736004,-1,7.61952375,0.356225337,1
+fields/00355__plt03540__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0680319965,-1,1.25715159,1.18015033,1
+fields/00355__plt03540__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0680000037,-1,1.31374654,1.13220934,1
+fields/00356__plt03560__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.175071999,-1,6.30491068,0.396819999,1
+fields/00353__plt03520__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0727040023,-1,1.16873088,1.26896,1
+fields/00358__plt03580__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.314687997,-1,7.62473186,0.498051997,1
+fields/00356__plt03560__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.450976014,-1,7.51225803,0.637085347,1
+fields/00357__plt03560__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0733119994,-1,1.25731364,1.185287,1
+fields/00357__plt03560__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0956799984,-1,1.31402642,1.15966267,1
+fields/00359__plt03580__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0962240025,-1,1.25762013,1.207928,1
+fields/00360__plt03600__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.445055991,-1,7.51147772,0.631184658,1
+fields/00358__plt03580__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.189472005,-1,6.12818879,0.417614671,1
+fields/00360__plt03600__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.183487996,-1,6.30805881,0.40512533,1
+fields/00359__plt03580__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0767360032,-1,1.31764422,1.13779734,1
+fields/00361__plt03600__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.070848003,-1,1.32207497,1.12835334,1
+fields/00361__plt03600__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0667840019,-1,1.25803506,1.17812134,1
+fields/00364__plt03640__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.226144001,-1,7.62744955,0.409442668,1
+fields/00362__plt03620__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.134304002,-1,6.30803984,0.355942002,1
+fields/00362__plt03620__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.148800001,-1,6.16023076,0.375756001,1
+fields/00363__plt03620__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0706560016,-1,1.31959718,1.130147,1
+fields/00366__plt03660__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.195968002,-1,6.32758652,0.416921335,1
+fields/00363__plt03620__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.147872001,-1,1.25887519,1.25846767,1
+fields/00366__plt03660__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.209344,-1,7.5042743,0.395651333,1
+fields/00364__plt03640__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.279967993,-1,7.50986382,0.46613666,1
+fields/00367__plt03660__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.087935999,-1,1.26321597,1.19471533,1
+fields/00365__plt03640__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0687040016,-1,1.26071606,1.177678,1
+fields/00365__plt03640__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0898559988,-1,1.31282791,1.15481,1
+fields/00367__plt03660__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.084991999,-1,1.30966081,1.15252133,1
+fields/00370__plt03700__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.261696011,-1,7.64432586,0.444590011,1
+fields/00368__plt03680__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.390399992,-1,7.63439122,0.573531992,1
+fields/00371__plt03700__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0694079995,-1,1.26225569,1.17702933,1
+fields/00368__plt03680__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.123039998,-1,7.50553659,0.309315998,1
+fields/00371__plt03700__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0727360025,-1,1.30638851,1.14293934,1
+fields/00372__plt03720__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.237920001,-1,6.33102491,0.458753334,1
+fields/00369__plt03680__rho.f32__c0001__dt-f32/chunk_0,3000000,38,spspeed,primary,0.0582079999,-1,1.18349302,1.23954267,1
+fields/00373__plt03720__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0608960018,-1,1.26244604,1.16835034,1
+fields/00372__plt03720__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.208672002,-1,7.50631566,0.394928669,1
+fields/00369__plt03680__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0685760006,-1,1.30998354,1.13584233,1
+fields/00370__plt03700__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.268447995,-1,6.15947086,0.495431995,1
+fields/00374__plt03740__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.201056004,-1,7.50803556,0.387270004,1
+fields/00374__plt03740__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.194112003,-1,6.3355004,0.414789336,1
+fields/00373__plt03720__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0683839992,-1,1.29902673,1.14465233,1
+fields/00375__plt03740__rho.f32__c0009__dt-f32/chunk_0,3000000,29,ndzip,primary,0.112640001,-1,1.15390439,1.32426667,1
+fields/00375__plt03740__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0745920017,-1,1.26222492,1.18224034,1
+fields/00377__plt03760__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.132223994,-1,1.2955031,1.21141966,1
+fields/00376__plt03760__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.284159988,-1,7.64742005,0.466979988,1
+fields/00377__plt03760__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.116672002,-1,1.26345989,1.22323767,1
+fields/00378__plt03780__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.341632009,-1,7.50298559,0.527971342,1
+fields/00376__plt03760__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.378784001,-1,7.50661121,0.565033334,1
+fields/00378__plt03780__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.233695999,-1,7.65887079,0.416242665,1
+fields/00380__plt03800__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.186015993,-1,6.33848758,0.406589327,1
+fields/00379__plt03780__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0768000036,-1,1.17398981,1.26769734,1
+fields/00379__plt03780__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0845760033,-1,1.29500431,1.16418734,1
+fields/00380__plt03800__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.191328004,-1,6.16032124,0.418280671,1
+fields/00382__plt03820__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.203391999,-1,6.16577289,0.430143999,1
+fields/00381__plt03800__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0728640035,-1,1.28939224,1.15717434,1
+fields/00381__plt03800__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.158559993,-1,1.26534054,1.26348099,1
+fields/00383__plt03820__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0682879984,-1,1.28638245,1.15513533,1
+fields/00384__plt03840__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.181664005,-1,7.66222872,0.364130672,1
+fields/00385__plt03840__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0689600036,-1,1.26518405,1.17401767,1
+fields/00382__plt03820__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.296992004,-1,7.66203276,0.479463337,1
+fields/00384__plt03840__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.373279989,-1,7.50583208,0.559548655,1
+fields/00383__plt03820__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0987839997,-1,1.26486051,1.20412433,1
+fields/00386__plt03860__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.191520005,-1,7.66463704,0.373929339,1
+fields/00386__plt03860__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.178240001,-1,7.50397893,0.364554668,1
+fields/00385__plt03840__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0858559981,-1,1.28642506,1.17266733,1
+fields/00387__plt03860__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.115391999,-1,1.26450358,1.22104433,1
+fields/00387__plt03860__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0803200006,-1,1.2829886,1.17004233,1
+fields/00388__plt03880__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.284960002,-1,7.50524112,0.471243335,1
+fields/00388__plt03880__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.295327991,-1,6.3521957,0.515425325,1
+fields/00389__plt03880__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.153247997,-1,1.26441972,1.25897366,1
+fields/00392__plt03920__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.217695996,-1,7.66912168,0.399998663,1
+fields/00389__plt03880__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0750719979,-1,1.27779326,1.169225,1
+fields/00391__plt03900__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0855680034,-1,1.27481716,1.18227534,1
+fields/00393__plt03920__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.119903997,-1,1.26641487,1.22388766,1
+fields/00390__plt03900__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.154080003,-1,7.66755146,0.336420003,1
+fields/00393__plt03920__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0716480017,-1,1.26986949,1.17262834,1
+fields/00391__plt03900__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0783040002,-1,1.26579763,1.182826,1
+fields/00394__plt03940__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.188255996,-1,6.37000453,0.407737996,1
+fields/00390__plt03900__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.288192004,-1,6.18040039,0.514407337,1
+fields/00394__plt03940__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.181216002,-1,6.19111048,0.407040002,1
+fields/00392__plt03920__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.235039994,-1,6.18362593,0.461137327,1
+fields/00395__plt03940__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0755200014,-1,1.2683308,1.177836,1
+fields/00395__plt03940__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0714880005,-1,1.26337122,1.17813133,1
+fields/00396__plt03960__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.173344001,-1,6.37808313,0.392548001,1
+fields/00396__plt03960__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.690303981,-1,7.50720238,0.876538648,1
+fields/00397__plt03960__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0838719979,-1,1.25605379,1.19696233,1
+fields/00399__plt03980__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.108992003,-1,1.2691567,1.21059067,1
+fields/00398__plt03980__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.202720001,-1,7.69453056,0.384420668,1
+fields/00397__plt03960__rho.f32__c0001__dt-f32/chunk_0,3000000,29,ndzip,primary,0.0778239965,-1,1.18071315,1.26194,1
+fields/00400__plt04000__part_per_cell.f32__c0001__dt-f32/chunk_0,3000000,0,ans,primary,0.40476799,-1,6.39098927,0.623529323,1
+fields/00399__plt03980__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0678720027,-1,1.25403001,1.18275867,1
+fields/00398__plt03980__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,2,ans shuffle=byte,primary,0.654879987,-1,7.51252714,0.840982654,1
+fields/00401__plt04000__rho.f32__c0001__dt-f32/chunk_0,3000000,35,spratio,primary,0.0684479997,-1,1.26970496,1.169571,1
+fields/00400__plt04000__part_per_cell.f32__c0009__dt-f32/chunk_0,3000000,0,ans,primary,0.173184007,-1,6.20396765,0.398540007,1
+fields/00401__plt04000__rho.f32__c0009__dt-f32/chunk_0,3000000,35,spratio,primary,0.0689600036,-1,1.25449772,1.183431,1
