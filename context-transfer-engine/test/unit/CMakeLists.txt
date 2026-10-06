@@ -2274,3 +2274,19 @@ set_tests_properties(cte_tag_name_rekey PROPERTIES
     TIMEOUT 120
     LABELS "unit;cte"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+
+# Well-known CTE ChiMod pool ids are distinct (issue #1186): a compile-time
+# check over whichever optional modules this build includes.
+add_executable(test_well_known_pool_ids test_well_known_pool_ids.cc)
+target_link_libraries(test_well_known_pool_ids clio_cte_core_client)
+foreach(_wk_mod filesystem replication cache indexer stream checkpoint)
+  if(TARGET clio_cte_${_wk_mod}_client)
+    target_link_libraries(test_well_known_pool_ids clio_cte_${_wk_mod}_client)
+    string(TOUPPER "${_wk_mod}" _wk_upper)
+    target_compile_definitions(test_well_known_pool_ids PRIVATE
+        CLIO_HAVE_${_wk_upper})
+  endif()
+endforeach()
+add_test(NAME cte_well_known_pool_ids COMMAND test_well_known_pool_ids)
+set_tests_properties(cte_well_known_pool_ids PROPERTIES
+    TIMEOUT 30 LABELS "unit;cte")
