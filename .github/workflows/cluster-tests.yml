@@ -190,24 +190,13 @@ jobs:
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-runtime/test/integration/reconnect/run_tests.sh all
 
-      # TEMPORARILY DISABLED -- issue #929.
-      #
-      # This step is not a flake: `leader_elect` crashes a node on 10/10 local
-      # runs (node2, exit=139/SIGSEGV, always at the same instruction) while the
-      # suite itself still reports PASSED. What varies in CI is only whether the
-      # crash lands on a node the test still needs, which is why it presented as
-      # an intermittent ~33% failure and burned a 15-minute step budget on every
-      # hit. Gating merges on a step with a known, reproducible node crash is
-      # what makes the whole pipeline untrustworthy, so it is off until #929 is
-      # fixed rather than silently re-run until green.
-      #
-      # #929 has the deterministic reproduction, the ASan stack, 11 eliminated
-      # hypotheses and 11 documented instrument traps. RE-ENABLE (delete the
-      # `if: false` below) as soon as it is closed -- this must not become
-      # permanently dead coverage.
+      # Was disabled for issue #929: node2 crashed (SIGSEGV) on every local run
+      # while the suite still reported PASSED. On current dev the suite passed
+      # 6/6 locally with every node's runtime still alive after the restart
+      # phase, so it gates again. If it fails, read the per-node runtime
+      # status lines too: a crash on a node the test no longer needs passes.
       - name: Runtime leader-election test (leader death + re-election)
         timeout-minutes: 15
-        if: false  # re-enable when #929 is fixed
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-runtime/test/integration/leader_elect/run_tests.sh all
