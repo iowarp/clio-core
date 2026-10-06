@@ -91,7 +91,9 @@
 #include <sys/wait.h>
 #if __linux__
 #include <sys/sysinfo.h>
+#include <sys/sysmacros.h>
 #else
+#include <sys/mount.h>
 #include <sys/sysctl.h>
 #endif
 #include <sys/types.h>
@@ -1708,6 +1710,47 @@ SharedLibrary &SharedLibrary::operator=(SharedLibrary &&other) noexcept {
   return *this;
 }
 
+#if CTP_ENABLE_PROCFS_SYSINFO
+/**
+ * Name the block device backing a path, without running a subprocess
+ * (issue #809). This used to popen("df -P <path> | tail | awk"): every call
+ * forked a shell that inherited every descriptor the process had open without
+ * close-on-exec, including the flock()ed descriptor of an HDF5 file -- whose
+ * lock then outlived H5Fclose() until the shell exited, so an immediate reopen
+ * failed with EAGAIN. The bdev health poll calls this repeatedly.
+ * @param path a file or directory
+ * @return the backing device's name (e.g. "nvme0n1p1", "disk1s1"), or "" if
+ *         it is not a real block device (overlay, tmpfs, ...)
+ */
+static std::string BackingDeviceName(const std::string &path) {
+#if defined(__linux__)
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) return "";
+  // /sys/dev/block/MAJ:MIN links to the device's sysfs node, whose last
+  // component is the device name df reports under /dev.
+  const std::string link = "/sys/dev/block/" +
+                           std::to_string(major(st.st_dev)) + ":" +
+                           std::to_string(minor(st.st_dev));
+  char target[PATH_MAX];
+  ssize_t n = readlink(link.c_str(), target, sizeof(target) - 1);
+  if (n <= 0) return "";
+  std::string t(target, static_cast<size_t>(n));
+  size_t slash = t.find_last_of('/');
+  return slash == std::string::npos ? t : t.substr(slash + 1);
+#elif defined(__APPLE__)
+  // statfs reports the mount's source, which is what df prints.
+  struct statfs sfs;
+  if (statfs(path.c_str(), &sfs) != 0) return "";
+  std::string from = sfs.f_mntfromname;
+  if (from.rfind("/dev/", 0) != 0) return "";
+  return from.substr(5);
+#else
+  (void)path;
+  return "";
+#endif
+}
+#endif
+
 /// @brief Retrieves storage device hardware health statistics.
 ///
 /// Reads a JSON file left by an external admin service
@@ -1716,33 +1759,19 @@ SharedLibrary &SharedLibrary::operator=(SharedLibrary &&other) noexcept {
 /// elevated privileges; this function is purely a non-root consumer.
 ///
 /// @param path  Path to the file or block device whose health to query.
-///              If not already a /dev/ node, df is used to find the backing
-///              device so the correct per-device JSON file is located.
+///              If not already a /dev/ node, the backing device is looked up
+///              so the correct per-device JSON file is located.
 /// @return      JSON string with health stats, or "{}" if unavailable.
 std::string SystemInfo::GetDeviceHealthStats(const std::string &path) {
 #if CTP_ENABLE_PROCFS_SYSINFO
   std::string device = path;
 
-  // If the path is not a raw block device, find the mount's backing device.
+  // If the path is not a raw block device, find the mount's backing device
+  // (left as the path itself when it has none, e.g. overlay in containers).
   if (path.find("/dev/") != 0) {
-    // Quote path to handle spaces safely.
-    std::string cmd =
-        "df -P \"" + path + "\" 2>/dev/null | tail -1 | awk '{print $1}'";
-    char buffer[256];
-    FILE *pipe = popen(cmd.c_str(), "r");
-    if (pipe) {
-      if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        std::string df_out = buffer;
-        if (!df_out.empty() && df_out.back() == '\n') {
-          df_out.pop_back();
-        }
-        // Only use the df output if it returned a real /dev/ node
-        // (ignore things like 'overlay' in containers).
-        if (df_out.find("/dev/") == 0) {
-          device = df_out;
-        }
-      }
-      pclose(pipe);
+    const std::string backing = BackingDeviceName(path);
+    if (!backing.empty()) {
+      device = "/dev/" + backing;
     }
   }
 
