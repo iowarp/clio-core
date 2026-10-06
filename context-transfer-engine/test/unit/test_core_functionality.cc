@@ -2474,21 +2474,12 @@ TEST_CASE("FUNCTIONAL - Distributed Execution Validation",
   HLOG(kInfo, "  Average: {}", get_avg_completer);
 
   // Validation: If multiple nodes exist, average completer should be > 0
-  // indicating distributed execution.
-  //
-  // TEMP-DISABLED (#503): in the 4-node docker setup every CTE blob op
-  // resolves to the client node's single local container (completer == 0 for
-  // all ops) instead of fanning out cross-node, so these assertions fail. The
-  // Put/Get data-integrity checks above still run. Re-enable once #503/#502 is
-  // fixed (CTE blob ops should route to remote containers, or this should
-  // assert on resolved target-node distribution rather than local completer_).
+  // indicating distributed execution. (#503: blob ops did route cross-node,
+  // but a node executing a task routed to it by another never recorded
+  // itself as the completer, so every op reported container 0.)
   if (num_nodes > 1) {
-    HLOG(kWarning,
-         "[#503] Cross-node distribution validation temporarily disabled "
-         "(put_avg_completer={}, get_avg_completer={}, num_nodes={})",
-         put_avg_completer, get_avg_completer, num_nodes);
-    // REQUIRE(put_avg_completer > 0.0);
-    // REQUIRE(get_avg_completer > 0.0);
+    REQUIRE(put_avg_completer > 0.0);
+    REQUIRE(get_avg_completer > 0.0);
   } else {
     INFO("Single node test - distributed execution validation skipped");
   }
