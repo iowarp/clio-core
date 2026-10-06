@@ -1006,3 +1006,48 @@ def t_crash_cycles(ctx):
   ctx.ok(0, 'write_file', path=p, size=8 << 20, seed=23, fsync=True)
   v = ctx.ok(n - 1, 'verify_file', path=p, size=8 << 20, seed=23)
   ctx.check(v['ok'], f'write after the crash cycles: {v}')
+
+
+# ---------------------------------------------------------------------------
+# A parity disk replaced while a data disk is also dead (#1199)
+# ---------------------------------------------------------------------------
+@test('safe_parity_replaced_with_data_down', 'safe', min_nodes=1,
+      redeploy_after=True, timeout=5400)
+def t_parity_replaced_with_data_down(ctx):
+  """Two members down in every array -- a data disk and a parity disk, i.e.
+  max_failures -- while every node writes fsynced record files. The parity
+  disk is then swapped for a fresh one and rebuilt with the data disk still
+  dead: the rebuild must succeed (the down data column is decoded from the
+  other parity), redundancy must be back (a SECOND data disk then dies and
+  every fsynced version still reads back), and a crash restart must keep
+  it all."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('pr')
+  ctx.ok(0, 'mkdir', path=base)
+  th, replies, logs, nfiles = _writers(ctx, base, 150, 'parrep')
+  time.sleep(20)
+  for h in cl.hosts:
+    cl.kill_disk(h, 1)                 # a data member
+  time.sleep(15)
+  for h in cl.hosts:
+    cl.kill_disk(h, SAFE_MEMBERS - 2)  # the first parity member
+  time.sleep(15)
+  t0 = time.time()
+  res = parallel(lambda h: cl.replace_disk(h, SAFE_MEMBERS - 2), cl.hosts)
+  ctx.metrics['parity_rebuild_s'] = round(time.time() - t0, 1)
+  failed = {h: str(r)[-400:] for h, r in zip(cl.hosts, res)
+            if isinstance(r, Exception) or r[0] != 0}
+  ctx.check(not failed, 'parity rebuild with a data member down failed: '
+                        f'{failed}')
+  for h in cl.hosts:
+    cl.kill_disk(h, 2)                 # a second data member: the rebuilt
+                                       # parity must now carry the stripe
+  th.join(timeout=150 + 1200)
+  ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'with two data members dead behind a rebuilt parity disk')
+  restart_cluster(ctx, crash=True)
+  cl.agents.clear()
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after a crash restart with the rebuilt parity seated')
