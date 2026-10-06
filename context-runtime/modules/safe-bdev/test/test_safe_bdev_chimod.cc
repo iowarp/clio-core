@@ -385,6 +385,101 @@ TEST_CASE("safe_bdev_ec_roundtrip_recovery", "[safe_bdev][ec][recovery]") {
   HLOG(kInfo, "safe_bdev EC end-to-end test PASSED");
 }
 
+TEST_CASE("safe_bdev_parity_rebuild_with_data_down",
+          "[safe_bdev][ec][recovery][parity]") {
+  // #1199: with one data member AND one parity member down (max_failures=2),
+  // the parity member must still be rebuildable -- the down data column is
+  // decoded from the other parity -- and the rebuilt parity must then carry a
+  // second data failure.
+  EnsureInit();
+  REQUIRE(g_initialized);
+  std::this_thread::sleep_for(100ms);
+  const int pidsalt = static_cast<int>(getpid() & 0xFFF);
+  auto member_name = [&](int idx) {
+    return "safe_pr_member_" + std::to_string(getpid()) + "_" +
+           std::to_string(idx);
+  };
+  const int k = 3;
+  std::vector<clio::run::PoolId> data_ids;
+  for (int c = 0; c < k; ++c) {
+    clio::run::PoolId id(static_cast<clio::run::u32>(8100 + pidsalt + c), 0);
+    clio::run::bdev::Client client(id);
+    REQUIRE(CreateRamMember(client, member_name(c), id));
+    data_ids.push_back(client.pool_id_);
+  }
+  std::vector<clio::run::PoolId> parity_ids;
+  for (int j = 0; j < 2; ++j) {
+    clio::run::PoolId id(static_cast<clio::run::u32>(8200 + pidsalt + j), 0);
+    clio::run::bdev::Client client(id);
+    REQUIRE(CreateRamMember(client, member_name(100 + j), id));
+    parity_ids.push_back(client.pool_id_);
+  }
+  clio::run::PoolId safe_id(static_cast<clio::run::u32>(8300 + pidsalt), 0);
+  clio::run::safe_bdev::Client safe(safe_id);
+  std::vector<clio::run::safe_bdev::MemberBdevDesc> members;
+  for (int c = 0; c < k; ++c) {
+    members.emplace_back(member_name(c), /*node_id=*/0, data_ids[c]);
+  }
+  auto create_task = safe.AsyncCreate(clio::run::PoolQuery::Dynamic(),
+                                      "safe_bdev_parity_rebuild_pool", safe_id,
+                                      /*max_failures=*/2, members);
+  create_task.Wait();
+  safe.pool_id_ = create_task->new_pool_id_;
+  REQUIRE(create_task->GetReturnCode() == 0);
+  for (int j = 0; j < 2; ++j) {
+    auto add = safe.AsyncAddBdev(clio::run::PoolQuery::Dynamic(),
+                                 member_name(100 + j), /*node_id=*/0,
+                                 parity_ids[static_cast<size_t>(j)],
+                                 /*as_parity=*/1);
+    add.Wait();
+    REQUIRE(add->GetReturnCode() == 0);
+  }
+  const clio::run::u64 io_len = 2 * static_cast<clio::run::u64>(k) * kChunkLen;
+  std::vector<clio::run::bdev::Block> blocks = AllocBlocks(safe, io_len);
+  std::vector<ctp::u8> pattern = MakePattern(io_len, 0xC3);
+  WriteBlocks(safe, blocks, pattern);
+  auto flush = safe.AsyncBuildParity(clio::run::PoolQuery::Dynamic(), 0);
+  flush.Wait();
+  REQUIRE(flush->GetReturnCode() == 0);
+  // Data member 1 and parity row 0 die: two down, within max_failures.
+  auto rm_d = safe.AsyncRemoveBdev(clio::run::PoolQuery::Dynamic(), data_ids[1],
+                                   /*was_faulty=*/1);
+  rm_d.Wait();
+  REQUIRE(rm_d->GetReturnCode() == 0);
+  auto rm_p = safe.AsyncRemoveBdev(clio::run::PoolQuery::Dynamic(),
+                                   parity_ids[0], /*was_faulty=*/1);
+  rm_p.Wait();
+  REQUIRE(rm_p->GetReturnCode() == 0);
+  {
+    std::vector<ctp::u8> got;
+    ReadBlocks(safe, blocks, got);
+    REQUIRE(got == pattern);
+  }
+  // Rebuild the parity row onto a fresh member while data member 1 is down.
+  clio::run::PoolId recover_id(static_cast<clio::run::u32>(8400 + pidsalt), 0);
+  clio::run::bdev::Client recover_client(recover_id);
+  REQUIRE(CreateRamMember(recover_client, member_name(200), recover_id));
+  recover_id = recover_client.pool_id_;
+  auto rec = safe.AsyncRecoverBdev(clio::run::PoolQuery::Dynamic(),
+                                   parity_ids[0], member_name(200),
+                                   /*node_id=*/0, recover_id);
+  rec.Wait();
+  REQUIRE(rec->GetReturnCode() == 0);
+  // The rebuilt parity must be correct: a SECOND data member dies (two data
+  // columns down now) and every byte still reads back.
+  auto rm_d0 = safe.AsyncRemoveBdev(clio::run::PoolQuery::Dynamic(),
+                                    data_ids[0], /*was_faulty=*/1);
+  rm_d0.Wait();
+  REQUIRE(rm_d0->GetReturnCode() == 0);
+  {
+    std::vector<ctp::u8> got;
+    ReadBlocks(safe, blocks, got);
+    REQUIRE(got == pattern);
+  }
+  HLOG(kInfo, "safe_bdev: parity rebuilt with a data member down, then "
+              "carried a second data failure -- OK");
+}
+
 TEST_CASE("safe_bdev_raid0_striping", "[safe_bdev][ec][striping]") {
   EnsureInit();
   REQUIRE(g_initialized);

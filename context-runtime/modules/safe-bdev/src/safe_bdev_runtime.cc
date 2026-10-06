@@ -2642,6 +2642,53 @@ clio::run::TaskResume Runtime::RebuildMember(bool is_data, int idx, bool &ok,
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::RebuildParityShard(
+    clio::run::u64 s, const std::vector<int> &stripe, int idx,
+    std::vector<uint8_t> &chunk, bool &built) {
+  CLIO_TASK_BODY_BEGIN
+  const int k_s = static_cast<int>(stripe.size());
+  std::vector<std::vector<uint8_t>> dchunks;
+  std::vector<int> down;
+  for (int d : stripe) {
+    if (static_cast<size_t>(d) >= data_members_.size() ||
+        !DataActive(static_cast<size_t>(d))) {
+      down.push_back(d);
+    }
+  }
+  if (down.empty()) {
+    // Every data column is on disk: read them as they are.
+    dchunks.assign(static_cast<size_t>(k_s),
+                   std::vector<uint8_t>(kChunkLen, 0));
+    built = true;
+    for (int pos = 0; pos < k_s && built; ++pos) {
+      const int d = stripe[static_cast<size_t>(pos)];
+      CLIO_CO_AWAIT(ReadDataSegment(static_cast<size_t>(d), SlotPhysOffset(s),
+                                    dchunks[static_cast<size_t>(pos)].data(),
+                                    kChunkLen, built));
+    }
+  } else {
+    // A data column is down: decode all k_s data chunks from the active
+    // data members plus the other parity rows (this row is faulty while it
+    // rebuilds and is not consulted).
+    CLIO_CO_AWAIT(ReconstructStripe(s, stripe, down, dchunks, built));
+    if (!built) {
+      HLOG(kError,
+           "safe_bdev RebuildMember: slot {}: cannot rebuild parity row {} "
+           "with {} data column(s) down -- too few survivors",
+           s, idx, down.size());
+    }
+  }
+  if (built) {
+    std::vector<const uint8_t *> ptrs(static_cast<size_t>(k_s));
+    for (int pos = 0; pos < k_s; ++pos) {
+      ptrs[static_cast<size_t>(pos)] = dchunks[static_cast<size_t>(pos)].data();
+    }
+    GetCodec(k_s)->EncodeParityShard(idx, ptrs, kChunkLen, chunk.data());
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::RebuildRedo(bool is_data, int idx, bool &ok) {
   CLIO_TASK_BODY_BEGIN
   std::set<clio::run::u64> redo;
@@ -2722,29 +2769,9 @@ clio::run::TaskResume Runtime::RebuildSlot(bool is_data, int idx,
         chunk = std::move(chunks[static_cast<size_t>(it - stripe.begin())]);
       }
     } else {
-      // Recompute this parity member's shard from the stripe's data chunks
-      // (all data members must be active).
-      std::vector<std::vector<uint8_t>> dchunks(
-          static_cast<size_t>(k_s), std::vector<uint8_t>(kChunkLen, 0));
-      built = true;
-      for (int pos = 0; pos < k_s && built; ++pos) {
-        const int d = stripe[static_cast<size_t>(pos)];
-        if (!DataActive(static_cast<size_t>(d))) {
-          built = false;
-          break;
-        }
-        CLIO_CO_AWAIT(ReadDataSegment(static_cast<size_t>(d), SlotPhysOffset(s),
-                                      dchunks[static_cast<size_t>(pos)].data(),
-                                      kChunkLen, built));
-      }
-      if (built) {
-        std::vector<const uint8_t *> ptrs(static_cast<size_t>(k_s));
-        for (int pos = 0; pos < k_s; ++pos) {
-          ptrs[static_cast<size_t>(pos)] =
-              dchunks[static_cast<size_t>(pos)].data();
-        }
-        GetCodec(k_s)->EncodeParityShard(idx, ptrs, kChunkLen, chunk.data());
-      }
+      // Recompute this parity member's shard from the stripe's data chunks,
+      // decoding any down data column from the survivors first (#1199).
+      CLIO_CO_AWAIT(RebuildParityShard(s, stripe, idx, chunk, built));
     }
     ctp::ipc::FullPtr<char> buf =
         built ? ipc->AllocateBuffer(kChunkLen) : ctp::ipc::FullPtr<char>();

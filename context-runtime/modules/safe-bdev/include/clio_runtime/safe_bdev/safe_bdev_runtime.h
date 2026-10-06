@@ -1526,6 +1526,26 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume RebuildSlot(bool is_data, int idx, clio::run::u64 s,
                                     bool &ok);
 
+  /**
+   * Compute parity member `idx`'s shard of slot `s` for a rebuild. Data
+   * columns that are active are read as they are on disk; when any data
+   * column of the stripe is down, every data chunk is first decoded from the
+   * stripe's survivors (ReconstructStripe: the active data members plus the
+   * OTHER parity rows -- the rebuilding row is faulty and is not consulted),
+   * so a parity disk can be replaced while a data disk is also dead, as
+   * long as the array is within max_failures (#1199).
+   * @param s the slot
+   * @param stripe CodeColumns(): the data columns the parity encodes
+   * @param idx the parity row being rebuilt
+   * @param chunk receives the encoded shard (kChunkLen bytes)
+   * @param built receives false when the data could not be obtained
+   */
+  clio::run::TaskResume RebuildParityShard(clio::run::u64 s,
+                                           const std::vector<int> &stripe,
+                                           int idx,
+                                           std::vector<uint8_t> &chunk,
+                                           bool &built);
+
   /** Rebuild every slot recorded in rebuild_redo_ (and clear them).
    * @param is_data data (true) or parity (false) member
    * @param idx the member's column / row
