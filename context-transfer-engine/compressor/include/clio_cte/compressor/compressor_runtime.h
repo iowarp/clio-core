@@ -40,6 +40,7 @@
 #include <clio_runtime/corwlock.h>
 #include <clio_ctp/data_structures/ipc/ring_buffer.h>
 #include <clio_ctp/introspect/system_info.h>
+#include <clio_ctp/compress/compress_factory.h>
 #include <memory>
 #include <unordered_map>
 #include <thread>
@@ -59,12 +60,53 @@
 
 namespace clio::cte::compressor {
 
+/** Compression presets as stored in Context::compress_preset_ and
+ *  CompressionHeader::compress_preset_. The estimator, the executor and the
+ *  decompressor all use this one encoding (#1189). */
+static constexpr int kPresetFast = 1;
+static constexpr int kPresetBalanced = 2;
+static constexpr int kPresetBest = 3;
+
+/**
+ * Map a stored preset to the codec preset.
+ * @param preset kPresetFast / kPresetBalanced / kPresetBest (anything else
+ *        is treated as balanced)
+ * @return the matching ctp::CompressionPreset
+ */
+inline ctp::CompressionPreset PresetFromWire(int preset) {
+  switch (preset) {
+    case kPresetFast:
+      return ctp::CompressionPreset::FAST;
+    case kPresetBest:
+      return ctp::CompressionPreset::BEST;
+    default:
+      return ctp::CompressionPreset::BALANCED;
+  }
+}
+
+/**
+ * Model input features for one candidate (library, preset).
+ * @param lib_id wire library id (CompressionHeader::compress_lib_)
+ * @param preset kPresetFast / kPresetBalanced / kPresetBest
+ * @param chunk_size chunk size in bytes
+ * @param entropy Shannon entropy of the sampled chunk
+ * @param mad mean absolute deviation of the sampled chunk
+ * @param second_derivative_mean mean second derivative of the sample
+ * @param context the put's context (data type)
+ * @return features with library_config_id in GetLibraryId's ML scheme
+ */
+CompressionFeatures MakeCodecFeatures(int lib_id, int preset,
+                                      clio::run::u64 chunk_size,
+                                      double entropy, double mad,
+                                      double second_derivative_mean,
+                                      const clio::cte::core::Context &context);
+
 /**
  * Compression statistics predicted by AI models
  */
 struct CompressionStats {
   int compress_lib_;           // Compression library ID
-  int compress_preset_;        // Compression preset (0=balanced, 1=best, 2=default, 3=fast)
+  int compress_preset_;        // kPresetFast / kPresetBalanced / kPresetBest
   double compression_ratio_;   // Predicted compression ratio
   double compress_time_ms_;    // Predicted compression time in milliseconds
   double decompress_time_ms_;  // Predicted decompression time in milliseconds
@@ -205,6 +247,18 @@ private:
    */
   void SelectCodec(DynamicScheduleTask &task, void *chunk_data,
                    clio::run::u64 chunk_size);
+
+  /**
+   * SelectCodec on a bare context, for the interposer PutBlob path, which
+   * has no DynamicScheduleTask.
+   * @param context the put's context; compress_lib_/compress_preset_ are
+   *        overwritten (compress_lib_ 0 = store raw)
+   * @param chunk_data the blob bytes (host-readable)
+   * @param chunk_size number of bytes at chunk_data
+   * @param tier_score out: the selected tier's score
+   */
+  void SelectCodecFor(Context &context, void *chunk_data,
+                      clio::run::u64 chunk_size, float *tier_score);
 
   /**
    * Compress data (Method::kCompress)

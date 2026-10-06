@@ -438,6 +438,30 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 // Compression Statistics Estimation
 // ==============================================================================
 
+CompressionFeatures MakeCodecFeatures(int lib_id, int preset,
+                                      clio::run::u64 chunk_size,
+                                      double entropy, double mad,
+                                      double second_derivative_mean,
+                                      const clio::cte::core::Context &context) {
+  CompressionFeatures features;
+  // The models are keyed by GetLibraryId's scheme (base_id*10 + preset),
+  // not by the wire id the put carries (#1189).
+  features.library_config_id = static_cast<double>(
+      ctp::CompressionFactory::GetLibraryId(
+          ctp::CompressionFactory::NameForWireId(lib_id),
+          PresetFromWire(preset)));
+  features.chunk_size_bytes = static_cast<double>(chunk_size);
+  features.shannon_entropy = entropy;
+  features.mad = mad;
+  features.second_derivative_mean = second_derivative_mean;
+  features.config_fast = (preset == kPresetFast) ? 1 : 0;
+  features.config_balanced = (preset == kPresetBalanced) ? 1 : 0;
+  features.config_best = (preset == kPresetBest) ? 1 : 0;
+  features.data_type_char = (context.data_type_ == 0) ? 1 : 0;
+  features.data_type_float = (context.data_type_ == 1) ? 1 : 0;
+  return features;
+}
+
 std::vector<CompressionStats> Runtime::EstCompressionStats(
     const void* chunk, clio::run::u64 chunk_size, const Context& context) {
   std::vector<CompressionStats> results;
@@ -464,61 +488,41 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
       ctp::DataStatisticsFactory::CalculateSecondDerivative(
           chunk, num_elements, data_type);
 
-  // Determine candidate compression libraries and configs
-  // Library IDs: BROTLI=0, BZIP2=1, Blosc2=2, FPZIP=3, LZ4=4, LZMA=5,
-  //              SNAPPY=6, SZ3=7, ZFP=8, ZLIB=9, ZSTD=10
-  // Config IDs: balanced=0, best=1, default=2, fast=3
+  // Candidate (wire library id, preset). Presets use the ONE encoding the
+  // executor and CompressionHeader use: kPresetFast=1, kPresetBalanced=2,
+  // kPresetBest=3. The estimator used to encode 3=fast/0=balanced/1=best,
+  // so "zstd fast" ran as BEST and "bzip2 best" as FAST (#1189).
+  // Wire ids: BROTLI=0, BZIP2=1, Blosc2=2, FPZIP=3, LZ4=4, LZMA=5,
+  //           SNAPPY=6, SZ3=7, ZFP=8, ZLIB=9, ZSTD=10
   std::vector<std::pair<int, int>> candidate_lib_configs;
   if (context.dynamic_compress_ == clio::cte::core::kCompressStatic) {
-    // Static mode: use specified library with default config
-    candidate_lib_configs.push_back({context.compress_lib_, 2});
+    // Static mode: the specified library at its balanced (default) preset
+    candidate_lib_configs.push_back({context.compress_lib_, kPresetBalanced});
   } else {
     // Dynamic mode: test common library/config combinations
     candidate_lib_configs = {
-        {10, 0},  // ZSTD balanced
-        {10, 3},  // ZSTD fast
-        {4, 3},   // LZ4 fast
-        {1, 1},   // BZIP2 best
-        {9, 0},   // ZLIB balanced
+        {10, kPresetBalanced},  // ZSTD balanced
+        {10, kPresetFast},      // ZSTD fast
+        {4, kPresetFast},       // LZ4 fast
+        {1, kPresetBest},       // BZIP2 best
+        {9, kPresetBalanced},   // ZLIB balanced
     };
   }
 
   // Run predictions for each candidate library/config
   for (const auto& [lib_id, config_id] : candidate_lib_configs) {
     CompressionPrediction pred;
+    const CompressionFeatures features = MakeCodecFeatures(
+        lib_id, config_id, chunk_size, entropy, mad, second_derivative_mean,
+        context);
 
     // Use Q-table predictor if available (primary method)
     if (qtable_predictor_ && qtable_predictor_->IsReady()) {
-      CompressionFeatures features;
-      features.library_config_id = static_cast<double>(lib_id);
-      features.chunk_size_bytes = static_cast<double>(chunk_size);
-      features.shannon_entropy = entropy;
-      features.mad = mad;
-      features.second_derivative_mean = second_derivative_mean;
-      // Set config encoding
-      features.config_fast = (config_id == 3) ? 1 : 0;
-      features.config_balanced = (config_id == 0) ? 1 : 0;
-      features.config_best = (config_id == 1) ? 1 : 0;
-      // Set data type encoding
-      features.data_type_char = (context.data_type_ == 0) ? 1 : 0;
-      features.data_type_float = (context.data_type_ == 1) ? 1 : 0;
-
       pred = qtable_predictor_->Predict(features);
     }
 #ifdef CLIO_COMPRESSOR_ENABLE_DENSE_NN
     // Fallback to DNN if Q-table not available
     else if (nn_predictor_ && nn_predictor_->IsReady()) {
-      CompressionFeatures features;
-      features.library_config_id = static_cast<double>(lib_id);
-      features.chunk_size_bytes = static_cast<double>(chunk_size);
-      features.shannon_entropy = entropy;
-      features.mad = mad;
-      features.second_derivative_mean = second_derivative_mean;
-      features.config_fast = (config_id == 3) ? 1 : 0;
-      features.config_balanced = (config_id == 0) ? 1 : 0;
-      features.config_best = (config_id == 1) ? 1 : 0;
-      features.data_type_char = (context.data_type_ == 0) ? 1 : 0;
-      features.data_type_float = (context.data_type_ == 1) ? 1 : 0;
       pred = nn_predictor_->Predict(features);
     }
 #endif  // CLIO_COMPRESSOR_ENABLE_DENSE_NN
@@ -536,8 +540,11 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     }
 
     // Add to results with library and preset
+    // Decompress time is the model's own prediction (0 when it has none),
+    // not the compress time a second time, which double-counted it in the
+    // max_performance objective (#1189).
     results.emplace_back(lib_id, config_id, pred.compression_ratio,
-                         pred.compression_time_ms, pred.compression_time_ms,
+                         pred.compression_time_ms, pred.decompression_time_ms,
                          pred.psnr_db);
   }
 
@@ -701,7 +708,11 @@ static void WriteTraceLog(const std::string& trace_folder,
 
 void Runtime::SelectCodec(DynamicScheduleTask &task, void *chunk_data,
                           clio::run::u64 chunk_size) {
-  Context &context = task.context_;
+  SelectCodecFor(task.context_, chunk_data, chunk_size, &task.tier_score_);
+}
+
+void Runtime::SelectCodecFor(Context &context, void *chunk_data,
+                             clio::run::u64 chunk_size, float *tier_score) {
   auto start_time = std::chrono::high_resolution_clock::now();
   if (context.trace_) {
     context.trace_key_ = g_trace_key_counter.fetch_add(1);
@@ -727,14 +738,14 @@ void Runtime::SelectCodec(DynamicScheduleTask &task, void *chunk_data,
     }
   }
 
-  auto [best_tier, best_lib, best_preset, best_time, tier_score] =
+  auto [best_tier, best_lib, best_preset, best_time, best_tier_score] =
       BestCompressForNode(context, chunk_data, chunk_size, container_id_,
                           stats);
   (void)best_tier;
   (void)best_time;
   context.compress_lib_ = best_lib;
   context.compress_preset_ = best_preset;
-  task.tier_score_ = tier_score;
+  *tier_score = best_tier_score;
 
   if (context.trace_) {
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -839,13 +850,8 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
     std::string library_name =
         ctp::CompressionFactory::NameForWireId(context.compress_lib_);
 
-    // Map preset integer to enum
-    ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-    if (context.compress_preset_ == 1) {
-      preset = ctp::CompressionPreset::FAST;
-    } else if (context.compress_preset_ == 3) {
-      preset = ctp::CompressionPreset::BEST;
-    }
+    const ctp::CompressionPreset preset =
+        PresetFromWire(context.compress_preset_);
 
     // Create compressor with specified preset
     auto compressor = ctp::CompressionFactory::GetPreset(library_name, preset);
@@ -1030,11 +1036,16 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       CLIO_CO_RETURN;
     }
 
-    // Check for compression header
+    // Check for compression header. The magic alone is not proof: a raw
+    // blob may begin with the same bytes. The persisted transform flag
+    // decides, as on the other read paths (#1189).
     auto* header = reinterpret_cast<CompressionHeader*>(temp_buffer.ptr_);
     size_t header_size = sizeof(CompressionHeader);
+    const bool stored_compressed =
+        (get_task->context_.transform_flags_ &
+         clio::cte::core::kBlobTransformCompressed) != 0;
 
-    if (header->IsValid()) {
+    if (stored_compressed && header->IsValid()) {
       // Data is compressed - decompress it
       int compress_lib = static_cast<int>(header->compress_lib_);
       int compress_preset = static_cast<int>(header->compress_preset_);
@@ -1046,13 +1057,7 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
       std::string library_name =
           ctp::CompressionFactory::NameForWireId(compress_lib);
 
-      // Map preset integer to enum
-      ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-      if (compress_preset == 1) {
-        preset = ctp::CompressionPreset::FAST;
-      } else if (compress_preset == 3) {
-        preset = ctp::CompressionPreset::BEST;
-      }
+      const ctp::CompressionPreset preset = PresetFromWire(compress_preset);
 
       // Create decompressor
       auto decompressor =
@@ -2854,12 +2859,8 @@ bool Runtime::CompressIntoShm(clio::cte::core::Context &ctx, const char *src,
                               clio::run::u64 *stored_size) {
   std::string library_name =
       ctp::CompressionFactory::NameForWireId(ctx.compress_lib_);
-  ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-  if (ctx.compress_preset_ == 1) {
-    preset = ctp::CompressionPreset::FAST;
-  } else if (ctx.compress_preset_ == 3) {
-    preset = ctp::CompressionPreset::BEST;
-  }
+  const ctp::CompressionPreset preset =
+      PresetFromWire(static_cast<int>(ctx.compress_preset_));
   auto compressor = ctp::CompressionFactory::GetPreset(library_name, preset);
   if (!compressor) {
     return false;
@@ -2927,12 +2928,8 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   }
   std::string library_name = ctp::CompressionFactory::NameForWireId(
       static_cast<int>(header->compress_lib_));
-  ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-  if (header->compress_preset_ == 1) {
-    preset = ctp::CompressionPreset::FAST;
-  } else if (header->compress_preset_ == 3) {
-    preset = ctp::CompressionPreset::BEST;
-  }
+  const ctp::CompressionPreset preset =
+      PresetFromWire(static_cast<int>(header->compress_preset_));
   auto decompressor = ctp::CompressionFactory::GetPreset(library_name, preset);
   if (!decompressor) {
     return 3;
@@ -2958,6 +2955,18 @@ clio::run::TaskResume Runtime::PutBlob(
     // replica-addressed or emulated puts) forward with the codec request
     // cleared — raw bytes, never a recorded codec (issue #818 rule).
     const bool whole_blob = task->segments_.empty() && task->offset_ == 0;
+    auto src_full =
+        CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    // kCompressDynamic asks the models to choose the codec. Only
+    // compressor::Client's DynamicSchedule ran them, so a core client
+    // reaching the compressor through the interposer got no compression at
+    // all (#1189). A choice of compress_lib_ 0 still stores raw below.
+    if (ctx.dynamic_compress_ == clio::cte::core::kCompressDynamic &&
+        ctx.compress_lib_ <= 0 && ctx.replica_ == 0 && !ctx.emulate_ &&
+        whole_blob && src_full.ptr_ != nullptr && task->size_ > 0) {
+      float tier_score = 0.0f;
+      SelectCodecFor(ctx, src_full.ptr_, task->size_, &tier_score);
+    }
     if (ctx.replica_ != 0 || ctx.compress_lib_ <= 0 || ctx.emulate_ ||
         !whole_blob) {
       if (ctx.compress_lib_ > 0 && !whole_blob) {
@@ -2967,8 +2976,6 @@ clio::run::TaskResume Runtime::PutBlob(
                              task.template Cast<clio::run::Task>()));
       CLIO_CO_RETURN;
     }
-    auto src_full =
-        CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
     ctp::ipc::FullPtr<char> stored;
     clio::run::u64 stored_size = 0;
     if (src_full.ptr_ != nullptr &&
@@ -3460,12 +3467,8 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
     if (stored_size > hdr && header->IsValid()) {
       std::string library_name =
           ctp::CompressionFactory::NameForWireId(header->compress_lib_);
-      ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-      if (header->compress_preset_ == 1) {
-        preset = ctp::CompressionPreset::FAST;
-      } else if (header->compress_preset_ == 3) {
-        preset = ctp::CompressionPreset::BEST;
-      }
+      const ctp::CompressionPreset preset =
+          PresetFromWire(static_cast<int>(header->compress_preset_));
       auto codec = ctp::CompressionFactory::GetPreset(library_name, preset);
       if (!codec) {
         task->return_code_ = 3;
