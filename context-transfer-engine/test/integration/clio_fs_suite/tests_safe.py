@@ -924,3 +924,85 @@ def t_disk_swapped_while_down(ctx):
   cl.agents.clear()
   _check_filesets(ctx, base, n, nfiles, logs, replies,
                   'after the blank swap and a full crash restart')
+
+
+# ---------------------------------------------------------------------------
+# Repeated whole-cluster crashes under load: recovery must stay cheap
+# ---------------------------------------------------------------------------
+def _crash_all_keep_writers(ctx):
+  """SIGKILL every daemon and FUSE client and bring the cluster back, WITHOUT
+  closing the node agents (writers started through them keep running and
+  retry through the outage). Returns the restart time in seconds."""
+  cl = ctx.cl
+  parallel(lambda h: cl.kill_fuse(h), cl.hosts)
+  parallel(lambda h: cl.kill_runtime(h), cl.hosts)
+  time.sleep(2)
+  t0 = time.time()
+  parallel(lambda h: cl.start_runtime(h), cl.hosts)
+  ups = parallel(cl.runtime_up, cl.hosts)
+  ctx.check(all(u is True for u in ups), f'runtime restart failed: {ups}')
+  time.sleep(3)
+  ms = parallel(cl.mount, cl.hosts)
+  ctx.check(all(m is True for m in ms), f'remount failed: {ms}')
+  for h in cl.hosts:
+    cl.agents.pop(h, None)  # new calls get fresh agents; writers keep theirs
+  return round(time.time() - t0, 1)
+
+
+def _array_file_sizes(ctx):
+  """Bytes of each node's safe_array allocation log, degraded-write journal
+  and member manifest, as {node: {name: bytes}}."""
+  lr = ctx.cl.local_root
+  out = {}
+  for i, h in enumerate(ctx.hosts):
+    rc, txt = sh(h, f'stat -c "%s %n" {lr}/data/safe_array.alog* 2>/dev/null',
+                 timeout=30)
+    sizes = {}
+    for ln in (txt or '').splitlines():
+      parts = ln.split()
+      if len(parts) == 2:
+        sizes[parts[1].rsplit('/', 1)[-1]] = int(parts[0])
+    out[f'node{i}'] = sizes
+  return out
+
+
+@test('safe_crash_cycles', 'safe', min_nodes=2, redeploy_after=True,
+      timeout=5400)
+def t_crash_cycles(ctx):
+  """Six whole-cluster SIGKILLs a minute apart while every node writes
+  fsynced record files with a data disk dead in every array (so every
+  crash lands on degraded writes and the degraded-write journal is in
+  use). Recovery must not get more expensive as the journal, allocation
+  log and manifest accumulate: every restart is timed and the array files
+  are measured after each cycle; the last restart may take at most 3x the
+  first (+5 s). Every fsynced version must read back intact at the end, and
+  the filesystem must take new writes."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('cc')
+  ctx.ok(0, 'mkdir', path=base)
+  for h in cl.hosts:
+    cl.kill_disk(h, 0)
+  cycles = 6
+  secs = 60 * cycles + 60
+  th, replies, logs, nfiles = _writers(ctx, base, secs, 'cycles')
+  restarts, sizes = [], []
+  for c in range(cycles):
+    time.sleep(60)
+    restarts.append(_crash_all_keep_writers(ctx))
+    sizes.append(_array_file_sizes(ctx))
+    ctx.note(f'cycle {c}: restart {restarts[-1]} s, array files '
+             f'{sizes[-1].get("node0")}')
+  th.join(timeout=secs + 1800)
+  ctx.metrics['restart_s_per_cycle'] = restarts
+  ctx.metrics['journal_bytes_node0_per_cycle'] = [
+      s.get('node0', {}).get('safe_array.alog.journal', 0) for s in sizes]
+  ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  ctx.check(restarts[-1] <= 3 * restarts[0] + 5,
+            f'recovery got slower across crashes: {restarts}')
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  f'after {cycles} whole-cluster crashes under degraded writes')
+  p = ctx.p('after_cycles')
+  ctx.ok(0, 'write_file', path=p, size=8 << 20, seed=23, fsync=True)
+  v = ctx.ok(n - 1, 'verify_file', path=p, size=8 << 20, seed=23)
+  ctx.check(v['ok'], f'write after the crash cycles: {v}')
