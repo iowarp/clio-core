@@ -70,6 +70,31 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
   }
   per_gpu_devices_.resize(device_count);
 
+  // RESTORE THE CALLER'S DEVICE ON EVERY EXIT.
+  //
+  // The loop below rebinds this thread with SetDevice(gpu_id) once per device,
+  // so without this it RETURNS bound to the LAST GPU. Every kernel the caller
+  // launches after CLIO_INIT without an explicit cudaSetDevice then runs on
+  // device N-1 while GetGpuInfo(0) hands it device 0's structures.
+  //
+  // That was survivable until the device ring: the gpu2cpu queue was pinned
+  // host or managed memory, addressable from any device, so a kernel on device
+  // 3 could still reach device 0's queue. `ring.dev_ring` is plain cudaMalloc
+  // -- local to the device that allocated it -- and dereferencing it from a
+  // kernel on another device is an ILLEGAL MEMORY ACCESS. Measured on a
+  // 4-GPU Frontera rtx node: cr_gpu_kernel_stress_cuda died in
+  // cudaDeviceSynchronize and cr_gpu2cpu_backpressure_cuda in
+  // cudaStreamQuery, both "CUDA Error 700", and both went away under
+  // CUDA_VISIBLE_DEVICES=0 (one device, so nothing to leave behind) or
+  // CLIO_GPU_DEVRING=0 (nothing device-local left to reach).
+  //
+  // Restoring what was current on entry, rather than hardcoding 0, keeps a
+  // caller that deliberately picked a device on it.
+  struct DeviceGuard {
+    int entry;
+    ~DeviceGuard() { ctp::GpuApi::SetDevice(entry); }
+  } device_guard{ctp::GpuApi::CurrentDevice()};
+
   constexpr size_t kQueueBackendBytes = 16 * 1024 * 1024;
 
   for (int gpu_id = 0; gpu_id < device_count; ++gpu_id) {
