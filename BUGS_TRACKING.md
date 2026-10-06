@@ -58,11 +58,11 @@ the reason.
 | 1049 | fixed on dev | d1dbb516f + 297bf813a. |
 | 1050 | open | Windows + pytest crash, no repro on current dev. |
 | 1059 | fixed on dev | 7118e904d + 3d7554a15. |
-| 1096 | fixed on dev | 4bafb3c68 (leftover: `clio_init` in runtime bindings still holds the GIL). |
+| 1096 | fixed on dev + here | 4bafb3c68; leftover `clio_init`/`clio_finalize` GIL release in fcd79070d (checked: a Python thread keeps running while clio_init blocks). |
 | 1100 | fixed on dev | 7118e904d. |
 | 1156 | fixed here | 4e93ca9d1: POSIX AIO EAGAIN (macOS request cap) completes synchronously; safe_bdev test YAML single-quoted for Windows. Test fails without the fix. ctest stays Linux-only until CI confirms macOS/Windows. |
 | 1160 | partly fixed on dev | 5806605ca batches parity updates; stripe-aware allocation only on gpu-vector-rewrite. |
-| 1180 | open | Rare (1/21); ask is diagnosability of a stalled nested pool create. |
+| 1180 | diagnostics fixed here | 6c739c79e: the stall warning names every pool create in flight (name, module, age). Root cause still unknown (rare, 1/21). |
 
 ## Not bugs (features, designs, CI process)
 
