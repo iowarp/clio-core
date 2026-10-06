@@ -1,94 +1,74 @@
 # Bug triage tracker — iowarp/clio-core open issues
 
-Working branch: `bugfix/oldest-first-triage`, branched fresh from `origin/dev`
-(not from the dirty `jaime-issues` branch, so none of its local fixes are
-assumed here — every bug below gets validated against this clean base).
+Working branch: `bugfix/oldest-first-triage`, rebased on `origin/dev`
+(b7d291934, 2026-10-05). Every open issue was re-read and classified; bugs
+were checked against dev and against the sibling triage branches
+(`jaime-issues`, `hyoklee-issue-triage`, issue-numbered branches) before any
+work. Verification ran in the `iowarp/clio-core-devcontainer` image (Linux,
+Debug, stackless coroutines) unless noted.
 
-Process per bug, oldest created-date first:
-1. **Validate**: re-read the issue against the current `dev` tip. Confirm the
-   referenced files/symbols/behavior still exist and still misbehave. Note if
-   stale (renamed/removed/already fixed) vs. still real.
-   - Checked separately: `origin/dev` is the live integration branch (last
-     commit 2026-10-05, 1458 commits ahead of `origin/main`'s 2026-08-18 tip).
-     `origin/main` only differs by a version-bump release merge — `dev` is
-     the correct base.
-   - The remote also already has many issue-numbered branches
-     (`915-aggregateout-no-copy`, `927-rwlock-exclusion`,
-     `929-dev-to-main-ci-flake`, `919-fix-flaky-ci-tests`,
-     `923-924-startup-diagnostics`, `fs-sieve-flush-and-hang-repro`,
-     `gpu2cpu-devicemem-queue`/`gpu2cpu-pinned-host-ring`, and others) — these
-     are leads that in-progress or landed work may already exist for that
-     bug; check their tip and any PR before assuming the issue needs fresh
-     work here.
-2. **Fix**: smallest correct change on this branch, one commit per bug
-   (reference the issue number in the commit subject).
-3. **Record** the outcome in the Status column below and in the Notes.
+Legend: **fixed here** = commit on this branch, verified locally;
+**fixed on dev** = already landed, issue only needs closing by hand (closing
+keywords do not fire on dev PRs); **open** = still real, not fixed here, with
+the reason.
 
-| # | Created | Title (short) | Status | Notes |
-|---|---|---|---|---|
-| 363 | 2026-03-21 | Install feedback: optional build features may block setup | **closed, verified** | Original repro (recipe.yaml/install.sh, WRP_CTE_ENABLE_COMPRESS etc.) is stale: those files/flags don't exist on dev anymore; CLIO_CORE_ENABLE_TESTS and CLIO_CTE_ENABLE_COMPRESS already default OFF. Found and fixed a live sibling bug: installers/conda/build.sh, installers/vcpkg/portfile.cmake, and installers/pip/README.md all referenced stale WRP_ prefixed flag names CMake silently ignores. Fix: 111c9aef5. Verification: installers/check_flag_names.mjs (2f68c44d1) — confirmed it fails against the pre-fix tree (catches all 8 stale flags) and passes against the fixed tree. |
-| 503 | 2026-06-07 | Re-enable disabled CTE distributed execution validation assertions | **blocked** | Confirmed still real: `TEMP-DISABLED (#503)` guard still present verbatim in context-transfer-engine/test/unit/test_core_functionality.cc (~line 2479), matches issue body exactly. Both fix paths (reroute CTE blob ops cross-node, or rework the assertion to check resolved target-node distribution) need the 4-node Docker distributed-test suite to verify — not available in this sandbox. Left unfixed rather than ship an unverified routing/test change. Needs a docker-capable environment or an architect decision on approach. |
-| 579 | 2026-06-18 | cte_tag/cte_query force-net tests hang in CI | pending, investigated | Confirmed real: ci-linux.yml lines 448-452 still exclude cte_tag_force_net/cte_query_force_net by name. Both run via clio_add_force_net_test() (cmake/ClioCoreCommon.cmake:1677), which just sets CLIO_FORCE_NET=1 + RESOURCE_LOCK clio_runtime; nothing there distinguishes them from the 10 sibling force_net tests that do pass (cte_core_unit/simple/functional, cte_reorganize, cte_block_reuse, cte_runtime_coverage, cte_client_config, cte_config_dpe, cte_bdev_leak_stress, cte_blob_replicas) — so the cause is inside the two test binaries, not the harness. Ruled out: the 'Tag - GetBlob Zero Size' test (test_tag_operations.cc:436) throws std::invalid_argument client-side (tag.cc:191-193) before any RPC, so it cannot be the wedge despite superficially resembling the macOS #504 class ('GetBlob/ReadData returns 0 bytes -> Wait() wedges', ClioCoreCommon.cmake:1679). Strongest lead: test_query.cc exercises PoolQuery::Broadcast() in 11 of its TagQuery/BlobQuery cases (test_query.cc:285-529), the only force_net-covered binary that does — several expect an explicitly empty result set (e.g. TagQuery - No Matches, test_query.cc:395-406). A Broadcast query task normally fans out and waits for N per-node replies; forcing every op through the full network/RPC path instead of the local fast path is exactly the condition under which a reply-count mismatch (e.g. counting expected responders from a list that doesn't match who actually replies in this single-node harness) would make the aggregating Wait() block forever — consistent with the known #504 empty/zero-length-response wedge pattern, just surfacing via Broadcast query fan-in rather than a 0-byte GetBlob. Unconfirmed for cte_tag_force_net: test_tag_operations.cc has no Broadcast usage, so this exact mechanism does not by itself explain the tag hang; no second common thread between the two binaries was found by inspection alone (checked async Put/Get, GetBlobSize/GetBlobScore, reorganize-score paths — all structurally similar to passing siblings). Not reproduced: this sandbox has no working shell (bash spawn fails, ENOENT) and no C++ build toolchain reachable from it, so neither test binary could be built/run to capture an actual hang/stack trace. Left unfixed — would be guessing at the client-side Broadcast fan-in/aggregation code (core_client.h) without being able to verify against a real repro. Needs a Linux box that can build+run `ctest -R cte_query_force_net` and `cte_tag_force_net` under a debugger/timeout to get a thread dump, or a maintainer who already knows the Broadcast reply-counting code path. |
-| 597 | 2026-06-20 | xfstests generic/quick 606/639 pass — gaps & bugs | pending, triaged | Fetched the real issue body (github.com/iowarp/clio-core/issues/597). This is a meta-report of 33 xfstests failures, not one bug: 14 need mmap (.mmap/.read_buf unimplemented in the FUSE adapter), 6 need atime/mtime/ctime tracking, 1 needs real inode numbers in readdir, 3 need exportfs/open_by_handle_at, 2 are two concrete candidate bugs worth fixing standalone (B1: FUSE Rename uses insert_or_assign so it never returns EEXIST/ENOTEMPTY on overwrite of an existing dest, generic/245; B2: rename-over-an-open-file leaves a stale fd, generic/035 — fstat(3) fails after rename-overwrite), 2 are fsx data-integrity failures needing triage with mmap disabled, and 5 are sandbox artifacts (unshare -rm lacking real root), not real bugs. No single fix applies. B1/B2 are the only pieces sized like a normal one-commit bug; the rest (mmap, timestamps, inode numbers, exportfs) are multi-day feature work. Not fixed this pass: this sandbox has no working shell/build toolchain (bash spawn fails) and no mounted FUSE adapter to run xfstests against, so even B1/B2 can't be verified end-to-end here — would need the chimod Rename path (insert_or_assign call site) read+patched and then xfstests generic/245+generic/035 rerun on a Linux box with fusermount3. |
-| 641 | 2026-06-27 | Fallback-runtime ctests hang under Boost coroutines | pending, triaged | Real issue: cr_cli_fallback_runtime/cr_cli_cte_fallback hang only in the Boost stackful-coroutine + Linux CI combo (passes stackless-Linux and Boost-macOS), a regression that landed on dev between 2026-06-25 and 06-27; issue names PR #638 (runtime-sleep reroute through CTP_THREAD_MODEL->SleepForUs) as prime suspect. Currently just skipped in CMake for that combo. Fix requires bisecting #638/#635/#636 on a Linux box with `cmake --preset boost` and capturing /tmp/fb_user_runtime.log — not reproducible in this sandbox (no build toolchain, no Boost-coroutine preset to build). Left pending; the 'fix/gpu-task-hangs' lead noted previously is unrelated (that's a GPU task issue, not this coroutine-backend/CLIO_FALLBACK_PORT nesting issue). |
-| 646 | 2026-06-29 | Allocators run dry under GB-scale FUSE churn | pending, triaged | Real issue: 3 gated (Catch2 `[.]`) stress cases in context-transport-primitives/test/unit/allocator/test_buddy_allocator.cc fail by design today — BuddyAllocator single-threaded dry-out after ~894M churn bytes (suspected large-page coalescing/fragmentation), BuddyAllocator 8-thread unlocked dry-out (test's own comment admits unlocked access should corrupt/segfault — the assertion is self-contradictory, needs `[!shouldfail]`/lock/removal, not a runtime fix), and ProducerConsumerAllocator 8-thread dry-out (per-thread block sizing/reclamation). These need actual allocator-internals changes plus a full GB-scale churn run to verify — can't be done by code reading alone, and no build/run capability here. Left pending. |
-| 706 | 2026-07-08 | Flaky reorganize-to-disk allocation failure | pending, triaged | Real issue: intermittent/deterministic-under-memory-pressure Reorganize (Get->Del(old)->Put(new)) rc=7/rc=21 allocation failures in tiered stress tests, reproducing deterministically only in a constrained deps-cpu docker container. Suspected root cause named in the issue: stale `remaining_space_` accounting during the Get/Del/Put burst, or the awaited Del not fully crediting capacity back before the re-Put. core_runtime.cc has dozens of `remaining_space_` debit/credit sites (e.g. 1555/1568/1764/1791/6353/7456) spread across ExtendBlob/FlushData/ListTargets; without the constrained-memory container to reproduce the race deterministically, I can't tell which site is the stale one from static reading alone — risk of 'fixing' the wrong credit/debit pair. Needs the deps-cpu docker repro plus instrumenting AllocateFromTarget/ExtendBlob as the issue itself suggests. Left pending. |
-| 646 | 2026-06-29 | Allocators run dry under GB-scale FUSE churn | pending | |
-| 706 | 2026-07-08 | Flaky reorganize-to-disk allocation failure | pending | |
-| 722 | 2026-07-10 | Daemon spins forever requeueing undeliverable response | pending, strong lead confirmed | Real issue: rc=110 Send failures to a dead client re-queue forever, no backoff/cap/drop, flooding the log (8.9GB/23M lines observed) and leaving stale pid/client state that blocks the next daemon's bind. Checked the jaime-issues lead properly (read its actual diff, not just the commit message): commit 297bf813a, already COMMITTED on jaime-issues (not just working-tree noise), adds exactly the three asked-for behaviors to context-runtime/src/ipc/ipc_cpu2cpu_zmq.cc — kMaxClientResponseRetries=32 / kClientResponseRetryDropSec=5.0s bound (line 26-27), drop+evict-client-identity after the bound instead of looping forever (~line 380-397), and demoting the per-attempt log from kError to rate-limited kDebug (~line 402) so a transient EAGAIN no longer floods the log the way the issue describes. This reads as a real, well-reasoned fix, not a stub. Not yet verified end-to-end: this sandbox has no build toolchain to compile+run a dead-client repro, and the git tool available here can't diff an arbitrary historical commit (only working-tree status/diff/log), so I confirmed the change by reading the current file content plus per-file `git log --stat` on that commit, not a clean `git show`. Recommend cherry-picking 297bf813a onto this branch and building it on a real dev box rather than re-deriving the fix. |
-| 725 | 2026-07-11 | stale restart state kills fresh daemons silently | pending, strong lead confirmed | Same commit 297bf813a also touches context-runtime/src/ipc_manager.cc (161 lines) adding a fail-closed check in ServerInit: before ClearUserIpcs() destroys/recreates shared-memory segments, it now reads the port's pid record, and if that pid is alive AND actually accepting on port+1, it returns false (falls back to client mode) instead of silently clobbering the live runtime's segments — directly answering this issue's ask ('loud failure or reinit, never silent exit') and also closing most of #877's shm-name-collision class. Does not yet address this issue's second finding (undocumented contiguous port cluster at base/base+1/base+3, no all-or-nothing bind) — I did not find a corresponding bind-rollback change in the diffs read. Same verification caveat as #722: read, not built/run. |
-| 768 | 2026-07-18 | Windows TCP IPC latency + auto-select fastest IPC | pending | |
-| 791 | 2026-07-22 | bdev leaks 64KiB block on Windows | pending | |
-| 793 | 2026-07-22 | native GetBlob can hang holding GIL | pending | jaime-issues lead (local, uncommitted work claims GIL release fix) |
-| 794 | 2026-07-22 | Tiered tests pass vacuously (ReorganizeBlob) | **fixed (unverified build)** | Real issue, confirmed arithmetically: the test moves 96x1MB blobs into a 64MB-capacity slow tier and REQUIREs all 96 to succeed, which is impossible by the test's own numbers (96MiB into 64MB). It "passed" historically only because ReorganizeBlob silently no-ops/falls-back on a full tier instead of reporting failure. Applied the issue's own recommended fix (option 1, preserves the stated over-subscription intent): test_tiered_storage_dram_default.cc now asserts `down_ok >= kSlowTierCapacityBlobs` (64 blobs, computed from kSlowFileCapacity/kBlobSize) instead of `down_ok == kNumBlobs`. Does NOT fix the issue's secondary finding (a SEGFAULT seen once when the tier is driven to 96/96 on a retry) — that needs a debugger session this sandbox can't run. Not build-verified: no C++ toolchain reachable here; change is a 1-line assertion edit with a 64/96-blob arithmetic check, low risk, but flag for a real ctest run before merging. |
-| 796 | 2026-07-22 | CTE WAL does not persist blob timestamps | pending, triaged | Real issue: Txn records (transaction_log.h) carry no timestamp fields, so WAL replay always zeroes last_modified_/last_read_/access_count_, making recovered blobs permanently invisible to TemporalSearch (core_runtime.cc:5359 treats ts==0 as "never written"). Issue recommends persisting a wall-clock-safe timestamp in the Txn records and restoring on replay (steady_clock epoch is boot-relative, so raw steady_clock values can't just be stored and replayed across a restart — that's the real complexity, not a one-line fix). This is a genuine WAL-format + replay-logic change across transaction_log.h and core_runtime.cc's replay path; needs a restart-recovery integration test to verify correctness, which this sandbox cannot run. Left pending rather than guess at the wall-clock conversion. |
-| 800 | 2026-07-22 | Windows link-lock flake (~22% of runs) | pending, triaged | Real issue, and it explicitly corrects an earlier over-claim (a prior fix (#790) was reported as eliminating the flake based on one run; it only reduced it 10.7%->3.6% per-job, still ~22% P(>=1 red/7-job run)). Residual failures are MSVC `vs_link_exe` access-denied/in-use, with Defender exclusions already applied and still failing — issue recommends a diagnostic CI run with `Set-MpPreference -DisableRealtimeMonitoring $true` to settle whether Defender is even the holder, rather than guessing more exclusions. This needs an actual Windows CI run to get a yes/no answer; nothing in this sandbox (no Windows CI access, no way to run a diagnostic job) can resolve it. Left pending. |
-| 803 | 2026-07-22 | Sanitizer CI jobs cannot fail (ubsan 151/259 defects, still green) | partially fixed upstream | Real issue: `ctest -S ... || true` + unconditional `exit 0` in CI/run_sanitizers.sh means no sanitizer finding can ever redden the job (confirmed by reading the script). Checking the current script on this branch's dev base: stage 1 of the issue's own staged fix is ALREADY IMPLEMENTED upstream — `emit_findings_summary()` (CI/run_sanitizers.sh) writes the ctest pass/fail line, per-test defect counts, and a sample of actual sanitizer messages to $GITHUB_STEP_SUMMARY, explicitly citing #803 in its comments, while staying non-gating. Stages 2 (triage the 151 ubsan findings as real-UB vs. harness-artifact) and 3 (ratchet the job to fail once a baseline is known) are NOT done — both require an actual sanitizer build + ctest run to get real MemoryChecker output, which this sandbox cannot produce. Left pending for stages 2/3; stage 1 needs no further action. |
-| 796 | 2026-07-22 | CTE WAL does not persist blob timestamps | pending | |
-| 800 | 2026-07-22 | Windows link-lock flake (~22% of runs) | pending | issue thread says mitigated (23%→7%) but root cause explicitly still open |
-| 803 | 2026-07-22 | Sanitizer CI jobs cannot fail (ubsan 151/259 defects, still green) | pending | |
-| 808 | 2026-07-23 | adapters(linux): FUSE smoke fails to bind port 9413 | **fixed (unverified build)** | Real issue: a leaked runtime from the preceding ctest suite leaves the port in TIME_WAIT/FIN_WAIT, which the smoke script's LISTEN-only `port_busy()` can't see, so it reports "free" a few ms before a genuinely-still-held bind fails. Applied the issue's own suggested fix 1 ("harness-only, safe", author's words) in CI/fuse_mount_smoke.sh: broadened `port_busy()` to probe all TCP states on the port (dropped `-l`/`-sTCP:LISTEN`), and wrapped the runtime-start bind in a bounded 3-attempt retry that waits out the port before retrying, instead of a single sleep-3-then-check. Did not attempt suggested fixes 2 (SO_REUSEADDR on the ZMQ ROUTER bind) or 3 (stop ctest from leaking the runtime) — both are C++ runtime changes needing a build to verify; the issue itself says fix 1 alone closes the race. Could not run `bash -n` or execute the script to confirm syntax: this sandbox's bash cannot resolve any file path passed to it (mangles C:\...\ into a path with all separators stripped, both via the Bash tool and run_script) — an environment bug, not something routing around it would fix. Reviewed the diff by eye for balanced quotes/fi/done; low confidence without an actual parse. |
-| 809 | 2026-07-23 | HDF5 VOL descriptor lingers past H5Fclose() | pending, triaged | Real issue, but it's explicit that the HDF5_USE_FILE_LOCKING=FALSE mitigation (#790) already works and is verified holding — this issue exists only to track the underlying root cause so it isn't lost, not because CI is currently broken. Root cause suspected in the clio VOL connector's file_close callback possibly returning before the runtime's async close/flush actually completes. Fixing requires instrumenting that callback and deciding a blocking-vs-documented-async-close contract — a real design decision (the tracker's decision-recording convention would apply once someone picks one), not a bug with one correct answer, and unverifiable without building the VOL connector and running the HDF5 close/reopen test. Left pending; not urgent since the mitigation holds. |
-| 809 | 2026-07-23 | HDF5 VOL descriptor lingers past H5Fclose() | pending | |
-| 836 | 2026-07-27 | kvhdf5 test targets fail post-link (CUDA+MPI) | **closed upstream** | Checked github.com/iowarp/clio-core/issues/836 directly: it shows status Closed. Conda-shadowing of libclio_run_cxx.so during post-link CTest discovery (same class as #697) — already resolved by someone else; no action needed here. |
-| 848 | 2026-07-28 | Windows CI one-different-test-per-run flake cluster | pending | lead: branch `940-singleton-test-windows-timeout`? |
-| 853 | 2026-07-28 | Cluster Tests: CTE distributed SHM-cache tests fail | pending | |
-| 856 | 2026-07-29 | Leader recovery crashes new SWIM leader (free(): invalid pointer) | pending | |
-| 859 | 2026-07-29 | CTE pinned zero-copy read views (pin missing) | pending | lead: branch `943-reorganize-del-read-pin` |
-| 863 | 2026-07-29 | ReorganizeBlob loses blob data under capacity pressure | pending | |
-| 877 | 2026-07-31 | Windows shm names collide across runtime instances | pending | jaime-issues lead (local, uncommitted) |
-| 882 | 2026-07-31 | icx (windows-2025) CI leg chronically flaky | pending | |
-| 892 | 2026-08-04 | Cross-node data path bound at ~116 MB/s | pending | |
-| 893 | 2026-08-04 | Sub-128KB deferred puts invisible cross-node | pending | |
-| 896 | 2026-08-04 | Put to SWIM-dead node hangs submitting client forever | pending | |
-| 907 | 2026-08-04 | test_fuse_ops hangs (zero output) on Windows CI | pending | |
-| 915 | 2026-08-05 | AggregateOut delegates to Copy(): corrupts origin | pending | lead: branch `915-aggregateout-no-copy` exists upstream — check its tip/PR before redoing |
-| 919 | 2026-08-05 | Fix flaky CI tests (bdev_fragmentation, cfs_rename, ...) | pending | lead: branch `919-fix-flaky-ci-tests` exists upstream |
-| 924 | 2026-08-05 | Daemon dies at startup: pool created then HasPool says not found | pending | lead: branch `923-924-startup-diagnostics` exists upstream |
-| 927 | 2026-08-05 | ctp::RwLock allows concurrent reader/writer | pending | lead: branch `927-rwlock-exclusion` exists upstream, plus `rwlock-batched-fairness` |
-| 929 | 2026-08-06 | dev→main PR flakes ~47% (duplicated PoolManager + SWIM/fiber SEGV) | pending | heavy investigation already (10 comments); Class A fixed+merged, Class C already fixed pre-filing, Class B root-caused but NOT fixed as of last read. Many bisect/probe branches upstream (`bisect-*`, `hb-instrument*`, `probe-bad-*`, `probe2-*`, `cluster-bisect-revert-heartbeat`) — read their latest state before redoing the bisection. |
-| 991 | 2026-08-18 | cr_shutdown_bt_* battletests intermittently hang on macOS | pending | |
-| 995 | 2026-08-18 | CTE FUSE loses regions from concurrently growing files | pending | lead: branch `fs-sieve-flush-and-hang-repro` (separate worktree exists: core-fs-sieve) |
-| 1000 | 2026-08-18 | DestroyPool orphans periodic tasks into RouteTask retry storm | pending | lead: branch `fix-routetask-nonworker-retry-drop` |
-| 1028 | 2026-08-25 | clio FUSE: O_DIRECT vs page-cache/mmap coherence | pending | |
-| 1029 | 2026-08-25 | clio FUSE: rmdir returns ENOTEMPTY (generic/070) | pending | |
-| 1030 | 2026-08-25 | cte_replication_persist_integration loses/zeros disk replica | pending | |
-| 1035 | 2026-08-27 | dev CI audit: redness is pre-merge gap, not flakiness | pending | |
-| 1039 | 2026-08-27 | Cluster Tests: CTE cache coherence 4-node step times out | pending | |
-| 1043 | 2026-08-27 | Windows checkout: schannel SEC_E_UNTRUSTED_ROOT not retried | pending | |
-| 1049 | 2026-08-28 | Runtime wedges in unbounded response-requeue loop | pending | jaime-issues lead (local, uncommitted) |
-| 1050 | 2026-08-28 | Windows: CTE client crashes (0xC0000409) under pytest | pending | |
-| 1059 | 2026-08-28 | Record-scoped permanent GetBlob failure on committed data | pending | jaime-issues lead (local, uncommitted) |
-| 1065 | 2026-08-29 | Client pool never releases connection (1024-client stall) | pending | PR #1168 reproduced this with a WILL_FAIL test, not fixed |
-| 1086 | 2026-09-11 | gpu2cpu producer-only design fails on Intel GPUs | pending | lead: branches `gpu2cpu-devicemem-queue`, `gpu2cpu-pinned-host-ring` |
-| 1096 | 2026-09-27 | Python binding holds GIL for whole RPC | pending | jaime-issues lead (local, uncommitted) |
-| 1100 | 2026-10-01 | Windows bdevs allocate up front (no lazy allocation) | pending | jaime-issues lead (local, uncommitted) |
-| 1156 | 2026-10-04 | safe_bdev disk-fault tests fail on macOS (rc=2, 0 bytes) | pending | |
-| 1159 | 2026-10-04 | clio-fs small-file create rate falls 11x (1→6 nodes) | pending | |
-| 1160 | 2026-10-04 | safe_bdev: 68-byte inode write waits behind 1 MiB stripes | **fixed upstream** | Commit 5806605ca ("safe_bdev: a write's parity update is batched... (#1160)"), already on this branch's base (origin/dev tip, merged hours before this session) — batches GatherSurvivors/ReadReplacedBytes/DeltaEncodeStripe/StoreDegradedParity into single round trips instead of per-row serial ones. No further code change needed here; issue just needs closing on GitHub once labeling access exists. |
-| 1167 | 2026-10-05 | CTE core put refills lost range, stays marked lost | pending | newest bug, filed the day before this session |
+## Bugs
 
-**Note on "leads":** branch names and the jaime-issues commit log are starting
-points only, not proof of a merged fix. Each must still be validated — read
-the branch's actual diff/PR state and confirm it addresses the issue's root
-cause — before marking a bug fixed.
+| # | Status | Notes |
+|---|---|---|
+| 363 | fixed here | Stale `WRP_` flag names in installers (189f41bd0) + `installers/check_flag_names.mjs` regression check. |
+| 503 | open (test debt) | `TEMP-DISABLED (#503)` assertion; needs a routing or test-design decision and the 4-node docker suite. |
+| 579 | in verification | Root cause (exit-time `zmq_ctx_term` hang) fixed on dev by d7598a6e4/#627; the CI `-E` exclusion is stale. Looping both tests 20x before dropping it. |
+| 597 | mostly fixed on dev | B1 d33aff8fb, B2 60f89b980/3e5126dbb, fsx 38a8174a4/ccc6328bf, mmap/timestamps/inode numbers landed. Left: exportfs (feature). |
+| 641 | obsolete | The fallback-runtime feature was removed; its tests only exist with `CLIO_CORE_ENABLE_RUNTIME_FALLBACK=ON`. Nothing to fix. |
+| 646 | fixed here | BuddyAllocator never merged adjacent free pages, so a mostly-free heap failed 1 MB requests (894 MB churn -> null). Now coalesces free pages before failing. All three hidden `[fuse_repro]` cases pass (also the ProducerConsumerAllocator one: 2910 nulls -> 0) and are un-hidden (~1 s). |
+| 706 | open (needs repro) | Partly explained (64 MB /dev/shm, over-subscribed tier per #794, reorganize rewrite 756097c94/879b47bb6); needs a fresh run in the constrained deps-cpu container. |
+| 722 | fixed on dev | Bounded retry + drop + evict (d1dbb516f, 297bf813a). Log size cap is extra protection pending in the jaime-issues working tree. |
+| 725 | fixed on dev | 3d7554a15 (restore hardening), 297bf813a (fail-loud port cluster), 5f597ac99 (docs). |
+| 768 | fixed here (Linux-neutral) | Net worker lanes were registered before they existed (null), so EnqueueNetTask never woke the net worker. Fixed in f6cb94637. Linux PutGet/TCP unchanged (~2 ms/op both); the Windows tick-bound latency is not measured with the fix. |
+| 791 | open (no repro) | Stale-cache measurement and alignment mismatch fixed on dev (7eac0527e, 7a76b4b1e); the exact 64 KiB residue is unexplained; Windows only. |
+| 793 | fixed on dev | 4bafb3c68: GIL released around every RPC, `wait(max_sec)`. |
+| 794 | fixed here (tests) | 6ff6cb70c: tiered tests assert actual placement from SHM records. Locally 64/64 in DRAM, 64/96 on file then 96/96 back in RAM. CI `-E` exclusions left until a CI run confirms them. |
+| 796 | fixed here | 726a13ea9: WAL create/extend records carry a wall-clock stamp, snapshot entry type 6 carries times, restore converts to the new boot's steady clock. `cr_cli_cte_BlobTimes`: 0 hits without the fix, 2 in order with it. |
+| 800 | open (CI infra) | Mitigated 23% -> 7% by build retry; the lock holder is unidentified; needs a Windows CI diagnostic run. |
+| 803 | open (CI) | Findings summary landed (bcd773823), UBSan cast class fixed (#1094). Jobs still cannot fail (`|| true`, `exit 0`); gating needs a fresh sanitizer baseline. |
+| 808 | fixed here | 4eeefd330: port guard probes every TCP state on base, base+1, base+3; start retry. Verified free/LISTEN/TIME-WAIT cases in the container. |
+| 809 | open | Root cause unknown; mitigation holds; macOS only. |
+| 848 | partly fixed on dev | RwLock (cebb678bb), DLL-copy race, detached_spawn fixed; Windows startup wedge remains. |
+| 853 | fixed on dev | Cluster Tests run 37173255855 passes both steps. |
+| 856 | partly fixed on dev | PR #918; remaining SIGSEGV tracked in #929; needs the leader_elect docker harness. |
+| 863 | partly fixed on dev | Data-loss path fixed (756097c94); capacity drift never confirmed. |
+| 877 | in progress elsewhere | Asks 1 and 3 on dev; fail-closed ServerInit is uncommitted in the jaime-issues checkout (another agent). |
+| 882 | partly fixed on dev | Same startup-wedge class as #848. |
+| 893 | fixed on dev | 2d769d309. |
+| 896 | fixed on dev | fe21df453 (regression test not added; multi-node). |
+| 907 | open | Windows + WinFsp hang, no root cause. |
+| 915 | fixed on dev | fb735bdb6 (PR #1027). |
+| 919 | fixed on dev | PRs #920, #932. |
+| 924 | fixed on dev | 499b7c2fb (PR #932). |
+| 927 | fixed on dev | cebb678bb (PR #1032). |
+| 929 | partly fixed on dev | A, D fixed; B (leader recovery SIGSEGV) open, needs the 4-node harness. |
+| 991 | needs repro | No 1800 s hang in recent macOS runs; `cr_shutdown_bt_churn` fails fast instead. |
+| 995 | open (needs FUSE repro) | Candidate 002b51b4d is a no-op: since #1007 an open sieve page counts in `pending_count_`, so the early return never skipped one. Added a contract test (422596b40) that AwaitPendingPuts drains an open page. |
+| 1000 | fixed on dev | 3c2f493de. |
+| 1028 | open | FUSE O_DIRECT/page-cache coherence; design-sized (#1060 §3.3). |
+| 1029 | open | Hypothesis: rmdir lacks the closer barrier; issue requires a CI-verified fix. |
+| 1030 | fixed on dev (likely) | bfae06809, 1ae09daef, 79b0b2ea5, 13ee44409; 20x acceptance loop pending. |
+| 1039 | not recurring | No coherence timeout on dev since 09-26. |
+| 1049 | fixed on dev | d1dbb516f + 297bf813a. |
+| 1050 | open | Windows + pytest crash, no repro on current dev. |
+| 1059 | fixed on dev | 7118e904d + 3d7554a15. |
+| 1096 | fixed on dev | 4bafb3c68 (leftover: `clio_init` in runtime bindings still holds the GIL). |
+| 1100 | fixed on dev | 7118e904d. |
+| 1156 | fixed here | 4e93ca9d1: POSIX AIO EAGAIN (macOS request cap) completes synchronously; safe_bdev test YAML single-quoted for Windows. Test fails without the fix. ctest stays Linux-only until CI confirms macOS/Windows. |
+| 1160 | partly fixed on dev | 5806605ca batches parity updates; stripe-aware allocation only on gpu-vector-rewrite. |
+| 1180 | open | Rare (1/21); ask is diagnosability of a stalled nested pool create. |
+
+## Not bugs (features, designs, CI process)
+
+26, 200, 223, 239, 240, 241, 250, 252, 266, 267, 268, 270, 305, 308, 310,
+324, 333, 351, 369, 374, 435, 443, 484, 513, 525, 526, 539, 551 (done on
+dev), 604, 612, 613, 637, 688, 693, 694, 695, 700, 710 (done on dev), 713,
+770, 771, 787, 826, 859, 892, 933, 961, 966, 968, 986, 999, 1008 (done on
+dev), 1013, 1015 (done on dev), 1035, 1036, 1043, 1044, 1060, 1076, 1086,
+1111, 1112, 1159.
