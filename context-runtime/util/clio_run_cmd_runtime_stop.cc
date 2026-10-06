@@ -186,7 +186,13 @@ int EscalateLocalKill(clio::run::u32 port) {
     HLOG(kWarning,
          "stop: runtime (pid {}) unresponsive - escalating to SIGTERM", pid);
     kill(pid, SIGTERM);
-    for (int i = 0; i < 100 && PidIsRunning(pid); ++i) {
+    // SIGTERM starts the runtime's graceful stop, whose own watchdog forces
+    // the process out within the default 5 s grace + 15 s teardown margin
+    // (RuntimeManager::RequestStop). SIGKILL must wait longer than that: at
+    // 10 s it killed live-but-slow runtimes mid-shutdown (exit 137 on loaded
+    // macOS runners, #991) that would have exited cleanly on their own.
+    constexpr int kSigtermWaitMs = 25000;
+    for (int i = 0; i < kSigtermWaitMs / 100 && PidIsRunning(pid); ++i) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     if (PidIsRunning(pid)) {
