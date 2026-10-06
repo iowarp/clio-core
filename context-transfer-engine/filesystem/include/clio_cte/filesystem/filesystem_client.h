@@ -1034,9 +1034,57 @@ class Client : public clio::cte::core::Client {
   FsOff TellFd(int fd);
   FsOff SizeFd(int fd);
   int CloseFd(int fd);
-  /** fsync(2): drain this file's deferred writes, reporting a latched
-   *  failure exactly once. */
+  /** fsync(2): drain this file's deferred writes (reporting a latched failure
+   *  exactly once), then make the file durable (SyncPathDurable). */
   int SyncFd(int fd);
+
+  // ---- fsync(2) durability (shared by the interceptors and FUSE) ----
+
+  /**
+   * Whether CTE performance.fsync_mode is "deferred", as learned from the
+   * first SyncTag reply: fsync then skips the device sync and leaves
+   * durability to the periodic flushes.
+   * @return true once a reply said "deferred"
+   */
+  static bool FsyncDeferred();
+
+  /**
+   * Make one CTE tag durable: SyncTag, broadcast to every core container.
+   * @param tag the tag (null is a no-op)
+   * @param lost_node out (optional): a container's node was down
+   * @param liveness_change_ns out (optional): wall-clock ns of the last
+   *        liveness change the sync saw (SyncTagTask::liveness_change_ns_)
+   * @return 0, -ENOSPC when no persistent tier had room, or -EIO
+   */
+  static int SyncTagDurable(const clio::cte::core::TagId &tag,
+                            bool *lost_node = nullptr,
+                            clio::run::u64 *liveness_change_ns = nullptr);
+
+  /**
+   * fsync(2)'s size step: fsync the size log at the file's stream home.
+   * @param tag the file's tag (null, or an id without a home: nothing to do)
+   * @return 0 or -EIO
+   */
+  static int SyncFileSize(const clio::cte::core::TagId &tag);
+
+  /**
+   * The CTE tag of a file or directory (its id is its inode number).
+   * @param path the path
+   * @param want_dir true: only a directory resolves
+   * @return the tag, or null when the path does not resolve
+   */
+  clio::cte::core::TagId TagOfPath(const std::string &path, bool want_dir);
+
+  /**
+   * fsync(2)'s durability step: the file's blobs (pages and inode record),
+   * its size, then the directory blocks naming it, so the bytes, the size
+   * and the name all survive power loss. Deferred writes must already be
+   * drained (Flush).
+   * @param tag the file's tag (null: only the directory)
+   * @param dir the directory whose entries must be durable
+   * @return 0, -ENOSPC or -EIO
+   */
+  int SyncDurable(const clio::cte::core::TagId &tag, const std::string &dir);
   int FtruncateFd(int fd, FsOff length);
   int TruncatePath(const std::string &raw_path, FsOff length);
   int RemovePath(const std::string &raw_path);

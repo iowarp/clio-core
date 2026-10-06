@@ -547,54 +547,26 @@ static bool UnsyncedTake(const clio::cte::core::TagId &tag,
 }
 
 /**
- * CTE performance.fsync_mode as learned from the first SyncTag reply:
- * -1 not yet known, 0 "durable", 1 "deferred" (fsync skips the device sync).
- */
-static std::atomic<int> g_fsync_deferred{-1};
-
-/**
- * Make one CTE tag durable (SyncTag, broadcast to every core container).
- * With fsync_mode "deferred" the first reply says so and later calls return
- * at once, leaving durability to the periodic flushes.
+ * Make one CTE tag durable (the filesystem client's SyncTagDurable), and
+ * apply this mount's unsynced-write window (#1133) on top.
  * @param tag the tag (null is a no-op)
  * @return 0, -ENOSPC when no persistent tier had room, or -EIO
  */
 static int SyncOneTag(const clio::cte::core::TagId &tag) {
-  if (g_fsync_deferred.load(std::memory_order_relaxed) == 1) return 0;
-  auto *cte_c = CLIO_CTE_CLIENT;
-  if (cte_c == nullptr || tag.IsNull()) return 0;
+  using clio::cte::filesystem::Client;
+  if (Client::FsyncDeferred()) return 0;
+  if (CLIO_CTE_CLIENT == nullptr || tag.IsNull()) return 0;
   clio::run::u64 opened_ns = 0;
   const bool unsynced = UnsyncedTake(tag, &opened_ns);
-  auto fut = cte_c->AsyncSyncTag(tag);
-  fut.Wait();
-  const bool deferred = fut->deferred_ != 0;
-  g_fsync_deferred.store(deferred ? 1 : 0, std::memory_order_relaxed);
-  if (deferred) return 0;
-  if (fut->containers_ == 0) {
-    // A module in front of the core dropped the sync: nothing was made
-    // durable, so fsync must not claim it was.
-    static std::once_flag warned;
-    std::call_once(warned, [&] {
-      HLOG(kError, "clio_cte_fuse: fsync reached no CTE core container "
-           "through pool {}.{}; fsync fails with EIO", cte_c->pool_id_.major_,
-           cte_c->pool_id_.minor_);
-    });
-    return -EIO;
-  }
-  const clio::run::u32 rc = fut->GetReturnCode();
-  if (rc == clio::cte::core::kSyncNoSpaceRc) return -ENOSPC;
-  if (rc != 0 && !clio::cte::core::IsNodeLostRc(rc)) {
-    HLOG(kError, "clio_cte_fuse: fsync of tag {}.{} failed (rc {}); "
-         "reporting EIO", tag.major_, tag.minor_,
-         static_cast<long long>(static_cast<clio::run::i32>(rc)));
-    return -EIO;
-  }
+  bool lost_node = false;
+  clio::run::u64 liveness_ns = 0;
+  int rc = Client::SyncTagDurable(tag, &lost_node, &liveness_ns);
+  if (rc != 0 || Client::FsyncDeferred()) return rc;
   // The live containers synced. A container whose node is down answers with
   // the lost-node code; once the cluster declares the node dead the sync
   // routes around it and succeeds. Either way, bytes written since the last
   // fsync that the node held are gone (#1133): fail if the window saw one.
-  const bool lost_node = rc != 0;
-  const bool moved = fut->liveness_change_ns_ >= opened_ns;
+  const bool moved = liveness_ns >= opened_ns;
   if (unsynced && (lost_node || moved)) {
     HLOG(kError, "clio_cte_fuse: fsync of tag {}.{}: a node {} while the "
          "file had unsynced writes; they may be lost, reporting EIO",
@@ -610,66 +582,24 @@ static int SyncOneTag(const clio::cte::core::TagId &tag) {
 }
 
 /**
- * The CTE tag of directory `dir` (its id is its inode number).
- * @param dir directory path
- * @return the tag, or null if the directory does not resolve
- */
-static clio::cte::core::TagId DirTagOf(const std::string &dir) {
-  auto *cfs = CLIO_CFS_CLIENT;
-  if (cfs == nullptr) return clio::cte::core::TagId::GetNull();
-  auto t = cfs->AsyncGetattr(dir);
-  t.Wait();
-  if (t->GetReturnCode() != 0 || t->exists_ == 0 || t->is_dir_ == 0) {
-    return clio::cte::core::TagId::GetNull();
-  }
-  return clio::cte::filesystem::FsUnpack(t->ino_);
-}
-
-/**
- * fsync(2)'s size step: the file's logical size lives in its stream home's
- * size log, which records with write(2) only; fsync that log.
- * @param tag the file's tag (null, or an id without a home: nothing to do)
- * @return 0 or -EIO
- */
-static int SyncFileSize(const clio::cte::core::TagId &tag) {
-  if (tag.IsNull()) return 0;
-  const clio::run::u64 packed = PackTag(tag);
-  if (!clio::cte::filesystem::FsIdHasHome(packed)) return 0;
-  auto f = StreamClient().AsyncSizeOp(
-      tag, clio::cte::filesystem::FsIdHome(packed),
-      clio::cte::stream::StreamSizeOp::kSync);
-  f.Wait();
-  const clio::run::u32 rc = f->GetReturnCode();
-  if (rc == 0) return 0;
-  if (clio::cte::core::IsNodeLostRc(rc)) {
-    // The home died: a size it logged is in its log (replayed when it
-    // restarts); sizes set since then are logged by its successor.
-    HLOG(kWarning, "clio_cte_fuse: fsync of the size of {}.{}: its home is "
-         "down", tag.major_, tag.minor_);
-    return 0;
-  }
-  HLOG(kError, "clio_cte_fuse: fsync of the size of {}.{} failed (rc {})",
-       tag.major_, tag.minor_, rc);
-  return -EIO;
-}
-
-/**
- * fsync(2)'s durability step: make the file's blobs (pages and its inode
- * record) durable on a persistent tier, then the directory blocks naming it
- * (in its parent directory's tag), so the bytes, the size and the name all
- * survive power loss.
+ * fsync(2)'s durability step, as the filesystem client's SyncDurable but
+ * through this mount's SyncOneTag: the file's blobs, its size, then the
+ * directory blocks naming it.
  * @param tag the file's tag (null: only the directory)
  * @param dir the directory whose entries must be durable
  * @return 0, -ENOSPC when no persistent tier had room, or -EIO
  */
 static int SyncDurable(const clio::cte::core::TagId &tag,
                        const std::string &dir) {
+  using clio::cte::filesystem::Client;
   int rc = SyncOneTag(tag);
   if (rc != 0) return rc;
-  if (g_fsync_deferred.load(std::memory_order_relaxed) == 1) return 0;
-  rc = SyncFileSize(tag);
+  if (Client::FsyncDeferred()) return 0;
+  rc = Client::SyncFileSize(tag);
   if (rc != 0) return rc;
-  return SyncOneTag(DirTagOf(dir));
+  auto *cfs = CLIO_CFS_CLIENT;
+  if (cfs == nullptr) return 0;
+  return SyncOneTag(cfs->TagOfPath(dir, /*want_dir=*/true));
 }
 
 /**
