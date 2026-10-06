@@ -17,7 +17,7 @@ the reason.
 | # | Status | Notes |
 |---|---|---|
 | 363 | fixed here | Stale `WRP_` flag names in installers (189f41bd0) + `installers/check_flag_names.mjs` regression check. |
-| 503 | open (test debt) | `TEMP-DISABLED (#503)` assertion; needs a routing or test-design decision and the 4-node docker suite. |
+| 503 | fixed here | Reproduced on the 4-node docker cluster: ops DID route cross-node, but a node running a task routed to it never set completer_ (only RouteLocal did), so all reported 0. Fixed in RouteTask's routed-task path; assertions re-enabled; avg completer 0 -> 1.75. Note: on this host the cluster needs a reduced config (4 threads, small segments/tiers) or nodes are OOM-killed. |
 | 579 | fixed on dev; CI exclusion dropped here | Root cause (exit-time `zmq_ctx_term` hang) fixed by d7598a6e4/#627. Both tests ran 20x each locally (Debug) with no hang; 12916cfd9 re-enables them in the leak-check job (not run locally under that preset). |
 | 597 | mostly fixed on dev | B1 d33aff8fb, B2 60f89b980/3e5126dbb, fsx 38a8174a4/ccc6328bf, mmap/timestamps/inode numbers landed. Left: exportfs (feature). |
 | 641 | obsolete | The fallback-runtime feature was removed; its tests only exist with `CLIO_CORE_ENABLE_RUNTIME_FALLBACK=ON`. Nothing to fix. |
