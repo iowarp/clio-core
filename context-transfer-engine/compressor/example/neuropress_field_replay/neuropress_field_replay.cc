@@ -782,6 +782,18 @@ int main(int argc, char **argv) {
       ok = rc_get == 0 && Fnv1a(data, r.bytes) == r.digest;
     }
     if (!ok) std::cerr << "  MISMATCH " << r.name << " rc=" << rc_get << "\n";
+    // CLIO_REPLAY_MISMATCH_DIR: keep the bytes of a failed round trip for an
+    // offline comparison with the source (a diagnostic; off when unset).
+    if (!ok && rc_get == 0) {
+      if (const char *md = std::getenv("CLIO_REPLAY_MISMATCH_DIR"); md && *md) {
+        std::string fn = r.name;
+        for (auto &ch : fn) if (ch == '/') ch = '_';
+        const std::string path = std::string(md) + "/" + fn + ".bin";
+        std::ofstream(path, std::ios::binary)
+            .write(data, static_cast<std::streamsize>(r.bytes));
+        std::cerr << "  MISMATCH-DUMP " << r.name << " -> " << path << "\n";
+      }
+    }
     /* Optionally hand the decompressed bytes to an external checker. The
        digest above is computed by the same program that computed the
        original one, so it proves the round trip is self-consistent; writing
@@ -813,7 +825,14 @@ int main(int argc, char **argv) {
           /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem, bytes,
           &b->dev);
       if (b->dev_alloc.IsNull() || b->dev == nullptr) return false;
-      if (clear) ctp::GpuApi::Memset(b->dev, 0, bytes);
+      if (clear) {
+        // cudaMemset on device memory returns before the memset runs, on the
+        // default stream; the runtime fills this buffer on a NON-BLOCKING
+        // stream, which does not wait for it. Without this wait the clear
+        // could land on top of the bytes read back (zeros in 128 B pieces).
+        ctp::GpuApi::Memset(b->dev, 0, bytes);
+        ctp::GpuApi::Synchronize();
+      }
       // off_ carries the raw device address, which ToFullPtr resolves for the
       // process that minted the id (ipc_manager.h, "Case 4").
       b->shm = ctp::ipc::ShmPtr<void>(b->dev_alloc, reinterpret_cast<size_t>(b->dev));

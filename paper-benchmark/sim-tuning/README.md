@@ -135,12 +135,50 @@ The two workloads of the benchmark, with the exact settings:
    search (all 45 settings on every chunk, 1 process) and stores it under
    `baselines/<workload>/exhaustive`; later runs reuse it.
 
+## Multi-process benchmark (processes x chunks in flight)
+
+`../model-accuracy/run_workload_bench.sh` runs the full benchmark of one staged
+workload, as done for Nyx and VPIC: best single codec, NeuroPress learning and
+oracle at 1x1, 2x8, 4x8 and 8x8, each timed read followed by one k-means
+iteration (`KMEANS=8`), the k-means check of every process log
+(`check_kmeans.sh`), then the compare CSVs and one figure.
+
+```bash
+cd paper-benchmark/model-accuracy
+# W = w_ct,w_dt,w_io; COST_BW in bytes per ms; READS timed reads
+GOVERNOR= PYTHON=$(which python3) CONFIGS="1x1 2x8 4x8 8x8" \
+  ./run_workload_bench.sh nyx-multiphase-50g 1,10,10 1000000 10 <figure dir>
+```
+
+On another machine (e.g. a Delta GPU node):
+- Rebuild and install first: the replay tool (`neuropress_field_replay`) needs
+  the wait after `cudaMemset` in its last bit-exact check; without it, runs
+  with many processes can report raw chunks as "NOT bit-exact" although the
+  stored data is correct.
+- `GOVERNOR=` (empty) leaves the CPU frequency governor alone; the default sets
+  it to `performance` with `sudo`, which a batch job does not have.
+- `PYTHON` is the Python with numpy, pandas and matplotlib (default
+  `~/np-venv/bin/python`).
+- The runs pin each process to the GPU's NUMA node (`numactl`); `PIN=0` turns
+  this off, `NUMA_NODE=<n>` selects the node.
+- Use one whole GPU node per benchmark (no other GPU work during the timed
+  runs). The first configuration also makes the exhaustive search if
+  `baselines/<workload>/exhaustive` is missing (all 45 settings, 1 process).
+- Choose the cost model offline first: `np_cost_sweep.py <workload>` then
+  `pick_cost_model.py <workload>` (NeuroPress runtime and ratio vs the best
+  single codec per model); `opp_grid.py <workload>` gives the possible gain.
+
 ## Scripts
 
 - `gen_nyx_multiphase_50g.sh`, `gen_vpic_slabs.sh`: make the two benchmark
   workloads with the exact settings (see above).
-- `nyx_probe.sh`, `vpic_probe.sh`: one probe run (generate, stage, exhaustive
-  search, score).
+- `nyx_probe.sh`, `vpic_probe.sh`, `warpx_probe.sh`, `gs_probe.sh`: one probe
+  run (generate, stage, exhaustive search, score); `data_probe.sh NAME DIR`:
+  the same for data already on disk. Each deletes its stored (compressed)
+  data after the search.
+- `opp_grid.py`: possible gain over a grid of cost models (and field subsets).
+- `pick_cost_model.py`: ranks `np_cost_sweep.py`'s models by NeuroPress's
+  runtime and ratio gain together.
 - `probe_eval.py`: opportunity per field, plus NeuroPress's result from the
   learning replay.
 - `np_mistakes.py`: where NeuroPress's extra cost over the best single codec

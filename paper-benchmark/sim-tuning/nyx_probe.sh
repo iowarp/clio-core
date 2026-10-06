@@ -37,4 +37,6 @@ cd "$MA"
 python3 stage_full_workloads.py "ref-$NAME" >> "$LOG" 2>&1
 NO_SELECTION_LOG=1 RUN_TAG=nolog MODES=exhaustive ./run_v2_all_workloads.sh "ref-$NAME"
 python3 baseline_store.py save "ref-$NAME" exhaustive >> "$LOG" 2>&1
+# the stored (compressed) data is not needed after the search: delete it
+rm -f "/mnt/nvme0/v2-work/runs/ref-${NAME}_exhaustive_nolog/chi_bdev.dat" "/mnt/nvme0/v2-work/runs/ref-${NAME}_exhaustive_nolog"/cte_tier.dat*
 OPENBLAS_NUM_THREADS=4 ~/np-venv/bin/python "$HERE/probe_eval.py" "ref-$NAME" --note "$NOTE" 2>/dev/null | tee -a "$LOG"

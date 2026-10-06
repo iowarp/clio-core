@@ -37,11 +37,13 @@ import textwrap
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.patches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 import compare_kmeans_runs as ck
+import plot_style as style
 
 MODES = (("fixed", "best single codec"), ("learn", "NeuroPress learning"),
          ("oracle", "oracle"))
@@ -149,47 +151,79 @@ def TitleWrap(text, width=150):
     return "\n".join(textwrap.fill(line, width) for line in text.split("\n"))
 
 
-def plot(t, ds, procs, inflight, w, best, png, reads=4, bw=520000.0):
-    """Application time and ratio of the three options, serial and parallel."""
-    fig, ax = plt.subplots(1, 2, figsize=(15, 5.6))
-    x = np.arange(len(MODES))
-    configs = list(dict.fromkeys(t.config))   # reference(s) first
-    width = 0.8 / len(configs)
-    labels = {c: c for c in configs}
-    for j, c in enumerate(configs):
-        s = t[t.config == c].set_index("mode").reindex([m for m, _ in MODES])
-        off = (j - (len(configs) - 1) / 2) * width
-        hatch = ("", "//", "..", "xx")[j % 4]
-        ax[0].bar(x + off, s.write_s, width, color="#4c72b0", hatch=hatch, edgecolor="white",
-                  label=f"write (compress + store), {labels[c]}")
-        ax[0].bar(x + off, s.read_s, width, bottom=s.write_s, color="#dd8452", hatch=hatch,
-                  edgecolor="white", label=f"{reads} reads + k-means, {labels[c]}")
-        ax[1].bar(x + off, s.ratio, width, color="#8172b3", hatch=hatch, edgecolor="white",
-                  label=labels[c])
-        for i, (v, r) in enumerate(zip(s.app_s, s.ratio)):
-            pct = "" if i == 0 else f"\n{100 * (v / s.app_s.iat[0] - 1):+.1f}%"
-            ax[0].text(i + off, v, f"{v:.2f} s{pct}", ha="center", va="bottom", fontsize=8.5)
-            rp = "" if i == 0 else f"\n{100 * (r / s.ratio.iat[0] - 1):+.1f}%"
-            ax[1].text(i + off, r, f"{r:.3f}x{rp}", ha="center", va="bottom", fontsize=8.5)
-    names = [f"best single codec\n({best})", "NeuroPress learning", "oracle\n(each chunk's best)"]
+def bar_options(ax, t, configs, names, reads):
+    """Draw the three options of every configuration side by side.
+
+    Top panel: application time, the write window as the darker lower part
+    and the reads + k-means above it; bottom panel: the ratio. Labels:
+    seconds or ratio over the best single codec, % against it over the other
+    two; a bar whose last read was not bit-exact gets a red edge and says so.
+
+    @param ax      the two axes (time, ratio)
+    @param t       one row per (config, mode), with the *_vs_best_single_pct columns
+    @param configs the configurations, in x order
+    @param names   {mode: legend name}
+    @param reads   the timed reads per process, for the legend
+    """
+    x = np.arange(len(configs))
+    width = 0.26   # three bars leave a gap between configurations
+    for k, (mode, _) in enumerate(MODES):
+        s = t[t["mode"] == mode].set_index("config").reindex(configs)
+        pos = x + (k - 1) * width
+        color = style.OPTION_COLORS[mode]
+        ok = s["digest_ok"] if "digest_ok" in s else pd.Series(True, index=s.index)
+        bad = ~ok.fillna(True).astype(bool).to_numpy()
+        edge = np.where(bad, "red", "white")
+        lw = np.where(bad, 2.2, 0.8)
+        ax[0].bar(pos, s.write_s, width, color=style.darker(color), edgecolor="white",
+                  linewidth=0.8)
+        ax[0].bar(pos, s.read_s, width, bottom=s.write_s, color=color, label=names[mode],
+                  edgecolor=edge, linewidth=lw)
+        ax[1].bar(pos, s.ratio, width, color=color, label=names[mode], edgecolor=edge,
+                  linewidth=lw)
+        for p, v, d, r, rd, b in zip(pos, s.app_s, s.app_s_vs_best_single_pct, s.ratio,
+                                     s.ratio_vs_best_single_pct, bad):
+            if not np.isfinite(v):
+                continue
+            note = "\nNOT\nbit-exact" if b else ""
+            for a, y, lab in ((ax[0], v, f"{v:.1f} s" if k == 0 else style.pct(d)),
+                              (ax[1], r, f"{r:.2f}x" if k == 0 else style.pct(rd))):
+                a.annotate(lab + note, (p, y), xytext=(0, 2), textcoords="offset points",
+                           ha="center", va="bottom", fontsize=8,
+                           color="red" if b else ("#333333" if k == 0 else color),
+                           fontweight="normal" if k == 0 else "bold")
     for a in ax:
-        a.set_xticks(x, names, fontsize=9)
-        a.set_ylim(0, a.get_ylim()[1] * 1.3)
-    ax[0].set_ylabel("seconds")
-    ax[0].set_title("Measured application time (local NVMe; % vs the best single codec\n"
-                    "of the same configuration); write = joint write window", fontsize=10.5)
-    ax[0].legend(fontsize=7.5, loc="upper center", ncol=2, bbox_to_anchor=(0.5, -0.17))
-    ax[1].set_title("Compression ratio (higher is better)", fontsize=10.5)
-    ax[1].legend(fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.17))
-    fig.suptitle(TitleWrap(f"{ds}: producer writes once, k-means consumer reads {reads} times; all options "
-                 f"select by the cost weights {w} (compress / decompress / transfer) at "
-                 f"{bw / 1e6:g} GB/s (one tier; the cost model's bandwidth, not this machine's)."
-                 f"\nWith {procs} processes, each process writes and reads one chunk in {procs} "
-                 f"with its own Clio runtime and its own NeuroPress learning.\nApplication "
-                 f"time = measured time when at least one process writes or does a timed read "
-                 f"(steady-clock timestamps of every process)."), fontsize=10)
+        a.set_ylim(0, a.get_ylim()[1] * 1.12)
+        a.set_xlim(-0.6, len(configs) - 0.4)
+    handles, labels = ax[0].get_legend_handles_labels()
+    handles.append(matplotlib.patches.Patch(facecolor=style.darker("#9aa0a6")))
+    labels.append(f"darker lower part: write\n(compress + store);\nupper part: {reads} reads + k-means")
+    ax[0].legend(handles, labels, loc="upper left", bbox_to_anchor=(1.005, 1.0))   # outside: no bar under it
+
+
+def plot(t, ds, procs, inflight, w, best, png, reads=4, bw=520000.0):
+    """Application time and ratio per configuration, the three options of one
+    configuration side by side."""
+    style.apply()
+    configs = list(dict.fromkeys(t.config))   # reference(s) first
+    fig, ax = plt.subplots(2, 1, figsize=(max(11, 2.6 * len(configs)), 9.5), sharex=True)
+    names = {"fixed": f"best single codec ({best})", "learn": "NeuroPress learning",
+             "oracle": "oracle (each chunk's best)"}
+    bar_options(ax, t, configs, names, reads)
+    ax[1].set_xticks(np.arange(len(configs)), [c.replace(", ", "\n") for c in configs])
+    ax[0].set_ylabel("application time (s)")
+    ax[0].set_title("Application time (lower is better)")
+    ax[1].set_ylabel("compression ratio")
+    ax[1].set_title("Compression ratio (higher is better)")
+    style.titles(fig, f"{ds}: best single codec, NeuroPress learning and oracle",
+                 TitleWrap(f"Producer writes once, a k-means consumer reads {reads} times. All "
+                           f"options select by the cost weights {w} (compress / decompress / "
+                           f"transfer) at {bw / 1e6:g} GB/s. % = change against the best single "
+                           f"codec of the same configuration. With P processes, each process "
+                           f"handles one chunk in P with its own Clio runtime. Application time "
+                           f"= time when at least one process writes or does a timed read.", 150))
     fig.tight_layout()
-    fig.savefig(png, dpi=130)
+    fig.savefig(png, dpi=150)
     print("wrote", png)
 
 

@@ -28,8 +28,11 @@ import replay_learning as rl  # noqa: E402
 
 def field(blob):
     """Field name of a chunk."""
-    m = re.search(r"comp\d+_([A-Za-z_0-9]+)\.f32", blob) or re.search(
-        r"__(force|position|velocity)_step", blob)
+    m = (re.search(r"comp\d+_([A-Za-z_0-9]+)\.f32", blob)
+         or re.search(r"__(force|position|velocity)_step", blob)
+         or re.search(r"__plt\d+__([A-Za-z_0-9]+)\.f32", blob)   # WarpX: plt<step>/<field>.f32
+         or re.search(r"__([A-Za-z][A-Za-z_0-9-]*?)(?:[-_]\d+x\d+(?:x\d+)*)?(?:_\d+_\d+_\d+)?\.[a-z0-9]+__c\d{4}__", blob))
+    # last one: any staged file, <name>[-dims].<ext> (SDRBench and others)
     return m.group(1) if m else "?"
 
 
@@ -50,6 +53,15 @@ def main():
     print(f"{a.dataset}: {len(order)} chunks, best single {names[bf]}, "
           f"opportunity {100 * (fixed - oracle) / fixed:.1f}%, other setting cheapest on "
           f"{100 * np.mean(np.nanargmin(cost[ok], axis=1) != bf):.0f}% of chunks")
+    # the benchmark's cost model: 1 write + 10 reads, weights 1/10/10, one 1 GB/s tier
+    _, cb = ev.load_truth(os.path.join(rl.STORE, a.dataset, "exhaustive"), len(names), store,
+                          w=(1.0, 10.0, 10.0), bw=1e6)
+    cb = ev.for_selection(cb)
+    okb = np.isfinite(cb).all(axis=1)
+    tb = cb[okb].sum(axis=0)
+    bb = int(np.argmin(tb))
+    print(f"   benchmark model (1/10/10 at 1 GB/s): best single {names[bb]}, opportunity "
+          f"{100 * (tb[bb] - cb[okb].min(axis=1).sum()) / tb[bb]:.1f}%")
     for fv in sorted(set(f)):
         m = (f == fv) & ok
         c = cost[m]
