@@ -62,7 +62,7 @@ the reason.
 | 1096 | fixed on dev + here | 4bafb3c68; leftover `clio_init`/`clio_finalize` GIL release in fcd79070d (checked: a Python thread keeps running while clio_init blocks). |
 | 1100 | fixed on dev | 7118e904d. |
 | 1156 | fixed here | 4e93ca9d1: POSIX AIO EAGAIN (macOS request cap) completes synchronously; safe_bdev test YAML single-quoted for Windows. Test fails without the fix. ctest stays Linux-only until CI confirms macOS/Windows. |
-| 1160 | partly fixed on dev | 5806605ca batches parity updates; stripe-aware allocation only on gpu-vector-rewrite. |
+| 1160 | fixed here | Parity batching (5806605ca) was on dev; the stripe-aware allocation (7e554a96) and one-write-per-consecutive-blocks put (7f4a095d5) existed only on gpu-vector-rewrite and are cherry-picked here (cluster-measured by their author: 47 -> 50 MiB/s, slow-stripe phases roughly halved). Locally: safe_bdev / cte_core / tiered / sieve / leak-stress suites 30/30; safe-bdev docker smoke (write 32 MB via clio-fs, replace a member, recover, verify) PASSED. |
 | 1180 | diagnostics fixed here | 6c739c79e: the stall warning names every pool create in flight (name, module, age). Root cause still unknown (rare, 1/21). |
 
 ## Not bugs (features, designs, CI process)
