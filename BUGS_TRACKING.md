@@ -37,7 +37,7 @@ the reason.
 | 848 | no longer occurring | Causes fixed on dev: RwLock reader/writer overlap (cebb678bb, #927), DLL-copy race, detached_spawn. The remaining startup-wedge signature ('inline retry exhausted' / 'RouteLocal returned 4') appears in 0 of the last 35 Windows CI runs; the only test failure in that window was cr_safe_bdev_disk_fail_tests on gpu-vector-rewrite, i.e. the #1156 YAML bug fixed here. |
 | 853 | fixed on dev | Cluster Tests run 37173255855 passes both steps. |
 | 856 | partly fixed on dev | PR #918; remaining SIGSEGV tracked in #929; needs the leader_elect docker harness. |
-| 863 | partly fixed on dev | Data-loss path fixed (756097c94); capacity drift never confirmed. |
+| 863 | fixed on dev | Data loss fixed by 756097c94 (place the new copy before freeing the old). Hazard 2 (drift) re-tested with the issue's own repro (kRounds=4, churn burst 8): 2 runs x 4 rounds, every fill-to-brim + reorganize round succeeded; the churn trigger (blob layout seen empty mid-move) never fires any more because place-then-swap removed that window. |
 | 877 | in progress elsewhere | Asks 1 and 3 on dev; fail-closed ServerInit is uncommitted in the jaime-issues checkout (another agent). |
 | 882 | no longer occurring | Same window as #848: the icx (windows-2025) leg's only failure in 35 runs was cr_safe_bdev_disk_fail_tests (#1156 YAML, fixed here); no wedge, no flake. |
 | 893 | fixed on dev | 2d769d309. |
