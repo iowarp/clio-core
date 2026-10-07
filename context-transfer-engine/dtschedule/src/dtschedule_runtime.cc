@@ -39,6 +39,8 @@
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_cte/dtschedule/ccm/data_stats.h>
 #include <algorithm>
+#include <cmath>
+#include <functional>
 #include <cctype>
 #include <chrono>
 #include <vector>
@@ -420,11 +422,20 @@ clio::run::TaskResume Runtime::PutBlob(
         }
       }
 
+      const uint32_t owner_for_tier = place.owner_node == UINT32_MAX
+                                          ? local_node_id : place.owner_node;
+      // Each candidate is priced at the tier its own stored size lands in
+      // on the owner (raw may spill to NVMe while compressed fits in RAM).
+      const uint32_t consumer_for_bw = place.consumer_node;
+      std::function<double(uint64_t)> store_bw =
+          [this, owner_for_tier, consumer_for_bw](uint64_t bytes) {
+            return StoreBwFor(bytes, owner_for_tier, consumer_for_bw);
+          };
       auto t0 = std::chrono::steady_clock::now();
       decision = ccm_manager_->SelectCodec(src_ptr.ptr_, original_size,
                                            match_name,
                                            knobs_.ratio_noise_sigma_, load_mult,
-                                           rank_bw_mb_ms);
+                                           rank_bw_mb_ms, &store_bw);
       select_ms = std::chrono::duration<double, std::milli>(
                       std::chrono::steady_clock::now() - t0)
                       .count();
@@ -433,7 +444,18 @@ clio::run::TaskResume Runtime::PutBlob(
         // joint / codec_first: the compressed size may fit a faster tier.
         const uint64_t z = static_cast<uint64_t>(
             original_size / std::max(decision.pred_ratio_, 1.0));
-        place.tier = ChooseTier(z);
+        place.tier = ChooseTier(z, owner_for_tier);
+        place.tier_score = TierScore(place.tier);
+        place.tier_bw_mb_ms = TierBwMbPerMs(place.tier);
+      }
+      {
+        // Reserve what will actually be stored on the owner's chosen tier.
+        const uint64_t stored =
+            decision.chosen_lib_.empty()
+                ? original_size
+                : static_cast<uint64_t>(original_size /
+                                        std::max(decision.pred_ratio_, 1.0));
+        place.tier = ChooseTier(stored, owner_for_tier, /*reserve=*/true);
         place.tier_score = TierScore(place.tier);
         place.tier_bw_mb_ms = TierBwMbPerMs(place.tier);
       }
@@ -989,6 +1011,7 @@ clio::run::TaskResume Runtime::PollNodeLoad(
   // Phase 3+: also store in the load ring for load-aware decisions
   uint32_t local_node_id = CLIO_IPC->GetNodeId();
   NodeLoadSample sample(ts_ms, cpu_util, 0);  // queued_tasks=0 for now
+  CLIO_CO_AWAIT(CollectTierRemaining(&sample.tier_remaining_));
   StoreLoadSample(local_node_id, sample);
 
   task->result_ = sample;
@@ -1358,6 +1381,7 @@ clio::run::TaskResume Runtime::SampleLoad(
 
   // Store sample in the ring buffer for this node
   NodeLoadSample sample(ts_ms, cpu_util, 0);  // queued_tasks=0 for phase 3
+  CLIO_CO_AWAIT(CollectTierRemaining(&sample.tier_remaining_));
   StoreLoadSample(local_node_id, sample);
 
   HLOG(kDebug, "dtschedule: SampleLoad node={} cpu={:.1f}%",
@@ -1378,6 +1402,17 @@ clio::run::TaskResume Runtime::SampleLoad(
   // Add extra load_peers from config (useful for tests)
   for (uint32_t peer : config_.load_peers_) {
     poll_nodes.insert(peer);
+  }
+  // With several tiers, every node may own a blob: poll them all so tier
+  // choice sees each owner's free bytes.
+  if (config_.tiers_.size() > 1) {
+    auto *pool_manager = CLIO_POOL_MANAGER;
+    const clio::run::PoolInfo *info = pool_manager->GetPoolInfo(pool_id_);
+    const uint32_t n = info == nullptr ? 0 : info->num_containers_;
+    for (uint32_t c = 0; c < n; ++c) {
+      poll_nodes.insert(static_cast<uint32_t>(
+          pool_manager->GetContainerNodeId(pool_id_, c)));
+    }
   }
 
   // Poll each remote node (bounded; skip nodes whose previous poll never returned)
@@ -1595,6 +1630,10 @@ void Runtime::StoreLoadSample(uint32_t node_id, const NodeLoadSample &sample) {
     }
     ring.samples_.push_back(sample);
   }
+  if (!sample.tier_remaining_.empty()) {
+    std::lock_guard<std::mutex> lock(tier_cap_lock_);
+    tier_reserved_.erase(node_id);  // the sample already counts those bytes
+  }
 }
 
 std::tuple<double, uint64_t, bool> Runtime::GetLoad(uint32_t node_id) {
@@ -1690,20 +1729,98 @@ uint32_t Runtime::PickConsumer(const TagId &tag_id) {
   return it->second.nodes_.back();  // Most recent (last) node
 }
 
-std::string Runtime::ChooseTier(uint64_t blob_size) {
-  // Highest-score tier with room, else the next lower, else the lowest.
-  // The capacity snapshot comes from Monitor; before the first snapshot the
-  // fastest configured tier is used.
-  std::lock_guard<std::mutex> lock(tier_cap_lock_);
-  if (tier_capacities_.empty()) {
-    return config_.tiers_.empty() ? "" : config_.tiers_.front().name_;
+std::string Runtime::ChooseTier(uint64_t blob_size, uint32_t owner_node,
+                                bool reserve) {
+  if (config_.tiers_.empty()) {
+    return "";
   }
-  for (const auto &tier : tier_capacities_) {
-    if (tier.remaining_bytes_ >= blob_size) {
-      return tier.name_;
+  std::vector<uint64_t> free_bytes;
+  {
+    std::lock_guard<std::mutex> outer(load_rings_lock_);
+    auto it = load_rings_.find(owner_node);
+    if (it != load_rings_.end()) {
+      std::lock_guard<std::mutex> lock(it->second.lock_);
+      if (!it->second.samples_.empty()) {
+        free_bytes = it->second.samples_.back().tier_remaining_;
+      }
     }
   }
-  return tier_capacities_.back().name_;
+  if (free_bytes.size() != config_.tiers_.size()) {
+    return config_.tiers_.front().name_;  // no capacity known yet
+  }
+  std::lock_guard<std::mutex> lock(tier_cap_lock_);
+  auto &reserved = tier_reserved_[owner_node];
+  reserved.resize(config_.tiers_.size(), 0);
+  size_t pick = config_.tiers_.size() - 1;
+  for (size_t i = 0; i < free_bytes.size(); ++i) {
+    const uint64_t avail =
+        free_bytes[i] > reserved[i] ? free_bytes[i] - reserved[i] : 0;
+    if (avail >= blob_size) {
+      pick = i;
+      break;
+    }
+  }
+  if (reserve) {
+    reserved[pick] += blob_size;
+  }
+  return config_.tiers_[pick].name_;
+}
+
+double Runtime::StoreBwFor(uint64_t bytes, uint32_t owner_node,
+                           uint32_t consumer_node) {
+  const uint32_t self = CLIO_IPC->GetNodeId();
+  const uint32_t owner = owner_node == UINT32_MAX ? self : owner_node;
+  double bw = TierBwMbPerMs(ChooseTier(bytes, owner));
+  const bool crosses = owner != self ||
+                       (consumer_node != UINT32_MAX && consumer_node != owner);
+  if (crosses) {
+    bw = std::min(bw, std::max(config_.net_bw_gbps_, 0.01) / 8.0);
+  }
+  return bw;
+}
+
+clio::run::TaskResume Runtime::CollectTierRemaining(
+    std::vector<uint64_t> *out) {
+  CLIO_TASK_BODY_BEGIN
+  out->assign(config_.tiers_.size(), 0);
+  if (config_.tiers_.size() < 2) {
+    out->clear();  // one tier: nothing to choose between
+    CLIO_CO_RETURN;
+  }
+  if (!copy_client_) {
+    copy_client_ = std::make_unique<clio::cte::core::Client>(
+        config_.core_pool_id_.IsNull() ? clio::cte::core::kCtePoolId
+                                       : config_.core_pool_id_);
+  }
+  {
+    auto list = copy_client_->AsyncListTargets(clio::run::PoolQuery::Local());
+    CLIO_CO_AWAIT(list);
+    if (list->GetReturnCode() != 0) {
+      out->clear();
+      CLIO_CO_RETURN;
+    }
+    std::vector<std::string> names(list->target_names_.begin(),
+                                   list->target_names_.end());
+    for (size_t i = 0; i < names.size(); ++i) {
+      auto info = copy_client_->AsyncGetTargetInfo(
+          names[i], clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(info);
+      if (info->GetReturnCode() != 0) {
+        continue;
+      }
+      // The configured tier whose score is closest to the target's.
+      size_t best = 0;
+      for (size_t t = 1; t < config_.tiers_.size(); ++t) {
+        if (std::fabs(config_.tiers_[t].score_ - info->target_score_) <
+            std::fabs(config_.tiers_[best].score_ - info->target_score_)) {
+          best = t;
+        }
+      }
+      (*out)[best] += info->remaining_space_;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 float Runtime::TierScore(const std::string &tier) const {
@@ -1730,7 +1847,9 @@ void Runtime::PlanTier(uint64_t size, Placement *place) const {
   if (place->order == "codec_first") {
     place->tier = config_.tiers_.empty() ? "" : config_.tiers_.front().name_;
   } else {
-    place->tier = const_cast<Runtime *>(this)->ChooseTier(size);
+    place->tier = const_cast<Runtime *>(this)->ChooseTier(
+        size, place->owner_node == UINT32_MAX ? CLIO_IPC->GetNodeId()
+                                              : place->owner_node);
   }
   place->tier_score = TierScore(place->tier);
   place->tier_bw_mb_ms = TierBwMbPerMs(place->tier);

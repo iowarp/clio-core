@@ -153,7 +153,9 @@ ccm::Decision CcmManager::SelectCodec(const void *blob_data,
                                       const std::string &blob_name,
                                       double ratio_noise_sigma,
                                       double load_mult,
-                                      double tier_bw_mb_ms) {
+                                      double tier_bw_mb_ms,
+                                      const std::function<double(uint64_t)>
+                                          *store_bw) {
   Features features = ComputeFeatures(blob_data, size);
   std::lock_guard<std::mutex> lock(config_lock_);
   if (!config_) {
@@ -192,7 +194,8 @@ ccm::Decision CcmManager::SelectCodec(const void *blob_data,
                                tier_bw_mb_ms > 0.0 ? tier_bw_mb_ms
                                                    : config_->net_bw_gbps_ / 8.0,
                                load_mult,
-                               ratio_noise_sigma, &rng_, compare_raw);
+                               ratio_noise_sigma, &rng_, compare_raw,
+                               store_bw);
   decision.qos_stage_index_ = stage_idx;
   decision.candidates_.insert(decision.candidates_.end(), rejected.begin(),
                               rejected.end());

@@ -40,6 +40,7 @@
 #include <clio_cte/dtschedule/ccm/data_stats.h>
 
 #include <atomic>
+#include <functional>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -114,7 +115,9 @@ class CcmManager {
                             const std::string &blob_name,
                             double ratio_noise_sigma = 0.0,
                             double load_mult = 1.0,
-                            double tier_bw_mb_ms = 0.0);
+                            double tier_bw_mb_ms = 0.0,
+                            const std::function<double(uint64_t)> *store_bw =
+                                nullptr);
 
   /**
    * Record observed compression performance.

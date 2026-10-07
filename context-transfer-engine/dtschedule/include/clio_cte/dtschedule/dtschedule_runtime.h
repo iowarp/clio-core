@@ -531,32 +531,51 @@ class Runtime : public clio::cte::core::CoreInterposer {
   // Phase 4b: Tier selection and scenario selection
 
   /**
-   * Tier snapshot: capacity remaining on each tier's devices.
-   * Updated by Monitor() from core's ListTargets.
+   * Optimistic per-node tier reservations: bytes this container has sent to
+   * each tier of each owner node since that node's last load sample (the
+   * sample's free bytes are stale until the next one arrives). Reset when a
+   * new sample for the node is stored.
    */
-  struct TierCapacity {
-    std::string name_;            ///< Tier name (e.g., "ram", "nvme")
-    float score_;                 ///< Device score for this tier
-    uint64_t remaining_bytes_ = 0;  ///< Remaining capacity (bytes)
-  };
-  std::vector<TierCapacity> tier_capacities_;  ///< Sorted by score, descending
+  std::unordered_map<uint32_t, std::vector<uint64_t>> tier_reserved_;
   std::mutex tier_cap_lock_;
 
   /**
-   * Choose a tier based on remaining capacity and blob size.
+   * Read this node's free bytes per configured tier from the core's local
+   * targets (ListTargets + GetTargetInfo, Local). A target belongs to the
+   * configured tier whose score is closest to the target's score.
    *
-   * Returns the highest-score tier with remaining_bytes >= size,
-   * or the next lower tier if the highest is full, etc.
-   * Falls back to the lowest-score tier if all are full.
-   * Returns empty string if no tiers configured.
-   *
-   * DESIGN.md §7 tier selection: "highest-score configured tier whose
-   * matching targets have remaining capacity >= size, else next lower".
-   *
-   * @param blob_size Size of blob to store (bytes)
-   * @return Chosen tier name, or empty string if no tiers
+   * @param out Free bytes per tier, in config_.tiers_ order
    */
-  std::string ChooseTier(uint64_t blob_size);
+  clio::run::TaskResume CollectTierRemaining(std::vector<uint64_t> *out);
+
+  /**
+   * Choose the tier a blob of blob_size bytes will land in on owner node.
+   *
+   * Highest-score configured tier whose free bytes on that node (latest
+   * load sample minus this container's reservations since) can hold the
+   * blob, else the lowest tier. Without a sample for the node, the fastest
+   * tier. DESIGN.md §7 tier selection.
+   *
+   * @param blob_size Bytes to store
+   * @param owner_node Node that will store them
+   * @param reserve Also reserve the bytes on the chosen tier
+   * @return Chosen tier name, or empty string if no tiers are configured
+   */
+  std::string ChooseTier(uint64_t blob_size, uint32_t owner_node,
+                         bool reserve = false);
+
+  /**
+   * Store bandwidth (MB/ms) for writing bytes to owner_node: the bandwidth
+   * of the tier those bytes would land in, capped by the network when the
+   * owner or a known consumer is another node.
+   *
+   * @param bytes Bytes to store (raw or compressed size)
+   * @param owner_node Node that owns the blob
+   * @param consumer_node Known consumer, or UINT32_MAX
+   * @return Bandwidth in MB/ms
+   */
+  double StoreBwFor(uint64_t bytes, uint32_t owner_node,
+                    uint32_t consumer_node);
 
   /**
    * Scenario selection result.

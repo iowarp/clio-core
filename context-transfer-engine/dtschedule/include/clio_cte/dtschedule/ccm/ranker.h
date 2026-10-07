@@ -37,6 +37,7 @@
 #include <clio_cte/dtschedule/ccm/predictor.h>
 #include <clio_cte/dtschedule/ccm/candidates.h>
 #include <random>
+#include <functional>
 #include <vector>
 #include <string>
 
@@ -94,7 +95,9 @@ class Ranker {
                        double load_mult = 1.0,
                        double ratio_noise_sigma = 0.0,
                        std::mt19937_64 *rng = nullptr,
-                       bool compare_raw = true);
+                       bool compare_raw = true,
+                       const std::function<double(uint64_t)> *store_bw =
+                           nullptr);
 
 };
 

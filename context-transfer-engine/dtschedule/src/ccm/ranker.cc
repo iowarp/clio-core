@@ -47,7 +47,8 @@ Decision Ranker::Rank(const std::vector<Candidate> &candidates,
                       double load_mult,
                       double ratio_noise_sigma,
                       std::mt19937_64 *rng,
-                      bool compare_raw) {
+                      bool compare_raw,
+                      const std::function<double(uint64_t)> *store_bw) {
   Decision decision{};
   decision.n_candidates_ = candidates.size();
   decision.chosen_tier_ = "default";  // tier selection arrives in phase 4
@@ -68,7 +69,13 @@ Decision Ranker::Rank(const std::vector<Candidate> &candidates,
     if (pred.ratio_ < 1.0) {
       pred.ratio_ = 1.0;
     }
-    const double storage_ms = (size_mb / pred.ratio_) / tier_bw;
+    // Bandwidth of the tier this candidate's stored size lands in (raw may
+    // spill to a slower tier while the compressed bytes still fit a fast one).
+    const double z_bw =
+        store_bw != nullptr
+            ? (*store_bw)(static_cast<uint64_t>(size / pred.ratio_))
+            : tier_bw;
+    const double storage_ms = (size_mb / pred.ratio_) / z_bw;
     const double cost = load_mult * (pred.ctime_ms_ + storage_ms) + pred.dtime_ms_;
     const bool useful = pred.ratio_ >= kMinUsefulRatio;
     decision.candidates_.push_back(CandidateRecord{
@@ -92,7 +99,9 @@ Decision Ranker::Rank(const std::vector<Candidate> &candidates,
   // storing the smaller payload beats storing the raw payload (same load
   // multiplier, no decompression); under the ratio objective raw is the
   // fallback only when no candidate is useful.
-  const double raw_cost = load_mult * size_mb / tier_bw;
+  const double raw_bw =
+      store_bw != nullptr ? (*store_bw)(static_cast<uint64_t>(size)) : tier_bw;
+  const double raw_cost = load_mult * size_mb / raw_bw;
   const bool raw_wins =
       best < 0 ||
       (compare_raw && objective != "ratio" && best_cost >= raw_cost);

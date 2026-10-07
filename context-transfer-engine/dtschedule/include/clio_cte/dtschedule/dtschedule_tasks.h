@@ -598,6 +598,9 @@ struct NodeLoadSample {
   uint64_t ts_ms_ = 0;               ///< Timestamp in milliseconds
   double cpu_util_ = 0.0;            ///< CPU utilization percentage
   uint32_t queued_tasks_ = 0;        ///< Tasks in worker queue
+  /** Free bytes per configured tier on that node, in DtscheduleConfig::tiers_
+   *  order (fastest first); empty when the node's targets were not read. */
+  std::vector<uint64_t> tier_remaining_;
 
   NodeLoadSample() = default;
   NodeLoadSample(uint64_t ts, double cpu, uint32_t queued)
@@ -605,7 +608,7 @@ struct NodeLoadSample {
 
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(ts_ms_, cpu_util_, queued_tasks_);
+    ar(ts_ms_, cpu_util_, queued_tasks_, tier_remaining_);
   }
 };
 
