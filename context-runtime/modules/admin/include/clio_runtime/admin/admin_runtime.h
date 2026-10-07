@@ -490,6 +490,16 @@ private:
   static constexpr double kIdleProbeSec = 10.0;
   /** net_key of an idle probe: no replica behind it, liveness only. */
   static constexpr size_t kIdleProbeKey = ~size_t(0);
+  /**
+   * #1222: a node held DEAD is re-probed every kDeadReprobeSec (slower than
+   * the idle cadence) with a TASK_LIVENESS_PROBE-flagged query that SendIn
+   * transmits despite the dead mark. An answer REJOINS it (SetAlive); with
+   * SWIM disabled -- the default -- this is the only way a node that merely
+   * lost connectivity ever comes back without a restart.
+   */
+  static constexpr float kDeadReprobeSec = 2.0f;
+  std::unordered_map<clio::run::u64, std::chrono::steady_clock::time_point>
+      last_dead_reprobe_;
   std::vector<PendingProgressQuery> pending_progress_queries_;
   /**
    * Consecutive liveness probes to a node that came back with an error (no
