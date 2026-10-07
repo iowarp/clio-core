@@ -41,6 +41,11 @@ READ_SPEED_TOLERANCE = 0.08
 # NeuroPress's own work per chunk / per training step, measured in learning runs (phases.csv)
 SEL_MS = {"Nyx": 0.300, "VPIC": 0.352, "WarpX": 0.278, "incflo": 0.260}
 TRAIN_MS = 0.15
+# HCompress's own work per chunk (prediction + feedback), measured in its option-A runs (phases.csv)
+HC_SEL_MS = {"Nyx": 0.246, "VPIC": 0.260, "WarpX": 0.266, "incflo": 0.263}
+# XGBoost's own work per chunk (chunk statistics + 12,564-tree inference on 1 CPU thread), measured
+# in its option-A runs (phases.csv, 2026-10-07)
+XGB_SEL_MS = {"Nyx": 5.085, "VPIC": 5.140, "WarpX": 5.321, "incflo": 5.170}
 
 
 def model_name(w):
