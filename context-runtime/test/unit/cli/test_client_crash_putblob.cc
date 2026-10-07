@@ -44,6 +44,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+
+#include "clio_ctp/introspect/system_info.h"
 #include <sstream>
 #include <string>
 #include <thread>
@@ -407,18 +409,29 @@ TEST_CASE("ClientCrash - dead SHM client's segments are reaped while running",
   }
   REQUIRE(up);
 
+  // The client's first data segment. Observed through its name entry, not
+  // the log: leak-check builds compile kInfo logging out. symlink_status,
+  // because the entry links into the (soon dead) client's /proc/<pid>/fd and
+  // would read as missing the moment the client dies.
+  const fs::path seg = ctp::SystemInfo::GetMemfdPath(
+      "clio_" + std::to_string(child) + "_0");
+  auto present = [&seg]() {
+    std::error_code ec;
+    return fs::exists(fs::symlink_status(seg, ec));
+  };
+  INFO("client segment entry: " << seg.string());
+  REQUIRE(present());
+
   kill(child, SIGKILL);
   int status = 0;
   REQUIRE(waitpid(child, &status, 0) == child);
 
   // Grace 2 s plus the 1 s reap period: well inside 30 s.
-  const std::string want = "for allocator (" + std::to_string(child) + ".";
   bool reaped = false;
   for (int i = 0; i < 300 && !reaped; ++i) {
-    reaped = ReadWholeFile(log_path).find(want) != std::string::npos;
+    reaped = !present();
     if (!reaped) std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
-  INFO("looking for '" << want << "' in " << log_path);
   REQUIRE(reaped);
   REQUIRE(server.IsRunning());
 
