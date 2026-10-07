@@ -32,3 +32,15 @@ set_tests_properties(test_dtschedule_interpose
     TIMEOUT 900
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+
+# Candidate presets cover fast/balanced/best and convert through the wire
+# helpers (#1205). Factory-only: no runtime.
+add_executable(test_dtschedule_presets test_dtschedule_presets.cc)
+target_link_libraries(test_dtschedule_presets
+    clio_cte_dtschedule_runtime
+    clio_cte_core_client)
+target_include_directories(test_dtschedule_presets PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include)
+add_test(NAME test_dtschedule_presets COMMAND test_dtschedule_presets)
+set_tests_properties(test_dtschedule_presets PROPERTIES TIMEOUT 120)

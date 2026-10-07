@@ -35,6 +35,13 @@
 
 namespace clio::cte::dtschedule::ccm {
 
+namespace {
+/** The presets every library is tried at, fastest first. */
+constexpr ctp::CompressionPreset kPresets[] = {
+    ctp::CompressionPreset::FAST, ctp::CompressionPreset::BALANCED,
+    ctp::CompressionPreset::BEST};
+}  // namespace
+
 size_t CandidateSet::BuildAll() {
   all_candidates_.clear();
 
@@ -48,8 +55,9 @@ size_t CandidateSet::BuildAll() {
 
   // Try each lossless library at all three presets
   for (const auto &lib : lossless_libs) {
-    for (int preset_val = 1; preset_val <= 3; ++preset_val) {
-      auto preset = static_cast<ctp::CompressionPreset>(preset_val);
+    // The enum values themselves: casting the 1-based wire numbers onto
+    // this 0-based enum never tried FAST and ran BEST as "balanced" (#1205).
+    for (ctp::CompressionPreset preset : kPresets) {
       auto compressor = ctp::CompressionFactory::GetPreset(lib, preset);
       if (compressor) {
         all_candidates_.push_back(Candidate{lib, preset, false});
@@ -59,8 +67,9 @@ size_t CandidateSet::BuildAll() {
 
   // Try each lossy library at all three presets
   for (const auto &lib : lossy_libs) {
-    for (int preset_val = 1; preset_val <= 3; ++preset_val) {
-      auto preset = static_cast<ctp::CompressionPreset>(preset_val);
+    // The enum values themselves: casting the 1-based wire numbers onto
+    // this 0-based enum never tried FAST and ran BEST as "balanced" (#1205).
+    for (ctp::CompressionPreset preset : kPresets) {
       auto compressor = ctp::CompressionFactory::GetPreset(lib, preset);
       if (compressor) {
         all_candidates_.push_back(Candidate{lib, preset, true});

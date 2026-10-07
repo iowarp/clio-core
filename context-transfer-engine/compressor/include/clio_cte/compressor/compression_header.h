@@ -36,6 +36,8 @@
 
 #include <cstdint>
 
+#include "clio_ctp/compress/compress_factory.h"
+
 namespace clio::cte::compressor {
 
 /**
@@ -47,6 +49,42 @@ enum class CompressPreset : uint32_t {
   kBalanced = 2,  ///< Balanced speed and ratio (default)
   kBest = 3,      ///< Best ratio, slower
 };
+
+/**
+ * Wire preset (1-based: headers, traces, Q-table config ids) for a codec
+ * preset. ctp::CompressionPreset is 0-based ({FAST=0, BALANCED=1, BEST=2,
+ * DEFAULT=3}); casting one numbering onto the other ran the slowest level
+ * for "balanced" and never tried "fast" (#1205). Convert only through
+ * these two helpers.
+ * @param preset the codec preset (DEFAULT maps to balanced)
+ * @return the CompressPreset wire value
+ */
+inline uint32_t ToWirePreset(ctp::CompressionPreset preset) {
+  switch (preset) {
+    case ctp::CompressionPreset::FAST:
+      return static_cast<uint32_t>(CompressPreset::kFast);
+    case ctp::CompressionPreset::BEST:
+      return static_cast<uint32_t>(CompressPreset::kBest);
+    default:
+      return static_cast<uint32_t>(CompressPreset::kBalanced);
+  }
+}
+
+/**
+ * Codec preset for a wire preset.
+ * @param wire a CompressPreset value (anything else reads as balanced)
+ * @return the ctp::CompressionPreset to build the codec with
+ */
+inline ctp::CompressionPreset FromWirePreset(uint32_t wire) {
+  switch (wire) {
+    case static_cast<uint32_t>(CompressPreset::kFast):
+      return ctp::CompressionPreset::FAST;
+    case static_cast<uint32_t>(CompressPreset::kBest):
+      return ctp::CompressionPreset::BEST;
+    default:
+      return ctp::CompressionPreset::BALANCED;
+  }
+}
 
 /**
  * Compression header prepended to compressed data for self-describing format.

@@ -258,7 +258,7 @@ ctp::ipc::FullPtr<char> Runtime::CompressWithDecision(
   auto *header = reinterpret_cast<compressor::CompressionHeader *>(buf.ptr_);
   *header = compressor::CompressionHeader(
       ctp::CompressionFactory::GetWireId(decision.chosen_lib_),
-      static_cast<uint32_t>(decision.chosen_preset_), size, comp_size);
+      compressor::ToWirePreset(decision.chosen_preset_), size, comp_size);
   out->used = true;
   return buf;
 }
@@ -816,14 +816,8 @@ ctp::ipc::FullPtr<char> Runtime::DecompressStored(const char *stored,
     return ctp::ipc::FullPtr<char>();
   }
   *lib_name = ctp::CompressionFactory::NameForWireId(header->compress_lib_);
-  ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-  if (header->compress_preset_ ==
-      static_cast<uint32_t>(compressor::CompressPreset::kFast)) {
-    preset = ctp::CompressionPreset::FAST;
-  } else if (header->compress_preset_ ==
-             static_cast<uint32_t>(compressor::CompressPreset::kBest)) {
-    preset = ctp::CompressionPreset::BEST;
-  }
+  const ctp::CompressionPreset preset =
+      compressor::FromWirePreset(header->compress_preset_);
   auto codec = ctp::CompressionFactory::GetPreset(*lib_name, preset);
   if (!codec) {
     HLOG(kWarning, "dtschedule: no codec '{}' for stored blob", *lib_name);
@@ -1542,7 +1536,8 @@ void Runtime::WriteTraceRow(const std::string &tag_id,
       place.owner_node == UINT32_MAX ? "" : std::to_string(place.owner_node),
       std::to_string(decision.n_candidates_),
       out.used ? decision.chosen_lib_ : "raw",
-      chose ? std::to_string(static_cast<int>(decision.chosen_preset_)) : "",
+      chose ? std::to_string(compressor::ToWirePreset(decision.chosen_preset_))
+            : "",
       std::to_string(place.scenario),
       place.tier.empty() ? decision.chosen_tier_ : place.tier,
       chose ? TraceNum(decision.pred_ctime_ms_) : "",
@@ -1572,7 +1567,7 @@ void Runtime::WriteCandidatesTrace(const std::string &tag_id,
     const bool ranked = c.reason_ == ccm::kReasonOk;
     candidates_trace_file_ << JoinCsv(
         {ts, std::to_string(container_id_), tag_id, blob_name, c.lib_,
-         std::to_string(static_cast<int>(c.preset_)),
+         std::to_string(compressor::ToWirePreset(c.preset_)),
          ranked || c.reason_ == ccm::kReasonSkipRatio ? TraceNum(c.pred_ctime_ms_) : "",
          ranked || c.reason_ == ccm::kReasonSkipRatio ? TraceNum(c.pred_dtime_ms_) : "",
          ranked || c.reason_ == ccm::kReasonSkipRatio ? TraceNum(c.pred_ratio_) : "",
