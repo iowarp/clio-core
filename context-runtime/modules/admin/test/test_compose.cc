@@ -213,6 +213,19 @@ TEST_CASE("Admin client Compose method", "[compose]") {
   HIPRINT("Admin client Compose test passed");
 }
 
+TEST_CASE("CLIO_ADMIN targets the admin pool", "[compose][admin]") {
+  // ServerInit's pool-log replay touches CLIO_ADMIN before ClientInit
+  // publishes the admin client, so the singleton is default-constructed
+  // first. That must still mean the admin pool: a PoolId(0,0) admin client
+  // routes nothing, which is how `clio_run start`'s node induction broke.
+  auto *admin_client = CLIO_ADMIN;
+  REQUIRE(admin_client != nullptr);
+  REQUIRE(admin_client->pool_id_ == clio::run::kAdminPoolId);
+
+  clio::run::admin::Client fresh;
+  REQUIRE(fresh.pool_id_ == clio::run::kAdminPoolId);
+}
+
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
