@@ -1,0 +1,113 @@
+# E10 -- load-response timeline (EVAL_PLAN.md section 2, reviewer concern C6).
+#
+# One producer/consumer pair for ~10 minutes: seismology with stage_sets=2
+# puts every level-0 producer (sG1IterDecon) on node 1 and the level-1
+# consumer (wrapper_siftSTFByMisfit) on node 2; the footprint is doubled
+# vs seismology_2n so level 0 runs long enough for three load steps.
+# load_period_ms: 500 so the trace's producer_cpu / consumer_cpu columns
+# resolve the steps; dtschedule.trace is the figure's only input.
+#
+# Load steps (EVAL_PLAN: consumer at t=120 s, release at t=240 s, producer
+# at t=300 s) are injected with stress-ng. No builtin jarvis package wraps
+# stress-ng (checked /mnt/common/llogan/jarvis-cd/builtin/builtin on
+# 2026-10-06), so the steps are driven by load_steps.sh next to this file:
+#
+#   # in a second shell, right after `jarvis ppl run` prints
+#   # "[clio_wfcommons_dist] [START] BEGIN" (t0):
+#   bash load_steps.sh <producer-host> <consumer-host>
+#
+# or wire it into the pipeline with builtin.my_shell (the script
+# backgrounds itself and returns at once) -- fill in the absolute path:
+#
+#   - pkg_type: builtin.my_shell
+#     pkg_name: load_steps
+#     script: /abs/path/to/jarvis_clio_core/pipelines/ares/dtschedule/load_steps.sh
+#
+# placed right before the wfcommons package. Inside a SLURM job the script
+# takes the first two hosts of $SLURM_JOB_NODELIST when no arguments are
+# given. The dtschedule.load_* knobs can also be flipped mid-run through
+# the chimod's kSetKnobs verb; jarvis does not drive that.
+#
+# Run:   jarvis ppl load yaml <this file> && jarvis ppl run
+# Figure: dtschedule/eval/e10_timeline.py
+
+name: dtschedule_e10
+
+ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+
+env:
+  CLIO_MEMFD_DIR: "${HOME}/iowarp_clio_tmp_${HOSTNAME}"
+  WFBENCH_DROP_CACHE: "1"
+
+scheduler:
+  name: slurm
+  job_name: dtschedule_e10
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 40
+  partition: debug
+  time: "01:00:00"
+  output: slurm-%j.out
+  error: slurm-%j.err
+  suffix: "-40g"
+  pre_cmds:
+    - 'mkdir -p /mnt/nvme/${USER}/dtschedule_e10'
+
+pkgs:
+  - pkg_type: jarvis_clio_core.clio_runtime
+    pkg_name: runtime
+    num_threads: 4
+    client_data_segment_size: "2G"
+    port: 9413
+    ipc_mode: "shm"
+    log_level: "info"
+    sleep: 4
+    swim_enabled: false
+
+  - pkg_type: jarvis_clio_core.clio_cte
+    pkg_name: cte_core
+    devices:
+      - ["ram::cte_ram_tier1", "16GB", 1.0]
+      - ["/mnt/nvme/${USER}/dtschedule_e10/cte_target.bin", "128GB", 0.7]
+    dpe_type: "max_bw"
+    pool_query: "local"
+    default_target_timeout_ms: 30000
+    poll_period_ms: 5000
+
+  - pkg_type: jarvis_clio_core.clio_dtschedule
+    pkg_name: dtschedule
+    ccm: qtable
+    workflow_aware: dag
+    load_aware: true
+    load_period_ms: 500
+    load_cap: 4.0
+    qos_objective: performance
+    qos_max_error: 1.0e-3
+    force_scenario: auto
+    decision_order: joint
+    net_bw_gbps: 40
+    trace_path: ${HOME}/jarvis-runs/dtschedule_e10/dtschedule_trace
+    trace_candidates: true
+
+  - pkg_type: jarvis_clio_core.clio_wfcommons_dist
+    pkg_name: wfcommons
+    recipe: seismology
+    num_tasks: 103
+    data_footprint: "60G"
+    cpu_work: 1
+    percent_cpu: 1.0
+    drop_page_cache: true
+    clio_prefix: true
+    placement: stage_sets
+    stage_sets: 2
+    data_class: auto
+    data_noise: 0.05
+    wf_python: ${HOME}/venv-dtschedule/bin/python
+    out: ${HOME}/dtschedule-runs/e10
+    ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+    interceptors: [cte_posix]
+
+interceptors:
+  - pkg_type: jarvis_clio_core.clio_adapters
+    pkg_name: cte_posix
+    posix: true

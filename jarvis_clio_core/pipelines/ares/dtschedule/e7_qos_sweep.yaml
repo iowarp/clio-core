@@ -1,0 +1,136 @@
+# E7 -- QoS sweep (EVAL_PLAN.md section 2, reviewer concerns C3/A3/B5).
+#
+# Seismology (float-dominated .stf traces) swept over the QoS spec.
+# Two independent loop groups (cartesian product, 7 x 2 = 14 runs):
+#
+#   group 1 (zipped): the error bound, the lossy allowlist and the
+#   per-stage overrides advance together
+#     row  qos_max_error  qos_lossy_allowlist   qos_stages
+#     0    0 (lossless)   default               -
+#     1    1e-2           default               -
+#     2    1e-3           default               -
+#     3    1e-4           default               -
+#     4    1e-5           default               -
+#     5    1.0            ['.*']  "no QoS at all": every file may be lossy,
+#                                 no effective bound (A3)
+#     6    1e-2           default stage 1 (sG1IterDecon outputs) lossy at 1e-2,
+#                                 stage 2 (wrapper_siftSTFByMisfit) lossless (B5)
+#   group 2: qos_objective in {performance, ratio}
+#
+# Per-row outputs in results.csv: wfcommons.makespan_ms, dtschedule.puts /
+# .compressed / .mean_ratio / .lib.<codec> / .tier.<tier>. The downstream
+# analysis error (L-inf of the consumer's result vs the lossless row) is
+# computed offline by the figure script from the workflow outputs.
+#
+# Run:   jarvis ppl submit <abs path>/e7_qos_sweep.yaml
+#   or   python3 sweep.py --exp e7 --from-test e7_qos_sweep.yaml
+# Figure: dtschedule/eval/e7_qos.py
+
+scheduler:
+  name: slurm
+  job_name: dtschedule_e7
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 40
+  partition: debug
+  time: "08:00:00"
+  output: slurm-%j.out
+  error: slurm-%j.err
+  suffix: "-40g"
+  pre_cmds:
+    - 'mkdir -p /mnt/nvme/${USER}/dtschedule_e7'
+
+config:
+  name: dtschedule_e7
+
+  ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+
+  env:
+    CLIO_MEMFD_DIR: "${HOME}/iowarp_clio_tmp_${HOSTNAME}"
+    WFBENCH_DROP_CACHE: "1"
+
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 4
+      client_data_segment_size: "2G"
+      port: 9413
+      ipc_mode: "shm"
+      log_level: "info"
+      sleep: 4
+      swim_enabled: false
+
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cte_ram_tier1", "16GB", 1.0]
+        - ["/mnt/nvme/${USER}/dtschedule_e7/cte_target.bin", "64GB", 0.7]
+      dpe_type: "max_bw"
+      pool_query: "local"
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    - pkg_type: jarvis_clio_core.clio_dtschedule
+      pkg_name: dtschedule
+      ccm: qtable
+      workflow_aware: dag
+      load_aware: true
+      qos_objective: performance
+      qos_max_error: 1.0e-3
+      force_scenario: auto
+      decision_order: joint
+      net_bw_gbps: 40
+      trace_path: ${HOME}/jarvis-runs/dtschedule_e7/dtschedule_trace
+      trace_candidates: true
+
+    - pkg_type: jarvis_clio_core.clio_wfcommons_dist
+      pkg_name: wfcommons
+      recipe: seismology
+      num_tasks: 103
+      data_footprint: "30G"
+      cpu_work: 1
+      percent_cpu: 1.0
+      drop_page_cache: true
+      clio_prefix: true
+      placement: stage_sets
+      stage_sets: 2
+      data_class: auto
+      data_noise: 0.05
+      wf_python: ${HOME}/venv-dtschedule/bin/python
+      out: ${HOME}/dtschedule-runs/e7
+      ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+      interceptors: [cte_posix]
+
+  interceptors:
+    - pkg_type: jarvis_clio_core.clio_adapters
+      pkg_name: cte_posix
+      posix: true
+
+vars:
+  dtschedule.qos_max_error: [0.0, 1.0e-2, 1.0e-3, 1.0e-4, 1.0e-5, 1.0, 1.0e-2]
+  dtschedule.qos_lossy_allowlist:
+    - ['.*\.(fits|nc|h5|bp|sac|dat|stf)$']
+    - ['.*\.(fits|nc|h5|bp|sac|dat|stf)$']
+    - ['.*\.(fits|nc|h5|bp|sac|dat|stf)$']
+    - ['.*\.(fits|nc|h5|bp|sac|dat|stf)$']
+    - ['.*\.(fits|nc|h5|bp|sac|dat|stf)$']
+    - ['.*']
+    - ['.*\.(fits|nc|h5|bp|sac|dat|stf)$']
+  dtschedule.qos_stages:
+    - []
+    - []
+    - []
+    - []
+    - []
+    - []
+    - [{match: '.*wrapper_siftSTFByMisfit.*', max_error: 0.0}]
+  dtschedule.qos_objective: ["performance", "ratio"]
+
+loop:
+  - [dtschedule.qos_max_error, dtschedule.qos_lossy_allowlist,
+     dtschedule.qos_stages]
+  - [dtschedule.qos_objective]
+
+run_timeout: 2400
+repeat: 1
+output: "${HOME}/jarvis-runs/dtschedule-results/e7_qos_sweep"

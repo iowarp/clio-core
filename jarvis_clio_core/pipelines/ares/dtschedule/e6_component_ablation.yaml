@@ -1,0 +1,116 @@
+# E6 -- component ablation (EVAL_PLAN.md section 2, reviewer concerns C1/B6).
+#
+# Leave-one-out over the dtschedule switches, as ZIPPED rows (all four
+# variables advance together, so each row is one configuration):
+#
+#   row  ccm                   load_aware  workflow_aware  qos_max_error
+#   0    qtable                true        dag             1e-3   full system
+#   1    fixed:zstd:balanced   true        dag             1e-3   - CCM selection
+#   2    qtable                false       dag             1e-3   - load-aware offload
+#   3    qtable                true        consumer        1e-3   - DAG routing (+w only)
+#   4    qtable                true        none            1e-3   - any routing
+#   5    qtable                true        dag             0      - lossy family
+#   6    fixed:zstd:balanced   false       none            0      everything off
+#
+# `prefetch` from the plan is not a DESIGN.md section 7 key and is not
+# swept here. Cumulative-add is the same table read bottom-up.
+# Cache hit rate and remote-read bytes come from the trace
+# (consumer_node vs owner_node columns), see dtschedule/eval/e6_stacked.py.
+#
+# Run:   jarvis ppl submit <abs path>/e6_component_ablation.yaml
+#   or   python3 sweep.py --exp e6 --from-test e6_component_ablation.yaml
+# Figure: dtschedule/eval/e6_stacked.py
+
+scheduler:
+  name: slurm
+  job_name: dtschedule_e6
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 40
+  partition: debug
+  time: "06:00:00"
+  output: slurm-%j.out
+  error: slurm-%j.err
+  suffix: "-40g"
+  pre_cmds:
+    - 'mkdir -p /mnt/nvme/${USER}/dtschedule_e6'
+
+config:
+  name: dtschedule_e6
+
+  ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+
+  env:
+    CLIO_MEMFD_DIR: "${HOME}/iowarp_clio_tmp_${HOSTNAME}"
+    WFBENCH_DROP_CACHE: "1"
+
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 4
+      client_data_segment_size: "2G"
+      port: 9413
+      ipc_mode: "shm"
+      log_level: "info"
+      sleep: 4
+      swim_enabled: false
+
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cte_ram_tier1", "16GB", 1.0]
+        - ["/mnt/nvme/${USER}/dtschedule_e6/cte_target.bin", "64GB", 0.7]
+      dpe_type: "max_bw"
+      pool_query: "local"
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    - pkg_type: jarvis_clio_core.clio_dtschedule
+      pkg_name: dtschedule
+      ccm: qtable
+      workflow_aware: dag
+      load_aware: true
+      qos_objective: performance
+      qos_max_error: 1.0e-3
+      force_scenario: auto
+      decision_order: joint
+      net_bw_gbps: 40
+      trace_path: ${HOME}/jarvis-runs/dtschedule_e6/dtschedule_trace
+      trace_candidates: true
+
+    - pkg_type: jarvis_clio_core.clio_wfcommons_dist
+      pkg_name: wfcommons
+      recipe: montage
+      num_tasks: 60
+      data_footprint: "30G"
+      cpu_work: 1
+      percent_cpu: 1.0
+      drop_page_cache: true
+      clio_prefix: true
+      placement: stage_sets
+      stage_sets: 2
+      data_class: auto
+      data_noise: 0.05
+      wf_python: ${HOME}/venv-dtschedule/bin/python
+      out: ${HOME}/dtschedule-runs/e6
+      ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+      interceptors: [cte_posix]
+
+  interceptors:
+    - pkg_type: jarvis_clio_core.clio_adapters
+      pkg_name: cte_posix
+      posix: true
+
+vars:
+  dtschedule.ccm:            ["qtable", "fixed:zstd:balanced", "qtable", "qtable", "qtable", "qtable", "fixed:zstd:balanced"]
+  dtschedule.load_aware:     [true,     true,                  false,    true,     true,     true,     false]
+  dtschedule.workflow_aware: ["dag",    "dag",                 "dag",    "consumer", "none", "dag",    "none"]
+  dtschedule.qos_max_error:  [1.0e-3,   1.0e-3,                1.0e-3,   1.0e-3,   1.0e-3,   0.0,      0.0]
+
+loop:
+  - [dtschedule.ccm, dtschedule.load_aware, dtschedule.workflow_aware,
+     dtschedule.qos_max_error]
+
+run_timeout: 2400
+repeat: 1
+output: "${HOME}/jarvis-runs/dtschedule-results/e6_component_ablation"
