@@ -297,7 +297,8 @@ def read_makespan(config):
     :return: Parsed JSON dict, or None when absent.
     """
     for pkg in config.get('pkgs', []):
-        if str(pkg.get('pkg_type', '')).endswith(WFCOMMONS_SUFFIX):
+        if str(pkg.get('pkg_type', '')).endswith(
+                (WFCOMMONS_SUFFIX, '.clio_prodcons')):
             out = os.path.expandvars(pkg.get('out', ''))
             path = os.path.join(out, 'makespan.json')
             if os.path.isfile(path):

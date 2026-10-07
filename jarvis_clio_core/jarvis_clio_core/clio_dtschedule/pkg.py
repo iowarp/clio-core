@@ -49,6 +49,7 @@ DEFAULT_POOL_ID = 566.0
 DOWNSTREAM_MODS = ('clio_cte_cache', 'clio_cte_indexer', 'clio_cte_core')
 CTE_PKG_SUFFIX = '.clio_cte'
 WFCOMMONS_PKG_SUFFIX = '.clio_wfcommons_dist'
+PRODCONS_PKG_SUFFIX = '.clio_prodcons'
 DAG_ENV = 'DTSCHEDULE_DAG_PATH'
 MODELS_REL = 'context-transfer-engine/dtschedule/models/qtable_v1'
 
@@ -421,6 +422,10 @@ class ClioDtschedule(Service):
         env_path = self.env.get(DAG_ENV, '') or os.environ.get(DAG_ENV, '')
         if env_path:
             return env_path
+        pc = self._find_pkg_def(PRODCONS_PKG_SUFFIX)
+        if pc is not None:
+            out = pc['config'].get('out', '${HOME}/dtschedule-runs/prodcons')
+            return os.path.join(os.path.expandvars(out), 'placement.json')
         wf = self._find_pkg_def(WFCOMMONS_PKG_SUFFIX)
         if wf is None:
             return ''

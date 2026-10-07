@@ -1,0 +1,66 @@
+# DTSchedule headline workload: MPI producer -> CLIO -> MPI checksum consumer.
+#
+# ares-comp-A (producer): dtschedule_heat_producer, 40 ranks (every hardware
+#   thread) of a 2D heat solver; every 200 sweeps each rank writes a 32 MB
+#   slab (10 steps -> 12.8 GB) through the CTE POSIX interposer.
+# ares-comp-B (consumer): dtschedule_checksum_consumer, 20 ranks, waits for
+#   each step, reads and checksums it (lighter than the producer).
+# CTE tiers per node: RAM 3 GB (score 1.0) + NVMe 32 GB (score 0.7); each
+# node owns ~6.4 GB raw, so raw data must spill to NVMe while compressed
+# data may still fit in RAM. Lossless only (qos_max_error 0): the consumer
+# checksums the bytes. Network: 40 GbE (-40g hostnames, MPI on 172.25/16).
+#
+# Baselines via sweep.py overrides: dtschedule.compose_filesystem=false (no
+# dtschedule), dtschedule.ccm=fixed:zstd:balanced + force_scenario=1
+# (always compress at the producer).
+name: dtschedule_prodcons_2n
+ssh_cmd: env -u LD_LIBRARY_PATH ssh
+env: {CLIO_MEMFD_DIR: '${HOME}/iowarp_clio_tmp_${HOSTNAME}', WFBENCH_DROP_CACHE: '1'}
+scheduler:
+  name: slurm
+  job_name: dtschedule_prodcons_2n
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 40
+  partition: debug
+  time: 01:00:00
+  output: slurm-%j.out
+  error: slurm-%j.err
+  suffix: -40g
+  pre_cmds: ['mkdir -p /mnt/nvme/${USER}/dtschedule_prodcons_2n']
+pkgs:
+- {pkg_type: jarvis_clio_core.clio_runtime, pkg_name: runtime, num_threads: 4, client_data_segment_size: 2G,
+  port: 9413, ipc_mode: shm, log_level: info, sleep: 4, swim_enabled: false}
+- pkg_type: jarvis_clio_core.clio_cte
+  pkg_name: cte_core
+  devices:
+  - ['ram::cte_ram_tier1', 3GB, 1.0]
+  - ['/mnt/nvme/${USER}/dtschedule_prodcons_2n/cte_target.bin', 32GB, 0.7]
+  dpe_type: max_bw
+  pool_query: local
+  default_target_timeout_ms: 30000
+  poll_period_ms: 5000
+- {pkg_type: jarvis_clio_core.clio_dtschedule, pkg_name: dtschedule, ccm: qtable,
+  workflow_aware: dag, load_aware: true, qos_objective: performance, qos_max_error: 0.0,
+  force_scenario: auto, decision_order: joint, net_bw_gbps: 40, trace_path: '${HOME}/jarvis-runs/dtschedule_prodcons_2n/dtschedule_trace',
+  trace_candidates: true, min_compress_bytes: 65536, load_period_ms: 500}
+- pkg_type: jarvis_clio_core.clio_prodcons
+  pkg_name: prodcons
+  mpirun: /mnt/common/llogan/spack/opt/spack/linux-skylake_avx512/openmpi-5.0.8-aaqsri5t5df5mcygbtc3le7l7lumndvj/bin/mpirun
+  launch_agent: /mnt/common/llogan/spack/opt/spack/linux-skylake_avx512/prrte-4.0.0-pag2d45mbp4iiutlhvzgrlzer65cm5if/bin/prted
+  bin_dir: /mnt/common/llogan/iowarp/dtschedule/build/bin
+  out: /mnt/common/llogan/dtschedule-runs/prodcons_2n
+  run: prodcons_2n
+  producer_nodes: 1
+  ppn_producer: 40
+  ppn_consumer: 20
+  steps: 10
+  nx: 2048
+  ny: 2048
+  iters_per_step: 200
+  noise: 0.0
+  passes: 4
+  net_if: 172.25.0.0/16
+  interceptors: [cte_posix]
+interceptors:
+- {pkg_type: jarvis_clio_core.clio_adapters, pkg_name: cte_posix, posix: true}

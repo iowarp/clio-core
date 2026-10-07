@@ -1,0 +1,218 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+
+/**
+ * @file heat_producer.c
+ * Producer half of the DTSchedule producer-consumer workload.
+ *
+ * A 2D heat-diffusion solver (5-point Jacobi) decomposed by rows across MPI
+ * ranks. Run one rank per hardware thread so it holds every core. After
+ * every --iters-per-step sweeps each rank writes its slab (nx x ny doubles,
+ * plus --noise relative noise, like sensor/numerical noise in real output)
+ * to /clio::<run>__step<s>_rank<r>.dat; after a barrier rank 0 writes the
+ * step marker /clio::<run>__step<s>.done that the consumer waits for.
+ *
+ * Summary (rank 0):
+ *   heat_producer ranks=N steps=S step_mb=M compute_s=C write_s=W wall_s=T
+ */
+
+#include <math.h>
+#include <mpi.h>
+
+#include "prodcons_common.h"
+
+/** Slab with one halo row above and below: (ny + 2) rows of nx doubles. */
+typedef struct {
+  int nx, ny;
+  double *cur, *next;
+} Slab;
+
+/**
+ * Allocate a slab and seed it with a smooth field plus a few hot spots.
+ * @param s Slab to fill
+ * @param nx Columns
+ * @param ny Interior rows
+ * @param rank Seeds the hot spots so ranks differ
+ * @return 0 on success, -1 when out of memory
+ */
+static int SlabInit(Slab *s, int nx, int ny, int rank) {
+  const size_t n = (size_t)nx * (size_t)(ny + 2);
+  s->nx = nx;
+  s->ny = ny;
+  s->cur = malloc(n * sizeof(double));
+  s->next = malloc(n * sizeof(double));
+  if (s->cur == NULL || s->next == NULL) return -1;
+  srand(1234u + (unsigned)rank);
+  for (int y = 0; y < ny + 2; ++y) {
+    for (int x = 0; x < nx; ++x) {
+      s->cur[(size_t)y * nx + x] =
+          20.0 + 5.0 * sin(0.01 * x) * cos(0.013 * (y + rank * ny));
+    }
+  }
+  for (int k = 0; k < 8; ++k) {
+    const int x = rand() % nx, y = 1 + rand() % ny;
+    s->cur[(size_t)y * nx + x] = 400.0;
+  }
+  memcpy(s->next, s->cur, n * sizeof(double));
+  return 0;
+}
+
+/**
+ * Exchange halo rows with the ranks above and below (non-periodic).
+ * @param s Slab
+ * @param rank This rank
+ * @param size Rank count
+ */
+static void SlabHalo(Slab *s, int rank, int size) {
+  const int up = rank > 0 ? rank - 1 : MPI_PROC_NULL;
+  const int down = rank + 1 < size ? rank + 1 : MPI_PROC_NULL;
+  double *first = s->cur + s->nx, *last = s->cur + (size_t)s->ny * s->nx;
+  double *top = s->cur, *bottom = s->cur + (size_t)(s->ny + 1) * s->nx;
+  MPI_Sendrecv(first, s->nx, MPI_DOUBLE, up, 0, bottom, s->nx, MPI_DOUBLE,
+               down, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+  MPI_Sendrecv(last, s->nx, MPI_DOUBLE, down, 1, top, s->nx, MPI_DOUBLE, up,
+               1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+}
+
+/**
+ * One Jacobi sweep over the interior, then swap buffers.
+ * @param s Slab
+ */
+static void SlabSweep(Slab *s) {
+  const int nx = s->nx;
+  for (int y = 1; y <= s->ny; ++y) {
+    const double *a = s->cur + (size_t)(y - 1) * nx;
+    const double *b = s->cur + (size_t)y * nx;
+    const double *c = s->cur + (size_t)(y + 1) * nx;
+    double *o = s->next + (size_t)y * nx;
+    o[0] = b[0];
+    o[nx - 1] = b[nx - 1];
+    for (int x = 1; x < nx - 1; ++x) {
+      o[x] = 0.25 * (a[x] + c[x] + b[x - 1] + b[x + 1]);
+    }
+  }
+  double *t = s->cur;
+  s->cur = s->next;
+  s->next = t;
+}
+
+/**
+ * Copy the interior to out with multiplicative noise of amplitude noise.
+ * @param s Slab
+ * @param out Destination (nx * ny doubles)
+ * @param noise Relative noise amplitude (0 = exact field)
+ */
+static void SlabSnapshot(const Slab *s, double *out, double noise) {
+  const size_t n = (size_t)s->nx * (size_t)s->ny;
+  const double *in = s->cur + s->nx;
+  for (size_t i = 0; i < n; ++i) {
+    const double r = (double)rand() / (double)RAND_MAX - 0.5;
+    out[i] = in[i] * (1.0 + noise * r);
+  }
+}
+
+/**
+ * Write this rank's snapshot for a step and, on rank 0, the step marker.
+ * @param o Options
+ * @param step Step index
+ * @param rank This rank
+ * @param buf Snapshot
+ * @param bytes Snapshot size
+ * @return 0 on success, errno otherwise
+ */
+static int WriteStep(const PcOptions *o, int step, int rank, const double *buf,
+                     size_t bytes) {
+  char path[512];
+  PcPath(path, sizeof(path), o->run, step, rank);
+  int rc = PcWriteFile(path, buf, bytes);
+  int all = 0;
+  MPI_Allreduce(&rc, &all, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  if (all == 0 && rank == 0) {
+    PcPath(path, sizeof(path), o->run, step, -1);
+    all = PcWriteFile(path, &step, sizeof(step));
+  }
+  MPI_Bcast(&all, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  return all;
+}
+
+/**
+ * Entry point: solve, write a snapshot every step, report.
+ * @param argc Argument count
+ * @param argv See PcParse (--run --steps --nx --ny --iters-per-step --noise)
+ * @return 0 on success, 2 on I/O failure
+ */
+int main(int argc, char **argv) {
+  MPI_Init(&argc, &argv);
+  int rank = 0, size = 1;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+  PcOptions o = {"prodcons", 10, 2048, 2048, 200, 0, 0.02, 0};
+  PcParse(argc, argv, &o);
+  Slab s;
+  const size_t bytes = (size_t)o.nx * (size_t)o.ny * sizeof(double);
+  double *snap = malloc(bytes);
+  if (SlabInit(&s, o.nx, o.ny, rank) != 0 || snap == NULL) {
+    fprintf(stderr, "heat_producer: rank %d out of memory\n", rank);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+  double compute_s = 0.0, write_s = 0.0;
+  const double t0 = PcNow();
+  int rc = 0;
+  for (int step = 0; step < o.steps && rc == 0; ++step) {
+    const double c0 = PcNow();
+    for (int it = 0; it < o.iters_per_step; ++it) {
+      SlabHalo(&s, rank, size);
+      SlabSweep(&s);
+    }
+    SlabSnapshot(&s, snap, o.noise);
+    const double w0 = PcNow();
+    rc = WriteStep(&o, step, rank, snap, bytes);
+    compute_s += w0 - c0;
+    write_s += PcNow() - w0;
+    if (rc != 0 && rank == 0) {
+      fprintf(stderr, "heat_producer: step %d write failed: %s\n", step,
+              strerror(rc));
+    }
+  }
+  if (rank == 0) {
+    printf("heat_producer ranks=%d steps=%d step_mb=%.1f compute_s=%.2f "
+           "write_s=%.2f wall_s=%.2f rc=%d\n",
+           size, o.steps, (double)bytes * size / 1e6, compute_s, write_s,
+           PcNow() - t0, rc);
+    fflush(stdout);
+  }
+  free(snap);
+  free(s.cur);
+  free(s.next);
+  MPI_Finalize();
+  return rc == 0 ? 0 : 2;
+}
