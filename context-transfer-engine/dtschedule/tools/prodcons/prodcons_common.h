@@ -98,10 +98,14 @@ static inline double PcNow(void) {
  */
 static inline void PcPath(char *buf, size_t len, const char *run, int step,
                           int rank) {
+  // DT_PRODCONS_PREFIX overrides the CTE root (e.g. a scratch directory to
+  // measure the data offline); default is the CTE namespace root.
+  const char *env = getenv("DT_PRODCONS_PREFIX");
+  const char *prefix = (env != NULL && env[0] != '\0') ? env : "/clio::";
   if (rank < 0) {
-    snprintf(buf, len, "/clio::%s__step%d.done", run, step);
+    snprintf(buf, len, "%s%s__step%d.done", prefix, run, step);
   } else {
-    snprintf(buf, len, "/clio::%s__step%d_rank%d.dat", run, step, rank);
+    snprintf(buf, len, "%s%s__step%d_rank%d.dat", prefix, run, step, rank);
   }
 }
 

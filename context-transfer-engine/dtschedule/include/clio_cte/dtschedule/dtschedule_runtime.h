@@ -547,6 +547,12 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * @param out Free bytes per tier, in config_.tiers_ order
    */
   clio::run::TaskResume CollectTierRemaining(std::vector<uint64_t> *out);
+  /** Configured tier index for a core target (name match, else score). */
+  size_t TierIndexForTarget(const std::string &target_name,
+                            float target_score) const;
+  /** Log per-tier free bytes when they change by more than 1 GiB. */
+  void LogTierRemaining(const std::vector<uint64_t> &free_bytes);
+  std::vector<uint64_t> logged_tier_free_;  ///< Last logged free bytes
 
   /**
    * Choose the tier a blob of blob_size bytes will land in on owner node.

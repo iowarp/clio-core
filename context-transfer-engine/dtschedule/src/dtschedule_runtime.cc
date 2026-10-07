@@ -1779,6 +1779,61 @@ double Runtime::StoreBwFor(uint64_t bytes, uint32_t owner_node,
   return bw;
 }
 
+size_t Runtime::TierIndexForTarget(const std::string &target_name,
+                                  float target_score) const {
+  /**
+   * Map a core target to a configured tier: by name first (tier names come
+   * from the device paths, e.g. "ram" in "ram::cte_ram_tier1_node0", "nvme"
+   * in "/mnt/nvme/.../cte_target.bin"), else the closest score. The core's
+   * reported score can be a measured bandwidth score that does not match
+   * the configured one, so score alone mislabels NVMe as RAM.
+   *
+   * @param target_name Core target name
+   * @param target_score Score the core reports for it
+   * @return Index into config_.tiers_
+   */
+  for (size_t t = 0; t < config_.tiers_.size(); ++t) {
+    const std::string &tier = config_.tiers_[t].name_;
+    if (!tier.empty() && target_name.find(tier) != std::string::npos) {
+      return t;
+    }
+  }
+  size_t best = 0;
+  for (size_t t = 1; t < config_.tiers_.size(); ++t) {
+    if (std::fabs(config_.tiers_[t].score_ - target_score) <
+        std::fabs(config_.tiers_[best].score_ - target_score)) {
+      best = t;
+    }
+  }
+  return best;
+}
+
+void Runtime::LogTierRemaining(const std::vector<uint64_t> &free_bytes) {
+  /**
+   * Log this node's free bytes per tier the first time and whenever a tier
+   * moved by more than 1 GiB since the last log line.
+   *
+   * @param free_bytes Free bytes per tier, in config_.tiers_ order
+   */
+  constexpr uint64_t kStep = 1ull << 30;
+  std::lock_guard<std::mutex> lock(tier_cap_lock_);
+  bool changed = logged_tier_free_.size() != free_bytes.size();
+  for (size_t i = 0; !changed && i < free_bytes.size(); ++i) {
+    const uint64_t a = free_bytes[i], b = logged_tier_free_[i];
+    changed = (a > b ? a - b : b - a) > kStep;
+  }
+  if (!changed) {
+    return;
+  }
+  logged_tier_free_ = free_bytes;
+  std::string msg;
+  for (size_t i = 0; i < free_bytes.size(); ++i) {
+    msg += " " + config_.tiers_[i].name_ + "=" +
+           std::to_string(free_bytes[i] >> 20) + "MiB";
+  }
+  HLOG(kInfo, "dtschedule: node {} tier free:{}", CLIO_IPC->GetNodeId(), msg);
+}
+
 clio::run::TaskResume Runtime::CollectTierRemaining(
     std::vector<uint64_t> *out) {
   CLIO_TASK_BODY_BEGIN
@@ -1808,17 +1863,11 @@ clio::run::TaskResume Runtime::CollectTierRemaining(
       if (info->GetReturnCode() != 0) {
         continue;
       }
-      // The configured tier whose score is closest to the target's.
-      size_t best = 0;
-      for (size_t t = 1; t < config_.tiers_.size(); ++t) {
-        if (std::fabs(config_.tiers_[t].score_ - info->target_score_) <
-            std::fabs(config_.tiers_[best].score_ - info->target_score_)) {
-          best = t;
-        }
-      }
-      (*out)[best] += info->remaining_space_;
+      (*out)[TierIndexForTarget(names[i], info->target_score_)] +=
+          info->remaining_space_;
     }
   }
+  LogTierRemaining(*out);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
