@@ -371,6 +371,25 @@ class SystemInfo {
    *  re-launch itself to run a phase in a fresh process. */
   CTP_DLL static std::string GetExecutablePath();
 
+  /** Which file a path names: device + file number (POSIX st_dev/st_ino,
+   *  Windows volume serial + file index). Equal identities mean the same
+   *  file even across renames; a deleted-and-recreated file differs. */
+  struct FileIdentity {
+    uint64_t device = 0;  ///< filesystem / volume
+    uint64_t file = 0;    ///< inode / file index on it
+    bool operator==(const FileIdentity &o) const {
+      return device == o.device && file == o.file;
+    }
+    bool operator!=(const FileIdentity &o) const { return !(*this == o); }
+  };
+
+  /** Identity of the file `path` names now.
+   *  @param path the file
+   *  @param id out: its identity
+   *  @return false when the path does not exist or cannot be queried */
+  CTP_DLL static bool GetFileIdentity(const std::string &path,
+                                      FileIdentity *id);
+
   /** Ignore the file-size-limit signal (POSIX SIGXFSZ), so a write past the
    *  limit fails with EFBIG instead of killing the process. The disposition
    *  is inherited by children spawned afterwards. No-op on Windows. */

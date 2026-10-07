@@ -1278,6 +1278,36 @@ bool SystemInfo::SetProcessFileSizeLimit(int pid, uint64_t soft_bytes,
 #endif
 }
 
+bool SystemInfo::GetFileIdentity(const std::string &path, FileIdentity *id) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) return false;
+  id->device = static_cast<uint64_t>(st.st_dev);
+  id->file = static_cast<uint64_t>(st.st_ino);
+  return true;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // Open for attributes only, sharing everything, so the check never
+  // conflicts with the handles the caller holds on the same file.
+  HANDLE h = CreateFileA(path.c_str(), FILE_READ_ATTRIBUTES,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                         nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  BY_HANDLE_FILE_INFORMATION info;
+  const BOOL ok = GetFileInformationByHandle(h, &info);
+  CloseHandle(h);
+  if (!ok) return false;
+  id->device = static_cast<uint64_t>(info.dwVolumeSerialNumber);
+  id->file = (static_cast<uint64_t>(info.nFileIndexHigh) << 32) |
+             static_cast<uint64_t>(info.nFileIndexLow);
+  return true;
+#else
+  (void)path;
+  (void)id;
+  return false;
+#endif
+}
+
 std::string SystemInfo::GetExecutablePath() {
 #if CTP_ENABLE_PROCFS_SYSINFO && defined(__APPLE__)
   uint32_t size = PATH_MAX;

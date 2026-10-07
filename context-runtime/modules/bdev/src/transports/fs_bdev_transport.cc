@@ -38,16 +38,22 @@ namespace {
 // works in restricted environments (containers/CI). Returns an opened AsyncIO,
 // or nullptr only if even POSIX AIO cannot open the file (a genuine error).
 std::unique_ptr<ctp::AsyncIO> OpenBackingFile(clio::run::u32 io_depth,
-                                              const std::string &file_path) {
+                                              const std::string &file_path,
+                                              bool create = false) {
+  // Only the bdev's Init may create the file. Every later open (worker
+  // contexts, growth) reopens the SAME file; with O_CREAT a deleted backing
+  // file was silently recreated empty and later writes and reads went to it
+  // (#1210).
+  const int flags = O_RDWR | (create ? O_CREAT : 0);
   auto io = ctp::AsyncIoFactory::Get(io_depth);
-  if (io && io->Open(file_path, O_RDWR | O_CREAT, 0644)) {
+  if (io && io->Open(file_path, flags, 0644)) {
     return io;
   }
   // Preferred backend is unusable in this environment. IoUringAsyncIO::Open()
   // closes any fds it opened before returning false, so it is safe to discard
   // it and retry with POSIX AIO.
   io = ctp::AsyncIoFactory::Get(io_depth, ctp::AsyncIoBackend::kPosixAio);
-  if (io && io->Open(file_path, O_RDWR | O_CREAT, 0644)) {
+  if (io && io->Open(file_path, flags, 0644)) {
     return io;
   }
   return nullptr;
@@ -167,7 +173,7 @@ bool FsBdevTransport::Init(const CreateParams& params,
   fail_marker_checked_ns_.store(0, std::memory_order_relaxed);
   fail_marker_present_.store(false, std::memory_order_relaxed);
 
-  auto setup_io = OpenBackingFile(io_depth_, file_path_);
+  auto setup_io = OpenBackingFile(io_depth_, file_path_, /*create=*/true);
   if (!setup_io) {
     // errno from the last open attempt. Without it this message says only
     // "it did not work", and a permission problem on a leftover file is
@@ -178,6 +184,8 @@ bool FsBdevTransport::Init(const CreateParams& params,
          strerror(errno));
     return false;
   }
+  // #1210: remember which file this is; later by-path opens check it.
+  file_id_valid_ = ctp::SystemInfo::GetFileIdentity(file_path_, &file_id_);
 
   // int64_t, not off_t: MSVC off_t is a 32-bit long, which wraps any
   // backing file of 2 GiB or more (#1059).
@@ -337,6 +345,7 @@ bool FsBdevTransport::Sync() {
   // Data first, then the allocator state that references it: a crash in
   // between leaves synced bytes in blocks the log may not show yet (the
   // CTE's own WAL still does), never a logged block whose bytes are lost.
+  if (!BackingFileIntact("sync")) return false;
   const int err = SyncFileData(file_path_);
   if (err != 0) {
     HLOG(kError, "bdev Sync: flushing {} failed ({})", file_path_,
@@ -431,6 +440,7 @@ bool FsBdevTransport::AllocateBlocks(size_t size, int worker_id, std::vector<Blo
 
 bool FsBdevTransport::GrowBackingFile(clio::run::u64 backed,
                                       clio::run::u64 target) {
+  if (!BackingFileIntact("grow")) return false;
   auto io = OpenBackingFile(io_depth_, file_path_);
   if (!io) {
     HLOG(kError, "EnsureFileBacked: failed to open {} to grow it", file_path_);
@@ -548,6 +558,18 @@ void FsBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& blocks
   allocator_.FreeBlocks(worker_id, blocks);
 }
 
+bool FsBdevTransport::BackingFileIntact(const char *what) const {
+  if (!file_id_valid_) return true;  // nothing recorded to compare with
+  ctp::SystemInfo::FileIdentity now;
+  if (ctp::SystemInfo::GetFileIdentity(file_path_, &now) && now == file_id_) {
+    return true;
+  }
+  HLOG(kError, "bdev {}: cannot {}: the backing file was deleted or "
+       "replaced while the device was in use; refusing rather than using a "
+       "different file", file_path_, what);
+  return false;
+}
+
 bool FsBdevTransport::InitializeWorkerIOContexts() {
   clio::run::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
   size_t num_workers = work_orchestrator ? work_orchestrator->GetWorkerCount() : 16;
@@ -570,6 +592,7 @@ bool FsBdevTransport::InitializeWorkerIOContexts() {
       num_workers + clio::run::WorkOrchestrator::ElasticHeadroom();
   io_contexts_.resize(reserved);
   bool success = true;
+  if (!BackingFileIntact("open worker I/O contexts")) return false;
   for (size_t i = 0; i < num_workers; ++i) {
     if (!io_contexts_[i].Init(file_path_, io_depth_, static_cast<clio::run::u32>(i))) {
       success = false;
@@ -590,7 +613,8 @@ WorkerIOContext *FsBdevTransport::GetWorkerIOContext(size_t worker_id) {
   }
   WorkerIOContext *ctx = &io_contexts_[worker_id];
   if (!ctx->is_initialized_) {
-    if (!ctx->Init(file_path_, io_depth_, static_cast<clio::run::u32>(worker_id))) {
+    if (!BackingFileIntact("open a worker I/O context") ||
+        !ctx->Init(file_path_, io_depth_, static_cast<clio::run::u32>(worker_id))) {
       return nullptr;
     }
   }

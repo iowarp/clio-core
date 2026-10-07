@@ -514,6 +514,66 @@ TEST_CASE("bdev_lazy_file_growth", "[bdev][file][growth]") {
 }
 
 /**
+ * The backing file is deleted while the device is in use (#1210). The bdev
+ * reopens it by path to sync and to grow; with O_CREAT those reopens made a
+ * NEW empty file, so the durability sync flushed the wrong file and later
+ * writes and reads went to the new one (reads came back as zeros). Now both
+ * refuse loudly and the path is not recreated. POSIX-only: deleting a file
+ * other handles hold open is the POSIX behaviour being exercised.
+ */
+#ifndef _WIN32
+TEST_CASE("bdev_backing_file_deleted_in_use", "[bdev][file][1210]") {
+  BdevChimodFixture fixture;
+  if (fixture.getNumContainers() != 1) {
+    HLOG(kInfo, "bdev_backing_file_deleted_in_use: skipping "
+                "(num_containers != 1)");
+    return;
+  }
+  REQUIRE(g_initialized);
+  constexpr clio::run::u64 kCapacity = 64 * 1024 * 1024;
+  constexpr clio::run::u64 kGrowthUnit = 8 * 1024 * 1024;
+  clio::run::PoolId pool_id(143, 0);
+  clio::run::bdev::Client client(pool_id);
+  auto create_task = client.AsyncCreate(
+      clio::run::PoolQuery::Dynamic(), fixture.getTestFile(), pool_id,
+      clio::run::bdev::BdevType::kFile, kCapacity, 32, 4096,
+      /*perf_metrics=*/nullptr, /*alloc_log_path=*/"", kGrowthUnit);
+  create_task.Wait();
+  REQUIRE(create_task->GetReturnCode() == 0);
+  client.pool_id_ = create_task->new_pool_id_;
+  auto q = clio::run::PoolQuery::DirectHash(0);
+
+  auto sync_ok = client.AsyncSync(q);
+  sync_ok.Wait();
+  REQUIRE(sync_ok->GetReturnCode() == 0);
+
+  std::filesystem::remove(fixture.getTestFile());
+  REQUIRE_FALSE(std::filesystem::exists(fixture.getTestFile()));
+
+  // Syncing would flush a different (or no) file: it must fail.
+  auto sync_gone = client.AsyncSync(q);
+  sync_gone.Wait();
+  REQUIRE(sync_gone->GetReturnCode() != 0);
+
+  // Growing past the backed prefix reopens the file: it must fail, and must
+  // not have recreated the path.
+  auto grow = client.AsyncAllocateBlocks(q, 2 * kGrowthUnit);
+  grow.Wait();
+  REQUIRE(grow->return_code_ != 0);
+  REQUIRE_FALSE(std::filesystem::exists(fixture.getTestFile()));
+
+  // A DIFFERENT file now sits at the path (an operator restored a copy, a
+  // tool rewrote it). Syncing by path used to flush that file and report
+  // success while the device's data stayed unsynced.
+  { std::ofstream(fixture.getTestFile()) << "not the device"; }
+  auto sync_other = client.AsyncSync(q);
+  sync_other.Wait();
+  REQUIRE(sync_other->GetReturnCode() != 0);
+  std::filesystem::remove(fixture.getTestFile());
+}
+#endif
+
+/**
  * A disk with less room than one growth unit: the backing file grows by just
  * what an allocation needs, so the space that exists is used, and once the
  * disk is full allocations fail at once. RLIMIT_FSIZE stands in for a full

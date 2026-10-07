@@ -10,6 +10,7 @@
 #include <clio_runtime/bdev/transports/block_allocator.h>
 #include <clio_runtime/bdev/bdev_alloc_log.h>
 #include <clio_ctp/io/async_io_factory.h>
+#include <clio_ctp/introspect/system_info.h>
 
 #include <atomic>
 #include <condition_variable>
@@ -86,6 +87,20 @@ class FsBdevTransport : public BdevTransport {
   std::vector<WorkerIOContext> io_contexts_;
   std::string file_path_;
   clio::run::u32 io_depth_;
+
+  // #1210: the identity of the file Init opened. Later code opens the file
+  // again BY PATH (worker contexts, growth, sync); if the path no longer
+  // names this file (deleted, replaced), those opens must fail loudly rather
+  // than create a new empty file or sync the wrong one.
+  ctp::SystemInfo::FileIdentity file_id_;
+  bool file_id_valid_ = false;
+
+  /**
+   * Whether file_path_ still names the file Init opened.
+   * @param what the operation about to reopen it (for the error message)
+   * @return true when it does (or when no identity could be recorded)
+   */
+  bool BackingFileIntact(const char *what) const;
 
   // #858: lazy backing-file growth. The file is truncated to at most one
   // growth unit at Init and extended in growth-unit steps as allocations
