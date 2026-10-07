@@ -1451,6 +1451,13 @@ class IpcManager {
   size_t WreapDeadIpcs();
 
   /**
+   * Seconds a dead client's segment stays mapped before WreapDeadIpcs
+   * reclaims it (#1192). Default 30; env CLIO_DEAD_IPC_GRACE_S overrides
+   * (tests use a short grace).
+   */
+  static int DeadIpcGraceSec();
+
+  /**
    * Reap all shared memory segments
    *
    * Destroys all shared memory backends (except main allocator) and clears
@@ -2080,6 +2087,13 @@ class IpcManager {
 
   /** Mutex for thread-safe access to shared memory structures */
   mutable std::mutex shm_mutex_;
+  // #1192: client allocators whose owning process was first seen dead, by
+  // allocator key, with the time of that first sighting. WreapDeadIpcs only
+  // unmaps a segment after it has been dead for DeadIpcGraceSec(), so tasks
+  // the dead client left in flight (dropped by the runtime within seconds)
+  // can never be torn out from under a worker. Guarded by shm_mutex_.
+  std::unordered_map<u64, std::chrono::steady_clock::time_point>
+      dead_alloc_since_;
 #endif
 
   /** Metadata overhead to add to each shared memory segment: 32MB */

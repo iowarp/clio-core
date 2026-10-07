@@ -3174,6 +3174,18 @@ ClientShmInfo IpcManager::GetClientShmInfo(u32 index) const {
   return ClientShmInfo(shm_name, pid, index, size, alloc_id);
 }
 
+int IpcManager::DeadIpcGraceSec() {
+  static const int grace = [] {
+    const char *e = std::getenv("CLIO_DEAD_IPC_GRACE_S");
+    if (e != nullptr && *e != '\0') {
+      int v = std::atoi(e);
+      if (v >= 0) return v;
+    }
+    return 30;
+  }();
+  return grace;
+}
+
 size_t IpcManager::WreapDeadIpcs() {
   HLOG(kDebug, "WreapDeadIpcs CALLED");
   std::lock_guard<std::mutex> lock(shm_mutex_);
@@ -3182,6 +3194,7 @@ size_t IpcManager::WreapDeadIpcs() {
 
   int current_pid = ctp::SystemInfo::GetPid();
   size_t reaped_count = 0;
+  const auto now = std::chrono::steady_clock::now();
 
   // Build list of allocator keys to remove (can't modify map while iterating)
   std::vector<u64> keys_to_remove;
@@ -3205,8 +3218,32 @@ size_t IpcManager::WreapDeadIpcs() {
     }
 
     // Check if the owning process is still alive.
-    if (!ctp::SystemInfo::IsProcessAlive(owner_pid)) {
-      // Process is dead - mark for removal
+    if (ctp::SystemInfo::IsProcessAlive(owner_pid)) {
+      if (dead_alloc_since_.erase(alloc_key) > 0) {
+        // A pid we saw dead answers kill(0) again: a zombie, a reused pid,
+        // or EPERM from another user's process. Say so, or a segment that
+        // never gets reclaimed has no trace of why.
+        HLOG(kInfo,
+             "WreapDeadIpcs: client pid {} answers again (zombie or reused "
+             "pid?); segment ({}.{}) kept",
+             owner_pid, major, minor);
+      }
+      continue;
+    }
+    // #1192: dead. Remember when we first saw it so, and reclaim only after
+    // the grace period: the tasks it left in flight are dropped by the
+    // runtime within seconds, and a segment unmapped under one of them would
+    // take a worker down with it.
+    auto since = dead_alloc_since_.find(alloc_key);
+    if (since == dead_alloc_since_.end()) {
+      dead_alloc_since_.emplace(alloc_key, now);
+      HLOG(kInfo,
+           "WreapDeadIpcs: client pid {} is gone; its segment ({}.{}) is "
+           "reclaimed in {} s unless it comes back",
+           owner_pid, major, minor, DeadIpcGraceSec());
+      continue;
+    }
+    if (now - since->second >= std::chrono::seconds(DeadIpcGraceSec())) {
       HLOG(kInfo,
            "WreapDeadIpcs: Process {} is dead, marking allocator ({}.{}) for "
            "removal",
@@ -3260,6 +3297,7 @@ size_t IpcManager::WreapDeadIpcs() {
 
     // Remove from alloc_map_
     alloc_map_.erase(map_it);
+    dead_alloc_since_.erase(key);
     reaped_count++;
   }
 

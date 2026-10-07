@@ -43,6 +43,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <clio_ctp/introspect/system_info.h>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -314,6 +315,70 @@ TEST_CASE("ClientCrash - PutBlob then terminate drops task with no leak [leak]",
   REQUIRE(requeues < 5000);
 
   clio::run::test::UnsetEnvVar("CLIO_TEST_SERVER_LOG");
+  fs::remove_all(work);
+}
+
+TEST_CASE("ClientCrash - a dead client's SHM segments are reclaimed (#1192)",
+          "[cli][cte][crash][reap]") {
+  // The admin WreapDeadIpcs periodic reclaims the segments of a client that
+  // died, after the grace period. A short grace keeps the test quick.
+  clio::run::test::SetEnvVar("CTP_LOG_LEVEL", "info");
+  clio::run::test::SetEnvVar("CLIO_PORT", std::to_string(kPort));
+  clio::run::test::SetEnvVar("CLIO_DEAD_IPC_GRACE_S", "2");
+  const fs::path work = fs::temp_directory_path() / "clio_client_reap_test";
+  fs::remove_all(work);
+  fs::create_directories(work);
+  const fs::path compose_yaml = work / "compose.yaml";
+  {
+    std::ofstream f(compose_yaml);
+    f << "compose:\n"
+         "  - mod_name: clio_cte_core\n"
+         "    pool_name: cte_client_reap\n"
+         "    pool_query: local\n"
+         "    pool_id: \"512.0\"\n"
+         "    storage:\n"
+         "      - path: " << (work / "ram_dev").string() << "\n"
+         "        bdev_type: ram\n"
+         "        capacity_limit: 256mb\n"
+         "    dpe:\n"
+         "      dpe_type: random\n";
+  }
+  clio::run::test::RuntimeServer server;
+  REQUIRE(server.Start(kPort, "127.0.0.1", /*ephemeral=*/true));
+  REQUIRE(server.WaitForReady());
+  REQUIRE(RunCliTimed({"compose", "start", compose_yaml.string()}, 60) == 0);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (child == 0) {
+    CrashClientMain(/*quiet=*/true);  // allocates SHM, PutBlobs, dies
+  }
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child);
+  // The client's segments are memfds with a symlink clio_<pid>_<idx> in the
+  // per-user memfd dir; reaping unmaps them and removes the symlinks.
+  const std::string dir = ctp::SystemInfo::GetMemfdDir();
+  const std::string prefix = "clio_" + std::to_string(child) + "_";
+  auto segments_left = [&]() {
+    size_t n = 0;
+    std::error_code ec;
+    for (const auto &e : fs::directory_iterator(dir, ec)) {
+      if (e.path().filename().string().rfind(prefix, 0) == 0) ++n;
+    }
+    return n;
+  };
+  size_t left = segments_left();
+  INFO("segments of the dead client right after its death: " << left);
+  for (int i = 0; i < 400 && left > 0; ++i) {  // grace 2 s + reaper 1 s period
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    left = segments_left();
+  }
+  REQUIRE(left == 0);
+  REQUIRE(server.IsRunning());  // and the daemon survived the reap
+  server.Stop();
+  for (int i = 0; i < 50 && server.IsRunning(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  clio::run::test::UnsetEnvVar("CLIO_DEAD_IPC_GRACE_S");
   fs::remove_all(work);
 }
 
