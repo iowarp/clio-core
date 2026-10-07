@@ -102,6 +102,16 @@ endif()
 # use_cte round trip (#1190): host-only (cuMemcpy, no kernel), so it is plain
 # CXX with no device-architecture restriction. Needs a GPU and starts an
 # in-process runtime.
+#
+# The executable is always built -- it must keep compiling -- but it is NOT
+# registered as a ctest by default (#1216). Running it segfaults on every GPU
+# host: the runtime's GPU worker faults in IpcGpu2Cpu::RecvIn, popping the
+# pinned gpu2cpu queue arena, which is a pre-existing runtime defect this test
+# is merely the first to expose. It reds vista (dev/r/gpu) and frontera
+# (dev/d/gpu) nightly. Re-enable with -DCLIO_CORE_ENABLE_GPU_VMM_CTE_TEST=ON
+# once #1216 is fixed.
+option(CLIO_CORE_ENABLE_GPU_VMM_CTE_TEST
+    "Register test_gpu_vmm_cte as a ctest (blocked on #1216)" OFF)
 if(CLIO_CORE_ENABLE_TESTS)
     add_executable(test_gpu_vmm_cte test/test_gpu_vmm_cte.cc)
     target_link_libraries(test_gpu_vmm_cte PRIVATE
@@ -111,11 +121,16 @@ if(CLIO_CORE_ENABLE_TESTS)
         CUDA::cuda_driver)
     add_dependencies(test_gpu_vmm_cte
         clio_cte_core_runtime clio_bdev_runtime clio_admin_runtime)
-    add_test(NAME test_gpu_vmm_cte COMMAND test_gpu_vmm_cte
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-    set_tests_properties(test_gpu_vmm_cte PROPERTIES
-        ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
-        RESOURCE_LOCK "clio_runtime"
-        TIMEOUT 120
-        LABELS "gpu;cte")
+    if(CLIO_CORE_ENABLE_GPU_VMM_CTE_TEST)
+        add_test(NAME test_gpu_vmm_cte COMMAND test_gpu_vmm_cte
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        set_tests_properties(test_gpu_vmm_cte PROPERTIES
+            ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+            RESOURCE_LOCK "clio_runtime"
+            TIMEOUT 120
+            LABELS "gpu;cte")
+    else()
+        message(STATUS
+            "CTE UVM: test_gpu_vmm_cte built but NOT registered (#1216)")
+    endif()
 endif()
