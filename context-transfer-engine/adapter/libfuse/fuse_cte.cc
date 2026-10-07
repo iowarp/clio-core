@@ -547,54 +547,26 @@ static bool UnsyncedTake(const clio::cte::core::TagId &tag,
 }
 
 /**
- * CTE performance.fsync_mode as learned from the first SyncTag reply:
- * -1 not yet known, 0 "durable", 1 "deferred" (fsync skips the device sync).
- */
-static std::atomic<int> g_fsync_deferred{-1};
-
-/**
- * Make one CTE tag durable (SyncTag, broadcast to every core container).
- * With fsync_mode "deferred" the first reply says so and later calls return
- * at once, leaving durability to the periodic flushes.
+ * Make one CTE tag durable (the filesystem client's SyncTagDurable), and
+ * apply this mount's unsynced-write window (#1133) on top.
  * @param tag the tag (null is a no-op)
  * @return 0, -ENOSPC when no persistent tier had room, or -EIO
  */
 static int SyncOneTag(const clio::cte::core::TagId &tag) {
-  if (g_fsync_deferred.load(std::memory_order_relaxed) == 1) return 0;
-  auto *cte_c = CLIO_CTE_CLIENT;
-  if (cte_c == nullptr || tag.IsNull()) return 0;
+  using clio::cte::filesystem::Client;
+  if (Client::FsyncDeferred()) return 0;
+  if (CLIO_CTE_CLIENT == nullptr || tag.IsNull()) return 0;
   clio::run::u64 opened_ns = 0;
   const bool unsynced = UnsyncedTake(tag, &opened_ns);
-  auto fut = cte_c->AsyncSyncTag(tag);
-  fut.Wait();
-  const bool deferred = fut->deferred_ != 0;
-  g_fsync_deferred.store(deferred ? 1 : 0, std::memory_order_relaxed);
-  if (deferred) return 0;
-  if (fut->containers_ == 0) {
-    // A module in front of the core dropped the sync: nothing was made
-    // durable, so fsync must not claim it was.
-    static std::once_flag warned;
-    std::call_once(warned, [&] {
-      HLOG(kError, "clio_cte_fuse: fsync reached no CTE core container "
-           "through pool {}.{}; fsync fails with EIO", cte_c->pool_id_.major_,
-           cte_c->pool_id_.minor_);
-    });
-    return -EIO;
-  }
-  const clio::run::u32 rc = fut->GetReturnCode();
-  if (rc == clio::cte::core::kSyncNoSpaceRc) return -ENOSPC;
-  if (rc != 0 && !clio::cte::core::IsNodeLostRc(rc)) {
-    HLOG(kError, "clio_cte_fuse: fsync of tag {}.{} failed (rc {}); "
-         "reporting EIO", tag.major_, tag.minor_,
-         static_cast<long long>(static_cast<clio::run::i32>(rc)));
-    return -EIO;
-  }
+  bool lost_node = false;
+  clio::run::u64 liveness_ns = 0;
+  int rc = Client::SyncTagDurable(tag, &lost_node, &liveness_ns);
+  if (rc != 0 || Client::FsyncDeferred()) return rc;
   // The live containers synced. A container whose node is down answers with
   // the lost-node code; once the cluster declares the node dead the sync
   // routes around it and succeeds. Either way, bytes written since the last
   // fsync that the node held are gone (#1133): fail if the window saw one.
-  const bool lost_node = rc != 0;
-  const bool moved = fut->liveness_change_ns_ >= opened_ns;
+  const bool moved = liveness_ns >= opened_ns;
   if (unsynced && (lost_node || moved)) {
     HLOG(kError, "clio_cte_fuse: fsync of tag {}.{}: a node {} while the "
          "file had unsynced writes; they may be lost, reporting EIO",
@@ -610,66 +582,24 @@ static int SyncOneTag(const clio::cte::core::TagId &tag) {
 }
 
 /**
- * The CTE tag of directory `dir` (its id is its inode number).
- * @param dir directory path
- * @return the tag, or null if the directory does not resolve
- */
-static clio::cte::core::TagId DirTagOf(const std::string &dir) {
-  auto *cfs = CLIO_CFS_CLIENT;
-  if (cfs == nullptr) return clio::cte::core::TagId::GetNull();
-  auto t = cfs->AsyncGetattr(dir);
-  t.Wait();
-  if (t->GetReturnCode() != 0 || t->exists_ == 0 || t->is_dir_ == 0) {
-    return clio::cte::core::TagId::GetNull();
-  }
-  return clio::cte::filesystem::FsUnpack(t->ino_);
-}
-
-/**
- * fsync(2)'s size step: the file's logical size lives in its stream home's
- * size log, which records with write(2) only; fsync that log.
- * @param tag the file's tag (null, or an id without a home: nothing to do)
- * @return 0 or -EIO
- */
-static int SyncFileSize(const clio::cte::core::TagId &tag) {
-  if (tag.IsNull()) return 0;
-  const clio::run::u64 packed = PackTag(tag);
-  if (!clio::cte::filesystem::FsIdHasHome(packed)) return 0;
-  auto f = StreamClient().AsyncSizeOp(
-      tag, clio::cte::filesystem::FsIdHome(packed),
-      clio::cte::stream::StreamSizeOp::kSync);
-  f.Wait();
-  const clio::run::u32 rc = f->GetReturnCode();
-  if (rc == 0) return 0;
-  if (clio::cte::core::IsNodeLostRc(rc)) {
-    // The home died: a size it logged is in its log (replayed when it
-    // restarts); sizes set since then are logged by its successor.
-    HLOG(kWarning, "clio_cte_fuse: fsync of the size of {}.{}: its home is "
-         "down", tag.major_, tag.minor_);
-    return 0;
-  }
-  HLOG(kError, "clio_cte_fuse: fsync of the size of {}.{} failed (rc {})",
-       tag.major_, tag.minor_, rc);
-  return -EIO;
-}
-
-/**
- * fsync(2)'s durability step: make the file's blobs (pages and its inode
- * record) durable on a persistent tier, then the directory blocks naming it
- * (in its parent directory's tag), so the bytes, the size and the name all
- * survive power loss.
+ * fsync(2)'s durability step, as the filesystem client's SyncDurable but
+ * through this mount's SyncOneTag: the file's blobs, its size, then the
+ * directory blocks naming it.
  * @param tag the file's tag (null: only the directory)
  * @param dir the directory whose entries must be durable
  * @return 0, -ENOSPC when no persistent tier had room, or -EIO
  */
 static int SyncDurable(const clio::cte::core::TagId &tag,
                        const std::string &dir) {
+  using clio::cte::filesystem::Client;
   int rc = SyncOneTag(tag);
   if (rc != 0) return rc;
-  if (g_fsync_deferred.load(std::memory_order_relaxed) == 1) return 0;
-  rc = SyncFileSize(tag);
+  if (Client::FsyncDeferred()) return 0;
+  rc = Client::SyncFileSize(tag);
   if (rc != 0) return rc;
-  return SyncOneTag(DirTagOf(dir));
+  auto *cfs = CLIO_CFS_CLIENT;
+  if (cfs == nullptr) return 0;
+  return SyncOneTag(cfs->TagOfPath(dir, /*want_dir=*/true));
 }
 
 /**
@@ -1247,6 +1177,7 @@ std::thread g_closer;
 bool g_closer_started = false;
 bool g_closer_stop = false;
 bool g_closer_busy = false;  // CloserMain is executing a popped entry
+std::string g_closer_busy_path;  // the path of that entry (g_closer_busy)
 
 bool CreateQueueNonEmpty() {
   std::lock_guard<std::mutex> lk(g_pc_mtx);
@@ -1279,6 +1210,7 @@ void CloserMain() {
     PendingClose pc = std::move(g_closer_q.front());
     g_closer_q.pop_front();
     g_closer_busy = true;
+    g_closer_busy_path = pc.path;
     lk.unlock();
 
     // Order the metadata op AFTER the file's in-flight writes land. A
@@ -1327,6 +1259,7 @@ void CloserMain() {
     }
     lk.lock();
     g_closer_busy = false;
+    g_closer_busy_path.clear();
     g_closer_cv.notify_all();
   }
 }
@@ -1396,6 +1329,21 @@ void CloserBarrier() {
                                             pc.flags);
     }
   }
+}
+
+/**
+ * Whether the asynchronous closer still holds an entry for `path` (queued,
+ * or being executed). Local only: no task is sent.
+ * @param path the path to look for
+ * @return true if a close or utimens for `path` has not finished yet
+ */
+bool CloserPendingFor(const std::string &path) {
+  std::lock_guard<std::mutex> lk(g_closer_mtx);
+  if (g_closer_busy && g_closer_busy_path == path) return true;
+  for (const auto &pc : g_closer_q) {
+    if (pc.path == path) return true;
+  }
+  return false;
 }
 
 void EnqueueDrainOrdered(PendingClose pc) {
@@ -2338,7 +2286,11 @@ int cte_fuse_readdir(const char *path, void *buf,
   auto t = cfs->AsyncReaddir(p);
   t.Wait();
   if (t->GetReturnCode() != 0) {
-    return 0;
+    // Never report a listing that failed as an empty directory: rm -r
+    // would unlink nothing and its rmdir would then fail ENOTEMPTY (#1029).
+    HLOG(kError, "clio_cte_fuse: readdir of {} failed (rc {})", p,
+         t->GetReturnCode());
+    return FsErrno(t->GetReturnCode());
   }
   size_t prefix_len = p.size();
   if (!p.empty() && p.back() != '/') prefix_len++;
@@ -2423,6 +2375,25 @@ int cte_fuse_rmdir(const char *path) {
   auto t = cfs->AsyncRmdir(std::string(path));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());  // 0/ENOTEMPTY/ENOENT/EIO
+  if (rc == ENOTEMPTY) {
+    // #1029: say what the directory still holds that a listing hides
+    // (.fuse_hidden names, pending/leaving entries) -- the server logs the
+    // block contents for the same rmdir.
+    auto l = cfs->AsyncReaddir(std::string(path));
+    l.Wait();
+    size_t shown = 0;
+    if (l->GetReturnCode() == 0) {
+      for (size_t i = 0; i < l->entries_.size(); ++i) {
+        const std::string e = l->entries_[i].str();
+        if (e.find("/.fuse_hidden") == std::string::npos) ++shown;
+      }
+    }
+    if (shown == 0) {
+      HLOG(kError, "clio_cte_fuse: rmdir {}: ENOTEMPTY but its listing "
+           "(rc {}, {} raw entries) shows no child", path,
+           l->GetReturnCode(), l->entries_.size());
+    }
+  }
   return FsErrno(rc);
 }
 
@@ -2461,8 +2432,29 @@ static void ShrinkAfterNoSpace(const std::string &hp,
   cte_fuse_truncate(hp.c_str(), static_cast<cte_off_t>(first_bad), nullptr);
 }
 
+/**
+ * Apply an open's O_TRUNC to a file that already existed.
+ *
+ * A file the Open just created (`created`) is empty by construction, so its
+ * O_TRUNC is skipped: the truncate is not free on a cluster -- it drains the
+ * asynchronous closer (putting the PREVIOUS file's close on this open's
+ * path) and sends a truncate to the inode's home, two dependent round trips
+ * on every `open(O_CREAT|O_TRUNC)` of a new file (#1159).
+ * @param cfs filesystem client (unused; the full truncate hook is used)
+ * @param p the opened path
+ * @param flags the open(2) flags
+ * @param created nonzero when this Open created the file
+ */
 static inline void MaybeTruncateOnOpen(clio::cte::filesystem::Client *cfs,
-                                       const std::string &p, int flags) {
+                                       const std::string &p, int flags,
+                                       clio::run::u32 created) {
+  if (created != 0) {
+    // A close of an earlier file by this name (removed on another node)
+    // must still land before this file is used, as the truncate's closer
+    // drain guaranteed. Rare, and checked locally.
+    if ((flags & O_TRUNC) && CloserPendingFor(p)) CloserBarrier();
+    return;
+  }
   if (flags & O_TRUNC) {
     // The FULL truncate hook, not a raw AsyncTruncate: O_TRUNC on reopen
     // must drain the file's deferred pipelines (closer AND sieve pages)
@@ -2547,7 +2539,7 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
   fi->fh = reinterpret_cast<uint64_t>(handle);
   RegisterOpenFile(handle, fi);
   MaybeDirectIo(fi);
-  MaybeTruncateOnOpen(cfs, p, fi->flags);
+  MaybeTruncateOnOpen(cfs, p, fi->flags, t->created_);
   if (fi->flags & O_TRUNC) HiwaterClamp(p, 0);
   return 0;
 }
@@ -2605,7 +2597,7 @@ int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   fi->fh = reinterpret_cast<uint64_t>(handle);
   RegisterOpenFile(handle, fi);
   MaybeDirectIo(fi);
-  MaybeTruncateOnOpen(cfs, p, fi->flags);
+  MaybeTruncateOnOpen(cfs, p, fi->flags, t->created_);
   if (fi->flags & O_TRUNC) HiwaterClamp(p, 0);
   return 0;
 }

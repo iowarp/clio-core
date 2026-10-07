@@ -240,6 +240,34 @@ class IpcManagerRun2Run {
   void ReplayDeferredRecv();
 
   /**
+   * Hold a CLIENT request whose pool this node has not finished creating (issue
+   * #1039). A client may connect while the runtime is still composing its
+   * pools; its request used to be consumed off the transport and dropped, so
+   * the client waited forever. The archive is kept whole (no task consumed,
+   * any transport-owned bulk frames still attached) and admitted by
+   * ReplayDeferredClientRecv once PoolManager::IsClientAdmissible holds.
+   * @param archive The received request, moved into the deferral list.
+   * @param mode Client transport it arrived on (kShm, kTcp or kIpc).
+   * @param recv_info The transport's receive info (fd / identity) for TCP/IPC.
+   * @param transport The receiving transport (TCP/IPC); nullptr for SHM.
+   */
+  void DeferClientRecv(clio::run::LoadTaskArchive &&archive,
+                       clio::run::IpcMode mode,
+                       const ctp::lbm::ClientInfo &recv_info,
+                       ctp::lbm::Transport *transport);
+
+  /**
+   * Admit every deferred client request whose pool is now admissible (created
+   * and its Create finished), and drop (with
+   * an error log) the ones older than kDeferredRecvTimeoutSec. Runs on the
+   * client-recv thread, which ticks every few hundred microseconds, so a held
+   * request is admitted promptly after its pool is created. SHM requests are
+   * pushed onto the ingress lane; TCP/IPC ones go through the same admission
+   * as a freshly received request.
+   */
+  void ReplayDeferredClientRecv();
+
+  /**
    * Scan send_map_ for tasks waiting on nodes that have been marked dead and
    * have exceeded their timeout.  Completes those tasks with a network-timeout
    * return code.
@@ -618,6 +646,21 @@ class IpcManagerRun2Run {
                                    const clio::run::LoadTaskArchive &archive);
   std::mutex deferred_recv_mutex_;
   std::list<DeferredRecv> deferred_recv_;  // list: erase never moves an archive
+
+  /** A client request held until its pool exists (see DeferClientRecv). */
+  struct DeferredClientRecv {
+    clio::run::LoadTaskArchive archive;
+    clio::run::IpcMode mode;
+    ctp::lbm::ClientInfo recv_info;
+    ctp::lbm::Transport *transport;
+    std::chrono::steady_clock::time_point arrived;
+  };
+  /** Release a dropped deferred client request's transport-owned frames. */
+  static void ReleaseDeferredClientRecv(DeferredClientRecv &d);
+  std::mutex deferred_client_mutex_;
+  std::list<DeferredClientRecv> deferred_client_recv_;
+  /** Mirrors deferred_client_recv_.size() so the recv loop skips the lock. */
+  std::atomic<size_t> deferred_client_count_{0};
 };
 
 }  // namespace clio::run

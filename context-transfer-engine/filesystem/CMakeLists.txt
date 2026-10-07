@@ -27,7 +27,9 @@ target_link_libraries(clio_cte_filesystem_runtime PUBLIC clio_cte_core_client)
 # reads call into the co-located stream container).
 target_link_libraries(clio_cte_filesystem_runtime PUBLIC
     clio_cte_stream_runtime clio_cte_stream_client)
-target_link_libraries(clio_cte_filesystem_client PUBLIC clio_cte_core_client)
+# fsync syncs the size log at the file's stream home (SyncFileSize).
+target_link_libraries(clio_cte_filesystem_client PUBLIC clio_cte_core_client
+    clio_cte_stream_client)
 target_include_directories(clio_cte_filesystem_runtime PRIVATE
     ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include)
 target_include_directories(clio_cte_filesystem_client PRIVATE

@@ -2274,3 +2274,58 @@ set_tests_properties(cte_tag_name_rekey PROPERTIES
     TIMEOUT 120
     LABELS "unit;cte"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+
+# Well-known CTE ChiMod pool ids are distinct (issue #1186): a compile-time
+# check over whichever optional modules this build includes.
+add_executable(test_well_known_pool_ids test_well_known_pool_ids.cc)
+target_link_libraries(test_well_known_pool_ids clio_cte_core_client)
+foreach(_wk_mod filesystem replication cache indexer stream checkpoint)
+  if(TARGET clio_cte_${_wk_mod}_client)
+    target_link_libraries(test_well_known_pool_ids clio_cte_${_wk_mod}_client)
+    string(TOUPPER "${_wk_mod}" _wk_upper)
+    target_compile_definitions(test_well_known_pool_ids PRIVATE
+        CLIO_HAVE_${_wk_upper})
+  endif()
+endforeach()
+add_test(NAME cte_well_known_pool_ids COMMAND test_well_known_pool_ids)
+set_tests_properties(cte_well_known_pool_ids PROPERTIES
+    TIMEOUT 30 LABELS "unit;cte")
+
+# fsync through the descriptor layer must reach a persistent tier (#1188).
+# Spawns its own clio_run daemon, composed with a RAM tier over a file tier;
+# UNIX-only for the same reason as cfs_shm_read (RuntimeServer).
+if(UNIX)
+add_executable(test_cfs_fsync_durable
+    test_cfs_fsync_durable.cc
+)
+target_include_directories(test_cfs_fsync_durable PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+target_compile_definitions(test_cfs_fsync_durable PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+target_link_libraries(test_cfs_fsync_durable
+    clio_cte_filesystem_client
+    clio_cte_core_client
+    # Config helpers of the client live in the runtime library (see
+    # test_cfs_shm_read above).
+    clio_cte_core_runtime
+    clio::run::admin_client
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+add_dependencies(test_cfs_fsync_durable
+    clio_run
+    clio_cte_core_runtime
+    clio_cte_filesystem_runtime
+    clio_bdev_runtime
+    clio_admin_runtime)
+add_test(NAME cfs_fsync_durable
+    COMMAND test_cfs_fsync_durable
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_tests_properties(cfs_fsync_durable PROPERTIES
+    RESOURCE_LOCK "clio_runtime"
+    TIMEOUT 180
+    ENVIRONMENT "${_cfs_shm_read_env}"
+    LABELS "unit;cte;cfs;msan_skip")
+endif()  # UNIX

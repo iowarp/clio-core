@@ -265,14 +265,14 @@ rm -rf /tmp/clio_$(whoami)/*
 
 Key CMake flags:
 ```
--DWRP_CORE_ENABLE_RUNTIME=ON    # Clio runtime
--DWRP_CORE_ENABLE_CTE=ON        # Context Transfer Engine
--DWRP_CORE_ENABLE_CAE=ON        # Context Assimilation Engine
--DWRP_CORE_ENABLE_CEE=ON        # Context Exploration Engine
--DWRP_CORE_ENABLE_TESTS=ON      # Enable test targets
--DWRP_CORE_ENABLE_COMPRESS=ON   # Compression support
--DWRP_CORE_ENABLE_PYTHON=ON     # Python bindings
--DWRP_CORE_ENABLE_ASAN=ON       # AddressSanitizer
+-DCLIO_CORE_ENABLE_RUNTIME=ON    # Clio runtime
+-DCLIO_CORE_ENABLE_CTE=ON        # Context Transfer Engine
+-DCLIO_CORE_ENABLE_CAE=ON        # Context Assimilation Engine
+-DCLIO_CORE_ENABLE_CEE=ON        # Context Exploration Engine
+-DCLIO_CORE_ENABLE_TESTS=ON      # Enable test targets
+-DCLIO_CTE_ENABLE_COMPRESS=ON   # Compression support
+-DCLIO_CORE_ENABLE_PYTHON=ON     # Python bindings
+-DCLIO_CORE_ENABLE_ASAN=ON       # AddressSanitizer
 ```
 
 ---

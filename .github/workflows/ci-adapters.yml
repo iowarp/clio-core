@@ -256,7 +256,21 @@ jobs:
       VCPKG_DEFAULT_TRIPLET: x64-windows
       CAE_LABEL_TEST_SKIP: "1"
     steps:
+      # actions/checkout has no retry, and Windows runners intermittently fail
+      # the fetch with a transient schannel SEC_E_UNTRUSTED_ROOT (#1043). Let
+      # the first attempt fail, pause, and check out once more.
       - name: Checkout repository
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Wait before retrying checkout
+        if: steps.checkout.outcome == 'failure'
+        shell: pwsh
+        run: Start-Sleep -Seconds 15
+      - name: Checkout repository (retry)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v6
         with:
           submodules: recursive
@@ -267,16 +281,38 @@ jobs:
           $url = "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-$ver.msi"
           $msi = "$env:RUNNER_TEMP\winfsp.msi"
           Write-Host "Downloading WinFsp $ver from $url"
-          Invoke-WebRequest -Uri $url -OutFile $msi
+          # The release CDN drops out briefly; retry the download (#1043).
+          for ($i = 1; $i -le 5; $i++) {
+            try { Invoke-WebRequest -Uri $url -OutFile $msi; break }
+            catch {
+              if ($i -eq 5) { throw }
+              Write-Host "WinFsp download attempt $i failed: $_; retrying"
+              Start-Sleep -Seconds (10 * $i)
+            }
+          }
           # ADDLOCAL=ALL pulls in the Developer feature (inc/fuse3 + lib).
           $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn ADDLOCAL=ALL" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "WinFsp install failed ($($p.ExitCode))" }
           Get-ChildItem "C:\Program Files (x86)\WinFsp\inc\fuse3" -ErrorAction SilentlyContinue
       - name: Bootstrap vcpkg
+        shell: pwsh
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
-          git pull
-          .\bootstrap-vcpkg.bat
+          # Same retry as ci-windows.yml: git pull and the vcpkg.exe download
+          # are network calls that intermittently fail on Windows (#1043).
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            git pull
+            .\bootstrap-vcpkg.bat
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            $delay = $i * 15
+            Write-Host "bootstrap-vcpkg attempt $i failed (exit $LASTEXITCODE); retry in ${delay}s"
+            Start-Sleep -Seconds $delay
+          }
+          if (-not $ok) {
+            Write-Error "bootstrap-vcpkg failed after 5 attempts"
+            exit 1
+          }
       - name: Configure CMake (hdf5_vol + WinFsp fuse)
         # VCPKG_APPLOCAL_DEPS=OFF disables vcpkg's per-target post-build
         # "z-applocal" DLL copy into build/bin/ altogether. With HDF5_VOL=ON
@@ -338,11 +374,11 @@ jobs:
           # VCPKG_APPLOCAL_DEPS=OFF above means dependency DLLs were never
           # copied next to the exes -- resolve them from the vcpkg tree.
           $env:PATH = "${{ github.workspace }}\build\vcpkg_installed\x64-windows\debug\bin;${{ github.workspace }}\build\vcpkg_installed\x64-windows\bin;$env:PATH"
-          # fuse_ops is excluded on Windows: it hangs with zero output until
-          # the ctest timeout (at 300s AND 900s ceilings — hung, not slow).
-          # Tracked in #907; test_fuse_adapter + the live mount smoke below
-          # are the Windows FUSE coverage until it is root-caused.
-          ctest --test-dir build --build-config Debug --output-on-failure --timeout 120 --repeat until-pass:2 -R "hdf5_vol|fuse" -E "copy_workspace|compat_suite|fuse_ops" -LE "docker|ollama|flaky"
+          # fuse_ops runs again (#907): it used to hang with zero output here,
+          # but a native Windows build with WinFsp (developer feature) passed
+          # it 8/8 in ~1 s with this exact invocation. If it hangs again, the
+          # 120 s timeout below bounds it -- re-exclude and reopen #907.
+          ctest --test-dir build --build-config Debug --output-on-failure --timeout 120 --repeat until-pass:2 -R "hdf5_vol|fuse" -E "copy_workspace|compat_suite" -LE "docker|ollama|flaky"
       # Live end-to-end WinFsp mount (#903): runtime up -> compose -> mount a
       # drive letter -> write/read/verify -> unmount. The WinFsp MSI install
       # above included the driver, so mounting works without a reboot.

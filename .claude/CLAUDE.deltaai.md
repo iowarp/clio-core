@@ -109,7 +109,7 @@ Never build in HOME. Always use `/work/hdd/bekn/$USER/`.
 
 2. **Module system differs between login and compute nodes** — `module spider` results may vary. Always verify on the node type where you'll build.
 
-3. **No io_uring** — SLES 15.6 kernel may not support it. Disable with `-DWRP_CORE_ENABLE_IO_URING=OFF`.
+3. **No io_uring** — SLES 15.6 kernel may not support it. Disable with `-DCLIO_CORE_ENABLE_IO_URING=OFF`.
 
 4. **Ninja from conda** — system cmake is 3.20 (old). Install cmake + ninja from conda for better compatibility.
 

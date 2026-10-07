@@ -66,7 +66,8 @@ Either:
 
 The GitHub Actions workflow `.github/workflows/build-pip.yml` uses
 [cibuildwheel](https://cibuildwheel.readthedocs.io/) to produce manylinux_2_28
-wheels for CPython 3.10-3.13.
+wheels for CPython 3.10-3.14 (Linux x86_64/aarch64, Windows amd64, macOS
+arm64).
 
 External deps are linked statically via `CLIO_CORE_STATIC_DEPS=ON` (set in the
 `pip-release` preset), so the wheel only contains IOWarp's own `.so` files.
@@ -111,7 +112,7 @@ iowarp_core/
 Pass extra CMake args via `scikit-build-core`:
 
 ```bash
-pip install -v . --config-settings=cmake.args="-DWRP_CORE_ENABLE_CAE=OFF"
+pip install -v . --config-settings=cmake.args="-DCLIO_CORE_ENABLE_CAE=OFF"
 ```
 
 ### Static vs Shared Dependencies

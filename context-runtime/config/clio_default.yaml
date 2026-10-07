@@ -472,6 +472,13 @@ compose:
   #   # Steer each tag's compressed copy toward the node that last read it
   #   # (consumer tracking). false = always place by hash of the tag id.
   #   tracking_enabled: true            # default: true
+  #   # Trained models for kCompressDynamic (all optional; unset = the fixed
+  #   # heuristic, ratio 2.0). Q-table is used first, then the dense NN.
+  #   qtable_model_path: ""             # Q-table predictor model
+  #   linreg_model_path: ""             # LinReg table predictor model
+  #   distribution_model_path: ""       # data-distribution classifier
+  #   dnn_model_weights_path: ""        # dense NN weights (DENSE_NN builds)
+  #   trace_folder_path: ""             # write per-put compression traces here
   #
   # Codec choice is per put, via Context::dynamic_compress_:
   #   0 kCompressSkip     store uncompressed

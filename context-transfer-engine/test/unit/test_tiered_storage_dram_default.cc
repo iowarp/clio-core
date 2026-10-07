@@ -111,6 +111,68 @@ static std::string FormatRcHistogram(const std::map<clio::run::u32, int> &rcs) {
 
 #include "simple_test.h"
 
+/**
+ * Where a blob's bytes live, read from its SHM metadata record (issue #794).
+ * ReorganizeBlob's return code cannot answer this: when the requested tier is
+ * full the placement engine falls back to another tier and still returns 0.
+ */
+enum class Placement { kMissing, kOnTier, kElsewhere };
+
+/**
+ * Classify one blob's placement against a bdev type.
+ * @param cte_client CTE client
+ * @param tag_id the blob's tag
+ * @param name the blob's name
+ * @param size the blob's expected size
+ * @param type the tier's bdev type
+ * @return kMissing if the record is absent or short, kOnTier if every block is
+ *         on `type`, else kElsewhere
+ */
+static Placement BlobPlacement(clio::cte::core::Client *cte_client,
+                               const clio::cte::core::TagId &tag_id,
+                               const std::string &name, clio::run::u64 size,
+                               clio::run::bdev::BdevType type) {
+  clio::cte::core::ShmBlobRecord rec{};
+  if (!cte_client->TryGetBlobRecordShm(tag_id, name, &rec) ||
+      rec.total_size_ != size || rec.num_blocks_ == 0) {
+    return Placement::kMissing;
+  }
+  for (clio::run::u32 b = 0;
+       b < rec.num_blocks_ && b < clio::cte::core::kMaxInlineBlocks; ++b) {
+    if (rec.blocks_[b].bdev_type_ != static_cast<clio::run::u32>(type)) {
+      return Placement::kElsewhere;
+    }
+  }
+  return Placement::kOnTier;
+}
+
+/**
+ * Count blobs blob_0..blob_{n-1} by placement on one tier.
+ * @param cte_client CTE client
+ * @param tag_id their tag
+ * @param n number of blobs
+ * @param size each blob's size
+ * @param type the tier's bdev type
+ * @param on_tier out: blobs wholly on the tier
+ * @param missing out: blobs with no (or a short) record
+ */
+static void CountPlacement(clio::cte::core::Client *cte_client,
+                           const clio::cte::core::TagId &tag_id, int n,
+                           clio::run::u64 size,
+                           clio::run::bdev::BdevType type, int *on_tier,
+                           int *missing) {
+  *on_tier = 0;
+  *missing = 0;
+  for (int i = 0; i < n; ++i) {
+    switch (BlobPlacement(cte_client, tag_id, "blob_" + std::to_string(i),
+                          size, type)) {
+      case Placement::kOnTier: ++*on_tier; break;
+      case Placement::kMissing: ++*missing; break;
+      case Placement::kElsewhere: break;
+    }
+  }
+}
+
 namespace fs = std::filesystem;
 
 static std::string chi_test_data_dir() {
@@ -341,9 +403,21 @@ TEST_CASE("DramDefault - Reorganize down to file then up to 0g RAM",
       down_rc[rc]++;
     }
   }
+  // Issue #794: assert where the blobs went, not how many calls returned 0.
+  // 96 x 1MB cannot fit the 64MB file tier: it must fill (allowing for
+  // allocator overhead and the periodic capacity refresh) without exceeding
+  // its capacity, and every blob must still exist somewhere.
+  constexpr int kSlowTierBlobs = static_cast<int>(kSlowFileCapacity / kBlobSize);
+  int on_file = 0;
+  int down_missing = 0;
+  CountPlacement(cte_client, tag_id, kNumBlobs, kBlobSize,
+                 clio::run::bdev::BdevType::kFile, &on_file, &down_missing);
   INFO("Reorganize down (-> file): " << down_ok << "/" << kNumBlobs
-       << FormatRcHistogram(down_rc));
-  REQUIRE(down_ok == kNumBlobs);
+       << " returned 0" << FormatRcHistogram(down_rc) << "; " << on_file
+       << " now on the file tier, " << down_missing << " missing");
+  REQUIRE(down_missing == 0);
+  REQUIRE(on_file <= kSlowTierBlobs);
+  REQUIRE(on_file >= kSlowTierBlobs * 3 / 4);
 
   // Back up to the "0g" (80% DRAM) fast tier.
   int up_ok = 0;
@@ -360,9 +434,18 @@ TEST_CASE("DramDefault - Reorganize down to file then up to 0g RAM",
       up_rc[rc]++;
     }
   }
+  // The 0g (80% DRAM) tier has room for everything: every blob must be back
+  // in RAM, not merely reported moved.
+  int on_ram = 0;
+  int up_missing = 0;
+  CountPlacement(cte_client, tag_id, kNumBlobs, kBlobSize,
+                 clio::run::bdev::BdevType::kRam, &on_ram, &up_missing);
   INFO("Reorganize up (-> 0g RAM): " << up_ok << "/" << kNumBlobs
-       << FormatRcHistogram(up_rc));
+       << " returned 0" << FormatRcHistogram(up_rc) << "; " << on_ram
+       << " now in RAM, " << up_missing << " missing");
   REQUIRE(up_ok == kNumBlobs);
+  REQUIRE(up_missing == 0);
+  REQUIRE(on_ram == kNumBlobs);
 }
 
 /**

@@ -297,6 +297,22 @@ std::string MemberState(const ArrayView &v, const std::string &role,
   return "";
 }
 
+/**
+ * Quote a path as a single-quoted YAML scalar. A double-quoted scalar treats
+ * the backslashes in Windows paths as escapes (#1156); a single-quoted one
+ * only needs its own quotes doubled.
+ * @param s the string to quote
+ * @return the YAML scalar
+ */
+static std::string YamlQuote(const std::string &s) {
+  std::string out = "'";
+  for (char c : s) {
+    out += c;
+    if (c == '\'') out += '\'';
+  }
+  return out + "'";
+}
+
 /** The 6-disk array under test and the bytes it should hold. */
 struct Rig {
   fs::path dir;
@@ -322,8 +338,8 @@ struct Rig {
     fs::remove(alloc_log, ec);
     fs::remove(alloc_log + ".members", ec);
     fs::remove(alloc_log + ".journal", ec);
-    std::string yaml = "max_failures: 2\nalloc_log: \"" + alloc_log +
-                       "\"\nmembers:\n";
+    std::string yaml = "max_failures: 2\nalloc_log: " + YamlQuote(alloc_log) +
+                       "\nmembers:\n";
     for (int i = 0; i < kMembers; ++i) {
       const std::string p = (dir / (tag + "_disk" + std::to_string(i) +
                                     ".bin")).string();
@@ -335,7 +351,7 @@ struct Rig {
       REQUIRE_FALSE(id.IsNull());
       paths.push_back(p);
       ids.push_back(id);
-      yaml += "  - pool_name: \"" + p + "\"\n    node_id: 0\n" +
+      yaml += "  - pool_name: " + YamlQuote(p) + "\n    node_id: 0\n" +
               "    pool_id_major: " + std::to_string(id.major_) + "\n" +
               "    pool_id_minor: " + std::to_string(id.minor_) + "\n";
       if (i >= kDataMembers) yaml += "    parity: true\n";

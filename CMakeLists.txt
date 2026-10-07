@@ -746,16 +746,30 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     # NOTE: this is DISTINCT from CLIO_CTP_ENABLE_SYCL (the SYCL-language switch,
     # controlled by CLIO_CORE_ENABLE_SYCL, which triggers <sycl/sycl.hpp> + -fsycl
     # in macros.h). zfp-sycl needs neither, so it uses its own flag/define.
+    #
+    # Opt-in (default: on only in SYCL builds). Auto-detecting it whenever
+    # /opt/zfp-sycl existed linked it into every compress-enabled build in the
+    # devcontainer, whose image ships that library: executables failed to link
+    # (its SYCL runtime symbols were unresolved) and anything that loaded it
+    # crashed before main in its static initializer, which selects a SYCL
+    # device (#1207).
+    option(CLIO_CTE_ENABLE_ZFP_SYCL
+        "Use the SYCL-enabled libzfp (zfp-sycl compressor)"
+        ${CLIO_CORE_ENABLE_SYCL})
     set(CLIO_CTP_ENABLE_ZFP_SYCL OFF)
     set(CLIO_ZFP_SYCL_ROOT "/opt/zfp-sycl" CACHE PATH
         "Install prefix of the SYCL-enabled libzfp (for zfp-sycl compressor)")
-    find_library(ZFP_SYCL_LIBRARY NAMES zfp
-        HINTS ${CLIO_ZFP_SYCL_ROOT}/lib ${CLIO_ZFP_SYCL_ROOT}/lib64
-        NO_DEFAULT_PATH)
-    find_path(ZFP_SYCL_INCLUDE_DIR NAMES zfp.h
-        HINTS ${CLIO_ZFP_SYCL_ROOT}/include
-        NO_DEFAULT_PATH)
-    if(ZFP_SYCL_LIBRARY AND ZFP_SYCL_INCLUDE_DIR)
+    if(CLIO_CTE_ENABLE_ZFP_SYCL)
+      find_library(ZFP_SYCL_LIBRARY NAMES zfp
+          HINTS ${CLIO_ZFP_SYCL_ROOT}/lib ${CLIO_ZFP_SYCL_ROOT}/lib64
+          NO_DEFAULT_PATH)
+      find_path(ZFP_SYCL_INCLUDE_DIR NAMES zfp.h
+          HINTS ${CLIO_ZFP_SYCL_ROOT}/include
+          NO_DEFAULT_PATH)
+    endif()
+    if(NOT CLIO_CTE_ENABLE_ZFP_SYCL)
+        message(STATUS "zfp-sycl compression disabled (CLIO_CTE_ENABLE_ZFP_SYCL=OFF)")
+    elseif(ZFP_SYCL_LIBRARY AND ZFP_SYCL_INCLUDE_DIR)
         message(STATUS "found SYCL libzfp at ${ZFP_SYCL_LIBRARY} (zfp-sycl GPU compression)")
         set(CLIO_CTP_ENABLE_ZFP_SYCL ON)
     else()

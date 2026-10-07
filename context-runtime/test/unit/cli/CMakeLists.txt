@@ -167,10 +167,10 @@ if(CLIO_CORE_ENABLE_TESTS)
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
-  set(_recovery_cases CorruptRestore)
+  set(_recovery_cases CorruptRestore BlobTimes)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # RLIMIT_FSIZE via prlimit(2) is Linux-only; the case is compiled out
-    # elsewhere, so it is only registered here.
+    # SystemInfo::SetProcessFileSizeLimit (prlimit) is Linux-only and fails
+    # elsewhere, so the case is only registered here.
     list(APPEND _recovery_cases PutBlobRollback)
   endif()
   foreach(_case ${_recovery_cases})

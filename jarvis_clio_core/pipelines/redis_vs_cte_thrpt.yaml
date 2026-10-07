@@ -16,7 +16,7 @@
 #       scaling with --threads and overrunning the 16 GiB tier.
 #
 # Requires: clio_cte_bench + clio_redis_bench in PATH (build with
-#           -DWRP_CORE_ENABLE_REDIS=ON), redis-server in PATH.
+#           -DCLIO_CORE_ENABLE_REDIS=ON), redis-server in PATH.
 #
 # Usage:
 #   jarvis pipeline test redis_vs_cte_thrpt.yaml

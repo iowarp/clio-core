@@ -2609,6 +2609,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         !blob_info_ptr->blocks_.empty()) {
       clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
       TxnExtendBlob txn;
+      txn.wall_ns_ = GetWallTimeNs();  // a put changed the content (#796)
       txn.tag_major_ = tag_id.major_;
       txn.tag_minor_ = tag_id.minor_;
       txn.blob_name_ = blob_name;
@@ -5625,6 +5626,7 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
     if (!blob_txn_logs_.empty()) {
       clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
       TxnExtendBlob txn;
+      txn.wall_ns_ = GetWallTimeNs();  // a truncate changed the content (#796)
       txn.tag_major_ = tag_id.major_;
       txn.tag_minor_ = tag_id.minor_;
       txn.blob_name_ = blob_name;
@@ -7084,6 +7086,30 @@ TagId Runtime::GetOrCreateTagChain(const std::string &name,
   return parent;
 }
 
+/**
+ * Write a blob's access times as metadata-log entry type 6 (issue #796),
+ * right after the blob's own record so restore can attach them by key. The
+ * times are steady-clock in memory and wall-clock on disk, because the steady
+ * clock restarts at boot. A new entry type for the same reason as types 2-4:
+ * the log has no version header, so an older reader must stop loudly rather
+ * than misparse the extra bytes.
+ * @param ofs the metadata log being written
+ * @param key the blob's composite key
+ * @param blob_info the blob, held under its write token
+ */
+static void WriteBlobTimesEntry(std::ofstream &ofs, const std::string &key,
+                                const BlobInfo &blob_info) {
+  const uint8_t entry_type = 6;
+  const uint32_t key_len = static_cast<uint32_t>(key.size());
+  const clio::run::u64 times[3] = {SteadyToWallNs(blob_info.last_modified_),
+                                   SteadyToWallNs(blob_info.last_read_),
+                                   blob_info.access_count_};
+  ofs.write(reinterpret_cast<const char *>(&entry_type), sizeof(entry_type));
+  ofs.write(reinterpret_cast<const char *>(&key_len), sizeof(key_len));
+  ofs.write(key.data(), key_len);
+  ofs.write(reinterpret_cast<const char *>(times), sizeof(times));
+}
+
 clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadataTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->entries_flushed_ = 0;
@@ -7295,6 +7321,7 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
         ofs.write(reinterpret_cast<const char *>(&size), sizeof(size));
       }
       task->entries_flushed_++;
+      WriteBlobTimesEntry(ofs, key, blob_info);
 
       // Entry type 4 == one replica's layout (issue #886), written right
       // after its blob's record so restore can attach it to the
@@ -8327,6 +8354,24 @@ void Runtime::RestoreMetadataFromLog() {
         rep->total_size_cache_ += size;
       }
 
+    } else if (entry_type == 6) {
+      // A blob's access times (issue #796), attached to the blob whose record
+      // FlushMetadata wrote just before it. Stored as wall clock; converted
+      // back to this boot's steady clock.
+      std::string composite_key;
+      if (!read_str(composite_key, "blob times key length")) break;
+      clio::run::u64 times[3];
+      ifs.read(reinterpret_cast<char *>(times), sizeof(times));
+      if (!ifs.good()) break;
+      std::shared_ptr<BlobInfo> blob_info_ptr =
+          tag_blob_name_to_info_.get(composite_key);
+      if (blob_info_ptr) {
+        blob_info_ptr->last_modified_ = WallToSteadyNs(times[0]);
+        blob_info_ptr->last_read_ = WallToSteadyNs(times[1]);
+        blob_info_ptr->access_count_ = times[2];
+        MirrorBlobToShm(composite_key, *blob_info_ptr);
+      }
+
     } else {
       corrupt("entry type", entry_type);
       stop = true;
@@ -8663,6 +8708,10 @@ void Runtime::ApplyWalCreateNewBlob(const std::vector<char> &payload,
   BlobInfo blob_info;
   blob_info.blob_name_ = txn.blob_name_;
   blob_info.score_ = txn.score_;
+  // Issue #796: a recovered blob keeps its write time. Left at 0 it read as
+  // "never written", so TemporalSearch skipped every pre-restart blob.
+  blob_info.last_modified_ = WallToSteadyNs(txn.wall_ns_);
+  blob_info.last_read_ = blob_info.last_modified_;
   // Carry over any transform mark already restored for this key (issue
   // #818). The WAL is only truncated once it exceeds a size threshold, so a
   // kCreateNewBlob record can outlive the metadata flush that recorded the
@@ -8691,6 +8740,13 @@ void Runtime::ApplyWalCreateNewBlob(const std::vector<char> &payload,
       // genuine delete+recreate never reaches this carry-over.
       blob_info.blocks_ = existing->blocks_;
       blob_info.RecomputeTotalSize();
+      // And the TIMES (#796): a snapshot restored before this record can
+      // hold a later write than the create.
+      blob_info.last_modified_ =
+          std::max(blob_info.last_modified_, existing->last_modified_);
+      blob_info.last_read_ =
+          std::max(blob_info.last_read_, existing->last_read_);
+      blob_info.access_count_ = existing->access_count_;
     }
   }
   tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
@@ -8752,6 +8808,10 @@ void Runtime::ApplyWalExtendBlob(const std::vector<char> &payload,
     }
     blob_info_ptr->RecomputeTotalSize();  // blocks_ rebuilt: resync cache
     blob_info_ptr->SetRestoreLoss(lost_bytes);
+    // A content change carries its write time (#796); a layout-only record
+    // (reorganize, rollback) leaves the time alone.
+    blob_info_ptr->last_modified_ = std::max(blob_info_ptr->last_modified_,
+                                             WallToSteadyNs(txn.wall_ns_));
     if (lost_bytes != 0) {
       // Part (or all) of the blob lived on a volatile tier: it comes back
       // SHORT or EMPTY, and reads into the lost range fail rather than
@@ -9358,6 +9418,7 @@ std::shared_ptr<BlobInfo> Runtime::CreateNewBlob(const std::string &blob_name,
     txn.tag_minor_ = tag_id.minor_;
     txn.blob_name_ = blob_name;
     txn.score_ = blob_score;
+    txn.wall_ns_ = GetWallTimeNs();  // restored on replay (#796)
     blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kCreateNewBlob,
                                                      txn);
   }

@@ -36,13 +36,27 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <clio_cte/core/core_client.h>
+
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace clio::cte::uvm {
 
-GpuVirtualMemoryManager::GpuVirtualMemoryManager() = default;
+/** One CTE staging buffer still read by an async H2D copy. */
+struct PendingFree {
+  ctp::ipc::FullPtr<char> shm;  ///< the staging buffer
+  cudaEvent_t done = nullptr;   ///< recorded after the copy on the stream
+};
+
+struct GpuVirtualMemoryManager::PendingFrees {
+  std::vector<PendingFree> list;
+};
+
+GpuVirtualMemoryManager::GpuVirtualMemoryManager()
+    : pending_frees_(std::make_unique<PendingFrees>()) {}
 
 GpuVirtualMemoryManager::~GpuVirtualMemoryManager() { destroy(); }
 
@@ -77,6 +91,28 @@ CUresult GpuVirtualMemoryManager::init(const GpuVmmConfig &config) {
     return res;
   }
 
+  // CTE backing store, when requested. It used to sit behind a macro nothing
+  // defined, so use_cte=true was silently ignored (#1190); a requested CTE
+  // that cannot be reached is now an init failure, not a quiet fallback.
+  use_cte_ = config.use_cte;
+  if (use_cte_) {
+    if (!clio::cte::core::CLIO_CTE_CLIENT_INIT("",
+                                               clio::run::PoolQuery::Local())) {
+      fprintf(stderr, "GpuVmm: use_cte=true but the CTE client could not be "
+              "initialized (is the runtime up?)\n");
+      return CUDA_ERROR_NOT_INITIALIZED;
+    }
+    cte_tag_ = std::make_unique<clio::cte::core::Tag>(config.cte_tag_name);
+    if (cte_tag_->GetTagId().IsNull()) {
+      fprintf(stderr, "GpuVmm: could not create CTE tag %s\n",
+              config.cte_tag_name.c_str());
+      cte_tag_.reset();
+      return CUDA_ERROR_NOT_INITIALIZED;
+    }
+    fprintf(stdout, "GpuVmm: CTE backing store enabled (tag: %s)\n",
+            config.cte_tag_name.c_str());
+  }
+
   // Align page size up to hardware granularity
   page_size_ = config.page_size;
   if (page_size_ < granularity) {
@@ -100,6 +136,7 @@ CUresult GpuVirtualMemoryManager::init(const GpuVmmConfig &config) {
             "  This GPU may not support a %zu-byte VA reservation.\n"
             "  Try a smaller va_size_bytes.\n",
             va_size_, res, va_size_);
+    cte_tag_.reset();
     return res;
   }
 
@@ -109,16 +146,6 @@ CUresult GpuVirtualMemoryManager::init(const GpuVmmConfig &config) {
   // Create CUDA streams for async overlap
   cudaStreamCreate(&transfer_stream_);
   cudaStreamCreate(&compute_stream_);
-
-  // Initialize CTE backing store if requested
-#ifdef CLIO_CTE_AVAILABLE
-  use_cte_ = config.use_cte;
-  if (use_cte_) {
-    cte_tag_ = std::make_unique<clio::cte::core::Tag>(config.cte_tag_name);
-    fprintf(stdout, "GpuVmm: CTE backing store enabled (tag: %s)\n",
-            config.cte_tag_name.c_str());
-  }
-#endif
 
   fprintf(stdout,
           "GpuVmm: Initialized\n"
@@ -141,24 +168,29 @@ void GpuVirtualMemoryManager::destroy() {
 
   if (va_base_ == 0) return;
 
-  // Unmap and free all backed pages
+  // In-flight async restores still read their staging buffers.
+  drainPendingFrees_(/*wait=*/true);
+
+  // Unmap and free all backed pages; drop the page blobs this run stored
+  // (they used to outlive the manager, #1190).
   for (size_t i = 0; i < total_pages_; ++i) {
     PageEntry &entry = page_table_[i];
     if (entry.mapped) {
-      CUdeviceptr page_addr = va_base_ + i * page_size_;
-      cuMemUnmap(page_addr, page_size_);
-      cuMemRelease(entry.alloc_handle);
-      entry.mapped = false;
+      unmapPage_(i);
+    }
+    if (entry.in_cte && cte_tag_) {
+      auto *cte = CLIO_CTE_CLIENT;
+      auto del = cte->AsyncDelBlob(cte_tag_->GetTagId(), pageBlobName_(i));
+      del.Wait();
+      entry.in_cte = false;
     }
   }
 
   // Free all host backing store buffers
   freeHostBackingStore_();
 
-  // Release CTE tag
-#ifdef CLIO_CTE_AVAILABLE
   cte_tag_.reset();
-#endif
+  use_cte_ = false;
 
   // Destroy CUDA streams
   if (transfer_stream_) {
@@ -245,6 +277,129 @@ CUresult GpuVirtualMemoryManager::mapAndBackPage_(size_t page_index) {
   return CUDA_SUCCESS;
 }
 
+void GpuVirtualMemoryManager::unmapPage_(size_t page_index) {
+  PageEntry &entry = page_table_[page_index];
+  CUdeviceptr page_addr = va_base_ + page_index * page_size_;
+  cuMemUnmap(page_addr, page_size_);
+  cuMemRelease(entry.alloc_handle);
+  entry.alloc_handle = 0;
+  entry.mapped = false;
+}
+
+std::string GpuVirtualMemoryManager::pageBlobName_(size_t page_index) {
+  return "page_" + std::to_string(page_index);
+}
+
+CUresult GpuVirtualMemoryManager::restoreFromCte_(size_t page_index,
+                                                  bool async) {
+  CUdeviceptr page_addr = va_base_ + page_index * page_size_;
+  auto *ipc = CLIO_CPU_IPC;
+  ctp::ipc::FullPtr<char> shm = ipc->AllocateBuffer(page_size_);
+  if (shm.IsNull()) {
+    fprintf(stderr, "GpuVmm: no staging buffer to restore page %zu\n",
+            page_index);
+    return CUDA_ERROR_OUT_OF_MEMORY;
+  }
+  auto *cte = CLIO_CTE_CLIENT;
+  auto get = cte->AsyncGetBlob(cte_tag_->GetTagId(), pageBlobName_(page_index),
+                               0, page_size_, 0,
+                               shm.shm_.template Cast<void>());
+  get.Wait();
+  if (get->GetReturnCode() != 0) {
+    fprintf(stderr, "GpuVmm: reading page %zu from CTE failed (rc %u)\n",
+            page_index, get->GetReturnCode());
+    ipc->FreeBuffer(shm);
+    return CUDA_ERROR_UNKNOWN;
+  }
+  if (!async) {
+    cudaError_t err = cudaMemcpy((void *)page_addr, shm.ptr_, page_size_,
+                                 cudaMemcpyHostToDevice);
+    ipc->FreeBuffer(shm);
+    return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
+  }
+  cudaError_t err = cudaMemcpyAsync((void *)page_addr, shm.ptr_, page_size_,
+                                    cudaMemcpyHostToDevice, transfer_stream_);
+  if (err != cudaSuccess) {
+    ipc->FreeBuffer(shm);
+    return CUDA_ERROR_UNKNOWN;
+  }
+  // The copy reads shm until it runs: free it once an event recorded after
+  // the copy has fired, not now (#1190).
+  PendingFree pf;
+  pf.shm = shm;
+  if (cudaEventCreateWithFlags(&pf.done, cudaEventDisableTiming) !=
+          cudaSuccess ||
+      cudaEventRecord(pf.done, transfer_stream_) != cudaSuccess) {
+    // No event to wait on: wait for the stream itself.
+    if (pf.done != nullptr) cudaEventDestroy(pf.done);
+    cudaStreamSynchronize(transfer_stream_);
+    ipc->FreeBuffer(shm);
+    return CUDA_SUCCESS;
+  }
+  pending_frees_->list.push_back(pf);
+  return CUDA_SUCCESS;
+}
+
+void GpuVirtualMemoryManager::drainPendingFrees_(bool wait) {
+  auto *ipc = CLIO_CPU_IPC;
+  auto &list = pending_frees_->list;
+  size_t kept = 0;
+  for (auto &pf : list) {
+    cudaError_t st =
+        wait ? cudaEventSynchronize(pf.done) : cudaEventQuery(pf.done);
+    if (st == cudaErrorNotReady) {
+      list[kept++] = pf;
+      continue;
+    }
+    cudaEventDestroy(pf.done);
+    ipc->FreeBuffer(pf.shm);
+  }
+  list.resize(kept);
+}
+
+CUresult GpuVirtualMemoryManager::populatePage_(size_t page_index,
+                                                bool async) {
+  PageEntry &entry = page_table_[page_index];
+  CUdeviceptr page_addr = va_base_ + page_index * page_size_;
+  CUresult res = CUDA_SUCCESS;
+  auto it = host_backing_store_.find(page_index);
+  if (entry.evicted_to_host && it != host_backing_store_.end()) {
+    // Restore saved data from host RAM. The sync path frees the buffer; the
+    // async path keeps it alive (reused by the next eviction).
+    cudaError_t err =
+        async ? cudaMemcpyAsync((void *)page_addr, it->second, page_size_,
+                                cudaMemcpyHostToDevice, transfer_stream_)
+              : cudaMemcpy((void *)page_addr, it->second, page_size_,
+                           cudaMemcpyHostToDevice);
+    res = (err == cudaSuccess) ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
+    if (res == CUDA_SUCCESS && !async) {
+      cudaFreeHost(it->second);
+      host_backing_store_.erase(it);
+    }
+  } else if (entry.evicted_to_host && entry.in_cte) {
+    res = restoreFromCte_(page_index, async);
+  } else {
+    // Fresh page: fill with configured value using driver API memset.
+    // cuMemsetD32 uses the same driver API context as cuMemMap/cuMemSetAccess,
+    // avoiding the runtime/driver context mismatch that causes fillKernel
+    // writes to appear as 0 when read back (A100 / Polaris).
+    size_t num_ints = page_size_ / sizeof(int);
+    res = async ? cuMemsetD32Async(page_addr, (unsigned int)fill_value_,
+                                   num_ints, transfer_stream_)
+                : cuMemsetD32(page_addr, (unsigned int)fill_value_, num_ints);
+  }
+  if (res != CUDA_SUCCESS) {
+    // Report it (it used to be logged and then answered with success) and
+    // leave the page unmapped with its saved copy intact for a retry.
+    fprintf(stderr, "GpuVmm: populating page %zu failed: %d\n", page_index,
+            res);
+    unmapPage_(page_index);
+    return res;
+  }
+  entry.evicted_to_host = false;
+  return CUDA_SUCCESS;
+}
+
 CUresult GpuVirtualMemoryManager::touchPage(size_t page_index) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -260,57 +415,11 @@ CUresult GpuVirtualMemoryManager::touchPage(size_t page_index) {
       return CUDA_SUCCESS;  // Already backed
     }
 
-    // Allocate + map + set access
+    // Allocate + map + set access, then restore or fill
     CUresult res = mapAndBackPage_(page_index);
     if (res != CUDA_SUCCESS) return res;
-
-    CUdeviceptr page_addr = va_base_ + page_index * page_size_;
-
-    // Restore from backing store or fill with default value
-    bool restored = false;
-
-#ifdef CLIO_CTE_AVAILABLE
-    if (use_cte_ && entry.evicted_to_host) {
-      // Restore from CTE: AsyncGetBlob → SHM → cudaMemcpy → GPU
-      std::string blob_name = "page_" + std::to_string(page_index);
-      ctp::ipc::FullPtr<char> shm = CLIO_CPU_IPC->AllocateBuffer(page_size_);
-      auto future = CLIO_CTE_CLIENT->AsyncGetBlob(
-          cte_tag_->GetTagId(), blob_name, 0, page_size_, 0, shm.shm_);
-      future.Wait();
-      cudaMemcpy((void *)page_addr, shm.ptr_, page_size_,
-                 cudaMemcpyHostToDevice);
-      CLIO_CPU_IPC->FreeBuffer(shm);
-      entry.evicted_to_host = false;
-      restored = true;
-    }
-#endif
-
-    if (!restored) {
-      auto it = host_backing_store_.find(page_index);
-      if (entry.evicted_to_host && it != host_backing_store_.end()) {
-        // Restore saved data from host RAM
-        cudaMemcpy((void *)page_addr, it->second, page_size_,
-                   cudaMemcpyHostToDevice);
-        cudaFreeHost(it->second);
-        host_backing_store_.erase(it);
-        entry.evicted_to_host = false;
-      } else {
-        // Fresh page: fill with configured value using driver API memset.
-        // cuMemsetD32 uses the same driver API context as cuMemMap/cuMemSetAccess,
-        // avoiding the runtime/driver context mismatch that causes fillKernel
-        // writes to appear as 0 when read back (A100 / Polaris).
-        size_t num_ints = page_size_ / sizeof(int);
-        CUresult fill_res = cuMemsetD32(page_addr, (unsigned int)fill_value_, num_ints);
-        if (fill_res != CUDA_SUCCESS) {
-          fprintf(stderr,
-                  "GpuVmm: cuMemsetD32 failed for page %zu: %d "
-                  "(page_addr=0x%llx, fill_value=%d)\n",
-                  page_index, fill_res,
-                  (unsigned long long)page_addr, fill_value_);
-        }
-        entry.evicted_to_host = false;
-      }
-    }
+    res = populatePage_(page_index, /*async=*/false);
+    if (res != CUDA_SUCCESS) return res;
   }
 
   // Prefetch ahead (outside mutex)
@@ -325,6 +434,7 @@ CUresult GpuVirtualMemoryManager::touchPageAsync(size_t page_index) {
   if (page_index >= total_pages_) {
     return CUDA_ERROR_INVALID_VALUE;
   }
+  drainPendingFrees_(/*wait=*/false);
 
   PageEntry &entry = page_table_[page_index];
   if (entry.mapped) {
@@ -333,53 +443,7 @@ CUresult GpuVirtualMemoryManager::touchPageAsync(size_t page_index) {
 
   CUresult res = mapAndBackPage_(page_index);
   if (res != CUDA_SUCCESS) return res;
-
-  CUdeviceptr page_addr = va_base_ + page_index * page_size_;
-
-  bool restored = false;
-
-#ifdef CLIO_CTE_AVAILABLE
-  if (use_cte_ && entry.evicted_to_host) {
-    // Restore from CTE (sync get, then async H2D)
-    std::string blob_name = "page_" + std::to_string(page_index);
-    ctp::ipc::FullPtr<char> shm = CLIO_CPU_IPC->AllocateBuffer(page_size_);
-    auto future = CLIO_CTE_CLIENT->AsyncGetBlob(
-        cte_tag_->GetTagId(), blob_name, 0, page_size_, 0, shm.shm_);
-    future.Wait();
-    cudaMemcpyAsync((void *)page_addr, shm.ptr_, page_size_,
-                    cudaMemcpyHostToDevice, transfer_stream_);
-    // SHM freed after transfer completes (caller must syncTransfer)
-    CLIO_CPU_IPC->FreeBuffer(shm);
-    entry.evicted_to_host = false;
-    restored = true;
-  }
-#endif
-
-  if (!restored) {
-    auto it = host_backing_store_.find(page_index);
-    if (entry.evicted_to_host && it != host_backing_store_.end()) {
-      // Async restore from host
-      cudaMemcpyAsync((void *)page_addr, it->second, page_size_,
-                      cudaMemcpyHostToDevice, transfer_stream_);
-      // Note: host buffer freed after sync (kept alive for async safety)
-      entry.evicted_to_host = false;
-    } else {
-      // Async fill using driver API for context consistency with cuMemMap
-      size_t num_ints = page_size_ / sizeof(int);
-      CUresult fill_res = cuMemsetD32Async(page_addr, (unsigned int)fill_value_,
-                                           num_ints, transfer_stream_);
-      if (fill_res != CUDA_SUCCESS) {
-        fprintf(stderr,
-                "GpuVmm: cuMemsetD32Async failed for page %zu: %d "
-                "(page_addr=0x%llx, fill_value=%d)\n",
-                page_index, fill_res,
-                (unsigned long long)page_addr, fill_value_);
-      }
-      entry.evicted_to_host = false;
-    }
-  }
-
-  return CUDA_SUCCESS;
+  return populatePage_(page_index, /*async=*/true);
 }
 
 CUresult GpuVirtualMemoryManager::touchRange(size_t offset, size_t size) {
@@ -405,6 +469,39 @@ bool GpuVirtualMemoryManager::isEvictedToHost(size_t page_index) const {
   std::lock_guard<std::mutex> lock(mutex_);
   if (page_index >= total_pages_) return false;
   return page_table_[page_index].evicted_to_host;
+}
+
+bool GpuVirtualMemoryManager::saveToCte_(size_t page_index,
+                                         const char *host_buf) {
+  auto *ipc = CLIO_CPU_IPC;
+  ctp::ipc::FullPtr<char> shm = ipc->AllocateBuffer(page_size_);
+  if (shm.IsNull()) return false;
+  memcpy(shm.ptr_, host_buf, page_size_);
+  auto put = cte_tag_->AsyncPutBlob(pageBlobName_(page_index),
+                                    shm.shm_.template Cast<void>(),
+                                    page_size_);
+  put.Wait();
+  const bool ok = put->GetReturnCode() == 0;
+  ipc->FreeBuffer(shm);
+  if (!ok) {
+    fprintf(stderr, "GpuVmm: storing page %zu in CTE failed (rc %u); "
+            "keeping it in host RAM\n", page_index, put->GetReturnCode());
+  }
+  return ok;
+}
+
+void GpuVirtualMemoryManager::storeEvicted_(size_t page_index,
+                                            char *host_buf) {
+  PageEntry &entry = page_table_[page_index];
+  if (use_cte_ && saveToCte_(page_index, host_buf)) {
+    entry.in_cte = true;
+    host_backing_store_.erase(page_index);
+    cudaFreeHost(host_buf);
+    return;
+  }
+  // Host RAM holds the newest copy and wins the restore (populatePage_
+  // checks it first); an older blob stays flagged so destroy() removes it.
+  host_backing_store_[page_index] = host_buf;
 }
 
 CUresult GpuVirtualMemoryManager::evictPage(size_t page_index) {
@@ -438,21 +535,7 @@ CUresult GpuVirtualMemoryManager::evictPage(size_t page_index) {
   cudaMemcpy(host_buf, (void *)page_addr, page_size_, cudaMemcpyDeviceToHost);
 
   // Store to CTE or keep in host RAM
-#ifdef CLIO_CTE_AVAILABLE
-  if (use_cte_) {
-    // Copy pinned host → SHM → AsyncPutBlob → Wait → free both
-    std::string blob_name = "page_" + std::to_string(page_index);
-    ctp::ipc::FullPtr<char> shm = CLIO_CPU_IPC->AllocateBuffer(page_size_);
-    memcpy(shm.ptr_, host_buf, page_size_);
-    auto future = cte_tag_->AsyncPutBlob(blob_name, shm.shm_, page_size_);
-    future.Wait();
-    CLIO_CPU_IPC->FreeBuffer(shm);
-    cudaFreeHost(host_buf);
-  } else
-#endif
-  {
-    host_backing_store_[page_index] = host_buf;
-  }
+  storeEvicted_(page_index, host_buf);
 
   // Unmap and release GPU physical memory
   CUresult res = cuMemUnmap(page_addr, page_size_);
@@ -510,22 +593,10 @@ CUresult GpuVirtualMemoryManager::evictPageAsync(size_t page_index) {
 
   // Must sync transfer stream before cuMemUnmap (driver API, not stream-able)
   cudaStreamSynchronize(transfer_stream_);
+  drainPendingFrees_(/*wait=*/false);
 
   // Store to CTE or keep in host RAM
-#ifdef CLIO_CTE_AVAILABLE
-  if (use_cte_) {
-    std::string blob_name = "page_" + std::to_string(page_index);
-    ctp::ipc::FullPtr<char> shm = CLIO_CPU_IPC->AllocateBuffer(page_size_);
-    memcpy(shm.ptr_, host_buf, page_size_);
-    auto future = cte_tag_->AsyncPutBlob(blob_name, shm.shm_, page_size_);
-    future.Wait();
-    CLIO_CPU_IPC->FreeBuffer(shm);
-    cudaFreeHost(host_buf);
-  } else
-#endif
-  {
-    host_backing_store_[page_index] = host_buf;
-  }
+  storeEvicted_(page_index, host_buf);
 
   // Unmap and release
   CUresult res = cuMemUnmap(page_addr, page_size_);
@@ -565,6 +636,8 @@ CUdeviceptr GpuVirtualMemoryManager::getPagePtr(size_t page_index) const {
 
 void GpuVirtualMemoryManager::syncTransfer() {
   cudaStreamSynchronize(transfer_stream_);
+  std::lock_guard<std::mutex> lock(mutex_);
+  drainPendingFrees_(/*wait=*/false);
 }
 
 void GpuVirtualMemoryManager::syncCompute() {

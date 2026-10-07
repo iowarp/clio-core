@@ -1149,6 +1149,27 @@ clio::run::TaskResume Runtime::SealBlock(const FsReq &req, FsResp &resp) {
     const bool seal = req.a_ != 0;
     if (seal && (!b.ents_.empty() || slot->splitting_)) {
       rc = ENOTEMPTY;  // pending entries (a mkdir inside) count too
+      // #1029: entries a listing does NOT show (pending reservations,
+      // leaving halves of a rename) or a split in flight make an rmdir fail
+      // after rm -r removed everything it was shown. Name them.
+      size_t hidden = 0;
+      std::string names;
+      for (const auto &kv : b.ents_) {
+        if (kv.second.state_ == kDirEntLive &&
+            kv.first.rfind(".fuse_hidden", 0) != 0) {
+          continue;
+        }
+        ++hidden;
+        if (names.size() < 512) {
+          names += kv.first + "(state " +
+                   std::to_string(static_cast<int>(kv.second.state_)) + ") ";
+        }
+      }
+      if (hidden != 0 || slot->splitting_) {
+        HLOG(kError, "filesystem: rmdir of dir {} block {} refused for "
+             "{} unlisted entr(ies), splitting={}: {}", req.dir_id_,
+             req.block_, hidden, slot->splitting_, names);
+      }
     } else if (b.sealed_ != seal) {
       b.sealed_ = seal;
       v = RecordChangeLocked(*slot, DirDelta(), false);
@@ -1383,7 +1404,15 @@ clio::run::TaskResume Runtime::CollectDir(
       if (rc != 0) CLIO_CO_RETURN;
       slots.push_back(std::move(slot));
     }
-    if (SnapshotDir(dir, blocks, slots, out, newest) || attempt >= 8) break;
+    if (SnapshotDir(dir, blocks, slots, out, newest)) break;
+    if (attempt >= 8) {
+      // Not "empty": an empty answer here made rm -r skip every child.
+      HLOG(kError, "filesystem: listing directory {} kept racing block "
+           "refetches; failing it EAGAIN", dir);
+      out->clear();
+      rc = EAGAIN;
+      break;
+    }
     // A copy was dropped for a refetch while we loaded the others: again.
     CLIO_CO_AWAIT(clio::run::yield(kLoadPollUs));
   }

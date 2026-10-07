@@ -57,7 +57,7 @@ cmake --build build -j$(nproc)
 cd build && ctest
 
 # For compression support
-cmake --preset=debug -DWRP_CORE_ENABLE_COMPRESS=ON
+cmake --preset=debug -DCLIO_CTE_ENABLE_COMPRESS=ON
 cmake --build build -j$(nproc)
 ```
 
@@ -109,7 +109,7 @@ source /home/iowarp/venv/bin/activate
 **Building Python bindings:**
 ```bash
 # Configure with Python support
-cmake --preset=debug -DWRP_CORE_ENABLE_PYTHON=ON
+cmake --preset=debug -DCLIO_CORE_ENABLE_PYTHON=ON
 
 # Build
 cmake --build build -j$(nproc)
@@ -347,7 +347,7 @@ conda install c-blosc2
 conda list | grep -E "zlib|bzip2|lzo|zstd|lz4|xz|brotli|snappy|blosc"
 
 # Rebuild with compression enabled
-cmake --preset=debug -DWRP_CORE_ENABLE_COMPRESS=ON
+cmake --preset=debug -DCLIO_CTE_ENABLE_COMPRESS=ON
 ```
 
 ## Additional Resources

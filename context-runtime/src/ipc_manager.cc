@@ -4725,6 +4725,16 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
 
   // Check if task has already been routed - if so, return ExecHere
   if (task_ptr->IsRouted()) {
+    // Record the container that runs it (#503). RouteLocal does this for a
+    // task routed on this node, but a task routed here by ANOTHER node
+    // arrives already marked routed and never passes RouteLocal, so it went
+    // back with the origin's completer (0): every remote PutBlob/GetBlob in a
+    // 4-node cluster reported container 0. ExecContainer() is the container
+    // BeginRunContext / RouteLocal resolved for this node.
+    ContainerHold exec = task_ptr->ExecContainer().get();
+    if (exec) {
+      task_ptr->SetCompleter(exec->container_id_);
+    }
     return RouteResult::ExecHere;
   }
 

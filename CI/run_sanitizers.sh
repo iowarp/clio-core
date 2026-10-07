@@ -122,17 +122,41 @@ fi
 
 # Write what the sanitizer actually found into the GitHub step summary.
 #
-# These jobs are non-gating by construction: the ctest invocation is followed by
-# `|| true` and this script ends with `exit 0`, so a sanitizer finding can never
-# turn a job red. That is not obviously wrong -- ubsan currently flags 151 of
-# 259 tests, and flipping the jobs to gating today would simply pin CI red --
-# but it does mean the findings are invisible unless somebody opens the raw log
-# and knows what to grep for. Nobody does, so nothing gets triaged.
+# asan and ubsan GATE (issue #803): once their backlog was cleared (#1094)
+# both ran 330/330 tests with zero defects on dev, so any failed test or any
+# test reporting a defect now fails the job -- see sanitizer_gate_status().
+# msan stays a report: its remaining findings are largely uninstrumented
+# third-party code, so gating it would pin CI red without a code defect.
 #
 # This prints the ctest pass/fail line, the per-test defect counts, and a sample
 # of the actual sanitizer messages from the MemoryChecker output files, which
-# otherwise only reach CDash. Purely additive: no job changes colour. Issue #803
-# tracks triaging the backlog and then ratcheting these to gating.
+# otherwise only reach CDash.
+# Decide whether a sanitizer run fails the job (issue #803).
+# Arguments:
+#   $1  sanitizer mode (asan | ubsan | msan | sanitize)
+#   $2  path to the ctest -S log of that run
+# Returns 1 for a gating mode (asan, ubsan, sanitize) whose run had a failed
+# test or any test reporting a defect, else 0. msan always returns 0.
+sanitizer_gate_status() {
+    local MODE="$1"
+    local CTEST_LOG="$2"
+    [ "${MODE}" = "msan" ] && return 0
+    if grep -qE "Defects: [1-9]" "${CTEST_LOG}" 2>/dev/null; then
+        print_warning "${MODE}: tests reported sanitizer defects"
+        return 1
+    fi
+    if grep -qE "[0-9]+% tests passed, [1-9][0-9]* tests? failed" \
+            "${CTEST_LOG}" 2>/dev/null; then
+        print_warning "${MODE}: tests failed"
+        return 1
+    fi
+    if ! grep -qE "[0-9]+% tests passed" "${CTEST_LOG}" 2>/dev/null; then
+        print_warning "${MODE}: no ctest summary line; the run did not complete"
+        return 1
+    fi
+    return 0
+}
+
 emit_findings_summary() {
     local MODE="$1"
     local CTEST_LOG="$2"
@@ -155,7 +179,11 @@ emit_findings_summary() {
         DEFECT_COUNT=$(grep -c "Defects: " "${CTEST_LOG}" || true)
         echo "Tests reporting defects: ${DEFECT_COUNT:-0}"
         echo ""
-        echo "> These jobs are non-gating: this is a report, not a gate (issue #803)."
+        if [ "${MODE}" = "msan" ]; then
+            echo "> msan is a report, not a gate (issue #803)."
+        else
+            echo "> ${MODE} gates: any failed test or reported defect fails the job (issue #803)."
+        fi
         echo ""
 
         if [ "${DEFECT_COUNT:-0}" != "0" ]; then
@@ -300,15 +328,18 @@ EOFCMAKE
 
     cd "${BUILD_DIR}"
     local CTEST_LOG="${BUILD_DIR}/sanitizer-ctest-${MODE}.log"
-    # `|| true` keeps this non-gating -- see emit_findings_summary() for why
-    # that is deliberate for now, and issue #803 for the plan to change it.
+    # ctest -S's own exit status is not the verdict (CDash submission problems
+    # change it); sanitizer_gate_status() reads the log instead (issue #803).
     ctest -S "${DASHBOARD_SCRIPT}" -VV 2>&1 | tee "${CTEST_LOG}" || true
     cd "${REPO_ROOT}"
 
     emit_findings_summary "${MODE}" "${CTEST_LOG}"
 
+    local GATE=0
+    sanitizer_gate_status "${MODE}" "${CTEST_LOG}" || GATE=1
     print_success "Done: ${MODE}"
     echo ""
+    return ${GATE}
 }
 
 ################################################################################
@@ -391,7 +422,7 @@ if [ "$DO_MSAN" = true ]; then
         "msan" \
         "MemorySanitizer" \
         "print_stacktrace=1:halt_on_error=0:poison_in_malloc=0:poison_in_free=0:poison_in_dtor=0:intercept_memcmp=0" \
-        || OVERALL_STATUS=$?
+        || print_warning "msan did not complete cleanly (a report, not a gate)"
 fi
 
 if [ "$DO_SANITIZE" = true ]; then
@@ -407,7 +438,7 @@ print_header "Sanitizer Run Complete"
 if [ $OVERALL_STATUS -eq 0 ]; then
     print_success "All requested sanitizer modes completed"
 else
-    print_warning "One or more sanitizer modes reported defects (exit: ${OVERALL_STATUS})"
+    print_error "A gating sanitizer mode (asan/ubsan) failed (exit: ${OVERALL_STATUS})"
 fi
 
-exit 0
+exit ${OVERALL_STATUS}

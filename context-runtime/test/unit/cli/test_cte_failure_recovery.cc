@@ -39,6 +39,11 @@
  *   std::string / vector or drove a read past the record -- before it bound
  *   its port, with nothing logged. The daemon must now stay up and say why.
  *
+ * BlobTimes (#796): a restored blob came back with last_modified_ == 0 --
+ *   neither the WAL nor the snapshot carried its times -- which TemporalSearch
+ *   reads as "never written", so every pre-restart blob vanished from time
+ *   queries. One blob is restored from the snapshot, one from the WAL.
+ *
  * PutBlobRollback (#1059, Linux): when a PutBlob's data write fails after
  *   the blob was already grown, the blob kept pointing at unwritten blocks
  *   and every later GetBlob of it failed. The write failure is real: the
@@ -46,12 +51,6 @@
  *   ignored), so placement succeeds and the write past the limit fails with
  *   EFBIG. The blob must keep its committed size and bytes.
  */
-
-#include <fcntl.h>
-#include <signal.h>
-#include <sys/resource.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -69,6 +68,7 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/transaction_log.h>
+#include <clio_ctp/introspect/system_info.h>
 
 #include "runtime_server.h"
 #include "simple_test.h"
@@ -81,41 +81,19 @@ namespace {
  * Run the clio_run binary with a hard kill deadline.
  * @param args arguments after the executable
  * @param timeout_sec seconds before the child is killed
- * @return exit code, -2 if signalled, -3 on timeout, -1 if fork failed
+ * @return exit code, -1 if it could not start, -3 if killed or signalled
  */
 int RunCliTimed(const std::vector<std::string> &args, int timeout_sec) {
-  std::vector<std::string> full;
-  full.push_back(CLIO_RUN_EXE);
-  full.insert(full.end(), args.begin(), args.end());
-  std::vector<char *> argv;
-  for (auto &a : full) argv.push_back(a.data());
-  argv.push_back(nullptr);
-
-  pid_t pid = fork();
-  if (pid < 0) return -1;
-  if (pid == 0) {
-    int devnull = open("/dev/null", O_WRONLY);
-    if (devnull >= 0) {
-      dup2(devnull, 1);
-      dup2(devnull, 2);
-      close(devnull);
-    }
-    execv(argv[0], argv.data());
-    _exit(127);
+  const std::string log =
+      (fs::temp_directory_path() / "cte_failure_recovery_cli.log").string();
+  ctp::SpawnedProcess proc =
+      ctp::SystemInfo::SpawnProcess(CLIO_RUN_EXE, args, log);
+  if (!proc.valid) return -1;
+  int rc = 0;
+  if (!ctp::SystemInfo::WaitForChild(proc, timeout_sec * 1000, &rc)) {
+    return -3;
   }
-  auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
-  int status = 0;
-  while (true) {
-    pid_t r = waitpid(pid, &status, WNOHANG);
-    if (r == pid) return WIFEXITED(status) ? WEXITSTATUS(status) : -2;
-    if (std::chrono::steady_clock::now() >= deadline) {
-      kill(pid, SIGKILL);
-      waitpid(pid, &status, 0);
-      return -3;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
+  return rc;
 }
 
 /**
@@ -133,13 +111,13 @@ void WaitForExit(clio::run::test::RuntimeServer &server) {
  * @param work_dir scratch directory for this test
  */
 void SetTestEnv(const fs::path &work_dir) {
-  setenv("CLIO_WAIT_SERVER", "15", 1);
-  setenv("CLIO_BIND_ADDR", "127.0.0.1", 1);
-  setenv("CLIO_RESTART_LOG", (work_dir / "restart_log.bin").string().c_str(),
-         1);
+  ctp::SystemInfo::Setenv("CLIO_WAIT_SERVER", "15", 1);
+  ctp::SystemInfo::Setenv("CLIO_BIND_ADDR", "127.0.0.1", 1);
+  ctp::SystemInfo::Setenv("CLIO_RESTART_LOG",
+                          (work_dir / "restart_log.bin").string(), 1);
   // Daemon output goes here (RuntimeServer truncates it on every Start).
-  setenv("CLIO_TEST_SERVER_LOG", (work_dir / "daemon.log").string().c_str(),
-         1);
+  ctp::SystemInfo::Setenv("CLIO_TEST_SERVER_LOG",
+                          (work_dir / "daemon.log").string(), 1);
 }
 
 /**
@@ -304,13 +282,165 @@ TEST_CASE("CorruptRestore - corrupt snapshot and WAL do not kill the daemon",
   fs::remove_all(work_dir);
 }
 
-#ifdef __linux__
+
+/** Set (to "1") in a child that runs one phase of a multi-process case. */
+constexpr const char *kPhaseEnv = "CLIO_TEST_PHASE_CHILD";
+
+/**
+ * Whether this process was launched by RunPhase. Phase cases do nothing
+ * otherwise, so running the whole binary unfiltered skips them.
+ * @return true inside a RunPhase child
+ */
+bool InPhaseChild() { return ctp::SystemInfo::Getenv(kPhaseEnv) == "1"; }
+
+/**
+ * Run one phase case of this binary in a fresh process. Each client phase of
+ * a restart test needs one: a client connects once, and the daemon it talked
+ * to is gone after the restart.
+ * @param phase the phase case's name (a test filter)
+ * @param log_path where the child's output goes
+ * @return the child's exit code (0 = the phase passed), -1 if it could not
+ *         start, -3 if it hung or crashed
+ */
+int RunPhase(const std::string &phase, const std::string &log_path) {
+  ctp::SystemInfo::Setenv(kPhaseEnv, "1", 1);
+  ctp::SpawnedProcess proc = ctp::SystemInfo::SpawnProcess(
+      ctp::SystemInfo::GetExecutablePath(), {phase}, log_path);
+  ctp::SystemInfo::Unsetenv(kPhaseEnv);
+  if (!proc.valid) return -1;
+  int rc = 0;
+  if (!ctp::SystemInfo::WaitForChild(proc, 120 * 1000, &rc)) return -3;
+  return rc;
+}
+
+/**
+ * Connect to the daemon as a CTE client on the given pool.
+ * @param pool_major pool id major of the composed CTE pool
+ * @return the client, or nullptr if init failed
+ */
+clio::cte::core::Client *ConnectCte(clio::run::u32 pool_major) {
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
+    return nullptr;
+  }
+  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) return nullptr;
+  auto *cte = CLIO_CTE_CLIENT;
+  cte->Init(clio::run::PoolId(pool_major, 0));
+  return cte;
+}
+
+/**
+ * Time-search one tag's blobs.
+ * @param cte CTE client
+ * @param tag tag name (a regex)
+ * @return the hits, in ascending last_modified_ order
+ */
+std::vector<clio::cte::core::TemporalSearchResult> SearchTimes(
+    clio::cte::core::Client *cte, const std::string &tag) {
+  auto search = cte->AsyncTemporalSearch(tag, ".*", 0, 0, 0,
+                                         clio::run::PoolQuery::Local());
+  search.Wait();
+  return search->results_;
+}
+
+/** Pool and tag shared by the BlobTimes case and its phases. */
+constexpr clio::run::u32 kTimesPool = 703;
+constexpr const char *kTimesTag = "times_tag";
+
+TEST_CASE("TimesPhaseWrite - one blob in the snapshot, one in the WAL",
+          "[cli][cte][restart][phase]") {
+  if (!InPhaseChild()) return;
+  auto *cte = ConnectCte(kTimesPool);
+  REQUIRE(cte != nullptr);
+  auto tag = cte->AsyncGetOrCreateTag(kTimesTag);
+  tag.Wait();
+  REQUIRE(tag->GetReturnCode() == 0);
+  REQUIRE(PutFill(cte, tag->tag_id_, "in_snapshot", 0, 4096, 's') == 0);
+  auto flush = cte->AsyncFlushMetadata(clio::run::PoolQuery::Local(), 0);
+  flush.Wait();
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  REQUIRE(PutFill(cte, tag->tag_id_, "in_wal", 0, 4096, 'w') == 0);
+  REQUIRE(SearchTimes(cte, kTimesTag).size() == 2);
+}
+
+TEST_CASE("TimesPhaseRead - both blobs are found by time, in write order",
+          "[cli][cte][restart][phase]") {
+  if (!InPhaseChild()) return;
+  auto *cte = ConnectCte(kTimesPool);
+  REQUIRE(cte != nullptr);
+  auto hits = SearchTimes(cte, kTimesTag);
+  INFO("TemporalSearch hits after restart: " << hits.size());
+  REQUIRE(hits.size() == 2);
+  REQUIRE(hits[0].blob_name_ == "in_snapshot");
+  REQUIRE(hits[1].blob_name_ == "in_wal");
+  REQUIRE(hits[0].last_modified_ < hits[1].last_modified_);
+}
+
+TEST_CASE("BlobTimes - restored blobs keep their write times",
+          "[cli][cte][restart]") {
+  constexpr unsigned kPort = 10605;
+  const fs::path work_dir = fs::temp_directory_path() / "cte_blob_times";
+  fs::remove_all(work_dir);
+  fs::create_directories(work_dir);
+  SetTestEnv(work_dir);
+  const fs::path compose_yaml = work_dir / "compose.yaml";
+  {
+    std::ofstream f(compose_yaml);
+    f << "compose:\n"
+         "  - mod_name: clio_cte_core\n"
+         "    pool_name: \"cte_times_test\"\n"
+         "    pool_query: local\n"
+         "    pool_id: \"" << kTimesPool << ".0\"\n"
+         "    restart: true\n"
+         "    storage:\n"
+         "      - path: " << (work_dir / "disk.bin").string() << "\n"
+         "        bdev_type: file\n"
+         "        capacity_limit: 64mb\n"
+         "    dpe:\n"
+         "      dpe_type: random\n"
+         "    performance:\n"
+         "      metadata_log_path: " << (work_dir / "meta_log").string()
+      << "\n";
+  }
+  const std::string phase_log = (work_dir / "phase.log").string();
+
+  // --- Phase 1: one blob in the snapshot, one only in the WAL.
+  clio::run::test::RuntimeServer server;
+  REQUIRE(server.Start(kPort));
+  REQUIRE(server.WaitForReady());
+  REQUIRE(RunCliTimed({"compose", compose_yaml.string()}, 60) == 0);
+  const int write_rc = RunPhase("TimesPhaseWrite", phase_log);
+  INFO("write phase output: " << Slurp(phase_log));
+  REQUIRE(write_rc == 0);
+  REQUIRE(RunCliTimed({"stop", "--grace-period", "2000"}, 90) == 0);
+  WaitForExit(server);
+  server.Stop();
+
+  // --- Phase 2: restart and restore (same restart-log handling as
+  // CorruptRestore: the compose with `restart: true` must run the restore).
+  fs::remove(work_dir / "restart_log.bin");
+  clio::run::test::RuntimeServer server2;
+  REQUIRE(server2.Start(kPort));
+  REQUIRE(server2.WaitForReady());
+  REQUIRE(RunCliTimed({"compose", compose_yaml.string()}, 60) == 0);
+
+  // --- Phase 3: a fresh client finds both blobs by time, in write order.
+  const int read_rc = RunPhase("TimesPhaseRead", phase_log);
+  INFO("read phase output: " << Slurp(phase_log));
+  REQUIRE(read_rc == 0);
+
+  REQUIRE(RunCliTimed({"stop", "--grace-period", "2000"}, 90) == 0);
+  WaitForExit(server2);
+  server2.Stop();
+  fs::remove_all(work_dir);
+}
+
+
 TEST_CASE("PutBlobRollback - a failed data write leaves the blob committed",
           "[cli][cte][putblob]") {
   constexpr unsigned kPort = 10604;
   constexpr size_t kHead = 4096;               // committed bytes
   constexpr size_t kGrow = 4 * 1024 * 1024;    // append that will fail
-  constexpr rlim_t kFsizeLimit = 1024 * 1024;  // writes past 1 MiB fail
+  constexpr uint64_t kFsizeLimit = 1024 * 1024;  // writes past 1 MiB fail
   const fs::path work_dir = fs::temp_directory_path() / "cte_putblob_rollback";
   fs::remove_all(work_dir);
   fs::create_directories(work_dir);
@@ -337,7 +467,7 @@ TEST_CASE("PutBlobRollback - a failed data write leaves the blob committed",
 
   // Ignored dispositions survive exec: the daemon gets EFBIG, not a SIGXFSZ
   // that would kill it, once it writes past its file-size limit.
-  signal(SIGXFSZ, SIG_IGN);
+  ctp::SystemInfo::IgnoreFileSizeSignal();
   clio::run::test::RuntimeServer server;
   REQUIRE(server.Start(kPort));
   REQUIRE(server.WaitForReady());
@@ -364,10 +494,9 @@ TEST_CASE("PutBlobRollback - a failed data write leaves the blob committed",
   // Cap the daemon's file size below where the append will land.
   // Lower only the soft limit (EFBIG is driven by it): an unprivileged
   // process cannot raise a hard limit back up afterwards.
-  struct rlimit orig;
-  REQUIRE(prlimit(server.Pid(), RLIMIT_FSIZE, nullptr, &orig) == 0);
-  struct rlimit lim = {kFsizeLimit, orig.rlim_max};
-  REQUIRE(prlimit(server.Pid(), RLIMIT_FSIZE, &lim, nullptr) == 0);
+  uint64_t orig = 0;
+  REQUIRE(ctp::SystemInfo::SetProcessFileSizeLimit(server.Pid(), kFsizeLimit,
+                                                   &orig));
   REQUIRE(PutFill(cte, tag_id, "blob", kHead, kGrow, 'b') != 0);
 
   // The failed append must not have grown the blob, and the committed bytes
@@ -381,7 +510,7 @@ TEST_CASE("PutBlobRollback - a failed data write leaves the blob committed",
                       [](char c) { return c == 'a'; }));
 
   // Lift the limit: the same append now succeeds.
-  REQUIRE(prlimit(server.Pid(), RLIMIT_FSIZE, &orig, nullptr) == 0);
+  REQUIRE(ctp::SystemInfo::SetProcessFileSizeLimit(server.Pid(), orig));
   REQUIRE(PutFill(cte, tag_id, "blob", kHead, kGrow, 'b') == 0);
   REQUIRE(blob_size() == kHead + kGrow);
 
@@ -390,6 +519,5 @@ TEST_CASE("PutBlobRollback - a failed data write leaves the blob committed",
   server.Stop();
   fs::remove_all(work_dir);
 }
-#endif  // __linux__
 
 SIMPLE_TEST_MAIN()

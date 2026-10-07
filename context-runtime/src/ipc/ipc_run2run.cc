@@ -45,6 +45,7 @@ extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 #include <clio_runtime/singletons.h>
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
 #include <clio_runtime/ipc/ipc_cpu2cpu_zmq.h>
+#include <clio_runtime/ipc/ipc_cpu2cpu.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/thread/thread_model_manager.h>
 
@@ -750,6 +751,97 @@ void IpcManagerRun2Run::ReplayDeferredRecv() {
     for (const auto &task_info : d.archive.GetTaskInfos()) {
       RecvInHandleOne(ipc_manager, pool_manager, task_info, d.archive, d.transport);
     }
+  }
+}
+
+// =============================================================================
+// Deferred CLIENT requests (issue #1039)
+// =============================================================================
+
+void IpcManagerRun2Run::DeferClientRecv(clio::run::LoadTaskArchive &&archive,
+                                        clio::run::IpcMode mode,
+                                        const ctp::lbm::ClientInfo &recv_info,
+                                        ctp::lbm::Transport *transport) {
+  const auto &infos = archive.GetTaskInfos();
+  HLOG(kInfo,
+       "[ClientRecv] holding a client request for pool {} method {} (client "
+       "pid {}): the pool is not (fully) created on this node yet",
+       infos.front().pool_id_, infos.front().method_id_,
+       infos.front().task_id_.pid_);
+  std::lock_guard<std::mutex> lk(deferred_client_mutex_);
+  deferred_client_recv_.push_back(
+      DeferredClientRecv{std::move(archive), mode, recv_info, transport,
+                         std::chrono::steady_clock::now()});
+  deferred_client_count_.store(deferred_client_recv_.size(),
+                               std::memory_order_release);
+}
+
+void IpcManagerRun2Run::ReleaseDeferredClientRecv(DeferredClientRecv &d) {
+  // A TCP/IPC archive still holds its transport-owned bulk frames (nothing
+  // deserialized it); SHM archives own their bytes outright.
+  if (d.transport != nullptr) {
+    d.transport->ClearRecvHandles(d.archive);
+  }
+}
+
+void IpcManagerRun2Run::ReplayDeferredClientRecv() {
+  if (deferred_client_count_.load(std::memory_order_acquire) == 0) {
+    return;
+  }
+  auto *ipc_manager = CLIO_IPC;
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  std::list<DeferredClientRecv> ready;
+  std::list<DeferredClientRecv> expired;
+  {
+    std::lock_guard<std::mutex> lk(deferred_client_mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = deferred_client_recv_.begin();
+         it != deferred_client_recv_.end();) {
+      const auto &info = it->archive.GetTaskInfos().front();
+      if (pool_manager->IsClientAdmissible(info.pool_id_)) {
+        ready.splice(ready.end(), deferred_client_recv_, it++);
+      } else if (std::chrono::duration<float>(now - it->arrived).count() >=
+                 kDeferredRecvTimeoutSec) {
+        expired.splice(expired.end(), deferred_client_recv_, it++);
+      } else {
+        ++it;
+      }
+    }
+    deferred_client_count_.store(deferred_client_recv_.size(),
+                                 std::memory_order_release);
+  }
+  for (auto &d : expired) {
+    const auto &info = d.archive.GetTaskInfos().front();
+    HLOG(kError,
+         "[ClientRecv] dropping a client request for pool {} method {} "
+         "(client pid {}): the pool was never created here in {} s",
+         info.pool_id_, info.method_id_, info.task_id_.pid_,
+         static_cast<clio::run::u32>(kDeferredRecvTimeoutSec));
+    ReleaseDeferredClientRecv(d);
+  }
+  for (auto &d : ready) {
+    const auto &info = d.archive.GetTaskInfos().front();
+    HLOG(kInfo,
+         "[ClientRecv] admitting a held client request for pool {} method {} "
+         "now that the pool exists",
+         info.pool_id_, info.method_id_);
+    if (d.mode != clio::run::IpcMode::kShm) {
+      clio::run::IpcCpu2CpuZmq::AdmitZmq(ipc_manager, d.mode, d.transport,
+                                         d.archive, d.recv_info);
+      continue;
+    }
+    // SHM requests normally execute inline on the worker that drains their
+    // shard; a held one goes through the shared ingress lane instead, like a
+    // TCP/IPC request, since no worker is draining on its behalf now.
+    clio::run::Future<clio::run::Task> f =
+        clio::run::IpcCpu2Cpu::AdmitShm(d.archive);
+    auto *worker_queues = ipc_manager->GetTaskQueue();
+    if (f.get() == nullptr || worker_queues == nullptr) {
+      continue;
+    }
+    auto &lane = worker_queues->GetLane(0, 0);
+    lane.Push(f);
+    ipc_manager->AwakenWorker(&lane);
   }
 }
 
@@ -1747,6 +1839,8 @@ void IpcManagerRun2Run::StartRecvThreads() {
     if (ipc_transport) ipc_transport->RegisterEventManager(client_recv_em_);
     HLOG(kInfo, "[ClientRecvThread] started");
     while (!recv_shutdown_.load(std::memory_order_acquire)) {
+      // issue #1039: admit client requests that arrived before their pool.
+      ReplayDeferredClientRecv();
       clio::run::u32 tasks_received = 0;
       bool did_work = clio::run::IpcCpu2CpuZmq::RecvIn(ipc_manager,
                                                        tasks_received);
@@ -1771,6 +1865,14 @@ void IpcManagerRun2Run::StopRecvThreads() {
   recv_shutdown_.store(true, std::memory_order_release);
   if (peer_recv_thread_.joinable()) peer_recv_thread_.join();
   if (client_recv_thread_.joinable()) client_recv_thread_.join();
+  // Requests still held for a pool that never appeared: release their
+  // transport-owned frames before the transports go away.
+  std::lock_guard<std::mutex> lk(deferred_client_mutex_);
+  for (auto &d : deferred_client_recv_) {
+    ReleaseDeferredClientRecv(d);
+  }
+  deferred_client_recv_.clear();
+  deferred_client_count_.store(0, std::memory_order_release);
 }
 
 }  // namespace clio::run

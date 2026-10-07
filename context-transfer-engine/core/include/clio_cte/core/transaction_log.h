@@ -142,6 +142,9 @@ struct TxnCreateNewBlob {
   clio::run::u32 tag_minor_;
   std::string blob_name_;
   float score_;
+  /** Wall-clock ns of the create (issue #796); 0 = not recorded. Trailing
+   *  field: an older runtime ignores it, and records without it read 0. */
+  clio::run::u64 wall_ns_ = 0;
 };
 
 /** Payload: extend (or replace) blob blocks */
@@ -150,6 +153,9 @@ struct TxnExtendBlob {
   clio::run::u32 tag_minor_;
   std::string blob_name_;
   std::vector<TxnExtendBlobBlock> new_blocks_;
+  /** Wall-clock ns of the content change (issue #796); 0 when the record
+   *  only moves or restores the layout. Trailing, as in TxnCreateNewBlob. */
+  clio::run::u64 wall_ns_ = 0;
 };
 
 /** Payload: replace one replica's block layout (issue #886) */
@@ -306,6 +312,7 @@ class TransactionLog {
     WriteU32(buffer_, txn.tag_minor_);
     WriteString(buffer_, txn.blob_name_);
     WriteFloat(buffer_, txn.score_);
+    WriteU64(buffer_, txn.wall_ns_);
     WriteRecord(type, buffer_);
   }
 
@@ -323,6 +330,7 @@ class TransactionLog {
       WriteU64(buffer_, blk.target_offset_);
       WriteU64(buffer_, blk.size_);
     }
+    WriteU64(buffer_, txn.wall_ns_);
     WriteRecord(type, buffer_);
   }
 
@@ -618,6 +626,7 @@ class TransactionLog {
     txn.tag_minor_ = ReadU32(data, off);
     txn.blob_name_ = ReadString(data, off);
     txn.score_ = ReadFloat(data, off);
+    txn.wall_ns_ = ReadTrailingU64(data, off);
     return txn;
   }
 
@@ -637,6 +646,7 @@ class TransactionLog {
       txn.new_blocks_[i].target_offset_ = ReadU64(data, off);
       txn.new_blocks_[i].size_ = ReadU64(data, off);
     }
+    txn.wall_ns_ = ReadTrailingU64(data, off);
     return txn;
   }
 
@@ -878,6 +888,18 @@ class TransactionLog {
     std::memcpy(&val, data.data() + off, sizeof(val));
     off += sizeof(val);
     return val;
+  }
+  /**
+   * Read an optional trailing u64: a field appended to a record type after
+   * records without it were already written (issue #796).
+   * @param data the record payload
+   * @param off in/out read offset
+   * @return the value, or 0 when the record ends before it
+   */
+  static clio::run::u64 ReadTrailingU64(const std::vector<char> &data,
+                                        size_t &off) {
+    if (data.size() < off + sizeof(clio::run::u64)) return 0;
+    return ReadU64(data, off);
   }
   static float ReadFloat(const std::vector<char> &data, size_t &off) {
     Need(data, off, sizeof(float));

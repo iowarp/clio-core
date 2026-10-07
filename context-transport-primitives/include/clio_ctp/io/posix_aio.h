@@ -109,6 +109,13 @@ class PosixAsyncIO : public AsyncIO {
   bool IsComplete(IoToken token, IoResult &result) override {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    auto done = done_.find(token);
+    if (done != done_.end()) {
+      result = done->second;
+      done_.erase(done);
+      return true;
+    }
+
     auto it = pending_.find(token);
     if (it == pending_.end()) return false;
 
@@ -137,6 +144,7 @@ class PosixAsyncIO : public AsyncIO {
       aio_cancel(regular_fd_, kv.second.get());
     }
     pending_.clear();
+    done_.clear();
 
     if (direct_fd_ >= 0) {
       close(direct_fd_);
@@ -150,6 +158,22 @@ class PosixAsyncIO : public AsyncIO {
 
   int GetEventFd() const override {
     return -1;  // POSIX AIO does not support eventfd
+  }
+
+ protected:
+  /** The kernel's per-request control block (POSIX struct aiocb). */
+  using ControlBlock = struct aiocb;
+
+  /**
+   * Hand one request to the kernel's POSIX AIO. Virtual so tests can make it
+   * refuse with EAGAIN, which macOS does once a process has more than
+   * kern.aio.process_max (16 by default) requests outstanding.
+   * @param cb the control block to submit
+   * @param is_write true for aio_write, false for aio_read
+   * @return 0 on success, else -1 with errno set
+   */
+  virtual int StartAio(ControlBlock *cb, bool is_write) {
+    return is_write ? aio_write(cb) : aio_read(cb);
   }
 
  private:
@@ -167,19 +191,52 @@ class PosixAsyncIO : public AsyncIO {
     cb->aio_nbytes = size;
     cb->aio_offset = offset;
 
-    int ret;
-    if (is_write) {
-      ret = aio_write(cb.get());
-    } else {
-      ret = aio_read(cb.get());
+    if (StartAio(cb.get(), is_write) == 0) {
+      pending_[token] = std::move(cb);
+      return token;
     }
-
-    if (ret != 0) {
+    if (errno != EAGAIN) {
       return kInvalidIoToken;
     }
-
-    pending_[token] = std::move(cb);
+    // Issue #1156: EAGAIN means the AIO request limit is reached, not that
+    // the I/O is bad. Failing it surfaced as a bdev write error with 0 bytes
+    // (safe_bdev fans one put out to more members than macOS allows), so do
+    // the I/O synchronously and report it through IsComplete as usual.
+    done_[token] = SyncIO(fd, buffer, size, offset, is_write);
     return token;
+  }
+
+  /**
+   * Perform one request synchronously, retrying short transfers.
+   * @param fd file descriptor
+   * @param buffer I/O buffer
+   * @param size bytes to transfer
+   * @param offset file offset
+   * @param is_write true to write, false to read
+   * @return bytes transferred and errno, in AsyncIO's result form
+   */
+  static IoResult SyncIO(int fd, void *buffer, size_t size, int64_t offset,
+                         bool is_write) {
+    IoResult result;
+    char *p = static_cast<char *>(buffer);
+    size_t done = 0;
+    while (done < size) {
+      ssize_t n = is_write ? pwrite(fd, p + done, size - done,
+                                    static_cast<off_t>(offset + done))
+                           : pread(fd, p + done, size - done,
+                                   static_cast<off_t>(offset + done));
+      if (n < 0 && errno == EINTR) continue;
+      if (n < 0) {
+        result.bytes_transferred = -1;
+        result.error_code = errno;
+        return result;
+      }
+      if (n == 0) break;  // read past end of file
+      done += static_cast<size_t>(n);
+    }
+    result.bytes_transferred = static_cast<ssize_t>(done);
+    result.error_code = 0;
+    return result;
   }
 
   /**
@@ -207,6 +264,7 @@ class PosixAsyncIO : public AsyncIO {
   std::atomic<IoToken> next_token_;
   std::mutex mutex_;
   std::unordered_map<IoToken, std::unique_ptr<struct aiocb>> pending_;
+  std::unordered_map<IoToken, IoResult> done_;  /**< completed synchronously */
 };
 
 }  // namespace ctp

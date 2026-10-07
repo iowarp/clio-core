@@ -37,6 +37,18 @@ target_link_libraries(test_qtable_predictor_exec
 )
 add_test(NAME test_qtable_predictor COMMAND test_qtable_predictor_exec)
 
+# Codec selection consistency: estimator presets/ids match the executor's,
+# model paths load from compose YAML (#1189).
+add_executable(test_codec_selection_exec
+  test_codec_selection.cc
+)
+target_link_libraries(test_codec_selection_exec
+  clio::cte::compressor_runtime
+  clio::cte::core_client   # Context / CompressorConfig headers
+  ctp::compress
+)
+add_test(NAME test_codec_selection COMMAND test_codec_selection_exec)
+
 # NOTE: test_compression_contention has been moved to the end of this file
 # as a standalone benchmark without ChiMod runtime dependency
 

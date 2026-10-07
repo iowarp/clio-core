@@ -298,6 +298,19 @@ bool WorkOrchestrator::SpawnWorkerThreads() {
     }
   }
 
+  // issue #768: publish the net workers' lanes now that they exist. The
+  // schedulers pick the net workers in DivideWorkers, which runs before this
+  // lane mapping, so registering there stored null lanes: EnqueueNetTask then
+  // never woke the net worker and every response waited for its next timer
+  // tick (~15.6 ms on Windows).
+  if (scheduler_) {
+    Worker *send_worker = scheduler_->GetNetSendWorker();
+    Worker *recv_worker = scheduler_->GetNetRecvWorker();
+    if (send_worker && recv_worker) {
+      ipc->SetNetLane(send_worker->GetLane(), recv_worker->GetLane());
+    }
+  }
+
   // Assign GPU lanes only to the designated GPU worker
   size_t num_gpus = ipc->GetGpuQueueCount();
   if (num_gpus > 0 && scheduler_) {
@@ -579,3 +592,16 @@ void WorkOrchestrator::RetireWorker(Worker *worker) {
 }
 
 }  // namespace clio::run
+
+/**
+ * Number of workers the in-process runtime owns (0 without one). A plain C
+ * symbol so simple_test.h can reference it weakly: the leak check needs it
+ * to tell an elastic worker spawn from a leak, but must not make tests that
+ * do not link the runtime fail to link (#1208).
+ * @return the runtime's current worker count
+ */
+extern "C" size_t clio_runtime_worker_count() {
+  auto *orch = CLIO_WORK_ORCHESTRATOR;
+  return orch == nullptr ? 0
+                         : static_cast<size_t>(orch->GetTotalWorkerCount());
+}

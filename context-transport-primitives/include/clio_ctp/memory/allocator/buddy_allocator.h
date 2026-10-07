@@ -39,6 +39,7 @@
 #include "clio_ctp/data_structures/ipc/slist_pre.h"
 #include "clio_ctp/data_structures/ipc/rb_tree_pre.h"
 #include "clio_ctp/thread/lock/mutex.h"
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -337,10 +338,15 @@ class _BuddyAllocator : public Allocator {
     constexpr size_t kAlign = alignof(PageT);
     requested_size = (requested_size + kAlign - 1) & ~(kAlign - 1);
 
-    if (requested_size <= kSmallThreshold) {
-      return AllocateSmall(requested_size);
+    OffsetPtr<> result = AllocateBySize(requested_size);
+    // Issue #646: freed pages are never merged with their neighbours, so a
+    // heap that is almost entirely free can still be too fragmented for one
+    // large request. Merge adjacent free pages and retry once, only on the
+    // path that would otherwise fail.
+    if (result.IsNull() && CoalesceFreePages()) {
+      result = AllocateBySize(requested_size);
     }
-    return AllocateLarge(requested_size);
+    return result;
   }
 
   /**
@@ -532,6 +538,85 @@ class _BuddyAllocator : public Allocator {
       auto node = list.pop(this);
       if (node.IsNull()) return 0;
       return node.shm_.off_.load();
+    }
+  }
+
+  /**
+   * Route an aligned request to the small or large path.
+   * @param size the request, already rounded to kMinSize and alignment
+   * @return the allocation, or null if no free page or heap space fits
+   */
+  CTP_CROSS_FUN OffsetPtr<> AllocateBySize(size_t size) {
+    if (size <= kSmallThreshold) {
+      return AllocateSmall(size);
+    }
+    return AllocateLarge(size);
+  }
+
+  /**
+   * Merge physically adjacent free pages (issue #646). Every free page is
+   * drained from the free lists, sorted by offset, and runs where one page
+   * ends exactly where the next begins are refiled as one page. Only
+   * free-list pages are touched, so gaps in the heap (arena tails, region
+   * headers) are never walked. Host only: device code has no allocator to
+   * sort with, and leaves the lists as they are.
+   * @return true if at least one merge happened
+   */
+  CTP_CROSS_FUN bool CoalesceFreePages() {
+#if CTP_IS_HOST
+    std::vector<size_t> pages;
+    for (size_t i = 0; i < kMaxSmallPages; ++i) DrainList(small_pages_[i], pages);
+    for (size_t i = 0; i < kMaxLargePages; ++i) DrainList(large_pages_[i], pages);
+    std::sort(pages.begin(), pages.end());
+    bool merged = false;
+    size_t i = 0;
+    while (i < pages.size()) {
+      size_t run_start = pages[i];
+      size_t run_end = run_start + sizeof(PageT) + OffsetToPage(run_start)->GetSize();
+      size_t j = i + 1;
+      while (j < pages.size() && pages[j] == run_end) {
+        run_end += sizeof(PageT) + OffsetToPage(pages[j])->GetSize();
+        merged = true;
+        ++j;
+      }
+      RefileFreePage(run_start, run_end - run_start);
+      i = j;
+    }
+    return merged;
+#else
+    return false;
+#endif
+  }
+
+  /**
+   * Pop every page of a free list into `out`.
+   * @param list the free list (left empty)
+   * @param out receives the pages' offsets
+   */
+  void DrainList(PageListT &list, std::vector<size_t> &out) {
+    for (size_t off = PopFromList(list); off != 0; off = PopFromList(list)) {
+      out.push_back(off);
+    }
+  }
+
+  /**
+   * File a free page of `total_size` bytes (header included) on the list its
+   * data size belongs to. Unlike AddRemainderToFreeList it never drops the
+   * page: a merged run is at least as large as the free page it started from.
+   * @param page_offset the page's offset
+   * @param total_size header plus data bytes
+   */
+  CTP_CROSS_FUN void RefileFreePage(size_t page_offset, size_t total_size) {
+    size_t data_size = total_size - sizeof(PageT);
+    PageT *page = OffsetToPage(page_offset);
+    page->size_ = data_size;
+    page->MarkFree();
+    if (data_size <= kSmallThreshold) {
+      EmplaceToList(small_pages_[GetSmallPageListIndexForFree(data_size)],
+                    page_offset);
+    } else {
+      EmplaceToList(large_pages_[GetLargePageListIndexForFree(data_size)],
+                    page_offset);
     }
   }
 

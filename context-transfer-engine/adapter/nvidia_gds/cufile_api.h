@@ -45,9 +45,10 @@
  * have access to the file, you may request a copy from help@hdfgroup.org.   *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-#ifndef CLIO_CTE_ADAPTER_STDIO_H
-#define CLIO_CTE_ADAPTER_STDIO_H
+#ifndef CLIO_CTE_ADAPTER_NVIDIA_GDS_CUFILE_API_H_
+#define CLIO_CTE_ADAPTER_NVIDIA_GDS_CUFILE_API_H_
 
+#include <cuda_runtime.h>
 #include <cufile.h>
 #include <dlfcn.h>
 
@@ -160,8 +161,5 @@ class CuFileApi : public RealApi {
 // Singleton macros
 #define CLIO_CTE_CUFILE_API \
   ctp::Singleton<::clio::cae::CuFileApi>::GetInstance()
-#define CLIO_CTE_STDIO_API \
-  ctp::Singleton<::clio::cae::StdioApi>::GetInstance()
-#define CLIO_CTE_STDIO_API_T clio::cae::StdioApi *
 
-#endif  // CLIO_CTE_ADAPTER_STDIO_H
+#endif  // CLIO_CTE_ADAPTER_NVIDIA_GDS_CUFILE_API_H_
