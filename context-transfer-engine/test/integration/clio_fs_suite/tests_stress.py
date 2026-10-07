@@ -612,16 +612,22 @@ def _torn_unsynced(t, writer, inflight, durable=0, k=None, nfiles=None):
   if not t:
     return False
   hw, hg, rw, rg = t
-  if hw == writer and rw == 0 and rg == 0:
-    # Head intact, rest zeros: only legal for a file with NO fsynced
-    # version -- over a durable one the zeros would be lost fsynced bytes.
+  if (hw == writer and rw == 0 and rg == 0) or \
+     (hw == 0 and hg == 0 and rw == writer):
+    # One part the unsynced write, the rest zeros: only legal for a file
+    # with NO fsynced version -- over a durable one the zeros would be lost
+    # fsynced bytes. Either part may be the one that landed: a write is
+    # split over extents that can live on different tiers, and a crash
+    # keeps whichever were persistent (seen: a block's tail kept, its head
+    # gone, after two adjacent nodes crashed).
+    g = hg if hw == writer else rg
     if durable != 0:
       return False
-    if hg == inflight:
+    if g == inflight:
       return True
     if k is None or nfiles is None:
       return False
-    return hg <= inflight and (hg - (k + 1)) % nfiles == 0
+    return g <= inflight and (g - (k + 1)) % nfiles == 0
   if hw != writer or rw != writer or rg == hg:
     return False
   # Either half may be the newer one: which part of an unsynced write

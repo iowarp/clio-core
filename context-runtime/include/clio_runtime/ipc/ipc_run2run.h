@@ -163,6 +163,12 @@ struct OriginProgress {
   // PROBED: QueryTaskProgress is itself an admin cross-node task, so probing
   // admin origins would recurse (issue #896).
   bool probe_eligible = true;
+  // #1197: true from registration until SendIn has transmitted the last
+  // replica. A Gone verdict (dead node, probe) that lands meanwhile must not
+  // complete and release the origin under the sender's feet; it is parked in
+  // deferred_gone and applied by FinishOriginSend.
+  bool sending = false;
+  std::vector<clio::run::u32> deferred_gone;
 };
 
 /** A replica the origin is still waiting on, to be probed via QueryTaskProgress. */
@@ -374,6 +380,52 @@ class IpcManagerRun2Run {
                               clio::run::u64 target_node_id,
                               clio::run::shared_ptr<clio::run::Task> origin_task);
 
+  /** What SendIn decided for one replica once its target was resolved. */
+  enum class SendInAction : clio::run::u32 {
+    kSkip,      /**< no target (unresolvable query / unknown host) */
+    kFailFast,  /**< target dead and the origin wants no retry */
+    kRetry,     /**< target dead; wait in send_in_retry_ */
+    kTransmit   /**< target alive; serialize and send */
+  };
+
+  /** One replica's plan: the copy to send, where, and how (#1185). */
+  struct SendInPlan {
+    clio::run::shared_ptr<clio::run::Task> task_copy;
+    clio::run::u64 target_node_id = kInvalidNodeId;
+    SendInAction action = SendInAction::kSkip;
+  };
+
+  /**
+   * Plan one replica of an origin: resolve its target node, create and stamp
+   * the task copy (also stored in origin_task->Subtasks()[replica_idx]) and
+   * decide skip / fail-fast / retry / transmit. Sends nothing and never
+   * completes the origin, so SendIn can register progress before acting.
+   * @param ipc_manager the runtime IPC manager
+   * @param pool_manager the pool manager (container + node lookups)
+   * @param origin_task the origin task being fanned out
+   * @param query the pool query of this replica
+   * @param replica_idx the replica's index in the origin's query list
+   * @param send_map_key the origin's send_map_ key (its address)
+   * @return the plan for this replica
+   */
+  SendInPlan SendInPlanReplica(clio::run::IpcManager *ipc_manager,
+                               clio::run::PoolManager *pool_manager,
+                               clio::run::shared_ptr<clio::run::Task> origin_task,
+                               const clio::run::PoolQuery &query,
+                               size_t replica_idx, size_t send_map_key);
+
+  /**
+   * Act on a SendIn plan: count fail-fast replicas (completing the origin
+   * when every replica is accounted for), queue retries, transmit the rest.
+   * @param ipc_manager the runtime IPC manager
+   * @param origin_task the origin task being fanned out
+   * @param send_map_key the origin's send_map_ key
+   * @param plan per-replica plans from SendInPlanReplica
+   */
+  void SendInExecutePlan(clio::run::IpcManager *ipc_manager,
+                         clio::run::shared_ptr<clio::run::Task> origin_task,
+                         size_t send_map_key, std::vector<SendInPlan> &plan);
+
   // ---------------------------------------------------------------------------
   // SendOut sub-functions
   // ---------------------------------------------------------------------------
@@ -502,11 +554,22 @@ class IpcManagerRun2Run {
   std::chrono::steady_clock::time_point last_progress_scan_{};
 
   /**
-   * Register an origin's replicas for progress tracking (called from SendIn).
+   * Register an origin's replicas for progress tracking (called from SendIn
+   * BEFORE any replica is transmitted, #1185). A no-op when the origin is no
+   * longer in send_map_, so a completed origin can never leave an orphan.
    * probe_eligible=false registers the origin for dead-node completion but
    * excludes it from QueryTaskProgress probing (admin-pool origins: the probe
    * is itself an admin cross-node task and would recurse).
    */
+  /**
+   * Mark the origin's send as finished (#1197): clears OriginProgress::sending
+   * and applies every Gone verdict parked while the replicas were being
+   * transmitted. Called by SendIn after its last transmit, on the sending
+   * worker. A no-op when the origin already completed.
+   * @param net_key the origin's send_map_ key
+   */
+  void FinishOriginSend(size_t net_key);
+
   void RegisterOriginProgress(size_t net_key,
                               const std::vector<clio::run::u64> &replica_targets,
                               bool probe_eligible = true);

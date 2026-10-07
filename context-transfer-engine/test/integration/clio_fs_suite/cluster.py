@@ -286,6 +286,20 @@ class Cluster:
            f'--new-id {new_id}')
     return sh(host, cmd, timeout=1830)
 
+  def rebuild_disk_inplace(self, host, k):
+    """Rebuild failed member k of `host`'s array onto the SAME member pool
+    (the operator swapped the drive at the same path while the node was
+    down, so the member pool now fronts a blank disk): RecoverBdev with the
+    failed id as the new id. Returns (rc, output) of the tool."""
+    lr = self.local_root
+    mid = f'{SAFE_MEMBER_POOL_MAJOR + k}.0'
+    cap = self.safe_member_gb() << 30
+    cmd = (f'{self.env_prefix()} timeout 1800 '
+           f'{self.bin_dir}/clio_safe_bdev_recover --array {SAFE_POOL_ID} '
+           f'--failed {mid} --member {self.safe_member_path(k)} '
+           f'--capacity {cap} --new-id {mid}')
+    return sh(host, cmd, timeout=1830)
+
   def revive_disk(self, host, k):
     """Undo kill_disk: the member's device answers again."""
     return sh(host, f'rm -f {self.safe_member_path(k)}.fail', timeout=30)

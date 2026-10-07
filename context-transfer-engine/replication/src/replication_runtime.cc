@@ -853,6 +853,22 @@ clio::run::TaskResume Runtime::GetBlob(
       // interposition must not invent its own error space.
       CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
                              task.template Cast<clio::run::Task>()));
+      if (task->GetReturnCode() != 0) {
+        // Which answer a read nobody could serve ends with, and where it
+        // was asked (#1169: a double node loss took ~80 s per read to fail).
+        // Rate-limited: every page of a dead pair lands here.
+        static std::atomic<clio::run::u64> logged{0};
+        const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
+        if (k < 8 || k % 256 == 0) {
+          const clio::run::u32 owner = OwnerOf(task->tag_id_, blob_name);
+          HLOG(kWarning, "replication: {}.{}/{} [{}, {}) served by no copy; "
+               "core rc {} at container {} (owner {}, owner alive {}; {} "
+               "such reads so far)", task->tag_id_.major_,
+               task->tag_id_.minor_, blob_name, req_lo, end,
+               task->GetReturnCode(), container_id_, owner,
+               ContainerAlive(owner), k + 1);
+        }
+      }
       CLIO_CO_RETURN;
     }
 

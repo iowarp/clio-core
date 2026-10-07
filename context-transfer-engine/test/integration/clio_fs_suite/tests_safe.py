@@ -14,14 +14,17 @@ than max_failures members. Beyond that, reads may FAIL (EIO) but must never
 return wrong bytes.
 """
 
+import os
+import random
 import threading
 import time
 
-from cluster import SAFE_MEMBERS, SAFE_PARITY, parallel
-from suite import test
+from cluster import SAFE_MEMBERS, SAFE_PARITY, AgentConn, parallel, sh
+from suite import TestFailure, test
 from tests_fault import restart_cluster
-from tests_stress import (CORRUPT, FILE_BLOCKS, FOREIGN, ZERO,
-                          _check_filesets)
+from tests_stress import (CORRUPT, FILE_BLOCKS, FOREIGN, ZERO, _apply,
+                          _check_filesets, _compare, _corrupt_blocks,
+                          _tier_mb, _tier_usage, _to_runs)
 
 
 def _writers(ctx, base, secs, tag):
@@ -390,6 +393,262 @@ def t_disk_replaced(ctx):
                   'after a crash restart with the replacement disk seated')
 
 
+def _log_has(cl, host, needle, wait_s=60):
+  """True if `host`'s runtime log (on the shared run dir) contains needle.
+
+  The daemon appends over NFS and the driver's view of the file lags its
+  writes by the attribute-cache time, so the file is re-read for up to
+  `wait_s` seconds before giving up.
+  """
+  deadline = time.time() + wait_s
+  while True:
+    try:
+      with open(cl.log_path(host, 'runtime'), errors='replace') as f:
+        if needle in f.read():
+          return True
+    except OSError:
+      pass
+    if time.time() >= deadline:
+      return False
+    time.sleep(2)
+
+
+@test('safe_rebuild_interrupted_then_crash', 'safe', min_nodes=2,
+      redeploy_after=True, timeout=5400)
+def t_rebuild_interrupted(ctx):
+  """A rebuild that does not get to finish. A data disk dies in every
+  node's array under writers and is replaced; on node1 the rebuild onto the
+  replacement stops part-way (the RECOVER_MAX_ROWS hook: the member stays
+  'recovering', as a crash mid-rebuild leaves it). node1 then loses a parity
+  disk too (max_failures down, one of them the half-built replacement) and is
+  SIGKILLed mid-write. Its restart must resume and finish the rebuild from
+  exactly k survivors while every other node keeps writing, and every
+  fsynced version must read back intact -- then with one more disk dead
+  per array, and after a crash restart of the whole cluster."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('ri')
+  ctx.ok(0, 'mkdir', path=base)
+  victim = cl.hosts[1 % n]
+  th, replies, logs, nfiles = _writers(ctx, base, 240, 'rebuildint')
+  time.sleep(15)
+  # node1's daemon restarts with the hook: its next rebuild stops after 8
+  # rows and leaves the member recovering.
+  cl.extra_env['CLIO_SAFE_BDEV_RECOVER_MAX_ROWS'] = '8'
+  try:
+    _bounce(ctx, victim, crash=False, down_s=5)
+  finally:
+    cl.extra_env.pop('CLIO_SAFE_BDEV_RECOVER_MAX_ROWS', None)
+  time.sleep(15)
+  for h in cl.hosts:
+    cl.kill_disk(h, 0)
+  time.sleep(15)
+  t0 = time.time()
+  res = parallel(lambda h: cl.replace_disk(h, 0), cl.hosts)
+  ctx.metrics['rebuild_s'] = round(time.time() - t0, 1)
+  bad = {h: r for h, r in zip(cl.hosts, res)
+         if isinstance(r, Exception) or r[0] != 0}
+  ctx.check(not bad, f'rebuild onto the replacement disk failed: '
+                     f'{ {h: str(r)[-400:] for h, r in bad.items()} }')
+  ctx.check(_log_has(cl, victim, 'rebuild interrupted (test hook)'),
+            f'{victim}: the rebuild was not interrupted by the hook')
+  # max_failures on node1: the half-built replacement and a parity disk.
+  cl.kill_disk(victim, SAFE_MEMBERS - 1)
+  time.sleep(10)
+  _bounce(ctx, victim, crash=True, down_s=20)
+  ctx.check(_log_has(cl, victim, 'resuming interrupted recovery'),
+            f'{victim}: restart did not resume the interrupted rebuild')
+  ctx.check(_log_has(cl, victim, 'completed on restart'),
+            f'{victim}: the resumed rebuild did not complete')
+  th.join(timeout=240 + 1200)
+  ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after an interrupted rebuild, a parity death and a crash')
+  for h in cl.hosts:  # one more per array: node1 is at max_failures again
+    cl.kill_disk(h, 1)
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after one more disk died behind the resumed rebuild')
+  restart_cluster(ctx, crash=True)
+  ctx.cl.agents.clear()
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after a crash restart with the resumed replacement seated')
+
+
+@test('safe_two_nodes_down_never_lies', 'safe', min_nodes=4,
+      redeploy_after=True, timeout=5400)
+def t_two_nodes_down(ctx):
+  """Two adjacent nodes -- a primary and the node that holds its remote
+  copies (container id + 1) -- are SIGKILLed at once while every node writes
+  fsynced record files. Data homed on the pair may be unreachable until they
+  return: a read from a survivor may fail (EIO) but must never return wrong
+  bytes, and writers elsewhere must keep going. Both come back 30 s later;
+  every fsynced version from every writer must then read back intact, and
+  again after a crash restart of the whole cluster."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('tn')
+  ctx.ok(0, 'mkdir', path=base)
+  # Fsynced files written before the outage, probed from a survivor during it.
+  names = [f'p{k}' for k in range(8)]
+  for nm in names:
+    ctx.ok(0, 'rec_write', timeout=900, path=f'{base}/{nm}', name=nm,
+           runs=[[0, FILE_BLOCKS]], writer=1, gen=1, fsync=True)
+  # Long enough to outlive the outage: the probes below take ~20 s per
+  # unreadable file, so the pair is back only ~3 min in.
+  th, replies, logs, nfiles = _writers(ctx, base, 300, 'twodown')
+  time.sleep(20)
+  down = [cl.hosts[n - 2], cl.hosts[n - 1]]
+  t_kill = time.time()
+  parallel(cl.kill_fuse, down)
+  parallel(cl.kill_runtime, down)
+  time.sleep(5)
+  lies, failed, ok = [], 0, 0
+  # Probe through a connection of its own: a node's agent serializes its
+  # calls, so a probe on node0's shared agent waited behind node0's 300 s
+  # writer call and that wait read as a 274 s stat (#1169). Each step is
+  # timed -- the stat, the first 4 KiB read, then the record scan -- so a
+  # slow one is named.
+  probe = AgentConn(cl.hosts[0], cl.agent_py, cl.env_prefix())
+  step_s = []
+  for nm in names[:3]:
+    path = f'{base}/{nm}'
+    t = time.time()
+    st = probe.call('stat', timeout=900, path=path)
+    t_stat = round(time.time() - t, 1)
+    t = time.time()
+    rd = probe.call('read_hex', timeout=900, path=path, off=0, length=4096)
+    t_read = round(time.time() - t, 1)
+    t = time.time()
+    r = probe.call('rec_scan', timeout=900, path=path, name=nm,
+                   nblocks=FILE_BLOCKS)
+    t_scan = round(time.time() - t, 1)
+    step_s.append([nm, t_stat, st.get('ok'), t_read, rd.get('ok'), t_scan,
+                   r.get('ok')])
+    if not r['ok']:
+      failed += 1  # an I/O error is an honest answer
+      continue
+    ok += 1
+    for start, count, w, g in r['ret']['runs']:
+      if w in (CORRUPT, FOREIGN, ZERO) or (w, g) != (1, 1):
+        lies.append((nm, start, count, w, g))
+  probe.close()
+  ctx.metrics.update({'files_readable_during_outage': ok,
+                      'files_failed_during_outage': failed,
+                      'probe_steps': step_s})
+  ctx.note(f'outage probes [file, stat s, ok, 4K read s, ok, scan s, ok]: '
+           f'{step_s}')
+  ctx.check(not lies, f'reads with two adjacent nodes down returned wrong '
+                      f'bytes: {lies[:6]}')
+  ctx.metrics['probe_s'] = round(time.time() - t_kill, 1)
+  time.sleep(5)
+  parallel(lambda h: cl.start_runtime(h), down)
+  ups = parallel(cl.runtime_up, down)
+  ctx.check(all(u is True for u in ups), f'runtime restart failed: {ups}')
+  time.sleep(3)
+  ms = parallel(cl.mount, down)
+  ctx.check(all(m is True for m in ms), f'remount failed: {ms}')
+  for h in down:
+    cl.agents.pop(h, None)
+  back_at = time.time()
+  ctx.metrics['outage_s'] = round(back_at - t_kill, 1)
+  # The filesystem must take writes again once the pair is back: one file
+  # checked from another node, and a second round of record writers whose
+  # every fsynced version is verified like the first round's.
+  p = ctx.p('after_return')
+  ctx.ok(0, 'write_file', path=p, size=8 << 20, seed=17, fsync=True)
+  v = ctx.ok(n - 1, 'verify_file', path=p, size=8 << 20, seed=17)
+  ctx.check(v['ok'], f'write after the pair returned: {v}')
+  base2 = ctx.p('tn_after')
+  ctx.ok(0, 'mkdir', path=base2)
+  th2, replies2, logs2, nfiles2 = _writers(ctx, base2, 60, 'twodown_after')
+  th.join(timeout=300 + 1200)
+  th2.join(timeout=60 + 600)
+  ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  ctx.metrics['writer_errors_after_return'] = _writer_errors(replies2, n)
+  ctx.metrics['writer_secs_after_return'] = round(time.time() - back_at, 1)
+  for i in range(n):  # what the failed rounds saw (first few per node)
+    errs = ((replies.get(i) or {}).get('ret') or {}).get('errors') or []
+    if errs:
+      ctx.note(f'node{i} first writer errors: {errs[:2]}')
+    errs2 = ((replies2.get(i) or {}).get('ret') or {}).get('errors') or []
+    if errs2:
+      ctx.note(f'node{i} writer errors after the return: {errs2[:2]}')
+  ctx.check(not any(ctx.metrics['writer_errors_after_return'].values()),
+            'writes failed after both nodes were back: '
+            f'{ctx.metrics["writer_errors_after_return"]}')
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after two adjacent nodes crashed and returned')
+  _check_filesets(ctx, base2, n, nfiles2, logs2, replies2,
+                  'for the writers started after the pair returned')
+  restart_cluster(ctx, crash=True)
+  ctx.cl.agents.clear()
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after a crash restart following the double node loss')
+  _check_filesets(ctx, base2, n, nfiles2, logs2, replies2,
+                  'after a crash restart, for the writers started after the '
+                  'return')
+
+
+@test('safe_chaos_disks_and_nodes', 'safe', min_nodes=3,
+      redeploy_after=True, timeout=5400)
+def t_chaos_disks_and_nodes(ctx):
+  """Random faults in a loop under fsynced record writers: a disk dies in
+  some node's array (never past max_failures per array), a dead disk comes
+  back or is replaced and rebuilt, a node is SIGKILLed or stopped and
+  brought back -- six rounds, in an order drawn from CLIO_SUITE_CHAOS_SEED
+  (default 7), so a failing run can be repeated. No array ever loses more
+  than it can cover, so every fsynced version must read back intact at the
+  end and after a crash restart of the whole cluster."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('ch')
+  ctx.ok(0, 'mkdir', path=base)
+  rng = random.Random(int(os.environ.get('CLIO_SUITE_CHAOS_SEED', '7')))
+  down = {h: set() for h in cl.hosts}      # members the array cannot use
+  replaced = {h: set() for h in cl.hosts}  # members rebuilt onto new disks
+  th, replies, logs, nfiles = _writers(ctx, base, 600, 'chaos')
+  time.sleep(20)
+  events = []
+  for rnd in range(6):
+    h = rng.choice(cl.hosts)
+    roll = rng.random()
+    if roll < 0.45 and len(down[h]) < SAFE_PARITY:
+      k = rng.choice([k for k in range(SAFE_MEMBERS)
+                      if k not in down[h] and k not in replaced[h]])
+      cl.kill_disk(h, k)
+      down[h].add(k)
+      events.append([rnd, h, 'kill_disk', k])
+    elif roll < 0.65 and down[h]:
+      k = rng.choice(sorted(down[h]))
+      if rng.random() < 0.5:
+        # The device answers again; the array keeps it faulty (its contents
+        # are stale), so it still counts against the budget.
+        cl.revive_disk(h, k)
+        events.append([rnd, h, 'revive_disk', k])
+      else:
+        rc, out = cl.replace_disk(h, k, gen=1 + len(replaced[h]))
+        ctx.check(rc == 0, f'round {rnd}: rebuild of member {k} on {h} '
+                           f'failed: {str(out)[-300:]}')
+        down[h].discard(k)
+        replaced[h].add(k)
+        events.append([rnd, h, 'replace_disk', k])
+    else:
+      crash = rng.random() < 0.5
+      _bounce(ctx, h, crash=crash, down_s=15)
+      events.append([rnd, h, 'crash' if crash else 'stop'])
+    ctx.note(f'round {rnd}: {events[-1]}')
+    time.sleep(45)
+  ctx.metrics['events'] = events
+  th.join(timeout=600 + 1200)
+  ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after six rounds of random disk and node faults')
+  restart_cluster(ctx, crash=True)
+  ctx.cl.agents.clear()
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after a crash restart following the chaos rounds')
+
+
 @test('safe_rolling_restart_degraded', 'safe', min_nodes=2,
       redeploy_after=True, timeout=7200)
 def t_rolling_restart_degraded(ctx):
@@ -423,3 +682,372 @@ def t_rolling_restart_degraded(ctx):
   ctx.cl.agents.clear()
   _check_filesets(ctx, base, n, nfiles, logs, replies,
                   'after the rolling restart and a full crash restart')
+
+
+# ---------------------------------------------------------------------------
+# Tiering under faults: overflow onto degraded arrays, crash, rebuild
+# ---------------------------------------------------------------------------
+def _ovf_nfiles(ctx):
+  """Number of 64 MiB record files per node that push the data through the
+  RAM and fast tiers onto the safe arrays. Same sizing as
+  stress_tier_overflow: every fsynced byte lands twice on the arrays (the
+  primary and its remote copy), so stay near 70% of one disk_gb array."""
+  per_node_mb = int(_tier_mb(ctx) * 1.5)
+  if len(ctx.hosts) > 1:
+    per_node_mb = min(per_node_mb, int(ctx.cl.disk_gb * 1024 * 0.7 / 2))
+  return max(2, per_node_mb // 64)
+
+
+def _ovf_verify(ctx, base, models, owned, reader_of, tag, tally, bad):
+  """Scan every node's files from reader_of(owner) and compare each with
+  its model. Differing and CORRUPT/FOREIGN block counts accumulate in
+  `tally`, the first differing blocks in `bad`; metrics get the verify
+  time and running count under `tag`. A file that cannot be read at all
+  fails the test: no array ever loses more than max_failures members here."""
+  lock = threading.Lock()
+
+  def one(i):
+    r = reader_of(i)
+    for nm in owned[i]:
+      got = ctx.ok(r, 'rec_scan', timeout=900, path=f'{base}/{nm}',
+                   name=nm, nblocks=FILE_BLOCKS)
+      ncorrupt = _corrupt_blocks(got['runs'])
+      nbad = _compare(_to_runs(models[nm]), got, FILE_BLOCKS, nm, bad)
+      with lock:
+        tally['corrupt'] += ncorrupt
+        tally['mismatch'] += nbad
+  t0 = time.time()
+  ctx.each(one)
+  ctx.metrics[f'verify_{tag}_s'] = round(time.time() - t0, 1)
+  ctx.metrics[f'bad_after_{tag}'] = tally['mismatch']
+
+
+def _ovf_overwrite(ctx, base, owned, models):
+  """From a third node, overwrite six random ranges of every file (gen 2)
+  with fsync and record them in the models."""
+  n = len(ctx.hosts)
+  rng = random.Random(4321)
+  plan = {}
+  for i in range(n):
+    for nm in owned[i]:
+      plan[nm] = []
+      for _ in range(6):
+        s = rng.randrange(FILE_BLOCKS)
+        plan[nm].append([s, min(rng.randrange(1, 512), FILE_BLOCKS - s)])
+
+  def overwrite(i):
+    ow = (i + 2) % n
+    for nm in owned[i]:
+      ctx.ok(ow, 'rec_write', timeout=900, path=f'{base}/{nm}', name=nm,
+             runs=plan[nm], writer=100 + ow, gen=2, fsync=True)
+  ctx.each(overwrite)
+  for i in range(n):
+    for nm in owned[i]:
+      _apply(models[nm], plan[nm], 100 + (i + 2) % n, 2)
+
+
+@test('safe_tier_overflow_degraded', 'safe', min_nodes=2,
+      redeploy_after=True, timeout=5400)
+def t_tier_overflow_degraded(ctx):
+  """Tiering with the arrays already hurt. A data disk dies in every node's
+  array first; then every node writes 1.5x its RAM + fast tiers in fsynced
+  64 MiB record files, so the organizer pushes the data down onto the
+  degraded arrays (every stripe is written with a member missing). Every
+  block must read back from another node; then after a crash restart of
+  the whole cluster with the disks still dead; then, once the dead disks
+  are replaced and rebuilt, with max_failures OTHER members killed (the
+  rebuilt member is now the only holder of its column); and finally after
+  random ranges are overwritten in that state."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('tod')
+  ctx.ok(0, 'mkdir', path=base)
+  nfiles = _ovf_nfiles(ctx)
+  ctx.metrics['bytes_per_node_mib'] = nfiles * 64
+  for h in cl.hosts:
+    cl.kill_disk(h, 1)  # a data member of every array
+  owned = {i: [f'n{i}_f{k}' for k in range(nfiles)] for i in range(n)}
+  models = {nm: [(i, 1)] * FILE_BLOCKS for i in range(n) for nm in owned[i]}
+
+  def write_all(i):
+    for nm in owned[i]:
+      ctx.ok(i, 'rec_write', timeout=900, path=f'{base}/{nm}', name=nm,
+             runs=[[0, FILE_BLOCKS]], writer=i, gen=1, fsync=True)
+  t0 = time.time()
+  try:
+    ctx.each(write_all)
+  except TestFailure:
+    ctx.note(f'tier usage when a write failed: {_tier_usage(ctx)}')
+    raise
+  ctx.metrics['write_MiB_per_s'] = round(
+      n * nfiles * 64 / max(0.001, time.time() - t0))
+  ctx.note(f'tiers after the writes onto degraded arrays: {_tier_usage(ctx)}')
+  tally = {'mismatch': 0, 'corrupt': 0}
+  bad = []
+  _ovf_verify(ctx, base, models, owned, lambda i: (i + 1) % n, 'degraded',
+              tally, bad)
+  restart_cluster(ctx, crash=True)
+  cl.agents.clear()
+  _ovf_verify(ctx, base, models, owned, lambda i: (i + 2) % n, 'crash',
+              tally, bad)
+  t0 = time.time()
+  res = parallel(lambda h: cl.replace_disk(h, 1), cl.hosts)
+  ctx.metrics['rebuild_s'] = round(time.time() - t0, 1)
+  failed = {h: str(r)[-400:] for h, r in zip(cl.hosts, res)
+            if isinstance(r, Exception) or r[0] != 0}
+  ctx.check(not failed, f'rebuild onto the replacement disks failed: {failed}')
+  for h in cl.hosts:  # max_failures others: the rebuilt member must serve
+    cl.kill_disk(h, 0)
+    cl.kill_disk(h, SAFE_MEMBERS - 1)
+  _ovf_verify(ctx, base, models, owned, lambda i: (i + 3) % n, 'rebuilt',
+              tally, bad)
+  _ovf_overwrite(ctx, base, owned, models)
+  _ovf_verify(ctx, base, models, owned, lambda i: i, 'overwrite', tally, bad)
+  ctx.metrics['corrupt_or_foreign_blocks'] = tally['corrupt']
+  ctx.metrics['bad_blocks_total'] = tally['mismatch']
+  ctx.check(tally['mismatch'] == 0 and tally['corrupt'] == 0 and not bad,
+            f'{tally["mismatch"]} blocks differ from the model '
+            f'({tally["corrupt"]} CORRUPT/FOREIGN), e.g. {bad[:8]}')
+
+
+# ---------------------------------------------------------------------------
+# A dead disk swapped for a blank one while its node is down
+# ---------------------------------------------------------------------------
+def _log_tail_has(cl, host, needle, offset, wait_s=30):
+  """True if `host`'s runtime log contains needle AFTER byte `offset` (the
+  part written since the node was restarted); re-read for up to wait_s
+  seconds because the driver's NFS view lags the daemon's appends."""
+  deadline = time.time() + wait_s
+  while True:
+    try:
+      with open(cl.log_path(host, 'runtime'), errors='replace') as f:
+        f.seek(offset)
+        if needle in f.read():
+          return True
+    except OSError:
+      pass
+    if time.time() >= deadline:
+      return False
+    time.sleep(2)
+
+
+def _swap_member_blank(cl, host, k):
+  """Simulate the operator swapping failed member k of `host`'s array for a
+  blank drive while the node is down: the member's backing file, its
+  allocation log and the fault marker go away, so the file bdev recreates
+  an empty member with no superblock at the next start."""
+  m = cl.safe_member_path(k)
+  alog = m[:-len('.dat')] + '.alog'
+  rc, out = sh(host, f'rm -f {m} {m}.fail {alog} && ls {os.path.dirname(m)}',
+               timeout=60)
+  return rc, out
+
+
+@test('safe_disk_swapped_while_down', 'safe', min_nodes=2,
+      redeploy_after=True, timeout=5400)
+def t_disk_swapped_while_down(ctx):
+  """The operator's offline repair path. A data disk dies in node1's array
+  while every node writes fsynced record files; node1 is stopped
+  gracefully, the dead disk is swapped for a BLANK one while the node is
+  down (backing file, allocation log and fault marker gone, so the member
+  comes back empty and without a superblock), and node1 restarts. The
+  array must not seat the blank member as if it still held its column:
+  every fsynced version must read back intact (reconstructed from parity,
+  or after a rebuild onto the blank member), never zeros or corrupt bytes,
+  and the filesystem must take new writes. How the member was seated is
+  read from node1's log and recorded. A crash restart of the whole cluster
+  must then keep the data intact too."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  vi = 1 % n
+  victim = cl.hosts[vi]
+  base = ctx.p('sw')
+  ctx.ok(0, 'mkdir', path=base)
+  th, replies, logs, nfiles = _writers(ctx, base, 150, 'swap')
+  time.sleep(20)
+  cl.kill_disk(victim, 2)
+  time.sleep(20)
+  cl.unmount(victim)
+  cl.stop_runtime(victim)
+  log_off = os.path.getsize(cl.log_path(victim, 'runtime'))
+  rc, out = _swap_member_blank(cl, victim, 2)
+  ctx.check(rc == 0, f'blank swap of member 2 on {victim} failed: {out[-300:]}')
+  cl.start_runtime(victim)
+  ctx.check(cl.runtime_up(victim),
+            f'{victim} did not come back with the blank member seated')
+  time.sleep(3)
+  ctx.check(cl.mount(victim), f'{victim} remount failed after the swap')
+  cl.agents.pop(victim, None)
+  # How the array seated column 2 at this start (the member manifest is
+  # expected to keep it down until an explicit rebuild).
+  mp = cl.safe_member_path(2)
+  seated = 'unknown'
+  for needle, label in ((f"data column 2 ('{mp}') restored as down",
+                         'restored-down'),
+                        (f"initialized fresh member '{mp}'", 'fresh-active'),
+                        (f"re-attached member '{mp}'", 'reattached'),
+                        (f"REFUSING member '{mp}'", 'refused')):
+    if _log_tail_has(cl, victim, needle, log_off, wait_s=20):
+      seated = label
+      break
+  ctx.check(seated != 'fresh-active',
+            'the blank member was seated as an active data column: the '
+            'array would serve zeros for everything that lived on it')
+  ctx.metrics['blank_member_seated_as'] = seated
+  ctx.note(f'{victim} seated the blank member as: {seated}')
+  # The operator's next step: rebuild onto the blank disk IN PLACE (same
+  # path, same member pool). Record whether the tool supports that; the
+  # integrity checks below hold either way.
+  t0 = time.time()
+  rc, out = cl.rebuild_disk_inplace(victim, 2)
+  ctx.metrics['inplace_rebuild_rc'] = rc
+  ctx.metrics['inplace_rebuild_s'] = round(time.time() - t0, 1)
+  if rc != 0:
+    ctx.note(f'in-place rebuild onto the blank member refused: {out[-400:]}')
+  th.join(timeout=150 + 1200)
+  ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after a dead disk was swapped for a blank one offline')
+  if rc == 0:
+    # Redundancy is claimed back: max_failures OTHER members may now die
+    # and the rebuilt column must carry its share.
+    cl.kill_disk(victim, 0)
+    cl.kill_disk(victim, SAFE_MEMBERS - 1)
+    _check_filesets(ctx, base, n, nfiles, logs, replies,
+                    f'with {SAFE_PARITY} more members dead behind the '
+                    'in-place rebuild')
+  p = ctx.p('after_swap')
+  ctx.ok(vi, 'write_file', path=p, size=8 << 20, seed=17, fsync=True)
+  v = ctx.ok((vi + 1) % n, 'verify_file', path=p, size=8 << 20, seed=17)
+  ctx.check(v['ok'], f'write on the repaired node after the swap: {v}')
+  restart_cluster(ctx, crash=True)
+  cl.agents.clear()
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after the blank swap and a full crash restart')
+
+
+# ---------------------------------------------------------------------------
+# Repeated whole-cluster crashes under load: recovery must stay cheap
+# ---------------------------------------------------------------------------
+def _crash_all_keep_writers(ctx):
+  """SIGKILL every daemon and FUSE client and bring the cluster back, WITHOUT
+  closing the node agents (writers started through them keep running and
+  retry through the outage). Returns the restart time in seconds."""
+  cl = ctx.cl
+  parallel(lambda h: cl.kill_fuse(h), cl.hosts)
+  parallel(lambda h: cl.kill_runtime(h), cl.hosts)
+  time.sleep(2)
+  t0 = time.time()
+  parallel(lambda h: cl.start_runtime(h), cl.hosts)
+  ups = parallel(cl.runtime_up, cl.hosts)
+  ctx.check(all(u is True for u in ups), f'runtime restart failed: {ups}')
+  time.sleep(3)
+  ms = parallel(cl.mount, cl.hosts)
+  ctx.check(all(m is True for m in ms), f'remount failed: {ms}')
+  for h in cl.hosts:
+    cl.agents.pop(h, None)  # new calls get fresh agents; writers keep theirs
+  return round(time.time() - t0, 1)
+
+
+def _array_file_sizes(ctx):
+  """Bytes of each node's safe_array allocation log, degraded-write journal
+  and member manifest, as {node: {name: bytes}}."""
+  lr = ctx.cl.local_root
+  out = {}
+  for i, h in enumerate(ctx.hosts):
+    rc, txt = sh(h, f'stat -c "%s %n" {lr}/data/safe_array.alog* 2>/dev/null',
+                 timeout=30)
+    sizes = {}
+    for ln in (txt or '').splitlines():
+      parts = ln.split()
+      if len(parts) == 2:
+        sizes[parts[1].rsplit('/', 1)[-1]] = int(parts[0])
+    out[f'node{i}'] = sizes
+  return out
+
+
+@test('safe_crash_cycles', 'safe', min_nodes=2, redeploy_after=True,
+      timeout=5400)
+def t_crash_cycles(ctx):
+  """Six whole-cluster SIGKILLs a minute apart while every node writes
+  fsynced record files with a data disk dead in every array (so every
+  crash lands on degraded writes and the degraded-write journal is in
+  use). Recovery must not get more expensive as the journal, allocation
+  log and manifest accumulate: every restart is timed and the array files
+  are measured after each cycle; the last restart may take at most 3x the
+  first (+5 s). Every fsynced version must read back intact at the end, and
+  the filesystem must take new writes."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('cc')
+  ctx.ok(0, 'mkdir', path=base)
+  for h in cl.hosts:
+    cl.kill_disk(h, 0)
+  cycles = 6
+  secs = 60 * cycles + 60
+  th, replies, logs, nfiles = _writers(ctx, base, secs, 'cycles')
+  restarts, sizes = [], []
+  for c in range(cycles):
+    time.sleep(60)
+    restarts.append(_crash_all_keep_writers(ctx))
+    sizes.append(_array_file_sizes(ctx))
+    ctx.note(f'cycle {c}: restart {restarts[-1]} s, array files '
+             f'{sizes[-1].get("node0")}')
+  th.join(timeout=secs + 1800)
+  ctx.metrics['restart_s_per_cycle'] = restarts
+  ctx.metrics['journal_bytes_node0_per_cycle'] = [
+      s.get('node0', {}).get('safe_array.alog.journal', 0) for s in sizes]
+  ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  ctx.check(restarts[-1] <= 3 * restarts[0] + 5,
+            f'recovery got slower across crashes: {restarts}')
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  f'after {cycles} whole-cluster crashes under degraded writes')
+  p = ctx.p('after_cycles')
+  ctx.ok(0, 'write_file', path=p, size=8 << 20, seed=23, fsync=True)
+  v = ctx.ok(n - 1, 'verify_file', path=p, size=8 << 20, seed=23)
+  ctx.check(v['ok'], f'write after the crash cycles: {v}')
+
+
+# ---------------------------------------------------------------------------
+# A parity disk replaced while a data disk is also dead (#1199)
+# ---------------------------------------------------------------------------
+@test('safe_parity_replaced_with_data_down', 'safe', min_nodes=1,
+      redeploy_after=True, timeout=5400)
+def t_parity_replaced_with_data_down(ctx):
+  """Two members down in every array -- a data disk and a parity disk, i.e.
+  max_failures -- while every node writes fsynced record files. The parity
+  disk is then swapped for a fresh one and rebuilt with the data disk still
+  dead: the rebuild must succeed (the down data column is decoded from the
+  other parity), redundancy must be back (a SECOND data disk then dies and
+  every fsynced version still reads back), and a crash restart must keep
+  it all."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  base = ctx.p('pr')
+  ctx.ok(0, 'mkdir', path=base)
+  th, replies, logs, nfiles = _writers(ctx, base, 150, 'parrep')
+  time.sleep(20)
+  for h in cl.hosts:
+    cl.kill_disk(h, 1)                 # a data member
+  time.sleep(15)
+  for h in cl.hosts:
+    cl.kill_disk(h, SAFE_MEMBERS - 2)  # the first parity member
+  time.sleep(15)
+  t0 = time.time()
+  res = parallel(lambda h: cl.replace_disk(h, SAFE_MEMBERS - 2), cl.hosts)
+  ctx.metrics['parity_rebuild_s'] = round(time.time() - t0, 1)
+  failed = {h: str(r)[-400:] for h, r in zip(cl.hosts, res)
+            if isinstance(r, Exception) or r[0] != 0}
+  ctx.check(not failed, 'parity rebuild with a data member down failed: '
+                        f'{failed}')
+  for h in cl.hosts:
+    cl.kill_disk(h, 2)                 # a second data member: the rebuilt
+                                       # parity must now carry the stripe
+  th.join(timeout=150 + 1200)
+  ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'with two data members dead behind a rebuilt parity disk')
+  restart_cluster(ctx, crash=True)
+  cl.agents.clear()
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after a crash restart with the rebuilt parity seated')

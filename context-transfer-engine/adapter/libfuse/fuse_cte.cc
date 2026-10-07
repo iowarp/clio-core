@@ -2024,8 +2024,31 @@ static int OpenHandleSize(CfsHandle *h, const std::string &hp,
   return rc;
 }
 
+static int GetattrStatImpl(const char *path, cte_stat_t *stbuf,
+                           struct fuse_file_info *fi);
+
 int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
                           struct fuse_file_info *fi) {
+  // A getattr that took seconds, with its answer (#1169: a stat took 274 s
+  // with two nodes down and no read-path diagnostic fired). Rate-limited.
+  const auto t0 = std::chrono::steady_clock::now();
+  const int rc = GetattrStatImpl(path, stbuf, fi);
+  const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+  if (ms > 2000.0) {
+    static std::atomic<clio::run::u64> logged{0};
+    const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
+    if (k < 16 || k % 256 == 0) {
+      HLOG(kWarning, "clio_cte_fuse: slow getattr of '{}': {} ms, rc {} ({} "
+           "such)", path != nullptr ? path : "", ms, rc, k + 1);
+    }
+  }
+  return rc;
+}
+
+static int GetattrStatImpl(const char *path, cte_stat_t *stbuf,
+                           struct fuse_file_info *fi) {
   // fstat through a handle with deferred appends sees them.
   CfsHandle *handle = fi != nullptr ? GetHandle(fi) : nullptr;
   std::string hidden;
@@ -2992,13 +3015,37 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
   if (SieveDataEnabled() && cte != nullptr && !handle->tag.IsNull()) {
     clio::run::u64 fsize = 0;
     PendingCreate pc_probe;
+    // Where a slow read spent its time (#1169): the size lookup at the
+    // inode's home, or the page reads. Logged, rate-limited, past 2 s.
+    const auto read_t0 = std::chrono::steady_clock::now();
+    double size_ms = 0;
+    auto slow_read = [&](int rc, clio::run::u64 pages) {
+      const double total_ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - read_t0)
+                                  .count();
+      if (total_ms < 2000.0) return;
+      static std::atomic<clio::run::u64> logged{0};
+      const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
+      if (k < 8 || k % 256 == 0) {
+        HLOG(kWarning, "clio_cte_fuse: slow read of tag {}.{} [{}, +{}): {} ms "
+             "(size lookup {} ms, {} page read(s)); rc {} ({} such reads so "
+             "far)", handle->tag.major_, handle->tag.minor_, offset, size,
+             total_ms, size_ms, pages, rc, k + 1);
+      }
+    };
     if (!PendingCreateLookup(hp, &pc_probe)) {
       // A pending minted create's whole size story is local; only ask the
       // chimod once the file exists server-side.
       // The descriptor's own file: after a rename over its name the path
       // names another file (or, mid-rename, none) and read 0 bytes.
       const int src = OpenHandleSize(handle, hp, &fsize);
-      if (src == -EIO) return -EIO;
+      size_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - read_t0)
+                    .count();
+      if (src == -EIO) {
+        slow_read(-EIO, 0);
+        return -EIO;
+      }
       // The descriptor's own file is gone on the server: a silent EOF would
       // read as a truncated file. ESTALE, as NFS reports a vanished file.
       if (src == -ENOENT) return -kOpenVanishedErrno;
@@ -3019,7 +3066,9 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
       // completes with the node-lost code; sent again it routes to the
       // stand-in, which serves it. Only after the retries is it EIO.
       int grc = 0;
-      for (int attempt = 0;; ++attempt) {
+      const auto read_t0 = std::chrono::steady_clock::now();
+      int attempt = 0;
+      for (;; ++attempt) {
         auto g = cte->AsyncGetBlobDefer(
             handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
             buf + done);
@@ -3032,16 +3081,35 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kReadNodeLostRetryMs));
       }
+      if (attempt > 0) {
+        // Where a slow failing read spent its time (#1169): how many
+        // node-lost answers it retried and what it ended with. Rate-limited:
+        // with a node down every page read of that node lands here.
+        static std::atomic<clio::run::u64> logged{0};
+        const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
+        if (k < 8 || k % 256 == 0) {
+          const double ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - read_t0)
+                                .count();
+          HLOG(kWarning, "clio_cte_fuse: read of tag {}.{} page {} got the "
+               "node-lost code {} time(s) over {} ms; final rc {} ({} such "
+               "reads so far)", handle->tag.major_, handle->tag.minor_,
+               clio::cte::filesystem::PageName(cur), attempt, ms, grc, k + 1);
+        }
+      }
       // 0 = read, 1 = the page does not exist (a hole: the pre-zeroed
       // buffer is the right answer). Anything else -- above all the
       // network-timeout code a page on a DEAD node completes with -- is an
       // I/O error. Treating it as a hole returned zeros with success: a
       // reader got silently corrupted data while a node was down.
       if (grc != 0 && grc != 1) {
+        slow_read(-EIO, done / clio::cte::filesystem::kFsPageSize + 1);
         return -EIO;
       }
       done += n;
     }
+    slow_read(0, (want + clio::cte::filesystem::kFsPageSize - 1) /
+                     clio::cte::filesystem::kFsPageSize);
     return static_cast<int>(want);
   }
   // cfs tiered read fallback.

@@ -48,6 +48,7 @@ extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/thread/thread_model_manager.h>
 
+#include <algorithm>
 #include <atomic>
 #include <unordered_set>
 #include <mutex>
@@ -248,142 +249,158 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
     return;
   }
 
+  // Register the origin in send_map_ (keyed by its address) so that
+  // responses can be matched back to it.
   size_t send_map_key = size_t(origin_task.get());
   {
     std::lock_guard<std::mutex> lk(send_map_mutex_);
     send_map_[send_map_key] = origin_task;
   }
 
-
   const std::vector<clio::run::PoolQuery> &pool_queries =
       origin_task->PoolQueries();
   size_t num_replicas = pool_queries.size();
   origin_task->Subtasks().resize(num_replicas);
 
-  // Per-replica target node, for the #628 task-progress scan. Left as
-  // kInvalidNodeId for replicas that were never dispatched to a live/queued
-  // node (those never wait on a network response, so the scan skips them).
-  std::vector<clio::run::u64> replica_targets(num_replicas, kInvalidNodeId);
-
   HLOG(kDebug, "[SendIn] Task {} to {} replicas", origin_task->task_id_,
        num_replicas);
 
+  // Pass 1 (#1185): decide what to do with every replica WITHOUT sending
+  // anything or completing the origin, so progress can be registered first.
+  std::vector<SendInPlan> plan(num_replicas);
+  std::vector<clio::run::u64> replica_targets(num_replicas, kInvalidNodeId);
   for (size_t i = 0; i < num_replicas; ++i) {
-    const clio::run::PoolQuery &query = pool_queries[i];
-
-    clio::run::u64 target_node_id =
-        SendInResolveTargetNode(ipc_manager, pool_manager, origin_task, query);
-    if (target_node_id == kInvalidNodeId) {
-      continue;
+    plan[i] = SendInPlanReplica(ipc_manager, pool_manager, origin_task,
+                                pool_queries[i], i, send_map_key);
+    if (plan[i].action == SendInAction::kRetry ||
+        plan[i].action == SendInAction::kTransmit) {
+      replica_targets[i] = plan[i].target_node_id;
     }
+  }
 
-    const clio::run::Host *target_host = ipc_manager->GetHost(target_node_id);
-    if (!target_host) {
-      HLOG(kError, "[SendIn] Task {} FAILED: Host not found for node_id {}",
-           origin_task->task_id_, target_node_id);
-      continue;
-    }
+  // Register progress BEFORE the first transmit or fail-fast completion
+  // (#1185). A reply that lands before registration used to complete the
+  // origin and erase its maps, after which the late registration re-created
+  // an orphan progress_map_ entry that nothing ever erased, and whose
+  // unaccounted replica the progress scan then probed. Fire-and-forget
+  // origins complete right after transmit and are never tracked.
+  const bool fire_and_forget =
+      origin_task->task_flags_.Any(TASK_FIRE_AND_FORGET);
+  if (!fire_and_forget) {
+    RegisterOriginProgress(send_map_key, replica_targets,
+                           /*probe_eligible=*/
+                           !(origin_task->pool_id_ == clio::run::kAdminPoolId));
+  }
 
-    clio::run::shared_ptr<clio::run::Task> task_copy =
-        container->NewCopyTask(origin_task->method_, origin_task, true);
-    origin_task->Subtasks()[i] = task_copy;
+  // Pass 2: act on the plan (skip, fail fast, retry, or transmit).
+  SendInExecutePlan(ipc_manager, origin_task, send_map_key, plan);
 
-    task_copy->task_id_.net_key_ = send_map_key;
-    task_copy->task_id_.replica_id_ = i;
-    // A collective (ManyToOne / AllToOne) member keeps its OWN query across the
-    // wire. `query` here is the physical envelope RouteManyToOne wrapped it in
-    // (Physical(leader)), and the target node was already resolved from it
-    // above, so nothing on this side still needs it. The receiving leader,
-    // however, needs the collective query itself: it carries the routing mode
-    // that makes RouteTask park the task in the BatchManager, plus the
-    // container_hash and batch_key that decide WHICH group it joins.
-    // Overwriting it with the envelope erased all three, so a forwarded member
-    // arrived at the leader looking like an ordinary Physical task: it ran
-    // standalone and returned an un-combined result (an AllReduce gave each
-    // caller back its own value with rc=0), and the collective it should have
-    // joined waited for a member that never arrived.
-    if (origin_task->pool_query_.IsCollectiveMode()) {
-      task_copy->pool_query_ = origin_task->pool_query_;
-    } else {
-      task_copy->pool_query_ = query;
-    }
-    task_copy->pool_query_.SetReturnNode(ipc_manager->GetNodeId());
+  if (fire_and_forget) {
+    RecvOutCompleteOriginTask(send_map_key, origin_task);
+    return;
+  }
+  // #1197: the origin may now be completed by probes and dead-node sweeps;
+  // apply any verdict that was parked while we were transmitting.
+  FinishOriginSend(send_map_key);
+}
 
-    const bool partitioned = Run2RunTestPartitioned(target_node_id);
-    if (!ipc_manager->IsAlive(target_node_id) || partitioned) {
-      float net_timeout = origin_task->pool_query_.GetNetTimeout();
-      if ((net_timeout >= 0 && net_timeout < 0.001f) ||
-          Run2RunFailFastDead() || partitioned) {
-        // Rate-limited: with a node down every task routed to it lands here,
-        // and one synchronous log line per task on the network worker was
-        // itself enough to stall it.
+IpcManagerRun2Run::SendInPlan IpcManagerRun2Run::SendInPlanReplica(
+    clio::run::IpcManager *ipc_manager, clio::run::PoolManager *pool_manager,
+    clio::run::shared_ptr<clio::run::Task> origin_task,
+    const clio::run::PoolQuery &query, size_t replica_idx,
+    size_t send_map_key) {
+  SendInPlan out;
+  out.target_node_id =
+      SendInResolveTargetNode(ipc_manager, pool_manager, origin_task, query);
+  if (out.target_node_id == kInvalidNodeId) {
+    return out;  // kSkip
+  }
+  const clio::run::Host *target_host = ipc_manager->GetHost(out.target_node_id);
+  if (!target_host) {
+    HLOG(kError, "[SendIn] Task {} FAILED: Host not found for node_id {}",
+         origin_task->task_id_, out.target_node_id);
+    out.target_node_id = kInvalidNodeId;
+    return out;  // kSkip
+  }
+
+  auto container =
+      pool_manager->GetStaticContainer(origin_task->pool_id_).get();
+  clio::run::shared_ptr<clio::run::Task> task_copy =
+      container->NewCopyTask(origin_task->method_, origin_task, true);
+  origin_task->Subtasks()[replica_idx] = task_copy;
+
+  // Stamp the copy so the response can find the origin and its replica slot.
+  task_copy->task_id_.net_key_ = send_map_key;
+  task_copy->task_id_.replica_id_ = replica_idx;
+  if (origin_task->pool_query_.IsCollectiveMode()) {
+    task_copy->pool_query_ = origin_task->pool_query_;
+  } else {
+    task_copy->pool_query_ = query;
+  }
+  task_copy->pool_query_.SetReturnNode(ipc_manager->GetNodeId());
+  out.task_copy = task_copy;
+
+  // A dead (or test-partitioned) target either fails fast or waits in the
+  // retry queue for the node to come back / the mapping to move (#856/#896).
+  const bool partitioned = Run2RunTestPartitioned(out.target_node_id);
+  if (!ipc_manager->IsAlive(out.target_node_id) || partitioned) {
+    float net_timeout = origin_task->pool_query_.GetNetTimeout();
+    const bool fail_fast = (net_timeout >= 0 && net_timeout < 0.001f) ||
+                           Run2RunFailFastDead() || partitioned;
+    out.action = fail_fast ? SendInAction::kFailFast : SendInAction::kRetry;
+    return out;
+  }
+  out.action = SendInAction::kTransmit;
+  return out;
+}
+
+void IpcManagerRun2Run::SendInExecutePlan(
+    clio::run::IpcManager *ipc_manager,
+    clio::run::shared_ptr<clio::run::Task> origin_task, size_t send_map_key,
+    std::vector<SendInPlan> &plan) {
+  for (SendInPlan &rp : plan) {
+    switch (rp.action) {
+      case SendInAction::kSkip:
+        break;
+      case SendInAction::kFailFast: {
         static std::atomic<clio::run::u64> skip_logged{0};
         if (skip_logged.fetch_add(1, std::memory_order_relaxed) % 1000 == 0) {
           HLOG(kWarning,
                "[SendIn] Task {} target node {} is dead -> skip (fail fast); "
                "{} such skips so far",
-               origin_task->task_id_, target_node_id, skip_logged.load());
+               origin_task->task_id_, rp.target_node_id, skip_logged.load());
         }
-        // A broadcast may legitimately answer from the reachable subset, but
-        // a single-target task that skips its ONLY target produced no result
-        // at all: completing it with rc 0 handed the caller an empty success
-        // (a read of a dead node's blob came back as zeros).
+        // Broadcast origins keep the RC of the replicas that did run; every
+        // other mode reports the shortfall as a network timeout.
         if (!origin_task->pool_query_.IsBroadcastMode()) {
           origin_task->SetReturnCode(kRun2RunNetworkTimeoutRC);
         }
-        // Issue #856: if this skip is the LAST replica to be accounted (every
-        // other replica already responded), nobody else will ever observe
-        // completed == size — the origin would never complete and its awaiting
-        // client/fiber parks forever (the 15-minute leader-election step
-        // timeout). Check for completion here like every other counting path.
-        // Reaching size mid-loop is only possible when every replica has
-        // already contributed, so no later iteration touches Subtasks() after
-        // RecvOutCompleteOriginTask clears it.
         clio::run::u32 completed =
             origin_task->CompletedReplicas().fetch_add(1) + 1;
         if (completed == origin_task->Subtasks().size()) {
           RecvOutCompleteOriginTask(send_map_key, origin_task);
         }
-        continue;
+        break;
       }
-      HLOG(kWarning,
-           "[SendIn] Task {} target node {} is dead, queuing for retry",
-           origin_task->task_id_, target_node_id);
-      replica_targets[i] = target_node_id;
-      std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
-      send_in_retry_.push_back(
-          {task_copy, target_node_id, std::chrono::steady_clock::now()});
-      continue;
+      case SendInAction::kRetry: {
+        HLOG(kWarning,
+             "[SendIn] Task {} target node {} is dead, queuing for retry",
+             origin_task->task_id_, rp.target_node_id);
+        std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
+        send_in_retry_.push_back(
+            {rp.task_copy, rp.target_node_id, std::chrono::steady_clock::now()});
+        break;
+      }
+      case SendInAction::kTransmit: {
+        if (RunContext *rc = origin_task->RunCtxPtr()) {
+          if (rc->notify_ns_ == 0) rc->notify_ns_ = clio::run::CycleNow();
+        }
+        SendInTransmitReplica(ipc_manager, rp.task_copy, rp.target_node_id,
+                              origin_task);
+        break;
+      }
     }
-
-    replica_targets[i] = target_node_id;
-    // Latency report (CLIO_EVLAT): the remote round trip starts here and
-    // ends in RecvOutCompleteOriginTask.
-    if (RunContext *rc = origin_task->RunCtxPtr()) {
-      if (rc->notify_ns_ == 0) rc->notify_ns_ = clio::run::CycleNow();
-    }
-    SendInTransmitReplica(ipc_manager, task_copy,
-                          target_node_id, origin_task);
   }
-
-  // Register EVERY origin: progress_map_ is the authoritative record of which
-  // node each replica was dispatched to, and the dead-node sweep
-  // (ScanSendMapTimeouts) needs it for all routing modes. Admin-pool origins
-  // are registered but NOT probe-eligible: QueryTaskProgress is itself an
-  // admin cross-node task, so probing them would recurse (issue #896).
-  if (origin_task->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
-    // No response is coming (the executor's EndTask skips SendOut for these),
-    // so nothing may wait for one: no progress probes, and the origin is
-    // finished now, exactly as a locally executed fire-and-forget task is.
-    // Tracked like a normal task, every detached remote close left a
-    // send_map_ entry here and a recv_map_ entry at the executor forever,
-    // which the hang watches then reported as stuck (#1149).
-    RecvOutCompleteOriginTask(send_map_key, origin_task);
-    return;
-  }
-  RegisterOriginProgress(send_map_key, replica_targets,
-                         /*probe_eligible=*/
-                         !(origin_task->pool_id_ == clio::run::kAdminPoolId));
 }
 
 // =============================================================================
@@ -968,9 +985,32 @@ void IpcManagerRun2Run::RegisterOriginProgress(
     // so the scan skips it and it never blocks completion.
     prog.replicas[i].accounted = (replica_targets[i] == kInvalidNodeId);
   }
+  prog.sending = true;  // #1197: cleared by FinishOriginSend
   std::lock_guard<std::mutex> lk(send_map_mutex_);
+  if (send_map_.find(net_key) == nullptr) {
+    // #1185: the origin already completed (ClaimOrigin erased it). Inserting
+    // now would create an entry nothing ever erases.
+    return;
+  }
   prog.gen = ++progress_gen_;
   progress_map_[net_key] = std::move(prog);
+}
+
+void IpcManagerRun2Run::FinishOriginSend(size_t net_key) {
+  std::vector<clio::run::u32> deferred;
+  {
+    std::lock_guard<std::mutex> lk(send_map_mutex_);
+    auto it = progress_map_.find(net_key);
+    if (it == progress_map_.end()) {
+      return;  // already completed (fail-fast or a reply) and erased
+    }
+    it->second.sending = false;
+    deferred.swap(it->second.deferred_gone);
+  }
+  for (clio::run::u32 rid : deferred) {
+    HandleTaskProgressResult(static_cast<clio::run::u64>(net_key), rid,
+                             /*gone=*/true, /*gen=*/0);
+  }
 }
 
 clio::run::u64 IpcManagerRun2Run::ReplicaTargetNode(
@@ -1218,6 +1258,20 @@ void IpcManagerRun2Run::HandleTaskProgressResult(clio::run::u64 net_key,
              replica_id, net_key, rp.gone_strikes, kGoneStrikesToFail);
         return;
       }
+    }
+  }
+  // #1197: never complete an origin whose SendIn is still transmitting it --
+  // RecvOutCompleteOriginTask would clear its subtasks and EndTask it under
+  // the sender's feet. Park the verdict; FinishOriginSend applies it.
+  {
+    std::lock_guard<std::mutex> lk(send_map_mutex_);
+    auto pit = progress_map_.find(static_cast<size_t>(net_key));
+    if (pit != progress_map_.end() && pit->second.sending) {
+      auto &dg = pit->second.deferred_gone;
+      if (std::find(dg.begin(), dg.end(), replica_id) == dg.end()) {
+        dg.push_back(replica_id);
+      }
+      return;
     }
   }
   // Claim the accounting transition; bail if a real response already took it.

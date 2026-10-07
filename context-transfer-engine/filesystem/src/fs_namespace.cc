@@ -47,6 +47,8 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <algorithm>
+#include <chrono>
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -192,6 +194,7 @@ clio::run::TaskResume Runtime::CallShard(clio::run::u32 target,
   }
   std::string enc;
   EncReq(req, &enc);
+  const auto shard_t0 = std::chrono::steady_clock::now();
   auto t = self_.AsyncShardOp(
       op, enc,
       clio::run::PoolQuery::DirectId(
@@ -203,6 +206,25 @@ clio::run::TaskResume Runtime::CallShard(clio::run::u32 target,
     // owns is unavailable, which POSIX can only express as an I/O error.
     resp = FsResp();
     resp.rc_ = EIO;
+  }
+  {
+    // A shard call that took seconds, and where it went (#1169: a stat
+    // took 274 s with two nodes down). Rate-limited.
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - shard_t0)
+                          .count();
+    if (ms > 2000.0) {
+      static std::atomic<clio::run::u64> logged{0};
+      const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
+      if (k < 16 || k % 256 == 0) {
+        auto *pm = CLIO_POOL_MANAGER;
+        HLOG(kWarning, "filesystem: shard op {} to container {} (node {}, "
+             "alive {}) took {} ms; task rc {}, resp rc {} ({} such calls)",
+             op, target, pm->GetContainerNodeId(pool_id_, target),
+             clio::cte::core::ContainerNodeAlive(pool_id_, target), ms,
+             t->GetReturnCode(), resp.rc_, k + 1);
+      }
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -332,7 +354,14 @@ clio::run::TaskResume Runtime::ExecInodeOp(clio::run::u32 op, const FsReq &req,
                                            FsResp &resp, int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
-  CLIO_CO_AWAIT(EnsureInode(req.id_));  // lazily loaded after a restart
+  int load_err = 0;
+  CLIO_CO_AWAIT(EnsureInode(req.id_, &load_err));  // lazily loaded after a restart
+  if (load_err != 0 && FindInode(req.id_) == nullptr) {
+    // The record is unreadable (its owner down with no copy here, #1166):
+    // nothing below may answer "no such inode" for it.
+    rc = load_err;
+    CLIO_CO_RETURN;
+  }
   switch (op) {
     case kShardInodeStat: {
       auto fi = FindInode(req.id_);
@@ -735,10 +764,25 @@ clio::run::TaskResume Runtime::FlushNames() {
   }
   if (!batch.empty()) {
     // One broadcast per drain tick carries every change since the last one.
-    // A node that is down misses it and resyncs when it restarts.
+    // A node that is down misses it and resyncs when it restarts. A
+    // broadcast that fails outright is retried on the next ticks (#1182:
+    // a node's index missed a directory rename and nothing said why); the
+    // records carry their own stamps, so re-sending them is harmless.
     auto u = cte_.AsyncUpdateTagNames(batch,
                                       clio::run::PoolQuery::Broadcast(0.0f));
     CLIO_CO_AWAIT(u);
+    if (u->GetReturnCode() != 0) {
+      ++tn_flush_failures_;
+      HLOG(kWarning, "filesystem: tag-name broadcast of {} byte(s) failed "
+           "(rc {}); {} failure(s) so far, re-queued", batch.size(),
+           u->GetReturnCode(), tn_flush_failures_);
+      if (tn_flush_failures_ <= kNameFlushRetries) {
+        std::lock_guard<std::mutex> g(tn_mu_);
+        tn_batch_.insert(0, batch);  // ahead of what was published since
+      }
+    } else {
+      tn_flush_failures_ = 0;
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

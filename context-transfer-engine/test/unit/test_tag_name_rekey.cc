@@ -266,4 +266,31 @@ TEST_CASE("rename whose destination parent never arrives keeps old subtree",
                                  "/d2c/sub/deep/f3", "/d2c/sub/f2"}));
 }
 
+TEST_CASE("an ancestor rename while a move is parked still lands the move",
+          "[cte][tagnames][rekey]") {
+  // #1182: xnode_tag_names, 1 run in 3. The subtree move arrives before its
+  // destination parent is named (parked, remembering the OLD absolute path
+  // /d1d/sub); then an ancestor rename /d1d -> /d2d re-keys the index under
+  // /d2d; then the parent arrives. The parked move used to look for
+  // /d1d/sub, find nothing, and leave the subtree under /d2d/sub for good.
+  TagNameFixture fx;
+  const Ids ids = MakeIds(4);
+  Publish(BatchA(ids, "d1d"));
+  Publish(BatchB(ids));  // sub -> <x>/moved, x unknown: parked
+  {
+    std::string b;
+    EncodeTagNameOp(&b, TagNameOp::kRename, ids.d, 160,
+                    MakeTagRefName(ids.root, "d1d"),
+                    MakeTagRefName(ids.root, "d2d"));
+    Publish(b);  // the ancestor moves while the subtree move is parked
+  }
+  Publish(BatchC(ids, "xd"));
+  REQUIRE(Query("^/d1d(/.*)?$").empty());
+  REQUIRE(Query("^/d2d/sub(/.*)?$").empty());
+  REQUIRE(ScenarioIndex("d2d", "xd") ==
+          std::set<std::string>({"/d2d", "/xd", "/xd/moved",
+                                 "/xd/moved/deep", "/xd/moved/deep/f3",
+                                 "/xd/moved/f2"}));
+}
+
 SIMPLE_TEST_MAIN()

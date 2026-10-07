@@ -58,6 +58,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <set>
 
 #include "simple_test.h"
 
@@ -384,6 +385,101 @@ TEST_CASE("safe_bdev_ec_roundtrip_recovery", "[safe_bdev][ec][recovery]") {
   HLOG(kInfo, "safe_bdev EC end-to-end test PASSED");
 }
 
+TEST_CASE("safe_bdev_parity_rebuild_with_data_down",
+          "[safe_bdev][ec][recovery][parity]") {
+  // #1199: with one data member AND one parity member down (max_failures=2),
+  // the parity member must still be rebuildable -- the down data column is
+  // decoded from the other parity -- and the rebuilt parity must then carry a
+  // second data failure.
+  EnsureInit();
+  REQUIRE(g_initialized);
+  std::this_thread::sleep_for(100ms);
+  const int pidsalt = static_cast<int>(getpid() & 0xFFF);
+  auto member_name = [&](int idx) {
+    return "safe_pr_member_" + std::to_string(getpid()) + "_" +
+           std::to_string(idx);
+  };
+  const int k = 3;
+  std::vector<clio::run::PoolId> data_ids;
+  for (int c = 0; c < k; ++c) {
+    clio::run::PoolId id(static_cast<clio::run::u32>(8100 + pidsalt + c), 0);
+    clio::run::bdev::Client client(id);
+    REQUIRE(CreateRamMember(client, member_name(c), id));
+    data_ids.push_back(client.pool_id_);
+  }
+  std::vector<clio::run::PoolId> parity_ids;
+  for (int j = 0; j < 2; ++j) {
+    clio::run::PoolId id(static_cast<clio::run::u32>(8200 + pidsalt + j), 0);
+    clio::run::bdev::Client client(id);
+    REQUIRE(CreateRamMember(client, member_name(100 + j), id));
+    parity_ids.push_back(client.pool_id_);
+  }
+  clio::run::PoolId safe_id(static_cast<clio::run::u32>(8300 + pidsalt), 0);
+  clio::run::safe_bdev::Client safe(safe_id);
+  std::vector<clio::run::safe_bdev::MemberBdevDesc> members;
+  for (int c = 0; c < k; ++c) {
+    members.emplace_back(member_name(c), /*node_id=*/0, data_ids[c]);
+  }
+  auto create_task = safe.AsyncCreate(clio::run::PoolQuery::Dynamic(),
+                                      "safe_bdev_parity_rebuild_pool", safe_id,
+                                      /*max_failures=*/2, members);
+  create_task.Wait();
+  safe.pool_id_ = create_task->new_pool_id_;
+  REQUIRE(create_task->GetReturnCode() == 0);
+  for (int j = 0; j < 2; ++j) {
+    auto add = safe.AsyncAddBdev(clio::run::PoolQuery::Dynamic(),
+                                 member_name(100 + j), /*node_id=*/0,
+                                 parity_ids[static_cast<size_t>(j)],
+                                 /*as_parity=*/1);
+    add.Wait();
+    REQUIRE(add->GetReturnCode() == 0);
+  }
+  const clio::run::u64 io_len = 2 * static_cast<clio::run::u64>(k) * kChunkLen;
+  std::vector<clio::run::bdev::Block> blocks = AllocBlocks(safe, io_len);
+  std::vector<ctp::u8> pattern = MakePattern(io_len, 0xC3);
+  WriteBlocks(safe, blocks, pattern);
+  auto flush = safe.AsyncBuildParity(clio::run::PoolQuery::Dynamic(), 0);
+  flush.Wait();
+  REQUIRE(flush->GetReturnCode() == 0);
+  // Data member 1 and parity row 0 die: two down, within max_failures.
+  auto rm_d = safe.AsyncRemoveBdev(clio::run::PoolQuery::Dynamic(), data_ids[1],
+                                   /*was_faulty=*/1);
+  rm_d.Wait();
+  REQUIRE(rm_d->GetReturnCode() == 0);
+  auto rm_p = safe.AsyncRemoveBdev(clio::run::PoolQuery::Dynamic(),
+                                   parity_ids[0], /*was_faulty=*/1);
+  rm_p.Wait();
+  REQUIRE(rm_p->GetReturnCode() == 0);
+  {
+    std::vector<ctp::u8> got;
+    ReadBlocks(safe, blocks, got);
+    REQUIRE(got == pattern);
+  }
+  // Rebuild the parity row onto a fresh member while data member 1 is down.
+  clio::run::PoolId recover_id(static_cast<clio::run::u32>(8400 + pidsalt), 0);
+  clio::run::bdev::Client recover_client(recover_id);
+  REQUIRE(CreateRamMember(recover_client, member_name(200), recover_id));
+  recover_id = recover_client.pool_id_;
+  auto rec = safe.AsyncRecoverBdev(clio::run::PoolQuery::Dynamic(),
+                                   parity_ids[0], member_name(200),
+                                   /*node_id=*/0, recover_id);
+  rec.Wait();
+  REQUIRE(rec->GetReturnCode() == 0);
+  // The rebuilt parity must be correct: a SECOND data member dies (two data
+  // columns down now) and every byte still reads back.
+  auto rm_d0 = safe.AsyncRemoveBdev(clio::run::PoolQuery::Dynamic(),
+                                    data_ids[0], /*was_faulty=*/1);
+  rm_d0.Wait();
+  REQUIRE(rm_d0->GetReturnCode() == 0);
+  {
+    std::vector<ctp::u8> got;
+    ReadBlocks(safe, blocks, got);
+    REQUIRE(got == pattern);
+  }
+  HLOG(kInfo, "safe_bdev: parity rebuilt with a data member down, then "
+              "carried a second data failure -- OK");
+}
+
 TEST_CASE("safe_bdev_raid0_striping", "[safe_bdev][ec][striping]") {
   EnsureInit();
   REQUIRE(g_initialized);
@@ -461,6 +557,96 @@ TEST_CASE("safe_bdev_raid0_striping", "[safe_bdev][ec][striping]") {
        num_chunks, k);
 }
 
+/**
+ * #1160: the allocator keeps consecutive single-chunk allocations (what
+ * concurrent small writers issue) off one stripe, so they do not serialize
+ * on its lock, and places a request with a chunk for every member as one
+ * whole stripe, whose parity then follows from its own bytes.
+ */
+TEST_CASE("safe_bdev_alloc_spreads_small_puts", "[safe_bdev][alloc][spread]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  std::this_thread::sleep_for(100ms);
+
+  const int pidsalt = static_cast<int>(getpid() & 0xFFF);
+  auto member_name = [&](int idx) {
+    return "al_member_" + std::to_string(getpid()) + "_" + std::to_string(idx);
+  };
+  const int k = 4;
+  std::vector<clio::run::PoolId> data_ids;
+  for (int c = 0; c < k; ++c) {
+    clio::run::PoolId id(static_cast<clio::run::u32>(9500 + pidsalt + c), 0);
+    clio::run::bdev::Client client(id);
+    REQUIRE(CreateRamMember(client, member_name(c), id));
+    data_ids.push_back(client.pool_id_);
+  }
+  clio::run::PoolId safe_id(static_cast<clio::run::u32>(9560 + pidsalt), 0);
+  clio::run::safe_bdev::Client safe(safe_id);
+  std::vector<clio::run::safe_bdev::MemberBdevDesc> members;
+  for (int c = 0; c < k; ++c) {
+    members.emplace_back(member_name(c), /*node_id=*/0, data_ids[c]);
+  }
+  auto create_task = safe.AsyncCreate(clio::run::PoolQuery::Dynamic(),
+                                      "safe_bdev_al_pool", safe_id,
+                                      /*max_failures=*/1, members);
+  create_task.Wait();
+  safe.pool_id_ = create_task->new_pool_id_;
+  REQUIRE(create_task->GetReturnCode() == 0);
+
+  // Banded addressing (mirrors Runtime::Unband): chunk -> (member, slot).
+  constexpr clio::run::u64 kSlotsPerMember = (1ull << 32);
+  auto decode = [&](const clio::run::bdev::Block &b, clio::run::u64 &d,
+                    clio::run::u64 &slot) {
+    const clio::run::u64 chunk = b.offset_ / kChunkLen;
+    d = chunk / kSlotsPerMember;
+    slot = chunk % kSlotsPerMember;
+  };
+
+  // Eight single-chunk allocations in a row: eight distinct stripes.
+  std::set<clio::run::u64> small_slots;
+  for (int i = 0; i < 8; ++i) {
+    std::vector<clio::run::bdev::Block> blocks = AllocBlocks(safe, kChunkLen);
+    REQUIRE(blocks.size() == 1);
+    clio::run::u64 d = 0, slot = 0;
+    decode(blocks[0], d, slot);
+    small_slots.insert(slot);
+  }
+  REQUIRE(small_slots.size() == 8);
+
+  // A chunk per member: one stripe, every member once.
+  {
+    std::vector<clio::run::bdev::Block> blocks =
+        AllocBlocks(safe, static_cast<clio::run::u64>(k) * kChunkLen);
+    REQUIRE(blocks.size() == static_cast<size_t>(k));
+    std::set<clio::run::u64> slots, mems;
+    for (const auto &b : blocks) {
+      clio::run::u64 d = 0, slot = 0;
+      decode(b, d, slot);
+      slots.insert(slot);
+      mems.insert(d);
+    }
+    REQUIRE(slots.size() == 1);
+    REQUIRE(mems.size() == static_cast<size_t>(k));
+    REQUIRE(small_slots.count(*slots.begin()) == 0);  // not a shared stripe
+  }
+
+  // Six chunks: a whole stripe first, the remainder a chunk at a time.
+  {
+    std::vector<clio::run::bdev::Block> blocks =
+        AllocBlocks(safe, static_cast<clio::run::u64>(k + 2) * kChunkLen);
+    REQUIRE(blocks.size() == static_cast<size_t>(k + 2));
+    std::set<clio::run::u64> first_stripe;
+    for (int i = 0; i < k; ++i) {
+      clio::run::u64 d = 0, slot = 0;
+      decode(blocks[static_cast<size_t>(i)], d, slot);
+      first_stripe.insert(slot);
+    }
+    REQUIRE(first_stripe.size() == 1);
+  }
+  HLOG(kInfo, "safe_bdev alloc: 8 small puts on 8 stripes; a {}-chunk put on "
+       "one stripe", k);
+}
+
 TEST_CASE("safe_bdev_reclaim", "[safe_bdev][ec][reclaim]") {
   EnsureInit();
   REQUIRE(g_initialized);
@@ -495,7 +681,10 @@ TEST_CASE("safe_bdev_reclaim", "[safe_bdev][ec][reclaim]") {
   const clio::run::u64 sz = static_cast<clio::run::u64>(k) * kChunkLen;
 
   // Allocate, capture the offset, free, allocate again: the SAME region should
-  // be reused (the allocator is a free-list, not a bump pointer).
+  // be reused (the allocator is a free-list, not a bump pointer). The request
+  // is a whole stripe, so the whole allocation is freed: a stripe is reused
+  // by a stripe-sized request only when every member's chunk of it is free
+  // (#1160); a single freed chunk goes to the next single-chunk request.
   auto a1 = safe.AsyncAllocateBlocks(clio::run::PoolQuery::Dynamic(), sz);
   a1.Wait();
   REQUIRE(a1->GetReturnCode() == 0);
@@ -503,7 +692,7 @@ TEST_CASE("safe_bdev_reclaim", "[safe_bdev][ec][reclaim]") {
   const clio::run::u64 off1 = a1->blocks_[0].offset_;
 
   clio::run::priv::vector<clio::run::bdev::Block> fblocks(CTP_MALLOC);
-  fblocks.push_back(a1->blocks_[0]);
+  for (size_t i = 0; i < a1->blocks_.size(); ++i) fblocks.push_back(a1->blocks_[i]);
   auto fr = safe.AsyncFreeBlocks(clio::run::PoolQuery::Dynamic(), fblocks);
   fr.Wait();
   REQUIRE(fr->GetReturnCode() == 0);

@@ -1116,7 +1116,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       a.free_.clear();
       for (clio::run::u64 s = 0; s < a.high_water_; ++s) {
         if (a.live_.count(s) == 0) {
-          a.free_.push_back(s);
+          a.free_.insert(s);
         }
       }
       total_live += a.live_.size();
@@ -1237,6 +1237,82 @@ void Runtime::RestoreParityCoverage() {
   }
 }
 
+void Runtime::EmitChunk(clio::run::shared_ptr<AllocateBlocksTask> &task,
+                        size_t d, clio::run::u64 s, clio::run::u64 &remaining) {
+  if (s + 1 > array_high_water_) {
+    array_high_water_ = s + 1;
+    alloc_log_.LogGroupOpen(kHighWaterGroup, 0, array_high_water_, 0, 0);
+  }
+  const clio::run::u64 seg = std::min<clio::run::u64>(kChunkLen, remaining);
+  if (seg < kChunkLen) data_alloc_[d].part_len_[s] = seg;
+  const clio::run::u64 off = BandOffset(static_cast<clio::run::u32>(d), s);
+  task->blocks_.push_back(clio::run::bdev::Block(off, seg, 0));
+  alloc_log_.LogAlloc(kAllocGroup, off, seg, 0);
+  // Do NOT dirty the slot here. Parity tracks COMMITTED (written) data, not
+  // reservations: an allocated-but-unwritten slot holds no meaningful bytes,
+  // and dirtying it lets the async BuildParity encode parity over UNWRITTEN
+  // data. Worse, such a stale build (started between alloc and the write) can
+  // land AFTER the write's parity flush and overwrite the correct parity with
+  // garbage -- a timing-dependent corruption. Write (and stripe-narrowing
+  // Free) are what dirty a slot; a widening add-drive is covered because the
+  // new member's WRITE dirties the stripes it joins.
+  remaining -= seg;
+}
+
+bool Runtime::AllocateFullStripe(
+    clio::run::shared_ptr<AllocateBlocksTask> &task,
+    clio::run::u64 &remaining) {
+  std::vector<size_t> active;
+  for (size_t d = 0; d < data_members_.size(); ++d) {
+    if (data_members_[d].state_ == ec::EcState::kActive) active.push_back(d);
+  }
+  if (active.size() < 2) return false;
+  const clio::run::u64 chunks_left = (remaining + kChunkLen - 1) / kChunkLen;
+  if (chunks_left < active.size()) return false;
+  // The lowest slot free on every live member: a stripe freed whole comes
+  // back first (the allocator stays a free list), else a slot none has used.
+  clio::run::u64 s = 0;
+  for (size_t d : active) s = std::max(s, data_alloc_[d].high_water_);
+  {
+    size_t smallest = active[0];
+    for (size_t d : active) {
+      if (data_alloc_[d].free_.size() < data_alloc_[smallest].free_.size()) {
+        smallest = d;
+      }
+    }
+    for (clio::run::u64 f : data_alloc_[smallest].free_) {
+      bool common = true;
+      for (size_t d : active) {
+        const MemberAlloc &a = data_alloc_[d];
+        if (f < a.high_water_ && a.free_.count(f) == 0) {
+          common = false;
+          break;
+        }
+      }
+      if (common) {
+        s = f;
+        break;
+      }
+    }
+  }
+  for (size_t d : active) {
+    if (s >= data_alloc_[d].cap_slots_) return false;
+  }
+  // Members in round-robin order from the cursor, as chunk-at-a-time
+  // allocation would have placed them.
+  const size_t n = data_members_.size();
+  size_t first = 0;
+  while (first < active.size() && active[first] < rr_cursor_ % n) ++first;
+  for (size_t i = 0; i < active.size(); ++i) {
+    const size_t d = active[(first + i) % active.size()];
+    data_alloc_[d].TakeSlot(s);
+    EmitChunk(task, d, s, remaining);
+  }
+  rr_cursor_ = static_cast<clio::run::u32>(
+      (active[(first + active.size() - 1) % active.size()] + 1) % n);
+  return true;
+}
+
 clio::run::TaskResume Runtime::AllocateBlocks(
     clio::run::shared_ptr<AllocateBlocksTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -1269,13 +1345,17 @@ clio::run::TaskResume Runtime::AllocateBlocks(
   // be executing this container concurrently. No co_await below, so a plain
   // mutex is safe here.
   std::lock_guard<std::mutex> alloc_g(alloc_mu_);
-  const size_t nmembers = data_members_.size();
   clio::run::u64 remaining = size;
   while (remaining > 0) {
-    // Advance the round-robin cursor to the next member that is active and has
-    // a free slot. Give up after a full sweep (array full).
+    // A request with a chunk for every live member takes a whole stripe
+    // (#1160): one never-used slot on each, so its parity follows from its
+    // own bytes (EncodeFullStripe) and it shares no stripe with any other
+    // writer. The rest goes a chunk at a time, each on the next member, in a
+    // slot the last few single-chunk allocations did not use.
+    if (AllocateFullStripe(task, remaining)) continue;
     size_t scanned = 0;
     int chosen = -1;
+    const size_t nmembers = data_members_.size();
     while (scanned < nmembers) {
       const size_t d = rr_cursor_ % nmembers;
       rr_cursor_ = static_cast<clio::run::u32>((d + 1) % nmembers);
@@ -1296,27 +1376,16 @@ clio::run::TaskResume Runtime::AllocateBlocks(
       CLIO_CO_RETURN;
     }
     const size_t d = static_cast<size_t>(chosen);
-    const clio::run::u64 s = data_alloc_[d].Take();
-    if (s + 1 > array_high_water_) {
-      array_high_water_ = s + 1;
-      alloc_log_.LogGroupOpen(kHighWaterGroup, 0, array_high_water_, 0, 0);
+    MemberAlloc &a = data_alloc_[d];
+    clio::run::u64 s = a.PickSpread(recent_slots_);
+    if (s >= a.cap_slots_) {
+      s = a.Take();  // every spread candidate avoided: any slot will do
+    } else {
+      a.TakeSlot(s);
     }
-    const clio::run::u64 seg = std::min<clio::run::u64>(kChunkLen, remaining);
-    if (seg < kChunkLen) data_alloc_[d].part_len_[s] = seg;
-    const clio::run::u64 off = BandOffset(static_cast<clio::run::u32>(d), s);
-
-    clio::run::bdev::Block block(off, seg, 0);
-    task->blocks_.push_back(block);
-    alloc_log_.LogAlloc(kAllocGroup, off, seg, 0);
-    // Do NOT dirty the slot here. Parity tracks COMMITTED (written) data, not
-    // reservations: an allocated-but-unwritten slot holds no meaningful bytes,
-    // and dirtying it lets the async BuildParity encode parity over UNWRITTEN
-    // data. Worse, such a stale build (started between alloc and the write) can
-    // land AFTER the write's parity flush and overwrite the correct parity with
-    // garbage -- a timing-dependent corruption. Write (and stripe-narrowing
-    // Free) are what dirty a slot; a widening add-drive is covered because the
-    // new member's WRITE dirties the stripes it joins.
-    remaining -= seg;
+    recent_slots_.push_back(s);
+    if (recent_slots_.size() > kSpreadWindow) recent_slots_.pop_front();
+    EmitChunk(task, d, s, remaining);
   }
   // Into the kernel before the caller learns the slots (one write, no
   // fsync): the CTE logs a blob layout that names them right after, and a
@@ -2573,6 +2642,53 @@ clio::run::TaskResume Runtime::RebuildMember(bool is_data, int idx, bool &ok,
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::RebuildParityShard(
+    clio::run::u64 s, const std::vector<int> &stripe, int idx,
+    std::vector<uint8_t> &chunk, bool &built) {
+  CLIO_TASK_BODY_BEGIN
+  const int k_s = static_cast<int>(stripe.size());
+  std::vector<std::vector<uint8_t>> dchunks;
+  std::vector<int> down;
+  for (int d : stripe) {
+    if (static_cast<size_t>(d) >= data_members_.size() ||
+        !DataActive(static_cast<size_t>(d))) {
+      down.push_back(d);
+    }
+  }
+  if (down.empty()) {
+    // Every data column is on disk: read them as they are.
+    dchunks.assign(static_cast<size_t>(k_s),
+                   std::vector<uint8_t>(kChunkLen, 0));
+    built = true;
+    for (int pos = 0; pos < k_s && built; ++pos) {
+      const int d = stripe[static_cast<size_t>(pos)];
+      CLIO_CO_AWAIT(ReadDataSegment(static_cast<size_t>(d), SlotPhysOffset(s),
+                                    dchunks[static_cast<size_t>(pos)].data(),
+                                    kChunkLen, built));
+    }
+  } else {
+    // A data column is down: decode all k_s data chunks from the active
+    // data members plus the other parity rows (this row is faulty while it
+    // rebuilds and is not consulted).
+    CLIO_CO_AWAIT(ReconstructStripe(s, stripe, down, dchunks, built));
+    if (!built) {
+      HLOG(kError,
+           "safe_bdev RebuildMember: slot {}: cannot rebuild parity row {} "
+           "with {} data column(s) down -- too few survivors",
+           s, idx, down.size());
+    }
+  }
+  if (built) {
+    std::vector<const uint8_t *> ptrs(static_cast<size_t>(k_s));
+    for (int pos = 0; pos < k_s; ++pos) {
+      ptrs[static_cast<size_t>(pos)] = dchunks[static_cast<size_t>(pos)].data();
+    }
+    GetCodec(k_s)->EncodeParityShard(idx, ptrs, kChunkLen, chunk.data());
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::RebuildRedo(bool is_data, int idx, bool &ok) {
   CLIO_TASK_BODY_BEGIN
   std::set<clio::run::u64> redo;
@@ -2653,29 +2769,9 @@ clio::run::TaskResume Runtime::RebuildSlot(bool is_data, int idx,
         chunk = std::move(chunks[static_cast<size_t>(it - stripe.begin())]);
       }
     } else {
-      // Recompute this parity member's shard from the stripe's data chunks
-      // (all data members must be active).
-      std::vector<std::vector<uint8_t>> dchunks(
-          static_cast<size_t>(k_s), std::vector<uint8_t>(kChunkLen, 0));
-      built = true;
-      for (int pos = 0; pos < k_s && built; ++pos) {
-        const int d = stripe[static_cast<size_t>(pos)];
-        if (!DataActive(static_cast<size_t>(d))) {
-          built = false;
-          break;
-        }
-        CLIO_CO_AWAIT(ReadDataSegment(static_cast<size_t>(d), SlotPhysOffset(s),
-                                      dchunks[static_cast<size_t>(pos)].data(),
-                                      kChunkLen, built));
-      }
-      if (built) {
-        std::vector<const uint8_t *> ptrs(static_cast<size_t>(k_s));
-        for (int pos = 0; pos < k_s; ++pos) {
-          ptrs[static_cast<size_t>(pos)] =
-              dchunks[static_cast<size_t>(pos)].data();
-        }
-        GetCodec(k_s)->EncodeParityShard(idx, ptrs, kChunkLen, chunk.data());
-      }
+      // Recompute this parity member's shard from the stripe's data chunks,
+      // decoding any down data column from the survivors first (#1199).
+      CLIO_CO_AWAIT(RebuildParityShard(s, stripe, idx, chunk, built));
     }
     ctp::ipc::FullPtr<char> buf =
         built ? ipc->AllocateBuffer(kChunkLen) : ctp::ipc::FullPtr<char>();
