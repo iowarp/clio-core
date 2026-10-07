@@ -922,6 +922,10 @@ static bool IsLossyLib(const std::string &lib) {
 }
 
 constexpr size_t kBlob4MiB = 4 * 1024 * 1024;
+/** The factory presets, in wire-id order (fast, balanced, best). */
+constexpr ctp::CompressionPreset kTestPresets[] = {
+    ctp::CompressionPreset::FAST, ctp::CompressionPreset::BALANCED,
+    ctp::CompressionPreset::BEST};
 constexpr const char *kReasonOk = "ok";
 constexpr const char *kReasonLossyNotAllowed = "qos_lossy_not_allowed";
 
@@ -1168,7 +1172,7 @@ TEST_CASE("DtscheduleCcm - qtable Predict is fast",
   auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < kCalls; ++i) {
     auto p = predictor.Predict(f, libs[i % libs.size()],
-                               static_cast<ctp::CompressionPreset>(1 + i % 3));
+                               kTestPresets[i % 3]);
     sink += p.ratio_;
   }
   auto t1 = std::chrono::steady_clock::now();

@@ -258,7 +258,7 @@ ctp::ipc::FullPtr<char> Runtime::CompressWithDecision(
   auto *header = reinterpret_cast<compressor::CompressionHeader *>(buf.ptr_);
   *header = compressor::CompressionHeader(
       ctp::CompressionFactory::GetWireId(decision.chosen_lib_),
-      static_cast<uint32_t>(decision.chosen_preset_), size, comp_size);
+      compressor::ToWirePreset(decision.chosen_preset_), size, comp_size);
   out->used = true;
   return buf;
 }
@@ -402,14 +402,22 @@ clio::run::TaskResume Runtime::PutBlob(
       load_mult = LoadMultiplier(cpu_a, cpu_b, knobs_.load_aware_,
                                  config_.load_cap_);
       PlanTier(original_size, &place);
-      // The ranker's store cost: the tier's bandwidth when this node owns
-      // the blob, else the slower of tier and network (the bytes cross the
-      // wire before they are stored).
+      // The ranker's store cost: the tier's bandwidth when the bytes stay
+      // on this node, else the slower of tier and network. The payload
+      // crosses the wire when the owner is another node, or when a known
+      // consumer sits on a node other than the owner (it reads the stored
+      // bytes over the network: compressing here shrinks that transfer).
       double rank_bw_mb_ms = place.tier_bw_mb_ms;
-      if (place.owner_node != UINT32_MAX && place.owner_node != local_node_id) {
-        const double net_mb_ms = std::max(config_.net_bw_gbps_, 0.01) / 8.0;
-        rank_bw_mb_ms = rank_bw_mb_ms > 0.0 ? std::min(rank_bw_mb_ms, net_mb_ms)
-                                            : net_mb_ms;
+      {
+        const uint32_t owner = place.owner_node == UINT32_MAX
+                                   ? local_node_id : place.owner_node;
+        const bool consumer_remote = place.consumer_node != UINT32_MAX &&
+                                     place.consumer_node != owner;
+        if (owner != local_node_id || consumer_remote) {
+          const double net_mb_ms = std::max(config_.net_bw_gbps_, 0.01) / 8.0;
+          rank_bw_mb_ms = rank_bw_mb_ms > 0.0
+                              ? std::min(rank_bw_mb_ms, net_mb_ms) : net_mb_ms;
+        }
       }
 
       auto t0 = std::chrono::steady_clock::now();
@@ -816,14 +824,8 @@ ctp::ipc::FullPtr<char> Runtime::DecompressStored(const char *stored,
     return ctp::ipc::FullPtr<char>();
   }
   *lib_name = ctp::CompressionFactory::NameForWireId(header->compress_lib_);
-  ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
-  if (header->compress_preset_ ==
-      static_cast<uint32_t>(compressor::CompressPreset::kFast)) {
-    preset = ctp::CompressionPreset::FAST;
-  } else if (header->compress_preset_ ==
-             static_cast<uint32_t>(compressor::CompressPreset::kBest)) {
-    preset = ctp::CompressionPreset::BEST;
-  }
+  ctp::CompressionPreset preset =
+      compressor::FromWirePreset(header->compress_preset_);
   auto codec = ctp::CompressionFactory::GetPreset(*lib_name, preset);
   if (!codec) {
     HLOG(kWarning, "dtschedule: no codec '{}' for stored blob", *lib_name);
@@ -1542,7 +1544,8 @@ void Runtime::WriteTraceRow(const std::string &tag_id,
       place.owner_node == UINT32_MAX ? "" : std::to_string(place.owner_node),
       std::to_string(decision.n_candidates_),
       out.used ? decision.chosen_lib_ : "raw",
-      chose ? std::to_string(static_cast<int>(decision.chosen_preset_)) : "",
+      chose ? std::to_string(compressor::ToWirePreset(decision.chosen_preset_))
+            : "",
       std::to_string(place.scenario),
       place.tier.empty() ? decision.chosen_tier_ : place.tier,
       chose ? TraceNum(decision.pred_ctime_ms_) : "",
@@ -1572,7 +1575,7 @@ void Runtime::WriteCandidatesTrace(const std::string &tag_id,
     const bool ranked = c.reason_ == ccm::kReasonOk;
     candidates_trace_file_ << JoinCsv(
         {ts, std::to_string(container_id_), tag_id, blob_name, c.lib_,
-         std::to_string(static_cast<int>(c.preset_)),
+         std::to_string(compressor::ToWirePreset(c.preset_)),
          ranked || c.reason_ == ccm::kReasonSkipRatio ? TraceNum(c.pred_ctime_ms_) : "",
          ranked || c.reason_ == ccm::kReasonSkipRatio ? TraceNum(c.pred_dtime_ms_) : "",
          ranked || c.reason_ == ccm::kReasonSkipRatio ? TraceNum(c.pred_ratio_) : "",

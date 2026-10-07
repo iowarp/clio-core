@@ -34,6 +34,7 @@
 #ifndef CLIO_CTE_COMPRESSOR_COMPRESSION_HEADER_H_
 #define CLIO_CTE_COMPRESSOR_COMPRESSION_HEADER_H_
 
+#include <clio_ctp/compress/compress_factory.h>
 #include <cstdint>
 
 namespace clio::cte::compressor {
@@ -47,6 +48,43 @@ enum class CompressPreset : uint32_t {
   kBalanced = 2,  ///< Balanced speed and ratio (default)
   kBest = 3,      ///< Best ratio, slower
 };
+
+/**
+ * Wire id (CompressPreset, 1-based) of a factory preset. The factory enum
+ * is 0-based (FAST=0, BALANCED=1, BEST=2, DEFAULT=3), so never static_cast
+ * between the two.
+ *
+ * @param preset Factory preset
+ * @return 1 (fast), 2 (balanced, also DEFAULT) or 3 (best)
+ */
+inline uint32_t ToWirePreset(ctp::CompressionPreset preset) {
+  switch (preset) {
+    case ctp::CompressionPreset::FAST:
+      return static_cast<uint32_t>(CompressPreset::kFast);
+    case ctp::CompressionPreset::BEST:
+      return static_cast<uint32_t>(CompressPreset::kBest);
+    case ctp::CompressionPreset::BALANCED:
+    case ctp::CompressionPreset::DEFAULT:
+      break;
+  }
+  return static_cast<uint32_t>(CompressPreset::kBalanced);
+}
+
+/**
+ * Factory preset for a wire id; unknown ids decode as BALANCED.
+ *
+ * @param wire 1, 2 or 3 (CompressPreset)
+ * @return The matching factory preset
+ */
+inline ctp::CompressionPreset FromWirePreset(uint32_t wire) {
+  if (wire == static_cast<uint32_t>(CompressPreset::kFast)) {
+    return ctp::CompressionPreset::FAST;
+  }
+  if (wire == static_cast<uint32_t>(CompressPreset::kBest)) {
+    return ctp::CompressionPreset::BEST;
+  }
+  return ctp::CompressionPreset::BALANCED;
+}
 
 /**
  * Compression header prepended to compressed data for self-describing format.

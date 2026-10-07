@@ -38,6 +38,11 @@ namespace clio::cte::dtschedule::ccm {
 size_t CandidateSet::BuildAll() {
   all_candidates_.clear();
 
+  // The three levels every candidate library is tried at. The factory enum
+  // is 0-based (FAST=0): never build these from integers (#1205).
+  static constexpr ctp::CompressionPreset kPresets[] = {
+      ctp::CompressionPreset::FAST, ctp::CompressionPreset::BALANCED,
+      ctp::CompressionPreset::BEST};
   // Lossless libraries and their presets
   const std::vector<std::string> lossless_libs = {
     "zstd", "lz4", "zlib", "bzip2", "lzma", "brotli", "snappy", "blosc2"
@@ -48,8 +53,7 @@ size_t CandidateSet::BuildAll() {
 
   // Try each lossless library at all three presets
   for (const auto &lib : lossless_libs) {
-    for (int preset_val = 1; preset_val <= 3; ++preset_val) {
-      auto preset = static_cast<ctp::CompressionPreset>(preset_val);
+    for (ctp::CompressionPreset preset : kPresets) {
       auto compressor = ctp::CompressionFactory::GetPreset(lib, preset);
       if (compressor) {
         all_candidates_.push_back(Candidate{lib, preset, false});
@@ -59,8 +63,7 @@ size_t CandidateSet::BuildAll() {
 
   // Try each lossy library at all three presets
   for (const auto &lib : lossy_libs) {
-    for (int preset_val = 1; preset_val <= 3; ++preset_val) {
-      auto preset = static_cast<ctp::CompressionPreset>(preset_val);
+    for (ctp::CompressionPreset preset : kPresets) {
       auto compressor = ctp::CompressionFactory::GetPreset(lib, preset);
       if (compressor) {
         all_candidates_.push_back(Candidate{lib, preset, true});
