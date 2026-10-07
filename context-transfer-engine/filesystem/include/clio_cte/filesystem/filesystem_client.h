@@ -1041,6 +1041,16 @@ class Client : public clio::cte::core::Client {
   int TruncatePath(const std::string &raw_path, FsOff length);
   int RemovePath(const std::string &raw_path);
   int RenamePath(const std::string &raw_src, const std::string &raw_dst);
+  /**
+   * mkdir(2) for a clio:: path: create the directory in the CTE namespace.
+   * The parent must exist (ENOENT otherwise); an existing entry is EEXIST so
+   * `mkdir -p` works; other failures are EIO.
+   *
+   * @param raw_path path carrying the clio:: marker
+   * @param mode     POSIX mode bits (recorded, not enforced)
+   * @return 0, or -1 with errno set
+   */
+  int MkdirPath(const std::string &raw_path, mode_t mode);
   int ReaddirPath(const std::string &raw_path, std::vector<std::string> *out);
 
   /** Stable 64-bit synthetic inode from the bare path. */

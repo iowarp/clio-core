@@ -55,6 +55,7 @@
 
 extern "C" {
 typedef int (*open_t)(const char *path, int flags, ...);
+typedef int (*mkdir_t)(const char *path, mode_t mode);
 typedef int (*open64_t)(const char *path, int flags, ...);
 typedef int (*__open_2_t)(const char *path, int oflag);
 typedef int (*creat_t)(const char *path, mode_t mode);
@@ -133,6 +134,8 @@ class PosixApi : public RealApi {
  public:
   /** open */
   open_t open = nullptr;
+  /** mkdir */
+  mkdir_t mkdir = nullptr;
   /** open64 */
   open64_t open64 = nullptr;
   /** __open_2 */
@@ -202,6 +205,8 @@ class PosixApi : public RealApi {
   PosixApi() : RealApi("open", "posix_intercepted") {
     open = (open_t)dlsym(real_lib_, "open");
     REQUIRE_API(open)
+    mkdir = (mkdir_t)dlsym(real_lib_, "mkdir");
+    REQUIRE_API(mkdir)
     open64 = (open64_t)dlsym(real_lib_, "open64");
     REQUIRE_API(open64)
     __open_2 = (__open_2_t)dlsym(real_lib_, "__open_2");

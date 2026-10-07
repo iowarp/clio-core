@@ -309,6 +309,23 @@ int Client::RemovePath(const std::string &raw_path) {
   return 0;
 }
 
+int Client::MkdirPath(const std::string &raw_path, mode_t mode) {
+  (void)mode;
+  if (!EnsureInit()) {
+    errno = EIO;
+    return -1;
+  }
+  std::string path = StripClioPrefix(raw_path);
+  auto t = AsyncMkdir(path);
+  t.Wait();
+  const int rc = static_cast<int>(t->GetReturnCode());
+  if (rc == 0) {
+    return 0;
+  }
+  errno = (rc == EEXIST || rc == ENOENT || rc == ENOTDIR) ? rc : EIO;
+  return -1;
+}
+
 int Client::RenamePath(const std::string &raw_src, const std::string &raw_dst) {
   if (!EnsureInit()) {
     errno = EIO;

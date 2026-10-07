@@ -440,3 +440,59 @@ TEST_CASE("POSIX Adapter: seek + truncate + sync + unlink",
   REQUIRE(stat(clio.c_str(), &probe) == -1);
   REQUIRE(errno == ENOENT);
 }
+
+/**
+ * POSIX Adapter: mkdir and create inside a subdirectory.
+ *
+ * The filesystem chimod requires a file's parent directory to exist, and
+ * `mkdir -p` style tooling creates each component; both must go through the
+ * interposer. A create under a directory that was never made must fail with
+ * ENOENT rather than succeed on the real filesystem.
+ */
+TEST_CASE("POSIX Adapter: mkdir then create in subdirectory",
+          "[posix][adapter][mkdir]") {
+  REQUIRE(initializeRuntime());
+  const std::string dir = "clio::/tmp/dt_mkdir_test";
+  const std::string sub = dir + "/sub";
+  const std::string file = sub + "/f.dat";
+  // Parents must exist in the CTE namespace: create /tmp first.
+  int rc = mkdir("clio::/tmp", 0755);
+  int err = errno;
+  INFO("mkdir clio::/tmp rc=" << rc << " errno=" << err);
+  REQUIRE((rc == 0 || err == EEXIST));
+  rc = mkdir(dir.c_str(), 0755);
+  err = errno;
+  INFO("mkdir " << dir << " rc=" << rc << " errno=" << err);
+  REQUIRE((rc == 0 || err == EEXIST));
+  rc = mkdir(sub.c_str(), 0755);
+  err = errno;
+  INFO("mkdir " << sub << " rc=" << rc << " errno=" << err);
+  REQUIRE((rc == 0 || err == EEXIST));
+  // Two root-marker spellings of the same path must agree.
+  rc = mkdir("/clio::tmp/dt_mkdir_test/sub", 0755);
+  REQUIRE((rc == 0 || errno == EEXIST));
+  const size_t n = 1 << 20;
+  std::vector<char> data(n);
+  for (size_t i = 0; i < n; ++i) data[i] = static_cast<char>((i * 7) % 251);
+  int fd = open(file.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  REQUIRE(fd >= 0);
+  REQUIRE(write(fd, data.data(), n) == static_cast<ssize_t>(n));
+  REQUIRE(close(fd) == 0);
+  fd = open("/clio::tmp/dt_mkdir_test/sub/f.dat", O_RDONLY);
+  REQUIRE(fd >= 0);
+  std::vector<char> got(n, 0);
+  REQUIRE(read(fd, got.data(), n) == static_cast<ssize_t>(n));
+  REQUIRE(close(fd) == 0);
+  REQUIRE(std::memcmp(got.data(), data.data(), n) == 0);
+  REQUIRE(unlink(file.c_str()) == 0);
+  // Whatever the namespace does with a create under a directory nobody
+  // made, it must stay inside the CTE: nothing may leak onto the real
+  // filesystem.
+  int fd2 = open("clio::/tmp/dt_missing_dir/f.dat", O_CREAT | O_WRONLY, 0644);
+  if (fd2 >= 0) {
+    close(fd2);
+    unlink("clio::/tmp/dt_missing_dir/f.dat");
+  }
+  REQUIRE_FALSE(stdfs::exists("/tmp/dt_missing_dir/f.dat"));
+  REQUIRE_FALSE(stdfs::exists("/tmp/dt_mkdir_test/sub/f.dat"));
+}

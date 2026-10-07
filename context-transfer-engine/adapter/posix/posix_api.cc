@@ -64,6 +64,22 @@ int CLIO_CTE_DECL(open)(const char *path, int flags, ...) {
   return real_api->open(path, flags);
 }
 
+/**
+ * mkdir(2): directories on clio:: paths are created in the CTE namespace
+ * (the filesystem chimod requires a file's parent to exist), everything
+ * else goes to the real libc.
+ */
+int CLIO_CTE_DECL(mkdir)(const char *path, mode_t mode) {
+  auto real_api = CLIO_CTE_POSIX_API;
+  auto cfs = CLIO_CFS_CLIENT;
+  if (real_api->IsInterceptorLoaded() &&
+      clio::cte::filesystem::Client::IsPathTracked(path)) {
+    HLOG(kDebug, "Intercept mkdir for path: {}", path);
+    return cfs->MkdirPath(path, mode);
+  }
+  return real_api->mkdir(path, mode);
+}
+
 int CLIO_CTE_DECL(open64)(const char *path, int flags, ...) {
   int mode = 0;
   auto real_api = CLIO_CTE_POSIX_API;
