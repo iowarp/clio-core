@@ -51,6 +51,7 @@
 
 #include "clio_runtime/work_orchestrator.h"
 #include "clio_runtime/worker.h"
+#include "clio_cte/compressor/compression_header.h"
 #include "clio_ctp/compress/compress_factory.h"
 #include "clio_ctp/util/gpu_api.h"
 #if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
@@ -115,50 +116,6 @@ static constexpr int kDecompWaitMaxSpins = 100000;
 // Bring chi namespace items into scope for CLIO_CUR_WORKER macro
 using clio::run::chi_cur_worker_key_;
 using clio::run::Worker;
-
-/**
- * Compression header prepended to compressed data for self-describing format.
- * This allows decompression without external metadata.
- */
-struct CompressionHeader {
-  static constexpr uint32_t kMagic = 0x43544543;  // "CTEC" in ASCII
-  uint32_t magic_;            // Magic number to identify compressed data
-  uint32_t compress_lib_;     // Compression library ID
-  uint32_t compress_preset_;  // Compression preset
-  uint64_t original_size_;    // Original uncompressed size
-  /**
-   * EXACT compressed payload size (bytes following this header).
-   *
-   * Frame-exact codecs need it. A reader does not know the compressed length
-   * a priori, so it over-allocates its fetch and the trailing bytes are
-   * garbage; passing that over-estimate to LZ4_decompress_safe (or zstd) makes
-   * decompression FAIL. Without this field the reader could only guess
-   * "request size minus header", which is exactly that over-estimate.
-   *
-   * 0 means "written before this field existed" -- readers fall back to the
-   * derived estimate for those blobs.
-   */
-  uint64_t compressed_size_;
-
-  CompressionHeader()
-      : magic_(kMagic),
-        compress_lib_(0),
-        compress_preset_(0),
-        original_size_(0),
-        compressed_size_(0) {}
-
-  CompressionHeader(uint32_t lib, uint32_t preset, uint64_t orig_size,
-                    uint64_t comp_size = 0)
-      : magic_(kMagic),
-        compress_lib_(lib),
-        compress_preset_(preset),
-        original_size_(orig_size),
-        compressed_size_(comp_size) {}
-
-  bool IsValid() const { return magic_ == kMagic; }
-};
-static_assert(sizeof(CompressionHeader) == 32,
-              "CompressionHeader must be 32 bytes");
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
