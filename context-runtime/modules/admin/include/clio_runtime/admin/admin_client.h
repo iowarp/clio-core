@@ -460,6 +460,7 @@ class Client : public clio::run::ContainerClient {
     auto* ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<HeartbeatTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query);
+    task->SetFlags(TASK_LIVENESS_PROBE);  // reaches a node marked dead (#1222)
     return ipc_manager->Send(task);
   }
 
@@ -515,6 +516,7 @@ class Client : public clio::run::ContainerClient {
 
     auto task = ipc_manager->NewTask<ProbeRequestTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, target_node_id);
+    task->SetFlags(TASK_LIVENESS_PROBE);  // reaches a node marked dead (#1222)
 
     return ipc_manager->Send(task);
   }
