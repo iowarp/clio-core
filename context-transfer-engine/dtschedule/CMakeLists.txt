@@ -55,3 +55,9 @@ target_include_directories(clio_cte_dtschedule_client PRIVATE
 if(BUILD_TESTING OR CLIO_CORE_ENABLE_TESTS)
     add_subdirectory(test)
 endif()
+
+# Co-located MPI load generator for the evaluations (optional: needs MPI).
+find_package(MPI COMPONENTS C QUIET)
+if(MPI_C_FOUND)
+    add_subdirectory(tools/mpi_stress)
+endif()
