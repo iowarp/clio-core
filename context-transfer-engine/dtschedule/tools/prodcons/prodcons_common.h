@@ -59,6 +59,8 @@ typedef struct {
   int producers;       /**< Producer rank count (consumer side) */
   double noise;        /**< Relative noise added to the output field */
   int passes;          /**< Consumer: compute passes over each file */
+  const char *payload; /**< Producer: directory of data files to emit
+                            instead of the solver field (NULL = field) */
 } PcOptions;
 
 /**
@@ -78,6 +80,7 @@ static inline void PcParse(int argc, char **argv, PcOptions *opts) {
     else if (!strcmp(k, "--producers")) opts->producers = atoi(v);
     else if (!strcmp(k, "--noise")) opts->noise = atof(v);
     else if (!strcmp(k, "--passes")) opts->passes = atoi(v);
+    else if (!strcmp(k, "--payload")) opts->payload = v;
   }
 }
 

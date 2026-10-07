@@ -76,6 +76,11 @@ class ClioProdcons(Application):
              'type': float, 'default': 0.02},
             {'name': 'passes', 'msg': 'Consumer passes over each file',
              'type': int, 'default': 4},
+            {'name': 'payload', 'msg': 'Directory of data files the '
+             'producer writes windows of instead of its solver field (the '
+             'field barely compresses losslessly); must exist on the '
+             'producer nodes. Empty = the field', 'type': str,
+             'default': ''},
             {'name': 'net_if', 'msg': 'CIDR for MPI traffic; empty = any',
              'type': str, 'default': ''},
             {'name': 'timeout_s', 'msg': 'Give up waiting for the consumer',
@@ -83,8 +88,12 @@ class ClioProdcons(Application):
         ]
 
     def _configure(self, **kwargs):
-        """Store the config."""
+        """Store the config and write placement.json now: clio_dtschedule
+        loads its DAG when its pool is created at runtime start, which is
+        before this package's start() runs."""
         super()._configure(**kwargs)
+        producers, consumers = self._split_hosts()
+        self._write_placement(producers, consumers)
 
     def _out(self):
         """Expanded output directory (created on demand)."""
@@ -108,16 +117,30 @@ class ClioProdcons(Application):
         per = int(c['ppn_producer'])
         size = int(c['nx']) * int(c['ny']) * 8
         files = {}
+        tasks = {}
+        for r in range(nprod):
+            tasks[f'heat_rank{r}'] = {'node': producers[r // per],
+                                      'outputs': [], 'inputs': []}
+        for i, host in enumerate(consumers):
+            tasks[f'checksum_{i}'] = {'node': host, 'outputs': [],
+                                      'inputs': []}
         for step in range(int(c['steps'])):
             for r in range(nprod):
-                files[f'step{step}_rank{r}.dat'] = {
+                name = f'step{step}_rank{r}.dat'
+                files[name] = {
                     'producer': f'heat_rank{r}',
                     'producer_node': producers[r // per],
-                    'consumers': ['checksum'],
+                    'consumers': [f'checksum_{i}'
+                                  for i in range(len(consumers))],
                     'consumer_nodes': list(consumers),
                     'size': size}
+                tasks[f'heat_rank{r}']['outputs'].append(name)
+                for i in range(len(consumers)):
+                    tasks[f'checksum_{i}']['inputs'].append(name)
+        # The clio_dtschedule DAG loader requires `tasks` (node + inputs /
+        # outputs per task); `files` adds the per-file placement block.
         doc = {'recipe': 'prodcons', 'nodes': producers + consumers,
-               'path_prefix': 'clio::', 'files': files}
+               'path_prefix': 'clio::', 'tasks': tasks, 'files': files}
         with open(os.path.join(self._out(), 'placement.json'), 'w') as fh:
             json.dump(doc, fh)
 
@@ -197,7 +220,9 @@ class ClioProdcons(Application):
                                  int(c['ppn_producer'])),
             nprod, int(c['ppn_producer']), 'dtschedule_heat_producer',
             f'{shape} --iters-per-step {int(c["iters_per_step"])} '
-            f'--noise {float(c["noise"])}', prod_log)
+            f'--noise {float(c["noise"])}'
+            + (f' --payload {c["payload"]}' if c.get('payload') else ''),
+            prod_log)
         self.log(f'prodcons consumer: {cons_cmd}')
         self.log(f'prodcons producer: {prod_cmd}')
         t0 = time.time()

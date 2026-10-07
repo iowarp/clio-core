@@ -46,8 +46,10 @@
  *   heat_producer ranks=N steps=S step_mb=M compute_s=C write_s=W wall_s=T
  */
 
+#include <dirent.h>
 #include <math.h>
 #include <mpi.h>
+#include <sys/stat.h>
 
 #include "prodcons_common.h"
 
@@ -142,6 +144,60 @@ static void SlabSnapshot(const Slab *s, double *out, double noise) {
 }
 
 /**
+ * Load this rank's payload file (the rank-th regular file of dir, sorted by
+ * name, modulo the count) into memory.
+ * @param dir Directory of data files
+ * @param rank This rank
+ * @param len Output: bytes loaded
+ * @return Malloc'd buffer, or NULL on failure
+ */
+static char *LoadPayload(const char *dir, int rank, size_t *len) {
+  struct dirent **list = NULL;
+  int n = scandir(dir, &list, NULL, alphasort);
+  char path[1024] = {0};
+  int files = 0;
+  for (int i = 0; i < n; ++i) {
+    if (list[i]->d_name[0] != '.') ++files;
+  }
+  for (int i = 0, k = 0; i < n && files > 0; ++i) {
+    if (list[i]->d_name[0] == '.') continue;
+    if (k++ == rank % files) {
+      snprintf(path, sizeof(path), "%s/%s", dir, list[i]->d_name);
+    }
+  }
+  for (int i = 0; i < n; ++i) free(list[i]);
+  free(list);
+  struct stat st;
+  if (path[0] == '\0' || stat(path, &st) != 0) return NULL;
+  char *buf = malloc((size_t)st.st_size);
+  size_t got = 0;
+  if (buf == NULL || PcReadFile(path, buf, (size_t)st.st_size, &got) != 0) {
+    free(buf);
+    return NULL;
+  }
+  *len = got;
+  return buf;
+}
+
+/**
+ * Fill out with a window of the payload, offset by step and rank so
+ * consecutive steps carry different bytes.
+ * @param payload Payload data
+ * @param plen Payload length (>= bytes)
+ * @param out Destination
+ * @param bytes Window size
+ * @param step Step index
+ * @param rank This rank
+ */
+static void PayloadWindow(const char *payload, size_t plen, char *out,
+                          size_t bytes, int step, int rank) {
+  const size_t span = plen - bytes + 1;
+  const size_t off = (((size_t)step * 7919u + (size_t)rank * 104729u) *
+                      4096u) % span & ~(size_t)4095;
+  memcpy(out, payload + off, bytes);
+}
+
+/**
  * Write this rank's snapshot for a step and, on rank 0, the step marker.
  * @param o Options
  * @param step Step index
@@ -168,7 +224,9 @@ static int WriteStep(const PcOptions *o, int step, int rank, const double *buf,
 /**
  * Entry point: solve, write a snapshot every step, report.
  * @param argc Argument count
- * @param argv See PcParse (--run --steps --nx --ny --iters-per-step --noise)
+ * @param argv See PcParse (--run --steps --nx --ny --iters-per-step --noise
+ *             --payload DIR: emit windows of the files in DIR instead of
+ *             the solver field, which barely compresses losslessly)
  * @return 0 on success, 2 on I/O failure
  */
 int main(int argc, char **argv) {
@@ -176,13 +234,20 @@ int main(int argc, char **argv) {
   int rank = 0, size = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
-  PcOptions o = {"prodcons", 10, 2048, 2048, 200, 0, 0.02, 0};
+  PcOptions o = {"prodcons", 10, 2048, 2048, 200, 0, 0.02, 0, NULL};
   PcParse(argc, argv, &o);
   Slab s;
   const size_t bytes = (size_t)o.nx * (size_t)o.ny * sizeof(double);
   double *snap = malloc(bytes);
   if (SlabInit(&s, o.nx, o.ny, rank) != 0 || snap == NULL) {
     fprintf(stderr, "heat_producer: rank %d out of memory\n", rank);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+  size_t plen = 0;
+  char *payload = o.payload ? LoadPayload(o.payload, rank, &plen) : NULL;
+  if (o.payload && (payload == NULL || plen < bytes)) {
+    fprintf(stderr, "heat_producer: rank %d: payload under %s unusable\n",
+            rank, o.payload);
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
   double compute_s = 0.0, write_s = 0.0;
@@ -194,7 +259,11 @@ int main(int argc, char **argv) {
       SlabHalo(&s, rank, size);
       SlabSweep(&s);
     }
-    SlabSnapshot(&s, snap, o.noise);
+    if (payload != NULL) {
+      PayloadWindow(payload, plen, (char *)snap, bytes, step, rank);
+    } else {
+      SlabSnapshot(&s, snap, o.noise);
+    }
     const double w0 = PcNow();
     rc = WriteStep(&o, step, rank, snap, bytes);
     compute_s += w0 - c0;
@@ -211,6 +280,7 @@ int main(int argc, char **argv) {
            PcNow() - t0, rc);
     fflush(stdout);
   }
+  free(payload);
   free(snap);
   free(s.cur);
   free(s.next);

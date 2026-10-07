@@ -1161,19 +1161,23 @@ clio::run::TaskResume Runtime::CompressAt(
   cache_ctx.min_persistence_level_ = 0;
   cache_ctx.version_ = tag_version;
 
-  const float score = config_.tiers_.empty() ? -1.0f : config_.tiers_.front().score_;
-  auto cache_put = copy_client_->AsyncPutBlob(
-      task->tag_id_, task->blob_name_.str(), 0, task->size_, task->blob_data_,
-      score, cache_ctx, /*flags=*/0, clio::run::PoolQuery::Local());
-  CLIO_CO_AWAIT(cache_put);
+  // The raw copy at C is a read accelerator, not the data: keep it only
+  // while C's fastest tier has room, and never fail the put over it. Under
+  // memory pressure C just compresses and the bytes go down the tiers.
+  bool raw_cached = false;
+  if (!config_.tiers_.empty() &&
+      ChooseTier(task->size_, C) == config_.tiers_.front().name_) {
+    ChooseTier(task->size_, C, /*reserve=*/true);
+    auto cache_put = copy_client_->AsyncPutBlob(
+        task->tag_id_, task->blob_name_.str(), 0, task->size_,
+        task->blob_data_, config_.tiers_.front().score_, cache_ctx,
+        /*flags=*/0, clio::run::PoolQuery::Local());
+    CLIO_CO_AWAIT(cache_put);
+    raw_cached = cache_put->GetReturnCode() == 0;
+  }
   double cache_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - cache_start)
                         .count();
-
-  if (cache_put->GetReturnCode() != 0) {
-    task->SetReturnCode(cache_put->GetReturnCode());
-    CLIO_CO_RETURN;
-  }
 
   // (b) Compress raw data with the task's codec.
   auto src_ptr = CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
@@ -1211,16 +1215,25 @@ clio::run::TaskResume Runtime::CompressAt(
                        .count();
 
   if (!out.used) {
-    // Compression failed or returned uncompressed; store raw.
+    // Compression did not pay: the raw bytes are the primary, at the owner
+    // (the cache copy above is only a replica).
+    auto raw_start = std::chrono::steady_clock::now();
+    auto raw_put = copy_client_->AsyncPutBlob(
+        task->tag_id_, task->blob_name_.str(), 0, task->size_,
+        task->blob_data_, task->score_, task->context_, /*flags=*/0,
+        clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(raw_put);
     task->comp_size_ = task->size_;
     task->ctime_ms_ = comp_ms;
-    task->store_ms_ = cache_ms;
-    task->context_ = task->context_;  // Unmodified
+    task->store_ms_ = cache_ms + std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() -
+                                     raw_start).count();
+    task->context_ = raw_put->context_;
     {
       std::lock_guard<std::mutex> lock(stats_lock_);
       stats_.s3_local_copies_++;
     }
-    task->SetReturnCode(0);
+    task->SetReturnCode(raw_put->GetReturnCode());
     CLIO_CO_RETURN;
   }
 
@@ -1247,29 +1260,30 @@ clio::run::TaskResume Runtime::CompressAt(
                         .count();
 
   if (owner_put->GetReturnCode() != 0) {
-    // Owner put failed; clean up local cache copy.
-    auto del = copy_client_->AsyncDelBlob(
-        task->tag_id_, task->blob_name_.str(), clio::run::PoolQuery::Local(),
-        clio::cte::core::kDelCacheCopyOnly);
-    CLIO_CO_AWAIT(del);
+    // Owner put failed; drop the local raw copy if one was kept.
+    if (raw_cached) {
+      auto del = copy_client_->AsyncDelBlob(
+          task->tag_id_, task->blob_name_.str(), clio::run::PoolQuery::Local(),
+          clio::cte::core::kDelCacheCopyOnly);
+      CLIO_CO_AWAIT(del);
+    }
     task->SetReturnCode(owner_put->GetReturnCode());
     CLIO_CO_RETURN;
   }
 
-  // (d) Register C as copy holder at the owner.
-  auto reg = copy_client_->AsyncRegisterReplicaContainer(
-      task->tag_id_, task->blob_name_.str(), C,
-      clio::run::PoolQuery::Dynamic(), tag_version);
-  CLIO_CO_AWAIT(reg);
-
-  if (reg->GetReturnCode() != 0) {
-    // Registration failed; clean up.
-    auto del = copy_client_->AsyncDelBlob(
-        task->tag_id_, task->blob_name_.str(), clio::run::PoolQuery::Local(),
-        clio::cte::core::kDelCacheCopyOnly);
-    CLIO_CO_AWAIT(del);
-    task->SetReturnCode(reg->GetReturnCode());
-    CLIO_CO_RETURN;
+  // (d) Register C as copy holder at the owner (only when it holds one; a
+  // failed registration just means reads go to the owner).
+  if (raw_cached) {
+    auto reg = copy_client_->AsyncRegisterReplicaContainer(
+        task->tag_id_, task->blob_name_.str(), C,
+        clio::run::PoolQuery::Dynamic(), tag_version);
+    CLIO_CO_AWAIT(reg);
+    if (reg->GetReturnCode() != 0) {
+      auto del = copy_client_->AsyncDelBlob(
+          task->tag_id_, task->blob_name_.str(), clio::run::PoolQuery::Local(),
+          clio::cte::core::kDelCacheCopyOnly);
+      CLIO_CO_AWAIT(del);
+    }
   }
 
   // (e) Return owner's result and OUT fields.
@@ -1779,6 +1793,27 @@ double Runtime::StoreBwFor(uint64_t bytes, uint32_t owner_node,
   return bw;
 }
 
+bool Runtime::IsOwnTarget(const std::string &target_name) const {
+  /**
+   * Whether a core target is this node's own device. The core registers
+   * "neighborhood" targets: each container also registers its neighbours'
+   * devices as "<path>_node<k>", so the local target list holds other
+   * nodes' NVMe/HDD files too and their space must not count here.
+   *
+   * @param target_name Core target name
+   * @return false only when the name ends in "_node<k>" for another node
+   */
+  const size_t pos = target_name.rfind("_node");
+  if (pos == std::string::npos || pos + 5 >= target_name.size()) {
+    return true;
+  }
+  const std::string digits = target_name.substr(pos + 5);
+  if (digits.find_first_not_of("0123456789") != std::string::npos) {
+    return true;
+  }
+  return std::stoul(digits) == CLIO_IPC->GetNodeId();
+}
+
 size_t Runtime::TierIndexForTarget(const std::string &target_name,
                                   float target_score) const {
   /**
@@ -1857,6 +1892,9 @@ clio::run::TaskResume Runtime::CollectTierRemaining(
     std::vector<std::string> names(list->target_names_.begin(),
                                    list->target_names_.end());
     for (size_t i = 0; i < names.size(); ++i) {
+      if (!IsOwnTarget(names[i])) {
+        continue;  // a neighbour's device registered here (core neighborhood)
+      }
       auto info = copy_client_->AsyncGetTargetInfo(
           names[i], clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(info);

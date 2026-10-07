@@ -547,6 +547,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * @param out Free bytes per tier, in config_.tiers_ order
    */
   clio::run::TaskResume CollectTierRemaining(std::vector<uint64_t> *out);
+  /** False for another node's device registered here as a neighbour. */
+  bool IsOwnTarget(const std::string &target_name) const;
   /** Configured tier index for a core target (name match, else score). */
   size_t TierIndexForTarget(const std::string &target_name,
                             float target_score) const;
