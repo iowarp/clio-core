@@ -57,6 +57,7 @@ if(BUILD_TESTING OR CLIO_CORE_ENABLE_TESTS)
 endif()
 
 # Co-located MPI load generator for the evaluations (optional: needs MPI).
+add_subdirectory(tools/compress_load)
 find_package(MPI COMPONENTS C QUIET)
 if(MPI_C_FOUND)
     add_subdirectory(tools/mpi_stress)

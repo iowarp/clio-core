@@ -29,6 +29,7 @@
  * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
+ */
 
 /**
  * @file mpi_stress.c
@@ -76,12 +77,16 @@ typedef struct {
   size_t mem_mb;      /**< Working set per rank */
   size_t halo_kb;     /**< Bytes exchanged with each neighbour per iteration */
   double compute_ms;  /**< Target length of the compute phase */
+  long iters;         /**< Stop after this many iterations (0 = no cap) */
+  double work_m;      /**< Fixed work: million updates per iteration (0 =
+                           time-boxed compute_ms instead) */
 } Options;
 
 /**
  * Parse argv into opts.
  * @param argc Argument count
- * @param argv Arguments (--duration-s, --mem-mb, --halo-kb, --compute-ms)
+ * @param argv Arguments (--duration-s, --mem-mb, --halo-kb, --compute-ms,
+ *             --iters, --work-m)
  * @param opts Output options, pre-filled with defaults
  */
 static void ParseArgs(int argc, char **argv, Options *opts) {
@@ -94,6 +99,10 @@ static void ParseArgs(int argc, char **argv, Options *opts) {
       opts->halo_kb = (size_t)atol(argv[i + 1]);
     } else if (strcmp(argv[i], "--compute-ms") == 0) {
       opts->compute_ms = atof(argv[i + 1]);
+    } else if (strcmp(argv[i], "--iters") == 0) {
+      opts->iters = atol(argv[i + 1]);
+    } else if (strcmp(argv[i], "--work-m") == 0) {
+      opts->work_m = atof(argv[i + 1]);
     }
   }
 }
@@ -116,6 +125,25 @@ static double Compute(double *a, size_t n, double budget_ms) {
       acc += a[i];
     }
   } while (Now() < end);
+  return acc;
+}
+
+/**
+ * Fixed-work compute phase: exactly `updates` FMA updates over the working
+ * set, so interference shows up as a longer runtime.
+ * @param a Working set
+ * @param n Elements in a
+ * @param updates Element updates to perform
+ * @return A value derived from the data (keeps the loop from being elided)
+ */
+static double ComputeFixed(double *a, size_t n, size_t updates) {
+  double acc = 0.0;
+  size_t i = 0;
+  for (size_t k = 0; k < updates; ++k, ++i) {
+    if (i >= n) i = 0;
+    a[i] = a[i] * 1.0000001 + 0.5;
+    acc += a[i];
+  }
   return acc;
 }
 
@@ -183,7 +211,7 @@ int main(int argc, char **argv) {
   int rank = 0, size = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
-  Options opts = {0.0, 256, 256, 50.0};
+  Options opts = {0.0, 256, 256, 50.0, 0, 0.0};
   ParseArgs(argc, argv, &opts);
   signal(SIGTERM, OnSignal);
   signal(SIGINT, OnSignal);
@@ -204,11 +232,14 @@ int main(int argc, char **argv) {
   double acc = 0.0;
   int stop = 0;
   while (!stop) {
-    acc += Compute(a, n, opts.compute_ms);
+    acc += opts.work_m > 0
+               ? ComputeFixed(a, n, (size_t)(opts.work_m * 1e6))
+               : Compute(a, n, opts.compute_ms);
     acc = Exchange(send, recv, halo, rank, size, acc) * 1e-9;
     ++iters;
     // Every rank must agree to stop in the same iteration.
-    int want = g_stop || (opts.duration_s > 0 && Now() - t0 >= opts.duration_s);
+    int want = g_stop || (opts.duration_s > 0 && Now() - t0 >= opts.duration_s) ||
+               (opts.iters > 0 && iters >= opts.iters);
     MPI_Allreduce(&want, &stop, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
   }
   const double wall = Now() - t0;
