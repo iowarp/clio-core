@@ -1,0 +1,4 @@
+mode,config,write_s,read_s,app_s,span_s,wall_s,prewarm_per_setting,codec_builds_in_timed,ratio,chunks,start_spread_ms,process_write_s,process_read_s,digest_ok,timed_ok,app_s_vs_best_single_pct,write_s_vs_best_single_pct,read_s_vs_best_single_pct,ratio_vs_best_single_pct
+fixed,"1 process, 1 chunk in flight",42.563395452,451.882599999,494.445995451,630.60235001,844.861,2,0,1.6132172800597622,12816,0.0,42.498,451.883,True,True,0.0,0.0,0.0,0.0
+learn,"1 process, 1 chunk in flight",32.990761365,362.83039999899995,395.821161364,515.06455862,716.27,2,0,2.175819994527589,12816,0.0,32.921,362.830,True,True,-19.946533088419727,-22.49029708589707,-19.70693272991638,34.874577741132605
+oracle,"1 process, 1 chunk in flight",31.792032112,364.757099998,396.54913211,516.525775966,715.893,2,0,2.115125200140705,12816,0.0,31.724,364.757,True,True,-19.799303511742494,-25.30663549186809,-19.28056092471646,31.11223306896076

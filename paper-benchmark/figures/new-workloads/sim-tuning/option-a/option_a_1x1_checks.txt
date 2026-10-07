@@ -1,0 +1,68 @@
+PASS  Nyx it1 best static: bit-exact and timed reads
+PASS  Nyx it1 best static: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  Nyx it1 NeuroPress: bit-exact and timed reads
+PASS  Nyx it1 NeuroPress: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  Nyx it1 cost oracle: bit-exact and timed reads
+PASS  Nyx it1 cost oracle: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  Nyx it1 time oracle: bit-exact and timed reads
+PASS  Nyx it1 time oracle: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  VPIC it1 best static: bit-exact and timed reads
+PASS  VPIC it1 best static: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  VPIC it1 NeuroPress: bit-exact and timed reads
+PASS  VPIC it1 NeuroPress: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  VPIC it1 cost oracle: bit-exact and timed reads
+PASS  VPIC it1 cost oracle: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  VPIC it1 time oracle: bit-exact and timed reads
+PASS  VPIC it1 time oracle: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  WarpX it1 best static: bit-exact and timed reads
+PASS  WarpX it1 best static: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  WarpX it1 NeuroPress: bit-exact and timed reads
+PASS  WarpX it1 NeuroPress: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  WarpX it1 cost oracle: bit-exact and timed reads
+PASS  WarpX it1 cost oracle: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  WarpX it1 time oracle: bit-exact and timed reads
+PASS  WarpX it1 time oracle: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  incflo it1 best static: bit-exact and timed reads
+PASS  incflo it1 best static: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  incflo it1 NeuroPress: bit-exact and timed reads
+PASS  incflo it1 NeuroPress: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  incflo it1 cost oracle: bit-exact and timed reads
+PASS  incflo it1 cost oracle: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  incflo it1 time oracle: bit-exact and timed reads
+PASS  incflo it1 time oracle: k-means 10 iterations, 0 failed  (10 done, 0 failed)
+PASS  Nyx it1 best static: read speed normal (not disturbed)  (0.843 s/GB per read, +0.0% vs the option's median)
+PASS  Nyx it1 NeuroPress: read speed normal (not disturbed)  (0.818 s/GB per read, +0.0% vs the option's median)
+PASS  Nyx it1 cost oracle: read speed normal (not disturbed)  (0.807 s/GB per read, +0.0% vs the option's median)
+PASS  Nyx it1 time oracle: read speed normal (not disturbed)  (0.769 s/GB per read, +0.0% vs the option's median)
+PASS  VPIC it1 best static: read speed normal (not disturbed)  (0.924 s/GB per read, +0.0% vs the option's median)
+PASS  VPIC it1 NeuroPress: read speed normal (not disturbed)  (0.852 s/GB per read, +0.0% vs the option's median)
+PASS  VPIC it1 cost oracle: read speed normal (not disturbed)  (0.856 s/GB per read, +0.0% vs the option's median)
+PASS  VPIC it1 time oracle: read speed normal (not disturbed)  (0.811 s/GB per read, +0.0% vs the option's median)
+PASS  WarpX it1 best static: read speed normal (not disturbed)  (0.706 s/GB per read, +0.0% vs the option's median)
+PASS  WarpX it1 NeuroPress: read speed normal (not disturbed)  (0.708 s/GB per read, +0.0% vs the option's median)
+PASS  WarpX it1 cost oracle: read speed normal (not disturbed)  (0.700 s/GB per read, +0.0% vs the option's median)
+PASS  WarpX it1 time oracle: read speed normal (not disturbed)  (0.701 s/GB per read, +0.0% vs the option's median)
+PASS  incflo it1 best static: read speed normal (not disturbed)  (0.714 s/GB per read, +0.0% vs the option's median)
+PASS  incflo it1 NeuroPress: read speed normal (not disturbed)  (0.750 s/GB per read, +0.0% vs the option's median)
+PASS  incflo it1 cost oracle: read speed normal (not disturbed)  (0.733 s/GB per read, +0.0% vs the option's median)
+PASS  incflo it1 time oracle: read speed normal (not disturbed)  (0.773 s/GB per read, +0.0% vs the option's median)
+PASS  Nyx: NeuroPress faster than the best static  (-19.9%)
+PASS  Nyx: NeuroPress ratio higher than the best static  (+34.9%)
+PASS  Nyx: time oracle is the fastest option  (time oracle 357.5 s, fastest other 395.8 s (NeuroPress))
+PASS  Nyx: time oracle ratio at least NeuroPress's  (2.48 vs 2.18)
+PASS  Nyx: tiering agrees with the measured run  (tiered -17.8% vs measured -19.9%)
+PASS  VPIC: NeuroPress faster than the best static  (-21.7%)
+PASS  VPIC: NeuroPress ratio higher than the best static  (+27.6%)
+PASS  VPIC: time oracle is the fastest option  (time oracle 191.0 s, fastest other 208.4 s (cost oracle))
+PASS  VPIC: time oracle ratio at least NeuroPress's  (2.29 vs 2.11)
+PASS  VPIC: tiering agrees with the measured run  (tiered -18.6% vs measured -21.7%)
+PASS  WarpX: NeuroPress faster than the best static  (-5.9%)
+PASS  WarpX: NeuroPress ratio higher than the best static  (+12.7%)
+PASS  WarpX: time oracle is the fastest option  (time oracle 147.2 s, fastest other 162.0 s (cost oracle))
+PASS  WarpX: time oracle ratio at least NeuroPress's  (2.87 vs 2.11)
+PASS  WarpX: tiering agrees with the measured run  (tiered -5.8% vs measured -5.9%)
+PASS  incflo: NeuroPress faster than the best static  (-22.2%)
+PASS  incflo: NeuroPress ratio higher than the best static  (+45.4%)
+PASS  incflo: time oracle is the fastest option  (time oracle 150.5 s, fastest other 166.4 s (NeuroPress))
+PASS  incflo: time oracle ratio at least NeuroPress's  (4.22 vs 2.44)
+PASS  incflo: tiering agrees with the measured run  (tiered -24.0% vs measured -22.2%)
