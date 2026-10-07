@@ -3174,6 +3174,34 @@ ClientShmInfo IpcManager::GetClientShmInfo(u32 index) const {
   return ClientShmInfo(shm_name, pid, index, size, alloc_id);
 }
 
+namespace {
+/**
+ * Is the client process that owns a segment gone for reaping purposes?
+ * kill(pid, 0) alone is not enough: a zombie (exited, parent has not
+ * waited) still answers, yet it has released every fd, so its memfd
+ * segments are kept alive only by our mapping and are reclaimable. On
+ * Linux the state letter in /proc/<pid>/stat tells the two apart.
+ * @param pid the owning process id
+ * @return true when the process is dead or a zombie
+ */
+bool ClientProcessGone(int pid) {
+  if (!ctp::SystemInfo::IsProcessAlive(pid)) return true;
+#if defined(__linux__)
+  std::ifstream st("/proc/" + std::to_string(pid) + "/stat");
+  std::string line;
+  if (st && std::getline(st, line)) {
+    // "<pid> (<comm>) <state> ..." -- comm may contain spaces/parens, so
+    // take the state from after the LAST ')'.
+    auto rp = line.rfind(')');
+    if (rp != std::string::npos && rp + 2 < line.size()) {
+      return line[rp + 2] == 'Z';
+    }
+  }
+#endif
+  return false;
+}
+}  // namespace
+
 int IpcManager::DeadIpcGraceSec() {
   static const int grace = [] {
     const char *e = std::getenv("CLIO_DEAD_IPC_GRACE_S");
@@ -3218,7 +3246,7 @@ size_t IpcManager::WreapDeadIpcs() {
     }
 
     // Check if the owning process is still alive.
-    if (ctp::SystemInfo::IsProcessAlive(owner_pid)) {
+    if (!ClientProcessGone(owner_pid)) {
       if (dead_alloc_since_.erase(alloc_key) > 0) {
         // A pid we saw dead answers kill(0) again: a zombie, a reused pid,
         // or EPERM from another user's process. Say so, or a segment that

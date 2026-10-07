@@ -352,8 +352,11 @@ TEST_CASE("ClientCrash - a dead client's SHM segments are reclaimed (#1192)",
   if (child == 0) {
     CrashClientMain(/*quiet=*/true);  // allocates SHM, PutBlobs, dies
   }
-  int status = 0;
-  REQUIRE(waitpid(child, &status, 0) == child);
+  // Deliberately do NOT wait for the child yet: until we do it is a zombie,
+  // which still answers kill(pid, 0) although it has released every fd. The
+  // reaper must see through that (/proc/<pid>/stat state 'Z') and reclaim
+  // the segments anyway -- a parent that never waits is the common way a
+  // dead client lingers. The child is reaped (waitpid) at the end.
   // The client's segments are memfds with a symlink clio_<pid>_<idx> in the
   // per-user memfd dir; reaping unmaps them and removes the symlinks.
   const std::string dir = ctp::SystemInfo::GetMemfdDir();
@@ -374,6 +377,8 @@ TEST_CASE("ClientCrash - a dead client's SHM segments are reclaimed (#1192)",
   }
   REQUIRE(left == 0);
   REQUIRE(server.IsRunning());  // and the daemon survived the reap
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child);
   server.Stop();
   for (int i = 0; i < 50 && server.IsRunning(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
