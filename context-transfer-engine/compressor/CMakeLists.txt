@@ -31,11 +31,19 @@ else()
     message(STATUS "Compressor: XGBoost predictor disabled")
 endif()
 
+# nlohmann_json is found (or fetched) by the root CMakeLists; the Q-table
+# predictor loads its model from JSON, so link the target explicitly instead
+# of relying on a system-wide header install.
+set(COMPRESSOR_LINK_LIBRARIES ctp::compress)
+if(TARGET nlohmann_json::nlohmann_json)
+    list(APPEND COMPRESSOR_LINK_LIBRARIES nlohmann_json::nlohmann_json)
+endif()
+
 add_clio_module_runtime(
   SOURCES
     ${COMPRESSOR_SOURCES}
   LINK_LIBRARIES
-    ctp::compress
+    ${COMPRESSOR_LINK_LIBRARIES}
 )
 
 # CUDA DRIVER API. A GPU codec runs in its own CUDA context (cuCtxCreate) and

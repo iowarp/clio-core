@@ -696,6 +696,19 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     set(CLIO_CTP_ENABLE_LIBPRESSIO OFF)
     find_package(LibPressio QUIET)
     if(LibPressio_FOUND)
+        # Spack/CMake installs export only the imported target, whose
+        # INTERFACE_INCLUDE_DIRECTORIES is <prefix>/include/libpressio while
+        # the wrapper includes <libpressio/libpressio.h>. Derive both that
+        # directory and its parent when the config did not set the variable.
+        if(NOT LibPressio_INCLUDE_DIRS AND TARGET LibPressio::libpressio)
+            get_target_property(_lp_inc_dirs LibPressio::libpressio
+                                INTERFACE_INCLUDE_DIRECTORIES)
+            set(LibPressio_INCLUDE_DIRS "")
+            foreach(_lp_dir IN LISTS _lp_inc_dirs)
+                get_filename_component(_lp_parent "${_lp_dir}" DIRECTORY)
+                list(APPEND LibPressio_INCLUDE_DIRS "${_lp_dir}" "${_lp_parent}")
+            endforeach()
+        endif()
         message(STATUS "found libpressio.h via CMake at ${LibPressio_INCLUDE_DIRS}")
         if(TARGET LibPressio::libpressio)
             set(libpressio_LIBRARIES LibPressio::libpressio)
