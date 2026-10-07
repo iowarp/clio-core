@@ -1,0 +1,28 @@
+# DTSchedule ChiMod — decision + codec + tier + location selection layer for
+# transparent compression. INTERPOSING on the core task interface, acting as
+# the policy engine for compression, tiering, and workflow-aware placement.
+#
+# Phase 1: skeleton with fixed-codec PutBlob/GetBlob, config parsing, tier
+# tables, trace writer. Phases 2-5 add algorithm layers (selection, load,
+# scenarios, DAG).
+module_name: dtschedule
+namespace: clio::cte
+version: 1.0.0
+
+kCreate: 0
+kDestroy: 1
+kMonitor: 9
+
+# Interposed core data verbs (MUST equal the core's ids)
+kPutBlob: 15
+kGetBlob: 16
+kGetBlobSize: 23
+kMultiPutBlob: 48
+
+# DTSchedule-specific verbs (above core's method-id space)
+kPollNodeLoad: 110           # Query node CPU/worker load sample
+kRegisterConsumer: 111       # Register (tag, node) consumer pair
+kCompressAt: 112             # Ship raw blob to node N for scenario 3
+kGetDecisionStats: 113       # Counters for tests and offline replay
+kSetKnobs: 114               # Change ablation knobs at runtime
+kSampleLoad: 115             # Periodic self-sampling of load (CPU%, worker queue)

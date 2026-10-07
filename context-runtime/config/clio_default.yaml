@@ -540,6 +540,62 @@ compose:
     # file sizes do not survive a stop and `clio_run start`. Default: unset.
     # log_path: "/mnt/nvme/$USER/clio/cte_stream_log"
 
+  # === DTSchedule (optional, decision-aware compression + placement) ===
+  # Policy layer at the TOP of the chain: runs on the submitting node, picks
+  # the codec/preset (Q-table CCM), the storage tier, where compression runs
+  # (producer or consumer) and whether a consumer copy is pushed, then
+  # forwards to the cache. Requires a build with CLIO_CTE_ENABLE_COMPRESS=ON.
+  # To enable: uncomment this entry AND re-point every client-facing entry
+  # that names 563.0 as its next_pool_id (clio_cte_stream, clio_cte_filesystem)
+  # at 566.0. Do not stack with clio_cte_compressor. Every key below shows
+  # its default; see docs/deployment/configuration.md.
+  # - mod_name: clio_cte_dtschedule
+  #   pool_name: clio_cte_dtschedule
+  #   pool_query: local
+  #   pool_id: "566.0"
+  #   next_pool_id: "563.0"               # cache pool — see entry above
+  #   compressed_next_pool_id: "564.0"    # compressed puts skip the cache
+  #                                       # (its local copies must stay raw);
+  #                                       # set to the cache's next pool
+  #   core_pool_id: "512.0"               # core pool used for consumer copies
+  #   qos:
+  #     objective: performance            # performance | ratio
+  #     max_error: 0                      # relative error bound; 0 = lossless only
+  #     lossy_allowlist: []               # regexes on blob/tag names allowed to go lossy
+  #     compression_preference: []        # restrict candidates to these libs (empty = all)
+  #     resample_error: 0.4               # |pred-obs|/obs that triggers an oracle resample
+  #     resample_chance: 1.0              # probability of resampling once triggered
+  #     stages: []                        # [{match: <regex>, max_error:, objective:, ...}]
+  #   ccm: qtable                         # qtable | ema | fixed:<lib>[:<preset>] | oracle
+  #   qtable_model_path: ""               # "" = the model shipped with the module
+  #   ratio_noise_sigma: 0.0              # log-normal noise on predicted ratio (ablation)
+  #   load_aware: true                    # scale costs by producer/consumer CPU load
+  #   load_period_ms: 1000                # node load sampling period (ms)
+  #   load_cap: 4.0                       # clamp of the load multiplier
+  #   load_peers: []                      # extra nodes to poll for load (for tests)
+  #   workflow_aware: consumer            # none | consumer | dag
+  #   dag_path: ""                        # placement.json from the WfCommons translator
+  #   dag:
+  #     colocate_fanin: true              # route sibling outputs to the consuming task's node
+  #     replicate_fanout_min: 4           # push copies to every consumer node at >= N consumers
+  #     replicate_max: 8                  # cap on pushed copies per blob
+  #   force_scenario: auto                # auto | 1 | 2 | 3 (ablation)
+  #   decision_order: joint               # joint | codec_first | tier_first (ablation)
+  #   tiers:                              # tier name -> device score (must match devices)
+  #     ram: 1.0
+  #     nvme: 0.7
+  #     ssd: 0.4
+  #     nfs: 0.1
+  #   tier_bw_mbps:                       # tier name -> MB/s for the cost model
+  #     ram: 20000
+  #     nvme: 3000
+  #     ssd: 500
+  #     nfs: 1000
+  #   net_bw_gbps: 25                     # network bandwidth used by the cost model
+  #   trace_path: ""                      # per-container CSV <path>.<node>.csv; "" = off
+  #   trace_candidates: false             # also write <path>.cand.csv with every candidate
+  #   min_compress_bytes: 4096            # smaller blobs are stored raw
+
   # === Context Filesystem (CFS) ===
   # POSIX-style filesystem chimod that the libfuse / POSIX adapters drive. It
   # sits at the canonical filesystem pool 560.0 (clio::cte::filesystem::
