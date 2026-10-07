@@ -48,23 +48,56 @@ namespace ctp {
 
 class Snappy : public Compressor {
  public:
+  /**
+   * Compress input into output.
+   *
+   * RawCompress writes up to MaxCompressedLength(input_size) bytes whatever
+   * the buffer size, so a smaller output buffer is refused up front instead
+   * of overrun. The old post-compress IsValidCompressedBuffer pass decoded
+   * the whole output again (~60% extra compress time, #1214) and could not
+   * fail: RawCompress always emits a valid stream.
+   * @param output destination, output_size bytes
+   * @param output_size in: capacity; out: compressed size
+   * @param input source bytes
+   * @param input_size number of source bytes
+   * @return false when output is too small
+   */
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
-    ::size_t out_sz = output_size;
-    snappy::RawCompress((char *)input, input_size, (char *)output,
-                        &out_sz);
+    if (output_size < snappy::MaxCompressedLength(input_size)) return false;
+    ::size_t out_sz = 0;
+    snappy::RawCompress(static_cast<const char *>(input), input_size,
+                        static_cast<char *>(output), &out_sz);
     output_size = out_sz;
-    bool ret = snappy::IsValidCompressedBuffer((char *)output, out_sz);
-    return ret;
+    return true;
   }
 
+  /**
+   * Decompress input into output.
+   *
+   * RawUncompress validates while decoding and is faster than the streaming
+   * UncompressAsMuchAsPossible path used before (#1214). That path also
+   * wrote through an unchecked sink, so a stream larger than output_size
+   * overran the buffer; the decoded length is now checked first.
+   * @param output destination, output_size bytes
+   * @param output_size in: capacity; out: decompressed size
+   * @param input compressed bytes
+   * @param input_size number of compressed bytes
+   * @return false for an invalid stream or one larger than output
+   */
   bool Decompress(void *output, size_t &output_size, void *input,
                   size_t input_size) override {
-    snappy::ByteArraySource source(reinterpret_cast<const char *>(input),
-                                   input_size);
-    snappy::UncheckedByteArraySink sink(reinterpret_cast<char *>(output));
-    output_size = snappy::UncompressAsMuchAsPossible(&source, &sink);
-    return output_size != 0;
+    const char *in = static_cast<const char *>(input);
+    ::size_t raw_len = 0;
+    if (!snappy::GetUncompressedLength(in, input_size, &raw_len) ||
+        raw_len > output_size) {
+      return false;
+    }
+    if (!snappy::RawUncompress(in, input_size, static_cast<char *>(output))) {
+      return false;
+    }
+    output_size = raw_len;
+    return raw_len != 0;
   }
 };
 
