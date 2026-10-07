@@ -41,7 +41,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS = "/mnt/nvme0/v2-work/runs"
 SC_DIR = os.environ.get("SC_DIR", "/mnt/nvme0/v2-work/single-codecs")
 ARCHIVE = os.path.join(HERE, "..", "result-archive", "exhaustive-search-2026-10-07")
-OPTION_A = os.path.join(HERE, "..", "figures", "new-workloads", "sim-tuning", "option-a", "option_a_1x1_runs.csv")
+OPTION_A = os.path.join(HERE, "..", "figures", "new-workloads", "sim-tuning", "ipdps-results", "option_a_1x1_runs.csv")
 STATIC_COLOR, WRITE_COLOR, READ_COLOR = "#2a7bd5", "#8f86d0", "#f0a5b0"
 
 

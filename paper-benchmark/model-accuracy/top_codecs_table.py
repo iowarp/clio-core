@@ -8,7 +8,7 @@ of the chunks.
 
     top_codecs_table.py RUNS_CSV [--out PREFIX]
 
-RUNS_CSV: a run table of final_check.py's schema (e.g. option-a/option_a_1x1_runs.csv); each run's
+RUNS_CSV: a run table of final_check.py's schema (e.g. ipdps-results/option_a_1x1_runs.csv); each run's
 choice per chunk is read from its folder: v2_measured.csv (one 'primary' row per compressed chunk)
 and blobs.csv (a chunk with no row was stored raw: 'store'). Writes PREFIX.csv (one row per
 workload, option and rank), PREFIX.pdf / .png (the table for the paper, booktabs style) and PREFIX.tex
