@@ -1,27 +1,27 @@
 \begin{table*}[t]
 \centering
 \small
-\begin{tabular}{l lrr lrr lrr lrr}
+\begin{tabular}{l lrr lrr lrr lrr lrr}
 \toprule
-Workload & \multicolumn{3}{c}{NeuroPress} & \multicolumn{3}{c}{Time oracle} & \multicolumn{3}{c}{HCompress} & \multicolumn{3}{c}{XGBoost} \\
-\cmidrule(lr){2-4} \cmidrule(lr){5-7} \cmidrule(lr){8-10} \cmidrule(lr){11-13}
- & Codec & Chunks & Time & Codec & Chunks & Time & Codec & Chunks & Time & Codec & Chunks & Time \\
+Workload & \multicolumn{3}{c}{Best static} & \multicolumn{3}{c}{NeuroPress} & \multicolumn{3}{c}{Time oracle} & \multicolumn{3}{c}{HCompress} & \multicolumn{3}{c}{XGBoost} \\
+\cmidrule(lr){2-4} \cmidrule(lr){5-7} \cmidrule(lr){8-10} \cmidrule(lr){11-13} \cmidrule(lr){14-16}
+ & Codec & Chunks & Time & Codec & Chunks & Time & Codec & Chunks & Time & Codec & Chunks & Time & Codec & Chunks & Time \\
 \midrule
-\textbf{Nyx} & ndzip & 40\% & 59\% & spratio & 53\% & 57\% & spratio$\cdot$bit & 65\% & 72\% & ndzip & 43\% & 40\% \\
-\scriptsize static: ndzip & ans$\cdot$byte & 27\% & 21\% & ans$\cdot$byte & 30\% & 30\% & ndzip & 34\% & 27\% & spratio & 27\% & 29\% \\
-\scriptsize cost model 1/40/5 & spratio & 16\% & 8\% & snappy$\cdot$bit & 7\% & 9\% & ndzip$\cdot$bit & $<$1\% & $<$1\% & ans$\cdot$byte & 19\% & 18\% \\
+\textbf{Nyx} & ndzip & 100\% & 100\% & ndzip & 40\% & 59\% & spratio & 53\% & 57\% & spratio$\cdot$bit & 65\% & 72\% & ndzip & 43\% & 40\% \\
+\scriptsize cost model 1/40/5 &  &  &  & ans$\cdot$byte & 27\% & 21\% & ans$\cdot$byte & 30\% & 30\% & ndzip & 34\% & 27\% & spratio & 27\% & 29\% \\
+\scriptsize at 1\,GB/s &  &  &  & spratio & 16\% & 8\% & snappy$\cdot$bit & 7\% & 9\% & ndzip$\cdot$bit & $<$1\% & $<$1\% & ans$\cdot$byte & 19\% & 18\% \\
 \midrule
-\textbf{VPIC} & ans$\cdot$byte & 42\% & 24\% & ans$\cdot$byte & 52\% & 37\% & spratio$\cdot$bit & 100\% & 100\% & spratio & 49\% & 61\% \\
-\scriptsize static: ndzip$\cdot$bit & spspeed & 25\% & 28\% & spratio & 47\% & 59\% & raw & $<$1\% & $<$1\% & ans$\cdot$byte & 43\% & 23\% \\
-\scriptsize cost model 1/40/5 & ndzip & 22\% & 32\% & spratio$\cdot$bit & 1\% & 2\% & spratio & $<$1\% & $<$1\% & spspeed & 4\% & 9\% \\
+\textbf{VPIC} & ndzip$\cdot$bit & 100\% & 100\% & ans$\cdot$byte & 42\% & 24\% & ans$\cdot$byte & 52\% & 37\% & spratio$\cdot$bit & 100\% & 100\% & spratio & 49\% & 61\% \\
+\scriptsize cost model 1/40/5 &  &  &  & spspeed & 25\% & 28\% & spratio & 47\% & 59\% & raw & $<$1\% & $<$1\% & ans$\cdot$byte & 43\% & 23\% \\
+\scriptsize at 0.5\,GB/s &  &  &  & ndzip & 22\% & 32\% & spratio$\cdot$bit & 1\% & 2\% & spratio & $<$1\% & $<$1\% & spspeed & 4\% & 9\% \\
 \midrule
-\textbf{WarpX} & ans & 32\% & 25\% & spratio & 48\% & 79\% & ndzip & 86\% & 88\% & ndzip & 37\% & 43\% \\
-\scriptsize static: ndzip$\cdot$bit & raw & 28\% & 41\% & ans$\cdot$byte & 32\% & 15\% & spratio & 13\% & 11\% & spratio & 29\% & 29\% \\
-\scriptsize cost model 1/20/1 & bitcomp1$\cdot$byte & 10\% & 9\% & cascaded$\cdot$RLE & 8\% & 3\% & ndzip$\cdot$bit & $<$1\% & $<$1\% & spratio$\cdot$bit & 26\% & 17\% \\
+\textbf{WarpX} & ndzip$\cdot$bit & 100\% & 100\% & ans & 32\% & 25\% & spratio & 48\% & 79\% & ndzip & 86\% & 88\% & ndzip & 37\% & 43\% \\
+\scriptsize cost model 1/20/1 &  &  &  & raw & 28\% & 41\% & ans$\cdot$byte & 32\% & 15\% & spratio & 13\% & 11\% & spratio & 29\% & 29\% \\
+\scriptsize at 0.5\,GB/s &  &  &  & bitcomp1$\cdot$byte & 10\% & 9\% & cascaded$\cdot$RLE & 8\% & 3\% & ndzip$\cdot$bit & $<$1\% & $<$1\% & spratio$\cdot$bit & 26\% & 17\% \\
 \midrule
-\textbf{incflo} & ndzip & 54\% & 76\% & lz4$\cdot$byte & 29\% & 35\% & spratio & 51\% & 48\% & ndzip & 59\% & 66\% \\
-\scriptsize static: ndzip$\cdot$bit & ans$\cdot$byte & 30\% & 13\% & spratio & 28\% & 28\% & spspeed$\cdot$bit & 48\% & 52\% & spratio$\cdot$bit & 30\% & 22\% \\
-\scriptsize cost model 1/40/5 & lz4$\cdot$bitshuf & 9\% & 3\% & ans$\cdot$byte & 28\% & 13\% & ndzip & 1\% & $<$1\% & spratio & 11\% & 12\% \\
+\textbf{incflo} & ndzip$\cdot$bit & 100\% & 100\% & ndzip & 54\% & 76\% & lz4$\cdot$byte & 29\% & 35\% & spratio & 51\% & 48\% & ndzip & 59\% & 66\% \\
+\scriptsize cost model 1/40/5 &  &  &  & ans$\cdot$byte & 30\% & 13\% & spratio & 28\% & 28\% & spspeed$\cdot$bit & 48\% & 52\% & spratio$\cdot$bit & 30\% & 22\% \\
+\scriptsize at 1\,GB/s &  &  &  & lz4$\cdot$bitshuf & 9\% & 3\% & ans$\cdot$byte & 28\% & 13\% & ndzip & 1\% & $<$1\% & spratio & 11\% & 12\% \\
 \bottomrule
 \end{tabular}
 \caption{Top three codecs per workload for each selector, measured in Clio (1 process, 1 chunk in flight, 1 write + 10 reads with k-means, page cache dropped before each read). Chunks: share of the chunks (= share of the data; every chunk is 4\,MiB) compressed with the codec; Time: share of the run's end-to-end time spent on those chunks. $\cdot$byte / $\cdot$bit: byte / bit shuffle before the codec; raw: stored uncompressed. The best static codec compresses every chunk with one setting.}

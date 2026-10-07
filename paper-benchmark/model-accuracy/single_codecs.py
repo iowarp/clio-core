@@ -14,6 +14,9 @@ Per workload, for every finished run in SC_DIR/<workload>/s<setting>_<name>/ (th
   ratio            raw bytes / stored bytes
   cost_s           the workload's cost model on the measured times: sum over the chunks of
                    w_ct x compress + w_dt x mean decompress + w_io x stored bytes / cost bandwidth
+  exh_cost_s, exh_rank_of_45   the same cost model on the stored exhaustive search the best static
+                   was chosen from (result-archive/exhaustive-baselines), and that setting's rank
+                   among all 45; the summary compares the two cost rankings
   ratio_mismatch_chunks, raw_fallback_chunks   chunks whose ratio differs from the exhaustive search
                    (repo archive) / chunks stored raw by a codec fallback
 next to the option-A best static (its setting, its option-A time and ratio, and how the same
@@ -30,6 +33,7 @@ import numpy as np
 import pandas as pd
 
 import compare_parallel_runs as cp
+import eval_v2_workloads as ev
 import final_config as fc
 import ground_truth as gt
 from plot_workload_summary import GRID, INK, INK_2
@@ -41,6 +45,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RUNS = "/mnt/nvme0/v2-work/runs"
 SC_DIR = os.environ.get("SC_DIR", "/mnt/nvme0/v2-work/single-codecs")
 ARCHIVE = os.path.join(HERE, "..", "result-archive", "exhaustive-search-2026-10-07")
+# the stored exhaustive search the option-A best static was chosen from (run_kmeans_parallel.sh)
+BASELINES = os.path.join(HERE, "..", "result-archive", "exhaustive-baselines")
 OPTION_A = os.path.join(HERE, "..", "figures", "new-workloads", "sim-tuning", "ipdps-results", "option_a_1x1_runs.csv")
 STATIC_COLOR, WRITE_COLOR, READ_COLOR = "#2a7bd5", "#8f86d0", "#f0a5b0"
 
@@ -80,6 +86,30 @@ def option_a_static(wl):
     return int(first.setting.iloc[0]), float(a.app_s.iloc[0]), float(a.ratio.iloc[0])
 
 
+def exhaustive_costs(wl):
+    """@return (total cost in s per setting over the complete chunks, the lowest-cost setting): the
+    workload's cost model on the stored exhaustive search, computed exactly as
+    eval_v2_workloads.load_truth and run_kmeans_parallel.sh do when they choose the best static
+    (a setting that does not shrink a chunk stores it raw; 'store' is raw I/O only)."""
+    ds, w, bw = fc.WORKLOADS[wl]
+    d = os.path.join(BASELINES, ds)
+    names, store = ev.settings_list()
+    pred = pd.read_csv(os.path.join(d, "v2_pred.csv.xz"), usecols=["blob", "bytes"])
+    m = pd.read_csv(os.path.join(d, "v2_measured.csv.xz"))
+    m = m[~ev.raw_primary(m)].drop_duplicates(["blob", "setting"])
+    m = m[m.decomp_ms > 0]
+    idx = {b: i for i, b in enumerate(pred.blob)}
+    cost = np.full((len(pred), len(names)), np.nan)
+    raw_io = pred.set_index("blob").bytes.reindex(m.blob).to_numpy(float) / bw
+    kept = m.ratio.to_numpy() > 1
+    c = np.where(kept, w[0] * m.comp_ms + w[1] * m.decomp_ms + w[2] * raw_io / m.ratio, w[0] * m.comp_ms + w[2] * raw_io)
+    cost[m.blob.map(idx).to_numpy(), m.setting.to_numpy()] = c
+    cost[:, store] = w[2] * pred.bytes.to_numpy(float) / bw
+    ok = ~np.isnan(cost).any(axis=1)
+    total = ev.for_selection(cost[ok]).sum(axis=0) / 1e3
+    return total, int(np.argmin(total))
+
+
 def workload_table(wl):
     """@return the table of one workload's finished runs (ranked by end-to-end time) and the
     summary lines."""
@@ -97,6 +127,10 @@ def workload_table(wl):
     t["rank_cost"] = t.cost_s.rank(method="min").astype(int)
     ref = option_a_static(wl)
     t["option_a_best_static"] = t.setting == (ref[0] if ref else -1)
+    exh, exh_best = exhaustive_costs(wl)
+    t["exh_cost_s"] = t.setting.map(lambda x: exh[x])
+    t["exh_rank_of_45"] = t.setting.map(lambda x: int((exh < exh[x]).sum()) + 1)
+    t["exh_rank"] = t.exh_cost_s.rank(method="min").astype(int)
     fast, cheap = t.iloc[0], t.loc[t.cost_s.idxmin()]
     lines = [f"{wl} (cost model {fc.model_name(fc.WORKLOADS[wl][1])} at {fc.WORKLOADS[wl][2] / 1e6:g} GB/s): "
              f"{len(t)} codecs, all bit-exact: {bool(t.digest_ok.all() and t.timed_ok.all())}",
@@ -112,6 +146,15 @@ def workload_table(wl):
                       f"{s.e2e_s:.1f} s ({100 * (s.e2e_s / ref[1] - 1):+.1f} %) ratio {s.ratio:.3f}",
                       f"  option-A best static is the lowest-cost codec here: {s.setting == cheap.setting}; "
                       f"it is {s.e2e_vs_fastest_pct:.1f} % slower than the fastest (e2e rank {s.rank_e2e})"]
+    names = ev.settings_list()[0]
+    by_exh = ", ".join(t.sort_values("exh_cost_s")["name"])
+    by_meas = ", ".join(t.sort_values("cost_s")["name"])
+    lines += [f"  lowest cost over all {len(exh)} settings in the exhaustive search: {names[exh_best]}"
+              + (f" (= the option-A best static: {exh_best == ref[0]})" if ref else ""),
+              f"  cost ranking of these codecs, exhaustive search: {by_exh}",
+              f"  cost ranking of these codecs, measured runs:     {by_meas}",
+              f"  same order: {by_exh == by_meas}; lowest-cost codec the same: "
+              f"{t.loc[t.exh_cost_s.idxmin()].setting == cheap.setting}"]
     odd = t[t.ratio_mismatch_chunks.fillna(0) > 0]
     lines.append("  chunks whose ratio differs from the exhaustive search: "
                  + (", ".join(f"{r['name']} {int(r.ratio_mismatch_chunks)} (raw {int(r.raw_fallback_chunks)})"

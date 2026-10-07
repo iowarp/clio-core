@@ -85,8 +85,8 @@ def table(runs_csv, top=3):
 
 
 # the methods of the paper table (the best static is one setting: it goes into the workload label)
-METHODS = ("NeuroPress", "time oracle", "HCompress", "XGBoost")
-HEAD = {"NeuroPress": "NeuroPress", "time oracle": "Time oracle", "cost oracle": "Cost oracle", "HCompress": "HCompress",
+METHODS = ("best static", "NeuroPress", "time oracle", "HCompress", "XGBoost")
+HEAD = {"best static": "Best static", "NeuroPress": "NeuroPress", "time oracle": "Time oracle", "cost oracle": "Cost oracle", "HCompress": "HCompress",
         "XGBoost": "XGBoost"}
 FAMILY_COLOR = {"ans": "#d1495b", "ndzip": "#2a7bd5", "spratio": "#2e8b57", "spspeed": "#8cc5a4", "lz4": "#e39b3a",
                 "snappy": "#c9a227", "bitcomp": "#8f86d0", "cascaded": "#5b5a55", "store": "#c4c3be", "zstd": "#7a1f2c",
@@ -123,7 +123,7 @@ def plot(t, out, statics):
     """The paper table as a figure (booktabs style): one block per workload, one column group per
     method with the codec, its share of the chunks and its share of the time; out without suffix
     (writes .pdf and .png). @param statics {workload: best static setting}"""
-    wl_w, grp_w, row_h, gap = 1.2, 1.6, 0.165, 0.07
+    wl_w, grp_w, row_h, gap = 1.05, 1.58, 0.165, 0.07
     wls = list(dict.fromkeys(t.workload))
     methods = [m for m in METHODS if m in set(t.option)]
     width = wl_w + grp_w * len(methods)
@@ -148,9 +148,8 @@ def plot(t, out, statics):
         top = y - gap / 2 - row_h / 2
         ds, w, bw = fc.WORKLOADS[wl]
         ax.text(0.04, top, wl, ha="left", va="center", fontsize=8, fontweight="bold", color=INK)
-        ax.text(0.04, top - row_h, f"best static: {short_name(statics[wl])}", ha="left", va="center", fontsize=6.5,
-                color=INK_2)
-        ax.text(0.04, top - 2 * row_h, f"cost model {fc.model_name(w)}", ha="left", va="center", fontsize=6.5, color=INK_2)
+        ax.text(0.04, top - row_h, f"cost model {fc.model_name(w)}", ha="left", va="center", fontsize=6.5, color=INK_2)
+        ax.text(0.04, top - 2 * row_h, f"at {bw / 1e6:g} GB/s", ha="left", va="center", fontsize=6.5, color=INK_2)
         for j, m in enumerate(methods):
             x = wl_w + j * grp_w
             s = t[(t.workload == wl) & (t.option == m) & (t["rank"] != "other")]
@@ -187,8 +186,8 @@ def latex(t, out, statics):
              rf"Workload & {head} \\", cmid, rf" & {sub} \\", r"\midrule"]
     pct = lambda v: f"{v:.0f}\\%" if v >= 0.5 or v == 0 else r"$<$1\%"
     for wi, wl in enumerate(dict.fromkeys(t.workload)):
-        label = [rf"\textbf{{{wl}}}", rf"\scriptsize static: {short_name(statics[wl], r'$\cdot$')}",
-                 rf"\scriptsize cost model {fc.model_name(fc.WORKLOADS[wl][1])}"]
+        label = [rf"\textbf{{{wl}}}", rf"\scriptsize cost model {fc.model_name(fc.WORKLOADS[wl][1])}",
+                 rf"\scriptsize at {fc.WORKLOADS[wl][2] / 1e6:g}\,GB/s"]
         for i in range(3):
             cells = [label[i]]
             for m in methods:
