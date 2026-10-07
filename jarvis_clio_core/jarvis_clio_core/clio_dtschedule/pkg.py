@@ -246,6 +246,25 @@ class ClioDtschedule(Service):
             {'name': 'net_bw_gbps',
              'msg': 'Inter-node network bandwidth used by the cost model',
              'type': float, 'default': 25.0},
+            {'name': 'placement',
+             'msg': 'Who places data chunks: owner (core hash owner + DPE) '
+                    'or dtschedule (writer node by default, the consumer '
+                    'for scenarios 2/3; location records for off-owner '
+                    'chunks)',
+             'type': str, 'choices': ['owner', 'dtschedule', 'local'],
+             'default': 'owner'},
+            {'name': 'demote_watermark',
+             'msg': 'Background compress-on-demote: while the owner\'s '
+                    'fastest tier has less free space than this fraction of '
+                    'its capacity, chunks this node read are compressed here '
+                    'and rewritten to a lower tier (0 = off)',
+             'type': float, 'default': 0.0},
+            {'name': 'demote_queue_mb',
+             'msg': 'Bytes of read chunks kept queued for demotion',
+             'type': int, 'default': 512},
+            {'name': 'demote_budget_mb',
+             'msg': 'Bytes demoted per load tick (load_period_ms)',
+             'type': int, 'default': 64},
             {'name': 'tier_bw_mbps',
              'msg': 'Tier name -> store bandwidth in MB/s for the cost '
                     'model; empty = derived from the device kind '
@@ -508,6 +527,10 @@ class ClioDtschedule(Service):
                             if cfg.get('tier_bw_mbps')
                             else self._default_tier_bw(cfg['tiers']),
             'net_bw_gbps': float(cfg['net_bw_gbps']),
+            'placement': cfg.get('placement', 'owner'),
+            'demote_watermark': float(cfg.get('demote_watermark', 0.0)),
+            'demote_queue_mb': int(cfg.get('demote_queue_mb', 512)),
+            'demote_budget_mb': int(cfg.get('demote_budget_mb', 64)),
             'trace_path': cfg['trace_path'],
             'trace_candidates': bool(cfg['trace_candidates']),
             'min_compress_bytes': int(cfg['min_compress_bytes']),

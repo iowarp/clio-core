@@ -353,6 +353,31 @@ def copy_traces(pipeline_name, config, out_dir, run_name):
         target = dest / os.path.basename(src)
         shutil.copy2(src, target)
         copied.append(str(target))
+    copied.extend(copy_workload_logs(config, dest))
+    return copied
+
+
+def copy_workload_logs(config, dest):
+    """Copy the prodcons producer/consumer logs next to the traces.
+
+    The package deletes them at the next run's start, and they hold the
+    only per-file read errors when a consumer reports bad files.
+
+    :param config: Per-run pipeline config.
+    :param dest: Destination directory (a pathlib.Path).
+    :return: List of copied file paths.
+    """
+    copied = []
+    for pkg in config.get('pkgs', []):
+        if not str(pkg.get('pkg_type', '')).endswith('.clio_prodcons'):
+            continue
+        out = os.path.expandvars(pkg.get('out', ''))
+        for name in ('producer.log', 'consumer.log'):
+            src = os.path.join(out, name)
+            if os.path.isfile(src):
+                target = dest / name
+                shutil.copy2(src, target)
+                copied.append(str(target))
     return copied
 
 

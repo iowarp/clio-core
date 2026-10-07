@@ -235,8 +235,6 @@ class ClioCte(Service):
         # The original retry loop existed for an Aurora apptainer
         # ZMTP-greeting race at >=64 daemons; for the bare-metal /
         # single-node path here the simple form is enough.
-        cmd = f'clio_run compose start {self.compose_config_path}'
-
         # Pssh fans the compose out to every node. With pool_query:
         # broadcast in the compose YAML, each admin container instance
         # handles a Create replica directly, so the per-node invocations
@@ -244,16 +242,55 @@ class ClioCte(Service):
         # others see "Pool with name '...' already exists" and return
         # the existing PoolId. Net effect is one successful pool create
         # per node, which is exactly what 2n needs.
-        Exec(cmd, PsshExecInfo(
-            env=self.mod_env,
-            hostfile=self.hostfile,
-            private_dir=self.private_dir,
-            bind_mounts=self.container_mounts,
-            **container_kwargs(self),
-        )).run()
+        for path in self._compose_phases():
+            cmd = f'clio_run compose start {path}'
+            Exec(cmd, PsshExecInfo(
+                env=self.mod_env,
+                hostfile=self.hostfile,
+                private_dir=self.private_dir,
+                bind_mounts=self.container_mounts,
+                **container_kwargs(self),
+            )).run()
 
         self.log("CTE started successfully")
         return True
+
+    def _compose_phases(self):
+        """Split the compose file into cluster-wide phases.
+
+        Compose runs separately on every node, so one node can finish a
+        pool while another has not started it. The filesystem pool's
+        Create broadcasts the stream pool to every node, and the stream
+        pool's Create sends a tag request into the chain below it. On a
+        node that has not created that chain yet, the request finds no
+        container and the whole compose hangs (#1223). Composing every
+        other entry on all nodes first, then the filesystem entries,
+        closes that window: pssh returns only once every node is done.
+
+        :return: Compose file paths to start, in order.
+        """
+        with open(self.compose_config_path) as fp:
+            doc = yaml.safe_load(fp) or {}
+        chain = doc.get('compose', []) or []
+        late = [e for e in chain
+                if e.get('mod_name') == 'clio_cte_filesystem']
+        early = [e for e in chain
+                 if e.get('mod_name') != 'clio_cte_filesystem']
+        if not late or not early:
+            return [self.compose_config_path]
+        paths = []
+        for idx, part in enumerate((early, late)):
+            path = os.path.join(self.shared_dir,
+                                f'cte_compose_phase{idx}.yaml')
+            phase_doc = dict(doc)
+            phase_doc['compose'] = part
+            with open(path, 'w') as fp:
+                fp.write(f'# CTE compose phase {idx} (see '
+                         f'_compose_phases)\n\n')
+                yaml.dump(phase_doc, fp, default_flow_style=False,
+                          indent=2, sort_keys=False)
+            paths.append(path)
+        return paths
 
     def stop(self):
         pass

@@ -10,9 +10,13 @@
 #   HDD  16 GB    score 0.3  (~200 MB/s, Seagate ST1000LM049)
 # Producer payload: montage-like data staged at /mnt/nvme/llogan/dt_payload
 # on the producer node (the heat field itself barely compresses losslessly).
+# Self-comparison defaults (user, 2026-10-07): every run is dtschedule with
+# its own placement (placement: dtschedule) and owner-local devices
+# (neighborhood: 1); configurations differ only in compression decisions.
 name: dtschedule_prodcons_3tier
 ssh_cmd: env -u LD_LIBRARY_PATH ssh
-env: {CLIO_MEMFD_DIR: '${HOME}/iowarp_clio_tmp_${HOSTNAME}', WFBENCH_DROP_CACHE: '1'}
+env: {CLIO_MEMFD_DIR: '${HOME}/iowarp_clio_tmp_${HOSTNAME}', WFBENCH_DROP_CACHE: '1',
+  CLIO_CFS_WRITE_WINDOW: '16'}
 scheduler:
   name: slurm
   job_name: dtschedule_prodcons_3tier
@@ -38,6 +42,7 @@ pkgs:
   pool_query: local
   default_target_timeout_ms: 30000
   poll_period_ms: 5000
+  neighborhood: 1
 - pkg_type: jarvis_clio_core.clio_dtschedule
   pkg_name: dtschedule
   ccm: qtable
@@ -53,6 +58,7 @@ pkgs:
   min_compress_bytes: 65536
   load_period_ms: 500
   tier_bw_mbps: {ram: 20000.0, nvme: 2000.0, hdd: 200.0}
+  placement: dtschedule
 - pkg_type: jarvis_clio_core.clio_prodcons
   pkg_name: prodcons
   mpirun: /mnt/common/llogan/spack/opt/spack/linux-skylake_avx512/openmpi-5.0.8-aaqsri5t5df5mcygbtc3le7l7lumndvj/bin/mpirun

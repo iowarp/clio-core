@@ -50,6 +50,8 @@
 
 #include <mpi.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 #include "prodcons_common.h"
 
@@ -111,6 +113,9 @@ static uint64_t Checksum(const void *data, size_t bytes, int passes,
   return (b << 32) | a;
 }
 
+/** Bad files a rank reports per step (the rest are only counted). */
+static const int kMaxBadReports = 3;
+
 /** qsort comparator for doubles. */
 static int CmpD(const void *x, const void *y) {
   const double a = *(const double *)x, b = *(const double *)y;
@@ -137,7 +142,13 @@ static int ProcessStep(const PcOptions *o, int step, int rank, int size,
     char path[512];
     PcPath(path, sizeof(path), o->run, step, r);
     size_t got = 0;
-    if (PcReadFile(path, buf, cap, &got) != 0 || got != cap) {
+    int err = PcReadFile(path, buf, cap, &got);
+    if (err != 0 || got != cap) {
+      if (bad < kMaxBadReports) {
+        fprintf(stderr, "prodcons consumer rank %d: bad file %s: errno=%d "
+                "(%s) got=%zu of %zu\n", rank, path, err,
+                err ? strerror(err) : "short read", got, cap);
+      }
       ++bad;
       continue;
     }
