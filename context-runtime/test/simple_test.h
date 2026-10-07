@@ -53,6 +53,26 @@
 #include "clio_ctp/memory/allocator/malloc_allocator.h"
 #endif
 
+#ifdef CTP_ALLOC_TRACK_SIZE
+// The elastic-worker exemption below needs the work orchestrator. Tests that
+// include this header BEFORE the runtime headers (most of them) never saw
+// CLIO_WORK_ORCHESTRATOR, so the exemption compiled to "0 workers" and was
+// silently dead: every elastic spawn failed whichever test it landed in
+// (#1208, and the ~147 KB "leaks" of #942). Pull the header in ourselves
+// whenever it is on the include path; context-transport-primitives tests do
+// not have it there and keep the strict check.
+#if defined(__has_include)
+#if __has_include(<clio_runtime/work_orchestrator.h>)
+#include <clio_runtime/work_orchestrator.h>
+#endif
+#endif
+#ifdef CLIO_WORK_ORCHESTRATOR
+#define CLIO_SIMPLE_TEST_HAS_ORCHESTRATOR 1
+#else
+#define CLIO_SIMPLE_TEST_HAS_ORCHESTRATOR 0
+#endif
+#endif  // CTP_ALLOC_TRACK_SIZE
+
 namespace SimpleTest {
 
 #ifdef CTP_ALLOC_TRACK_SIZE
@@ -79,7 +99,7 @@ inline size_t RuntimeHeapBytes() {
 // no runtime. Used to tell a genuine leak apart from an elastic worker being
 // spawned mid-test -- see the leak check below.
 inline size_t RuntimeWorkerCount() {
-#ifdef CLIO_WORK_ORCHESTRATOR
+#if CLIO_SIMPLE_TEST_HAS_ORCHESTRATOR
   auto *orch = CLIO_WORK_ORCHESTRATOR;
   return orch == nullptr ? 0 : static_cast<size_t>(orch->GetTotalWorkerCount());
 #else
@@ -318,10 +338,16 @@ inline int run_all_tests(const std::string& filter = "") {
         const bool leak_check =
             executed_count > 0 &&
             test.first.find("[noleak]") == std::string::npos;
-        const size_t heap_before =
-            leak_check ? detail::StabilizeRuntimeHeap() : 0;
+        // Worker count FIRST, heap second. The monitor thread spawns elastic
+        // workers asynchronously (often on the previous test's load); one
+        // that landed while the heap was settling was in workers_before but
+        // not in heap_before, so the next test was charged its ~147 KB with
+        // no worker-count change to excuse it (#1208). Read in this order,
+        // any spawn from here on raises the count.
         const size_t workers_before =
             leak_check ? detail::RuntimeWorkerCount() : 0;
+        const size_t heap_before =
+            leak_check ? detail::StabilizeRuntimeHeap() : 0;
         ++executed_count;
 #endif
 
