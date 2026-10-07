@@ -112,6 +112,10 @@ bool ReadDeviceFeatureStats(const void *, double *, double *, double *,
   return false;
 }
 
+bool ReadDeviceFeatureStatsFull(const void *, DeviceFeatureStats *, void *) {
+  return false;
+}
+
 }  // namespace ctp
 
 #endif

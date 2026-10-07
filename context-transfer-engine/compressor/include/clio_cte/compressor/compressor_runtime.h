@@ -57,6 +57,7 @@
 #include <clio_ctp/compress/gpu_setting_codec.h>
 #include <clio_ctp/compress/model/hcompress_ccp_predictor.h>
 #include <clio_ctp/compress/model/xgb_tree_predictor.h>
+#include <clio_ctp/compress/model/xgb_v2_predictor.h>
 
 #include "clio_cte/compressor/models/neuropress_cost.h"
 #include <clio_cte/core/core_client.h>
@@ -330,6 +331,12 @@ private:
   // only from xgb_model_path_ and exclusive with NeuroPress and HCompress.
   // Predict() reads no mutable state, so no lock is needed.
   std::unique_ptr<ctp::compress::model::XgbTreePredictor> xgb_predictor_;
+
+  // The XGBoost v2 selector, deployed for NeuroPress v2 (neuropress_v2_selection.cc).
+  // Ranks the 45 GPU settings using XGBoost predictions instead of the NeuroPress v2 network.
+  // Loaded when CLIO_XGB_V2_MODEL is set; exclusive with HCompress v2 and NeuroPress v2.
+  // Thread-safe: PredictAll() reads no mutable state.
+  std::unique_ptr<ctp::compress::model::XgbV2Predictor> xgb_v2_;
 
   /* ---- prediction reuse across timesteps ------------------------------
      Off by default; CLIO_NEUROPRESS_REUSE_PREDICTIONS=1 opts in, and it is
@@ -833,6 +840,36 @@ private:
    */
   void HCompressObserve(int wire_lib, int preset_field,
                         clio::run::u64 chunk_size, const Context& context);
+
+  /** Is XGBoost v2 ranking NeuroPress v2's setting table for this pool? */
+  bool XgbRanksV2() const {
+    return xgb_v2_ && xgb_v2_->IsReady() &&
+           neuropress_v2_;
+  }
+
+  /**
+   * @brief XGBoost v2's ranking of the 45 v2 settings for one chunk.
+   *
+   * Computes the 4 NeuroPress v2 chunk features (log2 bytes, entropy, MAD,
+   * log10 second derivative) from the chunk, evaluates XGBoost predictions
+   * for all 45 settings, and ranks by the same cost as NeuroPress v2
+   * (V2CostWeights at the chunk's bandwidth).
+   *
+   * @param chunk      chunk bytes, host or device resident
+   * @param chunk_size bytes of the chunk
+   * @param context    the chunk's compression context (type, bound)
+   * @param bw         the chunk's bandwidth, bytes per ms
+   * @param out_entropy optional: chunk's entropy (computed and cached)
+   * @param out_mad optional: chunk's MAD
+   * @param out_second_deriv optional: chunk's log10 second derivative
+   * @param out_features optional: the 4 NeuroPress v2 features
+   * @return best-first stats, in the v2 setting encoding
+   */
+  std::vector<CompressionStats> XgbRankV2Settings(
+      const void* chunk, clio::run::u64 chunk_size, const Context& context,
+      double bw, double* out_entropy = nullptr, double* out_mad = nullptr,
+      double* out_second_deriv = nullptr,
+      ctp::compress::model::NeuroPressV2Features* out_features = nullptr);
 
   /**
    * @brief XGBoost's half of EstCompressionStats (xgb_selection.cc).

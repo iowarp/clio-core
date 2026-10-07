@@ -596,6 +596,17 @@ bool ReadDeviceFeatureStats(const void *device_stats, double *out_entropy,
   return true;
 }
 
+bool ReadDeviceFeatureStatsFull(const void *device_stats, DeviceFeatureStats *out,
+                                void *stream) {
+  if (!device_stats || !out) return false;
+  cudaStream_t st = static_cast<cudaStream_t>(stream);
+  if (cudaMemcpyAsync(out, device_stats, sizeof(*out), cudaMemcpyDeviceToHost,
+                      st) != cudaSuccess) {
+    return false;
+  }
+  return cudaStreamSynchronize(st) == cudaSuccess;  // stream-scoped, as above
+}
+
 }  // namespace ctp
 
 

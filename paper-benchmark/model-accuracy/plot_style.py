@@ -5,7 +5,7 @@ import matplotlib.colors as mcolors
 
 # one colour per option, the same in every figure
 OPTION_COLORS = {"fixed": "#8d99ae", "learn": "#d1495b", "oracle": "#2e86ab",
-                 "hcompress": "#e09f3e"}
+                 "hcompress": "#e09f3e", "xgboost": "#5e9e94"}
 # measured read-side quantities (plot_model_vs_measured.py, panel C)
 METRIC_COLORS = {"bytes": "#7b6fa8", "io": "#e09f3e", "dec": "#4f9d69", "wall": "#6c757d"}
 TEXT_GREY = "#555555"

@@ -3,7 +3,7 @@
 # check_kmeans.sh -- confirm that the k-means consumer really ran in every
 # process of one run_kmeans_parallel.sh configuration: each process log must
 # show READS "KMEANS iteration i/READS done" lines with 0 chunks failed, for
-# every option that has run (fixed, learn, oracle, hcompress).
+# every option that has run (fixed, learn, oracle, hcompress, xgboost).
 #
 #   check_kmeans.sh DATASET TAG PROCS READS
 #
@@ -14,8 +14,8 @@ set -u
 DS=$1; TAG=$2; PROCS=$3; READS=$4
 RUNS=/mnt/nvme0/v2-work/runs
 bad=0
-for mode in fixed learn oracle hcompress; do
-  # an option not run for this tag (e.g. hcompress) is not checked
+for mode in fixed learn oracle hcompress xgboost; do
+  # an option not run for this tag (e.g. hcompress, xgboost) is not checked
   [ -f "$RUNS/$DS-p0_${mode}_$TAG/stdout.log" ] || continue
   for ((i = 0; i < PROCS; i++)); do
     log=$RUNS/$DS-p${i}_${mode}_$TAG/stdout.log

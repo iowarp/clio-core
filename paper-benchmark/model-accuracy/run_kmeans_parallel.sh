@@ -42,7 +42,7 @@ ROOT=/mnt/nvme0/v2-work
 RUNS=$ROOT/runs
 PY=${PYTHON:-$HOME/np-venv/bin/python}
 PROCS=${PROCS:-2}; INFLIGHT=${INFLIGHT:-8}
-# OPTIONS: which options to run (any of fixed learn oracle hcompress); runs of
+# OPTIONS: which options to run (any of fixed learn oracle hcompress xgboost); runs of
 # the others already present with the same tag stay in the comparison.
 OPTIONS=${OPTIONS:-fixed learn oracle}
 LOG=$RUNS/${DS}_kmeans_parallel.log
@@ -134,7 +134,8 @@ EOF
       learn)     run_option learn "$TAG" COST_W="$W"; say "$WL: NeuroPress learning done" ;;
       oracle)    run_option oracle "$TAG" ORACLE_MAP="$MAP"; say "$WL: oracle done" ;;
       hcompress) run_option hcompress "$TAG" COST_W="$W"; say "$WL: HCompress done" ;;
-      *) say "unknown option $opt (fixed|learn|oracle|hcompress)"; exit 1 ;;
+      xgboost)   run_option xgboost "$TAG" COST_W="$W"; say "$WL: XGBoost done" ;;
+      *) say "unknown option $opt (fixed|learn|oracle|hcompress|xgboost)"; exit 1 ;;
     esac
   done
   REF=(--serial-tag "km4$WL")

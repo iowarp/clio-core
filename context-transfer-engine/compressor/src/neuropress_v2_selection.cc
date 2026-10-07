@@ -312,6 +312,11 @@ std::vector<CompressionStats> Runtime::NeuroPressV2RankChunk(
   // HCompress ranks the settings (CLIO_HCOMPRESS_V2_SETTINGS=1); the network
   // is not run and the chunk's bytes are not read.
   if (HCompressRanksV2()) return HCompressRankV2Settings(chunk_size, bw);
+  // XGBoost v2 ranks the settings (CLIO_XGB_V2_MODEL set); uses NeuroPress v2
+  // features but XGBoost predictions instead of the network.
+  if (XgbRanksV2()) return XgbRankV2Settings(chunk, chunk_size, context, bw,
+                                              out_entropy, out_mad, out_second_deriv,
+                                              out_features);
   auto t0 = std::chrono::steady_clock::now();
   const auto w = V2CostWeights(bw);
   ctp::compress::model::NeuroPressV2Features f;
@@ -449,12 +454,120 @@ std::vector<CompressionStats> Runtime::HCompressRankV2Settings(
   return out;
 }
 
+std::vector<CompressionStats> Runtime::XgbRankV2Settings(
+    const void *chunk, clio::run::u64 chunk_size, const Context &context,
+    double bw, double *out_entropy, double *out_mad, double *out_second_deriv,
+    ctp::compress::model::NeuroPressV2Features *out_features) {
+  using ctp::compress::model::NeuroPressV2Predictor;
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto w = V2CostWeights(bw);
+  const double bytes = static_cast<double>(chunk_size);
+
+  // The 4 chunk features, computed as NeuroPress computes them: the
+  // statistics of the chunk as float32, MAD and the second difference
+  // normalised by the value range (NeuroPressV2Predictor::MakeFeatures).
+  double convert_ms = 0.0;
+  ctp::compress::model::NeuroPressV2Stats stats;
+
+  if (ctp::IsDevicePointer(chunk)) {
+    // GPU path: convert to float32, compute the statistics on the device,
+    // copy them (value range included) to the host.
+    void *stream = ctp::DeviceStatsStream();
+    const void *st = NeuroPressV2Predictor::DeviceStatsAsFloat32(
+        chunk, chunk_size, context.data_type_, stream);
+    convert_ms = NeuroPressV2Predictor::LastConvertMs();
+    ctp::DeviceFeatureStats h{};
+    if (st == nullptr || !ctp::ReadDeviceFeatureStatsFull(st, &h, stream)) {
+      HLOG(kError, "XGBoost v2: device statistics failed for a {}-byte chunk",
+           chunk_size);
+      return {};
+    }
+    stats.entropy = h.entropy;
+    stats.mad = h.mad;
+    stats.d2 = h.second_derivative;
+    stats.vmin = h.value_min;
+    stats.vmax = h.value_max;
+  } else {
+    // Host path: ToFloat32 and compute stats on host.
+    auto converted = NeuroPressV2Predictor::ToFloat32Host(
+        chunk, chunk_size, context.data_type_);
+    if (converted.empty()) {
+      HLOG(kWarning, "XGBoost v2: could not convert chunk to float32");
+      return {};
+    }
+    stats = NeuroPressV2Predictor::ComputeStats(converted.data(), converted.size());
+  }
+
+  // Build the 4 NeuroPress v2 features.
+  const auto features = NeuroPressV2Predictor::MakeFeatures(chunk_size, stats);
+
+  // Extract the 4 chunk features (log2 bytes, entropy, MAD, log10 2nd deriv).
+  float x[ctp::compress::model::kXgbV2NumChunkFeatures];
+  x[0] = static_cast<float>(features.x[0]);  // log2 bytes
+  x[1] = static_cast<float>(features.x[1]);  // entropy
+  x[2] = static_cast<float>(features.x[2]);  // MAD
+  x[3] = static_cast<float>(features.x[3]);  // log10 2nd derivative
+
+  // Get XGBoost v2 predictions for all 45 settings.
+  double comp_ms_log[ctp::compress::model::kXgbV2NumSettings];
+  double decomp_ms_log[ctp::compress::model::kXgbV2NumSettings];
+  double ratio_log[ctp::compress::model::kXgbV2NumSettings];
+  xgb_v2_->PredictAll(x, comp_ms_log, decomp_ms_log, ratio_log);
+
+  // Rank by cost.
+  struct Ranked {
+    int setting;
+    double cost;
+    double comp_ms, decomp_ms, ratio;
+  };
+  std::vector<Ranked> ranked;
+  ranked.reserve(ctp::kGpuSettingCount);
+
+  for (int s = 0; s < ctp::kGpuSettingCount; ++s) {
+    if (!ctp::GpuSettingAvailable(s)) continue;
+    // XGBoost v2 predictions are natural logs; exp() them.
+    double comp_ms = std::exp(comp_ms_log[s]);
+    double decomp_ms = std::exp(decomp_ms_log[s]);
+    double ratio = std::exp(ratio_log[s]);
+    const double c = V2Cost(w, comp_ms, decomp_ms, ratio, bytes);
+    if (std::isfinite(c)) {
+      ranked.push_back({s, c, comp_ms, decomp_ms, ratio});
+    }
+  }
+
+  std::stable_sort(ranked.begin(), ranked.end(),
+                   [](const Ranked &a, const Ranked &b) { return a.cost < b.cost; });
+
+  const double wall = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+  const double select_wall = wall - convert_ms;
+  g_select_timing = SelectTiming{select_wall, convert_ms};
+  RecordSelectionPhases(-1.0, select_wall, -1.0, /*reused=*/false, convert_ms, -1.0);
+
+  std::vector<CompressionStats> out;
+  out.reserve(ranked.size());
+  for (const auto &r : ranked) {
+    out.emplace_back(r.setting == StoreSetting() ? 0 : kNpSettingWire, r.setting,
+                     r.ratio, r.comp_ms, r.decomp_ms, 0.0);
+  }
+
+  if (out_entropy) *out_entropy = stats.entropy;
+  if (out_mad) *out_mad = stats.mad;
+  if (out_second_deriv) *out_second_deriv = stats.d2;
+  if (out_features) *out_features = features;
+
+  CLIO_PATH_TRACE("2 infer    XGBoost v2 ranked %zu settings at %.3g B/ms; "
+                  "primary=%s", out.size(), w.bw_bytes_per_ms,
+                  out.empty() ? "-" : ctp::GpuSettingSpec(out.front().compress_preset_));
+  return out;
+}
+
 bool Runtime::NeuroPressV2LaunchRank(const std::string &blob, const void *chunk,
                                      clio::run::u64 chunk_size,
                                      const Context &context, double bw) {
   if (!neuropress_v2_ || !ctp::IsDevicePointer(chunk) ||
       FixedV2Setting() >= 0 || !OracleV2Map().empty() || SelectionLogEnabled() ||
-      HCompressRanksV2()) {
+      HCompressRanksV2() || XgbRanksV2()) {
     return false;
   }
   V2PendingRank p;

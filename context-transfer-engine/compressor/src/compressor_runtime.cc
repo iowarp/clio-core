@@ -615,10 +615,14 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // With CLIO_HCOMPRESS_V2_SETTINGS=1 the v2 model is loaded beside
   // HCompress for its setting table, prewarm and logs only: HCompress ranks
   // the 45 settings (HCompressRankV2Settings) and the network never chooses.
+  // With CLIO_XGB_V2_MODEL set, the v2 model is loaded beside XGBoost v2 for
+  // the same reasons: XGBoost v2 ranks and the network never chooses.
+  const char *xgb_v2_model_dir = std::getenv("CLIO_XGB_V2_MODEL");
   const bool np_v2 =
       !config_.neuropress_model_path_.empty() &&
       (config_.hcompress_model_path_.empty() ||
-       HCompressV2SettingsRequested()) &&
+       HCompressV2SettingsRequested() ||
+       (xgb_v2_model_dir && *xgb_v2_model_dir)) &&
       config_.xgb_model_path_.empty() &&
       ctp::compress::model::NeuroPressV2Predictor::IsV2File(
           config_.neuropress_model_path_);
@@ -734,6 +738,46 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
          pool_name_, hcompress_predictor_->SeedRows(),
          hcompress_predictor_->Dimension(), hc_cfg.ratio_target_cap,
          hc_cfg.forget_factor, hc_cfg.feedback_interval);
+  }
+
+  // XGBoost v2 as the selector for NeuroPress v2 (CLIO_XGB_V2_MODEL; neuropress_v2_selection.cc).
+  if (xgb_v2_model_dir && *xgb_v2_model_dir) {
+    // Ensure NeuroPress v2 is loaded (it is the setting table and feature generator).
+    if (!neuropress_v2_) {
+      HLOG(kError,
+           "XGBoost v2 was requested (CLIO_XGB_V2_MODEL='{}') but NeuroPress v2 "
+           "is not loaded -- failing CreateCompressor. Set neuropress_model_path_ "
+           "to a v2 model file or use CLIO_HCOMPRESS_V2_SETTINGS=1 instead",
+           xgb_v2_model_dir);
+      task->SetReturnCode(1);
+      CLIO_CO_RETURN;
+    }
+    // XGBoost v2 and HCompress v2 are mutually exclusive: both rank the v2 settings.
+    if (HCompressRanksV2()) {
+      HLOG(kError,
+           "Both XGBoost v2 (CLIO_XGB_V2_MODEL) and HCompress v2 "
+           "(CLIO_HCOMPRESS_V2_SETTINGS=1) are enabled; a pool ranks the v2 "
+           "settings with exactly one selector -- failing CreateCompressor");
+      task->SetReturnCode(1);
+      CLIO_CO_RETURN;
+    }
+    auto xgb = std::make_unique<ctp::compress::model::XgbV2Predictor>();
+    if (!xgb->Load(std::string(xgb_v2_model_dir))) {
+      HLOG(kError,
+           "XGBoost v2 was requested (CLIO_XGB_V2_MODEL='{}') but the model "
+           "could not be loaded: {} -- failing CreateCompressor",
+           xgb_v2_model_dir, xgb->LastError());
+      task->SetReturnCode(1);
+      CLIO_CO_RETURN;
+    }
+    xgb_v2_ = std::move(xgb);
+    HLOG(kInfo,
+         "XGBoost v2 selector ON for pool '{}': {}/{}/{} trees (comp_time, "
+         "decomp_time, ratio), {} test vectors verified. Ranks the 45 v2 settings "
+         "with XGBoost predictions on the 4 NeuroPress v2 features; NeuroPress v2 "
+         "provides the setting table, prewarm and feature computation.",
+         pool_name_, xgb_v2_->NumTrees(0), xgb_v2_->NumTrees(1),
+         xgb_v2_->NumTrees(2), xgb_v2_->NumTestVectors());
   }
 
   // XGBoost as the selector (xgb_model_path_; xgb_selection.cc).

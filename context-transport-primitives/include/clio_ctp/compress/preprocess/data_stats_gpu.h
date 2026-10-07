@@ -131,6 +131,20 @@ bool ReadDeviceFeatureStats(const void *device_stats, double *out_entropy,
                             void *stream);
 
 /**
+ * @brief Copy a device stats handle's whole DeviceFeatureStats to the host,
+ * the value range included (ReadDeviceFeatureStats returns only the three
+ * features). The NeuroPress v2 features normalise MAD and the second
+ * difference by that range, so a host-side selector that builds those
+ * features (XGBoost v2) needs it.
+ * @param device_stats the handle ComputeDeviceStatsResident* returned
+ * @param out          filled on success
+ * @param stream       the stream the stats were computed on (synchronised)
+ * @return false on a null argument or a CUDA error (always false without CUDA)
+ */
+bool ReadDeviceFeatureStatsFull(const void *device_stats, DeviceFeatureStats *out,
+                                void *stream);
+
+/**
  * Computes the same three selection features either on-device (via
  * ComputeDeviceStats, when `chunk` is GPU-resident) or on-host (via
  * DataStatisticsFactory, otherwise) -- the exact dispatch

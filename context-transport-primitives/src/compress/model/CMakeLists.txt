@@ -24,6 +24,10 @@ set(CLIO_CTP_COMPRESS_MODEL_SRC
     # paper-benchmark/model-accuracy/export_xgb_trees.py. Standard library
     # only -- no XGBoost dependency (CLIO_CTP_ENABLE_XGBOOST stays off).
     xgb_tree_predictor.cc
+    # The XGBoost v2 selector: walks trees exported by
+    # paper-benchmark/model-accuracy/export_xgb_v2_trees.py. Standard library
+    # only -- no XGBoost dependency. Ranks 45 GPU settings on 4 chunk features.
+    xgb_v2_predictor.cc
     # Provides ByteShuffleDevice/ByteUnshuffleDevice on a CPU-only build;
     # compiles to nothing when CUDA is on (the .cu below defines them).
     ${CMAKE_CURRENT_SOURCE_DIR}/../preprocess/byte_shuffle_cpu_stub.cc

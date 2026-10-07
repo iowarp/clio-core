@@ -1,0 +1,8 @@
+# The repo keeps the XGBoost v2 model xz-compressed (xgb_v2_*.ubj.xz, xgb_v2_trees.txt.xz).
+# Uncompressed copies -- train_xgb_v2.py's JSON boosters, run_v2_workloads.sh's unpacked
+# xgb_v2_trees.txt for Clio -- are generated locally and not committed.
+xgb_v2_comp_time.json
+xgb_v2_decomp_time.json
+xgb_v2_ratio.json
+*.ubj
+xgb_v2_trees.txt

@@ -34,7 +34,7 @@ import replay_learning as rl
 
 RUNS = "/mnt/nvme0/v2-work/runs"
 OPTIONS = (("fixed", "best single codec"), ("learn", "NeuroPress learning"),
-           ("oracle", "oracle (each chunk's best)"), ("hcompress", "HCompress"))
+           ("oracle", "oracle (each chunk's best)"), ("hcompress", "HCompress"), ("xgboost", "XGBoost"))
 
 
 def present(t):

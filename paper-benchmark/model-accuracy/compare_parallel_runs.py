@@ -46,7 +46,7 @@ import compare_kmeans_runs as ck
 import plot_style as style
 
 MODES = (("fixed", "best single codec"), ("learn", "NeuroPress learning"),
-         ("oracle", "oracle"), ("hcompress", "HCompress"))
+         ("oracle", "oracle"), ("hcompress", "HCompress"), ("xgboost", "XGBoost"))
 
 
 def has_runs(ds, procs, mode, tag):
@@ -215,7 +215,7 @@ def plot(t, ds, procs, inflight, w, best, png, reads=4, bw=520000.0):
     configs = list(dict.fromkeys(t.config))   # reference(s) first
     fig, ax = plt.subplots(2, 1, figsize=(max(11, 2.6 * len(configs)), 9.5), sharex=True)
     names = {"fixed": f"best single codec ({best})", "learn": "NeuroPress learning",
-             "oracle": "oracle (each chunk's best)", "hcompress": "HCompress"}
+             "oracle": "oracle (each chunk's best)", "hcompress": "HCompress", "xgboost": "XGBoost"}
     bar_options(ax, t, configs, names, reads)
     ax[1].set_xticks(np.arange(len(configs)), [c.replace(", ", "\n") for c in configs])
     ax[0].set_ylabel("application time (s)")
