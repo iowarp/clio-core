@@ -157,25 +157,35 @@ ccm::Decision CcmManager::SelectCodec(const void *blob_data,
                                       const std::function<double(uint64_t)>
                                           *store_bw) {
   Features features = ComputeFeatures(blob_data, size);
-  std::lock_guard<std::mutex> lock(config_lock_);
-  if (!config_) {
-    return ccm::Decision{};
+  // Copy what this decision needs and release config_lock_ at once: every
+  // runtime worker selects through here, and holding the lock across the
+  // filter and the ranking serialized all of them on a CPU-starved node.
+  int stage_idx = -1;
+  double max_error = 0.0, net_bw_gbps = 0.0;
+  std::vector<std::string> comp_pref, allowlist;
+  std::string objective;
+  {
+    std::lock_guard<std::mutex> lock(config_lock_);
+    if (!config_) {
+      return ccm::Decision{};
+    }
+    std::string obj_override;
+    double max_err_override = -1.0;
+    std::vector<std::string> comp_pref_override;
+    auto [idx, was_overridden] = config_->ApplyQosStage(
+        blob_name, obj_override, max_err_override, comp_pref_override);
+    stage_idx = idx;
+    max_error =
+        (max_err_override >= 0.0) ? max_err_override : config_->max_error_;
+    comp_pref = was_overridden ? comp_pref_override
+                               : config_->compression_preference_;
+    objective = !obj_override.empty() ? obj_override : config_->objective_;
+    allowlist = config_->lossy_allowlist_;
+    net_bw_gbps = config_->net_bw_gbps_;
   }
-  std::string obj_override;
-  double max_err_override = -1.0;
-  std::vector<std::string> comp_pref_override;
-  auto [stage_idx, was_overridden] = config_->ApplyQosStage(
-      blob_name, obj_override, max_err_override, comp_pref_override);
-  const double max_error =
-      (max_err_override >= 0.0) ? max_err_override : config_->max_error_;
-  const auto &comp_pref =
-      was_overridden ? comp_pref_override : config_->compression_preference_;
-  const auto &objective =
-      !obj_override.empty() ? obj_override : config_->objective_;
   std::vector<CandidateRecord> rejected;
   auto filtered = candidates_.Filter(blob_name, comp_pref, max_error,
-                                     config_->lossy_allowlist_,
-                                     features.dtype_, &rejected);
+                                     allowlist, features.dtype_, &rejected);
   std::lock_guard<std::mutex> pred_lock(predictor_lock_);
   if (!predictor_) {
     HLOG(kWarning, "CCM: No predictor; skipping compression");
@@ -192,7 +202,7 @@ ccm::Decision CcmManager::SelectCodec(const void *blob_data,
   auto decision = Ranker::Rank(ranked, features, size, predictor_.get(),
                                objective,
                                tier_bw_mb_ms > 0.0 ? tier_bw_mb_ms
-                                                   : config_->net_bw_gbps_ / 8.0,
+                                                   : net_bw_gbps / 8.0,
                                load_mult,
                                ratio_noise_sigma, &rng_, compare_raw,
                                store_bw);
