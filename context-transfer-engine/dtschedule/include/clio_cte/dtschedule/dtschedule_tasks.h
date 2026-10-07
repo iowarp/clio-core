@@ -250,6 +250,22 @@ struct DtscheduleConfig {
 
   std::vector<uint32_t> load_peers_;            ///< Extra peers to poll for load (for tests)
 
+  // Background compress-on-demote (consumer side): chunks a node has just
+  // read are queued; while the owner's fastest tier is short of room they
+  // are compressed on this node's idle CPU and rewritten to a lower tier,
+  // freeing RAM so new writes keep landing in it.
+  // Data placement authority for chunks >= min_compress_bytes:
+  //   owner      -- the core's hash owner (bytes placed by the owner's DPE)
+  //   dtschedule -- dtschedule picks the store node by cost (tier + network
+  //                 across nodes; the consumer for scenarios 2/3) and records
+  //                 the location when it differs from the hash owner.
+  //   local      -- same routing, but always the writer's node (baseline).
+  std::string placement_ = "owner";
+  double demote_watermark_ = 0.0;   ///< Demote while fastest-tier free <
+                                    ///< this fraction of its capacity (0 = off)
+  int demote_queue_mb_ = 512;       ///< Max bytes of read chunks kept queued
+  int demote_budget_mb_ = 64;       ///< Max bytes demoted per load tick
+
   // Scenario selection (phases 3-4)
   std::string force_scenario_ = "auto";         ///< auto | 1 | 2 | 3
   std::string decision_order_ = "joint";        ///< joint | codec_first | tier_first
@@ -509,6 +525,21 @@ struct DtscheduleConfig {
       const long long raw = node["min_compress_bytes"].as<long long>();
       min_compress_bytes_ = static_cast<int>(
           std::min<long long>(raw, std::numeric_limits<int>::max()));
+    }
+    if (node["load_peers"]) {
+      load_peers_ = node["load_peers"].as<std::vector<uint32_t>>();
+    }
+    if (node["placement"]) {
+      placement_ = node["placement"].as<std::string>();
+    }
+    if (node["demote_watermark"]) {
+      demote_watermark_ = node["demote_watermark"].as<double>();
+    }
+    if (node["demote_queue_mb"]) {
+      demote_queue_mb_ = node["demote_queue_mb"].as<int>();
+    }
+    if (node["demote_budget_mb"]) {
+      demote_budget_mb_ = node["demote_budget_mb"].as<int>();
     }
   }
 

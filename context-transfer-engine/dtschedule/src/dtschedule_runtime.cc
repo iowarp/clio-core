@@ -39,6 +39,7 @@
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_cte/dtschedule/ccm/data_stats.h>
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <functional>
 #include <cctype>
@@ -48,6 +49,11 @@
 #include <sstream>
 
 namespace clio::cte::dtschedule {
+
+/** Smallest chunk worth demoting (independent of min_compress_bytes, so
+ *  writes can stay raw while demotion still compresses). */
+static constexpr clio::run::u64 kDemoteMinBytes = 64ull << 10;
+
 
 static std::string JoinCsv(const std::vector<std::string> &fields);
 static std::string TraceNum(double v);
@@ -318,6 +324,14 @@ clio::run::TaskResume Runtime::PutBlob(
     }
     CLIO_CO_RETURN;
   }
+  if (IsPlaced(task->blob_name_.str()) &&
+      (task->offset_ != 0 || !task->segments_.empty())) {
+    // A partial write lands where the chunk already lives (raw).
+    uint32_t node = CLIO_IPC->GetNodeId();
+    CLIO_CO_AWAIT(ResolveLocation(task->tag_id_, task->blob_name_.str(), &node));
+    CLIO_CO_AWAIT(PutAtNode(task, node));
+    CLIO_CO_RETURN;
+  }
     // Phase 3: initialize load info (may be overridden if ShouldSelect)
   double load_mult = 1.0;
   double producer_cpu = 0.0;
@@ -422,8 +436,9 @@ clio::run::TaskResume Runtime::PutBlob(
         }
       }
 
-      const uint32_t owner_for_tier = place.owner_node == UINT32_MAX
-                                          ? local_node_id : place.owner_node;
+      const uint32_t owner_for_tier =
+          (IsPlaced(task->blob_name_.str()) || place.owner_node == UINT32_MAX)
+              ? local_node_id : place.owner_node;
       // Each candidate is priced at the tier its own stored size lands in
       // on the owner (raw may spill to NVMe while compressed fits in RAM).
       const uint32_t consumer_for_bw = place.consumer_node;
@@ -477,12 +492,32 @@ clio::run::TaskResume Runtime::PutBlob(
     place.cost3_ms = choice.cost3_ms;
   }
   const uint32_t self_node = CLIO_IPC->GetNodeId();
+  const bool placed = IsPlaced(task->blob_name_.str());
+  // dtschedule decides the store node: the consumer for scenarios 2/3 (its
+  // node is idle and will read the chunk), else this (writer) node.
+  const bool to_consumer = placed && selected &&
+                           (place.scenario == 2 || place.scenario == 3) &&
+                           place.consumer_node != UINT32_MAX &&
+                           place.consumer_node != self_node;
   const bool remote_s3 = selected && place.scenario == 3 &&
                          !decision.chosen_lib_.empty() &&
                          place.consumer_node != UINT32_MAX &&
                          place.consumer_node != self_node;
   if (remote_s3) {
     CLIO_CO_AWAIT(CompressAtConsumer(task, decision, original_size, &out, &place));
+    if (placed && task->GetReturnCode() == 0) {
+      CLIO_CO_AWAIT(WriteLocation(task->tag_id_, task->blob_name_.str(),
+                                  place.consumer_node));
+    }
+  } else if (to_consumer) {
+    // Scenario 2 under dtschedule placement: ship the raw chunk to the
+    // consumer's node and store it there (it reads it locally, no decode).
+    {
+      std::lock_guard<std::mutex> lock(stats_lock_);
+      stats_.bytes_in_ += original_size;
+      stats_.bytes_out_ += original_size;
+    }
+    CLIO_CO_AWAIT(PutAtNode(task, place.consumer_node));
   } else {
     if (selected && place.scenario == 3) {
       std::lock_guard<std::mutex> lock(stats_lock_);
@@ -502,28 +537,38 @@ clio::run::TaskResume Runtime::PutBlob(
         stats_.bytes_out_ += out.comp_size;
         stats_.per_lib_count_[decision.chosen_lib_]++;
       }
-      CLIO_CO_AWAIT(ForwardCompressedPut(task));
+      if (placed) {
+        CLIO_CO_AWAIT(PutAtNode(task, BestStoreNode(task->size_)));
+      } else {
+        CLIO_CO_AWAIT(ForwardCompressedPut(task));
+      }
     } else {
       {
         std::lock_guard<std::mutex> lock(stats_lock_);
         stats_.bytes_in_ += original_size;
         stats_.bytes_out_ += original_size;
       }
-      CLIO_CO_AWAIT(ForwardRawPut(task));
+      if (placed) {
+        CLIO_CO_AWAIT(PutAtNode(task, BestStoreNode(task->size_)));
+      } else {
+        CLIO_CO_AWAIT(ForwardRawPut(task));
+      }
     }
     task->blob_data_ = orig_data;
     task->size_ = original_size;
     if (!comp_buf.IsNull()) {
       CLIO_IPC->FreeBuffer(comp_buf);
     }
-    if (selected && task->GetReturnCode() == 0 && place.scenario == 2) {
+    if (!placed && selected && task->GetReturnCode() == 0 &&
+        place.scenario == 2) {
       CLIO_CO_AWAIT(PushConsumerCopy(task->tag_id_, task->blob_name_.str(),
                                      orig_data, original_size,
                                      place.consumer_node, place.owner_node,
                                      task->context_.version_, &place));
     }
   }
-  if (selected && task->GetReturnCode() == 0 && place.dag_hit && dag_spec_ &&
+  if (!placed && selected && task->GetReturnCode() == 0 && place.dag_hit &&
+      dag_spec_ &&
       place.dag_consumers.size() >= dag_spec_->ReplicateFanoutMin()) {
     CLIO_CO_AWAIT(PushFanoutCopies(
         task->tag_id_, task->blob_name_.str(), orig_data, original_size,
@@ -706,7 +751,16 @@ clio::run::TaskResume Runtime::GetBlob(
   CLIO_TASK_BODY_BEGIN
   // Serve the read as-is first: a raw blob costs nothing extra and the core
   // reports the blob's transform state OUT through the context either way.
-  CLIO_CO_AWAIT(ForwardRawGet(task));
+  // Chunks dtschedule placed are read from the node that holds them.
+  uint32_t data_node = CLIO_IPC->GetNodeId();
+  const bool placed_get = IsPlaced(task->blob_name_.str());
+  if (placed_get) {
+    CLIO_CO_AWAIT(ResolveLocation(task->tag_id_, task->blob_name_.str(),
+                                  &data_node));
+    CLIO_CO_AWAIT(GetAtNode(task, data_node));
+  } else {
+    CLIO_CO_AWAIT(ForwardRawGet(task));
+  }
 
   // Phase 4: Consumer tracking for workflow_aware mode
   // Register this node as a consumer of the tag on first read (regardless of compression)
@@ -743,10 +797,28 @@ clio::run::TaskResume Runtime::GetBlob(
     }
   }
 
+  if (task->GetReturnCode() == 0 && task->context_.replica_ == 0 &&
+      !(task->context_.transform_flags_ &
+        clio::cte::core::kBlobTransformCompressed) &&
+      config_.demote_watermark_ > 0.0 && task->segments_.empty() &&
+      task->offset_ == 0 && task->size_ >= kDemoteMinBytes) {
+    // A whole raw chunk this node just consumed: a demotion candidate.
+    auto bytes = CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    if (bytes.ptr_ != nullptr) {
+      EnqueueDemote(task->tag_id_, task->blob_name_.str(),
+                    placed_get ? data_node
+                               : OwnerNode(task->tag_id_,
+                                           task->blob_name_.str()),
+                    bytes.ptr_, task->size_);
+    }
+  }
   if (task->GetReturnCode() != 0 || task->context_.replica_ != 0 ||
       !(task->context_.transform_flags_ &
         clio::cte::core::kBlobTransformCompressed)) {
     CLIO_CO_RETURN;
+  }
+  if (TryDecompressInPlace(*task)) {
+    CLIO_CO_RETURN;  // the first read already held the whole stored blob
   }
   {
     // The forwarded read handed back CODEC bytes (and the stored size is
@@ -756,8 +828,11 @@ clio::run::TaskResume Runtime::GetBlob(
     EnsureCoreClient();
     clio::run::u64 stored_size = 0;
     {
-      auto sz = core_client_->AsyncGetBlobSize(task->tag_id_,
-                                               task->GetBlobName());
+      clio::cte::core::Client *cc =
+          placed_get ? copy_client_.get() : core_client_.get();
+      auto sz = cc->AsyncGetBlobSize(
+          task->tag_id_, task->GetBlobName(),
+          placed_get ? NodeQuery(data_node) : clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(sz);
       if (sz->GetReturnCode() != 0 || sz->size_ == 0) {
         task->SetReturnCode(10 + sz->GetReturnCode());
@@ -771,10 +846,12 @@ clio::run::TaskResume Runtime::GetBlob(
       CLIO_CO_RETURN;
     }
     {
-      auto get = core_client_->AsyncGetBlob(
+      clio::cte::core::Client *gc =
+          placed_get ? copy_client_.get() : core_client_.get();
+      auto get = gc->AsyncGetBlob(
           task->tag_id_, task->GetBlobName(), 0, stored_size,
           /*flags=*/0, stored.shm_.template Cast<void>(),
-          clio::run::PoolQuery::Dynamic());
+          placed_get ? NodeQuery(data_node) : clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(get);
       if (get->GetReturnCode() != 0) {
         CLIO_IPC->FreeBuffer(stored);
@@ -832,6 +909,58 @@ void Runtime::EnsureCoreClient() {
  * @return the scratch buffer holding the original bytes, or a null pointer
  *         on a malformed header, missing codec, or codec failure
  */
+bool Runtime::TryDecompressInPlace(clio::cte::core::GetBlobTask &task) {
+  /**
+   * Fast path for reading a compressed blob: when the first (forwarded) read
+   * was a single region from offset 0 that already holds the whole stored
+   * blob (header + codec bytes, which is smaller than the original), decode
+   * from those bytes instead of asking for the stored size and re-reading
+   * the blob. One round trip instead of three.
+   *
+   * @param task The read; on success its buffer holds the original bytes and
+   *        the transform flags are cleared
+   * @return false when the fast path does not apply (caller falls back)
+   */
+  constexpr size_t kHdr = sizeof(compressor::CompressionHeader);
+  if (!task.segments_.empty() || task.offset_ != 0 || task.size_ < kHdr) {
+    return false;
+  }
+  auto buf = CLIO_IPC->ToFullPtr<char>(task.blob_data_.template Cast<char>());
+  if (buf.ptr_ == nullptr) {
+    return false;
+  }
+  const auto *header =
+      reinterpret_cast<const compressor::CompressionHeader *>(buf.ptr_);
+  if (!header->IsValid() || header->compressed_size_ == 0 ||
+      kHdr + header->compressed_size_ > task.size_) {
+    return false;
+  }
+  auto start = std::chrono::high_resolution_clock::now();
+  const clio::run::u64 stored = kHdr + header->compressed_size_;
+  std::vector<char> copy(buf.ptr_, buf.ptr_ + stored);  // buf is the target
+  clio::run::u64 out_size = 0;
+  std::string lib;
+  auto scratch = DecompressStored(copy.data(), stored, &out_size, &lib);
+  if (scratch.IsNull()) {
+    return false;
+  }
+  const bool ok = CopyRegionsFromOriginal(task, scratch.ptr_, out_size);
+  CLIO_IPC->FreeBuffer(scratch);
+  if (!ok) {
+    return false;
+  }
+  task.context_.transform_flags_ &=
+      ~(clio::cte::core::kBlobTransformed |
+        clio::cte::core::kBlobTransformCompressed);
+  WriteDecompressTraceRow(task.tag_id_.ToString(), task.blob_name_.str(),
+                          out_size, lib,
+                          std::chrono::duration<double, std::milli>(
+                              std::chrono::high_resolution_clock::now() - start)
+                              .count());
+  task.SetReturnCode(0);
+  return true;
+}
+
 ctp::ipc::FullPtr<char> Runtime::DecompressStored(const char *stored,
                                                   clio::run::u64 stored_size,
                                                   clio::run::u64 *out_size,
@@ -932,8 +1061,27 @@ clio::run::TaskResume Runtime::GetBlobSize(
     clio::run::shared_ptr<clio::cte::core::GetBlobSizeTask> &task) {
   CLIO_TASK_BODY_BEGIN
 
-  // Forward to core to get the blob size (at the owner when it is remote).
-  if (OwnerIsLocal(task->tag_id_, task->blob_name_.str())) {
+  // Forward to core to get the blob size (at the owner when it is remote,
+  // at the node dtschedule placed it on for placed chunks).
+  uint32_t size_node = CLIO_IPC->GetNodeId();
+  const bool placed_size = IsPlaced(task->blob_name_.str());
+  if (placed_size) {
+    if (!copy_client_) {
+      copy_client_ = std::make_unique<clio::cte::core::Client>(
+          config_.core_pool_id_.IsNull() ? clio::cte::core::kCtePoolId
+                                         : config_.core_pool_id_);
+    }
+    CLIO_CO_AWAIT(ResolveLocation(task->tag_id_, task->blob_name_.str(),
+                                  &size_node));
+    auto sz = copy_client_->AsyncGetBlobSize(task->tag_id_,
+                                             task->blob_name_.str(),
+                                             NodeQuery(size_node),
+                                             task->replica_);
+    CLIO_CO_AWAIT(sz);
+    task->size_ = sz->size_;
+    task->lost_bytes_ = sz->lost_bytes_;
+    task->SetReturnCode(sz->GetReturnCode());
+  } else if (OwnerIsLocal(task->tag_id_, task->blob_name_.str())) {
     CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlobSize,
                                 task.template Cast<clio::run::Task>()));
   } else {
@@ -955,11 +1103,13 @@ clio::run::TaskResume Runtime::GetBlobSize(
     // Fetch header to determine if blob is compressed and get original size
     auto hdr_buf = CLIO_IPC->AllocateBuffer(sizeof(compressor::CompressionHeader));
     if (!hdr_buf.IsNull()) {
-      auto get = core_client_->AsyncGetBlob(
+      clio::cte::core::Client *hc =
+          placed_size ? copy_client_.get() : core_client_.get();
+      auto get = hc->AsyncGetBlob(
           task->tag_id_, task->blob_name_.str(), 0,
           sizeof(compressor::CompressionHeader),
           /*flags=*/0, hdr_buf.shm_.template Cast<void>(),
-          clio::run::PoolQuery::Dynamic());
+          placed_size ? NodeQuery(size_node) : clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(get);
       if (get->GetReturnCode() == 0 &&
           (get->context_.transform_flags_ &
@@ -1165,7 +1315,8 @@ clio::run::TaskResume Runtime::CompressAt(
   // while C's fastest tier has room, and never fail the put over it. Under
   // memory pressure C just compresses and the bytes go down the tiers.
   bool raw_cached = false;
-  if (!config_.tiers_.empty() &&
+  const bool placed_here = IsPlaced(task->blob_name_.str());
+  if (!placed_here && !config_.tiers_.empty() &&
       ChooseTier(task->size_, C) == config_.tiers_.front().name_) {
     ChooseTier(task->size_, C, /*reserve=*/true);
     auto cache_put = copy_client_->AsyncPutBlob(
@@ -1221,7 +1372,8 @@ clio::run::TaskResume Runtime::CompressAt(
     auto raw_put = copy_client_->AsyncPutBlob(
         task->tag_id_, task->blob_name_.str(), 0, task->size_,
         task->blob_data_, task->score_, task->context_, /*flags=*/0,
-        clio::run::PoolQuery::Dynamic());
+        placed_here ? clio::run::PoolQuery::Local()
+                    : clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(raw_put);
     task->comp_size_ = task->size_;
     task->ctime_ms_ = comp_ms;
@@ -1250,10 +1402,14 @@ clio::run::TaskResume Runtime::CompressAt(
   comp_ctx.version_ = tag_version;
 
   size_t comp_total_size = sizeof(compressor::CompressionHeader) + out.comp_size;
+  // dtschedule-placed chunks are stored here, on the consumer's node (the
+  // producer records the location); others go to their hash owner.
   auto owner_put = compressed_client_->AsyncPutBlob(
       task->tag_id_, task->blob_name_.str(), 0, comp_total_size,
       comp_buf.shm_.template Cast<void>(), task->score_, comp_ctx,
-      /*flags=*/0, clio::run::PoolQuery::Dynamic());
+      /*flags=*/0,
+      placed_here ? clio::run::PoolQuery::Local()
+                  : clio::run::PoolQuery::Dynamic());
   CLIO_CO_AWAIT(owner_put);
   double store_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - store_start)
@@ -1448,6 +1604,7 @@ clio::run::TaskResume Runtime::SampleLoad(
       }
     }
   }
+  CLIO_CO_AWAIT(DemoteTick());
 
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
@@ -1647,6 +1804,8 @@ void Runtime::StoreLoadSample(uint32_t node_id, const NodeLoadSample &sample) {
   if (!sample.tier_remaining_.empty()) {
     std::lock_guard<std::mutex> lock(tier_cap_lock_);
     tier_reserved_.erase(node_id);  // the sample already counts those bytes
+    uint64_t &cap = tier0_capacity_[node_id];
+    cap = std::max(cap, sample.tier_remaining_.front());
   }
 }
 
@@ -1791,6 +1950,507 @@ double Runtime::StoreBwFor(uint64_t bytes, uint32_t owner_node,
     bw = std::min(bw, std::max(config_.net_bw_gbps_, 0.01) / 8.0);
   }
   return bw;
+}
+
+uint32_t Runtime::BestStoreNode(uint64_t bytes) {
+  /**
+   * Node whose storage takes `bytes` cheapest: the time to store them on
+   * the tier they would land in there, plus the network transfer when the
+   * node is not this one. This (writer) node wins ties, so data stays local
+   * until local fast tiers fill; then an idle node's RAM beats a local HDD.
+   * The chosen tier on the chosen node is reserved.
+   *
+   * @param bytes Bytes to store
+   * @return Node id
+   */
+  const uint32_t self = CLIO_IPC->GetNodeId();
+  if (config_.placement_ == "local") {
+    ChooseTier(bytes, self, /*reserve=*/true);
+    return self;  // baseline: always the writer's node
+  }
+  std::vector<uint32_t> nodes;
+  {
+    std::lock_guard<std::mutex> lock(load_rings_lock_);
+    for (const auto &kv : load_rings_) nodes.push_back(kv.first);
+  }
+  const double mb = static_cast<double>(bytes) / 1e6;
+  const double net = std::max(config_.net_bw_gbps_, 0.01) / 8.0;
+  auto cost = [&](uint32_t node) {
+    const double bw = std::max(TierBwMbPerMs(ChooseTier(bytes, node)), 1e-6);
+    return mb / bw + (node == self ? 0.0 : mb / net);
+  };
+  uint32_t best = self;
+  double best_cost = cost(self);
+  for (uint32_t node : nodes) {
+    if (node == self) continue;
+    const double c = cost(node);
+    if (c < best_cost * 0.9) {  // a clear win only
+      best = node;
+      best_cost = c;
+    }
+  }
+  ChooseTier(bytes, best, /*reserve=*/true);
+  return best;
+}
+
+clio::run::PoolQuery Runtime::NodeQuery(uint32_t node) const {
+  /**
+   * Query that executes on a given node.
+   *
+   * @param node Node id
+   * @return Local() for this node, Physical(node) otherwise
+   */
+  if (node == CLIO_IPC->GetNodeId()) {
+    return clio::run::PoolQuery::Local();
+  }
+  return clio::run::PoolQuery::Physical(node);
+}
+
+std::string Runtime::LocKey(const TagId &tag_id, const std::string &blob) {
+  /**
+   * Location-record key of a blob.
+   *
+   * @param tag_id Tag of the blob
+   * @param blob Blob name
+   * @return "<major>.<minor>/<blob>"
+   */
+  return tag_id.ToString() + "/" + blob;
+}
+
+clio::run::TaskResume Runtime::EnsureLocTag() {
+  CLIO_TASK_BODY_BEGIN
+  // Location records live in one CTE tag; the core hash-owns each record,
+  // so there is no central directory.
+  if (!loc_tag_ready_) {
+    if (!copy_client_) {
+      copy_client_ = std::make_unique<clio::cte::core::Client>(
+          config_.core_pool_id_.IsNull() ? clio::cte::core::kCtePoolId
+                                         : config_.core_pool_id_);
+    }
+    auto t = copy_client_->AsyncGetOrCreateTag("_dtschedule_loc");
+    CLIO_CO_AWAIT(t);
+    if (t->GetReturnCode() == 0) {
+      loc_tag_ = t->tag_id_;
+      loc_tag_ready_ = true;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::WriteLocation(const TagId &tag_id,
+                                             const std::string &blob,
+                                             uint32_t node) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const std::string key = LocKey(tag_id, blob);
+    bool had_other = false;
+    {
+      std::lock_guard<std::mutex> lock(loc_lock_);
+      auto it = loc_cache_.find(key);
+      if (it != loc_cache_.end()) {
+        if (it->second == node) {
+          CLIO_CO_RETURN;  // already recorded here
+        }
+        had_other = true;
+      }
+    }
+    // A chunk stored at its hash owner is found without a record unless an
+    // earlier write recorded another node.
+    if (node != OwnerNode(tag_id, blob) || had_other) {
+      CLIO_CO_AWAIT(EnsureLocTag());
+      if (!loc_tag_ready_) {
+        CLIO_CO_RETURN;
+      }
+      const uint32_t value = node;
+      auto put = copy_client_->AsyncPutBlob(
+          loc_tag_, key, 0, sizeof(value),
+          reinterpret_cast<const char *>(&value), -1.0f,
+          clio::cte::core::Context(), 0, clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(put);
+      if (put->GetReturnCode() != 0) {
+        HLOG(kWarning, "dtschedule: location record for {} failed ({})", key,
+             put->GetReturnCode());
+        CLIO_CO_RETURN;
+      }
+    }
+    std::lock_guard<std::mutex> lock(loc_lock_);
+    if (loc_cache_.size() >= (1u << 20)) {
+      loc_cache_.clear();
+    }
+    loc_cache_[key] = node;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ResolveLocation(const TagId &tag_id,
+                                               const std::string &blob,
+                                               uint32_t *node) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const std::string key = LocKey(tag_id, blob);
+    *node = OwnerNode(tag_id, blob);
+    {
+      std::lock_guard<std::mutex> lock(loc_lock_);
+      auto it = loc_cache_.find(key);
+      if (it != loc_cache_.end()) {
+        *node = it->second;
+        CLIO_CO_RETURN;
+      }
+    }
+    CLIO_CO_AWAIT(EnsureLocTag());
+    if (!loc_tag_ready_) {
+      CLIO_CO_RETURN;
+    }
+    auto buf = CLIO_IPC->AllocateBuffer(sizeof(uint32_t));
+    if (buf.IsNull()) {
+      CLIO_CO_RETURN;
+    }
+    auto get = copy_client_->AsyncGetBlob(
+        loc_tag_, key.c_str(), 0, sizeof(uint32_t), 0,
+        buf.shm_.template Cast<void>(), clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(get);
+    if (get->GetReturnCode() == 0) {
+      uint32_t value = 0;
+      std::memcpy(&value, buf.ptr_, sizeof(value));
+      *node = value;
+      std::lock_guard<std::mutex> lock(loc_lock_);
+      loc_cache_[key] = value;  // only positive answers are cached
+    }
+    CLIO_IPC->FreeBuffer(buf);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::PutAtNode(
+    clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task, uint32_t node) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    if (!copy_client_) {
+      copy_client_ = std::make_unique<clio::cte::core::Client>(
+          config_.core_pool_id_.IsNull() ? clio::cte::core::kCtePoolId
+                                         : config_.core_pool_id_);
+    }
+    std::vector<clio::cte::core::BlobRegion> regions;
+    clio::cte::core::ForEachBlobRegion(
+        *task, [&regions](const clio::cte::core::BlobRegion &r) {
+          regions.push_back(r);
+          return true;
+        });
+    clio::run::u32 rc = 0;
+    clio::cte::core::Context out_ctx = task->context_;
+    for (size_t i = 0; i < regions.size() && rc == 0; ++i) {
+      auto put = copy_client_->AsyncPutBlob(
+          task->tag_id_, task->blob_name_.str(), regions[i].blob_off_,
+          regions[i].size_, regions[i].data_, task->score_, task->context_,
+          task->flags_, NodeQuery(node));
+      CLIO_CO_AWAIT(put);
+      rc = put->GetReturnCode();
+      out_ctx = put->context_;
+    }
+    task->context_ = out_ctx;
+    task->SetReturnCode(rc);
+    if (rc == 0) {
+      CLIO_CO_AWAIT(WriteLocation(task->tag_id_, task->blob_name_.str(), node));
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::GetAtNode(
+    clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task, uint32_t node) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    if (!copy_client_) {
+      copy_client_ = std::make_unique<clio::cte::core::Client>(
+          config_.core_pool_id_.IsNull() ? clio::cte::core::kCtePoolId
+                                         : config_.core_pool_id_);
+    }
+    std::vector<clio::cte::core::BlobRegion> regions;
+    clio::cte::core::ForEachBlobRegion(
+        *task, [&regions](const clio::cte::core::BlobRegion &r) {
+          regions.push_back(r);
+          return true;
+        });
+    clio::run::u32 rc = 0;
+    clio::run::u32 tflags = 0;
+    clio::run::u64 version = 0;
+    for (size_t i = 0; i < regions.size() && rc == 0; ++i) {
+      auto get = copy_client_->AsyncGetBlob(
+          task->tag_id_, task->blob_name_.str().c_str(), regions[i].blob_off_,
+          regions[i].size_, task->flags_, regions[i].data_, NodeQuery(node),
+          task->context_);
+      CLIO_CO_AWAIT(get);
+      rc = get->GetReturnCode();
+      tflags = get->context_.transform_flags_;
+      if (i == 0) version = get->context_.version_;
+    }
+    task->context_.transform_flags_ = tflags;
+    task->context_.version_ = version;
+    task->SetReturnCode(rc);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::EnqueueDemote(const TagId &tag_id, const std::string &blob,
+                            uint32_t node, const char *data, size_t size) {
+  /**
+   * Keep a copy of a chunk this node just read for possible demotion. The
+   * queue is bounded by demote_queue_mb; the oldest entries are dropped.
+   *
+   * @param tag_id Tag of the blob
+   * @param blob Blob name
+   * @param node Node holding the chunk
+   * @param data Raw bytes read
+   * @param size Byte count
+   */
+  const size_t cap = static_cast<size_t>(config_.demote_queue_mb_) << 20;
+  if (size > cap) {
+    return;
+  }
+  DemoteItem item;
+  item.tag_id_ = tag_id;
+  item.blob_ = blob;
+  item.owner_ = node;
+  item.data_.assign(data, data + size);
+  std::lock_guard<std::mutex> lock(demote_lock_);
+  while (!demote_q_.empty() && demote_q_bytes_ + size > cap) {
+    demote_q_bytes_ -= demote_q_.front().data_.size();
+    demote_q_.pop_front();
+  }
+  demote_q_bytes_ += size;
+  demote_q_.push_back(std::move(item));
+}
+
+bool Runtime::OwnerUnderPressure(uint32_t owner) {
+  /**
+   * Whether the owner's fastest tier is short of room: its free bytes in
+   * the latest sample (minus this container's reservations since) are below
+   * demote_watermark x the largest free space ever seen there.
+   *
+   * @param owner Node id
+   * @return true when demoting this owner's chunks would free needed room
+   */
+  uint64_t free_bytes = 0;
+  {
+    std::lock_guard<std::mutex> outer(load_rings_lock_);
+    auto it = load_rings_.find(owner);
+    if (it == load_rings_.end()) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(it->second.lock_);
+    if (it->second.samples_.empty() ||
+        it->second.samples_.back().tier_remaining_.empty()) {
+      return false;
+    }
+    free_bytes = it->second.samples_.back().tier_remaining_.front();
+  }
+  std::lock_guard<std::mutex> lock(tier_cap_lock_);
+  const uint64_t cap = tier0_capacity_[owner];
+  auto res = tier_reserved_.find(owner);
+  const uint64_t reserved =
+      (res == tier_reserved_.end() || res->second.empty()) ? 0
+                                                           : res->second[0];
+  const uint64_t avail = free_bytes > reserved ? free_bytes - reserved : 0;
+  return cap > 0 &&
+         static_cast<double>(avail) <
+             config_.demote_watermark_ * static_cast<double>(cap);
+}
+
+bool Runtime::PopDemoteCandidate(DemoteItem *item) {
+  /**
+   * Take the oldest queued chunk whose owner is under pressure; chunks of
+   * owners with room stay queued.
+   *
+   * @param item Output
+   * @return false when no queued chunk qualifies
+   */
+  std::lock_guard<std::mutex> lock(demote_lock_);
+  for (auto it = demote_q_.begin(); it != demote_q_.end(); ++it) {
+    if (OwnerUnderPressure(it->owner_)) {
+      demote_q_bytes_ -= it->data_.size();
+      *item = std::move(*it);
+      demote_q_.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string Runtime::ChooseLowerTier(uint64_t bytes, uint32_t owner) {
+  /**
+   * The highest-score tier below the fastest whose free bytes on owner can
+   * hold bytes, else the lowest tier.
+   *
+   * @param bytes Bytes to place
+   * @param owner Node id
+   * @return Tier name (empty with fewer than two tiers)
+   */
+  if (config_.tiers_.size() < 2) {
+    return "";
+  }
+  std::vector<uint64_t> free_bytes;
+  {
+    std::lock_guard<std::mutex> outer(load_rings_lock_);
+    auto it = load_rings_.find(owner);
+    if (it != load_rings_.end()) {
+      std::lock_guard<std::mutex> lock(it->second.lock_);
+      if (!it->second.samples_.empty()) {
+        free_bytes = it->second.samples_.back().tier_remaining_;
+      }
+    }
+  }
+  for (size_t i = 1; i < config_.tiers_.size(); ++i) {
+    if (i < free_bytes.size() && free_bytes[i] >= bytes) {
+      return config_.tiers_[i].name_;
+    }
+  }
+  return config_.tiers_.back().name_;
+}
+
+bool Runtime::CompressForDemote(DemoteItem *item, ctp::ipc::FullPtr<char> *comp,
+                                size_t *stored, std::string *tier) {
+  /**
+   * Compress a queued chunk for demotion. Under memory pressure the goal is
+   * to free the fast tier and write fewer bytes to the shared slow one, so
+   * any codec with a useful ratio is taken: the CCM's choice when it makes
+   * one, else the first preferred codec (lz4 when no preference is set).
+   *
+   * @param item Chunk to compress
+   * @param comp Output: header + compressed bytes (caller frees)
+   * @param stored Output: bytes to store
+   * @param tier Output: lower tier the bytes go to
+   * @return false when no codec gives a useful ratio
+   */
+  const uint32_t owner = item->owner_;
+  std::function<double(uint64_t)> store_bw = [this, owner](uint64_t b) {
+    return TierBwMbPerMs(ChooseLowerTier(b, owner));
+  };
+  ccm::Decision decision = ccm_manager_->SelectCodec(
+      item->data_.data(), item->data_.size(), item->blob_, 0.0, 1.0, 0.0,
+      &store_bw);
+  if (decision.chosen_lib_.empty()) {
+    decision.chosen_lib_ = config_.compression_preference_.empty()
+                               ? std::string("lz4")
+                               : config_.compression_preference_.front();
+    decision.chosen_preset_ = ctp::CompressionPreset::FAST;
+  }
+  CompressOutcome out{};
+  *comp = CompressWithDecision(item->data_.data(), item->data_.size(),
+                               decision, &out);
+  if (!out.used) {
+    return false;
+  }
+  *stored = sizeof(compressor::CompressionHeader) + out.comp_size;
+  *tier = ChooseLowerTier(*stored, owner);
+  return true;
+}
+
+clio::run::TaskResume Runtime::DemoteTick() {
+  CLIO_TASK_BODY_BEGIN
+  // Runs on the periodic SampleLoad task. Pops up to kBatch chunks of
+  // owners under pressure (within demote_budget_mb), compresses them here,
+  // then deletes and rewrites them with all I/O of a batch in flight at
+  // once. Raw bytes are restored if a compressed rewrite fails.
+  if (config_.demote_watermark_ > 0.0 && config_.tiers_.size() >= 2 &&
+      ccm_manager_ != nullptr) {
+    if (!copy_client_) {
+      copy_client_ = std::make_unique<clio::cte::core::Client>(
+          config_.core_pool_id_.IsNull() ? clio::cte::core::kCtePoolId
+                                         : config_.core_pool_id_);
+    }
+    constexpr size_t kBatch = 16;
+    uint64_t budget = static_cast<uint64_t>(config_.demote_budget_mb_) << 20;
+    while (budget > 0) {
+      std::vector<DemoteItem> items;
+      std::vector<ctp::ipc::FullPtr<char>> comps;
+      std::vector<size_t> sizes;
+      std::vector<std::string> tiers;
+      while (items.size() < kBatch && budget > 0) {
+        DemoteItem item;
+        if (!PopDemoteCandidate(&item)) break;
+        budget -= std::min<uint64_t>(budget, item.data_.size());
+        ctp::ipc::FullPtr<char> comp;
+        size_t stored = 0;
+        std::string tier;
+        if (CompressForDemote(&item, &comp, &stored, &tier)) {
+          items.push_back(std::move(item));
+          comps.push_back(comp);
+          sizes.push_back(stored);
+          tiers.push_back(tier);
+        }
+      }
+      if (items.empty()) break;
+      std::vector<clio::run::Future<clio::cte::core::DelBlobTask>> dels;
+      for (size_t i = 0; i < items.size(); ++i) {
+        dels.push_back(copy_client_->AsyncDelBlob(
+            items[i].tag_id_, items[i].blob_,
+            IsPlaced(items[i].blob_) ? NodeQuery(items[i].owner_)
+                                     : clio::run::PoolQuery::Dynamic()));
+      }
+      std::vector<bool> deleted(items.size(), false);
+      for (size_t i = 0; i < dels.size(); ++i) {
+        CLIO_CO_AWAIT(dels[i]);
+        deleted[i] = dels[i]->GetReturnCode() == 0;
+      }
+      std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> puts;
+      std::vector<size_t> put_idx;
+      for (size_t i = 0; i < items.size(); ++i) {
+        if (!deleted[i]) continue;
+        clio::cte::core::Context ctx;
+        ctx.transform_flags_ |= clio::cte::core::kBlobTransformCompressed;
+        puts.push_back(copy_client_->AsyncPutBlob(
+            items[i].tag_id_, items[i].blob_, 0, sizes[i],
+            comps[i].shm_.template Cast<void>(), TierScore(tiers[i]), ctx,
+            /*flags=*/0,
+            IsPlaced(items[i].blob_) ? NodeQuery(items[i].owner_)
+                                     : clio::run::PoolQuery::Dynamic()));
+        put_idx.push_back(i);
+      }
+      for (size_t k = 0; k < puts.size(); ++k) {
+        CLIO_CO_AWAIT(puts[k]);
+        const size_t i = put_idx[k];
+        if (puts[k]->GetReturnCode() != 0) {
+          HLOG(kWarning, "dtschedule demote: compressed put of {} failed ({});"
+               " restoring raw", items[i].blob_, puts[k]->GetReturnCode());
+          auto raw = copy_client_->AsyncPutBlob(
+              items[i].tag_id_, items[i].blob_, 0, items[i].data_.size(),
+              items[i].data_.data(), -1.0f, clio::cte::core::Context(), 0,
+              IsPlaced(items[i].blob_) ? NodeQuery(items[i].owner_)
+                                       : clio::run::PoolQuery::Dynamic());
+          CLIO_CO_AWAIT(raw);
+          continue;
+        }
+        RecordDemotion(items[i].data_.size(), sizes[i], tiers[i]);
+      }
+      for (auto &c : comps) CLIO_IPC->FreeBuffer(c);
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::RecordDemotion(size_t raw_bytes, size_t stored_bytes,
+                             const std::string &tier) {
+  /**
+   * Count one demoted chunk; log at the 1st and every 256th.
+   *
+   * @param raw_bytes Raw size of the chunk
+   * @param stored_bytes Bytes written to the lower tier
+   * @param tier Tier written to
+   */
+  std::lock_guard<std::mutex> lock(stats_lock_);
+  ++demoted_;
+  demote_in_bytes_ += raw_bytes;
+  demote_out_bytes_ += stored_bytes;
+  if (demoted_ == 1 || demoted_ % 256 == 0) {
+    HLOG(kInfo, "dtschedule demote: {} chunks, {} MiB -> {} MiB (to {})",
+         demoted_, demote_in_bytes_ >> 20, demote_out_bytes_ >> 20, tier);
+  }
 }
 
 bool Runtime::IsOwnTarget(const std::string &target_name) const {

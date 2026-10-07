@@ -873,6 +873,26 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   CLIO_TASK_BODY_END
 }
 
+/**
+ * Preallocation hint for a page write: doubling (2x the written extent,
+ * floor 8 KiB, cap 64 KiB) keeps runs of small appends in place without
+ * reserving a flat 64 KiB per page; CLIO_CFS_PREALLOC overrides it.
+ * @param page_off offset of the write inside its page
+ * @param to_write bytes written into the page
+ * @return bytes to preallocate
+ */
+static clio::run::u64 WritePrealloc(clio::run::u64 page_off,
+                                    clio::run::u64 to_write) {
+  static constexpr clio::run::u64 kFsPreallocCap = 64ull * 1024;
+  static const clio::run::u64 flat_prealloc = [] {
+    const char *e = std::getenv("CLIO_CFS_PREALLOC");
+    return e != nullptr ? std::strtoull(e, nullptr, 10) : 0ULL;
+  }();
+  if (flat_prealloc != 0) return flat_prealloc;
+  return std::min<clio::run::u64>(
+      kFsPreallocCap, std::max<clio::run::u64>(2 * (page_off + to_write), 8192));
+}
+
 clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   CLIO_TASK_BODY_BEGIN
   CLIO_FS_LOOKUP(fi, task->handle_);
@@ -890,35 +910,47 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   clio::run::u64 cur = task->offset_;
   bool ok = true;
   bool no_space = false;  // the store is full: ENOSPC, not EIO
-  while (done < want) {
-    clio::run::u64 page_off = cur % kFsPageSize;
-    clio::run::u64 to_write = std::min(kFsPageSize - page_off, want - done);
-    // DOUBLING preallocation (2x the written extent, floor 8 KiB, cap 64 KiB)
-    // keeps runs of small appends in place without reserving a flat 64 KiB
-    // per page (which made a checkout's RAM tier ~3x its data).
-    static constexpr clio::run::u64 kFsPreallocCap = 64ull * 1024;
-    static const clio::run::u64 flat_prealloc = [] {
-      const char *e = std::getenv("CLIO_CFS_PREALLOC");
-      return e != nullptr ? std::strtoull(e, nullptr, 10) : 0ULL;
-    }();
-    const clio::run::u64 prealloc =
-        flat_prealloc != 0
-            ? flat_prealloc
-            : std::min<clio::run::u64>(
-                  kFsPreallocCap,
-                  std::max<clio::run::u64>(2 * (page_off + to_write), 8192));
-    auto p = cte_.AsyncPutBlob(tag_id, PageName(cur), page_off, to_write,
-                               src + done, /*score*/ -1.0f,
-                               clio::cte::core::Context::Preallocate(prealloc),
-                               /*flags*/ 0u, clio::run::PoolQuery::Dynamic());
-    CLIO_CO_AWAIT(p);
-    if (p->GetReturnCode() != 0) {
-      ok = false;
-      no_space = clio::cte::core::PutRcIsNoSpace(p->GetReturnCode());
-      break;
+  // CLIO_CFS_WRITE_WINDOW: pages of one write kept in flight at once (1 =
+  // strictly sequential, the historical behaviour). A large write otherwise
+  // pays one full put round trip per 1 MiB page, which makes throughput
+  // latency-bound regardless of how many bytes each page carries.
+  static const size_t window = [] {
+    const char *e = std::getenv("CLIO_CFS_WRITE_WINDOW");
+    const unsigned long long v = e != nullptr ? std::strtoull(e, nullptr, 10) : 1;
+    return static_cast<size_t>(v == 0 ? 1 : std::min<unsigned long long>(v, 256));
+  }();
+  while (done < want && ok) {
+    std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> inflight;
+    std::vector<clio::run::u64> sizes;
+    while (done < want && inflight.size() < window) {
+      clio::run::u64 page_off = cur % kFsPageSize;
+      clio::run::u64 to_write = std::min(kFsPageSize - page_off, want - done);
+      inflight.push_back(cte_.AsyncPutBlob(
+          tag_id, PageName(cur), page_off, to_write, src + done,
+          /*score*/ -1.0f,
+          clio::cte::core::Context::Preallocate(WritePrealloc(page_off,
+                                                              to_write)),
+          /*flags*/ 0u, clio::run::PoolQuery::Dynamic()));
+      sizes.push_back(to_write);
+      done += to_write;
+      cur += to_write;
     }
-    done += to_write;
-    cur += to_write;
+    // Await the whole window; the first failure stops further windows, and
+    // bytes_written_ counts only the pages before it.
+    clio::run::u64 good = 0;
+    for (size_t i = 0; i < inflight.size(); ++i) {
+      CLIO_CO_AWAIT(inflight[i]);
+      if (inflight[i]->GetReturnCode() != 0 && ok) {
+        ok = false;
+        no_space = clio::cte::core::PutRcIsNoSpace(inflight[i]->GetReturnCode());
+      }
+      if (ok) good += sizes[i];
+    }
+    if (!ok) {
+      clio::run::u64 issued = 0;
+      for (auto sz : sizes) issued += sz;
+      done = done - issued + good;
+    }
   }
   clio::run::u64 end = task->offset_ + done;
   clio::run::u64 new_size = 0;

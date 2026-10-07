@@ -442,6 +442,28 @@ static std::vector<DtPoolSpec> Phase5Pools() {
   };
 }
 
+/** Placement / demotion test pools (dtschedule-owned placement). */
+static constexpr int kPoolPlaced = 591;       ///< placement: dtschedule, zstd
+static constexpr int kPoolLocalDemote = 592;  ///< placement: local, demotion
+
+static std::vector<DtPoolSpec> Phase6Pools() {
+  const std::string common =
+      "    next_pool_id: 512.0\n    compressed_next_pool_id: 512.0\n"
+      "    core_pool_id: 512.0\n    load_aware: true\n"
+      "    load_period_ms: 200\n    workflow_aware: none\n"
+      "    tiers:\n      ram: 1.0\n      nvme: 0.7\n"
+      "    net_bw_gbps: 1\n";
+  return {
+      {kPoolPlaced, "case_6_placed",
+       common + "    placement: dtschedule\n    ccm: fixed:zstd:balanced\n"
+                "    min_compress_bytes: 4096\n"},
+      {kPoolLocalDemote, "case_6_demote",
+       common + "    placement: local\n    ccm: fixed:zstd:balanced\n"
+                "    min_compress_bytes: 1000000000000\n"
+                "    demote_watermark: 1.0\n    demote_budget_mb: 64\n"},
+  };
+}
+
 static std::vector<DtPoolSpec> Phase4cPools() {
   const std::string common =
       "    next_pool_id: 563.0\n    compressed_next_pool_id: 512.0\n"
@@ -586,6 +608,14 @@ compose:
                   << p.body_;
     }
     for (const auto &p : Phase4cPools()) {
+      config_file << "\n  - mod_name: clio_cte_dtschedule\n"
+                  << "    pool_name: " << p.name_ << "\n"
+                  << "    pool_query: local\n"
+                  << "    pool_id: " << p.id_ << ".0\n"
+                  << "    trace_path: " << TracePrefix(p.name_) << "\n"
+                  << p.body_;
+    }
+    for (const auto &p : Phase6Pools()) {
       config_file << "\n  - mod_name: clio_cte_dtschedule\n"
                   << "    pool_name: " << p.name_ << "\n"
                   << "    pool_query: local\n"
@@ -911,6 +941,9 @@ static std::string PoolName(int pool_major) {
     if (p.id_ == pool_major) return p.name_;
   }
   for (const auto &p : Phase5Pools()) {
+    if (p.id_ == pool_major) return p.name_;
+  }
+  for (const auto &p : Phase6Pools()) {
     if (p.id_ == pool_major) return p.name_;
   }
   return "";
@@ -1603,6 +1636,75 @@ TEST_CASE("DtscheduleS3 - a direct CompressAt compresses, stores and copies loca
   ipc->FreeBuffer(buf);
   RequireRoundTrip(io, tag_id, "s3_direct", data);
   REQUIRE(PoolStats(kPoolChain).s3_local_copies_ >= before.s3_local_copies_ + 1);
+}
+
+TEST_CASE("DtschedulePlacement - placed chunks round-trip compressed",
+          "[dtschedule][placement]") {
+  DtscheduleInterposeFixture fixture;
+  clio::cte::core::Client io(clio::run::PoolId(kPoolPlaced, 0));
+  clio::cte::core::Tag tag("placement_tag");
+  const auto tag_id = tag.GetTagId();
+  // Chunk-index names are what clio-fs gives data pages: dtschedule places
+  // them (writer node here) and reads them back through its location logic.
+  const std::string a = SmoothFloatField(1 << 20, 7);
+  const std::string b = SmoothFloatField(1 << 20, 8);
+  PutThrough(io, tag_id, "0", a);
+  PutThrough(io, tag_id, "1", b);
+  RequireRoundTrip(io, tag_id, "0", a);  // in-place decompress fast path
+  RequireRoundTrip(io, tag_id, "1", b);
+  auto sz = io.AsyncGetBlobSize(tag_id, "0");
+  sz.Wait();
+  REQUIRE(sz->GetReturnCode() == 0);
+  REQUIRE(sz->size_ == a.size());  // logical, not stored, size
+  REQUIRE(PoolStats(kPoolPlaced).compressed_ >= 2);
+  // A named (non-chunk) blob keeps hash routing and still round-trips.
+  PutThrough(io, tag_id, "meta_blob", a);
+  RequireRoundTrip(io, tag_id, "meta_blob", a);
+}
+
+TEST_CASE("DtschedulePlacement - partial write to a placed chunk",
+          "[dtschedule][placement]") {
+  DtscheduleInterposeFixture fixture;
+  clio::cte::core::Client io(clio::run::PoolId(kPoolPlaced, 0));
+  clio::cte::core::Tag tag("placement_partial_tag");
+  const auto tag_id = tag.GetTagId();
+  // Raw (incompressible) chunk, then an in-place update at an offset: the
+  // partial write must land where the chunk lives.
+  std::string data = Mt19937Bytes(256 << 10, 11);
+  PutThrough(io, tag_id, "5", data);
+  const std::string patch(4096, 'Z');
+  auto put = io.AsyncPutBlob(tag_id, "5", 8192, patch.size(), patch.data());
+  put.Wait();
+  REQUIRE(put->GetReturnCode() == 0);
+  std::memcpy(data.data() + 8192, patch.data(), patch.size());
+  RequireRoundTrip(io, tag_id, "5", data);
+}
+
+TEST_CASE("DtscheduleDemote - demoted chunks still read back exactly",
+          "[dtschedule][demote]") {
+  DtscheduleInterposeFixture fixture;
+  clio::cte::core::Client io(clio::run::PoolId(kPoolLocalDemote, 0));
+  clio::cte::core::Tag tag("demote_tag");
+  const auto tag_id = tag.GetTagId();
+  std::vector<std::string> chunks;
+  for (int i = 0; i < 6; ++i) {
+    chunks.push_back(SmoothFloatField(1 << 20, 20 + i));
+    PutThrough(io, tag_id, std::to_string(i), chunks.back());  // raw writes
+  }
+  // Reading queues each chunk for demotion; with watermark 1.0 the RAM tier
+  // is "under pressure" as soon as anything is stored, so the periodic
+  // sampler compresses and rewrites them.
+  for (int i = 0; i < 6; ++i) {
+    RequireRoundTrip(io, tag_id, std::to_string(i), chunks[i]);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+  for (int i = 0; i < 6; ++i) {
+    RequireRoundTrip(io, tag_id, std::to_string(i), chunks[i]);
+    auto sz = io.AsyncGetBlobSize(tag_id, std::to_string(i));
+    sz.Wait();
+    REQUIRE(sz->GetReturnCode() == 0);
+    REQUIRE(sz->size_ == chunks[i].size());
+  }
 }
 
 SIMPLE_TEST_MAIN()

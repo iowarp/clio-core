@@ -39,6 +39,7 @@
 #include <mutex>
 #include <fstream>
 #include <chrono>
+#include <deque>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -547,6 +548,83 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * @param out Free bytes per tier, in config_.tiers_ order
    */
   clio::run::TaskResume CollectTierRemaining(std::vector<uint64_t> *out);
+  // ---- dtschedule-owned placement (DtscheduleConfig::placement_) ----
+  TagId loc_tag_;                          ///< Tag holding location records
+  bool loc_tag_ready_ = false;             ///< loc_tag_ resolved
+  std::unordered_map<std::string, uint32_t> loc_cache_;  ///< blob -> node
+  std::mutex loc_lock_;                    ///< Guards loc_cache_
+  /** True when dtschedule (not the core's hash) places data chunks. */
+  bool PlacesData() const {
+    return config_.placement_ == "dtschedule" || config_.placement_ == "local";
+  }
+  /** True when dtschedule places this blob: placement mode on and the
+   *  name is a chunk index (clio-fs data pages; metadata keeps hash routing). */
+  bool IsPlaced(const std::string &blob) const {
+    return PlacesData() && IsChunkIndexName(blob);
+  }
+  /** Decode a compressed read from the bytes the first read returned. */
+  bool TryDecompressInPlace(clio::cte::core::GetBlobTask &task);
+  /** Cheapest node to store bytes on (tier + network); reserves the tier. */
+  uint32_t BestStoreNode(uint64_t bytes);
+  /** Query that runs on node (Local when it is this node). */
+  clio::run::PoolQuery NodeQuery(uint32_t node) const;
+  /** Key of a blob in the location cache / record tag. */
+  static std::string LocKey(const TagId &tag_id, const std::string &blob);
+  /** Resolve (create once) the `_dtschedule_loc` tag. */
+  clio::run::TaskResume EnsureLocTag();
+  /** Record that blob lives on node (no record when node is its hash
+   *  owner and no other location was recorded). */
+  clio::run::TaskResume WriteLocation(const TagId &tag_id,
+                                      const std::string &blob, uint32_t node);
+  /** Node holding blob: cached or recorded location, else its hash owner. */
+  clio::run::TaskResume ResolveLocation(const TagId &tag_id,
+                                        const std::string &blob,
+                                        uint32_t *node);
+  /** Put the task's bytes (all regions) on node through the core pool. */
+  clio::run::TaskResume PutAtNode(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task,
+      uint32_t node);
+  /** Get the task's regions from node through the core pool. */
+  clio::run::TaskResume GetAtNode(
+      clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task,
+      uint32_t node);
+
+  // ---- Background compress-on-demote (DtscheduleConfig::demote_*) ----
+  /** A chunk this node just read, kept for possible demotion. */
+  struct DemoteItem {
+    TagId tag_id_;              ///< Tag of the blob
+    std::string blob_;          ///< Blob name
+    uint32_t owner_ = 0;        ///< Node that owns the blob
+    std::vector<char> data_;    ///< Raw bytes as read
+  };
+  std::deque<DemoteItem> demote_q_;        ///< FIFO of read chunks
+  size_t demote_q_bytes_ = 0;              ///< Bytes held in demote_q_
+  std::mutex demote_lock_;                 ///< Guards demote_q_
+  std::unordered_map<uint32_t, uint64_t> tier0_capacity_;  ///< Max fastest-
+                                           ///< tier free bytes seen per node
+  uint64_t demoted_ = 0;                   ///< Chunks demoted compressed
+  uint64_t demote_in_bytes_ = 0;           ///< Raw bytes demoted
+  uint64_t demote_out_bytes_ = 0;          ///< Compressed bytes written
+
+  /** Queue a chunk this node read (bounded; oldest entries are dropped). */
+  void EnqueueDemote(const TagId &tag_id, const std::string &blob,
+                     uint32_t node, const char *data, size_t size);
+  /** True while the owner's fastest tier has less free space than the
+   *  demote watermark (fraction of the largest free space seen there). */
+  bool OwnerUnderPressure(uint32_t owner);
+  /** Pop the oldest queued chunk whose owner is under pressure. */
+  bool PopDemoteCandidate(DemoteItem *item);
+  /** Highest-score tier below the fastest with room for bytes on owner. */
+  std::string ChooseLowerTier(uint64_t bytes, uint32_t owner);
+  /** Demote queued chunks within the per-tick byte budget, in batches. */
+  clio::run::TaskResume DemoteTick();
+  /** Compress one chunk for demotion; false when no codec is useful. */
+  bool CompressForDemote(DemoteItem *item, ctp::ipc::FullPtr<char> *comp,
+                         size_t *stored, std::string *tier);
+  /** Count a demoted chunk (and log periodically). */
+  void RecordDemotion(size_t raw_bytes, size_t stored_bytes,
+                      const std::string &tier);
+
   /** False for another node's device registered here as a neighbour. */
   bool IsOwnTarget(const std::string &target_name) const;
   /** Configured tier index for a core target (name match, else score). */

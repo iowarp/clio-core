@@ -65,6 +65,7 @@ struct Options {
   int preset = 1;                ///< 0 fast, 1 balanced, 2 best (factory enum)
   double seconds = 30.0;         ///< How long to run
   std::string input;             ///< Data file (empty = synthetic field)
+  size_t chunk = 1u << 20;       ///< Bytes per compress call
 };
 
 /**
@@ -82,6 +83,7 @@ Options Parse(int argc, char **argv) {
     else if (k == "--preset") o.preset = std::atoi(v.c_str());
     else if (k == "--seconds") o.seconds = std::atof(v.c_str());
     else if (k == "--input") o.input = v;
+    else if (k == "--chunk-kb") o.chunk = std::strtoull(v.c_str(), nullptr, 10) << 10;
   }
   return o;
 }
@@ -123,11 +125,11 @@ std::vector<char> LoadData(const std::string &path) {
 void Worker(const Options &o, const std::vector<char> &data, int worker,
             std::chrono::steady_clock::time_point deadline,
             std::atomic<uint64_t> *in_bytes, std::atomic<uint64_t> *out_bytes) {
-  constexpr size_t kChunk = 1u << 20;
+  const size_t kChunk = o.chunk;
   auto codec = ctp::CompressionFactory::GetPreset(
       o.codec, static_cast<ctp::CompressionPreset>(o.preset));
   if (!codec) return;
-  std::vector<char> out(kChunk + (kChunk >> 3) + (64u << 10));
+  std::vector<char> out(kChunk + (kChunk >> 1) + (64u << 10));
   const size_t nchunks = data.size() / kChunk;
   size_t c = static_cast<size_t>(worker) % nchunks;
   uint64_t in_local = 0, out_local = 0;
@@ -173,9 +175,9 @@ int main(int argc, char **argv) {
   for (auto &t : pool) t.join();
   const double s = std::chrono::duration<double>(
                        std::chrono::steady_clock::now() - t0).count();
-  std::printf("compress_load threads=%d codec=%s preset=%d seconds=%.2f "
-              "mb_s=%.1f ratio=%.2f\n",
-              o.threads, o.codec.c_str(), o.preset, s,
+  std::printf("compress_load threads=%d codec=%s preset=%d chunk_kb=%zu "
+              "seconds=%.2f mb_s=%.1f ratio=%.2f\n",
+              o.threads, o.codec.c_str(), o.preset, o.chunk >> 10, s,
               static_cast<double>(in_bytes.load()) / 1e6 / s,
               out_bytes.load() ? static_cast<double>(in_bytes.load()) /
                                      static_cast<double>(out_bytes.load())
