@@ -592,3 +592,16 @@ void WorkOrchestrator::RetireWorker(Worker *worker) {
 }
 
 }  // namespace clio::run
+
+/**
+ * Number of workers the in-process runtime owns (0 without one). A plain C
+ * symbol so simple_test.h can reference it weakly: the leak check needs it
+ * to tell an elastic worker spawn from a leak, but must not make tests that
+ * do not link the runtime fail to link (#1208).
+ * @return the runtime's current worker count
+ */
+extern "C" size_t clio_runtime_worker_count() {
+  auto *orch = CLIO_WORK_ORCHESTRATOR;
+  return orch == nullptr ? 0
+                         : static_cast<size_t>(orch->GetTotalWorkerCount());
+}

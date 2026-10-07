@@ -54,22 +54,20 @@
 #endif
 
 #ifdef CTP_ALLOC_TRACK_SIZE
-// The elastic-worker exemption below needs the work orchestrator. Tests that
-// include this header BEFORE the runtime headers (most of them) never saw
-// CLIO_WORK_ORCHESTRATOR, so the exemption compiled to "0 workers" and was
-// silently dead: every elastic spawn failed whichever test it landed in
-// (#1208, and the ~147 KB "leaks" of #942). Pull the header in ourselves
-// whenever it is on the include path; context-transport-primitives tests do
-// not have it there and keep the strict check.
-#if defined(__has_include)
-#if __has_include(<clio_runtime/work_orchestrator.h>)
-#include <clio_runtime/work_orchestrator.h>
-#endif
-#endif
-#ifdef CLIO_WORK_ORCHESTRATOR
-#define CLIO_SIMPLE_TEST_HAS_ORCHESTRATOR 1
+// The elastic-worker exemption below needs the runtime's worker count. It
+// used to come from #ifdef CLIO_WORK_ORCHESTRATOR, but most tests include
+// this header BEFORE the runtime headers, so the macro was undefined here,
+// the count was always 0 and the exemption was silently dead: every elastic
+// spawn failed whichever test it landed in (#1208, the ~147 KB "leaks" of
+// #942). Including the runtime header instead broke tests that see the
+// runtime's headers without linking it. So the runtime exports a plain C
+// function and this header references it WEAKLY: tests linked with the
+// runtime get the real count, the rest see a null function and 0.
+#if defined(__GNUC__) && !defined(_WIN32)
+extern "C" size_t clio_runtime_worker_count() __attribute__((weak));
+#define CLIO_SIMPLE_TEST_WEAK_WORKER_COUNT 1
 #else
-#define CLIO_SIMPLE_TEST_HAS_ORCHESTRATOR 0
+#define CLIO_SIMPLE_TEST_WEAK_WORKER_COUNT 0
 #endif
 #endif  // CTP_ALLOC_TRACK_SIZE
 
@@ -99,7 +97,10 @@ inline size_t RuntimeHeapBytes() {
 // no runtime. Used to tell a genuine leak apart from an elastic worker being
 // spawned mid-test -- see the leak check below.
 inline size_t RuntimeWorkerCount() {
-#if CLIO_SIMPLE_TEST_HAS_ORCHESTRATOR
+#if CLIO_SIMPLE_TEST_WEAK_WORKER_COUNT
+  return clio_runtime_worker_count != nullptr ? clio_runtime_worker_count()
+                                              : 0;
+#elif defined(CLIO_WORK_ORCHESTRATOR)
   auto *orch = CLIO_WORK_ORCHESTRATOR;
   return orch == nullptr ? 0 : static_cast<size_t>(orch->GetTotalWorkerCount());
 #else
