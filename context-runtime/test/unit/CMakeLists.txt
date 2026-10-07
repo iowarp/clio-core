@@ -1694,8 +1694,12 @@ if(CLIO_CORE_ENABLE_MPI)
               ${MPIEXEC_POSTFLAGS}
       WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
+    # 4 ranks: OpenMPI refuses to start more ranks than it counts slots
+    # (physical cores), so a small VM or laptop failed this before the test
+    # ran. The MCA env var lets it oversubscribe; MPICH ignores it (unlike
+    # --oversubscribe, which MPICH rejects).
     set_tests_properties(cr_mpi_bdev_transport_all_modes PROPERTIES
-      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500;OMPI_MCA_rmaps_base_oversubscribe=1"
       RESOURCE_LOCK "clio_runtime"
       TIMEOUT 300
     )
