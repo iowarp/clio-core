@@ -22,8 +22,7 @@ speed) x 1000), ratio clamped to [0.1, 1e5]; how often a bound applies is
 printed.
 
 Writes to DIR (default the repo's model/weights/hcompress_v2):
-  hcompress_ccp_seed.json        library + size, Clio's format (weights and each
-                                 head's RLS matrix P): load it with
+  hcompress_ccp_seed.json        library + size, Clio's format: load it with
                                  hcompress_model_path = DIR
   hcompress_ccp_dtype_seed.json  library + dtype + size: the same format plus a
                                  "dtypes" list and the dtype columns after the
@@ -105,12 +104,11 @@ def targets(d, ratio_cap):
 
 
 def ridge(x, y, c):
-    """@return (w solving (X'X + c I) w = X'y, P = (X'X + c I)^-1, rows used),
-    over the rows where y is measured; P is the RLS state the seed leaves."""
+    """@return w solving (X'X + c I) w = X'y over the rows where y is measured."""
     ok = np.isfinite(y)
     xx, yy = x[ok], y[ok]
     a = xx.T @ xx + (c if c > 0 else 1e-3) * np.eye(x.shape[1])
-    return np.linalg.solve(a, xx.T @ yy), np.linalg.inv(a), int(ok.sum())
+    return np.linalg.solve(a, xx.T @ yy), int(ok.sum())
 
 
 def fit(d, c, ratio_cap, with_dtype):
@@ -119,14 +117,12 @@ def fit(d, c, ratio_cap, with_dtype):
     dtypes = vocab(d["dtype"]) if with_dtype else []
     x = encode(d, libs, dtypes)
     y = targets(d, ratio_cap)
-    ws, ps, ns = [], [], []
+    ws, ns = [], []
     for k in range(3):
-        w, pk, n = ridge(x, y[:, k], c)
+        w, n = ridge(x, y[:, k], c)
         ws.append(w)
-        ps.append(pk)
         ns.append(n)
-    return {"libraries": libs, "dtypes": dtypes, "w": ws, "p": ps, "samples": ns,
-            "rows": len(d)}
+    return {"libraries": libs, "dtypes": dtypes, "w": ws, "samples": ns, "rows": len(d)}
 
 
 def predict(model, d):
@@ -174,12 +170,7 @@ def write_json(model, path, c, ratio_cap):
         lines.append('  "dtypes": [' + ", ".join(f'"{k}"' for k in dt) + "],")
     lines.append(f'  "samples": [{model["samples"][0]}, {model["samples"][1]}, {model["samples"][2]}],')
     for k, (_, key) in enumerate(HEADS):
-        lines.append(f'  "{key}": [{nums(model["w"][k])}],')
-    # each head's P = (A + C I)^-1 (row-major), so feedback in Clio continues
-    # from the seed instead of from the prior (1/C) I
-    for k, (_, key) in enumerate(HEADS):
-        pkey = key.replace("w_", "p_", 1)
-        lines.append(f'  "{pkey}": [{nums(model["p"][k].ravel())}]' + ("," if k < 2 else ""))
+        lines.append(f'  "{key}": [{nums(model["w"][k])}]' + ("," if k < 2 else ""))
     lines.append("}")
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")

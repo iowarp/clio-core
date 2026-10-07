@@ -662,6 +662,25 @@ bool PreloadFiles(const std::vector<fs::path> &files,
   return true;
 }
 
+/**
+ * @brief Write back dirty pages and drop the page cache (Linux), so that the
+ * next read pass reads the stored data from the device, not from memory.
+ *
+ * Enabled by CLIO_REPLAY_DROP_CACHES=1; needs password-less sudo for
+ * /proc/sys/vm/drop_caches. Called outside every timed window. With several
+ * processes on one node each process drops the node's cache at its own pass
+ * start, which also empties the others' cache.
+ * @return elapsed milliseconds, or a negative value when the drop failed
+ */
+double DropPageCache() {
+  const auto t0 = std::chrono::steady_clock::now();
+  const int rc = std::system(
+      "sync && echo 1 | sudo -n tee /proc/sys/vm/drop_caches > /dev/null");
+  const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+  return rc == 0 ? ms : -1.0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -1691,8 +1710,20 @@ int main(int argc, char **argv) {
       std::cerr << "read buffer pool allocation failed\n";
       ok = false;
     }
+    const char *drop_env = std::getenv("CLIO_REPLAY_DROP_CACHES");
+    const bool drop_caches = drop_env != nullptr && *drop_env != '\0' && *drop_env != '0';
     for (size_t i = 1; i <= opt.read_repeat; ++i) {
       std::cout << "READ " << i << "/" << opt.read_repeat << std::endl;
+      if (drop_caches) {  // before the pass's timer: the drop is not timed
+        const double drop_ms = DropPageCache();
+        if (drop_ms < 0.0) {
+          std::cerr << "page-cache drop failed (needs sudo -n)\n";
+          ok = false;
+        } else {
+          std::cout << "  page cache dropped (untimed): " << std::fixed
+                    << std::setprecision(1) << drop_ms << " ms" << std::endl;
+        }
+      }
       for (auto &f : kmeans) f.second.BeginPass();
       kmeans_active = opt.kmeans > 0;
       const auto t_pass = std::chrono::steady_clock::now();

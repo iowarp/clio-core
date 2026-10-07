@@ -39,11 +39,16 @@ TRACK_COLOR, TRACK_INK = "#f4d3d8", "#a8505d"   # the oracle's track: a tint of 
 INK, INK_2, GRID = "#1a1a19", "#52514e", "#e6e5e1"
 
 
-def load(config):
-    """@return one row per (workload, option) of the given configuration."""
+def load(config, extras=("",)):
+    """@return one row per (workload, option, run) of the given configuration.
+
+    @param extras tag parts after the prefix, one per repeated run (e.g. dc1,
+                  dc2, dc3); "" is the untagged run
+    """
     rows = []
-    for label, desc, ds, prefix, w, model in WORKLOADS:
-        f = os.path.join(RUNS, f"{ds}_{prefix}{config}w{w}_compare.csv")
+    for (label, desc, ds, prefix, w, model), extra in (
+            (wl, e) for wl in WORKLOADS for e in extras):
+        f = os.path.join(RUNS, f"{ds}_{prefix}{extra}{config}w{w}_compare.csv")
         if not os.path.exists(f):
             continue
         t = pd.read_csv(f)
@@ -56,13 +61,47 @@ def load(config):
                          "best_single_app_s": best.app_s, "best_single_ratio": best.ratio,
                          "time_saved_pct": -r.app_s_vs_best_single_pct,
                          "ratio_gain_pct": r.ratio_vs_best_single_pct,
-                         "bit_exact": r.digest_ok})
+                         "bit_exact": r.digest_ok, "run": extra})
     return pd.DataFrame(rows)
+
+
+def aggregate(t):
+    """@return one row per (workload, option): the mean over the runs, with the
+    min, max and standard deviation of the two benefit columns and the run count."""
+    keys = ["workload", "description", "dataset", "cost_model", "config", "mode"]
+    g = t.groupby(keys, sort=False)
+    out = g[["app_s", "ratio", "best_single_app_s", "best_single_ratio", "time_saved_pct",
+             "ratio_gain_pct"]].mean()
+    for col in ("time_saved_pct", "ratio_gain_pct"):
+        out[f"{col}_min"] = g[col].min()
+        out[f"{col}_max"] = g[col].max()
+        out[f"{col}_std"] = g[col].std()
+    out["runs"] = g.size()
+    out["bit_exact"] = g["bit_exact"].all()
+    return out.reset_index()
 
 
 def pct(v):
     """@return v as a percentage, signed only when negative."""
     return f"{v:.0f}%" if v >= 0 else f"\u2212{-v:.0f}%"
+
+
+def rng(t, label, mode, col):
+    """@return (min, max) over the repeated runs, or None for a single run."""
+    if f"{col}_min" not in t:
+        return None
+    s = t[(t.workload == label) & (t["mode"] == mode)]
+    if not len(s) or s.runs.iloc[0] < 2:
+        return None
+    lo, hi = float(s[f"{col}_min"].iloc[0]), float(s[f"{col}_max"].iloc[0])
+    return (lo, hi) if hi - lo >= 0.05 else None   # no bar for a range of ~0 (e.g. the ratio)
+
+
+def whisker(a, r, y, h):
+    """A min-max error bar at height y: a thin line with end caps."""
+    a.plot([r[0], r[1]], [y, y], color=INK, lw=1.2, zorder=4, solid_capstyle="butt")
+    for x in r:
+        a.plot([x, x], [y - h * 0.32, y + h * 0.32], color=INK, lw=1.2, zorder=4)
 
 
 def value(t, label, mode, col):
@@ -92,10 +131,16 @@ def panel(a, t, labels, col, title, missing="run pending"):
         if np.isfinite(or_v):
             a.barh(y + yo, or_v, height=0.40, color=TRACK_COLOR, zorder=1)
         a.barh(y + yo, np_v, height=0.28, color=NP_COLOR, zorder=2)
+        np_rng = rng(t, lab, "learn", col)
+        if np_rng is not None:
+            whisker(a, np_rng, y + yo, 0.28)
         if np_v >= min_inside:
-            a.text(np_v - 0.012 * span, y + yo, pct(np_v), va="center", ha="right",
+            # with an error bar at the bar end the value sits at the bar's start
+            x, ha = ((0.012 * span, "left") if np_rng is not None
+                     else (np_v - 0.012 * span, "right"))
+            a.text(x, y + yo, pct(np_v), va="center", ha=ha,
                    fontsize=12, fontweight="bold", color="white", zorder=3)
-            end = np_v
+            end = max(np_v, np_rng[1]) if np_rng is not None else np_v
         else:
             a.text(np_v + pad, y + yo, pct(np_v), va="center", ha="left",
                    fontsize=12, fontweight="bold", color=INK, zorder=3)
@@ -114,7 +159,12 @@ def panel(a, t, labels, col, title, missing="run pending"):
                    color=INK, zorder=4)
         elif np.isfinite(hc_v):
             a.barh(y - 0.21, hc_v, height=0.22, color=HC_COLOR, zorder=2)
-            x = hc_v + pad if hc_v >= 0 else hc_v - pad
+            hc_rng = rng(t, lab, "hcompress", col)
+            if hc_rng is not None:
+                whisker(a, hc_rng, y - 0.21, 0.22)
+                x = max(hc_v, hc_rng[1]) + pad if hc_v >= 0 else min(hc_v, hc_rng[0]) - pad
+            else:
+                x = hc_v + pad if hc_v >= 0 else hc_v - pad
             a.text(x, y - 0.21, pct(hc_v), va="center", ha="left" if hc_v >= 0 else "right",
                    fontsize=10, color=INK_2)
         elif has_hc:
@@ -141,11 +191,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", required=True)
     ap.add_argument("--config", default="p1i1", help="processes x in flight as in the tag")
+    ap.add_argument("--extra", default="",
+                    help="repeated runs: tag parts, e.g. dc1,dc2,dc3 (mean and min-max bars)")
     a = ap.parse_args()
-    t = load(a.config)
-    if t.empty:
+    runs = load(a.config, a.extra.split(",") if a.extra else ("",))
+    if runs.empty:
         raise SystemExit("no compare CSV found")
+    t = aggregate(runs)
     t.to_csv(os.path.splitext(a.out)[0] + ".csv", index=False)
+    runs.to_csv(os.path.splitext(a.out)[0] + "_runs.csv", index=False)
+    nrun = int(t.runs.max())
     labels = [w[0] for w in WORKLOADS if w[0] in set(t.workload)]
     desc = {w[0]: w[1] for w in WORKLOADS}
     plt.rcParams.update({"font.family": "DejaVu Sans", "figure.facecolor": "white"})
@@ -179,7 +234,10 @@ def main():
     models = "; ".join(f"{w[0]} {w[5]}" for w in WORKLOADS if w[0] in labels)
     fig.text(0.012, 0.015,
              f"{cfg}; 1 write + 10 reads, each read followed by one k-means iteration; every "
-             f"chunk verified bit-exact. Each option selects by the workload's cost model "
+             f"chunk verified bit-exact"
+             + (f"; page cache dropped before each read; mean of {nrun} runs, error bars "
+                "min\u2013max" if nrun > 1 else "")
+             + f". Each option selects by the workload's cost model "
              f"(w_ct/w_dt/w_io at bandwidth): {models}."
              + ("" if has_hc else " HCompress was run at 1 process x 1 chunk only."),
              fontsize=8.5, color=INK_2, va="bottom", wrap=True)

@@ -150,21 +150,6 @@ class CcpRls {
     samples_ = samples;
   }
   bool Ready() const { return samples_ > 0; }
-  /** The inverse correlation matrix P (dim x dim, row-major). */
-  const std::vector<double>& Covariance() const { return p_; }
-  /**
-   * @brief Restore P, e.g. the seed's (A + C I)^-1 saved with the weights.
-   *
-   * Without it a loaded model continues from the prior (1/C) I, and the first
-   * feedback observation counts as much as the whole seed.
-   * @param p dim x dim, row-major
-   * @return false (P unchanged) when p has the wrong size
-   */
-  bool SetCovariance(std::vector<double> p) {
-    if (p.size() != dim_ * dim_) return false;
-    p_ = std::move(p);
-    return true;
-  }
 
  private:
   std::vector<double> w_;  /**< dim */

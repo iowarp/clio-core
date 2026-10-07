@@ -12,7 +12,9 @@
 # COST_BW  cost-model bandwidth in bytes per ms (1000000 = 1 GB/s)
 # READS    timed reads per run (each followed by one k-means iteration)
 # FIG_DIR  where the compare CSVs and configs_<DATASET>_w<W>.png go
-# PYTHON (default ~/np-venv/bin/python) runs the plot; GOVERNOR= (empty) leaves the
+# TAG_EXTRA (optional) is appended to the run tags (e.g. dc), so runs of another
+# setup -- CLIO_REPLAY_DROP_CACHES=1: page cache dropped before each timed read
+# -- stay apart from the others. PYTHON (default ~/np-venv/bin/python) runs the plot; GOVERNOR= (empty) leaves the
 # CPU governor alone where sudo is not available (e.g. Delta), see run_kmeans_parallel.sh.
 # Log: runs/DATASET_bench.log (steps, k-means checks).
 #===============================================================================
@@ -25,6 +27,7 @@ LOG=$RUNS/${DS}_bench.log
 BWL=$(awk -v b="$COST_BW" 'BEGIN{printf "%g", b / 1e6}')
 PREFIX=km${READS}b${BWL}g
 [ "$COST_BW" = 520000 ] && PREFIX=km${READS}
+PREFIX=$PREFIX${TAG_EXTRA:-}   # e.g. TAG_EXTRA=dc for runs with CLIO_REPLAY_DROP_CACHES=1
 WL=w${W//,/-}
 mkdir -p "$FIG"
 say() { echo "$(date +%T) $*" | tee -a "$LOG"; }
@@ -33,7 +36,7 @@ refs=${REFS:-}   # earlier configurations to compare with (tag prefixes, comma l
 for c in $CONFIGS; do
   p=${c%x*}; i=${c#*x}
   say "config ${p}x${i}"
-  ( cd "$HERE" && env COST_BW=$COST_BW READS=$READS FIG_DIR=$FIG PROCS=$p INFLIGHT=$i \
+  ( cd "$HERE" && env COST_BW=$COST_BW READS=$READS FIG_DIR=$FIG PROCS=$p INFLIGHT=$i TAG_PREFIX=$PREFIX \
       ${refs:+REF_TAG=$refs} ./run_kmeans_parallel.sh "$DS" "$W" ) \
       > "$RUNS/${DS}_${p}x${i}_bench.out" 2>&1 || say "config ${p}x${i}: run FAILED"
   "$HERE/check_kmeans.sh" "$DS" "${PREFIX}p${p}i${i}$WL" "$p" "$READS" >> "$LOG" 2>&1 \
