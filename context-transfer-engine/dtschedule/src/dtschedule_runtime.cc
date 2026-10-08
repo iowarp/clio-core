@@ -2716,12 +2716,26 @@ double Runtime::EffectiveParallelism(double cpu_pct) const {
   return std::max(config_.cpu_parallelism_, 1.0);
 }
 
-double Runtime::BottleneckMs(double d_mb, uint32_t node, double net_ms,
-                             double cpu_p_ms, double cpu_c_ms) {
+double Runtime::BottleneckMs(double d_mb, uint32_t node, uint32_t consumer,
+                             double net_ms, double cpu_p_ms, double cpu_c_ms) {
   const uint64_t bytes = static_cast<uint64_t>(d_mb * 1e6);
   const double store_ms =
       d_mb / std::max(TierBwMbPerMs(ChooseTier(bytes, node)), 1e-6);
-  const double worst = std::max({store_ms, net_ms, cpu_p_ms, cpu_c_ms});
+  // Per-node time: codec work plus the store when that node holds the chunk
+  // (with only per-resource terms, compressing and storing on the writer
+  // tied with storing at an idle consumer, which was 1.5x faster on HDD).
+  const uint32_t self = CLIO_IPC->GetNodeId();
+  const uint32_t C = consumer == UINT32_MAX ? self : consumer;
+  double p_ms = cpu_p_ms, c_ms = 0.0, other_ms = 0.0;
+  (C == self ? p_ms : c_ms) += cpu_c_ms;
+  if (node == self) {
+    p_ms += store_ms;
+  } else if (node == C) {
+    c_ms += store_ms;
+  } else {
+    other_ms = store_ms;
+  }
+  const double worst = std::max({net_ms, p_ms, c_ms, other_ms});
   // A small share of the total breaks ties toward options using less.
   return worst + 0.01 * (store_ms + net_ms + cpu_p_ms + cpu_c_ms);
 }
@@ -2752,10 +2766,10 @@ Runtime::ScenarioChoice Runtime::PlacedScenario(
     };
     const uint32_t b = tb(C) + d / nb < 0.9 * tb(self) ? C : self;
     const double net = (b == self ? 0.0 : d / nb) + (b == C ? 0.0 : d / nb);
-    return BottleneckMs(d, b, net, cpu_p, cpu_c);
+    return BottleneckMs(d, b, C, net, cpu_p, cpu_c);
   };
   auto s2 = [&](double d, double cpu_p, double cpu_c) {
-    return BottleneckMs(d, C, d / nb, cpu_p, cpu_c);
+    return BottleneckMs(d, C, C, d / nb, cpu_p, cpu_c);
   };
   const double cp = has_codec ? ctime_ms * load_mult / par_p : 0.0;
   const double dc = has_codec ? dtime_ms / par_c : 0.0;
@@ -2764,7 +2778,7 @@ Runtime::ScenarioChoice Runtime::PlacedScenario(
   const double z1 = has_codec ? s1(z_mb, cp, dc) : big;
   const double z2 = has_codec ? s2(z_mb, cp, dc) : big;
   const double z3 = has_codec
-      ? BottleneckMs(z_mb, C, raw_mb / nb, 0.0,
+      ? BottleneckMs(z_mb, C, C, raw_mb / nb, 0.0,
                      (ctime_ms * load_mult_c + dtime_ms) / par_c)
       : big;
   choice.cost1_ms = std::min(raw1, z1);

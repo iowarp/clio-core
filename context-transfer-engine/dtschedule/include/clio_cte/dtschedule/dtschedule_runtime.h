@@ -760,16 +760,20 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /**
    * Bottleneck cost of storing d_mb at a node: the busiest resource's share
    * per chunk (stages pipeline across chunks, so the slowest one sets the
-   * rate). Network terms on the one link add up.
+   * rate). Resources are the link and each node: a node's codec work and
+   * the stores it serves add up, because the same runtime workers run the
+   * codecs and drive (poll) the device I/O. Network terms on the one link
+   * add up.
    * @param d_mb Stored bytes (MB)
    * @param node Store node
+   * @param consumer Consumer node (UINT32_MAX when unknown)
    * @param net_ms Network time of this option per chunk (ms)
    * @param cpu_p_ms Producer CPU share per chunk (ms)
    * @param cpu_c_ms Consumer CPU share per chunk (ms)
    * @return Cost (ms)
    */
-  double BottleneckMs(double d_mb, uint32_t node, double net_ms,
-                      double cpu_p_ms, double cpu_c_ms);
+  double BottleneckMs(double d_mb, uint32_t node, uint32_t consumer,
+                      double net_ms, double cpu_p_ms, double cpu_c_ms);
   /**
    * Runtime workers running codec work concurrently on a node
    * (cpu_parallelism; its load enters through the load multiplier).
