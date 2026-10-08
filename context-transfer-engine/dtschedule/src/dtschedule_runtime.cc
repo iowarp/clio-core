@@ -176,8 +176,10 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
        config_.ccm_, config_.trace_path_.empty() ? "off" : config_.trace_path_,
        config_.load_aware_, config_.workflow_aware_);
 
-  // Phase 3: spawn periodic load sampling task
-  if (config_.load_aware_) {
+  // Periodic sampling also carries every node's free tier space, which
+  // placement needs whether or not CPU load is weighed (load_aware only
+  // switches the load multiplier off), so it always runs.
+  {
     int period_us = config_.load_period_ms_ * 1000;
     HLOG(kDebug, "dtschedule: Starting load sampling (period {}ms)",
          config_.load_period_ms_);
