@@ -98,6 +98,7 @@ struct Placement {
   uint32_t owner_node = UINT32_MAX;     ///< hash owner of the blob
   std::string tier;                     ///< chosen tier name
   float tier_score = -1.0f;             ///< its device score (-1 = unset)
+  bool auto_score = false;              ///< the put's score came from tier_score
   double tier_bw_mb_ms = 0.0;           ///< its bandwidth (MB/ms)
   std::string order;                    ///< decision order used
   int scenario = 1;                     ///< 1, 2, or 3
@@ -606,8 +607,12 @@ class Runtime : public clio::cte::core::CoreInterposer {
   }
   /** Decode a compressed read from the bytes the first read returned. */
   bool TryDecompressInPlace(clio::cte::core::GetBlobTask &task);
-  /** Cheapest node to store bytes on (tier + network); reserves the tier. */
-  uint32_t BestStoreNode(uint64_t bytes);
+  /** S1 store node, with the put's score set to that node's tier. */
+  uint32_t StoreNodeFor(clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task,
+                        const Placement &place);
+  /** Cheapest node to store bytes on (tier + network); reserves the tier.
+   *  @param tier receives the tier chosen on that node (optional) */
+  uint32_t BestStoreNode(uint64_t bytes, std::string *tier = nullptr);
   /** Query that runs on node (Local when it is this node). */
   clio::run::PoolQuery NodeQuery(uint32_t node) const;
   /** Key of a blob in the location cache / record tag. */

@@ -508,6 +508,7 @@ clio::run::TaskResume Runtime::PutBlob(
       }
       if (task->score_ < 0.0f && place.tier_score >= 0.0f) {
         task->score_ = place.tier_score;  // never override an explicit score
+        place.auto_score = true;
       }
     }
   }
@@ -598,7 +599,7 @@ clio::run::TaskResume Runtime::PutBlob(
         stats_.per_lib_count_[decision.chosen_lib_]++;
       }
       if (placed) {
-        CLIO_CO_AWAIT(PutAtNode(task, BestStoreNode(task->size_)));
+        CLIO_CO_AWAIT(PutAtNode(task, StoreNodeFor(task, place)));
       } else {
         CLIO_CO_AWAIT(ForwardCompressedPut(task));
       }
@@ -609,7 +610,7 @@ clio::run::TaskResume Runtime::PutBlob(
         stats_.bytes_out_ += original_size;
       }
       if (placed) {
-        CLIO_CO_AWAIT(PutAtNode(task, BestStoreNode(task->size_)));
+        CLIO_CO_AWAIT(PutAtNode(task, StoreNodeFor(task, place)));
       } else {
         CLIO_CO_AWAIT(ForwardRawPut(task));
       }
@@ -2058,7 +2059,29 @@ double Runtime::StoreBwFor(uint64_t bytes, uint32_t owner_node,
   return bw;
 }
 
-uint32_t Runtime::BestStoreNode(uint64_t bytes) {
+uint32_t Runtime::StoreNodeFor(
+    clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task,
+    const Placement &place) {
+  /**
+   * Store node for an S1 put, with the put's score set to the tier chosen
+   * on that node. The score computed up front is for the consumer's node
+   * when a consumer is known; kept on a local put it sent chunks to the
+   * consumer's tier (the local HDD once the consumer's NVMe was full) while
+   * the local NVMe stayed empty and the cost model priced NVMe.
+   *
+   * @param task The put (its size is what will be stored)
+   * @param place The placement decided for it
+   * @return Node id
+   */
+  std::string tier;
+  const uint32_t node = BestStoreNode(task->size_, &tier);
+  if (place.auto_score && TierScore(tier) >= 0.0f) {
+    task->score_ = TierScore(tier);
+  }
+  return node;
+}
+
+uint32_t Runtime::BestStoreNode(uint64_t bytes, std::string *tier) {
   /**
    * Node whose storage takes `bytes` cheapest: the time to store them on
    * the tier they would land in there, plus the network transfer when the
@@ -2071,7 +2094,8 @@ uint32_t Runtime::BestStoreNode(uint64_t bytes) {
    */
   const uint32_t self = CLIO_IPC->GetNodeId();
   if (config_.placement_ == "local") {
-    ChooseTier(bytes, self, /*reserve=*/true);
+    const std::string t = ChooseTier(bytes, self, /*reserve=*/true);
+    if (tier) *tier = t;
     return self;  // baseline: always the writer's node
   }
   std::vector<uint32_t> nodes;
@@ -2095,7 +2119,8 @@ uint32_t Runtime::BestStoreNode(uint64_t bytes) {
       best_cost = c;
     }
   }
-  ChooseTier(bytes, best, /*reserve=*/true);
+  const std::string t = ChooseTier(bytes, best, /*reserve=*/true);
+  if (tier) *tier = t;
   return best;
 }
 
