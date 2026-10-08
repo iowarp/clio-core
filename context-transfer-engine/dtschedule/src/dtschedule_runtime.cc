@@ -2689,7 +2689,8 @@ Runtime::ScenarioChoice Runtime::SelectScenario(uint64_t size,
   const double net_mb_ms = std::max(config_.net_bw_gbps_, 0.01) / 8.0;
   const double tier_mb_ms = place.tier_bw_mb_ms > 0.0 ? place.tier_bw_mb_ms
                                                        : net_mb_ms;
-  const double store_ms = (z_mb / tier_mb_ms) * load_mult;
+  // Storing is I/O, not CPU: the load multipliers scale only the codec work.
+  const double store_ms = z_mb / tier_mb_ms;
   const uint32_t P = CLIO_IPC->GetNodeId();
   const uint32_t C = place.consumer_node;
   const uint32_t O = place.owner_node == UINT32_MAX ? P : place.owner_node;
@@ -2717,7 +2718,7 @@ Runtime::ScenarioChoice Runtime::SelectScenario(uint64_t size,
                                  knobs_.load_aware_, config_.load_cap_);
   }
   choice.cost3_ms = net(raw_mb, P, C) + pred_ctime_ms * load_mult_c +
-                    net(z_mb, C, O) + store_ms * load_mult_c;
+                    net(z_mb, C, O) + store_ms;
 
   const std::string &force = knobs_.force_scenario_;
   if (force == "1") {

@@ -182,11 +182,15 @@ void QtablePredictor::Observe(const Features &features,
   Entry &e = state_cache_[state];
   const double n = std::min(e.count_, kMaxOnlineWeight);
   e.mean_.ctime_ms_ = (e.mean_.ctime_ms_ * n + obs_ctime_ms) / (n + 1.0);
-  e.mean_.dtime_ms_ = (e.mean_.dtime_ms_ * n + obs_dtime_ms) / (n + 1.0);
+  // The write path observes no decompression (obs_dtime_ms <= 0 means
+  // unknown): keep the learned decompression time instead of pulling it
+  // toward zero.
+  const double dtime = obs_dtime_ms > 0.0 ? obs_dtime_ms : e.mean_.dtime_ms_;
+  e.mean_.dtime_ms_ = (e.mean_.dtime_ms_ * n + dtime) / (n + 1.0);
   e.mean_.ratio_ = (e.mean_.ratio_ * n + obs_ratio) / (n + 1.0);
   e.count_ = n + 1.0;
   AccumulateMarginal({state[0], state[1], state[2]},
-                     Prediction{obs_ctime_ms, obs_dtime_ms, obs_ratio}, 1.0);
+                     Prediction{obs_ctime_ms, dtime, obs_ratio}, 1.0);
 }
 
 void QtablePredictor::AccumulateMarginal(const std::array<int, 3> &key,

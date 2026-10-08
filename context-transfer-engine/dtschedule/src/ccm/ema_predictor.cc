@@ -80,8 +80,11 @@ void EmaPredictor::Observe(const Features &features,
     // Update EMA: EMA_new = alpha * obs + (1 - alpha) * EMA_old
     ema_state.ema_ctime_ms_ = kAlpha * obs_ctime_ms +
                                (1.0 - kAlpha) * ema_state.ema_ctime_ms_;
-    ema_state.ema_dtime_ms_ = kAlpha * obs_dtime_ms +
-                               (1.0 - kAlpha) * ema_state.ema_dtime_ms_;
+    // obs_dtime_ms <= 0: no decompression observed; keep the estimate.
+    if (obs_dtime_ms > 0.0) {
+      ema_state.ema_dtime_ms_ = kAlpha * obs_dtime_ms +
+                                (1.0 - kAlpha) * ema_state.ema_dtime_ms_;
+    }
     ema_state.ema_ratio_ =
         kAlpha * obs_ratio + (1.0 - kAlpha) * ema_state.ema_ratio_;
   }
