@@ -364,6 +364,8 @@ struct RegisterTargetTask : public clio::run::Task {
   // pool). When attaching, the handler validates the pool via GetStats and
   // skips AsyncCreate.
   IN clio::run::u32 attach_existing_;
+  // File bdevs: lazy-growth (and reservation) step passed to the bdev create.
+  IN clio::run::u64 growth_unit_;
 
   // SHM constructor
   CTP_CROSS_FUN RegisterTargetTask()
@@ -372,7 +374,8 @@ struct RegisterTargetTask : public clio::run::Task {
         bdev_type_(clio::run::bdev::BdevType::kFile),
         total_size_(0),
         bdev_id_(clio::run::PoolId::GetNull()),
-        attach_existing_(0) {}
+        attach_existing_(0),
+        growth_unit_(clio::run::u64(1) << 30) {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit RegisterTargetTask(
@@ -380,14 +383,16 @@ struct RegisterTargetTask : public clio::run::Task {
       const clio::run::PoolQuery &pool_query, const std::string &target_name,
       clio::run::bdev::BdevType bdev_type, clio::run::u64 total_size,
       const clio::run::PoolQuery &target_query, const clio::run::PoolId &bdev_id,
-      clio::run::u32 attach_existing = 0)
+      clio::run::u32 attach_existing = 0,
+      clio::run::u64 growth_unit = clio::run::u64(1) << 30)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kRegisterTarget),
         target_name_(CLIO_PRIV_ALLOC, target_name),
         bdev_type_(bdev_type),
         total_size_(total_size),
         target_query_(target_query),
         bdev_id_(bdev_id),
-        attach_existing_(attach_existing) {
+        attach_existing_(attach_existing),
+        growth_unit_(growth_unit) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kRegisterTarget;
@@ -402,7 +407,7 @@ struct RegisterTargetTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
     ar(target_name_, bdev_type_, total_size_, target_query_, bdev_id_,
-       attach_existing_);
+       attach_existing_, growth_unit_);
   }
 
   /**
@@ -427,6 +432,7 @@ struct RegisterTargetTask : public clio::run::Task {
     target_query_ = other->target_query_;
     bdev_id_ = other->bdev_id_;
     attach_existing_ = other->attach_existing_;
+    growth_unit_ = other->growth_unit_;
   }
 
   /**

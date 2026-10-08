@@ -329,6 +329,11 @@ class ConfigManager : public ctp::BaseConfig {
    */
   u32 GetFirstBusyWait() const { return first_busy_wait_; }
 
+  /** Seconds a client must be dead, idle and without in-flight tasks before
+   *  its shared-memory segments are reaped (0 = never reap while running;
+   *  ClearUserIpcs still cleans up at the next start). #1192. */
+  u32 GetClientReapGraceS() const { return client_reap_grace_s_; }
+
   /**
    * Get the task-progress validity-check interval in milliseconds.
    *
@@ -544,6 +549,7 @@ class ConfigManager : public ctp::BaseConfig {
 
   // Worker sleep configuration (in microseconds)
   u32 first_busy_wait_ = 10000;              // Default: 10000us (10ms) busy wait
+  u32 client_reap_grace_s_ = 30;             // #1192: dead-client reap grace
   // #628 task-progress probe (0 = disabled). ON by default (issue #774): this
   // probe is the ONLY recovery for a cross-node task whose response was lost
   // (e.g. the SendOut retry queue timing out under sustained back-pressure) —

@@ -77,6 +77,27 @@ CUresult GpuVirtualMemoryManager::init(const GpuVmmConfig &config) {
     return res;
   }
 
+  // Hold our own reference on the device's primary context: destroy()
+  // releases one. Without this retain, that release dropped a reference
+  // GpuVmm never took -- the CUDA runtime's -- and could destroy the primary
+  // context, freeing every pinned allocation in it (the clio runtime's
+  // gpu2cpu queue arena included, which its GPU worker then segfaulted
+  // reading, #1216).
+  CUcontext primary = nullptr;
+  res = cuDevicePrimaryCtxRetain(&primary, device_);
+  if (res != CUDA_SUCCESS) {
+    fprintf(stderr, "GpuVmm: cuDevicePrimaryCtxRetain failed: %d\n", res);
+    return res;
+  }
+  ctx_retained_ = true;
+  cuCtxSetCurrent(primary);
+  // Every failure from here on gives that reference back.
+  auto fail = [this](CUresult r) {
+    cuDevicePrimaryCtxRelease(device_);
+    ctx_retained_ = false;
+    return r;
+  };
+
   // Query the allocation granularity for the device
   CUmemAllocationProp prop = {};
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -88,7 +109,7 @@ CUresult GpuVirtualMemoryManager::init(const GpuVmmConfig &config) {
                                        CU_MEM_ALLOC_GRANULARITY_MINIMUM);
   if (res != CUDA_SUCCESS) {
     fprintf(stderr, "GpuVmm: cuMemGetAllocationGranularity failed: %d\n", res);
-    return res;
+    return fail(res);
   }
 
   // CTE backing store, when requested. It used to sit behind a macro nothing
@@ -100,14 +121,14 @@ CUresult GpuVirtualMemoryManager::init(const GpuVmmConfig &config) {
                                                clio::run::PoolQuery::Local())) {
       fprintf(stderr, "GpuVmm: use_cte=true but the CTE client could not be "
               "initialized (is the runtime up?)\n");
-      return CUDA_ERROR_NOT_INITIALIZED;
+      return fail(CUDA_ERROR_NOT_INITIALIZED);
     }
     cte_tag_ = std::make_unique<clio::cte::core::Tag>(config.cte_tag_name);
     if (cte_tag_->GetTagId().IsNull()) {
       fprintf(stderr, "GpuVmm: could not create CTE tag %s\n",
               config.cte_tag_name.c_str());
       cte_tag_.reset();
-      return CUDA_ERROR_NOT_INITIALIZED;
+      return fail(CUDA_ERROR_NOT_INITIALIZED);
     }
     fprintf(stdout, "GpuVmm: CTE backing store enabled (tag: %s)\n",
             config.cte_tag_name.c_str());
@@ -137,7 +158,7 @@ CUresult GpuVirtualMemoryManager::init(const GpuVmmConfig &config) {
             "  Try a smaller va_size_bytes.\n",
             va_size_, res, va_size_);
     cte_tag_.reset();
-    return res;
+    return fail(res);
   }
 
   // Initialize the software page table (all pages start unmapped)
@@ -209,8 +230,12 @@ void GpuVirtualMemoryManager::destroy() {
   total_pages_ = 0;
   page_table_.clear();
 
-  // Release our reference to the primary context
-  cuDevicePrimaryCtxRelease(device_);
+  // Release the primary-context reference init() took (and only that
+  // one).
+  if (ctx_retained_) {
+    cuDevicePrimaryCtxRelease(device_);
+    ctx_retained_ = false;
+  }
 }
 
 size_t GpuVirtualMemoryManager::getMappedPageCount() const {

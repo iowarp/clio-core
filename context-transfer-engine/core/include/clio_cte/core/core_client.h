@@ -501,12 +501,14 @@ class Client : public clio::run::ContainerClient {
       const clio::run::PoolQuery &target_query = clio::run::PoolQuery::Local(),
       const clio::run::PoolId &bdev_id = clio::run::PoolId::GetNull(),
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
-      clio::run::u32 attach_existing = 0) {
+      clio::run::u32 attach_existing = 0,
+      clio::run::u64 growth_unit = clio::run::u64(1) << 30) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<RegisterTargetTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, target_name,
-        bdev_type, total_size, target_query, bdev_id, attach_existing);
+        bdev_type, total_size, target_query, bdev_id, attach_existing,
+        growth_unit);
 
     return ipc_manager->Send(task);
   }

@@ -3200,18 +3200,67 @@ bool ClientProcessGone(int pid) {
 #endif
   return false;
 }
+
+/** Steady-clock nanoseconds (the reaper's grace bookkeeping). */
+u64 SteadyNowNs() {
+  return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count());
+}
 }  // namespace
 
-int IpcManager::DeadIpcGraceSec() {
-  static const int grace = [] {
-    const char *e = std::getenv("CLIO_DEAD_IPC_GRACE_S");
-    if (e != nullptr && *e != '\0') {
-      int v = std::atoi(e);
-      if (v >= 0) return v;
-    }
-    return 30;
-  }();
-  return grace;
+void ReleaseClientInflight(u32 pid) {
+  auto *ipc = CLIO_IPC;
+  if (ipc != nullptr) ipc->ReleaseClientInflightCount(pid);
+}
+
+void IpcManager::AcquireClientInflight(u32 pid) {
+  std::lock_guard<std::mutex> lk(client_activity_mu_);
+  ClientActivity &a = client_activity_[pid];
+  a.inflight++;
+  a.last_admit_ns = SteadyNowNs();
+  a.dead_since_ns = 0;  // it just sent a task: not dead
+}
+
+void IpcManager::ReleaseClientInflightCount(u32 pid) {
+  std::lock_guard<std::mutex> lk(client_activity_mu_);
+  auto it = client_activity_.find(pid);
+  if (it != client_activity_.end() && it->second.inflight > 0) {
+    it->second.inflight--;
+  }
+}
+
+u64 IpcManager::GetClientInflight(u32 pid) {
+  std::lock_guard<std::mutex> lk(client_activity_mu_);
+  auto it = client_activity_.find(pid);
+  return it == client_activity_.end() ? 0 : it->second.inflight;
+}
+
+bool IpcManager::ClientReapable(u32 pid, u64 grace_ns) {
+  const u64 now = SteadyNowNs();
+  std::lock_guard<std::mutex> lk(client_activity_mu_);
+  ClientActivity &a = client_activity_[pid];
+  if (a.dead_since_ns == 0) a.dead_since_ns = now;
+  if (a.inflight != 0) return false;
+  if (now - a.dead_since_ns < grace_ns) return false;
+  if (a.last_admit_ns != 0 && now - a.last_admit_ns < grace_ns) return false;
+  return true;
+}
+
+void IpcManager::ForgetReapedClients(const std::vector<u32> &pids) {
+  if (pids.empty()) return;
+  {
+    std::lock_guard<std::mutex> lk(client_activity_mu_);
+    for (u32 pid : pids) client_activity_.erase(pid);
+  }
+#if CTP_IS_HOST
+  // The cached connection to each reaped client's response ring. Safe to
+  // drop: the client had no task in flight, so nothing can be sending to it.
+  std::lock_guard<std::mutex> lk(shm_conns_mutex_);
+  for (u32 pid : pids) {
+    shm_conns_.erase("clio-" + std::to_string(pid) + "-shm-out");
+  }
+#endif
 }
 
 size_t IpcManager::WreapDeadIpcs() {
@@ -3222,7 +3271,16 @@ size_t IpcManager::WreapDeadIpcs() {
 
   int current_pid = ctp::SystemInfo::GetPid();
   size_t reaped_count = 0;
-  const auto now = std::chrono::steady_clock::now();
+  // #1192: 0 disables reaping while running (ClearUserIpcs still cleans up
+  // at the next start).
+  auto *config = CLIO_CONFIG_MANAGER;
+  const u64 grace_s = config ? config->GetClientReapGraceS() : 30;
+  if (grace_s == 0) {
+    allocator_map_lock_.WriteUnlock();
+    return 0;
+  }
+  const u64 grace_ns = grace_s * 1000000000ull;
+  std::vector<u32> reaped_pids;
 
   // Build list of allocator keys to remove (can't modify map while iterating)
   std::vector<u64> keys_to_remove;
@@ -3245,33 +3303,11 @@ size_t IpcManager::WreapDeadIpcs() {
       continue;
     }
 
-    // Check if the owning process is still alive.
-    if (!ClientProcessGone(owner_pid)) {
-      if (dead_alloc_since_.erase(alloc_key) > 0) {
-        // A pid we saw dead answers kill(0) again: a zombie, a reused pid,
-        // or EPERM from another user's process. Say so, or a segment that
-        // never gets reclaimed has no trace of why.
-        HLOG(kInfo,
-             "WreapDeadIpcs: client pid {} answers again (zombie or reused "
-             "pid?); segment ({}.{}) kept",
-             owner_pid, major, minor);
-      }
-      continue;
-    }
-    // #1192: dead. Remember when we first saw it so, and reclaim only after
-    // the grace period: the tasks it left in flight are dropped by the
-    // runtime within seconds, and a segment unmapped under one of them would
-    // take a worker down with it.
-    auto since = dead_alloc_since_.find(alloc_key);
-    if (since == dead_alloc_since_.end()) {
-      dead_alloc_since_.emplace(alloc_key, now);
-      HLOG(kInfo,
-           "WreapDeadIpcs: client pid {} is gone; its segment ({}.{}) is "
-           "reclaimed in {} s unless it comes back",
-           owner_pid, major, minor, DeadIpcGraceSec());
-      continue;
-    }
-    if (now - since->second >= std::chrono::seconds(DeadIpcGraceSec())) {
+    // Reap only a client that is gone (dead or a zombie) and none of whose
+    // tasks can still be reading its segments (#1192).
+    if (ClientProcessGone(owner_pid) &&
+        ClientReapable(static_cast<u32>(owner_pid), grace_ns)) {
+      // Process is dead - mark for removal
       HLOG(kInfo,
            "WreapDeadIpcs: Process {} is dead, marking allocator ({}.{}) for "
            "removal",
@@ -3324,8 +3360,8 @@ size_t IpcManager::WreapDeadIpcs() {
     }
 
     // Remove from alloc_map_
+    reaped_pids.push_back(static_cast<u32>(map_it->first >> 32));
     alloc_map_.erase(map_it);
-    dead_alloc_since_.erase(key);
     reaped_count++;
   }
 
@@ -3337,6 +3373,7 @@ size_t IpcManager::WreapDeadIpcs() {
 
   // Release the lock before returning
   allocator_map_lock_.WriteUnlock();
+  ForgetReapedClients(reaped_pids);
 
   return reaped_count;
 }

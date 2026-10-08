@@ -997,7 +997,8 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
         }
         auto reg_task = client_.AsyncRegisterTarget(
             target_path, bdev_type, capacity_bytes, target_query, bdev_id,
-            clio::run::PoolQuery::Dynamic(), attach_existing);
+            clio::run::PoolQuery::Dynamic(), attach_existing,
+            device.growth_unit_);
         CLIO_CO_AWAIT(reg_task);
         clio::run::u32 result = reg_task->GetReturnCode();
         if (result == 0) {
@@ -1449,7 +1450,9 @@ clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTarg
            bdev_pool_id.major_, bdev_pool_id.minor_, target_name, target_node,
            this_node);
       auto create_task = bdev_client.AsyncCreate(
-          pool_query, target_name, bdev_pool_id, bdev_type, total_size);
+          pool_query, target_name, bdev_pool_id, bdev_type, total_size,
+          /*io_depth=*/32, /*alignment=*/4096, /*perf_metrics=*/nullptr,
+          /*alloc_log_path=*/"", task->growth_unit_);
       CLIO_CO_AWAIT(create_task);
       if (create_task->return_code_ == 0 && target_node != this_node) {
         // The pool exists only on target_node, so this node has no metadata

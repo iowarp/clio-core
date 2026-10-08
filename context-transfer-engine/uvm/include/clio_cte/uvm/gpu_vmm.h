@@ -168,6 +168,7 @@ class GpuVirtualMemoryManager {
   size_t total_pages_ = 0;
   int fill_value_ = 5;
   CUdevice device_ = 0;
+  bool ctx_retained_ = false;  ///< init() holds a primary-context reference
   size_t prefetch_window_ = 4;
 
   struct PageEntry {

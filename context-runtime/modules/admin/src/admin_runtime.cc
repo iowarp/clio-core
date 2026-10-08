@@ -1491,10 +1491,10 @@ clio::run::TaskResume Runtime::WreapDeadIpcs(clio::run::shared_ptr<WreapDeadIpcs
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   auto *ipc_manager = CLIO_IPC;
 
-  // Reclaim the shared-memory segments of clients that died (#1192). The
-  // reaper itself waits DeadIpcGraceSec() after first seeing a client dead,
-  // so an in-flight task of that client is never unmapped under a worker --
-  // the hazard 7c37a1be disabled this call for.
+  // Reap shared memory from dead (or zombie) client processes. Disabled earlier because
+  // reaping was not safe (7c37a1bed); it now skips any client that still has
+  // tasks in flight or was active within runtime.client_reap_grace_s, which
+  // also disables it when set to 0 (#1192).
   task->reaped_count_ = ipc_manager->WreapDeadIpcs();
 
   // Mark whether we did work (for periodic task efficiency tracking)

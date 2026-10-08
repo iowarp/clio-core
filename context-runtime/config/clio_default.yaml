@@ -54,6 +54,11 @@ runtime:
   queue_depth: 1024                    # Task queue depth per worker
   local_sched: "default"               # Local task scheduler algorithm
   first_busy_wait: 10000               # Microseconds to busy-wait before sleeping (10ms)
+  # Shared-memory segments of a client process that died are reclaimed once
+  # it has no task in flight and has been dead and idle this many seconds
+  # (#1192). 0 = never while the runtime runs; they are then cleaned up at
+  # the next runtime start.
+  client_reap_grace_s: 30
   task_progress_interval_ms: 5000      # default: 5000 -- how long a cross-node task may sit
                                        # quietly before the origin probes its node (issue #628);
                                        # 0 disables. Env CLIO_TASK_PROGRESS_INTERVAL_MS overrides.
@@ -319,11 +324,16 @@ compose:
         score: 1.0                       # DRAM = highest-performance tier
 
       # Persistent disk tier: where the replication chimod (below) keeps the
-      # durable copies of DRAM-cached data. Grows lazily (1GB units), so the
+      # durable copies of DRAM-cached data. Grows lazily, so the
       # capacity_limit is a cap, not an upfront allocation.
+      # growth_unit (file tiers, optional, default "1GB"): how far the file
+      #   grows -- and reserves -- at a time. The first unit is reserved when
+      #   the tier is created, so on a RAM-backed filesystem (tmpfs) each
+      #   file tier costs one unit of memory up front; use e.g. "64MB" there.
       - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
         bdev_type: "file"
         capacity_limit: "10GB"
+        # growth_unit: "1GB"
         score: 0.2
         persistence_level: "temporary"
 
