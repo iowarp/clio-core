@@ -129,12 +129,18 @@ struct StorageDeviceConfig {
   // Optional module name of the existing pool, for logging/validation only
   // (e.g. "clio_safe_bdev"). Not used to route — routing is purely by pool id.
   std::string existing_pool_module_;
+  // File tiers only: how far the backing file grows (and reserves) at a time.
+  // The bdev reserves its first unit when it is created, so on a RAM-backed
+  // filesystem (tmpfs) every file tier costs this much memory up front.
+  // YAML key: growth_unit (size string). Default matches the bdev's 1 GiB.
+  clio::run::u64 growth_unit_;
 
   StorageDeviceConfig()
       : capacity_limit_(0),
         score_(-1.0f),
         persistence_level_("volatile"),
-        existing_pool_id_(clio::run::PoolId::GetNull()) {}
+        existing_pool_id_(clio::run::PoolId::GetNull()),
+        growth_unit_(clio::run::u64(1) << 30) {}
   StorageDeviceConfig(const std::string &path, const std::string &bdev_type,
                       clio::run::u64 capacity, float score = -1.0f,
                       const std::string &persistence_level = "volatile")
@@ -143,7 +149,8 @@ struct StorageDeviceConfig {
         capacity_limit_(capacity),
         score_(score),
         persistence_level_(persistence_level),
-        existing_pool_id_(clio::run::PoolId::GetNull()) {}
+        existing_pool_id_(clio::run::PoolId::GetNull()),
+        growth_unit_(clio::run::u64(1) << 30) {}
 
   // True when this target should bind to an existing pool rather than create
   // its own bdev. Pool-id major 0 is reserved for "not set" (CTE/admin pools
