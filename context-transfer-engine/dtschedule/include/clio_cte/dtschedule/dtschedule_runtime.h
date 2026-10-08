@@ -77,7 +77,18 @@ struct CompressOutcome {
   double ctime_ms = 0.0;    ///< measured compression time (ms)
   double ratio = 1.0;       ///< original / compressed (1 when not attempted)
   size_t comp_size = 0;     ///< codec bytes (without header)
+  /** Bytes stored: header + codec bytes, zero-padded to kStoreAlign. */
+  size_t stored_size = 0;
 };
+
+/**
+ * Stored compressed blobs are padded to this many bytes. Block devices
+ * allocate 4 KiB-aligned extents and take the O_DIRECT path only for whole
+ * pages; an unaligned tail makes the kernel read the partial page before
+ * writing it, a seek per chunk on an HDD (the compressed HDD tier ran at
+ * 20-40 MB/s with the disk 100% busy).
+ */
+constexpr size_t kStoreAlign = 4096;
 
 /** Where a put's data goes relative to the nodes involved (trace + cost). */
 struct Placement {

@@ -275,6 +275,11 @@ ctp::ipc::FullPtr<char> Runtime::CompressWithDecision(
   *header = compressor::CompressionHeader(
       ctp::CompressionFactory::GetWireId(decision.chosen_lib_),
       compressor::ToWirePreset(decision.chosen_preset_), size, comp_size);
+  // Pad to whole pages (the bound's 64 KiB slack covers it); readers take
+  // the codec length from the header.
+  const size_t used = kHdr + comp_size;
+  out->stored_size = (used + kStoreAlign - 1) / kStoreAlign * kStoreAlign;
+  std::memset(buf.ptr_ + used, 0, out->stored_size - used);
   out->used = true;
   return buf;
 }
@@ -555,7 +560,7 @@ clio::run::TaskResume Runtime::PutBlob(
     }
     if (out.used) {
       task->blob_data_ = comp_buf.shm_.template Cast<void>();
-      task->size_ = sizeof(compressor::CompressionHeader) + out.comp_size;
+      task->size_ = out.stored_size;
       task->context_.transform_flags_ |= clio::cte::core::kBlobTransformCompressed;
     }
     {
@@ -583,7 +588,7 @@ clio::run::TaskResume Runtime::PutBlob(
     }
     if (out.used) {
       task->blob_data_ = comp_buf.shm_.template Cast<void>();
-      task->size_ = sizeof(compressor::CompressionHeader) + out.comp_size;
+      task->size_ = out.stored_size;
       task->context_.transform_flags_ |= clio::cte::core::kBlobTransformCompressed;
       {
         std::lock_guard<std::mutex> lock(stats_lock_);
@@ -1502,7 +1507,7 @@ clio::run::TaskResume Runtime::CompressAt(
   comp_ctx.transform_flags_ |= clio::cte::core::kBlobTransformCompressed;
   comp_ctx.version_ = tag_version;
 
-  size_t comp_total_size = sizeof(compressor::CompressionHeader) + out.comp_size;
+  size_t comp_total_size = out.stored_size;
   // dtschedule-placed chunks are stored here, on the consumer's node (the
   // producer records the location); others go to their hash owner.
   auto owner_put = compressed_client_->AsyncPutBlob(
