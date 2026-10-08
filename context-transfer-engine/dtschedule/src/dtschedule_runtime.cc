@@ -521,14 +521,32 @@ clio::run::TaskResume Runtime::PutBlob(
                                   place.consumer_node));
     }
   } else if (to_consumer) {
-    // Scenario 2 under dtschedule placement: ship the raw chunk to the
-    // consumer's node and store it there (it reads it locally, no decode).
+    // Scenario 2 under dtschedule placement: compress here (when the codec
+    // pays) and store the chunk on the consumer's node, which reads it
+    // locally.
+    if (!decision.chosen_lib_.empty()) {
+      comp_buf = CompressWithDecision(src_ptr.ptr_, original_size, decision, &out);
+    }
+    if (out.used) {
+      task->blob_data_ = comp_buf.shm_.template Cast<void>();
+      task->size_ = sizeof(compressor::CompressionHeader) + out.comp_size;
+      task->context_.transform_flags_ |= clio::cte::core::kBlobTransformCompressed;
+    }
     {
       std::lock_guard<std::mutex> lock(stats_lock_);
       stats_.bytes_in_ += original_size;
-      stats_.bytes_out_ += original_size;
+      stats_.bytes_out_ += out.used ? out.comp_size : original_size;
+      if (out.used) {
+        stats_.compressed_++;
+        stats_.per_lib_count_[decision.chosen_lib_]++;
+      }
     }
     CLIO_CO_AWAIT(PutAtNode(task, place.consumer_node));
+    task->blob_data_ = orig_data;
+    task->size_ = original_size;
+    if (!comp_buf.IsNull()) {
+      CLIO_IPC->FreeBuffer(comp_buf);
+    }
   } else {
     if (selected && place.scenario == 3) {
       std::lock_guard<std::mutex> lock(stats_lock_);
