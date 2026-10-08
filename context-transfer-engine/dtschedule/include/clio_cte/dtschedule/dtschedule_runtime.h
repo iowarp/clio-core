@@ -596,6 +596,9 @@ class Runtime : public clio::cte::core::CoreInterposer {
                             bool *reused, bool allow_raw = true);
   std::unordered_map<std::string, uint32_t> loc_cache_;  ///< blob -> node
   std::mutex loc_lock_;                    ///< Guards loc_cache_
+  std::mutex spread_lock_;                 ///< Guards spread_bytes_
+  /** Bytes this writer placed per consumer node (fan-out spreading). */
+  std::unordered_map<uint32_t, uint64_t> spread_bytes_;
   /** True when dtschedule (not the core's hash) places data chunks. */
   bool PlacesData() const {
     return config_.placement_ == "dtschedule" || config_.placement_ == "local";
@@ -607,6 +610,9 @@ class Runtime : public clio::cte::core::CoreInterposer {
   }
   /** Decode a compressed read from the bytes the first read returned. */
   bool TryDecompressInPlace(clio::cte::core::GetBlobTask &task);
+  /** Remote consumer to place a chunk at: the least-loaded of several. */
+  uint32_t SpreadConsumer(const std::vector<uint32_t> &consumers,
+                          uint64_t bytes);
   /** S1 store node, with the put's score set to that node's tier. */
   uint32_t StoreNodeFor(clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task,
                         const Placement &place);

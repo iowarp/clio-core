@@ -175,7 +175,11 @@ static int ProcessStep(const PcOptions *o, int step, int rank, int size,
                        char *buf, size_t cap, uint64_t *sum,
                        double *read_bytes) {
   int bad = 0;
-  for (int r = rank; r < o->producers; r += size) {
+  // Fan-out: ranks form o->groups contiguous groups (one per node with
+  // --map-by ppr) and every group reads every file.
+  const int groups = o->groups > 1 && size % o->groups == 0 ? o->groups : 1;
+  const int gsize = size / groups, grank = rank % gsize;
+  for (int r = grank; r < o->producers; r += gsize) {
     char path[512];
     PcPath(path, sizeof(path), o->run, step, r);
     size_t got = 0;
@@ -204,7 +208,8 @@ static int ProcessStep(const PcOptions *o, int step, int rank, int size,
     }
     double sq = 0.0;
     const double c0 = PcNow();
-    *sum ^= Checksum(buf, got, o->passes, &sq);
+    const uint64_t c = Checksum(buf, got, o->passes, &sq);
+    if (rank < gsize) *sum ^= c;  // one group's checksum: same for any fan-out
     g_cksum_s += PcNow() - c0;
     *read_bytes += (double)got;
   }
@@ -214,7 +219,8 @@ static int ProcessStep(const PcOptions *o, int step, int rank, int size,
 /**
  * Entry point: consume every step, report.
  * @param argc Argument count
- * @param argv See PcParse (--run --steps --nx --ny --producers --passes)
+ * @param argv See PcParse (--run --steps --nx --ny --producers --passes
+ *             --groups)
  * @return 0 on success, 2 when files were missing or a step timed out
  */
 int main(int argc, char **argv) {
@@ -222,7 +228,7 @@ int main(int argc, char **argv) {
   int rank = 0, size = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
-  PcOptions o = {"prodcons", 10, 2048, 2048, 0, 40, 0.0, 4, NULL, 0, 0};
+  PcOptions o = {"prodcons", 10, 2048, 2048, 0, 40, 0.0, 4, NULL, 0, 0, 1};
   PcParse(argc, argv, &o);
 #ifdef PC_USE_CTE_API
   if (PcApiInit() != 0) {

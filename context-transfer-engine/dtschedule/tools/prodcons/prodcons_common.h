@@ -65,6 +65,9 @@ typedef struct {
                             write (0 = the write returns once stored) */
   int float32;         /**< Field written as float32 (nx*ny*4 bytes per file,
                             lossy-compressible) instead of float64 */
+  int groups;          /**< Consumer: rank groups that each read every file
+                            (fan-out; one group per consumer node); <=1 =
+                            the ranks share the files */
 } PcOptions;
 
 /**
@@ -87,6 +90,7 @@ static inline void PcParse(int argc, char **argv, PcOptions *opts) {
     else if (!strcmp(k, "--payload")) opts->payload = v;
     else if (!strcmp(k, "--write-pending")) opts->write_pending = atoi(v);
     else if (!strcmp(k, "--float32")) opts->float32 = atoi(v);
+    else if (!strcmp(k, "--groups")) opts->groups = atoi(v);
   }
 }
 

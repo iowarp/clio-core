@@ -94,6 +94,9 @@ class ClioProdcons(Application):
             {'name': 'write_pending', 'msg': 'API mode: files a producer rank '
              'leaves in flight after each step (0 = wait until stored)',
              'type': int, 'default': 2},
+            {'name': 'fanout', 'msg': 'Every consumer node reads every file '
+             '(one rank group per node); off = the consumer ranks share the '
+             'files', 'type': bool, 'default': False},
         ]
 
     def _configure(self, **kwargs):
@@ -123,11 +126,20 @@ class ClioProdcons(Application):
         return f'{name}_api' if self.config.get('api') else name
 
     def _write_placement(self, producers, consumers):
-        """Write the DAG: every rank file produced on a producer host and
-        consumed on every consumer host (clio_dtschedule's dag_path)."""
+        """Write the DAG (clio_dtschedule's dag_path): every rank file is
+        produced on its producer host and consumed by the consumer rank that
+        reads it (rank r % ncons, on host (r % ncons) // ppn_consumer), or by
+        every consumer host with fanout."""
         c = self.config
         nprod = int(c['ppn_producer']) * len(producers)
         per = int(c['ppn_producer'])
+        cper = int(c['ppn_consumer'])
+        ncons = cper * len(consumers)
+
+        def readers(r):
+            if c.get('fanout'):
+                return list(range(len(consumers)))
+            return [(r % ncons) // cper]
         size = int(c['nx']) * int(c['ny']) * 8
         files = {}
         tasks = {}
@@ -143,12 +155,11 @@ class ClioProdcons(Application):
                 files[name] = {
                     'producer': f'heat_rank{r}',
                     'producer_node': producers[r // per],
-                    'consumers': [f'checksum_{i}'
-                                  for i in range(len(consumers))],
-                    'consumer_nodes': list(consumers),
+                    'consumers': [f'checksum_{i}' for i in readers(r)],
+                    'consumer_nodes': [consumers[i] for i in readers(r)],
                     'size': size}
                 tasks[f'heat_rank{r}']['outputs'].append(name)
-                for i in range(len(consumers)):
+                for i in readers(r):
                     tasks[f'checksum_{i}']['inputs'].append(name)
         # The clio_dtschedule DAG loader requires `tasks` (node + inputs /
         # outputs per task); `files` adds the per-file placement block.
@@ -228,7 +239,8 @@ class ClioProdcons(Application):
                                  int(c['ppn_consumer'])),
             ncons, int(c['ppn_consumer']),
             self._binary('dtschedule_checksum_consumer'),
-            f'{shape} --producers {nprod} --passes {int(c["passes"])}',
+            f'{shape} --producers {nprod} --passes {int(c["passes"])}'
+            + (f' --groups {len(consumers)}' if c.get('fanout') else ''),
             cons_log)
         prod_cmd = self._mpirun(
             self._write_hostfile('producer_hosts.txt', producers,

@@ -410,12 +410,8 @@ clio::run::TaskResume Runtime::PutBlob(
         if (info.producer_node != UINT32_MAX) {
           place.dag_hit = true;
           place.dag_consumers = info.consumer_nodes;
-          for (uint32_t node : info.consumer_nodes) {
-            if (node != UINT32_MAX && node != local_node_id) {
-              place.consumer_node = node;
-              break;
-            }
-          }
+          place.consumer_node = SpreadConsumer(info.consumer_nodes,
+                                               original_size);
           if (place.consumer_node == UINT32_MAX && !info.consumer_nodes.empty()) {
             place.consumer_node = info.consumer_nodes.front();
           }
@@ -2059,6 +2055,31 @@ double Runtime::StoreBwFor(uint64_t bytes, uint32_t owner_node,
   return bw;
 }
 
+uint32_t Runtime::SpreadConsumer(const std::vector<uint32_t> &consumers,
+                                 uint64_t bytes) {
+  /**
+   * The remote consumer node to place a chunk at. With one, that node; with
+   * several (fan-out), the one this writer has sent the fewest bytes so
+   * far, so each node stores and serves a share and the writer's link
+   * carries every byte once instead of once per consumer.
+   *
+   * @param consumers The file's consumer nodes (DAG)
+   * @param bytes Chunk size, charged to the chosen node
+   * @return Node id, or UINT32_MAX when no consumer is remote
+   */
+  const uint32_t self = CLIO_IPC->GetNodeId();
+  uint32_t best = UINT32_MAX;
+  std::lock_guard<std::mutex> lock(spread_lock_);
+  for (uint32_t node : consumers) {
+    if (node == UINT32_MAX || node == self) continue;
+    if (best == UINT32_MAX || spread_bytes_[node] < spread_bytes_[best]) {
+      best = node;
+    }
+  }
+  if (best != UINT32_MAX) spread_bytes_[best] += bytes;
+  return best;
+}
+
 uint32_t Runtime::StoreNodeFor(
     clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task,
     const Placement &place) {
@@ -2784,17 +2805,38 @@ Runtime::ScenarioChoice Runtime::PlacedScenario(
     load_mult_c = LoadMultiplier(place.consumer_cpu, place.consumer_cpu,
                                  knobs_.load_aware_, config_.load_cap_);
   }
+  // Remote readers a store node serves: every consumer node but itself
+  // (one consumer when the DAG names none). Each node's link carries what
+  // it sends; the busiest link is the network term, so keeping a fan-out
+  // file on the producer costs k transfers on its link.
+  auto readers = [&](uint32_t n) {
+    if (place.dag_consumers.empty()) {
+      return (C != UINT32_MAX && C != n) ? 1.0 : 0.0;
+    }
+    std::vector<uint32_t> seen;
+    for (uint32_t c : place.dag_consumers) {
+      if (c == UINT32_MAX || c == n) continue;
+      if (std::find(seen.begin(), seen.end(), c) == seen.end()) seen.push_back(c);
+    }
+    return static_cast<double>(seen.size());
+  };
+  // Link time when d MB (raw r MB shipped first) are stored at b.
+  auto link = [&](double d, double r, uint32_t b) {
+    const double ship = b == self ? 0.0 : r / nb;
+    return b == self ? readers(self) * d / nb
+                     : std::max(ship, readers(b) * d / nb);
+  };
   auto s1 = [&](double d, double cpu_p, double cpu_c) {
     // BestStoreNode's rule: the consumer's tier only on a clear win.
     const auto tb = [&](uint32_t n) {
       return d / std::max(TierBwMbPerMs(ChooseTier(static_cast<uint64_t>(d * 1e6), n)), 1e-6);
     };
     const uint32_t b = tb(C) + d / nb < 0.9 * tb(self) ? C : self;
-    const double net = (b == self ? 0.0 : d / nb) + (b == C ? 0.0 : d / nb);
+    const double net = link(d, d, b);
     return BottleneckMs(d, b, C, net, cpu_p, cpu_c);
   };
   auto s2 = [&](double d, double cpu_p, double cpu_c) {
-    return BottleneckMs(d, C, C, d / nb, cpu_p, cpu_c);
+    return BottleneckMs(d, C, C, link(d, d, C), cpu_p, cpu_c);
   };
   const double cp = has_codec ? ctime_ms * load_mult / par_p : 0.0;
   const double dc = has_codec ? dtime_ms / par_c : 0.0;
@@ -2803,7 +2845,7 @@ Runtime::ScenarioChoice Runtime::PlacedScenario(
   const double z1 = has_codec ? s1(z_mb, cp, dc) : big;
   const double z2 = has_codec ? s2(z_mb, cp, dc) : big;
   const double z3 = has_codec
-      ? BottleneckMs(z_mb, C, C, raw_mb / nb, 0.0,
+      ? BottleneckMs(z_mb, C, C, link(z_mb, raw_mb, C), 0.0,
                      (ctime_ms * load_mult_c + dtime_ms) / par_c)
       : big;
   choice.cost1_ms = std::min(raw1, z1);
