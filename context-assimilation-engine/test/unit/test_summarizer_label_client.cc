@@ -25,6 +25,7 @@
 #include <string>
 
 using clio::cae::summarizer::OllamaGenerate;
+using clio::cae::summarizer::detail::LoopbackNoProxyList;
 using clio_cae_test::OneShotHttpServer;
 
 TEST_CASE("LabelClient - argument validation", "[summarizer][label][args]") {
@@ -120,6 +121,48 @@ TEST_CASE("LabelClient - loopback bypasses a configured proxy",
   REQUIRE(ok);
   REQUIRE(out == "a fine label");
   server.Stop();
+}
+
+/**
+ * The bypass ADDS loopback to the environment's list rather than replacing it.
+ *
+ * CURLOPT_NOPROXY overrides libcurl's own reading of no_proxy outright, so a
+ * client that listed only loopback would silently push a site's internal
+ * hosts back through the proxy. Asserted on the list itself: a request to a
+ * loopback endpoint succeeds either way, so behaviour alone cannot tell the
+ * two apart.
+ *
+ * Both spellings matter -- libcurl reads lowercase first, so NO_PROXY has to
+ * be picked up when no_proxy is unset or empty.
+ */
+TEST_CASE("LabelClient - the no_proxy list keeps the environment's entries",
+          "[summarizer][label][proxy]") {
+  const std::string kLoopback = "localhost,127.0.0.1,::1";
+
+  SECTION("neither variable set: loopback only");
+  ctp::SystemInfo::Unsetenv("no_proxy");
+  ctp::SystemInfo::Unsetenv("NO_PROXY");
+  REQUIRE(LoopbackNoProxyList() == kLoopback);
+
+  SECTION("lowercase no_proxy is appended, not dropped");
+  ctp::SystemInfo::Setenv("no_proxy", "example.invalid,10.0.0.0/8", 1);
+  REQUIRE(LoopbackNoProxyList() == kLoopback + ",example.invalid,10.0.0.0/8");
+
+  SECTION("uppercase NO_PROXY is used when no_proxy is unset");
+  ctp::SystemInfo::Unsetenv("no_proxy");
+  ctp::SystemInfo::Setenv("NO_PROXY", "upper.invalid", 1);
+  REQUIRE(LoopbackNoProxyList() == kLoopback + ",upper.invalid");
+
+  SECTION("an empty no_proxy falls through to NO_PROXY");
+  ctp::SystemInfo::Setenv("no_proxy", "", 1);
+  REQUIRE(LoopbackNoProxyList() == kLoopback + ",upper.invalid");
+
+  SECTION("both empty: loopback only");
+  ctp::SystemInfo::Setenv("NO_PROXY", "", 1);
+  REQUIRE(LoopbackNoProxyList() == kLoopback);
+
+  ctp::SystemInfo::Unsetenv("no_proxy");
+  ctp::SystemInfo::Unsetenv("NO_PROXY");
 }
 
 SIMPLE_TEST_MAIN()
