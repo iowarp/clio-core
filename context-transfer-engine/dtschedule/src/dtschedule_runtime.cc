@@ -2702,12 +2702,11 @@ void Runtime::PlanTier(uint64_t size, Placement *place) const {
 }
 
 double Runtime::EffectiveParallelism(double cpu_pct) const {
-  const double par = std::max(config_.cpu_parallelism_, 1.0);
-  if (cpu_pct < 0.0) {
-    return par;
-  }
-  const double idle = std::clamp(1.0 - cpu_pct / 100.0, 0.0, 1.0);
-  return std::max(1.0, par * idle);
+  // Contention is already in the load multiplier that scales codec time;
+  // scaling the worker count by the idle fraction as well counted the same
+  // load twice (on 1 GbE it sent 32% of chunks raw over the slow link).
+  (void)cpu_pct;
+  return std::max(config_.cpu_parallelism_, 1.0);
 }
 
 double Runtime::BottleneckMs(double d_mb, uint32_t node, double net_ms,

@@ -760,9 +760,9 @@ class Runtime : public clio::cte::core::CoreInterposer {
   double BottleneckMs(double d_mb, uint32_t node, double net_ms,
                       double cpu_p_ms, double cpu_c_ms);
   /**
-   * Runtime workers effectively free for codec work on a node with the given
-   * CPU utilisation (cpu_parallelism scaled by the idle fraction, >= 1).
-   * @param cpu_pct CPU utilisation percent (negative = unknown, treated idle)
+   * Runtime workers running codec work concurrently on a node
+   * (cpu_parallelism; its load enters through the load multiplier).
+   * @param cpu_pct CPU utilisation percent (unused; kept for the trace API)
    * @return Effective parallelism
    */
   double EffectiveParallelism(double cpu_pct) const;
