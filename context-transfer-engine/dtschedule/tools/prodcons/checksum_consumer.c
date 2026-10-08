@@ -54,6 +54,31 @@
 #include <string.h>
 
 #include "prodcons_common.h"
+#ifdef PC_USE_CTE_API
+#include "pc_cte_api.h"
+#endif
+
+/**
+ * Complete a nonblocking MPI request while sleeping between tests, so ranks
+ * waiting for data leave their cores idle (blocking MPI calls busy-poll and
+ * would hold all 20 cores of the consumer node at 100%).
+ * @param req Request to complete
+ */
+static void SleepWait(MPI_Request *req) {
+  int done = 0;
+  MPI_Test(req, &done, MPI_STATUS_IGNORE);
+  while (!done) {
+    usleep(1000);
+    MPI_Test(req, &done, MPI_STATUS_IGNORE);
+  }
+}
+
+/** MPI_Barrier that sleeps instead of spinning (see SleepWait). */
+static void SleepBarrier(void) {
+  MPI_Request req;
+  MPI_Ibarrier(MPI_COMM_WORLD, &req);
+  SleepWait(&req);
+}
 
 /**
  * Wait until the step marker exists (rank 0 polls, everyone learns).
@@ -65,6 +90,11 @@
  */
 static int WaitForStep(const PcOptions *o, int step, int rank,
                        double timeout_s) {
+#ifdef PC_USE_CTE_API
+  // Files carry their own markers (PcApiWaitFile); no step-wide wait.
+  (void)o; (void)step; (void)rank; (void)timeout_s;
+  return 0;
+#endif
   int rc = ETIMEDOUT;
   if (rank == 0) {
     char path[512];
@@ -80,7 +110,9 @@ static int WaitForStep(const PcOptions *o, int step, int rank,
       usleep(20000);
     }
   }
-  MPI_Bcast(&rc, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  MPI_Request req;
+  MPI_Ibcast(&rc, 1, MPI_INT, 0, MPI_COMM_WORLD, &req);
+  SleepWait(&req);
   return rc;
 }
 
@@ -113,6 +145,11 @@ static uint64_t Checksum(const void *data, size_t bytes, int passes,
   return (b << 32) | a;
 }
 
+/** Seconds this rank spent in read(2) and in the checksum (summary only). */
+static double g_read_s = 0.0, g_cksum_s = 0.0;
+/** Seconds this rank waited for producer files' markers (API backend). */
+static double g_mwait_s = 0.0;
+
 /** Bad files a rank reports per step (the rest are only counted). */
 static const int kMaxBadReports = 3;
 
@@ -142,7 +179,20 @@ static int ProcessStep(const PcOptions *o, int step, int rank, int size,
     char path[512];
     PcPath(path, sizeof(path), o->run, step, r);
     size_t got = 0;
+#ifdef PC_USE_CTE_API
+    char name[512];
+    PcName(name, sizeof(name), o->run, step, r);
+    const double m0 = PcNow();
+    int err = PcApiWaitFile(name, 3600.0);
+    g_mwait_s += PcNow() - m0;
+    const double r0 = PcNow();
+    if (err == 0) err = PcApiGetFile(name, buf, cap, &got);
+    g_read_s += PcNow() - r0;
+#else
+    const double r0 = PcNow();
     int err = PcReadFile(path, buf, cap, &got);
+    g_read_s += PcNow() - r0;
+#endif
     if (err != 0 || got != cap) {
       if (bad < kMaxBadReports) {
         fprintf(stderr, "prodcons consumer rank %d: bad file %s: errno=%d "
@@ -153,7 +203,9 @@ static int ProcessStep(const PcOptions *o, int step, int rank, int size,
       continue;
     }
     double sq = 0.0;
+    const double c0 = PcNow();
     *sum ^= Checksum(buf, got, o->passes, &sq);
+    g_cksum_s += PcNow() - c0;
     *read_bytes += (double)got;
   }
   return bad;
@@ -170,8 +222,15 @@ int main(int argc, char **argv) {
   int rank = 0, size = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
-  PcOptions o = {"prodcons", 10, 2048, 2048, 0, 40, 0.0, 4, NULL};
+  PcOptions o = {"prodcons", 10, 2048, 2048, 0, 40, 0.0, 4, NULL, 0};
   PcParse(argc, argv, &o);
+#ifdef PC_USE_CTE_API
+  if (PcApiInit() != 0) {
+    fprintf(stderr, "checksum_consumer: rank %d: CLIO client init failed\n",
+            rank);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+#endif
   const size_t cap = (size_t)o.nx * (size_t)o.ny * sizeof(double);
   char *buf = malloc(cap);
   double *lag = malloc(sizeof(double) * (size_t)(o.steps > 0 ? o.steps : 1));
@@ -186,7 +245,7 @@ int main(int argc, char **argv) {
     if (rc != 0) break;
     const double p0 = PcNow();
     bad += ProcessStep(&o, step, rank, size, buf, cap, &sum, &read_bytes);
-    MPI_Barrier(MPI_COMM_WORLD);
+    SleepBarrier();
     wait_s += p0 - w0;
     proc_s += PcNow() - p0;
     lag[step] = PcNow() - p0;
@@ -198,13 +257,20 @@ int main(int argc, char **argv) {
   MPI_Reduce(&read_bytes, &bytes_all, 1, MPI_DOUBLE, MPI_SUM, 0,
              MPI_COMM_WORLD);
   MPI_Reduce(&sum, &sum_all, 1, MPI_UINT64_T, MPI_BXOR, 0, MPI_COMM_WORLD);
+  double read_max = 0.0, cksum_max = 0.0, mwait_max = 0.0;
+  MPI_Reduce(&g_mwait_s, &mwait_max, 1, MPI_DOUBLE, MPI_MAX, 0,
+             MPI_COMM_WORLD);
+  MPI_Reduce(&g_read_s, &read_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+  MPI_Reduce(&g_cksum_s, &cksum_max, 1, MPI_DOUBLE, MPI_MAX, 0,
+             MPI_COMM_WORLD);
   if (rank == 0) {
     const int n = rc == 0 ? o.steps : 0;
     if (n > 0) qsort(lag, (size_t)n, sizeof(double), CmpD);
     printf("checksum_consumer ranks=%d steps=%d read_mb=%.1f wait_s=%.2f "
-           "proc_s=%.2f lag_p50_s=%.2f wall_s=%.2f bad=%d checksum=%016llx "
-           "rc=%d\n",
-           size, o.steps, bytes_all / 1e6, wait_s, proc_s,
+           "proc_s=%.2f file_wait_s=%.2f read_s=%.2f cksum_s=%.2f "
+           "lag_p50_s=%.2f wall_s=%.2f bad=%d checksum=%016llx rc=%d\n",
+           size, o.steps, bytes_all / 1e6, wait_s, proc_s, mwait_max, read_max,
+           cksum_max,
            n > 0 ? lag[n / 2] : -1.0, PcNow() - t0, bad_all,
            (unsigned long long)sum_all, rc);
     fflush(stdout);

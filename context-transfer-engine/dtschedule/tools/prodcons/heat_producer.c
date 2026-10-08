@@ -52,6 +52,9 @@
 #include <sys/stat.h>
 
 #include "prodcons_common.h"
+#ifdef PC_USE_CTE_API
+#include "pc_cte_api.h"
+#endif
 
 /** Slab with one halo row above and below: (ny + 2) rows of nx doubles. */
 typedef struct {
@@ -208,6 +211,19 @@ static void PayloadWindow(const char *payload, size_t plen, char *out,
  */
 static int WriteStep(const PcOptions *o, int step, int rank, const double *buf,
                      size_t bytes) {
+#ifdef PC_USE_CTE_API
+  // Submit and return: the puts drain behind the next compute phase, and
+  // each file's own marker tells its consumer it is complete.
+  char name[512];
+  PcName(name, sizeof(name), o->run, step, rank);
+  // write_pending 0: every chunk in flight at once, but the step's write
+  // returns only once the file is stored, so data moves while the ranks wait
+  // in I/O instead of competing with the next compute phase for cores.
+  const int put_rc =
+      PcApiPutFile(name, buf, bytes, o->write_pending > 0 ? o->write_pending : 1);
+  PcApiDrain(o->write_pending > 0 ? 0 : 1);
+  return put_rc;
+#endif
   char path[512];
   PcPath(path, sizeof(path), o->run, step, rank);
   int rc = PcWriteFile(path, buf, bytes);
@@ -234,8 +250,14 @@ int main(int argc, char **argv) {
   int rank = 0, size = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
-  PcOptions o = {"prodcons", 10, 2048, 2048, 200, 0, 0.02, 0, NULL};
+  PcOptions o = {"prodcons", 10, 2048, 2048, 200, 0, 0.02, 0, NULL, 2};
   PcParse(argc, argv, &o);
+#ifdef PC_USE_CTE_API
+  if (PcApiInit() != 0) {
+    fprintf(stderr, "heat_producer: rank %d: CLIO client init failed\n", rank);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+#endif
   Slab s;
   const size_t bytes = (size_t)o.nx * (size_t)o.ny * sizeof(double);
   double *snap = malloc(bytes);
@@ -273,11 +295,17 @@ int main(int argc, char **argv) {
               strerror(rc));
     }
   }
+  double flush_s = 0.0;
+#ifdef PC_USE_CTE_API
+  const double f0 = PcNow();
+  if (PcApiDrain(1) != 0 && rc == 0) rc = EIO;
+  flush_s = PcNow() - f0;
+#endif
   if (rank == 0) {
     printf("heat_producer ranks=%d steps=%d step_mb=%.1f compute_s=%.2f "
-           "write_s=%.2f wall_s=%.2f rc=%d\n",
+           "write_s=%.2f flush_s=%.2f wall_s=%.2f rc=%d\n",
            size, o.steps, (double)bytes * size / 1e6, compute_s, write_s,
-           PcNow() - t0, rc);
+           flush_s, PcNow() - t0, rc);
     fflush(stdout);
   }
   free(payload);

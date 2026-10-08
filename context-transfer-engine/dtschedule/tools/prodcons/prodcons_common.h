@@ -61,6 +61,8 @@ typedef struct {
   int passes;          /**< Consumer: compute passes over each file */
   const char *payload; /**< Producer: directory of data files to emit
                             instead of the solver field (NULL = field) */
+  int write_pending;   /**< API backend: files left in flight after a step's
+                            write (0 = the write returns once stored) */
 } PcOptions;
 
 /**
@@ -81,6 +83,7 @@ static inline void PcParse(int argc, char **argv, PcOptions *opts) {
     else if (!strcmp(k, "--noise")) opts->noise = atof(v);
     else if (!strcmp(k, "--passes")) opts->passes = atoi(v);
     else if (!strcmp(k, "--payload")) opts->payload = v;
+    else if (!strcmp(k, "--write-pending")) opts->write_pending = atoi(v);
   }
 }
 
@@ -110,6 +113,20 @@ static inline void PcPath(char *buf, size_t len, const char *run, int step,
   } else {
     snprintf(buf, len, "%s%s__step%d_rank%d.dat", prefix, run, step, rank);
   }
+}
+
+/**
+ * Name of one rank's output for one step as a CTE tag (API backend): the
+ * flat-namespace file name without the "/clio::" root.
+ * @param buf Output buffer
+ * @param len Buffer length
+ * @param run Run name
+ * @param step Step index
+ * @param rank Producer rank
+ */
+static inline void PcName(char *buf, size_t len, const char *run, int step,
+                          int rank) {
+  snprintf(buf, len, "%s__step%d_rank%d.dat", run, step, rank);
 }
 
 /**

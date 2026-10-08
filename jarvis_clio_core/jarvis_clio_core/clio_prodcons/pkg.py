@@ -85,6 +85,12 @@ class ClioProdcons(Application):
              'type': str, 'default': ''},
             {'name': 'timeout_s', 'msg': 'Give up waiting for the consumer',
              'type': float, 'default': 3600.0},
+            {'name': 'api', 'msg': 'Use the CTE-API builds (*_api): files '
+             'are CTE tags put/get through the dtschedule pool, no POSIX '
+             'interposer or clio-fs routing', 'type': bool, 'default': False},
+            {'name': 'write_pending', 'msg': 'API mode: files a producer rank '
+             'leaves in flight after each step (0 = wait until stored)',
+             'type': int, 'default': 2},
         ]
 
     def _configure(self, **kwargs):
@@ -108,6 +114,10 @@ class ClioProdcons(Application):
         hosts = list(self.hostfile.hosts)
         n = max(1, min(int(self.config['producer_nodes']), len(hosts) - 1))
         return hosts[:n], hosts[n:]
+
+    def _binary(self, name):
+        """Program name, with the _api suffix in CTE-API mode."""
+        return f'{name}_api' if self.config.get('api') else name
 
     def _write_placement(self, producers, consumers):
         """Write the DAG: every rank file produced on a producer host and
@@ -212,16 +222,20 @@ class ClioProdcons(Application):
         cons_cmd = self._mpirun(
             self._write_hostfile('consumer_hosts.txt', consumers,
                                  int(c['ppn_consumer'])),
-            ncons, int(c['ppn_consumer']), 'dtschedule_checksum_consumer',
+            ncons, int(c['ppn_consumer']),
+            self._binary('dtschedule_checksum_consumer'),
             f'{shape} --producers {nprod} --passes {int(c["passes"])}',
             cons_log)
         prod_cmd = self._mpirun(
             self._write_hostfile('producer_hosts.txt', producers,
                                  int(c['ppn_producer'])),
-            nprod, int(c['ppn_producer']), 'dtschedule_heat_producer',
+            nprod, int(c['ppn_producer']),
+            self._binary('dtschedule_heat_producer'),
             f'{shape} --iters-per-step {int(c["iters_per_step"])} '
             f'--noise {float(c["noise"])}'
-            + (f' --payload {c["payload"]}' if c.get('payload') else ''),
+            + (f' --payload {c["payload"]}' if c.get('payload') else '')
+            + (f' --write-pending {int(c["write_pending"])}'
+               if c.get('api') else ''),
             prod_log)
         self.log(f'prodcons consumer: {cons_cmd}')
         self.log(f'prodcons producer: {prod_cmd}')
