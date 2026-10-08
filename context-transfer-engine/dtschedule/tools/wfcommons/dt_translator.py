@@ -31,6 +31,15 @@ With ``--clio-prefix`` every file path handed to wfbench starts with
 ``clio::`` so the CTE POSIX interposer picks it up (same rewrite as the
 builtin jarvis ``run_wfbench.py``).
 
+With ``--api`` only ``placement.json`` is written (no scripts, binaries or
+input data): ``dtschedule_wfrun`` (tools/wfrun) executes it over the CTE
+API, staging the workflow inputs itself. Every task then also carries the
+WfChef instance's ``runtime`` (s) and ``cores``; ``--size-mode instance``
+rescales file sizes to the instance's per-task output (and root-input)
+bytes, keeping the total footprint, clamped to ``[--min-file-kb,
+--max-file-mb]``; each workflow input file names its staging node (the
+first consumer's) as ``producer_node`` with ``"staged": true``.
+
 CLI example::
 
     dt_translator.py --recipe montage --num-tasks 60 --data-footprint 30G \\
@@ -68,6 +77,7 @@ RECIPE_IMPORTS = {
     "rnaseq": "RnaseqRecipe",
 }
 PLACEMENTS = ("round_robin", "stage_sets", "single")
+SIZE_MODES = ("uniform", "instance")
 DATA_DIR = "data"
 PROGRAM = "wfbench_dt"
 
@@ -117,6 +127,74 @@ def parse_size(text: Union[str, int, None]) -> int:
     return int(s)
 
 
+def _instance_weights(tasks: Dict[str, Dict], files: Dict[str, Dict],
+                      info: Dict[str, Dict], out_ids: set) -> Dict[str, float]:
+    """Weight of every placement file from the WfChef instance.
+
+    A task's output file weighs the task's instance output bytes; a
+    workflow input file weighs its first consumer's instance inputs that no
+    instance task produces.
+
+    :param tasks: Placement tasks.
+    :param files: Placement files.
+    :param info: ``DtWorkflowBenchmark.instance_info``.
+    :param out_ids: ``DtWorkflowBenchmark.instance_out_ids``.
+    :return: ``{file path: weight}`` (bytes, possibly 0).
+    """
+    weights: Dict[str, float] = {}
+    for path, entry in files.items():
+        if entry["producer"]:
+            weights[path] = float(info.get(entry["producer"], {}).get("out_bytes", 0))
+            continue
+        first = entry["consumers"][0] if entry["consumers"] else None
+        ins = info.get(first, {}).get("inputs", []) if first else []
+        weights[path] = float(sum(sz for fid, sz in ins if fid not in out_ids))
+    return weights
+
+
+def rescale_sizes(weights: Dict[str, float], total: int, min_bytes: int,
+                  max_bytes: int) -> Dict[str, int]:
+    """Spread ``total`` bytes over files in proportion to their weights.
+
+    Files are clamped to ``[min_bytes, max_bytes]`` and the remainder is
+    re-spread over the unclamped ones (a few water-filling passes), so the
+    footprint stays close to ``total`` unless the clamps forbid it.
+
+    :param weights: ``{file: weight}``.
+    :param total: Target total bytes.
+    :param min_bytes: Smallest file size.
+    :param max_bytes: Largest file size (0 = no cap).
+    :return: ``{file: bytes}``.
+    """
+    cap = max_bytes if max_bytes > 0 else 1 << 62
+    sizes: Dict[str, int] = {}
+    free = dict(weights)
+    budget = total
+    for _ in range(8):
+        wsum = sum(free.values())
+        if not free or budget <= 0:
+            break
+        clamped = {}
+        for f, w in free.items():
+            want = budget * w / wsum if wsum > 0 else budget / len(free)
+            if want <= min_bytes:
+                clamped[f] = min_bytes
+            elif want >= cap:
+                clamped[f] = cap
+        if not clamped:
+            for f, w in free.items():
+                sizes[f] = int(budget * w / wsum) if wsum > 0 else budget // len(free)
+            free = {}
+            break
+        for f, sz in clamped.items():
+            sizes[f] = sz
+            budget -= sz
+            free.pop(f)
+    for f in free:
+        sizes[f] = min_bytes
+    return sizes
+
+
 class DistributedTranslator(BashTranslator):
     """Translate a WfBench workflow into per-level, per-node scripts.
 
@@ -134,6 +212,12 @@ class DistributedTranslator(BashTranslator):
         when it is a path (wfcommons 1.2 otherwise downloads the latest
         schema from GitHub, which rejects the 1.5 instances it writes).
     :param logger: Logger.
+    :param api: Write only ``placement.json`` for ``dtschedule_wfrun``.
+    :param size_mode: ``uniform`` (WfBench sizes) or ``instance`` (API only).
+    :param instance_info: ``DtWorkflowBenchmark.instance_info``.
+    :param instance_out_ids: ``DtWorkflowBenchmark.instance_out_ids``.
+    :param min_file_bytes: Smallest file for ``size_mode=instance``.
+    :param max_file_bytes: Largest file for ``size_mode=instance`` (0 = any).
     """
 
     def __init__(self, workflow: Union[Workflow, pathlib.Path],
@@ -143,7 +227,12 @@ class DistributedTranslator(BashTranslator):
                  bench_dir: Optional[pathlib.Path] = None,
                  python_exe: Optional[str] = None,
                  schema_file: Optional[str] = None,
-                 logger: Optional[logging.Logger] = None) -> None:
+                 logger: Optional[logging.Logger] = None,
+                 api: bool = False, size_mode: str = "uniform",
+                 instance_info: Optional[Dict[str, Dict]] = None,
+                 instance_out_ids: Optional[set] = None,
+                 min_file_bytes: int = 1 << 20,
+                 max_file_bytes: int = 0) -> None:
         """Build the translator and compute DAG levels (see class doc)."""
         if not isinstance(workflow, Workflow) and schema_file:
             workflow = Instance(pathlib.Path(workflow), schema_file=schema_file,
@@ -161,6 +250,14 @@ class DistributedTranslator(BashTranslator):
         self.data_noise = data_noise
         self.bench_dir = pathlib.Path(bench_dir) if bench_dir else None
         self.python_exe = python_exe or sys.executable
+        if size_mode not in SIZE_MODES:
+            raise ValueError(f"size_mode must be one of {SIZE_MODES}")
+        self.api = api
+        self.size_mode = size_mode
+        self.instance_info = instance_info or {}
+        self.instance_out_ids = instance_out_ids or set()
+        self.min_file_bytes = int(min_file_bytes)
+        self.max_file_bytes = int(max_file_bytes)
 
     # ------------------------------------------------------------------
     # placement
@@ -296,12 +393,50 @@ class DistributedTranslator(BashTranslator):
                 entry["consumers"].append(name)
                 if assignment[name] not in entry["consumer_nodes"]:
                     entry["consumer_nodes"].append(assignment[name])
+        if self.api:
+            self._apply_api_fields(tasks, files)
         return {"recipe": self.workflow.name, "num_tasks": len(tasks),
                 "placement": self.placement, "stage_sets": self.stage_sets,
-                "path_prefix": "clio::" if self.clio_prefix else "",
+                "path_prefix": "clio::" if self.clio_prefix or self.api else "",
+                "api": self.api, "size_mode": self.size_mode if self.api else "uniform",
                 "data_dir": DATA_DIR, "out_dir": str(output_folder),
                 "nodes": self.nodes, "levels": len(self.task_level_map),
                 "tasks": tasks, "files": files}
+
+    def _apply_api_fields(self, tasks: Dict[str, Dict],
+                          files: Dict[str, Dict]) -> None:
+        """Add the fields ``dtschedule_wfrun`` needs to a placement.
+
+        Per task: the instance ``runtime`` (s) and ``cores``. Per workflow
+        input file: its staging node as ``producer_node`` (``staged``).
+        With ``size_mode=instance``: instance-proportional sizes.
+
+        :param tasks: Placement tasks (modified in place).
+        :param files: Placement files (modified in place).
+        """
+        for name, entry in tasks.items():
+            info = self.instance_info.get(name, {})
+            entry["runtime"] = round(float(info.get("runtime", 0.0)), 3)
+            entry["cores"] = int(info.get("cores", 1))
+        in_sizes = {f"{DATA_DIR}/{f.file_id}": int(f.size)
+                    for t in self.workflow.tasks.values() for f in t.input_files}
+        for path, entry in files.items():
+            if entry["size"] is None:
+                entry["size"] = in_sizes.get(path, 0)
+            if entry["producer"] is None and entry["consumers"]:
+                entry["producer_node"] = tasks[entry["consumers"][0]]["node"]
+                entry["staged"] = True
+        if self.size_mode != "instance" or not self.instance_info:
+            return
+        total = sum(int(f["size"] or 0) for f in files.values())
+        weights = _instance_weights(tasks, files, self.instance_info,
+                                    self.instance_out_ids)
+        sizes = rescale_sizes(weights, total, self.min_file_bytes,
+                              self.max_file_bytes)
+        for path, entry in files.items():
+            entry["size"] = sizes[path]
+            if entry["producer"]:
+                tasks[entry["producer"]]["output_bytes"][path] = sizes[path]
 
     def _level_script(self, level: int, node: str, names: List[str],
                       output_folder: pathlib.Path) -> str:
@@ -434,6 +569,10 @@ class DistributedTranslator(BashTranslator):
         assignment = self.assign_nodes()
         placement = self.build_placement(assignment, output_folder)
         (output_folder / "placement.json").write_text(json.dumps(placement, indent=2) + "\n")
+        if self.api:
+            self.logger.info(f"wrote API placement.json ({len(placement['tasks'])} "
+                             f"tasks) under {output_folder}")
+            return placement
         n_scripts = self._write_level_scripts(assignment, output_folder)
         shutil.copy(THIS_DIR / "run_dist.py", output_folder / "run_dist.py")
         (output_folder / "run_dist.py").chmod(0o755)
@@ -494,7 +633,22 @@ def main(argv=None) -> int:
     p.add_argument("--percent-cpu", type=float, default=1.0)
     p.add_argument("--python", default=sys.executable,
                    help="interpreter for bin/wfbench_dt (default: this one)")
+    p.add_argument("--api", action="store_true",
+                   help="write only placement.json for dtschedule_wfrun (CTE API)")
+    p.add_argument("--size-mode", default="uniform", choices=SIZE_MODES,
+                   help="--api file sizes: WfBench uniform or instance-proportional")
+    p.add_argument("--min-file-kb", type=int, default=1024,
+                   help="--size-mode instance: smallest file (KiB)")
+    p.add_argument("--max-file-mb", type=int, default=0,
+                   help="--size-mode instance: largest file (MiB, 0 = no cap)")
+    p.add_argument("--seed", type=int, default=None,
+                   help="seed python/numpy RNGs so WfChef builds the same instance")
     args = p.parse_args(argv)
+    if args.seed is not None:
+        import random
+        import numpy
+        random.seed(args.seed)
+        numpy.random.seed(args.seed)
     if args.cpu_work <= 0:
         print("[dt_translator] cpu_work <= 0 disables wfbench I/O; using 1")
         args.cpu_work = 1
@@ -508,7 +662,7 @@ def main(argv=None) -> int:
           f"footprint={data_bytes}B (={data_mb} MB) nodes={nodes}")
     bm = DtWorkflowBenchmark(recipe=load_recipe(args.recipe), num_tasks=args.num_tasks,
                              data_class=None if args.data_class == "auto" else args.data_class,
-                             data_noise=args.data_noise)
+                             data_noise=args.data_noise, sparse_inputs=args.api)
     kwargs = dict(save_dir=bench_dir, cpu_work=args.cpu_work, percent_cpu=args.percent_cpu)
     if data_mb > 0:
         kwargs["data"] = int(data_mb)
@@ -520,9 +674,16 @@ def main(argv=None) -> int:
     tr = DistributedTranslator(bm.workflow, nodes, placement=args.placement,
                                stage_sets=args.stage_sets, clio_prefix=args.clio_prefix,
                                data_class=args.data_class, data_noise=args.data_noise,
-                               bench_dir=bench_dir, python_exe=args.python)
+                               bench_dir=bench_dir, python_exe=args.python,
+                               api=args.api, size_mode=args.size_mode,
+                               instance_info=bm.instance_info,
+                               instance_out_ids=bm.instance_out_ids,
+                               min_file_bytes=args.min_file_kb << 10,
+                               max_file_bytes=args.max_file_mb << 20)
     placement = tr.translate(out)
     summarize(placement)
+    if args.api:
+        return 0
     print(f"[dt_translator] run with: {args.python} {out / 'run_dist.py'} --out {out}")
     return 0
 

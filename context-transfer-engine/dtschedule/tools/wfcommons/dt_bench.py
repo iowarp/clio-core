@@ -113,6 +113,15 @@ class DtWorkflowBenchmark(WorkflowBenchmark):
         with generated data (True) or leave that to the translator by
         creating nothing (False; stock would then write urandom, so the
         translator must generate them itself).
+    :param sparse_inputs: Pre-create workflow input files as sparse
+        placeholders of the right size instead (CTE-API runs stage their
+        inputs themselves, so nothing is written to the shared FS and the
+        stock ``os.urandom`` branch is still skipped).
+
+    ``instance_info`` maps every task id to what the WfChef instance said
+    about it before ``create_benchmark`` zeroes it: ``runtime`` (s),
+    ``cores``, ``out_bytes`` (sum of its output files) and ``inputs``
+    (``[(file id, bytes)]``), plus ``out_ids`` of all instance outputs.
     """
 
     def __init__(self, recipe: Type[WfChefWorkflowRecipe], num_tasks: int,
@@ -120,14 +129,39 @@ class DtWorkflowBenchmark(WorkflowBenchmark):
                  logger: Optional[logging.Logger] = None,
                  data_class: Optional[str] = None,
                  data_noise: Optional[float] = None,
-                 write_inputs: bool = True) -> None:
+                 write_inputs: bool = True,
+                 sparse_inputs: bool = False) -> None:
         """Create the benchmark generator; see class docstring."""
         super().__init__(recipe, num_tasks, with_flowcept, logger)
         self.data_class = data_class
         self.data_noise = data_noise
         self.write_inputs = write_inputs
+        self.sparse_inputs = sparse_inputs
+        self.instance_info: Dict[str, Dict] = {}
+        self.instance_out_ids: set = set()
         self.extensions = recipe_extensions(recipe)
         self._dt_save_dir: Optional[pathlib.Path] = None
+
+    def _set_argument_parameters(self, task: Task, *args, **kwargs) -> None:
+        """Record the instance runtime/cores/file sizes, then call stock.
+
+        Stock sets ``task.runtime = 0`` here and ``create_benchmark``
+        empties the file lists right after, so this is the last point where
+        the WfChef instance's values are visible.
+
+        :param task: The task about to be turned into a wfbench task.
+        :param args: Positional arguments of the stock method.
+        :param kwargs: Keyword arguments of the stock method.
+        """
+        outs = [(f.file_id, int(f.size or 0)) for f in task.output_files]
+        self.instance_info[task.task_id] = {
+            "runtime": float(task.runtime or 0.0),
+            "cores": int(task.cores or 1),
+            "out_bytes": sum(sz for _, sz in outs),
+            "inputs": [(f.file_id, int(f.size or 0)) for f in task.input_files],
+        }
+        self.instance_out_ids.update(fid for fid, _ in outs)
+        super()._set_argument_parameters(task, *args, **kwargs)
 
     def _ext_for(self, task: Task, direction: str) -> str:
         """Look up the extension for a task's inputs or outputs.
@@ -224,9 +258,24 @@ class DtWorkflowBenchmark(WorkflowBenchmark):
                 for i, item in enumerate(task.args):
                     if org_name in item:
                         task.args[i] = task.args[i].replace(org_name, file.file_id)
-        if self.write_inputs:
+        if self.sparse_inputs:
+            self._dt_sparse_workflow_inputs(workflow_inputs)
+        elif self.write_inputs:
             self._dt_write_workflow_inputs(workflow_inputs)
         return workflow_inputs
+
+    def _dt_sparse_workflow_inputs(self, workflow_inputs: List[File]) -> None:
+        """Create workflow input files as sparse placeholders in ``save_dir``.
+
+        :param workflow_inputs: Files returned by the rename step.
+        """
+        if self._dt_save_dir is None:
+            return
+        self._dt_save_dir.mkdir(parents=True, exist_ok=True)
+        for file in workflow_inputs:
+            path = self._dt_save_dir / file.file_id
+            with open(path, "ab") as fp:
+                fp.truncate(int(file.size))
 
     def _dt_write_workflow_inputs(self, workflow_inputs: List[File]) -> None:
         """Create workflow input files with generated data in ``save_dir``.

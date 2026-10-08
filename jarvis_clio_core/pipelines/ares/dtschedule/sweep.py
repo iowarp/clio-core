@@ -358,7 +358,8 @@ def copy_traces(pipeline_name, config, out_dir, run_name):
 
 
 def copy_workload_logs(config, dest):
-    """Copy the prodcons producer/consumer logs next to the traces.
+    """Copy the prodcons producer/consumer logs (and the CTE-API wfcommons
+    run's wfrun.log / tasks.csv) next to the traces.
 
     The package deletes them at the next run's start, and they hold the
     only per-file read errors when a consumer reports bad files.
@@ -369,10 +370,15 @@ def copy_workload_logs(config, dest):
     """
     copied = []
     for pkg in config.get('pkgs', []):
-        if not str(pkg.get('pkg_type', '')).endswith('.clio_prodcons'):
+        ptype = str(pkg.get('pkg_type', ''))
+        if ptype.endswith('.clio_prodcons'):
+            names = ('producer.log', 'consumer.log')
+        elif ptype.endswith(WFCOMMONS_SUFFIX) and pkg.get('api'):
+            names = ('wfrun.log', 'tasks.csv')
+        else:
             continue
         out = os.path.expandvars(pkg.get('out', ''))
-        for name in ('producer.log', 'consumer.log'):
+        for name in names:
             src = os.path.join(out, name)
             if os.path.isfile(src):
                 target = dest / name

@@ -1,0 +1,112 @@
+# DTSchedule WfCommons seismology over the CTE API (dtschedule_wfrun,
+# tools/wfrun), 2 nodes. Same runtime / CTE tiers / dtschedule blocks as
+# prodcons_api.yaml (RAM 1342MB, NVMe 2684MB, HDD 32GB; neighborhood 1;
+# placement dtschedule; workflow_aware dag). No interceptors: files are CTE
+# tags "<run>__<file>" of 1 MiB blobs put/get through the dtschedule pool,
+# so clio-fs's home-node routing cannot override dtschedule's placement.
+#
+# clio_wfcommons_dist api: true -- configure generates the WfChef instance
+# and writes placement.json (instance runtimes per task; stage_sets 2, so
+# consecutive levels sit on different nodes); clio_dtschedule loads it as its
+# DAG. start runs one mpirun of dtschedule_wfrun (ppn ranks per node) which
+# stages the workflow inputs, runs every task (wait for inputs, read, CPU
+# stencil for runtime x runtime_scale, write generated outputs by data
+# class) and writes makespan.json + tasks.csv to out.
+#
+# Seismology: 102 sG1IterDecon tasks (each reads one staged .sac/.lht
+# trace, writes one .stf float field) -> wrapper_siftSTFByMisfit fan-in on
+# the other node (reads ~10.5 GB, in --input-mem-mb batches). ~15 GB.
+# runtime_scale 1.0: the instance runtimes are short (~2.4 s each), ~240 s
+# compute in all, ~30 s per rank.
+#
+# Check offline: build/bin/dtschedule_wfrun --dry-run --placement
+#   <out>/placement.json --runtime-scale 1.0 --ppn 8
+# Run (inside an allocation, from this directory):
+#   python3 sweep.py --exp wf_seismology --pipeline wf_seismology_api.yaml \
+#     --run base: --hostfile ~/hostfile_dtsched_prodcons.txt
+name: dtschedule_wf_seismology_api
+ssh_cmd: env -u LD_LIBRARY_PATH ssh
+env:
+  CLIO_MEMFD_DIR: ${HOME}/iowarp_clio_tmp_${HOSTNAME}
+scheduler:
+  name: slurm
+  job_name: dtschedule_wf_seismology_api
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 40
+  partition: debug
+  time: 01:00:00
+  output: slurm-%j.out
+  error: slurm-%j.err
+  suffix: -40g
+  pre_cmds:
+  - mkdir -p /mnt/nvme/${USER}/dtschedule_wf_seismology_api /mnt/hdd/${USER}/dtschedule_wf_seismology_api
+pkgs:
+- pkg_type: jarvis_clio_core.clio_runtime
+  pkg_name: runtime
+  num_threads: 4
+  client_data_segment_size: 2G
+  port: 9413
+  ipc_mode: shm
+  log_level: info
+  sleep: 4
+  swim_enabled: false
+- pkg_type: jarvis_clio_core.clio_cte
+  pkg_name: cte_core
+  devices:
+  - - ram::cte_ram_tier1
+    - 1342MB
+    - 1.0
+  - - /mnt/nvme/${USER}/dtschedule_wf_seismology_api/cte_target.bin
+    - 2684MB
+    - 0.7
+  - - /mnt/hdd/${USER}/dtschedule_wf_seismology_api/cte_target.bin
+    - 32GB
+    - 0.3
+  dpe_type: max_bw
+  pool_query: local
+  default_target_timeout_ms: 30000
+  poll_period_ms: 5000
+  neighborhood: 1
+- pkg_type: jarvis_clio_core.clio_dtschedule
+  pkg_name: dtschedule
+  ccm: qtable
+  workflow_aware: dag
+  load_aware: true
+  qos_objective: performance
+  qos_max_error: 0.0
+  force_scenario: auto
+  decision_order: joint
+  net_bw_gbps: 40
+  trace_path: ${HOME}/jarvis-runs/dtschedule_wf_seismology_api/dtschedule_trace
+  trace_candidates: true
+  min_compress_bytes: 65536
+  load_period_ms: 500
+  tier_bw_mbps:
+    ram: 20000.0
+    nvme: 2000.0
+    hdd: 200.0
+  placement: dtschedule
+- pkg_type: jarvis_clio_core.clio_wfcommons_dist
+  pkg_name: wfcommons
+  api: true
+  recipe: seismology
+  num_tasks: 105
+  seed: 7
+  data_footprint: 15G
+  size_mode: instance
+  max_file_mb: 256
+  runtime_scale: 1.0
+  ppn: 8
+  write_pending: 1
+  input_mem_mb: 1024
+  placement: stage_sets
+  stage_sets: 2
+  data_class: auto
+  data_noise: 0.05
+  wf_python: ${HOME}/venv-dtschedule/bin/python
+  out: /mnt/common/llogan/dtschedule-runs/wf_seismology_api
+  mpirun: /mnt/common/llogan/spack/opt/spack/linux-skylake_avx512/openmpi-5.0.8-aaqsri5t5df5mcygbtc3le7l7lumndvj/bin/mpirun
+  launch_agent: /mnt/common/llogan/spack/opt/spack/linux-skylake_avx512/prrte-4.0.0-pag2d45mbp4iiutlhvzgrlzer65cm5if/bin/prted
+  bin_dir: /mnt/common/llogan/iowarp/dtschedule/build/bin
+  net_if: 172.25.0.0/16
