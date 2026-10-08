@@ -145,6 +145,7 @@ class ZeroMqTransport : public Transport {
       int iot = (iot_env && *iot_env) ? std::atoi(iot_env) : 8;
       if (iot < 1) iot = 1;
       zmq_ctx_set(owner.ctx, ZMQ_IO_THREADS, iot);
+      SetMaxSockets(owner.ctx);
       // Non-blocking termination semantics: new sockets default to LINGER=0 so
       // a close never waits for unsent messages, and blocking calls return
       // ETERM promptly on shutdown. Belt-and-suspenders alongside the leak in
@@ -153,6 +154,27 @@ class ZeroMqTransport : public Transport {
       HLOG(kInfo, "[ZeroMqTransport] Created shared context with {} I/O threads", iot);
     }
     return owner.ctx;
+  }
+
+  /**
+   * Raise a context's socket ceiling (ZMQ_MAX_SOCKETS, default 1023).
+   *
+   * A runtime keeps up to 512 client dial-backs (#1065) beside its own
+   * sockets, and zmq_close is asynchronous: an evicted dial-back counts
+   * against the ceiling until the context's reaper finishes it. Under client
+   * churn on a slow host the default left too little headroom, so a new
+   * dial-back failed with EMFILE and its response was dropped (#1233). The
+   * open-file limit, not this ceiling, is the real bound.
+   * CLIO_ZMQ_MAX_SOCKETS overrides; capped at ZMQ_SOCKET_LIMIT.
+   *
+   * @param ctx context to configure, before its first socket
+   */
+  static void SetMaxSockets(void *ctx) {
+    const char *env = ctp::env::GetCompat("ZMQ_MAX_SOCKETS");
+    int max_sockets = (env && *env) ? std::atoi(env) : 8192;
+    const int hard_limit = zmq_ctx_get(ctx, ZMQ_SOCKET_LIMIT);
+    if (hard_limit > 0 && max_sockets > hard_limit) max_sockets = hard_limit;
+    if (max_sockets > 0) zmq_ctx_set(ctx, ZMQ_MAX_SOCKETS, max_sockets);
   }
 
   /**
@@ -361,6 +383,7 @@ class ZeroMqTransport : public Transport {
         int iot = (iot_env && *iot_env) ? std::atoi(iot_env) : 8;
         if (iot < 1) iot = 1;
         zmq_ctx_set(ctx_, ZMQ_IO_THREADS, iot);
+        SetMaxSockets(ctx_);
       }
       socket_ = zmq_socket(ctx_, ZMQ_ROUTER);
       if (socket_ == nullptr) {
