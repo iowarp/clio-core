@@ -37,7 +37,7 @@ LABEL = {'raw_local': 'Local, raw', 'baseline': 'Local, raw', 's1': 'S1 compress
          's1_local_blosc': 'S1 compress@P', 'local_blosc': 'S1 compress@P',
          's2': 'S2 compress@P, store@C', 'cons_raw': 'Consumer, raw', 'local_raw': 'Local, raw',
          's3': 'S3 compress@C', 's3_cons_blosc': 'S3 compress@C', 'cons_blosc': 'S3 compress@C',
-         'auto': 'DTSchedule (auto)', 'full': 'DTSchedule (auto)', 'no_dag': 'DTSchedule w/o DAG'}
+         'auto': 'DTSchedule (auto)', 'full': 'DTSchedule (auto)', 'no_dag': 'DTSchedule w/o workflow knowledge'}
 
 
 def load(root, exp):
@@ -166,8 +166,8 @@ def fig_ablation(root, out, exp='e6', order=('baseline', 'no_placement', 'fixed_
     if not names:
         return
     lab = labels or {'baseline': 'Local, raw (no DTSchedule policy)', 'no_placement': 'w/o placement (local)',
-                     'fixed_ccm': 'w/o CCM (fixed zstd)', 'no_load': 'w/o load awareness',
-                     'no_dag': 'w/o DAG (consumer tracking)', 'full': 'DTSchedule (full)'}
+                     'fixed_ccm': 'zstd as the only codec', 'no_load': 'w/o load awareness',
+                     'no_dag': 'w/o workflow knowledge', 'full': 'DTSchedule (full)'}
     fig, ax = plt.subplots(figsize=(COL_W, 0.32 * len(names) + 0.5))
     bar_err(ax, names, runs)
     ax.set_yticklabels([lab.get(n, LABEL.get(n, n)) for n in names], fontsize=7)
@@ -269,7 +269,7 @@ def fig_e10(root, out):
     and consumer CPU from dtschedule's load samples; share of chunks per scenario and share
     compressed, per 5 s bin, from the decision trace."""
     import pandas as pd
-    tr = sorted(glob.glob(os.path.join(root, 'e10', 'traces', 'timeline', 'dtschedule_trace.[0-9].csv')))
+    tr = sorted(glob.glob(os.path.join(root, 'e10', 'traces', 'timeline', 'dtschedule_trace.0.csv')))  # writer's decisions only (the consumer logs the chunks it stores again)
     frames = [pd.read_csv(f) for f in tr]
     frames = [f for f in frames if len(f)]
     if not frames:
