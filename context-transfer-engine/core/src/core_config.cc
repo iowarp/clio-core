@@ -367,6 +367,10 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
       emitter << YAML::Key << "path" << YAML::Value << device.path_;
       emitter << YAML::Key << "bdev_type" << YAML::Value << device.bdev_type_;
       emitter << YAML::Key << "capacity_limit" << YAML::Value << FormatSizeBytes(device.capacity_limit_);
+      if (device.growth_unit_ != (clio::run::u64(1) << 30)) {
+        emitter << YAML::Key << "growth_unit" << YAML::Value
+                << FormatSizeBytes(device.growth_unit_);
+      }
       
       // Emit score only if it's manually set (not using automatic scoring)
       if (device.score_ >= 0.0f) {
@@ -569,6 +573,17 @@ bool Config::ParseStorageConfig(const YAML::Node &node) {
         HLOG(kError,
              "Config error: Invalid capacity_limit format '{}' for device {}",
              capacity_str, device_config.path_);
+        return false;
+      }
+    }
+
+    // Parse growth_unit (optional, file tiers): the bdev's lazy-growth step.
+    if (device_node["growth_unit"]) {
+      std::string growth_str = device_node["growth_unit"].as<std::string>();
+      if (!ParseSizeString(growth_str, device_config.growth_unit_)) {
+        HLOG(kError,
+             "Config error: Invalid growth_unit format '{}' for device {}",
+             growth_str, device_config.path_);
         return false;
       }
     }

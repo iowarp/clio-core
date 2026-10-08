@@ -319,11 +319,16 @@ compose:
         score: 1.0                       # DRAM = highest-performance tier
 
       # Persistent disk tier: where the replication chimod (below) keeps the
-      # durable copies of DRAM-cached data. Grows lazily (1GB units), so the
+      # durable copies of DRAM-cached data. Grows lazily, so the
       # capacity_limit is a cap, not an upfront allocation.
+      # growth_unit (file tiers, optional, default "1GB"): how far the file
+      #   grows -- and reserves -- at a time. The first unit is reserved when
+      #   the tier is created, so on a RAM-backed filesystem (tmpfs) each
+      #   file tier costs one unit of memory up front; use e.g. "64MB" there.
       - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
         bdev_type: "file"
         capacity_limit: "10GB"
+        # growth_unit: "1GB"
         score: 0.2
         persistence_level: "temporary"
 

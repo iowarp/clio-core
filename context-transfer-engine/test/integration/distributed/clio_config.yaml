@@ -39,23 +39,30 @@ compose:
     pool_query: local
     pool_id: "512.0"
     # Storage block device configuration
-    # This configuration defines 4 storage targets across 4 nodes
+    # This configuration defines 4 storage targets across 4 nodes.
+    # /mnt is a tmpfs, so a file tier's reservation is RAM: the default
+    # 1 GiB growth unit is 16 GiB across the cluster before any data and
+    # OOM-kills the CI runner. 64MB keeps the reservation small.
     storage:
       - path: /mnt/hdd1
         bdev_type: file
         capacity_limit: 10GB
+        growth_unit: 64MB
         score: 0.25
       - path: /mnt/hdd2
         bdev_type: file
         capacity_limit: 10GB
+        growth_unit: 64MB
         score: 0.25
       - path: /mnt/hdd3
         bdev_type: file
         capacity_limit: 10GB
+        growth_unit: 64MB
         score: 0.25
       - path: /mnt/hdd4
         bdev_type: file
         capacity_limit: 10GB
+        growth_unit: 64MB
         score: 0.25
     # Data Placement Engine configuration
     dpe:
