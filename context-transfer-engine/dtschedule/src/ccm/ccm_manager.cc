@@ -207,6 +207,7 @@ ccm::Decision CcmManager::SelectCodec(const void *blob_data,
                                ratio_noise_sigma, &rng_, compare_raw,
                                store_bw);
   decision.qos_stage_index_ = stage_idx;
+  decision.features_ = features;
   decision.candidates_.insert(decision.candidates_.end(), rejected.begin(),
                               rejected.end());
   return decision;
@@ -221,8 +222,11 @@ void CcmManager::Observe(const void *blob_data,
                          double pred_ratio,
                          double obs_ctime_ms,
                          double obs_dtime_ms,
-                         double obs_ratio) {
-  Features features = ComputeFeatures(blob_data, size);
+                         double obs_ratio,
+                         const Features *known_features) {
+  const Features features = known_features != nullptr
+                                ? *known_features
+                                : ComputeFeatures(blob_data, size);
   double resample_error = 0.0, resample_chance = 0.0, max_error = 0.0;
   std::vector<std::string> allowlist, preference;
   {

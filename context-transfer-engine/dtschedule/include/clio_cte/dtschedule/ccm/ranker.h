@@ -57,6 +57,7 @@ struct Decision {
   size_t n_candidates_;                  ///< Number of candidates considered
   int qos_stage_index_ = -1;             ///< Which QoS stage matched (-1 if none)
   std::vector<CandidateRecord> candidates_;  ///< Evaluated candidates (task 3)
+  Features features_{};                  ///< Features the decision was made on
 };
 
 /**

@@ -223,9 +223,15 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 }
 
 bool Runtime::ShouldSelect(size_t size) const {
+  // With placement: dtschedule a raw-only CCM still runs the placement
+  // decision (consumer node, tier); only the codec selection is skipped.
   return size >= static_cast<size_t>(config_.min_compress_bytes_) &&
-         !knobs_.ccm_.empty() && knobs_.ccm_ != "fixed:none" &&
-         ccm_manager_ != nullptr;
+         ccm_manager_ != nullptr &&
+         (CompressionEnabled() || config_.placement_ == "dtschedule");
+}
+
+bool Runtime::CompressionEnabled() const {
+  return !knobs_.ccm_.empty() && knobs_.ccm_ != "fixed:none";
 }
 
 ctp::ipc::FullPtr<char> Runtime::CompressWithDecision(
@@ -281,14 +287,14 @@ void Runtime::RecordDecision(const std::string &tag_id,
   if (out.attempted && !decision.chosen_lib_.empty()) {
     ccm_manager_->Observe(src, original_size, blob_name, decision.chosen_lib_,
                           decision.chosen_preset_, decision.pred_ctime_ms_,
-                          decision.pred_ratio_, out.ctime_ms, 0.0, out.ratio);
+                          decision.pred_ratio_, out.ctime_ms, 0.0, out.ratio,
+                          &decision.features_);
   }
   if (!trace_file_.is_open()) {
     return;
   }
-  ccm::Features features = ccm_manager_->ComputeFeaturesPublic(src, original_size);
-  WriteTraceRow(tag_id, blob_name, original_size, features, decision, out,
-                select_ms, load_mult, producer_cpu, place);
+  WriteTraceRow(tag_id, blob_name, original_size, decision.features_, decision,
+                out, select_ms, load_mult, producer_cpu, place);
   WriteCandidatesTrace(tag_id, blob_name, decision);
 }
 
@@ -447,10 +453,15 @@ clio::run::TaskResume Runtime::PutBlob(
             return StoreBwFor(bytes, owner_for_tier, consumer_for_bw);
           };
       auto t0 = std::chrono::steady_clock::now();
-      decision = ccm_manager_->SelectCodec(src_ptr.ptr_, original_size,
-                                           match_name,
-                                           knobs_.ratio_noise_sigma_, load_mult,
-                                           rank_bw_mb_ms, &store_bw);
+      bool reused = false;
+      if (CompressionEnabled()) {
+        decision = DecideCodec(task->tag_id_, src_ptr.ptr_, original_size,
+                               match_name, load_mult, rank_bw_mb_ms,
+                               &store_bw, &reused);
+      } else {
+        decision.chosen_lib_.clear();  // raw; placement is still decided
+        decision.pred_ratio_ = 1.0;
+      }
       select_ms = std::chrono::duration<double, std::milli>(
                       std::chrono::steady_clock::now() - t0)
                       .count();
@@ -583,6 +594,51 @@ clio::run::TaskResume Runtime::PutBlob(
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+ccm::Decision Runtime::DecideCodec(
+    const TagId &tag_id, const char *src, size_t size,
+    const std::string &match_name, double load_mult, double rank_bw_mb_ms,
+    const std::function<double(uint64_t)> *store_bw, bool *reused) {
+  // Chunks of one file share their data class, so the features and ranking
+  // of one chunk hold for its neighbours. Deciding per chunk cost ~1.2 ms of
+  // CPU per MiB on the writer: on a node whose cores the application holds,
+  // that alone capped writes at ~170 MB/s.
+  const uint64_t now_ms = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  // Size is part of the key: the store cost the ranker weighs scales with it.
+  const std::string key = tag_id.ToString() + "|" + std::to_string(size);
+  const uint64_t max_age_ms =
+      static_cast<uint64_t>(std::max(config_.load_period_ms_, 1));
+  {
+    std::lock_guard<std::mutex> lock(decision_cache_lock_);
+    auto it = decision_cache_.find(key);
+    if (it != decision_cache_.end() && it->second.uses_left > 0 &&
+        now_ms - it->second.made_ms <= max_age_ms) {
+      --it->second.uses_left;
+      *reused = true;
+      return it->second.decision;
+    }
+  }
+  ccm::Decision decision = ccm_manager_->SelectCodec(
+      src, size, match_name, knobs_.ratio_noise_sigma_, load_mult,
+      rank_bw_mb_ms, store_bw);
+  *reused = false;
+  if (config_.decision_reuse_chunks_ > 1) {
+    CachedDecision entry;
+    entry.decision = decision;
+    entry.decision.candidates_.clear();  // traced once, with the fresh one
+    entry.uses_left = config_.decision_reuse_chunks_ - 1;
+    entry.made_ms = now_ms;
+    std::lock_guard<std::mutex> lock(decision_cache_lock_);
+    if (decision_cache_.size() >= (1u << 16)) {
+      decision_cache_.clear();
+    }
+    decision_cache_[key] = std::move(entry);
+  }
+  return decision;
 }
 
 clio::run::TaskResume Runtime::ForwardCompressedPut(

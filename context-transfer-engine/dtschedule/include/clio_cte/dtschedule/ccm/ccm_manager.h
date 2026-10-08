@@ -138,6 +138,9 @@ class CcmManager {
    * Feed an observation back to the predictor and apply the resample rule:
    * when the prediction missed by more than resample_error, with probability
    * resample_chance every candidate is run on the chunk and observed.
+   *
+   * @param features Features the decision was made on; null recomputes them
+   *        from blob_data (a full pass over the chunk).
    */
   void Observe(const void *blob_data,
                size_t size,
@@ -148,7 +151,8 @@ class CcmManager {
                double pred_ratio,
                double obs_ctime_ms,
                double obs_dtime_ms,
-               double obs_ratio);
+               double obs_ratio,
+               const Features *features = nullptr);
 
   using ProbeKey = std::pair<std::string, ctp::CompressionPreset>;
   /**

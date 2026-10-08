@@ -280,6 +280,10 @@ struct DtscheduleConfig {
   std::string trace_path_ = "";                 ///< CSV trace file base path (empty = off)
   bool trace_candidates_ = false;               ///< Also write <trace_path>.cand.<node>.csv
   int min_compress_bytes_ = 4096;               ///< Minimum size to compress
+  // Chunks of one tag (file) that reuse a codec decision before it is made
+  // again (features + ranking). 1 = decide every chunk. A decision is also
+  // remade once it is older than load_period_ms.
+  int decision_reuse_chunks_ = 32;
 
   DtscheduleConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
 
@@ -525,6 +529,10 @@ struct DtscheduleConfig {
       const long long raw = node["min_compress_bytes"].as<long long>();
       min_compress_bytes_ = static_cast<int>(
           std::min<long long>(raw, std::numeric_limits<int>::max()));
+    }
+    if (node["decision_reuse_chunks"]) {
+      decision_reuse_chunks_ =
+          std::max(1, node["decision_reuse_chunks"].as<int>());
     }
     if (node["load_peers"]) {
       load_peers_ = node["load_peers"].as<std::vector<uint32_t>>();

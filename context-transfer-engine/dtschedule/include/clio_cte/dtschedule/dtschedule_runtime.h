@@ -485,6 +485,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
                             const ccm::Decision &decision);
   /** True when a put of this size goes through codec selection. */
   bool ShouldSelect(size_t size) const;
+  /** Whether the CCM may compress at all (ccm is not fixed:none). */
+  bool CompressionEnabled() const;
   /**
    * Compress a blob with the decision's codec into a fresh SHM buffer with
    * the shared header in front. Returns a null pointer (and out->used ==
@@ -551,6 +553,33 @@ class Runtime : public clio::cte::core::CoreInterposer {
   // ---- dtschedule-owned placement (DtscheduleConfig::placement_) ----
   TagId loc_tag_;                          ///< Tag holding location records
   bool loc_tag_ready_ = false;             ///< loc_tag_ resolved
+  /** A codec decision shared by the next chunks of one tag. */
+  struct CachedDecision {
+    ccm::Decision decision;   ///< Decision without its candidate records
+    int uses_left = 0;        ///< Chunks that may still reuse it
+    uint64_t made_ms = 0;     ///< When it was made (steady clock, ms)
+  };
+  std::unordered_map<std::string, CachedDecision> decision_cache_;
+  std::mutex decision_cache_lock_;         ///< Guards decision_cache_
+  /**
+   * Codec decision for a chunk: reuse the tag's recent decision when one is
+   * fresh, else select (features + ranking) and cache the result.
+   *
+   * @param tag_id Tag of the chunk (the file under the POSIX adapter)
+   * @param src Chunk bytes
+   * @param size Chunk size
+   * @param match_name Name the QoS rules and candidate filter match
+   * @param load_mult Load multiplier for the ranker
+   * @param rank_bw_mb_ms Store bandwidth for the ranker
+   * @param store_bw Per-size store bandwidth for the ranker
+   * @param reused Out: true when a cached decision was returned
+   * @return The decision
+   */
+  ccm::Decision DecideCodec(const TagId &tag_id, const char *src, size_t size,
+                            const std::string &match_name, double load_mult,
+                            double rank_bw_mb_ms,
+                            const std::function<double(uint64_t)> *store_bw,
+                            bool *reused);
   std::unordered_map<std::string, uint32_t> loc_cache_;  ///< blob -> node
   std::mutex loc_lock_;                    ///< Guards loc_cache_
   /** True when dtschedule (not the core's hash) places data chunks. */
