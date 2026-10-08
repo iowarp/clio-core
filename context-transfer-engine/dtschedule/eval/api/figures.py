@@ -412,6 +412,39 @@ def fig_async(root, out):
     print('async.pdf', {n: (round(stat(sync[n])[0], 1), round(stat(asy[n])[0], 1), stat(asy[n])[3]) for n in names})
 
 
+def fig_scaling(root, out, exp='scale'):
+    """Baselines across producer scale: Hermes (the runtime alone: raw, writer-local, tiered),
+    HCompress (codec chosen per tier from chunk size only, writer-local, no load or workflow
+    signal) and DTSchedule, with 10/20/40 producer ranks (5/10/20 consumer ranks) on the same
+    two nodes. Each rank writes 32 MB per step, so data grows with the rank count."""
+    runs = load(root, exp)
+    sysn = [('hermes', 'Hermes (runtime, raw)', C[0]), ('hcompress', 'HCompress (size-only codec)', C[2]),
+            ('dtsched', 'DTSchedule', C[1])]
+    ranks = sorted({int(k.rsplit('_p', 1)[1]) for k in runs if '_p' in k})
+    if not ranks:
+        return
+    fig, ax = plt.subplots(figsize=(COL_W, 1.75))
+    w = 0.27
+    for k, (key, lab, col) in enumerate(sysn):
+        xs, ys = [], []
+        for i, r in enumerate(ranks):
+            n = f'{key}_p{r}'
+            if n not in runs:
+                continue
+            xs.append(i + (k - 1) * w); ys.append(stat(runs[n])[0])
+        ax.bar(xs, ys, w * 0.92, color=col, label=lab)
+        for x, y in zip(xs, ys):
+            ax.text(x, y + 3, f'{y:.0f}', ha='center', fontsize=6)
+    gb = {r: runs[f'hermes_p{r}'][0]['makespan']['producer']['step_mb'] * runs[f'hermes_p{r}'][0]['makespan']['producer']['steps'] / 1000
+          for r in ranks if f'hermes_p{r}' in runs}
+    ax.set_xticks(range(len(ranks)))
+    ax.set_xticklabels([f'{r} ranks' + (f'\n{gb[r]:.1f} GB' if r in gb else '') for r in ranks], fontsize=6.5)
+    ax.set_ylabel('Makespan (s)'); ax.grid(axis='x', visible=False)
+    ax.legend(fontsize=6, ncol=3, loc='lower center', bbox_to_anchor=(0.45, 1.0), handlelength=1.2, columnspacing=0.8)
+    fig.tight_layout(); save(fig, out, 'scaling.pdf')
+    print('scaling.pdf', {n: round(stat(v)[0], 1) for n, v in sorted(runs.items())})
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--root', default=os.path.expanduser('~/jarvis-runs/dtschedule-results'))
@@ -419,7 +452,7 @@ def main():
     ap.add_argument('names', nargs='*')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    figs = {'motivation': fig_motivation, 'flip': fig_motivation_flip, 'codecs': tab_codecs, 'prodcons': fig_prodcons, 'e5': fig_e5_grid, 'e6': fig_ablation, 'workflows': fig_workflows, 'e10': fig_e10, 'e8e9': fig_e8_e9, 'e7': fig_e7, 'async': fig_async}
+    figs = {'motivation': fig_motivation, 'flip': fig_motivation_flip, 'codecs': tab_codecs, 'prodcons': fig_prodcons, 'e5': fig_e5_grid, 'e6': fig_ablation, 'workflows': fig_workflows, 'e10': fig_e10, 'e8e9': fig_e8_e9, 'e7': fig_e7, 'async': fig_async, 'scaling': fig_scaling}
     for n in (a.names or figs):
         figs[n](a.root, a.out)
 

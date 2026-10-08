@@ -57,6 +57,12 @@ namespace clio::cte::dtschedule::ccm {
 class QtablePredictor : public CcmPredictor {
  public:
   QtablePredictor() = default;
+  /**
+   * @param size_only Key states by (codec, preset, size bin) only, folding
+   *        the data-type and data-statistic bins together: the HCompress
+   *        baseline, which predicts the best codec from the data size alone.
+   */
+  explicit QtablePredictor(bool size_only) : size_only_(size_only) {}
   ~QtablePredictor() override = default;
 
   /**
@@ -121,6 +127,7 @@ class QtablePredictor : public CcmPredictor {
   /** Copy the bin edges out of binning_params_ once. */
   void LoadEdges();
 
+  bool size_only_ = false;                ///< HCompress: size bin only
   nlohmann::json qtable_;                 ///< Full qtable.json content
   nlohmann::json binning_params_;         ///< Full binning_params.json content
 

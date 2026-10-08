@@ -121,7 +121,18 @@ bool QtablePredictor::Load(const std::string &model_dir) {
         double count = state_entry.contains("sample_count")
                            ? state_entry["sample_count"].get<double>()
                            : 1.0;
-        state_cache_[state_key] = Entry{Prediction{ctime, dtime, ratio}, count};
+        if (size_only_) {
+          // Fold every data-type/statistic bin into its size bin.
+          state_key[2] = state_key[4] = state_key[5] = state_key[6] = 0;
+          Entry &e = state_cache_[state_key];
+          const double tot = e.count_ + count;
+          e.mean_.ctime_ms_ = (e.mean_.ctime_ms_ * e.count_ + ctime * count) / tot;
+          e.mean_.dtime_ms_ = (e.mean_.dtime_ms_ * e.count_ + dtime * count) / tot;
+          e.mean_.ratio_ = (e.mean_.ratio_ * e.count_ + ratio * count) / tot;
+          e.count_ = tot;
+        } else {
+          state_cache_[state_key] = Entry{Prediction{ctime, dtime, ratio}, count};
+        }
         AccumulateMarginal({state_key[0], state_key[1], state_key[2]},
                            Prediction{ctime, dtime, ratio}, count);
         n_states_loaded++;
@@ -251,6 +262,9 @@ std::array<int, 7> QtablePredictor::BuildStateTuple(
 
   // Bin continuous features using bin_edges
   const int size_bin = BinFeature(static_cast<double>(features.size_), edges_[0]);
+  if (size_only_) {
+    return {lib_id, config_id, 0, size_bin, 0, 0, 0};
+  }
   const int entropy_bin = BinFeature(features.entropy_, edges_[1]);
   const int mad_bin = BinFeature(features.mad_, edges_[2]);
   const int d2_bin = BinFeature(features.d2_, edges_[3]);

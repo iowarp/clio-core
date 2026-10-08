@@ -168,7 +168,7 @@ class ClioDtschedule(Service):
         """Compression-characteristic model knobs."""
         return [
             {'name': 'ccm',
-             'msg': 'Codec cost model: qtable | ema | oracle | '
+             'msg': 'Codec cost model: qtable | hcompress (size only) | ema | oracle | '
                     'fixed:<lib>[:<preset>]',
              'type': str, 'default': 'qtable'},
             {'name': 'qtable_model_path',

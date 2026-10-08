@@ -378,10 +378,17 @@ void CcmManager::UpdateConfig(const clio::cte::dtschedule::DtscheduleConfig &con
 std::unique_ptr<CcmPredictor> CcmManager::CreatePredictor(
     const std::string &ccm_spec,
     const std::string &model_dir) {
-  // Parse spec: "qtable", "ema", "fixed:<lib>[:<preset>]", "oracle"
+  // Parse spec: "qtable", "hcompress", "ema", "fixed:<lib>[:<preset>]", "oracle"
 
   if (ccm_spec == "qtable") {
     auto predictor = std::make_unique<QtablePredictor>();
+    if (predictor->Load(model_dir)) {
+      return predictor;
+    }
+    return nullptr;
+  } else if (ccm_spec == "hcompress") {
+    // HCompress baseline: the same trained table, keyed by data size only.
+    auto predictor = std::make_unique<QtablePredictor>(true);
     if (predictor->Load(model_dir)) {
       return predictor;
     }
