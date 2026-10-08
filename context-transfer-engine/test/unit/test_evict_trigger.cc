@@ -120,6 +120,36 @@ class EvictTriggerFixture {
     return false;
   }
 
+  /* Bytes the tier reports free right now. GetCapacity sums the canonical
+     per-target counters, which is what placement reads, so this is the same
+     number a put is about to be judged against. */
+  clio::run::u64 FreeBytes() {
+    auto *cte_client = CLIO_CTE_CLIENT;
+    if (cte_client == nullptr) return 0;
+    auto cap = cte_client->AsyncGetCapacity();
+    cap.Wait();
+    if (cap->GetReturnCode() != 0) return 0;
+    return cap->remaining_capacity_;
+  }
+
+  /* Block until the tier reports at least `need` bytes free.
+
+     DelBlob frees its blocks before it returns, but the bytes reaching the
+     counter that placement reads is not instantaneous under load, and a case
+     that opens by requiring a put to succeed is really requiring the previous
+     case's deletes to have landed. Stating that as its own wait keeps a slow
+     reclaim from being reported as an unexplained placement failure several
+     lines later, and keeps a reclaim that never happens reported as the leak
+     it is -- FreeBytes() is in the failure message either way. */
+  bool WaitForFreeBytes(clio::run::u64 need, int timeout_ms = 15000) {
+    const int kStepMs = 50;
+    for (int waited = 0; waited < timeout_ms; waited += kStepMs) {
+      if (FreeBytes() >= need) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(kStepMs));
+    }
+    return false;
+  }
+
   ~EvictTriggerFixture() { Cleanup(); }
 
   void Cleanup() {
@@ -216,16 +246,49 @@ static bool BlobRegionMatches(clio::cte::core::Client *cte_client,
   return ok;
 }
 
-/* Best-effort delete of "<prefix><i>" for i in [0, count). Already-evicted
-   blobs are absent, so return codes are ignored. Cases share one tier, so a
-   case that leaves it full makes the next one measure the wrong thing. */
-static void DropBlobs(clio::cte::core::Client *cte_client,
-                      const clio::cte::core::TagId &tag_id,
-                      const std::string &prefix, int count) {
-  for (int i = 0; i < count; ++i) {
-    cte_client->AsyncDelBlob(tag_id, prefix + std::to_string(i)).Wait();
+/* Hands the next case an empty tier, however this one ends.
+   
+   Cases share one tier, so a case that leaves it full makes the next one
+   measure the wrong thing. Deleting on the way out of the case body is not
+   enough: REQUIRE throws, so a case that fails never reaches its own
+   cleanup and every case after it fails too -- one defect reads as several,
+   and the first real failure is buried. Deleting from a destructor runs on
+   both paths.
+
+   Names are registered before the loop that writes them, not after, so a
+   case that dies part-way still cleans up what it managed to write.
+   Deleting a blob that was never created, or that eviction already took, is
+   a no-op whose return code is ignored. */
+class TierScope {
+ public:
+  TierScope(clio::cte::core::Client *cte_client,
+            const clio::cte::core::TagId &tag_id)
+      : cte_client_(cte_client), tag_id_(tag_id) {}
+
+  /* Register "<name>". */
+  void Track(const std::string &name) { names_.push_back(name); }
+
+  /* Register "<prefix><i>" for i in [0, count). */
+  void TrackRange(const std::string &prefix, int count) {
+    for (int i = 0; i < count; ++i) {
+      names_.push_back(prefix + std::to_string(i));
+    }
   }
-}
+
+  ~TierScope() {
+    for (size_t i = 0; i < names_.size(); ++i) {
+      cte_client_->AsyncDelBlob(tag_id_, names_[i]).Wait();
+    }
+  }
+
+  TierScope(const TierScope &) = delete;
+  TierScope &operator=(const TierScope &) = delete;
+
+ private:
+  clio::cte::core::Client *cte_client_;
+  clio::cte::core::TagId tag_id_;
+  std::vector<std::string> names_;
+};
 
 /**
  * A workload several times the tier's size keeps being admitted.
@@ -243,6 +306,8 @@ TEST_CASE("EvictTrigger - a full tier keeps accepting writes",
   /* 3x the tier, so eviction has to run repeatedly rather than once. */
   const int kNumBlobs =
       static_cast<int>((kTierBytes / kBlobSize) * 3);
+  TierScope tier(cte_client, tag_id);
+  tier.TrackRange("fill_", kNumBlobs);
   for (int i = 0; i < kNumBlobs; ++i) {
     const std::string name = "fill_" + std::to_string(i);
     const char pattern = static_cast<char>('A' + (i % 26));
@@ -258,8 +323,6 @@ TEST_CASE("EvictTrigger - a full tier keeps accepting writes",
   REQUIRE(BlobRegionMatches(cte_client, tag_id, "fill_" + std::to_string(last),
                             0, kBlobSize,
                             static_cast<char>('A' + (last % 26))));
-
-  DropBlobs(cte_client, tag_id, "fill_", kNumBlobs);
 }
 
 /**
@@ -269,7 +332,14 @@ TEST_CASE("EvictTrigger - a full tier keeps accepting writes",
 TEST_CASE("EvictTrigger - a write larger than the tier still fails",
           "[evict_trigger][noleak]") {
   REQUIRE(g_fixture != nullptr);
+  auto *cte_client = CLIO_CTE_CLIENT;
+  REQUIRE(cte_client != nullptr);
   clio::cte::core::Tag tag("evict_trigger_toobig_tag");
+
+  /* A refused extend keeps the blocks it did place, so the blob can still be
+     holding tier space even though the put failed. */
+  TierScope tier(cte_client, tag.GetTagId());
+  tier.Track("too_big");
 
   const clio::run::u64 kTooBig = kTierBytes * 2;
   const int rc = g_fixture->PutAt(tag.GetTagId(), "too_big", 0, kTooBig, 0.5f, 'X',
@@ -300,6 +370,10 @@ TEST_CASE("EvictTrigger - growing one blob past the tier does not livelock",
 
   clio::cte::core::Tag tag("evict_trigger_grow_tag");
   clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  TierScope tier(cte_client, tag_id);
+  tier.Track("grower");
+  tier.Track("victim");
 
   /* A neighbour gives eviction something legal to take, so this exercises
      "skip the locked blob, take the other one". */
@@ -347,10 +421,6 @@ TEST_CASE("EvictTrigger - growing one blob past the tier does not livelock",
   INFO("growth stopped after " << extra << " extra chunk(s) with rc=" << rc);
   REQUIRE(rc >= kPlaceRcFirst);
   REQUIRE(rc <= kPlaceRcLast);
-
-  /* grower owns nearly the whole tier; leaving it would starve later cases. */
-  cte_client->AsyncDelBlob(tag_id, "grower").Wait();
-  cte_client->AsyncDelBlob(tag_id, "victim").Wait();
 }
 
 /**
@@ -372,6 +442,8 @@ TEST_CASE("EvictTrigger - an ordinary put never evicts",
   /* Fill until the tier refuses. Without the flag this must terminate in a
      refusal rather than recycling forever. */
   const int kCap = static_cast<int>((kTierBytes / kBlobSize) * 3);
+  TierScope tier(cte_client, tag_id);
+  tier.TrackRange("plain_", kCap);
   int filled = 0;
   int rc = 0;
   for (; filled < kCap; ++filled) {
@@ -390,8 +462,6 @@ TEST_CASE("EvictTrigger - an ordinary put never evicts",
     REQUIRE(BlobRegionMatches(cte_client, tag_id,
                               "plain_" + std::to_string(i), 0, kBlobSize, 'P'));
   }
-
-  DropBlobs(cte_client, tag_id, "plain_", filled);
 }
 
 /**
@@ -411,6 +481,21 @@ TEST_CASE("EvictTrigger - eviction never takes authoritative blobs",
   /* Authoritative data at a LOW score, so a score-ranked eviction would reach
      for it first if it were eligible. */
   const int kKeepers = static_cast<int>(kTierBytes / kBlobSize) - 3;
+
+  TierScope tier(cte_client, tag_id);
+  tier.TrackRange("keep_", kKeepers);
+  tier.TrackRange("cache_", kKeepers * 2);
+
+  /* The keepers are not droppable, so nothing will be evicted to make room
+     for them: they need the space the previous case gave back. Requiring it
+     up front separates "the tier never came back" from the property under
+     test. */
+  const clio::run::u64 kKeeperBytes =
+      static_cast<clio::run::u64>(kKeepers) * kBlobSize;
+  const bool keeper_room = g_fixture->WaitForFreeBytes(kKeeperBytes);
+  INFO("tier free=" << g_fixture->FreeBytes() << " need=" << kKeeperBytes);
+  REQUIRE(keeper_room);
+
   for (int i = 0; i < kKeepers; ++i) {
     const int rc = g_fixture->PutAt(tag_id, "keep_" + std::to_string(i), 0,
                                     kBlobSize, 0.1f, 'K', /*droppable=*/false);
@@ -440,9 +525,6 @@ TEST_CASE("EvictTrigger - eviction never takes authoritative blobs",
     REQUIRE(BlobRegionMatches(cte_client, tag_id, "keep_" + std::to_string(i),
                               0, kBlobSize, 'K'));
   }
-
-  DropBlobs(cte_client, tag_id, "keep_", kKeepers);
-  DropBlobs(cte_client, tag_id, "cache_", kCached);
 }
 
 /**
@@ -459,6 +541,19 @@ TEST_CASE("EvictTrigger - taking over a droppable blob is refused",
 
   clio::cte::core::Tag tag("evict_trigger_conflict_tag");
   clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  const int kPressure = static_cast<int>(kTierBytes / kBlobSize) * 2;
+  TierScope tier(cte_client, tag_id);
+  tier.Track("cache_blob");
+  tier.Track("auth_blob");
+  tier.TrackRange("press_", kPressure);
+
+  /* auth_blob is not droppable, so the tier has to have real room for it
+     rather than room eviction can make. Two blobs' worth is all this case
+     stores before the pressure loop, which recycles among its own copies. */
+  const bool conflict_room = g_fixture->WaitForFreeBytes(2 * kBlobSize);
+  INFO("tier free=" << g_fixture->FreeBytes() << " need=" << (2 * kBlobSize));
+  REQUIRE(conflict_room);
 
   /* A cache copy, then an attempt to take ownership of the same name. */
   REQUIRE(g_fixture->PutAt(tag_id, "cache_blob", 0, kBlobSize, 0.5f, 'D',
@@ -483,17 +578,12 @@ TEST_CASE("EvictTrigger - taking over a droppable blob is refused",
 
   /* Push more droppable data than the tier holds. If the droppable put above
      had flipped the blob, this would consume it. */
-  const int kPressure = static_cast<int>(kTierBytes / kBlobSize) * 2;
   for (int i = 0; i < kPressure; ++i) {
     REQUIRE(g_fixture->PutAt(tag_id, "press_" + std::to_string(i), 0, kBlobSize,
                              0.9f, 'C', /*droppable=*/true) == 0);
   }
   REQUIRE(BlobRegionMatches(cte_client, tag_id, "auth_blob", 0, kBlobSize,
                             'L'));
-
-  DropBlobs(cte_client, tag_id, "press_", kPressure);
-  cte_client->AsyncDelBlob(tag_id, "cache_blob").Wait();
-  cte_client->AsyncDelBlob(tag_id, "auth_blob").Wait();
 }
 
 /**

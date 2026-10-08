@@ -14,6 +14,7 @@
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
+#include <cstdlib>
 #include <mutex>
 #include <string>
 
@@ -35,6 +36,33 @@ size_t WriteToStringCb(char *ptr, size_t size, size_t nmemb, void *userdata) {
 }
 
 }  // namespace
+
+namespace detail {
+
+// Hosts that must always be reached directly, never through an HTTP proxy.
+//
+// Ollama normally listens on the same host as the summarizer, so the endpoint
+// is a loopback address. A site that exports http_proxy -- HPC login and
+// compute nodes routinely do, to let outbound traffic reach the internet --
+// otherwise sends even a 127.0.0.1 request to the proxy, which refuses to
+// relay to loopback and answers with its own error page. Every label then
+// comes back empty behind an HTTP 503 that has nothing to do with the model.
+//
+// CURLOPT_NOPROXY REPLACES libcurl's own reading of no_proxy rather than
+// adding to it, so carry whatever the environment already asked to bypass:
+// a site that routes some internal host directly must keep working.
+std::string LoopbackNoProxyList() {
+  const char *env = std::getenv("no_proxy");
+  if (env == nullptr || *env == '\0') env = std::getenv("NO_PROXY");
+  std::string list = "localhost,127.0.0.1,::1";
+  if (env != nullptr && *env != '\0') {
+    list += ",";
+    list += env;
+  }
+  return list;
+}
+
+}  // namespace detail
 
 bool OllamaGenerate(const std::string &endpoint_base,
                     const std::string &model,
@@ -101,6 +129,9 @@ bool OllamaGenerate(const std::string &endpoint_base,
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  // Outlives curl_easy_perform below: libcurl keeps the pointer, not a copy.
+  const std::string no_proxy = detail::LoopbackNoProxyList();
+  curl_easy_setopt(curl, CURLOPT_NOPROXY, no_proxy.c_str());
 
   CURLcode rc = curl_easy_perform(curl);
   long http_code = 0;
@@ -145,6 +176,10 @@ bool OllamaGenerate(const std::string &, const std::string &,
   out_response.clear();
   return false;
 }
+
+namespace detail {
+std::string LoopbackNoProxyList() { return {}; }
+}  // namespace detail
 
 }  // namespace clio::cae::summarizer
 
