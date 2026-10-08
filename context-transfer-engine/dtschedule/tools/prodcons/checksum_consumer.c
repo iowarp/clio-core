@@ -222,7 +222,7 @@ int main(int argc, char **argv) {
   int rank = 0, size = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
-  PcOptions o = {"prodcons", 10, 2048, 2048, 0, 40, 0.0, 4, NULL, 0};
+  PcOptions o = {"prodcons", 10, 2048, 2048, 0, 40, 0.0, 4, NULL, 0, 0};
   PcParse(argc, argv, &o);
 #ifdef PC_USE_CTE_API
   if (PcApiInit() != 0) {
@@ -231,7 +231,7 @@ int main(int argc, char **argv) {
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
 #endif
-  const size_t cap = (size_t)o.nx * (size_t)o.ny * sizeof(double);
+  const size_t cap = PcFileBytes(&o);
   char *buf = malloc(cap);
   double *lag = malloc(sizeof(double) * (size_t)(o.steps > 0 ? o.steps : 1));
   if (buf == NULL || lag == NULL) MPI_Abort(MPI_COMM_WORLD, 1);

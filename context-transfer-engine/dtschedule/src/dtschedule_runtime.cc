@@ -2771,14 +2771,22 @@ Runtime::ScenarioChoice Runtime::PlacedScenario(
     choice.raw = !has_codec;
     return choice;
   }
+  if (config_.objective_ == "ratio" && has_codec) {
+    // The ratio objective stores the highest-ratio codec the ranker found;
+    // only where to run it is weighed (raw is not an option).
+    choice.cost1_ms = z1;
+    choice.cost2_ms = z2;
+    choice.raw = false;
+  }
   // Ties go to S2 (the consumer reads locally), then S1, then S3.
   const double best = std::min({choice.cost1_ms, choice.cost2_ms, z3});
+  const bool ratio_obj = config_.objective_ == "ratio" && has_codec;
   if (choice.cost2_ms <= best) {
     choice.chosen_scenario = 2;
-    choice.raw = raw2 <= z2;
+    choice.raw = !ratio_obj && raw2 <= z2;
   } else if (choice.cost1_ms <= best) {
     choice.chosen_scenario = 1;
-    choice.raw = raw1 <= z1;
+    choice.raw = !ratio_obj && raw1 <= z1;
   } else {
     choice.chosen_scenario = 3;
   }

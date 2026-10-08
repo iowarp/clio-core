@@ -88,6 +88,9 @@ class ClioProdcons(Application):
             {'name': 'api', 'msg': 'Use the CTE-API builds (*_api): files '
              'are CTE tags put/get through the dtschedule pool, no POSIX '
              'interposer or clio-fs routing', 'type': bool, 'default': False},
+            {'name': 'float32', 'msg': 'Write the solver field as float32 '
+             '(lossy codecs apply; files are half the size)', 'type': bool,
+             'default': False},
             {'name': 'write_pending', 'msg': 'API mode: files a producer rank '
              'leaves in flight after each step (0 = wait until stored)',
              'type': int, 'default': 2},
@@ -213,7 +216,8 @@ class ClioProdcons(Application):
         nprod = int(c['ppn_producer']) * len(producers)
         ncons = int(c['ppn_consumer']) * len(consumers)
         shape = (f'--run {c["run"]} --steps {int(c["steps"])} '
-                 f'--nx {int(c["nx"])} --ny {int(c["ny"])}')
+                 f'--nx {int(c["nx"])} --ny {int(c["ny"])}'
+                 + (' --float32 1' if c.get('float32') else ''))
         cons_log = os.path.join(out, 'consumer.log')
         prod_log = os.path.join(out, 'producer.log')
         for path in (cons_log, prod_log):

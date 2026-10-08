@@ -250,7 +250,7 @@ int main(int argc, char **argv) {
   int rank = 0, size = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &size);
-  PcOptions o = {"prodcons", 10, 2048, 2048, 200, 0, 0.02, 0, NULL, 2};
+  PcOptions o = {"prodcons", 10, 2048, 2048, 200, 0, 0.02, 0, NULL, 2, 0};
   PcParse(argc, argv, &o);
 #ifdef PC_USE_CTE_API
   if (PcApiInit() != 0) {
@@ -285,9 +285,14 @@ int main(int argc, char **argv) {
       PayloadWindow(payload, plen, (char *)snap, bytes, step, rank);
     } else {
       SlabSnapshot(&s, snap, o.noise);
+      if (o.float32) {  // narrow in place: floats fill the first half
+        float *f = (float *)snap;
+        const size_t n = (size_t)o.nx * (size_t)o.ny;
+        for (size_t i = 0; i < n; ++i) f[i] = (float)snap[i];
+      }
     }
     const double w0 = PcNow();
-    rc = WriteStep(&o, step, rank, snap, bytes);
+    rc = WriteStep(&o, step, rank, snap, PcFileBytes(&o));
     compute_s += w0 - c0;
     write_s += PcNow() - w0;
     if (rc != 0 && rank == 0) {
@@ -304,7 +309,7 @@ int main(int argc, char **argv) {
   if (rank == 0) {
     printf("heat_producer ranks=%d steps=%d step_mb=%.1f compute_s=%.2f "
            "write_s=%.2f flush_s=%.2f wall_s=%.2f rc=%d\n",
-           size, o.steps, (double)bytes * size / 1e6, compute_s, write_s,
+           size, o.steps, (double)PcFileBytes(&o) * size / 1e6, compute_s, write_s,
            flush_s, PcNow() - t0, rc);
     fflush(stdout);
   }

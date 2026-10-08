@@ -63,6 +63,8 @@ typedef struct {
                             instead of the solver field (NULL = field) */
   int write_pending;   /**< API backend: files left in flight after a step's
                             write (0 = the write returns once stored) */
+  int float32;         /**< Field written as float32 (nx*ny*4 bytes per file,
+                            lossy-compressible) instead of float64 */
 } PcOptions;
 
 /**
@@ -84,7 +86,17 @@ static inline void PcParse(int argc, char **argv, PcOptions *opts) {
     else if (!strcmp(k, "--passes")) opts->passes = atoi(v);
     else if (!strcmp(k, "--payload")) opts->payload = v;
     else if (!strcmp(k, "--write-pending")) opts->write_pending = atoi(v);
+    else if (!strcmp(k, "--float32")) opts->float32 = atoi(v);
   }
+}
+
+/**
+ * Bytes per output file.
+ * @param o Options
+ * @return nx * ny * (4 for float32, else 8)
+ */
+static inline size_t PcFileBytes(const PcOptions *o) {
+  return (size_t)o->nx * (size_t)o->ny * (o->float32 ? sizeof(float) : sizeof(double));
 }
 
 /** Monotonic seconds. */
