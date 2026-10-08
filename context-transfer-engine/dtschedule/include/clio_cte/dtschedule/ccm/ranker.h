@@ -98,7 +98,8 @@ class Ranker {
                        std::mt19937_64 *rng = nullptr,
                        bool compare_raw = true,
                        const std::function<double(uint64_t)> *store_bw =
-                           nullptr);
+                           nullptr,
+                       double cpu_parallelism = 1.0);
 
 };
 

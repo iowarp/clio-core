@@ -182,6 +182,13 @@ class ClioDtschedule(Service):
             {'name': 'min_compress_bytes',
              'msg': 'Blobs smaller than this are stored raw',
              'type': int, 'default': 4096},
+            {'name': 'cpu_parallelism',
+             'msg': 'Runtime workers running codec work at once (the cost '
+                    'model divides codec time by it)',
+             'type': float, 'default': 4.0},
+            {'name': 'decision_reuse_chunks',
+             'msg': 'Chunks of one file that reuse a codec decision',
+             'type': int, 'default': 32},
         ]
 
     @staticmethod
@@ -534,6 +541,8 @@ class ClioDtschedule(Service):
             'trace_path': cfg['trace_path'],
             'trace_candidates': bool(cfg['trace_candidates']),
             'min_compress_bytes': int(cfg['min_compress_bytes']),
+            'cpu_parallelism': float(cfg.get('cpu_parallelism', 4.0)),
+            'decision_reuse_chunks': int(cfg.get('decision_reuse_chunks', 32)),
         }
         return entry
 
@@ -806,7 +815,7 @@ class ClioDtschedule(Service):
         cfg = self.config
         for key in ('ccm', 'workflow_aware', 'load_aware', 'force_scenario',
                     'decision_order', 'qos_objective', 'qos_max_error',
-                    'ratio_noise_sigma'):
+                    'ratio_noise_sigma', 'cpu_parallelism', 'placement'):
             stat_dict[f'{pid}.{key}'] = cfg.get(key)
         acc = {'puts': 0, 'compressed': 0, 'raw': 0, 'bytes_in': 0,
                'ratios': [], 'ctimes': [], 'selects': [], 'dtimes': [],

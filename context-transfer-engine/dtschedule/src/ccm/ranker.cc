@@ -48,8 +48,13 @@ Decision Ranker::Rank(const std::vector<Candidate> &candidates,
                       double ratio_noise_sigma,
                       std::mt19937_64 *rng,
                       bool compare_raw,
-                      const std::function<double(uint64_t)> *store_bw) {
+                      const std::function<double(uint64_t)> *store_bw,
+                      double cpu_parallelism) {
   Decision decision{};
+  // Costs are per-chunk shares of the bottleneck, not latencies: codec work
+  // runs on cpu_parallelism runtime workers at once, while the network and a
+  // tier's device are shared by every chunk in flight. Load scales CPU only.
+  const double par = std::max(cpu_parallelism, 1.0);
   decision.n_candidates_ = candidates.size();
   decision.chosen_tier_ = "default";  // tier selection arrives in phase 4
   if (candidates.empty()) {
@@ -76,7 +81,8 @@ Decision Ranker::Rank(const std::vector<Candidate> &candidates,
             ? (*store_bw)(static_cast<uint64_t>(size / pred.ratio_))
             : tier_bw;
     const double storage_ms = (size_mb / pred.ratio_) / z_bw;
-    const double cost = load_mult * (pred.ctime_ms_ + storage_ms) + pred.dtime_ms_;
+    const double cost =
+        (load_mult * pred.ctime_ms_ + pred.dtime_ms_) / par + storage_ms;
     const bool useful = pred.ratio_ >= kMinUsefulRatio;
     decision.candidates_.push_back(CandidateRecord{
         c.lib_, c.preset_, pred.ctime_ms_, pred.dtime_ms_, pred.ratio_,
@@ -101,7 +107,7 @@ Decision Ranker::Rank(const std::vector<Candidate> &candidates,
   // fallback only when no candidate is useful.
   const double raw_bw =
       store_bw != nullptr ? (*store_bw)(static_cast<uint64_t>(size)) : tier_bw;
-  const double raw_cost = load_mult * size_mb / raw_bw;
+  const double raw_cost = size_mb / raw_bw;
   const bool raw_wins =
       best < 0 ||
       (compare_raw && objective != "ratio" && best_cost >= raw_cost);

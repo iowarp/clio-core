@@ -155,13 +155,14 @@ ccm::Decision CcmManager::SelectCodec(const void *blob_data,
                                       double load_mult,
                                       double tier_bw_mb_ms,
                                       const std::function<double(uint64_t)>
-                                          *store_bw) {
+                                          *store_bw,
+                                      bool allow_raw) {
   Features features = ComputeFeatures(blob_data, size);
   // Copy what this decision needs and release config_lock_ at once: every
   // runtime worker selects through here, and holding the lock across the
   // filter and the ranking serialized all of them on a CPU-starved node.
   int stage_idx = -1;
-  double max_error = 0.0, net_bw_gbps = 0.0;
+  double max_error = 0.0, net_bw_gbps = 0.0, cpu_parallelism = 1.0;
   std::vector<std::string> comp_pref, allowlist;
   std::string objective;
   {
@@ -182,6 +183,7 @@ ccm::Decision CcmManager::SelectCodec(const void *blob_data,
     objective = !obj_override.empty() ? obj_override : config_->objective_;
     allowlist = config_->lossy_allowlist_;
     net_bw_gbps = config_->net_bw_gbps_;
+    cpu_parallelism = config_->cpu_parallelism_;
   }
   std::vector<CandidateRecord> rejected;
   auto filtered = candidates_.Filter(blob_name, comp_pref, max_error,
@@ -197,15 +199,16 @@ ccm::Decision CcmManager::SelectCodec(const void *blob_data,
   // Pass load_mult to scale compress+store cost terms (phase 3+)
   // A fixed CCM is the "always this codec" baseline: it never falls back to
   // raw on cost (only when the codec is not useful at all).
+  // allow_raw false: the caller weighs raw itself (joint placed choice).
   const bool compare_raw =
-      dynamic_cast<FixedPredictor *>(predictor_.get()) == nullptr;
+      allow_raw && dynamic_cast<FixedPredictor *>(predictor_.get()) == nullptr;
   auto decision = Ranker::Rank(ranked, features, size, predictor_.get(),
                                objective,
                                tier_bw_mb_ms > 0.0 ? tier_bw_mb_ms
                                                    : net_bw_gbps / 8.0,
                                load_mult,
                                ratio_noise_sigma, &rng_, compare_raw,
-                               store_bw);
+                               store_bw, cpu_parallelism);
   decision.qos_stage_index_ = stage_idx;
   decision.features_ = features;
   decision.candidates_.insert(decision.candidates_.end(), rejected.begin(),

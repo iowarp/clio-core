@@ -284,6 +284,9 @@ struct DtscheduleConfig {
   // again (features + ranking). 1 = decide every chunk. A decision is also
   // remade once it is older than load_period_ms.
   int decision_reuse_chunks_ = 32;
+  // Runtime workers that run codec work concurrently: the cost model divides
+  // compress/decompress time by it (the network and devices are shared).
+  double cpu_parallelism_ = 4.0;
 
   DtscheduleConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
 
@@ -529,6 +532,9 @@ struct DtscheduleConfig {
       const long long raw = node["min_compress_bytes"].as<long long>();
       min_compress_bytes_ = static_cast<int>(
           std::min<long long>(raw, std::numeric_limits<int>::max()));
+    }
+    if (node["cpu_parallelism"]) {
+      cpu_parallelism_ = std::max(1.0, node["cpu_parallelism"].as<double>());
     }
     if (node["decision_reuse_chunks"]) {
       decision_reuse_chunks_ =

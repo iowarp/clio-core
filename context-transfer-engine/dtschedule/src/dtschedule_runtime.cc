@@ -379,6 +379,7 @@ clio::run::TaskResume Runtime::PutBlob(
       uint32_t local_node_id = CLIO_IPC->GetNodeId();
       auto [cpu_a, age_a, known_a] = GetLoad(local_node_id);
       producer_cpu = cpu_a;
+      place.producer_cpu = cpu_a;
       // The tracked consumer's load (when known) is the other side of the
       // multiplier; with no consumer the put is local-only and m = 1.
       double cpu_b = cpu_a;
@@ -442,8 +443,18 @@ clio::run::TaskResume Runtime::PutBlob(
         }
       }
 
+      // Tiers are those of the node that will store the bytes: with
+      // dtschedule placement and a known remote consumer that is the
+      // consumer (scenarios 2/3; PlacedScenario prices the S1 alternative
+      // on this node's tiers), else the writer or the hash owner.
+      const bool consumer_dest =
+          config_.placement_ == "dtschedule" &&
+          config_.workflow_aware_ != "none" &&
+          place.consumer_node != UINT32_MAX &&
+          place.consumer_node != local_node_id;
       const uint32_t owner_for_tier =
-          (IsPlaced(task->blob_name_.str()) || place.owner_node == UINT32_MAX)
+          consumer_dest ? place.consumer_node
+          : (IsPlaced(task->blob_name_.str()) || place.owner_node == UINT32_MAX)
               ? local_node_id : place.owner_node;
       // Each candidate is priced at the tier its own stored size lands in
       // on the owner (raw may spill to NVMe while compressed fits in RAM).
@@ -457,7 +468,7 @@ clio::run::TaskResume Runtime::PutBlob(
       if (CompressionEnabled()) {
         decision = DecideCodec(task->tag_id_, src_ptr.ptr_, original_size,
                                match_name, load_mult, rank_bw_mb_ms,
-                               &store_bw, &reused);
+                               &store_bw, &reused, !consumer_dest);
       } else {
         decision.chosen_lib_.clear();  // raw; placement is still decided
         decision.pred_ratio_ = 1.0;
@@ -481,9 +492,12 @@ clio::run::TaskResume Runtime::PutBlob(
                 ? original_size
                 : static_cast<uint64_t>(original_size /
                                         std::max(decision.pred_ratio_, 1.0));
-        place.tier = ChooseTier(stored, owner_for_tier, /*reserve=*/true);
+        // With consumer placement the scenario picks the node; reserve there
+        // once it is known (below), not on the consumer up front.
+        place.tier = ChooseTier(stored, owner_for_tier, /*reserve=*/!consumer_dest);
         place.tier_score = TierScore(place.tier);
         place.tier_bw_mb_ms = TierBwMbPerMs(place.tier);
+        place.reserve_bytes = consumer_dest ? stored : 0;
       }
       if (task->score_ < 0.0f && place.tier_score >= 0.0f) {
         task->score_ = place.tier_score;  // never override an explicit score
@@ -498,6 +512,13 @@ clio::run::TaskResume Runtime::PutBlob(
                                  decision.pred_ctime_ms_, decision.pred_dtime_ms_,
                                  load_mult, place);
     place.scenario = choice.chosen_scenario;
+    if (choice.raw) {
+      decision.chosen_lib_.clear();  // the joint choice stores it raw
+      decision.pred_ratio_ = 1.0;
+      if (place.reserve_bytes > 0) {
+        place.reserve_bytes = original_size;
+      }
+    }
     place.cost1_ms = choice.cost1_ms;
     place.cost2_ms = choice.cost2_ms;
     place.cost3_ms = choice.cost3_ms;
@@ -514,6 +535,9 @@ clio::run::TaskResume Runtime::PutBlob(
                          !decision.chosen_lib_.empty() &&
                          place.consumer_node != UINT32_MAX &&
                          place.consumer_node != self_node;
+  if (place.reserve_bytes > 0 && (remote_s3 || to_consumer)) {
+    ChooseTier(place.reserve_bytes, place.consumer_node, /*reserve=*/true);
+  }
   if (remote_s3) {
     CLIO_CO_AWAIT(CompressAtConsumer(task, decision, original_size, &out, &place));
     if (placed && task->GetReturnCode() == 0) {
@@ -617,7 +641,8 @@ clio::run::TaskResume Runtime::PutBlob(
 ccm::Decision Runtime::DecideCodec(
     const TagId &tag_id, const char *src, size_t size,
     const std::string &match_name, double load_mult, double rank_bw_mb_ms,
-    const std::function<double(uint64_t)> *store_bw, bool *reused) {
+    const std::function<double(uint64_t)> *store_bw, bool *reused,
+    bool allow_raw) {
   // Chunks of one file share their data class, so the features and ranking
   // of one chunk hold for its neighbours. Deciding per chunk cost ~1.2 ms of
   // CPU per MiB on the writer: on a node whose cores the application holds,
@@ -642,7 +667,7 @@ ccm::Decision Runtime::DecideCodec(
   }
   ccm::Decision decision = ccm_manager_->SelectCodec(
       src, size, match_name, knobs_.ratio_noise_sigma_, load_mult,
-      rank_bw_mb_ms, store_bw);
+      rank_bw_mb_ms, store_bw, allow_raw);
   *reused = false;
   if (config_.decision_reuse_chunks_ > 1) {
     CachedDecision entry;
@@ -2676,6 +2701,89 @@ void Runtime::PlanTier(uint64_t size, Placement *place) const {
   place->tier_bw_mb_ms = TierBwMbPerMs(place->tier);
 }
 
+double Runtime::EffectiveParallelism(double cpu_pct) const {
+  const double par = std::max(config_.cpu_parallelism_, 1.0);
+  if (cpu_pct < 0.0) {
+    return par;
+  }
+  const double idle = std::clamp(1.0 - cpu_pct / 100.0, 0.0, 1.0);
+  return std::max(1.0, par * idle);
+}
+
+double Runtime::BottleneckMs(double d_mb, uint32_t node, double net_ms,
+                             double cpu_p_ms, double cpu_c_ms) {
+  const uint64_t bytes = static_cast<uint64_t>(d_mb * 1e6);
+  const double store_ms =
+      d_mb / std::max(TierBwMbPerMs(ChooseTier(bytes, node)), 1e-6);
+  const double worst = std::max({store_ms, net_ms, cpu_p_ms, cpu_c_ms});
+  // A small share of the total breaks ties toward options using less.
+  return worst + 0.01 * (store_ms + net_ms + cpu_p_ms + cpu_c_ms);
+}
+
+Runtime::ScenarioChoice Runtime::PlacedScenario(
+    double raw_mb, double z_mb, double ctime_ms, double dtime_ms,
+    double load_mult, const Placement &place, bool has_codec) {
+  // Joint codec x scenario choice when dtschedule places the bytes:
+  //   S1 store at the cheaper node (writer on ties), C reads it from there
+  //   S2 compress here (or not), ship, store at C (C reads locally)
+  //   S3 ship raw, compress and store at C
+  // Each option costs its bottleneck resource per chunk (BottleneckMs).
+  ScenarioChoice choice;
+  const uint32_t self = CLIO_IPC->GetNodeId();
+  const uint32_t C = place.consumer_node;
+  const double nb = std::max(config_.net_bw_gbps_, 0.01) / 8.0;
+  const double par_p = EffectiveParallelism(place.producer_cpu);
+  const double par_c = EffectiveParallelism(place.consumer_cpu);
+  double load_mult_c = 1.0;
+  if (place.consumer_cpu >= 0.0) {
+    load_mult_c = LoadMultiplier(place.consumer_cpu, place.consumer_cpu,
+                                 knobs_.load_aware_, config_.load_cap_);
+  }
+  auto s1 = [&](double d, double cpu_p, double cpu_c) {
+    // BestStoreNode's rule: the consumer's tier only on a clear win.
+    const auto tb = [&](uint32_t n) {
+      return d / std::max(TierBwMbPerMs(ChooseTier(static_cast<uint64_t>(d * 1e6), n)), 1e-6);
+    };
+    const uint32_t b = tb(C) + d / nb < 0.9 * tb(self) ? C : self;
+    const double net = (b == self ? 0.0 : d / nb) + (b == C ? 0.0 : d / nb);
+    return BottleneckMs(d, b, net, cpu_p, cpu_c);
+  };
+  auto s2 = [&](double d, double cpu_p, double cpu_c) {
+    return BottleneckMs(d, C, d / nb, cpu_p, cpu_c);
+  };
+  const double cp = has_codec ? ctime_ms * load_mult / par_p : 0.0;
+  const double dc = has_codec ? dtime_ms / par_c : 0.0;
+  const double raw1 = s1(raw_mb, 0.0, 0.0), raw2 = s2(raw_mb, 0.0, 0.0);
+  const double big = std::numeric_limits<double>::max();
+  const double z1 = has_codec ? s1(z_mb, cp, dc) : big;
+  const double z2 = has_codec ? s2(z_mb, cp, dc) : big;
+  const double z3 = has_codec
+      ? BottleneckMs(z_mb, C, raw_mb / nb, 0.0,
+                     (ctime_ms * load_mult_c + dtime_ms) / par_c)
+      : big;
+  choice.cost1_ms = std::min(raw1, z1);
+  choice.cost2_ms = std::min(raw2, z2);
+  choice.cost3_ms = z3;
+  const std::string &force = knobs_.force_scenario_;
+  if (force == "1" || force == "2" || force == "3") {
+    choice.chosen_scenario = force[0] - '0';  // forced runs keep their codec
+    choice.raw = !has_codec;
+    return choice;
+  }
+  // Ties go to S2 (the consumer reads locally), then S1, then S3.
+  const double best = std::min({choice.cost1_ms, choice.cost2_ms, z3});
+  if (choice.cost2_ms <= best) {
+    choice.chosen_scenario = 2;
+    choice.raw = raw2 <= z2;
+  } else if (choice.cost1_ms <= best) {
+    choice.chosen_scenario = 1;
+    choice.raw = raw1 <= z1;
+  } else {
+    choice.chosen_scenario = 3;
+  }
+  return choice;
+}
+
 Runtime::ScenarioChoice Runtime::SelectScenario(uint64_t size,
                                                 double pred_ratio,
                                                 double pred_ctime_ms,
@@ -2697,7 +2805,10 @@ Runtime::ScenarioChoice Runtime::SelectScenario(uint64_t size,
   auto net = [&](double mb, uint32_t a, uint32_t b) {
     return a == b ? 0.0 : mb / net_mb_ms;
   };
-  choice.cost1_ms = pred_ctime_ms * load_mult + net(z_mb, P, O) + store_ms;
+  // Codec work is shared by cpu_parallelism workers; links and devices are not.
+  const double par = std::max(config_.cpu_parallelism_, 1.0);
+  const double ct = pred_ctime_ms / par, dt = pred_dtime_ms / par;
+  choice.cost1_ms = ct * load_mult + net(z_mb, P, O) + store_ms;
   choice.cost2_ms = choice.cost1_ms;
   choice.cost3_ms = 0.0;
 
@@ -2705,7 +2816,11 @@ Runtime::ScenarioChoice Runtime::SelectScenario(uint64_t size,
     choice.chosen_scenario = 1;
     return choice;
   }
-  choice.cost1_ms += net(z_mb, O, C) + pred_dtime_ms;
+  if (config_.placement_ == "dtschedule") {
+    return PlacedScenario(raw_mb, z_mb, pred_ctime_ms, pred_dtime_ms,
+                          load_mult, place, pred_ratio > 1.0);
+  }
+  choice.cost1_ms += net(z_mb, O, C) + dt;
   choice.cost2_ms += net(raw_mb, P, C);
 
   // Phase 4c: Scenario 3 cost model.
@@ -2717,7 +2832,7 @@ Runtime::ScenarioChoice Runtime::SelectScenario(uint64_t size,
     load_mult_c = LoadMultiplier(place.consumer_cpu, place.consumer_cpu,
                                  knobs_.load_aware_, config_.load_cap_);
   }
-  choice.cost3_ms = net(raw_mb, P, C) + pred_ctime_ms * load_mult_c +
+  choice.cost3_ms = net(raw_mb, P, C) + ct * load_mult_c +
                     net(z_mb, C, O) + store_ms;
 
   const std::string &force = knobs_.force_scenario_;

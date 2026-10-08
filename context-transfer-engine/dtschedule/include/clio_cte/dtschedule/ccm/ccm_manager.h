@@ -117,7 +117,8 @@ class CcmManager {
                             double load_mult = 1.0,
                             double tier_bw_mb_ms = 0.0,
                             const std::function<double(uint64_t)> *store_bw =
-                                nullptr);
+                                nullptr,
+                            bool allow_raw = true);
 
   /**
    * Record observed compression performance.

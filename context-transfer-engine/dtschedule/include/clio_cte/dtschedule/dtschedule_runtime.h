@@ -83,6 +83,7 @@ struct CompressOutcome {
 struct Placement {
   uint32_t consumer_node = UINT32_MAX;  ///< tracked consumer, if any
   double consumer_cpu = -1.0;           ///< its last CPU sample (-1 = unknown)
+  double producer_cpu = -1.0;           ///< this node's last CPU sample
   uint32_t owner_node = UINT32_MAX;     ///< hash owner of the blob
   std::string tier;                     ///< chosen tier name
   float tier_score = -1.0f;             ///< its device score (-1 = unset)
@@ -96,6 +97,7 @@ struct Placement {
   bool dag_hit = false;                 ///< consumer came from the DAG spec
   int fanout = -1;                      ///< fan-out copies attempted (-1 = none)
   std::vector<uint32_t> dag_consumers;  ///< all consumer nodes from the DAG
+  uint64_t reserve_bytes = 0;      ///< Bytes to reserve once the store node is known
 };
 
 class Runtime : public clio::cte::core::CoreInterposer {
@@ -579,7 +581,7 @@ class Runtime : public clio::cte::core::CoreInterposer {
                             const std::string &match_name, double load_mult,
                             double rank_bw_mb_ms,
                             const std::function<double(uint64_t)> *store_bw,
-                            bool *reused);
+                            bool *reused, bool allow_raw = true);
   std::unordered_map<std::string, uint32_t> loc_cache_;  ///< blob -> node
   std::mutex loc_lock_;                    ///< Guards loc_cache_
   /** True when dtschedule (not the core's hash) places data chunks. */
@@ -700,6 +702,7 @@ class Runtime : public clio::cte::core::CoreInterposer {
     double cost1_ms = 0.0;     ///< S1 cost (ms)
     double cost2_ms = 0.0;     ///< S2 cost (ms)
     double cost3_ms = 0.0;     ///< S3 cost (ms)
+    bool raw = false;          ///< store uncompressed (placed mode only)
   };
 
   /**
@@ -727,6 +730,42 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * @param place Placement info (producer, consumer, owner nodes)
    * @return Scenario choice (scenario 1/2/3, with all costs)
    */
+  /**
+   * Scenario costs and choice when dtschedule owns placement (see the .cc).
+   * @param raw_mb Raw chunk size (MB)
+   * @param z_mb Predicted stored size (MB)
+   * @param ct Predicted compress time per worker share (ms)
+   * @param dt Predicted decompress time per worker share (ms)
+   * @param load_mult Producer load multiplier
+   * @param store_ms Time to store z on the chosen tier (ms)
+   * @param place Placement facts (consumer CPU)
+   * @param net_z_ms Network time for z bytes producer -> consumer (ms)
+   * @param net_raw_ms Network time for raw bytes producer -> consumer (ms)
+   * @return Costs and the chosen scenario
+   */
+  ScenarioChoice PlacedScenario(double raw_mb, double z_mb, double ctime_ms,
+                                double dtime_ms, double load_mult,
+                                const Placement &place, bool has_codec);
+  /**
+   * Bottleneck cost of storing d_mb at a node: the busiest resource's share
+   * per chunk (stages pipeline across chunks, so the slowest one sets the
+   * rate). Network terms on the one link add up.
+   * @param d_mb Stored bytes (MB)
+   * @param node Store node
+   * @param net_ms Network time of this option per chunk (ms)
+   * @param cpu_p_ms Producer CPU share per chunk (ms)
+   * @param cpu_c_ms Consumer CPU share per chunk (ms)
+   * @return Cost (ms)
+   */
+  double BottleneckMs(double d_mb, uint32_t node, double net_ms,
+                      double cpu_p_ms, double cpu_c_ms);
+  /**
+   * Runtime workers effectively free for codec work on a node with the given
+   * CPU utilisation (cpu_parallelism scaled by the idle fraction, >= 1).
+   * @param cpu_pct CPU utilisation percent (negative = unknown, treated idle)
+   * @return Effective parallelism
+   */
+  double EffectiveParallelism(double cpu_pct) const;
   ScenarioChoice SelectScenario(uint64_t size, double pred_ratio,
                                 double pred_ctime_ms, double pred_dtime_ms,
                                 double load_mult, const Placement &place);
