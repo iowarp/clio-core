@@ -500,6 +500,9 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     }
 
     // Worker sleep configuration
+    if (runtime["client_reap_grace_s"]) {
+      client_reap_grace_s_ = runtime["client_reap_grace_s"].as<u32>();
+    }
     if (runtime["first_busy_wait"]) {
       first_busy_wait_ = runtime["first_busy_wait"].as<u32>();
     }

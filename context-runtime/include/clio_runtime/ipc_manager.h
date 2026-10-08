@@ -1445,10 +1445,33 @@ class IpcManager {
    * Does not reap:
    * - Segments owned by the current process
    * - The main allocator segment (AllocatorId 1.0)
+   * - A dead owner that still has tasks in flight, or that was admitted or
+   *   last seen alive within runtime.client_reap_grace_s (#1192): those
+   *   tasks may hold raw pointers into its segments, and a pid that only
+   *   LOOKS dead (another pid namespace) keeps showing activity.
    *
    * @return Number of shared memory segments reaped
    */
   size_t WreapDeadIpcs();
+
+  /**
+   * Count one task admitted from SHM client `pid` as in flight (#1192).
+   * @param pid the client process
+   */
+  void AcquireClientInflight(u32 pid);
+
+  /**
+   * Drop one in-flight task of client `pid` (see ReleaseClientInflight).
+   * @param pid the client process
+   */
+  void ReleaseClientInflightCount(u32 pid);
+
+  /**
+   * Tasks of client `pid` currently in flight (for tests and diagnostics).
+   * @param pid the client process
+   * @return the count (0 for an unknown pid)
+   */
+  u64 GetClientInflight(u32 pid);
 
   /**
    * Reap all shared memory segments
@@ -1699,6 +1722,32 @@ class IpcManager {
   std::unordered_map<std::string, std::unique_ptr<ctp::lbm::ShmMpscTransport>>
       shm_conns_;
   std::mutex shm_conns_mutex_;
+#endif
+  // #1192: per-SHM-client activity, so WreapDeadIpcs never unmaps a segment
+  // an admitted task can still read.
+  struct ClientActivity {
+    u64 inflight = 0;       ///< admitted tasks not yet destroyed
+    u64 last_admit_ns = 0;  ///< steady clock, last admitted task
+    u64 dead_since_ns = 0;  ///< steady clock, first reap scan that saw it dead
+  };
+  std::unordered_map<u32, ClientActivity> client_activity_;
+  std::mutex client_activity_mu_;
+  /**
+   * Whether a dead client's segments may be reaped now: no task in flight,
+   * nothing admitted and dead for at least the grace period. Records the
+   * first time the pid was seen dead.
+   * @param pid the client process (already found dead)
+   * @param grace_ns the grace period
+   * @return true when reaping is safe
+   */
+  bool ClientReapable(u32 pid, u64 grace_ns);
+  /**
+   * Forget reaped clients: their activity entries and cached response-ring
+   * connections.
+   * @param pids the clients whose segments were just reaped
+   */
+  void ForgetReapedClients(const std::vector<u32> &pids);
+#if CTP_IS_HOST
 
   // The single named MPSC receive rings that replace the old per-thread servers.
   // Runtime: shm_in_server_ ("clio-<runtime_pid>-shm-in", ~128MB) receives every

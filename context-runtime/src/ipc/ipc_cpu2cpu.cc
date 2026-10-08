@@ -82,6 +82,10 @@ Future<Task> IpcCpu2Cpu::AdmitShm(LoadTaskArchive &archive) {
   auto fs = f.GetFutureShm();
   fs->origin_ = ClientOrigin::kClientShm;
   fs->client_pid_ = ti.task_id_.pid_;
+  // #1192: this task may read the client's SHM segments until it is gone;
+  // the reaper must not unmap them before then. Released by ~RunContext.
+  CLIO_IPC->AcquireClientInflight(fs->client_pid_);
+  fs->counts_client_inflight_ = true;
   // Preserve the CLIENT's response-matching key (issue #774 / #768). The
   // runtime repurposes task_id_.net_key_ for its own bookkeeping when the task
   // is forwarded cross-node (IpcManagerRun2Run::SendIn overwrites it with the
