@@ -3175,6 +3175,32 @@ ClientShmInfo IpcManager::GetClientShmInfo(u32 index) const {
 }
 
 namespace {
+/**
+ * Is the client process that owns a segment gone for reaping purposes?
+ * kill(pid, 0) alone is not enough: a zombie (exited, parent has not
+ * waited) still answers, yet it has released every fd, so its memfd
+ * segments are kept alive only by our mapping and are reclaimable. On
+ * Linux the state letter in /proc/<pid>/stat tells the two apart.
+ * @param pid the owning process id
+ * @return true when the process is dead or a zombie
+ */
+bool ClientProcessGone(int pid) {
+  if (!ctp::SystemInfo::IsProcessAlive(pid)) return true;
+#if defined(__linux__)
+  std::ifstream st("/proc/" + std::to_string(pid) + "/stat");
+  std::string line;
+  if (st && std::getline(st, line)) {
+    // "<pid> (<comm>) <state> ..." -- comm may contain spaces/parens, so
+    // take the state from after the LAST ')'.
+    auto rp = line.rfind(')');
+    if (rp != std::string::npos && rp + 2 < line.size()) {
+      return line[rp + 2] == 'Z';
+    }
+  }
+#endif
+  return false;
+}
+
 /** Steady-clock nanoseconds (the reaper's grace bookkeeping). */
 u64 SteadyNowNs() {
   return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3277,9 +3303,9 @@ size_t IpcManager::WreapDeadIpcs() {
       continue;
     }
 
-    // Check if the owning process is still alive -- and, if not, that none
-    // of its tasks can still be reading its segments (#1192).
-    if (!ctp::SystemInfo::IsProcessAlive(owner_pid) &&
+    // Reap only a client that is gone (dead or a zombie) and none of whose
+    // tasks can still be reading its segments (#1192).
+    if (ClientProcessGone(owner_pid) &&
         ClientReapable(static_cast<u32>(owner_pid), grace_ns)) {
       // Process is dead - mark for removal
       HLOG(kInfo,

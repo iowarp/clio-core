@@ -8,6 +8,7 @@ sequence.  They run on node 0 only (max_nodes=1).
 import errno
 import os
 import stat
+import time
 
 from suite import test, TestUnsupported
 
@@ -517,6 +518,82 @@ def t_many(ctx):
   ctx.metrics.update({'create_per_s': round(n / (t1 - t0)),
                       'readverify_per_s': round(n / (t2 - t1)),
                       'unlink_per_s': round(n / (t3 - t2))})
+
+
+def _nettrace_totals(cl):
+  """Cumulative cross-node message counters from every node's runtime log
+  when the daemons run with CLIO_NET_TRACE=1: {'sendin': requests sent,
+  'sendout': responses sent, 'recv': messages received}, summed over nodes.
+  The runtime dumps a line every 32 ops, so each figure is accurate to
+  32 per node. The logs are on NFS: wait a moment before sampling."""
+  import re
+  time.sleep(3)
+  tot = {'sendin': 0, 'sendout': 0, 'recv': 0}
+  pat = re.compile(r'\[NETTRACE (\w+)\] n=(\d+) .*sendout\(.*? n=(\d+)\) '
+                   r'recv\(.*? n=(\d+)\)')
+  for h in cl.hosts:
+    best = {'sendin': 0, 'sendout': 0, 'recv': 0}
+    try:
+      with open(cl.log_path(h, 'runtime'), errors='replace') as f:
+        for ln in f:
+          m = pat.search(ln)
+          if not m:
+            continue
+          tag, n, so, rc = m.group(1), int(m.group(2)), int(m.group(3)), \
+              int(m.group(4))
+          if tag == 'sendin':
+            best['sendin'] = max(best['sendin'], n)
+          best['recv'] = max(best['recv'], rc)
+          best['sendout'] = max(best['sendout'], so)
+    except OSError:
+      pass
+    for k in tot:
+      tot[k] += best[k]
+  return tot
+
+
+@test('many_small_files_traced', 'posix', max_nodes=1, timeout=1800)
+def t_many_traced(ctx):
+  """many_small_files with per-phase cross-node message counts (#1159):
+  the same 10k 1 KiB files from one client, and after each phase the
+  cluster-wide CLIO_NET_TRACE counters, so the metrics give requests sent,
+  responses sent and messages received PER OPERATION for create, for
+  stat+read, and for unlink, at this cluster size."""
+  n = 10000
+  cl = ctx.cl
+  ctx.metrics['cluster_nodes'] = len(cl.hosts)
+  ctx.ok(0, 'mkdir', path=ctx.p('d'))
+  snaps = [_nettrace_totals(cl)]
+  import time as _t
+  t0 = _t.time()
+  r = ctx.ok(0, 'create_many', dirpath=ctx.p('d'), prefix='f', count=n,
+             size=1024, seed=0, timeout=1200)
+  ctx.check(not r['fails'], f'create fails {r["fails"][:3]}')
+  t1 = _t.time()
+  snaps.append(_nettrace_totals(cl))
+  ctx.check(ctx.ok(0, 'scandir_count', path=ctx.p('d'), timeout=300) == n,
+            'readdir count')
+  r = ctx.ok(0, 'verify_many', dirpath=ctx.p('d'), prefix='f', count=n,
+             size=1024, timeout=1200)
+  ctx.check(not r['bad'], f'verify bad {r["bad"][:3]}')
+  t2 = _t.time()
+  snaps.append(_nettrace_totals(cl))
+  r = ctx.ok(0, 'unlink_many', dirpath=ctx.p('d'), prefix='f', count=n,
+             timeout=1200)
+  ctx.check(not r['fails'], f'unlink fails {r["fails"][:3]}')
+  t3 = _t.time()
+  snaps.append(_nettrace_totals(cl))
+  ctx.check(ctx.ok(0, 'listdir', path=ctx.p('d')) == [], 'dir not empty')
+  ctx.metrics.update({'create_per_s': round(n / (t1 - t0)),
+                      'readverify_per_s': round(n / (t2 - t1)),
+                      'unlink_per_s': round(n / (t3 - t2))})
+  for i, ph in enumerate(('create', 'readverify', 'unlink')):
+    for k in ('sendin', 'sendout', 'recv'):
+      d = snaps[i + 1][k] - snaps[i][k]
+      ctx.metrics[f'{ph}_{k}_per_op'] = round(d / n, 2)
+  if snaps[-1]['recv'] == 0 and len(cl.hosts) > 1:
+    ctx.note('no [NETTRACE] lines in the runtime logs: run the daemons with '
+             'CLIO_SUITE_PASS_CLIO_NET_TRACE=1 for the message counts')
 
 
 @test('fsx_random_ops', 'posix', max_nodes=1, timeout=1800)

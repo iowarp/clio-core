@@ -1051,3 +1051,60 @@ def t_parity_replaced_with_data_down(ctx):
   cl.agents.clear()
   _check_filesets(ctx, base, n, nfiles, logs, replies,
                   'after a crash restart with the rebuilt parity seated')
+
+
+# ---------------------------------------------------------------------------
+# A node cut off from the cluster while it stays alive (split brain)
+# ---------------------------------------------------------------------------
+def _partition_symmetric(cl, victim):
+  """Cut `victim` off: it cannot send to any other node and no other node
+  can send to it (the CLIO_TEST_PARTITION_FILE hook on every daemon). The
+  victim's daemon and FUSE mount stay alive, so its own clients keep
+  going against its local containers while the rest of the cluster
+  declares it dead and fails over to its successor."""
+  vid = cl.hosts.index(victim)  # node ids are the 0-based host indices
+  others = [h for h in cl.hosts if h != victim]
+  cl.partition(victim, [cl.hosts.index(h) for h in others])
+  for h in others:
+    cl.partition(h, [vid])
+
+
+@test('safe_partition_during_writes', 'safe', min_nodes=3,
+      redeploy_after=True, timeout=5400)
+def t_partition_during_writes(ctx):
+  """Split brain under load. Every node writes fsynced record files with a
+  data disk dead in every array; node1 is then cut off from the cluster
+  for 45 s while it stays up: the others declare it dead and fail over to
+  its successor, its own writer keeps hitting its local containers, and
+  writes to blobs homed elsewhere fail fast. After the partition heals
+  and the writers finish, every fsynced version must read back from
+  every node (an acknowledged write on either side of the split may never
+  be lost or shadowed by a stale copy), and a crash restart of the whole
+  cluster must keep it so."""
+  n = len(ctx.hosts)
+  cl = ctx.cl
+  victim = cl.hosts[1]
+  base = ctx.p('sp')
+  ctx.ok(0, 'mkdir', path=base)
+  for h in cl.hosts:
+    cl.kill_disk(h, 0)
+  th, replies, logs, nfiles = _writers(ctx, base, 150, 'split')
+  time.sleep(20)
+  t0 = time.time()
+  _partition_symmetric(cl, victim)
+  time.sleep(45)
+  for h in cl.hosts:
+    cl.heal(h)
+  ctx.metrics['partition_s'] = round(time.time() - t0, 1)
+  th.join(timeout=150 + 1200)
+  ctx.metrics['writer_errors'] = _writer_errors(replies, n)
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after a 45 s partition of node1 under degraded writes')
+  p = ctx.p('after_split')
+  ctx.ok(1, 'write_file', path=p, size=8 << 20, seed=29, fsync=True)
+  v = ctx.ok(0, 'verify_file', path=p, size=8 << 20, seed=29)
+  ctx.check(v['ok'], f'write on the rejoined node after the split: {v}')
+  restart_cluster(ctx, crash=True)
+  cl.agents.clear()
+  _check_filesets(ctx, base, n, nfiles, logs, replies,
+                  'after the split healed and a full crash restart')

@@ -344,6 +344,16 @@ IpcManagerRun2Run::SendInPlan IpcManagerRun2Run::SendInPlanReplica(
   // A dead (or test-partitioned) target either fails fast or waits in the
   // retry queue for the node to come back / the mapping to move (#856/#896).
   const bool partitioned = Run2RunTestPartitioned(out.target_node_id);
+  if (!partitioned && !ipc_manager->IsAlive(out.target_node_id) &&
+      origin_task->task_flags_.Any(TASK_LIVENESS_PROBE)) {
+    // #1222: a SWIM probe must reach a node we hold dead, or a node that
+    // only lost connectivity can never answer and REJOIN (the retry queue
+    // sends to live nodes only, and the dead node holds us dead too, so it
+    // never sends us the proof of life RecvIn would accept). The wire call
+    // itself still fails cleanly if the node really is gone.
+    out.action = SendInAction::kTransmit;
+    return out;
+  }
   if (!ipc_manager->IsAlive(out.target_node_id) || partitioned) {
     float net_timeout = origin_task->pool_query_.GetNetTimeout();
     const bool fail_fast = (net_timeout >= 0 && net_timeout < 0.001f) ||
