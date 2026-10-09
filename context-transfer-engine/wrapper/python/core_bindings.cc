@@ -399,7 +399,7 @@ NB_MODULE(clio_cte_core_ext, m) {
              nb::gil_scoped_release release;
              task.Wait();
            }
-           return task->return_code_;
+           return task->GetReturnCode();  // a u32: the atomic itself has no Python type
          },
          "target_name"_a, "bdev_type"_a, "total_size"_a,
          "target_query"_a, "bdev_id"_a,
@@ -414,7 +414,7 @@ NB_MODULE(clio_cte_core_ext, m) {
              nb::gil_scoped_release release;
              task.Wait();
            }
-           return task->return_code_;
+           return task->GetReturnCode();  // a u32: the atomic itself has no Python type
          },
          "target_name"_a, "bdev_type"_a, "total_size"_a,
          "Register a storage target with default query and pool ID. "
