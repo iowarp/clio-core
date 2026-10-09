@@ -131,8 +131,15 @@ Credentials and endpoints are resolved from the standard cloud environment at
 assimilation time (no secrets are placed in the OMNI file):
 
 - **S3:** `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`
-  (or profiles / instance roles), `AWS_DEFAULT_REGION`, and an optional
-  S3-compatible endpoint via `S3_ENDPOINT` or `AWS_ENDPOINT_URL` (e.g. MinIO).
+  (or a `~/.aws/credentials` profile via `AWS_PROFILE`), `AWS_DEFAULT_REGION`,
+  and an optional S3-compatible endpoint via `S3_ENDPOINT` or
+  `AWS_ENDPOINT_URL` (e.g. MinIO). Public buckets (e.g. the AWS Open Data
+  registry) are read unsigned, like `aws s3 --no-sign-request`: set
+  `AWS_NO_SIGN_REQUEST=1`, or configure no credentials at all and CAE falls
+  back to anonymous. A region is still required. Requests go through
+  `https_proxy` / `http_proxy` (minus `no_proxy`; loopback is always direct)
+  as with curl, which HPC compute nodes need to reach AWS. These variables are
+  read by the runtime process that runs the assimilator, not by `clio_cae`.
 - **GCS:** Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`,
   gcloud ADC, or the GCE/GKE metadata server), and an optional endpoint via
   `GCS_ENDPOINT` (e.g. fake-gcs-server).

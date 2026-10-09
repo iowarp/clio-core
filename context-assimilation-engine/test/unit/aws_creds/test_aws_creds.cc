@@ -150,4 +150,68 @@ TEST_CASE("aws_creds_secret_never_appears_in_error_text", "[aws_creds]") {
   REQUIRE(r.error.find("TOKEN_BENCH") == std::string::npos);
 }
 
+TEST_CASE("aws_creds_no_sign_request_forces_anonymous", "[aws_creds]") {
+  cae::AwsCredEnv env;
+  env.access_key = "AKIA_ENV";
+  env.secret_key = "SECRET_ENV";
+  env.no_sign_request = "1";
+  // Explicit opt-out beats keys in the env AND a profile in the file.
+  cae::AwsCredResult r =
+      cae::ResolveAwsCredentialsFrom("bench", "us-west-2", env, kCreds, kConfig);
+  REQUIRE(r.ok);
+  REQUIRE(r.creds.anonymous);
+  REQUIRE(r.creds.access_key.empty());
+  REQUIRE(r.creds.secret_key.empty());
+  REQUIRE(r.creds.session_token.empty());
+  REQUIRE(r.creds.region == "us-west-2");
+}
+
+TEST_CASE("aws_creds_no_sign_request_zero_still_signs", "[aws_creds]") {
+  cae::AwsCredEnv env;
+  env.no_sign_request = "0";
+  cae::AwsCredResult r =
+      cae::ResolveAwsCredentialsFrom("", "", env, kCreds, kConfig);
+  REQUIRE(r.ok);
+  REQUIRE_FALSE(r.creds.anonymous);
+  REQUIRE(r.creds.access_key == "AKIA_DEFAULT");
+}
+
+TEST_CASE("aws_creds_nothing_configured_falls_back_to_anonymous",
+          "[aws_creds]") {
+  cae::AwsCredEnv env;
+  env.region = "us-west-2";
+  // No env keys, no profile named, no credentials file at all.
+  cae::AwsCredResult r = cae::ResolveAwsCredentialsFrom("", "", env, "", "");
+  REQUIRE(r.ok);
+  REQUIRE(r.creds.anonymous);
+  REQUIRE(r.creds.region == "us-west-2");
+  // A credentials file that only has other profiles is still "nothing" for
+  // the default profile.
+  const char* other_only =
+      "[bench]\naws_access_key_id = A\naws_secret_access_key = B\n";
+  cae::AwsCredResult r2 =
+      cae::ResolveAwsCredentialsFrom("", "", env, other_only, "");
+  REQUIRE(r2.ok);
+  REQUIRE(r2.creds.anonymous);
+}
+
+TEST_CASE("aws_creds_named_missing_profile_never_goes_anonymous",
+          "[aws_creds]") {
+  cae::AwsCredEnv env;
+  env.profile = "nope";  // named via AWS_PROFILE, so the caller meant to sign
+  cae::AwsCredResult r =
+      cae::ResolveAwsCredentialsFrom("", "us-east-1", env, kCreds, kConfig);
+  REQUIRE_FALSE(r.ok);
+  REQUIRE_FALSE(r.creds.anonymous);
+  REQUIRE(r.error.find("nope") != std::string::npos);
+}
+
+TEST_CASE("aws_creds_anonymous_still_needs_a_region", "[aws_creds]") {
+  cae::AwsCredEnv env;
+  env.no_sign_request = "1";
+  cae::AwsCredResult r = cae::ResolveAwsCredentialsFrom("", "", env, "", "");
+  REQUIRE_FALSE(r.ok);
+  REQUIRE(r.error.find("region") != std::string::npos);
+}
+
 SIMPLE_TEST_MAIN()
