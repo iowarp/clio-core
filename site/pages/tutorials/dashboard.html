@@ -1,0 +1,107 @@
+<!--
+title: Navigate the dashboard
+heading: Navigate <em>the dashboard.</em>
+description: Open the CLIO Core runtime dashboard, tour the Cluster, Pools and Config pages, read the storage tier roster, and create a pool from the browser.
+eyebrow: Tutorial · Explore
+lede: Every runtime serves a web dashboard. You don't install or run anything extra. It shows your nodes, worker threads and storage tiers, refreshes every two to five seconds, and can add or remove pools.
+facts: Time | 10 minutes ; Address | http://127.0.0.1:8080 ; Authentication | None, so keep it on loopback
+-->
+<h2>1. Open it</h2>
+<pre data-label="shell">
+$ clio_run start &
+</pre>
+<p>The runtime logs where the dashboard listens:</p>
+<pre data-label="output">
+Viz: dashboard listening at http://127.0.0.1:8080
+</pre>
+<p>Open that address. The navigation bar has three tabs, <strong>Cluster</strong>, <strong>Pools</strong> and <strong>Config</strong>, and a connection indicator.</p>
+<div class="tabs" data-label="Where the runtime runs">
+  <section class="tab-panel" data-tab="Another port"><p class="tab-title">Another port</p>
+<pre data-label="shell">
+$ clio_run start --viz-port 9000 &
+</pre></section>
+  <section class="tab-panel" data-tab="Remote host"><p class="tab-title">Remote host</p>
+<pre data-label="shell">
+# On your laptop, then open http://127.0.0.1:8080 locally
+$ ssh -L 8080:127.0.0.1:8080 user@node1
+</pre></section>
+  <section class="tab-panel" data-tab="Docker"><p class="tab-title">Docker</p>
+<pre data-label="yaml">
+services:
+  iowarp:
+    image: iowarp/deploy-cpu:latest
+    environment:
+      - CLIO_VIZ_BIND=0.0.0.0
+    ports:
+      - "9413:9413"
+      - "8080:8080"
+    command: ["clio_run", "start"]
+</pre></section>
+</div>
+<div class="callout warn">
+  <span class="callout-title">No authentication</span>
+  <p>Anyone who can reach the dashboard can create and destroy pools. It listens on loopback by default. Do not bind it to a public interface without a reverse proxy that controls access.</p>
+</div>
+
+<h2>2. Cluster</h2>
+<p>The landing page shows one card per node, with its IP address, whether it is alive, and <em>leader</em> or <em>this node</em> badges. On a laptop there is a single card.</p>
+<p>Below the cards, <strong>This node</strong> shows CPU and memory meters and a summary of worker tasks: how many are queued, blocked and processed. Click a node card to open its page. There you see utilization and a per-worker table with columns <em>worker</em>, <em>active</em>, <em>queued</em>, <em>blocked</em>, <em>periodic</em>, <em>retry</em>, <em>processed</em>, <em>load</em> and <em>suspend µs</em>.</p>
+<ul class="checks">
+  <li>Tasks pile up in <em>queued</em>: the workers cannot keep up. Add worker threads in <code>runtime</code> settings.</li>
+  <li>Many <em>blocked</em> tasks: work is waiting on I/O, often a slow tier.</li>
+</ul>
+
+<h2>3. Pools</h2>
+<p>Everything composed on this node, grouped by module. With the default configuration you see these groups:</p>
+<ul>
+  <li><code>clio_admin</code>, the runtime itself</li>
+  <li><code>clio_bdev</code>, the block devices: the default DRAM device and one per storage tier</li>
+  <li><code>clio_cte_core</code>, the storage engine</li>
+  <li><code>clio_cte_cache</code>, <code>clio_cte_indexer</code> and <code>clio_cte_replication</code>, the layers of the module chain</li>
+  <li><code>clio_cte_stream</code>, which keeps file sizes and orders appends</li>
+  <li><code>clio_cae_core</code>, for imports</li>
+  <li><code>clio_cte_filesystem</code>, which the FUSE mount drives</li>
+</ul>
+<p>Click a card to open that pool's page:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Module</th><th>Its page shows</th></tr></thead>
+  <tbody>
+    <tr><td><code>clio_cte_core</code></td><td>The <strong>tier roster</strong>: each tier's score, free space, capacity, latency, bandwidth, and bytes read and written. It also has <strong>register</strong> and <strong>unregister</strong> buttons.</td></tr>
+    <tr><td><code>clio_bdev</code></td><td>One block device: a capacity meter and full statistics (bandwidth, latency, operations).</td></tr>
+    <tr><td><code>clio_safe_bdev</code></td><td>Array members and recovery progress, with add, replace and remove.</td></tr>
+    <tr><td>Any other module</td><td>Identity, the scheduler's learned task-time predictions, and a box for running the pool's monitor queries.</td></tr>
+  </tbody>
+</table></div>
+<p>The <strong>×</strong> in a card's corner destroys that pool, after you confirm. The admin pool cannot be destroyed, since it is the runtime itself.</p>
+
+<h2>4. Config</h2>
+<p>Key settings the daemon <em>actually</em> came up with, after the config file, environment variables and command-line flags were applied: ports, hostfile, worker counts, scheduler, dashboard address and loaded modules. It also lists every REST endpoint and which module registered it. Check here first when a setting seems to have no effect.</p>
+
+<h2>5. Watch real work</h2>
+<p>With the filesystem mounted, keep the dashboard open and copy something in:</p>
+<pre data-label="shell">
+$ cp -r ~/datasets/era5-sample ~/clio-mnt/
+</pre>
+<ol class="steps">
+  <li><p><strong>Cluster → This node</strong>: the <em>processed</em> count climbs and the worker meters move.</p></li>
+  <li><p><strong>Pools → clio_cte_core</strong>: the RAM tier's free space drops, then the persistent disk tier's <em>bytes written</em> grows as replicas land.</p></li>
+  <li><p><strong>Pools → clio_bdev</strong>: the block device's capacity meter fills.</p></li>
+</ol>
+
+<h2>6. Create a pool from the browser</h2>
+<ol class="steps">
+  <li><p>On <strong>Pools</strong>, click <strong>Add Pool</strong> and choose <code>clio_bdev</code>.</p></li>
+  <li><p>Fill in the form: <strong>pool_name</strong> <code>ram::scratch</code>, keep the suggested <strong>pool_id</strong>, <strong>bdev_type</strong> <code>ram</code>, <strong>capacity</strong> <code>256MB</code>.</p></li>
+  <li><p>Click <strong>Validate</strong>. Each field is checked, nothing is created, and errors come back per field.</p></li>
+  <li><p>Click <strong>Create</strong>. A new card appears under <code>clio_bdev</code>. Click it to watch the device.</p></li>
+</ol>
+<p>Modules with a form (block devices, safe block devices, the CTE core) get typed fields. Other modules get a compose editor: identity fields plus a YAML box. Anything you could put in <code>clio.yaml</code>'s <code>compose</code> section works there. S3 and GCS block devices are left out of the form, because they need credentials. Compose those from a file (see <a href="/tutorials/cloud-storage.html">cloud storage</a>).</p>
+
+<h2>Scripting the same data</h2>
+<p>Each page reads a small REST API that you can call yourself:</p>
+<pre data-label="shell">
+$ curl -s http://127.0.0.1:8080/api/health
+$ curl -s http://127.0.0.1:8080/api/pools | python -m json.tool
+$ curl -s http://127.0.0.1:8080/api/topology     # node ids for /api/nodes/{node}/...
+</pre>
+<p>Other routes include <code>/api/config</code>, <code>/api/nodes/{node}/bdevs</code>, <code>/api/nodes/{node}/workers</code> and <code>/api/nodes/{node}/system_stats</code>. To turn the dashboard off, use <code>clio_run start --no-viz</code>.</p>

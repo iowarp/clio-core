@@ -1,0 +1,41 @@
+<!--
+title: Introduction
+heading: What CLIO Core <em>does for you.</em>
+description: CLIO Core is a tiered context store for scientific data, used mostly as a FUSE filesystem and searched from Python.
+eyebrow: Docs
+lede: CLIO Core stores your data across RAM, NVMe and disk, mounts that storage as a normal directory, and indexes what you write so you can search it from Python.
+facts: Written for | Scientists, HPC users and developers ; Works on | Linux, macOS, Windows ; License | BSD 3-Clause
+-->
+<h2>The short version</h2>
+<p>Most people use CLIO Core as a <strong>filesystem</strong>. You start one background process, the runtime, and mount a directory. Anything that can open a file can then use it: shell tools, Python, Jupyter, simulation codes and visualization tools.</p>
+<p>Under that directory, CLIO Core decides where each piece of data lives. Recently used data stays in RAM. Colder data moves to NVMe or disk. A persistent copy protects it across restarts. An index records the words in each file, so you can later ask "which files mention sea ice extent?" and get a ranked answer.</p>
+
+<h2>What you can do with it</h2>
+<div class="card-list">
+  <a href="/docs/basic-usage.html"><span class="feature-index">01</span><h3>Mount a filesystem</h3><p>Start the runtime, mount a directory, copy data in, and unmount. Takes about five minutes.</p></a>
+  <a href="/tutorials/compose.html"><span class="feature-index">02</span><h3>Compose storage tiers</h3><p>Combine RAM, NVMe, SSD and disk in one store with a short YAML file.</p></a>
+  <a href="/tutorials/python-semantic-query.html"><span class="feature-index">03</span><h3>Search from Python</h3><p>Find files by keyword relevance or name pattern, and read them back.</p></a>
+  <a href="/tutorials/dashboard.html"><span class="feature-index">04</span><h3>Watch the runtime</h3><p>See nodes, workers and storage tiers live in the built-in web dashboard.</p></a>
+</div>
+
+<h2>How the pieces fit</h2>
+<p>You will see these names in commands and logs:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Name</th><th>What it is</th><th>You meet it as</th></tr></thead>
+  <tbody>
+    <tr><td>Runtime</td><td>The background process on each node. It hosts every other component.</td><td><code>clio_run start</code></td></tr>
+    <tr><td>CTE</td><td>The Context Transfer Engine: tiered storage of <em>tags</em> (named containers) and <em>blobs</em> (named byte ranges).</td><td>Storage tiers in <code>clio.yaml</code></td></tr>
+    <tr><td>Filesystem</td><td>A POSIX namespace built from CTE tags. Every file is a tag, and its data is stored as 1 MiB page blobs.</td><td><code>clio_cte_fuse</code></td></tr>
+    <tr><td>Indexer</td><td>Keeps a keyword (BM25) index of what is written, for search.</td><td><code>SemanticSearch</code> in Python</td></tr>
+    <tr><td>CAE</td><td>The Context Assimilation Engine imports external data: files, HDF5, S3 and Google Cloud Storage.</td><td><code>AssimilationCtx</code></td></tr>
+    <tr><td>CEE</td><td>The Context Exploration Engine: a high-level API to bundle, query and retrieve.</td><td><code>import clio_cee</code></td></tr>
+  </tbody>
+</table></div>
+<p>The <a href="/docs/concepts.html">core concepts</a> page explains tags, blobs, scores and pools in more depth. The <a href="/design/index.html">design</a> section covers the internals.</p>
+
+<h2>Where to start</h2>
+<ol class="steps">
+  <li><h3>Install</h3><p><code>pip install iowarp-core</code> works on most workstations. See <a href="/docs/installation.html">Installation</a> for conda, Docker, Spack and source builds.</p></li>
+  <li><h3>Mount and copy a file</h3><p>Follow <a href="/docs/basic-usage.html">Basic usage</a> end to end.</p></li>
+  <li><h3>Shape your storage</h3><p>Use <a href="/tutorials/compose.html">Compose local tiers</a> when the defaults no longer fit.</p></li>
+</ol>

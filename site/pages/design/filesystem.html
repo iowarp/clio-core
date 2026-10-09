@@ -1,0 +1,398 @@
+<!--
+title: Filesystem design
+heading: The filesystem: clio-fs and FUSE
+description: Design of clio-fs, the distributed POSIX namespace built on CTE tags and blobs, and the FUSE daemon that mounts it.
+eyebrow: Design
+lede: clio-fs is a POSIX-shaped, distributed namespace built entirely out of CTE tags and blobs. It has no metadata server and no separate namespace log: directories, inodes and file data are all ordinary blobs, so they inherit the CTE's tiering, replication and durability. The FUSE daemon <code>clio_cte_fuse</code> mounts it as a normal directory on Linux, macOS and Windows.
+-->
+<h2 id="layers">Layers</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 330" role="img" aria-label="Filesystem layering">
+    <defs><marker id="ah5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="16" width="250" height="56" rx="8"/><text class="title" x="36" y="40">Unmodified applications</text><text class="muted" x="36" y="58">through the kernel VFS</text>
+    <rect class="box alt" x="300" y="16" width="250" height="56" rx="8"/><text class="title" x="316" y="40">LD_PRELOAD interceptors</text><text class="muted" x="316" y="58">POSIX, STDIO, MPI-IO, HDF5 VFD</text>
+    <rect class="box hl" x="20" y="100" width="250" height="56" rx="8"/><text class="title" x="36" y="124">FUSE daemon</text><text class="muted" x="36" y="142">libfuse3 / macFUSE / WinFsp</text>
+    <rect class="box hl" x="20" y="184" width="530" height="56" rx="8"/><text class="title" x="36" y="208">Filesystem client</text><text class="muted" x="36" y="226">descriptor table, write-behind, zero-IPC read and stat mirrors</text>
+    <rect class="box hl" x="20" y="268" width="250" height="52" rx="8"/><text class="title" x="36" y="292">Filesystem ChiMod</text><text class="muted" x="36" y="310">directories, inodes, handles</text>
+    <rect class="box" x="300" y="268" width="120" height="52" rx="8"/><text class="title" x="314" y="298">Stream</text>
+    <rect class="box" x="440" y="268" width="400" height="52" rx="8"/><text class="title" x="456" y="292">CTE chain (cache → … → core)</text><text class="muted" x="456" y="310">pages, directory blocks, inode records</text>
+    <path class="edge" d="M145,72 L145,98" marker-end="url(#ah5)"/>
+    <path class="edge" d="M145,156 L145,182" marker-end="url(#ah5)"/>
+    <path class="edge" d="M425,72 L425,182" marker-end="url(#ah5)"/>
+    <path class="edge" d="M145,240 L145,266" marker-end="url(#ah5)"/>
+    <path class="edge" d="M360,240 L360,266" marker-end="url(#ah5)"/>
+    <path class="edge" d="M500,240 L560,266" marker-end="url(#ah5)"/>
+    <path class="edge" d="M270,294 L298,294" marker-end="url(#ah5)"/>
+    <path class="edge" d="M420,294 L438,294" marker-end="url(#ah5)"/>
+  </svg>
+  <figcaption>The FUSE daemon and the interceptors share one client
+  library. Namespace operations go to the filesystem ChiMod, sizes and
+  appends go to Stream, and file pages go straight down the CTE chain.</figcaption>
+</figure>
+
+<h2 id="namespace">Namespace model</h2>
+
+<h3>Every object is a tag</h3>
+<p>Every file, directory and symbolic link is a CTE tag. The tag's
+identifier doubles as the inode number, so <code>stat</code> and
+<code>readdir</code> always agree. Identifiers are minted per container
+and also encode the container that <em>serves</em> the inode, its
+<strong>home</strong>. Ids are handed out only below a durably stored
+high-water mark, so a restart never reissues a live inode number.</p>
+
+<h3>Files: data pages plus an inode record</h3>
+<ul>
+  <li><strong>Data</strong> lives in the file's tag as 1 MiB page blobs
+  named by page index. Sparse files need no special handling: a missing
+  page is a hole and reads as zeros. Any other read failure is an I/O
+  error, never zeros.</li>
+  <li><strong>Attributes</strong> live in a small inode-record blob in the
+  same tag: type, size snapshot, link count, mode, owner, the three times,
+  flags, and the symbolic link target if there is one.</li>
+  <li><strong>Extended attributes</strong> live in one global tag, one blob
+  per file, kept out of the file's own tag so they do not distort its
+  size.</li>
+  <li><strong>The logical size</strong> lives in the
+  <a href="chain.html#stream">stream</a> for that file, not in the tag.
+  Writes raise it, truncates set it, appends reserve it. The inode
+  record's size snapshot is used only to reconcile after a restart or
+  failover.</li>
+</ul>
+<p>Writes preallocate space for growth, doubling up to 64 KiB. A flat
+64 KiB per page once made the RAM tier hold about three times the data
+written.</p>
+
+<h3>Directories: extendible-hash blocks</h3>
+<p>A directory is a tag whose entries live in <em>directory block</em>
+blobs. Block 0 also carries the directory's header: parent, own name, mode
+and owner, times.</p>
+<ul>
+  <li>Names are placed by a hash. When a block exceeds a threshold (1024
+  entries by default), half its names move to a new block determined by
+  the next hash bit. Blocks never merge.</li>
+  <li>A lookup walks down from block 0 using the name's hash bits. No
+  separate block directory has to be kept consistent.</li>
+  <li>Each entry has a state: <em>live</em>, <em>pending</em> (reserved by
+  an operation in progress, and invisible) or <em>leaving</em> (being
+  removed or moved, still visible, frozen).</li>
+  <li>The durable image of a block stores pending entries as absent and
+  leaving entries as live. After a crash, any half-done multi-step
+  operation is therefore simply aborted.</li>
+  <li>Block images are padded to powers of two so that rewrites do not
+  fragment into many small extents. This alone took file creation from 63
+  to 893 per second.</li>
+</ul>
+<p>Because blocks are keyed by the directory's identifier and not its
+path, <strong>renaming a directory moves one entry</strong>. Its subtree
+does not move, so directory rename is constant-time at any depth.</p>
+
+<h3>Path resolution is local</h3>
+<p>Every path-based request is sent to the <em>local</em> filesystem
+container. That container resolves the path component by component from
+its own cache of directory blocks. Blocks this node does not own are
+fetched from their home once, and this node registers as a
+<em>holder</em> that the home will push changes to. A warm path walk
+therefore costs no I/O and no network round trip.</p>
+<p>Every name is also published, asynchronously and in batches, as a CTE
+tag name. CTE search, query and the indexer therefore see real paths. This
+mirror is eventually consistent. The directory blocks remain the
+authority.</p>
+
+<h2 id="distribution">Where things live in a cluster</h2>
+<table>
+  <tr><th>State</th><th>Home</th></tr>
+  <tr><td>Directory block</td><td>The CTE owner of that block's blob, a hash of (directory, block number)</td></tr>
+  <tr><td>Inode (attributes, links, open handles, stream)</td><td>Chosen by hashing the file's path <em>at creation</em> and encoded in its identifier. A later rename does not move it.</td></tr>
+  <tr><td>Open file handle</td><td>The inode's home, encoded in the handle, so reads, writes and close go straight there</td></tr>
+  <tr><td>File data pages</td><td>The CTE owner of each page blob, hashed per page</td></tr>
+</table>
+<p>Homing inodes by the file's own path, rather than its directory, was a
+deliberate change. Previously every file in a directory landed on one
+container: 264 of 264 files on one node in a stress test, which created a
+hotspot. Data pages hash independently of inodes, so one large file's
+bandwidth spreads across the cluster.</p>
+<p>The namespace went through three designs before this one: a single
+metadata home on container 0, then hash sharding with per-node namespace
+logs, and finally the current directory blocks stored as CTE blobs.</p>
+<p>When a home's node is dead, its first live successor serves in its
+place. The successor loads the blocks and inode records from the CTE,
+which replication keeps reachable.</p>
+
+<h2 id="ops">Operations</h2>
+
+<h3>Create and open</h3>
+<p>Creating a file does three things, in order:</p>
+<ol>
+  <li>Mints an identifier homed by the file's path.</li>
+  <li>Stores the inode record, before the name exists anywhere.</li>
+  <li>Publishes the name to the parent's directory block, as an exclusive
+  insert.</li>
+</ol>
+<p>If the name was taken in the meantime, the record is discarded. Of
+<em>N</em> racing creators anywhere in the cluster, exactly one wins,
+which is what <code>O_EXCL</code> requires. A second step on the inode's
+home allocates the handle and applies <code>O_TRUNC</code>. If a racing
+rename removes the inode between the two steps, the open re-resolves and
+retries.</p>
+
+<h3>Directories</h3>
+<ul>
+  <li><strong>mkdir</strong> reserves the name as pending, creates the new
+  directory's first block on its own home, then commits or rolls back the
+  entry.</li>
+  <li><strong>rmdir</strong> marks the entry as leaving and seals every
+  block of the target directory. Sealing succeeds only if all of them are
+  empty; pending entries count as non-empty. The blocks are then dropped
+  and the entry removed. A racing create into a sealed block fails with
+  ENOENT.</li>
+  <li><strong>readdir</strong> loads every block and takes one consistent
+  snapshot, retrying if a block changed during collection. Pending
+  entries, and leaving entries for names that are live elsewhere, are
+  hidden. The listing is returned whole, not paged.</li>
+</ul>
+
+<h3>Rename</h3>
+<p>Rename is a multi-step protocol, not one atomic transaction. The design
+makes every intermediate state either invisible or harmless.</p>
+<ul>
+  <li><strong>Files.</strong>
+    <ol>
+      <li>Freeze the source entry.</li>
+      <li>Raise the inode's link count.</li>
+      <li>Insert at the destination, replacing a non-directory.</li>
+      <li>Remove the source.</li>
+      <li>Drop the extra link, unlink the replaced file, and publish one
+      tag-name change.</li>
+    </ol>
+  </li>
+  <li><strong>Directories.</strong> Freeze the source, then walk parent
+  pointers from the destination up to the root. Meeting the directory
+  being moved means EINVAL, because it would move into its own subtree.
+  Meeting an ancestor that is itself moving means EBUSY. Then seal an empty
+  destination directory if one is being replaced, move the single entry,
+  and update the moved directory's parent pointer.</li>
+  <li><strong>Crossing renames back off.</strong> Two-party operations that
+  collide (for example renames in opposite directions) get EBUSY, roll back
+  completely, and retry after a randomized back-off of 20 µs to 2 ms. This
+  prevents both deadlock and directory cycles.</li>
+</ul>
+<div class="callout warn">
+  <p><strong>Atomicity caveat.</strong> During a file rename, the inode is
+  briefly reachable under both names. <code>readdir</code> hides the
+  duplicate. After a crash in that window, the file can come back under
+  both names as two consistent hard links. The link count was raised
+  first, so the result is a leak, never a dangling name.
+  <code>RENAME_EXCHANGE</code> is not supported. <code>RENAME_NOREPLACE</code>
+  is implemented as probe-then-rename, which leaves a small race
+  window.</p>
+</div>
+
+<h3>Unlink and orphans</h3>
+<p>Unlink removes the name and lowers the link count on the inode's home.
+At zero links with no open handles, the inode is queued for purge. With
+handles still open, it becomes an <em>orphan</em> and is destroyed at the
+last close. The orphan list is persisted, so a restart destroys any
+orphans left behind (handles do not survive a restart).</p>
+<p>Purges are batched: every 20 ms each container receives one message
+listing up to 512 dead inodes, and deletes their pages locally. Before
+this change, every unlink was a cluster-wide broadcast, and
+<code>tar</code> extraction on four nodes took 45 s instead of 3 s.</p>
+
+<h3>Truncate</h3>
+<p>A truncate does the following, in order:</p>
+<ol>
+  <li>Sets the stream size.</li>
+  <li>Truncates the boundary page and physically zeroes the part that
+  survives beyond the new size, so a later extension cannot expose old
+  bytes.</li>
+  <li>Deletes the whole pages beyond the new size. It probes past the
+  recorded end, because clients push sizes lazily and stored pages can
+  outrun the recorded size.</li>
+</ol>
+
+<h3>Permissions</h3>
+<p>The ChiMod stores mode, owner and group but does not enforce them.
+Enforcement is delegated to the kernel: on Linux the daemon mounts with
+<code>default_permissions</code> unless that is turned off. Access times
+follow <code>relatime</code> by default.</p>
+
+<h3>Not provided</h3>
+<p>Advisory locks (<code>flock</code>, <code>fcntl</code>), hole punching
+and range collapse or insert, <code>RENAME_EXCHANGE</code>, and paged
+<code>readdir</code>.</p>
+
+<h2 id="consistency">Consistency model</h2>
+
+<h3>Server side: one writer per object, push before acknowledge</h3>
+<p>Each directory block and each inode has exactly one home that applies
+every change to it. A change works like this:</p>
+<ol>
+  <li>The home bumps the object's version.</li>
+  <li>It writes the blob if the durable image changed.</li>
+  <li>It pushes the change to every holder that caches the object.</li>
+  <li>Only then does it acknowledge.</li>
+</ol>
+<p>Commits for one object are grouped: one is in flight at a time, and
+changes that arrive in the meantime ride the next one. Holders apply a
+pushed change only if it matches the version they have, and on a gap they
+drop their copy and refetch it.</p>
+<p>As a result, when a namespace operation returns, every node that caches
+the affected state already sees the change. For single-object operations
+that is close to linearizable.</p>
+
+<h3>Leases bound staleness</h3>
+<p>A cached copy is trusted for a 10-second lease. After that it is
+revalidated against the home. If the home cannot be reached, the
+operation <strong>fails rather than serving possibly stale data</strong>.
+In the other direction, a home never stops pushing to a holder whose lease
+might still be running. It waits out an unreachable holder, plus 2 seconds
+of slack for clock skew.</p>
+<div class="callout warn">
+  <p><strong>Cost of the lease design.</strong> While a node holding
+  cached state is partitioned or dead but not yet declared dead, mutations
+  of that state can block for up to about 12 seconds. The design chooses
+  "slow but correct" over "fast but stale".</p>
+</div>
+
+<h3>Restarts cannot resurrect stale caches</h3>
+<p>When a home reloads an object from its blob after a restart, it jumps
+the object's version far ahead (by 2³²) and persists that before serving.
+A cached copy that was ahead of the blob therefore cannot pass as
+current. The home's first commit after a restart pushes a full snapshot to
+every container, because it no longer knows who held the object.</p>
+
+<h3>Client side: where POSIX is relaxed</h3>
+<table>
+  <tr><th>Mechanism</th><th>Behavior</th><th>Scope</th></tr>
+  <tr><td>Shared-memory attribute mirror</td><td>The runtime publishes per-path records that clients read lock-free. A generation counter invalidates a subtree after a directory rename. Records for complete directories make "not found" authoritative without asking the server.</td><td>Single-node by default</td></tr>
+  <tr><td>Write-behind</td><td><code>write()</code> can return before the runtime has the bytes. Failures latch per file and surface at <code>fsync</code> or <code>close</code>, like kernel writeback errors. Reads see in-flight bytes.</td><td>On by default</td></tr>
+  <tr><td>Close-to-open</td><td>Closing a file drains its pages, merges deferred appends and publishes its size, so the next opener anywhere sees the result.</td><td>Multi-node, or when the handle wrote</td></tr>
+</table>
+<p>Overlapping writes from different clients that have not been synced
+are <em>not</em> ordered last-writer-wins. Applications that write the same
+range from several nodes must synchronize themselves, as they would on
+most parallel filesystems.</p>
+
+<h2 id="durability">Durability and crash consistency</h2>
+<p>The namespace persists exactly as far as the CTE persists its blobs, and
+file sizes persist through the stream log. Every namespace operation
+stores the inode records it changed before it acknowledges, and reports
+ENOSPC or EIO if that store fails. Metadata is placed on a non-volatile
+tier when one exists. A device-level flush, however, happens only on
+<code>fsync</code>.</p>
+<p>The crash-consistency techniques:</p>
+<ul>
+  <li>The inode record is written before its name is published, so names
+  never point at missing inodes.</li>
+  <li>Durable directory images abort in-flight multi-step operations.</li>
+  <li>A block split writes the new child block before the parent records
+  the deeper split. A crash leaves an unreachable block, never a lost
+  entry.</li>
+  <li>Link counts are raised before names are added, so a crash can leak a
+  count but never leave a dangling name.</li>
+  <li>A directory whose entry exists but whose blocks are missing (a crash
+  between the two halves of rmdir) is repaired on the next
+  <code>stat</code>.</li>
+  <li>A corrupted split tree is detected and reported as an I/O error.</li>
+</ul>
+<p><code>fsync</code> through FUSE drains pages, publishes the size, waits
+for replication, syncs the file's tag to a persistent device, fsyncs the
+size log and syncs the parent directory, in that order. If a node that may
+have held unsynced writes for the file died since the last sync,
+<code>fsync</code> returns EIO.</p>
+
+<h2 id="fuse">The FUSE daemon</h2>
+
+<h3>Platforms</h3>
+<table>
+  <tr><th>Platform</th><th>Backend</th><th>Notes</th></tr>
+  <tr><td>Linux</td><td>libfuse3</td><td>Multi-threaded loop, <code>default_permissions</code>. Can also mount from an inherited file descriptor, which is how Apptainer's <code>--fusemount</code> works. An experimental low-level variant passes attributes in replies to cut kernel round trips.</td></tr>
+  <tr><td>macOS</td><td>macFUSE</td><td>Darwin attribute and extended-attribute callbacks. Source build only; the wheel does not include it.</td></tr>
+  <tr><td>Windows</td><td>WinFsp (FUSE3 compatibility layer)</td><td>A small compatibility header maps POSIX types and identities. No fallocate.</td></tr>
+</table>
+
+<h3>Kernel cache settings</h3>
+<ul>
+  <li><strong>Inode numbers from tag identifiers</strong>, so tools that
+  compare inode numbers work.</li>
+  <li><strong>The page cache is on</strong>, so <code>mmap</code> works.
+  Writeback caching is opt-in: trusting a lagging size corrupted git
+  packs.</li>
+  <li><strong>Direct I/O is chosen per file</strong> for write-only opens
+  (avoiding one 4 KiB request per dirtied page), for multi-node
+  <code>O_APPEND</code> (so the server picks the offset), and when two
+  server files would otherwise share one page cache.</li>
+  <li><strong>Attribute and negative-lookup caches</strong> last 1 s on a
+  single node and are disabled on multi-node mounts. The entry cache stays
+  at 1 s even on multi-node, because every <code>getattr</code> and
+  <code>open</code> re-resolves the full path at the owner anyway. Keeping
+  it took an 8-node <code>git</code> workload from over 600 s to 58 s.</li>
+  <li><strong>Unlinked-but-open files</strong> stay local to the mount:
+  libfuse's hidden-file rename becomes a server unlink plus a local
+  mapping, and the hidden names are filtered from listings.</li>
+</ul>
+
+<h3>Data path: bypassing the ChiMod</h3>
+<p>The filesystem ChiMod has read and write operations, but the FUSE
+daemon does not use them by default. Instead, the daemon goes straight to
+the file's page blobs through the CTE client.</p>
+<ul>
+  <li><strong>Writes</strong> are copied into the client's write sieve:
+  64 KiB shared-memory pages, shipped when full or every 500 µs. The
+  file's logical size is tracked in the client and published at
+  <code>flush</code>, <code>fsync</code> or <code>release</code>. Pages
+  go to the top of the filesystem's chain, so they are cached and
+  replicated.</li>
+  <li><strong>Reads</strong> are served from in-flight staging first, then
+  the zero-IPC shared-memory path, then a request. Reads whose owner just
+  died are retried for about 10 s, then fail with EIO.</li>
+  <li><strong>Appends</strong> trust the kernel's size on a single node and
+  use deferred, node-local staging (merged at the stream's home) on
+  multi-node mounts. A synchronous reservation mode is also available.</li>
+  <li><strong>Out of space</strong> is reported honestly. A refused page
+  fails the next write and the close with ENOSPC, and truncates the file
+  back to the last page that was stored.</li>
+  <li><strong>Close</strong> is fire-and-forget by default. Durability
+  lives in <code>flush</code> and <code>fsync</code>.</li>
+</ul>
+<p>Namespace callbacks are thin. Each issues one filesystem request, with
+fast paths in front. <code>stat</code> reads the shared-memory mirror
+first (about 10 µs, against about 290 µs through the ChiMod), and a
+complete-directory record answers "not found" without asking the server.
+Before unlink, rename and truncate, the daemon drains the file's pending
+writes, so a late size update cannot resurrect a truncated file or land
+data under an old name.</p>
+
+<h2 id="performance">Performance notes</h2>
+<ul>
+  <li><strong>Kernel transitions dominate.</strong> In the low-level
+  variant's measurements, about 91% of per-operation wall time was kernel
+  transit and only about 9.6 µs was daemon CPU time. That is why the
+  design invests so much in caches that answer without a request.</li>
+  <li><strong>Representative costs:</strong> <code>stat</code> about
+  31 µs through the ChiMod, <code>readdir</code> 255 µs for 10 entries
+  and 592 µs for 100, rename about 570 µs. A Linux kernel <code>git
+  clone</code> took 171 s (ext4: 39 s), down from over 15 minutes before
+  the FUSE overhaul.</li>
+  <li><strong>Large directories</strong> spread across many blocks and
+  nodes. <code>readdir</code> and a directory's <code>stat</code> still
+  visit every block, so very large directories make those calls
+  proportional to their block count.</li>
+  <li><strong>Each mutation costs</strong> one blob write plus one push
+  per holder of the object. Group commit amortizes bursts.</li>
+  <li><strong><code>stat</code> of a file not homed locally</strong>
+  always costs one size request to the stream home, even when its
+  attributes are cached.</li>
+</ul>
+
+<h2 id="tradeoffs">Tradeoffs at a glance</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>Namespace stored as CTE blobs</td><td class="good">One durability and replication story for data and metadata. No separate metadata store.</td><td class="cost">Metadata durability is bounded by the CTE configuration, for example RAM-only tiers.</td></tr>
+  <tr><td>Directory blocks keyed by directory identifier</td><td class="good">Constant-time directory rename. Directories scale across nodes.</td><td class="cost">Listings and directory stats visit every block. Blocks never merge.</td></tr>
+  <tr><td>Local resolution with pushed caches</td><td class="good">Warm path walks with no network traffic.</td><td class="cost">Each change pushes to every holder, and holders must be tracked.</td></tr>
+  <tr><td>Leases, failing closed</td><td class="good">Never serves stale namespace state.</td><td class="cost">Mutations can stall about 12 s behind an unreachable holder, and cut-off nodes get EIO.</td></tr>
+  <tr><td>Multi-step protocols instead of transactions</td><td class="good">No distributed locks or two-phase commit. Crashes leak instead of corrupting.</td><td class="cost">Rename is not one atomic step, and leaked link counts are possible after crashes.</td></tr>
+  <tr><td>FUSE data path straight to blobs</td><td class="good">Avoids a server-side hop and per-page serialization.</td><td class="cost">Write-behind means errors surface at close or fsync, not at write.</td></tr>
+  <tr><td>Fast paths only on single node</td><td class="good">Microsecond <code>stat</code> locally.</td><td class="cost">Multi-node mounts pay a request per <code>stat</code> or lookup miss.</td></tr>
+</table>

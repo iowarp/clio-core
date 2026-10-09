@@ -1,0 +1,65 @@
+<!--
+title: FUSE on Windows
+heading: Mount on <em>Windows.</em>
+description: Mount the CLIO Core context filesystem on Windows as a drive letter or folder with WinFsp.
+eyebrow: Tutorial · Mount
+lede: On Windows the adapter uses WinFsp and mounts as a drive letter or an empty folder. The pip wheel includes it.
+facts: Time | 10 minutes ; Driver | WinFsp 2.0 ; In the pip wheel | Yes
+-->
+<h2>1. Install WinFsp</h2>
+<p>Download and run the installer from <a href="https://winfsp.dev/rel/">winfsp.dev</a>. The default components are enough to mount. To build the adapter from source, also install the developer files: choose them in the installer, or run <code>msiexec /i winfsp.msi ADDLOCAL=ALL</code>.</p>
+
+<h2>2. Install CLIO Core</h2>
+<pre data-label="powershell">
+PS> py -3.12 -m pip install iowarp-core
+PS> clio_run --help
+</pre>
+<p>The <code>clio_cte_fuse</code> command adds WinFsp's <code>bin</code> folder to <code>PATH</code> itself, so you do not need to edit the system <code>PATH</code>.</p>
+
+<h2>3. Start the runtime and mount</h2>
+<p>Use two PowerShell windows. In the first:</p>
+<pre data-label="powershell">
+PS> clio_run start
+</pre>
+<p>In the second:</p>
+<div class="tabs" data-label="Mount type">
+  <section class="tab-panel" data-tab="Drive letter"><p class="tab-title">Drive letter</p>
+<pre data-label="powershell">
+PS> $env:CLIO_WITH_RUNTIME = "0"
+PS> clio_cte_fuse Z: -f
+</pre></section>
+  <section class="tab-panel" data-tab="Folder"><p class="tab-title">Folder</p>
+<pre data-label="powershell">
+PS> $env:CLIO_WITH_RUNTIME = "0"
+PS> clio_cte_fuse C:\iowarp\cte -f
+</pre>
+  <p>The folder's parent must exist. WinFsp creates the mount folder itself.</p></section>
+</div>
+
+<h2>4. Use it</h2>
+<pre data-label="powershell">
+PS> Copy-Item -Recurse $HOME\Documents\results Z:\
+PS> Get-ChildItem Z:\results
+</pre>
+<p>The drive appears in File Explorer. Python, Excel, ParaView and other applications can open files there directly.</p>
+
+<h2>5. Unmount</h2>
+<p>Stop the daemon, then the runtime:</p>
+<pre data-label="powershell">
+PS> Stop-Process -Name clio_cte_fuse -Force
+PS> clio_run stop
+</pre>
+
+<h2>Building from source</h2>
+<pre data-label="powershell">
+PS> cmake --preset windows-release -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON
+PS> cmake --build build --config Release
+</pre>
+<p>Set <code>VCPKG_ROOT</code> first. WinFsp is found under <code>%ProgramFiles(x86)%\WinFsp</code>, or pass <code>-DWINFSP_ROOT=</code>.</p>
+
+<h2>If something goes wrong</h2>
+<ul>
+  <li><strong>A missing <code>winfsp-x64.dll</code></strong>: WinFsp is not installed, or was installed without its core component.</li>
+  <li><strong>The drive letter is in use</strong>: pick another letter, or check <code>Get-PSDrive</code>.</li>
+  <li><strong>Files are invisible to Python</strong>: <code>CLIO_WITH_RUNTIME</code> was not <code>0</code> in the mount window.</li>
+</ul>

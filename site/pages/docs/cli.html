@@ -1,0 +1,91 @@
+<!--
+title: CLI and environment
+heading: <em>clio_run</em> and its environment.
+description: Reference for the clio_run command, the clio_cte_fuse daemon and the environment variables CLIO Core reads.
+eyebrow: Docs · Reference
+lede: One command manages the runtime and its pools. A second mounts the filesystem. Environment variables override the config file for a single run.
+facts: Binaries | clio_run (alias clio), clio_cte_fuse ; Config | ~/.clio/clio.yaml
+-->
+<h2>clio_run</h2>
+<pre data-label="usage">
+clio_run <command> [options]
+</pre>
+<div class="table-wrap"><table>
+  <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>start</code></td><td>Start the runtime in the foreground, recover persistent state, and compose the pools in the config.</td></tr>
+    <tr><td><code>stop</code></td><td>Stop the runtime. <code>--grace-period &lt;ms&gt;</code> sets the drain budget (default 5000); <code>--force</code> stops immediately.</td></tr>
+    <tr><td><code>status</code></td><td>Print <code>RUNNING</code>, <code>STOPPED (clean)</code> or <code>STOPPED (stale artifacts)</code>. The exit code is 0, 1 or 2 to match.</td></tr>
+    <tr><td><code>compose</code></td><td>Manage pools from a YAML file: <code>start</code>, <code>stop</code>, <code>list</code>.</td></tr>
+    <tr><td><code>monitor</code></td><td>Print worker statistics.</td></tr>
+    <tr><td><code>migrate</code></td><td>Move a container to a different node.</td></tr>
+    <tr><td><code>config export --path &lt;file&gt;</code></td><td>Write the node's effective configuration to a file.</td></tr>
+    <tr><td><code>refresh</code></td><td>Regenerate method files for module development.</td></tr>
+  </tbody>
+</table></div>
+
+<h3>start options</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>Option</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--fresh</code></td><td>Discard this node's persistent state instead of recovering it.</td></tr>
+    <tr><td><code>--disk &lt;path&gt;</code></td><td>Storage root for persistent state on this run (default <code>~/.clio</code>). Same as <code>CLIO_STORAGE_ROOT</code>.</td></tr>
+    <tr><td><code>--ephemeral</code></td><td>Skip the configured compose and start with only the admin pool.</td></tr>
+    <tr><td><code>--induct</code></td><td>Register this node with an existing cluster.</td></tr>
+    <tr><td><code>--viz</code>, <code>--no-viz</code></td><td>Serve or skip the web dashboard (on by default).</td></tr>
+    <tr><td><code>--viz-port &lt;port&gt;</code></td><td>Dashboard port (default 8080; 0 picks a free one).</td></tr>
+    <tr><td><code>--viz-bind &lt;addr&gt;</code></td><td>Dashboard bind address (default 127.0.0.1).</td></tr>
+  </tbody>
+</table></div>
+
+<h3>compose</h3>
+<p>A compose file has the same <code>compose:</code> list as <code>clio.yaml</code>. This one adds a 256 MB RAM block device:</p>
+<pre data-label="yaml · tiers.yaml">
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::scratch"
+    pool_query: local
+    pool_id: "320.0"
+    bdev_type: ram
+    capacity: "256MB"
+    restart: true
+</pre>
+<pre data-label="shell">
+$ clio_run compose start tiers.yaml   # create the pools in the file
+$ clio_run compose list               # list containers in the local daemon
+$ clio_run compose stop tiers.yaml    # destroy those pools
+</pre>
+<p>Pools marked <code>restart: true</code> are recorded in each node's pool log and composed again by the next <code>clio_run start</code>. <code>stop</code> destroys the pools now but keeps them in the log. <code>clio_run compose list --restartable</code> lists the log.</p>
+
+<h2>clio_cte_fuse</h2>
+<pre data-label="usage">
+clio_cte_fuse <mountpoint> [FUSE options]
+</pre>
+<p>The daemon creates or binds the filesystem pool itself. Every argument after the mountpoint goes to FUSE: <code>-f</code> (foreground), <code>-d</code> (debug trace), <code>-s</code> (single thread), <code>-o allow_other</code> (needs <code>user_allow_other</code> in <code>/etc/fuse.conf</code>). On Windows the mountpoint is a drive letter (<code>Z:</code>) or an empty directory path. On macOS, <code>-o backend=fskit</code> selects FSKit.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>CLIO_WITH_RUNTIME</code></td><td>1</td><td>Set to <code>0</code> to attach to a running runtime. Almost always what you want.</td></tr>
+    <tr><td><code>CLIO_FUSE_ATTR_CACHE_S</code></td><td>1.0 (0 on several nodes)</td><td>Kernel attribute cache lifetime, in seconds. <code>0</code> gives strict coherence across clients.</td></tr>
+    <tr><td><code>CLIO_FUSE_WRITEBACK</code></td><td>off</td><td>Kernel writeback caching. Unsafe with several writers.</td></tr>
+  </tbody>
+</table></div>
+
+<h2>Environment variables</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>CLIO_SERVER_CONF</code></td><td>Path of the runtime configuration file (overrides <code>~/.clio/clio.yaml</code>).</td></tr>
+    <tr><td><code>CLIO_STORAGE_ROOT</code></td><td>Directory for persistent tiers, the metadata log and the index. Expanded as <code>${CLIO_STORAGE_ROOT}</code> in the config.</td></tr>
+    <tr><td><code>CLIO_PORT</code></td><td>Base RPC port (default 9413).</td></tr>
+    <tr><td><code>CLIO_SERVER_ADDR</code></td><td>Address clients use to reach the runtime.</td></tr>
+    <tr><td><code>CLIO_IPC_MODE</code></td><td>Client transport: <code>SHM</code> (shared memory), <code>IPC</code> (Unix socket) or <code>TCP</code>. When unset, the client picks the fastest one that works: SHM for a runtime on the same machine, otherwise IPC, otherwise TCP.</td></tr>
+    <tr><td><code>CLIO_WITH_RUNTIME</code></td><td><code>0</code> attaches a client to a running runtime; <code>1</code> starts one in-process.</td></tr>
+    <tr><td><code>CLIO_CTE_POOL</code></td><td>Bind the CTE client to a chain layer, such as <code>564.0</code> for search.</td></tr>
+    <tr><td><code>CLIO_VIZ_ENABLE</code>, <code>CLIO_VIZ_PORT</code>, <code>CLIO_VIZ_BIND</code></td><td>Dashboard settings.</td></tr>
+    <tr><td><code>CTP_LOG_LEVEL</code></td><td>Log verbosity, such as <code>info</code> or <code>debug</code>.</td></tr>
+  </tbody>
+</table></div>
+
+<h2>Configuration file</h2>
+<p><code>~/.clio/clio.yaml</code> has a few top-level sections. <code>networking</code> sets ports and, for a cluster, the <code>hostfile</code> with one node address per line. <code>runtime</code> sets worker threads and queue depth. <code>viz</code> configures the dashboard. <code>compose</code> lists the pools to create. The installed <code>clio_default.yaml</code> documents every key in comments. The <a href="/tutorials/compose.html">compose tutorial</a> covers the storage settings.</p>

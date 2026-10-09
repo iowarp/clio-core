@@ -1,0 +1,62 @@
+name: Pages
+
+# Builds the CLIO Core website (site/) and publishes it to GitHub Pages.
+# Pull requests that touch the site run the same build, including the
+# internal link check, without deploying.
+#
+# One-time setup: repository Settings -> Pages -> Source = "GitHub Actions".
+# The site uses relative links only, so it works at the project path
+# (https://iowarp.github.io/clio-core/) or on a custom domain.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Fails on any broken internal link or anchor.
+      - name: Build the site
+        run: python3 site/build.py --out "$RUNNER_TEMP/site"
+      - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
