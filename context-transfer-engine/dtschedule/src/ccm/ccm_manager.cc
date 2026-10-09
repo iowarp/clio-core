@@ -386,6 +386,14 @@ std::unique_ptr<CcmPredictor> CcmManager::CreatePredictor(
       return predictor;
     }
     return nullptr;
+  } else if (ccm_spec == "qtable_static") {
+    // Ablation: the trained table without online learning.
+    auto predictor = std::make_unique<QtablePredictor>();
+    if (predictor->Load(model_dir)) {
+      predictor->SetFrozen(true);
+      return predictor;
+    }
+    return nullptr;
   } else if (ccm_spec == "hcompress") {
     // HCompress baseline: the same trained table, keyed by data size only.
     auto predictor = std::make_unique<QtablePredictor>(true);

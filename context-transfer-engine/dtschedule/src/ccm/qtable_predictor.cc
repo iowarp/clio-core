@@ -180,7 +180,7 @@ void QtablePredictor::Observe(const Features &features,
                               double obs_dtime_ms,
                               double obs_ratio) {
   auto lib_it = lib_to_id_.find(lib);
-  if (lib_it == lib_to_id_.end()) {
+  if (frozen_ || lib_it == lib_to_id_.end()) {
     return;
   }
   auto state = BuildStateTuple(features, lib_it->second, preset);

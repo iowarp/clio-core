@@ -63,6 +63,8 @@ class QtablePredictor : public CcmPredictor {
    *        baseline, which predicts the best codec from the data size alone.
    */
   explicit QtablePredictor(bool size_only) : size_only_(size_only) {}
+  /** Frozen table: predictions come from the trained table only (no online learning). */
+  void SetFrozen(bool frozen) { frozen_ = frozen; }
   ~QtablePredictor() override = default;
 
   /**
@@ -128,6 +130,7 @@ class QtablePredictor : public CcmPredictor {
   void LoadEdges();
 
   bool size_only_ = false;                ///< HCompress: size bin only
+  bool frozen_ = false;                   ///< ignore observations (ablation)
   nlohmann::json qtable_;                 ///< Full qtable.json content
   nlohmann::json binning_params_;         ///< Full binning_params.json content
 

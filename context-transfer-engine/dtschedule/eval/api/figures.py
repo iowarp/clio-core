@@ -623,6 +623,123 @@ def fig_fanin(root, out, exp='fanin_seis_x4_v4'):
     print('fanin.pdf', {k: round(stat(v)[0], 1) for k, v in sorted(runs.items())})
 
 
+def fig_wf_panels(root, out):
+    """One small figure per selected WfCommons workflow (two nodes): makespan in seconds
+    under Hermes, HCompress, the fixed DT policies and DT-AUTO (DTSchedule)."""
+    picks = ['bwa', 'blastio', 'seismology', 'montage', 'blast']
+    cfgs = [('baseline', 'Hermes', C[0]), ('hcompress', 'HComp.', C[2]), ('s1_local_blosc', 'DT-PP', C[6]),
+            ('cons_raw', 'DT-XC', C[3]), ('s3_cons_blosc', 'DT-CC', C[4]), ('full', 'DT-AUTO', C[1])]
+    for r in picks:
+        res = load(root, 'wf_blastio_v4') if r == 'blastio' else load(root, f'wf_{r}')
+        names = [c for c in cfgs if res.get(c[0])]
+        if len(names) < len(cfgs):
+            continue
+        ys = [stat(res[c[0]])[0] for c in names]
+        fig, ax = plt.subplots(figsize=(2.3, 1.45))
+        xs = range(len(names))
+        ax.bar(xs, ys, 0.72, color=[c[2] for c in names])
+        top = max(ys)
+        for x, y in zip(xs, ys):
+            ax.text(x, y + top * 0.02, f'{y:.0f}', ha='center', va='bottom', fontsize=6)
+        ax.set_xticks(list(xs)); ax.set_xticklabels([c[1] for c in names], fontsize=6, rotation=35, ha='right')
+        ax.set_ylabel('Makespan (s)', fontsize=7); ax.tick_params(axis='y', labelsize=6)
+        ax.set_ylim(0, top * 1.18); ax.grid(axis='x', visible=False)
+        fig.tight_layout(pad=0.3); save(fig, out, f'wf_{r}.pdf')
+        print(f'wf_{r}.pdf', {c[1]: round(y, 1) for c, y in zip(names, ys)})
+
+
+def ccm_rows(root, exp, run):
+    """(time, pred_ratio, obs_ratio, pred_ctime, obs_ctime, tag) of the compressed chunks of a run."""
+    import csv
+    out = []
+    for f in sorted(glob.glob(os.path.join(root, exp, 'traces', run, 'dtschedule_trace.[0-9].csv'))):
+        for x in csv.DictReader(open(f)):
+            if not x.get('chosen_scenario') or x.get('chosen_lib') in ('raw', ''):
+                continue
+            try:
+                v = (float(x['ts_ms']), float(x['pred_ratio']), float(x['obs_ratio']),
+                     float(x['pred_ctime_ms']), float(x['obs_ctime_ms']), x['tag'])
+            except (KeyError, ValueError):
+                continue
+            if v[2] > 0 and v[4] > 0:
+                out.append(v)
+    out.sort()
+    return out
+
+
+def fig_ccm_convergence(root, out):
+    """Online learning on workloads the table was not trained on: ratio-prediction error of
+    DT-AUTO's Q-table over the run (rolling window over the compressed chunks, in order)."""
+    cases = [('Compressible (11x)', 'comp_hi_40g_v4', 'auto_wb'), ('BWA', 'wf_bwa_v3', 'full'),
+             ('1000Genome', 'wf_genome_v3', 'full'), ('Cycles', 'wf_cycles_v3', 'full'),
+             ('Epigenomics', 'wf_epigenomics_v3', 'full'), ('Seismology', 'wf_seismology_v3', 'full')]
+    fig, ax = plt.subplots(figsize=(COL_W, 1.7))
+    for k, (lab, e, r) in enumerate(cases):
+        v = ccm_rows(root, e, r)
+        if len(v) < 50:
+            continue
+        ape = [abs(a[1] - a[2]) / a[2] * 100 for a in v]
+        w = max(10, len(ape) // 20)
+        roll = [statistics.mean(ape[max(0, i - w + 1):i + 1]) for i in range(len(ape))]
+        xs = [i / (len(ape) - 1) * 100 for i in range(len(ape))]
+        ax.plot(xs, roll, color=C[k], lw=1.3, label=lab)
+    ax.set_xlabel('compressed chunks, % of the run', fontsize=7)
+    ax.set_ylabel('ratio error (%)', fontsize=7); ax.tick_params(labelsize=6)
+    ax.set_ylim(0, None); ax.grid(axis='x', visible=False)
+    ax.legend(fontsize=5.5, ncol=3, loc='lower center', bbox_to_anchor=(0.5, 1.0), handlelength=1.2, columnspacing=0.8)
+    fig.tight_layout(); save(fig, out, 'ccm_convergence.pdf')
+
+
+def fig_adapt(root, out, exp='adapt_v4'):
+    """Shifting data: steps 0-6 Montage-like, 7-13 random, 14-19 ~11x compressible.
+    Per step: ratio-prediction error of the compressed chunks (top) and share of
+    chunks compressed (bottom), per predictor (online Q-table, frozen Q-table,
+    HCompress's size-only table, moving average)."""
+    import csv, re
+    preds = [('qtable', 'Q-table (online)', C[1]), ('qtable_static', 'Q-table (frozen)', C[0]),
+             ('hcompress', 'size only (HCompress)', C[2]), ('ema', 'moving average', C[6])]
+    runs = load(root, exp)
+    fig, (a, b) = plt.subplots(2, 1, figsize=(COL_W, 2.4), sharex=True)
+    for key, lab, col in preds:
+        ape, comp = {}, {}
+        for run in [k for k in runs if k.rsplit('_r', 1)[0] == key]:
+            for f in glob.glob(os.path.join(root, exp, 'traces', run, 'dtschedule_trace.[0-9].csv')):
+                for x in csv.DictReader(open(f)):
+                    if not x.get('chosen_scenario'):
+                        continue
+                    m = re.search(r'step(\d+)_', x['tag'])
+                    if not m:
+                        continue
+                    st_ = int(m.group(1))
+                    z = x['chosen_lib'] not in ('raw', '')
+                    comp.setdefault(st_, []).append(1.0 if z else 0.0)
+                    if z:
+                        try:
+                            pr, orr = float(x['pred_ratio']), float(x['obs_ratio'])
+                        except ValueError:
+                            continue
+                        if orr > 0:
+                            ape.setdefault(st_, []).append(abs(pr - orr) / orr * 100)
+        if not comp:
+            continue
+        xs = sorted(comp)
+        # Break the line where a step compressed nothing (no ratio to score).
+        ys = [statistics.mean(ape[x]) if x in ape else float('nan') for x in xs]
+        a.plot(xs, ys, color=col, lw=1.3, marker='o', ms=2.5, label=lab)
+        b.plot(xs, [statistics.mean(comp[x]) * 100 for x in xs], color=col, lw=1.3, marker='o', ms=2)
+    for ax in (a, b):
+        for edge in (6.5, 13.5):
+            ax.axvline(edge, color=INK2, lw=0.6, ls='--')
+        ax.grid(axis='x', visible=False); ax.tick_params(labelsize=6)
+    a.set_ylabel('ratio error (%)', fontsize=7); a.set_ylim(0, None)
+    b.set_ylabel('compressed (%)', fontsize=7); b.set_ylim(0, 105); b.set_xlabel('step', fontsize=7)
+    for x, t in ((3, 'Montage-like'), (10, 'random'), (16.5, '~11x')):
+        b.text(x, 98, t, ha='center', va='top', fontsize=6, color=INK2)
+    a.legend(fontsize=5.5, ncol=2, loc='lower center', bbox_to_anchor=(0.5, 1.0), handlelength=1.2, columnspacing=0.8)
+    fig.tight_layout(); save(fig, out, 'adapt.pdf')
+    print('adapt.pdf', {k: [round(stat(v)[0], 1) for v in [runs[k]]] for k in sorted(runs)})
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--root', default=os.path.expanduser('~/jarvis-runs/dtschedule-results'))
@@ -634,7 +751,7 @@ def main():
     global V2, V3
     V2, V3 = a.v2 or a.v3, a.v3
     os.makedirs(a.out, exist_ok=True)
-    figs = {'motivation': fig_motivation, 'flip': fig_motivation_flip, 'codecs': tab_codecs, 'prodcons': fig_prodcons, 'e5': fig_e5_grid, 'e6': fig_ablation, 'workflows': fig_workflows, 'e10': fig_e10, 'e8e9': fig_e8_e9, 'e7': fig_e7, 'async': fig_async, 'scaling': fig_scaling, 'stacked': fig_stacked, 'fanout': fig_fanout, 'fanin': fig_fanin}
+    figs = {'motivation': fig_motivation, 'flip': fig_motivation_flip, 'codecs': tab_codecs, 'prodcons': fig_prodcons, 'e5': fig_e5_grid, 'e6': fig_ablation, 'workflows': fig_workflows, 'e10': fig_e10, 'e8e9': fig_e8_e9, 'e7': fig_e7, 'async': fig_async, 'scaling': fig_scaling, 'stacked': fig_stacked, 'fanout': fig_fanout, 'fanin': fig_fanin, 'wfpanels': fig_wf_panels, 'ccmconv': fig_ccm_convergence, 'adapt': fig_adapt}
     for n in (a.names or figs):
         figs[n](a.root, a.out)
 

@@ -265,13 +265,29 @@ int main(int argc, char **argv) {
     fprintf(stderr, "heat_producer: rank %d out of memory\n", rank);
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
-  size_t plen = 0;
-  char *payload = o.payload ? LoadPayload(o.payload, rank, &plen) : NULL;
-  if (o.payload && (payload == NULL || plen < bytes)) {
-    fprintf(stderr, "heat_producer: rank %d: payload under %s unusable\n",
-            rank, o.payload);
-    MPI_Abort(MPI_COMM_WORLD, 1);
+  // --payload DIR[:DIR...]: with several directories the run is split into
+  // equal phases of steps, phase i writing windows of directory i (data
+  // whose character shifts mid-run).
+  enum { kMaxPhases = 8 };
+  char *phase_buf[kMaxPhases] = {NULL};
+  size_t phase_len[kMaxPhases] = {0};
+  int phases = 0;
+  if (o.payload) {
+    char dirs[4096];
+    snprintf(dirs, sizeof(dirs), "%s", o.payload);
+    for (char *save = NULL, *d = strtok_r(dirs, ":", &save);
+         d != NULL && phases < kMaxPhases; d = strtok_r(NULL, ":", &save)) {
+      phase_buf[phases] = LoadPayload(d, rank, &phase_len[phases]);
+      if (phase_buf[phases] == NULL || phase_len[phases] < bytes) {
+        fprintf(stderr, "heat_producer: rank %d: payload under %s unusable\n",
+                rank, d);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+      }
+      ++phases;
+    }
   }
+  char *payload = phases > 0 ? phase_buf[0] : NULL;
+  size_t plen = phases > 0 ? phase_len[0] : 0;
   double compute_s = 0.0, write_s = 0.0;
   const double t0 = PcNow();
   int rc = 0;
@@ -282,7 +298,8 @@ int main(int argc, char **argv) {
       SlabSweep(&s);
     }
     if (payload != NULL) {
-      PayloadWindow(payload, plen, (char *)snap, bytes, step, rank);
+      const int ph = phases > 1 ? step * phases / o.steps : 0;
+      PayloadWindow(phase_buf[ph], phase_len[ph], (char *)snap, bytes, step, rank);
     } else {
       SlabSnapshot(&s, snap, o.noise);
       if (o.float32) {  // narrow in place: floats fill the first half
@@ -313,7 +330,7 @@ int main(int argc, char **argv) {
            flush_s, PcNow() - t0, rc);
     fflush(stdout);
   }
-  free(payload);
+  for (int i = 0; i < phases; ++i) free(phase_buf[i]);
   free(snap);
   free(s.cur);
   free(s.next);
