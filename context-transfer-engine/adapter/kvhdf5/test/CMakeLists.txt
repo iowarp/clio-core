@@ -83,9 +83,15 @@ function(kvhdf5_add_gpu_test_target target)
     # runtime needs CLIO_BIND_ADDR set and finds its chimods by scanning
     # CHI_REPO_PATH / LD_LIBRARY_PATH, so inject those into the registered tests.
     # (build/bin is where clio drops every .so + chimod.)
+    # Each test case brings up its own runtime on the fixed port cluster
+    # (9413/9414). The root CMakeLists' RESOURCE_LOCK pass cannot see these:
+    # catch_discover_tests registers them at ctest time, not configure time. So
+    # take the same "clio_runtime_port" lock here, or `ctest -jN` overlaps them
+    # with other runtime tests and CLIO_INIT fails with "Address already in use".
     catch_discover_tests(${target}
         PROPERTIES
             ENVIRONMENT "CLIO_BIND_ADDR=127.0.0.1;CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin"
+            RESOURCE_LOCK "clio_runtime_port"
     )
 endfunction()
 

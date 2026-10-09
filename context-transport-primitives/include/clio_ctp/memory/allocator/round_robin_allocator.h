@@ -50,7 +50,7 @@ typedef BaseAllocator<_RoundRobinAllocator> RoundRobinAllocator;
  * The BuddyAllocator MUST BE LAST — it is followed by its managed region.
  */
 struct RrPartitionBlock {
-  ctp::ipc::atomic<int> initialized_;  /**< 0=uninitialized, 1=ready */
+  ctp::ipc::atomic<int> initialized_;  /**< 0=uninitialized, 2=initializing, 1=ready */
   ctp::ipc::atomic<int> lock_;         /**< Spinlock: 0=unlocked, 1=locked */
   BuddyAllocator alloc_;          /**< Shared buddy allocator (MUST BE LAST) */
 
@@ -68,6 +68,11 @@ struct RrPartitionBlock {
     size_t alloc_region_size = region_size - sizeof(RrPartitionBlock);
     alloc_.shm_init(backend, alloc_region_size);
     lock_.store(0);
+    // Publish the allocator state before the ready flag that other blocks
+    // spin on, or a waiter can see ready=1 ahead of the buddy free lists.
+#if !CTP_IS_HOST
+    __threadfence_system();
+#endif
     initialized_.store(1);
 #if !CTP_IS_HOST
     __threadfence_system();
@@ -217,7 +222,11 @@ class _RoundRobinAllocator : public Allocator {
 
   /**
    * Lazily initialize a partition.
-   * Only called once per partition (checked via initialized_ flag).
+   *
+   * Safe to call concurrently: ClaimPartition wraps, so several blocks can
+   * share a partition. One caller wins the 0->2 CAS and builds the allocator;
+   * the rest wait for 1. Re-running init over a live partition would wipe its
+   * buddy free lists and spinlock under an in-flight allocation.
    */
   CTP_CROSS_FUN
   bool LazyInitPartition(int partition_id) {
@@ -228,10 +237,18 @@ class _RoundRobinAllocator : public Allocator {
     if (block->initialized_.load_device() == 1) {
       return true;
     }
-    // Initialize in-place (only one thread should reach here per partition)
-    new (block) RrPartitionBlock();
-    MemoryBackend backend = GetBackend();
-    block->shm_init(backend, partition_size_);
+    int expected = 0;
+    if (block->initialized_.compare_exchange_strong(expected, 2)) {
+      // Construct only the allocator: placement-new of the whole block would
+      // reset initialized_ to 0 and let another caller win the CAS again.
+      new (&block->alloc_) BuddyAllocator();
+      MemoryBackend backend = GetBackend();
+      block->shm_init(backend, partition_size_);
+      return true;
+    }
+    while (block->initialized_.load_device() != 1) {
+      ctp::ipc::threadfence();
+    }
     return true;
   }
 
