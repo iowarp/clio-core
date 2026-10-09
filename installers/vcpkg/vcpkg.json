@@ -21,6 +21,15 @@
     "catch2"
   ],
   "features": {
+    "viz": {
+      "description": "Poco HTTP transport for the runtime web dashboard (and the GCS bdev / CAE Globus)",
+      "dependencies": [
+        {
+          "name": "poco",
+          "features": ["net", "netssl", "crypto", "json"]
+        }
+      ]
+    },
     "boost-coroutines": {
       "description": "Boost.Context stackful coroutine backend (CLIO_CORE_ENABLE_BOOST_COROUTINES, issue #620)",
       "dependencies": [
