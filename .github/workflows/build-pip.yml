@@ -120,7 +120,7 @@ jobs:
         # does not bundle libfuse3.so.3 — end users get it from their
         # distro's fuse3 packages.
         CIBW_BEFORE_ALL: >
-          yum install -y curl patchelf fuse3-devel &&
+          yum install -y curl patchelf fuse3-devel openssl-devel &&
           bash {project}/installers/pip/build_deps_manylinux.sh
         CIBW_ENVIRONMENT: ${{ matrix.cibw_environment }}
         CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
@@ -174,7 +174,7 @@ jobs:
 
     - name: Install vcpkg dependencies
       run: |
-        C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c
+        C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c "poco[net,netssl,crypto,json]"
 
     # WinFsp provides the FUSE3-compatible SDK the Windows fuse adapter
     # builds against (#899; see adapter/libfuse/CMakeLists.txt). The choco
@@ -277,7 +277,7 @@ jobs:
         # the C API in serialize/msgpack_wrapper.h).
         bash CI/retry.sh brew update
         bash CI/retry.sh brew install cmake pkg-config \
-          yaml-cpp cereal msgpack-c libsodium zeromq cppzmq
+          yaml-cpp cereal msgpack-c libsodium zeromq cppzmq poco
 
     - name: Install cibuildwheel
       run: bash CI/retry.sh pip install cibuildwheel
@@ -408,6 +408,7 @@ jobs:
       run: |
         docker run --rm \
           -v "$PWD/wheels:/wheels:ro" \
+          -v "$PWD/installers/pip:/ci:ro" \
           ${{ matrix.distro }} \
           bash -c '
             set -e
@@ -533,6 +534,9 @@ jobs:
             fi
             unset rc
 
+            echo "=== Web dashboard compiled in and its pages shipped ==="
+            python /ci/check_wheel_dashboard.py
+
             echo "=== Symbol resolution check ==="
             LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
             export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -618,6 +622,11 @@ jobs:
             python: '3.14'
 
     steps:
+    - name: Check out wheel check scripts
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: installers/pip
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -663,6 +672,9 @@ jobs:
           fi
           unset rc
         done
+
+        echo "=== Web dashboard compiled in and its pages shipped ==="
+        python installers/pip/check_wheel_dashboard.py
 
         echo "=== Symbol resolution check (otool -L) ==="
         LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
@@ -713,7 +725,9 @@ jobs:
     - name: Check out CI helpers
       uses: actions/checkout@v4
       with:
-        sparse-checkout: CI
+        sparse-checkout: |
+          CI
+          installers/pip
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -793,6 +807,10 @@ jobs:
         # .lib archives go to lib/) — search both.
         python -c "import iowarp_core, glob, os, sys; dirs = [iowarp_core.get_lib_dir(), iowarp_core.get_bin_dir()]; missing = [m for m in ('cache', 'replication') if not any(glob.glob(os.path.join(d, f'*clio_cte_{m}_*')) for d in dirs)]; sys.exit(f'missing chimods: {missing}' if missing else 0)"
         if ($LASTEXITCODE -ne 0) { throw "cache/replication chimod DLLs missing from wheel" }
+
+        Write-Host "=== Web dashboard compiled in and its pages shipped ==="
+        python installers/pip/check_wheel_dashboard.py
+        if ($LASTEXITCODE -ne 0) { throw "wheel has no web dashboard" }
 
         Write-Host "=== All Windows tests passed ==="
         # The bench --help calls above leave $LASTEXITCODE = 1 (they print
