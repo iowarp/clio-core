@@ -304,7 +304,7 @@ def run_test(cte) -> int:
     # ------------------------------------------------------------------ #
     # 8. Window that matches nothing returns []                          #
     # ------------------------------------------------------------------ #
-    far_future = time.monotonic_ns() + 3600 * _NS
+    far_future = now_ns() + 3600 * _NS  # an hour ahead, in epoch ns
     empty = client.TemporalSearch(
         tag_regex=".*",
         blob_regex=".*",
