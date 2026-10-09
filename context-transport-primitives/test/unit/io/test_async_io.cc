@@ -45,6 +45,7 @@
 #include <cstring>
 #include <string>
 #include <filesystem>
+#include <vector>
 
 static const size_t kBlockSize = 4096;
 static const size_t kIoDepth = 32;
@@ -209,6 +210,78 @@ static bool RunUnalignedWriteReadTest(ctp::AsyncIoBackend backend) {
   return match;
 }
 
+#if !defined(_WIN32)
+/**
+ * PosixAsyncIO whose kernel submission refuses every other request with
+ * EAGAIN, the way macOS does past kern.aio.process_max (issue #1156).
+ */
+class EagainPosixAio : public ctp::PosixAsyncIO {
+ public:
+  EagainPosixAio() : ctp::PosixAsyncIO(kIoDepth) {}
+  int refused_ = 0; /**< submissions refused so far */
+
+ protected:
+  int StartAio(ControlBlock *cb, bool is_write) override {
+    if (++calls_ % 2 == 0) {
+      ++refused_;
+      errno = EAGAIN;
+      return -1;
+    }
+    return ctp::PosixAsyncIO::StartAio(cb, is_write);
+  }
+
+ private:
+  int calls_ = 0;
+};
+
+/**
+ * Keep kIoDepth writes in flight on an AIO that hits its request limit, then
+ * read every block back. Before #1156 each refused submission returned
+ * kInvalidIoToken, which bdev reports as a failed write of 0 bytes.
+ * @return true if every block reads back what was written
+ */
+static bool RunPosixAioLimitTest() {
+  std::string path = CreateTempFile("test_aio_limit");
+  EagainPosixAio aio;
+  REQUIRE(aio.Open(path, O_RDWR | O_CREAT, 0644));
+
+  std::vector<std::vector<char>> blocks(kIoDepth,
+                                        std::vector<char>(kBlockSize));
+  std::vector<ctp::IoToken> tokens;
+  for (size_t i = 0; i < kIoDepth; ++i) {
+    memset(blocks[i].data(), static_cast<int>('a' + i % 26), kBlockSize);
+    ctp::IoToken t = aio.Write(blocks[i].data(), kBlockSize,
+                               static_cast<int64_t>(i * kBlockSize));
+    REQUIRE(t != ctp::kInvalidIoToken);
+    tokens.push_back(t);
+  }
+  for (ctp::IoToken t : tokens) {
+    ctp::IoResult result;
+    while (!aio.IsComplete(t, result)) {
+    }
+    REQUIRE(result.error_code == 0);
+    REQUIRE(result.bytes_transferred == static_cast<ssize_t>(kBlockSize));
+  }
+  REQUIRE(aio.refused_ == static_cast<int>(kIoDepth / 2));
+
+  bool match = true;
+  std::vector<char> read_buf(kBlockSize);
+  for (size_t i = 0; i < kIoDepth; ++i) {
+    ctp::IoToken t = aio.Read(read_buf.data(), kBlockSize,
+                              static_cast<int64_t>(i * kBlockSize));
+    REQUIRE(t != ctp::kInvalidIoToken);
+    ctp::IoResult result;
+    while (!aio.IsComplete(t, result)) {
+    }
+    REQUIRE(result.bytes_transferred == static_cast<ssize_t>(kBlockSize));
+    match = match && memcmp(read_buf.data(), blocks[i].data(), kBlockSize) == 0;
+  }
+  aio.Close();
+  std::filesystem::remove(path);
+  return match;
+}
+#endif
+
 TEST_CASE("TestAsyncIO") {
   PAGE_DIVIDE("Default") {
     bool ok = RunAlignedWriteReadTest(ctp::AsyncIoBackend::kDefault);
@@ -267,6 +340,10 @@ TEST_CASE("TestAsyncIO") {
   PAGE_DIVIDE("PosixAioUnaligned") {
     bool ok = RunUnalignedWriteReadTest(ctp::AsyncIoBackend::kPosixAio);
     REQUIRE(ok);
+  }
+
+  PAGE_DIVIDE("PosixAioRequestLimit") {
+    REQUIRE(RunPosixAioLimitTest());
   }
 #endif
 

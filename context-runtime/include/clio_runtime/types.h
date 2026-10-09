@@ -548,6 +548,12 @@ struct AddressHash {
                         ///< broadcast back to all); this is a merge, where the
                         ///< output is a subset of tasks and each completes a
                         ///< different parent set.
+#define TASK_LIVENESS_PROBE \
+  BIT_OPT(clio::run::u32, 11)  ///< SWIM liveness probe (admin Heartbeat / ProbeRequest).
+                               ///< SendIn transmits it even to a node marked DEAD: a
+                               ///< reachable node must be able to answer and REJOIN;
+                               ///< parking the probe in the retry queue (which only
+                               ///< sends to live nodes) made death permanent (#1222).
 #define TASK_EXTERNAL_CLIENT \
   BIT_OPT(clio::run::u32, 9)  ///< Task ingressed from an external user client (set in
                         ///< the IpcCpu2Cpu / IpcCpu2CpuZmq client-receive paths,

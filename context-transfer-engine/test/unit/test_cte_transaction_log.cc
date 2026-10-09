@@ -50,8 +50,10 @@ TEST_CASE("TransactionLog - Open Log Sync Size", "[cte][txnlog]") {
   log.Sync();
 
   // File: 4 byte format magic, then one record of
-  // 1 byte type + 8 byte seq + 4 byte payload-size + payload(4+4+4+6+4)
-  REQUIRE(log.Size() == 4 + 1 + 8 + 4 + (4 + 4 + 4 + 6 + 4));
+  // 1 byte type + 8 byte seq + 4 byte payload-size + payload: tag major,
+  // tag minor, name length, name, score, and the write's wall-clock stamp
+  // (8 bytes, #796).
+  REQUIRE(log.Size() == 4 + 1 + 8 + 4 + (4 + 4 + 4 + 6 + 4 + 8));
 
   log.Close();
   TxnRemove(path);
@@ -68,6 +70,7 @@ TEST_CASE("TransactionLog - CreateNewBlob roundtrip", "[cte][txnlog]") {
   txn.tag_minor_ = 9;
   txn.blob_name_ = "my_blob";
   txn.score_ = 0.75f;
+  txn.wall_ns_ = 1759800000123456789ULL;  // the write's time (#796)
   log.Log(TxnType::kCreateNewBlob, txn);
   log.Sync();
 
@@ -81,6 +84,7 @@ TEST_CASE("TransactionLog - CreateNewBlob roundtrip", "[cte][txnlog]") {
   REQUIRE(out.blob_name_ == "my_blob");
   REQUIRE(out.score_ > 0.74f);
   REQUIRE(out.score_ < 0.76f);
+  REQUIRE(out.wall_ns_ == 1759800000123456789ULL);
 
   log.Close();
   TxnRemove(path);

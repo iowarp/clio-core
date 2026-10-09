@@ -88,8 +88,13 @@ class CoreClientConfigFixture {
     // a sharing-violation. Best-effort removal is what we want — if the
     // file's open, leaving it in place is harmless because the runtime
     // already truncates/reuses it on the next pool create.
+    //
+    // The storage file is the bdev target's backing file, and that target
+    // lives for the whole process: remove a stale one only before the
+    // runtime exists. Deleting it under a live target makes the bdev refuse
+    // further I/O (#1210) -- it used to silently write to a new empty file.
     std::error_code _setup_ec;
-    fs::remove(test_storage_path_, _setup_ec);
+    if (!g_initialized) fs::remove(test_storage_path_, _setup_ec);
     fs::remove(test_config_path_, _setup_ec);
 
     // Initialize CLIO Runtime and CTE once
@@ -134,8 +139,9 @@ class CoreClientConfigFixture {
     // surfaces as 0xC0000409 / STATUS_STACK_BUFFER_OVERRUN). Best-effort
     // cleanup is correct here — leftover files are scrubbed by the
     // clio_test_cleanup_fixture between test binaries.
+    // The storage file stays: it backs a target that outlives this fixture
+    // (see the constructor).
     std::error_code ec;
-    fs::remove(test_storage_path_, ec);
     fs::remove(test_config_path_, ec);
   }
 

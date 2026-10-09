@@ -997,7 +997,8 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
         }
         auto reg_task = client_.AsyncRegisterTarget(
             target_path, bdev_type, capacity_bytes, target_query, bdev_id,
-            clio::run::PoolQuery::Dynamic(), attach_existing);
+            clio::run::PoolQuery::Dynamic(), attach_existing,
+            device.growth_unit_);
         CLIO_CO_AWAIT(reg_task);
         clio::run::u32 result = reg_task->GetReturnCode();
         if (result == 0) {
@@ -1449,7 +1450,9 @@ clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTarg
            bdev_pool_id.major_, bdev_pool_id.minor_, target_name, target_node,
            this_node);
       auto create_task = bdev_client.AsyncCreate(
-          pool_query, target_name, bdev_pool_id, bdev_type, total_size);
+          pool_query, target_name, bdev_pool_id, bdev_type, total_size,
+          /*io_depth=*/32, /*alignment=*/4096, /*perf_metrics=*/nullptr,
+          /*alloc_log_path=*/"", task->growth_unit_);
       CLIO_CO_AWAIT(create_task);
       if (create_task->return_code_ == 0 && target_node != this_node) {
         // The pool exists only on target_node, so this node has no metadata
@@ -2609,6 +2612,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         !blob_info_ptr->blocks_.empty()) {
       clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
       TxnExtendBlob txn;
+      txn.wall_ns_ = GetWallTimeNs();  // a put changed the content (#796)
       txn.tag_major_ = tag_id.major_;
       txn.tag_minor_ = tag_id.minor_;
       txn.blob_name_ = blob_name;
@@ -3311,17 +3315,23 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // blob succeed with the caller's buffer untouched, so a pager does not
     // have to tell "missing" apart from "read failed" itself.
     if (blob_info_ptr == nullptr) {
-      if (task->context_.create_on_get_) {
+      const clio::run::u32 miss_rc = NotFoundRc(tag_id, blob_name);
+      if (task->context_.create_on_get_ && miss_rc == 1) {
         // Bind the name so a later put has something to extend; the read
-        // itself returns success with the caller's buffer untouched.
+        // itself returns success with the caller's buffer untouched. Not
+        // while standing in for the blob's dead owner without its copies:
+        // the blob may exist there, and a fresh one here would read as
+        // zeros for it (#1166).
         CreateNewBlob(blob_name, tag_id, 0.5f);
         task->return_code_ = 0;
         clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
         CLIO_CO_RETURN;
       }
-      task->return_code_ = 1;
+      // Not found -- or unknowable, while this container stands in for the
+      // blob's dead owner without its copies (#1166).
+      task->return_code_ = miss_rc;
       clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
-  CLIO_CO_RETURN;
+      CLIO_CO_RETURN;
     }
 
     // Replica-targeted read (issue #886): Context::replica_ == N > 0 serves
@@ -5619,6 +5629,7 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
     if (!blob_txn_logs_.empty()) {
       clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
       TxnExtendBlob txn;
+      txn.wall_ns_ = GetWallTimeNs();  // a truncate changed the content (#796)
       txn.tag_major_ = tag_id.major_;
       txn.tag_minor_ = tag_id.minor_;
       txn.blob_name_ = blob_name;
@@ -6469,6 +6480,19 @@ void Runtime::RekeyIndexSubtree(const std::string &old_abs,
   for (const auto &k : movers) {
     tag_search_.Rename(k, new_abs + k.substr(old_abs.size()));
   }
+  // A rename parked under a parent this node has not heard of yet remembers
+  // the subtree's OLD absolute path, to move it when the parent arrives
+  // (UnparkNames). An ancestor rename applied meanwhile has just moved
+  // those keys: follow them, or the parked move finds nothing and the
+  // subtree stays under the ancestor's new name for good (#1182).
+  for (auto &pr : pending_rekey_) {
+    std::string &p = pr.second;
+    if (p == old_abs ||
+        (p.size() > old_abs.size() && p.compare(0, old_abs.size(), old_abs) == 0 &&
+         p[old_abs.size()] == '/')) {
+      p = new_abs + p.substr(old_abs.size());
+    }
+  }
 }
 
 void Runtime::TnAddName(const TagId &id, const std::string &name) {
@@ -7065,6 +7089,30 @@ TagId Runtime::GetOrCreateTagChain(const std::string &name,
   return parent;
 }
 
+/**
+ * Write a blob's access times as metadata-log entry type 6 (issue #796),
+ * right after the blob's own record so restore can attach them by key. The
+ * times are steady-clock in memory and wall-clock on disk, because the steady
+ * clock restarts at boot. A new entry type for the same reason as types 2-4:
+ * the log has no version header, so an older reader must stop loudly rather
+ * than misparse the extra bytes.
+ * @param ofs the metadata log being written
+ * @param key the blob's composite key
+ * @param blob_info the blob, held under its write token
+ */
+static void WriteBlobTimesEntry(std::ofstream &ofs, const std::string &key,
+                                const BlobInfo &blob_info) {
+  const uint8_t entry_type = 6;
+  const uint32_t key_len = static_cast<uint32_t>(key.size());
+  const clio::run::u64 times[3] = {SteadyToWallNs(blob_info.last_modified_),
+                                   SteadyToWallNs(blob_info.last_read_),
+                                   blob_info.access_count_};
+  ofs.write(reinterpret_cast<const char *>(&entry_type), sizeof(entry_type));
+  ofs.write(reinterpret_cast<const char *>(&key_len), sizeof(key_len));
+  ofs.write(key.data(), key_len);
+  ofs.write(reinterpret_cast<const char *>(times), sizeof(times));
+}
+
 clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadataTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->entries_flushed_ = 0;
@@ -7276,6 +7324,7 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
         ofs.write(reinterpret_cast<const char *>(&size), sizeof(size));
       }
       task->entries_flushed_++;
+      WriteBlobTimesEntry(ofs, key, blob_info);
 
       // Entry type 4 == one replica's layout (issue #886), written right
       // after its blob's record so restore can attach it to the
@@ -8211,7 +8260,7 @@ void Runtime::RestoreMetadataFromLog() {
       // post-restart reads/rebuilds see empty blobs. The WAL-replay path
       // below already did this; the snapshot path forgot.
       blob_info.RecomputeTotalSize();
-      blob_info.lost_bytes_ = snap_lost_bytes;
+      blob_info.SetRestoreLoss(snap_lost_bytes);
       if (snap_lost_bytes != 0) {
         // As in WAL replay: what a restart lost (#1147, #1163), summarized.
         NoteRestoreLoss(snap_lost_bytes);
@@ -8306,6 +8355,24 @@ void Runtime::RestoreMetadataFromLog() {
         BlobBlock block(bdev_client, target_query, offset, size);
         rep->blocks_.push_back(block);
         rep->total_size_cache_ += size;
+      }
+
+    } else if (entry_type == 6) {
+      // A blob's access times (issue #796), attached to the blob whose record
+      // FlushMetadata wrote just before it. Stored as wall clock; converted
+      // back to this boot's steady clock.
+      std::string composite_key;
+      if (!read_str(composite_key, "blob times key length")) break;
+      clio::run::u64 times[3];
+      ifs.read(reinterpret_cast<char *>(times), sizeof(times));
+      if (!ifs.good()) break;
+      std::shared_ptr<BlobInfo> blob_info_ptr =
+          tag_blob_name_to_info_.get(composite_key);
+      if (blob_info_ptr) {
+        blob_info_ptr->last_modified_ = WallToSteadyNs(times[0]);
+        blob_info_ptr->last_read_ = WallToSteadyNs(times[1]);
+        blob_info_ptr->access_count_ = times[2];
+        MirrorBlobToShm(composite_key, *blob_info_ptr);
       }
 
     } else {
@@ -8644,6 +8711,10 @@ void Runtime::ApplyWalCreateNewBlob(const std::vector<char> &payload,
   BlobInfo blob_info;
   blob_info.blob_name_ = txn.blob_name_;
   blob_info.score_ = txn.score_;
+  // Issue #796: a recovered blob keeps its write time. Left at 0 it read as
+  // "never written", so TemporalSearch skipped every pre-restart blob.
+  blob_info.last_modified_ = WallToSteadyNs(txn.wall_ns_);
+  blob_info.last_read_ = blob_info.last_modified_;
   // Carry over any transform mark already restored for this key (issue
   // #818). The WAL is only truncated once it exceeds a size threshold, so a
   // kCreateNewBlob record can outlive the metadata flush that recorded the
@@ -8672,6 +8743,13 @@ void Runtime::ApplyWalCreateNewBlob(const std::vector<char> &payload,
       // genuine delete+recreate never reaches this carry-over.
       blob_info.blocks_ = existing->blocks_;
       blob_info.RecomputeTotalSize();
+      // And the TIMES (#796): a snapshot restored before this record can
+      // hold a later write than the create.
+      blob_info.last_modified_ =
+          std::max(blob_info.last_modified_, existing->last_modified_);
+      blob_info.last_read_ =
+          std::max(blob_info.last_read_, existing->last_read_);
+      blob_info.access_count_ = existing->access_count_;
     }
   }
   tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
@@ -8732,7 +8810,11 @@ void Runtime::ApplyWalExtendBlob(const std::vector<char> &payload,
       blob_info_ptr->blocks_.push_back(block);
     }
     blob_info_ptr->RecomputeTotalSize();  // blocks_ rebuilt: resync cache
-    blob_info_ptr->lost_bytes_ = lost_bytes;
+    blob_info_ptr->SetRestoreLoss(lost_bytes);
+    // A content change carries its write time (#796); a layout-only record
+    // (reorganize, rollback) leaves the time alone.
+    blob_info_ptr->last_modified_ = std::max(blob_info_ptr->last_modified_,
+                                             WallToSteadyNs(txn.wall_ns_));
     if (lost_bytes != 0) {
       // Part (or all) of the blob lived on a volatile tier: it comes back
       // SHORT or EMPTY, and reads into the lost range fail rather than
@@ -9339,6 +9421,7 @@ std::shared_ptr<BlobInfo> Runtime::CreateNewBlob(const std::string &blob_name,
     txn.tag_minor_ = tag_id.minor_;
     txn.blob_name_ = blob_name;
     txn.score_ = blob_score;
+    txn.wall_ns_ = GetWallTimeNs();  // restored on replay (#796)
     blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kCreateNewBlob,
                                                      txn);
   }
@@ -10121,6 +10204,7 @@ clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 ne
   // The kept blocks span exactly [0, new_size) (the boundary block was trimmed),
   // so the O(1) size cache is precisely new_size.
   blob_info.total_size_cache_ = new_size;
+  blob_info.NoteTruncated(new_size);  // lost bytes past the cut are discarded
 
   // Free the dropped blocks, grouped by pool, and credit remaining_space_
   // (mirrors FreeAllBlobBlocks).
@@ -10174,6 +10258,36 @@ clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 ne
   CLIO_TASK_BODY_END
 }
 
+namespace {
+/**
+ * Whether two pool queries name the same place: the same routing mode, and
+ * for DirectId / DirectHash the same container id / hash.
+ * @param a a query
+ * @param b another
+ * @return true if a write to either lands on the same container
+ */
+bool SameRoute(const clio::run::PoolQuery &a, const clio::run::PoolQuery &b) {
+  if (a.GetRoutingMode() != b.GetRoutingMode()) return false;
+  if (a.IsDirectIdMode()) return a.GetContainerId() == b.GetContainerId();
+  if (a.IsDirectHashMode()) return a.GetHash() == b.GetHash();
+  return true;
+}
+}  // namespace
+
+void Runtime::FlushWriteRun(
+    WriteRun &run, ctp::ipc::ShmPtr<> data,
+    std::vector<clio::run::Future<clio::run::bdev::WriteTask>> &write_tasks,
+    std::vector<size_t> &expected_write_sizes,
+    std::vector<std::pair<clio::run::u64, clio::run::u64>> &write_targets) {
+  if (!run.open) return;
+  clio::run::bdev::Client client = run.client;
+  write_tasks.push_back(client.AsyncWrite(run.query, run.blocks,
+                                          data + run.data_off, run.size));
+  expected_write_sizes.push_back(run.size);
+  write_targets.emplace_back(run.pool.ToU64(), run.first_off);
+  run.open = false;
+}
+
 clio::run::TaskResume Runtime::ModifyExistingData(
     const clio::run::priv::vector<BlobBlock> &blocks, ctp::ipc::ShmPtr<> data, size_t data_size,
     size_t data_offset_in_blob, clio::run::u32 &error_code,
@@ -10198,6 +10312,7 @@ clio::run::TaskResume Runtime::ModifyExistingData(
   std::vector<clio::run::Future<clio::run::bdev::WriteTask>> write_tasks;
   std::vector<size_t> expected_write_sizes;
   std::vector<std::pair<clio::run::u64, clio::run::u64>> write_targets;
+  WriteRun run;
 
   // Step 2: Store the offset of the block in the blob. Normally the first block
   // is at offset 0; a tail-write hint lets the caller start mid-list (the block
@@ -10282,23 +10397,31 @@ clio::run::TaskResume Runtime::ModifyExistingData(
         }
       }
 
-      // Wrap single block in clio::run::priv::vector for AsyncWrite
+      // One write per run of consecutive blocks on the same target (#1160):
+      // a 1 MiB page used to reach safe_bdev as 16 single-chunk writes that
+      // each paid an intent-log, stripe-lock and parity cycle and contended
+      // on the stripes they shared. As one write it is a whole stripe,
+      // encoded from its own bytes. The transports write a block list from
+      // one contiguous buffer, which consecutive blocks of a put are.
       timer.Resume();
-      clio::run::priv::vector<clio::run::bdev::Block> blocks(CTP_MALLOC);
-      blocks.push_back(bdev_block);
-      timer.Pause();
-      t_vec_alloc_ms += timer.GetMsec();
-      timer.Reset();
-
-      // Create and send the async write task
-      timer.Resume();
-      clio::run::bdev::Client cte_clientcopy = block.bdev_client_;
-      auto write_task = cte_clientcopy.AsyncWrite(block.target_query_, blocks,
-                                                  data_ptr, write_size);
-      write_tasks.push_back(std::move(write_task));
-      expected_write_sizes.push_back(write_size);
-      write_targets.emplace_back(block.bdev_client_.pool_id_.ToU64(),
-                                 bdev_block.offset_);
+      if (run.open && run.pool == block.bdev_client_.pool_id_ &&
+          SameRoute(run.query, block.target_query_) &&
+          run.data_off + run.size == data_buffer_offset) {
+        run.blocks.push_back(bdev_block);
+        run.size += write_size;
+      } else {
+        FlushWriteRun(run, data, write_tasks, expected_write_sizes,
+                      write_targets);
+        run.open = true;
+        run.pool = block.bdev_client_.pool_id_;
+        run.query = block.target_query_;
+        run.client = block.bdev_client_;
+        run.blocks.clear();
+        run.blocks.push_back(bdev_block);
+        run.data_off = data_buffer_offset;
+        run.size = write_size;
+        run.first_off = bdev_block.offset_;
+      }
       timer.Pause();
       t_async_send_ms += timer.GetMsec();
       timer.Reset();
@@ -10309,6 +10432,7 @@ clio::run::TaskResume Runtime::ModifyExistingData(
     // Update block offset for next iteration
     block_offset_in_blob += block.size_;
   }
+  FlushWriteRun(run, data, write_tasks, expected_write_sizes, write_targets);
 
   // Step 7: Wait for all Async write operations to complete
   timer.Resume();
@@ -11010,7 +11134,9 @@ clio::run::TaskResume Runtime::GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask
     // Step 1: Check if blob exists
     std::shared_ptr<BlobInfo> blob_info_ptr = CheckBlobExists(blob_name, tag_id);
     if (blob_info_ptr == nullptr) {
-      task->return_code_ = 1;  // Blob not found
+      // Not found -- or unknowable, while this container stands in for the
+      // blob's dead owner without its copies (#1166).
+      task->return_code_ = NotFoundRc(tag_id, blob_name);
       CLIO_CO_RETURN;
     }
 
@@ -11042,8 +11168,9 @@ clio::run::TaskResume Runtime::GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask
       // through the lost range -- which fails and is served from a replica
       // -- rather than build a shorter copy that it then believes complete
       // (#1164). The split is reported so a heal can see what is stored.
-      task->size_ = blob_info_ptr->GetTotalSize() + blob_info_ptr->lost_bytes_;
-      task->lost_bytes_ = blob_info_ptr->lost_bytes_;
+      task->size_ = blob_info_ptr->LogicalSize();
+      task->lost_bytes_ =
+          blob_info_ptr->LogicalSize() - blob_info_ptr->GetTotalSize();
     }
 
     // Step 3: Update timestamps and log telemetry
@@ -11401,6 +11528,20 @@ clio::run::TaskResume Runtime::TemporalSearch(
 // ==============================================================================
 // Helper Functions for Dynamic Scheduling
 // ==============================================================================
+
+clio::run::u32 Runtime::NotFoundRc(const TagId &tag_id,
+                                   const std::string &blob_name) {
+  auto *pm = CLIO_POOL_MANAGER;
+  const clio::run::PoolInfo *info = pm->GetPoolInfo(pool_id_);
+  const clio::run::u32 n = info != nullptr ? info->num_containers_ : 0;
+  if (n <= 1) return 1;
+  const clio::run::u32 owner = BlobHash(tag_id, blob_name) % n;
+  if (owner == container_id_ || ContainerNodeAlive(pool_id_, owner)) return 1;
+  // Standing in for the dead owner without its copies: unknowable here.
+  return FailoverContainer(pool_id_, owner) == container_id_
+             ? kBlobOwnerDownRc
+             : 1;
+}
 
 bool Runtime::ServesBlob(const BlobInfo &blob_info, const TagId &tag_id,
                          const std::string &blob_name) {

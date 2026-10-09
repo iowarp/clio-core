@@ -1,40 +1,15 @@
 # IOWarp Core - Full Variant (Source Build)
-# Custom build with all optional features enabled (CUDA + MPI)
+# The release preset plus MPI, HDF5, ELF interception and CUDA.
 #
-# Usage: IOWARP_PRESET=custom conda build installers/conda/ -c conda-forge
+# Usage:
+#   IOWARP_PRESET=release \
+#   IOWARP_CMAKE_ARGS="-DCLIO_CORE_ENABLE_MPI=ON -DCLIO_CORE_ENABLE_HDF5=ON \
+#     -DCLIO_CORE_ENABLE_ELF=ON -DCLIO_CORE_ENABLE_CUDA=ON" \
+#   conda build installers/conda/ -c conda-forge
+#
+# (This file used to say IOWARP_PRESET=custom, a preset CMakePresets.json
+# does not define, and listed options such as mpi_enabled that the recipe
+# never read, so the variant could not build at all -- #1195.)
 
 preset:
-  - custom
-
-build_type:
-  - Release
-
-# Enable CUDA (Linux only)
-cuda_enabled:
-  - "ON"
-rocm_enabled:
-  - "OFF"
-
-# Enable MPI
-mpi_enabled:
-  - "ON"
-mpi_impl:
-  - openmpi
-
-# All core components
-runtime_enabled:
-  - "ON"
-cte_enabled:
-  - "ON"
-cae_enabled:
-  - "ON"
-cee_enabled:
-  - "ON"
-
-# All optional features
-zmq_enabled:
-  - "ON"
-hdf5_enabled:
-  - "ON"
-elf_enabled:
-  - "ON"
+  - release

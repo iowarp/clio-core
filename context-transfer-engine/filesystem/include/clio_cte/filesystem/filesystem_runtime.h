@@ -906,6 +906,10 @@ class Runtime : public clio::run::Container {
   // and broadcast in batches by the periodic drain.
   std::mutex tn_mu_;             ///< guards tn_batch_ (taken after ns_mu_)
   std::string tn_batch_;         ///< EncodeTagNameOp records not yet sent
+  /** Consecutive failed tag-name broadcasts; the batch is re-queued for up
+   *  to kNameFlushRetries of them (#1182). */
+  clio::run::u32 tn_flush_failures_ = 0;
+  static constexpr clio::run::u32 kNameFlushRetries = 30;
   bool catchup_pending_ = false; ///< restart: rebuild names on this node
   int catchup_attempts_ = 0;
   std::unordered_set<clio::run::u32> catchup_missing_;  ///< peers not yet heard
@@ -1040,8 +1044,13 @@ class Runtime : public clio::run::Container {
    * Make sure an inode this container homes is in memory: after a restart
    * inodes load lazily from their records.
    * @param packed inode id
+   * @param err if not null, receives EIO when the record could not be read
+   *        (its owner's node is down with no copy reachable, #1166; a lost
+   *        block; a malformed record) -- as opposed to no record existing,
+   *        which leaves it 0. A caller that finds no inode afterwards must
+   *        answer EIO, not ENOENT, when it is set.
    */
-  clio::run::TaskResume EnsureInode(clio::run::u64 packed);
+  clio::run::TaskResume EnsureInode(clio::run::u64 packed, int *err = nullptr);
   /**
    * Stat an inode: the home's own copy, else this container's cached copy,
    * else a fetch from the home (which registers this container for pushes).

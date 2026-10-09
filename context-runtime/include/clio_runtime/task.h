@@ -877,6 +877,14 @@ typedef ctp::ipc::multi_ext_spsc_queue<Future<Task>, CLIO_QUEUE_ALLOC_T>
 
 namespace clio::run {
 
+/**
+ * Drop one in-flight task from a SHM client's count (#1192). Defined in
+ * ipc_manager.cc; RunContext's destructor calls it so this header does not
+ * need IpcManager.
+ * @param pid the client process the task was admitted from
+ */
+void ReleaseClientInflight(u32 pid);
+
 // ============================================================================
 // RunContext (uses Future<Task> and TaskLane* - both must be complete above)
 // ============================================================================
@@ -941,6 +949,9 @@ class RunContext {
   //      and read at SendOut.
   ClientOrigin origin_;            /**< Origin transport mode (completion path) */
   u32 client_pid_;                 /**< Client PID for per-client routing */
+  /** Admitted from a SHM client: this context holds one in-flight count on
+   *  client_pid_ (released by the destructor). Runtime-side only. */
+  bool counts_client_inflight_ = false;
   /** Client's net_key (task vaddr) captured at RecvIn and restored onto
    *  task_id_.net_key_ at SendOut, because AllocLoadTask reassigns the server
    *  task's identity. The ZMQ recv thread keys pending_zmq_futures_ by this, so
@@ -1173,6 +1184,10 @@ class RunContext {
    * not here.
    */
   ~RunContext() {
+    // #1192: a task admitted from a SHM client pins that client's segments
+    // (its ShmPtrs may be resolved to raw pointers held across yields) until
+    // the task is gone.
+    if (counts_client_inflight_) ReleaseClientInflight(client_pid_);
 #if defined(CLIO_ENABLE_BOOST_COROUTINES)
     coro_handle_ = clio::run::detail::FiberHandle{};
     // fiber_state_ (and its boost::context::fiber) destructs next, freeing the

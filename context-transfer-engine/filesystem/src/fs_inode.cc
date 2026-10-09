@@ -404,10 +404,12 @@ clio::run::TaskResume Runtime::StatInode(clio::run::u64 packed,
   resp = FsResp();
   const clio::run::u32 home = InodeOwner(packed);
   if (home == container_id_) {
-    CLIO_CO_AWAIT(EnsureInode(packed));
+    int load_err = 0;
+    CLIO_CO_AWAIT(EnsureInode(packed, &load_err));
     std::shared_ptr<FileInfo> fi = FindInode(packed);
     if (fi == nullptr) {
-      resp.rc_ = ENOENT;
+      // A record that could not be read is not a missing inode (#1166).
+      resp.rc_ = load_err != 0 ? static_cast<clio::run::u32>(load_err) : ENOENT;
       CLIO_CO_RETURN;
     }
     std::lock_guard<std::mutex> g(meta_mu_);
@@ -511,8 +513,9 @@ int Runtime::ApplyInodePush(const FsReq &req) {
   return 0;
 }
 
-clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed) {
+clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed, int *err) {
   CLIO_TASK_BODY_BEGIN
+  if (err != nullptr) *err = 0;
   if (packed == 0 || InodeOwner(packed) != container_id_ ||
       FindInode(packed) != nullptr || IsDying(packed)) {
     CLIO_CO_RETURN;
@@ -525,6 +528,13 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed) {
   const clio::cte::core::TagId tag = FsUnpack(packed);
   auto sz = cte_.AsyncGetBlobSize(tag, kInodeBlob);
   CLIO_CO_AWAIT(sz);
+  // Only "no such blob" means there is no record. Anything else (the
+  // record's owner down with no copy reachable, #1166; a lost block) is a
+  // read failure: the inode may well exist, and the caller must say EIO.
+  if (sz->GetReturnCode() != 0 && sz->GetReturnCode() != kCteBlobNotFoundRc) {
+    if (err != nullptr) *err = EIO;
+    CLIO_CO_RETURN;
+  }
   if (sz->GetReturnCode() != 0 || sz->size_ == 0) CLIO_CO_RETURN;
   std::string rec(sz->size_, '\0');
   auto g = cte_.AsyncGetBlob(tag, kInodeBlob, 0, rec.size(), 0u, rec.data());
@@ -536,6 +546,7 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed) {
   if (g->GetReturnCode() != 0 ||
       !DecInodeRec(rec, fi.get(), &size, &writer, &fresh)) {
     HLOG(kError, "filesystem: inode record {} unreadable", packed);
+    if (err != nullptr) *err = EIO;
     CLIO_CO_RETURN;
   }
   fi->tag_id_ = tag;

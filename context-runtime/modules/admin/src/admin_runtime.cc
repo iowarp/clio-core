@@ -1491,9 +1491,11 @@ clio::run::TaskResume Runtime::WreapDeadIpcs(clio::run::shared_ptr<WreapDeadIpcs
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   auto *ipc_manager = CLIO_IPC;
 
-  // Call IpcManager::WreapDeadIpcs to reap shared memory from dead processes
-  // task->reaped_count_ = ipc_manager->WreapDeadIpcs();
-  task->reaped_count_ = 0;
+  // Reap shared memory from dead (or zombie) client processes. Disabled earlier because
+  // reaping was not safe (7c37a1bed); it now skips any client that still has
+  // tasks in flight or was active within runtime.client_reap_grace_s, which
+  // also disables it when set to 0 (#1192).
+  task->reaped_count_ = ipc_manager->WreapDeadIpcs();
 
   // Mark whether we did work (for periodic task efficiency tracking)
   if (task->reaped_count_ > 0) {
@@ -1751,6 +1753,20 @@ void Runtime::ReapProgressProbes(std::chrono::steady_clock::time_point now,
             pq.gen);
       }
       probe_failures_.erase(pq.target_node_id);
+      if (ipc_manager->GetNodeState(pq.target_node_id) ==
+          clio::run::NodeState::kDead) {
+        // #1222: a node we held dead answered: it is back. Same path SWIM
+        // takes on a rejoin (issue #856): drop the state parked for it, then
+        // mark it alive so routing, retries and the dead-node sweep stop
+        // treating it as gone.
+        HLOG(kWarning,
+             "[TaskProgress] node {} answered a liveness probe -- REJOINED, "
+             "marking alive",
+             pq.target_node_id);
+        run2run->FlushStaleStateForNode(pq.target_node_id);
+        ipc_manager->SetAlive(pq.target_node_id);
+        last_dead_reprobe_.erase(pq.target_node_id);
+      }
     } else {
       NoteProbeFailure(pq.target_node_id);
     }
@@ -1808,12 +1824,28 @@ void Runtime::FireIdleProbes() {
     busy.insert(pq.target_node_id);
   }
   const clio::run::u64 self = ipc_manager->GetNodeId();
+  const auto now = std::chrono::steady_clock::now();
   for (clio::run::u64 node : ipc_manager->GetNodeIds()) {
     if (node == self || busy.count(node) != 0) continue;
-    if (ipc_manager->GetNodeState(node) == clio::run::NodeState::kDead) continue;
-    const clio::run::u64 heard_ns = ipc_manager->NsSinceHeardFrom(node);
-    if (heard_ns == ~clio::run::u64(0) || heard_ns / 1e9 < kIdleProbeSec) {
-      continue;
+    const bool dead =
+        ipc_manager->GetNodeState(node) == clio::run::NodeState::kDead;
+    if (dead) {
+      // #1222: keep knocking on a dead node's door, slowly, so a node that
+      // only lost connectivity can answer and rejoin. Nothing else ever
+      // reaches it: its own sends to us are parked because it holds us dead.
+      auto lt = last_dead_reprobe_.find(node);
+      if (lt != last_dead_reprobe_.end() &&
+          std::chrono::duration<float>(now - lt->second).count() <
+              kDeadReprobeSec) {
+        continue;
+      }
+      last_dead_reprobe_[node] = now;
+    } else {
+      last_dead_reprobe_.erase(node);
+      const clio::run::u64 heard_ns = ipc_manager->NsSinceHeardFrom(node);
+      if (heard_ns == ~clio::run::u64(0) || heard_ns / 1e9 < kIdleProbeSec) {
+        continue;
+      }
     }
     clio::run::PoolQuery q =
         clio::run::PoolQuery::Physical(static_cast<clio::run::u32>(node));
@@ -1821,6 +1853,7 @@ void Runtime::FireIdleProbes() {
     auto task = ipc_manager->NewTask<QueryTaskProgressTask>(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, q, kIdleProbeKey,
         0u);
+    task->SetFlags(TASK_LIVENESS_PROBE);  // transmitted even to a dead node
     auto fut = ipc_manager->Send(task);
     pending_progress_queries_.push_back(
         {std::move(fut), kIdleProbeKey, 0u, 0ull, node,

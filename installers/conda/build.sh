@@ -34,8 +34,9 @@ cmake --preset="${PRESET}" \
     -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
     -DCMAKE_PREFIX_PATH="${PREFIX}" \
     -DCMAKE_FIND_ROOT_PATH="${PREFIX}" \
-    -DWRP_CORE_ENABLE_CONDA=ON \
-    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}"
+    -DCLIO_CORE_ENABLE_CONDA=ON \
+    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+    ${IOWARP_CMAKE_ARGS:-}
 
 cmake --build build --parallel "${CPU_COUNT}"
 cmake --install build

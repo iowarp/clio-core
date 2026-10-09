@@ -3174,6 +3174,95 @@ ClientShmInfo IpcManager::GetClientShmInfo(u32 index) const {
   return ClientShmInfo(shm_name, pid, index, size, alloc_id);
 }
 
+namespace {
+/**
+ * Is the client process that owns a segment gone for reaping purposes?
+ * kill(pid, 0) alone is not enough: a zombie (exited, parent has not
+ * waited) still answers, yet it has released every fd, so its memfd
+ * segments are kept alive only by our mapping and are reclaimable. On
+ * Linux the state letter in /proc/<pid>/stat tells the two apart.
+ * @param pid the owning process id
+ * @return true when the process is dead or a zombie
+ */
+bool ClientProcessGone(int pid) {
+  if (!ctp::SystemInfo::IsProcessAlive(pid)) return true;
+#if defined(__linux__)
+  std::ifstream st("/proc/" + std::to_string(pid) + "/stat");
+  std::string line;
+  if (st && std::getline(st, line)) {
+    // "<pid> (<comm>) <state> ..." -- comm may contain spaces/parens, so
+    // take the state from after the LAST ')'.
+    auto rp = line.rfind(')');
+    if (rp != std::string::npos && rp + 2 < line.size()) {
+      return line[rp + 2] == 'Z';
+    }
+  }
+#endif
+  return false;
+}
+
+/** Steady-clock nanoseconds (the reaper's grace bookkeeping). */
+u64 SteadyNowNs() {
+  return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count());
+}
+}  // namespace
+
+void ReleaseClientInflight(u32 pid) {
+  auto *ipc = CLIO_IPC;
+  if (ipc != nullptr) ipc->ReleaseClientInflightCount(pid);
+}
+
+void IpcManager::AcquireClientInflight(u32 pid) {
+  std::lock_guard<std::mutex> lk(client_activity_mu_);
+  ClientActivity &a = client_activity_[pid];
+  a.inflight++;
+  a.last_admit_ns = SteadyNowNs();
+  a.dead_since_ns = 0;  // it just sent a task: not dead
+}
+
+void IpcManager::ReleaseClientInflightCount(u32 pid) {
+  std::lock_guard<std::mutex> lk(client_activity_mu_);
+  auto it = client_activity_.find(pid);
+  if (it != client_activity_.end() && it->second.inflight > 0) {
+    it->second.inflight--;
+  }
+}
+
+u64 IpcManager::GetClientInflight(u32 pid) {
+  std::lock_guard<std::mutex> lk(client_activity_mu_);
+  auto it = client_activity_.find(pid);
+  return it == client_activity_.end() ? 0 : it->second.inflight;
+}
+
+bool IpcManager::ClientReapable(u32 pid, u64 grace_ns) {
+  const u64 now = SteadyNowNs();
+  std::lock_guard<std::mutex> lk(client_activity_mu_);
+  ClientActivity &a = client_activity_[pid];
+  if (a.dead_since_ns == 0) a.dead_since_ns = now;
+  if (a.inflight != 0) return false;
+  if (now - a.dead_since_ns < grace_ns) return false;
+  if (a.last_admit_ns != 0 && now - a.last_admit_ns < grace_ns) return false;
+  return true;
+}
+
+void IpcManager::ForgetReapedClients(const std::vector<u32> &pids) {
+  if (pids.empty()) return;
+  {
+    std::lock_guard<std::mutex> lk(client_activity_mu_);
+    for (u32 pid : pids) client_activity_.erase(pid);
+  }
+#if CTP_IS_HOST
+  // The cached connection to each reaped client's response ring. Safe to
+  // drop: the client had no task in flight, so nothing can be sending to it.
+  std::lock_guard<std::mutex> lk(shm_conns_mutex_);
+  for (u32 pid : pids) {
+    shm_conns_.erase("clio-" + std::to_string(pid) + "-shm-out");
+  }
+#endif
+}
+
 size_t IpcManager::WreapDeadIpcs() {
   HLOG(kDebug, "WreapDeadIpcs CALLED");
   std::lock_guard<std::mutex> lock(shm_mutex_);
@@ -3182,6 +3271,16 @@ size_t IpcManager::WreapDeadIpcs() {
 
   int current_pid = ctp::SystemInfo::GetPid();
   size_t reaped_count = 0;
+  // #1192: 0 disables reaping while running (ClearUserIpcs still cleans up
+  // at the next start).
+  auto *config = CLIO_CONFIG_MANAGER;
+  const u64 grace_s = config ? config->GetClientReapGraceS() : 30;
+  if (grace_s == 0) {
+    allocator_map_lock_.WriteUnlock();
+    return 0;
+  }
+  const u64 grace_ns = grace_s * 1000000000ull;
+  std::vector<u32> reaped_pids;
 
   // Build list of allocator keys to remove (can't modify map while iterating)
   std::vector<u64> keys_to_remove;
@@ -3204,8 +3303,10 @@ size_t IpcManager::WreapDeadIpcs() {
       continue;
     }
 
-    // Check if the owning process is still alive.
-    if (!ctp::SystemInfo::IsProcessAlive(owner_pid)) {
+    // Reap only a client that is gone (dead or a zombie) and none of whose
+    // tasks can still be reading its segments (#1192).
+    if (ClientProcessGone(owner_pid) &&
+        ClientReapable(static_cast<u32>(owner_pid), grace_ns)) {
       // Process is dead - mark for removal
       HLOG(kInfo,
            "WreapDeadIpcs: Process {} is dead, marking allocator ({}.{}) for "
@@ -3259,6 +3360,7 @@ size_t IpcManager::WreapDeadIpcs() {
     }
 
     // Remove from alloc_map_
+    reaped_pids.push_back(static_cast<u32>(map_it->first >> 32));
     alloc_map_.erase(map_it);
     reaped_count++;
   }
@@ -3271,6 +3373,7 @@ size_t IpcManager::WreapDeadIpcs() {
 
   // Release the lock before returning
   allocator_map_lock_.WriteUnlock();
+  ForgetReapedClients(reaped_pids);
 
   return reaped_count;
 }
@@ -4725,6 +4828,16 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
 
   // Check if task has already been routed - if so, return ExecHere
   if (task_ptr->IsRouted()) {
+    // Record the container that runs it (#503). RouteLocal does this for a
+    // task routed on this node, but a task routed here by ANOTHER node
+    // arrives already marked routed and never passes RouteLocal, so it went
+    // back with the origin's completer (0): every remote PutBlob/GetBlob in a
+    // 4-node cluster reported container 0. ExecContainer() is the container
+    // BeginRunContext / RouteLocal resolved for this node.
+    ContainerHold exec = task_ptr->ExecContainer().get();
+    if (exec) {
+      task_ptr->SetCompleter(exec->container_id_);
+    }
     return RouteResult::ExecHere;
   }
 

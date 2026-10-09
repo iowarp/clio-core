@@ -522,6 +522,23 @@ set_target_properties(${RUNTIME_CLEANUP_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Address-table WAL replay order (#1193)
+add_executable(test_address_table_wal test_address_table_wal.cc)
+target_include_directories(test_address_table_wal PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+)
+target_link_libraries(test_address_table_wal
+  clio_run_cxx
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+set_target_properties(test_address_table_wal PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Create IPC Errors test executable
 add_executable(${IPC_ERRORS_TEST_TARGET} ${IPC_ERRORS_TEST_SOURCES})
 
@@ -1249,6 +1266,17 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 120
   )
 
+  add_test(
+    NAME cr_address_table_wal
+    COMMAND test_address_table_wal
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_address_table_wal PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+    RESOURCE_LOCK "clio_runtime"
+    TIMEOUT 120
+  )
+
   # Worker load-reservation Tests (no server, no GPU — safe to run anywhere)
   add_test(
     NAME cr_worker_reservation_tests
@@ -1325,6 +1353,21 @@ if(CLIO_CORE_ENABLE_TESTS)
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 300
   )
+  # issue #1039: a request that reaches the runtime before its pool exists
+  # (client started mid-compose) must be held until the pool is created, not
+  # consumed and dropped. One case per client ingress path.
+  foreach(_late_mode SHM TCP)
+    string(TOLOWER "${_late_mode}" _late_lc)
+    add_test(
+      NAME cr_ipc_transport_${_late_lc}_late_pool
+      COMMAND ${IPC_TRANSPORT_MODES_TEST_TARGET} "IpcTransportMode - ${_late_mode} Task Before Pool Exists"
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cr_ipc_transport_${_late_lc}_late_pool PROPERTIES
+      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+      TIMEOUT 300
+    )
+  endforeach()
   endif()  # NOT WIN32 (ipc_transport_modes tests)
 
   # Shutdown Battletest (issue #710) — POSIX-only. Each scenario runs in its
@@ -1651,8 +1694,12 @@ if(CLIO_CORE_ENABLE_MPI)
               ${MPIEXEC_POSTFLAGS}
       WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
+    # 4 ranks: OpenMPI refuses to start more ranks than it counts slots
+    # (physical cores), so a small VM or laptop failed this before the test
+    # ran. The MCA env var lets it oversubscribe; MPICH ignores it (unlike
+    # --oversubscribe, which MPICH rejects).
     set_tests_properties(cr_mpi_bdev_transport_all_modes PROPERTIES
-      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500;OMPI_MCA_rmaps_base_oversubscribe=1"
       RESOURCE_LOCK "clio_runtime"
       TIMEOUT 300
     )

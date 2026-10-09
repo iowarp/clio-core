@@ -39,3 +39,16 @@ jobs:
         spack repo add installers/spack
         spack install iowarp+posix
         spack load iowarp+posix
+
+    # A variant that maps to a dead CMake flag still installs cleanly, so
+    # check the feature was actually built (#1194).
+    - name: Verify the POSIX adapter was installed
+      run: |
+        . ./spack/share/spack/setup-env.sh
+        prefix=$(spack location -i iowarp+posix)
+        lib=$(find "$prefix" -name 'libclio_cte_posix.so*' | head -1)
+        if [ -z "$lib" ]; then
+          echo "::error::iowarp+posix installed without libclio_cte_posix.so"
+          exit 1
+        fi
+        echo "found $lib"

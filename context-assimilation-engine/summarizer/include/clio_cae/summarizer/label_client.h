@@ -50,6 +50,24 @@ bool OllamaGenerate(const std::string &endpoint_base,
                     int num_predict,
                     std::string &out_response);
 
+namespace detail {
+
+/**
+ * The CURLOPT_NOPROXY list OllamaGenerate installs: loopback, followed by
+ * whatever the environment's no_proxy (or NO_PROXY, when no_proxy is unset or
+ * empty) already asked to bypass.
+ *
+ * Exposed because the behaviour worth pinning cannot be observed through
+ * OllamaGenerate. CURLOPT_NOPROXY REPLACES libcurl's own reading of no_proxy
+ * rather than adding to it, so a client that listed only loopback would
+ * silently push a site's internal hosts back through the proxy -- yet a test
+ * calling a loopback endpoint succeeds either way. Only the list itself
+ * distinguishes the two.
+ */
+std::string LoopbackNoProxyList();
+
+}  // namespace detail
+
 }  // namespace clio::cae::summarizer
 
 #endif  // CLIO_CAE_SUMMARIZER_LABEL_CLIENT_H_

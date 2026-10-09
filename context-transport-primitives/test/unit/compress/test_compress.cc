@@ -170,6 +170,66 @@ TEST_CASE("TestCompress") {
 #endif  // CTP_ENABLE_BLOSC2
 }
 
+#if CTP_ENABLE_SNAPPY
+// Snappy must refuse a too-small output buffer instead of writing past it,
+// and reject a corrupt stream (#1214). Canary bytes after the advertised
+// capacity catch an overrun even without a sanitizer.
+TEST_CASE("SnappyBoundsAndRoundTrip") {
+  const size_t kRaw = 1 << 20;
+  std::vector<char> raw(kRaw);
+  for (size_t i = 0; i < kRaw; ++i) {
+    raw[i] = static_cast<char>((i * 31 + (i >> 9)) & 0x7f);
+  }
+  ctp::Snappy snappy;
+  const size_t kSlack = 4096;
+  const char kCanary = static_cast<char>(0xA5);
+  auto canary_intact = [&](const std::vector<char> &buf, size_t from) {
+    for (size_t i = from; i < buf.size(); ++i) {
+      if (buf[i] != kCanary) return false;
+    }
+    return true;
+  };
+
+  // Round trip through properly sized buffers.
+  std::vector<char> cmp(kRaw * 2);
+  size_t cmp_size = cmp.size();
+  REQUIRE(snappy.Compress(cmp.data(), cmp_size, raw.data(), kRaw));
+  REQUIRE(cmp_size < kRaw);
+  std::vector<char> out(kRaw);
+  size_t out_size = out.size();
+  REQUIRE(snappy.Decompress(out.data(), out_size, cmp.data(), cmp_size));
+  REQUIRE(out_size == kRaw);
+  REQUIRE(out == raw);
+
+  // Compress into a buffer smaller than snappy's worst case: refused, and
+  // nothing past the advertised capacity is touched.
+  {
+    std::vector<char> small(1024 + kSlack, kCanary);
+    size_t cap = 1024;
+    REQUIRE_FALSE(snappy.Compress(small.data(), cap, raw.data(), kRaw));
+    REQUIRE(canary_intact(small, 1024));
+  }
+  // Decompress into a buffer smaller than the decoded size: refused, no
+  // overrun (the old unchecked sink wrote the whole megabyte).
+  {
+    std::vector<char> small(kRaw / 2 + kSlack, kCanary);
+    size_t cap = kRaw / 2;
+    REQUIRE_FALSE(snappy.Decompress(small.data(), cap, cmp.data(), cmp_size));
+    REQUIRE(canary_intact(small, kRaw / 2));
+  }
+  // A corrupt stream is rejected.
+  {
+    std::vector<char> bad(cmp.begin(), cmp.begin() + cmp_size);
+    for (size_t i = 16; i < bad.size(); i += 97) bad[i] ^= 0x5a;
+    std::vector<char> sink(kRaw + kSlack, kCanary);
+    size_t cap = kRaw;
+    const bool ok = snappy.Decompress(sink.data(), cap, bad.data(), bad.size());
+    REQUIRE((!ok || cap <= kRaw));
+    REQUIRE(canary_intact(sink, kRaw));
+  }
+}
+#endif  // CTP_ENABLE_SNAPPY
+
 #if CTP_ENABLE_ZFP_SYCL
 // zfp-sycl is lossy fixed-rate GPU (SYCL) compression. Requires a SYCL device
 // at runtime (e.g. ONEAPI_DEVICE_SELECTOR=opencl:cpu) and a SYCL-enabled libzfp

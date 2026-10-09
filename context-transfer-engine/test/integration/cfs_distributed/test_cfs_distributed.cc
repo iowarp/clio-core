@@ -45,6 +45,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -70,6 +71,7 @@ constexpr clio::run::u64 kInitSize = 2u * kMiB + 512u * 1024u;   // 2.5 MiB
 constexpr clio::run::u64 kModOff = 1u * kMiB - 64u * 1024u;      // 960 KiB
 constexpr clio::run::u64 kModLen = 128u * 1024u;                 // spans 1 MiB
 constexpr clio::run::u64 kFinalSize = 3u * kMiB + 512u * 1024u;  // 3.5 MiB
+constexpr const char *kSharedDir = "/dist685";
 constexpr const char *kSharedPath = "/dist685/shared.bin";
 // The CFS filesystem pool composed in clio_config.yaml (kCfsPoolId = 560.0).
 constexpr clio::run::u32 kCfsPoolMajor = 560;
@@ -116,6 +118,17 @@ int RunWriter() {
   clio::cte::filesystem::Client cfs;
   cfs.Init(clio::run::PoolId(kCfsPoolMajor, 0));
   auto *ipc = CLIO_IPC;
+
+  // The namespace has real directories: creating a file under a parent that
+  // does not exist is ENOENT, as POSIX says (#1229). Make the parent first;
+  // EEXIST (a rerun against a surviving namespace) is fine.
+  auto mkdir = cfs.AsyncMkdir(kSharedDir);
+  mkdir.Wait();
+  if (mkdir->GetReturnCode() != 0 && mkdir->GetReturnCode() != EEXIST) {
+    Log(role, "FAIL: AsyncMkdir rc=" +
+                  std::to_string(mkdir->GetReturnCode()));
+    return 3;
+  }
 
   auto open = cfs.AsyncOpen(kSharedPath, O_CREAT | O_RDWR, 0644);
   open.Wait();

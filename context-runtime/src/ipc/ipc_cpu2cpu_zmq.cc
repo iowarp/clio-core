@@ -27,6 +27,194 @@ namespace clio::run {
 static constexpr u32 kMaxClientResponseRetries = 32;
 static constexpr double kClientResponseRetryDropSec = 5.0;
 
+namespace {
+
+/**
+ * Point a TCP client request's response at the client's dial-back listener.
+ * TCP clients advertise an ephemeral response-listener port; open (or reuse
+ * from the connection cache) a dedicated dial-back DEALER to
+ * <identity-host>:<port> and route the response there instead of echoing back
+ * over the inbound ROUTER. The DEALER's identity is "hostname:pid", so the
+ * host part plus the advertised port is the listener address.
+ * @param ipc The runtime IpcManager (owns the dial-back connection cache).
+ * @param identity The client's ZMQ routing identity ("hostname:pid").
+ * @param client_port The client's advertised response-listener port.
+ * @param future The request's server-side Future; its FutureShm receives the
+ *        response transport, identity and port.
+ */
+void RouteTcpResponse(IpcManager *ipc, const std::string &identity,
+                      int client_port, Future<Task> &future) {
+  auto future_shm = future.GetFutureShm();
+  // Store for later eviction (issue #722): if SendOut exhausts retries
+  // to deliver the response, EvictClientByIdentity removes the cached
+  // dial-back connection so a retry gets a fresh connection.
+  future_shm->client_identity_ = identity;
+  future_shm->client_response_port_ = client_port;
+  // Fast path: open (or reuse) a dedicated dial-back DEALER to the
+  // client's ephemeral response listener at <identity-host>:<client_port>
+  // and route the response there, off the inbound ROUTER's sock_mtx_. A
+  // DEALER has a single peer so it auto-routes with no identity frame.
+  // This requires the client to advertise a response port (client_port_)
+  // AND present a parseable "hostname:pid" routing identity.
+  std::shared_ptr<ctp::lbm::Transport> dial_back;
+  size_t colon = identity.find(':');
+  const bool parseable_identity =
+      colon != std::string::npos &&
+      identity.find_first_not_of(
+          "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+          "0123456789.-:") == std::string::npos;
+  if (client_port > 0 && parseable_identity) {
+    std::string host = identity.substr(0, colon);
+    // Same-host client: dial loopback. The host part of the identity is
+    // the client's gethostname(); when it matches ours the client is on
+    // this machine, so 127.0.0.1 is both always resolvable and free of
+    // the LAN-interface firewall rules an external hostname would need.
+    // The cache key stays the full identity, so distinct clients never
+    // alias.
+    if (host == ctp::SystemInfo::GetHostname()) {
+      host = "127.0.0.1";
+    }
+    dial_back =
+        ipc->GetOrCreateClientByIdentity(identity, host, client_port);
+  }
+  // The inbound ROUTER is recv-only: responses NEVER go back over it (a
+  // worker Send racing the recv thread on the same non-thread-safe ZMQ
+  // socket is exactly what forced sock_mtx_ and deadlocked force_net).
+  // Every live client opens a response listener (client_port_ > 0) and
+  // connects with a "hostname:pid" identity, so dial-back always
+  // resolves. If it ever doesn't, the response is undeliverable — log and
+  // drop rather than echo over the ROUTER.
+  if (dial_back) {
+    // Hold the dial-back until this task is freed: the table is
+    // LRU-bounded and may evict it before SendOut runs (issue #1065).
+    future_shm->response_transport_ = dial_back.get();
+    future_shm->response_transport_owner_ = std::move(dial_back);
+    future_shm->response_identity_len_ = 0;  // DEALER: no identity frame
+  } else {
+    HLOG(kError,
+         "IpcCpu2CpuZmq::RecvIn: TCP client {} has no dial-back route "
+         "(client_port={}, identity='{}') — response undeliverable",
+         future_shm->client_pid_, client_port, identity);
+    future_shm->response_transport_ = nullptr;
+    future_shm->response_identity_len_ = 0;
+  }
+}
+
+}  // namespace
+
+/**
+ * Admit one received TCP/IPC client request: deserialize it with its pool's
+ * static container, stamp the client's response route on a new Future, and
+ * push it onto the ingress lane. Split out of RecvIn so a request held because
+ * its pool did not exist yet (issue #1039) is admitted by exactly the same
+ * code once the pool is created.
+ * @param ipc The runtime IpcManager.
+ * @param mode The client transport (kTcp or kIpc).
+ * @param transport The transport the request arrived on.
+ * @param archive The received request; its task is consumed and its
+ *        transport-owned receive handles are released.
+ * @param recv_info The transport's receive info (fd / routing identity).
+ * @return true if the request was enqueued for a worker.
+ */
+bool IpcCpu2CpuZmq::AdmitZmq(IpcManager *ipc, IpcMode mode,
+                             ctp::lbm::Transport *transport,
+                             LoadTaskArchive &archive,
+                             const ctp::lbm::ClientInfo &recv_info) {
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  const auto &info = archive.GetTaskInfos()[0];
+  PoolId pool_id = info.pool_id_;
+  u32 method_id = info.method_id_;
+  auto container = pool_manager->GetStaticContainer(pool_id).get();
+  if (!container) {
+    transport->ClearRecvHandles(archive);
+    return false;
+  }
+
+  // Allocate and deserialize the task
+  clio::run::shared_ptr<clio::run::Task> task_ptr =
+      container->AllocLoadTask(method_id, archive);
+
+  // SerializeIn copied any zmq-owned BULK_XFER payloads into
+  // CHI-owned buffers (LoadTaskArchive::bulk), so the zmq_msg_t
+  // handles in archive.recv[*].desc are now unreferenced. Free them
+  // here — this is the only place that closes them on the server
+  // inbound path; without it every inbound TCP bulk leaks one
+  // zmq_msg_t + its payload. Safe to call unconditionally: the zmq
+  // ClearRecvHandles only closes/deletes desc handles and leaves the
+  // (now CHI-owned) data buffers alone; SHM recv has desc==null so
+  // this is a no-op there.
+  transport->ClearRecvHandles(archive);
+
+  if (task_ptr.IsNull()) {
+    HLOG(kError, "IpcCpu2CpuZmq::RecvIn: Failed to deserialize task");
+    return false;
+  }
+
+  // This transport serves external user clients (TCP/IPC); runtime peers
+  // use the run2run path. Tag the task for per-RPC access control. The flag
+  // is in SerializeIn, so it rides along if the task is forwarded to a
+  // remote container owner.
+  task_ptr->SetFlags(TASK_EXTERNAL_CLIENT);
+
+  // If SerializeIn copied any ZMQ-owned BULK_XFER input into a fresh
+  // CHI buffer, the task now owns that buffer. Promote the count to
+  // TASK_DATA_OWNER so the task destructor frees it (mirrors admin
+  // RecvIn). Without this the copied buffer leaks one io_size
+  // allocation per inbound TCP/IPC bulk.
+  if (archive.daemon_allocated_bulk_count_ > 0) {
+    task_ptr->SetFlags(TASK_DATA_OWNER);
+  }
+
+  // Create the Future (owns the FutureShm via shared_ptr; pushing onto the
+  // lane copies it so the FutureShm outlives this scope).
+  Future<Task> future(pool_id, method_id, task_ptr);
+  auto future_shm = future.GetFutureShm();
+  future_shm->origin_ = (mode == IpcMode::kTcp)
+                            ? ClientOrigin::kClientTcp
+                            : ClientOrigin::kClientIpc;
+  // Capture the client's net_key so SendOut can stamp it back onto the
+  // response (AllocLoadTask reassigns the server task's identity).
+  future_shm->client_net_key_ = info.task_id_.net_key_;
+  future_shm->client_pid_ = info.task_id_.pid_;
+  // #968: also keep the client's non-recyclable identity so SendOut can
+  // echo it and the client can corroborate the net_key match. AllocLoadTask
+  // has already reassigned the server task's own task_id_, so this is the
+  // only surviving record of who actually asked.
+  future_shm->client_task_unique_ = info.task_id_.unique_;
+  future_shm->client_task_major_ = info.task_id_.major_;
+  future_shm->response_fd_ = recv_info.fd_;
+  // Resolve the response transport. TCP clients advertise an ephemeral
+  // response-listener port (archive.client_port_); open (or reuse from the
+  // connection cache) a dedicated dial-back DEALER to <identity-host>:<port>
+  // and route the response there instead of echoing back over the inbound
+  // ROUTER. The DEALER's identity is "hostname:pid", so the host part plus
+  // the advertised port is the listener address. IPC clients keep replying
+  // over the same connection-oriented unix socket.
+  if (mode == IpcMode::kTcp) {
+    RouteTcpResponse(ipc, recv_info.identity_, archive.client_port_, future);
+  } else {
+    future_shm->response_transport_ = transport;
+    future_shm->response_identity_len_ = 0;
+  }
+
+  // Allocate the task's RunContext (and resolve its container) now that it
+  // is deserialized, so RouteTask / the worker have an active RunContext.
+  future.GetTaskPtr()->BeginRunContext();
+
+  // issue #781: ClientMapTask removed. Recv threads deposit on the shared
+  // ingress lane (0); the runtime maps to a worker via RuntimeMapTask.
+  LaneId lane_id = 0;
+  auto *worker_queues = ipc->GetTaskQueue();
+  auto &lane_ref = worker_queues->GetLane(lane_id, 0);
+  lane_ref.Push(future);
+  // Always signal — see ipc_cpu2cpu_impl.h for the race.
+  ipc->AwakenWorker(&lane_ref);
+  HLOG(kDebug, "[TRACE768] t={} RecvIn ingested task mode={} lane_tid={}",
+       std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), (int)mode, lane_ref.GetTid());
+
+  return true;
+}
+
 //==============================================================================
 // RecvIn: poll ZMQ transports for incoming client tasks
 //==============================================================================
@@ -85,153 +273,21 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       PoolId pool_id = info.pool_id_;
       u32 method_id = info.method_id_;
 
-      // Get container for deserialization
-      auto container = pool_manager->GetStaticContainer(pool_id).get();
-      if (!container) {
-        HLOG(kError, "IpcCpu2CpuZmq::RecvIn: Container not found "
-             "for pool_id {}", pool_id);
-        // No AllocLoadTask ran, so the bulks are still transport-owned; see
-        // the note above.
-        transport->ClearRecvHandles(archive);
+      // issue #1039: a request for a pool this node has not created yet (the
+      // client connected while the runtime was still composing), or one it is
+      // still creating, is HELD with
+      // its transport-owned bulks still attached, not dropped -- dropping it
+      // left the client waiting forever. ReplayDeferredClientRecv admits it
+      // through AdmitZmq once the pool's Create has finished.
+      if (!pool_manager->IsClientAdmissible(pool_id)) {
+        ipc->GetRun2Run()->DeferClientRecv(std::move(archive), mode, recv_info,
+                                           transport);
         continue;
       }
 
-      // Allocate and deserialize the task
-      clio::run::shared_ptr<clio::run::Task> task_ptr =
-          container->AllocLoadTask(method_id, archive);
-
-      // SerializeIn copied any zmq-owned BULK_XFER payloads into
-      // CHI-owned buffers (LoadTaskArchive::bulk), so the zmq_msg_t
-      // handles in archive.recv[*].desc are now unreferenced. Free them
-      // here — this is the only place that closes them on the server
-      // inbound path; without it every inbound TCP bulk leaks one
-      // zmq_msg_t + its payload. Safe to call unconditionally: the zmq
-      // ClearRecvHandles only closes/deletes desc handles and leaves the
-      // (now CHI-owned) data buffers alone; SHM recv has desc==null so
-      // this is a no-op there.
-      transport->ClearRecvHandles(archive);
-
-      if (task_ptr.IsNull()) {
-        HLOG(kError, "IpcCpu2CpuZmq::RecvIn: Failed to deserialize task");
+      if (!AdmitZmq(ipc, mode, transport, archive, recv_info)) {
         continue;
       }
-
-      // This transport serves external user clients (TCP/IPC); runtime peers
-      // use the run2run path. Tag the task for per-RPC access control. The flag
-      // is in SerializeIn, so it rides along if the task is forwarded to a
-      // remote container owner.
-      task_ptr->SetFlags(TASK_EXTERNAL_CLIENT);
-
-      // If SerializeIn copied any ZMQ-owned BULK_XFER input into a fresh
-      // CHI buffer, the task now owns that buffer. Promote the count to
-      // TASK_DATA_OWNER so the task destructor frees it (mirrors admin
-      // RecvIn). Without this the copied buffer leaks one io_size
-      // allocation per inbound TCP/IPC bulk.
-      if (archive.daemon_allocated_bulk_count_ > 0) {
-        task_ptr->SetFlags(TASK_DATA_OWNER);
-      }
-
-      // Create the Future (owns the FutureShm via shared_ptr; pushing onto the
-      // lane copies it so the FutureShm outlives this scope).
-      Future<Task> future(pool_id, method_id, task_ptr);
-      auto future_shm = future.GetFutureShm();
-      future_shm->origin_ = (mode == IpcMode::kTcp)
-                                ? ClientOrigin::kClientTcp
-                                : ClientOrigin::kClientIpc;
-      // Capture the client's net_key so SendOut can stamp it back onto the
-      // response (AllocLoadTask reassigns the server task's identity).
-      future_shm->client_net_key_ = info.task_id_.net_key_;
-      future_shm->client_pid_ = info.task_id_.pid_;
-      // #968: also keep the client's non-recyclable identity so SendOut can
-      // echo it and the client can corroborate the net_key match. AllocLoadTask
-      // has already reassigned the server task's own task_id_, so this is the
-      // only surviving record of who actually asked.
-      future_shm->client_task_unique_ = info.task_id_.unique_;
-      future_shm->client_task_major_ = info.task_id_.major_;
-      future_shm->response_fd_ = recv_info.fd_;
-      // Resolve the response transport. TCP clients advertise an ephemeral
-      // response-listener port (archive.client_port_); open (or reuse from the
-      // connection cache) a dedicated dial-back DEALER to <identity-host>:<port>
-      // and route the response there instead of echoing back over the inbound
-      // ROUTER. The DEALER's identity is "hostname:pid", so the host part plus
-      // the advertised port is the listener address. IPC clients keep replying
-      // over the same connection-oriented unix socket.
-      if (mode == IpcMode::kTcp) {
-        const std::string &identity = recv_info.identity_;
-        int client_port = archive.client_port_;
-        // Store for later eviction (issue #722): if SendOut exhausts retries
-        // to deliver the response, EvictClientByIdentity removes the cached
-        // dial-back connection so a retry gets a fresh connection.
-        future_shm->client_identity_ = identity;
-        future_shm->client_response_port_ = client_port;
-        // Fast path: open (or reuse) a dedicated dial-back DEALER to the
-        // client's ephemeral response listener at <identity-host>:<client_port>
-        // and route the response there, off the inbound ROUTER's sock_mtx_. A
-        // DEALER has a single peer so it auto-routes with no identity frame.
-        // This requires the client to advertise a response port (client_port_)
-        // AND present a parseable "hostname:pid" routing identity.
-        std::shared_ptr<ctp::lbm::Transport> dial_back;
-        size_t colon = identity.find(':');
-        const bool parseable_identity =
-            colon != std::string::npos &&
-            identity.find_first_not_of(
-                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                "0123456789.-:") == std::string::npos;
-        if (client_port > 0 && parseable_identity) {
-          std::string host = identity.substr(0, colon);
-          // Same-host client: dial loopback. The host part of the identity is
-          // the client's gethostname(); when it matches ours the client is on
-          // this machine, so 127.0.0.1 is both always resolvable and free of
-          // the LAN-interface firewall rules an external hostname would need.
-          // The cache key stays the full identity, so distinct clients never
-          // alias.
-          if (host == ctp::SystemInfo::GetHostname()) {
-            host = "127.0.0.1";
-          }
-          dial_back =
-              ipc->GetOrCreateClientByIdentity(identity, host, client_port);
-        }
-        // The inbound ROUTER is recv-only: responses NEVER go back over it (a
-        // worker Send racing the recv thread on the same non-thread-safe ZMQ
-        // socket is exactly what forced sock_mtx_ and deadlocked force_net).
-        // Every live client opens a response listener (client_port_ > 0) and
-        // connects with a "hostname:pid" identity, so dial-back always
-        // resolves. If it ever doesn't, the response is undeliverable — log and
-        // drop rather than echo over the ROUTER.
-        if (dial_back) {
-          // Hold the dial-back until this task is freed: the table is
-          // LRU-bounded and may evict it before SendOut runs (issue #1065).
-          future_shm->response_transport_ = dial_back.get();
-          future_shm->response_transport_owner_ = std::move(dial_back);
-          future_shm->response_identity_len_ = 0;  // DEALER: no identity frame
-        } else {
-          HLOG(kError,
-               "IpcCpu2CpuZmq::RecvIn: TCP client {} has no dial-back route "
-               "(client_port={}, identity='{}') — response undeliverable",
-               future_shm->client_pid_, client_port, identity);
-          future_shm->response_transport_ = nullptr;
-          future_shm->response_identity_len_ = 0;
-        }
-      } else {
-        future_shm->response_transport_ = transport;
-        future_shm->response_identity_len_ = 0;
-      }
-
-      // Allocate the task's RunContext (and resolve its container) now that it
-      // is deserialized, so RouteTask / the worker have an active RunContext.
-      future.GetTaskPtr()->BeginRunContext();
-
-      // issue #781: ClientMapTask removed. Recv threads deposit on the shared
-      // ingress lane (0); the runtime maps to a worker via RuntimeMapTask.
-      LaneId lane_id = 0;
-      auto *worker_queues = ipc->GetTaskQueue();
-      auto &lane_ref = worker_queues->GetLane(lane_id, 0);
-      lane_ref.Push(future);
-      // Always signal — see ipc_cpu2cpu_impl.h for the race.
-      ipc->AwakenWorker(&lane_ref);
-      HLOG(kDebug, "[TRACE768] t={} RecvIn ingested task mode={} lane_tid={}",
-           std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), (int)mode, lane_ref.GetTid());
-
       did_work = true;
       tasks_received++;
       size_t total = recv_counter.fetch_add(1, std::memory_order_relaxed) + 1;

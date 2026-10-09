@@ -162,15 +162,11 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
          class_workers_[kHeavyClass].size(), kSpawnLoadUs, kIdleRetireSec);
   }
 
-  // Register both net workers' lanes with the IPC manager so
-  // EnqueueNetTask wakes the correct one based on the priority enqueued.
+  // The net workers' lanes are not assigned yet; WorkOrchestrator publishes
+  // them to the IPC manager after lane mapping (issue #768).
   IpcManager *ipc = CLIO_IPC;
   if (ipc) {
     ipc->SetNumSchedQueues(1);
-    if (net_send_worker_ && net_recv_worker_) {
-      ipc->SetNetLane(net_send_worker_->GetLane(),
-                      net_recv_worker_->GetLane());
-    }
   }
 
   int send_id = net_send_worker_ ? (int)net_send_worker_->GetId() : -1;
@@ -681,12 +677,19 @@ void DefaultScheduler::LoadBalance() {
     if (w == nullptr || !w->IsExecuting()) return false;
     if (!w->IsStalled(now_us, kStallThresholdSec)) return false;
     stalls_detected_.fetch_add(1, std::memory_order_relaxed);
+    // Name any pool creates in flight (#1180): a stalled admin
+    // GetOrCreatePool otherwise says nothing about which pool it is creating.
+    PoolManager *pool_manager = CLIO_POOL_MANAGER;
+    const std::string creates =
+        pool_manager != nullptr ? pool_manager->DescribeCreatesInProgress()
+                                : std::string();
     HLOG(kWarning,
          "[#781] worker {} STALLED on one task (pool {} method {} running "
-         "{} ms; load_us={} realtime_load_us={} threshold_s={})",
+         "{} ms; load_us={} realtime_load_us={} threshold_s={}){}{}",
          w->GetId(), w->CurrentPoolMajor(), w->CurrentMethod(),
          w->CurrentTaskAgeMs(now_us), (double)w->Load(),
-         w->RealtimeLoad(now_us), kStallThresholdSec);
+         w->RealtimeLoad(now_us), kStallThresholdSec,
+         creates.empty() ? "" : "; pool creates in progress: ", creates);
 
     // issue #785: LANE RESCUE. The stalled worker is inside ExecTask and is
     // provably not popping its lane, so its queued backlog is stranded behind a

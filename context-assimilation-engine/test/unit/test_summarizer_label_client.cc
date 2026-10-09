@@ -20,9 +20,12 @@
 
 #include "summarizer_http_stub.h"
 
+#include <clio_ctp/introspect/system_info.h>
+
 #include <string>
 
 using clio::cae::summarizer::OllamaGenerate;
+using clio::cae::summarizer::detail::LoopbackNoProxyList;
 using clio_cae_test::OneShotHttpServer;
 
 TEST_CASE("LabelClient - argument validation", "[summarizer][label][args]") {
@@ -83,6 +86,83 @@ TEST_CASE("LabelClient - success path", "[summarizer][label][success]") {
   REQUIRE(out == "a fine label");
 
   server.Stop();
+}
+
+/**
+ * A site-wide http_proxy must not capture a loopback endpoint.
+ *
+ * Ollama runs on the same host, so the endpoint is 127.0.0.1. Where the
+ * environment exports an HTTP proxy -- every ALCF login and compute node
+ * does, and container images often do -- libcurl would hand even a loopback
+ * request to the proxy, which refuses to relay to 127.0.0.1 and returns its
+ * own error page. The symptom is an HTTP 503 and an empty label with no sign
+ * that a proxy was involved at all.
+ *
+ * The proxy named here is deliberately unroutable: if the bypass regresses,
+ * the request goes to the proxy and this fails rather than silently
+ * succeeding against something real.
+ */
+TEST_CASE("LabelClient - loopback bypasses a configured proxy",
+          "[summarizer][label][proxy]") {
+  OneShotHttpServer server("HTTP/1.1 200 OK\r\n",
+                           "{\"response\":\"a fine label\",\"done\":true}");
+
+  ctp::SystemInfo::Setenv("http_proxy", "http://127.0.0.1:9/", 1);
+  ctp::SystemInfo::Setenv("https_proxy", "http://127.0.0.1:9/", 1);
+  ctp::SystemInfo::Unsetenv("no_proxy");
+  ctp::SystemInfo::Unsetenv("NO_PROXY");
+
+  std::string out;
+  const bool ok = OllamaGenerate(server.Endpoint(), "m", "p", 0, 0, out);
+
+  ctp::SystemInfo::Unsetenv("http_proxy");
+  ctp::SystemInfo::Unsetenv("https_proxy");
+
+  REQUIRE(ok);
+  REQUIRE(out == "a fine label");
+  server.Stop();
+}
+
+/**
+ * The bypass ADDS loopback to the environment's list rather than replacing it.
+ *
+ * CURLOPT_NOPROXY overrides libcurl's own reading of no_proxy outright, so a
+ * client that listed only loopback would silently push a site's internal
+ * hosts back through the proxy. Asserted on the list itself: a request to a
+ * loopback endpoint succeeds either way, so behaviour alone cannot tell the
+ * two apart.
+ *
+ * Both spellings matter -- libcurl reads lowercase first, so NO_PROXY has to
+ * be picked up when no_proxy is unset or empty.
+ */
+TEST_CASE("LabelClient - the no_proxy list keeps the environment's entries",
+          "[summarizer][label][proxy]") {
+  const std::string kLoopback = "localhost,127.0.0.1,::1";
+
+  SECTION("neither variable set: loopback only");
+  ctp::SystemInfo::Unsetenv("no_proxy");
+  ctp::SystemInfo::Unsetenv("NO_PROXY");
+  REQUIRE(LoopbackNoProxyList() == kLoopback);
+
+  SECTION("lowercase no_proxy is appended, not dropped");
+  ctp::SystemInfo::Setenv("no_proxy", "example.invalid,10.0.0.0/8", 1);
+  REQUIRE(LoopbackNoProxyList() == kLoopback + ",example.invalid,10.0.0.0/8");
+
+  SECTION("uppercase NO_PROXY is used when no_proxy is unset");
+  ctp::SystemInfo::Unsetenv("no_proxy");
+  ctp::SystemInfo::Setenv("NO_PROXY", "upper.invalid", 1);
+  REQUIRE(LoopbackNoProxyList() == kLoopback + ",upper.invalid");
+
+  SECTION("an empty no_proxy falls through to NO_PROXY");
+  ctp::SystemInfo::Setenv("no_proxy", "", 1);
+  REQUIRE(LoopbackNoProxyList() == kLoopback + ",upper.invalid");
+
+  SECTION("both empty: loopback only");
+  ctp::SystemInfo::Setenv("NO_PROXY", "", 1);
+  REQUIRE(LoopbackNoProxyList() == kLoopback);
+
+  ctp::SystemInfo::Unsetenv("no_proxy");
+  ctp::SystemInfo::Unsetenv("NO_PROXY");
 }
 
 SIMPLE_TEST_MAIN()

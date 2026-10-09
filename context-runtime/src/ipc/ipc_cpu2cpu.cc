@@ -24,12 +24,38 @@ Future<Task> IpcCpu2Cpu::RecvIn(IpcManager *ipc, u32 shard) {
       ipc->shm_in_servers_[shard] == nullptr) {
     return Future<Task>();
   }
-  LoadTaskArchive archive;
-  ctp::lbm::ClientInfo info =
-      ipc->shm_in_servers_[shard]->Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
-  if (info.rc != 0) {
-    return Future<Task>();
+  while (true) {
+    LoadTaskArchive archive;
+    ctp::lbm::ClientInfo info =
+        ipc->shm_in_servers_[shard]->Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+    if (info.rc != 0) {
+      return Future<Task>();
+    }
+    const auto &tis = archive.GetTaskInfos();
+    if (tis.empty()) {
+      continue;
+    }
+    // issue #1039: a request for a pool this node has not created yet (the
+    // client connected while the runtime was still composing), or one it is
+    // still creating, is HELD -- not dropped, and not run against a
+    // half-created container. It used to be consumed off the ring and discarded right here,
+    // silently, and its client waited forever: the 4-node coherence suite
+    // starts its clients a fixed 5 s after the runtime, and a compose that
+    // overran that lost each early client's first request. The client-recv
+    // thread admits it once the pool's Create has finished.
+    if (!CLIO_POOL_MANAGER->IsClientAdmissible(tis[0].pool_id_)) {
+      ipc->GetRun2Run()->DeferClientRecv(std::move(archive), IpcMode::kShm,
+                                         info, nullptr);
+      continue;
+    }
+    Future<Task> f = AdmitShm(archive);
+    if (f.get() != nullptr) {
+      return f;
+    }
   }
+}
+
+Future<Task> IpcCpu2Cpu::AdmitShm(LoadTaskArchive &archive) {
   const auto &tis = archive.GetTaskInfos();
   if (tis.empty()) {
     return Future<Task>();
@@ -42,6 +68,8 @@ Future<Task> IpcCpu2Cpu::RecvIn(IpcManager *ipc, u32 shard) {
   clio::run::shared_ptr<clio::run::Task> tp =
       container->AllocLoadTask(ti.method_id_, archive);
   if (tp.IsNull()) {
+    HLOG(kError, "IpcCpu2Cpu::AdmitShm: failed to deserialize a client task "
+         "for pool {} method {}", ti.pool_id_, ti.method_id_);
     return Future<Task>();
   }
   tp->SetFlags(TASK_EXTERNAL_CLIENT);
@@ -54,6 +82,10 @@ Future<Task> IpcCpu2Cpu::RecvIn(IpcManager *ipc, u32 shard) {
   auto fs = f.GetFutureShm();
   fs->origin_ = ClientOrigin::kClientShm;
   fs->client_pid_ = ti.task_id_.pid_;
+  // #1192: this task may read the client's SHM segments until it is gone;
+  // the reaper must not unmap them before then. Released by ~RunContext.
+  CLIO_IPC->AcquireClientInflight(fs->client_pid_);
+  fs->counts_client_inflight_ = true;
   // Preserve the CLIENT's response-matching key (issue #774 / #768). The
   // runtime repurposes task_id_.net_key_ for its own bookkeeping when the task
   // is forwarded cross-node (IpcManagerRun2Run::SendIn overwrites it with the
@@ -69,7 +101,6 @@ Future<Task> IpcCpu2Cpu::RecvIn(IpcManager *ipc, u32 shard) {
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   f.GetTaskPtr()->BeginRunContext();
-  // Return the resolved future; the calling worker routes + executes it inline.
   return f;
 }
 

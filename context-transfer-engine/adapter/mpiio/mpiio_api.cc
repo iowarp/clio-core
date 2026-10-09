@@ -12,12 +12,22 @@
  * chimod owns placement, so there is no separate collective-aggregation step
  * at this layer. Asynchronous (i*) ops complete synchronously and hand back
  * MPI_REQUEST_NULL.
+ *
+ * Errors: the descriptor layer defers writes (write-behind), so a failed
+ * write usually surfaces at MPI_File_sync or MPI_File_close, as it would at
+ * fsync/close. Every descriptor-layer failure is mapped from errno to an MPI
+ * error class and returned (#1187).
+ *
+ * Known limits of this layer (not errors): shared and ordered file pointers
+ * are per-process, and file views and derived-datatype layouts are ignored;
+ * a datatype only contributes its size.
  */
 
 bool mpiio_intercepted = true;
 
 #include "mpiio_api.h"
 
+#include <cerrno>
 #include <fcntl.h>
 
 #include <mutex>
@@ -100,26 +110,106 @@ size_t Bytes(int count, MPI_Datatype datatype) {
   return static_cast<size_t>(count) * static_cast<size_t>(tsize);
 }
 
+/**
+ * Map a descriptor-layer errno to the closest MPI error class.
+ * @param err errno from a failed descriptor-layer call
+ * @return an MPI error class (never MPI_SUCCESS)
+ */
+int ErrnoToMpi(int err) {
+  switch (err) {
+    case ENOSPC:
+    case EFBIG:
+      return MPI_ERR_NO_SPACE;
+#ifdef EDQUOT
+    case EDQUOT:
+      return MPI_ERR_QUOTA;
+#endif
+    case ENOENT:
+      return MPI_ERR_NO_SUCH_FILE;
+    case EEXIST:
+      return MPI_ERR_FILE_EXISTS;
+    case EACCES:
+    case EPERM:
+      return MPI_ERR_ACCESS;
+    case EROFS:
+      return MPI_ERR_READ_ONLY;
+    case EBADF:
+      return MPI_ERR_FILE;
+    default:
+      return MPI_ERR_IO;
+  }
+}
+
+/**
+ * Record how many bytes an operation transferred, so MPI_Get_count and
+ * MPI_Get_elements report the real amount (short at EOF) instead of garbage.
+ * @param status the caller's status (may be MPI_STATUS_IGNORE)
+ * @param bytes bytes actually transferred
+ */
+void SetStatusBytes(MPI_Status *status, size_t bytes) {
+  if (status == MPI_STATUS_IGNORE) {
+    return;
+  }
+  // Count in MPI_BYTE, as ROMIO does: the status stores bytes, and
+  // MPI_Get_count divides by the caller's datatype size.
+  MPI_Status_set_elements_x(status, MPI_BYTE, static_cast<MPI_Count>(bytes));
+  MPI_Status_set_cancelled(status, 0);
+}
+
+/**
+ * Turn a descriptor-layer transfer result into an MPI return code and fill
+ * the status.
+ * @param n bytes transferred, or -1 with errno set
+ * @param status the caller's status (may be MPI_STATUS_IGNORE)
+ * @return MPI_SUCCESS, or the mapped error class
+ */
+int FinishXfer(clio::cte::filesystem::FsSsize n, MPI_Status *status) {
+  if (n < 0) {
+    int err = errno;
+    SetStatusBytes(status, 0);
+    return ErrnoToMpi(err);
+  }
+  SetStatusBytes(status, static_cast<size_t>(n));
+  return MPI_SUCCESS;
+}
+
 /** Sequential read at the file pointer. */
-int DoRead(int fd, void *buf, int count, MPI_Datatype datatype) {
-  CLIO_CFS_CLIENT->ReadFd(fd, buf, Bytes(count, datatype));
-  return MPI_SUCCESS;
+int DoRead(int fd, void *buf, int count, MPI_Datatype datatype,
+           MPI_Status *status) {
+  return FinishXfer(CLIO_CFS_CLIENT->ReadFd(fd, buf, Bytes(count, datatype)),
+                    status);
 }
+/** Read at an explicit offset. */
 int DoReadAt(int fd, MPI_Offset off, void *buf, int count,
-             MPI_Datatype datatype) {
-  CLIO_CFS_CLIENT->PreadFd(fd, buf, Bytes(count, datatype),
-                      static_cast<off_t>(off));
-  return MPI_SUCCESS;
+             MPI_Datatype datatype, MPI_Status *status) {
+  return FinishXfer(CLIO_CFS_CLIENT->PreadFd(fd, buf, Bytes(count, datatype),
+                                             static_cast<off_t>(off)),
+                    status);
 }
-int DoWrite(int fd, const void *buf, int count, MPI_Datatype datatype) {
-  CLIO_CFS_CLIENT->WriteFd(fd, buf, Bytes(count, datatype));
-  return MPI_SUCCESS;
+/** Sequential write at the file pointer. */
+int DoWrite(int fd, const void *buf, int count, MPI_Datatype datatype,
+            MPI_Status *status) {
+  return FinishXfer(CLIO_CFS_CLIENT->WriteFd(fd, buf, Bytes(count, datatype)),
+                    status);
 }
+/** Write at an explicit offset. */
 int DoWriteAt(int fd, MPI_Offset off, const void *buf, int count,
-              MPI_Datatype datatype) {
-  CLIO_CFS_CLIENT->PwriteFd(fd, buf, Bytes(count, datatype),
-                       static_cast<off_t>(off));
-  return MPI_SUCCESS;
+              MPI_Datatype datatype, MPI_Status *status) {
+  return FinishXfer(CLIO_CFS_CLIENT->PwriteFd(fd, buf, Bytes(count, datatype),
+                                              static_cast<off_t>(off)),
+                    status);
+}
+
+/**
+ * Complete a non-blocking op synchronously. There is no request to carry a
+ * status, so only the return code reports the outcome.
+ * @param rc the MPI return code of the synchronous op
+ * @param request out: always MPI_REQUEST_NULL
+ * @return rc
+ */
+int CompleteNow(int rc, MPI_Request *request) {
+  *request = MPI_REQUEST_NULL;
+  return rc;
 }
 
 }  // namespace
@@ -160,7 +250,7 @@ int CLIO_CTE_DECL(MPI_File_open)(MPI_Comm comm, const char *filename, int amode,
     HLOG(kDebug, "Intercept MPI_File_open {} amode {}", filename, amode);
     int fd = CLIO_CFS_CLIENT->OpenFd(filename, MpiioShim::AmodeToFlags(amode), 0644);
     if (fd < 0) {
-      return MPI_ERR_NO_SUCH_FILE;
+      return ErrnoToMpi(errno);
     }
     *fh = Shim().Wrap(fd);
     return MPI_SUCCESS;
@@ -173,9 +263,12 @@ int CLIO_CTE_DECL(MPI_File_close)(MPI_File *fh) {
   int fd = Shim().Release(*fh);
   if (fd >= 0) {
     HLOG(kDebug, "Intercept MPI_File_close");
-    CLIO_CFS_CLIENT->CloseFd(fd);
+    // The handle is released either way, as close(2) releases the fd; a
+    // non-success return reports a deferred write that failed.
+    int rc = CLIO_CFS_CLIENT->CloseFd(fd);
+    int err = errno;
     *fh = MPI_FILE_NULL;
-    return MPI_SUCCESS;
+    return (rc == 0) ? MPI_SUCCESS : ErrnoToMpi(err);
   }
   return real_api->MPI_File_close(fh);
 }
@@ -189,7 +282,7 @@ int CLIO_CTE_DECL(MPI_File_seek)(MPI_File fh, MPI_Offset offset, int whence) {
                                        : SEEK_END;
     return (CLIO_CFS_CLIENT->SeekFd(fd, static_cast<off_t>(offset), w) >= 0)
                ? MPI_SUCCESS
-               : MPI_ERR_IO;
+               : ErrnoToMpi(errno);
   }
   return real_api->MPI_File_seek(fh, offset, whence);
 }
@@ -217,20 +310,18 @@ int CLIO_CTE_DECL(MPI_File_get_position)(MPI_File fh, MPI_Offset *offset) {
  */
 int CLIO_CTE_DECL(MPI_File_read)(MPI_File fh, void *buf, int count,
                                  MPI_Datatype datatype, MPI_Status *status) {
-  (void)status;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return DoRead(fd, buf, count, datatype);
+    return DoRead(fd, buf, count, datatype, status);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_read(fh, buf, count, datatype, status);
 }
 int CLIO_CTE_DECL(MPI_File_read_all)(MPI_File fh, void *buf, int count,
                                      MPI_Datatype datatype,
                                      MPI_Status *status) {
-  (void)status;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return DoRead(fd, buf, count, datatype);
+    return DoRead(fd, buf, count, datatype, status);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_read_all(fh, buf, count, datatype,
                                                status);
@@ -238,10 +329,9 @@ int CLIO_CTE_DECL(MPI_File_read_all)(MPI_File fh, void *buf, int count,
 int CLIO_CTE_DECL(MPI_File_read_shared)(MPI_File fh, void *buf, int count,
                                         MPI_Datatype datatype,
                                         MPI_Status *status) {
-  (void)status;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return DoRead(fd, buf, count, datatype);
+    return DoRead(fd, buf, count, datatype, status);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_read_shared(fh, buf, count, datatype,
                                                   status);
@@ -249,10 +339,9 @@ int CLIO_CTE_DECL(MPI_File_read_shared)(MPI_File fh, void *buf, int count,
 int CLIO_CTE_DECL(MPI_File_read_ordered)(MPI_File fh, void *buf, int count,
                                          MPI_Datatype datatype,
                                          MPI_Status *status) {
-  (void)status;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return DoRead(fd, buf, count, datatype);
+    return DoRead(fd, buf, count, datatype, status);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_read_ordered(fh, buf, count, datatype,
                                                    status);
@@ -260,10 +349,9 @@ int CLIO_CTE_DECL(MPI_File_read_ordered)(MPI_File fh, void *buf, int count,
 int CLIO_CTE_DECL(MPI_File_read_at)(MPI_File fh, MPI_Offset offset, void *buf,
                                     int count, MPI_Datatype datatype,
                                     MPI_Status *status) {
-  (void)status;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return DoReadAt(fd, offset, buf, count, datatype);
+    return DoReadAt(fd, offset, buf, count, datatype, status);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_read_at(fh, offset, buf, count, datatype,
                                               status);
@@ -272,10 +360,9 @@ int CLIO_CTE_DECL(MPI_File_read_at_all)(MPI_File fh, MPI_Offset offset,
                                         void *buf, int count,
                                         MPI_Datatype datatype,
                                         MPI_Status *status) {
-  (void)status;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return DoReadAt(fd, offset, buf, count, datatype);
+    return DoReadAt(fd, offset, buf, count, datatype, status);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_read_at_all(fh, offset, buf, count,
                                                   datatype, status);
@@ -286,20 +373,18 @@ int CLIO_CTE_DECL(MPI_File_read_at_all)(MPI_File fh, MPI_Offset offset,
  */
 int CLIO_CTE_DECL(MPI_File_write)(MPI_File fh, const void *buf, int count,
                                   MPI_Datatype datatype, MPI_Status *status) {
-  (void)status;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return DoWrite(fd, buf, count, datatype);
+    return DoWrite(fd, buf, count, datatype, status);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_write(fh, buf, count, datatype, status);
 }
 int CLIO_CTE_DECL(MPI_File_write_all)(MPI_File fh, const void *buf, int count,
                                       MPI_Datatype datatype,
                                       MPI_Status *status) {
-  (void)status;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return DoWrite(fd, buf, count, datatype);
+    return DoWrite(fd, buf, count, datatype, status);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_write_all(fh, buf, count, datatype,
                                                 status);
@@ -307,10 +392,9 @@ int CLIO_CTE_DECL(MPI_File_write_all)(MPI_File fh, const void *buf, int count,
 int CLIO_CTE_DECL(MPI_File_write_shared)(MPI_File fh, const void *buf,
                                          int count, MPI_Datatype datatype,
                                          MPI_Status *status) {
-  (void)status;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return DoWrite(fd, buf, count, datatype);
+    return DoWrite(fd, buf, count, datatype, status);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_write_shared(fh, buf, count, datatype,
                                                    status);
@@ -318,10 +402,9 @@ int CLIO_CTE_DECL(MPI_File_write_shared)(MPI_File fh, const void *buf,
 int CLIO_CTE_DECL(MPI_File_write_ordered)(MPI_File fh, const void *buf,
                                           int count, MPI_Datatype datatype,
                                           MPI_Status *status) {
-  (void)status;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return DoWrite(fd, buf, count, datatype);
+    return DoWrite(fd, buf, count, datatype, status);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_write_ordered(fh, buf, count, datatype,
                                                     status);
@@ -330,10 +413,9 @@ int CLIO_CTE_DECL(MPI_File_write_at)(MPI_File fh, MPI_Offset offset,
                                      const void *buf, int count,
                                      MPI_Datatype datatype,
                                      MPI_Status *status) {
-  (void)status;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return DoWriteAt(fd, offset, buf, count, datatype);
+    return DoWriteAt(fd, offset, buf, count, datatype, status);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_write_at(fh, offset, buf, count, datatype,
                                                status);
@@ -342,10 +424,9 @@ int CLIO_CTE_DECL(MPI_File_write_at_all)(MPI_File fh, MPI_Offset offset,
                                          const void *buf, int count,
                                          MPI_Datatype datatype,
                                          MPI_Status *status) {
-  (void)status;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return DoWriteAt(fd, offset, buf, count, datatype);
+    return DoWriteAt(fd, offset, buf, count, datatype, status);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_write_at_all(fh, offset, buf, count,
                                                    datatype, status);
@@ -358,9 +439,8 @@ int CLIO_CTE_DECL(MPI_File_iread)(MPI_File fh, void *buf, int count,
                                   MPI_Datatype datatype, MPI_Request *request) {
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    DoRead(fd, buf, count, datatype);
-    *request = MPI_REQUEST_NULL;
-    return MPI_SUCCESS;
+    return CompleteNow(DoRead(fd, buf, count, datatype, MPI_STATUS_IGNORE),
+                       request);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_iread(fh, buf, count, datatype, request);
 }
@@ -369,9 +449,8 @@ int CLIO_CTE_DECL(MPI_File_iread_shared)(MPI_File fh, void *buf, int count,
                                          MPI_Request *request) {
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    DoRead(fd, buf, count, datatype);
-    *request = MPI_REQUEST_NULL;
-    return MPI_SUCCESS;
+    return CompleteNow(DoRead(fd, buf, count, datatype, MPI_STATUS_IGNORE),
+                       request);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_iread_shared(fh, buf, count, datatype,
                                                    request);
@@ -381,9 +460,9 @@ int CLIO_CTE_DECL(MPI_File_iread_at)(MPI_File fh, MPI_Offset offset, void *buf,
                                      MPI_Request *request) {
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    DoReadAt(fd, offset, buf, count, datatype);
-    *request = MPI_REQUEST_NULL;
-    return MPI_SUCCESS;
+    return CompleteNow(
+        DoReadAt(fd, offset, buf, count, datatype, MPI_STATUS_IGNORE),
+        request);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_iread_at(fh, offset, buf, count, datatype,
                                                request);
@@ -393,9 +472,8 @@ int CLIO_CTE_DECL(MPI_File_iwrite)(MPI_File fh, const void *buf, int count,
                                    MPI_Request *request) {
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    DoWrite(fd, buf, count, datatype);
-    *request = MPI_REQUEST_NULL;
-    return MPI_SUCCESS;
+    return CompleteNow(DoWrite(fd, buf, count, datatype, MPI_STATUS_IGNORE),
+                       request);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_iwrite(fh, buf, count, datatype, request);
 }
@@ -404,9 +482,8 @@ int CLIO_CTE_DECL(MPI_File_iwrite_shared)(MPI_File fh, const void *buf,
                                           MPI_Request *request) {
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    DoWrite(fd, buf, count, datatype);
-    *request = MPI_REQUEST_NULL;
-    return MPI_SUCCESS;
+    return CompleteNow(DoWrite(fd, buf, count, datatype, MPI_STATUS_IGNORE),
+                       request);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_iwrite_shared(fh, buf, count, datatype,
                                                     request);
@@ -417,9 +494,9 @@ int CLIO_CTE_DECL(MPI_File_iwrite_at)(MPI_File fh, MPI_Offset offset,
                                       MPI_Request *request) {
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    DoWriteAt(fd, offset, buf, count, datatype);
-    *request = MPI_REQUEST_NULL;
-    return MPI_SUCCESS;
+    return CompleteNow(
+        DoWriteAt(fd, offset, buf, count, datatype, MPI_STATUS_IGNORE),
+        request);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_iwrite_at(fh, offset, buf, count,
                                                 datatype, request);
@@ -428,7 +505,10 @@ int CLIO_CTE_DECL(MPI_File_iwrite_at)(MPI_File fh, MPI_Offset offset,
 int CLIO_CTE_DECL(MPI_File_sync)(MPI_File fh) {
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    return MPI_SUCCESS;  // writes are synchronous
+    // Writes are deferred (write-behind): wait for this file's writes and
+    // report, once, a failure any of them latched -- fsync(2) semantics.
+    return (CLIO_CFS_CLIENT->SyncFd(fd) == 0) ? MPI_SUCCESS
+                                              : ErrnoToMpi(errno);
   }
   return CLIO_CTE_MPIIO_API->MPI_File_sync(fh);
 }

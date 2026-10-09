@@ -735,6 +735,105 @@ bool PoolManager::RegisterRemotePool(PoolId pool_id,
   return EnsureStaticContainer(pool_id).IsValid();
 }
 
+u64 PoolManager::BeginCreate(const std::string &pool_name,
+                             const std::string &chimod_name) {
+  std::lock_guard<std::mutex> lock(creates_mu_);
+  const u64 handle = next_create_++;
+  creates_[handle] = {pool_name, chimod_name, std::chrono::steady_clock::now(),
+                      PoolId()};
+  return handle;
+}
+
+void PoolManager::EndCreate(u64 handle) {
+  std::lock_guard<std::mutex> lock(creates_mu_);
+  auto it = creates_.find(handle);
+  if (it == creates_.end()) {
+    return;
+  }
+  if (!it->second.pool_id_.IsNull()) {
+    creating_ids_.fetch_sub(1, std::memory_order_release);
+  }
+  creates_.erase(it);
+}
+
+void PoolManager::SetCreatingPoolId(u64 handle, PoolId pool_id) {
+  std::lock_guard<std::mutex> lock(creates_mu_);
+  auto it = creates_.find(handle);
+  if (it != creates_.end() && it->second.pool_id_.IsNull() &&
+      !pool_id.IsNull()) {
+    it->second.pool_id_ = pool_id;
+    creating_ids_.fetch_add(1, std::memory_order_release);
+  }
+}
+
+bool PoolManager::IsPoolCreating(PoolId pool_id) const {
+  // Every client request asks this at ingress; with no create in flight (the
+  // steady state) answer without taking the lock.
+  if (creating_ids_.load(std::memory_order_acquire) == 0) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(creates_mu_);
+  for (const auto &kv : creates_) {
+    if (kv.second.pool_id_ == pool_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool PoolManager::IsClientAdmissible(PoolId pool_id) const {
+  return GetStaticContainer(pool_id).IsValid() && !IsPoolCreating(pool_id);
+}
+
+std::string PoolManager::DescribeCreatesInProgress() const {
+  std::vector<std::pair<u64, std::string>> parts;
+  const auto now = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(creates_mu_);
+    for (const auto &kv : creates_) {
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now - kv.second.start_)
+                          .count();
+      parts.emplace_back(kv.first, "creating '" + kv.second.pool_name_ +
+                                       "' (" + kv.second.chimod_ + ") for " +
+                                       std::to_string(ms) + " ms");
+    }
+  }
+  std::sort(parts.begin(), parts.end());
+  std::string out;
+  for (const auto &p : parts) {
+    out += (out.empty() ? "" : "; ") + p.second;
+  }
+  return out;
+}
+
+namespace {
+/** Keeps a pool create listed in PoolManager while CreatePool runs (#1180). */
+class CreateInProgressGuard {
+ public:
+  /**
+   * @param pm the pool manager
+   * @param pool_name the pool being created
+   * @param chimod_name its module
+   */
+  CreateInProgressGuard(PoolManager *pm, const std::string &pool_name,
+                        const std::string &chimod_name)
+      : pm_(pm), handle_(pm->BeginCreate(pool_name, chimod_name)) {}
+  ~CreateInProgressGuard() { pm_->EndCreate(handle_); }
+  /**
+   * Record the id of the pool being created (issue #1039).
+   * @param pool_id the pool's id, once CreatePool has resolved it
+   */
+  void SetPoolId(PoolId pool_id) { pm_->SetCreatingPoolId(handle_, pool_id); }
+  CreateInProgressGuard(const CreateInProgressGuard &) = delete;
+  CreateInProgressGuard &operator=(const CreateInProgressGuard &) = delete;
+
+ private:
+  PoolManager *pm_;
+  u64 handle_;
+};
+}  // namespace
+
 TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {
@@ -762,6 +861,8 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   const std::string chimod_name = create_task->chimod_name_.str();
   const std::string pool_name = create_task->pool_name_.str();
   const std::string chimod_params = create_task->chimod_params_.str();
+  // Listed until this coroutine ends, so a stall report can name the pool.
+  CreateInProgressGuard in_progress(this, pool_name, chimod_name);
 
   // Set num_containers equal to number of nodes in the cluster
   auto* ipc_manager = CLIO_IPC;
@@ -831,6 +932,10 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
          target_pool_id);
     CLIO_CO_RETURN;
   }
+
+  // From here until this coroutine ends, client requests for this pool are
+  // held at ingress rather than run against a half-created pool (#1039).
+  in_progress.SetPoolId(target_pool_id);
 
   // Create pool metadata
   PoolInfo pool_info(target_pool_id, pool_name, chimod_name, chimod_params,
@@ -1257,6 +1362,50 @@ bool PoolManager::UpdateContainerNodeMapping(PoolId pool_id,
   return true;
 }
 
+namespace {
+void SyncFileAndDir(const std::string &path);  // defined with the pool log
+
+/** One address-table WAL record, as replay orders them. */
+struct AddressTableRecord {
+  u64 order_ns;      ///< timestamp, raised to keep each file's append order
+  size_t file_rank;  ///< tie-break: the file's position in name order
+  size_t seq;        ///< tie-break: the record's position in its file
+  PoolId pool_id;
+  ContainerId container_id;
+  u32 new_node;
+};
+
+/**
+ * Read one domain_table.* file. A record stamped earlier than the one before
+ * it (the wall clock stepped back) is ordered right after it: append order
+ * is the truth within a file.
+ * @param path the file
+ * @param file_rank its position among the WAL files, sorted by name
+ * @param out records are appended here
+ */
+void ReadAddressTableFile(const std::filesystem::path &path, size_t file_rank,
+                          std::vector<AddressTableRecord> *out) {
+  std::ifstream ifs(path, std::ios::binary);
+  if (!ifs.is_open()) return;
+  u64 floor_ns = 0;
+  size_t seq = 0;
+  while (ifs.good()) {
+    u64 timestamp;
+    PoolId pool_id;
+    u32 container_id, old_node, new_node;
+    ifs.read(reinterpret_cast<char *>(&timestamp), sizeof(timestamp));
+    ifs.read(reinterpret_cast<char *>(&pool_id), sizeof(pool_id));
+    ifs.read(reinterpret_cast<char *>(&container_id), sizeof(container_id));
+    ifs.read(reinterpret_cast<char *>(&old_node), sizeof(old_node));
+    ifs.read(reinterpret_cast<char *>(&new_node), sizeof(new_node));
+    if (ifs.fail()) break;  // torn tail
+    floor_ns = std::max(floor_ns, timestamp);
+    out->push_back({floor_ns, file_rank, seq++, pool_id,
+                    static_cast<ContainerId>(container_id), new_node});
+  }
+}
+}  // namespace
+
 void PoolManager::WriteAddressTableWAL(PoolId pool_id,
                                         ContainerId container_id,
                                         u32 old_node, u32 new_node) {
@@ -1298,6 +1447,12 @@ void PoolManager::WriteAddressTableWAL(PoolId pool_id,
             sizeof(container_id));
   ofs.write(reinterpret_cast<const char *>(&old_node), sizeof(old_node));
   ofs.write(reinterpret_cast<const char *>(&new_node), sizeof(new_node));
+  ofs.flush();
+  ofs.close();
+  // A remap that a power loss erased would route the container back to the
+  // node it moved off (#1193). Remaps are rare: sync each one, as the pool
+  // log does.
+  SyncFileAndDir(wal_path);
 
   HLOG(kDebug, "PoolManager: WAL entry written to {}", wal_path);
 }
@@ -1317,35 +1472,36 @@ void PoolManager::ReplayAddressTableWAL() {
     return;
   }
 
-  size_t entries_replayed = 0;
+  // Only this WAL's own files: the directory also holds other logs (the
+  // pool log, pools.<node>.bin), whose records parsed as mappings here
+  // produced garbage pool ids -- and could remap a real pool's containers.
+  std::vector<fs::path> files;
   for (const auto &dir_entry : fs::directory_iterator(wal_dir)) {
-    // Only this WAL's own files: the directory also holds other logs (the
-    // pool log, pools.<node>.bin), whose records parsed as mappings here
-    // produced garbage pool ids -- and could remap a real pool's containers.
-    if (dir_entry.path().extension() != ".bin" ||
-        dir_entry.path().filename().string().rfind("domain_table.", 0) != 0) {
-      continue;
+    if (dir_entry.path().extension() == ".bin" &&
+        dir_entry.path().filename().string().rfind("domain_table.", 0) == 0) {
+      files.push_back(dir_entry.path());
     }
+  }
+  std::sort(files.begin(), files.end());
 
-    std::ifstream ifs(dir_entry.path(), std::ios::binary);
-    if (!ifs.is_open()) continue;
-
-    while (ifs.good()) {
-      u64 timestamp;
-      PoolId pool_id;
-      u32 container_id, old_node, new_node;
-
-      ifs.read(reinterpret_cast<char*>(&timestamp), sizeof(timestamp));
-      ifs.read(reinterpret_cast<char*>(&pool_id), sizeof(pool_id));
-      ifs.read(reinterpret_cast<char*>(&container_id), sizeof(container_id));
-      ifs.read(reinterpret_cast<char*>(&old_node), sizeof(old_node));
-      ifs.read(reinterpret_cast<char*>(&new_node), sizeof(new_node));
-      if (ifs.fail()) break;
-
-      // Apply the last-writer-wins mapping
-      UpdateContainerNodeMapping(pool_id, container_id, new_node);
-      entries_replayed++;
-    }
+  // Apply in time order, not directory-iteration order: with several files
+  // remapping the same container, the result after a restart depended on
+  // the order the filesystem listed them (#1193).
+  std::vector<AddressTableRecord> records;
+  for (size_t i = 0; i < files.size(); ++i) {
+    ReadAddressTableFile(files[i], i, &records);
+  }
+  std::sort(records.begin(), records.end(),
+            [](const AddressTableRecord &x, const AddressTableRecord &y) {
+              if (x.order_ns != y.order_ns) return x.order_ns < y.order_ns;
+              if (x.file_rank != y.file_rank) return x.file_rank < y.file_rank;
+              return x.seq < y.seq;
+            });
+  size_t entries_replayed = 0;
+  for (const auto &r : records) {
+    // Last writer (in time) wins.
+    UpdateContainerNodeMapping(r.pool_id, r.container_id, r.new_node);
+    entries_replayed++;
   }
 
   HLOG(kInfo, "ReplayAddressTableWAL: Replayed {} entries", entries_replayed);

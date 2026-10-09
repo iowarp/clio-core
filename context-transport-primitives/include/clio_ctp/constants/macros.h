@@ -82,6 +82,39 @@
 #define CTP_DLL CTP_DLL_IMPORT
 #endif
 
+/**
+ * Keep an inline function PRIVATE TO ITS SHARED OBJECT -- for the handful of
+ * header functions whose BODY depends on CTP_ENABLE_CUDA / CTP_ENABLE_ROCM.
+ *
+ * Those flags are deliberately per-target for CUDA (see the CTP_ENABLE_SYCL
+ * note in the top-level CMakeLists: under SYCL they must be global because one
+ * compiler builds every TU; under CUDA a host-only consumer genuinely wants
+ * the non-GPU body). But an `inline` function has EXTERNAL linkage and a weak,
+ * default-visibility symbol, so "per-target" is a fiction at run time: the
+ * dynamic linker binds ONE definition for the whole process -- the first one
+ * in load order -- and every caller in every library gets that body.
+ *
+ * Measured: the merge of #959 added `ctp::IsDevicePointer(out)` to
+ * cte/core/core_client.h. clio_cte_core_client is built WITHOUT
+ * CTP_ENABLE_CUDA, so it emitted the `return false` body, and it sits ahead of
+ * libclio_run_cxx in test binaries' DT_NEEDED order. IpcGpu2Cpu::RecvIn then
+ * read `task_on_device == false` for a cudaMalloc'd task, treated the device
+ * address as host memory and dereferenced it -- SIGSEGV in
+ * cte_devmem_putget_cuda and in the kvhdf5 CTE contract test, on a line that
+ * had not changed in years. cudaPointerGetAttributes, called on the very next
+ * line, correctly reported cudaMemoryTypeDevice.
+ *
+ * Hidden visibility makes the call direct instead of going through the PLT, so
+ * each library gets the body ITS OWN flags selected -- which is what the
+ * per-target define was always meant to mean. Nothing outside the defining
+ * library ever needs to take the address of these.
+ */
+#if CTP_COMPILER_MSVC
+#define CTP_SO_LOCAL
+#else
+#define CTP_SO_LOCAL __attribute__((visibility("hidden")))
+#endif
+
 /** DLL import / export for singletons */
 #ifdef CTP_COMPILING_DLL
 #define CTP_DLL_SINGLETON CTP_DLL_EXPORT

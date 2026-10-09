@@ -71,7 +71,21 @@ jobs:
       VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
       CAE_LABEL_TEST_SKIP: "1"
     steps:
+      # actions/checkout has no retry, and Windows runners intermittently fail
+      # the fetch with a transient schannel SEC_E_UNTRUSTED_ROOT (#1043). Let
+      # the first attempt fail, pause, and check out once more.
       - name: Checkout repository
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Wait before retrying checkout
+        if: steps.checkout.outcome == 'failure'
+        shell: pwsh
+        run: Start-Sleep -Seconds 15
+      - name: Checkout repository (retry)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v6
         with:
           submodules: recursive
@@ -301,7 +315,21 @@ jobs:
       VCPKG_DEFAULT_TRIPLET: x64-windows
       CAE_LABEL_TEST_SKIP: "1"
     steps:
+      # actions/checkout has no retry, and Windows runners intermittently fail
+      # the fetch with a transient schannel SEC_E_UNTRUSTED_ROOT (#1043). Let
+      # the first attempt fail, pause, and check out once more.
       - name: Checkout repository
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Wait before retrying checkout
+        if: steps.checkout.outcome == 'failure'
+        shell: pwsh
+        run: Start-Sleep -Seconds 15
+      - name: Checkout repository (retry)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v6
         with:
           submodules: recursive
@@ -393,7 +421,8 @@ jobs:
         if: steps.cache-oneapi.outputs.cache-hit != 'true'
         shell: cmd
         run: |
-          git clone --depth=1 https://github.com/oneapi-src/oneapi-ci.git oneapi-ci
+          REM A network fetch: retried like every other install step (#1043).
+          pwsh CI/Retry.ps1 -Attempts 5 -DelaySeconds 10 git clone --depth=1 https://github.com/oneapi-src/oneapi-ci.git oneapi-ci || exit /b 1
           cd oneapi-ci
           scripts\install_windows.bat %WINDOWS_BASEKIT_URL% %WINDOWS_CPP_COMPONENTS%
       - name: Save oneAPI cache
@@ -538,7 +567,21 @@ jobs:
       VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
       CAE_LABEL_TEST_SKIP: "1"
     steps:
+      # actions/checkout has no retry, and Windows runners intermittently fail
+      # the fetch with a transient schannel SEC_E_UNTRUSTED_ROOT (#1043). Let
+      # the first attempt fail, pause, and check out once more.
       - name: Checkout repository
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Wait before retrying checkout
+        if: steps.checkout.outcome == 'failure'
+        shell: pwsh
+        run: Start-Sleep -Seconds 15
+      - name: Checkout repository (retry)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v6
         with:
           submodules: recursive

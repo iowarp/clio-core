@@ -12633,6 +12633,23 @@ TEST_CASE("Autogen - PoolManager operations", "[autogen][poolmanager][ops]") {
     INFO("PoolManager is initialized");
   }
 
+  SECTION("DescribeCreatesInProgress") {
+    // Issue #1180: a stalled GetOrCreatePool must be able to name the pool.
+    REQUIRE(pool_manager->DescribeCreatesInProgress().empty());
+    const auto a = pool_manager->BeginCreate("stuck_pool", "mod_a");
+    const auto b = pool_manager->BeginCreate("later_pool", "mod_b");
+    const std::string both = pool_manager->DescribeCreatesInProgress();
+    INFO("described: " << both);
+    REQUIRE(both.find("creating 'stuck_pool' (mod_a) for ") == 0);
+    REQUIRE(both.find("; creating 'later_pool' (mod_b) for ") !=
+            std::string::npos);
+    pool_manager->EndCreate(a);
+    REQUIRE(pool_manager->DescribeCreatesInProgress().find("stuck_pool") ==
+            std::string::npos);
+    pool_manager->EndCreate(b);
+    REQUIRE(pool_manager->DescribeCreatesInProgress().empty());
+  }
+
   SECTION("GetPoolCount") {
     size_t count = pool_manager->GetPoolCount();
     REQUIRE(count > 0);

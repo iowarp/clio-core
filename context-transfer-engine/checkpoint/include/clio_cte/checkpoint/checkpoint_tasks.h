@@ -19,8 +19,11 @@ namespace clio::cte::checkpoint {
 using Context = clio::cte::core::Context;
 using TagId = clio::cte::core::TagId;
 
-/** Well-known default pool id/name for the fault handler. */
-static constexpr clio::run::PoolId kCheckpointPoolId(565, 0);
+/** Well-known default pool id/name for the fault handler. 566, not 565: the
+ *  stream ChiMod owns 565.0 and the default config composes it there, so a
+ *  shared id resolved Vector::Copy's fault handler to the stream pool (#1186).
+ *  test_well_known_pool_ids keeps the CTE ids distinct. */
+static constexpr clio::run::PoolId kCheckpointPoolId(566, 0);
 static constexpr const char *kCheckpointPoolName = "clio_cte_checkpoint";
 
 /**

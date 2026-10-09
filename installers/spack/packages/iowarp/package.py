@@ -123,6 +123,12 @@ class Iowarp(CMakePackage):
 
     conflicts('+fuse', when='~cte', msg='fuse adapter lives under CTE; enable +cte')
 
+    # The POSIX/STDIO/MPI-IO adapters intercept calls through the ELF toolkit;
+    # without it CMake silently skips them (#1194).
+    for _adapter in ('posix', 'stdio', 'mpiio'):
+        conflicts('+' + _adapter, when='~elf',
+                  msg='the {0} adapter needs +elf'.format(_adapter))
+
     # Networking libraries
     # +ares: build libfabric with the full Ares-rail fabric set. The
     # spec is a single node in the concretized graph, so this constraint
@@ -178,110 +184,47 @@ class Iowarp(CMakePackage):
         args.append(self.define_from_variant(
             'CLIO_CORE_ENABLE_BOOST_COROUTINES', 'boost_coro'))
 
-        # Context-transport-primitives (CTP) options
-        if '+hdf5' in self.spec:
-            args.append(self.define('CTP_ENABLE_VFD', 'ON'))
-        if '+compress' in self.spec:
-            args.append(self.define('CTP_ENABLE_COMPRESS', 'ON'))
-        if '+encrypt' in self.spec:
-            args.append(self.define('CTP_ENABLE_ENCRYPT', 'ON'))
-        if '+mochi' in self.spec:
-            args.append(self.define('CLIO_CORE_ENABLE_THALLIUM', 'ON'))
-        if '+zmq' in self.spec:
-            args.append(self.define('CTP_ENABLE_ZMQ_TESTS', 'ON'))
-        if '+elf' in self.spec:
-            args.append(self.define('CTP_ENABLE_ELF', 'ON'))
-        if '+cuda' in self.spec:
-            args.append(self.define('CTP_ENABLE_CUDA', 'ON'))
-        if '+rocm' in self.spec:
-            args.append(self.define('CTP_ENABLE_ROCM', 'ON'))
+        # Feature options. Every name here is an option() in the root
+        # CMakeLists.txt; the CTP_*/CTE_*/CAE_* spellings this used to pass
+        # are derived there, not read, so those variants built nothing (#1194).
+        # define_from_variant also passes OFF, which matters for the adapters
+        # whose CMake default is ON (POSIX).
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_ELF', 'elf'))
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_ZMQ', 'zmq'))
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_THALLIUM', 'mochi'))
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_MPI', 'mpiio'))
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_HDF5', 'hdf5'))
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_ENCRYPT', 'encrypt'))
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_PYTHON', 'python'))
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_CUDA', 'cuda'))
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_ROCM', 'rocm'))
         if '+adios2' in self.spec:
             args.append(self.define('CLIO_CTE_ENABLE_ADIOS2_ADAPTER', 'ON'))
             args.append(self.define('CLIO_CORE_ENABLE_GRAY_SCOTT', 'ON'))
 
-        # Tests and benchmarks
-        if '+test' in self.spec:
-            args.append(self.define('CLIO_CORE_ENABLE_TESTS', 'ON'))
-            args.append(self.define('CTP_ENABLE_TESTS', 'ON'))
-            args.append(self.define('CLIO_ENABLE_TESTS', 'ON'))
-            args.append(self.define('CLIO_CTE_ENABLE_TESTS', 'ON'))
-            args.append(self.define('CLIO_CAE_ENABLE_TESTS', 'ON'))
-            args.append(self.define('CLIO_CEE_ENABLE_TESTS', 'ON'))
-        else:
-            args.append(self.define('CLIO_CORE_ENABLE_TESTS', 'OFF'))
-            args.append(self.define('CTP_ENABLE_TESTS', 'OFF'))
-            args.append(self.define('CLIO_ENABLE_TESTS', 'OFF'))
-            args.append(self.define('CLIO_CTE_ENABLE_TESTS', 'OFF'))
-            args.append(self.define('CLIO_CAE_ENABLE_TESTS', 'OFF'))
-            args.append(self.define('CLIO_CEE_ENABLE_TESTS', 'OFF'))
+        # Tests and benchmarks: one switch each covers every component.
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_TESTS', 'test'))
+        args.append(self.define_from_variant(
+            'CLIO_CORE_ENABLE_BENCHMARKS', 'benchmark'))
 
-        if '+benchmark' in self.spec:
-            args.append(self.define('CLIO_CORE_ENABLE_BENCHMARKS', 'ON'))
-            args.append(self.define('CTP_ENABLE_BENCHMARKS', 'ON'))
-            args.append(self.define('CLIO_ENABLE_BENCHMARKS', 'ON'))
-            args.append(self.define('CLIO_CTE_ENABLE_BENCHMARKS', 'ON'))
-            args.append(self.define('CLIO_CAE_ENABLE_BENCHMARKS', 'ON'))
-            args.append(self.define('CLIO_CEE_ENABLE_BENCHMARKS', 'ON'))
-        else:
-            args.append(self.define('CLIO_CORE_ENABLE_BENCHMARKS', 'OFF'))
-            args.append(self.define('CTP_ENABLE_BENCHMARKS', 'OFF'))
-            args.append(self.define('CLIO_ENABLE_BENCHMARKS', 'OFF'))
-            args.append(self.define('CLIO_CTE_ENABLE_BENCHMARKS', 'OFF'))
-            args.append(self.define('CLIO_CAE_ENABLE_BENCHMARKS', 'OFF'))
-            args.append(self.define('CLIO_CEE_ENABLE_BENCHMARKS', 'OFF'))
+        # Context-transfer-engine (CTE) adapters. The I/O adapters also need
+        # +elf (enforced by the conflicts above).
+        cte = '+cte' in self.spec
+        for variant, option in (
+                ('posix', 'CLIO_CTE_ENABLE_POSIX_ADAPTER'),
+                ('stdio', 'CLIO_CTE_ENABLE_STDIO_ADAPTER'),
+                ('mpiio', 'CLIO_CTE_ENABLE_MPIIO_ADAPTER'),
+                ('hdf5', 'CLIO_CTE_ENABLE_VFD'),
+                ('compress', 'CLIO_CTE_ENABLE_COMPRESS'),
+                ('fuse', 'CLIO_CTE_ENABLE_FUSE_ADAPTER')):
+            on = cte and ('+' + variant) in self.spec
+            args.append(self.define(option, on))
+        # The VOL connector needs the HDF5 1.14 VOL API.
+        vol = cte and self.spec.satisfies('+hdf5 ^hdf5@1.14:')
+        args.append(self.define('CLIO_CTE_ENABLE_HDF5_VOL', vol))
 
-        # CLIO Runtime runtime options (if enabled)
-        if '+runtime' in self.spec:
-            if '+cuda' in self.spec:
-                args.append(self.define('CLIO_ENABLE_CUDA', 'ON'))
-            if '+rocm' in self.spec:
-                args.append(self.define('CLIO_ENABLE_ROCM', 'ON'))
-
-        # Context-transfer-engine (CTE) options (if enabled)
-        if '+cte' in self.spec:
-            if '+posix' in self.spec:
-                args.append(self.define('CTE_ENABLE_POSIX_ADAPTER', 'ON'))
-            if '+mpiio' in self.spec:
-                args.append(self.define('CTE_ENABLE_MPIIO_ADAPTER', 'ON'))
-                if 'openmpi' in self.spec:
-                    args.append(self.define('CTE_OPENMPI', 'ON'))
-                elif 'mpich' in self.spec:
-                    args.append(self.define('CTE_MPICH', 'ON'))
-            if '+stdio' in self.spec:
-                args.append(self.define('CTE_ENABLE_STDIO_ADAPTER', 'ON'))
-            if '+hdf5' in self.spec:
-                args.append(self.define('CTE_ENABLE_VFD', 'ON'))
-            if '+compress' in self.spec:
-                args.append(self.define('CTE_ENABLE_COMPRESS', 'ON'))
-            if '+encrypt' in self.spec:
-                args.append(self.define('CTE_ENABLE_ENCRYPT', 'ON'))
-            if '+python' in self.spec:
-                args.append(self.define('CTE_ENABLE_PYTHON', 'ON'))
-            if '+cuda' in self.spec:
-                args.append(self.define('CTE_ENABLE_CUDA', 'ON'))
-            if '+rocm' in self.spec:
-                args.append(self.define('CTE_ENABLE_ROCM', 'ON'))
-            if '+fuse' in self.spec:
-                args.append(self.define('CLIO_CTE_ENABLE_FUSE_ADAPTER', 'ON'))
-
-        # Context-assimilation-engine (CAE) options (if enabled)
+        # Context-assimilation-engine (CAE) object-store importers.
         if '+cae' in self.spec:
-            if '+posix' in self.spec:
-                args.append(self.define('CAE_ENABLE_POSIX_ADAPTER', 'ON'))
-            if '+mpiio' in self.spec:
-                args.append(self.define('CAE_ENABLE_MPIIO_ADAPTER', 'ON'))
-                if 'openmpi' in self.spec:
-                    args.append(self.define('CAE_OPENMPI', 'ON'))
-                elif 'mpich' in self.spec:
-                    args.append(self.define('CAE_MPICH', 'ON'))
-            if '+stdio' in self.spec:
-                args.append(self.define('CAE_ENABLE_STDIO_ADAPTER', 'ON'))
-            if '+hdf5' in self.spec:
-                args.append(self.define('CAE_ENABLE_VFD', 'ON'))
-            if '+cuda' in self.spec:
-                args.append(self.define('CAE_ENABLE_CUDA', 'ON'))
-            if '+rocm' in self.spec:
-                args.append(self.define('CAE_ENABLE_ROCM', 'ON'))
             if '+s3_cae' in self.spec:
                 args.append(self.define('CAE_ENABLE_S3', 'ON'))
             if '+gcs' in self.spec:

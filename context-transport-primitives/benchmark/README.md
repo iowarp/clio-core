@@ -13,7 +13,7 @@ This directory contains a comprehensive benchmark suite for measuring the perfor
 The benchmark is built automatically when `CTP_ENABLE_BENCHMARKS` is enabled:
 
 ```bash
-cmake --preset=debug -DWRP_CORE_ENABLE_BENCHMARKS=ON
+cmake --preset=debug -DCLIO_CORE_ENABLE_BENCHMARKS=ON
 cmake --build build --target allocator_benchmark
 ```
 

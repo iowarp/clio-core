@@ -329,6 +329,55 @@ TEST_CASE("PutSieve - background flusher ships idle partial pages unaided",
   REQUIRE(clio::cte::core::Client::DeferErrorCount() == 0);
 }
 
+TEST_CASE("PutSieve - AwaitPendingPuts drains a still-open page",
+          "[cte][sieve][995]") {
+  auto *client = CLIO_CTE_CLIENT;
+  REQUIRE(client != nullptr);
+
+  clio::cte::core::Tag tag("sieve_await_tag");
+  const clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  // A short write followed straight by fsync: the bytes sit in an open sieve
+  // page and AwaitPendingPuts (what fsync calls) must turn that page into a
+  // put and wait for it, or fsync returns before the data was even sent
+  // (suspected for #995). The page count is checked right after the await:
+  // the background flusher only sweeps a page left untouched for a full
+  // 500 us tick, so it cannot do the drain on the await's behalf.
+  auto &reg = clio::cte::core::Client::DeferRegistry::Get();
+  const bool sieving = clio::cte::core::Client::SievePutEnabled();
+  constexpr int kBlobs = 16;
+  int left_open = 0;
+  int missing = 0;
+  for (int i = 0; i < kBlobs; ++i) {
+    const std::string name = "await_" + std::to_string(i);
+    std::string v(512, static_cast<char>('a' + i % 26));
+    // The first write to a fresh blob is submitted as a put, not sieved;
+    // await it so nothing for this blob is in flight before the short write.
+    REQUIRE(client->AsyncPutBlobDefer(tag_id, name, 0, v.size(),
+                                      v.data()) == 0);
+    clio::cte::core::Client::AwaitPendingPuts(tag_id, name);
+    REQUIRE(client->AsyncPutBlobDefer(tag_id, name, 512, v.size(),
+                                      v.data()) == 0);
+    const size_t open_before = reg.sieve_pages_.load();
+    clio::cte::core::Client::AwaitPendingPuts(tag_id, name);
+    const size_t open_after = reg.sieve_pages_.load();
+    if (sieving && open_after >= open_before) ++left_open;
+    std::vector<char> got(512, 0);
+    auto fut = client->AsyncGetBlob(tag_id, name, 512, 512, /*flags=*/0,
+                                    got.data());
+    fut.Wait();
+    if (fut->GetReturnCode() != 0 ||
+        std::memcmp(got.data(), v.data(), 512) != 0) {
+      ++missing;
+    }
+  }
+  INFO("awaits that left the page open: " << left_open
+       << "; blobs not readable after the await: " << missing);
+  REQUIRE(left_open == 0);
+  REQUIRE(missing == 0);
+  REQUIRE(clio::cte::core::Client::DeferErrorCount() == 0);
+}
+
 TEST_CASE("PutSieve - per-blob budget sweeps the oldest page inline",
           "[cte][sieve][1007]") {
   auto *client = CLIO_CTE_CLIENT;

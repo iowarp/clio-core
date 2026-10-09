@@ -43,7 +43,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <clio_ctp/introspect/system_info.h>
 #include <fstream>
+
+#include "clio_ctp/introspect/system_info.h"
 #include <sstream>
 #include <string>
 #include <thread>
@@ -315,6 +318,200 @@ TEST_CASE("ClientCrash - PutBlob then terminate drops task with no leak [leak]",
 
   clio::run::test::UnsetEnvVar("CLIO_TEST_SERVER_LOG");
   fs::remove_all(work);
+}
+
+/**
+ * Attach as a SHM client, map a data segment and complete one PutBlob from it
+ * (so the daemon has resolved, i.e. mapped, that segment), touch `ready`, then
+ * idle until killed. Never returns.
+ * @param ready file to create once the segment is in use by the daemon
+ */
+[[noreturn]] void ShmIdleClientMain(const std::string &ready) {
+  int devnull = open("/dev/null", O_WRONLY);
+  if (devnull >= 0) {
+    dup2(devnull, STDOUT_FILENO);
+    close(devnull);
+  }
+  setenv("CLIO_WITH_RUNTIME", "0", 1);
+  setenv("CLIO_IPC_MODE", "shm", 1);
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) _exit(2);
+  auto *ipc = CLIO_IPC;
+  if (ipc == nullptr) _exit(3);
+  clio::cte::core::Client core;
+  core.Init(clio::run::PoolId(kCorePoolMajor, 0));
+  auto mk = core.AsyncGetOrCreateTag("/reap/tag",
+                                     clio::cte::core::TagId::GetNull(),
+                                     clio::run::PoolQuery::Local());
+  mk.Wait();
+  if (mk->GetReturnCode() != 0) _exit(4);
+  const clio::run::u64 size = 64 * 1024;
+  ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(size);
+  if (buf.IsNull()) _exit(5);
+  std::memset(buf.ptr_, 'r', size);
+  auto pb = core.AsyncPutBlob(mk->tag_id_, "b", 0, size,
+                              buf.shm_.template Cast<void>(), -1.0f,
+                              clio::cte::core::Context(), 0u,
+                              clio::run::PoolQuery::Local());
+  pb.Wait();
+  if (pb->GetReturnCode() != 0) _exit(6);
+  { std::ofstream(ready) << "ok"; }
+  for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+}
+
+/**
+ * #1192: a SHM client killed with SIGKILL leaves its data segments behind.
+ * The daemon must reclaim them once the client is dead, idle and has nothing
+ * in flight, while it keeps running -- not only at the next runtime start.
+ * (The periodic reaper used to be disabled, so they lived as long as the
+ * daemon.)
+ */
+TEST_CASE("ClientCrash - dead SHM client's segments are reaped while running",
+          "[cli][crash][reap][1192]") {
+  const std::string log_path = "/tmp/clio_client_reap.log";
+  ::unlink(log_path.c_str());
+  clio::run::test::SetEnvVar("CLIO_TEST_SERVER_LOG", log_path);
+  clio::run::test::SetEnvVar("CTP_LOG_LEVEL", "info");
+  clio::run::test::SetEnvVar("CLIO_PORT", std::to_string(kPort));
+
+  const fs::path work = fs::temp_directory_path() / "clio_client_reap_test";
+  fs::remove_all(work);
+  fs::create_directories(work);
+  const fs::path conf = work / "clio.yaml";
+  {
+    std::ofstream f(conf);
+    f << "runtime:\n"
+         "  client_reap_grace_s: 2\n"
+         "compose:\n"
+         "  - mod_name: clio_cte_core\n"
+         "    pool_name: cte_client_reap\n"
+         "    pool_query: local\n"
+         "    pool_id: \"512.0\"\n"
+         "    storage:\n"
+         "      - path: " << (work / "ram_dev").string() << "\n"
+         "        bdev_type: ram\n"
+         "        capacity_limit: 64mb\n"
+         "    dpe:\n"
+         "      dpe_type: random\n";
+  }
+  clio::run::test::SetEnvVar("CLIO_SERVER_CONF", conf.string());
+
+  clio::run::test::RuntimeServer server;
+  REQUIRE(server.Start(kPort, "127.0.0.1"));
+  REQUIRE(server.WaitForReady());
+
+  const std::string ready = (work / "client_ready").string();
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (child == 0) ShmIdleClientMain(ready);  // never returns
+  bool up = false;
+  for (int i = 0; i < 300 && !up; ++i) {
+    up = fs::exists(ready);
+    if (!up) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  REQUIRE(up);
+
+  // The client's first data segment. Observed through its name entry, not
+  // the log: leak-check builds compile kInfo logging out. symlink_status,
+  // because the entry links into the (soon dead) client's /proc/<pid>/fd and
+  // would read as missing the moment the client dies.
+  const fs::path seg = ctp::SystemInfo::GetMemfdPath(
+      "clio_" + std::to_string(child) + "_0");
+  auto present = [&seg]() {
+    std::error_code ec;
+    return fs::exists(fs::symlink_status(seg, ec));
+  };
+  INFO("client segment entry: " << seg.string());
+  REQUIRE(present());
+
+  kill(child, SIGKILL);
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child);
+
+  // Grace 2 s plus the 1 s reap period: well inside 30 s.
+  bool reaped = false;
+  for (int i = 0; i < 300 && !reaped; ++i) {
+    reaped = !present();
+    if (!reaped) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  REQUIRE(reaped);
+  REQUIRE(server.IsRunning());
+
+  server.Stop();
+  clio::run::test::UnsetEnvVar("CLIO_SERVER_CONF");
+  clio::run::test::UnsetEnvVar("CLIO_TEST_SERVER_LOG");
+  fs::remove_all(work);
+}
+
+TEST_CASE("ClientCrash - a dead client's SHM segments are reclaimed (#1192)",
+          "[cli][cte][crash][reap]") {
+  // The admin WreapDeadIpcs periodic reclaims the segments of a client that
+  // died, after the grace period (runtime.client_reap_grace_s). A short grace
+  // keeps the test quick.
+  clio::run::test::SetEnvVar("CTP_LOG_LEVEL", "info");
+  clio::run::test::SetEnvVar("CLIO_PORT", std::to_string(kPort));
+  const fs::path work =
+      fs::temp_directory_path() / "clio_client_reap_zombie_test";
+  fs::remove_all(work);
+  fs::create_directories(work);
+  const fs::path conf = work / "clio.yaml";
+  { std::ofstream(conf) << "runtime:\n  client_reap_grace_s: 2\n"; }
+  clio::run::test::SetEnvVar("CLIO_SERVER_CONF", conf.string());
+  const fs::path compose_yaml = work / "compose.yaml";
+  {
+    std::ofstream f(compose_yaml);
+    f << "compose:\n"
+         "  - mod_name: clio_cte_core\n"
+         "    pool_name: cte_client_reap\n"
+         "    pool_query: local\n"
+         "    pool_id: \"512.0\"\n"
+         "    storage:\n"
+         "      - path: " << (work / "ram_dev").string() << "\n"
+         "        bdev_type: ram\n"
+         "        capacity_limit: 256mb\n"
+         "    dpe:\n"
+         "      dpe_type: random\n";
+  }
+  clio::run::test::RuntimeServer server;
+  REQUIRE(server.Start(kPort, "127.0.0.1", /*ephemeral=*/true));
+  REQUIRE(server.WaitForReady());
+  REQUIRE(RunCliTimed({"compose", "start", compose_yaml.string()}, 60) == 0);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (child == 0) {
+    CrashClientMain(/*quiet=*/true);  // allocates SHM, PutBlobs, dies
+  }
+  // Deliberately do NOT wait for the child yet: until we do it is a zombie,
+  // which still answers kill(pid, 0) although it has released every fd. The
+  // reaper must see through that (/proc/<pid>/stat state 'Z') and reclaim
+  // the segments anyway -- a parent that never waits is the common way a
+  // dead client lingers. The child is reaped (waitpid) at the end.
+  // The client's segments are memfds with a symlink clio_<pid>_<idx> in the
+  // per-user memfd dir; reaping unmaps them and removes the symlinks.
+  const std::string dir = ctp::SystemInfo::GetMemfdDir();
+  const std::string prefix = "clio_" + std::to_string(child) + "_";
+  auto segments_left = [&]() {
+    size_t n = 0;
+    std::error_code ec;
+    for (const auto &e : fs::directory_iterator(dir, ec)) {
+      if (e.path().filename().string().rfind(prefix, 0) == 0) ++n;
+    }
+    return n;
+  };
+  size_t left = segments_left();
+  INFO("segments of the dead client right after its death: " << left);
+  for (int i = 0; i < 400 && left > 0; ++i) {  // grace 2 s + reaper 1 s period
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    left = segments_left();
+  }
+  REQUIRE(left == 0);
+  REQUIRE(server.IsRunning());  // and the daemon survived the reap
+  int status = 0;
+  REQUIRE(waitpid(child, &status, 0) == child);
+  server.Stop();
+  for (int i = 0; i < 50 && server.IsRunning(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  clio::run::test::UnsetEnvVar("CLIO_SERVER_CONF");
 }
 
 // Custom main: `crash-client` runs the standalone client (distributed suite);

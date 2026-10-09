@@ -151,12 +151,16 @@ struct CompressionPrediction {
   double psnr_db;               /**< Predicted PSNR in dB (0 for lossless) */
   double compression_time_ms;   /**< Predicted compression time in milliseconds */
   double inference_time_ms;     /**< Time taken for inference in milliseconds */
+  /** Predicted decompression time in milliseconds; 0 when the model does not
+   *  predict one (the Q-table and DNN models do not). */
+  double decompression_time_ms;
 
   /**
    * @brief Default constructor
    */
   CompressionPrediction()
-      : compression_ratio(0), psnr_db(0), compression_time_ms(0), inference_time_ms(0) {}
+      : compression_ratio(0), psnr_db(0), compression_time_ms(0),
+        inference_time_ms(0), decompression_time_ms(0) {}
 
   /**
    * @brief Constructor with values
@@ -167,7 +171,8 @@ struct CompressionPrediction {
    */
   CompressionPrediction(double ratio, double psnr, double compress_time, double infer_time)
       : compression_ratio(ratio), psnr_db(psnr),
-        compression_time_ms(compress_time), inference_time_ms(infer_time) {}
+        compression_time_ms(compress_time), inference_time_ms(infer_time),
+        decompression_time_ms(0) {}
 
   /**
    * @brief Get number of output features

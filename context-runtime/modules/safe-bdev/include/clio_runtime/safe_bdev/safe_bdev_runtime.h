@@ -44,6 +44,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <cstdio>  // std::FILE
 #include <cstdlib>  // std::getenv
 #include <map>
@@ -171,6 +172,27 @@ class Runtime : public clio::run::Container {
   /** Create the container (Method::kCreate). */
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
 
+  /**
+   * Record one allocated chunk: the array high water, the partial length,
+   * the block the caller gets and the alloc-log entry. Caller holds
+   * alloc_mu_ and has taken slot `s` on member `d`.
+   * @param task the allocation
+   * @param d data member
+   * @param s slot
+   * @param remaining bytes still to place; reduced by this chunk's share
+   */
+  void EmitChunk(clio::run::shared_ptr<AllocateBlocksTask> &task, size_t d,
+                 clio::run::u64 s, clio::run::u64 &remaining);
+  /**
+   * Place one whole stripe of the request (#1160): one never-used slot on
+   * every active member, when the request still has a chunk for each and
+   * the slot fits every member. Caller holds alloc_mu_.
+   * @param task the allocation
+   * @param remaining bytes still to place; reduced by the stripe
+   * @return true if a stripe was placed
+   */
+  bool AllocateFullStripe(clio::run::shared_ptr<AllocateBlocksTask> &task,
+                          clio::run::u64 &remaining);
   /** Allocate multiple blocks (Method::kAllocateBlocks). */
   clio::run::TaskResume AllocateBlocks(clio::run::shared_ptr<AllocateBlocksTask> &task);
 
@@ -337,7 +359,7 @@ class Runtime : public clio::run::Container {
   struct MemberAlloc {
     clio::run::u64 high_water_ = 0;      // next never-used slot
     clio::run::u64 cap_slots_ = 0;       // usable kChunkLen slots on this member
-    std::vector<clio::run::u64> free_;   // freed slots, reusable (LIFO)
+    std::set<clio::run::u64> free_;      // freed or skipped slots, reusable
     std::set<clio::run::u64> live_;      // currently-live slots
     /** Live slots whose block is shorter than kChunkLen: slot -> bytes in
      *  use. The rest of such a chunk is never addressed, so a degraded
@@ -357,23 +379,67 @@ class Runtime : public clio::run::Container {
       return bump_left + free_.size();
     }
     bool Full() const { return RemainingSlots() == 0; }
-    // Take the next slot (reuse a freed one first, else bump). Caller must have
-    // checked !Full(). Records it live.
+    // Take the next slot (reuse the highest freed one first, else bump).
+    // Caller must have checked !Full(). Records it live.
     clio::run::u64 Take() {
       clio::run::u64 s;
       if (!free_.empty()) {
-        s = free_.back();
-        free_.pop_back();
+        auto it = std::prev(free_.end());
+        s = *it;
+        free_.erase(it);
       } else {
         s = high_water_++;
       }
       live_.insert(s);
       return s;
     }
+    /**
+     * Take slot `s` itself (#1160: a full-stripe or stripe-spreading
+     * allocation chooses the slot). Never-used slots below it become free.
+     * Caller must have checked s < cap_slots_ and that s is not live.
+     * @param s the slot
+     */
+    void TakeSlot(clio::run::u64 s) {
+      if (s >= high_water_) {
+        for (clio::run::u64 x = high_water_; x < s; ++x) free_.insert(x);
+        high_water_ = s + 1;
+      } else {
+        free_.erase(s);
+      }
+      live_.insert(s);
+    }
+    /**
+     * The slot Take() would hand out next, or the first bump slot past the
+     * free list's reach.
+     * @return the slot
+     */
+    clio::run::u64 PeekSlot() const {
+      return free_.empty() ? high_water_ : *std::prev(free_.end());
+    }
+    /**
+     * A free slot that is not in `avoid` (#1160: concurrent single-chunk
+     * writers otherwise all land on one stripe and serialize on its lock):
+     * the highest free one, else the first bump slot not avoided. Caller
+     * must have checked !Full(); the result may be at or past cap_slots_
+     * only when every candidate below it is avoided, so callers compare.
+     * @param avoid slots handed out recently
+     * @return the slot
+     */
+    clio::run::u64 PickSpread(const std::deque<clio::run::u64> &avoid) const {
+      auto avoided = [&](clio::run::u64 s) {
+        return std::find(avoid.begin(), avoid.end(), s) != avoid.end();
+      };
+      for (auto it = free_.rbegin(); it != free_.rend(); ++it) {
+        if (!avoided(*it)) return *it;
+      }
+      clio::run::u64 s = high_water_;
+      while (avoided(s) && s + 1 < cap_slots_) ++s;
+      return s;
+    }
     // Release a live slot back to the free list.
     void Release(clio::run::u64 s) {
       if (live_.erase(s) != 0) {
-        free_.push_back(s);
+        free_.insert(s);
       }
       part_len_.erase(s);
     }
@@ -392,6 +458,11 @@ class Runtime : public clio::run::Container {
   std::vector<clio::run::bdev::Client> parity_clients_;
   std::vector<MemberAlloc> data_alloc_;     // per-data-member slot allocator
   clio::run::u32 rr_cursor_;                // round-robin data-member cursor
+  /** Slots the last few single-chunk allocations took (alloc_mu_): the
+   *  next one avoids them, so concurrent small writers get distinct stripes
+   *  (#1160). Bounded to kSpreadWindow entries. */
+  std::deque<clio::run::u64> recent_slots_;
+  static constexpr size_t kSpreadWindow = 16;
 
   // Reed-Solomon codec cache, keyed by stripe width k_s (data-shard count). Each
   // codec is RS(k_s, max_failures_); a stripe of width k_s uses parity shards
@@ -1454,6 +1525,26 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume RebuildSlot(bool is_data, int idx, clio::run::u64 s,
                                     bool &ok);
+
+  /**
+   * Compute parity member `idx`'s shard of slot `s` for a rebuild. Data
+   * columns that are active are read as they are on disk; when any data
+   * column of the stripe is down, every data chunk is first decoded from the
+   * stripe's survivors (ReconstructStripe: the active data members plus the
+   * OTHER parity rows -- the rebuilding row is faulty and is not consulted),
+   * so a parity disk can be replaced while a data disk is also dead, as
+   * long as the array is within max_failures (#1199).
+   * @param s the slot
+   * @param stripe CodeColumns(): the data columns the parity encodes
+   * @param idx the parity row being rebuilt
+   * @param chunk receives the encoded shard (kChunkLen bytes)
+   * @param built receives false when the data could not be obtained
+   */
+  clio::run::TaskResume RebuildParityShard(clio::run::u64 s,
+                                           const std::vector<int> &stripe,
+                                           int idx,
+                                           std::vector<uint8_t> &chunk,
+                                           bool &built);
 
   /** Rebuild every slot recorded in rebuild_redo_ (and clear them).
    * @param is_data data (true) or parity (false) member

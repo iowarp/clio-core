@@ -163,6 +163,12 @@ struct OriginProgress {
   // PROBED: QueryTaskProgress is itself an admin cross-node task, so probing
   // admin origins would recurse (issue #896).
   bool probe_eligible = true;
+  // #1197: true from registration until SendIn has transmitted the last
+  // replica. A Gone verdict (dead node, probe) that lands meanwhile must not
+  // complete and release the origin under the sender's feet; it is parked in
+  // deferred_gone and applied by FinishOriginSend.
+  bool sending = false;
+  std::vector<clio::run::u32> deferred_gone;
 };
 
 /** A replica the origin is still waiting on, to be probed via QueryTaskProgress. */
@@ -232,6 +238,34 @@ class IpcManagerRun2Run {
    * tick as ProcessRetryQueues.
    */
   void ReplayDeferredRecv();
+
+  /**
+   * Hold a CLIENT request whose pool this node has not finished creating (issue
+   * #1039). A client may connect while the runtime is still composing its
+   * pools; its request used to be consumed off the transport and dropped, so
+   * the client waited forever. The archive is kept whole (no task consumed,
+   * any transport-owned bulk frames still attached) and admitted by
+   * ReplayDeferredClientRecv once PoolManager::IsClientAdmissible holds.
+   * @param archive The received request, moved into the deferral list.
+   * @param mode Client transport it arrived on (kShm, kTcp or kIpc).
+   * @param recv_info The transport's receive info (fd / identity) for TCP/IPC.
+   * @param transport The receiving transport (TCP/IPC); nullptr for SHM.
+   */
+  void DeferClientRecv(clio::run::LoadTaskArchive &&archive,
+                       clio::run::IpcMode mode,
+                       const ctp::lbm::ClientInfo &recv_info,
+                       ctp::lbm::Transport *transport);
+
+  /**
+   * Admit every deferred client request whose pool is now admissible (created
+   * and its Create finished), and drop (with
+   * an error log) the ones older than kDeferredRecvTimeoutSec. Runs on the
+   * client-recv thread, which ticks every few hundred microseconds, so a held
+   * request is admitted promptly after its pool is created. SHM requests are
+   * pushed onto the ingress lane; TCP/IPC ones go through the same admission
+   * as a freshly received request.
+   */
+  void ReplayDeferredClientRecv();
 
   /**
    * Scan send_map_ for tasks waiting on nodes that have been marked dead and
@@ -374,6 +408,52 @@ class IpcManagerRun2Run {
                               clio::run::u64 target_node_id,
                               clio::run::shared_ptr<clio::run::Task> origin_task);
 
+  /** What SendIn decided for one replica once its target was resolved. */
+  enum class SendInAction : clio::run::u32 {
+    kSkip,      /**< no target (unresolvable query / unknown host) */
+    kFailFast,  /**< target dead and the origin wants no retry */
+    kRetry,     /**< target dead; wait in send_in_retry_ */
+    kTransmit   /**< target alive; serialize and send */
+  };
+
+  /** One replica's plan: the copy to send, where, and how (#1185). */
+  struct SendInPlan {
+    clio::run::shared_ptr<clio::run::Task> task_copy;
+    clio::run::u64 target_node_id = kInvalidNodeId;
+    SendInAction action = SendInAction::kSkip;
+  };
+
+  /**
+   * Plan one replica of an origin: resolve its target node, create and stamp
+   * the task copy (also stored in origin_task->Subtasks()[replica_idx]) and
+   * decide skip / fail-fast / retry / transmit. Sends nothing and never
+   * completes the origin, so SendIn can register progress before acting.
+   * @param ipc_manager the runtime IPC manager
+   * @param pool_manager the pool manager (container + node lookups)
+   * @param origin_task the origin task being fanned out
+   * @param query the pool query of this replica
+   * @param replica_idx the replica's index in the origin's query list
+   * @param send_map_key the origin's send_map_ key (its address)
+   * @return the plan for this replica
+   */
+  SendInPlan SendInPlanReplica(clio::run::IpcManager *ipc_manager,
+                               clio::run::PoolManager *pool_manager,
+                               clio::run::shared_ptr<clio::run::Task> origin_task,
+                               const clio::run::PoolQuery &query,
+                               size_t replica_idx, size_t send_map_key);
+
+  /**
+   * Act on a SendIn plan: count fail-fast replicas (completing the origin
+   * when every replica is accounted for), queue retries, transmit the rest.
+   * @param ipc_manager the runtime IPC manager
+   * @param origin_task the origin task being fanned out
+   * @param send_map_key the origin's send_map_ key
+   * @param plan per-replica plans from SendInPlanReplica
+   */
+  void SendInExecutePlan(clio::run::IpcManager *ipc_manager,
+                         clio::run::shared_ptr<clio::run::Task> origin_task,
+                         size_t send_map_key, std::vector<SendInPlan> &plan);
+
   // ---------------------------------------------------------------------------
   // SendOut sub-functions
   // ---------------------------------------------------------------------------
@@ -502,11 +582,22 @@ class IpcManagerRun2Run {
   std::chrono::steady_clock::time_point last_progress_scan_{};
 
   /**
-   * Register an origin's replicas for progress tracking (called from SendIn).
+   * Register an origin's replicas for progress tracking (called from SendIn
+   * BEFORE any replica is transmitted, #1185). A no-op when the origin is no
+   * longer in send_map_, so a completed origin can never leave an orphan.
    * probe_eligible=false registers the origin for dead-node completion but
    * excludes it from QueryTaskProgress probing (admin-pool origins: the probe
    * is itself an admin cross-node task and would recurse).
    */
+  /**
+   * Mark the origin's send as finished (#1197): clears OriginProgress::sending
+   * and applies every Gone verdict parked while the replicas were being
+   * transmitted. Called by SendIn after its last transmit, on the sending
+   * worker. A no-op when the origin already completed.
+   * @param net_key the origin's send_map_ key
+   */
+  void FinishOriginSend(size_t net_key);
+
   void RegisterOriginProgress(size_t net_key,
                               const std::vector<clio::run::u64> &replica_targets,
                               bool probe_eligible = true);
@@ -555,6 +646,21 @@ class IpcManagerRun2Run {
                                    const clio::run::LoadTaskArchive &archive);
   std::mutex deferred_recv_mutex_;
   std::list<DeferredRecv> deferred_recv_;  // list: erase never moves an archive
+
+  /** A client request held until its pool exists (see DeferClientRecv). */
+  struct DeferredClientRecv {
+    clio::run::LoadTaskArchive archive;
+    clio::run::IpcMode mode;
+    ctp::lbm::ClientInfo recv_info;
+    ctp::lbm::Transport *transport;
+    std::chrono::steady_clock::time_point arrived;
+  };
+  /** Release a dropped deferred client request's transport-owned frames. */
+  static void ReleaseDeferredClientRecv(DeferredClientRecv &d);
+  std::mutex deferred_client_mutex_;
+  std::list<DeferredClientRecv> deferred_client_recv_;
+  /** Mirrors deferred_client_recv_.size() so the recv loop skips the lock. */
+  std::atomic<size_t> deferred_client_count_{0};
 };
 
 }  // namespace clio::run

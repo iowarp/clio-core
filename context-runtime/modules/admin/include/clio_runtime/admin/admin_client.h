@@ -54,13 +54,16 @@ namespace clio::run::admin {
 class Client : public clio::run::ContainerClient {
  public:
   /**
-   * Default constructor
+   * Default constructor: targets the admin pool.
+   *
+   * There is exactly one admin pool (kAdminPoolId), so a default admin
+   * client means that pool. CLIO_ADMIN default-constructs on first use; when
+   * that first use came before ClientInit published its client (ServerInit's
+   * pool-log replay does), g_admin kept PoolId(0,0) for the life of the
+   * process and every admin task it sent -- `clio_run start`'s AddNode
+   * induction among them -- failed to route.
    */
-  Client() {
-    HLOG(kWarning,
-         "AdminClient: Default constructor called - pool_id_ will be "
-         "PoolId(0,0)");
-  }
+  Client() { Init(clio::run::kAdminPoolId); }
 
   /**
    * Constructor with pool ID
@@ -460,6 +463,7 @@ class Client : public clio::run::ContainerClient {
     auto* ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<HeartbeatTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query);
+    task->SetFlags(TASK_LIVENESS_PROBE);  // reaches a node marked dead (#1222)
     return ipc_manager->Send(task);
   }
 
@@ -515,6 +519,7 @@ class Client : public clio::run::ContainerClient {
 
     auto task = ipc_manager->NewTask<ProbeRequestTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, target_node_id);
+    task->SetFlags(TASK_LIVENESS_PROBE);  // reaches a node marked dead (#1222)
 
     return ipc_manager->Send(task);
   }

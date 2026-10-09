@@ -35,6 +35,49 @@
 
 namespace clio::gv_bench::kmeans_macros {
 
+/**
+ * NearestCentroid, out of line and over raw pointers.
+ *
+ * WHY NOT ::clio_km::NearestCentroid DIRECTLY. That one is a template over an
+ * indexable point, so it inlines into the caller. Inlined into a macro-form
+ * resumable body -- a Duff's-device switch -- its k x dims loop NEST crashes
+ * IGC outright:
+ *
+ *   IGC: Internal Compiler Error: Segmentation violation
+ *
+ * Reproduced offline on Aurora against libigc 2.11.43 with DPC++ 2025.3.2 and
+ * 2026.1.0 alike (ocloc compile -spirv_input -device pvc). Measured: a single
+ * flat loop in the same position is fine, a nest is not; the trip counts,
+ * unrolling pragmas and the accessor type make no difference; and a template
+ * wrapper marked noinline does not help because it still gets inlined. Only
+ * lifting the nest into a NON-template function over raw pointers, which
+ * noinline actually sticks to, compiles. This is the shape DESIGN.md asks for
+ * anyway: thin coroutine bodies, compute in noinline functions over raw
+ * pointers.
+ *
+ * CONTIGUITY. `pt` must address `dims` consecutive elements. Callers pass
+ * &h[pbase] for a point wholly inside the held range, and a hold never spans
+ * a page, so the run from pbase is contiguous. Indexing the Held by absolute
+ * offset elsewhere keeps the arithmetic identical to the baseline's.
+ */
+__attribute__((noinline)) CTP_GPU_FUN u32
+NearestCentroidOutOfLine(const float *pt, const float *cent, u32 dims, u32 k) {
+  float best = 3.4e38f;
+  u32 bestk = 0;
+  for (u32 c = 0; c < k; ++c) {
+    float d = 0.0f;
+    for (u32 i = 0; i < dims; ++i) {
+      const float x = pt[i] - cent[c * dims + i];
+      d += x * x;
+    }
+    if (d < best) {
+      best = d;
+      bestk = c;
+    }
+  }
+  return bestk;
+}
+
 namespace gv = ::clio::cte::gpu_vector;
 namespace gy = ::clio::run::gpu;
 using ::clio::run::u32;
@@ -92,15 +135,11 @@ CTP_GPU_FUN inline void AssignMacro(gv::DeviceVector<float> v, u64 per,
     const u64 npts = n / dims;
     for (u64 p = threadIdx.x; p < npts; p += blockDim.x) {
       const u64 pbase = base + off + p * dims;
-      // The held page is indexed by ABSOLUTE element offset, so close over
-      // that base rather than passing a raw pointer -- the arithmetic is then
-      // provably the baselines'.
-      struct PageAt {
-        const gv::Held<float> &hh;
-        u64 b;
-        CTP_GPU_FUN float operator[](u32 i) const { return hh[b + i]; }
-      } pt{h, pbase};
-      const u32 bestk = ::clio_km::NearestCentroid(pt, cent, dims, k);
+      // &h[pbase] rather than an indexable wrapper: the loop nest must stay
+      // out of this resumable body or IGC crashes. See
+      // NearestCentroidOutOfLine.
+      const u32 bestk =
+          NearestCentroidOutOfLine(&h[pbase], cent, dims, k);
       for (u32 i = 0; i < dims; ++i) {
         atomicAdd(&sums[bestk * dims + i], h[pbase + i]);
       }

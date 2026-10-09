@@ -85,12 +85,15 @@
 #include <fcntl.h>
 #include <spawn.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #if __linux__
 #include <sys/sysinfo.h>
+#include <sys/sysmacros.h>
 #else
+#include <sys/mount.h>
 #include <sys/sysctl.h>
 #endif
 #include <sys/types.h>
@@ -100,6 +103,7 @@
 #include <linux/memfd.h>
 #endif
 #if __APPLE__
+#include <mach-o/dyld.h>
 #include <pthread.h>
 #endif
 // WINDOWS
@@ -1218,6 +1222,115 @@ void SystemInfo::TerminateChild(SpawnedProcess &proc, int grace_ms) {
   proc.valid = false;
 }
 
+bool SystemInfo::WaitForChild(SpawnedProcess &proc, int timeout_ms,
+                              int *exit_code) {
+  if (!proc.valid) return false;
+  bool exited = false;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  int status = 0;
+  pid_t r = 0;
+  for (int waited = 0; proc.pid > 0; waited += 10) {
+    r = waitpid(proc.pid, &status, WNOHANG);
+    if (r != 0 || waited >= timeout_ms) break;
+    struct timespec ts = {0, 10 * 1000 * 1000};  // 10 ms
+    nanosleep(&ts, nullptr);
+  }
+  if (r == proc.pid) {
+    exited = WIFEXITED(status);
+    if (exited && exit_code != nullptr) *exit_code = WEXITSTATUS(status);
+    proc.pid = -1;
+  }
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  HANDLE hp = reinterpret_cast<HANDLE>(proc.win_process);
+  if (hp != NULL &&
+      WaitForSingleObject(hp, static_cast<DWORD>(timeout_ms)) ==
+          WAIT_OBJECT_0) {
+    DWORD code = 0;
+    exited = GetExitCodeProcess(hp, &code) != 0;
+    if (exited && exit_code != nullptr) *exit_code = static_cast<int>(code);
+  }
+#endif
+  TerminateChild(proc, 0);  // kills a timed-out child; releases handles
+  return exited;
+}
+
+void SystemInfo::IgnoreFileSizeSignal() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  signal(SIGXFSZ, SIG_IGN);
+#endif
+}
+
+bool SystemInfo::SetProcessFileSizeLimit(int pid, uint64_t soft_bytes,
+                                         uint64_t *prev_soft) {
+#if CTP_ENABLE_PROCFS_SYSINFO && defined(__linux__)
+  struct rlimit cur;
+  if (prlimit(static_cast<pid_t>(pid), RLIMIT_FSIZE, nullptr, &cur) != 0) {
+    return false;
+  }
+  if (prev_soft != nullptr) *prev_soft = static_cast<uint64_t>(cur.rlim_cur);
+  struct rlimit lim = {static_cast<rlim_t>(soft_bytes), cur.rlim_max};
+  return prlimit(static_cast<pid_t>(pid), RLIMIT_FSIZE, &lim, nullptr) == 0;
+#else
+  (void)pid;
+  (void)soft_bytes;
+  (void)prev_soft;
+  return false;
+#endif
+}
+
+bool SystemInfo::GetFileIdentity(const std::string &path, FileIdentity *id) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) return false;
+  id->device = static_cast<uint64_t>(st.st_dev);
+  id->file = static_cast<uint64_t>(st.st_ino);
+  return true;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // Open for attributes only, sharing everything, so the check never
+  // conflicts with the handles the caller holds on the same file.
+  HANDLE h = CreateFileA(path.c_str(), FILE_READ_ATTRIBUTES,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                         nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  BY_HANDLE_FILE_INFORMATION info;
+  const BOOL ok = GetFileInformationByHandle(h, &info);
+  CloseHandle(h);
+  if (!ok) return false;
+  id->device = static_cast<uint64_t>(info.dwVolumeSerialNumber);
+  id->file = (static_cast<uint64_t>(info.nFileIndexHigh) << 32) |
+             static_cast<uint64_t>(info.nFileIndexLow);
+  return true;
+#else
+  (void)path;
+  (void)id;
+  return false;
+#endif
+}
+
+std::string SystemInfo::GetExecutablePath() {
+#if CTP_ENABLE_PROCFS_SYSINFO && defined(__APPLE__)
+  uint32_t size = PATH_MAX;
+  std::string buf(size, '\0');
+  if (_NSGetExecutablePath(buf.data(), &size) != 0) return "";
+  char resolved[PATH_MAX];
+  if (realpath(buf.c_str(), resolved) == nullptr) return "";
+  return resolved;
+#elif CTP_ENABLE_PROCFS_SYSINFO
+  char path[PATH_MAX];
+  ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+  if (n <= 0) return "";
+  return std::string(path, static_cast<size_t>(n));
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  char path[MAX_PATH];
+  DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return "";
+  return std::string(path, n);
+#else
+  return "";
+#endif
+}
+
 #if CTP_ENABLE_WINDOWS_SYSINFO
 // Defined in winnt.h for SDK 10.0.17134 (Windows 10 1803) and later; define
 // defensively so an older SDK still compiles (the flag is simply ignored, and
@@ -1627,6 +1740,47 @@ SharedLibrary &SharedLibrary::operator=(SharedLibrary &&other) noexcept {
   return *this;
 }
 
+#if CTP_ENABLE_PROCFS_SYSINFO
+/**
+ * Name the block device backing a path, without running a subprocess
+ * (issue #809). This used to popen("df -P <path> | tail | awk"): every call
+ * forked a shell that inherited every descriptor the process had open without
+ * close-on-exec, including the flock()ed descriptor of an HDF5 file -- whose
+ * lock then outlived H5Fclose() until the shell exited, so an immediate reopen
+ * failed with EAGAIN. The bdev health poll calls this repeatedly.
+ * @param path a file or directory
+ * @return the backing device's name (e.g. "nvme0n1p1", "disk1s1"), or "" if
+ *         it is not a real block device (overlay, tmpfs, ...)
+ */
+static std::string BackingDeviceName(const std::string &path) {
+#if defined(__linux__)
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) return "";
+  // /sys/dev/block/MAJ:MIN links to the device's sysfs node, whose last
+  // component is the device name df reports under /dev.
+  const std::string link = "/sys/dev/block/" +
+                           std::to_string(major(st.st_dev)) + ":" +
+                           std::to_string(minor(st.st_dev));
+  char target[PATH_MAX];
+  ssize_t n = readlink(link.c_str(), target, sizeof(target) - 1);
+  if (n <= 0) return "";
+  std::string t(target, static_cast<size_t>(n));
+  size_t slash = t.find_last_of('/');
+  return slash == std::string::npos ? t : t.substr(slash + 1);
+#elif defined(__APPLE__)
+  // statfs reports the mount's source, which is what df prints.
+  struct statfs sfs;
+  if (statfs(path.c_str(), &sfs) != 0) return "";
+  std::string from = sfs.f_mntfromname;
+  if (from.rfind("/dev/", 0) != 0) return "";
+  return from.substr(5);
+#else
+  (void)path;
+  return "";
+#endif
+}
+#endif
+
 /// @brief Retrieves storage device hardware health statistics.
 ///
 /// Reads a JSON file left by an external admin service
@@ -1635,33 +1789,19 @@ SharedLibrary &SharedLibrary::operator=(SharedLibrary &&other) noexcept {
 /// elevated privileges; this function is purely a non-root consumer.
 ///
 /// @param path  Path to the file or block device whose health to query.
-///              If not already a /dev/ node, df is used to find the backing
-///              device so the correct per-device JSON file is located.
+///              If not already a /dev/ node, the backing device is looked up
+///              so the correct per-device JSON file is located.
 /// @return      JSON string with health stats, or "{}" if unavailable.
 std::string SystemInfo::GetDeviceHealthStats(const std::string &path) {
 #if CTP_ENABLE_PROCFS_SYSINFO
   std::string device = path;
 
-  // If the path is not a raw block device, find the mount's backing device.
+  // If the path is not a raw block device, find the mount's backing device
+  // (left as the path itself when it has none, e.g. overlay in containers).
   if (path.find("/dev/") != 0) {
-    // Quote path to handle spaces safely.
-    std::string cmd =
-        "df -P \"" + path + "\" 2>/dev/null | tail -1 | awk '{print $1}'";
-    char buffer[256];
-    FILE *pipe = popen(cmd.c_str(), "r");
-    if (pipe) {
-      if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        std::string df_out = buffer;
-        if (!df_out.empty() && df_out.back() == '\n') {
-          df_out.pop_back();
-        }
-        // Only use the df output if it returned a real /dev/ node
-        // (ignore things like 'overlay' in containers).
-        if (df_out.find("/dev/") == 0) {
-          device = df_out;
-        }
-      }
-      pclose(pipe);
+    const std::string backing = BackingDeviceName(path);
+    if (!backing.empty()) {
+      device = "/dev/" + backing;
     }
   }
 

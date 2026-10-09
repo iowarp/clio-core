@@ -44,6 +44,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
+#include <clio_runtime/bdev/bdev_tasks.h>
 
 #include <chrono>
 #include <cstdio>
@@ -51,9 +52,72 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <vector>
 
 #include "simple_test.h"
+
+/**
+ * Where a blob's bytes live, read from its SHM metadata record (issue #794).
+ * ReorganizeBlob's return code cannot answer this: when the requested tier is
+ * full the placement engine falls back to another tier and still returns 0.
+ */
+enum class Placement { kMissing, kOnTier, kElsewhere };
+
+/**
+ * Classify one blob's placement against a bdev type.
+ * @param cte_client CTE client
+ * @param tag_id the blob's tag
+ * @param name the blob's name
+ * @param size the blob's expected size
+ * @param type the tier's bdev type
+ * @return kMissing if the record is absent or short, kOnTier if every block is
+ *         on `type`, else kElsewhere
+ */
+static Placement BlobPlacement(clio::cte::core::Client *cte_client,
+                               const clio::cte::core::TagId &tag_id,
+                               const std::string &name, clio::run::u64 size,
+                               clio::run::bdev::BdevType type) {
+  clio::cte::core::ShmBlobRecord rec{};
+  if (!cte_client->TryGetBlobRecordShm(tag_id, name, &rec) ||
+      rec.total_size_ != size || rec.num_blocks_ == 0) {
+    return Placement::kMissing;
+  }
+  for (clio::run::u32 b = 0;
+       b < rec.num_blocks_ && b < clio::cte::core::kMaxInlineBlocks; ++b) {
+    if (rec.blocks_[b].bdev_type_ != static_cast<clio::run::u32>(type)) {
+      return Placement::kElsewhere;
+    }
+  }
+  return Placement::kOnTier;
+}
+
+/**
+ * Count blobs blob_0..blob_{n-1} by placement on one tier.
+ * @param cte_client CTE client
+ * @param tag_id their tag
+ * @param n number of blobs
+ * @param size each blob's size
+ * @param type the tier's bdev type
+ * @param on_tier out: blobs wholly on the tier
+ * @param missing out: blobs with no (or a short) record
+ */
+static void CountPlacement(clio::cte::core::Client *cte_client,
+                           const clio::cte::core::TagId &tag_id, int n,
+                           clio::run::u64 size,
+                           clio::run::bdev::BdevType type, int *on_tier,
+                           int *missing) {
+  *on_tier = 0;
+  *missing = 0;
+  for (int i = 0; i < n; ++i) {
+    switch (BlobPlacement(cte_client, tag_id, "blob_" + std::to_string(i),
+                          size, type)) {
+      case Placement::kOnTier: ++*on_tier; break;
+      case Placement::kMissing: ++*missing; break;
+      case Placement::kElsewhere: break;
+    }
+  }
+}
 
 namespace fs = std::filesystem;
 
@@ -312,12 +376,22 @@ TEST_CASE("TieredStorage - ReorganizeBlob to score 0",
   INFO("Reorganize results: " << success_count << " succeeded, " << failure_count
                               << " failed");
 
-  // All reorganizations should succeed
-  // The system should handle the case where DRAM is full
+  // Issue #794: a 0 return code does not mean the blob reached DRAM -- the
+  // placement engine falls back to the file tier once DRAM is full. Assert
+  // the placement: DRAM fills (allowing for allocator overhead and the
+  // periodic capacity refresh) without exceeding its capacity, and no blob
+  // is lost.
+  constexpr int kDramBlobs = static_cast<int>(kDramCapacity / kBlobSize);
+  int in_dram = 0;
+  int missing = 0;
+  CountPlacement(cte_client, tag_id, kNumBlobs, kBlobSize,
+                 clio::run::bdev::BdevType::kRam, &in_dram, &missing);
+  INFO("Placement: " << in_dram << " in DRAM (capacity " << kDramBlobs
+                     << "), " << missing << " missing");
   REQUIRE(failure_count == 0);
-  REQUIRE(success_count == kNumBlobs);
-
-  INFO("SUCCESS: All " << kNumBlobs << " blobs reorganized successfully");
+  REQUIRE(missing == 0);
+  REQUIRE(in_dram <= kDramBlobs);
+  REQUIRE(in_dram >= kDramBlobs * 3 / 4);
 }
 
 /**

@@ -2474,21 +2474,12 @@ TEST_CASE("FUNCTIONAL - Distributed Execution Validation",
   HLOG(kInfo, "  Average: {}", get_avg_completer);
 
   // Validation: If multiple nodes exist, average completer should be > 0
-  // indicating distributed execution.
-  //
-  // TEMP-DISABLED (#503): in the 4-node docker setup every CTE blob op
-  // resolves to the client node's single local container (completer == 0 for
-  // all ops) instead of fanning out cross-node, so these assertions fail. The
-  // Put/Get data-integrity checks above still run. Re-enable once #503/#502 is
-  // fixed (CTE blob ops should route to remote containers, or this should
-  // assert on resolved target-node distribution rather than local completer_).
+  // indicating distributed execution. (#503: blob ops did route cross-node,
+  // but a node executing a task routed to it by another never recorded
+  // itself as the completer, so every op reported container 0.)
   if (num_nodes > 1) {
-    HLOG(kWarning,
-         "[#503] Cross-node distribution validation temporarily disabled "
-         "(put_avg_completer={}, get_avg_completer={}, num_nodes={})",
-         put_avg_completer, get_avg_completer, num_nodes);
-    // REQUIRE(put_avg_completer > 0.0);
-    // REQUIRE(get_avg_completer > 0.0);
+    REQUIRE(put_avg_completer > 0.0);
+    REQUIRE(get_avg_completer > 0.0);
   } else {
     INFO("Single node test - distributed execution validation skipped");
   }
@@ -2518,6 +2509,39 @@ TEST_CASE("FUNCTIONAL - Distributed Execution Validation",
  * that fallback is what the distributed suites cover. */
 static clio::run::PoolQuery ShmCacheLocalQuery() {
   return clio::run::PoolQuery::Local();
+}
+
+/**
+ * A blob name derived from @p base that this node's container owns.
+ *
+ * A node's SHM mirror publishes only the blobs it owns (BlobHash % containers,
+ * 0bd41b182): a copy kept for another container may be stale, so it is
+ * erased, never served. On a multi-node pool (CTE_NUM_NODES > 1) a fixed name
+ * usually hashes to another node, so a Local put of it is correctly never
+ * cached here (#1229). Single node: @p base unchanged.
+ * @param client CTE client bound to the pool under test
+ * @param tag_id tag the blob lives in
+ * @param base name to derive from
+ * @return @p base, or @p base + "_<k>" for the first k this node owns
+ */
+static std::string LocalOwnedBlobName(clio::cte::core::Client &client,
+                                      const clio::cte::core::TagId &tag_id,
+                                      const std::string &base) {
+  const char *env = std::getenv("CTE_NUM_NODES");
+  const clio::run::u32 n =
+      env != nullptr && std::atoi(env) > 1 ? std::atoi(env) : 1;
+  if (n <= 1) return base;
+  // The container a Local task completes on is this node's.
+  auto probe = client.AsyncGetOrCreateTag(
+      "shm_owner_probe_tag", clio::cte::core::TagId::GetNull(),
+      ShmCacheLocalQuery());
+  probe.Wait();
+  const clio::run::u32 me =
+      static_cast<clio::run::u32>(probe->completer_.load());
+  for (clio::run::u32 k = 0;; ++k) {
+    std::string name = base + "_" + std::to_string(k);
+    if (clio::cte::core::BlobHash(tag_id, name) % n == me) return name;
+  }
 }
 
 TEST_CASE("CTE SHM cache write-then-read",
@@ -2566,7 +2590,8 @@ TEST_CASE("CTE SHM cache write-then-read",
   }
 
   SECTION("Write then read: the cache reflects the write") {
-    const std::string blob_name = "shm_rw_blob";
+    const std::string blob_name =
+        LocalOwnedBlobName(*fixture->core_client_, tag_id, "shm_rw_blob");
     const clio::run::u64 blob_size = 2048;
     auto test_data = fixture->CreateTestData(blob_size, 'S');
 
@@ -2623,7 +2648,8 @@ TEST_CASE("CTE SHM cache write-then-read",
   }
 
   SECTION("Overwrite then read: the cache reflects the NEW size") {
-    const std::string blob_name = "shm_rw_overwrite";
+    const std::string blob_name = LocalOwnedBlobName(
+        *fixture->core_client_, tag_id, "shm_rw_overwrite");
     const clio::run::u64 first_size = 1024;
     const clio::run::u64 second_size = 4096;
 
@@ -2695,7 +2721,8 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
   const clio::run::u64 kBlobSize = 1024;
   std::vector<std::string> names;
   for (int i = 0; i < kBlobs; ++i) {
-    std::string bn = "bench_blob_" + std::to_string(i);
+    std::string bn = LocalOwnedBlobName(
+        *fixture->core_client_, tag_id, "bench_blob_" + std::to_string(i));
     names.push_back(bn);
     auto data = fixture->CreateTestData(kBlobSize, 'K');
     auto fp = CLIO_IPC->AllocateBuffer(kBlobSize);
@@ -2820,7 +2847,8 @@ TEST_CASE("CTE SHM cache direct payload read",
   }
   REQUIRE(!tag_id.IsNull());
 
-  const std::string blob_name = "direct_read_blob";
+  const std::string blob_name =
+      LocalOwnedBlobName(client, tag_id, "direct_read_blob");
   const clio::run::u64 blob_size = 4096;
   auto test_data = fixture->CreateTestData(blob_size, 'D');
 
@@ -3004,6 +3032,9 @@ TEST_CASE("CTE SHM cache refuses direct reads of transformed blobs",
 
   const clio::run::u64 blob_size = 4096;
   auto test_data = fixture->CreateTestData(blob_size, 'X');
+  const std::string raw_name = LocalOwnedBlobName(client, tag_id, "raw_blob");
+  const std::string xform_name =
+      LocalOwnedBlobName(client, tag_id, "transformed_blob");
 
   // Put the SAME bytes twice: once declared raw, once declared transformed.
   // The only difference between the two blobs is the bit, so any difference in
@@ -3022,13 +3053,13 @@ TEST_CASE("CTE SHM cache refuses direct reads of transformed blobs",
     CLIO_IPC->FreeBuffer(fp);
   };
 
-  put_blob("raw_blob", clio::cte::core::kBlobTransformNone);
-  put_blob("transformed_blob", clio::cte::core::kBlobTransformed |
+  put_blob(raw_name, clio::cte::core::kBlobTransformNone);
+  put_blob(xform_name, clio::cte::core::kBlobTransformed |
                                    clio::cte::core::kBlobTransformCompressed);
 
   clio::cte::core::ShmBlobRecord raw_rec, xform_rec;
-  REQUIRE(client.TryGetBlobRecordShm(tag_id, "raw_blob", &raw_rec));
-  REQUIRE(client.TryGetBlobRecordShm(tag_id, "transformed_blob", &xform_rec));
+  REQUIRE(client.TryGetBlobRecordShm(tag_id, raw_name, &raw_rec));
+  REQUIRE(client.TryGetBlobRecordShm(tag_id, xform_name, &xform_rec));
 
   // CONTROL. Without this the refusal assertions below are vacuous: they would
   // also hold if nothing here were direct-readable in the first place. The raw
@@ -3042,7 +3073,7 @@ TEST_CASE("CTE SHM cache refuses direct reads of transformed blobs",
   }
   {
     std::vector<char> control(blob_size, 0);
-    REQUIRE(client.TryReadBlobShm(tag_id, "raw_blob", control.data(),
+    REQUIRE(client.TryReadBlobShm(tag_id, raw_name, control.data(),
                                   blob_size));
     REQUIRE(std::memcmp(control.data(), test_data.data(), blob_size) == 0);
   }
@@ -3064,7 +3095,7 @@ TEST_CASE("CTE SHM cache refuses direct reads of transformed blobs",
 
   SECTION("The payload fast path refuses") {
     std::vector<char> got(blob_size, 0);
-    REQUIRE_FALSE(client.TryReadBlobShm(tag_id, "transformed_blob", got.data(),
+    REQUIRE_FALSE(client.TryReadBlobShm(tag_id, xform_name, got.data(),
                                         blob_size));
   }
 
@@ -3073,7 +3104,7 @@ TEST_CASE("CTE SHM cache refuses direct reads of transformed blobs",
     // "no such blob".
     auto rd = CLIO_IPC->AllocateBuffer(blob_size);
     REQUIRE(!rd.IsNull());
-    auto g = client.AsyncGetBlob(tag_id, "transformed_blob", 0, blob_size, 0,
+    auto g = client.AsyncGetBlob(tag_id, xform_name, 0, blob_size, 0,
                                  rd.shm_.template Cast<void>(), ShmCacheLocalQuery());
     g.Wait();
     REQUIRE(g->return_code_ == 0);
@@ -3089,9 +3120,9 @@ TEST_CASE("CTE SHM cache refuses direct reads of transformed blobs",
     // A later put that does not declare a transform must not clear the mark:
     // the blob may now be a mix of codec output and raw bytes, and the only
     // safe reading of that is still "transformed".
-    put_blob("transformed_blob", clio::cte::core::kBlobTransformNone);
+    put_blob(xform_name, clio::cte::core::kBlobTransformNone);
     clio::cte::core::ShmBlobRecord after;
-    REQUIRE(client.TryGetBlobRecordShm(tag_id, "transformed_blob", &after));
+    REQUIRE(client.TryGetBlobRecordShm(tag_id, xform_name, &after));
     REQUIRE(after.IsTransformed());
     REQUIRE_FALSE(after.IsDirectReadable());
   }
@@ -3146,7 +3177,8 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
   }
   REQUIRE(!tag_id.IsNull());
 
-  const std::string blob_name = "wtr_blob";
+  const std::string blob_name =
+      LocalOwnedBlobName(client, tag_id, "wtr_blob");
   const clio::run::u64 kSize = 4096;
   const int kIters = 300;
   auto data = fixture->CreateTestData(kSize, 'W');

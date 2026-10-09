@@ -20,7 +20,7 @@
 # Fixed: client_blocks=64, rt_blocks=16
 #
 # Requirements:
-#   - clio_cte_gpu_bench in PATH (built with -DWRP_CORE_ENABLE_BAM=ON)
+#   - clio_cte_gpu_bench in PATH (not built by this tree; BaM support was removed)
 #   - CUDA-capable GPU
 #
 # Usage:

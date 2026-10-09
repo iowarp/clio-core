@@ -16,6 +16,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -967,13 +968,35 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
   const std::string path = FsNormPath(raw);
   FsResp sr;
   clio::run::u64 last_id = 0;
+  // Where a slow getattr went: resolving the path, or the stat at the
+  // inode's home (#1169). Logged, rate-limited, past 2 s.
+  const auto ga_t0 = std::chrono::steady_clock::now();
+  double resolve_ms = 0;
+  auto slow_getattr = [&](const char *how, int rc) {
+    const double total_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - ga_t0)
+                                .count();
+    if (total_ms < 2000.0) return;
+    static std::atomic<clio::run::u64> logged{0};
+    const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
+    if (k < 16 || k % 256 == 0) {
+      HLOG(kWarning, "filesystem: slow getattr of '{}': {} ms (resolve {} "
+           "ms) ended at {} with rc {} ({} such)", path, total_ms,
+           resolve_ms, how, rc, k + 1);
+    }
+  };
   for (int attempt = 0;; ++attempt) {
     CLIO_FS_RESOLVE(path, ent, par, erc);
+    resolve_ms = std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - ga_t0)
+                     .count();
     if (erc == ENOENT || erc == ENOTDIR) {
+      slow_getattr("resolve: no entry", erc);
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
     if (erc != 0) {
+      slow_getattr("resolve", erc);
       task->return_code_ = erc;
       CLIO_CO_RETURN;
     }
@@ -988,14 +1011,17 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
     last_id = ent.id_;
   }
   if (sr.rc_ == ENOENT) {  // entry without its state: a crash leftover
+    slow_getattr("stat: no state", ENOENT);
     task->return_code_ = 0;
     CLIO_CO_RETURN;
   }
   if (sr.rc_ != 0) {
+    slow_getattr("stat", static_cast<int>(sr.rc_));
     task->return_code_ = sr.rc_;
     CLIO_CO_RETURN;
   }
   FillGetattr(sr.attr_, task.get());
+  slow_getattr("stat", 0);
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
