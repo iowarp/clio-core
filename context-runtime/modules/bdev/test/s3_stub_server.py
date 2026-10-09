@@ -57,6 +57,14 @@ REQUESTS = 0
 SHORT_ONCE = os.environ.get("S3_STUB_SHORT_ONCE") == "1"
 SHORT_SERVED = set()
 
+# Public-read objects: a GET/HEAD with NO Authorization header is allowed for
+# any key containing this path segment, as a public bucket allows anonymous
+# reads. Everything else -- writes, other keys -- still demands a valid
+# signature, so an anonymous client that wrongly signed (or wrongly did not)
+# is caught either way. A request that does carry Authorization is always
+# verified, even on a public key.
+PUBLIC_SEGMENT = "/public/"
+
 
 def _sign(key, msg):
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
@@ -157,6 +165,9 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             REQUESTS += 1
         path, query = self._split()
+        if (method in ("GET", "HEAD") and PUBLIC_SEGMENT in path
+                and "Authorization" not in self.headers):
+            return True
         reason = verify(method, path, query, self.headers)
         if reason is not None:
             self._reject(reason)

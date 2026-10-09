@@ -120,6 +120,7 @@ s3::S3Config MakeS3Config(const std::string& bucket,
   cfg.access_key = creds.access_key;
   cfg.secret_key = creds.secret_key;
   cfg.session_token = creds.session_token;
+  cfg.anonymous = creds.anonymous;
   cfg.allow_bucket_create = false;  // a reader must never create a bucket
   return cfg;
 }
@@ -287,7 +288,8 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
   }
 
   // Resolve credentials + region in-process (no AWS SDK): environment keys
-  // first, else the named profile from ~/.aws/credentials. Only the profile
+  // first, else the named profile from ~/.aws/credentials, else anonymous
+  // (AWS_NO_SIGN_REQUEST, or nothing configured). Only the profile
   // NAME (ctx.s3_profile) ever travels in the task payload -- never a secret.
   // Timed because this can touch ~/.aws/credentials on EVERY object -- a
   // per-object filesystem cost that would be invisible in the aggregate.
@@ -298,6 +300,11 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
     HLOG(kError, "S3FileAssimilator: {}", cred.error);
     error_code = -6;
     CLIO_CO_RETURN;
+  }
+  if (cred.creds.anonymous) {
+    HLOG(kInfo,
+         "S3FileAssimilator: requesting s3://{}/{} anonymously (unsigned)",
+         bucket, key);
   }
 
   // In-process S3 client (Poco + SigV4). The connection is leased from the

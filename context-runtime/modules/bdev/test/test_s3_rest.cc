@@ -451,4 +451,43 @@ TEST_CASE("s3_rest_streaming_out_of_range_is_an_error", "[s3_rest]") {
   REQUIRE(st.body == nullptr);
 }
 
+TEST_CASE("s3_rest_anonymous_reads_a_public_object", "[s3_rest]") {
+  if (!StubAvailable()) {
+    INFO("S3_ENDPOINT unset; run via s3_stub_server.py. Skipping.");
+    return;
+  }
+  // Seed with a signed client, then read back unsigned. The stub lets an
+  // unsigned GET/HEAD through only for keys under "/public/" -- the stand-in
+  // for a public bucket such as the AWS Open Data registry.
+  s3::S3RestClient writer = MakeClient("anon");
+  s3::S3Connection wconn;
+  // "/stream/" opts into the stub's short-body mode, so the resume variant of
+  // this test also proves a ranged resume goes out unsigned.
+  const std::string pub_key = "anon/public/stream/open.bin";
+  const std::string priv_key = "anon/private/closed.bin";
+  std::vector<char> in = Pattern(200000, 5);
+  REQUIRE(writer.PutObject(wconn, pub_key, in.data(), in.size()).ok());
+  REQUIRE(writer.PutObject(wconn, priv_key, in.data(), in.size()).ok());
+
+  s3::S3Config cfg = s3::S3RestClient::ConfigFromEnv(Env("S3_STUB_BUCKET"), "");
+  cfg.anonymous = true;
+  s3::S3RestClient anon(cfg);
+  s3::S3Connection conn;
+
+  SECTION("a public object streams back whole, byte for byte");
+  std::vector<char> out;
+  REQUIRE(StreamWhole(anon, conn, pub_key, out) == in.size());
+  REQUIRE(std::memcmp(out.data(), in.data(), in.size()) == 0);
+
+  SECTION("a private object is refused, so the request really went unsigned");
+  // ConfigFromEnv picked up the stub's valid keys; had anonymous mode still
+  // signed with them, this GET would have succeeded.
+  REQUIRE_FALSE(cfg.access_key.empty());
+  std::vector<char> buf(16);
+  size_t got = 0;
+  s3::S3Result r = anon.GetObject(conn, priv_key, buf.data(), buf.size(), &got);
+  REQUIRE_FALSE(r.ok());
+  REQUIRE(r.http_status == 403);
+}
+
 SIMPLE_TEST_MAIN()

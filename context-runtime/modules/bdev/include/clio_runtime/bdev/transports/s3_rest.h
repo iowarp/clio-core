@@ -79,6 +79,14 @@ struct S3Config {
   std::string secret_key;  ///< AWS_SECRET_ACCESS_KEY
   std::string session_token;         ///< AWS_SESSION_TOKEN (optional)
   bool allow_bucket_create = false;  ///< S3_ALLOW_BUCKET_CREATE=1
+  /**
+   * Send requests unsigned (no Authorization / x-amz-* auth headers), the
+   * equivalent of `aws s3 --no-sign-request`. Public buckets such as the AWS
+   * Open Data registry must be read this way: a request signed with no usable
+   * credentials is rejected outright. Never set by ConfigFromEnv, so the kS3
+   * bdev always signs; the CAE assimilator sets it from its resolver.
+   */
+  bool anonymous = false;
 
   /**
    * Path-style addressing whenever an endpoint override is present (MinIO and
@@ -620,11 +628,16 @@ class S3RestClient {
    * overhead in a benchmark whose purpose is to measure CLIO overhead. The
    * tradeoff is that payload integrity rests on TLS rather than on the
    * signature covering the body.
+   *
+   * With config_.anonymous only the Host header is set: S3 treats a request
+   * with no Authorization header as anonymous, which is what a public bucket
+   * requires.
    */
   void Sign(Poco::Net::HTTPRequest &req, const std::string &method,
             const Endpoint &ep) const {
-    const AmzTime t = NowAmzTime();
     req.set("Host", ep.host_header);
+    if (config_.anonymous) return;
+    const AmzTime t = NowAmzTime();
     req.set("x-amz-date", t.amz_date);
     req.set("x-amz-content-sha256", kUnsignedPayload);
     if (!config_.session_token.empty()) {
