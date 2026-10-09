@@ -537,6 +537,25 @@ jobs:
             LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
             export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+            echo "=== Every chimod the default config composes is present ==="
+            # The runtime refuses to start when a composed module is missing,
+            # so a module that the shipped clio_default.yaml composes but the
+            # pip_package component omits breaks clio_run start (#1240). Derive
+            # the list from the shipped config so a new module cannot slip by.
+            DATA_DIR=$(python -c "import iowarp_core, os; print(os.path.join(os.path.dirname(iowarp_core.__file__), \"data\"))")
+            MODS=$(sed -n "s/^  - mod_name: *\([A-Za-z0-9_]*\).*/\1/p" "$DATA_DIR/clio_default.yaml")
+            if [ -z "$MODS" ]; then
+              echo "FAIL: no mod_name entries found in $DATA_DIR/clio_default.yaml"
+              exit 1
+            fi
+            for mod in $MODS; do
+              if [ ! -f "$LIB_DIR/lib${mod}_runtime.so" ]; then
+                echo "FAIL: default config composes $mod but lib${mod}_runtime.so is missing from the wheel"
+                exit 1
+              fi
+              echo "  $mod: ok"
+            done
+
             echo "=== Cache, replication, stream, filesystem chimods present ==="
             # They ship by default (#886/#899; filesystem needs stream); a
             # missing lib means the pip_package component lost them.
