@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 2.2.1 LANGUAGES C CXX)
+project(iowarp-core VERSION 2.3.0 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # MSVC-like front end detection
