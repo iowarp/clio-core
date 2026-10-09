@@ -138,7 +138,8 @@ class ScopedProxyEnv {
 }  // namespace
 
 TEST_CASE("s3_rest_proxy_selection", "[s3_rest][proxy]") {
-  const Poco::URI aws("https://terrafusiondatasampler.s3.us-west-2.amazonaws.com");
+  const Poco::URI aws(
+      "https://terrafusiondatasampler.s3.us-west-2.amazonaws.com");
 
   SECTION("the ALCF form: no scheme, explicit port");
   s3::ProxySpec p = s3::ProxyFor(aws, "proxy.alcf.anl.gov:3128", "");
@@ -565,7 +566,8 @@ TEST_CASE("s3_rest_anonymous_reads_a_public_object", "[s3_rest]") {
 
 TEST_CASE("s3_rest_requests_go_through_http_proxy", "[s3_rest][proxy]") {
   if (!StubAvailable() || Env("S3_STUB_PROXY").empty()) {
-    INFO("S3_ENDPOINT/S3_STUB_PROXY unset; run via s3_stub_server.py. Skipping.");
+    INFO("S3_ENDPOINT/S3_STUB_PROXY unset; run via s3_stub_server.py. "
+         "Skipping.");
     return;
   }
   // A name that does not resolve: the only way to reach the stub is through

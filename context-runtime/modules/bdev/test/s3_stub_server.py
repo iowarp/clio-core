@@ -315,7 +315,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
-    """A forward proxy for plain HTTP: relays absolute-form requests to the stub.
+    """A plain-HTTP forward proxy: relays absolute-form requests to the stub.
 
     Whatever host the client named, the request goes to the stub on loopback,
     with every header -- Host included -- passed through untouched, so the
@@ -345,7 +345,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in ("proxy-connection", "connection",
                                         "proxy-authorization")}
-        upstream = http.client.HTTPConnection("127.0.0.1", STUB_PORT, timeout=30)
+        upstream = http.client.HTTPConnection("127.0.0.1", STUB_PORT,
+                                              timeout=30)
         try:
             upstream.request(self.command, target, body=body, headers=headers)
             resp = upstream.getresponse()

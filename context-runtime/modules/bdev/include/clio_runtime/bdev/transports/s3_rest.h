@@ -233,9 +233,9 @@ inline ProxySpec ProxyFor(const Poco::URI &uri, const std::string &proxy_url,
  */
 inline ProxySpec ProxyFromEnv(const Poco::URI &uri) {
   const bool https = uri.getScheme() == "https";
-  const std::string proxy_url = https
-                                    ? detail::EnvEither("https_proxy", "HTTPS_PROXY")
-                                    : detail::EnvEither("http_proxy", "HTTP_PROXY");
+  const std::string proxy_url =
+      https ? detail::EnvEither("https_proxy", "HTTPS_PROXY")
+            : detail::EnvEither("http_proxy", "HTTP_PROXY");
   return ProxyFor(uri, proxy_url, detail::EnvEither("no_proxy", "NO_PROXY"));
 }
 
