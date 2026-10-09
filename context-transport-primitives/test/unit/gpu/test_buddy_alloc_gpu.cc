@@ -133,7 +133,7 @@ __global__ void BuddyAllocKernel(
   new (alloc) BuddyAllocator();
 
   // Sub-backend: data_ = full backend base so every OffsetPtr offset is
-  // a valid index into the entire 32 MB region (matches ClientInitGpu pattern).
+  // a valid index into the entire data region (matches ClientInitGpu pattern).
   ctp::ipc::MemoryBackend sub_backend;
   sub_backend.data_          = backend_base;
   sub_backend.data_capacity_ = total_capacity;
@@ -181,7 +181,12 @@ TEST_CASE("BuddyAllocatorGpu", "[gpu][allocator]") {
   SECTION("Alloc408ByteStructs1MBPerThread") {
     constexpr int    kNumThreads     = 32;
     constexpr size_t kPerThreadBytes = 1u * 1024u * 1024u;   // 1 MB
-    constexpr size_t kBackendSize    = kNumThreads * kPerThreadBytes;  // 32 MB
+    constexpr size_t kDataSize       = kNumThreads * kPerThreadBytes;  // 32 MB
+    // GpuShmMmap reserves the first kBackendHeaderSize bytes of the region for
+    // its header, so data_ only holds backend_size - kBackendHeaderSize bytes.
+    // Request the header on top, or the last thread's slice runs off the end
+    // of the pinned allocation (CUDA error 700 where nothing is mapped there).
+    constexpr size_t kBackendSize    = kDataSize + ctp::ipc::kBackendHeaderSize;
 
     // ptxas -v shows this kernel compiles to 0 bytes stack frame (fully
     // register-allocated).  4 096 B matches the CLIO Runtime orchestrator setting
@@ -193,6 +198,7 @@ TEST_CASE("BuddyAllocatorGpu", "[gpu][allocator]") {
     MemoryBackendId backend_id(42, 0);
     REQUIRE(backend.shm_init(backend_id, kBackendSize,
                              "/test_buddy_alloc_gpu", 0));
+    REQUIRE(backend.data_capacity_ >= kDataSize);
 
     // Per-thread result array in pinned host memory (readable after sync).
     int *d_results = nullptr;
@@ -202,7 +208,7 @@ TEST_CASE("BuddyAllocatorGpu", "[gpu][allocator]") {
 
     BuddyAllocKernel<<<1, kNumThreads>>>(
         backend.data_,
-        kBackendSize,
+        backend.data_capacity_,
         kPerThreadBytes,
         backend_id,
         d_results);
