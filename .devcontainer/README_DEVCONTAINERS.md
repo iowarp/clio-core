@@ -217,7 +217,7 @@ When contributing code:
 - **Contributing Guide**: `docs/contributing.md`
 - **CUDA Setup**: `.devcontainer/CUDA_SETUP.md`
 - **Project Documentation**: `CLAUDE.md`
-- **Module Development**: `context-transport-primitives/docs/MODULE_DEVELOPMENT_GUIDE.md`
+- **Module Development**: `docs/docs/sdk/context-runtime/2.module_dev_guide.md`
 
 ## Quick Reference
 

@@ -83,7 +83,9 @@ CTP_CROSS_FUN inline Timestamp GetCurrentTimeNs() {
   return 0;  // GPU device code: return 0 (no clock available)
 #else
   return static_cast<clio::run::u64>(
-      std::chrono::steady_clock::now().time_since_epoch().count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 #endif
 }
 #elif CTP_IS_SYCL_COMPILER
@@ -97,17 +99,25 @@ inline Timestamp GetCurrentTimeNs() {
   return 0;
 #else
   return static_cast<clio::run::u64>(
-      std::chrono::steady_clock::now().time_since_epoch().count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 #endif
 }
 #else
 inline Timestamp GetCurrentTimeNs() {
   return static_cast<clio::run::u64>(
-      std::chrono::steady_clock::now().time_since_epoch().count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 }
 #endif
 
 /** UTC WALL-clock nanoseconds. For the POSIX-visible tag timestamps
+ *  The clocks' native units differ by platform (system_clock counts 100 ns
+ *  ticks on MSVC and microseconds on macOS libc++), so every helper here
+ *  converts to nanoseconds explicitly; a raw count() was 100x / 1000x too
+ *  small there.
  *  (mtime/ctime served to stat) — GetCurrentTimeNs above is STEADY-clock
  *  (process-uptime-like) and reads as 1970-era when interpreted as an
  *  epoch: fine for relative bookkeeping (scores, LRU), wrong for stat.
@@ -120,7 +130,9 @@ inline Timestamp GetWallTimeNs() {
   return 0;
 #else
   return static_cast<clio::run::u64>(
-      std::chrono::system_clock::now().time_since_epoch().count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
 #endif
 }
 
@@ -5966,6 +5978,10 @@ struct TemporalSearchResult {
  * [time_begin_, time_end_] (inclusive; 0 on either bound means
  * "no constraint on that side").  Results are sorted by ascending
  * last_modified_.  max_entries_ caps the output (0 = unlimited).
+ *
+ * The bounds and each result's last_modified_ are wall-clock epoch
+ * nanoseconds; the handler converts the steady-clock blob timestamps
+ * (SteadyToWallNs) before comparing (#1241).
  *
  * This is a pure metadata scan — no blob bytes are read.
  */

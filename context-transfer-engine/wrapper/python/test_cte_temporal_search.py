@@ -131,10 +131,10 @@ _NS = 1_000_000_000  # nanoseconds per second
 
 
 def now_ns() -> int:
-    # CTE's GetCurrentTimeNs() uses std::chrono::steady_clock, which maps to
-    # CLOCK_MONOTONIC on Linux. time.monotonic_ns() uses the same clock, so
-    # the brackets we record here are directly comparable to blob timestamps.
-    return time.monotonic_ns()
+    # TemporalSearch bounds and results are wall-clock epoch nanoseconds
+    # (#1241): the runtime converts its steady-clock blob timestamps before
+    # comparing, so brackets from time.time_ns() line up with them.
+    return time.time_ns()
 
 
 def put_group(tag, prefix: str, count: int, payload: bytes = b"x") -> tuple[int, int]:
@@ -304,7 +304,7 @@ def run_test(cte) -> int:
     # ------------------------------------------------------------------ #
     # 8. Window that matches nothing returns []                          #
     # ------------------------------------------------------------------ #
-    far_future = time.monotonic_ns() + 3600 * _NS
+    far_future = now_ns() + 3600 * _NS  # an hour ahead, in epoch ns
     empty = client.TemporalSearch(
         tag_regex=".*",
         blob_regex=".*",

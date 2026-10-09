@@ -1,6 +1,6 @@
 # External CTE Core Integration Test
 # This CMakeLists.txt demonstrates how external applications can link to CTE Core
-# following the MODULE_DEVELOPMENT_GUIDE.md patterns
+# following the module_dev_guide.md patterns
 cmake_minimum_required(VERSION 3.20)
 project(cte_external_integration_test)
 

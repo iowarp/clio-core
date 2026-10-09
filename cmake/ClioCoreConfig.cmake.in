@@ -67,6 +67,31 @@ if(NOT msgpack-c_FOUND)
     endif()
 endif()
 
+# Imported targets named in the exported targets' INTERFACE_LINK_LIBRARIES
+# must exist when a consumer's project is generated, or CMake fails with
+# "the target was not found" (#1248). yaml-cpp (ctp::configure, linked by
+# ctp::cxx) and Threads are needed by every consumer. MPI and LibPressio are
+# only referenced by the opt-in ctp::mpi / ctp::compress targets, so they
+# are looked up quietly: a consumer that does not link those targets must
+# not fail because a package it never uses is missing.
+find_dependency(yaml-cpp)
+find_dependency(Threads)
+if(@CLIO_CORE_ENABLE_MPI@ AND NOT TARGET MPI::MPI_CXX)
+    find_package(MPI QUIET COMPONENTS CXX)  # ctp::mpi needs MPI::MPI_CXX
+endif()
+# LibPressio's config pulls in zfp, which hard-requires OpenMP for C, so
+# only look it up when the consuming project has C enabled.
+get_property(_clio_enabled_langs GLOBAL PROPERTY ENABLED_LANGUAGES)
+if(@CLIO_CTP_ENABLE_LIBPRESSIO@ AND NOT TARGET LibPressio::libpressio
+   AND "C" IN_LIST _clio_enabled_langs)
+    find_package(LibPressio QUIET)
+endif()
+unset(_clio_enabled_langs)
+if(@CLIO_CORE_ENABLE_CAE@ AND NOT TARGET CURL::libcurl)
+    # The CAE summarizer links libcurl when summarization was built.
+    find_package(CURL QUIET)
+endif()
+
 # Find HDF5 if CAE is enabled (required for CAE runtime)
 if(@CLIO_CORE_ENABLE_CAE@)
     # Try CONFIG mode first (for HDF5 installed to non-standard cmake/ directory)
