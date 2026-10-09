@@ -449,6 +449,14 @@ if(CAE_ENABLE_S3)
   set_property(TEST cae_s3_assim APPEND PROPERTY
     ENVIRONMENT "CAE_S3_TOOL=$<TARGET_FILE:cae_s3_tool>")
 
+  # The same import STRIPED: three concurrent 1 MiB ranged GETs for the 3 MB
+  # object, checked chunk by chunk against the seeded bytes.
+  add_test(NAME cae_s3_assim_striped COMMAND cae_s3_assim)
+  set_tests_properties(cae_s3_assim_striped PROPERTIES
+    LABELS "cloud;cae;s3;msan_skip"
+    TIMEOUT 300
+    ENVIRONMENT "CLIO_WITH_RUNTIME=1;CLIO_SERVER_CONF=${CMAKE_CURRENT_SOURCE_DIR}/clio_config.yaml;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10501;CAE_S3_TOOL=$<TARGET_FILE:cae_s3_tool>;CAE_S3_STREAMS=3;CAE_S3_PART_MB=1")
+
   install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/s3_assim/s3_assim_omni.yaml
     DESTINATION share/clio_cae/test/s3_assim
