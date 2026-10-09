@@ -164,6 +164,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Load configuration from compose YAML (or direct CreateParams)
   config_ = task->GetParams();
+  ResolveDefaultCodec();
   interposer_next_pool_ = config_.next_pool_id_;  // base forwarding target
 
   // Initialize the core client using next_pool_id from compose
@@ -2945,11 +2946,52 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   return 0;
 }
 
+void Runtime::ResolveDefaultCodec() {
+  default_mode_ = clio::cte::core::kCompressSkip;
+  default_lib_ = 0;
+  const std::string &name = config_.default_compress_;
+  if (name.empty() || name == "none") return;
+  const std::string &p = config_.default_preset_;
+  default_preset_ = p == "fast" ? kPresetFast
+                  : p == "best" ? kPresetBest
+                                : kPresetBalanced;
+  if (name == "dynamic") {
+    default_mode_ = clio::cte::core::kCompressDynamic;
+    HLOG(kInfo, "compressor: writes without a codec are compressed with a "
+         "per-blob dynamic choice (default_compress: dynamic)");
+    return;
+  }
+  const int wire = ctp::CompressionFactory::WireIdForName(name);
+  if (wire <= 0) {
+    HLOG(kError, "compressor: default_compress '{}' is not a codec built "
+         "into this binary; writes without a codec stay uncompressed", name);
+    return;
+  }
+  default_mode_ = clio::cte::core::kCompressStatic;
+  default_lib_ = wire;
+  HLOG(kInfo, "compressor: writes without a codec are compressed with {} "
+       "(preset {})", name, p);
+}
+
+void Runtime::ApplyDefaultCodec(clio::cte::core::Context &ctx) const {
+  if (default_mode_ == clio::cte::core::kCompressSkip) return;
+  if (ctx.compress_lib_ > 0 ||
+      ctx.dynamic_compress_ != clio::cte::core::kCompressSkip) {
+    return;  // the writer chose
+  }
+  ctx.dynamic_compress_ = default_mode_;
+  if (default_mode_ == clio::cte::core::kCompressStatic) {
+    ctx.compress_lib_ = default_lib_;
+    ctx.compress_preset_ = default_preset_;
+  }
+}
+
 clio::run::TaskResume Runtime::PutBlob(
     clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   {
     clio::cte::core::Context &ctx = task->context_;
+    ApplyDefaultCodec(ctx);
     // Compression is defined for WHOLE-BLOB writes only: a partial or
     // vectored write cannot patch a compressed stream, so those (and
     // replica-addressed or emulated puts) forward with the codec request
@@ -3922,7 +3964,13 @@ clio::run::TaskResume Runtime::MultiPutBlob(
   // SCALAR-EQUIVALENT semantics. No codec requested (or replica-addressed /
   // emulated): forward the batch intact — the chain below executes every
   // record with this context, records stay raw, amortization preserved.
-  if (task->context_.replica_ != 0 || task->context_.compress_lib_ <= 0 ||
+  ApplyDefaultCodec(task->context_);
+  // A dynamic request names no library yet: the scalar handler chooses one
+  // per record, so it counts as a codec request here too.
+  const bool codec_requested =
+      task->context_.compress_lib_ > 0 ||
+      task->context_.dynamic_compress_ == clio::cte::core::kCompressDynamic;
+  if (task->context_.replica_ != 0 || !codec_requested ||
       task->context_.emulate_) {
     CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
                            task.template Cast<clio::run::Task>()));

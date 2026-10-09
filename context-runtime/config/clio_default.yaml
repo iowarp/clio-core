@@ -482,6 +482,12 @@ compose:
   #   # Steer each tag's compressed copy toward the node that last read it
   #   # (consumer tracking). false = always place by hash of the tag id.
   #   tracking_enabled: true            # default: true
+  #   # Codec for writes that request none -- the FUSE mount and Python set
+  #   # no codec, so without this they are stored uncompressed (#1251).
+  #   # A library name ("zstd", "lz4", "snappy", ...), "dynamic" (the models
+  #   # below choose per blob), or unset/"none" (default: no compression).
+  #   default_compress: "zstd"
+  #   default_preset: "balanced"        # "fast" | "balanced" | "best"
   #   # Trained models for kCompressDynamic (all optional; unset = the fixed
   #   # heuristic, ratio 2.0). Q-table is used first, then the dense NN.
   #   qtable_model_path: ""             # Q-table predictor model
