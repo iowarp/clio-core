@@ -146,7 +146,7 @@ clio-core/
 ├── context-transport-primitives/   # Shared memory data structures, IPC, GPU support
 │   ├── include/clio_ctp/         # Public headers (ctp:: namespace)
 │   ├── src/                        # Implementation
-│   └── docs/MODULE_DEVELOPMENT_GUIDE.md  # Module dev guide
+│   └── (module dev guide: docs/docs/sdk/context-runtime/2.module_dev_guide.md, in the docs submodule)
 │
 ├── context-runtime/                # Clio modular runtime (clio::run:: namespace)
 │   ├── include/clio_run/           # Runtime headers
@@ -222,7 +222,7 @@ Every component depends on the ones below it. Never create upward dependencies.
 When making changes, consider cross-repo impact:
 - **clio-core API changes** affect clio-kit, clio-agent, and downstream users
 - **Config format changes** must update `docs/docs/deployment/configuration.md`
-- **Module interface changes** must update `MODULE_DEVELOPMENT_GUIDE.md`
+- **Module interface changes** must update `docs/docs/sdk/context-runtime/2.module_dev_guide.md` (docs submodule)
 
 ---
 

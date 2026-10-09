@@ -257,7 +257,7 @@ class CTECoreFunctionalTestFixture {
 
   /**
    * Helper method to copy data to shared memory pointer (FullPtr version)
-   * Primary version following MODULE_DEVELOPMENT_GUIDE.md pattern
+   * Primary version following module_dev_guide.md pattern
    */
   bool CopyToSharedMemory(ctp::ipc::FullPtr<char> ptr,
                           const std::vector<char> &data) {
@@ -267,7 +267,7 @@ class CTECoreFunctionalTestFixture {
     }
 
     // Access data directly through .ptr_ as specified in
-    // MODULE_DEVELOPMENT_GUIDE.md
+    // module_dev_guide.md
     if (ptr.ptr_ == nullptr) {
       INFO("Failed to get buffer data from ctp::ipc::FullPtr<char>");
       return false;
@@ -314,7 +314,7 @@ class CTECoreFunctionalTestFixture {
 
   /**
    * Helper method to copy data from shared memory pointer (FullPtr version)
-   * Following MODULE_DEVELOPMENT_GUIDE.md pattern
+   * Following module_dev_guide.md pattern
    */
   std::vector<char> CopyFromSharedMemory(ctp::ipc::FullPtr<char> ptr, size_t size) {
     std::vector<char> result;
@@ -325,7 +325,7 @@ class CTECoreFunctionalTestFixture {
     }
 
     // Access data directly through .ptr_ as specified in
-    // MODULE_DEVELOPMENT_GUIDE.md
+    // module_dev_guide.md
     if (ptr.ptr_ == nullptr) {
       INFO("Failed to get buffer data from ctp::ipc::FullPtr<char>");
       return result;
@@ -662,7 +662,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
     auto test_data = fixture->CreateTestData(blob_size, 'B');  // 'B' for Basic
     REQUIRE(fixture->VerifyTestData(test_data, 'B'));
 
-    // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+    // Following module_dev_guide.md AllocateBuffer<T> specification
     // Using CLIO_IPC->AllocateBuffer() which returns ctp::ipc::FullPtr<char>
     ctp::ipc::FullPtr<char> blob_data_fullptr = CLIO_IPC->AllocateBuffer(blob_size);
     if (blob_data_fullptr.IsNull()) {
@@ -719,7 +719,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
       REQUIRE(fixture->VerifyTestData(test_data, pattern));
 
       // Allocate and copy to shared memory using CLIO_CLIENT pattern
-      // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+      // Following module_dev_guide.md AllocateBuffer<T> specification
       ctp::ipc::FullPtr<char> blob_data_fullptr =
           CLIO_IPC->AllocateBuffer(blob_size);
       if (blob_data_fullptr.IsNull()) {
@@ -762,7 +762,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
                                       << "'");
 
       auto chunk_data = fixture->CreateTestData(chunk_size, pattern);
-      // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+      // Following module_dev_guide.md AllocateBuffer<T> specification
       ctp::ipc::FullPtr<char> chunk_fullptr = CLIO_IPC->AllocateBuffer(chunk_size);
 
       if (chunk_fullptr.IsNull()) {
@@ -797,7 +797,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
     const clio::run::u64 blob_size = 2048;
 
     auto test_data = fixture->CreateTestData(blob_size, 'A');  // 'A' for Async
-    // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+    // Following module_dev_guide.md AllocateBuffer<T> specification
     ctp::ipc::FullPtr<char> blob_data_fullptr = CLIO_IPC->AllocateBuffer(blob_size);
 
     if (blob_data_fullptr.IsNull()) {
@@ -835,7 +835,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
     // Test empty blob name
     INFO("Testing empty blob name error case...");
     auto test_data = fixture->CreateTestData(512);
-    // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+    // Following module_dev_guide.md AllocateBuffer<T> specification
     ctp::ipc::FullPtr<char> data_fullptr = CLIO_IPC->AllocateBuffer(512);
     ctp::ipc::ShmPtr<> data_ptr =
         data_fullptr.IsNull()
@@ -934,7 +934,7 @@ TEST_CASE("FUNCTIONAL - GetBlob Operations",
     REQUIRE(fixture->VerifyTestData(original_data, 'R'));
 
     // Store the blob first
-    // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+    // Following module_dev_guide.md AllocateBuffer<T> specification
     ctp::ipc::FullPtr<char> put_data_fullptr = CLIO_IPC->AllocateBuffer(blob_size);
     if (put_data_fullptr.IsNull()) {
       INFO(
@@ -1014,7 +1014,7 @@ TEST_CASE("FUNCTIONAL - GetBlob Operations",
       auto blob_data = fixture->CreateTestData(blob_size, pattern);
       original_data_set.push_back(blob_data);
 
-      // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+      // Following module_dev_guide.md AllocateBuffer<T> specification
       ctp::ipc::FullPtr<char> put_fullptr = CLIO_IPC->AllocateBuffer(blob_size);
       if (put_fullptr.IsNull()) {
         INFO("Skipping " << blob_name
@@ -1088,7 +1088,7 @@ TEST_CASE("FUNCTIONAL - GetBlob Operations",
     auto full_data = fixture->CreateTestData(total_size, 'F');  // 'F' for Full
 
     // Store the full blob
-    // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+    // Following module_dev_guide.md AllocateBuffer<T> specification
     ctp::ipc::FullPtr<char> put_fullptr = CLIO_IPC->AllocateBuffer(total_size);
     if (put_fullptr.IsNull()) {
       INFO(
@@ -1160,7 +1160,7 @@ TEST_CASE("FUNCTIONAL - GetBlob Operations",
 
     // Store blob for async retrieval
     auto test_data = fixture->CreateTestData(blob_size, 'A');  // 'A' for Async
-    // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+    // Following module_dev_guide.md AllocateBuffer<T> specification
     ctp::ipc::FullPtr<char> put_fullptr = CLIO_IPC->AllocateBuffer(blob_size);
 
     if (put_fullptr.IsNull()) {
@@ -1323,7 +1323,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
     REQUIRE(fixture->VerifyTestData(original_data, 'I'));
 
     // Allocate shared memory and store data using CLIO_CLIENT pattern
-    // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+    // Following module_dev_guide.md AllocateBuffer<T> specification
     ctp::ipc::FullPtr<char> put_fullptr = CLIO_IPC->AllocateBuffer(blob_size);
     if (put_fullptr.IsNull()) {
       INFO("Skipping Put-Get cycle due to memory context allocation failure");
@@ -1415,7 +1415,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
       auto blob_data = fixture->CreateTestData(blob_size, pattern);
       stored_data.push_back(blob_data);
 
-      // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+      // Following module_dev_guide.md AllocateBuffer<T> specification
       ctp::ipc::FullPtr<char> put_fullptr = CLIO_IPC->AllocateBuffer(blob_size);
       if (put_fullptr.IsNull()) {
         INFO("Skipping " << blob_name
@@ -1508,7 +1508,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
     INFO("Storing blobs in separate tags...");
 
     // Store in tag1
-    // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+    // Following module_dev_guide.md AllocateBuffer<T> specification
     ctp::ipc::FullPtr<char> put1_fullptr = CLIO_IPC->AllocateBuffer(blob_size);
     ctp::ipc::ShmPtr<> put1_ptr = put1_fullptr.IsNull()
                                   ? ctp::ipc::ShmPtr<>::GetNull()
@@ -1527,7 +1527,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
     }
 
     // Store in tag2
-    // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+    // Following module_dev_guide.md AllocateBuffer<T> specification
     ctp::ipc::FullPtr<char> put2_fullptr = CLIO_IPC->AllocateBuffer(blob_size);
     ctp::ipc::ShmPtr<> put2_ptr = put2_fullptr.IsNull()
                                   ? ctp::ipc::ShmPtr<>::GetNull()
@@ -1605,7 +1605,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
     const clio::run::u64 blob_size = 3072;  // 3KB
 
     auto test_data = fixture->CreateTestData(blob_size, 'A');  // 'A' for Async
-    // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+    // Following module_dev_guide.md AllocateBuffer<T> specification
     ctp::ipc::FullPtr<char> put_fullptr = CLIO_IPC->AllocateBuffer(blob_size);
 
     if (put_fullptr.IsNull() ||
@@ -1690,7 +1690,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
       INFO("Storing chunk " << i << " at offset " << offset << " with pattern '"
                             << pattern << "'");
 
-      // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
+      // Following module_dev_guide.md AllocateBuffer<T> specification
       ctp::ipc::FullPtr<char> chunk_fullptr = CLIO_IPC->AllocateBuffer(chunk_size);
       if (chunk_fullptr.IsNull() ||
           !fixture->CopyToSharedMemory(chunk_fullptr, chunk_data[i])) {
