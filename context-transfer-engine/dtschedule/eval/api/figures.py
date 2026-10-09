@@ -33,9 +33,9 @@ def save(fig, out, name):
     fig.savefig(os.path.join(out, 'preview', name.replace('.pdf', '.png')), dpi=200)
     plt.close(fig)
 
-LABEL = {'raw_local': 'Hermes (local, raw)', 'baseline': 'Hermes (local, raw)', 's1': 'DT-PP',
+LABEL = {'raw_local': 'Hermes', 'baseline': 'Hermes', 's1': 'DT-PP',
          's1_local_blosc': 'DT-PP', 'local_blosc': 'DT-PP',
-         's2': 'DT-PC', 'cons_raw': 'DT-PC (raw)', 'local_raw': 'Hermes (local, raw)',
+         's2': 'DT-PC', 'cons_raw': 'DT-XC', 'local_raw': 'Hermes',
          's3': 'DT-CC', 's3_cons_blosc': 'DT-CC', 'cons_blosc': 'DT-CC',
          'auto': 'DT-AUTO', 'full': 'DT-AUTO', 'no_dag': 'DT-AUTO w/o DAG',
          'hcompress': 'HCompress'}
@@ -223,7 +223,7 @@ def fig_ablation(root, out, exp='e6', order=('baseline', 'no_placement', 'fixed_
     names = [n for n in order if n in runs]
     if not names:
         return
-    lab = labels or {'baseline': 'Hermes (local, raw)', 'no_placement': 'w/o placement (local)',
+    lab = labels or {'baseline': 'Hermes', 'no_placement': 'w/o placement (local)',
                      'fixed_ccm': 'zstd as the only codec', 'no_load': 'w/o load awareness',
                      'no_dag': 'w/o workflow knowledge', 'full': 'DT-AUTO'}
     fig, ax = plt.subplots(figsize=(COL_W, 0.32 * len(names) + 0.5))
