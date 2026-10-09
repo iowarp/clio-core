@@ -166,8 +166,10 @@ rm -rf /tmp/cppzmq-*
 #
 # Static, because repair_wheel.sh only fixes RPATHs and does not bundle
 # third-party .so files. Two of our libraries link Poco (clio_ctp_host and
-# clio_run_cxx); hidden visibility gives each its own private copy instead of
-# letting the dynamic linker interpose one library's Poco onto the other.
+# clio_run_cxx), so each embeds a copy; clio_link_poco_private() (in
+# cmake/ClioCheckPocoAbi.cmake) links them with --exclude-libs so the copies
+# stay private. The visibility presets below are not enough on their own:
+# Poco's headers force default visibility on its API.
 echo "--- Poco 1.14.1 ---"
 cd /tmp
 download_tar https://github.com/pocoproject/poco/archive/refs/tags/poco-1.14.1-release.tar.gz poco.tar.gz
