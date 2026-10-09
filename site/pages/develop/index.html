@@ -1,0 +1,65 @@
+<!--
+title: Custom data operators
+heading: Develop custom data operators <em>for your workload.</em>
+description: Extend CLIO Core with your own data operators: modules that observe, transform or route data on its way to storage, new storage backends, and new placement policies.
+eyebrow: Develop
+lede: Every write in CLIO Core passes through a chain of data operators, and you can add your own. An operator is a module, built outside the CLIO Core tree, that the runtime loads at startup and that you place in the chain with a few lines of <code>clio.yaml</code>.
+facts: Language | C++20 ; Builds against | An installed CLIO Core ; Loaded | At runtime start, from a shared library
+-->
+<h2>What a data operator is</h2>
+<p>The runtime hosts <strong>modules</strong>, each in its own <strong>pool</strong>. Some modules are data operators: they receive the storage engine's calls, act on them, and pass them on. The built-in ones are the cache, the indexer, the compressor and replication (see <a href="/tutorials/operators.html">Compose data operators</a>). A module of your own works the same way:</p>
+<pre data-label="data path">
+filesystem 560.0 → your operator 600.0 → cache 563.0 → indexer 564.0 → replication 561.0 → core 512.0
+</pre>
+<p>Because the operator speaks the storage engine's interface, everything above it works unchanged: the FUSE mount, the Python API and other operators. It sees every call that passes through, and handles only the ones it cares about. The rest go down the chain untouched.</p>
+
+<h2>Choose an extension point</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>You want to</th><th>Write</th><th>Outside the tree?</th><th>Guide</th></tr></thead>
+  <tbody>
+    <tr><td>Observe, transform, filter or route data: auditing, encryption, deduplication, format conversion, custom caching</td><td>A chain operator</td><td class="good">Yes</td><td><a href="/develop/operator.html">Write a chain operator</a></td></tr>
+    <tr><td>Store data somewhere new: another device type, an object store, a remote service</td><td>A block device module, attached as a tier</td><td class="good">Yes</td><td><a href="/develop/extend-storage.html#a-block-device-module">Extend the storage system</a></td></tr>
+    <tr><td>Add a block device type selected by <code>bdev_type</code></td><td>A transport in the block device module</td><td class="cost">No</td><td><a href="/develop/extend-storage.html#a-new-bdev-type">Extend the storage system</a></td></tr>
+    <tr><td>Change where data is placed or when it moves</td><td>A placement policy or a data organizer</td><td class="cost">No</td><td><a href="/develop/extend-storage.html#placement-and-tiering-policies">Extend the storage system</a></td></tr>
+  </tbody>
+</table></div>
+
+<h2>Anatomy of a module</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>File</th><th>Holds</th></tr></thead>
+  <tbody>
+    <tr><td><code>clio_mod.yaml</code></td><td>The module's name, namespace and method ids. The build reads the name and namespace to name the libraries.</td></tr>
+    <tr><td><code>*_methods.h</code></td><td>The method ids as constants, and their names for the dashboard.</td></tr>
+    <tr><td><code>*_tasks.h</code></td><td>The configuration struct, parsed from the module's <code>compose</code> entry, and the task types of the module's own methods.</td></tr>
+    <tr><td><code>*_runtime.h</code>, <code>*_runtime.cc</code></td><td>The <code>Runtime</code> class: one handler per method, plus <code>CLIO_TASK_CC(...)</code>, which exports the module from the shared library.</td></tr>
+    <tr><td><code>*_exec.cc</code></td><td>Dispatch: routes each method id to its handler and handles serialization. Operators copy it from an existing operator.</td></tr>
+    <tr><td><code>*_client.h</code>, <code>*_client.cc</code></td><td>The client library that programs use to call the module.</td></tr>
+  </tbody>
+</table></div>
+<p>The build produces <code>lib&lt;namespace&gt;_&lt;module&gt;_runtime.so</code> and a client library. In <code>clio.yaml</code>, <code>mod_name</code> is the name the module reports, its <code>chimod_lib_name</code>.</p>
+<div class="callout">
+  <span class="callout-title">Write the dispatch file by hand</span>
+  <p><code>clio_run refresh</code> can generate dispatch files, but it currently writes include paths that do not match namespaced modules. Copy the dispatch file from an existing operator instead, as the guide does.</p>
+</div>
+
+<h2>How the runtime finds your module</h2>
+<p>When <code>clio_run start</code> runs, the runtime scans for shared libraries whose names end in <code>_runtime.so</code> and that export the module entry points. It looks in this order:</p>
+<ol>
+  <li>The directory that holds <code>libclio_run_cxx</code></li>
+  <li>Each directory in <code>CLIO_REPO_PATH</code> (separated by <code>:</code>, or <code>;</code> on Windows)</li>
+  <li>Each directory in <code>LD_LIBRARY_PATH</code></li>
+  <li><code>./lib</code>, <code>../lib</code> and <code>/usr/local/lib</code></li>
+</ol>
+<p>Scanning happens once, at startup. Set <code>CLIO_REPO_PATH</code> before you start the runtime; after that, <code>clio_run compose start</code> can create pools of your module. The log confirms each module it loads:</p>
+<pre data-label="output">
+LoadChiMod Loaded ChiMod: clio_demo_bytecount from /home/me/bytecount/build/libclio_demo_bytecount_runtime.so
+</pre>
+
+<h2>Talking to your operator</h2>
+<ul>
+  <li><strong>Through the chain.</strong> Put the operator in the filesystem's path, as the guide does, and every write through the mount reaches it. Or bind any CTE client to it with <code>CLIO_CTE_POOL=600.0</code>.</li>
+  <li><strong>Its <code>Monitor</code> method.</strong> The dashboard forwards <code>GET /api/pools/&lt;pool&gt;/monitor?query=&lt;text&gt;&amp;routing=local</code> to the module's <code>Monitor</code> handler and decodes a msgpack reply to JSON. This is the quickest way to expose statistics.</li>
+  <li><strong>Your own methods.</strong> Give them ids of 100 and above, so they never collide with the storage engine's, and call them from a client you write.</li>
+</ul>
+
+<p>Next: <a href="/develop/operator.html">write a chain operator</a>, step by step.</p>

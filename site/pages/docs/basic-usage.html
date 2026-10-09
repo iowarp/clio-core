@@ -1,0 +1,91 @@
+<!--
+title: Basic usage
+heading: Your first <em>context filesystem.</em>
+description: Start the CLIO runtime, mount the filesystem, copy data in, search it from Python, and shut everything down cleanly.
+eyebrow: Docs
+lede: Start the runtime, mount a directory, put files in it, find them again from Python, then stop everything cleanly. Linux commands are shown; the platform tutorials cover macOS and Windows.
+facts: Time | About 5 minutes ; Needs | A pip install and a FUSE driver ; Works in | Linux, macOS, Windows
+-->
+<h2>1. Start the runtime</h2>
+<p>The runtime is one background process per machine. Every other component runs inside it.</p>
+<pre data-label="shell">
+$ clio_run start
+</pre>
+<p>Leave it running in its own terminal, or add <code>&amp;</code> to run it in the background. It is ready when the log shows the client transport. Its port is the base RPC port, 9413, plus 3:</p>
+<pre data-label="output">
+IpcManager: TCP ROUTER transport bound on <address>:9416
+Viz: dashboard listening at http://127.0.0.1:8080
+</pre>
+<p>In another terminal, <code>clio_run status</code> prints <code>RUNNING</code>, <code>STOPPED (clean)</code>, or <code>STOPPED (stale artifacts)</code> when a crashed runtime left files behind.</p>
+<p>The runtime reads <code>~/.clio/clio.yaml</code>. To use a different file, set <code>CLIO_SERVER_CONF</code> <em>before</em> you start it:</p>
+<pre data-label="shell">
+$ export CLIO_SERVER_CONF=$HOME/my-clio.yaml
+$ clio_run start --disk /scratch/$USER/clio   # keep persistent state on scratch
+</pre>
+<div class="callout">
+  <span class="callout-title">What the default configuration gives you</span>
+  <p>A RAM tier sized to 80% of system memory, a 10 GB persistent disk tier under <code>~/.clio</code>, a metadata log, the replication, index and cache layers, and the filesystem pool. That is enough for this whole page.</p>
+</div>
+
+<h2>2. Mount the filesystem</h2>
+<pre data-label="shell">
+$ mkdir -p ~/clio-mnt
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
+</pre>
+<p><code>CLIO_WITH_RUNTIME=0</code> tells the FUSE daemon to attach to the runtime you started. Without it, the daemon starts a private runtime of its own, and nothing else can see your files. <code>-f</code> keeps the daemon in the foreground; leave it running.</p>
+<p>On Windows, mount a drive letter: <code>clio_cte_fuse Z: -f</code>. On macOS, see <a href="/tutorials/fuse-macos.html">FUSE on macOS</a>.</p>
+
+<h2>3. Use it like a directory</h2>
+<pre data-label="shell">
+$ mkdir -p ~/clio-mnt/notes
+$ cp report-2024.md field-log.txt ~/clio-mnt/notes/
+$ ls -l ~/clio-mnt/notes
+$ grep -i "sea ice" ~/clio-mnt/notes/*
+</pre>
+<p>Writes go through to the runtime as they happen, so file sizes are exact as soon as <code>write()</code> returns. Each file is stored as 1 MiB pages placed on the fastest tier with room. A copy goes to the persistent disk tier, and the index picks up the text.</p>
+<p>Open <a href="http://127.0.0.1:8080">http://127.0.0.1:8080</a> and look at <strong>Pools → clio_cte_core</strong>. The tier roster shows the bytes you just wrote. The <a href="/tutorials/dashboard.html">dashboard tutorial</a> walks through every page.</p>
+
+<h2>4. Find files from Python</h2>
+<p>Keyword search is served by the indexer pool (<code>564.0</code>). Point the client at it, then search the files you copied in:</p>
+<pre data-label="python">
+import os
+os.environ["CLIO_WITH_RUNTIME"] = "0"     # attach to the running runtime
+os.environ["CLIO_CTE_POOL"] = "564.0"     # search lives in the indexer
+
+import clio_cte_core_ext as cte
+
+cte.clio_init(cte.RuntimeMode.kClient, False)
+cte.initialize_cte("", cte.PoolQuery.Dynamic())
+client = cte.get_cte_client()
+
+# Each file is a tag named by its path. Map tag ids back to paths.
+paths = {}
+for name in client.TagQuery(".*notes/.*", 0):
+    tid = cte.Tag(name).GetTagId()
+    paths[(tid.major_, tid.minor_)] = name
+
+for hit in client.SemanticSearch(".*notes/.*", "[0-9]+", "sea ice extent", 5):
+    if hit.score > 0:                      # 0 means no query word appears
+        print(f"{hit.score:6.2f}  {paths.get((hit.tag_id.major_, hit.tag_id.minor_))}")
+</pre>
+<p>Results are ranked by BM25 relevance. Each hit is one 1 MiB page of a file, and <code>hit.blob_name</code> is the page number. The blob pattern <code>[0-9]+</code> limits the search to pages; each file also has a small attribute blob named <code>~i</code>. Every page that matches the patterns is ranked, so pages without any query word come back with a score of 0. <a href="/tutorials/python-semantic-query.html">Query files from Python</a> covers name and time queries, reading the bytes back, and the higher-level <code>clio_cee</code> API.</p>
+
+<h2>5. Stop cleanly</h2>
+<pre data-label="shell">
+$ fusermount3 -u ~/clio-mnt     # Linux. macOS: umount ~/clio-mnt
+$ clio_run stop
+</pre>
+<p><code>clio_run stop</code> drains in-flight work for up to five seconds by default. Use <code>--grace-period &lt;ms&gt;</code> to change that, or <code>--force</code> to stop immediately.</p>
+<p>Your files survive the stop. <code>clio_run start</code> recovers them from the metadata log, so start again and mount the same directory to see the same files. To begin from an empty store instead, use <code>clio_run start --fresh</code>, which discards this node's persistent state.</p>
+
+<h2>Troubleshooting</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>Symptom</th><th>Cause and fix</th></tr></thead>
+  <tbody>
+    <tr><td>Files written by the mount are invisible to Python</td><td>The FUSE daemon started its own runtime. Remount with <code>CLIO_WITH_RUNTIME=0</code>.</td></tr>
+    <tr><td><code>clio_cte_fuse: command not found</code> on macOS</td><td>The macOS wheel has no FUSE binary. Build with the <code>release-mac-fuse</code> preset.</td></tr>
+    <tr><td><code>fuse: device not found</code> on Linux</td><td>Install the FUSE 3 package: <code>sudo apt install fuse3 libfuse3-3</code>.</td></tr>
+    <tr><td>No <code>Viz:</code> line, or nothing on port 8080</td><td>Another process holds the port (the runtime still starts), or the build lacks Poco. Try <code>clio_run start --viz-port 9000</code>.</td></tr>
+    <tr><td><code>SemanticSearch</code> returns nothing</td><td>The client is bound to the core pool. Set <code>CLIO_CTE_POOL=564.0</code> before importing the module.</td></tr>
+  </tbody>
+</table></div>

@@ -1,0 +1,220 @@
+<!--
+title: Durability and recovery
+heading: Durability and recovery
+description: What CLIO Core persists, in what order, what survives a process crash, power loss or node loss, and how a restart recovers.
+eyebrow: Design
+lede: CLIO Core's default durability contract follows ext4. An acknowledged write is fast and survives a crash of the application. It is guaranteed to survive power loss only after <code>fsync</code> (or the periodic flush), and it is unavailable while its node is down unless replication is configured. This page explains how each layer meets that contract, and where it deliberately does not go further.
+-->
+<h2 id="levels">Four levels of "safe"</h2>
+<table>
+  <tr><th>Level</th><th>What it takes</th><th>Default behavior</th></tr>
+  <tr><td><strong>Acknowledged</strong></td><td>The owner has applied the write. For deferred puts, the write has been accepted into staging.</td><td>Survives an application crash once it reaches the runtime. Deferred-put errors surface at the next flush or close.</td></tr>
+  <tr><td><strong>Process-crash safe</strong></td><td>Data is on a persistent device (or in the OS page cache for it), and metadata log records have been written to the OS.</td><td>Holds for data on persistent tiers. Every metadata log record is flushed to the OS as it is written.</td></tr>
+  <tr><td><strong>Power-loss safe</strong></td><td>Device data and logs have been fsynced.</td><td>Requires <code>fsync</code> (a tag sync), or happens through the periodic flushes: data every 10 s, the metadata log every 5 s.</td></tr>
+  <tr><td><strong>Node-loss safe</strong></td><td>A copy exists on another node.</td><td>Off by default (replication factor 1). Configure remote copies, and failover to serve them.</td></tr>
+</table>
+<p>Data on a volatile tier (RAM, HBM, pinned memory) reaches only the first
+level until a flush moves it to a persistent tier.</p>
+
+<h2 id="state">What is persisted, and where</h2>
+<p>Persistent state lives under a single storage root
+(<code>CLIO_STORAGE_ROOT</code> or <code>clio_run start --disk</code>,
+default <code>~/.clio</code>):</p>
+<table>
+  <tr><th>Artifact</th><th>Owner</th><th>Contents</th><th>Sync policy</th></tr>
+  <tr><td>Block-device data file</td><td>bdev (file)</td><td>Blob bytes on the disk tier</td><td>fdatasync on sync. Otherwise kernel writeback.</td></tr>
+  <tr><td>Allocation log</td><td>bdev (file)</td><td>Allocation and free records, 40 bytes each</td><td>Flushed per call. Fsynced every 50 ms and on sync. Compacted atomically.</td></tr>
+  <tr><td>Metadata snapshot</td><td>CTE core</td><td>Every tag and blob: layouts, scores, flags, aliases</td><td>Written to a temporary file, fsynced, then renamed into place.</td></tr>
+  <tr><td>Metadata write-ahead log (one shard per worker)</td><td>CTE core</td><td>Create, extend, clear and delete blob; tag create, delete and identity; transform and droppable marks</td><td>Flushed per record. Fsynced every 5 s and on sync.</td></tr>
+  <tr><td>Pool log</td><td>Runtime</td><td>Which durable pools exist, with their parameters</td><td>Fsync of the file and its directory on every append.</td></tr>
+  <tr><td>Stream size log</td><td>Stream ChiMod</td><td>Logical file sizes, append plans and completions</td><td>Fsynced at least every 5 s and on file fsync.</td></tr>
+  <tr><td>Search index snapshot and log</td><td>Indexer</td><td>Term statistics for semantic search</td><td>Derived state, which can be rebuilt by rescanning.</td></tr>
+  <tr><td>Hand-back log</td><td>Replication</td><td>Changes made while standing in for a dead owner</td><td>Persisted only when a path is configured.</td></tr>
+  <tr><td>Filesystem namespace</td><td>clio-fs</td><td>Directory blocks, inode records, extended attributes</td><td>Stored as ordinary CTE blobs, so it inherits the CTE's durability.</td></tr>
+</table>
+<p>Without a <code>metadata_log_path</code>, the core persists nothing. The
+bytes on disk would survive, but nothing would record which blob they
+belong to. The shipped configuration sets the path.</p>
+
+<h2 id="ordering">Ordering invariants</h2>
+<p>Most of the reliability design comes down to doing things in the right
+order. Each rule below exists because the opposite order lost data at
+scale or under a file-system stress test.</p>
+<table>
+  <tr><th>Rule</th><th>Prevents</th></tr>
+  <tr><td><strong>Allocation is logged before blocks are returned; frees are logged before space is reused.</strong></td><td>Handing out live bytes twice after a crash. The worst a crash can do is leak space.</td></tr>
+  <tr><td><strong>Data is written before its layout is logged.</strong></td><td>A recovered blob pointing at a recycled extent that holds someone else's old bytes.</td></tr>
+  <tr><td><strong>A new copy is placed before the old one is freed</strong> (moves, flushes, reorganization).</td><td>A failed move or flush destroying the only copy.</td></tr>
+  <tr><td><strong>The zero-IPC mirror entry is withdrawn before blocks are freed.</strong></td><td>A reader in another process copying from an extent already reused by another blob.</td></tr>
+  <tr><td><strong>Device data is synced before the allocation log.</strong></td><td>A logged block whose bytes were lost.</td></tr>
+  <tr><td><strong>Snapshots are written beside the live file, then renamed; the log is trimmed only up to the snapshot's sequence number.</strong></td><td>Losing records written while the snapshot was being taken.</td></tr>
+  <tr><td><strong>Filesystem inode records are stored before the name is published.</strong></td><td>A directory entry pointing at a missing inode.</td></tr>
+  <tr><td><strong>Link counts are raised before a new name is inserted.</strong></td><td>A dangling name after a crash. The worst outcome is an over-count, a leak.</td></tr>
+</table>
+
+<h2 id="wal">The metadata log</h2>
+<p>The metadata log is <strong>sharded by worker</strong>, so concurrent
+workers do not contend on one file. Every record carries a sequence number
+from a single per-container counter. Replay merges all shards and sorts by
+that sequence before applying anything. Replaying each shard in file order
+once let an older full-layout record overwrite a newer one and shorten a
+blob after a crash. Records that carry a blob's layout are full-state
+rather than deltas, so replaying one is idempotent.</p>
+<p>Snapshots are expensive (about a second per 18k blobs before the fix
+that made them occasional). A full snapshot is therefore rebuilt only
+when one of these holds:</p>
+<ul>
+  <li>the log has grown past its capacity (32 MB by default);</li>
+  <li>unlogged changes such as scores are pending and the last snapshot is
+  over a minute old;</li>
+  <li>a snapshot is explicitly requested.</li>
+</ul>
+<p>Snapshotting yields regularly so it does not stall a worker.</p>
+<div class="callout warn">
+  <p><strong>Reliability tradeoff.</strong> Records are length-prefixed but
+  carry no checksum. A record whose length runs past the end of the file
+  ends the replay cleanly, which covers torn tails. A corrupted payload of
+  valid length, however, would be applied. If restore hits a corrupt log,
+  startup logs the problem and <em>continues with the state it could
+  recover</em>. That favors availability over strictness, and the operator
+  is told to move the log aside to start clean.</p>
+</div>
+
+<h2 id="restart">What a restart does</h2>
+<p><code>clio_run start</code> always recovers existing state.
+<code>--fresh</code> is the only way to discard it.</p>
+<ol>
+  <li><strong>Pools come back.</strong> The runtime replays its per-node
+  pool log, in creation order, and recreates every durable pool through its
+  module's restart path. Pools from the server's compose configuration are
+  treated as durable.</li>
+  <li><strong>Block devices rebuild their allocators</strong> from the
+  allocation log. Gaps below the highest live byte become free space, and
+  the heap resumes after the last live byte.</li>
+  <li><strong>The core restores metadata</strong> from the snapshot, then
+  replays the merged log.</li>
+  <li><strong>Volatile data is accounted as lost, not as zeros.</strong>
+  Blocks that lived on RAM, HBM or pinned memory are dropped. A blob keeps
+  the prefix before its first lost block, and the rest is marked lost.
+  Reads into the lost range fail with an I/O error. The replication layer
+  can serve those bytes from another copy if one exists.</li>
+  <li><strong>Sizes and caches are made consistent.</strong> Tag sizes are
+  recomputed in one linear pass (an earlier quadratic pass kept a 6-node
+  cluster from ever recovering). Node-local cache copies are discarded,
+  because invalidations may have been missed while the node was down.</li>
+  <li><strong>Restored space is reserved</strong> on persistent tiers that
+  do not log their own allocations, so new writes cannot land on restored
+  data. The cost is that holes below the reserved high-water mark stay
+  unusable.</li>
+  <li><strong>Higher layers reconcile.</strong>
+    <ul>
+      <li>The stream module re-queues appends staged before the crash and
+      finishes interrupted merges. It holds size operations until the
+      filesystem confirms each file's size, or two minutes pass.</li>
+      <li>The filesystem resumes inode numbering past its durable
+      reservation and destroys orphaned inodes.</li>
+      <li>The replication layer pulls back any changes another node made
+      while standing in for this one.</li>
+    </ul>
+  </li>
+</ol>
+
+<figure class="diagram">
+  <svg viewBox="0 0 860 120" role="img" aria-label="Restart sequence">
+    <defs><marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box" x="5" y="30" width="125" height="60" rx="8"/><text x="18" y="57" class="title">Pool log</text><text x="18" y="76" class="muted">recreate pools</text>
+    <rect class="box" x="150" y="30" width="125" height="60" rx="8"/><text x="163" y="57" class="title">Alloc log</text><text x="163" y="76" class="muted">rebuild heaps</text>
+    <rect class="box hl" x="295" y="30" width="135" height="60" rx="8"/><text x="308" y="57" class="title">Snapshot + WAL</text><text x="308" y="76" class="muted">sequence-ordered</text>
+    <rect class="box alt" x="450" y="30" width="125" height="60" rx="8"/><text x="463" y="57" class="title">Drop volatile</text><text x="463" y="76" class="muted">mark lost bytes</text>
+    <rect class="box" x="595" y="30" width="120" height="60" rx="8"/><text x="608" y="57" class="title">Reserve</text><text x="608" y="76" class="muted">restored space</text>
+    <rect class="box hl" x="735" y="30" width="120" height="60" rx="8"/><text x="748" y="57" class="title">Reconcile</text><text x="748" y="76" class="muted">stream, fs, repl.</text>
+    <path class="edge" d="M130,60 L148,60" marker-end="url(#ah3)"/>
+    <path class="edge" d="M275,60 L293,60" marker-end="url(#ah3)"/>
+    <path class="edge" d="M430,60 L448,60" marker-end="url(#ah3)"/>
+    <path class="edge" d="M575,60 L593,60" marker-end="url(#ah3)"/>
+    <path class="edge" d="M715,60 L733,60" marker-end="url(#ah3)"/>
+  </svg>
+  <figcaption>The order of a recovering start. Client requests that arrive
+  early are held until the module that owns them has finished its
+  restore.</figcaption>
+</figure>
+
+<h2 id="matrix">What survives what</h2>
+<table>
+  <tr><th>State</th><th>Application crash</th><th>Runtime crash (kill -9)</th><th>Power loss</th><th>Node loss</th></tr>
+  <tr><td>Data on a persistent tier</td><td>Yes</td><td>Yes</td><td>After sync or periodic flush</td><td>Only with remote copies</td></tr>
+  <tr><td>Data on a volatile tier</td><td>Yes</td><td>No; reported as lost</td><td>No</td><td>Only with remote copies</td></tr>
+  <tr><td>Blob and tag metadata</td><td>Yes</td><td>Yes (each log record reaches the OS)</td><td>Up to ~5 s of log may be lost; less after sync</td><td>Shadow copies under failover</td></tr>
+  <tr><td>Blob scores</td><td>Yes</td><td>Up to ~1 minute of changes lost</td><td>Same</td><td>n/a</td></tr>
+  <tr><td>Allocator state</td><td>Yes</td><td>Yes</td><td>~50 ms window; immediate after sync</td><td>n/a</td></tr>
+  <tr><td>Pool registry</td><td>Yes</td><td>Yes</td><td>Yes</td><td>n/a</td></tr>
+  <tr><td>File sizes (clio-fs)</td><td>Yes</td><td>Yes, with a stream log configured</td><td>Up to ~5 s; immediate after fsync</td><td>Via failover</td></tr>
+  <tr><td>Access counts, cache registrations</td><td>Yes</td><td>No (rebuilt)</td><td>No</td><td>No</td></tr>
+</table>
+
+<h2 id="fsync">What <code>fsync</code> means end to end</h2>
+<p>Through the FUSE filesystem, <code>fsync</code> on a file does the
+following, in order:</p>
+<ol>
+  <li>Drains the client's write-behind pages.</li>
+  <li>Publishes the file's size.</li>
+  <li>Waits for any pending asynchronous replication of the file.</li>
+  <li>Syncs the file's tag: data is moved to a persistent tier and its
+  devices are fsynced, then the metadata log is fsynced.</li>
+  <li>Fsyncs the stream size log.</li>
+  <li>Syncs the parent directory's tag, so the name is durable too.</li>
+</ol>
+<p>If a node that may have held this file's unsynced writes died since the
+last sync, <code>fsync</code> returns an I/O error rather than claiming
+durability it cannot vouch for. Measured cost: syncing to the device adds
+roughly 23–35% to fsync-heavy workloads such as sqlite, tar and appends.</p>
+<div class="callout warn">
+  <p><strong>Front ends differ.</strong> The <code>LD_PRELOAD</code>
+  interceptors (POSIX, STDIO) implement <code>fsync</code> as "drain the
+  deferred writes and report any latched error". That makes the write
+  visible and surfaces errors, but it does not sync the tag to a device.
+  MPI-IO's sync is a no-op. Applications that need power-loss durability
+  through these paths depend on the periodic flush. See
+  <a href="adapters.html">I/O adapters</a>.</p>
+</div>
+
+<h2 id="node-loss">Node failure</h2>
+<ul>
+  <li><strong>Default: a single copy.</strong> With the default replication
+  factor of 1, a node's blobs are unavailable while it is down. Requests
+  for them fail, after a network timeout or immediately in fail-fast
+  mode.</li>
+  <li><strong>Remote copies.</strong> With factor <em>N</em>, the owner
+  writes <em>N−1</em> copies to the next nodes in ring order before
+  acknowledging. A dead successor is skipped: the write succeeds with one
+  copy fewer, and nothing re-replicates it later.</li>
+  <li><strong>Failover.</strong> With <code>failover_to_successor</code>,
+  requests for a dead owner's blobs go to its first live successor, which
+  serves its shadow copy and records every change. When the owner
+  restarts, it pulls those changes back before serving. The successor also
+  pushes them periodically.</li>
+  <li><strong>Peer restarts are detected by incarnation.</strong> Every
+  message carries the sender's incarnation number. When a peer comes back
+  as a new process, requests that were in flight to the old one fail
+  promptly and are retried, rather than waiting forever for a reply that
+  will never come.</li>
+  <li><strong>Membership is conservative.</strong> Liveness comes from
+  probing peers that have outstanding requests or have gone quiet. The
+  gossip-based failure detector is off by default, because at 256 nodes
+  wide collective operations starved its probes and healthy nodes were
+  declared dead. As a consequence, automatic container recovery seldom
+  triggers. Durability across node loss is the replication layer's job,
+  not the runtime's.</li>
+</ul>
+
+<h2 id="tradeoffs">Tradeoffs at a glance</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>ext4-style "durable on fsync"</td><td class="good">RAM-speed writes. Applications choose when to pay for durability.</td><td class="cost">Seconds of exposure to power loss for un-synced data.</td></tr>
+  <tr><td>Worker-sharded log, globally sequenced</td><td class="good">No single-file contention on the write path.</td><td class="cost">Replay must merge and sort all shards.</td></tr>
+  <tr><td>Snapshot only when needed</td><td class="good">Low background cost at large blob counts.</td><td class="cost">Score changes can lag disk by a minute.</td></tr>
+  <tr><td>Continue on a corrupt log</td><td class="good">The node comes back with whatever it could recover.</td><td class="cost">Partial state is served. There are no per-record checksums.</td></tr>
+  <tr><td>Lost volatile data is an error</td><td class="good">Applications never silently read zeros.</td><td class="cost">Readers must handle I/O errors after a restart unless replicas exist.</td></tr>
+  <tr><td>Single copy by default</td><td class="good">No write amplification or network cost.</td><td class="cost">A down node's data is unavailable until it returns.</td></tr>
+  <tr><td>Reserve restored space by high-water mark</td><td class="good">Restored data can never be overwritten.</td><td class="cost">Holes below the mark are lost capacity on tiers without an allocation log.</td></tr>
+</table>

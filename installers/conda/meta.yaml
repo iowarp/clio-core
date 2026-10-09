@@ -7,7 +7,7 @@
    build exposes a working environ-bridge again; the CMake-side source
    of truth is in /CMakeLists.txt project(iowarp-core VERSION X.Y.Z),
    keep this number in sync when bumping. #}
-{% set version = "2.3.0" %}
+{% set version = "2.3.1" %}
 {% set preset = environ.get('IOWARP_PRESET', 'release') %}
 
 package:

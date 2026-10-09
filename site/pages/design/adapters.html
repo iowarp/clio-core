@@ -1,0 +1,190 @@
+<!--
+title: I/O adapters
+heading: I/O adapters
+description: Design of the CTE I/O adapters: POSIX, STDIO and MPI-IO interceptors, the HDF5 VOL and VFD connectors, ADIOS2, GPU paths.
+eyebrow: Design
+lede: Besides the FUSE mount, applications can reach the CTE through adapters that plug into the I/O libraries they already use. There are two distinct designs. The <strong>interceptors</strong> make the CTE the file's only home. The <strong>HDF5 connectors</strong> keep the native file authoritative and use the CTE as a disposable cache.
+-->
+<table>
+  <tr><th>Adapter</th><th>Mechanism</th><th>Where the data lives</th></tr>
+  <tr><td>POSIX, STDIO, MPI-IO</td><td>Symbol interception (<code>LD_PRELOAD</code>)</td><td>Only in the CTE (clio-fs). No backing file.</td></tr>
+  <tr><td>HDF5 VOL connector</td><td>HDF5 plugin, above the library</td><td>Native file first; dataset images cached in the CTE</td></tr>
+  <tr><td>HDF5 VFD</td><td>HDF5 plugin, below the library</td><td>Native file first; byte ranges optionally cached in the CTE</td></tr>
+  <tr><td>ADIOS2 engine</td><td>ADIOS2 plugin engine</td><td>Only in the CTE</td></tr>
+  <tr><td>GPU paths (vector, HDF5-like datasets, GDS)</td><td>GPU producer API, or cuFile interception</td><td>Only in the CTE</td></tr>
+</table>
+
+<h2 id="interceptors">Interceptors: POSIX, STDIO, MPI-IO</h2>
+
+<h3>How interception works</h3>
+<p>Each interceptor library defines the C library (or MPI) entry points
+itself and is loaded with <code>LD_PRELOAD</code>. At startup it walks the
+process's loaded libraries to find the <em>real</em> implementation of
+each function, skipping itself. Every call that is not for a tracked file
+goes straight to the real one. A load guard keeps <code>open</code> from
+being intercepted while the interceptor is only half initialized.</p>
+<p>The interceptors are Linux/ELF only, and require the ELF interception
+build option.</p>
+
+<h3>Which files are intercepted</h3>
+<p>Selection is opt-in by path: only paths containing a
+<code>clio::</code> component are taken over. The marker is stripped and
+the rest becomes a clio-fs path. Everything else, including the
+application's ordinary files, passes through untouched. This keeps the
+blast radius small: an interceptor can never accidentally capture a
+system library or a config file.</p>
+
+<h3>A shared descriptor layer</h3>
+<p>All interceptors (and the HDF5 VFD) use one descriptor layer in the
+filesystem client. An adapter owns only its handle table and seek
+offsets. Everything else lives in that layer:</p>
+<ul>
+  <li>write-behind staging;</li>
+  <li>size tracking;</li>
+  <li>zero-IPC reads;</li>
+  <li>error latching.</li>
+</ul>
+<p>CTE descriptors start at 8192 so they never collide with kernel
+descriptors. <code>stat</code> results are synthesized, with a fixed device
+number, a path-derived inode number and 1 MiB blocks. Creating a file
+whose parent directories exist on the host but not yet in clio-fs creates
+them on the fly.</p>
+
+<h3>Write-behind</h3>
+<p>A <code>write()</code> copies the buffer into pooled shared-memory
+staging, submits it, and returns, unless the file was opened
+<code>O_SYNC</code> or <code>O_DSYNC</code>.</p>
+<ul>
+  <li><strong>In-flight window.</strong> Bounded per process at 256 writes
+  or 64 MiB. That count was the best measured setting. A byte-only limit
+  let 4 KiB writes queue 16k deep and cost 1.6× throughput.</li>
+  <li><strong>Reads see pending writes.</strong> A read that is fully
+  covered is served from staging; a partially covered read waits for the
+  overlapping writes.</li>
+  <li><strong>Errors surface late.</strong> A failed write is latched and
+  reported once, at <code>fsync</code> or <code>close</code>, the way the
+  kernel reports writeback errors.</li>
+  <li><strong>Draining first.</strong> <code>stat</code>,
+  <code>SEEK_END</code>, truncate, unlink and rename all drain the file's
+  pending writes before acting.</li>
+</ul>
+
+<h3>Semantics and limits</h3>
+<table>
+  <tr><th>Adapter</th><th>Provides</th><th>Does not provide</th></tr>
+  <tr><td>POSIX</td><td>open/creat, read/write, pread/pwrite, lseek, the stat family, ftruncate, fsync, close, unlink and remove. <code>O_APPEND</code> and <code>O_TRUNC</code> are honored.</td><td><code>mmap</code>, vectored I/O, <code>rename</code>, <code>dup</code>, <code>fcntl</code>, directory iteration and fallocate are not intercepted. <code>flock</code> succeeds without locking.</td></tr>
+  <tr><td>STDIO</td><td>fopen/fdopen/freopen, character, line and block I/O, seeking, flush, close</td><td>No user-space buffering, so each character is a request. Formatted I/O (<code>fprintf</code>, <code>fscanf</code>) and <code>setvbuf</code> are not intercepted and must not be used on intercepted streams.</td></tr>
+  <tr><td>MPI-IO</td><td>Open, close, seek; independent, collective, shared and ordered read and write; nonblocking variants</td><td>Collectives run as independent I/O, and shared file pointers are per process. File views and derived datatypes are ignored (the data is treated as contiguous). Status objects are not filled in, and nonblocking calls complete at submission.</td></tr>
+</table>
+<div class="callout warn">
+  <p><strong>Durability through interceptors.</strong> Through these paths
+  there is no backing file on a parallel filesystem: the CTE's tier
+  configuration alone decides durability.</p>
+  <ul>
+    <li><strong>POSIX and STDIO.</strong> <code>fsync</code> drains pending
+    writes and reports errors, but does not force a sync to a persistent
+    device the way the FUSE mount does. Data reaches persistent tiers
+    through the periodic flush.</li>
+    <li><strong>MPI-IO.</strong> <code>MPI_File_sync</code> does nothing,
+    and the result of close is not checked. A failed deferred write
+    through MPI-IO can therefore go unreported. Applications that need
+    strict error reporting should use the FUSE mount or the POSIX
+    interceptor with <code>O_SYNC</code>.</li>
+  </ul>
+</div>
+
+<h2 id="hdf5">HDF5: native file first, CTE as a cache</h2>
+<p>Both HDF5 connectors take the opposite stance from the interceptors.
+<strong>Every write goes to the native HDF5 file first, synchronously.</strong>
+The CTE holds only a cache that can be thrown away at any time. They add
+no data-loss window beyond native HDF5's own.</p>
+
+<h3>Coherence stamps</h3>
+<p>Because the native file can be changed by tools that know nothing
+about the cache (h5repack, rsync, an editor), each cache is guarded by a
+<em>coherence stamp</em>. The stamp records the file's device, inode,
+size and modification time.</p>
+<ul>
+  <li><strong>Written at close.</strong> When a writing session closes,
+  the stamp is stored next to the cache.</li>
+  <li><strong>Checked at open.</strong> A missing, unreadable or
+  mismatched stamp means the whole cache is dropped. The check fails
+  closed.</li>
+  <li><strong>Ambiguous timestamps.</strong> Filesystem timestamps are
+  coarse, so a modification time younger than one granule (10 ms by
+  default, 1 s on Windows) is ambiguous. The stamp is then withheld, and
+  the next open rebuilds the cache. An opt-in mode waits for the timestamp
+  to settle instead, which is safe only for single-writer pipelines.</li>
+</ul>
+<p>Modification <em>during</em> a session is undefined, as with native
+HDF5.</p>
+
+<h3>VOL connector versus VFD</h3>
+<table>
+  <tr><th></th><th>VOL connector</th><th>VFD</th></tr>
+  <tr><td>Layer</td><td>Object level, above the HDF5 library. Sees datasets, types and selections.</td><td>Byte level, below the library. Sees only addresses, sizes and memory types.</td></tr>
+  <tr><td>What is cached</td><td>Whole dataset images, chunked into blobs (1 MiB by default)</td><td>Byte ranges of the file, in a clio-fs mirror (1 MiB pages)</td></tr>
+  <tr><td>Admission</td><td>Policy (on write, on read miss, or on second access), plus a self-tuning cost model that stages only if the native path measured slower than the tier, plus a per-device verdict</td><td>One switch: the read tier on or off</td></tr>
+  <tr><td>Read serving</td><td>On by default. Whole reads are served from the cache. Partial reads are served only if already cached and never trigger staging.</td><td>Off by default. When on, only ranges written or read in <em>this</em> session are served.</td></tr>
+  <tr><td>Metadata</td><td>Never cached (groups, attributes and links pass through)</td><td>Treated like any other byte range</td></tr>
+  <tr><td>Overhead when it cannot help</td><td>Near native: nothing touches the CTE until the first cacheable transfer</td><td>Near native with the read tier off</td></tr>
+  <tr><td>Weak spots</td><td>A partial write invalidates the whole dataset image. It does not stack over other VOL connectors.</td><td>Cannot distinguish hot data from metadata, and tiny HDF5 writes become many requests</td></tr>
+</table>
+<p>Much of the tuning came from metadata-heavy netCDF-4 workloads. Two
+examples:</p>
+<ul>
+  <li><strong>Lazy binding.</strong> The VOL connector does not touch the
+  CTE until the first cacheable transfer, so 32,768 open/close cycles that
+  touch only metadata cost nothing.</li>
+  <li><strong>No populate without read serving.</strong> With the VFD's
+  read tier off, writes do not populate the cache at all: an
+  attribute-heavy test went from 705 s to 10.8 s.</li>
+</ul>
+<p>The VOL connector writes cache chunks as droppable blobs. When the tier
+is full, it backs off for a few seconds instead of slowing the
+authoritative write.</p>
+
+<h2 id="adios2">ADIOS2 engine</h2>
+<p>A plugin engine that maps each variable, step and rank to one blob in
+a tag named after the engine. Synchronous puts block. Deferred puts are
+staged into shared memory and complete at the end of the step. It
+stores no variable metadata (shape, offset, type), so readers must use
+the writer's rank layout and step numbering. Start-up is staggered across
+ranks, so that thousands of ranks do not all connect at once.</p>
+
+<h2 id="gpu">GPU paths</h2>
+<p>GPU kernels are pure <em>producers</em>. All tasks and buffers are
+allocated by the host, in memory registered with the runtime, before the
+kernel launches. Inside the kernel, the only operation is "send this
+prepared task" and wait for its completion flag. This keeps device code
+free of allocators and locks.</p>
+<ul>
+  <li><strong>GPU vector.</strong> A paged array whose pages are blobs,
+  cached in a set-associative page cache in GPU memory shared by all
+  thread blocks. Kernels hold pages through coroutine guards. Fetches and
+  flushes are batched, up to 64 per request.</li>
+  <li><strong>The vector never writes back on its own.</strong> The caller
+  owns flushing, and a page that is being fetched or flushed is never
+  evicted. A refused fetch or flush stops the kernel with a reported
+  cause, instead of continuing with wrong data.</li>
+  <li><strong>Prefetching means rescoring pages</strong> so they move up the
+  tier stack. Measured, it did not pay off on the tested splits: one
+  migration cost four to five page faults, and promoting into a full tier
+  first needs a free.</li>
+  <li><strong>HDF5-like GPU datasets.</strong> One blob per chunk, with a
+  small metadata blob written once per dataset.</li>
+  <li><strong>The cuFile (GDS) interceptor</strong> bounces through host
+  memory into the POSIX interceptor. It is a compatibility shim, not
+  GPU-direct I/O, and is off by default.</li>
+</ul>
+
+<h2 id="tradeoffs">Tradeoffs at a glance</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>Opt-in <code>clio::</code> paths</td><td class="good">Interception never captures unrelated files.</td><td class="cost">Producers and consumers must both use the marker, an interceptor, FUSE or the API.</td></tr>
+  <tr><td>One shared descriptor layer</td><td class="good">Every interceptor gets the same write-behind, error and size semantics.</td><td class="cost">A fixed 1 MiB page size for clio-fs files.</td></tr>
+  <tr><td>Write-behind in interceptors</td><td class="good">Small-write throughput close to the page cache's.</td><td class="cost">Errors arrive at fsync or close. Interceptor fsync is not a device sync.</td></tr>
+  <tr><td>HDF5: native file is the authority</td><td class="good">No new data-loss window. The cache can always be discarded.</td><td class="cost">Writes are never faster than native. The gain is on re-reads.</td></tr>
+  <tr><td>Cost-gated VOL admission</td><td class="good">Caching is skipped where it would lose (fast local disk, tiny datasets).</td><td class="cost">The model needs measurements, so early accesses may be mis-admitted.</td></tr>
+  <tr><td>Simplified MPI-IO</td><td class="good">A drop-in for common independent-I/O codes.</td><td class="cost">Not suitable for codes relying on views, shared pointers or strict error reporting.</td></tr>
+</table>

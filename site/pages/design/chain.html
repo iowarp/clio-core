@@ -1,0 +1,344 @@
+<!--
+title: The interposition chain
+heading: The interposition chain
+description: Design of the CTE's stackable ChiMods: replication, cache, indexer, compressor, stream and checkpoint, plus the experimental UVM and LLM hooks.
+eyebrow: Design
+lede: Replication, caching, indexing and compression are not built into the core. Each is a separate ChiMod that speaks the <em>core's own interface</em> and forwards to the next pool down. A deployment composes the stack it needs, and a client pointed at the top of the stack uses the plain core API unchanged.
+-->
+<h2 id="pattern">The interposer pattern</h2>
+<p>An interposer is a ChiMod that accepts the core's method numbers and
+task formats. It overrides the handful of operations it cares about,
+usually put, get, size and batched put, and forwards everything else
+untouched to the pool named by its <code>next_pool_id</code>. Its own
+extra methods are numbered from 100 upward, so they cannot collide with a
+core method. A pool must be composed after the pool it forwards to.</p>
+<p>The core supplies the <em>mechanisms</em> the layers need: replica
+slots, shadow copies, cache-copy registration and invalidation, transform
+flags and fault handlers. Each layer supplies the <em>policy</em>: what to
+copy, where, and when.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 860 400" role="img" aria-label="Default interposition chain">
+    <defs><marker id="ah4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="200" height="56" rx="8"/><text class="title" x="36" y="44">Filesystem (clio-fs)</text><text class="muted" x="36" y="62">namespace, inodes</text>
+    <rect class="box alt" x="20" y="100" width="200" height="56" rx="8"/><text class="title" x="36" y="124">Stream</text><text class="muted" x="36" y="142">file sizes, ordered appends</text>
+    <rect class="box alt" x="20" y="180" width="200" height="56" rx="8"/><text class="title" x="36" y="204">Applications / adapters</text><text class="muted" x="36" y="222">core client API</text>
+    <rect class="box hl" x="330" y="20" width="240" height="56" rx="8"/><text class="title" x="346" y="44">Cache</text><text class="muted" x="346" y="62">node-local raw copy, coherence</text>
+    <rect class="box hl" x="330" y="100" width="240" height="56" rx="8"/><text class="title" x="346" y="124">Indexer</text><text class="muted" x="346" y="142">BM25 semantic search</text>
+    <rect class="box" x="330" y="180" width="240" height="56" rx="8" stroke-dasharray="5 4"/><text class="title" x="346" y="204">Compressor (optional)</text><text class="muted" x="346" y="222">encode down, decode up</text>
+    <rect class="box hl" x="330" y="260" width="240" height="56" rx="8"/><text class="title" x="346" y="284">Replication</text><text class="muted" x="346" y="302">replicas, remote copies, failover</text>
+    <rect class="box hl" x="330" y="340" width="240" height="50" rx="8"/><text class="title" x="346" y="370">CTE core</text>
+    <path class="edge hl" d="M450,76 L450,98" marker-end="url(#ah4)"/>
+    <path class="edge hl" d="M450,156 L450,178" marker-end="url(#ah4)"/>
+    <path class="edge hl" d="M450,236 L450,258" marker-end="url(#ah4)"/>
+    <path class="edge hl" d="M450,316 L450,338" marker-end="url(#ah4)"/>
+    <path class="edge" d="M220,48 L328,48" marker-end="url(#ah4)"/>
+    <path class="edge" d="M220,128 L270,128 L270,56 L328,56" marker-end="url(#ah4)"/>
+    <path class="edge" d="M220,208 L290,208 L290,64 L328,64" marker-end="url(#ah4)"/>
+    <path class="edge" d="M20,140 L8,140 L8,290 L328,290" marker-end="url(#ah4)"/>
+    <text class="muted" x="128" y="282">stream: staged appends</text>
+    <rect class="box" x="640" y="20" width="200" height="56" rx="8" stroke-dasharray="5 4"/><text class="title" x="656" y="44">Checkpoint</text><text class="muted" x="656" y="62">fault handler, on demand</text>
+    <path class="edge" d="M740,76 L740,365 L572,365" marker-end="url(#ah4)"/>
+    <text class="muted" x="620" y="350">lazy-copy reads</text>
+  </svg>
+  <figcaption>The default composition. The cache sits on top, so every
+  reader gets locality. The indexer sits above the compressor, so it sees
+  logical bytes. Replication sits directly on the core, so every copy it
+  makes is of the final stored form. The compressor entry is shipped
+  commented out, and checkpoint pools are created on demand.</figcaption>
+</figure>
+
+<h3>Why this order</h3>
+<ul>
+  <li><strong>Cache on top.</strong> The cache keeps an untransformed copy
+  on the reader's node. Blobs compressed further down can still be served
+  by zero-copy shared-memory reads, which refuse transformed data.</li>
+  <li><strong>Indexer above the compressor.</strong> The indexer re-reads
+  blobs to tokenize them, and needs the logical, uncompressed bytes.</li>
+  <li><strong>Replication directly above the core.</strong> Replicas are
+  copies of exactly what is stored, compressed or not, so every copy has
+  the same format.</li>
+</ul>
+
+<h2 id="replication">Replication: the reliability layer</h2>
+<p>Replication manages two independent kinds of copy.</p>
+<table>
+  <tr><th></th><th>Remote copies</th><th>Local persistent replicas</th></tr>
+  <tr><td>Protects against</td><td>Node loss</td><td>Device loss, and data loss on a volatile primary</td></tr>
+  <tr><td>Where</td><td>The next <em>k</em> nodes in ring order after the blob's owner</td><td>Durable tiers on the owner's own node</td></tr>
+  <tr><td>When written</td><td>Synchronously, before the put is acknowledged, one copy after another</td><td>Asynchronously by default: a sweep every 50 ms copies the current primary, so repeated overwrites are coalesced. Synchronous if the period is set to 0.</td></tr>
+  <tr><td>On failure</td><td>The dead or failing copy is skipped with a warning, and the put still succeeds</td><td>The blob stays dirty and the next sweep retries it</td></tr>
+  <tr><td>Configured by</td><td><code>replication_factor</code> (default 1, so no remote copies) or <code>remote_copies</code></td><td><code>num_replicas</code> (default 0)</td></tr>
+</table>
+
+<h3>Write path</h3>
+<p>At the owner, a put does the following in order:</p>
+<ol>
+  <li>Waits for any pending hand-back after a restart.</li>
+  <li>Locks the blob, so there is one writer.</li>
+  <li>Refills a primary that lost bytes in a restart, so a write past its
+  end cannot leave a zero-filled gap.</li>
+  <li>Writes the primary first, so the primary is never staler than a
+  replica.</li>
+  <li>Updates local replicas, or marks them dirty for the sweep.</li>
+  <li>Mirrors to remote copies.</li>
+</ol>
+<p><code>fsync</code> waits for any running sweep, flushes the tag's dirty
+replicas, and then forwards the sync to the core. After an fsync, the
+replicas are current.</p>
+
+<h3>Read path</h3>
+<p>A get tries copies in this order:</p>
+<ol>
+  <li>The primary, if it covers the requested range.</li>
+  <li>A local persistent replica. The whole replica is then re-cached into
+  the primary.</li>
+  <li>A remote copy, for example when the primary's device is gone or its
+  RAM contents were lost in a restart. The primary is healed from it.</li>
+  <li>Otherwise the core's normal "absent" semantics.</li>
+</ol>
+<p>After a restart, the primary is first reconciled with its remote copy.
+The reported size accounts for bytes lost in the restart.</p>
+
+<h3>Failover and hand-back</h3>
+<p>With failover enabled in the core, a dead owner's blobs are served by
+its first live successor from that successor's shadow copy. The successor
+logs every change it makes and invalidates cached copies cluster-wide.
+Changes return to the owner two ways:</p>
+<ul>
+  <li><strong>Pull:</strong> a restarted owner pulls changes from every live
+  node before it serves requests.</li>
+  <li><strong>Push:</strong> a sweep every 500 ms pushes changes to owners
+  that have come back.</li>
+</ul>
+<p>A hand-back log can make this survive a restart of the stand-in too.
+Hand-back runs even at replication factor 1, because the stand-in may hold
+the only copy of writes made during the outage. Hand-back pushes are not
+mirrored again, so a hand-back can never overwrite a newer copy. Puts
+forwarded to an owner that dies mid-flight are retried.</p>
+
+<div class="callout warn">
+  <p><strong>Tradeoffs.</strong> Replication is <em>owner-ordered and
+  best-effort</em>, not quorum-based.</p>
+  <ul>
+    <li>Remote copies add one synchronous network write each, sent one
+    after another, so put latency grows with the factor.</li>
+    <li>A copy that fails while a node is down leaves the write with fewer
+    copies. Nothing re-replicates it later; the only repair mechanism is
+    hand-back to a returning owner.</li>
+    <li>Placement follows ring order, with no awareness of racks or other
+    failure domains.</li>
+  </ul>
+  <p>Space per synced byte is roughly <em>1 + replicas + remote
+  copies</em>, plus any cache copy.</p>
+</div>
+
+<h2 id="cache">Cache: the locality layer</h2>
+<p>The cache keeps a <strong>node-local, untransformed copy</strong> of
+each blob a node uses but does not own. Requests to the cache are routed to
+the <em>submitter's</em> node, so a process touching its own data stays
+local, and only the authoritative hop crosses the network.</p>
+<p>Its central invariant is that <em>a cache copy that exists is complete
+and current</em>. Reads can therefore try the local copy without first
+probing its size.</p>
+
+<h3>Writes: write-through with owner-driven invalidation</h3>
+<ul>
+  <li><strong>On the owner's own node, nothing is cached.</strong> The
+  primary is already local, and a copy there would sit outside the
+  invalidation protocol.</li>
+  <li><strong>Elsewhere, the local copy is updated first.</strong> If no
+  copy exists and the put covers the blob from offset 0, one is created
+  speculatively.</li>
+  <li><strong>The authoritative put then goes to the owner.</strong> The
+  owner invalidates every other registered copy and registers this one,
+  atomically under the blob's write token. Because the local write
+  happens before registration, any later write by another node is
+  guaranteed to invalidate it.</li>
+  <li><strong>If the authoritative put fails</strong>, or the blob turns
+  out to extend beyond what this put wrote, the local copy is discarded. A
+  cache problem never fails a put.</li>
+</ul>
+<p>The cache was originally write-back, with a dirty set and a flush
+sweep. It was changed to write-through, so an acknowledged write is
+always on the authoritative path, and so 4 KiB writes no longer trigger
+re-pushes of the whole blob.</p>
+
+<h3>Reads: fetch, populate, register with a version check</h3>
+<p>On a miss, the cache reads from the owner straight into the caller's
+buffer, then populates the local copy. It registers the copy
+<em>conditionally on the version it read</em>. If the owner's content has
+moved on in the meantime, registration is refused and the copy deleted. A
+population that fails partway deletes the whole copy, because a
+half-written copy once served another file's old extents.</p>
+
+<h3>Retention</h3>
+<p>The cache has no LRU of its own. Copies are ordinary core replicas,
+with a score floor (default 0.5) that the organizer will not demote
+below. Only real capacity pressure in the core reclaims them, and they
+are the first thing reclaimed.</p>
+<div class="callout">
+  <p><strong>Tradeoffs.</strong> A remote-owned put costs one extra local
+  write. A miss costs a remote read, a local write and a registration
+  round trip. Partial writes to blobs with no existing copy are cached only
+  when they are next read. On multi-node clusters, batched puts are not
+  mirrored into the cache, because batches carry no origin
+  registration.</p>
+</div>
+
+<h2 id="indexer">Indexer: semantic search</h2>
+<p>The indexer owns the core's semantic-search operation. Before it
+existed, every search re-read and re-tokenized every candidate blob.</p>
+<ul>
+  <li><strong>A forward index.</strong> Each container keeps, for each
+  blob it owns, a map of term frequencies and a document length. It is not
+  an inverted index. Each query computes BM25 statistics over the documents
+  that match its tag and blob name filters, so the matching documents must
+  be visited anyway. What the index removes is reading and tokenizing
+  them.</li>
+  <li><strong>Asynchronous indexing.</strong> A successful mutation
+  enqueues its key in a coalescing pending set, so a hot blob overwritten
+  many times is re-tokenized once. A sweep, every 100 ms by default,
+  re-reads current bytes and updates the index. The first write to an
+  unseen tag schedules a one-time backfill of its existing blobs.</li>
+  <li><strong>Read-your-writes search.</strong> A search drains the pending
+  set first, filters by tag and blob regular expressions, and scores with
+  BM25. The broadcast results are merged into a global top-<em>k</em>.</li>
+  <li><strong>Durable but derived.</strong> With an index log configured,
+  the index is kept as a snapshot plus a log, and restored on restart
+  without rescanning storage. An explicit reindex scan repairs anything
+  missed in a crash window.</li>
+</ul>
+<div class="callout">
+  <p><strong>Measured.</strong> Indexing synchronously on the put path cut
+  1 MiB put throughput from 8.1 GB/s to 347 MB/s. Asynchronous indexing
+  restored it to 3.64 GB/s, and 4 KiB puts reached 31.7k IOPS against
+  38.2k with no indexer. The remaining gap is the sweep cost under
+  sustained overwrites.</p>
+  <p><strong>Limits.</strong> Matching is lexical (BM25 over alphanumeric
+  tokens), with no embeddings. Each shard computes term statistics over its
+  own slice, so merged scores only approximate a global BM25. The index is
+  held entirely in memory.</p>
+</div>
+
+<h2 id="compressor">Compressor: the encoding layer</h2>
+<p>The compressor encodes data on the way down and decodes it on the way
+up. It is <strong>off by default</strong>, both in the build and in the
+shipped configuration.</p>
+<ul>
+  <li><strong>Which writes are compressed.</strong> Whole-blob writes with
+  a codec requested. Partial writes, replica writes and puts with no
+  codec pass through raw.</li>
+  <li><strong>Stored format.</strong> A small header (codec, preset,
+  original and compressed sizes) followed by the codec output.</li>
+  <li><strong>Kept only if worthwhile.</strong> The compressed form must
+  save at least an eighth, otherwise the data is stored raw. Weakly
+  compressible pages, such as FP8 tensors at 93% of their raw size, had
+  doubled runtime.</li>
+  <li><strong>Marked in the core.</strong> A persistent transform flag
+  records that the blob is compressed, so every layer knows the stored
+  form differs from the logical one.</li>
+  <li><strong>Codecs.</strong> Lossless CPU codecs (zstd, lz4, zlib, bzip2,
+  lzma, snappy, blosc2), lossy scientific codecs (SZ3, ZFP, FPZIP) and GPU
+  codecs (nvCOMP family, cuSZ, ndzip, a SYCL ZFP).</li>
+</ul>
+<p><strong>Reads.</strong> A read of a compressed blob fetches the whole
+stored blob, decompresses it once, and copies out the requested ranges.
+Small random reads of compressed data therefore pay for a full decode. The
+cache layer above offsets this by keeping a raw copy near the reader.</p>
+<p><strong>Dynamic codec selection.</strong> A feature-based predictor
+scores a few candidate codecs on samples of the data (entropy, deviation,
+smoothness) and picks either the best ratio or the fastest end-to-end
+time for the target tier. It is opt-in through a dedicated client and
+should be treated as experimental. Pinning a specific codec is the
+supported path.</p>
+
+<h2 id="stream">Stream: sizes and ordered appends</h2>
+<p>Stream is not an interposer. It is a pool of its own that turns a tag
+into a byte stream, and it is the filesystem's source of truth for file
+sizes. It owns three things:</p>
+<ul>
+  <li><strong>The page layout:</strong> 1 MiB page blobs named by page
+  index.</li>
+  <li><strong>The authoritative logical size</strong> of each stream. It
+  changes by raise-only updates from writes, reservations from synchronous
+  appends, explicit sets from truncates, and drops.</li>
+  <li><strong>A cross-node append pipeline</strong>, described below.</li>
+</ul>
+<p>Each stream has a <em>home</em> container (for files, the inode's
+home).</p>
+
+<h3>Deferred appends</h3>
+<ol>
+  <li><strong>Stage.</strong> The origin node stamps the append with a
+  per-node monotonic clock and a counter, and writes the bytes as a
+  self-describing staged blob through the replication layer. Once that put
+  returns, a crash cannot lose the append, and the writer is
+  acknowledged.</li>
+  <li><strong>Ship.</strong> Every millisecond, queued appends are grouped
+  by stream and shipped in chunks of up to 16 MiB to the stream's live
+  home. A failed shipment is retried ahead of newer appends, so retries
+  never reorder.</li>
+  <li><strong>Merge.</strong> The home removes duplicates, sorts by
+  (clock, origin, counter), reserves the tail, logs the plan, and copies
+  the bytes into page blobs. The plan stays open until every copy
+  succeeds.</li>
+</ol>
+<p>The result is a deterministic total order: exact within one writer,
+timestamp order across writers. Truncates and drops wait for an
+in-progress merge, so they are ordered after it and never interleave with
+it.</p>
+<p><strong>Durability.</strong> Sizes and plans are kept in a record log,
+fsynced at least every 5 s and on file fsync. After a restart, staged
+appends are re-queued and interrupted plans finished. Restored sizes are
+held until the filesystem confirms them, so a truncate made elsewhere
+during failover is not undone by replaying old plans at stale
+offsets.</p>
+<div class="callout">
+  <p><strong>Tradeoffs.</strong> Every append is written twice (once
+  staged, once merged), in exchange for low-latency, crash-safe
+  acknowledgement on the origin. Each stream's home serializes its merges,
+  so a single very hot stream is limited by one node. Without a
+  <code>log_path</code>, sizes are not persisted across restarts.</p>
+</div>
+
+<h2 id="checkpoint">Checkpoint: lazy copies through fault handlers</h2>
+<p>The core lets a tag register a <em>fault handler</em>: a pool that is
+asked to produce a blob when a read (or put) finds it missing. The
+checkpoint ChiMod is such a handler. A "copy" of a dataset is therefore a
+new tag whose handler points at the source. The first access to each blob
+copies the whole source blob into the new tag and serves the read from
+it.</p>
+<ul>
+  <li>A lazy copy takes about 0.4 ms regardless of size. A forced eager
+  copy takes about 9.5 ms for 64 MiB and about 148 ms for 1 GiB.</li>
+  <li>It is <strong>copy-on-first-access from the live source, not a
+  point-in-time snapshot</strong>. A blob first touched after the source
+  changes gets the new bytes. Use the eager mode when a true snapshot
+  matters.</li>
+  <li>Handler registrations are not persisted, so a lazy copy should be
+  materialized before relying on it across a restart. Concurrent first
+  accesses to the same blob are not serialized.</li>
+</ul>
+<p>Its main user is the GPU vector's copy operation. This is a young
+component.</p>
+
+<h2 id="experimental">Experimental components</h2>
+<table>
+  <tr><th>Component</th><th>Idea</th><th>Status</th></tr>
+  <tr><td>UVM (GPU virtual memory)</td><td>Reserve a huge GPU virtual range and back pages on demand. Pages are evicted to pinned host memory (or to the CTE) and restored when touched.</td><td>Prototype. The caller must touch pages explicitly, there is no eviction policy, and the CTE backing is not yet wired in.</td></tr>
+  <tr><td>LMCache backend</td><td>Store LLM KV-cache records as CTE blobs: hashed keys, a self-describing record, deferred vectored puts, and batches for small records.</td><td>The most developed of the LLM hooks. Each hit costs three gets.</td></tr>
+  <tr><td>llama.cpp KV and weight paging</td><td>Prefix-KV offload, and layer-by-layer weight paging over UVM.</td><td>Prototypes. They depend on an out-of-tree llama.cpp fork.</td></tr>
+  <tr><td>Python bindings</td><td>The core client API, with async futures and the GIL released around every call.</td><td>Maintained. Other ChiMods are reached by pointing the core client at their pool, for example the indexer for search.</td></tr>
+</table>
+
+<h2 id="tradeoffs">Tradeoffs at a glance</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>Features as stackable interposers</td><td class="good">Pay only for what you compose. Each layer can be tested in isolation, and clients need no changes.</td><td class="cost">Each layer adds a forwarding hop, and the stack's order is part of its correctness.</td></tr>
+  <tr><td>Write-through cache with owner invalidation</td><td class="good">No dirty data outside the authoritative path. Readers never see stale copies.</td><td class="cost">Extra local writes, and coherence messages to the owner.</td></tr>
+  <tr><td>Synchronous remote copies that tolerate failures</td><td class="good">Durable on ack in the common case, and available while degraded.</td><td class="cost">No quorum: degraded writes keep fewer copies and are not re-replicated.</td></tr>
+  <tr><td>Asynchronous indexing</td><td class="good">Puts run near native speed.</td><td class="cost">A search pays the backlog drain, and the index is memory-resident.</td></tr>
+  <tr><td>Whole-blob compression</td><td class="good">Simple and codec-agnostic, with a strong ratio.</td><td class="cost">Partial reads decode the whole blob, and partial writes are stored raw.</td></tr>
+  <tr><td>Stage-then-merge appends</td><td class="good">Crash-safe appends from any node, in a deterministic order.</td><td class="cost">Bytes are written twice, and merging is serialized per stream.</td></tr>
+</table>

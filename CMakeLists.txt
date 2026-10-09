@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 2.3.0 LANGUAGES C CXX)
+project(iowarp-core VERSION 2.3.1 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # MSVC-like front end detection
@@ -2396,6 +2396,12 @@ if(TARGET clio_cte_cache_client)
 endif()
 if(TARGET clio_cte_replication_client)
   list(APPEND PIP_LIB_TARGETS clio_cte_replication_client clio_cte_replication_runtime)
+endif()
+# Indexer chimod (#905): the default config composes it into the filesystem
+# chain (cache -> indexer -> replication), so without it the wheel's
+# `clio_run start` fails to create pool 564.0 and the runtime exits (#1240).
+if(TARGET clio_cte_indexer_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_indexer_client clio_cte_indexer_runtime)
 endif()
 # Filesystem chimod: NEEDED by the clio_cte_fuse adapter binary that ships
 # in the wheel when CLIO_CTE_ENABLE_FUSE_ADAPTER is ON (#899).

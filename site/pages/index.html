@@ -1,0 +1,222 @@
+<!--
+title: CLIO Core: a context filesystem for scientific data
+description: CLIO Core mounts tiered RAM, NVMe and disk storage as an ordinary filesystem, then lets you search what you stored from Python. Open source, part of the Clio ecosystem.
+layout: landing
+-->
+<section class="hero page" aria-labelledby="hero-title">
+  <div class="hero-copy">
+    <a class="release" href="https://github.com/iowarp/clio-core">Open source <span aria-hidden="true">/</span> BSD 3-Clause <span aria-hidden="true">↗</span></a>
+    <h1 id="hero-title">A context filesystem<br><em>for scientific data.</em></h1>
+    <p class="lede">CLIO Core turns the RAM, NVMe and disks in your machines into one tiered store, then mounts it as a normal directory. Applications read and write files without changes. You search what they wrote from Python.</p>
+    <p class="eyebrow">Try it today</p>
+    <div class="installer-command"><code><span class="p" aria-hidden="true">$</span>pip install iowarp-core</code><button class="copy" type="button" hidden data-copy="pip install iowarp-core" aria-label="Copy the install command">Copy</button></div>
+    <div class="actions">
+      <a class="btn" href="/docs/basic-usage.html">Mount your first filesystem <span aria-hidden="true">→</span></a>
+      <a class="text-link" href="/docs/installation.html">Conda, Docker, Spack, source <span aria-hidden="true">→</span></a>
+    </div>
+  </div>
+  <div class="hero-visual" aria-hidden="true">
+    <svg viewBox="0 0 400 400" focusable="false">
+      <defs>
+        <mask id="hero-tiers" maskUnits="userSpaceOnUse" x="0" y="0" width="400" height="400">
+          <rect width="400" height="400" fill="#fff"/>
+          <rect x="0" y="132.5" width="400" height="18.75" fill="#000"/>
+          <rect x="0" y="248.75" width="400" height="18.75" fill="#000"/>
+        </mask>
+      </defs>
+      <circle class="orbit" cx="200" cy="200" r="196"/>
+      <path class="tier-band" d="M314.9 103.6 A150 150 0 1 0 314.9 296.4" mask="url(#hero-tiers)"/>
+      <rect class="blob" x="165.6" y="165.6" width="68.8" height="68.8" rx="8"/>
+      <rect class="page-blob" x="191" y="191" width="18" height="18" rx="2"/>
+      <text class="tier-label" x="330" y="96">RAM · score 1.0</text>
+      <text class="tier-label" x="330" y="314">Disk · score 0.2</text>
+      <text class="tier-label" x="8" y="204" text-anchor="start" transform="rotate(-90 14 200)">NVMe · score 0.9</text>
+    </svg>
+  </div>
+</section>
+
+<div class="chapters page">
+  <section class="chapter-row reveal" id="mount" aria-labelledby="mount-title">
+    <div class="section-heading">
+      <p class="eyebrow"><span class="chapter">01 /</span> Mount</p>
+      <h2 id="mount-title">Mount it like<br><em>any other directory.</em></h2>
+      <p>Start the runtime, then mount the filesystem with <code>clio_cte_fuse</code>. Copy files in with <code>cp</code>, open them from a notebook, or point a simulation at the mount. Writes go straight through, so a file's size is exact as soon as <code>write()</code> returns. Linux, macOS and Windows each use their native FUSE driver.</p>
+      <a class="text-link" href="/tutorials/fuse-linux.html">FUSE tutorials for each platform <span aria-hidden="true">→</span></a>
+    </div>
+    <div>
+<pre data-label="Linux">
+$ clio_run start &
+$ mkdir -p ~/clio-mnt
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
+$ cp -r ./results ~/clio-mnt/
+$ ls ~/clio-mnt/results
+</pre>
+      <dl class="notes">
+        <div><dt>Linux</dt><dd>libfuse3. Included in the pip wheel.</dd></div>
+        <div><dt>Windows</dt><dd>WinFsp, mounted as a drive letter such as <code>Z:</code>. Included in the pip wheel.</dd></div>
+        <div><dt>macOS</dt><dd>macFUSE, or FSKit on macOS 15.4 and newer. Build from source.</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <section class="chapter-row reveal" id="compose" aria-labelledby="compose-title">
+    <div class="section-heading">
+      <p class="eyebrow"><span class="chapter">02 /</span> Compose</p>
+      <h2 id="compose-title">Compose the storage<br><em>you already have.</em></h2>
+      <p>A short YAML file lists your storage tiers. Each tier gets a capacity and a score from 0 to 1. New data lands on the fastest tier with room. Data you stop touching moves down to slower, larger tiers. A replica on a persistent tier keeps your files across restarts.</p>
+      <a class="text-link" href="/tutorials/compose.html">Compose RAM, NVMe and SSD tiers <span aria-hidden="true">→</span></a>
+    </div>
+    <ol class="tier-stack" aria-label="Example tier stack">
+      <li><span class="tier-name">ram::hot</span><span class="tier-desc">DRAM, for the working set</span><span class="tier-type">score 1.0</span></li>
+      <li><span class="tier-name">/mnt/nvme</span><span class="tier-desc">Local NVMe, for staged data</span><span class="tier-type">score 0.9</span></li>
+      <li><span class="tier-name">/mnt/ssd</span><span class="tier-desc">SATA SSD, as a persistent copy</span><span class="tier-type">score 0.5</span></li>
+      <li><span class="tier-name">/mnt/hdd</span><span class="tier-desc">Disk, for capacity</span><span class="tier-type">score 0.2</span></li>
+      <li><span class="tier-name">s3:// · gs://</span><span class="tier-desc">Object stores: import from them, or use a bucket as a tier</span><span class="tier-type">optional</span></li>
+    </ol>
+  </section>
+
+  <section class="chapter-row reveal" id="query" aria-labelledby="query-title">
+    <div class="section-heading">
+      <p class="eyebrow"><span class="chapter">03 /</span> Query</p>
+      <h2 id="query-title">Ask for files<br><em>by what they say.</em></h2>
+      <p>The default setup indexes what you write. From Python you can search by keyword relevance (BM25) or by name pattern. You get back the files that match, ranked, and read them without going through the mount.</p>
+      <a class="text-link" href="/tutorials/python-semantic-query.html">Query files from Python <span aria-hidden="true">→</span></a>
+    </div>
+<pre data-label="python">
+import os
+os.environ["CLIO_WITH_RUNTIME"] = "0"   # attach to clio_run start
+os.environ["CLIO_CTE_POOL"] = "564.0"   # search lives in the indexer
+import clio_cte_core_ext as cte
+
+cte.clio_init(cte.RuntimeMode.kClient, False)
+cte.initialize_cte("", cte.PoolQuery.Dynamic())
+client = cte.get_cte_client()
+
+paths = {}
+for p in client.TagQuery(".*notes/.*", 0):
+    t = cte.Tag(p).GetTagId()
+    paths[(t.major_, t.minor_)] = p
+
+for h in client.SemanticSearch(tag_regex=".*notes/.*", blob_regex="[0-9]+",
+                               query_text="sea ice extent anomaly", k=5):
+    if h.score > 0:
+        print(round(h.score, 2), paths[(h.tag_id.major_, h.tag_id.minor_)])
+</pre>
+  </section>
+
+  <section class="chapter-row reveal" id="observe" aria-labelledby="observe-title">
+    <div class="section-heading">
+      <p class="eyebrow"><span class="chapter">04 /</span> Observe</p>
+      <h2 id="observe-title">Watch it work<br><em>in the dashboard.</em></h2>
+      <p>Every runtime serves a web dashboard on <code>127.0.0.1:8080</code>. It shows the nodes in your cluster, the load on each worker thread, and every storage tier's free space and traffic. You can add or remove pools there too, with no separate process to install.</p>
+      <a class="text-link" href="/tutorials/dashboard.html">Navigate the dashboard <span aria-hidden="true">→</span></a>
+    </div>
+    <dl class="notes">
+      <div><dt>Cluster</dt><dd>One card per node, with CPU and memory meters and a task summary.</dd></div>
+      <div><dt>Pools</dt><dd>Every module on this node. Open the CTE pool to see each tier's score, free space and bytes moved.</dd></div>
+      <div><dt>Config</dt><dd>Key settings the daemon actually came up with, and every REST endpoint it serves.</dd></div>
+    </dl>
+  </section>
+
+  <section class="chapter-row reveal" id="agents" aria-labelledby="agents-title">
+    <div class="section-heading">
+      <p class="eyebrow"><span class="chapter">05 /</span> Agents</p>
+      <h2 id="agents-title">Bring your AI<br><em>to your data.</em></h2>
+      <p>CLIO Core is the data layer of the Clio family. Clio Agent and Clio Coder are IOWarp's agents for science: one manages and analyzes data, the other writes scientific software. Anything they write through the mount is stored, tiered and indexed like the rest of your files.</p>
+      <a class="text-link" href="/tutorials/python-semantic-query.html">Query that data from Python <span aria-hidden="true">→</span></a>
+    </div>
+    <div class="ecosystem stacked">
+      <a href="https://clio.iowarp.ai"><img src="/assets/brand/clio-agent-mark.svg" width="48" height="48" alt=""><div><h3>Clio Agent</h3><p>A science agent for AI-driven data management, analysis and interactive results.</p></div></a>
+      <a href="https://coder.iowarp.ai"><img src="/assets/brand/clio-coder-mark.webp" width="48" height="48" alt=""><div><h3>Clio Coder</h3><p>A coding agent for scientific software, in the terminal or on the desktop.</p></div></a>
+    </div>
+  </section>
+
+  <section class="chapter-row reveal" id="install" aria-labelledby="install-title">
+    <div class="section-heading">
+      <p class="eyebrow"><span class="chapter">06 /</span> Install</p>
+      <h2 id="install-title">Install the way<br><em>your site works.</em></h2>
+      <p>The pip wheel runs on Linux, Windows and Apple Silicon Macs with Python 3.10 to 3.13. HPC sites can use Spack. Containers can use the Docker image. Build from source for GPUs, MPI, HDF5 or ADIOS2.</p>
+      <a class="text-link" href="/docs/installation.html">Full installation guide <span aria-hidden="true">→</span></a>
+    </div>
+    <div class="tabs" data-label="Install method">
+      <section class="tab-panel" data-tab="pip"><p class="tab-title">pip</p>
+<pre data-label="shell">
+$ pip install iowarp-core
+$ python -c "import iowarp_core; print(iowarp_core.get_version())"
+</pre></section>
+      <section class="tab-panel" data-tab="conda"><p class="tab-title">conda</p>
+<pre data-label="shell">
+$ conda create -n iowarp -c iowarp -c conda-forge iowarp-core
+$ conda activate iowarp
+</pre></section>
+      <section class="tab-panel" data-tab="Docker"><p class="tab-title">Docker</p>
+<pre data-label="shell">
+$ docker run -d -p 9413:9413 --memory=8g --name iowarp \
+    iowarp/deploy-cpu:latest clio_run start
+</pre></section>
+      <section class="tab-panel" data-tab="Spack"><p class="tab-title">Spack</p>
+<pre data-label="shell">
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ spack repo add clio-core/installers/spack
+$ spack install iowarp +fuse
+</pre></section>
+      <section class="tab-panel" data-tab="Source"><p class="tab-title">Source</p>
+<pre data-label="shell">
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ cd clio-core
+$ cmake --preset release-fuse
+$ cmake --build build -j"$(nproc)" && sudo cmake --install build
+</pre></section>
+    </div>
+  </section>
+
+  <section class="chapter-row reveal" id="stack" aria-labelledby="stack-title">
+    <div class="section-heading">
+      <p class="eyebrow"><span class="chapter">07 /</span> Under the hood</p>
+      <h2 id="stack-title">Five engines,<br><em>one runtime.</em></h2>
+      <p>The filesystem sits on a stack you can also use directly. Each layer has its own C++ and Python interfaces. The Design section explains how they fit together and which tradeoffs they make for speed and reliability.</p>
+      <a class="text-link" href="/design/index.html">Read the design <span aria-hidden="true">→</span></a>
+    </div>
+    <div class="card-list single">
+      <a href="/design/runtime.html"><span class="feature-index">Runtime</span><h3>CLIO Runtime</h3><p>Runs modules as coroutine tasks on a few worker threads per node, over shared memory, TCP or Unix sockets.</p></a>
+      <a href="/design/cte-core.html"><span class="feature-index">CTE</span><h3>Context Transfer Engine</h3><p>Tiered tag and blob storage with placement, replication, caching and an index. The filesystem is built on it.</p></a>
+      <a href="/design/adapters.html"><span class="feature-index">Adapters</span><h3>FUSE, POSIX, HDF5, ADIOS2, MPI-IO</h3><p>Ways in for unmodified applications: a mount, preloaded interceptors, or I/O library plugins.</p></a>
+      <a href="/docs/concepts.html"><span class="feature-index">CAE · CEE</span><h3>Assimilation and exploration</h3><p>Import data from files, HDF5, S3 or Google Cloud Storage, then bundle, query and retrieve it.</p></a>
+      <a href="/develop/index.html"><span class="feature-index">Develop</span><h3>Your own data operators</h3><p>Write a module that observes, transforms or routes data on its way to storage, build it outside the tree, and insert it into the chain.</p></a>
+      <a href="/design/runtime.html"><span class="feature-index">CTP</span><h3>Transport primitives</h3><p>Shared-memory data structures, allocators and networking, with CUDA and ROCm support.</p></a>
+    </div>
+  </section>
+
+  <section class="chapter-row reveal faq" id="questions" aria-labelledby="faq-title">
+    <div class="section-heading">
+      <p class="eyebrow"><span class="chapter">08 /</span> Questions</p>
+      <h2 id="faq-title">Common questions.</h2>
+    </div>
+    <div>
+      <details><summary>Do my applications need to change?</summary><p>No. Through the FUSE mount, CLIO Core looks like a local directory. Applications that use HDF5, ADIOS2 or MPI-IO can also use a plugin instead of the mount for lower overhead.</p></details>
+      <details><summary>Does my data survive a restart?</summary><p>Yes, with the default configuration. Every write is copied to a persistent disk tier and recorded in a metadata log under <code>~/.clio</code>. <code>clio_run start</code> recovers from that log. RAM-only setups are volatile by design.</p></details>
+      <details><summary>Can I use Amazon S3 or Google Cloud Storage?</summary><p>Yes, in two ways. The assimilation engine imports <code>s3://</code> and <code>gs://</code> objects into the filesystem. A build with the cloud options enabled can also use a bucket as a storage tier. See the <a href="/tutorials/cloud-storage.html">cloud storage tutorial</a> for what each one supports.</p></details>
+      <details><summary>Does it scale past one machine?</summary><p>Yes. Runtimes on several nodes form a cluster from a hostfile. Each tier can place data on neighboring nodes, and the filesystem namespace has no central metadata server.</p></details>
+      <details><summary>How mature is the project?</summary><p>CLIO Core is under active development. The filesystem, the runtime and the Python bindings run in CI on Linux, macOS and Windows. <a href="https://github.com/iowarp/clio-core/issues">Report an issue</a> if something does not work.</p></details>
+    </div>
+  </section>
+</div>
+
+<section class="page eco-section" id="ecosystem" aria-labelledby="eco-title">
+  <p class="eyebrow">The Clio ecosystem</p>
+  <h2 id="eco-title">Storage, agents and code,<br><em>from one team.</em></h2>
+  <div class="ecosystem">
+    <a href="https://clio.iowarp.ai"><img src="/assets/brand/clio-agent-mark.svg" width="48" height="48" alt="Clio Agent owl mark"><div><h3>Clio Agent</h3><p>Ask questions of your data and get interactive analyses back.</p></div></a>
+    <a href="https://coder.iowarp.ai"><img src="/assets/brand/clio-coder-mark.webp" width="48" height="48" alt="Clio ring mark"><div><h3>Clio Coder</h3><p>Explain, change and verify scientific codebases with the models you choose.</p></div></a>
+    <a href="https://iowarp.ai"><img src="/assets/brand/iowarp-mark.webp" width="48" height="48" alt="IOWarp lattice mark"><div><h3>IOWarp</h3><p>The platform that CLIO Core and the Clio applications belong to.</p></div></a>
+  </div>
+</section>
+
+<section class="finale page" aria-labelledby="finale-title">
+  <img src="/assets/brand/clio-core-mark.svg" width="88" height="88" alt="">
+  <h2 id="finale-title">Mount it on a machine<br><em>you already have.</em></h2>
+  <div class="actions">
+    <a class="btn" href="/docs/basic-usage.html">Start with basic usage <span aria-hidden="true">→</span></a>
+    <a class="btn ghost" href="https://github.com/iowarp/clio-core">View the source <span aria-hidden="true">↗</span></a>
+  </div>
+</section>

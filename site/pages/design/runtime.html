@@ -1,0 +1,254 @@
+<!--
+title: Runtime and block devices
+heading: Runtime and block devices
+description: The CLIO runtime foundations under the CTE: tasks, transports, workers, pools and routing, and the block-device module.
+eyebrow: Design
+lede: Everything in the storage stack runs as tasks inside the CLIO runtime: one process per node that hosts modules (ChiMods) and executes their operations as coroutines on a small pool of worker threads. This page covers the parts of the runtime that most affect the storage stack's performance and reliability, and the block-device module that every storage tier sits on.
+-->
+<h2 id="tasks">Tasks and coroutines</h2>
+<p>Every operation (a put, a directory insert, a block write) is a
+<strong>task</strong>. A task names a pool, a method and a routing query,
+and carries input fields, output fields and optional bulk data
+buffers.</p>
+<ul>
+  <li><strong>Tasks are serialized, not shared.</strong> A task lives in
+  the submitting process's private memory. To cross into the runtime, its
+  input fields are serialized into a buffer that is copied through a
+  shared-memory ring or sent over a socket. The runtime rebuilds the task
+  on its side, and serializes only the output fields on the way back.
+  Bulk buffers that already live in shared memory travel as pointers, with
+  no copy. Bulk data in private memory is copied once.</li>
+  <li><strong>Handlers are coroutines.</strong> A handler can await other
+  tasks (for example, the CTE awaiting block-device writes) without
+  blocking its worker thread. This is what makes nested operations
+  possible, such as a pool's creation awaiting the creation of the device
+  pools beneath it. Two cooperative primitives exist: await a subtask, or
+  yield for a while.</li>
+  <li><strong>Lifetime is reference-counted.</strong> A future holds a
+  reference to its task, so tasks are freed when the last holder lets
+  go.</li>
+</ul>
+
+<h2 id="transports">Getting a request into the runtime</h2>
+<p>A client process reaches the runtime over one of three transports,
+chosen automatically unless <code>CLIO_IPC_MODE</code> overrides the
+choice:</p>
+<table>
+  <tr><th>Mode</th><th>How it works</th><th>Relative cost</th></tr>
+  <tr><td><strong>Shared memory</strong></td><td>The client attaches the runtime's segments, serializes each request into one of several inbound rings (sharded by thread, which keeps each thread's requests in order), and receives replies on its own response ring. Bulk data in the client's shared-memory segment is passed by pointer.</td><td>Fastest. Chosen first when the runtime's segment exists.</td></tr>
+  <tr><td><strong>Unix socket</strong></td><td>Serialized requests over a local socket; bulk bytes are sent inline.</td><td>About 5× slower than shared memory. Used on the same machine when shared memory is unavailable.</td></tr>
+  <tr><td><strong>TCP</strong></td><td>ZeroMQ sockets, with the runtime dialing back to the client for replies; bulk bytes are sent inline.</td><td>About 190× slower than shared memory. Works across machines and containers.</td></tr>
+</table>
+<p>Workers drain their own inbound shard as part of their main loop, so
+there is no dedicated receive thread on the hot path. Code already running
+inside the runtime skips serialization entirely and hands the task over
+directly.</p>
+<h3>Dead clients and dead runtimes</h3>
+<ul>
+  <li><strong>The runtime survives dead clients.</strong> Shared-memory
+  rings check whether the other side's process is still alive and skip
+  transfers that stall. TCP replies to an unreachable client are retried
+  briefly, then dropped. The number of reply connections the runtime keeps
+  is bounded.</li>
+  <li><strong>Clients survive a dead runtime.</strong> A heartbeat detects
+  the loss, waits for the runtime to come back (or fails over to another
+  node, if configured), reconnects and resends.</li>
+  <li><strong>Dead clients' memory is reclaimed late.</strong> The
+  shared-memory segments of clients that died are freed only when the
+  runtime next starts.</li>
+</ul>
+
+<h2 id="workers">Workers and scheduling</h2>
+<p>The runtime starts a fixed number of worker threads (four by default)
+and assigns them roles:</p>
+<ul>
+  <li>a scheduler and housekeeping worker;</li>
+  <li>a network-send worker and a network-receive worker, so outbound
+  back-pressure cannot starve inbound replies;</li>
+  <li>a GPU-queue worker;</li>
+  <li>I/O workers in cost classes (quick, medium, heavy).</li>
+</ul>
+<p>Tasks are mapped by predicted cost:</p>
+<ul>
+  <li>Large I/O is spread round-robin across I/O workers.</li>
+  <li>Cheap tasks run inline on the worker that spawned them, if it is not
+  busy.</li>
+  <li>Everything else goes to the least-loaded worker in its cost
+  class.</li>
+</ul>
+<p>Predictions come from per-module models that learn from observed
+run times.</p>
+<p>A coroutine that yields is parked in a blocked queue, bucketed by how
+long it wants to wait, and resumed on the same worker. Completions of
+subtasks wake their parent directly through an event queue. A monitor
+detects a worker stuck on one task for over a second and moves that
+worker's queue, together with its parked coroutines, to a freshly spawned
+worker. It also grows a cost class whose workers are all saturated, and
+retires idle extra workers.</p>
+<div class="callout warn">
+  <p><strong>Tradeoff: a small default worker count.</strong> With four
+  threads, one worker handles all storage computation and I/O, and the
+  GPU queue shares the scheduler worker. Elastic workers soften stalls,
+  but throughput-oriented deployments should raise
+  <code>num_threads</code>. The LMCache integration, for example, measured
+  +35% going from four to six.</p>
+</div>
+
+<h2 id="network">Cross-node traffic</h2>
+<p>Remote requests and replies are sent by ordinary periodic tasks of the
+admin module, running on the network-send worker. Each tick does the
+following:</p>
+<ol>
+  <li>Drains a latency lane of small messages completely.</li>
+  <li>Alternates requests and replies from a bulk lane, up to an 8 MiB
+  budget.</li>
+</ol>
+<p>Probes and acknowledgements therefore never queue behind megabyte
+puts. The price is that bulk bandwidth per node is bounded by the tick
+rate. Replies travel on per-request connections, so a small
+acknowledgement does not wait behind a large frame on a shared one.</p>
+<h3>Failures</h3>
+<ul>
+  <li><strong>Restarted peers.</strong> Every message carries the sender's
+  incarnation number. When a peer restarts, requests in flight to its old
+  incarnation fail promptly and are retried.</li>
+  <li><strong>Silent peers.</strong> Peers with requests outstanding for
+  too long, or that have gone quiet, are probed. Silence for 30 seconds
+  marks them dead. A node whose own probe scan ran late re-arms instead of
+  blaming others.</li>
+  <li><strong>Gossip failure detection is off by default.</strong> A
+  SWIM-style detector exists but is disabled: at 256 nodes, wide
+  collective operations starved its probes and healthy nodes were declared
+  dead. A dead peer therefore produces failed requests, after the timeout,
+  or immediately in fail-fast mode. It does not produce automatic
+  container migration. Data availability across node loss is handled by
+  <a href="chain.html#replication">replication</a>.</li>
+</ul>
+
+<h2 id="pools">Pools, containers and routing</h2>
+<p>A <strong>pool</strong> is a named instance of a module spread across
+the cluster. A <strong>container</strong> is that pool's instance on one
+node.</p>
+<ul>
+  <li><strong>Container ID equals node ID.</strong> The number of
+  containers is fixed by the hostfile, not by how many nodes are currently
+  alive. That keeps hashing stable even while nodes come and go.</li>
+  <li><strong>Pool queries choose where a task runs:</strong>
+    <ul>
+      <li><em>Local</em>: this node.</li>
+      <li><em>Direct</em>: one container, by ID or by hash.</li>
+      <li><em>Range</em> or <em>Broadcast</em>: many containers.</li>
+      <li><em>Dynamic</em>: the module decides per task. The CTE, for
+      example, routes each blob to its owner.</li>
+    </ul>
+  </li>
+  <li><strong>Interposition works at this level.</strong> Interposer
+  modules override the routing decision too; the cache, for example,
+  routes to the submitter's own node. That is how routing and layering
+  compose.</li>
+</ul>
+<p>Pools defined in the configuration's <em>compose</em> list are created
+at startup, in order. Each pool must come after the pool it forwards
+to.</p>
+
+<h2 id="bdev">The block-device module</h2>
+<p>Every storage tier is a block-device (bdev) pool. Its interface is
+deliberately minimal:</p>
+<ul>
+  <li>allocate blocks of a given total size;</li>
+  <li>write or read a list of blocks;</li>
+  <li>free blocks;</li>
+  <li>report statistics;</li>
+  <li>sync.</li>
+</ul>
+<p>The bdev keeps <em>no per-object metadata</em>: recording which blocks
+belong to which blob is the CTE's job. For a local device, the CTE calls
+the allocator directly instead of sending a task, because the round trip
+was the dominant cost of small writes.</p>
+
+<table>
+  <tr><th>Backend</th><th>Storage</th><th>Persistence</th></tr>
+  <tr><td><code>ram</code></td><td>One sparse shared-memory mapping, readable directly by clients. This is what makes zero-IPC reads possible.</td><td>Volatile</td></tr>
+  <tr><td><code>pinned</code>, <code>hbm</code></td><td>Pinned host memory, or GPU device memory (a failed allocation is fatal; it never silently falls back to host memory)</td><td>Volatile</td></tr>
+  <tr><td><code>file</code></td><td>A backing file, using io_uring, libaio, POSIX AIO or IOCP depending on platform</td><td>Persistent, with an allocation log</td></tr>
+  <tr><td><code>s3</code>, <code>gcs</code></td><td>Object storage</td><td>Persistent data; allocator state not persisted</td></tr>
+  <tr><td><code>noop</code></td><td>Discards data</td><td>For benchmarking</td></tr>
+</table>
+
+<h3>The allocator</h3>
+<p>The allocator is a bump-pointer heap plus segregated free lists
+(512 B to 1 MB size classes), one set per worker. A worker can steal from
+other workers' lists. Once the heap is exhausted, a large request is
+assembled from several free blocks, so one allocation can return several
+extents.</p>
+<p>The allocator never compacts or coalesces, and the heap pointer only
+moves forward. Long-running churn therefore fragments free space into
+blocks of 1 MB or less, and the CTE handles the resulting multi-block
+layouts. Memory tiers align to 512 bytes; 4 KiB alignment had inflated
+small blobs 3.6×. File tiers align to 4 KiB, so direct I/O can be used
+when buffers allow.</p>
+
+<h3>File tiers</h3>
+<ul>
+  <li><strong>Lazy growth.</strong> A new backing file starts at one
+  growth unit (1 GiB by default) and is extended on demand as allocations
+  reach its end.</li>
+  <li><strong>Space reservation.</strong> On filesystems with native
+  <code>fallocate</code>, each growth step reserves real blocks, so a full
+  disk fails at allocation time rather than as an I/O error on a later
+  write. On filesystems without it (some network, FUSE and virtualized
+  mounts), the file is kept sparse. The C library's emulation of the
+  reservation writes every byte, which once stalled pool creation for
+  155 seconds on a Docker Desktop bind mount, so it is not used. The
+  tradeoff: on those filesystems, a full disk can surface as a write-time
+  error.</li>
+  <li><strong>Honest capacity.</strong> Reported free space is capped by
+  what the host filesystem actually has free, so the CTE does not place
+  data on a device configured larger than its disk. Several tiers sharing
+  one disk each see the whole free space, so the figure is an upper
+  bound.</li>
+  <li><strong>I/O is per block.</strong> Within one task, blocks are
+  written one at a time. Concurrency comes from many tasks running at
+  once.</li>
+</ul>
+
+<h3>The allocation log</h3>
+<p>A file tier's allocator survives restarts through an append-only
+allocation log.</p>
+<ul>
+  <li><strong>Allocations</strong> are logged before blocks are handed
+  out.</li>
+  <li><strong>Frees</strong> are logged before space is reused.</li>
+  <li><strong>Flushing and sync.</strong> Records are flushed to the OS on
+  every call and fsynced every 50 ms by a background thread.</li>
+  <li><strong>Compaction</strong> happens when dead records outnumber live
+  ones two to one, by writing a temporary file and renaming it into
+  place.</li>
+  <li><strong>On restart,</strong> live extents are replayed. Every gap
+  below the highest live byte becomes free space, and the heap resumes
+  after the last live byte.</li>
+</ul>
+<p>A crash can leak space, but never hand out live bytes twice. Before
+this log was restored, a restarted heap began again at zero and overwrote
+live data.</p>
+<p><strong>Sync</strong> fdatasyncs the data file first, then the log, so
+a crash can leave synced bytes the log does not yet mention (the CTE's own
+log covers them), but never a logged block whose bytes were lost.</p>
+
+<h2 id="registry">Durable pool registry</h2>
+<p>Each node keeps a small pool log of the durable pools it hosts and
+their parameters, fsynced on every change. <code>clio_run start</code>
+replays it in creation order, so a node comes back with the same storage
+tiers and module stack it had. <code>--fresh</code> discards it along with
+all other persisted state.</p>
+
+<h2 id="tradeoffs">Tradeoffs at a glance</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>Serialized tasks over shared-memory rings</td><td class="good">Process isolation with near-memcpy latency. Bulk data in shared memory moves by pointer.</td><td class="cost">Fixed-size rings. A client with very many outstanding requests can wait on ring space.</td></tr>
+  <tr><td>Coroutines on few workers</td><td class="good">Thousands of in-flight operations without thread overhead.</td><td class="cost">A handler that blocks a thread stalls its worker until the monitor rescues it.</td></tr>
+  <tr><td>Geometry fixed by the hostfile</td><td class="good">Stable hashing, no split-brain resharding.</td><td class="cost">Adding nodes means a new hostfile and a restart, and dead nodes' slots remain.</td></tr>
+  <tr><td>Conservative failure detection</td><td class="good">No false "dead" verdicts under load.</td><td class="cost">Slow detection (around 30 s) and no automatic container recovery.</td></tr>
+  <tr><td>Bump heap and free lists, no compaction</td><td class="good">Constant-time allocation with a simple, crash-safe log.</td><td class="cost">Fragmentation under churn; blobs become multi-extent.</td></tr>
+  <tr><td>Sparse files where fallocate is missing</td><td class="good">No multi-minute zero-fills on network or virtual filesystems.</td><td class="cost">A full disk may surface as a write error instead of an allocation error.</td></tr>
+</table>

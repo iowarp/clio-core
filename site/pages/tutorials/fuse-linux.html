@@ -1,0 +1,80 @@
+<!--
+title: FUSE on Linux
+heading: Mount on <em>Linux.</em>
+description: Mount the CLIO Core context filesystem on Linux with libfuse3, share it with other users, tune coherence, and run it in containers.
+eyebrow: Tutorial · Mount
+lede: On Linux, <code>clio_cte_fuse</code> uses libfuse3. It is included in the pip wheel, so you only install the system FUSE package and mount.
+facts: Time | 10 minutes ; Driver | libfuse3 ; In the pip wheel | Yes
+-->
+<h2>1. Install FUSE 3</h2>
+<div class="tabs" data-label="Distribution">
+  <section class="tab-panel" data-tab="Debian, Ubuntu"><p class="tab-title">Debian, Ubuntu</p>
+<pre data-label="shell">
+$ sudo apt install fuse3 libfuse3-3
+</pre></section>
+  <section class="tab-panel" data-tab="Fedora, RHEL"><p class="tab-title">Fedora, RHEL</p>
+<pre data-label="shell">
+$ sudo dnf install fuse3 fuse3-libs
+</pre></section>
+  <section class="tab-panel" data-tab="Source build"><p class="tab-title">Source build</p>
+<pre data-label="shell">
+$ sudo apt install libfuse3-dev fuse3     # or: sudo dnf install fuse3-devel fuse3
+$ cmake --preset release-fuse
+$ cmake --build build -j"$(nproc)" && sudo cmake --install build
+</pre></section>
+</div>
+
+<h2>2. Start the runtime and mount</h2>
+<pre data-label="shell">
+$ clio_run start &
+$ mkdir -p ~/clio-mnt
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
+</pre>
+<p>The daemon creates or binds the filesystem pool on its own; no extra compose step is needed. <code>CLIO_WITH_RUNTIME=0</code> attaches it to your runtime, so Python clients and other mounts see the same files.</p>
+<p>Every argument after the mountpoint goes to libfuse:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Option</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>-f</code></td><td>Stay in the foreground. Leave it off to daemonize.</td></tr>
+    <tr><td><code>-d</code></td><td>Print every FUSE request. Useful for debugging.</td></tr>
+    <tr><td><code>-s</code></td><td>Single-threaded mode.</td></tr>
+    <tr><td><code>-o allow_other</code></td><td>Let other users open the mount. Needs <code>user_allow_other</code> in <code>/etc/fuse.conf</code>.</td></tr>
+  </tbody>
+</table></div>
+
+<h2>3. Try it</h2>
+<pre data-label="shell">
+$ cp -r ~/datasets/era5-sample ~/clio-mnt/
+$ du -sh ~/clio-mnt/era5-sample
+$ python -c "import numpy as np; print(np.fromfile('$HOME/clio-mnt/era5-sample/t2m.bin', 'f4')[:5])"
+$ git clone https://github.com/iowarp/clio-core.git ~/clio-mnt/src   # git works too
+</pre>
+
+<h2>4. Unmount</h2>
+<pre data-label="shell">
+$ fusermount3 -u ~/clio-mnt
+</pre>
+<p>Files stay in CLIO Core; mount again to see them. Unmount with <code>fusermount3 -u</code> rather than Ctrl+C: the daemon does not exit on Ctrl+C.</p>
+
+<h2>Coherence and caching</h2>
+<p>Writes always go straight through to the runtime, so sizes are exact after <code>write()</code>. Two settings trade coherence for speed:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Variable</th><th>Default</th><th>When to change it</th></tr></thead>
+  <tbody>
+    <tr><td><code>CLIO_FUSE_ATTR_CACHE_S</code></td><td>1.0 on one node, 0 on several</td><td>Set to <code>0</code> when several processes on one node modify the same files and must see each other's metadata at once.</td></tr>
+    <tr><td><code>CLIO_FUSE_WRITEBACK</code></td><td>off</td><td>Set to <code>1</code> for a single writer doing many small writes. Unsafe with several writers.</td></tr>
+  </tbody>
+</table></div>
+
+<h2>Containers and Apptainer</h2>
+<p>In Docker, the container needs the FUSE device and the capability to mount:</p>
+<pre data-label="shell">
+$ docker run --device /dev/fuse --cap-add SYS_ADMIN ...
+</pre>
+
+<h2>If something goes wrong</h2>
+<ul>
+  <li><strong><code>fuse: device not found</code></strong>: the kernel module is not loaded. Run <code>sudo modprobe fuse</code>.</li>
+  <li><strong><code>Transport endpoint is not connected</code></strong>: the daemon exited and left a stale mount. Run <code>fusermount3 -u ~/clio-mnt</code> and mount again.</li>
+  <li><strong>Python does not see the files</strong>: the daemon started its own runtime. Mount again with <code>CLIO_WITH_RUNTIME=0</code>.</li>
+</ul>

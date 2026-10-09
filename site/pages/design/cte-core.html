@@ -1,0 +1,313 @@
+<!--
+title: CTE core design
+heading: CTE core: data model and data path
+description: Design of the Context Transfer Engine core ChiMod: data model, distribution, the put/get data path, and concurrency.
+eyebrow: Design
+lede: The core ChiMod is the storage engine at the bottom of the Context Transfer Engine. It names data, decides which device holds each byte, and keeps that mapping consistent under concurrency and failure. The layers above it (replication, caching, indexing, compression, streams, the filesystem) add policy on top. None of them bypass the core.
+-->
+<h2 id="model">Data model</h2>
+<p>The core stores <strong>blobs</strong> inside <strong>tags</strong>, on
+<strong>storage targets</strong>.</p>
+
+<h3>Tags</h3>
+<p>A tag is a named container, roughly a bucket or a file. Its identifier
+combines the node that created it with a per-node counter, so tags can be
+created anywhere without a central allocator. Part of the counter space is
+reserved for client-minted identifiers, which lets batch creators (such as
+the filesystem's create path) propose IDs without a round trip. A tag
+records:</p>
+<ul>
+  <li>its canonical name and total size;</li>
+  <li>POSIX-style access, modify and change times;</li>
+  <li>a list of aliases (hard links);</li>
+  <li>an optional <em>fault handler</em>: another pool that is asked to
+  produce a blob when a read misses. Lazy copies and checkpoints use
+  this.</li>
+</ul>
+<p>Hierarchical names are stored as chains. Each child tag is named relative
+to its parent's identifier, not by its full path, so renaming a parent
+rewrites one name rather than a whole subtree. A trigram index over tag
+names serves regular-expression tag queries without scanning every
+name.</p>
+
+<h3>Blobs</h3>
+<p>A blob is addressed by <em>(tag, name)</em>. Its metadata is a list of
+<strong>blocks</strong>, each a <em>(target, offset, logical size, physical
+capacity)</em> extent on one storage device. A blob has no fixed maximum
+size and no fixed chunk size: it is as many blocks, on as many devices, as
+its size needs. Alongside the layout, a blob carries:</p>
+<table>
+  <tr><th>Field</th><th>Purpose</th></tr>
+  <tr><td>Score (0–1)</td><td>How "hot" the blob is. It selects the tier during placement and drives reorganization.</td></tr>
+  <tr><td>Replica slots</td><td>Independent block lists for extra copies: persistent replicas, node-local cache copies, and shadow copies kept for a failed owner. Each has its own score and flags.</td></tr>
+  <tr><td>Version (last-modified stamp)</td><td>Used as the content version for conditional puts ("put only if still at version <em>v</em>") and for cache-coherence registration.</td></tr>
+  <tr><td>Generation</td><td>Lets a reader wait for a writer to publish a specific generation (producer/consumer pipelines).</td></tr>
+  <tr><td>Transform flags</td><td>Sticky marks such as "stored compressed", set by layers above and persisted in the log.</td></tr>
+  <tr><td>Droppable flag</td><td>Fixed when the blob is created. Marks the blob as a cache that may be evicted to make room. Authoritative data is never droppable.</td></tr>
+  <tr><td>Concurrency words</td><td>A write token, a reader-pin counter, a placement generation and a content sequence number (see <a href="#concurrency">Concurrency</a>).</td></tr>
+  <tr><td>Lost-bytes marker</td><td>After a restart, the range that lived on volatile memory and is gone. Reads into it fail with an I/O error instead of returning zeros.</td></tr>
+</table>
+<p>Each block records both its logical size and its physical capacity. The
+slack in the last allocation can then absorb a later append in place,
+without a new allocation, which makes small sequential appends cheap.</p>
+
+<h3>Storage targets</h3>
+<p>A target is a block-device pool (RAM, HBM, pinned host memory, file, S3,
+GCS, or a no-op device) registered with the core. Each target has a
+<strong>score</strong> that orders the tiers, a persistence level (volatile
+or durable), a capacity, measured performance figures, and a predicted
+device lifetime. The score can be set in the configuration. If it is not,
+the core derives it from measured bandwidth on a logarithmic scale.</p>
+<p>Free space is tracked in two places. An authoritative counter is debited
+and credited lock-free on the data path. A mirror inside the vector that the
+placement engine reads is refreshed periodically. Placement always re-reads
+the authoritative counter first: a stale mirror once made a full tier look
+permanently full, even after its blobs were deleted.</p>
+
+<figure class="diagram">
+  <svg viewBox="0 0 860 300" role="img" aria-label="Tag, blob, block and target relationships">
+    <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box hl" x="20" y="30" width="200" height="110" rx="8"/>
+    <text class="title" x="36" y="56">Tag</text>
+    <text class="muted" x="36" y="78">name, aliases, times</text>
+    <text class="muted" x="36" y="96">size share (per container)</text>
+    <text class="muted" x="36" y="114">optional fault handler</text>
+    <rect class="box hl" x="290" y="20" width="240" height="140" rx="8"/>
+    <text class="title" x="306" y="46">Blob (tag, name)</text>
+    <text class="muted" x="306" y="68">score, version, generation</text>
+    <text class="muted" x="306" y="86">primary block list</text>
+    <text class="muted" x="306" y="104">replica slots (persistent / cache / shadow)</text>
+    <text class="muted" x="306" y="122">write token, reader pins</text>
+    <text class="muted" x="306" y="140">transform + droppable flags</text>
+    <path class="edge" d="M220,85 L288,85" marker-end="url(#ah)"/>
+    <text class="muted" x="232" y="76">many</text>
+    <rect class="box" x="290" y="200" width="110" height="70" rx="6"/>
+    <text x="304" y="224">Block</text>
+    <text class="muted" x="304" y="244">target, offset</text>
+    <text class="muted" x="304" y="260">size / capacity</text>
+    <rect class="box" x="420" y="200" width="110" height="70" rx="6"/>
+    <text x="434" y="224">Block</text>
+    <text class="muted" x="434" y="244">target, offset</text>
+    <text class="muted" x="434" y="260">size / capacity</text>
+    <path class="edge" d="M360,160 L345,198" marker-end="url(#ah)"/>
+    <path class="edge" d="M450,160 L475,198" marker-end="url(#ah)"/>
+    <rect class="box alt" x="610" y="20" width="230" height="64" rx="8"/>
+    <text class="title" x="626" y="46">Target: RAM (score 1.0)</text>
+    <text class="muted" x="626" y="66">volatile, node-local</text>
+    <rect class="box alt" x="610" y="110" width="230" height="64" rx="8"/>
+    <text class="title" x="626" y="136">Target: NVMe (score 0.6)</text>
+    <text class="muted" x="626" y="156">persistent</text>
+    <rect class="box alt" x="610" y="200" width="230" height="64" rx="8"/>
+    <text class="title" x="626" y="226">Target: file / S3 (score 0.2)</text>
+    <text class="muted" x="626" y="246">persistent, capacity tier</text>
+    <path class="edge" d="M400,230 L608,52" marker-end="url(#ah)"/>
+    <path class="edge" d="M530,236 L608,142" marker-end="url(#ah)"/>
+  </svg>
+  <figcaption>A blob's bytes can span several blocks on several tiers. The
+  blob's score picks the preferred tier, and capacity decides whether it
+  spills to others.</figcaption>
+</figure>
+
+<h2 id="distribution">Distribution across a cluster</h2>
+<p>The core runs one container per node, and there is no metadata
+server.</p>
+<ul>
+  <li><strong>Each blob has exactly one owner.</strong> The owner container
+  is chosen by hashing <em>(tag, blob name)</em> over the number of
+  containers. That container holds the blob's metadata and its primary
+  layout, and every operation on the blob (put, get, delete, reorganize,
+  truncate) is routed to it.</li>
+  <li><strong>Tag names hash to an owner too.</strong> Get-or-create of a
+  tag that is not already cached locally is routed to the container chosen
+  by the name's hash. That keeps tag creation race-free without a central
+  service.</li>
+  <li><strong>Tag sizes are distributed.</strong> A container that holds
+  some of a tag's blobs keeps a share of the tag's size. Asking for a tag's
+  size is a broadcast that sums the shares. Dead nodes are skipped rather
+  than waited on, so the answer can be low while a node is down.</li>
+  <li><strong>Queries are broadcasts.</strong> Tag queries, blob queries,
+  listing a tag's contents, semantic search and eviction fan out to every
+  container and merge the replies.</li>
+</ul>
+
+<h3>Where the bytes go: the neighborhood</h3>
+<p>The owner decides placement, but it does not have to use only its own
+devices. Each container registers its own targets plus those of the next
+<em>k−1</em> nodes in ring order (<code>targets.neighborhood</code>). Two
+rules constrain this:</p>
+<ul>
+  <li><strong>Memory tiers are always node-local.</strong> RAM, HBM and
+  pinned-memory tiers are never borrowed from a neighbor; only persistent
+  tiers span the neighborhood.</li>
+  <li><strong>Dead nodes' devices are filtered out</strong> before
+  placement.</li>
+</ul>
+<p>The shipped configuration uses a neighborhood of 1, so the owner writes
+only to its own node's devices and placement is entirely owner-local. A
+larger neighborhood pools persistent capacity across nodes, at the price
+of network hops on the data path.</p>
+
+<h3>Failover</h3>
+<p>When <code>targets.failover_to_successor</code> is on, requests for a
+dead owner's blobs are routed to the first live successor container. That
+successor holds a <em>shadow copy</em> written by the replication layer.
+Shadow copies are hidden from listings and size totals until their holder
+is actually standing in for the owner. The <a href="chain.html#replication">replication
+page</a> describes how changes are handed back when the owner returns.</p>
+
+<div class="callout">
+  <p><strong>Tradeoff: single owner per blob.</strong> One container
+  serializes every mutation of a blob, which makes coherence, versioning
+  and crash ordering simple to reason about. The cost is that one hot blob
+  cannot be written in parallel from many workers. Vectored puts,
+  client-side write coalescing (the "sieve"), the deferred-put pipeline
+  and optional worker-level batching all reduce how often that
+  serialization is hit, rather than remove it.</p>
+</div>
+
+<h2 id="client">The client side</h2>
+<p>Clients talk to the runtime through tasks (see
+<a href="runtime.html">Runtime</a>). The core client adds four
+mechanisms that keep most small operations off the critical path:</p>
+<table>
+  <tr><th>Mechanism</th><th>What it does</th><th>Why</th></tr>
+  <tr><td>Zero-IPC reads</td><td>When a blob's metadata is mirrored in shared memory and its bytes sit in the local RAM tier, the client copies them out directly, without a task. It validates the placement generation and content sequence number before and after the copy, and any doubt falls back to a normal request.</td><td>Hot reads cost a memory copy instead of a round trip (about 10 µs versus about 100 µs or more).</td></tr>
+  <tr><td>Deferred puts</td><td>A put is copied into shared-memory staging and returns. A process-wide registry tracks in-flight puts, applies back-pressure based on staging capacity, serves reads of pending bytes from staging (read-your-writes), and latches errors for the next flush.</td><td>Hides write latency the way a page cache does.</td></tr>
+  <tr><td>Write sieve</td><td>Coalesces small writes into 64 KiB pages (up to 16 per blob and 1024 overall) and ships each page when it fills or on a short timer.</td><td>Many 4 KiB writes become a few large puts.</td></tr>
+  <tr><td>Private-memory puts</td><td>Callers can put from ordinary process memory. The runtime copies once into shared memory, or not at all when the caller is inside the runtime.</td><td>Callers (including Python) never manage shared memory themselves.</td></tr>
+</table>
+<p>The shared-memory metadata mirror is a derived, best-effort copy. Its
+tables are sized once at startup (64k tags and 256k blobs by default), do
+not grow, and hold at most 16 blocks per blob. Anything larger or
+overflowing is served by a normal request, never treated as absent. The
+mirror reserves on the order of 100 MB up front.</p>
+
+<h2 id="put">The put path</h2>
+<p>A put that reaches the owner proceeds as follows:</p>
+<ol>
+  <li><strong>Validate and resolve the score.</strong> An unspecified score
+  keeps the existing blob's score. A brand-new blob defaults to 1.0, the
+  hottest tier. Vectored puts (several disjoint segments) are normalized
+  to their covering extent.</li>
+  <li><strong>Consult the fault handler</strong> if the blob is missing and
+  the tag has one, so lazily copied data is materialized before it is
+  overwritten.</li>
+  <li><strong>Create the blob if needed</strong> with insert-if-absent
+  semantics, so concurrent creators converge on one blob instead of one
+  silently replacing another.</li>
+  <li><strong>Acquire the blob's write token.</strong> This serializes all
+  layout and size changes to the blob.</li>
+  <li><strong>Check conditions.</strong> Put-if-absent and
+  put-if-version fail with distinct return codes when the condition does
+  not hold.</li>
+  <li><strong>Drain readers.</strong> In-flight readers of the blob are
+  allowed to finish, and the content sequence number is made odd for the
+  duration of the write. Without this, a concurrent reader could see half
+  old and half new bytes.</li>
+  <li><strong>Place.</strong> If the put grows the blob, the placement
+  engine allocates new space (see <a href="placement.html">Placement</a>).
+  A put that overwrites existing bytes skips placement entirely. If there
+  is no room, the put evicts <em>droppable</em> data on the local node and
+  retries once.</li>
+  <li><strong>Write.</strong> One asynchronous device write is issued per
+  touched block, and all of them are awaited together. Writes past the
+  current end of the blob zero-fill the gap, giving sparse-file
+  semantics.</li>
+  <li><strong>Log after the data.</strong> The new layout is recorded in
+  the write-ahead log <em>after</em> the bytes are on the device. Logging
+  first could, after a crash, point the blob at a recycled extent that
+  still holds someone else's old bytes.</li>
+  <li><strong>Roll back on failure.</strong> If anything fails after
+  placement, the blob is shrunk back to its previous size and the rolled-back
+  layout is logged. Only growth can be undone: a failed overwrite inside
+  the old size leaves those bytes in whatever state the device reached.</li>
+  <li><strong>Publish and invalidate.</strong> The version is bumped,
+  statistics are updated, the shared-memory mirror is refreshed, and every
+  registered remote cache copy is invalidated <em>before</em> the
+  acknowledgement.</li>
+</ol>
+
+<h3>All-or-nothing placement</h3>
+<p>When a blob grows, all the new blocks, the reuse of slack in its last
+block and its new size are published as one step, with no suspension
+point in between. If any part of the allocation fails, the partial
+allocation is freed and the blob is restored exactly. No reader ever sees
+a blob that is longer than its blocks.</p>
+
+<h3>Startup and slow operations</h3>
+<p>A put that arrives before the core has finished registering its targets
+waits (up to two minutes by default) instead of failing. This covers
+clients that start before a large cluster has finished starting up. Any
+put that takes longer than two seconds logs a phase breakdown (token wait,
+placement, write), so slow paths can be diagnosed in production.</p>
+
+<h2 id="get">The get path</h2>
+<ul>
+  <li><strong>Generational reads</strong> wait, with back-off, until the
+  blob reaches the requested generation. The wait is bounded (two minutes
+  by default).</li>
+  <li><strong>Missing blobs</strong> go to the tag's fault handler if there
+  is one. Otherwise, on request, an empty blob is created.</li>
+  <li><strong>Reads never take the write token.</strong> They pin the blob,
+  re-check that it still exists under the pin, snapshot the layout and read
+  the blocks in parallel. Reads of the same blob proceed concurrently.
+  They wait only for operations that free extents, and for in-place
+  overwrites, both of which drain pins first.</li>
+  <li><strong>Lost data is an error, not zeros.</strong> A read that falls
+  into a range lost in a restart (for example, bytes that lived only in
+  RAM) fails with an I/O error code.</li>
+  <li><strong>The version is reported with the data.</strong> The version
+  is read before the layout snapshot. A racing write can therefore only
+  make a version-checked cache registration fail safely, never succeed
+  with stale data.</li>
+</ul>
+
+<h2 id="delete">Delete, truncate and links</h2>
+<p>Deleting a blob takes the write token and drains readers. It then does
+the following, in order:</p>
+<ol>
+  <li>Invalidates remote cache copies.</li>
+  <li>Folds replica blocks into the free list.</li>
+  <li>Withdraws the shared-memory mirror entry, <em>before</em> any block
+  is freed, so a zero-IPC reader can never copy from an extent that has
+  already been reused.</li>
+  <li>Frees the blocks and updates the tag's size share.</li>
+</ol>
+<p>Deleting a tag distinguishes three cases:</p>
+<ul>
+  <li><strong>Removing one alias</strong>, which leaves the tag in place.</li>
+  <li><strong>Removing the canonical name while aliases remain.</strong>
+  An alias is promoted to canonical, as in POSIX link semantics.</li>
+  <li><strong>A full recursive delete.</strong> This uses a striped
+  per-tag blob index so it does not scan every blob on the node, and it
+  prunes ancestors left empty.</li>
+</ul>
+<p>Truncation shares the resize path with replacing puts.</p>
+
+<h2 id="concurrency">Concurrency</h2>
+<p>Handlers are coroutines. A blob's tasks all land on its owner
+container, but the runtime's elastic scheduler can run them on different
+worker threads <em>at the same time</em>. The core therefore never relies
+on "no suspension point, therefore atomic" alone. It uses four explicit
+mechanisms:</p>
+<table>
+  <tr><th>Mechanism</th><th>Protects</th><th>Behavior</th></tr>
+  <tr><td>Per-blob write token</td><td>Every change to one blob's layout or size: put, resize, delete, reorganize, flush to persistent tier, snapshot.</td><td>Reentrant. Contenders poll with a cooperative yield (10 µs by default). That avoids lost wake-ups but gives no FIFO fairness.</td></tr>
+  <tr><td>Reader pins with a drain bit</td><td>Readers against operations that free extents or overwrite in place.</td><td>Readers never block writers. A writer that must exclude readers sets the drain bit, so new readers back off, and waits for the pin count to reach zero.</td></tr>
+  <tr><td>Placement generation and content sequence (seqlock)</td><td>Zero-IPC readers in other processes.</td><td>The placement generation is globally monotonic, so a delete followed by a re-create cannot be mistaken for the old blob. The sequence number is odd while a write is in progress. Readers compare both values before and after copying.</td></tr>
+  <tr><td>Self-locking maps holding shared pointers</td><td>Metadata lookups.</td><td>Each map operation locks internally. Erasing an entry never frees an object that another task is still using. Renames replace a tag's entry instead of mutating it in place.</td></tr>
+</table>
+<p>Operations on different blobs, reads of the same blob, and the per-block
+device I/O within one request all run in parallel. Mutations of one blob
+are serialized.</p>
+
+<h2 id="tradeoffs">Tradeoffs at a glance</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>Hash-owned blobs, no metadata server</td><td class="good">Linear metadata scaling, no single point of failure, no directory service hop.</td><td class="cost">Tag size and listing are broadcasts. Scans such as eviction and organizer rounds are O(blobs) per node.</td></tr>
+  <tr><td>Blobs are variable-length extent lists</td><td class="good">No fixed chunking, cheap appends into slack, a blob can straddle tiers.</td><td class="cost">The shared-memory mirror caps fast-path blobs at 16 blocks. Fragmented blobs fall back to requests.</td></tr>
+  <tr><td>Log after data, place before free</td><td class="good">No crash can make a blob reference another blob's old bytes.</td><td class="cost">Moves need transient double space, and log records trail the data slightly.</td></tr>
+  <tr><td>Readers never take the write token</td><td class="good">Read-heavy workloads scale with workers.</td><td class="cost">In-place writes must drain readers, and token contenders spin-yield with no fairness.</td></tr>
+  <tr><td>Rollback covers growth only</td><td class="good">Cheap, with no undo log of old bytes.</td><td class="cost">A failed in-place overwrite is not atomic, so callers that need atomic replace must write elsewhere and switch.</td></tr>
+  <tr><td>New blobs default to the hottest tier</td><td class="good">Fresh data is fast to read back.</td><td class="cost">The top tier fills first and later writes spill down. The organizer or explicit scores must demote cold data.</td></tr>
+</table>

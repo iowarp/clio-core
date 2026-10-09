@@ -1,0 +1,83 @@
+<!--
+title: Python API
+heading: The Python <em>modules.</em>
+description: Reference for clio_cte_core_ext (tags, blobs, regex, BM25 and temporal search) and clio_cee (bundle, query, retrieve, destroy).
+eyebrow: Docs · Reference
+lede: Two modules ship in the wheel. <code>clio_cte_core_ext</code> works directly with tags and blobs, including files in the mount. <code>clio_cee</code> is a higher-level API for bundling, querying and retrieving data.
+facts: Installed by | pip install iowarp-core ; Releases the GIL | During every RPC
+-->
+<h2>Connecting</h2>
+<p>Both modules attach to a running runtime when <code>CLIO_WITH_RUNTIME=0</code>. Set environment variables before the import, since the client reads them once when it connects.</p>
+<pre data-label="python">
+import os
+os.environ["CLIO_WITH_RUNTIME"] = "0"
+os.environ["CLIO_CTE_POOL"] = "564.0"    # needed for SemanticSearch
+
+import clio_cte_core_ext as cte
+cte.clio_init(cte.RuntimeMode.kClient, False)
+cte.initialize_cte("", cte.PoolQuery.Dynamic())
+client = cte.get_cte_client()
+</pre>
+
+<h2>clio_cte_core_ext</h2>
+
+<h3>Tag</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>Call</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td><code>Tag(name)</code></td><td>Opens the tag, creating it if needed. <code>Tag(tag_id)</code> wraps an existing id.</td></tr>
+    <tr><td><code>.PutBlob(name, data: bytes, off=0)</code></td><td>Writes bytes into a blob</td></tr>
+    <tr><td><code>.GetBlob(name, size, off=0)</code></td><td><code>bytes</code></td></tr>
+    <tr><td><code>.GetBlobSize(name)</code></td><td>Size in bytes</td></tr>
+    <tr><td><code>.GetBlobScore(name)</code></td><td>Placement score, 0.0 to 1.0</td></tr>
+    <tr><td><code>.GetContainedBlobs()</code></td><td>List of blob names</td></tr>
+    <tr><td><code>.ReorganizeBlob(name, score)</code></td><td>Moves a blob by giving it a new score</td></tr>
+    <tr><td><code>.GetTagId()</code></td><td><code>TagId</code> with <code>major_</code> and <code>minor_</code></td></tr>
+  </tbody>
+</table></div>
+
+<h3>Client</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>Call</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td><code>TagQuery(tag_regex, max_tags=0)</code></td><td>List of tag names</td></tr>
+    <tr><td><code>BlobQuery(tag_regex, blob_regex, max_blobs=0)</code></td><td>List of <code>(tag_name, blob_name)</code> pairs</td></tr>
+    <tr><td><code>SemanticSearch(tag_regex, blob_regex, query_text, k=10)</code></td><td>List of <code>SemanticSearchResult</code> (<code>tag_id</code>, <code>blob_name</code>, <code>score</code>), best first</td></tr>
+    <tr><td><code>TemporalSearch(tag_regex, blob_regex, time_begin=0, time_end=0, max_entries=0)</code></td><td>List of <code>TemporalSearchResult</code> (<code>tag_id</code>, <code>blob_name</code>, <code>last_modified</code>)</td></tr>
+    <tr><td><code>DelBlob(...)</code>, <code>PollTelemetryLog(...)</code></td><td>Delete a blob; read recent operations</td></tr>
+  </tbody>
+</table></div>
+<p>Regular expressions must match the whole name (<code>std::regex_match</code>), so use <code>.*part.*</code> to match a substring. <code>SemanticSearch</code> ranks every blob that matches both patterns, including blobs with no query word (score 0). For files in the mount, use <code>"[0-9]+"</code> as the blob pattern to search pages and skip each file's <code>~i</code> attribute blob.</p>
+<div class="callout warn">
+  <span class="callout-title">Time values are not Unix time yet</span>
+  <p><code>last_modified</code> currently comes from a steady clock that counts from boot, not from the Unix epoch, although the docstrings say epoch nanoseconds. A <code>time_begin</code> computed from <code>time.time()</code> matches nothing. Until this is fixed, treat <code>last_modified</code> as an ordering key within one run of the runtime, and do not filter by wall-clock time.</p>
+</div>
+<p>Every query also takes a <code>pool_query</code> argument: <code>PoolQuery.Broadcast()</code> (the default) asks every node, and <code>PoolQuery.Local()</code> asks only this one. Async versions return futures.</p>
+
+<h2>clio_cee</h2>
+<p>The Context Exploration Engine bundles data in, then queries and retrieves it. It suits documents you add from Python rather than files in the mount, because its query returns blob names only.</p>
+<pre data-label="python">
+import clio_cee as cee
+
+ctx = cee.ContextInterface()   # attaches to the running runtime
+ctx.context_bundle([
+    cee.AssimilationCtx(src="string::ice", dst="iowarp::climate_docs",
+                        format="string",
+                        src_data="Arctic sea ice extent fell to a record low."),
+    cee.AssimilationCtx(src="file::/data/run42/output.bin", dst="iowarp::run42",
+                        format="binary"),
+])
+names = ctx.context_query("climate_docs", ".*")     # ['ice']
+payload = ctx.context_retrieve("climate_docs", ".*", max_results=5)
+ctx.context_destroy(["climate_docs"])
+</pre>
+<div class="table-wrap"><table>
+  <thead><tr><th>Method</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>context_bundle(list[AssimilationCtx])</code></td><td>Imports each source into the destination tag. Returns 0 on success.</td></tr>
+    <tr><td><code>context_query(tag_re, blob_re, max_results=0, prompt="", time_begin=0, time_end=0)</code></td><td>List of blob names. A time bound selects temporal mode; else a <code>prompt</code> selects BM25 (top 10 if <code>max_results</code> is 0); else regex. BM25 over imported data needs imports routed through the indexer; see <a href="/tutorials/python-semantic-query.html#keyword-search-over-imported-data">keyword search over imported data</a>.</td></tr>
+    <tr><td><code>context_retrieve(tag_re, blob_re, max_results=1024, max_context_size=256 MiB, batch_size=32, prompt="", time_begin=0, time_end=0)</code></td><td>List of strings, each holding matching blobs packed back to back</td></tr>
+    <tr><td><code>context_destroy(list[str])</code></td><td>Deletes the named tags and their blobs</td></tr>
+  </tbody>
+</table></div>
+<p><code>AssimilationCtx(src, dst, format, depends_on="", range_off=0, range_size=0, src_token="", dst_token="")</code> describes one import. Sources use URL schemes: <code>file::</code> (format <code>binary</code>), <code>string::</code> (with <code>src_data</code>), <code>hdf5::</code> in builds with HDF5, <code>globus://</code> with Globus, and <code>s3://</code> or <code>gs://</code> in builds with the cloud options. Destinations are <code>iowarp::&lt;tag&gt;</code>.</p>
