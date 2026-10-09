@@ -33,15 +33,41 @@ def save(fig, out, name):
     fig.savefig(os.path.join(out, 'preview', name.replace('.pdf', '.png')), dpi=200)
     plt.close(fig)
 
-LABEL = {'raw_local': 'Local, raw', 'baseline': 'Local, raw', 's1': 'S1 compress@P',
-         's1_local_blosc': 'S1 compress@P', 'local_blosc': 'S1 compress@P',
-         's2': 'S2 compress@P, store@C', 'cons_raw': 'Consumer, raw', 'local_raw': 'Local, raw',
-         's3': 'S3 compress@C', 's3_cons_blosc': 'S3 compress@C', 'cons_blosc': 'S3 compress@C',
-         'auto': 'DTSchedule (auto)', 'full': 'DTSchedule (auto)', 'no_dag': 'DTSchedule w/o workflow knowledge'}
+LABEL = {'raw_local': 'Hermes (local, raw)', 'baseline': 'Hermes (local, raw)', 's1': 'DT-PP',
+         's1_local_blosc': 'DT-PP', 'local_blosc': 'DT-PP',
+         's2': 'DT-PC', 'cons_raw': 'DT-PC (raw)', 'local_raw': 'Hermes (local, raw)',
+         's3': 'DT-CC', 's3_cons_blosc': 'DT-CC', 'cons_blosc': 'DT-CC',
+         'auto': 'DT-AUTO', 'full': 'DT-AUTO', 'no_dag': 'DT-AUTO w/o DAG',
+         'hcompress': 'HCompress'}
 
 
-def load(root, exp):
-    """Valid runs of one experiment: {run: [result dict, ...]} (repetitions merged by run name)."""
+V2 = False  # --v2: use the re-runs after the 4 KiB padding / S1 score fixes (<exp>_v2)
+V3 = False  # --v3: additionally let <exp>_v3 runs (final build, screened exclusive nodes) replace same-named runs
+
+
+def resolve(root, exp):
+    """Experiment directory pattern to read: with --v2, <exp>_v2 replaces an experiment and
+    its older repetitions (<exp>_r*) when it exists."""
+    if not V2:
+        return exp
+    if exp == 'e5async_r*':
+        return 'e5async_v2'
+    if exp.endswith('_r*'):
+        return exp if not glob.glob(os.path.join(root, exp[:-3] + '_v2')) else None
+    return exp + '_v2' if glob.glob(os.path.join(root, exp + '_v2')) else exp
+
+
+def load(root, exp, allow_bad=False, newest=True):
+    """Valid runs of one experiment: {run: [result dict, ...]} (repetitions merged by run name).
+    With --v3, runs of <exp>_v3 replace the same-named runs of the resolved experiment.
+    allow_bad keeps runs whose consumer saw a few failed reads (reported on the console)."""
+    if V3 and newest and not exp.endswith('_r*') and not exp.endswith('_v3'):
+        out = load(root, exp, allow_bad, newest=False)
+        out.update(load(root, exp + '_v3', allow_bad))
+        return out
+    exp = resolve(root, exp) if not exp.endswith('_v3') else exp
+    if exp is None:
+        return {}
     out, skipped = {}, 0
     for e in sorted(glob.glob(os.path.join(root, exp))):
         for f in sorted(glob.glob(os.path.join(e, '*.json'))):
@@ -49,12 +75,22 @@ def load(root, exp):
                 d = json.load(fh)
             m = d.get('makespan') or {}
             bad = (m.get('consumer') or {}).get('bad', 0) or m.get('errors', 0) or 0
-            if m.get('status', 'ok') != 'ok' or bad or d.get('rc') or not m.get('total_ms'):
+            if bad and allow_bad and m.get('status', 'ok') == 'ok' and not d.get('rc') and m.get('total_ms'):
+                print(f"{exp}/{d['run']}: kept with {bad} failed reads")
+            elif m.get('status', 'ok') != 'ok' or bad or d.get('rc') or not m.get('total_ms'):
                 skipped += 1
                 continue
             out.setdefault(d['run'], []).append(d)
     if skipped:
         print(f'{exp}: skipped {skipped} invalid runs')
+    return out
+
+
+def reps(runs):
+    """Merge repetitions named <cfg>_r<k> into {cfg: [result, ...]}."""
+    out = {}
+    for k, v in runs.items():
+        out.setdefault(k.rsplit('_r', 1)[0] if '_r' in k and k.rsplit('_r', 1)[1].isdigit() else k, []).extend(v)
     return out
 
 
@@ -122,13 +158,30 @@ def fig_motivation_flip(root, out):
 def fig_e5_grid(root, out, rows=None, name='e5_grid.pdf', height=1.9):
     """Scenario ablation heatmap: rows = config, cols = (network, consumer load);
     cell = makespan / best config in that column."""
-    cols = [('40g', 'idle'), ('40g', 'cload'), ('1g', 'idle'), ('1g', 'cload')]
+    cols = [('40g', 'idle'), ('40g', 'cload'), ('40g', 'async')]
     rows = rows or ['raw_local', 's1', 's2', 's3', 'auto']
     data = {}
     for net, load_ in cols:
-        r = load(root, f'e5_{net}_{load_}')
-        for k, v in load(root, f'e5_{net}_{load_}_r*').items():  # repetitions
-            r.setdefault(k, []).extend(v)
+        if load_ == 'async':  # overlapped writes, idle consumer (Section "Where to compress")
+            r = {}
+            for k, v in load(root, 'e5async_r*').items():
+                r.setdefault(k, []).extend(v)
+            if V3:  # repetitions on the final build
+                for k, v in reps(load(root, 'e5async_v3')).items():
+                    r.setdefault(k, []).extend(v)
+            if V3 and reps(load(root, 'abl_async_v3')).get('full'):
+                r['auto'] = reps(load(root, 'abl_async_v3'))['full']
+            if V3:  # Hermes with overlapped writes and one consumer = the fan-out study's k=1
+                h = reps(load(root, 'fanout_v3', allow_bad=True)).get('hermes_k1')
+                if h:
+                    r['raw_local'] = h
+        else:
+            r = load(root, f'e5_{net}_{load_}')
+            for k, v in load(root, f'e5_{net}_{load_}_r*').items():  # repetitions
+                r.setdefault(k, []).extend(v)
+        r = reps(r)
+        if r.get('auto_wb'):  # blocking writes: DTSchedule with the writers-block hint
+            r['auto'] = r['auto_wb']
         data[(net, load_)] = {n: stat(r[n])[0] for n in rows if n in r}
     present = [c for c in cols if data[c]]
     if not present:
@@ -141,7 +194,11 @@ def fig_e5_grid(root, out, rows=None, name='e5_grid.pdf', height=1.9):
             if n in data[c]:
                 m[i, j] = data[c][n] / best
     fig, ax = plt.subplots(figsize=(COL_W, height))
-    ax.imshow(np.nan_to_num(m, nan=1.0), cmap='Blues', vmin=1.0, vmax=max(2.2, np.nanmax(m)), aspect='auto')
+    im = ax.imshow(np.nan_to_num(m, nan=1.0), cmap='Blues', vmin=1.0, vmax=max(2.2, np.nanmax(m)), aspect='auto')
+    cb = fig.colorbar(im, ax=ax, fraction=0.05, pad=0.03)
+    cb.set_label('makespan / best in column', fontsize=6.5)
+    cb.ax.tick_params(labelsize=6)
+    cb.outline.set_visible(False)
     for i in range(len(rows)):
         for j in range(len(present)):
             if not np.isnan(m[i, j]):
@@ -149,8 +206,9 @@ def fig_e5_grid(root, out, rows=None, name='e5_grid.pdf', height=1.9):
                 ax.text(j, i, f'{m[i, j]:.2f}x\n{s:.0f}s', ha='center', va='center', fontsize=6.5,
                         color='white' if m[i, j] > 1.6 else INK, fontweight='bold' if m[i, j] == 1.0 else None)
     ax.set_xticks(range(len(present)))
-    ax.set_xticklabels([f"{'40 GbE' if n == '40g' else '1 GbE'}\n{'idle C' if l == 'idle' else 'loaded C'}"
-                        for n, l in present], fontsize=7)
+    ax.set_xticklabels([{'idle': 'idle', 'cload': 'loaded', 'async': 'overlapped'}[l]
+                        for n, l in present], fontsize=6.5)
+    ax.set_xlabel('consumer idle / loaded; writes overlapped', fontsize=6.5)
     ax.set_yticks(range(len(rows))); ax.set_yticklabels([LABEL[n] for n in rows], fontsize=7)
     ax.grid(False)
     fig.tight_layout()
@@ -165,9 +223,9 @@ def fig_ablation(root, out, exp='e6', order=('baseline', 'no_placement', 'fixed_
     names = [n for n in order if n in runs]
     if not names:
         return
-    lab = labels or {'baseline': 'Local, raw (no DTSchedule policy)', 'no_placement': 'w/o placement (local)',
+    lab = labels or {'baseline': 'Hermes (local, raw)', 'no_placement': 'w/o placement (local)',
                      'fixed_ccm': 'zstd as the only codec', 'no_load': 'w/o load awareness',
-                     'no_dag': 'w/o workflow knowledge', 'full': 'DTSchedule (full)'}
+                     'no_dag': 'w/o workflow knowledge', 'full': 'DT-AUTO'}
     fig, ax = plt.subplots(figsize=(COL_W, 0.32 * len(names) + 0.5))
     bar_err(ax, names, runs)
     ax.set_yticklabels([lab.get(n, LABEL.get(n, n)) for n in names], fontsize=7)
@@ -178,13 +236,19 @@ def fig_ablation(root, out, exp='e6', order=('baseline', 'no_placement', 'fixed_
 
 def fig_workflows(root, out):
     """WfCommons recipes over the CTE API: makespan normalised to the local/raw baseline."""
-    recipes = ['montage', 'seismology', 'genome', 'epigenomics']
-    cfgs = ['baseline', 's1_local_blosc', 'cons_raw', 's3_cons_blosc', 'no_dag', 'full']
-    res = {r: load(root, f'wf_{r}') for r in recipes}
-    recipes = [r for r in recipes if res[r].get('baseline')]
+    recipes = ['montage', 'seismology', 'genome', 'epigenomics', 'blast', 'blastio', 'bwa', 'cycles', 'soykb', 'srasearch', 'rnaseq']
+    cfgs = ['baseline', 'hcompress', 's1_local_blosc', 'cons_raw', 's3_cons_blosc', 'full']
+    res = {r: (load(root, 'wf_blastio_v4') if r == 'blastio' else load(root, f'wf_{r}')) for r in recipes}
+    recipes = [r for r in recipes if all(res[r].get(c) for c in cfgs)]
+    # Left to right: by how much DT-AUTO beats the next best policy on that workflow.
+    def margin(r):
+        others = min(stat(res[r][c])[0] for c in cfgs if c != 'full')
+        return others / stat(res[r]['full'])[0]
+    recipes.sort(key=margin, reverse=True)
+    print('workflow order (next best / DT-AUTO):', [(r, round(margin(r), 2)) for r in recipes])
     if not recipes:
         return
-    fig, ax = plt.subplots(figsize=(2 * COL_W, 1.7))
+    fig, ax = plt.subplots(figsize=(2 * COL_W, 1.3))
     w = 0.8 / len(cfgs)
     for k, cfg in enumerate(cfgs):
         xs, ys = [], []
@@ -192,11 +256,16 @@ def fig_workflows(root, out):
             if cfg in res[r]:
                 xs.append(i + (k - (len(cfgs) - 1) / 2) * w)
                 ys.append(stat(res[r][cfg])[0] / stat(res[r]['baseline'])[0])
-        ax.bar(xs, ys, width=w * 0.92, color=C[k], label=LABEL.get(cfg, cfg))
+        col = {'baseline': C[0], 'hcompress': C[2], 's1_local_blosc': C[6], 'cons_raw': C[3],
+               's3_cons_blosc': C[4], 'full': C[1]}.get(cfg, C[k])
+        ax.bar(xs, ys, width=w * 0.92, color=col, label=LABEL.get(cfg, cfg))
     ax.axhline(1.0, color=INK2, lw=0.8)
     ax.set_xticks(range(len(recipes))); ax.set_xticklabels(recipes)
-    ax.set_ylabel('Makespan / local raw'); ax.set_yticks([0, 0.5, 1.0, 1.5])
-    ax.legend(ncol=3, fontsize=7, loc='upper left', bbox_to_anchor=(0, 1.32))
+    ax.set_ylabel('Makespan / Hermes'); ax.set_yticks([0, 0.5, 1.0, 1.5])
+    names = {'genome': '1000Gen.', 'epigenomics': 'Epigen.', 'blast': 'BLAST', 'blastio': 'BLAST (I/O)', 'bwa': 'BWA', 'soykb': 'SoyKB',
+             'srasearch': 'SRASearch', 'rnaseq': 'RNA-Seq'}
+    ax.set_xticklabels([names.get(r, r.capitalize()) for r in recipes], fontsize=6)
+    ax.legend(ncol=6, fontsize=6.5, loc='lower center', bbox_to_anchor=(0.5, 1.0), handlelength=1.2, columnspacing=1.0)
     ax.grid(axis='x', visible=False)
     fig.tight_layout(); save(fig, out, 'workflows.pdf')
     print('workflows.pdf', {r: {c: round(stat(res[r][c])[0], 1) for c in cfgs if c in res[r]} for r in recipes})
@@ -281,27 +350,32 @@ def fig_e10(root, out):
     cpu = g[['producer_cpu', 'consumer_cpu']].median()
     sc = d.groupby(['bin', 'chosen_scenario']).size().unstack(fill_value=0)
     sc = sc.div(sc.sum(axis=1), axis=0)
-    comp = g['chosen_lib'].apply(lambda s: (s != 'raw').mean())
-    fig, (a, b) = plt.subplots(2, 1, figsize=(COL_W, 2.4), sharex=True)
-    a.plot(cpu.index, cpu.producer_cpu, color=C[0], lw=1.5, label='producer CPU')
-    a.plot(cpu.index, cpu.consumer_cpu, color=C[1], lw=1.5, label='consumer CPU')
-    a.set_ylabel('CPU %'); a.set_ylim(0, 105); a.legend(fontsize=6.5, ncol=2, loc='lower left')
-    bottom = None
-    for k, s_ in enumerate(sorted(sc.columns)):
-        b.bar(sc.index, sc[s_], width=4.6, bottom=bottom, color=C[2 + k], label=f'S{int(s_)}')
-        bottom = sc[s_] if bottom is None else bottom + sc[s_]
-    b.plot(comp.index, comp, color=INK, lw=1.2, label='compressed')
-    b.set_ylabel('share of chunks'); b.set_xlabel('time since first write (s)')
-    b.legend(fontsize=6.5, ncol=4, loc='upper center', bbox_to_anchor=(0.5, 1.28))
+    z = d.chosen_lib != 'raw'
+    at_c = (z & (d.chosen_scenario == 3)).groupby(d['bin']).mean() * 100
+    at_p = (z & (d.chosen_scenario != 3)).groupby(d['bin']).mean() * 100
+    fig, (a, b) = plt.subplots(2, 1, figsize=(COL_W, 2.5), sharex=True,
+                               gridspec_kw={'height_ratios': [1, 1.15]})
     # Shade the injected-load window: bins where the consumer's CPU sample
     # stays above 70% (the 20-rank MPI job; the consumer alone stays below).
     hot = cpu.index[cpu.consumer_cpu >= 70]
-    if len(hot):
-        for ax in (a, b):
-            ax.axvspan(hot.min() - 2.5, hot.max() + 2.5, color='#d9d8d4', alpha=0.45, lw=0, zorder=0)
-        a.text((hot.min() + hot.max()) / 2, 8, 'consumer loaded', ha='center', fontsize=6.5, color=INK2)
     for ax in (a, b):
+        if len(hot):
+            ax.axvspan(hot.min() - 2.5, hot.max() + 2.5, color='#d9d8d4', alpha=0.5, lw=0, zorder=0)
         ax.grid(axis='x', visible=False)
+        ax.set_ylim(0, 105); ax.set_yticks([0, 50, 100])
+    a.plot(cpu.index, cpu.producer_cpu, color=C[0], lw=1.5)
+    a.plot(cpu.index, cpu.consumer_cpu, color=C[1], lw=1.5)
+    a.set_ylabel('CPU (%)')
+    # Direct labels instead of a legend box.
+    a.text(cpu.index.min(), 104, 'producer', color=C[0], fontsize=6.5, va='bottom')
+    a.text(cpu.index.min() + 22, 25, 'consumer', color=C[1], fontsize=6.5)
+    if len(hot):
+        a.text((hot.min() + hot.max()) / 2, 104, 'consumer loaded', ha='center', va='bottom',
+               fontsize=6.5, color=INK2)
+    b.plot(at_c.index, at_c, color=C[2], lw=1.5, marker='o', ms=2.5, label='at the consumer (DT-CC)')
+    b.plot(at_p.index, at_p, color=C[4], lw=1.5, marker='s', ms=2.5, label='at the producer (DT-PP/PC)')
+    b.set_ylabel('chunks\ncompressed (%)'); b.set_xlabel('time since first write (s)')
+    b.legend(fontsize=6.5, ncol=1, loc='upper left', handlelength=1.4)
     fig.tight_layout(); save(fig, out, 'e10_timeline.pdf')
     print('e10_timeline.pdf bins', len(cpu))
 
@@ -390,6 +464,8 @@ def fig_async(root, out):
             sync.setdefault(k, []).extend(v)
     for k, v in load(root, 'e5async_r*').items():
         asy.setdefault(k, []).extend(v)
+    if V3 and reps(load(root, 'abl_async_v3')).get('full'):
+        asy['auto'] = reps(load(root, 'abl_async_v3'))['full']
     names = [n for n in ('s1', 's2', 's3', 'auto') if n in sync and n in asy]
     if not names:
         return
@@ -403,7 +479,7 @@ def fig_async(root, out):
         ax.scatter(xs, comp, marker='_', s=120, color=INK, zorder=3, label='solver compute' if k else None)
         for x, y in zip(xs, ys):
             ax.text(x, y + 4, f'{y:.0f}', ha='center', fontsize=6.5)
-    short = {'s1': 'S1', 's2': 'S2', 's3': 'S3', 'auto': 'DTSchedule'}
+    short = {'s1': 'DT-PP', 's2': 'DT-PC', 's3': 'DT-CC', 'auto': 'DT-AUTO'}
     ax.set_xticks(range(len(names))); ax.set_xticklabels([short[n] for n in names], fontsize=6.5)
     ax.set_ylabel('Makespan (s)'); ax.grid(axis='x', visible=False)
     ax.set_ylim(0, max(stat(asy[n])[0] for n in names) * 1.12)
@@ -418,8 +494,8 @@ def fig_scaling(root, out, exp='scale'):
     signal) and DTSchedule, with 10/20/40 producer ranks (5/10/20 consumer ranks) on the same
     two nodes. Each rank writes 32 MB per step, so data grows with the rank count."""
     runs = load(root, exp)
-    sysn = [('hermes', 'Hermes (runtime, raw)', C[0]), ('hcompress', 'HCompress (size-only codec)', C[2]),
-            ('dtsched', 'DTSchedule', C[1])]
+    sysn = [('hermes', 'Hermes', C[0]), ('hcompress', 'HCompress', C[2]),
+            ('dtsched', 'DT-AUTO', C[1])]
     ranks = sorted({int(k.rsplit('_p', 1)[1]) for k in runs if '_p' in k})
     if not ranks:
         return
@@ -445,14 +521,120 @@ def fig_scaling(root, out, exp='scale'):
     print('scaling.pdf', {n: round(stat(v)[0], 1) for n, v in sorted(runs.items())})
 
 
+def fig_stacked(root, out):
+    """Stacked ablation: DTSchedule restricted to the writer's node (local), + workflow
+    knowledge (consumer placement and compression), + load awareness (full), in the
+    compute-heavy cell (overlapped writes) and with a loaded consumer. Bars: mean makespan,
+    whiskers: min-max; markers: the solver's compute time."""
+    cells = [('abl_async_v3', 'Producer computing\n(overlapped writes)'), ('abl_cload_v3', 'Consumer loaded\n(blocking writes)')]
+    steps = [('local', 'DT-AUTO, local only', C[0]), ('wf', '+ workflow knowledge', C[2]),
+             ('full', '+ load awareness (full)', C[1])]
+    data = {e: reps(load(root, e)) for e, _ in cells}
+    for e in data:  # blocking writes: the full system carries the writers_block hint
+        if data[e].get('full_wb'):
+            data[e]['full'] = data[e].pop('full_wb')
+    cells = [(e, l) for e, l in cells if data[e]]
+    if not cells:
+        return
+    fig, ax = plt.subplots(figsize=(COL_W, 1.8))
+    w = 0.27
+    for k, (key, lab, col) in enumerate(steps):
+        for i, (e, _) in enumerate(cells):
+            if key not in data[e]:
+                continue
+            mean, lo, hi, n = stat(data[e][key])
+            x = i + (k - 1) * w
+            ax.bar(x, mean, w * 0.92, color=col, label=lab if i == 0 else None)
+            if n > 1:
+                ax.plot([x, x], [lo, hi], color=INK, lw=0.8)
+            comp = statistics.mean(d['makespan']['producer']['compute_s'] for d in data[e][key])
+            ax.scatter([x], [comp], marker='_', s=90, color=INK, zorder=3,
+                       label='solver compute' if (i == 0 and k == 0) else None)
+            ax.text(x, 12, f'{mean:.0f}', ha='center', fontsize=6.5, color='white', fontweight='bold')
+    ax.set_xticks(range(len(cells))); ax.set_xticklabels([l for _, l in cells], fontsize=6.5)
+    ax.set_ylabel('Makespan (s)'); ax.grid(axis='x', visible=False)
+    ax.legend(fontsize=6, ncol=2, loc='lower center', bbox_to_anchor=(0.45, 1.0), handlelength=1.2, columnspacing=0.8)
+    fig.tight_layout(); save(fig, out, 'stacked_ablation.pdf')
+    print('stacked_ablation.pdf', {e: {k: (round(stat(v)[0], 1), stat(v)[3]) for k, v in data[e].items()} for e, _ in cells})
+
+
+def fig_fanout(root, out, exp='fanout_v3'):
+    """Hermes, HCompress and DTSchedule with one 40-rank producer node and k consumer nodes
+    (20 ranks each), each consumer reading every file (40 GbE, overlapped writes); DTSchedule
+    with fan-out replication as a fourth bar. Bars: mean; whiskers: min-max over runs."""
+    runs = reps(load(root, exp, allow_bad=True))
+    for k, v in reps(load(root, 'fanout_rep_v4')).items():  # rep_on_k<k>
+        runs[k.replace('rep_on_', 'rep_')] = v
+    sysn = [('hermes', 'Hermes', C[0]), ('hcompress', 'HCompress', C[2]),
+            ('dtsched', 'DT-AUTO', C[1]), ('rep', 'DT-AUTO + replication', C[3])]
+    ks = sorted({int(k.rsplit('_k', 1)[1]) for k in runs if '_k' in k})
+    if not ks:
+        return
+    fig, ax = plt.subplots(figsize=(COL_W, 1.8))
+    w = 0.2
+    for j, (key, lab, col) in enumerate(sysn):
+        for i, k in enumerate(ks):
+            n = f'{key}_k{k}'
+            if n not in runs:
+                continue
+            mean, lo, hi, cnt = stat(runs[n])
+            x = i + (j - 1.5) * w
+            ax.bar(x, mean, w * 0.92, color=col, label=lab if i == next(
+                ii for ii, kk in enumerate(ks) if f'{key}_k{kk}' in runs) else None)
+            if cnt > 1:
+                ax.plot([x, x], [lo, hi], color=INK, lw=0.8)
+            ax.text(x, hi + 8, f'{mean:.0f}', ha='center', fontsize=5.5)
+    ax.set_xticks(range(len(ks)))
+    ax.set_xticklabels([f'{k} consumer' + ('s' if k > 1 else '') for k in ks], fontsize=6.5)
+    ax.set_ylabel('Makespan (s)'); ax.grid(axis='x', visible=False)
+    ax.legend(fontsize=6, ncol=2, loc='lower center', bbox_to_anchor=(0.45, 1.0), handlelength=1.2, columnspacing=0.8)
+    fig.tight_layout(); save(fig, out, 'fanout.pdf')
+    print('fanout.pdf', {n: (round(stat(v)[0], 1), round(stat(v)[1]), round(stat(v)[2]), stat(v)[3]) for n, v in sorted(runs.items())})
+
+
+def fig_fanin(root, out, exp='fanin_seis_x4_v4'):
+    """Fan-in: Seismology's gather (4x data, 1/4 compute) on 2, 4 and 8 nodes, round-robin
+    tasks, under DTSchedule with the DAG, without consumer knowledge, writer-local, hash
+    placement and Hermes."""
+    runs = load(root, exp)
+    for n in (2, 4, 8):  # final build: fan-in degree counts the reducer itself
+        if runs.get(f'full2_n{n}'):
+            runs[f'full_n{n}'] = runs.pop(f'full2_n{n}')
+    runs.pop('fullfix_n8', None)
+    arms = [('hermes', 'Hermes', C[0]), ('owner', 'hash placement', C[6]), ('local', 'writer-local', C[3]),
+            ('none', 'DT-AUTO w/o DAG', C[2]), ('full', 'DT-AUTO', C[1])]
+    ns = sorted({int(k.rsplit('_n', 1)[1]) for k in runs if '_n' in k})
+    if not ns:
+        return
+    fig, ax = plt.subplots(figsize=(COL_W, 1.7))
+    w = 0.16
+    for j, (key, lab, col) in enumerate(arms):
+        xs, ys = [], []
+        for i, n in enumerate(ns):
+            if f'{key}_n{n}' in runs:
+                xs.append(i + (j - 2) * w); ys.append(stat(runs[f'{key}_n{n}'])[0])
+        ax.bar(xs, ys, w * 0.92, color=col, label=lab)
+        for x, y in zip(xs, ys):
+            ax.text(x, y + 3, f'{y:.0f}', ha='center', fontsize=5.5)
+    ax.set_xticks(range(len(ns))); ax.set_xticklabels([f'{n} nodes' for n in ns], fontsize=6.5)
+    ax.set_ylabel('Makespan (s)'); ax.grid(axis='x', visible=False)
+    ax.legend(fontsize=6, ncol=3, loc='lower center', bbox_to_anchor=(0.45, 1.0), handlelength=1.2, columnspacing=0.8)
+    fig.tight_layout(); save(fig, out, 'fanin.pdf')
+    print('fanin.pdf', {k: round(stat(v)[0], 1) for k, v in sorted(runs.items())})
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--root', default=os.path.expanduser('~/jarvis-runs/dtschedule-results'))
     ap.add_argument('--out', required=True)
+    ap.add_argument('--v2', action='store_true', help='use the <exp>_v2 re-runs where present')
+    ap.add_argument('--v3', action='store_true', help='also let <exp>_v3 runs replace same-named runs')
     ap.add_argument('names', nargs='*')
     a = ap.parse_args()
+    global V2, V3
+    V2, V3 = a.v2 or a.v3, a.v3
     os.makedirs(a.out, exist_ok=True)
-    figs = {'motivation': fig_motivation, 'flip': fig_motivation_flip, 'codecs': tab_codecs, 'prodcons': fig_prodcons, 'e5': fig_e5_grid, 'e6': fig_ablation, 'workflows': fig_workflows, 'e10': fig_e10, 'e8e9': fig_e8_e9, 'e7': fig_e7, 'async': fig_async, 'scaling': fig_scaling}
+    figs = {'motivation': fig_motivation, 'flip': fig_motivation_flip, 'codecs': tab_codecs, 'prodcons': fig_prodcons, 'e5': fig_e5_grid, 'e6': fig_ablation, 'workflows': fig_workflows, 'e10': fig_e10, 'e8e9': fig_e8_e9, 'e7': fig_e7, 'async': fig_async, 'scaling': fig_scaling, 'stacked': fig_stacked, 'fanout': fig_fanout, 'fanin': fig_fanin}
     for n in (a.names or figs):
         figs[n](a.root, a.out)
 

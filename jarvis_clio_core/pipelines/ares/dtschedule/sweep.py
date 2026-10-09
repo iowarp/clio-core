@@ -387,6 +387,41 @@ def copy_workload_logs(config, dest):
     return copied
 
 
+def load_and_run(jarvis, yaml_path, dry_run):
+    """``jarvis ppl load yaml`` then ``jarvis ppl run``, safe across concurrent sweeps.
+
+    ``ppl run`` runs jarvis's single global *current* pipeline, which ``ppl
+    load`` sets; two sweeps loading at nearly the same moment would run each
+    other's pipeline. A file lock spans the load and the start of the run
+    (``ppl run`` reads the current pipeline as it starts).
+
+    :param jarvis: jarvis executable.
+    :param yaml_path: Per-run pipeline YAML.
+    :param dry_run: Print the commands only.
+    :return: Exit code of the load, or of the run.
+    """
+    if dry_run:
+        rc = run_cmd([jarvis, 'ppl', 'load', 'yaml', yaml_path], True)
+        return rc or run_cmd([jarvis, 'ppl', 'run'], True)
+    import fcntl
+    lock = open(os.path.expanduser('~/.jarvis_sweep.lock'), 'w')
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        rc = run_cmd([jarvis, 'ppl', 'load', 'yaml', yaml_path], False)
+        if rc != 0:
+            return rc
+        print(' '.join([jarvis, 'ppl', 'run']), flush=True)
+        proc = subprocess.Popen([jarvis, 'ppl', 'run'])
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    return proc.wait()
+
+
 def execute_run(args, jarvis, base, run_name, overrides, out_dir):
     """Load, run and collect one sweep point.
 
@@ -406,9 +441,7 @@ def execute_run(args, jarvis, base, run_name, overrides, out_dir):
               'yaml': yaml_path, 'overrides': overrides,
               'started': time.strftime('%Y-%m-%dT%H:%M:%S')}
     t0 = time.time()
-    rc = run_cmd([jarvis, 'ppl', 'load', 'yaml', yaml_path], args.dry_run)
-    if rc == 0:
-        rc = run_cmd([jarvis, 'ppl', 'run'], args.dry_run)
+    rc = load_and_run(jarvis, yaml_path, args.dry_run)
     result['wall_s'] = round(time.time() - t0, 3)
     result['rc'] = rc
     result['status'] = 'dry-run' if args.dry_run else (

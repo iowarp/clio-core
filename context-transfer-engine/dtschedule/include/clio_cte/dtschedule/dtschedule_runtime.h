@@ -90,6 +90,16 @@ struct CompressOutcome {
  */
 constexpr size_t kStoreAlign = 4096;
 
+/** CPU percent below which codec work does not delay a node's job, and at
+ * which it delays it by the whole work time (see InterferenceMs). The
+ * overlapped-write run measured the upper end: on a node at 93-100% CPU,
+ * 75% of chunks compressed beside a 40-rank solver raised its compute time
+ * from 59 s to 200 s, about the codecs' total CPU time. */
+constexpr double kInterfLoPct = 60.0;
+constexpr double kInterfHiPct = 90.0;
+/** Attempts for a forwarded read that fails with the network-timeout code. */
+constexpr int kGetAttempts = 3;
+
 /** Where a put's data goes relative to the nodes involved (trace + cost). */
 struct Placement {
   uint32_t consumer_node = UINT32_MAX;  ///< tracked consumer, if any
@@ -108,6 +118,8 @@ struct Placement {
   double store_ms = -1.0;               ///< consumer-copy wall time
   bool dag_hit = false;                 ///< consumer came from the DAG spec
   int fanout = -1;                      ///< fan-out copies attempted (-1 = none)
+  double fanin = 1.0;                   ///< producer nodes writing to the consumer at once (DAG)
+  uint32_t store_node = UINT32_MAX;     ///< node that stored the chunk (placed puts)
   std::vector<uint32_t> dag_consumers;  ///< all consumer nodes from the DAG
   uint64_t reserve_bytes = 0;      ///< Bytes to reserve once the store node is known
 };
@@ -354,6 +366,11 @@ class Runtime : public clio::cte::core::CoreInterposer {
   uint64_t copies_pushed_ = 0;                ///< Successful fan-out copies pushed
   uint64_t copy_refused_ = 0;                 ///< Fan-out copies refused (rc != 0)
   uint64_t copy_skipped_local_ = 0;           ///< Fan-out copies skipped (local/owner)
+  uint64_t replica_reads_ = 0;                ///< Placed reads served by a local fan-out copy
+  uint64_t copy_skipped_slow_ = 0;            ///< Fan-out copies skipped: only the slowest tier had room
+  std::mutex dag_init_lock_;                  ///< Serializes re-resolving the DAG's host names
+  /** Re-resolve the DAG once the host table exists (it may be empty at compose time). */
+  void RefreshDag();
   std::mutex dag_lock_;                       ///< Protect DAG-related counters
 
   /**
@@ -637,6 +654,19 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::run::TaskResume PutAtNode(
       clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task,
       uint32_t node);
+  /** Push raw copies of a placed chunk to its other DAG consumers. */
+  clio::run::TaskResume PushPlacedFanoutCopies(const TagId &tag_id,
+                                               const std::string &blob_name,
+                                               ctp::ipc::ShmPtr<> raw_data,
+                                               uint64_t size, uint32_t primary,
+                                               Placement *place);
+  /** True when this node holds a fan-out copy of the tag's file (DAG). */
+  clio::run::TaskResume HoldsFanoutCopy(const TagId &tag_id, bool *holds);
+  /** Node a placed chunk was last stored on by this node (cache), or UINT32_MAX. */
+  uint32_t CachedLocation(const TagId &tag_id, const std::string &blob);
+  /** Whether a forwarded read that returned rc should be reissued. */
+  static bool RetryableGetRc(clio::run::u32 rc, int attempt,
+                             const std::string &blob);
   /** Get the task's regions from node through the core pool. */
   clio::run::TaskResume GetAtNode(
       clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task,
@@ -784,7 +814,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * @return Cost (ms)
    */
   double BottleneckMs(double d_mb, uint32_t node, uint32_t consumer,
-                      double net_ms, double cpu_p_ms, double cpu_c_ms);
+                      double net_ms, double cpu_p_ms, double cpu_c_ms,
+                      double c_share = 1.0);
   /**
    * Runtime workers running codec work concurrently on a node
    * (cpu_parallelism; its load enters through the load multiplier).
@@ -792,6 +823,19 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * @return Effective parallelism
    */
   double EffectiveParallelism(double cpu_pct) const;
+  /**
+   * Delay that codec work on a busy node adds to the job sharing it. A job
+   * that keeps every core busy (e.g. a bulk-synchronous solver) waits at its
+   * next synchronization for the rank whose core the codec took, so the
+   * work lands on the job's critical path in full rather than overlapping
+   * the I/O pipeline: 0 below kInterfLoPct CPU, rising linearly to the whole
+   * work time at kInterfHiPct. 0 when load awareness is off or CPU unknown.
+   * @param work_ms Codec work on that node per chunk (ms, not divided by
+   *        the runtime's workers: each stalls the job on its own)
+   * @param cpu_pct The node's CPU utilisation percent (-1 = unknown)
+   * @return Added cost (ms)
+   */
+  double InterferenceMs(double work_ms, double cpu_pct) const;
   ScenarioChoice SelectScenario(uint64_t size, double pred_ratio,
                                 double pred_ctime_ms, double pred_dtime_ms,
                                 double load_mult, const Placement &place);

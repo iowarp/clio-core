@@ -36,6 +36,7 @@
 
 #include <clio_ctp/compress/compress_factory.h>
 #include <clio_ctp/util/logging.h>
+#include <clio_runtime/ipc/ipc_run2run.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_cte/dtschedule/ccm/data_stats.h>
 #include <algorithm>
@@ -391,15 +392,7 @@ clio::run::TaskResume Runtime::PutBlob(
       // multiplier; with no consumer the put is local-only and m = 1.
       double cpu_b = cpu_a;
       place.consumer_node = PickConsumer(task->tag_id_);
-      if (config_.workflow_aware_ == "dag" && dag_spec_ && dag_spec_->IsLoaded() &&
-          dag_spec_->Unresolved() > 0 && !CLIO_IPC->GetAllHosts().empty()) {
-        // The host table was empty when the pool was composed: resolve again.
-        dag_spec_->Initialize(config_.dag_path_, CLIO_IPC,
-                              config_.dag_.colocate_fanin_,
-                              config_.dag_.replicate_fanout_min_,
-                              config_.dag_.replicate_max_);
-        dag_spec_->GetStats(dag_files_, dag_nodes_);
-      }
+      RefreshDag();
       if (config_.workflow_aware_ == "dag" && dag_spec_ && dag_spec_->IsLoaded()) {
         // The DAG names every file's consumers before the first byte is
         // written: prefer it over the live map (blob name, then tag name).
@@ -414,6 +407,9 @@ clio::run::TaskResume Runtime::PutBlob(
                                                original_size);
           if (place.consumer_node == UINT32_MAX && !info.consumer_nodes.empty()) {
             place.consumer_node = info.consumer_nodes.front();
+          }
+          if (place.consumer_node != UINT32_MAX) {
+            place.fanin = dag_spec_->FaninDegree(place.consumer_node);
           }
         }
       }
@@ -624,6 +620,16 @@ clio::run::TaskResume Runtime::PutBlob(
                                      task->context_.version_, &place));
     }
   }
+  if (placed && selected && task->GetReturnCode() == 0 && place.dag_hit &&
+      dag_spec_ &&
+      place.dag_consumers.size() >= dag_spec_->ReplicateFanoutMin()) {
+    // Under dtschedule placement the chunk has one stored copy (its location
+    // record); every other consumer of a widely read file gets a raw copy
+    // in its own tiers and reads that one (GetBlob).
+    CLIO_CO_AWAIT(PushPlacedFanoutCopies(
+        task->tag_id_, task->blob_name_.str(), orig_data, original_size,
+        CachedLocation(task->tag_id_, task->blob_name_.str()), &place));
+  }
   if (!placed && selected && task->GetReturnCode() == 0 && place.dag_hit &&
       dag_spec_ &&
       place.dag_consumers.size() >= dag_spec_->ReplicateFanoutMin()) {
@@ -634,6 +640,9 @@ clio::run::TaskResume Runtime::PutBlob(
         task->context_.version_, &place));
   }
   if (selected) {
+    if (placed) {
+      place.store_node = CachedLocation(task->tag_id_, task->blob_name_.str());
+    }
     RecordDecision(tag_name, task->blob_name_.str(),
                    original_size, src_ptr.ptr_, decision, out, select_ms,
                    load_mult, producer_cpu, place);
@@ -787,15 +796,18 @@ clio::run::TaskResume Runtime::ForwardRawGet(
   clio::run::u32 out_tflags = 0;
   clio::run::u64 version = 0;
   for (size_t i = 0; i < regions.size() && rc == 0; ++i) {
-    auto get = core_client_->AsyncGetBlob(
-        task->tag_id_, task->blob_name_.str(), regions[i].blob_off_,
-        regions[i].size_, task->flags_, regions[i].data_,
-        clio::run::PoolQuery::Dynamic(), task->context_);
-    CLIO_CO_AWAIT(get);
-    rc = get->GetReturnCode();
-    out_tflags = get->context_.transform_flags_;
-    if (i == 0) {
-      version = get->context_.version_;
+    for (int attempt = 0;; ++attempt) {
+      auto get = core_client_->AsyncGetBlob(
+          task->tag_id_, task->blob_name_.str(), regions[i].blob_off_,
+          regions[i].size_, task->flags_, regions[i].data_,
+          clio::run::PoolQuery::Dynamic(), task->context_);
+      CLIO_CO_AWAIT(get);
+      rc = get->GetReturnCode();
+      out_tflags = get->context_.transform_flags_;
+      if (i == 0) {
+        version = get->context_.version_;
+      }
+      if (!RetryableGetRc(rc, attempt, task->blob_name_.str())) break;
     }
   }
   task->context_.transform_flags_ = out_tflags;
@@ -858,11 +870,41 @@ clio::run::TaskResume Runtime::GetBlob(
   uint32_t data_node = CLIO_IPC->GetNodeId();
   const bool placed_get = IsPlaced(task->blob_name_.str());
   if (placed_get) {
-    CLIO_CO_AWAIT(ResolveLocation(task->tag_id_, task->blob_name_.str(),
-                                  &data_node));
-    CLIO_CO_AWAIT(GetAtNode(task, data_node));
+    bool local_copy = false;
+    {
+      bool holds = false;
+      CLIO_CO_AWAIT(HoldsFanoutCopy(task->tag_id_, &holds));
+      if (holds) {
+        CLIO_CO_AWAIT(GetAtNode(task, data_node));
+        local_copy = task->GetReturnCode() == 0;
+        if (local_copy) {
+          std::lock_guard<std::mutex> lock(dag_lock_);
+          if ((++replica_reads_ & 0x3fff) == 0) {
+            HLOG(kInfo, "dtschedule: {} placed reads served by local fan-out copies",
+                 replica_reads_);
+          }
+        }
+      }
+    }
+    if (!local_copy) {
+      CLIO_CO_AWAIT(ResolveLocation(task->tag_id_, task->blob_name_.str(),
+                                    &data_node));
+      CLIO_CO_AWAIT(GetAtNode(task, data_node));
+    }
   } else {
     CLIO_CO_AWAIT(ForwardRawGet(task));
+  }
+  if (task->GetReturnCode() != 0) {
+    // A failed read reaches the application only as EIO; record which path
+    // and which core return code produced it.
+    HLOG(kWarning,
+         "dtschedule: GetBlob tag={} blob='{}' [{}, +{}) failed rc={} "
+         "(placed={} data_node={} owner={} local_owner={})",
+         task->tag_id_.ToString(), task->blob_name_.str(),
+         (unsigned long long)task->offset_, (unsigned long long)task->size_,
+         task->GetReturnCode(), placed_get, data_node,
+         OwnerNode(task->tag_id_, task->blob_name_.str()),
+         OwnerIsLocal(task->tag_id_, task->blob_name_.str()));
   }
 
   // Phase 4: Consumer tracking for workflow_aware mode
@@ -1733,7 +1775,7 @@ void Runtime::OpenTraceFile() {
                        "n_candidates,chosen_lib,chosen_preset,chosen_scenario,"
                        "chosen_tier,pred_ctime_ms,pred_dtime_ms,pred_ratio,"
                        "obs_ctime_ms,obs_ratio,store_ms,forced,knobs_hash,"
-                       "obs_dtime_ms,select_ms\n";
+                       "obs_dtime_ms,select_ms,store_node,fanin\n";
         trace_file_.flush();
       }
       HLOG(kDebug, "dtschedule: Trace file opened: {}", trace_file);
@@ -1866,7 +1908,9 @@ void Runtime::WriteTraceRow(const std::string &tag_id,
       forced,
       std::to_string(knobs_.Hash()),
       "",                                               // obs_dtime_ms
-      TraceNum(select_ms)};
+      TraceNum(select_ms),
+      place.store_node == UINT32_MAX ? "" : std::to_string(place.store_node),
+      TraceNum(place.fanin)};
   std::lock_guard<std::mutex> lock(trace_lock_);
   trace_file_ << JoinCsv(f);
   trace_file_.flush();
@@ -2312,6 +2356,27 @@ clio::run::TaskResume Runtime::PutAtNode(
   CLIO_TASK_BODY_END
 }
 
+/**
+ * Whether a remote read should be reissued. Under heavy load a remote node can
+ * finish a read and still answer the origin's liveness probe with "Gone" before
+ * its response arrives; the runtime then fails the read with the network-timeout
+ * code and drops the late response. A read is idempotent, so reissue it.
+ * @param rc Return code of the forwarded read
+ * @param attempt Attempts made so far (0-based)
+ * @param blob Blob name (for the log)
+ * @return True to reissue the read
+ */
+bool Runtime::RetryableGetRc(clio::run::u32 rc, int attempt,
+                             const std::string &blob) {
+  if (rc != static_cast<clio::run::u32>(clio::run::kRun2RunNetworkTimeoutRC) ||
+      attempt + 1 >= kGetAttempts) {
+    return false;
+  }
+  HLOG(kWarning, "dtschedule: read of blob '{}' timed out on the network "
+       "(attempt {} of {}); reissuing", blob, attempt + 1, kGetAttempts);
+  return true;
+}
+
 clio::run::TaskResume Runtime::GetAtNode(
     clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task, uint32_t node) {
   CLIO_TASK_BODY_BEGIN
@@ -2331,14 +2396,17 @@ clio::run::TaskResume Runtime::GetAtNode(
     clio::run::u32 tflags = 0;
     clio::run::u64 version = 0;
     for (size_t i = 0; i < regions.size() && rc == 0; ++i) {
-      auto get = copy_client_->AsyncGetBlob(
-          task->tag_id_, task->blob_name_.str().c_str(), regions[i].blob_off_,
-          regions[i].size_, task->flags_, regions[i].data_, NodeQuery(node),
-          task->context_);
-      CLIO_CO_AWAIT(get);
-      rc = get->GetReturnCode();
-      tflags = get->context_.transform_flags_;
-      if (i == 0) version = get->context_.version_;
+      for (int attempt = 0;; ++attempt) {
+        auto get = copy_client_->AsyncGetBlob(
+            task->tag_id_, task->blob_name_.str().c_str(), regions[i].blob_off_,
+            regions[i].size_, task->flags_, regions[i].data_, NodeQuery(node),
+            task->context_);
+        CLIO_CO_AWAIT(get);
+        rc = get->GetReturnCode();
+        tflags = get->context_.transform_flags_;
+        if (i == 0) version = get->context_.version_;
+        if (!RetryableGetRc(rc, attempt, task->blob_name_.str())) break;
+      }
     }
     task->context_.transform_flags_ = tflags;
     task->context_.version_ = version;
@@ -2762,11 +2830,27 @@ double Runtime::EffectiveParallelism(double cpu_pct) const {
   return std::max(config_.cpu_parallelism_, 1.0);
 }
 
+double Runtime::InterferenceMs(double work_ms, double cpu_pct) const {
+  if (!knobs_.load_aware_ || cpu_pct < 0.0 || work_ms <= 0.0) {
+    return 0.0;
+  }
+  const double w = std::clamp((cpu_pct - kInterfLoPct) /
+                                  (kInterfHiPct - kInterfLoPct),
+                              0.0, 1.0);
+  return work_ms * w;
+}
+
 double Runtime::BottleneckMs(double d_mb, uint32_t node, uint32_t consumer,
-                             double net_ms, double cpu_p_ms, double cpu_c_ms) {
-  const uint64_t bytes = static_cast<uint64_t>(d_mb * 1e6);
+                             double net_ms, double cpu_p_ms, double cpu_c_ms,
+                             double c_share) {
+  const uint32_t self0 = CLIO_IPC->GetNodeId();
+  const uint32_t C0 = consumer == UINT32_MAX ? self0 : consumer;
+  // A consumer that c_share producer nodes write to at once gives each of
+  // them 1/c_share of its device and free space.
+  const double share = (node == C0 && C0 != self0) ? std::max(c_share, 1.0) : 1.0;
+  const uint64_t bytes = static_cast<uint64_t>(d_mb * share * 1e6);
   const double store_ms =
-      d_mb / std::max(TierBwMbPerMs(ChooseTier(bytes, node)), 1e-6);
+      d_mb * share / std::max(TierBwMbPerMs(ChooseTier(bytes, node)), 1e-6);
   // Per-node time: codec work plus the store when that node holds the chunk
   // (with only per-resource terms, compressing and storing on the writer
   // tied with storing at an idle consumer, which was 1.5x faster on HDD).
@@ -2820,9 +2904,12 @@ Runtime::ScenarioChoice Runtime::PlacedScenario(
     }
     return static_cast<double>(seen.size());
   };
+  // Fan-in: producer nodes that write to C at the same time share its
+  // inbound link and its tiers (DAG; 1 without one).
+  const double f = std::max(place.fanin, 1.0);
   // Link time when d MB (raw r MB shipped first) are stored at b.
   auto link = [&](double d, double r, uint32_t b) {
-    const double ship = b == self ? 0.0 : r / nb;
+    const double ship = b == self ? 0.0 : r / nb * (b == C ? f : 1.0);
     return b == self ? readers(self) * d / nb
                      : std::max(ship, readers(b) * d / nb);
   };
@@ -2831,26 +2918,40 @@ Runtime::ScenarioChoice Runtime::PlacedScenario(
     const auto tb = [&](uint32_t n) {
       return d / std::max(TierBwMbPerMs(ChooseTier(static_cast<uint64_t>(d * 1e6), n)), 1e-6);
     };
-    const uint32_t b = tb(C) + d / nb < 0.9 * tb(self) ? C : self;
+    const uint32_t b = f * (tb(C) + d / nb) < 0.9 * tb(self) ? C : self;
     const double net = link(d, d, b);
-    return BottleneckMs(d, b, C, net, cpu_p, cpu_c);
+    return BottleneckMs(d, b, C, net, cpu_p, cpu_c, f);
   };
   auto s2 = [&](double d, double cpu_p, double cpu_c) {
-    return BottleneckMs(d, C, C, link(d, d, C), cpu_p, cpu_c);
+    return BottleneckMs(d, C, C, link(d, d, C), cpu_p, cpu_c, f);
   };
   const double cp = has_codec ? ctime_ms * load_mult / par_p : 0.0;
   const double dc = has_codec ? dtime_ms / par_c : 0.0;
   const double raw1 = s1(raw_mb, 0.0, 0.0), raw2 = s2(raw_mb, 0.0, 0.0);
   const double big = std::numeric_limits<double>::max();
-  const double z1 = has_codec ? s1(z_mb, cp, dc) : big;
-  const double z2 = has_codec ? s2(z_mb, cp, dc) : big;
+  // Codec work beside a job that keeps a node's cores busy delays that job
+  // by the work itself, on top of the I/O pipeline's bottleneck: S1/S2
+  // compress on the producer and the consumer decompresses; S3 does both
+  // on the consumer. A writer whose ranks wait for their own writes
+  // (writers_block) loses no compute to codec work done during the write.
+  const double ip = config_.writers_block_ ? 0.0 : InterferenceMs(ctime_ms, place.producer_cpu);
+  const double id = InterferenceMs(dtime_ms, place.consumer_cpu);
+  const double ic = InterferenceMs(ctime_ms + dtime_ms, place.consumer_cpu);
+  const double z1 = has_codec ? s1(z_mb, cp, dc) + ip + id : big;
+  const double z2 = has_codec ? s2(z_mb, cp, dc) + ip + id : big;
   const double z3 = has_codec
       ? BottleneckMs(z_mb, C, C, link(z_mb, raw_mb, C), 0.0,
-                     (ctime_ms * load_mult_c + dtime_ms) / par_c)
+                     (ctime_ms * load_mult_c + dtime_ms) / par_c, f) + ic
       : big;
   choice.cost1_ms = std::min(raw1, z1);
   choice.cost2_ms = std::min(raw2, z2);
   choice.cost3_ms = z3;
+  if (C == self) {
+    // The writer consumes its own output: S2 and S3 degenerate to storing
+    // here, which S1 already prices (and S1 may still pick a cheaper node).
+    choice.cost2_ms = big;
+    choice.cost3_ms = big;
+  }
   const std::string &force = knobs_.force_scenario_;
   if (force == "1" || force == "2" || force == "3") {
     choice.chosen_scenario = force[0] - '0';  // forced runs keep their codec
@@ -2865,7 +2966,7 @@ Runtime::ScenarioChoice Runtime::PlacedScenario(
     choice.raw = false;
   }
   // Ties go to S2 (the consumer reads locally), then S1, then S3.
-  const double best = std::min({choice.cost1_ms, choice.cost2_ms, z3});
+  const double best = std::min({choice.cost1_ms, choice.cost2_ms, choice.cost3_ms});
   const bool ratio_obj = config_.objective_ == "ratio" && has_codec;
   if (choice.cost2_ms <= best) {
     choice.chosen_scenario = 2;
@@ -2929,6 +3030,12 @@ Runtime::ScenarioChoice Runtime::SelectScenario(uint64_t size,
   }
   choice.cost3_ms = net(raw_mb, P, C) + ct * load_mult_c +
                     net(z_mb, C, O) + store_ms;
+  // Interference with each node's job (see PlacedScenario).
+  const double ip = config_.writers_block_ ? 0.0
+                                          : InterferenceMs(pred_ctime_ms, place.producer_cpu);
+  choice.cost1_ms += ip + InterferenceMs(pred_dtime_ms, place.consumer_cpu);
+  choice.cost2_ms += ip;
+  choice.cost3_ms += InterferenceMs(pred_ctime_ms, place.consumer_cpu);
 
   const std::string &force = knobs_.force_scenario_;
   if (force == "1") {
@@ -3038,6 +3145,122 @@ uint32_t Runtime::PickConsumerFromDag(const std::string &tag_or_blob_name,
 
   forced_reason = "dag:1";
   return UINT32_MAX;
+}
+
+void Runtime::RefreshDag() {
+  if (config_.workflow_aware_ != "dag" || !dag_spec_ || !dag_spec_->IsLoaded() ||
+      dag_spec_->Unresolved() == 0 || CLIO_IPC->GetAllHosts().empty()) {
+    return;
+  }
+  // The host table was empty when the pool was composed: resolve again.
+  std::lock_guard<std::mutex> lock(dag_init_lock_);
+  if (dag_spec_->Unresolved() == 0) {
+    return;
+  }
+  dag_spec_->Initialize(config_.dag_path_, CLIO_IPC,
+                        config_.dag_.colocate_fanin_,
+                        config_.dag_.replicate_fanout_min_,
+                        config_.dag_.replicate_max_);
+  dag_spec_->GetStats(dag_files_, dag_nodes_);
+}
+
+uint32_t Runtime::CachedLocation(const TagId &tag_id, const std::string &blob) {
+  std::lock_guard<std::mutex> lock(loc_lock_);
+  auto it = loc_cache_.find(LocKey(tag_id, blob));
+  return it == loc_cache_.end() ? UINT32_MAX : it->second;
+}
+
+clio::run::TaskResume Runtime::PushPlacedFanoutCopies(
+    const TagId &tag_id, const std::string &blob_name,
+    ctp::ipc::ShmPtr<> raw_data, uint64_t size, uint32_t primary,
+    Placement *place) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    if (!copy_client_) {
+      copy_client_ = std::make_unique<clio::cte::core::Client>(
+          config_.core_pool_id_.IsNull() ? clio::cte::core::kCtePoolId
+                                         : config_.core_pool_id_);
+    }
+    const uint32_t cap = dag_spec_ ? dag_spec_->ReplicateMax() : 0;
+    std::vector<uint32_t> targets;
+    for (uint32_t node : place->dag_consumers) {
+      if (node == UINT32_MAX || node == primary) continue;
+      if (std::find(targets.begin(), targets.end(), node) != targets.end()) continue;
+      targets.push_back(node);
+      if (cap > 0 && targets.size() >= cap) break;
+    }
+    place->fanout = static_cast<int>(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) {
+      // Raw copy on the tier that node can still take: the reader then
+      // needs no codec work and the stored primary keeps its own form. A
+      // copy that would only fit the slowest tier is not made: reading the
+      // primary over the network is then no slower than the local disk, and
+      // the copy would take the space later primaries need.
+      if (config_.tiers_.size() > 1 &&
+          ChooseTier(size, targets[i]) == config_.tiers_.back().name_) {
+        std::lock_guard<std::mutex> lock(dag_lock_);
+        if ((++copy_skipped_slow_ & 0x3fff) == 0) {
+          HLOG(kInfo, "dtschedule: {} fan-out copies skipped for lack of "
+               "fast-tier space ({} pushed)", copy_skipped_slow_, copies_pushed_);
+        }
+        continue;
+      }
+      const std::string tier = ChooseTier(size, targets[i], /*reserve=*/true);
+      const float score = TierScore(tier) >= 0.0f ? TierScore(tier) : -1.0f;
+      auto put = copy_client_->AsyncPutBlob(
+          tag_id, blob_name, 0, size, raw_data, score,
+          clio::cte::core::Context(), 0, NodeQuery(targets[i]));
+      CLIO_CO_AWAIT(put);
+      std::lock_guard<std::mutex> lock(dag_lock_);
+      if (put->GetReturnCode() == 0) {
+        if ((++copies_pushed_ & 0x3fff) == 0) {
+          HLOG(kInfo, "dtschedule: {} fan-out copies pushed ({} refused, {} "
+               "skipped for lack of fast-tier space)",
+               copies_pushed_, copy_refused_, copy_skipped_slow_);
+        }
+      } else {
+        ++copy_refused_;
+      }
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::HoldsFanoutCopy(const TagId &tag_id, bool *holds) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    *holds = false;
+    RefreshDag();
+    if (config_.workflow_aware_ != "dag" || !dag_spec_ || !dag_spec_->IsLoaded() ||
+        dag_spec_->ReplicateFanoutMin() > std::max<uint32_t>(dag_nodes_, 1)) {
+      CLIO_CO_RETURN;  // replication cannot apply to any file
+    }
+    std::string tag_name = tag_id.ToString();
+    auto cached = CachedTagName(tag_name);
+    if (!cached.has_value()) {
+      if (!core_client_) {
+        core_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
+      }
+      auto name_task = core_client_->AsyncGetTagName(tag_id);
+      CLIO_CO_AWAIT(name_task);
+      std::string resolved =
+          name_task->found_ ? name_task->tag_name_.str() : std::string();
+      CacheTagName(tag_name, resolved);
+      cached = resolved;
+    }
+    if (cached->empty()) {
+      CLIO_CO_RETURN;
+    }
+    auto info = dag_spec_->LookupFile(*cached);
+    const uint32_t self = CLIO_IPC->GetNodeId();
+    *holds = info.producer_node != UINT32_MAX &&
+             info.consumer_nodes.size() >= dag_spec_->ReplicateFanoutMin() &&
+             std::find(info.consumer_nodes.begin(), info.consumer_nodes.end(),
+                       self) != info.consumer_nodes.end();
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::PushFanoutCopies(

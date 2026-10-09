@@ -307,6 +307,20 @@ bool DagSpecLoader::Initialize(const std::string &dag_path,
     file_by_path_[file_path] = info;
     file_by_basename_[GetBasename(file_path)] = info;
   }
+  // Fan-in degree: distinct producer nodes whose files each node consumes,
+  // the node itself included when it consumes its own outputs (they land in
+  // the same tiers as the remote producers' files).
+  std::unordered_map<uint32_t, std::set<uint32_t>> producers_of;
+  for (const auto &[path, info] : file_by_path_) {
+    if (info.producer_node == UINT32_MAX) continue;
+    for (uint32_t c : info.consumer_nodes) {
+      producers_of[c].insert(info.producer_node);
+    }
+  }
+  fanin_.clear();
+  for (const auto &[c, p] : producers_of) {
+    fanin_[c] = static_cast<uint32_t>(p.size());
+  }
   is_loaded_ = true;
   HLOG(kInfo, "dtschedule dag: loaded {} files from {}", file_by_path_.size(),
        dag_path);

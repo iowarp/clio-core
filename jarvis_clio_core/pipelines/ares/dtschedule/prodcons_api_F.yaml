@@ -1,0 +1,92 @@
+# CTE-API variant of prodcons_3tier.yaml (user, 2026-10-07: "implement a
+# limited version ... It's fine if we need to use new APIs and are not
+# completely transparent"). Same nodes, tiers, solver, payload and sizes;
+# the producer/consumer are the *_api builds (tools/prodcons/pc_cte_api.cc):
+# each file is a CTE tag of 1 MiB chunks put asynchronously (drained behind
+# the next compute phase) and read with all chunk gets in flight, through
+# the dtschedule pool. No POSIX interposer and no clio-fs, whose per-file
+# home-node routing of every read/write overrides dtschedule's placement.
+name: dtschedule_prodcons_api_F
+ssh_cmd: env -u LD_LIBRARY_PATH ssh
+env:
+  CLIO_MEMFD_DIR: ${HOME}/iowarp_clio_tmp_${HOSTNAME}
+  WFBENCH_DROP_CACHE: '1'
+  CLIO_CFS_WRITE_WINDOW: '16'
+scheduler:
+  name: slurm
+  job_name: dtschedule_prodcons_api_F
+  nodes: 2
+  ntasks_per_node: 1
+  cpus_per_task: 40
+  partition: debug
+  time: 01:00:00
+  output: slurm-%j.out
+  error: slurm-%j.err
+  suffix: -40g
+  pre_cmds:
+  - mkdir -p /mnt/nvme/${USER}/dtschedule_prodcons_3tier /mnt/hdd/${USER}/dtschedule_prodcons_3tier
+pkgs:
+- pkg_type: jarvis_clio_core.clio_runtime
+  pkg_name: runtime
+  num_threads: 4
+  client_data_segment_size: 2G
+  port: 9413
+  ipc_mode: shm
+  log_level: info
+  sleep: 4
+  swim_enabled: false
+- pkg_type: jarvis_clio_core.clio_cte
+  pkg_name: cte_core
+  devices:
+  - - ram::cte_ram_tier1
+    - 1342MB
+    - 1.0
+  - - /mnt/nvme/${USER}/dtschedule_prodcons_3tier/cte_target.bin
+    - 2684MB
+    - 0.7
+  - - /mnt/hdd/${USER}/dtschedule_prodcons_3tier/cte_target.bin
+    - 32GB
+    - 0.3
+  dpe_type: max_bw
+  pool_query: local
+  default_target_timeout_ms: 30000
+  poll_period_ms: 5000
+  neighborhood: 1
+- pkg_type: jarvis_clio_core.clio_dtschedule
+  pkg_name: dtschedule
+  ccm: qtable
+  workflow_aware: dag
+  load_aware: true
+  qos_objective: performance
+  qos_max_error: 0.0
+  force_scenario: auto
+  decision_order: joint
+  net_bw_gbps: 40
+  trace_path: ${HOME}/jarvis-runs/dtschedule_prodcons_api_F/dtschedule_trace
+  trace_candidates: true
+  min_compress_bytes: 65536
+  load_period_ms: 500
+  tier_bw_mbps:
+    ram: 20000.0
+    nvme: 2000.0
+    hdd: 200.0
+  placement: dtschedule
+- pkg_type: jarvis_clio_core.clio_prodcons
+  pkg_name: prodcons
+  mpirun: /mnt/common/llogan/spack/opt/spack/linux-skylake_avx512/openmpi-5.0.8-aaqsri5t5df5mcygbtc3le7l7lumndvj/bin/mpirun
+  launch_agent: /mnt/common/llogan/spack/opt/spack/linux-skylake_avx512/prrte-4.0.0-pag2d45mbp4iiutlhvzgrlzer65cm5if/bin/prted
+  bin_dir: /mnt/common/llogan/iowarp/dtschedule/build/bin
+  out: /mnt/common/llogan/dtschedule-runs/prodcons_api_F
+  run: prodcons_api
+  producer_nodes: 1
+  ppn_producer: 40
+  ppn_consumer: 20
+  steps: 20
+  nx: 2048
+  ny: 2048
+  iters_per_step: 50
+  noise: 0.0
+  passes: 4
+  net_if: 172.25.0.0/16
+  payload: /mnt/nvme/llogan/dt_payload
+  api: true

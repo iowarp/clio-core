@@ -236,6 +236,9 @@ struct DtscheduleConfig {
   bool load_aware_ = true;
   int load_period_ms_ = 1000;
   double load_cap_ = 4.0;
+  // Application hint: the writers' ranks wait for their own writes (blocking
+  // I/O phases), so codec work on the writer's node does not delay its job.
+  bool writers_block_ = false;
 
   // Workflow awareness (phases 4-5)
   std::string workflow_aware_ = "none";         ///< none | consumer | dag
@@ -305,6 +308,7 @@ struct DtscheduleConfig {
         load_aware_(other.load_aware_),
         load_period_ms_(other.load_period_ms_),
         load_cap_(other.load_cap_),
+        writers_block_(other.writers_block_),
         workflow_aware_(other.workflow_aware_),
         dag_path_(other.dag_path_),
         force_scenario_(other.force_scenario_),
@@ -446,6 +450,9 @@ struct DtscheduleConfig {
     }
     if (node["load_cap"]) {
       load_cap_ = node["load_cap"].as<double>();
+    }
+    if (node["writers_block"]) {
+      writers_block_ = node["writers_block"].as<bool>();
     }
 
     if (node["workflow_aware"]) {

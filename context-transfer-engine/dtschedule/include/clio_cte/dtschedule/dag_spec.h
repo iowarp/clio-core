@@ -162,6 +162,18 @@ class DagSpecLoader {
    */
   bool ColocateFanin() const { return colocate_fanin_; }
 
+  /**
+   * Fan-in degree of a node: how many nodes (itself included) produce files it consumes.
+   * Those producers write to it concurrently, sharing its link and tiers.
+   *
+   * @param node Consumer node ID
+   * @return Number of distinct producer nodes (at least 1)
+   */
+  uint32_t FaninDegree(uint32_t node) const {
+    auto it = fanin_.find(node);
+    return it == fanin_.end() || it->second == 0 ? 1u : it->second;
+  }
+
 
  private:
   /**
@@ -195,6 +207,7 @@ class DagSpecLoader {
   bool colocate_fanin_ = false;                               ///< Colocation config
   uint32_t replicate_fanout_min_ = 0;                         ///< Replication threshold
   uint32_t replicate_max_ = 0;                                ///< Max replicas
+  std::unordered_map<uint32_t, uint32_t> fanin_;              ///< Consumer node -> producer nodes
 };
 
 }  // namespace clio::cte::dtschedule

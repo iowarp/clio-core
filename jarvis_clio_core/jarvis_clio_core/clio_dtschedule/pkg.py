@@ -206,6 +206,11 @@ class ClioDtschedule(Service):
              'msg': 'Cap on the load multiplier applied to predicted '
                     'compute time',
              'type': float, 'default': 4.0},
+            {'name': 'writers_block',
+             'msg': 'Application hint: the writers\' ranks wait for their '
+                    'own writes, so codec work on the writer\'s node is '
+                    'not charged as interference with its job',
+             'type': bool, 'default': False},
         ]
 
     @staticmethod
@@ -520,6 +525,7 @@ class ClioDtschedule(Service):
             'load_aware': bool(cfg['load_aware']),
             'load_period_ms': int(cfg['load_period_ms']),
             'load_cap': float(cfg['load_cap']),
+            'writers_block': bool(cfg['writers_block']),
             'workflow_aware': cfg['workflow_aware'],
             'dag_path': cfg['dag_path'],
             'dag': {
