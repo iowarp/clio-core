@@ -136,8 +136,10 @@ assimilation time (no secrets are placed in the OMNI file):
   `AWS_ENDPOINT_URL` (e.g. MinIO). Public buckets (e.g. the AWS Open Data
   registry) are read unsigned, like `aws s3 --no-sign-request`: set
   `AWS_NO_SIGN_REQUEST=1`, or configure no credentials at all and CAE falls
-  back to anonymous. A region is still required. These variables are read by
-  the runtime process that runs the assimilator, not by `clio_cae`.
+  back to anonymous. A region is still required. Requests go through
+  `https_proxy` / `http_proxy` (minus `no_proxy`; loopback is always direct)
+  as with curl, which HPC compute nodes need to reach AWS. These variables are
+  read by the runtime process that runs the assimilator, not by `clio_cae`.
 - **GCS:** Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`,
   gcloud ADC, or the GCE/GKE metadata server), and an optional endpoint via
   `GCS_ENDPOINT` (e.g. fake-gcs-server).

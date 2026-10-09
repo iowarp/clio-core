@@ -72,6 +72,7 @@ std::vector<char> Pattern(size_t len, unsigned seed) {
 struct StubStats {
   long connections = 0;  ///< accepted TCP sockets so far
   long requests = 0;     ///< handled S3 requests so far (/__stats excluded)
+  long proxied = 0;      ///< requests relayed by the stub's forward proxy
 };
 
 /** Pull an integer field out of the stub's tiny {"k": n, ...} JSON by hand. */
@@ -102,10 +103,82 @@ StubStats ReadStats(Poco::Net::HTTPClientSession &probe) {
   StubStats s;
   s.connections = ExtractInt(body, "connections");
   s.requests = ExtractInt(body, "requests");
+  s.proxied = ExtractInt(body, "proxied");
   return s;
 }
 
+/**
+ * Point the proxy environment at `http_proxy` for one scope (no_proxy and the
+ * upper-case spellings cleared), restoring whatever was there afterwards --
+ * the ALCF nodes these tests run on export a real proxy.
+ */
+class ScopedProxyEnv {
+ public:
+  explicit ScopedProxyEnv(const std::string &http_proxy) {
+    for (const char *name : kNames) saved_.push_back(Env(name));
+    for (const char *name : kNames) ctp::SystemInfo::Unsetenv(name);
+    ctp::SystemInfo::Setenv("http_proxy", http_proxy, 1);
+  }
+  ~ScopedProxyEnv() {
+    for (size_t i = 0; i < saved_.size(); ++i) {
+      if (saved_[i].empty()) {
+        ctp::SystemInfo::Unsetenv(kNames[i]);
+      } else {
+        ctp::SystemInfo::Setenv(kNames[i], saved_[i], 1);
+      }
+    }
+  }
+
+ private:
+  static constexpr const char *kNames[] = {"http_proxy", "HTTP_PROXY",
+                                           "no_proxy", "NO_PROXY"};
+  std::vector<std::string> saved_;
+};
+
 }  // namespace
+
+TEST_CASE("s3_rest_proxy_selection", "[s3_rest][proxy]") {
+  const Poco::URI aws("https://terrafusiondatasampler.s3.us-west-2.amazonaws.com");
+
+  SECTION("the ALCF form: no scheme, explicit port");
+  s3::ProxySpec p = s3::ProxyFor(aws, "proxy.alcf.anl.gov:3128", "");
+  REQUIRE(p.enabled());
+  REQUIRE(p.host == "proxy.alcf.anl.gov");
+  REQUIRE(p.port == 3128);
+
+  SECTION("no port means curl's default, 1080");
+  REQUIRE(s3::ProxyFor(aws, "http://proxy.example", "").port == 1080);
+
+  SECTION("credentials in the proxy URL are percent-decoded");
+  p = s3::ProxyFor(aws, "http://user%40site:p%3Ass@proxy.example:8080", "");
+  REQUIRE(p.username == "user@site");
+  REQUIRE(p.password == "p:ss");
+  REQUIRE(p.port == 8080);
+
+  SECTION("no proxy configured, or an unsupported scheme, connects directly");
+  REQUIRE_FALSE(s3::ProxyFor(aws, "", "").enabled());
+  REQUIRE_FALSE(s3::ProxyFor(aws, "socks5://proxy.example:1080", "").enabled());
+
+  SECTION("no_proxy: '*', exact host, and domain suffix with or without '.'");
+  REQUIRE_FALSE(s3::ProxyFor(aws, "proxy:3128", "*").enabled());
+  REQUIRE_FALSE(s3::ProxyFor(aws, "proxy:3128", "localhost,.amazonaws.com")
+                    .enabled());
+  REQUIRE_FALSE(s3::ProxyFor(aws, "proxy:3128", "AMAZONAWS.COM").enabled());
+  REQUIRE_FALSE(
+      s3::ProxyFor(aws, "proxy:3128",
+                   "terrafusiondatasampler.s3.us-west-2.amazonaws.com")
+          .enabled());
+  // A suffix must fall on a label boundary.
+  REQUIRE(s3::ProxyFor(aws, "proxy:3128", "naws.com").enabled());
+
+  SECTION("loopback is always direct, even with no no_proxy at all");
+  REQUIRE_FALSE(
+      s3::ProxyFor(Poco::URI("http://127.0.0.1:9000"), "proxy:3128", "")
+          .enabled());
+  REQUIRE_FALSE(
+      s3::ProxyFor(Poco::URI("http://localhost:9000"), "proxy:3128", "")
+          .enabled());
+}
 
 TEST_CASE("s3_rest_key_for_offset", "[s3_rest]") {
   // Pure addressing: no endpoint needed, so this runs even standalone.
@@ -488,6 +561,55 @@ TEST_CASE("s3_rest_anonymous_reads_a_public_object", "[s3_rest]") {
   s3::S3Result r = anon.GetObject(conn, priv_key, buf.data(), buf.size(), &got);
   REQUIRE_FALSE(r.ok());
   REQUIRE(r.http_status == 403);
+}
+
+TEST_CASE("s3_rest_requests_go_through_http_proxy", "[s3_rest][proxy]") {
+  if (!StubAvailable() || Env("S3_STUB_PROXY").empty()) {
+    INFO("S3_ENDPOINT/S3_STUB_PROXY unset; run via s3_stub_server.py. Skipping.");
+    return;
+  }
+  // A name that does not resolve: the only way to reach the stub is through
+  // the proxy, which relays any host to it. The stub still verifies the
+  // signature, computed over this Host, so signing and proxying must agree.
+  Poco::URI direct(Env("S3_ENDPOINT"));
+  s3::S3Config cfg =
+      s3::S3RestClient::ConfigFromEnv(Env("S3_STUB_BUCKET"), "clio/proxied");
+  cfg.endpoint = "http://s3-via-proxy.invalid:" +
+                 std::to_string(direct.getPort());
+  ScopedProxyEnv proxy_env(Env("S3_STUB_PROXY"));
+
+  Poco::Net::HTTPClientSession probe(direct.getHost(), direct.getPort());
+  StubStats before = ReadStats(probe);
+
+  s3::S3RestClient client(cfg);
+  s3::S3Connection conn;
+  std::vector<char> out = Pattern(4096, 4);
+  const std::string key = client.KeyForOffset(0);
+  REQUIRE(client.PutObject(conn, key, out.data(), out.size()).ok());
+  std::vector<char> in(out.size(), 0);
+  size_t got = 0;
+  s3::S3Result get = client.GetObject(conn, key, in.data(), in.size(), &got);
+  REQUIRE(get.ok());
+  REQUIRE(got == out.size());
+  REQUIRE(std::memcmp(out.data(), in.data(), out.size()) == 0);
+
+  StubStats after = ReadStats(probe);
+  REQUIRE(after.proxied - before.proxied == 2);
+}
+
+TEST_CASE("s3_rest_loopback_endpoint_ignores_the_proxy", "[s3_rest][proxy]") {
+  if (!StubAvailable()) {
+    INFO("S3_ENDPOINT unset; run via s3_stub_server.py. Skipping.");
+    return;
+  }
+  // An unroutable proxy: if the loopback bypass regresses, this fails rather
+  // than quietly succeeding through something real.
+  ScopedProxyEnv proxy_env("http://127.0.0.1:9/");
+  s3::S3RestClient client = MakeClient("clio/loopback");
+  s3::S3Connection conn;
+  std::vector<char> out = Pattern(1024, 6);
+  REQUIRE(client.PutObject(conn, client.KeyForOffset(0), out.data(),
+                           out.size()).ok());
 }
 
 SIMPLE_TEST_MAIN()

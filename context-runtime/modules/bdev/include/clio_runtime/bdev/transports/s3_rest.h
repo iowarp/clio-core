@@ -57,6 +57,7 @@
 #include <Poco/Net/RejectCertificateHandler.h>
 #include <Poco/Net/SSLManager.h>
 
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <istream>
@@ -131,7 +132,118 @@ inline void EnsureSslInitialized() {
   });
 }
 
-/** Create an HTTP(S) session for `uri`; HTTPS gets a TLS context. */
+/** The HTTP proxy one endpoint is reached through; empty host => direct. */
+struct ProxySpec {
+  std::string host;
+  uint16_t port = 0;
+  std::string username;
+  std::string password;
+
+  bool enabled() const { return !host.empty(); }
+};
+
+namespace detail {
+
+/** First non-empty of two environment variables, else "". */
+inline std::string EnvEither(const char *a, const char *b) {
+  const char *v = std::getenv(a);
+  if (v == nullptr || *v == '\0') v = std::getenv(b);
+  return (v != nullptr && *v != '\0') ? std::string(v) : std::string();
+}
+
+/** ASCII lower-case copy. */
+inline std::string Lower(std::string s) {
+  for (char &c : s) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return s;
+}
+
+/**
+ * True if `host` must be reached directly: a loopback name (a proxy will not
+ * relay to its own loopback, and the stub-server tests listen there), or a
+ * match for an entry of the curl-style `no_proxy` list -- "*" for everything,
+ * else the host itself or any subdomain of it (a leading '.' is optional).
+ */
+inline bool BypassesProxy(const std::string &host,
+                          const std::string &no_proxy) {
+  const std::string h = Lower(host);
+  if (h == "localhost" || h == "127.0.0.1" || h == "::1") return true;
+  size_t pos = 0;
+  while (pos <= no_proxy.size()) {
+    size_t end = no_proxy.find_first_of(", ", pos);
+    if (end == std::string::npos) end = no_proxy.size();
+    std::string entry = Lower(no_proxy.substr(pos, end - pos));
+    pos = end + 1;
+    if (entry == "*") return true;
+    while (!entry.empty() && entry.front() == '.') entry.erase(0, 1);
+    if (entry.empty()) continue;
+    if (h == entry) return true;
+    if (h.size() > entry.size() &&
+        h.compare(h.size() - entry.size(), entry.size(), entry) == 0 &&
+        h[h.size() - entry.size() - 1] == '.') {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace detail
+
+/**
+ * The proxy for `uri`, given the proxy URL and no_proxy list that apply to its
+ * scheme (the testable core of ProxyFromEnv). The proxy URL may omit its
+ * scheme ("host:3128"); only http:// proxies are supported -- HTTPS endpoints
+ * tunnel through one with CONNECT -- so any other scheme, or an unparseable
+ * URL, means "connect directly". The port defaults to 1080, as in curl.
+ */
+inline ProxySpec ProxyFor(const Poco::URI &uri, const std::string &proxy_url,
+                          const std::string &no_proxy) {
+  ProxySpec p;
+  if (proxy_url.empty() || detail::BypassesProxy(uri.getHost(), no_proxy)) {
+    return p;
+  }
+  const std::string full = proxy_url.find("://") == std::string::npos
+                               ? "http://" + proxy_url
+                               : proxy_url;
+  try {
+    Poco::URI proxy(full);
+    if (detail::Lower(proxy.getScheme()) != "http" || proxy.getHost().empty()) {
+      return p;
+    }
+    p.host = proxy.getHost();
+    p.port = proxy.getSpecifiedPort() != 0 ? proxy.getSpecifiedPort() : 1080;
+    const std::string &info = proxy.getUserInfo();
+    const size_t colon = info.find(':');
+    Poco::URI::decode(info.substr(0, colon), p.username);
+    if (colon != std::string::npos) {
+      Poco::URI::decode(info.substr(colon + 1), p.password);
+    }
+  } catch (const Poco::Exception &) {
+    p = ProxySpec{};
+  }
+  return p;
+}
+
+/**
+ * The proxy for `uri` from the environment, the way curl and the AWS CLI read
+ * it: https_proxy / HTTPS_PROXY for https endpoints, http_proxy / HTTP_PROXY
+ * for http ones, minus no_proxy / NO_PROXY. HPC compute nodes typically reach
+ * the internet only this way (on ALCF, http://proxy.alcf.anl.gov:3128).
+ */
+inline ProxySpec ProxyFromEnv(const Poco::URI &uri) {
+  const bool https = uri.getScheme() == "https";
+  const std::string proxy_url = https
+                                    ? detail::EnvEither("https_proxy", "HTTPS_PROXY")
+                                    : detail::EnvEither("http_proxy", "HTTP_PROXY");
+  return ProxyFor(uri, proxy_url, detail::EnvEither("no_proxy", "NO_PROXY"));
+}
+
+/**
+ * Create an HTTP(S) session for `uri`; HTTPS gets a TLS context. The session
+ * goes through the environment's proxy when one applies (ProxyFromEnv); Poco
+ * then tunnels HTTPS with CONNECT and sends plain HTTP in absolute form.
+ */
 inline std::unique_ptr<Poco::Net::HTTPClientSession> MakeSession(
     const Poco::URI &uri) {
   std::unique_ptr<Poco::Net::HTTPClientSession> session;
@@ -142,6 +254,13 @@ inline std::unique_ptr<Poco::Net::HTTPClientSession> MakeSession(
   } else {
     session = std::make_unique<Poco::Net::HTTPClientSession>(uri.getHost(),
                                                             uri.getPort());
+  }
+  const ProxySpec proxy = ProxyFromEnv(uri);
+  if (proxy.enabled()) {
+    session->setProxy(proxy.host, proxy.port);
+    if (!proxy.username.empty()) {
+      session->setProxyCredentials(proxy.username, proxy.password);
+    }
   }
   session->setTimeout(Poco::Timespan(30, 0));  // 30s
   return session;

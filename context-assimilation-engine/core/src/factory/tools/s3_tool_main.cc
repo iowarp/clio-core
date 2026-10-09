@@ -100,10 +100,15 @@ namespace {
  *     turns a guaranteed failure into the request that can succeed, and it
  *     cannot weaken a request that had credentials to use.
  *
+ * PROXY. The SDK clears libcurl's proxy unless allowSystemProxy is set, so
+ * https_proxy / http_proxy / no_proxy would be ignored and a node that reaches
+ * the internet only through a proxy (HPC compute nodes) would time out.
+ *
  * @return A configured Aws::S3::S3Client.
  */
 Aws::S3::S3Client MakeS3Client() {
   Aws::Client::ClientConfiguration cfg;
+  cfg.allowSystemProxy = true;
   const char* region_env = std::getenv("AWS_DEFAULT_REGION");
   cfg.region = (region_env && *region_env) ? region_env : "us-east-1";
 
