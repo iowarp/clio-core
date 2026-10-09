@@ -121,6 +121,13 @@ if(CAE_ENABLE_S3)
   # Poco for the in-process signer/transport (NOT the AWS SDK).
   list(APPEND RUNTIME_LINK_LIBRARIES
     Poco::Net Poco::NetSSL Poco::Crypto Poco::Foundation)
+  # cfs::<path> destinations store the object as a clio-fs file, which needs
+  # the filesystem chimod's client (built by CTE, configured before CAE).
+  if(TARGET clio_cte_filesystem_client)
+    message(STATUS "CAE S3 cfs:: destinations: ENABLED")
+    add_compile_definitions(CAE_ENABLE_CFS_DST)
+    list(APPEND RUNTIME_LINK_LIBRARIES clio_cte_filesystem_client)
+  endif()
 else()
   message(STATUS "CAE S3 support: DISABLED")
 endif()
