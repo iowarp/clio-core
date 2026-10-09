@@ -751,9 +751,13 @@ clio::run::TaskResume Runtime::SeatDataMember(DataSeatSpec spec, int col,
   CLIO_CO_AWAIT(QueryMemberSlots(data_clients_.back(), MemberQuery(slot),
                                  cap_slots, qok));
   if (!qok) {
-    HLOG(kError, "safe_bdev Create: GetStats failed for member '{}'",
-         desc.pool_name_);
-    rc = 1;
+    // Dead at this start (#1245): seat it down, like a member persisted as
+    // faulty. Create refuses only if more than max_failures are down.
+    HLOG(kWarning, "safe_bdev Create: member '{}' does not answer GetStats; "
+         "seating data column {} as down", desc.pool_name_, col);
+    slot.state_ = ec::EcState::kFaulty;
+    data_members_.push_back(slot);
+    data_alloc_.emplace_back();
     CLIO_CO_RETURN;
   }
   const clio::run::u64 avail = cap_slots * kChunkLen;
@@ -768,9 +772,11 @@ clio::run::TaskResume Runtime::SeatDataMember(DataSeatSpec spec, int col,
   CLIO_CO_AWAIT(ReadSuperblock(/*is_parity=*/false, static_cast<size_t>(col),
                                sb, present, sb_ok));
   if (!sb_ok) {
-    HLOG(kError, "safe_bdev Create: superblock read failed for member '{}'",
-         desc.pool_name_);
-    rc = 1;
+    // An unreadable member is a failed disk, not a reason to refuse the
+    // array (#1245): seat it down; reads reconstruct it.
+    HLOG(kWarning, "safe_bdev Create: superblock read failed for member '{}'; "
+         "seating data column {} as down", desc.pool_name_, col);
+    data_members_.back().state_ = ec::EcState::kFaulty;
     CLIO_CO_RETURN;
   }
   if (!present) {
@@ -828,9 +834,10 @@ clio::run::TaskResume Runtime::SeatConfigParity(MemberBdevDesc desc,
   bool sb_ok = false;
   CLIO_CO_AWAIT(ReadSuperblock(/*is_parity=*/true, pj, sb, present, sb_ok));
   if (!sb_ok) {
-    HLOG(kError, "safe_bdev Create: superblock read failed for parity member "
-         "'{}'", desc.pool_name_);
-    rc = 1;
+    // Dead at this start (#1245): seat it down instead of refusing.
+    HLOG(kWarning, "safe_bdev Create: superblock read failed for parity "
+         "member '{}'; seating it as down", desc.pool_name_);
+    parity_members_[pj].state_ = ec::EcState::kFaulty;
     CLIO_CO_RETURN;
   }
   if (!present) {
@@ -1146,6 +1153,21 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       task->return_code_ = par_rc;
       CLIO_CO_RETURN;
     }
+  }
+  // Members found dead at this start are seated down (#1245); the array
+  // starts degraded while that is within its failure budget.
+  if (CountDownMembers() > max_failures_) {
+    HLOG(kError, "safe_bdev Create: {} members are down but max_failures is "
+         "{}; the array cannot serve its data", CountDownMembers(),
+         max_failures_);
+    task->return_code_ = 4;
+    CLIO_CO_RETURN;
+  }
+  if (CountDownMembers() != 0) {
+    HLOG(kWarning, "safe_bdev Create: starting DEGRADED with {} of {} "
+         "members down (max_failures {}); replace_member rebuilds them",
+         CountDownMembers(), data_members_.size() + parity_members_.size(),
+         max_failures_);
   }
   parity_level_ = static_cast<clio::run::u32>(parity_members_.size());
   for (size_t j = 0; j < parity_members_.size(); ++j) {
