@@ -131,10 +131,10 @@ _NS = 1_000_000_000  # nanoseconds per second
 
 
 def now_ns() -> int:
-    # CTE's GetCurrentTimeNs() uses std::chrono::steady_clock, which maps to
-    # CLOCK_MONOTONIC on Linux. time.monotonic_ns() uses the same clock, so
-    # the brackets we record here are directly comparable to blob timestamps.
-    return time.monotonic_ns()
+    # TemporalSearch bounds and results are wall-clock epoch nanoseconds
+    # (#1241): the runtime converts its steady-clock blob timestamps before
+    # comparing, so brackets from time.time_ns() line up with them.
+    return time.time_ns()
 
 
 def put_group(tag, prefix: str, count: int, payload: bytes = b"x") -> tuple[int, int]:

@@ -5967,6 +5967,10 @@ struct TemporalSearchResult {
  * "no constraint on that side").  Results are sorted by ascending
  * last_modified_.  max_entries_ caps the output (0 = unlimited).
  *
+ * The bounds and each result's last_modified_ are wall-clock epoch
+ * nanoseconds; the handler converts the steady-clock blob timestamps
+ * (SteadyToWallNs) before comparing (#1241).
+ *
  * This is a pure metadata scan — no blob bytes are read.
  */
 struct TemporalSearchTask : public clio::run::Task {

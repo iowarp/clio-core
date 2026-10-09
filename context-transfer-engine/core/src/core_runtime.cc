@@ -11502,7 +11502,10 @@ clio::run::TaskResume Runtime::TemporalSearch(
           if (composite_key.rfind(prefix, 0) != 0) return;
           std::string blob_name = composite_key.substr(prefix.length());
           if (!std::regex_match(blob_name, blob_pattern)) return;
-          Timestamp ts = blob_info.last_modified_;
+          // Blob timestamps are steady-clock (relative bookkeeping); the
+          // query bounds and the reported times are wall-clock epoch ns, so
+          // convert before comparing (#1241). Order is preserved.
+          Timestamp ts = SteadyToWallNs(blob_info.last_modified_);
           if (ts == 0) return;
           if (time_begin != 0 && ts < time_begin) return;
           if (time_end != 0 && ts > time_end) return;
