@@ -1,0 +1,63 @@
+<!--
+title: Core concepts
+heading: Tags, blobs, tiers <em>and pools.</em>
+description: The handful of ideas behind CLIO Core: tags and blobs, storage tiers and scores, persistence levels, pools and the module chain.
+eyebrow: Docs · Reference
+lede: Six ideas explain almost everything CLIO Core does: tags and blobs, files as tags, tiers and scores, persistence, pools, and the module chain.
+facts: Written for | Anyone configuring or scripting CLIO Core ; Read time | 8 minutes
+-->
+<h2>Tags and blobs</h2>
+<p>The storage engine (the CTE) stores <strong>blobs</strong>: named byte ranges, up to any size. Blobs are grouped under <strong>tags</strong>, which are named containers. A tag is something like a directory. A blob is something like a file or a piece of one.</p>
+<p>Both have names you choose, and both have numeric ids that the engine assigns. The Python and C++ APIs let you put and get blobs, list a tag's blobs, and query tags and blobs by regular expression.</p>
+
+<h2>Files are tags</h2>
+<p>The filesystem layer builds a POSIX namespace out of tags:</p>
+<ul>
+  <li>Every file, directory and symbolic link is a tag named by its path. The tag id doubles as the inode number.</li>
+  <li>A file's bytes are stored as <strong>page blobs</strong> of 1 MiB, named <code>"0"</code>, <code>"1"</code>, <code>"2"</code> and so on by offset.</li>
+  <li>Each of those tags also holds one small blob named <code>~i</code> with the entry's attributes (mode, size, times). Directories have only that blob.</li>
+</ul>
+<p>That is why the Python search APIs return a tag id and a blob name: together they mean "this page of this file". The <a href="/design/filesystem.html">filesystem design page</a> explains the namespace, consistency and crash safety.</p>
+
+<h2>Tiers and scores</h2>
+<p>A <strong>storage tier</strong> (also called a target) is one place the engine can put bytes: a slice of RAM, a file on an NVMe drive, a file on a disk. Each tier has a capacity and a <strong>score</strong> from 0.0 (slowest) to 1.0 (fastest).</p>
+<p>Blobs carry scores too. The data placement engine puts a new blob on the best tier that has room, using a policy you choose (<code>max_bw</code>, <code>round_robin</code> or <code>random</code>). Later, the organizer moves blobs whose score no longer matches their tier: hot data up, cold data down. With the <code>frecency</code> organizer, scores follow how recently and how often data is used.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Tier type</th><th><code>bdev_type</code></th><th><code>path</code></th></tr></thead>
+  <tbody>
+    <tr><td>DRAM</td><td><code>ram</code></td><td><code>ram::&lt;name&gt;</code></td></tr>
+    <tr><td>NVMe, SSD, HDD, parallel filesystem</td><td><code>file</code></td><td>A file path on that device</td></tr>
+    <tr><td>GPU memory</td><td><code>hbm</code>, <code>pinned</code></td><td>A name; needs a GPU build</td></tr>
+    <tr><td>Object store</td><td><code>s3</code>, <code>gcs</code></td><td><code>s3://bucket/prefix</code>; needs a build with the cloud options</td></tr>
+    <tr><td>Latency testing</td><td><code>noop</code></td><td>Discards data</td></tr>
+  </tbody>
+</table></div>
+<p>There is no separate NVMe or SSD type. The device is whatever the file path lives on.</p>
+
+<h2>Persistence levels</h2>
+<p>Each tier declares how long its contents last: <code>volatile</code> (lost at shutdown; the default), <code>temporary</code> (survives a restart) or <code>long_term</code>. The replication layer keeps its persistent copies only on non-volatile tiers. <strong>A configuration whose tiers are all volatile cannot keep data across a restart.</strong></p>
+<p>The metadata log (<code>performance.metadata_log_path</code>) records which blobs exist and where. Without it, a disk tier's bytes survive but nothing remembers what they belong to.</p>
+
+<h2>Pools and modules</h2>
+<p>Everything inside the runtime is a <strong>module</strong> (also called a ChiMod) running in a <strong>pool</strong>. A pool has a name, a module type and an id such as <code>512.0</code>. The <code>compose</code> section of <code>clio.yaml</code> lists the pools to create at startup. <code>clio_run compose start file.yaml</code> adds more later.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Pool id</th><th>Module</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>301.0</code></td><td><code>clio_bdev</code></td><td>Default RAM block device</td></tr>
+    <tr><td><code>400.0</code></td><td><code>clio_cae_core</code></td><td>Assimilation (imports)</td></tr>
+    <tr><td><code>512.0</code></td><td><code>clio_cte_core</code></td><td>Storage engine with your tiers</td></tr>
+    <tr><td><code>561.0</code></td><td><code>clio_cte_replication</code></td><td>Persistent copies</td></tr>
+    <tr><td><code>562.0</code></td><td><code>clio_cte_compressor</code></td><td>Optional compression</td></tr>
+    <tr><td><code>563.0</code></td><td><code>clio_cte_cache</code></td><td>Node-local copies; top of the chain</td></tr>
+    <tr><td><code>564.0</code></td><td><code>clio_cte_indexer</code></td><td>Keyword search index</td></tr>
+    <tr><td><code>565.0</code></td><td><code>clio_cte_stream</code></td><td>Byte streams: page layout, file sizes, appends</td></tr>
+    <tr><td><code>560.0</code></td><td><code>clio_cte_filesystem</code></td><td>The filesystem namespace</td></tr>
+  </tbody>
+</table></div>
+
+<h2>The module chain</h2>
+<p>Replication, caching, indexing and compression are separate modules that all speak the storage engine's interface. Each one forwards to the next through <code>next_pool_id</code>. In the default configuration, a write from the filesystem flows like this:</p>
+<pre data-label="data path">
+filesystem 560.0 → cache 563.0 → indexer 564.0 → [compressor 562.0] → replication 561.0 → core 512.0
+</pre>
+<p>Any client can bind to any layer. Set <code>CLIO_CTE_POOL=564.0</code>, for example, and your Python client talks to the indexer, which serves search and forwards everything else. The <a href="/design/chain.html">interposition chain</a> design page describes each layer's guarantees.</p>

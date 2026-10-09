@@ -1,0 +1,128 @@
+<!--
+title: Amazon S3 and Google Cloud
+heading: Bring in <em>S3 and Google Cloud.</em>
+description: Import objects from Amazon S3 and Google Cloud Storage into CLIO Core, or use a bucket as a cold storage tier.
+eyebrow: Tutorial · Compose
+lede: Object stores connect to CLIO Core in two ways. The assimilation engine imports <code>s3://</code> and <code>gs://</code> objects. A build with the cloud options can also use a bucket as a storage tier.
+facts: Time | 20 minutes ; You need | A source build with cloud options, and bucket credentials ; Status | Not yet verified end to end
+-->
+<div class="callout warn">
+  <span class="callout-title">Not yet verified</span>
+  <p>The commands on this page have not been run end to end against Amazon S3 or Google Cloud Storage. The other tutorials were checked on a live system; this one was checked only against the source code. Expect to adjust details, and please report what you find.</p>
+</div>
+
+<h2>Which one do you need?</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>Import (CAE)</th><th>Bucket as a tier</th></tr></thead>
+  <tbody>
+    <tr><td>What it does</td><td>Copies objects into CLIO Core once</td><td>Stores tiered data in a bucket</td></tr>
+    <tr><td>Data ends up</td><td>On your local tiers, searchable from Python</td><td>In the bucket</td></tr>
+    <tr><td>Build options</td><td><code>CAE_ENABLE_S3</code>, <code>CAE_ENABLE_GCS</code></td><td><code>CLIO_ENABLE_AMAZON_DRIVE</code>, <code>CLIO_ENABLE_GOOGLE_CLOUD</code></td></tr>
+    <tr><td>Status</td><td class="good">Supported, with unit tests</td><td class="cost">Config parsing tested; no end-to-end test yet</td></tr>
+  </tbody>
+</table></div>
+<p>The pip wheel includes neither. Build from source with the options you need, or use Spack (<code>spack install iowarp +s3 +gcs</code>).</p>
+<pre data-label="shell">
+$ cmake --preset release-fuse \
+    -DCAE_ENABLE_S3=ON -DCAE_ENABLE_GCS=ON \
+    -DCLIO_ENABLE_AMAZON_DRIVE=ON -DCLIO_ENABLE_GOOGLE_CLOUD=ON
+$ cmake --build build -j"$(nproc)" && sudo cmake --install build
+</pre>
+<p>S3 support needs the AWS SDK for C++ (<code>aws-cpp-sdk-s3</code>). The GCS importer needs <code>google-cloud-cpp</code>, and the GCS block device needs Poco (Net, NetSSL, Crypto, JSON). If one is missing, the build turns that option off with a warning.</p>
+
+<h2>Import objects</h2>
+<h3>1. Provide credentials</h3>
+<div class="tabs" data-label="Provider">
+  <section class="tab-panel" data-tab="Amazon S3"><p class="tab-title">Amazon S3</p>
+<pre data-label="shell">
+$ export AWS_ACCESS_KEY_ID=...
+$ export AWS_SECRET_ACCESS_KEY=...
+$ export AWS_DEFAULT_REGION=us-east-1
+$ export S3_ENDPOINT=https://s3.us-east-1.amazonaws.com   # or MinIO, Ceph, ...
+</pre>
+  <p><code>AWS_SESSION_TOKEN</code> is read for temporary credentials. <code>AWS_ENDPOINT_URL</code> works in place of <code>S3_ENDPOINT</code>. Set these in the environment of <code>clio_run start</code>, because downloads run inside the runtime.</p></section>
+  <section class="tab-panel" data-tab="Google Cloud Storage"><p class="tab-title">Google Cloud Storage</p>
+<pre data-label="shell">
+$ gcloud auth application-default login
+# or, for a service account:
+$ export GOOGLE_APPLICATION_CREDENTIALS=$HOME/keys/clio-sa.json
+</pre>
+  <p>The importer uses Application Default Credentials: the variable above, gcloud's stored login, or the metadata server on Google Cloud VMs. <code>GCS_ENDPOINT</code> overrides the endpoint, for example for an emulator.</p></section>
+</div>
+
+<h3>2. Import from Python</h3>
+<pre data-label="python">
+import os
+os.environ["CLIO_WITH_RUNTIME"] = "0"
+import clio_cee as cee
+
+ctx = cee.ContextInterface()
+rc = ctx.context_bundle([
+    cee.AssimilationCtx(src="s3://my-lab-bucket/runs/run42/output.bin",
+                        dst="iowarp::run42", format="binary"),
+    cee.AssimilationCtx(src="gs://my-lab-bucket/papers/ice-2024.txt",
+                        dst="iowarp::papers", format="binary"),
+])
+print("imported" if rc == 0 else f"failed: {rc}")
+</pre>
+<p>Each object becomes data under the destination tag, stored on your local tiers. <code>range_off</code> and <code>range_size</code> import part of an object. Imports in one bundle can depend on each other through <code>depends_on</code>.</p>
+
+<h3>3. Or describe imports in YAML</h3>
+<p>The same imports can be written as an OMNI file, which suits repeatable pipelines:</p>
+<pre data-label="yaml · imports.yaml">
+transfers:
+  - src: s3://my-lab-bucket/runs/run42/output.bin
+    dst: iowarp::run42
+    format: binary
+    depends_on: ""
+    range_off: 0
+    range_size: 0         # 0 = the whole object
+  - src: gs://my-lab-bucket/papers/ice-2024.txt
+    dst: iowarp::papers
+    format: binary
+</pre>
+<div class="callout">
+  <span class="callout-title">Imported data and the mount</span>
+  <p>Imports create CTE tags, not filesystem entries, so they do not show up under the mount. Find them from Python with <code>TagQuery</code>, <code>context_query</code> or <code>SemanticSearch</code>. To make an object appear as a file, copy it into the mount instead: <code>aws s3 cp s3://bucket/key ~/clio-mnt/</code>.</p>
+</div>
+
+<h2>Buckets as tiers</h2>
+<p>A build with <code>CLIO_ENABLE_AMAZON_DRIVE</code> or <code>CLIO_ENABLE_GOOGLE_CLOUD</code> can use a bucket as a storage tier. Give the tier <code>bdev_type: "s3"</code> or <code>"gcs"</code> and a path of the form <code>s3://bucket/prefix</code> or <code>gcs://bucket/prefix</code>. The prefix is required: CLIO Core appends <code>_node&lt;N&gt;</code> to the path for each node, and without a prefix that would change the bucket name.</p>
+
+<h3>1. Credentials for a bucket tier</h3>
+<div class="tabs" data-label="Provider">
+  <section class="tab-panel" data-tab="Amazon S3"><p class="tab-title">Amazon S3</p>
+<pre data-label="shell">
+$ export AWS_DEFAULT_REGION=us-east-1
+$ export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...
+</pre>
+  <p>Credentials come from the AWS SDK's usual sources: environment variables, <code>~/.aws/credentials</code>, or an instance role.</p></section>
+  <section class="tab-panel" data-tab="Google Cloud Storage"><p class="tab-title">Google Cloud Storage</p>
+<pre data-label="shell">
+$ export GCS_ACCESS_TOKEN=$(gcloud auth print-access-token)
+$ export GCS_PROJECT_ID=my-project        # used only when creating the bucket
+</pre>
+  <p>Access tokens expire after about an hour, so refresh the token and restart the runtime for long runs.</p></section>
+</div>
+
+<h3>2. Add the bucket to the tier list</h3>
+<p>In the <code>clio_cte_core</code> entry of <code>clio.yaml</code>, add the bucket below your local tiers:</p>
+<pre data-label="yaml">
+    storage:
+      - path: "ram::hot"
+        bdev_type: "ram"
+        capacity_limit: "16GB"
+        score: 1.0
+      - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
+        bdev_type: "file"
+        capacity_limit: "100GB"
+        score: 0.2
+        persistence_level: "temporary"
+      - path: "s3://my-lab-bucket/clio"      # or gcs://my-lab-bucket/clio
+        bdev_type: "s3"                      # or gcs
+        capacity_limit: "1TB"
+        score: 0.05
+        persistence_level: "long_term"
+</pre>
+<p>Give the bucket the lowest score, so only data the organizer demotes reaches it (see <a href="/tutorials/operators.html#tiering-where-data-moves-later">tiering</a>). The CTE roster in the <a href="/tutorials/dashboard.html">dashboard</a> lists it as a tier.</p>
+<p>If the runtime logs <code>CLIO_ENABLE_AMAZON_DRIVE is not defined. Cannot use S3 bdev.</code>, the build lacks the S3 option. Reconfigure with <code>-DCLIO_ENABLE_AMAZON_DRIVE=ON</code>.</p>

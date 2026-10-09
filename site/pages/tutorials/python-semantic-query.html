@@ -1,0 +1,137 @@
+<!--
+title: Query files from Python
+heading: Query the filesystem <em>from Python.</em>
+description: Search files written through the CLIO Core FUSE mount by BM25 keyword relevance or name pattern, and read them back from Python.
+eyebrow: Tutorial · Explore
+lede: Files you write through the mount are indexed as they land. From Python you can rank them by keyword relevance, filter them by path, and read their bytes, all without going through the mount.
+facts: Time | 15 minutes ; Modules | clio_cte_core_ext, clio_cee ; Search | BM25 over 1 MiB pages
+-->
+<h2>What you will build</h2>
+<p>A small script, <code>find.py</code>, that takes a question such as <em>"sea ice extent anomaly"</em> and prints the files in your mount that best match it, with the matching text.</p>
+<p>The script uses three facts from <a href="/docs/concepts.html">core concepts</a>:</p>
+<ul>
+  <li>Each file is a <strong>tag named by its path</strong> inside the mount.</li>
+  <li>Its bytes are <strong>page blobs</strong> named <code>"0"</code>, <code>"1"</code>, … of 1 MiB each. A small blob named <code>~i</code> holds its attributes, so search patterns use <code>[0-9]+</code> to match pages only.</li>
+  <li>The <strong>indexer</strong> (pool <code>564.0</code>) keeps a BM25 index of every page and serves search.</li>
+</ul>
+
+<h2>1. Put some text in the mount</h2>
+<pre data-label="shell">
+$ mkdir -p ~/clio-mnt/notes
+$ echo "Arctic sea ice extent fell to a record low in September."  > ~/clio-mnt/notes/ice.md
+$ echo "Ocean surface temperatures rose 0.3 C above the mean."      > ~/clio-mnt/notes/ocean.md
+$ echo "Atmospheric CO2 reached 421 ppm at Mauna Loa."             > ~/clio-mnt/notes/co2.md
+$ cp ~/papers/*.txt ~/clio-mnt/notes/          # any text you have
+</pre>
+<p>The indexer picks up new writes about every 100 ms, and a search waits for pending writes first. Results always include what you just wrote.</p>
+
+<h2>2. Connect</h2>
+<pre data-label="python · find.py">
+import os, sys
+os.environ.setdefault("CLIO_WITH_RUNTIME", "0")   # attach to `clio_run start`
+os.environ.setdefault("CLIO_CTE_POOL", "564.0")   # bind to the indexer layer
+
+import clio_cte_core_ext as cte
+
+cte.clio_init(cte.RuntimeMode.kClient, False)
+cte.initialize_cte("", cte.PoolQuery.Dynamic())
+client = cte.get_cte_client()
+</pre>
+<p>Binding to <code>564.0</code> is what makes <code>SemanticSearch</code> work: the storage core no longer serves search, and the indexer forwards every other call down the chain. Set both variables before the import.</p>
+
+<h2>3. List files by path</h2>
+<p>Tag and blob patterns are full-match regular expressions, so <code>.*notes/.*</code> matches every file under <code>notes</code>.</p>
+<pre data-label="python">
+paths = client.TagQuery(".*notes/.*", 0)
+print(paths)
+# ['/notes/ice.md', '/notes/ocean.md', '/notes/co2.md', ...]
+
+# Search results carry tag ids. Build a map back to paths.
+by_id = {}
+for p in paths:
+    tid = cte.Tag(p).GetTagId()
+    by_id[(tid.major_, tid.minor_)] = p
+</pre>
+<p>Use a pattern that does not depend on the exact prefix (<code>.*notes/.*</code> rather than <code>/notes/.*</code>). Your first <code>TagQuery(".*", 0)</code> shows how names look on your install. Subdirectories match too; they hold no pages, so they never appear in search results.</p>
+
+<h2>4. Rank files by relevance</h2>
+<pre data-label="python">
+question = " ".join(sys.argv[1:]) or "sea ice extent anomaly"
+hits = [h for h in client.SemanticSearch(".*notes/.*", "[0-9]+", question, 5)
+        if h.score > 0]                   # 0 means no query word appears
+
+for h in hits:
+    path = by_id.get((h.tag_id.major_, h.tag_id.minor_), "?")
+    page = int(h.blob_name)
+    print(f"{h.score:6.2f}  {path}  (MiB {page})")
+</pre>
+<pre data-label="example output">
+  2.41  /notes/ice.md  (MiB 0)
+  0.37  /notes/ocean.md  (MiB 0)
+</pre>
+<p>Scores are BM25: higher means a better match, and they are only comparable within one query. Every page that matches the two patterns is ranked, so pages without any query word come back with a score of 0; the filter drops them. A large file can match on several pages, so group by path if you want one row per file. <code>k</code> caps the results; <code>0</code> means no cap.</p>
+
+<h2>5. Read the matching text</h2>
+<pre data-label="python">
+for h in hits[:3]:
+    tag = cte.Tag(h.tag_id)
+    size = tag.GetBlobSize(h.blob_name)
+    text = tag.GetBlob(h.blob_name, size, 0).decode("utf-8", errors="replace")
+    print("──", by_id.get((h.tag_id.major_, h.tag_id.minor_)))
+    print(text[:300])
+</pre>
+<p>To read a whole file, read its pages in order:</p>
+<pre data-label="python">
+def read_file(path):
+    tag = cte.Tag(path)
+    pages = sorted((b for b in tag.GetContainedBlobs() if b.isdigit()), key=int)
+    return b"".join(tag.GetBlob(p, tag.GetBlobSize(p), 0) for p in pages)
+</pre>
+<p>This reads straight from the storage tiers and gives the same bytes as <code>open()</code> on the mount, without a FUSE round trip.</p>
+
+<h2>Narrow what gets indexed</h2>
+<p>By default the indexer tokenizes everything. For large binary datasets, restrict it in <code>clio.yaml</code> to the files worth searching:</p>
+<pre data-label="yaml">
+  - mod_name: clio_cte_indexer
+    pool_name: clio_cte_indexer
+    pool_query: local
+    pool_id: "564.0"
+    next_pool_id: "561.0"
+    index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
+    tag_re: ".*\\.(md|txt|csv|json)$"    # only index text-like files
+    blob_re: ".*"
+</pre>
+<p>The index persists under <code>index_log_path</code>, so a restart does not rescan your data.</p>
+
+<h2>The higher-level clio_cee API</h2>
+<p>For documents you add from Python rather than through the mount, <code>clio_cee</code> wraps import, listing, retrieval and deletion in four calls.</p>
+<pre data-label="python">
+import os
+os.environ.setdefault("CLIO_WITH_RUNTIME", "0")
+import clio_cee as cee
+
+ctx = cee.ContextInterface()
+rc = ctx.context_bundle([
+    cee.AssimilationCtx(src=f"string::{name}", dst="iowarp::climate_docs",
+                        format="string", src_data=text)
+    for name, text in [("ice", "Arctic sea ice extent fell to a record low."),
+                       ("co2", "Atmospheric CO2 reached 421 ppm.")]
+])
+print(rc)                                          # 0 on success
+print(ctx.context_query("climate_docs", ".*"))      # ['ice', 'co2'] in some order
+print(ctx.context_retrieve("climate_docs", ".*"))   # the texts, packed into one string
+ctx.context_destroy(["climate_docs"])
+</pre>
+<p><code>context_query</code> returns blob names only, which is why the tutorial above uses <code>clio_cte_core_ext</code> for mounted files. The full signatures are in the <a href="/docs/python-api.html">Python API reference</a>.</p>
+
+<h3>Keyword search over imported data</h3>
+<p><code>context_query(..., prompt="sea ice")</code> ranks imported blobs by BM25. In the default configuration it returns nothing: the import engine (pool <code>400.0</code>) writes straight to the storage core, below the indexer, so imports are never indexed. To index them, send imports through the top of the chain. In <code>clio.yaml</code>, move the <code>clio_cae_core</code> entry below the <code>clio_cte_cache</code> entry (an entry must come after the pool it forwards to) and change its <code>next_pool_id</code>:</p>
+<pre data-label="yaml">
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+    next_pool_id: "563.0"               # chain top (cache), so imports get indexed
+</pre>
+<p>Restart the runtime and import again. Then <code>ctx.context_query("climate_docs", ".*", max_results=2, prompt="sea ice minimum")</code> returns <code>['ice', 'co2']</code>, best match first. As with <code>SemanticSearch</code>, blobs without any query word are still ranked, after the matches.</p>
+<p>Next: <a href="/tutorials/dashboard.html">watch the same data in the dashboard</a>.</p>

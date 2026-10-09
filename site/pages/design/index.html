@@ -1,0 +1,167 @@
+<!--
+title: Design overview
+heading: How CLIO Core <em>is built.</em>
+description: How the Context Transfer Engine, its ChiMods, and the clio-fs filesystem are designed, and the performance and reliability tradeoffs behind them.
+eyebrow: Design
+lede: How the storage side of CLIO Core is built: the Context Transfer Engine (CTE), the ChiMods stacked on it, the clio-fs filesystem, and the runtime underneath. These pages describe mechanisms and the reasons behind them, with the costs stated alongside the benefits. There is no code here; for APIs, see the <a href="../docs/index.html">Docs</a>.
+-->
+<h2 id="pages">Pages</h2>
+<div class="card-grid">
+  <div class="card"><span class="tag">Foundation</span><h3><a href="runtime.html">Runtime and block devices</a></h3><p>Tasks and coroutines, transports, workers, routing, and the block-device module every tier sits on.</p></div>
+  <div class="card"><span class="tag">CTE core</span><h3><a href="cte-core.html">Data model and data path</a></h3><p>Tags, blobs and targets; hash ownership; the put and get paths; concurrency control.</p></div>
+  <div class="card"><span class="tag">CTE core</span><h3><a href="placement.html">Placement, tiering and eviction</a></h3><p>Scores, the placement engine, reorganization, the organizer, flushing and eviction.</p></div>
+  <div class="card"><span class="tag">Reliability</span><h3><a href="durability.html">Durability and recovery</a></h3><p>What is persisted, the ordering rules, what survives what, and how a restart recovers.</p></div>
+  <div class="card"><span class="tag">ChiMods</span><h3><a href="chain.html">The interposition chain</a></h3><p>Replication, cache, indexer, compressor, stream and checkpoint, and why they stack in that order.</p></div>
+  <div class="card"><span class="tag">Filesystem</span><h3><a href="filesystem.html">clio-fs and FUSE</a></h3><p>A distributed POSIX namespace made of blobs: directory blocks, inode homes, leases, rename, and the FUSE daemon.</p></div>
+  <div class="card"><span class="tag">Adapters</span><h3><a href="adapters.html">I/O adapters</a></h3><p>POSIX, STDIO and MPI-IO interception; the HDF5 VOL connector and VFD; ADIOS2; the GPU paths.</p></div>
+</div>
+
+<h2 id="stack">The stack</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 470" role="img" aria-label="Full storage stack">
+    <defs><marker id="ah0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <text class="muted" x="20" y="22">FRONT ENDS</text>
+    <rect class="box alt" x="20" y="32" width="190" height="50" rx="8"/><text class="title" x="34" y="62">FUSE mount</text>
+    <rect class="box alt" x="225" y="32" width="190" height="50" rx="8"/><text class="title" x="239" y="54">Interceptors</text><text class="muted" x="239" y="72">POSIX, STDIO, MPI-IO</text>
+    <rect class="box alt" x="430" y="32" width="190" height="50" rx="8"/><text class="title" x="444" y="54">HDF5 / ADIOS2</text><text class="muted" x="444" y="72">VOL, VFD, engine</text>
+    <rect class="box alt" x="635" y="32" width="205" height="50" rx="8"/><text class="title" x="649" y="54">C++ / Python / GPU</text><text class="muted" x="649" y="72">core client API</text>
+
+    <text class="muted" x="20" y="112">NAMESPACE AND STREAMS</text>
+    <rect class="box hl" x="20" y="122" width="395" height="50" rx="8"/><text class="title" x="34" y="144">Filesystem ChiMod (clio-fs)</text><text class="muted" x="34" y="162">directory blocks, inodes, handles</text>
+    <rect class="box hl" x="430" y="122" width="190" height="50" rx="8"/><text class="title" x="444" y="144">Stream</text><text class="muted" x="444" y="162">sizes, ordered appends</text>
+
+    <text class="muted" x="20" y="202">INTERPOSITION CHAIN</text>
+    <rect class="box hl" x="20" y="212" width="190" height="44" rx="8"/><text class="title" x="34" y="239">Cache</text>
+    <rect class="box hl" x="225" y="212" width="190" height="44" rx="8"/><text class="title" x="239" y="239">Indexer</text>
+    <rect class="box" x="430" y="212" width="190" height="44" rx="8" stroke-dasharray="5 4"/><text class="title" x="444" y="239">Compressor</text>
+    <rect class="box hl" x="635" y="212" width="205" height="44" rx="8"/><text class="title" x="649" y="239">Replication</text>
+    <path class="edge hl" d="M210,234 L223,234" marker-end="url(#ah0)"/>
+    <path class="edge hl" d="M415,234 L428,234" marker-end="url(#ah0)"/>
+    <path class="edge hl" d="M620,234 L633,234" marker-end="url(#ah0)"/>
+
+    <text class="muted" x="20" y="286">STORAGE ENGINE</text>
+    <rect class="box hl" x="20" y="296" width="820" height="54" rx="8"/><text class="title" x="34" y="320">CTE core</text><text class="muted" x="34" y="338">hash-owned blob metadata · placement engine · write-ahead log · reorganize / flush / evict</text>
+
+    <text class="muted" x="20" y="380">DEVICES (bdev pools)</text>
+    <rect class="box" x="20" y="390" width="190" height="44" rx="8"/><text x="34" y="417">RAM / HBM / pinned</text>
+    <rect class="box" x="225" y="390" width="190" height="44" rx="8"/><text x="239" y="417">NVMe / SSD file</text>
+    <rect class="box" x="430" y="390" width="190" height="44" rx="8"/><text x="444" y="417">HDD / PFS file</text>
+    <rect class="box" x="635" y="390" width="205" height="44" rx="8"/><text x="649" y="417">S3 / GCS</text>
+    <text class="muted" x="20" y="460">All of it runs as tasks inside the CLIO runtime: one process per node, coroutines on a few worker threads.</text>
+  </svg>
+  <figcaption>Front ends reach the CTE through the namespace layer
+  (FUSE, interceptors) or directly (HDF5, ADIOS2, the API). Every layer
+  below the front ends is a ChiMod pool, and every arrow between them is a
+  task.</figcaption>
+</figure>
+
+<h2 id="principles">Design principles</h2>
+<ol>
+  <li><strong>No central metadata service.</strong> Every blob, tag,
+  directory block and inode has exactly one home container chosen by
+  hashing. There is no metadata server to scale or fail over. The cost
+  is that whole-namespace questions (sizes, listings, searches) are
+  broadcasts.</li>
+  <li><strong>One writer per object.</strong> Each object's home
+  serializes its mutations. That makes versioning, coherence and crash
+  ordering tractable. Parallelism comes from many objects, not from
+  concurrent writers to one object.</li>
+  <li><strong>Everything is a blob.</strong> File data, directory blocks,
+  inode records, extended attributes and staged appends are all ordinary
+  CTE blobs. One tiering, replication and durability mechanism covers data
+  and metadata alike.</li>
+  <li><strong>Mechanism in the core, policy in layers.</strong> The core
+  provides replica slots, transform flags, invalidation, fault handlers and
+  conditional puts. Replication, caching, compression, indexing and
+  filesystem semantics are separate, optional ChiMods composed into a
+  chain.</li>
+  <li><strong>Operators rank tiers; data carries a score.</strong>
+  Placement matches a blob's score to configured tier scores, and
+  measurements only break ties. Movement between tiers is explicit, by
+  rescoring, flushing or eviction, and always copies before it frees.</li>
+  <li><strong>Durable on fsync, like ext4.</strong> Acknowledged writes
+  run at memory speed. Power-loss and node-loss durability are paid for
+  on request, through <code>fsync</code> and replication.</li>
+  <li><strong>Order operations so a crash leaks rather than
+  corrupts.</strong> Logs trail data, new copies precede frees, records
+  precede names, link counts rise before links appear. The failure mode is
+  wasted space, never a reference to the wrong bytes.</li>
+  <li><strong>Fail closed.</strong> Lost volatile data reads as an I/O
+  error, not zeros. Expired caches that cannot be revalidated fail, rather
+  than serving stale data. Coherence stamps that cannot vouch for a file
+  drop the cache.</li>
+  <li><strong>Keep hot paths off the network.</strong> Zero-IPC reads from
+  shared memory, local path resolution from pushed caches, write sieves and
+  write-behind, and node-local cache copies all exist to turn common
+  operations into memory accesses.</li>
+</ol>
+
+<h2 id="walkthrough">One write, end to end</h2>
+<p>An application on node A appends 4 KiB to
+<code>/mnt/clio/run/log.txt</code> through the FUSE mount, then calls
+<code>fsync</code>.</p>
+<ol>
+  <li><strong>Kernel to daemon.</strong> FUSE delivers the write to the
+  daemon on node A. On a single node, the kernel's cached size supplies
+  the append offset. On a multi-node mount, the append is staged locally
+  and merged by the file's stream home.</li>
+  <li><strong>Sieve.</strong> The bytes are copied into the client's
+  write sieve: a 64 KiB shared-memory page for the file's 1 MiB page
+  blob. The write returns immediately.</li>
+  <li><strong>Ship.</strong> Within about 500 µs the sieve page is sent
+  as a put to the filesystem's chain. The cache layer routes it to node A.
+  The file's page blob is owned by node B, the hash of (file tag, page
+  number), so the authoritative put travels to B. B invalidates other
+  nodes' cache copies and registers A's copy.</li>
+  <li><strong>Owner.</strong> On B, replication writes the primary (and any
+  remote copies) and passes the put to the core. The core takes the blob's
+  write token, drains readers, places the bytes (the RAM tier, since the
+  blob's score defaults to 1.0), writes them, logs the new layout, and
+  acknowledges.</li>
+  <li><strong><code>fsync</code>.</strong> The daemon drains the sieve,
+  publishes the file's size to its stream home, and waits for replication.
+  It then syncs the file's tag: B moves the page blob to a persistent tier
+  (place, swap, log, free) and fsyncs that device and its metadata log. The
+  daemon then fsyncs the stream's size log and syncs the parent directory's
+  tag, so the name is durable too. Only then does <code>fsync</code>
+  return.</li>
+</ol>
+<p>Any later reader on node A finds the bytes in its node-local cache copy
+and reads them through shared memory without a request. A reader on node C
+fetches them from B and gets a cache copy of its own, registered against
+B's current version.</p>
+
+<h2 id="ledger">Tradeoff summary</h2>
+<table class="tradeoffs">
+  <tr><th>Area</th><th>Optimized for</th><th>Accepted cost</th></tr>
+  <tr><td><a href="cte-core.html#distribution">Ownership</a></td><td class="good">Scale-out metadata with no single point of failure</td><td class="cost">Broadcasts for sizes, listings, search; hot single blobs are serialized</td></tr>
+  <tr><td><a href="cte-core.html#concurrency">Concurrency</a></td><td class="good">Lock-free reads, crash-safe mutations</td><td class="cost">Writers to one blob spin-yield with no fairness</td></tr>
+  <tr><td><a href="placement.html">Tiering</a></td><td class="good">Predictable placement, safe moves</td><td class="cost">Moves copy whole blobs and need 2× space; the organizer often does not pay for short jobs</td></tr>
+  <tr><td><a href="placement.html#evict">Eviction</a></td><td class="good">Authoritative data is never silently dropped</td><td class="cost">Full tiers of real data return ENOSPC; each eviction pass is a full scan</td></tr>
+  <tr><td><a href="durability.html">Durability</a></td><td class="good">Memory-speed writes, durability on request</td><td class="cost">Seconds of power-loss exposure for un-synced data; one copy by default</td></tr>
+  <tr><td><a href="durability.html#wal">Metadata log</a></td><td class="good">Uncontended per-worker logging, cheap snapshots</td><td class="cost">No per-record checksums; recovery continues on partial state</td></tr>
+  <tr><td><a href="chain.html#replication">Replication</a></td><td class="good">Availability while degraded</td><td class="cost">Not quorum-based: degraded writes keep fewer copies and are not re-replicated</td></tr>
+  <tr><td><a href="chain.html#cache">Caching</a></td><td class="good">Strong coherence, local reads</td><td class="cost">Extra local writes and owner fan-out on invalidation</td></tr>
+  <tr><td><a href="filesystem.html#consistency">Filesystem</a></td><td class="good">Never serves stale namespace state</td><td class="cost">Mutations can stall ~12 s behind a partitioned holder; rename is multi-step</td></tr>
+  <tr><td><a href="filesystem.html#fuse">FUSE</a></td><td class="good">Microsecond stat and write-behind data path</td><td class="cost">Fast paths are single-node; errors surface at close or fsync</td></tr>
+  <tr><td><a href="adapters.html">Adapters</a></td><td class="good">Drop-in acceleration without code changes</td><td class="cost">Interceptors relax fsync and MPI-IO semantics; HDF5 caching never speeds up writes</td></tr>
+  <tr><td><a href="runtime.html#network">Membership</a></td><td class="good">No false "dead" verdicts at scale</td><td class="cost">Slow failure detection; no automatic container recovery</td></tr>
+</table>
+
+<h2 id="maturity">Component maturity</h2>
+<table>
+  <tr><th>Component</th><th>In the default build and config</th><th>Status</th></tr>
+  <tr><td>CTE core, bdev, filesystem, stream</td><td>Yes</td><td>Production path, extensively hardened at 16–64 nodes and under file-system stress suites</td></tr>
+  <tr><td>Replication, cache</td><td>Yes</td><td>Production path. Replication factor 1 by default.</td></tr>
+  <tr><td>Indexer</td><td>Yes</td><td>Stable; lexical search only</td></tr>
+  <tr><td>Compressor</td><td>Built only with the compression option; not composed by default</td><td>Pinned codecs are mature. Dynamic codec selection is experimental.</td></tr>
+  <tr><td>Checkpoint (lazy copies)</td><td>Built; created on demand</td><td>New</td></tr>
+  <tr><td>HDF5 VOL connector and VFD</td><td>Source build option</td><td>Covered by differential compatibility suites</td></tr>
+  <tr><td>POSIX, STDIO and MPI-IO interceptors</td><td>Source build, with ELF interception</td><td>Usable, with the semantic limits described on the adapters page</td></tr>
+  <tr><td>GPU vector, UVM, LLM hooks</td><td>GPU / LLM build options</td><td>Research and prototype stage</td></tr>
+</table>
+
+<p class="lede">These pages describe the
+<code>dev</code> branch as of October 2026. When the design changes,
+update the matching page. Each page is self-contained and links to its
+neighbors.</p>

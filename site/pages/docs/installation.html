@@ -1,0 +1,184 @@
+<!--
+title: Installation
+heading: Install <em>CLIO Core.</em>
+description: Install CLIO Core with pip, conda, Docker, Spack, native packages, or from source on Linux, macOS and Windows.
+eyebrow: Docs
+lede: The pip wheel is the quickest start. Build from source only for GPUs, MPI, HDF5, ADIOS2, the I/O interceptors, or FUSE on macOS.
+facts: Time | 2 to 20 minutes ; Python | 3.10 to 3.13 for pip ; Needs root | Only for FUSE drivers and system installs
+-->
+<h2>Choose a method</h2>
+<p>Pick the method that fits your machine. Only its instructions are shown. Most people should start with pip.</p>
+<div class="tabs picker" data-label="Install method">
+  <section class="tab-panel" id="pip" data-tab="pip" data-note="Quickest start. Includes the FUSE mount on Linux and Windows."><p class="tab-title">pip</p>
+<p class="panel-meta"><strong>Platforms:</strong> Linux x86_64 and aarch64 (glibc 2.28+), Windows x64, macOS 14+ on Apple Silicon</p>
+<p>The wheel is self-contained. Its dependencies are linked statically on Linux and bundled on macOS and Windows. The only extra software you might need is a FUSE driver to mount the filesystem.</p>
+<pre data-label="shell">
+$ pip install iowarp-core
+$ python -c "import iowarp_core; print(iowarp_core.get_version())"
+</pre>
+<p>The wheel puts these commands on your <code>PATH</code>: <code>clio_run</code>, <code>clio_cte_fuse</code> (Linux and Windows), <code>clio_cte_bench</code> and <code>clio_run_thrpt_bench</code>. It also gives you the Python modules <code>iowarp_core</code>, <code>clio_cee</code> and <code>clio_cte_core_ext</code>.</p>
+<p>The first time Python imports <code>iowarp_core</code>, it copies the default configuration to <code>~/.clio/clio.yaml</code>. It never overwrites an existing file.</p>
+<div class="callout">
+  <span class="callout-title">To mount the filesystem</span>
+  <p>Linux needs the system FUSE 3 package (<code>sudo apt install fuse3 libfuse3-3</code>). Windows needs <a href="https://winfsp.dev/rel/">WinFsp</a>. The macOS wheel has no FUSE binary, so <a href="#source">build from source</a> on macOS to mount.</p>
+</div>
+<div class="callout warn">
+  <span class="callout-title">Other Python versions</span>
+  <p>Wheels are published for CPython 3.10 to 3.13 only, and there is no source distribution. On Python 3.14, or any other platform, pip reports "no matching distribution". Use another method there.</p>
+</div>
+  </section>
+  <section class="tab-panel" id="conda" data-tab="conda" data-note="Conda-managed environments."><p class="tab-title">conda</p>
+<p class="panel-meta"><strong>Platforms:</strong> linux-64, Python 3.12</p>
+<p>Packages are published to the <code>iowarp</code> channel on Anaconda.org for linux-64 and Python 3.12. They are built from the <code>release</code> preset and do not include the FUSE adapter.</p>
+<pre data-label="shell">
+$ conda create -n iowarp -c iowarp -c conda-forge python=3.12 iowarp-core
+$ conda activate iowarp
+$ clio_run --help
+</pre>
+<h4>Build the recipe yourself</h4>
+<p>To enable other features, build the recipe yourself. <code>IOWARP_PRESET</code> picks a preset from <code>CMakePresets.json</code>:</p>
+<pre data-label="shell">
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ cd clio-core
+$ conda install -n base -y conda-build -c conda-forge
+$ IOWARP_PRESET=release conda build installers/conda/ -c conda-forge --output-folder build/conda-output
+$ conda install -c conda-forge build/conda-output/*/iowarp-core-*.conda
+</pre>
+  </section>
+  <section class="tab-panel" id="docker" data-tab="Docker" data-note="Containers and Compose stacks."><p class="tab-title">Docker</p>
+<p class="panel-meta"><strong>Platforms:</strong> amd64, arm64</p>
+<p>The <code>iowarp/deploy-cpu</code> image is multi-arch (amd64 and arm64). It includes MPI, the HDF5 VOL connector, ADIOS2 and compression. It runs as the <code>iowarp</code> user. Its default command is a shell, so pass <code>clio_run start</code> yourself.</p>
+<pre data-label="shell">
+$ docker pull iowarp/deploy-cpu:latest
+$ docker run -d -p 9413:9413 -p 8080:8080 -e CLIO_VIZ_BIND=0.0.0.0 \
+    --memory=8g --name iowarp iowarp/deploy-cpu:latest clio_run start
+</pre>
+<p>Port 9413 is the runtime RPC port and 8080 is the dashboard. <code>:latest</code> is rebuilt from the <code>main</code> branch.</p>
+<h4>As a long-running service</h4>
+<p>For a long-running service, mount your own config and a volume for state. That keeps the persistent tier, the metadata log and the search index across <code>docker compose down</code>:</p>
+<pre data-label="docker-compose.yml">
+services:
+  iowarp:
+    image: iowarp/deploy-cpu:latest
+    volumes:
+      - ./clio.yaml:/etc/iowarp/clio.yaml:ro
+      - iowarp-state:/home/iowarp/.clio
+    environment:
+      - CLIO_SERVER_CONF=/etc/iowarp/clio.yaml
+      - CLIO_VIZ_BIND=0.0.0.0
+    ports:
+      - "9413:9413"
+      - "8080:8080"
+    mem_limit: 8g
+    command: ["clio_run", "start"]
+    restart: unless-stopped
+volumes:
+  iowarp-state:
+</pre>
+<p>CLIO Core uses <code>memfd_create()</code> for shared memory on Linux, so <code>/dev/shm</code> needs no tuning. Only <code>mem_limit</code> matters.</p>
+  </section>
+  <section class="tab-panel" id="spack" data-tab="Spack" data-note="HPC clusters with module systems."><p class="tab-title">Spack</p>
+<p class="panel-meta"><strong>Platforms:</strong> Linux x86_64 and aarch64</p>
+<ol class="steps">
+  <li><h4>Install a recent Spack</h4>
+<pre data-label="shell">
+$ git clone --depth=2 https://github.com/spack/spack.git
+$ . spack/share/spack/setup-env.sh
+</pre></li>
+  <li><h4>Add the IOWarp repository</h4>
+<pre data-label="shell">
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ spack repo add clio-core/installers/spack
+</pre></li>
+  <li><h4>Install</h4>
+<pre data-label="shell">
+$ spack install iowarp +fuse
+</pre>
+  <p>The package tracks the <code>main</code> (default) and <code>dev</code> branches. Variants include <code>+fuse</code>, <code>+python</code>, <code>+adios2</code>, <code>+mochi</code>, <code>+compress</code>, <code>+encrypt</code>, <code>+cuda</code>, <code>+rocm</code>, <code>+s3</code> and <code>+gcs</code>. HDF5, MPI-IO and ELF interception are on by default in Spack.</p></li>
+</ol>
+  </section>
+  <section class="tab-panel" id="packages" data-tab="Packages" data-note=".deb, .rpm, AppImage, Windows installer."><p class="tab-title">Packages</p>
+<p class="panel-meta"><strong>Platforms:</strong> Ubuntu 24.04, Fedora 40, Windows x64</p>
+<p>Each tagged release on <a href="https://github.com/iowarp/clio-core/releases">GitHub Releases</a> carries <code>.deb</code> (Ubuntu 24.04) and <code>.rpm</code> (Fedora 40) packages and an AppImage for x86_64 and arm64, plus a ZIP and an installer for Windows x64. They include the FUSE adapter but not the Python bindings. They do not create <code>~/.clio/clio.yaml</code>. Without that file the runtime uses built-in defaults. Set <code>CLIO_SERVER_CONF</code> to use your own file.</p>
+  </section>
+  <section class="tab-panel" id="source" data-tab="Source" data-note="GPUs, MPI, HDF5, ADIOS2, FUSE on macOS."><p class="tab-title">Source</p>
+<p class="panel-meta"><strong>Platforms:</strong> Linux, macOS, Windows</p>
+<p>You need a C++20 compiler (GCC 11+ or Clang 14+) and CMake 3.20 or newer.</p>
+<div class="tabs" data-platform data-label="Platform">
+  <section class="tab-panel" data-tab="Linux"><p class="tab-title">Linux</p>
+<pre data-label="shell">
+$ sudo apt install -y build-essential cmake ninja-build pkg-config git \
+    python3 python3-pip python3-venv libfuse3-dev fuse3 \
+    libyaml-cpp-dev libcereal-dev libmsgpack-dev libsodium-dev libzmq3-dev
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ cd clio-core
+$ cmake --preset release-fuse
+$ cmake --build build -j"$(nproc)"
+$ sudo cmake --install build
+</pre>
+  <p>As an alternative to apt, <code>CI/ci-deps.sh --only-deps release</code> builds every dependency into a conda environment.</p></section>
+  <section class="tab-panel" data-tab="macOS"><p class="tab-title">macOS</p>
+<pre data-label="shell">
+$ brew install --cask macfuse
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ cd clio-core
+$ ./CI/ci-deps.sh --only-deps release
+$ conda activate iowarp
+$ cmake --preset release-mac-fuse -DCLIO_CORE_ENABLE_CONDA=ON
+$ cmake --build build-mac-fuse -j"$(sysctl -n hw.ncpu)"
+</pre>
+  <p>The <code>release-mac-fuse</code> preset builds into <code>build-mac-fuse</code>. macFUSE needs a one-time approval in System Settings. See <a href="/tutorials/fuse-macos.html">FUSE on macOS</a>.</p></section>
+  <section class="tab-panel" data-tab="Windows"><p class="tab-title">Windows</p>
+<pre data-label="powershell">
+PS> git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+PS> cd clio-core
+PS> cmake --preset windows-release -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON
+PS> cmake --build build --config Release
+</pre>
+  <p>Dependencies come from vcpkg. Set <code>VCPKG_ROOT</code> first; the manifest is <code>installers/vcpkg/vcpkg.json</code>. The FUSE adapter uses WinFsp. Install the WinFsp MSI with its developer files (<code>ADDLOCAL=ALL</code>).</p></section>
+</div>
+
+<h4>Presets</h4>
+<div class="table-wrap"><table>
+  <thead><tr><th>Preset</th><th>Builds</th></tr></thead>
+  <tbody>
+    <tr><td><code>release</code>, <code>debug</code></td><td>CPU build with all engines, into <code>build</code></td></tr>
+    <tr><td><code>release-fuse</code></td><td>Adds the FUSE adapter on Linux</td></tr>
+    <tr><td><code>release-mac-fuse</code></td><td>FUSE adapter on macOS, into <code>build-mac-fuse</code></td></tr>
+    <tr><td><code>release-adapter</code></td><td>MPI, HDF5 VOL, ADIOS2 and FUSE adapters</td></tr>
+    <tr><td><code>vfd</code></td><td>HDF5 VFD plus ELF interception, into <code>build-vfd</code></td></tr>
+    <tr><td><code>cuda-release</code>, <code>rocm-debug</code>, <code>sycl-debug</code></td><td>NVIDIA, AMD and Intel GPUs</td></tr>
+    <tr><td><code>windows-release</code>, <code>windows-debug</code></td><td>Visual Studio and vcpkg</td></tr>
+    <tr><td><code>asan</code>, <code>ubsan</code>, <code>msan</code>, <code>leak-check</code></td><td>Sanitizer builds for development</td></tr>
+  </tbody>
+</table></div>
+
+<h4>Feature options</h4>
+<div class="table-wrap"><table>
+  <thead><tr><th>Option</th><th>Default</th><th>Enables</th></tr></thead>
+  <tbody>
+    <tr><td><code>CLIO_CTE_ENABLE_FUSE_ADAPTER</code></td><td>OFF</td><td><code>clio_cte_fuse</code> (libfuse3, macFUSE or WinFsp)</td></tr>
+    <tr><td><code>CLIO_CORE_ENABLE_PYTHON</code></td><td>OFF</td><td>Python bindings</td></tr>
+    <tr><td><code>CLIO_ENABLE_AMAZON_DRIVE</code></td><td>OFF</td><td>S3 block devices (AWS SDK)</td></tr>
+    <tr><td><code>CLIO_ENABLE_GOOGLE_CLOUD</code></td><td>OFF</td><td>Google Cloud Storage block devices (Poco)</td></tr>
+    <tr><td><code>CAE_ENABLE_S3</code>, <code>CAE_ENABLE_GCS</code></td><td>OFF</td><td>Import <code>s3://</code> and <code>gs://</code> objects</td></tr>
+    <tr><td><code>CLIO_CORE_ENABLE_ELF</code></td><td>OFF</td><td>ELF interception for the POSIX, STDIO and MPI-IO adapters</td></tr>
+    <tr><td><code>CLIO_CTE_ENABLE_HDF5_VOL</code>, <code>CLIO_CTE_ENABLE_VFD</code></td><td>OFF</td><td>HDF5 connectors</td></tr>
+    <tr><td><code>CLIO_CTE_ENABLE_ADIOS2</code></td><td>OFF</td><td>ADIOS2 engine plugin</td></tr>
+    <tr><td><code>CLIO_CTE_ENABLE_COMPRESS</code></td><td>OFF</td><td>The compressor module</td></tr>
+    <tr><td><code>CLIO_CORE_ENABLE_{CUDA,ROCM,SYCL}</code></td><td>OFF</td><td>GPU backends</td></tr>
+  </tbody>
+</table></div>
+<p>When an adapter's dependency is missing, the build skips it with a warning rather than failing. Check the configure output for the features you need.</p>
+  </section>
+</div>
+
+<h2>After installing</h2>
+<p>The runtime reads its configuration from the first of these that exists:</p>
+<ol>
+  <li><code>$CLIO_SERVER_CONF</code></li>
+  <li><code>~/.clio/clio.yaml</code></li>
+  <li>Built-in defaults: port 9413, a RAM tier sized from system memory, and persistent state under <code>~/.clio</code></li>
+</ol>
+<p>Upgrades never touch an existing <code>~/.clio/clio.yaml</code>. If a release adds modules to the default configuration, merge them from <code>&lt;prefix&gt;/etc/clio/clio_default.yaml</code>, or delete your copy so it is created again. Uninstall with the package manager you installed with.</p>
+<p>Next, <a href="/docs/basic-usage.html">start the runtime and mount the filesystem</a>.</p>

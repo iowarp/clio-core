@@ -1,0 +1,181 @@
+<!--
+title: Compose local tiers
+heading: Compose the context filesystem <em>from local storage.</em>
+description: Combine RAM, NVMe, SSD and disk into one tiered CLIO Core store with a YAML file, choose scores and persistence, and verify it in the dashboard.
+eyebrow: Tutorial · Compose
+lede: Describe your RAM, NVMe, SSD and disks in the <code>storage</code> list of <code>clio.yaml</code>. CLIO Core places new data on the fastest tier with room, and keeps a persistent copy on the tier you mark as durable.
+facts: Time | 15 minutes ; You need | A working install, a few GB on each device ; Result | A four-tier filesystem
+-->
+<h2>How a tier is described</h2>
+<p>Each entry under the CTE pool's <code>storage</code> list is one tier:</p>
+<pre data-label="yaml">
+- path: "/mnt/nvme/clio/tier"     # "ram::<name>" for DRAM, or a file path on the device
+  bdev_type: "file"               # ram | file  (hbm, pinned on GPU builds)
+  capacity_limit: "200GB"         # required; "0g" on a ram tier means 80% of DRAM
+  score: 0.9                      # 0.0 slowest ... 1.0 fastest; omit for automatic
+  persistence_level: "temporary"  # volatile (default) | temporary | long_term
+</pre>
+<div class="table-wrap"><table>
+  <thead><tr><th>Key</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>path</code></td><td>Where the tier lives. NVMe, SSD and HDD are all <code>file</code> tiers; the device is whatever the path is on. <code>${HOME}</code> and <code>${CLIO_STORAGE_ROOT}</code> are expanded. CLIO Core appends <code>_node&lt;N&gt;</code> to the path for each node it places data on.</td></tr>
+    <tr><td><code>capacity_limit</code></td><td>The most the tier may use. File tiers grow lazily, so this is a cap, not an upfront allocation.</td></tr>
+    <tr><td><code>score</code></td><td>Tier speed, from 0 to 1. Placement prefers higher scores. The organizer moves blobs toward the tier that matches their own score.</td></tr>
+    <tr><td><code>persistence_level</code></td><td>How long data lasts. Persistent copies only go to <code>temporary</code> or <code>long_term</code> tiers. A volatile-only setup loses everything on shutdown.</td></tr>
+  </tbody>
+</table></div>
+
+<h2>1. Start from the default configuration</h2>
+<p>Copy the default file, so you keep the module chain (replication, indexer, cache, filesystem) and change only the tiers:</p>
+<pre data-label="shell">
+$ cp ~/.clio/clio.yaml ~/clio-tiers.yaml
+$ sudo mkdir -p /mnt/nvme/clio /mnt/ssd/clio /mnt/hdd/clio
+$ sudo chown $USER /mnt/nvme/clio /mnt/ssd/clio /mnt/hdd/clio
+</pre>
+<p>Use your own mount points. On a laptop, two directories on the internal SSD are enough to follow along.</p>
+
+<h2>2. Describe the tiers</h2>
+<p>Open <code>~/clio-tiers.yaml</code> and find the entry with <code>mod_name: clio_cte_core</code>. Replace its <code>storage</code> list:</p>
+<pre data-label="yaml · ~/clio-tiers.yaml">
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+
+    storage:
+      - path: "ram::hot"                 # DRAM: the working set
+        bdev_type: "ram"
+        capacity_limit: "16GB"
+        score: 1.0
+
+      - path: "/mnt/nvme/clio/tier"      # local NVMe: staged and recent data
+        bdev_type: "file"
+        capacity_limit: "200GB"
+        score: 0.9
+
+      - path: "/mnt/ssd/clio/tier"       # SATA SSD: durable copies
+        bdev_type: "file"
+        capacity_limit: "500GB"
+        score: 0.5
+        persistence_level: "temporary"
+
+      - path: "/mnt/hdd/clio/tier"       # disk: capacity
+        bdev_type: "file"
+        capacity_limit: "4TB"
+        score: 0.2
+        persistence_level: "long_term"
+
+    performance:
+      metadata_log_path: "${CLIO_STORAGE_ROOT}/cte_metadata_log"
+      transaction_log_capacity: "32MB"
+
+    dpe:
+      dpe_type: "max_bw"                 # max_bw | round_robin | random
+</pre>
+<p>Keep <code>pool_id: "512.0"</code>: the FUSE daemon and every client look for the storage engine there. Keep the <code>metadata_log_path</code> too. Without it, the persistent tiers keep their bytes across a restart but nothing records which file they belong to.</p>
+
+<h3>Placement policies</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th><code>dpe_type</code></th><th>Behavior</th><th>Use when</th></tr></thead>
+  <tbody>
+    <tr><td><code>max_bw</code></td><td>Fastest tier with room first</td><td>Almost always; the default</td></tr>
+    <tr><td><code>round_robin</code></td><td>Rotates across tiers</td><td>Several devices of the same speed</td></tr>
+    <tr><td><code>random</code></td><td>Random tier</td><td>Benchmarks and testing</td></tr>
+  </tbody>
+</table></div>
+
+<h2>3. Point replication at your durable tier</h2>
+<p>The replication module writes a persistent copy of every file. It places those copies with <code>replica_score</code>, which defaults to 0.2. Set it to your durable tier's score. In this example that is the SSD:</p>
+<pre data-label="yaml">
+  - mod_name: clio_cte_replication
+    pool_name: clio_cte_replication
+    pool_query: local
+    pool_id: "561.0"
+    next_pool_id: "512.0"
+    num_replicas: 1
+    cache_score: 1.0
+    replica_score: 0.5      # matches the SSD tier above
+</pre>
+
+<h2>4. Start with the new tiers</h2>
+<p>Use a fresh storage root for the experiment, so the new layout does not meet metadata from the old one:</p>
+<pre data-label="shell">
+$ clio_run stop
+$ export CLIO_SERVER_CONF=~/clio-tiers.yaml
+$ clio_run start --disk /mnt/ssd/clio/state &
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
+</pre>
+<p>If a tier is misconfigured, the runtime logs a <code>Config error:</code> line that names the key. Check for one before you mount.</p>
+
+<h2>5. Check the result</h2>
+<ol class="steps">
+  <li><h4>List the pools</h4>
+<pre data-label="shell">
+$ clio_run compose list
+</pre></li>
+  <li><h4>Open the tier roster</h4><p>Go to <a href="http://127.0.0.1:8080">127.0.0.1:8080</a>, then <strong>Pools → clio_cte_core</strong>. You should see one row per tier, with its score, capacity and free space.</p></li>
+  <li><h4>Write data and watch it land</h4>
+<pre data-label="shell">
+$ dd if=/dev/urandom of=~/clio-mnt/sample.bin bs=1M count=2048
+</pre>
+  <p>The RAM row's free space drops first. The SSD row's <em>bytes written</em> grows a moment later, as persistent copies land. Once RAM is full, new pages go to NVMe.</p></li>
+</ol>
+
+<h2>Other layouts</h2>
+<div class="tabs" data-label="Layout">
+  <section class="tab-panel" data-tab="Laptop"><p class="tab-title">Laptop</p>
+<pre data-label="yaml">
+storage:
+  - path: "ram::hot"
+    bdev_type: "ram"
+    capacity_limit: "4GB"
+    score: 1.0
+  - path: "${CLIO_STORAGE_ROOT}/ssd_tier.dat"
+    bdev_type: "file"
+    capacity_limit: "50GB"
+    score: 0.2
+    persistence_level: "temporary"
+</pre></section>
+  <section class="tab-panel" data-tab="HPC node"><p class="tab-title">HPC node</p>
+<pre data-label="yaml">
+storage:
+  - path: "ram::hot"
+    bdev_type: "ram"
+    capacity_limit: "64GB"
+    score: 1.0
+  - path: "/local/nvme/clio"             # node-local burst buffer
+    bdev_type: "file"
+    capacity_limit: "1TB"
+    score: 0.9
+  - path: "/lustre/myproject/clio"       # parallel filesystem
+    bdev_type: "file"
+    capacity_limit: "10TB"
+    score: 0.2
+    persistence_level: "long_term"
+</pre></section>
+  <section class="tab-panel" data-tab="RAM only"><p class="tab-title">RAM only</p>
+<pre data-label="yaml">
+storage:
+  - path: "ram::scratch"
+    bdev_type: "ram"
+    capacity_limit: "0g"     # 80% of DRAM
+    score: 1.0
+# Volatile: everything is lost on stop. Keep the rest of the
+# chain as it is; the runtime logs that nothing will survive
+# a restart.
+</pre></section>
+</div>
+
+<h2>Add a tier while running</h2>
+<p>You can register a tier without restarting. Open <strong>Pools → clio_cte_core</strong> in the dashboard and fill in the <strong>register</strong> form: a target name, a type and a capacity create a new block device and add it as a tier. A pool id in <strong>attach</strong> adds an existing block device pool instead. The form calls a REST route you can also use directly:</p>
+<pre data-label="shell">
+$ curl -s --data-urlencode name=/mnt/nvme/clio/extra.dat -d bdev_type=file -d capacity=100GB     http://127.0.0.1:8080/api/mod/clio_cte_core/512.0/register_target
+{"ok":true,"name":"/mnt/nvme/clio/extra.dat","bdev_pool_id":"900.0","attached":false}
+</pre>
+<p>To attach a block device you composed yourself, compose it first (for example the <code>tiers.yaml</code> on the <a href="/docs/cli.html#compose">CLI page</a>), then pass its pool id:</p>
+<pre data-label="shell">
+$ clio_run compose start tiers.yaml
+$ curl -s --data-urlencode name=ram::scratch -d attach_pool_id=320.0     http://127.0.0.1:8080/api/mod/clio_cte_core/512.0/register_target
+</pre>
+<p>Tiers added this way start with score 0, so placement uses them last, and they last until the next restart. Add them to <code>clio.yaml</code> to keep them.</p>
+<p>Next: <a href="/tutorials/cloud-storage.html">add Amazon S3 or Google Cloud Storage</a>, or read <a href="/design/placement.html">how placement and tiering work</a>.</p>

@@ -1,0 +1,207 @@
+<!--
+title: Compose data operators
+heading: Add data operators <em>to the chain.</em>
+description: Protect data with an erasure-coded disk array, control how data moves between tiers, and add compression, by composing CLIO Core's built-in data operators in clio.yaml.
+eyebrow: Tutorial · Compose
+lede: Between the filesystem and your devices, every write passes through a chain of data operators. You choose which operators run, in what order and with what settings, in the same <code>clio.yaml</code> that lists your tiers.
+facts: Time | 25 minutes ; You need | The four-tier setup from Compose local tiers, or any working install ; Operators | Erasure coding, replication, placement, tiering, compression
+-->
+<h2>The operator chain</h2>
+<p>Each operator is a module in its own pool. It receives the storage engine's calls (put, get, size and so on), does its work, and passes them to the pool named by its <code>next_pool_id</code>. The default configuration builds this chain:</p>
+<pre data-label="data path">
+filesystem 560.0 → cache 563.0 → indexer 564.0 → [compressor 562.0] → replication 561.0 → core 512.0 → tiers
+</pre>
+<p>Block-device operators work one level lower: the storage engine's tiers are block devices, and an operator such as an erasure-coded array is itself a block device built from other block devices.</p>
+<div class="callout">
+  <span class="callout-title">Two rules for every chain</span>
+  <p>An entry in <code>compose</code> must come <em>after</em> the entry its <code>next_pool_id</code> names. And when you insert or remove an operator, re-point the <code>next_pool_id</code> of the operator above it, so nothing forwards to a pool that is not there.</p>
+</div>
+<div class="table-wrap"><table>
+  <thead><tr><th>Operator</th><th>Module</th><th>What it does</th><th>Built by default</th></tr></thead>
+  <tbody>
+    <tr><td>Erasure-coded array</td><td><code>clio_safe_bdev</code></td><td>Stripes data with Reed-Solomon parity over several devices and survives failed devices</td><td>Yes</td></tr>
+    <tr><td>Replication</td><td><code>clio_cte_replication</code></td><td>Keeps persistent copies of every write on a durable tier</td><td>Yes</td></tr>
+    <tr><td>Cache</td><td><code>clio_cte_cache</code></td><td>Keeps node-local raw copies for fast reads</td><td>Yes</td></tr>
+    <tr><td>Indexer</td><td><code>clio_cte_indexer</code></td><td>Indexes text for keyword search</td><td>Yes</td></tr>
+    <tr><td>Compressor</td><td><code>clio_cte_compressor</code></td><td>Compresses blobs on the way down, decompresses on the way up</td><td>No: <code>-DCLIO_CTE_ENABLE_COMPRESS=ON</code></td></tr>
+  </tbody>
+</table></div>
+
+<h2>Protect data with an erasure-coded array</h2>
+<p><code>clio_safe_bdev</code> combines block devices into one array. Data is split into 64 KiB chunks across the data members, and parity members hold Reed-Solomon parity. <code>max_failures</code> is how many members may fail at once without losing data; mark that many members <code>parity: true</code>. With no parity members there is no redundancy.</p>
+
+<h3>1. Compose the disks and the array</h3>
+<p>Add these entries to <code>compose</code> in <code>clio.yaml</code>, above the <code>clio_cte_core</code> entry. Each disk is a file block device on its own drive; here, four drives mounted at <code>/mnt/disk0</code> to <code>/mnt/disk3</code>.</p>
+<pre data-label="yaml · clio.yaml">
+  # Four disks: three hold data, one holds parity.
+  - mod_name: clio_bdev
+    pool_name: "/mnt/disk0/clio.dat"
+    pool_query: local
+    pool_id: "330.0"
+    bdev_type: file
+    capacity: "4GB"
+    alloc_log: "/mnt/disk0/clio.alog"
+  - mod_name: clio_bdev
+    pool_name: "/mnt/disk1/clio.dat"
+    pool_query: local
+    pool_id: "331.0"
+    bdev_type: file
+    capacity: "4GB"
+    alloc_log: "/mnt/disk1/clio.alog"
+  - mod_name: clio_bdev
+    pool_name: "/mnt/disk2/clio.dat"
+    pool_query: local
+    pool_id: "332.0"
+    bdev_type: file
+    capacity: "4GB"
+    alloc_log: "/mnt/disk2/clio.alog"
+  - mod_name: clio_bdev
+    pool_name: "/mnt/disk3/clio.dat"
+    pool_query: local
+    pool_id: "333.0"
+    bdev_type: file
+    capacity: "4GB"
+    alloc_log: "/mnt/disk3/clio.alog"
+
+  # One array over the four disks. It survives one failed disk.
+  - mod_name: clio_safe_bdev
+    pool_name: "raid0"
+    pool_query: local
+    pool_id: "350.0"
+    max_failures: 1
+    alloc_log: "/mnt/disk0/raid0.alog"
+    members:
+      - {pool_name: "/mnt/disk0/clio.dat", pool_id_major: 330}
+      - {pool_name: "/mnt/disk1/clio.dat", pool_id_major: 331}
+      - {pool_name: "/mnt/disk2/clio.dat", pool_id_major: 332}
+      - {pool_name: "/mnt/disk3/clio.dat", pool_id_major: 333, parity: true}
+</pre>
+<p>The <code>alloc_log</code> files let the disks and the array recover their layout after a restart.</p>
+
+<h3>2. Use the array as a tier</h3>
+<p>In the <code>clio_cte_core</code> entry, attach the array with <code>existing_pool_id</code> instead of a <code>path</code> and <code>bdev_type</code>. Here it is the persistent tier under a RAM tier:</p>
+<pre data-label="yaml · clio.yaml">
+    storage:
+      - path: "ram::hot"
+        bdev_type: "ram"
+        capacity_limit: "4GB"
+        score: 1.0
+      - path: "raid0"                      # the array as the persistent tier
+        existing_pool_id: "350.0"
+        existing_pool_module: "clio_safe_bdev"
+        score: 0.2                         # matches replication's replica_score
+        persistence_level: "long_term"
+</pre>
+<p>Give the array a <code>persistence_level</code> other than <code>volatile</code>, or the replication operator will not put its copies there. Its score of 0.2 matches replication's default <code>replica_score</code>. Start the runtime and mount as usual. Files you write are copied to the array, and after <code>clio_run stop</code> and <code>clio_run start</code> they are read back from it.</p>
+
+<h3>3. Check its health</h3>
+<pre data-label="shell">
+$ curl -s "http://127.0.0.1:8080/api/pools/350.0/monitor?query=stats&routing=local"
+</pre>
+<p>The reply includes <code>parity_level</code> (1 here), <code>faulty_members</code>, and recovery counters. The dashboard has a page for the array under <strong>Pools → clio_safe_bdev</strong>, with its members and buttons to add, replace and remove them.</p>
+
+<h3>4. Rehearse a disk failure</h3>
+<p>A file block device has a test hook: while a file named <code>&lt;pool_name&gt;.fail</code> exists, every I/O to that device fails. To see every read go through the array, make the array the only tier for this drill (remove the <code>ram::hot</code> entry and give the array score 1.0).</p>
+<pre data-label="shell">
+$ head -c 64M /dev/urandom > data.bin && cp data.bin ~/clio-mnt/
+$ touch /mnt/disk1/clio.dat.fail                    # disk1 now fails every I/O
+$ cmp data.bin ~/clio-mnt/data.bin && echo intact     # rebuilt from parity
+intact
+$ curl -s "http://127.0.0.1:8080/api/pools/350.0/monitor?query=stats&routing=local"
+</pre>
+<p>Reads still return the right bytes, rebuilt from the other members, and the stats now show <code>"faulty_members": 1</code>. Writes keep working in degraded mode. Replace the failed disk with a new one, and the array rebuilds onto it:</p>
+<pre data-label="shell">
+$ sudo mkdir -p /mnt/disk4 && sudo chown $USER /mnt/disk4
+$ curl -s -d failed_pool_id=331.0 --data-urlencode member_name=/mnt/disk4/clio.dat \
+    -d capacity=4GB -d bdev_type=file \
+    http://127.0.0.1:8080/api/mod/clio_safe_bdev/350.0/replace_member
+{"ok":true,"failed_pool_id":"331.0","member_name":"/mnt/disk4/clio.dat","member_pool_id":"900.0"}
+$ rm /mnt/disk1/clio.dat.fail
+</pre>
+<p>Watch <code>recovery_ops_completed</code> catch up with <code>recovery_ops_total</code> in the stats; then <code>faulty_members</code> is back to 0.</p>
+<div class="callout warn">
+  <span class="callout-title">Replace a failed disk before you restart</span>
+  <p>If a member still fails when the runtime starts, the array cannot be created and the runtime does not start. Replace or remove the member while the runtime is running. Afterwards, update the array's entry in <code>clio.yaml</code> to list the new disk.</p>
+</div>
+
+<h2>Keep extra copies with replication</h2>
+<p>The replication operator is on by default and writes a persistent copy of every write. Its settings, in the <code>clio_cte_replication</code> entry:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>replication_factor</code></td><td>1</td><td>Copies across nodes, including the original. Sets <code>remote_copies</code> to one less.</td></tr>
+    <tr><td><code>num_replicas</code></td><td>0</td><td>Extra copies on the writing node itself. The default configuration sets 1.</td></tr>
+    <tr><td><code>replica_score</code></td><td>0.2</td><td>Where copies go: the tier whose score matches. Below this score, the fast copy may be dropped.</td></tr>
+    <tr><td><code>cache_score</code></td><td>1.0</td><td>Where a copy is re-cached when it is read back.</td></tr>
+    <tr><td><code>replicate_period_ms</code></td><td>50</td><td>How often pending copies are written. <code>0</code> writes them before the write returns.</td></tr>
+  </tbody>
+</table></div>
+<p>Over an erasure-coded array, local copies add little: the array already survives a failed disk. In that case you can set <code>num_replicas: 0</code>.</p>
+
+<h2>Control how data moves</h2>
+<p>Three settings in the <code>clio_cte_core</code> entry decide where data goes when it is written and where it moves later.</p>
+
+<h3>Placement: where new data lands</h3>
+<pre data-label="yaml">
+    dpe:
+      dpe_type: "max_bw"       # max_bw | round_robin | random
+</pre>
+<p><code>max_bw</code> (the default) picks the fastest tier with room. <code>round_robin</code> rotates across tiers, which suits several devices of the same speed. <code>random</code> is for testing.</p>
+
+<h3>Tiering: where data moves later</h3>
+<p>The data organizer runs periodically and moves blobs whose score no longer matches their tier. Put its keys directly in the <code>clio_cte_core</code> entry, at the same level as <code>storage</code>:</p>
+<pre data-label="yaml">
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    organizer: "frecency"        # none (default) | frecency | hotset | cyclic | scatter | grayscott
+    organizer_period_ms: 2000    # how often it runs (default 5000)
+    storage:
+      # ... your tiers ...
+</pre>
+<p>The runtime logs <code>organizer=frecency, period 2000 ms</code> when it starts. <code>frecency</code> scores each blob by how recently and how often it is used, so hot data rises toward RAM and cold data sinks toward disk.</p>
+<div class="callout warn">
+  <span class="callout-title">Not under performance</span>
+  <p>The commented example in <code>clio_default.yaml</code> shows the organizer keys inside the <code>performance:</code> block. They are ignored there. Put them at the top level of the <code>clio_cte_core</code> entry, as above.</p>
+</div>
+
+<h3>Moving data yourself</h3>
+<p>Any client can give a blob a new score, and the storage engine moves it to the matching tier. This marks a finished run as cold, so its pages move to the slowest tier. Use it with the default <code>organizer: none</code>: an organizer recomputes every score each period and overrides scores you set.</p>
+<pre data-label="python · cool.py">
+import os
+os.environ["CLIO_WITH_RUNTIME"] = "0"
+import clio_cte_core_ext as cte
+
+cte.clio_init(cte.RuntimeMode.kClient, False)
+cte.initialize_cte("", cte.PoolQuery.Dynamic())
+
+tag = cte.Tag("/results/run42.bin")           # a file in the mount
+for page in tag.GetContainedBlobs():
+    if page.isdigit():                         # skip the ~i attribute blob
+        tag.ReorganizeBlob(page, 0.1)          # 0.1: the coldest tier
+print(tag.GetBlobScore("0"))                   # 0.1
+</pre>
+<p>The file stays readable through the mount the whole time. In the dashboard, the cold tier's <em>bytes written</em> grows as the pages move. The cache operator may keep a raw copy in RAM until other data needs the space.</p>
+
+<h2>Compress data</h2>
+<div class="callout warn">
+  <span class="callout-title">Not exercised by the filesystem yet</span>
+  <p>The compressor picks a codec for each write from fields that the writing client sets. The FUSE mount and the Python API do not set them, so their writes pass through uncompressed. Today, compression applies to C++ clients that request it. The steps below were checked against the source, not run for this page.</p>
+</div>
+<p>The compressor is not in the pip wheel or the <code>release-fuse</code> preset. Build with <code>-DCLIO_CTE_ENABLE_COMPRESS=ON</code>, and use that build for every client too: the option changes a data layout that clients and the runtime share. Codecs are found at configure time, among them zstd, lz4, zlib, lzma, bzip2, snappy and blosc2, plus zfp, sz3 and fpzip through LibPressio.</p>
+<p>The default configuration has the compressor entry commented out. Uncomment it, and point the indexer at it so it joins the chain:</p>
+<pre data-label="yaml">
+  - mod_name: clio_cte_compressor
+    pool_name: clio_cte_compressor
+    pool_query: local
+    pool_id: "562.0"
+    next_pool_id: "561.0"        # replication
+
+  - mod_name: clio_cte_indexer
+    # ...
+    next_pool_id: "562.0"        # was 561.0
+</pre>
+<p>A C++ client requests compression per write through the put's context: <code>dynamic_compress_ = 1</code> with a codec in <code>compress_lib_</code> (for example <code>10</code> for zstd) and <code>compress_preset_</code> 1, 2 or 3 (fast, balanced, best), or <code>dynamic_compress_ = 2</code> to let the compressor choose. A blob is stored compressed only if that saves at least an eighth of its size.</p>
+
+<p>Next: <a href="/develop/index.html">write your own data operator</a>.</p>

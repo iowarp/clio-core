@@ -1,0 +1,57 @@
+<!--
+title: Extend the storage system
+heading: Extend <em>the storage system.</em>
+description: Where to add a new storage backend, block device type, placement policy or data organizer to CLIO Core, and which of these can be built outside the source tree.
+eyebrow: Develop · Reference
+lede: Below the operator chain, the storage engine places data on tiers, and each tier is a block device. You can add a new kind of block device, or change how data is placed and moved. This page shows where each change goes.
+facts: Kind | Reference, with source pointers ; Paths | Relative to the clio-core repository
+-->
+<div class="callout">
+  <span class="callout-title">A map, not a walkthrough</span>
+  <p>This page names the interfaces and files to change. Unlike <a href="/develop/operator.html">Write a chain operator</a>, it has no step-by-step example that was built and run for this site.</p>
+</div>
+
+<h2>How tiers work</h2>
+<p>Each entry in the storage engine's <code>storage</code> list becomes a tier backed by a block device pool. A block device answers a small set of methods: allocate blocks, free blocks, write, read, and report statistics. The storage engine needs nothing else from a tier, so anything that answers those methods can be a tier.</p>
+<p>There are two ways to attach one:</p>
+<ul>
+  <li>Give the tier a <code>bdev_type</code> and a <code>path</code>, and the storage engine creates a block device of that type.</li>
+  <li>Give it <code>existing_pool_id</code>, and it uses a pool you composed yourself. <code>path</code>, <code>bdev_type</code> and <code>capacity_limit</code> become optional. The erasure-coded array in <a href="/tutorials/operators.html#protect-data-with-an-erasure-coded-array">Compose data operators</a> is attached this way.</li>
+</ul>
+
+<h2>A block device module</h2>
+<p>A module of your own can be a tier if it answers the block device methods with the block device's own ids and task types. This works outside the tree: build it like the <a href="/develop/operator.html">chain operator</a>, compose it, and attach it with <code>existing_pool_id</code>. The erasure-coded array, <code>clio_safe_bdev</code>, is the in-tree example. Its <code>clio_mod.yaml</code> reuses the block device ids:</p>
+<pre data-label="yaml · context-runtime/modules/safe-bdev/clio_mod.yaml">
+# Methods reused from bdev (same IDs as bdev so reused task types match)
+kAllocateBlocks: 10     # Allocate data blocks
+kFreeBlocks: 11         # Free data blocks
+kWrite: 12              # Write data
+kRead: 13               # Read data
+kGetStats: 14           # Get performance statistics
+</pre>
+<p>Its implementation, in <code>context-runtime/modules/safe-bdev/</code>, shows how to answer each method by calling other block devices. A module that stores data in a remote service would answer them by calling that service.</p>
+
+<h2>A new bdev type</h2>
+<p>To make a new type selectable with <code>bdev_type</code>, add a transport to the block device module. This changes CLIO Core itself.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Step</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Implement <code>BdevTransport</code>: <code>Init</code>, <code>Destroy</code>, <code>AllocateBlocks</code>, <code>FreeBlocks</code>, <code>WriteBlocks</code>, <code>ReadBlocks</code>, <code>GetCapacity</code>, <code>GetRemainingSize</code>, and optionally <code>FlushAllocLog</code> and <code>Sync</code></td><td><code>context-runtime/modules/bdev/include/clio_runtime/bdev/transports/bdev_transport.h</code>. The GCS transport, <code>gcs_bdev_transport.h</code> in the same directory, is a short example.</td></tr>
+    <tr><td>Add a value to <code>BdevType</code> and map the YAML string to it</td><td><code>CreateParams::LoadConfig</code> in <code>context-runtime/modules/bdev/include/clio_runtime/bdev/bdev_tasks.h</code></td></tr>
+    <tr><td>Create the transport for the new type</td><td><code>BdevTransportFactory::Create</code> in <code>context-runtime/modules/bdev/src/transports/bdev_transport.cc</code></td></tr>
+    <tr><td>Offer it in the dashboard's block device form</td><td>The type list in <code>context-runtime/modules/bdev/src/bdev_runtime.cc</code></td></tr>
+    <tr><td>Let the storage engine accept it as a tier type</td><td>The <code>bdev_type</code> check in <code>context-transfer-engine/core/src/core_config.cc</code> and the string-to-type mapping in <code>context-transfer-engine/core/src/core_runtime.cc</code></td></tr>
+  </tbody>
+</table></div>
+<p>Per the <a href="https://github.com/iowarp/clio-core/blob/main/AGENTS.md">contributor guide</a>, document new configuration keys in <code>context-runtime/config/clio_default.yaml</code>.</p>
+
+<h2>Placement and tiering policies</h2>
+<p>Placement and tiering run inside the storage engine and use its internal state, so new policies are added to CLIO Core itself.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Policy</th><th>Interface</th><th>Register it in</th><th>Selected by</th></tr></thead>
+  <tbody>
+    <tr><td>Placement: which tier a new blob goes to</td><td><code>DataPlacementEngine::SelectTargets</code> in <code>context-transfer-engine/core/include/clio_cte/core/dpe/dpe.h</code></td><td><code>DpeFactory::CreateDpe</code> and <code>StringToDpeType</code> in <code>core/src/dpe/dpe.cc</code>, plus the allowed values in <code>core/src/core_config.cc</code></td><td><code>dpe: {dpe_type: ...}</code></td></tr>
+    <tr><td>Tiering: when blobs move between tiers</td><td><code>DataOrganizer::Reorganize</code> in <code>context-transfer-engine/core/include/clio_cte/core/data_organizer/data_organizer.h</code></td><td><code>DataOrganizerFactory::Get</code> in <code>core/src/data_organizer/data_organizer.cc</code>, plus the allowed values in <code>core/src/core_config.cc</code></td><td><code>organizer: ...</code></td></tr>
+  </tbody>
+</table></div>
+<p>To move data from outside without a new policy, change blob scores from a client, as <a href="/tutorials/operators.html#moving-data-yourself">Compose data operators</a> shows. The storage engine moves each blob to the tier that matches its new score.</p>
