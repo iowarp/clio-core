@@ -248,6 +248,18 @@ class CompressionFactory {
   }
 
   /**
+   * Wire ID for a library name -- the reverse of NameForWireId().
+   *
+   * @param name canonical library name, e.g. "zstd"
+   * @return its wire ID, or 0 if the name is unknown or its backend was not
+   *         built into this binary
+   */
+  static int WireIdForName(const std::string& name) {
+    const CompressorInfo* info = FindByName(name);
+    return (info != nullptr && info->make != nullptr) ? info->wire_id : 0;
+  }
+
+  /**
    * Reverse of NameForWireId: the frozen wire id for a canonical name.
    *
    * @param library_name canonical lowercase name (or a registered alias)

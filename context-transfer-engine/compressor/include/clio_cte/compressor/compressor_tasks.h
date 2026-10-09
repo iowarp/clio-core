@@ -73,6 +73,17 @@ struct CompressorConfig {
    * locality.
    */
   bool tracking_enabled_ = true;
+  /**
+   * Codec applied to a write whose Context requests none (#1251): a library
+   * name ("zstd", "lz4", ...), "dynamic" (the models choose per blob), or
+   * empty (default) for none. Writes from the FUSE mount and Python set no
+   * codec, so without this the compressor never compressed them.
+   * Compose key: default_compress.
+   */
+  std::string default_compress_;
+  /** Preset for default_compress_: "fast", "balanced" (default) or "best".
+   *  Compose key: default_preset. */
+  std::string default_preset_ = "balanced";
 
   CompressorConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
 
@@ -83,7 +94,9 @@ struct CompressorConfig {
         dnn_model_weights_path_(other.dnn_model_weights_path_),
         trace_folder_path_(other.trace_folder_path_),
         next_pool_id_(other.next_pool_id_),
-        tracking_enabled_(other.tracking_enabled_) {
+        tracking_enabled_(other.tracking_enabled_),
+        default_compress_(other.default_compress_),
+        default_preset_(other.default_preset_) {
     (void)pool_id;
   }
 
@@ -95,7 +108,7 @@ struct CompressorConfig {
     // interposer chained beneath it.
     ar(qtable_model_path_, linreg_model_path_, distribution_model_path_,
        dnn_model_weights_path_, trace_folder_path_, next_pool_id_,
-       tracking_enabled_);
+       tracking_enabled_, default_compress_, default_preset_);
   }
 
   /**
@@ -137,6 +150,8 @@ struct CompressorConfig {
         read_path("distribution_model_path", &distribution_model_path_);
         read_path("dnn_model_weights_path", &dnn_model_weights_path_);
         read_path("trace_folder_path", &trace_folder_path_);
+        read_path("default_compress", &default_compress_);
+        read_path("default_preset", &default_preset_);
       } catch (...) {
         // Config parsing is best-effort
       }
