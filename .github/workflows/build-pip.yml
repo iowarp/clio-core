@@ -152,7 +152,9 @@ jobs:
   build-wheels-windows:
     name: Build Windows wheels
     runs-on: windows-latest
-    timeout-minutes: 120
+    # Five wheels at ~22 min each plus the vcpkg install. Was 120 before Poco
+    # (#1261); a cold vcpkg cache adds ~24 min building Poco and OpenSSL.
+    timeout-minutes: 180
 
     steps:
     - name: Checkout repository
@@ -172,9 +174,31 @@ jobs:
         git pull
         .\bootstrap-vcpkg.bat
 
+    # vcpkg builds every port from source; Poco + OpenSSL alone take ~24 min.
+    # Cache the built packages. vcpkg keys each package by its own ABI hash,
+    # so a stale cache only costs rebuilds, never wrong binaries. Saved right
+    # after the install so a later failing step still keeps the cache.
+    - name: Restore vcpkg binary cache
+      id: vcpkg-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/vcpkg-bincache
+        key: vcpkg-bin-x64-windows-${{ hashFiles('.github/workflows/build-pip.yml') }}
+        restore-keys: vcpkg-bin-x64-windows-
+
     - name: Install vcpkg dependencies
+      env:
+        VCPKG_BINARY_SOURCES: clear;files,${{ runner.temp }}/vcpkg-bincache,readwrite
       run: |
+        New-Item -ItemType Directory -Force "${{ runner.temp }}/vcpkg-bincache" | Out-Null
         C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c "poco[net,netssl,crypto,json]"
+
+    - name: Save vcpkg binary cache
+      if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/vcpkg-bincache
+        key: vcpkg-bin-x64-windows-${{ hashFiles('.github/workflows/build-pip.yml') }}
 
     # WinFsp provides the FUSE3-compatible SDK the Windows fuse adapter
     # builds against (#899; see adapter/libfuse/CMakeLists.txt). The choco

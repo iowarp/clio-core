@@ -80,6 +80,11 @@ int main() { return 0; }
   try_compile(_version_ok
     "${CMAKE_BINARY_DIR}/CMakeFiles/ClioCheckPocoAbi/build" "${_probe_src}"
     CMAKE_FLAGS "-DINCLUDE_DIRECTORIES=${_inc_dirs}"
+    # static_assert needs C++11, and Poco 1.15 headers need C++17. Without
+    # this the probe builds at the compiler default -- C++98 for Apple clang
+    # -- and fails as a bogus "version mismatch" (#1261, macOS wheel).
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
     OUTPUT_VARIABLE _probe_out)
   if(NOT _version_ok)
     message(FATAL_ERROR
