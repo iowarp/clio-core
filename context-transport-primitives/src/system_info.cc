@@ -112,6 +112,9 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <windows.h>
+// FSCTL_SET_SPARSE. Spelled out because <windows.h> leaves it out under
+// WIN32_LEAN_AND_MEAN, which Poco's headers (included above) define first.
+#include <winioctl.h>
 #include <timeapi.h>
 #include <filesystem>
 #pragma comment(lib, "iphlpapi.lib")

@@ -50,7 +50,7 @@ target_link_libraries(clio_ctp_host PUBLIC
 # ("symbol already defined"). CTP_HAS_POCO stays PUBLIC so test TUs that #if on
 # it still see it; the Poco symbols themselves live inside libclio_ctp_host.
 if(Poco_FOUND)
-    target_link_libraries(clio_ctp_host PRIVATE Poco::Net Poco::Foundation)
+    clio_link_poco_private(clio_ctp_host)
     target_compile_definitions(clio_ctp_host PUBLIC CTP_HAS_POCO=1)
 endif()
 if(WIN32)

@@ -239,7 +239,7 @@ target_link_libraries(${CLIO_LIB_NAME}
 # headers never mention a Poco type. CLIO_RUN_HAS_POCO is PUBLIC so ChiMods and
 # tests can #if on whether a dashboard exists in this build.
 if(Poco_FOUND)
-  target_link_libraries(${CLIO_LIB_NAME} PRIVATE Poco::Net Poco::Foundation)
+  clio_link_poco_private(${CLIO_LIB_NAME})
   target_compile_definitions(${CLIO_LIB_NAME} PUBLIC CLIO_RUN_HAS_POCO=1)
 else()
   target_compile_definitions(${CLIO_LIB_NAME} PUBLIC CLIO_RUN_HAS_POCO=0)

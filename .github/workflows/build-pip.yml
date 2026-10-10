@@ -120,7 +120,7 @@ jobs:
         # does not bundle libfuse3.so.3 — end users get it from their
         # distro's fuse3 packages.
         CIBW_BEFORE_ALL: >
-          yum install -y curl patchelf fuse3-devel &&
+          yum install -y curl patchelf fuse3-devel openssl-devel &&
           bash {project}/installers/pip/build_deps_manylinux.sh
         CIBW_ENVIRONMENT: ${{ matrix.cibw_environment }}
         CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
@@ -152,7 +152,9 @@ jobs:
   build-wheels-windows:
     name: Build Windows wheels
     runs-on: windows-latest
-    timeout-minutes: 120
+    # Five wheels at ~22 min each plus the vcpkg install. Was 120 before Poco
+    # (#1261); a cold vcpkg cache adds ~24 min building Poco and OpenSSL.
+    timeout-minutes: 180
 
     steps:
     - name: Checkout repository
@@ -172,9 +174,31 @@ jobs:
         git pull
         .\bootstrap-vcpkg.bat
 
+    # vcpkg builds every port from source; Poco + OpenSSL alone take ~24 min.
+    # Cache the built packages. vcpkg keys each package by its own ABI hash,
+    # so a stale cache only costs rebuilds, never wrong binaries. Saved right
+    # after the install so a later failing step still keeps the cache.
+    - name: Restore vcpkg binary cache
+      id: vcpkg-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/vcpkg-bincache
+        key: vcpkg-bin-x64-windows-${{ hashFiles('.github/workflows/build-pip.yml') }}
+        restore-keys: vcpkg-bin-x64-windows-
+
     - name: Install vcpkg dependencies
+      env:
+        VCPKG_BINARY_SOURCES: clear;files,${{ runner.temp }}/vcpkg-bincache,readwrite
       run: |
-        C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c
+        New-Item -ItemType Directory -Force "${{ runner.temp }}/vcpkg-bincache" | Out-Null
+        C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c "poco[net,netssl,crypto,json]"
+
+    - name: Save vcpkg binary cache
+      if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/vcpkg-bincache
+        key: vcpkg-bin-x64-windows-${{ hashFiles('.github/workflows/build-pip.yml') }}
 
     # WinFsp provides the FUSE3-compatible SDK the Windows fuse adapter
     # builds against (#899; see adapter/libfuse/CMakeLists.txt). The choco
@@ -277,7 +301,35 @@ jobs:
         # the C API in serialize/msgpack_wrapper.h).
         bash CI/retry.sh brew update
         bash CI/retry.sh brew install cmake pkg-config \
-          yaml-cpp cereal msgpack-c libsodium zeromq cppzmq
+          yaml-cpp cereal msgpack-c libsodium zeromq cppzmq openssl@3
+
+    # Poco for the runtime's web dashboard. Not from Homebrew: its poco
+    # bottle has a macOS 15.0 minimum even on this macos-14 runner, and
+    # delocate refuses to bundle it into a 14.0 wheel. Build it here for the
+    # wheel's target instead. Absolute install names let delocate find and
+    # bundle the dylibs (only PocoNet + PocoFoundation are linked; the
+    # NetSSL/Crypto libraries just satisfy find_package).
+    - name: Build Poco for the wheel's macOS target
+      env:
+        MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
+      run: |
+        POCO_PREFIX="${{ runner.temp }}/poco"
+        bash CI/retry.sh curl -fsSL -o poco.tar.gz \
+          https://github.com/pocoproject/poco/archive/refs/tags/poco-1.14.1-release.tar.gz
+        tar xzf poco.tar.gz
+        cmake -S poco-poco-1.14.1-release -B poco-build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX="$POCO_PREFIX" \
+          -DCMAKE_INSTALL_NAME_DIR="$POCO_PREFIX/lib" \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.macosx_deployment_target }} \
+          -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+          -DPOCO_MINIMAL_BUILD=ON \
+          -DENABLE_NET=ON -DENABLE_JSON=ON -DENABLE_XML=ON -DENABLE_UTIL=ON \
+          -DENABLE_CRYPTO=ON -DENABLE_NETSSL=ON \
+          -DENABLE_TESTS=OFF -DENABLE_SAMPLES=OFF
+        cmake --build poco-build -j "$(sysctl -n hw.ncpu)"
+        cmake --install poco-build
+        rm -rf poco.tar.gz poco-poco-1.14.1-release poco-build
 
     - name: Install cibuildwheel
       run: bash CI/retry.sh pip install cibuildwheel
@@ -300,7 +352,7 @@ jobs:
         # that delocate can resolve against @loader_path/../lib and
         # bundle into the wheel.
         CIBW_ENVIRONMENT_MACOS: >-
-          CMAKE_PREFIX_PATH=${{ matrix.brew_prefix }}
+          CMAKE_PREFIX_PATH="${{ runner.temp }}/poco:${{ matrix.brew_prefix }}"
           PKG_CONFIG_PATH=${{ matrix.brew_prefix }}/lib/pkgconfig
           MACOSX_DEPLOYMENT_TARGET=${{ matrix.macosx_deployment_target }}
           SKBUILD_CMAKE_DEFINE='CLIO_CORE_ENABLE_RPATH=ON'
@@ -408,6 +460,7 @@ jobs:
       run: |
         docker run --rm \
           -v "$PWD/wheels:/wheels:ro" \
+          -v "$PWD/installers/pip:/ci:ro" \
           ${{ matrix.distro }} \
           bash -c '
             set -e
@@ -533,6 +586,9 @@ jobs:
             fi
             unset rc
 
+            echo "=== Web dashboard compiled in and its pages shipped ==="
+            python /ci/check_wheel_dashboard.py
+
             echo "=== Symbol resolution check ==="
             LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
             export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -618,6 +674,11 @@ jobs:
             python: '3.14'
 
     steps:
+    - name: Check out wheel check scripts
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: installers/pip
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -663,6 +724,9 @@ jobs:
           fi
           unset rc
         done
+
+        echo "=== Web dashboard compiled in and its pages shipped ==="
+        python installers/pip/check_wheel_dashboard.py
 
         echo "=== Symbol resolution check (otool -L) ==="
         LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
@@ -713,7 +777,9 @@ jobs:
     - name: Check out CI helpers
       uses: actions/checkout@v4
       with:
-        sparse-checkout: CI
+        sparse-checkout: |
+          CI
+          installers/pip
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -793,6 +859,10 @@ jobs:
         # .lib archives go to lib/) — search both.
         python -c "import iowarp_core, glob, os, sys; dirs = [iowarp_core.get_lib_dir(), iowarp_core.get_bin_dir()]; missing = [m for m in ('cache', 'replication') if not any(glob.glob(os.path.join(d, f'*clio_cte_{m}_*')) for d in dirs)]; sys.exit(f'missing chimods: {missing}' if missing else 0)"
         if ($LASTEXITCODE -ne 0) { throw "cache/replication chimod DLLs missing from wheel" }
+
+        Write-Host "=== Web dashboard compiled in and its pages shipped ==="
+        python installers/pip/check_wheel_dashboard.py
+        if ($LASTEXITCODE -ne 0) { throw "wheel has no web dashboard" }
 
         Write-Host "=== All Windows tests passed ==="
         # The bench --help calls above leave $LASTEXITCODE = 1 (they print
