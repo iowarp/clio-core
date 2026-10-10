@@ -44,7 +44,10 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <fcntl.h>
 
 // The in-process S3 REST client (Poco::Net + SigV4). Loading the AWS SDK into
 // this runtime process stack-smashes CLIO_INIT, so the read path signs and
@@ -57,6 +60,9 @@
 // namespace collision (same ordering as BinaryFileAssimilator).
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
+#ifdef CAE_ENABLE_CFS_DST
+#include <clio_cte/filesystem/filesystem_client.h>
+#endif
 
 namespace clio::cae::core {
 
@@ -181,6 +187,114 @@ s3::S3Result FillChunk(s3::S3RestClient& client, s3::S3Connection& conn,
   return s3::S3Result{};
 }
 
+/** Size of one CTE blob of an imported object (also the clio-fs page size). */
+constexpr size_t kChunkBytes = 1024 * 1024;  // 1 MiB
+
+/**
+ * Striped-fetch knobs, read per object from the environment of the RUNTIME
+ * (the process that runs this assimilator):
+ *
+ *   CAE_S3_STREAMS  concurrent ranged GETs per object (default 8, 1 = the old
+ *                   single-stream path, max 64)
+ *   CAE_S3_PART_MB  bytes each GET asks for, in MiB (default 16, max 1024)
+ *
+ * One TCP stream to S3 is capped well below what the link can carry: through
+ * the ALCF proxy one stream measured ~23 MB/s and eight concurrent ranged
+ * streams ~186 MB/s. An object only stripes when it spans more than one part,
+ * so small objects keep the single-stream path.
+ */
+struct StripeConfig {
+  size_t streams = 8;
+  size_t part_bytes = 16 * kChunkBytes;
+};
+
+StripeConfig StripeConfigFromEnv() {
+  StripeConfig c;
+  const char *s = std::getenv("CAE_S3_STREAMS");
+  if (s != nullptr && *s != '\0') {
+    long v = std::strtol(s, nullptr, 10);
+    if (v >= 1) c.streams = static_cast<size_t>(std::min(v, 64L));
+  }
+  const char *p = std::getenv("CAE_S3_PART_MB");
+  if (p != nullptr && *p != '\0') {
+    long v = std::strtol(p, nullptr, 10);
+    if (v >= 1) {
+      c.part_bytes = static_cast<size_t>(std::min(v, 1024L)) * kChunkBytes;
+    }
+  }
+  return c;
+}
+
+/**
+ * One stream's share of a striped window: a contiguous run of chunk buffers,
+ * fetched with ONE ranged GET on a connection of its own.
+ */
+struct StripeJob {
+  uint64_t abs_off = 0;        ///< object offset of bufs[0]
+  std::vector<char *> bufs;    ///< destination chunk buffers, in object order
+  std::vector<size_t> sizes;   ///< bytes wanted in each buffer
+  int resumes = 0;             ///< resumes this stream needed
+  std::string error;           ///< empty on success
+};
+
+/**
+ * Fill every buffer of `job` from s3://<cfg.bucket>/<key>. Runs on a plain
+ * std::thread, so it touches no runtime state: the buffers were allocated by
+ * the coroutine, and the connection comes from (and returns to) the
+ * thread-safe pool.
+ */
+void FetchStripe(const s3::S3Config &cfg, S3ConnectionPool *pool,
+                 const std::string &key, int max_resumes, StripeJob *job) {
+  s3::S3RestClient client(cfg);
+  const std::string conn_key = client.ConnectionKey(key);
+  std::unique_ptr<s3::S3Connection> conn =
+      pool ? pool->Acquire(conn_key) : std::make_unique<s3::S3Connection>();
+  uint64_t len = 0;
+  for (size_t n : job->sizes) len += n;
+  s3::S3RestClient::S3GetStream st;
+  s3::S3Result b = client.BeginGetObject(*conn, key, job->abs_off, len, &st);
+  if (!b.ok()) {
+    job->error = !b.error.empty()
+                     ? b.error
+                     : "S3 GET " + key + " failed: HTTP " +
+                           std::to_string(b.http_status);
+  } else {
+    uint64_t off = job->abs_off;
+    for (size_t i = 0; i < job->bufs.size(); ++i) {
+      size_t filled = 0;
+      s3::S3Result fr = FillChunk(client, *conn, st, key, job->bufs[i],
+                                  job->sizes[i], off, max_resumes,
+                                  &job->resumes, &filled);
+      if (!fr.error.empty() || filled != job->sizes[i]) {
+        job->error = !fr.error.empty()
+                         ? fr.error
+                         : "short read at offset " + std::to_string(off);
+        break;
+      }
+      off += job->sizes[i];
+    }
+  }
+  // A body abandoned mid-stream carries unread bytes: never pool that socket.
+  if (job->error.empty()) {
+    client.EndGetObject(*conn, st);
+  } else if (st.body != nullptr) {
+    conn->Retire();
+    st.body = nullptr;
+  }
+  if (pool) {
+    pool->Release(conn_key, std::move(conn));
+  }
+}
+
+/**
+ * Blob name of chunk `idx`. An iowarp:: tag keeps the historical "chunk_<n>";
+ * a cfs:: file uses the clio-fs page name (the bare page index), so the FUSE
+ * mount reads the blobs as the file's pages.
+ */
+std::string ChunkBlobName(bool to_cfs, size_t idx) {
+  return to_cfs ? std::to_string(idx) : "chunk_" + std::to_string(idx);
+}
+
 }  // namespace
 
 void S3AssimLogPhaseTally() {
@@ -236,36 +350,56 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
   const SteadyClock::time_point _t_entry = SteadyClock::now();
   SteadyClock::time_point _t_phase;
 
-  // Validate destination protocol
+  // Validate destination protocol. iowarp::<tag> stores the object as a CTE
+  // tag of "chunk_<n>" blobs plus a "description" blob. cfs::<path> stores it
+  // as a FILE in the clio-fs namespace (pages "0", "1", ...), so a FUSE mount
+  // of that namespace reads it back with ordinary file I/O.
   std::string dst_protocol = GetUrlProtocol(ctx.dst);
-  if (dst_protocol != "iowarp") {
+  const bool to_cfs = (dst_protocol == "cfs");
+#ifndef CAE_ENABLE_CFS_DST
+  if (to_cfs) {
     HLOG(kError,
-         "S3FileAssimilator: Destination protocol must be 'iowarp', got '{}'",
+         "S3FileAssimilator: cfs:: destinations need the clio-fs filesystem "
+         "chimod, which this build does not have");
+    error_code = -1;
+    CLIO_CO_RETURN;
+  }
+#endif
+  if (dst_protocol != "iowarp" && !to_cfs) {
+    HLOG(kError,
+         "S3FileAssimilator: Destination protocol must be 'iowarp' or 'cfs', "
+         "got '{}'",
          dst_protocol);
     error_code = -1;
     CLIO_CO_RETURN;
   }
 
-  // Extract tag name from destination URL
+  // Extract tag name (iowarp) or absolute file path (cfs) from the URL
   std::string tag_name = GetUrlPath(ctx.dst);
-  if (tag_name.empty()) {
+  if (tag_name.empty() || (to_cfs && tag_name[0] != '/')) {
     HLOG(kError,
-         "S3FileAssimilator: Invalid destination URL, no tag name found");
+         "S3FileAssimilator: Invalid destination URL '{}' (want iowarp::<tag> "
+         "or cfs::/<absolute path>)",
+         ctx.dst);
     error_code = -2;
     CLIO_CO_RETURN;
   }
 
-  // Get or create the tag in CTE
-  _t_phase = SteadyClock::now();
-  auto tag_task = cte_client_->AsyncGetOrCreateTag(tag_name);
-  CLIO_CO_AWAIT(tag_task);
-  g_us_tag.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
-  clio::cte::core::TagId tag_id = tag_task->tag_id_;
-  if (tag_id.IsNull()) {
-    HLOG(kError, "S3FileAssimilator: Failed to get or create tag '{}'",
-         tag_name);
-    error_code = -3;
-    CLIO_CO_RETURN;
+  // Get or create the tag in CTE. A cfs:: file is opened later, once the GET
+  // has succeeded, so a failed request leaves no empty file behind.
+  clio::cte::core::TagId tag_id = clio::cte::core::TagId::GetNull();
+  if (!to_cfs) {
+    _t_phase = SteadyClock::now();
+    auto tag_task = cte_client_->AsyncGetOrCreateTag(tag_name);
+    CLIO_CO_AWAIT(tag_task);
+    g_us_tag.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
+    tag_id = tag_task->tag_id_;
+    if (tag_id.IsNull()) {
+      HLOG(kError, "S3FileAssimilator: Failed to get or create tag '{}'",
+           tag_name);
+      error_code = -3;
+      CLIO_CO_RETURN;
+    }
   }
 
   // Dependency-based scheduling is not yet supported (mirrors binary backend).
@@ -365,56 +499,225 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
   HLOG(kDebug, "S3FileAssimilator: s3://{}/{} -> {} bytes (offset {})", bucket,
        key, total_size, chunk_offset);
 
-  // Store object metadata as the "description" blob (mirrors binary backend).
-  std::string description = "binary<size=" + std::to_string(total_size) +
-                            ", offset=" + std::to_string(chunk_offset) + ">";
-  size_t desc_size = description.size();
-  auto desc_buffer = CLIO_IPC->AllocateBuffer(desc_size);
-  std::memcpy(desc_buffer.ptr_, description.c_str(), desc_size);
-  // Submitted AND awaited here, as it was before b8b84521. That commit deferred
-  // the await to after the body to take this CTE round trip off the critical
-  // path of every object; the targeted fine-granularity cells got slower, not
-  // faster, so the deferral bought nothing measurable and cost two things that
-  // are worth more than one round trip:
-  //
-  //   1. On the mid-body error paths (-8, -10) desc_task was abandoned while
-  //      still in flight, leaving a submitted-but-never-collected future.
-  //   2. A description failure was only discovered after the body had already
-  //      been committed, so the object was half-written when it was reported.
-  //
-  // Keep the trip. The per-object cost is one CTE hop and it is honest.
-  const SteadyClock::time_point _t_desc = SteadyClock::now();
-  auto desc_task =
-      cte_client_->AsyncPutBlob(tag_id, "description", 0, desc_size,
-                                desc_buffer.shm_.template Cast<void>(), 1.0f,
-                                clio::cte::core::Context(), 0);
-  CLIO_CO_AWAIT(desc_task);
-  g_us_desc.fetch_add(UsSince(_t_desc), std::memory_order_relaxed);
-  if (desc_task->return_code_ != 0) {
-    HLOG(kError,
-         "S3FileAssimilator: Failed to store description for tag '{}' (code {})",
-         tag_name, desc_task->return_code_);
-    CLIO_IPC->FreeBuffer(desc_task->blob_data_.template Cast<char>());
-    error_code = -9;
-    CLIO_CO_RETURN;
+#ifdef CAE_ENABLE_CFS_DST
+  // cfs::<path>: create the file in the clio-fs namespace and write its pages
+  // straight into the file's tag. Its size is published when it is closed at
+  // the end; until then readers see an empty file. Parent directories are
+  // created as needed (an existing one is not an error).
+  std::unique_ptr<clio::cte::filesystem::Client> cfs;
+  clio::run::u64 cfs_handle = 0;
+  // Close the file on every error path below, publishing no size.
+  struct CfsCloseOnError {
+    clio::cte::filesystem::Client *client = nullptr;
+    clio::run::u64 handle = 0;
+    ~CfsCloseOnError() {
+      if (client != nullptr && handle != 0) {
+        client->AsyncCloseDetached(handle, 0);
+      }
+    }
+  } cfs_guard;
+  if (to_cfs) {
+    // The runtime answers clients before compose has created every pool, and
+    // a clio-fs task sent ahead of its pool was observed never to complete
+    // (the CAE pool is composed first, the filesystem last). Wait for the pool
+    // here -- bounded -- instead of hanging the import.
+    _t_phase = SteadyClock::now();
+    while (!CLIO_POOL_MANAGER->HasPool(clio::cte::filesystem::kCfsPoolId)) {
+      if (UsSince(_t_phase) > 120ull * 1000 * 1000) {
+        HLOG(kError,
+             "S3FileAssimilator: no clio_cte_filesystem pool ({}) after 120 s; "
+             "compose it to use cfs:: destinations",
+             clio::cte::filesystem::kCfsPoolId);
+        error_code = -3;
+        CLIO_CO_RETURN;
+      }
+      CLIO_CO_AWAIT(clio::run::yield(10000.0));
+    }
+    cfs = std::make_unique<clio::cte::filesystem::Client>(
+        clio::cte::filesystem::kCfsPoolId);
+    for (size_t slash = tag_name.find('/', 1); slash != std::string::npos;
+         slash = tag_name.find('/', slash + 1)) {
+      auto mk = cfs->AsyncMkdir(tag_name.substr(0, slash));
+      CLIO_CO_AWAIT(mk);
+    }
+    auto open_task = cfs->AsyncOpen(
+        tag_name, static_cast<clio::run::u32>(O_CREAT | O_WRONLY | O_TRUNC),
+        0644);
+    CLIO_CO_AWAIT(open_task);
+    g_us_tag.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
+    if (open_task->GetReturnCode() != 0 || open_task->handle_ == 0) {
+      HLOG(kError,
+           "S3FileAssimilator: could not create clio-fs file '{}' (rc {}); is "
+           "the clio_cte_filesystem pool composed?",
+           tag_name, open_task->GetReturnCode());
+      error_code = -3;
+      CLIO_CO_RETURN;
+    }
+    cfs_handle = open_task->handle_;
+    cfs_guard.client = cfs.get();
+    cfs_guard.handle = cfs_handle;
+    tag_id = clio::cte::core::TagId(
+        static_cast<clio::run::u32>(open_task->tag_packed_ >> 32),
+        static_cast<clio::run::u32>(open_task->tag_packed_ & 0xffffffffULL));
   }
-  // Pre-existing leak found while b8b84521 moved this, and kept on the revert:
-  // the description buffer was allocated per object and never freed.
-  // BinaryFileAssimilator:176 has the same bug -- left alone rather than edited
-  // blind in an unrelated path.
-  CLIO_IPC->FreeBuffer(desc_task->blob_data_.template Cast<char>());
+#endif
+
+  // Store object metadata as the "description" blob (mirrors binary backend).
+  // Not for a cfs:: file: every blob of a file's tag is one of its pages.
+  if (!to_cfs) {
+    std::string description = "binary<size=" + std::to_string(total_size) +
+                              ", offset=" + std::to_string(chunk_offset) + ">";
+    size_t desc_size = description.size();
+    auto desc_buffer = CLIO_IPC->AllocateBuffer(desc_size);
+    std::memcpy(desc_buffer.ptr_, description.c_str(), desc_size);
+    // Submitted AND awaited here, as it was before b8b84521. That commit
+    // deferred the await to after the body to take this CTE round trip off the
+    // critical path of every object; the targeted fine-granularity cells got
+    // slower, not faster, so the deferral bought nothing measurable and cost
+    // two things that are worth more than one round trip:
+    //
+    //   1. On the mid-body error paths (-8, -10) desc_task was abandoned
+    //      while still in flight, leaving a submitted-but-never-collected
+    //      future.
+    //   2. A description failure was only discovered after the body had
+    //      already been committed, so the object was half-written when it was
+    //      reported.
+    //
+    // Keep the trip. The per-object cost is one CTE hop and it is honest.
+    const SteadyClock::time_point _t_desc = SteadyClock::now();
+    auto desc_task =
+        cte_client_->AsyncPutBlob(tag_id, "description", 0, desc_size,
+                                  desc_buffer.shm_.template Cast<void>(), 1.0f,
+                                  clio::cte::core::Context(), 0);
+    CLIO_CO_AWAIT(desc_task);
+    g_us_desc.fetch_add(UsSince(_t_desc), std::memory_order_relaxed);
+    if (desc_task->return_code_ != 0) {
+      HLOG(kError,
+           "S3FileAssimilator: Failed to store description for tag '{}' "
+           "(code {})",
+           tag_name, desc_task->return_code_);
+      CLIO_IPC->FreeBuffer(desc_task->blob_data_.template Cast<char>());
+      error_code = -9;
+      CLIO_CO_RETURN;
+    }
+    // Pre-existing leak found while b8b84521 moved this, and kept on the
+    // revert: the description buffer was allocated per object and never freed.
+    // BinaryFileAssimilator:176 has the same bug -- left alone rather than
+    // edited blind in an unrelated path.
+    CLIO_IPC->FreeBuffer(desc_task->blob_data_.template Cast<char>());
+  }
 
   // Stream the body into CTE in chunks, keeping up to kMaxParallelTasks PutBlob
   // tasks in flight (identical wait-and-drain shape to the binary backend). The
   // body now comes off the socket instead of a staged file; FillChunk resumes a
   // dropped keep-alive mid-object so a suspend across a PutBlob cannot truncate.
-  static constexpr size_t kMaxChunkSize = 1024 * 1024;  // 1 MB
+  static constexpr size_t kMaxChunkSize = kChunkBytes;
   static constexpr size_t kMaxParallelTasks = 32;
   static constexpr int kMaxResumes = 16;
   size_t chunk_idx = 0;
   size_t bytes_processed = 0;
   int resumes = 0;
   std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> active_tasks;
+
+  const StripeConfig stripe = StripeConfigFromEnv();
+  if (stripe.streams > 1 && total_size > stripe.part_bytes) {
+    // STRIPED: the object is fetched one window at a time. A window holds
+    // kPartsPerStream parts per stream; `streams` threads pull parts from a
+    // shared counter, each part one ranged GET, so a slow request delays only
+    // its own thread's next pull, not the whole window. The opening GET only
+    // supplied the size, so it is dropped rather than drained (draining would
+    // read the whole object).
+    static constexpr size_t kPartsPerStream = 4;
+    conn.Retire();
+    stream.body = nullptr;
+    using BufPtr = decltype(CLIO_IPC->AllocateBuffer(size_t{0}));
+    const size_t window = stripe.streams * kPartsPerStream * stripe.part_bytes;
+    const size_t chunks_per_part = stripe.part_bytes / kChunkBytes;
+    // Let a whole window's PutBlobs be in flight while the next one downloads.
+    const size_t inflight_cap =
+        std::max(kMaxParallelTasks, window / kChunkBytes);
+    while (bytes_processed < total_size) {
+      const size_t win_bytes = std::min(window, total_size - bytes_processed);
+      std::vector<BufPtr> bufs;
+      std::vector<size_t> sizes;
+      bool alloc_ok = true;
+      for (size_t off = 0; off < win_bytes; off += kChunkBytes) {
+        const size_t n = std::min(kChunkBytes, win_bytes - off);
+        bufs.push_back(CLIO_IPC->AllocateBuffer(n));
+        sizes.push_back(n);
+        if (bufs.back().ptr_ == nullptr) alloc_ok = false;
+      }
+      std::vector<StripeJob> jobs;
+      for (size_t c = 0; c < bufs.size(); c += chunks_per_part) {
+        StripeJob job;
+        job.abs_off = req_off + bytes_processed + c * kChunkBytes;
+        for (size_t k = c; k < std::min(c + chunks_per_part, bufs.size());
+             ++k) {
+          job.bufs.push_back(bufs[k].ptr_);
+          job.sizes.push_back(sizes[k]);
+        }
+        jobs.push_back(std::move(job));
+      }
+      _t_phase = SteadyClock::now();
+      if (alloc_ok) {
+        // Threads, not coroutines: the reads block in Poco, and the runtime
+        // worker blocks here anyway (as FillChunk does on the serial path).
+        std::atomic<size_t> next_job{0};
+        auto pull = [&]() {
+          for (size_t j = next_job.fetch_add(1); j < jobs.size();
+               j = next_job.fetch_add(1)) {
+            FetchStripe(client.config(), s3_pool_, key, kMaxResumes, &jobs[j]);
+          }
+        };
+        std::vector<std::thread> threads;
+        const size_t nthreads = std::min(stripe.streams, jobs.size());
+        for (size_t t = 1; t < nthreads; ++t) threads.emplace_back(pull);
+        pull();
+        for (auto& t : threads) t.join();
+      }
+      g_us_fill.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
+      std::string err = alloc_ok ? "" : "buffer allocation failed";
+      for (const StripeJob& job : jobs) {
+        resumes += job.resumes;
+        if (err.empty() && !job.error.empty()) err = job.error;
+      }
+      if (!err.empty()) {
+        HLOG(kError,
+             "S3FileAssimilator: striped read of s3://{}/{} failed in the "
+             "window at offset {}: {}",
+             bucket, key, req_off + bytes_processed, err);
+        for (auto& b : bufs) {
+          if (b.ptr_ != nullptr) CLIO_IPC->FreeBuffer(b);
+        }
+        error_code = -8;
+        CLIO_CO_RETURN;
+      }
+      for (size_t k = 0; k < bufs.size(); ++k) {
+        active_tasks.push_back(cte_client_->AsyncPutBlob(
+            tag_id, ChunkBlobName(to_cfs, chunk_idx), 0, sizes[k],
+            bufs[k].shm_.template Cast<void>(), 1.0f,
+            clio::cte::core::Context(), 0));
+        chunk_idx++;
+      }
+      bytes_processed += win_bytes;
+
+      while (active_tasks.size() > inflight_cap) {
+        auto& first_task = active_tasks.front();
+        _t_phase = SteadyClock::now();
+        CLIO_CO_AWAIT(first_task);
+        g_us_put.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
+        if (first_task->return_code_ != 0) {
+          HLOG(kError, "S3FileAssimilator: PutBlob task failed with code {}",
+               first_task->return_code_);
+          CLIO_IPC->FreeBuffer(first_task->blob_data_.template Cast<char>());
+          error_code = -10;
+          CLIO_CO_RETURN;
+        }
+        CLIO_IPC->FreeBuffer(first_task->blob_data_.template Cast<char>());
+        active_tasks.erase(active_tasks.begin());
+      }
+    }
+  }
 
   while (bytes_processed < total_size) {
     while (active_tasks.size() < kMaxParallelTasks &&
@@ -440,11 +743,10 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
         CLIO_CO_RETURN;
       }
 
-      std::string blob_name = "chunk_" + std::to_string(chunk_idx);
-      auto task =
-          cte_client_->AsyncPutBlob(tag_id, blob_name, 0, current_chunk_size,
-                                    buffer_ptr.shm_.template Cast<void>(), 1.0f,
-                                    clio::cte::core::Context(), 0);
+      auto task = cte_client_->AsyncPutBlob(
+          tag_id, ChunkBlobName(to_cfs, chunk_idx), 0, current_chunk_size,
+          buffer_ptr.shm_.template Cast<void>(), 1.0f,
+          clio::cte::core::Context(), 0);
       active_tasks.push_back(task);
       bytes_processed += current_chunk_size;
       chunk_idx++;
@@ -483,9 +785,27 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
   }
 
   // Drain any unread tail so the socket is reusable, then the guard pools it.
+  // (A no-op after a striped fetch: that stream was already dropped.)
   _t_phase = SteadyClock::now();
   client.EndGetObject(conn, stream);
   g_us_end.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
+
+#ifdef CAE_ENABLE_CFS_DST
+  // Every page is stored: publish the file's size by closing it.
+  if (to_cfs) {
+    auto close_task = cfs->AsyncClose(cfs_handle, total_size);
+    CLIO_CO_AWAIT(close_task);
+    cfs_guard.handle = 0;  // closed, whatever the outcome
+    if (close_task->GetReturnCode() != 0) {
+      HLOG(kError,
+           "S3FileAssimilator: closing clio-fs file '{}' failed (rc {}); its "
+           "size was not published",
+           tag_name, close_task->GetReturnCode());
+      error_code = -11;
+      CLIO_CO_RETURN;
+    }
+  }
+#endif
 
   g_n_chunks.fetch_add(chunk_idx, std::memory_order_relaxed);
   g_n_objects.fetch_add(1, std::memory_order_relaxed);
@@ -493,8 +813,8 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
 
   HLOG(kDebug,
        "S3FileAssimilator: Imported s3://{}/{} ({} chunks, {} resumes) into "
-       "tag '{}'",
-       bucket, key, chunk_idx, resumes, tag_name);
+       "{} '{}'",
+       bucket, key, chunk_idx, resumes, to_cfs ? "file" : "tag", tag_name);
   error_code = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

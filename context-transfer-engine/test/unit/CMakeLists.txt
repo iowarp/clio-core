@@ -2078,6 +2078,36 @@ add_dependencies(test_putblob_priv
     clio_bdev_runtime
     clio_admin_runtime)
 
+# cte_tiers' report against an in-process runtime (core/util/cte_tiers.cc
+# is only CLIO_INIT plus this call).
+add_executable(test_cte_tiers
+    test_cte_tiers.cc
+)
+target_include_directories(test_cte_tiers PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/util
+)
+target_link_libraries(test_cte_tiers
+    clio_cte_core_client
+    clio_cte_core_runtime
+    clio::run::admin_client
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+add_dependencies(test_cte_tiers
+    clio_cte_core_runtime
+    clio_bdev_runtime
+    clio_admin_runtime)
+add_test(NAME cte_tiers_report
+    COMMAND test_cte_tiers
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_tests_properties(cte_tiers_report PROPERTIES
+    ENVIRONMENT "${_getblob_priv_env}"
+    RESOURCE_LOCK "clio_runtime"
+    TIMEOUT 120
+    LABELS "unit;core;cte;msan_skip")
+
 add_test(NAME cte_putblob_priv_inline
     COMMAND test_putblob_priv
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
