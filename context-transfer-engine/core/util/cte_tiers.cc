@@ -1,11 +1,9 @@
 /**
  * cte_tiers — show where the CTE's bytes are: one line per storage target.
  *
- * For every registered target (ListTargets) prints its score and remaining
- * space (GetTargetInfo). Answers "did my data land on the tier I scored
- * highest?" without reading the runtime log. (GetTargetInfo's bytes_written_ /
- * bytes_read_ are not printed: they read 0 on targets that demonstrably hold
- * data, so free space is the trustworthy signal.)
+ * For every registered target prints its score and remaining space (see
+ * cte_tiers_report.h). Answers "did my data land on the tier I scored
+ * highest?" without reading the runtime log.
  *
  * Usage:
  *   cte_tiers
@@ -18,10 +16,10 @@
 #include <clio_cte/core/core_client.h>
 
 #include <chrono>
-#include <cstdio>
 #include <iostream>
-#include <string>
 #include <thread>
+
+#include "cte_tiers_report.h"
 
 int main() {
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
@@ -39,27 +37,5 @@ int main() {
     std::cerr << "error: failed to initialize CTE client\n";
     return 1;
   }
-  auto *client = CLIO_CTE_CLIENT;
-
-  auto list = client->AsyncListTargets(clio::run::PoolQuery::Local());
-  list.Wait();
-  if (list->GetReturnCode() != 0) {
-    std::cerr << "error: ListTargets failed (rc " << list->GetReturnCode()
-              << ")\n";
-    return 1;
-  }
-  std::printf("%-60s %6s %14s\n", "target", "score", "free_MB");
-  for (const std::string &name : list->target_names_) {
-    auto info =
-        client->AsyncGetTargetInfo(name, clio::run::PoolQuery::Local());
-    info.Wait();
-    if (info->GetReturnCode() != 0) {
-      std::printf("%-60s (GetTargetInfo rc %u)\n", name.c_str(),
-                  info->GetReturnCode());
-      continue;
-    }
-    std::printf("%-60s %6.2f %14.1f\n", name.c_str(), info->target_score_,
-                info->remaining_space_ / 1e6);
-  }
-  return 0;
+  return clio::cte::core::util::WriteTierReport(CLIO_CTE_CLIENT, std::cout);
 }
