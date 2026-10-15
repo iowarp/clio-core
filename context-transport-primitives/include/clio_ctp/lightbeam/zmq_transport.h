@@ -684,6 +684,12 @@ class ZeroMqTransport : public Transport {
   template <typename MetaT>
   int RecvMetadata(MetaT& meta, const LbmContext& ctx = LbmContext()) {
     (void)ctx;
+    // zmq_msg_recv processes pending pipe commands on this thread, and libzmq
+    // (uninstrumented) writes its signaler's eventfd counter on our stack
+    // before handing it to write(2). That stack still carries shadow from
+    // earlier instrumented frames, so the write interceptor reports libzmq's
+    // own bytes. Suppress only those interceptor checks.
+    ctp::MsanInterceptorCheckGuard msan_guard;
     zmq_msg_t msg;
     zmq_msg_init(&msg);
     int rc;
@@ -703,6 +709,10 @@ class ZeroMqTransport : public Transport {
         zmq_msg_close(&msg);
         return err;
       }
+      // A short frame lives inline in the zmq_msg_t on our stack, written by
+      // libzmq (uninstrumented): mark those bytes as the data they are.
+      CTP_MSAN_UNPOISON(zmq_msg_data(&identity_msg),
+                        zmq_msg_size(&identity_msg));
       meta.client_info_.identity_ = std::string(
           static_cast<char*>(zmq_msg_data(&identity_msg)),
           zmq_msg_size(&identity_msg));
@@ -743,6 +753,7 @@ class ZeroMqTransport : public Transport {
     }
 
     size_t msg_size = zmq_msg_size(&msg);
+    CTP_MSAN_UNPOISON(zmq_msg_data(&msg), msg_size);
     try {
       std::vector<char> meta_buf(static_cast<char*>(zmq_msg_data(&msg)),
                                   static_cast<char*>(zmq_msg_data(&msg)) + msg_size);

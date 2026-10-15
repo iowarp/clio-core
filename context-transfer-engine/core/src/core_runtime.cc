@@ -8062,17 +8062,25 @@ void Runtime::RestoreMetadataFromLog() {
          "keeping what was restored before it and ignoring the rest",
          log_path, static_cast<long long>(ifs.tellg()), what, value);
   };
+  // Every read goes through here: libstdc++.so copies the bytes into place
+  // where MSan cannot see it, so the bytes actually read -- and the stream
+  // state that says how many -- are marked initialized right after.
+  auto read_raw = [&ifs](char *dst, std::streamsize n) {
+    ifs.read(dst, n);
+    CTP_MSAN_UNPOISON_OBJ(ifs);
+    CTP_MSAN_UNPOISON(dst, static_cast<size_t>(ifs.gcount()));
+  };
   // Length-prefixed string, bounded by the bytes left in the file.
   auto read_str = [&](std::string &out, const char *what) -> bool {
     uint32_t len = 0;
-    ifs.read(reinterpret_cast<char *>(&len), sizeof(len));
+    read_raw(reinterpret_cast<char *>(&len), sizeof(len));
     if (!ifs.good()) return false;
     if (len > remaining()) {
       corrupt(what, len);
       return false;
     }
     out.assign(len, '\0');
-    ifs.read(out.data(), len);
+    read_raw(out.data(), len);
     return ifs.good();
   };
   // Serialized size of one block record: bdev ids, target query, offset, size.
@@ -8083,7 +8091,7 @@ void Runtime::RestoreMetadataFromLog() {
 
   while (!stop && ifs.peek() != EOF) {
     uint8_t entry_type;
-    ifs.read(reinterpret_cast<char *>(&entry_type), sizeof(entry_type));
+    read_raw(reinterpret_cast<char *>(&entry_type), sizeof(entry_type));
     if (!ifs.good()) break;
 
     if (entry_type == 0) {
@@ -8091,9 +8099,9 @@ void Runtime::RestoreMetadataFromLog() {
       std::string tag_name;
       if (!read_str(tag_name, "tag name length")) break;
       TagId tag_id;
-      ifs.read(reinterpret_cast<char *>(&tag_id), sizeof(tag_id));
+      read_raw(reinterpret_cast<char *>(&tag_id), sizeof(tag_id));
       clio::run::u64 total_size;
-      ifs.read(reinterpret_cast<char *>(&total_size), sizeof(total_size));
+      read_raw(reinterpret_cast<char *>(&total_size), sizeof(total_size));
 
       if (!ifs.good()) break;
 
@@ -8115,11 +8123,11 @@ void Runtime::RestoreMetadataFromLog() {
       std::string tag_name;
       if (!read_str(tag_name, "tag name length")) break;
       TagId tag_id;
-      ifs.read(reinterpret_cast<char *>(&tag_id), sizeof(tag_id));
+      read_raw(reinterpret_cast<char *>(&tag_id), sizeof(tag_id));
       clio::run::u64 total_size;
-      ifs.read(reinterpret_cast<char *>(&total_size), sizeof(total_size));
+      read_raw(reinterpret_cast<char *>(&total_size), sizeof(total_size));
       uint32_t num_aliases;
-      ifs.read(reinterpret_cast<char *>(&num_aliases), sizeof(num_aliases));
+      read_raw(reinterpret_cast<char *>(&num_aliases), sizeof(num_aliases));
       if (!ifs.good()) break;
       // Each alias costs at least its 4-byte length prefix.
       if (static_cast<clio::run::u64>(num_aliases) * sizeof(uint32_t) >
@@ -8168,25 +8176,25 @@ void Runtime::RestoreMetadataFromLog() {
       if (!read_str(blob_name, "blob name length")) break;
 
       float score;
-      ifs.read(reinterpret_cast<char *>(&score), sizeof(score));
+      read_raw(reinterpret_cast<char *>(&score), sizeof(score));
       uint32_t transform_flags = 0;
       uint32_t droppable = 0;
       if (has_transform_flags) {
-        ifs.read(reinterpret_cast<char *>(&transform_flags),
+        read_raw(reinterpret_cast<char *>(&transform_flags),
                  sizeof(transform_flags));
       }
       if (has_droppable) {
-        ifs.read(reinterpret_cast<char *>(&droppable), sizeof(droppable));
+        read_raw(reinterpret_cast<char *>(&droppable), sizeof(droppable));
       }
       int32_t compress_lib;
-      ifs.read(reinterpret_cast<char *>(&compress_lib), sizeof(compress_lib));
+      read_raw(reinterpret_cast<char *>(&compress_lib), sizeof(compress_lib));
       int32_t compress_preset;
-      ifs.read(reinterpret_cast<char *>(&compress_preset),
+      read_raw(reinterpret_cast<char *>(&compress_preset),
                sizeof(compress_preset));
       clio::run::u64 trace_key;
-      ifs.read(reinterpret_cast<char *>(&trace_key), sizeof(trace_key));
+      read_raw(reinterpret_cast<char *>(&trace_key), sizeof(trace_key));
       uint32_t num_blocks;
-      ifs.read(reinterpret_cast<char *>(&num_blocks), sizeof(num_blocks));
+      read_raw(reinterpret_cast<char *>(&num_blocks), sizeof(num_blocks));
 
       if (!ifs.good()) break;
       if (num_blocks * kBlockBytes > remaining()) {
@@ -8217,17 +8225,17 @@ void Runtime::RestoreMetadataFromLog() {
       // Read per-block data
       for (uint32_t i = 0; i < num_blocks; i++) {
         clio::run::u32 bdev_major, bdev_minor;
-        ifs.read(reinterpret_cast<char *>(&bdev_major), sizeof(bdev_major));
-        ifs.read(reinterpret_cast<char *>(&bdev_minor), sizeof(bdev_minor));
+        read_raw(reinterpret_cast<char *>(&bdev_major), sizeof(bdev_major));
+        read_raw(reinterpret_cast<char *>(&bdev_minor), sizeof(bdev_minor));
 
         // Read target_query as raw bytes (POD-like struct)
         clio::run::PoolQuery target_query;
-        ifs.read(reinterpret_cast<char *>(&target_query),
+        read_raw(reinterpret_cast<char *>(&target_query),
                  sizeof(clio::run::PoolQuery));
 
         clio::run::u64 offset, size;
-        ifs.read(reinterpret_cast<char *>(&offset), sizeof(offset));
-        ifs.read(reinterpret_cast<char *>(&size), sizeof(size));
+        read_raw(reinterpret_cast<char *>(&offset), sizeof(offset));
+        read_raw(reinterpret_cast<char *>(&size), sizeof(size));
 
         if (!ifs.good()) break;
 
@@ -8285,21 +8293,21 @@ void Runtime::RestoreMetadataFromLog() {
       std::string composite_key;
       if (!read_str(composite_key, "replica key length")) break;
       uint32_t rep_idx;
-      ifs.read(reinterpret_cast<char *>(&rep_idx), sizeof(rep_idx));
+      read_raw(reinterpret_cast<char *>(&rep_idx), sizeof(rep_idx));
       std::string rep_name;
       if (!read_str(rep_name, "replica name length")) break;
       float rep_score;
-      ifs.read(reinterpret_cast<char *>(&rep_score), sizeof(rep_score));
+      read_raw(reinterpret_cast<char *>(&rep_score), sizeof(rep_score));
       uint32_t rep_flags;
-      ifs.read(reinterpret_cast<char *>(&rep_flags), sizeof(rep_flags));
+      read_raw(reinterpret_cast<char *>(&rep_flags), sizeof(rep_flags));
       uint32_t rep_transform;
-      ifs.read(reinterpret_cast<char *>(&rep_transform),
+      read_raw(reinterpret_cast<char *>(&rep_transform),
                sizeof(rep_transform));
       float rep_min_score;
-      ifs.read(reinterpret_cast<char *>(&rep_min_score),
+      read_raw(reinterpret_cast<char *>(&rep_min_score),
                sizeof(rep_min_score));
       uint32_t num_blocks;
-      ifs.read(reinterpret_cast<char *>(&num_blocks), sizeof(num_blocks));
+      read_raw(reinterpret_cast<char *>(&num_blocks), sizeof(num_blocks));
 
       if (!ifs.good()) break;
       if (num_blocks * kBlockBytes > remaining()) {
@@ -8326,14 +8334,14 @@ void Runtime::RestoreMetadataFromLog() {
       // failed — the record's bytes are in the file either way.
       for (uint32_t i = 0; i < num_blocks; i++) {
         clio::run::u32 bdev_major, bdev_minor;
-        ifs.read(reinterpret_cast<char *>(&bdev_major), sizeof(bdev_major));
-        ifs.read(reinterpret_cast<char *>(&bdev_minor), sizeof(bdev_minor));
+        read_raw(reinterpret_cast<char *>(&bdev_major), sizeof(bdev_major));
+        read_raw(reinterpret_cast<char *>(&bdev_minor), sizeof(bdev_minor));
         clio::run::PoolQuery target_query;
-        ifs.read(reinterpret_cast<char *>(&target_query),
+        read_raw(reinterpret_cast<char *>(&target_query),
                  sizeof(clio::run::PoolQuery));
         clio::run::u64 offset, size;
-        ifs.read(reinterpret_cast<char *>(&offset), sizeof(offset));
-        ifs.read(reinterpret_cast<char *>(&size), sizeof(size));
+        read_raw(reinterpret_cast<char *>(&offset), sizeof(offset));
+        read_raw(reinterpret_cast<char *>(&size), sizeof(size));
         if (!ifs.good()) break;
         if (rep == nullptr) continue;
 
@@ -8364,7 +8372,7 @@ void Runtime::RestoreMetadataFromLog() {
       std::string composite_key;
       if (!read_str(composite_key, "blob times key length")) break;
       clio::run::u64 times[3];
-      ifs.read(reinterpret_cast<char *>(times), sizeof(times));
+      read_raw(reinterpret_cast<char *>(times), sizeof(times));
       if (!ifs.good()) break;
       std::shared_ptr<BlobInfo> blob_info_ptr =
           tag_blob_name_to_info_.get(composite_key);

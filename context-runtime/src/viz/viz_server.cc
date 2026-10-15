@@ -807,6 +807,9 @@ class PocoVizHandler : public Poco::Net::HTTPRequestHandler {
     // without rebuilding, point $CLIO_VIZ_PATH at a working copy; the daemon
     // then serves them from this same origin.
     presp.setContentLength(static_cast<std::streamsize>(resp.body.size()));
+    // Poco formats the status line and headers itself and hands them to
+    // send(2) from its own frames; only the interceptor checks reach that.
+    ctp::MsanInterceptorCheckGuard msan_guard;
     std::ostream &out = presp.send();
     if (req.method != "HEAD") {
       out.write(resp.body.data(),
@@ -851,6 +854,14 @@ bool VizServer::StartOn(const std::string &bind_addr, u32 port,
     Poco::Net::initializeNetwork();
     impl->socket = Poco::Net::ServerSocket(
         Poco::Net::SocketAddress(bind_addr, static_cast<Poco::UInt16>(port)));
+    // Assigned from a temporary that libPocoNet built and copied in; later
+    // inline reads of it (address(), close()) would otherwise be reported.
+    CTP_MSAN_UNPOISON_OBJ(impl->socket);
+    // libPocoNet also constructed the SocketImpl the handle points to. With
+    // poison_in_malloc=0 its heap block keeps whatever shadow a previous owner
+    // left, so the vptr that the inline address()/close() dispatch through
+    // reads as uninitialized. Clear the base-class part (vptr + fd).
+    CTP_MSAN_UNPOISON(impl->socket.impl(), sizeof(Poco::Net::SocketImpl));
     auto *params = new Poco::Net::HTTPServerParams();
     params->setMaxThreads(static_cast<int>(std::max<u32>(max_threads, 1)));
     params->setMaxQueued(64);

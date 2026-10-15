@@ -12,6 +12,7 @@
 #include <clio_runtime/bdev/transports/fs_bdev_transport.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/io/io_error.h>
+#include <clio_ctp/util/msan.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/manager.h>
 #include <clio_runtime/worker.h>
@@ -524,9 +525,13 @@ clio::run::u64 FsBdevTransport::HostFreeBytes() const {
     return host_free_.load(std::memory_order_relaxed);
   }
   std::error_code ec;
-  const std::filesystem::space_info si =
-      std::filesystem::space(std::filesystem::path(file_path_).parent_path(),
-                             ec);
+  // parent_path() and space() both run in libstdc++.so, which MSan does not
+  // see: the returned path and space_info read back as uninitialized.
+  std::filesystem::path dir = std::filesystem::path(file_path_).parent_path();
+  CTP_MSAN_UNPOISON_PATH(dir);
+  std::filesystem::space_info si = std::filesystem::space(dir, ec);
+  CTP_MSAN_UNPOISON_OBJ(si);
+  CTP_MSAN_UNPOISON_OBJ(ec);
   // Unknown (e.g. no permission to stat): do not cap by it.
   const clio::run::u64 free_b =
       ec ? ~clio::run::u64(0) : static_cast<clio::run::u64>(si.available);
