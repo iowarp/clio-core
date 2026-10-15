@@ -1515,9 +1515,8 @@ clio::run::TaskResume Runtime::StoreDegradedParity(clio::run::u64 s,
     rows.push_back(j);
     bufs.push_back(buf);
   }
-  const bool all_sent = rows.size() == ActiveParityCount();
   clio::run::u32 written = 0;
-  bool stale = !all_sent;  // an active row not even sent holds a stale shard
+  bool stale = false;
   for (size_t i = 0; i < futs.size(); ++i) {
     CLIO_CO_AWAIT(futs[i]);
     const bool wok =
@@ -1532,7 +1531,22 @@ clio::run::TaskResume Runtime::StoreDegradedParity(clio::run::u64 s,
       stale = true;
     }
   }
-  if (stale) CLIO_CO_RETURN;
+  // An active row not even sent (no SHM buffer) also holds a stale shard.
+  // Judged per row AFTER the writes, not by comparing how many rows were sent
+  // with how many are active now: a concurrent write can fault a row this one
+  // already sent, which made the counts differ and failed a write that every
+  // surviving row had taken.
+  for (size_t j = 0; j < parity_level_; ++j) {
+    if (parity_members_[j].state_ == ec::EcState::kActive &&
+        std::find(rows.begin(), rows.end(), j) == rows.end()) {
+      stale = true;
+    }
+  }
+  if (stale) {
+    HLOG(kError, "safe_bdev Write: slot {}: an active parity row did not take "
+         "its shard; refusing the write", s);
+    CLIO_CO_RETURN;
+  }
   // The stripe's down data chunks exist only in the parity: it needs at
   // least one written shard per down member to give them back.
   ok = written > 0 && written >= DownInStripe(st);
