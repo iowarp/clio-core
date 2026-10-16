@@ -1,0 +1,134 @@
+name: Qualify preserved 2.3.2 macOS capacity artifact
+
+on:
+  push:
+    branches: [codex/core-232-macos-capacity-qualification]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  macos-capacity:
+    name: Preserved wheel, macOS arm64 Python 3.14
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Check out qualification source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          architecture: arm64
+
+      - name: Verify artifact run and unchanged production source
+        env:
+          ARTIFACT_READ_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import subprocess
+          import urllib.request
+
+          evidence = Path("build/capacity-artifact-qualification")
+          evidence.mkdir(parents=True, exist_ok=True)
+          original_run = 38840677691
+          original_head = "d0dd6c6ecdb1631067deef5d9abbeb607c50dd99"
+          receipt = {"original_run": original_run, "expected_original_head": original_head,
+                     "qualification_head": os.environ["GITHUB_SHA"], "status": "failed"}
+          try:
+              assert platform.machine() == "arm64", platform.machine()
+              endpoint = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{original_run}"
+              request = urllib.request.Request(endpoint, headers={
+                  "Authorization": f"Bearer {os.environ['ARTIFACT_READ_TOKEN']}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  original = json.load(response)
+              assert original["head_sha"] == original_head, original["head_sha"]
+              subprocess.run(["git", "merge-base", "--is-ancestor", original_head, "HEAD"], check=True)
+              changed = subprocess.check_output(
+                  ["git", "diff", "--name-only", original_head, "HEAD"], text=True).splitlines()
+              allowed = {
+                  ".github/workflows/ci-linux.yml",
+                  ".github/workflows/capacity-artifact-qualification.yml",
+                  "context-transfer-engine/wrapper/python/CMakeLists.txt",
+                  "context-transfer-engine/wrapper/python/test_cte_capacity.py",
+              }
+              unexpected = sorted(set(changed) - allowed)
+              assert not unexpected, f"Production or unrelated source changed: {unexpected}"
+              test = Path("context-transfer-engine/wrapper/python/test_cte_capacity.py")
+              receipt.update(status="passed", original_head=original["head_sha"],
+                             original_run_url=original["html_url"],
+                             original_run_status=original["status"],
+                             original_run_conclusion=original["conclusion"],
+                             changed_paths=changed,
+                             test_sha256=hashlib.sha256(test.read_bytes()).hexdigest())
+          finally:
+              (evidence / "provenance.json").write_text(json.dumps(receipt, indent=2))
+          print(json.dumps(receipt, indent=2))
+          PY
+
+      - name: Download preserved macOS wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-macos-arm64
+          path: build/capacity-artifact-input/wheels
+          github-token: ${{ github.token }}
+          run-id: 38840677691
+          repository: ${{ github.repository }}
+
+      - name: Install exact wheel and run real capacity regression
+        shell: bash
+        run: |
+          python -m venv build/capacity-artifact-env
+          source build/capacity-artifact-env/bin/activate
+          export HOME="$PWD/build/capacity-artifact-qualification/home"
+          export USERPROFILE="$HOME"
+          mkdir -p "$HOME"
+          python - <<'PY'
+          import hashlib
+          from importlib.metadata import version
+          import json
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          evidence = Path("build/capacity-artifact-qualification")
+          wheels = sorted(Path("build/capacity-artifact-input/wheels").glob(
+              "iowarp_core-2.3.2-cp314-*-macosx_*_arm64.whl"))
+          assert len(wheels) == 1, [str(wheel) for wheel in wheels]
+          wheel = wheels[0].resolve()
+          with (evidence / "install.log").open("w") as log:
+              subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                              str(wheel), "psutil"], stdout=log, stderr=subprocess.STDOUT, check=True)
+          assert version("iowarp-core") == "2.3.2", version("iowarp-core")
+          receipt = {"wheel": str(wheel), "wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                     "installed_version": version("iowarp-core"), "python": sys.version,
+                     "psutil_version": version("psutil")}
+          (evidence / "installed-wheel.json").write_text(json.dumps(receipt, indent=2))
+          print(json.dumps(receipt, indent=2))
+          PY
+          MODULE_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_ext_dir())")
+          BIN_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_bin_dir())")
+          python context-transfer-engine/wrapper/python/test_cte_capacity.py \
+            --module-dir "$MODULE_DIR" --bin-dir "$BIN_DIR" \
+            --output-dir build/capacity-artifact-qualification/results \
+            | tee build/capacity-artifact-qualification/capacity-run.log
+
+      - name: Preserve artifact qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capacity-artifact-macos314-${{ github.run_id }}
+          path: build/capacity-artifact-qualification/
+          if-no-files-found: error

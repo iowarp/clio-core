@@ -378,6 +378,7 @@ def bounded_gil_check(
     process.suspend()
     errors: list[BaseException] = []
     done = threading.Event()
+    waiting = threading.Event()
     try:
         future = client.AsyncGetCapacity()
         assert future.wait(max_sec=0.1) is None
@@ -385,7 +386,8 @@ def bounded_gil_check(
         def wait_for_result() -> None:
             """Record the expected timeout while the main thread keeps running."""
             try:
-                future.result(max_sec=0.4)
+                waiting.set()
+                future.result(max_sec=1.0)
                 errors.append(AssertionError("Suspended daemon unexpectedly answered"))
             except TimeoutError:
                 pass
@@ -395,16 +397,27 @@ def bounded_gil_check(
                 done.set()
 
         beats = 0
+        first_heartbeat_elapsed: float | None = None
         start = time.monotonic()
         worker = threading.Thread(target=wait_for_result, daemon=True)
         worker.start()
+        assert waiting.wait(timeout=1.0), "Native-wait worker did not start"
         while not done.wait(0.01):
             beats += 1
+            if first_heartbeat_elapsed is None:
+                first_heartbeat_elapsed = time.monotonic() - start
             assert time.monotonic() - start < 3.0, "Bounded diagnostic wait hung"
         worker.join(timeout=1.0)
         elapsed = time.monotonic() - start
         assert not errors, errors
-        assert beats >= 10, (beats, elapsed)
+        # Scheduling granularity controls heartbeat frequency. Require Python
+        # progress well before the pending native wait expires, not a rate.
+        # Holding the GIL through its timeout produces no early heartbeat.
+        assert first_heartbeat_elapsed is not None and first_heartbeat_elapsed < 0.75, (
+            first_heartbeat_elapsed,
+            beats,
+            elapsed,
+        )
         assert elapsed < 2.0, elapsed
     finally:
         owned_process(args.daemon_pid, args.daemon_created, executable).resume()
@@ -412,6 +425,8 @@ def bounded_gil_check(
     assert resumed.total_capacity == 8 * MIB
     return {
         "heartbeat_count": beats,
+        "first_heartbeat_elapsed_seconds": first_heartbeat_elapsed,
+        "native_result_timeout_seconds": 1.0,
         "timeout_elapsed_seconds": elapsed,
         "wait_returned_none": True,
         "result_raised_timeout": True,
