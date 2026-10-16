@@ -53,6 +53,40 @@ namespace nb = nanobind;
 using namespace nb::literals;
 
 namespace {
+/** A copied capacity snapshot; values are bytes, not filesystem free space. */
+struct PyCapacityInfo {
+  uint64_t total_capacity;
+  uint64_t remaining_capacity;
+};
+
+/** Copied native target statistics; no TTL or placement eligibility is implied. */
+struct PyTargetInfo {
+  float target_score;
+  uint64_t remaining_space;
+  uint64_t bytes_read;
+  uint64_t bytes_written;
+  uint64_t ops_read;
+  uint64_t ops_written;
+};
+
+/**
+ * Reject failed diagnostic queries instead of reporting their zeroed outputs.
+ * @param task the completed native task
+ * @param operation the Python operation name used in the error message
+ * @throws std::runtime_error if no task or a nonzero return code was received
+ */
+template <typename TaskT>
+void RequireQuerySuccess(TaskT *task, const char *operation) {
+  if (task == nullptr) {
+    throw std::runtime_error(std::string(operation) + " returned no task");
+  }
+  const auto rc = task->GetReturnCode();
+  if (rc != 0) {
+    throw std::runtime_error(std::string(operation) +
+                             " failed with return code " + std::to_string(rc));
+  }
+}
+
 // Python-facing handle for an in-flight CTE task (async client APIs).
 //
 // Type-erased over the concrete task, but every operation runs against the
@@ -106,7 +140,7 @@ struct PyCteFuture {
 
   /**
    * Block, then produce the operation's Python result: bytes for GetBlob, a
-   * list for queries, None for status-only ops.
+   * list or copied snapshot for queries, None for status-only ops.
    * @param max_sec < 0 waits forever
    * @return the result object
    * @throws TimeoutError if max_sec elapsed first
@@ -329,6 +363,21 @@ NB_MODULE(clio_cte_core_ext, m) {
                   "parallelism defaults to 32 — matches C++ "
                   "clio::run::PoolQuery::Local default");
 
+  nb::class_<PyCapacityInfo>(m, "CapacityInfo")
+      .def_ro("total_capacity", &PyCapacityInfo::total_capacity,
+              "Summed configured target capacity in bytes.")
+      .def_ro("remaining_capacity", &PyCapacityInfo::remaining_capacity,
+              "Native remaining capacity in bytes, including evictable cache.");
+
+  nb::class_<PyTargetInfo>(m, "TargetInfo")
+      .def_ro("target_score", &PyTargetInfo::target_score)
+      .def_ro("remaining_space", &PyTargetInfo::remaining_space,
+              "Native remaining target space in bytes.")
+      .def_ro("bytes_read", &PyTargetInfo::bytes_read)
+      .def_ro("bytes_written", &PyTargetInfo::bytes_written)
+      .def_ro("ops_read", &PyTargetInfo::ops_read)
+      .def_ro("ops_written", &PyTargetInfo::ops_written);
+
   // Bind SemanticSearchResult — one row in the ranked output of a
   // SemanticSearch task. Exposed as a plain dataclass-style object so
   // Python callers can iterate the returned list and read the fields
@@ -390,7 +439,7 @@ NB_MODULE(clio_cte_core_ext, m) {
       .def("result", &PyCteFuture::Result, "max_sec"_a = -1.0f,
            "Block until done, then return the operation's result: bytes for "
            "AsyncGetBlob, a dict for conditional puts/versioned gets, "
-           "a list for the Async*Query/Search ops, None for "
+           "a list or snapshot for query operations, None for "
            "status-only ops (put/del/reorganize/register). Raises "
            "TimeoutError if max_sec (> 0) elapses first. The GIL is released "
            "while waiting.");
@@ -781,18 +830,108 @@ NB_MODULE(clio_cte_core_ext, m) {
          "Asynchronously reorganize a blob. Returns a Future; .wait() -> rc.")
      .def("AsyncRegisterTarget",
          [](clio::cte::core::Client &self, const std::string &target_name,
-            clio::run::bdev::BdevType bdev_type, uint64_t total_size) {
+            clio::run::bdev::BdevType bdev_type, uint64_t total_size,
+            const clio::run::PoolQuery &target_query,
+            const clio::run::PoolId &bdev_id,
+            const clio::run::PoolQuery &pool_query, uint32_t attach_existing,
+            uint64_t growth_unit) {
            using TaskT = clio::cte::core::RegisterTargetTask;
            clio::run::Future<TaskT> fut;
            {
              nb::gil_scoped_release release;
              fut = self.AsyncRegisterTarget(target_name, bdev_type,
-                                            total_size);
+                                            total_size, target_query, bdev_id,
+                                            pool_query, attach_existing,
+                                            growth_unit);
            }
            return MakePyFuture<TaskT>(std::move(fut));
          },
          "target_name"_a, "bdev_type"_a, "total_size"_a,
-         "Asynchronously register a storage target. .wait() -> rc.")
+         "target_query"_a = clio::run::PoolQuery::Local(),
+         "bdev_id"_a = clio::run::PoolId::GetNull(),
+         "pool_query"_a = clio::run::PoolQuery::Dynamic(),
+         "attach_existing"_a = uint32_t{0},
+         "growth_unit"_a = uint64_t{1} << 30,
+         "Asynchronously register a storage target. .wait() -> rc. "
+         "The original three-argument call retains native defaults. Supply "
+         "an explicit stable bdev_id when creating a managed target; null "
+         "does not allocate a new pool ID. Registration does not resize an "
+         "existing target or persist its configuration.")
+     .def("AsyncGetCapacity",
+         [](clio::cte::core::Client &self,
+            const clio::run::PoolQuery &pool_query) {
+           using TaskT = clio::cte::core::GetCapacityTask;
+           clio::run::Future<TaskT> fut;
+           {
+             nb::gil_scoped_release release;
+             fut = self.AsyncGetCapacity(pool_query);
+           }
+           return MakePyFuture<TaskT>(std::move(fut), [](TaskT *t) {
+             RequireQuerySuccess(t, "AsyncGetCapacity");
+             return nb::cast(PyCapacityInfo{t->total_capacity_,
+                                            t->remaining_capacity_});
+           });
+         },
+         "pool_query"_a = clio::run::PoolQuery::Local(),
+         "Read configured and remaining storage bytes. .result() -> "
+         "CapacityInfo; raises RuntimeError for a failed query. Local is "
+         "this node; Broadcast sums the cluster. Does not report target "
+         "health, TTL, or placement eligibility.")
+     .def("AsyncListTargets",
+         [](clio::cte::core::Client &self,
+            const clio::run::PoolQuery &pool_query) {
+           using TaskT = clio::cte::core::ListTargetsTask;
+           clio::run::Future<TaskT> fut;
+           {
+             nb::gil_scoped_release release;
+             fut = self.AsyncListTargets(pool_query);
+           }
+           return MakePyFuture<TaskT>(std::move(fut), [](TaskT *t) {
+             RequireQuerySuccess(t, "AsyncListTargets");
+             return nb::cast(t->target_names_);
+           });
+         },
+         "pool_query"_a = clio::run::PoolQuery::Local(),
+         "List registered target names. .result() -> list[str]; raises "
+         "RuntimeError for a failed query. Names are not health reports; "
+         "Broadcast appends names from replicas without deduplication.")
+     .def("AsyncStatTargets",
+         [](clio::cte::core::Client &self,
+            const clio::run::PoolQuery &pool_query) {
+           using TaskT = clio::cte::core::StatTargetsTask;
+           clio::run::Future<TaskT> fut;
+           {
+             nb::gil_scoped_release release;
+             fut = self.AsyncStatTargets(pool_query, 0);
+           }
+           return MakePyFuture<TaskT>(std::move(fut));
+         },
+         "pool_query"_a = clio::run::PoolQuery::Local(),
+         "Request a one-shot target-statistics refresh. .wait() -> rc. "
+         "A successful task can retain last-known statistics for a target "
+         "that did not answer; it does not prove every target is healthy.")
+     .def("AsyncGetTargetInfo",
+         [](clio::cte::core::Client &self, const std::string &target_name,
+            const clio::run::PoolQuery &pool_query) {
+           using TaskT = clio::cte::core::GetTargetInfoTask;
+           clio::run::Future<TaskT> fut;
+           {
+             nb::gil_scoped_release release;
+             fut = self.AsyncGetTargetInfo(target_name, pool_query);
+           }
+           return MakePyFuture<TaskT>(std::move(fut), [](TaskT *t) {
+             RequireQuerySuccess(t, "AsyncGetTargetInfo");
+             return nb::cast(PyTargetInfo{t->target_score_, t->remaining_space_,
+                                          t->bytes_read_, t->bytes_written_,
+                                          t->ops_read_, t->ops_written_});
+           });
+         },
+         "target_name"_a,
+         "pool_query"_a = clio::run::PoolQuery::Local(),
+         "Read a registered target's native statistics. .result() -> "
+         "TargetInfo; raises RuntimeError for a failed query, including a "
+         "missing target. No TTL, per-target total, or eligibility is "
+         "available in this native result; do not infer those fields.")
      .def("AsyncTagQuery",
          [](clio::cte::core::Client &self, const std::string &tag_regex,
             uint32_t max_tags, const clio::run::PoolQuery &pool_query) {

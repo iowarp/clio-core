@@ -231,4 +231,24 @@ if(BUILD_TESTING)
         TIMEOUT 180
         DEPENDS clio_cte_core_ext
     )
+
+    # Capacity/registration regression owns private daemons and filesystem
+    # state, including restart, full-tier refusal and bounded diagnostic waits.
+    # psutil is a required test-only dependency; its absence is a failure.
+    add_test(
+        NAME python_capacity_test
+        COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cte_capacity.py
+            --module-dir $<TARGET_FILE_DIR:clio_cte_core_ext>
+            --bin-dir $<TARGET_FILE_DIR:clio_run>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/capacity-results
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:clio_cte_core_ext>
+    )
+    set_tests_properties(
+        python_capacity_test
+        PROPERTIES
+        LABELS "python;bindings;capacity;integration"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        DEPENDS clio_cte_core_ext
+    )
 endif()
