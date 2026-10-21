@@ -200,12 +200,47 @@ class LinuxAioAsyncIO : public AsyncIO {
 
     struct iocb *iocbs[1] = {iocb};
     int submitted = io_submit(aio_ctx_, 1, iocbs);
+    if (submitted == -EAGAIN) {
+      // The context's io_depth_ requests are all in flight: EAGAIN means the
+      // queue is full, not that the I/O is bad. Failing it surfaced as a bdev
+      // write of 0 bytes (rc=2) and aborted CAE S3 imports into a file tier
+      // under 16 concurrent ranged GETs. Same fix as posix_aio.h (#1156): do
+      // the I/O synchronously and report it through IsComplete as usual.
+      completed_[token] = SyncIO(fd, buffer, size, offset, is_write);
+      in_flight_.insert(token);
+      return token;
+    }
     if (submitted != 1) {
       return kInvalidIoToken;
     }
 
     in_flight_.insert(token);
     return token;
+  }
+
+  /** Blocking pread/pwrite of the whole range; the EAGAIN fallback above. */
+  static IoResult SyncIO(int fd, void *buffer, size_t size, int64_t offset,
+                         bool is_write) {
+    IoResult result;
+    char *p = static_cast<char *>(buffer);
+    size_t done = 0;
+    while (done < size) {
+      ssize_t n = is_write ? pwrite(fd, p + done, size - done,
+                                    static_cast<off_t>(offset + done))
+                           : pread(fd, p + done, size - done,
+                                   static_cast<off_t>(offset + done));
+      if (n < 0 && errno == EINTR) continue;
+      if (n < 0) {
+        result.bytes_transferred = -1;
+        result.error_code = errno;
+        return result;
+      }
+      if (n == 0) break;  // read past end of file
+      done += static_cast<size_t>(n);
+    }
+    result.bytes_transferred = static_cast<ssize_t>(done);
+    result.error_code = 0;
+    return result;
   }
 
   /**

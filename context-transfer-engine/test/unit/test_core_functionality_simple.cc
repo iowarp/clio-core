@@ -37,6 +37,11 @@
 #include <memory>
 #include <thread>
 #include <chrono>
+#if !defined(_WIN32)
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 using namespace std::chrono_literals;
 
@@ -428,6 +433,52 @@ TEST_CASE("BlobInfo lost range bookkeeping", "[cte][core][blob][info][lost]") {
     REQUIRE(b.lost_bytes_ == 0);
     REQUIRE(b.LogicalSize() == 2048);
   }
+}
+
+/**
+ * Test Case: the debug check behind BlobInfo::GetTotalSize (#1233)
+ *
+ * The check must tolerate blocks_ running ahead of the size cache while a
+ * writer holds the blob, and must still catch a cache that drifted with no
+ * writer. The race it was relaxed for (a writer arriving mid-sum) cannot be
+ * staged deterministically here; cte_parallel_overlap_stress covers it.
+ */
+TEST_CASE("BlobInfo size cache check", "[cte][core][blob][info][size_cache]") {
+  auto *fixture = ctp::Singleton<CTECoreTestFixture>::GetInstance();
+  (void)fixture;
+  clio::cte::core::BlobInfo b;
+  clio::cte::core::BlobBlock blk;
+  blk.size_ = 4096;
+  b.blocks_.push_back(blk);
+  b.blocks_.push_back(blk);
+
+  SECTION("a cache that matches the blocks is returned") {
+    b.RecomputeTotalSize();
+    REQUIRE(b.GetTotalSize() == 8192);
+  }
+
+  SECTION("a writer may have the blocks ahead of the cache") {
+    b.total_size_cache_ = 4096;
+    REQUIRE(b.TryLockWrite(42));
+    REQUIRE(b.GetTotalSize() == 4096);
+    b.UnlockWrite(42);
+  }
+
+#if !defined(NDEBUG) && !defined(_WIN32)
+  SECTION("a cache that drifted with no writer aborts") {
+    b.total_size_cache_ = 4096;
+    pid_t pid = fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+      (void)b.GetTotalSize();
+      _exit(0);
+    }
+    int status = 0;
+    REQUIRE(waitpid(pid, &status, 0) == pid);
+    REQUIRE(WIFSIGNALED(status));
+    REQUIRE(WTERMSIG(status) == SIGABRT);
+  }
+#endif
 }
 
 /**

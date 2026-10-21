@@ -717,9 +717,20 @@ bool IpcManagerRun2Run::AllContainersPresent(
   // admitted on that evidence executed on the static instance: two puts
   // waited 120 s for targets that instance would never register while the
   // real container was ready 180 ms later (late-peer reproducer, trial 3).
+  //
+  // Registered is not enough either: the real container is registered before
+  // its Create body has run, and a peer that finished startup first can send
+  // it work in that window. CTE's GetOrCreateTag then ran against a container
+  // whose Create had not yet allocated its telemetry ring and dereferenced
+  // null in LogTelemetry (SIGSEGV on one rank of a 4-node clio-ml run). Hold
+  // the archive until the pool's Create has finished, like IsClientAdmissible
+  // does for local clients.
   for (const auto &task_info : archive.GetTaskInfos()) {
     if (!pool_manager->GetContainer(task_info.pool_id_, kInvalidContainerId)
              .get()) {
+      return false;
+    }
+    if (pool_manager->IsPoolCreating(task_info.pool_id_)) {
       return false;
     }
   }

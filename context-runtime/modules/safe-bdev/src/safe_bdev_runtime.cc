@@ -1002,7 +1002,10 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   data_alloc_.reserve(kMaxMembers);
   parity_members_.reserve(kMaxMembers);
   parity_clients_.reserve(kMaxMembers);
-  rs_cache_.clear();
+  {
+    std::lock_guard<std::mutex> g(rs_cache_mu_);
+    rs_cache_.clear();
+  }
   reattached_members_ = 0;
   {
     std::lock_guard<std::mutex> g(slot_mu_);

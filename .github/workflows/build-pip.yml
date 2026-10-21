@@ -153,9 +153,9 @@ jobs:
   build-wheels-windows:
     name: Build Windows wheels (${{ matrix.abi }})
     runs-on: windows-latest
-    # One wheel per ABI job (~22 min) plus the vcpkg install; a cold vcpkg
-    # cache adds ~24 min building Poco and OpenSSL (#1261).
-    timeout-minutes: 120
+    # Each ABI keeps the existing development budget for cold dependencies;
+    # a cold vcpkg cache adds ~24 min building Poco and OpenSSL (#1261).
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -467,6 +467,8 @@ jobs:
         mkdir -p build/capacity-results
         docker run --rm \
           -v "$PWD/wheels:/wheels:ro" \
+          -v "$PWD/context-transfer-engine/wrapper/python:/capacity-tests:ro" \
+          -v "$PWD/build/capacity-results:/capacity-results" \
           -v "$PWD/installers/pip:/ci:ro" \
           -v "$PWD/context-transfer-engine/wrapper/python:/capacity-tests:ro" \
           -v "$PWD/build/capacity-results:/capacity-results" \
@@ -697,7 +699,7 @@ jobs:
             python: '3.14'
 
     steps:
-    - name: Check out wheel check scripts and capacity regression
+    - name: Check out wheel checks and capacity regression
       uses: actions/checkout@v4
       with:
         sparse-checkout: |
@@ -823,6 +825,7 @@ jobs:
       with:
         sparse-checkout: |
           CI
+          context-transfer-engine/wrapper/python
           installers/pip
           context-transfer-engine/wrapper/python
 

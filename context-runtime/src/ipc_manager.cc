@@ -3189,7 +3189,16 @@ bool ClientProcessGone(int pid) {
 #if defined(__linux__)
   std::ifstream st("/proc/" + std::to_string(pid) + "/stat");
   std::string line;
-  if (st && std::getline(st, line)) {
+  // The stream state and the line are both written by uninstrumented
+  // libstdc++.so, so MSan must be told they are initialized before we test
+  // them.
+  CTP_MSAN_UNPOISON_OBJ(st);
+  if (st) {
+    std::getline(st, line);
+    CTP_MSAN_UNPOISON_OBJ(st);
+    CTP_MSAN_UNPOISON_STRING(line);
+  }
+  if (st) {
     // "<pid> (<comm>) <state> ..." -- comm may contain spaces/parens, so
     // take the state from after the LAST ')'.
     auto rp = line.rfind(')');

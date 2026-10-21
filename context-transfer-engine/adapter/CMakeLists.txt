@@ -51,6 +51,10 @@ if (CLIO_CTE_ENABLE_HDF5_VOL)
     add_subdirectory(hdf5_vol)
 endif()
 
+# CPU Vector adapter (host-paged vector over the CTE). The CPU sibling of
+# gpu_vector below; it needs no GPU toolchain, so it is always built.
+add_subdirectory(cpu_vector)
+
 # GPU Vector adapter (device-paged vector over the CTE).
 #
 # CLANG ONLY, AND SILENT ABOUT IT RATHER THAN BROKEN. Its device API is C++20

@@ -4321,6 +4321,18 @@ int cte_fuse_statfs(const char *path, cte_statvfs_t *stbuf) {
 // External linkage (declared in fuse_cte.h): the mount/process-entry glue in
 // fuse_cte_main.cc points fuse_main()/fuse_new() at this table. The callbacks
 // it references keep internal linkage — their addresses are captured here.
+#ifdef __APPLE__
+// macFUSE: cte_fuse_readdir has two overloads here (fuse_cte.h declares the
+// fuse_fill_dir_t one, this file defines the fuse_darwin_fill_dir_t one), so
+// CLIO_FUSE_TIMED's &fn cannot pick one. A single, non-overloaded name can.
+static int cte_fuse_readdir_darwin(const char *path, void *buf,
+                                   ClioFuseFillDirT filler, cte_off_t offset,
+                                   struct fuse_file_info *fi,
+                                   enum fuse_readdir_flags flags) {
+  return cte_fuse_readdir(path, buf, filler, offset, fi, flags);
+}
+#endif
+
 const struct fuse_operations cte_fuse_ops = {
     .getattr = CLIO_FUSE_TIMED(getattr, cte_fuse_getattr),
     .readlink = CLIO_FUSE_TIMED(readlink, cte_fuse_readlink),
@@ -4349,7 +4361,11 @@ const struct fuse_operations cte_fuse_ops = {
 #endif
     .listxattr = CLIO_FUSE_TIMED(listxattr, cte_fuse_listxattr),
     .removexattr = CLIO_FUSE_TIMED(removexattr, cte_fuse_removexattr),
+#ifdef __APPLE__
+    .readdir = CLIO_FUSE_TIMED(readdir, cte_fuse_readdir_darwin),
+#else
     .readdir = CLIO_FUSE_TIMED(readdir, cte_fuse_readdir),
+#endif
     .fsyncdir = CLIO_FUSE_TIMED(fsyncdir, cte_fuse_fsyncdir),
     .init = cte_fuse_init,
     .destroy = cte_fuse_destroy,

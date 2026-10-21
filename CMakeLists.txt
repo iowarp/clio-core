@@ -2579,3 +2579,11 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/packaging/CPackConfig.cmake)
 if(CLIO_CORE_ENABLE_APPIMAGE)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/packaging/AppImage.cmake)
 endif()
+
+# clio-ml (external/clio-ml, its own repo): Spark-MLlib-style algorithms over
+# gpu_vector / cpu_vector. Must come after CTE so the vector targets exist.
+option(CLIO_CORE_ENABLE_CLIO_ML "Add external/clio-ml to the build" OFF)
+if(CLIO_CORE_ENABLE_CLIO_ML)
+  set(CLIO_ML_ENABLE_CUDA ${CLIO_CORE_ENABLE_CUDA} CACHE BOOL "" FORCE)
+  add_subdirectory(external/clio-ml)
+endif()
