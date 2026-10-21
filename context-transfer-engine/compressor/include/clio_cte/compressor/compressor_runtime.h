@@ -737,6 +737,16 @@ private:
   size_t RetireBatches();
   std::mutex batch_mu_;
   std::vector<std::shared_ptr<PendingDecomp>> batch_;
+  /**
+   * Take `req` back out of batch_ if the drainer has not gathered it yet.
+   *
+   * True: withdrawn, and nothing will ever touch its source or destination.
+   * False: the drainer already owns it, so a kernel may still be reading
+   * src_device and writing dst until `done`; the waiter must wait that out
+   * before releasing either. Giving up on an owned request let the caller
+   * free the page and the scratch under a live decode (CUDA error 700).
+   */
+  bool WithdrawDecomp(const std::shared_ptr<PendingDecomp> &req);
   std::thread batch_thread_;
   std::atomic<bool> batch_stop_{false};
   bool batch_enabled_ = false;

@@ -43,6 +43,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -881,6 +882,12 @@ class IpcManager {
    * @param new_state New state to set
    */
   void SetNodeState(u64 node_id, NodeState new_state);
+
+ private:
+  /** SetNodeState for a caller that already holds hostfile_mu_. */
+  void SetNodeStateLocked(u64 node_id, NodeState new_state);
+
+ public:
 
   /**
    * Record that traffic was just received from this peer (issue #856).
@@ -1943,6 +1950,15 @@ class IpcManager {
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host
+  /**
+   * Guards hostfile_map_'s STRUCTURE (and hosts_cache_). LoadHostfile and
+   * AddNode rebuild or insert while worker threads iterate the map (e.g. the
+   * admin idle probe's GetNodeIds), which ASan caught as a heap-use-after-free.
+   * Writers that clear/insert hold it exclusively; lookups and iteration hold
+   * it shared. Never taken recursively: callers already holding it use the
+   * *Locked helpers.
+   */
+  mutable std::shared_mutex hostfile_mu_;
   /** Last-heard-from steady-clock ns per node id (see NoteHeardFrom). */
   static constexpr u64 kHeardSlots = 65536;
   std::unique_ptr<std::atomic<u64>[]> last_heard_ns_{
@@ -1971,7 +1987,8 @@ class IpcManager {
   }
   mutable std::vector<Host>
       hosts_cache_;  // Cached vector of hosts for GetAllHosts
-  mutable bool hosts_cache_valid_ = false;  // Flag to track cache validity
+  // Atomic: SetNodeState clears it under hostfile_mu_'s SHARED side.
+  mutable std::atomic<bool> hosts_cache_valid_{false};  // cache validity
   Host this_host_;                          // Identified host for this node
 
   // Client-side server waiting configuration (from environment variables)
