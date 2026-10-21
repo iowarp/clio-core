@@ -470,6 +470,8 @@ jobs:
           -v "$PWD/context-transfer-engine/wrapper/python:/capacity-tests:ro" \
           -v "$PWD/build/capacity-results:/capacity-results" \
           -v "$PWD/installers/pip:/ci:ro" \
+          -v "$PWD/context-transfer-engine/wrapper/python:/capacity-tests:ro" \
+          -v "$PWD/build/capacity-results:/capacity-results" \
           ${{ matrix.distro }} \
           bash -c '
             set -e
@@ -825,6 +827,7 @@ jobs:
           CI
           context-transfer-engine/wrapper/python
           installers/pip
+          context-transfer-engine/wrapper/python
 
     - name: Set up Python
       uses: actions/setup-python@v5
