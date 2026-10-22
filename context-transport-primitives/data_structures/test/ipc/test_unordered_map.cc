@@ -273,12 +273,17 @@ TEST_CASE("IpcMap: seqlock rejects a torn read", "[ipc_map]") {
   slot->gen_.fetch_add(1);  // now odd == "write in progress"
 
   Rec out;
-  REQUIRE_FALSE(m.TryGetBytes("torn", 4, &out, 4));
+  bool absent = true;
+  ctp::min_u32 attempts = 0;
+  REQUIRE_FALSE(m.TryGetBytes("torn", 4, &out, 4, &absent, &attempts));
+  REQUIRE_FALSE(absent);  // torn, not missing
+  REQUIRE(attempts == 4);  // spent the whole budget
 
-  // Completing the write makes it readable again.
+  // Completing the write makes it readable again, on the first pass.
   slot->gen_.fetch_add(1);
-  REQUIRE(m.TryGetBytes("torn", 4, &out, 4));
+  REQUIRE(m.TryGetBytes("torn", 4, &out, 4, &absent, &attempts));
   REQUIRE(out == Rec(1, 1));
+  REQUIRE(attempts == 1);
 }
 
 TEST_CASE("IpcMap: POD keys work without an allocator-aware key", "[ipc_map]") {

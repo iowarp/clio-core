@@ -331,13 +331,18 @@ class unordered_map : public ShmContainer<AllocT> {
    *        definitely not in the table (the probe ended consistently); a
    *        false from torn reads or exhausted retries leaves it false. A
    *        caller that treats a miss as proof of absence must check it.
+   * @param attempts if non-null, set to the number of probe passes made
+   *        (1 = no retry). Lets a caller count retries without the map
+   *        storing anything.
    * @return true if a consistent value was copied out.
    */
   template <typename KeyInit>
   CTP_INLINE_CROSS_FUN bool TryGet(const KeyInit &key_probe, size_t key_hash,
                                    ValueT *out, min_u32 max_retries = 16,
-                                   bool *absent = nullptr) const {
+                                   bool *absent = nullptr,
+                                   min_u32 *attempts = nullptr) const {
     if (absent != nullptr) *absent = false;
+    if (attempts != nullptr) *attempts = 0;
     if (!valid() || out == nullptr) {
       return false;
     }
@@ -345,6 +350,7 @@ class unordered_map : public ShmContainer<AllocT> {
     size_t mask = capacity_ - 1;
 
     for (min_u32 attempt = 0; attempt < max_retries; ++attempt) {
+      if (attempts != nullptr) *attempts = attempt + 1;
       size_t idx = key_hash & mask;
       bool saw_torn = false;
       const size_t probe_limit =
@@ -395,9 +401,10 @@ class unordered_map : public ShmContainer<AllocT> {
    */
   CTP_INLINE_CROSS_FUN
   bool TryGetBytes(const char *key, size_t len, ValueT *out,
-                   min_u32 max_retries = 16, bool *absent = nullptr) const {
+                   min_u32 max_retries = 16, bool *absent = nullptr,
+                   min_u32 *attempts = nullptr) const {
     return TryGet(BytesProbe{key, len}, KeyT::HashBytes(key, len), out,
-                  max_retries, absent);
+                  max_retries, absent, attempts);
   }
 
   /** Hash a key the same way the table does. */

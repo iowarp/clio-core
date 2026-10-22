@@ -40,6 +40,7 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/blob_batch.h>
 #include <clio_cte/core/shm_metadata_cache.h>
+#include <clio_cte/core/shm_read_stats.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_ctp/data_structures/priv/unordered_map_ll.h>
 #include <clio_ctp/thread/lock/rwlock.h>
@@ -197,6 +198,21 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Probe passes a blob record read may make before giving up to RPC.
+   *
+   * Retrying is cheap and giving up is not. A pass that meets a writer ends
+   * at the odd slot it found; a fallback costs a full round trip (12-40 us on
+   * one idle node, more under load). Measured under sustained in-place
+   * rewrites of one hot blob (issue #787): at the map's default of 16, the
+   * retries were bimodal -- nearly all of them came from reads that spent
+   * every pass (about 1.5 us) and fell back, 0.2-0.6% of reads at 20k puts/s
+   * and up to 1.5% with back-to-back puts, which took GetBlobSize p99 from
+   * 0.2 us to 9-19 us. At 256 the fallbacks went to zero across 1-8 readers
+   * and 4-64 KB blobs, and p99 came back to 0.4-0.5 us.
+   */
+  static constexpr ctp::min_u32 kShmRecordReadRetries = 256;
+
+  /**
    * Zero-IPC metadata read.
    *
    * @return true if a consistent record was found in shared memory. false
@@ -216,7 +232,19 @@ class Client : public clio::run::ContainerClient {
     if (n == 0) {
       return false;  // name too long for the fast path
     }
-    return shm_root_->blob_key_to_info_.TryGetBytes(key, n, out);
+    bool absent = false;
+    ctp::min_u32 attempts = 0;
+    const bool ok = shm_root_->blob_key_to_info_.TryGetBytes(
+        key, n, out, kShmRecordReadRetries, &absent, &attempts);
+    ShmReadCounters &stats = ThreadShmReadCounters();
+    ShmReadCounters::Bump(stats.record_reads);
+    if (attempts > 1) {
+      ShmReadCounters::Bump(stats.record_retries, attempts - 1);
+    }
+    if (!ok && !absent && attempts == kShmRecordReadRetries) {
+      ShmReadCounters::Bump(stats.record_fallbacks);
+    }
+    return ok;
   }
 
   /**
@@ -248,8 +276,11 @@ class Client : public clio::run::ContainerClient {
     if (ctp::IsDevicePointer(out)) {
       return false;
     }
+    ShmReadCounters &stats = ThreadShmReadCounters();
+    ShmReadCounters::Bump(stats.payload_reads);
     ShmBlobRecord rec;
     if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
+      ShmReadCounters::Bump(stats.payload_not_servable);
       return false;
     }
     // Source selection (issue #886 cache/replication split): the primary when
@@ -277,6 +308,7 @@ class Client : public clio::run::ContainerClient {
                             offset + size <= rec.RepCoveredBytes() &&
                             offset + size <= rec.rep_total_size_;
     if (!primary_ok && !replica_ok) {
+      ShmReadCounters::Bump(stats.payload_not_servable);
       return false;  // transformed/file/remote/GPU-tier and no serving replica
     }
     const ShmBlockDesc *src_blocks = primary_ok ? rec.blocks_ : rec.rep_blocks_;
@@ -287,6 +319,7 @@ class Client : public clio::run::ContainerClient {
     // construction. Take the RPC path, which waits for the writer.
     const clio::run::u64 seq_before = rec.content_seq_;
     if (seq_before & 1) {
+      ShmReadCounters::Bump(stats.payload_write_in_flight);
       return false;
     }
 
@@ -300,6 +333,7 @@ class Client : public clio::run::ContainerClient {
       }
       char *base = MapRamBdev(b.target_pool_);
       if (base == nullptr) {
+        ShmReadCounters::Bump(stats.payload_not_servable);
         return false;  // cannot reach this device -> RPC
       }
       clio::run::u64 intra = want_from;
@@ -310,6 +344,7 @@ class Client : public clio::run::ContainerClient {
       want_from = 0;
     }
     if (copied != size) {
+      ShmReadCounters::Bump(stats.payload_not_servable);
       return false;
     }
 
@@ -320,12 +355,13 @@ class Client : public clio::run::ContainerClient {
     // withdrew this record, so a copy that saw them must also see that.
     std::atomic_thread_fence(std::memory_order_acquire);
     ShmBlobRecord after;
-    if (!TryGetBlobRecordShm(tag_id, blob_name, &after)) {
+    if (!TryGetBlobRecordShm(tag_id, blob_name, &after) ||
+        after.placement_gen_ != gen_before || after.content_seq_ != seq_before) {
+      // Moved, overwritten in place, or withdrawn while we copied.
+      ShmReadCounters::Bump(stats.payload_raced_writer);
       return false;
     }
-    if (after.placement_gen_ != gen_before || after.content_seq_ != seq_before) {
-      return false;  // moved, or overwritten in place, while we copied
-    }
+    ShmReadCounters::Bump(stats.payload_hits);
     return true;
   }
 
