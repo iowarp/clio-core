@@ -328,6 +328,19 @@ clio::run::TaskResume Runtime::ParseOmni(clio::run::shared_ptr<ParseOmniTask> &t
   HLOG(kInfo, "ParseOmni: Processing {} assimilation contexts",
        assimilation_contexts.size());
 
+  // Reject unsatisfiable dependencies before anything is scheduled, so a bad
+  // OMNI file fails whole instead of half-transferred. Satisfiable ones need no
+  // further handling: the loop below runs the contexts in order.
+  const std::string dep_error = CheckDependencies(assimilation_contexts);
+  if (!dep_error.empty()) {
+    HLOG(kError, "ParseOmni: {}", dep_error);
+    task->result_code_ = -3;
+    task->error_message_ = dep_error;
+    task->num_tasks_scheduled_ = 0;
+    task->SetReturnCode(static_cast<clio::run::u32>(-3));
+    CLIO_CO_RETURN;
+  }
+
   // Process each assimilation context
   clio::run::u32 tasks_scheduled = 0;
 #ifdef CLIO_ENABLE_S3_REST

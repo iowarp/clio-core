@@ -93,11 +93,18 @@ transfers:
   - src: file::/path/to/data.bin    # Source URL (required)
     dst: iowarp::my_tag             # CTE destination tag (required)
     format: binary                  # Format: binary, hdf5, globus (required)
-    depends_on: ""                  # Dependency identifier (optional)
+    depends_on: ""                  # src or dst of an EARLIER transfer (optional)
     range_off: 0                    # Byte offset in source (optional)
     range_size: 0                   # Bytes to read, 0 = full file (optional)
     src_token: $GLOBUS_TOKEN        # Auth token, env vars expanded (optional)
 ```
+
+Transfers run in the order listed, and each one finishes before the next
+starts. `depends_on` documents and checks that order: it must be the exact `src`
+or `dst` URL of an earlier transfer, for example a `file::` ingest that depends
+on the `globus://` download staging that file. `ParseOmni` rejects the whole OMNI
+file, before running any transfer, if a `depends_on` names a later transfer,
+the transfer itself, or nothing in the list.
 
 **HDF5 with dataset filtering:**
 

@@ -111,12 +111,10 @@ bool GenerateTestFile(const std::string& file_path, size_t size_bytes) {
  */
 bool TestErrorCase(clio::cae::core::Client& cae_client,
                    const std::string& test_name,
-                   const clio::cae::core::AssimilationCtx& ctx,
+                   const std::vector<clio::cae::core::AssimilationCtx>& contexts,
                    bool should_fail = true) {
   HLOG(kInfo, "--- Testing: {} ---", test_name);
 
-  // Call ParseOmni with vector containing single context
-  std::vector<clio::cae::core::AssimilationCtx> contexts = {ctx};
   auto parse_task = cae_client.AsyncParseOmni(contexts);
   parse_task.Wait();
   // Use result_code_ (operation result) not GetReturnCode() (task completion status)
@@ -128,11 +126,14 @@ bool TestErrorCase(clio::cae::core::Client& cae_client,
   // Validate
   if (should_fail) {
     // We expect this to fail
-    if (result_code != 0) {
+    // A rejected OMNI must not have scheduled any of its transfers.
+    if (result_code != 0 && num_tasks_scheduled == 0) {
       HLOG(kSuccess, "{} failed as expected (error code: {})", test_name, result_code);
       return true;
     } else {
-      HLOG(kError, "{} should have failed but succeeded", test_name);
+      HLOG(kError, "{} should have failed with nothing scheduled "
+           "(error code: {}, scheduled: {})", test_name, result_code,
+           num_tasks_scheduled);
       return false;
     }
   } else {
@@ -145,6 +146,26 @@ bool TestErrorCase(clio::cae::core::Client& cae_client,
       return false;
     }
   }
+}
+
+/** Single-context form of TestErrorCase. */
+bool TestErrorCase(clio::cae::core::Client& cae_client,
+                   const std::string& test_name,
+                   const clio::cae::core::AssimilationCtx& ctx,
+                   bool should_fail = true) {
+  return TestErrorCase(cae_client, test_name,
+                       std::vector<clio::cae::core::AssimilationCtx>{ctx},
+                       should_fail);
+}
+
+/** @return the bytes CTE holds under tag_name (0 if the tag is empty) */
+size_t TagSize(const std::string& tag_name) {
+  auto *cte_client = CLIO_CTE_CLIENT;
+  auto tag_task = cte_client->AsyncGetOrCreateTag(tag_name);
+  tag_task.Wait();
+  auto size_task = cte_client->AsyncGetTagSize(tag_task->tag_id_);
+  size_task.Wait();
+  return size_task->tag_size_;
 }
 
 /**
@@ -326,6 +347,48 @@ int main(int argc, char* argv[]) {
     ctx7.range_size = 0;
     if (TestErrorCase(cae_client, "ValidCase_Control", ctx7, false)) {
       tests_passed++;
+    }
+
+    // Test 8: depends_on naming no transfer is rejected before anything runs
+    tests_total++;
+    clio::cae::core::AssimilationCtx dep_a;
+    dep_a.src = "file::" + kTestFileName;
+    dep_a.dst = "iowarp::test_dep_tag_a";
+    dep_a.format = "binary";
+    clio::cae::core::AssimilationCtx dep_b = dep_a;
+    dep_b.dst = "iowarp::test_dep_tag_b";
+    dep_b.depends_on = "iowarp::no_such_transfer";
+    if (TestErrorCase(cae_client, "DependsOnUnknown", {dep_a, dep_b}, true)) {
+      tests_passed++;
+    }
+
+    // Test 9: depends_on a LATER transfer cannot be honored (contexts run in
+    // order); rejected whole, so the earlier transfer is not run either
+    tests_total++;
+    clio::cae::core::AssimilationCtx dep_first = dep_a;
+    dep_first.dst = "iowarp::test_dep_tag_c";
+    dep_first.depends_on = dep_b.dst;
+    dep_b.depends_on = "";
+    if (TestErrorCase(cae_client, "DependsOnLater", {dep_first, dep_b}, true)) {
+      tests_passed++;
+    }
+
+    // Test 10: depends_on an EARLIER transfer runs both, and the dependent's
+    // data lands (it used to be skipped while reporting success)
+    tests_total++;
+    dep_b.depends_on = dep_a.dst;
+    if (TestErrorCase(cae_client, "DependsOnEarlier", {dep_a, dep_b}, false)) {
+      const size_t size_a = TagSize("test_dep_tag_a");
+      const size_t size_b = TagSize("test_dep_tag_b");
+      // >=: the tag also holds the assimilator's small "description" blob
+      if (size_a >= file_size && size_b >= file_size) {
+        HLOG(kSuccess, "DependsOnEarlier: tags hold {} and {} bytes", size_a,
+             size_b);
+        tests_passed++;
+      } else {
+        HLOG(kError, "DependsOnEarlier: tag sizes {} and {}, expected >= {}",
+             size_a, size_b, file_size);
+      }
     }
 
     // Cleanup

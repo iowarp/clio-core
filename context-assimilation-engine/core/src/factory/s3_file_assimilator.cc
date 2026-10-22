@@ -494,16 +494,6 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
     }
   }
 
-  // Dependency-based scheduling is not yet supported (mirrors binary backend).
-  if (!ctx.depends_on.empty()) {
-    HLOG(kDebug,
-         "S3FileAssimilator: Dependency handling not yet implemented "
-         "(depends_on: {})",
-         ctx.depends_on);
-    error_code = 0;
-    CLIO_CO_RETURN;
-  }
-
   // Parse the S3 source URL into bucket + key
   std::string bucket;
   std::string key;
