@@ -66,6 +66,8 @@ typedef intptr_t ssize_t;
 #ifndef O_TRUNC
 #  define O_TRUNC  0x0200
 #endif
+#else
+#include <unistd.h>
 #endif
 
 namespace ctp {
@@ -78,6 +80,23 @@ struct IoResult {
   ssize_t bytes_transferred;  /**< Bytes actually transferred (-1 on error) */
   int error_code;             /**< 0 on success, errno on failure */
 };
+
+/** Alignment an O_DIRECT transfer needs on this host: the larger of 4 KiB and
+ *  the kernel page size. Most filesystems accept their 4 KiB logical block
+ *  size, but Lustre requires PAGE_SIZE, so on a 64 KiB-page kernel (e.g.
+ *  aarch64 "+64k") a 4 KiB-aligned O_DIRECT write fails with EINVAL. Buffer,
+ *  length and file offset must all be multiples of it to use the direct fd. */
+inline size_t DirectIoAlign() {
+#ifdef _WIN32
+  return 4096;
+#else
+  static const size_t align = [] {
+    const long page = sysconf(_SC_PAGESIZE);
+    return page > 4096 ? static_cast<size_t>(page) : size_t{4096};
+  }();
+  return align;
+#endif
+}
 
 class AsyncIO {
  public:

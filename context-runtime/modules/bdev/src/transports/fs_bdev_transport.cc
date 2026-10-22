@@ -704,7 +704,7 @@ FsBdevTransport::AlignedBuf FsBdevTransport::TakeBounce(size_t size) {
   // reads `new (std::align_val_t(...)) char[n]` as PLACEMENT new and rejects
   // it (C2956). AlignedFree releases it with the matching operator delete[].
   return AlignedBuf(static_cast<char *>(
-      ::operator new[](size, std::align_val_t(kDirectAlign))));
+      ::operator new[](size, std::align_val_t(DirectAlign()))));
 }
 
 void FsBdevTransport::GiveBounce(AlignedBuf buf, size_t size) {
@@ -761,19 +761,18 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
     }
 
     // Up to three writes per block: an unaligned head and tail through the
-    // page cache, and the 4 KiB-aligned body between them bounced to the
-    // O_DIRECT fd (see WantsBounce). A FUSE write from an unaligned user
+    // page cache, and the DirectAlign()-aligned body between them bounced to
+    // the O_DIRECT fd (see WantsBounce). A FUSE write from an unaligned user
     // buffer arrives as ~1 MiB + a few bytes, so without the split no byte
     // of it could go direct.
+    const clio::run::u64 align = DirectAlign();
     clio::run::u64 seg_done = 0;
     while (seg_done < block_write_size) {
       const clio::run::u64 fo = block.offset_ + seg_done;
       const clio::run::u64 left = block_write_size - seg_done;
       const clio::run::u64 head =
-          std::min<clio::run::u64>(left, (kDirectAlign - fo % kDirectAlign) %
-                                             kDirectAlign);
-      const clio::run::u64 body =
-          ((left - head) / kDirectAlign) * kDirectAlign;
+          std::min<clio::run::u64>(left, (align - fo % align) % align);
+      const clio::run::u64 body = ((left - head) / align) * align;
       clio::run::u64 seg = left;
       if (body >= kBounceMin) {
         seg = head != 0 ? head : body;
