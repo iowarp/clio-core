@@ -42,6 +42,8 @@
 #include <clio_cae/core/core_tasks.h>
 #include <clio_cae/core/factory/hdf5_file_assimilator.h>
 
+#include "adapter/hdf5_vol/clio_vol_layout.h"
+
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -77,6 +79,16 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
          "Hdf5FileAssimilator: Destination protocol must be 'iowarp', got '{}'",
          dst_protocol);
     error_code = -1;
+    CLIO_CO_RETURN;
+  }
+
+  // format: hdf5_vol stages the file in the HDF5 VOL connector's own cache
+  // layout instead of one tag per dataset, so an application reading the file
+  // through that connector is served from the tier on its first read.
+  if (ctx.format == "hdf5_vol") {
+    int vol_rc = 0;
+    CLIO_CO_AWAIT(StageForVol(ctx, vol_rc));
+    error_code = vol_rc;
     CLIO_CO_RETURN;
   }
 
@@ -320,6 +332,208 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
       filtered_paths.size(), src_path);
   HLOG(kDebug, "Hdf5FileAssimilator::Schedule() - EXIT (success)");
 
+  error_code = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Hdf5FileAssimilator::StageForVol(
+    const AssimilationCtx& ctx, int& error_code) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  namespace layout = clio::adapter::vol_layout;
+  namespace fstamp = clio::adapter::stamp;
+
+  // The connector derives the tag from the file, so a destination path here
+  // would name a tag nothing reads. Refuse it rather than ignore it.
+  if (!GetUrlPath(ctx.dst).empty()) {
+    HLOG(kError,
+         "Hdf5FileAssimilator: format hdf5_vol stages into the VOL "
+         "connector's tag for the source file; dst must be 'iowarp::' with no "
+         "tag name, got '{}'",
+         ctx.dst);
+    error_code = -2;
+    CLIO_CO_RETURN;
+  }
+  const std::string src_path = GetUrlPath(ctx.src);
+  if (src_path.empty()) {
+    HLOG(kError, "Hdf5FileAssimilator: Invalid source URL, no file path found");
+    error_code = -3;
+    CLIO_CO_RETURN;
+  }
+  const std::string path = layout::CanonicalPath(src_path);
+  // The chunk size of the runtime's environment. A reader configured with a
+  // different one misses on the stamp instead of misreading the blobs.
+  const size_t chunk_size = layout::ChunkSizeFromEnv();
+
+  // The stamp vouches for the file as it is now, so the file must be quiet
+  // now: an mtime younger than the timestamp granule cannot rule out a write
+  // landing right after it. Waiting out one granule is cheap here.
+  if (!fstamp::SettleForStamp(path.c_str(), 2 * fstamp::GranularityNs())) {
+    HLOG(kError,
+         "Hdf5FileAssimilator: cannot stamp '{}' for the VOL cache (missing, "
+         "or still being modified)",
+         path);
+    error_code = -11;
+    CLIO_CO_RETURN;
+  }
+  const std::string stamp_before = layout::Stamp(path.c_str(), chunk_size);
+
+  // Native VOL explicitly: the runtime may have inherited
+  // HDF5_VOL_CONNECTOR=clio, and this read must come from the file itself.
+  hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+  H5Pset_vol(fapl, H5VL_NATIVE, nullptr);
+  hid_t file_id = H5Fopen(path.c_str(), H5F_ACC_RDONLY, fapl);
+  H5Pclose(fapl);
+  if (file_id < 0) {
+    HLOG(kError, "Hdf5FileAssimilator: Failed to open HDF5 file '{}'", path);
+    error_code = -4;
+    CLIO_CO_RETURN;
+  }
+  std::vector<std::string> dataset_paths;
+  if (DiscoverDatasets(file_id, dataset_paths) != 0) {
+    H5Fclose(file_id);
+    error_code = -5;
+    CLIO_CO_RETURN;
+  }
+
+  // Start from an empty tag: blobs left from an older version of the file,
+  // or from datasets the filters now exclude, must not survive under a fresh
+  // stamp.
+  const std::string tag_name = layout::TagName(path);
+  auto del_task = cte_client_->AsyncDelTag(tag_name);
+  CLIO_CO_AWAIT(del_task);
+  auto tag_task = cte_client_->AsyncGetOrCreateTag(tag_name);
+  CLIO_CO_AWAIT(tag_task);
+  const clio::cte::core::TagId tag_id = tag_task->tag_id_;
+  if (tag_id.IsNull()) {
+    HLOG(kError, "Hdf5FileAssimilator: Failed to get or create tag '{}'",
+         tag_name);
+    H5Fclose(file_id);
+    error_code = -5;
+    CLIO_CO_RETURN;
+  }
+
+  static constexpr size_t kMaxParallelTasks = 32;
+  size_t staged = 0, skipped = 0, staged_bytes = 0;
+  bool put_failed = false;
+  for (size_t d = 0; d < dataset_paths.size() && !put_failed; ++d) {
+    const std::string& ds_path = dataset_paths[d];
+    if (!MatchesFilter(ds_path, ctx.include_patterns, ctx.exclude_patterns)) {
+      continue;
+    }
+    hid_t dset = H5Dopen2(file_id, ds_path.c_str(), H5P_DEFAULT);
+    if (dset < 0) {
+      ++skipped;
+      continue;
+    }
+    // Only what the connector caches in the native representation of the
+    // stored type: atomic, fixed-size types whose native form is the stored
+    // size. Anything else the connector stages itself on a whole read.
+    hid_t ftype = H5Dget_type(dset);
+    hid_t ntype = H5I_INVALID_HID;
+    bool stageable = false;
+    switch (ftype >= 0 ? H5Tget_class(ftype) : H5T_NO_CLASS) {
+      case H5T_INTEGER:
+      case H5T_FLOAT:
+      case H5T_ENUM:
+      case H5T_BITFIELD:
+      case H5T_STRING:
+        if (H5Tis_variable_str(ftype) > 0) break;
+        ntype = H5Tget_native_type(ftype, H5T_DIR_DEFAULT);
+        stageable = ntype >= 0 && H5Tget_size(ntype) == H5Tget_size(ftype);
+        break;
+      default:
+        break;
+    }
+    hid_t space = H5Dget_space(dset);
+    const hssize_t nelem = space >= 0 ? H5Sget_simple_extent_npoints(space) : 0;
+    if (space >= 0) H5Sclose(space);
+    const size_t total =
+        stageable && nelem > 0 ? static_cast<size_t>(nelem) * H5Tget_size(ntype)
+                               : 0;
+    char* image = total > 0 ? static_cast<char*>(malloc(total)) : nullptr;
+    const bool read_ok =
+        image && H5Dread(dset, ntype, H5S_ALL, H5S_ALL, H5P_DEFAULT, image) >= 0;
+    if (ntype >= 0) H5Tclose(ntype);
+    if (ftype >= 0) H5Tclose(ftype);
+    H5Dclose(dset);
+    if (!read_ok) {
+      free(image);
+      ++skipped;
+      continue;
+    }
+
+    // Same blobs the connector's whole-read staging writes: chunk_i holds
+    // bytes [i*chunk, (i+1)*chunk) of the image at blob offset 0.
+    const size_t num_chunks = (total + chunk_size - 1) / chunk_size;
+    std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> active;
+    for (size_t i = 0; i < num_chunks || !active.empty();) {
+      while (i < num_chunks && active.size() < kMaxParallelTasks) {
+        const size_t off = i * chunk_size;
+        const size_t len = std::min(chunk_size, total - off);
+        auto buffer = CLIO_IPC->AllocateBuffer(len);
+        std::memcpy(buffer.ptr_, image + off, len);
+        active.push_back(cte_client_->AsyncPutBlob(
+            tag_id, layout::ChunkBlobName(ds_path, i), 0, len,
+            buffer.shm_.template Cast<void>(), -1.0f,
+            clio::cte::core::Context(), clio::cte::core::kCtePutDroppable));
+        ++i;
+      }
+      auto& first = active.front();
+      CLIO_CO_AWAIT(first);
+      if (first->return_code_ != 0) {
+        HLOG(kError,
+             "Hdf5FileAssimilator: PutBlob for '{}' failed with code {}",
+             ds_path, first->return_code_);
+        put_failed = true;
+      }
+      CLIO_IPC->FreeBuffer(first->blob_data_.template Cast<char>());
+      active.erase(active.begin());
+    }
+    free(image);
+    ++staged;
+    staged_bytes += total;
+  }
+  H5Fclose(file_id);
+
+  // A partial image must not be vouched for, and neither may a file that
+  // changed while it was being read.
+  const std::string stamp_after = layout::Stamp(path.c_str(), chunk_size);
+  if (put_failed || stamp_after != stamp_before) {
+    HLOG(kError,
+         "Hdf5FileAssimilator: {} while staging '{}' for the VOL cache; "
+         "dropping the partial image",
+         put_failed ? "a put failed" : "the file changed", path);
+    auto drop = cte_client_->AsyncDelTag(tag_name);
+    CLIO_CO_AWAIT(drop);
+    error_code = put_failed ? -9 : -12;
+    CLIO_CO_RETURN;
+  }
+
+  auto stamp_buf = CLIO_IPC->AllocateBuffer(stamp_after.size());
+  std::memcpy(stamp_buf.ptr_, stamp_after.data(), stamp_after.size());
+  auto stamp_task = cte_client_->AsyncPutBlob(
+      tag_id, layout::kStampBlobName, 0, stamp_after.size(),
+      stamp_buf.shm_.template Cast<void>(), -1.0f, clio::cte::core::Context(),
+      clio::cte::core::kCtePutDroppable);
+  CLIO_CO_AWAIT(stamp_task);
+  CLIO_IPC->FreeBuffer(stamp_task->blob_data_.template Cast<char>());
+  if (stamp_task->return_code_ != 0) {
+    HLOG(kError,
+         "Hdf5FileAssimilator: coherence stamp for '{}' failed to store "
+         "(code {}); the VOL connector will not trust the image",
+         path, stamp_task->return_code_);
+    error_code = -10;
+    CLIO_CO_RETURN;
+  }
+
+  HLOG(kInfo,
+       "Hdf5FileAssimilator: staged {} dataset(s), {} bytes of '{}' for the "
+       "HDF5 VOL connector (tag '{}', chunk {} B); {} left to the connector",
+       staged, staged_bytes, path, tag_name, chunk_size, skipped);
   error_code = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

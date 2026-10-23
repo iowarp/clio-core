@@ -368,7 +368,9 @@ if(HDF5_ENABLED)
   add_cae_unit_test(cae_hdf5_assim
     ${CMAKE_CURRENT_SOURCE_DIR}/hdf5_assim/test_hdf5_assim.cc
     EXTRA_LIBS ${HDF5_LIBRARIES}
-    EXTRA_INCLUDES ${HDF5_INCLUDE_DIRS}
+    # The CTE root: the hdf5_vol step checks the VOL connector's cache layout
+    # through adapter/hdf5_vol/clio_vol_layout.h.
+    EXTRA_INCLUDES ${HDF5_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/context-transfer-engine
   )
 
   # Set test labels

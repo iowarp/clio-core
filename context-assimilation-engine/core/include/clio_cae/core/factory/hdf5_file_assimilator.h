@@ -112,6 +112,18 @@ class Hdf5FileAssimilator : public BaseAssimilator {
    */
   int DiscoverDatasets(hid_t file_id, std::vector<std::string>& dataset_paths);
 
+  /**
+   * Stage a file for the HDF5 VOL connector (format: hdf5_vol).
+   * Writes each atomic dataset's native-type image into the connector's tag
+   * for the file, in its blob layout (adapter/hdf5_vol/clio_vol_layout.h),
+   * then stores the coherence stamp that lets the connector trust it.
+   * @param ctx Assimilation context; src is hdf5::<path>, dst is iowarp::
+   * @param error_code Output: 0 on success, non-zero error code on failure
+   * @return TaskResume for coroutine suspension/resumption
+   */
+  clio::run::TaskResume StageForVol(const AssimilationCtx& ctx,
+                                    int& error_code);
+
  public:
   /**
    * Process a single dataset: create tag, store description, transfer chunks
