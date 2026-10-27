@@ -24,6 +24,7 @@ extern "C" void clio_direct_dev_base_register(unsigned long long pool_id,
 extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id);
 #include <clio_runtime/bdev/bdev_runtime.h>
 #include <clio_runtime/bdev/blocking_offload.h>
+#include <clio_runtime/bdev/prediction_parse.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_runtime/comutex.h>
 #include <clio_ctp/util/gpu_api.h>
@@ -44,7 +45,6 @@ extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id);
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <thread>
 #include <cstdio>
 #include <cstring>
@@ -1037,40 +1037,6 @@ void Runtime::StopHealthPolling() {
     transport_->Destroy();
     transport_.reset();
   }
-}
-
-/**
- * Extract "days_remaining" from a prediction-server JSON response.
- *
- * Lightweight hand-rolled search to avoid pulling in a full JSON library.
- *
- * @param json Response body returned by SystemInfo::PredictDriveFailure.
- * @return The parsed day count; 999999 (healthy) when the value is null or
- *         unparseable; std::nullopt when the key is absent (e.g. an
- *         {"error": ...} reply), meaning the caller should keep its current
- *         estimate.
- */
-static std::optional<clio::run::u32> ParseDaysRemaining(
-    const std::string &json) {
-  const std::string key = "\"days_remaining\"";
-  auto pos = json.find(key);
-  if (pos == std::string::npos) return std::nullopt;
-  pos += key.size();
-  // Skip whitespace and colon
-  while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':')) ++pos;
-  // "null" means the server says the drive is healthy
-  if (json.size() >= pos + 4 && json.substr(pos, 4) == "null") return 999999;
-  if (pos >= json.size() ||
-      !std::isdigit(static_cast<unsigned char>(json[pos]))) {
-    return 999999;  // Unparseable -> treat as healthy
-  }
-  clio::run::u32 days = 0;
-  while (pos < json.size() &&
-         std::isdigit(static_cast<unsigned char>(json[pos]))) {
-    days = days * 10 + static_cast<clio::run::u32>(json[pos] - '0');
-    ++pos;
-  }
-  return days;
 }
 
 // ---------------------------------------------------------------------------
