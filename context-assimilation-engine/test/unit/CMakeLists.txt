@@ -1176,6 +1176,35 @@ set_tests_properties(cae_pagify_interpose PROPERTIES
   LABELS "coverage;cae;pagify;interpose"
 )
 #------------------------------------------------------------------------------
+# By-reference (zero-copy) assimilation: CTE misses served from the file
+#------------------------------------------------------------------------------
+add_executable(test_cae_reference
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_reference.cc
+)
+
+target_include_directories(test_cae_reference
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_cae_reference
+  PRIVATE
+    clio_cae_core_client
+    clio_cte_core_client
+    clio::run::cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+install(TARGETS test_cae_reference DESTINATION bin)
+
+add_test(NAME cae_reference COMMAND test_cae_reference)
+set_tests_properties(cae_reference PROPERTIES
+  TIMEOUT 120
+  LABELS "coverage;cae;reference;zerocopy"
+)
+#------------------------------------------------------------------------------
 # ChunkedDatasetWriter (.h5 export) tests
 #------------------------------------------------------------------------------
 # The HDF5-writing half of ExportData: reconstructing a kvhdf5 dataset (a __meta

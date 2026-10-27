@@ -382,12 +382,30 @@ clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task)
       task->SetReturnCode(1);
       CLIO_CO_RETURN;
     }
-    auto dst = CLIO_IPC->ToFullPtr<char>(task->blob_data_.Cast<char>());
+    // MATERIALISE request: CTE sends a size-0, null-buffer fault before a
+    // PutBlob into a page this tag does not hold, so a PARTIAL write lands
+    // on top of the source bytes instead of zeros. Read the whole page into
+    // a staging buffer and store it in the tag (kNoFault: the put must not
+    // fault back into us). Only written pages ever become resident.
+    ctp::ipc::FullPtr<char> stage;
+    const bool materialise =
+        task->size_ == 0 || task->blob_data_.IsNull();
+    if (materialise) {
+      stage = CLIO_IPC->AllocateBuffer(it->second.page_size);
+      if (stage.IsNull()) {
+        task->SetReturnCode(4);
+        CLIO_CO_RETURN;
+      }
+    }
+    auto dst = materialise
+                   ? stage
+                   : CLIO_IPC->ToFullPtr<char>(task->blob_data_.Cast<char>());
     auto st = std::make_shared<std::atomic<int>>(-1);
     {
       const RefExtent *ref = &it->second;  // refs_ entries are never erased
       std::string bname = task->GetBlobName();
-      const clio::run::u64 off = task->offset_, sz = task->size_;
+      const clio::run::u64 off = materialise ? 0 : task->offset_;
+      const clio::run::u64 sz = materialise ? it->second.page_size : task->size_;
       void *d = dst.ptr_;
       RefIoPool::Get().Submit([this, ref, bname, off, sz, d, st]() {
         st->store(ServeRefFault(*ref, bname, off, sz, d),
@@ -400,6 +418,21 @@ clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task)
       while (st->load(std::memory_order_acquire) < 0) {
         CLIO_CO_AWAIT(clio::run::yield(polls++ < 64 ? 20.0 : 200.0));
       }
+    }
+    if (materialise) {
+      int rc = st->load();
+      if (rc == 0) {
+        clio::cte::core::Context pctx;
+        pctx.op_flags_ |= clio::cte::core::Context::kNoFault;
+        auto put = cte_client_->AsyncPutBlob(
+            task->tag_id_, task->GetBlobName(), 0, it->second.page_size,
+            stage.shm_.template Cast<void>(), -1.0f, pctx);
+        CLIO_CO_AWAIT(put);
+        rc = (int)put->GetReturnCode();
+      }
+      CLIO_IPC->FreeBuffer(stage);
+      task->SetReturnCode((clio::run::u32)rc);
+      CLIO_CO_RETURN;
     }
     task->SetReturnCode((clio::run::u32)st->load());
     CLIO_CO_RETURN;
