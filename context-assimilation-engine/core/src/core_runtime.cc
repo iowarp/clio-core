@@ -46,8 +46,21 @@
 #endif
 
 #include "clio_ctp/data_structures/serialization/global_serialize.h"
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <cstring>
+#include "clio_ctp/util/gpu_api.h"
 #include <fstream>
 #include <vector>
 
@@ -175,10 +188,221 @@ bool ParsePageName(const std::string &name, clio::run::u64 *page_id) {
 }
 }  // namespace
 
+namespace {
+/** Strip "<proto>::" or "<proto>://" from a URL. */
+std::string StripProto(const std::string &url) {
+  size_t p = url.find("://");
+  if (p != std::string::npos) return url.substr(p + 3);
+  p = url.find("::");
+  if (p != std::string::npos) return url.substr(p + 2);
+  return url;
+}
+/** "k=v;k=v" option lookup in AssimilationCtx::src_data. */
+clio::run::u64 OptU64(const std::string &opts, const std::string &key,
+                      clio::run::u64 dflt) {
+  size_t p = 0;
+  while (p < opts.size()) {
+    size_t e = opts.find(';', p);
+    if (e == std::string::npos) e = opts.size();
+    const std::string kv = opts.substr(p, e - p);
+    const size_t eq = kv.find('=');
+    if (eq != std::string::npos && kv.substr(0, eq) == key) {
+      return std::strtoull(kv.c_str() + eq + 1, nullptr, 10);
+    }
+    p = e + 1;
+  }
+  return dflt;
+}
+}  // namespace
+
+int Runtime::AssimilateByReference(const AssimilationCtx &ctx,
+                                   std::string *ref_id,
+                                   std::string *tag_name) {
+  RefExtent ref;
+  ref.path = StripProto(ctx.src);
+  ref.fd = ::open(ref.path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (ref.fd < 0) {
+    HLOG(kError, "CAE reference: cannot open '{}': {}", ref.path,
+         std::strerror(errno));
+    return -10;
+  }
+  struct stat st;
+  if (::fstat(ref.fd, &st) != 0) {
+    ::close(ref.fd);
+    return -11;
+  }
+  const clio::run::u64 fsz = (clio::run::u64)st.st_size;
+  ref.base = ctx.range_off;
+  if (ref.base > fsz) {
+    ::close(ref.fd);
+    return -12;
+  }
+  ref.size = ctx.range_size ? std::min<clio::run::u64>(ctx.range_size,
+                                                       fsz - ref.base)
+                            : fsz - ref.base;
+  ref.page_size = OptU64(ctx.src_data, "page_size", 4ull << 20);
+  if (ref.page_size == 0) ref.page_size = 4ull << 20;
+#ifdef POSIX_FADV_SEQUENTIAL
+  ::posix_fadvise(ref.fd, (off_t)ref.base, (off_t)ref.size,
+                  POSIX_FADV_SEQUENTIAL);
+#endif
+  *ref_id = "ref:" + std::to_string(next_ref_id_++);
+  *tag_name = StripProto(ctx.dst);
+  HLOG(kInfo,
+       "CAE reference: tag '{}' -> '{}' [{}, +{}) page_size={} ({})",
+       *tag_name, ref.path, ref.base, ref.size, ref.page_size, *ref_id);
+  refs_[*ref_id] = std::move(ref);
+  return 0;
+}
+
+int Runtime::ServeRefFault(const RefExtent &ref, const std::string &blob_name,
+                           clio::run::u64 offset, clio::run::u64 size,
+                           void *dst) {
+  // The pager names pages by their decimal index; anything else (a _pi
+  // suffix, a metadata blob) is not part of a referenced extent.
+  if (blob_name.empty()) return 1;
+  clio::run::u64 page = 0;
+  for (char c : blob_name) {
+    if (c < '0' || c > '9') return 1;
+    page = page * 10 + (clio::run::u64)(c - '0');
+  }
+  if (dst == nullptr) return 1;
+  const clio::run::u64 psz = ref.page_size;
+  if (size == 0) size = psz > offset ? psz - offset : 0;
+  const clio::run::u64 lo = page * psz + offset;  // within the extent
+  clio::run::u64 avail = lo < ref.size ? ref.size - lo : 0;
+  const clio::run::u64 n = std::min(size, avail);
+#ifdef POSIX_FADV_WILLNEED
+  // Passes stream the extent in page order: when a fault opens a new window
+  // of R pages, ask the filesystem to start fetching the NEXT window so the
+  // faults that follow find it in flight. A hint only -- no buffer of ours.
+  {
+    static const clio::run::u64 kRa = [] {
+      const char *e = std::getenv("CLIO_CAE_REF_READAHEAD");
+      return (e != nullptr && *e) ? std::strtoull(e, nullptr, 10) : 16ull;
+    }();
+    if (kRa > 0 && offset == 0 && page % kRa == 0) {
+      const clio::run::u64 nlo = (page + kRa) * psz;
+      if (nlo < ref.size) {
+        ::posix_fadvise(ref.fd, (off_t)(ref.base + nlo),
+                        (off_t)std::min(kRa * psz, ref.size - nlo),
+                        POSIX_FADV_WILLNEED);
+      }
+    }
+  }
+#endif
+  const bool dev = ctp::IsDeviceAccessible(dst);
+  // Device destinations go through a per-thread host bounce; host
+  // destinations are read in place with no staging copy at all.
+  thread_local std::vector<char> bounce;
+  char *io = static_cast<char *>(dst);
+  if (dev) {
+    if (bounce.size() < size) bounce.resize(size);
+    io = bounce.data();
+  }
+  clio::run::u64 done = 0;
+  while (done < n) {
+    const ssize_t r = ::pread(ref.fd, io + done, (size_t)(n - done),
+                              (off_t)(ref.base + lo + done));
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      HLOG(kError, "CAE reference: pread '{}' page {} failed: {}", ref.path,
+           page, std::strerror(errno));
+      return 5;
+    }
+    if (r == 0) break;  // short file: tail reads as zero below
+    done += (clio::run::u64)r;
+  }
+  if (done < size) std::memset(io + done, 0, (size_t)(size - done));
+  if (dev) ctp::DeviceAwareMemcpy(dst, io, (size_t)size);
+  return 0;
+}
+
+namespace {
+/**
+ * Blocking source I/O for by-reference faults runs HERE, never on a runtime
+ * worker: a pread on a parallel filesystem can take milliseconds to seconds,
+ * and a worker parked in one stalls every task queued behind it (measured:
+ * all compute workers stalled on 1-3 s CAE GetBlobs). The fault task hands
+ * the read to this pool and yields until it completes.
+ */
+class RefIoPool {
+ public:
+  static RefIoPool &Get() {
+    // Leaked on purpose: its threads are detached and park on cv_, so
+    // destroying the mutex/cv at static teardown hung process exit.
+    static RefIoPool *pool = new RefIoPool();
+    return *pool;
+  }
+  void Submit(std::function<void()> fn) {
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      q_.push_back(std::move(fn));
+    }
+    cv_.notify_one();
+  }
+
+ private:
+  RefIoPool() {
+    const char *e = std::getenv("CLIO_CAE_REF_IO_THREADS");
+    unsigned n = (e != nullptr && *e) ? (unsigned)std::strtoul(e, nullptr, 10)
+                                      : 32u;
+    if (n == 0) n = 1;
+    for (unsigned i = 0; i < n; ++i) {
+      std::thread([this]() {
+        for (;;) {
+          std::function<void()> fn;
+          {
+            std::unique_lock<std::mutex> l(mu_);
+            cv_.wait(l, [this]() { return !q_.empty(); });
+            fn = std::move(q_.front());
+            q_.pop_front();
+          }
+          fn();
+        }
+      }).detach();
+    }
+  }
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> q_;
+};
+}  // namespace
+
 clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
     cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
+  }
+  // By-reference fault: CTE dispatched a miss on a tag CAE assimilated by
+  // reference. Read the page straight from the source object.
+  if (std::strncmp(task->context_.fault_params_, "ref:", 4) == 0) {
+    auto it = refs_.find(std::string(task->context_.fault_params_));
+    if (it == refs_.end()) {
+      task->SetReturnCode(1);
+      CLIO_CO_RETURN;
+    }
+    auto dst = CLIO_IPC->ToFullPtr<char>(task->blob_data_.Cast<char>());
+    auto st = std::make_shared<std::atomic<int>>(-1);
+    {
+      const RefExtent *ref = &it->second;  // refs_ entries are never erased
+      std::string bname = task->GetBlobName();
+      const clio::run::u64 off = task->offset_, sz = task->size_;
+      void *d = dst.ptr_;
+      RefIoPool::Get().Submit([this, ref, bname, off, sz, d, st]() {
+        st->store(ServeRefFault(*ref, bname, off, sz, d),
+                  std::memory_order_release);
+      });
+    }
+    {
+      // Poll fast first (a cached read lands in microseconds), then back off.
+      clio::run::u64 polls = 0;
+      while (st->load(std::memory_order_acquire) < 0) {
+        CLIO_CO_AWAIT(clio::run::yield(polls++ < 64 ? 20.0 : 200.0));
+      }
+    }
+    task->SetReturnCode((clio::run::u32)st->load());
+    CLIO_CO_RETURN;
   }
   // pagify: a request named "page:<id>" asks for a UNIFIED PAGE NUMBER, not
   // a blob. The caller (e.g. the gpu_vector) knows only page 0, page 1, ...
@@ -343,6 +567,29 @@ clio::run::TaskResume Runtime::ParseOmni(clio::run::shared_ptr<ParseOmniTask> &t
          "ParseOmni: Processing context {}/{} - src: {}, dst: {}, format: {}",
          i + 1, assimilation_contexts.size(), assimilation_ctx.src,
          assimilation_ctx.dst, assimilation_ctx.format);
+
+    // format "reference": map the source as an object, do not copy it.
+    if (assimilation_ctx.format == "reference" ||
+        assimilation_ctx.format == "ref") {
+      std::string ref_id, tag_name;
+      int rc = AssimilateByReference(assimilation_ctx, &ref_id, &tag_name);
+      if (rc == 0) {
+        auto tf = cte_client_->AsyncGetOrCreateTag(
+            tag_name, pool_id_, pool_name_, ref_id,
+            clio::cte::core::TagId::GetNull(), clio::run::PoolQuery::Local());
+        CLIO_CO_AWAIT(tf);
+        rc = (int)tf->GetReturnCode();
+      }
+      if (rc != 0) {
+        task->result_code_ = rc;
+        task->error_message_ = "reference assimilation failed";
+        task->num_tasks_scheduled_ = tasks_scheduled;
+        task->SetReturnCode(static_cast<clio::run::u32>(rc));
+        CLIO_CO_RETURN;
+      }
+      tasks_scheduled++;
+      continue;
+    }
 
     // Get appropriate assimilator for this context
     auto assimilator = factory.Get(assimilation_ctx.src);

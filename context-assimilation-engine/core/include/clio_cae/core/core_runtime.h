@@ -254,6 +254,27 @@ class Runtime : public clio::run::Container {
   /** pagify: per-tag page map, loaded once from the tag's "pagemap" blob.
    *  Keyed by tag so a pool serving several datasets keeps them apart. */
   std::map<clio::cte::core::TagId, clio::cae::core::Pagify> page_maps_;
+
+  /**
+   * By-reference assimilation (format "reference"): the bytes stay in the
+   * source object (a file, a dfuse-mounted DAOS container, ...). CAE only
+   * records the extent and registers itself as the destination tag's fault
+   * handler; a CTE miss on page N is served by reading the source directly
+   * into the requester's buffer. Nothing is copied into a CTE tier.
+   */
+  struct RefExtent {
+    std::string path;
+    int fd = -1;
+    clio::run::u64 base = 0;       // byte offset of page 0 in the source
+    clio::run::u64 size = 0;       // bytes of the extent
+    clio::run::u64 page_size = 0;  // bytes per page
+  };
+  std::map<std::string, RefExtent> refs_;  // key = fault_params id "ref:<n>"
+  clio::run::u64 next_ref_id_ = 0;
+  int AssimilateByReference(const struct AssimilationCtx &ctx,
+                            std::string *ref_id, std::string *tag_name);
+  int ServeRefFault(const RefExtent &ref, const std::string &blob_name,
+                    clio::run::u64 offset, clio::run::u64 size, void *dst);
 #ifdef CLIO_ENABLE_S3_REST
   /// Keep-alive S3 connections leased by the s3:// assimilator, one lease per
   /// object for its whole lifetime (safe across worker migration). Long-lived

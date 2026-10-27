@@ -1068,6 +1068,21 @@ class DeviceVector {
       CO_AWAIT(TagWait{ctag, 0}.Take());
       p = FindBlock(pn);
     }
+    // FETCHED, THEN EVICTED BEFORE THE HOLD. In a shared set a peer block's
+    // allocation can reclaim the frame between this block's fetch landing and
+    // this pin -- likelier the longer faults take (a by-reference page read
+    // from a parallel filesystem). Losing that race is not an error: fetch
+    // the slice again. Bounded, so a set that can never keep it still traps.
+    for (clio::run::u32 refetch = 0; refetch < 64; ++refetch) {
+      if (!__syncthreads_or(p == nullptr ? 1 : 0)) break;
+      {
+        const clio::run::u64 in_pg = off % h_->elems_per_page_;
+        clio::run::u64 rn = h_->elems_per_page_ - in_pg;
+        if (rn > count) rn = count;
+        CO_AWAIT(CoFetch(Tasks()->fetch_generation, off, rn));
+      }
+      p = FindBlock(pn);
+    }
     if (__syncthreads_or(p == nullptr ? 1 : 0)) {
       if (threadIdx.x == 0) {
         GPage *tbl = SetPages(SetOf(pn));

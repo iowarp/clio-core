@@ -3202,7 +3202,18 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // Yielding, not spinning: the worker runs other tasks while this one is
     // parked. Bounded, because a writer that never arrives has to surface as
     // an error rather than a hung worker.
-    if ((task->context_.op_flags_ & Context::kGenerational) && task->context_.generation_ != 0) {
+    // A missing blob on a tag with a fault handler (e.g. CAE by-reference
+    // assimilation) is materialised by that handler, not by a writer, so
+    // waiting for a generation would only stall the fault for the full
+    // timeout. Skip straight to the fault dispatch below.
+    bool fault_backed_miss = false;
+    if (blob_info_ptr == nullptr &&
+        (task->context_.op_flags_ & Context::kNoFault) == 0) {
+      std::shared_ptr<TagInfo> ti = tag_id_to_info_.get(tag_id);
+      fault_backed_miss = ti != nullptr && !ti->fault_pool_id_.IsNull();
+    }
+    if (!fault_backed_miss &&
+        (task->context_.op_flags_ & Context::kGenerational) && task->context_.generation_ != 0) {
       // Bound by TIME, not iterations: how long a yield actually parks is
       // not something this loop can assume, and an iteration count silently
       // became a 167 ms timeout that fired before a writer 400 ms away.
