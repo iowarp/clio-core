@@ -815,24 +815,6 @@ void DefaultScheduler::LoadBalance() {
              "retry={} periodic={}) live={} live_stalled={}",
              processed, outstanding, ob_queued, ob_blocked, ob_retry,
              ob_periodic, live, live_stalled);
-        // Per-worker view (every worker, the net worker included): which
-        // lane or shard holds the outstanding task.
-        std::string per_w;
-        IpcManager *hb_ipc = CLIO_IPC;
-        for (size_t i = 0; i < work_orch_->GetWorkerCount(); ++i) {
-          Worker *w = work_orch_->GetWorker(static_cast<u32>(i));
-          if (w == nullptr) continue;
-          WorkerStats st = w->GetWorkerStats();
-          per_w += " w" + std::to_string(w->GetId()) + ":lane=" +
-                   std::to_string(st.num_queued_tasks_) + "/blk=" +
-                   std::to_string(st.num_blocked_tasks_) + "/per=" +
-                   std::to_string(st.num_periodic_tasks_) + "/retry=" +
-                   std::to_string(st.num_retry_tasks_) +
-                   (w->IsExecuting() ? "/exec" : "") +
-                   (hb_ipc != nullptr && !hb_ipc->ShardEmpty(w->GetId())
-                        ? "/shard!" : "");
-        }
-        HLOG(kDebug, "[HANGWATCH-HB] workers:{}", per_w);
       }
       if (wd_last_processed == ~0ull) {
         wd_last_processed = processed;
