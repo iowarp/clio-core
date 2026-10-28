@@ -246,13 +246,54 @@ int Runtime::AssimilateByReference(const AssimilationCtx &ctx,
   ::posix_fadvise(ref.fd, (off_t)ref.base, (off_t)ref.size,
                   POSIX_FADV_SEQUENTIAL);
 #endif
-  *ref_id = "ref:" + std::to_string(next_ref_id_++);
+  {
+    // Content-derived id: identical on every node, distinct per extent.
+    const std::string k = ref.path + "|" + std::to_string(ref.base) + "|" +
+                          std::to_string(ref.size) + "|" +
+                          std::to_string(ref.page_size);
+    clio::run::u64 h = 1469598103934665603ull;  // FNV-1a 64
+    for (unsigned char c : k) { h ^= c; h *= 1099511628211ull; }
+    char hex[24];
+    std::snprintf(hex, sizeof(hex), "ref:%016llx", (unsigned long long)h);
+    *ref_id = hex;
+  }
   *tag_name = StripProto(ctx.dst);
   HLOG(kInfo,
        "CAE reference: tag '{}' -> '{}' [{}, +{}) page_size={} ({})",
        *tag_name, ref.path, ref.base, ref.size, ref.page_size, *ref_id);
-  refs_[*ref_id] = std::move(ref);
+  {
+    std::lock_guard<std::mutex> g(refs_mu_);
+    if (refs_.find(*ref_id) != refs_.end()) {
+      ::close(ref.fd);  // same extent assimilated again: keep the first
+    } else {
+      refs_[*ref_id] = std::move(ref);
+    }
+  }
   return 0;
+}
+
+std::string Runtime::EncodeRefDesc(const RefExtent &r) {
+  return std::to_string(r.base) + " " + std::to_string(r.size) + " " +
+         std::to_string(r.page_size) + " " + r.path;
+}
+
+bool Runtime::DecodeRefDesc(const char *buf, size_t n, RefExtent *r) {
+  std::string d(buf, strnlen(buf, n));
+  unsigned long long b = 0, sz = 0, ps = 0;
+  int used = 0;
+  if (std::sscanf(d.c_str(), "%llu %llu %llu %n", &b, &sz, &ps, &used) != 3 ||
+      used <= 0 || (size_t)used >= d.size() || ps == 0) {
+    return false;
+  }
+  r->base = b; r->size = sz; r->page_size = ps;
+  r->path = d.substr((size_t)used);
+  r->fd = ::open(r->path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (r->fd < 0) {
+    HLOG(kError, "CAE reference: cannot open '{}' on this node: {}", r->path,
+         std::strerror(errno));
+    return false;
+  }
+  return true;
 }
 
 int Runtime::ServeRefFault(const RefExtent &ref, const std::string &blob_name,
@@ -314,6 +355,25 @@ int Runtime::ServeRefFault(const RefExtent &ref, const std::string &blob_name,
     done += (clio::run::u64)r;
   }
   if (done < size) std::memset(io + done, 0, (size_t)(size - done));
+  {
+    // CLIO_CAE_REF_TRACE=N: log the first N faults served by this process.
+    static const long kTrace = [] {
+      const char *e = std::getenv("CLIO_CAE_REF_TRACE");
+      return (e != nullptr && *e) ? std::strtol(e, nullptr, 10) : 0L;
+    }();
+    static std::atomic<long> traced{0};
+    if (kTrace > 0 && traced.fetch_add(1) < kTrace) {
+      char host[64] = {0};
+      ::gethostname(host, sizeof(host) - 1);
+      float v[4] = {0, 0, 0, 0};
+      std::memcpy(v, io, std::min<size_t>(sizeof(v), (size_t)size));
+      HLOG(kInfo,
+           "CAE_REF_TRACE host={} path={} page={} off={} size={} read={} "
+           "dev={} v0={} v1={} v2={} v3={}",
+           host, ref.path, page, offset, size, done, dev ? 1 : 0, v[0], v[1],
+           v[2], v[3]);
+    }
+  }
   if (dev) ctp::DeviceAwareMemcpy(dst, io, (size_t)size);
   return 0;
 }
@@ -377,10 +437,47 @@ clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task)
   // By-reference fault: CTE dispatched a miss on a tag CAE assimilated by
   // reference. Read the page straight from the source object.
   if (std::strncmp(task->context_.fault_params_, "ref:", 4) == 0) {
-    auto it = refs_.find(std::string(task->context_.fault_params_));
-    if (it == refs_.end()) {
-      task->SetReturnCode(1);
-      CLIO_CO_RETURN;
+    const std::string ref_key(task->context_.fault_params_);
+    std::map<std::string, RefExtent>::iterator it;
+    bool have = false;
+    {
+      std::lock_guard<std::mutex> g(refs_mu_);
+      it = refs_.find(ref_key);
+      have = it != refs_.end();
+    }
+    if (!have) {
+      // Assimilated on another node: fetch its descriptor from the registry.
+      auto tf = cte_client_->AsyncGetOrCreateTag(kRefRegistryTag);
+      CLIO_CO_AWAIT(tf);
+      auto dbuf = CLIO_IPC->AllocateBuffer(kRefDescSize);
+      if (tf->GetReturnCode() != 0 || dbuf.IsNull()) {
+        task->SetReturnCode(1);
+        CLIO_CO_RETURN;
+      }
+      std::memset(dbuf.ptr_, 0, kRefDescSize);
+      clio::cte::core::Context gctx;
+      gctx.op_flags_ |= clio::cte::core::Context::kNoFault;
+      auto gf = cte_client_->AsyncGetBlob(
+          tf->tag_id_, ref_key.c_str(), 0, kRefDescSize, 0,
+          dbuf.shm_.template Cast<void>(), clio::run::PoolQuery::Dynamic(),
+          gctx);
+      CLIO_CO_AWAIT(gf);
+      RefExtent loaded;
+      const bool ok = gf->GetReturnCode() == 0 &&
+                      DecodeRefDesc(dbuf.ptr_, kRefDescSize, &loaded);
+      CLIO_IPC->FreeBuffer(dbuf);
+      if (!ok) {
+        HLOG(kError, "CAE reference: no descriptor for {}", ref_key);
+        task->SetReturnCode(1);
+        CLIO_CO_RETURN;
+      }
+      std::lock_guard<std::mutex> g(refs_mu_);
+      it = refs_.find(ref_key);
+      if (it == refs_.end()) {
+        it = refs_.emplace(ref_key, std::move(loaded)).first;
+      } else {
+        ::close(loaded.fd);  // a concurrent fault loaded it first
+      }
     }
     // MATERIALISE request: CTE sends a size-0, null-buffer fault before a
     // PutBlob into a page this tag does not hold, so a PARTIAL write lands
@@ -607,11 +704,65 @@ clio::run::TaskResume Runtime::ParseOmni(clio::run::shared_ptr<ParseOmniTask> &t
       std::string ref_id, tag_name;
       int rc = AssimilateByReference(assimilation_ctx, &ref_id, &tag_name);
       if (rc == 0) {
-        auto tf = cte_client_->AsyncGetOrCreateTag(
-            tag_name, pool_id_, pool_name_, ref_id,
-            clio::cte::core::TagId::GetNull(), clio::run::PoolQuery::Local());
+        // Publish the descriptor so the CAE on any node can serve faults.
+        auto rt = cte_client_->AsyncGetOrCreateTag(kRefRegistryTag);
+        CLIO_CO_AWAIT(rt);
+        rc = (int)rt->GetReturnCode();
+        if (rc == 0) {
+          std::string desc;
+          {
+            std::lock_guard<std::mutex> g(refs_mu_);
+            desc = EncodeRefDesc(refs_[ref_id]);
+          }
+          auto dbuf = CLIO_IPC->AllocateBuffer(kRefDescSize);
+          if (dbuf.IsNull() || desc.size() >= kRefDescSize) {
+            rc = -13;
+          } else {
+            std::memset(dbuf.ptr_, 0, kRefDescSize);
+            std::memcpy(dbuf.ptr_, desc.data(), desc.size());
+            clio::cte::core::Context pctx;
+            pctx.op_flags_ |= clio::cte::core::Context::kNoFault;
+            auto pf = cte_client_->AsyncPutBlob(
+                rt->tag_id_, ref_id.c_str(), 0, kRefDescSize,
+                dbuf.shm_.template Cast<void>(), -1.0f, pctx);
+            CLIO_CO_AWAIT(pf);
+            rc = (int)pf->GetReturnCode();
+            CLIO_IPC->FreeBuffer(dbuf);
+          }
+        }
+      }
+      if (rc == 0) {
+        // Register CAE as the tag's fault handler on EVERY CTE container:
+        // a GetBlob is routed to the page's hashed owner container, and that
+        // container consults ITS OWN TagInfo for the handler. Registering
+        // only locally left remote-owned pages unhandled (served as zeros).
+        // First resolve the canonical id, then pin it on each container.
+        // Resolve the CANONICAL tag id with the same routing every other
+        // client uses (the name's hash owner): a Local create here minted a
+        // second, node-local tag of the same name that the dataset never
+        // used, so the handler landed on the wrong tag.
+        auto tf = cte_client_->AsyncGetOrCreateTag(tag_name);
         CLIO_CO_AWAIT(tf);
         rc = (int)tf->GetReturnCode();
+        const clio::cte::core::TagId tid = tf->tag_id_;
+        const clio::run::PoolInfo *cinfo =
+            CLIO_POOL_MANAGER->GetPoolInfo(ResolveNextPoolId());
+        const clio::run::u32 ncont =
+            cinfo != nullptr ? cinfo->num_containers_ : 1;
+        for (clio::run::u32 c = 0; rc == 0 && c < ncont; ++c) {
+          auto cf = cte_client_->AsyncGetOrCreateTag(
+              tag_name, pool_id_, pool_name_, ref_id, tid,
+              clio::run::PoolQuery::DirectId(
+                  static_cast<clio::run::ContainerId>(c)));
+          CLIO_CO_AWAIT(cf);
+          rc = (int)cf->GetReturnCode();
+          if (rc == 0 && !(cf->tag_id_ == tid)) {
+            HLOG(kError,
+                 "CAE reference: tag '{}' id differs on container {}",
+                 tag_name, c);
+            rc = -14;
+          }
+        }
       }
       if (rc != 0) {
         task->result_code_ = rc;

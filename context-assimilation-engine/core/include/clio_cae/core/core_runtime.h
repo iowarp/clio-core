@@ -38,7 +38,9 @@
 #include <clio_cae/core/core_tasks.h>
 #include <clio_cae/core/factory/pagify.h>
 #include <clio_cae/core/core_client.h>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 
 // The long-lived container owns the S3 keep-alive connection pool the s3://
@@ -269,8 +271,18 @@ class Runtime : public clio::run::Container {
     clio::run::u64 size = 0;       // bytes of the extent
     clio::run::u64 page_size = 0;  // bytes per page
   };
-  std::map<std::string, RefExtent> refs_;  // key = fault_params id "ref:<n>"
-  clio::run::u64 next_ref_id_ = 0;
+  // key = fault_params id "ref:<16 hex>", a hash of the extent itself, so
+  // it names the same extent on EVERY node. A CTE miss is handled by the CAE
+  // on the page's OWNER node, which is usually not the node that assimilated
+  // it; that CAE loads the descriptor from the shared registry tag
+  // (kRefRegistryTag) and opens the source itself. Entries are never erased
+  // (in-flight reads hold pointers), so std::map node stability suffices.
+  std::map<std::string, RefExtent> refs_;
+  std::mutex refs_mu_;
+  static constexpr const char *kRefRegistryTag = "__cae_ref_registry";
+  static constexpr clio::run::u64 kRefDescSize = 1024;
+  static std::string EncodeRefDesc(const RefExtent &r);
+  static bool DecodeRefDesc(const char *buf, size_t n, RefExtent *r);
   int AssimilateByReference(const struct AssimilationCtx &ctx,
                             std::string *ref_id, std::string *tag_name);
   int ServeRefFault(const RefExtent &ref, const std::string &blob_name,

@@ -1278,6 +1278,13 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
   CLIO_TASK_BODY_END
 }
 
+bool Runtime::IsNodeLocalRefTag(const TagId &tag_id) {
+  std::shared_ptr<TagInfo> ti = tag_id_to_info_.get(tag_id);
+  if (ti == nullptr || ti->fault_pool_id_.IsNull()) return false;
+  const std::string p = ti->fault_params_.str();
+  return p.compare(0, 4, "ref:") == 0;
+}
+
 clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) {
   using namespace clio::cte::core;
   switch (task->method_) {
@@ -1307,13 +1314,20 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       return clio::run::PoolQuery::DirectHash(hash_value);
     }
 
-    // Blob operations: hash blob name to container
+    // Blob operations: hash blob name to container -- except on a
+    // BY-REFERENCE tag (CAE fault handler, fault_params "ref:..."): its
+    // source lives on shared storage that every node can read, so each node
+    // serves its own misses and keeps its own written pages. Routing those to
+    // a hashed owner only added a network hop per page (and a remote fault
+    // round trip that returned wrong data at 2+ nodes).
     case Method::kPutBlob: {
       auto typed = task.template Cast<PutBlobTask>();
+      if (IsNodeLocalRefTag(typed->tag_id_)) return clio::run::PoolQuery::Local();
       return HashBlobToContainer(typed->tag_id_, typed->GetBlobName());
     }
     case Method::kGetBlob: {
       auto typed = task.template Cast<GetBlobTask>();
+      if (IsNodeLocalRefTag(typed->tag_id_)) return clio::run::PoolQuery::Local();
       return HashBlobToContainer(typed->tag_id_, typed->GetBlobName());
     }
     case Method::kReorganizeBlob: {
@@ -1322,14 +1336,17 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
     }
     case Method::kDelBlob: {
       auto typed = task.template Cast<DelBlobTask>();
+      if (IsNodeLocalRefTag(typed->tag_id_)) return clio::run::PoolQuery::Local();
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
     case Method::kGetBlobScore: {
       auto typed = task.template Cast<GetBlobScoreTask>();
+      if (IsNodeLocalRefTag(typed->tag_id_)) return clio::run::PoolQuery::Local();
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
     case Method::kGetBlobSize: {
       auto typed = task.template Cast<GetBlobSizeTask>();
+      if (IsNodeLocalRefTag(typed->tag_id_)) return clio::run::PoolQuery::Local();
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
     case Method::kGetResidency: {
@@ -1340,6 +1357,7 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       // which a caller is entitled to read as "hole, zeros are correct".
       // Absence is the one answer this op must never get wrong.
       auto typed = task.template Cast<GetResidencyTask>();
+      if (IsNodeLocalRefTag(typed->tag_id_)) return clio::run::PoolQuery::Local();
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
     case Method::kRegisterReplicaContainer: {
@@ -1917,6 +1935,29 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
         // Mirror the binding into the search index so a Local TagQuery still
         // sees remote-canonical tag names (parity with the old full scan). (#598)
         tag_search_.Insert(ResolveTagName(tag_name), preferred_id);
+      }
+      // A FAULT HANDLER registered on a remote-canonical tag must still take
+      // effect HERE: a blob op on this tag that lands on this container
+      // (hashed owner, or node-local by-reference routing) consults THIS
+      // container's TagInfo for the handler. Without a record the miss was
+      // answered as create_on_get / not-found -- buffer untouched -- and a
+      // CAE by-reference dataset silently read garbage at 2+ nodes. Seed a
+      // stub record (the same kind PutBlob seeds for a non-owner container).
+      if (!task->fault_pool_id_.IsNull()) {
+        std::shared_ptr<TagInfo> ti = tag_id_to_info_.get(preferred_id);
+        if (ti == nullptr) {
+          TagInfo seed;
+          seed.tag_id_ = preferred_id;
+          seed.last_modified_ = GetWallTimeNs();
+          seed.last_read_ = seed.last_modified_;
+          seed.last_changed_ = seed.last_modified_;
+          seed.total_size_ = 0;
+          ti = std::make_shared<TagInfo>(seed);
+          tag_id_to_info_.insert_or_assign(preferred_id, ti);
+        }
+        ti->fault_pool_id_ = task->fault_pool_id_;
+        ti->fault_pool_name_ = task->fault_pool_name_;
+        ti->fault_params_ = task->fault_params_;
       }
       task->tag_id_ = preferred_id;
       task->return_code_ = 0;
@@ -3333,6 +3374,24 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // have to tell "missing" apart from "read failed" itself.
     if (blob_info_ptr == nullptr) {
       const clio::run::u32 miss_rc = NotFoundRc(tag_id, blob_name);
+      {
+        // CLIO_CTE_MISS_TRACE=N: log the first N misses this container
+        // answers with no fault handler (create_on_get or not-found).
+        static const long kMissTrace = [] {
+          const char *e = std::getenv("CLIO_CTE_MISS_TRACE");
+          return (e != nullptr && *e) ? std::strtol(e, nullptr, 10) : 0L;
+        }();
+        static std::atomic<long> miss_traced{0};
+        if (kMissTrace > 0 && miss_traced.fetch_add(1) < kMissTrace) {
+          std::shared_ptr<TagInfo> mti = tag_id_to_info_.get(tag_id);
+          HLOG(kInfo,
+               "CTE_MISS_TRACE container={} tag={}.{} blob={} create_on_get={} "
+               "taginfo={} fault_pool_null={}",
+               container_id_, tag_id.major_, tag_id.minor_, blob_name,
+               task->context_.create_on_get_ ? 1 : 0, mti != nullptr ? 1 : 0,
+               (mti == nullptr || mti->fault_pool_id_.IsNull()) ? 1 : 0);
+        }
+      }
       if (task->context_.create_on_get_ && miss_rc == 1) {
         // Bind the name so a later put has something to extend; the read
         // itself returns success with the caller's buffer untouched. Not
@@ -11616,6 +11675,10 @@ bool Runtime::ServesBlob(const BlobInfo &blob_info, const TagId &tag_id,
 
 clio::run::PoolQuery Runtime::HashBlobToContainer(const TagId &tag_id,
                                             const std::string &blob_name) {
+  // A CAE by-reference tag's source is on storage every node reads, so each
+  // node serves its own pages: no owner hop. Covers every Pod*/Multi* path
+  // that routes by owner directly (they bypass ScheduleTask).
+  if (IsNodeLocalRefTag(tag_id)) return clio::run::PoolQuery::Local();
   const clio::run::u32 hash_value = BlobHash(tag_id, blob_name);
   if (config_.targets_.failover_to_successor_) {
     // The owner's node is dead: its successor holds the replication
