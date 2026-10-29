@@ -86,6 +86,10 @@ clio::run::PoolQuery Runtime::ScheduleTask(
       }
       break;
     }
+    case clio::cte::core::Method::kGetOrCreateTag:
+    case clio::cte::core::Method::kDelTag:
+      // Answered (lookup hit) or driven (owner write + broadcast) from here.
+      return clio::run::PoolQuery::Local();
     case clio::cte::core::Method::kPodMultiGetBlob:
       // The pager's batch is served where it was issued: cache copies are
       // per node, and the core path below forwards remote records itself.
@@ -324,6 +328,199 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
       tc.populated += populated;
       for (auto &a : added) tc.cached.insert(std::move(a));
     }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+// ===========================================================================
+// Tag METADATA cache -- write-through, strongly consistent on completion.
+//
+// Every node's cache container keeps name -> TagId for the tags it has seen,
+// plus each tag's fault handler installed into its LOCAL core container. A
+// lookup (GetOrCreateTag with no write arguments) is answered here with no
+// round trip. A tag WRITE -- creation, fault-handler registration, delete,
+// rename -- goes to the tag's owner through the core first, and only after
+// the owner committed it is the change broadcast to every node's cache; the
+// write returns once every node acknowledged. Guarantee: after a tag write
+// returns, every lookup on every node sees it. While it is in flight, nodes
+// may briefly disagree (the write has not completed). Concurrent writes to
+// the SAME tag are serialized at its owner; their broadcasts are not
+// ordered against each other (last broadcast wins) -- tags change rarely.
+//
+// Not cached: a tag's byte size (it changes on every page write). A lookup
+// served from the cache reports tag_size_ = 0; ask GetTagSize for the size.
+// ===========================================================================
+
+bool Runtime::TagMetaLookup(const std::string &name, TagId *id) {
+  std::lock_guard<std::mutex> g(tmeta_mu_);
+  auto it = tmeta_by_name_.find(name);
+  if (it == tmeta_by_name_.end()) return false;
+  *id = it->second;
+  return true;
+}
+
+void Runtime::TagMetaInsert(const std::string &name, const TagId &id) {
+  if (name.empty() || id.IsNull()) return;
+  std::lock_guard<std::mutex> g(tmeta_mu_);
+  tmeta_by_name_[name] = id;
+  tmeta_names_[TagKey(id)].insert(name);
+}
+
+void Runtime::TagMetaDrop(const TagId &id, const std::string &name) {
+  std::lock_guard<std::mutex> g(tmeta_mu_);
+  if (!id.IsNull()) {
+    auto it = tmeta_names_.find(TagKey(id));
+    if (it != tmeta_names_.end()) {
+      for (const auto &n : it->second) tmeta_by_name_.erase(n);
+      tmeta_names_.erase(it);
+    }
+  }
+  if (!name.empty()) {
+    auto f = tmeta_by_name_.find(name);
+    if (f != tmeta_by_name_.end()) {
+      auto ns = tmeta_names_.find(TagKey(f->second));
+      if (ns != tmeta_names_.end()) ns->second.erase(name);
+      tmeta_by_name_.erase(f);
+    }
+  }
+}
+
+clio::run::Future<TagCacheUpdateTask> Runtime::SendTagMeta(
+    clio::run::u32 method, const std::string &name, const TagId &id,
+    const clio::run::PoolId &fault_pool_id, const std::string &fault_pool_name,
+    const std::string &fault_params) {
+  auto *ipc = CLIO_CPU_IPC;
+  auto t = ipc->NewTask<TagCacheUpdateTask>(
+      clio::run::CreateTaskId(), pool_id_, clio::run::PoolQuery::Broadcast(),
+      method, name, id, fault_pool_id, fault_pool_name, fault_params);
+  return ipc->Send(t);
+}
+
+clio::run::TaskResume Runtime::GetOrCreateTag(
+    clio::run::shared_ptr<
+        clio::cte::core::GetOrCreateTagTask<clio::cte::core::CreateParams>>
+        &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const std::string name = task->tag_name_.str();
+    const clio::run::PoolId fpool = task->fault_pool_id_;
+    const std::string fname = task->fault_pool_name_.str();
+    const std::string fparams = task->fault_params_.str();
+    // A write: registers a fault handler, or pins a caller-chosen id.
+    const bool is_write = !fpool.IsNull() || !task->tag_id_.IsNull();
+    TagId hit = TagId::GetNull();
+    if (!is_write && !name.empty() && TagMetaLookup(name, &hit)) {
+      task->tag_id_ = hit;
+      task->created_ = 0;
+      task->tag_size_ = 0;  // size is not cached (see above)
+      task->SetReturnCode(0);
+      CLIO_CO_RETURN;
+    }
+    // Miss or write: the owner decides (normal core routing).
+    auto f = GetNextClient()->AsyncGetOrCreateTag(
+        name, fpool, fname, fparams, task->tag_id_,
+        clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(f);
+    const clio::run::u32 rc = f->GetReturnCode();
+    task->tag_id_ = f->tag_id_;
+    task->created_ = f->created_;
+    task->tag_size_ = f->tag_size_;
+    if (rc == 0 && !task->tag_id_.IsNull()) {
+      if (is_write || task->created_ != 0) {
+        // Write-through: every node installs it before this returns.
+        auto b = SendTagMeta(Method::kTagCachePut, name, task->tag_id_, fpool,
+                             fname, fparams);
+        CLIO_CO_AWAIT(b);
+        if (b->GetReturnCode() != 0) {
+          HLOG(kWarning, "tag cache: put of '{}' rc={} on some node", name,
+               b->GetReturnCode());
+        }
+      } else {
+        TagMetaInsert(name, task->tag_id_);  // read miss: fill this node
+      }
+    }
+    task->SetReturnCode(rc);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::TagCachePut(
+    clio::run::shared_ptr<TagCacheUpdateTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const std::string name = task->tag_name_.str();
+    TagMetaInsert(name, task->tag_id_);
+    clio::run::u32 rc = 0;
+    if (!task->fault_pool_id_.IsNull()) {
+      // The fault handler must be visible to THIS node's core container: a
+      // page miss is resolved by whichever container the page lands on.
+      auto f = GetLocalClient()->AsyncGetOrCreateTag(
+          name, task->fault_pool_id_, task->fault_pool_name_.str(),
+          task->fault_params_.str(), task->tag_id_,
+          clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(f);
+      rc = f->GetReturnCode();
+    }
+    task->SetReturnCode(rc);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::TagCacheDrop(
+    clio::run::shared_ptr<TagCacheUpdateTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  TagMetaDrop(task->tag_id_, task->tag_name_.str());
+  task->SetReturnCode(0);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::DelTag(
+    clio::run::shared_ptr<clio::cte::core::DelTagTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const std::string name = task->tag_name_.str();
+    const TagId in_id = task->tag_id_;
+    clio::run::u32 rc = 0;
+    TagId gone = in_id;
+    if (name.empty()) {
+      auto f = GetNextClient()->AsyncDelTag(in_id, clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(f);
+      rc = f->GetReturnCode();
+      if (!f->tag_id_.IsNull()) gone = f->tag_id_;
+    } else {
+      auto f = GetNextClient()->AsyncDelTag(name, clio::run::PoolQuery::Dynamic(),
+                                            task->posix_unlink_ != 0);
+      CLIO_CO_AWAIT(f);
+      rc = f->GetReturnCode();
+      if (!f->tag_id_.IsNull()) gone = f->tag_id_;
+    }
+    task->tag_id_ = gone;
+    // Drop everywhere before returning -- also on failure: a stale entry is
+    // never worth keeping, and the next lookup re-reads the owner.
+    auto b = SendTagMeta(Method::kTagCacheDrop, name, gone,
+                         clio::run::PoolId::GetNull(), "", "");
+    CLIO_CO_AWAIT(b);
+    task->SetReturnCode(rc);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RenameTag(
+    clio::run::shared_ptr<clio::cte::core::RenameTagTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    // Rename is a core BROADCAST: this runs on every node's cache container,
+    // so each renames in its own core and drops its own stale entries; the
+    // broadcast completes only when every node did both.
+    const std::string old_name = task->old_name_.str();
+    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kRenameTag,
+                                task.template Cast<clio::run::Task>()));
+    TagMetaDrop(task->tag_id_, old_name);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

@@ -167,6 +167,65 @@ struct TagCacheTask : public clio::run::Task {
   }
 };
 
+/**
+ * Tag-metadata cache update (kTagCachePut / kTagCacheDrop), broadcast by the
+ * node that completed a tag write so every node's cache agrees before the
+ * write returns. Put carries the tag's static metadata: name, id, and its
+ * fault handler (null pool = none).
+ */
+struct TagCacheUpdateTask : public clio::run::Task {
+  IN clio::run::priv::string tag_name_;
+  IN TagId tag_id_;
+  IN clio::run::PoolId fault_pool_id_;
+  IN clio::run::priv::string fault_pool_name_;
+  IN clio::run::priv::string fault_params_;
+
+  TagCacheUpdateTask()
+      : clio::run::Task(),
+        tag_name_(CLIO_PRIV_ALLOC),
+        tag_id_(TagId::GetNull()),
+        fault_pool_id_(clio::run::PoolId::GetNull()),
+        fault_pool_name_(CLIO_PRIV_ALLOC),
+        fault_params_(CLIO_PRIV_ALLOC) {}
+  explicit TagCacheUpdateTask(const clio::run::TaskId &task_id,
+                              const clio::run::PoolId &pool_id,
+                              const clio::run::PoolQuery &pool_query,
+                              clio::run::u32 method,
+                              const std::string &tag_name,
+                              const TagId &tag_id,
+                              const clio::run::PoolId &fault_pool_id,
+                              const std::string &fault_pool_name,
+                              const std::string &fault_params)
+      : clio::run::Task(task_id, pool_id, pool_query, method),
+        tag_name_(CLIO_PRIV_ALLOC, tag_name),
+        tag_id_(tag_id),
+        fault_pool_id_(fault_pool_id),
+        fault_pool_name_(CLIO_PRIV_ALLOC, fault_pool_name),
+        fault_params_(CLIO_PRIV_ALLOC, fault_params) {
+    task_flags_.Clear();
+  }
+  template <typename Archive>
+  void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_name_, tag_id_, fault_pool_id_, fault_pool_name_, fault_params_);
+  }
+  template <typename Archive>
+  void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+  void Copy(const ctp::ipc::FullPtr<TagCacheUpdateTask> &other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
+    tag_name_ = other->tag_name_;
+    tag_id_ = other->tag_id_;
+    fault_pool_id_ = other->fault_pool_id_;
+    fault_pool_name_ = other->fault_pool_name_;
+    fault_params_ = other->fault_params_;
+  }
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+  }
+};
+
 }  // namespace clio::cte::cache
 
 #endif  // CLIO_CTE_CACHE_CACHE_TASKS_H_

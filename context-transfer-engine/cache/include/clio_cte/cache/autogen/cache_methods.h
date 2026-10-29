@@ -43,6 +43,20 @@ GLOBAL_CROSS_CONST clio::run::u32 kPodMultiGetBlob =
 GLOBAL_CROSS_CONST clio::run::u32 kEnrollTag = 90;
 GLOBAL_CROSS_CONST clio::run::u32 kInvalidateTag = 91;
 GLOBAL_CROSS_CONST clio::run::u32 kForgetTag = 92;
+
+// TAG METADATA CACHE (write-through, strongly consistent on completion).
+// Interposed core tag verbs: lookups are answered from this node's cache;
+// writes go to the tag's owner and then update every node's cache before
+// they complete.
+GLOBAL_CROSS_CONST clio::run::u32 kGetOrCreateTag =
+    clio::cte::core::Method::kGetOrCreateTag;
+GLOBAL_CROSS_CONST clio::run::u32 kDelTag = clio::cte::core::Method::kDelTag;
+GLOBAL_CROSS_CONST clio::run::u32 kRenameTag =
+    clio::cte::core::Method::kRenameTag;
+//   kTagCachePut  : (broadcast) install name -> id (+ fault handler) here.
+//   kTagCacheDrop : (broadcast) forget every cached name of a tag id here.
+GLOBAL_CROSS_CONST clio::run::u32 kTagCachePut = 93;
+GLOBAL_CROSS_CONST clio::run::u32 kTagCacheDrop = 94;
 GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 101;
 
 inline const std::vector<std::string>& GetMethodNames() {
@@ -59,6 +73,11 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[kEnrollTag] = "EnrollTag";
     v[kInvalidateTag] = "InvalidateTag";
     v[kForgetTag] = "ForgetTag";
+    v[kGetOrCreateTag] = "GetOrCreateTag";
+    v[kDelTag] = "DelTag";
+    v[kRenameTag] = "RenameTag";
+    v[kTagCachePut] = "TagCachePut";
+    v[kTagCacheDrop] = "TagCacheDrop";
     return v;
   }();
   return names;

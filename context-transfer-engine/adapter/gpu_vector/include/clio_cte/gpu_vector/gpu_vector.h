@@ -368,7 +368,9 @@ class Vector {
     if (page_bytes_ == 0 || nblocks_ == 0 || set_size_ == 0 || nsets_ == 0) {
       throw std::runtime_error("gpu_vector: zero page size / blocks / sets");
     }
-    clio::cte::core::Client cte(clio::cte::core::kCtePoolId);
+    // Through the storage pool: with the CTE cache module in front, the
+    // name is resolved from this node's tag cache when it already knows it.
+    clio::cte::core::Client cte(storage_pool_id_);
     auto tag = cte.AsyncGetOrCreateTag(tag_name);
     tag.Wait();
     if (tag->GetReturnCode() != 0) {
