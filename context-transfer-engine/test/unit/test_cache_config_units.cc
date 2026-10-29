@@ -153,4 +153,50 @@ TEST_CASE("CacheConfig - serialize round-trips every field",
   REQUIRE(out.min_score_ < 0.126f);
 }
 
+TEST_CASE("CacheConfig - auto_enroll defaults off, parses, and round-trips",
+          "[cache][config][tags]") {
+  CacheConfig def;
+  REQUIRE(def.auto_enroll_ == false);  // only explicitly enrolled tags
+
+  CacheConfig in;
+  in.LoadConfig(MakePoolConfig("next_pool_id: \"512.0\"\nauto_enroll: true\n"));
+  REQUIRE(in.auto_enroll_ == true);
+  REQUIRE(in.next_pool_id_.major_ == 512);
+
+  // Survives the compose constructor ...
+  CacheConfig composed(clio::run::PoolId(563, 0), in);
+  REQUIRE(composed.auto_enroll_ == true);
+
+  // ... and the wire.
+  std::vector<char> buf;
+  {
+    ctp::ipc::GlobalSerialize<std::vector<char>> oa(buf);
+    in.serialize(oa);
+    oa.Finalize();
+  }
+  CacheConfig out;
+  {
+    ctp::ipc::GlobalDeserialize<std::vector<char>> ia(buf);
+    out.serialize(ia);
+  }
+  REQUIRE(out.auto_enroll_ == true);
+}
+
+TEST_CASE("Tag cache verbs - ids sit above the core's and are named",
+          "[cache][tags]") {
+  using namespace clio::cte::cache;
+  REQUIRE(Method::kEnrollTag >= clio::cte::core::Method::kMaxMethodId);
+  REQUIRE(Method::kInvalidateTag >= clio::cte::core::Method::kMaxMethodId);
+  REQUIRE(Method::kForgetTag >= clio::cte::core::Method::kMaxMethodId);
+  REQUIRE(Method::kForgetTag < Method::kMaxMethodId);
+  // The pager verb is interposed under the CORE's id, not a module id.
+  REQUIRE(Method::kPodMultiGetBlob ==
+          clio::cte::core::Method::kPodMultiGetBlob);
+  const auto &names = Method::GetMethodNames();
+  REQUIRE(names[Method::kEnrollTag] == "EnrollTag");
+  REQUIRE(names[Method::kInvalidateTag] == "InvalidateTag");
+  REQUIRE(names[Method::kForgetTag] == "ForgetTag");
+  REQUIRE(names[Method::kPodMultiGetBlob] == "PodMultiGetBlob");
+}
+
 SIMPLE_TEST_MAIN()
