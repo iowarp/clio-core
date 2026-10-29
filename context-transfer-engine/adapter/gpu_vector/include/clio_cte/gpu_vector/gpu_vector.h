@@ -33,6 +33,7 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -324,14 +325,30 @@ class Vector {
    * correctness rule (invalidate after a resort, borrow a peer's frame,
    * publish before another block can read) existed to paper over that.
    */
+  /**
+   * Storage pool when the caller names none: CLIO_GV_STORAGE_POOL="maj.min"
+   * (e.g. "563.0", the CTE cache module, for tag-scoped node-local caching of
+   * remote-owned pages), else the CTE core.
+   */
+  static clio::run::PoolId DefaultStoragePool() {
+    const char *e = std::getenv("CLIO_GV_STORAGE_POOL");
+    if (e != nullptr && *e) {
+      unsigned maj = 0, min = 0;
+      if (std::sscanf(e, "%u.%u", &maj, &min) == 2) {
+        return clio::run::PoolId(maj, min);
+      }
+    }
+    return clio::cte::core::kCtePoolId;
+  }
+
   Vector(const std::string &tag_name, const std::vector<int> &gpu_ids,
          clio::run::u64 page_bytes, clio::run::u32 nblocks,
          clio::run::u32 set_size, clio::run::u64 num_elems,
          clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
          int compress_lib = 0, int compress_preset = 1,
          clio::run::u32 nsets = 0, clio::run::u32 capacity_pages = 0)
-      : storage_pool_id_(storage_pool_id.IsNull() ? clio::cte::core::kCtePoolId
-                                                  : storage_pool_id),
+      : storage_pool_id_(!storage_pool_id.IsNull() ? storage_pool_id
+                                                   : DefaultStoragePool()),
         compress_lib_(compress_lib),
         compress_preset_(compress_preset),
         page_bytes_(page_bytes),

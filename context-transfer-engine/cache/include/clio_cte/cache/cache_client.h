@@ -45,6 +45,26 @@ class Client : public clio::cte::core::Client {
     cache_pool_id_ = custom_pool_id;
     return fut;
   }
+  /** Cache `tag_id`'s remote-owned pages node-locally on the pager path. */
+  clio::run::Future<TagCacheTask> AsyncEnrollTag(const TagId &tag_id) {
+    return SendTagCache(Method::kEnrollTag, tag_id);
+  }
+  /** Drop every cached copy of `tag_id` on every node (stays enrolled). */
+  clio::run::Future<TagCacheTask> AsyncInvalidateTag(const TagId &tag_id) {
+    return SendTagCache(Method::kInvalidateTag, tag_id);
+  }
+  /** Invalidate `tag_id` everywhere, then stop caching it. */
+  clio::run::Future<TagCacheTask> AsyncForgetTag(const TagId &tag_id) {
+    return SendTagCache(Method::kForgetTag, tag_id);
+  }
+  clio::run::Future<TagCacheTask> SendTagCache(clio::run::u32 method,
+                                               const TagId &tag_id) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<TagCacheTask>(
+        clio::run::CreateTaskId(), cache_pool_id_,
+        clio::run::PoolQuery::Broadcast(), method, tag_id);
+    return ipc->Send(task);
+  }
 #endif  // CTP_IS_HOST
 
   clio::run::PoolId cache_pool_id_;

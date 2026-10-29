@@ -2811,6 +2811,19 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
     }
 
+    {
+      // CLIO_CTE_PUT_TRACE=N: log the first N blob writes this container stores.
+      static const long kPutTrace = [] {
+        const char *e = std::getenv("CLIO_CTE_PUT_TRACE");
+        return (e != nullptr && *e) ? std::strtol(e, nullptr, 10) : 0L;
+      }();
+      static std::atomic<long> put_traced{0};
+      if (kPutTrace > 0 && put_traced.fetch_add(1) < kPutTrace) {
+        HLOG(kInfo, "CTE_PUT_TRACE container={} tag={}.{} blob={} nodelocal={}",
+             container_id_, tag_id.major_, tag_id.minor_, task->GetBlobName(),
+             IsNodeLocalRefTag(tag_id) ? 1 : 0);
+      }
+    }
     if (task->context_.op_flags_ & Context::kShadowCopy) {
       blob_info_ptr->shadow_ = true;  // another container owns this blob
     }
@@ -3386,10 +3399,12 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           std::shared_ptr<TagInfo> mti = tag_id_to_info_.get(tag_id);
           HLOG(kInfo,
                "CTE_MISS_TRACE container={} tag={}.{} blob={} create_on_get={} "
-               "taginfo={} fault_pool_null={}",
+               "taginfo={} fault_pool_null={} nodelocal={} method_ctx_gen={}",
                container_id_, tag_id.major_, tag_id.minor_, blob_name,
                task->context_.create_on_get_ ? 1 : 0, mti != nullptr ? 1 : 0,
-               (mti == nullptr || mti->fault_pool_id_.IsNull()) ? 1 : 0);
+               (mti == nullptr || mti->fault_pool_id_.IsNull()) ? 1 : 0,
+               IsNodeLocalRefTag(tag_id) ? 1 : 0,
+               (unsigned long long)task->context_.generation_);
         }
       }
       if (task->context_.create_on_get_ && miss_rc == 1) {

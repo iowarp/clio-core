@@ -43,11 +43,16 @@ struct CacheConfig {
   /// reclaims one. Modest default keeps hot raw bytes resident without
   /// starving primaries of the fast tier.
   float min_score_ = 0.5f;
+  /// Tag-scoped caching of the GPU pager path (PodMultiGetBlob). false: only
+  /// tags enrolled with EnrollTag are cached there. true: every tag a pager
+  /// fetches through this pool is enrolled on first use (`auto_enroll: true`).
+  bool auto_enroll_ = false;
 
   CacheConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
   CacheConfig(const clio::run::PoolId &pool_id, const CacheConfig &other)
       : next_pool_id_(other.next_pool_id_),
-        min_score_(other.min_score_) {
+        min_score_(other.min_score_),
+        auto_enroll_(other.auto_enroll_) {
     (void)pool_id;
   }
 
@@ -56,7 +61,7 @@ struct CacheConfig {
     // EVERY field round-trips — the audit rule three silently-dropped-field
     // bugs on this branch bought us (replication copy-ctor, ReplicationConfig
     // period, CompressorConfig next_pool_id_).
-    ar(next_pool_id_, min_score_);
+    ar(next_pool_id_, min_score_, auto_enroll_);
   }
 
   /** Load configuration from compose YAML. */
@@ -80,6 +85,9 @@ struct CacheConfig {
         }
         if (node["min_score"]) {
           min_score_ = node["min_score"].as<float>();
+        }
+        if (node["auto_enroll"]) {
+          auto_enroll_ = node["auto_enroll"].as<bool>();
         }
       } catch (...) {
         // Config parsing is best-effort
@@ -118,6 +126,46 @@ struct DestroyTask : public clio::run::Task {
 };
 
 using MonitorTask = clio::run::admin::MonitorTask;
+
+/**
+ * Tag-scoped cache control (kEnrollTag / kInvalidateTag / kForgetTag). Sent
+ * as a Broadcast so every node's cache container applies it; dropped_ sums
+ * the cached copies released across the replies.
+ */
+struct TagCacheTask : public clio::run::Task {
+  IN TagId tag_id_;
+  OUT clio::run::u64 dropped_;
+
+  TagCacheTask() : clio::run::Task(), tag_id_(TagId::GetNull()), dropped_(0) {}
+  explicit TagCacheTask(const clio::run::TaskId &task_id,
+                        const clio::run::PoolId &pool_id,
+                        const clio::run::PoolQuery &pool_query,
+                        clio::run::u32 method, const TagId &tag_id)
+      : clio::run::Task(task_id, pool_id, pool_query, method),
+        tag_id_(tag_id),
+        dropped_(0) {
+    task_flags_.Clear();
+  }
+  template <typename Archive>
+  void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_);
+  }
+  template <typename Archive>
+  void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(dropped_);
+  }
+  void Copy(const ctp::ipc::FullPtr<TagCacheTask> &other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
+    tag_id_ = other->tag_id_;
+    dropped_ = other->dropped_;
+  }
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    dropped_ += other_base.template Cast<TagCacheTask>()->dropped_;
+  }
+};
 
 }  // namespace clio::cte::cache
 

@@ -6,6 +6,9 @@
 #define CLIO_CTE_CACHE_CACHE_RUNTIME_H_
 
 #include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <string>
 
 #include <clio_runtime/clio_runtime.h>
@@ -74,6 +77,11 @@ class Runtime : public clio::cte::core::CoreInterposer {
       clio::run::shared_ptr<clio::cte::core::GetBlobSizeTask> &task);
   clio::run::TaskResume MultiPutBlob(
       clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
+  clio::run::TaskResume PodMultiGetBlob(
+      clio::run::shared_ptr<clio::cte::core::PodMultiGetBlobTask> &task);
+  clio::run::TaskResume EnrollTag(clio::run::shared_ptr<TagCacheTask> &task);
+  clio::run::TaskResume InvalidateTag(clio::run::shared_ptr<TagCacheTask> &task);
+  clio::run::TaskResume ForgetTag(clio::run::shared_ptr<TagCacheTask> &task);
 
   // ---- Container virtuals (defined in autogen/cache_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
@@ -141,6 +149,22 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::cte::core::Client *GetNextClient();
   /** Lazily bind a direct core client for node-LOCAL copy access. */
   clio::cte::core::Client *GetLocalClient();
+
+  // ---- Tag-scoped caching (pager path) ----
+  /** Per enrolled tag: the pages this node holds a cache copy of, so a tag
+   *  invalidation can release them without scanning the core. */
+  struct TagCache {
+    std::unordered_set<std::string> cached;
+    clio::run::u64 hits = 0, misses = 0, populated = 0;
+  };
+  static clio::run::u64 TagKey(const TagId &t) {
+    return (static_cast<clio::run::u64>(t.major_) << 32) | t.minor_;
+  }
+  bool TagEnrolled(const TagId &tag_id, bool auto_enroll);
+  clio::run::TaskResume DropTagCopies(const TagId &tag_id,
+                                      clio::run::u64 &dropped);
+  std::mutex tags_mu_;
+  std::unordered_map<clio::run::u64, TagCache> tags_;
 
   CacheConfig config_;
   std::unique_ptr<clio::cte::core::Client> next_client_;
