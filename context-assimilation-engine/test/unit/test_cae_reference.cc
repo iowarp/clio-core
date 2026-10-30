@@ -350,7 +350,10 @@ TEST_CASE("on_fault: ingestion never takes the tier's last space",
                                            1.0f);
   put.Wait();
   REQUIRE(put->GetReturnCode() == 0);
-  fs::remove(big);
+  // Best effort: the assimilator keeps its source open between faults, and
+  // Windows refuses to delete an open file.
+  std::error_code ec;
+  fs::remove(big, ec);
 }
 
 SIMPLE_TEST_MAIN()

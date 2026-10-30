@@ -375,7 +375,10 @@ long long BinaryFileAssimilator::ReadBlob(const AssimilationCtx& ctx,
   const clio::run::u64 chunk = BlobBytes(ctx);
   if (cap < chunk) return -22;
   const std::string path = GetUrlPath(ctx.src);
-  // One open stream per (thread, file): faults on the same source reuse it.
+  // One open stream per (thread, file): faults on the same source reuse it
+  // (reopening per fault costs a metadata round trip on a parallel FS). The
+  // source therefore stays open for the runtime's lifetime -- on Windows that
+  // also means it cannot be deleted or replaced while the runtime runs.
   thread_local std::unordered_map<std::string, std::unique_ptr<std::ifstream>>
       streams;
   auto& in = streams[path];
