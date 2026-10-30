@@ -1180,6 +1180,8 @@ set_tests_properties(cae_pagify_interpose PROPERTIES
 #------------------------------------------------------------------------------
 # By-reference (zero-copy) assimilation: CTE misses served from the file
 #------------------------------------------------------------------------------
+# POSIX only: by-reference reads use pread (unsupported on Windows).
+if(NOT WIN32)
 add_executable(test_cae_reference
   ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_reference.cc
 )
@@ -1206,6 +1208,7 @@ set_tests_properties(cae_reference PROPERTIES
   TIMEOUT 120
   LABELS "coverage;cae;reference;zerocopy"
 )
+endif()
 #------------------------------------------------------------------------------
 # ChunkedDatasetWriter (.h5 export) tests
 #------------------------------------------------------------------------------

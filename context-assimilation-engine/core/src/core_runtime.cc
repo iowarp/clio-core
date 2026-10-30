@@ -46,9 +46,14 @@
 #endif
 
 #include "clio_ctp/data_structures/serialization/global_serialize.h"
+// By-reference assimilation reads its source with POSIX pread; it is
+// unsupported (fails cleanly) on Windows, where these headers do not exist.
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#define CAE_REF_POSIX 1
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -189,6 +194,34 @@ bool ParsePageName(const std::string &name, clio::run::u64 *page_id) {
 }  // namespace
 
 namespace {
+/** Open a by-reference source read-only; -1 (ENOSYS) where unsupported. */
+int RefOpen(const std::string &path) {
+#ifdef CAE_REF_POSIX
+  return ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+#else
+  (void)path;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+void RefClose(int fd) {
+#ifdef CAE_REF_POSIX
+  if (fd >= 0) ::close(fd);
+#else
+  (void)fd;
+#endif
+}
+/** Size of an open source, or -1. */
+long long RefFileSize(int fd) {
+#ifdef CAE_REF_POSIX
+  struct stat st;
+  if (::fstat(fd, &st) != 0) return -1;
+  return static_cast<long long>(st.st_size);
+#else
+  (void)fd;
+  return -1;
+#endif
+}
 /** Strip "<proto>::" or "<proto>://" from a URL. */
 std::string StripProto(const std::string &url) {
   size_t p = url.find("://");
@@ -220,21 +253,21 @@ int Runtime::AssimilateByReference(const AssimilationCtx &ctx,
                                    std::string *tag_name) {
   RefExtent ref;
   ref.path = StripProto(ctx.src);
-  ref.fd = ::open(ref.path.c_str(), O_RDONLY | O_CLOEXEC);
+  ref.fd = RefOpen(ref.path);
   if (ref.fd < 0) {
     HLOG(kError, "CAE reference: cannot open '{}': {}", ref.path,
          std::strerror(errno));
     return -10;
   }
-  struct stat st;
-  if (::fstat(ref.fd, &st) != 0) {
-    ::close(ref.fd);
+  const long long fsize = RefFileSize(ref.fd);
+  if (fsize < 0) {
+    RefClose(ref.fd);
     return -11;
   }
-  const clio::run::u64 fsz = (clio::run::u64)st.st_size;
+  const clio::run::u64 fsz = (clio::run::u64)fsize;
   ref.base = ctx.range_off;
   if (ref.base > fsz) {
-    ::close(ref.fd);
+    RefClose(ref.fd);
     return -12;
   }
   ref.size = ctx.range_size ? std::min<clio::run::u64>(ctx.range_size,
@@ -264,7 +297,7 @@ int Runtime::AssimilateByReference(const AssimilationCtx &ctx,
   {
     std::lock_guard<std::mutex> g(refs_mu_);
     if (refs_.find(*ref_id) != refs_.end()) {
-      ::close(ref.fd);  // same extent assimilated again: keep the first
+      RefClose(ref.fd);  // same extent assimilated again: keep the first
     } else {
       refs_[*ref_id] = std::move(ref);
     }
@@ -287,7 +320,7 @@ bool Runtime::DecodeRefDesc(const char *buf, size_t n, RefExtent *r) {
   }
   r->base = b; r->size = sz; r->page_size = ps;
   r->path = d.substr((size_t)used);
-  r->fd = ::open(r->path.c_str(), O_RDONLY | O_CLOEXEC);
+  r->fd = RefOpen(r->path);
   if (r->fd < 0) {
     HLOG(kError, "CAE reference: cannot open '{}' on this node: {}", r->path,
          std::strerror(errno));
@@ -341,6 +374,7 @@ int Runtime::ServeRefFault(const RefExtent &ref, const std::string &blob_name,
     if (bounce.size() < size) bounce.resize(size);
     io = bounce.data();
   }
+#ifdef CAE_REF_POSIX
   clio::run::u64 done = 0;
   while (done < n) {
     const ssize_t r = ::pread(ref.fd, io + done, (size_t)(n - done),
@@ -354,6 +388,12 @@ int Runtime::ServeRefFault(const RefExtent &ref, const std::string &blob_name,
     if (r == 0) break;  // short file: tail reads as zero below
     done += (clio::run::u64)r;
   }
+#else
+  clio::run::u64 done = 0;
+  (void)n;
+  (void)done;
+  return 38;  // ENOSYS: by-reference reads need POSIX pread
+#endif
   if (done < size) std::memset(io + done, 0, (size_t)(size - done));
   {
     // CLIO_CAE_REF_TRACE=N: log the first N faults served by this process.
@@ -364,7 +404,9 @@ int Runtime::ServeRefFault(const RefExtent &ref, const std::string &blob_name,
     static std::atomic<long> traced{0};
     if (kTrace > 0 && traced.fetch_add(1) < kTrace) {
       char host[64] = {0};
+#ifdef CAE_REF_POSIX
       ::gethostname(host, sizeof(host) - 1);
+#endif
       float v[4] = {0, 0, 0, 0};
       std::memcpy(v, io, std::min<size_t>(sizeof(v), (size_t)size));
       HLOG(kInfo,
@@ -476,7 +518,7 @@ clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task)
       if (it == refs_.end()) {
         it = refs_.emplace(ref_key, std::move(loaded)).first;
       } else {
-        ::close(loaded.fd);  // a concurrent fault loaded it first
+        RefClose(loaded.fd);  // a concurrent fault loaded it first
       }
     }
     // MATERIALISE request: CTE sends a size-0, null-buffer fault before a
