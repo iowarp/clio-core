@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <climits>
 #include <condition_variable>
@@ -194,6 +195,40 @@ std::string StripProto(const std::string &url) {
   p = url.find("::");
   if (p != std::string::npos) return url.substr(p + 2);
   return url;
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Ingest on fault: stage counters (CLIO_CAE_FAULT_STATS=1 logs them every 5 s)
+// ---------------------------------------------------------------------------
+namespace {
+struct FaultStats {
+  std::atomic<long long> entered{0}, read_done{0}, stored{0}, store_fail{0},
+      done{0}, alloc_fail{0}, read_fail{0};
+};
+FaultStats &FStats() {
+  static FaultStats *s = new FaultStats();
+  return *s;
+}
+void MaybeLogFaultStats() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_CAE_FAULT_STATS");
+    return e != nullptr && *e == '1';
+  }();
+  if (!on) return;
+  static std::atomic<long long> last{0};
+  const long long now = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+  long long prev = last.load();
+  if (now - prev < 5 || !last.compare_exchange_strong(prev, now)) return;
+  FaultStats &f = FStats();
+  HLOG(kInfo,
+       "CAE_FAULT_STATS entered={} read_done={} stored={} store_fail={} "
+       "done={} inflight={} alloc_fail={} read_fail={}",
+       f.entered.load(), f.read_done.load(), f.stored.load(),
+       f.store_fail.load(), f.done.load(), f.entered.load() - f.done.load(),
+       f.alloc_fail.load(), f.read_fail.load());
 }
 }  // namespace
 
@@ -386,8 +421,12 @@ clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task)
       of = ins.first->second;  // a concurrent fault may have won
     }
     const clio::run::u64 cap = of->blob_bytes;
+    FStats().entered++;
+    MaybeLogFaultStats();
     auto stage = CLIO_IPC->AllocateBuffer(cap);
     if (stage.IsNull()) {
+      FStats().alloc_fail++;
+      FStats().done++;
       task->SetReturnCode(4);
       CLIO_CO_RETURN;
     }
@@ -406,7 +445,10 @@ clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task)
       }
     }
     const long long n = st->load();
+    FStats().read_done++;
     if (n < 0) {
+      FStats().read_fail++;
+      FStats().done++;
       HLOG(kError, "CAE on_fault: ingest of {} from '{}' failed ({})",
            task->GetBlobName(), of->ctx.src, n);
       CLIO_IPC->FreeBuffer(stage);
@@ -417,8 +459,55 @@ clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task)
     if (static_cast<clio::run::u64>(n) < cap) {
       std::memset(stage.ptr_ + n, 0, cap - static_cast<clio::run::u64>(n));
     }
-    bool store = n > 0;
-    if (store && of->skip_stores.load(std::memory_order_relaxed) > 0) {
+    // CLIO_CAE_FAULT_STORE=0: never store (pure read-through on fault).
+    static const bool kStore = [] {
+      const char *e = std::getenv("CLIO_CAE_FAULT_STORE");
+      return !(e != nullptr && *e == '0');
+    }();
+    // Never take the last of the tier (see tier_free_): keep this much free
+    // for everything that is NOT re-ingestable. CLIO_CAE_FAULT_RESERVE_MB.
+    static const long long kReserve = [] {
+      const char *e = std::getenv("CLIO_CAE_FAULT_RESERVE_MB");
+      return ((e != nullptr && *e) ? std::atoll(e) : 512LL) << 20;
+    }();
+    // A size-0 "materialise" fault precedes a PARTIAL WRITE: storing the blob
+    // IS the write path there, so it always stores (no headroom, no skip).
+    const bool materialise = task->size_ == 0 || task->blob_data_.IsNull();
+    bool store = n > 0 && (kStore || materialise);
+    if (store && !materialise) {
+      // Refresh the free-space reading at most every 250 ms, one refresher
+      // at a time; everyone else uses (and debits) the cached value.
+      const long long now_ns = (long long)std::chrono::duration_cast<
+          std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (now_ns - tier_free_at_ns_.load() > 250LL * 1000 * 1000 &&
+          !tier_refreshing_.exchange(true)) {
+        auto lt = cte_client_->AsyncListTargets(clio::run::PoolQuery::Local());
+        CLIO_CO_AWAIT(lt);
+        long long free_b = 0;
+        if (lt->GetReturnCode() == 0) {
+          for (size_t ti = 0; ti < lt->target_names_.size(); ++ti) {
+            auto gi = cte_client_->AsyncGetTargetInfo(
+                lt->target_names_[ti], clio::run::PoolQuery::Local());
+            CLIO_CO_AWAIT(gi);
+            if (gi->GetReturnCode() == 0) {
+              free_b += (long long)gi->remaining_space_;
+            }
+          }
+          tier_free_.store(free_b);
+        }
+        tier_free_at_ns_.store(now_ns);
+        tier_refreshing_.store(false);
+      }
+      const long long free_now = tier_free_.load();
+      if (free_now >= 0 && free_now - (long long)cap < kReserve) {
+        store = false;  // keep the headroom: serve from the source only
+      } else if (free_now >= 0) {
+        tier_free_.fetch_sub((long long)cap);
+      }
+    }
+    if (store && !materialise &&
+        of->skip_stores.load(std::memory_order_relaxed) > 0) {
       of->skip_stores.fetch_sub(1, std::memory_order_relaxed);
       store = false;  // tier recently full: serve from the source only
     }
@@ -434,7 +523,9 @@ clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task)
                                            -1.0f, pctx);
       CLIO_CO_AWAIT(put);
       const clio::run::u32 prc = put->GetReturnCode();
+      if (prc == 0) FStats().stored++;
       if (prc != 0) {
+        FStats().store_fail++;
         // A failed put can leave a partial blob behind; a later read would
         // find it and never fault. Drop it so the next read ingests again.
         auto del = cte_client_->AsyncDelBlob(task->tag_id_,
@@ -466,6 +557,8 @@ clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task)
       }
     }
     CLIO_IPC->FreeBuffer(stage);
+    FStats().done++;
+    MaybeLogFaultStats();
     task->SetReturnCode(0);
     CLIO_CO_RETURN;
   }

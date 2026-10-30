@@ -290,6 +290,15 @@ class Runtime : public clio::run::Container {
   static std::string EncodeCtx(const AssimilationCtx &ctx);
   static bool DecodeCtx(const char *buf, size_t n, AssimilationCtx *ctx);
   std::shared_ptr<OnFault> MakeOnFault(const AssimilationCtx &ctx);
+
+  /** HEADROOM. Ingested-on-fault blobs can always be re-ingested from their
+   *  source, so they must never take the last of a tier: when they did, the
+   *  application's own writes (e.g. a cross-node collective) found no space
+   *  and the job deadlocked. Free space across this node's CTE targets, as
+   *  last measured and debited by our own stores since. */
+  std::atomic<long long> tier_free_{-1};
+  std::atomic<long long> tier_free_at_ns_{0};
+  std::atomic<bool> tier_refreshing_{false};
 #ifdef CLIO_ENABLE_S3_REST
   /// Keep-alive S3 connections leased by the s3:// assimilator, one lease per
   /// object for its whole lifetime (safe across worker migration). Long-lived

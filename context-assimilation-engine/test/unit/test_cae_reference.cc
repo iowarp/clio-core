@@ -62,6 +62,8 @@ void EnsureRuntime() {
   fs::path config_path =
       fs::path(__FILE__).parent_path() / "test_cae_reference_config.yaml";
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
+  // The test tier is 32 MB: keep a reserve that fits it (default 512 MB).
+  ctp::SystemInfo::Setenv("CLIO_CAE_FAULT_RESERVE_MB", "8", 1);
   REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
   SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
   std::this_thread::sleep_for(1s);
@@ -291,6 +293,64 @@ TEST_CASE("on_fault: a missing source fails the read that faults",
   REQUIRE(AssimilateRef("/nonexistent/cae_ref_missing.bin", "ref_missing") == 0);
   // ... and the first fault reports the missing source.
   REQUIRE(GetPage(TagOf("ref_missing"), "0", 0, 64).rc != 0);
+}
+
+TEST_CASE("on_fault: ingestion never takes the tier's last space",
+          "[cae][reference][onfault][headroom]") {
+  // A 40 MB source through a 32 MB tier with an 8 MB reserve: reads must
+  // keep working, the ingested blobs must stop short of the reserve, and an
+  // unrelated (non-re-ingestable) write must still find space. Before the
+  // headroom rule, ingestion filled the tier and a 16-node job deadlocked on
+  // its own collective's put.
+  EnsureRuntime();
+  constexpr clio::run::u64 kBig = 40ull << 20, kChunk = 64ull << 10;
+  const fs::path big = fs::temp_directory_path() /
+      ("cae_ref_big_" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+  {
+    std::ofstream out(big, std::ios::binary);
+    std::vector<char> buf(kChunk);
+    for (clio::run::u64 o = 0; o < kBig; o += kChunk) {
+      for (clio::run::u64 i = 0; i < kChunk; ++i) buf[i] = (char)Pattern(o + i);
+      out.write(buf.data(), (std::streamsize)kChunk);
+    }
+  }
+  clio::cae::core::Client cae(clio::cae::core::kCaePoolId);
+  std::vector<AssimilationCtx> ctxs(1);
+  ctxs[0].src = "file::" + big.string();
+  ctxs[0].dst = "iowarp::ref_headroom";
+  ctxs[0].format = "binary";
+  ctxs[0].on_fault = true;
+  ctxs[0].chunk_size = kChunk;
+  ctxs[0].blob_prefix = "";
+  auto f = cae.AsyncParseOmni(ctxs);
+  f.Wait();
+  REQUIRE(f->GetReturnCode() == 0);
+  REQUIRE(f->result_code_ == 0);
+  const auto tag = TagOf("ref_headroom");
+
+  for (clio::run::u64 pg = 0; pg < kBig / kChunk; ++pg) {
+    Read r = GetPage(tag, std::to_string(pg), 0, kChunk);
+    REQUIRE(r.rc == 0);
+    REQUIRE(r.data[0] == Pattern(pg * kChunk));
+    REQUIRE(r.data[kChunk - 1] == Pattern(pg * kChunk + kChunk - 1));
+  }
+  auto sz = CLIO_CTE_CLIENT->AsyncGetTagSize(tag);
+  sz.Wait();
+  REQUIRE(sz->tag_size_ > 0);              // it did ingest ...
+  REQUIRE(sz->tag_size_ <= (24ull << 20));  // ... but kept the 8 MB reserve
+
+  // The space it left is usable by everyone else.
+  const auto other = TagOf("ref_headroom_other");
+  auto buf = CLIO_IPC->AllocateBuffer(1ull << 20);
+  REQUIRE(!buf.IsNull());
+  std::memset(buf.ptr_, 0x33, 1ull << 20);
+  auto put = CLIO_CTE_CLIENT->AsyncPutBlob(other, "collective", 0, 1ull << 20,
+                                           buf.shm_.template Cast<void>(),
+                                           1.0f);
+  put.Wait();
+  REQUIRE(put->GetReturnCode() == 0);
+  fs::remove(big);
 }
 
 SIMPLE_TEST_MAIN()
