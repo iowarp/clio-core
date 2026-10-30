@@ -79,22 +79,13 @@ class Runtime : public clio::cte::core::CoreInterposer {
       clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
   clio::run::TaskResume PodMultiGetBlob(
       clio::run::shared_ptr<clio::cte::core::PodMultiGetBlobTask> &task);
-  clio::run::TaskResume EnrollTag(clio::run::shared_ptr<TagCacheTask> &task);
-  clio::run::TaskResume InvalidateTag(clio::run::shared_ptr<TagCacheTask> &task);
-  clio::run::TaskResume ForgetTag(clio::run::shared_ptr<TagCacheTask> &task);
-  // ---- Tag metadata cache (write-through) ----
+  // ---- Tag metadata, write-through to every node's core ----
   clio::run::TaskResume GetOrCreateTag(
       clio::run::shared_ptr<
           clio::cte::core::GetOrCreateTagTask<clio::cte::core::CreateParams>>
           &task);
   clio::run::TaskResume DelTag(
       clio::run::shared_ptr<clio::cte::core::DelTagTask> &task);
-  clio::run::TaskResume RenameTag(
-      clio::run::shared_ptr<clio::cte::core::RenameTagTask> &task);
-  clio::run::TaskResume TagCachePut(
-      clio::run::shared_ptr<TagCacheUpdateTask> &task);
-  clio::run::TaskResume TagCacheDrop(
-      clio::run::shared_ptr<TagCacheUpdateTask> &task);
 
   // ---- Container virtuals (defined in autogen/cache_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
@@ -165,37 +156,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /** Lazily bind a direct core client for node-LOCAL copy access. */
   clio::cte::core::Client *GetLocalClient();
 
-  // ---- Tag-scoped caching (pager path) ----
-  /** Per enrolled tag: the pages this node holds a cache copy of, so a tag
-   *  invalidation can release them without scanning the core. */
-  struct TagCache {
-    std::unordered_set<std::string> cached;
-    clio::run::u64 hits = 0, misses = 0, populated = 0;
-  };
-  static clio::run::u64 TagKey(const TagId &t) {
-    return (static_cast<clio::run::u64>(t.major_) << 32) | t.minor_;
-  }
-  bool TagEnrolled(const TagId &tag_id, bool auto_enroll);
-  clio::run::TaskResume DropTagCopies(const TagId &tag_id,
-                                      clio::run::u64 &dropped);
-  std::mutex tags_mu_;
-  std::unordered_map<clio::run::u64, TagCache> tags_;
-
-  /** Tag metadata cache: every name of a tag -> its id, and id -> names so a
-   *  delete/rename drops all of them. Static metadata only: a tag's byte
-   *  size changes on every page write and is NOT cached. */
-  std::mutex tmeta_mu_;
-  std::unordered_map<std::string, TagId> tmeta_by_name_;
-  std::unordered_map<clio::run::u64, std::unordered_set<std::string>>
-      tmeta_names_;
-  bool TagMetaLookup(const std::string &name, TagId *id);
-  void TagMetaInsert(const std::string &name, const TagId &id);
-  void TagMetaDrop(const TagId &id, const std::string &name);
-  /** Broadcast a put/drop to every node's cache and wait for all of them. */
-  clio::run::Future<TagCacheUpdateTask> SendTagMeta(
-      clio::run::u32 method, const std::string &name, const TagId &id,
-      const clio::run::PoolId &fault_pool_id,
-      const std::string &fault_pool_name, const std::string &fault_params);
+  /** Apply a tag write to EVERY core container (existing core verbs). */
+  clio::run::u32 NumCoreContainers();
 
   CacheConfig config_;
   std::unique_ptr<clio::cte::core::Client> next_client_;

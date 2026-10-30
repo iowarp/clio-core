@@ -30,16 +30,10 @@ namespace clio::cte::cache {
   X(kGetBlobSize, clio::cte::core::GetBlobSizeTask, GetBlobSize) \
   X(kMultiPutBlob, clio::cte::core::MultiPutBlobTask, MultiPutBlob) \
   X(kPodMultiGetBlob, clio::cte::core::PodMultiGetBlobTask, PodMultiGetBlob) \
-  X(kEnrollTag, TagCacheTask, EnrollTag)           \
-  X(kInvalidateTag, TagCacheTask, InvalidateTag)   \
-  X(kForgetTag, TagCacheTask, ForgetTag)           \
   X(kGetOrCreateTag,                                 \
     clio::cte::core::GetOrCreateTagTask<clio::cte::core::CreateParams>, \
     GetOrCreateTag)                                  \
-  X(kDelTag, clio::cte::core::DelTagTask, DelTag)    \
-  X(kRenameTag, clio::cte::core::RenameTagTask, RenameTag) \
-  X(kTagCachePut, TagCacheUpdateTask, TagCachePut)   \
-  X(kTagCacheDrop, TagCacheUpdateTask, TagCacheDrop)
+  X(kDelTag, clio::cte::core::DelTagTask, DelTag)
 
 void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
                    clio::run::u32 container_id) {
