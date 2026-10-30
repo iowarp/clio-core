@@ -146,12 +146,14 @@ def heartbeats_during(fn) -> tuple:
     return beats, time.monotonic() - t0, err
 
 
-def resume_later(pid: int, delay: float) -> None:
+def resume_later(pid: int, delay: float) -> subprocess.Popen:
     """Resume a suspended pid from ANOTHER process: a Python thread here
-    would need the very GIL a non-releasing binding holds."""
-    subprocess.Popen([sys.executable, "-c",
-                      "import time, psutil; time.sleep(%f); "
-                      "psutil.Process(%d).resume()" % (delay, pid)])
+    would need the very GIL a non-releasing binding holds. The caller must
+    wait() for the returned resumer before suspending pid again, or the
+    pending resume thaws the daemon under the next check."""
+    return subprocess.Popen([sys.executable, "-c",
+                             "import time, psutil; time.sleep(%f); "
+                             "psutil.Process(%d).resume()" % (delay, pid)])
 
 
 def suspend(proc, timeout: float = 5.0) -> None:
@@ -253,8 +255,10 @@ def main() -> int:
         }
         for name, fn in blocking.items():
             suspend(proc)
-            resume_later(proc.pid, SUSPEND_SEC)
+            resumer = resume_later(proc.pid, SUSPEND_SEC)
             beats, el, err = heartbeats_during(fn)
+            # A call that returned early leaves its resume pending.
+            resumer.wait()
             # A call served from the client's SHM cache never reaches the
             # frozen daemon and returns at once -- also fine.
             check(not err and (beats >= MIN_HEARTBEATS

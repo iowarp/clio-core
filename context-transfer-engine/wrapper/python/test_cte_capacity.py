@@ -370,12 +370,35 @@ def fill_and_overwrite(
     )
 
 
+def suspend_and_settle(process: Any, timeout: float = 5.0) -> None:
+    """Suspend process and wait until every thread is stopped. SIGSTOP lands
+    asynchronously: a worker polling shared memory on another core can still
+    serve a request submitted right after suspend() returns."""
+    process.suspend()
+    task_dir = Path(f"/proc/{process.pid}/task")
+    if not task_dir.is_dir():
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            states = [
+                (task / "stat").read_text().rsplit(")", 1)[1].split()[0]
+                for task in task_dir.iterdir()
+            ]
+        except OSError:  # a thread exited mid-scan
+            continue
+        if all(state in "tT" for state in states):
+            return
+        time.sleep(0.001)
+    raise TimeoutError(f"Daemon {process.pid} did not stop within {timeout}s")
+
+
 def bounded_gil_check(
     client: Any, args: argparse.Namespace, executable: Path
 ) -> dict[str, Any]:
     """Freeze only the owned daemon and verify deadlines plus Python heartbeats."""
     process = owned_process(args.daemon_pid, args.daemon_created, executable)
-    process.suspend()
+    suspend_and_settle(process)
     errors: list[BaseException] = []
     done = threading.Event()
     waiting = threading.Event()
