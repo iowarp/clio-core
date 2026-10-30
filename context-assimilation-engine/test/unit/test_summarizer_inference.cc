@@ -29,6 +29,8 @@
 #include <vector>
 
 using clio::cae::summarizer::GenerateSummary;
+using clio::cae::summarizer::InferenceTarget;
+using clio::cae::summarizer::LabelApi;
 using clio::cae::summarizer::LabelMatch;
 using clio_cae_test::OneShotHttpServer;
 
@@ -123,6 +125,26 @@ TEST_CASE("GenerateSummary - an unreachable endpoint yields no summary",
   std::string out = GenerateSummary("http://127.0.0.1:1", MakeRule(4096),
                                     kPrompt, "doc", "t", "b");
   REQUIRE(out.empty());
+}
+
+
+TEST_CASE("GenerateSummary - an OpenAI target chunks through chat/completions",
+          "[summarizer][inference]") {
+  OneShotHttpServer stub(
+      "HTTP/1.1 200 OK\r\n",
+      "{\"choices\":[{\"message\":{\"role\":\"assistant\","
+      "\"content\":\"hosted\"}}]}");
+  InferenceTarget target;
+  target.endpoint_ = stub.Endpoint();
+  target.api_ = LabelApi::kOpenAI;
+  // ctx 1 => the 256-byte sanity floor => 1000 bytes splits into 4 chunks.
+  std::string payload(1000, 'x');
+  std::string out =
+      GenerateSummary(target, MakeRule(1), kPrompt, payload, "t", "b");
+  stub.Stop();
+  REQUIRE(stub.RequestCount() == 4);
+  REQUIRE(out == "hosted\n\nhosted\n\nhosted\n\nhosted");
+  REQUIRE(stub.RequestHeads()[0].rfind("POST /chat/completions ", 0) == 0);
 }
 
 SIMPLE_TEST_MAIN()

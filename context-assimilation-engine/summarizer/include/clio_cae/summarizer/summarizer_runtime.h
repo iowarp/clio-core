@@ -43,6 +43,7 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_interposer.h>
 #include <clio_cae/summarizer/summarizer_client.h>
+#include <clio_cae/summarizer/label_client.h>
 #include <clio_cae/summarizer/summarizer_tasks.h>
 
 namespace clio::cae::summarizer {
@@ -147,6 +148,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::cte::core::Client *GetNextClient();
 
   SummarizerConfig config_;
+  // Resolved from config_ in Create: endpoint, protocol, token source.
+  InferenceTarget target_;
   std::unique_ptr<clio::cte::core::Client> next_client_;
 
   // tag_id → tag_name memo for rule matching. Read and written from PutBlob

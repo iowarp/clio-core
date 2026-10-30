@@ -50,6 +50,95 @@ bool OllamaGenerate(const std::string &endpoint_base,
                     int num_predict,
                     std::string &out_response);
 
+/**
+ * Synchronously call an OpenAI-compatible /chat/completions endpoint and
+ * return the first choice's message content.
+ *
+ * This is the protocol hosted inference services speak -- e.g. the ALCF
+ * Inference Endpoints (Metis, Sophia) behind
+ * https://inference-api.alcf.anl.gov/resource_server/<cluster>/.../v1.
+ *
+ * @param endpoint_base   Base URL up to and including the API version, e.g.
+ *                        ".../resource_server/metis/api/v1". The
+ *                        "/chat/completions" path is appended internally.
+ * @param api_key         Bearer token sent as `Authorization: Bearer ...`.
+ *                        Empty sends no Authorization header (a local vLLM
+ *                        or llama.cpp server typically needs none).
+ * @param model           Model id exactly as the server lists it (e.g.
+ *                        "Mistral-Large-3-675B-Instruct-2512").
+ * @param prompt          Full prompt text, sent as a single user message.
+ * @param num_predict     Hard cap on response tokens, sent as `max_tokens`.
+ *                        0 omits it and lets the server decide.
+ * @param out_response    Filled with choices[0].message.content on success;
+ *                        cleared on failure.
+ * @return true on HTTP 200 with a parseable body, false on any transport,
+ *         server, or parse error (logged at kWarning, never thrown).
+ */
+bool OpenAIChatComplete(const std::string &endpoint_base,
+                        const std::string &api_key,
+                        const std::string &model,
+                        const std::string &prompt,
+                        int num_predict,
+                        std::string &out_response);
+
+/** Wire protocol a summarizer pool uses to reach its inference server. */
+enum class LabelApi {
+  kOllama,  /**< POST {endpoint}/api/generate (default) */
+  kOpenAI,  /**< POST {endpoint}/chat/completions with a bearer token */
+};
+
+/**
+ * Map the compose `label_api` string onto a LabelApi.
+ *
+ * @param name "ollama" or "openai" (case-insensitive). Empty means ollama.
+ * @param out  Set to the parsed protocol on success; untouched otherwise.
+ * @return false for any other spelling, so a typo is reported rather than
+ *         silently falling back to Ollama.
+ */
+bool ParseLabelApi(const std::string &name, LabelApi &out);
+
+/**
+ * Where and how one summarizer pool reaches its model.
+ *
+ * The bearer token is never stored in the compose YAML: it is resolved per
+ * request from a file or environment variable, so a token refreshed on disk
+ * (ALCF access tokens expire after 48 h) is picked up without a restart.
+ */
+struct InferenceTarget {
+  std::string endpoint_;      /**< Base URL of the inference server */
+  LabelApi api_ = LabelApi::kOllama;  /**< Wire protocol */
+  std::string api_key_file_;  /**< Token file; ${VAR} is expanded */
+  std::string api_key_env_;   /**< Env var holding the token */
+};
+
+/**
+ * Resolve the bearer token for a target.
+ *
+ * `api_key_file_` wins when set and readable; otherwise `api_key_env_` is
+ * consulted. Surrounding whitespace (a trailing newline from `echo` or the
+ * ALCF token script) is stripped.
+ *
+ * @param target The inference target.
+ * @return The token, or "" when neither source yields one.
+ */
+std::string ResolveApiKey(const InferenceTarget &target);
+
+/**
+ * Run one prompt against a target using its configured protocol.
+ *
+ * @param target         Endpoint, protocol, and token source.
+ * @param model          Model name / id.
+ * @param prompt         Full prompt text.
+ * @param context_length Ollama `num_ctx`; ignored by the OpenAI protocol,
+ *                       whose servers fix the context window per model.
+ * @param num_predict    Response token cap (0 = server default).
+ * @param out_response   Model output on success; cleared on failure.
+ * @return true on success, false on any error (logged, never thrown).
+ */
+bool LabelGenerate(const InferenceTarget &target, const std::string &model,
+                   const std::string &prompt, int context_length,
+                   int num_predict, std::string &out_response);
+
 namespace detail {
 
 /**

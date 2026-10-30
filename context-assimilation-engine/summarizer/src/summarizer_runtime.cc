@@ -57,11 +57,31 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // CoreInterposer forwards everything we don't handle to this pool.
   interposer_next_pool_ = config_.next_pool_id_;
   next_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
+  // A misspelled protocol must fail loudly, not quietly fall back to Ollama
+  // and turn every label into an HTTP 404 against a hosted endpoint.
+  if (!ParseLabelApi(config_.label_api_, target_.api_)) {
+    HLOG(kError,
+         "Summarizer pool {}: unknown label_api '{}' (expected ollama|openai)",
+         pool_name_, config_.label_api_);
+    task->SetReturnCode(1);
+    CLIO_CO_RETURN;
+  }
+  target_.endpoint_ = config_.label_endpoint_;
+  target_.api_key_file_ = config_.label_api_key_file_;
+  target_.api_key_env_ = config_.label_api_key_env_;
   HLOG(kInfo,
        "Summarizer container created for pool: {} (ID: {}), next_pool_id={}, "
-       "label_matches={}, label_endpoint='{}'",
+       "label_matches={}, label_endpoint='{}', label_api='{}'",
        pool_name_, pool_id_, CorePoolId(), config_.label_matches_.size(),
-       config_.label_endpoint_);
+       config_.label_endpoint_,
+       target_.api_ == LabelApi::kOpenAI ? "openai" : "ollama");
+  if (target_.api_ == LabelApi::kOpenAI && ResolveApiKey(target_).empty()) {
+    HLOG(kWarning,
+         "Summarizer pool {}: label_api is openai but no token was found "
+         "(label_api_key_file='{}', label_api_key_env='{}'); requests will "
+         "be sent without Authorization",
+         pool_name_, config_.label_api_key_file_, config_.label_api_key_env_);
+  }
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -219,7 +239,7 @@ clio::run::TaskResume Runtime::PutBlob(
 
     // 5. Inference, then store. Both failures are logged, never propagated.
     std::string summary =
-        GenerateSummary(config_.label_endpoint_, *rule, pit->second, payload,
+        GenerateSummary(target_, *rule, pit->second, payload,
                         tag_name, blob_name);
     if (summary.empty()) {
       HLOG(kWarning,

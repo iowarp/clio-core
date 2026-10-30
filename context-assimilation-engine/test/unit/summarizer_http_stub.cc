@@ -113,6 +113,14 @@ std::string BodyOf(const std::string &request) {
   return request.substr(hdr_end + 4);
 }
 
+/**
+ * @param request A complete HTTP request.
+ * @return The request line and headers (everything before the terminator).
+ */
+std::string HeadOf(const std::string &request) {
+  return request.substr(0, request.find("\r\n\r\n"));
+}
+
 }  // namespace
 
 struct OneShotHttpServer::Impl {
@@ -122,6 +130,7 @@ struct OneShotHttpServer::Impl {
   std::atomic<size_t> requests_{0};
   mutable std::mutex requests_mu_;
   std::vector<std::string> request_bodies_;
+  std::vector<std::string> request_heads_;
   std::thread server_;
 };
 
@@ -173,13 +182,17 @@ OneShotHttpServer::OneShotHttpServer(const std::string &status_line,
           break;
         }
       }
-      (void)::send(conn, response.data(), static_cast<int>(response.size()), 0);
-      CloseSocket(conn);
+      // Record BEFORE replying: the client returns as soon as it has the
+      // response, and a test asserting RequestCount()/RequestBodies() right
+      // after the call must already see this request.
       {
         std::lock_guard<std::mutex> lock(impl->requests_mu_);
         impl->request_bodies_.push_back(BodyOf(request));
+        impl->request_heads_.push_back(HeadOf(request));
       }
       impl->requests_.fetch_add(1);
+      (void)::send(conn, response.data(), static_cast<int>(response.size()), 0);
+      CloseSocket(conn);
     }
   });
 }
@@ -210,6 +223,11 @@ size_t OneShotHttpServer::RequestCount() const {
 std::vector<std::string> OneShotHttpServer::RequestBodies() const {
   std::lock_guard<std::mutex> lock(impl_->requests_mu_);
   return impl_->request_bodies_;
+}
+
+std::vector<std::string> OneShotHttpServer::RequestHeads() const {
+  std::lock_guard<std::mutex> lock(impl_->requests_mu_);
+  return impl_->request_heads_;
 }
 
 }  // namespace clio_cae_test
