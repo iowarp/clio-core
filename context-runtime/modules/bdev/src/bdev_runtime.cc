@@ -24,6 +24,7 @@ extern "C" void clio_direct_dev_base_register(unsigned long long pool_id,
 extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id);
 #include <clio_runtime/bdev/bdev_runtime.h>
 #include <clio_runtime/bdev/blocking_offload.h>
+#include <clio_runtime/bdev/prediction_parse.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_runtime/comutex.h>
 #include <clio_ctp/util/gpu_api.h>
@@ -1063,34 +1064,14 @@ void Runtime::PollPredictionServer() {
       const std::string pred_json =
           ctp::SystemInfo::PredictDriveFailure(drive_type, health_json, pool_name_);
 
-      // Parse days_remaining out of the JSON string.  We use a lightweight
-      // hand-rolled search to avoid pulling in a full JSON library here.
-      //  • "days_remaining": 42   → 42
-      //  • "days_remaining": null → keep current value (healthy)
-      auto extract_days = [](const std::string &json) -> clio::run::u32 {
-        const std::string key = "\"days_remaining\"";
-        auto pos = json.find(key);
-        if (pos == std::string::npos) return 999999;
-        pos += key.size();
-        // Skip whitespace and colon
-        while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':')) ++pos;
-        // "null" means the server says the drive is healthy
-        if (json.size() >= pos + 4 && json.substr(pos, 4) == "null") return 999999;
-        // Parse integer
-        if (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos]))) {
-          clio::run::u32 days = 0;
-          while (pos < json.size() &&
-                 std::isdigit(static_cast<unsigned char>(json[pos]))) {
-            days = days * 10 + static_cast<clio::run::u32>(json[pos] - '0');
-            ++pos;
-          }
-          return days;
-        }
-        return 999999;  // Unparseable → treat as healthy
-      };
-
-      clio::run::u32 new_ttl = extract_days(pred_json);
-      predicted_ttl_days_.store(new_ttl, std::memory_order_relaxed);
+      // Only a response that actually carries "days_remaining" updates the
+      // TTL. An {"error": ...} reply (server unreachable) must retain the last
+      // known value -- otherwise it clobbers a lifespan injected via
+      // SetLifespan whenever this poll lands after it.
+      std::optional<clio::run::u32> new_ttl = ParseDaysRemaining(pred_json);
+      if (new_ttl.has_value()) {
+        predicted_ttl_days_.store(*new_ttl, std::memory_order_relaxed);
+      }
 
     } catch (...) {
       // If the prediction server is unreachable, silently retain the last
