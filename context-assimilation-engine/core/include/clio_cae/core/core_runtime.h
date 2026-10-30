@@ -37,7 +37,10 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cae/core/core_tasks.h>
 #include <clio_cae/core/factory/pagify.h>
+#include <clio_cae/core/factory/assimilation_ctx.h>
+#include <clio_cae/core/factory/base_assimilator.h>
 #include <clio_cae/core/core_client.h>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -258,35 +261,35 @@ class Runtime : public clio::run::Container {
   std::map<clio::cte::core::TagId, clio::cae::core::Pagify> page_maps_;
 
   /**
-   * By-reference assimilation (format "reference"): the bytes stay in the
-   * source object (a file, a dfuse-mounted DAOS container, ...). CAE only
-   * records the extent and registers itself as the destination tag's fault
-   * handler; a CTE miss on page N is served by reading the source directly
-   * into the requester's buffer. Nothing is copied into a CTE tier.
+   * Ingest on fault (AssimilationCtx::on_fault): ParseOmni ingests nothing,
+   * records the context, and registers the CAE as the destination tag's fault
+   * handler. A read of a blob the tag does not hold makes the source's own
+   * assimilator ingest exactly that blob (BaseAssimilator::ReadBlob); the
+   * blob is stored in the tag and serves the read.
+   *
+   * Key = fault_params id "fault:<16 hex>", a hash of the context, so it
+   * names the same source on EVERY node: a miss is handled by the CAE on the
+   * node the read landed on, which loads the context from the shared registry
+   * tag when it did not register it itself. Entries are never erased.
    */
-  struct RefExtent {
-    std::string path;
-    int fd = -1;
-    clio::run::u64 base = 0;       // byte offset of page 0 in the source
-    clio::run::u64 size = 0;       // bytes of the extent
-    clio::run::u64 page_size = 0;  // bytes per page
+  struct OnFault {
+    AssimilationCtx ctx;
+    std::shared_ptr<BaseAssimilator> assimilator;
+    clio::run::u64 blob_bytes = 0;
+    // The tag's tier is full: serve faults from the source without storing
+    // for the next `skip_stores` faults, then try again (space may free).
+    std::atomic<clio::run::u32> skip_stores{0};
+    std::atomic<bool> warned_full{false};
   };
-  // key = fault_params id "ref:<16 hex>", a hash of the extent itself, so
-  // it names the same extent on EVERY node. A CTE miss is handled by the CAE
-  // on the page's OWNER node, which is usually not the node that assimilated
-  // it; that CAE loads the descriptor from the shared registry tag
-  // (kRefRegistryTag) and opens the source itself. Entries are never erased
-  // (in-flight reads hold pointers), so std::map node stability suffices.
-  std::map<std::string, RefExtent> refs_;
-  std::mutex refs_mu_;
-  static constexpr const char *kRefRegistryTag = "__cae_ref_registry";
-  static constexpr clio::run::u64 kRefDescSize = 1024;
-  static std::string EncodeRefDesc(const RefExtent &r);
-  static bool DecodeRefDesc(const char *buf, size_t n, RefExtent *r);
-  int AssimilateByReference(const struct AssimilationCtx &ctx,
-                            std::string *ref_id, std::string *tag_name);
-  int ServeRefFault(const RefExtent &ref, const std::string &blob_name,
-                    clio::run::u64 offset, clio::run::u64 size, void *dst);
+  std::map<std::string, std::shared_ptr<OnFault>> on_fault_;
+  std::mutex on_fault_mu_;
+  static constexpr const char *kOnFaultRegistryTag = "__cae_on_fault";
+  static constexpr const char *kOnFaultPrefix = "fault:";
+  static constexpr clio::run::u64 kOnFaultDescBytes = 16384;
+  static std::string OnFaultId(const AssimilationCtx &ctx);
+  static std::string EncodeCtx(const AssimilationCtx &ctx);
+  static bool DecodeCtx(const char *buf, size_t n, AssimilationCtx *ctx);
+  std::shared_ptr<OnFault> MakeOnFault(const AssimilationCtx &ctx);
 #ifdef CLIO_ENABLE_S3_REST
   /// Keep-alive S3 connections leased by the s3:// assimilator, one lease per
   /// object for its whole lifetime (safe across worker migration). Long-lived

@@ -1282,7 +1282,7 @@ bool Runtime::IsNodeLocalRefTag(const TagId &tag_id) {
   std::shared_ptr<TagInfo> ti = tag_id_to_info_.get(tag_id);
   if (ti == nullptr || ti->fault_pool_id_.IsNull()) return false;
   const std::string p = ti->fault_params_.str();
-  return p.compare(0, 4, "ref:") == 0;
+  return p.compare(0, 6, "fault:") == 0;  // CAE ingest-on-fault tag
 }
 
 clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) {
@@ -1314,10 +1314,9 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       return clio::run::PoolQuery::DirectHash(hash_value);
     }
 
-    // Blob operations: hash blob name to container -- except on a
-    // BY-REFERENCE tag (CAE fault handler, fault_params "ref:..."): its
-    // source lives on shared storage that every node can read, so each node
-    // serves its own misses and keeps its own written pages. Routing those to
+    // Blob operations: hash blob name to container -- except on a CAE
+    // INGEST-ON-FAULT tag (fault_params "fault:..."): its source is readable
+    // from every node, so each node ingests and keeps the blobs it reads. Routing those to
     // a hashed owner only added a network hop per page (and a remote fault
     // round trip that returned wrong data at 2+ nodes).
     case Method::kPutBlob: {
@@ -1327,7 +1326,7 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
     }
     case Method::kGetBlob: {
       auto typed = task.template Cast<GetBlobTask>();
-      // By-reference tag: served on this node (see above).
+      // Ingest-on-fault tag: served on this node (see above).
       if (IsNodeLocalRefTag(typed->tag_id_)) return clio::run::PoolQuery::Local();
       clio::run::PoolQuery q =
           HashBlobToContainer(typed->tag_id_, typed->GetBlobName());
@@ -11857,8 +11856,8 @@ bool Runtime::ServesBlob(const BlobInfo &blob_info, const TagId &tag_id,
 
 clio::run::PoolQuery Runtime::HashBlobToContainer(const TagId &tag_id,
                                             const std::string &blob_name) {
-  // A CAE by-reference tag's source is on storage every node reads, so each
-  // node serves its own pages: no owner hop. Covers every Pod*/Multi* path
+  // A CAE ingest-on-fault tag's source is readable from every node, so each
+  // node ingests and serves its own blobs: no owner hop. Covers every Pod*/Multi* path
   // that routes by owner directly (they bypass ScheduleTask).
   if (IsNodeLocalRefTag(tag_id)) return clio::run::PoolQuery::Local();
   const clio::run::u32 hash_value = BlobHash(tag_id, blob_name);

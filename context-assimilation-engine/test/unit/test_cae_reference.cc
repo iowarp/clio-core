@@ -7,7 +7,7 @@
  */
 
 /**
- * CAE by-reference (zero-copy) assimilation.
+ * CAE ingest-on-fault assimilation (AssimilationCtx::on_fault).
  *
  * format "reference" maps a file into a CTE tag WITHOUT copying it: the CAE
  * records the extent and becomes the tag's fault handler, so a GetBlob on
@@ -24,7 +24,6 @@
 
 #include "simple_test.h"
 
-#include <unistd.h>
 
 #include <chrono>
 #include <cstdio>
@@ -69,7 +68,7 @@ void EnsureRuntime() {
   CLIO_CTE_CLIENT->Init(clio::cte::core::kCtePoolId);
 
   g_file = fs::temp_directory_path() /
-           ("cae_ref_" + std::to_string(::getpid()) + ".bin");
+           ("cae_ref_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
   std::ofstream out(g_file, std::ios::binary);
   std::vector<char> buf(kFileSize);
   for (clio::run::u64 i = 0; i < kFileSize; ++i) buf[i] = (char)Pattern(i);
@@ -86,10 +85,12 @@ clio::run::u32 AssimilateRef(const std::string &src, const std::string &tag,
   std::vector<AssimilationCtx> ctxs(1);
   ctxs[0].src = "file::" + src;
   ctxs[0].dst = "iowarp::" + tag;
-  ctxs[0].format = "reference";
+  ctxs[0].format = "binary";
   ctxs[0].range_off = off;
   ctxs[0].range_size = size;
-  ctxs[0].src_data = "page_size=" + std::to_string(kPage);
+  ctxs[0].on_fault = true;
+  ctxs[0].chunk_size = kPage;
+  ctxs[0].blob_prefix = "";
   auto f = cae.AsyncParseOmni(ctxs);
   f.Wait();
   return f->GetReturnCode() != 0 ? f->GetReturnCode() : f->result_code_;
@@ -172,17 +173,24 @@ TEST_CASE("reference: pages are read from the source file on a CTE miss",
   }
 }
 
-TEST_CASE("reference: assimilation stores nothing in the CTE",
-          "[cae][reference][zerocopy]") {
+TEST_CASE("on_fault: nothing is ingested until a blob faults",
+          "[cae][reference][onfault]") {
   EnsureRuntime();
   REQUIRE(AssimilateRef(g_file.string(), "ref_nocopy") == 0);
   const auto tag = TagOf("ref_nocopy");
-  // Fault a page in; the CAE writes into the caller's buffer only.
+  auto size_of = [&]() {
+    auto sz = CLIO_CTE_CLIENT->AsyncGetTagSize(tag);
+    sz.Wait();
+    REQUIRE(sz->GetReturnCode() == 0);
+    return sz->tag_size_;
+  };
+  REQUIRE(size_of() == 0);  // assimilation itself ingests nothing
   REQUIRE(GetPage(tag, "1", 0, kPage).rc == 0);
-  auto sz = CLIO_CTE_CLIENT->AsyncGetTagSize(tag);
-  sz.Wait();
-  REQUIRE(sz->GetReturnCode() == 0);
-  REQUIRE(sz->tag_size_ == 0);
+  REQUIRE(size_of() == kPage);  // the faulted blob was ingested ...
+  Read again = GetPage(tag, "1", 0, kPage);
+  REQUIRE(again.rc == 0);  // ... and serves the next read
+  REQUIRE(MatchesFile(again.data, kPage));
+  REQUIRE(size_of() == kPage);  // only the blob that faulted
 }
 
 TEST_CASE("reference: range_off/range_size select a window of the file",
@@ -276,10 +284,13 @@ TEST_CASE("reference: non-page blob names fail cleanly",
   REQUIRE(GetPage(tag, "1_pi3", 0, 64).rc != 0);
 }
 
-TEST_CASE("reference: a missing source file fails ParseOmni",
+TEST_CASE("on_fault: a missing source fails the read that faults",
           "[cae][reference][error]") {
   EnsureRuntime();
-  REQUIRE(AssimilateRef("/nonexistent/cae_ref_missing.bin", "ref_missing") != 0);
+  // Nothing is read at assimilation time, so the setup succeeds ...
+  REQUIRE(AssimilateRef("/nonexistent/cae_ref_missing.bin", "ref_missing") == 0);
+  // ... and the first fault reports the missing source.
+  REQUIRE(GetPage(TagOf("ref_missing"), "0", 0, 64).rc != 0);
 }
 
 SIMPLE_TEST_MAIN()

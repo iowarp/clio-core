@@ -69,6 +69,18 @@ struct AssimilationCtx {
   std::string src_data;
 
   // Dataset filtering (for HDF5 and other hierarchical formats)
+  // INGEST ON FAULT. false (default): ingest the whole source now. true:
+  // ingest nothing now -- the CAE becomes the destination tag's fault
+  // handler, and a read of a blob the tag does not hold yet makes the
+  // assimilator ingest exactly that blob, which then serves the read and stays
+  // in the tag like any eagerly ingested blob.
+  bool on_fault = false;
+  // Bytes per ingested blob (0 = the assimilator's default) and the blob-name
+  // prefix before the blob index ("" names blobs "0", "1", ... -- the page
+  // names a gpu_vector pager faults on).
+  size_t chunk_size = 0;
+  std::string blob_prefix = "chunk_";
+
   std::vector<std::string> include_patterns;  // Glob patterns for datasets to include
   std::vector<std::string> exclude_patterns;  // Glob patterns for datasets to exclude
 
@@ -98,7 +110,8 @@ struct AssimilationCtx {
   template<class Archive>
   void serialize(Archive& ar) {
     ar(src, dst, format, depends_on, range_off, range_size, src_token, dst_token,
-       include_patterns, exclude_patterns, src_data, s3_region, s3_profile);
+       include_patterns, exclude_patterns, src_data, s3_region, s3_profile,
+       on_fault, chunk_size, blob_prefix);
   }
 };
 
