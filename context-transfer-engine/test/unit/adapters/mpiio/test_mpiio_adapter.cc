@@ -216,6 +216,175 @@ TEST_CASE("MPI-IO Adapter: a failed write is reported at sync",
   REQUIRE(MPI_File_close(&fh) == MPI_SUCCESS);
 }
 
+namespace {
+/** Open a fresh clio:: file holding bytes 0, 1, 2, ... (mod 251). */
+MPI_File OpenPattern(const std::string& path, int nbytes) {
+  MPI_File_delete(path.c_str(), MPI_INFO_NULL);
+  MPI_File fh;
+  REQUIRE(MPI_File_open(MPI_COMM_SELF, path.c_str(),
+                        MPI_MODE_CREATE | MPI_MODE_RDWR, MPI_INFO_NULL,
+                        &fh) == MPI_SUCCESS);
+  std::vector<char> w(nbytes);
+  for (int i = 0; i < nbytes; ++i) w[i] = static_cast<char>(i % 251);
+  MPI_Status st;
+  REQUIRE(MPI_File_write_at(fh, 0, w.data(), nbytes, MPI_CHAR, &st) ==
+          MPI_SUCCESS);
+  REQUIRE(MPI_File_sync(fh) == MPI_SUCCESS);
+  return fh;
+}
+char Pattern(long off) { return static_cast<char>(off % 251); }
+}  // namespace
+
+TEST_CASE("MPI-IO Adapter: file metadata calls parallel HDF5 makes",
+          "[mpiio][adapter][hdf5]") {
+  REQUIRE(initializeRuntime());
+  // Before these were wrapped, each one handed the adapter's handle to the
+  // real MPI library, which crashed (H5Fopen calls MPI_File_get_info).
+  const std::string path = "clio::/tmp/clio_cte_mpiio_meta.dat";
+  MPI_File fh = OpenPattern(path, 4096);
+
+  MPI_Offset size = -1;
+  REQUIRE(MPI_File_get_size(fh, &size) == MPI_SUCCESS);
+  REQUIRE(size == 4096);
+  REQUIRE(MPI_File_set_size(fh, 1000) == MPI_SUCCESS);
+  REQUIRE(MPI_File_get_size(fh, &size) == MPI_SUCCESS);
+  REQUIRE(size == 1000);
+
+  MPI_Info info = MPI_INFO_NULL;
+  REQUIRE(MPI_File_get_info(fh, &info) == MPI_SUCCESS);
+  REQUIRE(info != MPI_INFO_NULL);
+  REQUIRE(MPI_File_set_info(fh, info) == MPI_SUCCESS);
+  MPI_Info_free(&info);
+
+  int amode = 0;
+  REQUIRE(MPI_File_get_amode(fh, &amode) == MPI_SUCCESS);
+  REQUIRE(amode == (MPI_MODE_CREATE | MPI_MODE_RDWR));
+
+  int flag = 0;
+  REQUIRE(MPI_File_set_atomicity(fh, 1) == MPI_SUCCESS);
+  REQUIRE(MPI_File_get_atomicity(fh, &flag) == MPI_SUCCESS);
+  REQUIRE(flag == 1);
+
+  REQUIRE(MPI_File_close(&fh) == MPI_SUCCESS);
+  REQUIRE(MPI_File_delete(path.c_str(), MPI_INFO_NULL) == MPI_SUCCESS);
+  REQUIRE(MPI_File_open(MPI_COMM_SELF, path.c_str(), MPI_MODE_RDONLY,
+                        MPI_INFO_NULL, &fh) != MPI_SUCCESS);
+}
+
+TEST_CASE("MPI-IO Adapter: non-contiguous file view",
+          "[mpiio][adapter][view]") {
+  REQUIRE(initializeRuntime());
+  const std::string path = "clio::/tmp/clio_cte_mpiio_view.dat";
+  MPI_File fh = OpenPattern(path, 1024);
+
+  // Tile: 4 blocks of 4 bytes every 16 bytes, tiled every 64 bytes,
+  // after an 8-byte displacement.
+  MPI_Datatype vec, tile;
+  MPI_Type_vector(4, 4, 16, MPI_BYTE, &vec);
+  MPI_Type_create_resized(vec, 0, 64, &tile);
+  MPI_Type_commit(&tile);
+  auto file_off = [](long pos) {  // data-stream byte -> file byte
+    return 8 + (pos / 16) * 64 + ((pos % 16) / 4) * 16 + pos % 4;
+  };
+
+  REQUIRE(MPI_File_set_view(fh, 8, MPI_BYTE, tile, "native", MPI_INFO_NULL) ==
+          MPI_SUCCESS);
+  SECTION("read across tiles, starting mid-block") {
+    std::vector<char> r(40);
+    MPI_Status st;
+    REQUIRE(MPI_File_read_at_all(fh, 3, r.data(), 40, MPI_CHAR, &st) ==
+            MPI_SUCCESS);
+    int count = -1;
+    MPI_Get_count(&st, MPI_CHAR, &count);
+    REQUIRE(count == 40);
+    for (int i = 0; i < 40; ++i) {
+      INFO("stream byte " << 3 + i);
+      REQUIRE(r[i] == Pattern(file_off(3 + i)));
+    }
+  }
+  SECTION("write through the view lands in the selected bytes only") {
+    std::vector<char> w(32, 'Z');
+    MPI_Status st;
+    REQUIRE(MPI_File_write_at(fh, 0, w.data(), 32, MPI_CHAR, &st) ==
+            MPI_SUCCESS);
+    REQUIRE(MPI_File_set_view(fh, 0, MPI_BYTE, MPI_BYTE, "native",
+                              MPI_INFO_NULL) == MPI_SUCCESS);
+    std::vector<char> r(200);
+    REQUIRE(MPI_File_read_at(fh, 0, r.data(), 200, MPI_CHAR, &st) ==
+            MPI_SUCCESS);
+    std::vector<bool> hit(200, false);
+    for (int i = 0; i < 32; ++i) hit[file_off(i)] = true;
+    for (int i = 0; i < 200; ++i) {
+      INFO("file byte " << i);
+      REQUIRE(r[i] == (hit[i] ? 'Z' : Pattern(i)));
+    }
+  }
+  SECTION("etype offsets count etypes, not bytes") {
+    REQUIRE(MPI_File_set_view(fh, 0, MPI_INT, MPI_INT, "native",
+                              MPI_INFO_NULL) == MPI_SUCCESS);
+    std::vector<char> r(8);
+    MPI_Status st;
+    REQUIRE(MPI_File_read_at(fh, 5, r.data(), 8, MPI_CHAR, &st) == MPI_SUCCESS);
+    for (int i = 0; i < 8; ++i) REQUIRE(r[i] == Pattern(20 + i));
+  }
+  SECTION("file-pointer ops refuse a non-default view") {
+    std::vector<char> r(4);
+    MPI_Status st;
+    REQUIRE(MPI_File_read(fh, r.data(), 4, MPI_CHAR, &st) != MPI_SUCCESS);
+  }
+  MPI_Type_free(&tile);
+  MPI_Type_free(&vec);
+  REQUIRE(MPI_File_close(&fh) == MPI_SUCCESS);
+}
+
+TEST_CASE("MPI-IO Adapter: derived memory datatype", "[mpiio][adapter][view]") {
+  REQUIRE(initializeRuntime());
+  const std::string path = "clio::/tmp/clio_cte_mpiio_memtype.dat";
+  MPI_File fh = OpenPattern(path, 256);
+
+  // Memory: 4 blocks of 4 bytes every 8 bytes; the gaps must be untouched.
+  MPI_Datatype mem;
+  MPI_Type_vector(4, 4, 8, MPI_BYTE, &mem);
+  MPI_Type_commit(&mem);
+  std::vector<char> r(32, '.');
+  MPI_Status st;
+  REQUIRE(MPI_File_read_at(fh, 100, r.data(), 1, mem, &st) == MPI_SUCCESS);
+  for (int i = 0; i < 28; ++i) {
+    INFO("memory byte " << i);
+    if (i % 8 < 4) {
+      REQUIRE(r[i] == Pattern(100 + (i / 8) * 4 + i % 8));
+    } else {
+      REQUIRE(r[i] == '.');
+    }
+  }
+  MPI_Type_free(&mem);
+  REQUIRE(MPI_File_close(&fh) == MPI_SUCCESS);
+}
+
+TEST_CASE("MPI-IO Adapter: an undecoded filetype is refused",
+          "[mpiio][adapter][view]") {
+  REQUIRE(initializeRuntime());
+  const std::string path = "clio::/tmp/clio_cte_mpiio_subarray.dat";
+  MPI_File fh = OpenPattern(path, 256);
+
+  // Subarray is not decoded: the view must be refused, not ignored, or reads
+  // would silently return the wrong bytes.
+  int sizes[1] = {16}, subsizes[1] = {4}, starts[1] = {2};
+  MPI_Datatype sub;
+  MPI_Type_create_subarray(1, sizes, subsizes, starts, MPI_ORDER_C, MPI_BYTE,
+                           &sub);
+  MPI_Type_commit(&sub);
+  REQUIRE(MPI_File_set_view(fh, 0, MPI_BYTE, sub, "native", MPI_INFO_NULL) !=
+          MPI_SUCCESS);
+  // The previous (default) view still applies.
+  char c = 0;
+  MPI_Status st;
+  REQUIRE(MPI_File_read_at(fh, 7, &c, 1, MPI_CHAR, &st) == MPI_SUCCESS);
+  REQUIRE(c == Pattern(7));
+  MPI_Type_free(&sub);
+  REQUIRE(MPI_File_close(&fh) == MPI_SUCCESS);
+}
+
 /*
  * Custom main: bracket Catch around MPI_Init/MPI_Finalize. With more
  * than one rank, this run is a smoke test only — the test cases above

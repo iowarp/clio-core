@@ -148,6 +148,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * after a foreign write (the CI-caught fragmented winner split).
    */
   bool IsBlobOwnerLocal(const TagId &tag_id, const std::string &blob_name);
+  /** Whether this node serves the blob for its dead owner (failover). */
+  bool IsStandingIn(const TagId &tag_id, const std::string &blob_name);
 
   /**
    * Best-effort population of THIS node's raw local copy from the blob's

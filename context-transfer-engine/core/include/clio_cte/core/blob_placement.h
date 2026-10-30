@@ -117,10 +117,35 @@ inline bool TargetNodeAlive(const TargetInfo &t) {
  * @param owner owner container
  * @return serving container
  */
+/**
+ * Whether this node sees fewer than half of the pool's containers alive:
+ * it is (probably) the cut-off side of a partition, and must neither stand
+ * in for dead owners nor answer authoritatively for what it owns while the
+ * majority may have a stand-in changing it.
+ * @param pool_id pool
+ * @return true on the minority side
+ */
+inline bool InMinority(clio::run::PoolId pool_id) {
+  const clio::run::u32 n = PoolContainers(pool_id);
+  if (n <= 1) return false;
+  clio::run::u32 alive = 0;
+  for (clio::run::u32 c = 0; c < n; ++c) {
+    if (ContainerNodeAlive(pool_id, c)) ++alive;
+  }
+  return alive * 2 < n;
+}
+
 inline clio::run::u32 FailoverContainer(clio::run::PoolId pool_id,
                                         clio::run::u32 owner) {
   const clio::run::u32 n = PoolContainers(pool_id);
   if (n <= 1 || ContainerNodeAlive(pool_id, owner)) return owner;
+  // Quorum: only a side that sees at least half the pool alive may stand in
+  // for dead owners. A node cut off by a partition sees every peer "dead";
+  // without this it named itself the stand-in and served its stale copies
+  // as authoritative (a file created on the other side read ENOENT). The
+  // minority keeps what it owns and fails the rest (EIO). alive*2 >= n, not
+  // a strict majority, so a 2-node cluster still survives losing one node.
+  if (InMinority(pool_id)) return owner;
   for (clio::run::u32 i = 1; i < n; ++i) {
     const clio::run::u32 c = (owner + i) % n;
     if (ContainerNodeAlive(pool_id, c)) return c;

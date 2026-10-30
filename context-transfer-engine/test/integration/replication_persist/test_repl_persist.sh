@@ -1,5 +1,15 @@
 #!/bin/bash
 # Replication persistence stress (issue #886): 50 CachedPuts (DRAM primary +
+# Remove this user's clio shared-memory files only. A bare
+# `rm -f /dev/shm/clio_*` under set -e aborted the test on nodes where
+# another user's job left a clio_* DIRECTORY there.
+clean_shm() {
+  local p
+  for p in /dev/shm/clio_*; do
+    [ -f "$p" ] && [ -O "$p" ] && rm -f "$p"
+  done
+  return 0
+}
 # disk replica), reboot the runtime, verify every disk replica survived and
 # the cache heals itself. Modeled on ../restart/test_restart.sh.
 set -e
@@ -58,13 +68,13 @@ stop_runtime() {
 cleanup() {
     stop_runtime
     sleep 1
-    rm -f /dev/shm/clio_*
+    clean_shm
     rm -rf "$CONF_DIR"
 }
 trap cleanup EXIT
 
 # Clean slate
-rm -f /dev/shm/clio_*
+clean_shm
 rm -rf "$CONF_DIR"
 mkdir -p "$CONF_DIR"
 
@@ -86,7 +96,7 @@ $BIN_DIR/test_repl_persist --put-blobs
 echo "Rebooting runtime..."
 stop_runtime
 sleep 1
-rm -f /dev/shm/clio_*   # volatile state dies with the machine
+clean_shm   # volatile state dies with the machine
 
 # === Phase 2: reboot runtime, verify disk replicas ===
 echo ""

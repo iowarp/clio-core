@@ -143,6 +143,12 @@ struct ReplicaProgress {
   // finished. The replica is declared lost only after kGoneStrikesToFail
   // answers, an interval apart.
   clio::run::u32 gone_strikes = 0;
+  // When this replica was dispatched. The dead-node scan times a replica out
+  // from the later of this and its node's death: measured from the death
+  // alone, every liveness re-probe sent to a long-dead node was failed on
+  // the next scan, before its answer could arrive -- a node held dead could
+  // never rejoin once revival needed an answered probe (dead-node-rejoin).
+  std::chrono::steady_clock::time_point sent_at{};
 };
 
 /** Gone answers, one probe interval apart, before a replica is declared lost. */

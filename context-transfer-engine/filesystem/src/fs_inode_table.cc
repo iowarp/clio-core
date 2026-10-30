@@ -32,7 +32,7 @@
  */
 
 /**
- * Directory blocks: homes, caches and the push protocol (see fs_dir_block.h
+ * Inode-table blocks: homes, caches and the push protocol (see fs_inode_table.h
  * for the layout).
  *
  * The CTE stores every block; clio-fs caches them. Each block has one HOME
@@ -82,14 +82,12 @@ constexpr double kLoadPollUs = 20.0;
 constexpr clio::run::u64 kIncarnationStride = 1ull << 32;
 /** A block load, wait or commit slower than this is reported (seconds). */
 constexpr double kSlowBlockOpS = 10.0;
-
-/** SetAttr flag bits shared with fs_namespace.cc (kShardDirAttr). */
-enum : clio::run::u32 {
-  kSetAtime = 1u, kSetMtime = 2u, kSetAtimeNow = 4u, kSetMtimeNow = 8u,
-  kSetUid = 16u, kSetGid = 32u, kSetMode = 64u, kAttrRepair = 128u,
-  kSetCtimeOnly = 256u, kAccessTouch = 512u,
-  kSetParent = 2048u,  // move: new parent id (req.b_) and name (req.leaf_)
-};
+/** How long a load keeps asking a block home that did not answer, waiting
+ *  for failover to name its stand-in (s): node death is declared within
+ *  ~10 s. Past it the load fails EIO. */
+constexpr int kHomeFailoverWaitS = 15;
+/** Pause between those attempts (us). */
+constexpr double kHomeFailoverPollUs = 250000.0;
 
 /** Encode a list of block indices. */
 std::string EncIndices(const std::vector<clio::run::u32> &v) {
@@ -130,28 +128,54 @@ clio::run::u32 Runtime::BlockHome(clio::run::u64 dir, clio::run::u32 k) {
   const clio::run::u32 n = NumContainers();
   if (n <= 1) return 0;
   const clio::run::u32 owner =
-      clio::cte::core::BlobHash(FsUnpack(dir), DirBlockName(k)) % n;
+      clio::cte::core::BlobHash(FsUnpack(dir), TableBlockName(k)) % n;
   return clio::cte::core::FailoverContainer(pool_id_, owner);
 }
 
 clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
-                                             clio::run::u32 k, DirBlock *out,
+                                             clio::run::u32 k, InodeTableBlock *out,
                                              int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
+  // Before the journal is replayed, "not in the journal" means nothing.
+  while (!dir_ready_.load(std::memory_order_acquire)) {
+    CLIO_CO_AWAIT(clio::run::yield(1000.0));
+  }
   if (dir_journal_) {
     rc = TakeJournaledBlock(dir, k, out);
-    const clio::run::u32 n = NumContainers();
-    if (rc == ENOENT && n > 1 &&
-        clio::cte::core::BlobHash(FsUnpack(dir), DirBlockName(k)) % n !=
-            container_id_) {
-      // Serving a dead home's block: it is in that node's own journal
-      // (#1263), not here. Not "no such directory", which would let a
-      // create or a repair replace it.
-      rc = EIO;
+    if (rc == ENOENT) {
+      // Nothing in this journal: either a stand-in for a dead home (the
+      // block is in that node's journal and in its replicated CTE mirror,
+      // #1263) or a block that does not exist. The CTE read tells them
+      // apart: only "no such blob" is ENOENT.
+      CLIO_CO_AWAIT(ReadBlockCte(dir, k, out, rc));
+      CLIO_CO_RETURN;
     }
+    if (rc != 0) CLIO_CO_RETURN;
+    // A stand-in may have changed the block while this node was down; the
+    // CTE hand-back delivered its copy. Take whichever is newer. A failed
+    // CTE read never fails a read the journal answered.
+    {
+      auto cte_copy = std::make_shared<InodeTableBlock>();
+      int cte_rc = 0;
+      CLIO_CO_AWAIT(ReadBlockCte(dir, k, cte_copy.get(), cte_rc));
+      if (cte_rc == 0 && cte_copy->version_ > out->version_) {
+        *out = std::move(*cte_copy);
+      }
+    }
+    rc = 0;
     CLIO_CO_RETURN;
   }
+  CLIO_CO_AWAIT(ReadBlockCte(dir, k, out, rc));
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ReadBlockCte(clio::run::u64 dir,
+                                            clio::run::u32 k,
+                                            InodeTableBlock *out, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
   bool ready = false;
   CLIO_CO_AWAIT(AwaitCteReady(ready));
   if (!ready) {
@@ -159,7 +183,7 @@ clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
     CLIO_CO_RETURN;
   }
   const clio::cte::core::TagId tag = FsUnpack(dir);
-  auto sz = cte_.AsyncGetBlobSize(tag, DirBlockName(k));
+  auto sz = cte_.AsyncGetBlobSize(tag, TableBlockName(k));
   CLIO_CO_AWAIT(sz);
   // Only "no such blob" means the block does not exist. Any other failure
   // (a lost node, a timeout, an unroutable request) must not read as an
@@ -174,12 +198,12 @@ clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
     CLIO_CO_RETURN;
   }
   std::string bytes(sz->size_, '\0');
-  auto g = cte_.AsyncGetBlob(tag, DirBlockName(k), 0, bytes.size(), 0u,
+  auto g = cte_.AsyncGetBlob(tag, TableBlockName(k), 0, bytes.size(), 0u,
                              bytes.data());
   CLIO_CO_AWAIT(g);
   if (g->GetReturnCode() != 0) {
     // Deleted between the two calls (an rmdir dropped it): it is gone.
-    auto again = cte_.AsyncGetBlobSize(tag, DirBlockName(k));
+    auto again = cte_.AsyncGetBlobSize(tag, TableBlockName(k));
     CLIO_CO_AWAIT(again);
     if (again->GetReturnCode() == kCteBlobNotFoundRc ||
         (again->GetReturnCode() == 0 && again->size_ == 0)) {
@@ -190,9 +214,14 @@ clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
   // A block that shrank leaves stale bytes past its end; the codec stops at
   // the encoded length.
   if (g->GetReturnCode() != 0 ||
-      !DecodeDirBlock(bytes.data(), bytes.size(), out) || out->dir_ != dir ||
+      !DecodeTableBlock(bytes.data(), bytes.size(), out) || out->dir_ != dir ||
       out->index_ != k) {
-    HLOG(kError, "filesystem: directory block {}/{} unreadable", dir, k);
+    if (g->GetReturnCode() == 0 && IsOldDirBlock(bytes.data(), bytes.size())) {
+      HLOG(kError, "filesystem: directory {} was written by an older clio-fs "
+           "(directory format CDB1); this volume must be recreated", dir);
+    } else {
+      HLOG(kError, "filesystem: inode-table block {}/{} unreadable", dir, k);
+    }
     rc = EIO;
   }
   CLIO_CO_RETURN;
@@ -205,10 +234,27 @@ clio::run::TaskResume Runtime::WriteBlockBlob(clio::run::u64 dir,
                                               int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
+  while (!dir_ready_.load(std::memory_order_acquire)) {
+    CLIO_CO_AWAIT(clio::run::yield(1000.0));
+  }
   if (dir_journal_) {
     rc = JournalAppend(FsLogRec::kBlockImage, image);
-    CLIO_CO_RETURN;
+    if (rc != 0) CLIO_CO_RETURN;
   }
+  // With the journal on, the CTE blob is the replicated mirror a stand-in
+  // reads while this node is down (#1263); the change is acknowledged only
+  // once both are written.
+  CLIO_CO_AWAIT(PutBlockCte(dir, k, image, rc));
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::PutBlockCte(clio::run::u64 dir,
+                                           clio::run::u32 k,
+                                           const std::string &image,
+                                           int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
   bool ready = false;
   CLIO_CO_AWAIT(AwaitCteReady(ready));
   if (!ready) {
@@ -225,14 +271,14 @@ clio::run::TaskResume Runtime::WriteBlockBlob(clio::run::u64 dir,
   while (cap < image.size()) cap <<= 1;
   std::string padded = image;
   padded.resize(cap, '\0');
-  auto p = cte_.AsyncPutBlob(tag, DirBlockName(k), 0, padded.size(),
+  auto p = cte_.AsyncPutBlob(tag, TableBlockName(k), 0, padded.size(),
                              padded.data(), -1.0f,
                              MetaCtx(inode_volatile_only_), 0u,
                              clio::run::PoolQuery::Dynamic());
   CLIO_CO_AWAIT(p);
   if (p->GetReturnCode() != 0 && !inode_volatile_only_) {
     // No non-volatile tier accepts it: keep it in RAM (lost on restart).
-    p = cte_.AsyncPutBlob(tag, DirBlockName(k), 0, padded.size(),
+    p = cte_.AsyncPutBlob(tag, TableBlockName(k), 0, padded.size(),
                           padded.data(), -1.0f, MetaCtx(true), 0u,
                           clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(p);
@@ -243,7 +289,7 @@ clio::run::TaskResume Runtime::WriteBlockBlob(clio::run::u64 dir,
     }
   }
   if (p->GetReturnCode() != 0) {
-    HLOG(kError, "filesystem: writing directory block {}/{} failed (rc {})",
+    HLOG(kError, "filesystem: writing inode-table block {}/{} failed (rc {})",
          dir, k, p->GetReturnCode());
     // A full store is ENOSPC, so a create or mkdir on a full filesystem says
     // so (as on ext4); anything else is an I/O error.
@@ -258,21 +304,38 @@ clio::run::TaskResume Runtime::WriteBlockBlob(clio::run::u64 dir,
 // ===========================================================================
 
 clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
-                                         std::shared_ptr<BlockSlot> &out,
+                                         std::shared_ptr<TableBlockSlot> &out,
                                          int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   out.reset();
   auto wait_t0 = std::chrono::steady_clock::now();
   double next_report_s = kSlowBlockOpS;
+  if (NumContainers() > 1) {
+    const clio::run::u64 hd = CLIO_IPC->HeldDeadSeq();
+    clio::run::u64 seen = seen_held_dead_seq_.load(std::memory_order_acquire);
+    if (hd != seen &&
+        seen_held_dead_seq_.compare_exchange_strong(seen, hd)) {
+      DropHomeBlocksAfterFailover();
+    }
+  }
   for (int attempt = 0;; ++attempt) {
-    const BlockKey key{dir, k};
+    const TableBlockKey key{dir, k};
     const clio::run::u32 home = BlockHome(dir, k);
     const bool mine = home == container_id_;
+    if (mine && NumContainers() > 1 &&
+        clio::cte::core::InMinority(pool_id_)) {
+      // Split brain, home side: this node sees most of the pool dead, so it
+      // is (probably) the one cut off, and the majority has a stand-in
+      // serving -- and changing -- this block. Answering from our copy
+      // reported a file created over there as ENOENT. Fail instead.
+      rc = EIO;
+      CLIO_CO_RETURN;
+    }
     bool busy = false;
     bool busy_commit = false;
     const char *busy_stage = "";
-    std::shared_ptr<BlockSlot> expired;  // a copy whose lease ran out
+    std::shared_ptr<TableBlockSlot> expired;  // a copy whose lease ran out
     if (FindCachedBlock(key, home, &out, &expired)) CLIO_CO_RETURN;
     if (expired != nullptr) {
       // Ask the home before serving it again: a change it could not push
@@ -282,7 +345,19 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
         out = expired;
         CLIO_CO_RETURN;
       }
-      if (rc != kFsRedirect) CLIO_CO_RETURN;  // unreachable: never stale
+      if (rc != kFsRedirect) {
+        // Unreachable: never serve the old copy. But a home that just died
+        // is not yet declared dead (~10 s); wait for failover to name its
+        // stand-in, which serves the block from its replicated CTE copy
+        // (#1263), rather than fail a lookup the cluster can answer.
+        if (std::chrono::steady_clock::now() - wait_t0 <
+            std::chrono::seconds(kHomeFailoverWaitS)) {
+          rc = 0;
+          CLIO_CO_AWAIT(clio::run::yield(kHomeFailoverPollUs));
+          continue;
+        }
+        CLIO_CO_RETURN;
+      }
       rc = 0;
       std::lock_guard<std::mutex> g(ns_mu_);
       auto it = blocks_.find(key);
@@ -296,7 +371,7 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
       std::lock_guard<std::mutex> g(ns_mu_);
       auto it = blocks_.find(key);
       if (it != blocks_.end()) {
-        BlockSlot &s = *it->second;
+        TableBlockSlot &s = *it->second;
         if (s.home_ == mine && (mine || s.home_id_ == home)) {
           out = it->second;  // revalidated by another task meanwhile
           CLIO_CO_RETURN;
@@ -321,7 +396,7 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
       const double waited = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - wait_t0).count();
       if (waited > next_report_s) {
-        HLOG(kWarning, "filesystem: waiting {} ms for directory block "
+        HLOG(kWarning, "filesystem: waiting {} ms for inode-table block "
              "{}/{} (home {}, mine {}): {}{}",
              static_cast<clio::run::u64>(waited * 1000.0), dir, k, home, mine,
              busy_commit ? "a moved copy is still committing"
@@ -333,7 +408,7 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
       continue;
     }
     const auto load_t0 = std::chrono::steady_clock::now();
-    auto slot = std::make_shared<BlockSlot>();
+    auto slot = std::make_shared<TableBlockSlot>();
     int lrc = 0;
     if (mine) {
       CLIO_CO_AWAIT(LoadHomeBlock(dir, k, slot, lrc));
@@ -344,7 +419,7 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
       const double took = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - load_t0).count();
       if (took > kSlowBlockOpS) {
-        HLOG(kWarning, "filesystem: loading directory block {}/{} from {} "
+        HLOG(kWarning, "filesystem: loading inode-table block {}/{} from {} "
              "took {} ms (rc {})", dir, k, mine ? "its blob" : "its home",
              static_cast<clio::run::u64>(took * 1000.0), lrc);
       }
@@ -355,10 +430,18 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
       CLIO_CO_AWAIT(clio::run::yield(1000.0));
       continue;
     }
-    if (!mine && lrc == EIO && attempt < 3 && BlockHome(dir, k) != home) {
+    if (!mine && lrc == EIO && BlockHome(dir, k) != home && attempt < 3) {
       // The home died while it was asked, and failover has since moved the
       // block to its successor, which holds its replica: ask there instead
       // of failing a lookup the cluster can still answer.
+      continue;
+    }
+    if (!mine && lrc == EIO &&
+        std::chrono::steady_clock::now() - wait_t0 <
+            std::chrono::seconds(kHomeFailoverWaitS)) {
+      // The home did not answer but is not yet declared dead (~10 s): wait
+      // for failover to move the block rather than fail now (#1263).
+      CLIO_CO_AWAIT(clio::run::yield(kHomeFailoverPollUs));
       continue;
     }
     rc = lrc == kFsRedirect ? EIO : lrc;
@@ -372,14 +455,47 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
   CLIO_TASK_BODY_END
 }
 
-bool Runtime::FindCachedBlock(const BlockKey &key, clio::run::u32 home,
-                              std::shared_ptr<BlockSlot> *out,
-                              std::shared_ptr<BlockSlot> *expired) {
+void Runtime::DropHomeBlocksAfterFailover() {
+  // Rejoin notice (decision stale_home_dir): a peer held this node dead,
+  // so a stand-in may have served and changed blocks homed here (a one-way
+  // partition never restarts this node, and a home trusts its copy with no
+  // lease: a file created over there stayed invisible here forever). Drop
+  // every CLEAN home block; the next use reloads it exactly as a restart
+  // does -- journal and the handed-back CTE copy, newest version wins --
+  // and resyncs its holders. Blocks with unwritten changes or work in
+  // flight are kept: dropping them would lose acknowledged changes.
+  size_t dropped = 0, kept = 0;
+  {
+    std::lock_guard<std::mutex> g(ns_mu_);
+    for (auto it = blocks_.begin(); it != blocks_.end();) {
+      const TableBlockSlot &s = *it->second;
+      if (!s.home_) {
+        ++it;
+        continue;
+      }
+      if (s.committing_ || s.splitting_ || s.persist_dirty_ ||
+          !s.unpushed_.empty()) {
+        ++kept;
+        ++it;
+        continue;
+      }
+      it = blocks_.erase(it);
+      ++dropped;
+    }
+  }
+  HLOG(kWarning, "filesystem: a peer held this node dead (rejoin notice); "
+       "dropped {} home directory block(s) to reload them, kept {} with "
+       "changes in flight", dropped, kept);
+}
+
+bool Runtime::FindCachedBlock(const TableBlockKey &key, clio::run::u32 home,
+                              std::shared_ptr<TableBlockSlot> *out,
+                              std::shared_ptr<TableBlockSlot> *expired) {
   const bool mine = home == container_id_;
   std::lock_guard<std::mutex> g(ns_mu_);
   auto it = blocks_.find(key);
   if (it == blocks_.end()) return false;
-  BlockSlot &s = *it->second;
+  TableBlockSlot &s = *it->second;
   if (s.home_ != mine || (!mine && s.home_id_ != home)) return false;
   if (mine || SteadyMs() < s.lease_until_ms_) {
     *out = it->second;
@@ -410,19 +526,19 @@ void Runtime::DropGoneHolders(
   }
 }
 
-void Runtime::InstallLoadedBlock(const BlockKey &key,
-                                 std::shared_ptr<BlockSlot> slot, int lrc,
-                                 std::shared_ptr<BlockSlot> *out) {
+void Runtime::InstallLoadedBlock(const TableBlockKey &key,
+                                 std::shared_ptr<TableBlockSlot> slot, int lrc,
+                                 std::shared_ptr<TableBlockSlot> *out) {
   std::lock_guard<std::mutex> g(ns_mu_);
   loading_.erase(key);
   auto ev = early_.find(key);
   if (lrc == 0) {
     if (ev != early_.end()) {
       // Pushes that arrived while the copy was in flight.
-      for (const DirDelta &x : ev->second) {
-        if (x.kind_ == DirDeltaKind::kOps &&
+      for (const TableDelta &x : ev->second) {
+        if (x.kind_ == TableDeltaKind::kOps &&
             x.new_version_ > slot->blk_.version_) {
-          ApplyDirOps(&slot->blk_, x);
+          ApplyTableOps(&slot->blk_, x);
         }
       }
     }
@@ -434,24 +550,38 @@ void Runtime::InstallLoadedBlock(const BlockKey &key,
   if (ev != early_.end()) early_.erase(ev);
 }
 
+/** CLIO_TRACE_DIRBLOCK=1: log every home directory-block load and commit
+ *  (version, row count), to find where acknowledged entries disappear. */
+static bool TraceDirBlock() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_TRACE_DIRBLOCK");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 clio::run::TaskResume Runtime::LoadHomeBlock(clio::run::u64 dir,
                                              clio::run::u32 k,
-                                             std::shared_ptr<BlockSlot> slot,
+                                             std::shared_ptr<TableBlockSlot> slot,
                                              int &lrc) {
   CLIO_TASK_BODY_BEGIN
   lrc = 0;
-  const BlockKey key{dir, k};
+  const TableBlockKey key{dir, k};
   SetLoadStage(key, "home load: reading the block blob (GetBlobSize/GetBlob)");
   CLIO_CO_AWAIT(ReadBlockBlob(dir, k, &slot->blk_, lrc));
+  if (TraceDirBlock()) {
+    HLOG(kWarning, "[DIRBLOCK] home load {}/{} on container {}: rc {} "
+         "version {} rows {}", dir, k, container_id_, lrc,
+         slot->blk_.version_, slot->blk_.rows_.size());
+  }
   // Loaded from the journal: its deltas build on the image there.
   slot->journal_image_ = lrc != 0;
   if (lrc == ENOENT && dir == FsPack(FsRootId()) && k == 0) {
-    // "/" exists by definition: its home materializes it on first use.
+    // "/" exists by definition: its home materializes its table on first
+    // use (its inode record is materialized by its own home, EnsureInode).
     slot->blk_.dir_ = dir;
     slot->blk_.version_ = 1;
-    const clio::run::u64 now = NowNs();
-    slot->blk_.hdr_.atime_ = slot->blk_.hdr_.mtime_ =
-        slot->blk_.hdr_.ctime_ = now;
+    slot->blk_.mtime_ = NowNs();
     slot->persist_dirty_ = true;
     lrc = 0;
   }
@@ -470,7 +600,7 @@ clio::run::TaskResume Runtime::LoadHomeBlock(clio::run::u64 dir,
     slot->blk_.version_ += kIncarnationStride;
     int wrc = 0;
     SetLoadStage(key, "home load: persisting the incarnation jump (PutBlob)");
-    CLIO_CO_AWAIT(WriteBlockBlob(dir, k, EncodeDirBlock(slot->blk_, true),
+    CLIO_CO_AWAIT(WriteBlockBlob(dir, k, EncodeTableBlock(slot->blk_, true),
                                  wrc));
     if (wrc != 0) {
       slot->persist_dirty_ = true;  // the next commit retries
@@ -484,7 +614,7 @@ clio::run::TaskResume Runtime::LoadHomeBlock(clio::run::u64 dir,
 clio::run::TaskResume Runtime::FetchBlock(clio::run::u64 dir,
                                           clio::run::u32 k,
                                           clio::run::u32 home,
-                                          std::shared_ptr<BlockSlot> slot,
+                                          std::shared_ptr<TableBlockSlot> slot,
                                           int &lrc) {
   CLIO_TASK_BODY_BEGIN
   FsReq fr;
@@ -493,9 +623,9 @@ clio::run::TaskResume Runtime::FetchBlock(clio::run::u64 dir,
   fr.a_ = container_id_;
   FsResp resp;
   const clio::run::u64 asked_ms = SteadyMs();
-  CLIO_CO_AWAIT(CallShard(home, kShardBlockFetch, fr, resp));
+  CLIO_CO_AWAIT(CallShard(home, kTableFetch, fr, resp));
   lrc = static_cast<int>(resp.rc_);
-  if (lrc == 0 && !DecodeDirBlock(resp.str_.data(), resp.str_.size(),
+  if (lrc == 0 && !DecodeTableBlock(resp.str_.data(), resp.str_.size(),
                                   &slot->blk_)) {
     lrc = EIO;
   }
@@ -507,7 +637,7 @@ clio::run::TaskResume Runtime::FetchBlock(clio::run::u64 dir,
 }
 
 clio::run::TaskResume Runtime::RevalidateBlock(
-    std::shared_ptr<BlockSlot> slot, clio::run::u64 dir, clio::run::u32 k,
+    std::shared_ptr<TableBlockSlot> slot, clio::run::u64 dir, clio::run::u32 k,
     clio::run::u32 home, int &rc) {
   CLIO_TASK_BODY_BEGIN
   clio::run::u64 have = 0;
@@ -522,12 +652,12 @@ clio::run::TaskResume Runtime::RevalidateBlock(
   fr.b_ = have;  // "unchanged" if the home is still at this version
   FsResp resp;
   const clio::run::u64 asked_ms = SteadyMs();
-  CLIO_CO_AWAIT(CallShard(home, kShardBlockFetch, fr, resp));
+  CLIO_CO_AWAIT(CallShard(home, kTableFetch, fr, resp));
   rc = static_cast<int>(resp.rc_);
   if (rc != 0) CLIO_CO_RETURN;
-  DirBlock nb;
+  InodeTableBlock nb;
   const bool changed = resp.id_ != kFetchUnchanged;
-  if (changed && !DecodeDirBlock(resp.str_.data(), resp.str_.size(), &nb)) {
+  if (changed && !DecodeTableBlock(resp.str_.data(), resp.str_.size(), &nb)) {
     rc = EIO;
     CLIO_CO_RETURN;
   }
@@ -548,7 +678,7 @@ clio::run::TaskResume Runtime::ServeBlockFetch(const FsReq &req,
     resp.rc_ = kFsRedirect;
     CLIO_CO_RETURN;
   }
-  std::shared_ptr<BlockSlot> slot;
+  std::shared_ptr<TableBlockSlot> slot;
   int rc = 0;
   CLIO_CO_AWAIT(LoadBlock(req.dir_id_, req.block_, slot, rc));
   if (rc != 0) {
@@ -569,38 +699,38 @@ clio::run::TaskResume Runtime::ServeBlockFetch(const FsReq &req,
   }
   // The in-memory state, uncommitted changes included: every later change
   // reaches the holder as a push with a higher version.
-  resp.str_ = EncodeDirBlock(slot->blk_, false);
+  resp.str_ = EncodeTableBlock(slot->blk_, false);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-int Runtime::ApplyBlockPush(const FsReq &req) {
-  std::vector<DirDelta> deltas;
-  if (!DecodeDirDeltas(req.str_, &deltas)) return EINVAL;
+int Runtime::ApplyTablePush(const FsReq &req) {
+  std::vector<TableDelta> deltas;
+  if (!DecodeTableDeltas(req.str_, &deltas)) return EINVAL;
   bool missing = false;
   std::lock_guard<std::mutex> g(ns_mu_);
-  for (const DirDelta &x : deltas) {
-    const BlockKey key{x.dir_, x.index_};
+  for (const TableDelta &x : deltas) {
+    const TableBlockKey key{x.dir_, x.index_};
     if (loading_.count(key) != 0) {
       early_[key].push_back(x);  // applied once the fetched copy lands
       continue;
     }
     auto it = blocks_.find(key);
     if (it == blocks_.end() || it->second->home_) {
-      if (x.kind_ != DirDeltaKind::kDrop) missing = true;
+      if (x.kind_ != TableDeltaKind::kDrop) missing = true;
       continue;
     }
-    DirBlock &b = it->second->blk_;
-    if (x.kind_ == DirDeltaKind::kDrop) {
+    InodeTableBlock &b = it->second->blk_;
+    if (x.kind_ == TableDeltaKind::kDrop) {
       blocks_.erase(it);
-    } else if (x.kind_ == DirDeltaKind::kSnapshot) {
-      DirBlock nb;
-      if (DecodeDirBlock(x.snapshot_.data(), x.snapshot_.size(), &nb)) {
+    } else if (x.kind_ == TableDeltaKind::kSnapshot) {
+      InodeTableBlock nb;
+      if (DecodeTableBlock(x.snapshot_.data(), x.snapshot_.size(), &nb)) {
         b = std::move(nb);
       } else {
         blocks_.erase(it);
       }
-    } else if (x.new_version_ > b.version_ && !ApplyDirOps(&b, x)) {
+    } else if (x.new_version_ > b.version_ && !ApplyTableOps(&b, x)) {
       blocks_.erase(it);  // missed a change: refetch on next use
     }
   }
@@ -617,9 +747,9 @@ namespace {
  * @param b the block, as the home holds it
  * @return the snapshot delta
  */
-DirDelta SnapshotDelta(const DirBlock &b) {
-  DirDelta x;
-  x.kind_ = DirDeltaKind::kSnapshot;
+TableDelta SnapshotDelta(const InodeTableBlock &b) {
+  TableDelta x;
+  x.kind_ = TableDeltaKind::kSnapshot;
   x.dir_ = b.dir_;
   x.index_ = b.index_;
   x.base_version_ = b.version_;
@@ -627,15 +757,15 @@ DirDelta SnapshotDelta(const DirBlock &b) {
   x.depth_ = b.depth_;
   x.mtime_ = b.mtime_;
   x.sealed_ = b.sealed_;
-  x.snapshot_ = EncodeDirBlock(b, false);
+  x.snapshot_ = EncodeTableBlock(b, false);
   return x;
 }
 }  // namespace
 
-clio::run::u64 Runtime::RecordChangeLocked(BlockSlot &slot, DirDelta delta,
+clio::run::u64 Runtime::RecordChangeLocked(TableBlockSlot &slot, TableDelta delta,
                                            bool persisted) {
-  DirBlock &b = slot.blk_;
-  delta.kind_ = DirDeltaKind::kOps;
+  InodeTableBlock &b = slot.blk_;
+  delta.kind_ = TableDeltaKind::kOps;
   delta.dir_ = b.dir_;
   delta.index_ = b.index_;
   delta.base_version_ = b.version_;
@@ -703,7 +833,7 @@ clio::run::TaskResume Runtime::PushToHolders(
   CLIO_TASK_BODY_END
 }
 
-void Runtime::PushTargetsLocked(const BlockSlot &slot, bool resync,
+void Runtime::PushTargetsLocked(const TableBlockSlot &slot, bool resync,
                                 std::vector<clio::run::u32> *holders,
                                 std::vector<clio::run::u64> *leases) {
   if (!resync) {
@@ -728,14 +858,15 @@ void Runtime::PushTargetsLocked(const BlockSlot &slot, bool resync,
   }
 }
 
-clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
+clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
                                            clio::run::u64 version, int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   for (;;) {
-    std::vector<DirDelta> deltas;
+    std::vector<TableDelta> deltas;
     std::string image, jrec;
     FsLogRec jtype = FsLogRec::kBlockDeltas;
+    std::string mirror;  // full image for the CTE copy of a journaled delta
     std::vector<clio::run::u32> holders;
     std::vector<clio::run::u64> leases;  // parallel to holders
     std::map<clio::run::u32, clio::run::u64> reg;  // registrations pushed to
@@ -750,8 +881,20 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
         v = slot->blk_.version_;
         dir = slot->blk_.dir_;
         k = slot->blk_.index_;
+        if (TraceDirBlock()) {
+          HLOG(kWarning, "[DIRBLOCK] commit {}/{} on container {}: version "
+               "{} rows {} deltas {} home {}", dir, k, container_id_, v,
+               slot->blk_.rows_.size(), slot->unpushed_.size(),
+               slot->home_);
+        }
         deltas.swap(slot->unpushed_);
         TakePersistLocked(*slot, deltas, &image, &jtype, &jrec);
+        // A journaled delta lives only in this node's journal: mirror the
+        // block's whole current image to its replicated CTE blob too, so a
+        // stand-in can serve it while this node is down (#1263).
+        if (dir_journal_ && image.empty() && !jrec.empty()) {
+          mirror = EncodeTableBlock(slot->blk_, true);
+        }
         reg = slot->holders_;
         if (slot->holders_unknown_) {
           resync = true;
@@ -768,18 +911,37 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
     int wrc = 0;
     const auto commit_t0 = std::chrono::steady_clock::now();
     if (!image.empty()) CLIO_CO_AWAIT(WriteBlockBlob(dir, k, image, wrc));
-    if (!jrec.empty()) wrc = JournalAppend(jtype, jrec);
+    if (wrc == 0 && !jrec.empty()) wrc = JournalAppend(jtype, jrec);
+    bool mirror_failed = false;
+    if (wrc == 0 && !mirror.empty()) {
+      int mrc = 0;
+      CLIO_CO_AWAIT(PutBlockCte(dir, k, mirror, mrc));
+      if (mrc == ENOSPC) {
+        // The change is durable in this node's journal; only the replicated
+        // mirror a stand-in would read is behind. Failing the operation for
+        // that made unlink/rmdir on a full store fail ENOSPC -- the one way
+        // to free space. Succeed, and rewrite the mirror at the next commit
+        // (persist_dirty_). The cost: a stand-in serving this block before
+        // that sees it without this change.
+        mirror_failed = true;
+        HLOG(kWarning, "filesystem: inode-table block {}/{} change is "
+             "journaled but its replicated mirror could not be written "
+             "(store full); retried at the next commit", dir, k);
+      } else {
+        wrc = mrc;
+      }
+    }
     std::vector<clio::run::u32> gone;
     if (!deltas.empty() && !holders.empty()) {
       FsReq pr;
-      pr.str_ = EncodeDirDeltas(deltas);
-      CLIO_CO_AWAIT(PushToHolders(kShardBlockPush, pr, holders, leases, &gone));
+      pr.str_ = EncodeTableDeltas(deltas);
+      CLIO_CO_AWAIT(PushToHolders(kTablePush, pr, holders, leases, &gone));
     }
     {
       const double took = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - commit_t0).count();
       if (took > kSlowBlockOpS) {
-        HLOG(kWarning, "filesystem: committing directory block {}/{} took "
+        HLOG(kWarning, "filesystem: committing inode-table block {}/{} took "
              "{} ms ({} holders{})", dir, k,
              static_cast<clio::run::u64>(took * 1000.0), holders.size(),
              resync ? ", resync" : "");
@@ -805,6 +967,8 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
       if (wrc != 0) {
         slot->persist_dirty_ = true;  // the next commit retries
         slot->journal_image_ = true;  // these deltas never reached it
+      } else if (mirror_failed) {
+        slot->persist_dirty_ = true;  // rewrite the mirror next time
       }
       slot->durable_version_ = v;
       slot->committing_ = false;
@@ -819,46 +983,51 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<BlockSlot> slot,
 }
 
 // ===========================================================================
-// Entry mutations (on the block's home)
+// Row mutations (on the block's home)
 // ===========================================================================
 
-int Runtime::InsertEntryLocked(BlockSlot &slot, const FsReq &req,
-                               FsResp &resp) {
+int Runtime::InsertRowLocked(TableBlockSlot &slot, const FsReq &req,
+                             FsResp &resp) {
   const clio::run::u32 f = req.flags_;
-  DirBlock &b = slot.blk_;
+  InodeTableBlock &b = slot.blk_;
   if (b.sealed_) return ENOENT;  // an rmdir is removing the directory
+  if (req.id_ == 0) return EINVAL;  // the caller names the inode
   const clio::cte::core::TagId dir_tag = FsUnpack(b.dir_);
+  const std::string key = KeyOf(req.leaf_);
   const std::string tn = clio::cte::core::MakeTagRefName(dir_tag, req.leaf_);
-  auto it = b.ents_.find(req.leaf_);
-  DirDelta dl;
+  auto it = b.rows_.find(key);
+  TableDelta dl;
   if ((f & kInsCommit) != 0) {
-    if (it == b.ents_.end()) {
-      // The reservation is gone: pending entries are never durable, so a
-      // home that restarted or failed over (and back) lost it. The name is
-      // still free, so take it now -- the check is as atomic here as the
+    if (it == b.rows_.end()) {
+      // The reservation is gone: pending rows are never durable, so a home
+      // that restarted or failed over (and back) lost it. The name is still
+      // free, so take it now -- the check is as atomic here as the
       // reservation was.
-      DirEntry e;
+      InodeRow e;
       e.id_ = req.id_;
       e.type_ = req.type_;
-      e.state_ = kDirEntPending;
-      it = b.ents_.emplace(req.leaf_, e).first;
+      e.spelling_ = RowSpelling(key, req.leaf_);
+      e.state_ = kRowPending;
+      it = b.rows_.emplace(key, e).first;
     } else if (it->second.id_ != req.id_) {
       return EEXIST;  // someone else took the name after we lost it
-    } else if (it->second.state_ == kDirEntLive) {
+    } else if (it->second.state_ == kRowLive) {
       return 0;  // already committed (a retried commit)
-    } else if (it->second.state_ != kDirEntPending) {
+    } else if (it->second.state_ != kRowPending) {
       return ENOENT;
     }
-    it->second.state_ = kDirEntLive;
+    it->second.state_ = kRowLive;
     b.mtime_ = NowNs();
-    dl.ops_.push_back({req.leaf_, true, it->second});
+    dl.ops_.push_back({key, true, it->second});
     RecordChangeLocked(slot, dl, true);
-    PublishName(clio::cte::core::TagNameOp::kAddName, FsUnpack(req.id_), tn);
+    PublishName(clio::cte::core::TagNameOp::kAddName, FsUnpack(req.id_),
+                clio::cte::core::MakeTagRefName(dir_tag,
+                                                RowName(key, it->second)));
     return 0;
   }
-  if (it != b.ents_.end()) {
-    DirEntry &e = it->second;
-    if (e.state_ != kDirEntLive) return (f & kInsFailBusy) ? EBUSY : kFsRetry;
+  if (it != b.rows_.end()) {
+    InodeRow &e = it->second;
+    if (e.state_ != kRowLive) return (f & kInsFailBusy) ? EBUSY : kFsRetry;
     resp.id_ = e.id_;
     resp.type_ = e.type_;
     if ((f & kInsExcl) != 0) return EEXIST;
@@ -872,15 +1041,17 @@ int Runtime::InsertEntryLocked(BlockSlot &slot, const FsReq &req,
     if (e.type_ == kFsTypeDir && (f & kInsReplaceDir) == 0) return ENOTEMPTY;
     resp.old_id_ = e.id_;
     resp.old_type_ = e.type_;
+    resp.str_ = RowName(key, e);  // the replaced name, as it was spelled
     const clio::run::u64 victim = e.id_;
     e.id_ = req.id_;
     e.type_ = req.type_;
+    e.spelling_ = RowSpelling(key, req.leaf_);
     b.mtime_ = NowNs();
-    dl.ops_.push_back({req.leaf_, true, e});
+    dl.ops_.push_back({key, true, e});
     RecordChangeLocked(slot, dl, true);
     if ((f & kInsNoTagName) == 0) {
       PublishName(clio::cte::core::TagNameOp::kRemoveName, FsUnpack(victim),
-                  tn);
+                  clio::cte::core::MakeTagRefName(dir_tag, resp.str_));
       PublishName(clio::cte::core::TagNameOp::kAddName, FsUnpack(e.id_), tn);
     }
     resp.id_ = req.id_;
@@ -888,25 +1059,15 @@ int Runtime::InsertEntryLocked(BlockSlot &slot, const FsReq &req,
     resp.attr_.id_ = b.dir_;
     return 0;
   }
-  DirEntry e;
+  InodeRow e;
+  e.id_ = req.id_;
   e.type_ = req.type_;
-  e.state_ = (f & kInsPending) ? kDirEntPending : kDirEntLive;
-  if ((f & kInsNewInode) != 0) {
-    // The caller minted the id and stored the inode's record first
-    // (CreateEntry); the inode's home loads it on first use. Nothing is
-    // created here, so the name's block and the inode need not share a
-    // container (#1158).
-    if (req.id_ == 0) return EINVAL;
-    e.id_ = req.id_;
-  } else {
-    const clio::cte::core::TagId id = req.id_ != 0 ? FsUnpack(req.id_) : MintId();
-    if (id.IsNull()) return kFsRetry;
-    e.id_ = FsPack(id);
-  }
-  b.ents_[req.leaf_] = e;
-  const bool live = e.state_ == kDirEntLive;
+  e.spelling_ = RowSpelling(key, req.leaf_);
+  e.state_ = (f & kInsPending) ? kRowPending : kRowLive;
+  b.rows_[key] = e;
+  const bool live = e.state_ == kRowLive;
   if (live) b.mtime_ = NowNs();
-  dl.ops_.push_back({req.leaf_, true, e});
+  dl.ops_.push_back({key, true, e});
   RecordChangeLocked(slot, dl, live);
   if (live && (f & kInsNoTagName) == 0) {
     PublishName(clio::cte::core::TagNameOp::kAddName, FsUnpack(e.id_), tn);
@@ -918,34 +1079,35 @@ int Runtime::InsertEntryLocked(BlockSlot &slot, const FsReq &req,
   return 0;
 }
 
-int Runtime::RemoveEntryLocked(BlockSlot &slot, const FsReq &req,
-                               FsResp &resp) {
+int Runtime::RemoveRowLocked(TableBlockSlot &slot, const FsReq &req,
+                             FsResp &resp) {
   const clio::run::u32 f = req.flags_;
-  DirBlock &b = slot.blk_;
-  auto it = b.ents_.find(req.leaf_);
-  if (it == b.ents_.end()) return ENOENT;
-  DirEntry &e = it->second;
+  InodeTableBlock &b = slot.blk_;
+  const std::string key = KeyOf(req.leaf_);
+  auto it = b.rows_.find(key);
+  if (it == b.rows_.end()) return ENOENT;
+  InodeRow &e = it->second;
   const bool mine = req.id_ != 0 && e.id_ == req.id_;
-  DirDelta dl;
+  TableDelta dl;
   if ((f & kRmRestore) != 0) {
-    if (mine && e.state_ == kDirEntLeaving) {
-      e.state_ = kDirEntLive;
-      dl.ops_.push_back({req.leaf_, true, e});
+    if (mine && e.state_ == kRowLeaving) {
+      e.state_ = kRowLive;
+      dl.ops_.push_back({key, true, e});
       RecordChangeLocked(slot, dl, false);
     }
     return 0;
   }
   if (req.id_ != 0 && !mine) return ENOENT;  // replaced underneath us
-  if (e.state_ == kDirEntPending && mine) {  // abort a reservation
-    b.ents_.erase(it);
-    dl.ops_.push_back({req.leaf_, false, DirEntry()});
+  if (e.state_ == kRowPending && mine) {  // abort a reservation
+    b.rows_.erase(it);
+    dl.ops_.push_back({key, false, InodeRow()});
     RecordChangeLocked(slot, dl, false);
     return 0;
   }
-  // A leaving entry may only be finished by the operation that marked it
+  // A leaving row may only be finished by the operation that marked it
   // (which names the id); everyone else waits for the outcome.
-  if (e.state_ != kDirEntLive && !(e.state_ == kDirEntLeaving && mine &&
-                                   (f & kRmMarkLeaving) == 0)) {
+  if (e.state_ != kRowLive && !(e.state_ == kRowLeaving && mine &&
+                                (f & kRmMarkLeaving) == 0)) {
     return (f & kRmFailBusy) ? EBUSY : kFsRetry;
   }
   if ((f & kRmNonDir) != 0 && e.type_ == kFsTypeDir) return EISDIR;
@@ -953,52 +1115,84 @@ int Runtime::RemoveEntryLocked(BlockSlot &slot, const FsReq &req,
   resp.old_id_ = e.id_;
   resp.old_type_ = e.type_;
   resp.attr_.id_ = b.dir_;
+  resp.str_ = RowName(key, e);  // the removed name, as it was spelled
   if ((f & kRmMarkLeaving) != 0) {
-    e.state_ = kDirEntLeaving;
-    dl.ops_.push_back({req.leaf_, true, e});
+    e.state_ = kRowLeaving;
+    dl.ops_.push_back({key, true, e});
     RecordChangeLocked(slot, dl, false);
     return 0;
   }
-  const DirEntry gone = e;
-  b.ents_.erase(it);
+  const clio::run::u64 gone = e.id_;
+  b.rows_.erase(it);
   b.mtime_ = NowNs();
-  dl.ops_.push_back({req.leaf_, false, DirEntry()});
+  dl.ops_.push_back({key, false, InodeRow()});
   RecordChangeLocked(slot, dl, true);
   if ((f & kRmNoTagName) == 0) {
-    PublishName(clio::cte::core::TagNameOp::kRemoveName, FsUnpack(gone.id_),
-                clio::cte::core::MakeTagRefName(FsUnpack(b.dir_), req.leaf_));
+    PublishName(clio::cte::core::TagNameOp::kRemoveName, FsUnpack(gone),
+                clio::cte::core::MakeTagRefName(FsUnpack(b.dir_), resp.str_));
   }
   return 0;
 }
 
-clio::run::TaskResume Runtime::EntryMutation(clio::run::u32 op,
-                                             const FsReq &req, FsResp &resp) {
+int Runtime::RespellRowLocked(TableBlockSlot &slot, const FsReq &req,
+                              FsResp &resp) {
+  InodeTableBlock &b = slot.blk_;
+  const std::string key = KeyOf(req.leaf_);
+  auto it = b.rows_.find(key);
+  if (it == b.rows_.end()) return ENOENT;
+  InodeRow &e = it->second;
+  if (req.id_ != 0 && e.id_ != req.id_) return ENOENT;  // replaced meanwhile
+  if (e.state_ != kRowLive) {
+    return (req.flags_ & kInsFailBusy) ? EBUSY : kFsRetry;
+  }
+  resp.id_ = e.id_;
+  resp.type_ = e.type_;
+  resp.attr_.id_ = b.dir_;
+  resp.str_ = RowName(key, e);  // the spelling it had
+  const std::string spelling = RowSpelling(key, req.leaf_);
+  if (spelling == e.spelling_) return 0;  // already spelled so
+  e.spelling_ = spelling;
+  b.mtime_ = NowNs();
+  TableDelta dl;
+  dl.ops_.push_back({key, true, e});
+  RecordChangeLocked(slot, dl, true);
+  const clio::cte::core::TagId dir_tag = FsUnpack(b.dir_);
+  PublishName(clio::cte::core::TagNameOp::kRename, FsUnpack(e.id_),
+              clio::cte::core::MakeTagRefName(dir_tag, resp.str_),
+              clio::cte::core::MakeTagRefName(dir_tag, req.leaf_));
+  return 0;
+}
+
+clio::run::TaskResume Runtime::RowMutation(clio::run::u32 op,
+                                           const FsReq &req, FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   if (BlockHome(req.dir_id_, req.block_) != container_id_) {
     resp.rc_ = kFsRedirect;
     CLIO_CO_RETURN;
   }
-  std::shared_ptr<BlockSlot> slot;
+  std::shared_ptr<TableBlockSlot> slot;
   int rc = 0;
   CLIO_CO_AWAIT(LoadBlock(req.dir_id_, req.block_, slot, rc));
   if (rc != 0) {
     resp.rc_ = static_cast<clio::run::u32>(rc);
     CLIO_CO_RETURN;
   }
-  if (op == kShardInsert) CLIO_CO_AWAIT(EnsureIdReserve(1024));
-  const clio::run::u64 h = DirNameHash(req.leaf_);
+  const clio::run::u64 h = TableHash(KeyOf(req.leaf_));
   clio::run::u64 before = 0, after = 0;
   for (;;) {
     {
       std::lock_guard<std::mutex> g(ns_mu_);
       before = slot->blk_.version_;
-      if (!BlockOwnsName(slot->blk_, h)) {
+      if (!BlockOwnsKey(slot->blk_, h)) {
         rc = kFsRedirect;  // it split: the caller re-walks
       } else if (slot->splitting_) {
         rc = kFsRetry;
+      } else if (op == kTableInsert) {
+        rc = InsertRowLocked(*slot, req, resp);
+      } else if (op == kTableRemove) {
+        rc = RemoveRowLocked(*slot, req, resp);
       } else {
-        rc = op == kShardInsert ? InsertEntryLocked(*slot, req, resp)
-                                : RemoveEntryLocked(*slot, req, resp);
+        rc = RespellRowLocked(*slot, req, resp);
       }
       after = slot->blk_.version_;
     }
@@ -1011,7 +1205,7 @@ clio::run::TaskResume Runtime::EntryMutation(clio::run::u32 op,
     if (crc != 0 && rc == 0) rc = crc;
   }
   resp.rc_ = static_cast<clio::run::u32>(rc);
-  if (rc == 0 && op == kShardInsert) CLIO_CO_AWAIT(SplitBlock(slot));
+  if (rc == 0 && op == kTableInsert) CLIO_CO_AWAIT(SplitBlock(slot));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -1020,23 +1214,23 @@ clio::run::TaskResume Runtime::EntryMutation(clio::run::u32 op,
 // Splits
 // ===========================================================================
 
-clio::run::TaskResume Runtime::SplitBlock(std::shared_ptr<BlockSlot> slot) {
+clio::run::TaskResume Runtime::SplitBlock(std::shared_ptr<TableBlockSlot> slot) {
   CLIO_TASK_BODY_BEGIN
-  DirBlock child;
+  InodeTableBlock child;
   std::vector<std::string> moved;
   clio::run::u32 d = 0;
   {
     std::lock_guard<std::mutex> g(ns_mu_);
-    DirBlock &b = slot->blk_;
+    InodeTableBlock &b = slot->blk_;
     if (!slot->home_ || slot->splitting_ || b.sealed_ ||
-        b.ents_.size() <= split_entries_ || b.depth_ >= kDirMaxDepth) {
+        b.rows_.size() <= split_entries_ || b.depth_ >= kTableMaxDepth) {
       CLIO_CO_RETURN;
     }
     d = b.depth_;
-    for (const auto &kv : b.ents_) {
-      if (((DirNameHash(kv.first) >> d) & 1ULL) == 0) continue;
+    for (const auto &kv : b.rows_) {
+      if (((TableHash(kv.first) >> d) & 1ULL) == 0) continue;
       // An operation in flight on this name finishes here first.
-      if (kv.second.state_ != kDirEntLive) CLIO_CO_RETURN;
+      if (kv.second.state_ != kRowLive) CLIO_CO_RETURN;
       moved.push_back(kv.first);
     }
     slot->splitting_ = true;
@@ -1045,27 +1239,27 @@ clio::run::TaskResume Runtime::SplitBlock(std::shared_ptr<BlockSlot> slot) {
     child.born_ = child.depth_ = d + 1;
     child.version_ = 1;
     child.mtime_ = b.mtime_;
-    for (const std::string &leaf : moved) child.ents_[leaf] = b.ents_[leaf];
+    for (const std::string &leaf : moved) child.rows_[leaf] = b.rows_[leaf];
   }
   // The new block is written by its own home before the old one lets go:
   // until the old block's depth changes nobody routes to the new one, so a
-  // crash in between leaves an unreachable orphan, never a lost entry.
+  // crash in between leaves an unreachable orphan, never a lost row.
   FsReq ir;
   ir.dir_id_ = child.dir_;
   ir.block_ = child.index_;
-  ir.str_ = EncodeDirBlock(child, false);
+  ir.str_ = EncodeTableBlock(child, false);
   FsResp irr;
   CLIO_CO_AWAIT(CallShard(BlockHome(child.dir_, child.index_),
-                          kShardBlockInstall, ir, irr));
+                          kTableInstall, ir, irr));
   clio::run::u64 v = 0;
   {
     std::lock_guard<std::mutex> g(ns_mu_);
     if (irr.rc_ == 0) {
-      DirBlock &b = slot->blk_;
-      DirDelta dl;
+      InodeTableBlock &b = slot->blk_;
+      TableDelta dl;
       for (const std::string &leaf : moved) {
-        b.ents_.erase(leaf);
-        dl.ops_.push_back({leaf, false, DirEntry()});
+        b.rows_.erase(leaf);
+        dl.ops_.push_back({leaf, false, InodeRow()});
       }
       b.depth_ = d + 1;
       v = RecordChangeLocked(*slot, dl, true);
@@ -1076,7 +1270,7 @@ clio::run::TaskResume Runtime::SplitBlock(std::shared_ptr<BlockSlot> slot) {
     int crc = 0;
     CLIO_CO_AWAIT(CommitBlock(slot, v, crc));
   } else {
-    HLOG(kWarning, "filesystem: splitting directory block {}/{} failed "
+    HLOG(kWarning, "filesystem: splitting inode-table block {}/{} failed "
          "(rc {}); it stays whole", child.dir_, child.index_ - (1u << d),
          irr.rc_);
   }
@@ -1086,8 +1280,8 @@ clio::run::TaskResume Runtime::SplitBlock(std::shared_ptr<BlockSlot> slot) {
 
 clio::run::TaskResume Runtime::InstallBlock(const FsReq &req, FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
-  auto slot = std::make_shared<BlockSlot>();
-  if (!DecodeDirBlock(req.str_.data(), req.str_.size(), &slot->blk_)) {
+  auto slot = std::make_shared<TableBlockSlot>();
+  if (!DecodeTableBlock(req.str_.data(), req.str_.size(), &slot->blk_)) {
     resp.rc_ = EINVAL;
     CLIO_CO_RETURN;
   }
@@ -1100,7 +1294,7 @@ clio::run::TaskResume Runtime::InstallBlock(const FsReq &req, FsResp &resp) {
   {
     std::lock_guard<std::mutex> g(ns_mu_);
     // A leftover from an earlier failed split of the same block is replaced.
-    blocks_[BlockKey{slot->blk_.dir_, slot->blk_.index_}] = slot;
+    blocks_[TableBlockKey{slot->blk_.dir_, slot->blk_.index_}] = slot;
   }
   int rc = 0;
   CLIO_CO_AWAIT(CommitBlock(slot, slot->blk_.version_, rc));
@@ -1113,16 +1307,16 @@ clio::run::TaskResume Runtime::InstallBlock(const FsReq &req, FsResp &resp) {
 // Directory lifecycle: mkdir, rmdir, attributes
 // ===========================================================================
 
-clio::run::TaskResume Runtime::DirCreate(const FsReq &req, FsResp &resp) {
+clio::run::TaskResume Runtime::CreateTable(const FsReq &req, FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   if (BlockHome(req.dir_id_, 0) != container_id_) {
     resp.rc_ = kFsRedirect;
     CLIO_CO_RETURN;
   }
-  if ((req.flags_ & kAttrRepair) != 0) {
+  if ((req.flags_ & kCreateRepair) != 0) {
     // Only when truly missing (a crash between rmdir's halves left the
-    // parent's entry but not the listing).
-    std::shared_ptr<BlockSlot> have;
+    // parent's row but not the table).
+    std::shared_ptr<TableBlockSlot> have;
     int lrc = 0;
     CLIO_CO_AWAIT(LoadBlock(req.dir_id_, 0, have, lrc));
     if (lrc != ENOENT) {
@@ -1130,22 +1324,16 @@ clio::run::TaskResume Runtime::DirCreate(const FsReq &req, FsResp &resp) {
       CLIO_CO_RETURN;
     }
   }
-  auto slot = std::make_shared<BlockSlot>();
-  DirBlock &b = slot->blk_;
+  auto slot = std::make_shared<TableBlockSlot>();
+  InodeTableBlock &b = slot->blk_;
   b.dir_ = req.dir_id_;
   b.version_ = 1;
-  b.hdr_.parent_ = req.b_;
-  b.hdr_.leaf_ = req.leaf_;
-  b.hdr_.mode_ = req.mode_;
-  b.hdr_.uid_ = req.uid_;
-  b.hdr_.gid_ = req.gid_;
-  const clio::run::u64 now = NowNs();
-  b.hdr_.atime_ = b.hdr_.mtime_ = b.hdr_.ctime_ = now;
+  b.mtime_ = NowNs();
   slot->home_ = true;
   slot->persist_dirty_ = true;
   {
     std::lock_guard<std::mutex> g(ns_mu_);
-    blocks_[BlockKey{b.dir_, 0}] = slot;
+    blocks_[TableBlockKey{b.dir_, 0}] = slot;
   }
   int rc = 0;
   CLIO_CO_AWAIT(CommitBlock(slot, b.version_, rc));
@@ -1160,7 +1348,7 @@ clio::run::TaskResume Runtime::SealBlock(const FsReq &req, FsResp &resp) {
     resp.rc_ = kFsRedirect;
     CLIO_CO_RETURN;
   }
-  std::shared_ptr<BlockSlot> slot;
+  std::shared_ptr<TableBlockSlot> slot;
   int rc = 0;
   CLIO_CO_AWAIT(LoadBlock(req.dir_id_, req.block_, slot, rc));
   if (rc != 0) {
@@ -1170,18 +1358,18 @@ clio::run::TaskResume Runtime::SealBlock(const FsReq &req, FsResp &resp) {
   clio::run::u64 v = 0;
   {
     std::lock_guard<std::mutex> g(ns_mu_);
-    DirBlock &b = slot->blk_;
+    InodeTableBlock &b = slot->blk_;
     resp.str_ = EncIndices(ChildBlocks(b));
     const bool seal = req.a_ != 0;
-    if (seal && (!b.ents_.empty() || slot->splitting_)) {
-      rc = ENOTEMPTY;  // pending entries (a mkdir inside) count too
-      // #1029: entries a listing does NOT show (pending reservations,
+    if (seal && (!b.rows_.empty() || slot->splitting_)) {
+      rc = ENOTEMPTY;  // pending rows (a mkdir inside) count too
+      // #1029: rows a listing does NOT show (pending reservations,
       // leaving halves of a rename) or a split in flight make an rmdir fail
       // after rm -r removed everything it was shown. Name them.
       size_t hidden = 0;
       std::string names;
-      for (const auto &kv : b.ents_) {
-        if (kv.second.state_ == kDirEntLive &&
+      for (const auto &kv : b.rows_) {
+        if (kv.second.state_ == kRowLive &&
             kv.first.rfind(".fuse_hidden", 0) != 0) {
           continue;
         }
@@ -1198,7 +1386,7 @@ clio::run::TaskResume Runtime::SealBlock(const FsReq &req, FsResp &resp) {
       }
     } else if (b.sealed_ != seal) {
       b.sealed_ = seal;
-      v = RecordChangeLocked(*slot, DirDelta(), false);
+      v = RecordChangeLocked(*slot, TableDelta(), false);
     }
   }
   if (v != 0) {
@@ -1214,10 +1402,10 @@ clio::run::TaskResume Runtime::DropBlock(const FsReq &req, FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   std::vector<clio::run::u32> holders;
   std::vector<clio::run::u64> leases;
-  std::shared_ptr<BlockSlot> sealed;
+  std::shared_ptr<TableBlockSlot> sealed;
   {
     std::lock_guard<std::mutex> g(ns_mu_);
-    auto it = blocks_.find(BlockKey{req.dir_id_, req.block_});
+    auto it = blocks_.find(TableBlockKey{req.dir_id_, req.block_});
     if (it != blocks_.end() && it->second->home_) {
       if (!it->second->blk_.sealed_) {
         resp.rc_ = EBUSY;
@@ -1234,90 +1422,34 @@ clio::run::TaskResume Runtime::DropBlock(const FsReq &req, FsResp &resp) {
     JournalDropBlock(req.dir_id_, req.block_);
   } else {
     auto d = cte_.AsyncDelBlob(FsUnpack(req.dir_id_),
-                               DirBlockName(req.block_),
+                               TableBlockName(req.block_),
                                clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(d);
   }
   if (sealed != nullptr) {
     std::lock_guard<std::mutex> g(ns_mu_);
-    auto it = blocks_.find(BlockKey{req.dir_id_, req.block_});
+    auto it = blocks_.find(TableBlockKey{req.dir_id_, req.block_});
     if (it != blocks_.end() && it->second == sealed) blocks_.erase(it);
   }
   if (!holders.empty()) {
-    DirDelta x;
-    x.kind_ = DirDeltaKind::kDrop;
+    TableDelta x;
+    x.kind_ = TableDeltaKind::kDrop;
     x.dir_ = req.dir_id_;
     x.index_ = req.block_;
-    std::vector<DirDelta> one;
+    std::vector<TableDelta> one;
     one.push_back(x);
     FsReq pr;
-    pr.str_ = EncodeDirDeltas(one);
+    pr.str_ = EncodeTableDeltas(one);
     std::vector<clio::run::u32> gone;
-    CLIO_CO_AWAIT(PushToHolders(kShardBlockPush, pr, holders, leases, &gone));
+    CLIO_CO_AWAIT(PushToHolders(kTablePush, pr, holders, leases, &gone));
   }
   resp.rc_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::DirAttrOp(const FsReq &req, FsResp &resp) {
-  CLIO_TASK_BODY_BEGIN
-  const clio::run::u32 f = req.flags_;
-  if (BlockHome(req.dir_id_, 0) != container_id_) {
-    resp.rc_ = kFsRedirect;
-    CLIO_CO_RETURN;
-  }
-  std::shared_ptr<BlockSlot> slot;
-  int rc = 0;
-  CLIO_CO_AWAIT(LoadBlock(req.dir_id_, 0, slot, rc));
-  if (rc != 0) {
-    resp.rc_ = static_cast<clio::run::u32>(rc);
-    CLIO_CO_RETURN;
-  }
-  clio::run::u64 v = 0;
-  {
-    std::lock_guard<std::mutex> g(ns_mu_);
-    DirHeader &h = slot->blk_.hdr_;
-    const clio::run::u64 now = NowNs();
-    bool changed = false;
-    if ((f & kAccessTouch) == 0) {  // directory reads do not track atime
-      if (f & kSetAtimeNow) { h.atime_ = now; changed = true; }
-      else if (f & kSetAtime) { h.atime_ = req.a_; changed = true; }
-      if (f & kSetMtimeNow) { h.mtime_ = now; changed = true; }
-      else if (f & kSetMtime) { h.mtime_ = req.b_; changed = true; }
-      if (f & kSetUid) { h.uid_ = req.uid_; changed = true; }
-      if (f & kSetGid) { h.gid_ = req.gid_; changed = true; }
-      if (f & kSetMode) { h.mode_ = req.mode_ & 07777u; changed = true; }
-      if (f & kSetParent) {
-        h.parent_ = req.id_;
-        h.leaf_ = req.leaf_;
-        changed = true;
-      }
-      if (changed || (f & kSetCtimeOnly)) {
-        h.ctime_ = now;
-        DirDelta dl;
-        dl.has_hdr_ = true;
-        dl.hdr_ = h;
-        v = RecordChangeLocked(*slot, dl, true);
-      }
-    }
-  }
-  if (v != 0) {
-    int crc = 0;
-    CLIO_CO_AWAIT(CommitBlock(slot, v, crc));
-    rc = crc;
-  }
-  if (rc == 0) {
-    CLIO_CO_AWAIT(DirStat(req.dir_id_, resp));
-  } else {
-    resp.rc_ = static_cast<clio::run::u32>(rc);
-  }
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
-
-clio::run::TaskResume Runtime::SealDir(clio::run::u64 dir, bool seal,
-                                       int &rc) {
+clio::run::TaskResume Runtime::SealTable(clio::run::u64 dir, bool seal,
+                                         int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   std::vector<clio::run::u32> todo{0}, sealed;
@@ -1329,7 +1461,7 @@ clio::run::TaskResume Runtime::SealDir(clio::run::u64 dir, bool seal,
     r.block_ = k;
     r.a_ = seal ? 1 : 0;
     FsResp resp;
-    CLIO_CO_AWAIT(CallShard(BlockHome(dir, k), kShardBlockSeal, r, resp));
+    CLIO_CO_AWAIT(CallShard(BlockHome(dir, k), kTableSeal, r, resp));
     if (resp.rc_ != 0 && seal) {
       rc = resp.rc_ == kFsRedirect ? EBUSY : static_cast<int>(resp.rc_);
       break;
@@ -1345,24 +1477,24 @@ clio::run::TaskResume Runtime::SealDir(clio::run::u64 dir, bool seal,
       r.block_ = k;
       r.a_ = 0;
       FsResp resp;
-      CLIO_CO_AWAIT(CallShard(BlockHome(dir, k), kShardBlockSeal, r, resp));
+      CLIO_CO_AWAIT(CallShard(BlockHome(dir, k), kTableSeal, r, resp));
     }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::DropDir(clio::run::u64 dir) {
+clio::run::TaskResume Runtime::DropTable(clio::run::u64 dir) {
   CLIO_TASK_BODY_BEGIN
   std::vector<clio::run::u32> blocks;
   int rc = 0;
-  CLIO_CO_AWAIT(DirBlocks(dir, &blocks, rc));
+  CLIO_CO_AWAIT(TableBlocks(dir, &blocks, rc));
   for (clio::run::u32 k : blocks) {
     FsReq r;
     r.dir_id_ = dir;
     r.block_ = k;
     FsResp resp;
-    CLIO_CO_AWAIT(CallShard(BlockHome(dir, k), kShardBlockDrop, r, resp));
+    CLIO_CO_AWAIT(CallShard(BlockHome(dir, k), kTableDrop, r, resp));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -1372,9 +1504,9 @@ clio::run::TaskResume Runtime::DropDir(clio::run::u64 dir) {
 // Reads through the cache
 // ===========================================================================
 
-clio::run::TaskResume Runtime::DirBlocks(clio::run::u64 dir,
-                                         std::vector<clio::run::u32> *out,
-                                         int &rc) {
+clio::run::TaskResume Runtime::TableBlocks(clio::run::u64 dir,
+                                           std::vector<clio::run::u32> *out,
+                                           int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   out->clear();
@@ -1392,13 +1524,13 @@ clio::run::TaskResume Runtime::DirBlocks(clio::run::u64 dir,
       rc = EIO;
       CLIO_CO_RETURN;
     }
-    std::shared_ptr<BlockSlot> slot;
+    std::shared_ptr<TableBlockSlot> slot;
     CLIO_CO_AWAIT(LoadBlock(dir, k, slot, rc));
     if (rc != 0) CLIO_CO_RETURN;
     out->push_back(k);
     {
       std::lock_guard<std::mutex> g(ns_mu_);
-      const DirBlock &b = slot->blk_;
+      const InodeTableBlock &b = slot->blk_;
       shape += std::to_string(b.index_) + ":" + std::to_string(b.born_) + "-" +
                std::to_string(b.depth_) + " ";
       for (clio::run::u32 c : ChildBlocks(b)) todo.push_back(c);
@@ -1412,7 +1544,7 @@ clio::run::TaskResume Runtime::DirBlocks(clio::run::u64 dir,
 }
 
 clio::run::TaskResume Runtime::CollectDir(
-    clio::run::u64 dir, std::vector<std::pair<std::string, DirEntry>> *out,
+    clio::run::u64 dir, std::vector<std::pair<std::string, InodeRow>> *out,
     clio::run::u64 *newest, int &rc) {
   CLIO_TASK_BODY_BEGIN
   // A listing is one snapshot of this node's copies of every block, taken
@@ -1426,11 +1558,11 @@ clio::run::TaskResume Runtime::CollectDir(
     out->clear();
     *newest = 0;
     std::vector<clio::run::u32> blocks;
-    CLIO_CO_AWAIT(DirBlocks(dir, &blocks, rc));
+    CLIO_CO_AWAIT(TableBlocks(dir, &blocks, rc));
     if (rc != 0) CLIO_CO_RETURN;
-    std::vector<std::shared_ptr<BlockSlot>> slots;
+    std::vector<std::shared_ptr<TableBlockSlot>> slots;
     for (clio::run::u32 k : blocks) {
-      std::shared_ptr<BlockSlot> slot;
+      std::shared_ptr<TableBlockSlot> slot;
       CLIO_CO_AWAIT(LoadBlock(dir, k, slot, rc));
       if (rc != 0) CLIO_CO_RETURN;
       slots.push_back(std::move(slot));
@@ -1453,83 +1585,82 @@ clio::run::TaskResume Runtime::CollectDir(
 
 bool Runtime::SnapshotDir(
     clio::run::u64 dir, const std::vector<clio::run::u32> &blocks,
-    const std::vector<std::shared_ptr<BlockSlot>> &slots,
-    std::vector<std::pair<std::string, DirEntry>> *out,
+    const std::vector<std::shared_ptr<TableBlockSlot>> &slots,
+    std::vector<std::pair<std::string, InodeRow>> *out,
     clio::run::u64 *newest) {
   std::lock_guard<std::mutex> g(ns_mu_);
   // Every copy must still be the cached one: a copy that missed a change is
   // dropped (and refetched) and no longer receives pushes.
   for (size_t i = 0; i < blocks.size(); ++i) {
-    auto it = blocks_.find(BlockKey{dir, blocks[i]});
+    auto it = blocks_.find(TableBlockKey{dir, blocks[i]});
     if (it == blocks_.end() || it->second != slots[i]) return false;
   }
-  std::map<std::string, DirEntry> names;  // a name split across blocks: once
+  std::map<std::string, InodeRow> names;  // a name split across blocks: once
   std::unordered_set<clio::run::u64> live_ids;
   for (const auto &slot : slots) {
     *newest = std::max(*newest, slot->blk_.mtime_);
-    for (const auto &kv : slot->blk_.ents_) {
-      if (kv.second.state_ == kDirEntPending) continue;
+    for (const auto &kv : slot->blk_.rows_) {
+      if (kv.second.state_ == kRowPending) continue;
       names.emplace(kv.first, kv.second);
-      if (kv.second.state_ == kDirEntLive) live_ids.insert(kv.second.id_);
+      if (kv.second.state_ == kRowLive) live_ids.insert(kv.second.id_);
     }
   }
   for (const auto &kv : names) {
     // A leaving name whose inode is already live under another name is a
     // rename caught mid-way: list the file once, under its new name.
-    if (kv.second.state_ == kDirEntLeaving &&
+    if (kv.second.state_ == kRowLeaving &&
         live_ids.count(kv.second.id_) != 0) {
       continue;
     }
-    out->emplace_back(kv.first, kv.second);
+    out->emplace_back(RowName(kv.first, kv.second), kv.second);
   }
   return true;
 }
 
-clio::run::TaskResume Runtime::DirStat(clio::run::u64 dir, FsResp &resp) {
+clio::run::TaskResume Runtime::StatDir(clio::run::u64 dir, FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   std::vector<clio::run::u32> blocks;
   int rc = 0;
-  CLIO_CO_AWAIT(DirBlocks(dir, &blocks, rc));
-  DirHeader hdr;
+  CLIO_CO_AWAIT(TableBlocks(dir, &blocks, rc));
   clio::run::u64 newest = 0;
   for (size_t i = 0; rc == 0 && i < blocks.size(); ++i) {
-    std::shared_ptr<BlockSlot> slot;
+    std::shared_ptr<TableBlockSlot> slot;
     CLIO_CO_AWAIT(LoadBlock(dir, blocks[i], slot, rc));
     if (rc != 0) break;
     std::lock_guard<std::mutex> g(ns_mu_);
-    if (blocks[i] == 0) hdr = slot->blk_.hdr_;
     newest = std::max(newest, slot->blk_.mtime_);
   }
-  resp.rc_ = static_cast<clio::run::u32>(rc);
-  if (rc != 0) CLIO_CO_RETURN;
+  if (rc != 0) {
+    resp = FsResp();
+    resp.rc_ = static_cast<clio::run::u32>(rc);
+    CLIO_CO_RETURN;
+  }
+  CLIO_CO_AWAIT(StatInode(dir, resp));
+  if (resp.rc_ != 0) CLIO_CO_RETURN;
+  // Creates and removes change the table, not the record (writing the
+  // record on every create would serialize a directory's creates on its
+  // inode home): a row change after the last attribute change is the
+  // directory's mtime and ctime.
   FsAttr &a = resp.attr_;
-  a.id_ = dir;
-  a.type_ = kFsTypeDir;
-  a.size_ = 0;
-  a.nlink_ = 2;
-  a.mode_ = hdr.mode_;
-  a.uid_ = hdr.uid_;
-  a.gid_ = hdr.gid_;
-  a.atime_ = hdr.atime_;
-  DirEffectiveTimes(hdr, newest, &a.mtime_, &a.ctime_);
+  if (newest > a.ctime_) a.mtime_ = a.ctime_ = newest;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::WalkToBlock(clio::run::u64 dir,
-                                           const std::string &leaf,
-                                           std::shared_ptr<BlockSlot> &slot,
+                                           const std::string &key,
+                                           std::shared_ptr<TableBlockSlot> &slot,
                                            int &rc) {
   CLIO_TASK_BODY_BEGIN
-  const clio::run::u64 h = DirNameHash(leaf);
+  const clio::run::u64 h = TableHash(key);
   clio::run::u32 k = 0;
-  for (clio::run::u32 step = 0; step <= kDirMaxDepth + 1; ++step) {
+  for (clio::run::u32 step = 0; step <= kTableMaxDepth + 1; ++step) {
     CLIO_CO_AWAIT(LoadBlock(dir, k, slot, rc));
     if (rc != 0) CLIO_CO_RETURN;
     clio::run::u32 next = 0;
     {
       std::lock_guard<std::mutex> g(ns_mu_);
-      next = NextBlockForName(slot->blk_, h);
+      next = NextTableBlock(slot->blk_, h);
     }
     if (next == k) CLIO_CO_RETURN;
     k = next;
@@ -1539,16 +1670,17 @@ clio::run::TaskResume Runtime::WalkToBlock(clio::run::u64 dir,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::LookupEntry(clio::run::u64 dir,
-                                           const std::string &leaf,
-                                           DirEntry &out, int &rc) {
+clio::run::TaskResume Runtime::LookupRow(clio::run::u64 dir,
+                                         const std::string &name,
+                                         InodeRow &out, int &rc) {
   CLIO_TASK_BODY_BEGIN
-  std::shared_ptr<BlockSlot> slot;
-  CLIO_CO_AWAIT(WalkToBlock(dir, leaf, slot, rc));
+  const std::string key = KeyOf(name);
+  std::shared_ptr<TableBlockSlot> slot;
+  CLIO_CO_AWAIT(WalkToBlock(dir, key, slot, rc));
   if (rc != 0) CLIO_CO_RETURN;
   std::lock_guard<std::mutex> g(ns_mu_);
-  auto it = slot->blk_.ents_.find(leaf);
-  if (it == slot->blk_.ents_.end() || it->second.state_ == kDirEntPending) {
+  auto it = slot->blk_.rows_.find(key);
+  if (it == slot->blk_.rows_.end() || it->second.state_ == kRowPending) {
     rc = ENOENT;
   } else {
     out = it->second;
@@ -1558,22 +1690,22 @@ clio::run::TaskResume Runtime::LookupEntry(clio::run::u64 dir,
 }
 
 clio::run::TaskResume Runtime::ResolvePath(const std::string &path,
-                                           DirEntry &ent,
+                                           InodeRow &ent,
                                            clio::run::u64 &parent, int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   parent = 0;
-  ent = DirEntry();
+  ent = InodeRow();
   ent.id_ = FsPack(FsRootId());
   ent.type_ = kFsTypeDir;
   if (path == "/") CLIO_CO_RETURN;
   if (path.rfind(kFsIdStatPrefix, 0) == 0) {
     // An open file named by its inode (FsIdStatPath): it may have no name
-    // left at all. Ops on it act on the inode; there is no parent entry.
+    // left at all. Ops on it act on the inode; there is no parent row.
     ent.id_ = std::strtoull(path.c_str() + sizeof(kFsIdStatPrefix) - 1,
                             nullptr, 10);
     ent.type_ = kFsTypeFile;
-    ent.state_ = kDirEntLive;
+    ent.state_ = kRowLive;
     CLIO_CO_RETURN;
   }
   size_t pos = 1;
@@ -1588,8 +1720,8 @@ clio::run::TaskResume Runtime::ResolvePath(const std::string &path,
       CLIO_CO_RETURN;
     }
     parent = ent.id_;
-    DirEntry next;
-    CLIO_CO_AWAIT(LookupEntry(parent, comp, next, rc));
+    InodeRow next;
+    CLIO_CO_AWAIT(LookupRow(parent, comp, next, rc));
     if (rc != 0) CLIO_CO_RETURN;
     ent = next;
   }
@@ -1597,13 +1729,13 @@ clio::run::TaskResume Runtime::ResolvePath(const std::string &path,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::EntryOp(clio::run::u32 op, FsReq req,
+clio::run::TaskResume Runtime::TableOp(clio::run::u32 op, FsReq req,
                                        FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   for (int attempt = 0; attempt < 200; ++attempt) {
-    std::shared_ptr<BlockSlot> slot;
+    std::shared_ptr<TableBlockSlot> slot;
     int rc = 0;
-    CLIO_CO_AWAIT(WalkToBlock(req.dir_id_, req.leaf_, slot, rc));
+    CLIO_CO_AWAIT(WalkToBlock(req.dir_id_, KeyOf(req.leaf_), slot, rc));
     if (rc != 0) {
       resp = FsResp();
       resp.rc_ = static_cast<clio::run::u32>(rc);
@@ -1613,13 +1745,23 @@ clio::run::TaskResume Runtime::EntryOp(clio::run::u32 op, FsReq req,
       std::lock_guard<std::mutex> g(ns_mu_);
       req.block_ = slot->blk_.index_;
     }
-    CLIO_CO_AWAIT(CallShard(BlockHome(req.dir_id_, req.block_), op, req, resp));
+    bool lost = false;
+    CLIO_CO_AWAIT(CallShard(BlockHome(req.dir_id_, req.block_), op, req, resp,
+                            &lost));
+    // The block's home died with the call in flight: once it is declared
+    // dead BlockHome names its stand-in, which serves the block from its
+    // replicated CTE copy (#1263). Walk again rather than fail the lookup
+    // in the ~10 s before the death is declared; bounded by this loop.
+    if (lost) {
+      CLIO_CO_AWAIT(clio::run::yield(std::min(500000.0, 50000.0 * (attempt + 1))));
+      continue;
+    }
     if (resp.rc_ != static_cast<clio::run::u32>(kFsRedirect)) CLIO_CO_RETURN;
     {
       // Our copy said the name was here and the home says it is not: drop
       // the copy (a push may still be on its way) and walk again.
       std::lock_guard<std::mutex> g(ns_mu_);
-      auto it = blocks_.find(BlockKey{req.dir_id_, req.block_});
+      auto it = blocks_.find(TableBlockKey{req.dir_id_, req.block_});
       if (it != blocks_.end() && !it->second->home_ &&
           !it->second->committing_) {
         blocks_.erase(it);
@@ -1645,23 +1787,23 @@ clio::run::TaskResume Runtime::CheckMoveTarget(clio::run::u64 moving,
       CLIO_CO_RETURN;
     }
     if (cur == root) CLIO_CO_RETURN;
-    std::shared_ptr<BlockSlot> slot;
-    CLIO_CO_AWAIT(LoadBlock(cur, 0, slot, rc));
-    if (rc != 0) CLIO_CO_RETURN;
-    DirHeader hdr;
-    {
-      std::lock_guard<std::mutex> g(ns_mu_);
-      hdr = slot->blk_.hdr_;
+    // The directory's record points back at the row that names it.
+    FsResp sr;
+    CLIO_CO_AWAIT(StatInode(cur, sr));
+    if (sr.rc_ != 0) {
+      rc = static_cast<int>(sr.rc_);
+      CLIO_CO_RETURN;
     }
-    DirEntry up;
-    CLIO_CO_AWAIT(LookupEntry(hdr.parent_, hdr.leaf_, up, rc));
+    const clio::run::u64 up_dir = sr.attr_.parent_;
+    InodeRow up;
+    CLIO_CO_AWAIT(LookupRow(up_dir, sr.attr_.parent_key_, up, rc));
     // An ancestor that is itself being moved (or removed) could close a
     // cycle with this move: back off and let it finish.
-    if (rc != 0 || up.id_ != cur || up.state_ == kDirEntLeaving) {
+    if (rc != 0 || up.id_ != cur || up.state_ == kRowLeaving) {
       rc = EBUSY;
       CLIO_CO_RETURN;
     }
-    cur = hdr.parent_;
+    cur = up_dir;
   }
   rc = EBUSY;
   CLIO_CO_RETURN;
@@ -1671,7 +1813,7 @@ clio::run::TaskResume Runtime::CheckMoveTarget(clio::run::u64 moving,
 clio::run::TaskResume Runtime::EncodeHomeNames(std::string *out) {
   CLIO_TASK_BODY_BEGIN
   out->clear();
-  std::vector<BlockKey> keys;
+  std::vector<TableBlockKey> keys;
   if (dir_journal_) {
     JournaledHomeKeys(&keys);
   } else {
@@ -1679,27 +1821,28 @@ clio::run::TaskResume Runtime::EncodeHomeNames(std::string *out) {
                                          clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(list);
     for (size_t i = 0; i < list->tag_ids_.size(); ++i) {
-      keys.push_back(BlockKey{list->tag_ids_[i],
-                              static_cast<clio::run::u32>(std::strtoul(
-                                  list->blob_names_[i].c_str() + 2, nullptr,
-                                  10))});
+      keys.push_back(TableBlockKey{
+          list->tag_ids_[i],
+          static_cast<clio::run::u32>(
+              std::strtoul(list->blob_names_[i].c_str() + 2, nullptr, 10))});
     }
   }
   const clio::run::u64 now = NowNs();
-  for (const BlockKey &key : keys) {
+  for (const TableBlockKey &key : keys) {
     const clio::run::u64 dir = key.dir_;
     const clio::run::u32 k = key.index_;
     if (BlockHome(dir, k) != container_id_) continue;
-    std::shared_ptr<BlockSlot> slot;
+    std::shared_ptr<TableBlockSlot> slot;
     int rc = 0;
     CLIO_CO_AWAIT(LoadBlock(dir, k, slot, rc));
     if (rc != 0) continue;
     std::lock_guard<std::mutex> g(ns_mu_);
-    for (const auto &kv : slot->blk_.ents_) {
-      if (kv.second.state_ == kDirEntPending) continue;
+    for (const auto &kv : slot->blk_.rows_) {
+      if (kv.second.state_ == kRowPending) continue;
       clio::cte::core::EncodeTagNameOp(
           out, clio::cte::core::TagNameOp::kAddName, FsUnpack(kv.second.id_),
-          now, clio::cte::core::MakeTagRefName(FsUnpack(dir), kv.first));
+          now, clio::cte::core::MakeTagRefName(FsUnpack(dir),
+                                               RowName(kv.first, kv.second)));
     }
   }
   CLIO_CO_RETURN;

@@ -43,6 +43,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -838,6 +839,18 @@ class IpcManager {
    * Cheap (one relaxed atomic store), called from the receive threads.
    */
   void NoteHeardFrom(u64 node_id);
+
+  /** A peer probed this node as one it holds DEAD (rejoin notice). */
+  void NoteHeldDeadByPeer() {
+    held_dead_seq_.fetch_add(1, std::memory_order_acq_rel);
+  }
+  /** Count of rejoin notices received; a change means a peer failed this
+   *  node over since the caller last looked, so state it homes may have
+   *  been changed by a stand-in. */
+  u64 HeldDeadSeq() const {
+    return held_dead_seq_.load(std::memory_order_acquire);
+  }
+  std::atomic<u64> held_dead_seq_{0};
   /**
    * Record the incarnation a message from node_id carried (#1148).
    * @param node_id the sending node
@@ -849,6 +862,19 @@ class IpcManager {
   bool NotePeerIncarnation(u64 node_id, u64 incarnation);
   /** Nanoseconds since the last message from node_id; ~0ull if never. */
   u64 NsSinceHeardFrom(u64 node_id) const;
+
+  /**
+   * Nanoseconds since this node last got a pong from node_id on the control
+   * channel (~0 if never). The control channel (base port + 2) is a
+   * separate ZMQ context, socket pair and thread that carries only tiny
+   * ping/pong frames, so bulk data queued on the main peer sockets cannot
+   * delay it (decision control_port: probes queued behind 1 MiB PutBlobs
+   * missed the silence window and healthy nodes were declared dead).
+   */
+  u64 NsSincePong(u64 node_id) const;
+  /** Start / stop the control channel thread (runtime only). */
+  void StartControlChannel();
+  void StopControlChannel();
   /** Every node id in the hostfile (fixed after init; safe from any thread). */
   std::vector<u64> GetNodeIds() const;
   /** Number of nodes marked dead so far; a collective can never complete
@@ -881,6 +907,12 @@ class IpcManager {
    * @param new_state New state to set
    */
   void SetNodeState(u64 node_id, NodeState new_state);
+
+ private:
+  /** SetNodeState for a caller that already holds hostfile_mu_. */
+  void SetNodeStateLocked(u64 node_id, NodeState new_state);
+
+ public:
 
   /**
    * Record that traffic was just received from this peer (issue #856).
@@ -1943,10 +1975,25 @@ class IpcManager {
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host
+  /**
+   * Guards hostfile_map_'s STRUCTURE (and hosts_cache_). LoadHostfile and
+   * AddNode rebuild or insert while worker threads iterate the map (e.g. the
+   * admin idle probe's GetNodeIds), which ASan caught as a heap-use-after-free.
+   * Writers that clear/insert hold it exclusively; lookups and iteration hold
+   * it shared. Never taken recursively: callers already holding it use the
+   * *Locked helpers.
+   */
+  mutable std::shared_mutex hostfile_mu_;
   /** Last-heard-from steady-clock ns per node id (see NoteHeardFrom). */
   static constexpr u64 kHeardSlots = 65536;
   std::unique_ptr<std::atomic<u64>[]> last_heard_ns_{
       new std::atomic<u64>[kHeardSlots]()};
+  /** Last pong steady-clock ns per node id (control channel). */
+  std::unique_ptr<std::atomic<u64>[]> last_pong_ns_{
+      new std::atomic<u64>[kHeardSlots]()};
+  std::thread control_thread_;
+  std::atomic<bool> control_stop_{false};
+  void ControlChannelLoop();
   /** Confirmed membership changes; see GetMembershipEpoch (issue #856). */
   std::atomic<u64> membership_epoch_{0};
   /** Time of the latest real peer liveness transition; see
@@ -1971,7 +2018,8 @@ class IpcManager {
   }
   mutable std::vector<Host>
       hosts_cache_;  // Cached vector of hosts for GetAllHosts
-  mutable bool hosts_cache_valid_ = false;  // Flag to track cache validity
+  // Atomic: SetNodeState clears it under hostfile_mu_'s SHARED side.
+  mutable std::atomic<bool> hosts_cache_valid_{false};  // cache validity
   Host this_host_;                          // Identified host for this node
 
   // Client-side server waiting configuration (from environment variables)

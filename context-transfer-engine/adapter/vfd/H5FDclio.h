@@ -107,6 +107,11 @@ CLIO_VFD_API extern unsigned long H5FDclio_vec_max_span_g;
 CLIO_VFD_API extern unsigned long H5FDclio_cache_read_hits_g;
 CLIO_VFD_API extern unsigned long H5FDclio_cache_read_misses_g;
 
+/* fsync(2) calls issued by flush and close. The barrier is opt-in (fsync=1 or
+   CLIO_VFD_FSYNC=1), and with or without it the bytes a reader sees are
+   identical, so this is the only way a test can tell whether it ran. */
+CLIO_VFD_API extern unsigned long H5FDclio_fsyncs_g;
+
 /* H5PLget_plugin_type/H5PLget_plugin_info are declared by <H5PLextern.h>
  * (included above) with H5PLUGIN_DLL. Re-declaring them bare here made the
  * two declarations disagree about linkage, which MSVC rejects outright

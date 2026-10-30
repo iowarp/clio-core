@@ -188,9 +188,14 @@ class ConfigManager : public ctp::BaseConfig {
     // that may never be spawned. Rescues are rare and replacements are
     // recycled, so a modest fixed ceiling is enough: the pool only ever needs
     // as many replacements as there are workers wedged AT ONCE.
-    static constexpr u32 kMaxElasticLanes = 8;
+    // 16, not 8: under tiering load every baseline worker was observed
+    // wedged at once (16 workers parked in fdatasync/fallocate), so 8
+    // replacements could not cover them and the pool refused to grow while
+    // the CPUs sat idle. Blocking device calls now run off the workers
+    // (bdev BlockingOffload); this is the margin for anything else.
+    static constexpr u32 kMaxElasticLanes = 16;
     int ncpu = ctp::SystemInfo::GetCpuCount();
-    u32 want = (ncpu > 0) ? static_cast<u32>(ncpu) : 8;
+    u32 want = (ncpu > 0) ? static_cast<u32>(ncpu) : kMaxElasticLanes;
     return want < kMaxElasticLanes ? want : kMaxElasticLanes;
   }
 

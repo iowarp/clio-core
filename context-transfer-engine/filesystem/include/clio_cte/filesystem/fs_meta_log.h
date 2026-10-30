@@ -33,12 +33,12 @@
 
 /**
  * Append-only log of one filesystem container's metadata: the directory
- * journal (see fs_dir_journal.cc).
+ * journal (see fs_table_journal.cc).
  *
- * The container is home for a hash-chosen set of directory blocks
- * (fs_dir_block.h). It holds them in memory and makes every change durable
+ * The container is home for a hash-chosen set of inode-table blocks
+ * (fs_inode_table.h). It holds them in memory and makes every change durable
  * here, on its own node, as the delta it already pushes to the nodes caching
- * the block -- a few bytes per entry instead of a rewrite of the whole block.
+ * the block -- a few bytes per row instead of a rewrite of the whole block.
  * Each record is self-checking and written with a single write(2), so a
  * daemon crash (kill -9) loses nothing that returned to the caller; fsync
  * (SyncMeta, and a periodic tick) covers power loss. At startup the log is

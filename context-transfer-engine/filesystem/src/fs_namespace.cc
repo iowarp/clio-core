@@ -34,7 +34,8 @@
 /**
  * Transport between filesystem containers (ShardOp), inodes, the deferred
  * data purge, the CTE tag-name publisher and the small per-container system
- * records (id reservations, orphans). Directories live in fs_dirs.cc.
+ * records (id reservations, orphans). The inode table lives in
+ * fs_inode_table.cc.
  *
  * Multi-step operations (mkdir, rmdir, rename, link) keep consistency with
  * per-entry states instead of locks held across network round trips: a
@@ -97,28 +98,6 @@ bool DecReq(const std::string &s, Runtime::FsReq *r) {
          d.U64(&r->dir_id_) && d.U32(&r->block_);
 }
 
-/** Encode attributes. */
-void EncAttr(FsEnc &e, const Runtime::FsAttr &a) {
-  e.U64(a.id_);
-  e.U32(a.type_);
-  e.U64(a.size_);
-  e.U32(a.nlink_);
-  e.U32(a.mode_);
-  e.U32(a.uid_);
-  e.U32(a.gid_);
-  e.U64(a.atime_);
-  e.U64(a.mtime_);
-  e.U64(a.ctime_);
-}
-
-/** Decode attributes. */
-bool DecAttr(FsDec &d, Runtime::FsAttr *a) {
-  return d.U64(&a->id_) && d.U32(&a->type_) && d.U64(&a->size_) &&
-         d.U32(&a->nlink_) && d.U32(&a->mode_) && d.U32(&a->uid_) &&
-         d.U32(&a->gid_) && d.U64(&a->atime_) && d.U64(&a->mtime_) &&
-         d.U64(&a->ctime_);
-}
-
 /** Encode a response. */
 void EncResp(const Runtime::FsResp &r, std::string *out) {
   FsEnc e(out);
@@ -129,7 +108,7 @@ void EncResp(const Runtime::FsResp &r, std::string *out) {
   e.U32(r.old_type_);
   e.U32(r.created_);
   e.U64(r.handle_);
-  EncAttr(e, r.attr_);
+  Runtime::EncodeAttr(e, r.attr_);
   e.Str(r.str_);
 }
 
@@ -138,20 +117,34 @@ bool DecResp(const std::string &s, Runtime::FsResp *r) {
   FsDec d(s.data(), s.size());
   return d.U32(&r->rc_) && d.U64(&r->id_) && d.U32(&r->type_) &&
          d.U64(&r->old_id_) && d.U32(&r->old_type_) && d.U32(&r->created_) &&
-         d.U64(&r->handle_) && DecAttr(d, &r->attr_) && d.Str(&r->str_);
+         d.U64(&r->handle_) && Runtime::DecodeAttr(d, &r->attr_) && d.Str(&r->str_);
 }
 
-/** SetAttr flag bits (FsReq::flags_ of kShardInodeSetAttr / kShardDirAttr). */
-enum : clio::run::u32 {
-  kSetAtime = 1u, kSetMtime = 2u, kSetAtimeNow = 4u, kSetMtimeNow = 8u,
-  kSetUid = 16u, kSetGid = 32u, kSetMode = 64u, kAttrRepair = 128u,
-  kSetCtimeOnly = 256u,
-  // A read: advance atime by the relatime rule, never ctime (see
-  // InodeSetAttr). Set from the UtimensTask flag kUtimensAccess.
-  kAccessTouch = 512u,
-  kAccessStrict = 1024u,  // with kAccessTouch: strictatime, always move
-};
 }  // namespace
+
+void Runtime::EncodeAttr(FsEnc &e, const FsAttr &a) {
+  e.U64(a.id_);
+  e.U32(a.type_);
+  e.U64(a.size_);
+  e.U32(a.nlink_);
+  e.U32(a.mode_);
+  e.U32(a.uid_);
+  e.U32(a.gid_);
+  e.U64(a.atime_);
+  e.U64(a.mtime_);
+  e.U64(a.ctime_);
+  e.U64(a.parent_);
+  e.Str(a.parent_key_);
+  e.U32(a.volume_flags_);
+}
+
+bool Runtime::DecodeAttr(FsDec &d, FsAttr *a) {
+  return d.U64(&a->id_) && d.U32(&a->type_) && d.U64(&a->size_) &&
+         d.U32(&a->nlink_) && d.U32(&a->mode_) && d.U32(&a->uid_) &&
+         d.U32(&a->gid_) && d.U64(&a->atime_) && d.U64(&a->mtime_) &&
+         d.U64(&a->ctime_) && d.U64(&a->parent_) && d.Str(&a->parent_key_) &&
+         d.U32(&a->volume_flags_);
+}
 
 // ===========================================================================
 // Ownership and transport
@@ -189,8 +182,9 @@ clio::run::u32 Runtime::InodeOwner(clio::run::u64 packed) {
 
 clio::run::TaskResume Runtime::CallShard(clio::run::u32 target,
                                          clio::run::u32 op, const FsReq &req,
-                                         FsResp &resp) {
+                                         FsResp &resp, bool *node_lost) {
   CLIO_TASK_BODY_BEGIN
+  if (node_lost != nullptr) *node_lost = false;
   if (target == container_id_) {
     CLIO_CO_AWAIT(ExecShardOp(op, req, resp));
     CLIO_CO_RETURN;
@@ -207,6 +201,11 @@ clio::run::TaskResume Runtime::CallShard(clio::run::u32 target,
   if (t->GetReturnCode() != 0 || !DecResp(t->resp_.str(), &resp)) {
     // The owner is unreachable (dead node, network timeout): the state it
     // owns is unavailable, which POSIX can only express as an I/O error.
+    if (node_lost != nullptr &&
+        clio::cte::core::IsNodeLostRc(
+            static_cast<clio::run::u32>(t->GetReturnCode()))) {
+      *node_lost = true;
+    }
     resp = FsResp();
     resp.rc_ = EIO;
   }
@@ -280,33 +279,30 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
   // Records dirtied from here on are this op's: only their failure fails it.
   const clio::run::u64 since = DirtySeq();
   switch (op) {
-    case kShardInsert:
-    case kShardRemove:
-      CLIO_CO_AWAIT(EntryMutation(op, req, resp));
+    case kTableInsert:
+    case kTableRemove:
+    case kTableRespell:
+      CLIO_CO_AWAIT(RowMutation(op, req, resp));
       rc = static_cast<int>(resp.rc_);
       break;
-    case kShardDirCreate:
-      CLIO_CO_AWAIT(DirCreate(req, resp));
+    case kTableCreate:
+      CLIO_CO_AWAIT(CreateTable(req, resp));
       rc = static_cast<int>(resp.rc_);
       break;
-    case kShardBlockSeal:
+    case kTableSeal:
       CLIO_CO_AWAIT(SealBlock(req, resp));
       rc = static_cast<int>(resp.rc_);
       break;
-    case kShardDirAttr:
-      CLIO_CO_AWAIT(DirAttrOp(req, resp));
-      rc = static_cast<int>(resp.rc_);
-      break;
-    case kShardBlockFetch:
+    case kTableFetch:
       CLIO_CO_AWAIT(ServeBlockFetch(req, resp));
       rc = static_cast<int>(resp.rc_);
       break;
-    case kShardBlockPush: rc = ApplyBlockPush(req); break;
-    case kShardBlockInstall:
+    case kTablePush: rc = ApplyTablePush(req); break;
+    case kTableInstall:
       CLIO_CO_AWAIT(InstallBlock(req, resp));
       rc = static_cast<int>(resp.rc_);
       break;
-    case kShardBlockDrop:
+    case kTableDrop:
       CLIO_CO_AWAIT(DropBlock(req, resp));
       rc = static_cast<int>(resp.rc_);
       break;
@@ -340,8 +336,8 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
   // push handler that waited for this node's own inode stores -- which push
   // back to the sender, whose handler waits the same way -- deadlocked two
   // nodes storing inodes cached on each other.
-  if (op != kShardBlockPush && op != kShardInodePush &&
-      op != kShardBlockFetch) {
+  if (op != kTablePush && op != kShardInodePush &&
+      op != kTableFetch) {
     int ferr = 0;
     CLIO_CO_AWAIT(FlushInodes(&ferr, since));
     // The change could not be made durable (a full store): say so rather
@@ -414,8 +410,6 @@ clio::run::TaskResume Runtime::ExecInodeOp(clio::run::u32 op, const FsReq &req,
 // Inodes
 // ===========================================================================
 
-clio::cte::core::TagId Runtime::MintId() { return MintIdFor(container_id_); }
-
 clio::cte::core::TagId Runtime::MintIdFor(clio::run::u32 home) {
   std::lock_guard<std::mutex> g(meta_mu_);
   // Only ids covered by the durable reservation are handed out, so a
@@ -430,51 +424,47 @@ clio::cte::core::TagId Runtime::MintIdFor(clio::run::u32 home) {
 }
 
 clio::run::TaskResume Runtime::MintIdReady(clio::run::u32 home,
-                                           clio::cte::core::TagId &id) {
+                                           clio::cte::core::TagId &id,
+                                           int &rc) {
   CLIO_TASK_BODY_BEGIN
+  rc = 0;
   for (;;) {
     id = MintIdFor(home);
     if (!id.IsNull()) break;
-    CLIO_CO_AWAIT(EnsureIdReserve(1024));
+    bool ok = false;
+    CLIO_CO_AWAIT(EnsureIdReserve(1024, ok));
+    if (!ok) {
+      rc = EIO;  // never mint past a reservation that is not recorded
+      break;
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-std::shared_ptr<Runtime::FileInfo> Runtime::NewInode(
-    const clio::cte::core::TagId &id, clio::run::u32 type, clio::run::u32 mode,
-    const std::string &symlink, const std::string &path) {
-  auto fi = std::make_shared<FileInfo>();
-  fi->tag_id_ = id;
-  fi->path_ = path;
-  fi->type_ = type;
-  fi->mode_ = mode == 0xFFFFFFFFu ? mode : (mode & 07777u);
-  fi->symlink_ = symlink;
-  const clio::run::u64 now = NowNs();
-  fi->atime_ = fi->mtime_ = fi->ctime_ = now;
+std::shared_ptr<Runtime::InodeState> Runtime::FindInode(clio::run::u64 packed) {
   std::lock_guard<std::mutex> g(meta_mu_);
-  by_tag_[FsPack(id)] = fi;
-  LogInode(*fi);
-  return fi;
+  auto it = inodes_.find(packed);
+  return it == inodes_.end() ? nullptr : it->second;
 }
 
-std::shared_ptr<Runtime::FileInfo> Runtime::FindInode(clio::run::u64 packed) {
-  std::lock_guard<std::mutex> g(meta_mu_);
-  auto it = by_tag_.find(packed);
-  return it == by_tag_.end() ? nullptr : it->second;
-}
-
-void Runtime::InodeAttrLocked(const FileInfo &fi, FsAttr *attr) {
+void Runtime::InodeAttrLocked(const InodeState &fi, FsAttr *attr) {
+  const bool dir = fi.type_ == kFsTypeDir;
   attr->id_ = FsPack(fi.tag_id_);
   attr->type_ = fi.type_;
-  attr->size_ = FileSize(fi);
-  attr->nlink_ = fi.nlink_;
+  attr->size_ = dir ? 0 : FileSize(fi);
+  // A directory has one name, but "." and its own row: POSIX counts 2 (and
+  // no subdirectory links, which tools treat as "unknown", as on btrfs).
+  attr->nlink_ = dir ? 2u : fi.nlink_;
   attr->mode_ = fi.mode_;
   attr->uid_ = fi.uid_;
   attr->gid_ = fi.gid_;
   attr->atime_ = fi.atime_;
   attr->mtime_ = fi.mtime_;
   attr->ctime_ = fi.ctime_;
+  attr->parent_ = fi.parent_;
+  attr->parent_key_ = fi.parent_key_;
+  attr->volume_flags_ = fi.volume_flags_;
 }
 
 int Runtime::InodeOpenLocal(const FsReq &req, FsResp &resp) {
@@ -488,13 +478,13 @@ int Runtime::InodeOpenLocal(const FsReq &req, FsResp &resp) {
   resp.handle_ = h;
   InodeAttrLocked(*fi, &resp.attr_);
   if (!req.dir_.empty()) {
-    fi->path_ = req.dir_;  // the name it was opened by (mirror key)
-    MirrorFile(fi->path_, *fi);
+    fi->mirror_path_ = req.dir_;  // the name it was opened by (mirror key)
+    MirrorFile(fi->mirror_path_, *fi);
   }
   return 0;
 }
 
-void Runtime::DropInodeLocked(const std::shared_ptr<FileInfo> &fi) {
+void Runtime::DropInodeLocked(const std::shared_ptr<InodeState> &fi) {
   if (fi->open_count_ > 0) {
     // POSIX: an unlinked file lives until its last descriptor closes.
     fi->orphan_ = true;
@@ -506,7 +496,7 @@ void Runtime::DropInodeLocked(const std::shared_ptr<FileInfo> &fi) {
     std::lock_guard<std::mutex> g(purge_mu_);
     orphans_dirty_ = true;  // it leaves the orphan record
   }
-  by_tag_.erase(packed);
+  inodes_.erase(packed);
   // Its record still reads nlink 1 until the purge deletes it: an open
   // racing the rename that dropped it must not load it back (#1150).
   dying_.insert(packed);
@@ -520,19 +510,19 @@ void Runtime::DropInodeLocked(const std::shared_ptr<FileInfo> &fi) {
 int Runtime::InodeNlink(const FsReq &req, FsResp &resp) {
   const auto delta = static_cast<clio::run::i64>(req.a_);
   std::lock_guard<std::mutex> g(meta_mu_);
-  auto it = by_tag_.find(req.id_);
-  if (it == by_tag_.end()) return ENOENT;
-  std::shared_ptr<FileInfo> fi = it->second;
+  auto it = inodes_.find(req.id_);
+  if (it == inodes_.end()) return ENOENT;
+  std::shared_ptr<InodeState> fi = it->second;
   const clio::run::i64 n = static_cast<clio::run::i64>(fi->nlink_) + delta;
   fi->nlink_ = n > 0 ? static_cast<clio::run::u32>(n) : 0u;
   fi->ctime_ = NowNs();
   // Keep the name the inode publishes itself under current: a size push
   // after a rename must not re-publish (resurrect) the old name.
-  if (!req.str_.empty()) {
+  if (!req.str_.empty() && fi->type_ != kFsTypeDir) {
     if (delta > 0) {
-      fi->path_ = req.str_;
-    } else if (fi->path_ == req.str_) {
-      fi->path_.clear();
+      fi->mirror_path_ = req.str_;
+    } else if (fi->mirror_path_ == req.str_) {
+      fi->mirror_path_.clear();
     }
   }
   InodeAttrLocked(*fi, &resp.attr_);
@@ -547,10 +537,16 @@ int Runtime::InodeNlink(const FsReq &req, FsResp &resp) {
 int Runtime::InodeSetAttr(const FsReq &req, FsResp &resp) {
   const clio::run::u32 f = req.flags_;
   std::lock_guard<std::mutex> g(meta_mu_);
-  auto it = by_tag_.find(req.id_);
-  if (it == by_tag_.end()) return ENOENT;
-  FileInfo &fi = *it->second;
+  auto it = inodes_.find(req.id_);
+  if (it == inodes_.end()) return ENOENT;
+  InodeState &fi = *it->second;
   const clio::run::u64 now = NowNs();
+  const bool dir = fi.type_ == kFsTypeDir;
+  if ((f & kAccessTouch) && dir) {
+    // Directory reads (listings) do not track atime.
+    InodeAttrLocked(fi, &resp.attr_);
+    return 0;
+  }
   if (f & kAccessTouch) {
     // relatime (the Linux default): a read moves atime only when it is not
     // newer than the last change or is a day old. A read is not a change,
@@ -560,7 +556,7 @@ int Runtime::InodeSetAttr(const FsReq &req, FsResp &resp) {
         fi.atime_ <= fi.ctime_ || now - fi.atime_ >= kDayNs) {
       fi.atime_ = now;
       LogInode(fi);
-      if (!fi.path_.empty()) MirrorFile(fi.path_, fi);
+      if (!fi.mirror_path_.empty()) MirrorFile(fi.mirror_path_, fi);
     }
     InodeAttrLocked(fi, &resp.attr_);
     return 0;
@@ -569,12 +565,17 @@ int Runtime::InodeSetAttr(const FsReq &req, FsResp &resp) {
   else if (f & kSetAtime) fi.atime_ = req.a_;
   if (f & kSetMtimeNow) fi.mtime_ = now;
   else if (f & kSetMtime) fi.mtime_ = req.b_;
+  if (f & (kSetMtimeNow | kSetMtime)) fi.mtime_set_ns_ = now;
   if (f & kSetUid) fi.uid_ = req.uid_;
   if (f & kSetGid) fi.gid_ = req.gid_;
   if (f & kSetMode) fi.mode_ = req.mode_ & 07777u;
+  if ((f & kSetParent) && dir) {
+    fi.parent_ = req.b_;
+    fi.parent_key_ = req.str_;
+  }
   fi.ctime_ = now;
   LogInode(fi);
-  if (!fi.path_.empty()) MirrorFile(fi.path_, fi);
+  if (!fi.mirror_path_.empty()) MirrorFile(fi.mirror_path_, fi);
   InodeAttrLocked(fi, &resp.attr_);
   return 0;
 }
@@ -582,7 +583,7 @@ int Runtime::InodeSetAttr(const FsReq &req, FsResp &resp) {
 clio::run::TaskResume Runtime::InodeTruncate(const FsReq &req, FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   resp.rc_ = 0;
-  std::shared_ptr<FileInfo> fi = FindInode(req.id_);
+  std::shared_ptr<InodeState> fi = FindInode(req.id_);
   if (fi == nullptr) {
     resp.rc_ = ENOENT;
     CLIO_CO_RETURN;
@@ -605,7 +606,7 @@ clio::run::TaskResume Runtime::InodeTruncate(const FsReq &req, FsResp &resp) {
     const clio::run::u64 now = NowNs();
     fi->mtime_ = fi->ctime_ = now;
     LogInode(*fi);
-    if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
+    if (!fi->mirror_path_.empty()) MirrorFile(fi->mirror_path_, *fi);
     InodeAttrLocked(*fi, &resp.attr_);
   }
   // The pages are the truth, not the size: a client pushes a file's size
@@ -831,7 +832,10 @@ clio::run::TaskResume Runtime::CatchUpNames() {
 // ===========================================================================
 
 namespace {
-/** Blob holding container `c`'s id reservation. */
+/** Xattr key (in the system tag) holding container `c`'s id reservation. */
+std::string IdsKey(clio::run::u32 c) { return "~ids." + std::to_string(c); }
+/** Blob that held the id reservation before it moved to IdsKey (read only,
+ *  so a reservation stored by an earlier build is still honoured). */
 std::string IdsBlob(clio::run::u32 c) { return "ids." + std::to_string(c); }
 /** Blob holding container `c`'s orphan list. */
 std::string OrphansBlob(clio::run::u32 c) {
@@ -846,7 +850,7 @@ clio::cte::core::Context SysCtx(bool volatile_only) {
 }
 }  // namespace
 
-void Runtime::LogInode(const FileInfo &fi) {
+void Runtime::LogInode(const InodeState &fi) {
   // The inode's record lives in CTE (FlushInodes stores and pushes it before
   // the change is acknowledged). Orphans are also listed in this container's
   // orphan record, so a restart can destroy them.
@@ -857,8 +861,10 @@ void Runtime::LogInode(const FileInfo &fi) {
   }
 }
 
-clio::run::TaskResume Runtime::EnsureIdReserve(clio::run::u32 margin) {
+clio::run::TaskResume Runtime::EnsureIdReserve(clio::run::u32 margin,
+                                               bool &ok) {
   CLIO_TASK_BODY_BEGIN
+  ok = true;
   for (;;) {
     clio::run::u32 want = 0;
     bool go = false;
@@ -874,27 +880,32 @@ clio::run::TaskResume Runtime::EnsureIdReserve(clio::run::u32 margin) {
       CLIO_CO_AWAIT(clio::run::yield(20.0));
       continue;
     }
-    bool ok = true;
-    if (!sys_tag_id_.IsNull()) {
+    // The reservation is a key of this container's system tag, on its own
+    // CTE container: an in-memory update made durable by the CTE WAL, like
+    // the inode records. It used to be a blob that had to land on a
+    // non-volatile tier; with none configured every store failed, the
+    // counter restarted at 1 after each restart, and new directories took
+    // the ids of live ones -- each showing the other's contents.
+    if (sys_tag_id_.IsNull()) {
+      ok = false;
+    } else {
       std::string rec;
       FsEnc(&rec).U32(want);
-      auto p = cte_.AsyncPutBlob(sys_tag_id_, IdsBlob(container_id_), 0,
-                                 rec.size(), rec.data(), -1.0f,
-                                 SysCtx(inode_volatile_only_), 0u,
-                                 clio::run::PoolQuery::Dynamic());
+      auto p = cte_.AsyncTagSetXattr(sys_tag_id_, IdsKey(container_id_), rec,
+                                     0, clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(p);
       ok = p->GetReturnCode() == 0;
       if (!ok) {
         HLOG(kError, "filesystem: storing the id reservation failed (rc {}); "
-             "ids minted now could repeat after a restart",
+             "no inode is created until it is stored, since an unrecorded "
+             "reservation lets ids repeat after a restart",
              p->GetReturnCode());
       }
     }
     {
       std::lock_guard<std::mutex> g(meta_mu_);
       reserving_ = false;
-      // Unavailability must not stop creates: advance anyway (logged above).
-      minted_hi_ = std::max(minted_hi_, want);
+      if (ok) minted_hi_ = std::max(minted_hi_, want);
     }
     break;
   }
@@ -914,7 +925,7 @@ clio::run::TaskResume Runtime::StoreOrphans() {
     FsEnc e(&rec);
     std::lock_guard<std::mutex> g(meta_mu_);
     std::vector<clio::run::u64> ids;
-    for (const auto &kv : by_tag_) {
+    for (const auto &kv : inodes_) {
       if (kv.second->orphan_) ids.push_back(kv.first);
     }
     e.U32(static_cast<clio::run::u32>(ids.size()));
@@ -938,6 +949,23 @@ clio::run::TaskResume Runtime::LoadSysRecords() {
   if (sys_tag_id_.IsNull()) CLIO_CO_RETURN;
   std::string rec;
   {
+    auto x = cte_.AsyncTagGetXattr(sys_tag_id_, IdsKey(container_id_),
+                                   clio::run::PoolQuery::Local());
+    CLIO_CO_AWAIT(x);
+    clio::run::u32 hi = 0;
+    if (x->GetReturnCode() == 0 && x->found_) {
+      const std::string v = x->value_.str();
+      FsDec d(v.data(), v.size());
+      if (d.U32(&hi)) {
+        // Everything reserved before the restart may be in use: start past it.
+        std::lock_guard<std::mutex> lk(meta_mu_);
+        next_minor_ = std::max<clio::run::u32>(hi, 1);
+        minted_hi_ = next_minor_;
+      }
+    }
+  }
+  {
+    // A reservation an earlier build stored as a blob.
     auto sz = cte_.AsyncGetBlobSize(sys_tag_id_, IdsBlob(container_id_));
     CLIO_CO_AWAIT(sz);
     if (sz->GetReturnCode() == 0 && sz->size_ >= 4) {
@@ -948,9 +976,9 @@ clio::run::TaskResume Runtime::LoadSysRecords() {
       clio::run::u32 hi = 0;
       FsDec d(rec.data(), rec.size());
       if (g->GetReturnCode() == 0 && d.U32(&hi)) {
-        // Everything reserved before the restart may be in use: start past it.
         std::lock_guard<std::mutex> lk(meta_mu_);
-        next_minor_ = std::max<clio::run::u32>(hi, 1);
+        next_minor_ = std::max<clio::run::u32>(next_minor_,
+                                               std::max<clio::run::u32>(hi, 1));
         minted_hi_ = next_minor_;
       }
     }
@@ -978,9 +1006,9 @@ clio::run::TaskResume Runtime::LoadSysRecords() {
   for (clio::run::u64 id : orphans) {
     CLIO_CO_AWAIT(EnsureInode(id));
     std::lock_guard<std::mutex> g(meta_mu_);
-    auto it = by_tag_.find(id);
-    if (it == by_tag_.end()) continue;
-    std::shared_ptr<FileInfo> fi = it->second;
+    auto it = inodes_.find(id);
+    if (it == inodes_.end()) continue;
+    std::shared_ptr<InodeState> fi = it->second;
     fi->open_count_ = 0;
     fi->orphan_ = false;
     DropInodeLocked(fi);

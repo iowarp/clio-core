@@ -2915,6 +2915,35 @@ TEST_CASE("CTE SHM cache direct payload read",
         tag_id, blob_name, got.data(), blob_size, blob_size / 2));
   }
 
+  SECTION("Read counters account for each outcome") {
+    // issue #787: these counters are the only way to see the fast path
+    // degrade to RPC, so every outcome must land in exactly one of them.
+    const auto before = clio::cte::core::GetThreadShmReadStats();
+    std::vector<char> got(blob_size, 0);
+    REQUIRE(client.TryReadBlobShm(tag_id, blob_name, got.data(), blob_size));
+    REQUIRE_FALSE(client.TryReadBlobShm(tag_id, blob_name, got.data(),
+                                        blob_size, blob_size / 2));
+    clio::cte::core::ShmBlobRecord missing;
+    REQUIRE_FALSE(
+        client.TryGetBlobRecordShm(tag_id, "no_such_blob_787", &missing));
+    const auto after = clio::cte::core::GetThreadShmReadStats();
+
+    REQUIRE(after.payload_reads - before.payload_reads == 2);
+    REQUIRE(after.payload_hits - before.payload_hits == 1);
+    REQUIRE(after.payload_not_servable - before.payload_not_servable == 1);
+    REQUIRE(after.payload_write_in_flight == before.payload_write_in_flight);
+    REQUIRE(after.payload_raced_writer == before.payload_raced_writer);
+    // The hit reads the record before and after its copy; the refused read
+    // once; the lookup of a missing blob once.
+    REQUIRE(after.record_reads - before.record_reads == 4);
+    // A blob that is not cached is a miss, not a fallback.
+    REQUIRE(after.record_fallbacks == before.record_fallbacks);
+
+    const auto process = clio::cte::core::GetShmReadStats();
+    REQUIRE(process.payload_hits >= after.payload_hits);
+    REQUIRE(process.record_reads >= after.record_reads);
+  }
+
   SECTION("Payload benchmark: direct vs RPC") {
     const int kIters = 2000;
     std::vector<char> buf(blob_size, 0);

@@ -153,7 +153,11 @@ class DefaultScheduler : public Scheduler {
   static bool HasRoom(const Worker *w, double hold_us, double now_us);
 
  private:
-  static constexpr double kStallThresholdSec = 1.0;  ///< #781: worker stall cutoff
+  /// #781: worker stall cutoff. A task holding its worker this long has its
+  /// worker's backlog redistributed and a replacement started. 0.3 s was
+  /// tried and flagged routine 1-2 s device tasks on every worker; liveness
+  /// no longer depends on worker queues (control channel), so 1 s.
+  static constexpr double kStallThresholdSec = 1.0;
   static constexpr double kRetireCooldownSec = 5.0;  ///< #781: idle elastic retire
   static constexpr u32 kStealBatch = 4;              ///< #781: tasks stolen per victim
 

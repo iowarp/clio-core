@@ -70,9 +70,11 @@
 #include "clio_cte/core/content_transfer_engine.h"
 #include "clio_cte/core/core_client.h"  // CLIO_CTE_CLIENT + GetCapacity
 #include "clio_cte/filesystem/filesystem_client.h"
+#include "clio_cte/filesystem/fs_inode.h"
 #include "clio_cte/filesystem/fs_shard.h"
 #include "clio_cte/stream/stream_client.h"  // deferred O_APPEND
 #include "clio_cte/replication/replication_tasks.h"  // FlushTagTask (fsync barrier)
+#include "fuse_cte_profile.h"  // CLIO_FUSE_PROFILE: per-callback timing
 
 // Bridge the POSIX type spellings the callbacks use to the concrete types
 // each platform's FUSE layer expects in `struct fuse_operations`. On Linux
@@ -170,6 +172,77 @@ struct CfsHandle {
   std::atomic<clio::run::u64> nospace_seen{0};
 };
 
+// ---------------------------------------------------------------------------
+// Case policy. On a case-insensitive volume every spelling of a path is one
+// file, so every path-keyed cache below keys on the canonical path (the
+// volume reports its policy at mount, cte_fuse_init). Values keep the
+// spelling wherever a name goes back to the kernel or the runtime.
+// ---------------------------------------------------------------------------
+std::atomic<bool> g_case_insensitive{false};
+
+/**
+ * The key a path is cached under on this mount.
+ * @param p path as spelled
+ * @return its canonical form (the path itself on a case-sensitive volume)
+ */
+std::string CacheKey(const std::string &p) {
+  return clio::cte::filesystem::FsCanonicalPath(
+      p, g_case_insensitive.load(std::memory_order_relaxed));
+}
+
+/**
+ * A map keyed by path that treats every spelling of a path as one key
+ * (CacheKey). Iteration yields canonical keys.
+ */
+template <typename V>
+class PathMap {
+ public:
+  using Map = std::unordered_map<std::string, V>;
+  using iterator = typename Map::iterator;
+  /** @return the value for `p`, default-constructed if absent */
+  V &operator[](const std::string &p) { return m_[CacheKey(p)]; }
+  /** @return the entry for `p`, or end() */
+  iterator find(const std::string &p) { return m_.find(CacheKey(p)); }
+  /** Insert unless present. @return (entry, inserted) */
+  std::pair<iterator, bool> emplace(const std::string &p, const V &v) {
+    return m_.emplace(CacheKey(p), v);
+  }
+  /** Erase `p`. @return entries erased (0 or 1) */
+  size_t erase(const std::string &p) { return m_.erase(CacheKey(p)); }
+  /** Erase at an iterator. @return the next iterator */
+  iterator erase(iterator it) { return m_.erase(it); }
+  iterator begin() { return m_.begin(); }
+  iterator end() { return m_.end(); }
+  size_t size() const { return m_.size(); }
+  bool empty() const { return m_.empty(); }
+  void clear() { m_.clear(); }
+
+ private:
+  Map m_;
+};
+
+/** A set of paths with the same key rule as PathMap. */
+class PathSet {
+ public:
+  /** Add `p`. */
+  void insert(const std::string &p) { s_.insert(CacheKey(p)); }
+  /** Remove `p`. @return entries removed (0 or 1) */
+  size_t erase(const std::string &p) { return s_.erase(CacheKey(p)); }
+  /** @return 1 if `p` is present, else 0 */
+  size_t count(const std::string &p) const { return s_.count(CacheKey(p)); }
+
+ private:
+  std::unordered_set<std::string> s_;
+};
+
+/** Orders spellings by their canonical form (hard-link groups, where one
+ *  name may be named again by another spelling of it). */
+struct CacheKeyLess {
+  bool operator()(const std::string &a, const std::string &b) const {
+    return CacheKey(a) < CacheKey(b);
+  }
+};
+
 /** The files open on one libfuse node -- one kernel inode, one page cache. */
 struct OpenNode {
   std::string path;  ///< the node's current path (follows renames)
@@ -191,10 +264,10 @@ struct OpenNode {
 // nodes through renames (OpenFilesRenamed), so every open of a node sees the
 // files already open on it.
 std::mutex g_open_files_mu;
-std::unordered_map<std::string, std::shared_ptr<OpenNode>> g_open_files;
+PathMap<std::shared_ptr<OpenNode>> g_open_files;
 // Hidden names that DO exist on the server: hides that fell back to a
 // server rename (HideOpenFile). Guarded by g_open_files_mu.
-std::unordered_set<std::string> g_server_hidden;
+PathSet g_server_hidden;
 
 /**
  * Register a new open of `h` on its node and keep the page cache from mixing
@@ -255,20 +328,31 @@ static void UnregisterOpenFile(CfsHandle *h) {
  */
 static void OpenFilesRenamed(const std::string &from, const std::string &to) {
   std::lock_guard<std::mutex> g(g_open_files_mu);
-  std::vector<std::pair<std::string, std::shared_ptr<OpenNode>>> moved;
-  const std::string dir_prefix = from + "/";
+  std::vector<std::shared_ptr<OpenNode>> moved;
+  const std::string from_key = CacheKey(from);
+  const std::string dir_prefix = from_key + "/";
   for (auto it = g_open_files.begin(); it != g_open_files.end();) {
-    const std::string &k = it->first;
-    if (k == from || k.compare(0, dir_prefix.size(), dir_prefix) == 0) {
-      moved.emplace_back(to + k.substr(from.size()), it->second);
+    const std::string &k = it->first;  // canonical
+    if (k == from_key || k.compare(0, dir_prefix.size(), dir_prefix) == 0) {
+      moved.push_back(it->second);
       it = g_open_files.erase(it);
     } else {
       ++it;
     }
   }
-  for (auto &kv : moved) {
-    kv.second->path = kv.first;
-    g_open_files[kv.first] = kv.second;
+  // A node's path keeps its own spelling below the moved prefix. Count
+  // components, not bytes: folding can change a name's length.
+  const size_t depth =
+      static_cast<size_t>(std::count(from.begin(), from.end(), '/'));
+  for (auto &node : moved) {
+    size_t cut = 0, seen = 0;
+    while (seen <= depth && cut != std::string::npos) {
+      cut = node->path.find('/', cut + (seen == 0 ? 0 : 1));
+      if (cut != std::string::npos) ++seen;
+    }
+    node->path = to + (cut == std::string::npos ? std::string()
+                                                : node->path.substr(cut));
+    g_open_files[node->path] = node;
   }
 }
 
@@ -374,6 +458,27 @@ bool SieveDataEnabled() {
   static const bool v = [] {
     const char *e = getenv("CLIO_FUSE_SIEVE");
     return e == nullptr || *e != '0';
+  }();
+  return v;
+}
+
+/**
+ * Write data that may be in flight to the store at once (bytes).
+ *
+ * Writes are copied into client shared memory and shipped as deferred puts;
+ * with no window a burst of writes queued there as fast as applications
+ * wrote, and client shared-memory segments are never released: a Steam
+ * install (48 GB, ~9 writers) grew the adapter to 64 segments / 8 GB.
+ * Past the window a write first awaits the oldest puts.
+ * CLIO_FUSE_WRITE_INFLIGHT_MB overrides the 256 MiB default; 0 = no window.
+ * @return the window in bytes (0 = unbounded)
+ */
+clio::run::u64 WriteInflightBytes() {
+  static const clio::run::u64 v = [] {
+    const char *e = getenv("CLIO_FUSE_WRITE_INFLIGHT_MB");
+    const clio::run::u64 mb =
+        e != nullptr && e[0] != 0 ? std::strtoull(e, nullptr, 10) : 256;
+    return mb << 20;
   }();
   return v;
 }
@@ -637,12 +742,17 @@ bool SieveCreateEnabled() {
 // read-clamping consult this in the meantime. Path-keyed; renames move the
 // entry, the closer erases it once the size-carrying close has been sent.
 std::mutex g_hw_mtx;
-std::unordered_map<std::string, clio::run::u64> g_hiwater;
+PathMap<clio::run::u64> g_hiwater;
 // Wall-clock time (ns) of the last write(2) this mount accepted per path,
 // kept alongside the hiwater: sieved bytes reach the chimod -- and so the
 // tag's mtime -- only when their page ships, so a stat right after write(2)
 // reported the PRE-write mtime (make and rsync compare exactly that).
-std::unordered_map<std::string, clio::run::u64> g_wtime;
+PathMap<clio::run::u64> g_wtime;
+// A write time an explicit utimens took off the stat overlay (the caller's
+// times win there), kept for the size push only: the push must still tell
+// the chimod the bytes predate the utimens, or it stamps the time it lands
+// and undoes the caller's mtime (cp -p / tar futimens before close).
+PathMap<clio::run::u64> g_wtime_pre;
 
 /** Current wall-clock time in nanoseconds since the epoch. */
 static clio::run::u64 WallNowNs() {
@@ -667,7 +777,7 @@ struct DirAttrEntry {
   std::chrono::steady_clock::time_point expiry;
 };
 std::mutex g_dir_attr_mtx;
-std::unordered_map<std::string, DirAttrEntry> g_dir_attr;
+PathMap<DirAttrEntry> g_dir_attr;
 double g_dir_attr_ttl_s = 0.0;  ///< set at init; 0 disables the cache
 
 /**
@@ -730,6 +840,7 @@ void HiwaterRaise(const std::string &path, clio::run::u64 end) {
     auto &v = g_hiwater[path];
     if (end > v) v = end;
     g_wtime[path] = WallNowNs();
+    g_wtime_pre.erase(path);
   }
   // A write supersedes a pending utimens mtime (the 2 s overlay would
   // otherwise keep reporting the stamped time over the write).
@@ -747,6 +858,19 @@ clio::run::u64 WriteTimeFor(const std::string &path) {
   auto it = g_wtime.find(path);
   return it == g_wtime.end() ? 0 : it->second;
 }
+/**
+ * Write time a size push carries for `path`: the last write(2), including
+ * one an explicit utimens has since taken off the stat overlay.
+ * @param path the file's current path
+ * @return nanoseconds since the epoch, or 0 when nothing is outstanding
+ */
+clio::run::u64 PushTimeFor(const std::string &path) {
+  std::lock_guard<std::mutex> lk(g_hw_mtx);
+  auto it = g_wtime.find(path);
+  if (it != g_wtime.end()) return it->second;
+  auto pt = g_wtime_pre.find(path);
+  return pt == g_wtime_pre.end() ? 0 : pt->second;
+}
 clio::run::u64 HiwaterFor(const std::string &path) {
   std::lock_guard<std::mutex> lk(g_hw_mtx);
   auto it = g_hiwater.find(path);
@@ -756,6 +880,7 @@ void HiwaterErase(const std::string &path) {
   std::lock_guard<std::mutex> lk(g_hw_mtx);
   g_hiwater.erase(path);
   g_wtime.erase(path);
+  g_wtime_pre.erase(path);
 }
 /**
  * Drop a path's hiwater entry after `pushed` was adopted by the chimod --
@@ -771,6 +896,7 @@ void HiwaterEraseIfCovered(const std::string &path, clio::run::u64 pushed) {
   if (it == g_hiwater.end() || it->second > pushed) return;
   g_hiwater.erase(it);
   g_wtime.erase(path);
+  g_wtime_pre.erase(path);
 }
 // Truncate invalidates any unflushed-write extent past the new size; without
 // this, getattr's hiwater overlay kept reporting the pre-truncate size.
@@ -798,6 +924,13 @@ void HiwaterRename(const std::string &from, const std::string &to) {
     clio::run::u64 v = wt->second;
     g_wtime.erase(wt);
     auto &dst = g_wtime[to];
+    if (v > dst) dst = v;
+  }
+  auto pt = g_wtime_pre.find(from);
+  if (pt != g_wtime_pre.end()) {
+    clio::run::u64 v = pt->second;
+    g_wtime_pre.erase(pt);
+    auto &dst = g_wtime_pre[to];
     if (v > dst) dst = v;
   }
 }
@@ -928,7 +1061,7 @@ struct PendingCreate {
 };
 std::mutex g_pc_mtx;
 std::mutex g_flush_mtx;  // held across an ENTIRE flush (swap + Wait + retire)
-std::unordered_map<std::string, PendingCreate> g_pending_creates;
+PathMap<PendingCreate> g_pending_creates;
 std::vector<clio::cte::filesystem::MultiCreateEnt> g_create_queue;
 
 /**
@@ -982,14 +1115,15 @@ static inline int FsErrno(int rc) {
 // Links made by OTHER mounts stay subject to plain TTL staleness.
 // ---------------------------------------------------------------------------
 std::mutex g_lg_mtx;
-std::unordered_map<std::string, std::shared_ptr<std::set<std::string>>>
-    g_link_groups;
+/** One hard-link group: its names as spelled, one per canonical name. */
+using LinkGroup = std::set<std::string, CacheKeyLess>;
+PathMap<std::shared_ptr<LinkGroup>> g_link_groups;
 
 void LinkGroupJoin(const std::string &a, const std::string &b) {
   std::lock_guard<std::mutex> lk(g_lg_mtx);
   auto ita = g_link_groups.find(a);
   auto itb = g_link_groups.find(b);
-  std::shared_ptr<std::set<std::string>> g;
+  std::shared_ptr<LinkGroup> g;
   if (ita != g_link_groups.end() && itb != g_link_groups.end()) {
     g = ita->second;
     for (const auto &m : *itb->second) g->insert(m);
@@ -998,7 +1132,7 @@ void LinkGroupJoin(const std::string &a, const std::string &b) {
   } else if (itb != g_link_groups.end()) {
     g = itb->second;
   } else {
-    g = std::make_shared<std::set<std::string>>();
+    g = std::make_shared<LinkGroup>();
   }
   g->insert(a);
   g->insert(b);
@@ -1032,7 +1166,7 @@ std::vector<std::string> LinkGroupSiblings(const std::string &p) {
   auto it = g_link_groups.find(p);
   if (it == g_link_groups.end()) return out;
   for (const auto &m : *it->second) {
-    if (m != p) out.push_back(m);
+    if (CacheKey(m) != CacheKey(p)) out.push_back(m);
   }
   return out;
 }
@@ -1099,7 +1233,7 @@ struct TimesOverlay {
   std::chrono::steady_clock::time_point at;
 };
 std::mutex g_to_mtx;
-std::unordered_map<std::string, TimesOverlay> g_times_overlay;
+PathMap<TimesOverlay> g_times_overlay;
 
 void TimesOverlaySet(const std::string &p, clio::run::u64 a,
                      clio::run::u64 m, clio::run::u64 c) {
@@ -1142,7 +1276,7 @@ bool PendingCreateLookup(const std::string &path, PendingCreate *out) {
 // path -> errno. The open() that "created" such a file already returned, so
 // the failure is owed to that file's fsync/close, like a failed write-back.
 std::mutex g_create_err_mtx;
-std::unordered_map<std::string, int> g_create_errors;
+PathMap<int> g_create_errors;
 
 /**
  * Record the entries of a MultiCreate batch that failed (the task's failed_
@@ -1286,7 +1420,7 @@ bool AnyCreateUnretired() {
 // fsync of the path reports them, as a write-back error surfaces at fsync on
 // a local filesystem.
 std::mutex g_publish_err_mtx;
-std::unordered_map<std::string, int> g_publish_err;
+PathMap<int> g_publish_err;
 
 /** Record a background publish failure for `path` (first one wins). */
 void LatchPublishError(const std::string &path, int err) {
@@ -1352,7 +1486,17 @@ void RunPublish(const PendingClose &pc) {
  * apply it. Shared by the closer thread and the synchronous barrier.
  * @param pc the entry
  */
+// Depth of RunCloserEntry on this thread. An entry can call back into a
+// hook that drains the closer (a refused write-behind shrinks the file
+// through cte_fuse_truncate): waiting for the closer there waited for this
+// very entry, and every later close and truncate hung behind it.
+thread_local int t_closer_entry_depth = 0;
+
 void RunCloserEntry(const PendingClose &pc) {
+  struct DepthGuard {
+    DepthGuard() { ++t_closer_entry_depth; }
+    ~DepthGuard() { --t_closer_entry_depth; }
+  } depth_guard;
   // Order the metadata op AFTER the file's in-flight writes land. A
   // fire-and-forget task racing them is how a detached close dropped
   // writes on a dead handle, and how a detached utimens republished the
@@ -1389,7 +1533,21 @@ void RunCloserEntry(const PendingClose &pc) {
               static_cast<clio::run::u64>(pc.tag.minor_),
           pc.hiwater, pc.wtime);
       t.Wait();
-      HiwaterEraseIfCovered(pc.path, pc.hiwater);
+      // Only on success (see RunPublish): erasing on a FAILED push (e.g. the
+      // inode's home unreachable mid-partition) discarded the one record
+      // that a size update was still pending, with nothing left to retry it
+      // from -- the file was stuck reporting size 0 forever, even after the
+      // partition healed (safe_partition_during_writes: fsynced data lost).
+      // release()'s return is not delivered to close(2) either way, so this
+      // failure is otherwise silent; latch it for the next fsync/flush/stat.
+      if (t->GetReturnCode() == 0) {
+        HiwaterEraseIfCovered(pc.path, pc.hiwater);
+      } else {
+        HLOG(kError, "clio_cte_fuse: closer publishing the size of {} failed "
+             "(rc {}); keeping the hiwater overlay for the next push",
+             pc.path, t->GetReturnCode());
+        LatchPublishError(pc.path, -EIO);
+      }
     }
   } else if (pc.hiwater != 0) {
     // AWAITED: the hiwater entry may only be dropped once the chimod
@@ -1397,7 +1555,14 @@ void RunCloserEntry(const PendingClose &pc) {
     // the stale pre-close size.
     auto t = CLIO_CFS_CLIENT->AsyncClose(pc.fh, pc.hiwater);
     t.Wait();
-    HiwaterEraseIfCovered(pc.path, pc.hiwater);
+    if (t->GetReturnCode() == 0) {
+      HiwaterEraseIfCovered(pc.path, pc.hiwater);
+    } else {
+      HLOG(kError, "clio_cte_fuse: closer publishing the size of {} failed "
+           "(rc {}); keeping the hiwater overlay for the next push",
+           pc.path, t->GetReturnCode());
+      LatchPublishError(pc.path, -EIO);
+    }
   } else {
     CLIO_CFS_CLIENT->AsyncCloseDetached(pc.fh);
   }
@@ -1466,6 +1631,9 @@ void MaybeDirectIo(struct fuse_file_info *fi) {
 // unlink call this — they're rare, and a queued entry executing after the
 // path moves is how every ghost/EEXIST class in the lock-cycle repro arose.
 void CloserBarrier() {
+  // Inside a closer entry: the entries before it have run, the ones after it
+  // must run after it -- there is nothing this caller may wait for.
+  if (t_closer_entry_depth > 0) return;
   std::deque<PendingClose> q;
   {
     // Also wait out an entry CloserMain already popped: it is invisible to
@@ -1525,9 +1693,46 @@ void cte_fuse_mark_session_live() {
 // FUSE lifecycle
 // ============================================================================
 
+/**
+ * Ask the mounted volume for its case policy (its root reports it) and
+ * adopt it for every path cache (CacheKey).
+ * @return true for a case-insensitive volume
+ */
+static bool QueryVolumeCasePolicy() {
+  auto t = CLIO_CFS_CLIENT->AsyncGetattr("/");
+  t.Wait();
+  const bool ci =
+      t->GetReturnCode() == 0 &&
+      (t->volume_flags_ & clio::cte::filesystem::kVolumeCaseInsensitive) != 0;
+  g_case_insensitive.store(ci, std::memory_order_relaxed);
+  return ci;
+}
+
+/**
+ * Adopt the mounted volume's case policy. On a case-insensitive volume every
+ * path cache keys on the canonical path (CacheKey), WinFsp treats the
+ * spellings of a name as one file (one open node, one cache), and no
+ * negative lookup is cached: creating "Foo" cannot invalidate a cached miss
+ * on "foo".
+ * @param conn the FUSE connection being initialized
+ * @param cfg the FUSE configuration being initialized
+ */
+static void ApplyVolumeCasePolicy(struct fuse_conn_info *conn,
+                                  struct fuse_config *cfg) {
+  if (!QueryVolumeCasePolicy()) return;
+  cfg->negative_timeout = 0;
+#ifdef FUSE_CAP_CASE_INSENSITIVE
+  conn->want |= FUSE_CAP_CASE_INSENSITIVE;
+#else
+  (void)conn;
+#endif
+  fprintf(stderr, "clio_cte_fuse: case-insensitive volume\n");
+}
+
 static void *cte_fuse_init(struct fuse_conn_info *conn,
                            struct fuse_config *cfg) {
   (void)conn;
+  clio::cte::fuse_profile::Start();
   // Trust the inode numbers we report (st_ino in getattr, d_ino in readdir),
   // both derived from the tag id, instead of letting FUSE auto-generate them.
   // This makes stat and readdir agree on d_ino/st_ino (generic/637), and gives
@@ -1660,6 +1865,7 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
       cte_c->pool_id_ = data_pool;
     }
   }
+  ApplyVolumeCasePolicy(conn, cfg);
   return nullptr;
 }
 
@@ -1681,7 +1887,18 @@ int cte_fuse_bootstrap_clients() {
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
     fprintf(stderr, "WARNING: CTE core client init failed; statfs capacity=0\n");
   }
+  if (QueryVolumeCasePolicy()) {
+    fprintf(stderr, "clio_cte_fuse: case-insensitive volume\n");
+  }
   return 0;
+}
+
+std::string cte_fuse_cache_key(const std::string &path) {
+  return CacheKey(path);
+}
+
+bool cte_fuse_case_insensitive() {
+  return g_case_insensitive.load(std::memory_order_relaxed);
 }
 #endif  // !_WIN32
 
@@ -2264,7 +2481,11 @@ int cte_fuse_utimens(const char *path_in, const cte_timespec_t tv[2],
   // the source's mtime right after writing; the overlay must not win).
   {
     std::lock_guard<std::mutex> lk(g_hw_mtx);
-    g_wtime.erase(path_s);
+    auto wt = g_wtime.find(path_s);
+    if (wt != g_wtime.end()) {
+      g_wtime_pre[path_s] = wt->second;
+      g_wtime.erase(wt);
+    }
   }
   // Translate the POSIX (atime, mtime) timespec pair into the chimod's flag
   // encoding: bit0/bit1 = explicit atime/mtime, bit2/bit3 = UTIME_NOW (resolved
@@ -2648,6 +2869,19 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
   // holds without asking the chimod.
   if (SieveCreateEnabled() && (fi->flags & O_EXCL) &&
       CLIO_CTE_CLIENT != nullptr) {
+#ifdef _WIN32
+    {
+      // WinFsp sends an exclusive create without looking the name up first
+      // (on Linux the kernel's negative lookup is what makes this path
+      // exclusive). Unchecked, a second create of an existing name
+      // "succeeded" and its data was dropped when the batched create failed.
+      // A miss under a complete directory is answered locally.
+      cte_stat_t st;
+      const int grc = cte_fuse_getattr_stat(path, &st, nullptr);
+      if (grc == 0) return -EEXIST;
+      if (grc != -ENOENT) return grc;
+    }
+#endif
     auto *handle = new CfsHandle();
     handle->fh = 0;  // no server handle; data ops key off the tag
     handle->path = p;
@@ -2937,7 +3171,7 @@ static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
     auto t = cfs->AsyncAdvanceSize(
         (static_cast<clio::run::u64>(handle->tag.major_) << 32) |
             static_cast<clio::run::u64>(handle->tag.minor_),
-        hiwater, WriteTimeFor(hp));
+        hiwater, PushTimeFor(hp));
     t.Wait();
     if (t->GetReturnCode() != 0) {
       HLOG(kError, "clio_cte_fuse: publishing the size of {} failed (rc {}); "
@@ -2999,7 +3233,7 @@ static int FlushAsync(CfsHandle *handle, const std::string &p) {
     pc.path = p;
     pc.tag = handle->tag;
     pc.hiwater = HiwaterFor(p);
-    pc.wtime = WriteTimeFor(p);
+    pc.wtime = PushTimeFor(p);
     EnqueueDrainOrdered(std::move(pc));
     // The kernel caches each NAME separately (see the awaited path below).
     for (const auto &sib : LinkGroupSiblings(p)) InvalidatePath(sib);
@@ -3019,8 +3253,11 @@ int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
   const std::string p =
       handle ? HandlePath(handle, path) : std::string(path ? path : "");
   if (p.empty()) return 0;
+  // A file with hard links takes the awaited path: its size and pages are
+  // overlaid under THIS name only, so a stat or read through a sibling
+  // right after close(2) saw the old file until the queued publish landed.
   if (handle != nullptr && AsyncFlushEnabled() && !MultiNode() &&
-      !handle->appended.load()) {
+      !handle->appended.load() && LinkGroupSiblings(p).empty()) {
     return FlushAsync(handle, p);
   }
   if (handle != nullptr && handle->fh == 0) {
@@ -3139,7 +3376,7 @@ int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
       pc.path = handle->path;
       pc.tag = handle->tag;
       pc.hiwater = hiwater;
-      pc.wtime = WriteTimeFor(handle->path);
+      pc.wtime = PushTimeFor(handle->path);
       EnqueueDrainOrdered(std::move(pc));
     } else {
       cfs->AsyncCloseDetached(handle->fh);
@@ -3154,15 +3391,29 @@ int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
         auto tt = cfs->AsyncAdvanceSize(
             (static_cast<clio::run::u64>(handle->tag.major_) << 32) |
                 static_cast<clio::run::u64>(handle->tag.minor_),
-            hiwater, WriteTimeFor(handle->path));
+            hiwater, PushTimeFor(handle->path));
         tt.Wait();
-        HiwaterEraseIfCovered(handle->path, hiwater);
+        // Same fix as RunCloserEntry/RunPublish: erase only once the push is
+        // known durable, so a failed push (e.g. during a partition) still
+        // leaves the overlay to retry from instead of stranding the file at
+        // size 0 forever.
+        if (tt->GetReturnCode() == 0) {
+          HiwaterEraseIfCovered(handle->path, hiwater);
+        } else {
+          LatchPublishError(handle->path, -EIO);
+        }
       }
     } else {
       auto t = cfs->AsyncClose(handle->fh, hiwater);
       t.Wait();
-      if (hiwater != 0) HiwaterEraseIfCovered(handle->path, hiwater);
       rc = (t->GetReturnCode() == 0) ? 0 : -EIO;
+      if (hiwater != 0) {
+        if (rc == 0) {
+          HiwaterEraseIfCovered(handle->path, hiwater);
+        } else {
+          LatchPublishError(handle->path, -EIO);
+        }
+      }
     }
   }
   UnregisterOpenFile(handle);
@@ -3297,8 +3548,15 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
             buf + done);
         g.Wait();
         grc = static_cast<int>(g->GetReturnCode());
-        if (!clio::cte::core::IsNodeLostRc(static_cast<clio::run::u32>(grc)) ||
-            attempt >= kReadNodeLostRetries) {
+        // Owner-down from a stand-in (#1280) can be as transient as
+        // node-lost: the stand-in's liveness view lags the router's until it
+        // too declares the owner dead and serves its copies. Retried within
+        // the same bound; after it, still EIO (never zeros).
+        const bool transient =
+            clio::cte::core::IsNodeLostRc(static_cast<clio::run::u32>(grc)) ||
+            static_cast<clio::run::u32>(grc) ==
+                clio::cte::core::kBlobOwnerDownRc;
+        if (!transient || attempt >= kReadNodeLostRetries) {
           break;
         }
         std::this_thread::sleep_for(
@@ -3326,6 +3584,10 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
       // I/O error. Treating it as a hole returned zeros with success: a
       // reader got silently corrupted data while a node was down.
       if (grc != 0 && grc != 1) {
+        HLOG(kError, "clio_cte_fuse: read of tag {}.{} page {} failed rc {} "
+             "after {} attempt(s); reporting EIO", handle->tag.major_,
+             handle->tag.minor_, clio::cte::filesystem::PageName(cur), grc,
+             attempt + 1);
         slow_read(-EIO, done / clio::cte::filesystem::kFsPageSize + 1);
         return -EIO;
       }
@@ -3417,7 +3679,8 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
           clio::cte::filesystem::kFsPageSize - page_off, size - done);
       int rc = cte->AsyncPutBlobDefer(
           handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
-          buf + done);
+          buf + done, -1.0f, clio::cte::core::Context(), 0,
+          clio::run::PoolQuery::Dynamic(), WriteInflightBytes());
       if (rc != 0) {
         // A full store is ENOSPC (as on ext4); anything else is EIO.
         return (rc > 0 && clio::cte::core::PutRcIsNoSpace(
@@ -3981,6 +4244,84 @@ int cte_fuse_rename(const char *from, const char *to,
 // Reporting a non-zero capacity also matters operationally: a 0-block fs is
 // hidden by `df` (which lists no path), which breaks tools that probe free
 // space and xfstests' mount detection.
+namespace {
+/** The store's capacity as statfs last reported it (see StatfsCapacity). */
+struct StatfsCache {
+  std::mutex mu;
+  bool valid = false;        ///< an answer has been fetched
+  bool refreshing = false;   ///< a caller is fetching a new one
+  std::chrono::steady_clock::time_point at;  ///< when the answer was fetched
+  clio::run::u64 total = 0;
+  clio::run::u64 remaining = 0;
+};
+StatfsCache g_statfs_cache;
+
+/**
+ * How long a capacity answer serves statfs (ms). CLIO_FUSE_STATFS_TTL_MS
+ * overrides the 1000 ms default; 0 asks the store on every call.
+ * @return the time to live in milliseconds
+ */
+clio::run::u64 StatfsTtlMs() {
+  static const clio::run::u64 v = [] {
+    const char *e = getenv("CLIO_FUSE_STATFS_TTL_MS");
+    return e != nullptr && e[0] != 0 ? std::strtoull(e, nullptr, 10) : 1000;
+  }();
+  return v;
+}
+
+/**
+ * The store's total and remaining capacity for statfs, at most
+ * StatfsTtlMs() old.
+ *
+ * Windows queries volume information about once per file written (a
+ * Steam-style install of 15k files sent 9,100 queries), and each answer was
+ * a capacity broadcast to every node (~120 us here). WinFsp's own volume
+ * cache (VolumeInfoTimeout) does not absorb them -- writes invalidate it.
+ * One caller refreshes an expired answer; the others keep serving the old
+ * one meanwhile. fallocate's space check asks the store directly
+ * (StoreRemainingBytes), where a stale "enough" would matter.
+ * @param total receives the total capacity (bytes)
+ * @param remaining receives the remaining capacity (bytes)
+ */
+void StatfsCapacity(clio::run::u64 *total, clio::run::u64 *remaining) {
+  const auto now = std::chrono::steady_clock::now();
+  const auto ttl = std::chrono::milliseconds(StatfsTtlMs());
+  {
+    std::lock_guard<std::mutex> g(g_statfs_cache.mu);
+    const bool fresh = g_statfs_cache.valid && now - g_statfs_cache.at < ttl;
+    if (fresh || (g_statfs_cache.valid && g_statfs_cache.refreshing)) {
+      *total = g_statfs_cache.total;
+      *remaining = g_statfs_cache.remaining;
+      return;
+    }
+    g_statfs_cache.refreshing = true;
+  }
+  clio::run::u64 t_bytes = 0, r_bytes = 0;
+  bool ok = false;
+  auto *cte = CLIO_CTE_CLIENT;
+  if (cte != nullptr) {
+    // Broadcast: total + remaining capacity across the whole cluster.
+    auto t = cte->AsyncGetCapacity(clio::run::PoolQuery::Broadcast());
+    t.Wait();
+    if (t->return_code_ == 0) {
+      t_bytes = t->total_capacity_;
+      r_bytes = t->remaining_capacity_;
+      ok = true;
+    }
+  }
+  std::lock_guard<std::mutex> g(g_statfs_cache.mu);
+  g_statfs_cache.refreshing = false;
+  if (ok) {
+    g_statfs_cache.valid = StatfsTtlMs() != 0;
+    g_statfs_cache.at = std::chrono::steady_clock::now();
+    g_statfs_cache.total = t_bytes;
+    g_statfs_cache.remaining = r_bytes;
+  }
+  *total = ok ? t_bytes : g_statfs_cache.total;
+  *remaining = ok ? r_bytes : g_statfs_cache.remaining;
+}
+}  // namespace
+
 int cte_fuse_statfs(const char *path, cte_statvfs_t *stbuf) {
   (void)path;
   std::memset(stbuf, 0, sizeof(*stbuf));
@@ -3988,16 +4329,7 @@ int cte_fuse_statfs(const char *path, cte_statvfs_t *stbuf) {
 
   clio::run::u64 total_bytes = 0;
   clio::run::u64 remaining_bytes = 0;
-  auto *cte = CLIO_CTE_CLIENT;
-  if (cte != nullptr) {
-    // Broadcast: total + remaining capacity across the whole cluster.
-    auto t = cte->AsyncGetCapacity(clio::run::PoolQuery::Broadcast());
-    t.Wait();
-    if (t->return_code_ == 0) {
-      total_bytes = t->total_capacity_;
-      remaining_bytes = t->remaining_capacity_;
-    }
-  }
+  StatfsCapacity(&total_bytes, &remaining_bytes);
   fsblkcnt_t total_blocks = total_bytes / kBlockSize;
   fsblkcnt_t free_blocks = remaining_bytes / kBlockSize;
 
@@ -4024,41 +4356,57 @@ int cte_fuse_statfs(const char *path, cte_statvfs_t *stbuf) {
 // External linkage (declared in fuse_cte.h): the mount/process-entry glue in
 // fuse_cte_main.cc points fuse_main()/fuse_new() at this table. The callbacks
 // it references keep internal linkage — their addresses are captured here.
-const struct fuse_operations cte_fuse_ops = {
-    .getattr = cte_fuse_getattr,
-    .readlink = cte_fuse_readlink,
-    .mkdir = cte_fuse_mkdir,
-    .unlink = cte_fuse_unlink,
-    .rmdir = cte_fuse_rmdir,
-    .symlink = cte_fuse_symlink,
-    .rename = cte_fuse_rename,
-    .link = cte_fuse_link,
-    .chmod = cte_fuse_chmod,
-    .chown = cte_fuse_chown,
-    .truncate = cte_fuse_truncate,
-    .open = cte_fuse_open,
-    .read = cte_fuse_read,
-    .write = cte_fuse_write,
-    .statfs = cte_fuse_statfs,
-    .flush = cte_fuse_flush,
-    .release = cte_fuse_release,
-    .fsync = cte_fuse_fsync,
 #ifdef __APPLE__
-    .setxattr = cte_fuse_setxattr_darwin,
-    .getxattr = cte_fuse_getxattr_darwin,
-#else
-    .setxattr = cte_fuse_setxattr,
-    .getxattr = cte_fuse_getxattr,
+// macFUSE: cte_fuse_readdir has two overloads here (fuse_cte.h declares the
+// fuse_fill_dir_t one, this file defines the fuse_darwin_fill_dir_t one), so
+// CLIO_FUSE_TIMED's &fn cannot pick one. A single, non-overloaded name can.
+static int cte_fuse_readdir_darwin(const char *path, void *buf,
+                                   ClioFuseFillDirT filler, cte_off_t offset,
+                                   struct fuse_file_info *fi,
+                                   enum fuse_readdir_flags flags) {
+  return cte_fuse_readdir(path, buf, filler, offset, fi, flags);
+}
 #endif
-    .listxattr = cte_fuse_listxattr,
-    .removexattr = cte_fuse_removexattr,
-    .readdir = cte_fuse_readdir,
-    .fsyncdir = cte_fuse_fsyncdir,
+
+const struct fuse_operations cte_fuse_ops = {
+    .getattr = CLIO_FUSE_TIMED(getattr, cte_fuse_getattr),
+    .readlink = CLIO_FUSE_TIMED(readlink, cte_fuse_readlink),
+    .mkdir = CLIO_FUSE_TIMED(mkdir, cte_fuse_mkdir),
+    .unlink = CLIO_FUSE_TIMED(unlink, cte_fuse_unlink),
+    .rmdir = CLIO_FUSE_TIMED(rmdir, cte_fuse_rmdir),
+    .symlink = CLIO_FUSE_TIMED(symlink, cte_fuse_symlink),
+    .rename = CLIO_FUSE_TIMED(rename, cte_fuse_rename),
+    .link = CLIO_FUSE_TIMED(link, cte_fuse_link),
+    .chmod = CLIO_FUSE_TIMED(chmod, cte_fuse_chmod),
+    .chown = CLIO_FUSE_TIMED(chown, cte_fuse_chown),
+    .truncate = CLIO_FUSE_TIMED(truncate, cte_fuse_truncate),
+    .open = CLIO_FUSE_TIMED(open, cte_fuse_open),
+    .read = CLIO_FUSE_TIMED(read, cte_fuse_read),
+    .write = CLIO_FUSE_TIMED(write, cte_fuse_write),
+    .statfs = CLIO_FUSE_TIMED(statfs, cte_fuse_statfs),
+    .flush = CLIO_FUSE_TIMED(flush, cte_fuse_flush),
+    .release = CLIO_FUSE_TIMED(release, cte_fuse_release),
+    .fsync = CLIO_FUSE_TIMED(fsync, cte_fuse_fsync),
+#ifdef __APPLE__
+    .setxattr = CLIO_FUSE_TIMED(setxattr, cte_fuse_setxattr_darwin),
+    .getxattr = CLIO_FUSE_TIMED(getxattr, cte_fuse_getxattr_darwin),
+#else
+    .setxattr = CLIO_FUSE_TIMED(setxattr, cte_fuse_setxattr),
+    .getxattr = CLIO_FUSE_TIMED(getxattr, cte_fuse_getxattr),
+#endif
+    .listxattr = CLIO_FUSE_TIMED(listxattr, cte_fuse_listxattr),
+    .removexattr = CLIO_FUSE_TIMED(removexattr, cte_fuse_removexattr),
+#ifdef __APPLE__
+    .readdir = CLIO_FUSE_TIMED(readdir, cte_fuse_readdir_darwin),
+#else
+    .readdir = CLIO_FUSE_TIMED(readdir, cte_fuse_readdir),
+#endif
+    .fsyncdir = CLIO_FUSE_TIMED(fsyncdir, cte_fuse_fsyncdir),
     .init = cte_fuse_init,
     .destroy = cte_fuse_destroy,
-    .create = cte_fuse_create,
-    .utimens = cte_fuse_utimens,
+    .create = CLIO_FUSE_TIMED(create, cte_fuse_create),
+    .utimens = CLIO_FUSE_TIMED(utimens, cte_fuse_utimens),
 #ifdef __linux__
-    .fallocate = cte_fuse_fallocate,
+    .fallocate = CLIO_FUSE_TIMED(fallocate, cte_fuse_fallocate),
 #endif
 };

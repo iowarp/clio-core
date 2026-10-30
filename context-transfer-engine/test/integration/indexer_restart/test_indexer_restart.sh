@@ -1,5 +1,15 @@
 #!/bin/bash
 # Indexer restart integration test (issue #905): prove the SemanticSearch
+# Remove this user's clio shared-memory files only. A bare
+# `rm -f /dev/shm/clio_*` under set -e aborted the test on nodes where
+# another user's job left a clio_* DIRECTORY there.
+clean_shm() {
+  local p
+  for p in /dev/shm/clio_*; do
+    [ -f "$p" ] && [ -O "$p" ] && rm -f "$p"
+  done
+  return 0
+}
 # index is rebuilt from storage after a daemon reboot.
 set -e
 
@@ -28,13 +38,13 @@ stop_runtime() {
 cleanup() {
     stop_runtime
     sleep 1
-    rm -f /dev/shm/clio_*
+    clean_shm
     rm -rf "$CONF_DIR"
 }
 trap cleanup EXIT
 
 # Clean slate
-rm -f /dev/shm/clio_*
+clean_shm
 rm -rf "$CONF_DIR"
 mkdir -p "$CONF_DIR"
 
@@ -61,7 +71,7 @@ $BIN_DIR/test_indexer_restart --put
 echo "Stopping runtime..."
 stop_runtime
 sleep 1
-rm -f /dev/shm/clio_*
+clean_shm
 
 echo "Phase 1 complete. Persistent state in $CONF_DIR:"
 ls -la "$CONF_DIR" 2>/dev/null || true

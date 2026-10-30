@@ -200,6 +200,16 @@ class SystemInfo {
    */
   CTP_DLL static size_t GetProcessMemoryBudget();
 
+  /**
+   * Parse one cgroup memory-limit file (cgroup v2 memory.max or cgroup v1
+   * memory.limit_in_bytes).
+   *
+   * @param path file to read
+   * @return the limit in bytes; 0 when the file is missing, unreadable, not a
+   *         number, "max", or the cgroup v1 "unlimited" sentinel
+   */
+  CTP_DLL static size_t ReadMemoryLimitFile(const std::string &path);
+
   CTP_DLL static CpuTimes GetCpuTimes();
 
   static float ComputeCpuUtilization(const CpuTimes &prev,

@@ -7,8 +7,10 @@ machinery for choosing what to throw away after paying for it. This is that
 measurement.
 
 WHAT IS COMPARED
-    CLIO_VOL_ADMIT=write          (default) stage on write and on read-miss
+    CLIO_VOL_ADMIT=write                    stage on write and on read-miss
+                                            (default when stamp settle is on)
     CLIO_VOL_ADMIT=read-miss                stage only on read-miss
+                                            (default otherwise)
     CLIO_VOL_ADMIT=second-access            stage only once a dataset has been
                                             read twice -- decide on evidence
                                             instead of on a guess

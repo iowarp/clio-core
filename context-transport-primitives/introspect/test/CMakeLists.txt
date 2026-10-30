@@ -20,6 +20,19 @@ add_test(NAME ctp_drive_prediction COMMAND test_drive_prediction_exec)
 set_tests_properties(ctp_drive_prediction PROPERTIES LABELS "msan_skip")
 
 #------------------------------------------------------------------------------
+# cgroup memory-limit parser (SystemInfo::ReadMemoryLimitFile)
+#------------------------------------------------------------------------------
+add_executable(test_memory_limit_exec test_memory_limit.cc)
+add_dependencies(test_memory_limit_exec clio_ctp_host)
+target_link_libraries(test_memory_limit_exec
+    clio_ctp_host
+    Catch2::Catch2WithMain)
+
+add_test(NAME ctp_memory_limit COMMAND test_memory_limit_exec)
+# Catch2 main: same MSan false positive as ctp_drive_prediction above.
+set_tests_properties(ctp_memory_limit PROPERTIES LABELS "msan_skip")
+
+#------------------------------------------------------------------------------
 # Drive-failure prediction END-TO-END test (Linux only)
 #------------------------------------------------------------------------------
 # Drives a live Python prediction server (real LightGBM models) through the

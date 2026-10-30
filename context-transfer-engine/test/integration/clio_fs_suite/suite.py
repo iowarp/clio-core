@@ -165,6 +165,8 @@ def load_tests():
   import tests_stress  # noqa: F401
   import tests_safe  # noqa: F401
   import tests_copy  # noqa: F401
+  import tests_tier  # noqa: F401
+  import tests_replcache  # noqa: F401
 
 
 def slurm_hosts():
@@ -242,10 +244,17 @@ def run_one(cl, t, hosts, log):
     rec['status'] = 'ERROR'
     rec['error'] = f'{type(e).__name__}: {e}\n{traceback.format_exc()[-2000:]}'
   rec['secs'] = round(time.time() - t0, 2)
-  if rec['status'] == 'PASS':
-    # Free the test's data: later tests (and the disk tier on nodes with
-    # little NVMe headroom) must not inherit it. Also exercises unlink/rmdir
-    # of whole trees at scale.
+  # A partition a test set and did not undo (it raised first) survives the
+  # test and even a redeploy, and every test after it then fails EIO
+  # against a cluster that is silently split (reliability2: 30 failures).
+  parallel(cl.heal, cl.hosts)
+  if rec['status'] != 'HANG':
+    # Free the test's data whatever the outcome: a failed test that filled
+    # the tiers would otherwise make every later test in the leg fail ENOSPC
+    # (seen: one oversized write took the 4 tests after it down). Diagnosis
+    # lives in the notes and daemon logs, not in the leftover files. After a
+    # HANG the node is redeployed anyway. Also exercises unlink/rmdir of
+    # whole trees at scale.
     r = cl.agent(hosts[0]).call('rmtree', timeout=900, path=ctx.dir)
     if not r.get('ok'):
       ctx.notes.append(f'cleanup rmtree failed: {r.get("err")}')
@@ -281,7 +290,7 @@ def main():
   ap.add_argument('--skip', default='')
   ap.add_argument('--profile', default='persistent',
                   choices=['persistent', 'persistent_norepl', 'ram',
-                           'tiered', 'safe'],
+                           'tiered', 'safe', 'ares_tiers'],
                   help='persistent_norepl: disk tier + WALs but no '
                        'replication chimod and no periodic data flush, so '
                        'only fsync itself moves data off the RAM tier')
@@ -294,6 +303,18 @@ def main():
                   help='tiered profile: RAM tier per node (MB)')
   ap.add_argument('--fast-mb', type=int, default=2048,
                   help='tiered profile: fast file tier per node (MB)')
+  ap.add_argument('--ssd-mb', type=int, default=4096,
+                  help='ares_tiers profile: SATA SSD tier per node (MB)')
+  ap.add_argument('--probe-silence-s', type=int, default=0,
+                  help='seconds of silence before a peer is declared dead '
+                       '(0: CLIO_SUITE_PROBE_SILENCE_S or 10). Load-only '
+                       'legs use the runtime default 30: a CPU-saturated '
+                       'node can send nothing for >10 s and was falsely '
+                       'declared dead, failing fsyncs EIO')
+  ap.add_argument('--working-set-mb', type=int, default=0,
+                  help='MB each node writes in the tier overflow / spill / '
+                       'hot-set tests (0: 1.5x the RAM + fast tiers). The '
+                       'CI tier-mix legs size the tiers as fractions of it')
   ap.add_argument('--organizer', default='frecency',
                   choices=['none', 'frecency', 'cyclic', 'scatter', 'hotset'],
                   help='tiered profile: CTE data organizer (tier migration)')
@@ -338,7 +359,7 @@ def main():
          len(hosts) >= t['min_nodes']]
   # Fault tests last: they deliberately break the deployment.
   order = {'posix': 0, 'dist': 1, 'dirs': 2, 'apps': 3, 'perf': 4,
-           'stress': 5, 'fault': 6}
+           'stress': 5, 'tier': 5, 'safe': 7, 'fault': 6, 'repl': 6}
   sel.sort(key=lambda t: order.get(t['group'], 9))
 
   bin_dir = snapshot_bins(os.path.abspath(args.bin),
@@ -348,7 +369,10 @@ def main():
                attr_cache_s=args.attr_cache, fsync_mode=args.fsync_mode,
                disk_gb=args.disk_gb, ram_gb=args.ram_gb, ram_mb=args.ram_mb,
                fast_mb=args.fast_mb, organizer=args.organizer,
-               neighborhood=args.neighborhood, local_root=args.local_root)
+               neighborhood=args.neighborhood, local_root=args.local_root,
+               ssd_mb=args.ssd_mb)
+  cl.working_set_mb = args.working_set_mb
+  cl.probe_silence_s = args.probe_silence_s
   log(f'hosts={hosts} profile={args.profile} '
       f'neighborhood={args.neighborhood} tests={len(sel)}')
   ok, msg = cl.up(wipe=True)

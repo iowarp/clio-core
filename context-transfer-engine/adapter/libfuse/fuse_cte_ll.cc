@@ -64,6 +64,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -86,6 +87,7 @@ struct InoEntry {
 
 std::mutex g_ino_mtx;
 std::unordered_map<fuse_ino_t, InoEntry> g_ino_to_path;
+/** Keyed by cte_fuse_cache_key: every spelling of a name is one inode. */
 std::unordered_map<std::string, fuse_ino_t> g_path_to_ino;
 fuse_ino_t g_next_ino = 2;  // 1 is the root
 
@@ -94,14 +96,15 @@ double g_ttl = 1.0;  // entry+attr TTL, CLIO_FUSE_ATTR_CACHE_S
 // Return the ino for `path`, minting one if new; bumps nlookup by `add`.
 fuse_ino_t InternPath(const std::string &path, uint64_t add) {
   if (path == "/") return FUSE_ROOT_ID;
+  const std::string key = cte_fuse_cache_key(path);
   std::lock_guard<std::mutex> lk(g_ino_mtx);
-  auto it = g_path_to_ino.find(path);
+  auto it = g_path_to_ino.find(key);
   if (it != g_path_to_ino.end()) {
     g_ino_to_path[it->second].nlookup += add;
     return it->second;
   }
   fuse_ino_t ino = g_next_ino++;
-  g_path_to_ino.emplace(path, ino);
+  g_path_to_ino.emplace(key, ino);
   g_ino_to_path.emplace(ino, InoEntry{path, add});
   return ino;
 }
@@ -127,7 +130,7 @@ void Forget(fuse_ino_t ino, uint64_t n) {
   auto it = g_ino_to_path.find(ino);
   if (it == g_ino_to_path.end()) return;
   if (it->second.nlookup <= n) {
-    g_path_to_ino.erase(it->second.path);
+    g_path_to_ino.erase(cte_fuse_cache_key(it->second.path));
     g_ino_to_path.erase(it);
   } else {
     it->second.nlookup -= n;
@@ -140,19 +143,34 @@ void Forget(fuse_ino_t ino, uint64_t n) {
 void RenamePaths(const std::string &from, const std::string &to) {
   std::lock_guard<std::mutex> lk(g_ino_mtx);
   std::vector<std::pair<fuse_ino_t, std::string>> moves;
+  // Compare in canonical form (any spelling of `from` names the same
+  // nodes); keep each node's own spelling below the moved prefix, cut by
+  // path components since folding can change a name's length.
+  const std::string from_key = cte_fuse_cache_key(from);
+  const size_t depth =
+      static_cast<size_t>(std::count(from.begin(), from.end(), '/'));
   for (auto &kv : g_ino_to_path) {
     const std::string &p = kv.second.path;
-    if (p == from) {
+    const std::string pk = cte_fuse_cache_key(p);
+    if (pk == from_key) {
       moves.emplace_back(kv.first, to);
-    } else if (p.size() > from.size() && p.compare(0, from.size(), from) == 0 &&
-               p[from.size()] == '/') {
-      moves.emplace_back(kv.first, to + p.substr(from.size()));
+    } else if (pk.size() > from_key.size() &&
+               pk.compare(0, from_key.size(), from_key) == 0 &&
+               pk[from_key.size()] == '/') {
+      size_t cut = 0, seen = 0;
+      while (seen <= depth && cut != std::string::npos) {
+        cut = p.find('/', cut + (seen == 0 ? 0 : 1));
+        if (cut != std::string::npos) ++seen;
+      }
+      moves.emplace_back(kv.first,
+                         to + (cut == std::string::npos ? std::string()
+                                                        : p.substr(cut)));
     }
   }
   for (auto &m : moves) {
-    g_path_to_ino.erase(g_ino_to_path[m.first].path);
+    g_path_to_ino.erase(cte_fuse_cache_key(g_ino_to_path[m.first].path));
     g_ino_to_path[m.first].path = m.second;
-    g_path_to_ino[m.second] = m.first;
+    g_path_to_ino[cte_fuse_cache_key(m.second)] = m.first;
   }
   // The destination may have had its own (replaced) ino: leave it — its
   // getattr will report ENOENT and the kernel forgets it naturally.
@@ -209,9 +227,11 @@ void ll_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
   int rc = FillEntry(path, nullptr, 1, &e);
   if (rc == -ENOENT) {
     // Negative entry WITH a TTL: e.ino == 0 caches the absence in the
-    // kernel (the reply_err path would re-issue the lookup every time).
+    // kernel (the reply_err path would re-issue the lookup every time). Not
+    // on a case-insensitive volume: the kernel caches the miss per
+    // spelling, and creating "Foo" cannot invalidate a miss on "foo".
     std::memset(&e, 0, sizeof(e));
-    e.entry_timeout = g_ttl;
+    e.entry_timeout = cte_fuse_case_insensitive() ? 0.0 : g_ttl;
     fuse_reply_entry(req, &e);
     return;
   }

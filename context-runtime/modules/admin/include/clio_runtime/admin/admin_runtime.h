@@ -490,6 +490,15 @@ private:
   static constexpr double kIdleProbeSec = 10.0;
   /** net_key of an idle probe: no replica behind it, liveness only. */
   static constexpr size_t kIdleProbeKey = ~size_t(0);
+  /** Net key of a re-probe to a node this one holds DEAD. It doubles as the
+   *  rejoin notice (decision stale_home_dir): the target learns a peer
+   *  failed it over, so its directory homes reload what a stand-in may have
+   *  changed meanwhile. */
+  static constexpr size_t kDeadReprobeKey = ~size_t(0) - 1;
+  /** Peers that recently sent this node a rejoin notice, and when. */
+  std::mutex held_dead_mu_;
+  std::unordered_map<clio::run::u64, std::chrono::steady_clock::time_point>
+      held_dead_by_;
   /**
    * #1222: a node held DEAD is re-probed every kDeadReprobeSec (slower than
    * the idle cadence) with a TASK_LIVENESS_PROBE-flagged query that SendIn

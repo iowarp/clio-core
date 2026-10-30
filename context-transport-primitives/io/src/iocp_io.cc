@@ -32,6 +32,7 @@
 #undef max
 #endif
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -44,6 +45,51 @@ namespace ctp {
 
 namespace {
 constexpr ULONG_PTR kCompletionKey = 1;
+
+/**
+ * Translate a Win32 error into the errno value IoResult::error_code promises
+ * (ClassifyErrno consumes errno, not GetLastError()). Without this a full disk
+ * (ERROR_DISK_FULL, 112) reaches the callers as "Unknown" rather than ENOSPC.
+ * @param win32 a GetLastError() value
+ * @return the matching errno, or `win32` unchanged when there is no mapping
+ */
+int Win32ToErrno(DWORD win32) {
+  switch (win32) {
+    case ERROR_HANDLE_DISK_FULL:
+    case ERROR_DISK_FULL:         return ENOSPC;
+    case ERROR_FILE_TOO_LARGE:    return EFBIG;
+    case ERROR_ACCESS_DENIED:
+    case ERROR_WRITE_PROTECT:     return EACCES;
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:    return ENOENT;
+    case ERROR_DEV_NOT_EXIST:
+    case ERROR_DEVICE_NOT_CONNECTED: return ENODEV;
+    case ERROR_NOT_READY:
+    case ERROR_BUSY:              return EBUSY;
+    case ERROR_CRC:
+    case ERROR_IO_DEVICE:         return EIO;
+    case ERROR_SEM_TIMEOUT:
+    case ERROR_TIMEOUT:           return ETIMEDOUT;
+    case ERROR_INVALID_HANDLE:
+    case ERROR_INVALID_PARAMETER: return EINVAL;
+    default:                      return static_cast<int>(win32);
+  }
+}
+
+/**
+ * Translate a completed OVERLAPPED's NTSTATUS (OVERLAPPED::Internal) to errno.
+ * @param status the NTSTATUS
+ * @return the errno, or `status` unchanged if ntdll cannot translate it
+ */
+int NtStatusToErrno(LONG status) {
+  using Fn = ULONG(WINAPI *)(LONG);
+  static const Fn to_dos = reinterpret_cast<Fn>(
+      ::GetProcAddress(::GetModuleHandleA("ntdll.dll"), "RtlNtStatusToDosError"));
+  if (to_dos == nullptr) return static_cast<int>(status);
+  const DWORD win32 = to_dos(status);
+  return win32 == ERROR_MR_MID_NOT_FOUND ? static_cast<int>(status)
+                                         : Win32ToErrno(win32);
+}
 }  // namespace
 
 struct IocpAsyncIO::Impl {
@@ -84,7 +130,7 @@ struct IocpAsyncIO::Impl {
       LONG status = static_cast<LONG>(op->overlapped.Internal);
       if (status != 0) {
         res.bytes_transferred = -1;
-        res.error_code = static_cast<int>(status);
+        res.error_code = NtStatusToErrno(status);
       } else {
         res.error_code = 0;
       }
@@ -161,7 +207,7 @@ struct IocpAsyncIO::Impl {
       if (err != ERROR_IO_PENDING) {
         IoResult res;
         res.bytes_transferred = -1;
-        res.error_code = static_cast<int>(err);
+        res.error_code = Win32ToErrno(err);
         completed[token] = res;
         delete op;
         in_flight.insert(token);

@@ -14,11 +14,14 @@
 #include "simple_test.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <clio_ctp/introspect/system_info.h>
@@ -210,6 +213,138 @@ TEST_CASE("IpcInternals - loopback bind ignores a configured hostfile",
   fs::remove(cfg);
   fs::path empty_cfg =
       fs::temp_directory_path() / "clio_loopback_empty_cfg.yaml";
+  {
+    std::ofstream f(empty_cfg);
+    f << "runtime:\n  num_threads: 1\n";
+  }
+  (void)config->LoadYaml(empty_cfg.string());
+  (void)ipc->LoadHostfile();
+  fs::remove(empty_cfg);
+}
+
+// Node-state transitions, inbound tracking and AddNode on hosts that are in
+// the table. The SWIM test case above uses an unknown node id, so it only
+// reaches the early returns. Each call takes hostfile_mu_, so this also
+// checks that no path locks it twice (that would deadlock here).
+TEST_CASE("IpcInternals - host table transitions and AddNode",
+          "[ipc][hostfile][swim]") {
+  EnsureInitialized();
+  auto *ipc = CLIO_IPC;
+  auto *config = CLIO_CONFIG_MANAGER;
+  REQUIRE(ipc != nullptr);
+  REQUIRE(config != nullptr);
+
+  // Node 1 (10.255.255.1) is a peer that never answers; this process is
+  // node 0. A non-loopback bind address makes LoadHostfile honor the file.
+  // SWIM and the idle/dead-node reprobes are off so that nothing but this
+  // test changes the peer's state.
+  fs::path hostfile = fs::temp_directory_path() / "clio_table_hostfile.txt";
+  {
+    std::ofstream f(hostfile);
+    f << "127.0.0.1\n";
+    f << "10.255.255.1\n";
+  }
+  fs::path cfg = fs::temp_directory_path() / "clio_table_hostfile_cfg.yaml";
+  {
+    std::ofstream f(cfg);
+    f << "runtime:\n  task_progress_interval_ms: 0\n"
+         "swim:\n  enabled: false\n"
+         "networking:\n  hostfile: " << hostfile.string() << "\n";
+  }
+  REQUIRE(config->LoadYaml(cfg.string()));
+  ctp::SystemInfo::Setenv("CLIO_BIND_ADDR", "0.0.0.0", 1);
+  REQUIRE(ipc->LoadHostfile());
+  REQUIRE(ipc->GetNumHosts() == 2);
+  const clio::run::Host *peer_host = ipc->GetHostByIp("10.255.255.1");
+  REQUIRE(peer_host != nullptr);
+  const u64 peer = peer_host->node_id;
+  REQUIRE(ipc->IsAlive(peer));
+
+  SECTION("SetDead and SetAlive change a known node's state");
+  ipc->SetDead(peer);
+  REQUIRE(ipc->GetNodeState(peer) == clio::run::NodeState::kDead);
+  REQUIRE_FALSE(ipc->IsAlive(peer));
+  ipc->SetAlive(peer);
+  REQUIRE(ipc->GetNodeState(peer) == clio::run::NodeState::kAlive);
+
+  SECTION("SetNodeState sets the state and invalidates the host cache");
+  (void)ipc->GetAllHosts();  // build the cache before the change
+  ipc->SetNodeState(peer, clio::run::NodeState::kSuspected);
+  REQUIRE(ipc->GetNodeState(peer) == clio::run::NodeState::kSuspected);
+  bool found = false;
+  for (const auto &h : ipc->GetAllHosts()) {
+    if (h.node_id == peer) {
+      REQUIRE(h.state == clio::run::NodeState::kSuspected);
+      found = true;
+    }
+  }
+  REQUIRE(found);
+  ipc->SetNodeState(424242, clio::run::NodeState::kDead);  // unknown: no-op
+  REQUIRE(ipc->GetNumHosts() == 2);
+
+  SECTION("NoteInbound resets SecondsSinceInbound");
+  ipc->NoteInbound(peer);
+  REQUIRE(ipc->SecondsSinceInbound(peer) < 60.0f);
+  ipc->NoteInbound(424242);  // unknown: no-op
+  REQUIRE(ipc->SecondsSinceInbound(424242) ==
+          std::numeric_limits<float>::max());
+
+  SECTION("AddNode of an address in the table returns its id and revives it");
+  REQUIRE_FALSE(ipc->IsAlive(peer));  // still kSuspected from above
+  REQUIRE(ipc->AddNode("10.255.255.1", 0) == peer);
+  REQUIRE(ipc->IsAlive(peer));
+  REQUIRE(ipc->GetNumHosts() == 2);
+
+  SECTION("AddNode registers a new address once");
+  const u64 added = ipc->AddNode("10.255.255.2", 0);
+  REQUIRE(added == 2);
+  REQUIRE(ipc->GetNumHosts() == 3);
+  const clio::run::Host *added_host = ipc->GetHostByIp("10.255.255.2");
+  REQUIRE(added_host != nullptr);
+  REQUIRE(added_host->node_id == added);
+  REQUIRE(ipc->AddNode("10.255.255.2", 0) == added);
+  REQUIRE(ipc->GetNumHosts() == 3);
+
+  SECTION("Concurrent AddNode of one address registers it once");
+  {
+    std::vector<u64> ids(8);
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < ids.size(); ++i) {
+      threads.emplace_back(
+          [&, i] { ids[i] = ipc->AddNode("10.255.255.3", 0); });
+    }
+    for (auto &t : threads) t.join();
+    for (u64 id : ids) REQUIRE(id == ids[0]);
+    REQUIRE(ipc->GetNumHosts() == 4);
+  }
+
+  SECTION("Readers survive a concurrent hostfile reload");
+  // The race hostfile_mu_ was added for: GetNodeIds iterating hostfile_map_
+  // while LoadHostfile clears and refills it (an ASan heap-use-after-free).
+  {
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 4; ++r) {
+      readers.emplace_back([&] {
+        while (!stop.load()) {
+          for (u64 id : ipc->GetNodeIds()) (void)ipc->GetNodeState(id);
+          (void)ipc->GetNumHosts();
+          (void)ipc->GetLeaderNodeId();
+        }
+      });
+    }
+    for (int i = 0; i < 50; ++i) REQUIRE(ipc->LoadHostfile());
+    stop = true;
+    for (auto &t : readers) t.join();
+    REQUIRE(ipc->GetNumHosts() == 2);  // the reload dropped AddNode's hosts
+  }
+
+  // Restore the no-hostfile, no-override state for later users of the
+  // singleton, as the hostfile test cases above do.
+  ctp::SystemInfo::Unsetenv("CLIO_BIND_ADDR");
+  fs::remove(hostfile);
+  fs::remove(cfg);
+  fs::path empty_cfg = fs::temp_directory_path() / "clio_table_empty_cfg.yaml";
   {
     std::ofstream f(empty_cfg);
     f << "runtime:\n  num_threads: 1\n";

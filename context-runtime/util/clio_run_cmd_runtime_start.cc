@@ -1,5 +1,6 @@
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -20,6 +21,9 @@
 
 #ifdef __linux__
 #include <sys/prctl.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -317,7 +321,63 @@ static void MaybeAllowPtrace() {
 #endif
 }
 
+namespace {
+
+#if defined(__SANITIZE_ADDRESS__)
+#define CLIO_FATAL_REPORT_ENABLED 0  // ASan reports SEGV itself, better
+#elif defined(__linux__)
+#define CLIO_FATAL_REPORT_ENABLED 1
+#else
+#define CLIO_FATAL_REPORT_ENABLED 0  // siginfo_t/backtrace are POSIX/glibc
+#endif
+
+#if CLIO_FATAL_REPORT_ENABLED
+/**
+ * Fatal-signal reporter: the runtime has died mid-run with nothing in its
+ * log and no core (core dumps are often off on clusters), so a crash was
+ * indistinguishable from a kill. Writes the signal, faulting address and a
+ * raw backtrace to stderr (the runtime log) with async-signal-safe calls,
+ * then re-raises with the default action so the exit status is unchanged.
+ */
+void FatalSignalReport(int sig, siginfo_t *si, void *) {
+  char msg[160];
+  int n = std::snprintf(msg, sizeof(msg),
+                        "\n=== clio_run FATAL signal %d (%s) addr=%p pid=%d\n",
+                        sig, strsignal(sig), si ? si->si_addr : nullptr,
+                        static_cast<int>(getpid()));
+  if (n > 0) {
+    ssize_t w = write(STDERR_FILENO, msg, static_cast<size_t>(n));
+    (void)w;
+  }
+  void *frames[64];
+  int depth = backtrace(frames, 64);
+  backtrace_symbols_fd(frames, depth, STDERR_FILENO);
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+void InstallFatalSignalReport() {
+  // backtrace() loads libgcc on first use, which is not signal-safe: do it
+  // now.
+  void *warm[1];
+  (void)backtrace(warm, 1);
+  struct sigaction sa;
+  std::memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = FatalSignalReport;
+  sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK;
+  sigemptyset(&sa.sa_mask);
+  for (int sig : {SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL}) {
+    sigaction(sig, &sa, nullptr);
+  }
+}
+#else
+void InstallFatalSignalReport() {}
+#endif
+
+}  // namespace
+
 int RuntimeStart(int argc, char* argv[]) {
+  InstallFatalSignalReport();
   MaybeAllowPtrace();
   bool induct = false;
   bool fresh = false;

@@ -10,6 +10,7 @@
 #include "clio_cte/filesystem/api.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 // The descriptor layer below is POSIX-SHAPED but not POSIX-only: nothing
 // in it makes a system call. posix_compat.h supplies the vocabulary it is
@@ -200,7 +201,8 @@ class Client : public clio::cte::core::Client {
     if (shm_fs_root_ == nullptr || out == nullptr) {
       return false;
     }
-    if (!shm_fs_root_->path_to_file_.TryGetBytes(path.data(), path.size(),
+    const std::string key = shm_fs_root_->Key(path);
+    if (!shm_fs_root_->path_to_file_.TryGetBytes(key.data(), key.size(),
                                                  out, 16, absent)) {
       return false;
     }
@@ -1232,6 +1234,16 @@ class Client : public clio::cte::core::Client {
     return TryReadShmImpl(path, off, buf, count, ShmHolePolicy::kZeroFillHoles);
   }
 
+  /** CLIO_TRACE_SHM_READ=1: log every page the shared-memory read path
+   *  hands back as zeros, and why (residency "absent" vs. an SHM hit). */
+  static bool TraceShmRead() {
+    static const bool on = [] {
+      const char *e = std::getenv("CLIO_TRACE_SHM_READ");
+      return e != nullptr && e[0] == '1';
+    }();
+    return on;
+  }
+
   FsSsize TryReadShmImpl(const std::string &path, clio::run::u64 off, void *buf,
                          size_t count, ShmHolePolicy policy) {
     // Read-your-own-writes, here rather than only in Read().
@@ -1353,6 +1365,16 @@ class Client : public clio::cte::core::Client {
                                             static_cast<clio::run::u64>(to_read));
           res.Wait();
           if (res->GetReturnCode() == 0 && res->exists_ == 0) {
+            if (TraceShmRead()) {
+              std::fprintf(stderr,
+                           "[SHM-READ] zero-fill (residency: absent) %s tag "
+                           "%u.%u page %s off %llu len %llu file_size %llu\n",
+                           path.c_str(), rec.tag_id_.major_, rec.tag_id_.minor_,
+                           PageName(cur).c_str(),
+                           static_cast<unsigned long long>(page_off),
+                           static_cast<unsigned long long>(to_read),
+                           static_cast<unsigned long long>(rec.size_));
+            }
             std::memset(dst + done, 0, static_cast<size_t>(to_read));
             ShmReadHoles().fetch_add(1, std::memory_order_relaxed);
             done += to_read;
@@ -1362,6 +1384,25 @@ class Client : public clio::cte::core::Client {
         }
         ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
         return -1;
+      }
+      if (TraceShmRead()) {
+        // A shared-memory HIT that returns an all-zero page: either a real
+        // zero page or a stale record pointing at reused memory.
+        const char *p = dst + done;
+        bool all_zero = to_read > 0;
+        for (clio::run::u64 i = 0; i < to_read && all_zero; i += 512) {
+          all_zero = p[i] == 0;
+        }
+        if (all_zero) {
+          std::fprintf(stderr,
+                       "[SHM-READ] zero page from SHM hit %s tag %u.%u page %s "
+                       "off %llu len %llu file_size %llu\n",
+                       path.c_str(), rec.tag_id_.major_, rec.tag_id_.minor_,
+                       PageName(cur).c_str(),
+                       static_cast<unsigned long long>(page_off),
+                       static_cast<unsigned long long>(to_read),
+                       static_cast<unsigned long long>(rec.size_));
+        }
       }
       done += to_read;
       cur += to_read;

@@ -13,11 +13,21 @@ reported as a failure, never masked. Only atomic datatypes (integer, float,
 enum, bitfield, fixed-length string) are cached — compound/array (mem/file
 layout can differ) and vlen/reference (pointers, not bytes) delegate to native.
 A transfer is cached only when its **memory datatype matches the size of the
-dataset's stored type**, since the cached image is sized by the transfer's type.
+dataset's stored type**, since the cached image is sized by the transfer's type;
+for atomic types it must also be the **native form of the stored type**, the one
+representation the image is kept in (an `I32` dataset read as `NATIVE_UINT`
+converts, so it goes to the file).
 **Selection-aware reads:** hyperslab/point reads are served from the cached
 linear image via HDF5 gather/scatter when it is already populated (serve-only; a
 miss falls back to native). A non-whole write, an `H5Dset_extent`, or a failed
 cache operation invalidates the image so reads never see stale data.
+**Collective reads** are served from the tier like independent ones. Their
+native fallbacks run independent rather than collective, so ranks that hit and
+ranks that miss never wait on each other.
+**Pre-staging:** the CAE's `hdf5_vol` OMNI format writes a file into this
+connector's cache layout (`clio_vol_layout.h`) ahead of the application, so its
+first reads are served from the tier. The tag is keyed by the file's canonical
+path, so a symlinked or relative name reaches the same cache.
 **Safe mode:** `H5Fflush`, `H5Dflush` and `H5Fclose` drain all in-flight async
 CTE puts before returning, so a successful flush/close is a real durability
 barrier for the cache path (no async write outlives it).
@@ -67,7 +77,8 @@ writes are valid native HDF5 files readable by standard tools.
 | Knob | Default | Effect |
 |---|---|---|
 | `CLIO_VOL_CACHE` | on | `0`/`off`/`false`/`no` disables the CTE tier entirely — pure pass-through, no runtime required |
-| `CLIO_VOL_CHUNK_SIZE` | 1 MiB | Blob chunk size for staging dataset images |
+| `CLIO_VOL_CHUNK_SIZE` | 64 KiB | Blob chunk size for staging dataset images. A partial read fetches every chunk it touches, so this sets the cost of a small read; larger values favour whole-dataset reads slightly. Part of the coherence stamp, so an image staged with another size is a miss |
+| `CLIO_VOL_ADMIT` | `read-miss` (`write` when `CLIO_STAMP_SETTLE_MAX_NS` is set) | Which accesses put data in the tier: `write`, `read-miss` or `second-access`. Without stamp settling a writing close withholds the coherence stamp, the next open drops whatever the write staged, and write admission ends up staging everything twice |
 | `CLIO_VOL_MAX_SERVE_BYTES` | 1 GiB | Datasets larger than this are not served from cache for partial reads (see below) |
 | `CLIO_VOL_TRACE` | unset | Directory for access telemetry (see below) |
 | `CLIO_VOL_STAMP_GRANULARITY_NS` | 10 ms | Bound on filesystem timestamp granularity. A coherence stamp is withheld when the file's mtime is younger than this, because mtime cannot then rule out a later same-granule write (see below) |
@@ -96,7 +107,8 @@ a field.
 - **No capacity limit or eviction.** The tier grows without bound (W11).
 - **Cache staleness during a session** (the between-sessions case is closed).
   At close the connector records the file's identity and state --
-  `dev:ino:size:mtime` -- as a reserved blob in its own tag, and validates it at
+  `dev:ino:size:mtime`, plus the chunk size the image was cut with -- as a
+  reserved blob in its own tag, and validates it at
   open. Anything but an exact match drops the tag, so a file replaced or edited
   behind HDF5's back between sessions is detected and the cache is not used for
   it. A missing or unreadable stamp counts as a mismatch: the check is

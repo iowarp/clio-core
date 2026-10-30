@@ -132,10 +132,67 @@ s3::S3Config MakeS3Config(const std::string& bucket,
 }
 
 /**
+ * Resume knobs, read per object from the environment of the RUNTIME:
+ *
+ *   CAE_S3_MAX_RESUMES   resumes IN A ROW that deliver no byte before a stream
+ *                        gives up (default 16, max 1000). A resume that
+ *                        delivers bytes resets the count.
+ *   CAE_S3_BACKOFF_MS    wait before the first resume of such a run, doubled
+ *                        for each next one up to 30 s (default 500, 0 = none)
+ *   CAE_S3_PART_RETRIES  times a failed part of a striped window is fetched
+ *                        again, from where it stopped, on a fresh connection
+ *                        before the object fails (default 4, max 100)
+ *
+ * The ALCF proxy drops streams in bursts. Resuming at once, with no wait, spent
+ * all 16 resumes of a part in milliseconds, and one failed part failed the whole
+ * object: 156 of 199 P108 granules failed three full re-downloads that way in
+ * job 8932102. With the defaults a stream now gives up only after it has
+ * delivered nothing for about 5.5 minutes, and then its part is retried.
+ */
+struct ResumeConfig {
+  int max_resumes = 16;
+  uint64_t backoff_ms = 500;
+  int part_retries = 4;
+
+  /** Wait before the `n`-th resume in a row (n >= 1). */
+  std::chrono::milliseconds Backoff(int n) const {
+    constexpr uint64_t kCapMs = 30000;
+    uint64_t ms = backoff_ms;
+    for (int i = 1; i < n && ms < kCapMs; ++i) ms *= 2;
+    return std::chrono::milliseconds(std::min(ms, kCapMs));
+  }
+};
+
+ResumeConfig ResumeConfigFromEnv() {
+  ResumeConfig c;
+  auto read = [](const char *name, long lo, long hi, long *out) {
+    const char *s = std::getenv(name);
+    if (s == nullptr || *s == '\0') return;
+    char *end = nullptr;
+    long v = std::strtol(s, &end, 10);
+    if (end != s && v >= lo) *out = std::min(v, hi);
+  };
+  long r = c.max_resumes, b = static_cast<long>(c.backoff_ms),
+       p = c.part_retries;
+  read("CAE_S3_MAX_RESUMES", 1, 1000, &r);
+  read("CAE_S3_BACKOFF_MS", 0, 30000, &b);
+  read("CAE_S3_PART_RETRIES", 0, 100, &p);
+  c.max_resumes = static_cast<int>(r);
+  c.backoff_ms = static_cast<uint64_t>(b);
+  c.part_retries = static_cast<int>(p);
+  return c;
+}
+
+/**
  * Fill exactly `want` bytes into `buf` from the live GET stream, resuming with a
  * ranged GET whenever the response body ends short of `want` before the whole
  * transfer is exhausted (e.g. a keep-alive socket dropped across a co_await).
  * Mirrors what the old fork+exec path got for free by staging to a whole file.
+ *
+ * Each resume waits rc.Backoff() first, and a resume GET that fails counts as
+ * a resume too, so a proxy that drops connections for a few seconds is waited
+ * out instead of exhausting the budget at once. The wait blocks the calling
+ * thread, as the socket reads already do.
  *
  * @param client   The S3 client.
  * @param conn     The leased connection (kept across resumes).
@@ -144,7 +201,7 @@ s3::S3Config MakeS3Config(const std::string& bucket,
  * @param buf      Destination buffer of capacity >= want.
  * @param want     Bytes to place into buf (<= bytes remaining in the transfer).
  * @param abs_start Object offset of buf[0] (absolute, for the Range header).
- * @param max_resumes Cap on resume attempts before giving up.
+ * @param rc       Resume budget and backoff.
  * @param resumes  In/out: running count of resumes across the whole object.
  * @param filled   Output: bytes actually placed into buf.
  * @return An S3Result: ok when want bytes were filled, else error set.
@@ -152,35 +209,50 @@ s3::S3Config MakeS3Config(const std::string& bucket,
 s3::S3Result FillChunk(s3::S3RestClient& client, s3::S3Connection& conn,
                        s3::S3RestClient::S3GetStream& st, const std::string& key,
                        char* buf, size_t want, uint64_t abs_start,
-                       int max_resumes, int* resumes, size_t* filled) {
+                       const ResumeConfig& rc, int* resumes, size_t* filled) {
   size_t got_total = 0;
+  int stalled = 0;  // resumes in a row that delivered nothing
   while (got_total < want) {
     size_t got = 0;
     s3::S3Result rr = client.ReadBody(st, buf + got_total, want - got_total,
                                       &got);
     got_total += got;
     if (got_total >= want) break;
+    if (got > 0) stalled = 0;
     // The body ended (clean EOF or a mid-stream error) before this chunk was
-    // full, yet the transfer is not complete. Retire the response and resume
-    // from where we stopped with a ranged GET for the remaining bytes.
-    if (*resumes >= max_resumes) {
-      if (rr.error.empty()) {
-        rr.error = "S3 GET " + key + " ended short after " +
-                   std::to_string(max_resumes) + " resumes at offset " +
-                   std::to_string(abs_start + got_total);
+    // full, yet the transfer is not complete. Drop the response -- a body that
+    // ended short leaves the socket suspect, and draining it could block -- and
+    // resume from where we stopped with a ranged GET for the remaining bytes.
+    std::string last_error = rr.error;
+    conn.Retire();
+    st = s3::S3RestClient::S3GetStream{};
+    for (;;) {
+      if (stalled >= rc.max_resumes) {
+        s3::S3Result fail;
+        fail.error = "S3 GET " + key + " ended short: " +
+                     std::to_string(stalled) +
+                     " resumes in a row delivered nothing at offset " +
+                     std::to_string(abs_start + got_total) +
+                     (last_error.empty() ? "" : " (last: " + last_error + ")");
+        *filled = got_total;
+        return fail;
       }
-      *filled = got_total;
-      return rr;
-    }
-    ++(*resumes);
-    client.EndGetObject(conn, st);
-    const uint64_t resume_off = abs_start + got_total;
-    const uint64_t resume_len = static_cast<uint64_t>(want - got_total);
-    s3::S3Result rb = client.BeginGetObject(conn, key, resume_off, resume_len,
-                                            &st);
-    if (!rb.ok()) {
-      *filled = got_total;
-      return rb;
+      ++stalled;
+      ++(*resumes);
+      std::this_thread::sleep_for(rc.Backoff(stalled));
+      const uint64_t resume_off = abs_start + got_total;
+      const uint64_t resume_len = static_cast<uint64_t>(want - got_total);
+      s3::S3Result rb = client.BeginGetObject(conn, key, resume_off,
+                                              resume_len, &st);
+      if (rb.ok()) break;
+      if (rb.not_found) {
+        *filled = got_total;
+        return rb;
+      }
+      last_error = !rb.error.empty()
+                       ? rb.error
+                       : "HTTP " + std::to_string(rb.http_status);
+      conn.Retire();
     }
   }
   *filled = got_total;
@@ -234,6 +306,7 @@ struct StripeJob {
   std::vector<char *> bufs;    ///< destination chunk buffers, in object order
   std::vector<size_t> sizes;   ///< bytes wanted in each buffer
   int resumes = 0;             ///< resumes this stream needed
+  int retries = 0;             ///< times the part was fetched again
   std::string error;           ///< empty on success
 };
 
@@ -242,47 +315,66 @@ struct StripeJob {
  * std::thread, so it touches no runtime state: the buffers were allocated by
  * the coroutine, and the connection comes from (and returns to) the
  * thread-safe pool.
+ *
+ * A part that fails (its stream stalled past rc.max_resumes, or its GET
+ * failed) is fetched again up to rc.part_retries times on a fresh connection,
+ * starting at the first buffer not yet filled, so one bad stream no longer
+ * fails the whole object.
  */
 void FetchStripe(const s3::S3Config &cfg, S3ConnectionPool *pool,
-                 const std::string &key, int max_resumes, StripeJob *job) {
+                 const std::string &key, const ResumeConfig &rc,
+                 StripeJob *job) {
   s3::S3RestClient client(cfg);
   const std::string conn_key = client.ConnectionKey(key);
-  std::unique_ptr<s3::S3Connection> conn =
-      pool ? pool->Acquire(conn_key) : std::make_unique<s3::S3Connection>();
-  uint64_t len = 0;
-  for (size_t n : job->sizes) len += n;
-  s3::S3RestClient::S3GetStream st;
-  s3::S3Result b = client.BeginGetObject(*conn, key, job->abs_off, len, &st);
-  if (!b.ok()) {
-    job->error = !b.error.empty()
-                     ? b.error
-                     : "S3 GET " + key + " failed: HTTP " +
-                           std::to_string(b.http_status);
-  } else {
-    uint64_t off = job->abs_off;
-    for (size_t i = 0; i < job->bufs.size(); ++i) {
-      size_t filled = 0;
-      s3::S3Result fr = FillChunk(client, *conn, st, key, job->bufs[i],
-                                  job->sizes[i], off, max_resumes,
-                                  &job->resumes, &filled);
-      if (!fr.error.empty() || filled != job->sizes[i]) {
-        job->error = !fr.error.empty()
-                         ? fr.error
-                         : "short read at offset " + std::to_string(off);
-        break;
+  size_t i = 0;               // first buffer not yet filled
+  uint64_t off = job->abs_off;
+  for (;;) {
+    job->error.clear();
+    std::unique_ptr<s3::S3Connection> conn =
+        pool ? pool->Acquire(conn_key) : std::make_unique<s3::S3Connection>();
+    uint64_t len = 0;
+    for (size_t k = i; k < job->sizes.size(); ++k) len += job->sizes[k];
+    s3::S3RestClient::S3GetStream st;
+    s3::S3Result b = client.BeginGetObject(*conn, key, off, len, &st);
+    if (!b.ok()) {
+      job->error = !b.error.empty()
+                       ? b.error
+                       : "S3 GET " + key + " failed: HTTP " +
+                             std::to_string(b.http_status);
+    } else {
+      for (; i < job->bufs.size(); ++i) {
+        size_t filled = 0;
+        s3::S3Result fr = FillChunk(client, *conn, st, key, job->bufs[i],
+                                    job->sizes[i], off, rc, &job->resumes,
+                                    &filled);
+        if (!fr.error.empty() || filled != job->sizes[i]) {
+          job->error = !fr.error.empty()
+                           ? fr.error
+                           : "short read at offset " + std::to_string(off);
+          break;
+        }
+        off += job->sizes[i];
       }
-      off += job->sizes[i];
     }
-  }
-  // A body abandoned mid-stream carries unread bytes: never pool that socket.
-  if (job->error.empty()) {
-    client.EndGetObject(*conn, st);
-  } else if (st.body != nullptr) {
-    conn->Retire();
-    st.body = nullptr;
-  }
-  if (pool) {
-    pool->Release(conn_key, std::move(conn));
+    // A body abandoned mid-stream carries unread bytes: never pool that socket.
+    if (job->error.empty()) {
+      client.EndGetObject(*conn, st);
+    } else {
+      conn->Retire();
+      st.body = nullptr;
+    }
+    if (pool) {
+      pool->Release(conn_key, std::move(conn));
+    }
+    if (job->error.empty() || b.not_found || job->retries >= rc.part_retries) {
+      return;
+    }
+    ++job->retries;
+    HLOG(kWarning,
+         "S3FileAssimilator: part of s3://{}/{} failed at offset {}, retry {} "
+         "of {}: {}",
+         cfg.bucket, key, off, job->retries, rc.part_retries, job->error);
+    std::this_thread::sleep_for(rc.Backoff(job->retries + 2));
   }
 }
 
@@ -400,16 +492,6 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
       error_code = -3;
       CLIO_CO_RETURN;
     }
-  }
-
-  // Dependency-based scheduling is not yet supported (mirrors binary backend).
-  if (!ctx.depends_on.empty()) {
-    HLOG(kDebug,
-         "S3FileAssimilator: Dependency handling not yet implemented "
-         "(depends_on: {})",
-         ctx.depends_on);
-    error_code = 0;
-    CLIO_CO_RETURN;
   }
 
   // Parse the S3 source URL into bucket + key
@@ -613,10 +695,11 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
   // dropped keep-alive mid-object so a suspend across a PutBlob cannot truncate.
   static constexpr size_t kMaxChunkSize = kChunkBytes;
   static constexpr size_t kMaxParallelTasks = 32;
-  static constexpr int kMaxResumes = 16;
+  const ResumeConfig resume_cfg = ResumeConfigFromEnv();
   size_t chunk_idx = 0;
   size_t bytes_processed = 0;
   int resumes = 0;
+  int part_retries = 0;  // striped parts fetched again (FetchStripe)
   std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> active_tasks;
 
   const StripeConfig stripe = StripeConfigFromEnv();
@@ -666,7 +749,7 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
         auto pull = [&]() {
           for (size_t j = next_job.fetch_add(1); j < jobs.size();
                j = next_job.fetch_add(1)) {
-            FetchStripe(client.config(), s3_pool_, key, kMaxResumes, &jobs[j]);
+            FetchStripe(client.config(), s3_pool_, key, resume_cfg, &jobs[j]);
           }
         };
         std::vector<std::thread> threads;
@@ -679,6 +762,7 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
       std::string err = alloc_ok ? "" : "buffer allocation failed";
       for (const StripeJob& job : jobs) {
         resumes += job.resumes;
+        part_retries += job.retries;
         if (err.empty() && !job.error.empty()) err = job.error;
       }
       if (!err.empty()) {
@@ -731,7 +815,7 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
       _t_phase = SteadyClock::now();
       s3::S3Result fr =
           FillChunk(client, conn, stream, key, buffer, current_chunk_size,
-                    req_off + bytes_processed, kMaxResumes, &resumes, &filled);
+                    req_off + bytes_processed, resume_cfg, &resumes, &filled);
       g_us_fill.fetch_add(UsSince(_t_phase), std::memory_order_relaxed);
       if (!fr.error.empty() || filled != current_chunk_size) {
         HLOG(kError,
@@ -812,9 +896,16 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
   g_us_total.fetch_add(UsSince(_t_entry), std::memory_order_relaxed);
 
   HLOG(kDebug,
-       "S3FileAssimilator: Imported s3://{}/{} ({} chunks, {} resumes) into "
-       "{} '{}'",
-       bucket, key, chunk_idx, resumes, to_cfs ? "file" : "tag", tag_name);
+       "S3FileAssimilator: Imported s3://{}/{} ({} chunks, {} resumes, {} part "
+       "retries) into {} '{}'",
+       bucket, key, chunk_idx, resumes, part_retries, to_cfs ? "file" : "tag",
+       tag_name);
+  if (resumes > 0 || part_retries > 0) {
+    // Visible at the default level: how flaky the link was for this object.
+    HLOG(kInfo,
+         "S3FileAssimilator: s3://{}/{} needed {} resumes and {} part retries",
+         bucket, key, resumes, part_retries);
+  }
   error_code = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

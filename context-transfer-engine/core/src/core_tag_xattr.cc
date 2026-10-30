@@ -157,6 +157,12 @@ void Runtime::EraseTagXattrs(const TagId &tag_id) {
   tag_xattrs_.erase(PackTag(tag_id));
 }
 
+bool Runtime::HasTagXattrs(const TagId &tag_id) {
+  std::lock_guard<std::mutex> g(tag_xattr_mu_);
+  auto it = tag_xattrs_.find(PackTag(tag_id));
+  return it != tag_xattrs_.end() && !it->second.empty();
+}
+
 void Runtime::ApplyWalTagXattr(const std::vector<char> &payload, bool del) {
   auto txn = TransactionLog::DeserializeTagXattr(payload);
   const clio::run::u64 packed = PackTag(TagId{txn.tag_major_, txn.tag_minor_});

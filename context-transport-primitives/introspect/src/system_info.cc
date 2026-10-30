@@ -412,6 +412,33 @@ size_t SystemInfo::GetRamAvailable() {
 #endif
 }
 
+size_t SystemInfo::ReadMemoryLimitFile(const std::string &path) {
+  std::ifstream f(path);
+  CTP_MSAN_UNPOISON_OBJ(f);  // stream state is owned by libstdc++.so
+  if (!f.is_open()) {
+    return 0;
+  }
+  std::string v;
+  f >> v;
+  CTP_MSAN_UNPOISON_OBJ(f);
+  if (!f) {
+    return 0;
+  }
+  CTP_MSAN_UNPOISON_STRING(v);
+  if (v == "max") {
+    return 0;  // explicitly unlimited
+  }
+  try {
+    unsigned long long n = std::stoull(v);
+    // cgroup v1 reports a sentinel near SIZE_MAX when unlimited.
+    if (n > 0 && n < (1ULL << 62)) {
+      return static_cast<size_t>(n);
+    }
+  } catch (...) {
+  }
+  return 0;
+}
+
 /**
  * Memory limit imposed on this process by its cgroup, or 0 when unlimited or
  * unreadable (cgroup v2 first, then v1).
@@ -421,24 +448,9 @@ static size_t ReadCgroupMemoryLimit() {
   const char *paths[] = {"/sys/fs/cgroup/memory.max",
                          "/sys/fs/cgroup/memory/memory.limit_in_bytes"};
   for (const char *path : paths) {
-    std::ifstream f(path);
-    if (!f.is_open()) {
-      continue;
-    }
-    std::string v;
-    if (!(f >> v)) {
-      continue;
-    }
-    if (v == "max") {
-      return 0;  // explicitly unlimited
-    }
-    try {
-      unsigned long long n = std::stoull(v);
-      // cgroup v1 reports a sentinel near SIZE_MAX when unlimited.
-      if (n > 0 && n < (1ULL << 62)) {
-        return static_cast<size_t>(n);
-      }
-    } catch (...) {
+    size_t limit = SystemInfo::ReadMemoryLimitFile(path);
+    if (limit > 0) {
+      return limit;
     }
   }
 #endif
@@ -1896,9 +1908,15 @@ std::string SystemInfo::PredictDriveFailure(const std::string &drive_type,
   const std::string url =
       (env_url && *env_url) ? env_url
                             : "http://host.docker.internal:8000/predict/auto";
+  // Everything below is uninstrumented Poco doing its own address parsing and
+  // socket work through libc on stack MSan considers poisoned; only the
+  // interceptor checks reach it. The response body is unpoisoned explicitly.
+  ctp::MsanInterceptorCheckGuard msan_guard;
   try {
     Poco::URI uri(url);
+    CTP_MSAN_UNPOISON_OBJ(uri);
     std::string path = uri.getPathAndQuery();
+    CTP_MSAN_UNPOISON_STRING(path);
     if (path.empty()) {
       path = "/";
     }
@@ -1920,8 +1938,10 @@ std::string SystemInfo::PredictDriveFailure(const std::string &drive_type,
     CTP_MSAN_UNPOISON_STRING(body);
     return body.empty() ? "{}" : body;
   } catch (const Poco::Exception &e) {
+    std::string msg = e.displayText();
+    CTP_MSAN_UNPOISON_STRING(msg);  // built by uninstrumented Poco
     return std::string("{\"error\": \"Prediction server unreachable: ") +
-           JsonEscape(e.displayText()) + "\"}";
+           JsonEscape(msg) + "\"}";
   }
 #else
   (void)payload;

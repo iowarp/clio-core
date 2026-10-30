@@ -283,6 +283,11 @@ struct TargetInfo {
   clio::run::u64 ops_written_;
   float target_score_;        // Target score (0-1, normalized log bandwidth)
   clio::run::u64 remaining_space_;  // Remaining allocatable space in bytes
+  // Bumped on every incremental debit/credit of remaining_space_. The periodic
+  // stats refresh only overwrites remaining_space_ when this did not move
+  // while its GetStats was in flight; otherwise its snapshot predates a
+  // free/alloc and writing it back would erase that update.
+  clio::run::u64 space_epoch_;
   clio::run::u64 max_capacity_;     // Total (max) capacity in bytes, fixed at register
   clio::run::bdev::PerfMetrics perf_metrics_;  // Performance metrics from bdev
   clio::run::u32 expected_ttl_days_; // Predictive device TTL (defaults to 999999)
@@ -301,6 +306,7 @@ struct TargetInfo {
         ops_written_(0),
         target_score_(0.0f),
         remaining_space_(0),
+        space_epoch_(0),
         max_capacity_(0),
         expected_ttl_days_(999999),
         persistence_level_(clio::run::bdev::PersistenceLevel::kVolatile),
@@ -316,6 +322,7 @@ struct TargetInfo {
         ops_written_(0),
         target_score_(0.0f),
         remaining_space_(0),
+        space_epoch_(0),
         max_capacity_(0),
         expected_ttl_days_(999999),
         persistence_level_(clio::run::bdev::PersistenceLevel::kVolatile) {}
@@ -332,6 +339,7 @@ struct TargetInfo {
         ops_written_(other.ops_written_),
         target_score_(other.target_score_),
         remaining_space_(other.remaining_space_),
+        space_epoch_(other.space_epoch_),
         max_capacity_(other.max_capacity_),
         perf_metrics_(other.perf_metrics_),
         expected_ttl_days_(other.expected_ttl_days_),
@@ -350,6 +358,7 @@ struct TargetInfo {
       ops_written_ = other.ops_written_;
       target_score_ = other.target_score_;
       remaining_space_ = other.remaining_space_;
+      space_epoch_ = other.space_epoch_;
       max_capacity_ = other.max_capacity_;
       perf_metrics_ = other.perf_metrics_;
       expected_ttl_days_ = other.expected_ttl_days_;
@@ -1603,12 +1612,27 @@ struct BlobInfo {
     // Only checkable while no writer holds the blob: GetBlob reads the cache
     // while a PutBlob may be mid-update (it polls this under IsWriteLocked),
     // and re-summing blocks_ under that writer both races it and sees blocks_
-    // ahead of the cache.
-    const bool writer = ctp::ipc::atomic_ref<clio::run::u64>(
-                            const_cast<clio::run::u64 &>(write_owner_))
-                            .load() != 0;
-    assert((writer || ComputeTotalSizeSlow() == total_size_cache_) &&
-           "BlobInfo::total_size_cache_ drifted from sum(blocks_)");
+    // ahead of the cache. A writer can also take the blob after that first
+    // look and move blocks_ during the sum, so compare only when the blob was
+    // unlocked, and its placement generation and content sequence unchanged,
+    // both before and after the sum (#1233). Every PutBlob moves
+    // content_seq_; the other blocks_ mutators bump placement_gen_.
+    auto load = [](const clio::run::u64 &word) {
+      return ctp::ipc::atomic_ref<clio::run::u64>(
+                 const_cast<clio::run::u64 &>(word))
+          .load();
+    };
+    const clio::run::u64 gen_before = load(placement_gen_);
+    const clio::run::u64 seq_before = load(content_seq_);
+    if (load(write_owner_) == 0) {
+      const clio::run::u64 sum = ComputeTotalSizeSlow();
+      const clio::run::u64 cached = load(total_size_cache_);
+      const bool quiet = load(write_owner_) == 0 &&
+                         load(placement_gen_) == gen_before &&
+                         load(content_seq_) == seq_before;
+      assert((!quiet || sum == cached) &&
+             "BlobInfo::total_size_cache_ drifted from sum(blocks_)");
+    }
 #endif
     return total_size_cache_;
   }
@@ -2005,6 +2029,12 @@ struct Context {
    *  back to its returning owner. The owner applies it while it still
    *  holds back client traffic until its hand-back pull is done (#1154). */
   static constexpr clio::run::u32 kHandoffPush = 1u << 7;
+  /** kStandInRead -- set by the routing node when it sent this GetBlob to
+   *  a stand-in because it holds the owner dead. A stand-in that misses
+   *  such a read answers kBlobOwnerDownRc even if it still sees the owner
+   *  alive: its liveness view can lag the router's, and "not found" there
+   *  reads as a hole -- zeros returned for data held by the dead owner. */
+  static constexpr clio::run::u32 kStandInRead = 1u << 8;
 
   /**
    * Fault-handler parameters (checkpointing / lazy copy). When the core

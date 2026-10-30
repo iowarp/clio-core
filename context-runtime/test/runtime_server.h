@@ -268,13 +268,22 @@ class RuntimeServer {
   static std::string LogTail(size_t max_lines = 40) {
     const std::string path = ServerLogPath();
     std::ifstream f(path, std::ios::binary | std::ios::ate);
+    CTP_MSAN_UNPOISON_OBJ(f);  // stream state is owned by libstdc++.so
     if (!f.is_open()) return "(daemon log " + path + " not readable)";
-    const std::streamoff size = f.tellg();
+    std::streamoff size = f.tellg();
+    CTP_MSAN_UNPOISON_OBJ(size);
     constexpr std::streamoff kMaxBytes = 64 * 1024;
     f.seekg(size > kMaxBytes ? size - kMaxBytes : 0);
+    CTP_MSAN_UNPOISON_OBJ(f);
     std::vector<std::string> lines;
     std::string line;
-    while (std::getline(f, line)) lines.push_back(line);
+    for (;;) {
+      std::getline(f, line);
+      CTP_MSAN_UNPOISON_OBJ(f);  // getline updates the state in libstdc++.so
+      if (!f) break;
+      CTP_MSAN_UNPOISON_STRING(line);
+      lines.push_back(line);
+    }
     if (lines.empty()) return "(daemon log " + path + " is empty)";
     const size_t start =
         lines.size() > max_lines ? lines.size() - max_lines : 0;

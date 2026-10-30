@@ -62,6 +62,11 @@ const size_t kTestFileSize = 16 * 1024 * 1024; // 16MB
 const std::string kTestDir = "/tmp";
 const std::string kTestBackendFile = "/tmp/clio_cte_posix_test.dat";
 const std::string kTestFile = "clio::" + kTestBackendFile;
+// The CTE storage target's backing file. It must not be kTestBackendFile:
+// the test cases delete that path as scratch, and deleting a target's file
+// while the runtime serves it fails every later write that lands on a worker
+// opening it afresh ("the backing file was deleted or replaced").
+const std::string kTargetBackendFile = "/tmp/clio_cte_posix_target.dat";
 
 /**
  * Initialize CTE runtime and register test target. Must be called before
@@ -94,12 +99,12 @@ bool initializeRuntime() {
   clio::run::PoolId bdev_pool_id(950, 0);
   clio::run::bdev::Client bdev_client(bdev_pool_id);
   auto create_task = bdev_client.AsyncCreate(
-      clio::run::PoolQuery::Dynamic(), kTestBackendFile, bdev_pool_id,
+      clio::run::PoolQuery::Dynamic(), kTargetBackendFile, bdev_pool_id,
       clio::run::bdev::BdevType::kFile);
   create_task.Wait();
   std::this_thread::sleep_for(100ms);
   auto reg_task = cte_client->AsyncRegisterTarget(
-      kTestBackendFile, clio::run::bdev::BdevType::kFile, kTestFileSize * 10,
+      kTargetBackendFile, clio::run::bdev::BdevType::kFile, kTestFileSize * 10,
       clio::run::PoolQuery::Local(), bdev_pool_id);
   reg_task.Wait();
   if (reg_task->GetReturnCode() != 0) {

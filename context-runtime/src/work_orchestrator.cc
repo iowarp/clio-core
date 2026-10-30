@@ -168,7 +168,19 @@ bool WorkOrchestrator::StartWorkers() {
 
 void WorkOrchestrator::AwakenAllWorkers() {
   int runtime_pid = ctp::SystemInfo::GetPid();
-  for (auto *worker : all_workers_) {
+  // Walk the PUBLISHED prefix through the raw storage, never by iterator.
+  // The monitor thread appends an elastic worker (SpawnAdditionalWorker)
+  // while workers and client threads wake-all from RouteLocal; the storage is
+  // reserved up front so the append never reallocates, and every entry below
+  // the published count is complete. A checked Debug-STL iterator, however,
+  // treats the concurrent push_back as an orphaning write and raises "vector
+  // iterators incompatible" -- on Windows Debug builds a MODAL CRT dialog that
+  // froze the calling thread until ctest's 600 s timeout (cte_reorganize_all
+  // on the win-10 CDash runner).
+  const size_t n = num_workers_published_.load(std::memory_order_acquire);
+  Worker *const *workers = all_workers_.data();
+  for (size_t i = 0; i < n; ++i) {
+    Worker *worker = workers[i];
     if (!worker) continue;
     TaskLane *lane = worker->GetLane();
     if (!lane) continue;
@@ -256,7 +268,7 @@ Worker *WorkOrchestrator::GetWorker(u32 worker_id) const {
     return nullptr;
   }
 
-  return all_workers_[worker_id];
+  return all_workers_.data()[worker_id];  // raw: no checked-iterator race with push_back
 }
 
 size_t WorkOrchestrator::GetWorkerCount() const {
@@ -558,10 +570,12 @@ Worker *WorkOrchestrator::SpawnAdditionalWorker() {
   size_t elastic_budget =
       cfg ? static_cast<size_t>(cfg->GetElasticLaneHeadroom()) : 8;
   if (all_workers_.size() >= baseline_worker_count_ + elastic_budget) {
+    // (Not necessarily CPU-bound: the stalled workers may be asleep in a
+    // syscall. The ceiling is the reserved-lane budget.)
     HLOG(kWarning,
-         "[#785] NOT spawning: {} workers >= baseline {} + {} cores. The pool "
-         "is CPU-bound; another thread would only take cycles from running "
-         "tasks. Backlog on the stalled worker stays queued.",
+         "[#785] NOT spawning: {} workers >= baseline {} + {} elastic lanes "
+         "(the reserved-lane ceiling). Backlog on the stalled worker is "
+         "redistributed to healthy workers each monitor tick.",
          all_workers_.size(), baseline_worker_count_, elastic_budget);
     return nullptr;
   }

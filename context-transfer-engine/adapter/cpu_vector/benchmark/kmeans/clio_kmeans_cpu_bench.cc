@@ -22,6 +22,7 @@
 #include <clio_cte/cpu_vector/cpu_vector.h>
 #include <clio_runtime/clio_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>

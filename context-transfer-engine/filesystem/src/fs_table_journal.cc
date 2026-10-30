@@ -35,8 +35,8 @@
  * Directory journal: how a home persists its directory blocks when the
  * deployment names a metadata_log_path.
  *
- * The blocks live in memory (fs_dirs.cc). Each commit appends what changed
- * -- the same DirDelta list it pushes to the nodes caching the block -- so
+ * The blocks live in memory (fs_inode_table.cc). Each commit appends what changed
+ * -- the same TableDelta list it pushes to the nodes caching the block -- so
  * a create costs a few bytes in one local write(2), not a rewrite of the
  * whole block in a CTE blob. A block's first commit (new, split off, the
  * root materialized, or after a failed append) journals its whole image, so
@@ -88,22 +88,22 @@ bool DecBlockDrop(const std::string &p, clio::run::u64 *dir,
 
 }  // namespace
 
-size_t Runtime::ReplayBlockDeltas(const std::string &p, BlockState *state) {
-  std::vector<DirDelta> ds;
-  if (!DecodeDirDeltas(p, &ds)) return 1;
+size_t Runtime::ReplayBlockDeltas(const std::string &p, TableBlockState *state) {
+  std::vector<TableDelta> ds;
+  if (!DecodeTableDeltas(p, &ds)) return 1;
   size_t bad = 0;
-  for (const DirDelta &x : ds) {
-    auto it = state->find(BlockKey{x.dir_, x.index_});
+  for (const TableDelta &x : ds) {
+    auto it = state->find(TableBlockKey{x.dir_, x.index_});
     if (it == state->end()) {
       ++bad;  // no image to build on (a dropped block's late commit)
       continue;
     }
     // Not newer: a compaction's image already holds it.
-    if (x.kind_ != DirDeltaKind::kOps ||
+    if (x.kind_ != TableDeltaKind::kOps ||
         x.new_version_ <= it->second.version_) {
       continue;
     }
-    if (!ApplyDirOps(&it->second, x)) ++bad;
+    if (!ApplyTableOps(&it->second, x)) ++bad;
   }
   return bad;
 }
@@ -113,11 +113,13 @@ void Runtime::OpenDirJournal(const std::string &path) {
   if (path.empty()) {
     HLOG(kInfo, "filesystem: no metadata_log_path; directory blocks persist "
          "in CTE blobs");
+    dir_ready_.store(true, std::memory_order_release);
     return;
   }
   if (!dir_log_.Open(path)) {
     HLOG(kError, "filesystem: cannot open directory journal {}: {}; "
          "directory blocks persist in CTE blobs", path, std::strerror(errno));
+    dir_ready_.store(true, std::memory_order_release);
     return;
   }
   dir_journal_ = true;
@@ -134,29 +136,30 @@ void Runtime::OpenDirJournal(const std::string &path) {
     blocks = journaled_.size();
   }
   dir_log_synced_ms_ = SteadyMs();
+  dir_ready_.store(true, std::memory_order_release);
   HLOG(kInfo, "filesystem: directory journal {}: {} ({} records, {} blocks)",
        path, is_restart_ ? "replayed" : "fresh", n, blocks);
 }
 
 size_t Runtime::ReplayDirJournal() {
-  BlockState state;
+  TableBlockState state;
   size_t bad = 0;
   const size_t n = dir_log_.Replay(
       [&state, &bad](FsLogRec t, const std::string &p) {
         if (t == FsLogRec::kBlockImage) {
-          DirBlock b;
-          if (!DecodeDirBlock(p.data(), p.size(), &b)) {
+          InodeTableBlock b;
+          if (!DecodeTableBlock(p.data(), p.size(), &b)) {
             ++bad;
             return;
           }
-          const BlockKey key{b.dir_, b.index_};
+          const TableBlockKey key{b.dir_, b.index_};
           state[key] = std::move(b);
         } else if (t == FsLogRec::kBlockDeltas) {
           bad += ReplayBlockDeltas(p, &state);
         } else if (t == FsLogRec::kBlockDrop) {
           clio::run::u64 dir = 0;
           clio::run::u32 k = 0;
-          if (DecBlockDrop(p, &dir, &k)) state.erase(BlockKey{dir, k});
+          if (DecBlockDrop(p, &dir, &k)) state.erase(TableBlockKey{dir, k});
           else ++bad;
         }
       });
@@ -170,7 +173,7 @@ size_t Runtime::ReplayDirJournal() {
   std::lock_guard<std::mutex> g(ns_mu_);
   journaled_.clear();
   for (const auto &kv : state) {
-    journaled_[kv.first] = EncodeDirBlock(kv.second, true);
+    journaled_[kv.first] = EncodeTableBlock(kv.second, true);
   }
   return n;
 }
@@ -188,7 +191,7 @@ void Runtime::CompactDirJournalLocked() {
     for (const auto &kv : blocks_) {
       if (!kv.second->home_) continue;
       recs.emplace_back(FsLogRec::kBlockImage,
-                        EncodeDirBlock(kv.second->blk_, true));
+                        EncodeTableBlock(kv.second->blk_, true));
     }
   }
   if (!dir_log_.Rewrite(recs)) {
@@ -215,7 +218,7 @@ int Runtime::JournalDropBlock(clio::run::u64 dir, clio::run::u32 k) {
   }
   // Forgotten in the same step as the append: a compaction in between
   // would snapshot the block and drop this record, bringing it back.
-  const BlockKey key{dir, k};
+  const TableBlockKey key{dir, k};
   std::lock_guard<std::mutex> g(ns_mu_);
   journaled_.erase(key);
   auto it = blocks_.find(key);
@@ -226,17 +229,17 @@ int Runtime::JournalDropBlock(clio::run::u64 dir, clio::run::u32 k) {
 }
 
 int Runtime::TakeJournaledBlock(clio::run::u64 dir, clio::run::u32 k,
-                                DirBlock *out) {
+                                InodeTableBlock *out) {
   std::string img;
   {
     // Copied, not moved: it leaves journaled_ only once the slot is in
     // blocks_ (InstallLoadedBlock), so a compaction never misses it.
     std::lock_guard<std::mutex> g(ns_mu_);
-    auto it = journaled_.find(BlockKey{dir, k});
+    auto it = journaled_.find(TableBlockKey{dir, k});
     if (it == journaled_.end()) return ENOENT;
     img = it->second;
   }
-  if (!DecodeDirBlock(img.data(), img.size(), out) || out->dir_ != dir ||
+  if (!DecodeTableBlock(img.data(), img.size(), out) || out->dir_ != dir ||
       out->index_ != k) {
     HLOG(kError, "filesystem: journaled directory block {}/{} unreadable",
          dir, k);
@@ -245,13 +248,13 @@ int Runtime::TakeJournaledBlock(clio::run::u64 dir, clio::run::u32 k,
   return 0;
 }
 
-void Runtime::TakePersistLocked(BlockSlot &slot,
-                                const std::vector<DirDelta> &deltas,
+void Runtime::TakePersistLocked(TableBlockSlot &slot,
+                                const std::vector<TableDelta> &deltas,
                                 std::string *image, FsLogRec *jtype,
                                 std::string *jrec) {
   if (!dir_journal_) {
     if (slot.persist_dirty_) {
-      *image = EncodeDirBlock(slot.blk_, true);
+      *image = EncodeTableBlock(slot.blk_, true);
       slot.persist_dirty_ = false;
     }
     return;
@@ -261,11 +264,11 @@ void Runtime::TakePersistLocked(BlockSlot &slot,
   slot.persist_dirty_ = false;
   if (slot.journal_image_) {
     *jtype = FsLogRec::kBlockImage;
-    *jrec = EncodeDirBlock(slot.blk_, true);
+    *jrec = EncodeTableBlock(slot.blk_, true);
     slot.journal_image_ = false;
   } else if (!deltas.empty()) {
     *jtype = FsLogRec::kBlockDeltas;
-    *jrec = EncodeDirDeltas(deltas);
+    *jrec = EncodeTableDeltas(deltas);
   }
 }
 
@@ -282,7 +285,7 @@ void Runtime::SyncDirJournalIfDue() {
   if (dir_log_.Unsynced()) dir_log_.Sync();
 }
 
-void Runtime::JournaledHomeKeys(std::vector<BlockKey> *out) {
+void Runtime::JournaledHomeKeys(std::vector<TableBlockKey> *out) {
   out->clear();
   std::lock_guard<std::mutex> g(ns_mu_);
   for (const auto &kv : journaled_) out->push_back(kv.first);

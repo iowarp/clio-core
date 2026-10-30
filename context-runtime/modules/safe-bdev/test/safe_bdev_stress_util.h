@@ -82,9 +82,35 @@ constexpr size_t kLiveCap = 150;
 
 inline bool g_initialized = false;
 
+/** @return directory for member backing files. */
+inline std::filesystem::path StressDir();
+
+/**
+ * Delete member and alloc-log files that earlier runs left behind. A run that
+ * exits without finalizing (Windows terminates the process) never removes its
+ * 16 MiB members, and enough of them fill the temp volume, after which every
+ * member write fails with a disk-full error and the whole suite goes red.
+ * Only files older than an hour are touched, so a concurrent run is safe.
+ */
+inline void SweepStaleFiles() {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(1);
+  for (fs::directory_iterator it(StressDir(), ec), end; !ec && it != end;
+       it.increment(ec)) {
+    const std::string name = it->path().filename().string();
+    if (name.rfind("sbs", 0) != 0) continue;
+    std::error_code fe;
+    if (it->is_regular_file(fe) && fs::last_write_time(*it, fe) < cutoff) {
+      fs::remove(it->path(), fe);
+    }
+  }
+}
+
 /** Start the embedded runtime once per process. */
 inline void EnsureInit() {
   if (g_initialized) return;
+  SweepStaleFiles();
   g_initialized = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (g_initialized) {
     SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;

@@ -12,6 +12,7 @@
 #include <clio_runtime/bdev/transports/fs_bdev_transport.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/io/io_error.h>
+#include <clio_ctp/util/msan.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/manager.h>
 #include <clio_runtime/worker.h>
@@ -346,13 +347,36 @@ bool FsBdevTransport::Sync() {
   // between leaves synced bytes in blocks the log may not show yet (the
   // CTE's own WAL still does), never a logged block whose bytes are lost.
   if (!BackingFileIntact("sync")) return false;
+  // Group commit. Every CTE fsync syncs the whole multi-GB tier file, and
+  // under tiering load hundreds of them queued up, each a full fdatasync
+  // (4.9 s average, 26 s max on the DRAM-heavy mix). A caller's writes have
+  // completed before it calls Sync, so ANY fdatasync that starts after this
+  // call registered covers them: register a ticket, then either wait for a
+  // sync that started after the ticket or start one that covers everyone
+  // registered so far.
+  std::unique_lock<std::mutex> lk(gc_mu_);
+  const clio::run::u64 ticket = ++gc_next_;
+  for (;;) {
+    if (gc_done_ >= ticket) return gc_ok_through_ >= ticket;
+    if (!gc_running_) break;
+    gc_cv_.wait(lk);
+  }
+  gc_running_ = true;
+  const clio::run::u64 covers = gc_next_;  // everyone registered so far
+  lk.unlock();
   const int err = SyncFileData(file_path_);
+  if (err == 0) FlushAllocLog();
+  lk.lock();
+  gc_running_ = false;
+  gc_done_ = covers;
+  if (err == 0) gc_ok_through_ = covers;
+  gc_cv_.notify_all();
+  lk.unlock();
   if (err != 0) {
     HLOG(kError, "bdev Sync: flushing {} failed ({})", file_path_,
          strerror(err));
     return false;
   }
-  FlushAllocLog();
   return true;
 }
 
@@ -393,7 +417,13 @@ void FsBdevTransport::LogBlocks(const std::vector<Block>& blocks,
 
 void FsBdevTransport::FlushAllocLog() {
   if (!has_alloc_log_) return;
-  alloc_log_.Flush();
+  // SyncAppended, not Flush: Flush holds the log mutex across the fsync, and
+  // every worker logging an allocation or free (LogBlocks) waited on it for
+  // the whole fsync -- AllocateBlocks/FreeBlocks stalled their workers for
+  // up to ~10 s under tiering load. SyncAppended appends under the lock and
+  // fsyncs a duplicate descriptor without it; the same records are durable
+  // when it returns.
+  alloc_log_.SyncAppended();
   // Compact once history dominates: the log is then bounded by ~2x the
   // live-block count instead of growing with every allocate/free.
   constexpr clio::run::u64 kMinCompactRecords = 4096;
@@ -436,6 +466,39 @@ bool FsBdevTransport::AllocateBlocks(size_t size, int worker_id, std::vector<Blo
   // Logged BEFORE the caller can write into or reference the blocks.
   LogBlocks(blocks, /*is_free=*/false);
   return true;
+}
+
+bool FsBdevTransport::AllocateBlocksDeferred(size_t size, int worker_id,
+                                             std::vector<Block>& blocks,
+                                             clio::run::u64* need) {
+  *need = 0;
+  if (!allocator_.AllocateBlocks(size, worker_id, blocks)) {
+    return false;
+  }
+  clio::run::u64 end = 0;
+  for (const Block &b : blocks) {
+    clio::run::u64 e = b.offset_ + b.size_;
+    if (e > end) end = e;
+  }
+  if (end <= file_backed_bytes_.load(std::memory_order_acquire)) {
+    // Inside the backed prefix: complete now (the common case).
+    LogBlocks(blocks, /*is_free=*/false);
+    return true;
+  }
+  *need = end;  // the caller grows the file off the worker, then finishes
+  return true;
+}
+
+void FsBdevTransport::FinishAllocate(bool backed_ok, int worker_id,
+                                     std::vector<Block>& blocks) {
+  if (!backed_ok) {
+    // Same as AllocateBlocks: a disk that cannot provide the promised space
+    // fails the allocation cleanly instead of handing out blocks that EIO.
+    allocator_.FreeBlocks(worker_id, blocks);
+    blocks.clear();
+    return;
+  }
+  LogBlocks(blocks, /*is_free=*/false);
 }
 
 bool FsBdevTransport::GrowBackingFile(clio::run::u64 backed,
@@ -524,9 +587,13 @@ clio::run::u64 FsBdevTransport::HostFreeBytes() const {
     return host_free_.load(std::memory_order_relaxed);
   }
   std::error_code ec;
-  const std::filesystem::space_info si =
-      std::filesystem::space(std::filesystem::path(file_path_).parent_path(),
-                             ec);
+  // parent_path() and space() both run in libstdc++.so, which MSan does not
+  // see: the returned path and space_info read back as uninitialized.
+  std::filesystem::path dir = std::filesystem::path(file_path_).parent_path();
+  CTP_MSAN_UNPOISON_PATH(dir);
+  std::filesystem::space_info si = std::filesystem::space(dir, ec);
+  CTP_MSAN_UNPOISON_OBJ(si);
+  CTP_MSAN_UNPOISON_OBJ(ec);
   // Unknown (e.g. no permission to stat): do not cap by it.
   const clio::run::u64 free_b =
       ec ? ~clio::run::u64(0) : static_cast<clio::run::u64>(si.available);
@@ -637,7 +704,7 @@ FsBdevTransport::AlignedBuf FsBdevTransport::TakeBounce(size_t size) {
   // reads `new (std::align_val_t(...)) char[n]` as PLACEMENT new and rejects
   // it (C2956). AlignedFree releases it with the matching operator delete[].
   return AlignedBuf(static_cast<char *>(
-      ::operator new[](size, std::align_val_t(kDirectAlign))));
+      ::operator new[](size, std::align_val_t(DirectAlign()))));
 }
 
 void FsBdevTransport::GiveBounce(AlignedBuf buf, size_t size) {
@@ -694,19 +761,18 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
     }
 
     // Up to three writes per block: an unaligned head and tail through the
-    // page cache, and the 4 KiB-aligned body between them bounced to the
-    // O_DIRECT fd (see WantsBounce). A FUSE write from an unaligned user
+    // page cache, and the DirectAlign()-aligned body between them bounced to
+    // the O_DIRECT fd (see WantsBounce). A FUSE write from an unaligned user
     // buffer arrives as ~1 MiB + a few bytes, so without the split no byte
     // of it could go direct.
+    const clio::run::u64 align = DirectAlign();
     clio::run::u64 seg_done = 0;
     while (seg_done < block_write_size) {
       const clio::run::u64 fo = block.offset_ + seg_done;
       const clio::run::u64 left = block_write_size - seg_done;
       const clio::run::u64 head =
-          std::min<clio::run::u64>(left, (kDirectAlign - fo % kDirectAlign) %
-                                             kDirectAlign);
-      const clio::run::u64 body =
-          ((left - head) / kDirectAlign) * kDirectAlign;
+          std::min<clio::run::u64>(left, (align - fo % align) % align);
+      const clio::run::u64 body = ((left - head) / align) * align;
       clio::run::u64 seg = left;
       if (body >= kBounceMin) {
         seg = head != 0 ? head : body;

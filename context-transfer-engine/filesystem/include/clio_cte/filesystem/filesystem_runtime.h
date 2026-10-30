@@ -53,7 +53,9 @@
 #include <clio_cte/stream/stream_client.h>
 #include <clio_cte/stream/stream_runtime.h>
 #include <clio_cte/filesystem/fs_shard.h>
-#include <clio_cte/filesystem/fs_dir_block.h>
+#include <clio_cte/filesystem/fs_canonical.h>
+#include <clio_cte/filesystem/fs_inode.h>
+#include <clio_cte/filesystem/fs_inode_table.h>
 #include <clio_cte/filesystem/fs_meta_log.h>
 #include <clio_cte/filesystem/shm_fs_cache.h>
 
@@ -239,9 +241,25 @@ class Runtime : public clio::run::Container {
     clio::run::u64 atime_ = 0;               ///< ns
     clio::run::u64 mtime_ = 0;               ///< ns
     clio::run::u64 ctime_ = 0;               ///< ns
+    clio::run::u64 parent_ = 0;              ///< directories: Inode::parent_
+    std::string parent_key_;                 ///< directories: Inode::parent_key_
+    clio::run::u32 volume_flags_ = 0;        ///< root: Inode::volume_flags_
   };
 
-  /** Request of one ShardOp (a superset; each op reads what it needs). */
+  /**
+   * Append attributes to an encoding (shard replies and inode pushes).
+   * @param e encoder
+   * @param a attributes
+   */
+  static void EncodeAttr(FsEnc &e, const FsAttr &a);
+  /**
+   * Read what EncodeAttr wrote.
+   * @param d decoder
+   * @param a receives the attributes
+   * @return false if malformed
+   */
+  static bool DecodeAttr(FsDec &d, FsAttr *a);
+
   /** How long a node serves a cached directory block or inode attributes
    *  without asking the home (ms), measured from when it asked. */
   static constexpr clio::run::u64 kCacheLeaseMs = 10000;
@@ -316,8 +334,28 @@ class Runtime : public clio::run::Container {
   clio::cte::stream::Client stream_;
   /** This node's stream container (resolved in Create; empty if absent). */
   clio::run::ContainerHold stream_hold_;
-  /** Entries a directory block holds before it splits. */
+  /** Rows an inode-table block holds before it splits. */
   clio::run::u32 split_entries_ = 1024;
+  /** Names are compared case-insensitively (FilesystemConfig; fixed for the
+   *  volume's life by the root inode's record). */
+  bool case_insensitive_ = false;
+
+  /**
+   * The canonical name of one path component on this volume.
+   * @param name the component as spelled
+   * @return the inode-table key
+   */
+  std::string KeyOf(const std::string &name) const {
+    return FsCanonicalName(name, case_insensitive_);
+  }
+  /**
+   * The canonical form of a whole path on this volume.
+   * @param path the path as spelled
+   * @return the path every spelling of it maps to
+   */
+  std::string KeyOfPath(const std::string &path) const {
+    return FsCanonicalPath(path, case_insensitive_);
+  }
   /** Next holder registration number (blocks and inodes). */
   std::atomic<clio::run::u64> reg_seq_{1};
   /** When this container started (steady ms): a lease granted by an earlier
@@ -325,20 +363,16 @@ class Runtime : public clio::run::Container {
   clio::run::u64 started_ms_ = 0;
 
   // ---- inodes this container is home for ----
-  struct FileInfo {
-    clio::cte::core::TagId tag_id_;
-    std::string path_;                       ///< a current name (mirror only)
-    // Everything below is guarded by meta_mu_.
-    clio::run::u32 type_ = kFsTypeFile;      ///< file or symlink
-    clio::run::u32 nlink_ = 1;
-    clio::run::u32 mode_ = 0xFFFFFFFFu;      ///< all-ones = adapter default
-    clio::run::u32 uid_ = 0xFFFFFFFFu;
-    clio::run::u32 gid_ = 0xFFFFFFFFu;
-    clio::run::u64 atime_ = 0, mtime_ = 0, ctime_ = 0;
-    std::string symlink_;                    ///< symlink target
-    clio::run::u32 open_count_ = 0;          ///< live handles
-    bool orphan_ = false;     ///< last name gone while open: purge at close
-    bool has_xattr_ = false;  ///< an xattr blob may exist
+  /**
+   * An inode resident on its home: its persisted attributes (the Inode
+   * base, what its record holds) plus state that lives only in memory.
+   * Everything is guarded by meta_mu_.
+   */
+  struct InodeState : Inode {
+    /** The path the SHM mirror publishes it under (a name it was opened or
+     *  created by); empty when it has none. Not persisted. */
+    std::string mirror_path_;
+    clio::run::u32 open_count_ = 0;  ///< live handles
     bool dirty_ = false;      ///< times changed since last logged
     /** Containers caching its attrs -> their registration number. */
     std::map<clio::run::u32, clio::run::u64> holders_;
@@ -347,24 +381,27 @@ class Runtime : public clio::run::Container {
     bool holders_unknown_ = false;
     /** When each holder's lease on the cached attributes runs out. */
     std::map<clio::run::u32, clio::run::u64> holder_lease_ms_;
+    /** Wall time (ns) of the last explicit mtime set (utimens); a size push
+     *  for a write before it keeps that mtime. Not persisted. */
+    clio::run::u64 mtime_set_ns_ = 0;
   };
-  std::mutex meta_mu_;  ///< guards handles_, by_tag_ and FileInfo fields
-  std::unordered_map<clio::run::u64, std::shared_ptr<FileInfo>> handles_;
-  std::unordered_map<clio::run::u64, std::shared_ptr<FileInfo>> by_tag_;
+  std::mutex meta_mu_;  ///< guards handles_, inodes_ and InodeState fields
+  std::unordered_map<clio::run::u64, std::shared_ptr<InodeState>> handles_;
+  std::unordered_map<clio::run::u64, std::shared_ptr<InodeState>> inodes_;
   std::atomic<clio::run::u64> next_handle_{1};
 
-  // ---- directory blocks (fs_dirs.cc) ----
+  // ---- inode-table blocks (fs_inode_table.cc) ----
   /** Identifies one block: (directory id, block index). */
-  struct BlockKey {
+  struct TableBlockKey {
     clio::run::u64 dir_ = 0;
     clio::run::u32 index_ = 0;
-    bool operator==(const BlockKey &o) const {
+    bool operator==(const TableBlockKey &o) const {
       return dir_ == o.dir_ && index_ == o.index_;
     }
   };
-  /** Hash of a BlockKey. */
-  struct BlockKeyHash {
-    size_t operator()(const BlockKey &k) const {
+  /** Hash of a TableBlockKey. */
+  struct TableBlockKeyHash {
+    size_t operator()(const TableBlockKey &k) const {
       return static_cast<size_t>(FsMix64(k.dir_ ^ (static_cast<clio::run::u64>(
                                                        k.index_) << 40)));
     }
@@ -374,15 +411,15 @@ class Runtime : public clio::run::Container {
    * container is the block's home, otherwise a cached copy kept current by
    * the home's pushes.
    */
-  struct BlockSlot {
-    DirBlock blk_;
+  struct TableBlockSlot {
+    InodeTableBlock blk_;
     bool home_ = false;                ///< this container is the home
     clio::run::u32 home_id_ = 0;       ///< the home (cached copies)
     // ---- home only (ns_mu_) ----
     /** Containers caching a copy -> their registration number (a failed
      *  push only drops a holder that has not re-registered since). */
     std::map<clio::run::u32, clio::run::u64> holders_;
-    std::vector<DirDelta> unpushed_;   ///< changes not yet pushed
+    std::vector<TableDelta> unpushed_;   ///< changes not yet pushed
     clio::run::u64 durable_version_ = 0;  ///< written + pushed up to here
     bool persist_dirty_ = false;       ///< durable image changed
     bool committing_ = false;          ///< a commit is writing/pushing
@@ -403,29 +440,38 @@ class Runtime : public clio::run::Container {
     bool journal_image_ = true;
   };
   std::mutex ns_mu_;  ///< guards blocks_, loading_, early_ and every slot
-  std::unordered_map<BlockKey, std::shared_ptr<BlockSlot>, BlockKeyHash> blocks_;
+  std::unordered_map<TableBlockKey, std::shared_ptr<TableBlockSlot>, TableBlockKeyHash> blocks_;
+  /** IpcManager::HeldDeadSeq() when home blocks were last trusted. A change
+   *  is a rejoin notice: a peer held this node dead and may have failed its
+   *  homes over, so clean home blocks are dropped and reloaded. */
+  std::atomic<clio::run::u64> seen_held_dead_seq_{0};
+  /** Drop every clean home block (reload on next use); see above. */
+  void DropHomeBlocksAfterFailover();
   /** Blocks being loaded here (a push that arrives meanwhile is kept),
    *  each with the step its loader is on -- named in a slow waiter's
    *  warning, so a load that never returns says where it is stuck. */
-  std::unordered_map<BlockKey, const char *, BlockKeyHash> loading_;
+  std::unordered_map<TableBlockKey, const char *, TableBlockKeyHash> loading_;
 
   /**
    * Record which step the loader of `key` is on (static string).
    * @param key the block being loaded
    * @param stage what the loader is waiting on
    */
-  void SetLoadStage(const BlockKey &key, const char *stage) {
+  void SetLoadStage(const TableBlockKey &key, const char *stage) {
     std::lock_guard<std::mutex> g(ns_mu_);
     auto it = loading_.find(key);
     if (it != loading_.end()) it->second = stage;
   }
   /** Pushes that arrived while their block was loading. */
-  std::unordered_map<BlockKey, std::vector<DirDelta>, BlockKeyHash> early_;
+  std::unordered_map<TableBlockKey, std::vector<TableDelta>, TableBlockKeyHash> early_;
 
-  // ---- directory journal (fs_dir_journal.cc) ----
+  // ---- inode-table journal (fs_table_journal.cc) ----
   /** True when directory blocks persist in dir_log_ (metadata_log_path is
    *  set) instead of CTE blobs. */
   bool dir_journal_ = false;
+  /** Set once OpenDirJournal has decided the journal (and replayed it): home
+   *  block loads wait for it, as must anything a peer asks before Create. */
+  std::atomic<bool> dir_ready_{false};
   /** Node-local journal of the blocks this container is home for. */
   FsMetaLog dir_log_;
   /** Orders appends against a compaction's snapshot + rewrite. Taken
@@ -433,7 +479,7 @@ class Runtime : public clio::run::Container {
   std::mutex dir_log_mu_;
   /** Durable images replayed from the journal and not loaded yet (a home
    *  block moves to blocks_ on first use). Guarded by ns_mu_. */
-  std::unordered_map<BlockKey, std::string, BlockKeyHash> journaled_;
+  std::unordered_map<TableBlockKey, std::string, TableBlockKeyHash> journaled_;
   /** Steady ms of the journal's last periodic fsync. */
   clio::run::u64 dir_log_synced_ms_ = 0;
 
@@ -491,9 +537,13 @@ class Runtime : public clio::run::Container {
    * @param op FsShardOp code
    * @param req request
    * @param resp filled with the response (rc_ = EIO when unreachable)
+   * @param node_lost if non-null, set true when the call failed because the
+   *        target's node was lost with it in flight (the caller may resolve
+   *        the target again: failover names the stand-in once it is dead)
    */
   clio::run::TaskResume CallShard(clio::run::u32 target, clio::run::u32 op,
-                                  const FsReq &req, FsResp &resp);
+                                  const FsReq &req, FsResp &resp,
+                                  bool *node_lost = nullptr);
   /**
    * Send ShardOp `op` to container `target` without waiting (fan-out).
    * @param target container (may be this one)
@@ -517,7 +567,7 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume ExecInodeOp(clio::run::u32 op, const FsReq &req,
                                     FsResp &resp, int &rc);
 
-  // ---- directory blocks: homes and caches (fs_dirs.cc) ----
+  // ---- inode-table blocks: homes and caches (fs_inode_table.cc) ----
   /**
    * The container that owns block (dir, k): the owner of its CTE blob, or,
    * while that node is dead, the successor serving it.
@@ -536,7 +586,7 @@ class Runtime : public clio::run::Container {
    * @param rc 0, ENOENT (no such block/directory) or EIO
    */
   clio::run::TaskResume LoadBlock(clio::run::u64 dir, clio::run::u32 k,
-                                  std::shared_ptr<BlockSlot> &out, int &rc);
+                                  std::shared_ptr<TableBlockSlot> &out, int &rc);
   /**
    * Read block (dir, k) from its CTE blob (the home's first use).
    * @param dir packed directory id
@@ -545,17 +595,37 @@ class Runtime : public clio::run::Container {
    * @param rc 0, ENOENT (no blob) or EIO
    */
   clio::run::TaskResume ReadBlockBlob(clio::run::u64 dir, clio::run::u32 k,
-                                      DirBlock *out, int &rc);
+                                      InodeTableBlock *out, int &rc);
   /**
    * Write a block's durable image to its CTE blob (on a non-volatile tier
    * when the deployment has one).
    * @param dir packed directory id
    * @param k block index
-   * @param image EncodeDirBlock(block, true)
+   * @param image EncodeTableBlock(block, true)
    * @param rc 0 or EIO
    */
   clio::run::TaskResume WriteBlockBlob(clio::run::u64 dir, clio::run::u32 k,
                                        const std::string &image, int &rc);
+  /**
+   * Read block (dir, k) from its CTE blob only (no journal lookup).
+   * @param dir packed directory id
+   * @param k block index
+   * @param out receives the block
+   * @param rc 0, ENOENT (no such blob) or EIO (any other failure)
+   */
+  clio::run::TaskResume ReadBlockCte(clio::run::u64 dir, clio::run::u32 k,
+                                     InodeTableBlock *out, int &rc);
+  /**
+   * Store a block image in its CTE blob, padded to a power of two, on a
+   * non-volatile tier when one accepts it (else RAM). With the directory
+   * journal on this is the replicated mirror a stand-in reads (#1263).
+   * @param dir packed directory id
+   * @param k block index
+   * @param image EncodeTableBlock(block, true)
+   * @param rc 0, ENOSPC (store full) or EIO
+   */
+  clio::run::TaskResume PutBlockCte(clio::run::u64 dir, clio::run::u32 k,
+                                    const std::string &image, int &rc);
   /**
    * Open this container's directory journal, then replay it (restart) or
    * empty it (fresh start). Leaves dir_journal_ false when `path` is empty
@@ -584,14 +654,14 @@ class Runtime : public clio::run::Container {
    */
   int JournalAppend(FsLogRec type, const std::string &payload);
   /** Blocks rebuilt while replaying the directory journal. */
-  using BlockState = std::unordered_map<BlockKey, DirBlock, BlockKeyHash>;
+  using TableBlockState = std::unordered_map<TableBlockKey, InodeTableBlock, TableBlockKeyHash>;
   /**
    * Apply one kBlockDeltas record during replay.
-   * @param p payload (EncodeDirDeltas)
+   * @param p payload (EncodeTableDeltas)
    * @param state blocks replayed so far
    * @return number of deltas that could not be applied
    */
-  static size_t ReplayBlockDeltas(const std::string &p, BlockState *state);
+  static size_t ReplayBlockDeltas(const std::string &p, TableBlockState *state);
   /**
    * Journal the deletion of block (dir, k) (rmdir) and, in the same step,
    * forget its replayed image and its sealed slot.
@@ -610,7 +680,7 @@ class Runtime : public clio::run::Container {
    * @param jtype receives the journal record type
    * @param jrec receives the journal record (empty: none)
    */
-  void TakePersistLocked(BlockSlot &slot, const std::vector<DirDelta> &deltas,
+  void TakePersistLocked(TableBlockSlot &slot, const std::vector<TableDelta> &deltas,
                          std::string *image, FsLogRec *jtype,
                          std::string *jrec);
   /**
@@ -620,7 +690,7 @@ class Runtime : public clio::run::Container {
    * @param out receives the block
    * @return 0, ENOENT (no such block) or EIO (undecodable image)
    */
-  int TakeJournaledBlock(clio::run::u64 dir, clio::run::u32 k, DirBlock *out);
+  int TakeJournaledBlock(clio::run::u64 dir, clio::run::u32 k, InodeTableBlock *out);
   /**
    * fsync the directory journal.
    * @return 0 or EIO
@@ -634,7 +704,7 @@ class Runtime : public clio::run::Container {
    * but not loaded, and loaded home slots.
    * @param out receives the keys
    */
-  void JournaledHomeKeys(std::vector<BlockKey> *out);
+  void JournaledHomeKeys(std::vector<TableBlockKey> *out);
   /** Journal size that triggers a compaction (bytes). */
   static constexpr clio::run::u64 kDirJournalCompactBytes = 64ull << 20;
   /** Longest a journal record waits for its fsync on the drain tick (ms). */
@@ -653,7 +723,7 @@ class Runtime : public clio::run::Container {
    * @param lrc 0 or an errno
    */
   clio::run::TaskResume LoadHomeBlock(clio::run::u64 dir, clio::run::u32 k,
-                                      std::shared_ptr<BlockSlot> slot,
+                                      std::shared_ptr<TableBlockSlot> slot,
                                       int &lrc);
   /**
    * Fetch a copy of a block from its home, registering as a holder and
@@ -666,7 +736,7 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume FetchBlock(clio::run::u64 dir, clio::run::u32 k,
                                    clio::run::u32 home,
-                                   std::shared_ptr<BlockSlot> slot, int &lrc);
+                                   std::shared_ptr<TableBlockSlot> slot, int &lrc);
   /**
    * The containers a home block's next push goes to (ns_mu_ held).
    * @param slot the home block
@@ -675,7 +745,7 @@ class Runtime : public clio::run::Container {
    * @param holders out: containers to push to
    * @param leases out: their lease ends (steady ms), parallel to holders
    */
-  void PushTargetsLocked(const BlockSlot &slot, bool resync,
+  void PushTargetsLocked(const TableBlockSlot &slot, bool resync,
                          std::vector<clio::run::u32> *holders,
                          std::vector<clio::run::u64> *leases);
   /**
@@ -687,9 +757,9 @@ class Runtime : public clio::run::Container {
    * @param expired set to a copy from that home whose lease ran out
    * @return true when out was set
    */
-  bool FindCachedBlock(const BlockKey &key, clio::run::u32 home,
-                       std::shared_ptr<BlockSlot> *out,
-                       std::shared_ptr<BlockSlot> *expired);
+  bool FindCachedBlock(const TableBlockKey &key, clio::run::u32 home,
+                       std::shared_ptr<TableBlockSlot> *out,
+                       std::shared_ptr<TableBlockSlot> *expired);
   /**
    * Deregister holders a push found gone. Only the registration the push
    * went to is removed (a holder that fetched again meanwhile stays), and a
@@ -712,8 +782,8 @@ class Runtime : public clio::run::Container {
    * @param lrc the load's result (the slot is cached only when 0)
    * @param out set to slot on success
    */
-  void InstallLoadedBlock(const BlockKey &key, std::shared_ptr<BlockSlot> slot,
-                          int lrc, std::shared_ptr<BlockSlot> *out);
+  void InstallLoadedBlock(const TableBlockKey &key, std::shared_ptr<TableBlockSlot> slot,
+                          int lrc, std::shared_ptr<TableBlockSlot> *out);
   /** FsResp::id_ of a fetch whose req.b_ matched the home's version. */
   static constexpr clio::run::u64 kFetchUnchanged = 1;
   /**
@@ -726,7 +796,7 @@ class Runtime : public clio::run::Container {
    * @param rc 0 (copy current, lease renewed), kFsRedirect (not the home
    *           any more) or an errno (unreachable: never serve the copy)
    */
-  clio::run::TaskResume RevalidateBlock(std::shared_ptr<BlockSlot> slot,
+  clio::run::TaskResume RevalidateBlock(std::shared_ptr<TableBlockSlot> slot,
                                         clio::run::u64 dir, clio::run::u32 k,
                                         clio::run::u32 home, int &rc);
   /**
@@ -734,7 +804,7 @@ class Runtime : public clio::run::Container {
    * @return 0, or ENOENT when some block is not cached here (the home then
    *         stops pushing it here)
    */
-  int ApplyBlockPush(const FsReq &req);
+  int ApplyTablePush(const FsReq &req);
   /**
    * Record a change to a home block (ns_mu_ held): bumps its version and
    * queues the delta for the next push.
@@ -743,7 +813,7 @@ class Runtime : public clio::run::Container {
    * @param persisted true if the change alters the block's durable image
    * @return the block's new version
    */
-  clio::run::u64 RecordChangeLocked(BlockSlot &slot, DirDelta delta,
+  clio::run::u64 RecordChangeLocked(TableBlockSlot &slot, TableDelta delta,
                                     bool persisted);
   /**
    * Make version `version` of a home block durable and pushed to every
@@ -752,7 +822,7 @@ class Runtime : public clio::run::Container {
    * @param version version the caller needs committed
    * @param rc 0 or EIO (the blob write failed)
    */
-  clio::run::TaskResume CommitBlock(std::shared_ptr<BlockSlot> slot,
+  clio::run::TaskResume CommitBlock(std::shared_ptr<TableBlockSlot> slot,
                                     clio::run::u64 version, int &rc);
   /**
    * Send a push (shard op `op`, request `req`) to every holder of a cached
@@ -760,7 +830,7 @@ class Runtime : public clio::run::Container {
    * cache it, or that could not be reached before their lease ran out, are
    * returned in `gone`. A holder is never given up on while its lease is
    * valid: it could still serve the old copy.
-   * @param op kShardBlockPush or kShardInodePush
+   * @param op kTablePush or kShardInodePush
    * @param req the push
    * @param holders containers caching it
    * @param leases each holder's lease end (steady ms), parallel to holders
@@ -771,28 +841,36 @@ class Runtime : public clio::run::Container {
       const std::vector<clio::run::u32> &holders,
       const std::vector<clio::run::u64> &leases,
       std::vector<clio::run::u32> *gone);
-  /** Insert / replace an entry in a home block (ns_mu_ held). */
-  int InsertEntryLocked(BlockSlot &slot, const FsReq &req, FsResp &resp);
-  /** Remove / mark / restore an entry in a home block (ns_mu_ held). */
-  int RemoveEntryLocked(BlockSlot &slot, const FsReq &req, FsResp &resp);
   /**
-   * Home side of an entry mutation (kShardInsert / kShardRemove): waits out
-   * busy entries, commits, splits the block when it grew too big.
+   * Insert / replace a row in a home block (ns_mu_ held). req.leaf_ is the
+   * caller's spelling; the row is keyed by its canonical name.
    */
-  clio::run::TaskResume EntryMutation(clio::run::u32 op, const FsReq &req,
-                                      FsResp &resp);
+  int InsertRowLocked(TableBlockSlot &slot, const FsReq &req, FsResp &resp);
+  /** Remove / mark / restore a row in a home block (ns_mu_ held). */
+  int RemoveRowLocked(TableBlockSlot &slot, const FsReq &req, FsResp &resp);
+  /**
+   * Change the spelling of a row in a home block (ns_mu_ held): a rename
+   * between two spellings of one name (req.leaf_ the new spelling, req.id_
+   * the inode the row must still name).
+   */
+  int RespellRowLocked(TableBlockSlot &slot, const FsReq &req, FsResp &resp);
+  /**
+   * Home side of a row mutation (kTableInsert / kTableRemove /
+   * kTableRespell): waits out busy rows, commits, splits the block when it
+   * grew too big.
+   */
+  clio::run::TaskResume RowMutation(clio::run::u32 op, const FsReq &req,
+                                    FsResp &resp);
   /** Split a home block that outgrew split_entries_. */
-  clio::run::TaskResume SplitBlock(std::shared_ptr<BlockSlot> slot);
+  clio::run::TaskResume SplitBlock(std::shared_ptr<TableBlockSlot> slot);
   /** Install a block handed over by a split (this container is its home). */
   clio::run::TaskResume InstallBlock(const FsReq &req, FsResp &resp);
-  /** Create a new directory's block 0 (mkdir stage two; repair too). */
-  clio::run::TaskResume DirCreate(const FsReq &req, FsResp &resp);
+  /** Create a new directory's table block 0 (mkdir stage two; repair too). */
+  clio::run::TaskResume CreateTable(const FsReq &req, FsResp &resp);
   /** Seal (req.a_ = 1: fails ENOTEMPTY unless empty) or unseal a block. */
   clio::run::TaskResume SealBlock(const FsReq &req, FsResp &resp);
   /** Delete a sealed block and tell its holders to forget it. */
   clio::run::TaskResume DropBlock(const FsReq &req, FsResp &resp);
-  /** Get or set a directory's attributes / parent pointer (block 0's home). */
-  clio::run::TaskResume DirAttrOp(const FsReq &req, FsResp &resp);
   /**
    * Seal every block of a directory (rmdir), or unseal them.
    * @param dir packed directory id
@@ -800,9 +878,9 @@ class Runtime : public clio::run::Container {
    *        block), false to unseal
    * @param rc 0, ENOTEMPTY or EIO
    */
-  clio::run::TaskResume SealDir(clio::run::u64 dir, bool seal, int &rc);
+  clio::run::TaskResume SealTable(clio::run::u64 dir, bool seal, int &rc);
   /** Delete every (sealed) block of a directory. */
-  clio::run::TaskResume DropDir(clio::run::u64 dir);
+  clio::run::TaskResume DropTable(clio::run::u64 dir);
   /**
    * Every block index of a directory (walks the split tree through the
    * cache).
@@ -810,72 +888,79 @@ class Runtime : public clio::run::Container {
    * @param out receives the indices
    * @param rc 0, ENOENT or EIO
    */
-  clio::run::TaskResume DirBlocks(clio::run::u64 dir,
-                                  std::vector<clio::run::u32> *out, int &rc);
+  clio::run::TaskResume TableBlocks(clio::run::u64 dir,
+                                    std::vector<clio::run::u32> *out, int &rc);
   /**
    * Snapshot of a directory's listing from this node's block copies, under
-   * one lock (see CollectDir). Pending entries are hidden; a leaving entry
-   * whose inode is live under another name (a rename in progress) is too.
+   * one lock (see CollectDir). Pending rows are hidden; a leaving row whose
+   * inode is live under another name (a rename in progress) is too.
    * @param dir directory id
    * @param blocks the directory's block indices
    * @param slots the loaded copy of each block, in the same order
-   * @param out receives (name, entry) pairs sorted by name
+   * @param out receives (listed name, row) pairs in key order
    * @param newest receives the newest block mtime
    * @return false if a copy was replaced meanwhile (the caller retries)
    */
   bool SnapshotDir(clio::run::u64 dir,
                    const std::vector<clio::run::u32> &blocks,
-                   const std::vector<std::shared_ptr<BlockSlot>> &slots,
-                   std::vector<std::pair<std::string, DirEntry>> *out,
+                   const std::vector<std::shared_ptr<TableBlockSlot>> &slots,
+                   std::vector<std::pair<std::string, InodeRow>> *out,
                    clio::run::u64 *newest);
   /**
    * List a directory (every block, through the cache).
    * @param dir packed directory id
-   * @param out receives (name, entry), sorted by name, pending ones left out
+   * @param out receives (listed name, row) in key order, pending ones left out
    * @param newest receives the newest block mtime
    * @param rc 0, ENOENT or EIO
    */
   clio::run::TaskResume CollectDir(
       clio::run::u64 dir,
-      std::vector<std::pair<std::string, DirEntry>> *out,
+      std::vector<std::pair<std::string, InodeRow>> *out,
       clio::run::u64 *newest, int &rc);
-  /** Stat a directory (block 0's header + effective times). */
-  clio::run::TaskResume DirStat(clio::run::u64 dir, FsResp &resp);
   /**
-   * The block holding `leaf` in `dir`, walking down the split tree.
+   * Stat a directory: its inode record's attributes, with mtime/ctime moved
+   * up to its table's newest row change (see DirTimes).
    * @param dir packed directory id
-   * @param leaf entry name
+   * @param resp receives attr_; rc_ ENOENT when its record or its table is
+   *        missing
+   */
+  clio::run::TaskResume StatDir(clio::run::u64 dir, FsResp &resp);
+  /**
+   * The block holding canonical name `key` in `dir`, walking down the split
+   * tree.
+   * @param dir packed directory id
+   * @param key canonical name (KeyOf)
    * @param slot receives the block
    * @param rc 0, ENOENT or EIO
    */
-  clio::run::TaskResume WalkToBlock(clio::run::u64 dir, const std::string &leaf,
-                                    std::shared_ptr<BlockSlot> &slot, int &rc);
+  clio::run::TaskResume WalkToBlock(clio::run::u64 dir, const std::string &key,
+                                    std::shared_ptr<TableBlockSlot> &slot, int &rc);
   /**
-   * Look up `leaf` in `dir` through the cache.
+   * Look up a name of `dir` through the cache.
    * @param dir packed directory id
-   * @param leaf entry name
-   * @param out receives the entry
+   * @param name the name, as spelled (any spelling of it is found)
+   * @param out receives the row
    * @param rc 0, ENOENT or EIO
    */
-  clio::run::TaskResume LookupEntry(clio::run::u64 dir, const std::string &leaf,
-                                    DirEntry &out, int &rc);
+  clio::run::TaskResume LookupRow(clio::run::u64 dir, const std::string &name,
+                                  InodeRow &out, int &rc);
   /**
    * Resolve an absolute path through the cache.
    * @param path normalized absolute path
-   * @param ent receives the entry ("/" resolves to the root)
+   * @param ent receives the row ("/" resolves to the root)
    * @param parent receives the parent directory's id (0 for "/")
    * @param rc 0, ENOENT, ENOTDIR or EIO
    */
-  clio::run::TaskResume ResolvePath(const std::string &path, DirEntry &ent,
+  clio::run::TaskResume ResolvePath(const std::string &path, InodeRow &ent,
                                     clio::run::u64 &parent, int &rc);
   /**
-   * Run an entry mutation on the home of the block holding (dir, leaf),
-   * re-walking when a split moved the name meanwhile.
-   * @param op kShardInsert or kShardRemove
+   * Run a row mutation on the home of the block holding (dir, KeyOf(leaf)),
+   * re-walking when a split moved the key meanwhile.
+   * @param op kTableInsert, kTableRemove or kTableRespell
    * @param req request (dir_id_ and leaf_ set; block_ filled here)
    * @param resp response
    */
-  clio::run::TaskResume EntryOp(clio::run::u32 op, FsReq req, FsResp &resp);
+  clio::run::TaskResume TableOp(clio::run::u32 op, FsReq req, FsResp &resp);
   /**
    * Refuse to move directory `moving` under `dst_parent` when that would
    * put it inside its own subtree, or when an ancestor is itself moving.
@@ -895,10 +980,11 @@ class Runtime : public clio::run::Container {
   /**
    * Make sure at least `margin` ids are durably reserved beyond the next
    * one (writes the reservation record when not).
+   * @param margin ids that must stay reserved past the next one
+   * @param ok OUT false when the reservation could not be recorded (no id
+   *        past the recorded one may then be minted)
    */
-  clio::run::TaskResume EnsureIdReserve(clio::run::u32 margin);
-  /** Mint a new, never-reused inode id homed here (0 when none reserved). */
-  clio::cte::core::TagId MintId();
+  clio::run::TaskResume EnsureIdReserve(clio::run::u32 margin, bool &ok);
   /**
    * Mint a new, never-reused inode id homed on `home` (null when none is
    * reserved). The major names this container as the minter, so ids minted
@@ -911,28 +997,25 @@ class Runtime : public clio::run::Container {
    * Mint an id homed on `home`, extending the durable id reservation first
    * when it has run out.
    * @param home the container that will serve the inode
-   * @param id OUT the id
+   * @param id OUT the id (null when rc != 0)
+   * @param rc OUT 0, or EIO when the reservation could not be recorded
    */
   clio::run::TaskResume MintIdReady(clio::run::u32 home,
-                                    clio::cte::core::TagId &id);
+                                    clio::cte::core::TagId &id, int &rc);
   /**
    * Store the record of a NEW inode before its name is published (#1158).
    * The inode's home (FsInodeHomeFor) is usually not the container that
    * inserts the name; it loads the inode from this record on first use
    * (EnsureInode). Stored first, a published name never leads to a missing
    * inode. When the home is this container the inode is made resident too.
-   * @param id the inode's id (its home encoded)
-   * @param type kFsTypeFile or kFsTypeSymlink
-   * @param mode permission bits
-   * @param symlink target (symlinks)
-   * @param path the file's path
+   * @param ino the new inode: tag_id_, type_, mode_, symlink_ and (for a
+   *        directory) parent_ / parent_key_ set; the times are set here
+   * @param mirror_path the path it is created under (SHM mirror key)
    * @param rc OUT 0, or ENOSPC / EIO when the record could not be stored
    */
-  clio::run::TaskResume CreateInodeRecord(const clio::cte::core::TagId &id,
-                                          clio::run::u32 type,
-                                          clio::run::u32 mode,
-                                          const std::string &symlink,
-                                          const std::string &path, int &rc);
+  clio::run::TaskResume CreateInodeRecord(Inode ino,
+                                          const std::string &mirror_path,
+                                          int &rc);
   /**
    * Undo CreateInodeRecord for an id whose name was never published (the
    * name was taken meanwhile, or the insert failed).
@@ -940,30 +1023,37 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume DiscardInodeRecord(const clio::cte::core::TagId &id);
   /**
-   * Create a file or symlink: mint an id homed by the file's path (or adopt
-   * the client-minted r.id_), store its inode record, then publish the name
-   * on its block's home. A name taken meanwhile yields the existing entry
-   * (EEXIST with kInsExcl) and the record is discarded.
+   * Create an inode and its first name: mint an id homed by the path (or
+   * adopt the client-minted r.id_), store the inode's record, then insert
+   * the row on its block's home. A name taken meanwhile yields the existing
+   * row (EEXIST with kInsExcl) and the record is discarded.
    * @param r dir_id_, dir_ and leaf_ set; id_ a client-minted id or 0
-   * @param type kFsTypeFile or kFsTypeSymlink
+   * @param type kFsTypeFile, kFsTypeSymlink or kFsTypeDir
    * @param mode permission bits
    * @param symlink target (symlinks)
-   * @param flags kInsExcl or 0
+   * @param flags kInsExcl, kInsPending (mkdir) or 0
    * @param er OUT the insert result; created_ != 0 when the name is new
    */
   clio::run::TaskResume CreateEntry(FsReq r, clio::run::u32 type,
                                     clio::run::u32 mode,
                                     const std::string &symlink,
                                     clio::run::u32 flags, FsResp &er);
-  /** Create the inode for a new file/symlink (meta_mu_ NOT held). */
-  std::shared_ptr<FileInfo> NewInode(const clio::cte::core::TagId &id,
-                                     clio::run::u32 type, clio::run::u32 mode,
-                                     const std::string &symlink,
-                                     const std::string &path);
+  /**
+   * The root directory's record, created by its home the first time the
+   * volume is used: it carries the volume's flags (kVolume*) from then on.
+   * @param rc OUT 0, or ENOSPC / EIO when it could not be stored
+   */
+  clio::run::TaskResume MaterializeRoot(int &rc);
+  /**
+   * Refuse a configuration that disagrees with the volume (the root's
+   * record), on the root's home. Logs why.
+   * @param ok OUT false when the volume was created with other flags
+   */
+  clio::run::TaskResume CheckVolumeFlags(bool &ok);
   /** @return the inode `packed` (nullptr if not homed here). */
-  std::shared_ptr<FileInfo> FindInode(clio::run::u64 packed);
+  std::shared_ptr<InodeState> FindInode(clio::run::u64 packed);
   /** Fill `attr` from an inode (meta_mu_ held). */
-  void InodeAttrLocked(const FileInfo &fi, FsAttr *attr);
+  void InodeAttrLocked(const InodeState &fi, FsAttr *attr);
 
   /**
    * Set a file's mtime/ctime for a size push (AdvanceSize): the client's
@@ -972,7 +1062,7 @@ class Runtime : public clio::run::Container {
    * @param task the push, after its size op ran (old_size_ is set)
    * @param fi the file, under meta_mu_
    */
-  void StampSizePush(const AdvanceSizeTask &task, FileInfo *fi);
+  void StampSizePush(const AdvanceSizeTask &task, InodeState *fi);
   /** Open inode: allocate a handle (O_TRUNC is applied by the caller). */
   int InodeOpenLocal(const FsReq &req, FsResp &resp);
   /**
@@ -996,7 +1086,7 @@ class Runtime : public clio::run::Container {
   /** getxattr/setxattr/listxattr/removexattr on an inode. */
   clio::run::TaskResume InodeXattr(const FsReq &req, FsResp &resp);
   /** Destroy inode `packed` now or when its last handle closes. */
-  void DropInodeLocked(const std::shared_ptr<FileInfo> &fi);
+  void DropInodeLocked(const std::shared_ptr<InodeState> &fi);
   /** Queue the data purge of a destroyed inode. */
   void QueuePurge(const PurgeItem &item);
   /** Drain queued purges (periodic ShardOp body). */
@@ -1053,7 +1143,7 @@ class Runtime : public clio::run::Container {
    * @param fi the inode
    * @return symlink target length, or the file's stream size
    */
-  clio::run::u64 FileSize(const FileInfo &fi);
+  clio::run::u64 FileSize(const InodeState &fi);
   /**
    * Change a file's size at its stream (this container is its home).
    * @param tag file tag
@@ -1079,14 +1169,14 @@ class Runtime : public clio::run::Container {
    * can dirty an inode calls FlushInodes() before it replies.
    * @param fi the inode
    */
-  void MarkInodeDirtyLocked(const FileInfo &fi);
+  void MarkInodeDirtyLocked(const InodeState &fi);
   /**
    * Record an inode change (meta_mu_ held): its record is stored before the
    * change is acknowledged, and an orphan (unlinked while open) is kept in
    * this container's orphan record so a restart can destroy it.
    * @param fi the inode
    */
-  void LogInode(const FileInfo &fi);
+  void LogInode(const InodeState &fi);
   /** Set once a non-volatile placement of an inode record failed but a RAM
    *  one succeeded: the deployment has no persistent tier to put them on. */
   bool inode_volatile_only_ = false;
@@ -1097,6 +1187,12 @@ class Runtime : public clio::run::Container {
    * @param rec the encoded record (EncInodeRec)
    * @param rc the PutBlob return code (0 on success)
    */
+  /**
+   * Where an inode's record lives: its owner's CTE container (Local when the
+   * owner is this container). EnsureInode reads it there.
+   * @param packed the inode's packed id
+   */
+  clio::run::PoolQuery InodeRecQuery(clio::run::u64 packed);
   clio::run::TaskResume StoreInodeRec(clio::run::u64 packed,
                                       const std::string &rec, int &rc);
   /**
@@ -1171,6 +1267,19 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume EnsureInode(clio::run::u64 packed, int *err = nullptr);
   /**
+   * The inode record this home's first live successor stored while it
+   * served the inode (this node down or cut off), if any.
+   * @param packed inode
+   * @param rec receives the record (empty: none)
+   * @param from receives the container holding it
+   */
+  clio::run::TaskResume FetchStandInRecord(clio::run::u64 packed,
+                                           std::string *rec,
+                                           clio::run::u32 *from);
+  /** Whether inode record a was written after b (ctime/mtime; an
+   *  unreadable b loses). */
+  static bool RecordNewer(const std::string &a, const std::string &b);
+  /**
    * Stat an inode: the home's own copy, else this container's cached copy,
    * else a fetch from the home (which registers this container for pushes).
    * @param packed inode id
@@ -1180,7 +1289,7 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume StatInode(clio::run::u64 packed, FsResp &resp);
   /**
    * Copy an inode's attributes into a Getattr reply.
-   * @param a the attributes (StatEntry / StatInode)
+   * @param a the attributes (StatRow / StatInode)
    * @param task the reply to fill (exists_ = 1)
    */
   static void FillGetattr(const FsAttr &a, GetattrTask *task);
@@ -1200,34 +1309,6 @@ class Runtime : public clio::run::Container {
   /** Holder side of an inode push (req.id_, attrs in req.str_; b_=1 drop). */
   int ApplyInodePush(const FsReq &req);
   /**
-   * Encode an inode record.
-   * @param fi inode
-   * @param size logical size to record
-   * @param writer the container storing the record
-   * @param fresh written at create by the minter: no container caches the
-   *        inode yet and no stream exists (kInodeRecFresh)
-   * @return record bytes
-   */
-  static std::string EncInodeRec(const FileInfo &fi, clio::run::u64 size,
-                                 clio::run::u32 writer, bool fresh = false);
-  /**
-   * Decode an inode record.
-   * @param rec record bytes
-   * @param fi receives the attributes
-   * @param size receives the recorded size
-   * @param writer receives the container that stored it (kNoRecWriter for a
-   *        record from before the field existed)
-   * @param fresh receives the kInodeRecFresh flag (may be null)
-   * @return false if malformed
-   */
-  static bool DecInodeRec(const std::string &rec, FileInfo *fi,
-                          clio::run::u64 *size, clio::run::u32 *writer,
-                          bool *fresh = nullptr);
-  /** DecInodeRec's writer for records that do not carry one. */
-  static constexpr clio::run::u32 kNoRecWriter = 0xFFFFFFFFu;
-  /** Record flag: written at create, before any access (see EncInodeRec). */
-  static constexpr clio::run::u32 kInodeRecFresh = 4u;
-  /**
    * After a restart, reconcile every stream this node's stream container
    * restored from its log with its file's inode record, before the
    * filesystem serves anything: a file served elsewhere while this node was
@@ -1243,27 +1324,57 @@ class Runtime : public clio::run::Container {
 
   // ---- public-handler building blocks (filesystem_runtime.cc) ----
   /**
-   * Stat an entry wherever its attributes live (directory or inode).
-   * @param parent packed id of the directory holding it (0 for "/")
-   * @param leaf its name there (to repair a directory lost to a crash)
-   * @param e the entry
+   * Stat the inode a row names.
+   * @param parent packed id of the directory holding the row (0 for "/")
+   * @param name its name there (to repair a directory lost to a crash)
+   * @param e the row
    * @param resp receives the attributes
    */
-  clio::run::TaskResume StatEntry(clio::run::u64 parent,
-                                  const std::string &leaf, const DirEntry &e,
-                                  FsResp &resp);
-  /** Rename a non-directory (entry move + nlink bookkeeping). */
+  clio::run::TaskResume StatRow(clio::run::u64 parent,
+                                const std::string &name, const InodeRow &e,
+                                FsResp &resp);
+  /**
+   * Rename a non-directory (row move + nlink bookkeeping).
+   * @param src source path
+   * @param dst destination path
+   * @param sp packed id of the source's directory
+   * @param dp packed id of the destination's directory
+   * @param se the source row
+   * @param rc OUT 0 or an errno (EBUSY: crossed another rename, retry)
+   */
   clio::run::TaskResume RenameFile(const std::string &src,
                                    const std::string &dst, clio::run::u64 sp,
-                                   clio::run::u64 dp, const DirEntry &se,
+                                   clio::run::u64 dp, const InodeRow &se,
                                    int &rc);
-  /** Rename a directory: one entry moves; its subtree stays where it is. */
+  /**
+   * Rename a directory: one row moves; its subtree stays where it is (its
+   * table is keyed by the directory's id, not its path).
+   * @param src source path
+   * @param dst destination path
+   * @param sp packed id of the source's directory
+   * @param dp packed id of the destination's directory
+   * @param se the source row
+   * @param rc OUT 0 or an errno (EBUSY: crossed another rename, retry)
+   */
   clio::run::TaskResume RenameDir(const std::string &src,
                                   const std::string &dst, clio::run::u64 sp,
-                                  clio::run::u64 dp, const DirEntry &se,
+                                  clio::run::u64 dp, const InodeRow &se,
                                   int &rc);
   /**
-   * Remove an empty directory: seal its blocks, drop them, remove its entry.
+   * Rename between two spellings of one name (same directory, same key):
+   * the row stays, only its spelling changes.
+   * @param src source path
+   * @param dst destination path (same key as src)
+   * @param dir packed id of the directory
+   * @param se the row
+   * @param rc OUT 0 or an errno
+   */
+  clio::run::TaskResume RespellName(const std::string &src,
+                                    const std::string &dst, clio::run::u64 dir,
+                                    const InodeRow &se, int &rc);
+  /**
+   * Remove an empty directory: seal its blocks, drop them, remove its row,
+   * then drop its inode.
    * @param parent packed id of its parent
    * @param leaf its name
    * @param expect its id (0 = whatever is there)
@@ -1284,7 +1395,7 @@ class Runtime : public clio::run::Container {
   // ---- issue #817: shared-memory attribute mirror (single-node only) ----
   ShmFsCache shm_fs_cache_;
   /** Publish a file's attributes under `path` (meta_mu_ held). */
-  void MirrorFile(const std::string &path, const FileInfo &fi,
+  void MirrorFile(const std::string &path, const InodeState &fi,
                   clio::run::u32 extra_flags = 0);
   /** Drop a path from the mirror (unlink/rename/rmdir). */
   void MirrorErase(const std::string &path) { shm_fs_cache_.ErasePath(path); }
@@ -1298,15 +1409,15 @@ class Runtime : public clio::run::Container {
 
 /** ShardOp codes (see Runtime::ExecShardOp). */
 enum FsShardOp : clio::run::u32 {
-  kShardInsert = 2,      ///< insert / replace an entry, optionally minting its inode
-  kShardRemove = 3,      ///< remove an entry
-  kShardDirCreate = 4,   ///< create a directory's block 0
-  kShardBlockSeal = 5,   ///< seal (rmdir) or unseal one block
-  kShardDirAttr = 6,     ///< get / set a directory's attributes
-  kShardBlockFetch = 7,  ///< send a block and register the caller for pushes
-  kShardBlockPush = 8,   ///< apply a home's deltas to cached blocks
-  kShardBlockInstall = 9,   ///< take over a block split off another home
-  kShardBlockDrop = 10,  ///< delete a sealed block (rmdir)
+  kTableInsert = 2,      ///< insert / replace a row
+  kTableRemove = 3,      ///< remove / mark / restore a row
+  kTableCreate = 4,      ///< create a directory's table block 0
+  kTableSeal = 5,        ///< seal (rmdir) or unseal one block
+  kTableRespell = 6,     ///< change the spelling of a row
+  kTableFetch = 7,       ///< send a block and register the caller for pushes
+  kTablePush = 8,        ///< apply a home's deltas to cached blocks
+  kTableInstall = 9,     ///< take over a block split off another home
+  kTableDrop = 10,       ///< delete a sealed block (rmdir)
   kShardInodeStat = 11,  ///< stat an inode (req.b_ != 0: register req.a_ for pushes)
   kShardInodeOpen = 12,  ///< open an inode (handle)
   kShardInodeNlink = 13, ///< add to an inode's link count
@@ -1319,34 +1430,56 @@ enum FsShardOp : clio::run::u32 {
   kShardInodePush = 20,     ///< apply an inode home's attribute push
 };
 
-/** Insert flags (FsReq::flags_ of kShardInsert). */
+/** Insert flags (FsReq::flags_ of kTableInsert). */
 enum : clio::run::u32 {
   kInsExcl = 1u,         ///< fail EEXIST when the name exists
   kInsReplace = 2u,      ///< replace an existing non-directory (rename)
-  kInsReplaceDir = 4u,   ///< replace an existing (retired) directory entry
+  kInsReplaceDir = 4u,   ///< replace an existing (retired) directory row
   kInsFailBusy = 8u,     ///< EBUSY instead of waiting on a busy name/dir
-  kInsNewInode = 16u,    ///< mint + create the inode here (create/symlink)
+  kInsNewInode = 16u,    ///< the caller stored the new inode's record (req.id_)
   kInsPending = 32u,     ///< insert invisible (mkdir reservation)
-  kInsCommit = 64u,      ///< make a pending entry live
+  kInsCommit = 64u,      ///< make a pending row live
   kInsNoTagName = 128u,  ///< do not publish the name (rename publishes once)
 };
 
-/** Remove flags (FsReq::flags_ of kShardRemove). */
+/** Remove flags (FsReq::flags_ of kTableRemove). */
 enum : clio::run::u32 {
-  kRmNonDir = 1u,        ///< EISDIR if the entry is a directory
-  kRmDirOnly = 2u,       ///< ENOTDIR if the entry is not a directory
-  kRmMarkLeaving = 4u,   ///< only mark the entry leaving (two-phase remove)
-  kRmRestore = 8u,       ///< make a leaving entry live again (abort)
+  kRmNonDir = 1u,        ///< EISDIR if the row names a directory
+  kRmDirOnly = 2u,       ///< ENOTDIR if the row does not name a directory
+  kRmMarkLeaving = 4u,   ///< only mark the row leaving (two-phase remove)
+  kRmRestore = 8u,       ///< make a leaving row live again (abort)
   kRmFailBusy = 16u,     ///< EBUSY instead of waiting on a busy name
   kRmNoTagName = 32u,    ///< do not publish the removal (rename publishes once)
+};
+
+/** Attribute-change flags (FsReq::flags_ of kShardInodeSetAttr). */
+enum : clio::run::u32 {
+  kSetAtime = 1u,        ///< atime := req.a_
+  kSetMtime = 2u,        ///< mtime := req.b_
+  kSetAtimeNow = 4u,     ///< atime := now (the home's clock)
+  kSetMtimeNow = 8u,     ///< mtime := now (the home's clock)
+  kSetUid = 16u,         ///< uid := req.uid_
+  kSetGid = 32u,         ///< gid := req.gid_
+  kSetMode = 64u,        ///< mode := req.mode_
+  /** A read: advance atime by the relatime rule, never ctime (see
+   *  InodeSetAttr). Set from the UtimensTask flag kUtimensAccess. */
+  kAccessTouch = 512u,
+  kAccessStrict = 1024u, ///< with kAccessTouch: strictatime, always move
+  /** A directory moved: parent_ := req.b_, parent_key_ := req.str_. */
+  kSetParent = 2048u,
+};
+
+/** Table-create flags (FsReq::flags_ of kTableCreate). */
+enum : clio::run::u32 {
+  /** Create block 0 only if it is missing (a crash between rmdir's halves
+   *  left the parent's row but not the table). */
+  kCreateRepair = 1u,
 };
 
 /** xattr sub-ops (FsReq::type_ of kShardInodeXattr). */
 enum : clio::run::u32 {
   kXattrGet = 1u, kXattrSet = 2u, kXattrList = 3u, kXattrRemove = 4u,
 };
-/** FsReq::flags_ bit of kShardInodeXattr: the id is a directory (no inode). */
-static constexpr clio::run::u32 kXattrNoInode = 1u << 8;
 
 /** Internal "try again" result of an entry mutation that must wait. */
 static constexpr int kFsRetry = -1;

@@ -514,6 +514,16 @@ using cte_statvfs_t = struct statvfs;
 // express. Signatures are exactly the fuse_operations member shapes.
 // ---------------------------------------------------------------------------
 int cte_fuse_bootstrap_clients();
+/**
+ * The key a path is cached under on this mount: its canonical form on a
+ * case-insensitive volume, the path itself otherwise. Valid once
+ * cte_fuse_bootstrap_clients (or the high-level init) has run.
+ * @param path path as spelled
+ * @return cache key
+ */
+std::string cte_fuse_cache_key(const std::string &path);
+/** @return true when the mounted volume compares names case-insensitively */
+bool cte_fuse_case_insensitive();
 int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
                           struct fuse_file_info *fi);
 int cte_fuse_create(const char *path, cte_mode_t mode,

@@ -19,7 +19,7 @@ External Source          CAE Module              CTE Module
 (file, HDF5, Globus) --> ParseOmni task -------> Tag + Blob storage
 ```
 
-**Supported formats:** `binary`, `hdf5`, `globus`
+**Supported formats:** `binary`, `hdf5`, `hdf5_vol`, `globus`
 
 **Supported source schemes:** `file::`, `string::`, `hdf5::`, `globus://`,
 `s3://` (Amazon S3 / MinIO), `gs://` and `gcs://` (Google Cloud Storage)
@@ -93,17 +93,24 @@ transfers:
   - src: file::/path/to/data.bin    # Source URL (required)
     dst: iowarp::my_tag             # CTE destination tag (required)
     format: binary                  # Format: binary, hdf5, globus (required)
-    depends_on: ""                  # Dependency identifier (optional)
+    depends_on: ""                  # src or dst of an EARLIER transfer (optional)
     range_off: 0                    # Byte offset in source (optional)
     range_size: 0                   # Bytes to read, 0 = full file (optional)
     src_token: $GLOBUS_TOKEN        # Auth token, env vars expanded (optional)
 ```
 
+Transfers run in the order listed, and each one finishes before the next
+starts. `depends_on` documents and checks that order: it must be the exact `src`
+or `dst` URL of an earlier transfer, for example a `file::` ingest that depends
+on the `globus://` download staging that file. `ParseOmni` rejects the whole OMNI
+file, before running any transfer, if a `depends_on` names a later transfer,
+the transfer itself, or nothing in the list.
+
 **HDF5 with dataset filtering:**
 
 ```yaml
 transfers:
-  - src: file::/data/experiment.h5
+  - src: hdf5::/data/experiment.h5
     dst: iowarp::experiment
     format: hdf5
     dataset_filter:
@@ -112,6 +119,26 @@ transfers:
       exclude_patterns:
         - "/sensors/raw/*"
 ```
+
+**HDF5 staged for the clio HDF5 VOL connector (`hdf5_vol`):**
+
+```yaml
+transfers:
+  - src: hdf5::/data/experiment.h5
+    dst: "iowarp::"                    # no tag name: the connector derives it
+    format: hdf5_vol
+```
+
+`hdf5` gives each dataset a tag of its own. `hdf5_vol` instead writes the file
+in the cache layout of CTE's HDF5 VOL connector
+(`context-transfer-engine/adapter/hdf5_vol/clio_vol_layout.h`): the native-type
+image of every atomic dataset under the connector's tag for the file, then the
+coherence stamp that lets the connector trust it. An application that later
+reads the file through the connector is served from the CTE tier from its
+first read, including hyperslab and MPI-collective reads, instead of reading
+the file. The chunk size is `CLIO_VOL_CHUNK_SIZE` in the runtime's environment
+and must match the application's; a mismatch is a cache miss, never a wrong
+read. `dataset_filter` applies as for `hdf5`.
 
 **Cloud object stores (S3 / GCS):**
 
@@ -149,8 +176,8 @@ assimilation time (no secrets are placed in the OMNI file):
 | Field | Description |
 |---|---|
 | `src` | Source URL (`file::`, `string::`, `hdf5::`, `globus://`, `s3://`, `gs://`) |
-| `dst` | CTE destination tag (`iowarp::tag_name`) |
-| `format` | `binary`, `hdf5`, or `globus` |
+| `dst` | CTE destination tag (`iowarp::tag_name`; `iowarp::` for `hdf5_vol`) |
+| `format` | `binary`, `hdf5`, `hdf5_vol`, or `globus` |
 | `range_off` / `range_size` | Byte range within source (0 = full file) |
 | `src_token` / `dst_token` | Auth tokens; environment variables are expanded |
 | `dataset_filter` | HDF5 dataset include/exclude glob patterns |

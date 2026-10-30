@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <clio_cte/cache/cache_runtime.h>
+#include <clio_cte/core/blob_placement.h>
 
 namespace clio::cte::cache {
 
@@ -547,8 +548,31 @@ bool Runtime::IsBlobOwnerLocal(const TagId &tag_id,
   if (pool_manager->HasContainer(pool_id_, cid)) {
     return true;
   }
-  return pool_manager->GetContainerNodeId(pool_id_, cid) ==
-         CLIO_IPC->GetNodeId();
+  if (pool_manager->GetContainerNodeId(pool_id_, cid) ==
+      CLIO_IPC->GetNodeId()) {
+    return true;
+  }
+  return IsStandingIn(tag_id, blob_name);
+}
+
+bool Runtime::IsStandingIn(const TagId &tag_id, const std::string &blob_name) {
+  // Standing in for a dead owner: this node's core holds the blob's
+  // authoritative copy (the replication chimod's remote copy, served by
+  // failover) in the SAME BlobInfo as any cache copy it took as a reader
+  // earlier. That cache slot was kept current by the owner's invalidations,
+  // which stopped when the owner died -- serving it read a stale page
+  // (zeros) while every other node, reading through this one, got the
+  // right bytes. Callers behave as the owner: no cache copy, read the
+  // primary.
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  const clio::run::PoolInfo *info = pool_manager->GetPoolInfo(pool_id_);
+  if (info == nullptr || info->num_containers_ <= 1) return false;
+  const clio::run::u32 cid =
+      clio::cte::core::BlobHash(tag_id, blob_name) % info->num_containers_;
+  const clio::run::u32 serving =
+      clio::cte::core::FailoverContainer(pool_id_, cid);
+  return serving != cid && pool_manager->GetContainerNodeId(pool_id_, serving) ==
+                               CLIO_IPC->GetNodeId();
 }
 
 /** Mutate a put context to aim at THE cache replica: raw bytes, the
@@ -771,6 +795,14 @@ clio::run::TaskResume Runtime::GetBlob(
     // chain and never populate here.
     const bool owner_local = IsBlobOwnerLocal(task->tag_id_, blob_name);
     if (owner_local) {
+      // A cache copy left from when this node was only a reader (it is now
+      // standing in) must not outlive the stand-in period: drop it.
+      if (IsStandingIn(task->tag_id_, blob_name)) {
+        auto del = GetLocalClient()->AsyncDelBlob(
+            task->tag_id_, blob_name, clio::run::PoolQuery::Local(),
+            clio::cte::core::kDelCacheCopyOnly);
+        CLIO_CO_AWAIT(del);  // "not found" (no copy) is the usual answer
+      }
       // The primary is node-local: read it through the next pool inline (no
       // new task, see PutBlob) and never populate a copy.
       CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,

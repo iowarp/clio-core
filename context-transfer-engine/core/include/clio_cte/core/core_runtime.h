@@ -910,6 +910,19 @@ private:
   std::mutex regs_reset_mu_;
   std::unordered_set<std::string> regs_reset_;
 
+  // Cache invalidations that could not be delivered (the node was
+  // unreachable): node -> (tag, blob). A partitioned node is alive and keeps
+  // its cache, so dropping them left it serving stale copies after the
+  // split healed. StatTargets resends them once the node answers again.
+  std::mutex pending_inval_mu_;
+  std::unordered_map<clio::run::u64,
+                     std::unordered_map<std::string,
+                                        std::pair<TagId, std::string>>>
+      pending_inval_;
+  void NotePendingInval(clio::run::u64 node, const TagId &tag_id,
+                        const std::string &blob_name);
+  clio::run::TaskResume RetryPendingInvals();
+
   // Telemetry ring buffer for performance monitoring
   static inline constexpr size_t kTelemetryRingSize = 1024; // Ring buffer size
   std::unique_ptr<ctp::ipc::circular_mpsc_ring_buffer<CteTelemetry, ctp::ipc::MallocAllocator>> telemetry_log_;
@@ -956,6 +969,12 @@ private:
    * @param tag_id the deleted tag
    */
   void EraseTagXattrs(const TagId &tag_id);
+  /**
+   * Whether a tag has a non-empty xattr section.
+   * @param tag_id the tag
+   * @return true if at least one key is set
+   */
+  bool HasTagXattrs(const TagId &tag_id);
   /**
    * Write every xattr section to a FlushMetadata snapshot, one
    * kSnapTagXattrEntry record per tag.
@@ -1624,9 +1643,12 @@ private:
    * exist, and a reader must not treat the miss as an absence.
    * @param tag_id the blob's tag
    * @param blob_name its name
+   * @param stand_in_read the router sent the read here as the owner's
+   *        stand-in (Context::kStandInRead)
    * @return 1 or kBlobOwnerDownRc
    */
-  clio::run::u32 NotFoundRc(const TagId &tag_id, const std::string &blob_name);
+  clio::run::u32 NotFoundRc(const TagId &tag_id, const std::string &blob_name,
+                            bool stand_in_read = false);
   /**
    * Whether this container lists / counts a blob: always its own; a shadow
    * copy only while it stands in for the copy's dead owner.

@@ -584,13 +584,15 @@ compose:
     pool_query: local
     pool_id: "560.0"
     next_pool_id: "563.0"               # chain top (cache) — see entries above
-    # No metadata server: each directory is split into directory blocks,
-    # each block has one home container that holds it in memory, and every
-    # node caches what it reads while the home pushes every change before
-    # acknowledging it. An inode's attributes are one key of its
-    # file tag's xattr section (in memory, made durable by the CTE WAL).
+    # No metadata server. Names live in the inode table: each directory's
+    # rows (name -> inode) are split into table blocks, each block has one
+    # home container that holds it in memory, and every node caches what it
+    # reads while the home pushes every change before acknowledging it. Every
+    # inode -- file, symlink or directory -- has a record of its attributes:
+    # one key of its tag's xattr section (in memory, made durable by the CTE
+    # WAL), held by the container its id names.
     # metadata_log_path names this node's on-disk metadata:
-    #   <path>.dirs.<container> -- journal of the directory blocks this node
+    #   <path>.dirs.<container> -- journal of the table blocks this node
     #                              is home for (one small record per change,
     #                              fsync'd by fsync/fsyncdir and every 1 s)
     #   <path>.stream           -- the stream log (file sizes, appends)
@@ -598,8 +600,12 @@ compose:
     # directories with it (issue #1263). Unset, directory blocks are stored
     # as CTE blobs instead (one blob write per change; slower).
     metadata_log_path: "${CLIO_STORAGE_ROOT}/cfs_namespace_log"
-    # Entries a directory block holds before it splits (default 1024).
+    # Rows a table block holds before it splits (default 1024).
     # dir_split_entries: 1024
+    # Compare names case-insensitively, keeping their spelling, as NTFS does
+    # (default false): Foo.TXT and foo.txt are one file. Fixed when the volume
+    # is created; a runtime configured the other way refuses the volume.
+    # case_insensitive: false
     # Stream pool holding every file's logical size and merging deferred
     # O_APPEND writes (see the clio_cte_stream entry). Default: "565.0".
     # stream_pool_id: "565.0"

@@ -222,7 +222,8 @@ class IoUringAsyncIO : public AsyncIO {
 
   /**
    * Choose the O_DIRECT fd only when the buffer, the length AND the file
-   * offset are all 4 KiB-aligned; anything else uses the buffered fd. The
+   * offset are all DirectIoAlign()-aligned (4 KiB, or the page size when that
+   * is larger -- Lustre needs it); anything else uses the buffered fd. The
    * offset check was missing: an aligned buffer written at an unaligned file
    * offset (a truncate zeroing a page tail) went to O_DIRECT and failed with
    * EINVAL.
@@ -233,8 +234,9 @@ class IoUringAsyncIO : public AsyncIO {
    */
   int SelectFd(void *buffer, size_t size, int64_t offset) const {
     if (direct_fd_ >= 0 &&
-        (reinterpret_cast<uintptr_t>(buffer) % 4096 == 0) &&
-        (size % 4096 == 0) && (offset % 4096 == 0)) {
+        (reinterpret_cast<uintptr_t>(buffer) % DirectIoAlign() == 0) &&
+        (size % DirectIoAlign() == 0) &&
+        (offset % static_cast<int64_t>(DirectIoAlign()) == 0)) {
       return direct_fd_;
     }
     return regular_fd_;

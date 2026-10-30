@@ -103,18 +103,6 @@ clio::run::TaskResume BinaryFileAssimilator::Schedule(const AssimilationCtx& ctx
   HLOG(kDebug, "BinaryFileAssimilator: Tag '{}' obtained/created successfully",
        tag_name);
 
-  // Handle dependency-based scheduling
-  if (!ctx.depends_on.empty()) {
-    // TODO: Implement dependency handling
-    // For now, log that dependencies are not yet supported
-    HLOG(kDebug,
-         "BinaryFileAssimilator: Dependency handling not yet implemented "
-         "(depends_on: {})",
-         ctx.depends_on);
-    error_code = 0;
-    CLIO_CO_RETURN;
-  }
-
   // Extract source file path
   std::string src_path = GetUrlPath(ctx.src);
   HLOG(kDebug, "BinaryFileAssimilator: Extracted src_path='{}'", src_path);

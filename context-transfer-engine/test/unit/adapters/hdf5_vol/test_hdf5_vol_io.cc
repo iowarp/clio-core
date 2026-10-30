@@ -25,6 +25,7 @@
 #include "simple_test.h"
 
 #include "clio_vol.h"
+#include "clio_vol_layout.h"
 
 #include <hdf5.h>
 
@@ -32,9 +33,16 @@
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_cte/core/core_client.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>  // symlink
+#endif
 
 namespace {
 
@@ -342,7 +350,8 @@ namespace {
 clio::run::u64 cteBlobSize(const std::string &h5_path,
                            const std::string &blob_name) {
   auto *cte_client = CLIO_CTE_CLIENT;
-  auto tag = cte_client->AsyncGetOrCreateTag(std::string("hdf5:") + h5_path);
+  auto tag = cte_client->AsyncGetOrCreateTag(
+      clio::adapter::vol_layout::TagName(h5_path));
   tag.Wait();
   REQUIRE(tag->GetReturnCode() == 0);
   auto sz = cte_client->AsyncGetBlobSize(tag->tag_id_, blob_name);
@@ -353,7 +362,8 @@ clio::run::u64 cteBlobSize(const std::string &h5_path,
 /** Drop one chunk blob out of the tier, standing in for a per-blob eviction. */
 void cteDelBlob(const std::string &h5_path, const std::string &blob_name) {
   auto *cte_client = CLIO_CTE_CLIENT;
-  auto tag = cte_client->AsyncGetOrCreateTag(std::string("hdf5:") + h5_path);
+  auto tag = cte_client->AsyncGetOrCreateTag(
+      clio::adapter::vol_layout::TagName(h5_path));
   tag.Wait();
   REQUIRE(tag->GetReturnCode() == 0);
   auto del = cte_client->AsyncDelBlob(tag->tag_id_, blob_name);
@@ -560,6 +570,168 @@ TEST_CASE("HDF5 VOL IO - A missing chunk is a miss, not garbage",
   REQUIRE(H5Dclose(dset2) >= 0);
   REQUIRE(H5Fclose(file2) >= 0);
   REQUIRE(H5Pclose(fapl) >= 0);
+}
+
+namespace {
+
+/** Write `image` into the connector's tag for `h5_path` exactly as the CAE's
+ *  hdf5_vol format does, and stamp it with `stamp_chunk` as the chunk size. */
+void stageLikeCae(const std::string &h5_path, const std::string &ds_path,
+                  const std::vector<int> &image, size_t chunk,
+                  size_t stamp_chunk) {
+  namespace layout = clio::adapter::vol_layout;
+  auto *cte_client = CLIO_CTE_CLIENT;
+  const std::string tag_name = layout::TagName(h5_path);
+  auto del = cte_client->AsyncDelTag(tag_name);
+  del.Wait();
+  auto tag = cte_client->AsyncGetOrCreateTag(tag_name);
+  tag.Wait();
+  REQUIRE(tag->GetReturnCode() == 0);
+  const char *bytes = reinterpret_cast<const char *>(image.data());
+  const size_t total = image.size() * sizeof(int);
+  for (size_t i = 0; i * chunk < total; ++i) {
+    const size_t len = std::min(chunk, total - i * chunk);
+    auto buf = CLIO_IPC->AllocateBuffer(len);
+    std::memcpy(buf.ptr_, bytes + i * chunk, len);
+    auto put = cte_client->AsyncPutBlob(
+        tag->tag_id_, layout::ChunkBlobName(ds_path, i), 0, len,
+        buf.shm_.template Cast<void>(), -1.0f);
+    put.Wait();
+    REQUIRE(put->GetReturnCode() == 0);
+  }
+  const std::string stamp = layout::Stamp(h5_path.c_str(), stamp_chunk);
+  REQUIRE(!stamp.empty());
+  auto buf = CLIO_IPC->AllocateBuffer(stamp.size());
+  std::memcpy(buf.ptr_, stamp.data(), stamp.size());
+  auto put = cte_client->AsyncPutBlob(tag->tag_id_, layout::kStampBlobName, 0,
+                                      stamp.size(),
+                                      buf.shm_.template Cast<void>(), -1.0f);
+  put.Wait();
+  REQUIRE(put->GetReturnCode() == 0);
+}
+
+/** Read `count` ints at `start` of /data in `path` through the connector; a
+ *  whole read when count is 0. */
+std::vector<int> readThroughVol(const std::string &path, hid_t mem_type,
+                                hsize_t start = 0, hsize_t count = 0) {
+  hid_t fapl = makeFapl(setupVolEnvironment());
+  hid_t file = H5Fopen(path.c_str(), H5F_ACC_RDONLY, fapl);
+  REQUIRE(file >= 0);
+  hid_t dset = H5Dopen2(file, "data", H5P_DEFAULT);
+  REQUIRE(dset >= 0);
+  std::vector<int> out(count ? count : kNumElems, -1);
+  if (count == 0) {
+    REQUIRE(H5Dread(dset, mem_type, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                    out.data()) >= 0);
+  } else {
+    hid_t fspace = H5Dget_space(dset);
+    REQUIRE(H5Sselect_hyperslab(fspace, H5S_SELECT_SET, &start, nullptr,
+                                &count, nullptr) >= 0);
+    hid_t mspace = H5Screate_simple(1, &count, nullptr);
+    REQUIRE(H5Dread(dset, mem_type, mspace, fspace, H5P_DEFAULT,
+                    out.data()) >= 0);
+    H5Sclose(mspace);
+    H5Sclose(fspace);
+  }
+  REQUIRE(H5Dclose(dset) >= 0);
+  REQUIRE(H5Fclose(file) >= 0);
+  REQUIRE(H5Pclose(fapl) >= 0);
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("HDF5 VOL IO - An image staged ahead of the open is served",
+          "[hdf5_vol][io]") {
+  // The CAE's hdf5_vol format fills the connector's cache before the
+  // application opens the file. The staged image deliberately holds DIFFERENT
+  // values from the file, so every assertion below says which store answered:
+  // the file holds i, the tier holds kStaged + i.
+  constexpr int kStaged = 1000000;
+  setupVolEnvironment();
+  const std::string path = "/tmp/clio_vol_io_prestaged.h5";
+  std::remove(path.c_str());
+  {
+    hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT,
+                           H5P_DEFAULT);  // native: nothing staged by writing
+    REQUIRE(file >= 0);
+    hsize_t dims[1] = {kNumElems};
+    hid_t space = H5Screate_simple(1, dims, nullptr);
+    hid_t dset = H5Dcreate2(file, "data", H5T_STD_I32LE, space, H5P_DEFAULT,
+                            H5P_DEFAULT, H5P_DEFAULT);
+    std::vector<int> w(kNumElems);
+    for (size_t i = 0; i < kNumElems; ++i) w[i] = static_cast<int>(i);
+    REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                     w.data()) >= 0);
+    H5Dclose(dset);
+    H5Sclose(space);
+    REQUIRE(H5Fclose(file) >= 0);
+  }
+  // Out of the timestamp granule, so the connector's close-time stamp holds.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  std::vector<int> image(kNumElems);
+  for (size_t i = 0; i < kNumElems; ++i) image[i] = kStaged + static_cast<int>(i);
+  stageLikeCae(path, "/data", image, 4096, 4096);
+
+  // Whole and hyperslab reads are both answered by the tier.
+  auto whole = readThroughVol(path, H5T_NATIVE_INT);
+  REQUIRE(whole[0] == kStaged);
+  REQUIRE(whole[kNumElems - 1] == kStaged + static_cast<int>(kNumElems) - 1);
+  auto part = readThroughVol(path, H5T_NATIVE_INT, 1500, 100);
+  REQUIRE(part[0] == kStaged + 1500);
+  REQUIRE(part[99] == kStaged + 1599);
+
+#ifndef _WIN32
+  // One file, one tag, however it is named: a symlink reaches the same image.
+  const std::string link = "/tmp/clio_vol_io_prestaged_link.h5";
+  std::remove(link.c_str());
+  REQUIRE(::symlink(path.c_str(), link.c_str()) == 0);
+  auto via_link = readThroughVol(link, H5T_NATIVE_INT, 10, 5);
+  REQUIRE(via_link[0] == kStaged + 10);
+  std::remove(link.c_str());
+#endif
+
+  // A same-size memory type in another representation is not the staged
+  // image's type, so it goes to the file.
+  auto as_uint = readThroughVol(path, H5T_NATIVE_UINT, 1500, 100);
+  REQUIRE(as_uint[0] == 1500);
+}
+
+TEST_CASE("HDF5 VOL IO - A staged image with another chunk size is a miss",
+          "[hdf5_vol][io]") {
+  // chunk_<i> means different bytes under a different chunk size, so a stamp
+  // naming another size must not be trusted. The bytes here are staged at
+  // 4 KiB but stamped as 8 KiB: a connector that ignored the size would serve
+  // them; this one must read the file and drop the tag.
+  constexpr int kStaged = 2000000;
+  setupVolEnvironment();
+  const std::string path = "/tmp/clio_vol_io_prestaged_chunk.h5";
+  std::remove(path.c_str());
+  {
+    hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT,
+                           H5P_DEFAULT);
+    REQUIRE(file >= 0);
+    hsize_t dims[1] = {kNumElems};
+    hid_t space = H5Screate_simple(1, dims, nullptr);
+    hid_t dset = H5Dcreate2(file, "data", H5T_NATIVE_INT, space, H5P_DEFAULT,
+                            H5P_DEFAULT, H5P_DEFAULT);
+    std::vector<int> w(kNumElems);
+    for (size_t i = 0; i < kNumElems; ++i) w[i] = static_cast<int>(i);
+    REQUIRE(H5Dwrite(dset, H5T_NATIVE_INT, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+                     w.data()) >= 0);
+    H5Dclose(dset);
+    H5Sclose(space);
+    REQUIRE(H5Fclose(file) >= 0);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  std::vector<int> image(kNumElems);
+  for (size_t i = 0; i < kNumElems; ++i) image[i] = kStaged + static_cast<int>(i);
+  stageLikeCae(path, "/data", image, 4096, 8192);
+
+  auto part = readThroughVol(path, H5T_NATIVE_INT, 1500, 100);
+  REQUIRE(part[0] == 1500);
+  REQUIRE(cteBlobSize(path, "/data/chunk_0") == 0);
 }
 
 SIMPLE_TEST_MAIN()

@@ -210,7 +210,10 @@ class WorkOrchestrator {
   void RetireWorker(Worker *worker);
 
   /** Interval between monitor-thread LoadBalance() ticks. */
-  static constexpr u32 kMonitorPeriodMs = 500;
+  /// How often LoadBalance (stall detection, rescue, rebalancing) runs. With
+  /// the 300 ms stall cutoff this bounds a stalled worker's backlog to about
+  /// 0.4 s before it moves (was 500 ms + 1 s).
+  static constexpr u32 kMonitorPeriodMs = 100;
 
  private:
   /** Monitor-thread body: LoadBalance() loop on a kMonitorPeriodMs cadence. */

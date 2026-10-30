@@ -102,6 +102,40 @@ struct AssimilationCtx {
   }
 };
 
+/**
+ * Check every context's depends_on against the transfers before it.
+ *
+ * ParseOmni runs the contexts in order and each assimilator finishes its
+ * transfer before the next one starts, so a dependency on an EARLIER context
+ * (named by that context's exact src or dst URL) is already satisfied when
+ * its dependent runs. Anything else cannot be honored: a dependency on a later
+ * context, on the context itself, or on nothing in the list.
+ *
+ * @param ctxs the contexts in submission order
+ * @return empty when every dependency names an earlier context; otherwise a
+ *         message naming the first one that does not
+ */
+inline std::string CheckDependencies(const std::vector<AssimilationCtx>& ctxs) {
+  auto provides = [&ctxs](size_t j, const std::string& dep) {
+    return ctxs[j].src == dep || ctxs[j].dst == dep;
+  };
+  for (size_t i = 0; i < ctxs.size(); ++i) {
+    const std::string& dep = ctxs[i].depends_on;
+    if (dep.empty()) continue;
+    bool earlier = false;
+    for (size_t j = 0; j < i && !earlier; ++j) earlier = provides(j, dep);
+    if (earlier) continue;
+    bool later = false;
+    for (size_t j = i + 1; j < ctxs.size() && !later; ++j) later = provides(j, dep);
+    return "transfer " + std::to_string(i + 1) + " (src " + ctxs[i].src +
+           ") depends_on '" + dep + "', which " +
+           (later ? "only a later transfer provides; transfers run in order, "
+                    "so list that transfer first"
+                  : "is not the src or dst of any earlier transfer");
+  }
+  return "";
+}
+
 }  // namespace clio::cae::core
 
 #endif  // CLIO_CAE_CORE_ASSIMILATION_CTX_H_

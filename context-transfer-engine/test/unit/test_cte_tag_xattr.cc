@@ -249,4 +249,40 @@ TEST_CASE("TagXattr - deleting the tag drops its section", "[cte][tag_xattr]") {
   REQUIRE_FALSE(Get(tag, "x", &v));
 }
 
+namespace {
+/** Get or create a tag by name; returns its id. */
+TagId Tag(const std::string &name) {
+  auto t = CLIO_CTE_CLIENT->AsyncGetOrCreateTag(name);
+  t.Wait();
+  REQUIRE(t->GetReturnCode() == 0);
+  return t->tag_id_;
+}
+}  // namespace
+
+TEST_CASE("TagXattr - a parent with a section outlives its last child",
+          "[cte][tag_xattr]") {
+  Fixture();
+  // "/xkeep/child" materializes "/xkeep"; a section on it makes it state, not
+  // a path placeholder, so deleting the child must not prune it (its delete
+  // record would erase the section at the next restart).
+  const TagId kept = Tag("/xkeep");
+  const TagId child = Tag("/xkeep/child");
+  REQUIRE(Set(kept, "~i", "record") == 0);
+  auto d = CLIO_CTE_CLIENT->AsyncDelTag(child);
+  d.Wait();
+  REQUIRE(d->GetReturnCode() == 0);
+  REQUIRE(Tag("/xkeep") == kept);
+  std::string v;
+  REQUIRE(Get(kept, "~i", &v));
+  REQUIRE(v == "record");
+
+  // Without state the placeholder still goes with its last child.
+  const TagId plain = Tag("/xplain");
+  const TagId pchild = Tag("/xplain/child");
+  auto d2 = CLIO_CTE_CLIENT->AsyncDelTag(pchild);
+  d2.Wait();
+  REQUIRE(d2->GetReturnCode() == 0);
+  REQUIRE_FALSE(Tag("/xplain") == plain);
+}
+
 SIMPLE_TEST_MAIN()

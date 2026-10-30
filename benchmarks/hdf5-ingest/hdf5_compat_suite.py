@@ -1026,6 +1026,10 @@ def _env(mode):
         # The policy itself is measured separately; this pin is only so a
         # mechanics regression cannot hide behind a policy change.
         e["CLIO_VOL_ADMIT_COST"] = "0"
+        # Same reasoning for WHEN data is admitted: the telemetry checks pin
+        # write-side staging, and the default admission policy depends on the
+        # stamp settle knob, so name the policy rather than inherit it.
+        e["CLIO_VOL_ADMIT"] = "write"
     elif mode == "vfd":
         e["HDF5_PLUGIN_PATH"] = BIN
         e["HDF5_DRIVER"] = "clio_vfd"

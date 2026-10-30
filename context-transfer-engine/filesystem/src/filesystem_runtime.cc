@@ -97,13 +97,6 @@ inline std::vector<std::pair<std::string, std::string>> DeserializeXattrs(
   return xa;
 }
 
-/** SetAttr flag bits shared with fs_namespace.cc (kShardInodeSetAttr). */
-enum : clio::run::u32 {
-  kSetAtime = 1u, kSetMtime = 2u, kSetAtimeNow = 4u, kSetMtimeNow = 8u,
-  kSetUid = 16u, kSetGid = 32u, kSetMode = 64u, kAttrRepair = 128u,
-  kSetCtimeOnly = 256u, kAccessTouch = 512u, kAccessStrict = 1024u,
-};
-
 /** Random backoff (us) for a two-party operation that lost a race. */
 inline double BackoffUs(int attempt) {
   thread_local std::mt19937 rng(std::random_device{}());
@@ -151,6 +144,16 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // Caches granted by an earlier incarnation of this container run out by
   // started_ms_ + lease; resync pushes wait at most that long for them.
   started_ms_ = SteadyMs();
+  // Directory blocks this container is home for: in memory, persisted in a
+  // node-local journal next to the stream log when metadata_log_path is set
+  // (else in CTE blobs). Replayed first, before any await: the container is
+  // registered before Create runs, so peers' lookups arrive while it awaits
+  // below, and a home block loaded before the replay came back empty -- for
+  // "/" a fresh empty root that then replaced the journaled one.
+  OpenDirJournal(cfg.metadata_log_path_.empty()
+                     ? std::string()
+                     : ctp::ConfigParse::ExpandPath(cfg.metadata_log_path_) +
+                           ".dirs." + std::to_string(container_id_));
   next_pool_id_ = cfg.next_pool_id_;
   if (!next_pool_id_.IsNull()) {
     cte_ = clio::cte::core::Client(next_pool_id_);
@@ -209,17 +212,21 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     if (st->GetReturnCode() == 0) sys_tag_id_ = st->tag_id_;
   }
   split_entries_ = std::max<clio::run::u32>(cfg.dir_split_entries_, 16);
-  // Directory blocks this container is home for: in memory, persisted in a
-  // node-local journal next to the stream log when metadata_log_path is set
-  // (else in CTE blobs). Replayed before anything reads a directory.
-  OpenDirJournal(cfg.metadata_log_path_.empty()
-                     ? std::string()
-                     : ctp::ConfigParse::ExpandPath(cfg.metadata_log_path_) +
-                           ".dirs." + std::to_string(container_id_));
+  case_insensitive_ = cfg.case_insensitive_;
   // Inode records live in CTE blobs and load on demand; only this
   // container's id reservation and orphan list are read up front.
   CLIO_CO_AWAIT(LoadSysRecords());
   if (is_restart_) CLIO_CO_AWAIT(ReconcileRestoredStreams());
+  {
+    // The root's home holds the volume's flags (created with the volume):
+    // a configuration that disagrees would key names differently.
+    bool flags_ok = true;
+    CLIO_CO_AWAIT(CheckVolumeFlags(flags_ok));
+    if (!flags_ok) {
+      fields->return_code_ = EINVAL;
+      CLIO_CO_RETURN;
+    }
+  }
   // Mirror the namespace into CTE tag names (async). The root first; on a
   // restart this node missed broadcasts while down, so drop its published
   // names, re-add the ones this container owns, and pull the rest from peers.
@@ -264,7 +271,8 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     if (multi_node && !forced) {
       HLOG(kInfo, "filesystem: shared-memory attribute cache disabled on a "
            "{}-node deployment", ipc->GetNumHosts());
-    } else if (shm_fs_cache_.Create(capacity, fields->new_pool_id_)) {
+    } else if (shm_fs_cache_.Create(capacity, fields->new_pool_id_,
+                                    case_insensitive_)) {
       HLOG(kInfo, "filesystem: shared-memory attribute cache enabled "
            "(files={})", capacity);
     }
@@ -343,12 +351,14 @@ void Runtime::EnsurePurgeDrain() {
 // issue #817: shared-memory attribute mirror (single node only)
 // ===========================================================================
 
-void Runtime::MirrorFile(const std::string &path, const FileInfo &fi,
+void Runtime::MirrorFile(const std::string &path, const InodeState &fi,
                          clio::run::u32 extra_flags) {
   if (!shm_fs_cache_.IsEnabled()) return;
   // A file with several names is refreshed only under its primary name;
   // refuse the fast path for the others so they never serve a stale size.
-  if (path != fi.path_ || fi.nlink_ > 1) extra_flags |= kShmFileNoFastPath;
+  if (KeyOfPath(path) != KeyOfPath(fi.mirror_path_) || fi.nlink_ > 1) {
+    extra_flags |= kShmFileNoFastPath;
+  }
   ShmFileRecord rec;
   rec.tag_id_ = fi.tag_id_;
   rec.size_ = FileSize(fi);
@@ -393,26 +403,25 @@ void Runtime::MirrorRefuse(const std::string &path) {
 // Shared building blocks
 // ===========================================================================
 
-clio::run::TaskResume Runtime::StatEntry(clio::run::u64 parent,
-                                         const std::string &leaf,
-                                         const DirEntry &e, FsResp &resp) {
+clio::run::TaskResume Runtime::StatRow(clio::run::u64 parent,
+                                       const std::string &name,
+                                       const InodeRow &e, FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
+  (void)name;
   if (e.type_ != kFsTypeDir) {
     CLIO_CO_AWAIT(StatInode(e.id_, resp));
     CLIO_CO_RETURN;
   }
-  CLIO_CO_AWAIT(DirStat(e.id_, resp));
-  if (resp.rc_ == ENOENT && e.state_ == kDirEntLive && parent != 0) {
-    // The parent's live entry is authoritative: a listing missing behind it
+  CLIO_CO_AWAIT(StatDir(e.id_, resp));
+  if (resp.rc_ == ENOENT && e.state_ == kRowLive && parent != 0) {
+    // The parent's live row is authoritative: a table missing behind it
     // (crash between rmdir's halves) is recreated rather than reported gone.
     FsReq r;
     r.dir_id_ = e.id_;
-    r.b_ = parent;
-    r.leaf_ = leaf;
-    r.flags_ = 128u;  // kAttrRepair
+    r.flags_ = kCreateRepair;
     FsResp cr;
-    CLIO_CO_AWAIT(CallShard(BlockHome(e.id_, 0), kShardDirCreate, r, cr));
-    CLIO_CO_AWAIT(DirStat(e.id_, resp));
+    CLIO_CO_AWAIT(CallShard(BlockHome(e.id_, 0), kTableCreate, r, cr));
+    CLIO_CO_AWAIT(StatDir(e.id_, resp));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -436,7 +445,7 @@ clio::run::TaskResume Runtime::UnlinkInode(clio::run::u64 packed,
  * parent directory's id) and `erc` (0, ENOENT, ENOTDIR or EIO).
  */
 #define CLIO_FS_RESOLVE(pathv, ent, par, erc)                                 \
-  DirEntry ent;                                                               \
+  InodeRow ent;                                                               \
   clio::run::u64 par = 0;                                                     \
   int erc = 0;                                                                \
   CLIO_CO_AWAIT(ResolvePath((pathv), ent, par, erc))
@@ -530,10 +539,24 @@ clio::run::TaskResume Runtime::CreateEntry(FsReq r, clio::run::u32 type,
     }
     id = FsUnpack(r.id_);
   } else {
-    CLIO_CO_AWAIT(MintIdReady(FsInodeHomeFor(path, NumContainers()), id));
+    int mrc = 0;
+    CLIO_CO_AWAIT(MintIdReady(FsInodeHomeFor(path, NumContainers()), id, mrc));
+    if (mrc != 0) {
+      er.rc_ = static_cast<clio::run::u32>(mrc);
+      CLIO_CO_RETURN;
+    }
+  }
+  Inode ino;
+  ino.tag_id_ = id;
+  ino.type_ = type;
+  ino.mode_ = mode;
+  ino.symlink_ = symlink;
+  if (type == kFsTypeDir) {
+    ino.parent_ = r.dir_id_;
+    ino.parent_key_ = KeyOf(r.leaf_);
   }
   int crc = 0;
-  CLIO_CO_AWAIT(CreateInodeRecord(id, type, mode, symlink, path, crc));
+  CLIO_CO_AWAIT(CreateInodeRecord(ino, path, crc));
   if (crc != 0) {
     er.rc_ = static_cast<clio::run::u32>(crc);
     CLIO_CO_RETURN;
@@ -543,7 +566,7 @@ clio::run::TaskResume Runtime::CreateEntry(FsReq r, clio::run::u32 type,
   r.mode_ = mode;
   r.str_ = symlink;
   r.flags_ = kInsNewInode | flags;
-  CLIO_CO_AWAIT(EntryOp(kShardInsert, r, er));
+  CLIO_CO_AWAIT(TableOp(kTableInsert, r, er));
   if (er.rc_ != 0 || er.created_ == 0 || er.id_ != r.id_) {
     // The name went to another inode (or nowhere): ours was never published.
     CLIO_CO_AWAIT(DiscardInodeRecord(id));
@@ -564,9 +587,9 @@ clio::run::TaskResume Runtime::OpenName(OpenTask *task, const FsReq &name,
     // O_EXCL keys off; the others get the winner's entry (CreateEntry).
     bool exists = false;
     if ((task->flags_ & O_EXCL) == 0) {
-      DirEntry e;
+      InodeRow e;
       int lrc = 0;
-      CLIO_CO_AWAIT(LookupEntry(r.dir_id_, r.leaf_, e, lrc));
+      CLIO_CO_AWAIT(LookupRow(r.dir_id_, r.leaf_, e, lrc));
       if (lrc == 0) {
         exists = true;
         er.id_ = e.id_;
@@ -580,9 +603,9 @@ clio::run::TaskResume Runtime::OpenName(OpenTask *task, const FsReq &name,
                                 (task->flags_ & O_EXCL) ? kInsExcl : 0u, er));
     }
   } else {
-    DirEntry e;
+    InodeRow e;
     int lrc = 0;
-    CLIO_CO_AWAIT(LookupEntry(r.dir_id_, r.leaf_, e, lrc));
+    CLIO_CO_AWAIT(LookupRow(r.dir_id_, r.leaf_, e, lrc));
     if (lrc == ENOENT) {  // handle_ = 0: ENOENT to the client
       task->return_code_ = 0;
       done = true;
@@ -603,7 +626,8 @@ clio::run::TaskResume Runtime::OpenName(OpenTask *task, const FsReq &name,
   CLIO_TASK_BODY_END
 }
 
-clio::run::u64 Runtime::FileSize(const FileInfo &fi) {
+clio::run::u64 Runtime::FileSize(const InodeState &fi) {
+  if (fi.type_ == kFsTypeDir) return 0;
   if (fi.type_ == kFsTypeSymlink) return fi.symlink_.size();
   if (!stream_hold_) return 0;
   // This container is the inode's home and therefore its stream's home: the
@@ -647,8 +671,12 @@ clio::run::TaskResume Runtime::SyncMeta(
   CLIO_TASK_BODY_END
 }
 
-void Runtime::StampSizePush(const AdvanceSizeTask &task, FileInfo *fi) {
+void Runtime::StampSizePush(const AdvanceSizeTask &task, InodeState *fi) {
   if (task.reserve_ == 0 && task.mtime_ns_ != 0) {
+    // A write the client made before an explicit utimens (cp -p, rsync -t,
+    // tar): its push lands after close, which is after the utimens, and
+    // stamping the write's time would undo the times the caller set.
+    if (task.mtime_ns_ <= fi->mtime_set_ns_) return;
     // The write's own time: the push lands after close, and the client has
     // already reported that time to stat callers. Never backwards: a batched
     // create can land after the write and stamp its own (later) time.
@@ -694,7 +722,7 @@ clio::run::TaskResume Runtime::AdvanceSize(
   CLIO_CO_AWAIT(EnsureInode(task->tag_packed_));
   // Only a record this update dirties can fail it (see FlushInodes).
   const clio::run::u64 since = DirtySeq();
-  std::shared_ptr<FileInfo> fi = FindInode(task->tag_packed_);
+  std::shared_ptr<InodeState> fi = FindInode(task->tag_packed_);
   if (fi == nullptr) {
     task->return_code_ = ENOENT;
     CLIO_CO_RETURN;
@@ -718,7 +746,7 @@ clio::run::TaskResume Runtime::AdvanceSize(
     std::lock_guard<std::mutex> g(meta_mu_);
     StampSizePush(*task, fi.get());
     LogInode(*fi);
-    if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
+    if (!fi->mirror_path_.empty()) MirrorFile(fi->mirror_path_, *fi);
   }
   int ferr = 0;
   // The record carries the new size/mtime.
@@ -773,7 +801,7 @@ clio::run::TaskResume Runtime::MultiCreate(
     // failed ("unable to stat just-written file" in git checkout).
     if (auto fi = FindInode(e.tag_packed_)) {
       std::lock_guard<std::mutex> g(meta_mu_);
-      fi->path_ = path;
+      fi->mirror_path_ = path;
       if (e.ctime_ns_ != 0) {
         // The client's creation time, not this batch's arrival: stat
         // already reported it, and git compares it exactly.
@@ -799,7 +827,7 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
   // node while its workers sat idle).
   const clio::run::u64 t_start = SteadyMs();
   clio::run::u64 t_size = 0;
-  std::shared_ptr<FileInfo> fi;
+  std::shared_ptr<InodeState> fi;
   {
     std::lock_guard<std::mutex> g(meta_mu_);
     auto it = handles_.find(task->handle_);
@@ -813,7 +841,7 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
     CLIO_CO_RETURN;
   }
   // Sieve-written files advance their logical size at close: the handle's
-  // FileInfo tracks the file across renames.
+  // InodeState tracks the file across renames.
   if (task->advance_size_ != 0) {
     clio::run::u32 rc = 0;
     CLIO_CO_AWAIT(FileSizeOp(fi->tag_id_, clio::cte::stream::StreamSizeOp::kMax,
@@ -829,7 +857,7 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
     } else if (fi->dirty_) {
       fi->dirty_ = false;
       LogInode(*fi);
-      if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
+      if (!fi->mirror_path_.empty()) MirrorFile(fi->mirror_path_, *fi);
     }
   }
   int ferr = 0;
@@ -847,11 +875,11 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
   CLIO_TASK_BODY_END
 }
 
-// Look up the FileInfo for a handle (nullptr if unknown). Brief lock only.
+// Look up the InodeState for a handle (nullptr if unknown). Brief lock only.
 // The critical section is one hash lookup; sharding or a shared_mutex here
 // measured neutral-to-worse (see git history of this file).
 #define CLIO_FS_LOOKUP(fi, handle)                       \
-  std::shared_ptr<FileInfo> fi;                          \
+  std::shared_ptr<InodeState> fi;                          \
   do {                                                   \
     std::lock_guard<std::mutex> g(meta_mu_);             \
     auto it = handles_.find(handle);                     \
@@ -973,7 +1001,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     const clio::run::u64 now = clio::cte::core::GetWallTimeNs();
     fi->mtime_ = fi->ctime_ = now;
     fi->dirty_ = true;
-    if (!fi->path_.empty()) MirrorFile(fi->path_, *fi);
+    if (!fi->mirror_path_.empty()) MirrorFile(fi->mirror_path_, *fi);
   }
   task->bytes_written_ = done;
   task->new_size_ = new_size;
@@ -1039,7 +1067,7 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
       CLIO_CO_RETURN;
     }
     sr = FsResp();
-    CLIO_CO_AWAIT(StatEntry(par, FsLeaf(path), ent, sr));
+    CLIO_CO_AWAIT(StatRow(par, FsLeaf(path), ent, sr));
     // The inode the name led to is gone: a rename over the name raced us
     // (look again, see Open) unless it is the same missing inode twice.
     if (sr.rc_ != ENOENT || ent.type_ == kFsTypeDir ||
@@ -1078,6 +1106,7 @@ void Runtime::FillGetattr(const FsAttr &a, GetattrTask *task) {
   task->gid_ = a.gid_;
   task->mode_ = a.mode_;
   task->nlink_ = a.nlink_;
+  task->volume_flags_ = a.volume_flags_;
 }
 
 clio::run::TaskResume Runtime::StatSize(clio::run::shared_ptr<StatSizeTask> &task) {
@@ -1088,7 +1117,7 @@ clio::run::TaskResume Runtime::StatSize(clio::run::shared_ptr<StatSizeTask> &tas
   CLIO_FS_RESOLVE(path, ent, par, erc);
   if (erc == 0) {
     FsResp sr;
-    CLIO_CO_AWAIT(StatEntry(par, FsLeaf(path), ent, sr));
+    CLIO_CO_AWAIT(StatRow(par, FsLeaf(path), ent, sr));
     if (sr.rc_ == 0) {
       task->exists_ = 1;
       task->size_ = sr.attr_.size_;
@@ -1160,7 +1189,7 @@ clio::run::TaskResume Runtime::Unlink(clio::run::shared_ptr<UnlinkTask> &task) {
   r.leaf_ = FsLeaf(path);
   r.flags_ = kRmNonDir;
   FsResp rr;
-  CLIO_CO_AWAIT(EntryOp(kShardRemove, r, rr));
+  CLIO_CO_AWAIT(TableOp(kTableRemove, r, rr));
   if (rr.rc_ != 0) {
     task->return_code_ = rr.rc_;
     CLIO_CO_RETURN;
@@ -1186,37 +1215,38 @@ clio::run::TaskResume Runtime::Mkdir(clio::run::shared_ptr<MkdirTask> &task) {
     task->return_code_ = perc;
     CLIO_CO_RETURN;
   }
-  // 1. Reserve the name (invisible) on its block's home: exactly one of
-  //    several racing mkdirs (any node) gets it, and mints the id.
+  // 1. Store the new directory's inode record and reserve its name
+  //    (invisible) on its block's home: exactly one of several racing mkdirs
+  //    (any node) gets the name; the others' records are discarded.
   FsReq r;
   r.dir_id_ = pe.id_;
+  r.dir_ = FsParentDir(path);
   r.leaf_ = FsLeaf(path);
-  r.type_ = kFsTypeDir;
-  r.flags_ = kInsExcl | kInsPending;
   FsResp rr;
-  CLIO_CO_AWAIT(EntryOp(kShardInsert, r, rr));
+  CLIO_CO_AWAIT(CreateEntry(r, kFsTypeDir, 0xFFFFFFFFu, std::string(),
+                            kInsExcl | kInsPending, rr));
   if (rr.rc_ != 0) {
     task->return_code_ = rr.rc_;
     CLIO_CO_RETURN;
   }
-  // 2. Create the new directory's block 0 on ITS home.
+  // 2. Create the new directory's table block 0 on ITS home.
   FsReq c;
   c.dir_id_ = rr.id_;
-  c.b_ = pe.id_;
-  c.leaf_ = r.leaf_;
   FsResp cr;
-  CLIO_CO_AWAIT(CallShard(BlockHome(rr.id_, 0), kShardDirCreate, c, cr));
+  CLIO_CO_AWAIT(CallShard(BlockHome(rr.id_, 0), kTableCreate, c, cr));
   // 3. Publish (or roll back) the reservation.
   r.id_ = rr.id_;
+  r.type_ = kFsTypeDir;
   r.flags_ = cr.rc_ == 0 ? kInsCommit : 0u;
   FsResp fr;
-  CLIO_CO_AWAIT(EntryOp(cr.rc_ == 0 ? kShardInsert : kShardRemove, r, fr));
+  CLIO_CO_AWAIT(TableOp(cr.rc_ == 0 ? kTableInsert : kTableRemove, r, fr));
   task->return_code_ = cr.rc_ != 0 ? cr.rc_ : fr.rc_;
-  if (cr.rc_ == 0 && fr.rc_ != 0) {
-    // Lost the name: nothing can reach the new directory, drop its block.
-    CLIO_CO_AWAIT(DropDir(rr.id_));
-  }
-  if (task->return_code_ == 0) {
+  if (task->return_code_ != 0) {
+    // Lost the name (or never got a table): nothing can reach the new
+    // directory, so its table and record go.
+    if (cr.rc_ == 0) CLIO_CO_AWAIT(DropTable(rr.id_));
+    CLIO_CO_AWAIT(DiscardInodeRecord(FsUnpack(rr.id_)));
+  } else {
     // The parent stays COMPLETE: the new name is published right here (as
     // a complete dir of its own), so a mirror miss under the parent is
     // still authoritative. Demoting the parent on every mkdir switched off
@@ -1240,7 +1270,7 @@ clio::run::TaskResume Runtime::RemoveDir(clio::run::u64 parent,
   r.id_ = expect;
   r.flags_ = kRmDirOnly | kRmMarkLeaving;
   FsResp mr;
-  CLIO_CO_AWAIT(EntryOp(kShardRemove, r, mr));
+  CLIO_CO_AWAIT(TableOp(kTableRemove, r, mr));
   if (mr.rc_ != 0) {
     rc = static_cast<int>(mr.rc_);
     CLIO_CO_RETURN;
@@ -1249,14 +1279,16 @@ clio::run::TaskResume Runtime::RemoveDir(clio::run::u64 parent,
   //    block's home first (and this fails ENOTEMPTY) or finds it sealed.
   const clio::run::u64 dir = mr.old_id_;
   int src = 0;
-  CLIO_CO_AWAIT(SealDir(dir, true, src));
-  if (src == 0) CLIO_CO_AWAIT(DropDir(dir));
-  // 3. Remove the entry, or restore it.
+  CLIO_CO_AWAIT(SealTable(dir, true, src));
+  if (src == 0) CLIO_CO_AWAIT(DropTable(dir));
+  // 3. Remove the row, or restore it.
   r.id_ = dir;
   r.flags_ = src == 0 ? 0u : kRmRestore;
   FsResp fr;
-  CLIO_CO_AWAIT(EntryOp(kShardRemove, r, fr));
+  CLIO_CO_AWAIT(TableOp(kTableRemove, r, fr));
   rc = src != 0 ? src : static_cast<int>(fr.rc_);
+  // 4. Its only name is gone: drop the directory's inode.
+  if (rc == 0) CLIO_CO_AWAIT(UnlinkInode(dir, std::string()));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -1284,7 +1316,7 @@ clio::run::TaskResume Runtime::Rmdir(clio::run::shared_ptr<RmdirTask> &task) {
 clio::run::TaskResume Runtime::RenameFile(const std::string &src,
                                           const std::string &dst,
                                           clio::run::u64 sp, clio::run::u64 dp,
-                                          const DirEntry &se, int &rc) {
+                                          const InodeRow &se, int &rc) {
   CLIO_TASK_BODY_BEGIN
   const clio::run::u64 id = se.id_;
   FsReq s;
@@ -1293,7 +1325,7 @@ clio::run::TaskResume Runtime::RenameFile(const std::string &src,
   s.id_ = id;
   s.flags_ = kRmMarkLeaving | kRmFailBusy;
   FsResp sr;
-  CLIO_CO_AWAIT(EntryOp(kShardRemove, s, sr));
+  CLIO_CO_AWAIT(TableOp(kTableRemove, s, sr));
   if (sr.rc_ != 0) {
     rc = static_cast<int>(sr.rc_);
     CLIO_CO_RETURN;
@@ -1313,11 +1345,11 @@ clio::run::TaskResume Runtime::RenameFile(const std::string &src,
   ins.type_ = se.type_;
   ins.flags_ = kInsReplace | kInsFailBusy | kInsNoTagName;
   FsResp ir;
-  CLIO_CO_AWAIT(EntryOp(kShardInsert, ins, ir));
+  CLIO_CO_AWAIT(TableOp(kTableInsert, ins, ir));
   const bool same = ir.rc_ == 0 && ir.old_id_ == id;
   s.flags_ = (ir.rc_ != 0 || same) ? kRmRestore : kRmNoTagName;
   FsResp fr;
-  CLIO_CO_AWAIT(EntryOp(kShardRemove, s, fr));
+  CLIO_CO_AWAIT(TableOp(kTableRemove, s, fr));
   // Drop the handoff link. A failed or no-op rename keeps the source as the
   // inode's name; a completed one leaves the destination (set above).
   CLIO_CO_AWAIT(UnlinkInode(id, (ir.rc_ != 0 || same) ? dst : src));
@@ -1329,16 +1361,17 @@ clio::run::TaskResume Runtime::RenameFile(const std::string &src,
     CLIO_CO_AWAIT(UnlinkInode(ir.old_id_, dst));  // the replaced destination
   }
   if (!same) {
-    // ONE name change for the whole move (the per-home steps publish none).
-    const std::string to =
-        clio::cte::core::MakeTagRefName(FsUnpack(dp), FsLeaf(dst));
+    // ONE name change for the whole move (the per-home steps publish none),
+    // under the names as they were spelled.
+    const clio::cte::core::TagId dt = FsUnpack(dp);
+    const std::string to = clio::cte::core::MakeTagRefName(dt, FsLeaf(dst));
     if (ir.old_id_ != 0) {
       PublishName(clio::cte::core::TagNameOp::kRemoveName,
-                  FsUnpack(ir.old_id_), to);
+                  FsUnpack(ir.old_id_),
+                  clio::cte::core::MakeTagRefName(dt, ir.str_));
     }
     PublishName(clio::cte::core::TagNameOp::kRename, FsUnpack(id),
-                clio::cte::core::MakeTagRefName(FsUnpack(sp), FsLeaf(src)),
-                to);
+                clio::cte::core::MakeTagRefName(FsUnpack(sp), sr.str_), to);
   }
   rc = 0;
   CLIO_CO_RETURN;
@@ -1348,7 +1381,7 @@ clio::run::TaskResume Runtime::RenameFile(const std::string &src,
 clio::run::TaskResume Runtime::RenameDir(const std::string &src,
                                          const std::string &dst,
                                          clio::run::u64 sp, clio::run::u64 dp,
-                                         const DirEntry &se, int &rc) {
+                                         const InodeRow &se, int &rc) {
   CLIO_TASK_BODY_BEGIN
   const clio::run::u64 id = se.id_;
   // 1. Freeze the source entry (a crossing move backs off on it).
@@ -1358,7 +1391,7 @@ clio::run::TaskResume Runtime::RenameDir(const std::string &src,
   s.id_ = id;
   s.flags_ = kRmMarkLeaving | kRmFailBusy | kRmDirOnly;
   FsResp sr;
-  CLIO_CO_AWAIT(EntryOp(kShardRemove, s, sr));
+  CLIO_CO_AWAIT(TableOp(kTableRemove, s, sr));
   if (sr.rc_ != 0) {
     rc = static_cast<int>(sr.rc_);
     CLIO_CO_RETURN;
@@ -1369,13 +1402,13 @@ clio::run::TaskResume Runtime::RenameDir(const std::string &src,
   //    once replaced).
   clio::run::u64 victim = 0;
   if (rc == 0) {
-    DirEntry de;
+    InodeRow de;
     int lrc = 0;
-    CLIO_CO_AWAIT(LookupEntry(dp, FsLeaf(dst), de, lrc));
+    CLIO_CO_AWAIT(LookupRow(dp, FsLeaf(dst), de, lrc));
     if (lrc == 0 && de.type_ != kFsTypeDir) {
       rc = ENOTDIR;
     } else if (lrc == 0) {
-      CLIO_CO_AWAIT(SealDir(de.id_, true, rc));
+      CLIO_CO_AWAIT(SealTable(de.id_, true, rc));
       if (rc == 0) victim = de.id_;
     } else if (lrc != ENOENT) {
       rc = lrc;
@@ -1391,35 +1424,56 @@ clio::run::TaskResume Runtime::RenameDir(const std::string &src,
     ins.id_ = id;
     ins.type_ = kFsTypeDir;
     ins.flags_ = kInsReplace | kInsReplaceDir | kInsFailBusy | kInsNoTagName;
-    CLIO_CO_AWAIT(EntryOp(kShardInsert, ins, ir));
+    CLIO_CO_AWAIT(TableOp(kTableInsert, ins, ir));
     rc = static_cast<int>(ir.rc_);
   }
   if (rc == 0) {
     FsReq pa;
-    pa.dir_id_ = id;
-    pa.id_ = dp;
-    pa.leaf_ = FsLeaf(dst);
-    pa.flags_ = 2048u;  // kSetParent
+    pa.id_ = id;
+    pa.b_ = dp;
+    pa.str_ = KeyOf(FsLeaf(dst));
+    pa.flags_ = kSetParent;
     FsResp par;
-    CLIO_CO_AWAIT(CallShard(BlockHome(id, 0), kShardDirAttr, pa, par));
-    if (victim != 0) CLIO_CO_AWAIT(DropDir(victim));
-    const std::string to =
-        clio::cte::core::MakeTagRefName(FsUnpack(dp), FsLeaf(dst));
+    CLIO_CO_AWAIT(CallShard(InodeOwner(id), kShardInodeSetAttr, pa, par));
+    if (par.rc_ == 0) RefreshCachedInode(id, par.attr_);
+    if (victim != 0) {
+      CLIO_CO_AWAIT(DropTable(victim));
+      CLIO_CO_AWAIT(UnlinkInode(victim, std::string()));
+    }
+    const clio::cte::core::TagId dt = FsUnpack(dp);
+    const std::string to = clio::cte::core::MakeTagRefName(dt, FsLeaf(dst));
     if (victim != 0) {
       PublishName(clio::cte::core::TagNameOp::kRemoveName, FsUnpack(victim),
-                  to);
+                  clio::cte::core::MakeTagRefName(dt, ir.str_));
     }
     PublishName(clio::cte::core::TagNameOp::kRename, FsUnpack(id),
-                clio::cte::core::MakeTagRefName(FsUnpack(sp), FsLeaf(src)),
-                to);
+                clio::cte::core::MakeTagRefName(FsUnpack(sp), sr.str_), to);
   } else if (victim != 0) {
     int urc = 0;
-    CLIO_CO_AWAIT(SealDir(victim, false, urc));
+    CLIO_CO_AWAIT(SealTable(victim, false, urc));
   }
   // 5. Finish or undo the source.
   s.flags_ = rc == 0 ? kRmNoTagName : kRmRestore;
   FsResp fr;
-  CLIO_CO_AWAIT(EntryOp(kShardRemove, s, fr));
+  CLIO_CO_AWAIT(TableOp(kTableRemove, s, fr));
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RespellName(const std::string &src,
+                                           const std::string &dst,
+                                           clio::run::u64 dir,
+                                           const InodeRow &se, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  (void)src;
+  FsReq r;
+  r.dir_id_ = dir;
+  r.leaf_ = FsLeaf(dst);
+  r.id_ = se.id_;
+  r.flags_ = kInsFailBusy;
+  FsResp rr;
+  CLIO_CO_AWAIT(TableOp(kTableRespell, r, rr));
+  rc = static_cast<int>(rr.rc_);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -1459,7 +1513,9 @@ clio::run::TaskResume Runtime::Rename(clio::run::shared_ptr<RenameTask> &task) {
       break;
     }
     is_dir = se.type_ == kFsTypeDir;
-    if (is_dir) {
+    if (sp == dpe.id_ && KeyOf(FsLeaf(src)) == KeyOf(FsLeaf(dst))) {
+      CLIO_CO_AWAIT(RespellName(src, dst, sp, se, rc));
+    } else if (is_dir) {
       CLIO_CO_AWAIT(RenameDir(src, dst, sp, dpe.id_, se, rc));
     } else {
       CLIO_CO_AWAIT(RenameFile(src, dst, sp, dpe.id_, se, rc));
@@ -1518,7 +1574,7 @@ clio::run::TaskResume Runtime::Link(clio::run::shared_ptr<LinkTask> &task) {
   ins.type_ = te.type_;
   ins.flags_ = kInsExcl;
   FsResp ir;
-  CLIO_CO_AWAIT(EntryOp(kShardInsert, ins, ir));
+  CLIO_CO_AWAIT(TableOp(kTableInsert, ins, ir));
   if (ir.rc_ != 0) {
     CLIO_CO_AWAIT(UnlinkInode(id, std::string()));
     task->return_code_ = ir.rc_;
@@ -1565,7 +1621,7 @@ clio::run::TaskResume Runtime::Readlink(clio::run::shared_ptr<ReadlinkTask> &tas
     CLIO_CO_RETURN;
   }
   FsResp sr;
-  CLIO_CO_AWAIT(StatEntry(par, FsLeaf(path), ent, sr));
+  CLIO_CO_AWAIT(StatRow(par, FsLeaf(path), ent, sr));
   if (sr.rc_ == 0) {
     task->target_ = clio::run::priv::string(CTP_MALLOC, sr.str_);
   }
@@ -1593,16 +1649,9 @@ clio::run::TaskResume Runtime::Readlink(clio::run::shared_ptr<ReadlinkTask> &tas
     }                                                                         \
     (req).id_ = _e.id_;                                                       \
     FsResp _ar;                                                               \
-    if (_e.type_ == kFsTypeDir) {                                             \
-      (req).dir_id_ = _e.id_;                                                 \
-      (req).flags_ |= kSetCtimeOnly;                                          \
-      CLIO_CO_AWAIT(                                                          \
-          CallShard(BlockHome(_e.id_, 0), kShardDirAttr, req, _ar));          \
-    } else {                                                                  \
-      CLIO_CO_AWAIT(                                                          \
-          CallShard(InodeOwner((req).id_), kShardInodeSetAttr, req, _ar));    \
-      if (_ar.rc_ == 0) RefreshCachedInode((req).id_, _ar.attr_);             \
-    }                                                                         \
+    CLIO_CO_AWAIT(                                                            \
+        CallShard(InodeOwner((req).id_), kShardInodeSetAttr, req, _ar));      \
+    if (_ar.rc_ == 0) RefreshCachedInode((req).id_, _ar.attr_);               \
     rcv = static_cast<int>(_ar.rc_);                                          \
   } while (0)
 
@@ -1651,7 +1700,7 @@ clio::run::TaskResume Runtime::Readdir(clio::run::shared_ptr<ReaddirTask> &task)
   CLIO_FS_RESOLVE(dir, de, dpar, rc);
   (void)dpar;
   if (rc == 0 && de.type_ != kFsTypeDir) rc = ENOTDIR;
-  std::vector<std::pair<std::string, DirEntry>> listing;
+  std::vector<std::pair<std::string, InodeRow>> listing;
   clio::run::u64 newest = 0;
   if (rc == 0) CLIO_CO_AWAIT(CollectDir(de.id_, &listing, &newest, rc));
   task->entries_.reserve(listing.size());
@@ -1673,14 +1722,10 @@ clio::run::TaskResume Runtime::Readdir(clio::run::shared_ptr<ReaddirTask> &task)
 clio::run::TaskResume Runtime::InodeXattr(const FsReq &req, FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   resp.rc_ = 0;
-  const bool no_inode = (req.flags_ & kXattrNoInode) != 0;
-  std::shared_ptr<FileInfo> fi;
-  if (!no_inode) {
-    fi = FindInode(req.id_);
-    if (fi == nullptr) {
-      resp.rc_ = ENOENT;
-      CLIO_CO_RETURN;
-    }
+  std::shared_ptr<InodeState> fi = FindInode(req.id_);
+  if (fi == nullptr) {
+    resp.rc_ = ENOENT;
+    CLIO_CO_RETURN;
   }
   // Serialize this id's read-modify-write (cooperative wait, no lock held
   // across the awaits below).
@@ -1787,7 +1832,7 @@ clio::run::TaskResume Runtime::InodeXattr(const FsReq &req, FsResp &resp) {
         ipc->FreeBuffer(buf);
       }
     }
-    if (fi != nullptr && resp.rc_ == 0) {
+    if (resp.rc_ == 0) {
       std::lock_guard<std::mutex> g(meta_mu_);
       fi->has_xattr_ = true;
       fi->ctime_ = clio::cte::core::GetWallTimeNs();
@@ -1821,14 +1866,7 @@ clio::run::TaskResume Runtime::InodeXattr(const FsReq &req, FsResp &resp) {
     _xq.str_ = (namev);                                                       \
     _xq.str2_ = (valuev);                                                     \
     _xq.flags_ = (flagsv) & 0xFFu;                                            \
-    clio::run::u32 _owner = InodeOwner(_xq.id_);                              \
-    if (_e.type_ == kFsTypeDir) {                                             \
-      /* A directory has no inode home: its xattrs are serialized on the */  \
-      /* home of its block 0, which every request for it reaches. */         \
-      _xq.flags_ |= kXattrNoInode;                                            \
-      _owner = BlockHome(_e.id_, 0);                                          \
-    }                                                                         \
-    CLIO_CO_AWAIT(CallShard(_owner, kShardInodeXattr, _xq, xr));              \
+    CLIO_CO_AWAIT(CallShard(InodeOwner(_xq.id_), kShardInodeXattr, _xq, xr)); \
   } while (0)
 
 clio::run::TaskResume Runtime::Setxattr(clio::run::shared_ptr<SetxattrTask> &task) {

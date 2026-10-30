@@ -152,6 +152,10 @@ add_clio_module_runtime(
 # Add HDF5 include directories to runtime if enabled
 if(HDF5_ENABLED)
   target_include_directories(clio_cae_core_runtime PRIVATE ${HDF5_INCLUDE_DIRS})
+  # format: hdf5_vol writes the HDF5 VOL connector's cache layout, which that
+  # connector defines in adapter/hdf5_vol/clio_vol_layout.h (header-only).
+  target_include_directories(clio_cae_core_runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine)
 endif()
 
 # The in-process S3 read path includes the bdev module's header-only S3 REST
