@@ -279,7 +279,21 @@ compose:
   #   pool_query: local
   #   pool_id: "401.0"
   #   next_pool_id: "563.0"             # chain top (cache), as CAE uses
-  #   label_endpoint: "http://127.0.0.1:11434"   # Ollama-compatible server
+  #   label_endpoint: "http://127.0.0.1:11434"   # inference server base URL
+  #   label_api: ollama                 # ollama (default): POST
+  #                                     #   {label_endpoint}/api/generate
+  #                                     # openai: POST
+  #                                     #   {label_endpoint}/chat/completions
+  #                                     #   with Authorization: Bearer <token>
+  #                                     # Any other value fails pool Create.
+  #   label_api_key_file: ""            # openai only: file holding the bearer
+  #                                     #   token (wins over the env var)
+  #   label_api_key_env: ""             # openai only: env var holding it
+  #                                     # Both are re-read on every request,
+  #                                     # so a refreshed token needs no
+  #                                     # restart; the token never goes in
+  #                                     # this file. Neither set -> no
+  #                                     # Authorization header.
   #   label_prompts:
   #     summarize: "Summarize the following text in one short sentence."
   #   label_matches:
@@ -287,8 +301,32 @@ compose:
   #       blob_re: ".*"
   #       model: "gemma3:1b"
   #       prompt: "summarize"
-  #       context_length: 4096          # tokens (Ollama num_ctx)
-  #       num_predict: 0                # cap on response tokens; 0 = no cap
+  #       context_length: 4096          # tokens; Ollama num_ctx, and the
+  #                                     #   chunking budget for both APIs
+  #       num_predict: 0                # cap on response tokens (Ollama
+  #                                     #   num_predict / OpenAI max_tokens);
+  #                                     #   0 = no cap
+  #
+  # Hosted example -- ALCF Inference Endpoints, Metis cluster, Mistral Large 3.
+  # Model ids are cluster-specific and listed at inference.alcf.anl.gov.
+  # Fetch a Globus access token (valid 48 h) with ALCF's helper script and
+  # write it where label_api_key_file points:
+  #   python inference_auth_token.py authenticate      # once, interactive
+  #   python inference_auth_token.py get_access_token > ~/.alcf_access_token
+  # On ALCF compute nodes, export https_proxy=http://proxy.alcf.anl.gov:3128
+  # before starting the runtime; loopback is never proxied.
+  #
+  #   label_endpoint: "https://inference-api.alcf.anl.gov/resource_server/metis/api/v1"
+  #   label_api: openai
+  #   label_api_key_file: "${HOME}/.alcf_access_token"
+  #   label_api_key_env: ALCF_ACCESS_TOKEN
+  #   label_matches:
+  #     - tag_re: ".*\\.txt$"
+  #       blob_re: ".*"
+  #       model: "Mistral-Large-3-675B-Instruct-2512"
+  #       prompt: "summarize"
+  #       context_length: 32768
+  #       num_predict: 256
 
   # === Context Transfer Engine (CTE) ===
   # High-performance data buffering and transfer engine. Sits at the

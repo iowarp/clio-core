@@ -78,6 +78,24 @@ TEST_CASE("SummarizerConfig - LoadConfig parses label_endpoint",
   SummarizerConfig params;
   params.LoadConfig(MakePoolConfig("label_endpoint: \"http://host:11434\"\n"));
   REQUIRE(params.label_endpoint_ == "http://host:11434");
+  // Unset protocol keys stay empty: Ollama, no token.
+  REQUIRE(params.label_api_.empty());
+  REQUIRE(params.label_api_key_file_.empty());
+  REQUIRE(params.label_api_key_env_.empty());
+}
+
+TEST_CASE("SummarizerConfig - LoadConfig parses the OpenAI / ALCF keys",
+          "[summarizer][config][loadconfig]") {
+  SummarizerConfig params;
+  params.LoadConfig(MakePoolConfig(
+      "label_endpoint: "
+      "\"https://inference-api.alcf.anl.gov/resource_server/metis/api/v1\"\n"
+      "label_api: openai\n"
+      "label_api_key_file: \"/home/u/.alcf_token\"\n"
+      "label_api_key_env: ALCF_ACCESS_TOKEN\n"));
+  REQUIRE(params.label_api_ == "openai");
+  REQUIRE(params.label_api_key_file_ == "/home/u/.alcf_token");
+  REQUIRE(params.label_api_key_env_ == "ALCF_ACCESS_TOKEN");
 }
 
 TEST_CASE("SummarizerConfig - LoadConfig parses label_prompts map",
@@ -168,6 +186,9 @@ TEST_CASE("SummarizerConfig - copy constructor copies all fields",
   src.LoadConfig(MakePoolConfig(
       "next_pool_id: \"321.4\"\n"
       "label_endpoint: \"http://e\"\n"
+      "label_api: openai\n"
+      "label_api_key_file: \"/f\"\n"
+      "label_api_key_env: E\n"
       "label_prompts:\n"
       "  p: \"P\"\n"
       "label_matches:\n"
@@ -178,6 +199,9 @@ TEST_CASE("SummarizerConfig - copy constructor copies all fields",
   REQUIRE(copy.next_pool_id_.major_ == 321);
   REQUIRE(copy.next_pool_id_.minor_ == 4);
   REQUIRE(copy.label_endpoint_ == "http://e");
+  REQUIRE(copy.label_api_ == "openai");
+  REQUIRE(copy.label_api_key_file_ == "/f");
+  REQUIRE(copy.label_api_key_env_ == "E");
   REQUIRE(copy.label_prompts_.size() == 1);
   REQUIRE(copy.label_matches_.size() == 1);
 }
@@ -185,13 +209,19 @@ TEST_CASE("SummarizerConfig - copy constructor copies all fields",
 TEST_CASE("SummarizerConfig - compose pool-id constructor copies config",
           "[summarizer][config][ctor]") {
   SummarizerConfig src;
-  src.LoadConfig(MakePoolConfig("label_endpoint: \"http://compose\"\n"));
+  src.LoadConfig(MakePoolConfig("label_endpoint: \"http://compose\"\n"
+                                "label_api: openai\n"
+                                "label_api_key_file: \"/kf\"\n"
+                                "label_api_key_env: KE\n"));
 
   // The pool_id argument is intentionally ignored by the ctor; it exists to
   // match the compressor compose pattern.
   clio::run::PoolId pid(42, 0);
   SummarizerConfig composed(pid, src);
   REQUIRE(composed.label_endpoint_ == "http://compose");
+  REQUIRE(composed.label_api_ == "openai");
+  REQUIRE(composed.label_api_key_file_ == "/kf");
+  REQUIRE(composed.label_api_key_env_ == "KE");
 }
 
 TEST_CASE("LabelMatch - serialize round-trips every field",
@@ -230,6 +260,9 @@ TEST_CASE("SummarizerConfig - serialize round-trips config", "[summarizer][confi
   in.LoadConfig(MakePoolConfig(
       "next_pool_id: \"700.2\"\n"
       "label_endpoint: \"http://ser\"\n"
+      "label_api: openai\n"
+      "label_api_key_file: \"/tok\"\n"
+      "label_api_key_env: TOK\n"
       "label_prompts:\n"
       "  k: \"V\"\n"
       "label_matches:\n"
@@ -255,6 +288,9 @@ TEST_CASE("SummarizerConfig - serialize round-trips config", "[summarizer][confi
   REQUIRE(out.next_pool_id_.major_ == 700);
   REQUIRE(out.next_pool_id_.minor_ == 2);
   REQUIRE(out.label_endpoint_ == "http://ser");
+  REQUIRE(out.label_api_ == "openai");
+  REQUIRE(out.label_api_key_file_ == "/tok");
+  REQUIRE(out.label_api_key_env_ == "TOK");
   REQUIRE(out.label_prompts_.size() == 1);
   REQUIRE(out.label_prompts_["k"] == "V");
   REQUIRE(out.label_matches_.size() == 1);
