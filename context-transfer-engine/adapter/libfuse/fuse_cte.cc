@@ -3190,6 +3190,13 @@ static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
            hp, berr);
       return berr;
     }
+    // The chimod now holds this size: drop the overlay, as RunPublish and
+    // the closer do. Kept, it outlived a truncate from ANOTHER node (whose
+    // clamp only touches its own overlay): this node's getattr kept
+    // reporting the pre-truncate size, and release() queued a close that
+    // re-pushed it to the chimod (xnode_fsx: size 3760749 != model 3759753
+    // right after a remote truncate).
+    HiwaterEraseIfCovered(hp, hiwater);
   }
   return 0;
 }
