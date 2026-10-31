@@ -53,7 +53,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <type_traits>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -195,10 +197,111 @@ inline OpStat::OpStat(const char *n) : name(n) {
 }
 
 /**
- * Read CLIO_FUSE_PROFILE and, if set, start the reporter thread.
- * Called once from the adapter's init callback.
+ * In-flight callback of one FUSE thread, read by the stuck-op watchdog.
+ * A callback that never returns otherwise leaves no trace: the profile only
+ * counts finished calls, and the runtime may never see the request (a
+ * post-restart tree walk hung 15+ min with nothing logged anywhere).
+ */
+struct InFlight {
+  std::atomic<const char *> name{nullptr};  ///< callback, null when idle
+  std::atomic<int64_t> t0_ms{0};            ///< steady-clock start (ms)
+  std::atomic<uint64_t> seq{0};             ///< bumped per call
+  char path[256] = {0};                     ///< first path argument
+  InFlight *next = nullptr;                 ///< registry link
+};
+inline std::atomic<InFlight *> g_inflight_head{nullptr};
+
+/** Steady-clock milliseconds. */
+inline int64_t NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+/** This thread's slot (registered once, never freed: FUSE threads are few). */
+inline InFlight *Slot() {
+  thread_local InFlight *slot = [] {
+    auto *s = new InFlight();
+    InFlight *head = g_inflight_head.load();
+    do {
+      s->next = head;
+    } while (!g_inflight_head.compare_exchange_weak(head, s));
+    return s;
+  }();
+  return slot;
+}
+
+/** Marks one callback in flight on this thread for its lifetime. */
+class InFlightScope {
+ public:
+  InFlightScope(const char *name, const char *path) : s_(Slot()) {
+    if (path != nullptr) {
+      std::snprintf(s_->path, sizeof(s_->path), "%s", path);
+    } else {
+      s_->path[0] = '\0';
+    }
+    s_->t0_ms.store(NowMs(), std::memory_order_relaxed);
+    s_->seq.fetch_add(1, std::memory_order_relaxed);
+    s_->name.store(name, std::memory_order_release);
+  }
+  ~InFlightScope() { s_->name.store(nullptr, std::memory_order_release); }
+  InFlightScope(const InFlightScope &) = delete;
+  InFlightScope &operator=(const InFlightScope &) = delete;
+
+ private:
+  InFlight *s_;
+};
+
+/**
+ * Watchdog: every 10 s, log each callback in flight for 30 s or more (once
+ * when it crosses 30 s, then every 120 s while it stays stuck).
+ * CLIO_FUSE_STUCK_S overrides the 30 s threshold; 0 disables the watchdog.
+ */
+inline void StartWatchdog() {
+  double stuck_s = 30.0;
+  if (const char *e = std::getenv("CLIO_FUSE_STUCK_S")) {
+    if (*e != '\0') stuck_s = std::atof(e);
+  }
+  if (stuck_s <= 0) return;
+  const int64_t stuck_ms = static_cast<int64_t>(stuck_s * 1000);
+  std::thread([stuck_ms]() {
+    std::vector<std::pair<InFlight *, std::pair<uint64_t, int64_t>>> logged;
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(10));
+      const int64_t now = NowMs();
+      for (InFlight *s = g_inflight_head.load(); s != nullptr; s = s->next) {
+        const char *name = s->name.load(std::memory_order_acquire);
+        if (name == nullptr) continue;
+        const uint64_t seq = s->seq.load(std::memory_order_relaxed);
+        const int64_t age = now - s->t0_ms.load(std::memory_order_relaxed);
+        if (age < stuck_ms) continue;
+        auto it = std::find_if(logged.begin(), logged.end(),
+                               [s](const auto &p) { return p.first == s; });
+        if (it != logged.end() && it->second.first == seq &&
+            now - it->second.second < 120000) {
+          continue;
+        }
+        char path[sizeof(s->path)];
+        std::memcpy(path, s->path, sizeof(path));
+        path[sizeof(path) - 1] = '\0';
+        HLOG(kWarning, "clio_cte_fuse: {} of '{}' in flight for {} s "
+             "(stuck-op watchdog)", name, path, age / 1000);
+        if (it == logged.end()) {
+          logged.push_back({s, {seq, now}});
+        } else {
+          it->second = {seq, now};
+        }
+      }
+    }
+  }).detach();
+}
+
+/**
+ * Start the stuck-op watchdog, then read CLIO_FUSE_PROFILE and, if set,
+ * start the reporter thread. Called once from the adapter's init callback.
  */
 inline void Start() {
+  StartWatchdog();
   const char *e = std::getenv("CLIO_FUSE_PROFILE");
   if (e == nullptr || *e == '\0') return;
   const double secs = std::max(1.0, std::atof(e));
@@ -228,8 +331,21 @@ struct Timed<R (*)(A...), Fn> {
   template <const char *Name>
   static R Call(A... a) {
     static OpStat stat(Name);
+    InFlightScope inflight(Name, FirstPath(a...));
     Scope s(stat);
     return Fn(a...);
+  }
+
+ private:
+  /** The first argument when it is a path (every path-taking callback). */
+  static const char *FirstPath() { return nullptr; }
+  template <typename T, typename... Rest>
+  static const char *FirstPath(T first, Rest...) {
+    if constexpr (std::is_same_v<T, const char *>) {
+      return first;
+    } else {
+      return nullptr;
+    }
   }
 };
 
