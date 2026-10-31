@@ -3190,6 +3190,13 @@ static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
            hp, berr);
       return berr;
     }
+    // The chimod now holds this size: drop the overlay, as RunPublish and
+    // the closer do. Kept, it outlived a truncate from ANOTHER node (whose
+    // clamp only touches its own overlay): this node's getattr kept
+    // reporting the pre-truncate size, and release() queued a close that
+    // re-pushed it to the chimod (xnode_fsx: size 3760749 != model 3759753
+    // right after a remote truncate).
+    HiwaterEraseIfCovered(hp, hiwater);
   }
   return 0;
 }
@@ -3546,7 +3553,17 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
         auto g = cte->AsyncGetBlobDefer(
             handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
             buf + done);
-        g.Wait();
+        // Waited in slices so a read whose completion never arrives is
+        // named in the log (an unbounded wait hung the dirs_crash_restart
+        // audit for 15+ min with nothing logged). It still waits for the
+        // completion: the runtime may yet write into buf.
+        for (int slice = 1; !g.Wait(30.0f); ++slice) {
+          HLOG(kWarning, "clio_cte_fuse: read of tag {}.{} page {} "
+               "(off {} len {}) still outstanding after {} s",
+               handle->tag.major_, handle->tag.minor_,
+               clio::cte::filesystem::PageName(cur), page_off, n,
+               slice * 30);
+        }
         grc = static_cast<int>(g->GetReturnCode());
         // Owner-down from a stand-in (#1280) can be as transient as
         // node-lost: the stand-in's liveness view lags the router's until it
