@@ -816,8 +816,13 @@ clio::run::TaskResume Runtime::PushToHolders(
       // so the restarted home's compose -- for ~128 s on a cluster-wide
       // crash restart (stress_crash_under_pressure). Past the lease the
       // holder must ask the home before using its copy, so it is gone.
+      // Backoff starts at 25 us: a flat 20 ms poll put a 20 ms floor under
+      // every commit (atime updates included), and a 28,800-file tree walk
+      // went from ~5 ms to ~30 ms a file (dirs_crash_restart timed out).
+      double poll_us = 25.0;
       while (!xf.second.IsComplete() && SteadyMs() < h.second) {
-        CLIO_CO_AWAIT(clio::run::yield(20000.0));
+        CLIO_CO_AWAIT(clio::run::yield(poll_us));
+        poll_us = std::min(poll_us * 2.0, 20000.0);
       }
       if (!xf.second.IsComplete()) {
         gone->push_back(h.first);
