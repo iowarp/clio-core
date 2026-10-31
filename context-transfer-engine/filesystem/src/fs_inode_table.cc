@@ -808,9 +808,24 @@ clio::run::TaskResume Runtime::PushToHolders(
       }
     }
     for (auto &xf : fs) {
+      const auto &h = todo[xf.first];
+      // Wait for the push only while the holder's lease lasts. A peer whose
+      // own filesystem pool is not composed yet (it restarted too, so it
+      // caches nothing) holds the push in its deferred queue for up to
+      // 120 s before dropping it; awaiting that blocked every commit -- and
+      // so the restarted home's compose -- for ~128 s on a cluster-wide
+      // crash restart (stress_crash_under_pressure). Past the lease the
+      // holder must ask the home before using its copy, so it is gone.
+      while (!xf.second.IsComplete() && SteadyMs() < h.second) {
+        CLIO_CO_AWAIT(clio::run::yield(20000.0));
+      }
+      if (!xf.second.IsComplete()) {
+        gone->push_back(h.first);
+        ParkPush(std::move(xf.second));
+        continue;
+      }
       CLIO_CO_AWAIT(xf.second);
       FsResp resp;
-      const auto &h = todo[xf.first];
       if (!ReadShardResp(xf.second, &resp)) {
         wait.push_back(h);  // unreachable: retry until it gets it or expires
       } else if (resp.rc_ == ENOENT) {
@@ -831,6 +846,19 @@ clio::run::TaskResume Runtime::PushToHolders(
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+void Runtime::ParkPush(clio::run::Future<ShardOpTask> &&f) {
+  // Keep an abandoned in-flight push alive until it settles, then drop it;
+  // never destroy a future whose task is still out on the network.
+  std::lock_guard<std::mutex> g(parked_mu_);
+  auto &v = parked_pushes_;
+  v.erase(std::remove_if(v.begin(), v.end(),
+                         [](const clio::run::Future<ShardOpTask> &p) {
+                           return p.IsComplete();
+                         }),
+          v.end());
+  v.push_back(std::move(f));
 }
 
 void Runtime::PushTargetsLocked(const TableBlockSlot &slot, bool resync,
