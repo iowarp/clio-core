@@ -31,9 +31,18 @@ GLOBAL_CROSS_CONST clio::run::u32 kGetBlobSize =
 GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob =
     clio::cte::core::Method::kMultiPutBlob;
 
-// No cache-specific methods beyond Create/Destroy/Monitor: the data verbs
-// are the core's, and asynchronous write-through needs no sweep. The id
-// space above the core's stays reserved for future module verbs.
+// The GPU pager's batched fetch, interposed for TAG-SCOPED caching.
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiGetBlob =
+    clio::cte::core::Method::kPodMultiGetBlob;
+
+// Tag metadata, write-through (see cache_runtime.cc): tag creation and
+// handler registration, and tag deletion, are interposed so every node's core
+// learns them before they return. Same ids and task structs as the core.
+GLOBAL_CROSS_CONST clio::run::u32 kGetOrCreateTag =
+    clio::cte::core::Method::kGetOrCreateTag;
+GLOBAL_CROSS_CONST clio::run::u32 kDelTag = clio::cte::core::Method::kDelTag;
+
+// No module-specific verbs: everything this module does rides the core's.
 GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 101;
 
 inline const std::vector<std::string>& GetMethodNames() {
@@ -46,6 +55,9 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[kGetBlob] = "GetBlob";
     v[kGetBlobSize] = "GetBlobSize";
     v[kMultiPutBlob] = "MultiPutBlob";
+    v[kPodMultiGetBlob] = "PodMultiGetBlob";
+    v[kGetOrCreateTag] = "GetOrCreateTag";
+    v[kDelTag] = "DelTag";
     return v;
   }();
   return names;

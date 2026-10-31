@@ -1629,6 +1629,8 @@ private:
    * @param blob_name Blob name
    * @return PoolQuery with DirectHash based on tag_id and blob_name
    */
+  /** True for a CAE ingest-on-fault tag: blob ops on it stay on this node. */
+  bool IsNodeLocalRefTag(const TagId &tag_id);
   clio::run::PoolQuery HashBlobToContainer(const TagId &tag_id,
                                      const std::string &blob_name);
 

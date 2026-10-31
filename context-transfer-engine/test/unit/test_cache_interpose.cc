@@ -361,4 +361,74 @@ TEST_CASE("CacheInterpose - async write-through cache over core",
   }
 }
 
+TEST_CASE("CacheInterpose - tag metadata cache is write-through",
+          "[cte][cache][tags]") {
+  CacheInterposeFixture fixture;
+  {
+    clio::cte::cache::Client cache(clio::cte::cache::kCachePoolId,
+                                   clio::cte::core::kCtePoolId);
+    clio::cte::cache::CacheConfig params;
+    params.next_pool_id_ = clio::cte::core::kCtePoolId;
+    auto create = cache.AsyncCreateCache(
+        clio::run::PoolQuery::Local(), clio::cte::cache::kCachePoolName,
+        clio::cte::cache::kCachePoolId, params);
+    create.Wait();
+    REQUIRE(create->GetReturnCode() == 0);
+  }
+  clio::cte::core::Client via_cache(clio::cte::cache::kCachePoolId);
+  clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+  using clio::cte::core::TagId;
+  auto lookup = [](clio::cte::core::Client &c, const std::string &n) {
+    auto f = c.AsyncGetOrCreateTag(n);
+    f.Wait();
+    REQUIRE(f->GetReturnCode() == 0);
+    return std::make_pair(f->tag_id_, f->created_);
+  };
+
+  // Create through the cache, then the lookup is a cache hit for the same id
+  // -- and the owner agrees.
+  auto [a, a_created] = lookup(via_cache, "tmeta_a");
+  REQUIRE(!a.IsNull());
+  REQUIRE(a_created == 1);
+  auto [a2, a2_created] = lookup(via_cache, "tmeta_a");
+  REQUIRE(a2 == a);
+  REQUIRE(a2_created == 0);
+  REQUIRE(lookup(core, "tmeta_a").first == a);
+
+  // A fault-handler registration is a WRITE: it goes to the owner and every
+  // node's cache before it returns; the id does not change.
+  {
+    auto f = via_cache.AsyncGetOrCreateTag(
+        "tmeta_a", clio::run::PoolId(4242, 0), "no_such_handler", "p");
+    f.Wait();
+    REQUIRE(f->GetReturnCode() == 0);
+    REQUIRE(f->tag_id_ == a);
+  }
+
+  // DELETE invalidates everywhere before returning: the next lookup must not
+  // be answered with the dead id.
+  {
+    auto d = via_cache.AsyncDelTag("tmeta_a");
+    d.Wait();
+    REQUIRE(d->GetReturnCode() == 0);
+  }
+  auto [a3, a3_created] = lookup(via_cache, "tmeta_a");
+  REQUIRE(a3_created == 1);
+  REQUIRE(!(a3 == a));
+
+  // RENAME drops the old name's entry on every node: the old name is now a
+  // different tag, and the new name resolves to the renamed one.
+  auto [b, b_created] = lookup(via_cache, "tmeta_b");
+  REQUIRE(b_created == 1);
+  {
+    auto r = via_cache.AsyncRenameTag("tmeta_b", "tmeta_c", b);
+    r.Wait();
+    REQUIRE(r->GetReturnCode() == 0);
+  }
+  REQUIRE(lookup(via_cache, "tmeta_c").first == b);
+  auto [b2, b2_created] = lookup(via_cache, "tmeta_b");
+  REQUIRE(b2_created == 1);
+  REQUIRE(!(b2 == b));
+}
+
 SIMPLE_TEST_MAIN()

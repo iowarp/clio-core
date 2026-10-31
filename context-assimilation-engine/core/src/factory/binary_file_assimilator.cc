@@ -40,6 +40,8 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <memory>
+#include <unordered_map>
 #include <vector>
 
 // Include clio_cte headers after closing any clio_cae namespace to avoid Method
@@ -183,7 +185,7 @@ clio::run::TaskResume BinaryFileAssimilator::Schedule(const AssimilationCtx& ctx
   HLOG(kDebug, "BinaryFileAssimilator: Description blob stored successfully");
 
   // Define chunking parameters
-  static constexpr size_t kMaxChunkSize = 1024 * 1024;  // 1 MB
+  const size_t kMaxChunkSize = static_cast<size_t>(BlobBytes(ctx));
   static constexpr size_t kMaxParallelTasks = 32;
 
   // Calculate number of chunks
@@ -275,7 +277,7 @@ clio::run::TaskResume BinaryFileAssimilator::Schedule(const AssimilationCtx& ctx
            chunk_idx, bytes_read);
 
       // Create blob name with chunk index
-      std::string blob_name = "chunk_" + std::to_string(chunk_idx);
+      std::string blob_name = ctx.blob_prefix + std::to_string(chunk_idx);
 
       HLOG(kDebug,
            "BinaryFileAssimilator: Submitting chunk {} (offset={}, size={}, "
@@ -348,6 +350,61 @@ clio::run::TaskResume BinaryFileAssimilator::Schedule(const AssimilationCtx& ctx
   error_code = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+clio::run::u64 BinaryFileAssimilator::BlobBytes(const AssimilationCtx& ctx) {
+  return ctx.chunk_size != 0 ? ctx.chunk_size : 1024ull * 1024;  // 1 MB
+}
+
+long long BinaryFileAssimilator::ReadBlob(const AssimilationCtx& ctx,
+                                          const std::string& blob_name,
+                                          char* dst, clio::run::u64 cap) {
+  // Blob "<prefix><i>" holds source bytes [range_off + i*chunk, +chunk) --
+  // the same split Schedule() stores.
+  const std::string& pre = ctx.blob_prefix;
+  if (blob_name.size() <= pre.size() ||
+      blob_name.compare(0, pre.size(), pre) != 0) {
+    return -22;  // EINVAL: not one of this source's blobs
+  }
+  clio::run::u64 idx = 0;
+  for (size_t i = pre.size(); i < blob_name.size(); ++i) {
+    const char c = blob_name[i];
+    if (c < '0' || c > '9') return -22;
+    idx = idx * 10 + static_cast<clio::run::u64>(c - '0');
+  }
+  const clio::run::u64 chunk = BlobBytes(ctx);
+  if (cap < chunk) return -22;
+  const std::string path = GetUrlPath(ctx.src);
+  // One open stream per (thread, file): faults on the same source reuse it
+  // (reopening per fault costs a metadata round trip on a parallel FS). The
+  // source therefore stays open for the runtime's lifetime -- on Windows that
+  // also means it cannot be deleted or replaced while the runtime runs.
+  thread_local std::unordered_map<std::string, std::unique_ptr<std::ifstream>>
+      streams;
+  auto& in = streams[path];
+  if (!in || !in->is_open()) {
+    in = std::make_unique<std::ifstream>(path, std::ios::binary);
+    if (!in->is_open()) {
+      streams.erase(path);
+      return -2;  // ENOENT
+    }
+  }
+  in->clear();
+  in->seekg(0, std::ios::end);
+  const clio::run::u64 file_size = static_cast<clio::run::u64>(in->tellg());
+  const clio::run::u64 base = ctx.range_off;
+  if (base > file_size) return -22;
+  const clio::run::u64 total =
+      ctx.range_size > 0 ? std::min<clio::run::u64>(ctx.range_size,
+                                                    file_size - base)
+                         : file_size - base;
+  const clio::run::u64 lo = idx * chunk;
+  if (lo >= total) return 0;  // past the source
+  const clio::run::u64 n = std::min<clio::run::u64>(chunk, total - lo);
+  in->seekg(static_cast<std::streamoff>(base + lo), std::ios::beg);
+  in->read(dst, static_cast<std::streamsize>(n));
+  if (static_cast<clio::run::u64>(in->gcount()) != n) return -5;  // EIO
+  return static_cast<long long>(n);
 }
 
 std::string BinaryFileAssimilator::GetUrlProtocol(const std::string& url) {
