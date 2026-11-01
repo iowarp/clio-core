@@ -274,18 +274,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Pin to macos-14 (Apple Silicon, macOS 14 Sonoma host). macos-latest
-          # is currently macos-15, where Homebrew bottles target macOS 15.0,
-          # which forces every bundled dylib's minimum target to 15.0 and
-          # makes the resulting wheel installable only on macOS 15+. macos-14
-          # bottles target macOS 14.0, giving the wheel ~2.5 years of OS
-          # compatibility (Sonoma, Sequoia, ...). The deployment target
-          # below has to match so delocate accepts the bundle.
-          - runner: macos-14
+          # macos-15 (Apple Silicon). macos-14 runner images are retired
+          # (brownouts from Oct 2026, removal Nov 2 2026). Homebrew bottles
+          # here target macOS 15.0, so every bundled dylib -- and therefore
+          # the wheel -- needs macOS 15+. The deployment target below has to
+          # match so delocate accepts the bundle.
+          - runner: macos-15
             arch: arm64
             cibw_build: "cp310-macosx_arm64 cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64 cp314-macosx_arm64"
             brew_prefix: /opt/homebrew
-            macosx_deployment_target: '14.0'
+            macosx_deployment_target: '15.0'
 
     steps:
     - name: Checkout repository
@@ -308,10 +306,9 @@ jobs:
         bash CI/retry.sh brew install cmake pkg-config \
           yaml-cpp cereal msgpack-c libsodium zeromq cppzmq openssl@3
 
-    # Poco for the runtime's web dashboard. Not from Homebrew: its poco
-    # bottle has a macOS 15.0 minimum even on this macos-14 runner, and
-    # delocate refuses to bundle it into a 14.0 wheel. Build it here for the
-    # wheel's target instead. Absolute install names let delocate find and
+    # Poco for the runtime's web dashboard, built here for the wheel's
+    # deployment target rather than taken from Homebrew, so its minimum
+    # macOS always matches what delocate accepts. Absolute install names let delocate find and
     # bundle the dylibs (only PocoNet + PocoFoundation are linked; the
     # NetSSL/Crypto libraries just satisfy find_package).
     - name: Build Poco for the wheel's macOS target
@@ -344,8 +341,8 @@ jobs:
         CIBW_BUILD: ${{ matrix.cibw_build }}
         # MACOSX_DEPLOYMENT_TARGET must match (or exceed) the minimum
         # macOS target of every dylib bundled by delocate. Homebrew
-        # bottles on the macos-14 runner are built for macOS 14.0, so
-        # the wheel's deployment target has to be at least 14.0 — set
+        # bottles on the macos-15 runner are built for macOS 15.0, so
+        # the wheel's deployment target has to be at least 15.0 — set
         # it for cibuildwheel (which propagates it into the build) AND
         # set it as an env var seen by the C++ compiler.
         MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
@@ -686,13 +683,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Same runner as the build so the wheel's macosx_14_0_arm64
+          # Same runner as the build so the wheel's macosx_15_0_arm64
           # platform tag is satisfied (the wheel is also installable on
-          # macos-15+, but pinning here keeps test infra deterministic).
-          - runner: macos-14
+          # later macOS, but pinning here keeps test infra deterministic).
+          - runner: macos-15
             arch: arm64
             python: '3.12'
-          - runner: macos-14
+          - runner: macos-15
             arch: arm64
             python: '3.14'
 
