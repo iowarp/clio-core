@@ -1812,7 +1812,13 @@ if(CLIO_CORE_ENABLE_ROCM)
     gpu/test_cte_devmem_putget.cc
   )
   target_compile_options(test_cte_devmem_putget PRIVATE
-    "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:--generate-code=arch=compute_89,code=sm_89>"
+    # No hardcoded --generate-code here: an sm_89-only cubin has no image for
+    # any other GPU (e.g. sm_120), so every kernel launch failed with
+    # cudaErrorSymbolNotFound and the test read back stale memory. The target's
+    # CMake emits neither CUDA_ARCHITECTURES nor CUDA_STANDARD flags for this
+    # target (flags.make had only "-g -fcoroutines"), so derive the arch
+    # list from the cache below and pass -std explicitly.
+    "$<$<COMPILE_LANGUAGE:CUDA>:-std=c++20>"
     # HIP_STANDARD 20 on the target does NOT reach the command line here (the
     # source gets its language from set_source_files_properties, and no -std
     # was emitted at all -- verified in compile_commands.json). Say it
@@ -1827,8 +1833,20 @@ if(CLIO_CORE_ENABLE_ROCM)
   # the ROCm build was clean. HIP_STANDARD is the property that actually
   # applies under HIP_PLATFORM=amd; the CUDA_* ones are kept (at 20) because
   # HIP_PLATFORM=nvidia really does route this through the CUDA language.
+  # Only reached for the HIP-NVCC path: the generator expression applies the
+  # flag to CUDA-language sources, which HIP_PLATFORM=amd never produces.
+  set(_devmem_archs "$CACHE{CMAKE_CUDA_ARCHITECTURES}")
+  foreach(_arch IN LISTS _devmem_archs)
+    string(REGEX REPLACE "-(real|virtual)$" "" _arch "${_arch}")
+    if(_arch MATCHES "^[0-9]+$")
+      target_compile_options(test_cte_devmem_putget PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:--generate-code=arch=compute_${_arch},code=sm_${_arch}>")
+    endif()
+  endforeach()
+  # CUDA_ARCHITECTURES is left to add_rocm_gpu_executable (as for
+  # test_gpu_kernel_stress); re-setting it from CMAKE_CUDA_ARCHITECTURES here
+  # cleared it, since that variable is empty in this scope.
   set_target_properties(test_cte_devmem_putget PROPERTIES
-    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_STANDARD 20
     CUDA_STANDARD_REQUIRED ON
     HIP_STANDARD 20

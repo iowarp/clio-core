@@ -148,6 +148,91 @@ jobs:
         path: installers/pip/wheelhouse/*.whl
 
   #------------------------------------------------------------
+  # GPU wheel variants (Linux x86_64, manylinux_2_28)
+  #
+  # Published as separate distributions that install the same iowarp_core
+  # package: iowarp-core-cuda12, iowarp-core-rocm6, iowarp-core-sycl. The
+  # variant's CMake defines (backend + fat architecture list) are in the
+  # CLIO_WHEEL_GPU overrides at the bottom of pyproject.toml;
+  # installers/pip/gpu_variant.py renames the distribution and adds its
+  # runtime dependency; install_gpu_toolchain.sh installs the compiler in
+  # the manylinux image. One job per (variant, Python): a fat GPU build is
+  # ~5x a CPU build, and five of them serially do not fit a job's time limit.
+  # The import test runs in the build container (no GPU), so it checks that
+  # the wheel loads, not that kernels run.
+  #------------------------------------------------------------
+  build-wheels-gpu:
+    name: GPU wheel (${{ matrix.variant }}, ${{ matrix.py }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cuda12, rocm6, sycl]
+        py: [cp310, cp311, cp312, cp313, cp314]
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /opt/hostedtoolcache/CodeQL
+        df -h /
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
+
+    - name: Select GPU variant
+      run: python3 installers/pip/gpu_variant.py ${{ matrix.variant }}
+
+    - name: Build wheel
+      env:
+        CIBW_BUILD: ${{ matrix.py }}-manylinux_x86_64
+        CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+        CIBW_BEFORE_ALL: >
+          yum install -y curl patchelf fuse3-devel openssl-devel &&
+          bash {project}/installers/pip/install_gpu_toolchain.sh ${{ matrix.variant }} &&
+          bash {project}/installers/pip/build_deps_manylinux.sh
+        # The icx/icpx and nvcc paths need oneAPI's environment and CUDA on
+        # PATH; harmless for the other variants.
+        CIBW_ENVIRONMENT: >-
+          CLIO_WHEEL_GPU=${{ matrix.variant }}
+          CMAKE_PREFIX_PATH=/usr/local
+          PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
+          CFLAGS=-march=x86-64
+          CXXFLAGS=-march=x86-64
+          PATH=/opt/intel/oneapi/compiler/latest/bin:/usr/local/cuda-12.9/bin:/opt/rocm/bin:$PATH
+          LD_LIBRARY_PATH=/opt/intel/oneapi/compiler/latest/lib:/opt/rocm/lib:$LD_LIBRARY_PATH
+        CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+          bash {project}/installers/pip/repair_wheel.sh {dest_dir} {wheel} manylinux_2_28
+        CIBW_TEST_COMMAND: >
+          python -c "import iowarp_core; print('Version:', iowarp_core.get_version())"
+      run: cibuildwheel --output-dir installers/pip/wheelhouse
+
+    - name: Verify wheel glibc requirements match the platform tag
+      run: python3 installers/pip/check_wheel_glibc.py installers/pip/wheelhouse/*.whl
+
+    - name: Report wheel size
+      # PyPI's default per-file limit is 100 MB; fat GPU binaries can exceed
+      # it, which needs a limit increase on the PyPI project before release.
+      run: ls -lh installers/pip/wheelhouse/
+
+    - name: Upload wheel
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-gpu-${{ matrix.variant }}-${{ matrix.py }}
+        path: installers/pip/wheelhouse/*.whl
+
+  #------------------------------------------------------------
   # Build Windows wheels via cibuildwheel
   #------------------------------------------------------------
   build-wheels-windows:
@@ -980,6 +1065,39 @@ jobs:
       uses: actions/download-artifact@v4
       with:
         name: wheels-macos-arm64
+        path: dist/
+
+    - name: List distributions
+      run: ls -lh dist/
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        skip-existing: true
+        verbose: true
+
+  #------------------------------------------------------------
+  # Publish GPU variants. Separate from publish-to-pypi so a GPU build
+  # failure cannot block the CPU release. Each distribution
+  # (iowarp-core-cuda12/-rocm6/-sycl) needs its own trusted-publisher entry
+  # on PyPI before this can succeed.
+  #------------------------------------------------------------
+  publish-gpu-to-pypi:
+    name: Publish GPU wheels to PyPI
+    needs: [check-version, build-wheels-gpu]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: pypi
+    permissions:
+      id-token: write
+    steps:
+    - name: Download GPU wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheels-gpu-*
+        merge-multiple: true
         path: dist/
 
     - name: List distributions

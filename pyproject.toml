@@ -122,3 +122,65 @@ cmake.define.CLIO_CTE_ENABLE_FUSE_ADAPTER = "ON"
 if.platform-system = "win32"
 inherit.cmake.define = "append"
 cmake.define.CLIO_CTE_ENABLE_FUSE_ADAPTER = "ON"
+
+# ---------------------------------------------------------------------------
+# GPU wheel variants. Selected by the CLIO_WHEEL_GPU environment variable at
+# build time (build-pip.yml sets it per matrix entry). Each variant is
+# published as its own distribution (iowarp-core-cuda12, iowarp-core-rocm6,
+# iowarp-core-sycl) that installs the same `iowarp_core` import package;
+# installers/pip/gpu_variant.py rewrites [project].name/dependencies, which
+# overrides cannot change. Unset = the CPU wheel, unchanged.
+#
+# Architecture lists are fat builds so one wheel runs on every current
+# laptop, desktop and datacenter part of that vendor (see the per-variant
+# comments). Built for Linux x86_64 (manylinux_2_28) only.
+# ---------------------------------------------------------------------------
+
+# CUDA 12.9 (the first 12.x with sm_100/sm_120).
+#   75  Turing: RTX 20, GTX 16, T4, laptop RTX 20
+#   80  A100, A30
+#   86  RTX 30 desktop/laptop, A-series workstation, A10/A40
+#   89  RTX 40 desktop/laptop, L4, L40S, RTX Ada
+#   90  H100, H200, GH200
+#   100 B200, GB200
+#   120 RTX 50 desktop/laptop, RTX PRO Blackwell  (+ PTX for newer GPUs)
+# libcudart.so.12 comes from the nvidia-cuda-runtime-cu12 pip dependency
+# (repair_wheel.sh points RPATH at it); the driver comes from the system.
+[[tool.scikit-build.overrides]]
+if.env.CLIO_WHEEL_GPU = "cuda12"
+inherit.cmake.define = "append"
+cmake.define.CLIO_CORE_ENABLE_CUDA = "ON"
+cmake.define.CMAKE_CUDA_ARCHITECTURES = "75-real;80-real;86-real;89-real;90-real;100-real;120"
+cmake.define.CMAKE_CUDA_COMPILER = "/usr/local/cuda-12.9/bin/nvcc"
+
+# ROCm 6.4, HIP on AMD. Needs a system ROCm 6.x runtime (libamdhip64.so.6);
+# RPATH includes /opt/rocm/lib.
+#   gfx90a   MI210/MI250/MI250X (Frontier)
+#   gfx942   MI300A/MI300X/MI325X (El Capitan)
+#   gfx1030  RX 6800/6900, Radeon PRO W6800
+#   gfx1100  RX 7900, Radeon PRO W7900/W7800
+#   gfx1101  RX 7800/7700, Radeon PRO W7700
+#   gfx1102  RX 7600, laptop RX 7000S/M
+#   gfx1151  Ryzen AI Max (Strix Halo) laptops/mini-PCs
+#   gfx1200  RX 9060
+#   gfx1201  RX 9070, Radeon AI PRO R9700
+[[tool.scikit-build.overrides]]
+if.env.CLIO_WHEEL_GPU = "rocm6"
+inherit.cmake.define = "append"
+cmake.define.CLIO_CORE_ENABLE_ROCM = "ON"
+cmake.define.CLIO_ROCM_HIP_PLATFORM = "amd"
+cmake.define.ROCM_ROOT = "/opt/rocm"
+cmake.define.CMAKE_HIP_ARCHITECTURES = "gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1200;gfx1201"
+
+# SYCL via oneAPI DPC++, spir64 (JIT). One SPIR-V image runs on every Intel
+# GPU with a Level Zero/OpenCL driver: Arc/Xe laptop iGPUs (Meteor/Lunar/
+# Arrow Lake), Arc A/B desktop, Data Center GPU Max (Aurora). AOT
+# (spir64_gen) accepts only one SYCL_DEVICE, so it would drop all but one of
+# these. libsycl comes from the intel-sycl-rt pip dependency.
+[[tool.scikit-build.overrides]]
+if.env.CLIO_WHEEL_GPU = "sycl"
+inherit.cmake.define = "append"
+cmake.define.CLIO_CORE_ENABLE_SYCL = "ON"
+cmake.define.SYCL_TARGET = "spir64"
+cmake.define.CMAKE_C_COMPILER = "icx"
+cmake.define.CMAKE_CXX_COMPILER = "icpx"

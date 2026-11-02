@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 2.3.2 LANGUAGES C CXX)
+project(iowarp-core VERSION 2.4.0 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # MSVC-like front end detection
@@ -1339,7 +1339,10 @@ if(CLIO_CORE_ENABLE_RPATH)
         # replaces the libraries this build just produced, and a freshly linked
         # test dies in Catch's post-link discovery with "undefined symbol"
         # (issue #836). DT_RPATH is searched before LD_LIBRARY_PATH.
-        add_link_options("LINKER:--disable-new-dtags")
+        # HOST_LINK only: CMake does not wrap LINKER: for the CUDA/HIP-NVCC
+        # device-link step, so nvcc forwarded a bare --disable-new-dtags to
+        # the host compiler ("cc1plus: unknown pass new-dtags").
+        add_link_options("$<HOST_LINK:LINKER:--disable-new-dtags>")
     endif()
 
     message(STATUS "RPATH: Using relative paths ($ORIGIN/../lib)")
