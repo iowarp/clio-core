@@ -171,6 +171,9 @@ cmake.define.CLIO_CORE_ENABLE_ROCM = "ON"
 cmake.define.CLIO_ROCM_HIP_PLATFORM = "amd"
 cmake.define.ROCM_ROOT = "/opt/rocm"
 cmake.define.CMAKE_HIP_ARCHITECTURES = "gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1200;gfx1201"
+# ROCm's clang does not search manylinux's gcc-toolset, so it failed CMake's
+# HIP compiler check with "ld.lld: unable to find library -lstdc++".
+cmake.define.CMAKE_HIP_FLAGS = "--gcc-toolchain=/opt/rh/gcc-toolset-14/root/usr"
 
 # SYCL via oneAPI DPC++, spir64 (JIT). One SPIR-V image runs on every Intel
 # GPU with a Level Zero/OpenCL driver: Arc/Xe laptop iGPUs (Meteor/Lunar/
