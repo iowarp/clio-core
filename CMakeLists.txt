@@ -2379,6 +2379,21 @@ foreach(_t clio_ctp_host clio_run_cxx)
     list(APPEND PIP_LIB_TARGETS ${_t})
   endif()
 endforeach()
+# GPU twins (CUDA/ROCm/SYCL builds, i.e. the GPU wheel variants). The host
+# libraries list them as NEEDED (libclio_run_cxx.so -> libclio_run_cxx_gpu.so
+# -> libclio_ctp_rocm_gpu.so), so leaving them out made the first GPU wheel
+# fail its import test with "libclio_run_cxx_gpu.so: cannot open shared
+# object file". Only shared libraries are installed; static/interface
+# targets are already linked in.
+foreach(_t clio_run_cxx_gpu clio_ctp_cuda clio_ctp_gpu_linker
+           clio_ctp_rocm_gpu clio_ctp_rocm_host)
+  if(TARGET ${_t})
+    get_target_property(_t_type ${_t} TYPE)
+    if(_t_type STREQUAL "SHARED_LIBRARY")
+      list(APPEND PIP_LIB_TARGETS ${_t})
+    endif()
+  endif()
+endforeach()
 if(TARGET clio_admin_client)
   list(APPEND PIP_LIB_TARGETS clio_admin_client clio_admin_runtime)
 endif()
