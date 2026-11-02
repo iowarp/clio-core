@@ -131,6 +131,10 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
             info = zipfile.ZipInfo(arc)
             st = os.stat(full)
             info.external_attr = (st.st_mode & 0xFFFF) << 16
+            # writestr(ZipInfo) uses the ZipInfo's own compress_type, which
+            # defaults to STORED (the archive's ZIP_DEFLATED is ignored), so
+            # every wheel shipped uncompressed: 26.8 MB instead of ~9.7 MB.
+            info.compress_type = zipfile.ZIP_DEFLATED
             with open(full, 'rb') as fh:
                 zf.writestr(info, fh.read())
 " "$WORK_DIR/unpack" "$REPACK_DIR/$WHEEL_NAME"
