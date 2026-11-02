@@ -475,6 +475,12 @@ if(CLIO_CORE_ENABLE_ROCM)
             list(APPEND CMAKE_INSTALL_RPATH "${ROCM_ROOT}/lib")
         endif()
         add_compile_definitions(__HIP_PLATFORM_AMD__=1)
+        # ROCm 6.2-6.x declare the CUDA-style warp-sync builtins this tree
+        # uses (__shfl_sync in atomic.h; __syncwarp is shimmed in macros.h)
+        # only behind this opt-in; ROCm 7 makes them default and ignores it.
+        # Without it the first AMD wheel build (ROCm 6.4) failed with
+        # "use of undeclared identifier '__shfl_sync'".
+        add_compile_definitions(HIP_ENABLE_WARP_SYNC_BUILTINS=1)
         # ...and link the HIP runtime everywhere, for exactly the reason the
         # SYCL block below says of libsycl: gpu_api.h's inline helpers call
         # hipPointerGetAttributes, hipMemcpy and friends, so ANY target that
