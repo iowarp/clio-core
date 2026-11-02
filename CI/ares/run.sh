@@ -24,6 +24,10 @@ SUITE_DIR="${REPO}/context-transfer-engine/test/integration/clio_fs_suite"
 
 BUILD="" SUITE="all" NODES=6 OUT="" BASELINE="" PARTITION="compute"
 TIME="24:00:00" THRESHOLD="0.20" WORKING_SET_MB=4096 EXCLUDE="" NODELIST="" REL_DISK_GB=13
+# Node screening before submit: idle nodes whose /mnt/nvme has less than
+# MIN_NVME_GB free, or whose /mnt/ssd or /mnt/hdd cannot be read (a dead
+# drive), are excluded automatically. 0 disables.
+MIN_NVME_GB=30
 while [ $# -gt 0 ]; do
   case "$1" in
     --build) BUILD="$2"; shift 2 ;;
@@ -38,6 +42,7 @@ while [ $# -gt 0 ]; do
     --exclude) EXCLUDE="$2"; shift 2 ;;
     --nodelist) NODELIST="$2"; shift 2 ;;
     --rel-disk-gb) REL_DISK_GB="$2"; shift 2 ;;
+    --min-nvme-gb) MIN_NVME_GB="$2"; shift 2 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -60,6 +65,26 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
   [ -n "${BASELINE}" ] && args+=(--baseline "${BASELINE}")
   # --exclude: nodes to keep out of the allocation, e.g. ones whose shared
   # NVMe is too full for the tiers (the suite's deploy preflight names them).
+  # Screen idle nodes (shared cluster: other users fill /mnt/nvme, and dead
+  # drives return EIO) so the allocation never lands on one the deploy
+  # preflight would reject -- that fails every leg of the run.
+  if [ "${MIN_NVME_GB}" -gt 0 ] && [ -z "${NODELIST}" ]; then
+    idle="$(sinfo -p "${PARTITION}" -h -t idle -o '%N')"
+    if [ -n "${idle}" ]; then
+      nidle="$(scontrol show hostnames "${idle}" | wc -l)"
+      unfit="$(timeout 240 srun -p "${PARTITION}" -w "${idle}" -N "${nidle}" -t 4 bash -c '
+          h=$(hostname -s)
+          nv=$(df -BG --output=avail /mnt/nvme 2>/dev/null | tail -1 | tr -dc 0-9)
+          for d in /mnt/ssd /mnt/hdd; do ls "$d" >/dev/null 2>&1 || { echo "$h $d unreadable"; exit; }; done
+          [ "${nv:-0}" -lt '"${MIN_NVME_GB}"' ] && echo "$h /mnt/nvme ${nv:-0} GB free"
+          true' 2>/dev/null)"
+      if [ -n "${unfit}" ]; then
+        echo "excluding unfit nodes:"; echo "${unfit}" | sed 's/^/  /'
+        bad="$(echo "${unfit}" | awk '{print $1}' | paste -sd,)"
+        EXCLUDE="${EXCLUDE:+${EXCLUDE},}${bad}"
+      fi
+    fi
+  fi
   xargs_=()
   [ -n "${EXCLUDE}" ] && xargs_=(--exclude "${EXCLUDE}")
   [ -n "${NODELIST}" ] && xargs_+=(-w "${NODELIST}")
@@ -114,9 +139,9 @@ tier_mix() {
 # byte plus rewrite garbage: with a 2 GB fast tier that filled a 13 GB disk
 # tier (ENOSPC, reliability6), with 1 GB it is ~7 GB of 14.
 LEGS_RELIABILITY=(
-  "posix_dist|persistent|posix,dist,dirs,apps|--disk-gb ${REL_DISK_GB}"
+  "posix_dist|persistent|posix,dist,dirs,apps,cache|--disk-gb ${REL_DISK_GB}"
   "node_faults|persistent|fault,repl|--disk-gb ${REL_DISK_GB}"
-  "stress_tiers|tiered|stress|--ram-mb 512 --fast-mb 1024 --disk-gb ${REL_DISK_GB} --probe-silence-s 30"
+  "stress_tiers|tiered|stress,cache|--ram-mb 512 --fast-mb 1024 --disk-gb ${REL_DISK_GB} --probe-silence-s 30"
   "safe_bdev|safe|safe|--ram-mb 512 --fast-mb 1024 --disk-gb ${REL_DISK_GB}"
 )
 # Tiering under different DRAM:NVMe:SSD:HDD fractions. Each mix runs the

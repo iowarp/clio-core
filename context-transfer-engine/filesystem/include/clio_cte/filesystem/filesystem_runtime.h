@@ -745,6 +745,10 @@ class Runtime : public clio::run::Container {
    * @param holders out: containers to push to
    * @param leases out: their lease ends (steady ms), parallel to holders
    */
+  /** Hold an abandoned, still in-flight push until it settles. */
+  void ParkPush(clio::run::Future<ShardOpTask> &&f);
+  std::mutex parked_mu_;
+  std::vector<clio::run::Future<ShardOpTask>> parked_pushes_;
   void PushTargetsLocked(const TableBlockSlot &slot, bool resync,
                          std::vector<clio::run::u32> *holders,
                          std::vector<clio::run::u64> *leases);

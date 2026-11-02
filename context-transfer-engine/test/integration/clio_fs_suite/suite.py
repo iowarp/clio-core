@@ -167,6 +167,7 @@ def load_tests():
   import tests_copy  # noqa: F401
   import tests_tier  # noqa: F401
   import tests_replcache  # noqa: F401
+  import tests_cache  # noqa: F401
 
 
 def slurm_hosts():
@@ -359,7 +360,8 @@ def main():
          len(hosts) >= t['min_nodes']]
   # Fault tests last: they deliberately break the deployment.
   order = {'posix': 0, 'dist': 1, 'dirs': 2, 'apps': 3, 'perf': 4,
-           'stress': 5, 'tier': 5, 'safe': 7, 'fault': 6, 'repl': 6}
+           'stress': 5, 'tier': 5, 'cache': 5, 'safe': 7, 'fault': 6,
+           'repl': 6}
   sel.sort(key=lambda t: order.get(t['group'], 9))
 
   bin_dir = snapshot_bins(os.path.abspath(args.bin),
