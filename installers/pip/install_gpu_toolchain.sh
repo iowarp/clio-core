@@ -17,6 +17,11 @@ case "$VARIANT" in
     dnf install -y cuda-nvcc-12-9 cuda-cudart-devel-12-9 cuda-driver-devel-12-9 \
       cuda-nvrtc-devel-12-9 cuda-cccl-12-9
     /usr/local/cuda-12.9/bin/nvcc --version | tail -1
+    # libclio_ctp_gpu_linker links -lcuda (the driver), which a build image
+    # has no driver for; link against CUDA's stub (LIBRARY_PATH in
+    # build-pip.yml). The wheel then needs the user's real libcuda.so.1. The
+    # .so.1 link lets the GPU-less import test load the wheel; never shipped.
+    ln -sf libcuda.so /usr/local/cuda-12.9/lib64/stubs/libcuda.so.1
     ;;
   rocm6)
     cat > /etc/yum.repos.d/rocm.repo <<'REPO'

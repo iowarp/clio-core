@@ -212,9 +212,13 @@ jobs:
           CXXFLAGS=-march=x86-64
           PATH=/opt/intel/oneapi/compiler/latest/bin:/usr/local/cuda-12.9/bin:/opt/rocm/bin:$PATH
           LD_LIBRARY_PATH=/opt/intel/oneapi/compiler/latest/lib:/opt/rocm/lib:$LD_LIBRARY_PATH
+          LIBRARY_PATH=/usr/local/cuda-12.9/lib64/stubs
         CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
           bash {project}/installers/pip/repair_wheel.sh {dest_dir} {wheel} manylinux_2_28
+        # The CUDA stubs dir supplies libcuda.so.1 for this GPU-less import
+        # test only (see install_gpu_toolchain.sh); absent for other variants.
         CIBW_TEST_COMMAND: >
+          LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64/stubs:$LD_LIBRARY_PATH
           python -c "import iowarp_core; print('Version:', iowarp_core.get_version())"
       run: cibuildwheel --output-dir installers/pip/wheelhouse
 
