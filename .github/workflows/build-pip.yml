@@ -1107,9 +1107,24 @@ jobs:
     - name: List distributions
       run: ls -lh dist/
 
-    - name: Publish to PyPI
+    # Trusted publishing first. A project that does not exist on PyPI yet
+    # can only be created by trusted publishing if an owner registered a
+    # "pending publisher" for it; until then fall back to the API token,
+    # which can create the project if it is account-scoped. The `id` lets the
+    # fallback run only when this step failed.
+    - name: Publish to PyPI (trusted publishing)
+      id: trusted
+      continue-on-error: true
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
+        skip-existing: true
+        verbose: true
+
+    - name: Publish to PyPI (API token fallback)
+      if: steps.trusted.outcome == 'failure'
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        password: ${{ secrets.PYPI_API_TOKEN }}
         skip-existing: true
         verbose: true
 
