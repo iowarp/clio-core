@@ -249,6 +249,18 @@
 
 #if CTP_IS_ROCM_COMPILER
 #include <hip/hip_runtime.h>
+// ROCm 6.x has no __syncwarp on AMD (HIP_ENABLE_WARP_SYNC_BUILTINS, set in
+// CMakeLists.txt, adds __shfl_sync and friends but not this), and
+// local_serialize.h calls it directly. A wavefront executes in lockstep, so a
+// wave barrier with release/acquire fences is the equivalent. ROCm 7 ships
+// its own, hence the version guard.
+#if defined(__HIP_PLATFORM_AMD__) && HIP_VERSION_MAJOR < 7
+__device__ inline void __syncwarp(unsigned long long = ~0ull) {
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+  __builtin_amdgcn_wave_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+#endif
 #elif CTP_ENABLE_ROCM
 // g++/clang++ host TUs with CTP_ENABLE_ROCM get the host-callable HIP
 // runtime API header (hipMalloc, hipMemcpy, hipIpcMemHandle_t, etc.)

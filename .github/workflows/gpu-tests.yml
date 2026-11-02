@@ -216,6 +216,77 @@ jobs:
   # CI has no GPU runner (see the disabled steps above), so this cannot RUN
   # them. It parses every one of them, which is the same bargain the
   # distributed_md step already makes and catches the same class of mistake.
+  # ROCm (HIP) compile-only build. No AMD runner exists, so this builds the
+  # ROCm code through HIP-NVCC (HIP_PLATFORM=nvidia): the same CTP_ENABLE_ROCM
+  # sources, HIP API and add_rocm_* CMake paths as an AMD build, compiled by
+  # nvcc. Before this job nothing in CI built CLIO_CORE_ENABLE_ROCM at all,
+  # and three breaks landed on dev unseen: the gpu2cpu device ring was
+  # CUDA-only, the devmem test hardcoded sm_89, and LINKER:--disable-new-dtags
+  # reached nvcc's device-link step ("cc1plus: unknown pass new-dtags").
+  # Runs in deps-cpu (8.6 GB) plus CUDA 12.9 + hip-dev rather than
+  # deps-nvidia (35.7 GB, larger than the runner's free disk). CUDA 12.9, not
+  # 13: ROCm 6.4's nvidia_hip_runtime_api.h does not compile against CUDA 13
+  # (cudaGraphAddNode signature change).
+  build-rocm-nvidia:
+    name: Build ROCm via HIP-NVCC (compile only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        submodules: recursive
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /opt/hostedtoolcache/CodeQL
+        df -h /
+
+    - name: Compile ROCm GPU targets (inside deps-cpu)
+      run: |
+        docker run --rm -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
+          -e HIP_PLATFORM=nvidia -e CUDA_PATH=/usr/local/cuda-12.9 \
+          iowarp/deps-cpu:latest bash -c '
+            set -eux
+            git config --global --add safe.directory "*"
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends wget curl gpg ca-certificates
+            # CUDA 12.9 toolkit (same repo/version as deps-nvidia.Dockerfile).
+            wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+            dpkg -i cuda-keyring_1.1-1_all.deb
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends cuda-toolkit-12-9
+            # HIP-NVCC, exactly as deps-nvidia.Dockerfile installs it: hip-dev
+            # is force-extracted so the AMD hipcc does not replace hipcc-nvidia.
+            # Nothing may apt-get install after this (apt is left with
+            # deliberately unmet deps).
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+            echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.4 noble main" > /etc/apt/sources.list.d/rocm.list
+            printf "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n" > /etc/apt/preferences.d/rocm-pin-600
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends hipcc-nvidia hip-runtime-nvidia
+            apt-get download hip-dev
+            dpkg -i --force-overwrite --force-depends hip-dev_*.deb
+            rm -f hip-dev_*.deb cuda-keyring_*.deb
+            export PATH=/usr/local/cuda-12.9/bin:/opt/rocm/bin:$PATH
+            export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}
+            hipconfig --platform
+            # rocm-debug defaults CMAKE_CUDA_ARCHITECTURES=native, which has
+            # no device to detect here; 120 matches what this was validated on.
+            cmake --preset rocm-debug -B build-rocm \
+              -DCMAKE_CUDA_ARCHITECTURES=120 \
+              -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc \
+              -DCUDAToolkit_ROOT=/usr/local/cuda-12.9
+            # The two ROCm GPU tests: together they build clio_run_cxx_gpu
+            # (gpu2cpu_init_hip.cc) and the CTE runtime, and exercise the
+            # nvcc device-link step.
+            cmake --build build-rocm -j"$(nproc)" \
+              --target test_gpu_kernel_stress test_cte_devmem_putget
+          '
+
   validate-gpu-vector-harnesses:
     name: gpu_vector docker harnesses parse
     runs-on: ubuntu-24.04

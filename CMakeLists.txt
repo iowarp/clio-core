@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 2.3.2 LANGUAGES C CXX)
+project(iowarp-core VERSION 2.4.0 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # MSVC-like front end detection
@@ -475,6 +475,12 @@ if(CLIO_CORE_ENABLE_ROCM)
             list(APPEND CMAKE_INSTALL_RPATH "${ROCM_ROOT}/lib")
         endif()
         add_compile_definitions(__HIP_PLATFORM_AMD__=1)
+        # ROCm 6.2-6.x declare the CUDA-style warp-sync builtins this tree
+        # uses (__shfl_sync in atomic.h; __syncwarp is shimmed in macros.h)
+        # only behind this opt-in; ROCm 7 makes them default and ignores it.
+        # Without it the first AMD wheel build (ROCm 6.4) failed with
+        # "use of undeclared identifier '__shfl_sync'".
+        add_compile_definitions(HIP_ENABLE_WARP_SYNC_BUILTINS=1)
         # ...and link the HIP runtime everywhere, for exactly the reason the
         # SYCL block below says of libsycl: gpu_api.h's inline helpers call
         # hipPointerGetAttributes, hipMemcpy and friends, so ANY target that
@@ -1339,7 +1345,10 @@ if(CLIO_CORE_ENABLE_RPATH)
         # replaces the libraries this build just produced, and a freshly linked
         # test dies in Catch's post-link discovery with "undefined symbol"
         # (issue #836). DT_RPATH is searched before LD_LIBRARY_PATH.
-        add_link_options("LINKER:--disable-new-dtags")
+        # HOST_LINK only: CMake does not wrap LINKER: for the CUDA/HIP-NVCC
+        # device-link step, so nvcc forwarded a bare --disable-new-dtags to
+        # the host compiler ("cc1plus: unknown pass new-dtags").
+        add_link_options("$<HOST_LINK:LINKER:--disable-new-dtags>")
     endif()
 
     message(STATUS "RPATH: Using relative paths ($ORIGIN/../lib)")
@@ -2368,6 +2377,21 @@ set(PIP_LIB_TARGETS)
 foreach(_t clio_ctp_host clio_run_cxx)
   if(TARGET ${_t})
     list(APPEND PIP_LIB_TARGETS ${_t})
+  endif()
+endforeach()
+# GPU twins (CUDA/ROCm/SYCL builds, i.e. the GPU wheel variants). The host
+# libraries list them as NEEDED (libclio_run_cxx.so -> libclio_run_cxx_gpu.so
+# -> libclio_ctp_rocm_gpu.so), so leaving them out made the first GPU wheel
+# fail its import test with "libclio_run_cxx_gpu.so: cannot open shared
+# object file". Only shared libraries are installed; static/interface
+# targets are already linked in.
+foreach(_t clio_run_cxx_gpu clio_ctp_cuda clio_ctp_gpu_linker
+           clio_ctp_rocm_gpu clio_ctp_rocm_host)
+  if(TARGET ${_t})
+    get_target_property(_t_type ${_t} TYPE)
+    if(_t_type STREQUAL "SHARED_LIBRARY")
+      list(APPEND PIP_LIB_TARGETS ${_t})
+    endif()
   endif()
 endforeach()
 if(TARGET clio_admin_client)
