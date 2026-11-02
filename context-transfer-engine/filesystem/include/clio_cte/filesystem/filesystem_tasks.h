@@ -72,7 +72,7 @@ struct FilesystemConfig {
   clio::run::PoolId next_pool_id_;  ///< CTE core pool id (e.g. 512.0)
   /**
    * Node-local file persisting this container's slice of the namespace
-   * (directory entries/attributes and the inodes it is home for). Empty =
+   * (its inode-table blocks and the inodes it is home for). Empty =
    * the namespace is volatile (lost on restart). "~" and $VARS expand; the
    * container id is appended so co-located containers never share a file.
    */
@@ -89,22 +89,32 @@ struct FilesystemConfig {
    * large one spreads over the cluster in blocks of about this many entries.
    */
   clio::run::u32 dir_split_entries_;
+  /**
+   * Compare names case-insensitively, as NTFS does (YAML `case_insensitive`,
+   * default false). Names keep the spelling they were created with. Fixed
+   * when the volume is created: a volume opened with the other setting is
+   * refused.
+   */
+  bool case_insensitive_;
 
   FilesystemConfig()
       : next_pool_id_(clio::run::PoolId::GetNull()),
         stream_pool_id_(565, 0),
-        dir_split_entries_(1024) {}
+        dir_split_entries_(1024),
+        case_insensitive_(false) {}
   FilesystemConfig(const clio::run::PoolId &pool_id, const FilesystemConfig &other)
       : next_pool_id_(other.next_pool_id_),
         metadata_log_path_(other.metadata_log_path_),
         stream_pool_id_(other.stream_pool_id_),
-        dir_split_entries_(other.dir_split_entries_) {
+        dir_split_entries_(other.dir_split_entries_),
+        case_insensitive_(other.case_insensitive_) {
     (void)pool_id;
   }
 
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(next_pool_id_, metadata_log_path_, stream_pool_id_, dir_split_entries_);
+    ar(next_pool_id_, metadata_log_path_, stream_pool_id_, dir_split_entries_,
+       case_insensitive_);
   }
 
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
@@ -131,6 +141,9 @@ struct FilesystemConfig {
       }
       if (node["dir_split_entries"]) {
         dir_split_entries_ = node["dir_split_entries"].as<clio::run::u32>();
+      }
+      if (node["case_insensitive"]) {
+        case_insensitive_ = node["case_insensitive"].as<bool>();
       }
     } catch (...) {
       // best-effort
@@ -228,6 +241,10 @@ struct MultiCreateEnt {
   std::string path_;
   clio::run::u64 tag_packed_ = 0;
   clio::run::u32 mode_ = 0644;
+  /** Wall time (ns) the client created the file, its initial times; 0 = when
+   *  the batch lands. The batch lands after the client already reported
+   *  this time (and the file's writes) to stat callers. */
+  clio::run::u64 ctime_ns_ = 0;
 };
 
 inline std::string EncodeMultiCreate(const std::vector<MultiCreateEnt> &ents) {
@@ -244,6 +261,7 @@ inline std::string EncodeMultiCreate(const std::vector<MultiCreateEnt> &ents) {
     out.append(e.path_);
     put64(e.tag_packed_);
     put32(e.mode_);
+    put64(e.ctime_ns_);
   }
   return out;
 }
@@ -273,7 +291,10 @@ inline bool DecodeMultiCreate(const char *data, size_t len,
     if (!get32(&plen) || off + plen > len) return false;
     e.path_.assign(data + off, plen);
     off += plen;
-    if (!get64(&e.tag_packed_) || !get32(&e.mode_)) return false;
+    if (!get64(&e.tag_packed_) || !get32(&e.mode_) ||
+        !get64(&e.ctime_ns_)) {
+      return false;
+    }
     out->push_back(std::move(e));
   }
   return true;
@@ -331,27 +352,35 @@ struct AdvanceSizeTask : public clio::run::Task {
    * have appended since); the reservation is linearized at the home.
    */
   IN clio::run::u32 reserve_;
+  /**
+   * Raise mode: wall time (ns) of the last write the size covers, which
+   * becomes the file's mtime; 0 = the time this lands. The push trails the
+   * write (it is sent at or after close), so stamping its arrival moved the
+   * mtime a client had already reported, and git re-hashed every file.
+   */
+  IN clio::run::u64 mtime_ns_;
   OUT clio::run::u64 old_size_;
   AdvanceSizeTask()
       : clio::run::Task(), tag_packed_(0), size_(0), reserve_(0),
-        old_size_(0) {}
+        mtime_ns_(0), old_size_(0) {}
   explicit AdvanceSizeTask(const clio::run::TaskId &task_id,
                            const clio::run::PoolId &pool_id,
                            const clio::run::PoolQuery &pool_query,
                            clio::run::u64 tag_packed, clio::run::u64 size,
-                           clio::run::u32 reserve = 0)
+                           clio::run::u32 reserve = 0,
+                           clio::run::u64 mtime_ns = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kAdvanceSize),
         tag_packed_(tag_packed), size_(size), reserve_(reserve),
-        old_size_(0) {}
+        mtime_ns_(mtime_ns), old_size_(0) {}
   void Copy(const ctp::ipc::FullPtr<AdvanceSizeTask> &o) {
     // Base fields first (pool id, method, query, flags): a forwarded copy
     // without them reached SendIn with a null pool and crashed the node.
     clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     tag_packed_ = o->tag_packed_; size_ = o->size_; reserve_ = o->reserve_;
-    old_size_ = o->old_size_;
+    mtime_ns_ = o->mtime_ns_; old_size_ = o->old_size_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(tag_packed_, size_, reserve_);
+    Task::SerializeIn(ar); ar(tag_packed_, size_, reserve_, mtime_ns_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
     Task::SerializeOut(ar); ar(old_size_);
@@ -359,7 +388,7 @@ struct AdvanceSizeTask : public clio::run::Task {
 };
 
 /**
- * SyncMeta: fsync the namespace log (directory entries, directory state,
+ * SyncMeta: fsync the namespace log (inode-table blocks,
  * orphan inodes) so creates, renames and unlinks survive power loss.
  * Broadcast: every container fsyncs the log of the namespace shard it owns.
  */
@@ -458,20 +487,24 @@ struct GetattrTask : public clio::run::Task {
   OUT clio::run::u32 uid_;  // chown'd owner uid; 0xFFFFFFFF = defer to default
   OUT clio::run::u32 gid_;  // chown'd owner gid; 0xFFFFFFFF = defer to default
   OUT clio::run::u32 mode_;  // chmod'd/created mode bits; 0xFFFFFFFF = default
-  // POSIX link count (canonical name + hard-link aliases), computed
-  // server-side so getattr costs ONE round trip — the adapter previously
-  // issued a separate alias query per regular-file stat.
+  // POSIX link count (the inode's rows; 2 for a directory), computed
+  // server-side so getattr costs ONE round trip.
   OUT clio::run::u32 nlink_;
+  // The volume's flags (kVolume* in fs_inode.h); reported for "/" only, so a
+  // client learns the volume's case policy from the volume itself.
+  OUT clio::run::u32 volume_flags_;
   GetattrTask()
       : clio::run::Task(), path_(CTP_MALLOC), exists_(0), is_dir_(0), size_(0),
         ino_(0), ctime_(0), mtime_(0), atime_(0), is_symlink_(0),
-        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu), nlink_(1) {}
+        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu), nlink_(1),
+        volume_flags_(0) {}
   explicit GetattrTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                        const clio::run::PoolQuery &pool_query, const std::string &path)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetattr),
         path_(CTP_MALLOC, path), exists_(0), is_dir_(0), size_(0), ino_(0),
         ctime_(0), mtime_(0), atime_(0), is_symlink_(0),
-        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu), nlink_(1) {}
+        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu), nlink_(1),
+        volume_flags_(0) {}
   void Copy(const ctp::ipc::FullPtr<GetattrTask>& o) {
     // Base fields first (pool id, method, query, flags): a forwarded copy
     // without them reached SendIn with a null pool and crashed the node.
@@ -480,6 +513,7 @@ struct GetattrTask : public clio::run::Task {
     size_ = o->size_; ino_ = o->ino_; ctime_ = o->ctime_;
     mtime_ = o->mtime_; atime_ = o->atime_; is_symlink_ = o->is_symlink_;
     uid_ = o->uid_; gid_ = o->gid_; mode_ = o->mode_; nlink_ = o->nlink_;
+    volume_flags_ = o->volume_flags_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_);
@@ -487,7 +521,7 @@ struct GetattrTask : public clio::run::Task {
   template <typename Ar> void SerializeOut(Ar &ar) {
     Task::SerializeOut(ar);
     ar(exists_, is_dir_, size_, ino_, ctime_, mtime_, atime_, is_symlink_,
-       uid_, gid_, mode_, nlink_);
+       uid_, gid_, mode_, nlink_, volume_flags_);
   }
 };
 

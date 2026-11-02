@@ -32,15 +32,21 @@
  */
 
 /**
- * Append-only log of one filesystem container's metadata shard.
+ * Append-only log of one filesystem container's metadata: the directory
+ * journal (see fs_table_journal.cc).
  *
- * Each container owns a hash-chosen slice of the namespace (see fs_shard.h)
- * and persists exactly that slice here, on its own node: directory
- * listings/attributes and the inodes it is home for. Every mutation appends
- * one self-checking record with a single write(2), so a daemon crash (kill
- * -9) loses nothing that returned to the caller. At startup the log is
+ * The container is home for a hash-chosen set of inode-table blocks
+ * (fs_inode_table.h). It holds them in memory and makes every change durable
+ * here, on its own node, as the delta it already pushes to the nodes caching
+ * the block -- a few bytes per row instead of a rewrite of the whole block.
+ * Each record is self-checking and written with a single write(2), so a
+ * daemon crash (kill -9) loses nothing that returned to the caller; fsync
+ * (SyncMeta, and a periodic tick) covers power loss. At startup the log is
  * replayed, a torn tail is cut off, and the live state is rewritten as a
  * compact snapshot.
+ *
+ * Node-local: a node that never comes back takes its blocks with it
+ * (issue #1263).
  *
  * Record: [u32 magic][u32 len][u8 type][payload(len)][u32 fnv1a(type+payload)]
  */
@@ -68,6 +74,11 @@ enum class FsLogRec : clio::run::u32 {
   kInodePut = 6,  /**< inode created / changed (full record) */
   kInodeDel = 7,  /**< inode destroyed */
   kNextId = 8,    /**< id-mint reservation high-water mark */
+  // Types 1-8 belong to the retired per-container namespace log
+  // (cab47ad1f); they are never written now and are skipped on replay.
+  kBlockImage = 9,    /**< a directory block's whole durable image */
+  kBlockDeltas = 10,  /**< EncodeDirDeltas of a block's committed changes */
+  kBlockDrop = 11,    /**< a directory block was deleted (rmdir) */
 };
 
 /** One container's append-only metadata log (a typed RecordLog). */
@@ -98,10 +109,14 @@ class FsMetaLog {
    * Append one record. No-op when not open.
    * @param type record type
    * @param payload encoded record body
+   * @return false when the write failed (errno set, e.g. ENOSPC)
    */
-  void Append(FsLogRec type, const std::string &payload) {
-    log_.Append(static_cast<clio::run::u32>(type), payload);
+  bool Append(FsLogRec type, const std::string &payload) {
+    return log_.Append(static_cast<clio::run::u32>(type), payload);
   }
+
+  /** @return true when records were appended since the last fsync. */
+  bool Unsynced() { return log_.Unsynced(); }
 
   /**
    * fsync the namespace log (see RecordLog::Sync).

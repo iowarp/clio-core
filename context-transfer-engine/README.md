@@ -23,6 +23,9 @@ CTE provides:
 - **Async-first API** returning a `Future`, so multiple operations can be
   pipelined before the first `Wait()`.
 
+Python clients can also use the existing owner-atomic create-if-absent and
+version-checked writes; see [conditional writes and coordination boundaries](wrapper/python/CONDITIONAL_WRITES.md).
+
 ## Building
 
 CTE is built as part of CLIO Core; it is enabled by default

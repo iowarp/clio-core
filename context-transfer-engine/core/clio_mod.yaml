@@ -66,3 +66,4 @@ kReorganizeHint: 54     # Set the organizer phase hint (organizer_hint_) for the
 kUpdateTagNames: 55     # Batched broadcast tag-name add/remove/rename (filesystem namespace mirror)
 kSyncTag: 56            # fsync for one tag: blobs to a persistent tier, sync devices + WAL (broadcast)
 kListLocalBlobs: 57     # list blobs (tag id + name) matching a name pattern on the queried containers
+kTagXattr: 58           # set / get / delete / list one key of a tag's xattr section

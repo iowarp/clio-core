@@ -141,7 +141,7 @@ The CTE Core library is properly linkable and functional.
 
 ## CMake Integration Pattern
 
-The `CMakeLists.txt` in this directory demonstrates the **proper MODULE_DEVELOPMENT_GUIDE.md patterns** for external applications to link with CTE Core ChiMods:
+The `CMakeLists.txt` in this directory demonstrates the **proper module development guide patterns** ([guide](../../../../docs/docs/sdk/context-runtime/2.module_dev_guide.md)) for external applications to link with CTE Core ChiMods:
 
 ### Key Patterns (Updated to Follow Guide):
 

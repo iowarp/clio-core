@@ -143,6 +143,12 @@ struct ReplicaProgress {
   // finished. The replica is declared lost only after kGoneStrikesToFail
   // answers, an interval apart.
   clio::run::u32 gone_strikes = 0;
+  // When this replica was dispatched. The dead-node scan times a replica out
+  // from the later of this and its node's death: measured from the death
+  // alone, every liveness re-probe sent to a long-dead node was failed on
+  // the next scan, before its answer could arrive -- a node held dead could
+  // never rejoin once revival needed an answered probe (dead-node-rejoin).
+  std::chrono::steady_clock::time_point sent_at{};
 };
 
 /** Gone answers, one probe interval apart, before a replica is declared lost. */
@@ -350,8 +356,24 @@ class IpcManagerRun2Run {
   bool HasRecvTask(clio::run::u64 net_key, clio::run::u32 replica_id) const {
     size_t recv_key = static_cast<size_t>(net_key) ^
                       (static_cast<size_t>(replica_id) * 0x9e3779b97f4a7c15ULL);
-    std::lock_guard<std::mutex> lk(recv_map_mutex_);
-    return recv_map_.find(recv_key) != nullptr;
+    {
+      std::lock_guard<std::mutex> lk(recv_map_mutex_);
+      if (recv_map_.find(recv_key) != nullptr) return true;
+    }
+    // A task held in deferred_recv_ (its pool is not composed / still in
+    // Create here) is alive too: it has not entered recv_map_ yet. Answering
+    // Gone for it let the origin fail a healthy put after two probes when
+    // pool creation outlasted the probe interval (12-node startup).
+    std::lock_guard<std::mutex> lk(deferred_recv_mutex_);
+    for (const auto &d : deferred_recv_) {
+      for (const auto &ti : d.archive.GetTaskInfos()) {
+        if (static_cast<clio::run::u64>(ti.task_id_.net_key_) == net_key &&
+            ti.task_id_.replica_id_ == replica_id) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   // ---------------------------------------------------------------------------
@@ -644,7 +666,7 @@ class IpcManagerRun2Run {
   /** True when every task in the archive has its container on this node. */
   static bool AllContainersPresent(clio::run::PoolManager *pool_manager,
                                    const clio::run::LoadTaskArchive &archive);
-  std::mutex deferred_recv_mutex_;
+  mutable std::mutex deferred_recv_mutex_;  // mutable: HasRecvTask is const
   std::list<DeferredRecv> deferred_recv_;  // list: erase never moves an archive
 
   /** A client request held until its pool exists (see DeferClientRecv). */

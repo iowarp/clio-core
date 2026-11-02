@@ -87,8 +87,10 @@ class RecordLog {
    * Append one record with a single write(2). No-op when not open.
    * @param type record type (low 8 bits are stored)
    * @param payload encoded record body
+   * @return false when the write failed (errno says why: ENOSPC on a full
+   *         device); true when it landed or the log is not open
    */
-  void Append(clio::run::u32 type, const std::string &payload);
+  bool Append(clio::run::u32 type, const std::string &payload);
 
   /**
    * fsync the log so every appended record survives power loss (Append

@@ -210,6 +210,67 @@ int main() {
     std::printf("[vfd-no-runtime] ok: raw/meta classification\n");
   }
 
+  // The durability barrier is opt-in for close as well as flush. Without it the
+  // driver must not fsync -- that was ~4 ms per file and made file-per-step
+  // output 8-24x slower than sec2 -- and with it both callbacks must. The bytes
+  // a reader sees are the same either way, so the fsync counter is the only
+  // witness.
+  {
+    const char *path = "/tmp/clio_cte_vfd_nort_fsync.h5";
+    const std::vector<double> w = MakeF64(256);
+    // Write session: create, write, explicit flush, close. Reports the fsyncs
+    // issued by the flush and by the close separately.
+    auto session = [&](hid_t fapl, unsigned long *at_flush,
+                       unsigned long *at_close) -> bool {
+      std::remove(path);
+      const unsigned long f0 = H5FDclio_fsyncs_g;
+      hid_t f = H5Fcreate(path, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+      if (f < 0 || !WriteDset(f, "d", w)) return false;
+      if (H5Fflush(f, H5F_SCOPE_GLOBAL) < 0) return false;
+      const unsigned long f1 = H5FDclio_fsyncs_g;
+      if (H5Fclose(f) < 0) return false;
+      *at_flush = f1 - f0;
+      *at_close = H5FDclio_fsyncs_g - f1;
+      return true;
+    };
+    unsigned long at_flush = 0, at_close = 0;
+
+    hid_t plain = H5Pcreate(H5P_FILE_ACCESS);
+    CHECK(plain >= 0 && H5Pset_fapl_clio(plain, 0) >= 0, "fsync: default fapl");
+    CHECK(session(plain, &at_flush, &at_close), "fsync: default session");
+    CHECK(at_flush == 0, "fsync: flush does not fsync by default");
+    CHECK(at_close == 0, "fsync: close does not fsync by default");
+
+    hid_t barrier = H5Pcreate(H5P_FILE_ACCESS);
+    CHECK(barrier >= 0 &&
+              H5Pset_driver_by_name(barrier, "clio_vfd", "cache=0;fsync=1") >= 0,
+          "fsync: fsync=1 fapl");
+    CHECK(session(barrier, &at_flush, &at_close), "fsync: fsync=1 session");
+    CHECK(at_flush >= 1, "fsync: fsync=1 makes flush fsync");
+    CHECK(at_close >= 1, "fsync: fsync=1 makes close fsync");
+
+    // A read-only open has nothing to persist and must never fsync, barrier
+    // or not (on Windows the equivalent call fails on a read-only handle).
+    const unsigned long r0 = H5FDclio_fsyncs_g;
+    hid_t rf = H5Fopen(path, H5F_ACC_RDONLY, barrier);
+    CHECK(rf >= 0 && ReadDsetEq(rf, "d", w), "fsync: read back under fsync=1");
+    CHECK(H5Fclose(rf) >= 0, "fsync: close read-only");
+    CHECK(H5FDclio_fsyncs_g == r0, "fsync: a read-only open never fsyncs");
+
+    // The environment can switch the barrier on for a FAPL that left it off.
+    TestSetenv("CLIO_VFD_FSYNC", "1", /*overwrite*/ 1);
+    const bool env_ok = session(plain, &at_flush, &at_close);
+    TestSetenv("CLIO_VFD_FSYNC", "0", /*overwrite*/ 1);
+    CHECK(env_ok, "fsync: CLIO_VFD_FSYNC=1 session");
+    CHECK(at_close >= 1, "fsync: CLIO_VFD_FSYNC=1 makes close fsync");
+
+    H5Pclose(plain);
+    H5Pclose(barrier);
+    std::remove(path);
+    std::printf("[vfd-no-runtime] ok: the fsync barrier is opt-in for flush "
+                "and close\n");
+  }
+
   std::printf("[vfd-no-runtime] PASS: the driver is complete without CLIO\n");
   return 0;
 }

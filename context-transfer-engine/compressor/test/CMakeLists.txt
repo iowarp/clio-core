@@ -266,7 +266,7 @@ add_executable(test_compression_benchmark_exec
     test_compression_benchmark.cc
 )
 target_include_directories(test_compression_benchmark_exec PRIVATE
-    ${CMAKE_SOURCE_DIR}/context-transport-primitives/test/unit  # For basic_test.h
+    ${CMAKE_SOURCE_DIR}/context-transport-primitives/base/test  # For basic_test.h
 )
 target_link_libraries(test_compression_benchmark_exec
     clio::cte::compressor_runtime

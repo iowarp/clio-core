@@ -246,9 +246,16 @@ class Agent:
       while off < size:
         n = min(chunk, size - off)
         d = pattern(seed, off, n)
-        w = os.write(fd, d)
-        if w != n:
-          raise OSError(errno_mod.EIO, f'short write {w}/{n} at {off}')
+        # A short count is legal (a write split into several requests, the
+        # store filling after the first): write the rest, as applications
+        # do; the call that cannot make progress raises the real errno.
+        w = 0
+        while w < n:
+          k = os.write(fd, d[w:])
+          if k <= 0:
+            raise OSError(errno_mod.EIO, f'write made no progress at '
+                                         f'{off + w}')
+          w += k
         h.update(d)
         off += n
       if fsync:
@@ -398,6 +405,145 @@ class Agent:
     """Rewrite a cycling set of record files, logging each fsynced one."""
     return sr.FileSetWriter(dirpath, writer, nfiles, blocks, secs, seed,
                             blk, log_path, retry).run()
+
+  # ---- timed I/O for the tiering studies (CI/ares) -----------------------
+  # Timed here, on the node, so ssh/JSON round trips never enter the numbers.
+  # Every byte written follows pattern(seed); reads verify it, so a fast but
+  # wrong answer is a failure, not a speedup.
+
+  def op_io_bench(self, path, size, bs, mode='write', access='seq', seed=0,
+                  fsync=False, secs_cap=0, verify=True):
+    """Write or read `size` bytes of `path` in `bs`-byte requests.
+
+    Args:
+      mode: 'write' (creates/truncates) or 'read' (file must exist).
+      access: 'seq' or 'rand' (a seeded shuffle of the bs-aligned offsets).
+      fsync: write mode: fsync before the clock stops (durable bandwidth).
+      secs_cap: stop after this many seconds (0 = do all of size).
+    Returns:
+      dict: bytes, secs, mb_s, iops, lat_us p50/p99/max, bad (mismatches).
+    """
+    n = max(1, size // bs)
+    offs = [i * bs for i in range(n)]
+    if access == 'rand':
+      random.Random(f'io:{seed}:{bs}').shuffle(offs)
+    if mode == 'write':
+      fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    else:
+      fd = os.open(path, os.O_RDONLY)
+    lat = []
+    bad = 0
+    done = 0
+    t0 = time.perf_counter()
+    try:
+      for off in offs:
+        if mode == 'write':
+          d = pattern(seed, off, bs)
+          s = time.perf_counter()
+          w = 0
+          while w < bs:
+            k = os.pwrite(fd, d[w:], off + w)
+            if k <= 0:
+              raise OSError(errno_mod.EIO, f'pwrite no progress at {off + w}')
+            w += k
+          lat.append(time.perf_counter() - s)
+        else:
+          s = time.perf_counter()
+          d = os.pread(fd, bs, off)
+          lat.append(time.perf_counter() - s)
+          if verify and d != pattern(seed, off, bs):
+            bad += 1
+        done += bs
+        if secs_cap and time.perf_counter() - t0 > secs_cap:
+          break
+      if mode == 'write' and fsync:
+        os.fsync(fd)
+    finally:
+      os.close(fd)
+    dt = time.perf_counter() - t0
+    lat.sort()
+
+    def pct(p):
+      return round(lat[min(len(lat) - 1, int(p * len(lat)))] * 1e6, 1)
+
+    return {'bytes': done, 'secs': round(dt, 3),
+            'mb_s': round(done / dt / (1 << 20), 2) if dt > 0 else 0.0,
+            'iops': round(len(lat) / dt, 1) if dt > 0 else 0.0,
+            'lat_us_p50': pct(0.50), 'lat_us_p99': pct(0.99),
+            'lat_us_max': pct(1.0), 'bad': bad}
+
+  def op_produce(self, dirpath, count, item_size, seed, interval_s=0.0):
+    """Producer: write `count` items into dirpath, each published by an
+    atomic rename of `.tmp` to `item<i>` after fsync, carrying its publish
+    wall time in an 8-byte header. Returns secs and MB/s."""
+    t0 = time.perf_counter()
+    for i in range(count):
+      tmp = f'{dirpath}/.item{i}.tmp'
+      body = pattern(seed + i, 0, item_size)
+      fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+      try:
+        os.write(fd, int(time.time() * 1e6).to_bytes(8, 'little') + body)
+        os.fsync(fd)
+      finally:
+        os.close(fd)
+      os.rename(tmp, f'{dirpath}/item{i}')
+      if interval_s:
+        time.sleep(interval_s)
+    dt = time.perf_counter() - t0
+    return {'secs': round(dt, 3),
+            'mb_s': round(count * item_size / dt / (1 << 20), 2)}
+
+  def op_consume(self, dirpath, count, item_size, seed, timeout_s=600):
+    """Consumer: wait for item0..item<count-1> in order, read and verify
+    each. lag = consumer read time - producer publish time (needs the nodes'
+    clocks in NTP sync; reported, not asserted). Returns secs, MB/s, lag
+    percentiles, bad and missing counts."""
+    t0 = time.perf_counter()
+    lags = []
+    bad = 0
+    missing = 0
+    for i in range(count):
+      p = f'{dirpath}/item{i}'
+      while not os.path.exists(p):
+        if time.perf_counter() - t0 > timeout_s:
+          missing = count - i
+          break
+        time.sleep(0.002)
+      if missing:
+        break
+      with open(p, 'rb') as f:
+        d = f.read()
+      now = time.time()
+      if len(d) != 8 + item_size or d[8:] != pattern(seed + i, 0, item_size):
+        bad += 1
+        continue
+      lags.append(now - int.from_bytes(d[:8], 'little') / 1e6)
+    dt = time.perf_counter() - t0
+    lags.sort()
+
+    def pct(q):
+      if not lags:
+        return None
+      return round(lags[min(len(lags) - 1, int(q * len(lags)))] * 1e3, 2)
+
+    got = len(lags)
+    return {'secs': round(dt, 3),
+            'mb_s': round(got * item_size / dt / (1 << 20), 2) if dt else 0,
+            'lag_ms_p50': pct(0.5), 'lag_ms_p99': pct(0.99), 'bad': bad,
+            'missing': missing}
+
+  def op_clock(self):
+    """This node's wall clock (seconds), for clock-offset estimation."""
+    return time.time()
+
+  def op_drop_caches(self):
+    """Best effort: drop the kernel page cache so a re-read hits the clio
+    tiers rather than the FUSE page cache (needs passwordless sudo; returns
+    False when unavailable, and the test records that)."""
+    r = subprocess.run(['sudo', '-n', 'sh', '-c',
+                        'sync; echo 3 > /proc/sys/vm/drop_caches'],
+                       capture_output=True, timeout=60)
+    return r.returncode == 0
 
   def op_sha256(self, path, chunk=1 << 20):
     h = hashlib.sha256()

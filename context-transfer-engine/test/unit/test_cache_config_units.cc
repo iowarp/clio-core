@@ -153,4 +153,18 @@ TEST_CASE("CacheConfig - serialize round-trips every field",
   REQUIRE(out.min_score_ < 0.126f);
 }
 
+TEST_CASE("Cache interposes the pager fetch and tag writes under core ids",
+          "[cache][tags]") {
+  using namespace clio::cte::cache;
+  // No module-specific verbs: the interposed ones carry the core's ids.
+  REQUIRE(Method::kPodMultiGetBlob ==
+          clio::cte::core::Method::kPodMultiGetBlob);
+  REQUIRE(Method::kGetOrCreateTag == clio::cte::core::Method::kGetOrCreateTag);
+  REQUIRE(Method::kDelTag == clio::cte::core::Method::kDelTag);
+  const auto &names = Method::GetMethodNames();
+  REQUIRE(names[Method::kPodMultiGetBlob] == "PodMultiGetBlob");
+  REQUIRE(names[Method::kGetOrCreateTag] == "GetOrCreateTag");
+  REQUIRE(names[Method::kDelTag] == "DelTag");
+}
+
 SIMPLE_TEST_MAIN()

@@ -604,12 +604,20 @@ def t_append_home_restart(ctx):
   res = {}
 
   def app(i):
+    # fsync every 100 records: a writer appends only ~600-700 records in the
+    # 30 s, so with fsync_every=500 its one fsync (seq 499) often landed in
+    # the outage and no later fsync existed to show recovery -- the check
+    # below then failed by construction (4 of 6 runs without any fix,
+    # ab_append). More fsyncs also bound more records as durable pre-kill.
     res[i] = ctx.a(i).call('append_records', timeout=600, path=p, writer=i,
-                           count=10 ** 7, max_secs=30, fsync_every=500)
+                           count=10 ** 7, max_secs=45, fsync_every=100)
   ts = [threading.Thread(target=app, args=(i,)) for i in writers]
   for t in ts:
     t.start()
-  time.sleep(4)
+  # Long enough for several fsyncs (every 100 records at ~20/s) to finish
+  # before the kill: with 4 s, durable_before_kill was 0 in every run and
+  # the test could not see an acknowledged append get lost.
+  time.sleep(15)
   vh = ctx.hosts[victim]
   t_kill = time.time()
   ctx.cl.kill_fuse(vh)
@@ -665,6 +673,11 @@ def t_data_failover(ctx):
     owners = {fs_dir_owner(d, n) for d in ['/'] + [
         '/' + '/'.join(rel.strip('/').split('/')[:k])
         for k in range(1, len(rel.strip('/').split('/')) + 1)]}
+    # The files' inode homes too (FsInodeHomeFor hashes the file's path):
+    # an inode homed on the victim is unavailable while it is down by
+    # design, and its EIO is not the page failover this test is about.
+    owners |= {fs_dir_owner(f'{rel}/f{k}', n) for k in range(8)}
+    owners |= {fs_dir_owner(f'{rel}/n{k}', n) for k in range(3)}
     return next((i for i in range(n - 1, 0, -1) if i not in owners), None)
 
   # Try directory names until one leaves a node clear of the path (a fixed
@@ -740,8 +753,14 @@ def t_handoff_successor_restart(ctx):
     # stays down while the files are used); its successor, which covers for
     # it, is only down while nothing touches the path. Node 0 writes, so it
     # is neither.
+    # Nor may either home one of the files' inodes (FsInodeHomeFor hashes
+    # the file's path): an inode homed on a down node is unavailable by
+    # design, and the rewrites below would fail EIO for that, not for the
+    # hand-back this test is about.
+    homes = {fs_dir_owner(f'{rel}/f{k}', n) for k in range(8)}
     return next(((v, (v + 1) % n) for v in range(n - 1, 0, -1)
-                 if v not in owners and (v + 1) % n != 0), None)
+                 if v not in owners and v not in homes and
+                 (v + 1) % n not in homes and (v + 1) % n != 0), None)
 
   # The directory's owner depends on its name: try names until one leaves an
   # owner/successor pair clear of the path. A fixed name could leave none
@@ -802,6 +821,102 @@ def t_handoff_successor_restart(ctx):
                        f'e.g. {stale[:2]}')
 
 
+@test('restart_with_slow_handback_peers', 'fault', min_nodes=4,
+      redeploy_after=True, timeout=1200)
+def t_restart_slow_handback_peers(ctx):
+  """A node returns while every peer answers its hand-back pull late (a
+  test hook, CLIO_TEST_HANDOFF_PULL_DELAY_MS: alive, probed fine, slower
+  than the owner's bound). Its restart must not wait on them (#1285): the
+  remount finishes in bounded time, no read returns the owner's pre-outage
+  bytes while the pulls are out, and every change reaches it after."""
+  n = len(ctx.hosts)
+
+  def pick_for(root):
+    rel = root[len(ctx.cl.mnt):]
+    owners = {fs_dir_owner(d, n) for d in ['/'] + [
+        '/' + '/'.join(rel.strip('/').split('/')[:k])
+        for k in range(1, len(rel.strip('/').split('/')) + 1)]}
+    homes = {fs_dir_owner(f'{rel}/f{k}', n) for k in range(8)}
+    return next(((v, (v + 1) % n) for v in range(n - 1, 0, -1)
+                 if v not in owners and v not in homes and
+                 (v + 1) % n not in owners and (v + 1) % n not in homes and
+                 (v + 1) % n != 0), None)
+
+  root, pick = None, None
+  for k in range(64):
+    cand = ctx.p(f'fz{k}')
+    pick = pick_for(cand)
+    if pick is not None:
+      root = cand
+      break
+  if pick is None:
+    raise TestUnsupported('no directory name leaves an owner/successor pair '
+                          'clear of the path and its inodes')
+  victim, succ = pick
+  vh, sh_ = ctx.hosts[victim], ctx.hosts[succ]
+  ctx.ok(0, 'mkdir', path=root)
+  ctx.note(f'node{victim} goes down; every peer answers its pull 12 s late')
+  size = 8 * MiB
+  files = [f'{root}/f{k}' for k in range(8)]
+  for k, p in enumerate(files):
+    ctx.ok(0, 'write_file', path=p, size=size, seed=400 + k, fsync=True)
+  # Every peer answers a hand-back pull 12 s late (test hook): alive and
+  # probed fine, but slower than the returning owner's 5 s bound. Peers
+  # are restarted with it before the owner goes down (a restart of a
+  # covering node keeps its handoff log, #1130).
+  cl = ctx.cl
+  saved = dict(cl.extra_env)
+  cl.extra_env['CLIO_TEST_HANDOFF_PULL_DELAY_MS'] = '12000'
+  try:
+    for i, h in enumerate(ctx.hosts):
+      if i == victim:
+        continue
+      cl.kill_fuse(h)
+      cl.stop_runtime(h)
+      cl.start_runtime(h)
+      ctx.check(cl.runtime_up(h), f'{h} runtime did not restart')
+      ctx.check(cl.mount(h), f'{h} remount failed')
+      cl.agents.pop(h, None)
+  finally:
+    cl.extra_env.clear()
+    cl.extra_env.update(saved)
+  cl.kill_fuse(vh)
+  cl.kill_runtime(vh)
+  time.sleep(3)
+  for k, p in enumerate(files):
+    ctx.ok(0, 'write_file', path=p, size=size, seed=800 + k, fsync=True)
+  # Bring the victim back (without the hook): its Create asks live peers
+  # that answer late, so its bounded wait must run out.
+  t0 = time.time()
+  cl.start_runtime(vh)
+  ctx.check(cl.runtime_up(vh), f'{vh} runtime did not restart')
+  mounted = cl.mount(vh, timeout=90)
+  ctx.metrics['remount_s'] = round(time.time() - t0, 1)
+  ctx.check(mounted, f'{vh} remount failed with slow peers '
+                     f'({ctx.metrics["remount_s"]} s)')
+  cl.agents.pop(vh, None)
+  # Read at once from the victim: its owned blobs must not come back as
+  # the pre-outage bytes while the late pulls are still out.
+  early = []
+  for k, p in enumerate(files):
+    r = ctx.call(victim, 'verify_file', path=p, size=size, seed=800 + k)
+    if not (r.get('ok') and r['ret']['ok']):
+      early.append((p, r.get('err') or r.get('ret')))
+  ctx.metrics['wrong_while_pulls_out'] = len(early)
+  ctx.check(not early, f'{len(early)} reads on node{victim} wrong while its '
+                       f'hand-back pulls were still out, e.g. {early[:2]}')
+  time.sleep(5)
+  stale = []
+  for i in range(n):
+    for k, p in enumerate(files):
+      r = ctx.call(i, 'verify_file', path=p, size=size, seed=800 + k)
+      if not (r.get('ok') and r['ret']['ok']):
+        stale.append((i, p, r.get('err') or r.get('ret')))
+  ctx.metrics['stale_after_pulls'] = len(stale)
+  ctx.check(not stale, f'{len(stale)} reads wrong after the late pulls '
+                       f'answered, e.g. {stale[:2]}')
+
+
 def blob_info_notes(ctx, path, verdict):
   """Note every node's view (cte_search --blob-info) of the page blob a
   failed verify mismatched in, to tell a stale copy from a lost one."""
@@ -858,27 +973,44 @@ def t_truncate_during_failover(ctx):
   ctx.check(done, 'truncate never succeeded while the home was down '
                   '(no failover within 90 s)')
   # Two timed steps, so a hang names its half: the append, then the fsync.
+  # Only the home merges appends (decision stream-standin-merge), so while
+  # it is down an O_APPEND may report EIO at close -- allowed -- but must
+  # return promptly (it used to block for 120 s), and the tail it wrote
+  # stays queued and lands once the home is back (checked below).
+  t_app = time.time()
   r = ctx.ok(a, 'sh', cmd=f'timeout 60 python3 -c "import os; '
                           f'fd=os.open({p!r}, os.O_WRONLY|os.O_APPEND); '
                           f'os.write(fd, b\'T\'*4096); os.close(fd)"')
-  ctx.check(r['rc'] == 0, f'append after the truncate failed or took over '
-                          f'60 s (rc {r["rc"]}): {r["err"][-300:]}')
+  ctx.metrics['append_during_outage_s'] = round(time.time() - t_app, 1)
+  ctx.metrics['append_during_outage_rc'] = r['rc']
+  ctx.check(r['rc'] != 124 and time.time() - t_app < 30,
+            f'append while the home is down hung (rc {r["rc"]}, '
+            f'{time.time() - t_app:.0f} s): {r["err"][-300:]}')
   r = ctx.ok(a, 'sh', cmd=f'timeout 60 python3 -c "import os; '
                           f'fd=os.open({p!r}, os.O_RDONLY); os.fsync(fd); '
                           f'os.close(fd)"')
-  ctx.check(r['rc'] == 0, f'fsync while the home is down failed or took '
-                          f'over 60 s (rc {r["rc"]}): {r["err"][-300:]}')
+  ctx.check(r['rc'] != 124, f'fsync while the home is down hung over 60 s '
+                            f'(rc {r["rc"]}): {r["err"][-300:]}')
   want = 1 * MiB + 4096
   for i in range(n):
     if i != victim:
       sz = ctx.ok(i, 'stat', path=p)['size']
-      ctx.check(sz == want, f'node{i} sees size {sz} during the outage, '
-                            f'want {want}')
+      # The truncate is visible at once; the queued tail may not be yet.
+      ctx.check(sz in (1 * MiB, want), f'node{i} sees size {sz} during '
+                                       f'the outage, want {1 * MiB} or {want}')
   ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
   ctx.cl.agents.pop(vh, None)
+  # The queued tail merges once the home is back (staged appends retry
+  # every 100 ms); give it a moment before the after-checks.
+  t_back = time.time()
+  while time.time() - t_back < 60:
+    if all(ctx.ok(i, 'stat', path=p)['size'] == want for i in range(n)):
+      break
+    time.sleep(2)
+  ctx.metrics['tail_landed_after_s'] = round(time.time() - t_back, 1)
   time.sleep(2)
   def tails():
     out = {}

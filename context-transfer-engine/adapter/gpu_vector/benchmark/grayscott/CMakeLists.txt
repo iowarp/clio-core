@@ -421,8 +421,12 @@ if(CLIO_CORE_ENABLE_SYCL)
     # REGRESSION COVERAGE for the SYCL row. Without an entry here the row is
     # only ever as correct as the last time someone ran it by hand.
     # --blocks 8 is the SYCL backend's documented ceiling, not a taste.
+    # --data-mb 2048 --hbm-mb 512 keeps the default's 4:1 data:HBM ratio, so
+    # the run still pages out of core, at 1/8 the size: the 16 GB default
+    # takes ~1900 s on an Aurora PVC, past the 900 s timeout; this takes ~170 s.
     add_test(NAME cte_gpu_vector_grayscott_macros_sycl
         COMMAND clio_grayscott_macros_bench_sycl --blocks 8 --steps 2
+                --data-mb 2048 --hbm-mb 512
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     set_tests_properties(cte_gpu_vector_grayscott_macros_sycl PROPERTIES

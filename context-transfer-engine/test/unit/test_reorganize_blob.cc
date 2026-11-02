@@ -674,6 +674,29 @@ TEST_CASE("ReorganizeBlob - Pipelined reads survive extent reuse (#753)",
     int churn_seq = 0;
     bool hit_863 = false;
     while (true) {
+      {
+        // Hang diagnostic: what the client is still waiting on.
+        static auto diag_last = std::chrono::steady_clock::now();
+        const auto diag_now = std::chrono::steady_clock::now();
+        if (diag_now - diag_last > std::chrono::seconds(5)) {
+          diag_last = diag_now;
+          std::printf("[753-DIAG] move_done=%d churn_fired=%d verified=%d "
+                      "overlapped=%d gets:",
+                      (int)reorg->IsComplete(), (int)churn_fired, verified,
+                      overlapped);
+          for (int i = 0; i < kDepth; ++i) {
+            if (gets[i].IsNull()) {
+              std::printf(" [%d]=null", i);
+            } else {
+              std::printf(" [%d]=%s rc=%u", i,
+                          gets[i]->IsComplete() ? "done" : "pending",
+                          (unsigned)gets[i]->GetReturnCode());
+            }
+          }
+          std::printf("\n");
+          std::fflush(stdout);
+        }
+      }
       const bool move_done = reorg->IsComplete();
       for (int i = 0; i < kDepth; ++i) {
         if (gets[i].IsNull() || !gets[i]->IsComplete()) continue;

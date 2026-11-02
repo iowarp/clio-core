@@ -45,6 +45,20 @@
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 
 namespace {
+
+/**
+ * How long a task is predicted to hold its worker per execution (us): the
+ * wall-time model, which sees the task's I/O size and is trained on the time
+ * the task actually occupied the worker (parked time excluded). This is what
+ * a worker's load counts. Not the CPU model: thread CPU time has ~15.6 ms
+ * granularity on Windows, so its samples read 0 or ~15600 us.
+ * @param task the task
+ * @return predicted hold time in microseconds
+ */
+float HoldUs(const clio::run::Task &task) {
+  const float wall = task.PredictedWallUs();
+  return wall > 0.0f ? wall : 0.0f;
+}
 /**
  * Event-queue wait per popping worker (CLIO_EVLAT). The global evq_wait
  * channel showed completion events sitting 5-50 ms in their parent's queue
@@ -183,6 +197,7 @@ bool Worker::Init() {
       "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kServer);
 
   is_initialized_ = true;
+  is_running_ = true;  // see Run(): a later Stop() must stick
   return true;
 }
 
@@ -317,7 +332,11 @@ void Worker::Run() {
   }
   // Set current worker once for the entire thread duration
   SetAsCurrentWorker();
-  is_running_ = true;
+  // is_running_ was set by Init, before this thread existed. Setting it
+  // here overwrote a Stop() that came first: an elastic worker spawned just
+  // before shutdown then never exited, its join timed out, and the
+  // orchestrator freed the Worker under the still-running thread
+  // (heap-use-after-free in SuspendMe under ASan).
 
   // Create this worker thread's IpcManagerTls on its OWN thread, which
   // ServerInit's the named MPSC SHM receive server "clio-<pid>-<tid>" (#642).
@@ -424,6 +443,15 @@ void Worker::Run() {
     }
 
     if (!did_work_) {
+      // Idle with an empty lane: every task reserved on this worker has
+      // started (or was placed elsewhere), so its queued load is zero.
+      // Resetting here keeps a reservation lost on any path -- a task
+      // whose RunContext was replaced before it started -- from marking
+      // an idle worker busy forever.
+      TaskLane *idle_lane = assigned_lane_.load(std::memory_order_acquire);
+      if (idle_lane == nullptr || idle_lane->Size() == 0) {
+        queued_load_us_.store(0, std::memory_order_relaxed);
+      }
       // No work was done - suspend worker with adaptive sleep
       SuspendMe();
     }
@@ -1282,6 +1310,40 @@ void Worker::ClearCurrentWorker() {
                             static_cast<class Worker *>(nullptr));
 }
 
+void Worker::ReserveOn(Task *task, Worker *w, double us) {
+  ReleaseTaskReservation(task);
+  if (w == nullptr || !(us > 0.0)) return;
+  w->ReserveLoad(us);
+  task->SetSchedReservedUs(static_cast<float>(us));
+  task->SetSchedReservedWorker(w->GetId());
+}
+
+void Worker::ReleaseTaskReservation(Task *task) {
+  const float reserved = task->SchedReservedUs();
+  const u32 holder = task->SchedReservedWorker();
+  task->SetSchedReservedUs(0.0f);
+  task->SetSchedReservedWorker(0xFFFFFFFFu);
+  if (reserved == 0.0f || holder == 0xFFFFFFFFu) return;
+  auto *orch = CLIO_WORK_ORCHESTRATOR;
+  Worker *w = orch != nullptr ? orch->GetWorker(holder) : nullptr;
+  if (w != nullptr) w->ReleaseReservation(reserved);
+}
+
+void Worker::BookHold(Task *task) {
+  const float hold = HoldUs(*task);
+  task->SetBookedHoldUs(hold);
+  load_.store(load_.load(std::memory_order_relaxed) + hold,
+              std::memory_order_relaxed);
+}
+
+void Worker::UnbookHold(Task *task) {
+  const float booked = task->BookedHoldUs();
+  task->SetBookedHoldUs(0.0f);
+  const float v = load_.load(std::memory_order_relaxed) - booked;
+  // Never below zero (float rounding over many tasks), never NaN.
+  load_.store(v > 0.0f ? v : 0.0f, std::memory_order_relaxed);
+}
+
 void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
   // Non-periodic tasks always count as real work.
   // Periodic tasks must express work via the task's did_work_ flag.
@@ -1335,6 +1397,7 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
   // Start CPU and wall timers before execution
   task_ptr->RunCpuTimer().Resume();
   task_ptr->RunWallTimer().Resume();
+  task_ptr->SetExecSegments(task_ptr->ExecSegments() + 1);
 
   // Call appropriate coroutine function based on task state. Driving the
   // coroutine is the Task's own responsibility (it owns its RunContext/frame).
@@ -1344,9 +1407,7 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
     // first-execution add for new tasks, and EndTask subtracts it once more
     // when the task finishes, so load_ always equals the predicted cost of
     // the tasks that can actually occupy this worker right now.
-    load_.store(load_.load(std::memory_order_relaxed) +
-                    task_ptr->PredictedLoad(),
-                std::memory_order_relaxed);
+    BookHold(task_ptr.get());
     task_ptr->ResumeCoroutine(task_ptr);
   } else {
     task_ptr->StartCoroutine(task_ptr);
@@ -1362,23 +1423,18 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
     // be 0 (BeginTask populates it just now). So only (re)compute PredictedLoad
     // when the task was NOT map-accounted.
     float reserved = task_ptr->SchedReservedUs();
-    if (exec) {
-      if (reserved == 0.0f) {
-        task_ptr->SetPredictedLoad(
-            exec->InferCpuTime(task_ptr->method_, task_ptr->PredictedStat()));
-      }
+    if (exec && reserved == 0.0f) {
+      task_ptr->SetPredictedLoad(
+          exec->InferCpuTime(task_ptr->method_, task_ptr->PredictedStat()));
       task_ptr->SetPredictedWallUs(exec->InferWallClockTime(
           task_ptr->method_, task_ptr->PredictedStat()));
     }
     // The task is now EXECUTING: count its predicted cost in load_ (whether the
     // value came from the map or from here), and release the queued reservation
     // so it is not double-counted. EndTask subtracts the same PredictedLoad.
-    load_.store(load_.load(std::memory_order_relaxed) +
-                    task_ptr->PredictedLoad(),
-                std::memory_order_relaxed);
+    BookHold(task_ptr.get());
     if (reserved != 0.0f) {
-      ReleaseReservation(reserved);
-      task_ptr->SetSchedReservedUs(0);
+      ReleaseTaskReservation(task_ptr.get());
     }
   }
 
@@ -1418,9 +1474,7 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
     // tasks waited ~40 ms per hop in lanes (clio-evlat: C-P p50 85 ms on two
     // nodes against 7 ms on one; multi_await 40 ms against a 1.5 ms get).
     // Release the cost while parked; the resume above re-adds it.
-    load_.store(load_.load(std::memory_order_relaxed) -
-                    task_ptr->PredictedLoad(),
-                std::memory_order_relaxed);
+    UnbookHold(task_ptr.get());
     // yield_time_us_ > 0 means cooperative yield (polling) — add to periodic
     // queue so the worker re-checks after the requested delay.
     // yield_time_us_ == 0 means waiting for a Future event — the event queue
@@ -1467,9 +1521,7 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   }
 
   // Subtract predicted load from worker
-  load_.store(load_.load(std::memory_order_relaxed) -
-                  task_ptr->PredictedLoad(),
-              std::memory_order_relaxed);
+  UnbookHold(task_ptr.get());
 
   // issue #781: defensively release any still-held queued reservation for tasks
   // that reach EndTask WITHOUT executing (e.g. the early-error EACCES path), so a
@@ -1477,8 +1529,7 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   // it in ExecTask (sched_reserved_us_ == 0 here), so this is a no-op for them.
   float reserved = task_ptr->SchedReservedUs();
   if (reserved != 0.0f) {
-    ReleaseReservation(reserved);
-    task_ptr->SetSchedReservedUs(0);
+    ReleaseTaskReservation(task_ptr.get());
   }
 
   // Reinforce model with actual CPU and wall time
@@ -1487,8 +1538,16 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   container->ReinforceCpuModel(
       task_ptr->method_, task_ptr->PredictedLoad(), actual_cpu_us,
       task_ptr->PredictedStat());
+  // The wall model predicts how long ONE execution holds the worker -- what
+  // BookHold counts each time the task runs. The timer sums every execution
+  // (it pauses while the task is parked), so divide by their number: a task
+  // that resumed fifty times for 20 us each holds its worker 20 us, not 1 ms.
+  const u32 segments = task_ptr->ExecSegments();
+  const float hold_us =
+      segments > 1 ? actual_wall_us / static_cast<float>(segments)
+                   : actual_wall_us;
   container->ReinforceWallModel(
-      task_ptr->method_, task_ptr->PredictedWallUs(), actual_wall_us,
+      task_ptr->method_, task_ptr->PredictedWallUs(), hold_us,
       task_ptr->PredictedStat());
   // issue #781: fold the measured cost into the scheduler's perf-bin PDF so the
   // monitor thread can report the live workload distribution (telemetry).
@@ -2106,6 +2165,7 @@ void Worker::ReschedulePeriodicTask(clio::run::shared_ptr<Task> &task_ptr) {
   // Reset timers and predictions for next period
   task_ptr->RunCpuTimer().time_ns_ = 0;
   task_ptr->RunWallTimer().time_ns_ = 0;
+  task_ptr->SetExecSegments(0);
   task_ptr->SetPredictedLoad(0);
   task_ptr->SetPredictedWallUs(0);
   task_ptr->PredictedStat() = TaskStat();

@@ -1,5 +1,15 @@
 #!/bin/bash
 set -e
+# Remove this user's clio shared-memory files only. A bare
+# `rm -f /dev/shm/clio_*` under set -e aborted the test on nodes where
+# another user's job left a clio_* DIRECTORY there.
+clean_shm() {
+  local p
+  for p in /dev/shm/clio_*; do
+    [ -f "$p" ] && [ -O "$p" ] && rm -f "$p"
+  done
+  return 0
+}
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Use BIN_DIR from environment, or fall back to /workspace/build/bin
@@ -42,14 +52,14 @@ stop_runtime() {
 cleanup() {
     stop_runtime
     sleep 1
-    rm -f /dev/shm/clio_*
+    clean_shm
     rm -rf "$CONF_DIR"
     rm -rf /tmp/cte_restart_ram
 }
 trap cleanup EXIT
 
 # Clean slate
-rm -f /dev/shm/clio_*
+clean_shm
 rm -rf "$CONF_DIR"
 rm -rf /tmp/cte_restart_ram
 
@@ -73,7 +83,7 @@ stop_runtime
 sleep 1
 
 # Clear SHM but keep persistent files
-rm -f /dev/shm/clio_*
+clean_shm
 
 echo "Phase 1 complete. Persistent files in $CONF_DIR:"
 ls -la "$CONF_DIR"/restart/ 2>/dev/null || echo "  (no restart dir yet)"

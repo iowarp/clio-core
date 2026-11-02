@@ -297,7 +297,7 @@ bool IpcManager::ClientInit() {
   if (client_try_new_servers_ > 0) {
     if (LoadHostfile()) {
       HLOG(kInfo, "IpcManager::ClientInit: Loaded {} hosts from hostfile",
-           hostfile_map_.size());
+           GetNumHosts());
     } else {
       HLOG(kWarning, "IpcManager::ClientInit: Failed to load hostfile, "
            "Phase 2 failover will be disabled");
@@ -729,6 +729,7 @@ bool IpcManager::ServerInit() {
   }
 
   is_initialized_ = true;
+  StartControlChannel();
 
   return true;
 }
@@ -851,6 +852,7 @@ void IpcManager::ServerFinalize() {
   if (!is_initialized_) {
     return;
   }
+  StopControlChannel();
 
   // Mark shutdown so ZeroMqTransport leaks shared-context sockets instead of
   // zmq_close-ing them on Windows (avoids libzmq's signaler WSASTARTUP abort).
@@ -1780,6 +1782,7 @@ static void SplitHostPort(const std::string &entry, std::string &host,
 }
 
 bool IpcManager::LoadHostfile() {
+  std::unique_lock<std::shared_mutex> hl(hostfile_mu_);
   ConfigManager *config = CLIO_CONFIG_MANAGER;
   std::string hostfile_path = config->GetHostfilePath();
 
@@ -1863,6 +1866,7 @@ bool IpcManager::LoadHostfile() {
 }
 
 const Host *IpcManager::GetHost(u64 node_id) const {
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) {
     // Log all available node IDs when lookup fails
@@ -1879,6 +1883,7 @@ const Host *IpcManager::GetHost(u64 node_id) const {
 }
 
 const Host *IpcManager::GetHostByIp(const std::string &ip_address) const {
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
   // Search through hostfile_map_ for matching IP address
   for (const auto &pair : hostfile_map_) {
     if (pair.second.ip_address == ip_address) {
@@ -1889,6 +1894,8 @@ const Host *IpcManager::GetHostByIp(const std::string &ip_address) const {
 }
 
 const std::vector<Host> &IpcManager::GetAllHosts() const {
+  // Exclusive: a rebuild writes hosts_cache_.
+  std::unique_lock<std::shared_mutex> hl(hostfile_mu_);
   // Rebuild cache if invalid
   if (!hosts_cache_valid_) {
     hosts_cache_.clear();
@@ -1904,9 +1911,13 @@ const std::vector<Host> &IpcManager::GetAllHosts() const {
   return hosts_cache_;
 }
 
-size_t IpcManager::GetNumHosts() const { return hostfile_map_.size(); }
+size_t IpcManager::GetNumHosts() const {
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
+  return hostfile_map_.size();
+}
 
 bool IpcManager::IsAlive(u64 node_id) const {
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return false;
   return it->second.state == NodeState::kAlive;
@@ -1918,12 +1929,13 @@ void IpcManager::SetDead(u64 node_id) {
   // rejoins and dies again is recoverable each time, while duplicate
   // coordinators within one epoch are still refused.
   membership_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   if (it->second.state == NodeState::kDead) return;  // Already dead
   NoteLivenessChange(node_id);
 
-  SetNodeState(node_id, NodeState::kDead);
+  SetNodeStateLocked(node_id, NodeState::kDead);
 
   // Record dead-node entry for retry tracking
   DeadNodeEntry entry;
@@ -1967,10 +1979,126 @@ void IpcManager::NoteHeardFrom(u64 node_id) {
 }
 
 std::vector<u64> IpcManager::GetNodeIds() const {
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
   std::vector<u64> ids;
   ids.reserve(hostfile_map_.size());
   for (const auto &kv : hostfile_map_) ids.push_back(kv.first);
   return ids;
+}
+
+bool Run2RunTestPartitioned(u32 node_id);  // ipc/ipc_run2run.cc
+
+u64 IpcManager::NsSincePong(u64 node_id) const {
+  if (node_id >= kHeardSlots) return ~0ull;
+  const u64 last = last_pong_ns_[node_id].load(std::memory_order_relaxed);
+  if (last == 0) return ~0ull;
+  const u64 now = static_cast<u64>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  return now > last ? now - last : 0;
+}
+
+void IpcManager::StartControlChannel() {
+  if (control_thread_.joinable()) return;
+  control_stop_.store(false);
+  control_thread_ = std::thread([this] { ControlChannelLoop(); });
+}
+
+void IpcManager::StopControlChannel() {
+  control_stop_.store(true);
+  if (control_thread_.joinable()) control_thread_.join();
+}
+
+void IpcManager::ControlChannelLoop() {
+  // Own context: its I/O thread never queues behind the main context's bulk
+  // traffic. Frames: ping = "P<node_id>", pong = "Q<node_id>".
+  void *ctx = zmq_ctx_new();
+  ConfigManager *config = CLIO_CONFIG_MANAGER;
+  const u32 base = config->GetPort();
+  void *router = zmq_socket(ctx, ZMQ_ROUTER);
+  int zero = 0, hwm = 64;
+  zmq_setsockopt(router, ZMQ_LINGER, &zero, sizeof(zero));
+  zmq_setsockopt(router, ZMQ_SNDHWM, &hwm, sizeof(hwm));
+  const std::string bind = "tcp://*:" + std::to_string(base + 2);
+  if (zmq_bind(router, bind.c_str()) != 0) {
+    HLOG(kWarning, "control channel: cannot bind {} ({}); liveness falls "
+         "back to the main sockets", bind, zmq_strerror(zmq_errno()));
+    zmq_close(router);
+    zmq_ctx_term(ctx);
+    return;
+  }
+  const u64 self = GetNodeId();
+  std::vector<std::pair<u64, void *>> dealers;
+  auto now_ns = [] {
+    return static_cast<u64>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+  };
+  u64 last_ping = 0;
+  while (!control_stop_.load(std::memory_order_relaxed)) {
+    if (dealers.empty()) {
+      // The hostfile may not be loaded yet when the thread starts.
+      std::vector<std::pair<u64, std::string>> peers;
+      for (u64 n : GetNodeIds()) {
+        if (n == self) continue;
+        const Host *h = GetHost(n);
+        if (h == nullptr) continue;
+        peers.emplace_back(n, "tcp://" + h->ip_address + ":" +
+                                  std::to_string(h->PortOr(base) + 2));
+      }
+      for (auto &p : peers) {
+        void *d = zmq_socket(ctx, ZMQ_DEALER);
+        zmq_setsockopt(d, ZMQ_LINGER, &zero, sizeof(zero));
+        zmq_setsockopt(d, ZMQ_SNDHWM, &hwm, sizeof(hwm));
+        zmq_connect(d, p.second.c_str());
+        dealers.emplace_back(p.first, d);
+      }
+    }
+    const u64 t = now_ns();
+    if (t - last_ping > 500000000ull) {  // ping every 0.5 s
+      last_ping = t;
+      const std::string ping = "P" + std::to_string(self);
+      for (auto &d : dealers) {
+        if (Run2RunTestPartitioned(static_cast<u32>(d.first))) continue;
+        zmq_send(d.second, ping.data(), ping.size(), ZMQ_DONTWAIT);
+      }
+    }
+    std::vector<zmq_pollitem_t> items(1 + dealers.size());
+    items[0] = {router, 0, ZMQ_POLLIN, 0};
+    for (size_t i = 0; i < dealers.size(); ++i) {
+      items[i + 1] = {dealers[i].second, 0, ZMQ_POLLIN, 0};
+    }
+    if (zmq_poll(items.data(), static_cast<int>(items.size()), 100) <= 0) {
+      continue;
+    }
+    if (items[0].revents & ZMQ_POLLIN) {
+      char id[256], buf[64];
+      while (true) {
+        int idn = zmq_recv(router, id, sizeof(id), ZMQ_DONTWAIT);
+        if (idn < 0) break;
+        int n = zmq_recv(router, buf, sizeof(buf) - 1, ZMQ_DONTWAIT);
+        if (n <= 1 || buf[0] != 'P') continue;
+        buf[n] = '\0';
+        const u64 from = std::strtoull(buf + 1, nullptr, 10);
+        if (Run2RunTestPartitioned(static_cast<u32>(from))) continue;
+        const std::string pong = "Q" + std::to_string(self);
+        zmq_send(router, id, idn, ZMQ_SNDMORE | ZMQ_DONTWAIT);
+        zmq_send(router, pong.data(), pong.size(), ZMQ_DONTWAIT);
+      }
+    }
+    for (size_t i = 0; i < dealers.size(); ++i) {
+      if (!(items[i + 1].revents & ZMQ_POLLIN)) continue;
+      char buf[64];
+      while (zmq_recv(dealers[i].second, buf, sizeof(buf), ZMQ_DONTWAIT) >
+             0) {
+        if (buf[0] == 'Q' && dealers[i].first < kHeardSlots) {
+          last_pong_ns_[dealers[i].first].store(now_ns(),
+                                                std::memory_order_relaxed);
+        }
+      }
+    }
+  }
+  for (auto &d : dealers) zmq_close(d.second);
+  zmq_close(router);
+  zmq_ctx_term(ctx);
 }
 
 u64 IpcManager::NsSinceHeardFrom(u64 node_id) const {
@@ -1988,6 +2116,7 @@ void IpcManager::SetAlive(u64 node_id) {
   // rejoins and dies again is recoverable each time, while duplicate
   // coordinators within one epoch are still refused.
   membership_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   if (it->second.state == NodeState::kAlive) return;  // Already alive
@@ -1995,7 +2124,7 @@ void IpcManager::SetAlive(u64 node_id) {
   // was lost when it died (recorded then, in SetDead), and writes made while
   // it was down went to live successors.
 
-  SetNodeState(node_id, NodeState::kAlive);
+  SetNodeStateLocked(node_id, NodeState::kAlive);
 
   // Remove from dead_nodes_ list
   dead_nodes_.erase(std::remove_if(dead_nodes_.begin(), dead_nodes_.end(),
@@ -2009,18 +2138,21 @@ void IpcManager::SetAlive(u64 node_id) {
 }
 
 NodeState IpcManager::GetNodeState(u64 node_id) const {
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return NodeState::kDead;
   return it->second.state;
 }
 
 void IpcManager::NoteInbound(u64 node_id) {
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   it->second.last_inbound = std::chrono::steady_clock::now();
 }
 
 float IpcManager::SecondsSinceInbound(u64 node_id) const {
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) {
     return std::numeric_limits<float>::max();
@@ -2031,6 +2163,11 @@ float IpcManager::SecondsSinceInbound(u64 node_id) const {
 }
 
 void IpcManager::SetNodeState(u64 node_id, NodeState new_state) {
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
+  SetNodeStateLocked(node_id, new_state);
+}
+
+void IpcManager::SetNodeStateLocked(u64 node_id, NodeState new_state) {
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   it->second.state = new_state;
@@ -2041,6 +2178,7 @@ void IpcManager::SetNodeState(u64 node_id, NodeState new_state) {
 void IpcManager::SetSelfFenced(bool fenced) { self_fenced_ = fenced; }
 
 u64 IpcManager::GetLeaderNodeId() const {
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
   u64 leader = std::numeric_limits<u64>::max();
   for (const auto &[id, host] : hostfile_map_) {
     if (host.state == NodeState::kAlive && host.node_id < leader) {
@@ -2065,6 +2203,7 @@ u64 IpcManager::GetNeighborhoodLeaderNodeId(u64 for_node) const {
   u64 base = (for_node / n) * n;
   u64 end = base + n;
   u64 leader = std::numeric_limits<u64>::max();
+  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
   for (const auto &[id, host] : hostfile_map_) {
     if (host.state == NodeState::kAlive && host.node_id >= base &&
         host.node_id < end && host.node_id < leader) {
@@ -2081,21 +2220,38 @@ u64 IpcManager::GetNeighborhoodLeaderNodeId() const {
 u64 IpcManager::AddNode(const std::string &ip_address, u32 port) {
   (void)port;  // Port stored elsewhere (ConfigManager) for now
 
-  // Check if node already exists
-  for (const auto &pair : hostfile_map_) {
-    if (pair.second.ip_address == ip_address) {
-      HLOG(kInfo, "AddNode: Node {} already registered as node_id={}",
-           ip_address, pair.first);
-      SetAlive(pair.first);
-      return pair.first;
+  // Check if node already exists. SetAlive takes hostfile_mu_ itself, so it
+  // runs after the scan's lock is released.
+  auto find_existing = [&]() -> u64 {
+    for (const auto &pair : hostfile_map_) {
+      if (pair.second.ip_address == ip_address) return pair.first;
     }
+    return std::numeric_limits<u64>::max();
+  };
+  u64 existing;
+  {
+    std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
+    existing = find_existing();
+  }
+  if (existing != std::numeric_limits<u64>::max()) {
+    HLOG(kInfo, "AddNode: Node {} already registered as node_id={}",
+         ip_address, existing);
+    SetAlive(existing);
+    return existing;
   }
 
-  // Assign next node ID (linear offset)
-  u64 new_node_id = static_cast<u64>(hostfile_map_.size());
-  Host host(ip_address, new_node_id);
-  hostfile_map_[new_node_id] = host;
-  hosts_cache_valid_ = false;
+  // Assign next node ID (linear offset). Re-check under the exclusive lock:
+  // another thread may have registered the same address in between.
+  u64 new_node_id;
+  {
+    std::unique_lock<std::shared_mutex> hl(hostfile_mu_);
+    existing = find_existing();
+    if (existing != std::numeric_limits<u64>::max()) return existing;
+    new_node_id = static_cast<u64>(hostfile_map_.size());
+    Host host(ip_address, new_node_id);
+    hostfile_map_[new_node_id] = host;
+    hosts_cache_valid_ = false;
+  }
 
   HLOG(kInfo, "AddNode: Registered {} as node_id={}", ip_address, new_node_id);
   return new_node_id;
@@ -3189,7 +3345,16 @@ bool ClientProcessGone(int pid) {
 #if defined(__linux__)
   std::ifstream st("/proc/" + std::to_string(pid) + "/stat");
   std::string line;
-  if (st && std::getline(st, line)) {
+  // The stream state and the line are both written by uninstrumented
+  // libstdc++.so, so MSan must be told they are initialized before we test
+  // them.
+  CTP_MSAN_UNPOISON_OBJ(st);
+  if (st) {
+    std::getline(st, line);
+    CTP_MSAN_UNPOISON_OBJ(st);
+    CTP_MSAN_UNPOISON_STRING(line);
+  }
+  if (st) {
     // "<pid> (<comm>) <state> ..." -- comm may contain spaces/parens, so
     // take the state from after the LAST ')'.
     auto rp = line.rfind(')');
@@ -3953,7 +4118,7 @@ bool IpcManager::WaitForServerAndReconnect(
   }
 
   // Phase 2: Try random hosts from the hostfile
-  if (client_try_new_servers_ <= 0 || hostfile_map_.empty()) {
+  if (client_try_new_servers_ <= 0 || GetNumHosts() == 0) {
     reconnecting_.store(false, std::memory_order_release);
     return false;
   }

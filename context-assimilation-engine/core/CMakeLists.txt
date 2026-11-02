@@ -121,6 +121,13 @@ if(CAE_ENABLE_S3)
   # Poco for the in-process signer/transport (NOT the AWS SDK).
   list(APPEND RUNTIME_LINK_LIBRARIES
     Poco::Net Poco::NetSSL Poco::Crypto Poco::Foundation)
+  # cfs::<path> destinations store the object as a clio-fs file, which needs
+  # the filesystem chimod's client (built by CTE, configured before CAE).
+  if(TARGET clio_cte_filesystem_client)
+    message(STATUS "CAE S3 cfs:: destinations: ENABLED")
+    add_compile_definitions(CAE_ENABLE_CFS_DST)
+    list(APPEND RUNTIME_LINK_LIBRARIES clio_cte_filesystem_client)
+  endif()
 else()
   message(STATUS "CAE S3 support: DISABLED")
 endif()
@@ -145,6 +152,10 @@ add_clio_module_runtime(
 # Add HDF5 include directories to runtime if enabled
 if(HDF5_ENABLED)
   target_include_directories(clio_cae_core_runtime PRIVATE ${HDF5_INCLUDE_DIRS})
+  # format: hdf5_vol writes the HDF5 VOL connector's cache layout, which that
+  # connector defines in adapter/hdf5_vol/clio_vol_layout.h (header-only).
+  target_include_directories(clio_cae_core_runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine)
 endif()
 
 # The in-process S3 read path includes the bdev module's header-only S3 REST

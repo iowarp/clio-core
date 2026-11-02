@@ -271,6 +271,77 @@ def t_cache_after_home_restart(ctx):
                         f'seen by a cache, e.g. {misses[:6]}')
 
 
+@test('failover_reload_keeps_entries', 'dirs', min_nodes=4,
+      redeploy_after=True, timeout=2400)
+def t_failover_reload_keeps_entries(ctx):
+  """The home of a directory is cut off one way (nobody can send to it)
+  long enough to be failed over, while every other node keeps creating
+  files in that directory, and the home itself created files there before
+  the split. After the heal the home receives the rejoin notice and
+  reloads its blocks; that reload must keep EVERY entry: the ones it made
+  before the split and the ones the stand-in made during it. Checked from
+  every node. (A wrongly triggered reload lost recent entries; this checks
+  the reload a real failover needs.)"""
+  import time
+  from tests_fault import fs_dir_owner
+  n = len(ctx.hosts)
+  base = ctx.p('fr')
+  ctx.ok(0, 'mkdir', path=base)
+  rel0 = base[len(ctx.cl.mnt):]
+  # A directory homed on a node other than node0 (the driver's writer).
+  d = a = None
+  for k in range(64):
+    cand = f'{base}/d{k}'
+    own = fs_dir_owner(cand[len(ctx.cl.mnt):], n)
+    if own not in (0, fs_dir_owner(rel0, n)):
+      d, a = cand, own
+      break
+  if d is None:
+    from suite import TestUnsupported
+    raise TestUnsupported('no candidate directory homed away from node0')
+  ctx.ok(0, 'mkdir', path=d)
+  ctx.note(f'directory home node{a}')
+  made = set()
+  for k in range(40):  # before the split: some written by the home itself
+    i = a if k % 2 == 0 else 0
+    ctx.ok(i, 'write_file', path=f'{d}/pre{k}', size=64, seed=k, fsync=True)
+    made.add(f'pre{k}')
+  others = [i for i in range(n) if i != a]
+  for i in others:
+    ctx.cl.partition(ctx.hosts[i], [a])
+  try:
+    time.sleep(15)  # declared dead, its blocks failed over
+    t0 = time.time()
+    k = 0
+    while time.time() - t0 < 30:
+      i = others[k % len(others)]
+      r = ctx.call(i, 'write_file', path=f'{d}/mid{k}', size=64, seed=1000 + k,
+                   fsync=True, timeout=120)
+      if r.get('ok'):
+        made.add(f'mid{k}')
+      k += 1
+    ctx.metrics['created_during_split'] = sum(
+        1 for x in made if x.startswith('mid'))
+  finally:
+    for i in others:
+      ctx.cl.heal(ctx.hosts[i])
+  time.sleep(20)  # rejoin, notice, reload
+  for k in range(10):  # and the home keeps working after the reload
+    ctx.ok(a, 'write_file', path=f'{d}/post{k}', size=64, seed=2000 + k,
+           fsync=True)
+    made.add(f'post{k}')
+  lost = {}
+  for i in range(n):
+    r = ctx.call(i, 'listdir', path=d, timeout=300)
+    seen = set(r.get('ret') or []) if r.get('ok') else set()
+    miss = sorted(made - seen)
+    if miss:
+      lost[f'node{i}'] = (len(miss), miss[:5])
+  ctx.metrics['entries'] = len(made)
+  ctx.check(not lost, f'acknowledged entries missing after the failover '
+                      f'reload: {lost}')
+
+
 @test('partitioned_cache_not_stale', 'dirs', min_nodes=3, redeploy_after=True,
       timeout=1800)
 def t_partitioned_cache(ctx):
@@ -293,29 +364,49 @@ def t_partitioned_cache(ctx):
     ctx.ok(i, 'stat', path=f'{d}/f0')
   for i in range(n - 1):
     ctx.cl.partition(ctx.hosts[i], [a])
-  time.sleep(2)
-  t0 = time.time()
-  ctx.ok(0, 'write_file', path=f'{d}/f1', size=100, seed=2, timeout=300)
-  ctx.ok(0, 'sh', cmd=f'chmod 600 {d}/f0', timeout=300)
-  ctx.metrics['change_during_partition_s'] = round(time.time() - t0, 1)
   stale = []
-  r = ctx.call(a, 'stat', path=f'{d}/f1', timeout=300)
-  if not r['ok'] and (r.get('err') or '').startswith('ENOENT'):
-    stale.append('f1 created during the partition: ENOENT')
-  r = ctx.call(a, 'stat', path=f'{d}/f0', timeout=300)
-  if r['ok'] and r['ret']['perm'] != 0o600:
-    stale.append(f'f0 mode {oct(r["ret"]["perm"])}, set to 0o600')
-  for i in range(n - 1):
-    ctx.cl.heal(ctx.hosts[i])
+  try:
+    # Changes whose metadata lives on the cut-off node fail EIO until the
+    # others declare it dead (~10 s); give failover that long, then retry.
+    time.sleep(15)
+    t0 = time.time()
+    for op, kw in (('write_file', dict(path=f'{d}/f1', size=100, seed=2)),
+                   ('sh', dict(cmd=f'chmod 600 {d}/f0'))):
+      r = ctx.call(0, op, timeout=300, **kw)
+      while not r.get('ok') and time.time() - t0 < 60:
+        time.sleep(5)
+        r = ctx.call(0, op, timeout=300, **kw)
+      ctx.check(r.get('ok') and (op != 'sh' or r['ret']['rc'] == 0),
+                f'{op} during the partition failed 75 s in: {r}')
+    ctx.metrics['change_during_partition_s'] = round(time.time() - t0, 1)
+    r = ctx.call(a, 'stat', path=f'{d}/f1', timeout=300)
+    if not r['ok'] and (r.get('err') or '').startswith('ENOENT'):
+      stale.append('f1 created during the partition: ENOENT')
+    r = ctx.call(a, 'stat', path=f'{d}/f0', timeout=300)
+    if r['ok'] and r['ret']['perm'] != 0o600:
+      stale.append(f'f0 mode {oct(r["ret"]["perm"])}, set to 0o600')
+  finally:
+    # Whatever happened above: a partition left in place outlives the test
+    # (and redeploys) and breaks everything after it (reliability2).
+    for i in range(n - 1):
+      ctx.cl.heal(ctx.hosts[i])
   ctx.check(not stale, f'the partitioned node served stale copies as '
                        f'current: {stale}')
   ok = False
+  last = {}
   for _ in range(60):
     st = ctx.call(a, 'stat', path=f'{d}/f1')
     st0 = ctx.call(a, 'stat', path=f'{d}/f0')
+    ls = ctx.call(a, 'listdir', path=d)
+    last = {'f1': st.get('err') or 'ok',
+            'f0_perm': oct(st0['ret']['perm']) if st0.get('ok')
+            else st0.get('err'),
+            'listing': sorted(ls.get('ret') or []) if ls.get('ok')
+            else ls.get('err')}
     if st['ok'] and st0['ok'] and st0['ret']['perm'] == 0o600:
       ok = True
       break
     time.sleep(2)
-  ctx.check(ok, 'after the partition healed the node still does not see '
-                'the changes made during it')
+  ctx.metrics['converged'] = ok
+  ctx.check(ok, f'after the partition healed the node still does not see '
+                f'the changes made during it: {last}')

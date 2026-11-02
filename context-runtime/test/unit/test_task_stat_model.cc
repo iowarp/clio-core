@@ -290,6 +290,10 @@ TEST_CASE("TaskStatModel: every container owns its own model; the static "
   // Reinforcement from a completed task moves ONLY the container it ran on.
   TaskStat cpu_stat;
   cpu_stat.compute_ = 9;
+  // Start from a known coefficient: the pool's model persists across runs, so
+  // a previous run's learning (possibly down to kMinModelCoef, where it cannot
+  // shrink further) would otherwise decide this check.
+  local_dc.get()->SetMethodCpuCoef(method, 1.0f);
   const float local_before = local_dc.get()->GetMethodModel()[method];
   const float other_before = other_dc.get()->GetMethodModel()[method];
   const float static_before = static_dc.get()->GetMethodModel()[method];

@@ -1281,16 +1281,16 @@ set_tests_properties(cte_reorganize_no_loss PROPERTIES
     LABELS "unit;cte"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
 
-add_executable(test_fs_dir_block test_fs_dir_block.cc)
-target_include_directories(test_fs_dir_block PRIVATE
+add_executable(test_fs_inode_table test_fs_inode_table.cc)
+target_include_directories(test_fs_inode_table PRIVATE
     ${CMAKE_SOURCE_DIR}/context-runtime/test
     ${CMAKE_SOURCE_DIR}/context-transfer-engine/filesystem/include)
-target_link_libraries(test_fs_dir_block
+target_link_libraries(test_fs_inode_table
     clio_cte_core_client
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT})
-add_test(NAME cte_fs_dir_block COMMAND test_fs_dir_block)
-set_tests_properties(cte_fs_dir_block PROPERTIES
+add_test(NAME cte_fs_inode_table COMMAND test_fs_inode_table)
+set_tests_properties(cte_fs_inode_table PROPERTIES
     TIMEOUT 120
     LABELS "unit;cte"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")
@@ -1309,6 +1309,24 @@ target_link_libraries(test_cte_conditional_put
     ${CMAKE_THREAD_LIBS_INIT})
 add_test(NAME cte_conditional_put COMMAND test_cte_conditional_put)
 set_tests_properties(cte_conditional_put PROPERTIES
+    TIMEOUT 300
+    LABELS "unit;cte"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+
+add_executable(test_cte_tag_xattr test_cte_tag_xattr.cc)
+target_include_directories(test_cte_tag_xattr PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test)
+target_link_libraries(test_cte_tag_xattr
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT})
+add_test(NAME cte_tag_xattr COMMAND test_cte_tag_xattr)
+set_tests_properties(cte_tag_xattr PROPERTIES
     TIMEOUT 300
     LABELS "unit;cte"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
@@ -1794,7 +1812,13 @@ if(CLIO_CORE_ENABLE_ROCM)
     gpu/test_cte_devmem_putget.cc
   )
   target_compile_options(test_cte_devmem_putget PRIVATE
-    "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:--generate-code=arch=compute_89,code=sm_89>"
+    # No hardcoded --generate-code here: an sm_89-only cubin has no image for
+    # any other GPU (e.g. sm_120), so every kernel launch failed with
+    # cudaErrorSymbolNotFound and the test read back stale memory. The target's
+    # CMake emits neither CUDA_ARCHITECTURES nor CUDA_STANDARD flags for this
+    # target (flags.make had only "-g -fcoroutines"), so derive the arch
+    # list from the cache below and pass -std explicitly.
+    "$<$<COMPILE_LANGUAGE:CUDA>:-std=c++20>"
     # HIP_STANDARD 20 on the target does NOT reach the command line here (the
     # source gets its language from set_source_files_properties, and no -std
     # was emitted at all -- verified in compile_commands.json). Say it
@@ -1809,8 +1833,20 @@ if(CLIO_CORE_ENABLE_ROCM)
   # the ROCm build was clean. HIP_STANDARD is the property that actually
   # applies under HIP_PLATFORM=amd; the CUDA_* ones are kept (at 20) because
   # HIP_PLATFORM=nvidia really does route this through the CUDA language.
+  # Only reached for the HIP-NVCC path: the generator expression applies the
+  # flag to CUDA-language sources, which HIP_PLATFORM=amd never produces.
+  set(_devmem_archs "$CACHE{CMAKE_CUDA_ARCHITECTURES}")
+  foreach(_arch IN LISTS _devmem_archs)
+    string(REGEX REPLACE "-(real|virtual)$" "" _arch "${_arch}")
+    if(_arch MATCHES "^[0-9]+$")
+      target_compile_options(test_cte_devmem_putget PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:--generate-code=arch=compute_${_arch},code=sm_${_arch}>")
+    endif()
+  endforeach()
+  # CUDA_ARCHITECTURES is left to add_rocm_gpu_executable (as for
+  # test_gpu_kernel_stress); re-setting it from CMAKE_CUDA_ARCHITECTURES here
+  # cleared it, since that variable is empty in this scope.
   set_target_properties(test_cte_devmem_putget PROPERTIES
-    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_STANDARD 20
     CUDA_STANDARD_REQUIRED ON
     HIP_STANDARD 20
@@ -2077,6 +2113,36 @@ add_dependencies(test_putblob_priv
     clio_cte_core_runtime
     clio_bdev_runtime
     clio_admin_runtime)
+
+# cte_tiers' report against an in-process runtime (core/util/cte_tiers.cc
+# is only CLIO_INIT plus this call).
+add_executable(test_cte_tiers
+    test_cte_tiers.cc
+)
+target_include_directories(test_cte_tiers PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/util
+)
+target_link_libraries(test_cte_tiers
+    clio_cte_core_client
+    clio_cte_core_runtime
+    clio::run::admin_client
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+add_dependencies(test_cte_tiers
+    clio_cte_core_runtime
+    clio_bdev_runtime
+    clio_admin_runtime)
+add_test(NAME cte_tiers_report
+    COMMAND test_cte_tiers
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_tests_properties(cte_tiers_report PROPERTIES
+    ENVIRONMENT "${_getblob_priv_env}"
+    RESOURCE_LOCK "clio_runtime"
+    TIMEOUT 120
+    LABELS "unit;core;cte;msan_skip")
 
 add_test(NAME cte_putblob_priv_inline
     COMMAND test_putblob_priv

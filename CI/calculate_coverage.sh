@@ -179,7 +179,7 @@ fi
 #                                excluded individually
 #   - anything else           -> exclude the whole subtree
 # A kept path may also be a single FILE (the prediction phase keeps
-# context-transport-primitives/src/system_info.cc), so an ancestor directory
+# context-transport-primitives/introspect/src/system_info.cc), so an ancestor directory
 # excludes its non-kept sibling files by name as well.
 # ---------------------------------------------------------------------------
 _cdash_path_is_kept() {
@@ -661,10 +661,11 @@ TMP_DIR=$(mktemp -d)
 # Extract coverage for each component
 print_info "Extracting component coverage..."
 
-# CTP is mostly header-only, so include both src/ and include/
+# CTP is mostly header-only, so include every module's src/ and include/
 lcov --extract coverage_filtered.info \
-     "${REPO_ROOT}/context-transport-primitives/src/*" \
-     "${REPO_ROOT}/context-transport-primitives/include/*" \
+     "${REPO_ROOT}/context-transport-primitives/*/src/*" \
+     "${REPO_ROOT}/context-transport-primitives/base/include/*" \
+     "${REPO_ROOT}/context-transport-primitives/*/include/*" \
      --output-file "${TMP_DIR}/ctp.info" \
      >/dev/null 2>&1 || true
 

@@ -10,6 +10,7 @@
 #include "clio_cte/filesystem/api.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 // The descriptor layer below is POSIX-SHAPED but not POSIX-only: nothing
 // in it makes a system call. posix_compat.h supplies the vocabulary it is
@@ -186,12 +187,23 @@ class Client : public clio::cte::core::Client {
            shm_fs_root_->overflow_.load(std::memory_order_acquire) != 0;
   }
 
-  bool TryGetFileRecordShm(const std::string &path, ShmFileRecord *out) const {
+  /**
+   * @param absent if non-null, set true only when a false return PROVES the
+   *        path has no record (or only a stale-generation one); a torn or
+   *        contended read leaves it false. Authoritative negatives must use
+   *        it: a record being rewritten (a size push right after close) used
+   *        to read as missing, and a COMPLETE parent turned that into ENOENT
+   *        for a file that existed ("unable to stat just-written file").
+   */
+  bool TryGetFileRecordShm(const std::string &path, ShmFileRecord *out,
+                           bool *absent = nullptr) const {
+    if (absent != nullptr) *absent = false;
     if (shm_fs_root_ == nullptr || out == nullptr) {
       return false;
     }
-    if (!shm_fs_root_->path_to_file_.TryGetBytes(path.data(), path.size(),
-                                                 out)) {
+    const std::string key = shm_fs_root_->Key(path);
+    if (!shm_fs_root_->path_to_file_.TryGetBytes(key.data(), key.size(),
+                                                 out, 16, absent)) {
       return false;
     }
     // A FILE record from an older namespace generation may sit under a stale
@@ -205,6 +217,7 @@ class Client : public clio::cte::core::Client {
     if (out->nsgen_ !=
         shm_fs_root_->nsgen_.load(std::memory_order_relaxed)) {
       if (!(out->flags_ & kShmFileIsDir)) {
+        if (absent != nullptr) *absent = true;  // stale name: no record
         return false;
       }
       out->flags_ &= ~kShmDirComplete;
@@ -275,14 +288,20 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
-  /** Tag-keyed size advance (see AdvanceSizeTask). */
+  /**
+   * Tag-keyed size advance (see AdvanceSizeTask).
+   * @param tag_packed the file's packed TagId
+   * @param size the new size (never lowers it)
+   * @param mtime_ns wall time (ns) of the last write the size covers, the
+   *        file's new mtime; 0 = the time the push lands
+   */
   clio::run::Future<AdvanceSizeTask> AsyncAdvanceSize(
-      clio::run::u64 tag_packed, clio::run::u64 size) {
-    auto *ipc = CLIO_CPU_IPC;
+      clio::run::u64 tag_packed, clio::run::u64 size,
+      clio::run::u64 mtime_ns = 0) {
     // Local: the local container forwards to the inode's live home (the
     // encoded one, or its successor while that node is down).
     return AsyncAdvanceSizeAt(clio::run::PoolQuery::Local(), tag_packed, size,
-                              0u);
+                              0u, mtime_ns);
   }
 
   /**
@@ -293,14 +312,16 @@ class Client : public clio::cte::core::Client {
    * @param tag_packed the file's packed TagId
    * @param size new size (raise) or length (reserve)
    * @param reserve nonzero for an append reservation
+   * @param mtime_ns raise mode: the file's new mtime (0 = when it lands)
    */
   clio::run::Future<AdvanceSizeTask> AsyncAdvanceSizeAt(
       const clio::run::PoolQuery &query, clio::run::u64 tag_packed,
-      clio::run::u64 size, clio::run::u32 reserve) {
+      clio::run::u64 size, clio::run::u32 reserve,
+      clio::run::u64 mtime_ns = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<AdvanceSizeTask>(clio::run::CreateTaskId(),
                                               pool_id_, query, tag_packed,
-                                              size, reserve);
+                                              size, reserve, mtime_ns);
     return ipc->Send(task);
   }
 
@@ -1085,6 +1106,14 @@ class Client : public clio::cte::core::Client {
    * @return 0, -ENOSPC or -EIO
    */
   int SyncDurable(const clio::cte::core::TagId &tag, const std::string &dir);
+
+  /**
+   * fsync every filesystem container's directory journal and system
+   * records (SyncMeta, broadcast): the namespace half of fsync/fsyncdir.
+   * A container on a lost node does not fail it (its journal is its own).
+   * @return 0 or -EIO
+   */
+  int SyncMetaDurable();
   int FtruncateFd(int fd, FsOff length);
   int TruncatePath(const std::string &raw_path, FsOff length);
   int RemovePath(const std::string &raw_path);
@@ -1203,6 +1232,16 @@ class Client : public clio::cte::core::Client {
   FsSsize TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
                      size_t count) {
     return TryReadShmImpl(path, off, buf, count, ShmHolePolicy::kZeroFillHoles);
+  }
+
+  /** CLIO_TRACE_SHM_READ=1: log every page the shared-memory read path
+   *  hands back as zeros, and why (residency "absent" vs. an SHM hit). */
+  static bool TraceShmRead() {
+    static const bool on = [] {
+      const char *e = std::getenv("CLIO_TRACE_SHM_READ");
+      return e != nullptr && e[0] == '1';
+    }();
+    return on;
   }
 
   FsSsize TryReadShmImpl(const std::string &path, clio::run::u64 off, void *buf,
@@ -1326,6 +1365,16 @@ class Client : public clio::cte::core::Client {
                                             static_cast<clio::run::u64>(to_read));
           res.Wait();
           if (res->GetReturnCode() == 0 && res->exists_ == 0) {
+            if (TraceShmRead()) {
+              std::fprintf(stderr,
+                           "[SHM-READ] zero-fill (residency: absent) %s tag "
+                           "%u.%u page %s off %llu len %llu file_size %llu\n",
+                           path.c_str(), rec.tag_id_.major_, rec.tag_id_.minor_,
+                           PageName(cur).c_str(),
+                           static_cast<unsigned long long>(page_off),
+                           static_cast<unsigned long long>(to_read),
+                           static_cast<unsigned long long>(rec.size_));
+            }
             std::memset(dst + done, 0, static_cast<size_t>(to_read));
             ShmReadHoles().fetch_add(1, std::memory_order_relaxed);
             done += to_read;
@@ -1335,6 +1384,25 @@ class Client : public clio::cte::core::Client {
         }
         ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
         return -1;
+      }
+      if (TraceShmRead()) {
+        // A shared-memory HIT that returns an all-zero page: either a real
+        // zero page or a stale record pointing at reused memory.
+        const char *p = dst + done;
+        bool all_zero = to_read > 0;
+        for (clio::run::u64 i = 0; i < to_read && all_zero; i += 512) {
+          all_zero = p[i] == 0;
+        }
+        if (all_zero) {
+          std::fprintf(stderr,
+                       "[SHM-READ] zero page from SHM hit %s tag %u.%u page %s "
+                       "off %llu len %llu file_size %llu\n",
+                       path.c_str(), rec.tag_id_.major_, rec.tag_id_.minor_,
+                       PageName(cur).c_str(),
+                       static_cast<unsigned long long>(page_off),
+                       static_cast<unsigned long long>(to_read),
+                       static_cast<unsigned long long>(rec.size_));
+        }
       }
       done += to_read;
       cur += to_read;

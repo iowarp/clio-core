@@ -62,7 +62,7 @@ parks — which is why case 1 of the test passes and case 2 does not.
 
 ## The code path
 
-`context-transport-primitives/include/clio_ctp/data_structures/ipc/ring_buffer.h`
+`context-transport-primitives/data_structures/include/clio_ctp/data_structures/ipc/ring_buffer.h`
 
 Producer, `Emplace()` (~line 500) — note it claims the slot **before** checking for space:
 
@@ -157,7 +157,7 @@ The fire kernel is fatal not because it spins, but because **it spins holding th
 ## Refuted theories — do not re-derive these
 
 1. **"A resident spinning kernel starves the CPU's D2H copy."** *False.*
-   `context-transport-primitives/test/unit/gpu/test_gpu_spin_kernel_copy_gpu.cc` exists specifically
+   `context-transport-primitives/base/test/gpu/test_gpu_spin_kernel_copy_gpu.cc` exists specifically
    to keep this dead: it proves a spinning kernel permits **28k+ concurrent D2H copies/sec** across
    device/managed × pinned/pageable, using `DeviceAwareMemcpy`'s exact pattern. Keep it green.
 2. **OOM / too many GPU backends.** Device bytes are *constant* across the chunk sweep (total
@@ -239,7 +239,7 @@ GPU-producer lanes.
 |---|---|
 | `context-runtime/test/unit/gpu/test_gpu2cpu_backpressure_gpu.cc` case 1 — *producer fills the ring exactly* | **passes**; guards the normal path |
 | `context-runtime/test/unit/gpu/test_gpu2cpu_backpressure_gpu.cc` case 2 — *producer overruns the ring* | **reproduces this bug**; opt-in via `CLIO_TEST_GPU2CPU_OVERRUN=1`. Fails cleanly with a ring-state dump rather than hanging. |
-| `context-transport-primitives/test/unit/gpu/test_gpu_spin_kernel_copy_gpu.cc` | **passes**; pins the CUDA invariant so refuted theory #1 cannot be re-derived |
+| `context-transport-primitives/base/test/gpu/test_gpu_spin_kernel_copy_gpu.cc` | **passes**; pins the CUDA invariant so refuted theory #1 cannot be re-derived |
 
 Case 2 is gated only because `simple_test.h` has no Catch2 `[.]` hidden-tag support, so an env var
 was the only way to keep CI green. **When the ring is fixed, delete the gate** so the overrun case

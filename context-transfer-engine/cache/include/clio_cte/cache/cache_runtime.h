@@ -6,6 +6,9 @@
 #define CLIO_CTE_CACHE_CACHE_RUNTIME_H_
 
 #include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <string>
 
 #include <clio_runtime/clio_runtime.h>
@@ -74,6 +77,15 @@ class Runtime : public clio::cte::core::CoreInterposer {
       clio::run::shared_ptr<clio::cte::core::GetBlobSizeTask> &task);
   clio::run::TaskResume MultiPutBlob(
       clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
+  clio::run::TaskResume PodMultiGetBlob(
+      clio::run::shared_ptr<clio::cte::core::PodMultiGetBlobTask> &task);
+  // ---- Tag metadata, write-through to every node's core ----
+  clio::run::TaskResume GetOrCreateTag(
+      clio::run::shared_ptr<
+          clio::cte::core::GetOrCreateTagTask<clio::cte::core::CreateParams>>
+          &task);
+  clio::run::TaskResume DelTag(
+      clio::run::shared_ptr<clio::cte::core::DelTagTask> &task);
 
   // ---- Container virtuals (defined in autogen/cache_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
@@ -127,6 +139,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * after a foreign write (the CI-caught fragmented winner split).
    */
   bool IsBlobOwnerLocal(const TagId &tag_id, const std::string &blob_name);
+  /** Whether this node serves the blob for its dead owner (failover). */
+  bool IsStandingIn(const TagId &tag_id, const std::string &blob_name);
 
   /**
    * Best-effort population of THIS node's raw local copy from the blob's
@@ -141,6 +155,9 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::cte::core::Client *GetNextClient();
   /** Lazily bind a direct core client for node-LOCAL copy access. */
   clio::cte::core::Client *GetLocalClient();
+
+  /** Apply a tag write to EVERY core container (existing core verbs). */
+  clio::run::u32 NumCoreContainers();
 
   CacheConfig config_;
   std::unique_ptr<clio::cte::core::Client> next_client_;

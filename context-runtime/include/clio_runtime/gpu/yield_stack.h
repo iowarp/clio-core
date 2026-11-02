@@ -638,8 +638,23 @@ struct YieldFrame {
       __trap();
     }
 #endif
-    if (fresh_ && lcur_ > lane_->sp_) {
-      lane_->sp_ = lcur_;
+    if (fresh_) {
+      if (lcur_ > lane_->sp_) {
+        lane_->sp_ = lcur_;
+      }
+      // ZERO THE LOCAL ON FIRST ENTRY. CLIO_YLOCAL runs no constructor, and
+      // this space last held some EARLIER frame's locals -- a popped callee's
+      // page number or page pointer, say. A gv::Held declared here then
+      // carries that stale value as its page_, and the first move-assignment
+      // into it (MHoldPage's `*out = Pin(...)`) Unpins it: an atomicSub on a
+      // garbage address, which PVC reports as "Segmentation fault from GPU
+      // ... access: 2 (Atomic)". All-zero is the state the stack had when it
+      // was allocated, and it is a valid empty value for every type held here
+      // (a null Held, a zero counter).
+      char *p = lane_base_ + off;
+      for (clio::run::u32 i = 0; i < size; ++i) {
+        p[i] = 0;
+      }
     }
     return lane_base_ + off;
   }

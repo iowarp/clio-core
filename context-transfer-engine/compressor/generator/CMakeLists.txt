@@ -12,7 +12,7 @@ add_executable(clio_cte_compression_benchmark
 target_include_directories(clio_cte_compression_benchmark PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
-    ${CMAKE_SOURCE_DIR}/context-transport-primitives/include
+    ${CLIO_CTP_INCLUDE_DIRS}
 )
 
 target_compile_features(clio_cte_compression_benchmark PRIVATE cxx_std_17)
@@ -73,7 +73,7 @@ if(ADIOS2_FOUND OR TARGET adios2::cxx11)
     target_include_directories(gray_scott_analysis PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
-        ${CMAKE_SOURCE_DIR}/context-transport-primitives/include
+        ${CLIO_CTP_INCLUDE_DIRS}
     )
 
     target_link_libraries(gray_scott_analysis PRIVATE

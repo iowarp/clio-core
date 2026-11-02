@@ -33,9 +33,11 @@
 
 /**
  * Filesystem runtime: inode records in CTE. Each inode's persistent
- * attributes are one small blob (kInodeBlob) in the file's own tag, written
- * by the inode's home before it acknowledges a change and read by any
- * container (through the cache chain) to stat the file.
+ * attributes are one key (kInodeKey) of the xattr section of the file's own
+ * tag, held by the CTE container on the inode's home node: the home writes
+ * it before it acknowledges a change and reads it back after a restart.
+ * Other containers get attributes from the home (stat, pushes), never from
+ * the record.
  */
 
 #include <algorithm>
@@ -45,70 +47,37 @@
 namespace clio::cte::filesystem {
 
 namespace {
-/** Blob holding an inode's record, in the file's tag (never a page name). */
-constexpr const char *kInodeBlob = "~i";
-/** Record format tag. */
-constexpr clio::run::u32 kInodeRecMagic = 0x31494643u;  // "CFI1"
+/** Xattr key of an inode's record in the file's tag section. */
+constexpr const char *kInodeKey = "~i";
+/** Format tag of inode records written before directories had records
+ *  ("CFI1"): recognized only to say why such a volume is refused. */
+constexpr clio::run::u32 kOldInodeRecMagic = 0x31494643u;
 /** Wait between checks while another task stores the same inode (us). */
 constexpr double kStoreBusyPollUs = 20.0;
 }  // namespace
 
-std::string Runtime::EncInodeRec(const FileInfo &fi, clio::run::u64 size,
-                                 clio::run::u32 writer, bool fresh) {
-  std::string p;
-  FsEnc e(&p);
-  e.U32(kInodeRecMagic);
-  e.U32(fi.type_);
-  e.U64(size);
-  e.U32(fi.nlink_);
-  e.U32(fi.mode_);
-  e.U32(fi.uid_);
-  e.U32(fi.gid_);
-  e.U64(fi.atime_);
-  e.U64(fi.mtime_);
-  e.U64(fi.ctime_);
-  e.U32((fi.orphan_ ? 1u : 0u) | (fi.has_xattr_ ? 2u : 0u) |
-        (fresh ? kInodeRecFresh : 0u));
-  e.Str(fi.symlink_);
-  // Appended last so older decoders (and older records) still line up.
-  e.U32(writer);
-  return p;
-}
-
-bool Runtime::DecInodeRec(const std::string &rec, FileInfo *fi,
-                          clio::run::u64 *size, clio::run::u32 *writer,
-                          bool *fresh) {
-  FsDec d(rec.data(), rec.size());
-  clio::run::u32 magic = 0, flags = 0;
-  if (!d.U32(&magic) || magic != kInodeRecMagic || !d.U32(&fi->type_) ||
-      !d.U64(size) || !d.U32(&fi->nlink_) || !d.U32(&fi->mode_) ||
-      !d.U32(&fi->uid_) || !d.U32(&fi->gid_) || !d.U64(&fi->atime_) ||
-      !d.U64(&fi->mtime_) || !d.U64(&fi->ctime_) || !d.U32(&flags) ||
-      !d.Str(&fi->symlink_)) {
-    return false;
-  }
-  fi->orphan_ = (flags & 1u) != 0;
-  fi->has_xattr_ = (flags & 2u) != 0;
-  if (fresh != nullptr) *fresh = (flags & kInodeRecFresh) != 0;
-  if (!d.U32(writer)) *writer = kNoRecWriter;
-  return true;
+clio::run::PoolQuery Runtime::InodeRecQuery(clio::run::u64 packed) {
+  const clio::run::u32 owner = InodeOwner(packed);
+  return owner == container_id_
+             ? clio::run::PoolQuery::Local()
+             : clio::run::PoolQuery::DirectId(
+                   static_cast<clio::run::ContainerId>(owner));
 }
 
 clio::run::TaskResume Runtime::CreateInodeRecord(
-    const clio::cte::core::TagId &id, clio::run::u32 type, clio::run::u32 mode,
-    const std::string &symlink, const std::string &path, int &rc) {
+    Inode ino, const std::string &mirror_path, int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
-  auto fi = std::make_shared<FileInfo>();
-  fi->tag_id_ = id;
-  fi->path_ = path;
-  fi->type_ = type;
-  fi->mode_ = mode == 0xFFFFFFFFu ? mode : (mode & 07777u);
-  fi->symlink_ = symlink;
+  auto fi = std::make_shared<InodeState>();
+  static_cast<Inode &>(*fi) = ino;
+  fi->mirror_path_ = ino.type_ == kFsTypeDir ? std::string() : mirror_path;
+  if (fi->mode_ != 0xFFFFFFFFu) fi->mode_ &= 07777u;
+  fi->nlink_ = 1;
   const clio::run::u64 now = clio::cte::core::GetWallTimeNs();
   fi->atime_ = fi->mtime_ = fi->ctime_ = now;
-  const std::string rec = EncInodeRec(*fi, 0, container_id_, /*fresh=*/true);
-  const clio::run::u64 packed = FsPack(id);
+  const std::string rec =
+      EncodeInodeRecord(*fi, 0, container_id_, /*fresh=*/true);
+  const clio::run::u64 packed = FsPack(fi->tag_id_);
   CLIO_CO_AWAIT(StoreInodeRec(packed, rec, rc));
   if (rc != 0) {
     rc = clio::cte::core::PutRcIsNoSpace(static_cast<clio::run::u32>(rc))
@@ -119,7 +88,7 @@ clio::run::TaskResume Runtime::CreateInodeRecord(
   if (InodeOwner(packed) == container_id_) {
     // Homed here: resident at once. The record is stored, nothing is dirty.
     std::lock_guard<std::mutex> g(meta_mu_);
-    if (by_tag_.count(packed) == 0) by_tag_[packed] = fi;
+    if (inodes_.count(packed) == 0) inodes_[packed] = fi;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -131,17 +100,28 @@ clio::run::TaskResume Runtime::DiscardInodeRecord(
   const clio::run::u64 packed = FsPack(id);
   {
     std::lock_guard<std::mutex> g(meta_mu_);
-    by_tag_.erase(packed);
+    inodes_.erase(packed);
     inode_dirty_.erase(packed);
     inode_dirty_seq_.erase(packed);
   }
-  auto d = cte_.AsyncDelBlob(id, kInodeBlob, clio::run::PoolQuery::Dynamic());
+  auto d = cte_.AsyncTagDelXattr(id, kInodeKey, 0, InodeRecQuery(packed));
   CLIO_CO_AWAIT(d);  // best effort: a leftover record names nothing
+  if (NumContainers() > 1) {
+    // And its mirror on the home's successor (StoreInodeRec).
+    const clio::run::u32 succ = (InodeHome(packed) + 1) % NumContainers();
+    if (succ != InodeOwner(packed)) {
+      auto dm = cte_.AsyncTagDelXattr(
+          id, kInodeKey, 0,
+          clio::run::PoolQuery::DirectId(
+              static_cast<clio::run::ContainerId>(succ)));
+      CLIO_CO_AWAIT(dm);
+    }
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-void Runtime::MarkInodeDirtyLocked(const FileInfo &fi) {
+void Runtime::MarkInodeDirtyLocked(const InodeState &fi) {
   const clio::run::u64 packed = FsPack(fi.tag_id_);
   inode_dirty_.insert(packed);
   inode_dirty_seq_[packed] = ++dirty_seq_;
@@ -175,16 +155,7 @@ namespace {
 std::string EncInodePush(const Runtime::FsAttr &a, const std::string &link) {
   std::string out;
   FsEnc e(&out);
-  e.U64(a.id_);
-  e.U32(a.type_);
-  e.U64(a.size_);
-  e.U32(a.nlink_);
-  e.U32(a.mode_);
-  e.U32(a.uid_);
-  e.U32(a.gid_);
-  e.U64(a.atime_);
-  e.U64(a.mtime_);
-  e.U64(a.ctime_);
+  Runtime::EncodeAttr(e, a);
   e.Str(link);
   return out;
 }
@@ -192,10 +163,7 @@ std::string EncInodePush(const Runtime::FsAttr &a, const std::string &link) {
 /** Decode what EncInodePush wrote. @return false if malformed */
 bool DecInodePush(const std::string &s, Runtime::FsAttr *a, std::string *link) {
   FsDec d(s.data(), s.size());
-  return d.U64(&a->id_) && d.U32(&a->type_) && d.U64(&a->size_) &&
-         d.U32(&a->nlink_) && d.U32(&a->mode_) && d.U32(&a->uid_) &&
-         d.U32(&a->gid_) && d.U64(&a->atime_) && d.U64(&a->mtime_) &&
-         d.U64(&a->ctime_) && d.Str(link);
+  return Runtime::DecodeAttr(d, a) && d.Str(link);
 }
 
 /** One inode record to store and push. */
@@ -210,10 +178,33 @@ struct InodeWork {
 };
 }  // namespace
 
+/** CLIO_TRACE_INODE=1: log every inode record stored and loaded (size,
+ *  writer, container), to find where an fsynced file's size is lost. */
+static bool TraceInode() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_TRACE_INODE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+static void TraceInodeRec(const char *what, clio::run::u64 packed,
+                          const std::string &rec, clio::run::u32 at) {
+  if (!TraceInode()) return;
+  Inode ino;
+  clio::run::u64 size = 0;
+  clio::run::u32 writer = 0;
+  const bool ok = DecodeInodeRecord(rec, &ino, &size, &writer, nullptr);
+  HLOG(kWarning, "[INODE] {} {} on container {}: size {} writer {} "
+       "mtime {} ctime {}{}", what, packed, at, size, writer, ino.mtime_,
+       ino.ctime_, ok ? "" : " (undecodable)");
+}
+
 clio::run::TaskResume Runtime::StoreInodeRec(clio::run::u64 packed,
                                              const std::string &rec,
                                              int &rc) {
   CLIO_TASK_BODY_BEGIN
+  TraceInodeRec("store", packed, rec, container_id_);
   {
     bool ready = false;
     CLIO_CO_AWAIT(AwaitCteReady(ready));
@@ -222,28 +213,35 @@ clio::run::TaskResume Runtime::StoreInodeRec(clio::run::u64 packed,
       CLIO_CO_RETURN;
     }
   }
-  // kMetaBlob: storing the record is not a change to the file (no ctime
-  // bump); a non-volatile tier keeps it across a restart.
-  clio::cte::core::Context meta_ctx;
-  meta_ctx.op_flags_ |= clio::cte::core::Context::kMetaBlob;
-  meta_ctx.min_persistence_level_ = inode_volatile_only_ ? 0 : 1;
-  auto p = cte_.AsyncPutBlob(FsUnpack(packed), kInodeBlob, 0,
-                             rec.size(), rec.data(), -1.0f, meta_ctx,
-                             0u, clio::run::PoolQuery::Dynamic());
+  // The owner's own CTE container holds the record: one in-memory update and
+  // a WAL append there, no blob placement or device write. Only the owner
+  // reads it (EnsureInode, Local), so a record stored by another container --
+  // a create's name inserter is usually not the inode's home -- is sent
+  // there; stored Local it was invisible to the home (a dead home's records
+  // are on its own node, #1263).
+  auto p = cte_.AsyncTagSetXattr(FsUnpack(packed), kInodeKey, rec, 0,
+                                 InodeRecQuery(packed));
   CLIO_CO_AWAIT(p);
-  if (p->GetReturnCode() != 0 && !inode_volatile_only_) {
-    meta_ctx.min_persistence_level_ = 0;
-    p = cte_.AsyncPutBlob(FsUnpack(packed), kInodeBlob, 0, rec.size(),
-                          rec.data(), -1.0f, meta_ctx, 0u,
-                          clio::run::PoolQuery::Dynamic());
-    CLIO_CO_AWAIT(p);
-    if (p->GetReturnCode() == 0) {
-      HLOG(kWarning, "filesystem: no non-volatile CTE tier accepts inode "
-           "records; they stay in RAM and do not survive a restart");
-      inode_volatile_only_ = true;
+  rc = static_cast<int>(p->GetReturnCode());
+  if (rc == 0 && NumContainers() > 1) {
+    // Mirror the record on the home's first successor: that is the node
+    // failover hands the inode to while the home is down, and it can only
+    // serve (stat, truncate, fsync an open file) what it has a record of.
+    // Tag xattrs are not blobs, so the replication chimod never copies them.
+    // Skipped when the successor is where it was just stored (it is the
+    // stand-in now). Best effort: a missed mirror costs availability during
+    // the next outage, never correctness (EnsureInode takes the newer).
+    const clio::run::u32 n = NumContainers();
+    const clio::run::u32 succ = (InodeHome(packed) + 1) % n;
+    if (succ != InodeOwner(packed) &&
+        clio::cte::core::ContainerNodeAlive(pool_id_, succ)) {
+      auto m = cte_.AsyncTagSetXattr(
+          FsUnpack(packed), kInodeKey, rec, 0,
+          clio::run::PoolQuery::DirectId(
+              static_cast<clio::run::ContainerId>(succ)));
+      CLIO_CO_AWAIT(m);
     }
   }
-  rc = static_cast<int>(p->GetReturnCode());
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -283,15 +281,15 @@ clio::run::TaskResume Runtime::FlushInodes(int *err, clio::run::u64 since) {
           ++it;  // failed moments ago and not this caller's change
           continue;
         }
-        auto fit = by_tag_.find(packed);
-        if (fit != by_tag_.end()) {
-          const FileInfo &fi = *fit->second;
+        auto fit = inodes_.find(packed);
+        if (fit != inodes_.end()) {
+          const InodeState &fi = *fit->second;
           inode_storing_.insert(packed);
           InodeWork w;
           w.packed = packed;
           auto sit = inode_dirty_seq_.find(packed);
           w.seq = sit == inode_dirty_seq_.end() ? 0 : sit->second;
-          w.rec = EncInodeRec(fi, FileSize(fi), container_id_);
+          w.rec = EncodeInodeRecord(fi, FileSize(fi), container_id_, false);
           FsAttr a;
           InodeAttrLocked(fi, &a);
           w.push = EncInodePush(a, fi.symlink_);
@@ -311,7 +309,14 @@ clio::run::TaskResume Runtime::FlushInodes(int *err, clio::run::u64 since) {
           }
           work.push_back(std::move(w));
         }
-        if (fit == by_tag_.end()) {
+        if (fit == inodes_.end()) {
+          if (TraceInode()) {
+            // Suspected loss path: a dirty inode no longer in memory has its
+            // unstored change discarded while the flush reports success.
+            HLOG(kWarning, "[INODE] DROP dirty {} on container {}: not in "
+                 "memory, its pending record is discarded", packed,
+                 container_id_);
+          }
           inode_dirty_seq_.erase(packed);
           inode_store_failed_ms_.erase(packed);
         }
@@ -347,8 +352,8 @@ clio::run::TaskResume Runtime::FlushInodes(int *err, clio::run::u64 since) {
       }
       std::lock_guard<std::mutex> g(meta_mu_);
       inode_storing_.erase(w.packed);
-      auto fit = by_tag_.find(w.packed);
-      if (fit != by_tag_.end()) {
+      auto fit = inodes_.find(w.packed);
+      if (fit != inodes_.end()) {
         if (w.resync) {
           // Everyone who took the push caches it: register them, with the
           // lease the resync assumed (see CommitBlock).
@@ -379,7 +384,7 @@ clio::run::TaskResume Runtime::FlushInodes(int *err, clio::run::u64 since) {
       } else {
         HLOG(kWarning, "filesystem: storing inode {} failed (rc {}); will "
              "retry", w.packed, src);
-        if (fit != by_tag_.end()) inode_dirty_.insert(w.packed);
+        if (fit != inodes_.end()) inode_dirty_.insert(w.packed);
         inode_store_failed_ms_[w.packed] = SteadyMs();
         failed.insert(w.packed);
         if (err != nullptr && *err == 0 && w.seq > since) {
@@ -406,7 +411,7 @@ clio::run::TaskResume Runtime::StatInode(clio::run::u64 packed,
   if (home == container_id_) {
     int load_err = 0;
     CLIO_CO_AWAIT(EnsureInode(packed, &load_err));
-    std::shared_ptr<FileInfo> fi = FindInode(packed);
+    std::shared_ptr<InodeState> fi = FindInode(packed);
     if (fi == nullptr) {
       // A record that could not be read is not a missing inode (#1166).
       resp.rc_ = load_err != 0 ? static_cast<clio::run::u32>(load_err) : ENOENT;
@@ -513,6 +518,43 @@ int Runtime::ApplyInodePush(const FsReq &req) {
   return 0;
 }
 
+bool Runtime::RecordNewer(const std::string &a, const std::string &b) {
+  Inode ia, ib;
+  clio::run::u64 sa = 0, sb = 0;
+  clio::run::u32 wa = 0, wb = 0;
+  if (!DecodeInodeRecord(a, &ia, &sa, &wa, nullptr)) return false;
+  if (!DecodeInodeRecord(b, &ib, &sb, &wb, nullptr)) return true;
+  const clio::run::u64 ta = std::max(ia.ctime_, ia.mtime_);
+  const clio::run::u64 tb = std::max(ib.ctime_, ib.mtime_);
+  return ta > tb;
+}
+
+clio::run::TaskResume Runtime::FetchStandInRecord(clio::run::u64 packed,
+                                                  std::string *rec,
+                                                  clio::run::u32 *from) {
+  CLIO_TASK_BODY_BEGIN
+  rec->clear();
+  const clio::run::u32 n = NumContainers();
+  // The stand-in is the first live container after the home (the CTE's
+  // FailoverContainer rule). One failure at a time is the guarantee, so the
+  // first live successor is the one that served it.
+  for (clio::run::u32 i = 1; i < n; ++i) {
+    const clio::run::u32 c = (container_id_ + i) % n;
+    if (!clio::cte::core::ContainerNodeAlive(pool_id_, c)) continue;
+    auto g = cte_.AsyncTagGetXattr(
+        FsUnpack(packed), kInodeKey,
+        clio::run::PoolQuery::DirectId(static_cast<clio::run::ContainerId>(c)));
+    CLIO_CO_AWAIT(g);
+    if (g->GetReturnCode() == 0 && g->found_) {
+      *rec = g->value_.str();
+      *from = c;
+    }
+    break;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed, int *err) {
   CLIO_TASK_BODY_BEGIN
   if (err != nullptr) *err = 0;
@@ -526,26 +568,71 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed, int *err) {
     if (!ready) CLIO_CO_RETURN;
   }
   const clio::cte::core::TagId tag = FsUnpack(packed);
-  auto sz = cte_.AsyncGetBlobSize(tag, kInodeBlob);
-  CLIO_CO_AWAIT(sz);
-  // Only "no such blob" means there is no record. Anything else (the
-  // record's owner down with no copy reachable, #1166; a lost block) is a
-  // read failure: the inode may well exist, and the caller must say EIO.
-  if (sz->GetReturnCode() != 0 && sz->GetReturnCode() != kCteBlobNotFoundRc) {
+  auto g = cte_.AsyncTagGetXattr(tag, kInodeKey,
+                                 clio::run::PoolQuery::Local());
+  CLIO_CO_AWAIT(g);
+  if (g->GetReturnCode() != 0) {
     if (err != nullptr) *err = EIO;
     CLIO_CO_RETURN;
   }
-  if (sz->GetReturnCode() != 0 || sz->size_ == 0) CLIO_CO_RETURN;
-  std::string rec(sz->size_, '\0');
-  auto g = cte_.AsyncGetBlob(tag, kInodeBlob, 0, rec.size(), 0u, rec.data());
-  CLIO_CO_AWAIT(g);
-  auto fi = std::make_shared<FileInfo>();
+  std::string rec = g->found_ ? g->value_.str() : std::string();
+  bool found = g->found_;
+  if (InodeHome(packed) == container_id_ && NumContainers() > 1) {
+    // While this node was down (or cut off) its successor served the inode
+    // and stored every record it wrote -- creates included -- in ITS core:
+    // tag xattrs are not blobs, so replication never hands them back. Left
+    // there, a file created during the outage vanishes once this home is
+    // back, and a change made there is undone. Take the stand-in's record
+    // when it is newer and keep it here.
+    std::string theirs;
+    clio::run::u32 from = 0;
+    CLIO_CO_AWAIT(FetchStandInRecord(packed, &theirs, &from));
+    if (!theirs.empty() && (!found || RecordNewer(theirs, rec))) {
+      int src = 0;
+      CLIO_CO_AWAIT(StoreInodeRec(packed, theirs, src));
+      if (src != 0) {
+        // Not kept here: serve nothing rather than the older record.
+        if (err != nullptr) *err = EIO;
+        CLIO_CO_RETURN;
+      }
+      HLOG(kWarning, "filesystem: inode {} took the record container {} "
+           "stored while it served this home", packed, from);
+      rec = theirs;
+      found = true;
+    }
+    // The successor's copy stays: it is the mirror the next outage needs.
+  }
+  if (!found) {
+    if (packed == FsPack(FsRootId()) && InodeHome(packed) == container_id_) {
+      // "/" exists by definition: its home creates its record on first use,
+      // and with it the volume's flags.
+      int mrc = 0;
+      CLIO_CO_AWAIT(MaterializeRoot(mrc));
+      if (mrc != 0 && err != nullptr) *err = mrc;
+      CLIO_CO_RETURN;
+    }
+    // Serving a dead home's inode: its record is in that node's CTE, not
+    // here (#1263). Not "no such file", which would let a create replace it.
+    if (NumContainers() > 1 && InodeHome(packed) != container_id_ &&
+        err != nullptr) {
+      *err = EIO;
+    }
+    CLIO_CO_RETURN;
+  }
+  TraceInodeRec("load", packed, rec, container_id_);
+  auto fi = std::make_shared<InodeState>();
   clio::run::u64 size = 0;
   clio::run::u32 writer = kNoRecWriter;
   bool fresh = false;
-  if (g->GetReturnCode() != 0 ||
-      !DecInodeRec(rec, fi.get(), &size, &writer, &fresh)) {
-    HLOG(kError, "filesystem: inode record {} unreadable", packed);
+  if (!DecodeInodeRecord(rec, fi.get(), &size, &writer, &fresh)) {
+    FsDec md(rec.data(), rec.size());
+    clio::run::u32 magic = 0;
+    if (md.U32(&magic) && magic == kOldInodeRecMagic) {
+      HLOG(kError, "filesystem: inode {} was written by an older clio-fs "
+           "(record format CFI1); this volume must be recreated", packed);
+    } else {
+      HLOG(kError, "filesystem: inode record {} unreadable", packed);
+    }
     if (err != nullptr) *err = EIO;
     CLIO_CO_RETURN;
   }
@@ -556,7 +643,7 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed, int *err) {
   fi->holders_unknown_ = NumContainers() > 1 && !fresh;
   const bool served_elsewhere =
       writer != kNoRecWriter && writer != container_id_;
-  if (fi->type_ != kFsTypeSymlink && !fresh) {
+  if (fi->type_ == kFsTypeFile && !fresh) {
     // Another container stored the latest record: it served the inode while
     // this one was away (a failover), so this container's stream state is
     // older than the record -- a truncate there must not be undone by the
@@ -581,7 +668,61 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed, int *err) {
   std::lock_guard<std::mutex> lk(meta_mu_);
   // Dropped while the record was being read: it stays gone (#1150).
   if (dying_.count(packed) != 0) CLIO_CO_RETURN;
-  by_tag_.emplace(packed, fi);  // a racing loader may have won: keep it
+  inodes_.emplace(packed, fi);  // a racing loader may have won: keep it
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::MaterializeRoot(int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  Inode root;
+  root.tag_id_ = FsRootId();
+  root.type_ = kFsTypeDir;
+  root.volume_flags_ = case_insensitive_ ? kVolumeCaseInsensitive : 0u;
+  root.fold_version_ = case_insensitive_ ? kFsFoldTableVersion : 0u;
+  CLIO_CO_AWAIT(CreateInodeRecord(root, std::string(), rc));
+  if (rc == 0) {
+    HLOG(kInfo, "filesystem: new volume, names compared case-{}",
+         case_insensitive_ ? "insensitively" : "sensitively");
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::CheckVolumeFlags(bool &ok) {
+  CLIO_TASK_BODY_BEGIN
+  ok = true;
+  const clio::run::u64 root = FsPack(FsRootId());
+  if (InodeHome(root) != container_id_) CLIO_CO_RETURN;
+  int err = 0;
+  CLIO_CO_AWAIT(EnsureInode(root, &err));
+  std::shared_ptr<InodeState> fi = FindInode(root);
+  if (fi == nullptr) {
+    // Unreadable (it says why): a volume that cannot be checked is not
+    // served, since its names may be keyed differently.
+    ok = false;
+    CLIO_CO_RETURN;
+  }
+  bool ci = false;
+  clio::run::u32 fold = 0;
+  {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    ci = (fi->volume_flags_ & kVolumeCaseInsensitive) != 0;
+    fold = fi->fold_version_;
+  }
+  if (ci != case_insensitive_) {
+    HLOG(kError, "filesystem: this volume was created case-{} but the "
+         "configuration says case_insensitive: {}; a volume keeps the "
+         "setting it was created with (recreate it to change it)",
+         ci ? "insensitive" : "sensitive",
+         case_insensitive_ ? "true" : "false");
+    ok = false;
+  } else if (ci && fold != kFsFoldTableVersion) {
+    HLOG(kError, "filesystem: this volume folds names with Unicode table "
+         "{} but this build has {}; its names would be keyed "
+         "differently", fold, kFsFoldTableVersion);
+    ok = false;
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

@@ -154,8 +154,8 @@ PY
 EXTRA="-I$W/context-runtime/include -I$W/context-runtime/modules/admin/include
        -I$W/context-runtime/modules/bdev/include
        -I$W/context-transfer-engine/core/include
-       -I$W/context-transport-primitives/include
-       -I$B/context-transport-primitives/src/include
+       $(printf -- "-I%s " $W/context-transport-primitives/*/include)
+       -I$B/context-transport-primitives/include
        -I$W/context-transfer-engine/checkpoint/include
        -I$W/context-transfer-engine/compressor/include"
 

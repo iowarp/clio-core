@@ -123,7 +123,7 @@ Whenever you build a new function, always create a docstring for it. It should d
 
 ### GPU Compiler Macro Rule
 
-**NEVER** use raw GPU compiler-detection macros (`__CUDACC__`, `__HIPCC__`, `__HIP__`, `__CUDA_ARCH__`, `__HIP_DEVICE_COMPILE__`) anywhere except `context-transport-primitives/include/clio_ctp/constants/macros.h`. We do not want code paths to compile just because a GPU compiler is being used — we need the explicit CMake build flags (`CTP_ENABLE_CUDA`, `CTP_ENABLE_ROCM`) to be set as well.
+**NEVER** use raw GPU compiler-detection macros (`__CUDACC__`, `__HIPCC__`, `__HIP__`, `__CUDA_ARCH__`, `__HIP_DEVICE_COMPILE__`) anywhere except `context-transport-primitives/constants/include/clio_ctp/constants/macros.h`. We do not want code paths to compile just because a GPU compiler is being used — we need the explicit CMake build flags (`CTP_ENABLE_CUDA`, `CTP_ENABLE_ROCM`) to be set as well.
 
 **Use these macros instead:**
 - `CTP_IS_GPU` — true when compiling device code (replaces `__CUDA_ARCH__` / `__HIP_DEVICE_COMPILE__`)
@@ -373,7 +373,7 @@ cmake --preset=debug -DCLIO_CORE_ENABLE_CTE=ON -DCLIO_CORE_ENABLE_CAE=OFF
 - Always use the debug CMakePreset when compiling code in this repo
 - Never hardcode paths in CMakeLists.txt files
 - Use find_package() for all dependencies
-- Follow Module build patterns from MODULE_DEVELOPMENT_GUIDE.md
+- Follow Module build patterns from the module development guide (docs/docs/sdk/context-runtime/2.module_dev_guide.md)
 - All compilation warnings have been resolved as of the current state
 
 ### RPATH Configuration
@@ -390,7 +390,7 @@ Always use CTP_MCTX macro unless we are writing GPU code, which necessitates a s
 
 ### Module Build Patterns
 
-This project follows the CLIO Runtime MODULE_DEVELOPMENT_GUIDE.md patterns for proper Module development:
+This project follows the CLIO Runtime module development guide (docs/docs/sdk/context-runtime/2.module_dev_guide.md) patterns for proper Module development:
 
 **Required Packages for Module Development:**
 ```cmake
@@ -1093,7 +1093,7 @@ This documentation covers:
 ### External Integration Test
 A standalone external integration test is available at: `context-transfer-engine/test/unit/external/`
 
-This test demonstrates MODULE_DEVELOPMENT_GUIDE.md compliant patterns:
+This test demonstrates patterns compliant with the module development guide (docs/docs/sdk/context-runtime/2.module_dev_guide.md):
 - Modern find_package() usage for Module discovery
 - Proper target linking with namespace::module_type aliases
 - Automatic dependency resolution through Module targets
@@ -1147,7 +1147,7 @@ echo "CMake cleanup completed!"
 
 When creating or modifying Modules (CLIO Runtime modules), refer to the comprehensive module development guide:
 
-**📖 See [context-transport-primitives/docs/MODULE_DEVELOPMENT_GUIDE.md](context-transport-primitives/docs/MODULE_DEVELOPMENT_GUIDE.md) for complete Module development documentation**
+**📖 See [docs/docs/sdk/context-runtime/2.module_dev_guide.md](docs/docs/sdk/context-runtime/2.module_dev_guide.md) for complete Module development documentation**
 
 This guide covers:
 - Module structure and architecture

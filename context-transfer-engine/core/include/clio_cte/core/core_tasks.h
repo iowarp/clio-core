@@ -83,7 +83,9 @@ CTP_CROSS_FUN inline Timestamp GetCurrentTimeNs() {
   return 0;  // GPU device code: return 0 (no clock available)
 #else
   return static_cast<clio::run::u64>(
-      std::chrono::steady_clock::now().time_since_epoch().count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 #endif
 }
 #elif CTP_IS_SYCL_COMPILER
@@ -97,17 +99,25 @@ inline Timestamp GetCurrentTimeNs() {
   return 0;
 #else
   return static_cast<clio::run::u64>(
-      std::chrono::steady_clock::now().time_since_epoch().count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 #endif
 }
 #else
 inline Timestamp GetCurrentTimeNs() {
   return static_cast<clio::run::u64>(
-      std::chrono::steady_clock::now().time_since_epoch().count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 }
 #endif
 
 /** UTC WALL-clock nanoseconds. For the POSIX-visible tag timestamps
+ *  The clocks' native units differ by platform (system_clock counts 100 ns
+ *  ticks on MSVC and microseconds on macOS libc++), so every helper here
+ *  converts to nanoseconds explicitly; a raw count() was 100x / 1000x too
+ *  small there.
  *  (mtime/ctime served to stat) — GetCurrentTimeNs above is STEADY-clock
  *  (process-uptime-like) and reads as 1970-era when interpreted as an
  *  epoch: fine for relative bookkeeping (scores, LRU), wrong for stat.
@@ -120,7 +130,9 @@ inline Timestamp GetWallTimeNs() {
   return 0;
 #else
   return static_cast<clio::run::u64>(
-      std::chrono::system_clock::now().time_since_epoch().count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
 #endif
 }
 
@@ -271,6 +283,11 @@ struct TargetInfo {
   clio::run::u64 ops_written_;
   float target_score_;        // Target score (0-1, normalized log bandwidth)
   clio::run::u64 remaining_space_;  // Remaining allocatable space in bytes
+  // Bumped on every incremental debit/credit of remaining_space_. The periodic
+  // stats refresh only overwrites remaining_space_ when this did not move
+  // while its GetStats was in flight; otherwise its snapshot predates a
+  // free/alloc and writing it back would erase that update.
+  clio::run::u64 space_epoch_;
   clio::run::u64 max_capacity_;     // Total (max) capacity in bytes, fixed at register
   clio::run::bdev::PerfMetrics perf_metrics_;  // Performance metrics from bdev
   clio::run::u32 expected_ttl_days_; // Predictive device TTL (defaults to 999999)
@@ -289,6 +306,7 @@ struct TargetInfo {
         ops_written_(0),
         target_score_(0.0f),
         remaining_space_(0),
+        space_epoch_(0),
         max_capacity_(0),
         expected_ttl_days_(999999),
         persistence_level_(clio::run::bdev::PersistenceLevel::kVolatile),
@@ -304,6 +322,7 @@ struct TargetInfo {
         ops_written_(0),
         target_score_(0.0f),
         remaining_space_(0),
+        space_epoch_(0),
         max_capacity_(0),
         expected_ttl_days_(999999),
         persistence_level_(clio::run::bdev::PersistenceLevel::kVolatile) {}
@@ -320,6 +339,7 @@ struct TargetInfo {
         ops_written_(other.ops_written_),
         target_score_(other.target_score_),
         remaining_space_(other.remaining_space_),
+        space_epoch_(other.space_epoch_),
         max_capacity_(other.max_capacity_),
         perf_metrics_(other.perf_metrics_),
         expected_ttl_days_(other.expected_ttl_days_),
@@ -338,6 +358,7 @@ struct TargetInfo {
       ops_written_ = other.ops_written_;
       target_score_ = other.target_score_;
       remaining_space_ = other.remaining_space_;
+      space_epoch_ = other.space_epoch_;
       max_capacity_ = other.max_capacity_;
       perf_metrics_ = other.perf_metrics_;
       expected_ttl_days_ = other.expected_ttl_days_;
@@ -1588,8 +1609,30 @@ struct BlobInfo {
   // is caught during testing before it can corrupt a size in release.
   CTP_CROSS_FUN clio::run::u64 GetTotalSize() const {
 #if !defined(NDEBUG) && CTP_IS_HOST
-    assert(ComputeTotalSizeSlow() == total_size_cache_ &&
-           "BlobInfo::total_size_cache_ drifted from sum(blocks_)");
+    // Only checkable while no writer holds the blob: GetBlob reads the cache
+    // while a PutBlob may be mid-update (it polls this under IsWriteLocked),
+    // and re-summing blocks_ under that writer both races it and sees blocks_
+    // ahead of the cache. A writer can also take the blob after that first
+    // look and move blocks_ during the sum, so compare only when the blob was
+    // unlocked, and its placement generation and content sequence unchanged,
+    // both before and after the sum (#1233). Every PutBlob moves
+    // content_seq_; the other blocks_ mutators bump placement_gen_.
+    auto load = [](const clio::run::u64 &word) {
+      return ctp::ipc::atomic_ref<clio::run::u64>(
+                 const_cast<clio::run::u64 &>(word))
+          .load();
+    };
+    const clio::run::u64 gen_before = load(placement_gen_);
+    const clio::run::u64 seq_before = load(content_seq_);
+    if (load(write_owner_) == 0) {
+      const clio::run::u64 sum = ComputeTotalSizeSlow();
+      const clio::run::u64 cached = load(total_size_cache_);
+      const bool quiet = load(write_owner_) == 0 &&
+                         load(placement_gen_) == gen_before &&
+                         load(content_seq_) == seq_before;
+      assert((!quiet || sum == cached) &&
+             "BlobInfo::total_size_cache_ drifted from sum(blocks_)");
+    }
 #endif
     return total_size_cache_;
   }
@@ -1986,6 +2029,12 @@ struct Context {
    *  back to its returning owner. The owner applies it while it still
    *  holds back client traffic until its hand-back pull is done (#1154). */
   static constexpr clio::run::u32 kHandoffPush = 1u << 7;
+  /** kStandInRead -- set by the routing node when it sent this GetBlob to
+   *  a stand-in because it holds the owner dead. A stand-in that misses
+   *  such a read answers kBlobOwnerDownRc even if it still sees the owner
+   *  alive: its liveness view can lag the router's, and "not found" there
+   *  reads as a hole -- zeros returned for data held by the dead owner. */
+  static constexpr clio::run::u32 kStandInRead = 1u << 8;
 
   /**
    * Fault-handler parameters (checkpointing / lazy copy). When the core
@@ -5655,6 +5704,129 @@ struct ListLocalBlobsTask : public clio::run::Task {
   }
 };
 
+/** TagXattrTask::op_: insert or replace one key. */
+GLOBAL_CROSS_CONST clio::run::u32 kTagXattrSet = 0;
+/** TagXattrTask::op_: read one key (found_ says whether it exists). */
+GLOBAL_CROSS_CONST clio::run::u32 kTagXattrGet = 1;
+/** TagXattrTask::op_: remove one key; an empty key removes every key. */
+GLOBAL_CROSS_CONST clio::run::u32 kTagXattrDel = 2;
+/** TagXattrTask::op_: list keys, in order, after the cursor in key_. */
+GLOBAL_CROSS_CONST clio::run::u32 kTagXattrList = 3;
+
+/** TagXattrTask::flags_ for kTagXattrSet: fail if the key exists. */
+GLOBAL_CROSS_CONST clio::run::u32 kTagXattrCreate = 0x1;
+/** TagXattrTask::flags_ for kTagXattrSet: fail if the key is absent. */
+GLOBAL_CROSS_CONST clio::run::u32 kTagXattrReplace = 0x2;
+/** TagXattrTask::flags_ for kTagXattrDel: fail if the key is absent. */
+GLOBAL_CROSS_CONST clio::run::u32 kTagXattrMustExist = 0x4;
+
+/** TagXattr return code: kTagXattrCreate and the key exists. */
+static constexpr clio::run::u32 kTagXattrExistsRc = 17;   // EEXIST
+/** TagXattr return code: kTagXattrReplace / kTagXattrMustExist and the key
+ *  is absent. */
+static constexpr clio::run::u32 kTagXattrMissingRc = 61;  // ENODATA
+/** TagXattr return code: the key or value exceeds its limit. */
+static constexpr clio::run::u32 kTagXattrTooBigRc = 7;    // E2BIG
+/** TagXattr return code: an unknown op_. */
+static constexpr clio::run::u32 kTagXattrBadOpRc = 22;    // EINVAL
+/** Longest key a tag's xattr section accepts, in bytes. */
+static constexpr size_t kTagXattrMaxKey = 255;
+/** Largest value a tag's xattr section accepts, in bytes. */
+static constexpr size_t kTagXattrMaxValue = 64 * 1024;
+
+/**
+ * TagXattrTask - one operation on a tag's xattr section: a key/value map
+ * kept beside the tag's blobs, in memory on the container the task reaches
+ * and logged one key at a time in that container's WAL. Keys and values are
+ * opaque bytes. With PoolQuery::Dynamic the task goes to the container the
+ * tag id hashes to; a caller that keeps its own placement (one writer per
+ * tag) may route it explicitly instead.
+ */
+struct TagXattrTask : public clio::run::Task {
+  IN TagId tag_id_;                   ///< Tag whose section is addressed
+  IN clio::run::u32 op_;              ///< kTagXattrSet/Get/Del/List
+  IN clio::run::u32 flags_;           ///< kTagXattrCreate/Replace/MustExist
+  IN clio::run::priv::string key_;    ///< Key; for List, the cursor
+  INOUT clio::run::priv::string value_;  ///< Set: the value; Get: result
+  IN clio::run::u32 max_keys_;        ///< List: page size (0 = all)
+  OUT std::vector<std::string> keys_; ///< List: keys after the cursor
+  OUT clio::run::u32 found_;          ///< Get: 1 if the key exists; List: 1
+                                      ///< if keys remain after this page
+
+  /** SHM default constructor */
+  TagXattrTask()
+      : clio::run::Task(),
+        tag_id_(TagId::GetNull()),
+        op_(kTagXattrGet),
+        flags_(0),
+        key_(CLIO_PRIV_ALLOC),
+        value_(CLIO_PRIV_ALLOC),
+        max_keys_(0),
+        found_(0) {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit TagXattrTask(const clio::run::TaskId &task_id,
+                                      const clio::run::PoolId &pool_id,
+                                      const clio::run::PoolQuery &pool_query,
+                                      const TagId &tag_id, clio::run::u32 op,
+                                      clio::run::u32 flags,
+                                      const std::string &key,
+                                      const std::string &value,
+                                      clio::run::u32 max_keys)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kTagXattr),
+        tag_id_(tag_id),
+        op_(op),
+        flags_(flags),
+        key_(CLIO_PRIV_ALLOC, key),
+        value_(CLIO_PRIV_ALLOC, value),
+        max_keys_(max_keys),
+        found_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kTagXattr;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /** Serialize IN and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, op_, flags_, key_, value_, max_keys_);
+  }
+
+  /** Serialize OUT and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(value_, keys_, found_);
+  }
+
+  /** Copy from another TagXattrTask */
+  void Copy(const ctp::ipc::FullPtr<TagXattrTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    op_ = other->op_;
+    flags_ = other->flags_;
+    key_ = other->key_;
+    value_ = other->value_;
+    max_keys_ = other->max_keys_;
+    keys_ = other->keys_;
+    found_ = other->found_;
+  }
+
+  /** AggregateOut: keep the answer of a container that found the key. */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<TagXattrTask>();
+    if (other->found_ && !found_) {
+      found_ = other->found_;
+      value_ = other->value_;
+    }
+    keys_.insert(keys_.end(), other->keys_.begin(), other->keys_.end());
+  }
+};
+
 /** SyncTag return code: a persistent tier had no room for the tag's bytes. */
 static constexpr clio::run::u32 kSyncNoSpaceRc = 28;  // ENOSPC
 /** SyncTag return code: a device sync or a read of the tag's bytes failed. */
@@ -5966,6 +6138,10 @@ struct TemporalSearchResult {
  * [time_begin_, time_end_] (inclusive; 0 on either bound means
  * "no constraint on that side").  Results are sorted by ascending
  * last_modified_.  max_entries_ caps the output (0 = unlimited).
+ *
+ * The bounds and each result's last_modified_ are wall-clock epoch
+ * nanoseconds; the handler converts the steady-clock blob timestamps
+ * (SteadyToWallNs) before comparing (#1241).
  *
  * This is a pure metadata scan — no blob bytes are read.
  */

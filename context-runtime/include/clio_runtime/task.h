@@ -459,9 +459,20 @@ class Task {
   void SetPredictedLoad(float v);
   float SchedReservedUs() const;       // issue #781 queued-load reservation
   void SetSchedReservedUs(float v);    // issue #781
+  /** Worker holding this task's reservation (kNoReservedWorker if none). */
+  u32 SchedReservedWorker() const;
+  void SetSchedReservedWorker(u32 v);
   ctp::HighResMonotonicTimer& RunWallTimer();
   float PredictedWallUs() const;
   void SetPredictedWallUs(float v);
+  /** Hold time (us) this task currently counts in its worker's load_: what
+   *  the worker added, so it subtracts exactly that (a re-route can change
+   *  the prediction in between). 0 while not counted. */
+  float BookedHoldUs() const;
+  void SetBookedHoldUs(float v);
+  /** How many times a worker has run this task (first run + each resume). */
+  u32 ExecSegments() const;
+  void SetExecSegments(u32 v);
   TaskStat& PredictedStat();
   /** The parent task waiting on this task's completion (i.e. whose coroutine
    *  resumes when this task finishes), read through this task's own future.
@@ -1048,9 +1059,15 @@ class RunContext {
   float sched_reserved_us_ = 0; /**< #781 queued-load reservation on a worker
                                   * (predicted cost added to worker.queued_load_
                                   * at map, released when the task starts) */
+  /** Worker whose queued_load_ holds sched_reserved_us_: the release must
+   *  go to THAT worker, which is not always the one that runs the task (a
+   *  task can be mapped more than once before it starts). */
+  u32 sched_reserved_worker_ = 0xFFFFFFFFu;
   ctp::HighResMonotonicTimer wall_timer_; /**< Wall clock time across yields */
   float predicted_wall_us_ =
       0; /**< Predicted wall time from InferWallClockTime */
+  float booked_hold_us_ = 0; /**< Hold counted in the worker's load_ (us) */
+  u32 exec_segments_ = 0; /**< Executions so far (first run + resumes) */
   TaskStat
       predicted_stat_; /**< TaskStat used for prediction (for reinforcement) */
 
@@ -1119,8 +1136,12 @@ class RunContext {
         flags_(other.flags_),
         cpu_timer_(other.cpu_timer_),
         predicted_load_(other.predicted_load_),
+        sched_reserved_us_(other.sched_reserved_us_),
+        sched_reserved_worker_(other.sched_reserved_worker_),
         wall_timer_(other.wall_timer_),
         predicted_wall_us_(other.predicted_wall_us_),
+        booked_hold_us_(other.booked_hold_us_),
+        exec_segments_(other.exec_segments_),
         predicted_stat_(other.predicted_stat_) {
 #ifndef CLIO_ENABLE_BOOST_COROUTINES
     other.coro_handle_ = nullptr;
@@ -1153,8 +1174,12 @@ class RunContext {
       flags_ = other.flags_;
       cpu_timer_ = other.cpu_timer_;
       predicted_load_ = other.predicted_load_;
+      sched_reserved_us_ = other.sched_reserved_us_;
+      sched_reserved_worker_ = other.sched_reserved_worker_;
       wall_timer_ = other.wall_timer_;
       predicted_wall_us_ = other.predicted_wall_us_;
+      booked_hold_us_ = other.booked_hold_us_;
+      exec_segments_ = other.exec_segments_;
       predicted_stat_ = other.predicted_stat_;
 #ifndef CLIO_ENABLE_BOOST_COROUTINES
       other.coro_handle_ = nullptr;
@@ -1237,8 +1262,11 @@ class RunContext {
     cpu_timer_.time_ns_ = 0;
     predicted_load_ = 0;
     sched_reserved_us_ = 0;
+    sched_reserved_worker_ = 0xFFFFFFFFu;
     wall_timer_.time_ns_ = 0;
     predicted_wall_us_ = 0;
+    booked_hold_us_ = 0;
+    exec_segments_ = 0;
     predicted_stat_ = TaskStat();
   }
 };
@@ -1324,9 +1352,15 @@ CLIO_RCTX_GET(float, PredictedLoad, predicted_load_)
 CLIO_RCTX_SET(float, SetPredictedLoad, predicted_load_)
 CLIO_RCTX_GET(float, SchedReservedUs, sched_reserved_us_)
 CLIO_RCTX_SET(float, SetSchedReservedUs, sched_reserved_us_)
+CLIO_RCTX_GET(u32, SchedReservedWorker, sched_reserved_worker_)
+CLIO_RCTX_SET(u32, SetSchedReservedWorker, sched_reserved_worker_)
 CLIO_RCTX_REF(ctp::HighResMonotonicTimer, RunWallTimer, wall_timer_)
 CLIO_RCTX_GET(float, PredictedWallUs, predicted_wall_us_)
 CLIO_RCTX_SET(float, SetPredictedWallUs, predicted_wall_us_)
+CLIO_RCTX_GET(float, BookedHoldUs, booked_hold_us_)
+CLIO_RCTX_SET(float, SetBookedHoldUs, booked_hold_us_)
+CLIO_RCTX_GET(u32, ExecSegments, exec_segments_)
+CLIO_RCTX_SET(u32, SetExecSegments, exec_segments_)
 CLIO_RCTX_REF(TaskStat, PredictedStat, predicted_stat_)
 #ifndef CLIO_ENABLE_BOOST_COROUTINES
 CLIO_RCTX_REF(std::coroutine_handle<>, CoroHandle, coro_handle_)

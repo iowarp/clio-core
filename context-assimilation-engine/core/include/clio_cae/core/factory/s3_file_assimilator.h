@@ -76,8 +76,10 @@ void S3AssimLogPhaseTally();
  *
  * Credentials, region, and an optional S3-compatible endpoint are resolved
  * from the standard AWS environment at assimilation time
- * (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN, profiles,
- * instance roles; AWS_DEFAULT_REGION; S3_ENDPOINT or AWS_ENDPOINT_URL).
+ * (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN, profiles;
+ * AWS_DEFAULT_REGION; S3_ENDPOINT or AWS_ENDPOINT_URL). Public buckets are
+ * read unsigned when AWS_NO_SIGN_REQUEST is set or no credentials are
+ * configured at all (see aws_creds.h).
  */
 class S3FileAssimilator : public BaseAssimilator {
  public:

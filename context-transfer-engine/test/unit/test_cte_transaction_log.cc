@@ -322,6 +322,47 @@ TEST_CASE("TransactionLog - CreateTag DelTag roundtrip", "[cte][txnlog]") {
   TxnRemove(path);
 }
 
+TEST_CASE("TransactionLog - TagXattr set and delete roundtrip",
+          "[cte][txnlog]") {
+  std::string path = TxnTempFile("txn_tag_xattr");
+  TxnRemove(path);
+
+  TransactionLog log;
+  log.Open(path, 4096);
+
+  TxnTagXattr set_txn;
+  set_txn.tag_major_ = 31;
+  set_txn.tag_minor_ = 32;
+  set_txn.key_ = "~i";
+  set_txn.value_ = std::string("a\0b", 3);  // values are binary
+  log.Log(TxnType::kSetTagXattr, set_txn);
+
+  TxnTagXattr del_txn;
+  del_txn.tag_major_ = 31;
+  del_txn.tag_minor_ = 32;
+  del_txn.key_ = "";  // the whole section
+  log.Log(TxnType::kDelTagXattr, del_txn);
+  log.Sync();
+
+  auto entries = log.Load();
+  REQUIRE(entries.size() == 2);
+  REQUIRE(entries[0].type_ == TxnType::kSetTagXattr);
+  REQUIRE(entries[1].type_ == TxnType::kDelTagXattr);
+
+  TxnTagXattr set_out = TransactionLog::DeserializeTagXattr(entries[0].payload_);
+  REQUIRE(set_out.tag_major_ == 31);
+  REQUIRE(set_out.tag_minor_ == 32);
+  REQUIRE(set_out.key_ == "~i");
+  REQUIRE(set_out.value_ == std::string("a\0b", 3));
+
+  TxnTagXattr del_out = TransactionLog::DeserializeTagXattr(entries[1].payload_);
+  REQUIRE(del_out.key_.empty());
+  REQUIRE(del_out.value_.empty());
+
+  log.Close();
+  TxnRemove(path);
+}
+
 TEST_CASE("TransactionLog - Load from nonexistent file", "[cte][txnlog]") {
   TransactionLog log;
   // No Open() was performed -> file_path_ empty, fs::exists("") is false

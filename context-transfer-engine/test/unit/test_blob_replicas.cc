@@ -814,6 +814,92 @@ TEST_CASE("BlobReplicas - snapshot replica layouts restore into a fresh pool",
   REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
 }
 
+TEST_CASE("BlobReplicas - legacy type-0 tag snapshot restores into a new pool",
+          "[cte][wal][noleak]") {
+  // Covers RestoreMetadataFromLog's legacy TagInfo branch (entry type 0).
+  // FlushMetadata only writes type 5 now, so type 0 exists only in a snapshot
+  // left behind by an older binary. Write one by hand and replay it into a
+  // cold pool the same way the replica-restore case above does.
+  const std::string log_path = chi_test_data_dir() + "/legacy_tag_meta.log";
+  const std::string tag_name = "legacy_v0_tag";
+  const clio::cte::core::TagId tag_id(1, 4242);
+  const clio::run::u64 total_size = 12345;
+  {
+    std::ofstream out(log_path, std::ios::binary | std::ios::trunc);
+    CTP_MSAN_UNPOISON_OBJ(out);  // stream state is owned by libstdc++.so
+    REQUIRE(out.is_open());
+    const uint8_t entry_type = 0;
+    const uint32_t name_len = static_cast<uint32_t>(tag_name.size());
+    out.write(reinterpret_cast<const char *>(&entry_type), sizeof(entry_type));
+    out.write(reinterpret_cast<const char *>(&name_len), sizeof(name_len));
+    out.write(tag_name.data(), name_len);
+    out.write(reinterpret_cast<const char *>(&tag_id), sizeof(tag_id));
+    out.write(reinterpret_cast<const char *>(&total_size), sizeof(total_size));
+    CTP_MSAN_UNPOISON_OBJ(out);
+    REQUIRE(out.good());
+  }
+
+  const clio::run::PoolId pool_id(515, 0);
+  clio::run::PoolConfig cfg;
+  cfg.mod_name_ = "clio_cte_core";
+  cfg.pool_name_ = "clio_cte_legacy_restored";
+  cfg.pool_id_ = pool_id;
+  cfg.pool_query_ = clio::run::PoolQuery::Local();
+  cfg.restart_ = true;  // -> Runtime::Restart -> replay the snapshot
+  {
+    std::ostringstream y;
+    y << "targets:\n"
+      << "  neighborhood: 1\n"
+      << "storage:\n"
+      << "  - path: \"ram::legacy_tag_dram\"\n"
+      << "    bdev_type: \"ram\"\n"
+      << "    capacity_limit: \"16MB\"\n"
+      << "    score: 1.0\n"
+      << "performance:\n"
+      << "  metadata_log_path: " << log_path << "\n";
+    cfg.config_ = y.str();
+  }
+
+  clio::run::admin::Client admin_client(clio::run::kAdminPoolId);
+  auto compose = admin_client.AsyncCompose(cfg);
+  compose.Wait();
+  const clio::run::u32 compose_rc = compose->GetReturnCode();
+
+  // The tag must be known to the restored pool under its original id.
+  clio::run::u32 found = 0;
+  std::string restored_name;
+  if (compose_rc == 0) {
+    clio::cte::core::Client restored(pool_id);
+    auto name = restored.AsyncGetTagName(tag_id, clio::run::PoolQuery::Local());
+    name.Wait();
+    found = name->found_;
+    restored_name = name->tag_name_.str();
+    CTP_MSAN_UNPOISON_STRING(restored_name);
+
+    // Same reasoning as the replica-restore case for tearing down first and
+    // for the [noleak] tag.
+    auto destroy = admin_client.AsyncDestroyPool(clio::run::PoolQuery::Local(),
+                                                 pool_id);
+    destroy.Wait();
+  }
+
+  // The snapshot and any WAL shards the restored pool opened beside it.
+  std::error_code ec;
+  for (const auto &entry :
+       fs::directory_iterator(fs::path(log_path).parent_path(), ec)) {
+    CTP_MSAN_UNPOISON_OBJ(entry);
+    std::string name = entry.path().filename().string();
+    CTP_MSAN_UNPOISON_STRING(name);
+    if (name.rfind("legacy_tag_meta.log", 0) == 0) {
+      fs::remove(entry.path(), ec);
+    }
+  }
+
+  REQUIRE(compose_rc == 0);
+  REQUIRE(found == 1);
+  REQUIRE(restored_name == tag_name);
+}
+
 TEST_CASE("BlobReplicas - ReplicationConfig parses compose YAML",
           "[cte][replicas][replication][886]") {
   // The chimod's LoadConfig is what turns a clio_cte_replication compose

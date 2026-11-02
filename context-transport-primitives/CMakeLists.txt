@@ -21,7 +21,40 @@ set(CLIO_CTP_SHM_VERSION_MAJOR 2)
 set(CLIO_CTP_SHM_VERSION_MINOR 0)
 set(CLIO_CTP_SHM_VERSION_PATCH 0)
 set(CLIO_CTP_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
-include_directories(${CLIO_CTP_ROOT}/include)
+
+# ------------------------------------------------------------------------------
+# Modules
+# ------------------------------------------------------------------------------
+# Each module owns an include/, src/ and test/ directory under the CTP root.
+# Headers live at <module>/include/clio_ctp/<module>/, so they are still
+# included as "clio_ctp/<module>/...". base/ holds what belongs to no single
+# module: the clio_ctp.h umbrella header (base/include) and the shared test
+# harness plus the cross-module tests (base/test).
+set(CLIO_CTP_MODULES
+    constants
+    types
+    util
+    thread
+    memory
+    data_structures
+    serialize
+    introspect
+    io
+    lightbeam
+    compress
+    encrypt
+    search
+    solver
+)
+set(CLIO_CTP_INCLUDE_DIRS ${CLIO_CTP_ROOT}/base/include)
+foreach(_module IN LISTS CLIO_CTP_MODULES)
+    list(APPEND CLIO_CTP_INCLUDE_DIRS ${CLIO_CTP_ROOT}/${_module}/include)
+endforeach()
+# Cached so sibling projects that add the CTP headers by path (GPU twins in
+# context-runtime, CTE compressor tools) see the same list.
+set(CLIO_CTP_INCLUDE_DIRS ${CLIO_CTP_INCLUDE_DIRS} CACHE INTERNAL
+    "Include directories of every context-transport-primitives module")
+include_directories(${CLIO_CTP_INCLUDE_DIRS})
 include_directories(${PROJECT_BINARY_DIR}/include)
 add_compile_definitions(_CRT_SECURE_NO_DEPRECATE)
 
@@ -314,10 +347,33 @@ if(NOT IS_HSHM_MAIN)
 endif()
 
 # ------------------------------------------------------------------------------
-# Build clio_ctp source libraries (must be before ctp::compress so that
-# qtable_predictor and dense_nn_predictor targets are available)
+# Test harness (shared by every module's test/ directory)
 # ------------------------------------------------------------------------------
-add_subdirectory(src)
+if(CLIO_CORE_ENABLE_TESTS)
+    message("Building CTP unit tests")
+    find_package(Catch2 3 REQUIRED)
+    # main.cc, main_mpi.cc and basic_test.h
+    set(TEST_MAIN ${CLIO_CTP_ROOT}/base/test)
+    include_directories(${TEST_MAIN})
+endif()
+
+# ------------------------------------------------------------------------------
+# Build modules and the clio_ctp source libraries
+# ------------------------------------------------------------------------------
+# Called from a module's CMakeLists.txt to add its src/ files to the CTP
+# libraries. Paths are recorded relative to the CTP root because the same list
+# is compiled again for the CUDA/ROCm builds, which mirror sources by path.
+function(clio_ctp_add_sources)
+    file(RELATIVE_PATH _module "${CLIO_CTP_ROOT}" "${CMAKE_CURRENT_SOURCE_DIR}")
+    foreach(_src IN LISTS ARGN)
+        set_property(GLOBAL APPEND PROPERTY CLIO_CTP_SRC_FILES "${_module}/${_src}")
+    endforeach()
+endfunction()
+
+foreach(_module IN LISTS CLIO_CTP_MODULES)
+    add_subdirectory(${_module})
+endforeach()
+include(cmake/ClioCtpLibraries.cmake)
 
 # ctp::compress - Compression support
 add_library(compress INTERFACE)
@@ -513,20 +569,14 @@ if(CLIO_CORE_ENABLE_DOXYGEN)
     )
 endif()
 
-if(NOT IS_HSHM_MAIN)
-    add_custom_target(lint COMMAND bash ${CLIO_CTP_ROOT}/scripts/lint.sh ${CLIO_CTP_ROOT})
-    add_custom_target(preamble COMMAND python3 ${CLIO_CTP_ROOT}/scripts/preamble.py ${CLIO_CTP_ROOT})
-endif()
-
 # ------------------------------------------------------------------------------
-# Build tests + benchmarks
+# Build cross-module tests + benchmarks
 # ------------------------------------------------------------------------------
-set(TEST_MAIN ${CLIO_CTP_ROOT}/test/unit)
+# Per-module tests are added by each module's CMakeLists.txt above.
 # enable_testing() is handled by root CMakeLists.txt
 
 if(CLIO_CORE_ENABLE_TESTS)
-    message("Building CTP unit tests")
-    add_subdirectory(test)
+    add_subdirectory(base/test)
 endif()
 
 if(CLIO_CORE_ENABLE_BENCHMARKS)
@@ -539,7 +589,9 @@ endif()
 # ------------------------------------------------------------------------------
 # Install hshm
 # ------------------------------------------------------------------------------
-install(DIRECTORY include/ DESTINATION include)
+foreach(_include_dir IN LISTS CLIO_CTP_INCLUDE_DIRS)
+    install(DIRECTORY ${_include_dir}/ DESTINATION include)
+endforeach()
 
 # Component config files are no longer installed separately
 # All configuration is handled by unified IOWarp Core (IowarpCoreConfig.cmake)
@@ -551,5 +603,5 @@ install(EXPORT ${CLIO_CTP_EXPORTED_TARGETS}
 )
 
 if(CLIO_CORE_ENABLE_JARVIS)
-    jarvis_repo_add("${CTP_ROOT}/test/jarvis_hshm")
+    jarvis_repo_add("${CTP_ROOT}/base/test/jarvis_hshm")
 endif()

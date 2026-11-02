@@ -64,7 +64,7 @@ if(CLIO_GPU_SOURCES)
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include
+        ${CLIO_CTP_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
@@ -73,7 +73,7 @@ if(CLIO_GPU_SOURCES)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include>
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+      "$<BUILD_INTERFACE:${CLIO_CTP_INCLUDE_DIRS}>"
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     )
@@ -89,7 +89,7 @@ if(CLIO_GPU_SOURCES)
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include
+        ${CLIO_CTP_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
@@ -98,7 +98,7 @@ if(CLIO_GPU_SOURCES)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include>
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+      "$<BUILD_INTERFACE:${CLIO_CTP_INCLUDE_DIRS}>"
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     )
@@ -126,7 +126,7 @@ if(CLIO_GPU_SOURCES)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include>
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+      "$<BUILD_INTERFACE:${CLIO_CTP_INCLUDE_DIRS}>"
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     )
@@ -150,11 +150,11 @@ endif()
 
 # Set include directories as PUBLIC so they propagate to consumers
 # Use CMAKE_CURRENT_SOURCE_DIR/.. to get runtime directory (this is runtime/src)
-# Also include clio_ctp headers which are in context-transport-primitives/include
+# Also include the clio_ctp headers (one include dir per CTP module)
 target_include_directories(${CLIO_LIB_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+  "$<BUILD_INTERFACE:${CLIO_CTP_INCLUDE_DIRS}>"
   $<INSTALL_INTERFACE:include>
 )
 
@@ -239,7 +239,7 @@ target_link_libraries(${CLIO_LIB_NAME}
 # headers never mention a Poco type. CLIO_RUN_HAS_POCO is PUBLIC so ChiMods and
 # tests can #if on whether a dashboard exists in this build.
 if(Poco_FOUND)
-  target_link_libraries(${CLIO_LIB_NAME} PRIVATE Poco::Net Poco::Foundation)
+  clio_link_poco_private(${CLIO_LIB_NAME})
   target_compile_definitions(${CLIO_LIB_NAME} PUBLIC CLIO_RUN_HAS_POCO=1)
 else()
   target_compile_definitions(${CLIO_LIB_NAME} PUBLIC CLIO_RUN_HAS_POCO=0)

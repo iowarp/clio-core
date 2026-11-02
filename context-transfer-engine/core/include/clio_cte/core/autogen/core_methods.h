@@ -116,7 +116,11 @@ GLOBAL_CROSS_CONST clio::run::u32 kSyncTag = 56;
 // modules whose state lives in blobs of nameless tags.
 GLOBAL_CROSS_CONST clio::run::u32 kListLocalBlobs = 57;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 58;
+// Per-tag key/value section (set / get / delete / list one key), held in
+// memory on the container that owns it and logged per key in the WAL.
+GLOBAL_CROSS_CONST clio::run::u32 kTagXattr = 58;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 59;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -154,6 +158,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[55] = "UpdateTagNames";
     v[56] = "SyncTag";
     v[57] = "ListLocalBlobs";
+    v[58] = "TagXattr";
     v[41] = "GetCapacity";
     v[42] = "GetNumAliases";
     v[43] = "PodPutBlob";

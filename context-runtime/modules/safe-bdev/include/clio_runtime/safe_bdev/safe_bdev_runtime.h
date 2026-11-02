@@ -467,7 +467,12 @@ class Runtime : public clio::run::Container {
   // Reed-Solomon codec cache, keyed by stripe width k_s (data-shard count). Each
   // codec is RS(k_s, max_failures_); a stripe of width k_s uses parity shards
   // 0..parity_level_-1 of it. Few distinct widths, so this stays tiny.
+  // Guarded by rs_cache_mu_: GetCodec runs from coroutines on several workers
+  // at once, and an unguarded find/emplace raced two inserts and corrupted the
+  // tree (LeakSanitizer: a lost node in cr_safe_bdev_concurrency_tests).
+  // Codecs are never erased, so a returned pointer stays valid after unlock.
   std::map<int, std::unique_ptr<ec::ReedSolomon>> rs_cache_;
+  std::mutex rs_cache_mu_;
 
   // Persistent allocator-state log (WAL). REUSED from the bdev module. All slot
   // allocations are logged under a SINGLE group id (kAllocGroup) as BANDED
@@ -822,6 +827,7 @@ class Runtime : public clio::run::Container {
 
   /** RS codec for a stripe of width `k` (RS(k, max_failures_)); cached. */
   ec::ReedSolomon *GetCodec(int k) {
+    std::lock_guard<std::mutex> lk(rs_cache_mu_);
     auto it = rs_cache_.find(k);
     if (it == rs_cache_.end()) {
       it = rs_cache_

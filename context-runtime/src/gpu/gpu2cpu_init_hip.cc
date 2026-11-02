@@ -40,6 +40,55 @@
 
 namespace clio::run {
 
+// Backend calls the gpu2cpu device ring needs. The ring was written against
+// the CUDA runtime only, so every ROCm build (AMD or HIP-NVCC) compiled it
+// out and ServerInitGpuQueues failed with "device ring alloc failed" now
+// that the ring is the default. One spelling per backend here; the ring code
+// below is backend-neutral.
+namespace {
+#if CTP_ENABLE_CUDA
+inline bool RingDevMalloc(void **p, size_t n) {
+  return cudaMalloc(p, n) == cudaSuccess;
+}
+inline bool RingHostAllocMapped(void **p, size_t n) {
+  return cudaHostAlloc(p, n, cudaHostAllocMapped) == cudaSuccess;
+}
+inline bool RingHostDevPtr(void **d, void *h) {
+  return cudaHostGetDevicePointer(d, h, 0) == cudaSuccess;
+}
+inline void RingCopyH2D(void *dst, const void *src, size_t n) {
+  cudaMemcpy(dst, src, n, cudaMemcpyHostToDevice);
+}
+inline void RingCopyH2DSync(void *dst, const void *src, size_t n,
+                            void *stream) {
+  auto *s = static_cast<cudaStream_t>(stream);
+  cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, s);
+  cudaStreamSynchronize(s);
+}
+inline void RingHostFree(void *p) { cudaFreeHost(p); }
+#elif CTP_ENABLE_ROCM
+inline bool RingDevMalloc(void **p, size_t n) {
+  return hipMalloc(p, n) == hipSuccess;
+}
+inline bool RingHostAllocMapped(void **p, size_t n) {
+  return hipHostMalloc(p, n, hipHostMallocMapped) == hipSuccess;
+}
+inline bool RingHostDevPtr(void **d, void *h) {
+  return hipHostGetDevicePointer(d, h, 0) == hipSuccess;
+}
+inline void RingCopyH2D(void *dst, const void *src, size_t n) {
+  (void)hipMemcpy(dst, src, n, hipMemcpyHostToDevice);
+}
+inline void RingCopyH2DSync(void *dst, const void *src, size_t n,
+                            void *stream) {
+  auto s = static_cast<hipStream_t>(stream);
+  (void)hipMemcpyAsync(dst, src, n, hipMemcpyHostToDevice, s);
+  (void)hipStreamSynchronize(s);
+}
+inline void RingHostFree(void *p) { (void)hipHostFree(p); }
+#endif
+}  // namespace
+
 // Note: queue construction happens host-side (see ServerInitGpuQueues).
 // We previously launched a single-thread kernel to construct the
 // BuddyAllocator + GpuTaskQueue in device memory, but the kernel had no
@@ -144,12 +193,9 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
                               std::string(dr) != "false");
       if (use_ring) {
         void *ring_mem = nullptr;
-#if CTP_ENABLE_CUDA
-        if (cudaMalloc(&ring_mem, sizeof(clio::run::GpuDeviceRing)) !=
-            cudaSuccess) {
+        if (!RingDevMalloc(&ring_mem, sizeof(clio::run::GpuDeviceRing))) {
           ring_mem = nullptr;
         }
-#endif
         if (ring_mem == nullptr) {
           HLOG(kError, "ServerInitGpuQueues: device ring alloc failed "
                "(gpu_id={})", gpu_id);
@@ -160,17 +206,14 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
         // read submissions with plain loads. cudaHostAllocMapped is what makes
         // the same bytes addressable from a kernel; cudaHostGetDevicePointer
         // yields the address the device must use.
-#if CTP_ENABLE_CUDA
         void *h_ents = nullptr, *h_rdy = nullptr;
         void *d_ents = nullptr, *d_rdy = nullptr;
         bool host_ok =
-            cudaHostAlloc(&h_ents,
-                          clio::run::kGpuRingCapacity *
-                              sizeof(clio::run::GpuRingEntry),
-                          cudaHostAllocMapped) == cudaSuccess &&
-            cudaHostAlloc(&h_rdy,
-                          clio::run::kGpuRingCapacity * sizeof(unsigned int),
-                          cudaHostAllocMapped) == cudaSuccess;
+            RingHostAllocMapped(&h_ents,
+                                clio::run::kGpuRingCapacity *
+                                    sizeof(clio::run::GpuRingEntry)) &&
+            RingHostAllocMapped(&h_rdy, clio::run::kGpuRingCapacity *
+                                            sizeof(unsigned int));
         if (host_ok) {
           // Stamps must read "not ready" before any producer runs, or the
           // consumer would accept whatever the allocation happened to contain.
@@ -179,8 +222,8 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
           std::memset(h_ents, 0,
                       clio::run::kGpuRingCapacity *
                           sizeof(clio::run::GpuRingEntry));
-          host_ok = cudaHostGetDevicePointer(&d_ents, h_ents, 0) == cudaSuccess &&
-                    cudaHostGetDevicePointer(&d_rdy, h_rdy, 0) == cudaSuccess;
+          host_ok = RingHostDevPtr(&d_ents, h_ents) &&
+                    RingHostDevPtr(&d_rdy, h_rdy);
         }
         if (!host_ok) {
           HLOG(kError, "ServerInitGpuQueues: mapped host ring alloc failed "
@@ -190,17 +233,14 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
         }
         dev.ring.host_entries = static_cast<clio::run::GpuRingEntry *>(h_ents);
         dev.ring.host_ready = static_cast<unsigned int *>(h_rdy);
-#endif
         // Construct on the host, then upload once: head_/tail_ zeroed and the
         // payload pointers set to the DEVICE-side addresses of the pinned
         // allocations above.
         {
           auto *init = new clio::run::GpuDeviceRing();
-#if CTP_ENABLE_CUDA
           init->entries_ = static_cast<clio::run::GpuRingEntry *>(d_ents);
           init->ready_ = static_cast<unsigned int *>(d_rdy);
-          cudaMemcpy(ring_mem, init, sizeof(*init), cudaMemcpyHostToDevice);
-#endif
+          RingCopyH2D(ring_mem, init, sizeof(*init));
           delete init;
         }
         dev.ring.dev_ring = static_cast<clio::run::GpuDeviceRing *>(ring_mem);
@@ -282,6 +322,17 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
                     cudaMemAdviseSetAccessedBy, dev_id);
 #endif
     }
+#elif CTP_ENABLE_ROCM
+    // Same advice as the CUDA branch (see above). hipMemAdvise keeps the
+    // (advice, int device) form; under HIP-NVCC it forwards to cudaMemAdvise.
+    if (!ring_live) {
+      int dev_id = 0;
+      (void)hipGetDevice(&dev_id);
+      (void)hipMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                         hipMemAdviseSetPreferredLocation, hipCpuDeviceId);
+      (void)hipMemAdvise(dev.queue_backend, kQueueBackendBytes,
+                         hipMemAdviseSetAccessedBy, dev_id);
+    }
 #endif
 
     // Host-side construction. queue_backend is managed memory mapped
@@ -340,7 +391,7 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
  * ends up parked on a device task).
  */
 bool gpu::IpcManager::RingNext(u32 gpu_id, clio::run::GpuRingEntry *out) {
-#if CTP_ENABLE_CUDA
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM
   if (gpu_id >= per_gpu_devices_.size()) return false;
   auto &m = per_gpu_devices_[gpu_id].ring;
   if (m.dev_ring == nullptr || m.host_ready == nullptr) return false;
@@ -397,10 +448,7 @@ bool gpu::IpcManager::RingNext(u32 gpu_id, clio::run::GpuRingEntry *out) {
   // the only CUDA call left on this path, and it is paid per BATCH of real
   // work rather than per poll.
   m.tail += accepted;
-  auto *stream = static_cast<cudaStream_t>(m.stream);
-  cudaMemcpyAsync(&m.dev_ring->tail_, &m.tail, sizeof(m.tail),
-                  cudaMemcpyHostToDevice, stream);
-  cudaStreamSynchronize(stream);
+  RingCopyH2DSync(&m.dev_ring->tail_, &m.tail, sizeof(m.tail), m.stream);
 
   *out = m.pending[m.pending_pos++];
   return true;
@@ -425,16 +473,14 @@ void gpu::IpcManager::FinalizeGpuQueues() {
       ctp::GpuApi::Free(reinterpret_cast<char *>(dev.ring.dev_ring));
       dev.ring.dev_ring = nullptr;
     }
-#if CTP_ENABLE_CUDA
     if (dev.ring.host_entries) {
-      cudaFreeHost(dev.ring.host_entries);
+      RingHostFree(dev.ring.host_entries);
       dev.ring.host_entries = nullptr;
     }
     if (dev.ring.host_ready) {
-      cudaFreeHost(dev.ring.host_ready);
+      RingHostFree(dev.ring.host_ready);
       dev.ring.host_ready = nullptr;
     }
-#endif
     dev.gpu2cpu_queue = ctp::ipc::FullPtr<clio::run::GpuTaskQueue>::GetNull();
     dev.client_backends.clear();
   }
@@ -488,5 +534,8 @@ extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
 #if CTP_ENABLE_CUDA
   ctp::CtpCopyKernel<uint4><<<64, 256, 0, (cudaStream_t) stream>>>(dst, src,
                                                                    n);
+#elif CTP_IS_ROCM_COMPILER
+  ctp::CtpCopyKernel<uint4><<<64, 256, 0, (hipStream_t) stream>>>(dst, src,
+                                                                  n);
 #endif
 }

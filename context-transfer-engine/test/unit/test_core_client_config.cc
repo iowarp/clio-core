@@ -76,11 +76,15 @@ class CoreClientConfigFixture {
   CoreClientConfigFixture() {
     INFO("=== Initializing Core Client/Config Test Environment ===");
 
-    // Initialize test paths
-    std::string home_dir = ctp::SystemInfo::GetHomeDir();
-    REQUIRE(!home_dir.empty());
-    test_storage_path_ = home_dir + "/cte_client_test.dat";
-    test_config_path_ = home_dir + "/cte_test_config.yaml";
+    // Initialize test paths. The storage file grows to ~1 GB, so it goes in
+    // the temp directory (TMPDIR on POSIX, TMP/TEMP on Windows), not in a
+    // quota-limited home directory; home is only the fallback.
+    std::error_code tmp_ec;
+    std::string test_dir = fs::temp_directory_path(tmp_ec).string();
+    if (tmp_ec || test_dir.empty()) test_dir = ctp::SystemInfo::GetHomeDir();
+    REQUIRE(!test_dir.empty());
+    test_storage_path_ = (fs::path(test_dir) / "cte_client_test.dat").string();
+    test_config_path_ = (fs::path(test_dir) / "cte_test_config.yaml").string();
 
     // Clean up existing files. Non-throwing form: on Windows the previous
     // test case's bdev runtime still holds the storage file open (same

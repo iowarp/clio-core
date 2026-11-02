@@ -22,6 +22,14 @@
 // keeps working and the bdev's contract is unchanged), and otherwise reads the
 // [profile] section of ~/.aws/credentials. Secrets never travel in a task
 // payload -- only the profile NAME does.
+//
+// Anonymous access: public buckets (the AWS Open Data registry) must be read
+// unsigned, as with `aws s3 --no-sign-request`. Mirroring cae_s3_tool, the
+// resolver goes anonymous when AWS_NO_SIGN_REQUEST is set, or when nothing at
+// all is configured -- no env keys, no profile named, and no [default] profile
+// -- since a signed request could only have been rejected. A profile that was
+// named but is missing or incomplete still fails loudly: that caller meant to
+// sign.
 
 #include <cctype>
 #include <cstdlib>
@@ -38,6 +46,7 @@ struct AwsCredentials {
   std::string secret_key;
   std::string session_token;  ///< empty unless STS/temporary credentials
   std::string region;
+  bool anonymous = false;  ///< send unsigned; the key fields are then empty
 };
 
 /** Outcome of resolution: ok, or an error naming the profile and file tried. */
@@ -57,6 +66,7 @@ struct AwsCredEnv {
   std::string region_alt;        ///< AWS_REGION (newer SDK spelling)
   std::string shared_creds_file; ///< AWS_SHARED_CREDENTIALS_FILE
   std::string config_file;       ///< AWS_CONFIG_FILE
+  std::string no_sign_request;   ///< AWS_NO_SIGN_REQUEST ("" or "0" = sign)
 };
 
 namespace detail {
@@ -113,21 +123,72 @@ inline std::string IniGet(const IniSections &ini, const std::string &section,
   return k == s->second.end() ? "" : k->second;
 }
 
+/**
+ * Fill r->creds with keys (or mark them anonymous) per the credential
+ * precedence of ResolveAwsCredentialsFrom. Returns false with r->error set.
+ *
+ * @param profile        Effective profile name.
+ * @param profile_named  True if the caller named it (ctx or AWS_PROFILE)
+ *                       rather than it defaulting to "default".
+ */
+inline bool ResolveKeys(const std::string &profile, bool profile_named,
+                        const AwsCredEnv &env,
+                        const std::string &credentials_text,
+                        AwsCredResult *r) {
+  // Same truthiness as cae_s3_tool: any non-empty value but "0".
+  if (!env.no_sign_request.empty() && env.no_sign_request != "0") {
+    r->creds.anonymous = true;
+    return true;
+  }
+  if (!env.access_key.empty() && !env.secret_key.empty()) {
+    r->creds.access_key = env.access_key;
+    r->creds.secret_key = env.secret_key;
+    r->creds.session_token = env.session_token;
+    return true;
+  }
+  IniSections creds = ParseIni(credentials_text);
+  if (creds.find(profile) == creds.end()) {
+    if (!profile_named) {
+      // Nothing configured anywhere: a signed request could only be rejected,
+      // so ask anonymously -- the only request that can succeed (public data).
+      r->creds.anonymous = true;
+      return true;
+    }
+    r->error = "AWS credentials: no profile [" + profile +
+               "] in the credentials file (set AWS_ACCESS_KEY_ID/"
+               "AWS_SECRET_ACCESS_KEY, or AWS_SHARED_CREDENTIALS_FILE / "
+               "s3_profile correctly)";
+    return false;
+  }
+  r->creds.access_key = IniGet(creds, profile, "aws_access_key_id");
+  r->creds.secret_key = IniGet(creds, profile, "aws_secret_access_key");
+  r->creds.session_token = IniGet(creds, profile, "aws_session_token");
+  if (r->creds.access_key.empty() || r->creds.secret_key.empty()) {
+    r->error = "AWS credentials: profile [" + profile +
+               "] is missing aws_access_key_id / aws_secret_access_key";
+    return false;
+  }
+  return true;
+}
+
 }  // namespace detail
 
 /**
  * Resolve credentials + region from injected inputs (the testable core).
  *
  * Precedence -- credentials:
- *   1. env access+secret (+token) if BOTH key and secret are present;
- *   2. else the `[profile]` section of the credentials file, where profile is
- *      ctx_profile, else env AWS_PROFILE, else "default".
+ *   1. anonymous if AWS_NO_SIGN_REQUEST is set (any value but "0");
+ *   2. env access+secret (+token) if BOTH key and secret are present;
+ *   3. else the `[profile]` section of the credentials file, where profile is
+ *      ctx_profile, else env AWS_PROFILE, else "default";
+ *   4. else, if no profile was named and [default] does not exist, anonymous.
  * Precedence -- region:
  *   ctx_region, else AWS_DEFAULT_REGION, else AWS_REGION, else the profile's
  *   `region` in the config file (section "default" or "profile <name>").
- * A missing profile, missing keys, or unresolved region each fail loudly,
- * naming the profile and (for credentials) the file searched. No silent
- * us-east-1 default: a wrong region is a 301 the signer will not follow.
+ *   Anonymous requests need a region too.
+ * A named profile that is missing, missing keys, or an unresolved region each
+ * fail loudly, naming the profile and (for credentials) the file searched. No
+ * silent us-east-1 default: a wrong region is a 301 the signer will not follow.
  *
  * @param ctx_profile AssimilationCtx.s3_profile (may be empty).
  * @param ctx_region  AssimilationCtx.s3_region (may be empty).
@@ -147,28 +208,9 @@ inline AwsCredResult ResolveAwsCredentialsFrom(const std::string &ctx_profile,
                            : (!env.profile.empty() ? env.profile : "default");
 
   // --- credentials ---
-  if (!env.access_key.empty() && !env.secret_key.empty()) {
-    r.creds.access_key = env.access_key;
-    r.creds.secret_key = env.secret_key;
-    r.creds.session_token = env.session_token;
-  } else {
-    detail::IniSections creds = detail::ParseIni(credentials_text);
-    if (creds.find(profile) == creds.end()) {
-      r.error = "AWS credentials: no profile [" + profile +
-                "] in the credentials file (set AWS_ACCESS_KEY_ID/"
-                "AWS_SECRET_ACCESS_KEY, or AWS_SHARED_CREDENTIALS_FILE / "
-                "s3_profile correctly)";
-      return r;
-    }
-    r.creds.access_key = detail::IniGet(creds, profile, "aws_access_key_id");
-    r.creds.secret_key = detail::IniGet(creds, profile, "aws_secret_access_key");
-    r.creds.session_token =
-        detail::IniGet(creds, profile, "aws_session_token");
-    if (r.creds.access_key.empty() || r.creds.secret_key.empty()) {
-      r.error = "AWS credentials: profile [" + profile +
-                "] is missing aws_access_key_id / aws_secret_access_key";
-      return r;
-    }
+  const bool profile_named = !ctx_profile.empty() || !env.profile.empty();
+  if (!detail::ResolveKeys(profile, profile_named, env, credentials_text, &r)) {
+    return r;
   }
 
   // --- region ---
@@ -243,6 +285,7 @@ inline AwsCredResult ResolveAwsCredentials(const std::string &ctx_profile,
   env.region_alt = detail::Env("AWS_REGION");
   env.shared_creds_file = detail::Env("AWS_SHARED_CREDENTIALS_FILE");
   env.config_file = detail::Env("AWS_CONFIG_FILE");
+  env.no_sign_request = detail::Env("AWS_NO_SIGN_REQUEST");
 
   const std::string creds_path = !env.shared_creds_file.empty()
                                      ? env.shared_creds_file

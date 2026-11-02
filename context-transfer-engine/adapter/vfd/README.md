@@ -107,6 +107,8 @@ non-path and `H5Fopen` would abort. Both flags are now advertised.
 |---|---|---|---|
 | `cache_enabled` | `H5Pset_fapl_clio` | on | Populate the CTE tier on write |
 | `cache=0\|1` | `HDF5_DRIVER_CONFIG` | on | The same knob, from the environment |
+| `fsync=0\|1` | `HDF5_DRIVER_CONFIG` | off | `fsync` the native file in `H5Fflush` and `H5Fclose`, failing them if it does not succeed (see Durability) |
+| `CLIO_VFD_FSYNC` | env | off | `1` turns the same barrier on for every file in the process; it cannot turn off one a FAPL asked for |
 | `sieve=<bytes>` | `HDF5_DRIVER_CONFIG` | 64 KiB | Vector-I/O coalescing window: consecutive elements whose spanning region fits in it are serviced as one I/O. `0` restores element-at-a-time. Accepts 0 through 1 GiB; the value bounds a per-call scratch allocation, so anything larger is refused rather than clamped |
 | `HDF5_DRIVER=clio_vfd` | env | — | Select the driver without source changes |
 | `HDF5_PLUGIN_PATH` | env | — | Where HDF5 looks for the `.so` |
@@ -134,11 +136,17 @@ of the process — files stay native-only, which is correct but unaccelerated.
 
 ## Durability
 
-- `H5Fflush` / `H5Dflush` → `fsync` on the authoritative file. Fail-closed: a
-  flush that did not reach disk returns an error rather than reporting success.
-- `H5Fclose` → `fsync` then `close`, both checked. After a successful close the
-  on-disk file is a complete native HDF5 image and CLIO holds nothing needed to
-  read it.
+- Writes go straight to the authoritative file, so after a successful
+  `H5Fclose` it is a complete native HDF5 image and CLIO holds nothing needed to
+  read it. `close` is checked, and its failure fails the `H5Fclose`.
+- By default, like sec2, neither `H5Fflush` nor `H5Fclose` waits for the data to
+  reach stable storage: it is in the page cache, visible to every process on the
+  node, and the kernel writes it back on its own schedule.
+- To make both a durability barrier, set `fsync=1` in `HDF5_DRIVER_CONFIG` (or
+  `CLIO_VFD_FSYNC=1`). Flush and close then `fsync` the authoritative file and
+  fail if it does not succeed. It is off by default because it is expensive: about
+  4 ms per file on local NVMe, which makes file-per-step output 8-24x slower per
+  file than sec2, and more on a parallel filesystem.
 - Any driver failure either falls through to the native path or returns a real
   HDF5 error with a populated error stack. It never reports success for data that
   was not committed.

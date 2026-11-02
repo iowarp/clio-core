@@ -81,6 +81,7 @@ using namespace std::chrono_literals;
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_runtime/bdev/transports/block_allocator.h>
 #include <clio_runtime/bdev/bdev_tasks.h>
+#include <clio_runtime/bdev/prediction_parse.h>
 // Include the allocator WAL directly for the compaction test (drives the log
 // without a runtime).
 #include <clio_runtime/bdev/bdev_alloc_log.h>
@@ -1198,6 +1199,32 @@ TEST_CASE("bdev_set_lifespan_overrides_stats", "[bdev][health][ttl]") {
   REQUIRE(remaining_size > 0);
 
   HLOG(kInfo, "Injected bdev lifespan: {} days", stats_task->predicted_ttl_days_);
+}
+
+TEST_CASE("bdev_parse_days_remaining", "[bdev][health][ttl]") {
+  using clio::run::bdev::kHealthyTtlDays;
+  using clio::run::bdev::ParseDaysRemaining;
+
+  // A reply without the key (server unreachable) must not produce a value,
+  // so the poll thread keeps an injected / last-known TTL.
+  REQUIRE_FALSE(ParseDaysRemaining("").has_value());
+  REQUIRE_FALSE(ParseDaysRemaining("{}").has_value());
+  REQUIRE_FALSE(ParseDaysRemaining(
+      "{\"error\": \"Prediction server unreachable: Host not found\"}")
+      .has_value());
+
+  // Integer values, with and without whitespace around the colon.
+  REQUIRE(ParseDaysRemaining("{\"days_remaining\": 42}") == 42u);
+  REQUIRE(ParseDaysRemaining("{\"days_remaining\":7,\"x\":1}") == 7u);
+  REQUIRE(ParseDaysRemaining("{\"days_remaining\" :  0}") == 0u);
+
+  // null means healthy; anything unparseable is treated as healthy too.
+  REQUIRE(ParseDaysRemaining("{\"days_remaining\": null}") == kHealthyTtlDays);
+  REQUIRE(ParseDaysRemaining("{\"days_remaining\": \"soon\"}") ==
+          kHealthyTtlDays);
+  REQUIRE(ParseDaysRemaining("{\"days_remaining\": -3}") == kHealthyTtlDays);
+  REQUIRE(ParseDaysRemaining("\"days_remaining\":") == kHealthyTtlDays);
+  REQUIRE(ParseDaysRemaining("\"days_remaining\": nul") == kHealthyTtlDays);
 }
 
 TEST_CASE("bdev_error_conditions", "[bdev][error][edge_cases]") {

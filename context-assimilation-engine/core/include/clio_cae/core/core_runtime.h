@@ -37,8 +37,13 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cae/core/core_tasks.h>
 #include <clio_cae/core/factory/pagify.h>
+#include <clio_cae/core/factory/assimilation_ctx.h>
+#include <clio_cae/core/factory/base_assimilator.h>
 #include <clio_cae/core/core_client.h>
+#include <atomic>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 
 // The long-lived container owns the S3 keep-alive connection pool the s3://
@@ -254,6 +259,46 @@ class Runtime : public clio::run::Container {
   /** pagify: per-tag page map, loaded once from the tag's "pagemap" blob.
    *  Keyed by tag so a pool serving several datasets keeps them apart. */
   std::map<clio::cte::core::TagId, clio::cae::core::Pagify> page_maps_;
+
+  /**
+   * Ingest on fault (AssimilationCtx::on_fault): ParseOmni ingests nothing,
+   * records the context, and registers the CAE as the destination tag's fault
+   * handler. A read of a blob the tag does not hold makes the source's own
+   * assimilator ingest exactly that blob (BaseAssimilator::ReadBlob); the
+   * blob is stored in the tag and serves the read.
+   *
+   * Key = fault_params id "fault:<16 hex>", a hash of the context, so it
+   * names the same source on EVERY node: a miss is handled by the CAE on the
+   * node the read landed on, which loads the context from the shared registry
+   * tag when it did not register it itself. Entries are never erased.
+   */
+  struct OnFault {
+    AssimilationCtx ctx;
+    std::shared_ptr<BaseAssimilator> assimilator;
+    clio::run::u64 blob_bytes = 0;
+    // The tag's tier is full: serve faults from the source without storing
+    // for the next `skip_stores` faults, then try again (space may free).
+    std::atomic<clio::run::u32> skip_stores{0};
+    std::atomic<bool> warned_full{false};
+  };
+  std::map<std::string, std::shared_ptr<OnFault>> on_fault_;
+  std::mutex on_fault_mu_;
+  static constexpr const char *kOnFaultRegistryTag = "__cae_on_fault";
+  static constexpr const char *kOnFaultPrefix = "fault:";
+  static constexpr clio::run::u64 kOnFaultDescBytes = 16384;
+  static std::string OnFaultId(const AssimilationCtx &ctx);
+  static std::string EncodeCtx(const AssimilationCtx &ctx);
+  static bool DecodeCtx(const char *buf, size_t n, AssimilationCtx *ctx);
+  std::shared_ptr<OnFault> MakeOnFault(const AssimilationCtx &ctx);
+
+  /** HEADROOM. Ingested-on-fault blobs can always be re-ingested from their
+   *  source, so they must never take the last of a tier: when they did, the
+   *  application's own writes (e.g. a cross-node collective) found no space
+   *  and the job deadlocked. Free space across this node's CTE targets, as
+   *  last measured and debited by our own stores since. */
+  std::atomic<long long> tier_free_{-1};
+  std::atomic<long long> tier_free_at_ns_{0};
+  std::atomic<bool> tier_refreshing_{false};
 #ifdef CLIO_ENABLE_S3_REST
   /// Keep-alive S3 connections leased by the s3:// assimilator, one lease per
   /// object for its whole lifetime (safe across worker migration). Long-lived

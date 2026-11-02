@@ -52,6 +52,8 @@ namespace clio::cte::stream {
 namespace {
 /** Longest a Flush waits for its merges before failing (microseconds). */
 constexpr double kFlushDeadlineUs = 120.0 * 1e6;
+/// How long a flush waits on a stream whose home is down before failing EIO.
+constexpr double kFlushDeadHomeGraceUs = 5.0 * 1e6;
 /** Poll interval of a waiting Flush (microseconds). */
 constexpr double kFlushPollUs = 200.0;
 /** Backoff before re-shipping a batch whose home did not answer (ns). */
@@ -329,6 +331,19 @@ clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {
       task->return_code_ = kRcTimeout;
       CLIO_CO_RETURN;
     }
+    // Only the stream's home merges (decision stream-standin-merge): while
+    // it is dead nothing can complete this flush, and waiting out the full
+    // deadline blocked close()/fsync() for up to 120 s -- uninterruptibly,
+    // inside FUSE (truncate_during_failover hung). Fail fast instead; the
+    // staged appends stay queued and merge when the home is back.
+    if (waited_us >= kFlushDeadHomeGraceUs &&
+        !clio::cte::core::ContainerNodeAlive(pool_id_, task->home_)) {
+      HLOG(kWarning, "stream: flush of {}.{} failed: its home container {} "
+           "is down (appends stay queued until it returns)",
+           task->tag_id_.major_, task->tag_id_.minor_, task->home_);
+      task->return_code_ = kRcIo;
+      CLIO_CO_RETURN;
+    }
     CLIO_CO_AWAIT(clio::run::yield(kFlushPollUs));
   }
   auto s = self_.AsyncSizeOp(task->tag_id_, LiveHome(task->home_),
@@ -469,6 +484,7 @@ clio::run::TaskResume Runtime::FinishOpenPlans() {
             [](const StreamPlan &a, const StreamPlan &b) { return a.id_ < b.id_; });
   for (const auto &plan : plans) {
     bool ok = true;
+    TracePlan("replay-open-plan", plan);
     CLIO_CO_AWAIT(ExecutePlan(plan, nullptr, &ok));
     std::lock_guard<std::mutex> g(mu_);
     LogDoneLocked(plan.id_);

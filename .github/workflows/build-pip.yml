@@ -121,7 +121,7 @@ jobs:
         # does not bundle libfuse3.so.3 — end users get it from their
         # distro's fuse3 packages.
         CIBW_BEFORE_ALL: >
-          yum install -y curl patchelf fuse3-devel &&
+          yum install -y curl patchelf fuse3-devel openssl-devel &&
           bash {project}/installers/pip/build_deps_manylinux.sh
         CIBW_ENVIRONMENT: ${{ matrix.cibw_environment }}
         CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
@@ -148,12 +148,103 @@ jobs:
         path: installers/pip/wheelhouse/*.whl
 
   #------------------------------------------------------------
+  # GPU wheel variants (Linux x86_64, manylinux_2_28)
+  #
+  # Published as separate distributions that install the same iowarp_core
+  # package: iowarp-core-cuda12, iowarp-core-rocm6, iowarp-core-sycl. The
+  # variant's CMake defines (backend + fat architecture list) are in the
+  # CLIO_WHEEL_GPU overrides at the bottom of pyproject.toml;
+  # installers/pip/gpu_variant.py renames the distribution and adds its
+  # runtime dependency; install_gpu_toolchain.sh installs the compiler in
+  # the manylinux image. One job per (variant, Python): a fat GPU build is
+  # ~5x a CPU build, and five of them serially do not fit a job's time limit.
+  # The import test runs in the build container (no GPU), so it checks that
+  # the wheel loads, not that kernels run.
+  #------------------------------------------------------------
+  build-wheels-gpu:
+    name: GPU wheel (${{ matrix.variant }}, ${{ matrix.py }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cuda12, rocm6, sycl]
+        py: [cp310, cp311, cp312, cp313, cp314]
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /opt/hostedtoolcache/CodeQL
+        df -h /
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
+
+    - name: Select GPU variant
+      run: python3 installers/pip/gpu_variant.py ${{ matrix.variant }}
+
+    - name: Build wheel
+      env:
+        CIBW_BUILD: ${{ matrix.py }}-manylinux_x86_64
+        CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+        CIBW_BEFORE_ALL: >
+          yum install -y curl patchelf fuse3-devel openssl-devel &&
+          bash {project}/installers/pip/install_gpu_toolchain.sh ${{ matrix.variant }} &&
+          bash {project}/installers/pip/build_deps_manylinux.sh
+        # The icx/icpx and nvcc paths need oneAPI's environment and CUDA on
+        # PATH; harmless for the other variants.
+        CIBW_ENVIRONMENT: >-
+          CLIO_WHEEL_GPU=${{ matrix.variant }}
+          CMAKE_PREFIX_PATH=/usr/local
+          PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
+          CFLAGS=-march=x86-64
+          CXXFLAGS=-march=x86-64
+          PATH=/opt/intel/oneapi/compiler/latest/bin:/usr/local/cuda-12.9/bin:/opt/rocm/bin:$PATH
+          LD_LIBRARY_PATH=/opt/intel/oneapi/compiler/latest/lib:/opt/rocm/lib:$LD_LIBRARY_PATH
+          LIBRARY_PATH=/usr/local/cuda-12.9/lib64/stubs
+        CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+          bash {project}/installers/pip/repair_wheel.sh {dest_dir} {wheel} manylinux_2_28
+        # The CUDA stubs dir supplies libcuda.so.1 for this GPU-less import
+        # test only (see install_gpu_toolchain.sh); absent for other variants.
+        CIBW_TEST_COMMAND: >
+          LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64/stubs:$LD_LIBRARY_PATH
+          python -c "import iowarp_core; print('Version:', iowarp_core.get_version())"
+      run: cibuildwheel --output-dir installers/pip/wheelhouse
+
+    - name: Verify wheel glibc requirements match the platform tag
+      run: python3 installers/pip/check_wheel_glibc.py installers/pip/wheelhouse/*.whl
+
+    - name: Report wheel size
+      # PyPI's default per-file limit is 100 MB; fat GPU binaries can exceed
+      # it, which needs a limit increase on the PyPI project before release.
+      run: ls -lh installers/pip/wheelhouse/
+
+    - name: Upload wheel
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-gpu-${{ matrix.variant }}-${{ matrix.py }}
+        path: installers/pip/wheelhouse/*.whl
+
+  #------------------------------------------------------------
   # Build Windows wheels via cibuildwheel
   #------------------------------------------------------------
   build-wheels-windows:
     name: Build Windows wheels (${{ matrix.abi }})
     runs-on: windows-latest
-    timeout-minutes: 120
+    # Each ABI keeps the existing development budget for cold dependencies;
+    # a cold vcpkg cache adds ~24 min building Poco and OpenSSL (#1261).
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -177,9 +268,31 @@ jobs:
         git pull
         .\bootstrap-vcpkg.bat
 
+    # vcpkg builds every port from source; Poco + OpenSSL alone take ~24 min.
+    # Cache the built packages. vcpkg keys each package by its own ABI hash,
+    # so a stale cache only costs rebuilds, never wrong binaries. Saved right
+    # after the install so a later failing step still keeps the cache.
+    - name: Restore vcpkg binary cache
+      id: vcpkg-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/vcpkg-bincache
+        key: vcpkg-bin-x64-windows-${{ hashFiles('.github/workflows/build-pip.yml') }}
+        restore-keys: vcpkg-bin-x64-windows-
+
     - name: Install vcpkg dependencies
+      env:
+        VCPKG_BINARY_SOURCES: clear;files,${{ runner.temp }}/vcpkg-bincache,readwrite
       run: |
-        C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c
+        New-Item -ItemType Directory -Force "${{ runner.temp }}/vcpkg-bincache" | Out-Null
+        C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c "poco[net,netssl,crypto,json]"
+
+    - name: Save vcpkg binary cache
+      if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/vcpkg-bincache
+        key: vcpkg-bin-x64-windows-${{ hashFiles('.github/workflows/build-pip.yml') }}
 
     # WinFsp provides the FUSE3-compatible SDK the Windows fuse adapter
     # builds against (#899; see adapter/libfuse/CMakeLists.txt). The choco
@@ -250,18 +363,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Pin to macos-14 (Apple Silicon, macOS 14 Sonoma host). macos-latest
-          # is currently macos-15, where Homebrew bottles target macOS 15.0,
-          # which forces every bundled dylib's minimum target to 15.0 and
-          # makes the resulting wheel installable only on macOS 15+. macos-14
-          # bottles target macOS 14.0, giving the wheel ~2.5 years of OS
-          # compatibility (Sonoma, Sequoia, ...). The deployment target
-          # below has to match so delocate accepts the bundle.
-          - runner: macos-14
+          # macos-15 (Apple Silicon). macos-14 runner images are retired
+          # (brownouts from Oct 2026, removal Nov 2 2026). Homebrew bottles
+          # here target macOS 15.0, so every bundled dylib -- and therefore
+          # the wheel -- needs macOS 15+. The deployment target below has to
+          # match so delocate accepts the bundle.
+          - runner: macos-15
             arch: arm64
             cibw_build: "cp310-macosx_arm64 cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64 cp314-macosx_arm64"
             brew_prefix: /opt/homebrew
-            macosx_deployment_target: '14.0'
+            macosx_deployment_target: '15.0'
 
     steps:
     - name: Checkout repository
@@ -282,7 +393,34 @@ jobs:
         # the C API in serialize/msgpack_wrapper.h).
         bash CI/retry.sh brew update
         bash CI/retry.sh brew install cmake pkg-config \
-          yaml-cpp cereal msgpack-c libsodium zeromq cppzmq
+          yaml-cpp cereal msgpack-c libsodium zeromq cppzmq openssl@3
+
+    # Poco for the runtime's web dashboard, built here for the wheel's
+    # deployment target rather than taken from Homebrew, so its minimum
+    # macOS always matches what delocate accepts. Absolute install names let delocate find and
+    # bundle the dylibs (only PocoNet + PocoFoundation are linked; the
+    # NetSSL/Crypto libraries just satisfy find_package).
+    - name: Build Poco for the wheel's macOS target
+      env:
+        MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
+      run: |
+        POCO_PREFIX="${{ runner.temp }}/poco"
+        bash CI/retry.sh curl -fsSL -o poco.tar.gz \
+          https://github.com/pocoproject/poco/archive/refs/tags/poco-1.14.1-release.tar.gz
+        tar xzf poco.tar.gz
+        cmake -S poco-poco-1.14.1-release -B poco-build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX="$POCO_PREFIX" \
+          -DCMAKE_INSTALL_NAME_DIR="$POCO_PREFIX/lib" \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.macosx_deployment_target }} \
+          -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+          -DPOCO_MINIMAL_BUILD=ON \
+          -DENABLE_NET=ON -DENABLE_JSON=ON -DENABLE_XML=ON -DENABLE_UTIL=ON \
+          -DENABLE_CRYPTO=ON -DENABLE_NETSSL=ON \
+          -DENABLE_TESTS=OFF -DENABLE_SAMPLES=OFF
+        cmake --build poco-build -j "$(sysctl -n hw.ncpu)"
+        cmake --install poco-build
+        rm -rf poco.tar.gz poco-poco-1.14.1-release poco-build
 
     - name: Install cibuildwheel
       run: bash CI/retry.sh pip install cibuildwheel
@@ -292,8 +430,8 @@ jobs:
         CIBW_BUILD: ${{ matrix.cibw_build }}
         # MACOSX_DEPLOYMENT_TARGET must match (or exceed) the minimum
         # macOS target of every dylib bundled by delocate. Homebrew
-        # bottles on the macos-14 runner are built for macOS 14.0, so
-        # the wheel's deployment target has to be at least 14.0 — set
+        # bottles on the macos-15 runner are built for macOS 15.0, so
+        # the wheel's deployment target has to be at least 15.0 — set
         # it for cibuildwheel (which propagates it into the build) AND
         # set it as an env var seen by the C++ compiler.
         MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
@@ -305,7 +443,7 @@ jobs:
         # that delocate can resolve against @loader_path/../lib and
         # bundle into the wheel.
         CIBW_ENVIRONMENT_MACOS: >-
-          CMAKE_PREFIX_PATH=${{ matrix.brew_prefix }}
+          CMAKE_PREFIX_PATH="${{ runner.temp }}/poco:${{ matrix.brew_prefix }}"
           PKG_CONFIG_PATH=${{ matrix.brew_prefix }}/lib/pkgconfig
           MACOSX_DEPLOYMENT_TARGET=${{ matrix.macosx_deployment_target }}
           SKBUILD_CMAKE_DEFINE='CLIO_CORE_ENABLE_RPATH=ON'
@@ -415,6 +553,9 @@ jobs:
         mkdir -p build/capacity-results
         docker run --rm \
           -v "$PWD/wheels:/wheels:ro" \
+          -v "$PWD/context-transfer-engine/wrapper/python:/capacity-tests:ro" \
+          -v "$PWD/build/capacity-results:/capacity-results" \
+          -v "$PWD/installers/pip:/ci:ro" \
           -v "$PWD/context-transfer-engine/wrapper/python:/capacity-tests:ro" \
           -v "$PWD/build/capacity-results:/capacity-results" \
           ${{ matrix.distro }} \
@@ -543,6 +684,9 @@ jobs:
             fi
             unset rc
 
+            echo "=== Web dashboard compiled in and its pages shipped ==="
+            python /ci/check_wheel_dashboard.py
+
             echo "=== Symbol resolution check ==="
             LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
             export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -630,21 +774,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Same runner as the build so the wheel's macosx_14_0_arm64
+          # Same runner as the build so the wheel's macosx_15_0_arm64
           # platform tag is satisfied (the wheel is also installable on
-          # macos-15+, but pinning here keeps test infra deterministic).
-          - runner: macos-14
+          # later macOS, but pinning here keeps test infra deterministic).
+          - runner: macos-15
             arch: arm64
             python: '3.12'
-          - runner: macos-14
+          - runner: macos-15
             arch: arm64
             python: '3.14'
 
     steps:
-    - name: Check out capacity regression
+    - name: Check out wheel checks and capacity regression
       uses: actions/checkout@v4
       with:
-        sparse-checkout: context-transfer-engine/wrapper/python
+        sparse-checkout: |
+          installers/pip
+          context-transfer-engine/wrapper/python
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -692,6 +838,9 @@ jobs:
           fi
           unset rc
         done
+
+        echo "=== Web dashboard compiled in and its pages shipped ==="
+        python installers/pip/check_wheel_dashboard.py
 
         echo "=== Symbol resolution check (otool -L) ==="
         LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
@@ -762,6 +911,8 @@ jobs:
       with:
         sparse-checkout: |
           CI
+          context-transfer-engine/wrapper/python
+          installers/pip
           context-transfer-engine/wrapper/python
 
     - name: Set up Python
@@ -845,6 +996,10 @@ jobs:
         python -c "import iowarp_core, glob, os, sys; dirs = [iowarp_core.get_lib_dir(), iowarp_core.get_bin_dir()]; missing = [m for m in ('cache', 'replication') if not any(glob.glob(os.path.join(d, f'*clio_cte_{m}_*')) for d in dirs)]; sys.exit(f'missing chimods: {missing}' if missing else 0)"
         if ($LASTEXITCODE -ne 0) { throw "cache/replication chimod DLLs missing from wheel" }
 
+        Write-Host "=== Web dashboard compiled in and its pages shipped ==="
+        python installers/pip/check_wheel_dashboard.py
+        if ($LASTEXITCODE -ne 0) { throw "wheel has no web dashboard" }
+
         $moduleDir = python -c "import iowarp_core; print(iowarp_core.get_ext_dir())"
         if ($LASTEXITCODE -ne 0) { throw "get_ext_dir failed" }
         python context-transfer-engine/wrapper/python/test_cte_capacity.py `
@@ -922,6 +1077,54 @@ jobs:
     - name: Publish to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
+        skip-existing: true
+        verbose: true
+
+  #------------------------------------------------------------
+  # Publish GPU variants. Separate from publish-to-pypi so a GPU build
+  # failure cannot block the CPU release. Each distribution
+  # (iowarp-core-cuda12/-rocm6/-sycl) needs its own trusted-publisher entry
+  # on PyPI before this can succeed.
+  #------------------------------------------------------------
+  publish-gpu-to-pypi:
+    name: Publish GPU wheels to PyPI
+    needs: [check-version, build-wheels-gpu]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: pypi
+    permissions:
+      id-token: write
+    steps:
+    - name: Download GPU wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheels-gpu-*
+        merge-multiple: true
+        path: dist/
+
+    - name: List distributions
+      run: ls -lh dist/
+
+    # Trusted publishing first. A project that does not exist on PyPI yet
+    # can only be created by trusted publishing if an owner registered a
+    # "pending publisher" for it; until then fall back to the API token,
+    # which can create the project if it is account-scoped. The `id` lets the
+    # fallback run only when this step failed.
+    - name: Publish to PyPI (trusted publishing)
+      id: trusted
+      continue-on-error: true
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        skip-existing: true
+        verbose: true
+
+    - name: Publish to PyPI (API token fallback)
+      if: steps.trusted.outcome == 'failure'
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        password: ${{ secrets.PYPI_API_TOKEN }}
         skip-existing: true
         verbose: true
 

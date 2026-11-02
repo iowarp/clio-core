@@ -737,6 +737,16 @@ private:
   size_t RetireBatches();
   std::mutex batch_mu_;
   std::vector<std::shared_ptr<PendingDecomp>> batch_;
+  /**
+   * Take `req` back out of batch_ if the drainer has not gathered it yet.
+   *
+   * True: withdrawn, and nothing will ever touch its source or destination.
+   * False: the drainer already owns it, so a kernel may still be reading
+   * src_device and writing dst until `done`; the waiter must wait that out
+   * before releasing either. Giving up on an owned request let the caller
+   * free the page and the scratch under a live decode (CUDA error 700).
+   */
+  bool WithdrawDecomp(const std::shared_ptr<PendingDecomp> &req);
   std::thread batch_thread_;
   std::atomic<bool> batch_stop_{false};
   bool batch_enabled_ = false;
@@ -800,6 +810,24 @@ private:
 
   // Configuration
   CompressorConfig config_;
+
+  /** Resolved default_compress (#1251): mode kCompressSkip = no default. */
+  int default_mode_ = 0;
+  int default_lib_ = 0;     ///< wire ID when default_mode_ is static
+  int default_preset_ = 2;  ///< wire preset (kPresetBalanced)
+
+  /**
+   * Resolve config_.default_compress_ / default_preset_ into
+   * default_mode_ / default_lib_ / default_preset_. An unknown or unbuilt
+   * library is reported and leaves no default.
+   */
+  void ResolveDefaultCodec();
+
+  /**
+   * Give a write that requests no codec the pool's default (#1251).
+   * @param ctx the write's context; left alone if it names a codec or mode
+   */
+  void ApplyDefaultCodec(clio::cte::core::Context &ctx) const;
 
   // Target state cache for compression/tiering decisions
   std::unordered_map<std::string, TargetState> target_states_;

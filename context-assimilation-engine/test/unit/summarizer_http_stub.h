@@ -37,8 +37,9 @@
 /**
  * A minimal in-process HTTP server used by the summarizer tests to stand in
  * for an Ollama endpoint. Shared by:
- *   - test_summarizer_label_client.cc — drives OllamaGenerate's response
- *     handling (status, malformed JSON, missing field, success).
+ *   - test_summarizer_label_client.cc — drives OllamaGenerate's and
+ *     OpenAIChatComplete's response handling (status, malformed JSON,
+ *     missing field, success, bearer token).
  *   - test_summarizer_store.cc — lets the full PutBlob → summarize → store
  *     path run end-to-end with no model installed.
  *
@@ -93,6 +94,12 @@ class OneShotHttpServer {
 
   /** Bodies of the requests received so far, in arrival order. */
   std::vector<std::string> RequestBodies() const;
+
+  /**
+   * Request lines and headers of the requests received so far, in arrival
+   * order -- lets a test assert on the path and on Authorization.
+   */
+  std::vector<std::string> RequestHeads() const;
 
  private:
   struct Impl;

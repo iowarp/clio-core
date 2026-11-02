@@ -42,6 +42,7 @@
  *
  * Usage: ref <data_mb> <dims> <k> <iters>
  */
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>

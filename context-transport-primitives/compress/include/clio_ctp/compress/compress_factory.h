@@ -1,0 +1,686 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#ifndef CTP_SHM_INCLUDE_HSHM_SHM_UTIL_COMPRESS_COMPRESS_FACTORY_H_
+#define CTP_SHM_INCLUDE_HSHM_SHM_UTIL_COMPRESS_COMPRESS_FACTORY_H_
+
+#if CTP_ENABLE_COMPRESS
+
+#include <array>
+#include <cctype>
+#include <memory>
+#include <string>
+#include "compress.h"
+#include "lossless_modes.h"
+#include "snappy.h"
+#include "blosc.h"
+
+#if CTP_ENABLE_LIBPRESSIO
+#include "libpressio_modes.h"
+#endif
+
+#if CTP_ENABLE_NVCOMP
+#include "nvcomp.h"
+#endif
+
+#if CTP_ENABLE_ZFP_SYCL
+#include "sycl_zfp.h"
+#endif
+
+#if CTP_ENABLE_CUSZ
+#include "cusz.h"
+#endif
+
+#if CTP_ENABLE_NDZIP
+#include "ndzip.h"
+#endif
+
+#if CTP_ENABLE_CUSZP
+#include "cuszp.h"
+#endif
+
+namespace ctp {
+
+/**
+ * Compression preset levels for configurable compressors.
+ * Maps to compression levels (lossless) or error bounds (lossy).
+ */
+enum class CompressionPreset {
+  FAST,      // Fast compression, lower ratio/quality
+  BALANCED,  // Balanced speed and ratio/quality
+  BEST,      // Best ratio/quality, slower
+  DEFAULT    // Default configuration (for compressors without levels)
+};
+
+/**
+ * Factory for creating configured compression instances.
+ *
+ * Provides a unified interface for creating compressors with different
+ * configuration presets (FAST/BALANCED/BEST).
+ */
+class CompressionFactory {
+ public:
+  /**
+   * Get a compressor instance with the specified preset.
+   *
+   * @param library_name Name of compression library (case-insensitive)
+   *                     Supported: "bzip2", "zstd", "lz4", "zlib", "lzma",
+   *                                "brotli", "snappy", "blosc2"
+   *                                "zfp", "sz3", "fpzip" (if LibPressio enabled)
+   *                                "nvcomp-lz4", "nvcomp-snappy", "nvcomp-zstd",
+   *                                "nvcomp-gdeflate", "nvcomp-deflate",
+   *                                "nvcomp-ans" (if nvcomp enabled)
+   *                                "zfp-sycl" (lossy fixed-rate, if SYCL enabled)
+   *                                "cusz" (GPU lossy float, if cuSZ enabled)
+   *                                "ndzip" (GPU lossless float, if ndzip enabled)
+   *                                "cuszp" (GPU lossy float, if cuSZp enabled)
+   * @param preset Compression preset level (FAST/BALANCED/BEST/DEFAULT)
+   * @return Unique pointer to configured compressor instance,
+   *         or nullptr if library not found
+   *
+   * Example:
+   *   auto compressor = CompressionFactory::GetPreset("bzip2", CompressionPreset::FAST);
+   *   if (compressor) {
+   *     // Use compressor for compression
+   *   }
+   */
+  /**
+   * Compress a whole batch with ONE codec instance.
+   *
+   * This is the interface callers should reach for. It resolves the codec
+   * once and hands the codec the entire batch, so a GPU codec can issue a
+   * single launch covering every job instead of one per buffer.
+   *
+   * There is no autoselection here and there is not meant to be: the caller
+   * states which library it wants. Picking a codec is a policy decision that
+   * belongs to whoever knows the data, not to the compressor.
+   *
+   * @return true only if every job succeeded; per-job status is in job.ok.
+   */
+  static bool CompressBatch(const std::string& library_name,
+                            CompressionPreset preset, CompressJob* jobs,
+                            size_t n) {
+    auto codec = GetPreset(library_name, preset);
+    if (!codec) {
+      for (size_t i = 0; i < n; ++i) jobs[i].ok = false;
+      return false;
+    }
+    return codec->CompressBatch(jobs, n);
+  }
+
+  /** Decompress a whole batch with one codec instance. See CompressBatch. */
+  static bool DecompressBatch(const std::string& library_name,
+                              CompressionPreset preset, CompressJob* jobs,
+                              size_t n) {
+    auto codec = GetPreset(library_name, preset);
+    if (!codec) {
+      for (size_t i = 0; i < n; ++i) jobs[i].ok = false;
+      return false;
+    }
+    return codec->DecompressBatch(jobs, n);
+  }
+
+  /** Batch by wire id, for callers that carry the id rather than the name. */
+  static bool CompressBatchWire(int wire_id, CompressionPreset preset,
+                                CompressJob* jobs, size_t n) {
+    return CompressBatch(NameForWireId(wire_id), preset, jobs, n);
+  }
+
+  /** Batch by wire id. See CompressBatchWire. */
+  static bool DecompressBatchWire(int wire_id, CompressionPreset preset,
+                                  CompressJob* jobs, size_t n) {
+    return DecompressBatch(NameForWireId(wire_id), preset, jobs, n);
+  }
+
+  static std::unique_ptr<Compressor> GetPreset(
+      const std::string& library_name,
+      CompressionPreset preset = CompressionPreset::BALANCED) {
+    const CompressorInfo* info = FindByName(library_name);
+    // info->make is null when the backend is disabled at build time (LibPressio
+    // for lossy, nvcomp for GPU); GetPreset then returns nullptr just as the
+    // old per-name if-chain fell through to "return nullptr".
+    if (info == nullptr || info->make == nullptr) {
+      return nullptr;
+    }
+    return info->make(preset);
+  }
+
+  /**
+   * Get library ID for a given library name and preset.
+   * This ID can be used for model training and runtime compression selection.
+   *
+   * @param library_name Name of compression library
+   * @param preset Compression preset level
+   * @return Integer ID encoding both library and preset, or 0 if unknown
+   *
+   * ID encoding scheme:
+   * - Lossless: base_id * 10 + preset (e.g., BZIP2_FAST=11, BZIP2_BALANCED=12, BZIP2_BEST=13)
+   * - Lossy: base_id * 10 + preset (e.g., ZFP_FAST=101, ZFP_BALANCED=102, ZFP_BEST=103)
+   */
+  static int GetLibraryId(const std::string& library_name, CompressionPreset preset) {
+    const CompressorInfo* info = FindByName(library_name);
+    if (info == nullptr) return 0;  // Unknown library
+
+    // Single-mode libraries (snappy, blosc2, nvcomp) always encode preset 2.
+    if (info->single_mode) {
+      return info->base_id * 10 + 2;
+    }
+
+    // Encode preset: FAST=1, BALANCED=2, BEST=3, DEFAULT=2
+    int preset_id = 2;  // Default to BALANCED
+    switch (preset) {
+      case CompressionPreset::FAST: preset_id = 1; break;
+      case CompressionPreset::BALANCED: preset_id = 2; break;
+      case CompressionPreset::BEST: preset_id = 3; break;
+      case CompressionPreset::DEFAULT: preset_id = 2; break;
+    }
+
+    return info->base_id * 10 + preset_id;
+  }
+
+  /**
+   * Get library name and preset from library ID.
+   * Reverse of GetLibraryId().
+   *
+   * @param library_id Integer ID encoding library and preset
+   * @return Pair of (library_name, preset), or ("unknown", DEFAULT) if invalid
+   */
+  static std::pair<std::string, CompressionPreset> GetLibraryInfo(int library_id) {
+    int base_id = library_id / 10;
+    int preset_id = library_id % 10;
+
+    const CompressorInfo* info = FindByBaseId(base_id);
+    std::string library_name = info ? info->name : "unknown";
+
+    CompressionPreset preset = CompressionPreset::BALANCED;
+    if (preset_id == 1) preset = CompressionPreset::FAST;
+    else if (preset_id == 2) preset = CompressionPreset::BALANCED;
+    else if (preset_id == 3) preset = CompressionPreset::BEST;
+
+    return {library_name, preset};
+  }
+
+  /**
+   * Map a CTE wire ID to its canonical library name.
+   *
+   * The wire ID is the raw integer stored in CompressionHeader.compress_lib_
+   * (an array index, the on-disk/runtime protocol). It is a SEPARATE, frozen
+   * namespace from GetLibraryId's ML scheme (base_id*10 + preset). Out-of-range
+   * IDs fall back to "zstd" (the historical CTE default). Append-only: never
+   * renumber existing IDs or old compressed blobs become unreadable.
+   *
+   * @param wire_id Integer wire ID (compress_lib_)
+   * @return Canonical library name, or "zstd" if out of range
+   */
+  static std::string NameForWireId(int wire_id) {
+    const CompressorInfo* info = FindByWireId(wire_id);
+    return info ? info->name : "zstd";
+  }
+
+  /**
+   * Wire ID for a library name -- the reverse of NameForWireId().
+   *
+   * @param name canonical library name, e.g. "zstd"
+   * @return its wire ID, or 0 if the name is unknown or its backend was not
+   *         built into this binary
+   */
+  static int WireIdForName(const std::string& name) {
+    const CompressorInfo* info = FindByName(name);
+    return (info != nullptr && info->make != nullptr) ? info->wire_id : 0;
+  }
+
+  /**
+   * Reverse of NameForWireId: the frozen wire id for a canonical name.
+   *
+   * @param library_name canonical lowercase name (or a registered alias)
+   * @return the wire id, or 0 if the name is not in the registry. 0 is the
+   *         same "no codec" value the CTE context uses, so a caller can pass
+   *         the result straight through without a special case.
+   */
+  /** Does this wire id name a codec that executes on the device? */
+  static bool IsGpuWireId(int wire_id) {
+    const CompressorInfo* info = FindByWireId(wire_id);
+    return info != nullptr && info->gpu;
+  }
+
+  static int GetWireId(const std::string& library_name) {
+    const CompressorInfo* info = FindByName(library_name);
+    return info ? info->wire_id : 0;
+  }
+
+  /**
+   * Get string name for preset.
+   *
+   * @param preset Compression preset
+   * @return String representation ("fast", "balanced", "best", "default")
+   */
+  static std::string GetPresetName(CompressionPreset preset) {
+    switch (preset) {
+      case CompressionPreset::FAST: return "fast";
+      case CompressionPreset::BALANCED: return "balanced";
+      case CompressionPreset::BEST: return "best";
+      case CompressionPreset::DEFAULT: return "default";
+      default: return "unknown";
+    }
+  }
+
+
+  /**
+   * Override the stream for GPU codecs built on THIS thread only.
+   *
+   * A caller running several codec operations concurrently needs each one on
+   * its own stream, or they serialize against each other and its per-operation
+   * buffers buy nothing. The override is thread-local because a codec is
+   * constructed and used within one operation on one thread; pass null to go
+   * back to the current context's default stream.
+   *
+   * This is the ONLY stream override. A process-wide one existed and has been
+   * deleted: it held a stream created inside the compressor's dedicated codec
+   * CUcontext, so any codec that adopted it while running in the primary
+   * context received a stream from a context it was not in. See compress.h.
+   */
+  static void SetGpuStreamForThread(void *stream) { GpuStreamTls() = stream; }
+
+
+ private:
+
+  /** Per-thread stream override; see SetGpuStreamForThread. */
+  static void *&GpuStreamTls() { return GpuCodecStreamThread(); }
+
+  /** Signature of a function that constructs a compressor for a given preset. */
+  using MakeFn = std::unique_ptr<Compressor> (*)(CompressionPreset);
+
+  /**
+   * One row of the compressor registry -- the single source of truth tying a
+   * compressor's canonical name to its two frozen, INDEPENDENT integer
+   * namespaces:
+   *   - wire_id: raw index stored in CompressionHeader.compress_lib_ (the CTE
+   *              on-disk/runtime protocol; resolved by NameForWireId).
+   *   - base_id: ML scheme, encoded as base_id*10 + preset (see GetLibraryId).
+   * Both are append-only: NEVER renumber an existing entry or stored blobs /
+   * trained models break. `make` is nullptr when the backend is unavailable in
+   * this build (LibPressio off for lossy, nvcomp off for GPU); the name and ids
+   * still resolve, but GetPreset then returns nullptr.
+   *
+   * To add a compressor, add ONE row here (plus, for a GPU algorithm, one case
+   * in NvComp::MakeManager). No other edits in this file are needed.
+   */
+  struct CompressorInfo {
+    const char* name;  // canonical lowercase name
+    int wire_id;       // CTE wire/on-disk id (frozen, append-only)
+    int base_id;       // ML scheme base id (frozen, append-only)
+    bool single_mode;  // preset ignored; id always uses preset slot 2
+    MakeFn make;       // constructor, or nullptr if backend disabled
+    // Does this codec execute on the DEVICE? Declared per codec rather than
+    // sniffed from the name. The compressor runtime gates its whole GPU path
+    // (batched decompress, device codec context, tier-aware fetch -- ten call
+    // sites) on this, and it used to test `name starts with "nvcomp-"`, which
+    // silently drove cuszp/cusz/zfp-sycl -- all GPU compressors -- down the
+    // HOST path: per-page cudaStreamCreate, cudaMalloc, and D2H staging on a
+    // kHBM fault that should never leave the device.
+    bool gpu;
+  };
+
+  // Construction helpers for single-mode and backend-guarded compressors.
+  static std::unique_ptr<Compressor> MakeSnappy(CompressionPreset) {
+#if CTP_ENABLE_SNAPPY
+    return std::make_unique<Snappy>();
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeBlosc(CompressionPreset) {
+#if CTP_ENABLE_BLOSC2
+    return std::make_unique<Blosc>();
+#else
+    return nullptr;
+#endif
+  }
+
+  // Optional lossless codecs. The registry ROW must survive even when the
+  // backend is absent: wire_id and base_id are frozen protocol values, and
+  // NameForWireId still has to resolve them so a blob written on a box that
+  // had the codec reports the right name on one that does not. Only the
+  // constructor goes away -- exactly the nullptr contract the lossy/GPU
+  // backends have always used.
+  static std::unique_ptr<Compressor> MakeBrotli(CompressionPreset preset) {
+#if CTP_ENABLE_BROTLI
+    return CreateLossless<BrotliWithModes>(preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeBzip2(CompressionPreset preset) {
+#if CTP_ENABLE_BZIP2
+    return CreateLossless<Bzip2WithModes>(preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeLz4(CompressionPreset preset) {
+#if CTP_ENABLE_LZ4
+    return CreateLossless<Lz4WithModes>(preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeLzma(CompressionPreset preset) {
+#if CTP_ENABLE_LZMA
+    return CreateLossless<LzmaWithModes>(preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeZlib(CompressionPreset preset) {
+#if CTP_ENABLE_ZLIB
+    return CreateLossless<ZlibWithModes>(preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeZstd(CompressionPreset preset) {
+#if CTP_ENABLE_ZSTD
+    return CreateLossless<ZstdWithModes>(preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+
+  static std::unique_ptr<Compressor> MakeZfp(CompressionPreset preset) {
+#if CTP_ENABLE_LIBPRESSIO
+    return CreateLossy("zfp", preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeSz3(CompressionPreset preset) {
+#if CTP_ENABLE_LIBPRESSIO
+    return CreateLossy("sz3", preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeFpzip(CompressionPreset preset) {
+#if CTP_ENABLE_LIBPRESSIO
+    return CreateLossy("fpzip", preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  // GPU compressors (nvcomp). Each helper is always defined so its registry row
+  // is valid in every build; it returns nullptr when nvcomp is disabled (the
+  // name/ids still resolve, but GetPreset yields nullptr). All are single-mode.
+  // GetGpuCodecStreamThreadOnly is the only stream source. The process-wide
+  // is codec_slots_[0].stream, created inside the compressor's dedicated codec
+  // CUcontext. Handing it to nvcomp while running in the PRIMARY context (which
+  // is where CompressIntoShm runs) makes nvcomp's own internal cudaEventRecord
+  // fail with "invalid resource handle" -- compute-sanitizer counted 1016 of
+  // them in a single short run -- and it escalates intermittently to an illegal
+  // memory access that aborts the process (seen in 1 of 13 nvcomp-ans runs).
+  // The thread override is safe: the runtime installs it inside the guard for
+  // the matching context. With no override the codec gets null, i.e. the
+  // current context's default stream, which is always valid.
+  static std::unique_ptr<Compressor> MakeNvCompLz4(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::LZ4);
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompSnappy(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::SNAPPY, GetGpuCodecStreamThreadOnly());
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompZstd(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::ZSTD, GetGpuCodecStreamThreadOnly());
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompGdeflate(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::GDEFLATE, GetGpuCodecStreamThreadOnly());
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompDeflate(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::DEFLATE, GetGpuCodecStreamThreadOnly());
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompAns(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::ANS, GetGpuCodecStreamThreadOnly());
+#else
+    return nullptr;
+#endif
+  }
+  // GPU (SYCL/Intel-XPU) zfp. LOSSY fixed-rate only -- zfp's GPU backends do
+  // not support reversible/precision/accuracy modes -- so, unlike the
+  // single-mode nvcomp lossless codecs, presets map to fixed bit rates
+  // (FAST=8, BALANCED=16, BEST=24 bits per 32-bit value): higher rate ->
+  // higher fidelity, lower compression. Returns nullptr when the SYCL
+  // libzfp is not available in this build.
+  static std::unique_ptr<Compressor> MakeSyclZfp(CompressionPreset preset) {
+#if CTP_ENABLE_ZFP_SYCL
+    double rate;
+    switch (preset) {
+      case CompressionPreset::FAST: rate = 8.0; break;
+      case CompressionPreset::BEST: rate = 24.0; break;
+      case CompressionPreset::BALANCED:
+      case CompressionPreset::DEFAULT:
+      default: rate = 16.0; break;
+    }
+    return std::make_unique<SyclZfp>(rate);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  // cuSZ: GPU error-bounded LOSSY float compressor. Multi-mode like the lossy
+  // CPU entries -- presets map to error bounds (FAST=1e-2 loose, BALANCED=1e-3,
+  // BEST=1e-4 tight); higher fidelity -> lower compression. Returns nullptr when
+  // cuSZ is not available in this build.
+  static std::unique_ptr<Compressor> MakeCusz(CompressionPreset preset) {
+#if CTP_ENABLE_CUSZ
+    double eb;
+    switch (preset) {
+      case CompressionPreset::FAST: eb = 1e-2; break;
+      case CompressionPreset::BEST: eb = 1e-4; break;
+      case CompressionPreset::BALANCED:
+      case CompressionPreset::DEFAULT:
+      default: eb = 1e-3; break;
+    }
+    return std::make_unique<Cusz>(eb);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  // ndzip: GPU high-throughput LOSSLESS float compressor. Single-mode (no preset
+  // levels), like snappy/blosc2. Returns nullptr when ndzip is not available.
+  static std::unique_ptr<Compressor> MakeNdzip(CompressionPreset) {
+#if CTP_ENABLE_NDZIP
+    return std::make_unique<Ndzip>();
+#else
+    return nullptr;
+#endif
+  }
+  // cuSZp: GPU ultra-fast error-bounded LOSSY float compressor (single-kernel).
+  // Multi-mode like cusz/the lossy CPU entries -- presets map to ABSOLUTE error
+  // bounds (FAST=1e-2 loose, BALANCED=1e-3, BEST=1e-4 tight). Returns nullptr
+  // when cuSZp is not available in this build.
+  static std::unique_ptr<Compressor> MakeCuszp(CompressionPreset preset) {
+#if CTP_ENABLE_CUSZP
+    float eb;
+    switch (preset) {
+      case CompressionPreset::FAST: eb = 1e-2f; break;
+      case CompressionPreset::BEST: eb = 1e-4f; break;
+      case CompressionPreset::BALANCED:
+      case CompressionPreset::DEFAULT:
+      default: eb = 1e-3f; break;
+    }
+    return std::make_unique<Cuszp>(eb);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+
+  /**
+   * The compressor registry: the single source of truth (see CompressorInfo).
+   * constexpr std::array -> constant-initialized static data: no heap allocation
+   * and no thread-safe-init guard. The size is deduced (CTAD), so adding a row
+   * stays a one-line change. Iteration over 12 entries is trivial and happens
+   * only once per blob (in the factory setup path), never in the compress loop.
+   */
+  static const auto& Registry() {
+    //                                          name  wire base single  make            gpu
+    static constexpr std::array kRegistry = {
+        CompressorInfo{"brotli",      0,  6, false, &MakeBrotli, false},
+        CompressorInfo{"bzip2",       1,  1, false, &MakeBzip2, false},
+        CompressorInfo{"blosc2",      2,  8, true,  &MakeBlosc, false},
+        CompressorInfo{"fpzip",       3, 12, false, &MakeFpzip, false},
+        CompressorInfo{"lz4",         4,  3, false, &MakeLz4, false},
+        CompressorInfo{"lzma",        5,  5, false, &MakeLzma, false},
+        CompressorInfo{"snappy",      6,  7, true,  &MakeSnappy, false},
+        CompressorInfo{"sz3",         7, 11, false, &MakeSz3, false},
+        CompressorInfo{"zfp",         8, 10, false, &MakeZfp, false},
+        CompressorInfo{"zlib",        9,  4, false, &MakeZlib, false},
+        CompressorInfo{"zstd",       10,  2, false, &MakeZstd, false},
+        CompressorInfo{"nvcomp-lz4",      11, 13, true, &MakeNvCompLz4, true},
+        CompressorInfo{"nvcomp-snappy",   12, 14, true, &MakeNvCompSnappy, true},
+        CompressorInfo{"nvcomp-zstd",     13, 15, true, &MakeNvCompZstd, true},
+        CompressorInfo{"nvcomp-gdeflate", 14, 16, true, &MakeNvCompGdeflate, true},
+        CompressorInfo{"nvcomp-deflate",  15, 17, true, &MakeNvCompDeflate, true},
+        CompressorInfo{"nvcomp-ans",      16, 18, true, &MakeNvCompAns, true},
+        CompressorInfo{"zfp-sycl",        17, 19, false, &MakeSyclZfp, true},
+        CompressorInfo{"cusz",            18, 20, false, &MakeCusz, true},
+        CompressorInfo{"ndzip",           19, 21, true,  &MakeNdzip, false},
+        CompressorInfo{"cuszp",           20, 22, false, &MakeCuszp, true},
+    };
+    return kRegistry;
+  }
+
+  /**
+   * Look up a registry entry by (case-insensitive) name; nullptr if unknown.
+   * Accepts the historical "blosc" alias for "blosc2".
+   */
+  static const CompressorInfo* FindByName(const std::string& name) {
+    std::string n = name;
+    for (auto& c : n) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (n == "blosc") n = "blosc2";  // historical alias
+    for (const auto& e : Registry()) {
+      if (n == e.name) return &e;
+    }
+    return nullptr;
+  }
+
+  /** Look up a registry entry by CTE wire id; nullptr if none. */
+  static const CompressorInfo* FindByWireId(int wire_id) {
+    for (const auto& e : Registry()) {
+      if (e.wire_id == wire_id) return &e;
+    }
+    return nullptr;
+  }
+
+  /** Look up a registry entry by ML base id; nullptr if none. */
+  static const CompressorInfo* FindByBaseId(int base_id) {
+    for (const auto& e : Registry()) {
+      if (e.base_id == base_id) return &e;
+    }
+    return nullptr;
+  }
+
+  template<typename CompressorClass>
+  static std::unique_ptr<Compressor> CreateLossless(CompressionPreset preset) {
+    LosslessMode mode;
+    switch (preset) {
+      case CompressionPreset::FAST:
+        mode = LosslessMode::FAST;
+        break;
+      case CompressionPreset::BALANCED:
+      case CompressionPreset::DEFAULT:
+        mode = LosslessMode::BALANCED;
+        break;
+      case CompressionPreset::BEST:
+        mode = LosslessMode::BEST;
+        break;
+    }
+    return std::make_unique<CompressorClass>(mode);
+  }
+
+#if CTP_ENABLE_LIBPRESSIO
+  static std::unique_ptr<Compressor> CreateLossy(
+      const std::string& compressor_id, CompressionPreset preset) {
+    CompressionMode mode;
+    switch (preset) {
+      case CompressionPreset::FAST:
+        mode = CompressionMode::FAST;
+        break;
+      case CompressionPreset::BALANCED:
+      case CompressionPreset::DEFAULT:
+        mode = CompressionMode::BALANCED;
+        break;
+      case CompressionPreset::BEST:
+        mode = CompressionMode::BEST;
+        break;
+    }
+    return std::make_unique<LibPressioWithModes>(compressor_id, mode);
+  }
+#endif
+};
+
+}  // namespace ctp
+
+#endif  // CTP_ENABLE_COMPRESS
+
+#endif  // CTP_SHM_INCLUDE_HSHM_SHM_UTIL_COMPRESS_COMPRESS_FACTORY_H_

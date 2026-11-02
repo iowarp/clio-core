@@ -67,7 +67,7 @@ namespace clio::cae::summarizer {
  * signal to store nothing. A production deploy would dispatch each chunk to a
  * dedicated inference worker pool; this runs them inline on the calling worker.
  *
- * @param endpoint Base URL of the Ollama-compatible inference server.
+ * @param target Inference server, protocol, and token source.
  * @param rule The matched rule (supplies model, context_length, num_predict).
  * @param prompt_template Prompt text prepended to each chunk.
  * @param payload The blob bytes to summarize.
@@ -75,7 +75,7 @@ namespace clio::cae::summarizer {
  * @param blob_name Blob name, for log context only.
  * @return The concatenated summary, or "" when every chunk failed.
  */
-inline std::string GenerateSummary(const std::string &endpoint,
+inline std::string GenerateSummary(const InferenceTarget &target,
                                    const LabelMatch &rule,
                                    const std::string &prompt_template,
                                    const std::string &payload,
@@ -91,9 +91,9 @@ inline std::string GenerateSummary(const std::string &endpoint,
     full_prompt.append(chunks[i].data(), chunks[i].size());
 
     std::string chunk_summary;
-    bool ok = OllamaGenerate(endpoint, rule.model_, full_prompt,
-                             rule.context_length_, rule.num_predict_,
-                             chunk_summary);
+    bool ok = LabelGenerate(target, rule.model_, full_prompt,
+                            rule.context_length_, rule.num_predict_,
+                            chunk_summary);
     if (!ok || chunk_summary.empty()) {
       HLOG(kWarning,
            "Summarizer: chunk {} of {} failed for tag='{}' blob='{}' "
@@ -107,6 +107,29 @@ inline std::string GenerateSummary(const std::string &endpoint,
   }
   if (successful_chunks == 0) summary.clear();
   return summary;
+}
+
+/**
+ * GenerateSummary against an Ollama endpoint with no authentication.
+ *
+ * @param endpoint Base URL of the Ollama-compatible inference server.
+ * @param rule The matched rule (supplies model, context_length, num_predict).
+ * @param prompt_template Prompt text prepended to each chunk.
+ * @param payload The blob bytes to summarize.
+ * @param tag_name Tag name, for log context only.
+ * @param blob_name Blob name, for log context only.
+ * @return The concatenated summary, or "" when every chunk failed.
+ */
+inline std::string GenerateSummary(const std::string &endpoint,
+                                   const LabelMatch &rule,
+                                   const std::string &prompt_template,
+                                   const std::string &payload,
+                                   const std::string &tag_name,
+                                   const std::string &blob_name) {
+  InferenceTarget target;
+  target.endpoint_ = endpoint;
+  return GenerateSummary(target, rule, prompt_template, payload, tag_name,
+                         blob_name);
 }
 
 }  // namespace clio::cae::summarizer

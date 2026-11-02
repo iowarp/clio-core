@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <clio_cte/cache/cache_runtime.h>
+#include <clio_cte/core/blob_placement.h>
 
 namespace clio::cte::cache {
 
@@ -86,10 +87,253 @@ clio::run::PoolQuery Runtime::ScheduleTask(
       }
       break;
     }
+    case clio::cte::core::Method::kGetOrCreateTag:
+    case clio::cte::core::Method::kDelTag:
+      // Driven from here: the core resolves the name (locally once known),
+      // then a write is applied to every core container.
+      return clio::run::PoolQuery::Local();
+    case clio::cte::core::Method::kPodMultiGetBlob:
+      // The pager's batch is served where it was issued: cache copies are
+      // per node, and the core path below forwards remote records itself.
+      return clio::run::PoolQuery::Local();
     default:
       break;
   }
   return CoreInterposer::ScheduleTask(task);
+}
+
+// ===========================================================================
+// The GPU pager's batched fetch, cached like GetBlob.
+//
+// Remote-owned pages are served from this node's cache copy; misses (and
+// owner-local pages) go to the core as one batch; each fetched remote page
+// becomes a cache copy registered with its owner (RegisterReplicaContainer),
+// so the owner's next write to it deletes the copy first -- the same
+// owner-driven coherence GetBlob/PutBlob already use. No opt-in: every tag
+// fetched through this pool is cached.
+// ===========================================================================
+
+clio::run::TaskResume Runtime::PodMultiGetBlob(
+    clio::run::shared_ptr<clio::cte::core::PodMultiGetBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    using clio::cte::core::kPodMultiMax;
+    using clio::cte::core::PodBlobReq;
+    const clio::run::u32 n = std::min<clio::run::u32>(task->count_, kPodMultiMax);
+    if (n == 0 || CLIO_IPC->GetNumHosts() <= 1) {
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodMultiGetBlob,
+                                  task.template Cast<clio::run::Task>()));
+      CLIO_CO_RETURN;
+    }
+    task->NormalizeBlobName();  // decimal names from here on
+    const TagId tag = task->tag_id_;
+    auto *local = GetLocalClient();
+    auto *next = GetNextClient();
+
+    // 1. Remote-owned pages: try this node's cache copy (all issued, then
+    //    awaited). A cache copy is coherent by invalidation, so the
+    //    generational stamp-wait does not apply to it.
+    Context rctx = task->context_;
+    rctx.op_flags_ &= ~Context::kGenerational;
+    rctx.generation_ = 0;
+    rctx.create_on_get_ = false;
+    rctx.replica_ = clio::cte::core::kCacheReplica;
+    bool remote[kPodMultiMax] = {};
+    bool hit[kPodMultiMax] = {};
+    clio::run::Future<clio::cte::core::GetBlobTask> gets[kPodMultiMax];
+    for (clio::run::u32 i = 0; i < n; ++i) {
+      const std::string name = task->GetBlobName(i);
+      if (IsBlobOwnerLocal(tag, name)) continue;
+      remote[i] = true;
+      const PodBlobReq &r = task->reqs_[i];
+      gets[i] = local->AsyncGetBlob(tag, name, r.offset_, r.size_,
+                                    task->flags_, r.data_,
+                                    clio::run::PoolQuery::Local(), rctx);
+    }
+    clio::run::u32 nhit = 0;
+    for (clio::run::u32 i = 0; i < n; ++i) {
+      if (!remote[i]) continue;
+      CLIO_CO_AWAIT(gets[i]);
+      if (gets[i]->GetReturnCode() == 0) {
+        hit[i] = true;
+        task->reqs_[i].rc_ = 0;
+        ++nhit;
+      }
+    }
+    if (nhit == n) {
+      task->num_ok_ = n;
+      CLIO_CO_RETURN;
+    }
+
+    // 2. Everything else in ONE core batch (owner-local pages and cache
+    //    misses), compacted to the front and restored after.
+    PodBlobReq saved[kPodMultiMax];
+    clio::run::u32 map[kPodMultiMax];
+    clio::run::u32 m = 0;
+    for (clio::run::u32 i = 0; i < n; ++i) saved[i] = task->reqs_[i];
+    for (clio::run::u32 i = 0; i < n; ++i) {
+      if (!hit[i]) {
+        map[m] = i;
+        task->reqs_[m] = saved[i];
+        ++m;
+      }
+    }
+    task->count_ = m;
+    task->num_ok_ = 0;
+    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodMultiGetBlob,
+                                task.template Cast<clio::run::Task>()));
+    const clio::run::u32 core_ok = task->num_ok_;
+    clio::run::u32 rcs[kPodMultiMax];
+    for (clio::run::u32 j = 0; j < m; ++j) rcs[j] = task->reqs_[j].rc_;
+    for (clio::run::u32 i = 0; i < n; ++i) task->reqs_[i] = saved[i];
+    for (clio::run::u32 j = 0; j < m; ++j) task->reqs_[map[j]].rc_ = rcs[j];
+    task->count_ = n;
+    task->num_ok_ = nhit + core_ok;
+
+    // 3. Populate this node's cache with the remote pages just fetched, then
+    //    register with their owners so a primary write invalidates them. A
+    //    copy whose registration fails is dropped (nobody would invalidate it).
+    Context pctx;
+    AimAtCacheReplica(&pctx);
+    bool pop[kPodMultiMax] = {};
+    clio::run::Future<clio::cte::core::PutBlobTask> puts[kPodMultiMax];
+    for (clio::run::u32 j = 0; j < m; ++j) {
+      const clio::run::u32 i = map[j];
+      const PodBlobReq &r = task->reqs_[i];
+      if (!remote[i] || r.rc_ != 0 || r.offset_ != 0 || r.size_ == 0) continue;
+      pop[i] = true;
+      puts[i] = local->AsyncPutBlob(tag, task->GetBlobName(i), 0, r.size_,
+                                    r.data_, /*score=*/-1.0f, pctx,
+                                    /*flags=*/0, clio::run::PoolQuery::Local());
+    }
+    clio::run::Future<clio::cte::core::RegisterReplicaContainerTask>
+        regs[kPodMultiMax];
+    for (clio::run::u32 i = 0; i < n; ++i) {
+      if (!pop[i]) continue;
+      CLIO_CO_AWAIT(puts[i]);
+      if (puts[i]->GetReturnCode() != 0) {
+        pop[i] = false;
+        continue;
+      }
+      regs[i] = next->AsyncRegisterReplicaContainer(
+          tag, task->GetBlobName(i), CLIO_IPC->GetNodeId(),
+          clio::run::PoolQuery::Dynamic(), /*expected_version=*/0);
+    }
+    for (clio::run::u32 i = 0; i < n; ++i) {
+      if (!pop[i]) continue;
+      CLIO_CO_AWAIT(regs[i]);
+      if (regs[i]->GetReturnCode() != 0) {
+        // Unregistered: nobody would invalidate it. Drop it.
+        auto del = local->AsyncDelBlob(tag, task->GetBlobName(i),
+                                       clio::run::PoolQuery::Local(),
+                                       clio::cte::core::kDelCacheCopyOnly);
+        CLIO_CO_AWAIT(del);
+      }
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+// ===========================================================================
+// Tag metadata, write-through -- strongly consistent on completion.
+//
+// The core already resolves a tag name LOCALLY when its container knows the
+// name (ScheduleTask's GetOrCreateTag rule) and serves page faults from its
+// local TagInfo. So "caching" a tag on every node means installing it in
+// every node's core, using the core's own verbs:
+//   - a tag WRITE (creation, fault-handler registration, pinned id) goes to
+//     the owner, then GetOrCreateTag(name, handler, id) is applied to EVERY
+//     core container before the write returns;
+//   - a delete goes to the owner, then DelTag(id) is applied to every core
+//     container before it returns;
+//   - rename is already a core broadcast; lookups need no help.
+// Guarantee: once a tag write returns, every node resolves the tag (and its
+// fault handler) locally and correctly. While it runs, nodes may disagree.
+// ===========================================================================
+
+clio::run::u32 Runtime::NumCoreContainers() {
+  const clio::run::PoolInfo *info =
+      CLIO_POOL_MANAGER->GetPoolInfo(CorePoolId());
+  return (info != nullptr && info->num_containers_ > 0) ? info->num_containers_
+                                                         : 1;
+}
+
+clio::run::TaskResume Runtime::GetOrCreateTag(
+    clio::run::shared_ptr<
+        clio::cte::core::GetOrCreateTagTask<clio::cte::core::CreateParams>>
+        &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const std::string name = task->tag_name_.str();
+    const clio::run::PoolId fpool = task->fault_pool_id_;
+    const std::string fname = task->fault_pool_name_.str();
+    const std::string fparams = task->fault_params_.str();
+    auto *core = GetNextClient();
+    auto f = core->AsyncGetOrCreateTag(name, fpool, fname, fparams,
+                                       task->tag_id_,
+                                       clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(f);
+    const clio::run::u32 rc = f->GetReturnCode();
+    task->tag_id_ = f->tag_id_;
+    task->created_ = f->created_;
+    task->tag_size_ = f->tag_size_;
+    const bool wrote = !fpool.IsNull() || f->created_ != 0;
+    if (rc == 0 && wrote && !task->tag_id_.IsNull() &&
+        CLIO_IPC->GetNumHosts() > 1) {
+      const clio::run::u32 nc = NumCoreContainers();
+      for (clio::run::u32 c = 0; c < nc; ++c) {
+        auto w = core->AsyncGetOrCreateTag(
+            name, fpool, fname, fparams, task->tag_id_,
+            clio::run::PoolQuery::DirectId(
+                static_cast<clio::run::ContainerId>(c)));
+        CLIO_CO_AWAIT(w);
+        if (w->GetReturnCode() != 0) {
+          HLOG(kWarning, "tag write-through of '{}' to container {} rc={}",
+               name, c, w->GetReturnCode());
+        }
+      }
+    }
+    task->SetReturnCode(rc);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::DelTag(
+    clio::run::shared_ptr<clio::cte::core::DelTagTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    auto *core = GetNextClient();
+    const std::string name = task->tag_name_.str();
+    clio::run::u32 rc = 0;
+    TagId id = task->tag_id_;
+    if (name.empty()) {
+      auto f = core->AsyncDelTag(id, clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(f);
+      rc = f->GetReturnCode();
+      if (!f->tag_id_.IsNull()) id = f->tag_id_;
+    } else {
+      auto f = core->AsyncDelTag(name, clio::run::PoolQuery::Dynamic(),
+                                 task->posix_unlink_ != 0);
+      CLIO_CO_AWAIT(f);
+      rc = f->GetReturnCode();
+      if (!f->tag_id_.IsNull()) id = f->tag_id_;
+    }
+    task->tag_id_ = id;
+    if (rc == 0 && !id.IsNull() && CLIO_IPC->GetNumHosts() > 1) {
+      // Every other node's copy of the tag (name, handler, its local blobs).
+      const clio::run::u32 nc = NumCoreContainers();
+      for (clio::run::u32 c = 0; c < nc; ++c) {
+        auto d = core->AsyncDelTag(id, clio::run::PoolQuery::DirectId(
+                                           static_cast<clio::run::ContainerId>(c)));
+        CLIO_CO_AWAIT(d);  // rc 1 = that node had no copy: fine
+      }
+    }
+    task->SetReturnCode(rc);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 bool Runtime::IsBlobOwnerLocal(const TagId &tag_id,
@@ -113,8 +357,31 @@ bool Runtime::IsBlobOwnerLocal(const TagId &tag_id,
   if (pool_manager->HasContainer(pool_id_, cid)) {
     return true;
   }
-  return pool_manager->GetContainerNodeId(pool_id_, cid) ==
-         CLIO_IPC->GetNodeId();
+  if (pool_manager->GetContainerNodeId(pool_id_, cid) ==
+      CLIO_IPC->GetNodeId()) {
+    return true;
+  }
+  return IsStandingIn(tag_id, blob_name);
+}
+
+bool Runtime::IsStandingIn(const TagId &tag_id, const std::string &blob_name) {
+  // Standing in for a dead owner: this node's core holds the blob's
+  // authoritative copy (the replication chimod's remote copy, served by
+  // failover) in the SAME BlobInfo as any cache copy it took as a reader
+  // earlier. That cache slot was kept current by the owner's invalidations,
+  // which stopped when the owner died -- serving it read a stale page
+  // (zeros) while every other node, reading through this one, got the
+  // right bytes. Callers behave as the owner: no cache copy, read the
+  // primary.
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  const clio::run::PoolInfo *info = pool_manager->GetPoolInfo(pool_id_);
+  if (info == nullptr || info->num_containers_ <= 1) return false;
+  const clio::run::u32 cid =
+      clio::cte::core::BlobHash(tag_id, blob_name) % info->num_containers_;
+  const clio::run::u32 serving =
+      clio::cte::core::FailoverContainer(pool_id_, cid);
+  return serving != cid && pool_manager->GetContainerNodeId(pool_id_, serving) ==
+                               CLIO_IPC->GetNodeId();
 }
 
 /** Mutate a put context to aim at THE cache replica: raw bytes, the
@@ -164,6 +431,21 @@ clio::run::TaskResume Runtime::PutBlob(
     // invalidate it and this node would serve its own stale bytes forever
     // (the CI-caught fragmented winner split).
     const bool owner_local = IsBlobOwnerLocal(task->tag_id_, blob_name);
+    if (owner_local) {
+      // Owner-local: no copy to keep, so the put IS the authoritative put.
+      // Run the next pool's handler inline, as the other interposers do,
+      // instead of submitting a new task: the extra task cost a scheduler
+      // route, a worker hop and a completion event per put, and large puts
+      // all queue on the I/O workers -- 1 MiB puts ran ~4x slower through
+      // this layer than straight into the layer below it.
+      task->context_ = orig_ctx;
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
+                                  task.template Cast<clio::run::Task>()));
+      task->context_.replica_ = orig_ctx.replica_;
+      task->context_.replica_flags_ = orig_ctx.replica_flags_;
+      task->context_.origin_node_ = Context::kNoOriginNode;
+      CLIO_CO_RETURN;
+    }
 
     // 1. ONE fused local task: apply the put to the local raw copy iff it
     //    exists (UPDATE_ONLY; kReplicaAbsentRc = it doesn't). No probes.
@@ -321,7 +603,22 @@ clio::run::TaskResume Runtime::GetBlob(
     // authoritative primary is node-local already; skip straight to the
     // chain and never populate here.
     const bool owner_local = IsBlobOwnerLocal(task->tag_id_, blob_name);
-    if (!owner_local) {
+    if (owner_local) {
+      // A cache copy left from when this node was only a reader (it is now
+      // standing in) must not outlive the stand-in period: drop it.
+      if (IsStandingIn(task->tag_id_, blob_name)) {
+        auto del = GetLocalClient()->AsyncDelBlob(
+            task->tag_id_, blob_name, clio::run::PoolQuery::Local(),
+            clio::cte::core::kDelCacheCopyOnly);
+        CLIO_CO_AWAIT(del);  // "not found" (no copy) is the usual answer
+      }
+      // The primary is node-local: read it through the next pool inline (no
+      // new task, see PutBlob) and never populate a copy.
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
+                                  task.template Cast<clio::run::Task>()));
+      CLIO_CO_RETURN;
+    }
+    {
       task->context_.replica_ = clio::cte::core::kCacheReplica;
       CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
                              task.template Cast<clio::run::Task>()));
@@ -542,7 +839,13 @@ clio::run::TaskResume Runtime::GetBlobSize(
     // present copy current. NOTE: the copy is populated whole-blob and
     // reclaimed/invalidated whole-blob, so a present size is the full
     // logical size.
-    if (!IsBlobOwnerLocal(task->tag_id_, task->blob_name_.str())) {
+    if (IsBlobOwnerLocal(task->tag_id_, task->blob_name_.str())) {
+      // Owner-local: ask the next pool inline (no new task, see PutBlob).
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlobSize,
+                                  task.template Cast<clio::run::Task>()));
+      CLIO_CO_RETURN;
+    }
+    {
       auto *local = GetLocalClient();
       auto sz = local->AsyncGetBlobSize(task->tag_id_,
                                         task->blob_name_.str(),

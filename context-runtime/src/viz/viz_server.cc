@@ -36,6 +36,35 @@
  * Poco HTTP transport that fronts them.
  */
 
+// POCO FIRST, BEFORE ANY HEADER THAT CAN PULL <format>. Poco 1.11's
+// Poco/Format.h calls format(result, fmt, values) UNQUALIFIED with no
+// dependent arguments, so it is bound where the header is parsed: if
+// C++20 std::format is already visible, argument-dependent lookup on
+// std::string finds it too and the call is ambiguous (DPC++/clang with
+// libstdc++ 13 fails here; the CUDA/CPU builds only got lucky on order).
+// CLIO_RUN_HAS_POCO is a compile definition, so it is set at this point.
+#if CLIO_RUN_HAS_POCO
+#include <Poco/Net/Net.h>
+#include <Poco/Net/HTTPRequestHandler.h>
+#include <Poco/Net/HTTPRequestHandlerFactory.h>
+#include <Poco/Net/HTTPServer.h>
+#include <Poco/Net/HTTPServerParams.h>
+#include <Poco/Net/HTTPServerRequest.h>
+#include <Poco/Net/HTTPServerResponse.h>
+#include <Poco/Net/ServerSocket.h>
+#include <Poco/Net/SocketAddress.h>
+#include <Poco/StreamCopier.h>
+#include <Poco/ThreadPool.h>
+#include <Poco/URI.h>
+// Poco/Net pulls <windows.h> on Windows, which defines an empty function-like
+// Yield() macro (winbase.h). Including Poco first (above) means that macro is
+// live for every runtime header below and mangles their Yield() methods
+// (std_thread.h, mutex.h, shm_transport.h: MSVC C2062/C2059).
+#ifdef Yield
+#undef Yield
+#endif
+#endif
+
 #include "clio_runtime/viz/viz_server.h"
 
 #include <algorithm>
@@ -55,21 +84,6 @@
 #include "clio_runtime/pool_manager.h"
 #include "clio_runtime/viz/viz_json.h"
 #include "clio_ctp/util/msan.h"
-
-#if CLIO_RUN_HAS_POCO
-#include <Poco/Net/Net.h>
-#include <Poco/Net/HTTPRequestHandler.h>
-#include <Poco/Net/HTTPRequestHandlerFactory.h>
-#include <Poco/Net/HTTPServer.h>
-#include <Poco/Net/HTTPServerParams.h>
-#include <Poco/Net/HTTPServerRequest.h>
-#include <Poco/Net/HTTPServerResponse.h>
-#include <Poco/Net/ServerSocket.h>
-#include <Poco/Net/SocketAddress.h>
-#include <Poco/StreamCopier.h>
-#include <Poco/ThreadPool.h>
-#include <Poco/URI.h>
-#endif
 
 // Global pointer variable definition for the viz server singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::viz::VizServer, g_viz_server);
@@ -807,6 +821,9 @@ class PocoVizHandler : public Poco::Net::HTTPRequestHandler {
     // without rebuilding, point $CLIO_VIZ_PATH at a working copy; the daemon
     // then serves them from this same origin.
     presp.setContentLength(static_cast<std::streamsize>(resp.body.size()));
+    // Poco formats the status line and headers itself and hands them to
+    // send(2) from its own frames; only the interceptor checks reach that.
+    ctp::MsanInterceptorCheckGuard msan_guard;
     std::ostream &out = presp.send();
     if (req.method != "HEAD") {
       out.write(resp.body.data(),
@@ -851,6 +868,14 @@ bool VizServer::StartOn(const std::string &bind_addr, u32 port,
     Poco::Net::initializeNetwork();
     impl->socket = Poco::Net::ServerSocket(
         Poco::Net::SocketAddress(bind_addr, static_cast<Poco::UInt16>(port)));
+    // Assigned from a temporary that libPocoNet built and copied in; later
+    // inline reads of it (address(), close()) would otherwise be reported.
+    CTP_MSAN_UNPOISON_OBJ(impl->socket);
+    // libPocoNet also constructed the SocketImpl the handle points to. With
+    // poison_in_malloc=0 its heap block keeps whatever shadow a previous owner
+    // left, so the vptr that the inline address()/close() dispatch through
+    // reads as uninitialized. Clear the base-class part (vptr + fd).
+    CTP_MSAN_UNPOISON(impl->socket.impl(), sizeof(Poco::Net::SocketImpl));
     auto *params = new Poco::Net::HTTPServerParams();
     params->setMaxThreads(static_cast<int>(std::max<u32>(max_threads, 1)));
     params->setMaxQueued(64);

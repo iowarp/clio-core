@@ -106,7 +106,6 @@ mcp = FastMCP("IOWarp Context Transfer Engine (CTE) MCP Server")
 _initialized = False
 _runtime_initialized = False
 _client = None
-_mctx = None
 
 def _initialize_runtime() -> bool:
     """Attempt to initialize CTE runtime.
@@ -199,7 +198,7 @@ def _ensure_initialized() -> bool:
     guarantee that CTE runtime is fully initialized. CTE runtime must be
     initialized separately before using query/reorganization functions.
     """
-    global _initialized, _client, _mctx
+    global _initialized, _client
     
     if not CTE_AVAILABLE:
         return False
@@ -210,7 +209,6 @@ def _ensure_initialized() -> bool:
     try:
         # Try to get the client - this will work if CTE is already initialized
         _client = cte.get_cte_client()
-        _mctx = cte.MemContext()
         _initialized = True
         return True
     except Exception as e:
@@ -303,7 +301,7 @@ def tag_query(tag_regex: str, max_tags: int = 0) -> str:
     
     try:
         # Attempt the query - this may fail if CTE runtime is not initialized
-        tags = _client.TagQuery(_mctx, tag_regex, max_tags, pool_query)
+        tags = _client.TagQuery(tag_regex, max_tags, pool_query)
         return json.dumps({
             'tag_regex': tag_regex,
             'max_tags': max_tags,
@@ -375,7 +373,7 @@ def blob_query(tag_regex: str, blob_regex: str, max_blobs: int = 0) -> str:
     
     try:
         # Attempt the query - this may fail if CTE runtime is not initialized
-        blobs = _client.BlobQuery(_mctx, tag_regex, blob_regex, max_blobs, pool_query)
+        blobs = _client.BlobQuery(tag_regex, blob_regex, max_blobs, pool_query)
         # Convert pairs to lists for JSON serialization
         blob_list = [(tag, blob) for tag, blob in blobs]
         return json.dumps({
@@ -437,7 +435,7 @@ def poll_telemetry_log(minimum_logical_time: int = 0) -> str:
     
     try:
         # Attempt the query - this may fail if CTE runtime is not initialized
-        telemetry = _client.PollTelemetryLog(_mctx, minimum_logical_time)
+        telemetry = _client.PollTelemetryLog(minimum_logical_time)
         
         # Serialize telemetry entries
         entries = []
@@ -527,7 +525,7 @@ def reorganize_blob(tag_id_major: int, tag_id_minor: int, blob_name: str, new_sc
         tag_id.minor_ = tag_id_minor
         
         # Attempt reorganization - this may fail if CTE runtime is not initialized
-        result_code = _client.ReorganizeBlob(_mctx, tag_id, blob_name, new_score)
+        result_code = _client.ReorganizeBlob(tag_id, blob_name, new_score)
         
         return json.dumps({
             'tag_id': {
@@ -683,26 +681,27 @@ def initialize_cte_runtime() -> str:
                         # Generate config
                         config = {
                             'networking': {
-                                'protocol': 'zmq',
                                 'hostfile': hostfile,
-                                'port': port
+                                'port': port,
                             },
-                            'workers': {
-                                'num_workers': 2
+                            'runtime': {
+                                'num_threads': 2,
                             },
-                            'memory': {
-                                'main_segment_size': '512M',
-                                'client_data_segment_size': '256M',
-                                'runtime_data_segment_size': '256M'
-                            },
-                            'devices': [
-                                {
-                                    'mount_point': storage_dir,
-                                    'capacity': '512M'
-                                }
-                            ]
+                            'compose': [{
+                                'mod_name': 'clio_cte_core',
+                                'pool_name': 'cte_main',
+                                'pool_query': 'local',
+                                'pool_id': '512.0',
+                                'storage': [{
+                                    'path': os.path.join(storage_dir,
+                                                         'cte_tier.dat'),
+                                    'bdev_type': 'file',
+                                    'capacity_limit': '512MB',
+                                    'score': 0.5,
+                                }],
+                            }],
                         }
-                        
+
                         # Write config
                         config_path = os.path.join(temp_dir, f"cte_mcp_conf_{os.getpid()}.yaml")
                         with open(config_path, 'w') as f:
@@ -777,7 +776,6 @@ def initialize_cte_runtime() -> str:
                         # Following test_bindings.py pattern
                         try:
                             client = cte.get_cte_client()
-                            mctx = cte.MemContext()
                             
                             # Get storage directory from config if available
                             storage_dir = None
@@ -786,9 +784,14 @@ def initialize_cte_runtime() -> str:
                                     import yaml
                                     with open(config_path, 'r') as f:
                                         config = yaml.safe_load(f)
-                                    devices = config.get('devices', [])
-                                    if devices and len(devices) > 0:
-                                        storage_dir = devices[0].get('mount_point')
+                                    for pool in config.get('compose', []):
+                                        for dev in pool.get('storage', []):
+                                            path = dev.get('path', '')
+                                            if dev.get('bdev_type') == 'file' and path:
+                                                storage_dir = os.path.dirname(path)
+                                                break
+                                        if storage_dir:
+                                            break
                                 except Exception:
                                     pass
                             
@@ -807,7 +810,7 @@ def initialize_cte_runtime() -> str:
                                 target_query = cte.PoolQuery.Local()
                                 target_size = 512 * 1024 * 1024  # 512MB
                                 
-                                reg_result = client.RegisterTarget(mctx, target_path, cte.BdevType.kFile,
+                                reg_result = client.RegisterTarget(target_path, cte.BdevType.kFile,
                                                                   target_size, target_query, bdev_id)
                                 
                                 if reg_result == 0:
@@ -1213,7 +1216,7 @@ def delete_blob(tag_name: str, blob_name: str) -> str:
                 'error': 'DelBlob method not available on Client'
             }, indent=2)
         
-        result = _client.DelBlob(_mctx, tag_id, blob_name)
+        result = _client.DelBlob(tag_id, blob_name)
         
         return json.dumps({
             'tag_name': tag_name,
@@ -1273,9 +1276,6 @@ def get_cte_types() -> str:
         if hasattr(cte, 'BlobId'):
             types_info['types']['BlobId'] = 'Available'
         
-        # Check for MemContext
-        if hasattr(cte, 'MemContext'):
-            types_info['types']['MemContext'] = 'Available'
         
         # Check for CteTelemetry
         if hasattr(cte, 'CteTelemetry'):

@@ -54,7 +54,7 @@ to. It is a drop-in replacement for the default `sec2` driver.
 | Caches | Dataset images of atomic types (int, float, enum, bitfield, fixed string) | Byte ranges, only with `CLIO_VFD_READ_TIER=1` |
 | Passes to native | Compound, array, vlen, reference types; everything that is not dataset I/O | Everything, unless the read tier is on |
 | Telemetry | Per-dataset access trace (`CLIO_VOL_TRACE`) | `CLIO_VFD_DEBUG` prints each I/O |
-| Extra cost | A runtime round trip per cached transfer | `fsync` on every file close (deliberate) |
+| Extra cost | A runtime round trip per cached transfer | With the cache on, a tier write per write; `fsync` at flush and close only with `fsync=1` |
 
 - **Start with the VOL** when the same datasets are read again in later
   sessions, and the file lives on storage slower than the tier: a parallel
@@ -167,7 +167,7 @@ A benchmark that writes once and reads once will correctly report 0%.
 | `CLIO_VOL_TRACE` | — | Directory for VOL access telemetry |
 | `CLIO_STAMP_GRANULARITY_NS` | 10 ms | Raise it on filesystems with coarse timestamps (NFS, FAT) |
 
-Tuning knobs (chunk size, admission policy, sieve window, fsync on flush) are
+Tuning knobs (chunk size, admission policy, sieve window, fsync on flush and close) are
 in the per-connector READMEs.
 
 ## Limits

@@ -1,0 +1,276 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#ifndef CTP_SHM_INCLUDE_HSHM_SHM_IO_POSIX_AIO_H_
+#define CTP_SHM_INCLUDE_HSHM_SHM_IO_POSIX_AIO_H_
+
+#if !defined(_WIN32)
+
+#include "async_io.h"
+#include <aio.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
+#include <memory>
+
+// O_DIRECT is a Linux extension; Darwin has no equivalent open flag and
+// instead exposes uncached I/O through fcntl(F_NOCACHE) post-open. Define
+// it as 0 so the `flags & ~O_DIRECT` / `flags | O_DIRECT` bitops still
+// compile and the "direct" open path degrades gracefully into a second
+// regular fd. Tests that exercise the aligned-buffer path still pass
+// because aligned reads/writes work fine through the page cache.
+#ifndef O_DIRECT
+#define O_DIRECT 0
+#endif
+
+namespace ctp {
+
+class PosixAsyncIO : public AsyncIO {
+ public:
+  PosixAsyncIO(uint32_t io_depth)
+      : direct_fd_(-1), regular_fd_(-1), next_token_(1) {
+    (void)io_depth;
+  }
+
+  ~PosixAsyncIO() override {
+    Close();
+  }
+
+  bool Open(const std::string &path, int flags, mode_t mode) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    int base_flags = flags & ~O_DIRECT;
+
+    regular_fd_ = open(path.c_str(), base_flags, mode);
+    if (regular_fd_ < 0) return false;
+
+    direct_fd_ = open(path.c_str(), base_flags | O_DIRECT, mode);
+
+    return true;
+  }
+
+  ssize_t GetFileSize() const override {
+    int fd = regular_fd_ >= 0 ? regular_fd_ : direct_fd_;
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0) return -1;
+    return st.st_size;
+  }
+
+  bool Truncate(size_t size) override {
+    int fd = regular_fd_ >= 0 ? regular_fd_ : direct_fd_;
+    if (fd < 0) return false;
+    return ftruncate(fd, static_cast<off_t>(size)) == 0;
+  }
+
+  IoToken Write(void *buffer, size_t size, int64_t offset) override {
+    return SubmitIO(buffer, size, offset, true);
+  }
+
+  IoToken Read(void *buffer, size_t size, int64_t offset) override {
+    return SubmitIO(buffer, size, offset, false);
+  }
+
+  bool IsComplete(IoToken token, IoResult &result) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto done = done_.find(token);
+    if (done != done_.end()) {
+      result = done->second;
+      done_.erase(done);
+      return true;
+    }
+
+    auto it = pending_.find(token);
+    if (it == pending_.end()) return false;
+
+    int err = aio_error(it->second.get());
+    if (err == EINPROGRESS) return false;
+
+    if (err == 0) {
+      ssize_t bytes = aio_return(it->second.get());
+      result.bytes_transferred = bytes;
+      result.error_code = 0;
+    } else {
+      aio_return(it->second.get());
+      result.bytes_transferred = -1;
+      result.error_code = err;
+    }
+
+    pending_.erase(it);
+    return true;
+  }
+
+  void Close() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // Cancel pending operations
+    for (auto &kv : pending_) {
+      aio_cancel(regular_fd_, kv.second.get());
+    }
+    pending_.clear();
+    done_.clear();
+
+    if (direct_fd_ >= 0) {
+      close(direct_fd_);
+      direct_fd_ = -1;
+    }
+    if (regular_fd_ >= 0) {
+      close(regular_fd_);
+      regular_fd_ = -1;
+    }
+  }
+
+  int GetEventFd() const override {
+    return -1;  // POSIX AIO does not support eventfd
+  }
+
+ protected:
+  /** The kernel's per-request control block (POSIX struct aiocb). */
+  using ControlBlock = struct aiocb;
+
+  /**
+   * Hand one request to the kernel's POSIX AIO. Virtual so tests can make it
+   * refuse with EAGAIN, which macOS does once a process has more than
+   * kern.aio.process_max (16 by default) requests outstanding.
+   * @param cb the control block to submit
+   * @param is_write true for aio_write, false for aio_read
+   * @return 0 on success, else -1 with errno set
+   */
+  virtual int StartAio(ControlBlock *cb, bool is_write) {
+    return is_write ? aio_write(cb) : aio_read(cb);
+  }
+
+ private:
+  IoToken SubmitIO(void *buffer, size_t size, int64_t offset, bool is_write) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    int fd = SelectFd(buffer, size, offset);
+    IoToken token = next_token_.fetch_add(1);
+
+    auto cb = std::make_unique<struct aiocb>();
+    memset(cb.get(), 0, sizeof(struct aiocb));
+
+    cb->aio_fildes = fd;
+    cb->aio_buf = buffer;
+    cb->aio_nbytes = size;
+    cb->aio_offset = offset;
+
+    if (StartAio(cb.get(), is_write) == 0) {
+      pending_[token] = std::move(cb);
+      return token;
+    }
+    if (errno != EAGAIN) {
+      return kInvalidIoToken;
+    }
+    // Issue #1156: EAGAIN means the AIO request limit is reached, not that
+    // the I/O is bad. Failing it surfaced as a bdev write error with 0 bytes
+    // (safe_bdev fans one put out to more members than macOS allows), so do
+    // the I/O synchronously and report it through IsComplete as usual.
+    done_[token] = SyncIO(fd, buffer, size, offset, is_write);
+    return token;
+  }
+
+  /**
+   * Perform one request synchronously, retrying short transfers.
+   * @param fd file descriptor
+   * @param buffer I/O buffer
+   * @param size bytes to transfer
+   * @param offset file offset
+   * @param is_write true to write, false to read
+   * @return bytes transferred and errno, in AsyncIO's result form
+   */
+  static IoResult SyncIO(int fd, void *buffer, size_t size, int64_t offset,
+                         bool is_write) {
+    IoResult result;
+    char *p = static_cast<char *>(buffer);
+    size_t done = 0;
+    while (done < size) {
+      ssize_t n = is_write ? pwrite(fd, p + done, size - done,
+                                    static_cast<off_t>(offset + done))
+                           : pread(fd, p + done, size - done,
+                                   static_cast<off_t>(offset + done));
+      if (n < 0 && errno == EINTR) continue;
+      if (n < 0) {
+        result.bytes_transferred = -1;
+        result.error_code = errno;
+        return result;
+      }
+      if (n == 0) break;  // read past end of file
+      done += static_cast<size_t>(n);
+    }
+    result.bytes_transferred = static_cast<ssize_t>(done);
+    result.error_code = 0;
+    return result;
+  }
+
+  /**
+   * Choose the O_DIRECT fd only when the buffer, the length AND the file
+   * offset are all DirectIoAlign()-aligned (4 KiB, or the page size when that
+   * is larger -- Lustre needs it); anything else uses the buffered fd. The
+   * offset check was missing: an aligned buffer written at an unaligned file
+   * offset (a truncate zeroing a page tail) went to O_DIRECT and failed with
+   * EINVAL.
+   * @param buffer I/O buffer
+   * @param size I/O length
+   * @param offset file offset
+   * @return fd to submit on
+   */
+  int SelectFd(void *buffer, size_t size, int64_t offset) const {
+    if (direct_fd_ >= 0 &&
+        (reinterpret_cast<uintptr_t>(buffer) % DirectIoAlign() == 0) &&
+        (size % DirectIoAlign() == 0) &&
+        (offset % static_cast<int64_t>(DirectIoAlign()) == 0)) {
+      return direct_fd_;
+    }
+    return regular_fd_;
+  }
+
+  int direct_fd_;
+  int regular_fd_;
+  std::atomic<IoToken> next_token_;
+  std::mutex mutex_;
+  std::unordered_map<IoToken, std::unique_ptr<struct aiocb>> pending_;
+  std::unordered_map<IoToken, IoResult> done_;  /**< completed synchronously */
+};
+
+}  // namespace ctp
+
+#endif  // !defined(_WIN32)
+
+#endif  // CTP_SHM_INCLUDE_HSHM_SHM_IO_POSIX_AIO_H_

@@ -111,6 +111,11 @@ unsigned long H5FDclio_cache_read_misses_g = 0;
  * from a read miss: a workload that invalidates on every open is paying to
  * populate a cache it can never use. */
 unsigned long H5FDclio_cache_stale_invalidations_g = 0;
+/* fsync(2) calls issued by flush and close. Exported so a test can assert the
+ * durability barrier is off by default and on when asked for: both outcomes
+ * leave identical bytes in the page cache, so nothing else can tell them
+ * apart. */
+unsigned long H5FDclio_fsyncs_g = 0;
 
 /* Also governs the coherence stamp: coherence exists only to make the read
  * tier safe, so with the tier off, validating and stamping is pure cost. Safe
@@ -479,7 +484,7 @@ static bool H5FD__clio_cache_env_enabled(void) {
            strcmp(v, "false") == 0 || strcmp(v, "no") == 0);
 }
 
-/* Read the CLIO_VFD_FSYNC opt-IN for the flush callback. Default off; any of
+/* Read the CLIO_VFD_FSYNC opt-IN for the flush and close barrier. Default off; any of
  * "1"/"on"/"true"/"yes" turns it on for every file in the process. The mirror
  * image of CLIO_VFD_CACHE: that one can only DISABLE what the FAPL asked for,
  * this one can only ENABLE what the FAPL left off -- in both cases the
@@ -512,7 +517,8 @@ extern "C" {
  * read tier makes them meaningful. */
 typedef struct H5FD_clio_fapl_t {
   hbool_t cache_enabled; /* populate the CTE cache tier (default on) */
-  hbool_t fsync_on_flush; /* fsync(2) the native file in flush (default off) */
+  hbool_t fsync_barrier; /* fsync(2) the native file in flush and close
+                            (default off) */
   size_t sieve_max;      /* vector-I/O coalescing window, bytes (0 = off) */
 } H5FD_clio_fapl_t;
 
@@ -547,7 +553,7 @@ static inline bool H5FD__clio_sieve_valid(size_t v) {
 /* Default policy when a file is opened without a driver-specific FAPL
  * (e.g. H5Pset_driver(fapl, driver, NULL)): cache on, coalescing on. */
 static const H5FD_clio_fapl_t H5FD_clio_fapl_default_g = {
-    /*cache_enabled*/ 1, /*fsync_on_flush*/ 0,
+    /*cache_enabled*/ 1, /*fsync_barrier*/ 0,
     /*sieve_max*/ H5FD_CLIO_SIEVE_MAX_DEF};
 
 /*
@@ -560,8 +566,9 @@ static const H5FD_clio_fapl_t H5FD_clio_fapl_default_g = {
  *
  * Recognised keys:
  *   cache=0|1|on|off|true|false|yes|no   the CTE tier
- *   fsync=0|1|on|off|true|false|yes|no   fsync(2) inside the flush callback
- *                                        (default off; see H5FD__clio_flush)
+ *   fsync=0|1|on|off|true|false|yes|no   fsync(2) in the flush and close
+ *                                        callbacks (default off; see
+ *                                        H5FD__clio_flush)
  *   sieve=<bytes>                        vector-I/O coalescing window
  *                                        (0 disables; default 65536)
  *
@@ -605,7 +612,7 @@ static bool H5FD__clio_apply_config_str(hid_t fapl_id, H5FD_clio_fapl_t *fa) {
                             .c_str());
         return false;
       }
-      fa->fsync_on_flush = on ? 1 : 0;
+      fa->fsync_barrier = on ? 1 : 0;
     } else if (e.first == "sieve") {
       /* strtoull WRAPS a negative instead of rejecting it -- "-1" parses as
          ULLONG_MAX with errno untouched, which would install a SIZE_MAX
@@ -944,10 +951,10 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     fa.cache_enabled = 0;
   }
 
-  /* Same shape, opposite direction: the environment can turn the flush-time
-     durability barrier ON for a file whose FAPL did not ask for it. */
-  if (!fa.fsync_on_flush && H5FD__clio_fsync_env_forced()) {
-    fa.fsync_on_flush = 1;
+  /* Same shape, opposite direction: the environment can turn the durability
+     barrier ON for a file whose FAPL did not ask for it. */
+  if (!fa.fsync_barrier && H5FD__clio_fsync_env_forced()) {
+    fa.fsync_barrier = 1;
   }
 
   /* A read-only open has nothing to gain from the cache tier, so do not attach
@@ -1219,9 +1226,11 @@ static herr_t H5FD__clio_close(H5FD_t *_file) {
   // Write the summary before the handles go. No-op when tracing is off.
   clio::vfdtrace::CloseFile(file->trace);
   file->trace = nullptr;
-  // fsync + close the authoritative native file first -- a successful close is
-  // a durability barrier (no pending dirty state), and the on-disk file is a
-  // complete valid native HDF5 image afterward.
+  // Close the authoritative native file first. Its bytes are already in the
+  // page cache (writes are write-through), so after a successful close the
+  // on-disk file is a complete, valid native HDF5 image to every reader -- the
+  // same guarantee sec2 gives. Persisting it to stable storage is the opt-in
+  // barrier, as in H5FD__clio_flush, which explains why it is not the default.
   if (file->posix_fd >= 0) {
     /* Only a file we could have WRITTEN has anything to persist, and asking to
      * persist a read-only one is not portable: fsync(2) tolerates a read-only
@@ -1231,13 +1240,16 @@ static herr_t H5FD__clio_close(H5FD_t *_file) {
      * EBADF -- which this fail-closed branch would then turn into a failed
      * H5Fclose on a file that was never dirty. Reproduced by the no-runtime
      * test's read-only reopen, which is the second open of the same path. */
-    if (H5FD_CLIO_WRITABLE(file) && clio_vfd_fsync(file->posix_fd) < 0) {
-      H5FD_CLIO_ERROR("fsync() on close failed");
-      ret_value = FAIL; /* fail-closed: a close that did not persist fails */
+    if (file->fa.fsync_barrier && H5FD_CLIO_WRITABLE(file)) {
+      H5FDclio_fsyncs_g++;
+      if (clio_vfd_fsync(file->posix_fd) < 0) {
+        H5FD_CLIO_ERROR("fsync() on close failed");
+        ret_value = FAIL; /* fail-closed: a close that did not persist fails */
+      }
     }
     // close() itself can fail (EIO, and notably deferred write errors on NFS).
-    // A close that reports an error has not necessarily persisted, so it is
-    // fail-closed too -- the whole point of the barrier.
+    // A close that reports an error may not have written everything back, so
+    // it is fail-closed too, barrier or not.
     if (clio_vfd_close(file->posix_fd) < 0) {
       H5FD_CLIO_ERROR("close() of authoritative native file failed");
       ret_value = FAIL;
@@ -2028,14 +2040,19 @@ static herr_t H5FD__clio_get_handle(H5FD_t *_file, hid_t fapl,
  *              tst_h_strings2, tst_h_compounds2 and the ncdump shell tests
  *              were the same shape.
  *
+ *              close() used to fsync unconditionally as well, for the same
+ *              reason and at a similar price: about 4 ms per file on local
+ *              NVMe, which made file-per-step output 8-24x slower per file
+ *              than sec2, and an fsync on a parallel filesystem is a server
+ *              round trip. sec2 does not do it, and neither does the CLIO
+ *              VOL, which writes through the native driver.
+ *
  *              The barrier is still available, because "my writes are on
- *              stable storage when H5Fflush returns" is a real requirement for
- *              some callers -- it is just opt-in now: fsync=1 in the driver
- *              config string (HDF5_DRIVER_CONFIG="fsync=1"), or
- *              CLIO_VFD_FSYNC=1 in the environment for a process that cannot
- *              reach the FAPL. close() fsyncs unconditionally either way, so
- *              a file that is closed normally is always durable; only the
- *              per-flush barrier is a choice.
+ *              stable storage when H5Fflush/H5Fclose returns" is a real
+ *              requirement for some callers -- it is just opt-in, and one
+ *              switch covers both callbacks: fsync=1 in the driver config
+ *              string (HDF5_DRIVER_CONFIG="fsync=1"), or CLIO_VFD_FSYNC=1 in
+ *              the environment for a process that cannot reach the FAPL.
  *
  * Return:      SUCCEED/FAIL
  *
@@ -2045,7 +2062,7 @@ static herr_t H5FD__clio_flush(H5FD_t *_file, hid_t dxpl_id, bool closing) {
   (void)dxpl_id;
   (void)closing;
   H5FD_clio_t *file = (H5FD_clio_t *)_file;
-  if (!file->fa.fsync_on_flush) {
+  if (!file->fa.fsync_barrier) {
     return SUCCEED;
   }
   // Opt-in durability barrier; fail-closed so a flush that did not reach disk
@@ -2058,10 +2075,12 @@ static herr_t H5FD__clio_flush(H5FD_t *_file, hid_t dxpl_id, bool closing) {
   // write access. The debug CRT asserts and the release CRT returns EBADF,
   // which the fail-closed branch below would turn into a failed flush on a
   // file that was never dirty.
-  if (file->posix_fd >= 0 && H5FD_CLIO_WRITABLE(file) &&
-      clio_vfd_fsync(file->posix_fd) < 0) {
-    H5FD_CLIO_ERROR("fsync() in flush failed");
-    return FAIL;
+  if (file->posix_fd >= 0 && H5FD_CLIO_WRITABLE(file)) {
+    H5FDclio_fsyncs_g++;
+    if (clio_vfd_fsync(file->posix_fd) < 0) {
+      H5FD_CLIO_ERROR("fsync() in flush failed");
+      return FAIL;
+    }
   }
   return SUCCEED;
 } /* end H5FD__clio_flush() */

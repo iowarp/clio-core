@@ -122,6 +122,60 @@ class ChiModGenerator {
   }
 
   /**
+   * The C++ namespace a ChiMod's generated code lives in: the module's own
+   * `namespace:` in clio_mod.yaml when present, else the repository's.
+   * @param config the ChiMod's clio_mod.yaml
+   * @return namespace such as "clio::cte"
+   */
+  std::string ModuleNamespace(const YAML::Node& config) const {
+    if (config["namespace"]) return config["namespace"].as<std::string>();
+    return repo_namespace_;
+  }
+
+  /**
+   * The directory under <chimod>/include/ that holds the module's headers
+   * (#1249). A namespace is not a path: clio::cte lives under clio_cte/ but
+   * clio::run under clio_runtime/, so the on-disk layout decides. The first
+   * include/<dir> holding <module_name>/<chimod>_runtime.h wins, then any
+   * holding <module_name>/; with neither (a module being created), the
+   * namespace with "::" as "_".
+   * @param chimod_name ChiMod directory name (also the header stem)
+   * @param module_name module_name from clio_mod.yaml
+   * @param ns the module's C++ namespace
+   * @return include prefix such as "clio_cte"
+   */
+  std::string IncludePrefix(const std::string& chimod_name,
+                            const std::string& module_name,
+                            const std::string& ns) const {
+    const fs::path inc = repo_path_ / chimod_name / "include";
+    std::error_code ec;
+    if (fs::is_directory(inc, ec)) {
+      std::string with_dir;
+      for (const auto& d : fs::directory_iterator(inc, ec)) {
+        if (!d.is_directory()) continue;
+        const fs::path mod_dir = d.path() / module_name;
+        if (fs::exists(mod_dir / (chimod_name + "_runtime.h"), ec)) {
+          return d.path().filename().string();
+        }
+        if (with_dir.empty() && fs::is_directory(mod_dir, ec)) {
+          with_dir = d.path().filename().string();
+        }
+      }
+      if (!with_dir.empty()) return with_dir;
+    }
+    std::string prefix;
+    for (size_t i = 0; i < ns.size(); ++i) {
+      if (ns.compare(i, 2, "::") == 0) {
+        prefix += '_';
+        ++i;
+      } else {
+        prefix += ns[i];
+      }
+    }
+    return prefix;
+  }
+
+  /**
    * Extract methods from configuration, filtering out those with value -1
    */
   std::vector<Method> GetMethods(const YAML::Node& config) {
@@ -303,8 +357,10 @@ class ChiModGenerator {
     oss << " * Changes should be made to the autogen tool or the YAML configuration.\n";
     oss << " */\n";
     oss << "\n";
-    oss << "#include \"" << namespace_name << "/" << module_name << "/" << chimod_name << "_runtime.h\"\n";
-    oss << "#include \"" << namespace_name << "/" << module_name << "/autogen/" << chimod_name << "_methods.h\"\n";
+    const std::string inc_prefix =
+        IncludePrefix(chimod_name, module_name, namespace_name);
+    oss << "#include \"" << inc_prefix << "/" << module_name << "/" << chimod_name << "_runtime.h\"\n";
+    oss << "#include \"" << inc_prefix << "/" << module_name << "/autogen/" << chimod_name << "_methods.h\"\n";
     oss << "#include <clio_runtime/clio_runtime.h>\n";
     oss << "#include <clio_runtime/task.h>  // For TaskResume coroutine return type\n";
     oss << "\n";
@@ -616,7 +672,10 @@ class ChiModGenerator {
     // Create include autogen directory for methods header
     // Structure: [chimod_directory]/include/[namespace]/[module_name]/autogen/
     std::string module_name = config["module_name"] ? config["module_name"].as<std::string>() : chimod_name;
-    fs::path include_autogen_dir = repo_path_ / chimod_name / "include" / repo_namespace_ / module_name / "autogen";
+    const std::string ns = ModuleNamespace(config);
+    fs::path include_autogen_dir =
+        repo_path_ / chimod_name / "include" /
+        IncludePrefix(chimod_name, module_name, ns) / module_name / "autogen";
     fs::create_directories(include_autogen_dir);
 
     // Create src autogen directory for lib_exec source
@@ -624,7 +683,7 @@ class ChiModGenerator {
     fs::create_directories(src_autogen_dir);
 
     // Generate methods header
-    std::string methods_content = GenerateMethodsHeader(chimod_name, config, repo_namespace_);
+    std::string methods_content = GenerateMethodsHeader(chimod_name, config, ns);
     fs::path methods_file = include_autogen_dir / (chimod_name + "_methods.h");
     std::ofstream methods_stream(methods_file);
     if (!methods_stream) {
@@ -635,7 +694,7 @@ class ChiModGenerator {
     HIPRINT("  Generated: {}", methods_file.string());
 
     // Generate lib_exec source file
-    std::string lib_exec_content = GenerateLibExecSource(chimod_name, config, repo_namespace_);
+    std::string lib_exec_content = GenerateLibExecSource(chimod_name, config, ns);
     fs::path lib_exec_file = src_autogen_dir / (chimod_name + "_lib_exec.cc");
     std::ofstream lib_exec_stream(lib_exec_file);
     if (!lib_exec_stream) {

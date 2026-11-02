@@ -80,6 +80,11 @@ int main() { return 0; }
   try_compile(_version_ok
     "${CMAKE_BINARY_DIR}/CMakeFiles/ClioCheckPocoAbi/build" "${_probe_src}"
     CMAKE_FLAGS "-DINCLUDE_DIRECTORIES=${_inc_dirs}"
+    # static_assert needs C++11, and Poco 1.15 headers need C++17. Without
+    # this the probe builds at the compiler default -- C++98 for Apple clang
+    # -- and fails as a bogus "version mismatch" (#1261, macOS wheel).
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
     OUTPUT_VARIABLE _probe_out)
   if(NOT _version_ok)
     message(FATAL_ERROR
@@ -91,4 +96,29 @@ int main() { return 0; }
       "${_probe_out}")
   endif()
   message(STATUS "Poco header/library version check: OK (${Poco_VERSION})")
+endfunction()
+
+# clio_link_poco_private(<target>)
+#
+# Link <target> PRIVATE against Poco::Net and Poco::Foundation, the way every
+# Clio library that uses Poco must (PRIVATE keeps Poco's _FILE_OFFSET_BITS
+# INTERFACE definitions away from the POSIX interception adapters).
+#
+# When Poco is a static library on Linux (the pip wheel builds it that way,
+# because the wheel does not bundle third-party .so files), each shared library
+# that links it embeds its own copy. Poco's headers force default visibility
+# on its symbols, so both copies would be exported and the dynamic linker would
+# bind one library's Poco globals onto the other's -- their destructors then run
+# twice at exit ("free(): double free detected", wheel import aborts). Linking
+# with --exclude-libs keeps each embedded copy's symbols local to its library.
+#
+# Arguments:
+#   target - the shared/static library or executable that uses Poco::Net.
+function(clio_link_poco_private target)
+  target_link_libraries(${target} PRIVATE Poco::Net Poco::Foundation)
+  get_target_property(_poco_type Poco::Foundation TYPE)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND _poco_type STREQUAL "STATIC_LIBRARY")
+    target_link_options(${target} PRIVATE
+      "LINKER:--exclude-libs,libPocoNet.a:libPocoFoundation.a:libPocoNetd.a:libPocoFoundationd.a")
+  endif()
 endfunction()

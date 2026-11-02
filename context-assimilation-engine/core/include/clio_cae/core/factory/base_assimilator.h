@@ -61,6 +61,28 @@ class BaseAssimilator {
   virtual clio::run::TaskResume Schedule(const AssimilationCtx& ctx, int& error_code) = 0;
 
   /**
+   * Ingest-on-fault support: the bytes of ONE destination blob, exactly as
+   * Schedule() would have stored them, into `dst` (capacity `cap` =
+   * BlobBytes(ctx)). Plain blocking I/O, no tasks -- the CAE calls it off the
+   * runtime workers. Returns the byte count (0: the blob lies past the
+   * source), or -errno; -ENOSYS when the assimilator cannot ingest per blob.
+   */
+  virtual long long ReadBlob(const AssimilationCtx& ctx,
+                             const std::string& blob_name, char* dst,
+                             clio::run::u64 cap) {
+    (void)ctx;
+    (void)blob_name;
+    (void)dst;
+    (void)cap;
+    return -38;  // ENOSYS
+  }
+  /** Bytes per blob this assimilator stores for `ctx` (0: unsupported). */
+  virtual clio::run::u64 BlobBytes(const AssimilationCtx& ctx) {
+    (void)ctx;
+    return 0;
+  }
+
+  /**
    * PAGIFY: the assimilator's page-space layout for `ctx`.
    *
    * A consumer (the gpu_vector) addresses data as page 0, 1, 2, ... and

@@ -82,10 +82,14 @@ static uint64_t ParseDurationNs(const std::string &s) {
   return total_ns;
 }
 
-// CLOCK_MONOTONIC — same clock CTE uses for last_modified.
-static uint64_t MonotonicNowNs() {
+// Wall-clock epoch ns -- the clock TemporalSearch bounds and results use
+// (#1241). Converted explicitly: system_clock's native unit is platform-
+// dependent (100 ns on MSVC, us on macOS).
+static uint64_t WallNowNs() {
   return static_cast<uint64_t>(
-      std::chrono::steady_clock::now().time_since_epoch().count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +126,7 @@ static void PrintUsage(const char *prog) {
     "  --semantic QUERY     BM25 keyword query text\n"
     "  --since DURATION     Temporal: blobs modified within DURATION of now\n"
     "                       (e.g. 30s, 5m, 2h, 1d, 1h30m)\n"
-    "  --time-begin NS      Temporal: lower bound, nanoseconds (CLOCK_MONOTONIC)\n"
+    "  --time-begin NS      Temporal: lower bound, epoch nanoseconds (wall clock)\n"
     "\n"
     "Other options:\n"
     "  --time-end NS        Upper bound for --time-begin (0 = no upper bound)\n"
@@ -403,7 +407,7 @@ static int RunSearch(clio::cte::core::Client *client, const Args &a) {
     uint64_t time_end   = a.time_end;
     if (!a.since.empty()) {
       uint64_t duration_ns = ParseDurationNs(a.since);
-      time_begin = MonotonicNowNs() - duration_ns;
+      time_begin = WallNowNs() - duration_ns;
       time_end   = 0;
     }
 

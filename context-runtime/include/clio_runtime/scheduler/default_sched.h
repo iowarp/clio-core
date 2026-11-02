@@ -49,14 +49,23 @@
 
 namespace clio::run {
 
+class Container;
+
 /**
- * Default scheduler implementation with I/O-size-based routing.
- * Routes tasks based on io_size_: small I/O and metadata go to the scheduler
- * worker (worker 0), large I/O (>= 4KB) goes to dedicated I/O workers via
- * round-robin, and network tasks split across two dedicated workers — one
- * owns ROUTER recvs (kRecv / kClientRecv), the other owns DEALER sends
- * (kSend / kClientSend) — so a backlog on either direction can't starve
- * SWIM heartbeat probes on the other.
+ * Default scheduler: one pool of general workers, each kept to at most
+ * kMaxWorkerHoldUs of work.
+ *
+ * Every task is booked as the time it is predicted to HOLD a worker: the
+ * method's learned wall-time model, which sees the task's I/O size and is
+ * trained on the time the task really occupied its worker. A task runs on the worker that submitted it when that
+ * worker has room for it, else on the least-loaded pool worker; when no
+ * worker has room the pool grows by one (on the monitor thread, at once).
+ * There are no I/O, compute or cost-class partitions: the hold estimate is
+ * the only input.
+ *
+ * Outside the pool: two network workers -- one owns ROUTER recvs
+ * (kRecv / kClientRecv), the other DEALER sends (kSend / kClientSend), since a
+ * ZeroMQ socket has exactly one owner thread -- and the GPU polling worker.
  */
 class DefaultScheduler : public Scheduler {
  public:
@@ -121,9 +130,34 @@ class DefaultScheduler : public Scheduler {
   Worker *GetNetRecvWorker() const override { return net_recv_worker_; }
   Worker *PickAltWorker(u32 avoid_id) const override;
 
+  void GrowPool() override;
+
+  /**
+   * Most work (us) a worker should hold: about one OS context switch. Past
+   * that, a task waiting behind it would be served sooner by another thread,
+   * so the pool grows instead.
+   */
+  static constexpr double kMaxWorkerHoldUs = 100.0;
+
+  /** Most one task may book (us): bounds the damage of a bad prediction. */
+  static constexpr double kMaxBookedHoldUs = 1.0e6;
+
+  /**
+   * Whether  w can take a task predicted to hold a worker  hold_us. An
+   * idle worker can always take one, however long.
+   * @param w the worker
+   * @param hold_us the task's predicted hold time (us)
+   * @param now_us current time (NowUs)
+   * @return true if the worker stays within kMaxWorkerHoldUs
+   */
+  static bool HasRoom(const Worker *w, double hold_us, double now_us);
+
  private:
-  static constexpr size_t kLargeIOThreshold = 4096;  ///< I/O size threshold
-  static constexpr double kStallThresholdSec = 1.0;  ///< #781: worker stall cutoff
+  /// #781: worker stall cutoff. A task holding its worker this long has its
+  /// worker's backlog redistributed and a replacement started. 0.3 s was
+  /// tried and flagged routine 1-2 s device tasks on every worker; liveness
+  /// no longer depends on worker queues (control channel), so 1 s.
+  static constexpr double kStallThresholdSec = 1.0;
   static constexpr double kRetireCooldownSec = 5.0;  ///< #781: idle elastic retire
   static constexpr u32 kStealBatch = 4;              ///< #781: tasks stolen per victim
 
@@ -149,8 +183,8 @@ class DefaultScheduler : public Scheduler {
   std::atomic<u64> stalls_detected_{0};     ///< #781 cumulative stall events
   std::atomic<u64> rescues_performed_{0};   ///< #785 lane transfers off stalled workers
   /** #785: replacement workers spawned by rescues. Only ever touched by
-   *  LoadBalance on the monitor thread, so it needs no lock. Kept separate from
-   *  io_workers_ (which the mapper scans) so a rescuer is not immediately handed
+   *  LoadBalance on the monitor thread, so it needs no lock. Kept out of
+   *  pool_ (which the mapper scans) so a rescuer is not immediately handed
    *  fresh work, but still checked for stalls so cascades are rescued. */
   std::vector<Worker *> elastic_workers_;
 
@@ -166,116 +200,50 @@ class DefaultScheduler : public Scheduler {
   Worker *PickLeastLoadedLive(double now_us, Worker *avoid_a,
                               Worker *avoid_b) const;
 
-  //=========================================================================
-  // Cost-class worker pools
-  //
-  // Compute workers are partitioned into three pools by the PREDICTED cost of
-  // the task being mapped, so a 5us metadata lookup never queues behind a
-  // 2ms transfer on the same worker. Boundaries are the learned per-method
-  // estimate (Container::InferCpuTime), not the I/O size, so a method whose
-  // cost changes with load migrates classes on its own.
-  //
-  //   kQuickClass   predicted <= 10us   (stat, lookups)
-  //   kMediumClass  predicted <= 50us
-  //   kHeavyClass   predicted  > 50us   (readdir, rename, 1MiB transfers)
-  //
-  // Each pool grows and shrinks on its own: when EVERY worker in a class is
-  // carrying more than kSpawnLoadUs of work the class gets another worker,
-  // and a class-elastic worker that stays idle for kIdleRetireSec is retired.
-  //=========================================================================
-  enum CostClass {
-    kQuickClass = 0,
-    kMediumClass,
-    kHeavyClass,
-    kNumCostClasses
-  };
-
-  static constexpr double kQuickClassUs = 10.0;   ///< upper bound, quick pool
-  static constexpr double kMediumClassUs = 50.0;  ///< upper bound, medium pool
-  /// Every worker in a class busier than this => the class needs one more.
-  /// 500us (not 100us): a worker mid-transfer legitimately carries a few
-  /// hundred microseconds, and treating that as "overloaded" made the heavy
-  /// class grow on every tick forever.
-  static constexpr double kSpawnLoadUs = 500.0;
-  /// A class-elastic worker idle this long is retired. Deliberately long — a
-  /// worker spawned for a burst should still be there for the next burst
-  /// rather than being torn down and recreated between them.
-  static constexpr double kIdleRetireSec = 10.0;
   /**
-   * Growth guards. Without them the heavy class grows without bound: a heavy
-   * task is >kMediumClassUs by definition, so a worker executing one always
-   * reports more than kSpawnLoadUs and the "all workers busy" condition is
-   * permanently true. Measured: 85 threads on a 40-core box and a 3.4x
-   * throughput collapse.
-   *
-   * kMinSaturatedTicks   the class must look saturated on this many
-   *                      CONSECUTIVE monitor ticks — one busy instant is
-   *                      normal, sustained saturation is a backlog.
-   * kMaxClassWorkers     hard ceiling per class, sized off the machine so the
-   *                      pools cannot oversubscribe the cores they run on.
+   * Predict how long a task will hold a worker, and record the predictions on
+   * it (PredictedLoad = CPU, PredictedWallUs = wall) so the worker books and
+   * trains on the same values.
+   * @param task the task
+   * @param container its execution container
+   * @return the hold estimate (us), from the wall model
    */
-  static constexpr u32 kMinSaturatedTicks = 2;
-  static u32 MaxClassWorkers() {
-    unsigned hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 8;
-    u32 per_class = hw / kNumCostClasses;
-    return per_class < 2 ? 2 : per_class;
-  }
-
-  /** Cost class for a predicted execution time (us). */
-  static CostClass ClassFor(double predicted_us) {
-    if (predicted_us <= kQuickClassUs) return kQuickClass;
-    if (predicted_us <= kMediumClassUs) return kMediumClass;
-    return kHeavyClass;
-  }
-
-  static const char *ClassName(int c) {
-    switch (c) {
-      case kQuickClass: return "quick";
-      case kMediumClass: return "medium";
-      case kHeavyClass: return "heavy";
-      default: return "?";
-    }
-  }
+  static double PredictHold(Task *task, Container &container);
 
   /**
-   * Least-loaded worker in \a cls, or nullptr if the class has no workers.
-   * Sets \a *all_busy when every candidate is above kSpawnLoadUs, which is the
-   * signal LoadBalance uses to grow the class.
+   * Least-loaded pool worker, scanning from a rotating start so ties spread.
+   * @param now_us current time (NowUs)
+   * @return the worker, or nullptr if the pool is empty
    */
-  Worker *PickInClass(CostClass cls, double now_us, bool *all_busy) const;
+  Worker *PickPoolWorker(double now_us) const;
 
-  /** Monitor-thread half of the elasticity: honour pending spawn requests and
-   *  retire class workers that have been idle past kIdleRetireSec. */
-  void RebalanceClasses(double now_us);
+  /** Whether  w is in pool_. */
+  bool InPool(const Worker *w) const;
 
-  /// Per-class pools. Mutated only by DivideWorkers (startup) and
-  /// RebalanceClasses (monitor thread); read by mappers on task threads, which
-  /// is why the vectors are guarded by class_mu_.
-  std::vector<Worker *> class_workers_[kNumCostClasses];
-  /// Workers this scheduler spawned for a class (retirable; the startup
-  /// workers are not).
-  std::vector<Worker *> class_elastic_[kNumCostClasses];
-  /// us timestamp when each elastic worker was last seen busy (monitor only).
-  std::vector<double> class_elastic_busy_us_[kNumCostClasses];
-  mutable std::mutex class_mu_;
-  /// Set by a mapper that found every worker in the class saturated; consumed
-  /// by the monitor thread. Spawning a thread inline would put ~100us of
-  /// thread-creation on the submitting client's critical path.
-  std::atomic<bool> class_needs_worker_[kNumCostClasses] = {};
-  /// Consecutive monitor ticks each class has looked saturated.
-  u32 class_saturated_ticks_[kNumCostClasses] = {};
-  std::atomic<u64> class_spawns_[kNumCostClasses] = {};
-  std::atomic<u64> class_retires_[kNumCostClasses] = {};
-  std::atomic<u64> class_routed_[kNumCostClasses] = {};
+  /** Copy of pool_, for monitor-thread scans that may call out. */
+  std::vector<Worker *> PoolSnapshot() const;
 
-  Worker *scheduler_worker_;              ///< Worker 0: metadata + small I/O
-  std::vector<Worker *> io_workers_;      ///< Workers 1..N-3: large I/O
+  /// The routable workers: worker 0, the startup workers between it and the
+  /// GPU/network block, and every worker GrowPool added. Read by mappers on
+  /// any thread, appended to by GrowPool on the monitor thread.
+  std::vector<Worker *> pool_;
+  mutable std::mutex pool_mu_;  ///< guards pool_
+  std::atomic<u64> pool_grows_{0};  ///< workers GrowPool added (telemetry)
+  // Placement telemetry: on the submitting worker, on another pool worker
+  // with room, or on the least-loaded worker with no room anywhere.
+  std::atomic<u64> map_here_{0};
+  std::atomic<u64> map_other_{0};
+  std::atomic<u64> map_full_{0};
+  /// Set when SpawnAdditionalWorker refused (thread budget spent). Monitor
+  /// thread only, like GrowPool.
+  bool spawn_exhausted_ = false;
+
+  Worker *scheduler_worker_;              ///< Worker 0 (in pool_)
   Worker *net_send_worker_;               ///< Worker N-2: kSend / kClientSend
   Worker *net_recv_worker_;               ///< Worker N-1: kRecv / kClientRecv
   Worker *gpu_worker_;                    ///< GPU queue polling worker
-  /// Round-robin index for I/O workers. mutable so the const class picker
-  /// can rotate its scan start (ties would otherwise always pick pool[0]).
+  /// Rotating scan start for PickPoolWorker. mutable so the const picker
+  /// can advance it (ties would otherwise always pick pool_[0]).
   mutable std::atomic<u32> next_io_idx_{0};
   WorkOrchestrator *work_orch_ = nullptr; ///< #781 set in DivideWorkers; elastic spawn
 };

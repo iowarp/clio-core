@@ -368,7 +368,21 @@ int Client::SyncDurable(const clio::cte::core::TagId &tag,
   if (FsyncDeferred()) return 0;
   rc = SyncFileSize(tag);
   if (rc != 0) return rc;
-  return SyncTagDurable(TagOfPath(dir, /*want_dir=*/true));
+  rc = SyncTagDurable(TagOfPath(dir, /*want_dir=*/true));
+  if (rc != 0) return rc;
+  return SyncMetaDurable();
+}
+
+int Client::SyncMetaDurable() {
+  if (FsyncDeferred()) return 0;
+  auto t = AsyncSyncMeta();
+  t.Wait();
+  const clio::run::u32 rc = t->GetReturnCode();
+  if (rc != 0 && !clio::cte::core::IsNodeLostRc(rc)) {
+    HLOG(kError, "fsync of the filesystem namespace failed (rc {})", rc);
+    return -EIO;
+  }
+  return 0;
 }
 
 int Client::FtruncateFd(int fd, FsOff length) {

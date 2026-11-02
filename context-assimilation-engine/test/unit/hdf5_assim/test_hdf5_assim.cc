@@ -40,6 +40,9 @@
  * 3. Calling ParseOmni to discover and transfer datasets to CTE
  * 4. Validating that multiple tags were created (one per dataset)
  * 5. Verifying each tag's metadata and data in CTE
+ * 6. Staging the same file with format hdf5_vol and verifying the HDF5 VOL
+ *    connector's cache layout: one tag for the file, native-type images in
+ *    chunk blobs, and a coherence stamp
  *
  * Test Strategy:
  * - Tests HDF5 format discovery and multi-dataset handling
@@ -73,6 +76,9 @@
 
 // CTE headers
 #include <clio_cte/core/core_client.h>
+
+// The HDF5 VOL connector's cache layout, which format hdf5_vol writes
+#include "adapter/hdf5_vol/clio_vol_layout.h"
 
 // Logging
 #include <clio_ctp/util/logging.h>
@@ -454,6 +460,68 @@ bool VerifyDatasetData(const std::string& file_path,
   return data_matches;
 }
 
+/** Read `blob_name` of `tag_id` whole; empty when it is absent. */
+std::string ReadBlob(clio::cte::core::Client* cte_client,
+                     const clio::cte::core::TagId& tag_id,
+                     const std::string& blob_name) {
+  auto sz = cte_client->AsyncGetBlobSize(tag_id, blob_name);
+  sz.Wait();
+  const size_t n = sz->size_;
+  if (n == 0) return std::string();
+  auto buffer = CLIO_IPC->AllocateBuffer(n);
+  auto get = cte_client->AsyncGetBlob(tag_id, blob_name, 0, n, 0,
+                                      buffer.shm_.template Cast<void>());
+  get.Wait();
+  if (get->GetReturnCode() != 0) return std::string();
+  return std::string(static_cast<const char*>(buffer.ptr_), n);
+}
+
+/**
+ * Verify one dataset's VOL-layout image: the chunk blobs, concatenated, are
+ * exactly the dataset read in the native form of its file type.
+ */
+bool VerifyVolImage(const std::string& file_path,
+                    const std::string& dataset_path,
+                    const clio::cte::core::TagId& tag_id, size_t chunk,
+                    clio::cte::core::Client* cte_client) {
+  namespace layout = clio::adapter::vol_layout;
+  hid_t file_id = H5Fopen(file_path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+  if (file_id < 0) return false;
+  hid_t dset = H5Dopen2(file_id, dataset_path.c_str(), H5P_DEFAULT);
+  hid_t ftype = H5Dget_type(dset);
+  hid_t ntype = H5Tget_native_type(ftype, H5T_DIR_DEFAULT);
+  hid_t space = H5Dget_space(dset);
+  const size_t total =
+      static_cast<size_t>(H5Sget_simple_extent_npoints(space)) *
+      H5Tget_size(ntype);
+  std::string expect(total, '\0');
+  H5Dread(dset, ntype, H5S_ALL, H5S_ALL, H5P_DEFAULT, &expect[0]);
+  H5Sclose(space);
+  H5Tclose(ntype);
+  H5Tclose(ftype);
+  H5Dclose(dset);
+  H5Fclose(file_id);
+
+  std::string got;
+  for (size_t i = 0; i * chunk < total; ++i) {
+    const std::string part =
+        ReadBlob(cte_client, tag_id, layout::ChunkBlobName(dataset_path, i));
+    if (part.size() != std::min(chunk, total - i * chunk)) {
+      HLOG(kError, "  {} chunk {}: {} bytes, expected {}", dataset_path, i,
+           part.size(), std::min(chunk, total - i * chunk));
+      return false;
+    }
+    got += part;
+  }
+  if (got != expect) {
+    HLOG(kError, "  {}: staged image differs from the file", dataset_path);
+    return false;
+  }
+  HLOG(kSuccess, "  {}: {} bytes in {} chunk(s) match the file", dataset_path,
+       total, (total + chunk - 1) / chunk);
+  return true;
+}
+
 /**
  * Clean up test file
  */
@@ -474,6 +542,14 @@ int main(int argc, char* argv[]) {
   HLOG(kInfo, "======================================");
 
   int exit_code = 0;
+
+  // A small VOL chunk size, so format hdf5_vol splits every dataset here into
+  // several blobs. Set before the runtime starts, which reads it.
+#ifdef _WIN32
+  _putenv_s("CLIO_VOL_CHUNK_SIZE", "256");
+#else
+  setenv("CLIO_VOL_CHUNK_SIZE", "256", 1);
+#endif
 
   try {
     // Initialize CLIO Runtime runtime (CLIO_WITH_RUNTIME controls behavior)
@@ -639,6 +715,59 @@ int main(int argc, char* argv[]) {
       exit_code = 1;
     } else {
       HLOG(kSuccess, "All expected datasets found and verified in CTE");
+    }
+
+    // Step 7b: the same file, staged for the HDF5 VOL connector
+    HLOG(kInfo, "[STEP 7b] Staging with format hdf5_vol...");
+    {
+      namespace layout = clio::adapter::vol_layout;
+      const size_t chunk = layout::ChunkSizeFromEnv();
+
+      // A tag name in dst is refused: the connector derives its own.
+      clio::cae::core::AssimilationCtx bad;
+      bad.src = "hdf5::" + kTestFileName;
+      bad.dst = "iowarp::some_tag";
+      bad.format = "hdf5_vol";
+      auto bad_task = cae_client.AsyncParseOmni(
+          std::vector<clio::cae::core::AssimilationCtx>{bad});
+      bad_task.Wait();
+      if (bad_task->GetReturnCode() == 0) {
+        HLOG(kError, "hdf5_vol accepted a dst tag name it cannot honor");
+        exit_code = 1;
+      }
+
+      clio::cae::core::AssimilationCtx vol;
+      vol.src = "hdf5::" + kTestFileName;
+      vol.dst = "iowarp::";
+      vol.format = "hdf5_vol";
+      auto vol_task = cae_client.AsyncParseOmni(
+          std::vector<clio::cae::core::AssimilationCtx>{vol});
+      vol_task.Wait();
+      if (vol_task->GetReturnCode() != 0) {
+        HLOG(kError, "hdf5_vol ParseOmni failed with result_code: {}",
+             vol_task->GetReturnCode());
+        exit_code = 1;
+      } else {
+        auto tag_task =
+            cte_client->AsyncGetOrCreateTag(layout::TagName(kTestFileName));
+        tag_task.Wait();
+        const clio::cte::core::TagId tag_id = tag_task->tag_id_;
+        for (const auto& name : expected_datasets) {
+          if (!VerifyVolImage(kTestFileName, "/" + name, tag_id, chunk,
+                              cte_client)) {
+            exit_code = 1;
+          }
+        }
+        const std::string stamp =
+            ReadBlob(cte_client, tag_id, layout::kStampBlobName);
+        if (stamp != layout::Stamp(kTestFileName.c_str(), chunk)) {
+          HLOG(kError, "coherence stamp '{}' does not describe the file",
+               stamp);
+          exit_code = 1;
+        } else {
+          HLOG(kSuccess, "coherence stamp matches: {}", stamp);
+        }
+      }
     }
 
     // Step 8: Cleanup

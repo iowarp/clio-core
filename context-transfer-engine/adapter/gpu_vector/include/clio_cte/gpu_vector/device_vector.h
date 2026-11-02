@@ -82,8 +82,28 @@ template <typename T>
 inline T AtomicAnd(GV_G T *p, NonDeduced<T> v) { return GvGRef<T>(*p).fetch_and(v); }
 template <typename T>
 inline T AtomicCas(GV_G T *p, NonDeduced<T> cmp, NonDeduced<T> val) {
-  // The generic AtomicCas's 64-bit special case is NVPTX-only; on SPIR-V it is
-  // this same atomic_ref, just in the generic space.
+#if defined(__NVPTX__)
+  // THE SAME TOOLCHAIN BUG AS THE GENERIC AtomicCas (sycl_cuda_compat.h): a
+  // 64-bit compare_exchange through atomic_ref emits __clc_atomic_compare_
+  // exchange, which libspirv does not define for nvptx64 -- here in its
+  // global-space mangling, so the device link dies at
+  //   ptxas fatal : Unresolved extern function
+  //                 '_Z29__clc_atomic_compare_exchangePU3AS1mmmiii'
+  // This overload used to skip the workaround entirely, which broke every
+  // SYCL-on-NVIDIA build of gpu_vector (SPIR-V never takes this branch).
+  // The pointer is known global, so the global-space PTX instruction applies.
+  if constexpr (sizeof(T) == 8) {
+    unsigned long long out;
+    asm volatile("atom.global.cas.b64 %0, [%1], %2, %3;"
+                 : "=l"(out)
+                 : "l"(reinterpret_cast<unsigned long long>(p)),
+                   "l"(static_cast<unsigned long long>(cmp)),
+                   "l"(static_cast<unsigned long long>(val))
+                 : "memory");
+    return static_cast<T>(out);
+  }
+#endif
+  // On SPIR-V the 64-bit case needs no special path: atomic_ref links.
   T expected = cmp;
   GvGRef<T>(*p).compare_exchange_strong(expected, val);
   return expected;
@@ -1046,6 +1066,21 @@ class DeviceVector {
       if (!__syncthreads_or(ctag != kNoClaim ? 1 : 0)) break;
       if (ctag == kNoClaim) ctag = 0;
       CO_AWAIT(TagWait{ctag, 0}.Take());
+      p = FindBlock(pn);
+    }
+    // FETCHED, THEN EVICTED BEFORE THE HOLD. In a shared set a peer block's
+    // allocation can reclaim the frame between this block's fetch landing and
+    // this pin -- likelier the longer faults take (a by-reference page read
+    // from a parallel filesystem). Losing that race is not an error: fetch
+    // the slice again. Bounded, so a set that can never keep it still traps.
+    for (clio::run::u32 refetch = 0; refetch < 64; ++refetch) {
+      if (!__syncthreads_or(p == nullptr ? 1 : 0)) break;
+      {
+        const clio::run::u64 in_pg = off % h_->elems_per_page_;
+        clio::run::u64 rn = h_->elems_per_page_ - in_pg;
+        if (rn > count) rn = count;
+        CO_AWAIT(CoFetch(Tasks()->fetch_generation, off, rn));
+      }
       p = FindBlock(pn);
     }
     if (__syncthreads_or(p == nullptr ? 1 : 0)) {

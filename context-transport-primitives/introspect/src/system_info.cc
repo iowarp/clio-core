@@ -1,0 +1,1952 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#define CTP_COMPILING_DLL
+#define __HSHM_IS_COMPILING__
+
+#include <clio_ctp/util/env_compat.h>
+#include "clio_ctp/introspect/system_info.h"
+
+#include <atomic>
+#include <cerrno>
+#include <climits>
+#ifdef __linux__
+#include <linux/limits.h>  // PATH_MAX on some Linux toolchains
+#endif
+// LCOV_EXCL_START — compile-time fallback, unreachable on standard Linux
+#ifndef PATH_MAX
+#define PATH_MAX 4096  // POSIX default; not always in <climits> under NVHPC
+#endif
+// LCOV_EXCL_STOP
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+
+#if CTP_HAS_POCO
+#include <Poco/Exception.h>
+#include <Poco/StreamCopier.h>
+#include <Poco/Timespan.h>
+#include <Poco/URI.h>
+#include <Poco/Net/HTTPClientSession.h>
+#include <Poco/Net/HTTPMessage.h>
+#include <Poco/Net/HTTPRequest.h>
+#include <Poco/Net/HTTPResponse.h>
+#include <istream>
+#endif
+
+#include "clio_ctp/constants/macros.h"
+// MSan: mark memory that uninstrumented code (the kernel, libstdc++, Poco)
+// filled in as initialized -- see the header.
+#include "clio_ctp/util/msan.h"
+#if CTP_ENABLE_PROCFS_SYSINFO
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <ifaddrs.h>
+#include <libgen.h>
+#include <limits.h>
+#include <netdb.h>
+#include <signal.h>
+#include <sys/socket.h>
+// LINUX
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#if __linux__
+#include <sys/sysinfo.h>
+#include <sys/sysmacros.h>
+#else
+#include <sys/mount.h>
+#include <sys/sysctl.h>
+#endif
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+#if __linux__
+#include <linux/memfd.h>
+#endif
+#if __APPLE__
+#include <mach-o/dyld.h>
+#include <pthread.h>
+#endif
+// WINDOWS
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <windows.h>
+// FSCTL_SET_SPARSE. Spelled out because <windows.h> leaves it out under
+// WIN32_LEAN_AND_MEAN, which Poco's headers (included above) define first.
+#include <winioctl.h>
+#include <timeapi.h>
+#include <filesystem>
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "winmm.lib")
+#else
+#error \
+    "Must define either CTP_ENABLE_PROCFS_SYSINFO or CTP_ENABLE_WINDOWS_SYSINFO"
+#endif
+
+#if CTP_ENABLE_PROCFS_SYSINFO
+// The process environment for posix_spawn. glibc only declares `environ` in
+// <unistd.h> under _GNU_SOURCE/_DEFAULT_SOURCE, so declare it here at GLOBAL
+// scope (declaring it inside namespace ctp would bind to a non-existent
+// ctp::environ).
+extern "C" char **environ;
+#endif
+
+namespace ctp {
+
+#if CTP_ENABLE_WINDOWS_SYSINFO
+// Translate a POSIX shm_open()-style name ("/ctp_xxx") into a Win32
+// kernel-object name. Win32 names can't contain `/`; the "Local\" prefix
+// places the object in the user's session namespace, which is correct
+// for per-host SHM. Returns the cleaned name suitable for both
+// CreateFileMapping and OpenFileMapping.
+static std::string WinShmName(const std::string &posix_name) {
+  std::string base = posix_name;
+  while (!base.empty() && (base.front() == '/' || base.front() == '\\')) {
+    base.erase(0, 1);
+  }
+  for (auto &c : base) {
+    if (c == '/' || c == '\\') c = '_';
+  }
+  return "Local\\" + base;
+}
+#endif
+
+void SystemInfo::RefreshCpuFreqKhz() {
+#if CTP_IS_HOST
+  for (int i = 0; i < ncpu_; ++i) {
+    cur_cpu_freq_[i] = GetCpuFreqKhz(i);
+  }
+#endif
+}
+
+size_t SystemInfo::GetCpuFreqKhz(int cpu) {
+#if CTP_IS_HOST
+#if CTP_ENABLE_PROCFS_SYSINFO
+  // Read /sys/devices/system/cpu/cpuN/cpufreq/cpuinfo_cur_freq
+  // Use snprintf to build the path so MSan can track the buffer as initialized
+  char cpu_path[256];
+  snprintf(cpu_path, sizeof(cpu_path),
+           "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_cur_freq", cpu);
+  std::ifstream cpu_file(cpu_path);
+  size_t freq_khz = 0;
+  cpu_file >> freq_khz;
+  return freq_khz;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return 0;
+#endif
+#else
+  return 0;
+#endif
+}
+
+size_t SystemInfo::GetCpuMaxFreqKhz(int cpu) {
+#if CTP_IS_HOST
+#if CTP_ENABLE_PROCFS_SYSINFO
+  // Read /sys/devices/system/cpu/cpuN/cpufreq/cpuinfo_max_freq
+  char cpu_path[256];
+  snprintf(cpu_path, sizeof(cpu_path),
+           "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+  std::ifstream cpu_file(cpu_path);
+  size_t freq_khz = 0;
+  cpu_file >> freq_khz;
+  return freq_khz;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return 0;
+#endif
+#else
+  return 0;
+#endif
+}
+
+size_t SystemInfo::GetCpuMinFreqKhz(int cpu) {
+#if CTP_IS_HOST
+#if CTP_ENABLE_PROCFS_SYSINFO
+  // Read /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq
+  std::string cpu_str = ctp::Formatter::format(
+      "/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_min_freq", cpu);
+  std::ifstream cpu_file(cpu_str);
+  size_t freq_khz;
+  cpu_file >> freq_khz;
+  return freq_khz;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return 0;
+#endif
+#else
+  return 0;
+#endif
+}
+
+size_t SystemInfo::GetCpuMinFreqMhz(int cpu) {
+  return GetCpuMinFreqKhz(cpu) / 1000;
+}
+
+size_t SystemInfo::GetCpuMaxFreqMhz(int cpu) {
+  return GetCpuMaxFreqKhz(cpu) / 1000;
+}
+
+void SystemInfo::SetCpuFreqMhz(int cpu, size_t cpu_freq_mhz) {
+  SetCpuFreqKhz(cpu, cpu_freq_mhz * 1000);
+}
+
+void SystemInfo::SetCpuFreqKhz(int cpu, size_t cpu_freq_khz) {
+  SetCpuMinFreqKhz(cpu, cpu_freq_khz);
+  SetCpuMaxFreqKhz(cpu, cpu_freq_khz);
+}
+
+void SystemInfo::SetCpuMinFreqKhz(int cpu, size_t cpu_freq_khz) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  std::string cpu_str = ctp::Formatter::format(
+      "/sys/devices/system/cpu/cpu{}/cpufreq/scaling_min_freq", cpu);
+  std::ofstream min_freq_file(cpu_str);
+  min_freq_file << cpu_freq_khz;
+#endif
+}
+
+void SystemInfo::SetCpuMaxFreqKhz(int cpu, size_t cpu_freq_khz) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  std::string cpu_str = ctp::Formatter::format(
+      "/sys/devices/system/cpu/cpu{}/cpufreq/scaling_max_freq", cpu);
+  std::ofstream max_freq_file(cpu_str);
+  max_freq_file << cpu_freq_khz;
+#endif
+}
+
+int SystemInfo::GetCpuCount() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+
+#if __linux__
+  return get_nprocs_conf();
+#else
+  int count;
+  using size_t = std::size_t;
+  size_t count_len = sizeof(count);
+#if __APPLE__
+  if (sysctlbyname("hw.physicalcpu", &count, &count_len, NULL, 0) == -1) {
+#else
+  int mib[2];
+  if (sysctl(mib, 2, &count, &count_len, NULL, 0) == -1) {
+#endif
+    perror("sysctl");
+    return 1;
+  }
+  return count;
+#endif
+
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  SYSTEM_INFO sys_info;
+  GetSystemInfo(&sys_info);
+  return sys_info.dwNumberOfProcessors;
+
+#endif
+}
+
+int SystemInfo::GetPageSize() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return getpagesize();
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  SYSTEM_INFO sys_info;
+  GetSystemInfo(&sys_info);
+  if (sys_info.dwAllocationGranularity != 0) {
+    return sys_info.dwAllocationGranularity;
+  }
+  return sys_info.dwPageSize;
+#endif
+}
+
+int SystemInfo::GetTid() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+#ifdef __linux__
+  return (pid_t)syscall(SYS_gettid);
+#elif __APPLE__
+  uint64_t tid = 0;
+  pthread_threadid_np(nullptr, &tid);
+  return static_cast<int>(tid);
+#else
+  return GetPid();
+#endif
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return GetCurrentThreadId();
+#endif
+}
+
+int SystemInfo::GetPid() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+#ifdef SYS_getpid
+#if defined(__OpenBSD__) || defined(__APPLE__)
+  // syscall(2) is deprecated on macOS; getpid() is the supported interface and
+  // is not subject to the fork-caching issue this raw syscall historically
+  // worked around on glibc.
+  return (pid_t)getpid();
+#else
+  return (pid_t)syscall(SYS_getpid);
+#endif
+#else
+#warning "GetPid is not defined"
+  return 0;
+#endif
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return GetCurrentProcessId();
+#endif
+}
+
+int SystemInfo::GetUid() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return getuid();
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return 0;
+#endif
+};
+
+int SystemInfo::GetGid() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return getgid();
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return 0;
+#endif
+};
+
+size_t SystemInfo::GetRamCapacity() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+#if __APPLE__ || __OpenBSD__
+  int mib[2];
+  uint64_t mem_total;  // Use uint64_t for memory sizes
+
+  mib[0] = CTL_HW;
+#if __APPLE__
+  mib[1] = HW_MEMSIZE;  // This is what you're looking for
+#else
+  mib[1] = HW_PHYSMEM;
+#endif
+  using size_t = std::size_t;
+  size_t len = sizeof(mem_total);
+  if (sysctl(mib, 2, &mem_total, &len, NULL, 0) == -1) {
+    perror("sysctl");
+    return 1;
+  } else {
+    return mem_total;
+  }
+#else
+  struct sysinfo info;
+  sysinfo(&info);
+  return info.totalram;
+#endif
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  MEMORYSTATUSEX mem_info;
+  mem_info.dwLength = sizeof(mem_info);
+  GlobalMemoryStatusEx(&mem_info);
+  return (size_t)mem_info.ullTotalPhys;
+#endif
+}
+
+size_t SystemInfo::GetRamAvailable() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+#ifdef __linux__
+  std::ifstream meminfo("/proc/meminfo");
+  // libstdc++.so is not MSan-instrumented, so neither the stream's own state
+  // nor the bytes getline() copies into `line` are recorded as initialized;
+  // the rfind() below would be reported on every call.
+  CTP_MSAN_UNPOISON_OBJ(meminfo);
+  if (!meminfo.is_open()) return 0;
+  std::string line;
+  while (std::getline(meminfo, line)) {
+    CTP_MSAN_UNPOISON_STRING(line);
+    if (line.rfind("MemAvailable:", 0) == 0) {
+      size_t kb = 0;
+      std::sscanf(line.c_str(), "MemAvailable: %zu", &kb);
+      return kb * 1024;  // convert kB to bytes
+    }
+  }
+  return 0;
+#else
+  return 0;
+#endif
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  MEMORYSTATUSEX mem_info;
+  mem_info.dwLength = sizeof(mem_info);
+  GlobalMemoryStatusEx(&mem_info);
+  return static_cast<size_t>(mem_info.ullAvailPhys);
+#else
+  return 0;
+#endif
+}
+
+size_t SystemInfo::ReadMemoryLimitFile(const std::string &path) {
+  std::ifstream f(path);
+  CTP_MSAN_UNPOISON_OBJ(f);  // stream state is owned by libstdc++.so
+  if (!f.is_open()) {
+    return 0;
+  }
+  std::string v;
+  f >> v;
+  CTP_MSAN_UNPOISON_OBJ(f);
+  if (!f) {
+    return 0;
+  }
+  CTP_MSAN_UNPOISON_STRING(v);
+  if (v == "max") {
+    return 0;  // explicitly unlimited
+  }
+  try {
+    unsigned long long n = std::stoull(v);
+    // cgroup v1 reports a sentinel near SIZE_MAX when unlimited.
+    if (n > 0 && n < (1ULL << 62)) {
+      return static_cast<size_t>(n);
+    }
+  } catch (...) {
+  }
+  return 0;
+}
+
+/**
+ * Memory limit imposed on this process by its cgroup, or 0 when unlimited or
+ * unreadable (cgroup v2 first, then v1).
+ */
+static size_t ReadCgroupMemoryLimit() {
+#ifdef __linux__
+  const char *paths[] = {"/sys/fs/cgroup/memory.max",
+                         "/sys/fs/cgroup/memory/memory.limit_in_bytes"};
+  for (const char *path : paths) {
+    size_t limit = SystemInfo::ReadMemoryLimitFile(path);
+    if (limit > 0) {
+      return limit;
+    }
+  }
+#endif
+  return 0;
+}
+
+size_t SystemInfo::GetProcessMemoryBudget() {
+  size_t budget = GetRamCapacity();
+  size_t cgroup_limit = ReadCgroupMemoryLimit();
+  if (cgroup_limit > 0 && (budget == 0 || cgroup_limit < budget)) {
+    budget = cgroup_limit;
+  }
+  return budget;
+}
+
+CpuTimes SystemInfo::GetCpuTimes() {
+  CpuTimes ct = {};
+#if CTP_ENABLE_PROCFS_SYSINFO
+#ifdef __linux__
+  std::ifstream stat("/proc/stat");
+  if (stat.is_open()) {
+    std::string cpu_label;
+    stat >> cpu_label >> ct.user >> ct.nice >> ct.system >> ct.idle
+         >> ct.iowait >> ct.irq >> ct.softirq >> ct.steal;
+  }
+#endif
+#endif
+  return ct;
+}
+
+void SystemInfo::YieldThread() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  sched_yield();
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  Yield();
+#endif
+}
+
+bool SystemInfo::CreateTls(ThreadLocalKey &key, void *data) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  int ret = pthread_key_create(&key.pthread_key_, nullptr);
+  if (ret != 0) {
+    return false;
+  }
+  return SetTls(key, data);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  key.windows_key_ = TlsAlloc();
+  if (key.windows_key_ == TLS_OUT_OF_INDEXES) {
+    return false;
+  }
+  return TlsSetValue(key.windows_key_, data);
+#endif
+}
+
+bool SystemInfo::SetTls(const ThreadLocalKey &key, void *data) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return pthread_setspecific(key.pthread_key_, data) == 0;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return TlsSetValue(key.windows_key_, data);
+#endif
+}
+
+void *SystemInfo::GetTls(const ThreadLocalKey &key) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return pthread_getspecific(key.pthread_key_);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return TlsGetValue(key.windows_key_);
+#endif
+}
+
+std::string SystemInfo::GetMemfdDir() {
+  // Default is /tmp/clio_$USER, but some sites have a tiny /
+  // partition where /tmp fills up (ares compute nodes are a known
+  // example: a stale prior run -- or any other user's clutter --
+  // can leave no space, mkdir under /tmp silently fails, and the
+  // subsequent memfd symlink + shm_open returns ENOENT here. Allow
+  // env override so deployments can point clio's per-user
+  // bookkeeping at an NFS-backed location (e.g. $HOME).
+  const char *override_dir = ctp::env::GetCompat("MEMFD_DIR");
+  if (override_dir && *override_dir) {
+    return std::string(override_dir);
+  }
+#if CTP_ENABLE_WINDOWS_SYSINFO
+  // Windows has no /tmp and uses USERNAME (not USER). Anchor the per-user
+  // bookkeeping dir under the system temp directory (%TMP%/%TEMP%).
+  const char *user = getenv("USERNAME");
+  if (!user) user = "unknown";
+  std::error_code ec;
+  std::filesystem::path base = std::filesystem::temp_directory_path(ec);
+  if (ec) base = std::filesystem::path(".");
+  return (base / (std::string("clio_") + user)).string();
+#else
+  const char *user = getenv("USER");
+  if (!user) user = "unknown";
+  return std::string("/tmp/clio_") + user;
+#endif
+}
+
+std::string SystemInfo::GetMemfdPath(const std::string &name) {
+  // Strip leading '/' from name if present
+  const char *base = name.c_str();
+  if (base[0] == '/') {
+    base++;
+  }
+  return GetMemfdDir() + "/" + base;
+}
+
+void SystemInfo::EnsureMemfdDir() {
+  std::string dir = GetMemfdDir();
+#if CTP_ENABLE_PROCFS_SYSINFO
+  // All POSIX platforms (Linux, macOS, BSD) need this per-user dir to exist:
+  // it holds the file-backed shared-memory segments and the IPC Unix-domain
+  // socket. It was previously Linux-only, so on macOS the IPC socket bind
+  // failed ("failed to bind Unix socket") because the parent dir was absent.
+  mkdir(dir.c_str(), 0700);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+#endif
+}
+
+bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
+                                       size_t size) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+#if __linux__
+  fd.posix_fd_ = memfd_create(name.c_str(), 0);
+  if (fd.posix_fd_ < 0) {
+    return false;
+  }
+  int ret = ftruncate(fd.posix_fd_, size);
+  if (ret < 0) {
+    close(fd.posix_fd_);
+    return false;
+  }
+  EnsureMemfdDir();
+  std::string memfd_path = GetMemfdPath(name);
+  unlink(memfd_path.c_str());
+  std::string proc_path =
+      "/proc/" + std::to_string(getpid()) + "/fd/" + std::to_string(fd.posix_fd_);
+  if (symlink(proc_path.c_str(), memfd_path.c_str()) < 0) {
+    close(fd.posix_fd_);
+    return false;
+  }
+  return true;
+#else
+  // macOS / BSD: POSIX shm_open() names are capped at PSHMNAMLEN (31 chars
+  // on macOS) and shm objects live in an anonymous namespace with no
+  // filesystem path, so the per-user readiness probes and tooling that
+  // expect /tmp/clio_$USER/<name> (mirroring Linux's memfd symlink)
+  // never observe the segment -- WaitForServer() then times out, the test
+  // leaves an orphaned server holding the port, and every later test fails
+  // with "Address already in use". Back the segment with a regular file in
+  // the memfd dir instead: arbitrary-length names, an openable path for
+  // cross-process attach, and MAP_SHARED gives identical semantics.
+  EnsureMemfdDir();
+  std::string shm_path = GetMemfdPath(name);
+  fd.posix_fd_ = open(shm_path.c_str(), O_CREAT | O_RDWR, 0600);
+  if (fd.posix_fd_ < 0) {
+    return false;
+  }
+  int ret = ftruncate(fd.posix_fd_, size);
+  if (ret < 0) {
+    close(fd.posix_fd_);
+    return false;
+  }
+  return true;
+#endif
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // Back the section with a SPARSE FILE, not the paging file.
+  //
+  // The obvious spelling, CreateFileMapping(INVALID_HANDLE_VALUE, ...), asks
+  // for a pagefile-backed section -- and a section created without SEC_RESERVE
+  // is SEC_COMMIT, so the WHOLE size is charged against the system commit
+  // limit the moment it is created, before a single byte is touched. Neither
+  // POSIX branch above behaves that way: Linux's memfd_create + ftruncate and
+  // macOS's regular file are both sparse and charge per touched page.
+  //
+  // That asymmetry is not academic. A CLIO client's per-process data segment
+  // defaults to 512 MB (+32 MB metadata), so on Windows every process that
+  // called ClientInit charged 544 MB of commit whether it used any of it or
+  // not. Measured on a 32 GB host: eight such segments cost 4361 MB of commit
+  // with zero bytes written. Run a test suite that starts several client
+  // processes at once and the commit limit is reached, at which point
+  // CreateFileMapping fails with ERROR_COMMITMENT_LIMIT, ZeroMQ cannot create
+  // a thread, and unrelated processes on the machine start failing to fork.
+  //
+  // A file-backed section is charged to the file instead, and a sparse file
+  // allocates only the ranges written. The same eight segments then cost 0 MB
+  // of commit. FILE_ATTRIBUTE_TEMPORARY keeps the pages in memory unless the
+  // system is actually short of it, so this is not a trip to the disk.
+  //
+  // Everything else is unchanged: the section still carries the same
+  // "Local\<base>" name, so OpenSharedMemory/SharedMemoryExists are untouched,
+  // and a second process still attaches by name.
+  //
+  // POSIX shared memory names start with `/` (e.g. "/ctp_shm_42"). Win32
+  // kernel object names can't contain `/`, so map to "Local\<base>" — the
+  // per-session namespace, which is right for single-host SHM. Without
+  // this the mapping was created anonymously (nullptr name) and could
+  // not be reopened by name, breaking every OpenSharedMemory.
+  std::string win_name = WinShmName(name);
+
+  EnsureMemfdDir();
+  std::string shm_path = GetMemfdPath(name);
+
+  // FILE_SHARE_DELETE so DestroySharedMemory can unlink the path the way the
+  // POSIX branches do while a mapping is still live.
+  HANDLE hfile = CreateFileA(shm_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                 FILE_SHARE_DELETE,
+                             nullptr, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_TEMPORARY, nullptr);
+  if (hfile == INVALID_HANDLE_VALUE) {
+    fd.windows_fd_ = nullptr;
+    return false;
+  }
+
+  // Sparse, so extending the file below reserves no disk either. Best effort:
+  // a filesystem without sparse support still gives a correct (if eagerly
+  // sized) file, and the commit-charge problem this function exists to avoid
+  // is solved by the file backing regardless.
+  DWORD unused = 0;
+  DeviceIoControl(hfile, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &unused,
+                  nullptr);
+
+  LARGE_INTEGER end;
+  end.QuadPart = static_cast<LONGLONG>(size);
+  if (!SetFilePointerEx(hfile, end, nullptr, FILE_BEGIN) ||
+      !SetEndOfFile(hfile)) {
+    // Same reason as the CreateFileMappingA path below: preserve the error
+    // across the cleanup call so the caller reports this failure, not
+    // CloseHandle's.
+    const DWORD size_err = GetLastError();
+    CloseHandle(hfile);
+    fd.windows_fd_ = nullptr;
+    SetLastError(size_err);
+    return false;
+  }
+
+  fd.windows_fd_ = CreateFileMappingA(
+      hfile,                                       // backing file
+      nullptr,                                     // default security
+      PAGE_READWRITE,                              // read/write access
+      static_cast<DWORD>(size >> 32),              // size, high-order DWORD
+      static_cast<DWORD>(size & 0xFFFFFFFFull),    // size, low-order DWORD
+      win_name.c_str());                           // mapping object name
+  const DWORD map_err = GetLastError();
+
+  // The section holds its own reference to the file, so the file handle has
+  // done its job. Closing it here keeps File a union of one handle and leaves
+  // CloseSharedMemory unchanged.
+  CloseHandle(hfile);
+
+  if (fd.windows_fd_ == nullptr) {
+    // Restore the error AFTER the cleanup call. The caller reports the failure
+    // with GetLastSharedMemoryError(), which reads GetLastError() -- so the
+    // DeleteFileA below would otherwise be what gets reported, and the real
+    // reason would be lost. That is how a create failure came to be blamed on
+    // "Win32 error 203" (ERROR_ENVVAR_NOT_FOUND), a code nothing in this
+    // function can produce.
+    DeleteFileA(shm_path.c_str());
+    SetLastError(map_err);
+    return false;
+  }
+  return true;
+#endif
+}
+
+bool SystemInfo::OpenSharedMemory(File &fd, const std::string &name) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+#if __linux__
+  std::string memfd_path = GetMemfdPath(name);
+  fd.posix_fd_ = open(memfd_path.c_str(), O_RDWR);
+  return fd.posix_fd_ >= 0;
+#else
+  // macOS / BSD: attach to the file-backed segment created by
+  // CreateNewSharedMemory (see the rationale there).
+  std::string shm_path = GetMemfdPath(name);
+  fd.posix_fd_ = open(shm_path.c_str(), O_RDWR);
+  return fd.posix_fd_ >= 0;
+#endif
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  std::string win_name = WinShmName(name);
+  fd.windows_fd_ =
+      OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, win_name.c_str());
+  return fd.windows_fd_ != nullptr;
+#endif
+}
+
+void SystemInfo::CloseSharedMemory(File &file) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  close(file.posix_fd_);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  CloseHandle(file.windows_fd_);
+#endif
+}
+
+bool SystemInfo::SharedMemoryExists(const std::string &name) {
+  // Open-then-close: cheaper than shm_attach (no header/data mapping) and
+  // side-effect free. A same-host runtime always creates its main segment
+  // (ServerInitShm is unconditional), so segment-present == local server up.
+  File probe;
+  if (!OpenSharedMemory(probe, name)) {
+    return false;
+  }
+  CloseSharedMemory(probe);
+  return true;
+}
+
+void SystemInfo::DestroySharedMemory(const std::string &name) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+#if __linux__
+  std::string memfd_path = GetMemfdPath(name);
+  unlink(memfd_path.c_str());
+#else
+  // macOS / BSD: the segment is a regular file in the memfd dir.
+  std::string shm_path = GetMemfdPath(name);
+  unlink(shm_path.c_str());
+#endif
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // The segment is the sparse file CreateNewSharedMemory made; remove it, as
+  // the POSIX branches remove theirs. This used to be an empty branch, from
+  // when the Windows section was backed by the paging file and had no path to
+  // remove -- so every segment ever created leaked its name until the machine
+  // was rebooted, and shm_init's "destroy any stale segment first" call did
+  // nothing at all.
+  //
+  // Best effort, exactly like unlink() above: the file was opened with
+  // FILE_SHARE_DELETE, so this succeeds even while a mapping is live on a
+  // filesystem with POSIX delete semantics, and where it does not, the
+  // CREATE_ALWAYS in CreateNewSharedMemory still resets the contents.
+  DeleteFileA(GetMemfdPath(name).c_str());
+#endif
+}
+
+std::string SystemInfo::GetLastSharedMemoryError() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return strerror(errno);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  DWORD err = GetLastError();
+  char *buf = nullptr;
+  DWORD n = FormatMessageA(
+      FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+          FORMAT_MESSAGE_IGNORE_INSERTS,
+      nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+      reinterpret_cast<char *>(&buf), 0, nullptr);
+  std::string msg;
+  if (n && buf) {
+    msg.assign(buf, n);
+    while (!msg.empty() && (msg.back() == '\r' || msg.back() == '\n' ||
+                            msg.back() == '.' || msg.back() == ' ')) {
+      msg.pop_back();
+    }
+  }
+  if (buf) {
+    LocalFree(buf);
+  }
+  if (msg.empty()) {
+    msg = "unknown error";
+  }
+  return msg + " (Win32 error " + std::to_string(err) + ")";
+#endif
+}
+
+void *SystemInfo::MapPrivateMemory(size_t size) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+#if __APPLE__ || __OpenBSD__
+  void *ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#else
+  void *ptr = mmap64(nullptr, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
+  if (ptr != MAP_FAILED && ptr != nullptr) {
+    CTP_MSAN_UNPOISON(ptr, size);
+  }
+  return ptr;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  void *ptr = VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
+  if (ptr) {
+    CTP_MSAN_UNPOISON(ptr, size);
+  }
+  return ptr;
+#endif
+}
+
+void *SystemInfo::MapSharedMemory(const File &fd, size_t size, i64 off) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+#if __APPLE__ || __OpenBSD__
+  void *ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   fd.posix_fd_, static_cast<off_t>(off));
+#else
+  void *ptr = mmap64(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                     fd.posix_fd_, off);
+#endif
+  if (ptr == MAP_FAILED) {
+    // Keep errno for the caller's GetLastSharedMemoryError() (#1173).
+    int saved_errno = errno;
+    perror("mmap");
+    errno = saved_errno;
+    return nullptr;
+  }
+#if defined(__linux__) && defined(MADV_DONTDUMP)
+  // Exclude giant shared reservations from core dumps. The runtime's main and
+  // metadata segments default to the machine's RAM capacity (issues #727 and
+  // #783) and stay almost entirely sparse — but a core dump MATERIALIZES the
+  // whole range as zeros, and a piped core_pattern (systemd-coredump, apport,
+  // WSL) bypasses RLIMIT_CORE=0. The runtime's abort()-based shutdown then
+  // spends minutes streaming zeros through the pipe: the daemon outlived the
+  // 60 s shutdown wait of cr_cli_runtime_command_tests / cr_cli_cte_wal_restart
+  // / cr_cli_compose_restart in CI (verified: abort-to-death 65 s → 2 s with
+  // these pages excluded). Small segments stay dumpable; nothing of value is
+  // lost from a reservation that is overwhelmingly unfaulted.
+  constexpr size_t kDontDumpMin = 1ULL << 30;  // 1 GiB
+  if (size >= kDontDumpMin) {
+    (void)madvise(ptr, size, MADV_DONTDUMP);
+  }
+#endif
+  CTP_MSAN_UNPOISON(ptr, size);
+  return ptr;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // Convert i64 to low and high dwords
+  DWORD highDword = (DWORD)((off >> 32) & 0xFFFFFFFF);
+  DWORD lowDword = (DWORD)(off & 0xFFFFFFFF);
+  void *ret = MapViewOfFile(fd.windows_fd_,       // handle to map object
+                            FILE_MAP_ALL_ACCESS,  // read/write permission
+                            highDword,            // file offset high
+                            lowDword,             // file offset low
+                            size);                // number of bytes to map
+  if (ret == nullptr) {
+    DWORD error = GetLastError();
+    LPVOID msg_buf;
+    FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                       FORMAT_MESSAGE_IGNORE_INSERTS,
+                   NULL, error, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                   (LPSTR)&msg_buf, 0, NULL);
+    printf("MapViewOfFile failed with error: %s\n", (char *)msg_buf);
+    LocalFree(msg_buf);
+    // FormatMessage/printf/LocalFree may overwrite the thread's last error;
+    // put back the MapViewOfFile code for GetLastSharedMemoryError() (#1173).
+    SetLastError(error);
+  }
+  return ret;
+#endif
+}
+
+void SystemInfo::UnmapMemory(void *ptr, size_t size) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  munmap(ptr, size);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // This is the counterpart of TWO allocators, because on POSIX one munmap()
+  // serves both: MapSharedMemory() (MapViewOfFile) and MapPrivateMemory()
+  // (VirtualAlloc). Win32 has a separate deallocator for each, and the one
+  // that used to be here -- VirtualFree(ptr, size, MEM_RELEASE) -- was wrong
+  // for both:
+  //
+  //   * A MapViewOfFile region is MEM_MAPPED. VirtualFree cannot free it at
+  //     all; only UnmapViewOfFile can.
+  //   * For a VirtualAlloc region, MEM_RELEASE REQUIRES dwSize to be 0.
+  //     Passing the region's size fails with ERROR_INVALID_PARAMETER.
+  //
+  // Both failures were silent -- the return value is discarded -- so every
+  // view and every private mapping leaked for the life of the process. That
+  // was invisible while Windows segments were pagefile-backed, but once they
+  // gained a sparse backing file (#1063) a leaked view keeps a live section on
+  // that file, and CreateNewSharedMemory's CREATE_ALWAYS cannot truncate a
+  // file with a mapped section: ERROR_USER_MAPPED_FILE. See #1069.
+  //
+  // Ask the OS which kind of region this is rather than threading a flag
+  // through every caller: the callers are shared with the POSIX build, where
+  // the distinction does not exist.
+  if (ptr == nullptr) {
+    return;
+  }
+  MEMORY_BASIC_INFORMATION mbi;
+  if (VirtualQuery(ptr, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+      mbi.Type == MEM_MAPPED) {
+    UnmapViewOfFile(ptr);
+    return;
+  }
+  VirtualFree(ptr, 0, MEM_RELEASE);
+  (void)size;
+#endif
+}
+
+// Some build toolchains (older glibc headers) predate the kernel constant;
+// the kernel rejects it with EINVAL when unsupported, which the fallback
+// below handles, so defining it locally is safe.
+#if defined(__linux__) && !defined(MADV_POPULATE_WRITE)
+#define MADV_POPULATE_WRITE 23
+#endif
+
+bool SystemInfo::BulkFault(void *addr, size_t size) {
+  if (addr == nullptr || size == 0) {
+    return false;
+  }
+  // Page-align the range: madvise requires an aligned start, and the touch
+  // loop wants to land exactly once per page.
+  const size_t page = static_cast<size_t>(GetPageSize());
+  uintptr_t begin = reinterpret_cast<uintptr_t>(addr);
+  uintptr_t end = begin + size;
+  begin &= ~(static_cast<uintptr_t>(page) - 1);
+
+#if defined(__linux__)
+  // Cache the kernel's answer: one EINVAL/ENOSYS (pre-5.14) is permanent,
+  // so later calls skip straight to the touch loop.
+  static std::atomic<bool> populate_supported{true};
+  if (populate_supported.load(std::memory_order_relaxed)) {
+    if (madvise(reinterpret_cast<void *>(begin), end - begin,
+                MADV_POPULATE_WRITE) == 0) {
+      return true;
+    }
+    if (errno == EINVAL || errno == ENOSYS) {
+      populate_supported.store(false, std::memory_order_relaxed);
+    }
+    // Any other errno (e.g. ENOMEM under pressure): fall through and touch —
+    // partial population is fine, the remainder demand-faults.
+  }
+#elif defined(_WIN32)
+  // PrefetchVirtualMemory materializes the whole range into the working set
+  // in one call. Pages arrive resident; the later write's dirty-bit
+  // transition is a cheap soft fault, not a demand-zero fault.
+  WIN32_MEMORY_RANGE_ENTRY range;
+  range.VirtualAddress = reinterpret_cast<PVOID>(begin);
+  range.NumberOfBytes = static_cast<SIZE_T>(end - begin);
+  if (PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
+    return true;
+  }
+  // Fall through to the touch loop (e.g. pre-Win8, or an unmapped subrange).
+#endif
+
+  // Universal fallback (and the macOS primary path): write-touch one byte
+  // per page. A volatile read-modify-write faults the page for writing while
+  // preserving its contents. Same per-page cost as demand faulting, but paid
+  // here, at a controlled point, instead of scattered through a bulk memcpy.
+  volatile char *p = reinterpret_cast<volatile char *>(begin);
+  for (uintptr_t off = 0; off < end - begin; off += page) {
+    p[off] = p[off];
+  }
+  return true;
+}
+
+void *SystemInfo::AlignedAlloc(size_t alignment, size_t size) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return aligned_alloc(alignment, size);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return _aligned_malloc(size, alignment);
+#endif
+}
+
+void SystemInfo::AlignedFree(void *ptr) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  free(ptr);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  _aligned_free(ptr);
+#endif
+}
+
+bool SystemInfo::IsProcessAlive(int pid) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return kill(pid, 0) != -1 || errno != ESRCH;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                         static_cast<DWORD>(pid));
+  if (h == NULL) return false;
+  CloseHandle(h);
+  return true;
+#endif
+}
+
+std::string SystemInfo::GetModuleDirectory() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  Dl_info dl_info;
+  void *addr = reinterpret_cast<void *>(&SystemInfo::GetModuleDirectory);
+  if (dladdr(addr, &dl_info) == 0) return "";
+  char resolved[PATH_MAX];
+  if (realpath(dl_info.dli_fname, resolved) == nullptr) return "";
+  std::string resolved_str(resolved);
+  auto pos = resolved_str.rfind('/');
+  return (pos != std::string::npos) ? resolved_str.substr(0, pos) : std::string();
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  HMODULE hModule = nullptr;
+  if (!GetModuleHandleExA(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCSTR>(&SystemInfo::GetModuleDirectory),
+          &hModule)) {
+    return "";
+  }
+  char path[MAX_PATH];
+  if (GetModuleFileNameA(hModule, path, MAX_PATH) == 0) return "";
+  std::string path_str(path);
+  auto pos2 = path_str.rfind('\\');
+  if (pos2 == std::string::npos) pos2 = path_str.rfind('/');
+  return (pos2 != std::string::npos) ? path_str.substr(0, pos2) : std::string();
+#endif
+}
+
+uint64_t SystemInfo::ThreadCpuTimeNs() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  struct timespec ts;
+#ifdef CLOCK_THREAD_CPUTIME_ID
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+           static_cast<uint64_t>(ts.tv_nsec);
+  }
+#endif
+  return 0;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  FILETIME create_t, exit_t, kernel_t, user_t;
+  if (!::GetThreadTimes(::GetCurrentThread(), &create_t, &exit_t, &kernel_t,
+                         &user_t)) {
+    return 0;
+  }
+  auto to_u64 = [](FILETIME f) {
+    ULARGE_INTEGER u;
+    u.LowPart = f.dwLowDateTime;
+    u.HighPart = f.dwHighDateTime;
+    return u.QuadPart;  // 100-ns intervals
+  };
+  return (to_u64(kernel_t) + to_u64(user_t)) * 100ull;
+#endif
+}
+
+std::string SystemInfo::GetMathLibraryName() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+#if __APPLE__
+  // macOS ships the math functions in libSystem; /usr/lib/libm.dylib is the
+  // dlopen-able entry (resolved via the dyld shared cache) and exports the
+  // standard symbols (sin/cos/...). "libm.so.6" does not exist on macOS, so
+  // SharedLibrary(GetMathLibraryName()).GetSymbol("sin") returned null there.
+  return "libm.dylib";
+#else
+  return "libm.so.6";
+#endif
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return "ucrtbase.dll";
+#endif
+}
+
+void SystemInfo::TerminateProcessNow(int exit_code) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  // No-op on POSIX: callers fall through and main() returns normally,
+  // so static destructors, atexit handlers, leak sanitizers, and coverage
+  // instrumentation all run as they should.
+  (void)exit_code;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // TerminateProcess skips DLL detach notifications and the entire
+  // destructor chain, which is exactly what we need to dodge libzmq's
+  // signaler abort during shutdown on Windows.
+  ::TerminateProcess(::GetCurrentProcess(), static_cast<UINT>(exit_code));
+  // Fallback in case TerminateProcess somehow returns (it shouldn't).
+  ::_exit(exit_code);
+#endif
+}
+
+SpawnedProcess SystemInfo::SpawnProcess(const std::string &exe,
+                                        const std::vector<std::string> &args,
+                                        const std::string &log_path,
+                                        bool detached) {
+  SpawnedProcess proc;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  // Redirect stdout(1) to the log file, then dup stderr(2) onto it.
+  posix_spawn_file_actions_addopen(&actions, 1, log_path.c_str(),
+                                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  posix_spawn_file_actions_adddup2(&actions, 1, 2);
+  posix_spawnattr_t attr;
+  posix_spawnattr_t *attrp = nullptr;
+#ifdef POSIX_SPAWN_SETSID
+  if (detached) {
+    // New session => no controlling terminal, mirroring Windows DETACHED_PROCESS.
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    attrp = &attr;
+  }
+#else
+  (void)detached;
+#endif
+  std::vector<char *> argv;
+  argv.push_back(const_cast<char *>(exe.c_str()));
+  for (const auto &a : args) argv.push_back(const_cast<char *>(a.c_str()));
+  argv.push_back(nullptr);
+  pid_t pid = -1;
+  int rc =
+      posix_spawn(&pid, exe.c_str(), &actions, attrp, argv.data(), environ);
+  posix_spawn_file_actions_destroy(&actions);
+  if (attrp != nullptr) posix_spawnattr_destroy(attrp);
+  if (rc == 0) {
+    proc.pid = static_cast<int>(pid);
+    proc.valid = true;
+  }
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  std::string cmd = "\"" + exe + "\"";
+  for (const auto &a : args) cmd += " " + a;
+  STARTUPINFOA si;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  SECURITY_ATTRIBUTES sa;
+  sa.nLength = sizeof(sa);
+  sa.lpSecurityDescriptor = nullptr;
+  sa.bInheritHandle = TRUE;
+  HANDLE hlog = CreateFileA(log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (hlog != INVALID_HANDLE_VALUE) {
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    si.hStdOutput = hlog;
+    si.hStdError = hlog;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  }
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof(pi));
+  std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+  mutable_cmd.push_back('\0');
+  // #721: DETACHED_PROCESS gives the child no console; CREATE_NEW_PROCESS_GROUP
+  // detaches it from the parent's Ctrl-C group. This is the flag combination
+  // under which libzmq's ROUTER failed WSAStartup and went silently dead.
+  DWORD flags = detached ? (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) : 0;
+  BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE,
+                           flags, nullptr, nullptr, &si, &pi);
+  if (hlog != INVALID_HANDLE_VALUE) CloseHandle(hlog);
+  if (ok) {
+    proc.pid = static_cast<int>(pi.dwProcessId);
+    proc.win_process = reinterpret_cast<uint64_t>(pi.hProcess);
+    proc.win_thread = reinterpret_cast<uint64_t>(pi.hThread);
+    proc.valid = true;
+  }
+#endif
+  return proc;
+}
+
+bool SystemInfo::IsChildRunning(const SpawnedProcess &proc) {
+  if (!proc.valid) return false;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  if (proc.pid <= 0) return false;
+  int status;
+  // 0 => still running; >0 => exited (and now reaped); -1 => already reaped.
+  return waitpid(proc.pid, &status, WNOHANG) == 0;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  HANDLE h = reinterpret_cast<HANDLE>(proc.win_process);
+  if (h == NULL) return false;
+  DWORD code = 0;
+  if (!GetExitCodeProcess(h, &code)) return false;
+  return code == STILL_ACTIVE;
+#endif
+}
+
+void SystemInfo::TerminateChild(SpawnedProcess &proc, int grace_ms) {
+  if (!proc.valid) return;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  if (proc.pid > 0) {
+    int status;
+    // If a prior IsChildRunning() already reaped it (or it exits right now),
+    // don't send a signal to a possibly-recycled pid.
+    pid_t r = waitpid(proc.pid, &status, WNOHANG);
+    if (r == 0) {  // still running: graceful SIGTERM, then SIGKILL
+      kill(proc.pid, SIGTERM);
+      bool reaped = false;
+      for (int i = 0; i < grace_ms / 100; ++i) {
+        if (waitpid(proc.pid, &status, WNOHANG) != 0) { reaped = true; break; }
+        struct timespec ts = {0, 100 * 1000 * 1000};  // 100 ms
+        nanosleep(&ts, nullptr);
+      }
+      if (!reaped) {
+        kill(proc.pid, SIGKILL);
+        waitpid(proc.pid, &status, 0);
+      }
+    }
+  }
+  proc.pid = -1;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  HANDLE hp = reinterpret_cast<HANDLE>(proc.win_process);
+  HANDLE ht = reinterpret_cast<HANDLE>(proc.win_thread);
+  if (hp != NULL) {
+    ::TerminateProcess(hp, 0);
+    WaitForSingleObject(hp, static_cast<DWORD>(grace_ms));
+    CloseHandle(hp);
+  }
+  if (ht != NULL) CloseHandle(ht);
+  proc.win_process = 0;
+  proc.win_thread = 0;
+#endif
+  proc.valid = false;
+}
+
+bool SystemInfo::WaitForChild(SpawnedProcess &proc, int timeout_ms,
+                              int *exit_code) {
+  if (!proc.valid) return false;
+  bool exited = false;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  int status = 0;
+  pid_t r = 0;
+  for (int waited = 0; proc.pid > 0; waited += 10) {
+    r = waitpid(proc.pid, &status, WNOHANG);
+    if (r != 0 || waited >= timeout_ms) break;
+    struct timespec ts = {0, 10 * 1000 * 1000};  // 10 ms
+    nanosleep(&ts, nullptr);
+  }
+  if (r == proc.pid) {
+    exited = WIFEXITED(status);
+    if (exited && exit_code != nullptr) *exit_code = WEXITSTATUS(status);
+    proc.pid = -1;
+  }
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  HANDLE hp = reinterpret_cast<HANDLE>(proc.win_process);
+  if (hp != NULL &&
+      WaitForSingleObject(hp, static_cast<DWORD>(timeout_ms)) ==
+          WAIT_OBJECT_0) {
+    DWORD code = 0;
+    exited = GetExitCodeProcess(hp, &code) != 0;
+    if (exited && exit_code != nullptr) *exit_code = static_cast<int>(code);
+  }
+#endif
+  TerminateChild(proc, 0);  // kills a timed-out child; releases handles
+  return exited;
+}
+
+void SystemInfo::IgnoreFileSizeSignal() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  signal(SIGXFSZ, SIG_IGN);
+#endif
+}
+
+bool SystemInfo::SetProcessFileSizeLimit(int pid, uint64_t soft_bytes,
+                                         uint64_t *prev_soft) {
+#if CTP_ENABLE_PROCFS_SYSINFO && defined(__linux__)
+  struct rlimit cur;
+  if (prlimit(static_cast<pid_t>(pid), RLIMIT_FSIZE, nullptr, &cur) != 0) {
+    return false;
+  }
+  if (prev_soft != nullptr) *prev_soft = static_cast<uint64_t>(cur.rlim_cur);
+  struct rlimit lim = {static_cast<rlim_t>(soft_bytes), cur.rlim_max};
+  return prlimit(static_cast<pid_t>(pid), RLIMIT_FSIZE, &lim, nullptr) == 0;
+#else
+  (void)pid;
+  (void)soft_bytes;
+  (void)prev_soft;
+  return false;
+#endif
+}
+
+bool SystemInfo::GetFileIdentity(const std::string &path, FileIdentity *id) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) return false;
+  id->device = static_cast<uint64_t>(st.st_dev);
+  id->file = static_cast<uint64_t>(st.st_ino);
+  return true;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // Open for attributes only, sharing everything, so the check never
+  // conflicts with the handles the caller holds on the same file.
+  HANDLE h = CreateFileA(path.c_str(), FILE_READ_ATTRIBUTES,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                         nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  BY_HANDLE_FILE_INFORMATION info;
+  const BOOL ok = GetFileInformationByHandle(h, &info);
+  CloseHandle(h);
+  if (!ok) return false;
+  id->device = static_cast<uint64_t>(info.dwVolumeSerialNumber);
+  id->file = (static_cast<uint64_t>(info.nFileIndexHigh) << 32) |
+             static_cast<uint64_t>(info.nFileIndexLow);
+  return true;
+#else
+  (void)path;
+  (void)id;
+  return false;
+#endif
+}
+
+std::string SystemInfo::GetExecutablePath() {
+#if CTP_ENABLE_PROCFS_SYSINFO && defined(__APPLE__)
+  uint32_t size = PATH_MAX;
+  std::string buf(size, '\0');
+  if (_NSGetExecutablePath(buf.data(), &size) != 0) return "";
+  char resolved[PATH_MAX];
+  if (realpath(buf.c_str(), resolved) == nullptr) return "";
+  return resolved;
+#elif CTP_ENABLE_PROCFS_SYSINFO
+  char path[PATH_MAX];
+  ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+  if (n <= 0) return "";
+  return std::string(path, static_cast<size_t>(n));
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  char path[MAX_PATH];
+  DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return "";
+  return std::string(path, n);
+#else
+  return "";
+#endif
+}
+
+#if CTP_ENABLE_WINDOWS_SYSINFO
+// Defined in winnt.h for SDK 10.0.17134 (Windows 10 1803) and later; define
+// defensively so an older SDK still compiles (the flag is simply ignored, and
+// the null-handle fallback below downgrades to a standard-resolution timer).
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#endif
+
+void SystemInfo::RequestTimerResolutionFromEnv() {
+#if CTP_ENABLE_WINDOWS_SYSINFO
+  // Diagnostic / workaround knob for the tick-quantized waits behind the
+  // Windows TCP latency (issue #768). WaitForMultipleObjectsEx and ::Sleep
+  // expire their timeouts only at timer interrupts (~15.6ms default), so a
+  // Wait(100us) that nothing signals wakes up to 15.6ms late. Setting
+  // CLIO_WIN_TIMER_MS=1 raises this process's timer resolution to 1ms
+  // (timeBeginPeriod is per-process since Windows 10 2004, so BOTH the
+  // daemon and the client must set it). Never released deliberately: the
+  // request must live as long as the process serves traffic.
+  static bool requested = false;
+  if (requested) return;
+  const char *env = std::getenv("CLIO_WIN_TIMER_MS");
+  if (env == nullptr || *env == '\0') return;
+  UINT ms = static_cast<UINT>(std::atoi(env));
+  if (ms == 0) return;
+  MMRESULT rc = ::timeBeginPeriod(ms);
+  requested = true;
+  // This file sits below the logging layer; a diagnostic knob still deserves
+  // one line of confirmation.
+  std::fprintf(stderr, "SystemInfo: timeBeginPeriod(%u) -> %s\n", ms,
+               rc == TIMERR_NOERROR ? "ok" : "FAILED");
+#endif
+}
+
+void SystemInfo::SleepForUs(size_t us) {
+  if (us == 0) return;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  // POSIX: nanosleep already honors sub-microsecond requests (subject to the
+  // hrtimer slack, ~50us by default), so no special handling is needed.
+  struct timespec ts;
+  ts.tv_sec = static_cast<time_t>(us / 1000000);
+  ts.tv_nsec = static_cast<long>((us % 1000000) * 1000);
+  nanosleep(&ts, nullptr);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // One-shot high-resolution waitable timer. Unlike std::this_thread::sleep_for
+  // (which rounds up to the ~1-15.6ms global timer tick), this gives
+  // sub-millisecond accuracy without calling timeBeginPeriod (no global timer
+  // rate change). The timer is created/closed per call rather than cached in a
+  // thread_local (a project rule + per-DLL duplication hazard on Windows); the
+  // CreateWaitableTimer cost is a few microseconds, dwarfed by any sleep long
+  // enough to be worth issuing.
+  HANDLE timer = ::CreateWaitableTimerExW(
+      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  if (timer == nullptr) {
+    // Pre-1803: high-resolution flag unsupported. Standard-resolution timer.
+    timer = ::CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+  }
+  if (timer != nullptr) {
+    LARGE_INTEGER due;
+    // Negative => relative due time, expressed in 100ns units.
+    due.QuadPart = -static_cast<LONGLONG>(us) * 10;
+    if (::SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+      ::WaitForSingleObject(timer, INFINITE);
+    }
+    ::CloseHandle(timer);
+    return;
+  }
+  // Last resort: coarse Sleep, rounded up to >= 1ms.
+  ::Sleep(static_cast<DWORD>((us + 999) / 1000));
+#endif
+}
+
+void SystemInfo::SetCurrentThreadName(const std::string &name) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+#ifdef __linux__
+  // pthread_setname_np truncates names longer than 15 chars (+ NUL).
+  pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
+#endif
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // SetThreadDescription needs wide chars.
+  std::wstring wname(name.begin(), name.end());
+  SetThreadDescription(GetCurrentThread(), wname.c_str());
+#endif
+}
+
+std::string SystemInfo::GetHomeDir() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  const char *home = std::getenv("HOME");
+  return home ? std::string(home) : std::string();
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // USERPROFILE is the canonical home on Windows (C:\Users\<name>).
+  // Fall back to HOMEDRIVE+HOMEPATH or HOME if a user explicitly set them.
+  char buf[MAX_PATH];
+  DWORD len = ::GetEnvironmentVariableA("USERPROFILE", buf, sizeof(buf));
+  if (len > 0 && len < sizeof(buf)) return std::string(buf, len);
+  len = ::GetEnvironmentVariableA("HOME", buf, sizeof(buf));
+  if (len > 0 && len < sizeof(buf)) return std::string(buf, len);
+  return std::string();
+#endif
+}
+
+std::string SystemInfo::GetHostname() {
+  char buf[256] = {0};
+#if CTP_ENABLE_PROCFS_SYSINFO
+  if (gethostname(buf, sizeof(buf) - 1) != 0) return "";
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  DWORD len = sizeof(buf);
+  if (!GetComputerNameExA(ComputerNameDnsHostname, buf, &len)) return "";
+#endif
+  return std::string(buf);
+}
+
+std::string SystemInfo::GetModuleDirectoryFor(void *symbol) {
+  if (!symbol) return "";
+#if CTP_ENABLE_PROCFS_SYSINFO
+  Dl_info dl_info;
+  if (dladdr(symbol, &dl_info) == 0) return "";
+  char resolved[PATH_MAX];
+  if (realpath(dl_info.dli_fname, resolved) == nullptr) return "";
+  std::string resolved_str(resolved);
+  auto pos = resolved_str.rfind('/');
+  return (pos != std::string::npos) ? resolved_str.substr(0, pos)
+                                    : std::string();
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  HMODULE hModule = nullptr;
+  if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCSTR>(symbol), &hModule)) {
+    return "";
+  }
+  char path[MAX_PATH];
+  if (GetModuleFileNameA(hModule, path, MAX_PATH) == 0) return "";
+  std::string path_str(path);
+  auto pos2 = path_str.rfind('\\');
+  if (pos2 == std::string::npos) pos2 = path_str.rfind('/');
+  return (pos2 != std::string::npos) ? path_str.substr(0, pos2) : std::string();
+#endif
+}
+
+std::vector<std::string> SystemInfo::GetLocalInterfaceIps() {
+  std::vector<std::string> ips;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  struct ifaddrs *ifaddr = nullptr;
+  if (getifaddrs(&ifaddr) != 0 || ifaddr == nullptr) return ips;
+  for (struct ifaddrs *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == nullptr) continue;
+    char buf[INET6_ADDRSTRLEN] = {0};
+    const int fam = ifa->ifa_addr->sa_family;
+    if (fam == AF_INET) {
+      auto *sa = reinterpret_cast<struct sockaddr_in *>(ifa->ifa_addr);
+      if (inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf))) {
+        ips.emplace_back(buf);
+      }
+    } else if (fam == AF_INET6) {
+      auto *sa = reinterpret_cast<struct sockaddr_in6 *>(ifa->ifa_addr);
+      if (inet_ntop(AF_INET6, &sa->sin6_addr, buf, sizeof(buf))) {
+        std::string s(buf);
+        auto pct = s.find('%');
+        ips.push_back(pct == std::string::npos ? s : s.substr(0, pct));
+      }
+    }
+  }
+  freeifaddrs(ifaddr);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  ULONG buf_len = 16 * 1024;
+  std::vector<char> buf(buf_len);
+  auto *addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(buf.data());
+  const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                      GAA_FLAG_SKIP_DNS_SERVER;
+  ULONG rc = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, addrs, &buf_len);
+  if (rc == ERROR_BUFFER_OVERFLOW) {
+    buf.resize(buf_len);
+    addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES *>(buf.data());
+    rc = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, addrs, &buf_len);
+  }
+  if (rc != NO_ERROR) return ips;
+  for (auto *a = addrs; a != nullptr; a = a->Next) {
+    for (auto *u = a->FirstUnicastAddress; u != nullptr; u = u->Next) {
+      char text[INET6_ADDRSTRLEN] = {0};
+      auto *sa = u->Address.lpSockaddr;
+      if (sa->sa_family == AF_INET) {
+        auto *in4 = reinterpret_cast<sockaddr_in *>(sa);
+        if (inet_ntop(AF_INET, &in4->sin_addr, text, sizeof(text))) {
+          ips.emplace_back(text);
+        }
+      } else if (sa->sa_family == AF_INET6) {
+        auto *in6 = reinterpret_cast<sockaddr_in6 *>(sa);
+        if (inet_ntop(AF_INET6, &in6->sin6_addr, text, sizeof(text))) {
+          std::string s(text);
+          auto pct = s.find('%');
+          ips.push_back(pct == std::string::npos ? s : s.substr(0, pct));
+        }
+      }
+    }
+  }
+#endif
+  return ips;
+}
+
+std::vector<std::string> SystemInfo::ResolveHostname(const std::string &host) {
+  std::vector<std::string> ips;
+  struct addrinfo hints {};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo *res = nullptr;
+  if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) {
+    return ips;
+  }
+  for (struct addrinfo *p = res; p != nullptr; p = p->ai_next) {
+    char buf[INET6_ADDRSTRLEN] = {0};
+    if (p->ai_family == AF_INET) {
+      auto *sa = reinterpret_cast<struct sockaddr_in *>(p->ai_addr);
+      if (inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf))) {
+        ips.emplace_back(buf);
+      }
+    } else if (p->ai_family == AF_INET6) {
+      auto *sa = reinterpret_cast<struct sockaddr_in6 *>(p->ai_addr);
+      if (inet_ntop(AF_INET6, &sa->sin6_addr, buf, sizeof(buf))) {
+        std::string s(buf);
+        auto pct = s.find('%');
+        ips.push_back(pct == std::string::npos ? s : s.substr(0, pct));
+      }
+    }
+  }
+  freeaddrinfo(res);
+  return ips;
+}
+
+std::vector<std::string> SystemInfo::ListDirectory(const std::string &path) {
+  std::vector<std::string> entries;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  DIR *dir = opendir(path.c_str());
+  if (dir == nullptr) return entries;
+  while (struct dirent *entry = readdir(dir)) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+      continue;
+    }
+    entries.emplace_back(entry->d_name);
+  }
+  closedir(dir);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  std::error_code ec;
+  if (!std::filesystem::is_directory(path, ec)) return entries;
+  for (auto &p : std::filesystem::directory_iterator(path, ec)) {
+    if (ec) break;
+    entries.push_back(p.path().filename().string());
+  }
+#endif
+  return entries;
+}
+
+bool SystemInfo::RemoveFile(const std::string &path) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return ::unlink(path.c_str()) == 0;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  std::error_code ec;
+  return std::filesystem::remove(path, ec);
+#endif
+}
+
+std::string SystemInfo::GetLibrarySearchPathVar() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return "LD_LIBRARY_PATH";
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return "PATH";
+#endif
+}
+
+char SystemInfo::GetPathListSeparator() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return ':';
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return ';';
+#endif
+}
+
+std::string SystemInfo::GetSharedLibExtension() {
+#if CTP_ENABLE_WINDOWS_SYSINFO
+  return ".dll";
+#elif __APPLE__
+  return ".dylib";
+#else
+  return ".so";
+#endif
+}
+
+std::string SystemInfo::Getenv(const char *name, size_t max_size) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  char *var = getenv(name);
+  if (var == nullptr) {
+    return "";
+  }
+  return std::string(var);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  std::string var;
+  var.resize(max_size);
+  DWORD len = GetEnvironmentVariableA(name, var.data(),
+                                      static_cast<DWORD>(var.size()));
+  if (len == 0) {
+    return "";
+  }
+  var.resize(len);
+  return var;
+#endif
+  std::cout << "undefined" << std::endl;
+  return "";
+}
+
+void SystemInfo::Setenv(const char *name, const std::string &value,
+                        int overwrite) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  setenv(name, value.c_str(), overwrite);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // _putenv_s updates BOTH the CRT environment block (which std::getenv
+  // reads) and the Win32 process environment block (which
+  // GetEnvironmentVariable reads). SetEnvironmentVariable only touches
+  // the Win32 block, which would leave std::getenv blind to the new
+  // value — and clio::run::env::GetCompat goes through std::getenv. Honor the
+  // overwrite flag manually since _putenv_s always overwrites.
+  if (!overwrite) {
+    char probe[2];
+    if (::GetEnvironmentVariableA(name, probe, sizeof(probe)) != 0) {
+      return;  // already set, caller asked us not to overwrite
+    }
+  }
+  (void)_putenv_s(name, value.c_str());
+#endif
+}
+
+void SystemInfo::Unsetenv(const char *name) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  unsetenv(name);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // Setting an env var to an empty string via _putenv_s removes it from
+  // both the CRT and Win32 environment blocks.
+  (void)_putenv_s(name, "");
+#endif
+}
+
+SharedLibrary::SharedLibrary(const std::string &name) : handle_(nullptr) {
+  Load(name);
+}
+
+SharedLibrary::~SharedLibrary() {
+  if (handle_) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+    dlclose(handle_);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+    ::FreeLibrary((HMODULE)handle_);
+#endif
+    handle_ = nullptr;
+  }
+}
+
+void SharedLibrary::Load(const std::string &name) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  handle_ = dlopen(name.c_str(), RTLD_GLOBAL | RTLD_NOW);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  handle_ = LoadLibraryA(name.c_str());
+  if (!handle_) {
+    DWORD err = ::GetLastError();
+    char *buf = nullptr;
+    DWORD len = ::FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+            FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        reinterpret_cast<LPSTR>(&buf), 0, nullptr);
+    if (buf) {
+      error_string_.assign(buf, len);
+      ::LocalFree(buf);
+    } else {
+      error_string_ = "LoadLibraryA failed: " + std::to_string(err);
+    }
+  } else {
+    error_string_.clear();
+  }
+#endif
+}
+
+std::string SharedLibrary::GetError() const {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  const char *err = dlerror();
+  return err ? std::string(err) : std::string();
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return error_string_;
+#endif
+}
+
+void *SharedLibrary::GetSymbol(const std::string &name) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  return dlsym(handle_, name.c_str());
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  return (void *)::GetProcAddress((HMODULE)handle_, name.c_str());
+#endif
+}
+
+SharedLibrary::SharedLibrary(SharedLibrary &&other) noexcept
+    : handle_(other.handle_) {
+  other.handle_ = nullptr;
+}
+
+SharedLibrary &SharedLibrary::operator=(SharedLibrary &&other) noexcept {
+  if (this != &other) {
+    handle_ = other.handle_;
+    other.handle_ = nullptr;
+  }
+  return *this;
+}
+
+#if CTP_ENABLE_PROCFS_SYSINFO
+/**
+ * Name the block device backing a path, without running a subprocess
+ * (issue #809). This used to popen("df -P <path> | tail | awk"): every call
+ * forked a shell that inherited every descriptor the process had open without
+ * close-on-exec, including the flock()ed descriptor of an HDF5 file -- whose
+ * lock then outlived H5Fclose() until the shell exited, so an immediate reopen
+ * failed with EAGAIN. The bdev health poll calls this repeatedly.
+ * @param path a file or directory
+ * @return the backing device's name (e.g. "nvme0n1p1", "disk1s1"), or "" if
+ *         it is not a real block device (overlay, tmpfs, ...)
+ */
+static std::string BackingDeviceName(const std::string &path) {
+#if defined(__linux__)
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) return "";
+  // /sys/dev/block/MAJ:MIN links to the device's sysfs node, whose last
+  // component is the device name df reports under /dev.
+  const std::string link = "/sys/dev/block/" +
+                           std::to_string(major(st.st_dev)) + ":" +
+                           std::to_string(minor(st.st_dev));
+  char target[PATH_MAX];
+  ssize_t n = readlink(link.c_str(), target, sizeof(target) - 1);
+  if (n <= 0) return "";
+  std::string t(target, static_cast<size_t>(n));
+  size_t slash = t.find_last_of('/');
+  return slash == std::string::npos ? t : t.substr(slash + 1);
+#elif defined(__APPLE__)
+  // statfs reports the mount's source, which is what df prints.
+  struct statfs sfs;
+  if (statfs(path.c_str(), &sfs) != 0) return "";
+  std::string from = sfs.f_mntfromname;
+  if (from.rfind("/dev/", 0) != 0) return "";
+  return from.substr(5);
+#else
+  (void)path;
+  return "";
+#endif
+}
+#endif
+
+/// @brief Retrieves storage device hardware health statistics.
+///
+/// Reads a JSON file left by an external admin service
+/// (e.g. a smartmontools/smartd cron job writing
+/// /tmp/iowarp_hw_health_<device>.json).  iowarp itself never needs
+/// elevated privileges; this function is purely a non-root consumer.
+///
+/// @param path  Path to the file or block device whose health to query.
+///              If not already a /dev/ node, the backing device is looked up
+///              so the correct per-device JSON file is located.
+/// @return      JSON string with health stats, or "{}" if unavailable.
+std::string SystemInfo::GetDeviceHealthStats(const std::string &path) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  std::string device = path;
+
+  // If the path is not a raw block device, find the mount's backing device
+  // (left as the path itself when it has none, e.g. overlay in containers).
+  if (path.find("/dev/") != 0) {
+    const std::string backing = BackingDeviceName(path);
+    if (!backing.empty()) {
+      device = "/dev/" + backing;
+    }
+  }
+
+  // Extract the basename of the device (e.g. /dev/nvme0n1 -> nvme0n1).
+  std::string dev_basename = device;
+  size_t slash_pos = dev_basename.find_last_of('/');
+  if (slash_pos != std::string::npos) {
+    dev_basename = dev_basename.substr(slash_pos + 1);
+  }
+
+  // Read health stats written by the external admin service.
+  // e.g. /tmp/iowarp_hw_health_nvme0n1.json
+  std::string stats_path =
+      "/tmp/iowarp_hw_health_" + dev_basename + ".json";
+  std::ifstream stats_file(stats_path);
+  if (!stats_file.is_open()) {
+    return "{}";
+  }
+
+  std::string result((std::istreambuf_iterator<char>(stats_file)),
+                     std::istreambuf_iterator<char>());
+  return result.empty() ? "{}" : result;
+#else
+  (void)path;
+  return "{}";
+#endif
+}
+
+/// @brief Derive the drive type ("hdd" or "ssd") from a pool/drive name.
+std::string SystemInfo::DeriveDriveType(const std::string &pool_name) {
+  // Case-insensitive substring match on "hdd"; default to "ssd" otherwise so
+  // an unlabelled pool routes to the flash model rather than failing.
+  std::string lower = pool_name;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return lower.find("hdd") != std::string::npos ? "hdd" : "ssd";
+}
+
+#if CTP_HAS_POCO
+namespace {
+// Minimal JSON string escaping so an error message embedded in the fallback
+// payload can never produce invalid JSON (quotes/backslashes/control chars).
+std::string JsonEscape(const std::string &s) {
+  // The only caller escapes a Poco exception's displayText(). Poco is not
+  // MSan-instrumented, so the message characters it composed carry no shadow
+  // and every byte examined below would be reported.
+  CTP_MSAN_UNPOISON_STRING(s);
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n':
+      case '\r':
+      case '\t': out += ' '; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          out += ' ';
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+}  // namespace
+#endif
+
+/// @brief Predicts drive failure by POSTing health metrics to a local
+/// prediction server. See the header for the graceful-degradation contract.
+std::string SystemInfo::PredictDriveFailure(const std::string &drive_type,
+                                            const std::string &health_json,
+                                            const std::string &drive_id) {
+  // The request body is identical regardless of transport availability so the
+  // payload contract is stable; only the actual send is Poco-gated.
+  const std::string metrics =
+      (health_json.empty() || health_json == "{}") ? "{}" : health_json;
+  const std::string payload = "{\"drive_type\": \"" + drive_type + "\", " +
+                              "\"drive_id\": \"" + drive_id + "\", " +
+                              "\"metrics\": " + metrics + "}";
+
+#if CTP_HAS_POCO
+  // Endpoint is overridable via CLIO_PREDICT_URL so tests and non-Docker
+  // deployments can target a reachable server. The default host.docker.internal
+  // only resolves under Docker Desktop; on any other host the connect fails
+  // fast and we return an {"error": ...} JSON object rather than throwing.
+  const char *env_url = std::getenv("CLIO_PREDICT_URL");
+  const std::string url =
+      (env_url && *env_url) ? env_url
+                            : "http://host.docker.internal:8000/predict/auto";
+  // Everything below is uninstrumented Poco doing its own address parsing and
+  // socket work through libc on stack MSan considers poisoned; only the
+  // interceptor checks reach it. The response body is unpoisoned explicitly.
+  ctp::MsanInterceptorCheckGuard msan_guard;
+  try {
+    Poco::URI uri(url);
+    CTP_MSAN_UNPOISON_OBJ(uri);
+    std::string path = uri.getPathAndQuery();
+    CTP_MSAN_UNPOISON_STRING(path);
+    if (path.empty()) {
+      path = "/";
+    }
+
+    Poco::Net::HTTPClientSession session(uri.getHost(), uri.getPort());
+    session.setTimeout(Poco::Timespan(5, 0));  // 5s for connect/send/receive
+
+    Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_POST, path,
+                               Poco::Net::HTTPMessage::HTTP_1_1);
+    req.setContentType("application/json");
+    req.setContentLength(static_cast<std::streamsize>(payload.size()));
+    session.sendRequest(req) << payload;
+
+    Poco::Net::HTTPResponse res;
+    std::istream &rs = session.receiveResponse(res);
+    std::string body;
+    Poco::StreamCopier::copyToString(rs, body);
+    // Response bytes came off the wire through uninstrumented Poco.
+    CTP_MSAN_UNPOISON_STRING(body);
+    return body.empty() ? "{}" : body;
+  } catch (const Poco::Exception &e) {
+    std::string msg = e.displayText();
+    CTP_MSAN_UNPOISON_STRING(msg);  // built by uninstrumented Poco
+    return std::string("{\"error\": \"Prediction server unreachable: ") +
+           JsonEscape(msg) + "\"}";
+  }
+#else
+  (void)payload;
+  return "{}";
+#endif
+}
+
+}  // namespace ctp

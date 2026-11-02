@@ -466,8 +466,36 @@ inline int run_all_tests(const std::string& filter = "") {
 #define SIMPLE_TEST_SETENV(k, v) setenv((k), (v), 1)
 #endif
 
+#ifdef _WIN32
+#include <crtdbg.h>
+#include <cstdlib>
+namespace SimpleTest {
+/**
+ * Route Debug-CRT assertion and error reports to stderr and make abort()
+ * silent. A Debug build reports a failed CRT or checked-STL assertion through
+ * a MODAL dialog; in an unattended ctest run nobody can dismiss it, so the
+ * test hangs until its timeout with no message instead of failing with the
+ * assertion text (cte_reorganize_all on the win-10 CDash runner). The
+ * _CrtSetReport* calls compile to no-ops in a release CRT.
+ */
+inline void DisableCrtDialogs() {
+  _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+  _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+  _set_error_mode(_OUT_TO_STDERR);
+  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+}
+}  // namespace SimpleTest
+#define SIMPLE_TEST_DISABLE_CRT_DIALOGS() SimpleTest::DisableCrtDialogs()
+#else
+#define SIMPLE_TEST_DISABLE_CRT_DIALOGS() ((void)0)
+#endif
+
 #define SIMPLE_TEST_MAIN() \
 int main(int argc, char* argv[]) { \
+    /* Never block an unattended run on a Debug-CRT dialog. */ \
+    SIMPLE_TEST_DISABLE_CRT_DIALOGS(); \
     /* Unit tests assert queue/scheduling semantics; mark the process so \
        CLIO_RUN_INLINE (run_inline.h) keeps the normal task path. */ \
     SIMPLE_TEST_SETENV("CLIO_UNIT_TEST", "1"); \

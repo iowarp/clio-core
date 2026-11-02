@@ -48,6 +48,7 @@
 #include <clio_ctp/util/msan.h>
 
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 
@@ -284,10 +285,18 @@ size_t Container::ImportModel(const TaskStatModelSnapshot &snapshot) {
       continue;  // new method, or one this container never exercised: keep seed
     }
     const MethodStatWeights &w = it->second;
-    if (i < method_model_.size()) method_model_[i] = w.cpu_coef_;
-    if (i < method_mape_.size()) method_mape_[i] = w.cpu_mape_;
-    if (i < method_model_wall_.size()) method_model_wall_[i] = w.wall_coef_;
-    if (i < method_mape_wall_.size()) method_mape_wall_[i] = w.wall_mape_;
+    // A saved model can hold a NaN or negative coefficient learned before
+    // samples were checked; restore those as the seed, not as poison.
+    if (i < method_model_.size()) method_model_[i] = SaneCoef(w.cpu_coef_);
+    if (i < method_mape_.size()) {
+      method_mape_[i] = std::isfinite(w.cpu_mape_) ? w.cpu_mape_ : 0.0f;
+    }
+    if (i < method_model_wall_.size()) {
+      method_model_wall_[i] = SaneCoef(w.wall_coef_);
+    }
+    if (i < method_mape_wall_.size()) {
+      method_mape_wall_[i] = std::isfinite(w.wall_mape_) ? w.wall_mape_ : 0.0f;
+    }
     ++restored;
   }
   // A restore is not new learning: leaving the flag clear keeps the periodic

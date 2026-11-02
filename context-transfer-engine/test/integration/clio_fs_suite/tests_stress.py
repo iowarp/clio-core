@@ -39,9 +39,51 @@ KIND = {ZERO: 'ZERO', CORRUPT: 'CORRUPT', FOREIGN: 'FOREIGN'}
 def _tier_mb(ctx):
   """RAM + fast tier per node (MB) under the tiered profile, else RAM."""
   cl = ctx.cl
-  if cl.profile in ('tiered', 'safe'):
+  if cl.profile in ('tiered', 'safe', 'ares_tiers'):
     return cl.ram_mb + cl.fast_mb
   return cl.ram_gb * 1024
+
+
+def _ram_tier_mb(cl):
+  """The RAM tier per node (MB): ram_mb on the MB-sized layouts, ram_gb on
+  the persistent ones."""
+  if cl.profile in ('tiered', 'safe', 'ares_tiers'):
+    return cl.ram_mb
+  return cl.ram_gb * 1024
+
+
+def _working_set_mb(ctx, factor):
+  """MB per node the overflow-style tests write: --working-set-mb when the
+  run sets it (the CI tier-mix legs size every tier as a fraction of it),
+  else `factor` x the RAM + fast tiers."""
+  ws = getattr(ctx.cl, 'working_set_mb', 0)
+  return ws if ws else int(_tier_mb(ctx) * factor)
+
+
+def _durable_cap_mb(ctx):
+  """MB per node a write may total and still fit, with ~30% headroom, once
+  every fsynced byte is stored as all its copies on the file tiers.
+
+  The copies of a byte: the primary flushed off RAM, the replication
+  chimod's local replica (num_replicas, 0 on 'safe'), and the remote copy
+  each node keeps for another (remote_copies 1, when there are 2+ nodes).
+  The persistent capacity is every file tier: NVMe (fast_mb on tiered
+  layouts), SSD (ares_tiers) and the disk tier or safe array (disk_gb).
+  Writing more than this ends in ENOSPC by design, which is not what the
+  overflow tests measure."""
+  cl = ctx.cl
+  n = len(ctx.hosts)
+  cap = cl.disk_gb * 1024
+  if cl.profile in ('tiered', 'ares_tiers'):
+    cap += cl.fast_mb
+  if cl.profile == 'ares_tiers':
+    cap += cl.ssd_mb
+  copies = 1
+  if cl.profile in ('persistent', 'tiered', 'ares_tiers'):
+    copies += 1  # local replica
+  if cl.profile != 'persistent_norepl' and cl.profile != 'ram' and n > 1:
+    copies += 1  # remote copy held for another node
+  return int(cap * 0.7 / copies)
 
 
 def _tier_usage(ctx):
@@ -50,8 +92,13 @@ def _tier_usage(ctx):
   lr = ctx.cl.local_root
   out = {}
   for i in range(len(ctx.hosts)):
+    extra = ''
+    if ctx.cl.profile == 'ares_tiers':
+      extra = (f' {ctx.cl.ssd_root}/data/cte_ssd_tier.dat*'
+               f' {ctx.cl.hdd_root}/data/cte_disk_tier.dat*')
     r = ctx.call(i, 'sh', cmd=f'du -m {lr}/data/cte_fast_tier.dat* '
-                              f'{lr}/data/cte_disk_tier.dat* 2>/dev/null')
+                              f'{lr}/data/cte_disk_tier.dat*{extra} '
+                              f'2>/dev/null')
     out[f'node{i}'] = ' '.join(
         f'{ln.split()[1].rsplit("/", 1)[-1]}={ln.split()[0]}M'
         for ln in (r.get('ret') or {}).get('out', '').splitlines()
@@ -134,12 +181,12 @@ def t_tier_overflow(ctx):
   with the old file's data, a migration that copied the wrong blob) or a
   block not holding its latest fsynced version fails the test."""
   n = len(ctx.hosts)
-  per_node_mb = int(_tier_mb(ctx) * 1.5)
-  if ctx.cl.profile == 'safe' and n > 1:
-    # Every fsynced byte is stored twice on the safe arrays there (the
-    # primary and the remote copy), so 1.5x RAM + fast would need ~94% of a
-    # disk_gb array: keep it to ~70%, which still overflows both upper tiers.
-    per_node_mb = min(per_node_mb, int(ctx.cl.disk_gb * 1024 * 0.7 / 2))
+  per_node_mb = min(_working_set_mb(ctx, 1.5), _durable_cap_mb(ctx))
+  ctx.metrics['per_node_mb'] = per_node_mb
+  if per_node_mb <= _tier_mb(ctx):
+    ctx.note(f'durable capacity caps the write at {per_node_mb} MB/node, '
+             f'under the {_tier_mb(ctx)} MB upper tiers: this layout '
+             f'cannot overflow them with every copy kept')
   nfiles = max(2, per_node_mb // 64)
   base = ctx.p('ovf')
   ctx.ok(0, 'mkdir', path=base)
@@ -281,6 +328,62 @@ def t_tier_overflow(ctx):
 # 2. Concurrent overwriters + readers on one shared file, every node
 # ---------------------------------------------------------------------------
 
+def _node_clock_offsets(ctx, rounds=5):
+  """Each node's wall-clock offset from the driver (s): remote time minus
+  the round trip's midpoint, from the shortest of `rounds` round trips."""
+  offs = []
+  for i in range(len(ctx.hosts)):
+    best = None
+    for _ in range(rounds):
+      t0 = time.time()
+      remote = ctx.ok(i, 'clock')
+      t1 = time.time()
+      if best is None or t1 - t0 < best[0]:
+        best = (t1 - t0, remote - (t0 + t1) / 2)
+    offs.append(best[1])
+  return offs
+
+
+def _deskew(ctx, results):
+  """Put every node's rec_shared_stress timestamps on the driver's clock.
+
+  The checks compare a write's times on one node with a read's on another;
+  Ares nodes have been ~28 s apart, which turned in-order reads into
+  'read a hole although a write was fsynced 16 s before the open' and
+  'read before it was written' (every shared-file test failed on the node
+  set with the skewed node, and passed on the others)."""
+  offs = _node_clock_offsets(ctx)
+  spread = max(offs) - min(offs)
+  ctx.metrics['clock_spread_s'] = round(spread, 3)
+  if spread > SKEW_S:
+    ctx.note(f'node clocks span {spread:.1f} s; timestamps corrected per '
+             f'node: ' + ', '.join(f'node{i} {o:+.2f}'
+                                   for i, o in enumerate(offs)))
+  for i, res in enumerate(results):
+    o = offs[i]
+    for log in (res.get('writes') or {}).values():
+      for rec in log:
+        rec[2] -= o
+        rec[3] -= o
+    for wid, rec in list((res.get('inflight') or {}).items()):
+      if rec:
+        rec[2] -= o
+    for ob in res.get('obs') or []:
+      ob[3] -= o
+      ob[4] -= o
+    for tr in res.get('truncs') or []:
+      tr[1] -= o
+      if tr[2] is not None:
+        tr[2] -= o
+    # rec_safe_save: [target, writer, gen, t_issue, t_renamed]; the final
+    # version is judged by which rename was last across nodes.
+    for sv in res.get('saves') or []:
+      sv[3] -= o
+      if sv[4] is not None:
+        sv[4] -= o
+  return results
+
+
 def _index_writes(results):
   """Merge all writers' logs: block -> [(writer, gen, t_issue, t_ack)],
   with in-flight writes (outcome unknown) at t_ack = None."""
@@ -362,7 +465,7 @@ def t_shared_concurrent(ctx):
     return ctx.ok(i, 'rec_shared_stress', timeout=secs + 600, path=p,
                   name=nm, nblocks=nb, writer_base=10 * i + 1,
                   writers=2, readers=2, secs=secs, seed=i)
-  results = ctx.each(run)
+  results = _deskew(ctx, ctx.each(run))
   by_block = _index_writes(results)
   nwrites = sum(len(v) for v in by_block.values())
   nobs = sum(len(r['obs']) for r in results)
@@ -483,7 +586,7 @@ def _shared_run(ctx, tag, secs, sync, truncater):
                   name=tag, nblocks=nb, writer_base=10 * i + 1, writers=2,
                   readers=2, secs=secs, seed=i, sync=sync,
                   truncater=truncater and i == 0)
-  results = ctx.each(run)
+  results = _deskew(ctx, ctx.each(run))
   time.sleep(2)
   scans = ctx.all_nodes('rec_scan', timeout=900, path=p, name=tag,
                         nblocks=nb)
@@ -669,6 +772,22 @@ def _reread_note(ctx, nmx, path, block, nodes):
   ctx.note(f'{nmx} block {block} re-read: {seen}')
 
 
+def _missing_note(ctx, nmx, path, gen):
+  """A durable file one node cannot see: is it gone everywhere (lost
+  namespace entry) or only from that node's view (stale negative entry)?
+  Notes every node's answer, and which nodes own its directory and inode."""
+  from tests_fault import fs_dir_owner
+  n = len(ctx.hosts)
+  seen = {}
+  for i in range(n):
+    r = ctx.a(i).call('exists', timeout=60, path=path)
+    seen[f'node{i}'] = r.get('ret') if r.get('ok') else r.get('err')
+  rel = path[len(ctx.cl.mnt):]
+  ctx.note(f'{nmx} (durable gen {gen}) missing; exists per node: {seen}; '
+           f'dir owner node{fs_dir_owner(rel.rsplit("/", 1)[0], n)}, '
+           f'inode home node{fs_dir_owner(rel, n)}')
+
+
 def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
                     skip_writer_of=None):
   """Verify FileSetWriter output after a fault.
@@ -705,6 +824,7 @@ def _check_filesets(ctx, base, n, nfiles, logs, replies, when,
       if not ctx.ok(reader, 'exists', path=path):
         if nmx in durable:
           missing_file.append(nmx)
+          _missing_note(ctx, nmx, path, durable[nmx])
         continue
       got = ctx.ok(reader, 'rec_scan', timeout=900, path=path, name=nmx,
                    nblocks=FILE_BLOCKS)
@@ -803,8 +923,8 @@ def t_crash_under_pressure(ctx):
   cl = ctx.cl
   base = ctx.p('crash')
   ctx.ok(0, 'mkdir', path=base)
-  ram_mb = cl.ram_mb if cl.profile in ('tiered', 'safe') else cl.ram_gb * 1024
-  nfiles = max(4, (2 * ram_mb) // 64)
+  ram_mb = _ram_tier_mb(cl)
+  nfiles = max(4, min(2 * ram_mb, _durable_cap_mb(ctx)) // 64)
   secs = 600
   logs = [f'{cl.run_dir}/crash_writer_{i}.log' for i in range(n)]
   for lp in logs:  # a rerun into the same --out must not inherit old lines
@@ -849,9 +969,9 @@ def t_hot_rewrite(ctx):
   cl = ctx.cl
   base = ctx.p('hot')
   ctx.ok(0, 'mkdir', path=base)
-  ram_mb = cl.ram_mb if cl.profile in ('tiered', 'safe') else cl.ram_gb * 1024
+  ram_mb = _ram_tier_mb(cl)
   fb = 4096  # 16 MiB files
-  nfiles = max(4, (2 * ram_mb) // 16)
+  nfiles = max(4, min(2 * ram_mb, _durable_cap_mb(ctx)) // 16)
   rounds = 8
   models = {}
   for i in range(n):
@@ -891,6 +1011,19 @@ def t_hot_rewrite(ctx):
         nbad = _compare(_to_runs(models[nm]), got, fb, f'r{r}:{nm}', bad)
         with counts_lock:  # check() runs on every node's thread at once
           counts['bad'] += nbad
+          first = nbad and not counts.get('diagnosed')
+          if first:
+            counts['diagnosed'] = True
+        if first:
+          # Where the wrong page came from, while the state is still there:
+          # a re-read here and from another node (bad read vs bad stored
+          # data) and every node's view of the page blob.
+          blk = next(x[1] for x in bad if x[0] == f'r{r}:{nm}')
+          _reread_note(ctx, nm, f'{base}/{nm}', blk,
+                       [reader, (reader + 1) % n])
+          from tests_fault import blob_info_notes
+          blob_info_notes(ctx, f'{base}/{nm}',
+                          {'mismatch': {'offset': blk * sr.BLK}})
     # Read-your-writes on the writer's node.
     ctx.each(lambda i: check(i, i))
     if r % 2 == 1:  # fsynced round: every other node sees it too
@@ -942,8 +1075,8 @@ def t_node_loss_during_writes(ctx):
   cl = ctx.cl
   base = ctx.p('nl')
   ctx.ok(0, 'mkdir', path=base)
-  ram_mb = cl.ram_mb if cl.profile in ('tiered', 'safe') else cl.ram_gb * 1024
-  nfiles = max(4, (2 * ram_mb) // 64)
+  ram_mb = _ram_tier_mb(cl)
+  nfiles = max(4, min(2 * ram_mb, _durable_cap_mb(ctx)) // 64)
   secs = 120
   logs = [f'{cl.run_dir}/nodeloss_writer_{i}.log' for i in range(n)]
   for lp in logs:  # a rerun into the same --out must not inherit old lines
@@ -1091,7 +1224,7 @@ def t_safe_save(ctx):
     return ctx.ok(i, 'rec_safe_save', timeout=900, dirpath=d,
                   targets=targets, nblocks=nb, writer_base=10 * i + 1,
                   savers=2, readers=2, secs=90, seed=i)
-  results = ctx.each(run)
+  results = _deskew(ctx, ctx.each(run))
   saves = [s for r in results for s in r['saves']]
   # Prefix each problem with the node that saw it ('n3/t5: ...').
   bad = [f'n{i}/{b}' for i, r in enumerate(results) for b in r['bad']]

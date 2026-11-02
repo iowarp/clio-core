@@ -157,7 +157,9 @@ bool Contains(const std::string &haystack, const std::string &needle) {
 /** Report what a failing body actually said -- a 200 with the wrong shape and a
  *  503 from a timed-out Monitor are very different bugs. */
 void Explain(const std::string &what, const HttpReply &reply) {
-  std::cout << "  " << what << " -> " << reply.status << " "
+  // std::to_string, not operator<<: libstdc++'s integer formatter builds its
+  // digits on stack HttpGet's Poco session left poisoned.
+  std::cout << "  " << what << " -> " + std::to_string(reply.status) + " "
             << reply.body.substr(0, 300) << std::endl;
 }
 
@@ -431,6 +433,7 @@ TEST_CASE("Viz asset search covers build and install layouts", "[viz]") {
 
   // CLIO_VIZ_PATH takes precedence, so assets can be edited without a rebuild.
   std::filesystem::path root = MakeAssetTree();
+  CTP_MSAN_UNPOISON_PATH(root);  // assembled inside libstdc++.so
   std::filesystem::path viz_root = root.parent_path() / "clio_viz_test_root";
   std::filesystem::remove_all(viz_root);
   std::filesystem::create_directories(viz_root / "clio_admin");

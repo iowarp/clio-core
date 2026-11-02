@@ -42,6 +42,15 @@ PS> Copy-Item -Recurse $HOME\Documents\results Z:\
 PS> Get-ChildItem Z:\results
 </pre>
 <p>The drive appears in File Explorer. Python, Excel, ParaView and other applications can open files there directly.</p>
+<div class="callout warn">
+  <span class="callout-title">Microsoft Defender slows file creation on the mount</span>
+  <p>Defender scans every new file larger than about 8 KB when it is closed. On a WinFsp mount each scan adds roughly 10 ms to <code>close</code>. Workloads that create many files, such as <code>git clone</code>, unpacking archives or builds, slow down sharply. The cost comes from Defender and WinFsp, not CLIO: WinFsp's own in-memory sample filesystem shows the same delay.</p>
+  <p>In our tests, a path exclusion for the drive letter (<code>Add-MpPreference -ExclusionPath "Z:\"</code>) had no effect. The drive letter exists only in your login session, and Defender does not match it. Excluding the program that writes the files does work. With the writer excluded, creating 22 KB files went from about 90 to about 1,800 files per second:</p>
+<pre data-label="powershell (administrator)">
+PS> Add-MpPreference -ExclusionProcess "git.exe"
+</pre>
+  <p>A process exclusion stops Defender from scanning files that program opens <em>anywhere</em>, not only on the mount. Exclude only programs you trust, and remove the exclusion when you no longer need it with <code>Remove-MpPreference -ExclusionProcess "git.exe"</code>.</p>
+</div>
 
 <h2>5. Unmount</h2>
 <p>Stop the daemon, then the runtime:</p>
@@ -62,4 +71,6 @@ PS> cmake --build build --config Release
   <li><strong>A missing <code>winfsp-x64.dll</code></strong>: WinFsp is not installed, or was installed without its core component.</li>
   <li><strong>The drive letter is in use</strong>: pick another letter, or check <code>Get-PSDrive</code>.</li>
   <li><strong>Files are invisible to Python</strong>: <code>CLIO_WITH_RUNTIME</code> was not <code>0</code> in the mount window.</li>
+  <li><strong>git reports "dubious ownership"</strong>: files on the mount show an unknown owner. Mount with <code>-o uid=-1,gid=-1</code> so they belong to the user who mounted: <code>clio_cte_fuse Z: -f -o uid=-1,gid=-1</code>.</li>
+  <li><strong>Creating many files is slow</strong>: see the Microsoft Defender note under <a href="#4-use-it">Use it</a>.</li>
 </ul>

@@ -250,6 +250,8 @@ class Runtime : public clio::run::Container {
                                   size_t last, clio::run::u64 off, bool *ok);
   /** Queue staged blobs for background deletion (merged or discarded). */
   void QueueStagedDelete(const std::vector<AppendEntry> &entries);
+  /** CLIO_TRACE_STREAM=1: log one merge plan (where, which appends). */
+  void TracePlan(const char *what, const StreamPlan &plan) const;
   /** Delete a bounded batch of queued staged blobs (Sequence tick). */
   clio::run::TaskResume ReapStaged();
 

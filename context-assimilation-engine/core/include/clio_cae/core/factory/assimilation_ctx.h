@@ -69,6 +69,18 @@ struct AssimilationCtx {
   std::string src_data;
 
   // Dataset filtering (for HDF5 and other hierarchical formats)
+  // INGEST ON FAULT. false (default): ingest the whole source now. true:
+  // ingest nothing now -- the CAE becomes the destination tag's fault
+  // handler, and a read of a blob the tag does not hold yet makes the
+  // assimilator ingest exactly that blob, which then serves the read and stays
+  // in the tag like any eagerly ingested blob.
+  bool on_fault = false;
+  // Bytes per ingested blob (0 = the assimilator's default) and the blob-name
+  // prefix before the blob index ("" names blobs "0", "1", ... -- the page
+  // names a gpu_vector pager faults on).
+  size_t chunk_size = 0;
+  std::string blob_prefix = "chunk_";
+
   std::vector<std::string> include_patterns;  // Glob patterns for datasets to include
   std::vector<std::string> exclude_patterns;  // Glob patterns for datasets to exclude
 
@@ -98,9 +110,44 @@ struct AssimilationCtx {
   template<class Archive>
   void serialize(Archive& ar) {
     ar(src, dst, format, depends_on, range_off, range_size, src_token, dst_token,
-       include_patterns, exclude_patterns, src_data, s3_region, s3_profile);
+       include_patterns, exclude_patterns, src_data, s3_region, s3_profile,
+       on_fault, chunk_size, blob_prefix);
   }
 };
+
+/**
+ * Check every context's depends_on against the transfers before it.
+ *
+ * ParseOmni runs the contexts in order and each assimilator finishes its
+ * transfer before the next one starts, so a dependency on an EARLIER context
+ * (named by that context's exact src or dst URL) is already satisfied when
+ * its dependent runs. Anything else cannot be honored: a dependency on a later
+ * context, on the context itself, or on nothing in the list.
+ *
+ * @param ctxs the contexts in submission order
+ * @return empty when every dependency names an earlier context; otherwise a
+ *         message naming the first one that does not
+ */
+inline std::string CheckDependencies(const std::vector<AssimilationCtx>& ctxs) {
+  auto provides = [&ctxs](size_t j, const std::string& dep) {
+    return ctxs[j].src == dep || ctxs[j].dst == dep;
+  };
+  for (size_t i = 0; i < ctxs.size(); ++i) {
+    const std::string& dep = ctxs[i].depends_on;
+    if (dep.empty()) continue;
+    bool earlier = false;
+    for (size_t j = 0; j < i && !earlier; ++j) earlier = provides(j, dep);
+    if (earlier) continue;
+    bool later = false;
+    for (size_t j = i + 1; j < ctxs.size() && !later; ++j) later = provides(j, dep);
+    return "transfer " + std::to_string(i + 1) + " (src " + ctxs[i].src +
+           ") depends_on '" + dep + "', which " +
+           (later ? "only a later transfer provides; transfers run in order, "
+                    "so list that transfer first"
+                  : "is not the src or dst of any earlier transfer");
+  }
+  return "";
+}
 
 }  // namespace clio::cae::core
 

@@ -158,6 +158,43 @@ cmake -S cppzmq-4.10.0 -B cppzmq-build \
 cmake --install cppzmq-build
 rm -rf /tmp/cppzmq-*
 
+# Poco 1.14.1 (static only) -- the runtime's web dashboard HTTP server.
+# Without it CMake prints "Web dashboard (viz): DISABLED" and the wheel ships
+# a clio_run with no dashboard. The root CMakeLists asks for Net, NetSSL,
+# Crypto and JSON together (NetSSL/Crypto need openssl-devel, installed in
+# CIBW_BEFORE_ALL); the runtime itself links only Net + Foundation.
+#
+# Static, because repair_wheel.sh only fixes RPATHs and does not bundle
+# third-party .so files. Two of our libraries link Poco (clio_ctp_host and
+# clio_run_cxx), so each embeds a copy; clio_link_poco_private() (in
+# cmake/ClioCheckPocoAbi.cmake) links them with --exclude-libs so the copies
+# stay private. The visibility presets below are not enough on their own:
+# Poco's headers force default visibility on its API.
+echo "--- Poco 1.14.1 ---"
+cd /tmp
+download_tar https://github.com/pocoproject/poco/archive/refs/tags/poco-1.14.1-release.tar.gz poco.tar.gz
+tar xzf poco.tar.gz && rm poco.tar.gz
+cmake -S poco-poco-1.14.1-release -B poco-build \
+    -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DCMAKE_CXX_VISIBILITY_PRESET=hidden \
+    -DCMAKE_C_VISIBILITY_PRESET=hidden \
+    -DCMAKE_VISIBILITY_INLINES_HIDDEN=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DPOCO_MINIMAL_BUILD=ON \
+    -DENABLE_NET=ON \
+    -DENABLE_JSON=ON \
+    -DENABLE_XML=ON \
+    -DENABLE_UTIL=ON \
+    -DENABLE_CRYPTO=ON \
+    -DENABLE_NETSSL=ON \
+    -DENABLE_TESTS=OFF \
+    -DENABLE_SAMPLES=OFF
+cmake --build poco-build -j$NPROC
+cmake --install poco-build
+rm -rf /tmp/poco-*
+
 # liburing 2.5 (static + shared, for io_uring async I/O backend)
 echo "--- liburing 2.5 ---"
 cd /tmp

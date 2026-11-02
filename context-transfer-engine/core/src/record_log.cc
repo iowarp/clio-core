@@ -258,19 +258,22 @@ size_t RecordLog::Replay(
   return n;
 }
 
-void RecordLog::Append(clio::run::u32 type, const std::string &payload) {
+bool RecordLog::Append(clio::run::u32 type, const std::string &payload) {
   std::string rec;
   rec.reserve(payload.size() + kRecHeader + kRecTrailer);
   Frame(type, payload, &rec);
   std::lock_guard<std::mutex> g(mu_);
-  if (fd_ < 0) return;
+  if (fd_ < 0) return true;
   if (!WriteAll(fd_, rec.data(), rec.size())) {
+    const int e = errno;
     HLOG(kError, "record log: append to {} failed: {}", path_,
-         std::strerror(errno));
-    return;
+         std::strerror(e));
+    errno = e;
+    return false;
   }
   since_compact_ += rec.size();
   unsynced_ = true;
+  return true;
 }
 
 bool RecordLog::Sync() {

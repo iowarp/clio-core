@@ -6,6 +6,7 @@ add_clio_module_runtime(
     src/core_runtime.cc
     src/core_config.cc
     src/core_viz.cc
+    src/core_tag_xattr.cc
     # Data placement engine: one source file per placement policy
     src/dpe/dpe.cc
     src/dpe/random_dpe.cc
@@ -53,6 +54,7 @@ add_clio_module_client(
     src/content_transfer_engine.cc
     src/tag.cc
     src/record_log.cc
+    src/shm_read_stats.cc
 )
 
 # Tell clio_cte/api.h to emit dllexport (instead of the default dllimport

@@ -66,6 +66,12 @@ class BinaryFileAssimilator : public BaseAssimilator {
    */
   clio::run::TaskResume Schedule(const AssimilationCtx& ctx, int& error_code) override;
 
+  /** Ingest-on-fault: the bytes of blob "<blob_prefix><i>". */
+  long long ReadBlob(const AssimilationCtx& ctx, const std::string& blob_name,
+                     char* dst, clio::run::u64 cap) override;
+  /** ctx.chunk_size, or 1 MB. */
+  clio::run::u64 BlobBytes(const AssimilationCtx& ctx) override;
+
  private:
   /**
    * Extract protocol from URL (part before ::)

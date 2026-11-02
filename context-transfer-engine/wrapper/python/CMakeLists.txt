@@ -196,6 +196,25 @@ if(BUILD_TESTING)
         DEPENDS clio_cte_core_ext
     )
 
+    # Existing conditional-write semantics through real, separate TCP clients.
+    # The driver owns one disposable RAM daemon (including its kill test).
+    # Serialize runtime tests because daemon startup clears per-user IPC files.
+    add_test(
+        NAME python_conditional_put_test
+        COMMAND ${Python_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test_cte_conditional.py
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:clio_cte_core_ext>
+    )
+    set_tests_properties(
+        python_conditional_put_test
+        PROPERTIES
+        # Exclude this fixture from the broad CDash UNTIL_PASS sweep. The
+        # Linux unit workflow discovers and runs it exactly once, without retry.
+        LABELS "python;bindings;conditional;integration"
+        TIMEOUT 240
+        RUN_SERIAL TRUE
+        DEPENDS clio_cte_core_ext
+    )
+
     # GIL release + typed futures (#1096, #793): spawns its own daemon,
     # suspends it, and checks blocking calls keep the main thread running,
     # Async*Query results arrive, and Future.wait(max_sec) honours max_sec

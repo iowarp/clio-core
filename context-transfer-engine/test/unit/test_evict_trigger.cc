@@ -493,7 +493,10 @@ TEST_CASE("EvictTrigger - eviction never takes authoritative blobs",
   const clio::run::u64 kKeeperBytes =
       static_cast<clio::run::u64>(kKeepers) * kBlobSize;
   const bool keeper_room = g_fixture->WaitForFreeBytes(kKeeperBytes);
-  INFO("tier free=" << g_fixture->FreeBytes() << " need=" << kKeeperBytes);
+  // std::to_string, not operator<<: libstdc++'s integer formatter builds its
+  // digits on stack MSan still considers poisoned (see FreeBytes's 'cap').
+  INFO("tier free=" + std::to_string(g_fixture->FreeBytes()) +
+       " need=" + std::to_string(kKeeperBytes));
   REQUIRE(keeper_room);
 
   for (int i = 0; i < kKeepers; ++i) {
@@ -552,7 +555,8 @@ TEST_CASE("EvictTrigger - taking over a droppable blob is refused",
      rather than room eviction can make. Two blobs' worth is all this case
      stores before the pressure loop, which recycles among its own copies. */
   const bool conflict_room = g_fixture->WaitForFreeBytes(2 * kBlobSize);
-  INFO("tier free=" << g_fixture->FreeBytes() << " need=" << (2 * kBlobSize));
+  INFO("tier free=" + std::to_string(g_fixture->FreeBytes()) +  // see above
+       " need=" + std::to_string(2 * kBlobSize));
   REQUIRE(conflict_room);
 
   /* A cache copy, then an attempt to take ownership of the same name. */

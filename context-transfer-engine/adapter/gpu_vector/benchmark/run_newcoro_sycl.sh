@@ -72,8 +72,8 @@ SYCL_TARGET="${SYCL_TARGET:-nvptx64-nvidia-cuda}"
 EXTRA="-I$W/context-runtime/include -I$W/context-runtime/modules/admin/include
        -I$W/context-runtime/modules/bdev/include
        -I$W/context-transfer-engine/core/include
-       -I$W/context-transport-primitives/include
-       -I$B/context-transport-primitives/src/include
+       $(printf -- "-I%s " $W/context-transport-primitives/*/include)
+       -I$B/context-transport-primitives/include
        -I$W/context-transfer-engine/checkpoint/include
        -I$W/context-transfer-engine/compressor/include"
 DEFS="-DCTP_ENABLE_SYCL=1 -DCTP_ENABLE_CUDA=0 -DCLIO_COROC -DCLIO_RUNTIME=1

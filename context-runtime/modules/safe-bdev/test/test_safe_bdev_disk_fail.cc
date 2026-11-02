@@ -50,6 +50,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -1170,9 +1171,11 @@ TEST_CASE("safe_bdev_degraded_churn_verify",
   auto phase = [&](int steps, const char *when) {
     const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, steps);
     INFO(std::string("churn ") + when + ": " + e);
+    if (!e.empty()) fprintf(stderr, "churn %s: %s\n", when, e.c_str());
     REQUIRE(e.empty());
     const std::string v = VerifyChurn(rig.safe, sets);
     INFO(std::string("verify ") + when + ": " + v);
+    if (!v.empty()) fprintf(stderr, "verify %s: %s\n", when, v.c_str());
     REQUIRE(v.empty());
   };
   phase(40, "healthy");
@@ -1213,9 +1216,11 @@ TEST_CASE("safe_bdev_two_down_churn_across_restart",
   auto phase = [&](int steps, const char *when) {
     const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, steps);
     INFO(std::string("churn ") + when + ": " + e);
+    if (!e.empty()) fprintf(stderr, "churn %s: %s\n", when, e.c_str());
     REQUIRE(e.empty());
     const std::string v = VerifyChurn(rig.safe, sets);
     INFO(std::string("verify ") + when + ": " + v);
+    if (!v.empty()) fprintf(stderr, "verify %s: %s\n", when, v.c_str());
     REQUIRE(v.empty());
   };
   phase(40, "healthy");
@@ -1262,6 +1267,7 @@ TEST_CASE("safe_bdev_concurrent_degraded_crash",
   auto phase = [&](int steps, const char *when) {
     const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, steps);
     INFO(std::string("churn ") + when + ": " + e);
+    if (!e.empty()) fprintf(stderr, "churn %s: %s\n", when, e.c_str());
     REQUIRE(e.empty());
   };
   phase(30, "healthy");
@@ -1326,9 +1332,11 @@ TEST_CASE("safe_bdev_degraded_crash_cycles",
   auto phase = [&](int steps, const std::string &when) {
     const std::string e = ChurnPhase(rig.safe, sets, rngs, next_tag, steps);
     INFO("churn " + when + ": " + e);
+    if (!e.empty()) fprintf(stderr, "churn %s: %s\n", when.c_str(), e.c_str());
     REQUIRE(e.empty());
     const std::string v = VerifyChurn(rig.safe, sets);
     INFO("verify " + when + ": " + v);
+    if (!v.empty()) fprintf(stderr, "verify %s: %s\n", when.c_str(), v.c_str());
     REQUIRE(v.empty());
   };
   phase(30, "healthy");

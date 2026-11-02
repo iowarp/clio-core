@@ -259,16 +259,6 @@ compose:
   #                         # across any process crash) and small writes skip
   #                         # an fsync each -- ~10x the small-file create rate.
 
-  # === Context Assimilation Engine (CAE) ===
-  # Assimilation / discovery entrypoint at its own pool 400.0
-  # (clio::cae::core::kCaePoolId). CEE calls ParseOmni here; CAE forwards
-  # the data-path tasks it owns to the CTE core at next_pool_id (512.0).
-  - mod_name: clio_cae_core
-    pool_name: cae_main
-    pool_query: local
-    pool_id: "400.0"
-    next_pool_id: "512.0"               # CTE core pool — see entry below
-
   # === Summarizer (CAE) ===
   # Transparent LLM summarization — optional, OFF by default (commented out).
   # An interposer on the CTE core's task interface: it forwards every core
@@ -277,8 +267,9 @@ compose:
   # as `{blob_name}_label` in the same tag.
   #
   # To enable, uncomment this block AND point the CAE core's next_pool_id
-  # above at "401.0" so the data path runs through it. Compose it BEFORE any
-  # pool it forwards to exists — i.e. after the CTE core entry below.
+  # (CAE entry below) at "401.0" so the data path runs through it. It must
+  # be composed after the pool it forwards to exists and before the CAE
+  # entry: move it next to the CAE entry, after the cache.
   #
   # Inference is synchronous on the handling worker, so scope tag_re/blob_re
   # tightly: a rule matching a hot write path serializes it behind the model.
@@ -287,8 +278,22 @@ compose:
   #   pool_name: clio_cae_summarizer
   #   pool_query: local
   #   pool_id: "401.0"
-  #   next_pool_id: "512.0"             # CTE core pool — see entry below
-  #   label_endpoint: "http://127.0.0.1:11434"   # Ollama-compatible server
+  #   next_pool_id: "563.0"             # chain top (cache), as CAE uses
+  #   label_endpoint: "http://127.0.0.1:11434"   # inference server base URL
+  #   label_api: ollama                 # ollama (default): POST
+  #                                     #   {label_endpoint}/api/generate
+  #                                     # openai: POST
+  #                                     #   {label_endpoint}/chat/completions
+  #                                     #   with Authorization: Bearer <token>
+  #                                     # Any other value fails pool Create.
+  #   label_api_key_file: ""            # openai only: file holding the bearer
+  #                                     #   token (wins over the env var)
+  #   label_api_key_env: ""             # openai only: env var holding it
+  #                                     # Both are re-read on every request,
+  #                                     # so a refreshed token needs no
+  #                                     # restart; the token never goes in
+  #                                     # this file. Neither set -> no
+  #                                     # Authorization header.
   #   label_prompts:
   #     summarize: "Summarize the following text in one short sentence."
   #   label_matches:
@@ -296,14 +301,38 @@ compose:
   #       blob_re: ".*"
   #       model: "gemma3:1b"
   #       prompt: "summarize"
-  #       context_length: 4096          # tokens (Ollama num_ctx)
-  #       num_predict: 0                # cap on response tokens; 0 = no cap
+  #       context_length: 4096          # tokens; Ollama num_ctx, and the
+  #                                     #   chunking budget for both APIs
+  #       num_predict: 0                # cap on response tokens (Ollama
+  #                                     #   num_predict / OpenAI max_tokens);
+  #                                     #   0 = no cap
+  #
+  # Hosted example -- ALCF Inference Endpoints, Metis cluster, Mistral Large 3.
+  # Model ids are cluster-specific and listed at inference.alcf.anl.gov.
+  # Fetch a Globus access token (valid 48 h) with ALCF's helper script and
+  # write it where label_api_key_file points:
+  #   python inference_auth_token.py authenticate      # once, interactive
+  #   python inference_auth_token.py get_access_token > ~/.alcf_access_token
+  # On ALCF compute nodes, export https_proxy=http://proxy.alcf.anl.gov:3128
+  # before starting the runtime; loopback is never proxied.
+  #
+  #   label_endpoint: "https://inference-api.alcf.anl.gov/resource_server/metis/api/v1"
+  #   label_api: openai
+  #   label_api_key_file: "${HOME}/.alcf_access_token"
+  #   label_api_key_env: ALCF_ACCESS_TOKEN
+  #   label_matches:
+  #     - tag_re: ".*\\.txt$"
+  #       blob_re: ".*"
+  #       model: "Mistral-Large-3-675B-Instruct-2512"
+  #       prompt: "summarize"
+  #       context_length: 32768
+  #       num_predict: 256
 
   # === Context Transfer Engine (CTE) ===
   # High-performance data buffering and transfer engine. Sits at the
   # canonical CTE entrypoint 512.0 (clio::cte::core::kCtePoolId) so every
   # CTE client / FUSE adapter resolves to it directly. Remove this (and
-  # the CAE entry above) if you do not need CTE.
+  # the CAE entry below) if you do not need CTE.
   - mod_name: clio_cte_core
     pool_name: cte_main
     pool_query: local
@@ -366,6 +395,20 @@ compose:
       # Default: false (operations on the dead owner's blobs fail).
       # failover_to_successor: true
 
+    # Internal data organizer ---------------------------------------------
+    # Periodic tier re-placement. Commented out = "none" (disabled). Each
+    # replica runs DynamicReorganize every period and rescores blobs through
+    # ReorganizeBlobInternal; higher score = faster tier. These keys sit at
+    # the top level of this entry, NOT under performance: (ignored there).
+    # organizer: "none"                  # "none" | "frecency" (recency+frequency)
+    #                                    # | "grayscott" (reference policy: write-once
+    #                                    #   checkpoint tags sink to the slowest tier;
+    #                                    #   with a ReorganizeHint(step) the pair about
+    #                                    #   to be overwritten is demoted. Measured not
+    #                                    #   to pay on Gray-Scott -- see its header)
+    # organizer_tasks: 1                 # Periodic replicas (blob space is hash-partitioned)
+    # organizer_period_ms: 5000          # Period between organizer rounds (ms)
+
     # Performance tuning ---------------------------------------------------
     # Uncomment to override defaults:
     # performance:
@@ -376,18 +419,6 @@ compose:
     #   max_concurrent_operations: 64    # Max concurrent I/O operations
     #   score_threshold: 0.7             # Score above which blobs are reorganized
     #   score_difference_threshold: 0.05 # Min score delta to trigger reorganization
-    #
-    # Internal data organizer (periodic tier re-placement). Commented out =
-    # "none" (disabled). Each replica runs DynamicReorganize every period and
-    # rescores blobs through ReorganizeBlobInternal; higher score = faster tier.
-    #   organizer: "none"                # "none" | "frecency" (recency+frequency)
-    #                                    # | "grayscott" (reference policy: write-once
-    #                                    #   checkpoint tags sink to the slowest tier;
-    #                                    #   with a ReorganizeHint(step) the pair about
-    #                                    #   to be overwritten is demoted. Measured not
-    #                                    #   to pay on Gray-Scott -- see its header)
-    #   organizer_tasks: 1               # Periodic replicas (blob space is hash-partitioned)
-    #   organizer_period_ms: 5000        # Period between organizer rounds (ms)
     #   flush_metadata_period_ms: 5000   # Metadata flush interval (ms): syncs
     #                                    # the metadata WAL each period. The full
     #                                    # snapshot (a pass over every blob) is
@@ -482,6 +513,12 @@ compose:
   #   # Steer each tag's compressed copy toward the node that last read it
   #   # (consumer tracking). false = always place by hash of the tag id.
   #   tracking_enabled: true            # default: true
+  #   # Codec for writes that request none -- the FUSE mount and Python set
+  #   # no codec, so without this they are stored uncompressed (#1251).
+  #   # A library name ("zstd", "lz4", "snappy", ...), "dynamic" (the models
+  #   # below choose per blob), or unset/"none" (default: no compression).
+  #   default_compress: "zstd"
+  #   default_preset: "balanced"        # "fast" | "balanced" | "best"
   #   # Trained models for kCompressDynamic (all optional; unset = the fixed
   #   # heuristic, ratio 2.0). Q-table is used first, then the dense NN.
   #   qtable_model_path: ""             # Q-table predictor model
@@ -533,6 +570,19 @@ compose:
     next_pool_id: "564.0"               # indexer — see entry above
     min_score: 0.5                      # cache copies' score floor
 
+  # === Context Assimilation Engine (CAE) ===
+  # Assimilation / discovery entrypoint at its own pool 400.0
+  # (clio::cae::core::kCaePoolId). CEE calls ParseOmni here; CAE forwards
+  # the data-path tasks it owns to next_pool_id. It points at the top of the
+  # operator chain (the cache, 563.0), not the bare core, so imported data
+  # passes through the indexer and is keyword-searchable (#1242); it is
+  # composed here, after the chain it forwards to exists.
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+    next_pool_id: "563.0"               # chain top (cache) — see entry above
+
   # === Stream (byte-stream layer over CTE tags) ===
   # Owns what makes a tag a byte stream: its page layout (1 MiB page blobs
   # named by page index), its authoritative logical size, and deferred
@@ -572,14 +622,28 @@ compose:
     pool_query: local
     pool_id: "560.0"
     next_pool_id: "563.0"               # chain top (cache) — see entries above
-    # The namespace is stored in the CTE -- no metadata server, no log:
-    # directories are split into directory blocks (one CTE blob each), inodes
-    # are one CTE blob each, and every node caches what it reads while each
-    # block's home pushes every change before acknowledging it.
-    # metadata_log_path only names this node's stream log (<path>.stream).
-    # metadata_log_path: "/mnt/nvme/$USER/clio/cfs_namespace_log"
-    # Entries a directory block holds before it splits (default 1024).
+    # No metadata server. Names live in the inode table: each directory's
+    # rows (name -> inode) are split into table blocks, each block has one
+    # home container that holds it in memory, and every node caches what it
+    # reads while the home pushes every change before acknowledging it. Every
+    # inode -- file, symlink or directory -- has a record of its attributes:
+    # one key of its tag's xattr section (in memory, made durable by the CTE
+    # WAL), held by the container its id names.
+    # metadata_log_path names this node's on-disk metadata:
+    #   <path>.dirs.<container> -- journal of the table blocks this node
+    #                              is home for (one small record per change,
+    #                              fsync'd by fsync/fsyncdir and every 1 s)
+    #   <path>.stream           -- the stream log (file sizes, appends)
+    # The journal is node-local: a node that never returns takes its
+    # directories with it (issue #1263). Unset, directory blocks are stored
+    # as CTE blobs instead (one blob write per change; slower).
+    metadata_log_path: "${CLIO_STORAGE_ROOT}/cfs_namespace_log"
+    # Rows a table block holds before it splits (default 1024).
     # dir_split_entries: 1024
+    # Compare names case-insensitively, keeping their spelling, as NTFS does
+    # (default false): Foo.TXT and foo.txt are one file. Fixed when the volume
+    # is created; a runtime configured the other way refuses the volume.
+    # case_insensitive: false
     # Stream pool holding every file's logical size and merging deferred
     # O_APPEND writes (see the clio_cte_stream entry). Default: "565.0".
     # stream_pool_id: "565.0"

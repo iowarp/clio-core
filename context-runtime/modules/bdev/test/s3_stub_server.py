@@ -16,6 +16,10 @@ Two things make it worth more than a plain echo server:
   * It speaks the exact status codes the transport's semantics depend on:
     404 on a missing object (the sparse zero-fill path) and 200 on bucket HEAD.
 
+It also runs a minimal forward HTTP proxy (S3_STUB_PROXY) that relays
+absolute-form requests to the stub, so the client's http_proxy handling can be
+exercised without any real network.
+
 Usage (the form CTest uses): start on an ephemeral port, export S3_ENDPOINT and
 credentials into the environment, run a child command, exit with its status.
 
@@ -24,6 +28,7 @@ credentials into the environment, run a child command, exit with its status.
 
 import hashlib
 import hmac
+import http.client
 import os
 import subprocess
 import sys
@@ -47,6 +52,11 @@ LOCK = threading.Lock()
 CONNECTIONS = 0
 REQUESTS = 0
 
+# Requests relayed by the forward proxy (ProxyHandler), also served over
+# /__stats: proof that a request really went through the proxy.
+PROXIED = 0
+STUB_PORT = 0  # set in main(); where the proxy relays to
+
 # Short-body mode (S3_STUB_SHORT_ONCE=1): the FIRST GET seen for each key serves
 # only the first half of the requested bytes -- with an honest Content-Length and
 # an honest Content-Range whose /total still names the full object -- then any
@@ -56,6 +66,14 @@ REQUESTS = 0
 # resume is not itself truncated.
 SHORT_ONCE = os.environ.get("S3_STUB_SHORT_ONCE") == "1"
 SHORT_SERVED = set()
+
+# Public-read objects: a GET/HEAD with NO Authorization header is allowed for
+# any key containing this path segment, as a public bucket allows anonymous
+# reads. Everything else -- writes, other keys -- still demands a valid
+# signature, so an anonymous client that wrongly signed (or wrongly did not)
+# is caught either way. A request that does carry Authorization is always
+# verified, even on a public key.
+PUBLIC_SEGMENT = "/public/"
 
 
 def _sign(key, msg):
@@ -157,6 +175,9 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             REQUESTS += 1
         path, query = self._split()
+        if (method in ("GET", "HEAD") and PUBLIC_SEGMENT in path
+                and "Authorization" not in self.headers):
+            return True
         reason = verify(method, path, query, self.headers)
         if reason is not None:
             self._reject(reason)
@@ -233,7 +254,8 @@ class Handler(BaseHTTPRequestHandler):
         # the counters without perturbing them.
         if path == "/__stats":
             with LOCK:
-                body = f'{{"connections": {CONNECTIONS}, "requests": {REQUESTS}}}'
+                body = (f'{{"connections": {CONNECTIONS}, '
+                        f'"requests": {REQUESTS}, "proxied": {PROXIED}}}')
             self._respond(200, body.encode("utf-8"))
             return
         if not self._authorized("GET"):
@@ -292,6 +314,63 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(204)
 
 
+class ProxyHandler(BaseHTTPRequestHandler):
+    """A plain-HTTP forward proxy: relays absolute-form requests to the stub.
+
+    Whatever host the client named, the request goes to the stub on loopback,
+    with every header -- Host included -- passed through untouched, so the
+    stub still verifies a signature computed for the name the client used. A
+    request NOT in absolute form never came through proxy logic and is refused.
+    """
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        if os.environ.get("S3_STUB_VERBOSE") == "1":
+            sys.stderr.write("[s3-proxy] " + (fmt % args) + "\n")
+
+    def _relay(self):
+        global PROXIED
+        if not self.path.startswith("http://"):
+            body = b"not a proxy request (expected absolute-form URI)"
+            self.send_response(400)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        target = self.path[len("http://"):]
+        slash = target.find("/")
+        target = target[slash:] if slash >= 0 else "/"
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else None
+        headers = {k: v for k, v in self.headers.items()
+                   if k.lower() not in ("proxy-connection", "connection",
+                                        "proxy-authorization")}
+        upstream = http.client.HTTPConnection("127.0.0.1", STUB_PORT,
+                                              timeout=30)
+        try:
+            upstream.request(self.command, target, body=body, headers=headers)
+            resp = upstream.getresponse()
+            data = resp.read()
+        finally:
+            upstream.close()
+        with LOCK:
+            PROXIED += 1
+        self.send_response(resp.status)
+        for k, v in resp.getheaders():
+            if k.lower() not in ("connection", "transfer-encoding",
+                                 "content-length", "keep-alive"):
+                self.send_header(k, v)
+        # A HEAD response advertises the real size but carries no body.
+        clen = resp.getheader("Content-Length") if self.command == "HEAD" \
+            else str(len(data))
+        self.send_header("Content-Length", clen or "0")
+        self.end_headers()
+        if self.command != "HEAD" and data:
+            self.wfile.write(data)
+
+    do_GET = do_PUT = do_HEAD = do_DELETE = _relay
+
+
 def main():
     if "--" not in sys.argv:
         sys.exit(__doc__)
@@ -303,6 +382,12 @@ def main():
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
+    global STUB_PORT
+    STUB_PORT = port
+
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+    proxy.daemon_threads = True
+    threading.Thread(target=proxy.serve_forever, daemon=True).start()
 
     env = dict(os.environ)
     env.update({
@@ -312,11 +397,13 @@ def main():
         "AWS_SECRET_ACCESS_KEY": SECRET_KEY,
         "AWS_DEFAULT_REGION": REGION,
         "S3_STUB_BUCKET": BUCKET,
+        "S3_STUB_PROXY": f"http://127.0.0.1:{proxy.server_address[1]}",
     })
     env.pop("AWS_SESSION_TOKEN", None)  # long-term creds only, so tests are stable
     try:
         return subprocess.call(child, env=env)
     finally:
+        proxy.shutdown()
         server.shutdown()
 
 

@@ -34,12 +34,11 @@
 /**
  * Placement helpers of the clio-fs namespace.
  *
- * There is no metadata server. Directories are stored as directory blocks
- * (CTE blobs, see fs_dir_block.h) whose home is the container owning the
- * blob; inodes are homed on the container that minted their id (encoded in
- * the id); file pages follow the CTE core's per-page hash. Path operations
- * go to the local container, which resolves paths through its cache of
- * directory blocks.
+ * There is no metadata server. Names live in the inode table, stored as
+ * blocks (CTE blobs, see fs_inode_table.h) whose home is the container
+ * owning the blob; inodes are homed on the container their id names; file
+ * pages follow the CTE core's per-page hash. Path operations go to the
+ * local container, which resolves paths through its cache of table blocks.
  *
  * This header is shared by clients (who route tasks with it) and the
  * runtime, so the two can never disagree.
@@ -55,7 +54,7 @@
 
 namespace clio::cte::filesystem {
 
-/** Entry types stored in a directory entry and an inode. */
+/** Inode types (stored in an inode's record and copied into its rows). */
 GLOBAL_CROSS_CONST clio::run::u32 kFsTypeFile = 1;
 GLOBAL_CROSS_CONST clio::run::u32 kFsTypeDir = 2;
 GLOBAL_CROSS_CONST clio::run::u32 kFsTypeSymlink = 3;
@@ -150,7 +149,7 @@ inline std::string FsJoin(const std::string &dir, const std::string &leaf) {
 
 /**
  * Query for a path-based operation: the local container. It resolves the
- * path through its own cache of directory blocks (fs_dir_block.h) and sends
+ * path through its own cache of inode-table blocks (fs_inode_table.h) and sends
  * only mutations to the homes of the blocks involved.
  * @return Local query
  */

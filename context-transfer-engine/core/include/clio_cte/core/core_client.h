@@ -40,6 +40,7 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/blob_batch.h>
 #include <clio_cte/core/shm_metadata_cache.h>
+#include <clio_cte/core/shm_read_stats.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_ctp/data_structures/priv/unordered_map_ll.h>
 #include <clio_ctp/thread/lock/rwlock.h>
@@ -197,6 +198,21 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Probe passes a blob record read may make before giving up to RPC.
+   *
+   * Retrying is cheap and giving up is not. A pass that meets a writer ends
+   * at the odd slot it found; a fallback costs a full round trip (12-40 us on
+   * one idle node, more under load). Measured under sustained in-place
+   * rewrites of one hot blob (issue #787): at the map's default of 16, the
+   * retries were bimodal -- nearly all of them came from reads that spent
+   * every pass (about 1.5 us) and fell back, 0.2-0.6% of reads at 20k puts/s
+   * and up to 1.5% with back-to-back puts, which took GetBlobSize p99 from
+   * 0.2 us to 9-19 us. At 256 the fallbacks went to zero across 1-8 readers
+   * and 4-64 KB blobs, and p99 came back to 0.4-0.5 us.
+   */
+  static constexpr ctp::min_u32 kShmRecordReadRetries = 256;
+
+  /**
    * Zero-IPC metadata read.
    *
    * @return true if a consistent record was found in shared memory. false
@@ -216,7 +232,19 @@ class Client : public clio::run::ContainerClient {
     if (n == 0) {
       return false;  // name too long for the fast path
     }
-    return shm_root_->blob_key_to_info_.TryGetBytes(key, n, out);
+    bool absent = false;
+    ctp::min_u32 attempts = 0;
+    const bool ok = shm_root_->blob_key_to_info_.TryGetBytes(
+        key, n, out, kShmRecordReadRetries, &absent, &attempts);
+    ShmReadCounters &stats = ThreadShmReadCounters();
+    ShmReadCounters::Bump(stats.record_reads);
+    if (attempts > 1) {
+      ShmReadCounters::Bump(stats.record_retries, attempts - 1);
+    }
+    if (!ok && !absent && attempts == kShmRecordReadRetries) {
+      ShmReadCounters::Bump(stats.record_fallbacks);
+    }
+    return ok;
   }
 
   /**
@@ -248,8 +276,11 @@ class Client : public clio::run::ContainerClient {
     if (ctp::IsDevicePointer(out)) {
       return false;
     }
+    ShmReadCounters &stats = ThreadShmReadCounters();
+    ShmReadCounters::Bump(stats.payload_reads);
     ShmBlobRecord rec;
     if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
+      ShmReadCounters::Bump(stats.payload_not_servable);
       return false;
     }
     // Source selection (issue #886 cache/replication split): the primary when
@@ -277,6 +308,7 @@ class Client : public clio::run::ContainerClient {
                             offset + size <= rec.RepCoveredBytes() &&
                             offset + size <= rec.rep_total_size_;
     if (!primary_ok && !replica_ok) {
+      ShmReadCounters::Bump(stats.payload_not_servable);
       return false;  // transformed/file/remote/GPU-tier and no serving replica
     }
     const ShmBlockDesc *src_blocks = primary_ok ? rec.blocks_ : rec.rep_blocks_;
@@ -287,6 +319,7 @@ class Client : public clio::run::ContainerClient {
     // construction. Take the RPC path, which waits for the writer.
     const clio::run::u64 seq_before = rec.content_seq_;
     if (seq_before & 1) {
+      ShmReadCounters::Bump(stats.payload_write_in_flight);
       return false;
     }
 
@@ -300,6 +333,7 @@ class Client : public clio::run::ContainerClient {
       }
       char *base = MapRamBdev(b.target_pool_);
       if (base == nullptr) {
+        ShmReadCounters::Bump(stats.payload_not_servable);
         return false;  // cannot reach this device -> RPC
       }
       clio::run::u64 intra = want_from;
@@ -310,6 +344,7 @@ class Client : public clio::run::ContainerClient {
       want_from = 0;
     }
     if (copied != size) {
+      ShmReadCounters::Bump(stats.payload_not_servable);
       return false;
     }
 
@@ -320,12 +355,13 @@ class Client : public clio::run::ContainerClient {
     // withdrew this record, so a copy that saw them must also see that.
     std::atomic_thread_fence(std::memory_order_acquire);
     ShmBlobRecord after;
-    if (!TryGetBlobRecordShm(tag_id, blob_name, &after)) {
+    if (!TryGetBlobRecordShm(tag_id, blob_name, &after) ||
+        after.placement_gen_ != gen_before || after.content_seq_ != seq_before) {
+      // Moved, overwritten in place, or withdrawn while we copied.
+      ShmReadCounters::Bump(stats.payload_raced_writer);
       return false;
     }
-    if (after.placement_gen_ != gen_before || after.content_seq_ != seq_before) {
-      return false;  // moved, or overwritten in place, while we copied
-    }
+    ShmReadCounters::Bump(stats.payload_hits);
     return true;
   }
 
@@ -2033,9 +2069,10 @@ class Client : public clio::run::ContainerClient {
    * AwaitPutsUntilSpace / a same-key AsyncGetBlobDefer). Client mode stages
    * at submit as always, and buffers are free on return.
    *
-   * @param runtime_extent When non-null and co-located, registered as the
-   *        put's served extent for read-your-writes; null registers the key
-   *        count-only (pending reads await instead of composing).
+   * @param runtime_extent When non-null and co-located (or when it is
+   *        `staging`), registered as the put's served extent for
+   *        read-your-writes; null registers the key count-only (pending
+   *        reads await instead of composing).
    * @param submit Submits the put; retried after awaiting the oldest deferred
    *        put whenever it returns an empty future (SHM exhaustion).
    */
@@ -2057,8 +2094,15 @@ class Client : public clio::run::ContainerClient {
     }
     clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
     clio::run::u64 seq = reg.seq_gen_.fetch_add(1) + 1;
-    const char *ext =
-        CLIO_RUNTIME_MANAGER->IsRuntime() ? runtime_extent : nullptr;
+    // A staging buffer is ours until this put is reaped (KeyRelease runs
+    // before PoolFreeStaging), so it is a valid extent in client mode too.
+    // Registering it lets a write to the same blob that does not overlap
+    // proceed at once: count-only registration makes KeyOverlapsPending
+    // assume overlap, which serialized every 1 MiB FUSE write whose
+    // unaligned user buffer the kernel split into two requests on one page.
+    const char *ext = (CLIO_RUNTIME_MANAGER->IsRuntime() || !staging.IsNull())
+                          ? runtime_extent
+                          : nullptr;
     reg.KeyAdd(key, seq, ext, offset, size);
     DeferredPut rec;
     rec.fut_ = fut.template Cast<clio::run::Task>();
@@ -3992,6 +4036,93 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<ListLocalBlobsTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, blob_regex);
     return ipc_manager->Send(task);
+  }
+
+  /**
+   * One operation on a tag's xattr section - asynchronous. See TagXattrTask
+   * for the ops, flags and return codes.
+   * @param tag_id tag whose section is addressed
+   * @param op kTagXattrSet / kTagXattrGet / kTagXattrDel / kTagXattrList
+   * @param flags kTagXattrCreate / kTagXattrReplace / kTagXattrMustExist
+   * @param key the key (List: the cursor; keys after it are returned)
+   * @param value the value to store (Set only)
+   * @param max_keys List page size (0 = all)
+   * @param pool_query routing (default: Dynamic, the tag id's hashed owner)
+   * @return future for the TagXattrTask
+   */
+  clio::run::Future<TagXattrTask> AsyncTagXattr(
+      const TagId &tag_id, clio::run::u32 op, clio::run::u32 flags,
+      const std::string &key, const std::string &value = std::string(),
+      clio::run::u32 max_keys = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<TagXattrTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, op, flags,
+        key, value, max_keys);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Insert or replace one key of a tag's xattr section - asynchronous.
+   * @param tag_id the tag
+   * @param key the key
+   * @param value the value
+   * @param flags kTagXattrCreate / kTagXattrReplace (0 = upsert)
+   * @param pool_query routing (default: Dynamic)
+   * @return future for the TagXattrTask (rc 0 on success)
+   */
+  clio::run::Future<TagXattrTask> AsyncTagSetXattr(
+      const TagId &tag_id, const std::string &key, const std::string &value,
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    return AsyncTagXattr(tag_id, kTagXattrSet, flags, key, value, 0,
+                         pool_query);
+  }
+
+  /**
+   * Read one key of a tag's xattr section - asynchronous.
+   * @param tag_id the tag
+   * @param key the key
+   * @param pool_query routing (default: Dynamic)
+   * @return future for the TagXattrTask (found_, value_)
+   */
+  clio::run::Future<TagXattrTask> AsyncTagGetXattr(
+      const TagId &tag_id, const std::string &key,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    return AsyncTagXattr(tag_id, kTagXattrGet, 0, key, std::string(), 0,
+                         pool_query);
+  }
+
+  /**
+   * Remove one key of a tag's xattr section, or every key when `key` is
+   * empty - asynchronous.
+   * @param tag_id the tag
+   * @param key the key (empty = all)
+   * @param flags kTagXattrMustExist (0 = absent is fine)
+   * @param pool_query routing (default: Dynamic)
+   * @return future for the TagXattrTask
+   */
+  clio::run::Future<TagXattrTask> AsyncTagDelXattr(
+      const TagId &tag_id, const std::string &key, clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    return AsyncTagXattr(tag_id, kTagXattrDel, flags, key, std::string(), 0,
+                         pool_query);
+  }
+
+  /**
+   * List the keys of a tag's xattr section in order - asynchronous.
+   * @param tag_id the tag
+   * @param cursor return keys strictly after this one (empty = from start)
+   * @param max_keys page size (0 = all)
+   * @param pool_query routing (default: Dynamic)
+   * @return future for the TagXattrTask (keys_; found_ = 1 if more remain)
+   */
+  clio::run::Future<TagXattrTask> AsyncTagListXattr(
+      const TagId &tag_id, const std::string &cursor = std::string(),
+      clio::run::u32 max_keys = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    return AsyncTagXattr(tag_id, kTagXattrList, 0, cursor, std::string(),
+                         max_keys, pool_query);
   }
 
   /**

@@ -1644,6 +1644,33 @@ clio::run::TaskResume Runtime::QueryTaskProgress(
   // Answer from run2run's recv_map_: kRunning (1) if this node still holds the
   // queried replica task, kGone (0) otherwise (never received / already
   // responded / dropped by a restart). Issue #628.
+  if (task->query_net_key_ == kDeadReprobeKey) {
+    // Rejoin notice: the prober holds this node dead, so it may have failed
+    // our homes over to a stand-in that changed them. Cached home state is
+    // suspect; the filesystem reloads it (see IpcManager::HeldDeadSeq).
+    // Honored only once at least half the peers sent one recently: only a
+    // majority fails a node over (failover-quorum). A single cut-off node
+    // holds every peer dead and re-probes them all; acting on its notices
+    // alone made healthy majority nodes drop and reload home directory
+    // blocks, and the reload lost recent entries (safe_partition_during_
+    // writes). A sender-side majority check raced the heal.
+    const auto now = std::chrono::steady_clock::now();
+    const clio::run::u64 sender = task->pool_query_.GetReturnNode();
+    std::lock_guard<std::mutex> g(held_dead_mu_);
+    held_dead_by_[sender] = now;
+    for (auto it = held_dead_by_.begin(); it != held_dead_by_.end();) {
+      it = now - it->second > std::chrono::seconds(60)
+               ? held_dead_by_.erase(it)
+               : std::next(it);
+    }
+    const size_t peers = CLIO_IPC->GetNodeIds().size() > 0
+                             ? CLIO_IPC->GetNodeIds().size() - 1
+                             : 0;
+    if (peers > 0 && held_dead_by_.size() * 2 >= peers) {
+      CLIO_IPC->NoteHeldDeadByPeer();
+      held_dead_by_.clear();  // one reload per failover
+    }
+  }
   bool present = CLIO_IPC->GetRun2Run()->HasRecvTask(task->query_net_key_,
                                                      task->query_replica_id_);
   task->status_ = present ? 1u : 0u;
@@ -1665,6 +1692,11 @@ clio::run::TaskResume Runtime::QueryTaskProgress(
  */
 void Runtime::NoteProbeFailure(clio::run::u64 node_id) {
   auto *ipc_manager = CLIO_IPC;
+  if (ipc_manager->NsSincePong(node_id) / 1e9 < ProbeSilenceSec()) {
+    // Answering pongs on the control channel: alive, just congested.
+    probe_failures_.erase(node_id);
+    return;
+  }
   const clio::run::u32 failures = ++probe_failures_[node_id];
   if (failures < kProbeFailuresToDeclareDead) {
     HLOG(kWarning,
@@ -1729,7 +1761,13 @@ void Runtime::ReapProgressProbes(std::chrono::steady_clock::time_point now,
         // window is proof of life, only total silence kills.
         const clio::run::u64 heard_ns =
             ipc_manager->NsSinceHeardFrom(pq.target_node_id);
-        if (heard_ns / 1e9 < ProbeSilenceSec()) {
+        // A pong on the control channel inside the window proves the node
+        // and the path both ways are alive; the probe is only stuck behind
+        // bulk data on the main socket (decision control_port).
+        const clio::run::u64 pong_ns =
+            ipc_manager->NsSincePong(pq.target_node_id);
+        if (heard_ns / 1e9 < ProbeSilenceSec() ||
+            pong_ns / 1e9 < ProbeSilenceSec()) {
           pq.fired_at = now;
         } else {
           pq.silence_reported = true;
@@ -1746,7 +1784,7 @@ void Runtime::ReapProgressProbes(std::chrono::steady_clock::time_point now,
     }
     // A failed probe is inconclusive -- only a successful answer decides.
     if (pq.future->GetReturnCode() == 0) {
-      if (pq.net_key != kIdleProbeKey) {
+      if (pq.net_key != kIdleProbeKey && pq.net_key != kDeadReprobeKey) {
         bool gone = (pq.future->status_ == 0);
         run2run->HandleTaskProgressResult(
             static_cast<clio::run::u64>(pq.net_key), pq.replica_id, gone,
@@ -1763,7 +1801,14 @@ void Runtime::ReapProgressProbes(std::chrono::steady_clock::time_point now,
              "[TaskProgress] node {} answered a liveness probe -- REJOINED, "
              "marking alive",
              pq.target_node_id);
-        run2run->FlushStaleStateForNode(pq.target_node_id);
+        // No FlushStaleStateForNode here. A restart is caught when its new
+        // incarnation's first message arrives (RecvIn FailInFlightToNode),
+        // which drops the old incarnation's state then; what is still parked
+        // now was owed to the CURRENT incarnation while we held it dead (a
+        // node is no longer revived by its own messages, only by this
+        // round trip). Discarding it left a restarted node's mount waiting
+        // forever for answers; the retry queues deliver it now it is alive.
+        (void)run2run;
         ipc_manager->SetAlive(pq.target_node_id);
         last_dead_reprobe_.erase(pq.target_node_id);
       }
@@ -1806,6 +1851,12 @@ void Runtime::FireStuckProbes(clio::run::u32 interval_ms) {
     auto task = ipc_manager->NewTask<QueryTaskProgressTask>(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, q, sr.net_key,
         sr.replica_id);
+    // A stuck-replica probe is a liveness probe too: it must reach a node
+    // held dead. Without the flag it failed fast there, and while it was in
+    // flight it marked the node "busy", so FireIdleProbes never sent the
+    // flagged re-probe either -- a node held dead with replicas stuck on it
+    // (any partition) could never answer, so never rejoin (dead-node-rejoin).
+    task->SetFlags(TASK_LIVENESS_PROBE);
     auto fut = ipc_manager->Send(task);
     pending_progress_queries_.push_back(
         {std::move(fut), static_cast<size_t>(sr.net_key), sr.replica_id,
@@ -1825,6 +1876,23 @@ void Runtime::FireIdleProbes() {
   }
   const clio::run::u64 self = ipc_manager->GetNodeId();
   const auto now = std::chrono::steady_clock::now();
+  // Whether this node sees at least half the cluster alive. Only such a
+  // node can have failed a peer over (failover-quorum), so only its
+  // re-probes carry the rejoin notice. A cut-off minority node sees every
+  // peer dead; its notices made the majority drop and reload home
+  // directory blocks that nobody had failed over, and the reload lost
+  // recent entries (safe_partition_during_writes, baseline1).
+  // (Kept as a first filter; the receiver makes the real decision by
+  // counting distinct senders, see QueryTaskProgress.)
+  bool majority = true;
+  {
+    size_t total = 0, alive = 0;
+    for (clio::run::u64 n : ipc_manager->GetNodeIds()) {
+      ++total;
+      if (n == self || ipc_manager->IsAlive(n)) ++alive;
+    }
+    majority = total == 0 || alive * 2 >= total;
+  }
   for (clio::run::u64 node : ipc_manager->GetNodeIds()) {
     if (node == self || busy.count(node) != 0) continue;
     const bool dead =
@@ -1850,13 +1918,13 @@ void Runtime::FireIdleProbes() {
     clio::run::PoolQuery q =
         clio::run::PoolQuery::Physical(static_cast<clio::run::u32>(node));
     q.SetNetTimeout(5.0f);
+    const size_t key = dead && majority ? kDeadReprobeKey : kIdleProbeKey;
     auto task = ipc_manager->NewTask<QueryTaskProgressTask>(
-        clio::run::CreateTaskId(), clio::run::kAdminPoolId, q, kIdleProbeKey,
-        0u);
+        clio::run::CreateTaskId(), clio::run::kAdminPoolId, q, key, 0u);
     task->SetFlags(TASK_LIVENESS_PROBE);  // transmitted even to a dead node
     auto fut = ipc_manager->Send(task);
     pending_progress_queries_.push_back(
-        {std::move(fut), kIdleProbeKey, 0u, 0ull, node,
+        {std::move(fut), key, 0u, 0ull, node,
          std::chrono::steady_clock::now(), false});
   }
 }
@@ -1973,7 +2041,7 @@ clio::run::TaskResume Runtime::HeartbeatProbe(clio::run::shared_ptr<HeartbeatPro
           clio::run::NodeState::kDead) {
         HLOG(kInfo, "SWIM: node {} answered a probe — REJOINED, marking alive",
              it->target_node_id);
-        CLIO_IPC->GetRun2Run()->FlushStaleStateForNode(it->target_node_id);
+        // Parked work is owed to the current incarnation (see ReapProgressProbes).
         ipc_manager->SetAlive(it->target_node_id);
       } else {
         ipc_manager->SetNodeState(it->target_node_id,
@@ -2008,7 +2076,7 @@ clio::run::TaskResume Runtime::HeartbeatProbe(clio::run::shared_ptr<HeartbeatPro
                "SWIM: node {} answered an indirect probe — REJOINED, marking "
                "alive",
                it->target_node_id);
-          CLIO_IPC->GetRun2Run()->FlushStaleStateForNode(it->target_node_id);
+          // Parked work is owed to the current incarnation (see ReapProgressProbes).
           ipc_manager->SetAlive(it->target_node_id);
         } else {
           ipc_manager->SetNodeState(it->target_node_id,

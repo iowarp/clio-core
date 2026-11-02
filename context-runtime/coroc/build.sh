@@ -75,7 +75,16 @@ link_stub() {  # link_stub <basename>  -> echoes -l<name> if it resolved
 }
 LIBS="$(link_stub clang-cpp)"
 [[ -n "${LIBS}" ]] || { echo "no libclang-cpp found under ${LIBDIR}" >&2; exit 1; }
-LIBS="${LIBS} $(link_stub LLVM)"
+# ...but ONLY when libclang-cpp does not already carry LLVM. An LLVM built
+# with shared-mode=static (Aurora's spack llvm-develop) links LLVM into
+# libclang-cpp itself; adding libLLVM then loads every cl::opt twice and the
+# tool dies at startup with "LLVM ERROR: Option 'default' already exists!".
+# (grep -c, not -q: -q closes the pipe early and pipefail reads nm's SIGPIPE
+# as "not found".)
+if [[ "$(nm -D --defined-only "${STUB}/libclang-cpp.so" 2>/dev/null \
+        | grep -c '_ZN4llvm2cl6Option11addArgumentEv' || true)" == "0" ]]; then
+  LIBS="${LIBS} $(link_stub LLVM)"
+fi
 
 # Bake in where clang's builtin headers and the host C++ library live, so the
 # caller passes only -I and -D. The tool's toolchain and the project's are

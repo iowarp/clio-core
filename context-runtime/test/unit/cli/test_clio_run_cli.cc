@@ -257,8 +257,10 @@ TEST_CASE("RefreshRepo - generates methods header and lib_exec source",
 
   REQUIRE(CallRefreshRepo({tmp.path.string()}) == 0);
 
-  // module_name overrides the directory name in the include path
-  fs::path header = tmp.path / "alpha" / "include" / "test::ns" / "alpha_mod" /
+  // module_name overrides the directory name in the include path. With no
+  // include/ tree yet, the prefix is the namespace with "::" as "_" -- never
+  // a literal "test::ns" directory (#1249).
+  fs::path header = tmp.path / "alpha" / "include" / "test_ns" / "alpha_mod" /
                     "autogen" / "alpha_methods.h";
   fs::path source = tmp.path / "alpha" / "src" / "autogen" / "alpha_lib_exec.cc";
   REQUIRE(fs::exists(header));
@@ -300,8 +302,9 @@ TEST_CASE("RefreshRepo - generates methods header and lib_exec source",
 
   const std::string s = ReadAll(source);
   SECTION("source includes runtime + autogen headers via module_name");
-  REQUIRE(Contains(s, "#include \"test::ns/alpha_mod/alpha_runtime.h\""));
-  REQUIRE(Contains(s, "test::ns/alpha_mod/autogen/alpha_methods.h"));
+  REQUIRE(Contains(s, "#include \"test_ns/alpha_mod/alpha_runtime.h\""));
+  REQUIRE(Contains(s, "test_ns/alpha_mod/autogen/alpha_methods.h"));
+  REQUIRE_FALSE(Contains(s, "test::ns/"));
 
   SECTION("kRestart >= 0 generates Runtime::Restart");
   REQUIRE(Contains(s, "void Runtime::Restart("));
@@ -335,6 +338,33 @@ TEST_CASE("RefreshRepo - generates methods header and lib_exec source",
 
   SECTION("malformed module yaml produced no output but no failure");
   REQUIRE_FALSE(fs::exists(tmp.path / "badmod" / "src"));
+}
+
+TEST_CASE("RefreshRepo - include prefix follows the module's header layout",
+          "[cli][refresh_repo]") {
+  // A namespace is not a path: clio::run lives under include/clio_runtime/,
+  // which no "::" mapping produces. The generator must use the directory
+  // that holds <module>/<chimod>_runtime.h (#1249).
+  TempDir tmp;
+  WriteFile(tmp.path / "clio_repo.yaml",
+            "namespace: clio::run\n"
+            "modules:\n"
+            "  - gamma\n");
+  WriteFile(tmp.path / "gamma" / "clio_mod.yaml", "module_name: gamma\n");
+  WriteFile(tmp.path / "gamma" / "include" / "clio_runtime" / "gamma" /
+                "gamma_runtime.h",
+            "// runtime header\n");
+
+  REQUIRE(CallRefreshRepo({tmp.path.string()}) == 0);
+
+  REQUIRE(fs::exists(tmp.path / "gamma" / "include" / "clio_runtime" /
+                     "gamma" / "autogen" / "gamma_methods.h"));
+  REQUIRE_FALSE(fs::exists(tmp.path / "gamma" / "include" / "clio_run"));
+  const std::string s =
+      ReadAll(tmp.path / "gamma" / "src" / "autogen" / "gamma_lib_exec.cc");
+  REQUIRE(Contains(s, "#include \"clio_runtime/gamma/gamma_runtime.h\""));
+  REQUIRE(Contains(s, "clio_runtime/gamma/autogen/gamma_methods.h"));
+  REQUIRE(Contains(s, "namespace clio::run::gamma {"));
 }
 
 TEST_CASE("RefreshRepo - default namespace and module with no methods",

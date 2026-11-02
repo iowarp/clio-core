@@ -180,10 +180,133 @@ PyCteFuture MakePyFuture(clio::run::Future<TaskT> fut,
   return pf;
 }
 
+/**
+ * Submit an existing scalar owner-conditional put from immutable Python bytes.
+ * @param self the CTE client whose pool owns the blob
+ * @param tag_id blob namespace
+ * @param blob_name blob key
+ * @param data nonempty immutable payload, retained through completion
+ * @param off byte offset within the blob (puts do not truncate)
+ * @param op_flag Context::kPutIfAbsent or Context::kPutIfVersion
+ * @param version expected version for a compare-and-swap put
+ * @return typed Python future with native code and returned/new version
+ */
+PyCteFuture ConditionalPut(clio::cte::core::Client &self,
+                           const clio::cte::core::TagId &tag_id,
+                           const std::string &blob_name, nb::bytes data,
+                           size_t off, clio::run::u32 op_flag,
+                           clio::run::u64 version) {
+  if (data.size() == 0) {
+    throw std::invalid_argument("conditional puts require nonempty data");
+  }
+  const char *ptr = data.c_str();
+  const size_t len = data.size();
+  clio::cte::core::Context context;
+  context.op_flags_ = op_flag;
+  context.version_ = version;
+  using TaskT = clio::cte::core::PutBlobTask;
+  clio::run::Future<TaskT> fut;
+  {
+    nb::gil_scoped_release release;
+    fut = self.AsyncPutBlob(tag_id, blob_name, off, len, ptr, -1.0f, context);
+  }
+  if (fut.IsNull()) {
+    throw std::runtime_error("conditional put submission failed");
+  }
+  return MakePyFuture<TaskT>(std::move(fut), [data](TaskT *task) {
+    nb::dict result;
+    result["code"] = task->GetReturnCode();
+    result["version"] = task->context_.version_;
+    return result;
+  });
+}
+
+/**
+ * Send an authoritative get, bypassing the unversioned SHM read fast path.
+ * @param self CTE client providing owner routing through its pool
+ * @param tag_id blob namespace
+ * @param blob_name blob key
+ * @param size number of bytes to read
+ * @param off byte offset within the blob
+ * @param dst retained private destination for the typed PostWait hook
+ * @return existing native GetBlobTask future, with context.version_ populated
+ */
+clio::run::Future<clio::cte::core::GetBlobTask> SubmitVersionedGet(
+    clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
+    const std::string &blob_name, size_t size, size_t off, char *dst) {
+  using TaskT = clio::cte::core::GetBlobTask;
+  auto *ipc = CLIO_CPU_IPC;
+  auto *runtime = CLIO_RUNTIME_MANAGER;
+  clio::cte::core::Context context;
+  context.op_flags_ = clio::cte::core::Context::kNoFault;
+  if (runtime->IsRuntime()) {
+    auto task =
+        ipc->NewTask<TaskT>(clio::run::CreateTaskId(), self.pool_id_,
+                            clio::run::PoolQuery::Dynamic(), tag_id, blob_name,
+                            off, size, 0u, ctp::ipc::ShmPtr<>::FromRaw(dst),
+                            context);
+    return ipc->Send(task);
+  }
+  auto staging = ipc->AllocateBuffer(size);
+  if (staging.IsNull()) {
+    throw std::runtime_error("versioned get staging allocation failed");
+  }
+  auto task = ipc->NewTask<TaskT>(
+      clio::run::CreateTaskId(), self.pool_id_, clio::run::PoolQuery::Dynamic(),
+      tag_id, blob_name, off, size, 0u, ctp::ipc::ShmPtr<>(staging.shm_), context);
+  task->priv_dest_ = dst;
+  task->priv_src_ = staging.ptr_;
+  auto fut = ipc->Send(task);
+  // Match AsyncGetBlob(char*): ownership stays client-local, after Send has
+  // serialized flags, and typed Future::Wait delivers bytes via PostWait.
+  task->SetFlags(TASK_DATA_OWNER);
+  return fut;
+}
+
+/**
+ * Wrap an authoritative get and its retained private buffer for Python.
+ * @param self CTE client
+ * @param tag_id blob namespace
+ * @param blob_name blob key
+ * @param size positive read size, normally a fixed-size coordination record
+ * @param off byte offset within the blob
+ * @return code, version and bytes (None on a failed read) via Future.result()
+ */
+PyCteFuture VersionedGet(clio::cte::core::Client &self,
+                         const clio::cte::core::TagId &tag_id,
+                         const std::string &blob_name, size_t size,
+                         size_t off) {
+  if (size == 0) {
+    throw std::invalid_argument("versioned gets require positive data_size");
+  }
+  auto buf = std::make_shared<std::string>(size, '\0');
+  clio::run::Future<clio::cte::core::GetBlobTask> fut;
+  {
+    nb::gil_scoped_release release;
+    fut = SubmitVersionedGet(self, tag_id, blob_name, size, off, buf->data());
+  }
+  if (fut.IsNull()) {
+    throw std::runtime_error("versioned get submission failed");
+  }
+  using TaskT = clio::cte::core::GetBlobTask;
+  return MakePyFuture<TaskT>(std::move(fut), [buf](TaskT *task) {
+    nb::dict result;
+    const auto code = task->GetReturnCode();
+    result["code"] = code;
+    result["version"] = task->context_.version_;
+    result["data"] = code == 0 ? nb::object(nb::bytes(buf->data(), buf->size()))
+                               : nb::object(nb::none());
+    return result;
+  });
+}
+
 }  // namespace
 
 NB_MODULE(clio_cte_core_ext, m) {
   m.doc() = "Python bindings for WRP CTE Core";
+
+  m.attr("PUT_EXISTS_RC") = clio::cte::core::kPutExistsRc;
+  m.attr("PUT_VERSION_MISMATCH_RC") = clio::cte::core::kPutVersionMismatchRc;
 
   // Bind CteOp enum
   nb::enum_<clio::cte::core::CteOp>(m, "CteOp")
@@ -315,7 +438,8 @@ NB_MODULE(clio_cte_core_ext, m) {
            "Non-blocking: True if the task has completed.")
       .def("result", &PyCteFuture::Result, "max_sec"_a = -1.0f,
            "Block until done, then return the operation's result: bytes for "
-           "AsyncGetBlob, a list or snapshot for query operations, None for "
+           "AsyncGetBlob, a dict for conditional puts/versioned gets, "
+           "a list or snapshot for query operations, None for "
            "status-only ops (put/del/reorganize/register). Raises "
            "TimeoutError if max_sec (> 0) elapses first. The GIL is released "
            "while waiting.");
@@ -449,7 +573,7 @@ NB_MODULE(clio_cte_core_ext, m) {
              nb::gil_scoped_release release;
              task.Wait();
            }
-           return task->GetReturnCode();
+           return task->GetReturnCode();  // a u32: the atomic itself has no Python type
          },
          "target_name"_a, "bdev_type"_a, "total_size"_a,
          "target_query"_a, "bdev_id"_a,
@@ -464,7 +588,7 @@ NB_MODULE(clio_cte_core_ext, m) {
              nb::gil_scoped_release release;
              task.Wait();
            }
-           return task->GetReturnCode();
+           return task->GetReturnCode();  // a u32: the atomic itself has no Python type
          },
          "target_name"_a, "bdev_type"_a, "total_size"_a,
          "Register a storage target with default query and pool ID. "
@@ -566,6 +690,39 @@ NB_MODULE(clio_cte_core_ext, m) {
          "tag_id"_a, "blob_name"_a, "data"_a, "off"_a = 0,
          "Asynchronously put blob data from a private buffer (issue #830). "
          "Returns a Future; .wait() -> return code (0 = success).")
+     .def("AsyncPutBlobIfAbsent",
+         [](clio::cte::core::Client &self,
+            const clio::cte::core::TagId &tag_id,
+            const std::string &blob_name, nb::bytes data, size_t off) {
+           return ConditionalPut(self, tag_id, blob_name, data, off,
+                                 clio::cte::core::Context::kPutIfAbsent, 0);
+         },
+         "tag_id"_a, "blob_name"_a, "data"_a, "off"_a = 0,
+         "Atomically create a primary blob if absent. Future.result() -> "
+         "{code, version}; PUT_EXISTS_RC means another writer already won. "
+         "Nonempty bytes required; existing AsyncPutBlob is unchanged.")
+     .def("AsyncPutBlobIfVersion",
+         [](clio::cte::core::Client &self,
+            const clio::cte::core::TagId &tag_id,
+            const std::string &blob_name, nb::bytes data,
+            clio::run::u64 version, size_t off) {
+           return ConditionalPut(self, tag_id, blob_name, data, off,
+                                 clio::cte::core::Context::kPutIfVersion,
+                                 version);
+         },
+         "tag_id"_a, "blob_name"_a, "data"_a, "version"_a, "off"_a = 0,
+         "Atomically put only at the expected primary content version "
+         "(absent = 0). Future.result() -> {code, version}; "
+         "PUT_VERSION_MISMATCH_RC means refetch before retrying. "
+         "Puts overwrite a range and never truncate; use fixed-size records.")
+     .def("AsyncGetBlobVersioned", &VersionedGet,
+         "tag_id"_a, "blob_name"_a, "data_size"_a, "off"_a = 0,
+         "Read stored primary bytes through the owner, bypassing the "
+         "unversioned SHM cache and lazy fault handlers. "
+         "Future.result() -> {code, version, data}; data is None on failure. "
+         "A concurrent write can yield newer bytes with an older version; "
+         "CAS then conflicts safely. Versions do not promise durable fencing "
+         "across runtime restart or blob deletion/recreation.")
      .def("AsyncGetBlob",
          [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
             const std::string &blob_name, size_t data_size, size_t off) {

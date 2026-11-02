@@ -290,7 +290,7 @@ class Container {
   float InferCpuTime(u32 method_id, const TaskStat &stat) const {
     float x = static_cast<float>(stat.compute_) + 1.0f;
     if (method_id < method_model_.size()) {
-      return method_model_[method_id] * x;
+      return SanePrediction(method_model_[method_id] * x, x);
     }
     return x;
   }
@@ -302,11 +302,61 @@ class Container {
    * @return Predicted wall clock time in microseconds
    */
   float InferWallClockTime(u32 method_id, const TaskStat &stat) const {
-    float x = stat.wall_time_ + 1.0f;
+    float x = SaneInput(stat.wall_time_) + 1.0f;
     if (method_id < method_model_wall_.size()) {
-      return method_model_wall_[method_id] * x;
+      return SanePrediction(method_model_wall_[method_id] * x, x);
     }
     return x;
+  }
+
+  /** Smallest coefficient a model keeps: an update that overshoots below
+   *  zero (a large over-prediction with a high learning rate) lands here. */
+  static constexpr float kMinModelCoef = 1.0e-6f;
+
+  /**
+   * A model coefficient that inference and learning can use. A NaN or
+   * infinity (one bad sample makes every later update NaN, and it persists
+   * in the saved model) becomes the seed 1.0; an overshoot below zero is
+   * clamped to kMinModelCoef, keeping the direction of the update.
+   * @param coef the stored or updated coefficient
+   * @return a finite coefficient >= kMinModelCoef
+   */
+  static float SaneCoef(float coef) {
+    if (!std::isfinite(coef)) return 1.0f;
+    return coef < kMinModelCoef ? kMinModelCoef : coef;
+  }
+
+  /**
+   * A model input (TaskStat field) clamped to a finite, non-negative value.
+   * @param v the input
+   * @return v, or 0 when it is negative or not finite
+   */
+  static float SaneInput(float v) {
+    return (std::isfinite(v) && v > 0.0f) ? v : 0.0f;
+  }
+
+  /**
+   * A prediction the scheduler can book: finite and non-negative.
+   * @param pred the model's prediction (us)
+   * @param x the model input it was computed from (fallback: one us per unit)
+   * @return pred, or x when pred is unusable
+   */
+  static float SanePrediction(float pred, float x) {
+    return (std::isfinite(pred) && pred >= 0.0f) ? pred : x;
+  }
+
+  /**
+   * Whether a completed task's measurement may train a model. A negative or
+   * non-finite time is a timer artifact, not a cost (a thread CPU timer read
+   * on two threads when the task resumed on another worker).
+   * @param pred the prediction made for it
+   * @param real the measured time
+   * @param x the model input
+   * @return true if the sample is usable
+   */
+  static bool SaneSample(float pred, float real, float x) {
+    return std::isfinite(pred) && std::isfinite(real) && real >= 0.0f &&
+           std::isfinite(x) && x >= 1.0f;
   }
 
   /**
@@ -318,8 +368,10 @@ class Container {
     if (method_id >= method_model_.size()) return;
     float lr = learning_rate_;
     float x = static_cast<float>(stat.compute_) + 1.0f;
+    if (!SaneSample(pred_cpu, real_cpu, x)) return;
     float e = pred_cpu - real_cpu;
-    method_model_[method_id] -= lr * (e / x);
+    method_model_[method_id] =
+        SaneCoef(method_model_[method_id] - lr * (e / x));
     if (real_cpu > 0) {
       float ape = std::abs(e) / real_cpu;
       method_mape_[method_id] =
@@ -336,9 +388,11 @@ class Container {
                           const TaskStat &stat) {
     if (method_id >= method_model_wall_.size()) return;
     float lr = learning_rate_;
-    float x = stat.wall_time_ + 1.0f;
+    float x = SaneInput(stat.wall_time_) + 1.0f;
+    if (!SaneSample(pred_wall, real_wall, x)) return;
     float e = pred_wall - real_wall;
-    method_model_wall_[method_id] -= lr * (e / x);
+    method_model_wall_[method_id] =
+        SaneCoef(method_model_wall_[method_id] - lr * (e / x));
     if (real_wall > 0) {
       float ape = std::abs(e) / real_wall;
       method_mape_wall_[method_id] =
@@ -355,12 +409,12 @@ class Container {
    */
   void SetMethodCpuCoef(u32 method_id, float coef) {
     if (method_id >= method_model_.size()) return;
-    method_model_[method_id] = coef;
+    method_model_[method_id] = SaneCoef(coef);
     model_dirty_.store(true, std::memory_order_relaxed);
   }
   void SetMethodWallCoef(u32 method_id, float coef) {
     if (method_id >= method_model_wall_.size()) return;
-    method_model_wall_[method_id] = coef;
+    method_model_wall_[method_id] = SaneCoef(coef);
     model_dirty_.store(true, std::memory_order_relaxed);
   }
 

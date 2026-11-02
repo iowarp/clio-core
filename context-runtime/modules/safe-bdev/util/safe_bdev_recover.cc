@@ -44,6 +44,13 @@
  *       --member /mnt/nvme/new_m0.dat --capacity 2147483648 \
  *       --new-id 7200.0
  *
+ * With --add data|parity instead of --failed it plugs a brand-new drive into
+ * the running array (AddBdev): a data member grows the array's capacity, a
+ * parity member raises its tolerance. No rebuild is involved.
+ *
+ *   clio_safe_bdev_recover --array 7100.0 --add data \
+ *       --member /mnt/hdd/new_m4.dat --capacity 2147483648 --new-id 7300.0
+ *
  * Connects as a client to the runtime named by the usual CLIO_* environment
  * (CLIO_SERVER_CONF, CLIO_IPC_MODE). Exit 0 on success; prints one line.
  */
@@ -65,6 +72,7 @@ struct Options {
   std::string failed;    ///< failed member's pool id
   std::string member;    ///< replacement member's backing file
   std::string new_id;    ///< pool id for the replacement member
+  std::string add;       ///< "data"/"parity": add a new member, no rebuild
   unsigned long long capacity = 0;  ///< replacement capacity (bytes)
 };
 
@@ -83,11 +91,14 @@ bool ParseArgs(int argc, char **argv, Options *o) {
     else if (k == "--failed") o->failed = v;
     else if (k == "--member") o->member = v;
     else if (k == "--new-id") o->new_id = v;
+    else if (k == "--add") o->add = v;
     else if (k == "--capacity") o->capacity = std::strtoull(v.c_str(), nullptr, 10);
     else return false;
   }
-  return !o->array.empty() && !o->failed.empty() && !o->member.empty() &&
-         !o->new_id.empty() && o->capacity > 0;
+  const bool add_ok = o->add == "data" || o->add == "parity";
+  if (!o->add.empty() && (!add_ok || !o->failed.empty())) return false;
+  return !o->array.empty() && (add_ok || !o->failed.empty()) &&
+         !o->member.empty() && !o->new_id.empty() && o->capacity > 0;
 }
 
 /**
@@ -120,8 +131,8 @@ int main(int argc, char **argv) {
   Options o;
   if (!ParseArgs(argc, argv, &o)) {
     std::fprintf(stderr,
-                 "usage: %s --array ID --failed ID --member PATH "
-                 "--capacity BYTES --new-id ID\n", argv[0]);
+                 "usage: %s --array ID (--failed ID | --add data|parity) "
+                 "--member PATH --capacity BYTES --new-id ID\n", argv[0]);
     return 1;
   }
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
@@ -136,6 +147,18 @@ int main(int argc, char **argv) {
   }
   auto *ipc = CLIO_IPC;
   clio::run::safe_bdev::Client array(clio::run::PoolId::FromString(o.array));
+  if (!o.add.empty()) {
+    auto add = array.AsyncAddBdev(
+        clio::run::PoolQuery::Local(), o.member,
+        static_cast<clio::run::u32>(ipc->GetNodeId()), member_id,
+        o.add == "parity" ? 1u : 0u);
+    add.Wait();
+    const clio::run::u32 arc = add->GetReturnCode();
+    std::printf("{\"ok\": %s, \"step\": \"add\", \"rc\": %u, "
+                "\"member_pool\": \"%s\"}\n", arc == 0 ? "true" : "false",
+                arc, member_id.ToString().c_str());
+    return arc == 0 ? 0 : 3;
+  }
   auto rec = array.AsyncRecoverBdev(
       clio::run::PoolQuery::Local(), clio::run::PoolId::FromString(o.failed),
       o.member, static_cast<clio::run::u32>(ipc->GetNodeId()), member_id);

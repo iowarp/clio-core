@@ -136,7 +136,8 @@ class Cluster:
                ram_gb=8, disk_gb=20, local_root=None, net_suffix='-40g',
                extra_env=None, replicate_period_ms=0, fsync_mode=None,
                ram_mb=512, fast_mb=2048, organizer='frecency',
-               organizer_period_ms=2000, neighborhood=1):
+               organizer_period_ms=2000, neighborhood=1, ssd_mb=4096,
+               ssd_root=None, hdd_root=None):
     self.hosts = list(hosts)
     self.bin_dir = bin_dir
     self.run_dir = run_dir            # shared (NFS): configs, logs, results
@@ -168,6 +169,12 @@ class Cluster:
     # this many nodes (itself and the next ones), so a blob may be placed
     # on a neighbor's device.
     self.neighborhood = neighborhood
+    # Profile 'ares_tiers': four real device tiers per node -- RAM (ram_mb),
+    # NVMe (fast_mb, under local_root), SATA SSD (ssd_mb) and HDD (disk_gb)
+    # -- each a separate CTE target on its own device, for tiering studies.
+    self.ssd_mb = ssd_mb
+    self.ssd_root = ssd_root or f'/mnt/ssd/{user}/clio_fs_suite'
+    self.hdd_root = hdd_root or f'/mnt/hdd/{user}/clio_fs_suite'
     self.agents = {}
     self.agent_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  'agent.py')
@@ -194,8 +201,9 @@ class Cluster:
     # Failure detection: the runtime defaults (30 s silence + 30 s retry per
     # send) ride out restarts but stall every op on a dead node for 30 s;
     # a filesystem deployment wants a prompt EIO. Overridable per run.
-    e['CLIO_PROBE_SILENCE_S'] = os.environ.get('CLIO_SUITE_PROBE_SILENCE_S',
-                                               '10')
+    e['CLIO_PROBE_SILENCE_S'] = str(getattr(self, 'probe_silence_s', 0) or
+                                    os.environ.get(
+                                        'CLIO_SUITE_PROBE_SILENCE_S', '10'))
     e['CLIO_NET_RETRY_TIMEOUT_S'] = os.environ.get(
         'CLIO_SUITE_NET_RETRY_TIMEOUT_S', '10')
     e['CLIO_NET_DEAD_FAIL_FAST'] = os.environ.get(
@@ -300,6 +308,20 @@ class Cluster:
            f'--capacity {cap} --new-id {mid}')
     return sh(host, cmd, timeout=1830)
 
+  def add_disk(self, host, gen=1, as_parity=False):
+    """Plug a brand-new drive into `host`'s running array (AddBdev, no
+    rebuild): a data member grows capacity, a parity member raises the
+    tolerance. Returns (rc, output) of clio_safe_bdev_recover --add."""
+    lr = self.local_root
+    kind = 'parity' if as_parity else 'data'
+    new_id = f'{SAFE_MEMBER_POOL_MAJOR + 500 + gen}.0'
+    cap = self.safe_member_gb() << 30
+    cmd = (f'{self.env_prefix()} timeout 600 '
+           f'{self.bin_dir}/clio_safe_bdev_recover --array {SAFE_POOL_ID} '
+           f'--add {kind} --member {lr}/data/safe_add{gen}.dat '
+           f'--capacity {cap} --new-id {new_id}')
+    return sh(host, cmd, timeout=630)
+
   def revive_disk(self, host, k):
     """Undo kill_disk: the member's device answers again."""
     return sh(host, f'rm -f {self.safe_member_path(k)}.fail', timeout=30)
@@ -312,7 +334,7 @@ class Cluster:
     lr = self.local_root
     # 'safe' is the tiered profile whose slow tier is a safe_bdev array of
     # SAFE_MEMBERS file bdevs (SAFE_PARITY of them parity) on each node.
-    tiered = self.profile in ('tiered', 'safe')
+    tiered = self.profile in ('tiered', 'safe', 'ares_tiers')
     ram_cap = f'{self.ram_mb}MB' if tiered else f'{self.ram_gb}GB'
     storage = []
     if tiered or self.ram_gb > 0:  # ram_gb 0: disk tier only (#1116)
@@ -333,6 +355,13 @@ class Cluster:
           f'        capacity_limit: "{self.fast_mb}MB"\n'
           f'        score: 0.6\n'
           f'        persistence_level: "temporary"\n')
+    if self.profile == 'ares_tiers':
+      storage.append(
+          f'      - path: "{self.ssd_root}/data/cte_ssd_tier.dat"\n'
+          f'        bdev_type: "file"\n'
+          f'        capacity_limit: "{self.ssd_mb}MB"\n'
+          f'        score: 0.4\n'
+          f'        persistence_level: "temporary"\n')
     if self.profile == 'safe':
       storage.append(
           f'      - path: "{lr}/data/safe_array"\n'
@@ -345,10 +374,13 @@ class Cluster:
           # never place anything on it: writes fill the fast tier and then
           # fail ENOSPC with the array empty (#1119).
           f'        persistence_level: "long_term"\n')
-    if self.profile in ('persistent', 'persistent_norepl', 'tiered', 'safe'):
+    if self.profile in ('persistent', 'persistent_norepl', 'tiered', 'safe',
+                        'ares_tiers'):
+      disk_dir = (f'{self.hdd_root}/data' if self.profile == 'ares_tiers'
+                  else f'{lr}/data')
       if self.profile != 'safe':
         storage.append(
-            f'      - path: "{lr}/data/cte_disk_tier.dat"\n'
+            f'      - path: "{disk_dir}/cte_disk_tier.dat"\n'
             f'        bdev_type: "file"\n'
             f'        capacity_limit: "{self.disk_gb}GB"\n'
             f'        score: 0.2\n'
@@ -371,7 +403,7 @@ class Cluster:
       perf += '      flush_data_period_ms: 2000\n'
       organizer = (f'    organizer: "{self.organizer}"\n'
                    f'    organizer_period_ms: {self.organizer_period_ms}\n')
-    if self.profile in ('persistent', 'tiered', 'safe'):
+    if self.profile in ('persistent', 'tiered', 'safe', 'ares_tiers'):
       # A local persistent replica (num_replicas) guards against losing a
       # device. On the safe profile the slow tier is a safe_bdev array that
       # already survives max_failures dead disks, so a second copy on that
@@ -449,8 +481,11 @@ compose:
     sh(host, f'pkill -9 -u $USER -f "[c]lio_cte_fuse" ; '
              f'pkill -9 -u $USER -f "[c]lio_run" ; sleep 0.5; '
              f'rm -rf {self.local_root}/data {self.local_root}/memfd '
-             f'{self.local_root}/conf; '
-             f'mkdir -p {self.local_root}/data; {self.seal_mnt_cmd()}',
+             f'{self.local_root}/conf {self.local_root}/test_partition; '
+             f'mkdir -p {self.local_root}/data; {self.seal_mnt_cmd()}'
+             + (f'; rm -rf {self.ssd_root}/data {self.hdd_root}/data; '
+                f'mkdir -p {self.ssd_root}/data {self.hdd_root}/data'
+                if self.profile == 'ares_tiers' else ''),
        timeout=60)
 
   def seal_mnt_cmd(self):
@@ -468,11 +503,30 @@ compose:
     persistent state; fresh=True passes --fresh (discard it, start empty)."""
     log = self.log_path(host, 'runtime')
     args = 'start --fresh' if fresh else 'start'
+    # Never start over a daemon that has not finished exiting (see
+    # kill_runtime): it would fail to bind and runtime_up would be fooled.
+    # A SIGKILLed daemon in the middle of a safe_bdev rebuild has been seen
+    # to hold its port for over 2 minutes (I/O in flight): every node's
+    # restart then failed to bind (reliability7). Wait for the process AND
+    # its listening socket, up to 180 s.
+    t0 = time.time()
+    while time.time() - t0 < 180:
+      rc, _ = sh(host, f'ss -ltn | grep -q ":{self.port} "', timeout=20)
+      if not self.runtime_pid(host) and rc != 0:
+        break
+      time.sleep(0.5)
     # CLIO_SUITE_GDB=1 runs the daemon under gdb and dumps every thread's
     # stack into the runtime log if it crashes (silent SIGSEGV otherwise).
-    cmd = (f'{self.env_prefix()} nohup {self._gdb("runtime")}'
-           f'{self.bin_dir}/clio_run {args} '
-           f'--no-viz </dev/null >>{log} 2>&1 &')
+    # Record how the daemon ended: runtimes have died silently mid-test
+    # (no log line, no core: ulimit -c is 0 on Ares) and the cause was
+    # unknowable. rc 137 = SIGKILL (ours, or the OOM killer), 139 = SIGSEGV,
+    # 134 = abort.
+    # (nohup on the wrapper: SIGHUP stays ignored for clio_run, as before.)
+    inner = (f'{self.env_prefix()} {self._gdb("runtime")}'
+             f'{self.bin_dir}/clio_run {args} --no-viz </dev/null '
+             f'>>{log} 2>&1; echo "=== $(date) clio_run exited rc=$?" '
+             f'>>{log}')
+    cmd = f'nohup sh -c {shlex.quote(inner)} </dev/null >/dev/null 2>&1 &'
     sh(host, f'echo "=== {time.ctime()} clio_run {args}" >> {log}; {cmd}')
 
   def gdb_prefix(self):
@@ -526,8 +580,21 @@ compose:
     """Undo partition() on `host`."""
     sh(host, f'rm -f {self.local_root}/test_partition')
 
-  def kill_runtime(self, host, sig='KILL'):
+  def kill_runtime(self, host, sig='KILL', wait_s=180):
+    """Signal the daemon; for SIGKILL also wait until it has exited and
+    released its port. A SIGKILLed daemon can take seconds to die (a big
+    address space, I/O in flight): a restart in that window failed to bind
+    ("Failed to initialize Clio runtime") while runtime_up() saw the dying
+    process's socket and reported the node up (reliability6)."""
     sh(host, f'pkill -{sig} -u $USER -f "[c]lio_run (start|restart)"')
+    if sig != 'KILL':
+      return
+    t0 = time.time()
+    while time.time() - t0 < wait_s:
+      rc, _ = sh(host, f'ss -ltn | grep -q ":{self.port} "', timeout=20)
+      if not self.runtime_pid(host) and rc != 0:
+        return
+      time.sleep(0.5)
 
   def mount(self, host, timeout=90):
     """Start clio_cte_fuse on host and wait for a usable mount."""
@@ -597,12 +664,71 @@ compose:
     self.agents = {}
 
   # -- whole-cluster -------------------------------------------------------
+  def space_needs_mb(self):
+    """{directory: MB} the file tiers and logs need on each node."""
+    lr = self.local_root
+    need = {lr: 1024}  # WALs, journals, memfd slack
+    tiered = self.profile in ('tiered', 'safe', 'ares_tiers')
+    if tiered:
+      need[lr] += self.fast_mb
+    if self.profile == 'ares_tiers':
+      need[self.ssd_root] = self.ssd_mb
+      need[self.hdd_root] = self.disk_gb * 1024
+    elif self.profile != 'ram':
+      need[lr] += self.disk_gb * 1024
+    if self.profile == 'safe':
+      # The drive tests create more member files next to the array: a
+      # replacement for a dead member and up to two plugged-in drives, each
+      # one member in size (the replacement failed ENOSPC on a node the
+      # preflight had passed).
+      need[lr] += 3 * self.disk_gb * 1024 // SAFE_MEMBERS
+    return need
+
+  def check_space(self):
+    """Hosts whose devices lack room for the tiers: {host: problem}.
+
+    Ares NVMe drives are shared and have been found 93-100% full; a disk
+    tier that cannot grow made a whole leg fail ENOSPC (reliability1/3)."""
+    need = self.space_needs_mb()
+    paths = ' '.join(need)
+
+    def chk(h):
+      # mkdir first and on its own: a device that is missing, read-only or
+      # not ours fails here, and its error line must not be parsed as df
+      # output (it crashed this check with a ValueError on ares-comp-16).
+      rc, out = sh(h, f'mkdir -p {paths}', timeout=30)
+      if rc != 0:
+        return f'cannot create tier directories: {out.strip()[-300:]}'
+      rc, out = sh(h, f'df -Pm {paths} | tail -n +2', timeout=30)
+      if rc != 0:
+        return f'df failed: {out[-200:]}'
+      lines = [ln for ln in out.strip().splitlines()
+               if ln.split() and ln.split()[0].startswith('/')]
+      if len(lines) != len(need):
+        return f'unexpected df output: {out.strip()[-300:]}'
+      have = {}
+      for p, ln in zip(need, lines):
+        f = ln.split()
+        dev, avail = f[0], int(f[3])
+        have.setdefault(dev, [avail, 0])[1] += need[p]
+      bad = [f'{d} {a} MB free, needs {n}' for d, (a, n) in have.items()
+             if a < n * 1.1]
+      return '; '.join(bad)
+    res = parallel(chk, self.hosts)
+    return {h: str(r) for h, r in zip(self.hosts, res)
+            if isinstance(r, Exception) or r}
+
   def up(self, wipe=True):
     """Bring every node up; return (ok, message). wipe=True is a new
     deployment: its data is removed and every daemon starts --fresh."""
     self.write_config()
     if wipe:
       parallel(self.wipe, self.hosts)
+      short = self.check_space()
+      if short:
+        return False, ('not enough free space for the configured tiers '
+                       '(a full device fails writes ENOSPC/EIO and every '
+                       f'test after it): {short}')
     parallel(lambda h: self.start_runtime(h, fresh=wipe), self.hosts)
     ups = parallel(self.runtime_up, self.hosts)
     bad = [h for h, ok in zip(self.hosts, ups) if ok is not True]

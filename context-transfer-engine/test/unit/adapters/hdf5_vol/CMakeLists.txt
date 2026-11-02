@@ -75,6 +75,8 @@ add_executable(test_hdf5_vol_io
 
 target_include_directories(test_hdf5_vol_io PRIVATE
     ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/hdf5_vol
+    # clio_vol_layout.h includes "adapter/clio_coherence_stamp.h"
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine
     ${CMAKE_SOURCE_DIR}/context-runtime/test
     ${HDF5_INCLUDE_DIRS}
 )
@@ -106,10 +108,21 @@ if(NOT WIN32)
   add_test(NAME cte_hdf5_vol_io_passthrough
       COMMAND test_hdf5_vol_io "HDF5 VOL IO - Passthrough callbacks")
 
+  # The cache layout the CAE's hdf5_vol format stages into (clio_vol_layout.h).
+  add_test(NAME cte_hdf5_vol_io_prestaged
+      COMMAND test_hdf5_vol_io
+          "HDF5 VOL IO - An image staged ahead of the open is served")
+
+  add_test(NAME cte_hdf5_vol_io_prestaged_chunk
+      COMMAND test_hdf5_vol_io
+          "HDF5 VOL IO - A staged image with another chunk size is a miss")
+
   set_tests_properties(
       cte_hdf5_vol_io_dataset
       cte_hdf5_vol_io_groups_attrs
       cte_hdf5_vol_io_passthrough
+      cte_hdf5_vol_io_prestaged
+      cte_hdf5_vol_io_prestaged_chunk
       PROPERTIES
           TIMEOUT 300
           LABELS "unit;adapter;hdf5_vol;cte"

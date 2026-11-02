@@ -146,12 +146,37 @@ def heartbeats_during(fn) -> tuple:
     return beats, time.monotonic() - t0, err
 
 
-def resume_later(pid: int, delay: float) -> None:
+def resume_later(pid: int, delay: float) -> subprocess.Popen:
     """Resume a suspended pid from ANOTHER process: a Python thread here
-    would need the very GIL a non-releasing binding holds."""
-    subprocess.Popen([sys.executable, "-c",
-                      "import time, psutil; time.sleep(%f); "
-                      "psutil.Process(%d).resume()" % (delay, pid)])
+    would need the very GIL a non-releasing binding holds. The caller must
+    wait() for the returned resumer before suspending pid again, or the
+    pending resume thaws the daemon under the next check."""
+    return subprocess.Popen([sys.executable, "-c",
+                             "import time, psutil; time.sleep(%f); "
+                             "psutil.Process(%d).resume()" % (delay, pid)])
+
+
+def suspend(proc, timeout: float = 5.0) -> None:
+    """Suspend proc and wait until every thread has stopped. SIGSTOP lands
+    asynchronously: a worker thread polling shared memory on another core
+    can still pick up and finish a request submitted right after
+    proc.suspend() returns."""
+    proc.suspend()
+    task_dir = "/proc/%d/task" % proc.pid
+    if not os.path.isdir(task_dir):
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            states = []
+            for tid in os.listdir(task_dir):
+                with open(os.path.join(task_dir, tid, "stat")) as f:
+                    states.append(f.read().rsplit(")", 1)[1].split()[0])
+        except OSError:  # a thread exited mid-scan
+            continue
+        if all(s in "tT" for s in states):
+            return
+        time.sleep(0.001)
 
 
 def check(cond: bool, msg: str, failures: list) -> None:
@@ -229,9 +254,11 @@ def main() -> int:
                 tid, "b1", len(payload), 0).result(),
         }
         for name, fn in blocking.items():
-            proc.suspend()
-            resume_later(proc.pid, SUSPEND_SEC)
+            suspend(proc)
+            resumer = resume_later(proc.pid, SUSPEND_SEC)
             beats, el, err = heartbeats_during(fn)
+            # A call that returned early leaves its resume pending.
+            resumer.wait()
             # A call served from the client's SHM cache never reaches the
             # frozen daemon and returns at once -- also fine.
             check(not err and (beats >= MIN_HEARTBEATS
@@ -240,7 +267,7 @@ def main() -> int:
                   f"(err={err or None})", failures)
 
         # 3a. wait(max_sec) against a suspended daemon.
-        proc.suspend()
+        suspend(proc)
         fut = client.AsyncGetContainedBlobs(tid)
         t0 = time.monotonic()
         rc = fut.wait(0.5)
@@ -253,7 +280,7 @@ def main() -> int:
 
         # 3b. wait(max_sec) against a dead daemon.
         # Freeze it first so the request cannot complete before the kill.
-        proc.suspend()
+        suspend(proc)
         fut = client.AsyncGetContainedBlobs(tid)
         proc.kill()
         daemon.wait(10)

@@ -380,6 +380,38 @@ class Worker {
   }
   /** #781: release the reservation when the task starts executing (or is
    *  cancelled) — the executing cost is then tracked by load_ instead. */
+  /**
+   * Reserve \a us of queued load for \a task on \a w, first releasing any
+   * reservation the task already holds on another (or the same) worker. A
+   * task mapped twice before it starts would otherwise leave the first
+   * reservation on its worker for good.
+   * @param task the task being placed
+   * @param w the worker it is placed on
+   * @param us the reservation (us)
+   */
+  static void ReserveOn(Task *task, Worker *w, double us);
+
+  /**
+   * Release \a task's reservation from the worker that holds it (recorded
+   * by ReserveOn), whichever worker calls this.
+   * @param task the task starting, ending, or being re-placed
+   */
+  static void ReleaseTaskReservation(Task *task);
+
+  /**
+   * Count a task's predicted hold in load_ while it can occupy this worker
+   * (executing, or resumed), recording the amount on the task.
+   * @param task the task about to run here
+   */
+  void BookHold(Task *task);
+
+  /**
+   * Remove exactly what BookHold counted for  task (when it parks or
+   * ends), so load_ cannot drift when the prediction changed meanwhile.
+   * @param task the task leaving the worker
+   */
+  void UnbookHold(Task *task);
+
   void ReleaseReservation(double us) {
     long long amt = ReservationUs(us);
     if (amt <= 0) {

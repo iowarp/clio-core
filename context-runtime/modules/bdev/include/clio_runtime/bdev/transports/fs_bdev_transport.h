@@ -14,8 +14,13 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace clio::run::bdev {
 
@@ -40,6 +45,12 @@ class FsBdevTransport : public BdevTransport {
   void Destroy() override;
 
   bool AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) override;
+  bool AllocateBlocksDeferred(size_t size, int worker_id,
+                              std::vector<Block>& blocks,
+                              clio::run::u64* need) override;
+  bool EnsureBacked(clio::run::u64 end) override { return EnsureFileBacked(end); }
+  void FinishAllocate(bool backed_ok, int worker_id,
+                      std::vector<Block>& blocks) override;
   void FreeBlocks(int worker_id, const std::vector<Block>& blocks) override;
 
   clio::run::TaskResume WriteBlocks(ctp::ipc::FullPtr<WriteTask> task) override;
@@ -74,6 +85,14 @@ class FsBdevTransport : public BdevTransport {
   static constexpr int kAllocLogSyncPeriodMs = 50;
   std::thread sync_thread_;
   std::mutex sync_mu_;
+  /// Sync group commit: tickets issued, the last ticket a finished
+  /// fdatasync covered, and the last ticket covered by a successful one.
+  std::mutex gc_mu_;
+  std::condition_variable gc_cv_;
+  clio::run::u64 gc_next_ = 0;
+  clio::run::u64 gc_done_ = 0;
+  clio::run::u64 gc_ok_through_ = 0;
+  bool gc_running_ = false;
   std::condition_variable sync_cv_;
   bool sync_stop_ = false;
 
@@ -83,6 +102,46 @@ class FsBdevTransport : public BdevTransport {
 
   /** Stop and join the sync thread (idempotent). */
   void StopAllocLogSync();
+  /** O_DIRECT alignment: 4 KiB, or the page size when larger (Lustre on a
+   *  64 KiB-page kernel rejects 4 KiB-aligned direct writes with EINVAL). */
+  static size_t DirectAlign() { return ctp::DirectIoAlign(); }
+  /** Frees a DirectAlign()-aligned bounce buffer. */
+  struct AlignedFree {
+    void operator()(char *p) const {
+      ::operator delete[](p, std::align_val_t(DirectAlign()));
+    }
+  };
+  using AlignedBuf = std::unique_ptr<char[], AlignedFree>;
+  /** Writes at least this big are bounced to reach the O_DIRECT fd. */
+  static constexpr size_t kBounceMin = 64 * 1024;
+  /** Recycled bounce buffers kept (larger ones are freed at once). */
+  static constexpr size_t kBouncePoolMax = 32;
+  static constexpr size_t kBounceKeepMax = 4 * 1024 * 1024;
+  std::mutex bounce_mu_;
+  std::vector<std::pair<size_t, AlignedBuf>> bounce_pool_;
+
+  /**
+   * Whether a write should be copied through an aligned bounce buffer: the
+   * AIO backends send a write to the O_DIRECT fd only when the buffer, the
+   * length and the offset are all DirectAlign()-aligned, and task data in shared
+   * memory is not page-aligned. Without the bounce, every data write went
+   * through the page cache and fsync then wrote it all back (~550 MB/s on a
+   * device that takes 2.2 GB/s direct).
+   * @param buf source buffer
+   * @param size write length
+   * @param offset file offset
+   * @return true when only the buffer is misaligned
+   */
+  static bool WantsBounce(const void *buf, size_t size, clio::run::u64 offset) {
+    return size >= kBounceMin && size % DirectAlign() == 0 &&
+           offset % DirectAlign() == 0 &&
+           reinterpret_cast<uintptr_t>(buf) % DirectAlign() != 0;
+  }
+  /** @return a DirectAlign()-aligned buffer of at least `size` bytes (pooled). */
+  AlignedBuf TakeBounce(size_t size);
+  /** Return a bounce buffer of `size` bytes to the pool. */
+  void GiveBounce(AlignedBuf buf, size_t size);
+
   StandardBlockAllocator allocator_;
   std::vector<WorkerIOContext> io_contexts_;
   std::string file_path_;

@@ -57,6 +57,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -228,7 +229,32 @@ int main(int /*argc*/, char* /*argv*/[]) {
              expected_size);
         exit_code = 1;
       } else {
-        HLOG(kSuccess, "S3 object bytes verified in CTE");
+        HLOG(kSuccess, "S3 object size verified in CTE");
+      }
+
+      // And the bytes themselves: read every 1 MiB chunk back and compare it
+      // with the seeded pattern. With CAE_S3_STREAMS > 1 the chunks arrive
+      // from concurrent ranged GETs, so a chunk stored under the wrong index
+      // keeps the size right and only shows up here.
+      constexpr size_t kChunk = 1024 * 1024;
+      for (size_t idx = 0; idx * kChunk < kObjectSize && exit_code == 0;
+           ++idx) {
+        const size_t n = std::min(kChunk, kObjectSize - idx * kChunk);
+        auto buf = CLIO_IPC->AllocateBuffer(n);
+        auto get = cte_client->AsyncGetBlob(
+            tag_id, "chunk_" + std::to_string(idx), 0, n, 0,
+            buf.shm_.template Cast<void>());
+        get.Wait();
+        if (get->GetReturnCode() != 0 ||
+            std::memcmp(buf.ptr_, data.data() + idx * kChunk, n) != 0) {
+          HLOG(kError, "chunk_{} does not match the S3 object (rc={})", idx,
+               get->GetReturnCode());
+          exit_code = 1;
+        }
+        CLIO_IPC->FreeBuffer(buf);
+      }
+      if (exit_code == 0) {
+        HLOG(kSuccess, "S3 object content verified chunk by chunk");
       }
     }
   } catch (const std::exception& e) {

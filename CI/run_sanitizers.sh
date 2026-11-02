@@ -143,6 +143,17 @@ sanitizer_gate_status() {
     [ "${MODE}" = "msan" ] && return 0
     if grep -qE "Defects: [1-9]" "${CTEST_LOG}" 2>/dev/null; then
         print_warning "${MODE}: tests reported sanitizer defects"
+        # The reports themselves are only in the MemoryChecker files (and the
+        # job summary, which the API does not expose): print each one with
+        # its stack, so the log alone says what the defect was.
+        local MEMCHECK_DIR="${BUILD_DIR}/Testing/Temporary"
+        local f
+        for f in "${MEMCHECK_DIR}"/MemoryChecker.*.log; do
+            [ -s "${f}" ] || continue
+            grep -qE "ERROR: [A-Za-z]+Sanitizer|runtime error:" "${f}" || continue
+            echo "==== sanitizer report: ${f}"
+            grep -E -A40 "ERROR: [A-Za-z]+Sanitizer|runtime error:" "${f}" | head -80
+        done
         return 1
     fi
     if grep -qE "[0-9]+% tests passed, [1-9][0-9]* tests? failed" \

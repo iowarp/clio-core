@@ -120,7 +120,7 @@ jobs:
             {"phase":"fuse","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.fuse","flag":"fuse","apt":"libfuse3-dev fuse3","pkgconfig":"/usr/lib/x86_64-linux-gnu/pkgconfig","cmake_args":"-DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON -DCLIO_CTE_ENABLE_FILESYSTEM=ON","labels":"fuse|adapter","exclude_labels":"docker|copy_workspace|integration","extract":"*/context-transfer-engine/adapter/* */context-transfer-engine/filesystem/*","cdash_scope":"context-transfer-engine/adapter"},
             {"phase":"cae","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.cae","flag":"cae","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_CAE=ON","labels":"cae","extract":"*/context-assimilation-engine/*","cdash_scope":"context-assimilation-engine"},
             {"phase":"cee","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.cee","flag":"cee","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_CEE=ON","labels":"cee","extract":"*/context-exploration-engine/*","cdash_scope":"context-exploration-engine"},
-            {"phase":"prediction","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.prediction","flag":"prediction","apt":"python3-venv","cmake_args":"","labels":"prediction_e2e|bdev","extract":"*/hw_failure_monitor/* */context-transport-primitives/src/system_info.cc */context-runtime/modules/bdev/*","cdash_scope":"context-runtime/modules/bdev context-transport-primitives/src/system_info.cc"}
+            {"phase":"prediction","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.prediction","flag":"prediction","apt":"python3-venv","cmake_args":"","labels":"prediction_e2e|bdev","extract":"*/hw_failure_monitor/* */context-transport-primitives/introspect/src/system_info.cc */context-runtime/modules/bdev/*","cdash_scope":"context-runtime/modules/bdev context-transport-primitives/introspect/src/system_info.cc"}
           ]
           JSON
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -192,6 +192,54 @@ jobs:
           fi
           conda activate iowarp
           ./CI/calculate_coverage.sh --build --run-ctest --clean --site ${{ matrix.site }}
+      - name: Require real Python conditional-write and capacity coverage
+        if: matrix.phase == 'unit' && matrix.arch == 'amd64'
+        # These daemon/restart fixtures are excluded from the broad CDash
+        # UNTIL_PASS sweep. Each must be discovered once and run once, without
+        # retry; missing, skipped or failed execution is a failure.
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda &>/dev/null; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+          python3 -m pip install psutil
+          python3 - <<'PY'
+          from collections import Counter
+          import json
+          from pathlib import Path
+          import subprocess
+          import xml.etree.ElementTree as ET
+
+          for test, report in (("python_conditional_put_test", "conditional-python.xml"),
+                               ("python_capacity_test", "capacity-python.xml")):
+              command = ["ctest", "--test-dir", "build", "-R", f"^{test}$"]
+              discovered = json.loads(subprocess.check_output(command + ["--show-only=json-v1"], text=True))
+              # CTest adds the required cleanup fixture around the selected test.
+              expected_names = Counter({
+                  "cr_pre_test_cleanup": 1,
+                  test: 1,
+                  "cr_post_test_cleanup": 1,
+              })
+              discovered_names = Counter(t["name"] for t in discovered["tests"])
+              print(f"Focused {test}: {dict(discovered_names)}", flush=True)
+              if discovered_names != expected_names:
+                  raise SystemExit(f"{test} must be registered exactly once with its cleanup fixture")
+              junit = Path("build", report).resolve()
+              subprocess.run(command + ["--output-on-failure", "--no-tests=error", "--output-junit", str(junit)], check=True)
+              results = list(ET.parse(junit).getroot().iter("testcase"))
+              result_names = Counter(result.attrib["name"] for result in results)
+              unsuccessful = any(result.find(tag) is not None for result in results for tag in ("skipped", "failure", "error"))
+              if result_names != expected_names or unsuccessful:
+                  raise SystemExit(f"{test} and its cleanup fixture must execute once and pass; absent/skipped/failed is failure")
+              print(f"Verified: {test} executed once and passed against the real runtime")
+          PY
+          # Refresh the report (native counters after healthy client finalizers
+          # ran) without rebuilding, clearing counters, or rerunning any tests.
+          ./CI/calculate_coverage.sh
       - name: Require real Python capacity coverage
         if: matrix.phase == 'unit' && matrix.arch == 'amd64'
         # This daemon/restart fixture executes exactly once, outside the broad

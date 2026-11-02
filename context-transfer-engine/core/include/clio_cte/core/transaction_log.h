@@ -118,6 +118,16 @@ enum class TxnType : uint8_t {
    * records land in -- see ApplyWalSetTagIdentity.
    */
   kSetTagIdentity = 9,
+  /**
+   * Set one key of a tag's xattr section (TagXattrTask). The record holds
+   * the key's full value, so replay is an upsert.
+   */
+  kSetTagXattr = 10,
+  /**
+   * Remove one key of a tag's xattr section, or the whole section when the
+   * key is empty.
+   */
+  kDelTagXattr = 11,
 };
 
 /** A single block entry within TxnExtendBlob */
@@ -219,6 +229,15 @@ struct TxnSetTagIdentity {
   clio::run::u32 tag_minor_;
   std::string canonical_name_;
   std::vector<std::string> aliases_;
+};
+
+/** Payload: set or remove one key of a tag's xattr section (value unused
+ *  for kDelTagXattr; an empty key there removes every key). */
+struct TxnTagXattr {
+  clio::run::u32 tag_major_;
+  clio::run::u32 tag_minor_;
+  std::string key_;
+  std::string value_;
 };
 
 /**
@@ -411,6 +430,16 @@ class TransactionLog {
     WriteU32(buffer_, txn.tag_minor_);
     WriteString(buffer_, txn.canonical_name_);
     WriteStringVector(buffer_, txn.aliases_);
+    WriteRecord(type, buffer_);
+  }
+
+  void Log(TxnType type, const TxnTagXattr &txn) {
+    std::lock_guard<std::mutex> lk(mu_);
+    buffer_.clear();
+    WriteU32(buffer_, txn.tag_major_);
+    WriteU32(buffer_, txn.tag_minor_);
+    WriteString(buffer_, txn.key_);
+    WriteString(buffer_, txn.value_);
     WriteRecord(type, buffer_);
   }
 
@@ -724,6 +753,21 @@ class TransactionLog {
     if (off < data.size()) {
       txn.aliases_ = ReadStringVector(data, off);
     }
+    return txn;
+  }
+
+  /**
+   * Decode a kSetTagXattr / kDelTagXattr payload.
+   * @param data record payload
+   * @return the decoded record (throws std::out_of_range if corrupt)
+   */
+  static TxnTagXattr DeserializeTagXattr(const std::vector<char> &data) {
+    TxnTagXattr txn;
+    size_t off = 0;
+    txn.tag_major_ = ReadU32(data, off);
+    txn.tag_minor_ = ReadU32(data, off);
+    txn.key_ = ReadString(data, off);
+    txn.value_ = ReadString(data, off);
     return txn;
   }
 
