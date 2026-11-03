@@ -80,7 +80,7 @@ jobs:
         include:
           - runner: ubuntu-latest
             arch: x86_64
-            cibw_build: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64"
+            cibw_build: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64 cp315-manylinux_x86_64"
             cibw_image: manylinux_2_28
             cibw_environment: >-
               CMAKE_PREFIX_PATH=/usr/local
@@ -89,7 +89,7 @@ jobs:
               CXXFLAGS=-march=x86-64
           - runner: ubuntu-24.04-arm
             arch: aarch64
-            cibw_build: "cp310-manylinux_aarch64 cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64 cp314-manylinux_aarch64"
+            cibw_build: "cp310-manylinux_aarch64 cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64 cp314-manylinux_aarch64 cp315-manylinux_aarch64"
             cibw_image: manylinux_2_28
             cibw_environment: >-
               CMAKE_PREFIX_PATH=/usr/local
@@ -169,7 +169,7 @@ jobs:
       fail-fast: false
       matrix:
         variant: [cuda12, rocm6, sycl]
-        py: [cp310, cp311, cp312, cp313, cp314]
+        py: [cp310, cp311, cp312, cp313, cp314, cp315]
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -248,7 +248,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        abi: [cp310, cp311, cp312, cp313, cp314]
+        abi: [cp310, cp311, cp312, cp313, cp314, cp315]
 
     steps:
     - name: Checkout repository
@@ -370,7 +370,7 @@ jobs:
           # match so delocate accepts the bundle.
           - runner: macos-15
             arch: arm64
-            cibw_build: "cp310-macosx_arm64 cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64 cp314-macosx_arm64"
+            cibw_build: "cp310-macosx_arm64 cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64 cp314-macosx_arm64 cp315-macosx_arm64"
             brew_prefix: /opt/homebrew
             macosx_deployment_target: '15.0'
 
@@ -782,7 +782,7 @@ jobs:
             python: '3.12'
           - runner: macos-15
             arch: arm64
-            python: '3.14'
+            python: '3.15'
 
     steps:
     - name: Check out wheel checks and capacity regression
@@ -896,8 +896,8 @@ jobs:
         include:
           - python: '3.12'
             abi: cp312
-          - python: '3.14'
-            abi: cp314
+          - python: '3.15'
+            abi: cp315
 
     steps:
     # FIRST step on purpose: actions/checkout cleans the workspace, so running
