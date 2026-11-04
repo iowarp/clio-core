@@ -427,6 +427,33 @@ if(NOT WIN32)
   add_test(NAME cae_http_auth COMMAND cae_http_auth_test)
   set_tests_properties(cae_http_auth PROPERTIES TIMEOUT 60 LABELS "cae;http")
   install(TARGETS cae_http_auth_test DESTINATION bin)
+
+  # The download engine, HttpFileAssimilator::Run and the factory's http(s)
+  # dispatch end to end against an HTTP server on 127.0.0.1 inside the test,
+  # through the real curl. No runtime is started and nothing leaves the host.
+  add_executable(cae_http_fetch_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/http_fetch/test_http_fetch.cc
+  )
+  target_include_directories(cae_http_fetch_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test         # simple_test.h
+  )
+  target_link_libraries(cae_http_fetch_test PRIVATE
+    clio_cae_core_runtime
+    clio_cte_core_client
+    clio::run::cxx
+    Threads::Threads
+  )
+  set_target_properties(cae_http_fetch_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+  )
+  add_test(NAME cae_http_fetch COMMAND cae_http_fetch_test)
+  set_tests_properties(cae_http_fetch PROPERTIES
+    TIMEOUT 120
+    LABELS "cae;http;msan_skip"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+  )
+  install(TARGETS cae_http_fetch_test DESTINATION bin)
 endif()
 
 #------------------------------------------------------------------------------
