@@ -405,7 +405,9 @@ HttpFetchResult HttpFetch(const HttpFetchRequest &req,
     r.error = "probe failed: " + pr.error;
     return r;
   }
-  if (pr.status >= 400 || pr.status == 0) {
+  // 416 to "bytes=0-0" with "bytes */0" is an empty resource, not an error.
+  const bool empty_resource = pr.status == 416 && pr.ranges && pr.total == 0;
+  if ((pr.status >= 400 && !empty_resource) || pr.status == 0) {
     r.error = "HTTP " + std::to_string(pr.status) +
               (pr.status == 401 || pr.status == 403 || pr.status == 400
                    ? " (the server wants credentials or request parameters; "
@@ -510,11 +512,14 @@ HttpFetchResult HttpFetch(const HttpFetchRequest &req,
         have += got;
         // A ranged part is done once all its bytes are written; a whole-body
         // GET once curl exits cleanly with the advertised length (if any).
+        // -2 (the server ignored Range) wrote bytes from the wrong offset, so
+        // the part is never complete then, and a retry would get the same.
         const bool complete =
-            ranged ? have == pt.len
+            ranged ? have == pt.len && code != -2
                    : code == 0 && (pt.len == 0 || have == pt.len);
         if (complete) break;
-        if (code == -3 || attempt >= cfg.part_retries) {  // -3: local write error
+        // -3: local write error, -2: server ignored Range. Neither is retried.
+        if (code == -3 || code == -2 || attempt >= cfg.part_retries) {
           std::lock_guard<std::mutex> g(emu);
           if (first_error.empty()) {
             first_error = "bytes " + std::to_string(pt.src_off) + "+" +
