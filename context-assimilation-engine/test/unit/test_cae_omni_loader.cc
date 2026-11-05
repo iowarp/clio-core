@@ -46,6 +46,7 @@
 #include <clio_cae/core/omni_run.h>
 
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -544,6 +545,33 @@ TEST_CASE("RunScript - start failures and signals are reported",
               true);
   REQUIRE(RunScript(echo, {"a b", "c"}, &err) == 0);
   REQUIRE(err.empty());
+}
+
+TEST_CASE("RunScript - an exit status that cannot be collected is a failure",
+          "[cae][omni][run][error]") {
+  // A process that ignores SIGCHLD has its children reaped by the kernel, so
+  // waitpid fails with ECHILD. The script may have failed; it must not count
+  // as a success.
+  struct IgnoreSigchld {
+    struct sigaction old {};
+    IgnoreSigchld() {
+      struct sigaction ign {};
+      ign.sa_handler = SIG_IGN;
+      sigemptyset(&ign.sa_mask);
+      sigaction(SIGCHLD, &ign, &old);
+    }
+    ~IgnoreSigchld() { sigaction(SIGCHLD, &old, nullptr); }
+  };
+  TempDir d;
+  std::string script = d.Write("ok.sh", "#!/bin/sh\nexit 0\n", true);
+  std::string err;
+  int code = 0;
+  {
+    IgnoreSigchld guard;
+    code = RunScript(script, {}, &err);
+  }
+  REQUIRE(code == -1);
+  REQUIRE(err.find("waitpid failed") != std::string::npos);
 }
 #endif  // _WIN32
 
