@@ -18,9 +18,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -263,6 +265,156 @@ uint64_t FetchInto(const HttpFetchConfig &cfg, const std::string &curl_cfg,
   return got;
 }
 
+/**
+ * A private temporary file holding `text`, removed when this object goes out
+ * of scope. mkstemp creates it 0600, so other users cannot read the secrets a
+ * wgetrc holds.
+ */
+class PrivateTempFile {
+ public:
+  /**
+   * @param text bytes to write
+   * @param err  set on failure; path() is then ""
+   */
+  PrivateTempFile(const std::string &text, std::string *err) {
+    const char *tmp = std::getenv("TMPDIR");
+    std::string tmpl = std::string(tmp != nullptr && *tmp != '\0' ? tmp : "/tmp") +
+                       "/cae_http_XXXXXX";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back('\0');
+    int fd = ::mkstemp(buf.data());
+    if (fd < 0) {
+      *err = "mkstemp " + tmpl + ": " + std::strerror(errno);
+      return;
+    }
+    path_ = buf.data();
+    size_t off = 0;
+    while (off < text.size()) {
+      ssize_t n = ::write(fd, text.data() + off, text.size() - off);
+      if (n < 0 && errno == EINTR) continue;
+      if (n < 0) {
+        *err = "write " + path_ + ": " + std::strerror(errno);
+        break;
+      }
+      off += static_cast<size_t>(n);
+    }
+    ::close(fd);
+    if (off < text.size()) {
+      ::unlink(path_.c_str());
+      path_.clear();
+    }
+  }
+  ~PrivateTempFile() {
+    if (!path_.empty()) ::unlink(path_.c_str());
+  }
+  PrivateTempFile(const PrivateTempFile &) = delete;
+  PrivateTempFile &operator=(const PrivateTempFile &) = delete;
+
+  /** Path of the file, or "" if it could not be created. */
+  const std::string &path() const { return path_; }
+
+ private:
+  std::string path_;
+};
+
+/** What wget's exit status means (wget(1), EXIT STATUS). */
+std::string WgetExitText(int code) {
+  switch (code) {
+    case 0: return "ok";
+    case 3: return "wget 3: file I/O error";
+    case 4: return "wget 4: network failure";
+    case 5: return "wget 5: TLS verification failed";
+    case 6: return "wget 6: username/password authentication failed";
+    case 8: return "wget 8: the server answered with an error";
+    default: return "wget exit " + std::to_string(code);
+  }
+}
+
+/** The private wgetrc and URL list one wget run reads. */
+struct WgetFiles {
+  std::unique_ptr<PrivateTempFile> rc;
+  std::unique_ptr<PrivateTempFile> urls;
+};
+
+/**
+ * Write the wgetrc and the one-line URL list for `auth`.
+ *
+ * @return true when both files exist; otherwise false with *err set
+ */
+bool MakeWgetFiles(const HttpAuth &auth, WgetFiles *f, std::string *err) {
+  std::string rc = http_detail::WgetConfig(auth, err);
+  if (rc.empty()) return false;
+  f->rc = std::make_unique<PrivateTempFile>(rc, err);
+  if (f->rc->path().empty()) return false;
+  f->urls = std::make_unique<PrivateTempFile>(auth.url + "\n", err);
+  return !f->urls->path().empty();
+}
+
+/** Run wget with `args` and the private files; returns stdout and exit code. */
+int RunWget(const HttpFetchConfig &cfg, const WgetFiles &f,
+            std::vector<std::string> args, std::string *out,
+            std::string *err) {
+  // --config replaces ~/.wgetrc; -i reads the URL from the private file.
+  args.insert(args.begin(), "--config=" + f.rc->path());
+  args.push_back("-i");
+  args.push_back(f.urls->path());
+  CurlProc p;
+  if (!SpawnCurl(cfg.wget, args, "", &p, err)) return -1;
+  char buf[8192];
+  for (;;) {
+    ssize_t n = ::read(p.out, buf, sizeof(buf));
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) break;
+    if (out) out->append(buf, static_cast<size_t>(n));
+  }
+  return ReapCurl(&p);
+}
+
+/** HttpProbeUrl for client = wget: a HEAD request (--spider) with -S. */
+HttpProbe WgetProbe(const HttpAuth &auth, const HttpFetchConfig &cfg) {
+  HttpProbe p;
+  WgetFiles f;
+  std::string err, dump;
+  if (!MakeWgetFiles(auth, &f, &err)) {
+    p.error = err;
+    return p;
+  }
+  // -o /dev/stdout: wget writes its log (with -S, the response headers) there.
+  int code = RunWget(cfg, f,
+                     {"--spider", "-S", "-o", "/dev/stdout", "--tries=1",
+                      "--timeout=30"},
+                     &dump, &err);
+  if (code < 0) {
+    p.error = err;
+    return p;
+  }
+  p = http_detail::ParseProbeHeaders(dump);
+  p.ranges = false;  // fetched in one stream
+  if (code != 0 && p.status == 0) p.error = WgetExitText(code);
+  return p;
+}
+
+/**
+ * Download the whole body with wget into `part_path`.
+ *
+ * @return "" on success, else why it failed
+ */
+std::string WgetFetchInto(const HttpAuth &auth, const HttpFetchConfig &cfg,
+                          const std::string &part_path) {
+  WgetFiles f;
+  std::string err;
+  if (!MakeWgetFiles(auth, &f, &err)) return err;
+  int code = RunWget(cfg, f,
+                     {"-q", "-O", part_path,
+                      "--tries=" + std::to_string(cfg.part_retries + 1),
+                      "--waitretry=" + std::to_string(std::max(1, cfg.backoff_ms / 1000)),
+                      "--retry-connrefused", "--timeout=30",
+                      "--read-timeout=120"},
+                     nullptr, &err);
+  if (code < 0) return err;
+  return code == 0 ? "" : WgetExitText(code);
+}
+
 }  // namespace
 
 HttpFetchConfig HttpFetchConfig::FromEnv() {
@@ -276,6 +428,8 @@ HttpFetchConfig HttpFetchConfig::FromEnv() {
   c.progress_s = static_cast<int>(EnvLong("CAE_HTTP_PROGRESS_S", 30, 0, 3600));
   const char *curl = std::getenv("CAE_HTTP_CURL");
   if (curl != nullptr && *curl != '\0') c.curl = curl;
+  const char *wget = std::getenv("CAE_HTTP_WGET");
+  if (wget != nullptr && *wget != '\0') c.wget = wget;
   return c;
 }
 
@@ -301,6 +455,37 @@ std::string CurlConfig(const HttpAuth &auth, std::string *err) {
   return c;
 }
 
+std::string WgetConfig(const HttpAuth &auth, std::string *err) {
+  // A wgetrc value runs to the end of its line and loses surrounding blanks.
+  auto bad = [](const std::string &v) {
+    return v.find_first_of("\r\n") != std::string::npos ||
+           (!v.empty() && (std::isspace(static_cast<unsigned char>(v.front())) ||
+                           std::isspace(static_cast<unsigned char>(v.back()))));
+  };
+  std::string c = "# cae http request\n";
+  for (const auto &h : auth.headers) {
+    if (bad(h)) {
+      *err = "a header cannot be passed to wget (line break or outer blank)";
+      return "";
+    }
+    c += "header = " + h + "\n";
+  }
+  if (!auth.userpwd.empty()) {
+    size_t colon = auth.userpwd.find(':');
+    std::string user = auth.userpwd.substr(0, colon);
+    std::string pass = colon == std::string::npos ? "" : auth.userpwd.substr(colon + 1);
+    if (bad(user) || bad(pass)) {
+      *err = "user or password cannot be passed to wget (line break or outer "
+             "blank)";
+      return "";
+    }
+    c += "http_user = " + user + "\n";
+    if (!pass.empty()) c += "http_password = " + pass + "\n";
+    c += "auth_no_challenge = off\n";
+  }
+  return c;
+}
+
 HttpProbe ParseProbeHeaders(const std::string &dump) {
   HttpProbe p;
   std::istringstream in(dump);
@@ -308,7 +493,7 @@ HttpProbe ParseProbeHeaders(const std::string &dump) {
   int64_t clen = -1;
   std::string crange;
   while (std::getline(in, line)) {
-    if (!line.empty() && line.back() == '\r') line.pop_back();
+    line = detail::Trim(line);  // wget -S indents; also drops the '\r'
     if (line.compare(0, 5, "HTTP/") == 0) {  // a new response (redirects)
       std::istringstream sl(line);
       std::string ver;
@@ -348,6 +533,7 @@ HttpProbe ParseProbeHeaders(const std::string &dump) {
 }  // namespace http_detail
 
 HttpProbe HttpProbeUrl(const HttpAuth &auth, const HttpFetchConfig &cfg) {
+  if (auth.client == "wget") return WgetProbe(auth, cfg);
   HttpProbe p;
   std::string err;
   std::string conf = http_detail::CurlConfig(auth, &err);
@@ -381,6 +567,49 @@ HttpProbe HttpProbeUrl(const HttpAuth &auth, const HttpFetchConfig &cfg) {
   return p;
 }
 
+namespace {
+
+/**
+ * The client = wget path of HttpFetch, after the probe and the skip check:
+ * one wget run into "<dst>.cae-part", renamed to dst once complete.
+ *
+ * @param req  the download
+ * @param cfg  tuning (wget executable, retries)
+ * @param want bytes expected (meaningful when r->probe.total >= 0)
+ * @param r    result to fill: ok, bytes, error
+ */
+void FetchWithWget(const HttpFetchRequest &req, const HttpFetchConfig &cfg,
+                   uint64_t want, HttpFetchResult *r) {
+  std::string err;
+  size_t slash = req.dst_path.rfind('/');
+  if (slash != std::string::npos && !MkdirP(req.dst_path.substr(0, slash), &err)) {
+    r->error = err;
+    return;
+  }
+  const std::string part_path = req.dst_path + ".cae-part";
+  r->parts = 1;
+  std::string why = WgetFetchInto(req.auth, cfg, part_path);
+  struct stat st;
+  const bool have = ::stat(part_path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+  r->bytes = have ? static_cast<uint64_t>(st.st_size) : 0;
+  if (why.empty() && !have) why = "wget wrote no file";
+  if (why.empty() && r->probe.total >= 0 && r->bytes != want) {
+    why = "got " + std::to_string(r->bytes) + " bytes, expected " +
+          std::to_string(want);
+  }
+  if (why.empty() && ::rename(part_path.c_str(), req.dst_path.c_str()) != 0) {
+    why = "rename to " + req.dst_path + ": " + std::strerror(errno);
+  }
+  if (!why.empty()) {
+    ::unlink(part_path.c_str());
+    r->error = why;
+    return;
+  }
+  r->ok = true;
+}
+
+}  // namespace
+
 HttpFetchResult HttpFetch(const HttpFetchRequest &req,
                           const HttpFetchConfig &cfg, const HttpLog &log) {
   HttpFetchResult r;
@@ -395,6 +624,11 @@ HttpFetchResult HttpFetch(const HttpFetchRequest &req,
   const std::string curl_cfg = http_detail::CurlConfig(req.auth, &err);
   if (curl_cfg.empty()) {
     r.error = err;
+    return r;
+  }
+
+  if (req.auth.client == "wget" && (req.range_off > 0 || req.range_size > 0)) {
+    r.error = "range_off/range_size are not supported with client = wget";
     return r;
   }
 
@@ -447,6 +681,13 @@ HttpFetchResult HttpFetch(const HttpFetchRequest &req,
     r.ok = true;
     r.skipped = true;
     r.bytes = want;
+    return r;
+  }
+
+  if (req.auth.client == "wget") {
+    say("GET " + Mb(want) + " in one stream with wget");
+    FetchWithWget(req, cfg, want, &r);
+    r.seconds = std::chrono::duration<double>(Clock::now() - t0).count();
     return r;
   }
 

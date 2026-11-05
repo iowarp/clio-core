@@ -30,6 +30,17 @@
 //   user = alice                          # HTTP basic auth
 //   password = ${EXAMPLE_PASSWORD}
 //
+//   [https://physionet.org/files/]
+//   client = wget                         # download with wget, not curl
+//
+// client picks the program that does the HTTP work: curl (default; parallel
+// ranged GETs) or wget (one stream). Some sites accept a password only from
+// clients they list by User-Agent; PhysioNet, for one, allows HTTP basic auth
+// only from Wget/, libwfdb/ and PhysioNet-Python-Client/ and answers 403 to
+// curl. client = wget runs the real wget there, so the site sees the client it
+// expects, with the same credentials and the same guarantees (nothing secret on
+// the command line, an all-or-nothing destination file).
+//
 // Every matching section applies, host sections first and then prefixes from
 // shortest to longest, so a more specific section overrides a key of a broader
 // one. ${VAR} in a value is replaced by that environment variable; an unset
@@ -65,6 +76,7 @@ struct HttpAuth {
   std::string userpwd;               ///< "user:password" for basic auth, or ""
   std::vector<std::string> sections; ///< config sections that matched
   size_t num_query = 0;              ///< query.* params appended to url
+  std::string client = "curl";       ///< program that downloads: curl or wget
 };
 
 /** Outcome of resolution: ok, or an error naming the section and key. */
@@ -236,6 +248,7 @@ inline HttpAuthResult ResolveHttpAuthFrom(const std::string &url,
   std::string query;
   std::string user, password;
   std::string bearer;
+  std::string client = "curl";
   std::vector<std::pair<std::string, std::string>> headers;  // name -> value
   for (const std::string &key : order) {
     const auto &vs = keys[key];
@@ -259,10 +272,17 @@ inline HttpAuthResult ResolveHttpAuthFrom(const std::string &url,
       user = val;
     } else if (key == "password") {
       password = val;
+    } else if (key == "client") {
+      client = http_detail::Lower(val);
+      if (client != "curl" && client != "wget") {
+        r.error = "[" + vs.second + "] client: '" + val +
+                  "' is not curl or wget";
+        return r;
+      }
     } else {
       r.error = "[" + vs.second + "] unknown key '" + key +
                 "' (expected query.<name>, header.<Name>, bearer_token, user, "
-                "password)";
+                "password, client)";
       return r;
     }
   }
@@ -285,6 +305,7 @@ inline HttpAuthResult ResolveHttpAuthFrom(const std::string &url,
   }
   for (const auto &h : headers) r.auth.headers.push_back(h.first + ": " + h.second);
   if (!user.empty()) r.auth.userpwd = user + ":" + password;
+  r.auth.client = client;
 
   r.auth.url = url;
   if (!query.empty()) {

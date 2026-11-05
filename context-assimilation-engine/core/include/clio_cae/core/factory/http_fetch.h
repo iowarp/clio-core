@@ -18,6 +18,12 @@
 // input (curl -K -), never on its command line, so `ps` on a shared node does
 // not show them.
 //
+// A site whose config section says client = wget (http_auth.h) is fetched by
+// wget instead, in one stream. wget gets its credentials and headers from a
+// private (0600) temporary wgetrc (--config) and the URL from a private
+// temporary file (-i), both removed when it exits; again nothing secret is on
+// its command line.
+//
 // The engine has no runtime dependencies, so cae_http_tool and the tests can
 // use it as is.
 
@@ -39,6 +45,7 @@ struct HttpFetchConfig {
   bool overwrite = false;              ///< CAE_HTTP_OVERWRITE=1: no skip
   int progress_s = 30;                 ///< CAE_HTTP_PROGRESS_S: 0 = quiet
   std::string curl = "curl";           ///< CAE_HTTP_CURL: curl executable
+  std::string wget = "wget";           ///< CAE_HTTP_WGET: wget executable
 
   static HttpFetchConfig FromEnv();
 };
@@ -89,7 +96,22 @@ namespace http_detail {
 /** curl -K config lines for this request (url, headers, user), or "" + *err. */
 std::string CurlConfig(const HttpAuth &auth, std::string *err);
 
-/** Parse the header dump (curl -D -) of a ranged probe. */
+/**
+ * wgetrc lines for this request (headers, user, password), or "" + *err.
+ *
+ * @param auth resolved request; userpwd is split at its first ':'
+ * @param err  set when a value cannot be expressed in a wgetrc (line breaks,
+ *             or leading/trailing blanks, which wget would strip)
+ * @return the wgetrc text; "" with *err set on failure. A request with no
+ *         credentials or headers yields a comment line, never "".
+ */
+std::string WgetConfig(const HttpAuth &auth, std::string *err);
+
+/**
+ * Parse the header dump (curl -D -, or wget -S, whose lines are indented) of
+ * a probe. The last response wins, so redirects and a 401 challenge before
+ * the authenticated retry are skipped.
+ */
 HttpProbe ParseProbeHeaders(const std::string &dump);
 
 }  // namespace http_detail

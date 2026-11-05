@@ -19,6 +19,7 @@
 #include <clio_cae/core/factory/http_file_assimilator.h>
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -30,6 +31,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -68,6 +70,8 @@ std::string Pattern(size_t n) {
  *   /basic.bin     401 unless basic auth u:p
  *   /hdr.bin       401 unless "X-Key: k1"
  *   /slow.bin      /data.bin, each data GET waits 1.2 s first
+ *   /wgetonly.bin  PhysioNet's rule: 403 unless the User-Agent starts with
+ *                  "Wget/"; then 401 + WWW-Authenticate until basic auth u:p
  */
 class TestServer {
  public:
@@ -164,6 +168,7 @@ class TestServer {
     const std::string range = Header(req, "range");
     const bool probe = range == "bytes=0-0";
     const std::string auth = Header(req, "authorization");
+    const bool head = method == "HEAD";
 
     std::string ctype = "application/octet-stream";
     const std::string* body = &data_;
@@ -199,6 +204,17 @@ class TestServer {
       liar = !probe;
     } else if (path == "/slow.bin") {
       if (!probe) std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    } else if (path == "/wgetonly.bin" &&
+               Header(req, "user-agent").compare(0, 5, "Wget/") != 0) {
+      Reply(fd, "403 Forbidden",
+            "Content-Type: text/html; charset=utf-8\r\nContent-Length: 0\r\n", "", 0);
+      ::close(fd);
+      return;
+    } else if (path == "/wgetonly.bin" && auth != "Basic dTpw") {
+      Reply(fd, "401 Unauthorized",
+            "WWW-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\n", "", 0);
+      ::close(fd);
+      return;
     } else if ((path == "/bearer.bin" && auth != "Bearer tok") ||
                (path == "/basic.bin" && auth != "Basic dTpw") ||
                (path == "/hdr.bin" && Header(req, "x-key") != "k1")) {
@@ -206,7 +222,8 @@ class TestServer {
       ::close(fd);
       return;
     } else if (path != "/data.bin" && path != "/bearer.bin" &&
-               path != "/basic.bin" && path != "/hdr.bin") {
+               path != "/basic.bin" && path != "/hdr.bin" &&
+               path != "/wgetonly.bin") {
       Reply(fd, "404 Not Found", "Content-Length: 0\r\n", "", 0);
       ::close(fd);
       return;
@@ -237,7 +254,7 @@ class TestServer {
             part, half ? part.size() / 2 : part.size());
     } else {
       if (length) hdrs += "Content-Length: " + std::to_string(total) + "\r\n";
-      Reply(fd, "200 OK", hdrs, *body, total);
+      Reply(fd, "200 OK", hdrs, *body, head ? 0 : total);
     }
     ::close(fd);
   }
@@ -597,6 +614,7 @@ TEST_CASE("http_fetch_config_from_env", "[http_fetch]") {
   ::setenv("CAE_HTTP_OVERWRITE", "1", 1);
   ::setenv("CAE_HTTP_PROGRESS_S", "0", 1);
   ::setenv("CAE_HTTP_CURL", "/usr/bin/curl", 1);
+  ::setenv("CAE_HTTP_WGET", "/usr/bin/wget", 1);
   auto c = cae::HttpFetchConfig::FromEnv();
   REQUIRE(c.streams == 64);
   REQUIRE(c.part_bytes == (2ull << 20));
@@ -605,10 +623,11 @@ TEST_CASE("http_fetch_config_from_env", "[http_fetch]") {
   REQUIRE(c.overwrite);
   REQUIRE(c.progress_s == 0);
   REQUIRE(c.curl == "/usr/bin/curl");
+  REQUIRE(c.wget == "/usr/bin/wget");
   for (const char* v : {"CAE_HTTP_STREAMS", "CAE_HTTP_PART_MB",
                         "CAE_HTTP_PART_RETRIES", "CAE_HTTP_BACKOFF_MS",
                         "CAE_HTTP_OVERWRITE", "CAE_HTTP_PROGRESS_S",
-                        "CAE_HTTP_CURL"}) {
+                        "CAE_HTTP_CURL", "CAE_HTTP_WGET"}) {
     ::unsetenv(v);
   }
   auto d = cae::HttpFetchConfig::FromEnv();
@@ -616,6 +635,85 @@ TEST_CASE("http_fetch_config_from_env", "[http_fetch]") {
   REQUIRE(d.part_bytes == (64ull << 20));
   REQUIRE_FALSE(d.overwrite);
   REQUIRE(d.curl == "curl");
+  REQUIRE(d.wget == "wget");
+}
+
+// --- client = wget ---------------------------------------------------------
+
+namespace {
+
+/** True when wget is on PATH; the client = wget cases need the real one. */
+bool HaveWget() {
+  return std::system("command -v wget > /dev/null 2>&1") == 0;
+}
+
+/** Entries in directory `d` (not . or ..). */
+size_t CountEntries(const std::string& d) {
+  size_t n = 0;
+  if (DIR* dir = ::opendir(d.c_str())) {
+    while (dirent* e = ::readdir(dir)) {
+      std::string name = e->d_name;
+      if (name != "." && name != "..") ++n;
+    }
+    ::closedir(dir);
+  }
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE("http_fetch_wget_client_passes_a_wget_only_site", "[http_fetch]") {
+  if (!HaveWget()) {
+    std::cerr << "skipped: wget not on PATH\n";
+    return;
+  }
+  auto cfg = Cfg();
+  // curl, even with the right password, is refused, as by PhysioNet.
+  auto viacurl = Req("/wgetonly.bin", "wgetonly_curl.bin");
+  viacurl.auth.userpwd = "u:p";
+  auto r = cae::HttpFetch(viacurl, cfg, nullptr);
+  REQUIRE_FALSE(r.ok);
+  REQUIRE(r.probe.status == 403);
+
+  // wget's private files go to TMPDIR and must be gone afterwards.
+  const std::string scratch = TmpDir() + "/wget_tmp";
+  ::mkdir(scratch.c_str(), 0700);
+  const char* old = std::getenv("TMPDIR");
+  const std::string saved = old ? old : "";
+  ::setenv("TMPDIR", scratch.c_str(), 1);
+
+  auto req = Req("/wgetonly.bin", "wgetonly.bin");
+  req.auth.client = "wget";
+  req.auth.userpwd = "u:p";
+  r = cae::HttpFetch(req, cfg, nullptr);
+  REQUIRE(r.ok);
+  REQUIRE(r.probe.status == 200);
+  REQUIRE(r.probe.total == static_cast<int64_t>(Server().data().size()));
+  REQUIRE(Slurp(req.dst_path) == Server().data());
+  REQUIRE_FALSE(Exists(req.dst_path + ".cae-part"));
+  r = cae::HttpFetch(req, cfg, nullptr);
+  REQUIRE(r.ok);
+  REQUIRE(r.skipped);
+
+  // A wrong password: the 401 survives wget's authenticated retry.
+  auto bad = Req("/wgetonly.bin", "wgetonly_bad.bin");
+  bad.auth.client = "wget";
+  bad.auth.userpwd = "u:wrong";
+  r = cae::HttpFetch(bad, cfg, nullptr);
+  REQUIRE_FALSE(r.ok);
+  REQUIRE(r.probe.status == 401);
+  REQUIRE_FALSE(Exists(bad.dst_path));
+
+  // Ranges are a curl-only feature.
+  auto ranged = Req("/data.bin", "wget_range.bin");
+  ranged.auth.client = "wget";
+  ranged.range_size = 10;
+  r = cae::HttpFetch(ranged, cfg, nullptr);
+  REQUIRE_FALSE(r.ok);
+  REQUIRE(r.error.find("not supported with client = wget") != std::string::npos);
+
+  REQUIRE(CountEntries(scratch) == 0);
+  if (old) ::setenv("TMPDIR", saved.c_str(), 1); else ::unsetenv("TMPDIR");
 }
 
 // --- the assimilator and the config file ------------------------------------

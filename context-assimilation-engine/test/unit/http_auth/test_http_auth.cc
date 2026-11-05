@@ -207,4 +207,60 @@ TEST_CASE("http_fetch_probe_parses_ranges_and_redirects", "[http_fetch]") {
   REQUIRE(bad.total == -1);
 }
 
+TEST_CASE("http_auth_client_key", "[http_auth]") {
+  const std::string ini =
+      "[physionet.org]\nuser = u\npassword = p\nclient = WGET\n"
+      "[bad.example]\nclient = aria2\n";
+  auto r = cae::ResolveHttpAuthFrom("https://physionet.org/files/x", "", ini, Env({}));
+  REQUIRE(r.ok);
+  REQUIRE(r.auth.client == "wget");
+  REQUIRE(r.auth.userpwd == "u:p");
+
+  auto d = cae::ResolveHttpAuthFrom("https://other.org/x", "", ini, Env({}));
+  REQUIRE(d.ok);
+  REQUIRE(d.auth.client == "curl");
+
+  auto bad = cae::ResolveHttpAuthFrom("https://bad.example/x", "", ini, Env({}));
+  REQUIRE_FALSE(bad.ok);
+  REQUIRE(bad.error.find("not curl or wget") != std::string::npos);
+}
+
+TEST_CASE("http_fetch_wget_config_lines_and_rejects", "[http_fetch]") {
+  cae::HttpAuth a;
+  a.url = "https://h/x";
+  a.headers = {"X-Key: k1"};
+  a.userpwd = "alice:pa:ss";
+  std::string err;
+  std::string c = cae::http_detail::WgetConfig(a, &err);
+  REQUIRE(c.find("header = X-Key: k1\n") != std::string::npos);
+  REQUIRE(c.find("http_user = alice\n") != std::string::npos);
+  REQUIRE(c.find("http_password = pa:ss\n") != std::string::npos);
+
+  cae::HttpAuth none;
+  none.url = "https://h/x";
+  REQUIRE_FALSE(cae::http_detail::WgetConfig(none, &err).empty());
+
+  cae::HttpAuth blank = a;
+  blank.userpwd = "alice: secret";
+  REQUIRE(cae::http_detail::WgetConfig(blank, &err).empty());
+  REQUIRE(err.find("outer blank") != std::string::npos);
+
+  cae::HttpAuth nl = a;
+  nl.headers = {"X-Key: k\n1"};
+  REQUIRE(cae::http_detail::WgetConfig(nl, &err).empty());
+}
+
+TEST_CASE("http_fetch_probe_parses_wget_server_response", "[http_fetch]") {
+  // wget -S: indented headers, a 401 challenge before the authenticated 200.
+  auto p = cae::http_detail::ParseProbeHeaders(
+      "Spider mode enabled.\n"
+      "  HTTP/1.1 401 Unauthorized\n  WWW-Authenticate: Basic realm=\"x\"\n"
+      "Authentication selected: Basic realm=\"x\"\n"
+      "  HTTP/1.1 200 OK\n  Content-Type: text/csv\n  Content-Length: 3375\n"
+      "Length: 3375 (3.3K) [text/csv]\n");
+  REQUIRE(p.status == 200);
+  REQUIRE(p.total == 3375);
+  REQUIRE(p.content_type == "text/csv");
+}
+
 SIMPLE_TEST_MAIN()
