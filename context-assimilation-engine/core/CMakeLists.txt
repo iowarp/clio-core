@@ -216,7 +216,7 @@ endif()
 # OMNI parsing, split out of the clio_cae binary so the unit tests can link it
 # (a main()-only translation unit is not linkable from a test). Static: it has
 # exactly two consumers, the binary below and test_cae_omni_loader.
-add_library(cae_omni_loader STATIC src/omni_loader.cc)
+add_library(cae_omni_loader STATIC src/omni_loader.cc src/omni_run.cc)
 target_include_directories(cae_omni_loader
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

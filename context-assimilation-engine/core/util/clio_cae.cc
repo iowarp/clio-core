@@ -52,6 +52,7 @@
 #include <clio_cae/core/constants.h>
 #include <clio_cae/core/core_client.h>
 #include <clio_cae/core/omni_loader.h>
+#include <clio_cae/core/omni_run.h>
 
 #include <string>
 #include <vector>
@@ -84,8 +85,19 @@ int main(int argc, char* argv[]) {
     }
 
     // Load OMNI file and parse transfers
+    std::vector<clio::cae::core::RunStep> runs;
     std::vector<clio::cae::core::AssimilationCtx> contexts =
-        clio::cae::core::LoadOmni(omni_file_path);
+        clio::cae::core::LoadOmni(omni_file_path, &runs);
+
+    // `run:` steps transform sources here, in the client, before anything is
+    // submitted; the runtime only ever sees their output files.
+    if (!runs.empty()) {
+      std::string run_err = clio::cae::core::ExecuteRunSteps(runs, &contexts);
+      if (!run_err.empty()) {
+        HLOG(kError, "Run step failed, nothing was submitted: {}", run_err);
+        return 1;
+      }
+    }
 
     // Connect to CAE core container using the standard pool ID
     clio::cae::core::Client client(clio::cae::core::kCaePoolId);

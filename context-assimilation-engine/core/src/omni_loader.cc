@@ -41,14 +41,38 @@
 #include <clio_ctp/util/logging.h>
 #include <yaml-cpp/yaml.h>
 
+#include <filesystem>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace clio::cae::core {
 
-std::vector<AssimilationCtx> LoadOmni(
-    const std::string& omni_path) {
+namespace {
+
+// Every per-transfer key LoadOmni reads. Anything else is warned about.
+const std::set<std::string>& KnownTransferKeys() {
+  static const std::set<std::string> keys = {
+      "src",       "dst",       "format",         "depends_on",
+      "range_off", "range_size", "src_token",     "dst_token",
+      "dataset_filter", "run",  "run_out"};
+  return keys;
+}
+
+// Env-expand `raw` and make it absolute, resolving a relative path against
+// the directory that holds the OMNI file.
+std::string ResolvePath(const std::string& raw,
+                        const std::filesystem::path& base) {
+  std::filesystem::path p(ctp::ConfigParse::ExpandPath(raw));
+  if (p.is_relative()) p = base / p;
+  return p.lexically_normal().string();
+}
+
+}  // namespace
+
+std::vector<AssimilationCtx> LoadOmni(const std::string& omni_path,
+                                      std::vector<RunStep>* runs) {
   HLOG(kInfo, "Loading OMNI file: {}", omni_path);
 
   YAML::Node config;
@@ -71,6 +95,8 @@ std::vector<AssimilationCtx> LoadOmni(
 
   std::vector<clio::cae::core::AssimilationCtx> contexts;
   contexts.reserve(transfers.size());
+  const std::filesystem::path omni_dir =
+      std::filesystem::absolute(omni_path).parent_path();
 
   // Parse each transfer entry
   for (size_t i = 0; i < transfers.size(); ++i) {
@@ -88,6 +114,16 @@ std::vector<AssimilationCtx> LoadOmni(
     if (!transfer["format"]) {
       throw std::runtime_error("Transfer " + std::to_string(i + 1) +
                                " missing required 'format' field");
+    }
+
+    if (transfer.IsMap()) {
+      for (const auto& kv : transfer) {
+        const std::string key = kv.first.as<std::string>();
+        if (KnownTransferKeys().count(key) == 0) {
+          HLOG(kWarning, "Transfer {}: unknown key '{}' is ignored", (i + 1),
+               key);
+        }
+      }
     }
 
     AssimilationCtx ctx;
@@ -136,12 +172,37 @@ std::vector<AssimilationCtx> LoadOmni(
       }
     }
 
+    // Optional run step: a script that turns src into run_out before ingest.
+    if (transfer["run"] || transfer["run_out"]) {
+      const std::string where = "Transfer " + std::to_string(i + 1);
+      if (!transfer["run"]) {
+        throw std::runtime_error(where + " has 'run_out' but no 'run' script");
+      }
+      if (!transfer["run_out"]) {
+        throw std::runtime_error(
+            where + " has 'run' but no 'run_out': name the file the script "
+            "writes, which is what gets ingested");
+      }
+      if (runs == nullptr) {
+        throw std::runtime_error(
+            where + " has a 'run' step, which this caller does not execute");
+      }
+      RunStep step;
+      step.transfer = i;
+      step.script = ResolvePath(transfer["run"].as<std::string>(), omni_dir);
+      step.out = ResolvePath(transfer["run_out"].as<std::string>(), omni_dir);
+      runs->push_back(step);
+    }
+
     contexts.push_back(ctx);
 
     HLOG(kInfo, "  Loaded transfer {}/{}: ", (i + 1), transfers.size());
     HLOG(kInfo, "    src: {}", ctx.src);
     HLOG(kInfo, "    dst: {}", ctx.dst);
     HLOG(kInfo, "    format: {}", ctx.format);
+    if (runs != nullptr && !runs->empty() && runs->back().transfer == i) {
+      HLOG(kInfo, "    run: {} -> {}", runs->back().script, runs->back().out);
+    }
     if (!ctx.src_token.empty()) {
       HLOG(kInfo, "    src_token: <set>");
     }
