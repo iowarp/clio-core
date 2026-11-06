@@ -61,6 +61,10 @@ ignore:
   # it needs a live runtime. The OMNI parsing it used to carry now lives in
   # core/src/omni_loader.cc and is covered by test_cae_omni_loader.
   - "**/util/clio_cae.cc"
+  # cae_http_tool process entry: argument parsing and one call into the
+  # download engine. It defines main(), so no test can link it; the engine
+  # itself (http_fetch.cc) is covered by cae_http_fetch_test.
+  - "**/factory/tools/http_tool_main.cc"
   # cte_tiers process entry: CLIO_INIT plus one call. The report itself is
   # core/util/cte_tiers_report.h, covered by test_cte_tiers.
   - "**/util/cte_tiers.cc"
