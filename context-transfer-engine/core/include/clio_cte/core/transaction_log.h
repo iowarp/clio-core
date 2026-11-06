@@ -285,8 +285,11 @@ class TransactionLog {
     capacity_bytes_ = capacity_bytes;
     buffer_.reserve(4096);
     namespace fs = std::filesystem;
-    const bool is_new = !fs::exists(file_path_) ||
-                        fs::file_size(file_path_) == 0;
+    // error_code overload: the file can vanish between a check and the stat
+    // (a test or a compaction removing it); never throw out of a coroutine.
+    std::error_code ec;
+    const auto sz = fs::file_size(file_path_, ec);
+    const bool is_new = ec || sz == 0;
     ofs_.open(file_path_, std::ios::binary | std::ios::app);
     if (is_new && ofs_.is_open()) {
       WriteMagic();
@@ -513,10 +516,12 @@ class TransactionLog {
   /** Return current on-disk file size */
   clio::run::u64 Size() const {
     namespace fs = std::filesystem;
-    if (fs::exists(file_path_)) {
-      return static_cast<clio::run::u64>(fs::file_size(file_path_));
-    }
-    return 0;
+    // Non-throwing: a file removed concurrently (exists() then file_size()
+    // raced) threw filesystem_error out of a coroutine and aborted the
+    // runtime (cte_blob_replicas_force_net, PR #1334 leak-check).
+    std::error_code ec;
+    const auto sz = fs::file_size(file_path_, ec);
+    return ec ? 0 : static_cast<clio::run::u64>(sz);
   }
 
   /**
