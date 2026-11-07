@@ -44,7 +44,7 @@ fi
 BIN=$BUILD/bin
 DIR=/mnt/nvme/$USER/sbdev_bench
 mkdir -p "$DIR"
-export CLIO_WITH_RUNTIME=0 CLIO_IPC_MODE=SHM CLIO_MEMFD_DIR=$DIR/memfd
+export CLIO_WITH_RUNTIME=0 CLIO_IPC_MODE=SHM CLIO_MEMFD_DIR=${SBDEV_MEMFD_DIR:-$DIR/memfd}
 export CTP_LOG_LEVEL=warning LD_LIBRARY_PATH=$BIN PATH=$BIN:/usr/bin:/bin
 mkdir -p "$CLIO_MEMFD_DIR"
 hostname > "$OUT/node"
@@ -52,13 +52,13 @@ df -h /mnt/nvme > "$OUT/df.txt"
 DEV=$(df --output=source /mnt/nvme | tail -1 | xargs basename)
 echo "device=$DEV" >> "$OUT/node"
 
-bdev_entry() {  # idx major
+bdev_entry() {  # idx major [type]
   cat <<EOF
   - mod_name: clio_bdev
     pool_name: "$DIR/bdev$1.dat"
     pool_query: local
     pool_id: "$2.0"
-    bdev_type: file
+    bdev_type: ${3:-file}
     capacity: "${FILE_GB}GB"
 EOF
 }
@@ -83,6 +83,7 @@ compose:
 EOF
     case $c in
       bdev) bdev_entry 0 301; return;;
+      ram) bdev_entry 0 301 ram; return;;  # software-path ceiling, no device
       safe4p0) data=4 parity=0;;
       safe3p1) data=3 parity=1;;
       safe2p2) data=2 parity=2;;
@@ -116,11 +117,19 @@ for c in $CONFIGS; do
   # Fresh files every config: no allocator/parity state carried over.
   rm -rf "$DIR"/bdev*.dat "$DIR"/conf_* "$DIR"/memfd/*
   for i in 0 1 2 3; do fallocate -l ${FILE_GB}G "$DIR/bdev$i.dat"; done
+  # SBDEV_PREWRITE=1: write every byte once so no extent is unwritten
+  # (isolates XFS unwritten-extent conversion from bdev's own cost).
+  if [ "${SBDEV_PREWRITE:-0}" = 1 ]; then
+    for i in 0 1 2 3; do
+      dd if=/dev/zero of="$DIR/bdev$i.dat" bs=1M count=$((FILE_GB * 1024)) \
+         oflag=direct conv=notrunc status=none
+    done
+  fi
   export CLIO_SERVER_CONF=$d/clio_server.yaml
-  "$BIN/clio_run" start --fresh --no-viz > "$d/runtime.log" 2>&1 &
+  ${SBDEV_RT_WRAP:-} "$BIN/clio_run" start --fresh --no-viz > "$d/runtime.log" 2>&1 &
   RT=$!
   sleep 8
-  pool=$([ $c = bdev ] && echo 301.0 || echo 350.0)
+  pool=$(case $c in bdev|ram) echo 301.0;; *) echo 350.0;; esac)
   for sz in $SIZES; do
     for mode in write read; do
       tag=$c.$mode.$sz
