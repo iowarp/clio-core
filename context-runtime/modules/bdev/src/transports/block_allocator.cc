@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iterator>
+#include <set>
 #ifdef __linux__
 #include <execinfo.h>
 #endif
@@ -34,64 +35,13 @@ static_assert(sizeof(kBlockSizes) / sizeof(kBlockSizes[0]) ==
                   static_cast<size_t>(BlockSizeCategory::kMaxCategories),
               "kBlockSizes must match BlockSizeCategory");
 
-WorkerBlockMap::WorkerBlockMap() {
-  blocks_.resize(static_cast<size_t>(BlockSizeCategory::kMaxCategories));
-}
-
-bool WorkerBlockMap::AllocateBlock(int block_type, Block &block, size_t min_size) {
-  if (block_type < 0 ||
-      block_type >= static_cast<int>(BlockSizeCategory::kMaxCategories)) {
-    return false;
-  }
-  auto &list = blocks_[block_type];
-  if (list.empty()) return false;
-
-  for (auto it = list.begin(); it != list.end(); ++it) {
-    if (it->size_ >= min_size) {
-      block = *it;
-      list.erase(it);
-      return true;
-    }
-  }
-  return false;
-}
-
-bool WorkerBlockMap::AllocateAnyUpTo(size_t max_bytes, Block &block) {
-  // Largest category first so a big request drains few large freed extents
-  // rather than many tiny ones. Match on the block's PHYSICAL FOOTPRINT (its
-  // 4 KiB-aligned size, which is what it actually occupies), not its logical
-  // size_ -- taking a block whose footprint exceeds the remainder would occupy
-  // more space than is charged for it. Alignment is 4 KiB everywhere in this
-  // allocator (the block-size categories and the heap slab are all 4 KiB
-  // multiples), so it is safe to compute here without the allocator's field.
-  for (int bt = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1; bt >= 0;
-       --bt) {
-    auto &list = blocks_[bt];
-    for (auto it = list.begin(); it != list.end(); ++it) {
-      clio::run::u64 footprint = ((it->size_ + 4095) / 4096) * 4096;
-      if (it->size_ > 0 && footprint <= max_bytes) {
-        block = *it;
-        list.erase(it);
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-void WorkerBlockMap::FreeBlock(Block block) {
-  int block_type = static_cast<int>(block.block_type_);
-  if (block_type >= 0 &&
-      block_type < static_cast<int>(BlockSizeCategory::kMaxCategories)) {
-    blocks_[block_type].push_back(block);
-  }
-}
-
 GlobalBlockMap::GlobalBlockMap() {}
 
-void GlobalBlockMap::Init(size_t num_workers) {
-  worker_maps_.resize(num_workers);
-  worker_locks_.resize(num_workers);
+void GlobalBlockMap::Init(size_t /*num_workers*/) {
+  clio::run::ScopedCoMutex lock(mu_);
+  by_off_.clear();
+  by_size_.clear();
+  free_bytes_ = 0;
 }
 
 int GlobalBlockMap::FindBlockType(size_t io_size) {
@@ -101,85 +51,117 @@ int GlobalBlockMap::FindBlockType(size_t io_size) {
   return -1;
 }
 
-bool GlobalBlockMap::AllocateBlock(int worker, size_t io_size, Block &block) {
-  int block_type = FindBlockType(io_size);
-  if (block_type == -1) {
-    block_type = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1;
-  }
+namespace {
+clio::run::u32 TypeOf(clio::run::u64 footprint) {
+  int bt = GlobalBlockMap::FindBlockType(static_cast<size_t>(footprint));
+  if (bt < 0) bt = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1;
+  return static_cast<clio::run::u32>(bt);
+}
+}  // namespace
 
-  size_t worker_idx = static_cast<size_t>(worker) % worker_maps_.size();
-
-  {
-    clio::run::ScopedCoMutex lock(worker_locks_[worker_idx]);
-    if (worker_maps_[worker_idx].AllocateBlock(block_type, block, io_size)) {
-      return true;
-    }
-  }
-
-  for (size_t i = 1; i < worker_maps_.size(); ++i) {
-    size_t other_worker = (worker_idx + i) % worker_maps_.size();
-    clio::run::ScopedCoMutex lock(worker_locks_[other_worker]);
-    if (worker_maps_[other_worker].AllocateBlock(block_type, block, io_size)) {
-      return true;
-    }
-  }
-
-  return false;
+void GlobalBlockMap::AddLocked(clio::run::u64 off, clio::run::u64 len) {
+  by_off_.emplace(off, len);
+  by_size_.emplace(len, off);
+  free_bytes_ += len;
 }
 
-bool GlobalBlockMap::AllocateAnyUpTo(int worker, size_t max_bytes,
+void GlobalBlockMap::EraseLocked(
+    std::map<clio::run::u64, clio::run::u64>::iterator it) {
+  by_size_.erase({it->second, it->first});
+  free_bytes_ -= it->second;
+  by_off_.erase(it);
+}
+
+void GlobalBlockMap::InsertLocked(clio::run::u64 off, clio::run::u64 len) {
+  if (len == 0) return;
+  // Merge with the right neighbour, then the left one.
+  auto next = by_off_.lower_bound(off);
+  if (next != by_off_.end() && next->first < off + len) {
+    // Overlap means a double free or a stale recovery record: never let the
+    // index hold the same byte twice. Keep the existing extent, add only the
+    // parts outside it (rare; logged by the CLIO_BDEV_CHECK_ALLOC checker).
+    HLOG(kWarning, "bdev free index: freed [{}, {}) overlaps free [{}, {})",
+         off, off + len, next->first, next->first + next->second);
+    clio::run::u64 left_len = next->first > off ? next->first - off : 0;
+    clio::run::u64 right_start = next->first + next->second;
+    clio::run::u64 end = off + len;
+    if (left_len) InsertLocked(off, left_len);
+    if (right_start < end) InsertLocked(right_start, end - right_start);
+    return;
+  }
+  if (next != by_off_.end() && next->first == off + len) {
+    len += next->second;
+    EraseLocked(next);
+  }
+  auto it = by_off_.lower_bound(off);
+  if (it != by_off_.begin()) {
+    auto prev = std::prev(it);
+    const clio::run::u64 prev_end = prev->first + prev->second;
+    if (prev_end > off) {
+      HLOG(kWarning, "bdev free index: freed [{}, {}) overlaps free [{}, {})",
+           off, off + len, prev->first, prev_end);
+      if (prev_end >= off + len) return;
+      len = off + len - prev_end;
+      off = prev_end;
+    }
+    if (prev->first + prev->second == off) {
+      off = prev->first;
+      len += prev->second;
+      EraseLocked(prev);
+    }
+  }
+  AddLocked(off, len);
+}
+
+bool GlobalBlockMap::AllocateBlock(int /*worker*/, size_t footprint,
+                                   Block &block) {
+  if (footprint == 0) return false;
+  clio::run::ScopedCoMutex lock(mu_);
+  auto fit = by_size_.lower_bound({static_cast<clio::run::u64>(footprint), 0});
+  if (fit == by_size_.end()) return false;
+  const clio::run::u64 len = fit->first;
+  const clio::run::u64 off = fit->second;
+  EraseLocked(by_off_.find(off));
+  if (len > footprint) AddLocked(off + footprint, len - footprint);
+  block = Block(off, footprint, TypeOf(footprint));
+  return true;
+}
+
+bool GlobalBlockMap::AllocateAnyUpTo(int /*worker*/, size_t max_bytes,
                                      Block &block) {
-  if (worker_maps_.empty()) return false;
-  size_t worker_idx = static_cast<size_t>(worker) % worker_maps_.size();
-  {
-    clio::run::ScopedCoMutex lock(worker_locks_[worker_idx]);
-    if (worker_maps_[worker_idx].AllocateAnyUpTo(max_bytes, block)) {
-      return true;
-    }
-  }
-  for (size_t i = 1; i < worker_maps_.size(); ++i) {
-    size_t other = (worker_idx + i) % worker_maps_.size();
-    clio::run::ScopedCoMutex lock(worker_locks_[other]);
-    if (worker_maps_[other].AllocateAnyUpTo(max_bytes, block)) {
-      return true;
-    }
-  }
-  return false;
+  if (max_bytes == 0) return false;
+  clio::run::ScopedCoMutex lock(mu_);
+  if (by_size_.empty()) return false;
+  auto big = std::prev(by_size_.end());
+  const clio::run::u64 len = big->first;
+  const clio::run::u64 off = big->second;
+  const clio::run::u64 take = std::min<clio::run::u64>(len, max_bytes);
+  EraseLocked(by_off_.find(off));
+  if (len > take) AddLocked(off + take, len - take);
+  block = Block(off, take, TypeOf(take));
+  return true;
 }
 
-bool GlobalBlockMap::FreeBlock(int worker, Block &block) {
-  if (worker_maps_.empty()) return false;
-  size_t worker_idx = static_cast<size_t>(worker) % worker_maps_.size();
-  clio::run::ScopedCoMutex lock(worker_locks_[worker_idx]);
-  worker_maps_[worker_idx].FreeBlock(block);
+bool GlobalBlockMap::FreeBlock(int /*worker*/, Block &block) {
+  clio::run::ScopedCoMutex lock(mu_);
+  InsertLocked(block.offset_, block.size_);
   return true;
 }
 
 void GlobalBlockMap::SeedFreeRange(clio::run::u64 offset, clio::run::u64 size) {
-  if (size == 0 || worker_maps_.empty()) {
-    return;
-  }
-  const size_t kMaxIdx =
-      static_cast<size_t>(BlockSizeCategory::kMaxCategories) - 1;
-  clio::run::ScopedCoMutex lock(worker_locks_[0]);
-  clio::run::u64 cur = offset;
-  clio::run::u64 left = size;
-  while (left > 0) {
-    // Largest class that fits what is left; a tail below the smallest class
-    // is filed there anyway (AllocateBlock checks the real size).
-    size_t idx = 0;
-    for (size_t i = kMaxIdx + 1; i-- > 0;) {
-      if (kBlockSizes[i] <= left) {
-        idx = i;
-        break;
-      }
-    }
-    clio::run::u64 chunk = std::min<clio::run::u64>(left, kBlockSizes[idx]);
-    worker_maps_[0].FreeBlock(
-        Block(cur, chunk, static_cast<clio::run::u32>(idx)));
-    cur += chunk;
-    left -= chunk;
-  }
+  if (size == 0) return;
+  clio::run::ScopedCoMutex lock(mu_);
+  InsertLocked(offset, size);
+}
+
+clio::run::u64 GlobalBlockMap::FreeBytes() {
+  clio::run::ScopedCoMutex lock(mu_);
+  return free_bytes_;
+}
+
+size_t GlobalBlockMap::NumExtents() {
+  clio::run::ScopedCoMutex lock(mu_);
+  return by_off_.size();
 }
 
 Heap::Heap() : heap_(0), total_size_(0), alignment_(4096) {}
@@ -289,72 +271,63 @@ bool StandardBlockAllocator::AllocateBlocksImpl(size_t size, int worker_id,
     blocks.clear();
     return true;
   }
+  const clio::run::u64 footprint = AlignSize(total_size);
+  int type = GlobalBlockMap::FindBlockType(static_cast<size_t>(total_size));
+  if (type == -1) type = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1;
 
-  // 1. Reuse a single free extent that already fits (the common case).
+  // 1. Best fit from the coalescing free index: freed space is reused first,
+  //    and because frees merge, a large request finds a large extent whenever
+  //    the freed space it needs is contiguous (#1333).
   Block block;
-  if (global_block_map_.AllocateBlock(worker_id, total_size, block)) {
+  if (global_block_map_.AllocateBlock(worker_id, footprint, block)) {
+    block.size_ = total_size;  // logical size the caller reads/writes
+    block.block_type_ = static_cast<clio::run::u32>(type);
     blocks.push_back(block);
-    allocated_bytes_.fetch_add(block.size_, std::memory_order_relaxed);
+    allocated_bytes_.fetch_add(footprint, std::memory_order_relaxed);
     return true;
   }
 
-  // 2. Take one contiguous block from the heap. This is tried BEFORE
-  //    fragmenting so that a request the heap can satisfy stays a SINGLE
-  //    block -- fragmenting a request the heap could serve cleanly only
-  //    scatters it for no benefit (and broke callers that assume one
-  //    allocation is one block, e.g. bdev_file_vs_ram_comparison).
-  clio::run::u64 aligned_total_size = AlignSize(total_size);
-  int whole_type = GlobalBlockMap::FindBlockType(aligned_total_size);
-  if (whole_type == -1) {
-    whole_type = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1;
-  }
-  if (heap_.Allocate(aligned_total_size, whole_type, block)) {
-    block.size_ = total_size;  // logical size the caller reads/writes
+  // 2. One contiguous block from the untouched heap.
+  if (heap_.Allocate(footprint, type, block)) {
+    block.size_ = total_size;
     blocks.push_back(block);
     // Charge the ALIGNED size (the heap advanced by it, and FreeBlocks credits
     // AlignSize(size_) -- keeping the two in step; see #798).
-    allocated_bytes_.fetch_add(aligned_total_size, std::memory_order_relaxed);
+    allocated_bytes_.fetch_add(footprint, std::memory_order_relaxed);
     return true;
   }
 
-  // 3. LAST RESORT: the heap cannot give a contiguous block (the tier is at or
-  //    near capacity). ASSEMBLE the request from several smaller freed extents
-  //    (issue #820). Without this, the free list is bucketed by size category
-  //    -- a 1 MiB ask never sees freed 64 KiB blocks -- so a large ask can
-  //    never reuse a fragmented pool and the bump-only heap climbs to capacity
-  //    -> write EIO (xfstests 074/521/522). This is the allocator's job, not
-  //    the CTE's (which used to cap every block at 64 KiB to dodge it); the
-  //    blocks_ vector carries multi-block extents transparently.
-  //
-  //    Accounting is in PHYSICAL footprint bytes (AlignSize(size_)): each
-  //    reused block is reported at its footprint and covers that many bytes, so
-  //    a big ask consumes one slab per slab of need, not one slab per (possibly
-  //    sub-slab) freed logical size. The caller distributes the logical request
-  //    across these physical blocks.
-  clio::run::u64 remaining_phys = aligned_total_size;
+  // 3. LAST RESORT (#820): no single free extent or heap span fits. Assemble
+  //    the request from the LARGEST free extents first so it spans as few
+  //    pieces as possible. Pieces report their physical footprint; the caller
+  //    distributes the logical request across them.
+  clio::run::u64 remaining_phys = footprint;
   Block fb;
   while (remaining_phys > 0 &&
          global_block_map_.AllocateAnyUpTo(worker_id, remaining_phys, fb)) {
-    clio::run::u64 fp = AlignSize(fb.size_);       // true footprint
-    if (fp > remaining_phys) fp = remaining_phys;  // last partial block
-    fb.size_ = fp;                                 // report the footprint
     blocks.push_back(fb);
-    allocated_bytes_.fetch_add(fp, std::memory_order_relaxed);
-    remaining_phys -= fp;
+    allocated_bytes_.fetch_add(fb.size_, std::memory_order_relaxed);
+    remaining_phys -= fb.size_;
   }
   if (remaining_phys == 0) {
-    return true;  // satisfied entirely from reused space
+    return true;
   }
 
-  // Freed extents did not cover it and the heap is full: genuinely out of
-  // space. Roll everything back so the caller sees all-or-nothing (it frees
-  // `blocks` only on a true return).
+  // Genuinely out of space: roll back so the caller sees all-or-nothing.
   for (auto &b : blocks) {
     global_block_map_.FreeBlock(worker_id, b);
-    allocated_bytes_.fetch_sub(AlignSize(b.size_), std::memory_order_relaxed);
+    allocated_bytes_.fetch_sub(b.size_, std::memory_order_relaxed);
   }
   blocks.clear();
+  RetractHeapTail();
   return false;
+}
+
+void StandardBlockAllocator::RetractHeapTail() {
+  global_block_map_.RetractTail(
+      [this](clio::run::u64 start, clio::run::u64 end) {
+        return heap_.Retract(start, end);
+      });
 }
 
 void StandardBlockAllocator::InitFromLive(
@@ -393,21 +366,16 @@ void StandardBlockAllocator::FreeBlocks(int worker_id, const std::vector<Block>&
   if (CheckEnabled()) CheckFreed(blocks);
   clio::run::u64 freed_bytes = 0;
   for (const auto& block : blocks) {
+    if (block.size_ == 0) continue;
     Block block_copy = block;
-    clio::run::u64 aligned_size = AlignSize(block.size_);
-    block_copy.size_ = aligned_size;
-    int bt = -1;
-    for (int i = 0; i < static_cast<int>(BlockSizeCategory::kMaxCategories); ++i) {
-      if (aligned_size <= kBlockSizes[i]) {
-        bt = i;
-        break;
-      }
-    }
-    if (bt == -1) bt = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1;
-    block_copy.block_type_ = static_cast<clio::run::u32>(bt);
+    block_copy.size_ = AlignSize(block.size_);  // physical footprint
+    block_copy.block_type_ = TypeOf(block_copy.size_);
     freed_bytes += block_copy.size_;
-    global_block_map_.FreeBlock(worker_id, block_copy);
+    global_block_map_.FreeBlock(worker_id, block_copy);  // merges neighbours
   }
+  // Freed space at the top of the used range goes back to the heap, so the
+  // heap -- not a pile of extents -- serves the next big contiguous request.
+  RetractHeapTail();
 
   clio::run::u64 cur = allocated_bytes_.load(std::memory_order_relaxed);
   clio::run::u64 dec = std::min(cur, freed_bytes);

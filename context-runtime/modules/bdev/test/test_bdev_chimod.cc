@@ -60,7 +60,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <atomic>
+#include <algorithm>
 #include <random>
 #include <set>
 #include <string>
@@ -2561,6 +2565,184 @@ TEST_CASE("bdev_alltoone_barrier", "[bdev][alltoone]") {
       REQUIRE(futures[i]->blocks_[0].offset_ == first_block);
     }
   }
+}
+
+//==============================================================================
+// FREE-SPACE COALESCING (#1333): StandardBlockAllocator driven directly
+//==============================================================================
+
+namespace {
+using clio::run::bdev::Block;
+using clio::run::bdev::StandardBlockAllocator;
+constexpr clio::run::u64 kA4K = 4096;
+constexpr clio::run::u64 kA1M = 1024 * 1024;
+
+std::vector<Block> AllocN(StandardBlockAllocator &a, size_t n, size_t sz) {
+  std::vector<Block> out;
+  for (size_t i = 0; i < n; ++i) {
+    std::vector<Block> b;
+    REQUIRE(a.AllocateBlocks(sz, 0, b));
+    REQUIRE(b.size() == 1);
+    out.push_back(b[0]);
+  }
+  return out;
+}
+
+void FreeShuffled(StandardBlockAllocator &a, std::vector<Block> v, int seed) {
+  std::mt19937_64 rng(seed);
+  std::shuffle(v.begin(), v.end(), rng);
+  for (const Block &b : v) a.FreeBlocks(static_cast<int>(rng() % 8), {b});
+}
+}  // namespace
+
+TEST_CASE("bdev_coalesce_shred_then_large", "[bdev][allocator][coalesce]") {
+  // Fill 16 MiB with 4 KiB blocks, free them in random order from random
+  // workers, then ask for 1 MiB: it must be ONE block, not 256 scraps.
+  StandardBlockAllocator a;
+  a.Init(8, 16 * kA1M, 4096);
+  auto blocks = AllocN(a, 16 * kA1M / kA4K, kA4K);
+  std::vector<Block> none;
+  REQUIRE(!a.AllocateBlocks(kA4K, 0, none));  // full
+  FreeShuffled(a, blocks, 1);
+  // Everything merged and handed back to the heap.
+  REQUIRE(a.GetFreeExtentCount() == 0);
+  REQUIRE(a.GetHeapCursor() == 0);
+  REQUIRE(a.GetRemainingSize() == 16 * kA1M);
+  for (int i = 0; i < 16; ++i) {
+    std::vector<Block> big;
+    REQUIRE(a.AllocateBlocks(kA1M, 0, big));
+    REQUIRE(big.size() == 1);
+    REQUIRE(big[0].size_ == kA1M);
+  }
+}
+
+TEST_CASE("bdev_coalesce_interior_hole", "[bdev][allocator][coalesce]") {
+  // A live block at the top pins the heap; the freed space below it must
+  // still merge into one extent that serves a 1 MiB request in one piece.
+  StandardBlockAllocator a;
+  a.Init(8, 64 * kA1M, 4096);
+  auto blocks = AllocN(a, 512, kA4K);         // 2 MiB
+  auto pin = AllocN(a, 1, kA4K);              // keeps the heap cursor up
+  FreeShuffled(a, blocks, 2);
+  REQUIRE(a.GetFreeExtentCount() == 1);
+  REQUIRE(a.GetFreeIndexBytes() == 2 * kA1M);
+  const clio::run::u64 cursor = a.GetHeapCursor();
+  std::vector<Block> big;
+  REQUIRE(a.AllocateBlocks(kA1M, 0, big));
+  REQUIRE(big.size() == 1);
+  REQUIRE(big[0].offset_ == 0);               // reused, not fresh heap
+  REQUIRE(a.GetHeapCursor() == cursor);
+  REQUIRE(a.GetFreeIndexBytes() == kA1M);     // remainder split back
+  a.FreeBlocks(0, big);
+  a.FreeBlocks(0, pin);
+  REQUIRE(a.GetFreeExtentCount() == 0);
+  REQUIRE(a.GetHeapCursor() == 0);
+}
+
+TEST_CASE("bdev_coalesce_checkerboard", "[bdev][allocator][coalesce]") {
+  // Every other 4 KiB block freed: nothing can merge, the heap is full, so a
+  // 1 MiB request is assembled from pieces -- and must still be exact,
+  // non-overlapping, and fully reusable.
+  StandardBlockAllocator a;
+  a.Init(8, 2 * kA1M, 4096);
+  auto blocks = AllocN(a, 512, kA4K);
+  std::vector<Block> keep, drop;
+  for (size_t i = 0; i < blocks.size(); ++i)
+    (i % 2 ? keep : drop).push_back(blocks[i]);
+  FreeShuffled(a, drop, 3);
+  REQUIRE(a.GetFreeExtentCount() == 256);
+  std::vector<Block> big;
+  REQUIRE(a.AllocateBlocks(kA1M, 0, big));
+  REQUIRE(big.size() == 256);
+  clio::run::u64 sum = 0;
+  std::set<clio::run::u64> offs;
+  for (const Block &b : big) {
+    sum += b.size_;
+    REQUIRE(b.offset_ % (2 * kA4K) == 0);     // only the freed slots
+    offs.insert(b.offset_);
+  }
+  REQUIRE(sum == kA1M);
+  REQUIRE(offs.size() == 256);
+  a.FreeBlocks(0, big);
+  FreeShuffled(a, keep, 4);
+  REQUIRE(a.GetFreeExtentCount() == 0);
+  REQUIRE(a.GetHeapCursor() == 0);
+}
+
+TEST_CASE("bdev_coalesce_out_of_space_rollback", "[bdev][allocator][coalesce]") {
+  StandardBlockAllocator a;
+  a.Init(8, 2 * kA1M, 4096);
+  auto blocks = AllocN(a, 512, kA4K);
+  std::vector<Block> drop = {blocks[10], blocks[100], blocks[300]};
+  FreeShuffled(a, drop, 5);
+  const clio::run::u64 free_before = a.GetFreeIndexBytes();
+  const clio::run::u64 remain_before = a.GetRemainingSize();
+  std::vector<Block> big;
+  REQUIRE(!a.AllocateBlocks(kA1M, 0, big));
+  REQUIRE(big.empty());
+  REQUIRE(a.GetFreeIndexBytes() == free_before);
+  REQUIRE(a.GetRemainingSize() == remain_before);
+  REQUIRE(a.GetFreeExtentCount() == 3);
+}
+
+TEST_CASE("bdev_coalesce_concurrent", "[bdev][allocator][coalesce]") {
+  // 8 threads randomly allocate (512 B .. 1 MiB) and free. A shadow map
+  // proves no byte is ever owned twice; at the end everything must have
+  // merged back into the heap.
+  StandardBlockAllocator a;
+  const clio::run::u64 cap = 256 * kA1M;
+  a.Init(8, cap, 4096);
+  std::mutex mu;
+  std::map<clio::run::u64, clio::run::u64> live;  // off -> end
+  std::atomic<int> overlaps{0}, fails{0};
+  auto claim = [&](const std::vector<Block> &v) {
+    std::lock_guard<std::mutex> g(mu);
+    for (const Block &b : v) {
+      const clio::run::u64 lo = b.offset_, hi = b.offset_ + ((b.size_ + 4095) / 4096) * 4096;
+      auto it = live.upper_bound(lo);
+      if (it != live.begin() && std::prev(it)->second > lo) overlaps++;
+      if (it != live.end() && it->first < hi) overlaps++;
+      if (hi > cap) overlaps++;
+      live[lo] = hi;
+    }
+  };
+  auto release = [&](const std::vector<Block> &v) {
+    std::lock_guard<std::mutex> g(mu);
+    for (const Block &b : v) live.erase(b.offset_);
+  };
+  const size_t sizes[] = {512, 4096, 5000, 16384, 65536, 131072, kA1M};
+  std::vector<std::thread> th;
+  for (int t = 0; t < 8; ++t) {
+    th.emplace_back([&, t] {
+      std::mt19937_64 rng(100 + t);
+      std::vector<std::vector<Block>> mine;
+      for (int i = 0; i < 20000; ++i) {
+        if (mine.empty() || rng() % 100 < 55) {
+          std::vector<Block> b;
+          if (a.AllocateBlocks(sizes[rng() % 7], t, b)) {
+            claim(b);
+            mine.push_back(std::move(b));
+          } else {
+            fails++;
+          }
+        } else {
+          size_t k = rng() % mine.size();
+          release(mine[k]);
+          a.FreeBlocks(t, mine[k]);
+          mine[k] = std::move(mine.back());
+          mine.pop_back();
+        }
+      }
+      for (auto &b : mine) { release(b); a.FreeBlocks(t, b); }
+    });
+  }
+  for (auto &x : th) x.join();
+  REQUIRE(overlaps.load() == 0);
+  REQUIRE(live.empty());
+  REQUIRE(a.GetFreeExtentCount() == 0);
+  REQUIRE(a.GetHeapCursor() == 0);
+  REQUIRE(a.GetRemainingSize() == cap);
+  HLOG(kInfo, "bdev_coalesce_concurrent: {} allocation failures (full)", fails.load());
 }
 
 //==============================================================================
