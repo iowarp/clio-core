@@ -7282,6 +7282,23 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     const clio::run::u64 last_ms = last_snapshot_ms_.load();
     const bool must_compact =
         wal_bytes > config_.performance_.transaction_log_capacity_bytes_;
+    // #1312: a WAL far past its capacity means snapshots are not completing
+    // (nothing else truncates it), and every restart replays all of it into
+    // memory. Say so at error level -- embedders run at kError -- at most
+    // once a minute.
+    const clio::run::u64 cap = config_.performance_.transaction_log_capacity_bytes_;
+    if (cap > 0 && wal_bytes > 4 * cap &&
+        now_ms - last_wal_overflow_log_ms_ >= 60000) {
+      last_wal_overflow_log_ms_ = now_ms;
+      const clio::run::u64 done = last_snapshot_done_ms_.load();
+      HLOG(kError,
+           "FlushMetadata: metadata WAL is {} bytes, {}x its {}-byte "
+           "capacity; last completed snapshot {} -- a snapshot is not "
+           "finishing, so the WAL cannot be truncated",
+           wal_bytes, wal_bytes / cap, cap,
+           done == 0 ? std::string("never (this run)")
+                     : std::to_string((now_ms - done) / 1000) + " s ago");
+    }
     const bool unlogged_due =
         snapshot_dirty_.load() &&
         (last_ms == 0 || now_ms - last_ms >= kSnapshotMaxAgeMs);
@@ -7300,11 +7317,18 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     namespace fs = std::filesystem;
     fs::create_directories(fs::path(log_path).parent_path());
 
-    // Cap on the per-blob write-token acquire below. At the 10us poll default
-    // this is ~2s per blob: long enough to outlast any real write, short
-    // enough that a stuck holder degrades to a loud warning instead of hanging
-    // the flush forever.
-    constexpr clio::run::u64 kFlushTokenMaxSpins = 200000;
+    // Cap on the per-blob write-token acquire below, in WALL-CLOCK time
+    // (#1312). It used to be 200000 spins of yield(poll_us), meant as ~2 s;
+    // but a yield can take far longer than poll_us on a loaded worker, and a
+    // write whose I/O never completes ([AIO-STUCK]) holds its token forever.
+    // With many such blobs the snapshot never finished, so the WAL was never
+    // truncated and grew to GBs. 2 s for the first stuck blob; once one has
+    // timed out, others are most likely stuck behind the same I/O, so later
+    // waits are short and the whole snapshot stays bounded.
+    constexpr clio::run::u64 kFlushTokenWaitMs = 2000;
+    constexpr clio::run::u64 kFlushTokenWaitAfterStuckMs = 50;
+    clio::run::u64 token_wait_ms = kFlushTokenWaitMs;
+    size_t stuck_blobs = 0;
 
     // Every WAL record up to here has already been applied in memory, so the
     // snapshot below contains it; records logged while the snapshot is being
@@ -7391,20 +7415,29 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       // Same acquire pattern PutBlobImpl uses; reentrant and lost-wakeup-proof.
       clio::run::u64 flush_tok = reinterpret_cast<clio::run::u64>(&kv);
       clio::run::u64 spins = 0;
+      bool have_tok = true;
+      const clio::run::u64 wait_t0_ms = SteadyNowMs();
       while (!blob_info.TryLockWrite(flush_tok, "FlushMetadata",
                                      GetCurrentTimeNs())) {
-        if (++spins > kFlushTokenMaxSpins) { break; }
+        if (SteadyNowMs() - wait_t0_ms >= token_wait_ms) {
+          have_tok = false;
+          break;
+        }
+        ++spins;
         CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
       }
-      const bool have_tok = (spins <= kFlushTokenMaxSpins);
       BlobWriteLockGuard flush_guard(&blob_info, have_tok ? flush_tok : 0);
       if (!have_tok) {
-        const char *site = blob_info.write_site_;
-        HLOG(kError,
-             "FlushMetadata: could not take the write token for blob '{}' "
-             "after {} spins (held by {} for {} ms); its layout may be "
-             "captured mid-staging", key, spins, site != nullptr ? site : "?",
-             (GetCurrentTimeNs() - blob_info.write_since_ns_) / 1e6);
+        token_wait_ms = kFlushTokenWaitAfterStuckMs;
+        if (++stuck_blobs <= 8) {
+          const char *site = blob_info.write_site_;
+          HLOG(kError,
+               "FlushMetadata: could not take the write token for blob '{}' "
+               "after {} spins (held by {} for {} ms); its layout may be "
+               "captured mid-staging", key, spins,
+               site != nullptr ? site : "?",
+               (GetCurrentTimeNs() - blob_info.write_since_ns_) / 1e6);
+        }
       }
       // Entry type 2 == blob record carrying transform_flags_ (issue #818);
       // type 3 additionally carries droppable_. A NEW type each time rather
@@ -7538,6 +7571,12 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       }
     }
 
+    if (stuck_blobs > 0) {
+      HLOG(kError,
+           "FlushMetadata: {} blob(s) had a write token held past the "
+           "flush wait; their layouts were snapshotted without it",
+           stuck_blobs);
+    }
     ofs.close();
     if (ofs.fail() || !TransactionLog::DurableReplace(tmp_path, log_path)) {
       HLOG(kError, "FlushMetadata: could not write snapshot {}; the previous "
@@ -7574,6 +7613,7 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       }
     }
 
+    last_snapshot_done_ms_.store(SteadyNowMs());
     task->return_code_ = 0;
     const double snapshot_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - snapshot_t0).count();

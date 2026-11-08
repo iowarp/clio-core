@@ -1020,6 +1020,10 @@ private:
   /** Steady-clock time of the last full snapshot (ms since epoch of the
    *  steady clock; 0 = none yet). */
   std::atomic<clio::run::u64> last_snapshot_ms_{0};
+  /** SteadyNowMs() of the last snapshot that was swapped in (#1312). */
+  std::atomic<clio::run::u64> last_snapshot_done_ms_{0};
+  /** Rate limit for the WAL-over-capacity error (FlushMetadata only). */
+  clio::run::u64 last_wal_overflow_log_ms_ = 0;
 
   /**
    * Get access to configuration manager
