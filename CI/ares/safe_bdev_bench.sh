@@ -60,6 +60,7 @@ bdev_entry() {  # idx major [type]
     pool_id: "$2.0"
     bdev_type: ${3:-file}
     capacity: "${FILE_GB}GB"
+${SBDEV_PERSIST:+    persistence_level: $SBDEV_PERSIST}
 EOF
 }
 
