@@ -1483,10 +1483,13 @@ clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTarg
           pool_query, target_name, bdev_pool_id, bdev_type, total_size,
           /*io_depth=*/32, /*alignment=*/4096, /*perf_metrics=*/nullptr,
           /*alloc_log_path=*/"", task->growth_unit_,
-          // The target's configured persistence: a volatile tier's blocks are
-          // dropped on recovery anyway, so its bdev may skip the allocator
-          // WAL; temporary/long_term tiers keep it.
-          static_cast<int>(GetPersistenceLevelForTarget(target_name)));
+          // The target's CONFIGURED persistence: a tier explicitly marked
+          // volatile drops its blocks on recovery anyway, so its bdev may skip
+          // the allocator WAL. A target with no configured level (registered
+          // at runtime, or no persistence_level key) passes -1 and keeps the
+          // WAL -- GetPersistenceLevelForTarget's kVolatile fallback is not a
+          // promise that its blocks are disposable.
+          ConfiguredPersistenceLevel(target_name));
       CLIO_CO_AWAIT(create_task);
       if (create_task->return_code_ == 0 && target_node != this_node) {
         // The pool exists only on target_node, so this node has no metadata
@@ -6953,6 +6956,30 @@ float Runtime::GetManualScoreForTarget(const std::string &target_name) {
   }
 
   return -1.0f;  // No manual score configured for this target
+}
+
+int Runtime::ConfiguredPersistenceLevel(const std::string &target_name) {
+  for (size_t i = 0; i < storage_devices_.size(); ++i) {
+    const auto &device = storage_devices_[i];
+    const std::string expected_target_name = "storage_device_" + std::to_string(i);
+    if (target_name == expected_target_name || target_name == device.path_ ||
+        (target_name.rfind(device.path_, 0) == 0 &&
+         (target_name.size() == device.path_.size() ||
+          target_name[device.path_.size()] == '_'))) {
+      if (device.persistence_level_ == "volatile") {
+        return static_cast<int>(clio::run::bdev::PersistenceLevel::kVolatile);
+      }
+      if (device.persistence_level_ == "temporary") {
+        return static_cast<int>(
+            clio::run::bdev::PersistenceLevel::kTemporaryNonVolatile);
+      }
+      if (device.persistence_level_ == "long_term") {
+        return static_cast<int>(clio::run::bdev::PersistenceLevel::kLongTerm);
+      }
+      return -1;  // configured device without an explicit level
+    }
+  }
+  return -1;  // not a configured device (registered at runtime)
 }
 
 clio::run::bdev::PersistenceLevel Runtime::GetPersistenceLevelForTarget(
