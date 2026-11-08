@@ -275,6 +275,16 @@ bool FsBdevTransport::Init(const CreateParams& params,
 }
 
 bool FsBdevTransport::OpenAllocLog(const CreateParams& params) {
+  if (params.SkipsAllocLog()) {
+    // Explicitly volatile: nothing recovers this bdev's allocations, so keep
+    // no WAL and no sync thread. Remove a default log a previous non-volatile
+    // run may have left, so a later run with persistence never replays it.
+    std::error_code ec;
+    std::filesystem::remove(file_path_ + ".alloc_log", ec);
+    HLOG(kDebug, "bdev {}: persistence_level volatile, allocator WAL off",
+         file_path_);
+    return true;
+  }
   // An explicit alloc_log always recovers. The default log recovers on every
   // recovering start (a plain `clio_run start`); after `start --fresh` no
   // metadata references the old bytes, so their allocations are garbage and

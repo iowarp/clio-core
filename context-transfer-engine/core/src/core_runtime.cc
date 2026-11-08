@@ -1482,7 +1482,11 @@ clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTarg
       auto create_task = bdev_client.AsyncCreate(
           pool_query, target_name, bdev_pool_id, bdev_type, total_size,
           /*io_depth=*/32, /*alignment=*/4096, /*perf_metrics=*/nullptr,
-          /*alloc_log_path=*/"", task->growth_unit_);
+          /*alloc_log_path=*/"", task->growth_unit_,
+          // The target's configured persistence: a volatile tier's blocks are
+          // dropped on recovery anyway, so its bdev may skip the allocator
+          // WAL; temporary/long_term tiers keep it.
+          static_cast<int>(GetPersistenceLevelForTarget(target_name)));
       CLIO_CO_AWAIT(create_task);
       if (create_task->return_code_ == 0 && target_node != this_node) {
         // The pool exists only on target_node, so this node has no metadata

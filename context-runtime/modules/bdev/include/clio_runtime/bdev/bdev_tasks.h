@@ -193,6 +193,11 @@ struct CreateParams {
 
   // Persistence level for this block device
   PersistenceLevel persistence_level_ = PersistenceLevel::kVolatile;
+  // True only when the creator SET persistence_level_ (YAML key or the
+  // AsyncCreate argument). The default kVolatile is not a promise that the
+  // data is disposable -- CTE creates every tier bdev without it -- so only
+  // an explicit "volatile" may drop the allocator WAL (see SkipsAllocLog).
+  bool persistence_explicit_ = false;
 
   // When a memory-backed bdev commits its pages (see AllocPolicy). Defaulted
   // here rather than in each constructor so every existing caller — and every
@@ -266,13 +271,19 @@ struct CreateParams {
   CreateParams(BdevType bdev_type, clio::run::u64 total_size, clio::run::u32 io_depth,
                clio::run::u32 alignment, const PerfMetrics *perf_metrics = nullptr,
                const std::string &alloc_log_path = "",
-               clio::run::u64 growth_unit = clio::run::u64(1) << 30)
+               clio::run::u64 growth_unit = clio::run::u64(1) << 30,
+               int persistence_level = -1)
       : bdev_type_(bdev_type),
         total_size_(total_size),
         io_depth_(io_depth),
         alignment_(alignment),
         alloc_log_path_(alloc_log_path),
         growth_unit_(growth_unit) {
+    // persistence_level < 0: not specified (keep the default, not explicit).
+    if (persistence_level >= 0) {
+      persistence_level_ = static_cast<PersistenceLevel>(persistence_level);
+      persistence_explicit_ = true;
+    }
     // Set performance metrics (use provided metrics or defaults)
     if (perf_metrics != nullptr) {
       perf_metrics_ = *perf_metrics;
@@ -304,7 +315,19 @@ struct CreateParams {
   void serialize(Archive &ar) {
     ar(bdev_type_, total_size_, io_depth_, alignment_, perf_metrics_,
        persistence_level_, alloc_policy_, alloc_log_path_, growth_unit_,
-       populate_unit_);
+       populate_unit_, persistence_explicit_);
+  }
+
+  /**
+   * A bdev explicitly marked volatile keeps no allocator WAL: its contents
+   * do not survive a restart by contract (CTE already drops every block on a
+   * volatile target when it recovers), so the log's appends and its periodic
+   * fdatasync are pure overhead. An explicit alloc_log path still wins.
+   */
+  bool SkipsAllocLog() const {
+    return persistence_explicit_ &&
+           persistence_level_ == PersistenceLevel::kVolatile &&
+           alloc_log_path_.empty();
   }
 
   /**
@@ -468,10 +491,13 @@ struct CreateParams {
       std::string pl_str = config["persistence_level"].as<std::string>();
       if (pl_str == "volatile") {
         persistence_level_ = PersistenceLevel::kVolatile;
+        persistence_explicit_ = true;
       } else if (pl_str == "temporary") {
         persistence_level_ = PersistenceLevel::kTemporaryNonVolatile;
+        persistence_explicit_ = true;
       } else if (pl_str == "long_term") {
         persistence_level_ = PersistenceLevel::kLongTerm;
+        persistence_explicit_ = true;
       }
     }
   }

@@ -527,6 +527,56 @@ TEST_CASE("bdev_lazy_file_growth", "[bdev][file][growth]") {
  * other handles hold open is the POSIX behaviour being exercised.
  */
 #ifndef _WIN32
+TEST_CASE("bdev_volatile_skips_alloc_log", "[bdev][file][alloc_log][volatile]") {
+  // Only an EXPLICITLY volatile file bdev drops its allocator WAL; the
+  // default (unspecified) and non-volatile levels keep it, since CTE tiers
+  // and safe-bdev members rely on it to recover after a restart.
+  BdevChimodFixture fixture;
+  if (fixture.getNumContainers() != 1) {
+    HLOG(kInfo, "bdev_volatile_skips_alloc_log: skipping (needs a local stat; "
+                "num_containers != 1)");
+    return;
+  }
+  REQUIRE(g_initialized);
+  struct Case { int level; bool want_log; clio::run::u32 major; const char *tag; };
+  const Case cases[] = {
+      {-1, true, 151, "unset"},
+      {static_cast<int>(clio::run::bdev::PersistenceLevel::kVolatile), false, 152, "volatile"},
+      {static_cast<int>(clio::run::bdev::PersistenceLevel::kTemporaryNonVolatile), true, 153, "temporary"},
+      {static_cast<int>(clio::run::bdev::PersistenceLevel::kLongTerm), true, 154, "long_term"},
+  };
+  for (const Case &c : cases) {
+    const std::string file = fixture.getTestFile() + "." + c.tag;
+    const std::string log = file + ".alloc_log";
+    std::remove(file.c_str());
+    // A stale log from an earlier non-volatile run must not survive a
+    // volatile create either.
+    { std::ofstream stale(log); stale << "stale"; }
+    clio::run::PoolId pool_id(c.major, 0);
+    clio::run::bdev::Client client(pool_id);
+    auto create_task = client.AsyncCreate(
+        clio::run::PoolQuery::Dynamic(), file, pool_id,
+        clio::run::bdev::BdevType::kFile, 16 * 1024 * 1024, 32, 4096,
+        /*perf_metrics=*/nullptr, /*alloc_log_path=*/"",
+        /*growth_unit=*/clio::run::u64(1) << 30, c.level);
+    create_task.Wait();
+    REQUIRE(create_task->GetReturnCode() == 0);
+    client.pool_id_ = create_task->new_pool_id_;
+    // The bdev still works: allocate, write, read back.
+    auto alloc = client.AsyncAllocateBlocks(clio::run::PoolQuery::Local(), 65536);
+    alloc.Wait();
+    REQUIRE(alloc->GetReturnCode() == 0);
+    REQUIRE(!alloc->blocks_.empty());
+    struct stat st;
+    const bool has_log = stat(log.c_str(), &st) == 0;
+    HLOG(kInfo, "bdev_volatile_skips_alloc_log: {} -> alloc_log {}", c.tag,
+         has_log ? "present" : "absent");
+    REQUIRE(has_log == c.want_log);
+    std::remove(file.c_str());
+    std::remove(log.c_str());
+  }
+}
+
 TEST_CASE("bdev_backing_file_deleted_in_use", "[bdev][file][1210]") {
   BdevChimodFixture fixture;
   if (fixture.getNumContainers() != 1) {
