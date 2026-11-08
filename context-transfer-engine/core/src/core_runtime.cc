@@ -11554,20 +11554,16 @@ clio::run::TaskResume Runtime::GetContainedBlobs(
     std::string prefix = std::to_string(tag_id.major_) + "." +
                          std::to_string(tag_id.minor_) + ".";
 
-    // Iterate through tag_blob_name_to_info_ and filter by prefix
-    tag_blob_name_to_info_.for_each(
-        [this, &prefix, &task, &tag_id](
-            const std::string &composite_key,
-            const std::shared_ptr<BlobInfo> &blob_info_sp) {
-          // Check if composite key starts with the tag prefix
-          if (composite_key.rfind(prefix, 0) == 0) {
-            // Extract blob name (everything after the prefix)
-            std::string blob_name = composite_key.substr(prefix.length());
-            if (ServesBlob(*blob_info_sp, tag_id, blob_name)) {
-              task->blob_names_.push_back(blob_name);
-            }
-          }
-        });
+    // Per-tag blob index (#1336): visit only this tag's blobs, not every
+    // blob in the container. The index is maintained at every insert/erase
+    // of tag_blob_name_to_info_ (and on WAL replay).
+    for (std::string &blob_name : BlobIndexNames(tag_id)) {
+      std::shared_ptr<BlobInfo> blob_info_sp =
+          tag_blob_name_to_info_.get(prefix + blob_name);
+      if (blob_info_sp && ServesBlob(*blob_info_sp, tag_id, blob_name)) {
+        task->blob_names_.push_back(std::move(blob_name));
+      }
+    }
 
     // Success
     task->return_code_ = 0;
@@ -11692,27 +11688,25 @@ clio::run::TaskResume Runtime::BlobQuery(clio::run::shared_ptr<BlobQueryTask> &t
       std::string prefix = std::to_string(tag_id.major_) + "." +
                            std::to_string(tag_id.minor_) + ".";
 
-      // Iterate and collect matching blobs for this tag
-      tag_blob_name_to_info_.for_each(
-          [this, &prefix, &blob_pattern, &tag_name, &tag_id, &task](
-              const std::string &composite_key,
-              const std::shared_ptr<BlobInfo> &blob_info_sp) {
-            if (composite_key.rfind(prefix, 0) == 0) {
-              std::string blob_name = composite_key.substr(prefix.length());
-              if (ServesBlob(*blob_info_sp, tag_id, blob_name) &&
-                  std::regex_match(blob_name, blob_pattern)) {
-                // Increase total matched counter (counts all matches)
-                task->total_blobs_matched_++;
-                // Respect max_blobs_ if set
-                if (task->max_blobs_ == 0 ||
-                    task->tag_names_.size() <
-                        static_cast<size_t>(task->max_blobs_)) {
-                  task->tag_names_.push_back(tag_name);
-                  task->blob_names_.push_back(blob_name);
-                }
-              }
-            }
-          });
+      // Collect matching blobs through the per-tag index (#1336): the old
+      // loop walked EVERY blob in the container once per matching tag, so a
+      // query over a few small tags cost O(tags x all blobs).
+      for (const std::string &blob_name : BlobIndexNames(tag_id)) {
+        if (!std::regex_match(blob_name, blob_pattern)) continue;
+        std::shared_ptr<BlobInfo> blob_info_sp =
+            tag_blob_name_to_info_.get(prefix + blob_name);
+        if (!blob_info_sp || !ServesBlob(*blob_info_sp, tag_id, blob_name)) {
+          continue;
+        }
+        // Increase total matched counter (counts all matches)
+        task->total_blobs_matched_++;
+        // Respect max_blobs_ if set
+        if (task->max_blobs_ == 0 ||
+            task->tag_names_.size() < static_cast<size_t>(task->max_blobs_)) {
+          task->tag_names_.push_back(tag_name);
+          task->blob_names_.push_back(blob_name);
+        }
+      }
     }
 
     // Success
