@@ -82,7 +82,19 @@ facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no me
   </tbody>
 </table>
 
-<!--WINBENCH-->
+<h3>Against NTFS on a Windows workstation</h3>
+<p>A small Python script (1 GiB written in 1 MiB writes and fsynced, read back, then 2,000 files of 4 KiB created, stat'ed and listed) run twice on an NTFS directory and twice on a Context FS mount at <code>Z:</code>. Release build of the <code>dev</code> branch (f88db54bf), default runtime configuration bound to 127.0.0.1, WinFsp 2.0. Ryzen 7 3800X, 32 GB RAM, WD Black SN850X NVMe, Windows. Ranges are the two runs.</p>
+<table>
+  <thead><tr><th>Metric</th><th>NTFS (NVMe)</th><th>Context FS (WinFsp)</th></tr></thead>
+  <tbody>
+    <tr><td>Sequential write, 1 MiB, then fsync</td><td>1,081-1,258 MB/s</td><td><strong>2,347-3,838 MB/s</strong></td></tr>
+    <tr><td>Sequential read, 1 MiB</td><td><strong>2,122-2,278 MB/s</strong></td><td>965-1,354 MB/s</td></tr>
+    <tr><td>Create and write 4 KiB files</td><td><strong>2,310-2,748 / s</strong></td><td>1,321-1,366 / s</td></tr>
+    <tr><td><code>stat</code></td><td><strong>11-14 µs</strong></td><td>235-283 µs</td></tr>
+    <tr><td>List 2,000 entries</td><td><strong>1.2-1.3 ms</strong></td><td>7.1-9.3 ms</td></tr>
+  </tbody>
+</table>
+<p>Read this carefully. In this run the runtime registered a single storage target, the DRAM tier, so Context FS writes landed in memory: they are faster than NTFS but are not on disk when fsync returns, which NTFS guarantees. With a persistent disk tier active, writes also pay for the replica. Reads, file creation and metadata cross the WinFsp kernel boundary on every call and are 1.6x-20x slower than NTFS, consistent with the Linux numbers above. Defender real-time scanning was left on for both targets. Single machine, two runs each.</p>
 
 <h2>Where to go next</h2>
 <ul>

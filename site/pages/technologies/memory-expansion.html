@@ -54,7 +54,17 @@ facts: GPU backends | CUDA, SYCL (Intel); HIP build path ; CPU | cpu_vector ; Sp
 </table>
 <p>Compression costs 8x when the data fits and wins 2.4x at 4x oversubscription, because compressed pages keep more of the working set in the fast tier. The paging mechanism itself costs 1.31x on a 256 KB stream that fits, and disappears into PCIe time at 4x oversubscription.</p>
 
-<!--MEMBENCH-->
+<h2>CPU memory expansion on a workstation</h2>
+<p><code>cpu_vector</code> gives host code the same paging. <code>clio_kmeans_cpu_bench</code> clusters 4 GB of points (67M points, 16 dimensions, 8 clusters, 64 KB pages, 8 threads) while its page cache shrinks from the size of the data to an eighth of it. Release build of <code>dev</code> (f88db54bf) on Windows, Ryzen 7 3800X, 32 GB RAM; the backing store is a DRAM tier.</p>
+<table>
+  <thead><tr><th>Page cache</th><th>Data / cache</th><th>ms per iteration</th><th>Page faults</th></tr></thead>
+  <tbody>
+    <tr><td>4,096 MB</td><td>1x</td><td>1,202</td><td>303,365</td></tr>
+    <tr><td>1,024 MB</td><td>4x</td><td>1,229</td><td>327,680</td></tr>
+    <tr><td>512 MB</td><td>8x</td><td>1,249</td><td>327,680</td></tr>
+  </tbody>
+</table>
+<p>An 8x smaller cache cost 4% per iteration, and all three runs produced the same cluster counts and checksum. Even the full-size cache faulted most pages, because a sequential scan through an LRU-like cache evicts pages before reuse, so all three runs stream from the DRAM tier. This shows how little cache size matters for a streaming pass, not the cost against a plain in-memory array. One run each.</p>
 
 <h2>Where to go next</h2>
 <ul>

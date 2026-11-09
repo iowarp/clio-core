@@ -66,7 +66,17 @@ print(tag.GetContainedBlobs())               # list keys in the tag
 </table>
 <p>Absolute numbers are this machine's; the campaign notes that the ratios carry over but the bandwidths must be re-measured on your hardware.</p>
 
-<!--KVBENCH-->
+<h2>Put and get bandwidth on a workstation</h2>
+<p><code>clio_cte_bench</code>, 1 MiB blobs, put then get, 4 client threads with 8 requests in flight each, 16,000 operations, against a separate runtime with a 16 GB DRAM tier (<code>cte_config_ram.yaml</code>). Release build of <code>dev</code> (f88db54bf) on Windows: Ryzen 7 3800X, 32 GB RAM. The client reaches the runtime over loopback TCP, the transport Windows auto-selects.</p>
+<table>
+  <thead><tr><th>Metric</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>Aggregate bandwidth</td><td>1,474 MB/s</td></tr>
+    <tr><td>Per-thread bandwidth</td><td>365-373 MB/s</td></tr>
+    <tr><td>Mean latency per 1 MiB operation</td><td>2.7 ms</td></tr>
+  </tbody>
+</table>
+<p>One run. The same benchmark at 64 KiB and 4 KiB stopped partway with put errors on this build, so small-value numbers are not reported here; the YCSB results above cover small records.</p>
 
 <h2>Where to go next</h2>
 <ul>
