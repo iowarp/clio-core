@@ -31,29 +31,41 @@ print(tag.GetContainedBlobs())               # list keys in the tag
 
 <h2>Performance against Redis, RocksDB and DynamoDB</h2>
 <p>The repository's YCSB binding (<code>context-transfer-engine/benchmark/ycsb</code>) runs the standard workloads against CLIO Core and three other stores. Throughput in operations per second, higher is better:</p>
-<table>
-  <thead><tr><th>YCSB workload</th><th>CLIO Core (SHM)</th><th>Redis</th><th>RocksDB (embedded)</th><th>DynamoDB Local</th></tr></thead>
-  <tbody>
-    <tr><td>A: 50% read, 50% update</td><td>6,952</td><td>21,650</td><td>49,140</td><td>1,664</td></tr>
-    <tr><td>B: 95% read, 5% update</td><td><strong>42,553</strong></td><td>16,787</td><td>64,809</td><td>1,867</td></tr>
-    <tr><td>C: read only</td><td><strong>34,566-55,866</strong></td><td>21,044</td><td>62,383</td><td>1,915</td></tr>
-    <tr><td>F: read-modify-write</td><td>7,637</td><td>14,762</td><td>27,824</td><td>1,335</td></tr>
-  </tbody>
-</table>
-<ul class="bars" aria-label="YCSB workload B, operations per second">
-  <li><span>RocksDB (embedded)</span><span class="bar"><i style="width:100%"></i></span><span class="val">64,809</span></li>
+<div class="chart-grid">
+  <figure><figcaption>A: 50% read, 50% update, ops/s</figcaption>
+<ul class="bars" aria-label="A: 50% read, 50% update, ops/s">
+  <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:14%"></i></span><span class="val">6,952</span></li>
+  <li><span>Redis</span><span class="bar"><i style="width:44%"></i></span><span class="val">21,650</span></li>
+  <li><span>RocksDB (embedded)</span><span class="bar"><i style="width:100%"></i></span><span class="val">49,140</span></li>
+  <li><span>DynamoDB Local</span><span class="bar"><i style="width:3%"></i></span><span class="val">1,664</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>B: 95% read, 5% update, ops/s</figcaption>
+<ul class="bars" aria-label="B: 95% read, 5% update, ops/s">
   <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:66%"></i></span><span class="val">42,553</span></li>
   <li><span>Redis</span><span class="bar"><i style="width:26%"></i></span><span class="val">16,787</span></li>
+  <li><span>RocksDB (embedded)</span><span class="bar"><i style="width:100%"></i></span><span class="val">64,809</span></li>
   <li><span>DynamoDB Local</span><span class="bar"><i style="width:3%"></i></span><span class="val">1,867</span></li>
 </ul>
-<p class="bars-caption">Workload B, 100k records of about 1.1 KB, 100k operations, 4 threads, one WSL2 machine.</p>
-<ul class="bars" aria-label="YCSB workload C, operations per second">
-  <li><span>RocksDB (embedded)</span><span class="bar"><i style="width:100%"></i></span><span class="val">62,383</span></li>
+  </figure>
+  <figure><figcaption>C: read only, ops/s</figcaption>
+<ul class="bars" aria-label="C: read only, ops/s">
   <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:55%"></i></span><span class="val">34,566+</span></li>
   <li><span>Redis</span><span class="bar"><i style="width:34%"></i></span><span class="val">21,044</span></li>
+  <li><span>RocksDB (embedded)</span><span class="bar"><i style="width:100%"></i></span><span class="val">62,383</span></li>
   <li><span>DynamoDB Local</span><span class="bar"><i style="width:3%"></i></span><span class="val">1,915</span></li>
 </ul>
-<p class="bars-caption">Workload C (read only), higher is better. CLIO Core measured 34,566-55,866 across runs; the bar shows the low end.</p>
+  </figure>
+  <figure><figcaption>F: read-modify-write, ops/s</figcaption>
+<ul class="bars" aria-label="F: read-modify-write, ops/s">
+  <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:27%"></i></span><span class="val">7,637</span></li>
+  <li><span>Redis</span><span class="bar"><i style="width:53%"></i></span><span class="val">14,762</span></li>
+  <li><span>RocksDB (embedded)</span><span class="bar"><i style="width:100%"></i></span><span class="val">27,824</span></li>
+  <li><span>DynamoDB Local</span><span class="bar"><i style="width:5%"></i></span><span class="val">1,335</span></li>
+</ul>
+  </figure>
+</div>
+<p class="bars-caption">Higher is better. 100k records of about 1.1 KB, 100k operations, 4 threads, one WSL2 machine. CLIO Core measured 34,566-55,866 on workload C across runs; the bar shows the low end.</p>
 <p>How to read it:</p>
 <ul>
   <li>CLIO Core's shared-memory read path is about twice as fast as Redis on the read-heavy workloads, B and C.</li>
@@ -75,14 +87,23 @@ print(tag.GetContainedBlobs())               # list keys in the tag
 
 <h2>Put and get bandwidth on a workstation</h2>
 <p><code>clio_cte_bench</code>, put then get, 4 client threads with 8 requests in flight each, against a separate runtime with a 16 GB DRAM tier (<code>cte_config_ram.yaml</code>). Release build of <code>dev</code> (f88db54bf) on Windows: Ryzen 7 3800X, 32 GB RAM. The client reaches the runtime over loopback TCP, the transport Windows auto-selects.</p>
-<table>
-  <thead><tr><th>Value size</th><th>Operations</th><th>Aggregate bandwidth</th><th>Operations / s</th><th>Mean latency</th></tr></thead>
-  <tbody>
-    <tr><td>1 MiB</td><td>16,000</td><td>1,474 MB/s</td><td>1,474</td><td>2.7 ms</td></tr>
-    <tr><td>64 KiB</td><td>8,000</td><td>945 MB/s</td><td>15,117</td><td>265 µs</td></tr>
-    <tr><td>4 KiB</td><td>20,000</td><td>106 MB/s</td><td>27,075</td><td>148 µs</td></tr>
-  </tbody>
-</table>
+<div class="chart-grid">
+  <figure><figcaption>Operations per second (higher is better)</figcaption>
+<ul class="bars" aria-label="Operations per second (higher is better)">
+  <li class="ours"><span>1 MiB values</span><span class="bar"><i style="width:5%"></i></span><span class="val">1,474</span></li>
+  <li class="ours"><span>64 KiB values</span><span class="bar"><i style="width:56%"></i></span><span class="val">15,117</span></li>
+  <li class="ours"><span>4 KiB values</span><span class="bar"><i style="width:100%"></i></span><span class="val">27,075</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Mean latency per operation, µs (lower is better)</figcaption>
+<ul class="bars" aria-label="Mean latency per operation, µs (lower is better)">
+  <li class="ours"><span>1 MiB values</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,700</span></li>
+  <li class="ours"><span>64 KiB values</span><span class="bar"><i style="width:10%"></i></span><span class="val">265</span></li>
+  <li class="ours"><span>4 KiB values</span><span class="bar"><i style="width:5%"></i></span><span class="val">148</span></li>
+</ul>
+  </figure>
+</div>
+<p class="bars-caption">Aggregate bandwidth: 1,474 MB/s at 1 MiB, 945 MB/s at 64 KiB, 106 MB/s at 4 KiB.</p>
 <p>One run each. Longer 64 KiB and 4 KiB runs (80,000 operations) stopped partway with put errors on this build, so the small-value rows use shorter runs.</p>
 
 <h2>Where to go next</h2>

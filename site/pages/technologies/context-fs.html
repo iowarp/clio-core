@@ -18,14 +18,11 @@ facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no me
 
 <h2>FUSE on every desktop and cluster</h2>
 <p>One daemon mounts on all three operating systems with each platform's native driver:</p>
-<table>
-  <thead><tr><th>Platform</th><th>Driver</th><th>Install</th></tr></thead>
-  <tbody>
-    <tr><td>Linux</td><td>libfuse3</td><td>Included in the pip wheel</td></tr>
-    <tr><td>Windows</td><td>WinFsp (FUSE 3 compatibility layer), mounted as a drive letter</td><td>Included in the pip wheel</td></tr>
-    <tr><td>macOS</td><td>macFUSE, or FSKit on macOS 15.4 and newer</td><td>Build from source</td></tr>
-  </tbody>
-</table>
+<ul class="checks">
+  <li><strong>Linux</strong>: libfuse3, included in the pip wheel.</li>
+  <li><strong>Windows</strong>: WinFsp (FUSE 3 compatibility layer), mounted as a drive letter, included in the pip wheel.</li>
+  <li><strong>macOS</strong>: macFUSE, or FSKit on macOS 15.4 and newer; build from source.</li>
+</ul>
 <p>Writes go straight through, so a file's size is exact as soon as <code>write()</code> returns. Attribute and negative-lookup caches last 1 s, and a shared-memory mirror answers <code>stat</code> without a round trip to the runtime. See the <a href="/tutorials/fuse-linux.html">Linux</a>, <a href="/tutorials/fuse-macos.html">macOS</a> and <a href="/tutorials/fuse-windows.html">Windows</a> tutorials.</p>
 
 <h2>Tiering</h2>
@@ -51,16 +48,14 @@ facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no me
 <p>The block device module has S3 and Google Cloud Storage transports, so a bucket can be a tier like any disk. Give it the lowest score and only data the organizer demotes reaches it. Separately, the assimilation engine imports existing <code>s3://</code> and <code>gs://</code> objects, including anonymous reads of public buckets. The <a href="/tutorials/cloud-storage.html">cloud storage tutorial</a> covers both.</p>
 
 <h2>Performance</h2>
-<p>Measured metadata latencies for one operation each, through the FUSE mount on Linux (from <a href="/design/filesystem.html">Filesystem and FUSE</a>):</p>
-<table>
-  <thead><tr><th>Operation</th><th>Latency</th></tr></thead>
-  <tbody>
-    <tr><td><code>stat</code>, shared-memory mirror</td><td>about 10 µs</td></tr>
-    <tr><td><code>stat</code>, through the filesystem module</td><td>about 31 µs</td></tr>
-    <tr><td><code>readdir</code>, 10 entries / 100 entries</td><td>255 µs / 592 µs</td></tr>
-    <tr><td><code>rename</code></td><td>about 570 µs</td></tr>
-  </tbody>
-</table>
+<p>Metadata latency for one operation each, through the FUSE mount on Linux (from <a href="/design/filesystem.html">Filesystem and FUSE</a>):</p>
+<ul class="bars" aria-label="Metadata latency through the FUSE mount on Linux">
+  <li class="ours"><span>stat, shared-memory mirror</span><span class="bar"><i style="width:2%"></i></span><span class="val">~10 µs</span></li>
+  <li class="ours"><span>stat, filesystem module</span><span class="bar"><i style="width:5%"></i></span><span class="val">~31 µs</span></li>
+  <li class="ours"><span>readdir, 10 entries</span><span class="bar"><i style="width:43%"></i></span><span class="val">255 µs</span></li>
+  <li class="ours"><span>rename</span><span class="bar"><i style="width:96%"></i></span><span class="val">~570 µs</span></li>
+  <li class="ours"><span>readdir, 100 entries</span><span class="bar"><i style="width:100%"></i></span><span class="val">592 µs</span></li>
+</ul>
 <p>About 91% of each operation's wall time is kernel transit; the daemon itself spends about 9.6 µs of CPU time per operation.</p>
 
 <h3>Against ext4: cloning the Linux kernel</h3>
@@ -97,17 +92,14 @@ facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no me
   <li><span>NTFS</span><span class="bar"><i style="width:5%"></i></span><span class="val">12</span></li>
 </ul>
   </figure>
+  <figure><figcaption>List 2,000 entries, ms (lower is better)</figcaption>
+<ul class="bars" aria-label="List 2,000 entries, ms (lower is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">8.2</span></li>
+  <li><span>NTFS</span><span class="bar"><i style="width:15%"></i></span><span class="val">1.25</span></li>
+</ul>
+  </figure>
 </div>
-<table>
-  <thead><tr><th>Metric (two runs)</th><th>NTFS (NVMe)</th><th>Context FS (WinFsp)</th></tr></thead>
-  <tbody>
-    <tr><td>Sequential write, 1 MiB, then fsync</td><td>1,081-1,258 MB/s</td><td><strong>2,347-3,838 MB/s</strong></td></tr>
-    <tr><td>Sequential read, 1 MiB</td><td><strong>2,122-2,278 MB/s</strong></td><td>965-1,354 MB/s</td></tr>
-    <tr><td>Create and write 4 KiB files</td><td><strong>2,310-2,748 / s</strong></td><td>1,321-1,366 / s</td></tr>
-    <tr><td><code>stat</code></td><td><strong>11-14 µs</strong></td><td>235-283 µs</td></tr>
-    <tr><td>List 2,000 entries</td><td><strong>1.2-1.3 ms</strong></td><td>7.1-9.3 ms</td></tr>
-  </tbody>
-</table>
+<p class="bars-caption">Bars are the mean of two runs; the two runs were within 1,081-1,258 vs 2,347-3,838 MB/s for writes and 2,122-2,278 vs 965-1,354 MB/s for reads (NTFS vs Context FS).</p>
 <p>Read the write result carefully: in this run the runtime registered a single storage target, the DRAM tier, so Context FS writes landed in memory and were not on disk when fsync returned, which NTFS guarantees. With a persistent disk tier active, writes also pay for the replica. Reads, file creation and metadata cross the WinFsp kernel boundary on every call, which is where NTFS leads. Defender real-time scanning was on for both. Single machine, two runs each.</p>
 
 <h2>Where to go next</h2>

@@ -597,7 +597,7 @@ dl.notes dd { margin: 0; color: var(--ink-soft); }
 .chart-grid figure, .figure { margin: 0; }
 .chart-grid figcaption { font-size: 0.85rem; color: var(--muted); margin-bottom: var(--space-2); }
 .chart-grid .bars { margin: 0; }
-.chart-grid .bars li { grid-template-columns: 6.5rem minmax(0, 1fr) 4.5rem; }
+.chart-grid .bars li { grid-template-columns: 8.5rem minmax(0, 1fr) 5rem; }
 .figure { margin: var(--space-5) 0; }
 .figure img { display: block; width: 100%; height: auto; border-radius: var(--radius); background: #fff; padding: var(--space-2); }
 .figure figcaption { font-size: 0.85rem; color: var(--muted); margin-top: var(--space-2); }

@@ -1,72 +1,90 @@
 <!--
 title: Memory expansion
-heading: Memory expansion: <em>bigger than the device.</em>
-description: CLIO Core's paged vectors let GPU and CPU code work on data larger than device memory, paging to host RAM, NVMe and remote nodes, at close to the speed of hand-written message passing.
+heading: Memory expansion: <em>GPU memory without a ceiling.</em>
+description: Eternia, CLIO Core's memory expansion technology, extends GPU memory across nodes and a tiered hierarchy of DRAM and storage. On up to 64 Aurora nodes it runs within 0.88-1.19x of MPI, oneCCL and Intel SHMEM, and it runs problems twice as large as file-system and buffering baselines.
 eyebrow: Technologies · Memory
-lede: gpu_vector and cpu_vector are arrays whose pages live in CLIO Core's tiers. Kernels hold the pages they need, the runtime fetches, flushes and evicts the rest, and the same vector can span the GPUs of many nodes.
-facts: GPU backends | CUDA, SYCL (Intel); HIP build path ; CPU | cpu_vector ; Spill tiers | HBM, host RAM, NVMe, any CTE tier ; Scale | Tested to 64 Aurora nodes
+lede: Eternia is a software distributed shared memory built on CLIO Core. It extends GPU memory across nodes and down a tiered hierarchy of DRAM and storage, and takes placement, coherence and persistence off the programmer's hands.
+facts: Interface | Paged vector (gpu_vector, cpu_vector) ; GPUs | Intel Max 1550 (SYCL), NVIDIA (CUDA) ; Tiers | HBM, DRAM, DAOS, Lustre, any CTE tier ; Scale | Measured to 64 Aurora nodes
 -->
 <ul class="headline-stats">
-  <li><strong>0.93x</strong><span>MPI's step time, LBANN-style training on 4 Aurora nodes</span></li>
-  <li><strong>10x</strong><span>less slowest-rank communication time than MPI there</span></li>
-  <li><strong>1.01-1.19x</strong><span>MPI's time at 64 nodes on four workloads</span></li>
-  <li><strong>bit-equal</strong><span>results to the MPI, oneCCL and SHMEM versions</span></li>
+  <li><strong>0.88-1.19x</strong><span>MPI's time on four workloads, 4 to 64 Aurora nodes</span></li>
+  <li><strong>2x</strong><span>larger problems than DDN, Hermes and cuFile can run</span></li>
+  <li><strong>1.22-1.24x</strong><span>faster than the fastest of them where they still run</span></li>
+  <li><strong>52 ms</strong><span>communication at 64 nodes, against about 7 s for the libraries</span></li>
 </ul>
 
 <h2>What it is</h2>
-<p>A paged vector looks like a normal array to the code that uses it. Its contents are split into pages (from 64 KB to several MB, chosen per vector) that are stored as CTE blobs. A GPU block asks for the pages it is about to touch (<code>CoFetch</code>, <code>CoHoldPage</code>), works on them in device memory, and flushes the pages it changed (<code>CoBeginFlush</code>, <code>CoEndFlush</code>). Pages that do not fit in the device cache spill to the next tier: host RAM, NVMe, or another node's memory. The cache size is a parameter, so the same code runs with the whole dataset resident or with a fraction of it.</p>
+<p>Scientific and AI applications increasingly produce datasets that exceed GPU memory, and buying more HBM is expensive in both money and energy. Today the alternatives are distributed GPU memory libraries, which are bounded by aggregate device memory, and hand-written out-of-core code, which is complex, rarely reusable and pays heavy data-movement penalties.</p>
+<p>Eternia gives kernels a <strong>paged vector</strong> whose pages live in CLIO Core's tiers. The interface is explicit on purpose: kernels issue their own batched, asynchronous fetches and flushes, so data movement overlaps computation.</p>
 <ul class="checks">
-  <li><strong>Larger than memory.</strong> A dataset is bounded by the tier stack, not by GPU memory or host RAM.</li>
-  <li><strong>One namespace across nodes.</strong> A rank reads another node's pages by name, so many codes that used halo exchanges or collectives become plain reads and writes.</li>
-  <li><strong>Compression on the fault path.</strong> Pages can be LZ4-compressed as they leave the fast tier, which trades CPU for capacity when the data no longer fits.</li>
-  <li><strong>Portable.</strong> The same kernels compile for CUDA and SYCL, and were measured on NVIDIA laptop and A100 GPUs and on Intel GPUs; <code>cpu_vector</code> gives host code the same paging.</li>
+  <li><strong>Generational coherence</strong> keeps pages cached in GPU memory consistent across nodes and tiers, without sharer tracking or invalidations.</li>
+  <li><strong>Tiered by construction.</strong> Pages that do not fit in the GPU's frame cache spill to DRAM, then to DAOS, Lustre or any tier the runtime composes, so a dataset is bounded by the tier stack, not by device memory.</li>
+  <li><strong>Persistent checkpoints.</strong> Checkpoints are copy-on-write snapshots in the tiered store, drained to persistent storage in the background and readable in portable formats such as HDF5.</li>
+  <li><strong>Shipped with its expertise.</strong> An agent skill encodes how to use the interface well, and derives application-specific placement policies from an application's own kernels.</li>
 </ul>
 
 <h2>Against MPI, oneCCL and Intel SHMEM</h2>
-<p>The hardest comparison for a paging system is hand-written message passing, where the programmer moves exactly the bytes that are needed. Four very different workloads were rewritten on <code>gpu_vector</code> and run on Aurora (Intel Data Center GPU Max, one tile per rank) against MPI, oneCCL and Intel SHMEM versions of the same code. Ratios below 1 mean the paged version is faster.</p>
-<table>
-  <thead><tr><th>Workload, 4 nodes</th><th>gpu_vector</th><th>MPI</th><th>oneCCL</th><th>Intel SHMEM</th></tr></thead>
-  <tbody>
-    <tr><td>Neural-network training (LBANN pattern), ms/step</td><td><strong>1,919-1,923</strong></td><td>2,062</td><td>2,039</td><td>2,102</td></tr>
-    <tr><td>Slowest-rank communication, ms</td><td><strong>33.8</strong></td><td>336.8</td><td>195.0</td><td>352.2</td></tr>
-    <tr><td>Particle-mesh (GROMACS pattern), ms/pass</td><td><strong>~300</strong></td><td>307.6</td><td>309.1</td><td>309.3</td></tr>
-    <tr><td>Slowest-rank communication, ms</td><td><strong>3.4</strong></td><td>47.6</td><td>86.8</td><td>43.6</td></tr>
-  </tbody>
-</table>
-<p>Results are bit-equal to the baselines (network weights and mesh checksums). In weak scaling from 4 to 64 nodes, the paged versions finished at 64 nodes within 1.01x (particle-mesh), 1.07x (training), 1.12x (Gray-Scott stencil) and 1.19x (k-means) of MPI.</p>
-<ul class="bars" aria-label="Training step time on 4 nodes, ms, lower is better">
-  <li class="ours"><span>gpu_vector</span><span class="bar"><i style="width:91%"></i></span><span class="val">1,921</span></li>
-  <li><span>oneCCL</span><span class="bar"><i style="width:97%"></i></span><span class="val">2,039</span></li>
-  <li><span>MPI</span><span class="bar"><i style="width:98%"></i></span><span class="val">2,062</span></li>
-  <li><span>Intel SHMEM</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,102</span></li>
+<p>Four workloads with very different access patterns (k-means, a Gray-Scott stencil, the particle-mesh Ewald spread and gather of a molecular-dynamics step, and model-parallel neural-network training) were written once on Eternia's paged vector and again as standalone MPI, oneCCL and Intel SHMEM codes. They weak-scale from 4 to 64 Aurora nodes, one GPU tile per node, with each node's share fitting in GPU memory. Every run ends in a correctness gate: identical checksums, bit-equal mesh totals, identical weight digests.</p>
+<figure class="figure"><img src="/assets/figures/eternia-weak-scaling.png" alt="Weak scaling on Aurora from 4 to 64 nodes for kmeans, Gray-Scott, gmx and lbann. Each bar is time per iteration for Eternia, MPI, oneCCL and Intel SHMEM, split into communication and compute." loading="lazy"><figcaption>Weak scaling on Aurora, one GPU tile per node. Each bar is time per iteration, split into communication on the slowest rank (hatched) and compute. Flat is ideal, except for lbann, whose model grows with the node count. Intel SHMEM failed validation for lbann at 4 and 8 nodes and has no result at 64.</figcaption></figure>
+<p>The libraries cache nothing and need no coherence, so they are the upper bound. Eternia stays within 20% of MPI at every scale measured and matches or beats oneCCL and Intel SHMEM in several configurations:</p>
+<ul>
+  <li><strong>gmx</strong> is at parity (1.00-1.06x MPI) and faster than all three libraries at 24 nodes (0.88x). Its halo is a handful of whole mesh planes that Eternia publishes once per pass.</li>
+  <li><strong>lbann</strong> trains faster on Eternia at 4 and 8 nodes (0.90x and 0.98x) and stays within 7% at 16 and 64.</li>
+  <li><strong>kmeans</strong> (1.10-1.19x) and <strong>Gray-Scott</strong> (1.12-1.16x) hold steady as the machine grows. At 64 nodes Intel SHMEM falls to 1.53x MPI on Gray-Scott while Eternia holds 1.12x.</li>
 </ul>
-<p class="bars-caption">LBANN-pattern training step, 4 Aurora nodes, lower is better.</p>
 <div class="chart-grid">
-  <figure><figcaption>Slowest-rank communication, training, ms (lower is better)</figcaption>
-<ul class="bars" aria-label="Slowest-rank communication, training, ms (lower is better)">
-  <li class="ours"><span>gpu_vector</span><span class="bar"><i style="width:10%"></i></span><span class="val">33.8</span></li>
-  <li><span>oneCCL</span><span class="bar"><i style="width:55%"></i></span><span class="val">195.0</span></li>
-  <li><span>MPI</span><span class="bar"><i style="width:96%"></i></span><span class="val">336.8</span></li>
-  <li><span>Intel SHMEM</span><span class="bar"><i style="width:100%"></i></span><span class="val">352.2</span></li>
-</ul>
-  </figure>
-  <figure><figcaption>Slowest-rank communication, particle-mesh, ms (lower is better)</figcaption>
-<ul class="bars" aria-label="Slowest-rank communication, particle-mesh, ms (lower is better)">
-  <li class="ours"><span>gpu_vector</span><span class="bar"><i style="width:4%"></i></span><span class="val">3.4</span></li>
-  <li><span>Intel SHMEM</span><span class="bar"><i style="width:50%"></i></span><span class="val">43.6</span></li>
-  <li><span>MPI</span><span class="bar"><i style="width:55%"></i></span><span class="val">47.6</span></li>
-  <li><span>oneCCL</span><span class="bar"><i style="width:100%"></i></span><span class="val">86.8</span></li>
-</ul>
-  </figure>
+  <figure><figcaption>gmx communication on the slowest rank, 64 nodes, seconds (lower is better)</figcaption>
+  <ul class="bars">
+    <li class="ours"><span>Eternia</span><span class="bar"><i style="width:2%"></i></span><span class="val">0.052</span></li>
+    <li><span>MPI</span><span class="bar"><i style="width:100%"></i></span><span class="val">~7</span></li>
+    <li><span>oneCCL</span><span class="bar"><i style="width:100%"></i></span><span class="val">~7</span></li>
+    <li><span>Intel SHMEM</span><span class="bar"><i style="width:100%"></i></span><span class="val">~7</span></li>
+  </ul></figure>
+  <figure><figcaption>Gray-Scott time relative to MPI, 64 nodes (lower is better)</figcaption>
+  <ul class="bars">
+    <li><span>MPI</span><span class="bar"><i style="width:65%"></i></span><span class="val">1.00x</span></li>
+    <li class="ours"><span>Eternia</span><span class="bar"><i style="width:73%"></i></span><span class="val">1.12x</span></li>
+    <li><span>Intel SHMEM</span><span class="bar"><i style="width:100%"></i></span><span class="val">1.53x</span></li>
+  </ul></figure>
 </div>
-<h3>Weak scaling to 64 nodes</h3>
-<p>Time relative to MPI at 64 Aurora nodes (1.00 = MPI; lower is better). Not every code is there yet: on one node, a molecular-dynamics code is still 2.6x MPI.</p>
-<ul class="bars" aria-label="Time relative to MPI at 64 nodes">
-  <li class="ours"><span>Particle-mesh</span><span class="bar"><i style="width:85%"></i></span><span class="val">1.01x</span></li>
-  <li class="ours"><span>Training</span><span class="bar"><i style="width:90%"></i></span><span class="val">1.07x</span></li>
-  <li class="ours"><span>Stencil</span><span class="bar"><i style="width:94%"></i></span><span class="val">1.12x</span></li>
-  <li class="ours"><span>k-means</span><span class="bar"><i style="width:100%"></i></span><span class="val">1.19x</span></li>
-</ul>
+<p>Where the residual cost comes from: the kernels themselves run within 2-6% of MPI's. The gap is small control-path exchanges, such as k-means' 4 KB centroid reduction, which ride the runtime's TCP transport where the libraries use the fabric directly.</p>
+
+<h2>Larger problems than file systems and I/O buffers</h2>
+<p>A GPU simulation that outgrows memory would otherwise write its output through a parallel file system or an I/O buffering layer. Gray-Scott on 4 Delta nodes (four NVIDIA A40 GPUs, 256 GB of DRAM per node) grows from 32 GB to 256 GB of data, against the same code writing through the DDN Exascaler file system over POSIX, through the tiered buffering system Hermes, and through NVIDIA cuFile (GPUDirect Storage). Runtime in seconds, lower is better:</p>
+<div class="chart-grid">
+  <figure><figcaption>32 GB</figcaption>
+  <ul class="bars">
+    <li class="ours"><span>Eternia</span><span class="bar"><i style="width:7%"></i></span><span class="val">40.2</span></li>
+    <li><span>cuFile</span><span class="bar"><i style="width:9%"></i></span><span class="val">49.2</span></li>
+    <li><span>Hermes</span><span class="bar"><i style="width:10%"></i></span><span class="val">53.6</span></li>
+    <li><span>DDN</span><span class="bar"><i style="width:25%"></i></span><span class="val">138.5</span></li>
+  </ul></figure>
+  <figure><figcaption>64 GB</figcaption>
+  <ul class="bars">
+    <li class="ours"><span>Eternia</span><span class="bar"><i style="width:17%"></i></span><span class="val">93.8</span></li>
+    <li><span>cuFile</span><span class="bar"><i style="width:21%"></i></span><span class="val">116.2</span></li>
+    <li><span>Hermes</span><span class="bar"><i style="width:24%"></i></span><span class="val">129.6</span></li>
+    <li><span>DDN</span><span class="bar"><i style="width:41%"></i></span><span class="val">223.4</span></li>
+  </ul></figure>
+  <figure><figcaption>128 GB</figcaption>
+  <ul class="bars">
+    <li class="ours"><span>Eternia</span><span class="bar"><i style="width:30%"></i></span><span class="val">165.3</span></li>
+    <li><span>cuFile</span><span class="bar"><i style="width:37%"></i></span><span class="val">201.1</span></li>
+    <li><span>Hermes</span><span class="bar"><i style="width:41%"></i></span><span class="val">227.9</span></li>
+    <li><span>DDN</span><span class="bar"><i style="width:100%"></i></span><span class="val">549.6</span></li>
+  </ul></figure>
+  <figure><figcaption>192 GB and 256 GB</figcaption>
+  <ul class="bars">
+    <li class="ours"><span>Eternia, 192 GB</span><span class="bar"><i style="width:51%"></i></span><span class="val">281.5</span></li>
+    <li class="ours"><span>Eternia, 256 GB</span><span class="bar"><i style="width:82%"></i></span><span class="val">451.3</span></li>
+    <li><span>DDN, Hermes, cuFile</span><span class="bar"><i style="width:0%"></i></span><span class="val">out of memory</span></li>
+  </ul></figure>
+</div>
+<p class="bars-caption">Gray-Scott on 4 Delta nodes as the dataset grows. Beyond 128 GB the DDN, Hermes and cuFile editions exhaust memory and no longer run.</p>
+<p>The alternatives keep the whole grid resident in memory while they compute and write it, so the largest problem they can run is bounded by the memory of the nodes they run on. Eternia pages the grid through its tiers, so it runs twice the data, and runs the sizes the others can handle 1.22-1.24x faster than the fastest of them.</p>
+
+<h2>Where these numbers come from</h2>
+<p>All results on this page are from the Eternia paper's evaluation (<code>external/eternia</code>), run on Argonne's Aurora (two Xeon CPU Max 9470, 1 TB DDR5 and six Intel Data Center GPU Max 1550 per node, Slingshot 11) and NCSA's Delta. Every timed region runs for at least two minutes, and every run is checked against its reference.</p>
 
 <h2>Where to go next</h2>
 <ul>
