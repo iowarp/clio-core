@@ -11624,6 +11624,39 @@ clio::run::TaskResume Runtime::GetContainedBlobs(
   CLIO_TASK_BODY_END
 }
 
+std::vector<std::pair<std::string, TagId>> Runtime::MatchTags(
+    const std::string &tag_regex) {
+  // One tag matcher for TagQuery and BlobQuery (#1336). An anchored literal
+  // (getattr/lookup/rename) resolves through the O(1) name hash, walking the
+  // hierarchy for absolute paths, instead of compiling a std::regex over the
+  // whole index per call (#680); aliases/hard links resolve too since they
+  // are stored under their own relative key. Anything else goes through the
+  // trigram search index, whose keys are the absolute tag names (#598).
+  std::vector<std::pair<std::string, TagId>> out;
+  std::string exact;
+  if (TryParseAnchoredLiteral(tag_regex, &exact)) {
+    TagId id = TagId::GetNull();
+    if (IsHierPath(exact)) {
+      id = ResolvePathToIdLocked(exact);
+    } else {
+      TagId *p = tag_name_to_id_.find(exact);
+      if (p != nullptr) {
+        id = *p;
+      }
+    }
+    if (!id.IsNull()) {
+      out.emplace_back(exact, id);
+    }
+    return out;
+  }
+  auto result = tag_search_.Search(tag_regex);
+  out.reserve(result.size());
+  for (const auto &kv : result) {
+    out.emplace_back(kv.first, kv.second);
+  }
+  return out;
+}
+
 clio::run::TaskResume Runtime::TagQuery(clio::run::shared_ptr<TagQueryTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
@@ -11638,44 +11671,19 @@ clio::run::TaskResume Runtime::TagQuery(clio::run::shared_ptr<TagQueryTask> &tas
     task->results_.clear();
     task->result_ids_.clear();
     size_t total = 0;
-    std::string exact;
-    if (TryParseAnchoredLiteral(tag_regex, &exact)) {
-      // Exact-match query (getattr/lookup/rename): resolve through the O(1) name
-      // hash (walking the hierarchy for absolute paths) instead of compiling a
-      // std::regex over the whole index per call -- the dominant metadata cost
-      // under concurrent workloads (#680). Aliases/hard links resolve too since
-      // they are stored under their own relative key in tag_name_to_id_.
-      TagId id = TagId::GetNull();
-      if (IsHierPath(exact)) {
-        id = ResolvePathToIdLocked(exact);
-      } else {
-        TagId *p = tag_name_to_id_.find(exact);
-        if (p != nullptr) {
-          id = *p;
-        }
+    std::vector<std::pair<std::string, TagId>> matched = MatchTags(tag_regex);
+    total = matched.size();
+    // Each result carries a packed id, used by the filesystem readdir to
+    // assign a stable inode without a second lookup.
+    for (const auto &kv : matched) {
+      if (task->max_tags_ != 0 && task->results_.size() >= task->max_tags_) {
+        break;
       }
-      if (!id.IsNull()) {
-        task->results_.push_back(exact);
-        task->result_ids_.push_back(
-            (static_cast<clio::run::u64>(id.major_) << 32) |
-            static_cast<clio::run::u64>(id.minor_));
-        total = 1;
-      }
-    } else {
-      auto result = tag_search_.Search(tag_regex);
-      total = result.size();
-      // Iterate (name, TagId) pairs so each result carries a packed id, used by
-      // the filesystem readdir to assign a stable inode without a second lookup.
-      for (const auto &kv : result) {
-        if (task->max_tags_ != 0 && task->results_.size() >= task->max_tags_) {
-          break;
-        }
-        task->results_.push_back(kv.first);
-        const TagId &id = kv.second;
-        task->result_ids_.push_back(
-            (static_cast<clio::run::u64>(id.major_) << 32) |
-            static_cast<clio::run::u64>(id.minor_));
-      }
+      task->results_.push_back(kv.first);
+      const TagId &id = kv.second;
+      task->result_ids_.push_back(
+          (static_cast<clio::run::u64>(id.major_) << 32) |
+          static_cast<clio::run::u64>(id.minor_));
     }
 
     // Total matched tags (summed across replicas during AggregateOut)
@@ -11705,14 +11713,10 @@ clio::run::TaskResume Runtime::BlobQuery(clio::run::shared_ptr<BlobQueryTask> &t
     std::regex blob_pattern(blob_regex);
 
     // Find matching tag IDs and resolved names.
-    std::vector<std::pair<std::string, TagId>> matching_tags;
-    tag_name_to_id_.for_each(
-        [&](const std::string &stored, const TagId &tag_id) {
-          std::string full = ResolveTagName(stored);
-          if (std::regex_match(full, tag_pattern)) {
-            matching_tags.emplace_back(full, tag_id);
-          }
-        });
+    // Same matcher as TagQuery (#1336): the search index, not a regex over
+    // every tag name.
+    std::vector<std::pair<std::string, TagId>> matching_tags =
+        MatchTags(tag_regex);
 
     // Build results: pairs of (tag_name, blob_name) for matching blobs.
     // Also compute total_blobs_matched_.

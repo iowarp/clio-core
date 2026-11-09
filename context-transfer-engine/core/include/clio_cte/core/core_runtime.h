@@ -798,6 +798,15 @@ private:
    * @return names (possibly empty)
    */
   std::vector<std::string> BlobIndexNames(const TagId &tag);
+  /**
+   * Tags whose absolute name matches `tag_regex` (#1336): the matcher shared
+   * by TagQuery and BlobQuery. Anchored literals resolve by hash; other
+   * patterns go through tag_search_.
+   * @param tag_regex ECMAScript regex over absolute tag names
+   * @return (absolute name, tag id) pairs, unbounded
+   */
+  std::vector<std::pair<std::string, TagId>> MatchTags(
+      const std::string &tag_regex);
   /** Drop the whole index (container reset). */
   void BlobIndexClear();
 
