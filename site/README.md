@@ -25,7 +25,28 @@ python3 site/build.py --serve    # build, then serve on http://127.0.0.1:8000/
 `.github/workflows/pages.yml` runs the same build on pull requests and deploys
 `main` to GitHub Pages. Enable it once under Settings → Pages → Source:
 "GitHub Actions". All links are relative, so the site works at
-`https://iowarp.github.io/clio-core/`, on a custom domain, or from disk.
+`https://iowarp.github.io/clio-core/` or on a custom domain. Links to section
+indexes are written as directories (`../docs/`), so browse it through
+`--serve` rather than from disk.
+
+## Search engines and LLMs
+
+The public origin is `SITE_URL` in `build.py` (`https://core.iowarp.ai`,
+override with the `SITE_URL` environment variable). From it the build adds:
+
+- a `<link rel="canonical">` and `og:url` on every page. Directory indexes use
+  the trailing-slash form (`/docs/`, never `/docs/index.html`), matching the
+  internal links; redirect stubs point at their new page.
+- JSON-LD: `WebSite` and `SoftwareSourceCode` on the home page, a
+  `BreadcrumbList` (Home › section › page) everywhere else.
+- `sitemap.xml` with every page, in nav order. `<lastmod>` is the date of the
+  last commit that touched the page source (the file's mtime if it has
+  uncommitted changes), which is why the workflow checks out full history.
+- `robots.txt` allowing all crawlers and naming the sitemap.
+- `llms.txt`: `SITE_SUMMARY` from `build.py`, then each section's pages with
+  their `description`.
+
+New pages need nothing extra: add them to `NAV` and they appear in all of these.
 
 ## Layout
 
