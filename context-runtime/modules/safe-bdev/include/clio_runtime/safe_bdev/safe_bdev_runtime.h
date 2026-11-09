@@ -128,6 +128,13 @@ class Runtime : public clio::run::Container {
    *  into for erasure coding (the "1 MB" of the design; a configurable knob,
    *  kept at 64 KiB here so small test members still hold many slots). */
   static constexpr clio::run::u64 kChunkLen = 65536;
+  /** issue #1343: sub-chunk allocation unit; a request piece shorter than
+   *  a chunk takes whole units of a shared (packed) slot, not a whole slot. */
+  static constexpr clio::run::u64 kSubUnit = 4096;
+  static constexpr clio::run::u32 kSubUnits =
+      static_cast<clio::run::u32>(kChunkLen / kSubUnit);
+  static_assert(kChunkLen % kSubUnit == 0 && kChunkLen / kSubUnit <= 32,
+                "packed-slot mask is a u32");
 
   /**
    * Reserved superblock area at the front of every member bdev (absolute
@@ -191,6 +198,14 @@ class Runtime : public clio::run::Container {
    * @param remaining bytes still to place; reduced by the stripe
    * @return true if a stripe was placed
    */
+  /** issue #1343: pack a sub-chunk piece into kSubUnit units of a shared
+   *  slot. Caller holds alloc_mu_. @return false when no member has room. */
+  bool AllocatePacked(clio::run::shared_ptr<AllocateBlocksTask> &task,
+                      clio::run::u64 &remaining);
+  /** Hand out units [first, ...) of slot `s` on member `d` for `remaining`. */
+  void EmitPacked(clio::run::shared_ptr<AllocateBlocksTask> &task, size_t d,
+                  clio::run::u64 s, clio::run::u32 first,
+                  clio::run::u64 &remaining);
   bool AllocateFullStripe(clio::run::shared_ptr<AllocateBlocksTask> &task,
                           clio::run::u64 &remaining);
   /** Allocate multiple blocks (Method::kAllocateBlocks). */
@@ -365,11 +380,69 @@ class Runtime : public clio::run::Container {
      *  use. The rest of such a chunk is never addressed, so a degraded
      *  write retry need not preserve it (see RetryStripeDegraded). */
     std::unordered_map<clio::run::u64, clio::run::u64> part_len_;
+    /** issue #1343: live slots shared by sub-chunk allocations, slot ->
+     *  occupancy mask of its kSubUnit units (bit i = bytes [i*kSubUnit,
+     *  (i+1)*kSubUnit) handed out). A slot is live while its mask is nonzero
+     *  and never also appears in part_len_. */
+    std::unordered_map<clio::run::u64, clio::run::u32> packed_;
 
     /** @return bytes of slot `s` that hold addressable data. */
     clio::run::u64 LiveLen(clio::run::u64 s) const {
       auto it = part_len_.find(s);
       return it == part_len_.end() ? kChunkLen : it->second;
+    }
+
+    /**
+     * A packed slot with `units` contiguous free units.
+     * @param units units needed (1..kSubUnits)
+     * @param slot receives the slot
+     * @param first receives the first unit of the run
+     * @return true when one exists
+     */
+    bool FindPacked(clio::run::u32 units, clio::run::u64 &slot,
+                    clio::run::u32 &first) const {
+      const clio::run::u32 want = (units >= 32) ? ~0u : ((1u << units) - 1u);
+      for (const auto &kv : packed_) {
+        for (clio::run::u32 u = 0; u + units <= kSubUnits; ++u) {
+          if ((kv.second & (want << u)) == 0) {
+            slot = kv.first;
+            first = u;
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+    /** Mark units [first, first+units) of slot `s` used (makes it packed). */
+    void TakeUnits(clio::run::u64 s, clio::run::u32 first,
+                   clio::run::u32 units) {
+      const clio::run::u32 want = (units >= 32) ? ~0u : ((1u << units) - 1u);
+      packed_[s] |= (want << first);
+      part_len_.erase(s);
+    }
+    /**
+     * Release units of a packed slot.
+     * @return true when the slot became empty (caller releases it)
+     */
+    bool ReleaseUnits(clio::run::u64 s, clio::run::u32 first,
+                      clio::run::u32 units) {
+      auto it = packed_.find(s);
+      if (it == packed_.end()) return true;
+      const clio::run::u32 want = (units >= 32) ? ~0u : ((1u << units) - 1u);
+      it->second &= ~(want << first);
+      return it->second == 0;
+    }
+    /** @return bytes handed out on this member. */
+    clio::run::u64 UsedBytes() const {
+      clio::run::u64 b = 0;
+      for (clio::run::u64 s : live_) {
+        auto it = packed_.find(s);
+        b += (it == packed_.end())
+                 ? kChunkLen
+                 : static_cast<clio::run::u64>(__builtin_popcount(it->second)) *
+                       kSubUnit;
+      }
+      return b;
     }
 
     // Slots not yet handed out (bump headroom + reusable frees).
@@ -442,6 +515,7 @@ class Runtime : public clio::run::Container {
         free_.insert(s);
       }
       part_len_.erase(s);
+      packed_.erase(s);
     }
   };
 

@@ -773,6 +773,117 @@ TEST_CASE("safe_bdev_partial_chunk", "[safe_bdev][ec][partial]") {
        io_len);
 }
 
+// issue #1343: a 4 KiB allocation used to take a whole 64 KiB slot, so a
+// small-block workload ran out at 1/16 of the capacity ("no data member has a
+// free slot"). Sub-chunk pieces now pack into 4 KiB units of shared slots.
+// Fill the array with 4 KiB blocks, check it holds far more than one per
+// slot, that every block keeps its own bytes (including through a degraded
+// read with a data member gone), and that freed units are reused.
+TEST_CASE("safe_bdev_small_alloc_packs", "[safe_bdev][alloc][packed]") {
+  EnsureInit();
+  REQUIRE(g_initialized);
+  std::this_thread::sleep_for(100ms);
+
+  const int pidsalt = static_cast<int>(getpid() & 0xFFF);
+  auto member_name = [&](int idx) {
+    return "pk_member_" + std::to_string(getpid()) + "_" + std::to_string(idx);
+  };
+  const int k = 3;
+  std::vector<clio::run::PoolId> data_ids;
+  for (int c = 0; c < k; ++c) {
+    clio::run::PoolId id(static_cast<clio::run::u32>(13100 + pidsalt + c), 0);
+    clio::run::bdev::Client client(id);
+    REQUIRE(CreateRamMember(client, member_name(c), id));
+    data_ids.push_back(client.pool_id_);
+  }
+  clio::run::PoolId parity_id(static_cast<clio::run::u32>(13160 + pidsalt), 0);
+  clio::run::bdev::Client parity_client(parity_id);
+  REQUIRE(CreateRamMember(parity_client, member_name(50), parity_id));
+  parity_id = parity_client.pool_id_;
+  clio::run::PoolId safe_id(static_cast<clio::run::u32>(13180 + pidsalt), 0);
+  clio::run::safe_bdev::Client safe(safe_id);
+  std::vector<clio::run::safe_bdev::MemberBdevDesc> members;
+  for (int c = 0; c < k; ++c) {
+    members.emplace_back(member_name(c), /*node_id=*/0, data_ids[c]);
+  }
+  auto create_task = safe.AsyncCreate(clio::run::PoolQuery::Dynamic(),
+                                      "safe_bdev_pk_pool", safe_id,
+                                      /*max_failures=*/1, members);
+  create_task.Wait();
+  safe.pool_id_ = create_task->new_pool_id_;
+  REQUIRE(create_task->GetReturnCode() == 0);
+  auto add = safe.AsyncAddBdev(clio::run::PoolQuery::Dynamic(), member_name(50),
+                               /*node_id=*/0, parity_id, /*as_parity=*/1);
+  add.Wait();
+  REQUIRE(add->GetReturnCode() == 0);
+
+  constexpr clio::run::u64 kSmall = 4096;
+  const clio::run::u64 slots_total =
+      static_cast<clio::run::u64>(k) * (kMemberRamSize / kChunkLen);
+  std::vector<clio::run::bdev::Block> blocks;
+  for (;;) {
+    auto a = safe.AsyncAllocateBlocks(clio::run::PoolQuery::Dynamic(), kSmall);
+    a.Wait();
+    if (a->GetReturnCode() != 0) break;
+    REQUIRE(a->blocks_.size() == 1);
+    REQUIRE(a->blocks_[0].size_ == kSmall);
+    blocks.push_back(a->blocks_[0]);
+    REQUIRE(blocks.size() <= slots_total * (kChunkLen / kSmall));
+  }
+  HLOG(kInfo, "safe_bdev packed: {} x 4 KiB blocks on {} slots", blocks.size(),
+       slots_total);
+  // Before #1343 this stopped at <= slots_total (one block per slot).
+  REQUIRE(blocks.size() > slots_total * 8);
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    for (size_t j = i + 1; j < blocks.size() && j < i + 64; ++j) {
+      REQUIRE_FALSE(RangesOverlap(blocks[i].offset_, kSmall, blocks[j].offset_,
+                                  kSmall));
+    }
+  }
+
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    WriteBlocks(safe, {blocks[i]},
+                MakePattern(kSmall, static_cast<ctp::u8>(i * 31 + 7)));
+  }
+  FlushParity(safe);
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    std::vector<ctp::u8> got;
+    ReadBlocks(safe, {blocks[i]}, got);
+    REQUIRE(got == MakePattern(kSmall, static_cast<ctp::u8>(i * 31 + 7)));
+  }
+
+  // Free every other block, then allocate again: the freed units come back.
+  clio::run::priv::vector<clio::run::bdev::Block> fblocks(CTP_MALLOC);
+  size_t freed = 0;
+  for (size_t i = 0; i < blocks.size(); i += 2) {
+    fblocks.push_back(blocks[i]);
+    ++freed;
+  }
+  auto fr = safe.AsyncFreeBlocks(clio::run::PoolQuery::Dynamic(), fblocks);
+  fr.Wait();
+  REQUIRE(fr->GetReturnCode() == 0);
+  size_t again = 0;
+  for (;;) {
+    auto a = safe.AsyncAllocateBlocks(clio::run::PoolQuery::Dynamic(), kSmall);
+    a.Wait();
+    if (a->GetReturnCode() != 0) break;
+    ++again;
+    REQUIRE(again <= freed);
+  }
+  REQUIRE(again == freed);
+
+  // The kept (odd) blocks survive a lost data member: degraded read.
+  auto rm = safe.AsyncRemoveBdev(clio::run::PoolQuery::Dynamic(), data_ids[1],
+                                 /*was_faulty=*/1);
+  rm.Wait();
+  REQUIRE(rm->GetReturnCode() == 0);
+  for (size_t i = 1; i < blocks.size(); i += 2) {
+    std::vector<ctp::u8> got;
+    ReadBlocks(safe, {blocks[i]}, got);
+    REQUIRE(got == MakePattern(kSmall, static_cast<ctp::u8>(i * 31 + 7)));
+  }
+}
+
 namespace {
 
 /**
