@@ -187,6 +187,8 @@ clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
   CLIO_TASK_BODY_END
 }
 
+static bool TraceDirBlock();
+
 clio::run::TaskResume Runtime::ReadBlockStandIn(clio::run::u64 dir,
                                                 clio::run::u32 k,
                                                 InodeTableBlock *out,
@@ -211,11 +213,36 @@ clio::run::TaskResume Runtime::ReadBlockStandIn(clio::run::u64 dir,
       }
     }
     if (c == container_id_) CLIO_CO_RETURN;
+    {
+      FsReq fr;
+      fr.dir_id_ = dir;
+      fr.block_ = k;
+      FsResp fresp;
+      CLIO_CO_AWAIT(CallShard(c, kTableStandInFetch, fr, fresp));
+      const bool ok = fresp.rc_ == 0 &&
+                      DecodeTableBlock(fresp.str_.data(), fresp.str_.size(),
+                                       out) &&
+                      out->dir_ == dir && out->index_ == k;
+      if (TraceDirBlock()) {
+        HLOG(kWarning, "[DIRBLOCK] stand-in fetch {}/{} on container {} -> "
+             "{}: rc {} version {}", dir, k, container_id_, c, fresp.rc_,
+             ok ? out->version_ : 0);
+      }
+      if (ok) {
+        rc = 0;
+        CLIO_CO_RETURN;
+      }
+    }
     const auto q = clio::run::PoolQuery::DirectId(
         static_cast<clio::run::ContainerId>(c));
     const clio::cte::core::TagId tag = FsUnpack(dir);
     auto sz = cte_.AsyncGetBlobSize(tag, TableBlockName(k), q);
     CLIO_CO_AWAIT(sz);
+    if (TraceDirBlock()) {
+      HLOG(kWarning, "[DIRBLOCK] stand-in probe {}/{} on container {} -> {}: "
+           "size rc {} size {}", dir, k, container_id_, c,
+           sz->GetReturnCode(), sz->size_);
+    }
     if (sz->GetReturnCode() != 0 || sz->size_ == 0) CLIO_CO_RETURN;
     std::string bytes(sz->size_, '\0');
     auto g = cte_.AsyncGetBlob(tag, TableBlockName(k), 0, bytes.size(), 0u,
@@ -438,8 +465,16 @@ clio::run::TaskResume Runtime::LoadBlock(clio::run::u64 dir, clio::run::u32 k,
           CLIO_CO_RETURN;
         }
         // Its home moved (failover or return): this copy is not current.
-        if (s.committing_) busy = busy_commit = true;
-        else blocks_.erase(it);
+        if (s.committing_) {
+          busy = busy_commit = true;
+        } else {
+          if (s.home_ && !mine) {
+            // We stood in for the home that is back now: keep our newer
+            // image until it fetches it (#1322).
+            handback_[key] = {EncodeTableBlock(s.blk_, false), SteadyMs()};
+          }
+          blocks_.erase(it);
+        }
       }
       const char *stage = "";
       if (!busy) {
@@ -763,6 +798,39 @@ clio::run::TaskResume Runtime::ServeBlockFetch(const FsReq &req,
   resp.str_ = EncodeTableBlock(slot->blk_, false);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+int Runtime::ServeStandInFetch(const FsReq &req, FsResp &resp) {
+  // issue #1322: a returning home asks the container that served its block
+  // while it was away. The newest copy is that container's in-memory home
+  // slot (or, once evicted, its journal image); its CTE copy may lag.
+  const TableBlockKey key{req.dir_id_, req.block_};
+  std::string img;
+  {
+    std::lock_guard<std::mutex> g(ns_mu_);
+    const clio::run::u64 now = SteadyMs();
+    for (auto ht = handback_.begin(); ht != handback_.end();) {
+      ht = (now - ht->second.second > 600000) ? handback_.erase(ht) : ++ht;
+    }
+    auto hb = handback_.find(key);
+    auto it = blocks_.find(key);
+    if (hb != handback_.end() &&
+        (it == blocks_.end() || !it->second->home_)) {
+      img = hb->second.first;
+    } else if (it != blocks_.end() && it->second->home_) {
+      img = EncodeTableBlock(it->second->blk_, false);
+    } else {
+      auto jt = journaled_.find(key);
+      if (jt != journaled_.end()) img = jt->second;
+    }
+  }
+  if (img.empty()) {
+    resp.rc_ = ENOENT;
+    return ENOENT;
+  }
+  resp.str_ = std::move(img);
+  resp.rc_ = 0;
+  return 0;
 }
 
 int Runtime::ApplyTablePush(const FsReq &req) {

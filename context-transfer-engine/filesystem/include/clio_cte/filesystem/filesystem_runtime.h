@@ -480,6 +480,10 @@ class Runtime : public clio::run::Container {
   /** Durable images replayed from the journal and not loaded yet (a home
    *  block moves to blocks_ on first use). Guarded by ns_mu_. */
   std::unordered_map<TableBlockKey, std::string, TableBlockKeyHash> journaled_;
+  /** issue #1322: image + time of a block this container served as stand-in
+   *  home, kept after the real home returns so it can fetch the newest copy. */
+  std::unordered_map<TableBlockKey, std::pair<std::string, clio::run::u64>,
+                     TableBlockKeyHash> handback_;
   /** Steady ms of the journal's last periodic fsync. */
   clio::run::u64 dir_log_synced_ms_ = 0;
 
@@ -622,6 +626,8 @@ class Runtime : public clio::run::Container {
    * @param out receives the block when rc == 0
    * @param rc 0 when the stand-in holds a decodable copy, else nonzero
    */
+  /** issue #1322: answer kTableStandInFetch from the home slot or journal. */
+  int ServeStandInFetch(const FsReq &req, FsResp &resp);
   clio::run::TaskResume ReadBlockStandIn(clio::run::u64 dir, clio::run::u32 k,
                                          InodeTableBlock *out, int &rc);
   /**
@@ -1441,6 +1447,7 @@ enum FsShardOp : clio::run::u32 {
   kShardPurgeLocal = 18,    ///< drop this container's pages of a batch of ids
   kShardRepublish = 19,     ///< send this container's names to node req.a_
   kShardInodePush = 20,     ///< apply an inode home's attribute push
+  kTableStandInFetch = 21,  ///< send the block this container served as a stand-in (#1322)
 };
 
 /** Insert flags (FsReq::flags_ of kTableInsert). */
