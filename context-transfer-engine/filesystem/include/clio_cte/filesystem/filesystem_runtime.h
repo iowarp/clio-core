@@ -616,6 +616,15 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume ReadBlockCte(clio::run::u64 dir, clio::run::u32 k,
                                      InodeTableBlock *out, int &rc);
   /**
+   * issue #1322: read a block straight from the container that stood in for
+   * this (returning) home: the first live successor. Its copy is newer than
+   * this node's journal until replication hands it back.
+   * @param out receives the block when rc == 0
+   * @param rc 0 when the stand-in holds a decodable copy, else nonzero
+   */
+  clio::run::TaskResume ReadBlockStandIn(clio::run::u64 dir, clio::run::u32 k,
+                                         InodeTableBlock *out, int &rc);
+  /**
    * Store a block image in its CTE blob, padded to a power of two, on a
    * non-volatile tier when one accepts it (else RAM). With the directory
    * journal on this is the replicated mirror a stand-in reads (#1263).

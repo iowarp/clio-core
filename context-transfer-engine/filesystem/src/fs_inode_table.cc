@@ -163,10 +163,71 @@ clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
         *out = std::move(*cte_copy);
       }
     }
+    // issue #1322: the CTE copy reflects the stand-in's changes only once the
+    // replication hand-back has delivered them. A home that loads the block
+    // before that adopted its stale journal copy and then committed over the
+    // stand-in's newer entries (fsynced creates lost cluster-wide). Ask the
+    // stand-in directly, as EnsureInode does for inode records.
+    if (NumContainers() > 1 && BlockHome(dir, k) == container_id_) {
+      auto si_copy = std::make_shared<InodeTableBlock>();
+      int si_rc = 0;
+      CLIO_CO_AWAIT(ReadBlockStandIn(dir, k, si_copy.get(), si_rc));
+      if (si_rc == 0 && si_copy->version_ > out->version_) {
+        HLOG(kWarning, "filesystem: block {}/{} took the stand-in's copy "
+             "(version {} over {})", dir, k, si_copy->version_,
+             out->version_);
+        *out = std::move(*si_copy);
+      }
+    }
     rc = 0;
     CLIO_CO_RETURN;
   }
   CLIO_CO_AWAIT(ReadBlockCte(dir, k, out, rc));
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ReadBlockStandIn(clio::run::u64 dir,
+                                                clio::run::u32 k,
+                                                InodeTableBlock *out,
+                                                int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = ENOENT;
+  {
+    bool ready = false;
+    CLIO_CO_AWAIT(AwaitCteReady(ready));
+    if (!ready) CLIO_CO_RETURN;
+  }
+  {
+    const clio::run::u32 n = NumContainers();
+    // The stand-in is the first live container after the home (the CTE's
+    // FailoverContainer rule), as in FetchStandInRecord.
+    clio::run::u32 c = container_id_;
+    for (clio::run::u32 i = 1; i < n; ++i) {
+      const clio::run::u32 cand = (container_id_ + i) % n;
+      if (clio::cte::core::ContainerNodeAlive(pool_id_, cand)) {
+        c = cand;
+        break;
+      }
+    }
+    if (c == container_id_) CLIO_CO_RETURN;
+    const auto q = clio::run::PoolQuery::DirectId(
+        static_cast<clio::run::ContainerId>(c));
+    const clio::cte::core::TagId tag = FsUnpack(dir);
+    auto sz = cte_.AsyncGetBlobSize(tag, TableBlockName(k), q);
+    CLIO_CO_AWAIT(sz);
+    if (sz->GetReturnCode() != 0 || sz->size_ == 0) CLIO_CO_RETURN;
+    std::string bytes(sz->size_, '\0');
+    auto g = cte_.AsyncGetBlob(tag, TableBlockName(k), 0, bytes.size(), 0u,
+                               bytes.data(), q);
+    CLIO_CO_AWAIT(g);
+    if (g->GetReturnCode() != 0) CLIO_CO_RETURN;
+    if (!DecodeTableBlock(bytes.data(), bytes.size(), out) ||
+        out->dir_ != dir || out->index_ != k) {
+      CLIO_CO_RETURN;
+    }
+    rc = 0;
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
