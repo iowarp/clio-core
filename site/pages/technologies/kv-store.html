@@ -67,16 +67,16 @@ print(tag.GetContainedBlobs())               # list keys in the tag
 <p>Absolute numbers are this machine's; the campaign notes that the ratios carry over but the bandwidths must be re-measured on your hardware.</p>
 
 <h2>Put and get bandwidth on a workstation</h2>
-<p><code>clio_cte_bench</code>, 1 MiB blobs, put then get, 4 client threads with 8 requests in flight each, 16,000 operations, against a separate runtime with a 16 GB DRAM tier (<code>cte_config_ram.yaml</code>). Release build of <code>dev</code> (f88db54bf) on Windows: Ryzen 7 3800X, 32 GB RAM. The client reaches the runtime over loopback TCP, the transport Windows auto-selects.</p>
+<p><code>clio_cte_bench</code>, put then get, 4 client threads with 8 requests in flight each, against a separate runtime with a 16 GB DRAM tier (<code>cte_config_ram.yaml</code>). Release build of <code>dev</code> (f88db54bf) on Windows: Ryzen 7 3800X, 32 GB RAM. The client reaches the runtime over loopback TCP, the transport Windows auto-selects.</p>
 <table>
-  <thead><tr><th>Metric</th><th>Result</th></tr></thead>
+  <thead><tr><th>Value size</th><th>Operations</th><th>Aggregate bandwidth</th><th>Operations / s</th><th>Mean latency</th></tr></thead>
   <tbody>
-    <tr><td>Aggregate bandwidth</td><td>1,474 MB/s</td></tr>
-    <tr><td>Per-thread bandwidth</td><td>365-373 MB/s</td></tr>
-    <tr><td>Mean latency per 1 MiB operation</td><td>2.7 ms</td></tr>
+    <tr><td>1 MiB</td><td>16,000</td><td>1,474 MB/s</td><td>1,474</td><td>2.7 ms</td></tr>
+    <tr><td>64 KiB</td><td>8,000</td><td>945 MB/s</td><td>15,117</td><td>265 µs</td></tr>
+    <tr><td>4 KiB</td><td>20,000</td><td>106 MB/s</td><td>27,075</td><td>148 µs</td></tr>
   </tbody>
 </table>
-<p>One run. The same benchmark at 64 KiB and 4 KiB stopped partway with put errors on this build, so small-value numbers are not reported here; the YCSB results above cover small records.</p>
+<p>One run each. Longer 64 KiB and 4 KiB runs (80,000 operations) stopped partway with put errors on this build, so the small-value rows use shorter runs.</p>
 
 <h2>Where to go next</h2>
 <ul>
