@@ -1,0 +1,234 @@
+<!--
+title: Cache module
+heading: The <em>cache</em> module
+description: The CTE cache: the top of the storage chain, keeping a node-local raw copy of each blob for fast reads while writing through to the authoritative chain below.
+eyebrow: Modules · Context Transfer Engine
+lede: The cache module is the top of the standard interposition chain. It keeps an untransformed copy of each blob on the node that reads or writes it, stored in the CTE core's cache-replica slot, and pushes every write down the chain before acknowledging it. Reads that hit the local copy never leave the node.
+facts: Library | clio_cte_cache ; Default pool | 563.0 ; Source | context-transfer-engine/cache ; Semantics | write-through, invalidation-coherent
+-->
+<h2>What it does</h2>
+<p>In a multi-node deployment each blob has one owner container, chosen by
+hashing its tag and name. Without a cache, every read of a blob owned
+elsewhere crosses the network, and a compressed blob cannot be served by the
+zero-IPC shared-memory read path at all. The cache module gives each node a
+<strong>raw, node-local copy</strong> of the blobs it touches. The copy is
+stored by the local CTE core container in a dedicated replica slot flagged
+<code>REPLICA_CACHE</code>, so it is visible to the same shared-memory
+mirror that lets clients read local blobs without a runtime round trip.</p>
+<p>Use it whenever a chain has more than one node, or whenever the
+compressor is enabled and you want reads of hot data to stay uncompressed
+and local. On a single node without compression it adds little, since the
+primary copy is already local.</p>
+
+<h2>Where it sits</h2>
+<p>The cache is an interposer on the core's task interface. It overrides the
+blob data verbs and forwards everything else to <code>next_pool_id</code>.
+The default chain in <code>context-runtime/config/clio_default.yaml</code>
+is:</p>
+<pre data-label="yaml">
+cache(563.0) -> indexer(564.0) -> [compressor(562.0) ->] replication(561.0) -> core(512.0)
+</pre>
+<p>The filesystem module, the stream module and the Context Assimilation
+Engine core all point their <code>next_pool_id</code> at the cache, so data
+written through them takes the whole chain. The cache must be composed after
+every pool it forwards to.</p>
+
+<h2>Composing it</h2>
+<p>From the four-node coherence test configuration
+(<code>context-transfer-engine/test/integration/coherence/clio_config.yaml</code>),
+trimmed to the chain:</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::coherence_dram"
+        bdev_type: "ram"
+        capacity_limit: "512MB"
+        score: 1.0
+      - path: "/tmp/coherence_disk.dat"
+        bdev_type: "file"
+        capacity_limit: "2GB"
+        score: 0.2
+        persistence_level: "temporary"
+
+  - mod_name: clio_cte_replication
+    pool_name: clio_cte_replication
+    pool_query: local
+    pool_id: "561.0"
+    next_pool_id: "512.0"
+
+  - mod_name: clio_cte_cache
+    pool_name: clio_cte_cache
+    pool_query: local
+    pool_id: "563.0"
+    next_pool_id: "561.0"
+    min_score: 0.5
+</pre>
+<p>Clients bind to the chain top: construct a
+<code>clio::cte::core::Client</code> on pool 563.0, or set
+<code>CLIO_CTE_POOL=563.0</code> for processes that use the shared client
+singleton. The cache module's own client class exists only to create the
+pool programmatically with <code>AsyncCreateCache</code>.</p>
+
+<h2>Operations</h2>
+<p>From <code>cache/clio_mod.yaml</code> and the runtime header, the module
+intercepts these core verbs with the core's own method ids:</p>
+<ul>
+  <li><strong>PutBlob</strong> and <strong>MultiPutBlob</strong>: write
+  through to the authoritative chain, and update or create the local raw
+  copy.</li>
+  <li><strong>GetBlob</strong>: serve from the local copy when present,
+  otherwise fetch from the owner chain and populate the local copy.</li>
+  <li><strong>GetBlobSize</strong>: answer from the local copy's size when
+  present, since the copy is raw and complete, otherwise ask the chain.</li>
+  <li><strong>PodMultiGetBlob</strong>, the GPU pager's batched fetch: served
+  like GetBlob, page by page, with misses sent to the core as one batch.</li>
+  <li><strong>GetOrCreateTag</strong> and <strong>DelTag</strong>: on a
+  cluster, a tag write or delete goes to the owner and is then applied to
+  every core container before returning, so every node resolves the tag
+  locally afterwards.</li>
+</ul>
+<p>Requests that address an explicit replica (a non-zero
+<code>replica_</code> in the context) bypass the cache logic entirely and are
+routed to the owner as the core would route them. The module defines no
+verbs of its own beyond create, destroy and monitor.</p>
+
+<h2>Routing</h2>
+<p>The cache overrides the scheduler's routing decision for the verbs it
+handles. Puts, gets and size probes without explicit replica addressing run
+on the <em>submitting</em> node, as do tag writes and pager batches. The
+local handler then reaches the blob's owner through the chain client, so only
+the authoritative hop crosses the network. All other tasks route exactly as
+the core routes them.</p>
+
+<h2>Write behavior</h2>
+<ol class="steps">
+  <li><strong>Owner-local writes keep no copy.</strong> If this node owns
+  the blob, the put is forwarded inline to the next pool and nothing else
+  happens. The primary is already local DRAM and readable over shared
+  memory, and an owner-side copy would sit outside the invalidation
+  protocol.</li>
+  <li><strong>Update an existing copy.</strong> Otherwise the module first
+  applies the put to the local cache slot in update-only mode. If a copy
+  exists it is updated in place and stays byte-identical to what this node
+  wrote.</li>
+  <li><strong>Create a copy speculatively.</strong> If no copy exists and the
+  put is a single region at offset 0, a copy is created. The authoritative
+  put then carries a verify flag; if the owner reports that the blob already
+  extended beyond this write, the local prefix is deleted.</li>
+  <li><strong>Write through.</strong> The authoritative put goes to the owner
+  chain, one region at a time for vectored writes, carrying this node's id
+  so the owner invalidates every other node's copy and registers this one.
+  The acknowledgement is returned only after the owner has accepted the
+  write. A failed authoritative put also deletes the local copy.</li>
+</ol>
+<p>Multi-blob batches are written through first, and then mirrored to the
+local cache slot only on single-node deployments, since batched copies carry
+no owner registration and nothing would invalidate them on a cluster. On a
+cluster, locality for batched data comes from the read path.</p>
+
+<h2>Read behavior</h2>
+<ul>
+  <li><strong>Owner-local reads</strong> go straight to the next pool. If this
+  node is standing in for a dead owner, any cache copy it holds from earlier
+  is deleted first, since the owner's invalidations stopped when it
+  died.</li>
+  <li><strong>Hit.</strong> The read is attempted against the local cache
+  slot without a size probe. A present copy is complete and current by
+  construction, so the attempt either succeeds or misses.</li>
+  <li><strong>Miss.</strong> The regions are fetched from the owner chain
+  directly into the caller's buffer. The layers below decompress and heal as
+  needed.</li>
+  <li><strong>Populate.</strong> If the read covered the whole blob and the
+  data is untransformed, the caller's buffer seeds the local copy. Otherwise
+  the blob is copied from the chain in 4 MiB chunks. The copy is then
+  registered with the owner, carrying the version seen at fetch time. If the
+  owner has moved on, registration is refused and the copy is deleted; the
+  next read refetches. A population that fails part-way is deleted whole, so
+  a partial prefix is never served.</li>
+</ul>
+
+<h2>Coherence</h2>
+<p>Coherence is owner-driven invalidation. Every cache copy is registered
+with the blob's owner container. Before the owner acknowledges a primary
+write, it invalidates every registered copy except the writer's. The ordering
+on the write path (local copy written, then authoritative put, then
+registration inside the owner's write token) means a later foreign write
+always catches the copy. Registration on the read path is version-checked
+for the same reason. The result is that a read served from the cache
+reflects every write acknowledged before it, across nodes.</p>
+<p>Tag metadata is strongly consistent on completion: once a tag create or
+delete returns, every node resolves it locally. While the write-through is
+running, nodes may disagree.</p>
+
+<h2>Eviction and capacity</h2>
+<ul>
+  <li>Cache copies carry a score floor, <code>min_score</code>. The core's
+  organizer never rescores a cache copy below that floor, so a copy is not
+  demoted to a slower tier simply for being idle.</li>
+  <li>Under genuine tier pressure the core frees a cache copy's blocks,
+  before a put is allowed to fail. The slot's metadata survives, so the next
+  cache write refills it.</li>
+  <li>The bytes held by cache copies are reported as free capacity, the way
+  Linux reports page cache, so a cache full of hot data does not make the
+  system look full.</li>
+  <li>On restart the core forgets every restored cache layout. A node that
+  was down missed invalidations, so its copies may be stale; the chain
+  refills them on demand.</li>
+</ul>
+
+<h2>Configuration</h2>
+<dl class="notes">
+  <dt><code>next_pool_id</code></dt>
+  <dd>The pool authoritative writes go to, as <code>"major.minor"</code>. In
+  the default chain this is the indexer (564.0); in a chain without the
+  indexer it is the compressor or replication pool. Unset falls back to the
+  core pool 512.0.</dd>
+  <dt><code>min_score</code></dt>
+  <dd>Score floor for the raw cache copies, propagated to the core as the
+  replica's minimum score. Default 0.5. A higher value keeps copies on fast
+  tiers longer at the expense of primaries competing for the same tier.</dd>
+</dl>
+<p>There is no cache size setting. The cache uses the core's tiers, bounded
+by their <code>capacity_limit</code>, and relies on the core's eviction.
+There is no flush period either: this layer tracks no dirty state.</p>
+
+<h2>Behaviors worth knowing</h2>
+<ul class="checks">
+  <li>A cache failure degrades reads, never the put: the acknowledgement
+  depends only on the authoritative write.</li>
+  <li>On a single-node runtime every blob is owner-local, so puts, gets and
+  size probes pass straight through to the next pool. Only multi-blob
+  batches still write a raw mirror copy there.</li>
+  <li>Partial writes to a blob with no local copy do not create one; only a
+  whole-blob write or a later read does.</li>
+  <li>A copy is populated and invalidated whole. A present size answer from
+  the cache is therefore the full logical size.</li>
+  <li>Populating a large blob on a miss costs a second read of the blob
+  from the owner (in chunks) unless the original read already covered it.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>Batched puts are not mirrored into the cache on multi-node
+  deployments.</li>
+  <li>Cache copies do not survive a restart of the node that holds them.</li>
+  <li>The owner node never holds a cache copy of its own blobs; owner-local
+  reads of compressed data go through the compressor.</li>
+  <li>Standing-in nodes serve the replicated primary, not a cache copy, while
+  the owner is down.</li>
+</ul>
+
+<h2>Testing</h2>
+<ul>
+  <li><code>context-transfer-engine/test/integration/coherence</code>: a
+  four-node Docker cluster with cache over replication over core, checking
+  that cross-node reads never return stale generations. Built when both the
+  cache and replication client targets exist.</li>
+  <li><code>context-transfer-engine/test/integration/clio_fs_suite/tests_cache.py</code>:
+  filesystem-level stress of the same promise through overwrites, truncates,
+  unlink-and-recreate and working sets larger than the fast tiers.</li>
+</ul>

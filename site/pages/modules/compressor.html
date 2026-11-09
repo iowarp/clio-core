@@ -1,0 +1,261 @@
+<!--
+title: Compressor module
+heading: Compressor: <em>transparent encoding.</em>
+description: The CTE compressor module: supported codecs and libraries, how a codec is chosen per put (static, default, or model-driven dynamic selection), where it sits in the chain, configuration keys and defaults, and limits.
+eyebrow: Modules · Transfer engine
+lede: The compressor is the encoding layer of the CTE interposition chain. It compresses whole-blob writes on the way down and decompresses reads on the way out, including partial and vectored reads, so every layer above it sees uncompressed bytes. Which codec runs is decided per put: the writer can name one, the pool can supply a default, or predictive models can choose.
+facts: Library | clio_cte_compressor ; Default pool | 562.0 ; Build option | CLIO_CTE_ENABLE_COMPRESS (OFF) ; Source | context-transfer-engine/compressor
+-->
+<h2>What it does</h2>
+<p>Compression in CLIO Core is a policy layered over the CTE core, not a
+feature of the core itself. The compressor module intercepts the core's
+own put and get tasks. On a whole-blob put it compresses the payload into
+a shared-memory buffer prefixed with a small header that records the
+codec, preset and original size, and forwards that stored image to the
+next pool. On a read it fetches the stored image, decompresses it once,
+and copies the requested range or ranges into the caller's buffers. Size
+probes report the logical, uncompressed size.</p>
+<p>Use it when data is compressible enough to be worth a decode on every
+read: checkpoints, simulation fields, model pages. The module itself
+refuses to store a result that saves less than one eighth of the raw
+size, so marginal data stays raw and, on device tiers, stays mappable
+without a copy.</p>
+<p>The module is optional. It is built only with
+<code>CLIO_CTE_ENABLE_COMPRESS=ON</code>, which also enables the
+compression primitives it links against.</p>
+
+<h2>Where it sits</h2>
+<p>The canonical chain is cache, then indexer, then compressor, then
+replication, then the core. The compressor sits below the indexer so the
+indexer's read-backs see logical bytes, and above replication so the
+durable copies are the stored, compressed form. The node-local cache
+above it keeps a raw copy, which is how a compressed blob keeps the
+zero-IPC shared-memory read path.</p>
+<ul>
+  <li><strong>Interposed verbs</strong>: PutBlob, GetBlob, GetBlobSize and
+  MultiPutBlob, plus the POD variants used by device producers such as the
+  GPU vector adapter. MultiPutBlob is forwarded verbatim: batch records
+  carry no per-record context, so compression cannot be requested on that
+  path.</li>
+  <li><strong>Own verbs</strong>: DynamicSchedule, Compress, Decompress,
+  PollNodeLoad and PollConsumers, reached through the compressor client,
+  which inherits the core client API and overrides put and get to route
+  through the compressor pool.</li>
+  <li><strong>Calls</strong>: the pool named by <code>next_pool_id</code>
+  for storage, and the compression primitives for the codecs.</li>
+</ul>
+
+<h2>Composing it</h2>
+<p>The default configuration ships this entry commented out. Enabling it
+means uncommenting it and re-pointing the indexer's
+<code>next_pool_id</code> at 562.0. Order matters: each entry must follow
+the entry it forwards to.</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_cte_compressor
+    pool_name: clio_cte_compressor
+    pool_query: local
+    pool_id: "562.0"
+    next_pool_id: "561.0"           # replication pool
+    tracking_enabled: true
+    default_compress: "zstd"        # library name, "dynamic", or unset
+    default_preset: "balanced"      # "fast" | "balanced" | "best"
+    # qtable_model_path: ""
+    # linreg_model_path: ""
+    # distribution_model_path: ""
+    # dnn_model_weights_path: ""
+    # trace_folder_path: ""
+</pre>
+<p>A standalone test configuration places the compressor at the CTE
+entry pool 512.0 and the core at 513.0, which lets an unmodified core
+client compress without knowing the module exists.</p>
+
+<h2>Configuration</h2>
+<dl class="notes">
+  <dt>next_pool_id</dt>
+  <dd>Pool this compressor forwards to, as "major.minor". Required for
+  chaining; it round-trips with the pool so a programmatically created
+  compressor keeps its target.</dd>
+  <dt>default_compress</dt>
+  <dd>Codec for writes whose context requests none. A registry name such
+  as "zstd" or "lz4", "dynamic" to let the models choose per blob, or
+  unset or "none" for no default. Default: unset. Writes from the FUSE
+  mount and the Python API request no codec, so without this key they are
+  stored uncompressed. A name that is not built into the binary is
+  reported at pool creation and leaves no default.</dd>
+  <dt>default_preset</dt>
+  <dd>Preset for the default codec: "fast", "balanced" or "best". Default
+  "balanced". Anything else is treated as balanced.</dd>
+  <dt>tracking_enabled</dt>
+  <dd>Default true. Each decompress registers the reading node against the
+  blob's tag, and later explicit Compress tasks for that tag are routed to
+  the most recent reader. At most 32 consumers are tracked per tag. When
+  false, Compress tasks are placed by hash of the tag id and the periodic
+  consumer poll does nothing.</dd>
+  <dt>qtable_model_path, linreg_model_path, distribution_model_path,
+  dnn_model_weights_path</dt>
+  <dd>Trained models for dynamic selection. All optional; unset means the
+  fixed heuristic described below.</dd>
+  <dt>trace_folder_path</dt>
+  <dd>Directory for per-put trace logs of predicted statistics and
+  scheduling time, written only for puts whose context sets the trace
+  flag. Default: unset, no traces.</dd>
+</dl>
+
+<h2>Supported codecs</h2>
+<p>Codecs come from a single registry in the compression primitives. Each
+row has a canonical name and a frozen wire id that is stored in the blob
+header, so a blob written where a codec exists still reports the right
+name where it does not. A codec whose backend was not built resolves by
+name but cannot be instantiated, and a write that asks for it is stored
+raw.</p>
+<ul>
+  <li><strong>Lossless CPU, with fast, balanced and best presets</strong>:
+  brotli, bzip2, lz4, lzma, zlib, zstd.</li>
+  <li><strong>Lossless CPU, single mode</strong>: snappy, blosc2 (the
+  name "blosc" is accepted as an alias).</li>
+  <li><strong>Lossy CPU through LibPressio</strong>: zfp, sz3, fpzip.
+  Presets map to error-bound modes.</li>
+  <li><strong>GPU through nvcomp</strong>: nvcomp-lz4, nvcomp-snappy,
+  nvcomp-zstd, nvcomp-gdeflate, nvcomp-deflate, nvcomp-ans. Single
+  mode.</li>
+  <li><strong>Other GPU codecs</strong>: zfp-sycl (lossy fixed rate; presets
+  are 8, 16 and 24 bits per value), cusz and cuszp (lossy, presets are
+  absolute error bounds 1e-2, 1e-3, 1e-4), ndzip (lossless float, single
+  mode).</li>
+</ul>
+<p>Wire ids and the model feature ids are separate namespaces. Out-of-range
+wire ids resolve to zstd, the historical default.</p>
+
+<h2>How a codec is chosen</h2>
+<p>The choice is made per put from three fields of the write's context:
+a mode, a library wire id and a preset.</p>
+<ol class="steps">
+  <li><strong>The writer chooses.</strong> Mode kCompressStatic (1) with a
+  library id compresses with exactly that codec and preset. Mode
+  kCompressDynamic (2) asks the models to pick. Mode kCompressSkip (0)
+  with no library stores raw.</li>
+  <li><strong>The pool's default applies.</strong> If the writer named
+  neither a codec nor a mode, <code>default_compress</code> fills in the
+  mode, and for a static default the library and preset.</li>
+  <li><strong>Dynamic selection runs</strong> when the mode is dynamic, the
+  put is a whole-blob primary write and the data is host-readable. The
+  module samples up to 64 KiB of the payload and computes Shannon entropy,
+  mean absolute deviation and mean second derivative, treating the data
+  as bytes or as 32-bit floats according to the context's data type. For
+  each candidate it predicts ratio and times, then picks the candidate
+  with the highest predicted ratio, or the lowest predicted end-to-end
+  time when the context sets the performance objective. Candidates whose
+  predicted PSNR falls below a requested target are dropped.</li>
+  <li><strong>The codec runs and the result is checked.</strong> The
+  compressed image must be at most 87.5% of the raw size. Otherwise the
+  raw bytes are stored and the blob is never recorded as carrying the
+  attempted codec.</li>
+</ol>
+<p>The dynamic candidate set is fixed: zstd balanced, zstd fast, lz4
+fast, bzip2 best and zlib balanced. Predictions come from the Q-table
+predictor when its model is loaded, otherwise from the dense neural
+network predictor in builds that have Eigen, otherwise from a heuristic
+that assumes a ratio of 2.0 for every candidate. With the heuristic the
+ratio objective keeps the first candidate, zstd balanced. The time
+objective estimates transfer time from the fastest known storage
+target's score and adds predicted compress and decompress times.</p>
+<div class="callout">
+  <p><strong>Partial writes are never compressed.</strong> A write at a
+  nonzero offset, a vectored write, a replica-addressed write or an
+  emulated write forwards with the codec request cleared. A compressed
+  stream cannot be patched in place.</p>
+</div>
+
+<h2>Reading compressed blobs</h2>
+<ul>
+  <li>A read of a transformed blob fetches the whole stored image,
+  decompresses it once, and slices each requested region out of the
+  result. The raw core cannot serve a partial read of compressed data; the
+  compressor can.</li>
+  <li>Decompression return codes distinguish a codec that could not be
+  created, a failed decode, and an invalid header or undersized
+  destination.</li>
+  <li>GPU codecs run in a dedicated CUDA context with preallocated device
+  buffers, because allocating or creating streams while a page-faulting
+  kernel is resident deadlocks. A request that does not fit a
+  preallocated slot, or arrives with every slot busy, falls back to the
+  host path or stores raw. It never allocates.</li>
+  <li>For nvcomp-family blobs read on a device page-fault path, several
+  pages' chunks are combined into one batched decompress launch. A
+  further drain-thread batching mode exists but is incomplete and is off
+  unless <code>CLIO_COMPRESS_GPU_BATCH=1</code>.</li>
+</ul>
+
+<h2>Explicit client verbs</h2>
+<p>The compressor client's put and get already route through the module.
+The explicit verbs exist for callers that want to drive it directly.</p>
+<ul>
+  <li><strong>DynamicSchedule</strong>: same inputs as a put; analyzes the
+  data, picks a codec, compresses and stores. Returns the selected tier
+  score.</li>
+  <li><strong>Compress</strong>: same inputs as a put; compresses with the
+  context's codec and stores.</li>
+  <li><strong>Decompress</strong>: same inputs as a get; fetches and
+  decompresses, returning the output size and decode time.</li>
+  <li><strong>PollNodeLoad</strong> and <strong>PollConsumers</strong>:
+  sample a node's CPU and worker load, and periodically poll every
+  tracked consumer node.</li>
+</ul>
+<pre data-label="cpp">
+clio::cte::core::Context ctx;
+ctx.dynamic_compress_ = clio::cte::core::kCompressStatic;
+ctx.compress_lib_ = ctp::CompressionFactory::GetWireId("zstd");  // 10
+ctx.compress_preset_ = 2;  // 1 = fast, 2 = balanced, 3 = best
+auto put = client.AsyncPutBlob(tag_id, "field.bin", 0, size, data, 1.0f, ctx);
+put.Wait();
+</pre>
+<p>After the put, the returned context carries the actual original and
+compressed sizes, the achieved ratio and the compress time.</p>
+
+<h2>Behaviors worth knowing</h2>
+<ul>
+  <li>Compression state is recorded on the blob as transform flags set by
+  the compressor, which is the authoritative answer to "is this blob
+  compressed". The requested library id on the blob is provenance
+  only.</li>
+  <li>A put that fails to compress, or whose codec is unavailable, is
+  stored raw and succeeds. Compression failures do not surface as put
+  errors.</li>
+  <li>Scheduler cost estimates treat compression as roughly 300 bytes per
+  microsecond of CPU and decompression as three times faster. Both
+  coefficients are then learned from real completions.</li>
+  <li>A compression telemetry ring records per-operation library, sizes
+  and times for monitoring.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>Whole-blob writes only. Appends and in-place range writes to a
+  compressed blob are not supported by this layer; the filesystem module
+  works around this with fixed-size page blobs.</li>
+  <li>Batched puts (MultiPutBlob) are never compressed.</li>
+  <li>Codec selection is per blob and has no per-tag or per-tier rules.
+  The only pool-wide knob is the default codec; tier awareness enters
+  only through the time objective's bandwidth estimate.</li>
+  <li>Dynamic selection considers five fixed CPU candidates. GPU and
+  lossy codecs must be requested statically.</li>
+  <li>Without trained models the dynamic mode degrades to a constant
+  ratio guess, which makes it equivalent to choosing zstd balanced.</li>
+  <li>Decompressing a partial read costs a full-blob decode.</li>
+</ul>
+
+<h2>How it is tested</h2>
+<ul>
+  <li><code>context-transfer-engine/compressor/test</code>: predictor unit
+  tests (distribution classifier, linear-regression table, Q-table), a
+  codec-selection consistency test, the functional test of the
+  Compress, Decompress and DynamicSchedule tasks, transparent-compression
+  integration tests including an ADIOS2-style client, a contention
+  benchmark and a per-library compression benchmark.</li>
+  <li><code>context-transfer-engine/test/unit</code>:
+  test_compressor_interpose (a plain core client against the compressor
+  pool: whole-blob compress, partial and vectored decompress, logical
+  sizes), test_interposer_stack (compressor over replication over core)
+  and test_cache_stack (the full four-layer chain).</li>
+</ul>
