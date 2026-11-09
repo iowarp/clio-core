@@ -1037,6 +1037,10 @@ private:
   /**
    * Get the persistence level for a target from its storage device config
    */
+  /** Explicitly configured persistence of a storage target as an int
+   *  (PersistenceLevel), or -1 when the target has no configured level. */
+  int ConfiguredPersistenceLevel(const std::string &target_name);
+
   clio::run::bdev::PersistenceLevel GetPersistenceLevelForTarget(
       const std::string &target_name);
 
