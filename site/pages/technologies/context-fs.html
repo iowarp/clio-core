@@ -58,6 +58,58 @@ facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no me
 </ul>
 <p>About 91% of each operation's wall time is kernel transit; the daemon itself spends about 9.6 µs of CPU time per operation.</p>
 
+<h3>Parallel I/O with IOR</h3>
+<p>IOR, the standard HPC I/O benchmark, weak-scaled from 1 to 6 MPI ranks on one node: each rank writes and then reads its own 256 MiB file in 1 MiB transfers, with fsync after writing and the page cache dropped between the write and read phases. Context FS (release build of <code>dev</code> at c5dba42bc, default runtime configuration, one DRAM tier) against ext4 on the same machine: WSL2 Ubuntu 24.04 with 6 cores and 11 GB of memory, on a Ryzen 7 3800X with NVMe. Each bar is the mean of three runs, in MiB/s, higher is better.</p>
+<div class="chart-grid">
+  <figure><figcaption>Write bandwidth, MiB/s</figcaption>
+<ul class="bars" aria-label="Write bandwidth, MiB/s">
+  <li class="ours"><span>Context FS, 1 rank</span><span class="bar"><i style="width:25%"></i></span><span class="val">359</span></li>
+  <li><span>ext4, 1 rank</span><span class="bar"><i style="width:36%"></i></span><span class="val">530</span></li>
+  <li class="ours"><span>Context FS, 2 ranks</span><span class="bar"><i style="width:33%"></i></span><span class="val">476</span></li>
+  <li><span>ext4, 2 ranks</span><span class="bar"><i style="width:47%"></i></span><span class="val">692</span></li>
+  <li class="ours"><span>Context FS, 4 ranks</span><span class="bar"><i style="width:44%"></i></span><span class="val">643</span></li>
+  <li><span>ext4, 4 ranks</span><span class="bar"><i style="width:84%"></i></span><span class="val">1,225</span></li>
+  <li class="ours"><span>Context FS, 6 ranks</span><span class="bar"><i style="width:42%"></i></span><span class="val">606</span></li>
+  <li><span>ext4, 6 ranks</span><span class="bar"><i style="width:100%"></i></span><span class="val">1,459</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Read bandwidth, MiB/s</figcaption>
+<ul class="bars" aria-label="Read bandwidth, MiB/s">
+  <li class="ours"><span>Context FS, 1 rank</span><span class="bar"><i style="width:4%"></i></span><span class="val">182</span></li>
+  <li><span>ext4, 1 rank</span><span class="bar"><i style="width:28%"></i></span><span class="val">1,327</span></li>
+  <li class="ours"><span>Context FS, 2 ranks</span><span class="bar"><i style="width:6%"></i></span><span class="val">277</span></li>
+  <li><span>ext4, 2 ranks</span><span class="bar"><i style="width:57%"></i></span><span class="val">2,672</span></li>
+  <li class="ours"><span>Context FS, 4 ranks</span><span class="bar"><i style="width:6%"></i></span><span class="val">273</span></li>
+  <li><span>ext4, 4 ranks</span><span class="bar"><i style="width:89%"></i></span><span class="val">4,215</span></li>
+  <li class="ours"><span>Context FS, 6 ranks</span><span class="bar"><i style="width:5%"></i></span><span class="val">235</span></li>
+  <li><span>ext4, 6 ranks</span><span class="bar"><i style="width:100%"></i></span><span class="val">4,726</span></li>
+</ul>
+  </figure>
+</div>
+<p>On a single node, ext4 leads at every rank count. ext4 is a kernel filesystem on local NVMe, while Context FS routes every 1 MiB transfer through FUSE to the runtime process and back. Context FS write bandwidth grows 1.8x from 1 to 4 ranks and then levels off at about 600-640 MiB/s; reads stay between 180 and 280 MiB/s. Where Context FS is built to help is across nodes, where it presents one namespace over every node's tiers without a metadata server. Multi-node IOR results on the Ares cluster will be added here.</p>
+<h3>Checkpointing a simulation through the tiers</h3>
+<p>From the Eternia paper's evaluation: Gray-Scott on 2 Aurora nodes, 8 steps, a checkpoint every 2 steps. Each checkpoint is a copy-on-write snapshot that CLIO Core drains down the tier stack in the background, in a layout the HDF5 VOL can read. It is compared with a conventional synchronous checkpoint, in which the simulation waits until the snapshot reaches persistent storage; in the Lustre-heavy composition that is a simulation writing its checkpoint to the parallel file system. Total runtime in seconds, lower is better.</p>
+<div class="chart-grid">
+  <figure><figcaption>DRAM only</figcaption>
+<ul class="bars" aria-label="DRAM only">
+  <li class="ours"><span>CLIO async snapshot</span><span class="bar"><i style="width:83%"></i></span><span class="val">34.4</span></li>
+  <li><span>Synchronous checkpoint</span><span class="bar"><i style="width:100%"></i></span><span class="val">41.6</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Balanced (25% DRAM, 50% DAOS, 25% Lustre)</figcaption>
+<ul class="bars" aria-label="Balanced (25% DRAM, 50% DAOS, 25% Lustre)">
+  <li class="ours"><span>CLIO async snapshot</span><span class="bar"><i style="width:75%"></i></span><span class="val">95.5</span></li>
+  <li><span>Synchronous checkpoint</span><span class="bar"><i style="width:100%"></i></span><span class="val">127.9</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Lustre-heavy (10% DRAM, 20% DAOS, 70% Lustre)</figcaption>
+<ul class="bars" aria-label="Lustre-heavy (10% DRAM, 20% DAOS, 70% Lustre)">
+  <li class="ours"><span>CLIO async snapshot</span><span class="bar"><i style="width:85%"></i></span><span class="val">100.1</span></li>
+  <li><span>Synchronous checkpoint</span><span class="bar"><i style="width:100%"></i></span><span class="val">117.2</span></li>
+</ul>
+  </figure>
+</div>
+<p class="bars-caption">The asynchronous snapshot is 15-25% faster in every composition. Persisting the grid four times still moves 25-62 s of data against 10-48 s of computation; the snapshot lets that traffic proceed in the background instead of blocking the run on the slowest tier. For a science application at larger scale, see the <a href="/technologies/memory-expansion.html">Gray-Scott comparison against DDN, Hermes and cuFile</a>.</p>
 <h3>Against ext4: cloning the Linux kernel</h3>
 <ul class="bars" aria-label="git clone of the Linux kernel, seconds">
   <li><span>ext4</span><span class="bar"><i style="width:23%"></i></span><span class="val">39 s</span></li>

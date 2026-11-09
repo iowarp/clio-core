@@ -51,9 +51,31 @@ layout: landing
     </div>
   </section>
 
+  <section class="chapter-row reveal" id="scale" aria-labelledby="scale-title">
+    <div class="section-heading">
+      <p class="eyebrow"><span class="chapter">02 /</span> Scale</p>
+      <h2 id="scale-title">Parallel on every node,<br><em>from a laptop to 64.</em></h2>
+      <p>CLIO Core runs as one runtime per node, and every module is a pool with a container on each node. Work and data spread across the machine instead of funnelling through a central server, so a pipeline that grows from one node to many keeps the same configuration.</p>
+      <a class="text-link" href="/design/runtime.html">How the runtime schedules work <span aria-hidden="true">&rarr;</span></a>
+    </div>
+    <div>
+      <ul class="checks">
+        <li><strong>No central servers.</strong> Each pool places a container on every node. Context FS homes each inode on a node by its path, so there is no metadata server to saturate.</li>
+        <li><strong>Many clients at once.</strong> The runtime runs requests as lightweight coroutine tasks across worker threads, and clients reach it over shared memory, TCP or Unix sockets.</li>
+        <li><strong>Parallel from inside GPU kernels.</strong> With memory expansion, every GPU block issues its own batched, asynchronous fetches and flushes, so data movement overlaps computation.</li>
+        <li><strong>Tiers on every node.</strong> Each node composes its own RAM, NVMe, disks and buckets, and the engine places data across all of them.</li>
+      </ul>
+      <ul class="headline-stats">
+        <li><strong>64 nodes</strong><span>Eternia within 0.88-1.19x of MPI, oneCCL and Intel SHMEM on Aurora</span></li>
+        <li><strong>1 &rarr; 16 nodes</strong><span>clio-ml time per iteration stays flat; Spark MLlib's grows 3.6x</span></li>
+        <li><strong>2x</strong><span>larger Gray-Scott runs than DDN, Hermes and cuFile on 4 Delta nodes</span></li>
+      </ul>
+    </div>
+  </section>
+
   <section class="chapter-row reveal" id="mount" aria-labelledby="mount-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">02 /</span> Context FS</p>
+      <p class="eyebrow"><span class="chapter">03 /</span> Context FS</p>
       <h2 id="mount-title">Mount it like<br><em>any other directory.</em></h2>
       <p>Context FS is the stack composed as a filesystem. Start the runtime, then mount it with <code>clio_cte_fuse</code>. Copy files in with <code>cp</code>, open them from a notebook, or point a simulation at the mount. Writes go straight through, so a file's size is exact as soon as <code>write()</code> returns. Linux, macOS and Windows each use their native FUSE driver.</p>
       <a class="text-link" href="/technologies/context-fs.html">Context FS: tiering, RAID, buckets <span aria-hidden="true">→</span></a>
@@ -76,7 +98,7 @@ $ ls ~/clio-mnt/results
 
   <section class="chapter-row reveal" id="compose" aria-labelledby="compose-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">03 /</span> Compose</p>
+      <p class="eyebrow"><span class="chapter">04 /</span> Compose</p>
       <h2 id="compose-title">Compose the storage<br><em>you already have.</em></h2>
       <p>A short YAML file lists the modules a pipeline needs and the tiers under them. Each tier gets a capacity and a score from 0 to 1. New data lands on the fastest tier with room; data you stop touching moves down to slower, larger tiers. Every product on top, from the filesystem to clio-ml, uses the same tiers.</p>
       <a class="text-link" href="/tutorials/compose.html">Compose RAM, NVMe and SSD tiers <span aria-hidden="true">→</span></a>
@@ -92,7 +114,7 @@ $ ls ~/clio-mnt/results
 
   <section class="chapter-row reveal" id="query" aria-labelledby="query-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">04 /</span> Query</p>
+      <p class="eyebrow"><span class="chapter">05 /</span> Query</p>
       <h2 id="query-title">Ask for data<br><em>by what it says.</em></h2>
       <p>The default composition indexes what you write, whichever product wrote it. From Python you can search by keyword relevance (BM25) or by name pattern, get back the matching blobs ranked, and read them straight from the key-value store.</p>
       <a class="text-link" href="/tutorials/python-semantic-query.html">Query files from Python <span aria-hidden="true">→</span></a>
@@ -121,7 +143,7 @@ for h in client.SemanticSearch(tag_regex=".*notes/.*", blob_regex="[0-9]+",
 
   <section class="chapter-row reveal" id="observe" aria-labelledby="observe-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">05 /</span> Observe</p>
+      <p class="eyebrow"><span class="chapter">06 /</span> Observe</p>
       <h2 id="observe-title">Watch it work<br><em>in the dashboard.</em></h2>
       <p>Every runtime serves a web dashboard on <code>127.0.0.1:8080</code>. It shows the nodes in your cluster, the load on each worker thread, and every storage tier's free space and traffic. You can add or remove pools there too, with no separate process to install.</p>
       <a class="text-link" href="/tutorials/dashboard.html">Navigate the dashboard <span aria-hidden="true">→</span></a>
@@ -135,7 +157,7 @@ for h in client.SemanticSearch(tag_regex=".*notes/.*", blob_regex="[0-9]+",
 
   <section class="chapter-row reveal" id="agents" aria-labelledby="agents-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">06 /</span> Agents</p>
+      <p class="eyebrow"><span class="chapter">07 /</span> Agents</p>
       <h2 id="agents-title">Bring your AI<br><em>to your data.</em></h2>
       <p>CLIO Core is the data layer of the Clio family. Clio Agent and Clio Coder are IOWarp's agents for science: one manages and analyzes data, the other writes scientific software. Anything they write through Context FS or the key-value store is stored, tiered and indexed like the rest of your pipeline's data.</p>
       <a class="text-link" href="/tutorials/python-semantic-query.html">Query that data from Python <span aria-hidden="true">→</span></a>
@@ -148,7 +170,7 @@ for h in client.SemanticSearch(tag_regex=".*notes/.*", blob_regex="[0-9]+",
 
   <section class="chapter-row reveal" id="install" aria-labelledby="install-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">07 /</span> Install</p>
+      <p class="eyebrow"><span class="chapter">08 /</span> Install</p>
       <h2 id="install-title">Install the way<br><em>your site works.</em></h2>
       <p>The pip wheel runs on Linux, Windows and Apple Silicon Macs with Python 3.10 to 3.13. HPC sites can use Spack. Containers can use the Docker image. Build from source for GPUs, MPI, HDF5 or ADIOS2.</p>
       <a class="text-link" href="/docs/installation.html">Full installation guide <span aria-hidden="true">→</span></a>
@@ -187,7 +209,7 @@ $ cmake --build build -j"$(nproc)" && sudo cmake --install build
 
   <section class="chapter-row reveal" id="stack" aria-labelledby="stack-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">08 /</span> Under the hood</p>
+      <p class="eyebrow"><span class="chapter">09 /</span> Under the hood</p>
       <h2 id="stack-title">Five engines,<br><em>one runtime.</em></h2>
       <p>Every product is built from these layers, and you can use each one directly. Each layer has its own C++ and Python interfaces. The Design section explains how they fit together and which tradeoffs they make for speed and reliability.</p>
       <a class="text-link" href="/design/index.html">Read the design <span aria-hidden="true">→</span></a>
@@ -204,7 +226,7 @@ $ cmake --build build -j"$(nproc)" && sudo cmake --install build
 
   <section class="chapter-row reveal faq" id="questions" aria-labelledby="faq-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">09 /</span> Questions</p>
+      <p class="eyebrow"><span class="chapter">10 /</span> Questions</p>
       <h2 id="faq-title">Common questions.</h2>
     </div>
     <div>
