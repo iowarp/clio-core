@@ -2510,7 +2510,11 @@ static int cte_fuse_getattr(const char *path, cte_stat_t *stbuf,
     if (it != g_recent_pos.end()) {
       bool fresh = now - it->second <= window;
       g_recent_pos.erase(it);
+#if defined(__linux__)
       if (fresh) return -ESTALE;
+#else
+      (void)fresh;
+#endif
     }
   }
   return rc;
