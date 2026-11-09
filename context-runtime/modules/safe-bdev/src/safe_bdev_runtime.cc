@@ -1111,8 +1111,23 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       clio::run::u64 s = 0, within = 0;
       Unband(b.offset, d, s, within);
       if (d < data_alloc_.size()) {
-        data_alloc_[d].live_.insert(s);
-        if (b.size < kChunkLen) data_alloc_[d].part_len_[s] = b.size;
+        MemberAlloc &ma = data_alloc_[d];
+        ma.live_.insert(s);
+        if (within != 0 || ma.packed_.count(s) != 0) {
+          // A packed slot (#1343): rebuild its unit mask from every live
+          // block in it. A block at offset 0 recorded first as a short
+          // whole-slot block folds into the mask too.
+          auto pl = ma.part_len_.find(s);
+          if (pl != ma.part_len_.end()) {
+            ma.TakeUnits(s, 0, static_cast<clio::run::u32>(
+                                   (pl->second + kSubUnit - 1) / kSubUnit));
+          }
+          ma.TakeUnits(s, static_cast<clio::run::u32>(within / kSubUnit),
+                       static_cast<clio::run::u32>(
+                           (b.size + kSubUnit - 1) / kSubUnit));
+        } else if (b.size < kChunkLen) {
+          ma.part_len_[s] = b.size;
+        }
       }
     }
     clio::run::u64 total_live = 0;
@@ -1339,6 +1354,65 @@ bool Runtime::AllocateFullStripe(
   return true;
 }
 
+bool Runtime::AllocatePacked(clio::run::shared_ptr<AllocateBlocksTask> &task,
+                             clio::run::u64 &remaining) {
+  // issue #1343: a piece shorter than a chunk takes whole kSubUnit units of a
+  // shared slot instead of a whole kChunkLen slot (a 4 KiB allocation used to
+  // burn 64 KiB, so small-block workloads hit "no free slot" at 1/16 of the
+  // capacity). Members round-robin from the cursor as the chunk path does; a
+  // member's partly used slot is filled before a fresh one is opened, so
+  // packed slots stay few. Caller holds alloc_mu_.
+  const clio::run::u32 units =
+      static_cast<clio::run::u32>((remaining + kSubUnit - 1) / kSubUnit);
+  const size_t n = data_members_.size();
+  int fresh = -1;
+  for (size_t i = 0; i < n; ++i) {
+    const size_t d = (rr_cursor_ + i) % n;
+    if (data_members_[d].state_ != ec::EcState::kActive) continue;
+    MemberAlloc &a = data_alloc_[d];
+    clio::run::u64 s = 0;
+    clio::run::u32 first = 0;
+    if (a.FindPacked(units, s, first)) {
+      rr_cursor_ = static_cast<clio::run::u32>((d + 1) % n);
+      EmitPacked(task, d, s, first, remaining);
+      return true;
+    }
+    if (fresh < 0 && !a.Full()) fresh = static_cast<int>(d);
+  }
+  if (fresh < 0) return false;
+  const size_t d = static_cast<size_t>(fresh);
+  MemberAlloc &a = data_alloc_[d];
+  clio::run::u64 s = a.PickSpread(recent_slots_);
+  if (s >= a.cap_slots_) {
+    s = a.Take();
+  } else {
+    a.TakeSlot(s);
+  }
+  recent_slots_.push_back(s);
+  if (recent_slots_.size() > kSpreadWindow) recent_slots_.pop_front();
+  rr_cursor_ = static_cast<clio::run::u32>((d + 1) % n);
+  EmitPacked(task, d, s, 0, remaining);
+  return true;
+}
+
+void Runtime::EmitPacked(clio::run::shared_ptr<AllocateBlocksTask> &task,
+                         size_t d, clio::run::u64 s, clio::run::u32 first,
+                         clio::run::u64 &remaining) {
+  if (s + 1 > array_high_water_) {
+    array_high_water_ = s + 1;
+    alloc_log_.LogGroupOpen(kHighWaterGroup, 0, array_high_water_, 0, 0);
+  }
+  const clio::run::u64 seg = remaining;  // < kChunkLen
+  const clio::run::u32 units =
+      static_cast<clio::run::u32>((seg + kSubUnit - 1) / kSubUnit);
+  data_alloc_[d].TakeUnits(s, first, units);
+  const clio::run::u64 off =
+      BandOffset(static_cast<clio::run::u32>(d), s) + first * kSubUnit;
+  task->blocks_.push_back(clio::run::bdev::Block(off, seg, 0));
+  alloc_log_.LogAlloc(kAllocGroup, off, seg, 0);
+  remaining = 0;
+}
+
 clio::run::TaskResume Runtime::AllocateBlocks(
     clio::run::shared_ptr<AllocateBlocksTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -1379,6 +1453,7 @@ clio::run::TaskResume Runtime::AllocateBlocks(
     // writer. The rest goes a chunk at a time, each on the next member, in a
     // slot the last few single-chunk allocations did not use.
     if (AllocateFullStripe(task, remaining)) continue;
+    if (remaining < kChunkLen && AllocatePacked(task, remaining)) continue;
     size_t scanned = 0;
     int chosen = -1;
     const size_t nmembers = data_members_.size();
@@ -1453,7 +1528,17 @@ clio::run::TaskResume Runtime::FreeBlocks(clio::run::shared_ptr<FreeBlocksTask> 
            b.offset_, d, s);
       continue;
     }
-    data_alloc_[d].Release(s);
+    MemberAlloc &ma = data_alloc_[d];
+    if (ma.packed_.count(s) != 0) {
+      // A packed slot (#1343) is released only with its last unit.
+      if (ma.ReleaseUnits(s, static_cast<clio::run::u32>(within / kSubUnit),
+                          static_cast<clio::run::u32>(
+                              (b.size_ + kSubUnit - 1) / kSubUnit))) {
+        ma.Release(s);
+      }
+    } else {
+      ma.Release(s);
+    }
     alloc_log_.LogFree(kAllocGroup, b.offset_, b.size_, 0);
   }
   alloc_log_.Append();  // survives a process crash, as AllocateBlocks
@@ -2299,7 +2384,7 @@ void Runtime::ArrayCapacity(clio::run::u64 *total,
     } else {
       // Its data is still stored (reconstructable): it stays "used", and
       // only its free space leaves the array.
-      *total += data_alloc_[d].live_.size() * kChunkLen;
+      *total += data_alloc_[d].UsedBytes();
     }
   }
 }
@@ -3485,9 +3570,12 @@ clio::run::TaskResume Runtime::EncodeStripe(clio::run::u64 s, bool &ok) {
     gen = slot_gen_[s];
   }
   const int k_s = static_cast<int>(stripe.size());
-  if (k_s <= 0) {
+  if (k_s <= 0 || (parity_level_ == 0 && parity_members_.empty())) {
+    // Nothing to protect, or no parity to compute (#1343: a k+0 array read
+    // every data column's whole chunk back on each partial-stripe write only
+    // to encode a parity that has nowhere to go).
     std::lock_guard<std::mutex> g(slot_mu_);
-    dirty_slots_.erase(s);  // nothing left to protect
+    dirty_slots_.erase(s);
     ok = true;
     CLIO_CO_RETURN;
   }
