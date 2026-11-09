@@ -168,7 +168,8 @@ clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
     // before that adopted its stale journal copy and then committed over the
     // stand-in's newer entries (fsynced creates lost cluster-wide). Ask the
     // stand-in directly, as EnsureInode does for inode records.
-    if (NumContainers() > 1 && BlockHome(dir, k) == container_id_) {
+    if (NumContainers() > 1 && BlockHome(dir, k) == container_id_ &&
+        SteadyMs() < standin_until_ms_.load(std::memory_order_acquire)) {
       auto si_copy = std::make_shared<InodeTableBlock>();
       int si_rc = 0;
       CLIO_CO_AWAIT(ReadBlockStandIn(dir, k, si_copy.get(), si_rc));
@@ -560,6 +561,7 @@ void Runtime::DropHomeBlocksAfterFailover() {
   // does -- journal and the handed-back CTE copy, newest version wins --
   // and resyncs its holders. Blocks with unwritten changes or work in
   // flight are kept: dropping them would lose acknowledged changes.
+  standin_until_ms_.store(SteadyMs() + 600000, std::memory_order_release);
   size_t dropped = 0, kept = 0;
   {
     std::lock_guard<std::mutex> g(ns_mu_);

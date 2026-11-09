@@ -447,6 +447,11 @@ class Runtime : public clio::run::Container {
   std::atomic<clio::run::u64> seen_held_dead_seq_{0};
   /** Drop every clean home block (reload on next use); see above. */
   void DropHomeBlocksAfterFailover();
+  /** issue #1322: until this steady-ms deadline (set by a rejoin notice) a
+   *  home that loads its own block also asks its stand-in for a newer copy.
+   *  Outside it there is no stand-in to ask: on a full-cluster restart every
+   *  node would wait on a neighbour that is itself still loading. */
+  std::atomic<clio::run::u64> standin_until_ms_{0};
   /** Blocks being loaded here (a push that arrives meanwhile is kept),
    *  each with the step its loader is on -- named in a slow waiter's
    *  warning, so a load that never returns says where it is stuck. */
