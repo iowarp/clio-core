@@ -1213,10 +1213,19 @@ void Worker::SuspendMe() {
     // with a task pending (the cr_ipc_transport_shm / cr_client_retry_*_shm
     // timeouts). max_sleep (50 ms) is exactly the "maximum sleep" knob meant to
     // bound this; honor it so the worker self-heals by re-polling its lane.
+    //
+    // issue #1339: floor the parked timeout at kMinParkUs. The net SendPoll
+    // periodic runs at 25us, and using that as the epoll timeout made an IDLE
+    // daemon's net workers wake ~8k times/s (~1 core total). A parked worker has
+    // already spun ~1ms with no work, and every producer that feeds a
+    // sub-millisecond periodic (EnqueueNetTask, SHM shard, lanes) wakes the
+    // worker explicitly, so the fast period only matters while busy.
+    constexpr int kMinParkUs = 1000;
     double suspend_period_us = GetSuspendPeriod();
     int timeout_us = (suspend_period_us < 0)
                          ? static_cast<int>(max_sleep)
-                         : std::min(static_cast<int>(suspend_period_us),
+                         : std::min(std::max(static_cast<int>(suspend_period_us),
+                                             kMinParkUs),
                                     static_cast<int>(max_sleep));
 
     // issue #807: park protocol for the inbound SHM shard. The ORDER is
