@@ -2478,6 +2478,8 @@ static int cte_fuse_getattr(const char *path, struct fuse_darwin_attr *attr,
 static std::mutex g_pos_mtx;
 static std::unordered_map<std::string, std::chrono::steady_clock::time_point>
     g_recent_pos;
+static std::unordered_map<int64_t, std::chrono::steady_clock::time_point>
+    g_estale_tid;  ///< last ESTALE per calling thread (guarded by g_pos_mtx)
 
 static bool StaleOnVanished() {
 #if defined(__linux__)
@@ -2510,6 +2512,23 @@ static int cte_fuse_getattr(const char *path, cte_stat_t *stbuf,
     if (it != g_recent_pos.end()) {
       bool fresh = now - it->second <= window;
       g_recent_pos.erase(it);
+      // The VFS retries an ESTALE syscall exactly ONCE. A syscall that walks
+      // two such paths (rename: source and target) would see a second ESTALE
+      // on the retry and leak it to the application (dirs_rename_storm). Give
+      // each calling thread at most one per second: its retry then always
+      // sees the real answer.
+      if (fresh) {
+        const fuse_context *fc = fuse_get_context();
+        const int64_t tid = fc != nullptr ? static_cast<int64_t>(fc->pid) : -1;
+        auto tt = g_estale_tid.find(tid);
+        if (tt != g_estale_tid.end() &&
+            now - tt->second < std::chrono::seconds(1)) {
+          fresh = false;
+        } else {
+          if (g_estale_tid.size() >= 4096) g_estale_tid.clear();
+          g_estale_tid[tid] = now;
+        }
+      }
 #if defined(__linux__)
       if (fresh) return -ESTALE;
 #else
