@@ -81,6 +81,20 @@ jobs:
               cmake --build build -j"$(nproc)" --target \
                 clio_run_s3_rest_test clio_run_gcs_rest_test clio_bdev_runtime
 
+              # The tests link Poco (Net, NetSSL, Crypto). Make sure the loader
+              # can find its shared objects: put the directory of whichever copy
+              # the build linked on the path, and install the runtime package if
+              # the image ships only the link-time files.
+              if ! ldd ./build/bin/clio_run_s3_rest_test | grep -q "libPocoNetSSL.*=> /"; then
+                poco_dir=$(dirname "$(find /usr /opt -name "libPocoNetSSL.so.*" 2>/dev/null | head -1)" 2>/dev/null || true)
+                if [ -n "$poco_dir" ] && [ "$poco_dir" != "." ]; then
+                  export LD_LIBRARY_PATH="$poco_dir:$LD_LIBRARY_PATH"
+                else
+                  apt-get update -qq && apt-get install -y -qq libpoco-dev
+                fi
+              fi
+              ldd ./build/bin/clio_run_s3_rest_test | grep -i poco
+
               echo "::group::S3 transport against VersityGW"
               # S3_REAL_SERVER skips the tests that read the stub's own counters.
               S3_REAL_SERVER=1 \

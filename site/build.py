@@ -92,6 +92,26 @@ NAV = {
             ("develop/extend-storage.html", "Extend the storage system"),
         ]),
     ],
+    "modules": [
+        ("Modules", [
+            ("modules/index.html", "Module reference"),
+        ]),
+        ("Storage", [
+            ("modules/bdev.html", "Block devices (bdev)"),
+            ("modules/safe-bdev.html", "Erasure-coded arrays (safe_bdev)"),
+            ("modules/cte-core.html", "CTE core"),
+        ]),
+        ("Data path", [
+            ("modules/cache.html", "Cache"),
+            ("modules/replication.html", "Replication"),
+            ("modules/compressor.html", "Compressor"),
+        ]),
+        ("Context", [
+            ("modules/indexer.html", "Indexer"),
+            ("modules/cae-core.html", "CAE core (assimilation)"),
+            ("modules/summarizer.html", "Summarizer"),
+        ]),
+    ],
     "design": [
         ("Design", [
             ("design/index.html", "Overview and principles"),
@@ -111,6 +131,7 @@ PRIMARY = [
     ("technologies/index.html", "Technologies", "technologies"),
     ("docs/index.html", "Docs", "docs"),
     ("tutorials/index.html", "Tutorials", "tutorials"),
+    ("modules/index.html", "Modules", "modules"),
     ("develop/index.html", "Develop", "develop"),
     ("design/index.html", "Design", "design"),
 ]
