@@ -1,0 +1,106 @@
+# Cloud block devices against real emulators: VersityGW for Amazon S3 and
+# fake-gcs-server for Google Cloud Storage. Both run as service containers on
+# a GitHub-hosted runner, so the job is free for this public repository and
+# needs no AWS or Google account, no credentials and no secrets.
+#
+# What it validates that ci-linux.yml's s3-bdev job does not:
+#   * the S3 transport against an independent S3 implementation (VersityGW),
+#     not only our own stdlib stub, including SigV4 as VersityGW verifies it;
+#   * the GCS transport at all: bucket create (and 409-as-success), media upload,
+#     alt=media download, '/' in object names (%2F), 404 as a sparse read, delete.
+name: CI cloud bdev
+
+on:
+  pull_request:
+    paths:
+      - "context-runtime/modules/bdev/**"
+      - "context-transport-primitives/**"
+      - ".github/workflows/ci-cloud-bdev.yml"
+  push:
+    branches: [main, dev]
+    paths:
+      - "context-runtime/modules/bdev/**"
+      - ".github/workflows/ci-cloud-bdev.yml"
+  schedule:
+    - cron: "0 7 * * 1"   # weekly, to catch emulator or API drift
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cloud-bdev:
+    name: cloud-bdev (VersityGW + fake-gcs-server)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # The emulators start with `docker run` rather than as `services:` because
+    # MinIO needs its `server` argument, which a service container cannot pass.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Start the emulators
+        run: |
+          # VersityGW: an Apache-2.0 S3 gateway that verifies SigV4. MinIO's
+          # images are no longer publicly pullable from Docker Hub or Quay.
+          docker run -d --name clio-s3 --network host --entrypoint sh \
+            versity/versitygw:latest -c \
+            'mkdir -p /data && exec versitygw --access clioci --secret clioci-secret-key --port 127.0.0.1:7070 posix /data'
+          docker run -d --name clio-fake-gcs --network host \
+            fsouza/fake-gcs-server:latest \
+            -scheme http -host 127.0.0.1 -port 4443 -public-host 127.0.0.1:4443
+          for i in $(seq 1 60); do
+            curl -s -o /dev/null http://127.0.0.1:7070/ && \
+            curl -sf http://127.0.0.1:4443/storage/v1/b >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:4443/storage/v1/b
+          # The S3 test expects its bucket to exist (as the stub provides).
+          AWS_ACCESS_KEY_ID=clioci AWS_SECRET_ACCESS_KEY=clioci-secret-key \
+          AWS_DEFAULT_REGION=us-east-1 \
+            aws --endpoint-url http://127.0.0.1:7070 s3 mb s3://clio-ci
+
+      - name: Build and test the S3 and GCS transports (inside deps-cpu)
+        run: |
+          docker run --rm --network host -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
+            iowarp/deps-cpu:latest bash -c '
+              set -eo pipefail
+              export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+              git config --global --add safe.directory /workspace
+              cmake --preset release \
+                -DCLIO_ENABLE_AMAZON_DRIVE=ON \
+                -DCLIO_ENABLE_GOOGLE_CLOUD=ON \
+                -DCLIO_CORE_ENABLE_PYTHON=OFF 2>&1 | tee /tmp/configure.log
+              # Fail loudly if either flag was silently auto-disabled (no Poco).
+              grep -q "Amazon S3 bdev support: ENABLED" /tmp/configure.log
+              grep -q "Google Cloud Storage bdev support: ENABLED" /tmp/configure.log
+              # clio_bdev_runtime compiles both transports end to end.
+              cmake --build build -j"$(nproc)" --target \
+                clio_run_s3_rest_test clio_run_gcs_rest_test clio_bdev_runtime
+
+              echo "::group::S3 transport against VersityGW"
+              # S3_REAL_SERVER skips the tests that read the stub's own counters.
+              S3_REAL_SERVER=1 \
+              S3_ENDPOINT=http://127.0.0.1:7070 \
+              S3_STUB_BUCKET=clio-ci \
+              AWS_DEFAULT_REGION=us-east-1 \
+              AWS_ACCESS_KEY_ID=clioci \
+              AWS_SECRET_ACCESS_KEY=clioci-secret-key \
+                ./build/bin/clio_run_s3_rest_test
+              echo "::endgroup::"
+
+              echo "::group::GCS transport against fake-gcs-server"
+              GCS_ENDPOINT=http://127.0.0.1:4443 \
+              GCS_PROJECT_ID=clio-ci \
+                ./build/bin/clio_run_gcs_rest_test
+              echo "::endgroup::"
+            '
+
+      - name: Emulator logs on failure
+        if: failure()
+        run: |
+          docker logs clio-s3 2>&1 | tail -50 || true
+          docker logs clio-fake-gcs 2>&1 | tail -50 || true
