@@ -7327,8 +7327,16 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     // waits are short and the whole snapshot stays bounded.
     constexpr clio::run::u64 kFlushTokenWaitMs = 2000;
     constexpr clio::run::u64 kFlushTokenWaitAfterStuckMs = 50;
+    // A holder past kFlushTokenStuckMs is wedged I/O ([AIO-STUCK]), not a live
+    // write. Only those may shorten later waits or let the WAL be truncated:
+    // a snapshot that skipped a LIVE write's token can miss that write's
+    // layout, and truncating the WAL would then drop the record that restores
+    // it (safe_disk_swapped_while_down saw CORRUPT blocks after a crash
+    // restart when every wait after the first timeout was 50 ms).
+    constexpr clio::run::u64 kFlushTokenStuckMs = 30000;
     clio::run::u64 token_wait_ms = kFlushTokenWaitMs;
     size_t stuck_blobs = 0;
+    size_t live_skipped = 0;
 
     // Every WAL record up to here has already been applied in memory, so the
     // snapshot below contains it; records logged while the snapshot is being
@@ -7428,7 +7436,13 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       }
       BlobWriteLockGuard flush_guard(&blob_info, have_tok ? flush_tok : 0);
       if (!have_tok) {
-        token_wait_ms = kFlushTokenWaitAfterStuckMs;
+        const clio::run::u64 held_ms =
+            (GetCurrentTimeNs() - blob_info.write_since_ns_) / 1000000;
+        if (held_ms >= kFlushTokenStuckMs) {
+          token_wait_ms = kFlushTokenWaitAfterStuckMs;
+        } else {
+          ++live_skipped;
+        }
         if (++stuck_blobs <= 8) {
           const char *site = blob_info.write_site_;
           HLOG(kError,
@@ -7600,7 +7614,11 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
           total_wal_size += log->Size();
         }
       }
-      if (total_wal_size >
+      if (live_skipped > 0) {
+        HLOG(kWarning, "FlushMetadata: {} blob(s) were mid-write without "
+             "their token; keeping the WAL untruncated this cycle",
+             live_skipped);
+      } else if (total_wal_size >
           config_.performance_.transaction_log_capacity_bytes_) {
         for (auto &log : blob_txn_logs_) {
           if (log) log->TruncateThrough(snapshot_seq);
