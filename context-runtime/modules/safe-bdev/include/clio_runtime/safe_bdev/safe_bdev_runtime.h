@@ -34,6 +34,7 @@
 #ifndef SAFE_BDEV_RUNTIME_H_
 #define SAFE_BDEV_RUNTIME_H_
 
+#include <bit>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/comutex.h>
 #include <clio_runtime/bdev/bdev_client.h>
@@ -439,7 +440,7 @@ class Runtime : public clio::run::Container {
         auto it = packed_.find(s);
         b += (it == packed_.end())
                  ? kChunkLen
-                 : static_cast<clio::run::u64>(__builtin_popcount(it->second)) *
+                 : static_cast<clio::run::u64>(std::popcount(static_cast<clio::run::u32>(it->second))) *
                        kSubUnit;
       }
       return b;
