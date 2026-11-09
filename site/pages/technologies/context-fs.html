@@ -8,8 +8,8 @@ facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no me
 -->
 <ul class="headline-stats">
   <li><strong>10 µs</strong><span>stat from the shared-memory mirror</span></li>
-  <li><strong>58 s</strong><span>8-node git workload, from over 600 s</span></li>
-  <li><strong>3 s</strong><span>tar extract on 4 nodes, from 45 s</span></li>
+  <li><strong>0</strong><span>metadata servers: inodes are homed by path</span></li>
+  <li><strong>3 OSes</strong><span>one FUSE daemon for Linux, macOS and Windows</span></li>
   <li><strong>N + M</strong><span>drives in an erasure-coded array that grows in place</span></li>
 </ul>
 
@@ -64,28 +64,42 @@ facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no me
 <p>About 91% of each operation's wall time is kernel transit; the daemon itself spends about 9.6 µs of CPU time per operation.</p>
 
 <h3>Against ext4: cloning the Linux kernel</h3>
-<ul class="bars" aria-label="git clone of the Linux kernel, seconds, lower is better">
-  <li><span>ext4</span><span class="bar"><i style="width:4%"></i></span><span class="val">39 s</span></li>
-  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:19%"></i></span><span class="val">171 s</span></li>
-  <li><span>Context FS, earlier</span><span class="bar"><i style="width:100%"></i></span><span class="val">&gt; 900 s</span></li>
+<ul class="bars" aria-label="git clone of the Linux kernel, seconds">
+  <li><span>ext4</span><span class="bar"><i style="width:23%"></i></span><span class="val">39 s</span></li>
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">171 s</span></li>
 </ul>
-<p class="bars-caption">Linux kernel <code>git clone</code>, one node. A local kernel filesystem has no FUSE crossing; Context FS pays one per metadata operation and is 4.4x slower here, down from over 23x before the FUSE overhaul.</p>
-
-<h3>Scaling fixes on multi-node runs</h3>
-<table>
-  <thead><tr><th>Workload</th><th>Before</th><th>After</th><th>Change</th></tr></thead>
-  <tbody>
-    <tr><td><code>tar</code> extraction, 4 nodes</td><td>45 s</td><td>3 s</td><td>Batched inode purges (one message per container every 20 ms)</td></tr>
-    <tr><td><code>git</code> workload, 8 nodes</td><td>&gt; 600 s</td><td>58 s</td><td>1 s FUSE entry cache kept on multi-node</td></tr>
-    <tr><td>File creation</td><td>63 / s</td><td>893 / s</td><td>Directory block images padded to powers of two</td></tr>
-    <tr><td>Kernel checkout on Windows (WinFsp)</td><td>~22 files/s (70+ min projected)</td><td>462 s</td><td>Inline metadata tasks, batched create, asynchronous publish on close</td></tr>
-  </tbody>
-</table>
+<p class="bars-caption">Linux kernel <code>git clone</code>, one node, lower is better. A clone is tens of thousands of small-file creates and lookups; a local kernel filesystem has no FUSE crossing, and Context FS pays one per metadata operation.</p>
 
 <h3>Against NTFS on a Windows workstation</h3>
-<p>A small Python script (1 GiB written in 1 MiB writes and fsynced, read back, then 2,000 files of 4 KiB created, stat'ed and listed) run twice on an NTFS directory and twice on a Context FS mount at <code>Z:</code>. Release build of the <code>dev</code> branch (f88db54bf), default runtime configuration bound to 127.0.0.1, WinFsp 2.0. Ryzen 7 3800X, 32 GB RAM, WD Black SN850X NVMe, Windows. Ranges are the two runs.</p>
+<p>The same Python script (1 GiB written in 1 MiB writes and fsynced, read back, then 2,000 files of 4 KiB created, stat'ed and listed) on an NTFS directory and on a Context FS mount at <code>Z:</code>. Release build of <code>dev</code> (f88db54bf), default runtime configuration bound to 127.0.0.1, WinFsp 2.0. Ryzen 7 3800X, 32 GB RAM, WD Black SN850X NVMe. Bars are the mean of two runs.</p>
+<div class="chart-grid">
+  <figure><figcaption>Sequential write + fsync, MB/s (higher is better)</figcaption>
+<ul class="bars" aria-label="Sequential write + fsync, MB/s (higher is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">3,093</span></li>
+  <li><span>NTFS</span><span class="bar"><i style="width:38%"></i></span><span class="val">1,170</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Sequential read, MB/s (higher is better)</figcaption>
+<ul class="bars" aria-label="Sequential read, MB/s (higher is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:53%"></i></span><span class="val">1,160</span></li>
+  <li><span>NTFS</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,200</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>4 KiB file creates per second (higher is better)</figcaption>
+<ul class="bars" aria-label="4 KiB file creates per second (higher is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:53%"></i></span><span class="val">1,344</span></li>
+  <li><span>NTFS</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,529</span></li>
+</ul>
+  </figure>
+  <figure><figcaption><code>stat</code> latency, µs (lower is better)</figcaption>
+<ul class="bars" aria-label="<code>stat</code> latency, µs (lower is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">259</span></li>
+  <li><span>NTFS</span><span class="bar"><i style="width:5%"></i></span><span class="val">12</span></li>
+</ul>
+  </figure>
+</div>
 <table>
-  <thead><tr><th>Metric</th><th>NTFS (NVMe)</th><th>Context FS (WinFsp)</th></tr></thead>
+  <thead><tr><th>Metric (two runs)</th><th>NTFS (NVMe)</th><th>Context FS (WinFsp)</th></tr></thead>
   <tbody>
     <tr><td>Sequential write, 1 MiB, then fsync</td><td>1,081-1,258 MB/s</td><td><strong>2,347-3,838 MB/s</strong></td></tr>
     <tr><td>Sequential read, 1 MiB</td><td><strong>2,122-2,278 MB/s</strong></td><td>965-1,354 MB/s</td></tr>
@@ -94,7 +108,7 @@ facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no me
     <tr><td>List 2,000 entries</td><td><strong>1.2-1.3 ms</strong></td><td>7.1-9.3 ms</td></tr>
   </tbody>
 </table>
-<p>Read this carefully. In this run the runtime registered a single storage target, the DRAM tier, so Context FS writes landed in memory: they are faster than NTFS but are not on disk when fsync returns, which NTFS guarantees. With a persistent disk tier active, writes also pay for the replica. Reads, file creation and metadata cross the WinFsp kernel boundary on every call and are 1.6x-20x slower than NTFS, consistent with the Linux numbers above. Defender real-time scanning was left on for both targets. Single machine, two runs each.</p>
+<p>Read the write result carefully: in this run the runtime registered a single storage target, the DRAM tier, so Context FS writes landed in memory and were not on disk when fsync returned, which NTFS guarantees. With a persistent disk tier active, writes also pay for the replica. Reads, file creation and metadata cross the WinFsp kernel boundary on every call, which is where NTFS leads. Defender real-time scanning was on for both. Single machine, two runs each.</p>
 
 <h2>Where to go next</h2>
 <ul>

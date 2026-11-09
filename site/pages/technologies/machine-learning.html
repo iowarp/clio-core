@@ -40,6 +40,15 @@ facts: Algorithms | 30+ modules; 13 benchmarked below ; Backends | CPU, CUDA, SY
 </ul>
 <p class="bars-caption">k-means, 160M rows on 16 nodes. clio-ml's time per iteration stays flat as nodes are added; Spark's grows 3.6x from 1 to 16 nodes, and tuning its executor layout does not change that.</p>
 
+<p>Speedup per iteration over Spark MLlib, higher is better:</p>
+<ul class="bars" aria-label="Speedup per iteration over Spark MLlib">
+  <li class="ours"><span>linreg, 16 nodes</span><span class="bar"><i style="width:100%"></i></span><span class="val">59.1x</span></li>
+  <li class="ours"><span>linreg, 8 nodes</span><span class="bar"><i style="width:66%"></i></span><span class="val">39.1x</span></li>
+  <li class="ours"><span>logreg, 16 nodes</span><span class="bar"><i style="width:52%"></i></span><span class="val">30.5x</span></li>
+  <li class="ours"><span>k-means, 16 nodes</span><span class="bar"><i style="width:47%"></i></span><span class="val">27.6x</span></li>
+  <li class="ours"><span>logreg, 1 node</span><span class="bar"><i style="width:15%"></i></span><span class="val">8.7x</span></li>
+  <li class="ours"><span>k-means, 1 node</span><span class="bar"><i style="width:14%"></i></span><span class="val">8.3x</span></li>
+</ul>
 <h3>Read these before quoting a speedup</h3>
 <ul>
   <li><strong>An iteration is not the same progress everywhere.</strong> clio-ml's linear and logistic regression use batch gradient descent; MLlib uses L-BFGS. To the same linear model on one node, clio-ml takes 30 iterations in 0.94 s and Spark 6.8 s: 7.3x, not 21.8x.</li>
@@ -65,6 +74,7 @@ facts: Algorithms | 30+ modules; 13 benchmarked below ; Backends | CPU, CUDA, SY
     <tr><td>Random forest</td><td>16.8</td><td>4.01</td><td>0.2x (Spark faster)</td></tr>
   </tbody>
 </table>
+<figure class="figure"><img src="/assets/figures/clio-ml-algos-10m.png" alt="Bar chart of whole-fit time per algorithm for clio-ml, Spark MLlib and Dask-ML on 10M rows" loading="lazy"><figcaption>Fit time per algorithm, 10M rows, one Aurora node.</figcaption></figure>
 <p>Random forest is slower because clio-ml currently fits its trees one after another; Spark grows all trees together level by level.</p>
 
 <h2>Out of core: 61 GB on one node</h2>
@@ -78,7 +88,13 @@ facts: Algorithms | 30+ modules; 13 benchmarked below ; Backends | CPU, CUDA, SY
     <tr><td>Spark MLlib</td><td>332.6 GB</td><td>17.13</td></tr>
   </tbody>
 </table>
-<p>clio-ml used 69-112 GB in total across cache sizes; Dask about 200 GB and Spark 333-455 GB for the same data. Page size matters: 64 KB pages made k-means 5.2x slower than 4 MB pages. Dask's linear regression was ahead of clio-ml out of core (2.67 vs 4.34 s per iteration). These are single runs.</p>
+<figure class="figure"><img src="/assets/figures/clio-ml-memory-vs-perf.png" alt="Total memory against seconds per iteration for clio-ml, Spark and Dask on 500M rows" loading="lazy"><figcaption>Memory used against time per iteration, 500M rows (61 GB) on one node. Lower left is better.</figcaption></figure>
+<ul class="bars" aria-label="Total memory for 61 GB of data, k-means">
+  <li class="ours"><span>clio-ml</span><span class="bar"><i style="width:21%"></i></span><span class="val">68.9 GB</span></li>
+  <li><span>Dask-ML</span><span class="bar"><i style="width:60%"></i></span><span class="val">198.6 GB</span></li>
+  <li><span>Spark MLlib</span><span class="bar"><i style="width:100%"></i></span><span class="val">332.6 GB</span></li>
+</ul>
+<p>clio-ml used 69-112 GB in total across cache sizes; Dask about 200 GB and Spark 333-455 GB for the same data. Dask's linear regression was ahead of clio-ml out of core (2.67 vs 4.34 s per iteration). These are single runs.</p>
 
 
 <h2>Where to go next</h2>

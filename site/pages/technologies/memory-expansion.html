@@ -10,7 +10,7 @@ facts: GPU backends | CUDA, SYCL (Intel); HIP build path ; CPU | cpu_vector ; Sp
   <li><strong>0.93x</strong><span>MPI's step time, LBANN-style training on 4 Aurora nodes</span></li>
   <li><strong>10x</strong><span>less slowest-rank communication time than MPI there</span></li>
   <li><strong>1.01-1.19x</strong><span>MPI's time at 64 nodes on four workloads</span></li>
-  <li><strong>2.4x</strong><span>faster reads at 4x oversubscription with LZ4 pages</span></li>
+  <li><strong>bit-equal</strong><span>results to the MPI, oneCCL and SHMEM versions</span></li>
 </ul>
 
 <h2>What it is</h2>
@@ -40,31 +40,33 @@ facts: GPU backends | CUDA, SYCL (Intel); HIP build path ; CPU | cpu_vector ; Sp
   <li><span>MPI</span><span class="bar"><i style="width:98%"></i></span><span class="val">2,062</span></li>
   <li><span>Intel SHMEM</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,102</span></li>
 </ul>
-<p class="bars-caption">LBANN-pattern training step, 4 Aurora nodes. Single-node numbers and the remaining gaps (a molecular-dynamics code is still 2.6x MPI on one node) are in the evaluation notes.</p>
-
-<h2>When the data does not fit</h2>
-<p>A streaming benchmark with a 512 MB top tier and a spill tier capped at 2,000 MB/s reads the same data at increasing oversubscription (total data divided by top-tier size), with raw and LZ4-compressed pages (30% zeros). Read throughput in GB/s:</p>
-<table>
-  <thead><tr><th>Oversubscription</th><th>Raw pages</th><th>LZ4 pages</th></tr></thead>
-  <tbody>
-    <tr><td>0.5x (fits)</td><td><strong>27.55</strong></td><td>3.04</td></tr>
-    <tr><td>2x</td><td>3.69</td><td><strong>4.73</strong></td></tr>
-    <tr><td>4x</td><td>2.55</td><td><strong>6.10</strong></td></tr>
-  </tbody>
-</table>
-<p>Compression costs 8x when the data fits and wins 2.4x at 4x oversubscription, because compressed pages keep more of the working set in the fast tier. The paging mechanism itself costs 1.31x on a 256 KB stream that fits, and disappears into PCIe time at 4x oversubscription.</p>
-
-<h2>CPU memory expansion on a workstation</h2>
-<p><code>cpu_vector</code> gives host code the same paging. <code>clio_kmeans_cpu_bench</code> clusters 4 GB of points (67M points, 16 dimensions, 8 clusters, 64 KB pages, 8 threads) while its page cache shrinks from the size of the data to an eighth of it. Release build of <code>dev</code> (f88db54bf) on Windows, Ryzen 7 3800X, 32 GB RAM; the backing store is a DRAM tier.</p>
-<table>
-  <thead><tr><th>Page cache</th><th>Data / cache</th><th>ms per iteration</th><th>Page faults</th></tr></thead>
-  <tbody>
-    <tr><td>4,096 MB</td><td>1x</td><td>1,202</td><td>303,365</td></tr>
-    <tr><td>1,024 MB</td><td>4x</td><td>1,229</td><td>327,680</td></tr>
-    <tr><td>512 MB</td><td>8x</td><td>1,249</td><td>327,680</td></tr>
-  </tbody>
-</table>
-<p>An 8x smaller cache cost 4% per iteration, and all three runs produced the same cluster counts and checksum. Even the full-size cache faulted most pages, because a sequential scan through an LRU-like cache evicts pages before reuse, so all three runs stream from the DRAM tier. This shows how little cache size matters for a streaming pass, not the cost against a plain in-memory array. One run each.</p>
+<p class="bars-caption">LBANN-pattern training step, 4 Aurora nodes, lower is better.</p>
+<div class="chart-grid">
+  <figure><figcaption>Slowest-rank communication, training, ms (lower is better)</figcaption>
+<ul class="bars" aria-label="Slowest-rank communication, training, ms (lower is better)">
+  <li class="ours"><span>gpu_vector</span><span class="bar"><i style="width:10%"></i></span><span class="val">33.8</span></li>
+  <li><span>oneCCL</span><span class="bar"><i style="width:55%"></i></span><span class="val">195.0</span></li>
+  <li><span>MPI</span><span class="bar"><i style="width:96%"></i></span><span class="val">336.8</span></li>
+  <li><span>Intel SHMEM</span><span class="bar"><i style="width:100%"></i></span><span class="val">352.2</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Slowest-rank communication, particle-mesh, ms (lower is better)</figcaption>
+<ul class="bars" aria-label="Slowest-rank communication, particle-mesh, ms (lower is better)">
+  <li class="ours"><span>gpu_vector</span><span class="bar"><i style="width:4%"></i></span><span class="val">3.4</span></li>
+  <li><span>Intel SHMEM</span><span class="bar"><i style="width:50%"></i></span><span class="val">43.6</span></li>
+  <li><span>MPI</span><span class="bar"><i style="width:55%"></i></span><span class="val">47.6</span></li>
+  <li><span>oneCCL</span><span class="bar"><i style="width:100%"></i></span><span class="val">86.8</span></li>
+</ul>
+  </figure>
+</div>
+<h3>Weak scaling to 64 nodes</h3>
+<p>Time relative to MPI at 64 Aurora nodes (1.00 = MPI; lower is better). Not every code is there yet: on one node, a molecular-dynamics code is still 2.6x MPI.</p>
+<ul class="bars" aria-label="Time relative to MPI at 64 nodes">
+  <li class="ours"><span>Particle-mesh</span><span class="bar"><i style="width:85%"></i></span><span class="val">1.01x</span></li>
+  <li class="ours"><span>Training</span><span class="bar"><i style="width:90%"></i></span><span class="val">1.07x</span></li>
+  <li class="ours"><span>Stencil</span><span class="bar"><i style="width:94%"></i></span><span class="val">1.12x</span></li>
+  <li class="ours"><span>k-means</span><span class="bar"><i style="width:100%"></i></span><span class="val">1.19x</span></li>
+</ul>
 
 <h2>Where to go next</h2>
 <ul>
