@@ -96,7 +96,7 @@ jobs:
               ldd ./build/bin/clio_run_s3_rest_test | grep -i poco
 
               echo "::group::S3 transport against VersityGW"
-              # S3_REAL_SERVER skips the tests that read the stub's own counters.
+              # S3_REAL_SERVER skips the tests that read counters only the stub keeps.
               S3_REAL_SERVER=1 \
               S3_ENDPOINT=http://127.0.0.1:7070 \
               S3_STUB_BUCKET=clio-ci \
