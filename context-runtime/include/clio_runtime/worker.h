@@ -123,8 +123,17 @@ struct WorkerStats {
 //   Worker* worker = CLIO_CUR_WORKER;
 //   clio::run::shared_ptr<Task> current_task = worker->GetCurrentTask();
 //   RunContext* run_ctx = worker->GetCurrentRunContext();
-#define CLIO_CUR_WORKER \
-  (CTP_THREAD_MODEL->GetTls<clio::run::Worker>(clio::run::chi_cur_worker_key_))
+// The key exists only once a runtime or client initialized (WorkOrchestrator
+// or IpcManager). Before that -- a standalone unit test driving a transport
+// or allocator directly -- reading it is pthread_getspecific on a key nobody
+// allocated: NULL on glibc, but on macOS the low key numbers belong to
+// libsystem and hold real pointers, which CoMutex then dereferenced as a
+// Worker (cr_bdev_alloc_policy_tests SIGSEGV on macos-15). No key, no worker.
+#define CLIO_CUR_WORKER                                                   \
+  (clio::run::chi_cur_worker_key_created_                                 \
+       ? CTP_THREAD_MODEL->GetTls<clio::run::Worker>(                     \
+             clio::run::chi_cur_worker_key_)                              \
+       : static_cast<clio::run::Worker *>(nullptr))
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
 
