@@ -8,7 +8,7 @@ path such as ``/clio-core/`` and straight from disk).
 Each page source starts with a metadata comment::
 
     <!--
-    title: Composing the context filesystem
+    title: Composing local storage tiers
     description: One sentence for search engines and social cards.
     eyebrow: Tutorial
     lede: The answer, shown under the title.
@@ -45,6 +45,15 @@ REPO_URL = "https://github.com/iowarp/clio-core"
 
 # Section navigation: (group title, [(page path, label), ...]).
 NAV = {
+    "technologies": [
+        ("Technologies", [
+            ("technologies/index.html", "The composable I/O stack"),
+            ("technologies/context-fs.html", "Context FS"),
+            ("technologies/kv-store.html", "Key-value store"),
+            ("technologies/memory-expansion.html", "Memory expansion"),
+            ("technologies/machine-learning.html", "Machine learning"),
+        ]),
+    ],
     "docs": [
         ("Start here", [
             ("docs/index.html", "Introduction"),
@@ -99,6 +108,7 @@ NAV = {
 
 PRIMARY = [
     ("index.html", "Overview", "overview"),
+    ("technologies/index.html", "Technologies", "technologies"),
     ("docs/index.html", "Docs", "docs"),
     ("tutorials/index.html", "Tutorials", "tutorials"),
     ("develop/index.html", "Develop", "develop"),
@@ -282,11 +292,34 @@ def add_heading_ids(body: str) -> tuple[str, list[tuple[int, str, str]]]:
     return body, toc
 
 
-def header_html(section: str) -> str:
-    """Render the sticky site header with primary navigation."""
-    links = "".join(
-        f'<a href="/{href}"{" aria-current=\"page\"" if key == section else ""}>{label}</a>'
-        for href, label, key in PRIMARY)
+# Primary entries that open a dropdown of their section's pages.
+DROPDOWNS = {"technologies"}
+
+
+def header_html(section: str, page: str = "") -> str:
+    """Render the sticky site header with primary navigation.
+
+    Args:
+        section: Section key of the current page, highlighted in the nav.
+        page: Output path of the current page, highlighted in dropdowns.
+    """
+    parts = []
+    for href, label, key in PRIMARY:
+        current = " aria-current=\"page\"" if key == section else ""
+        if key not in DROPDOWNS:
+            parts.append(f'<a href="/{href}"{current}>{label}</a>')
+            continue
+        items = [item for _, group in NAV[key] for item in group]
+        lis = "".join(
+            f'<li><a href="/{h}"{" aria-current=\"page\"" if h == page else ""}>{l}</a></li>'
+            for h, l in items)
+        parts.append(
+            f'<div class="nav-drop"><a href="/{href}"{current}>{label}</a>'
+            f'<button class="nav-drop-toggle" type="button" aria-expanded="false" '
+            f'aria-controls="drop-{key}" aria-label="{label} menu">'
+            f'<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3"/></svg></button>'
+            f'<ul class="nav-drop-menu" id="drop-{key}">{lis}</ul></div>')
+    links = "".join(parts)
     return f"""<header class="site-header">
   <div class="header-inner">
     <a class="brand" href="/index.html" aria-label="CLIO Core home">
@@ -310,8 +343,14 @@ def footer_html() -> str:
   <div class="footer-inner">
     <div class="footer-brand">
       <a class="brand" href="/index.html"><img class="mark-dark" src="/assets/brand/clio-core-mark.svg" width="30" height="30" alt=""><img class="mark-light" src="/assets/brand/clio-core-mark-light.svg" width="30" height="30" alt=""><span class="brand-name">CLIO <em>Core</em></span></a>
-      <p>Tiered storage for scientific data, mounted as an ordinary filesystem and searchable from Python. Part of the Clio ecosystem.</p>
+      <p>A composable I/O stack for data-intensive pipelines: storage, memory and compute modules you assemble from YAML. Part of the Clio ecosystem.</p>
     </div>
+    <div><h2>Technologies</h2><ul>
+      <li><a href="/technologies/context-fs.html">Context FS</a></li>
+      <li><a href="/technologies/kv-store.html">Key-value store</a></li>
+      <li><a href="/technologies/memory-expansion.html">Memory expansion</a></li>
+      <li><a href="/technologies/machine-learning.html">Machine learning</a></li>
+    </ul></div>
     <div><h2>Docs</h2><ul>
       <li><a href="/docs/installation.html">Installation</a></li>
       <li><a href="/docs/basic-usage.html">Basic usage</a></li>
@@ -456,7 +495,7 @@ def render_page(src: Path, out_root: Path) -> str:
         main = body
     doc = (head_html(meta, page) +
            f'\n<body class="{section}">\n<a class="skip" href="#content">Skip to content</a>\n' +
-           header_html(section) + f'\n<main id="content">\n{main}\n</main>\n' + footer_html() +
+           header_html(section, page) + f'\n<main id="content">\n{main}\n</main>\n' + footer_html() +
            '\n<script src="/assets/js/site.js" defer></script>\n</body>\n</html>\n')
     out = out_root / page
     out.parent.mkdir(parents=True, exist_ok=True)

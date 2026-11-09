@@ -1,6 +1,9 @@
 # CLIO Core website
 
-The public website for CLIO Core: **Overview**, **Docs** (installation, basic
+The public website for CLIO Core, a composable I/O stack for data-intensive
+pipelines: **Overview**, **Technologies** (the composable stack and its
+products: Context FS, key-value store, memory expansion, machine learning,
+each with measured results against alternative systems), **Docs** (installation, basic
 usage, concepts, CLI, Python API), **Tutorials** (composing the context
 filesystem from RAM/NVMe/SSD/disk and S3/GCS, FUSE on Linux/macOS/Windows, the
 dashboard, Python semantic query, AI agents over MCP) and **Design** (how the
@@ -34,6 +37,7 @@ site/
   build.py              Wraps pages in the shared layout, writes _site/, checks links
   pages/                Page sources (one HTML fragment per page)
     index.html          Overview (landing layout)
+    technologies/       The stack, Context FS, key-value store, memory expansion, machine learning
     docs/               Introduction, installation, basic usage, concepts, CLI, Python API
     tutorials/          Compose, cloud storage, FUSE x3, dashboard, Python query, AI agents
     design/             Runtime, CTE, placement, durability, chain, filesystem, adapters
@@ -64,7 +68,10 @@ $ sudo apt install fuse3
 ```
 
 - Add the page to `NAV` in `build.py` so it appears in the sidebar and in the
-  previous/next links.
+  previous/next links. Sections listed in `DROPDOWNS` (Technologies) also get
+  a header dropdown built from their `NAV` entries.
+- Every performance figure on a Technologies page must come from a benchmark
+  document in the repository; state its hardware and caveats next to it.
 - Write internal links root-relative (`href="/docs/cli.html"`). The build
   rewrites them relative to each page.
 - `<pre data-label="...">` blocks hold raw text. The build escapes them, adds

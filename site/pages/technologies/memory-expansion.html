@@ -1,0 +1,63 @@
+<!--
+title: Memory expansion
+heading: Memory expansion: <em>bigger than the device.</em>
+description: CLIO Core's paged vectors let GPU and CPU code work on data larger than device memory, paging to host RAM, NVMe and remote nodes, at close to the speed of hand-written message passing.
+eyebrow: Technologies · Memory
+lede: gpu_vector and cpu_vector are arrays whose pages live in CLIO Core's tiers. Kernels hold the pages they need, the runtime fetches, flushes and evicts the rest, and the same vector can span the GPUs of many nodes.
+facts: GPU backends | CUDA, SYCL (Intel); HIP build path ; CPU | cpu_vector ; Spill tiers | HBM, host RAM, NVMe, any CTE tier ; Scale | Tested to 64 Aurora nodes
+-->
+<ul class="headline-stats">
+  <li><strong>0.93x</strong><span>MPI's step time, LBANN-style training on 4 Aurora nodes</span></li>
+  <li><strong>10x</strong><span>less slowest-rank communication time than MPI there</span></li>
+  <li><strong>1.01-1.19x</strong><span>MPI's time at 64 nodes on four workloads</span></li>
+  <li><strong>2.4x</strong><span>faster reads at 4x oversubscription with LZ4 pages</span></li>
+</ul>
+
+<h2>What it is</h2>
+<p>A paged vector looks like a normal array to the code that uses it. Its contents are split into pages (from 64 KB to several MB, chosen per vector) that are stored as CTE blobs. A GPU block asks for the pages it is about to touch (<code>CoFetch</code>, <code>CoHoldPage</code>), works on them in device memory, and flushes the pages it changed (<code>CoBeginFlush</code>, <code>CoEndFlush</code>). Pages that do not fit in the device cache spill to the next tier: host RAM, NVMe, or another node's memory. The cache size is a parameter, so the same code runs with the whole dataset resident or with a fraction of it.</p>
+<ul class="checks">
+  <li><strong>Larger than memory.</strong> A dataset is bounded by the tier stack, not by GPU memory or host RAM.</li>
+  <li><strong>One namespace across nodes.</strong> A rank reads another node's pages by name, so many codes that used halo exchanges or collectives become plain reads and writes.</li>
+  <li><strong>Compression on the fault path.</strong> Pages can be LZ4-compressed as they leave the fast tier, which trades CPU for capacity when the data no longer fits.</li>
+  <li><strong>Portable.</strong> The same kernels compile for CUDA and SYCL, and were measured on NVIDIA laptop and A100 GPUs and on Intel GPUs; <code>cpu_vector</code> gives host code the same paging.</li>
+</ul>
+
+<h2>Against MPI, oneCCL and Intel SHMEM</h2>
+<p>The hardest comparison for a paging system is hand-written message passing, where the programmer moves exactly the bytes that are needed. Four very different workloads were rewritten on <code>gpu_vector</code> and run on Aurora (Intel Data Center GPU Max, one tile per rank) against MPI, oneCCL and Intel SHMEM versions of the same code. Ratios below 1 mean the paged version is faster.</p>
+<table>
+  <thead><tr><th>Workload, 4 nodes</th><th>gpu_vector</th><th>MPI</th><th>oneCCL</th><th>Intel SHMEM</th></tr></thead>
+  <tbody>
+    <tr><td>Neural-network training (LBANN pattern), ms/step</td><td><strong>1,919-1,923</strong></td><td>2,062</td><td>2,039</td><td>2,102</td></tr>
+    <tr><td>Slowest-rank communication, ms</td><td><strong>33.8</strong></td><td>336.8</td><td>195.0</td><td>352.2</td></tr>
+    <tr><td>Particle-mesh (GROMACS pattern), ms/pass</td><td><strong>~300</strong></td><td>307.6</td><td>309.1</td><td>309.3</td></tr>
+    <tr><td>Slowest-rank communication, ms</td><td><strong>3.4</strong></td><td>47.6</td><td>86.8</td><td>43.6</td></tr>
+  </tbody>
+</table>
+<p>Results are bit-equal to the baselines (network weights and mesh checksums). In weak scaling from 4 to 64 nodes, the paged versions finished at 64 nodes within 1.01x (particle-mesh), 1.07x (training), 1.12x (Gray-Scott stencil) and 1.19x (k-means) of MPI.</p>
+<ul class="bars" aria-label="Training step time on 4 nodes, ms, lower is better">
+  <li class="ours"><span>gpu_vector</span><span class="bar"><i style="width:91%"></i></span><span class="val">1,921</span></li>
+  <li><span>oneCCL</span><span class="bar"><i style="width:97%"></i></span><span class="val">2,039</span></li>
+  <li><span>MPI</span><span class="bar"><i style="width:98%"></i></span><span class="val">2,062</span></li>
+  <li><span>Intel SHMEM</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,102</span></li>
+</ul>
+<p class="bars-caption">LBANN-pattern training step, 4 Aurora nodes. Single-node numbers and the remaining gaps (a molecular-dynamics code is still 2.6x MPI on one node) are in the evaluation notes.</p>
+
+<h2>When the data does not fit</h2>
+<p>A streaming benchmark with a 512 MB top tier and a spill tier capped at 2,000 MB/s reads the same data at increasing oversubscription (total data divided by top-tier size), with raw and LZ4-compressed pages (30% zeros). Read throughput in GB/s:</p>
+<table>
+  <thead><tr><th>Oversubscription</th><th>Raw pages</th><th>LZ4 pages</th></tr></thead>
+  <tbody>
+    <tr><td>0.5x (fits)</td><td><strong>27.55</strong></td><td>3.04</td></tr>
+    <tr><td>2x</td><td>3.69</td><td><strong>4.73</strong></td></tr>
+    <tr><td>4x</td><td>2.55</td><td><strong>6.10</strong></td></tr>
+  </tbody>
+</table>
+<p>Compression costs 8x when the data fits and wins 2.4x at 4x oversubscription, because compressed pages keep more of the working set in the fast tier. The paging mechanism itself costs 1.31x on a 256 KB stream that fits, and disappears into PCIe time at 4x oversubscription.</p>
+
+<!--MEMBENCH-->
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/technologies/machine-learning.html">Machine learning on paged vectors</a></li>
+  <li><a href="/design/placement.html">Placement and tiering</a></li>
+</ul>

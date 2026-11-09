@@ -1,0 +1,28 @@
+<!--
+title: Technologies
+heading: One stack, <em>four products.</em>
+description: CLIO Core is a composable I/O stack. Context FS, a key-value store, memory expansion and machine learning are products built from the same modules.
+eyebrow: Technologies
+lede: CLIO Core is a set of runtime modules (block devices, a tiered blob engine, adapters, data operators) that you compose from YAML into the I/O path your pipeline needs. The products on these pages are four such compositions.
+facts: Runtime | Coroutine tasks over shared memory, TCP or sockets ; Composed from | One YAML file ; Platforms | Linux, macOS, Windows, GPUs
+-->
+<h2>The composable I/O stack</h2>
+<p>A data-intensive pipeline moves the same bytes through several systems: a simulation writes checkpoints, an analysis job reads them back, a model trains on them, an agent searches them. Each hop usually means a different storage system, a copy, and a format. CLIO Core gives every hop the same substrate. You pick the modules a stage needs and the runtime wires them together:</p>
+<ul class="checks">
+  <li><strong>Block devices</strong> for RAM, NVMe, SSD, disk, GPU memory, Amazon S3 and Google Cloud Storage, plus <code>safe_bdev</code>, which erasure-codes across several of them.</li>
+  <li><strong>The Context Transfer Engine (CTE)</strong>, which stores tags and blobs across those devices, scores each tier and moves data between them.</li>
+  <li><strong>Adapters</strong> that put an interface in front of the CTE: a FUSE mount, POSIX and MPI-IO interceptors, HDF5 and ADIOS2 plugins, and paged vectors for CPU and GPU memory.</li>
+  <li><strong>Data operators</strong> that sit in the chain between an adapter and storage and index, compress, transform or route data on the way through.</li>
+</ul>
+<p>Every product below runs on the same runtime, so the data a pipeline stage writes through one product can be read through another without a copy.</p>
+
+<h2>Products</h2>
+<div class="product-grid">
+  <a href="/technologies/context-fs.html"><span class="feature-index">Storage</span><h3>Context FS</h3><p>A distributed filesystem over your tiers. FUSE on Linux, macOS and Windows; erasure-coded arrays that grow one drive at a time; buckets as tiers.</p><span class="stat">Metadata ops in 10-570 µs, no metadata server</span></a>
+  <a href="/technologies/kv-store.html"><span class="feature-index">Storage</span><h3>Key-value store</h3><p>Tags and blobs from C++ or Python over shared memory, with placement scores, regex queries and keyword search.</p><span class="stat">YCSB-B: 42.6k ops/s vs Redis 16.8k</span></a>
+  <a href="/technologies/memory-expansion.html"><span class="feature-index">Memory</span><h3>Memory expansion</h3><p>Paged vectors for GPU and CPU code whose data is larger than device memory, spilling to RAM, NVMe and beyond.</p><span class="stat">0.93x MPI step time on 4 Aurora nodes</span></a>
+  <a href="/technologies/machine-learning.html"><span class="feature-index">Compute</span><h3>Machine learning</h3><p>clio-ml: MLlib-equivalent algorithms that train out of core on one GPU tile per node.</p><span class="stat">8-59x faster per iteration than Spark MLlib</span></a>
+</div>
+
+<h2>How the numbers on these pages were measured</h2>
+<p>Every figure on the technology pages comes from a benchmark in the repository, with its hardware and its caveats. Where a comparison favors another system, the page says so. Most runs are single runs on one machine or a small allocation; treat them as measured examples, not guarantees for your hardware. Each page links the source document so you can rerun it.</p>

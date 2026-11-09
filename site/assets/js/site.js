@@ -35,6 +35,21 @@
     });
   }
 
+  // Header dropdowns (Technologies): click or keyboard toggle; hover is CSS.
+  document.querySelectorAll(".nav-drop").forEach(function (drop) {
+    var btn = drop.querySelector(".nav-drop-toggle");
+    if (!btn) return;
+    var set = function (open) {
+      drop.classList.toggle("open", open);
+      btn.setAttribute("aria-expanded", String(open));
+    };
+    btn.addEventListener("click", function (e) { e.stopPropagation(); set(!drop.classList.contains("open")); });
+    document.addEventListener("click", function (e) { if (!drop.contains(e.target)) set(false); });
+    drop.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && drop.classList.contains("open")) { set(false); btn.focus(); }
+    });
+  });
+
   // Collapse the section menu on phones so the article leads.
   var sideDetails = document.querySelector(".side-nav details");
   if (sideDetails && window.matchMedia("(max-width: 900px)").matches) sideDetails.open = false;

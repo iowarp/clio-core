@@ -1,0 +1,76 @@
+<!--
+title: Key-value store
+heading: A key-value store <em>over every tier.</em>
+description: CLIO Core's tag and blob store is a key-value store for C++ and Python, with tier placement scores, regex queries, keyword search and a shared-memory read path.
+eyebrow: Technologies · Storage
+lede: Underneath every CLIO Core product is a key-value store: tags (namespaces) hold blobs (values), and each blob is placed on a tier by its score. Use it directly when your pipeline thinks in objects, not files.
+facts: Keys | Tag + blob name ; Values | Arbitrary bytes, partial put/get by offset ; Clients | C++, Python ; Transport | Shared memory, TCP, Unix sockets
+-->
+<ul class="headline-stats">
+  <li><strong>42.6k</strong><span>YCSB-B ops/s, against Redis 16.8k</span></li>
+  <li><strong>~2x</strong><span>Redis on read-heavy YCSB workloads</span></li>
+  <li><strong>15-16 GB/s</strong><span>async GPU checkpoint into a RAM tier</span></li>
+  <li><strong>2.0x</strong><span>the HDF5 async VOL on that checkpoint</span></li>
+</ul>
+
+<h2>The data model</h2>
+<p>A <strong>tag</strong> is a named collection, a <strong>blob</strong> is a named value inside it. Puts and gets take an offset, so large values can be written and read in pieces. Each put carries a <strong>score</strong> from 0 to 1 that the placement policy uses to choose a tier, and the organizer can move a blob later with <code>ReorganizeBlob</code>. Queries match tag and blob names with regular expressions, and the default setup indexes what you write for keyword (BM25) search.</p>
+<pre data-label="python">
+import clio_cte_core_ext as cte
+
+cte.clio_init(cte.RuntimeMode.kClient, False)
+cte.initialize_cte("", cte.PoolQuery.Dynamic())
+
+tag = cte.Tag("experiments/run-42")          # get or create the namespace
+tag.PutBlob("params", b'{"dt": 0.01}')       # put bytes (zero-copy in runtime mode)
+size = tag.GetBlobSize("params")
+print(tag.GetBlob("params", size, 0))        # get bytes back
+print(tag.GetContainedBlobs())               # list keys in the tag
+</pre>
+<p>The same operations exist in C++ (<code>clio::cte::core::Tag::PutBlob</code>, <code>GetBlob</code>), with asynchronous variants such as <code>AsyncPutBlob</code>, and on the client for whole-store queries (<code>TagQuery</code>, <code>BlobQuery</code>, <code>SemanticSearch</code>). The <a href="/docs/python-api.html">Python API reference</a> lists them all.</p>
+
+<h2>Performance against Redis, RocksDB and DynamoDB</h2>
+<p>The repository's YCSB binding (<code>context-transfer-engine/benchmark/ycsb</code>) runs the standard workloads against CLIO Core and three other stores. Throughput in operations per second, higher is better:</p>
+<table>
+  <thead><tr><th>YCSB workload</th><th>CLIO Core (SHM)</th><th>Redis</th><th>RocksDB (embedded)</th><th>DynamoDB Local</th></tr></thead>
+  <tbody>
+    <tr><td>A: 50% read, 50% update</td><td>6,952</td><td>21,650</td><td>49,140</td><td>1,664</td></tr>
+    <tr><td>B: 95% read, 5% update</td><td><strong>42,553</strong></td><td>16,787</td><td>64,809</td><td>1,867</td></tr>
+    <tr><td>C: read only</td><td><strong>34,566-55,866</strong></td><td>21,044</td><td>62,383</td><td>1,915</td></tr>
+    <tr><td>F: read-modify-write</td><td>7,637</td><td>14,762</td><td>27,824</td><td>1,335</td></tr>
+  </tbody>
+</table>
+<ul class="bars" aria-label="YCSB workload B, operations per second">
+  <li><span>RocksDB (embedded)</span><span class="bar"><i style="width:100%"></i></span><span class="val">64,809</span></li>
+  <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:66%"></i></span><span class="val">42,553</span></li>
+  <li><span>Redis</span><span class="bar"><i style="width:26%"></i></span><span class="val">16,787</span></li>
+  <li><span>DynamoDB Local</span><span class="bar"><i style="width:3%"></i></span><span class="val">1,867</span></li>
+</ul>
+<p class="bars-caption">Workload B, 100k records of about 1.1 KB, 100k operations, 4 threads, one WSL2 machine.</p>
+<p>How to read it:</p>
+<ul>
+  <li>CLIO Core's shared-memory read path is about twice as fast as Redis on the read-heavy workloads, B and C.</li>
+  <li>The update-heavy workloads, A and F, are slower than Redis because the binding implements an update as a full-record read followed by a full-record rewrite, where Redis updates one hash field. A partial put at an offset is the planned fix.</li>
+  <li>Embedded RocksDB has no inter-process hop at all and leads every workload. CLIO Core is a separate runtime process that many clients and nodes share.</li>
+  <li>DynamoDB Local is the local emulator, not the AWS service. All records sit in one tag, so scale-out across tags is not exercised. These are single-node numbers on a development machine.</li>
+</ul>
+
+<h2>GPU checkpoints through the store</h2>
+<p>The <code>kvhdf5</code> adapter writes HDF5-style datasets from GPU kernels as CTE blobs. Its scaling campaign checkpoints a Gray-Scott simulation on an RTX 4090 with local NVMe, comparing asynchronous blob puts against HDF5:</p>
+<table>
+  <thead><tr><th>Tier, I/O-bound (8 steps)</th><th>CLIO async puts</th><th>Against</th></tr></thead>
+  <tbody>
+    <tr><td>RAM</td><td>about 15-16 GB/s</td><td>2.8x the synchronous baselines, 2.0x the HDF5 async VOL, about 2.1x a threaded raw writer (7,214 MB/s)</td></tr>
+    <tr><td>File on NVMe</td><td>about 1.1 GB/s</td><td>Disk-bound: 1.0-1.4x the baselines</td></tr>
+  </tbody>
+</table>
+<p>Absolute numbers are this machine's; the campaign notes that the ratios carry over but the bandwidths must be re-measured on your hardware.</p>
+
+<!--KVBENCH-->
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/concepts.html">Core concepts: tags, blobs, scores</a></li>
+  <li><a href="/design/cte-core.html">CTE data model and data path</a></li>
+  <li><a href="/tutorials/python-semantic-query.html">Query stored data from Python</a></li>
+</ul>

@@ -1,0 +1,91 @@
+<!--
+title: Context FS
+heading: Context FS: <em>a filesystem you compose.</em>
+description: Context FS is CLIO Core's distributed filesystem: FUSE on Linux, macOS and Windows, score-based tiering, expandable erasure-coded arrays and S3 or Google Cloud buckets as tiers.
+eyebrow: Technologies · Storage
+lede: Context FS mounts the tiers you compose (RAM, NVMe, disk, erasure-coded arrays, cloud buckets) as one ordinary directory. Applications use it without changes; the stack underneath decides where each page lives.
+facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no metadata server ; Unit of data | 1 MiB page blobs ; Durability | ext4-style, durable on fsync
+-->
+<ul class="headline-stats">
+  <li><strong>10 µs</strong><span>stat from the shared-memory mirror</span></li>
+  <li><strong>58 s</strong><span>8-node git workload, from over 600 s</span></li>
+  <li><strong>3 s</strong><span>tar extract on 4 nodes, from 45 s</span></li>
+  <li><strong>N + M</strong><span>drives in an erasure-coded array that grows in place</span></li>
+</ul>
+
+<h2>What it is</h2>
+<p>Context FS is a product of CLIO Core, not the whole of it. It is the filesystem adapter (<code>clio_cte_fuse</code>) plus the filesystem module, composed over the Context Transfer Engine. Directories, inodes and file data are all stored as CTE tags and blobs, so the filesystem inherits tiering, replication, durability and indexing from the engine, and has no central metadata server: each inode is homed on a node by its path.</p>
+
+<h2>FUSE on every desktop and cluster</h2>
+<p>One daemon mounts on all three operating systems with each platform's native driver:</p>
+<table>
+  <thead><tr><th>Platform</th><th>Driver</th><th>Install</th></tr></thead>
+  <tbody>
+    <tr><td>Linux</td><td>libfuse3</td><td>Included in the pip wheel</td></tr>
+    <tr><td>Windows</td><td>WinFsp (FUSE 3 compatibility layer), mounted as a drive letter</td><td>Included in the pip wheel</td></tr>
+    <tr><td>macOS</td><td>macFUSE, or FSKit on macOS 15.4 and newer</td><td>Build from source</td></tr>
+  </tbody>
+</table>
+<p>Writes go straight through, so a file's size is exact as soon as <code>write()</code> returns. Attribute and negative-lookup caches last 1 s, and a shared-memory mirror answers <code>stat</code> without a round trip to the runtime. See the <a href="/tutorials/fuse-linux.html">Linux</a>, <a href="/tutorials/fuse-macos.html">macOS</a> and <a href="/tutorials/fuse-windows.html">Windows</a> tutorials.</p>
+
+<h2>Tiering</h2>
+<p>Each tier in the YAML gets a capacity and a score between 0 and 1. New data lands on the fastest tier with room; data you stop touching is demoted to slower, larger tiers, and a replica on a persistent tier keeps files across restarts.</p>
+<ol class="tier-stack" aria-label="Example tier stack">
+  <li><span class="tier-name">ram::hot</span><span class="tier-desc">DRAM, for the working set</span><span class="tier-type">score 1.0</span></li>
+  <li><span class="tier-name">/mnt/nvme</span><span class="tier-desc">Local NVMe, for staged data</span><span class="tier-type">score 0.9</span></li>
+  <li><span class="tier-name">safe_bdev</span><span class="tier-desc">Erasure-coded array of disks</span><span class="tier-type">score 0.4</span></li>
+  <li><span class="tier-name">s3:// · gs://</span><span class="tier-desc">A bucket as the capacity tier</span><span class="tier-type">score 0.1</span></li>
+</ol>
+<p><a href="/tutorials/compose.html">Compose local tiers</a> walks through a full configuration, and <a href="/design/placement.html">Placement and tiering</a> explains the policy.</p>
+
+<h2>Expandable RAID with safe_bdev</h2>
+<p><code>safe_bdev</code> is a block device made of other block devices. It protects data with Reed-Solomon erasure coding: for <em>N</em> drives that must survive <em>f</em> simultaneous failures it uses <em>k = N − f</em> data drives and <em>m = f</em> parity drives, so 8 drives surviving 2 failures is RS(6, 2) with 25% overhead. Unlike a classic RAID array, it grows in place:</p>
+<ul class="checks">
+  <li><strong>Add drives at runtime</strong> as data or parity members (<code>safe_bdev_add_bdev</code>). New blocks are allocated round-robin over the members that have room, so total data capacity is the sum of the members' capacities and an added drive's space is usable immediately, even when the array was already mostly full.</li>
+  <li><strong>Mixed sizes.</strong> Each member fills to its own capacity; stripes narrower than <em>k</em> are protected as mirrors until enough members have written into them.</li>
+  <li><strong>Replace and rebuild.</strong> Remove a failed member and name a replacement; the runtime rebuilds its shards while the filesystem stays mounted, and the dashboard shows recovery progress.</li>
+</ul>
+<p>The array is an ordinary tier, so Context FS on top of it needs no changes. The <code>cr_safe_bdev_integration_docker</code> test composes three data drives and one added parity drive under a mounted Context FS, removes a member, rebuilds it, and checks that the data still reads back.</p>
+
+<h2>Amazon S3 and Google Cloud as tiers</h2>
+<p>The block device module has S3 and Google Cloud Storage transports, so a bucket can be a tier like any disk. Give it the lowest score and only data the organizer demotes reaches it. Separately, the assimilation engine imports existing <code>s3://</code> and <code>gs://</code> objects, including anonymous reads of public buckets. The <a href="/tutorials/cloud-storage.html">cloud storage tutorial</a> covers both.</p>
+
+<h2>Performance</h2>
+<p>Measured metadata latencies for one operation each, through the FUSE mount on Linux (from <a href="/design/filesystem.html">Filesystem and FUSE</a>):</p>
+<table>
+  <thead><tr><th>Operation</th><th>Latency</th></tr></thead>
+  <tbody>
+    <tr><td><code>stat</code>, shared-memory mirror</td><td>about 10 µs</td></tr>
+    <tr><td><code>stat</code>, through the filesystem module</td><td>about 31 µs</td></tr>
+    <tr><td><code>readdir</code>, 10 entries / 100 entries</td><td>255 µs / 592 µs</td></tr>
+    <tr><td><code>rename</code></td><td>about 570 µs</td></tr>
+  </tbody>
+</table>
+<p>About 91% of each operation's wall time is kernel transit; the daemon itself spends about 9.6 µs of CPU time per operation.</p>
+
+<h3>Against ext4: cloning the Linux kernel</h3>
+<ul class="bars" aria-label="git clone of the Linux kernel, seconds, lower is better">
+  <li><span>ext4</span><span class="bar"><i style="width:4%"></i></span><span class="val">39 s</span></li>
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:19%"></i></span><span class="val">171 s</span></li>
+  <li><span>Context FS, earlier</span><span class="bar"><i style="width:100%"></i></span><span class="val">&gt; 900 s</span></li>
+</ul>
+<p class="bars-caption">Linux kernel <code>git clone</code>, one node. A local kernel filesystem has no FUSE crossing; Context FS pays one per metadata operation and is 4.4x slower here, down from over 23x before the FUSE overhaul.</p>
+
+<h3>Scaling fixes on multi-node runs</h3>
+<table>
+  <thead><tr><th>Workload</th><th>Before</th><th>After</th><th>Change</th></tr></thead>
+  <tbody>
+    <tr><td><code>tar</code> extraction, 4 nodes</td><td>45 s</td><td>3 s</td><td>Batched inode purges (one message per container every 20 ms)</td></tr>
+    <tr><td><code>git</code> workload, 8 nodes</td><td>&gt; 600 s</td><td>58 s</td><td>1 s FUSE entry cache kept on multi-node</td></tr>
+    <tr><td>File creation</td><td>63 / s</td><td>893 / s</td><td>Directory block images padded to powers of two</td></tr>
+    <tr><td>Kernel checkout on Windows (WinFsp)</td><td>~22 files/s (70+ min projected)</td><td>462 s</td><td>Inline metadata tasks, batched create, asynchronous publish on close</td></tr>
+  </tbody>
+</table>
+
+<!--WINBENCH-->
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/basic-usage.html">Mount your first filesystem</a></li>
+  <li><a href="/design/filesystem.html">Filesystem and FUSE design</a> and <a href="/design/durability.html">durability and recovery</a></li>
+</ul>
