@@ -3570,9 +3570,12 @@ clio::run::TaskResume Runtime::EncodeStripe(clio::run::u64 s, bool &ok) {
     gen = slot_gen_[s];
   }
   const int k_s = static_cast<int>(stripe.size());
-  if (k_s <= 0) {
+  if (k_s <= 0 || (parity_level_ == 0 && parity_members_.empty())) {
+    // Nothing to protect, or no parity to compute (#1343: a k+0 array read
+    // every data column's whole chunk back on each partial-stripe write only
+    // to encode a parity that has nowhere to go).
     std::lock_guard<std::mutex> g(slot_mu_);
-    dirty_slots_.erase(s);  // nothing left to protect
+    dirty_slots_.erase(s);
     ok = true;
     CLIO_CO_RETURN;
   }
