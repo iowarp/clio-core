@@ -7,14 +7,79 @@ lede: CLIO Core is a set of runtime modules (block devices, a tiered blob engine
 facts: Runtime | Coroutine tasks over shared memory, TCP or sockets ; Composed from | One YAML file ; Platforms | Linux, macOS, Windows, GPUs
 -->
 <h2>The composable I/O stack</h2>
-<p>A data-intensive pipeline moves the same bytes through several systems: a simulation writes checkpoints, an analysis job reads them back, a model trains on them, an agent searches them. Each hop usually means a different storage system, a copy, and a format. CLIO Core gives every hop the same substrate. You pick the modules a stage needs and the runtime wires them together:</p>
+<p>A data-intensive pipeline moves the same bytes through several systems: a simulation writes checkpoints, an analysis job reads them back, a model trains on them, an agent searches them. Each hop usually means a different storage system, a copy and a format. CLIO Core replaces those systems with one runtime and a set of modules you compose, so every hop shares the same substrate.</p>
+
+<h3>Basic principles</h3>
 <ul class="checks">
-  <li><strong>Block devices</strong> for RAM, NVMe, SSD, disk, GPU memory, Amazon S3 and Google Cloud Storage, plus <code>safe_bdev</code>, which erasure-codes across several of them.</li>
-  <li><strong>The Context Transfer Engine (CTE)</strong>, which stores tags and blobs across those devices, scores each tier and moves data between them.</li>
-  <li><strong>Adapters</strong> that put an interface in front of the CTE: a FUSE mount, POSIX and MPI-IO interceptors, HDF5 and ADIOS2 plugins, and paged vectors for CPU and GPU memory.</li>
-  <li><strong>Data operators</strong> that sit in the chain between an adapter and storage and index, compress, transform or route data on the way through.</li>
+  <li><strong>Everything is a module.</strong> Storage devices, the blob engine, caches, filesystems and even machine-learning algorithms are modules (ChiMods), shared libraries the runtime loads at startup.</li>
+  <li><strong>A module runs as a pool.</strong> A pool is a named instance of a module, addressed by a numeric <code>pool_id</code>, with one container on each node it spans. Two pools of the same module can run side by side with different settings.</li>
+  <li><strong>Work is a task.</strong> Clients submit tasks to a pool over shared memory, TCP or sockets; worker threads run them as coroutines, so a task that waits on I/O or another pool never blocks a thread.</li>
+  <li><strong>The stack is a YAML file.</strong> The <code>compose</code> list names the pools to create, in order, with each module's own settings. Changing the stack means editing that list, not the code.</li>
 </ul>
-<p>Every product below runs on the same runtime, so the data a pipeline stage writes through one product can be read through another without a copy.</p>
+
+<h3>Pool queries: choosing where work runs</h3>
+<p>Every task carries a <em>pool query</em> that tells the runtime which containers of the pool should run it. The same module code can then serve one node or a whole cluster.</p>
+<ul class="checks">
+  <li><code>Local</code>: the container on this node. Used for node-local work and by default in the <code>compose</code> list (<code>pool_query: local</code>).</li>
+  <li><code>DirectId</code>, <code>DirectHash</code>, <code>Physical</code>: one container, chosen by id, by hashing a key, or by node.</li>
+  <li><code>Range</code>, <code>Broadcast</code>: many containers, or all of them.</li>
+  <li><code>Dynamic</code>: the module decides per task. The CTE routes each blob to the node that owns it; the cache routes to the caller's own node.</li>
+  <li><code>ManyToOne</code>, <code>AllToOne</code>: collectives. Tasks from many containers are batched at one leader, run once, and the result is sent back to all of them; <code>AllToOne</code> waits for every container, like a reduction.</li>
+</ul>
+
+<h3>Data operators</h3>
+<p>Data-path modules form an <strong>interposition chain</strong>. Each operator speaks the storage engine's interface, receives its calls, handles the ones it cares about and forwards the rest to its <code>next_pool_id</code>. Because the interface is the same above and below, an operator can be inserted or removed without touching the modules around it, and everything above it (the FUSE mount, the Python API, other operators) works unchanged.</p>
+<p class="mono-line">filesystem 560.0 → your operator 600.0 → cache 563.0 → indexer 564.0 → replication 561.0 → core 512.0</p>
+<p>An operator is a C++ class whose handlers are coroutines. This one counts the bytes written to each tag: it forwards the write down the chain, waits for it, and counts it only if it succeeded.</p>
+<pre data-label="c++">
+class Runtime : public clio::cte::core::CoreInterposer {
+ public:
+  clio::run::TaskResume PutBlob(
+      clio::run::shared_ptr&lt;clio::cte::core::PutBlobTask&gt; &amp;task) {
+    CLIO_TASK_BODY_BEGIN
+    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
+                                task.template Cast&lt;clio::run::Task&gt;()));
+    if (task-&gt;GetReturnCode() == 0) CountBytes(*task);  // after it succeeded
+    CLIO_CO_RETURN;
+    CLIO_TASK_BODY_END
+  }
+  // ...
+};
+CLIO_TASK_CC(Runtime)   // export the module from the shared library
+</pre>
+<p>Build it outside the CLIO Core tree, point <code>CLIO_REPO_PATH</code> at the library, and add it to the chain:</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_demo_bytecount
+    pool_name: bytecount
+    pool_query: local
+    pool_id: "600.0"
+    next_pool_id: "563.0"     # forward to the cache
+</pre>
+<p><a href="/develop/operator.html">Write a chain operator</a> walks through the full module, build and run.</p>
+
+<h3>The modules that ship</h3>
+<div class="product-grid">
+  <a href="/modules/bdev.html"><span class="feature-index">Storage</span><h3>Block devices</h3><p>RAM, files, asynchronous I/O, GPU memory, Amazon S3 and Google Cloud Storage as tiers.</p></a>
+  <a href="/modules/safe-bdev.html"><span class="feature-index">Storage</span><h3>safe_bdev</h3><p>Erasure coding across other block devices; grows in place and rebuilds failed members.</p></a>
+  <a href="/modules/cte-core.html"><span class="feature-index">Storage</span><h3>CTE core</h3><p>Tags, blobs, scores and placement across every tier.</p></a>
+  <a href="/modules/cache.html"><span class="feature-index">Operator</span><h3>Cache</h3><p>Hot copies on fast tiers, kept consistent with the store below.</p></a>
+  <a href="/modules/replication.html"><span class="feature-index">Operator</span><h3>Replication</h3><p>Durable copies on persistent tiers, and recovery from them.</p></a>
+  <a href="/modules/compressor.html"><span class="feature-index">Operator</span><h3>Compressor</h3><p>Compression on the way down, with the codec chosen per workload.</p></a>
+  <a href="/modules/indexer.html"><span class="feature-index">Context</span><h3>Indexer</h3><p>Keyword (BM25) and name search over everything written.</p></a>
+  <a href="/modules/cae-core.html"><span class="feature-index">Context</span><h3>Assimilation</h3><p>Imports files, HDF5, web, S3, Google Cloud and Globus data.</p></a>
+  <a href="/modules/summarizer.html"><span class="feature-index">Context</span><h3>Summarizer</h3><p>Language-model summaries stored beside the data they describe.</p></a>
+</div>
+<p>The filesystem, stream and checkpoint modules also enter the chain at the cache. <a href="/modules/index.html">The module reference</a> covers each one and its settings.</p>
+
+<h3>What you can build</h3>
+<p>Because a module is just code the runtime hosts, the same mechanism scales from a few lines in the storage path to an entire application.</p>
+<ul class="checks">
+  <li><strong>The storage layer.</strong> A new block-device type or a module attached as a tier puts data somewhere new: another device, an object store, a remote service. A placement policy changes where data lands and when it moves. See <a href="/develop/extend-storage.html">Extend the storage system</a>.</li>
+  <li><strong>Data operators in the I/O path.</strong> Encryption, deduplication, format conversion, auditing or custom caching, applied to every write and read that passes through, with no change to the application.</li>
+  <li><strong>In-transit analytics.</strong> An operator sees data as it is written, so it can index, summarize, reduce or check it before it ever lands, with the collective pool queries to combine results across nodes. The indexer and summarizer are built this way.</li>
+  <li><strong>Full workloads.</strong> Whole computations can run as modules next to the data they use. The clio-ml algorithms (k-means, ALS, gradient-boosted trees, CNNs and more) are modules that train out of core on data the stack already holds.</li>
+</ul>
 
 <h2>Products</h2>
 <div class="product-grid">
