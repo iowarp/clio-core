@@ -77,7 +77,7 @@ fi
 # Where the data actually landed: allocated size of this node's DAOS and
 # Flare tier files every 30 s (the DRAM tier is whatever is not here).
 ( while [ ! -e "$OUT/stop" ]; do
-    echo "$(date +%T) daos_kb=$(du -sk "$DM/tiers/$JOB/$H"* 2>/dev/null | awk '{s+=$1} END{print s+0}') flare_kb=$(du -sk "$FLARE/tiers/$JOB/$H"* 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+    echo "$(date +%T) daos_kb=$(du -sk "$DM/tiers/$JOB/$H"* 2>/dev/null | awk '{s+=$1} END{print s+0}') flare_kb=$(du -sk "$FLARE/tiers/$JOB/$H"* 2>/dev/null | awk '{s+=$1} END{print s+0}') flare_free_kb=$(df -k --output=avail "$FLARE/tiers/$JOB" 2>/dev/null | tail -1 | tr -d ' ')"
     sleep 30
   done > "$LOG.tiers.log" 2>&1 ) &
 while [ ! -e "$OUT/stop" ]; do
