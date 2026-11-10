@@ -230,6 +230,10 @@ n = $MD_N
 
 [mdtest-hard]
 n = $MD_N
+
+# Not part of the score; random 4 KiB reads ran for 20 minutes at 64 nodes.
+[ior-rnd4K-easy-read]
+run = FALSE
 EOF
 echo "=== caps: ior-easy ${EASY_MB}MB/rank, ior-hard $HARD_SEG seg/rank, mdtest $MD_N files/rank"
 mkdir -p results
