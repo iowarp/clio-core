@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <system_error>
@@ -18,6 +19,9 @@
 #include <clio_runtime/worker.h>
 #include <clio_runtime/work_orchestrator.h>
 #include <fcntl.h>
+#ifdef __linux__
+#include <sys/vfs.h>  // statfs (IsNetworkFs)
+#endif
 #ifndef _WIN32
 #include <unistd.h>  // close (ReserveFileSpace)
 #else
@@ -38,6 +42,37 @@ namespace {
 // backend cannot open the file, transparently fall back to POSIX AIO, which
 // works in restricted environments (containers/CI). Returns an opened AsyncIO,
 // or nullptr only if even POSIX AIO cannot open the file (a genuine error).
+/**
+ * True when `file_path` (or, before it exists, its directory) lives on a
+ * FUSE, Lustre, NFS or other network filesystem, where kernel AIO does not
+ * submit asynchronously.
+ */
+bool IsNetworkFs(const std::string &file_path) {
+#ifndef __linux__
+  (void)file_path;
+  return false;
+#else
+  struct statfs sf;
+  if (statfs(file_path.c_str(), &sf) != 0) {
+    const auto slash = file_path.find_last_of('/');
+    const std::string dir =
+        slash == std::string::npos ? "." : file_path.substr(0, slash);
+    if (statfs(dir.empty() ? "/" : dir.c_str(), &sf) != 0) return false;
+  }
+  switch (static_cast<unsigned long>(sf.f_type)) {
+    case 0x65735546UL:  // FUSE (dfuse)
+    case 0x0BD00BD0UL:  // Lustre
+    case 0x6969UL:      // NFS
+    case 0xFE534D42UL:  // SMB2
+    case 0xFF534D42UL:  // CIFS
+    case 0x47504653UL:  // GPFS
+      return true;
+    default:
+      return false;
+  }
+#endif
+}
+
 std::unique_ptr<ctp::AsyncIO> OpenBackingFile(clio::run::u32 io_depth,
                                               const std::string &file_path,
                                               bool create = false) {
@@ -46,6 +81,22 @@ std::unique_ptr<ctp::AsyncIO> OpenBackingFile(clio::run::u32 io_depth,
   // file was silently recreated empty and later writes and reads went to it
   // (#1210).
   const int flags = O_RDWR | (create ? O_CREAT : 0);
+  // libaio's io_submit() runs a buffered (or FUSE/network) write
+  // synchronously inside the syscall, so on dfuse, Lustre or NFS every write
+  // blocked a runtime worker for the full network round trip (IO500 at 16
+  // nodes: workers STALLED for seconds, metadata commits took 75 s). POSIX
+  // AIO performs the I/O on helper threads, keeping workers free.
+  // CLIO_BDEV_AIO=posix|default overrides the detection.
+  bool use_posix = IsNetworkFs(file_path);
+  if (const char *e = std::getenv("CLIO_BDEV_AIO")) {
+    use_posix = std::string(e) == "posix";
+  }
+  if (use_posix) {
+    auto pio = ctp::AsyncIoFactory::Get(io_depth, ctp::AsyncIoBackend::kPosixAio);
+    if (pio && pio->Open(file_path, flags, 0644)) {
+      return pio;
+    }
+  }
   auto io = ctp::AsyncIoFactory::Get(io_depth);
   if (io && io->Open(file_path, flags, 0644)) {
     return io;
@@ -136,6 +187,13 @@ int SyncFileData(const std::string &file_path) {
   ::close(fd);
   return rc == 0 ? 0 : err;
 #endif
+}
+
+// Steady-clock time in nanoseconds, used to age the host free-space sample.
+clio::run::u64 SteadyNowNs() {
+  return static_cast<clio::run::u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 }  // namespace
@@ -588,18 +646,12 @@ bool FsBdevTransport::EnsureFileBacked(clio::run::u64 end_offset) {
   return true;
 }
 
-clio::run::u64 FsBdevTransport::HostFreeBytes() const {
-  const clio::run::u64 now_ns = static_cast<clio::run::u64>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now().time_since_epoch()).count());
-  const clio::run::u64 at = host_free_ns_.load(std::memory_order_acquire);
-  if (at != 0 && now_ns - at < kHostFreeTtlNs) {
-    return host_free_.load(std::memory_order_relaxed);
-  }
+void FsBdevTransport::SampleHostFreeBytes(
+    std::shared_ptr<HostFreeCache> cache, std::string dir_str) {
   std::error_code ec;
   // parent_path() and space() both run in libstdc++.so, which MSan does not
   // see: the returned path and space_info read back as uninitialized.
-  std::filesystem::path dir = std::filesystem::path(file_path_).parent_path();
+  std::filesystem::path dir(dir_str);
   CTP_MSAN_UNPOISON_PATH(dir);
   std::filesystem::space_info si = std::filesystem::space(dir, ec);
   CTP_MSAN_UNPOISON_OBJ(si);
@@ -607,9 +659,46 @@ clio::run::u64 FsBdevTransport::HostFreeBytes() const {
   // Unknown (e.g. no permission to stat): do not cap by it.
   const clio::run::u64 free_b =
       ec ? ~clio::run::u64(0) : static_cast<clio::run::u64>(si.available);
-  host_free_.store(free_b, std::memory_order_relaxed);
-  host_free_ns_.store(now_ns, std::memory_order_release);
-  return free_b;
+  // Timestamp at completion so the TTL measures from the fresh value.
+  const clio::run::u64 done_ns = SteadyNowNs();
+  cache->free_bytes.store(free_b, std::memory_order_relaxed);
+  cache->sampled_ns.store(done_ns, std::memory_order_release);
+  cache->refreshing.store(false, std::memory_order_release);
+}
+
+clio::run::u64 FsBdevTransport::HostFreeBytes() const {
+  // Never call statfs on the caller's thread: on DAOS dfuse or Lustre it is
+  // a network RPC that measured up to 11.7 s, stalling a runtime worker.
+  // A stale sample is refreshed by a detached thread; callers get the last
+  // value immediately, or "unknown" (no cap) before any value exists.
+  HostFreeCache &cache = *host_free_cache_;
+  const clio::run::u64 now_ns = SteadyNowNs();
+  const clio::run::u64 at = cache.sampled_ns.load(std::memory_order_acquire);
+  const clio::run::u64 cached =
+      cache.free_bytes.load(std::memory_order_relaxed);
+  if (at != 0 && now_ns - at < kHostFreeTtlNs) {
+    return cached;
+  }
+  const clio::run::u64 fallback = at != 0 ? cached : ~clio::run::u64(0);
+  // Single-flight: concurrent callers (every worker running GetStats) do not
+  // each start a refresh; the winner launches one.
+  bool expected = false;
+  if (!cache.refreshing.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return fallback;
+  }
+  // The thread captures a copy of the path and the shared cache, never
+  // `this`, so it stays valid if the transport is destroyed first.
+  std::string dir = std::filesystem::path(file_path_).parent_path().string();
+  try {
+    std::thread(&FsBdevTransport::SampleHostFreeBytes, host_free_cache_,
+                std::move(dir))
+        .detach();
+  } catch (const std::system_error &) {
+    // Could not start a thread: release the guard and report the fallback.
+    cache.refreshing.store(false, std::memory_order_release);
+  }
+  return fallback;
 }
 
 clio::run::u64 FsBdevTransport::GetRemainingSize() const {
@@ -813,6 +902,15 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
       }
 
       if (result.error_code != 0) {
+        static std::atomic<clio::run::u64> write_errs{0};
+        const clio::run::u64 ne = write_errs.fetch_add(1) + 1;
+        if (ne <= 20 || (ne & (ne - 1)) == 0) {
+          HLOG(kError,
+               "file bdev write failed: errno {} ({}) offset {} size {} "
+               "(#{} so far)",
+               result.error_code, std::strerror(result.error_code), fo, seg,
+               ne);
+        }
         task->return_code_ = 4;
         task->io_error_ =
             static_cast<clio::run::u32>(ctp::ClassifyErrno(result.error_code));

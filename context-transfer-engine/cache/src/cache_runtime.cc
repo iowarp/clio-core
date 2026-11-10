@@ -18,6 +18,8 @@ static constexpr clio::run::u64 kCacheChunkBytes = 4ULL * 1024 * 1024;
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   config_ = task->GetParams();
+  HLOG(kInfo, "cache: md-only mode {} (no node-local blob data copies)",
+       config_.md_only_ ? "ON" : "OFF");
   interposer_next_pool_ = config_.next_pool_id_;  // base forwarding target
   if (!config_.next_pool_id_.IsNull()) {
     next_client_ =
@@ -120,7 +122,9 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
     using clio::cte::core::kPodMultiMax;
     using clio::cte::core::PodBlobReq;
     const clio::run::u32 n = std::min<clio::run::u32>(task->count_, kPodMultiMax);
-    if (n == 0 || CLIO_IPC->GetNumHosts() <= 1) {
+    // Md-only: no cache serve and no populate, so the whole batch goes to
+    // the core as one forward (the same path as the single-node case).
+    if (MdOnly() || n == 0 || CLIO_IPC->GetNumHosts() <= 1) {
       CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodMultiGetBlob,
                                   task.template Cast<clio::run::Task>()));
       CLIO_CO_RETURN;
@@ -394,6 +398,61 @@ void Runtime::AimAtCacheReplica(Context *ctx) const {
   ctx->min_persistence_level_ = 0;
 }
 
+// ===========================================================================
+// Metadata-only data path: no node-local blob copy at all. Blob data goes
+// straight to the owner chain; the tag write-through paths are untouched.
+// ===========================================================================
+
+clio::run::TaskResume Runtime::PutBlobMdOnly(
+    clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  {
+    const Context orig_ctx = task->context_;
+    const std::string blob_name = task->blob_name_.str();
+    if (IsBlobOwnerLocal(task->tag_id_, blob_name)) {
+      // Owner-local: the put IS the authoritative put. Run it inline on the
+      // next pool, as the full path does (see PutBlob).
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
+                                  task.template Cast<clio::run::Task>()));
+      task->context_.replica_ = orig_ctx.replica_;
+      task->context_.replica_flags_ = orig_ctx.replica_flags_;
+      task->context_.origin_node_ = Context::kNoOriginNode;
+      CLIO_CO_RETURN;
+    }
+    // Remote owner: the authoritative put(s) only, replayed in list order
+    // (last-writer-wins, as in PutBlob step 2). Dynamic hash-routes each
+    // region to the owner chain.
+    auto *next = GetNextClient();
+    std::vector<clio::cte::core::BlobRegion> regions;
+    clio::cte::core::ForEachBlobRegion(*task,
+        [&regions](const clio::cte::core::BlobRegion &r) {
+          regions.push_back(r);
+          return true;
+        });
+    clio::run::u32 rc = 0;
+    Context out_ctx = orig_ctx;
+    for (size_t i = 0; i < regions.size() && rc == 0; ++i) {
+      auto put = next->AsyncPutBlob(task->tag_id_, blob_name,
+                                    regions[i].blob_off_, regions[i].size_,
+                                    regions[i].data_, task->score_,
+                                    orig_ctx, task->flags_);
+      CLIO_CO_AWAIT(put);
+      rc = put->GetReturnCode();
+      out_ctx = put->context_;
+    }
+    out_ctx.replica_ = orig_ctx.replica_;
+    out_ctx.replica_flags_ = orig_ctx.replica_flags_;
+    out_ctx.origin_node_ = Context::kNoOriginNode;
+    task->context_ = out_ctx;
+    task->SetReturnCode(rc);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::PutBlob(
     clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -401,6 +460,10 @@ clio::run::TaskResume Runtime::PutBlob(
   if (task->context_.replica_ != 0) {
     CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
                            task.template Cast<clio::run::Task>()));
+    CLIO_CO_RETURN;
+  }
+  if (MdOnly()) {
+    CLIO_CO_AWAIT(PutBlobMdOnly(task));
     CLIO_CO_RETURN;
   }
   {
@@ -557,7 +620,8 @@ clio::run::TaskResume Runtime::MultiPutBlob(
     // Multinode read locality still comes from the read path's populate,
     // which registers (version-checked). Single-node has no foreign
     // writers, so the mirror is coherent by construction there.
-    if (CLIO_IPC->GetNumHosts() <= 1) {
+    // Md-only skips the mirror batch entirely (no node-local copies).
+    if (!MdOnly() && CLIO_IPC->GetNumHosts() <= 1) {
       task->context_ = orig_ctx;
       AimAtCacheReplica(&task->context_);
       task->num_ok_ = 0;
@@ -579,6 +643,65 @@ clio::run::TaskResume Runtime::MultiPutBlob(
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::FetchFromOwnerChain(
+    clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  {
+    auto *next = GetNextClient();
+    const std::string blob_name = task->blob_name_.str();
+    std::vector<clio::cte::core::BlobRegion> regions;
+    clio::cte::core::ForEachBlobRegion(*task,
+        [&regions](const clio::cte::core::BlobRegion &r) {
+          regions.push_back(r);
+          return true;
+        });
+    clio::run::u32 rc = 0;
+    clio::run::u32 out_tflags = 0;
+    clio::run::u64 fetch_version = 0;
+    for (size_t i = 0; i < regions.size() && rc == 0; ++i) {
+      auto get = next->AsyncGetBlob(
+          task->tag_id_, blob_name, regions[i].blob_off_, regions[i].size_,
+          task->flags_, regions[i].data_, clio::run::PoolQuery::Dynamic(),
+          task->context_);
+      CLIO_CO_AWAIT(get);
+      rc = get->GetReturnCode();
+      out_tflags = get->context_.transform_flags_;
+      if (i == 0) {
+        fetch_version = get->context_.version_;
+      }
+    }
+    task->context_.transform_flags_ = out_tflags;
+    task->context_.version_ = fetch_version;
+    task->SetReturnCode(rc);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::GetBlobMdOnly(
+    clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  {
+    // No cache-replica read, no populate, and no IsStandingIn copy delete:
+    // this node never creates a copy, so there is none to drop. The owner
+    // node reads its node-local primary inline, as the full path does.
+    if (IsBlobOwnerLocal(task->tag_id_, task->blob_name_.str())) {
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
+                                  task.template Cast<clio::run::Task>()));
+      CLIO_CO_RETURN;
+    }
+    CLIO_CO_AWAIT(FetchFromOwnerChain(task));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::GetBlob(
     clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -587,6 +710,10 @@ clio::run::TaskResume Runtime::GetBlob(
   if (task->context_.replica_ != 0) {
     CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
                            task.template Cast<clio::run::Task>()));
+    CLIO_CO_RETURN;
+  }
+  if (MdOnly()) {
+    CLIO_CO_AWAIT(GetBlobMdOnly(task));
     CLIO_CO_RETURN;
   }
   {
@@ -845,7 +972,8 @@ clio::run::TaskResume Runtime::GetBlobSize(
                                   task.template Cast<clio::run::Task>()));
       CLIO_CO_RETURN;
     }
-    {
+    // Md-only: no node-local copy to answer from, so ask the owner chain.
+    if (!MdOnly()) {
       auto *local = GetLocalClient();
       auto sz = local->AsyncGetBlobSize(task->tag_id_,
                                         task->blob_name_.str(),

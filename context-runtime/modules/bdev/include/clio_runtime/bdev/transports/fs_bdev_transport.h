@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -174,12 +175,32 @@ class FsBdevTransport : public BdevTransport {
    *  fast for kGrowRetryNs instead of retrying the reservation. */
   clio::run::u64 grow_fail_end_ = 0;
   clio::run::u64 grow_fail_ns_ = 0;
-  /** Host filesystem free bytes (cached for kHostFreeTtlNs) and when it
-   *  was sampled (steady ns); 0 ns = never. */
-  mutable std::atomic<clio::run::u64> host_free_{0};
-  mutable std::atomic<clio::run::u64> host_free_ns_{0};
-  static constexpr clio::run::u64 kHostFreeTtlNs = 1000000000ull;
-  /** @return free bytes on the backing file's filesystem (cached). */
+  /** Cached host filesystem free-space sample. Held by shared_ptr so a
+   *  detached refresh thread can publish into it even if the transport is
+   *  destroyed first. */
+  struct HostFreeCache {
+    /** Last sampled free bytes (~0 = unknown, do not cap). */
+    std::atomic<clio::run::u64> free_bytes{0};
+    /** Steady-clock ns when the sample finished; 0 = never sampled. */
+    std::atomic<clio::run::u64> sampled_ns{0};
+    /** Single-flight guard: only one refresh thread runs at a time. */
+    std::atomic<bool> refreshing{false};
+  };
+  std::shared_ptr<HostFreeCache> host_free_cache_ =
+      std::make_shared<HostFreeCache>();
+  // 5 s: statfs on a network filesystem (DAOS dfuse, Lustre) is an RPC that
+  // took seconds under load; GetStats calls this on every poll.
+  static constexpr clio::run::u64 kHostFreeTtlNs = 5000000000ull;
+  /**
+   * Refresh `cache` with the free bytes of `dir`'s filesystem. Runs on a
+   * detached thread so a slow statfs never blocks a runtime worker.
+   * @param cache shared cache to publish the sample into
+   * @param dir directory to stat (copied; the thread owns it)
+   */
+  static void SampleHostFreeBytes(std::shared_ptr<HostFreeCache> cache,
+                                  std::string dir);
+  /** @return free bytes on the backing file's filesystem (cached; never
+   *  blocks on statfs, refreshes asynchronously). */
   clio::run::u64 HostFreeBytes() const;
   /** How long a failed grow is trusted before disk space is probed again. */
   static constexpr clio::run::u64 kGrowRetryNs = 2000000000ull;

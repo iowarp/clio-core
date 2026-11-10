@@ -39,6 +39,10 @@ namespace clio::cte::cache {
  *    down (decompressed below) and best-effort re-populates.
  *  - GetBlobSize answers from the cache replica (raw size == logical size)
  *    before consulting the chain.
+ *
+ * Metadata-only mode (CacheConfig::md_only_) keeps NO node-local data copy:
+ * puts, gets and size queries bypass the cache replica entirely and use only
+ * the authoritative owner chain. Tag write-through and routing are unchanged.
  */
 class Runtime : public clio::cte::core::CoreInterposer {
  public:
@@ -129,6 +133,47 @@ class Runtime : public clio::cte::core::CoreInterposer {
  private:
   /** Aim a put context at THE cache replica slot (raw bytes, score floor). */
   void AimAtCacheReplica(Context *ctx) const;
+
+  /**
+   * True when metadata-only mode is on (no node-local blob data copies).
+   * @return The configured CacheConfig::md_only_ value.
+   */
+  bool MdOnly() const { return config_.md_only_; }
+
+  /**
+   * Metadata-only PutBlob: no cache replica is written, created or deleted.
+   * An owner-local blob runs the put inline on the next pool (the put IS the
+   * authoritative write). A remote-owned blob gets only the authoritative
+   * put(s) to the owner chain: no origin registration, no VERIFY_COMPLETE,
+   * no local delete tail.
+   * @param task The put task. Its return code and OUT context are set on
+   *             completion, matching the full write-through path.
+   * @return Coroutine resume token.
+   */
+  clio::run::TaskResume PutBlobMdOnly(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task);
+
+  /**
+   * Metadata-only GetBlob: no cache replica read and no populate. An
+   * owner-local blob is read inline on the next pool; any other blob is
+   * fetched from the owner chain straight into the caller's buffers.
+   * @param task The get task. Its buffers, return code and transform/version
+   *             OUT fields are set on completion.
+   * @return Coroutine resume token.
+   */
+  clio::run::TaskResume GetBlobMdOnly(
+      clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task);
+
+  /**
+   * Read every region of a get task from the authoritative owner chain
+   * (Dynamic routing) directly into the caller's buffers. Stops at the first
+   * failing region. Sets the task's transform_flags_, version_ and return
+   * code from the chain's answer. Does not populate any local copy.
+   * @param task The get task whose regions are fetched.
+   * @return Coroutine resume token.
+   */
+  clio::run::TaskResume FetchFromOwnerChain(
+      clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task);
 
   /**
    * True when THIS node hosts the blob's owner container (issue #894).

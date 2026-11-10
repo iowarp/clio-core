@@ -563,12 +563,22 @@ compose:
   # primary alone would refuse — and min_score is the floor below which the
   # organizer will not rescore a cache copy (only genuine tier pressure
   # evicts one).
+  #
+  # md_only (default false): metadata-only mode. The cache keeps NO node-local
+  # copies of blob data: no cache-replica writes, reads, populates or size
+  # probes. Every blob read and write goes straight to the authoritative owner
+  # chain. Tag metadata write-through and task routing are unchanged. Use it
+  # when node-local copies crowd the fast tiers more than they help (for
+  # example write-heavy runs where every remote-owned byte is otherwise written
+  # twice); leave it off for read-heavy workloads that re-read remote data
+  # locally.
   - mod_name: clio_cte_cache
     pool_name: clio_cte_cache
     pool_query: local
     pool_id: "563.0"
     next_pool_id: "564.0"               # indexer — see entry above
     min_score: 0.5                      # cache copies' score floor
+    md_only: false                      # true: metadata-only, no data copies
 
   # === Context Assimilation Engine (CAE) ===
   # Assimilation / discovery entrypoint at its own pool 400.0

@@ -787,6 +787,55 @@ double g_entry_ttl_s = 0.0;  ///< kernel entry TTL, set at init (#1323)
  * @param stbuf receives the attributes on a hit
  * @return true on a fresh hit
  */
+// READDIR PREFETCH (opt-in, CLIO_FUSE_READDIR_PREFETCH=<window>): a listing
+// of a large directory issues its children's getattrs concurrently, `window`
+// in flight, and parks the results here. find/ls -l then stat every entry;
+// without this each stat was its own serial round trip to the entry's owner
+// node (IO500 find at 16 nodes: one pfind rank stat'ing 512k entries of
+// mdtest-hard one by one took >12 min). Each result is consumed by the
+// first getattr of that path and expires after kPrefetchTtlNs, so staleness
+// is bounded by that window. Off by default: multi-node mounts otherwise
+// keep exact close-to-open attributes.
+// pfind/ls read the WHOLE listing before stat'ing anything, so the TTL must
+// cover the full stat pass over a large directory (a 2 s TTL expired most of
+// a 512k-entry prefetch before its first stat). CLIO_FUSE_READDIR_PREFETCH_TTL_S.
+static int64_t PrefetchTtlNs() {
+  static const int64_t ttl = [] {
+    const char *e = getenv("CLIO_FUSE_READDIR_PREFETCH_TTL_S");
+    const double s = (e != nullptr && *e != '\0') ? atof(e) : 60.0;
+    return static_cast<int64_t>(s * 1e9);
+  }();
+  return ttl;
+}
+static std::mutex g_pf_mtx;
+static std::unordered_map<std::string, std::pair<cte_stat_t, int64_t>> g_pf;
+static int64_t PfNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static int PrefetchWindow() {
+  static const int w = [] {
+    const char *e = getenv("CLIO_FUSE_READDIR_PREFETCH");
+    return (e != nullptr && *e != '\0') ? atoi(e) : 0;
+  }();
+  return w;
+}
+static bool PrefetchTake(const std::string &p, cte_stat_t *st) {
+  if (PrefetchWindow() <= 0) return false;
+  std::lock_guard<std::mutex> lk(g_pf_mtx);
+  auto it = g_pf.find(p);
+  if (it == g_pf.end()) return false;
+  const bool fresh = PfNowNs() - it->second.second < PrefetchTtlNs();
+  if (fresh) *st = it->second.first;
+  g_pf.erase(it);
+  return fresh;
+}
+static void PrefetchDrop(const std::string &p) {
+  if (PrefetchWindow() <= 0) return;
+  std::lock_guard<std::mutex> lk(g_pf_mtx);
+  g_pf.erase(p);
+}
+
 static bool DirAttrLookup(const std::string &p, cte_stat_t *stbuf) {
   if (g_dir_attr_ttl_s <= 0.0) return false;
   std::lock_guard<std::mutex> lk(g_dir_attr_mtx);
@@ -826,6 +875,7 @@ static void DirAttrClear() {
  * @param p the path being created, removed, renamed or changed
  */
 static void DirAttrInvalidate(const std::string &p) {
+  PrefetchDrop(p);
   if (g_dir_attr_ttl_s <= 0.0) return;
   std::lock_guard<std::mutex> lk(g_dir_attr_mtx);
   g_dir_attr.erase(p);
@@ -2264,6 +2314,7 @@ static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
     }
   }
 
+  if (PrefetchTake(p, stbuf)) return 0;
   // Delegate to the filesystem chimod: it owns exists/is-dir/logical-size.
   auto t = cfs->AsyncGetattr(p);
   t.Wait();
@@ -2750,6 +2801,51 @@ int cte_fuse_readdir(const char *path, void *buf,
   }
   size_t prefix_len = p.size();
   if (!p.empty() && p.back() != '/') prefix_len++;
+  // Only directories too large for the caller's own parallelism, and one
+  // prefetch per mount at a time: pfind lists hundreds of directories at
+  // once, and prefetching all of them (2000-entry mdtest-easy dirs too)
+  // put ~65k getattrs in flight per node, saturated every runtime worker
+  // and made a stat of the mount root take 61 s.
+  static const size_t pf_min = [] {
+    const char *e = getenv("CLIO_FUSE_READDIR_PREFETCH_MIN");
+    return (e != nullptr && *e != '\0') ? static_cast<size_t>(atoll(e))
+                                         : static_cast<size_t>(8192);
+  }();
+  static std::mutex pf_one;
+  std::unique_lock<std::mutex> pf_lk(pf_one, std::defer_lock);
+  if (const int win = PrefetchWindow();
+      win > 0 && t->entries_.size() >= pf_min && pf_lk.try_lock()) {
+    using GetattrFuture = decltype(cfs->AsyncGetattr(p));
+    std::vector<std::pair<std::string, GetattrFuture>> inflight;
+    inflight.reserve(static_cast<size_t>(win));
+    auto drain = [&]() {
+      for (auto &kv : inflight) {
+        kv.second.Wait();
+        if (kv.second->GetReturnCode() != 0 || kv.second->exists_ == 0) continue;
+        cte_stat_t pst;
+        memset(&pst, 0, sizeof(pst));
+        FillStatFromGetattr(kv.second.get(), kv.first, &pst);
+        std::lock_guard<std::mutex> lk(g_pf_mtx);
+        g_pf[kv.first] = {pst, PfNowNs()};
+      }
+      inflight.clear();
+    };
+    const int64_t pf_t0 = PfNowNs();
+    for (size_t i = 0; i < t->entries_.size(); ++i) {
+      std::string full = t->entries_[i].str();
+      if (!full.empty() && full.back() == '/') full.pop_back();
+      if (full.size() <= prefix_len) continue;
+      if (full.find(".fuse_hidden", prefix_len) == prefix_len) continue;
+      auto f = cfs->AsyncGetattr(full);
+      inflight.emplace_back(std::move(full), std::move(f));
+      if (inflight.size() >= static_cast<size_t>(win)) drain();
+    }
+    drain();
+    if (t->entries_.size() >= 4096) {
+      HLOG(kWarning, "clio_cte_fuse: readdir prefetch of {} ({} entries) took {} ms",
+           p, t->entries_.size(), (PfNowNs() - pf_t0) / 1000000);
+    }
+  }
   // entries_ and inos_ are index-aligned (the chimod builds them together).
   for (size_t i = 0; i < t->entries_.size(); ++i) {
     std::string full = t->entries_[i].str();
