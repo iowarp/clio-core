@@ -298,6 +298,7 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
       rc = static_cast<int>(resp.rc_);
       break;
     case kTablePush: rc = ApplyTablePush(req); break;
+    case kTableStandInFetch: rc = ServeStandInFetch(req, resp); break;
     case kTableInstall:
       CLIO_CO_AWAIT(InstallBlock(req, resp));
       rc = static_cast<int>(resp.rc_);
@@ -337,7 +338,7 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
   // back to the sender, whose handler waits the same way -- deadlocked two
   // nodes storing inodes cached on each other.
   if (op != kTablePush && op != kShardInodePush &&
-      op != kTableFetch) {
+      op != kTableFetch && op != kTableStandInFetch) {
     int ferr = 0;
     CLIO_CO_AWAIT(FlushInodes(&ferr, since));
     // The change could not be made durable (a full store): say so rather
