@@ -360,12 +360,18 @@ clio::run::TaskResume Runtime::PutBlockCte(clio::run::u64 dir,
   while (cap < image.size()) cap <<= 1;
   std::string padded = image;
   padded.resize(cap, '\0');
+  // The level THIS put asked for decides whether it retries. Reading
+  // inode_volatile_only_ again after the await let another task's
+  // successful fallback (which sets it) cancel this task's retry: its
+  // refused non-volatile put then surfaced as a failed mkdir/create (rc 12;
+  // IO500 mdtest at 64 and 256 nodes).
+  const bool asked_volatile = inode_volatile_only_;
   auto p = cte_.AsyncPutBlob(tag, TableBlockName(k), 0, padded.size(),
                              padded.data(), -1.0f,
-                             MetaCtx(inode_volatile_only_), 0u,
+                             MetaCtx(asked_volatile), 0u,
                              clio::run::PoolQuery::Dynamic());
   CLIO_CO_AWAIT(p);
-  if (p->GetReturnCode() != 0 && !inode_volatile_only_) {
+  if (p->GetReturnCode() != 0 && !asked_volatile) {
     // No non-volatile tier accepts it: keep it in RAM (lost on restart).
     p = cte_.AsyncPutBlob(tag, TableBlockName(k), 0, padded.size(),
                           padded.data(), -1.0f, MetaCtx(true), 0u,
