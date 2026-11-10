@@ -27,7 +27,7 @@
 #
 # Knobs (qsub -v): MODE, PPN (IO500 ranks per node, 16), STONEWALL (300 s,
 # the IO500 rule), RAM_PCT (25), DAOS_PCT (50), FLARE_X (4), BUILD_DIR
-# (build/fs), IO500 (binary), DAOS_POOL (IOWarp), DAOS_CONT (io500_cliofs).
+# (build/fs), IO500 (binary), DAOS_POOL (IOWarp), DAOS_CONT (io500_<nodes>n).
 set -u
 MODE=${MODE:-cliofs}
 PPN=${PPN:-16}
@@ -41,7 +41,6 @@ MD_N=${MD_N:-2000}              # mdtest-easy/hard files per rank
 BUILD_DIR=${BUILD_DIR:-/home/llogan/clio-core/build/fs}
 IO500=${IO500:-/lus/flare/projects/IOWarp/llogan/io500/src/io500}
 DAOS_POOL=${DAOS_POOL:-IOWarp}
-DAOS_CONT=${DAOS_CONT:-io500_cliofs}
 FLARE=${FLARE:-/lus/flare/projects/IOWarp/llogan/io500}
 HERE=/home/llogan/clio-core/benchmarks/io500
 
@@ -86,6 +85,23 @@ export PATH=/soft/daos/bin:$PATH DAOS_AGENT_DRPC_DIR=/run/daos_agent_oneScratch
 # Same fabric settings as `module load daos` (without them dfuse failed DER_HG).
 export FI_CXI_RX_MATCH_MODE=hybrid FI_MR_CACHE_MONITOR=kdreg2 \
   FI_MR_CACHE_MAX_COUNT=2000000 FI_CXI_DEFAULT_CQ_SIZE=131072 NA_OFI_CXI_PROTO_RNR=0
+
+# One DAOS container per node count, so jobs at different scales (different
+# queues, possibly concurrent) never share one. DAOS_RESET=1 destroys it at
+# the start: failed runs leave millions of mdtest files behind, deleting
+# them through dfuse takes hours, and they filled the pool's metadata tier
+# (mdtest-hard-write hit ENOSPC at 64 nodes). DAOS_DESTROY lists other
+# containers to drop first (the old shared io500_cliofs).
+DAOS_CONT=${DAOS_CONT:-io500_${NN}n}
+if [ "$MODE" != flare ]; then
+  for c in ${DAOS_DESTROY:-}; do
+    daos cont destroy "$DAOS_POOL" "$c" --force 2>&1 | grep -v ' ERR ' | tail -1
+  done
+  if [ "${DAOS_RESET:-1}" = 1 ]; then
+    daos cont destroy "$DAOS_POOL" "$DAOS_CONT" --force 2>&1 | grep -v ' ERR ' | tail -1
+  fi
+  daos pool query "$DAOS_POOL" 2>&1 | grep -i -E 'total size|free' | head -4
+fi
 
 if [ "$MODE" = cliofs ]; then
   test -x "$BUILD_DIR/bin/clio_cte_fuse" || { echo "NO $BUILD_DIR/bin/clio_cte_fuse"; exit 2; }
