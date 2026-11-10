@@ -98,6 +98,44 @@ std::atomic<unsigned long long> EvqWaitByWorker::n[EvqWaitByWorker::kMax];
 std::atomic<unsigned long long> EvqWaitByWorker::sum[EvqWaitByWorker::kMax];
 std::atomic<unsigned long long> EvqWaitByWorker::slow[EvqWaitByWorker::kMax];
 EvqWaitByWorker g_evqw_init;
+
+/**
+ * Which workers run peers' tasks (CLIO_EVLAT): per worker, how many remote
+ * tasks it first-ran and their summed r_exec (first run -> EndTask). If one
+ * worker runs nearly all of them, remote throughput per node is capped at
+ * 1 / r_exec no matter how many workers the pool has.
+ * Printed at exit as "clio-evremote worker=N n=.. exec_sum=..ms".
+ */
+struct RemoteExecByWorker {
+  static constexpr int kMax = 64;
+  static std::atomic<unsigned long long> n[kMax], cyc[kMax];
+  static void Start(unsigned worker) {
+    if (worker < static_cast<unsigned>(kMax)) {
+      n[worker].fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  static void Exec(unsigned worker, unsigned long long cycles) {
+    if (worker < static_cast<unsigned>(kMax)) {
+      cyc[worker].fetch_add(cycles, std::memory_order_relaxed);
+    }
+  }
+  static void Report() {
+    for (int w = 0; w < kMax; ++w) {
+      const unsigned long long c = n[w].load();
+      if (c == 0) continue;
+      std::fprintf(stderr, "clio-evremote worker=%d n=%llu exec_sum=%.0fms\n",
+                   w, c,
+                   static_cast<double>(cyc[w].load()) /
+                       clio_evlat_cycles_per_us() / 1000.0);
+    }
+  }
+  RemoteExecByWorker() {
+    if (clio::run::evlat::On()) std::atexit(Report);
+  }
+};
+std::atomic<unsigned long long> RemoteExecByWorker::n[RemoteExecByWorker::kMax];
+std::atomic<unsigned long long> RemoteExecByWorker::cyc[RemoteExecByWorker::kMax];
+RemoteExecByWorker g_remote_exec_init;
 }  // namespace
 
 // <coroutine> only for the C++20 stackless backend, not the Boost stackful one.
@@ -1428,6 +1466,7 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
         const unsigned long long now = CycleNow();
         evlat::Span(evlat::kRemoteLane, ev_rc->remote_arrive_cyc_, now);
         ev_rc->remote_start_cyc_ = now;
+        RemoteExecByWorker::Start(GetId());
       }
     }
     task_ptr->StartCoroutine(task_ptr);
@@ -1652,7 +1691,11 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   if (is_remote) {
     if (evlat::On()) {
       if (RunContext *ev_rc = task_ptr->RunCtxPtr()) {
-        evlat::Span(evlat::kRemoteExec, ev_rc->remote_start_cyc_, CycleNow());
+        if (ev_rc->remote_start_cyc_ != 0) {
+          const unsigned long long now = CycleNow();
+          evlat::Span(evlat::kRemoteExec, ev_rc->remote_start_cyc_, now);
+          RemoteExecByWorker::Exec(GetId(), now - ev_rc->remote_start_cyc_);
+        }
         ev_rc->remote_start_cyc_ = 0;
       }
     }
