@@ -10016,6 +10016,28 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
        ordered_targets.size());
 
   if (ordered_targets.empty()) {
+    // Say WHY nothing qualified (rate-limited): every registered target with
+    // the inputs each filter above looks at. A refusal here reaches clio-fs
+    // as a failed mkdir/create (rc 12), seen at 64+ nodes with all three
+    // tiers registered and the Flare tier nearly empty.
+    static std::atomic<clio::run::u64> no_candidate_logs{0};
+    if (no_candidate_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+      std::string desc;
+      for (const TargetInfo &t : available_targets) {
+        desc += " [pool " + std::to_string(t.bdev_client_.pool_id_.major_) +
+                " remaining " + std::to_string(t.remaining_space_) +
+                " score " + std::to_string(t.target_score_) +
+                " persistence " +
+                std::to_string(static_cast<int>(t.persistence_level_)) +
+                " ttl_days " + std::to_string(t.expected_ttl_days_) +
+                " alive " + std::to_string(TargetNodeAlive(t) ? 1 : 0) + "]";
+      }
+      HLOG(kWarning,
+           "ExtendBlob: no candidate target for {} byte(s) (blob score {}, "
+           "min persistence {}, max persistence {}); {} registered:{}",
+           additional_size, blob_score, min_persistence_level,
+           max_persistence_level, available_targets.size(), desc);
+    }
     undo_fill();
     if (shortfall != nullptr) {
       *shortfall = needed_size;
