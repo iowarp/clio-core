@@ -10,7 +10,7 @@ log() { echo "[$H $(date +%T)] $*"; }
 
 pkill -9 -u "$USER" -f '[c]lio_cte_fuse' ; pkill -9 -u "$USER" -f '[c]lio_run' ; sleep 0.5
 fusermount3 -u -z "$LR/mnt" 2>/dev/null
-rm -rf "$LR"; mkdir -p "$LR/mnt" "$LR/conf" "$LR/memfd" "$DM"
+rm -rf "$LR"; mkdir -p "$LR/mnt" "$LR/conf" "$LR/memfd" "$LR/meta" "$DM"
 
 for t in 1 2 3 4 5; do
   mountpoint -q "$DM" && break

@@ -2069,6 +2069,34 @@ clio::run::TaskResume Runtime::GetTargetInfo(clio::run::shared_ptr<GetTargetInfo
   CLIO_TASK_BODY_END
 }
 
+/**
+ * Decides whether a kCtePutAppend put must be refused because its shape is one
+ * the append path cannot honour (see kCtePutAppend). Logs the first refusal in
+ * the process at kWarning, so a misuse cannot flood the log.
+ * @param flags PutBlobTask::flags_ of the put
+ * @param replica Context::replica_ of the put (0 = primary blob)
+ * @param vectored true when the put carries vectored segments
+ * @return true when the put must fail with kCtePutAppendInvalidRc
+ */
+static bool AppendPutRefused(clio::run::u32 flags, int replica, bool vectored) {
+  if ((flags & kCtePutAppend) == 0) return false;
+  const char *reason = nullptr;
+  if ((flags & kCtePutReplace) != 0) {
+    reason = "combined with kCtePutReplace";
+  } else if (replica != 0) {
+    reason = "on a replica-targeted put";
+  } else if (vectored) {
+    reason = "on a vectored put";
+  }
+  if (reason == nullptr) return false;
+  static std::atomic<bool> warned{false};
+  if (!warned.exchange(true)) {
+    HLOG(kWarning, "PutBlob kCtePutAppend refused: {} (rc {})", reason,
+         kCtePutAppendInvalidRc);
+  }
+  return true;
+}
+
 template <typename TaskT>
 clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -2201,6 +2229,12 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     }
     if (blob_name.empty()) {
       task->return_code_ = 4;
+      CLIO_CO_RETURN;
+    }
+    // Append shapes this path cannot honour fail before any blob state is
+    // touched. See kCtePutAppend.
+    if (AppendPutRefused(task->flags_, task->context_.replica_, vectored)) {
+      task->return_code_ = kCtePutAppendInvalidRc;
       CLIO_CO_RETURN;
     }
 
@@ -2462,6 +2496,13 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // a prior holder, it may have grown the blob while we were suspended, so this
     // must be read here — never hoisted above the acquire.
     old_blob_size = blob_info_ptr->GetTotalSize();
+    // kCtePutAppend: the write position is the blob's size as it stands under
+    // the token, read just above. The caller's offset_ input is ignored. Every
+    // later use of `offset` (extend, hole fill, modify, WAL, telemetry, size
+    // accounting, generation stamp, SLOW-PUT) sees this resolved value.
+    if (task->flags_ & kCtePutAppend) {
+      offset = old_blob_size;
+    }
     // State BEFORE the extend, for the tail-write scan hint (see below). Capture
     // the last block's index and its start offset in the blob (blocks' sizes sum
     // to old_blob_size, so the last block starts at old_blob_size - its size).
@@ -2946,7 +2987,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         !task->context_.emulate_) {
       bool ok = true;
       if ((task->context_.replica_flags_ & REPLICA_VERIFY_COMPLETE) != 0) {
-        ok = task->offset_ == 0 && task->size_ >= old_blob_size;
+        // `offset`, not task->offset_: an append's resolved offset is only
+        // published below, and the check must see where the bytes went.
+        ok = offset == 0 && task->size_ >= old_blob_size;
         if constexpr (TaskT::kSupportsVectored) {
           ok = ok && task->segments_.empty();
         }
@@ -2974,6 +3017,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
     }
 
+    // Report where the bytes landed. For an ordinary put this echoes the input
+    // offset; for kCtePutAppend it is the resolved append position.
+    task->offset_ = offset;
     task->return_code_ = 0;
   } catch (const std::exception &e) {
     HLOG(kError, "PutBlob failed with exception: {}", e.what());
@@ -4649,6 +4695,8 @@ clio::run::TaskResume Runtime::PodPutBlob(
       CLIO_CO_AWAIT(fut);
       clio_evlat_add(14, clio::run::CycleNow() - ev_p2);
       task->SetReturnCode(fut->GetReturnCode());
+      // The owner resolved any kCtePutAppend position; hand it back.
+      task->offset_ = fut->offset_;
       CLIO_CO_RETURN;
     }
   }

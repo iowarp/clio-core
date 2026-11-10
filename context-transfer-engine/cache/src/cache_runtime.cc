@@ -442,6 +442,10 @@ clio::run::TaskResume Runtime::PutBlobMdOnly(
       CLIO_CO_AWAIT(put);
       rc = put->GetReturnCode();
       out_ctx = put->context_;
+      if (task->flags_ & clio::cte::core::kCtePutAppend) {
+        // The owner resolved the append position; hand it back.
+        task->offset_ = put->offset_;
+      }
     }
     out_ctx.replica_ = orig_ctx.replica_;
     out_ctx.replica_flags_ = orig_ctx.replica_flags_;
@@ -462,7 +466,10 @@ clio::run::TaskResume Runtime::PutBlob(
                            task.template Cast<clio::run::Task>()));
     CLIO_CO_RETURN;
   }
-  if (MdOnly()) {
+  // An append (kCtePutAppend) has no offset this node can write a copy at:
+  // only the owner knows where the blob ends. It takes the authoritative-only
+  // path, exactly as the metadata-only mode does.
+  if (MdOnly() || (task->flags_ & clio::cte::core::kCtePutAppend)) {
     CLIO_CO_AWAIT(PutBlobMdOnly(task));
     CLIO_CO_RETURN;
   }

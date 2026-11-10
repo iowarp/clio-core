@@ -650,6 +650,11 @@ compose:
     metadata_log_path: "${CLIO_STORAGE_ROOT}/cfs_namespace_log"
     # Rows a table block holds before it splits (default 1024).
     # dir_split_entries: 1024
+    # Bytes of appended changes a table block's CTE blob may hold past its last
+    # full image (a size, default 256KB). A commit appends its delta to the
+    # blob and rewrites the blob whole once the log would pass this. 0 rewrites
+    # the whole block on every commit (the earlier behaviour).
+    # dir_log_compact_bytes: 256KB
     # Compare names case-insensitively, keeping their spelling, as NTFS does
     # (default false): Foo.TXT and foo.txt are one file. Fixed when the volume
     # is created; a runtime configured the other way refuses the volume.

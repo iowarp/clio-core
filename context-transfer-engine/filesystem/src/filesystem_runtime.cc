@@ -212,6 +212,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     if (st->GetReturnCode() == 0) sys_tag_id_ = st->tag_id_;
   }
   split_entries_ = std::max<clio::run::u32>(cfg.dir_split_entries_, 16);
+  dir_log_compact_bytes_ = cfg.dir_log_compact_bytes_;
   case_insensitive_ = cfg.case_insensitive_;
   // Inode records live in CTE blobs and load on demand; only this
   // container's id reservation and orphan list are read up front.

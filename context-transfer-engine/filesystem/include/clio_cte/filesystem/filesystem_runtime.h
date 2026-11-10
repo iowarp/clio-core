@@ -52,6 +52,7 @@
 #include <clio_cte/filesystem/filesystem_tasks.h>
 #include <clio_cte/stream/stream_client.h>
 #include <clio_cte/stream/stream_runtime.h>
+#include <clio_cte/filesystem/fs_block_log.h>
 #include <clio_cte/filesystem/fs_shard.h>
 #include <clio_cte/filesystem/fs_canonical.h>
 #include <clio_cte/filesystem/fs_inode.h>
@@ -336,6 +337,10 @@ class Runtime : public clio::run::Container {
   clio::run::ContainerHold stream_hold_;
   /** Rows an inode-table block holds before it splits. */
   clio::run::u32 split_entries_ = 1024;
+  /** A block's blob may hold this many bytes of delta frames past its image
+   *  before the next commit rewrites it whole (0: every commit writes an
+   *  image). Set from FilesystemConfig::dir_log_compact_bytes_. */
+  clio::run::u64 dir_log_compact_bytes_ = 256ull << 10;
   /** Names are compared case-insensitively (FilesystemConfig; fixed for the
    *  volume's life by the root inode's record). */
   bool case_insensitive_ = false;
@@ -438,6 +443,17 @@ class Runtime : public clio::run::Container {
      *  deltas build on (new, split off, materialized, or a journal write
      *  failed), so the next commit journals the whole block. */
     bool journal_image_ = true;
+    /** Home: the blob's next write must be a full image, because it has no
+     *  log to append to (new, split, sealed, a failed write, or a blob that
+     *  LoadHomeBlock found holding more than one frame). */
+    bool blob_image_due_ = true;
+    /** Home: bytes of delta frames appended to the blob since its image
+     *  frame; the log is compacted once this would pass
+     *  dir_log_compact_bytes_. */
+    clio::run::u64 blob_log_bytes_ = 0;
+    /** Home: the blob's length as this home last wrote or read it. An append
+     *  must land there (BlockBlobWrite::expect_end_). */
+    clio::run::u64 blob_end_ = 0;
   };
   std::mutex ns_mu_;  ///< guards blocks_, loading_, early_ and every slot
   std::unordered_map<TableBlockKey, std::shared_ptr<TableBlockSlot>, TableBlockKeyHash> blocks_;
@@ -604,26 +620,29 @@ class Runtime : public clio::run::Container {
    * @param rc 0, ENOENT (no blob) or EIO
    */
   clio::run::TaskResume ReadBlockBlob(clio::run::u64 dir, clio::run::u32 k,
-                                      InodeTableBlock *out, int &rc);
+                                      InodeTableBlock *out, int &rc,
+                                      BlockLogInfo *log = nullptr);
   /**
-   * Write a block's durable image to its CTE blob (on a non-volatile tier
-   * when the deployment has one).
+   * Write one planned change to a block's CTE blob: a replacing image frame
+   * or an appended delta frame (see BlockBlobWrite).
    * @param dir packed directory id
    * @param k block index
-   * @param image EncodeTableBlock(block, true)
-   * @param rc 0 or EIO
+   * @param blob the write
+   * @param rc 0, ENOSPC (store full) or EIO
    */
   clio::run::TaskResume WriteBlockBlob(clio::run::u64 dir, clio::run::u32 k,
-                                       const std::string &image, int &rc);
+                                       BlockBlobWrite &blob, int &rc);
   /**
    * Read block (dir, k) from its CTE blob only (no journal lookup).
    * @param dir packed directory id
    * @param k block index
    * @param out receives the block
    * @param rc 0, ENOENT (no such blob) or EIO (any other failure)
+   * @param log if non-null, receives what the blob held (see BlockLogInfo)
    */
   clio::run::TaskResume ReadBlockCte(clio::run::u64 dir, clio::run::u32 k,
-                                     InodeTableBlock *out, int &rc);
+                                     InodeTableBlock *out, int &rc,
+                                     BlockLogInfo *log = nullptr);
   /**
    * issue #1322: read a block straight from the container that stood in for
    * this (returning) home: the first live successor. Its copy is newer than
@@ -636,16 +655,17 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume ReadBlockStandIn(clio::run::u64 dir, clio::run::u32 k,
                                          InodeTableBlock *out, int &rc);
   /**
-   * Store a block image in its CTE blob, padded to a power of two, on a
-   * non-volatile tier when one accepts it (else RAM). With the directory
-   * journal on this is the replicated mirror a stand-in reads (#1263).
+   * Store a planned write in a block's CTE blob, on a non-volatile tier when
+   * one accepts it (else RAM). An image replaces the blob (kCtePutReplace);
+   * a delta frame is appended (kCtePutAppend), and must land at
+   * expect_end_, or the log is no longer the one this home wrote.
    * @param dir packed directory id
    * @param k block index
-   * @param image EncodeTableBlock(block, true)
+   * @param blob the write
    * @param rc 0, ENOSPC (store full) or EIO
    */
   clio::run::TaskResume PutBlockCte(clio::run::u64 dir, clio::run::u32 k,
-                                    const std::string &image, int &rc);
+                                    BlockBlobWrite &blob, int &rc);
   /**
    * Open this container's directory journal, then replay it (restart) or
    * empty it (fresh start). Leaves dir_journal_ false when `path` is empty
@@ -692,17 +712,57 @@ class Runtime : public clio::run::Container {
   int JournalDropBlock(clio::run::u64 dir, clio::run::u32 k);
   /**
    * At the start of a commit (ns_mu_ held): take what this commit must make
-   * durable. CTE blobs: the image when the block changed durably. Journal:
-   * the whole image for a block with none journaled yet, else the deltas.
+   * durable. CTE blob: one image when a full image is due (see
+   * blob_image_due_), else the commit's delta batch appended as one frame.
+   * Journal: the whole image for a block with none journaled yet, else the
+   * deltas.
    * @param slot the block (home)
    * @param deltas the changes this commit pushes
-   * @param image receives the CTE blob image (empty: none)
+   * @param blob receives the CTE blob write (empty bytes: none)
    * @param jtype receives the journal record type
    * @param jrec receives the journal record (empty: none)
    */
   void TakePersistLocked(TableBlockSlot &slot, const std::vector<TableDelta> &deltas,
-                         std::string *image, FsLogRec *jtype,
+                         BlockBlobWrite *blob, FsLogRec *jtype,
                          std::string *jrec);
+  /**
+   * Choose the CTE blob write for a commit (ns_mu_ held): the delta batch as
+   * an append while the log stays within dir_log_compact_bytes_, else one
+   * image frame that replaces the blob.
+   * @param slot the block (home)
+   * @param deltas the commit's delta batch (non-empty unless image_due)
+   * @param image_due true when a full image is required regardless
+   * @param blob receives the write
+   */
+  void PlanBlobWriteLocked(TableBlockSlot &slot,
+                           const std::vector<TableDelta> &deltas,
+                           bool image_due, BlockBlobWrite *blob);
+  /**
+   * Record the outcome of a commit's writes (ns_mu_ held): a successful blob
+   * write advances the slot's log bookkeeping; a failed one, or a mirror the
+   * store could not take, makes the next commit write a full image.
+   * @param slot the block (home)
+   * @param blob the write the commit planned
+   * @param wrc 0, or the error the commit's writes returned
+   * @param mirror_failed true if the journal's replicated mirror was skipped
+   */
+  void SettleBlobWriteLocked(TableBlockSlot &slot, const BlockBlobWrite &blob,
+                             int wrc, bool mirror_failed);
+  /**
+   * Perform a commit's durable writes: with no journal, the blob write; with
+   * the journal, the journal record and then the blob mirror (#1263).
+   * @param dir packed directory id
+   * @param k block index
+   * @param blob the planned blob write
+   * @param jtype journal record type
+   * @param jrec journal record (empty: none)
+   * @param wrc receives 0 or the error (ENOSPC or EIO)
+   * @param mirror_failed receives true when only the mirror hit a full store
+   */
+  clio::run::TaskResume WriteCommitRecords(clio::run::u64 dir, clio::run::u32 k,
+                                           BlockBlobWrite &blob, FsLogRec jtype,
+                                           const std::string &jrec, int &wrc,
+                                           bool &mirror_failed);
   /**
    * Hand the replayed image of block (dir, k) to its home's first load.
    * @param dir packed directory id

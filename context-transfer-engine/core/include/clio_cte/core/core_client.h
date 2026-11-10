@@ -1629,6 +1629,9 @@ class Client : public clio::run::ContainerClient {
         auto old = entry->fut_.template Cast<PutBlobTask>();
         PutBlobTask *ot = old.get();
         if (!ot->segments_.empty()) return;  // vectored: not resent here
+        // An append is NOT idempotent: a lost one may have landed, and a
+        // resend would add its bytes a second time. Surface the loss instead.
+        if (ot->flags_ & kCtePutAppend) return;
         HLOG(kWarning, "write-behind put lost its owner node in flight; "
              "resending (attempt {})", attempt + 1);
         std::this_thread::sleep_for(kWait);
@@ -1840,8 +1843,12 @@ class Client : public clio::run::ContainerClient {
    *        before submitting, await oldest puts until at most this much
    *        payload remains in flight. 0 (default) = no wall — bounded only
    *        by shared memory itself.
+   * kCtePutAppend is NOT accepted here: deferred puts coalesce into batches
+   * that carry no per-record flags, and a deferred put returns no future, so
+   * the landed offset could never be read back. Use AsyncPutBlob.
    * @return 0 submitted; -1 degenerate request (size 0 / null source); -2
-   *         shared memory exhausted with nothing left to await.
+   *         shared memory exhausted with nothing left to await; -3 the flags
+   *         ask for an append, which this path cannot honour.
    */
   int AsyncPutBlobDefer(
       const TagId &tag_id, const std::string &blob_name, clio::run::u64 offset,
@@ -1851,6 +1858,9 @@ class Client : public clio::run::ContainerClient {
       clio::run::u64 max_inflight_bytes = 0) {
     if (size == 0 || priv_data == nullptr) {
       return -1;
+    }
+    if (flags & kCtePutAppend) {
+      return -3;
     }
     if (max_inflight_bytes != 0) {
       AwaitPutsUntilSpace(max_inflight_bytes);

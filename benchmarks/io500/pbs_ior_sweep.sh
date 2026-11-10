@@ -28,5 +28,5 @@ while read -r tag vars; do
   # shellcheck disable=SC2086
   env MODE=cliofs BENCH=ior CACHE=0 PERSIST=volatile FUSE_PROFILE=0 \
       RUN_TAG="$tag" $vars bash "$HERE/pbs_io500_aurora.sh" < /dev/null 2>&1 \
-    | grep -E 'IORCELL|===|FAILED|rc='
+    | grep -E 'IORCELL|MDCELL|===|FAILED|rc='
 done <<< "$CONFIGS"

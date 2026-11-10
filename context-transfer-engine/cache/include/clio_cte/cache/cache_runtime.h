@@ -145,9 +145,13 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * An owner-local blob runs the put inline on the next pool (the put IS the
    * authoritative write). A remote-owned blob gets only the authoritative
    * put(s) to the owner chain: no origin registration, no VERIFY_COMPLETE,
-   * no local delete tail.
+   * no local delete tail. Also the path for kCtePutAppend puts: an append's
+   * position is only known to the owner, so no node-local copy can be written
+   * at a guessed offset. Any registered local copy is dropped by the owner's
+   * invalidation, which completes before the authoritative put returns.
    * @param task The put task. Its return code and OUT context are set on
-   *             completion, matching the full write-through path.
+   *             completion, matching the full write-through path; for an
+   *             append its offset_ is the landed offset.
    * @return Coroutine resume token.
    */
   clio::run::TaskResume PutBlobMdOnly(

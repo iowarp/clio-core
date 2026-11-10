@@ -163,6 +163,12 @@ EOF
       default_target_timeout_ms: 30000
       poll_period_ms: 5000
 EOF
+  # DIR_LOG_COMPACT sets dir_log_compact_bytes: how much a directory block's
+  # blob may grow by appended deltas before it is rewritten as one image
+  # (unset = the module default; 0 = rewrite the whole block every commit).
+  # META_LOG=1 gives the filesystem module a node-local directory journal
+  # (metadata_log_path). Without it every create and delete rewrites its
+  # whole directory block as a CTE blob before it is acknowledged.
   # CACHE=1 (default): filesystem -> stream -> cache -> core. The cache
   # module keeps a node-local raw copy (tiers scoring >= min_score) next to
   # the authoritative copy on the blob's hash-owner node, so every byte is
@@ -195,6 +201,8 @@ EOF
     pool_query: local
     pool_id: "560.0"
     next_pool_id: "$NEXT"
+$( [ "${META_LOG:-0}" = 1 ] && echo "    metadata_log_path: \"$LR/meta/cfs_namespace_log\"" )
+$( [ -n "${DIR_LOG_COMPACT:-}" ] && echo "    dir_log_compact_bytes: \"$DIR_LOG_COMPACT\"" )
 EOF
   # Per-node bring-up runs for the whole job in the background; it writes
   # $OUT/ready/<host> once the mount answers and tears down on $OUT/stop.
@@ -289,6 +297,33 @@ if [ "${BENCH:-io500}" = ior ]; then
     rc=$?
     echo "IORCELL tag=${RUN_TAG:-none} nodes=$NN phase=$ph rc=$rc $(grep -E '^(write|read) ' "ior-easy-$ph.txt" | awk '{print "MiB/s=" $2, "open_s=" $7, "io_s=" $8, "close_s=" $9}')"
   done
+elif [ "${BENCH:-io500}" = mdtest ]; then
+  # BENCH=mdtest: create then delete, for the per-rank-directory layout
+  # (IO500 mdtest-easy) and the single shared directory (mdtest-hard).
+  # PROFILE=1 samples thread CPU and stacks on this node during each delete.
+  MDT=${MDT:-$(dirname "$IO500")/bin/mdtest}
+  run_md() {  # <tag> <phase flag> <layout args...>
+    local tag=$1 fl=$2; shift 2
+    mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
+      "$MDT" -n "$MD_N" -F -N 1 -P "$fl" "$@" -a POSIX > "mdtest-$tag.txt" 2>&1
+    echo "MDCELL tag=${RUN_TAG:-none} nodes=$NN phase=$tag rc=$? $(grep -E 'File (creation|removal)' "mdtest-$tag.txt" | awk '{print $1 "_" $2 "_per_s=" $4}' | tr '\n' ' ')"
+  }
+  mkdir -p "$DATADIR/md-easy" "$DATADIR/md-hard" 2>/dev/null
+  run_md easy-create -C -u -L -d "$DATADIR/md-easy"
+  SP=
+  [ "${PROFILE:-0}" = 1 ] && { bash "$HERE/sample_stacks.sh" "$OUT/prof_easy_delete" \
+    "${PROFILE_DELAY:-2}" "${PROFILE_N:-12}" > /dev/null 2>&1 & SP=$!; }
+  run_md easy-delete -r -u -L -d "$DATADIR/md-easy"
+  # Only the sampler: a bare `wait` would also wait for the node scripts,
+  # which run until the job tears down (this hung two jobs).
+  [ -n "$SP" ] && wait "$SP"
+  run_md hard-create -C -t -w 3901 -e 3901 -d "$DATADIR/md-hard"
+  SP=
+  [ "${PROFILE:-0}" = 1 ] && { bash "$HERE/sample_stacks.sh" "$OUT/prof_hard_delete" \
+    "${PROFILE_DELAY:-2}" "${PROFILE_N:-12}" > /dev/null 2>&1 & SP=$!; }
+  run_md hard-delete -r -t -w 3901 -e 3901 -d "$DATADIR/md-hard"
+  [ -n "$SP" ] && wait "$SP"
+  rc=0
 else
 echo "=== IO500 start $(date)"
 mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \

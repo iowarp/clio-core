@@ -134,7 +134,7 @@ clio::run::u32 Runtime::BlockHome(clio::run::u64 dir, clio::run::u32 k) {
 
 clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
                                              clio::run::u32 k, InodeTableBlock *out,
-                                             int &rc) {
+                                             int &rc, BlockLogInfo *log) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   // Before the journal is replayed, "not in the journal" means nothing.
@@ -183,7 +183,7 @@ clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
     rc = 0;
     CLIO_CO_RETURN;
   }
-  CLIO_CO_AWAIT(ReadBlockCte(dir, k, out, rc));
+  CLIO_CO_AWAIT(ReadBlockCte(dir, k, out, rc, log));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -250,7 +250,7 @@ clio::run::TaskResume Runtime::ReadBlockStandIn(clio::run::u64 dir,
                                bytes.data(), q);
     CLIO_CO_AWAIT(g);
     if (g->GetReturnCode() != 0) CLIO_CO_RETURN;
-    if (!DecodeTableBlock(bytes.data(), bytes.size(), out) ||
+    if (!DecodeBlockLog(bytes.data(), bytes.size(), out, nullptr) ||
         out->dir_ != dir || out->index_ != k) {
       CLIO_CO_RETURN;
     }
@@ -262,7 +262,8 @@ clio::run::TaskResume Runtime::ReadBlockStandIn(clio::run::u64 dir,
 
 clio::run::TaskResume Runtime::ReadBlockCte(clio::run::u64 dir,
                                             clio::run::u32 k,
-                                            InodeTableBlock *out, int &rc) {
+                                            InodeTableBlock *out, int &rc,
+                                            BlockLogInfo *log) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   bool ready = false;
@@ -300,11 +301,12 @@ clio::run::TaskResume Runtime::ReadBlockCte(clio::run::u64 dir,
       CLIO_CO_RETURN;
     }
   }
-  // A block that shrank leaves stale bytes past its end; the codec stops at
-  // the encoded length.
+  // The blob is an image frame, possibly followed by delta frames (see
+  // fs_block_log.h); a bare image from an earlier clio-fs is read as before.
+  BlockLogInfo scan;
   if (g->GetReturnCode() != 0 ||
-      !DecodeTableBlock(bytes.data(), bytes.size(), out) || out->dir_ != dir ||
-      out->index_ != k) {
+      !DecodeBlockLog(bytes.data(), bytes.size(), out, &scan) ||
+      out->dir_ != dir || out->index_ != k) {
     if (g->GetReturnCode() == 0 && IsOldDirBlock(bytes.data(), bytes.size())) {
       HLOG(kError, "filesystem: directory {} was written by an older clio-fs "
            "(directory format CDB1); this volume must be recreated", dir);
@@ -312,6 +314,8 @@ clio::run::TaskResume Runtime::ReadBlockCte(clio::run::u64 dir,
       HLOG(kError, "filesystem: inode-table block {}/{} unreadable", dir, k);
     }
     rc = EIO;
+  } else if (log != nullptr) {
+    *log = scan;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -319,29 +323,20 @@ clio::run::TaskResume Runtime::ReadBlockCte(clio::run::u64 dir,
 
 clio::run::TaskResume Runtime::WriteBlockBlob(clio::run::u64 dir,
                                               clio::run::u32 k,
-                                              const std::string &image,
-                                              int &rc) {
+                                              BlockBlobWrite &blob, int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   while (!dir_ready_.load(std::memory_order_acquire)) {
     CLIO_CO_AWAIT(clio::run::yield(1000.0));
   }
-  if (dir_journal_) {
-    rc = JournalAppend(FsLogRec::kBlockImage, image);
-    if (rc != 0) CLIO_CO_RETURN;
-  }
-  // With the journal on, the CTE blob is the replicated mirror a stand-in
-  // reads while this node is down (#1263); the change is acknowledged only
-  // once both are written.
-  CLIO_CO_AWAIT(PutBlockCte(dir, k, image, rc));
+  CLIO_CO_AWAIT(PutBlockCte(dir, k, blob, rc));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::PutBlockCte(clio::run::u64 dir,
                                            clio::run::u32 k,
-                                           const std::string &image,
-                                           int &rc) {
+                                           BlockBlobWrite &blob, int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   bool ready = false;
@@ -351,30 +346,30 @@ clio::run::TaskResume Runtime::PutBlockCte(clio::run::u64 dir,
     CLIO_CO_RETURN;
   }
   const clio::cte::core::TagId tag = FsUnpack(dir);
-  // Pad to a power of two (>= 4 KiB). Every create grows the image a little;
-  // a blob rewritten at a slightly larger size each time gains one more small
-  // extent per write, and every rewrite then touches all of them (creates
-  // slowed linearly with directory size). Padded, the blob only changes size
-  // a few times and stays a few extents. The codec ignores the padding.
-  size_t cap = 4096;
-  while (cap < image.size()) cap <<= 1;
-  std::string padded = image;
-  padded.resize(cap, '\0');
+  // An image replaces the blob, so a log that shrank leaves no stale bytes.
+  // A frame is appended at the blob's current end, which must be where this
+  // home left the log (checked below). Images used to be padded to a power of
+  // two (>= 4 KiB) so a blob rewritten slightly larger each commit did not
+  // gain a small extent per write. That padding is gone: frames must be
+  // contiguous, and the compaction threshold (dir_log_compact_bytes) now
+  // bounds how many extents a log accumulates between images.
+  const clio::run::u32 flags = blob.append_ ? clio::cte::core::kCtePutAppend
+                                            : clio::cte::core::kCtePutReplace;
   // The level THIS put asked for decides whether it retries. Reading
   // inode_volatile_only_ again after the await let another task's
   // successful fallback (which sets it) cancel this task's retry: its
   // refused non-volatile put then surfaced as a failed mkdir/create (rc 12;
   // IO500 mdtest at 64 and 256 nodes).
   const bool asked_volatile = inode_volatile_only_;
-  auto p = cte_.AsyncPutBlob(tag, TableBlockName(k), 0, padded.size(),
-                             padded.data(), -1.0f,
-                             MetaCtx(asked_volatile), 0u,
+  auto p = cte_.AsyncPutBlob(tag, TableBlockName(k), 0, blob.bytes_.size(),
+                             blob.bytes_.data(), -1.0f,
+                             MetaCtx(asked_volatile), flags,
                              clio::run::PoolQuery::Dynamic());
   CLIO_CO_AWAIT(p);
   if (p->GetReturnCode() != 0 && !asked_volatile) {
     // No non-volatile tier accepts it: keep it in RAM (lost on restart).
-    p = cte_.AsyncPutBlob(tag, TableBlockName(k), 0, padded.size(),
-                          padded.data(), -1.0f, MetaCtx(true), 0u,
+    p = cte_.AsyncPutBlob(tag, TableBlockName(k), 0, blob.bytes_.size(),
+                          blob.bytes_.data(), -1.0f, MetaCtx(true), flags,
                           clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(p);
     if (p->GetReturnCode() == 0) {
@@ -382,6 +377,15 @@ clio::run::TaskResume Runtime::PutBlockCte(clio::run::u64 dir,
            "directories do not survive a restart");
       inode_volatile_only_ = true;
     }
+  }
+  if (p->GetReturnCode() == 0 && blob.append_ &&
+      p->offset_ != blob.expect_end_) {
+    // Someone else wrote to the blob since this home last did: the frame is
+    // at the wrong place, so the commit fails and the next one writes an image.
+    HLOG(kError, "filesystem: inode-table block {}/{} log append landed at {} "
+         "but this home left it at {}", dir, k, p->offset_, blob.expect_end_);
+    rc = EIO;
+    CLIO_CO_RETURN;
   }
   if (p->GetReturnCode() != 0) {
     HLOG(kError, "filesystem: writing inode-table block {}/{} failed (rc {})",
@@ -578,7 +582,7 @@ void Runtime::DropHomeBlocksAfterFailover() {
         continue;
       }
       if (s.committing_ || s.splitting_ || s.persist_dirty_ ||
-          !s.unpushed_.empty()) {
+          s.blob_image_due_ || !s.unpushed_.empty()) {
         ++kept;
         ++it;
         continue;
@@ -672,7 +676,8 @@ clio::run::TaskResume Runtime::LoadHomeBlock(clio::run::u64 dir,
   lrc = 0;
   const TableBlockKey key{dir, k};
   SetLoadStage(key, "home load: reading the block blob (GetBlobSize/GetBlob)");
-  CLIO_CO_AWAIT(ReadBlockBlob(dir, k, &slot->blk_, lrc));
+  BlockLogInfo log;
+  CLIO_CO_AWAIT(ReadBlockBlob(dir, k, &slot->blk_, lrc, &log));
   if (TraceDirBlock()) {
     HLOG(kWarning, "[DIRBLOCK] home load {}/{} on container {}: rc {} "
          "version {} rows {}", dir, k, container_id_, lrc,
@@ -680,6 +685,13 @@ clio::run::TaskResume Runtime::LoadHomeBlock(clio::run::u64 dir,
   }
   // Loaded from the journal: its deltas build on the image there.
   slot->journal_image_ = lrc != 0;
+  // The first commit writes a full image instead of a frame when the blob
+  // cannot simply be extended: the journal is authoritative and the blob may
+  // lag it, the load failed, or the blob holds more than one frame or an old
+  // bare image. That commit compacts it; the load itself writes nothing.
+  slot->blob_image_due_ = dir_journal_ || lrc != 0 || log.NeedsImage();
+  slot->blob_log_bytes_ = log.DeltaBytes();
+  slot->blob_end_ = log.valid_bytes_;
   if (lrc == ENOENT && dir == FsPack(FsRootId()) && k == 0) {
     // "/" exists by definition: its home materializes its table on first
     // use (its inode record is materialized by its own home, EnsureInode).
@@ -704,12 +716,14 @@ clio::run::TaskResume Runtime::LoadHomeBlock(clio::run::u64 dir,
     slot->blk_.version_ += kIncarnationStride;
     int wrc = 0;
     SetLoadStage(key, "home load: persisting the incarnation jump (PutBlob)");
-    CLIO_CO_AWAIT(WriteBlockBlob(dir, k, EncodeTableBlock(slot->blk_, true),
-                                 wrc));
-    if (wrc != 0) {
-      slot->persist_dirty_ = true;  // the next commit retries
-      slot->journal_image_ = true;
+    BlockBlobWrite image = MakeImageWrite(slot->blk_);
+    if (dir_journal_) {
+      wrc = JournalAppend(FsLogRec::kBlockImage,
+                          EncodeTableBlock(slot->blk_, true));
     }
+    if (wrc == 0) CLIO_CO_AWAIT(WriteBlockBlob(dir, k, image, wrc));
+    // The jump is an image, so it also compacts whatever log the blob held.
+    SettleBlobWriteLocked(*slot, image, wrc, false);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -1028,15 +1042,75 @@ void Runtime::PushTargetsLocked(const TableBlockSlot &slot, bool resync,
   }
 }
 
+namespace {
+/**
+ * Log a block commit that took longer than kSlowBlockOpS.
+ * @param dir packed directory id
+ * @param k block index
+ * @param t0 when the commit's writes started
+ * @param holders number of containers the commit pushed to
+ * @param resync true if the commit pushed a snapshot to every container
+ */
+void WarnIfSlowCommit(clio::run::u64 dir, clio::run::u32 k,
+                      std::chrono::steady_clock::time_point t0, size_t holders,
+                      bool resync) {
+  const double took = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - t0).count();
+  if (took > kSlowBlockOpS) {
+    HLOG(kWarning, "filesystem: committing inode-table block {}/{} took "
+         "{} ms ({} holders{})", dir, k,
+         static_cast<clio::run::u64>(took * 1000.0), holders,
+         resync ? ", resync" : "");
+  }
+}
+}  // namespace
+
+clio::run::TaskResume Runtime::WriteCommitRecords(
+    clio::run::u64 dir, clio::run::u32 k, BlockBlobWrite &blob, FsLogRec jtype,
+    const std::string &jrec, int &wrc, bool &mirror_failed) {
+  CLIO_TASK_BODY_BEGIN
+  wrc = 0;
+  mirror_failed = false;
+  if (!dir_journal_) {
+    // The blob is the only persistence.
+    if (!blob.bytes_.empty()) CLIO_CO_AWAIT(WriteBlockBlob(dir, k, blob, wrc));
+    CLIO_CO_RETURN;
+  }
+  // With the journal, the record is journaled first and the blob is the
+  // replicated mirror a stand-in reads while this node is down (#1263); the
+  // change is acknowledged only once both are written.
+  if (!jrec.empty()) wrc = JournalAppend(jtype, jrec);
+  if (wrc == 0 && !blob.bytes_.empty()) {
+    int mrc = 0;
+    CLIO_CO_AWAIT(WriteBlockBlob(dir, k, blob, mrc));
+    if (mrc == ENOSPC) {
+      // The change is durable in this node's journal; only the replicated
+      // mirror a stand-in would read is behind. Failing the operation for
+      // that made unlink/rmdir on a full store fail ENOSPC -- the one way
+      // to free space. Succeed, and write the mirror at the next commit
+      // (a full image, see SettleBlobWriteLocked). The cost: a stand-in
+      // serving this block before that sees it without this change.
+      mirror_failed = true;
+      HLOG(kWarning, "filesystem: inode-table block {}/{} change is "
+           "journaled but its replicated mirror could not be written "
+           "(store full); retried at the next commit", dir, k);
+    } else {
+      wrc = mrc;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
                                            clio::run::u64 version, int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   for (;;) {
     std::vector<TableDelta> deltas;
-    std::string image, jrec;
+    BlockBlobWrite blob;  // what the blob gets: an image or an appended frame
+    std::string jrec;
     FsLogRec jtype = FsLogRec::kBlockDeltas;
-    std::string mirror;  // full image for the CTE copy of a journaled delta
     std::vector<clio::run::u32> holders;
     std::vector<clio::run::u64> leases;  // parallel to holders
     std::map<clio::run::u32, clio::run::u64> reg;  // registrations pushed to
@@ -1058,13 +1132,7 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
                slot->home_);
         }
         deltas.swap(slot->unpushed_);
-        TakePersistLocked(*slot, deltas, &image, &jtype, &jrec);
-        // A journaled delta lives only in this node's journal: mirror the
-        // block's whole current image to its replicated CTE blob too, so a
-        // stand-in can serve it while this node is down (#1263).
-        if (dir_journal_ && image.empty() && !jrec.empty()) {
-          mirror = EncodeTableBlock(slot->blk_, true);
-        }
+        TakePersistLocked(*slot, deltas, &blob, &jtype, &jrec);
         reg = slot->holders_;
         if (slot->holders_unknown_) {
           resync = true;
@@ -1079,27 +1147,17 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
       continue;
     }
     int wrc = 0;
-    const auto commit_t0 = std::chrono::steady_clock::now();
-    if (!image.empty()) CLIO_CO_AWAIT(WriteBlockBlob(dir, k, image, wrc));
-    if (wrc == 0 && !jrec.empty()) wrc = JournalAppend(jtype, jrec);
     bool mirror_failed = false;
-    if (wrc == 0 && !mirror.empty()) {
-      int mrc = 0;
-      CLIO_CO_AWAIT(PutBlockCte(dir, k, mirror, mrc));
-      if (mrc == ENOSPC) {
-        // The change is durable in this node's journal; only the replicated
-        // mirror a stand-in would read is behind. Failing the operation for
-        // that made unlink/rmdir on a full store fail ENOSPC -- the one way
-        // to free space. Succeed, and rewrite the mirror at the next commit
-        // (persist_dirty_). The cost: a stand-in serving this block before
-        // that sees it without this change.
-        mirror_failed = true;
-        HLOG(kWarning, "filesystem: inode-table block {}/{} change is "
-             "journaled but its replicated mirror could not be written "
-             "(store full); retried at the next commit", dir, k);
-      } else {
-        wrc = mrc;
-      }
+    const auto commit_t0 = std::chrono::steady_clock::now();
+    CLIO_CO_AWAIT(WriteCommitRecords(dir, k, blob, jtype, jrec, wrc,
+                                     mirror_failed));
+    if (TraceDirBlock()) {
+      HLOG(kWarning, "[DIRBLOCK] commit {}/{} wrote {} of {} bytes (rc {})",
+           dir, k,
+           blob.bytes_.empty() ? "no blob"
+                               : (blob.append_ ? "a delta frame (appended)"
+                                               : "an image (replaced blob)"),
+           blob.bytes_.size(), wrc);
     }
     std::vector<clio::run::u32> gone;
     if (!deltas.empty() && !holders.empty()) {
@@ -1107,16 +1165,7 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
       pr.str_ = EncodeTableDeltas(deltas);
       CLIO_CO_AWAIT(PushToHolders(kTablePush, pr, holders, leases, &gone));
     }
-    {
-      const double took = std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - commit_t0).count();
-      if (took > kSlowBlockOpS) {
-        HLOG(kWarning, "filesystem: committing inode-table block {}/{} took "
-             "{} ms ({} holders{})", dir, k,
-             static_cast<clio::run::u64>(took * 1000.0), holders.size(),
-             resync ? ", resync" : "");
-      }
-    }
+    WarnIfSlowCommit(dir, k, commit_t0, holders.size(), resync);
     {
       std::lock_guard<std::mutex> g(ns_mu_);
       if (resync) {
@@ -1134,12 +1183,7 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
         }
       }
       DropGoneHolders(gone, reg, &slot->holders_, &slot->holder_lease_ms_);
-      if (wrc != 0) {
-        slot->persist_dirty_ = true;  // the next commit retries
-        slot->journal_image_ = true;  // these deltas never reached it
-      } else if (mirror_failed) {
-        slot->persist_dirty_ = true;  // rewrite the mirror next time
-      }
+      SettleBlobWriteLocked(*slot, blob, wrc, mirror_failed);
       slot->durable_version_ = v;
       slot->committing_ = false;
     }
@@ -1432,6 +1476,7 @@ clio::run::TaskResume Runtime::SplitBlock(std::shared_ptr<TableBlockSlot> slot) 
         dl.ops_.push_back({leaf, false, InodeRow()});
       }
       b.depth_ = d + 1;
+      slot->blob_image_due_ = true;  // a split rewrites the block whole
       v = RecordChangeLocked(*slot, dl, true);
     }
     slot->splitting_ = false;
@@ -1461,6 +1506,7 @@ clio::run::TaskResume Runtime::InstallBlock(const FsReq &req, FsResp &resp) {
   }
   slot->home_ = true;
   slot->persist_dirty_ = true;
+  slot->blob_image_due_ = true;
   {
     std::lock_guard<std::mutex> g(ns_mu_);
     // A leftover from an earlier failed split of the same block is replaced.
@@ -1501,6 +1547,7 @@ clio::run::TaskResume Runtime::CreateTable(const FsReq &req, FsResp &resp) {
   b.mtime_ = NowNs();
   slot->home_ = true;
   slot->persist_dirty_ = true;
+  slot->blob_image_due_ = true;
   {
     std::lock_guard<std::mutex> g(ns_mu_);
     blocks_[TableBlockKey{b.dir_, 0}] = slot;
@@ -1556,6 +1603,7 @@ clio::run::TaskResume Runtime::SealBlock(const FsReq &req, FsResp &resp) {
       }
     } else if (b.sealed_ != seal) {
       b.sealed_ = seal;
+      slot->blob_image_due_ = true;  // seal/unseal rewrites the block whole
       v = RecordChangeLocked(*slot, TableDelta(), false);
     }
   }
