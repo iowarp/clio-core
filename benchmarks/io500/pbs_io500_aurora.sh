@@ -45,6 +45,18 @@ DAOS_CONT=${DAOS_CONT:-io500_cliofs}
 FLARE=${FLARE:-/lus/flare/projects/IOWarp/llogan/io500}
 HERE=/home/llogan/clio-core/benchmarks/io500
 
+# Ask the per-node scripts to tear down and wait at most DOWN_WAIT seconds:
+# at 256 nodes a teardown that never finished held the whole allocation
+# for ten minutes after the benchmark had already failed.
+stop_nodes() {
+  touch stop
+  for _ in $(seq 1 "${DOWN_WAIT:-180}"); do
+    kill -0 "$NODES_PID" 2>/dev/null || return 0
+    sleep 1
+  done
+  echo "=== teardown still running after ${DOWN_WAIT:-180} s; ending the job"
+  kill "$NODES_PID" 2>/dev/null
+}
 NN=$(sort -u "$PBS_NODEFILE" | wc -l)
 NP=$(( NN * PPN ))
 # Per-node share of the dataset in MB: ior-easy + ior-hard + mdtest-hard
@@ -181,7 +193,7 @@ EOF
   echo "=== clio-fs up on $up/$NN nodes"
   if [ "$up" -lt "$NN" ]; then
     echo "clio-fs bring-up FAILED"; tail -40 logs/node_up.log
-    touch stop; wait $NODES_PID; exit 3
+    stop_nodes; exit 3
   fi
   # SETTLE: seconds to wait after every mount answers. At 64 nodes pool
   # creation was still in progress on some nodes when IO500 started.
@@ -204,7 +216,7 @@ elif [ "$MODE" = daos ]; then
   echo "=== dfuse up on $up/$NN nodes"
   if [ "$up" -lt "$NN" ]; then
     echo "dfuse bring-up FAILED"; tail -40 logs/node_up.log
-    touch stop; wait $NODES_PID; exit 3
+    stop_nodes; exit 3
   fi
   DATADIR=/tmp/$USER/daos_io500/data/daos_${NN}n_$JOB
 else
@@ -268,10 +280,10 @@ echo "IO500CELL mode=$MODE nodes=$NN ppn=$PPN rc=$rc $(grep -h '^\[SCORE' result
 fi
 
 if [ "$MODE" = cliofs ]; then
-  touch stop; wait $NODES_PID
+  stop_nodes
   rm -rf "$FLARE/tiers/$JOB"
 elif [ "$MODE" = daos ]; then
-  touch stop; wait $NODES_PID
+  stop_nodes
 else
   rm -rf "$DATADIR"
 fi
