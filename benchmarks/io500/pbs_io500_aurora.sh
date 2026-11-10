@@ -78,6 +78,10 @@ sort -u "$PBS_NODEFILE" > hostfile
 echo "=== IO500 mode=$MODE nodes=$NN ppn=$PPN stonewall=$STONEWALL out=$OUT"
 echo "=== commit $(git -C /home/llogan/clio-core rev-parse --short HEAD) $(git -C /home/llogan/clio-core status --porcelain -uno | wc -l) dirty files"
 
+# The launcher pings every node and aborts the job when one does not answer.
+# Under the dfuse mdtest load at 64 and 256 nodes a node stayed silent for
+# ~100 s and both DAOS runs were killed in mdtest-easy-write.
+export PALS_PING_PERIOD=${PALS_PING_PERIOD:-120} PALS_RPC_TIMEOUT=${PALS_RPC_TIMEOUT:-900}
 export PATH=/soft/daos/bin:$PATH DAOS_AGENT_DRPC_DIR=/run/daos_agent_oneScratch
 # Same fabric settings as `module load daos` (without them dfuse failed DER_HG).
 export FI_CXI_RX_MATCH_MODE=hybrid FI_MR_CACHE_MONITOR=kdreg2 \
