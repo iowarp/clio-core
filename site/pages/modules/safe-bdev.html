@@ -1,0 +1,262 @@
+<!--
+title: Safe block device (safe-bdev)
+heading: The erasure-coded block device (<em>safe-bdev</em>)
+description: Reference for clio_safe_bdev, the Reed-Solomon block device that aggregates ordinary bdev pools: layout, composition, adding members at runtime, removal and rebuild, mixed member sizes, crash consistency and tests.
+eyebrow: Modules · Storage
+lede: A safe-bdev looks like a bdev to everything above it, but spreads its bytes over several member bdevs and keeps Reed-Solomon parity so the array survives up to max_failures member failures. Members can be added while the array is in use, a failed member is rebuilt onto a replacement, and the whole state survives a restart.
+facts: Library | clio_safe_bdev ; Source | context-runtime/modules/safe-bdev ; Code | Cauchy Reed-Solomon over GF(2^8) ; Tests | cr_all_safe_bdev_tests and siblings
+-->
+<h2>What it does</h2>
+<p>The module reuses the bdev task types for its data plane, so a CTE or any
+other bdev client can use it without change: AllocateBlocks, FreeBlocks,
+Write, Read, GetStats and Sync carry the same method IDs as in
+<a href="/modules/bdev.html">bdev</a>. On top of those it adds management
+operations:</p>
+<ul>
+  <li><strong>AddBdev</strong> appends a member as a data column or, with the
+  parity flag, as a parity column.</li>
+  <li><strong>RemoveBdev</strong> marks a member faulty or cleanly removed.
+  Nothing is copied; reads reconstruct around it.</li>
+  <li><strong>RecoverBdev</strong> seats a replacement pool in a failed
+  member's position and rebuilds that member's chunks onto it.</li>
+  <li><strong>BuildParity</strong> re-encodes stripes whose parity is stale.
+  It is registered as a periodic task every 50 ms.</li>
+  <li><strong>FlushAllocLog</strong> flushes and compacts the allocator log,
+  also periodic at 50 ms.</li>
+</ul>
+<p>Use it when a CTE tier must outlive a disk. For a tier that only needs to
+survive a node, see <a href="/modules/replication.html">replication</a> and
+<a href="/design/durability.html">the durability design</a>.</p>
+
+<h2>Where it sits</h2>
+<p>The array is a pool composed after its member bdev pools and before the
+CTE that uses it. The CTE attaches to it as an existing pool rather than
+creating a bdev. The array calls each member through an ordinary bdev client.
+With <code>distributed: true</code> members live on the nodes their
+<code>node_id</code> names, the array runs on the first member's node, and
+management tasks sent to any other node's container return an error code
+telling the caller to route to the home node.</p>
+
+<h2>Composing an array</h2>
+<p>This is the integration-test configuration: three file members as data,
+with a parity member added at startup through AddBdev. The order matters,
+because each member must exist before the array that names it.</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_bdev
+    pool_name: "/mnt/bdev0.dat"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: file
+    capacity: "256MB"
+    alloc_log: "/mnt/bdev0.alog"
+  # ... bdev1 at 302.0 and bdev2 at 303.0 the same way ...
+
+  - mod_name: clio_safe_bdev
+    pool_name: "safe0"
+    pool_query: local
+    pool_id: "350.0"
+    max_failures: 1
+    alloc_log: "/mnt/safe0.alog"
+    members:
+      - pool_name: "/mnt/bdev0.dat"
+        node_id: 0
+        pool_id_major: 301
+        pool_id_minor: 0
+      - pool_name: "/mnt/bdev1.dat"
+        node_id: 0
+        pool_id_major: 302
+        pool_id_minor: 0
+      - pool_name: "/mnt/bdev2.dat"
+        node_id: 0
+        pool_id_major: 303
+        pool_id_minor: 0
+
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "safe0"
+        existing_pool_id: "350.0"
+        existing_pool_module: "clio_safe_bdev"
+        score: 1.0
+</pre>
+<p>A member entry may carry <code>parity: true</code> to seat it as a parity
+column at creation; the disk-failure tests compose four data and two parity
+members this way. Creation refuses more parity members than
+<code>max_failures</code>.</p>
+<h3>Configuration keys</h3>
+<dl class="notes">
+  <dt>max_failures</dt>
+  <dd>How many simultaneous member failures the array must tolerate, and the
+  most parity members it will accept. Default 1.</dd>
+  <dt>members</dt>
+  <dd>A sequence of <code>pool_name</code>, <code>node_id</code>,
+  <code>pool_id_major</code>, <code>pool_id_minor</code> and optional
+  <code>parity</code>. Members are referenced, not created.</dd>
+  <dt>alloc_log</dt>
+  <dd>Path of the array's write-ahead log. Empty disables all persistence.
+  When set, the member manifest lives at <code>&lt;alloc_log&gt;.members</code>
+  and the degraded-write journal at <code>&lt;alloc_log&gt;.journal</code>.</dd>
+  <dt>distributed</dt>
+  <dd>Default false. True routes member I/O to each member's node and faults
+  members whose node dies.</dd>
+  <dt>intent_sync</dt>
+  <dd>Default true: stripe intents are fsynced before any member write, so
+  parity stays consistent across a power loss. False hands intents to the
+  kernel only, which is consistent across a process crash but not a power
+  loss, and skips an fsync per small write.</dd>
+</dl>
+
+<h2>Layout</h2>
+<p>Every member is split into fixed 64 KiB chunks behind a 64 KiB superblock
+at offset 0 that records the array's identity, the member's role and its
+index. A data member's chunk for slot <em>s</em> is at byte
+<code>65536 + s × 65536</code>. The logical offset handed to callers encodes
+the location directly:</p>
+<pre data-label="cpp">
+chunk  = offset / 65536
+member = chunk / 2^32       // data column
+slot   = chunk % 2^32
+</pre>
+<p>There is no chunk map to persist. Each data member owns a band of 2^32
+slots, so held offsets stay valid when members are added, removed or
+recovered, because a member's index never changes.</p>
+<p>A <strong>stripe</strong> is slot <em>s</em> on every data member, whether
+or not the chunk is allocated, and its parity lives at slot <em>s</em> on
+every parity member. Parity row <em>j</em> is a Cauchy Reed-Solomon
+combination over GF(2^8) of all data columns, with coefficients that do not
+depend on the number of columns. Consequences:</p>
+<ul>
+  <li>A write updates parity from the change alone (old XOR new over the
+  written range) when the stripe is healthy and current; otherwise the stripe
+  is re-encoded whole.</li>
+  <li>Adding a data member adds a column of zeros, so existing parity stays
+  valid and nothing moves.</li>
+  <li>A freed chunk still counts in its stripe, so frees never touch parity
+  and recovery rebuilds every slot below the array's high-water mark, not
+  just live ones.</li>
+  <li>The number of data members plus <code>max_failures</code> must not
+  exceed 256, and each role holds at most 256 members.</li>
+</ul>
+<p>Parity is written before a write is acknowledged, under a per-stripe lock.
+Before any member write, the stripes it touches are logged as intents in the
+allocator log and, by default, fsynced. Once the parity is written the intents
+are cleared. After a crash, every stripe still holding an intent is marked
+dirty and re-encoded before it can be used for reconstruction. The log also
+records which data members were down when each write began, so a restart can
+tell a write that never landed from one that did.</p>
+
+<h2>Allocation and mixed sizes</h2>
+<p>Blocks are placed one chunk at a time, round-robin over the data members
+that still have room, each member filling to its own capacity. When a request
+has a chunk for every active member, a whole stripe is placed at once. Small
+concurrent writers are spread over distinct recent slots so they do not
+serialize on one stripe lock. Adjacent chunks on the same member are
+coalesced into one block, so a multi-chunk allocation usually comes back as
+several blocks.</p>
+<p>Members may differ in size. Each member's slot count comes from its own
+GetStats at creation or when added. Because every data slot needs a matching
+parity slot, each data member's usable slots are clamped to the smallest
+parity member's count, never below what it has already used. A parity member
+added later must hold at least as many slots as any data member has used, and
+a recovery replacement must hold at least the slots the failed member had
+used; otherwise the operation is refused. The array's capacity reported to
+the CTE is the sum of the active data members' clamped slots; a down member
+contributes only its live chunks.</p>
+
+<h2>Adding members at runtime</h2>
+<p>AddBdev takes a member pool name, node, pool ID and a parity flag. The
+command-line tool <code>clio_safe_bdev_recover --add data|parity</code>
+creates a file bdev and calls it, and the dashboard page under
+<code>viz/</code> offers the same action.</p>
+<ul>
+  <li><strong>As data.</strong> The member's superblock is read; a blank
+  member gets one written, and a member owned by another array is refused.
+  It joins the round-robin with a fresh column index. No data moves. If some
+  existing member reports a predicted lifetime under seven days, AddBdev
+  instead treats that member as failing and migrates it onto the new one.</li>
+  <li><strong>As parity.</strong> Refused once the parity count has reached
+  <code>max_failures</code>. Otherwise every written slot is marked dirty and
+  the background builder computes the new parity column off the critical
+  path.</li>
+</ul>
+<p>Each membership change appends a snapshot to the member manifest, which is
+compacted periodically.</p>
+
+<h2>Removal, failure and rebuild</h2>
+<ul>
+  <li><strong>Automatic faulting.</strong> A member I/O that fails with a
+  fatal device error (media error or vanished device) marks that member
+  faulty and persists the fact. A transient error, a full device or a
+  rejected range fails only that request. In a distributed array, a dead node
+  faults every member on it.</li>
+  <li><strong>RemoveBdev</strong> sets the member to faulty or removed. From
+  then on reads of its chunks decode from any <em>N</em> of the
+  <em>N + m</em> columns, reading only the byte range requested, and writes
+  keep its bytes in the parity. Writes to a stripe with a down member
+  reconstruct the stripe first and save the down column's chunk in the
+  journal so a crash mid-write cannot lose it.</li>
+  <li><strong>RecoverBdev</strong> replaces the failed member's client with the
+  new pool, marks it recovering in the manifest, and rebuilds every slot below
+  the array high-water mark: data members from survivors and parity, parity
+  members by re-encoding. Writes that arrive during the rebuild are redone
+  onto the replacement. The flag in the manifest means an interrupted rebuild
+  resumes at the next start. Progress counters are visible through
+  Monitor.</li>
+  <li><strong>Restart.</strong> Creation reopens the allocator log, replays
+  the member manifest and the per-member live slot sets, reads each member's
+  superblock and refuses one owned by a foreign array, seats members found
+  dead as down, and fails if more members are down than
+  <code>max_failures</code>. Beyond that budget a read returns an error, never
+  wrong bytes.</li>
+</ul>
+<p>Sync encodes every dirty stripe, syncs every active member, then fsyncs
+the log, so a plain bdev client's Sync on the array means durable and
+parity-protected.</p>
+
+<h2>Limits</h2>
+<ul>
+  <li>The chunk size is a compile-time constant of 64 KiB.</li>
+  <li>Without <code>alloc_log</code> there is no persistence: membership,
+  allocator state, intents and the journal are all disabled.</li>
+  <li>Parity placement is dedicated: parity members hold only parity.</li>
+  <li>A removed member keeps its index; there is no way to shrink the array
+  or reclaim a column.</li>
+  <li>The disk-failure tests are validated on Linux only.</li>
+</ul>
+<div class="callout">
+  <p>The design note <code>DESIGN-dynamic-view.md</code> in the module
+  directory describes variable-width stripes whose membership is derived from
+  live chunks. The implementation moved to fixed-width stripes over every data
+  column, as the runtime header documents, so the note's sections on stripe
+  width and mirror-then-widen behavior no longer match the code.</p>
+</div>
+
+<h2>How it is tested</h2>
+<p>Tests live in <code>context-runtime/modules/safe-bdev/test</code>.</p>
+<ul>
+  <li><code>cr_safe_bdev_ec_tests</code> covers the header-only coding core
+  with no runtime: field axioms, reconstruction from any <em>k</em> shards,
+  incremental parity, and add, remove and recover at the array level.</li>
+  <li><code>cr_safe_bdev_config_tests</code> parses compose YAML into the
+  creation parameters and round-trips them through serialization.</li>
+  <li><code>cr_all_safe_bdev_tests</code> runs the runtime suite: round-trip
+  recovery, parity rebuild with a data member down, striping, allocation
+  spread, reclaim, partial chunks, superblock reattach and foreign refusal,
+  adding data without reshuffle, allocator-log restart, interrupted recovery
+  resumed across a restart, and capacity after adding data then parity.</li>
+  <li><code>cr_safe_bdev_concurrency_tests</code> runs the data plane with 16
+  worker threads so several tasks enter the container at once.</li>
+  <li><code>cr_safe_bdev_stress_tests</code> grows an array from one to four
+  data members, unplugs and recovers, with and without concurrent I/O.</li>
+  <li><code>cr_safe_bdev_disk_fail_tests</code> (Linux only) kills file
+  members with the bdev fault marker: degraded service, faults kept across a
+  restart, rebuild under load, crashes between data and parity, crashes during
+  degraded writes, delta parity on small rewrites, sync with dying disks and
+  two members lost.</li>
+  <li><code>test_safe_bdev_dist_stress.cc</code> builds a distributed driver
+  that is not a ctest; it needs a live multi-node runtime and the harness
+  under <code>test/integration/safe-bdev</code>.</li>
+</ul>

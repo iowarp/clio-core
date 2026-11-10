@@ -1,0 +1,296 @@
+<!--
+title: Context Assimilation Engine core
+heading: Context Assimilation Engine <em>core.</em>
+description: The clio_cae_core module ingests external data (local files, HDF5, HTTP, S3, GCS, Globus) into Context Transfer Engine tags from an OMNI YAML description, and can sit in front of the CTE as a transparent interceptor.
+eyebrow: Modules · Assimilation
+lede: The Context Assimilation Engine (CAE) core is the module that moves data from outside the stack into it. You describe transfers in an OMNI YAML file, submit it with clio_cae, and the module reads each source and writes it as blobs into a CTE tag. The same module can also be placed in front of the CTE core so that ordinary put, get and tag operations flow through it.
+facts: Module | clio_cae_core ; Pool ID | 400.0 ; Submit tool | clio_cae ; Source | context-assimilation-engine/core
+-->
+<h2 id="what">What assimilation does</h2>
+<p>Assimilation copies a source (a file, a dataset, an object) into the
+<a href="/design/cte-core.html">Context Transfer Engine</a> as one tag
+holding one or more blobs. After that, the data is served by the CTE
+tiers like anything written through the normal client: it can be read by
+name, searched, exported again, or served to a filesystem view. Use the
+CAE when data already exists somewhere else and you want it inside the
+stack without writing a loader against the CTE client yourself.</p>
+<p>The unit of work is a <strong>transfer</strong>: a source URL, a
+destination tag and a format. A list of transfers is an
+<strong>OMNI file</strong>. The client tool parses the file, performs any
+local preprocessing, and sends the whole list to the CAE pool in one
+<code>ParseOmni</code> task. The pool runs the transfers in order, each
+one finishing before the next starts.</p>
+
+<h2 id="where">Where it sits</h2>
+<p>The CAE is a pool inside the <a href="/design/runtime.html">CLIO
+runtime</a>, composed alongside a CTE core pool. Its handlers call the
+CTE client to create tags and put blobs, so a CTE pool must exist before
+the CAE pool is created. Two placements are in use:</p>
+<ul>
+  <li><strong>Side by side.</strong> The CAE pool is created at its own
+  ID (400.0 by convention) and only ever acts when an OMNI file is
+  submitted. Blobs are written to the global CTE core pool.</li>
+  <li><strong>As an interceptor.</strong> The CAE is created at the
+  CTE's own entry pool ID and given a <code>next_pool_id</code>. The
+  operations <code>GetOrCreateTag</code>, <code>PutBlob</code>,
+  <code>GetBlob</code> and <code>SemanticSearch</code> that arrive at
+  the CAE are forwarded unchanged to that next pool, which may be the
+  CTE core directly or another interposer such as the
+  <a href="/modules/summarizer.html">summarizer</a> or the
+  <a href="/modules/indexer.html">indexer</a>. A CTE client pointed at
+  the CAE pool works unchanged. When <code>next_pool_id</code> is not
+  set, forwarding falls back to the global CTE core pool ID.</li>
+</ul>
+<p>The method IDs of the forwarded operations are asserted at compile
+time to match the CTE core's, which is what lets a task built by the CTE
+client dispatch to a CAE handler.</p>
+
+<h2 id="compose">Composing it</h2>
+<p>The minimal deployment from the module's example configuration
+creates a CTE core and a CAE next to it. The CTE entry must come first.</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+</pre>
+<p>The interceptor placement, adapted from the summarizer test
+configuration, puts the real CTE core at 513.0 and the CAE at the entry
+ID 512.0 with a summarizer between them:</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_core
+    pool_query: local
+    pool_id: "513.0"
+  - mod_name: clio_cae_summarizer
+    pool_name: clio_cae_summarizer
+    pool_query: local
+    pool_id: "401.0"
+    next_pool_id: "513.0"
+  - mod_name: clio_cae_core
+    pool_name: cae_labeler
+    pool_query: local
+    pool_id: "512.0"
+    next_pool_id: "401.0"
+</pre>
+<p>The only module-specific compose key is <code>next_pool_id</code>,
+written as <code>"major.minor"</code>. Any other key on the entry is
+ignored by this module. Dynamic routing queries on the forwarded
+operations are resolved to the local container, so an intercepted task
+runs on the node that received it.</p>
+
+<h2 id="sources">Supported sources and formats</h2>
+<p>The source scheme in <code>src</code> selects the assimilator. The
+scheme is everything before <code>://</code>, or before <code>::</code>
+for the custom forms.</p>
+<ul>
+  <li><code>file::/path</code>: a local file, read in chunks of 1 MB by
+  default and stored as blobs named <code>chunk_0</code>,
+  <code>chunk_1</code> and so on in the destination tag. The runtime
+  process must be able to read the path. Byte ranges apply.</li>
+  <li><code>string::name</code>: an inline payload carried in the
+  request itself, stored verbatim as one blob named by the part after the
+  scheme. Used by programs that build transfers in code rather than from a
+  file.</li>
+  <li><code>hdf5::/path.h5</code>: an HDF5 file. Each dataset becomes a
+  tag named <code>&lt;dst&gt;/&lt;dataset path&gt;</code>, large datasets
+  are split into several blobs, and <code>dataset_filter</code> selects
+  datasets by glob. Requires a build with
+  <code>CLIO_CORE_ENABLE_HDF5=ON</code>.</li>
+  <li><code>http://</code> and <code>https://</code>: a web download
+  through a curl child process. Compiled in on POSIX builds only; a
+  Globus web URL under <code>https://app.globus.org</code> is handed to
+  the Globus assimilator instead. Credentials come from
+  <code>~/.clio/cae_http_auth.ini</code>.</li>
+  <li><code>s3://bucket/key</code>: Amazon S3 or an S3-compatible store
+  such as MinIO. Requires <code>CAE_ENABLE_S3=ON</code> and the AWS SDK for
+  C++. Credentials, region and endpoint come from the standard AWS
+  environment of the runtime process: the access key variables or an
+  <code>AWS_PROFILE</code>, <code>AWS_DEFAULT_REGION</code>, and
+  <code>S3_ENDPOINT</code> or <code>AWS_ENDPOINT_URL</code>. Public
+  buckets are read unsigned when <code>AWS_NO_SIGN_REQUEST=1</code> is
+  set or no credentials exist. The container keeps a pool of keep-alive
+  connections across imports.</li>
+  <li><code>gs://</code> or <code>gcs://bucket/object</code>: Google
+  Cloud Storage through Application Default Credentials, with an optional
+  <code>GCS_ENDPOINT</code> override. Requires
+  <code>CAE_ENABLE_GCS=ON</code> and google-cloud-cpp.</li>
+  <li><code>globus://</code>: a Globus endpoint, with the access token
+  taken from <code>src_token</code> or <code>GLOBUS_ACCESS_TOKEN</code>.
+  Requires <code>CAE_ENABLE_GLOBUS=ON</code>.</li>
+</ul>
+<p>The cloud and Globus options default to off and disable themselves
+with a warning when their SDK is not found. A source whose scheme was
+not compiled in fails the OMNI file with "No assimilator found".</p>
+<p>The <code>format</code> field takes <code>binary</code>,
+<code>hdf5</code>, <code>hdf5_vol</code> or <code>globus</code>.
+<code>hdf5_vol</code> stages an HDF5 file in the cache layout of the CTE's
+HDF5 VOL connector, under the tag the connector itself would derive, so an
+application opening the file through the connector is served from the
+CTE tier from its first read. Its chunk size is read from
+<code>CLIO_VOL_CHUNK_SIZE</code> in the runtime's environment and must
+match the application's; a mismatch is a cache miss, not a wrong
+read.</p>
+
+<h2 id="omni">The OMNI file</h2>
+<p>The test file for S3 ingestion is a complete example:</p>
+<pre data-label="yaml">
+name: test_s3_assim
+
+transfers:
+  - src: s3://clio-cae-test/example_key
+    dst: iowarp::test_s3_assim_tag
+    format: binary
+    depends_on: ""
+    range_off: 0
+    range_size: 0
+</pre>
+<p>Per-transfer keys the loader reads:</p>
+<dl class="notes">
+  <dt>src, dst, format</dt>
+  <dd>Required. <code>dst</code> is <code>iowarp::&lt;tag&gt;</code>, or
+  <code>iowarp::</code> with no name for <code>hdf5_vol</code>.</dd>
+  <dt>depends_on</dt>
+  <dd>The exact <code>src</code> or <code>dst</code> of an earlier
+  transfer. Transfers already run in order; this key documents and checks
+  the dependency. A dependency on a later transfer, on itself, or on
+  nothing in the list rejects the whole file before anything runs.</dd>
+  <dt>range_off, range_size</dt>
+  <dd>Byte range within the source. Zero size means the whole file.</dd>
+  <dt>src_token, dst_token</dt>
+  <dd>Authentication tokens. Environment variables are expanded.</dd>
+  <dt>dataset_filter</dt>
+  <dd><code>include_patterns</code> and <code>exclude_patterns</code>
+  lists of glob patterns for HDF5 datasets. <code>*</code> crosses
+  <code>/</code>.</dd>
+  <dt>run, run_out</dt>
+  <dd>A script that transforms the source before ingest. It runs in the
+  client, never in the runtime, with the source path or URL and
+  <code>run_out</code> as its two arguments. The transfer then ingests
+  <code>run_out</code>. If any run step fails, nothing is submitted.
+  Relative paths resolve against the OMNI file's directory.</dd>
+</dl>
+<p>Any other key on a transfer is logged as a warning and ignored. The
+HDF5 example file in the tests carries <code>name</code> and
+<code>description</code> keys on its transfers; these are ignored by the
+loader, and its <code>depends_on</code> by transfer name does not match
+what the dependency check accepts.</p>
+
+<h2 id="run">Running it</h2>
+<ol class="steps">
+  <li>Start the runtime with a configuration whose compose list includes
+  the CTE and CAE pools:
+<pre data-label="shell">
+$ export CLIO_X=/path/to/clio_config.yaml
+$ clio_run start
+</pre></li>
+  <li>Submit the OMNI file:
+<pre data-label="shell">
+$ clio_cae /path/to/transfers.yaml
+</pre></li>
+</ol>
+<p>The tool connects to the CAE pool at 400.0, loads the file, executes
+any <code>run</code> steps, and waits for <code>ParseOmni</code>. It
+exits non-zero when the assimilation result code or the task framework
+code is non-zero, and also when transfers were requested but zero
+assimilations were scheduled. Cloud credentials are read by the runtime
+process, not by the tool, so set them where the runtime runs.</p>
+<div class="callout">
+  <p><strong>Completion is reported per transfer, not per blob.</strong>
+  The tool's success message notes that assimilation is scheduled, not
+  complete. Dataset-level errors such as a full CTE tier are logged by the
+  runtime, not by the tool. Check the runtime log, or list the destination
+  tag, to confirm the blobs landed.</p>
+</div>
+
+<h2 id="operations">Operations</h2>
+<ul>
+  <li><strong>ParseOmni.</strong> Takes a serialized list of transfer
+  contexts, checks dependencies, and runs each one through its
+  assimilator in order. Returns the number of transfers scheduled, a
+  result code and an error message. When replicas are aggregated, counts
+  are summed and the first failure wins.</li>
+  <li><strong>ProcessHdf5Dataset.</strong> Processes one dataset of one
+  HDF5 file into a tag prefix. It accepts a routing query so individual
+  datasets can be sent to specific nodes.</li>
+  <li><strong>ExportData.</strong> Writes every blob in a tag to a file,
+  in <code>hdf5</code> or <code>binary</code> format, and reports bytes
+  exported. A tag that does not exist is an error; an empty tag writes
+  nothing.</li>
+  <li><strong>ImportData.</strong> The inverse of export for HDF5: reads
+  the dataset whose in-file path equals the tag name and stores it in the
+  key-value HDF5 form the <a href="/technologies/kv-store.html">key-value
+  store</a> uses.</li>
+  <li><strong>GetOrCreateTag, PutBlob, GetBlob, SemanticSearch.</strong>
+  Interceptor passthroughs forwarded to the next pool.</li>
+  <li><strong>Monitor.</strong> The standard container status hook.</li>
+</ul>
+<p>The C++ client exposes each of these as an asynchronous call on
+<code>clio::cae::core::Client</code>, plus <code>CLIO_CAE_CLIENT_INIT</code>
+for a process-wide singleton. The library links as
+<code>clio::cae::core_client</code> from the <code>clio-core</code> CMake
+package.</p>
+
+<h2 id="behaviors">Behaviors worth knowing</h2>
+<ul>
+  <li><strong>Transfers are sequential and fail fast.</strong> A failing
+  transfer stops the file; later transfers do not run, and the count of
+  scheduled transfers tells you how far it got.</li>
+  <li><strong>Ingest on fault.</strong> A transfer context can be marked
+  <code>on_fault</code>. The CAE then ingests nothing, publishes the
+  context in a registry tag so every node can see it, and registers
+  itself as the destination tag's fault handler on every CTE container.
+  A read of a blob the tag does not hold makes the source's assimilator
+  fetch exactly that blob, which then serves the read and stays in the
+  tag. When the tier is full, faults are served from the source without
+  storing. This flag is not an OMNI key; it is set by programs that build
+  contexts directly.</li>
+  <li><strong>Blob names and sizes.</strong> Binary sources are split
+  into blobs of <code>chunk_size</code> bytes (1 MB when unset) named
+  with <code>blob_prefix</code> and an index. Both fields are on the
+  context, not the OMNI file.</li>
+  <li><strong>No secrets in OMNI files.</strong> Cloud credentials are
+  resolved from the runtime's environment at assimilation time. Proxy
+  settings follow the usual <code>https_proxy</code> variables, with
+  loopback always direct.</li>
+  <li><strong>Scheduler hints.</strong> The module reports per-task cost
+  estimates so the runtime can tell a 4 KiB put from a 1 MiB put when
+  the CAE is the interceptor.</li>
+</ul>
+
+<h2 id="limits">Current limits</h2>
+<ul>
+  <li>Node failure, recovery, migration and upgrade methods are not
+  implemented for this module.</li>
+  <li>HTTP sources need a POSIX build; S3, GCS, Globus and HDF5 are
+  compile-time options that are off by default.</li>
+  <li>Configuration parsing is best-effort: a malformed
+  <code>next_pool_id</code> leaves the default in place without an
+  error.</li>
+  <li><code>ExportData</code> and <code>ImportData</code> support HDF5
+  only when the module was built with HDF5; export also supports
+  <code>binary</code>.</li>
+  <li>The Destroy handler is not run on ordinary runtime shutdown; the
+  container destructor does the cleanup instead.</li>
+</ul>
+
+<h2 id="tests">How it is tested</h2>
+<p>Tests live under <code>context-assimilation-engine/test/unit</code>
+and are enabled with <code>BUILD_TESTING</code>. They cover the OMNI
+loader and dependency check, the transfer context and its serialization,
+binary and ranged assimilation, HDF5 import and export, the CTE
+interceptor round trip, string sources, the page-map and pagify helpers,
+S3 credentials and striped S3 reads, and HTTP authentication and
+fetching.
+Sample OMNI files sit next to them in <code>binary_assim</code>,
+<code>hdf5_assim</code>, <code>s3_assim</code> and <code>gcs_assim</code>.
+A Globus integration test with its own runtime configuration is in
+<code>test/integration/globus_matsci</code>. Sample datasets for the
+tests, including an HDF5 conversion of a CSV file, are in
+<code>context-assimilation-engine/data</code>.</p>

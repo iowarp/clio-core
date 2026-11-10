@@ -1,0 +1,228 @@
+<!--
+title: Summarizer
+heading: The <em>summarizer.</em>
+description: The clio_cae_summarizer interposer runs a configured language-model prompt over blobs as they are written and stores the response next to them, through an Ollama or OpenAI-compatible endpoint.
+eyebrow: Modules · Assimilation
+lede: The summarizer is an interposer on the Context Transfer Engine's task interface. It forwards every operation to the pool below it, and after a successful put whose tag and blob names match a configured rule, it sends the blob's bytes to a language model and stores the reply as a sibling blob named with a _label suffix. With no rules configured it is a pure passthrough.
+facts: Module | clio_cae_summarizer ; Pool ID | 401.0 by convention ; Backends | Ollama, OpenAI-compatible ; Source | context-assimilation-engine/summarizer
+-->
+<h2 id="what">What it summarizes</h2>
+<p>The summarizer watches <code>PutBlob</code>. When a write completes
+successfully and a rule matches, it reads the written payload, runs a
+prompt template over it, and stores the model's response as a new blob
+called <code>{blob_name}_label</code> in the same tag, with the same
+placement score as the original. Nothing else is summarized: reads,
+tag creation, metadata operations and searches pass straight through.</p>
+<p>Use it when you want a short natural-language description of each
+ingested document or dataset chunk to exist alongside the data, for
+example so that <a href="/design/cte-core.html">keyword search</a> or an
+agent can find the data by what it says rather than by its name. The
+summary is written as an ordinary blob, so anything that can read blobs
+can read it.</p>
+
+<h2 id="where">Where it sits</h2>
+<p>The module sits between whatever addresses the CTE and the CTE core
+itself. Typical chains, from the top down:</p>
+<ul>
+  <li><a href="/modules/cae-core.html">CAE core</a> as the entry point,
+  then the summarizer, then the CTE core.</li>
+  <li>CAE core, summarizer, <a href="/modules/indexer.html">indexer</a>,
+  CTE core, as in the dispatch test configuration.</li>
+  <li>A CTE client pointed directly at the summarizer pool.</li>
+</ul>
+<p>Its compose key <code>next_pool_id</code> names the pool below. When
+unset, the canonical CTE core pool is used. The summary blob is written
+through a client addressed at that lower pool, so the write never
+re-enters the summarizer. A rule whose blob pattern is <code>.*</code>
+therefore does not summarize its own summaries.</p>
+<p>Like the cache, replication and indexer interposers, the module is
+deliberately absent from the repository's module registry: regenerating
+its dispatch code would remove the default-case forwarding it depends
+on, so its method table is maintained by hand.</p>
+
+<h2 id="compose">Composing it</h2>
+<p>This is the labeling test configuration. The CTE core comes first
+because an interposer's next pool must exist when its container is
+created.</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "256MB"
+
+  - mod_name: clio_cte_core
+    pool_name: cte_core
+    pool_query: local
+    pool_id: "513.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "128MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+
+  - mod_name: clio_cae_summarizer
+    pool_name: clio_cae_summarizer
+    pool_query: local
+    pool_id: "401.0"
+    next_pool_id: "513.0"
+    label_endpoint: "http://127.0.0.1:11434"
+    label_prompts:
+      summarize: "Summarize the following text in one short sentence."
+    label_matches:
+      - tag_re: ".*\\.txt$"
+        blob_re: ".*"
+        model: "gemma3:1b"
+        prompt: "summarize"
+        context_length: 4096
+
+  - mod_name: clio_cae_core
+    pool_name: cae_labeler
+    pool_query: local
+    pool_id: "512.0"
+    next_pool_id: "401.0"
+</pre>
+
+<h2 id="config">Configuration</h2>
+<dl class="notes">
+  <dt>next_pool_id</dt>
+  <dd>Pool to forward to, as <code>"major.minor"</code>. Default: the
+  canonical CTE core pool.</dd>
+  <dt>label_endpoint</dt>
+  <dd>Base URL of the inference server. The module appends
+  <code>/api/generate</code> for Ollama or <code>/chat/completions</code>
+  for the OpenAI protocol.</dd>
+  <dt>label_api</dt>
+  <dd><code>ollama</code> (default when empty) or <code>openai</code>,
+  case-insensitive. Any other spelling fails container creation with an
+  error rather than falling back.</dd>
+  <dt>label_api_key_file, label_api_key_env</dt>
+  <dd>Where the bearer token for the OpenAI protocol comes from: a file
+  (with <code>${VAR}</code> expansion) or an environment variable. The
+  file wins when readable. Both are re-read on every request, so a
+  refreshed token needs no restart. Surrounding whitespace is stripped.
+  The token itself is never placed in the compose file. If neither
+  yields a token, requests are sent without an Authorization header and
+  a warning is logged at creation.</dd>
+  <dt>label_prompts</dt>
+  <dd>A map from prompt name to prompt text. The full model input is the
+  prompt text, a blank line, then the payload chunk.</dd>
+  <dt>label_matches</dt>
+  <dd>A list of rules, checked in order; the first match wins. Each has
+  <code>tag_re</code>, <code>blob_re</code>, <code>model</code>,
+  <code>prompt</code> (a key in <code>label_prompts</code>),
+  <code>context_length</code> (default 4096) and
+  <code>num_predict</code> (default 0, no cap).</dd>
+</dl>
+<p>Rule regexes are matched with search semantics, so
+<code>.*\.txt</code> matches any name ending in <code>.txt</code>
+without anchors, and globs are not converted. An invalid regex disables
+only that rule, with a warning, and matching continues with the next.
+A rule naming a prompt that does not exist is skipped with a warning.</p>
+
+<h2 id="backends">Backends</h2>
+<ul>
+  <li><strong>Ollama.</strong> A POST to <code>/api/generate</code> with
+  <code>stream: false</code>. <code>context_length</code> is sent as
+  <code>options.num_ctx</code> and <code>num_predict</code> as
+  <code>options.num_predict</code>; a value of 0 omits the option and
+  leaves Ollama's default. The <code>response</code> field is the
+  summary.</li>
+  <li><strong>OpenAI-compatible.</strong> A POST to
+  <code>/chat/completions</code> with the prompt as a single user
+  message and <code>stream: false</code>. <code>num_predict</code> is
+  sent as <code>max_tokens</code> when non-zero;
+  <code>context_length</code> is not sent, because these servers fix the
+  context window per model, but it still drives chunking below. The
+  first choice's message content is the summary. This is the protocol
+  hosted inference services speak, and also what a local vLLM or
+  llama.cpp server exposes, usually without a token.</li>
+</ul>
+<p>Both calls use libcurl with a 5 second connect timeout and a 120
+second total timeout. Loopback addresses bypass any configured proxy,
+and the environment's <code>no_proxy</code> list is honored in addition.
+Any transport, HTTP or parse error returns no summary and is logged at
+warning level.</p>
+
+<h2 id="chunking">Chunking</h2>
+<p>When <code>context_length</code> is positive, the payload is split so
+each request fits the model's context. Three quarters of the token
+budget is reserved for the payload and converted to bytes at about 3
+bytes per token, less the prompt template's size. Each chunk is
+summarized separately and the responses are concatenated with a blank
+line between them. A chunk that fails is skipped; only when every chunk
+fails is nothing stored. A <code>context_length</code> of 0 disables
+chunking and sends the whole payload in one request.</p>
+<p>Binary payloads tokenize closer to one byte per token, so the byte
+estimate errs toward splitting more rather than overflowing. With
+<code>num_predict</code> set, the final summary is roughly that many
+tokens times the number of chunks.</p>
+
+<h2 id="operations">Operations</h2>
+<ul>
+  <li><strong>Create</strong> reads the compose keys, resolves the
+  protocol and token source, and logs the number of rules.</li>
+  <li><strong>Destroy</strong> clears the tag-name cache.</li>
+  <li><strong>Monitor</strong> is the standard no-op status hook.</li>
+  <li><strong>PutBlob</strong> forwards first, then summarizes if the
+  write succeeded, the write was not replica-addressed, and a rule
+  matches.</li>
+  <li><strong>Every other CTE core verb</strong> (GetBlob,
+  GetOrCreateTag, SemanticSearch, the metadata operations) is forwarded
+  verbatim by the dispatch default.</li>
+</ul>
+<p>The summarizer has no client of its own beyond pool creation. Programs
+talk to it with the ordinary CTE core client, pointed at its pool ID.</p>
+
+<h2 id="behaviors">Behaviors worth knowing</h2>
+<ul>
+  <li><strong>The user's write is never affected.</strong> The original
+  put is forwarded before any model call, and its return code is what the
+  caller sees. Every summarization failure is logged and swallowed.</li>
+  <li><strong>Tag names are resolved lazily.</strong> A put carries only
+  the tag ID, so the module asks the pool below for the name on the local
+  node and caches it. If the name cannot be resolved on that node, the
+  rule's tag pattern is matched against an empty string.</li>
+  <li><strong>Inference is blocking.</strong> The HTTP call runs on the
+  worker that owns the put. A rule that matches a hot write path
+  serializes that path behind the model, so scope <code>tag_re</code> and
+  <code>blob_re</code> narrowly.</li>
+  <li><strong>Summaries inherit placement.</strong> The label blob is
+  written with the source blob's score, so it lands on the same kind of
+  tier.</li>
+  <li><strong>The payload is copied.</strong> The blob bytes are copied
+  out of shared memory into a private string before the model call, so
+  the request does not share lifetime with the inbound buffer.</li>
+</ul>
+
+<h2 id="limits">Current limits</h2>
+<ul>
+  <li>Chunks are summarized one after another on the calling worker;
+  there is no dedicated inference worker pool.</li>
+  <li>Only the two wire protocols above are supported, with one model
+  per rule. There is no local in-process model.</li>
+  <li>Configuration parsing is best-effort: a malformed value leaves the
+  default in place silently, apart from <code>label_api</code>, which
+  fails creation.</li>
+  <li>A put larger than the model's context produces a concatenation of
+  per-chunk summaries, not a single summary of the whole.</li>
+  <li>There is no re-summarization: an overwritten blob gets a new label
+  only because the new put matches again, and a blob written before the
+  rule existed is never labeled.</li>
+</ul>
+
+<h2 id="tests">How it is tested</h2>
+<p>Tests live under <code>context-assimilation-engine/test/unit</code>.
+The config-units and rules tests cover compose parsing, rule matching
+and chunk-boundary arithmetic without a runtime. The label-client and
+inference tests point the HTTP client at an in-process stub to check
+both protocols, token resolution, the proxy bypass list and
+partial-chunk failure. Runtime tests use the compose files in the same
+directory: the dispatch test against a dead endpoint exercises the
+match-and-forward path and the SemanticSearch forward, the store test
+checks the label blob lands in the tag, and the labeling test runs
+against a local Ollama instance with the configuration shown above.</p>

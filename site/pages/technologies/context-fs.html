@@ -3,7 +3,7 @@ title: Context FS
 heading: Context FS: <em>a filesystem you compose.</em>
 description: Context FS is CLIO Core's distributed filesystem: FUSE on Linux, macOS and Windows, score-based tiering, expandable erasure-coded arrays and S3 or Google Cloud buckets as tiers.
 eyebrow: Technologies · Storage
-lede: Context FS mounts the tiers you compose (RAM, NVMe, disk, erasure-coded arrays, cloud buckets) as one ordinary directory. Applications use it without changes; the stack underneath decides where each page lives.
+lede: Mount like any other directory on Windows, macOS and Linux via FUSE. Context FS presents the tiers you compose (RAM, NVMe, disk, erasure-coded arrays, cloud buckets) as one ordinary directory. Applications use it without changes; the stack underneath decides where each page lives.
 facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no metadata server ; Unit of data | 1 MiB page blobs ; Durability | ext4-style, durable on fsync
 -->
 <ul class="headline-stats">
@@ -17,6 +17,13 @@ facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no me
 <p>Context FS is a product of CLIO Core, not the whole of it. It is the filesystem adapter (<code>clio_cte_fuse</code>) plus the filesystem module, composed over the Context Transfer Engine. Directories, inodes and file data are all stored as CTE tags and blobs, so the filesystem inherits tiering, replication, durability and indexing from the engine, and has no central metadata server: each inode is homed on a node by its path.</p>
 
 <h2>FUSE on every desktop and cluster</h2>
+<pre data-label="Linux">
+$ clio_run start &
+$ mkdir -p ~/clio-mnt
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
+$ cp -r ./results ~/clio-mnt/
+$ ls ~/clio-mnt/results
+</pre>
 <p>One daemon mounts on all three operating systems with each platform's native driver:</p>
 <ul class="checks">
   <li><strong>Linux</strong>: libfuse3, included in the pip wheel.</li>

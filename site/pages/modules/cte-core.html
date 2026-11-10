@@ -1,0 +1,392 @@
+<!--
+title: CTE core module
+heading: CTE <em>core</em>
+description: Reference for the Context Transfer Engine core module: tags, blobs, scores, storage targets, its operations, configuration keys, placement and organizer hooks, and how the other CTE modules attach to it.
+eyebrow: Modules · Context Transfer Engine
+lede: The core module is the storage engine every other CTE module ends at. It owns the tag and blob namespace, registers the storage tiers as targets, places each blob by its score, and executes every put, get, delete, query and reorganize. This page is the reference for using and configuring it; the internals are on the design page.
+facts: Module | clio_cte_core ; Pool | 512.0 (kCtePoolId) ; Source | context-transfer-engine/core ; Python | clio_cte_core_ext
+-->
+<h2 id="what">What it does</h2>
+<p>The core stores <strong>blobs</strong> (named byte ranges) inside
+<strong>tags</strong> (named groups, roughly a bucket or a file) on
+<strong>storage targets</strong> (block-device pools: RAM, pinned host
+memory, HBM, a backing file, S3, GCS or a no-op device). Every blob has a
+<strong>score</strong> between 0.0 and 1.0. The score selects the tier at
+placement time and drives later reorganization: 1.0 means the fastest
+tier, 0.0 the slowest. A new blob without an explicit score lands at 1.0;
+a put that omits the score keeps the blob's current one.</p>
+<p>Use the core directly when you want a tiered key-value style store with
+explicit control over placement. Use it through the
+<a href="/modules/cache.html">cache</a>,
+<a href="/modules/replication.html">replication</a>,
+<a href="/modules/compressor.html">compressor</a> and
+<a href="/modules/indexer.html">indexer</a> modules, or the
+<a href="/design/filesystem.html">filesystem</a>, when you want those
+policies added on top. None of them bypass the core; see
+<a href="/design/cte-core.html">CTE core design</a> for the data path,
+distribution and concurrency model.</p>
+
+<h2 id="where">Where it sits</h2>
+<ul>
+  <li><strong>Pool.</strong> The core is composed at pool 512.0, the
+  constant <code>kCtePoolId</code> that every CTE client and adapter
+  resolves to by default. One container runs per node.</li>
+  <li><strong>Below it.</strong> Each entry in its <code>storage</code>
+  list becomes a <a href="/modules/bdev.html">bdev</a> pool that the core
+  creates and registers as a target. A target can instead bind to an
+  already composed pool such as <a href="/modules/safe-bdev.html">safe-bdev</a>
+  with <code>existing_pool_id</code>.</li>
+  <li><strong>Above it.</strong> The interposer modules speak the core's
+  own task interface and stack with <code>next_pool_id</code>. The
+  canonical chain in the default configuration is cache (563.0) to indexer
+  (564.0) to optional compressor (562.0) to replication (561.0) to core
+  (512.0). Each entry must be composed after the pool it forwards to.</li>
+  <li><strong>CAE.</strong> The Context Assimilation Engine core sits at
+  its own pool 400.0 and forwards tag creation, put, get and semantic
+  search to the CTE core. The default configuration warns against placing
+  CAE in front of the CTE at 512.0, because the two modules' method IDs
+  collide.</li>
+</ul>
+
+<h2 id="compose">Composing it</h2>
+<p>This entry is the CTE section of <code>context-runtime/config/clio_default.yaml</code>
+with the comments removed. A RAM tier with capacity <code>0g</code> takes
+80% of system DRAM; a file tier grows lazily, so its capacity is a cap, not
+an upfront allocation.</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "0g"
+        score: 1.0
+      - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
+        bdev_type: "file"
+        capacity_limit: "10GB"
+        score: 0.2
+        persistence_level: "temporary"
+    performance:
+      metadata_log_path: "${CLIO_STORAGE_ROOT}/cte_metadata_log"
+      transaction_log_capacity: "32MB"
+    dpe:
+      dpe_type: "max_bw"
+    targets:
+      neighborhood: 1
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+</pre>
+<p>To use a pool that is already composed as a tier, replace the
+<code>path</code>, <code>bdev_type</code> and <code>capacity_limit</code>
+keys with the pool's identifier. The pool must implement the bdev task
+interface, and the core reads its free space from that pool's statistics.
+This form is exercised by <code>test/unit/test_cte_existing_pool.cc</code>.</p>
+<pre data-label="yaml">
+    storage:
+      - existing_pool_id: "350.0"
+        existing_pool_module: "clio_safe_bdev"
+        score: 0.5
+</pre>
+
+<h2 id="ops">Operations</h2>
+<p>Method IDs come from <code>context-transfer-engine/core/clio_mod.yaml</code>;
+the client surface is <code>include/clio_cte/core/core_client.h</code>.
+Every client method has an asynchronous form that returns a future, and
+the <code>Tag</code> wrapper adds blocking convenience calls.</p>
+<h3>Targets</h3>
+<ul>
+  <li><strong>RegisterTarget</strong> and <strong>UnregisterTarget</strong>
+  add or remove a storage target on a node. Registration takes the target
+  name, bdev type, total size and optionally an existing pool to attach
+  and a file growth unit. Compose registers the <code>storage</code>
+  entries for you; clients call this only when adding tiers at run
+  time.</li>
+  <li><strong>ListTargets</strong>, <strong>GetTargetInfo</strong> (score,
+  capacity, performance figures) and <strong>StatTargets</strong>, which
+  refreshes free space and performance for every target and runs
+  periodically.</li>
+  <li><strong>GetCapacity</strong> reports remaining capacity.</li>
+</ul>
+<h3>Tags</h3>
+<ul>
+  <li><strong>GetOrCreateTag</strong> returns a tag by name, creating it if
+  needed. A second overload attaches a <em>fault handler</em>: another pool
+  asked to produce a blob when a read misses, used for lazy copies and
+  checkpoints.</li>
+  <li><strong>DelTag</strong>, <strong>RenameTag</strong>,
+  <strong>GetOrCreateTagAlias</strong>, <strong>GetTagName</strong>,
+  <strong>GetNumAliases</strong> and <strong>GetTagSize</strong>. Tag size
+  is summed across containers.</li>
+  <li><strong>GetContainedBlobs</strong> lists a tag's blob names.
+  <strong>TagXattr</strong> sets, gets, deletes or lists one extended
+  attribute key on a tag.</li>
+  <li><strong>SyncTag</strong> flushes a tag's blobs to a persistent tier
+  and syncs the devices and the write-ahead log. This is what fsync on the
+  filesystem maps to.</li>
+</ul>
+<h3>Blobs</h3>
+<ul>
+  <li><strong>PutBlob</strong> writes a byte range at an offset, with an
+  optional score and a <code>Context</code>. Variants: a shared-memory
+  pointer, a private buffer (the runtime copies it once, or not at all when
+  the caller is inside the runtime), a vectored put of several regions in
+  one task, and a deferred put that returns immediately and is tracked in
+  a process-wide registry with flow control. Conditional forms put only if
+  the blob is absent or still at a given version.</li>
+  <li><strong>GetBlob</strong> reads a byte range, with the same
+  shared-memory, private-buffer, vectored and deferred variants. A
+  generational get waits for a writer to publish a given generation. When
+  the bytes are in the local RAM tier and the metadata mirror is attached,
+  a private-buffer get copies them without a round trip.</li>
+  <li><strong>DelBlob</strong>, <strong>TruncateBlob</strong>,
+  <strong>GetBlobSize</strong>, <strong>GetBlobScore</strong>,
+  <strong>GetBlobInfo</strong> (score, size, blocks and targets) and
+  <strong>GetResidency</strong>.</li>
+  <li><strong>ReorganizeBlob</strong> sets a new score and moves the blob
+  to the tier that score selects. <strong>ReorganizeHint</strong> passes a
+  phase hint to the data organizer. <strong>Evict</strong> frees the
+  lowest-scored blobs off a tier.</li>
+  <li><strong>Pod</strong> variants of put, get and reorganize, and batched
+  multi-put, multi-get and multi-score forms, exist for GPU callers with
+  fixed-length names.</li>
+</ul>
+<h3>Queries</h3>
+<ul>
+  <li><strong>TagQuery</strong> matches tag names against a regular
+  expression. <strong>BlobQuery</strong> matches blobs by tag and blob
+  name patterns. <strong>ListLocalBlobs</strong> lists blobs matching a
+  name pattern on the queried containers.</li>
+  <li><strong>SemanticSearch</strong> runs BM25 keyword search over blob
+  contents with a tag and blob filter and a top-k limit.
+  <strong>TemporalSearch</strong> returns blobs whose last-modified time
+  falls in an inclusive range, filtered by tag and blob patterns and
+  sorted by timestamp.</li>
+  <li><strong>PollTelemetryLog</strong> returns telemetry records newer
+  than a given logical time.</li>
+</ul>
+
+<h2 id="api">Client API</h2>
+<p>In C++ the <code>Tag</code> wrapper covers the common case. Its blocking
+put from a private buffer defaults the score to 1.0; the asynchronous and
+shared-memory forms default to -1.0, which means keep the existing
+score.</p>
+<pre data-label="cpp">
+#include &lt;clio_cte/core/core_client.h&gt;
+
+clio::cte::core::Tag tag("experiment/run1");      // GetOrCreateTag
+std::string payload = "hello";
+tag.PutBlob("step0", payload.data(), payload.size());   // offset 0, score 1.0
+std::string out(payload.size(), '\0');
+tag.GetBlob("step0", out.data(), out.size());
+float score = tag.GetBlobScore("step0");
+tag.ReorganizeBlob("step0", 0.2f);                  // demote to a slower tier
+</pre>
+<p>The Python module is <code>clio_cte_core_ext</code>, built with nanobind
+from <code>context-transfer-engine/wrapper/python/core_bindings.cc</code>.
+Blob payloads are <code>bytes</code>. The <code>Tag</code> class binds
+PutBlob, GetBlob, GetBlobScore, GetBlobSize, GetContainedBlobs,
+ReorganizeBlob and GetTagId; the <code>Client</code> class adds DelBlob,
+RegisterTarget, TagQuery, BlobQuery, SemanticSearch, TemporalSearch,
+PollTelemetryLog, the conditional and deferred puts, and the asynchronous
+forms, which return a future with <code>wait</code>, <code>done</code> and
+<code>result</code>. All blocking calls release the GIL.</p>
+<pre data-label="python">
+import clio_cte_core_ext as cte
+
+cte.clio_init(cte.RuntimeMode.kClient)
+tag = cte.Tag("experiment/run1")
+tag.PutBlob("step0", b"hello", 0)
+size = tag.GetBlobSize("step0")
+data = tag.GetBlob("step0", size, 0)
+tag.ReorganizeBlob("step0", 0.0)
+
+client = cte.get_cte_client()
+client.DelBlob(tag.GetTagId(), "step0")
+</pre>
+<p>The <a href="/docs/python-api.html">Python API page</a> covers the
+module in more depth.</p>
+
+<h2 id="config">Configuration</h2>
+<p>Keys are parsed in <code>context-transfer-engine/core/src/core_config.cc</code>;
+defaults are the constructors in <code>core_config.h</code>. Sizes accept
+suffixes from <code>k</code> to <code>p</code> (powers of 1024).</p>
+<h3>storage (list)</h3>
+<ul>
+  <li><code>path</code>: <code>ram::&lt;name&gt;</code> for memory tiers, a
+  file path for file tiers, a URL with a prefix for <code>s3</code> and
+  <code>gcs</code>. Required unless binding to an existing pool.</li>
+  <li><code>bdev_type</code>: <code>file</code>, <code>ram</code>,
+  <code>hbm</code>, <code>pinned</code>, <code>noop</code>, <code>s3</code>
+  or <code>gcs</code>.</li>
+  <li><code>capacity_limit</code>: size string. <code>0</code> is valid only
+  for <code>ram</code> and means 80% of system DRAM.</li>
+  <li><code>score</code>: 0.0 to 1.0. Absent means automatic scoring from
+  measured bandwidth.</li>
+  <li><code>persistence_level</code>: <code>volatile</code> (default),
+  <code>temporary</code> or <code>long_term</code>. Placement filters and
+  persistent replicas key off this, so a tier left at volatile can never
+  satisfy a persistence request.</li>
+  <li><code>growth_unit</code> (file tiers): lazy-growth step, default
+  1 GB. The first unit is reserved at creation.</li>
+  <li><code>existing_pool_id</code>, <code>existing_pool_module</code>:
+  bind to an already composed pool; the module name is for logging
+  only.</li>
+</ul>
+<h3>performance</h3>
+<ul>
+  <li><code>metadata_log_path</code>: directory for the metadata write-ahead
+  log and snapshots. Empty (the built-in default) disables metadata
+  durability; the shipped configuration sets it.</li>
+  <li><code>transaction_log_capacity</code>: WAL capacity, default 32 MB. A
+  full snapshot is rebuilt when the WAL exceeds it.</li>
+  <li><code>flush_metadata_period_ms</code> (5000) and
+  <code>flush_data_period_ms</code> (10000): periods of the metadata and
+  data flush tasks. <code>flush_data_min_persistence</code> (1) is the
+  lowest persistence level the data flush writes to.</li>
+  <li><code>fsync_mode</code>: <code>durable</code> (default) returns from
+  fsync once bytes sit on a tier at the minimum persistence and are synced
+  along with the WAL; <code>deferred</code> returns at once and relies on
+  the periodic flushes.</li>
+  <li><code>stat_targets_period_ms</code> (1000): how often each target's
+  capacity and free space are re-read. Validated to 10 to 60000.</li>
+  <li><code>max_concurrent_operations</code> (64),
+  <code>score_threshold</code> (0.7),
+  <code>score_difference_threshold</code> (0.05),
+  <code>target_stat_interval_ms</code> (5000, marked legacy in the
+  header).</li>
+</ul>
+<h3>targets</h3>
+<ul>
+  <li><code>neighborhood</code>: how many nodes, in ring order, a container
+  registers persistent targets from. The built-in default is 4; the
+  shipped configuration sets 1, so placement is owner-local. Memory tiers
+  are always node-local regardless.</li>
+  <li><code>default_target_timeout_ms</code> (30000),
+  <code>poll_period_ms</code> (5000).</li>
+  <li><code>failover_to_successor</code> (false): route a dead owner's blobs
+  to the first live successor, which serves the replication module's
+  remote copy.</li>
+</ul>
+<h3>dpe and organizer</h3>
+<ul>
+  <li><code>dpe.dpe_type</code>: <code>max_bw</code> (default),
+  <code>round_robin</code> or <code>random</code>.</li>
+  <li><code>organizer</code> (top level of the entry, not under performance):
+  <code>none</code> (default), <code>frecency</code>, <code>grayscott</code>,
+  <code>cyclic</code>, <code>scatter</code> or <code>hotset</code>.
+  <code>organizer_tasks</code> (1) periodic replicas partition the blob
+  space; <code>organizer_period_ms</code> (5000) is the round period.</li>
+</ul>
+<p>The config class can also load a standalone CTE configuration file
+from the path in <code>CLIO_SERVER_CONF</code>; an unset variable means
+built-in defaults, not an error.</p>
+
+<h2 id="hooks">Placement and organizer hooks</h2>
+<p>Two policy interfaces are pluggable without touching the data path.</p>
+<ul>
+  <li><strong>Data placement engine.</strong> <code>DataPlacementEngine::SelectTargets</code>
+  in <code>include/clio_cte/core/dpe/dpe.h</code> receives the available
+  targets, the blob's score and the size to place, and returns an ordered
+  list of targets. Policies live one per file under <code>dpe/</code> and
+  are registered in <code>DpeFactory::CreateDpe</code>. The
+  <a href="/design/placement.html">placement page</a> describes how
+  <code>max_bw</code> uses the score and capacity.</li>
+  <li><strong>Data organizer.</strong> <code>DataOrganizer::Reorganize</code>
+  in <code>include/clio_cte/core/data_organizer/data_organizer.h</code> is
+  a coroutine called by each periodic DynamicReorganize task. It receives
+  a read-only snapshot per blob (score, last read and write, access count,
+  size) and applies new scores through the runtime's reorganize logic.
+  Policies are registered in <code>DataOrganizerFactory::Get</code>. With
+  <code>organizer: none</code> no periodic task is spawned and placement
+  changes only through explicit ReorganizeBlob calls.</li>
+</ul>
+
+<h2 id="attach">How other modules attach</h2>
+<p>Every interposer derives from <code>CoreInterposer</code> in
+<code>include/clio_cte/core/core_interposer.h</code>. It forwards any core
+method it does not override to the next pool verbatim, routes tasks exactly
+as the core does (blob verbs to the blob's owner by hash, tag creation by
+tag-name hash), and numbers its own verbs at 100 and above so they never
+shadow a core method. Compose order must put each interposer after the
+pool its <code>next_pool_id</code> names.</p>
+<ul>
+  <li><strong>Replication</strong> (561.0) writes durable copies on the
+  next nodes by hash before the put is acknowledged and keeps the shadow
+  copies that <code>failover_to_successor</code> serves.</li>
+  <li><strong>Compressor</strong> (562.0, optional) transforms bytes on the
+  way down and marks the blob with a transform flag the core persists.</li>
+  <li><strong>Indexer</strong> (564.0) sits above the compressor so its
+  read-backs see logical bytes, and keeps its own index log.</li>
+  <li><strong>Cache</strong> (563.0) is the top of the chain. It keeps a raw
+  node-local copy, routes reads to the submitter's node, and keeps the
+  zero-IPC shared-memory path live even for compressed blobs. A client
+  bound to the chain attaches the core's metadata mirror with
+  <code>AttachShmCacheOf</code>.</li>
+  <li><strong>Filesystem</strong> maps files to tags and blobs, and points at
+  the top of whatever chain is composed. Its fsync becomes SyncTag.</li>
+</ul>
+
+<h2 id="behavior">Behaviors worth knowing</h2>
+<dl class="notes">
+  <dt>Durability</dt>
+  <dd>Blob layouts are logged to the WAL after the bytes are on the device.
+  Without <code>metadata_log_path</code> the disk tier's bytes survive a
+  restart but nothing remembers which blob they belong to. Bytes that lived
+  only in RAM are gone after a restart; reads into that range fail with an
+  I/O error rather than returning zeros.</dd>
+  <dt>Consistency</dt>
+  <dd>Each blob has one owner container that serialises its mutations.
+  Reads of one blob run concurrently with each other and never block
+  behind writers except in-place overwrites, which drain readers first.
+  Conditional puts fail with distinct return codes.</dd>
+  <dt>Capacity</dt>
+  <dd>A put with no room evicts droppable (cache) data on the local node
+  and retries once. Authoritative data is never dropped by the put path;
+  demotion happens through the organizer or explicit reorganization.</dd>
+  <dt>Startup</dt>
+  <dd>A put that arrives before targets are registered waits up to two
+  minutes instead of failing.</dd>
+</dl>
+
+<h2 id="limits">Current limits</h2>
+<ul>
+  <li>The method manifest in <code>clio_mod.yaml</code> has drifted from the
+  generated method header: methods 36 to 42, MultiPutBlob (48) and
+  RegisterReplicaContainer (49) exist in the header but not the manifest,
+  so the manifest's own comment says to treat the header as authoritative
+  until reconciled.</li>
+  <li>The organizer validation error message lists only <code>none</code>
+  and <code>frecency</code> even though all six names are accepted.</li>
+  <li>The shared-memory metadata mirror is sized once at startup and holds
+  at most 16 blocks per blob; larger or fragmented blobs take the normal
+  request path.</li>
+  <li>Client-mode puts have no zero-IPC fast path. A direct write into the
+  RAM segment could race the organizer relocating the blob, so writes
+  always go through a task.</li>
+  <li>Node failure, recovery, migrate and upgrade lifecycle methods are not
+  implemented by this module.</li>
+</ul>
+
+<h2 id="tests">How it is tested</h2>
+<ul>
+  <li><code>context-transfer-engine/test/unit/</code>: Catch2 tests for the
+  core, including <code>test_core_functionality.cc</code>,
+  <code>test_tag_operations.cc</code>, <code>test_reorganize_blob.cc</code>,
+  <code>test_cte_config_errors.cc</code>, <code>test_cte_config_dpe.cc</code>,
+  <code>test_cte_existing_pool.cc</code>, <code>test_data_organizer.cc</code>,
+  <code>test_cte_transaction_log.cc</code>, <code>test_query.cc</code>,
+  <code>test_evict.cc</code>, <code>test_cte_shm_metadata_cache.cc</code>,
+  <code>test_torn_read.cc</code> and the interposer stack tests.</li>
+  <li><code>context-transfer-engine/test/integration/</code>: multi-node
+  Docker Compose scenarios (<code>distributed</code>, <code>restart</code>,
+  <code>coherence</code>, <code>client_crash</code>,
+  <code>replication_persist</code> and others) with their own
+  <code>clio_config.yaml</code> files.</li>
+  <li><code>context-transfer-engine/wrapper/python/</code>: Python tests
+  such as <code>test_bindings.py</code>, <code>test_cte_async.py</code>,
+  <code>test_cte_conditional.py</code> and
+  <code>test_cte_semantic_search.py</code>.</li>
+</ul>
