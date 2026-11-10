@@ -1,0 +1,59 @@
+<!--
+title: linreg
+heading: <em>linreg:</em> linear regression.
+description: API reference for clio-ml's linear regression module (ordinary least squares by full-batch gradient descent): Python fit_linreg, C++ FitLinearRegression, GlmOptions and GlmResult.
+eyebrow: Docs · Machine learning
+lede: Ordinary least squares fitted by full-batch gradient descent, the equivalent of Spark MLlib's LinearRegression without regularisation. It shares the GLM engine and the <code>GlmOptions</code>/<code>GlmResult</code> types with logistic regression and the linear SVM.
+facts: Module | ml_linreg ; Header | clio_ml/glm.h ; Rows | features, then target
+-->
+<h2>What it does</h2>
+<p>Each iteration is one paged pass that accumulates the mean-squared-error gradient over all rows, followed by one update with a fixed learning rate. There is no regularisation and no early stop. The loss recorded before each update is the mean squared error.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by the target. The <code>Dataset</code> therefore has <code>n_features + 1</code> columns. <code>clio_ml.COLUMNS["linreg"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+y = X[:, 0] - 2 * X[:, 1] + 0.5
+data = np.column_stack([X, y]).astype(np.float32)
+
+r = cm.fit_linreg(data, iters=20, learning_rate=0.1)
+w, b = r.weights[:7], r.weights[7]
+print(r.loss_history[0], "->", r.loss_history[-1])
+print(cm.predict("linreg", r, data[0, :7]))    # linear value for one row
+</pre>
+<ul>
+  <li><code>fit_linreg(X, **options)</code> calls the GLM engine with <code>GlmKind.linear</code>.</li>
+  <li>Options (<code>GlmOptions</code>): <code>iters</code> (100), <code>learning_rate</code> (0.1), <code>threads</code> (256).</li>
+  <li>Result <code>GlmResult</code>: <code>weights</code> (<code>n_features</code> coefficients, then the intercept), <code>loss_history</code> (mean loss before each update), <code>stats</code>.</li>
+  <li><code>predict("linreg", r, x)</code> returns the linear value <code>w . x + b</code>.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+enum class GlmKind { kLinear = 0, kLogistic = 1, kSvm = 2 };
+struct GlmOptions {
+  u32 iters = 100;
+  float learning_rate = 0.1f;
+  u32 threads = 256;
+  ClusterExchange cluster;
+};
+struct GlmResult {
+  std::vector<float> weights;       // F coefficients, then intercept
+  std::vector<float> loss_history;  // mean loss before each update
+  VecStats stats;
+};
+GlmResult FitGlm(GlmKind kind, Dataset &ds, const GlmOptions &opt);
+GlmResult FitLinearRegression(Dataset &ds, const GlmOptions &opt);   // FitGlm(kLinear, ...)
+GlmResult FitGlmPlain(GlmKind kind, const float *data, u64 n_rows, u32 n_features,
+                      u64 elems_per_page, u32 nblocks, const GlmOptions &opt);
+GlmResult FitGlmReference(GlmKind kind, const float *data, u64 n_rows, u32 n_features,
+                          u64 elems_per_page, u32 nblocks, u32 iters, float learning_rate);
+float GlmPredict(GlmKind kind, const std::vector<float> &w, const float *x);
+</pre>
+<p><code>clio_ml/linear_regression.h</code> only includes <code>glm.h</code>. The ChiMod is module <code>ml_linreg</code>.</p>
+
+<p>Related: <a href="/docs/ml/logreg.html">logistic regression</a>, <a href="/docs/ml/svm.html">linear SVM</a>, <a href="/docs/ml/enet.html">elastic net</a>, <a href="/docs/ml/pglm.html">Poisson GLM</a>.</p>

@@ -1,0 +1,44 @@
+<!--
+title: gbtc
+heading: <em>gbtc:</em> gradient-boosted tree classifier.
+description: API reference for clio-ml's gradient-boosted tree classifier (binary log-loss with Newton leaves): Python fit_gbtc, the GbtOptions logistic flag, GbtPredict and GbtPredictProba.
+eyebrow: Docs · Machine learning
+lede: Binary classification with gradient-boosted trees, the equivalent of Spark MLlib's GBTClassifier. It is the <a href="/docs/ml/gbt.html">gbt</a> engine with <code>logistic</code> set: histograms hold gradient and Hessian sums, splits maximise <code>G^2 / (H + l2)</code>, and leaves take Newton steps.
+facts: Module | ml_gbtc ; Header | clio_ml/gbt.h ; Rows | features, then 0/1 label
+-->
+<h2>What it does</h2>
+<p>The logistic path computes its exponentials with an exact routine built from IEEE operations only, so host and device agree bit for bit and near-tied split choices do not flip between them. The regression path is unchanged by this flag.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by a 0/1 label. <code>clio_ml.COLUMNS["gbtc"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+y = ((X[:, 0] > 0) ^ (X[:, 1] > 0)).astype(np.float32)   # XOR-like
+data = np.column_stack([X, y]).astype(np.float32)
+
+r = cm.fit_gbtc(data, num_trees=3, max_depth=3)
+margin = cm.predict("gbtc", r, data[0, :7])              # raw margin
+p = 1 / (1 + np.exp(-margin))                             # probability of class 1
+</pre>
+<ul>
+  <li><code>fit_gbtc(X, **options)</code> is <code>fit_gbt</code> with <code>logistic=True</code> preset.</li>
+  <li>Options (<code>GbtOptions</code>): <code>num_trees</code> (20), <code>max_depth</code> (3), <code>num_bins</code> (32), <code>learning_rate</code> (0.3), <code>l2</code> (0.0; the Hessian regulariser), <code>min_hessian</code> (1.0; minimum child Hessian sum), <code>threads</code> (256).</li>
+  <li>Result <code>GbtResult</code>, as for <a href="/docs/ml/gbt.html">gbt</a>.</li>
+  <li><code>predict("gbtc", r, x)</code> returns the raw margin from <code>GbtPredict</code>; apply a sigmoid for the probability. <code>GbtPredictProba</code> is C++ only.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+clio_ml::GbtOptions opt;
+opt.logistic = true;        // labels must be 0/1
+opt.num_trees = 20;
+clio_ml::GbtResult r = clio_ml::FitGbt(ds, opt);
+float p = clio_ml::GbtPredictProba(r.model, x);   // 1 / (1 + exp(-GbtPredict(m, x)))
+</pre>
+<p>Types and signatures are on the <a href="/docs/ml/gbt.html">gbt</a> page. The ChiMod is module <code>ml_gbtc</code>.</p>
+
+<p>Related: <a href="/docs/ml/logreg.html">logistic regression</a>, <a href="/docs/ml/rf.html">random forest</a>.</p>

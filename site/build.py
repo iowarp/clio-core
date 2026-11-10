@@ -60,13 +60,26 @@ SITE_SUMMARY = (
     "written lets you search files from Python by BM25 keyword relevance or name pattern. It is "
     "written in C++ with Python bindings and installs with pip, conda, Docker, Spack or from source.")
 
+def _ml_algorithm_pages():
+    """Every docs/ml/<algo>.html page, labelled by its title."""
+    out = []
+    for f in sorted((Path(__file__).parent / "pages" / "docs" / "ml").glob("*.html")):
+        if f.name == "index.html":
+            continue
+        m = re.search(r"^title:\s*(.+)$", f.read_text(encoding="utf-8"), re.M)
+        out.append((f"docs/ml/{f.name}", m.group(1).strip() if m else f.stem))
+    return out
+
+
+ML_ALGOS = _ml_algorithm_pages()
+
 # Section navigation: (group title, [(page path, label), ...]).
 NAV = {
     "technologies": [
         ("Technologies", [
-            ("technologies/index.html", "The composable I/O stack"),
+            ("technologies/index.html", "Context Runtime"),
             ("technologies/context-fs.html", "Context FS"),
-            ("technologies/kv-store.html", "Key-value store"),
+            ("technologies/context-transfer-engine.html", "Context Transfer Engine"),
             ("technologies/memory-expansion.html", "Memory expansion"),
             ("technologies/machine-learning.html", "Machine learning"),
         ]),
@@ -76,12 +89,31 @@ NAV = {
             ("docs/index.html", "Introduction"),
             ("docs/installation.html", "Installation"),
             ("docs/basic-usage.html", "Basic usage"),
-        ]),
-        ("Reference", [
             ("docs/concepts.html", "Core concepts"),
             ("docs/cli.html", "CLI and environment"),
+        ]),
+        ("Context FS", [
+            ("docs/context-fs.html", "Start and compose"),
+        ]),
+        ("Context Assimilation Engine", [
+            ("docs/cae.html", "Assimilate data"),
+        ]),
+        ("Context Exploration Engine", [
+            ("docs/cee.html", "Explore and search"),
+        ]),
+        ("Context Transfer Engine", [
+            ("docs/cte.html", "Data model and API"),
             ("docs/python-api.html", "Python API"),
         ]),
+        ("Context Runtime", [
+            ("docs/runtime.html", "Build a ChiMod"),
+        ]),
+        ("Memory expansion", [
+            ("docs/memory-expansion.html", "CPU and GPU vectors"),
+        ]),
+        ("Machine learning", [
+            ("docs/ml/index.html", "Overview"),
+        ] + ML_ALGOS),
     ],
     "tutorials": [
         ("Overview", [
@@ -159,6 +191,7 @@ REDIRECTS = {
     "tutorials.html": "tutorials/index.html",
     "install/index.html": "docs/installation.html",
     "tutorials/fuse-adapters.html": "tutorials/fuse-linux.html",
+    "technologies/kv-store.html": "technologies/context-transfer-engine.html",
 }
 
 ICON_GITHUB = ('<svg class="filled" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8'
@@ -415,8 +448,9 @@ def footer_html() -> str:
       <p>A composable I/O stack for data-intensive pipelines: storage, memory and compute modules you assemble from YAML. Part of the Clio ecosystem.</p>
     </div>
     <div><h2>Technologies</h2><ul>
+      <li><a href="/technologies/index.html">Context Runtime</a></li>
       <li><a href="/technologies/context-fs.html">Context FS</a></li>
-      <li><a href="/technologies/kv-store.html">Key-value store</a></li>
+      <li><a href="/technologies/context-transfer-engine.html">Context Transfer Engine</a></li>
       <li><a href="/technologies/memory-expansion.html">Memory expansion</a></li>
       <li><a href="/technologies/machine-learning.html">Machine learning</a></li>
     </ul></div>

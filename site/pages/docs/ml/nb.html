@@ -1,0 +1,60 @@
+<!--
+title: nb
+heading: <em>nb:</em> Gaussian naive Bayes.
+description: API reference for clio-ml's Gaussian naive Bayes module: Python fit_nb and predict, C++ FitNaiveBayes and NaiveBayesPredict, options and model fields.
+eyebrow: Docs · Machine learning
+lede: Gaussian naive Bayes, the equivalent of Spark MLlib's NaiveBayes with modelType gaussian and scikit-learn's GaussianNB. One paged pass computes class priors, per-class feature means and smoothed variances.
+facts: Module | ml_nb ; Header | clio_ml/naive_bayes.h ; Rows | features, then class label
+-->
+<h2>What it does</h2>
+<p>A single pass accumulates per-class counts, sums and sums of squares. Variances are smoothed by <code>var_smoothing * max variance</code>, as scikit-learn does. The result is bit-reproducible across cache sizes and block counts.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by the class label in <code>0..num_classes-1</code>. <code>clio_ml.COLUMNS["nb"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+y = (X[:, 0] + X[:, 1] > 0).astype(np.float32)
+data = np.column_stack([X, y]).astype(np.float32)
+
+r = cm.fit_nb(data, num_classes=2)
+m = r.model
+print(m.prior, np.asarray(m.mean).reshape(m.C, m.nf))
+print(cm.predict("nb", r, data[0, :7]))        # predicted class
+</pre>
+<ul>
+  <li><code>fit_nb(X, **options)</code>.</li>
+  <li>Options (<code>NaiveBayesOptions</code>): <code>num_classes</code> (2), <code>var_smoothing</code> (1e-9), <code>threads</code> (256).</li>
+  <li>Result <code>NaiveBayesResult</code>: <code>model</code> and <code>stats</code>. <code>model</code> (<code>NaiveBayesModel</code>) has <code>nf</code>, <code>C</code>, <code>prior</code> (C), <code>mean</code> (C*nf) and <code>var</code> (C*nf, smoothed).</li>
+  <li><code>predict("nb", r, x)</code> returns the class index.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct NaiveBayesOptions {
+  u32 num_classes = 2;
+  float var_smoothing = 1e-9f;
+  u32 threads = 256;
+  ClusterExchange cluster;
+};
+struct NaiveBayesModel {
+  u32 nf = 0, C = 0;
+  std::vector<float> prior;  // C
+  std::vector<float> mean;   // C*nf
+  std::vector<float> var;    // C*nf (smoothed)
+  std::vector<float> Flatten() const;
+};
+struct NaiveBayesResult { NaiveBayesModel model; VecStats stats; };
+NaiveBayesResult FitNaiveBayes(Dataset &ds, const NaiveBayesOptions &opt);
+NaiveBayesResult FitNaiveBayesPlain(const float *data, u64 n_rows, u32 nf,
+                                    u64 elems_per_page, u32 nblocks,
+                                    const NaiveBayesOptions &opt);
+NaiveBayesResult FitNaiveBayesReference(/* same arguments */);
+u32 NaiveBayesPredict(const NaiveBayesModel &m, const float *x);
+</pre>
+<p>The ChiMod is module <code>ml_nb</code>.</p>
+
+<p>Related: <a href="/docs/ml/knn.html">k-nearest neighbours</a>, <a href="/docs/ml/logreg.html">logistic regression</a>, <a href="/docs/ml/tree.html">decision tree</a>.</p>

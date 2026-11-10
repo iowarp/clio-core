@@ -1,0 +1,65 @@
+<!--
+title: kmeans
+heading: <em>kmeans:</em> k-means clustering.
+description: API reference for clio-ml's k-means module (Lloyd's algorithm): Python fit_kmeans, C++ FitKMeans, options, result fields and row layout.
+eyebrow: Docs · Machine learning
+lede: Lloyd's k-means with caller-supplied initial centroids, the equivalent of Spark MLlib's KMeans. Centroids stay resident on the device; the rows are paged. Fixed iteration count, no early stop.
+facts: Module | ml_kmeans ; Header | clio_ml/kmeans.h ; Rows | features only
+-->
+<h2>What it does</h2>
+<p>Each iteration assigns every row to its nearest centroid and recomputes the centroids from the sums. Partials are reduced per block in a fixed order, so the result is bit-identical whether the cache holds all pages or a fraction of them. k-means parallel initialisation is not implemented: you pass the initial centroids.</p>
+
+<h2>Rows</h2>
+<p>Every column is a feature. <code>clio_ml.COLUMNS["kmeans"]</code> is 0.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+X = np.random.default_rng(0).normal(size=(4096, 8)).astype(np.float32)
+
+r = cm.fit_kmeans(X, k=4, iters=5)            # init_centroids defaults to X[:k]
+centroids = np.asarray(r.centroids).reshape(4, 8)
+print(r.counts)                               # points per cluster, last iteration
+
+cm.init()
+ds = cm.dataset(X, cache_pages=8)
+r2 = cm.fit_kmeans(ds, k=4, iters=5, init_centroids=X[:4])   # required for a Dataset
+cm.finalize()
+</pre>
+<ul>
+  <li><code>fit_kmeans(X, init_centroids=None, **options)</code>. For an in-memory array the default initial centroids are the first <code>k</code> rows; for a <code>Dataset</code> you must pass <code>init_centroids</code> (shape <code>k x features</code>).</li>
+  <li>Options: <code>k</code> (8), <code>iters</code> (10), <code>threads</code> (256).</li>
+  <li>Result <code>KMeansResult</code>: <code>centroids</code> (<code>k * dims</code>, row-major), <code>counts</code> (cluster sizes after the last iteration), <code>stats</code> (<code>faults</code>, <code>puts</code>, <code>evicts</code>, <code>get_errors</code>, <code>put_errors</code>; paged runs only).</li>
+  <li>No one-row predictor is exposed through <code>predict</code>.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct KMeansOptions {
+  u32 k = 8;
+  u32 iters = 10;
+  u32 threads = 256;        // <= GV_LB_THREADS
+  ClusterExchange cluster;  // default: single node
+};
+struct KMeansResult {
+  std::vector<float> centroids;  // k*dims, row-major
+  std::vector<u32> counts;       // k
+  VecStats stats;                // paged runs only
+};
+KMeansResult FitKMeans(Dataset &ds, const std::vector<float> &init_centroids,
+                       const KMeansOptions &opt);
+KMeansResult FitKMeansPlain(const float *data, u64 n_rows, u32 dims,
+                            u64 elems_per_page, u32 nblocks,
+                            const std::vector<float> &init_centroids,
+                            const KMeansOptions &opt);
+std::vector<float> FitKMeansReference(const float *data, u64 n_rows, u32 dims,
+                                      u64 elems_per_page, u32 nblocks,
+                                      const std::vector<float> &init_centroids,
+                                      u32 k, u32 iters);
+</pre>
+<p><code>FitKMeans</code> runs over a paged <code>Dataset</code> and needs the runtime. <code>FitKMeansPlain</code> runs the same kernel over a plain device copy of the data and needs a device but no runtime. <code>FitKMeansReference</code> is the CPU oracle with the same summation order.</p>
+
+<h2>ChiMod</h2>
+<p>Module <code>ml_kmeans</code>, library <code>clio_ml_kmeans_chimod</code>, client <code>clio_ml::chimod::KMeansClient</code>. Compute params are <code>KMeansParams(k, iters, threads, init_centroids)</code>. See <a href="/docs/ml/index.html#running-as-chimods">running as ChiMods</a>.</p>
+
+<p>Related: <a href="/docs/ml/bkm.html">bisecting k-means</a>, <a href="/docs/ml/gmm.html">Gaussian mixture</a>, fuzzy c-means.</p>

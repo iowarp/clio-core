@@ -1,0 +1,223 @@
+<!--
+title: Machine learning
+heading: clio-ml: <em>training on paged data.</em>
+description: How to build clio-ml, compose storage for it, load training data into a paged Dataset and fit any of its 32 algorithm modules from Python or C++.
+eyebrow: Docs · Machine learning
+lede: clio-ml is a library of Spark-MLlib-style algorithms written over CLIO Core's paged vectors. A dataset is a <code>Dataset</code> whose pages live in Context Transfer Engine tiers and stream through a device page cache, so training is not bounded by GPU or host memory. Every algorithm is also a ChiMod that runs on each node's shard.
+facts: Source | external/clio-ml ; Backends | CPU, CUDA, SYCL ; Python | clio_ml (nanobind) ; Modules | 32
+-->
+<h2>What it is</h2>
+<p>clio-ml is a ChiMod repository: one top-level directory per algorithm, each with a C++ API header under <code>include/clio_ml/</code>, a ChiMod client and runtime under <code>src/</code>, and a <code>clio_mod.yaml</code>. Shared code lives in <code>common/</code>: the <code>Dataset</code> wrapper, backend selection, the cluster exchange and the three paged engines (k-means, generalized linear models and a generic pass over the rows) for CPU, CUDA and SYCL.</p>
+<p>Every algorithm reads its data one page at a time from the paged vector and accumulates partial results per block in a fixed order. For a fixed data layout, block count and page size, the result is bit-identical whether the page cache holds the whole dataset or a fraction of it, and whether one node or several take part. Fits run as fixed iteration counts rather than to a tolerance, which keeps runs comparable.</p>
+
+<h2>Building</h2>
+<p>clio-ml does not vendor the runtime. Its engine libraries are built from inside a CLIO Core configure, which adds <code>external/clio-ml</code> as a subdirectory when the option below is on. The backend follows the core build: CUDA when <code>CLIO_CORE_ENABLE_CUDA</code> is on, SYCL when <code>CLIO_CORE_ENABLE_SYCL</code> is on without CUDA, and otherwise a CPU backend over <code>cpu_vector</code>.</p>
+<pre data-label="shell">
+$ cd core
+$ cmake -S . -B build \
+    -DCLIO_CORE_ENABLE_CUDA=ON \
+    -DCLIO_CORE_ENABLE_TESTS=ON \
+    -DCLIO_CORE_ENABLE_CLIO_ML=ON \
+    -DCLIO_ML_PYTHON=ON
+$ cmake --build build
+</pre>
+<ul>
+  <li><code>CLIO_CORE_ENABLE_CLIO_ML</code> (default OFF) adds clio-ml to the core build and sets <code>CLIO_ML_ENABLE_CUDA</code> from <code>CLIO_CORE_ENABLE_CUDA</code>.</li>
+  <li><code>CLIO_ML_PYTHON</code> (default OFF) builds the <code>clio_ml</code> Python package with nanobind 2.9.2 and stages it at <code>&lt;build&gt;/python/clio_ml</code>.</li>
+  <li><code>CLIO_ML_ENABLE_TESTS</code> (default ON) builds the per-algorithm unit tests and registers the <code>clio_ml_python</code> ctest.</li>
+  <li><code>CLIO_ML_SYCL_AOT_DEVICE</code> (SYCL only) ahead-of-time compiles the kernels for one Intel device such as <code>pvc</code>; empty means JIT.</li>
+</ul>
+<div class="callout">
+  <span class="callout-title">Standalone configure</span>
+  <p>The clio-ml README shows a standalone <code>cmake -S external/clio-ml -DCLIO_CORE_ROOT=...</code> invocation. The engine CMake file states that the algorithm libraries are in-tree only, so use the core option above to get a working build.</p>
+</div>
+<p>To use the Python package, put the staged directory on <code>PYTHONPATH</code>. On Windows the extension cannot find the runtime DLLs through <code>PATH</code>; list their directories in <code>CLIO_ML_DLL_PATH</code> (separated by <code>;</code>) before importing.</p>
+<pre data-label="shell">
+$ export PYTHONPATH=$PWD/build/python
+$ python -c "import clio_ml; print(clio_ml.backend)"   # cpu, cuda or sycl
+</pre>
+
+<h2>Composing storage and memory</h2>
+<p>A paged fit needs a runtime with a Context Transfer Engine pool. Every page of a <code>Dataset</code> is a blob in a CTE tag named after the dataset, so the pool's <code>storage</code> tiers decide where pages live when they are not in the device cache. The clio-ml tests use a RAM tier on a private port; add file tiers exactly as in <a href="/tutorials/compose.html">Compose local tiers</a> when the data exceeds DRAM.</p>
+<pre data-label="yaml · clio_ml.yaml">
+networking:
+  port: 9463
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+compose:
+  - mod_name: clio_cte_core
+    pool_name: clio_cte
+    pool_query: local
+    pool_id: 512.0
+    storage:
+      - path: "ram::clio_ml"
+        bdev_type: "ram"
+        capacity_limit: "512MB"
+        score: 1.0
+      - path: "/mnt/nvme/clio_ml/tier"
+        bdev_type: "file"
+        capacity_limit: "200GB"
+        score: 0.9
+    dpe:
+      dpe_type: "max_bw"
+</pre>
+<p>Point the client at the file and bind to loopback, which the Windows build requires:</p>
+<pre data-label="shell">
+$ export CLIO_SERVER_CONF=$PWD/clio_ml.yaml
+$ export CLIO_BIND_ADDR=127.0.0.1
+</pre>
+<p><code>clio_ml.init()</code> starts the runtime in-process and connects the CTE client; <code>clio_ml.finalize()</code> stops it. In C++ the same two calls are <code>clio::run::CLIO_INIT(RuntimeMode::kClient, true)</code> and <code>clio::cte::core::CLIO_CTE_CLIENT_INIT()</code>.</p>
+
+<h3>The Dataset and its cache</h3>
+<p>A <code>Dataset</code> is a row-major float32 matrix stored in a paged vector: <code>gpu_vector</code> on CUDA and SYCL builds, <code>cpu_vector</code> on the CPU build. These are the paged vectors of <a href="/docs/memory-expansion.html">memory expansion</a>, so the same cache, tiering and coherence rules apply. The constructor takes the cache geometry:</p>
+<ul>
+  <li><code>page_bytes</code>: the page size. A row must never straddle a page, so <code>page_bytes / 4</code> must be a multiple of the column count; the constructor throws otherwise.</li>
+  <li><code>nblocks</code>: how many device blocks the fit launches. Each block owns a contiguous range of pages.</li>
+  <li><code>set_size</code>: cache frames per block. <code>nblocks * set_size</code> frames smaller than the page count makes the fit out of core, and the result's <code>stats.evicts</code> counts the pages written back.</li>
+  <li><code>gpu_ids</code>: the devices to cache on (ignored on the CPU backend).</li>
+</ul>
+<p>The Python helper <code>clio_ml.dataset(X, cache_pages=None, page_bytes=16384, nblocks=4, gpu_ids=(0,))</code> computes this geometry from the array shape: it picks whole rows per page, at most four blocks, and <code>cache_pages</code> frames in total (all pages when omitted). It then calls <code>Dataset.preload(X)</code>, which writes the array into the paged store.</p>
+
+<h2>Getting training data in</h2>
+<p>The primary path is to assimilate the data where it already lives. Large tables usually arrive as CSV or Parquet files, often bigger than memory. <code>clio_ml.assimilate</code> streams the columns you name into a page-aligned float32 staging file, and the <a href="/docs/cae.html">Context Assimilation Engine</a> maps that file onto the dataset's tag, one blob per page. With <code>on_fault=True</code> (the default) nothing is copied up front: the CAE reads a page from the staging file the first time training touches it, and from then on the page lives on the tiers you composed.</p>
+<pre data-label="python · assimilated Parquet">
+import clio_ml as cm
+
+cm.init()
+ds, info = cm.assimilate("/data/trips.parquet",          # or a .csv
+                         columns=["distance", "duration", "passengers", "fare"],
+                         cache_pages=256,                # fewer than info["n_pages"]: out of core
+                         stage_dir="/scratch/clio")      # default: $CLIO_ML_STAGE_DIR or next to the file
+print(info["n_rows"], "rows in", info["n_pages"], "pages")
+
+model = cm.fit_linreg(ds, iters=50)                      # label column last
+centers = cm.fit_kmeans(cm.attach(info["tag"], info["n_rows"], info["n_cols"]),
+                        k=8, iters=20, init_centroids=X0)    # reopen the same tag; X0: k x features
+cm.finalize()
+</pre>
+<ul class="checks">
+  <li><strong>Columns</strong> keep the order given; put label columns last (<code>clio_ml.COLUMNS</code> gives the count per algorithm). Non-numeric or unknown columns raise an error naming the column.</li>
+  <li><strong>Missing values</strong> raise an error unless you pass <code>fill_value=</code>.</li>
+  <li><strong>Readers:</strong> Parquet needs <code>pyarrow</code>. CSV uses <code>pyarrow</code> when installed, then <code>pandas</code>, then the standard <code>csv</code> module. The file is read in batches, never whole.</li>
+  <li><strong>Ingest:</strong> <code>on_fault=True</code> pulls pages on first use, so keep the staging file in place while the dataset is used; <code>on_fault=False</code> ingests every page immediately.</li>
+  <li><strong>Reuse:</strong> <code>cm.attach(tag, n_rows, n_cols)</code> opens a dataset over a tag assimilated earlier; <code>cm.stage_table(...)</code> writes a staging file without a runtime. From C++, <code>clio_ml/assimilate.h</code> provides <code>AssimilateFloat32File</code>.</li>
+  <li><strong>Requires</strong> clio-core built with <code>CLIO_CORE_ENABLE_CAE=ON</code>; <code>cm.has_cae</code> reports it. Fits on an assimilated table are bit-equal to fits on the same rows passed as an array.</li>
+</ul>
+<p>Data already in memory can still be handed over directly: <code>cm.dataset(X)</code> preloads a NumPy array into the paged store, and every <code>fit_*</code> also accepts a plain array with no runtime at all.</p>
+
+<h2>From a NumPy array (Python)</h2>
+<p>Two ways to run every algorithm: in memory with no runtime, or paged through the runtime. Both return the same native result objects. This example fits linear regression both ways and checks that the paged fit, run out of core, is bit-equal to the in-memory fit. It follows the package's own test.</p>
+<pre data-label="python">
+import os
+import numpy as np
+
+os.environ.setdefault("CLIO_SERVER_CONF", "/path/to/clio_ml.yaml")
+os.environ.setdefault("CLIO_BIND_ADDR", "127.0.0.1")
+import clio_ml as cm
+
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+y = X @ np.array([1.5, -2, 0.5, 3, -1, 0.25, -0.75], np.float32) + 0.5
+data = np.column_stack([X, y]).astype(np.float32)   # 7 features, then the label
+
+# 1. In memory: no runtime needed.
+plain = cm.fit_linreg(data, iters=20)
+print(plain.weights[:7], "intercept", plain.weights[7])
+print("prediction", cm.predict("linreg", plain, data[0, :7]))
+
+# 2. Paged: a cache smaller than the data (8 pages here) runs out of core.
+cm.init()
+ds = cm.dataset(data, cache_pages=4)
+paged = cm.fit_linreg(ds, iters=20)
+print("evicts", paged.stats.evicts,
+      "bit-equal", np.array_equal(plain.weights, paged.weights))
+cm.finalize()
+</pre>
+<p>Options are keyword arguments named exactly as the C++ options fields, so <code>fit_kmeans(X, k=8, iters=20)</code> sets <code>KMeansOptions::k</code> and <code>KMeansOptions::iters</code>. An unknown name raises <code>TypeError</code>. Nested options take a dict, for example <code>fit_rf(X, num_trees=4, tree={"max_depth": 3})</code>. <code>predict(name, result, x)</code> evaluates one feature row for the algorithms that have a predictor. The in-memory path uses the algorithm's <code>*Plain</code> function with a 16 KiB page geometry; the native module <code>clio_ml.native</code> exposes every <code>Fit*</code>, <code>Fit*Plain</code>, <code>Fit*Reference</code> and <code>*Predict</code> function directly.</p>
+
+<h2>End-to-end example (C++)</h2>
+<pre data-label="cpp">
+#include "clio_ml/glm.h"
+
+// Runtime up: CLIO_INIT(RuntimeMode::kClient, true) and CLIO_CTE_CLIENT_INIT().
+constexpr clio_ml::u32 kNf = 7, kCols = kNf + 1, kBlocks = 4;
+constexpr clio_ml::u64 kPageBytes = 16 * 1024;           // 4096 floats = 512 rows
+std::vector<float> data = /* rows of 7 features then the label */;
+const clio_ml::u64 rows = data.size() / kCols;
+
+clio_ml::Dataset ds("linreg_demo", {0}, kPageBytes, kBlocks, /*set_size=*/16, rows, kCols);
+ds.Vec().Preload(data.data(), data.size());
+
+clio_ml::GlmOptions opt;
+opt.iters = 100;
+opt.learning_rate = 0.1f;
+clio_ml::GlmResult r = clio_ml::FitLinearRegression(ds, opt);
+// r.weights: 7 coefficients then the intercept; r.stats.evicts > 0 when out of core
+float yhat = clio_ml::GlmPredict(clio_ml::GlmKind::kLinear, r.weights, data.data());
+</pre>
+
+<h2>Running as ChiMods</h2>
+<p>Each algorithm is also a module named <code>ml_&lt;key&gt;</code> (listed in <code>clio_repo.yaml</code>) with two methods beyond the container lifecycle:</p>
+<ul>
+  <li><code>Compute</code> (method 10), sent with <code>PoolQuery::Broadcast()</code>: every container opens its node's shard, the tag <code>&lt;tag&gt;_n&lt;container id&gt;</code>, and runs the library <code>Fit*</code> on it. Replicas' models are merged; any disagreement sets the task's <code>mismatch_</code> flag.</li>
+  <li><code>Gather</code> (method 11), sent with <code>PoolQuery::AllToOne</code>: the per-pass all-gather. Each member's partial is written into its container-id slot, so the merge order is fixed and the cluster fit stays bit-identical to a single-device fit with <code>nodes * nblocks</code> blocks.</li>
+</ul>
+<p>The C++ client is <code>clio_ml::chimod::Client&lt;Algo&gt;</code>, for example <code>KMeansClient</code>. <code>AsyncCreate(query, pool_name, pool_id)</code> creates the pool, and <code>AsyncCompute(tag, global_rows, cols, page_bytes, nblocks, set_size, compute_id, params)</code> runs the fit; <code>params</code> is the algorithm's options encoded as floats by a helper such as <code>KMeansParams(k, iters, threads, init)</code>. The task returns <code>model_</code> (the flattened model), <code>faults_</code>, <code>evicts_</code>, <code>replicas_</code>, <code>mismatch_</code> and <code>error_</code>. The ChiMod path has no Python binding.</p>
+
+<h2>Algorithms</h2>
+<p>Each page gives the full name, the Python and C++ API with option defaults, the row layout and a short example.</p>
+<h3>Clustering</h3>
+<ul>
+  <li><a href="/docs/ml/kmeans.html">kmeans</a>: k-means (Lloyd)</li>
+  <li><a href="/docs/ml/bkm.html">bkm</a>: bisecting k-means</li>
+  <li><a href="/docs/ml/gmm.html">gmm</a>: Gaussian mixture model</li>
+  <li>fcm: fuzzy c-means</li>
+  <li>msh: mean shift</li>
+  <li><a href="/docs/ml/pic.html">pic</a>: power iteration clustering</li>
+</ul>
+<h3>Regression</h3>
+<ul>
+  <li><a href="/docs/ml/linreg.html">linreg</a>: linear regression</li>
+  <li><a href="/docs/ml/enet.html">enet</a>: elastic net and Lasso</li>
+  <li><a href="/docs/ml/pglm.html">pglm</a>: Poisson generalized linear model</li>
+  <li><a href="/docs/ml/iso.html">iso</a>: isotonic regression</li>
+  <li><a href="/docs/ml/aft.html">aft</a>: accelerated failure time survival regression</li>
+  <li><a href="/docs/ml/fm.html">fm</a>: factorization machine regression</li>
+  <li><a href="/docs/ml/gbt.html">gbt</a>: gradient-boosted regression trees</li>
+</ul>
+<h3>Classification</h3>
+<ul>
+  <li><a href="/docs/ml/logreg.html">logreg</a>: binary logistic regression</li>
+  <li><a href="/docs/ml/mlr.html">mlr</a>: multinomial logistic regression</li>
+  <li><a href="/docs/ml/svm.html">svm</a>: linear support vector machine</li>
+  <li><a href="/docs/ml/nb.html">nb</a>: Gaussian naive Bayes</li>
+  <li><a href="/docs/ml/knn.html">knn</a>: k-nearest neighbours</li>
+  <li><a href="/docs/ml/tree.html">tree</a>: decision tree</li>
+  <li><a href="/docs/ml/rf.html">rf</a>: random forest</li>
+  <li><a href="/docs/ml/gbtc.html">gbtc</a>: gradient-boosted tree classifier</li>
+</ul>
+<h3>Neural networks</h3>
+<ul>
+  <li><a href="/docs/ml/mlp.html">mlp</a>: multilayer perceptron</li>
+  <li>cnn: 1-D convolutional classifier</li>
+  <li>lstm: LSTM sequence classifier</li>
+  <li>gnn: graph neural network</li>
+  <li>torch: clio_torch MLP trained data-parallel</li>
+</ul>
+<h3>Decomposition, recommendation, text and patterns</h3>
+<ul>
+  <li><a href="/docs/ml/pca.html">pca</a>: principal component analysis</li>
+  <li><a href="/docs/ml/als.html">als</a>: alternating least squares</li>
+  <li><a href="/docs/ml/lda.html">lda</a>: latent Dirichlet allocation</li>
+  <li><a href="/docs/ml/w2v.html">w2v</a>: word2vec</li>
+  <li><a href="/docs/ml/fim.html">fim</a>: frequent itemsets and association rules</li>
+  <li><a href="/docs/ml/seq.html">seq</a>: sequential pattern mining</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/memory-expansion.html">Memory expansion: the paged vectors underneath</a></li>
+  <li><a href="/docs/cae.html">Context Assimilation Engine: staging external data</a></li>
+  <li><a href="/technologies/machine-learning.html">Measured results</a></li>
+</ul>

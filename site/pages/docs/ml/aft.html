@@ -1,0 +1,36 @@
+<!--
+title: aft
+heading: <em>aft:</em> accelerated failure time survival regression.
+description: API reference for clio-ml's accelerated failure time survival regression module: Python fit_aft, C++ API, options, result fields and row layout.
+eyebrow: Docs · Machine learning
+lede: A Weibull accelerated failure time model, the equivalent of Spark MLlib's AFTSurvivalRegression.
+facts: Module | ml_aft ; Header | clio_ml/aft.h
+-->
+<h2>What it does</h2>
+<p>A Weibull accelerated failure time model, the equivalent of Spark MLlib's AFTSurvivalRegression. It fits the coefficients, the intercept and log(sigma) by full-batch Adam on the mean negative log-likelihood, one paged pass per step.</p>
+
+<h2>Rows</h2>
+<p>Features, then <code>time</code> and <code>event</code> (1 observed, 0 censored). <code>clio_ml.COLUMNS["aft"]</code> is 2.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+r = cm.fit_aft(X, iters=500)                   # X: features | time | event
+median = cm.predict("aft", r, X[0, :-2])        # exp(mu) * (ln 2)^sigma
+</pre>
+<ul>
+  <li><code>fit_aft(X, **options)</code> accepts an in-memory array or a paged <code>Dataset</code> from <code>cm.dataset(X)</code> or <code>cm.assimilate(...)</code>.</li>
+  <li>Options: <code>iters</code> (500), <code>learning_rate</code> (0.02, Adam), <code>threads</code> (256).</li>
+  <li>Result <code>AftResult</code>: <code>coef</code> (n_features coefficients, the intercept, then log(sigma)), <code>loss_history</code> (mean negative log-likelihood per step), <code>stats</code>. <code>Sigma()</code> returns exp of the last coefficient.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+AftResult FitAft(Dataset &amp;ds, const AftOptions &amp;opt);
+AftResult FitAftPlain(const float *data, u64 n_rows, u32 nf, u64 elems_per_page,
+                      u32 nblocks, const AftOptions &amp;opt);
+float AftPredictMedian(const AftResult &amp;r, const float *x);  // median survival time
+</pre>
+<p>The paged call needs the runtime; the <code>Plain</code> call runs the same kernel over a plain copy of the data without one.</p>
+
+<p>Related: <a href="/docs/ml/pglm.html">Poisson GLM</a>, <a href="/docs/ml/linreg.html">linear regression</a>. Back to the <a href="/docs/ml/index.html">machine learning overview</a>.</p>

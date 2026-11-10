@@ -1,0 +1,61 @@
+<!--
+title: fim
+heading: <em>fim:</em> frequent itemsets and association rules.
+description: API reference for clio-ml's frequent itemset mining module (FP-Growth-equivalent output mined level-wise): Python fit_fim, C++ MineFrequentItemsets, FrequentItemsetOptions, Itemset and AssociationRule.
+eyebrow: Docs · Machine learning
+lede: Mines every itemset whose support is at least <code>min_support</code>, plus association rules, with the same output as Spark MLlib's FPGrowth. Candidates of size L are generated on the host from the frequent (L-1)-itemsets and counted in one paged pass per level.
+facts: Module | ml_fim ; Header | clio_ml/frequent_itemsets.h ; Rows | one 0/1 column per item
+-->
+<h2>What it does</h2>
+<p>Counts are integers, so the result is exact and independent of paging or block order. Itemsets are returned sorted by size and then by items. Rules have a single consequent item.</p>
+
+<h2>Rows</h2>
+<p>One transaction per row with one 0/1 column per item. <code>clio_ml.COLUMNS["fim"]</code> is 0.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+T = (np.random.default_rng(1).random((4096, 8)) < 0.4).astype(np.float32)
+
+r = cm.fit_fim(T, min_support=0.1, min_confidence=0.6, max_size=4)
+for s in r.itemsets[:5]:
+    print(s.items, s.count)
+for rule in r.rules[:5]:
+    print(rule.antecedent, "->", rule.consequent, rule.confidence, rule.lift)
+</pre>
+<ul>
+  <li><code>fit_fim(X, **options)</code> calls <code>MineFrequentItemsets</code>.</li>
+  <li>Options (<code>FrequentItemsetOptions</code>): <code>min_support</code> (0.05, fraction of transactions), <code>min_confidence</code> (0.6, for rules), <code>max_size</code> (4), <code>threads</code> (256).</li>
+  <li>Result <code>FrequentItemsetResult</code>: <code>itemsets</code> (list of <code>Itemset</code> with ascending <code>items</code> and <code>count</code>), <code>rules</code> (list of <code>AssociationRule</code> with <code>antecedent</code>, <code>consequent</code>, <code>confidence</code>, <code>lift</code>), <code>stats</code>.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct FrequentItemsetOptions {
+  float min_support = 0.05f;
+  float min_confidence = 0.6f;
+  u32 max_size = 4;
+  u32 threads = 256;
+  ClusterExchange cluster;
+};
+struct Itemset { std::vector<u32> items; u64 count = 0; };
+struct AssociationRule {
+  std::vector<u32> antecedent;
+  u32 consequent = 0;
+  double confidence = 0, lift = 0;
+};
+struct FrequentItemsetResult {
+  std::vector<Itemset> itemsets;       // sorted by (size, items)
+  std::vector<AssociationRule> rules;
+  VecStats stats;
+  std::vector<float> Flatten() const;
+};
+FrequentItemsetResult MineFrequentItemsets(Dataset &ds, const FrequentItemsetOptions &opt);
+FrequentItemsetResult MineFrequentItemsetsPlain(const float *data, u64 n_rows, u32 n_items,
+                                                u64 elems_per_page, u32 nblocks,
+                                                const FrequentItemsetOptions &opt);
+FrequentItemsetResult MineFrequentItemsetsReference(/* same arguments */);
+</pre>
+<p>The ChiMod is module <code>ml_fim</code>.</p>
+
+<p>Related: <a href="/docs/ml/seq.html">sequential patterns</a>, <a href="/docs/ml/lda.html">LDA</a>.</p>

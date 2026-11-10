@@ -1,90 +1,61 @@
 <!--
-title: Technologies
-heading: One stack, <em>four products.</em>
-description: CLIO Core is a composable I/O stack. Context FS, a key-value store, memory expansion and machine learning are products built from the same modules.
-eyebrow: Technologies
-lede: CLIO Core is a set of runtime modules (block devices, a tiered blob engine, adapters, data operators) that you compose from YAML into the I/O path your pipeline needs. The products on these pages are four such compositions.
-facts: Runtime | Coroutine tasks over shared memory, TCP or sockets ; Composed from | One YAML file ; Platforms | Linux, macOS, Windows, GPUs
+title: Context Runtime
+heading: Context Runtime: <em>one runtime for data and compute.</em>
+description: The Context Runtime is the distributed task runtime under CLIO Core. Modules run as pools, tasks travel over shared memory, sockets, TCP and storage tiers, and the stack can be recomposed, grown and recovered while it runs.
+eyebrow: Technologies · Runtime
+lede: The Context Runtime hosts every CLIO Core module. Where MPI gives a fixed set of processes a way to exchange messages, the Context Runtime gives a long-running service a way to move data across memory, networks and storage, to change what it runs without restarting, and to keep going when nodes come and go.
+facts: Unit of code | Module (ChiMod), run as a pool ; Unit of work | Task, run as a coroutine ; Transports | Shared memory, Unix sockets, TCP ; Configured by | One YAML compose file
 -->
-<h2>The composable I/O stack</h2>
-<p>A data-intensive pipeline moves the same bytes through several systems: a simulation writes checkpoints, an analysis job reads them back, a model trains on them, an agent searches them. Each hop usually means a different storage system, a copy and a format. CLIO Core replaces those systems with one runtime and a set of modules you compose, so every hop shares the same substrate.</p>
-
-<h3>Basic principles</h3>
+<h2>Beyond message passing</h2>
+<p>MPI is the standard way to write parallel programs: a fixed set of ranks is launched together, exchanges messages and collectives, and exits together. That model fits a single simulation. It fits less well when one data set passes through a simulation, an analysis service, a model and an agent, each with its own lifetime, and when data must also move between memory, local disks and cloud storage.</p>
+<p>The Context Runtime starts from a different unit. Instead of ranks, it hosts <strong>modules</strong> as long-lived pools on every node. Instead of messages, clients submit <strong>tasks</strong> to a pool, and the runtime decides which node runs them, on which worker, and over which transport. The same runtime moves bytes over the network and onto storage, so a transfer to another node and a transfer to an NVMe tier or an S3 bucket go through one interface.</p>
 <ul class="checks">
-  <li><strong>Everything is a module.</strong> Storage devices, the blob engine, caches, filesystems and even machine-learning algorithms are modules (ChiMods), shared libraries the runtime loads at startup.</li>
-  <li><strong>A module runs as a pool.</strong> A pool is a named instance of a module, addressed by a numeric <code>pool_id</code>, with one container on each node it spans. Two pools of the same module can run side by side with different settings.</li>
-  <li><strong>Work is a task.</strong> Clients submit tasks to a pool over shared memory, TCP or sockets; worker threads run them as coroutines, so a task that waits on I/O or another pool never blocks a thread.</li>
-  <li><strong>The stack is a YAML file.</strong> The <code>compose</code> list names the pools to create, in order, with each module's own settings. Changing the stack means editing that list, not the code.</li>
+  <li><strong>MPI:</strong> processes and messages; fixed membership; a rank failure usually ends the job; storage is a separate library.</li>
+  <li><strong>Context Runtime:</strong> modules and tasks; nodes can be added and pools created or destroyed while it runs; clients survive restarts; network and storage paths share one abstraction.</li>
+</ul>
+<p>The two coexist. An MPI application can keep its ranks and use the runtime underneath for I/O, checkpoints and memory expansion.</p>
+
+<h2>Diverse transfer paths</h2>
+<p>A task reaches its module over the cheapest path available, without the caller choosing it.</p>
+<ul class="checks">
+  <li><strong>Within a node:</strong> shared-memory rings, or a Unix socket when shared memory is unavailable. Code already inside the runtime hands tasks over directly, with no serialization.</li>
+  <li><strong>Across nodes:</strong> TCP, with small messages on a latency lane so probes and acknowledgements never wait behind large transfers.</li>
+  <li><strong>From GPUs:</strong> GPU kernels can submit tasks themselves, through a GPU queue served by the runtime.</li>
+  <li><strong>Into storage:</strong> block devices for RAM, pinned and GPU memory, files and asynchronous I/O, Amazon S3 and Google Cloud Storage, and erasure-coded arrays built from any of them, with GPUDirect Storage support.</li>
 </ul>
 
-<h3>Pool queries: choosing where work runs</h3>
-<p>Every task carries a <em>pool query</em> that tells the runtime which containers of the pool should run it. The same module code can then serve one node or a whole cluster.</p>
+<h2>Abstractions</h2>
 <ul class="checks">
-  <li><code>Local</code>: the container on this node. Used for node-local work and by default in the <code>compose</code> list (<code>pool_query: local</code>).</li>
-  <li><code>DirectId</code>, <code>DirectHash</code>, <code>Physical</code>: one container, chosen by id, by hashing a key, or by node.</li>
-  <li><code>Range</code>, <code>Broadcast</code>: many containers, or all of them.</li>
-  <li><code>Dynamic</code>: the module decides per task. The CTE routes each blob to the node that owns it; the cache routes to the caller's own node.</li>
-  <li><code>ManyToOne</code>, <code>AllToOne</code>: collectives. Tasks from many containers are batched at one leader, run once, and the result is sent back to all of them; <code>AllToOne</code> waits for every container, like a reduction.</li>
+  <li><strong>Modules (ChiMods)</strong> are shared libraries that define a set of methods. Storage, caching, replication, filesystems, search and machine-learning algorithms are all modules.</li>
+  <li><strong>Pools</strong> are running instances of a module, with one container on each node. Two pools of one module can run side by side with different settings.</li>
+  <li><strong>Tasks</strong> are method calls on a pool. Handlers are coroutines, so a task that waits on I/O or on another pool frees its worker thread.</li>
+  <li><strong>Pool queries</strong> say where a task should run: this node, one container chosen by key, a range, every container, or wherever the module decides. Collective queries batch tasks from many nodes, run them once and return the result to all of them.</li>
+  <li><strong>Interposition</strong> lets a module stand in front of another and forward what it does not handle. Caching, replication, compression and indexing are added this way, without changing the modules above or below.</li>
 </ul>
 
-<h3>Data operators</h3>
-<p>Data-path modules form an <strong>interposition chain</strong>. Each operator speaks the storage engine's interface, receives its calls, handles the ones it cares about and forwards the rest to its <code>next_pool_id</code>. Because the interface is the same above and below, an operator can be inserted or removed without touching the modules around it, and everything above it (the FUSE mount, the Python API, other operators) works unchanged.</p>
-<p class="mono-line">filesystem 560.0 → your operator 600.0 → cache 563.0 → indexer 564.0 → replication 561.0 → core 512.0</p>
-<p>An operator is a C++ class whose handlers are coroutines. This one counts the bytes written to each tag: it forwards the write down the chain, waits for it, and counts it only if it succeeded.</p>
-<pre data-label="c++">
-class Runtime : public clio::cte::core::CoreInterposer {
- public:
-  clio::run::TaskResume PutBlob(
-      clio::run::shared_ptr&lt;clio::cte::core::PutBlobTask&gt; &amp;task) {
-    CLIO_TASK_BODY_BEGIN
-    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
-                                task.template Cast&lt;clio::run::Task&gt;()));
-    if (task-&gt;GetReturnCode() == 0) CountBytes(*task);  // after it succeeded
-    CLIO_CO_RETURN;
-    CLIO_TASK_BODY_END
-  }
-  // ...
-};
-CLIO_TASK_CC(Runtime)   // export the module from the shared library
-</pre>
-<p>Build it outside the CLIO Core tree, point <code>CLIO_REPO_PATH</code> at the library, and add it to the chain:</p>
-<pre data-label="yaml">
-compose:
-  - mod_name: clio_demo_bytecount
-    pool_name: bytecount
-    pool_query: local
-    pool_id: "600.0"
-    next_pool_id: "563.0"     # forward to the cache
-</pre>
-<p><a href="/develop/operator.html">Write a chain operator</a> walks through the full module, build and run.</p>
+<h2>Dynamic recomposition</h2>
+<p>The stack is described by a compose file, a list of pools and their settings. The runtime creates them at startup, and <code>clio_run compose start</code> and <code>compose stop</code> create or destroy the pools in a compose file while the runtime keeps serving. New modules are discovered from a library path, so an operator built outside the tree can be added to a running deployment. Pools are recorded in a durable registry, so a restarted node brings its composition back.</p>
 
-<h3>The modules that ship</h3>
-<div class="product-grid">
-  <a href="/modules/bdev.html"><span class="feature-index">Storage</span><h3>Block devices</h3><p>RAM, files, asynchronous I/O, GPU memory, Amazon S3 and Google Cloud Storage as tiers.</p></a>
-  <a href="/modules/safe-bdev.html"><span class="feature-index">Storage</span><h3>safe_bdev</h3><p>Erasure coding across other block devices; grows in place and rebuilds failed members.</p></a>
-  <a href="/modules/cte-core.html"><span class="feature-index">Storage</span><h3>CTE core</h3><p>Tags, blobs, scores and placement across every tier.</p></a>
-  <a href="/modules/cache.html"><span class="feature-index">Operator</span><h3>Cache</h3><p>Hot copies on fast tiers, kept consistent with the store below.</p></a>
-  <a href="/modules/replication.html"><span class="feature-index">Operator</span><h3>Replication</h3><p>Durable copies on persistent tiers, and recovery from them.</p></a>
-  <a href="/modules/compressor.html"><span class="feature-index">Operator</span><h3>Compressor</h3><p>Compression on the way down, with the codec chosen per workload.</p></a>
-  <a href="/modules/indexer.html"><span class="feature-index">Context</span><h3>Indexer</h3><p>Keyword (BM25) and name search over everything written.</p></a>
-  <a href="/modules/cae-core.html"><span class="feature-index">Context</span><h3>Assimilation</h3><p>Imports files, HDF5, web, S3, Google Cloud and Globus data.</p></a>
-  <a href="/modules/summarizer.html"><span class="feature-index">Context</span><h3>Summarizer</h3><p>Language-model summaries stored beside the data they describe.</p></a>
-</div>
-<p>The filesystem, stream and checkpoint modules also enter the chain at the cache. <a href="/modules/index.html">The module reference</a> covers each one and its settings.</p>
+<h2>Scheduling</h2>
+<p>Each node runs a pool of worker threads with roles: scheduling, network send and receive, a GPU queue, and I/O workers in cost classes. Tasks are mapped by predicted cost, learned from observed run times: large I/O is spread across I/O workers, cheap tasks run inline, and everything else goes to the least-loaded worker in its class. A monitor moves the queue of a worker stuck on one task to a fresh worker, grows a class whose workers are saturated, and retires idle extra workers.</p>
 
-<h3>What you can build</h3>
-<p>Because a module is just code the runtime hosts, the same mechanism scales from a few lines in the storage path to an entire application.</p>
+<h2>Elasticity</h2>
+<p>Nodes can be added to a running cluster. When a node is registered, every module's containers receive an <code>Expand</code> callback so they can re-partition data or update routing. Containers can be migrated to another node through a <code>Migrate</code> callback, and after a node is lost, a <code>Recover</code> callback rebuilds a container elsewhere from replicas or checkpoints, with <code>ScheduleRecover</code> letting the module pick where. Container ids are fixed by the host list, so hashing stays stable while nodes come and go.</p>
+
+<h2>Failure detection</h2>
 <ul class="checks">
-  <li><strong>The storage layer.</strong> A new block-device type or a module attached as a tier puts data somewhere new: another device, an object store, a remote service. A placement policy changes where data lands and when it moves. See <a href="/develop/extend-storage.html">Extend the storage system</a>.</li>
-  <li><strong>Data operators in the I/O path.</strong> Encryption, deduplication, format conversion, auditing or custom caching, applied to every write and read that passes through, with no change to the application.</li>
-  <li><strong>In-transit analytics.</strong> An operator sees data as it is written, so it can index, summarize, reduce or check it before it ever lands, with the collective pool queries to combine results across nodes. The indexer and summarizer are built this way.</li>
-  <li><strong>Full workloads.</strong> Whole computations can run as modules next to the data they use. The clio-ml algorithms (k-means, ALS, gradient-boosted trees, CNNs and more) are modules that train out of core on data the stack already holds.</li>
+  <li><strong>Restarted peers</strong> are detected from an incarnation number on every message; requests in flight to the old incarnation fail promptly and are retried.</li>
+  <li><strong>Silent peers</strong> are probed, and declared dead after 30 seconds of silence. Requests to them fail after a timeout, or immediately in fail-fast mode.</li>
+  <li><strong>Clients</strong> detect a lost runtime with a heartbeat, wait for it or fail over to another node, reconnect and resend. The runtime, in turn, survives clients that die.</li>
+  <li><strong>Data</strong> survives node loss through the replication module, not through the runtime alone. A gossip detector exists but is off by default, because at large scale wide collectives starved its probes.</li>
 </ul>
+<p><a href="/design/runtime.html">Runtime design</a> covers each mechanism and its tradeoffs, and <a href="/docs/runtime.html">the Context Runtime docs</a> show how to build a module.</p>
 
-<h2>Products</h2>
+<h2>Built on the runtime</h2>
+<p>Each CLIO Core technology is a composition of modules on the Context Runtime.</p>
 <div class="product-grid">
   <a href="/technologies/context-fs.html"><span class="feature-index">Storage</span><h3>Context FS</h3><p>A distributed filesystem over your tiers. FUSE on Linux, macOS and Windows; erasure-coded arrays that grow one drive at a time; buckets as tiers.</p><span class="stat">Metadata ops in 10-570 µs, no metadata server</span></a>
-  <a href="/technologies/kv-store.html"><span class="feature-index">Storage</span><h3>Key-value store</h3><p>Tags and blobs from C++ or Python over shared memory, with placement scores, regex queries and keyword search.</p><span class="stat">YCSB-B: 42.6k ops/s vs Redis 16.8k</span></a>
+  <a href="/technologies/context-transfer-engine.html"><span class="feature-index">Storage</span><h3>Context Transfer Engine</h3><p>Tags and blobs from C++ or Python over shared memory, with placement scores, regex queries and keyword search.</p><span class="stat">YCSB-B: 42.6k ops/s vs Redis 16.8k</span></a>
   <a href="/technologies/memory-expansion.html"><span class="feature-index">Memory</span><h3>Memory expansion</h3><p>Paged vectors for GPU and CPU code whose data is larger than device memory, spilling to RAM, NVMe and beyond.</p><span class="stat">0.93x MPI step time on 4 Aurora nodes</span></a>
   <a href="/technologies/machine-learning.html"><span class="feature-index">Compute</span><h3>Machine learning</h3><p>clio-ml: MLlib-equivalent algorithms that train out of core on one GPU tile per node.</p><span class="stat">8-59x faster per iteration than Spark MLlib</span></a>
 </div>

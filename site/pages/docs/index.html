@@ -1,13 +1,13 @@
 <!--
 title: Introduction
 heading: What CLIO Core <em>does for you.</em>
-description: CLIO Core is a composable I/O stack for data-intensive pipelines: a filesystem, a key-value store, memory expansion and machine learning built from one runtime.
+description: CLIO Core is a composable I/O stack for data-intensive pipelines: a filesystem, the Context Transfer Engine, memory expansion and machine learning built from one runtime.
 eyebrow: Docs
 lede: CLIO Core is a runtime of storage, memory and compute modules that you compose into the I/O path a pipeline needs. It places data across RAM, NVMe, disk, GPUs and cloud buckets, and exposes it as a filesystem, a key-value store, paged memory or training data.
 facts: Written for | Scientists, HPC users and developers ; Works on | Linux, macOS, Windows ; License | BSD 3-Clause
 -->
 <h2>The short version</h2>
-<p>You start one background process per node, the runtime, with a YAML file that lists the modules and storage tiers you want. What you put in front of them decides the product you get: <a href="/technologies/context-fs.html">Context FS</a> mounts a directory that any program can use, the <a href="/technologies/kv-store.html">key-value store</a> gives C++ and Python direct access to tags and blobs, <a href="/technologies/memory-expansion.html">memory expansion</a> pages GPU and CPU arrays larger than memory, and <a href="/technologies/machine-learning.html">clio-ml</a> trains models on that data. The quickest way to see it work is the filesystem, so these docs start there.</p>
+<p>You start one background process per node, the runtime, with a YAML file that lists the modules and storage tiers you want. What you put in front of them decides the product you get: <a href="/technologies/context-fs.html">Context FS</a> mounts a directory that any program can use, the <a href="/technologies/context-transfer-engine.html">key-value store</a> gives C++ and Python direct access to tags and blobs, <a href="/technologies/memory-expansion.html">memory expansion</a> pages GPU and CPU arrays larger than memory, and <a href="/technologies/machine-learning.html">clio-ml</a> trains models on that data. The quickest way to see it work is the filesystem, so these docs start there.</p>
 <p>Underneath every product, CLIO Core decides where each piece of data lives. Recently used data stays in RAM. Colder data moves to NVMe or disk. A persistent copy protects it across restarts. An index records the words in each file, so you can later ask "which files mention sea ice extent?" and get a ranked answer.</p>
 
 <h2>What you can do with it</h2>
@@ -18,19 +18,16 @@ facts: Written for | Scientists, HPC users and developers ; Works on | Linux, ma
   <a href="/tutorials/dashboard.html"><span class="feature-index">04</span><h3>Watch the runtime</h3><p>See nodes, workers and storage tiers live in the built-in web dashboard.</p></a>
 </div>
 
-<h2>How the pieces fit</h2>
-<p>You will see these names in commands and logs:</p>
-<div class="table-wrap"><table>
-  <thead><tr><th>Name</th><th>What it is</th><th>You meet it as</th></tr></thead>
-  <tbody>
-    <tr><td>Runtime</td><td>The background process on each node. It hosts every other component.</td><td><code>clio_run start</code></td></tr>
-    <tr><td>CTE</td><td>The Context Transfer Engine: tiered storage of <em>tags</em> (named containers) and <em>blobs</em> (named byte ranges).</td><td>Storage tiers in <code>clio.yaml</code></td></tr>
-    <tr><td>Filesystem</td><td>A POSIX namespace built from CTE tags. Every file is a tag, and its data is stored as 1 MiB page blobs.</td><td><code>clio_cte_fuse</code></td></tr>
-    <tr><td>Indexer</td><td>Keeps a keyword (BM25) index of what is written, for search.</td><td><code>SemanticSearch</code> in Python</td></tr>
-    <tr><td>CAE</td><td>The Context Assimilation Engine imports external data: files, HDF5, S3 and Google Cloud Storage.</td><td><code>AssimilationCtx</code></td></tr>
-    <tr><td>CEE</td><td>The Context Exploration Engine: a high-level API to bundle, query and retrieve.</td><td><code>import clio_cee</code></td></tr>
-  </tbody>
-</table></div>
+<h2>The documentation, by technology</h2>
+<div class="card-list">
+  <a href="/docs/context-fs.html"><span class="feature-index">01</span><h3>Context FS</h3><p>Start the runtime, mount the filesystem, the default composition, and where to go for advanced ones.</p></a>
+  <a href="/docs/cae.html"><span class="feature-index">02</span><h3>Context Assimilation Engine</h3><p>Bring files, HDF5, web and cloud data into the stack, and describe content as it is written.</p></a>
+  <a href="/docs/cee.html"><span class="feature-index">03</span><h3>Context Exploration Engine</h3><p>Bundle, query and retrieve data by name, keywords or time, and compose storage for search.</p></a>
+  <a href="/docs/cte.html"><span class="feature-index">04</span><h3>Context Transfer Engine</h3><p>Tags, blobs and scores: the data model and the C++ and Python APIs.</p></a>
+  <a href="/docs/runtime.html"><span class="feature-index">05</span><h3>Context Runtime</h3><p>Build a ChiMod: modules, tasks, pools and pool queries.</p></a>
+  <a href="/docs/memory-expansion.html"><span class="feature-index">06</span><h3>Memory expansion</h3><p>CPU and GPU vectors larger than memory: API, configuration and examples.</p></a>
+  <a href="/docs/ml/index.html"><span class="feature-index">07</span><h3>Machine learning</h3><p>Compose storage and memory for clio-ml, and the API of each algorithm.</p></a>
+</div>
 <p>The <a href="/docs/concepts.html">core concepts</a> page explains tags, blobs, scores and pools in more depth. The <a href="/design/index.html">design</a> section covers the internals.</p>
 
 <h2>Where to start</h2>

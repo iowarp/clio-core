@@ -1,0 +1,36 @@
+<!--
+title: w2v
+heading: <em>w2v:</em> word2vec.
+description: API reference for clio-ml's word2vec module: Python fit_w2v, C++ API, options, result fields and row layout.
+eyebrow: Docs · Machine learning
+lede: Skip-gram embeddings with negative sampling, the equivalent of Spark MLlib's Word2Vec.
+facts: Module | ml_w2v ; Header | clio_ml/word2vec.h
+-->
+<h2>What it does</h2>
+<p>Skip-gram embeddings with negative sampling, the equivalent of Spark MLlib's Word2Vec. Input and output embeddings are learned by full-batch Adam on the logistic loss, one paged pass per step, with gradients summed in a fixed row order so results are bit-reproducible across paging and node counts. You generate the pairs and negative samples.</p>
+
+<h2>Rows</h2>
+<p>Fixed records <code>[center id, context id, label, pad]</code>: label 1 for a positive pair, 0 for a negative sample.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+r = cm.fit_w2v(P, vocab_size=5000, dim=64)     # P: (center, context, label, 0)
+vectors = np.asarray(r.model.params)[:5000 * 64].reshape(5000, 64)
+</pre>
+<ul>
+  <li><code>fit_w2v(X, **options)</code> accepts an in-memory array or a paged <code>Dataset</code> from <code>cm.dataset(X)</code> or <code>cm.assimilate(...)</code>.</li>
+  <li>Options: <code>vocab_size</code> (required), <code>dim</code> (8), <code>iters</code> (300), <code>learning_rate</code> (0.05, Adam), <code>seed</code> (1), <code>threads</code> (256).</li>
+  <li>Result <code>Word2VecResult</code>: <code>model</code> (<code>V</code>, <code>d</code>, <code>params</code> = input then output embeddings), <code>loss_history</code>, <code>stats</code>.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+Word2VecResult FitWord2Vec(Dataset &amp;ds, const Word2VecOptions &amp;opt);
+Word2VecResult FitWord2VecPlain(const float *data, u64 n_pairs, u64 elems_per_page,
+                                u32 nblocks, const Word2VecOptions &amp;opt);
+u32 Word2VecNearest(const Word2VecModel &amp;m, u32 w);  // nearest word by cosine
+</pre>
+<p>The paged call needs the runtime; the <code>Plain</code> call runs the same kernel over a plain copy of the data without one.</p>
+
+<p>Related: <a href="/docs/ml/lda.html">LDA</a>. Back to the <a href="/docs/ml/index.html">machine learning overview</a>.</p>
