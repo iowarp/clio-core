@@ -65,9 +65,24 @@ $ cmake --build build -j"$(nproc)" && sudo cmake --install build
 </section>
 
 <div class="chapters page">
+  <section class="chapter-row reveal" id="technologies" aria-labelledby="tech-title">
+    <div class="section-heading">
+      <p class="eyebrow"><span class="chapter">01 /</span> Technologies</p>
+      <h2 id="tech-title">Mask diverse storage<br><em>under cohesive interfaces.</em></h2>
+      <p>Storage is becoming more diverse and increasingly integrated into memory to drive down costs. A single system may include DRAM, NVMe, burst buffers, Amazon S3 or Google Cloud as candidate storage. CLIO Core presents that complex, distributed storage through simple, cohesive interfaces: filesystems, a key-value store, memory expansion and popular machine-learning algorithms. You worry about the data; CLIO Core worries about where it is placed.</p>
+      <a class="text-link" href="/technologies/index.html">How the stack composes <span aria-hidden="true">→</span></a>
+    </div>
+    <div class="product-grid">
+      <a href="/technologies/context-fs.html"><span class="feature-index">Storage</span><h3>Context FS</h3><p>Mount like any other directory on Windows, macOS and Linux via FUSE, over tiered, erasure-coded and cloud storage.</p><span class="stat">stat in ~10 µs, no metadata server</span></a>
+      <a href="/technologies/kv-store.html"><span class="feature-index">Storage</span><h3>Key-value store</h3><p>Tags and blobs from C++ and Python, placed by score across every tier.</p><span class="stat">YCSB-B 42.6k ops/s, 2.5x Redis</span></a>
+      <a href="/technologies/memory-expansion.html"><span class="feature-index">Memory</span><h3>Memory expansion</h3><p>Paged GPU and CPU vectors larger than device memory, across nodes.</p><span class="stat">0.93x MPI step time on Aurora</span></a>
+      <a href="/technologies/machine-learning.html"><span class="feature-index">Compute</span><h3>Machine learning</h3><p>clio-ml: MLlib-equivalent training out of core on one GPU tile per node.</p><span class="stat">8-59x Spark MLlib per iteration</span></a>
+    </div>
+  </section>
+
   <section class="chapter-row reveal" id="compose" aria-labelledby="compose-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">01 /</span> Compose</p>
+      <p class="eyebrow"><span class="chapter">02 /</span> Compose</p>
       <h2 id="compose-title">Compose a storage stack<br><em>special for your case.</em></h2>
       <p>One YAML file describes the whole stack. Its <code>compose</code> section lists the modules to start, and each one runs as a pool inside the runtime. Block devices turn RAM, files, NVMe, erasure-coded arrays and S3 or Google Cloud buckets into tiers. The Context Transfer Engine places data across them by score. Above it sit <strong>data operators</strong>: modules that each handle one concern and pass everything else down the chain through <code>next_pool_id</code>.</p>
       <ul class="checks">
@@ -121,21 +136,6 @@ compose:
     next_pool_id: "564.0"
     min_score: 0.5
 </pre>
-  </section>
-
-  <section class="chapter-row reveal" id="technologies" aria-labelledby="tech-title">
-    <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">02 /</span> Technologies</p>
-      <h2 id="tech-title">Mask diverse storage<br><em>under cohesive interfaces.</em></h2>
-      <p>Storage is becoming more diverse and increasingly integrated into memory to drive down costs. A single system may include DRAM, NVMe, burst buffers, Amazon S3 or Google Cloud as candidate storage. CLIO Core presents that complex, distributed storage through simple, cohesive interfaces: filesystems, a key-value store, memory expansion and popular machine-learning algorithms. You worry about the data; CLIO Core worries about where it is placed.</p>
-      <a class="text-link" href="/technologies/index.html">How the stack composes <span aria-hidden="true">→</span></a>
-    </div>
-    <div class="product-grid">
-      <a href="/technologies/context-fs.html"><span class="feature-index">Storage</span><h3>Context FS</h3><p>Mount like any other directory on Windows, macOS and Linux via FUSE, over tiered, erasure-coded and cloud storage.</p><span class="stat">stat in ~10 µs, no metadata server</span></a>
-      <a href="/technologies/kv-store.html"><span class="feature-index">Storage</span><h3>Key-value store</h3><p>Tags and blobs from C++ and Python, placed by score across every tier.</p><span class="stat">YCSB-B 42.6k ops/s, 2.5x Redis</span></a>
-      <a href="/technologies/memory-expansion.html"><span class="feature-index">Memory</span><h3>Memory expansion</h3><p>Paged GPU and CPU vectors larger than device memory, across nodes.</p><span class="stat">0.93x MPI step time on Aurora</span></a>
-      <a href="/technologies/machine-learning.html"><span class="feature-index">Compute</span><h3>Machine learning</h3><p>clio-ml: MLlib-equivalent training out of core on one GPU tile per node.</p><span class="stat">8-59x Spark MLlib per iteration</span></a>
-    </div>
   </section>
 
   <section class="chapter-row reveal" id="scale" aria-labelledby="scale-title">
