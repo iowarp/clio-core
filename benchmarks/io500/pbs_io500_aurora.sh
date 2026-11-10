@@ -172,7 +172,7 @@ EOF
         DAOS_POOL="$DAOS_POOL" DAOS_CONT="$DAOS_CONT" \
     bash "$HERE/cliofs_node.sh" > logs/node_up.log 2>&1 &
   NODES_PID=$!
-  for _ in $(seq 1 240); do
+  for _ in $(seq 1 "${UP_WAIT:-240}"); do
     [ "$(ls ready 2>/dev/null | wc -l)" -ge "$NN" ] && break
     kill -0 $NODES_PID 2>/dev/null || break
     sleep 1
@@ -192,7 +192,7 @@ elif [ "$MODE" = daos ]; then
     env OUT="$OUT" DAOS_POOL="$DAOS_POOL" DAOS_CONT="$DAOS_CONT" \
     bash "$HERE/daos_node.sh" > logs/node_up.log 2>&1 &
   NODES_PID=$!
-  for _ in $(seq 1 240); do
+  for _ in $(seq 1 "${UP_WAIT:-240}"); do
     [ "$(ls ready 2>/dev/null | wc -l)" -ge "$NN" ] && break
     kill -0 $NODES_PID 2>/dev/null || break
     sleep 1
