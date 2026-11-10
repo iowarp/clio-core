@@ -40,9 +40,12 @@
 
 #include "clio_runtime/worker.h"
 #include "clio_runtime/cycle_counter.h"
+#include "clio_runtime/evlat.h"
 
 /** Latency-report channel hook (defined in ipc_gpu2cpu.cc). */
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
+/** Measured TSC rate for the report (defined in ipc_gpu2cpu.cc). */
+extern "C" double clio_evlat_cycles_per_us();
 
 namespace {
 
@@ -73,7 +76,7 @@ struct EvqWaitByWorker {
     if (worker >= static_cast<unsigned>(kMax)) return;
     n[worker].fetch_add(1, std::memory_order_relaxed);
     sum[worker].fetch_add(cycles, std::memory_order_relaxed);
-    if (cycles > 5000ull * 2995ull) {
+    if (cycles > static_cast<unsigned long long>(5000.0 * clio_evlat_cycles_per_us())) {
       slow[worker].fetch_add(1, std::memory_order_relaxed);
     }
   }
@@ -82,7 +85,7 @@ struct EvqWaitByWorker {
       const unsigned long long c = n[w].load();
       if (c == 0) continue;
       std::fprintf(stderr, "clio-evqw worker=%d n=%llu avg=%.0fus slow(>5ms)=%llu\n",
-                   w, c, static_cast<double>(sum[w].load()) / 2995.0 /
+                   w, c, static_cast<double>(sum[w].load()) / clio_evlat_cycles_per_us() /
                              static_cast<double>(c),
                    slow[w].load());
     }
@@ -1419,6 +1422,14 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
     BookHold(task_ptr.get());
     task_ptr->ResumeCoroutine(task_ptr);
   } else {
+    if (evlat::On() && task_ptr->IsRemote()) {
+      // Serving node, first run of a peer's task: close r_lane, open r_exec.
+      if (RunContext *ev_rc = task_ptr->RunCtxPtr()) {
+        const unsigned long long now = CycleNow();
+        evlat::Span(evlat::kRemoteLane, ev_rc->remote_arrive_cyc_, now);
+        ev_rc->remote_start_cyc_ = now;
+      }
+    }
     task_ptr->StartCoroutine(task_ptr);
     task_ptr->SetStarted();
 
@@ -1639,6 +1650,12 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   // small ACK / heartbeat reply doesn't queue behind a 1 MiB GetBlob
   // response on the wire.
   if (is_remote) {
+    if (evlat::On()) {
+      if (RunContext *ev_rc = task_ptr->RunCtxPtr()) {
+        evlat::Span(evlat::kRemoteExec, ev_rc->remote_start_cyc_, CycleNow());
+        ev_rc->remote_start_cyc_ = 0;
+      }
+    }
     CLIO_IPC->GetRun2Run()->NoteResponseAge(task_ptr, "end-task");
     size_t io_size = task_ptr->PredictedStat().io_size_;
     NetQueuePriority prio = (io_size >= kNetQueueIoThreshold)

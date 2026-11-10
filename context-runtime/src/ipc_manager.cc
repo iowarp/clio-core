@@ -51,6 +51,7 @@
 #endif
 
 #include "clio_runtime/ipc_manager.h"
+#include "clio_runtime/evlat.h"
 
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
 #include <zmq.h>
@@ -2971,6 +2972,14 @@ void IpcManager::NetProfMarkRecvIn(const clio::run::shared_ptr<Task> &task) {
   netqprof::life_start[key] = netqprof::NowNs();
 }
 
+/** The four cross-node Send priorities (not the client response ones). */
+static inline bool IsCrossNodeSend(NetQueuePriority p) {
+  return p == NetQueuePriority::kSendInLatency ||
+         p == NetQueuePriority::kSendInIO ||
+         p == NetQueuePriority::kSendOutLatency ||
+         p == NetQueuePriority::kSendOutIO;
+}
+
 void IpcManager::EnqueueNetTask(Future<Task> future,
                                 NetQueuePriority priority) {
   if (net_queue_.IsNull()) {
@@ -2982,6 +2991,12 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
   u32 priority_idx = static_cast<u32>(priority);
   auto &lane = net_queue_->GetLane(0, priority_idx);
   bool was_empty = lane.Empty();
+  if (evlat::On() && IsCrossNodeSend(priority)) {
+    auto t = future.GetTaskPtr();
+    if (!t.IsNull()) {
+      if (RunContext *rc = t->RunCtxPtr()) rc->net_enq_cyc_ = CycleNow();
+    }
+  }
   if (netqprof::On()) {
     netqprof::push_ns[priority_idx].store(netqprof::NowNs(),
                                           std::memory_order_relaxed);
@@ -3093,6 +3108,17 @@ bool IpcManager::TryPopNetTask(NetQueuePriority priority,
     }
   }
   if (popped) {
+    if (evlat::On() && IsCrossNodeSend(priority)) {
+      auto t = future.GetTaskPtr();
+      RunContext *rc = t.IsNull() ? nullptr : t->RunCtxPtr();
+      if (rc != nullptr && rc->net_enq_cyc_ != 0) {
+        const bool is_in = priority == NetQueuePriority::kSendInLatency ||
+                           priority == NetQueuePriority::kSendInIO;
+        evlat::Span(is_in ? evlat::kOriginNetQ : evlat::kRemoteNetQ,
+                    rc->net_enq_cyc_, CycleNow());
+        rc->net_enq_cyc_ = 0;
+      }
+    }
     if (netqprof::On()) {
       uint64_t pushed =
           netqprof::push_ns[priority_idx].load(std::memory_order_relaxed);

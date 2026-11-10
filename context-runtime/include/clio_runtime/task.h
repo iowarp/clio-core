@@ -1030,6 +1030,13 @@ class RunContext {
    *  at SendIn and read when the remote reply completes it (channel
    *  rtt_remote). 0 when unset. */
   unsigned long long notify_ns_ = 0;
+  /** Cross-node stage stamps (CLIO_EVLAT only; see clio_runtime/evlat.h).
+   *  net_enq_cyc_: pushed onto the net send queue (SendIn or SendOut).
+   *  remote_arrive_cyc_ / remote_start_cyc_: on the serving node, when
+   *  RecvIn received the task and when a worker first ran it. 0 = unset. */
+  unsigned long long net_enq_cyc_ = 0;
+  unsigned long long remote_arrive_cyc_ = 0;
+  unsigned long long remote_start_cyc_ = 0;
 
  private:
   std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event

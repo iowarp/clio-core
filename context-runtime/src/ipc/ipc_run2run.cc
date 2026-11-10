@@ -39,6 +39,7 @@
 
 /** Latency-report channel hook (defined in ipc_gpu2cpu.cc). */
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
+#include "clio_runtime/evlat.h"
 #include <clio_runtime/pool_manager.h>
 #include <clio_runtime/config_manager.h>
 #include <clio_runtime/worker.h>
@@ -256,6 +257,8 @@ void IpcManagerRun2Run::SendInTransmitReplica(
 // =============================================================================
 
 void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_task) {
+  clio::run::evlat::ScopedSpan ev_span(clio::run::evlat::kOriginSend,
+                                       clio::run::evlat::kBusyNetSend);
   auto *ipc_manager = CLIO_IPC;
   auto *pool_manager = CLIO_POOL_MANAGER;
 
@@ -516,6 +519,8 @@ int IpcManagerRun2Run::SendOutTransmit(
 // =============================================================================
 
 void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_task) {
+  clio::run::evlat::ScopedSpan ev_span(clio::run::evlat::kRemoteSend,
+                                       clio::run::evlat::kBusyNetSend);
   auto *ipc_manager = CLIO_IPC;
 
   if (origin_task.IsNull()) {
@@ -567,6 +572,11 @@ void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_ta
   // actually left. Erasing before the send made a response parked in
   // send_out_retry_ look Gone to the origin, which then failed the task.
   if (rc == 0) {
+    if (clio::run::RunContext *ev_rc = origin_task->RunCtxPtr()) {
+      clio::run::evlat::Span(clio::run::evlat::kRemoteResid,
+                             ev_rc->remote_arrive_cyc_, clio::run::evlat::Now());
+      ev_rc->remote_arrive_cyc_ = 0;
+    }
     EraseRecvEntry(origin_task);
   }
   // Task frees via RAII when its shared_ptr owners drop (the by-value
@@ -584,6 +594,7 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     const clio::run::TaskInfo &task_info,
     clio::run::LoadTaskArchive &archive,
     ctp::lbm::Transport *lbm_transport) {
+  const unsigned long long ev_arrive = clio::run::evlat::Now();
   // Receipt is proof of life (issue #774): a task arriving from a node we had
   // SWIM-marked dead proves it is alive NOW. Without this, a one-sided death
   // verdict is TERMINAL: our revival probes to the "dead" node are themselves
@@ -697,6 +708,11 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   future.GetTaskPtr()->BeginRunContext();
+  if (ev_arrive != 0) {
+    if (clio::run::RunContext *ev_rc = task_ptr->RunCtxPtr()) {
+      ev_rc->remote_arrive_cyc_ = ev_arrive;
+    }
+  }
   ipc_manager->NetProfMarkRecvIn(task_ptr);
   task_ptr->SetRouted();
 
@@ -1847,6 +1863,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
       while (!recv_shutdown_.load(std::memory_order_acquire)) {
         clio::run::LoadTaskArchive archive;
         const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
+        const unsigned long long ev_r0 = clio::run::evlat::Now();
         auto info = lbm_transport->Recv(archive);
         int rc = info.rc;
         if (rc != 0) {
@@ -1861,6 +1878,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
         const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
         if (nettrace::On()) nettrace::recv_ns += nt1 - nt0;
         drained_any = true;
+        const unsigned long long ev_r1 = clio::run::evlat::Now();
         CheckPeerIncarnation(archive);
         clio::run::MsgType msg_type = archive.GetMsgType();
         switch (msg_type) {
@@ -1885,10 +1903,25 @@ void IpcManagerRun2Run::StartRecvThreads() {
                  static_cast<int>(msg_type));
             break;
         }
+        if (ev_r0 != 0) {
+          namespace ev = clio::run::evlat;
+          const unsigned long long ev_r2 = clio::run::CycleNow();
+          if (msg_type == clio::run::MsgType::kSerializeIn) {
+            ev::Span(ev::kRemoteRead, ev_r0, ev_r1);
+            ev::Span(ev::kRemoteRecvIn, ev_r1, ev_r2);
+          } else if (msg_type == clio::run::MsgType::kSerializeOut) {
+            ev::Span(ev::kOriginRead, ev_r0, ev_r1);
+            ev::Span(ev::kOriginRecvOut, ev_r1, ev_r2);
+          }
+          clio_evlat_busy(ev::kBusyPeerRecv, ev_r0, ev_r2);
+        }
         lbm_transport->ClearRecvHandles(archive);
       }
       if (!drained_any && !recv_shutdown_.load(std::memory_order_acquire)) {
+        const unsigned long long ev_p0 = clio::run::evlat::Now();
         lbm_transport->PollRecv(kZmqPollTimeoutMs);
+        clio::run::evlat::Span(clio::run::evlat::kPeerRecvPoll, ev_p0,
+                               clio::run::evlat::Now());
       }
     }
     HLOG(kInfo, "[PeerRecvThread] shutting down");
