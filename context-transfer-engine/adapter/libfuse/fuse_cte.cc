@@ -779,6 +779,7 @@ struct DirAttrEntry {
 std::mutex g_dir_attr_mtx;
 PathMap<DirAttrEntry> g_dir_attr;
 double g_dir_attr_ttl_s = 0.0;  ///< set at init; 0 disables the cache
+double g_entry_ttl_s = 0.0;  ///< kernel entry TTL, set at init (#1323)
 
 /**
  * Serve a directory's attributes from the cache.
@@ -1791,6 +1792,7 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   }
   cfg->attr_timeout = attr_ttl;
   cfg->entry_timeout = entry_ttl;
+  g_entry_ttl_s = entry_ttl;
   g_dir_attr_ttl_s = MultiNode() ? 0.0 : attr_ttl;
   cfg->negative_timeout = attr_ttl;
   // Writeback cache: OFF by default. Enabling it batches write()s in the
@@ -2464,10 +2466,77 @@ static int cte_fuse_getattr(const char *path, struct fuse_darwin_attr *attr,
   return 0;
 }
 #else
+// issue #1323: multi-node mounts keep a 1 s ENTRY cache, so after another
+// node unlinks a name this kernel still holds a positive dentry for it. An
+// open(O_CREAT) on that dentry revalidates it with GETATTR (not LOOKUP), and an
+// ENOENT reply there fails the open outright: the kernel never falls back to
+// LOOKUP + CREATE. Answer ESTALE ONCE for a path this mount resolved positive
+// within the entry TTL: the VFS retries the walk with LOOKUP_REVAL, the forced
+// LOOKUP gets the real ENOENT, and the open proceeds to CREATE (a plain stat
+// ends in ENOENT as before). The one-shot erase keeps the REVAL retry from
+// seeing ESTALE again.
+static std::mutex g_pos_mtx;
+static std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+    g_recent_pos;
+static std::unordered_map<int64_t, std::chrono::steady_clock::time_point>
+    g_estale_tid;  ///< last ESTALE per calling thread (guarded by g_pos_mtx)
+
+static bool StaleOnVanished() {
+#if defined(__linux__)
+  return MultiNode() && g_entry_ttl_s > 0.0;
+#else
+  return false;
+#endif
+}
+
 // Linux (struct stat) and Windows (WinFsp stat via cte_stat_t).
 static int cte_fuse_getattr(const char *path, cte_stat_t *stbuf,
                             struct fuse_file_info *fi) {
-  return cte_fuse_getattr_stat(path, stbuf, fi);
+  int rc = cte_fuse_getattr_stat(path, stbuf, fi);
+  if (path == nullptr || fi != nullptr || !StaleOnVanished()) return rc;
+  const auto now = std::chrono::steady_clock::now();
+  const auto window = std::chrono::duration_cast<
+      std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(g_entry_ttl_s * 2.0 + 0.5));
+  std::lock_guard<std::mutex> lk(g_pos_mtx);
+  if (rc == 0) {
+    if (g_recent_pos.size() >= 65536) {
+      for (auto it = g_recent_pos.begin(); it != g_recent_pos.end();) {
+        it = (now - it->second > window) ? g_recent_pos.erase(it) : ++it;
+      }
+      if (g_recent_pos.size() >= 65536) g_recent_pos.clear();
+    }
+    g_recent_pos[path] = now;
+  } else if (rc == -ENOENT) {
+    auto it = g_recent_pos.find(path);
+    if (it != g_recent_pos.end()) {
+      bool fresh = now - it->second <= window;
+      g_recent_pos.erase(it);
+      // The VFS retries an ESTALE syscall exactly ONCE. A syscall that walks
+      // two such paths (rename: source and target) would see a second ESTALE
+      // on the retry and leak it to the application (dirs_rename_storm). Give
+      // each calling thread at most one per second: its retry then always
+      // sees the real answer.
+      if (fresh) {
+        const fuse_context *fc = fuse_get_context();
+        const int64_t tid = fc != nullptr ? static_cast<int64_t>(fc->pid) : -1;
+        auto tt = g_estale_tid.find(tid);
+        if (tt != g_estale_tid.end() &&
+            now - tt->second < std::chrono::seconds(1)) {
+          fresh = false;
+        } else {
+          if (g_estale_tid.size() >= 4096) g_estale_tid.clear();
+          g_estale_tid[tid] = now;
+        }
+      }
+#if defined(__linux__)
+      if (fresh) return -ESTALE;
+#else
+      (void)fresh;
+#endif
+    }
+  }
+  return rc;
 }
 #endif
 

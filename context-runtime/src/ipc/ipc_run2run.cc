@@ -1915,19 +1915,26 @@ void IpcManagerRun2Run::StartRecvThreads() {
     }
     if (ipc_transport) ipc_transport->RegisterEventManager(client_recv_em_);
     HLOG(kInfo, "[ClientRecvThread] started");
+    int idle_waits = 0;
     while (!recv_shutdown_.load(std::memory_order_acquire)) {
       // issue #1039: admit client requests that arrived before their pool.
       ReplayDeferredClientRecv();
       clio::run::u32 tasks_received = 0;
       bool did_work = clio::run::IpcCpu2CpuZmq::RecvIn(ipc_manager,
                                                        tasks_received);
+      if (did_work) idle_waits = 0;
       if (!did_work && !recv_shutdown_.load(std::memory_order_acquire)) {
         // Nothing drained: block on the IPC socket via the EventManager (its
         // bounded timeout also re-polls the TCP transport). If only TCP exists,
         // block on its native zmq_poll instead so we don't hit the EventManager's
         // tick-floored empty-handle Sleep fallback on Windows.
         if (ipc_transport) {
-          client_recv_em_.Wait(kRecvWaitTimeoutUs);
+          // issue #1339: back off to 1ms after ~100 empty waits (~10ms idle);
+          // reset on work. Bounds idle CPU while keeping the TCP re-poll fast
+          // under load.
+          int wait_us = (idle_waits < 100) ? kRecvWaitTimeoutUs : 1000;
+          ++idle_waits;
+          client_recv_em_.Wait(wait_us);
         } else if (tcp_transport) {
           tcp_transport->PollRecv(kZmqPollTimeoutMs);
         }
