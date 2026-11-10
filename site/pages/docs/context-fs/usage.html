@@ -70,6 +70,8 @@ PS&gt;clio_run stop
   <p>The indexer sits above the compressor so its read-backs see uncompressed bytes. The cache sits on top so that the zero-copy shared-memory read path stays available even for blobs that are compressed or replicated below. <a href="/design/chain.html">The interposition chain</a> explains the design.</p>
 </div>
 
+<div class="callout"><span class="callout-title">Performance</span><p>A RAM tier is faulted in lazily, so the first writes into it pay page faults. Start the runtime with <code>CLIO_PREFAULT=0</code> (or a size such as <code>4GB</code>) to fault it in at startup. That and the other tuning knobs are covered in <a href="/docs/context-fs/performance.html">Performance and tuning</a>.</p></div>
+
 <h2>Changing the tiers</h2>
 <p>Tiers are the <code>storage</code> list of the <code>clio_cte_core</code> entry. Each entry has a <code>path</code> (<code>ram::&lt;name&gt;</code> for DRAM or a file path on the device), a <code>bdev_type</code> (<code>ram</code> or <code>file</code>; <code>hbm</code> and <code>pinned</code> on GPU builds), a <code>capacity_limit</code>, a <code>score</code> from 0.0 (slowest) to 1.0 (fastest), and an optional <code>persistence_level</code> of <code>volatile</code> (the default), <code>temporary</code> or <code>long_term</code>. Copy the default file, edit the list, and point the runtime at your copy:</p>
 <pre data-label="yaml · ~/clio-tiers.yaml (excerpt)">

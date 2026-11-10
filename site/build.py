@@ -69,6 +69,7 @@ def _title_of(f: Path) -> str:
 # sidebar. These pages come first, in this order, when they exist.
 DOC_CORE_PAGES = [("index.html", "Overview"), ("install.html", "Install"),
                   ("quickstart.html", "Quickstart"), ("usage.html", "Usage"),
+                  ("performance.html", "Performance and tuning"),
                   ("api.html", "API reference")]
 
 
