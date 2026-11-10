@@ -1,0 +1,46 @@
+<!--
+title: Context Exploration Engine
+heading: Context Exploration Engine: <em>ask for data by what it says.</em>
+description: The Context Exploration Engine (CEE) finds and reads data in CLIO Core by name pattern, keyword relevance or time window, from C++ or Python, across every node.
+eyebrow: Technologies · Context
+lede: Once data is in the stack, the next question is which of it matters. The Context Exploration Engine is one small interface for finding and reading data by name, by content or by time, whichever technology wrote it, and handing it to an analysis, a model or an agent.
+facts: Python | import clio_cee ; C++ | iowarp::ContextInterface ; Queries | Regex, BM25 keywords, time window ; Scope | Every node, one call
+-->
+<h2>Key takeaways</h2>
+<ul class="checks">
+  <li>One small API in C++ and Python: bundle, query, retrieve and destroy.</li>
+  <li>Finds data by name pattern, by keyword relevance (BM25) or by time window, across every node at once.</li>
+  <li>Sees everything written through Context FS, the Context Transfer Engine or the assimilation engine, with no import step.</li>
+  <li>Returns matches packed into one size-bounded buffer, ready for an analysis or a model.</li>
+</ul>
+
+<h2>Three ways to ask</h2>
+<ul class="checks">
+  <li><strong>By name:</strong> regular expressions over tag and blob names.</li>
+  <li><strong>By content:</strong> a prompt ranked by keyword relevance (BM25) against the indexed text, including labels written by the summarizer.</li>
+  <li><strong>By time:</strong> what was modified in a time window.</li>
+</ul>
+<p>Every query is broadcast, so each node answers for the data it owns and the runtime merges the result.</p>
+<pre data-label="python">
+import clio_cee as cee
+
+ctx = cee.ContextInterface()
+hits = ctx.context_query("run42.*", ".*", max_results=5,
+                         prompt="sea ice extent anomaly")
+data = ctx.context_retrieve("run42.*", ".*", max_results=5,
+                            max_context_size=64 << 20,
+                            prompt="sea ice extent anomaly")
+</pre>
+
+<h2>One view over everything</h2>
+<p>The engine stores nothing of its own. Files written through a Context FS mount, objects put through the Context Transfer Engine and data imported by the assimilation engine are all tags and blobs, so they are all queryable the moment they are written. <code>context_bundle</code> imports new sources through the assimilation engine in the same call style.</p>
+
+<h2>Composed for search</h2>
+<p>What the engine can find depends on the stack you compose: keep the indexer in the chain so every writer is indexed, add the summarizer for content labels, and give retrieval a fast tier. The defaults already do the first; the <a href="/docs/cee.html#composing-storage-for-search">docs</a> show the rest.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/cee.html">Context Exploration Engine docs</a>: API, query modes, MCP server and limits.</li>
+  <li><a href="/tutorials/python-semantic-query.html">Query files from Python</a>.</li>
+  <li><a href="/technologies/cae.html">Context Assimilation Engine</a>: bring data in to explore.</li>
+</ul>

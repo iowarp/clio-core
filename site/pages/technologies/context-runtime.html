@@ -1,0 +1,60 @@
+<!--
+title: Context Runtime
+heading: Context Runtime: <em>one runtime for data and compute.</em>
+description: The Context Runtime is the distributed task runtime under CLIO Core. Modules run as pools, tasks travel over shared memory, sockets, TCP and storage tiers, and the stack can be recomposed, grown and recovered while it runs.
+eyebrow: Technologies · Runtime
+lede: The Context Runtime hosts every CLIO Core module. Where MPI gives a fixed set of processes a way to exchange messages, the Context Runtime gives a long-running service a way to move data across memory, networks and storage, to change what it runs without restarting, and to keep going when nodes come and go.
+facts: Unit of code | Module (ChiMod), run as a pool ; Unit of work | Task, run as a coroutine ; Transports | Shared memory, Unix sockets, TCP ; Configured by | One YAML compose file
+-->
+<h2>Key takeaways</h2>
+<ul class="checks">
+  <li>Hosts every module as a long-lived pool and runs work as tasks, rather than as a fixed set of MPI ranks.</li>
+  <li>One abstraction for moving data over shared memory, sockets, TCP and storage tiers.</li>
+  <li>Recompose the stack, add nodes and recover from failures while it runs.</li>
+</ul>
+
+<h2>Beyond message passing</h2>
+<p>MPI is the standard way to write parallel programs: a fixed set of ranks is launched together, exchanges messages and collectives, and exits together. That model fits a single simulation. It fits less well when one data set passes through a simulation, an analysis service, a model and an agent, each with its own lifetime, and when data must also move between memory, local disks and cloud storage.</p>
+<p>The Context Runtime starts from a different unit. Instead of ranks, it hosts <strong>modules</strong> as long-lived pools on every node. Instead of messages, clients submit <strong>tasks</strong> to a pool, and the runtime decides which node runs them, on which worker, and over which transport. The same runtime moves bytes over the network and onto storage, so a transfer to another node and a transfer to an NVMe tier or an S3 bucket go through one interface.</p>
+<ul class="checks">
+  <li><strong>MPI:</strong> processes and messages; fixed membership; a rank failure usually ends the job; storage is a separate library.</li>
+  <li><strong>Context Runtime:</strong> modules and tasks; nodes can be added and pools created or destroyed while it runs; clients survive restarts; network and storage paths share one abstraction.</li>
+</ul>
+<p>The two coexist. An MPI application can keep its ranks and use the runtime underneath for I/O, checkpoints and memory expansion.</p>
+
+<h2>Diverse transfer paths</h2>
+<p>A task reaches its module over the cheapest path available, without the caller choosing it.</p>
+<ul class="checks">
+  <li><strong>Within a node:</strong> shared-memory rings, or a Unix socket when shared memory is unavailable. Code already inside the runtime hands tasks over directly, with no serialization.</li>
+  <li><strong>Across nodes:</strong> TCP, with small messages on a latency lane so probes and acknowledgements never wait behind large transfers.</li>
+  <li><strong>From GPUs:</strong> GPU kernels can submit tasks themselves, through a GPU queue served by the runtime.</li>
+  <li><strong>Into storage:</strong> block devices for RAM, pinned and GPU memory, files and asynchronous I/O, Amazon S3 and Google Cloud Storage, and erasure-coded arrays built from any of them, with GPUDirect Storage support.</li>
+</ul>
+
+<h2>Abstractions</h2>
+<ul class="checks">
+  <li><strong>Modules (ChiMods)</strong> are shared libraries that define a set of methods. Storage, caching, replication, filesystems, search and machine-learning algorithms are all modules.</li>
+  <li><strong>Pools</strong> are running instances of a module, with one container on each node. Two pools of one module can run side by side with different settings.</li>
+  <li><strong>Tasks</strong> are method calls on a pool. Handlers are coroutines, so a task that waits on I/O or on another pool frees its worker thread.</li>
+  <li><strong>Pool queries</strong> say where a task should run: this node, one container chosen by key, a range, every container, or wherever the module decides. Collective queries batch tasks from many nodes, run them once and return the result to all of them.</li>
+  <li><strong>Interposition</strong> lets a module stand in front of another and forward what it does not handle. Caching, replication, compression and indexing are added this way, without changing the modules above or below.</li>
+</ul>
+
+<h2>Dynamic recomposition</h2>
+<p>The stack is described by a compose file, a list of pools and their settings. The runtime creates them at startup, and <code>clio_run compose start</code> and <code>compose stop</code> create or destroy the pools in a compose file while the runtime keeps serving. New modules are discovered from a library path, so an operator built outside the tree can be added to a running deployment. Pools are recorded in a durable registry, so a restarted node brings its composition back.</p>
+
+<h2>Scheduling</h2>
+<p>Each node runs a pool of worker threads with roles: scheduling, network send and receive, a GPU queue, and I/O workers in cost classes. Tasks are mapped by predicted cost, learned from observed run times: large I/O is spread across I/O workers, cheap tasks run inline, and everything else goes to the least-loaded worker in its class. A monitor moves the queue of a worker stuck on one task to a fresh worker, grows a class whose workers are saturated, and retires idle extra workers.</p>
+
+<h2>Elasticity</h2>
+<p>Nodes can be added to a running cluster. When a node is registered, every module's containers receive an <code>Expand</code> callback so they can re-partition data or update routing. Containers can be migrated to another node through a <code>Migrate</code> callback, and after a node is lost, a <code>Recover</code> callback rebuilds a container elsewhere from replicas or checkpoints, with <code>ScheduleRecover</code> letting the module pick where. Container ids are fixed by the host list, so hashing stays stable while nodes come and go.</p>
+
+<h2>Failure detection</h2>
+<ul class="checks">
+  <li><strong>Restarted peers</strong> are detected from an incarnation number on every message; requests in flight to the old incarnation fail promptly and are retried.</li>
+  <li><strong>Silent peers</strong> are probed, and declared dead after 30 seconds of silence. Requests to them fail after a timeout, or immediately in fail-fast mode.</li>
+  <li><strong>Clients</strong> detect a lost runtime with a heartbeat, wait for it or fail over to another node, reconnect and resend. The runtime, in turn, survives clients that die.</li>
+  <li><strong>Data</strong> survives node loss through the replication module, not through the runtime alone. A gossip detector exists but is off by default, because at large scale wide collectives starved its probes.</li>
+</ul>
+<p><a href="/design/runtime.html">Runtime design</a> covers each mechanism and its tradeoffs, and <a href="/docs/runtime.html">the Context Runtime docs</a> show how to build a module.</p>
+

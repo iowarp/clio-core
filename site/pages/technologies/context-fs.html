@@ -6,6 +6,13 @@ eyebrow: Technologies · Storage
 lede: Mount like any other directory on Windows, macOS and Linux via FUSE. Context FS presents the tiers you compose (RAM, NVMe, disk, erasure-coded arrays, cloud buckets) as one ordinary directory. Applications use it without changes; the stack underneath decides where each page lives.
 facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no metadata server ; Unit of data | 1 MiB page blobs ; Durability | ext4-style, durable on fsync
 -->
+<h2>Key takeaways</h2>
+<ul class="checks">
+  <li>Mount it like any other directory on Linux, macOS and Windows through FUSE. Applications run unchanged.</li>
+  <li>Files spread across the tiers you compose (RAM, NVMe, erasure-coded arrays, Amazon S3 or Google Cloud buckets) by score, with distributed metadata and no metadata server.</li>
+  <li>Every file is also tags and blobs in the Context Transfer Engine, so search, assimilation and the other technologies use it without a copy.</li>
+</ul>
+
 <ul class="headline-stats">
   <li><strong>10 µs</strong><span>stat from the shared-memory mirror</span></li>
   <li><strong>0</strong><span>metadata servers: inodes are homed by path</span></li>

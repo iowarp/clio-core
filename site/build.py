@@ -74,15 +74,22 @@ def _ml_algorithm_pages():
 ML_ALGOS = _ml_algorithm_pages()
 
 # Section navigation: (group title, [(page path, label), ...]).
+# Each technology: (technology page, docs page, label). Drives the
+# Technologies and Docs dropdowns, so both list the same systems.
+TECHNOLOGIES = [
+    ("technologies/context-fs.html", "docs/context-fs.html", "Context FS"),
+    ("technologies/cae.html", "docs/cae.html", "Context Assimilation Engine"),
+    ("technologies/cee.html", "docs/cee.html", "Context Exploration Engine"),
+    ("technologies/context-transfer-engine.html", "docs/cte.html", "Context Transfer Engine"),
+    ("technologies/context-runtime.html", "docs/runtime.html", "Context Runtime"),
+    ("technologies/memory-expansion.html", "docs/memory-expansion.html", "Memory expansion"),
+    ("technologies/machine-learning.html", "docs/ml/index.html", "Machine learning"),
+]
+
 NAV = {
     "technologies": [
-        ("Technologies", [
-            ("technologies/index.html", "Context Runtime"),
-            ("technologies/context-fs.html", "Context FS"),
-            ("technologies/context-transfer-engine.html", "Context Transfer Engine"),
-            ("technologies/memory-expansion.html", "Memory expansion"),
-            ("technologies/machine-learning.html", "Machine learning"),
-        ]),
+        ("Technologies", [("technologies/index.html", "Overview")]
+         + [(tp, lb) for tp, _, lb in TECHNOLOGIES]),
     ],
     "docs": [
         ("Start here", [
@@ -400,15 +407,8 @@ DROPDOWNS = {"technologies", "docs"}
 # Dropdowns that list fixed entries instead of every page in the section.
 # Docs links one page per technology.
 DROPDOWN_ITEMS = {
-    "docs": [
-        ("docs/context-fs.html", "Context FS"),
-        ("docs/cae.html", "Context Assimilation Engine"),
-        ("docs/cee.html", "Context Exploration Engine"),
-        ("docs/cte.html", "Context Transfer Engine"),
-        ("docs/runtime.html", "Context Runtime"),
-        ("docs/memory-expansion.html", "Memory expansion"),
-        ("docs/ml/index.html", "Machine learning"),
-    ],
+    "technologies": [(tp, lb) for tp, _, lb in TECHNOLOGIES],
+    "docs": [(dp, lb) for _, dp, lb in TECHNOLOGIES],
 }
 
 

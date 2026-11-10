@@ -1,64 +1,76 @@
 <!--
-title: Context Runtime
-heading: Context Runtime: <em>one runtime for data and compute.</em>
-description: The Context Runtime is the distributed task runtime under CLIO Core. Modules run as pools, tasks travel over shared memory, sockets, TCP and storage tiers, and the stack can be recomposed, grown and recovered while it runs.
-eyebrow: Technologies · Runtime
-lede: The Context Runtime hosts every CLIO Core module. Where MPI gives a fixed set of processes a way to exchange messages, the Context Runtime gives a long-running service a way to move data across memory, networks and storage, to change what it runs without restarting, and to keep going when nodes come and go.
-facts: Unit of code | Module (ChiMod), run as a pool ; Unit of work | Task, run as a coroutine ; Transports | Shared memory, Unix sockets, TCP ; Configured by | One YAML compose file
+title: Technologies
+heading: The technologies, <em>at a glance.</em>
+description: CLIO Core's technologies and what each one gives you: Context FS, the Context Assimilation, Exploration and Transfer Engines, the Context Runtime, memory expansion and machine learning.
+eyebrow: Technologies
+lede: CLIO Core is a composable I/O stack: one runtime, one store and a set of modules you compose in YAML. Each technology below is a way of using that stack, and they all share the same data, so a file written through the mount can be searched, paged into GPU memory or trained on without a copy.
+facts: Storage | Context FS, Context Transfer Engine ; Context | Assimilation and Exploration Engines ; Runtime | Context Runtime ; Compute | Memory expansion, machine learning
 -->
-<h2>Beyond message passing</h2>
-<p>MPI is the standard way to write parallel programs: a fixed set of ranks is launched together, exchanges messages and collectives, and exits together. That model fits a single simulation. It fits less well when one data set passes through a simulation, an analysis service, a model and an agent, each with its own lifetime, and when data must also move between memory, local disks and cloud storage.</p>
-<p>The Context Runtime starts from a different unit. Instead of ranks, it hosts <strong>modules</strong> as long-lived pools on every node. Instead of messages, clients submit <strong>tasks</strong> to a pool, and the runtime decides which node runs them, on which worker, and over which transport. The same runtime moves bytes over the network and onto storage, so a transfer to another node and a transfer to an NVMe tier or an S3 bucket go through one interface.</p>
+<h2>Context FS</h2>
+<p class="eyebrow">Storage</p>
 <ul class="checks">
-  <li><strong>MPI:</strong> processes and messages; fixed membership; a rank failure usually ends the job; storage is a separate library.</li>
-  <li><strong>Context Runtime:</strong> modules and tasks; nodes can be added and pools created or destroyed while it runs; clients survive restarts; network and storage paths share one abstraction.</li>
+    <li>Mount it like any other directory on Linux, macOS and Windows through FUSE. Applications run unchanged.</li>
+    <li>Files spread across the tiers you compose (RAM, NVMe, erasure-coded arrays, Amazon S3 or Google Cloud buckets) by score, with distributed metadata and no metadata server.</li>
+    <li>Every file is also tags and blobs in the Context Transfer Engine, so search, assimilation and the other technologies use it without a copy.</li>
 </ul>
-<p>The two coexist. An MPI application can keep its ranks and use the runtime underneath for I/O, checkpoints and memory expansion.</p>
+<p><a href="/technologies/context-fs.html">Context FS overview</a> · <a href="/docs/context-fs.html">Docs</a></p>
 
-<h2>Diverse transfer paths</h2>
-<p>A task reaches its module over the cheapest path available, without the caller choosing it.</p>
+<h2>Context Assimilation Engine</h2>
+<p class="eyebrow">Context</p>
 <ul class="checks">
-  <li><strong>Within a node:</strong> shared-memory rings, or a Unix socket when shared memory is unavailable. Code already inside the runtime hands tasks over directly, with no serialization.</li>
-  <li><strong>Across nodes:</strong> TCP, with small messages on a latency lane so probes and acknowledgements never wait behind large transfers.</li>
-  <li><strong>From GPUs:</strong> GPU kernels can submit tasks themselves, through a GPU queue served by the runtime.</li>
-  <li><strong>Into storage:</strong> block devices for RAM, pinned and GPU memory, files and asynchronous I/O, Amazon S3 and Google Cloud Storage, and erasure-coded arrays built from any of them, with GPUDirect Storage support.</li>
+    <li>Brings files, HDF5 datasets, web downloads, S3, Google Cloud and Globus data into the stack with one YAML file.</li>
+    <li>Ingests on fault: register a source and only the parts that are read are pulled in, when they are read.</li>
+    <li>Describes data in the I/O path: the summarizer labels it and the indexer makes it searchable as it lands.</li>
+    <li>Serves imported data as numbered pages, so memory expansion and clio-ml can work on it directly.</li>
 </ul>
+<p><a href="/technologies/cae.html">Context Assimilation Engine overview</a> · <a href="/docs/cae.html">Docs</a></p>
 
-<h2>Abstractions</h2>
+<h2>Context Exploration Engine</h2>
+<p class="eyebrow">Context</p>
 <ul class="checks">
-  <li><strong>Modules (ChiMods)</strong> are shared libraries that define a set of methods. Storage, caching, replication, filesystems, search and machine-learning algorithms are all modules.</li>
-  <li><strong>Pools</strong> are running instances of a module, with one container on each node. Two pools of one module can run side by side with different settings.</li>
-  <li><strong>Tasks</strong> are method calls on a pool. Handlers are coroutines, so a task that waits on I/O or on another pool frees its worker thread.</li>
-  <li><strong>Pool queries</strong> say where a task should run: this node, one container chosen by key, a range, every container, or wherever the module decides. Collective queries batch tasks from many nodes, run them once and return the result to all of them.</li>
-  <li><strong>Interposition</strong> lets a module stand in front of another and forward what it does not handle. Caching, replication, compression and indexing are added this way, without changing the modules above or below.</li>
+    <li>One small API in C++ and Python: bundle, query, retrieve and destroy.</li>
+    <li>Finds data by name pattern, by keyword relevance (BM25) or by time window, across every node at once.</li>
+    <li>Sees everything written through Context FS, the Context Transfer Engine or the assimilation engine, with no import step.</li>
+    <li>Returns matches packed into one size-bounded buffer, ready for an analysis or a model.</li>
 </ul>
+<p><a href="/technologies/cee.html">Context Exploration Engine overview</a> · <a href="/docs/cee.html">Docs</a></p>
 
-<h2>Dynamic recomposition</h2>
-<p>The stack is described by a compose file, a list of pools and their settings. The runtime creates them at startup, and <code>clio_run compose start</code> and <code>compose stop</code> create or destroy the pools in a compose file while the runtime keeps serving. New modules are discovered from a library path, so an operator built outside the tree can be added to a running deployment. Pools are recorded in a durable registry, so a restarted node brings its composition back.</p>
-
-<h2>Scheduling</h2>
-<p>Each node runs a pool of worker threads with roles: scheduling, network send and receive, a GPU queue, and I/O workers in cost classes. Tasks are mapped by predicted cost, learned from observed run times: large I/O is spread across I/O workers, cheap tasks run inline, and everything else goes to the least-loaded worker in its class. A monitor moves the queue of a worker stuck on one task to a fresh worker, grows a class whose workers are saturated, and retires idle extra workers.</p>
-
-<h2>Elasticity</h2>
-<p>Nodes can be added to a running cluster. When a node is registered, every module's containers receive an <code>Expand</code> callback so they can re-partition data or update routing. Containers can be migrated to another node through a <code>Migrate</code> callback, and after a node is lost, a <code>Recover</code> callback rebuilds a container elsewhere from replicas or checkpoints, with <code>ScheduleRecover</code> letting the module pick where. Container ids are fixed by the host list, so hashing stays stable while nodes come and go.</p>
-
-<h2>Failure detection</h2>
+<h2>Context Transfer Engine</h2>
+<p class="eyebrow">Storage</p>
 <ul class="checks">
-  <li><strong>Restarted peers</strong> are detected from an incarnation number on every message; requests in flight to the old incarnation fail promptly and are retried.</li>
-  <li><strong>Silent peers</strong> are probed, and declared dead after 30 seconds of silence. Requests to them fail after a timeout, or immediately in fail-fast mode.</li>
-  <li><strong>Clients</strong> detect a lost runtime with a heartbeat, wait for it or fail over to another node, reconnect and resend. The runtime, in turn, survives clients that die.</li>
-  <li><strong>Data</strong> survives node loss through the replication module, not through the runtime alone. A gossip detector exists but is off by default, because at large scale wide collectives starved its probes.</li>
+    <li>A key-value store for C++ and Python: tags hold blobs, with partial reads and writes by offset.</li>
+    <li>Each blob is placed on a tier by its score; changing the score moves it.</li>
+    <li>Regex, keyword and time-window queries, and a shared-memory path for clients on the same node.</li>
+    <li>The substrate every other technology writes to.</li>
 </ul>
-<p><a href="/design/runtime.html">Runtime design</a> covers each mechanism and its tradeoffs, and <a href="/docs/runtime.html">the Context Runtime docs</a> show how to build a module.</p>
+<p><a href="/technologies/context-transfer-engine.html">Context Transfer Engine overview</a> · <a href="/docs/cte.html">Docs</a></p>
 
-<h2>Built on the runtime</h2>
-<p>Each CLIO Core technology is a composition of modules on the Context Runtime.</p>
-<div class="product-grid">
-  <a href="/technologies/context-fs.html"><span class="feature-index">Storage</span><h3>Context FS</h3><p>A distributed filesystem over your tiers. FUSE on Linux, macOS and Windows; erasure-coded arrays that grow one drive at a time; buckets as tiers.</p><span class="stat">Metadata ops in 10-570 µs, no metadata server</span></a>
-  <a href="/technologies/context-transfer-engine.html"><span class="feature-index">Storage</span><h3>Context Transfer Engine</h3><p>Tags and blobs from C++ or Python over shared memory, with placement scores, regex queries and keyword search.</p><span class="stat">YCSB-B: 42.6k ops/s vs Redis 16.8k</span></a>
-  <a href="/technologies/memory-expansion.html"><span class="feature-index">Memory</span><h3>Memory expansion</h3><p>Paged vectors for GPU and CPU code whose data is larger than device memory, spilling to RAM, NVMe and beyond.</p><span class="stat">0.93x MPI step time on 4 Aurora nodes</span></a>
-  <a href="/technologies/machine-learning.html"><span class="feature-index">Compute</span><h3>Machine learning</h3><p>clio-ml: MLlib-equivalent algorithms that train out of core on one GPU tile per node.</p><span class="stat">8-59x faster per iteration than Spark MLlib</span></a>
-</div>
+<h2>Context Runtime</h2>
+<p class="eyebrow">Runtime</p>
+<ul class="checks">
+    <li>Hosts every module as a long-lived pool and runs work as tasks, rather than as a fixed set of MPI ranks.</li>
+    <li>One abstraction for moving data over shared memory, sockets, TCP and storage tiers.</li>
+    <li>Recompose the stack, add nodes and recover from failures while it runs.</li>
+</ul>
+<p><a href="/technologies/context-runtime.html">Context Runtime overview</a> · <a href="/docs/runtime.html">Docs</a></p>
+
+<h2>Memory expansion</h2>
+<p class="eyebrow">Memory</p>
+<ul class="checks">
+    <li>Paged vectors for CPU and GPU code whose data is larger than device memory.</li>
+    <li>Pages spill to DRAM and storage tiers; placement, coherence and persistence are handled for you.</li>
+    <li>Measured within 0.88-1.19x of MPI, oneCCL and Intel SHMEM on up to 64 Aurora nodes.</li>
+</ul>
+<p><a href="/technologies/memory-expansion.html">Memory expansion overview</a> · <a href="/docs/memory-expansion.html">Docs</a></p>
+
+<h2>Machine learning</h2>
+<p class="eyebrow">Compute</p>
+<ul class="checks">
+    <li>clio-ml: the Spark MLlib algorithm set, over 30 modules, on CPU, CUDA and SYCL.</li>
+    <li>Trains out of core: data larger than GPU memory streams from the tiers you compose.</li>
+    <li>Measured 8-59x faster per iteration than Spark MLlib.</li>
+</ul>
+<p><a href="/technologies/machine-learning.html">Machine learning overview</a> · <a href="/docs/ml/index.html">Docs</a></p>
 
 <h2>How the numbers on these pages were measured</h2>
 <p>Every figure on the technology pages comes from a benchmark in the repository, with its hardware and its caveats. Where a comparison favors another system, the page says so. Most runs are single runs on one machine or a small allocation; treat them as measured examples, not guarantees for your hardware. Each page links the source document so you can rerun it.</p>
