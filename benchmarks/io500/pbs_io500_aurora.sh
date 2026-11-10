@@ -183,6 +183,9 @@ EOF
     echo "clio-fs bring-up FAILED"; tail -40 logs/node_up.log
     touch stop; wait $NODES_PID; exit 3
   fi
+  # SETTLE: seconds to wait after every mount answers. At 64 nodes pool
+  # creation was still in progress on some nodes when IO500 started.
+  sleep "${SETTLE:-0}"
   DATADIR=$LR/mnt/io500_$JOB
 elif [ "$MODE" = daos ]; then
   daos cont query "$DAOS_POOL" "$DAOS_CONT" > /dev/null 2>&1 \
