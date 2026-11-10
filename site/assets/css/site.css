@@ -602,3 +602,8 @@ dl.notes dd { margin: 0; color: var(--ink-soft); }
 .figure img { display: block; width: 100%; height: auto; border-radius: var(--radius); background: #fff; padding: var(--space-2); }
 .figure figcaption { font-size: 0.85rem; color: var(--muted); margin-top: var(--space-2); }
 @media (max-width: 720px) { .chart-grid { grid-template-columns: minmax(0, 1fr); } }
+
+/* ---------- Install tabs in the hero ---------- */
+.install-intro { color: var(--ink-soft); margin: var(--space-4) 0 0; max-width: 40rem; }
+.tabs.hero-install { margin: var(--space-3) 0 var(--space-4); max-width: 40rem; }
+.tabs.hero-install pre { margin: 0; }
